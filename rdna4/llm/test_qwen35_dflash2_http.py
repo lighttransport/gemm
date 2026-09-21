@@ -4,7 +4,9 @@ Run with ``--model TARGET --sidecar DFLASH``.  The test is intentionally
 separate from the CPU-only protocol suite because it loads both GGUF files.
 """
 import argparse
+import http.client
 import json
+import os
 import subprocess
 import time
 import urllib.request
@@ -29,6 +31,26 @@ def post(port, body):
         return json.load(response)
 
 
+def cancel_stream(port):
+    """Close an active stream after its first token and verify cleanup later."""
+    body = {
+        "messages": [{"role": "user", "content": "List ten facts about C++."}],
+        "temperature": 0, "max_tokens": 64, "stream": True,
+    }
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=HTTP_TIMEOUT)
+    try:
+        connection.request("POST", "/v1/chat/completions",
+                           body=json.dumps(body).encode(),
+                           headers={"Content-Type": "application/json"})
+        response = connection.getresponse()
+        require(response.status == 200, response.status)
+        while response.readline():
+            # Closing the connection exercises the server's disconnect watcher.
+            break
+    finally:
+        connection.close()
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
@@ -42,36 +64,59 @@ def main():
         "--max-output", "8", "--qwen35-dflash2", args.sidecar,
         "--qwen35-dflash2-draft", "7",
     ]
-    # The runner inherits this stream from codex_server.  Discard it here so
-    # long GPU runs cannot deadlock on an undrained diagnostic pipe.
+    os.makedirs("tmp/qwen38/dflash-http-quality", exist_ok=True)
+    server_log_path = os.path.join(
+        "tmp/qwen38/dflash-http-quality", f"server-{args.port}.log")
+    server_log = open(server_log_path, "w", encoding="utf-8")
+    # Keep diagnostics in a repository-local file so long GPU runs cannot
+    # deadlock on an undrained subprocess pipe, while failures remain useful.
     process = subprocess.Popen(command, stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL)
+                                stderr=server_log, text=True)
     try:
         for _ in range(180):
             try:
                 with urllib.request.urlopen(
                         f"http://127.0.0.1:{args.port}/health", timeout=2) as response:
-                health = json.load(response)
+                    health = json.load(response)
                 break
             except Exception:
                 if process.poll() is not None:
+                    server_log.flush()
+                    with open(server_log_path, encoding="utf-8") as diagnostics:
+                        tail = diagnostics.read()[-4000:]
                     raise RuntimeError(
-                        f"DFlash2 server exited before readiness (status {process.returncode})")
+                        f"DFlash2 server exited before readiness (status {process.returncode})\n{tail}")
                 time.sleep(1)
         else:
             raise RuntimeError("DFlash2 server did not become ready")
         require(health.get("status") == "ready", health)
 
-        prompt = [{"role": "user", "content": "Write one short sentence about C++."}]
-        greedy = {"messages": prompt, "temperature": 0, "max_tokens": 8}
-        first = post(args.port, greedy)
-        second = post(args.port, greedy)
-        first_text = first["choices"][0]["message"]["content"]
-        require(first.get("usage", {}).get("completion_tokens", 0) > 0, first)
-        require(first_text == second["choices"][0]["message"]["content"],
-                "greedy request was not repeatable")
-        require("C++" in first_text, first_text)
+        cases = (
+            ("Write one short sentence about C++.", "C++"),
+            ("What is 2+2? Answer with just the number 4.", "4"),
+        )
+        for prompt_text, expected in cases:
+            prompt = [{"role": "user", "content": prompt_text}]
+            greedy = {"messages": prompt, "temperature": 0, "max_tokens": 8}
+            first = post(args.port, greedy)
+            second = post(args.port, greedy)
+            first_text = first["choices"][0]["message"]["content"]
+            require(first.get("usage", {}).get("completion_tokens", 0) > 0, first)
+            require(first_text == second["choices"][0]["message"]["content"],
+                    "greedy request was not repeatable")
+            require(expected in first_text, first_text)
 
+        cancel_stream(args.port)
+        time.sleep(1)
+        recovery = post(args.port, {
+            "messages": [{"role": "user", "content": "Answer 3+3 with 6."}],
+            "temperature": 0, "max_tokens": 8,
+        })
+        require(recovery.get("usage", {}).get("completion_tokens", 0) > 0,
+                recovery)
+        require("6" in recovery["choices"][0]["message"]["content"], recovery)
+
+        prompt = [{"role": "user", "content": cases[0][0]}]
         sampled = {
             "messages": prompt, "temperature": 0.7, "top_p": 0.95,
             "top_k": 20, "seed": 42, "max_tokens": 8,
@@ -92,6 +137,7 @@ def main():
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait()
+        server_log.close()
 
 
 if __name__ == "__main__":

@@ -418,15 +418,6 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
         int prefix_matches_cache = requested_prefix > 0 && requested_prefix == prefix_cache_n;
         for (int i = 0; prefix_matches_cache && i < requested_prefix; ++i)
             if (prefix_cache[i] != tokens[i]) prefix_matches_cache = 0;
-        /* DFlash owns a separate recurrent sidecar cache.  Target snapshots
-         * do not include those rows, so replay the prompt until a sidecar
-         * snapshot is available instead of mixing old draft state with a
-         * restored target prefix. */
-        if (dflash_draft > 0) {
-            prompt_matches_cache = 0;
-            prefix_matches_cache = 0;
-            common = 0;
-        }
         int restored_prefix = 0;
         int restored_prompt = 0;
         if (common != cache_n && prompt_matches_cache &&

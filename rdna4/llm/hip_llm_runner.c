@@ -33231,6 +33231,13 @@ struct hip_llm_state_snapshot {
     void **dflash_key_host, **dflash_value_host;
     size_t dflash_kv_bytes;
     int dflash_kv_end;
+    void *dflash_feature_host;
+    size_t dflash_feature_bytes;
+    int dflash_feature_rows;
+    void **qwen35_key_host, **qwen35_value_host;
+    void **qwen35_key_scale_host, **qwen35_value_scale_host;
+    size_t *qwen35_kv_bytes, *qwen35_scale_bytes;
+    int qwen35_kv_count;
 };
 
 void hip_llm_free_state_snapshot(hip_llm_state_snapshot *s) {
@@ -33251,6 +33258,18 @@ void hip_llm_free_state_snapshot(hip_llm_state_snapshot *s) {
     }
     free(s->dflash_key_host);
     free(s->dflash_value_host);
+    free(s->dflash_feature_host);
+    if (s->qwen35_key_host && s->qwen35_value_host) {
+        for (int l = 0; l < s->n_layers; ++l) {
+            free(s->qwen35_key_host[l]);
+            free(s->qwen35_value_host[l]);
+            free(s->qwen35_key_scale_host ? s->qwen35_key_scale_host[l] : NULL);
+            free(s->qwen35_value_scale_host ? s->qwen35_value_scale_host[l] : NULL);
+        }
+    }
+    free(s->qwen35_key_host); free(s->qwen35_value_host);
+    free(s->qwen35_key_scale_host); free(s->qwen35_value_scale_host);
+    free(s->qwen35_kv_bytes); free(s->qwen35_scale_bytes);
     free(s->ple_host);
     if (s->kv_key_host && s->kv_value_host) {
         for (int l = 0; l < s->n_layers; ++l) {
@@ -33343,12 +33362,22 @@ hip_llm_state_snapshot *hip_llm_snapshot_state(hip_llm_runner *r) {
         s->logits_bytes=(size_t)r->n_vocab*sizeof(float);
         s->hc_host=malloc(s->hc_bytes);s->logits_host=malloc(s->logits_bytes);
         if(!s->hc_host || !s->logits_host ||
-           hipMemcpy(s->hc_host,r->d_hc,s->hc_bytes,hipMemcpyDeviceToHost) ||
-           hipMemcpy(s->logits_host,r->d_logits,s->logits_bytes,hipMemcpyDeviceToHost))goto fail;
+           hipMemcpy(s->hc_host,r->d_hc,s->hc_bytes,hipMemcpyDeviceToHost))goto fail;
+        memcpy(s->logits_host, r->h_output, s->logits_bytes);
         if(r->qwen4_nextn_fusion_loaded) {
             s->nextn_hc_host=malloc(s->hc_bytes);
             if(!s->nextn_hc_host || hipMemcpy(s->nextn_hc_host,r->d_qwen4_nextn_hc,s->hc_bytes,hipMemcpyDeviceToHost))goto fail;
         }
+    }
+    /* Non-MoE Qwen3.8 prompt reuse also needs the logits that correspond to
+     * the last prompt row.  Without this small snapshot, a cache hit resumes
+     * from stale logits left by the preceding generated request. */
+    if (!s->logits_host) {
+        s->logits_bytes = (size_t)r->n_vocab * sizeof(float);
+        s->logits_host = malloc(s->logits_bytes);
+        if (!s->logits_host)
+            goto fail;
+        memcpy(s->logits_host, r->h_output, s->logits_bytes);
     }
     for (int l = 0; l < r->n_layers; ++l) {
         hip_layer *cl = &r->layers[l];
@@ -33387,6 +33416,16 @@ hip_llm_state_snapshot *hip_llm_snapshot_state(hip_llm_runner *r) {
         s->dflash_kv_bytes = (size_t)HLLM_DFLASH_WINDOW *
             HLLM_DFLASH_KV_HEADS * HLLM_DFLASH_HEAD_DIM * sizeof(float);
         s->dflash_kv_end = d->kv_end;
+        s->dflash_feature_rows = d->feature_rows;
+        s->dflash_feature_bytes = (size_t)d->feature_rows *
+            HLLM_DFLASH_LAYERS * (size_t)r->n_embd * sizeof(float);
+        if (s->dflash_feature_bytes) {
+            s->dflash_feature_host = malloc(s->dflash_feature_bytes);
+            if (!s->dflash_feature_host || hipMemcpy(s->dflash_feature_host,
+                    d->features, s->dflash_feature_bytes,
+                    hipMemcpyDeviceToHost) != hipSuccess)
+                goto fail;
+        }
         if (!s->dflash_key_host || !s->dflash_value_host) goto fail;
         for (int l = 0; l < HLLM_DFLASH_LAYERS; ++l) {
             s->dflash_key_host[l] = malloc(s->dflash_kv_bytes);
@@ -33396,6 +33435,47 @@ hip_llm_state_snapshot *hip_llm_snapshot_state(hip_llm_runner *r) {
                           s->dflash_kv_bytes, hipMemcpyDeviceToHost) != hipSuccess ||
                 hipMemcpy(s->dflash_value_host[l], d->layers[l].value_cache,
                           s->dflash_kv_bytes, hipMemcpyDeviceToHost) != hipSuccess)
+                goto fail;
+        }
+    }
+    /* A Q8 target snapshot must include the target attention rows as well as
+     * the hybrid SSM and DFlash state.  Bound this host-side copy to short
+     * prompts; long-context serving falls back to replay instead of silently
+     * consuming multiple gigabytes per cached conversation. */
+    if (r->qwen35_dflash2 && r->kv_cache_type == HIP_LLM_KV_Q8_0_Q8_0 &&
+        s->position >= 0 && s->position + 1 <= 8192) {
+        s->qwen35_kv_count = s->position + 1;
+        s->qwen35_key_host = calloc((size_t)s->n_layers, sizeof(void *));
+        s->qwen35_value_host = calloc((size_t)s->n_layers, sizeof(void *));
+        s->qwen35_key_scale_host = calloc((size_t)s->n_layers, sizeof(void *));
+        s->qwen35_value_scale_host = calloc((size_t)s->n_layers, sizeof(void *));
+        s->qwen35_kv_bytes = calloc((size_t)s->n_layers, sizeof(size_t));
+        s->qwen35_scale_bytes = calloc((size_t)s->n_layers, sizeof(size_t));
+        if (!s->qwen35_key_host || !s->qwen35_value_host ||
+            !s->qwen35_key_scale_host || !s->qwen35_value_scale_host ||
+            !s->qwen35_kv_bytes || !s->qwen35_scale_bytes) goto fail;
+        for (int l = 0; l < s->n_layers; ++l) {
+            hip_layer *cl = &r->layers[l];
+            if (cl->is_ssm || !r->d_key_cache[l] || !r->d_key_cache_scale[l]) continue;
+            size_t row_bytes = (size_t)cl->local_kv_heads * cl->local_head_dim;
+            size_t scale_row = (size_t)cl->local_kv_heads *
+                               (cl->local_head_dim / 32) * sizeof(float);
+            s->qwen35_kv_bytes[l] = (size_t)s->qwen35_kv_count * row_bytes;
+            s->qwen35_scale_bytes[l] = (size_t)s->qwen35_kv_count * scale_row;
+            s->qwen35_key_host[l] = malloc(s->qwen35_kv_bytes[l]);
+            s->qwen35_value_host[l] = malloc(s->qwen35_kv_bytes[l]);
+            s->qwen35_key_scale_host[l] = malloc(s->qwen35_scale_bytes[l]);
+            s->qwen35_value_scale_host[l] = malloc(s->qwen35_scale_bytes[l]);
+            if (!s->qwen35_key_host[l] || !s->qwen35_value_host[l] ||
+                !s->qwen35_key_scale_host[l] || !s->qwen35_value_scale_host[l] ||
+                hipMemcpy(s->qwen35_key_host[l], r->d_key_cache[l],
+                          s->qwen35_kv_bytes[l], hipMemcpyDeviceToHost) != hipSuccess ||
+                hipMemcpy(s->qwen35_value_host[l], r->d_value_cache[l],
+                          s->qwen35_kv_bytes[l], hipMemcpyDeviceToHost) != hipSuccess ||
+                hipMemcpy(s->qwen35_key_scale_host[l], r->d_key_cache_scale[l],
+                          s->qwen35_scale_bytes[l], hipMemcpyDeviceToHost) != hipSuccess ||
+                hipMemcpy(s->qwen35_value_scale_host[l], r->d_value_cache_scale[l],
+                          s->qwen35_scale_bytes[l], hipMemcpyDeviceToHost) != hipSuccess)
                 goto fail;
         }
     }
@@ -33411,6 +33491,9 @@ int hip_llm_restore_state(hip_llm_runner *r, const hip_llm_state_snapshot *s) {
     if(hipStreamSynchronize(r->stream))return -1;
     if(s->hc_host && (hipMemcpy(r->d_hc,s->hc_host,s->hc_bytes,hipMemcpyHostToDevice) ||
        hipMemcpy(r->d_logits,s->logits_host,s->logits_bytes,hipMemcpyHostToDevice)))return -1;
+    if(!s->hc_host && s->logits_host && hipMemcpy(r->d_logits, s->logits_host,
+                                                   s->logits_bytes,
+                                                   hipMemcpyHostToDevice)) return -1;
     if(s->logits_host)memcpy(r->h_output,s->logits_host,s->logits_bytes);
     if(s->nextn_hc_host && (!r->d_qwen4_nextn_hc ||
        hipMemcpy(r->d_qwen4_nextn_hc,s->nextn_hc_host,s->hc_bytes,hipMemcpyHostToDevice)))return -1;
@@ -33458,6 +33541,11 @@ int hip_llm_restore_state(hip_llm_runner *r, const hip_llm_state_snapshot *s) {
     if (s->dflash_key_host) {
         hllm_qwen35_dflash2 *d = r->qwen35_dflash2;
         if (!d) return -1;
+        if (s->dflash_feature_host &&
+            (!d->features || hipMemcpy(d->features, s->dflash_feature_host,
+                                        s->dflash_feature_bytes,
+                                        hipMemcpyHostToDevice) != hipSuccess))
+            return -1;
         for (int l = 0; l < HLLM_DFLASH_LAYERS; ++l) {
             if (hipMemcpy(d->layers[l].key_cache, s->dflash_key_host[l],
                           s->dflash_kv_bytes, hipMemcpyHostToDevice) != hipSuccess ||
@@ -33466,7 +33554,21 @@ int hip_llm_restore_state(hip_llm_runner *r, const hip_llm_state_snapshot *s) {
                 return -1;
         }
         d->kv_end = s->dflash_kv_end;
-        d->feature_rows = 0;
+        d->feature_rows = s->dflash_feature_rows;
+    }
+    if (s->qwen35_key_host && r->qwen35_dflash2) {
+        for (int l = 0; l < r->n_layers; ++l) {
+            if (!s->qwen35_key_host[l] || !r->d_key_cache[l]) continue;
+            if (hipMemcpy(r->d_key_cache[l], s->qwen35_key_host[l],
+                          s->qwen35_kv_bytes[l], hipMemcpyHostToDevice) != hipSuccess ||
+                hipMemcpy(r->d_value_cache[l], s->qwen35_value_host[l],
+                          s->qwen35_kv_bytes[l], hipMemcpyHostToDevice) != hipSuccess ||
+                hipMemcpy(r->d_key_cache_scale[l], s->qwen35_key_scale_host[l],
+                          s->qwen35_scale_bytes[l], hipMemcpyHostToDevice) != hipSuccess ||
+                hipMemcpy(r->d_value_cache_scale[l], s->qwen35_value_scale_host[l],
+                          s->qwen35_scale_bytes[l], hipMemcpyHostToDevice) != hipSuccess)
+                return -1;
+        }
     }
     /* A snapshot contains persistent request state, not the contents of the
      * scratch quantization buffers.  Reused device addresses can otherwise

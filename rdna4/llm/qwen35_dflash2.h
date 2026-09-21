@@ -543,7 +543,15 @@ int hip_llm_qwen35_dflash2_commit(hip_llm_runner *r, int position,
     hllm_qwen35_dflash2 *d = r ? r->qwen35_dflash2 : NULL;
     hllm_qwen35_mtp *m = r ? r->qwen35_mtp : NULL;
     if (!d || !m || position != m->verify_position || processed < 1 ||
-        processed > m->verify_rows || processed > d->feature_rows) return -1;
+        processed > m->verify_rows || processed > d->feature_rows) {
+        fprintf(stderr,
+                "DFlash2 commit rejected: d=%d verifier=%d position=%d/%d "
+                "processed=%d rows=%d features=%d\n",
+                d != NULL, m ? m->verify_rows : -1, position,
+                m ? m->verify_position : -1, processed,
+                m ? m->verify_rows : -1, d ? d->feature_rows : -1);
+        return -1;
+    }
     if (hllm_qwen35_dflash2_inject(r,position,processed)) return -1;
     return hip_llm_qwen35_mtp_commit(r,processed);
 }

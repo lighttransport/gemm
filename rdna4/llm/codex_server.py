@@ -33,11 +33,16 @@ def runner_command(args):
     """Build the resident runner command without changing benchmark defaults."""
     server_profile = bool(getattr(args, "qwen35_server_profile", False))
     dflash = getattr(args, "qwen35_dflash2", None)
+    qwen35_mtp = getattr(args, "qwen35_mtp", None)
     if server_profile and dflash:
         raise ValueError("--qwen35-server-profile and --qwen35-dflash2 are mutually exclusive")
     qwen4_mtp = getattr(args, "qwen4_mtp", None)
     if dflash and qwen4_mtp:
         raise ValueError("--qwen35-dflash2 cannot be combined with --qwen4-mtp")
+    if dflash and qwen35_mtp:
+        raise ValueError("--qwen35-dflash2 cannot be combined with --qwen35-mtp")
+    if qwen35_mtp and qwen4_mtp:
+        raise ValueError("--qwen35-mtp cannot be combined with --qwen4-mtp")
     cmd = [args.runner, args.model, "--stdio-server", "--gpu-only-bench", "-s", str(args.context)]
     if getattr(args, "moe_cache_mb", 0):
         cmd += ["--moe-cache-mb", str(args.moe_cache_mb)]
@@ -54,6 +59,15 @@ def runner_command(args):
                 "--qwen4-mtp-draft", str(getattr(args, "qwen4_mtp_draft", 1)),
                 "--qwen4-mtp-cache-mb", str(getattr(args, "qwen4_mtp_cache_mb", 128)),
                 "--qwen4-mtp-verify", getattr(args, "qwen4_mtp_verify", "scalar")]
+    if qwen35_mtp:
+        if not server_profile:
+            cmd += ["--kv-cache", "q8q8", "--qwen35-prefill-bf16",
+                    "--qwen35-decode-graph", "--qwen35-native-q8-prefill",
+                    "--qwen35-native-mmvq"]
+        cmd += ["--qwen35-mtp", qwen35_mtp,
+                "--qwen35-mtp-draft", str(getattr(args, "qwen35_mtp_draft", 3))]
+        if getattr(args, "qwen35_mtp_window", False):
+            cmd.append("--qwen35-mtp-window")
     if server_profile:
         # Keep the resident Qwen3.8 HTTP/stdio route on the validated exact
         # Q8/Q8 profile. This only changes server command construction; the
@@ -796,6 +810,11 @@ def main():
                     help="exact MTP fallback after low draft acceptance")
     ap.add_argument("--qwen35-server-profile", action="store_true",
                     help="use the validated exact Qwen3.8 Q8/Q8 HTTP/stdio profile")
+    ap.add_argument("--qwen35-mtp", metavar="SIDECAR",
+                    help="exact dense Qwen3.8 NextN sidecar for greedy serving")
+    ap.add_argument("--qwen35-mtp-draft", type=int, choices=range(1, 33), default=3)
+    ap.add_argument("--qwen35-mtp-window", action="store_true",
+                    help="use the windowed dense NextN verifier")
     ap.add_argument("--qwen35-dflash2", metavar="SIDECAR",
                     help="exact Qwen3.8 DFlash2 sidecar for HTTP/stdio serving")
     ap.add_argument("--qwen35-dflash2-draft", type=int, choices=range(1, 8), default=7)

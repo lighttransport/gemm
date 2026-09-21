@@ -59,13 +59,15 @@ and Q8 K plus Q8 V.  It is mutually exclusive with dense NextN and Qwen4 MTP.
 The HTTP shim enables it with `--qwen35-dflash2 SIDECAR`; each request is
 serialized through the exact propose/verify/commit window.  Temperature-zero
 requests use the exact argmax window, while sampled requests verify full row
-logits with the existing sampler.  DFlash requests currently replay their
-prompt because the sidecar's private recurrent cache is not part of target
-snapshots; this preserves output correctness at the cost of prompt-cache
-reuse.
+logits with the existing sampler.  Bounded target prompt snapshots include the
+sidecar's recurrent K/V cache, target Q8 KV rows, captured features and prompt
+logits, so repeated short requests restore both target and draft state without
+replaying the prompt.  Long prompts fall back to replay to avoid multi-gigabyte
+host snapshots.
 
 The opt-in HTTP quality gate covers deterministic greedy and seeded sampled
-requests, repeated-request state isolation, and a coherent C++ response:
+requests, repeated-request state isolation, disconnect cancellation followed
+by recovery, and coherent coding and non-coding responses:
 
 ```sh
 python3 rdna4/llm/test_qwen35_dflash2_http.py \

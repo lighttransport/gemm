@@ -55,6 +55,22 @@ class ProtocolTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "cannot be combined"):
             runner_command(args)
 
+    def test_qwen35_mtp_runner_command_is_exact_and_mutually_exclusive(self):
+        args = SimpleNamespace(
+            runner="./test_hip_llm", model="target.gguf", context=4096,
+            moe_cache_mb=0, coding=False, qwen4_coding_profile=False,
+            qwen4_exact=False, qwen4_mtp=None, qwen35_server_profile=False,
+            qwen35_dflash2=None, qwen35_mtp="nextn.gguf",
+            qwen35_mtp_draft=3, qwen35_mtp_window=True,
+        )
+        command = runner_command(args)
+        self.assertEqual(command[-5:], ["--qwen35-mtp", "nextn.gguf",
+                                        "--qwen35-mtp-draft", "3",
+                                        "--qwen35-mtp-window"])
+        args.qwen35_dflash2 = "dflash.gguf"
+        with self.assertRaisesRegex(ValueError, "cannot be combined"):
+            runner_command(args)
+
     def test_seed_uses_versioned_reference_sampler_request(self):
         backend = Backend.__new__(Backend)
         backend.lock = threading.Lock()

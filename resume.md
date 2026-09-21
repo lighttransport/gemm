@@ -210,15 +210,21 @@ protocol suite passes all 12 tests, including request cancellation, cache
 reuse, tool-call framing and diagnostic alignment.  DFlash2 is available with
 `--qwen35-dflash2 SIDECAR --qwen35-dflash2-draft 1..7`; its exact
 propose/verify/commit window is serialized per request.  A real two-request
-loopback test returned coherent output for both greedy and sampled requests;
-the DFlash sidecar currently replays each prompt because target snapshots do
-not yet include its private recurrent cache.  This favors output correctness
-over cache reuse until a sidecar snapshot is implemented.
+loopback test returned coherent output for both greedy and sampled requests.
+Target prompt snapshots now include the DFlash sidecar's private recurrent K/V
+cache and target Q8 KV rows, so repeated short prompts restore target and draft
+state without replaying the prompt.  Long prompts above the bounded snapshot
+budget continue to replay for memory safety.
 The reproducible GPU gate is `test_qwen35_dflash2_http.py`; it checks greedy
 and seeded sampled repeatability plus a coherent C++ response.
 The sampled random-64K target gate now passes 32 suffix tokens with prefix hash
 `90178de69a24a76e`, suffix hash `34e2f6bc082bc49f`, and `Result: PASS` after a
 445.67 tok/s prefix.
+
+Dense Qwen3.8 NextN is now selectable in the resident HTTP/stdio harness with
+`--qwen35-mtp SIDECAR --qwen35-mtp-draft N [--qwen35-mtp-window]`.  The command
+uses the validated Q8/Q8 server profile; exact speculative windows are used for
+greedy requests, while sampled requests remain on ordinary target decoding.
 
 CLI: `--qwen35-dflash2 SIDECAR --qwen35-dflash2-draft 1..7`; it currently
 requires benchmark mode, `--qwen35-batched-prefill`, `--qwen35-decode-graph`

@@ -1,8 +1,10 @@
 # Dense Qwen3.8 NextN on RDNA4
 
 This is a benchmark-runner and C API implementation for the dense Qwen3.5/3.8
-architecture. It does not use the Qwen4 MoE/HC speculative path. HTTP/stdio
-serving does not yet schedule these dense speculative windows.
+architecture. It does not use the Qwen4 MoE/HC speculative path. The resident
+HTTP/stdio server can schedule exact greedy windows with
+`--qwen35-mtp SIDECAR --qwen35-mtp-draft N`; sampled requests automatically
+use ordinary target decoding so sampler state remains exact.
 
 The target retains Q8 K **and** Q8 V. The draft sidecar owns its fusion weights,
 one attention/FFN block, output head and F16 KV. Its embedding stays mapped on
