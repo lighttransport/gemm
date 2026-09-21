@@ -274,7 +274,13 @@ The original checkpoint configuration is required; this is not a general
 Qwen3-VL loader. Host build, sm_120 NVRTC compilation, and GPU execution pass,
 but the first English-prompt GPU comparison **fails numerical acceptance**:
 full pre-norm cosine 0.9632453344, cropped-prompt cosine 0.9211241964.
-Per-layer diagnostics are being used to locate this large mismatch.
+Per-layer diagnostics exposed nondeterministic weight-upload ordering:
+cuBLAS uses a nonblocking stream, so it must wait for staged host-to-device
+copies before consuming each matrix. Explicit upload synchronization makes
+two native runs bit-exact and improves cosine to 0.9993278549 / 0.9994377151
+(full / cropped). BF16 rounding of unnormalized attention probabilities
+improves these further to **0.9994088823 / 0.9995524853**, still below the
+0.99996 gate. Further per-layer arithmetic diagnosis remains necessary.
 It is deliberately
 not the default generation encoder until comparison against captured
 `hidden_prenorm.npy` and cropped prompt embeddings meets the strict gate.

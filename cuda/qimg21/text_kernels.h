@@ -36,7 +36,7 @@ static const char *q21_text_src =
 "  for(int s=0;s<=t;s++) { float dot=0;\n"
 "    for(int e=0;e<4;e++)dot+=qr[e]*k[s*1024+kh*128+l+32*e];\n"
 "    for(int d=16;d;d>>=1)dot+=__shfl_xor_sync(0xffffffff,dot,d);\n"
-"    float p=expf(dot*0.08838834764831845f-mx); den+=p;\n"
+"    float p=expf(dot*0.08838834764831845f-mx); den+=p; p=rb(p);\n"
 "    for(int e=0;e<4;e++)acc[e]+=p*v[s*1024+kh*128+l+32*e];\n"
 "  }\n"
 "  for(int e=0;e<4;e++)o[t*4096+h*128+l+32*e]=rb(acc[e]/den);\n"

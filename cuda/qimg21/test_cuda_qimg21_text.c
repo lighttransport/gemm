@@ -20,7 +20,10 @@ static int text_linear(cuda_qimg_runner *r, qimg21_kernels *k,
     }
     CUdeviceptr w = upload_bf16(s, name);
     if (!w) return -1;
-    int rc = gemm(r, out, w, in_bf, n, no, ni);
+    /* The cuBLAS handle owns a separate stream. Pageable host-to-device
+     * copies may return after staging, before the device transfer finishes. */
+    int rc = cuCtxSynchronize();
+    if (!rc) rc = gemm(r, out, w, in_bf, n, no, ni);
     if (!rc) rc = launch_vec(k->round_bf16, r->stream, n * no, out);
     free_d(&w);
     return rc;
@@ -35,7 +38,8 @@ static int text_norm(cuda_qimg_runner *r, CUfunction fn, const qimg21_shards *s,
     CUdeviceptr w = upload_f32(s, name);
     if (!w) return -1;
     void *a[] = {&out, &in, &w, &d};
-    int rc = cuLaunchKernel(fn, rows, 1, 1, 256, 1, 1, 0, r->stream, a, NULL);
+    int rc = cuCtxSynchronize();
+    if (!rc) rc = cuLaunchKernel(fn, rows, 1, 1, 256, 1, 1, 0, r->stream, a, NULL);
     if (!rc) rc = cuStreamSynchronize(r->stream);
     free_d(&w);
     return rc;
