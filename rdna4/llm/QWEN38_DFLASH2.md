@@ -454,7 +454,9 @@ reflects the remaining measured costs.
    generic attention kernel ABI faulted under captured graph replay, even when
    the new body was disabled.  Use a separate verifier-only kernel and fuse
    the combine only if the selected split count and packed-F16 accumulation
-   order remain exact.
+   order remain exact.  A 64-thread exact merge probe retained the random
+   64K hashes but fell from 35.77 to 35.64 tok/s, so it was removed; reducing
+   partial traffic rather than only changing combine occupancy is still open.
 3. **Hybrid recurrent tail.** Sequential candidate recurrence and rollback
    checkpoints are already batched and device-local. Alpha/beta F16 work now
    shares one exact launch per recurrent layer, and convolution plus recurrent

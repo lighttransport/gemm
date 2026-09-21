@@ -18,6 +18,12 @@ adding a slower opt-in path.  The launcher now forwards the existing decode
 and prefill profile diagnostics through the production wrapper, making stage
 timing reproducible without changing serving defaults.
 
+A separate 64-thread split-combine kernel kept the random 64K prefix/suffix
+hashes exact but measured 35.64 tok/s versus 35.77 tok/s for the existing
+256-thread merge.  It was removed; the long-context verifier tail still needs
+a fused design that reduces global partial traffic without changing the
+captured graph ABI.
+
 ## 2026-09-22 continuation: bounded overlap and rejected candidates
 
 The ordinary IQ1 audit now reuses the exact Q8_1 activation bytes and FP16
