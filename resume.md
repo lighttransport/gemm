@@ -24,6 +24,11 @@ hashes exact but measured 35.64 tok/s versus 35.77 tok/s for the existing
 a fused design that reduces global partial traffic without changing the
 captured graph ABI.
 
+The scalar DeltaNet recurrence also received a restricted-pointer and
+four-way-unroll A/B.  Its 4K random gate stayed exact but slipped to 42.80
+tok/s from the 42.90 tok/s control, so the recurrent kernel remains unchanged;
+accepted-row checkpoint publication is still the safe optimization boundary.
+
 ## 2026-09-22 continuation: bounded overlap and rejected candidates
 
 The ordinary IQ1 audit now reuses the exact Q8_1 activation bytes and FP16

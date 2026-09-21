@@ -470,6 +470,8 @@ reflects the remaining measured costs.
    strides explicit, so a DFlash window commits only its accepted row. GPU
    HTTP and pinned llama.cpp gates retain greedy and seeded-sampled token/byte
    parity after this hardening.
+   A restricted-pointer/four-way-unroll DeltaNet scalar probe was exact but
+   moved the 4K random gate from 42.90 to 42.80 tok/s, so it was reverted.
    The verifier now also uses the existing fused Q/K normalize-and-expand
    kernel, removing three intermediate launches per recurrent layer while
    preserving the same per-head reduction order.
