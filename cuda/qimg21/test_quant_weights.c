@@ -4,9 +4,18 @@
 #include "quant_weights.h"
 
 int main(int argc, char **argv) {
-    if (argc != 5) return 2;
+    if (argc != 5 && argc != 6) return 2;
     size_t rows = strtoull(argv[2], NULL, 10), cols = strtoull(argv[3], NULL, 10);
-    uint16_t *out = q21_read_int8_matrix(argv[1], rows, cols);
+    uint16_t *out = NULL;
+    if (argc == 6 && !strcmp(argv[5], "--quantize")) {
+        st_context *st = safetensors_open(argv[1]);
+        if (!st) return 1;
+        int index = safetensors_find(st, "weight");
+        if (index >= 0 && safetensors_ndims(st, index) == 2 &&
+            safetensors_shape(st, index)[0] == rows && safetensors_shape(st, index)[1] == cols)
+            out = q21_quantize_matrix_on_load(st, index);
+        safetensors_close(st);
+    } else if (argc == 5) out = q21_read_int8_matrix(argv[1], rows, cols);
     if (!out) return 1;
     FILE *fp = fopen(argv[4], "wb");
     if (!fp) { free(out); return 1; }

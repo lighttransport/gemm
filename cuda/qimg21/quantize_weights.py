@@ -7,6 +7,7 @@ snapshot. This is weight compression, not an INT8 activation/GEMM backend.
 import argparse
 import json
 from pathlib import Path
+import shutil
 
 import numpy as np
 
@@ -34,6 +35,19 @@ def main():
     sources = sorted((args.model / "transformer").glob("diffusion_pytorch_model-*.safetensors"))
     if not sources:
         raise ValueError("no transformer shards found")
+    estimated = 0
+    for source in sources:
+        with safe_open(str(source), framework="pt", device="cpu") as shard:
+            for name in shard.keys():
+                shape = shard.get_slice(name).get_shape()
+                if len(shape) == 2:
+                    estimated += shape[0] * shape[1] + shape[0] * 4 + 4096
+    parent = args.out.resolve().parent
+    while not parent.exists():
+        parent = parent.parent
+    if shutil.disk_usage(parent).free < estimated + 64 * 1024 * 1024:
+        raise ValueError(f"INT8 export needs about {estimated / 2**30:.2f} GiB plus headroom; "
+                         "use native --quantize-on-load int8-row to avoid the disk copy")
     args.out.mkdir(parents=True, exist_ok=False)
     records = []
     for source in sources:

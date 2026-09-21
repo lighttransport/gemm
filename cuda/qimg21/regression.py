@@ -99,16 +99,19 @@ def main() -> int:
     ap.add_argument("--native-attention", choices=("math", "reverse64"), default="math")
     ap.add_argument("--quantized", action="store_true")
     ap.add_argument("--quantized-transformer", type=Path, help="Optional native row-INT8 package")
+    ap.add_argument("--quantize-on-load", choices=("int8-row",), help="Quantize each matrix without a disk export")
     ap.add_argument("--cosine-threshold", type=float)
     args = ap.parse_args()
     if args.native_attention != "math" and not args.native:
         ap.error("--native-attention requires --native")
-    if args.quantized_transformer:
+    if args.quantized_transformer and args.quantize_on_load:
+        ap.error("choose a package or quantize-on-load, not both")
+    if args.quantized_transformer or args.quantize_on_load:
         if not args.native:
-            ap.error("--quantized-transformer requires --native")
+            ap.error("quantized weights require --native")
         args.quantized = True
     elif args.quantized:
-        ap.error("--quantized requires an actual --quantized-transformer package")
+        ap.error("--quantized requires --quantized-transformer or --quantize-on-load")
 
     root = Path(__file__).resolve().parents[2]
     model = Path(args.model).resolve()
@@ -183,10 +186,13 @@ def main() -> int:
                                      "--guidance-scale", str(args.true_cfg_scale)])
                 if args.quantized_transformer:
                     guidance.extend(["--quantized-transformer", str(args.quantized_transformer.resolve())])
+                if args.quantize_on_load:
+                    guidance.extend(["--quantize-on-load", args.quantize_on_load])
                 timesteps = _load_timesteps(ref_dir, case.steps)
                 (run_dir / "native_config.json").write_text(json.dumps({
                     "attention": args.native_attention, "model": str(model),
                     "quantized_transformer": str(args.quantized_transformer.resolve()) if args.quantized_transformer else None,
+                    "quantize_on_load": args.quantize_on_load,
                     "dtype": args.dtype, "timesteps": timesteps,
                     "case": case.name, "prompt": args.prompt,
                     "negative_prompt": args.negative_prompt, "true_cfg_scale": args.true_cfg_scale,

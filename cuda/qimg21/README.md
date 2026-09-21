@@ -66,8 +66,24 @@ reject invalid scales, shapes, and payloads:
 Full-checkpoint export, GPU model parity, image quality, and quantizer-specific
 threshold calibration remain unverified. The `0.995` quantized model-output
 gate is still provisional, not measured acceptance. The regression driver
-selects it only when an actual quantized package is supplied; `--quantized`
+selects it only when an actual quantized package or quantize-on-load mode is supplied; `--quantized`
 alone cannot relabel a BF16 run as a quantized experiment.
+
+When disk space is limited, pass `--quantize-on-load int8-row` instead of
+`--quantized-transformer DIR` to the native executable, `native_generate.py`,
+or `regression.py --native`. This applies the identical symmetric row-INT8
+quantization/reconstruction to one original matrix at a time, without a
+second model copy. CPU tests verify bit-exact equivalence to exported packages
+for BF16/F32 inputs, zero rows, and half-integer rounding ties. This avoids
+disk storage, not quantization error or CPU quantization cost; matrices are
+re-quantized on each load. Package export checks available disk space before
+creating its output directory. On the saved 256x256/seed42 matched-input
+fixture, streamed INT8 denoiser cosine is **0.9995792302** at the low timestep
+and **0.9999601303** at timestep 1, with finite outputs (relative L2 0.02904
+and 0.00896). Both clear the provisional 0.995 gate. A tighter 0.999 candidate
+gate is being tested on additional seeds/resolutions; these first two cases
+alone do not establish calibration or image quality. Full exported-model GPU
+loading remains untested because the workspace lacks space for the copy.
 
 Current native BF16 arithmetic explicitly rounds the text projection before
 GELU and Q/K normalization before multiplication by the learned RMS weights.

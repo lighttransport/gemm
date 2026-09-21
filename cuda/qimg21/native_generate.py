@@ -91,8 +91,11 @@ def main() -> int:
     ap.add_argument("--native-attention", choices=("math", "reverse64"), default="math")
     ap.add_argument("--quantized-transformer", type=Path,
                     help="Optional experimental row-INT8 transformer package")
+    ap.add_argument("--quantize-on-load", choices=("int8-row",))
     ap.add_argument("--native-vae", action="store_true", help="Decode with the native F32 CUDA VAE (experimental)")
     args = ap.parse_args()
+    if args.quantized_transformer and args.quantize_on_load:
+        ap.error("choose a quantized package or quantize-on-load, not both")
 
     root = Path(__file__).resolve().parents[2]
     model = Path(args.model).resolve()
@@ -208,6 +211,8 @@ def main() -> int:
         ])
     if args.quantized_transformer:
         native_command.extend(["--quantized-transformer", str(args.quantized_transformer.resolve())])
+    if args.quantize_on_load:
+        native_command.extend(["--quantize-on-load", args.quantize_on_load])
     _run(native_command, cwd=root)
     if args.native_vae:
         from PIL import Image

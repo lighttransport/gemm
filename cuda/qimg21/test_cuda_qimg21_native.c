@@ -171,17 +171,22 @@ static st_context *find_tensor(const qimg21_shards *s, const char *name, int *id
 }
 
 static const char *qimg21_quantized_transformer;
+static int qimg21_quantize_on_load;
 
 static CUdeviceptr upload_bf16(const qimg21_shards *s, const char *name) {
     int idx; st_context *st = find_tensor(s, name, &idx);
     if (!st) { fprintf(stderr, "native: missing tensor %s\n", name); return 0; }
-    if (qimg21_quantized_transformer && safetensors_ndims(st, idx) == 2) {
+    if ((qimg21_quantized_transformer || qimg21_quantize_on_load) && safetensors_ndims(st, idx) == 2) {
         const uint64_t *shape = safetensors_shape(st, idx);
         char path[2048];
-        int len = snprintf(path, sizeof(path), "%s/%s.safetensors", qimg21_quantized_transformer, name);
-        if (len < 0 || len >= (int)sizeof(path)) return 0;
-        uint16_t *data = q21_read_int8_matrix(path, shape[0], shape[1]);
-        if (!data) { fprintf(stderr, "native: invalid/missing INT8 matrix %s\n", path); return 0; }
+        uint16_t *data;
+        if (qimg21_quantize_on_load) data = q21_quantize_matrix_on_load(st, idx);
+        else {
+            int len = snprintf(path, sizeof(path), "%s/%s.safetensors", qimg21_quantized_transformer, name);
+            if (len < 0 || len >= (int)sizeof(path)) return 0;
+            data = q21_read_int8_matrix(path, shape[0], shape[1]);
+        }
+        if (!data) { fprintf(stderr, "native: invalid/missing INT8 matrix %s\n", name); return 0; }
         size_t bytes = (size_t)shape[0] * shape[1] * 2;
         CUdeviceptr d = checked_cuMemAlloc(bytes);
         if (d && cuMemcpyHtoD(d, data, bytes) != CUDA_SUCCESS) { cuMemFree(d); d = 0; }
@@ -459,6 +464,10 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--model") && i + 1 < argc) model = argv[++i];
         else if (!strcmp(argv[i], "--quantized-transformer") && i + 1 < argc) qimg21_quantized_transformer = argv[++i];
+        else if (!strcmp(argv[i], "--quantize-on-load") && i + 1 < argc) {
+            if (strcmp(argv[++i], "int8-row")) return 2;
+            qimg21_quantize_on_load = 1;
+        }
         else if (!strcmp(argv[i], "--attention") && i + 1 < argc) {
             const char *mode = argv[++i];
             if (!strcmp(mode, "reverse64")) qimg21_attention_reverse64 = 1;
@@ -487,6 +496,10 @@ int main(int argc, char **argv) {
         }
     }
     if (steps < 1 || steps > 100 || (manual_t >= 0.0f && steps != 1)) return 2;
+    if (qimg21_quantize_on_load && qimg21_quantized_transformer) {
+        fprintf(stderr,"native: choose a quantized package or quantize-on-load, not both\n"); return 2;
+    }
+    if (qimg21_quantize_on_load) fprintf(stderr,"native: row-INT8 quantization on load; BF16 compute, no exported copy\n");
     if (qimg21_quantized_transformer) {
         char path[2048], format[64];
         int len = snprintf(path, sizeof(path), "%s/format.txt", qimg21_quantized_transformer);
