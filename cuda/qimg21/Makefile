@@ -1,6 +1,6 @@
 PYTHON ?= ../../tmp/qimg21-ref-venv/bin/python
 
-.PHONY: all setup generate reference compare regress native clean
+.PHONY: all setup generate reference compare regress native native-vae clean
 
 all: test_cuda_qimg21 native
 
@@ -8,12 +8,19 @@ test_cuda_qimg21: test_cuda_qimg21.py
 	@chmod +x test_cuda_qimg21.py
 	@ln -sf test_cuda_qimg21.py test_cuda_qimg21
 
-native: test_cuda_qimg21_native
+native: test_cuda_qimg21_native test_cuda_qimg21_vae
 
 test_cuda_qimg21_native: test_cuda_qimg21_native.c ../../cuda/cuew.c ../../cuda/cublasew.c
 	$(CC) -O2 -std=c11 -D_GNU_SOURCE -Wall -Wextra -I../../common -I../../cuda -I../qimg \
 		-o $@ test_cuda_qimg21_native.c ../../cuda/cuew.c ../../cuda/cublasew.c \
 		-ldl -lm -lpthread
+
+test_cuda_qimg21_vae: test_cuda_qimg21_vae.c ../../cuda/cuew.c ../../cuda/cublasew.c
+	$(CC) -O2 -std=c11 -D_GNU_SOURCE -Wall -Wextra -I../../common -I../../cuda -I../qimg \
+		-o $@ test_cuda_qimg21_vae.c ../../cuda/cuew.c ../../cuda/cublasew.c \
+		-ldl -lm -lpthread
+
+native-vae: test_cuda_qimg21_vae
 
 setup:
 	./setup_reference.sh
@@ -35,4 +42,4 @@ regress:
 	$(PYTHON) regression.py --model /mnt/nvme01/models/qimg-21
 
 clean:
-	rm -f test_cuda_qimg21 test_cuda_qimg21_native qwen_image21.png
+	rm -f test_cuda_qimg21 test_cuda_qimg21_native test_cuda_qimg21_vae qwen_image21.png

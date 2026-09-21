@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run native Qwen-Image 2.1 denoising and decode with the official VAE.
+"""Run native Qwen-Image 2.1 denoising with an optional native CUDA VAE.
 
 The text encoder remains the validated Diffusers boundary for now.  This
 driver turns its prompt embedding into an F32 fixture, invokes the native
@@ -88,6 +88,7 @@ def main() -> int:
     ap.add_argument("--work-dir", default="tmp/qimg21-native-generate")
     ap.add_argument("--out", default="tmp/qimg21-native-generate.png")
     ap.add_argument("--native-bin", default="cuda/qimg21/test_cuda_qimg21_native")
+    ap.add_argument("--native-vae", action="store_true", help="Decode with the native F32 CUDA VAE (experimental)")
     args = ap.parse_args()
 
     root = Path(__file__).resolve().parents[2]
@@ -105,6 +106,8 @@ def main() -> int:
         raise SystemExit(f"model directory does not exist: {model}")
     if not native_bin.exists():
         raise SystemExit(f"native executable not found: {native_bin}; run `make -C cuda/qimg21 native` first")
+    if args.native_vae and not (root / "cuda/qimg21/test_cuda_qimg21_vae").exists():
+        raise SystemExit("native VAE executable missing; run `make -C cuda/qimg21 native`")
     if args.height % 32 or args.width % 32:
         raise SystemExit("height and width must be divisible by 32")
     if args.steps < 1 or args.steps > 100:
@@ -200,7 +203,24 @@ def main() -> int:
             str(args.true_cfg_scale),
         ])
     _run(native_command, cwd=root)
-    _decode_vae(model, native_latents, out, args.height, args.width, args.dtype)
+    if args.native_vae:
+        from PIL import Image
+
+        decoded_path = work / "native_decoded.npy"
+        _run([
+            str(root / "cuda/qimg21/test_cuda_qimg21_vae"),
+            "--model", str(model / "vae"), "--latents", str(native_latents),
+            "--height-tokens", str(args.height // 16),
+            "--width-tokens", str(args.width // 16), "--out", str(decoded_path),
+        ], cwd=root)
+        decoded = np.load(decoded_path)
+        if decoded.shape != (4, args.height, args.width) or not np.isfinite(decoded).all():
+            raise SystemExit("native VAE returned an invalid RGBA tensor")
+        pixels = np.rint(np.clip(decoded * 0.5 + 0.5, 0, 1) * 255).astype(np.uint8)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        Image.fromarray(pixels.transpose(1, 2, 0)).save(out)
+    else:
+        _decode_vae(model, native_latents, out, args.height, args.width, args.dtype)
     print(f"native denoise trace: {steps_dir}")
     print(f"fixtures: {work}")
     return 0

@@ -162,5 +162,34 @@ tmp/qimg21-ref-venv/bin/python cuda/qimg21/native_generate.py \
 The work directory contains `prompt/prompt_embeds.npy`, the deterministic
 initial `latents.npy`, one `steps/step_XXX.npy` file per Euler update, and the
 final `native_latents.npy`. These arrays are the hand-off points for comparing
-the native transformer/scheduler against the PyTorch reference before a native
-text encoder or VAE port is attempted.
+the native transformer/scheduler against the PyTorch reference.
+
+Add `--native-vae` to use the native F32 CUDA decoder. It reads the original
+VAE safetensors, applies latent denormalization and the learned post-quant
+convolution, then runs the residual/attention/upsampling graph and clamps the
+RGBA result. Text encoding still uses Python. This decoder supports single
+images; encoding/editing and larger-resolution memory validation remain work
+in progress. Its kernels and residual copies share the default CUDA stream
+to avoid races with the shared VAE helpers' synchronous device copies.
+
+Reproduce the decoder comparison with:
+
+```sh
+make -C cuda/qimg21 native-vae
+tmp/qimg21-ref-venv/bin/python cuda/qimg21/vae_regression.py
+```
+
+The deterministic cases are 128x128/seed17, 256x256/seed42, and
+128x256/seed123. On the RTX 5060 Ti, their minimum output cosine against the
+official F32 PyTorch VAE with TF32 disabled was 0.99999999935, with maximum
+mean absolute error 0.00000332 and finite outputs throughout. The script
+enforces cosine >= 0.99996 and writes inputs, outputs, and results under
+`tmp/qimg21-vae-regression`. These decoder results do not establish denoiser
+or full-pipeline acceptance. `--case HEIGHTxWIDTH:SEED` is repeatable for
+additional coverage.
+
+The additional 512x512/seed42 F32 decoder comparison passed with cosine
+0.99999999951 (native subprocess including startup: 12.04 seconds). Native
+1024x1024 decoding completed, but the untiled F32 PyTorch reference ran out
+of VRAM on this GPU; its 1024 parity is therefore unverified. This is not
+the requested 1024x1024/40-step generation benchmark, which remains pending.
