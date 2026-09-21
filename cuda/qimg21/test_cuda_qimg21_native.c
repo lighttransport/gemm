@@ -102,7 +102,7 @@ static int npy_read_f32(const char *path, npy_f32 *out) {
 
 static int npy_write_f32(const char *path, const float *x, size_t n, int d0, int d1) {
     FILE *fp = fopen(path, "wb");
-    if (!fp) return -1;
+    if (!fp) { fprintf(stderr, "native: cannot write %s: %s\n", path, strerror(errno)); return -1; }
     char hdr[256];
     int len = snprintf(hdr, sizeof(hdr), "{'descr': '<f4', 'fortran_order': False, 'shape': (%d, %d), }", d0, d1);
     int padded = ((len + 10 + 63) / 64) * 64 - 10;
@@ -112,11 +112,15 @@ static int npy_write_f32(const char *path, const float *x, size_t n, int d0, int
     memset(body, ' ', (size_t)padded);
     memcpy(body, hdr, (size_t)len);
     body[padded - 1] = '\n';
-    fwrite("\x93NUMPY\x01\x00", 1, 8, fp);
     uint16_t h = (uint16_t)padded;
-    fwrite(&h, 2, 1, fp); fwrite(body, 1, (size_t)padded, fp);
-    int ok = fwrite(x, sizeof(float), n, fp) == n ? 0 : -1;
-    fclose(fp); return ok;
+    int ok = fwrite("\x93NUMPY\x01\x00", 1, 8, fp) == 8 &&
+             fwrite(&h, 2, 1, fp) == 1 &&
+             fwrite(body, 1, (size_t)padded, fp) == (size_t)padded &&
+             fwrite(x, sizeof(float), n, fp) == n ? 0 : -1;
+    /* Buffered writes can succeed even when the final flush fails (ENOSPC). */
+    if (fclose(fp) != 0) ok = -1;
+    if (ok) fprintf(stderr, "native: failed writing %s; output may be incomplete\n", path);
+    return ok;
 }
 
 /* Optional full-tensor stage dumps used to close the native/PyTorch parity
@@ -124,6 +128,7 @@ static int npy_write_f32(const char *path, const float *x, size_t n, int d0, int
  * back to the host. */
 static const char *qimg21_stage_dir;
 static int qimg21_stage_block = 0;
+static int qimg21_stage_error;
 
 static void dump_stage(const char *label, CUdeviceptr d, size_t n, int d0, int d1) {
     if (!qimg21_stage_dir) return;
@@ -144,11 +149,11 @@ static void dump_stage(const char *label, CUdeviceptr d, size_t n, int d0, int d
     }
     char path[1024];
     float *h = (float *)malloc(n * sizeof(float));
-    if (!h) return;
+    if (!h) { qimg21_stage_error = 1; return; }
     if (cuMemcpyDtoH(h, d, n * sizeof(float)) == CUDA_SUCCESS) {
         snprintf(path, sizeof(path), "%s/%s.npy", qimg21_stage_dir, label);
-        npy_write_f32(path, h, n, d0, d1);
-    }
+        if (npy_write_f32(path, h, n, d0, d1)) qimg21_stage_error = 1;
+    } else qimg21_stage_error = 1;
     free(h);
 }
 
@@ -698,22 +703,23 @@ int main(int argc, char **argv) {
                 pred[j]=qimg21_round_bf16_host(neg_pred[j]+guided);
             }
         }
+        if (qimg21_stage_error) { fprintf(stderr, "native: stage capture failed\n"); rc = 1; }
         if (rc != 0) break;
         if (pred_dir) {
             char pred_path[1024];
             snprintf(pred_path, sizeof(pred_path), "%s/pred_%03d.npy", pred_dir, i);
-            npy_write_f32(pred_path, pred, (size_t)ni * 64, ni, 64);
+            if (npy_write_f32(pred_path, pred, (size_t)ni * 64, ni, 64)) { rc = 1; break; }
         }
         qimg21_euler_bf16(la.data,pred,(size_t)ni*64,sigmas[i],sigmas[i+1]);
         if (dump_dir) {
             char step_path[1024];
             snprintf(step_path, sizeof(step_path), "%s/step_%03d.npy", dump_dir, i);
-            npy_write_f32(step_path, la.data, (size_t)ni * 64, ni, 64);
+            if (npy_write_f32(step_path, la.data, (size_t)ni * 64, ni, 64)) { rc = 1; break; }
         }
     }
     if (rc == 0) {
-        npy_write_f32(out_path, la.data, (size_t)ni * 64, ni, 64);
-        fprintf(stderr, "native: wrote %s (%d tokens x 64, %d steps)\n", out_path, ni, steps);
+        if (npy_write_f32(out_path, la.data, (size_t)ni * 64, ni, 64)) rc = 1;
+        else fprintf(stderr, "native: wrote %s (%d tokens x 64, %d steps)\n", out_path, ni, steps);
     }
     free(pred); free(neg_pred); free(sigmas); cuModuleUnload(m); for(int i=0;i<s.n;i++)safetensors_close(s.st[i]);
     q21_edit_free(&edit);q21_edit_free(&negative_edit);free(packed);npy_free(&condition);

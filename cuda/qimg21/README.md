@@ -510,7 +510,7 @@ cosine 0.999999999837.
 
 Both Python wrappers now accept `--native-normalization` and `--native-rope`
 alongside `--native-attention`; regression records them in `native_config.json`.
-Broader validation is running with:
+Broader validation was run with:
 
 ```sh
 OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=1 tmp/qimg21-ref-venv/bin/python cuda/qimg21/regression.py \
@@ -525,13 +525,30 @@ The original matrix process subsequently exited during the rectangular case
 when the filesystem filled. Its partial remaining cases are not acceptance
 evidence. After space recovery, the two unfinished cases were restarted in
 `tmp/qimg21-accurate-regression-remaining` with fresh outputs.
+The restarted cases completed but **failed** the unchanged 0.99996 gate:
+256x512/seed123 predictions were 0.999991815 / **0.999937836**, while
+512x512/seed7 predictions were 0.999988945 / 0.999992314 / 0.999991200 /
+**0.999946099**. All six trajectory checkpoints passed (minimum 0.999980070).
+The combined configuration therefore remains experimental; passing trajectories
+does not override failed matched-input predictions.
 Completed large replay outputs may be compressed as `.npy.gz`; decompress
 before using the replay commands. The original forward-MMA candidate can be
 regenerated from its preserved Q/K/V and layout; its metrics remain recorded.
 
 `editing_regression.py` also accepts and records the same three native
-accuracy options. Positive-only editing validation with this combination is
-queued after the restarted matrix, not yet accepted.
+accuracy options. Positive-only editing validation with this combination
+completed in `tmp/qimg21-edit-accurate-regression`: the high prediction passes
+at **0.9999689764854415**, but the low prediction **0.999887702401766** and
+trajectory **0.999957597830316 / 0.9999571642207834** fail. Editing is not
+accepted. Native output now propagates header, payload and close/flush errors
+to a nonzero runner status, including requested diagnostic captures; incomplete
+files must not be used as reference evidence. CPU coverage exercises successful
+NPY round-trip, missing output parent, and delayed `/dev/full` flush failure:
+
+```sh
+TMPDIR="$PWD/tmp" make -C cuda/qimg21 test_scheduler
+tmp/qimg21-ref-venv/bin/python cuda/qimg21/test_native_output.py
+```
 
 Compare the replay without loading PyTorch or allocating GPU memory:
 
