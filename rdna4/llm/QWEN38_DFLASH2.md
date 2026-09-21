@@ -80,6 +80,11 @@ temperature-0.6, seed-42 suffix retains prefix hash `90178de69a24a76e`,
 produces suffix hash `34e2f6bc082bc49f`, and completes 32 tokens with
 `Result: PASS` after a 445.67 tok/s random prefix.
 
+Grouped verifier attention now combines split partials and applies the Q8
+attention gate in one launch.  The pinned greedy and sampled reference gate
+still reports identical tokens, EOS, and output bytes, with warm K=7 decode
+above 60 tok/s.
+
 The reference validator accepts the sidecar directly:
 
 ```sh

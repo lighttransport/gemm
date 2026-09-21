@@ -67,6 +67,7 @@ static double hllm_monotonic_ms(void) {
 #include "qwen35_matvec_q2k.inc"
 #include "qwen35_matvec_iq.inc"
 #include "qwen35_attention_q8.inc"
+#include "qwen35_attention_q8_gate.inc"
 #include "qwen35_dflash2.inc"
 
 #ifdef LLM_HIPBLASLT_ENABLED
@@ -13907,10 +13908,12 @@ struct hip_llm_runner {
     int requested_qwen35_native_q8_attention;
     hipModule_t q8_attention_module;
     hipModule_t q8_prefill_module;
+    hipModule_t q8_gate_module;
     hipFunction_t fn_q8_attention_decode, fn_q8_attention_decode_gqa3;
     hipFunction_t fn_q8_attention_decode_gqa3_reuse;
     hipFunction_t fn_q8_attention_decode_reuse8;
     hipFunction_t fn_q8_attention_combine;
+    hipFunction_t fn_q8_attention_combine_gate;
     hipFunction_t fn_q8_attention_prefill_wmma;
     void *d_q8_attention_parts, *d_q8_attention_meta;
     int q8_attention_max_splits, q8_attention_nsm;
@@ -17908,6 +17911,11 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
                   "qwen35_attention_q8_decode_reuse8"));
         CHECK_HIP(hipModuleGetFunction(&r->fn_q8_attention_combine,
                   r->q8_attention_module, "qwen35_attention_q8_combine"));
+        if (hip_compile_kernels_ex(&r->q8_gate_module, r->device,
+                qwen35_attention_q8_gate_source, "qwen35_attention_q8_gate.hip",
+                r->verbose, "qwen35_attention_q8_gate", 0) <= 0) return -1;
+        CHECK_HIP(hipModuleGetFunction(&r->fn_q8_attention_combine_gate,
+                  r->q8_gate_module, "qwen35_attention_q8_combine_gate"));
         if (hip_compile_kernels_ex(&r->q8_prefill_module, r->device,
                 qwen35_attention_q8_source, "qwen35_attention_q8_prefill.hip", r->verbose,
                 "qwen35_attention_q8_prefill", 0) <= 0) return -1;
@@ -22741,7 +22749,7 @@ static inline void launch_attn_decode_native_q8(hip_llm_runner *r, void *out,
 
 static inline void launch_attn_verify_native_q8(hip_llm_runner *r, void *out,
         void *parts, void *meta, void *q, void *k, void *v, void *ks,
-        void *vs, void *positions, int queries, int group_queries) {
+        void *vs, void *positions, void *gate, int queries, int group_queries) {
     /* Expose the exact verifier window in one launch. Up to eight queries use
      * the measured eight-split shared-K/V schedule; wider dense-NextN windows
      * retain the scalar split selector. Each query reads its device-resident
@@ -22763,10 +22771,19 @@ static inline void launch_attn_verify_native_q8(hip_llm_runner *r, void *out,
                launch_splits, r->n_heads,
                32, 4, 1, 0, r->stream, a);
     }
-    void *b[] = { &out, &parts, &meta, &positions, &r->n_heads,
-        &r->q8_attention_nsm, &occupancy, &forced_splits };
-    LAUNCH(r->fn_q8_attention_combine, r->n_heads, queries, 1, 256, 1, 1,
-           (size_t)r->q8_attention_max_splits * 2 * sizeof(float), r->stream, b);
+    if (gate && r->fn_q8_attention_combine_gate) {
+        void *b[] = { &out, &parts, &meta, &gate, &positions, &r->n_heads,
+            &r->q8_attention_nsm, &occupancy, &forced_splits };
+        LAUNCH(r->fn_q8_attention_combine_gate, r->n_heads, queries, 1,
+               256, 1, 1,
+               (size_t)r->q8_attention_max_splits * 2 * sizeof(float),
+               r->stream, b);
+    } else {
+        void *b[] = { &out, &parts, &meta, &positions, &r->n_heads,
+            &r->q8_attention_nsm, &occupancy, &forced_splits };
+        LAUNCH(r->fn_q8_attention_combine, r->n_heads, queries, 1, 256, 1, 1,
+               (size_t)r->q8_attention_max_splits * 2 * sizeof(float), r->stream, b);
+    }
 }
 
 static int launch_attn_prefill_native_q8(hip_llm_runner *r, void *out,
@@ -32615,6 +32632,7 @@ void hip_llm_free(hip_llm_runner *r) {
     if (r->d_q8_prefill_meta) hipFree(r->d_q8_prefill_meta);
     if (r->q8_attention_module) hipModuleUnload(r->q8_attention_module);
     if (r->q8_prefill_module) hipModuleUnload(r->q8_prefill_module);
+    if (r->q8_gate_module) hipModuleUnload(r->q8_gate_module);
     if (r->module) hipModuleUnload(r->module);
 
 #ifdef LLM_HIPBLASLT_ENABLED

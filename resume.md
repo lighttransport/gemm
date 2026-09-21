@@ -226,6 +226,11 @@ Dense Qwen3.8 NextN is now selectable in the resident HTTP/stdio harness with
 uses the validated Q8/Q8 server profile; exact speculative windows are used for
 greedy requests, while sampled requests remain on ordinary target decoding.
 
+The dense verifier now fuses Q8 attention split-combine with the per-head gate
+for grouped verifier windows.  The ordinary decode path is unchanged.  The
+full pinned reference validator preserves greedy and sampled token streams,
+EOS, and output bytes; warm DFlash K=7 decode remains above 60 tok/s.
+
 CLI: `--qwen35-dflash2 SIDECAR --qwen35-dflash2-draft 1..7`; it currently
 requires benchmark mode, `--qwen35-batched-prefill`, `--qwen35-decode-graph`
 and `--kv-cache q8q8`.  `validate_qwen38_reference.py` accepts `--dflash2`
