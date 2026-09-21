@@ -36,7 +36,7 @@ class TextCaptureTest(unittest.TestCase):
         expected = encoder(input_ids=ids, attention_mask=mask)
         with tempfile.TemporaryDirectory(dir=root / "tmp", prefix="qimg21-text-") as work:
             folder = Path(work)
-            with capture_text_encoder(pipe, folder):
+            with capture_text_encoder(pipe, folder, stage_layer=0):
                 actual = encoder(input_ids=ids, attention_mask=mask)
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
             saved_ids = np.load(folder / "input_ids.npy")
@@ -46,6 +46,7 @@ class TextCaptureTest(unittest.TestCase):
                                           ids[..., None].expand(-1, -1, 4).bfloat16().float().numpy())
             metadata = json.loads((folder / "capture.json").read_text())
             self.assertEqual(metadata["drop_idx"], 2)
+            self.assertEqual(metadata["stage_layer"], 0)
             self.assertEqual(metadata["norm_calls"], 1)
             self.assertFalse(encoder._forward_pre_hooks)
             self.assertFalse(encoder.model.language_model.norm._forward_pre_hooks)

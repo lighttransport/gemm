@@ -61,6 +61,8 @@ def main():
     ap.add_argument("--negative-prompt")
     ap.add_argument("--work-dir", type=Path, default=Path("tmp/qimg21-text-regression"))
     ap.add_argument("--reference-dir", type=Path, help="Reuse an explicit existing text-stage capture")
+    ap.add_argument("--native-attention", choices=("custom", "cutlass-efficient", "flash-exact"),
+                    default="flash-exact")
     args = ap.parse_args()
     root = Path(__file__).resolve().parents[2]
     work = args.work_dir.resolve()
@@ -86,7 +88,7 @@ def main():
         hidden_path = candidate / "hidden.npy"
         subprocess.run([str(root / "cuda/qimg21/test_cuda_qimg21_text"),
                         "--model", str(args.model.resolve()), "--tokens", str(token_path),
-                        "--out", str(hidden_path)], check=True)
+                        "--attention", args.native_attention, "--out", str(hidden_path)], check=True)
         got = np.load(hidden_path, allow_pickle=False)
         results[branch] = {"full_prenorm": compare_hidden(hidden, got),
                            "cropped_prompt": compare_hidden(cropped, got[drop:])}

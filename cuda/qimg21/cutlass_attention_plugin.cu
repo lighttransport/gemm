@@ -134,3 +134,60 @@ extern "C" int q21_cutlass_attention(float *out, const void *q, const void *k,
     if (error != cudaSuccess) return error;
     return lse_error == cudaSuccess ? output_error : lse_error;
 }
+
+/* Text-only causal GQA entry point. Q is [N,32,128], K/V are [N,8,128]. */
+extern "C" int q21_cutlass_text_attention(float *out, const void *q,
+                                            const void *k, const void *v,
+                                            int tokens, cudaStream_t stream) {
+    if (!out || !q || !k || !v || tokens <= 0) return cudaErrorInvalidValue;
+    constexpr int query_heads = 32, kv_heads = 8, head_dim = 128;
+    typename q21_kernel::Params params;
+    params.query_ptr = static_cast<const cutlass::bfloat16_t *>(q);
+    params.key_ptr = static_cast<const cutlass::bfloat16_t *>(k);
+    params.value_ptr = static_cast<const cutlass::bfloat16_t *>(v);
+    cutlass::bfloat16_t *output = nullptr;
+    float *lse = nullptr;
+    int lse_queries = ((tokens + q21_kernel::kAlignLSE - 1) /
+                       q21_kernel::kAlignLSE) * q21_kernel::kAlignLSE;
+    cudaError_t error = cudaMalloc(&output, static_cast<size_t>(tokens) *
+                                   query_heads * head_dim * sizeof(*output));
+    if (error != cudaSuccess) return error;
+    error = cudaMalloc(&lse, static_cast<size_t>(lse_queries) * query_heads * sizeof(*lse));
+    if (error != cudaSuccess) {
+        cudaFree(output);
+        return error;
+    }
+    params.output_ptr = output;
+    params.logsumexp_ptr = lse;
+    params.scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(head_dim)));
+    params.head_dim = params.head_dim_value = head_dim;
+    params.num_queries = params.num_keys = params.num_keys_absolute = tokens;
+    params.custom_mask_type = q21_kernel::CausalFromTopLeft;
+    params.q_strideM = query_heads * head_dim;
+    params.k_strideM = params.v_strideM = kv_heads * head_dim;
+    params.o_strideM = query_heads * head_dim;
+    params.q_strideH = params.k_strideH = params.v_strideH = head_dim;
+    params.q_strideB = static_cast<int64_t>(tokens) * query_heads * head_dim;
+    params.k_strideB = params.v_strideB = static_cast<int64_t>(tokens) * kv_heads * head_dim;
+    params.num_batches = 1;
+    params.num_heads = query_heads;
+    params.q_heads_per_kv = query_heads / kv_heads;
+    size_t shared_bytes = sizeof(typename q21_kernel::SharedStorage);
+    error = cudaFuncSetAttribute(q21_cutlass_attention_kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(shared_bytes));
+    if (error == cudaSuccess) {
+        dim3 grid((tokens + q21_kernel::kQueriesPerBlock - 1) /
+                  q21_kernel::kQueriesPerBlock, query_heads, 1);
+        q21_cutlass_attention_kernel<<<grid, params.getThreadsGrid(), shared_bytes, stream>>>(params);
+        error = cudaGetLastError();
+    }
+    if (error == cudaSuccess) {
+        int count = tokens * query_heads * head_dim;
+        q21_cutlass_bf16_to_f32<<<(count + 255) / 256, 256, 0, stream>>>(out, output, count);
+        error = cudaGetLastError();
+    }
+    cudaError_t lse_error = cudaFree(lse);
+    cudaError_t output_error = cudaFree(output);
+    if (error != cudaSuccess) return error;
+    return lse_error == cudaSuccess ? output_error : lse_error;
+}

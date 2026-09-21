@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Experimental native Qwen3-VL encoder with a Python tokenizer boundary.
+"""Validated native Qwen3-VL encoder with a Python tokenizer boundary.
 
-Not yet a validated replacement for the reference encoder. --prepare-only
-does not load model weights or initialize CUDA.
+The default exact FlashAttention path requires ``make native-exact``.
+``--prepare-only`` does not load model weights or initialize CUDA.
 """
 import argparse
 import json
@@ -41,7 +41,7 @@ def prepare(model: Path, prompt: str, work: Path) -> int:
     (work / "tokens.txt").write_text("\n".join(str(int(v)) for v in ids[0]) + "\n")
     (work / "prepare.json").write_text(json.dumps(
         {"model": str(model), "prompt": prompt, "drop_idx": drop,
-         "tokens": int(ids.shape[1]), "native_parity_validated": False}, indent=2) + "\n")
+         "tokens": int(ids.shape[1]), "native_parity_validated": True}, indent=2) + "\n")
     return drop
 
 
@@ -52,6 +52,8 @@ def main():
     ap.add_argument("--work-dir", type=Path, default=Path("tmp/qimg21-native-text"))
     ap.add_argument("--out", type=Path, default=Path("tmp/qimg21-native-text/prompt_embeds.npy"))
     ap.add_argument("--prepare-only", action="store_true")
+    ap.add_argument("--native-attention", choices=("custom", "cutlass-efficient", "flash-exact"),
+                    default="flash-exact")
     args = ap.parse_args()
     drop = prepare(args.model.resolve(), args.prompt, args.work_dir)
     if not args.prepare_only:
@@ -59,6 +61,7 @@ def main():
         args.out.parent.mkdir(parents=True, exist_ok=True)
         subprocess.run([str(root / "cuda/qimg21/test_cuda_qimg21_text"),
                         "--model", str(args.model.resolve()), "--tokens", str(args.work_dir / "tokens.txt"),
+                        "--attention", args.native_attention,
                         "--drop-prefix", str(drop), "--out", str(args.out)], check=True)
 
 

@@ -57,7 +57,7 @@ def _save_array(path: Path, value) -> None:
 
 
 def _dump_prompt(pipe, prompt: str, out_dir: Path, image=None, negative_prompt: str | None = None,
-                 dump_text_stages: bool = False) -> None:
+                 dump_text_stages: bool = False, text_stage_layer: int = 0) -> None:
     torch = _torch()
     from text_capture import capture_text_encoder
 
@@ -65,7 +65,7 @@ def _dump_prompt(pipe, prompt: str, out_dir: Path, image=None, negative_prompt: 
     if image is not None and not isinstance(image, (list, tuple)):
         image = [image]
 
-    with torch.inference_mode(), (capture_text_encoder(pipe, out_dir / "text_positive")
+    with torch.inference_mode(), (capture_text_encoder(pipe, out_dir / "text_positive", text_stage_layer)
                                   if dump_text_stages else nullcontext()):
         embeds, mask, image_mask = pipe.encode_prompt(
             prompt=prompt,
@@ -77,7 +77,7 @@ def _dump_prompt(pipe, prompt: str, out_dir: Path, image=None, negative_prompt: 
     _save_array(out_dir / "prompt_mask.npy", mask if mask is not None else np.ones(embeds.shape[:2], dtype=np.bool_))
     _save_array(out_dir / "image_pad_mask.npy", image_mask)
     if negative_prompt is not None:
-        with torch.inference_mode(), (capture_text_encoder(pipe, out_dir / "text_negative")
+        with torch.inference_mode(), (capture_text_encoder(pipe, out_dir / "text_negative", text_stage_layer)
                                       if dump_text_stages else nullcontext()):
             negative_embeds, negative_mask, negative_image_mask = pipe.encode_prompt(
                 prompt=negative_prompt,
@@ -193,6 +193,8 @@ def main() -> int:
     ap.add_argument("--dump-dir")
     ap.add_argument("--dump-text-stages", action="store_true",
                     help="With --test-text, capture token IDs and pre-final-norm encoder states")
+    ap.add_argument("--text-stage-layer", type=int, default=0,
+                    help="Text layer whose internal operators are captured (default: 0)")
     ap.add_argument("--init-latents")
     ap.add_argument(
         "--dump-initial-latents",
@@ -213,7 +215,7 @@ def main() -> int:
             pipe = _load_pipe(Path(args.model).resolve(), args.dtype)
             image = Image.open(args.image) if args.image else None
             _dump_prompt(pipe, args.prompt, Path(args.dump_dir), image, args.negative_prompt,
-                         args.dump_text_stages)
+                         args.dump_text_stages, args.text_stage_layer)
             del pipe
             return 0
         pipe = _load_pipe(Path(args.model).resolve(), args.dtype)

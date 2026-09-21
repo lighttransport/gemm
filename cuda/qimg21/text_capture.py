@@ -15,7 +15,7 @@ def _save(path, tensor):
 
 
 @contextmanager
-def capture_text_encoder(pipe, folder: Path):
+def capture_text_encoder(pipe, folder: Path, stage_layer: int = 0):
     """One encode_prompt invocation, without changing any module outputs.
 
     Capture the input to final RMSNorm, not its output: Qwen-Image 2.1 uses
@@ -25,7 +25,11 @@ def capture_text_encoder(pipe, folder: Path):
     folder.mkdir(parents=True, exist_ok=True)
     encoder = pipe.text_encoder
     model = getattr(encoder.model, "language_model", encoder.model)
+    layers = tuple(getattr(model, "layers", ()))
+    if not 0 <= stage_layer < len(layers):
+        raise ValueError(f"stage_layer must be in [0, {len(layers)})")
     metadata = {"drop_idx": int(pipe._drop_idx), "hidden_boundary": "before_final_rmsnorm",
+                "stage_layer": stage_layer,
                 "calls": 0, "norm_calls": 0, "inputs": {}}
     handles = []
 
@@ -47,12 +51,12 @@ def capture_text_encoder(pipe, folder: Path):
     try:
         handles.append(encoder.register_forward_pre_hook(inputs_hook, with_kwargs=True))
         handles.append(model.norm.register_forward_pre_hook(norm_hook))
-        for index, layer in enumerate(getattr(model, "layers", ())):
+        for index, layer in enumerate(layers):
             def layer_hook(module, args, output, index=index):
                 value = output[0] if isinstance(output, tuple) else output
                 _save(folder / f"layer_{index:02d}.npy", value)
             handles.append(layer.register_forward_hook(layer_hook))
-            if index == 0:
+            if index == stage_layer:
                 for name, child in layer.named_modules():
                     if not name:
                         continue

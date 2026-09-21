@@ -1018,7 +1018,7 @@ integer preservation, pre-norm capture, unchanged outputs, and hook cleanup.
 An experimental streamed native encoder is now available separately:
 
 ```sh
-make -C cuda/qimg21 test_cuda_qimg21_text
+make -C cuda/qimg21 native-text-exact
 tmp/qimg21-ref-venv/bin/python cuda/qimg21/native_text.py \
   --model /mnt/nvme01/models/qimg-21 --prompt "a red apple on a white table"
 ```
@@ -1031,26 +1031,17 @@ batch-one integer token IDs, rejects vision tokens, and limits inputs to
 4096 tokens. Python handles only processor/tokenization and system-prefix
 cropping; `--prepare-only` runs that stage without CUDA or model weights.
 The original checkpoint configuration is required; this is not a general
-Qwen3-VL loader. Host build, sm_120 NVRTC compilation, and GPU execution pass,
-but the first English-prompt GPU comparison **fails numerical acceptance**:
-full pre-norm cosine 0.9632453344, cropped-prompt cosine 0.9211241964.
-Per-layer diagnostics exposed nondeterministic weight-upload ordering:
-cuBLAS uses a nonblocking stream, so it must wait for staged host-to-device
-copies before consuming each matrix. Explicit upload synchronization makes
-two native runs bit-exact and improves cosine to 0.9993278549 / 0.9994377151
-(full / cropped). BF16 rounding of unnormalized attention probabilities
-improves these further to **0.9994088823 / 0.9995524853**, still below the
-0.99996 gate. First-layer operator capture then identified a GEMM dispatch
-difference: BF16-output GEMM matches PyTorch Q projection and Q normalization
-bit-for-bit, whereas F32-output GEMM followed by rounding does not. The
-experimental encoder now defaults to BF16-output GEMM; full/cropped cosine
-is **0.9997771787 / 0.9994480992**, still failing. `--f32-gemm-output` on the
-C executable retains the old path for diagnostics. Further arithmetic
-diagnosis remains necessary; improving one operator does not establish
-end-to-end acceptance.
-It is deliberately
-not the default generation encoder until comparison against captured
-`hidden_prenorm.npy` and cropped prompt embeddings meets the strict gate.
+Qwen3-VL loader. The validated default uses the pinned FlashAttention forward
+specialization selected by PyTorch on sm_120, an exported exact BF16 text-RoPE
+table, BF16-output GEMMs, and PyTorch-matched RMS reduction topologies. The
+positive English prompt and empty negative prompt are bit-exact at all 36
+saved layer boundaries. Full pre-norm and cropped prompt embeddings have zero
+relative L2 and MAE; their reported cosines are `1.0` (the empty cropped
+branch prints `0.9999999999999998` from the F64 metric calculation). All four
+comparisons pass the `0.99996` gate. `--native-attention custom` and
+`cutlass-efficient` remain diagnostic alternatives; `flash-exact` is the
+acceptance default. `--f32-gemm-output` likewise retains the older diagnostic
+GEMM path.
 CPU tokenization checks against the installed official pipeline cover an
 English prompt, an empty negative prompt, and Unicode/newline text:
 
@@ -1077,18 +1068,14 @@ reference cropping. Use a fresh work directory for each run; an explicit
 outputs must still be new. `test_text_regression.py` exercises the gate and
 fixture rejection paths without CUDA; passing that unit test does not prove
 the native model meets the gate.
-Text-stage reference captures now include `layer_NN.npy`; the native text
-executable can save matching boundaries with `--dump-dir DIR`.
-First-layer `stage_*.npy` files expose normalization, Q/K/V projections,
-Q/K normalization, attention output, and MLP projections for matched-stage
-comparisons.
-RoPE-specific diagnosis shows precise CUDA math matches the first layer's
-rotary Q/K values bit-for-bit; default fast math differs in 36 Q and 2 K
-elements on the 29-token prompt. A full precise-math text run still fails
-(full cosine 0.9997824312, cropped 0.9994433137), so this is not a solution
-to encoder acceptance. Unlike the text projections, changing all denoiser
-GEMMs to BF16 outputs left both low-timestep attention-mode results unchanged;
-that unsuccessful denoiser experiment was removed.
+Text-stage reference captures include `layer_NN.npy`. Use
+`--text-stage-layer N` on the PyTorch fixture and `--dump-layer N` with
+`--dump-dir DIR` on the native executable to expose matching normalization,
+Q/K/V projection, RoPE, attention and MLP boundaries for any layer. This
+diagnosis found that formula-based fast RoPE differed in 36 Q and 2 K values,
+the generic 256-thread head RMS reduction first differed at layer 3, and the
+short empty prompt selects a vector-four wide RMS reduction at layer 34.
+The exact table and matched reduction paths eliminate those differences.
 
 For native true CFG, pass `--negative-prompt` and `--true-cfg-scale` to
 `native_generate.py` (the negative embedding is exported beside the positive
