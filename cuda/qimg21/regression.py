@@ -1,0 +1,196 @@
+#!/usr/bin/env python3
+"""Run deterministic Qwen-Image 2.1 reference/runner parity cases."""
+
+from __future__ import annotations
+
+import argparse
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+
+@dataclass(frozen=True)
+class Case:
+    height: int
+    width: int
+    steps: int
+    seed: int
+
+    @property
+    def name(self) -> str:
+        return f"{self.height}x{self.width}-s{self.steps}-seed{self.seed}"
+
+
+DEFAULT_CASES = (
+    Case(256, 256, 2, 42),
+    Case(256, 512, 2, 123),
+    Case(512, 512, 4, 42),
+)
+FULL_CASE = Case(1024, 1024, 40, 42)
+
+
+def _parse_case(value: str) -> Case:
+    try:
+        geometry, steps_text, seed_text = value.split(":", 2)
+        height_text, width_text = geometry.lower().split("x", 1)
+        case = Case(int(height_text), int(width_text), int(steps_text), int(seed_text))
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(
+            f"invalid case {value!r}; expected HEIGHTxWIDTH:STEPS:SEED"
+        ) from exc
+    if min(case.height, case.width, case.steps) <= 0:
+        raise argparse.ArgumentTypeError("case dimensions and steps must be positive")
+    if case.height % 32 or case.width % 32:
+        raise argparse.ArgumentTypeError("case dimensions must be divisible by 32")
+    return case
+
+
+def _run(command: list[str], root: Path) -> None:
+    print("+", " ".join(str(part) for part in command), flush=True)
+    subprocess.run(command, cwd=root, check=True)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--model", required=True)
+    ap.add_argument("--prompt", default="a red apple on a white table")
+    ap.add_argument("--dtype", choices=("bf16", "fp16"), default="bf16")
+    ap.add_argument(
+        "--case",
+        dest="cases",
+        action="append",
+        type=_parse_case,
+        help="repeatable HEIGHTxWIDTH:STEPS:SEED override (default: three smoke cases)",
+    )
+    ap.add_argument(
+        "--include-full",
+        action="store_true",
+        help="also run the 1024x1024/40-step acceptance case",
+    )
+    ap.add_argument("--work-dir", default="tmp/qimg21-regression")
+    ap.add_argument(
+        "--native",
+        action="store_true",
+        help="run the native C/NVRTC denoiser against the PyTorch reference checkpoints",
+    )
+    ap.add_argument("--native-bin", default="cuda/qimg21/test_cuda_qimg21_native")
+    ap.add_argument("--quantized", action="store_true")
+    ap.add_argument("--cosine-threshold", type=float)
+    args = ap.parse_args()
+
+    root = Path(__file__).resolve().parents[2]
+    model = Path(args.model).resolve()
+    if not model.is_dir():
+        raise SystemExit(f"model directory does not exist: {model}")
+    work = Path(args.work_dir)
+    if not work.is_absolute():
+        work = root / work
+    cases = list(args.cases or DEFAULT_CASES)
+    if args.include_full:
+        cases.append(FULL_CASE)
+
+    reference = root / "cuda/qimg21/reference.py"
+    runner = root / "cuda/qimg21/test_cuda_qimg21.py"
+    compare = root / "cuda/qimg21/compare.py"
+    native_bin = Path(args.native_bin)
+    if not native_bin.is_absolute():
+        native_bin = root / native_bin
+    if args.native and not native_bin.exists():
+        raise SystemExit(f"native executable not found: {native_bin}; run `make -C cuda/qimg21 native` first")
+    failed: list[str] = []
+    for case in cases:
+        case_dir = work / case.name
+        ref_dir = case_dir / "reference"
+        run_dir = case_dir / ("native" if args.native else "runner")
+        out_path = run_dir / "runner.png"
+        common = [
+            "--model",
+            str(model),
+            "--prompt",
+            args.prompt,
+            "--height",
+            str(case.height),
+            "--width",
+            str(case.width),
+            "--steps",
+            str(case.steps),
+            "--seed",
+            str(case.seed),
+        ]
+        print(f"\n=== {case.name} ===", flush=True)
+        try:
+            _run(
+                [
+                    sys.executable,
+                    str(reference),
+                    *common,
+                    "--dtype",
+                    args.dtype,
+                    "--dump-initial-latents",
+                    "--dump-dir",
+                    str(ref_dir),
+                ],
+                root,
+            )
+            if args.native:
+                _run(
+                    [
+                        str(native_bin),
+                        "--model",
+                        str(model),
+                        "--prompt-embeds",
+                        str(ref_dir / "prompt_embeds.npy"),
+                        "--latents",
+                        str(ref_dir / "initial_latents.npy"),
+                        "--height-tokens",
+                        str(case.height // 16),
+                        "--width-tokens",
+                        str(case.width // 16),
+                        "--steps",
+                        str(case.steps),
+                        "--dump-dir",
+                        str(run_dir),
+                        "--out",
+                        str(run_dir / "native_latents.npy"),
+                    ],
+                    root,
+                )
+            else:
+                _run(
+                    [
+                        sys.executable,
+                        str(runner),
+                        "--generate",
+                        *common,
+                        "--dtype",
+                        args.dtype,
+                        "--dump-initial-latents",
+                        "--dump-dir",
+                        str(run_dir),
+                        "--out",
+                        str(out_path),
+                    ],
+                    root,
+                )
+            compare_command = [sys.executable, str(compare), "--reference-dir", str(ref_dir), "--runner-dir", str(run_dir)]
+            if args.native:
+                compare_command.append("--steps-only")
+            if args.quantized:
+                compare_command.append("--quantized")
+            if args.cosine_threshold is not None:
+                compare_command.extend(["--cosine-threshold", str(args.cosine_threshold)])
+            _run(compare_command, root)
+        except subprocess.CalledProcessError:
+            failed.append(case.name)
+            print(f"FAIL: {case.name}", file=sys.stderr)
+
+    if failed:
+        print("\nREGRESSION FAIL: " + ", ".join(failed), file=sys.stderr)
+        return 1
+    print(f"\nREGRESSION PASS: {len(cases)} cases")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

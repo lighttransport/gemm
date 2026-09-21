@@ -84,6 +84,21 @@ def generate(args) -> int:
         generator = None
     else:
         latents = None
+    if args.dump_initial_latents and latents is None:
+        latents, _ = pipe.prepare_latents(
+            None,
+            1,
+            pipe.transformer.config.in_channels,
+            args.height,
+            args.width,
+            torch.bfloat16 if args.dtype == "bf16" else torch.float16,
+            torch.device("cuda"),
+            generator,
+            None,
+        )
+        if out_dir:
+            _save_array(out_dir / "initial_latents.npy", latents[0])
+        generator = None
 
     free0, total = torch.cuda.mem_get_info()
     print(f"GPU: {torch.cuda.get_device_name(0)}  free={free0/2**30:.2f}GiB total={total/2**30:.2f}GiB")
@@ -142,6 +157,11 @@ def main() -> int:
     ap.add_argument("--out", default="qwen_image21.png")
     ap.add_argument("--dump-dir")
     ap.add_argument("--init-latents")
+    ap.add_argument(
+        "--dump-initial-latents",
+        action="store_true",
+        help="save the exact packed PyTorch noise tensor used by the denoising loop",
+    )
     ap.add_argument("--no-kv-cache", action="store_true")
     args = ap.parse_args()
 

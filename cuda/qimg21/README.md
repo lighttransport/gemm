@@ -30,6 +30,40 @@ tmp/qimg21-ref-venv/bin/python cuda/qimg21/compare.py \
   --reference-dir tmp/qimg21-reference --runner-dir tmp/qimg21-runner
 ```
 
+`compare.py` treats parity as an acceptance test: every matched denoising
+checkpoint must reach cosine `>= 0.99996` for the non-quantized BF16/FP16
+weights. It exits non-zero on a missing checkpoint, shape mismatch, non-finite
+value, or threshold failure. For a quantized experiment, pass `--quantized`;
+that selects the provisional `0.995` gate until a quantizer-specific
+calibration set establishes a tighter measured threshold. Use
+`--cosine-threshold X` to record an explicit threshold in benchmark logs.
+The regression driver also records `initial_latents.npy`, preserving the exact
+PyTorch-packed noise input for native denoiser comparisons.
+
+Run the deterministic smoke matrix with:
+
+```sh
+tmp/qimg21-ref-venv/bin/python cuda/qimg21/regression.py \
+  --model /mnt/nvme01/models/qimg-21
+```
+
+The default matrix covers 256x256, 256x512, and 512x512. Add
+`--include-full` for the 1024x1024/40-step acceptance run, or pass repeatable
+`--case HEIGHTxWIDTH:STEPS:SEED` values to define a custom matrix. Each case
+gets isolated fixtures under `tmp/qimg21-regression/`.
+
+Once the native binary is built, run the native denoiser parity matrix with:
+
+```sh
+tmp/qimg21-ref-venv/bin/python cuda/qimg21/regression.py \
+  --native --model /mnt/nvme01/models/qimg-21 \
+  --case 256x256:2:42
+```
+
+Native mode compares every C/NVRTC scheduler checkpoint directly against the
+PyTorch reference using the exact `initial_latents.npy` fixture and does not
+require a VAE image decode.
+
 The first deliverable is batch-1 text-to-image with the model’s recommended
 no-guidance path. Condition-image editing, true CFG, and quantized weights
 remain outside this runner. The native executable currently takes the text
@@ -48,7 +82,7 @@ tmp/qimg21-ref-venv/bin/python cuda/qimg21/test_cuda_qimg21.py --test-text \
   --model /mnt/nvme01/models/qimg-21 --dump-dir tmp/qimg21-native-fixture
 tmp/qimg21-ref-venv/bin/python cuda/qimg21/make_native_fixture.py \
   --prompt-embeds tmp/qimg21-native-fixture/prompt_embeds.npy \
-  --out-dir tmp/qimg21-native-fixture
+  --dtype bf16 --torch-rng --out-dir tmp/qimg21-native-fixture
 cuda/qimg21/test_cuda_qimg21_native \
   --model /mnt/nvme01/models/qimg-21 \
   --prompt-embeds tmp/qimg21-native-fixture/prompt_embeds.npy \
@@ -66,7 +100,9 @@ products. Block weights are uploaded and released one block at a time, keeping
 the transformer resident set appropriate for a 12–16 GB GPU. The native
 scheduler mirrors FlowMatch Euler dynamic shifting from the local scheduler
 config, and activation boundaries are rounded to BF16 to match the PyTorch
-reference numerics. Add `--verbose` for finite-value stage probes.
+reference numerics. `--torch-rng` makes the fixture use the same CUDA RNG and
+packing as the Diffusers pipeline; omit it only for a standalone NumPy smoke
+input. Add `--verbose` for finite-value stage probes.
 
 ## Hybrid native image generation
 

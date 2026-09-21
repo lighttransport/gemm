@@ -1,6 +1,6 @@
 PYTHON ?= ../../tmp/qimg21-ref-venv/bin/python
 
-.PHONY: all setup generate reference compare native clean
+.PHONY: all setup generate reference compare regress native clean
 
 all: test_cuda_qimg21 native
 
@@ -30,6 +30,9 @@ reference:
 
 compare:
 	$(PYTHON) compare.py --reference-dir ../../tmp/qimg21-reference --runner-dir ../../tmp/qimg21-runner
+
+regress:
+	$(PYTHON) regression.py --model /mnt/nvme01/models/qimg-21
 
 clean:
 	rm -f test_cuda_qimg21 test_cuda_qimg21_native qwen_image21.png

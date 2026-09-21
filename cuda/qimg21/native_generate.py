@@ -144,8 +144,26 @@ def main() -> int:
 
     h_tokens, w_tokens = args.height // 16, args.width // 16
     latent_path = work / "latents.npy"
-    rng = np.random.default_rng(args.seed)
-    np.save(latent_path, rng.standard_normal((h_tokens * w_tokens, 64), dtype=np.float32))
+    _run(
+        [
+            sys.executable,
+            str(root / "cuda/qimg21/make_native_fixture.py"),
+            "--prompt-embeds",
+            str(prompt_path),
+            "--height-tokens",
+            str(h_tokens),
+            "--width-tokens",
+            str(w_tokens),
+            "--seed",
+            str(args.seed),
+            "--dtype",
+            args.dtype,
+            "--torch-rng",
+            "--out-dir",
+            str(work),
+        ],
+        root,
+    )
     native_latents = work / "native_latents.npy"
     _run(
         [

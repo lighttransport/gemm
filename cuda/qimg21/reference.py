@@ -20,6 +20,12 @@ def main() -> int:
     ap.add_argument("--width", type=int, default=256)
     ap.add_argument("--steps", type=int, default=1)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--dtype", choices=("bf16", "fp16"), default="bf16")
+    ap.add_argument(
+        "--dump-initial-latents",
+        action="store_true",
+        help="save the exact packed PyTorch noise tensor used by the denoising loop",
+    )
     ap.add_argument("--dump-dir", required=True)
     args = ap.parse_args()
 
@@ -30,13 +36,29 @@ def main() -> int:
         raise SystemExit("reference requires CUDA")
     out = Path(args.dump_dir)
     out.mkdir(parents=True, exist_ok=True)
+    dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
     pipe = QwenImage21Pipeline.from_pretrained(
-        str(Path(args.model).resolve()), dtype=torch.bfloat16, local_files_only=True
+        str(Path(args.model).resolve()), dtype=dtype, local_files_only=True
     )
     pipe.enable_sequential_cpu_offload(device="cuda")
     if max(args.height, args.width) > 1024:
         pipe.vae.enable_tiling()
     gen = torch.Generator(device="cuda").manual_seed(args.seed)
+    initial_latents = None
+    if args.dump_initial_latents:
+        initial_latents, _ = pipe.prepare_latents(
+            None,
+            1,
+            pipe.transformer.config.in_channels,
+            args.height,
+            args.width,
+            dtype,
+            torch.device("cuda"),
+            gen,
+            None,
+        )
+        np.save(out / "initial_latents.npy", initial_latents[0].detach().float().cpu().numpy())
+
     def callback(_pipe, step, _timestep, kwargs):
         value = kwargs.get("latents")
         if value is not None:
@@ -52,7 +74,8 @@ def main() -> int:
         height=args.height,
         width=args.width,
         num_inference_steps=args.steps,
-        generator=gen,
+        generator=None if initial_latents is not None else gen,
+        latents=initial_latents,
         use_kv_cache=True,
         callback_on_step_end=callback,
         callback_on_step_end_tensor_inputs=["latents", "prompt_embeds"],

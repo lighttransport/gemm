@@ -9,10 +9,32 @@ ap.add_argument("--prompt-embeds", required=True, help="F32 prompt_embeds.npy fr
 ap.add_argument("--height-tokens", type=int, default=16)
 ap.add_argument("--width-tokens", type=int, default=16)
 ap.add_argument("--seed", type=int, default=42)
+ap.add_argument("--dtype", choices=("bf16", "fp16"), default="bf16")
+ap.add_argument(
+    "--torch-rng",
+    action="store_true",
+    help="use the same CUDA torch.randn layout as QwenImage21Pipeline",
+)
 ap.add_argument("--out-dir", required=True)
 a = ap.parse_args()
 out = Path(a.out_dir); out.mkdir(parents=True, exist_ok=True)
 np.save(out / "prompt_embeds.npy", np.load(a.prompt_embeds).astype(np.float32, copy=False))
-g = np.random.default_rng(a.seed)
-np.save(out / "latents.npy", g.standard_normal((a.height_tokens * a.width_tokens, 64), dtype=np.float32))
+if a.torch_rng:
+    import torch
+    if not torch.cuda.is_available():
+        raise SystemExit("--torch-rng requires CUDA")
+    dtype = torch.bfloat16 if a.dtype == "bf16" else torch.float16
+    generator = torch.Generator(device="cuda").manual_seed(a.seed)
+    latents = torch.randn(
+        (1, 1, 64, a.height_tokens, a.width_tokens),
+        generator=generator,
+        device="cuda",
+        dtype=dtype,
+    )
+    # Qwen-Image 2.1 uses a plain spatial flatten: [B,C,H,W] -> [B,HW,C].
+    latents = latents.view(1, 64, a.height_tokens * a.width_tokens).transpose(1, 2)[0]
+    np.save(out / "latents.npy", latents.float().cpu().numpy())
+else:
+    g = np.random.default_rng(a.seed)
+    np.save(out / "latents.npy", g.standard_normal((a.height_tokens * a.width_tokens, 64), dtype=np.float32))
 print(out)
