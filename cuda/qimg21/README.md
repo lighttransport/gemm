@@ -1447,7 +1447,47 @@ All 40 saved `[4096,64]` latent checkpoints are finite. The decoded
 `[4,1024,1024]` tensor is finite and within `[-1,1]`; the saved image is a
 1024x1024 RGBA PNG. Visual inspection shows a coherent red apple on a white
 surface, consistent with the prompt. Fixtures, image, and timing log remain
-under ignored `tmp/`, not in Git. No corresponding 40-step PyTorch trajectory
-was compared; that benchmark is performance and quality evidence rather than
-the strict parity gate. The deterministic efficient-SDPA editing gate is
-documented above. True-CFG parity remains a separate required validation.
+under ignored `tmp/`, not in Git.
+
+## Exact 1024x1024/40-step PyTorch parity
+
+The corresponding full-resolution strict parity run now passes against the
+pinned efficient-SDPA PyTorch reference. It uses exact CUTLASS attention,
+vector-four normalization and the exact host-generated RoPE table:
+
+```sh
+OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=1 /usr/bin/time -v \
+  tmp/qimg21-ref-venv/bin/python cuda/qimg21/regression.py \
+  --native --model /mnt/nvme01/models/qimg-21 \
+  --reference-sdpa-backend efficient \
+  --native-attention cutlass-efficient --native-normalization vector4 \
+  --native-rope host-table-exact --cosine-threshold 0.99996 \
+  --case 1024x1024:40:42 --work-dir tmp/qimg21-exact-1024-40
+```
+
+All 40 matched denoiser predictions pass: minimum cosine is
+**0.999971784** and maximum relative L2 is **0.0075120298**. All 40
+free-running Euler checkpoints also pass: minimum cosine is **0.999989908**
+and maximum relative L2 is **0.0045665863**. The complete reference,
+40 independent matched native invocations, native trajectory and comparisons
+finished in **28m 32.15s**, with zero swaps.
+
+Decoding the PyTorch and native final latents through the same validated native
+F32 VAE gives RGB cosine **0.9999990451**, RGB relative L2 **0.0015630461**,
+MAE **0.000802789**, PSNR **58.16 dB**, and alpha MAE
+**0.0000116778**. Both images are finite and visual inspection shows no
+obvious difference. Reproduce the paired decode with:
+
+```sh
+OMP_NUM_THREADS=2 tmp/qimg21-ref-venv/bin/python cuda/qimg21/quant_quality.py \
+  --model /mnt/nvme01/models/qimg-21 --height 1024 --width 1024 \
+  --reference-latents tmp/qimg21-exact-1024-40/1024x1024-s40-seed42/reference/step_039.npy \
+  --quantized-latents tmp/qimg21-exact-1024-40/1024x1024-s40-seed42/native/trajectory/final_latents.npy \
+  --out-dir tmp/qimg21-exact-1024-40-image-quality
+```
+
+The acceptance invocation was not sampled for a new GPU-memory peak. The
+same native 1024x1024 denoiser executable and streamed-weight layout was
+previously sampled at **1,948 MiB**; the shared native F32 decoder peaked at
+**3,112 MiB**, as recorded above. These are observed process peaks, not an
+allocator-enforced cap. Fixtures, decoded images and logs remain ignored.
