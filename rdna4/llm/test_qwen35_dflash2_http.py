@@ -4,6 +4,7 @@ Run with ``--model TARGET --sidecar DFLASH``.  The test is intentionally
 separate from the CPU-only protocol suite because it loads both GGUF files.
 """
 import argparse
+import concurrent.futures
 import http.client
 import json
 import os
@@ -29,6 +30,22 @@ def post(port, body):
     )
     with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:
         return json.load(response)
+
+
+def concurrent_quality_cases(port):
+    cases = (
+        ("Answer 5+5 with just 10.", "10"),
+        ("Answer 7+7 with just 14.", "14"),
+    )
+    bodies = [({"messages": [{"role": "user", "content": prompt}],
+                "temperature": 0, "max_tokens": 8}, expected)
+              for prompt, expected in cases]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda item: post(port, item[0]), bodies))
+    for result, (_, expected) in zip(results, bodies):
+        text = result["choices"][0]["message"]["content"]
+        require(result.get("usage", {}).get("completion_tokens", 0) > 0, result)
+        require(expected in text, text)
 
 
 def cancel_stream(port):
@@ -138,6 +155,8 @@ def main():
         require(recovery.get("usage", {}).get("completion_tokens", 0) > 0,
                 recovery)
         require("6" in recovery["choices"][0]["message"]["content"], recovery)
+
+        concurrent_quality_cases(args.port)
 
         prompt = [{"role": "user", "content": cases[0][0]}]
         sampled = {

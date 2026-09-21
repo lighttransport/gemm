@@ -342,7 +342,8 @@ reflects the remaining measured costs.
    snapshots now cover up to 16,384 tokens; a roughly 10k-token, 12k-context
 run passes repeatability and cache reuse, including after the
    cancellation/recovery sequence. The 14k-token/16k-context boundary run also
-   passes.
+   passes. Two independent non-coding requests are also issued concurrently to
+   check scheduler serialization and cache isolation.
 4. **Kernel and graph count.** Q/gate deinterleave, QK normalization, RoPE
    and Q8/Q8 KV storage are now fused exactly. The remaining small launches
    include SiLU/gating and state preparation. Fuse adjacent operations when
