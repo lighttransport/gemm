@@ -37,6 +37,19 @@ unused accumulators and row-count branches. Two warm K=4 repeats retained
 140/134, hash `44915ec1039a64c8`, and 74.79 tok/s, so the specialization is
 limited to five-row sidecar projections.
 
+## 2026-09-22 continuation: default GQA reuse launch
+
+The ordinary Q8/Q8 GQA path previously launched both the three-head kernel and
+the long-context reuse kernel; one returned immediately based on device
+position. The reuse kernel is context-polymorphic when that guard is disabled,
+so the default path now launches only it and keeps the three-head kernel as a
+fallback when reuse is unavailable. The C++ 4K gate stayed exact
+(`96b92d606dde5e28`); three repeats measured 40.24--40.31 tok/s versus
+40.09 tok/s for the paired-launch control. A matched random 64K gate retained
+prefix hash `90178de69a24a76e`, suffix hash `aed3c962c4a6525d`, and measured
+35.47 tok/s versus 33.73 tok/s control. The graph ABI and Q8/Q8 arithmetic
+remain unchanged.
+
 ## 2026-09-22 continuation: sidecar overlap ordering hardening
 
 The opt-in `LLM_QWEN35_DFLASH_OVERLAP_INJECT=1` path now records a

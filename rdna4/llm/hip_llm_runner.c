@@ -22826,14 +22826,19 @@ static inline void launch_attn_decode_native_q8(hip_llm_runner *r, void *out,
         &r->q8_attention_nsm, &occupancy, &forced_splits, &queries,
         &position_start, &adaptive_long_context };
     if (r->n_heads == 6 * r->n_kv_heads &&
-        r->fn_q8_attention_decode_gqa3 &&
         r->fn_q8_attention_decode_gqa3_reuse) {
-        LAUNCH(r->fn_q8_attention_decode_gqa3,
-               2 * r->n_kv_heads * r->q8_attention_max_splits, 1, 1,
-               32, 12, 1, 0, r->stream, a);
+        /* The reuse kernel is context-polymorphic when its adaptive guard is
+         * disabled.  Use it for both short and long windows so the paired
+         * gqa3 launch cannot become a no-op at either side of the boundary. */
+        adaptive_long_context = 0;
         LAUNCH(r->fn_q8_attention_decode_gqa3_reuse,
                2 * r->n_kv_heads * r->q8_attention_max_splits, 1, 1,
                32, 4, 1, 0, r->stream, a);
+    } else if (r->n_heads == 6 * r->n_kv_heads &&
+               r->fn_q8_attention_decode_gqa3) {
+        LAUNCH(r->fn_q8_attention_decode_gqa3,
+               2 * r->n_kv_heads * r->q8_attention_max_splits, 1, 1,
+               32, 12, 1, 0, r->stream, a);
     } else {
         LAUNCH(r->fn_q8_attention_decode,
                r->n_heads * r->q8_attention_max_splits, 1, 1,

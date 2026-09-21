@@ -85,6 +85,18 @@ at the transaction boundary.  The guarded run retains prefix hash
 35.67 tok/s.  Short-window DFlash remains enabled; the HTTP/stdio quality
 harness passes after the guard.
 
+## Default GQA reuse launch (2026-09-22)
+
+Ordinary Q8/Q8 GQA decode no longer launches both context-specialized kernels
+when one would return immediately. The existing three-head reuse kernel now
+runs with its adaptive guard disabled for every context, while the older
+three-head kernel remains a fallback if the reuse function is unavailable.
+The C++ 4K gate retained hash `96b92d606dde5e28`; three repeats measured
+40.24--40.31 tok/s versus 40.09 tok/s for the paired-launch control. A matched
+random 64K run retained prefix `90178de69a24a76e` and suffix
+`aed3c962c4a6525d`, measuring 35.47 tok/s versus 33.73 tok/s control. The
+captured graph arguments and Q8/Q8 arithmetic are unchanged.
+
 ## IQ2_XS launch-bounds probe (2026-09-22)
 
 The native one-row IQ2_XS decode kernel is compiled with
