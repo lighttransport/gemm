@@ -67,6 +67,17 @@ def main() -> int:
             if step == 0 and embeds is not None:
                 name = "negative_prompt_embeds.npy" if is_negative else "prompt_embeds.npy"
                 np.save(out / name, embeds.detach().float().cpu().numpy())
+                branch = "negative" if is_negative else "positive"
+                for key in ("img_mask", "encoder_hidden_states_mask"):
+                    value = kwargs.get(key)
+                    if value is not None:
+                        np.save(pred_dir / f"{branch}_{key}.npy", value.detach().cpu().numpy())
+                shapes = kwargs.get("img_shapes")
+                if shapes is not None:
+                    (pred_dir / f"{branch}_layout.json").write_text(json.dumps({
+                        "img_shapes": shapes, "text_slots": int(embeds.shape[1]),
+                        "target_tokens": (args.height // 16) * (args.width // 16),
+                    }, indent=2) + "\n")
             if is_negative:
                 return
             value = kwargs.get("timestep")

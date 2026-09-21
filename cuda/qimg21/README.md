@@ -206,6 +206,22 @@ text encoder output as an F32 `.npy` fixture; tokenisation and the Qwen3-VL
 text encoder remain at that Python boundary. The scheduler loop is native now,
 while the official Qwen-Image 2.1 VAE is used as a separate decode stage.
 
+Editing bring-up has a CPU-native joint-layout builder in `joint_layout.h`:
+four-token image-slot expansion, interleaved text/image scatter indices,
+separate condition-image attention blocks, target modulation boundary, and
+centered three-axis RoPE positions. Four layout tests match official Diffusers
+metadata and RoPE exactly, including adjacent images and rectangular grids:
+
+```sh
+make -C cuda/qimg21 test_joint_layout
+OMP_NUM_THREADS=2 tmp/qimg21-ref-venv/bin/python cuda/qimg21/test_joint_layout.py
+```
+
+Reference prediction captures also save each CFG branch's `img_mask`, text
+key-validity mask, and `img_shapes` layout. This is preparatory work only:
+the native denoiser does not yet consume editing layouts, and native VAE
+encoding/vision-conditioned text encoding remain unimplemented.
+
 For native text-encoder bring-up, `test_cuda_qimg21.py --test-text
 --dump-text-stages --dump-dir DIR` additionally records `text_positive/`
 (and `text_negative/` when requested). Each directory contains exact integer

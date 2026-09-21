@@ -25,6 +25,9 @@ native-vae: test_cuda_qimg21_vae
 test_quant_weights: test_quant_weights.c quant_weights.h ../../common/safetensors.h
 	$(CC) -O2 -std=c11 -D_GNU_SOURCE -Wall -Wextra -o $@ test_quant_weights.c -lm
 
+test_joint_layout: test_joint_layout.c joint_layout.h
+	$(CC) -O2 -std=c11 -Wall -Wextra -Wpedantic -o $@ test_joint_layout.c
+
 test_cuda_qimg21_text: test_cuda_qimg21_text.c text_kernels.h quant_weights.h test_cuda_qimg21_native.c ../../cuda/cuew.c ../../cuda/cublasew.c
 	$(CC) -O2 -std=c11 -D_GNU_SOURCE -Wall -Wextra -I../../common -I../../cuda -I../qimg \
 		-o $@ test_cuda_qimg21_text.c ../../cuda/cuew.c ../../cuda/cublasew.c -ldl -lm -lpthread
@@ -57,4 +60,4 @@ regress:
 	$(PYTHON) regression.py --model /mnt/nvme01/models/qimg-21
 
 clean:
-	rm -f test_cuda_qimg21 test_cuda_qimg21_native test_cuda_qimg21_vae test_cuda_qimg21_text test_weight_upload test_quant_weights test_scheduler qwen_image21.png
+	rm -f test_cuda_qimg21 test_cuda_qimg21_native test_cuda_qimg21_vae test_cuda_qimg21_text test_weight_upload test_quant_weights test_joint_layout test_scheduler qwen_image21.png

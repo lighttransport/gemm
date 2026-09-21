@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise CFG fixture indexing without loading model weights or using GPU."""
 import sys
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -20,7 +21,7 @@ class Transformer(torch.nn.Module):
         self.img_in = torch.nn.Identity()
         self.proj_out = torch.nn.Identity()
 
-    def forward(self, hidden_states, encoder_hidden_states, timestep):
+    def forward(self, hidden_states, encoder_hidden_states, timestep, **kwargs):
         self.img_in(hidden_states)
         return self.proj_out(torch.full_like(hidden_states, encoder_hidden_states[0, 0, 0]))
 
@@ -45,7 +46,11 @@ class Pipeline:
             negative = torch.full((1, 1, 4096), 1 + step, dtype=torch.bfloat16)
             timestep = torch.tensor([0.8 - step * 0.7], dtype=torch.bfloat16)
             for embeds in (positive, negative):
-                self.transformer(hidden_states=sample, encoder_hidden_states=embeds, timestep=timestep)
+                slots = torch.zeros((1, embeds.shape[1]+1), dtype=torch.bool)
+                slots[:, -1] = True
+                self.transformer(hidden_states=sample, encoder_hidden_states=embeds, timestep=timestep,
+                                 img_mask=slots, img_shapes=[[(1, 2, 2)]],
+                                 encoder_hidden_states_mask=torch.ones(embeds.shape[:2], dtype=torch.int64))
             kwargs["callback_on_step_end"](
                 self, step, timestep, {"latents": sample, "prompt_embeds": positive})
         return SimpleNamespace(images=[Image.new("RGBA", (32, 32))])
@@ -78,6 +83,11 @@ class ReferenceCaptureTest(unittest.TestCase):
                 self.assertTrue((folder / f"negative_{step:03d}.npy").exists())
             self.assertEqual(np.load(folder / "negative_prompt_embeds.npy").shape, (1, 1, 4096))
             self.assertEqual(np.load(folder / "prompt_embeds.npy").shape, (1, 3, 4096))
+            for branch, text_slots in (("positive", 3), ("negative", 1)):
+                metadata = json.loads((folder / f"{branch}_layout.json").read_text())
+                self.assertEqual(metadata["text_slots"], text_slots)
+                self.assertEqual(metadata["img_shapes"], [[[1, 2, 2]]])
+                self.assertEqual(np.load(folder / f"{branch}_img_mask.npy").dtype, np.bool_)
 
 
 if __name__ == "__main__":
