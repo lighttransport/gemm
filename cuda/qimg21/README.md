@@ -89,6 +89,31 @@ The same matched-input low-timestep denoiser compared with a PyTorch math
 SDPA reference scored 0.99994985006, still below 0.99996. Changing the
 attention backend alone therefore does not resolve the parity failure.
 
+The native Euler update rounds its BF16 prediction-times-step product and
+casts the updated sample back to BF16, matching the CUDA PyTorch scheduler.
+The model timestep separately follows BF16 rounding of `sigma*1000` and
+division by 1000. True CFG preserves the BF16 subtraction, multiplication,
+and addition boundaries before passing the prediction to Euler.
+
+Run the independent scheduler arithmetic regression with:
+
+```sh
+make -C cuda/qimg21 test_scheduler
+tmp/qimg21-ref-venv/bin/python cuda/qimg21/scheduler_regression.py
+```
+
+Three seeded tests cover sigma transitions 1→0.02, 0.63→0.37, and 0.02→0.
+All match CUDA PyTorch bit-for-bit with finite outputs. This isolates the
+scheduler update from denoiser errors and does not validate a complete
+trajectory. CUDA is the acceptance reference: CPU PyTorch converts the
+scalar step to BF16 before multiplying, producing different rounding.
+
+After these corrections, the native 256x256/seed42 two-step trajectory scored
+0.9999691665 and 0.9999702302 against the saved PyTorch scheduler checkpoints,
+passing the 0.99996 gate with finite outputs. The isolated matched-input
+low-timestep denoiser test still fails; trajectory agreement does not waive
+that requirement or establish multi-seed/full-resolution acceptance.
+
 Run the deterministic smoke matrix with:
 
 ```sh

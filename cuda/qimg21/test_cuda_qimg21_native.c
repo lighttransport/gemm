@@ -205,6 +205,23 @@ static CUdeviceptr upload_f32(const qimg21_shards *s, const char *name) {
 
 static void free_d(CUdeviceptr *p) { if (*p) { cuMemFree(*p); *p = 0; } }
 
+static float qimg21_round_bf16_host(float x) {
+    uint32_t bits=(uint32_t)qimg_f32_to_bf16_rne(x)<<16;
+    float y; memcpy(&y,&bits,sizeof(y)); return y;
+}
+
+/* FlowMatch Euler uses a BF16 model output and a scalar F32 dt. PyTorch
+ * retains BF16 for that product, adds to the F32-upcast sample, then casts
+ * the result back to the prediction dtype. Preserve both rounding points. */
+static void qimg21_euler_bf16(float *sample, const float *prediction,
+                            size_t n, float sigma, float next_sigma) {
+    const float dt=next_sigma-sigma;
+    for(size_t i=0;i<n;i++) {
+        float update=qimg21_round_bf16_host(dt*qimg21_round_bf16_host(prediction[i]));
+        sample[i]=qimg21_round_bf16_host(sample[i]+update);
+    }
+}
+
 /* Model-specific kernels.  GEMMs are cuBLAS BF16; these kernels are the
  * precision-sensitive pieces that are not delegated to a framework. */
 static const char *qimg21_src =
@@ -460,11 +477,18 @@ int main(int argc, char **argv) {
     int rc = 0;
     for (int i = 0; i < steps; i++) {
         fprintf(stderr, "native: step %d/%d sigma=%.7f\n", i + 1, steps, sigmas[i]);
-        rc = native_step(r, &k, &s, p, nt, la.data, ni, ih, iw, sigmas[i], pred);
+        /* The pipeline casts scheduler timestep (sigma*1000) to BF16,
+         * then divides by 1000 in BF16 before calling the transformer. */
+        float model_t=manual_t>=0.0f ? manual_t :
+            qimg21_round_bf16_host(qimg21_round_bf16_host(sigmas[i]*1000.0f)/1000.0f);
+        rc = native_step(r, &k, &s, p, nt, la.data, ni, ih, iw, model_t, pred);
         if (rc == 0 && negative_prompt_path) {
-            rc = native_step(r, &k, &s, neg.data, nnt, la.data, ni, ih, iw, sigmas[i], neg_pred);
-            if (rc == 0) for (size_t j = 0; j < (size_t)ni * 64; j++)
-                pred[j] = neg_pred[j] + guidance_scale * (pred[j] - neg_pred[j]);
+            rc = native_step(r, &k, &s, neg.data, nnt, la.data, ni, ih, iw, model_t, neg_pred);
+            if (rc == 0) for (size_t j = 0; j < (size_t)ni * 64; j++) {
+                float difference=qimg21_round_bf16_host(pred[j]-neg_pred[j]);
+                float guided=qimg21_round_bf16_host(guidance_scale*difference);
+                pred[j]=qimg21_round_bf16_host(neg_pred[j]+guided);
+            }
         }
         if (rc != 0) break;
         if (pred_dir) {
@@ -472,8 +496,7 @@ int main(int argc, char **argv) {
             snprintf(pred_path, sizeof(pred_path), "%s/pred_%03d.npy", pred_dir, i);
             npy_write_f32(pred_path, pred, (size_t)ni * 64, ni, 64);
         }
-        for (size_t j = 0; j < (size_t)ni * 64; j++)
-            la.data[j] += (sigmas[i + 1] - sigmas[i]) * pred[j];
+        qimg21_euler_bf16(la.data,pred,(size_t)ni*64,sigmas[i],sigmas[i+1]);
         if (dump_dir) {
             char step_path[1024];
             snprintf(step_path, sizeof(step_path), "%s/step_%03d.npy", dump_dir, i);
