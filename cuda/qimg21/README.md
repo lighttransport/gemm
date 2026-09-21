@@ -851,7 +851,24 @@ ordinary `mma64` raises the high-timestep editing prediction to
 **0.999957879** (pass), but its low-timestep prediction is **0.999881718** and
 trajectory cosines are **0.999942440 / 0.999943021** (fail). Artifact:
 `tmp/qimg21-edit-host-scale-mma-vector-ln/results.json`. This is the current
-best complete two-step editing result under the revised acceptance target.
+best reverse-traversal two-step editing result under the revised target.
+
+`mma64-forward-flash` is an explicit experimental mode that applies
+Flash-style exp2 softmax while traversing 64-key tiles in forward order. On an
+exact low-timestep editing block-17 Q/K/V replay, forward traversal reduces
+target attention relative L2 from **8.2169e-4** to **4.4080e-4** (cosine
+0.999999902850); prefix relative L2 is 4.9129e-4. The reusable
+`capture_edit_block.py` captures a selected official transformer block directly
+from existing editing fixtures, without rerunning VAE or text/vision encoding.
+These injected-state comparisons are diagnostic only.
+
+In the complete two-step editing regression, forward-Flash with vector4
+LayerNorm and host-table/original-tree Q/K RMS passes the high prediction
+(**0.999963623**) and both scheduler trajectory checkpoints
+(**0.999951105 / 0.999950821**). The independently matched low prediction is
+only **0.999868168**, so the run still fails overall. Artifacts:
+`tmp/qimg21-edit-low-block17-v3` and
+`tmp/qimg21-edit-forward-flash-vector-ln/results.json`.
 
 An explicit non-fused multiply/add RoPE experiment was rejected: matched
 block-17 Q/K mismatches rose to 13/11 elements and block-output relative L2

@@ -601,7 +601,8 @@ int main(int argc, char **argv) {
             else if (!strcmp(mode, "mma64")) {qimg21_attention_mma64=1;qimg21_attention_reverse64=0;}
             else if (!strcmp(mode, "mma64-flash")) {qimg21_attention_mma64=2;qimg21_attention_reverse64=0;}
             else if (!strcmp(mode, "mma64-mixed")) {qimg21_attention_mma64=3;qimg21_attention_reverse64=0;}
-            else { fprintf(stderr, "native: attention must be math, reverse64, mma64, mma64-flash, or mma64-mixed\n"); return 2; }
+            else if (!strcmp(mode, "mma64-forward-flash")) {qimg21_attention_mma64=4;qimg21_attention_reverse64=0;}
+            else { fprintf(stderr, "native: unsupported attention mode\n"); return 2; }
         }
         else if (!strcmp(argv[i], "--prompt-embeds") && i + 1 < argc) prompt_path = argv[++i];
         else if (!strcmp(argv[i], "--negative-prompt-embeds") && i + 1 < argc) negative_prompt_path = argv[++i];
@@ -729,7 +730,8 @@ int main(int argc, char **argv) {
         size_t length=strlen(q21_mma64_src)+64;
         char *source=malloc(length);
         if(!source)return 1;
-        snprintf(source,length,"#define Q21_FLASH_SOFTMAX %d\n%s",qimg21_attention_mma64>=2,q21_mma64_src);
+        snprintf(source,length,"#define Q21_FLASH_SOFTMAX %d\n#define Q21_FORWARD_KEYS %d\n%s",
+                 qimg21_attention_mma64>=2, qimg21_attention_mma64==4, q21_mma64_src);
         int compiled=cu_compile_kernels(&mma_module,r->device,source,"qimg21_mma64.cu",verbose,"qimg21_mma64");
         free(source);
         if(compiled<0 || cuModuleGetFunction(&k.mma_attention,mma_module,"q21_flash_reverse64") ||
