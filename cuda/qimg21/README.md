@@ -908,6 +908,14 @@ incorrect guidance formula. Artifacts: `tmp/qimg21-edit-cfg-forward-flash-095`,
 `tmp/qimg21-edit-cfg-positive-forward-low`, and
 `tmp/qimg21-edit-cfg-negative-forward-low`.
 
+Two accuracy fallbacks were checked on the non-CFG low editing checkpoint.
+The native scalar/math attention path with vector4 LayerNorm and host-table
+RoPE scores **0.999875346**. Forward-Flash with vector4 Q/K RMS scores
+**0.999873028**, worse than its original-tree Q/K RMS result. Neither clears
+0.99995, so no default-mode change was made. Artifacts are
+`tmp/qimg21-edit-math-vector-low` and
+`tmp/qimg21-edit-forward-vector-rms-low`.
+
 An explicit non-fused multiply/add RoPE experiment was rejected: matched
 block-17 Q/K mismatches rose to 13/11 elements and block-output relative L2
 rose to 5.0646e-5. No production RoPE change was retained; diagnostic artifacts
@@ -1345,4 +1353,5 @@ All 40 saved `[4096,64]` latent checkpoints are finite. The decoded
 surface, consistent with the prompt. Fixtures, image, and timing log remain
 under ignored `tmp/`, not in Git. No corresponding 40-step PyTorch trajectory
 was compared: successful generation does not establish the strict parity
-acceptance gate, which still fails on the small low-timestep denoiser case.
+acceptance gate, which still fails on editing and true-CFG low-timestep
+predictions.
