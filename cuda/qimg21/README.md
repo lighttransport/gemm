@@ -645,6 +645,27 @@ separate score/log2 scaling left text equality unchanged at 99.8853%; it was
 removed rather than adding another runner option. Its output remains in
 `tmp/qimg21-edit-attn0/efficient_softmax.npy` for diagnostics.
 
+Two further checks rule out specific explanations for the editing drift:
+
+- A separate diagnostic build changed every denoiser GEMM output to BF16
+  before expanding it back to F32. On the editing low-timestep fixture,
+  prediction is bit-identical to the ordinary F32-output GEMM path, including
+  the failing cosine **0.999887702401766**. The diagnostic production-source
+  change was removed; output is `tmp/qimg21-edit-bf16-output-low`.
+- Native fast `tanhf`, followed by the existing BF16 rounding operation,
+  matches PyTorch BF16 `tanh` on **all 65,280 finite BF16 bit patterns**,
+  including signed zeros: zero bit mismatches and zero maximum absolute error.
+  This checks the gate activation only, not the complete residual update.
+  Reproduce the GPU regression (a fresh output directory is required):
+
+```sh
+TMPDIR="$PWD/tmp" make -C cuda/qimg21 test_tanh_bf16
+OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=1 tmp/qimg21-ref-venv/bin/python cuda/qimg21/tanh_regression.py
+```
+
+Results are recorded in `tmp/qimg21-tanh-regression/results.json` with Torch
+version and GPU identity. These checks do not waive the failing model gates.
+
 Compare the replay without loading PyTorch or allocating GPU memory:
 
 ```sh

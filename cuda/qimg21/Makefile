@@ -52,6 +52,10 @@ test_text_projection: test_text_projection.c test_cuda_qimg21_native.c ../../cud
 	$(CC) -O2 -std=c11 -D_GNU_SOURCE -Wall -Wextra -I../../common -I../../cuda -I../qimg \
 		-o $@ test_text_projection.c ../../cuda/cuew.c ../../cuda/cublasew.c -ldl -lm -lpthread
 
+test_tanh_bf16: test_tanh_bf16.c test_cuda_qimg21_native.c ../../cuda/cuew.c ../../cuda/cublasew.c
+	$(CC) -O2 -std=c11 -D_GNU_SOURCE -Wall -Wextra -I../../common -I../../cuda -I../qimg \
+		-o $@ test_tanh_bf16.c ../../cuda/cuew.c ../../cuda/cublasew.c -ldl -lm -lpthread
+
 test_scheduler: test_scheduler.c test_cuda_qimg21_native.c ../../cuda/cuew.c ../../cuda/cublasew.c
 	$(CC) -O2 -std=c11 -D_GNU_SOURCE -Wall -Wextra -I../../common -I../../cuda -I../qimg \
 		-o $@ test_scheduler.c ../../cuda/cuew.c ../../cuda/cublasew.c -ldl -lm -lpthread
