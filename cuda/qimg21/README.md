@@ -59,6 +59,26 @@ It checks both input dtypes and BF16 ties-to-even conversion. F32 element
 counts must use four bytes per element; using the BF16 divisor reads past
 the source tensor, which the guard page detects.
 
+To isolate attention error from upstream projection/normalization drift,
+set `QIMG21_STAGE_DIR` and `QIMG21_STAGE_BLOCK` when running a native denoiser
+fixture. The dump includes `rope_q.npy`, `rope_k.npy`, `v.npy`, and
+`attn_raw.npy`. Replay those exact inputs with:
+
+```sh
+tmp/qimg21-ref-venv/bin/python cuda/qimg21/attention_probe.py \
+  --stage-dir tmp/qimg21-attn-native17
+```
+
+`--backend math` or `--backend flash` selects a diagnostic PyTorch SDPA
+backend explicitly. The default preserves PyTorch's normal selection.
+On block 17 of the low-timestep fixture, the native attention cosine was
+0.99999928391 against default SDPA and 0.99999999884 against math SDPA
+(PyTorch 2.14.0+cu130). These isolated operator checks do not replace the
+full denoiser acceptance gate.
+The same matched-input low-timestep denoiser compared with a PyTorch math
+SDPA reference scored 0.99994985006, still below 0.99996. Changing the
+attention backend alone therefore does not resolve the parity failure.
+
 Run the deterministic smoke matrix with:
 
 ```sh
