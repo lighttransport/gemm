@@ -316,8 +316,9 @@ the target latents. It assembles interleaved text/image tokens, applies the
 zero-timestep modulation to the condition prefix, predicts only the target
 tail, and leaves condition latents unchanged through Euler steps. The default
 text-to-image path is unchanged. `--attention reverse64` is now available as
-an opt-in layout-aware arithmetic experiment, with full-model validation still
-pending. CFG editing remains unsupported. This is experimental:
+an opt-in layout-aware arithmetic experiment. Its timestep-1 editing cosine is
+**0.999915311**, worse than default attention, so it remains nondefault.
+This is experimental:
 the first full-model editing prediction (256x256 target, 1024x1024 condition,
 seed42, captured timestep 1) is finite with cosine **0.999932378** and relative
 L2 **0.011906675**. It **fails** the 0.99996 gate. A mid-run total GPU-memory
@@ -335,6 +336,22 @@ Use the exact captured timestep, not a guessed value. The installed official
 one-step editing scheduler produced nonfinite output; two-step capture is
 used instead. A native `--steps 1 --timestep T` call above is a matched-input
 prediction diagnostic, not the official one-step generation trajectory.
+
+Experimental native editing CFG accepts `--negative-editing-layout` together
+with `--negative-prompt-embeds` and `--guidance-scale S` (S > 1). Each branch
+gets a separately validated layout and its own token count; both reuse the
+same fixed condition latents and target state, and combine target predictions
+with the existing BF16 CFG rounding. Missing branch-layout pairs are rejected.
+This branch-aware path builds and has CLI guard coverage, but guided editing
+GPU parity is not yet validated. The editing regression driver below still
+intentionally rejects CFG captures until its paired-fixture checks are added.
+
+The separate text-to-image true-CFG regression (256x256, two steps, seed42,
+empty negative prompt, scale4) runs to completion with finite outputs but
+**fails** the strict gate: prediction cosines **0.999959521 / 0.999387980**,
+trajectory cosines **0.999956809 / 0.999956741**. Reproduce with
+`regression.py --native --model /mnt/nvme01/models/qimg-21 --negative-prompt ''
+--true-cfg-scale 4 --case 256x256:2:42 --work-dir tmp/qimg21-truecfg-regression`.
 
 For full fixture-driven editing validation, `editing_regression.py` checks
 every captured timestep at matched inputs, then runs an independent Euler

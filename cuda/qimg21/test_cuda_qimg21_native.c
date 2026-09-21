@@ -482,6 +482,7 @@ int main(int argc, char **argv) {
     const char *model = NULL, *prompt_path = NULL, *latent_path = NULL;
     const char *negative_prompt_path = NULL;
     const char *editing_layout_path = NULL, *condition_path = NULL;
+    const char *negative_editing_layout_path = NULL;
     const char *out_path = "native_latents.npy", *dump_dir = NULL, *pred_dir = NULL;
     int ih = 16, iw = 16, steps = 1, verbose = 1;
     float guidance_scale = 1.0f;
@@ -504,6 +505,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--guidance-scale") && i + 1 < argc) guidance_scale = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--latents") && i + 1 < argc) latent_path = argv[++i];
         else if (!strcmp(argv[i], "--editing-layout") && i + 1 < argc) editing_layout_path = argv[++i];
+        else if (!strcmp(argv[i], "--negative-editing-layout") && i + 1 < argc) negative_editing_layout_path = argv[++i];
         else if (!strcmp(argv[i], "--condition-latents") && i + 1 < argc) condition_path = argv[++i];
         else if (!strcmp(argv[i], "--out") && i + 1 < argc) out_path = argv[++i];
         else if (!strcmp(argv[i], "--dump-dir") && i + 1 < argc) dump_dir = argv[++i];
@@ -518,6 +520,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "usage: %s --model DIR --prompt-embeds E.npy --latents L.npy "
                     "[--negative-prompt-embeds NEG.npy --guidance-scale S] "
                     "[--editing-layout layout.txt --condition-latents C.npy] "
+                    "[--negative-editing-layout negative_layout.txt] "
                     "[--steps N --dump-dir DIR --pred-dir DIR --height-tokens 16 --width-tokens 16 "
                     "--timestep .5 --out O.npy --verbose]\n", argv[0]);
             return 2;
@@ -525,8 +528,9 @@ int main(int argc, char **argv) {
     }
     if (steps < 1 || steps > 100 || (manual_t >= 0.0f && steps != 1)) return 2;
     if (!!editing_layout_path != !!condition_path ||
-        (editing_layout_path && negative_prompt_path)) {
-        fprintf(stderr,"native: editing requires layout plus condition latents; CFG editing not yet supported\n");
+        (editing_layout_path && (!!negative_prompt_path != !!negative_editing_layout_path)) ||
+        (negative_editing_layout_path && !editing_layout_path)) {
+        fprintf(stderr,"native: editing requires layout plus condition latents; editing CFG also requires a negative layout and embeds\n");
         return 2;
     }
     if (qimg21_quantize_on_load && qimg21_quantized_transformer) {
@@ -572,14 +576,20 @@ int main(int argc, char **argv) {
         for(size_t j=0;j<(size_t)nc*64;j++)if(!isfinite(condition.data[j]))return 2;
         for(size_t j=0;j<(size_t)ni*64;j++)if(!isfinite(la.data[j]))return 2;
         for(size_t j=0;j<(size_t)nt*4096;j++)if(!isfinite(pe.data[j]))return 2;
+        for(size_t j=0;j<(size_t)nnt*4096;j++)if(!isfinite(neg.data[j]))return 2;
         packed=malloc((size_t)(nc+ni)*64*sizeof(float));
         if(!packed)return 1;
         memcpy(packed,condition.data,(size_t)nc*64*sizeof(float));
     }
     const float *p=pe.data; cuda_qimg_runner*r=cuda_qimg_init(0,verbose);if(!r)return 1;
     q21_edit_context edit={0};
+    q21_edit_context negative_edit={0};
     if(editing_layout_path && q21_edit_init(&edit,r,editing_layout_path,nt,nc+ni,ih,iw,qimg21_attention_reverse64)) {
         cuda_qimg_free(r);free(packed);npy_free(&condition);return 1;
+    }
+    if(negative_editing_layout_path && q21_edit_init(&negative_edit,r,negative_editing_layout_path,
+                                                  nnt,nc+ni,ih,iw,qimg21_attention_reverse64)) {
+        q21_edit_free(&edit);cuda_qimg_free(r);free(packed);npy_free(&condition);return 1;
     }
     qimg21_shards s={{0},0};char path[1024];for(int i=1;i<=2;i++){snprintf(path,sizeof(path),"%s/transformer/diffusion_pytorch_model-%05d-of-00002.safetensors",model,i);s.st[s.n]=safetensors_open(path);if(!s.st[s.n]){fprintf(stderr,"native: cannot open %s\n",path);cuda_qimg_free(r);return 1;}fprintf(stderr,"native: opened shard %d (%d tensors)\n",i,s.st[s.n]->n_tensors);s.n++;}
     qimg21_kernels k;CUmodule m;if(cu_compile_kernels(&m,r->device,qimg21_src,"qimg21_native.cu",verbose,"qimg21_native")<0||get_kernel(&k,m)!=0){fprintf(stderr,"native: custom kernel compile failed\n");return 1;}fprintf(stderr,"native: custom kernels ready\n");
@@ -603,7 +613,8 @@ int main(int argc, char **argv) {
         rc = native_step(r, &k, &s, p, nt, packed?packed:la.data, nc+ni, ih, iw, model_t, pred,
                          editing_layout_path?&edit:NULL);
         if (rc == 0 && negative_prompt_path) {
-            rc = native_step(r, &k, &s, neg.data, nnt, la.data, ni, ih, iw, model_t, neg_pred, NULL);
+            rc = native_step(r, &k, &s, neg.data, nnt, packed?packed:la.data, nc+ni, ih, iw, model_t,
+                             neg_pred, negative_editing_layout_path?&negative_edit:NULL);
             if (rc == 0) for (size_t j = 0; j < (size_t)ni * 64; j++) {
                 float difference=qimg21_round_bf16_host(pred[j]-neg_pred[j]);
                 float guided=qimg21_round_bf16_host(guidance_scale*difference);
@@ -628,6 +639,6 @@ int main(int argc, char **argv) {
         fprintf(stderr, "native: wrote %s (%d tokens x 64, %d steps)\n", out_path, ni, steps);
     }
     free(pred); free(neg_pred); free(sigmas); cuModuleUnload(m); for(int i=0;i<s.n;i++)safetensors_close(s.st[i]);
-    q21_edit_free(&edit);free(packed);npy_free(&condition);
+    q21_edit_free(&edit);q21_edit_free(&negative_edit);free(packed);npy_free(&condition);
     cuda_qimg_free(r); npy_free(&pe); npy_free(&neg); npy_free(&la); return rc;
 }
