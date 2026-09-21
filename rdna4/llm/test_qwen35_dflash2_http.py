@@ -75,6 +75,7 @@ def main():
     parser.add_argument("--runner", default="./rdna4/llm/test_hip_llm")
     parser.add_argument("--port", type=int, default=18090)
     parser.add_argument("--context", type=int, default=512)
+    parser.add_argument("--snapshot-max-tokens", type=int, default=0)
     parser.add_argument("--long-prompt-tokens", type=int, default=0,
                         help="also exercise a deterministic longer cached prompt")
     args = parser.parse_args()
@@ -84,6 +85,8 @@ def main():
         "--max-output", "8", "--qwen35-dflash2", args.sidecar,
         "--qwen35-dflash2-draft", "7",
     ]
+    if args.snapshot_max_tokens:
+        command += ["--qwen35-snapshot-max-tokens", str(args.snapshot_max_tokens)]
     os.makedirs("tmp/qwen38/dflash-http-quality", exist_ok=True)
     server_log_path = os.path.join(
         "tmp/qwen38/dflash-http-quality", f"server-{args.port}.log")
