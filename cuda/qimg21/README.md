@@ -118,6 +118,17 @@ The same matched-input low-timestep denoiser compared with a PyTorch math
 SDPA reference scored 0.99994985006, still below 0.99996. Changing the
 attention backend alone therefore does not resolve the parity failure.
 
+CPU softmax-order replay gives a more specific lead: reverse-order 64-key
+tiles with BF16-rounded unnormalized probabilities match the saved block-17
+PyTorch image-attention output at cosine 0.9999999904 (99.8369% exact), versus
+0.9999992812 for the full-F32 calculation. Reproduce with
+`OMP_NUM_THREADS=2 python attention_order_probe.py --stage-dir DIR` using a
+stage directory containing `pytorch_attn_matched.npy` from the CUDA probe.
+This is an inference from saved outputs, not proof of PyTorch's dispatch.
+The native executable exposes an experimental `--attention reverse64` kernel
+for full-denoiser validation; default `--attention math` remains unchanged.
+Native GPU accuracy/performance for the new kernel has not yet been measured.
+
 The native Euler update rounds its BF16 prediction-times-step product and
 casts the updated sample back to BF16, matching the CUDA PyTorch scheduler.
 The model timestep separately follows BF16 rounding of `sigma*1000` and

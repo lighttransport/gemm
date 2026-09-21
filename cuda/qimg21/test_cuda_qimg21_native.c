@@ -257,6 +257,22 @@ static const char *qimg21_src =
 "__global__ void gate_res_bf16(float*x,const float*y,const float*m,int N,int D,int prefix,int which){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=N*D)return;int t=i/D,j=i%D,row=t<prefix?1:0;int base=row*4*D+which*2*D+D;float g=tanhf(m[base+j]);unsigned u=__float_as_uint(g),l=(u>>16)&1u;g=__uint_as_float((u+0x7fffu+l)&0xffff0000u);float p=g*y[i];u=__float_as_uint(p);l=(u>>16)&1u;p=__uint_as_float((u+0x7fffu+l)&0xffff0000u);float z=x[i]+p;u=__float_as_uint(z);l=(u>>16)&1u;x[i]=__uint_as_float((u+0x7fffu+l)&0xffff0000u);}\n"
 "__global__ void qk_rope(float*q,float*k,const float*qw,const float*kw,int N,int D,int nh,int hd,int prefix,int ih,int iw){int t=blockIdx.x,h=blockIdx.y,j=threadIdx.x;if(t>=N||h>=nh)return;__shared__ float sq[128],sk[128];float aq=0,ak=0;for(int z=j;z<hd;z+=blockDim.x){float v=q[t*D+h*hd+z];aq+=v*v;v=k[t*D+h*hd+z];ak+=v*v;}sq[j]=aq;sk[j]=ak;__syncthreads();for(int z=64;z;z>>=1){if(j<z){sq[j]+=sq[j+z];sk[j]+=sk[j+z];}__syncthreads();}if(j&1)return;float iq=rsqrtf(sq[0]/hd+1e-6f),ik=rsqrtf(sk[0]/hd+1e-6f);int axis,off,pos;if(j<16){axis=16;off=0;pos=t<prefix?t:prefix;}else if(j<72){axis=56;off=16;pos=t<prefix?t:-(ih-ih/2)+(t-prefix)/iw;}else{axis=56;off=72;pos=t<prefix?t:-(iw-iw/2)+(t-prefix)%iw;}int pair=(j-off)&~1;float ang=(float)pos*exp2f(-log2f(10000.f)*(float)(pair)/(float)axis);float c=cosf(ang),sn=sinf(ang);int d0=h*hd+off+pair,d1=d0+1;float x0=q[t*D+d0]*iq*qw[off+pair],x1=q[t*D+d1]*iq*qw[off+pair+1];float y0=k[t*D+d0]*ik*kw[off+pair],y1=k[t*D+d1]*ik*kw[off+pair+1];q[t*D+d0]=x0*c-x1*sn;q[t*D+d1]=x0*sn+x1*c;k[t*D+d0]=y0*c-y1*sn;k[t*D+d1]=y0*sn+y1*c;}\n"
 "__device__ float q21_rne(float x){unsigned u=__float_as_uint(x),l=(u>>16)&1u;return __uint_as_float((u+0x7fffu+l)&0xffff0000u);}\n"
+/* CPU replay of the observed sm_120 fixture most closely matches 64-key
+ * tiles visited backwards with unnormalized probabilities rounded to BF16. Keep
+ * this experimental path explicit until full-denoiser parity is measured. */
+"__global__ void masked_attn_reverse64(float*o,const float*q,const float*k,const float*v,int N,int P,int nh,int hd){\n"
+" int h=blockIdx.x,qi=blockIdx.y*4+threadIdx.x/32,lane=threadIdx.x&31,D=nh*hd; if(qi>=N||h>=nh)return;\n"
+" float qr[4],acc[4]={0,0,0,0}; for(int e=0;e<4;e++)qr[e]=q[qi*D+h*hd+lane+32*e];\n"
+" int limit=qi<P?qi+1:N; float mx=-1e30f,den=0;\n"
+" for(int b=((limit-1)/64)*64;b>=0;b-=64){float nm=mx; int end=min(b+64,limit);\n"
+"  for(int t=b;t<end;t++){float dot=0;for(int e=0;e<4;e++)dot+=qr[e]*k[t*D+h*hd+lane+32*e];\n"
+"   for(int z=16;z;z>>=1)dot+=__shfl_xor_sync(0xffffffff,dot,z);nm=fmaxf(nm,dot*rsqrtf((float)hd));}\n"
+"  float alpha=expf(mx-nm);den*=alpha;for(int e=0;e<4;e++)acc[e]*=alpha;\n"
+"  for(int t=b;t<end;t++){float dot=0;for(int e=0;e<4;e++)dot+=qr[e]*k[t*D+h*hd+lane+32*e];\n"
+"   for(int z=16;z;z>>=1)dot+=__shfl_xor_sync(0xffffffff,dot,z);float p=expf(dot*rsqrtf((float)hd)-nm);den+=p;p=q21_rne(p);\n"
+"   for(int e=0;e<4;e++)acc[e]+=p*v[t*D+h*hd+lane+32*e];}mx=nm;}\n"
+" for(int e=0;e<4;e++)o[qi*D+h*hd+lane+32*e]=acc[e]/den;\n"
+"}\n"
 "__global__ void qk_rope_bf16(float*q,float*k,const float*qw,const float*kw,int N,int D,int nh,int hd,int prefix,int ih,int iw){int t=blockIdx.x,h=blockIdx.y,j=threadIdx.x;if(t>=N||h>=nh)return;__shared__ float sq6[128],sk6[128];float aq=0,ak=0;for(int z=j;z<hd;z+=blockDim.x){float v=q[t*D+h*hd+z];aq+=v*v;v=k[t*D+h*hd+z];ak+=v*v;}sq6[j]=aq;sk6[j]=ak;__syncthreads();for(int z=64;z;z>>=1){if(j<z){sq6[j]+=sq6[j+z];sk6[j]+=sk6[j+z];}__syncthreads();}if(j&1)return;float iq=rsqrtf(sq6[0]/hd+1e-6f),ik=rsqrtf(sk6[0]/hd+1e-6f);int axis,off,pos;if(j<16){axis=16;off=0;pos=t<prefix?t:prefix;}else if(j<72){axis=56;off=16;pos=t<prefix?t:-(ih-ih/2)+(t-prefix)/iw;}else{axis=56;off=72;pos=t<prefix?t:-(iw-iw/2)+(t-prefix)%iw;}int pair=(j-off)&~1;float ang=(float)pos*exp2f(-log2f(10000.f)*(float)(pair)/(float)axis);float c=cosf(ang),sn=sinf(ang);int d0=h*hd+off+pair,d1=d0+1;float x0=q21_rne(q[t*D+d0]*iq)*qw[off+pair],x1=q21_rne(q[t*D+d1]*iq)*qw[off+pair+1];float y0=q21_rne(k[t*D+d0]*ik)*kw[off+pair],y1=q21_rne(k[t*D+d1]*ik)*kw[off+pair+1];unsigned u=__float_as_uint(x0),l=(u>>16)&1u;x0=__uint_as_float((u+0x7fffu+l)&0xffff0000u);u=__float_as_uint(x1);l=(u>>16)&1u;x1=__uint_as_float((u+0x7fffu+l)&0xffff0000u);u=__float_as_uint(y0);l=(u>>16)&1u;y0=__uint_as_float((u+0x7fffu+l)&0xffff0000u);u=__float_as_uint(y1);l=(u>>16)&1u;y1=__uint_as_float((u+0x7fffu+l)&0xffff0000u);q[t*D+d0]=x0*c-x1*sn;q[t*D+d1]=x0*sn+x1*c;k[t*D+d0]=y0*c-y1*sn;k[t*D+d1]=y0*sn+y1*c;}\n"
 "__global__ void masked_attn(float*o,const float*q,const float*k,const float*v,int N,int P,int nh,int hd){int h=blockIdx.x,warp=threadIdx.x/32,lane=threadIdx.x&31,qi=blockIdx.y*4+warp;if(h>=nh)return;int D=nh*hd;float qr[4],or_[4];for(int e=0;e<4;e++){int d=lane*4+e;qr[e]=(qi<N&&d<hd)?q[qi*D+h*hd+d]:0;or_[e]=0;}float mi=-1e30f,li=0;extern __shared__ float sm[];float*sk=sm,*sv=sm+32*128;for(int b=0;b<N;b+=32){for(int z=threadIdx.x;z<32*128;z+=128){int kk=z/128,d=z%128,t=b+kk;sk[z]=(t<N)?k[t*D+h*hd+d]:0;sv[z]=(t<N)?v[t*D+h*hd+d]:0;}__syncthreads();for(int kk=0;kk<32;kk++){int kt=b+kk;bool allow=kt<N&&qi<N&&(qi>=P||kt<=qi);if(!allow)continue;float dot=0;for(int e=0;e<4;e++)dot+=qr[e]*sk[kk*128+lane*4+e];for(int z=16;z;z>>=1)dot+=__shfl_xor_sync(0xffffffff,dot,z);float score=dot*rsqrtf((float)hd),nm=fmaxf(mi,score),a=expf(mi-nm),p=expf(score-nm);li=li*a+p;for(int e=0;e<4;e++)or_[e]=or_[e]*a+p*sv[kk*128+lane*4+e];mi=nm;}__syncthreads();}if(qi<N){float il=li>0?1.f/li:0;for(int e=0;e<4;e++){int d=lane*4+e;if(d<hd)o[qi*D+h*hd+d]=or_[e]*il;}}}\n"
 "__global__ void masked_attn_precise(float*o,const float*q,const float*k,const float*v,int N,int P,int nh,int hd){int h=blockIdx.x,warp=threadIdx.x/32,lane=threadIdx.x&31,qi=blockIdx.y*4+warp;if(h>=nh)return;int D=nh*hd;float qr[4],or_[4];for(int e=0;e<4;e++){int d=lane*4+e;qr[e]=(qi<N&&d<hd)?q[qi*D+h*hd+d]:0;or_[e]=0;}extern __shared__ float sm[];float*sk=sm,*sv=sm+32*128;float mx=-1e30f;for(int b=0;b<N;b+=32){for(int z=threadIdx.x;z<32*128;z+=128){int kk=z/128,d=z%128,t=b+kk;sk[z]=(t<N)?k[t*D+h*hd+d]:0;sv[z]=(t<N)?v[t*D+h*hd+d]:0;}__syncthreads();for(int kk=0;kk<32;kk++){int kt=b+kk;if(!(kt<N&&qi<N&&(qi>=P||kt<=qi)))continue;float dot=0;for(int e=0;e<4;e++)dot+=qr[e]*sk[kk*128+lane*4+e];for(int z=16;z;z>>=1)dot+=__shfl_xor_sync(0xffffffff,dot,z);mx=fmaxf(mx,dot*rsqrtf((float)hd));}__syncthreads();}for(int z=16;z;z>>=1)mx=fmaxf(mx,__shfl_xor_sync(0xffffffff,mx,z));float sum=0;for(int b=0;b<N;b+=32){for(int z=threadIdx.x;z<32*128;z+=128){int kk=z/128,d=z%128,t=b+kk;sk[z]=(t<N)?k[t*D+h*hd+d]:0;sv[z]=(t<N)?v[t*D+h*hd+d]:0;}__syncthreads();for(int kk=0;kk<32;kk++){int kt=b+kk;if(!(kt<N&&qi<N&&(qi>=P||kt<=qi)))continue;float dot=0;for(int e=0;e<4;e++)dot+=qr[e]*sk[kk*128+lane*4+e];for(int z=16;z;z>>=1)dot+=__shfl_xor_sync(0xffffffff,dot,z);float p=expf(dot*rsqrtf((float)hd)-mx);sum+=p;for(int e=0;e<4;e++)or_[e]+=p*sv[kk*128+lane*4+e];}__syncthreads();}if(qi<N){float il=sum>0?1.f/sum:0;for(int e=0;e<4;e++){int d=lane*4+e;if(d<hd)o[qi*D+h*hd+d]=or_[e]*il;}}}\n"
@@ -275,6 +291,8 @@ typedef struct {
     CUfunction zero_rms, gelu, silu, round_bf16, mul_silu, mod_ln, mod_ln_precise, gate_res, qk_rope, attn, final_ln, proj;
 } qimg21_kernels;
 
+static int qimg21_attention_reverse64;
+
 static int get_kernel(qimg21_kernels *k, CUmodule m) {
     k->mod = m;
     return cuModuleGetFunction(&k->zero_rms, m, "zero_rms") ||
@@ -286,7 +304,7 @@ static int get_kernel(qimg21_kernels *k, CUmodule m) {
            cuModuleGetFunction(&k->mod_ln_precise, m, "mod_ln_precise") ||
            cuModuleGetFunction(&k->gate_res, m, "gate_res_bf16") ||
            cuModuleGetFunction(&k->qk_rope, m, "qk_rope_bf16") ||
-           cuModuleGetFunction(&k->attn, m, "masked_attn_precise") ||
+           cuModuleGetFunction(&k->attn, m, qimg21_attention_reverse64 ? "masked_attn_reverse64" : "masked_attn_precise") ||
            cuModuleGetFunction(&k->final_ln, m, "final_ln_precise") ||
            cuModuleGetFunction(&k->proj, m, "proj_bf16");
 }
@@ -441,6 +459,12 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--model") && i + 1 < argc) model = argv[++i];
         else if (!strcmp(argv[i], "--quantized-transformer") && i + 1 < argc) qimg21_quantized_transformer = argv[++i];
+        else if (!strcmp(argv[i], "--attention") && i + 1 < argc) {
+            const char *mode = argv[++i];
+            if (!strcmp(mode, "reverse64")) qimg21_attention_reverse64 = 1;
+            else if (!strcmp(mode, "math")) qimg21_attention_reverse64 = 0;
+            else { fprintf(stderr, "native: attention must be math or reverse64\n"); return 2; }
+        }
         else if (!strcmp(argv[i], "--prompt-embeds") && i + 1 < argc) prompt_path = argv[++i];
         else if (!strcmp(argv[i], "--negative-prompt-embeds") && i + 1 < argc) negative_prompt_path = argv[++i];
         else if (!strcmp(argv[i], "--guidance-scale") && i + 1 < argc) guidance_scale = (float)atof(argv[++i]);
