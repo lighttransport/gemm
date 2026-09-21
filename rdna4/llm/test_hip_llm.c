@@ -272,6 +272,7 @@ static int prompt_bos_id(const gguf_context *gguf) {
 
 static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
                             int n_vocab, int max_seq_len, int bos_id, int mtp_draft,
+                            int dflash_draft,
                             int coding_mode, const hllm_sampler_config *sampling_defaults) {
     char line[4 * 1024 * 1024];
     int32_t *cache = (int32_t *)malloc((size_t)max_seq_len * sizeof(int32_t));
@@ -569,6 +570,8 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
         int mtp_index = 0, mtp_pending = -1, mtp_error = 0;
         int mtp_approx_fallback = 0;
         int mtp_adaptive_fallback = 0;
+        int32_t dflash_drafts[7], dflash_argmax[8];
+        int dflash_count = 0, dflash_index = 0, dflash_rows = 0;
         int32_t stops[] = { eos, eot, im_end };
         for (int k = 0; logits && k < max_tokens; k++) {
             if (g_stdio_cancel) { cancelled = 1; break; }
@@ -593,7 +596,10 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
                             mtp.accepted, mtp.drafted);
                 }
             }
-            int next = use_mtp ? mtp.tokens[mtp_index++] : sampler ? hllm_sampler_sample(sampler, logits) : (temperature <= 0.0f) ? argmax_logits(logits, n_vocab) :
+            int dflash_window = dflash_draft > 0 && temperature <= 0.0f && !sampler &&
+                                dflash_rows > 0;
+            int next = dflash_window ? dflash_argmax[dflash_index] :
+                use_mtp ? mtp.tokens[mtp_index++] : sampler ? hllm_sampler_sample(sampler, logits) : (temperature <= 0.0f) ? argmax_logits(logits, n_vocab) :
                 (coding_mode ? sample_top_k_p_coding(logits, n_vocab, top_k, top_p,
                                temperature, presence, repetition, min_p, seen, &rng, vocab) :
                  sample_top_k_p(logits, n_vocab, top_k, top_p, temperature, presence,
@@ -635,10 +641,42 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
                 finish_eos = 1;
                 break;
             }
+            if (dflash_window) {
+                int matched = dflash_index < dflash_count && next == dflash_drafts[dflash_index];
+                dflash_index++;
+                if (!matched || dflash_index == dflash_rows) {
+                    if (hip_llm_qwen35_dflash2_commit(gpu, cache_n - dflash_index,
+                                                      dflash_index)) {
+                        mtp_error = 1; break;
+                    }
+                    dflash_rows = dflash_index = dflash_count = 0;
+                }
+            }
+            if (dflash_draft > 0 && !sampler && temperature <= 0.0f &&
+                dflash_rows == 0 && k + 1 < max_tokens) {
+                int count = max_tokens - k - 1;
+                if (count > dflash_draft) count = dflash_draft;
+                if (count > 0 && hip_llm_qwen35_dflash2_propose(gpu, next, cache_n - 1,
+                                                                  count, dflash_drafts)) {
+                    mtp_error = 1; break;
+                }
+                if (count > 0) {
+                    int32_t inputs[8]; inputs[0] = next;
+                    memcpy(inputs + 1, dflash_drafts, (size_t)count * sizeof(int32_t));
+                    if (hip_llm_qwen35_mtp_verify_argmax(gpu, inputs, count + 1,
+                                                         cache_n - 1, dflash_argmax)) {
+                        mtp_error = 1; break;
+                    }
+                    dflash_count = count;
+                    dflash_rows = count + 1;
+                    dflash_index = 0;
+                }
+            }
             /* If approximate MTP just fell back after a zero-accept batch,
              * replay the emitted anchor through the target so the ordinary
              * decode path resumes with fresh logits and state. */
-            if (!use_mtp || mtp_approx_fallback || mtp_adaptive_fallback)
+            if (!use_mtp && !dflash_window &&
+                (!dflash_draft || dflash_rows == 0))
                 logits = hip_llm_forward_logits(gpu, next, cache_n - 1);
             double token_now = get_time_ms();
             double token_ms = token_now - t_decode0;
@@ -1686,7 +1724,7 @@ int main(int argc, char **argv) {
     }
     if (qwen35_dflash2_path) {
         char error[192] = "invalid benchmark mode or draft width";
-        if (!bench_mode || stdio_server || qwen4_mtp || qwen35_mtp_path ||
+        if ((!bench_mode && !stdio_server) || qwen4_mtp || qwen35_mtp_path ||
             qwen35_dflash2_draft < 1 || qwen35_dflash2_draft > 7 ||
             !qwen35_batched_prefill || !qwen35_decode_graph ||
             kv_cache_type != HIP_LLM_KV_Q8_0_Q8_0 ||
@@ -1781,6 +1819,7 @@ int main(int argc, char **argv) {
         int bos = prompt_bos_id(gguf);
         pass = run_stdio_server(gpu, vocab, n_vocab, n_max_seq, bos,
                                 qwen4_mtp ? qwen4_mtp_draft : 0,
+                                qwen35_dflash2_path ? qwen35_dflash2_draft : 0,
                                 coding_mode, reference_sampling ? &sampling : NULL) == 0;
         hip_llm_free(gpu);
         if (cpu_model) transformer_free(cpu_model);

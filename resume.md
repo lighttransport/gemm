@@ -199,17 +199,21 @@ Remaining optimization items, in measured priority order:
    broaden long-context sampled and quality coverage once the performance work
    stabilizes.
 
-The first serving step is now complete for the ordinary Qwen3.8 target.  The
+The first serving step is now complete for the ordinary Qwen3.8 target, and
+the exact DFlash2 window transaction is now available through the same
+resident stdio child.  The
 `codex_server.py --qwen35-server-profile` option starts the resident stdio
 runner with the validated exact Q8/Q8 cache, native prefill, decode graph and
 MMVQ routes.  A loopback OpenAI-compatible request returned the exact
 `READY` response and stopped on the model's `<|im_end|>` token; the existing
 protocol suite passes all 12 tests, including request cancellation, cache
-reuse, tool-call framing and diagnostic alignment.  DFlash2 remains
-benchmark-only because its exact multi-row verifier is currently gated on the
-benchmark execution path; exposing it through HTTP would require a separate
-stateful window transaction rather than silently falling back to ordinary
-decode.
+reuse, tool-call framing and diagnostic alignment.  DFlash2 is available with
+`--qwen35-dflash2 SIDECAR --qwen35-dflash2-draft 1..7`; its exact
+propose/verify/commit window is serialized per request and preserves
+prompt-cache reuse.  A real two-request loopback test returned identical
+`READY` output on both requests.  Sampled HTTP requests continue to use the
+ordinary exact target path until a sampler-aware DFlash window transaction is
+added.
 
 CLI: `--qwen35-dflash2 SIDECAR --qwen35-dflash2-draft 1..7`; it currently
 requires benchmark mode, `--qwen35-batched-prefill`, `--qwen35-decode-graph`

@@ -54,9 +54,13 @@ bash rdna4/llm/run_qwen38_gsq_rocm.sh --gpu-only-bench \
 ```
 
 Draft width may be 1 through 7.  The sidecar currently requires benchmark
-mode, batched Qwen3.8 prefill, the decode graph, and Q8 K plus Q8 V.  It is
-mutually exclusive with dense NextN and Qwen4 MTP.  HTTP/stdio scheduling is
-not implemented.
+mode or the resident stdio server, batched Qwen3.8 prefill, the decode graph,
+and Q8 K plus Q8 V.  It is mutually exclusive with dense NextN and Qwen4 MTP.
+The HTTP shim enables it with `--qwen35-dflash2 SIDECAR`; each request is
+serialized through the exact propose/verify/commit window and reuses the
+ordinary prompt cache.  Temperature-zero requests use the exact argmax window;
+sampled HTTP requests remain on ordinary exact target decode until a
+sampler-aware DFlash transaction is added.
 
 The reference validator accepts the sidecar directly:
 

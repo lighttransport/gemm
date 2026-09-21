@@ -27,6 +27,13 @@ class ProtocolTest(unittest.TestCase):
         self.assertIn("q8q8", command)
         self.assertEqual(command[-2:], ["--sampling-profile", "llama"])
 
+        args.qwen35_dflash2 = "draft.gguf"
+        args.qwen35_dflash2_draft = 7
+        dflash_command = runner_command(args)
+        self.assertIn("--qwen35-dflash2", dflash_command)
+        self.assertEqual(dflash_command[-4:], ["--qwen35-dflash2", "draft.gguf",
+                                               "--qwen35-dflash2-draft", "7"])
+
     def test_seed_uses_versioned_reference_sampler_request(self):
         backend = Backend.__new__(Backend)
         backend.lock = threading.Lock()

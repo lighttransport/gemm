@@ -54,6 +54,13 @@ def runner_command(args):
         cmd += ["--kv-cache", "q8q8", "--qwen35-prefill-bf16",
                 "--qwen35-decode-graph", "--qwen35-native-q8-prefill",
                 "--qwen35-native-mmvq", "--sampling-profile", "llama"]
+    dflash = getattr(args, "qwen35_dflash2", None)
+    if dflash:
+        cmd += ["--kv-cache", "q8q8", "--qwen35-prefill-bf16",
+                "--qwen35-decode-graph", "--qwen35-native-q8-prefill",
+                "--qwen35-native-mmvq",
+                "--qwen35-dflash2", dflash,
+                "--qwen35-dflash2-draft", str(getattr(args, "qwen35_dflash2_draft", 7))]
     return cmd
 
 
@@ -783,6 +790,9 @@ def main():
                     help="exact MTP fallback after low draft acceptance")
     ap.add_argument("--qwen35-server-profile", action="store_true",
                     help="use the validated exact Qwen3.8 Q8/Q8 HTTP/stdio profile")
+    ap.add_argument("--qwen35-dflash2", metavar="SIDECAR",
+                    help="exact Qwen3.8 DFlash2 sidecar for HTTP/stdio serving")
+    ap.add_argument("--qwen35-dflash2-draft", type=int, choices=range(1, 8), default=7)
     args = ap.parse_args()
     Handler.backend = Backend(args)
     Handler.model = Handler.backend.model
