@@ -16,6 +16,16 @@ Seeded sampled K=7 measured 70.47 tok/s warm (140 drafted, 115 accepted) with
 stable hash `630b7cbc72230e0d` and about 250 ms draft time. The full HTTP/stdio
 cache, cancellation, concurrency, and multi-turn C++ quality harness passes.
 
+Every non-anchor DFlash2 proposal row is the same mask token. The default
+embedding path now decodes one anchor row and one mask row with the exact IQ1_M
+scalar kernel, then performs device-to-device copies for the remaining mask
+rows. Set `LLM_QWEN35_DFLASH_EMBED_BROADCAST=0` to restore the previous
+row-batched A/B path. Matched 4K K=7 greedy runs retained 140 drafted/134
+accepted and hash `44915ec1039a64c8`; draft time fell from 368--370 ms to
+263--264 ms, and warm decode improved from 78.66--79.88 to 82.65--84.12
+tok/s. The complete HTTP/stdio and multi-turn C++ quality suite, including
+seeded sampling, passed with the default fast path.
+
 ## Fused sidecar attention merge (2026-09-22)
 
 The DFlash2 verifier now uses a fused attention kernel for schedules of up to
@@ -582,6 +592,12 @@ reflects the remaining measured costs.
    its independent reductions retain the original order and exact output
    hashes.
 
+   A three-repeat DeltaNet warp-per-row batch probe averaged 38.99 tok/s on
+   the seeded sampled 4K gate versus 38.94 tok/s for the reference-order
+   implementation, with identical sequence hash `c6bb94e73050164e` on every
+   run. The gain is below measurement noise, so the warp path remains opt-in
+   (`LLM_SSM_BATCH_WARP=1`) and the reference-order default is retained.
+
    The HTTP quality harness now forces another conversation between long-prompt
    requests, which proves restoration from host state instead of reuse of the
    still-live GPU context. The validated interleaved prompt is 6,535 actual
@@ -610,12 +626,12 @@ reflects the remaining measured costs.
    cheaper draft-cache storage are the next candidates, provided K=4/K=7
    acceptance and authoritative output remain stable.
 
-   The anchor and fixed mask-token rows now use one exact row-batched IQ1_M
-   embedding launch. The pinned greedy K=7 gate is exact at 83.69 tok/s warm
-   (140 drafted/134 accepted, hash `44915ec1039a64c8`), and seeded sampled K=7
-   is exact at 70.47 tok/s (140 drafted/115 accepted, hash
-   `630b7cbc72230e0d`). Draft projection cost remains the material sidecar
-   target after this launch-count reduction.
+   The anchor and fixed mask-token rows now use one scalar IQ1_M mask embedding
+   plus device copies for the remaining rows. The pinned greedy K=7 gate is
+   exact at 82.65--84.12 tok/s warm (140 drafted/134 accepted, hash
+   `44915ec1039a64c8`), and seeded sampled K=7 remains exact at 70.47 tok/s
+   (140 drafted/115 accepted, hash `630b7cbc72230e0d`). Projection cost remains
+   the material sidecar target after eliminating redundant mask embedding work.
 6. **Prompt-cache injection.**  Feature capture now shares the target
    RMSNorm kernel and both 4K and random-64K prefill retain their targets.
    The hipBLASLt bridge now allocates scratch lazily per HIP stream, so a

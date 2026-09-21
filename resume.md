@@ -518,6 +518,23 @@ exact at 35.80 tok/s (prefill 443.99 tok/s, prefix `90178de69a24a76e`, suffix
 `7463f176c9b85ba3`).  The gain is small, so the grouped/mixed projection work
 in item 1 remains open; no production tuning defaults changed.
 
+The DFlash2 mask rows now use a safe default fast path. Every non-anchor
+proposal row has the same mask token, so the runner embeds one anchor and one
+mask row with the exact IQ1_M scalar kernel, then copies the mask row on-device
+for the remaining rows. `LLM_QWEN35_DFLASH_EMBED_BROADCAST=0` restores the
+older row-batched embedding for A/B checks. Matched 4K K=7 greedy runs kept
+140 drafted/134 accepted and hash `44915ec1039a64c8`; draft time fell from
+368--370 ms to 263--264 ms and warm decode rose from 78.66--79.88 to
+82.65--84.12 tok/s. The full HTTP/stdio, cancellation, cache, concurrency,
+sampled-repeatability, and multi-turn C++ harness passed with the broadcast
+path. Target verification and selector indexing remain unchanged.
+
+The DeltaNet warp-per-row batch probe was rerun three times under the seeded
+sampled 4K gate. It averaged 38.99 tok/s versus 38.94 tok/s for the
+reference-order path, with `c6bb94e73050164e` on every run. The difference is
+within dispatch noise, so `LLM_SSM_BATCH_WARP=1` remains an explicit diagnostic
+option and the reference-order production default is unchanged.
+
 The resident Qwen3.8/DFlash2 server now has request-owned, bounded
 multi-context state. `REQ3` carries a hashed cache namespace, and the HTTP
 shim derives it from `prompt_cache_key`, conversation/session metadata, or

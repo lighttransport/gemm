@@ -517,7 +517,28 @@ int hip_llm_qwen35_dflash2_propose(hip_llm_runner *r, int32_t anchor,
     int rows=count+1, ne=r->n_embd, qd=HLLM_DFLASH_HEADS*HLLM_DFLASH_HEAD_DIM;
     int kd=HLLM_DFLASH_KV_HEADS*HLLM_DFLASH_HEAD_DIM;
     d->q81_source=NULL;
-    if (r->fn_embed_iq1_m_batch) {
+    const char *embed_broadcast_env =
+        getenv("LLM_QWEN35_DFLASH_EMBED_BROADCAST");
+    int embed_broadcast = rows > 2 &&
+        (!embed_broadcast_env || atoi(embed_broadcast_env) != 0);
+    if (embed_broadcast) {
+        /* All non-anchor rows are the same mask token.  Keep the exact scalar
+         * IQ1_M embedding for one mask row, then replicate its device bits;
+         * this removes redundant codebook traversal without changing any
+         * feature values consumed by the draft graph. */
+        launch_embed_iq1_m(r, d->x, r->d_token_embd, anchor, ne);
+        launch_embed_iq1_m(r, (float *)d->x + (size_t)ne,
+                           r->d_token_embd, d->mask_token, ne);
+        for (int i = 2; i < rows; ++i) {
+            if (hipMemcpyAsync((float *)d->x + (size_t)i * ne,
+                               (float *)d->x + ne,
+                               (size_t)ne * sizeof(float),
+                               hipMemcpyDeviceToDevice, r->stream) != hipSuccess) {
+                r->qwen4_forward_error = 1;
+                return -1;
+            }
+        }
+    } else if (r->fn_embed_iq1_m_batch) {
         /* The anchor and mask rows use the same exact IQ1_M decode contract.
          * Publish all row ids into the selector-candidate scratch (which is
          * consumed by top-k only after this launch) and perform one batched
