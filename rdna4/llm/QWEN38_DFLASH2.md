@@ -348,6 +348,9 @@ run passes repeatability and cache reuse, including after the
    deployments that deliberately budget larger host-side Q8 KV snapshots; the
    default remains 16k tokens. A 32k-budget run with a roughly 20k-token prompt
    in a 24k context passes cache reuse and cancellation recovery.
+   A 65,536-context run with a roughly 60k-token prompt and a 65,536 snapshot
+   budget also passes cache reuse without replay, including cancellation and
+   concurrent-request checks.
 4. **Kernel and graph count.** Q/gate deinterleave, QK normalization, RoPE
    and Q8/Q8 KV storage are now fused exactly. The remaining small launches
    include SiLU/gating and state preparation. Fuse adjacent operations when

@@ -255,6 +255,8 @@ requests concurrently and verifies both answers remain isolated and coherent.
 Deployments that need a larger host snapshot budget can pass
 `--qwen35-snapshot-max-tokens N`; zero keeps the 16k default. The opt-in
 32k-budget gate passes with a roughly 20k-token prompt in a 24k context.
+The same opt-in path now passes a roughly 60k-token prompt at 65,536 context
+with a 65,536 snapshot budget, reusing cached prompt state without replay.
 
 CLI: `--qwen35-dflash2 SIDECAR --qwen35-dflash2-draft 1..7`; it currently
 requires benchmark mode, `--qwen35-batched-prefill`, `--qwen35-decode-graph`
