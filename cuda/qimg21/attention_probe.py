@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
+from attention_replay_compare import metrics
 
 
 def main():
@@ -63,28 +64,16 @@ def main():
     native = np.load(folder / "attn_raw.npy")
     if native.shape != ref.shape:
         raise ValueError(f"shape mismatch: {native.shape} vs {ref.shape}")
-    a, b = native.astype(np.float64).ravel(), ref.astype(np.float64).ravel()
-    finite = bool(np.isfinite(a).all() and np.isfinite(b).all())
-    cosine = float(a @ b / (np.linalg.norm(a) * np.linalg.norm(b)))
-    result = dict(backend=args.backend, torch=torch.__version__, cosine=cosine,
-                  relative_l2=float(np.linalg.norm(a-b)/np.linalg.norm(b)),
-                  equal_fraction=float(np.mean(a==b)), finite=finite)
-    # The condition prefix can dwarf the target. Report both rather than
-    # letting a large, accurate condition block conceal target-only error.
-    result["regions"] = {}
-    for name, start, end in (("prefix", 0, prefix), ("target", prefix, len(ref))):
-        x, y = native[start:end].astype(np.float64).ravel(), ref[start:end].astype(np.float64).ravel()
-        if not x.size:
-            continue
-        result["regions"][name] = {
-            "cosine": float(x @ y / max(np.linalg.norm(x) * np.linalg.norm(y), 1e-30)),
-            "relative_l2": float(np.linalg.norm(x-y) / max(np.linalg.norm(y), 1e-30)),
-            "equal_fraction": float(np.mean(x == y)),
-        }
+    result = metrics(ref, native, len(ref)-prefix)
+    # Preserve the existing top-level aggregate fields for older notebooks.
+    aggregate = result["regions"]["all"]
+    result.update(backend=args.backend, torch=torch.__version__, finite=True,
+                  cosine=aggregate["cosine"], relative_l2=aggregate["relative_l2"],
+                  equal_fraction=aggregate["equal_fraction"])
     np.save(folder / f"pytorch_attn_matched_{args.backend}.npy", ref)
     (folder / f"attention_probe_{args.backend}.json").write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result))
-    return 0 if finite and cosine >= 0.99996 else 1
+    return 0 if result["passed"] else 1
 
 
 if __name__ == "__main__":

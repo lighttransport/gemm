@@ -402,6 +402,22 @@ cuda/qimg21/test_bf16_attention tmp/qimg21-edit-attn0 \
 The replay builds; GPU parity is queued behind guided-editing validation.
 It does not alter default denoiser attention or imply full-model acceptance.
 
+Compare the replay without loading PyTorch or allocating GPU memory:
+
+```sh
+OPENBLAS_NUM_THREADS=1 tmp/qimg21-ref-venv/bin/python cuda/qimg21/attention_replay_compare.py \
+  --reference tmp/qimg21-edit-attn0/pytorch_attn_matched_default.npy \
+  --candidate tmp/qimg21-edit-attn0/mma_attention.npy --target-tokens 256 \
+  --out tmp/qimg21-edit-attn0/mma_comparison.json
+```
+
+Both replay comparators require the whole tensor, prefix, and target region
+to clear 0.99996, and reject nonfinite or mismatched inputs. Two CPU tests
+cover invalid inputs and a failing target hidden inside a passing aggregate
+(23 CPU tests pass total). The existing scalar editing kernel's target-only
+cosine versus default SDPA is **0.999999561**, compared with aggregate
+**0.999999823**; both pass this isolated first-block attention check.
+
 `edit_kernels.h` adds experimental CUDA primitives for that layout:
 interleaved text/image scatter, Q/K RMSNorm plus layout-driven three-axis
 RoPE, and block-causal attention that keeps adjacent images separate.
