@@ -16,10 +16,12 @@ class Encoder(torch.nn.Module):
         super().__init__()
         self.model = torch.nn.Module()
         self.model.language_model = torch.nn.Module()
+        self.model.language_model.layers = torch.nn.ModuleList([torch.nn.Identity()])
         self.model.language_model.norm = torch.nn.RMSNorm(4, dtype=torch.bfloat16)
 
     def forward(self, input_ids, attention_mask):
         hidden = input_ids[..., None].expand(-1, -1, 4).to(torch.bfloat16)
+        hidden = self.model.language_model.layers[0](hidden)
         return self.model.language_model.norm(hidden)
 
 
@@ -47,6 +49,9 @@ class TextCaptureTest(unittest.TestCase):
             self.assertEqual(metadata["norm_calls"], 1)
             self.assertFalse(encoder._forward_pre_hooks)
             self.assertFalse(encoder.model.language_model.norm._forward_pre_hooks)
+            np.testing.assert_array_equal(np.load(folder / "layer_00.npy"),
+                                          np.load(folder / "hidden_prenorm.npy"))
+            self.assertFalse(encoder.model.language_model.layers[0]._forward_hooks)
 
             with self.assertRaisesRegex(RuntimeError, "expected fixture boundaries"):
                 with capture_text_encoder(pipe, folder):

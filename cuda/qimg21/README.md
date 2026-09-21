@@ -271,8 +271,11 @@ batch-one integer token IDs, rejects vision tokens, and limits inputs to
 4096 tokens. Python handles only processor/tokenization and system-prefix
 cropping; `--prepare-only` runs that stage without CUDA or model weights.
 The original checkpoint configuration is required; this is not a general
-Qwen3-VL loader. Host build and sm_120 NVRTC compilation pass, but **GPU
-execution and numerical parity are not yet validated**. It is deliberately
+Qwen3-VL loader. Host build, sm_120 NVRTC compilation, and GPU execution pass,
+but the first English-prompt GPU comparison **fails numerical acceptance**:
+full pre-norm cosine 0.9632453344, cropped-prompt cosine 0.9211241964.
+Per-layer diagnostics are being used to locate this large mismatch.
+It is deliberately
 not the default generation encoder until comparison against captured
 `hidden_prenorm.npy` and cropped prompt embeddings meets the strict gate.
 CPU tokenization checks against the installed official pipeline cover an
@@ -301,6 +304,8 @@ reference cropping. Use a fresh work directory for each run; an explicit
 outputs must still be new. `test_text_regression.py` exercises the gate and
 fixture rejection paths without CUDA; passing that unit test does not prove
 the native model meets the gate.
+Text-stage reference captures now include `layer_NN.npy`; the native text
+executable can save matching boundaries with `--dump-dir DIR`.
 
 For native true CFG, pass `--negative-prompt` and `--true-cfg-scale` to
 `native_generate.py` (the negative embedding is exported beside the positive

@@ -47,6 +47,11 @@ def capture_text_encoder(pipe, folder: Path):
     try:
         handles.append(encoder.register_forward_pre_hook(inputs_hook, with_kwargs=True))
         handles.append(model.norm.register_forward_pre_hook(norm_hook))
+        for index, layer in enumerate(getattr(model, "layers", ())):
+            def layer_hook(module, args, output, index=index):
+                value = output[0] if isinstance(output, tuple) else output
+                _save(folder / f"layer_{index:02d}.npy", value)
+            handles.append(layer.register_forward_hook(layer_hook))
         yield
         if metadata["calls"] != 1 or metadata["norm_calls"] != 1:
             raise RuntimeError("text encoder did not execute the expected fixture boundaries")

@@ -42,12 +42,13 @@ static int text_norm(cuda_qimg_runner *r, CUfunction fn, const qimg21_shards *s,
 }
 
 int main(int argc, char **argv) {
-    const char *model = NULL, *tokens = NULL, *out = NULL;
+    const char *model = NULL, *tokens = NULL, *out = NULL, *dump_dir = NULL;
     int drop = 0, layers = 36;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--model") && i + 1 < argc) model = argv[++i];
         else if (!strcmp(argv[i], "--tokens") && i + 1 < argc) tokens = argv[++i];
         else if (!strcmp(argv[i], "--out") && i + 1 < argc) out = argv[++i];
+        else if (!strcmp(argv[i], "--dump-dir") && i + 1 < argc) dump_dir = argv[++i];
         else if (!strcmp(argv[i], "--drop-prefix") && i + 1 < argc) drop = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--max-layers") && i + 1 < argc) layers = atoi(argv[++i]);
         else { fprintf(stderr, "text: unknown/incomplete option %s\n", argv[i]); return 2; }
@@ -112,6 +113,7 @@ int main(int argc, char **argv) {
     ALLOC(att,n*4096,4); ALLOC(tmp,n*4096,4); ALLOC(gate,n*12288,4); ALLOC(up,n*12288,4);
     #undef ALLOC
     if(cuMemcpyHtoD(x,host,(size_t)n*4096*4))goto done;
+    if(dump_dir && mkdir(dump_dir,0755) && errno!=EEXIST)goto done;
     #define CHECK(call) do { if((call)!=0)goto done; } while(0)
     #define NAME(suffix) snprintf(name,sizeof(name),"model.language_model.layers.%d.%s",l,suffix)
     #define LINEAR(suffix,dst,no,ni) do { NAME(suffix); CHECK(text_linear(r,&base,&shards,name,dst,bf,n,no,ni)); } while(0)
@@ -143,6 +145,12 @@ int main(int argc, char **argv) {
         CHECK(launch_cast(r,bf,gate,ffcount));
         LINEAR("mlp.down_proj.weight",tmp,4096,12288);
         CHECK(cuLaunchKernel(add,(count+255)/256,1,1,256,1,1,0,r->stream,ra,NULL));
+        if(dump_dir) {
+            CHECK(cuStreamSynchronize(r->stream));
+            CHECK(cuMemcpyDtoH(host,x,(size_t)n*4096*4));
+            snprintf(path,sizeof(path),"%s/layer_%02d.npy",dump_dir,l);
+            CHECK(npy_write_f32(path,host,(size_t)n*4096,n,4096));
+        }
     }
     CHECK(cuStreamSynchronize(r->stream));
     CHECK(cuMemcpyDtoH(host,x,(size_t)n*4096*4));
