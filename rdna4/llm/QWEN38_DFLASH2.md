@@ -25,6 +25,10 @@ hashes but measured 35.78 tok/s at 64K versus 35.77 tok/s for the validated
 still needs a fusion that removes partial traffic rather than only changing
 the combine width.
 
+The IQ2_XS `__launch_bounds__(512, 2)` variant was also reverted after two
+exact 4K runs ranged from 42.82 to 42.91 tok/s; the committed `512, 1` bound
+remains the measured choice.
+
 ## Packed Q8/Q8 KV scales (2026-09-21)
 
 Q8 K/V cache scales now use the same rounded FP16 contract as the stored

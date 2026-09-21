@@ -26,6 +26,10 @@ A separate 128-thread Q8 attention combine A/B kept the 4K suffix exact at
 35.77 tok/s for the 256-thread merge.  The extra value load made it neutral,
 so the kernel and its opt-in dispatch were removed.
 
+Finally, `__launch_bounds__(512, 2)` on IQ2_XS was compared with the retained
+`512, 1` bound.  Two 4K runs ranged from 42.82 to 42.91 tok/s with the exact
+hash, so the stricter occupancy request was reverted as noise.
+
 ## 2026-09-22 continuation: IQ1_M micro-tuning and fusion audit
 
 The default one-row IQ1_M F32 kernel now marks its output, weight and
