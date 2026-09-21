@@ -238,29 +238,41 @@ Remaining optimization items, in measured priority order:
 5. Revisit dense NextN/MTP scheduling; the current exact implementation is
    slower than ordinary decode and remains below 60 tok/s.
 
-The first serving step is now complete for the ordinary Qwen3.8 target, and
-the exact DFlash2 window transaction is now available through the same
-resident stdio child.  The
-`codex_server.py --qwen35-server-profile` option starts the resident stdio
-runner with the validated exact Q8/Q8 cache, native prefill, decode graph and
-MMVQ routes.  A loopback OpenAI-compatible request returned the exact
-`READY` response and stopped on the model's `<|im_end|>` token; the existing
-protocol suite passes all 12 tests, including request cancellation, cache
-reuse, tool-call framing and diagnostic alignment.  DFlash2 is available with
-`--qwen35-dflash2 SIDECAR --qwen35-dflash2-draft 1..7`; its exact
-propose/verify/commit window is serialized per request.  A real two-request
-loopback test returned coherent output for both greedy and sampled requests.
-Target prompt snapshots now include the DFlash sidecar's private recurrent K/V
-cache and target Q8 KV rows, so repeated short prompts restore target and draft
-state without replaying the prompt.  Long prompts above the bounded snapshot
-budget continue to replay for memory safety.
-The reproducible GPU gate is `test_qwen35_dflash2_http.py`. It now drives the
-resident JSONL protocol directly before serving the same backend over HTTP.
-Both routes cover greedy and seeded-sampled repeatability, repeated cache
-reuse, cancellation after a real streamed DFlash token, deterministic
-recovery, and serialized concurrent-request isolation.  The short gate and a
-6,600-token actual long-prompt run pass; the long run also reuses the cached
-prompt for sampled generation and cancellation without replay.
+The resident Qwen3.8/DFlash2 server now has request-owned, bounded
+multi-context state. `REQ3` carries a hashed cache namespace, and the HTTP
+shim derives it from `prompt_cache_key`, conversation/session metadata, or
+`X-Prompt-Cache-Key`. A FIFO gate gives queued requests fair access to the
+single mutable GPU context. `request_id` and `X-Request-ID` provide targeted
+`POST /v1/cancel`; cancelling a queued request cannot signal the active one.
+The GPU work remains serialized because target recurrent scratch and DFlash
+verification state are still single-context; no decode batching is enabled.
+
+Successful prompt boundaries publish portable snapshots transactionally into
+an entry- and byte-bounded LRU (`--context-cache-entries`, default 4;
+`--context-cache-max-mib`, default 2048). Failed, cancelled, and incomplete
+requests never publish, while earlier committed entries survive. Longest
+exact token-prefix reuse is restricted to the same cache identity. The
+snapshot includes target Q8/Q8 KV and scales, hybrid convolution/recurrent
+state, prompt logits, and DFlash private KV/features. Snapshot position must
+exactly match the token key before publication.
+
+This validation exposed two long-context snapshot bugs that immediate repeats
+had hidden: batched prefill did not publish its final host position, and Q8/Q8
+FP16 scale rows were copied with an FP32 size. The former captured only a
+stale short KV prefix; the latter crossed the scale allocation beyond roughly
+half context. Both are fixed. A forced A/B/A context switch now restores an
+actual 6,535-token prompt with identical greedy output and `cached_tokens=6535`;
+the complete host snapshot is 448.3 MiB. The old same-context-only large-prompt
+cache observations did not prove portable target KV and are superseded by this
+interleaved gate.
+
+The reproducible GPU gate is `test_qwen35_dflash2_http.py`. It drives the
+resident JSONL protocol directly, then tests the OpenAI-compatible HTTP shim.
+Coverage includes greedy and seeded sampling, targeted and disconnect
+cancellation, recovery, malformed cache metadata, concurrent distinct cache
+identities, LRU eviction, forced context restoration, and a two-turn C++ task
+whose generated programs are compiled and run. The CPU protocol/template/tool
+suite now passes 27 tests.
 The sampled random-64K target gate now passes 32 suffix tokens with prefix hash
 `90178de69a24a76e`, suffix hash `34e2f6bc082bc49f`, and `Result: PASS` after a
 445.67 tok/s prefix.
@@ -289,18 +301,11 @@ The attention verifier now pairs Q/K RMS normalization in one launch, retaining
 the original per-head reduction order while removing one more preparation
 launch per grouped attention layer. The HTTP and llama.cpp gates remain exact.
 
-The DFlash2 HTTP quality gate now requires repeated requests to report cached
-input tokens and accepts `--context N --long-prompt-tokens N` for deterministic
-longer-context cache reuse checks. The Q8 target snapshot bound is now 16,384
-tokens; a roughly 10k-token prompt in a 12k context passes repeatability and
-nonzero cache reuse after cancellation recovery. The 14k-token/16k-context
-boundary run also passes. The gate now sends two independent non-coding
-requests concurrently and verifies both answers remain isolated and coherent.
-Deployments that need a larger host snapshot budget can pass
-`--qwen35-snapshot-max-tokens N`; zero keeps the 16k default. The opt-in
-32k-budget gate passes with a roughly 20k-token prompt in a 24k context.
-The same opt-in path now passes a roughly 60k-token prompt at 65,536 context
-with a 65,536 snapshot budget, reusing cached prompt state without replay.
+The Q8 target snapshot token bound remains 16,384 by default and can be changed
+with `--qwen35-snapshot-max-tokens N`. Larger token bounds also require enough
+`--context-cache-max-mib` host budget. Claims for 10K--60K portable snapshots
+must be rerun with the forced interleaved-context gate; earlier tests only hit
+the still-live device context and therefore did not validate host restoration.
 
 Verifier SSM alpha softplus/scale and beta sigmoid preparation now share one
 batched elementwise launch. The pinned greedy and sampled llama.cpp hashes and

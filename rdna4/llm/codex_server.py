@@ -7,6 +7,7 @@ limits, while the child keeps the model and KV/SSM state resident.
 """
 import argparse
 import base64
+import hashlib
 import io
 import json
 import math
@@ -27,6 +28,63 @@ from qwen_tools import call_events, parse_calls, tool_instructions, tool_registr
 
 
 WEB_DIR = Path(__file__).with_name("web")
+MAX_REQUEST_BYTES = 16 * 1024 * 1024
+MAX_RUNNER_LINE_BYTES = 4 * 1024 * 1024
+
+
+class FairRequestGate:
+    """FIFO admission for the single mutable GPU execution context."""
+
+    def __init__(self):
+        self.condition = threading.Condition()
+        self.next_ticket = 0
+        self.serving = 0
+        self.abandoned = set()
+        self.closed = False
+
+    def _advance(self):
+        while self.serving in self.abandoned:
+            self.abandoned.remove(self.serving)
+            self.serving += 1
+
+    def acquire(self, cancellation):
+        with self.condition:
+            if self.closed:
+                raise RuntimeError("backend is closed")
+            ticket = self.next_ticket
+            self.next_ticket += 1
+            while ticket != self.serving:
+                if cancellation.is_set() or self.closed:
+                    self.abandoned.add(ticket)
+                    self._advance()
+                    self.condition.notify_all()
+                    return None
+                self.condition.wait(0.05)
+            if cancellation.is_set() or self.closed:
+                self.serving += 1
+                self._advance()
+                self.condition.notify_all()
+                return None
+            return ticket
+
+    def release(self, ticket):
+        if ticket is None:
+            return
+        with self.condition:
+            if ticket != self.serving:
+                raise RuntimeError("request gate released out of order")
+            self.serving += 1
+            self._advance()
+            self.condition.notify_all()
+
+    def close(self):
+        with self.condition:
+            self.closed = True
+            self.condition.notify_all()
+
+    def queued(self):
+        with self.condition:
+            return max(0, self.next_ticket - self.serving - 1 - len(self.abandoned))
 
 
 def runner_command(args):
@@ -44,6 +102,10 @@ def runner_command(args):
     if qwen35_mtp and qwen4_mtp:
         raise ValueError("--qwen35-mtp cannot be combined with --qwen4-mtp")
     cmd = [args.runner, args.model, "--stdio-server", "--gpu-only-bench", "-s", str(args.context)]
+    cmd += ["--context-cache-entries",
+            str(getattr(args, "context_cache_entries", 4)),
+            "--context-cache-max-mib",
+            str(getattr(args, "context_cache_max_mib", 2048))]
     snapshot_limit = getattr(args, "qwen35_snapshot_max_tokens", 0)
     if snapshot_limit:
         cmd += ["--qwen35-snapshot-max-tokens", str(snapshot_limit)]
@@ -263,8 +325,12 @@ class Backend:
             popen_kwargs["start_new_session"] = True
         self.proc = subprocess.Popen(cmd, **popen_kwargs)
         self.lock = threading.Lock()
+        self.request_gate = FairRequestGate()
         self.cancel_lock = threading.Lock()
         self.active_cancel = None
+        self.active_request_id = None
+        self.request_cancellations = {}
+        self.metrics_local = threading.local()
         self.ready = False
         self.model = args.model.rsplit("/", 1)[-1]
         try:
@@ -282,14 +348,20 @@ class Backend:
     def health(self):
         """Return readiness state without sending a request to the runner."""
         exit_status = self.proc.poll()
+        gate = getattr(self, "request_gate", None)
         return {
             "status": "ready" if self.ready and exit_status is None else "unavailable",
             "runner_alive": exit_status is None,
             "runner_exit_status": exit_status,
+            "active_request": getattr(self, "active_request_id", None),
+            "queued_requests": gate.queued() if gate is not None else 0,
         }
 
     def close(self):
         """Stop and reap the resident runner during server shutdown."""
+        gate = getattr(self, "request_gate", None)
+        if gate is not None:
+            gate.close()
         if self.proc.poll() is None:
             if os.name == "posix" and hasattr(self.proc, "pid"):
                 try:
@@ -355,56 +427,105 @@ class Backend:
                 except ProcessLookupError:
                     pass
 
+    def cancel_request(self, request_id):
+        """Cancel one queued or active request without touching its peers."""
+        with self.cancel_lock:
+            cancellation = getattr(self, "request_cancellations", {}).get(request_id)
+            if cancellation is None:
+                return False
+            cancellation.set()
+            active = cancellation is self.active_cancel
+            if active and self.proc.poll() is None:
+                try:
+                    os.kill(self.proc.pid, signal.SIGUSR1)
+                except ProcessLookupError:
+                    pass
+            return True
+
+    @property
+    def last_metrics(self):
+        local = getattr(self, "metrics_local", None)
+        return getattr(local, "value", {}) if local is not None else {}
+
+    @last_metrics.setter
+    def last_metrics(self, value):
+        if not hasattr(self, "metrics_local"):
+            self.metrics_local = threading.local()
+        self.metrics_local.value = value
+
     def generate(self, prompt, max_tokens, temperature, top_p, top_k, presence, repetition, min_p,
                  prefix="", cancellation=None, on_token=None, seed=None,
-                 frequency=0.0, penalty_last_n=64):
+                 frequency=0.0, penalty_last_n=64, cache_key="shared",
+                 request_id=None):
         request_start = time.monotonic()
         cancellation = cancellation if cancellation is not None else threading.Event()
         prefix_payload = base64.b64encode(prefix.encode("utf-8")).decode("ascii") if prefix else "-"
         payload = base64.b64encode(prompt.encode("utf-8")).decode("ascii")
-        line = f"REQ {max_tokens} {temperature} {top_p} {top_k} {presence} {repetition} {min_p} {prefix_payload} {payload}\n"
-        if seed is not None:
-            line = (f"REQ2 {seed} {max_tokens} {temperature} {top_p} {top_k} "
-                    f"{presence} {repetition} {min_p} {frequency} {penalty_last_n} "
-                    f"{prefix_payload} {payload}\n")
-        with self.lock:
-            if self.proc.poll() is not None:
-                raise RuntimeError("runner exited")
-            # The constructor normally consumes READY; retain this check for
-            # tests and callers that construct Backend without __init__.
-            self._wait_ready()
-            with self.cancel_lock:
-                if cancellation.is_set():
-                    return "", 0, 0, 0, "cancelled"
-                self.active_cancel = cancellation
-            # Preserve the final empty field: an immediate EOS is a valid
-            # completion and the runner's OK line intentionally ends with an
-            # empty base64 payload in that case.
-            # HIP libraries may print diagnostics on stdout. Consume those
-            # within the transaction: returning early leaves its OK queued
-            # and makes the next HTTP request receive the previous answer.
-            try:
-                self.proc.stdin.write(line)
-                self.proc.stdin.flush()
-                while True:
-                    raw = self.proc.stdout.readline()
-                    if not raw:
-                        raise RuntimeError("runner closed its response pipe")
-                    result = raw.rstrip("\r\n")
-                    if result.startswith("TOK "):
-                        if on_token is not None:
-                            try:
-                                on_token(base64.b64decode(result[4:]).decode("utf-8", "replace"))
-                            except (ValueError, UnicodeError):
-                                sys.stderr.write("[runner diagnostic] malformed token frame\n")
-                        continue
-                    if result.startswith(("OK ", "ERR ")):
-                        break
-                    sys.stderr.write("[runner diagnostic] " + result + "\n")
-            finally:
-                # Clear ownership before another request can take self.lock.
+        cache_identity = hashlib.sha256(str(cache_key).encode("utf-8")).hexdigest()
+        seed_field = "-" if seed is None else str(seed)
+        line = (f"REQ3 {cache_identity} {seed_field} {max_tokens} {temperature} "
+                f"{top_p} {top_k} {presence} {repetition} {min_p} {frequency} "
+                f"{penalty_last_n} {prefix_payload} {payload}\n")
+        if len(line) >= MAX_RUNNER_LINE_BYTES:
+            raise ValueError("encoded prompt exceeds the runner protocol limit")
+        if not hasattr(self, "request_gate"):
+            self.request_gate = FairRequestGate()
+        if not hasattr(self, "request_cancellations"):
+            self.request_cancellations = {}
+        request_id = request_id or "req-" + uuid.uuid4().hex
+        with self.cancel_lock:
+            if request_id in self.request_cancellations:
+                raise ValueError("duplicate active request_id")
+            self.request_cancellations[request_id] = cancellation
+        ticket = None
+        try:
+            ticket = self.request_gate.acquire(cancellation)
+            if ticket is None:
+                return "", 0, 0, 0, "cancelled"
+            with self.lock:
+                if self.proc.poll() is not None:
+                    raise RuntimeError("runner exited")
+                # The constructor normally consumes READY; retain this check for
+                # tests and callers that construct Backend without __init__.
+                self._wait_ready()
                 with self.cancel_lock:
-                    self.active_cancel = None
+                    if cancellation.is_set():
+                        return "", 0, 0, 0, "cancelled"
+                    self.active_cancel = cancellation
+                    self.active_request_id = request_id
+                # Preserve the final empty field: an immediate EOS is a valid
+                # completion and the runner's OK line intentionally ends with an
+                # empty base64 payload in that case.
+                # HIP libraries may print diagnostics on stdout. Consume those
+                # within the transaction: returning early leaves its OK queued
+                # and makes the next HTTP request receive the previous answer.
+                try:
+                    self.proc.stdin.write(line)
+                    self.proc.stdin.flush()
+                    while True:
+                        raw = self.proc.stdout.readline()
+                        if not raw:
+                            raise RuntimeError("runner closed its response pipe")
+                        result = raw.rstrip("\r\n")
+                        if result.startswith("TOK "):
+                            if on_token is not None:
+                                try:
+                                    on_token(base64.b64decode(result[4:]).decode("utf-8", "replace"))
+                                except (ValueError, UnicodeError):
+                                    sys.stderr.write("[runner diagnostic] malformed token frame\n")
+                            continue
+                        if result.startswith(("OK ", "ERR ")):
+                            break
+                        sys.stderr.write("[runner diagnostic] " + result + "\n")
+                finally:
+                    # Clear ownership before another request can take self.lock.
+                    with self.cancel_lock:
+                        self.active_cancel = None
+                        self.active_request_id = None
+        finally:
+            self.request_gate.release(ticket)
+            with self.cancel_lock:
+                self.request_cancellations.pop(request_id, None)
         if not result.startswith("OK "):
             raise RuntimeError(result)
         fields = result.split(" ", 7)
@@ -450,6 +571,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(raw)))
+            request_id = getattr(self, "_request_id", None)
+            if request_id:
+                self.send_header("X-Request-ID", request_id)
             self.end_headers()
             self.wfile.write(raw)
             return True
@@ -524,8 +648,34 @@ class Handler(BaseHTTPRequestHandler):
         else:
             api_path = path
         if api_path == "/v1/cancel":
-            self.backend.cancel()
-            self.send_json(202, {"status": "cancellation_requested"})
+            request_id = None
+            try:
+                n = int(self.headers.get("Content-Length", "0"))
+                if n < 0 or n > 4096:
+                    raise ValueError("cancellation body is too large")
+                if n > 0:
+                    body = json.loads(self.rfile.read(n))
+                    if not isinstance(body, dict):
+                        raise ValueError("cancellation body must be a JSON object")
+                    request_id = body.get("request_id")
+                    if request_id is not None and (
+                            not isinstance(request_id, str) or not request_id or
+                            len(request_id) > 128):
+                        raise ValueError(
+                            "request_id must be a non-empty string of at most 128 characters")
+            except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+                self.send_json(400, {"error": {"message": str(exc),
+                                                "type": "invalid_request_error"}})
+                return
+            if request_id is None:
+                self.backend.cancel()
+                found = True
+            else:
+                found = isinstance(request_id, str) and self.backend.cancel_request(request_id)
+            self.send_json(202 if found else 404, {
+                "status": "cancellation_requested" if found else "request_not_found",
+                "request_id": request_id,
+            })
             return
         if api_path not in ("/v1/chat/completions", "/v1/completions", "/v1/responses"):
             self.log_message("404 POST %s", self.path)
@@ -536,6 +686,11 @@ class Handler(BaseHTTPRequestHandler):
             if n <= 0:
                 self.send_json(400, {"error": {"message": "request body is required", "type": "invalid_request_error"}})
                 return
+            if n > MAX_REQUEST_BYTES:
+                self.close_connection = True
+                self.send_json(413, {"error": {"message": "request body is too large",
+                                                "type": "invalid_request_error"}})
+                return
             try:
                 req = json.loads(self.rfile.read(n))
             except (json.JSONDecodeError, UnicodeDecodeError) as exc:
@@ -543,6 +698,32 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if not isinstance(req, dict):
                 self.send_json(400, {"error": {"message": "request body must be a JSON object", "type": "invalid_request_error"}})
+                return
+            if "request_id" in req:
+                request_id = req["request_id"]
+            elif self.headers.get("X-Request-ID") is not None:
+                request_id = self.headers.get("X-Request-ID")
+            else:
+                request_id = "req-" + uuid.uuid4().hex
+            if not isinstance(request_id, str) or not request_id or len(request_id) > 128:
+                self.send_json(400, {"error": {"message": "request_id must be a non-empty string of at most 128 characters",
+                                                "type": "invalid_request_error"}})
+                return
+            self._request_id = request_id
+            metadata = req.get("metadata") if isinstance(req.get("metadata"), dict) else {}
+            if "prompt_cache_key" in req:
+                cache_key = req["prompt_cache_key"]
+            elif "conversation_id" in metadata:
+                cache_key = metadata["conversation_id"]
+            elif "session_id" in metadata:
+                cache_key = metadata["session_id"]
+            elif self.headers.get("X-Prompt-Cache-Key") is not None:
+                cache_key = self.headers.get("X-Prompt-Cache-Key")
+            else:
+                cache_key = "shared"
+            if not isinstance(cache_key, str) or not cache_key or len(cache_key) > 512:
+                self.send_json(400, {"error": {"message": "prompt_cache_key must be a non-empty string of at most 512 characters",
+                                                "type": "invalid_request_error"}})
                 return
             if api_path == "/v1/completions":
                 prompt = req.get("prompt", "")
@@ -570,6 +751,20 @@ class Handler(BaseHTTPRequestHandler):
             messages = fit_context(messages, self.context, limit)
             prompt = chat_prompt(messages)
             prefix = chat_prefix(messages)
+            # The C child reads one complete request into a fixed 4 MiB line.
+            # Check the actual UTF-8/base64 expansion before streaming headers;
+            # an oversized partial line would otherwise desynchronize every
+            # later request on the resident runner.
+            prompt_bytes = len(prompt.encode("utf-8"))
+            prefix_bytes = len(prefix.encode("utf-8"))
+            encoded_bytes = (4 * ((prompt_bytes + 2) // 3) +
+                             (4 * ((prefix_bytes + 2) // 3) if prefix else 1) +
+                             2048)
+            if encoded_bytes >= MAX_RUNNER_LINE_BYTES:
+                self.send_json(400, {"error": {
+                    "message": "encoded prompt exceeds the runner protocol limit",
+                    "type": "invalid_request_error"}})
+                return
             # Explicit API sampling controls override the requested coding
             # profile.  Keep the server default aligned with the local
             # non-thinking coding evaluation profile; it is deliberately
@@ -618,6 +813,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Content-Type", "text/event-stream")
                 self.send_header("Cache-Control", "no-cache")
                 self.send_header("Connection", "keep-alive")
+                self.send_header("X-Request-ID", request_id)
                 self.end_headers()
                 stream_base = {"id": stream_response_id, "object": "response",
                                "created_at": stream_created, "status": "in_progress",
@@ -663,7 +859,8 @@ class Handler(BaseHTTPRequestHandler):
                 text, cached, ptok, ctok, finish = self.backend.generate(
                     prompt, limit, temp, top_p, top_k, presence, repetition, min_p, prefix, cancelled,
                     stream_token, seed=seed, frequency=frequency,
-                    penalty_last_n=penalty_last_n)
+                    penalty_last_n=penalty_last_n, cache_key=cache_key,
+                    request_id=request_id)
             finally:
                 stop_watcher.set()
                 watcher.join(timeout=0.2)
@@ -672,6 +869,7 @@ class Handler(BaseHTTPRequestHandler):
                     stream_keepalive.join(timeout=0.2)
             if cancelled.is_set() or finish == "cancelled":
                 self.log_message("request cancelled: %s", self.path)
+                self.close_connection = True
                 return
             tool_text, calls = parse_calls(text, registry)
             if calls:
@@ -823,7 +1021,15 @@ def main():
     ap.add_argument("--qwen35-dflash2-draft", type=int, choices=range(1, 8), default=7)
     ap.add_argument("--qwen35-snapshot-max-tokens", type=int, default=0,
                     help="bound host-side Qwen3.8 Q8 prompt snapshots (0=16K default)")
+    ap.add_argument("--context-cache-entries", type=int, default=4,
+                    help="maximum portable conversation snapshots (0 disables)")
+    ap.add_argument("--context-cache-max-mib", type=int, default=2048,
+                    help="host-memory budget for portable conversation snapshots")
     args = ap.parse_args()
+    if not 0 <= args.context_cache_entries <= 64:
+        ap.error("--context-cache-entries must be 0..64")
+    if not 0 <= args.context_cache_max_mib <= 65536:
+        ap.error("--context-cache-max-mib must be 0..65536")
     Handler.backend = Backend(args)
     Handler.model = Handler.backend.model
     Handler.max_tokens = args.max_output

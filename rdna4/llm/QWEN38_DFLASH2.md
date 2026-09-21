@@ -61,9 +61,9 @@ serialized through the exact propose/verify/commit window.  Temperature-zero
 requests use the exact argmax window, while sampled requests verify full row
 logits with the existing sampler.  Bounded target prompt snapshots include the
 sidecar's recurrent K/V cache, target Q8 KV rows, captured features and prompt
-logits, so repeated short requests restore both target and draft state without
-replaying the prompt.  Long prompts fall back to replay to avoid multi-gigabyte
-host snapshots.
+logits, so cached requests can restore both target and draft state without
+replaying the prompt. Snapshots above the configured token or byte budget are
+rejected and replayed.
 
 The opt-in HTTP quality gate covers deterministic greedy and seeded sampled
 requests, direct stdio transactions, repeated-request state isolation,
@@ -75,6 +75,43 @@ python3 rdna4/llm/test_qwen35_dflash2_http.py \
   --model /mnt/nvme02/models/qwen38/27b/gsq/Qwen3.8-27B-GSQ-RCO-IQ2_XS.gguf \
   --sidecar /mnt/nvme02/models/qwen38/27b/dflash2/Qwen3.8-27B-DFlash2-Q4_K_M.gguf
 ```
+
+## Multi-context coding-agent serving
+
+The Python shim uses `REQ3`, which adds a SHA-256 cache identity to the stdio
+request. HTTP callers may supply `prompt_cache_key`,
+`metadata.conversation_id`, `metadata.session_id`, or
+`X-Prompt-Cache-Key`. The runner selects the longest exact token prefix only
+within that identity. Successful prompt and system-prefix boundaries enter a
+transactional host LRU; cancelled or failed work is discarded without
+removing earlier committed entries. Configure it with:
+
+```sh
+python3 rdna4/llm/codex_server.py TARGET.gguf \
+  --qwen35-dflash2 DFLASH2.gguf \
+  --context-cache-entries 4 --context-cache-max-mib 2048 \
+  --qwen35-snapshot-max-tokens 16384
+```
+
+The HTTP scheduler is FIFO. Each request may provide `request_id` or
+`X-Request-ID`, and every response echoes `X-Request-ID`. A targeted
+`POST /v1/cancel` body of `{"request_id":"..."}` cancels that queued or
+active request. Disconnect cancellation carries the same request ownership,
+so a disconnected queued client cannot signal the request currently using the
+GPU. Execution is deliberately serialized: the target recurrent scratch,
+sampler transaction, and DFlash verifier are one mutable device context, and
+no exact multi-context decode batch has yet justified changing that contract.
+
+Snapshots are accepted only when their recorded position exactly equals the
+token-key length. Q8/Q8 scales are copied at their actual FP16 row size. This
+check caught a stale batched-prefill position and an oversized scale copy that
+short, same-context repeats could hide. The current forced A/B/A GPU gate
+restores 6,535 tokens after an unrelated conversation, reports
+`cached_tokens=6535`, and reproduces the exact greedy response. That snapshot
+uses 448.3 MiB versus about 234 MiB for a 26-token prompt. The harness also
+checks LRU eviction, malformed metadata, concurrent identities, deterministic
+seeded sampling, cancellation recovery, and a two-turn C++ task by compiling
+and running both generated programs.
 
 The ordinary target's sampled random-64K quality gate also passes: a
 temperature-0.6, seed-42 suffix retains prefix hash `90178de69a24a76e`,
@@ -399,20 +436,14 @@ reflects the remaining measured costs.
    its independent reductions retain the original order and exact output
    hashes.
 
-   The HTTP quality harness now checks the server's reported cached input on
-   repeated requests and supports deterministic longer prompts. Q8 target
-   snapshots now cover up to 16,384 tokens; a roughly 10k-token, 12k-context
-run passes repeatability and cache reuse, including after the
-   cancellation/recovery sequence. The 14k-token/16k-context boundary run also
-   passes. Two independent non-coding requests are also issued concurrently to
-   check scheduler serialization and cache isolation.
-   The HTTP/stdio harness forwards `--qwen35-snapshot-max-tokens N` for
-   deployments that deliberately budget larger host-side Q8 KV snapshots; the
-   default remains 16k tokens. A 32k-budget run with a roughly 20k-token prompt
-   in a 24k context passes cache reuse and cancellation recovery.
-   A 65,536-context run with a roughly 60k-token prompt and a 65,536 snapshot
-   budget also passes cache reuse without replay, including cancellation and
-   concurrent-request checks.
+   The HTTP quality harness now forces another conversation between long-prompt
+   requests, which proves restoration from host state instead of reuse of the
+   still-live GPU context. The validated interleaved prompt is 6,535 actual
+   tokens. Q8 target snapshots are bounded to 16,384 tokens by default; larger
+   bounds can be requested with `--qwen35-snapshot-max-tokens N`, but they also
+   need a sufficient `--context-cache-max-mib` budget. Earlier 10K--60K
+   same-context observations must be rerun with this interleaved gate before
+   being treated as portable-cache validation.
    Batched verifier SSM alpha/beta preparation now uses one elementwise launch
    for softplus/scale and sigmoid, with exact llama.cpp hashes preserved.
 4. **Kernel and graph count.** Q/gate deinterleave, QK normalization, RoPE,

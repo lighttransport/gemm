@@ -321,6 +321,14 @@ hip_llm_state_snapshot *hip_llm_snapshot_state_window(hip_llm_runner *r,
                                                        int start_pos,
                                                        int n_positions);
 int hip_llm_restore_state(hip_llm_runner *r, const hip_llm_state_snapshot *snapshot);
+/* Size of owned host buffers, for bounded multi-context snapshot caches. */
+size_t hip_llm_state_snapshot_bytes(const hip_llm_state_snapshot *snapshot);
+/* True when the snapshot contains every position-dependent cache row needed
+ * to restore it after another conversation has used the runner. */
+int hip_llm_state_snapshot_is_portable(const hip_llm_state_snapshot *snapshot);
+/* Number of prefix tokens represented by the snapshot.  Portable prompt
+ * caches must compare this with their token key before publishing it. */
+int hip_llm_state_snapshot_token_count(const hip_llm_state_snapshot *snapshot);
 void hip_llm_free_state_snapshot(hip_llm_state_snapshot *snapshot);
 
 /* Read last hidden state (d_x) from GPU into dst. n = n_embd. */

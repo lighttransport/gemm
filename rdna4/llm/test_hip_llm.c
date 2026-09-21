@@ -270,22 +270,161 @@ static int prompt_bos_id(const gguf_context *gguf) {
         (int)gguf->kv[id].value.u32 : -1;
 }
 
+typedef struct {
+    int32_t *tokens;
+    int n_tokens;
+    char *identity;
+    hip_llm_state_snapshot *snapshot;
+    size_t bytes;
+    uint64_t age;
+} stdio_snapshot_entry;
+
+typedef struct {
+    stdio_snapshot_entry *entries;
+    int capacity;
+    size_t byte_limit;
+    size_t bytes;
+    uint64_t clock;
+} stdio_snapshot_cache;
+
+static void stdio_snapshot_entry_clear(stdio_snapshot_cache *cache, int i) {
+    stdio_snapshot_entry *entry = &cache->entries[i];
+    if (entry->snapshot) {
+        if (cache->bytes >= entry->bytes) cache->bytes -= entry->bytes;
+        else cache->bytes = 0;
+    }
+    free(entry->tokens);
+    free(entry->identity);
+    hip_llm_free_state_snapshot(entry->snapshot);
+    memset(entry, 0, sizeof(*entry));
+}
+
+static int stdio_snapshot_cache_init(stdio_snapshot_cache *cache, int capacity,
+                                     size_t byte_limit) {
+    memset(cache, 0, sizeof(*cache));
+    if (capacity < 0) capacity = 0;
+    cache->capacity = capacity;
+    cache->byte_limit = byte_limit;
+    if (capacity == 0 || byte_limit == 0) return 0;
+    cache->entries = calloc((size_t)capacity, sizeof(*cache->entries));
+    return cache->entries ? 0 : -1;
+}
+
+static void stdio_snapshot_cache_free(stdio_snapshot_cache *cache) {
+    if (!cache) return;
+    for (int i = 0; i < cache->capacity; ++i)
+        stdio_snapshot_entry_clear(cache, i);
+    free(cache->entries);
+    memset(cache, 0, sizeof(*cache));
+}
+
+static int stdio_snapshot_cache_find(const stdio_snapshot_cache *cache,
+                                     const char *identity,
+                                     const int32_t *tokens, int n_tokens) {
+    int best = -1;
+    for (int i = 0; i < cache->capacity; ++i) {
+        const stdio_snapshot_entry *entry = &cache->entries[i];
+        if (!entry->snapshot || entry->n_tokens > n_tokens ||
+            strcmp(entry->identity, identity) != 0) continue;
+        if (memcmp(entry->tokens, tokens,
+                   (size_t)entry->n_tokens * sizeof(*tokens)) != 0) continue;
+        if (best < 0 || entry->n_tokens > cache->entries[best].n_tokens)
+            best = i;
+    }
+    return best;
+}
+
+/* Takes ownership of snapshot whether it is retained or rejected. */
+static int stdio_snapshot_cache_publish(stdio_snapshot_cache *cache,
+                                        const char *identity,
+                                        const int32_t *tokens, int n_tokens,
+                                        hip_llm_state_snapshot *snapshot) {
+    if (!snapshot) return 0;
+    size_t state_bytes = hip_llm_state_snapshot_bytes(snapshot);
+    size_t bytes = state_bytes + (size_t)n_tokens * sizeof(*tokens) +
+                   strlen(identity) + 1;
+    int snapshot_tokens = hip_llm_state_snapshot_token_count(snapshot);
+    if (!hip_llm_state_snapshot_is_portable(snapshot) ||
+        snapshot_tokens != n_tokens || !cache->entries ||
+        n_tokens <= 0 || bytes > cache->byte_limit) {
+        fprintf(stderr,
+                "llm_server: context snapshot rejected tokens=%d state_tokens=%d portable=%d "
+                "bytes=%.1f MiB limit=%.1f MiB\n",
+                n_tokens, snapshot_tokens,
+                hip_llm_state_snapshot_is_portable(snapshot),
+                bytes / (double)(1ULL << 20),
+                cache->byte_limit / (double)(1ULL << 20));
+        hip_llm_free_state_snapshot(snapshot);
+        return 0;
+    }
+    int32_t *token_copy = malloc((size_t)n_tokens * sizeof(*tokens));
+    char *identity_copy = strdup(identity);
+    if (!token_copy || !identity_copy) {
+        free(token_copy); free(identity_copy);
+        hip_llm_free_state_snapshot(snapshot);
+        return -1;
+    }
+    memcpy(token_copy, tokens, (size_t)n_tokens * sizeof(*tokens));
+    int slot = -1;
+    for (int i = 0; i < cache->capacity; ++i) {
+        stdio_snapshot_entry *entry = &cache->entries[i];
+        if (entry->snapshot && entry->n_tokens == n_tokens &&
+            strcmp(entry->identity, identity) == 0 &&
+            memcmp(entry->tokens, tokens,
+                   (size_t)n_tokens * sizeof(*tokens)) == 0) {
+            slot = i;
+            break;
+        }
+        if (!entry->snapshot && slot < 0) slot = i;
+    }
+    size_t replaced = slot >= 0 && cache->entries[slot].snapshot ?
+                      cache->entries[slot].bytes : 0;
+    while (cache->bytes - replaced + bytes > cache->byte_limit || slot < 0) {
+        int oldest = -1;
+        for (int i = 0; i < cache->capacity; ++i)
+            if (i != slot && cache->entries[i].snapshot &&
+                (oldest < 0 || cache->entries[i].age < cache->entries[oldest].age))
+                oldest = i;
+        if (oldest < 0) break;
+        stdio_snapshot_entry_clear(cache, oldest);
+        if (slot < 0) slot = oldest;
+    }
+    replaced = slot >= 0 && cache->entries[slot].snapshot ?
+               cache->entries[slot].bytes : 0;
+    if (slot < 0 || cache->bytes - replaced + bytes > cache->byte_limit) {
+        free(token_copy); free(identity_copy);
+        hip_llm_free_state_snapshot(snapshot);
+        return 0;
+    }
+    stdio_snapshot_entry_clear(cache, slot);
+    cache->entries[slot] = (stdio_snapshot_entry) {
+        .tokens = token_copy, .n_tokens = n_tokens,
+        .identity = identity_copy, .snapshot = snapshot,
+        .bytes = bytes, .age = ++cache->clock,
+    };
+    cache->bytes += bytes;
+    fprintf(stderr,
+            "llm_server: context snapshot committed slot=%d tokens=%d "
+            "bytes=%.1f MiB cache=%.1f MiB\n",
+            slot, n_tokens, bytes / (double)(1ULL << 20),
+            cache->bytes / (double)(1ULL << 20));
+    return 1;
+}
+
 static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
                             int n_vocab, int max_seq_len, int bos_id, int mtp_draft,
                             int dflash_draft,
-                            int coding_mode, const hllm_sampler_config *sampling_defaults) {
+                            int coding_mode, const hllm_sampler_config *sampling_defaults,
+                            int context_cache_entries, size_t context_cache_bytes) {
     char line[4 * 1024 * 1024];
     int32_t *cache = (int32_t *)malloc((size_t)max_seq_len * sizeof(int32_t));
-    int32_t *prefix_cache = (int32_t *)malloc((size_t)max_seq_len * sizeof(int32_t));
-    int32_t *prompt_cache = (int32_t *)malloc((size_t)max_seq_len * sizeof(int32_t));
     int cache_n = 0;
-    int prefix_cache_n = 0;
-    int prompt_cache_n = 0;
-    hip_llm_state_snapshot *prefix_snapshot = NULL;
-    hip_llm_state_snapshot *prompt_snapshot = NULL;
+    char active_identity[513] = "";
+    stdio_snapshot_cache snapshot_cache;
     unsigned rng = 0x51f15e5du;
-    if (!cache || !prefix_cache || !prompt_cache) {
-        free(cache); free(prefix_cache); free(prompt_cache); return 1;
+    if (!cache || stdio_snapshot_cache_init(&snapshot_cache,
+            context_cache_entries, context_cache_bytes) != 0) {
+        free(cache); return 1;
     }
     signal(SIGUSR1, stdio_cancel_handler);
     fprintf(stderr, "JSONL backend ready (max_seq_len=%d)\n", max_seq_len);
@@ -298,15 +437,38 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
         float temperature = 0.2f, top_p = 0.95f, presence = 0.0f;
         float repetition = 1.0f, min_p = 0.0f;
         char *b64 = NULL, *prefix_b64 = NULL;
+        const char *cache_identity = "shared";
         hllm_sampler_config request_sampling;
         hllm_sampler_defaults(&request_sampling);
         if (sampling_defaults) request_sampling = *sampling_defaults;
         int use_reference = sampling_defaults != NULL;
+        int version3 = !strncmp(line, "REQ3 ", 5);
         int version2 = !strncmp(line, "REQ2 ", 5);
         static char b64buf[sizeof(line)];
         static char prefix_b64buf[sizeof(line)];
+        static char cache_identity_buf[513];
         int fields = 0;
-        if (version2) {
+        if (version3) {
+            char seed_text[32], extra, *end = NULL;
+            int n = sscanf(line + 5, "%512s %31s %d %f %f %d %f %f %f %f %d %4194303s %4194303s %c",
+                cache_identity_buf, seed_text, &max_tokens, &temperature, &top_p,
+                &top_k, &presence, &repetition, &min_p,
+                &request_sampling.frequency, &request_sampling.penalty_last_n,
+                prefix_b64buf, b64buf, &extra);
+            if (n != 13 || strlen(cache_identity_buf) > 512) {
+                puts("ERR invalid REQ3"); fflush(stdout); continue;
+            }
+            cache_identity = cache_identity_buf;
+            if (strcmp(seed_text, "-") != 0) {
+                unsigned long seed = strtoul(seed_text, &end, 10);
+                if (seed_text[0] == '-' || !end || *end || seed >= UINT32_MAX) {
+                    puts("ERR invalid REQ3"); fflush(stdout); continue;
+                }
+                request_sampling.seed = seed;
+                use_reference = 1;
+            }
+            fields = 9;
+        } else if (version2) {
             char seed_text[32], extra, *end = NULL;
             int n = sscanf(line + 5, "%31s %d %f %f %d %f %f %f %f %d %4194303s %4194303s %c",
                 seed_text, &max_tokens, &temperature, &top_p, &top_k, &presence,
@@ -410,41 +572,51 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
         }
         free(prefix_tokens); free(prefix);
         int common = 0;
-        while (common < cache_n && common < n_tokens && cache[common] == tokens[common]) common++;
-        int prompt_matches_cache = prompt_cache_n > 0 && prompt_cache_n <= n_tokens &&
-                                   prompt_snapshot != NULL;
-        for (int i = 0; prompt_matches_cache && i < prompt_cache_n; ++i)
-            if (prompt_cache[i] != tokens[i]) prompt_matches_cache = 0;
-        int prefix_matches_cache = requested_prefix > 0 && requested_prefix == prefix_cache_n;
-        for (int i = 0; prefix_matches_cache && i < requested_prefix; ++i)
-            if (prefix_cache[i] != tokens[i]) prefix_matches_cache = 0;
-        int restored_prefix = 0;
-        int restored_prompt = 0;
-        if (common != cache_n && prompt_matches_cache &&
-            hip_llm_restore_state(gpu, prompt_snapshot) == 0) {
-            memcpy(cache, prompt_cache, (size_t)prompt_cache_n * sizeof(int32_t));
-            cache_n = prompt_cache_n;
-            common = prompt_cache_n;
-            restored_prompt = 1;
-        } else if (common != cache_n && prefix_matches_cache && prefix_snapshot &&
-            hip_llm_restore_state(gpu, prefix_snapshot) == 0) {
-            memcpy(cache, prefix_cache, (size_t)prefix_cache_n * sizeof(int32_t));
-            cache_n = prefix_cache_n;
-            common = prefix_cache_n;
-            restored_prefix = 1;
+        if (strcmp(active_identity, cache_identity) == 0)
+            while (common < cache_n && common < n_tokens &&
+                   cache[common] == tokens[common]) common++;
+        int have_state = cache_n > 0 && common == cache_n;
+        if (!have_state) {
+            int hit = stdio_snapshot_cache_find(&snapshot_cache, cache_identity,
+                                                 tokens, n_tokens);
+            int restore_rc = hit >= 0 ? hip_llm_restore_state(
+                gpu, snapshot_cache.entries[hit].snapshot) : -1;
+            if (hit >= 0 && restore_rc == 0) {
+                stdio_snapshot_entry *entry = &snapshot_cache.entries[hit];
+                memcpy(cache, entry->tokens,
+                       (size_t)entry->n_tokens * sizeof(*cache));
+                cache_n = entry->n_tokens;
+                common = entry->n_tokens;
+                entry->age = ++snapshot_cache.clock;
+                snprintf(active_identity, sizeof(active_identity), "%s",
+                         cache_identity);
+                fprintf(stderr,
+                        "llm_server: context snapshot restored slot=%d tokens=%d\n",
+                        hit, common);
+                have_state = 1;
+            } else if (hit >= 0) {
+                fprintf(stderr,
+                        "llm_server: context snapshot restore failed slot=%d rc=%d\n",
+                        hit, restore_rc);
+                /* A failed restore may have partially written device state.
+                 * Reset below and evict the unusable snapshot so future
+                 * requests do not loop on the same corrupt entry. */
+                stdio_snapshot_entry_clear(&snapshot_cache, hit);
+            } else {
+                int entries = 0;
+                for (int i = 0; i < snapshot_cache.capacity; ++i)
+                    entries += snapshot_cache.entries[i].snapshot != NULL;
+                fprintf(stderr,
+                        "llm_server: context snapshot miss tokens=%d entries=%d "
+                        "identity=%.8s\n",
+                        n_tokens, entries, cache_identity);
+            }
         }
-        if (common != cache_n) {
-            /* Subsequent forwards overwrite positional KV storage. A host
-             * recurrent snapshot cannot restore those overwritten entries. */
-            hip_llm_free_state_snapshot(prefix_snapshot);
-            prefix_snapshot = NULL;
-            prefix_cache_n = 0;
-            hip_llm_free_state_snapshot(prompt_snapshot);
-            prompt_snapshot = NULL;
-            prompt_cache_n = 0;
+        if (!have_state) {
             hip_llm_reset_state(gpu);
             cache_n = 0;
             common = 0;
+            active_identity[0] = '\0';
         }
         if (n_tokens > max_seq_len) n_tokens = max_seq_len;
         hip_llm_set_qwen4_batch_request_tokens(gpu, n_tokens);
@@ -456,7 +628,7 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
         int publish_chunk = publish_chunk_env && atoi(publish_chunk_env) != 0;
         int prompt_added = n_tokens - common;
         int batches = prompt_added > 0 ? (prompt_added + batch_size - 1) / batch_size : 0;
-        if (!restored_prompt && !restored_prefix && requested_prefix > common && requested_prefix < n_tokens) {
+        if (requested_prefix > common && requested_prefix < n_tokens) {
             int a = requested_prefix - common;
             int b = n_tokens - requested_prefix;
             batches = (a + batch_size - 1) / batch_size +
@@ -466,6 +638,8 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
         hip_llm_set_decode_mode(gpu, 0);
         float *logits = prompt_added == 0 && cache_n > 0 ?
                         hip_llm_current_logits(gpu) : NULL;
+        hip_llm_state_snapshot *pending_prefix_snapshot = NULL;
+        hip_llm_state_snapshot *pending_prompt_snapshot = NULL;
         int cancelled = 0;
         int batch_index = 0;
         for (int off = 0; off < prompt_added; ) {
@@ -474,7 +648,7 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
             if (cc > batch_size) cc = batch_size;
             if (publish_chunk)
                 hip_llm_set_qwen4_batch_request_tokens(gpu, cc);
-            if (!restored_prefix && requested_prefix > 0 && common + off < requested_prefix &&
+            if (requested_prefix > 0 && common + off < requested_prefix &&
                 common + off + cc > requested_prefix)
                 cc = requested_prefix - common - off;
             logits = hip_llm_forward_batch_logits(gpu, tokens + common + off, cc,
@@ -489,59 +663,42 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
                     batch_ms > 0.0 ? 1000.0 * (off + cc) / batch_ms : 0.0);
             fflush(stderr);
             if (!logits) break;
-            if (!restored_prefix && requested_prefix > 0 && common + off + cc == requested_prefix) {
-                hip_llm_free_state_snapshot(prefix_snapshot);
-                prefix_snapshot = hip_llm_snapshot_state(gpu);
-                if (prefix_snapshot) {
-                    memcpy(prefix_cache, tokens, (size_t)requested_prefix * sizeof(int32_t));
-                    prefix_cache_n = requested_prefix;
-                } else {
-                    prefix_cache_n = 0;
-                }
-            }
+            if (requested_prefix > common &&
+                common + off + cc == requested_prefix)
+                pending_prefix_snapshot = hip_llm_snapshot_state(gpu);
             off += cc;
         }
         double t_prefill1 = get_time_ms();
         if (g_stdio_cancel) cancelled = 1;
         if (cancelled) {
-            hip_llm_free_state_snapshot(prefix_snapshot);
-            prefix_snapshot = NULL;
-            prefix_cache_n = 0;
-            hip_llm_free_state_snapshot(prompt_snapshot);
-            prompt_snapshot = NULL;
-            prompt_cache_n = 0;
+            hip_llm_free_state_snapshot(pending_prefix_snapshot);
             hip_llm_reset_state(gpu);
             cache_n = 0;
+            active_identity[0] = '\0';
             free(tokens);
             puts("OK 0 0 0 cancelled");
             fflush(stdout);
             continue;
         }
         if (!logits && prompt_added > 0) {
-            hip_llm_free_state_snapshot(prefix_snapshot);
-            prefix_snapshot = NULL;
-            prefix_cache_n = 0;
-            hip_llm_free_state_snapshot(prompt_snapshot);
-            prompt_snapshot = NULL;
-            prompt_cache_n = 0;
+            hip_llm_free_state_snapshot(pending_prefix_snapshot);
             hip_llm_reset_state(gpu);
             cache_n = 0;
+            active_identity[0] = '\0';
             free(tokens); puts("ERR prefill"); fflush(stdout); continue;
         }
         /* Save the state at the complete prompt boundary. Generated text is
          * decoded to UTF-8 and may not re-tokenize to the original BPE pieces
          * on the next turn. If that happens, restore this boundary and replay
          * only the appended conversation suffix instead of resetting. */
-        hip_llm_free_state_snapshot(prompt_snapshot);
-        prompt_snapshot = hip_llm_snapshot_state(gpu);
-        if (prompt_snapshot) {
-            memcpy(prompt_cache, tokens, (size_t)n_tokens * sizeof(int32_t));
-            prompt_cache_n = n_tokens;
-        } else {
-            prompt_cache_n = 0;
-        }
+        pending_prompt_snapshot = hip_llm_snapshot_state(gpu);
         hllm_sampler *sampler = use_reference ? hllm_sampler_create(&request_sampling, n_vocab) : NULL;
         if (use_reference && !sampler) {
+            hip_llm_free_state_snapshot(pending_prefix_snapshot);
+            hip_llm_free_state_snapshot(pending_prompt_snapshot);
+            hip_llm_reset_state(gpu);
+            cache_n = 0;
+            active_identity[0] = '\0';
             free(tokens); puts("ERR sampler"); fflush(stdout); continue;
         }
         for (int i = 0; sampler && i < n_tokens; ++i) hllm_sampler_accept(sampler, tokens[i]);
@@ -550,6 +707,7 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
             cache[i] = tokens[i];
         }
         cache_n = n_tokens;
+        snprintf(active_identity, sizeof(active_identity), "%s", cache_identity);
         free(tokens);
         if (max_tokens < 0) max_tokens = 0;
         if (max_tokens > max_seq_len - cache_n) max_tokens = max_seq_len - cache_n;
@@ -646,8 +804,25 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
             generated++;
             if (is_stop) {
                 /* Stop was sampled but never forwarded. Only processed
-                 * tokens belong in the reusable KV/recurrent prefix. */
+                 * tokens belong in the reusable KV/recurrent prefix.  A
+                 * speculative row predicts this stop from an already
+                 * processed input, so publish inputs through that row before
+                 * closing the transaction. */
                 cache_n--;
+                if (dflash_window) {
+                    int processed = dflash_index + 1;
+                    if (hip_llm_qwen35_dflash2_commit(gpu, dflash_position,
+                                                      processed)) {
+                        fprintf(stderr,
+                                "llm_server: DFlash stop commit failed pos=%d rows=%d\n",
+                                dflash_position, processed);
+                        fflush(stderr);
+                        mtp_error = 1;
+                    }
+                    dflash_rows = dflash_index = dflash_count = 0;
+                    dflash_position = -1;
+                    dflash_logits = NULL;
+                }
                 finish_eos = 1;
                 break;
             }
@@ -716,9 +891,27 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
             fflush(stderr);
         }
         if (g_stdio_cancel) cancelled = 1;
+        /* A length limit may cut through an accepted speculative window.
+         * Publish exactly the rows whose tokens were emitted; later verifier
+         * rows remain transaction-local and must not leak into the next turn. */
+        if (!cancelled && !mtp_error && dflash_rows > 0 && dflash_index > 0) {
+            if (hip_llm_qwen35_dflash2_commit(gpu, dflash_position,
+                                              dflash_index)) {
+                fprintf(stderr,
+                        "llm_server: DFlash length commit failed pos=%d rows=%d\n",
+                        dflash_position, dflash_index);
+                fflush(stderr);
+                mtp_error = 1;
+            }
+            dflash_rows = dflash_index = dflash_count = 0;
+            dflash_position = -1;
+            dflash_logits = NULL;
+        }
         if (mtp_error) {
-            hip_llm_free_state_snapshot(prefix_snapshot); prefix_snapshot = NULL;
-            prefix_cache_n = cache_n = 0;
+            hip_llm_free_state_snapshot(pending_prefix_snapshot);
+            hip_llm_free_state_snapshot(pending_prompt_snapshot);
+            cache_n = 0;
+            active_identity[0] = '\0';
             hip_llm_reset_state(gpu);
             hip_llm_set_decode_mode(gpu, 0);
             hllm_sampler_free(sampler);
@@ -773,24 +966,31 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
          * drop it before the next HTTP request rather than serving from stale
          * target state. */
         if (getenv("LLM_QWEN4_MTP_TRUST_DRAFT")) {
-            hip_llm_free_state_snapshot(prefix_snapshot);
-            prefix_snapshot = NULL;
-            prefix_cache_n = 0;
-            hip_llm_free_state_snapshot(prompt_snapshot);
-            prompt_snapshot = NULL;
-            prompt_cache_n = 0;
+            hip_llm_free_state_snapshot(pending_prefix_snapshot);
+            hip_llm_free_state_snapshot(pending_prompt_snapshot);
+            pending_prefix_snapshot = pending_prompt_snapshot = NULL;
             hip_llm_reset_state(gpu);
             cache_n = 0;
+            active_identity[0] = '\0';
         }
         if (cancelled) {
-            hip_llm_free_state_snapshot(prefix_snapshot);
-            prefix_snapshot = NULL;
-            prefix_cache_n = 0;
-            hip_llm_free_state_snapshot(prompt_snapshot);
-            prompt_snapshot = NULL;
-            prompt_cache_n = 0;
+            hip_llm_free_state_snapshot(pending_prefix_snapshot);
+            hip_llm_free_state_snapshot(pending_prompt_snapshot);
+            pending_prefix_snapshot = pending_prompt_snapshot = NULL;
             hip_llm_reset_state(gpu);
             cache_n = 0;
+            active_identity[0] = '\0';
+        } else if (!getenv("LLM_QWEN4_MTP_TRUST_DRAFT")) {
+            if (pending_prefix_snapshot) {
+                stdio_snapshot_cache_publish(&snapshot_cache, cache_identity,
+                    cache, requested_prefix, pending_prefix_snapshot);
+                pending_prefix_snapshot = NULL;
+            }
+            if (pending_prompt_snapshot) {
+                stdio_snapshot_cache_publish(&snapshot_cache, cache_identity,
+                    cache, n_tokens, pending_prompt_snapshot);
+                pending_prompt_snapshot = NULL;
+            }
         }
         printf("OK %d %d %d %s %s %.3f %.3f\n", cancelled ? 0 : common,
                cancelled ? 0 : n_tokens, generated,
@@ -801,10 +1001,7 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
         free(enc); free(text); free(seen);
     }
     free(cache);
-    free(prefix_cache);
-    free(prompt_cache);
-    hip_llm_free_state_snapshot(prefix_snapshot);
-    hip_llm_free_state_snapshot(prompt_snapshot);
+    stdio_snapshot_cache_free(&snapshot_cache);
     return 0;
 }
 
@@ -1070,6 +1267,8 @@ int main(int argc, char **argv) {
     const char *qwen35_dflash2_path = NULL;
     int qwen35_dflash2_draft = 4;
     int qwen35_snapshot_max_tokens = 0;
+    int context_cache_entries = 4;
+    int context_cache_max_mib = 2048;
     const char *load_qwen4_nextn_fusion = NULL;
     /* Q4_K/Q6_K exact verification is host-synchronization bound; recurrent
      * width-2 drafts minimize rejected-suffix work on the RX 9070 XT. */
@@ -1307,6 +1506,16 @@ int main(int argc, char **argv) {
             qwen35_dflash2_draft = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--qwen35-snapshot-max-tokens") == 0 && i + 1 < argc) {
             qwen35_snapshot_max_tokens = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--context-cache-entries") == 0 && i + 1 < argc) {
+            context_cache_entries = atoi(argv[++i]);
+            if (context_cache_entries < 0 || context_cache_entries > 64) {
+                fprintf(stderr, "--context-cache-entries must be 0..64\n"); return 1;
+            }
+        } else if (strcmp(argv[i], "--context-cache-max-mib") == 0 && i + 1 < argc) {
+            context_cache_max_mib = atoi(argv[++i]);
+            if (context_cache_max_mib < 0 || context_cache_max_mib > 65536) {
+                fprintf(stderr, "--context-cache-max-mib must be 0..65536\n"); return 1;
+            }
         } else if (strcmp(argv[i], "--inspect-qwen4-nextn") == 0 && i + 1 < argc) {
             inspect_qwen4_nextn = argv[++i];
         } else if (strcmp(argv[i], "--verify-qwen4-nextn") == 0 && i + 1 < argc) {
@@ -1359,6 +1568,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "       [--qwen35-mtp-window] (exact Q8/Q8 target windows, draft <=15; requires decode graph)\n");
             fprintf(stderr, "       [--qwen35-dflash2 SIDECAR --qwen35-dflash2-draft 1..7] (exact DFlash2 windows)\n");
             fprintf(stderr, "       [--qwen35-snapshot-max-tokens N] (bound Qwen3.8 Q8 prompt snapshots)\n");
+            fprintf(stderr, "       [--context-cache-entries N] [--context-cache-max-mib MiB] (bounded portable prompt snapshots)\n");
             fprintf(stderr, "       [--qwen35-reference-math] (diagnostic; incomplete whole-model parity)\n");
             fprintf(stderr, "       [--sampling-profile llama] [--seed N] [--temp T] [--top-k K] [--top-p P] [--min-p P]\n");
             fprintf(stderr, "       [--repeat-penalty R] [--presence-penalty P] [--frequency-penalty F] [--penalty-last-n N]\n");
@@ -1854,7 +2064,9 @@ int main(int argc, char **argv) {
         pass = run_stdio_server(gpu, vocab, n_vocab, n_max_seq, bos,
                                 qwen4_mtp ? qwen4_mtp_draft : 0,
                                 qwen35_dflash2_path ? qwen35_dflash2_draft : 0,
-                                coding_mode, reference_sampling ? &sampling : NULL) == 0;
+                                coding_mode, reference_sampling ? &sampling : NULL,
+                                context_cache_entries,
+                                (size_t)context_cache_max_mib << 20) == 0;
         hip_llm_free(gpu);
         if (cpu_model) transformer_free(cpu_model);
         bpe_vocab_free(vocab);

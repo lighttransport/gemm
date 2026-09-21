@@ -7,6 +7,45 @@ Launcher: `run_qwen38_codex_server_rocm.sh`, 7200 MiB expert cache,
 Sampling: temperature 1.0, top_p .95, top_k 40, min_p .01,
 presence penalty 0; no implicit frequency/no-repeat penalty in server requests.
 
+## Current Qwen3.8/DFlash2 multi-context gate — 2026-09-21
+
+The Qwen3.8 resident backend now assigns each request a FIFO ticket and a
+request-owned cancellation event. Cache reuse is namespaced by a hashed
+conversation identity and backed by a bounded transactional LRU of portable
+host snapshots. `--context-cache-entries` defaults to 4,
+`--context-cache-max-mib` to 2048, and
+`--qwen35-snapshot-max-tokens=0` selects the 16,384-token default bound.
+
+`REQ3` carries the cache identity and complete sampling controls. The HTTP shim
+accepts `prompt_cache_key`, conversation/session metadata, and the
+`X-Prompt-Cache-Key` header. It accepts `request_id` or `X-Request-ID`, echoes
+the ID in responses, and supports targeted `POST /v1/cancel`. A queued
+cancellation never signals the active runner transaction. The GPU execution
+path stays serialized because the target and DFlash verifier share mutable
+device state.
+
+Portable snapshots contain prompt logits, hybrid convolution/recurrent state,
+target Q8/Q8 KV plus FP16 scales, and DFlash private state. Publication occurs
+only after successful generation; failures and cancellations discard pending
+snapshots but preserve older committed entries. Restore uses the longest exact
+token prefix for the same cache identity. The runner rejects a snapshot unless
+its position equals its token-key length, and evicts entries that fail restore.
+
+The real-GPU harness now forces A/B/A switching rather than accepting an
+immediate same-context hit. On RX 9070 XT it restored an actual 6,535-token
+prefix (`cached_tokens=6535`) after an unrelated conversation, reproduced the
+same greedy output, and reported a 448.3 MiB snapshot. It also passed direct
+stdio transactions, seeded sampling, LRU eviction, malformed cache metadata,
+targeted/disconnect cancellation with recovery, concurrent distinct
+identities, and a two-turn C++ generation whose programs compiled and printed
+the expected result. The CPU protocol/template/tool suite passes 27 tests.
+
+The gate exposed and fixed two portability bugs: batched prefill left the host
+position stale, and Q8/Q8 FP16 scale rows were copied using an FP32 byte size.
+Previous long-prompt immediate-repeat results did not prove host restoration;
+larger 10K--60K snapshot claims need the new forced-interleave gate before they
+are considered validated.
+
 ## Findings and fixes
 
 - Calling raw ggml CPU dot kernels after `dlopen` without `ggml_cpu_init`
@@ -93,5 +132,6 @@ Short/suffix-prefill throughput should not be compared directly with the
 long initial prompt. Fast runs that omitted experts or returned malformed
 code are not valid decode-performance baselines.
 
-Remaining work includes request-owned concurrent cancellation, longer-context
-validation, and further decode optimization.
+Remaining serving work is an exact, beneficial multi-context decode batch and
+forced-interleave validation above the current 6,535-token gate. Decode
+optimization remains tracked separately.

@@ -1,9 +1,11 @@
 """GPU-independent regression for runner stdout transaction alignment."""
 import base64
+import hashlib
 import io
 import os
 import queue
 import threading
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
@@ -25,6 +27,8 @@ class ProtocolTest(unittest.TestCase):
         self.assertIn("--stdio-server", command)
         self.assertIn("--kv-cache", command)
         self.assertIn("q8q8", command)
+        self.assertIn("--context-cache-entries", command)
+        self.assertIn("--context-cache-max-mib", command)
         self.assertEqual(command[-2:], ["--sampling-profile", "llama"])
 
         args.qwen35_server_profile = False
@@ -96,8 +100,35 @@ class ProtocolTest(unittest.TestCase):
             stdout=io.StringIO("OK 0 1 0 stop \n"))
         backend.generate("test", 4, .6, .95, 0, 1.5, 1.1, .05,
                          seed=42, frequency=.2, penalty_last_n=32)
+        identity = hashlib.sha256(b"shared").hexdigest()
         self.assertEqual(backend.proc.stdin.getvalue(),
-                         "REQ2 42 4 0.6 0.95 0 1.5 1.1 0.05 0.2 32 - dGVzdA==\n")
+                         f"REQ3 {identity} 42 4 0.6 0.95 0 1.5 1.1 0.05 0.2 32 - dGVzdA==\n")
+
+    def test_cache_identity_is_stable_and_namespaced(self):
+        backend = Backend.__new__(Backend)
+        backend.lock = threading.Lock()
+        backend.cancel_lock = threading.Lock()
+        backend.active_cancel = None
+        backend.ready = True
+        backend.proc = SimpleNamespace(
+            poll=lambda: None, stdin=io.StringIO(),
+            stdout=io.StringIO("OK 0 1 0 stop \nOK 0 1 0 stop \n"))
+        backend.generate("test", 0, 0, .95, 20, 0, 1, 0,
+                         cache_key="conversation-a")
+        backend.generate("test", 0, 0, .95, 20, 0, 1, 0,
+                         cache_key="conversation-b")
+        lines = backend.proc.stdin.getvalue().splitlines()
+        self.assertEqual(lines[0].split()[1],
+                         hashlib.sha256(b"conversation-a").hexdigest())
+        self.assertEqual(lines[1].split()[1],
+                         hashlib.sha256(b"conversation-b").hexdigest())
+        self.assertNotEqual(lines[0].split()[1], lines[1].split()[1])
+
+    def test_oversized_runner_request_is_rejected_before_dispatch(self):
+        backend = Backend.__new__(Backend)
+        with self.assertRaisesRegex(ValueError, "runner protocol limit"):
+            backend.generate("x" * (4 * 1024 * 1024), 1, 0, .95, 20,
+                             0, 1, 0)
 
     def test_responses_tool_output_is_preserved(self):
         messages = responses_input_messages([
@@ -159,6 +190,8 @@ class ProtocolTest(unittest.TestCase):
             "status": "unavailable",
             "runner_alive": False,
             "runner_exit_status": 1,
+            "active_request": None,
+            "queued_requests": 0,
         })
 
     def test_close_reaps_running_runner(self):
@@ -200,25 +233,29 @@ class ProtocolTest(unittest.TestCase):
             stdout=SimpleNamespace(readline=lambda: replies.get(timeout=5)))
         first, second = threading.Event(), threading.Event()
 
-        def generate(event):
+        def generate(event, request_id):
             return backend.generate("test", 4, 1, .95, 40, 0, 1, .01,
-                                    cancellation=event)
+                                    cancellation=event, request_id=request_id)
 
         with patch("codex_server.os.kill") as kill, ThreadPoolExecutor(2) as pool:
-            active = pool.submit(generate, first)
+            active = pool.submit(generate, first, "active")
             self.assertTrue(submitted.wait(2))
-            queued = pool.submit(generate, second)
-            second.set()
-            backend.cancel(second)
+            queued = pool.submit(generate, second, "queued")
+            for _ in range(100):
+                with backend.cancel_lock:
+                    if "queued" in backend.request_cancellations:
+                        break
+                time.sleep(0.005)
+            self.assertTrue(backend.cancel_request("queued"))
             kill.assert_not_called()
             self.assertFalse(first.is_set())
-            backend.cancel(first)
+            self.assertTrue(backend.cancel_request("active"))
             kill.assert_called_once()
             replies.put("OK 0 0 0 cancelled \n")
             self.assertEqual(active.result(timeout=2)[4], "cancelled")
             self.assertEqual(queued.result(timeout=2)[4], "cancelled")
-            self.assertEqual(stdin.getvalue().count("REQ "), 1)
-            backend.cancel(first)
+            self.assertEqual(stdin.getvalue().count("REQ3 "), 1)
+            self.assertFalse(backend.cancel_request("active"))
             self.assertEqual(kill.call_count, 1)
 
     def test_cancelled_during_startup_is_not_dispatched(self):

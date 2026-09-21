@@ -31698,6 +31698,17 @@ ffn_section:
         hipMemcpyAsync(r->d_hc, last_hc, hcd * sizeof(float),
                        hipMemcpyDeviceToDevice, r->stream);
     }
+    /* Batched kernels receive positions as an interval and do not all touch
+     * the scalar runner position.  Publish the last completed row just as the
+     * scalar path does.  Snapshotting used to observe whatever decode or
+     * earlier short request had last written cur_position, producing a
+     * portable-looking snapshot with only that stale number of target KV
+     * rows after a long prefill. */
+    int final_position = position_start + M - 1;
+    r->cur_position = final_position;
+    if (hipMemcpyAsync(r->d_position, &final_position, sizeof(final_position),
+                       hipMemcpyHostToDevice, r->stream) != hipSuccess)
+        return -1;
     if (fingerprint) {
         uint64_t *hashes = calloc((size_t)r->n_layers * 5, sizeof(uint64_t));
         if (!hashes) return -1;
@@ -33351,7 +33362,59 @@ struct hip_llm_state_snapshot {
     void **qwen35_key_scale_host, **qwen35_value_scale_host;
     size_t *qwen35_kv_bytes, *qwen35_scale_bytes;
     int qwen35_kv_count;
+    int portable;
 };
+
+size_t hip_llm_state_snapshot_bytes(const hip_llm_state_snapshot *s) {
+    if (!s) return 0;
+    size_t bytes = sizeof(*s) + s->ple_bytes + s->hc_bytes +
+                   s->logits_bytes + s->nextn_kv_bytes +
+                   s->dflash_feature_bytes;
+    if (s->conv_host) bytes += (size_t)s->n_layers * sizeof(*s->conv_host);
+    if (s->rec_host) bytes += (size_t)s->n_layers * sizeof(*s->rec_host);
+    if (s->conv_bytes) bytes += (size_t)s->n_layers * sizeof(*s->conv_bytes);
+    if (s->rec_bytes) bytes += (size_t)s->n_layers * sizeof(*s->rec_bytes);
+    if (s->kv_key_host) bytes += (size_t)s->n_layers * sizeof(*s->kv_key_host);
+    if (s->kv_value_host) bytes += (size_t)s->n_layers * sizeof(*s->kv_value_host);
+    if (s->kv_bytes) bytes += (size_t)s->n_layers * sizeof(*s->kv_bytes);
+    if (s->index_host) bytes += (size_t)s->n_layers * sizeof(*s->index_host);
+    if (s->dflash_key_host)
+        bytes += (size_t)HLLM_DFLASH_LAYERS * sizeof(*s->dflash_key_host);
+    if (s->dflash_value_host)
+        bytes += (size_t)HLLM_DFLASH_LAYERS * sizeof(*s->dflash_value_host);
+    if (s->qwen35_key_host)
+        bytes += (size_t)s->n_layers * sizeof(*s->qwen35_key_host);
+    if (s->qwen35_value_host)
+        bytes += (size_t)s->n_layers * sizeof(*s->qwen35_value_host);
+    if (s->qwen35_key_scale_host)
+        bytes += (size_t)s->n_layers * sizeof(*s->qwen35_key_scale_host);
+    if (s->qwen35_value_scale_host)
+        bytes += (size_t)s->n_layers * sizeof(*s->qwen35_value_scale_host);
+    if (s->qwen35_kv_bytes)
+        bytes += (size_t)s->n_layers * sizeof(*s->qwen35_kv_bytes);
+    if (s->qwen35_scale_bytes)
+        bytes += (size_t)s->n_layers * sizeof(*s->qwen35_scale_bytes);
+    for (int l = 0; l < s->n_layers; ++l) {
+        bytes += s->conv_bytes ? s->conv_bytes[l] : 0;
+        bytes += s->rec_bytes ? s->rec_bytes[l] : 0;
+        bytes += s->kv_bytes ? 2 * s->kv_bytes[l] : 0;
+        bytes += s->index_host && s->index_host[l] ? s->index_bytes : 0;
+        bytes += s->qwen35_kv_bytes ? 2 * s->qwen35_kv_bytes[l] : 0;
+        bytes += s->qwen35_scale_bytes ? 2 * s->qwen35_scale_bytes[l] : 0;
+    }
+    if (s->nextn_hc_host) bytes += s->hc_bytes;
+    if (s->dflash_key_host || s->dflash_value_host)
+        bytes += 2 * (size_t)HLLM_DFLASH_LAYERS * s->dflash_kv_bytes;
+    return bytes;
+}
+
+int hip_llm_state_snapshot_is_portable(const hip_llm_state_snapshot *s) {
+    return s && s->portable;
+}
+
+int hip_llm_state_snapshot_token_count(const hip_llm_state_snapshot *s) {
+    return s && s->position >= 0 ? s->position + 1 : 0;
+}
 
 void hip_llm_free_state_snapshot(hip_llm_state_snapshot *s) {
     if (!s) return;
@@ -33461,6 +33524,7 @@ hip_llm_state_snapshot *hip_llm_snapshot_state(hip_llm_runner *r) {
     hip_llm_state_snapshot *s = (hip_llm_state_snapshot *)calloc(1, sizeof(*s));
     if (!s) return NULL;
     s->n_layers = r->n_layers;
+    s->portable = 0;
     s->conv_host = (void **)calloc((size_t)s->n_layers, sizeof(void *));
     s->rec_host = (void **)calloc((size_t)s->n_layers, sizeof(void *));
     s->conv_bytes = (size_t *)calloc((size_t)s->n_layers, sizeof(size_t));
@@ -33555,7 +33619,8 @@ hip_llm_state_snapshot *hip_llm_snapshot_state(hip_llm_runner *r) {
      * the hybrid SSM and DFlash state.  Bound this host-side copy to short
      * prompts; keep the host copy bounded so long-context serving does not
      * silently consume multiple gigabytes per cached conversation. */
-    if (r->qwen35_dflash2 && r->kv_cache_type == HIP_LLM_KV_Q8_0_Q8_0 &&
+    if (r->is_hybrid && !r->is_qwen4exp &&
+        r->kv_cache_type == HIP_LLM_KV_Q8_0_Q8_0 &&
         s->position >= 0 && s->position + 1 <=
             (r->qwen35_snapshot_max_tokens > 0 ? r->qwen35_snapshot_max_tokens : 16384)) {
         s->qwen35_kv_count = s->position + 1;
@@ -33568,12 +33633,22 @@ hip_llm_state_snapshot *hip_llm_snapshot_state(hip_llm_runner *r) {
         if (!s->qwen35_key_host || !s->qwen35_value_host ||
             !s->qwen35_key_scale_host || !s->qwen35_value_scale_host ||
             !s->qwen35_kv_bytes || !s->qwen35_scale_bytes) goto fail;
+        int attention_layers = 0;
+        int copied_layers = 0;
         for (int l = 0; l < s->n_layers; ++l) {
             hip_layer *cl = &r->layers[l];
-            if (cl->is_ssm || !r->d_key_cache[l] || !r->d_key_cache_scale[l]) continue;
+            if (cl->is_ssm) continue;
+            ++attention_layers;
+            if (!r->d_key_cache[l] || !r->d_value_cache[l] ||
+                !r->d_key_cache_scale[l] || !r->d_value_cache_scale[l])
+                continue;
             size_t row_bytes = (size_t)cl->local_kv_heads * cl->local_head_dim;
+            /* Q8/Q8 scale caches use one FP16 scale per 32 values.  Treating
+             * them as float happened to stay inside an 8K allocation for
+             * tiny snapshots, but crossed it beyond half context and made
+             * long snapshot creation fail. */
             size_t scale_row = (size_t)cl->local_kv_heads *
-                               (cl->local_head_dim / 32) * sizeof(float);
+                               (cl->local_head_dim / 32) * sizeof(uint16_t);
             s->qwen35_kv_bytes[l] = (size_t)s->qwen35_kv_count * row_bytes;
             s->qwen35_scale_bytes[l] = (size_t)s->qwen35_kv_count * scale_row;
             s->qwen35_key_host[l] = malloc(s->qwen35_kv_bytes[l]);
@@ -33591,7 +33666,10 @@ hip_llm_state_snapshot *hip_llm_snapshot_state(hip_llm_runner *r) {
                 hipMemcpy(s->qwen35_value_scale_host[l], r->d_value_cache_scale[l],
                           s->qwen35_scale_bytes[l], hipMemcpyDeviceToHost) != hipSuccess)
                 goto fail;
+            ++copied_layers;
         }
+        s->portable = s->qwen35_kv_count == s->position + 1 &&
+                      attention_layers > 0 && copied_layers == attention_layers;
     }
     return s;
 fail:
@@ -33670,7 +33748,7 @@ int hip_llm_restore_state(hip_llm_runner *r, const hip_llm_state_snapshot *s) {
         d->kv_end = s->dflash_kv_end;
         d->feature_rows = s->dflash_feature_rows;
     }
-    if (s->qwen35_key_host && r->qwen35_dflash2) {
+    if (s->qwen35_key_host) {
         for (int l = 0; l < r->n_layers; ++l) {
             if (!s->qwen35_key_host[l] || !r->d_key_cache[l]) continue;
             if (hipMemcpy(r->d_key_cache[l], s->qwen35_key_host[l],

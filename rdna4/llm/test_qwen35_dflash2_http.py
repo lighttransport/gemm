@@ -7,9 +7,13 @@ import argparse
 import concurrent.futures
 import http.client
 import json
+from pathlib import Path
 import signal
+import subprocess
+import tempfile
 import threading
 import time
+import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
 from types import SimpleNamespace
@@ -37,13 +41,28 @@ def post(port, body):
         return json.load(response)
 
 
+def post_error(port, body, status):
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}/v1/chat/completions",
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        urllib.request.urlopen(request, timeout=HTTP_TIMEOUT)
+    except urllib.error.HTTPError as error:
+        require(error.code == status, error.code)
+        return json.load(error)
+    raise AssertionError(f"request unexpectedly succeeded; expected HTTP {status}")
+
+
 def concurrent_quality_cases(port):
     cases = (
         ("Answer 5+5 with just 10.", "10"),
         ("Answer 7+7 with just 14.", "14"),
     )
     bodies = [({"messages": [{"role": "user", "content": prompt}],
-                "temperature": 0, "max_tokens": 8}, expected)
+                "temperature": 0, "max_tokens": 8,
+                "prompt_cache_key": f"concurrent-{expected}"}, expected)
               for prompt, expected in cases]
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
         results = list(pool.map(lambda item: post(port, item[0]), bodies))
@@ -53,11 +72,13 @@ def concurrent_quality_cases(port):
         require(expected in text, text)
 
 
-def cancel_stream(port, prompt="List ten facts about C++."):
+def cancel_stream(port, prompt="List ten facts about C++.", explicit=False):
     """Close an active stream after its first token and verify cleanup later."""
     body = {
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0, "max_tokens": 64, "stream": True,
+        "prompt_cache_key": "cancel-stream",
+        "request_id": "cancel-explicit" if explicit else "cancel-disconnect",
     }
     connection = http.client.HTTPConnection("127.0.0.1", port, timeout=HTTP_TIMEOUT)
     try:
@@ -82,6 +103,19 @@ def cancel_stream(port, prompt="List ten facts about C++."):
                 saw_token = True
                 break
         require(saw_token, "stream ended before the first generated token")
+        require(response.getheader("X-Request-ID") == body["request_id"],
+                dict(response.getheaders()))
+        if explicit:
+            cancel_request = urllib.request.Request(
+                f"http://127.0.0.1:{port}/v1/cancel",
+                data=json.dumps({"request_id": body["request_id"]}).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(cancel_request, timeout=HTTP_TIMEOUT) as cancelled:
+                payload = json.load(cancelled)
+            require(payload.get("status") == "cancellation_requested", payload)
+            while response.readline():
+                pass
         # Closing after a real token leaves a DFlash window transaction active
         # and exercises cooperative rollback in the resident stdio child.
     finally:
@@ -94,16 +128,16 @@ def direct_stdio_cases(backend):
     prompt = chat_prompt(messages)
     prefix = chat_prefix(messages)
     greedy = backend.generate(prompt, 8, 0, 0.95, 20, 0, 1, 0,
-                              prefix=prefix, seed=42)
+                              prefix=prefix, seed=42, cache_key="direct-a")
     repeated = backend.generate(prompt, 8, 0, 0.95, 20, 0, 1, 0,
-                                prefix=prefix, seed=42)
+                                prefix=prefix, seed=42, cache_key="direct-a")
     require(greedy[0] == repeated[0] and "13" in greedy[0], greedy)
     require(greedy[3] > 0 and repeated[1] > 0, repeated)
 
     sampled = backend.generate(prompt, 8, 0.7, 0.95, 20, 0, 1, 0,
-                               prefix=prefix, seed=42)
+                               prefix=prefix, seed=42, cache_key="direct-a")
     sampled_repeat = backend.generate(prompt, 8, 0.7, 0.95, 20, 0, 1, 0,
-                                      prefix=prefix, seed=42)
+                                      prefix=prefix, seed=42, cache_key="direct-a")
     require(sampled[0] == sampled_repeat[0] and sampled[3] > 0, sampled)
     require(sampled_repeat[1] > 0, sampled_repeat)
 
@@ -116,11 +150,21 @@ def direct_stdio_cases(backend):
     cancelled = backend.generate(
         chat_prompt([{"role": "user", "content": "List twenty C++ language features."}]),
         64, 0, 0.95, 20, 0, 1, 0, cancellation=cancellation,
-        on_token=cancel_after_token, seed=42)
+        on_token=cancel_after_token, seed=42, cache_key="cancelled")
     require(cancellation.is_set() and cancelled[-1] == "cancelled", cancelled)
     recovered = backend.generate(prompt, 8, 0, 0.95, 20, 0, 1, 0,
-                                 prefix=prefix, seed=42)
-    require(recovered[0] == greedy[0], recovered)
+                                 prefix=prefix, seed=42, cache_key="direct-a")
+    require(recovered[0] == greedy[0] and recovered[1] > 0, recovered)
+
+    other_prompt = chat_prompt([
+        {"role": "user", "content": "What is 4+4? Answer with just 8."}])
+    other = backend.generate(other_prompt, 8, 0, 0.95, 20, 0, 1, 0,
+                             seed=42, cache_key="direct-b")
+    restored = backend.generate(prompt, 8, 0, 0.95, 20, 0, 1, 0,
+                                prefix=prefix, seed=42, cache_key="direct-a")
+    require("8" in other[0], other)
+    require(restored[0] == greedy[0] and restored[1] > 0,
+            "A/B/A context restore failed: " + repr(restored))
 
     cases = (
         ("Answer 6+6 with just 12.", "12"),
@@ -131,7 +175,8 @@ def direct_stdio_cases(backend):
         text, expected = item
         result = backend.generate(
             chat_prompt([{"role": "user", "content": text}]),
-            8, 0, 0.95, 20, 0, 1, 0, seed=42)
+            8, 0, 0.95, 20, 0, 1, 0, seed=42,
+            cache_key=f"direct-concurrent-{expected}")
         return result, expected
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
@@ -139,6 +184,72 @@ def direct_stdio_cases(backend):
     for result, expected in results:
         require(result[3] > 0 and expected in result[0], result)
     print("DFlash2 stdio window/cache/sampling/cancel/concurrency: PASS")
+
+
+def extract_cpp(text):
+    if "```" not in text:
+        return text.strip()
+    chunks = text.split("```")
+    for i in range(1, len(chunks), 2):
+        candidate = chunks[i]
+        if candidate.lstrip().startswith(("cpp\n", "c++\n", "C++\n")):
+            candidate = candidate.split("\n", 1)[1]
+        if "#include" in candidate or "int main" in candidate:
+            return candidate.strip()
+    return text.strip()
+
+
+def compile_cpp_answer(text):
+    source = extract_cpp(text)
+    scratch_root = Path(__file__).with_name("tmp")
+    scratch_root.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="dflash-agent-", dir=scratch_root) as directory:
+        path = Path(directory)
+        source_path = path / "answer.cpp"
+        binary_path = path / "answer"
+        source_path.write_text(source)
+        build = subprocess.run(
+            ["c++", "-std=c++17", "-Wall", "-Wextra", "-Werror",
+             str(source_path), "-o", str(binary_path)],
+            capture_output=True, text=True, timeout=30)
+        require(build.returncode == 0,
+                f"generated C++ did not compile:\n{build.stderr}\n{source}")
+        run = subprocess.run([str(binary_path)], capture_output=True,
+                             text=True, timeout=5)
+        require(run.returncode == 0 and run.stdout.strip() == "42",
+                f"generated C++ returned {run.returncode}: {run.stdout!r} {run.stderr!r}")
+
+
+def coding_agent_cases(port):
+    first_messages = [{
+        "role": "user",
+        "content": ("Return only valid C++17 source code, without Markdown. "
+                    "Write a complete program that prints exactly 42 followed by a newline."),
+    }]
+    first_body = {"messages": first_messages, "temperature": 0,
+                  "max_tokens": 64, "prompt_cache_key": "coding-session"}
+    first = post(port, first_body)
+    first_text = first["choices"][0]["message"]["content"]
+    compile_cpp_answer(first_text)
+    distractor = post(port, {
+        "messages": [{"role": "user", "content": "Answer 1+1 with just 2."}],
+        "temperature": 0, "max_tokens": 8,
+        "prompt_cache_key": "coding-distractor",
+    })
+    require("2" in distractor["choices"][0]["message"]["content"], distractor)
+    second_messages = first_messages + [
+        {"role": "assistant", "content": first_text},
+        {"role": "user", "content": (
+            "Keep the observable output identical. Add a constexpr function named "
+            "answer that returns 42, and have main print answer(). Return only source code.")},
+    ]
+    second = post(port, {"messages": second_messages, "temperature": 0,
+                         "max_tokens": 96, "prompt_cache_key": "coding-session"})
+    second_text = second["choices"][0]["message"]["content"]
+    require(second.get("usage", {}).get("cached_tokens", 0) > 0, second)
+    require("answer" in second_text, second_text)
+    compile_cpp_answer(second_text)
+    print("DFlash2 multi-turn C++ compile/run quality: PASS")
 
 
 def cleanup_on_signal(signum, _frame):
@@ -159,7 +270,7 @@ def main():
     parser.add_argument("--context", type=int, default=512)
     parser.add_argument("--snapshot-max-tokens", type=int, default=0)
     parser.add_argument("--long-prompt-tokens", type=int, default=0,
-                        help="also exercise a deterministic longer cached prompt")
+                        help="target token count for a deterministic longer cached prompt")
     args = parser.parse_args()
     options = SimpleNamespace(
         runner=args.runner, model=args.model, context=args.context,
@@ -168,6 +279,7 @@ def main():
         qwen35_server_profile=False, qwen35_dflash2=args.sidecar,
         qwen35_dflash2_draft=7,
         qwen35_snapshot_max_tokens=args.snapshot_max_tokens,
+        context_cache_entries=2, context_cache_max_mib=2048,
     )
     backend = Backend(options)
     _active_backend = backend
@@ -189,14 +301,27 @@ def main():
                 f"http://127.0.0.1:{args.port}/health", timeout=2) as response:
             health = json.load(response)
         require(health.get("status") == "ready", health)
+        bad_cache = post_error(args.port, {
+            "messages": [{"role": "user", "content": "ignored"}],
+            "prompt_cache_key": ["not", "a", "string"],
+        }, 400)
+        require(bad_cache.get("error", {}).get("type") == "invalid_request_error",
+                bad_cache)
+        bad_request_id = post_error(args.port, {
+            "messages": [{"role": "user", "content": "ignored"}],
+            "request_id": ["not", "a", "string"],
+        }, 400)
+        require(bad_request_id.get("error", {}).get("type") == "invalid_request_error",
+                bad_request_id)
 
         cases = (
             ("Write one short sentence about C++.", "C++"),
             ("What is 2+2? Answer with just the number 4.", "4"),
         )
-        for prompt_text, expected in cases:
+        for case_index, (prompt_text, expected) in enumerate(cases):
             prompt = [{"role": "user", "content": prompt_text}]
-            greedy = {"messages": prompt, "temperature": 0, "max_tokens": 8}
+            greedy = {"messages": prompt, "temperature": 0, "max_tokens": 8,
+                      "prompt_cache_key": f"http-repeat-{case_index}"}
             first = post(args.port, greedy)
             second = post(args.port, greedy)
             third = post(args.port, greedy)
@@ -219,17 +344,45 @@ def main():
                     "long prompt must fit the selected context")
             unit = ("C++ uses deterministic compilation, explicit ownership, and "
                     "well-defined arithmetic. ")
-            long_text = (unit * ((args.long_prompt_tokens * 4) // len(unit) + 1))[:
-                args.long_prompt_tokens * 4]
+            # This tokenizer averages close to six source characters per token
+            # for the repeated sentence. Keep the requested value meaningful
+            # and verify the actual API count below rather than relying only
+            # on a character heuristic.
+            char_budget = args.long_prompt_tokens * 6
+            long_text = (unit * (char_budget // len(unit) + 1))[:char_budget]
             long_body = {"messages": [{"role": "user", "content": long_text}],
-                         "temperature": 0, "max_tokens": 8}
+                         "temperature": 0, "max_tokens": 8,
+                         "prompt_cache_key": "long-session"}
             long_a = post(args.port, long_body)
+            actual_long_tokens = long_a.get("usage", {}).get("prompt_tokens", 0)
+            require(actual_long_tokens >= int(args.long_prompt_tokens * 0.85),
+                    f"long prompt token target missed: requested "
+                    f"{args.long_prompt_tokens}, got {actual_long_tokens}")
             long_b = post(args.port, long_body)
             require(long_a["choices"][0]["message"]["content"] ==
                     long_b["choices"][0]["message"]["content"],
                     "long cached prompt was not repeatable")
             require(long_b.get("usage", {}).get("cached_tokens", 0) > 0,
                     "long prompt did not report cache reuse")
+
+            # A same-context repeat can still pass when the live GPU state is
+            # correct but the host snapshot is incomplete.  Force another
+            # conversation through the one-runner backend, then require the
+            # long context to restore byte-for-byte equivalent output.
+            distractor = post(args.port, {
+                "messages": [{"role": "user",
+                              "content": "Answer only: context switch complete."}],
+                "temperature": 0, "max_tokens": 8,
+                "prompt_cache_key": "long-distractor",
+            })
+            require(distractor.get("usage", {}).get("completion_tokens", 0) > 0,
+                    distractor)
+            long_c = post(args.port, long_body)
+            require(long_a["choices"][0]["message"]["content"] ==
+                    long_c["choices"][0]["message"]["content"],
+                    "long context changed after an interleaved conversation")
+            require(long_c.get("usage", {}).get("cached_tokens", 0) > 0,
+                    "long context was not restored after interleaving")
 
             long_sampled = dict(long_body, temperature=0.7, top_p=0.95,
                                 top_k=20, seed=42)
@@ -244,10 +397,13 @@ def main():
                     "long sampled prompt did not reuse the cached transaction")
 
         cancel_stream(args.port, long_text or "List ten facts about C++.")
+        cancel_stream(args.port, "List twenty C++ standard library types.",
+                      explicit=True)
         time.sleep(1)
         recovery = post(args.port, {
             "messages": [{"role": "user", "content": "Answer 3+3 with 6."}],
             "temperature": 0, "max_tokens": 8,
+            "prompt_cache_key": "recovery",
         })
         require(recovery.get("usage", {}).get("completion_tokens", 0) > 0,
                 recovery)
@@ -255,10 +411,26 @@ def main():
 
         concurrent_quality_cases(args.port)
 
+        # Capacity two: after A/B/C, A's committed snapshot must be evicted.
+        eviction_results = []
+        for key, value in (("evict-a", "11"), ("evict-b", "12"),
+                           ("evict-c", "13"), ("evict-a", "11")):
+            eviction_results.append(post(args.port, {
+                "messages": [{"role": "user", "content":
+                              f"Answer with just the number {value}."}],
+                "temperature": 0, "max_tokens": 8,
+                "prompt_cache_key": key,
+            }))
+        require(eviction_results[-1].get("usage", {}).get("cached_tokens", -1) == 0,
+                "LRU did not evict the oldest context")
+
+        coding_agent_cases(args.port)
+
         prompt = [{"role": "user", "content": cases[0][0]}]
         sampled = {
             "messages": prompt, "temperature": 0.7, "top_p": 0.95,
             "top_k": 20, "seed": 42, "max_tokens": 8,
+            "prompt_cache_key": "sampled-cpp",
         }
         sampled_a = post(args.port, sampled)
         sampled_b = post(args.port, sampled)
