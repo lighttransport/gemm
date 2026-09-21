@@ -96,7 +96,7 @@ def main() -> int:
         help="run the native C/NVRTC denoiser against the PyTorch reference checkpoints",
     )
     ap.add_argument("--native-bin", default="cuda/qimg21/test_cuda_qimg21_native")
-    ap.add_argument("--native-attention", choices=("math", "reverse64", "mma64", "mma64-flash"), default="math")
+    ap.add_argument("--native-attention", choices=("math", "reverse64", "mma64", "mma64-flash", "mma64-mixed"), default="math")
     ap.add_argument("--native-normalization", choices=("default", "vector4"), default="default")
     ap.add_argument("--native-rope", choices=("default", "host-table", "host-table-vector4"), default="default")
     ap.add_argument("--quantized", action="store_true")

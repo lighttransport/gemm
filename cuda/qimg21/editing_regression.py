@@ -32,7 +32,7 @@ def main():
     ap.add_argument("--model", required=True, type=Path)
     ap.add_argument("--reference-dir", required=True, type=Path)
     ap.add_argument("--work-dir", required=True, type=Path)
-    ap.add_argument("--native-attention", choices=("math", "reverse64", "mma64", "mma64-flash"), default="math")
+    ap.add_argument("--native-attention", choices=("math", "reverse64", "mma64", "mma64-flash", "mma64-mixed"), default="math")
     ap.add_argument("--native-normalization", choices=("default", "vector4"), default="default")
     ap.add_argument("--native-rope", choices=("default", "host-table", "host-table-vector4"), default="default")
     args = ap.parse_args()

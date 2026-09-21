@@ -593,6 +593,37 @@ and target image segments use `aten::_scaled_dot_product_flash_attention`.
 The trace is `tmp/qimg21-attention-backends.log`. Matching the masked-text
 backend's arithmetic is therefore a separate remaining parity task.
 
+Forward 64-key traversal is now available in the standalone attention replay:
+`--forward64` (ordinary softmax) and `--forward64-flash` (Flash-style softmax).
+On the same saved editing Q/K/V, ordinary forward traversal raises text-row
+cosine from 0.999999772809 to **0.999999997115** and elementwise equality from
+92.6904% to **99.8853%**. The leading 8 text rows match exactly; the 12 text
+rows after the condition image are 99.8088% exact. Forward Flash-style
+softmax is slightly worse on text. Forward traversal worsens target image
+cosine to 0.999999502640, so it is not suitable for replacing image attention.
+
+The experimental `--attention mma64-mixed` (Python: `--native-attention
+mma64-mixed`) selects ordinary forward traversal only for text rows and
+reverse Flash-style traversal for condition/target images. Both paths remain
+native BF16 tensor-core kernels, reusing the same buffers. Defaults and the
+0.99996 acceptance target are unchanged. All 25 CPU tests pass. Full saved
+editing validation was run with:
+
+```sh
+OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=1 tmp/qimg21-ref-venv/bin/python cuda/qimg21/editing_regression.py \
+  --model /mnt/nvme01/models/qimg-21 \
+  --reference-dir tmp/qimg21-edit-reference-256-s2-mask \
+  --work-dir tmp/qimg21-edit-mixed-regression \
+  --native-attention mma64-mixed --native-normalization vector4 --native-rope host-table-vector4
+```
+
+It completed but failed all four gates: predictions **0.999923131554 /
+0.999884239326**, trajectory **0.999899042085 / 0.999899960032**. All outputs
+are finite. This combination is not accepted; operator replay improvements
+alone do not establish full denoiser acceptance. Compared with the earlier
+editing combination, this run also changes RMS and image softmax arithmetic,
+so its differences cannot be attributed solely to text traversal order.
+
 Compare the replay without loading PyTorch or allocating GPU memory:
 
 ```sh

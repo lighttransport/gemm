@@ -320,7 +320,7 @@ typedef struct {
     CUmodule mod;
     CUfunction zero_rms, gelu, silu, round_bf16, mul_silu, mod_ln, mod_ln_precise, gate_res, qk_rope, attn, final_ln, proj;
     CUfunction mma_attention;
-    CUfunction table_rope;
+    CUfunction table_rope, mma_text;
     int norm_threads;
 } qimg21_kernels;
 
@@ -333,6 +333,7 @@ static int get_kernel(qimg21_kernels *k, CUmodule m) {
     k->mod = m;
     k->mma_attention = NULL;
     k->table_rope = NULL;
+    k->mma_text = NULL;
     k->norm_threads = 256;
     return cuModuleGetFunction(&k->zero_rms, m, "zero_rms") ||
            cuModuleGetFunction(&k->gelu, m, "gelu_tanh_ordered") ||
@@ -493,7 +494,9 @@ static int native_step(cuda_qimg_runner *r, qimg21_kernels *k, const qimg21_shar
                 int nq=end-start,nkv=end;
                 CUdeviceptr sq=qb+(size_t)start*D*2,so=att+(size_t)start*D*4;
                 void *aa[]={&so,&sq,&kb,&vb,&nq,&nkv,(void *)&NH,(void *)&HD};
-                if(cuLaunchKernel(k->mma_attention,NH,(nq+63)/64,1,128,1,1,4*64*136*2,r->stream,aa,NULL) ||
+                int is_text=edit?edit->layout.image_id[start]<0:start<nt;
+                CUfunction attention=is_text && k->mma_text?k->mma_text:k->mma_attention;
+                if(cuLaunchKernel(attention,NH,(nq+63)/64,1,128,1,1,4*64*136*2,r->stream,aa,NULL) ||
                    cuCtxSynchronize())goto fail_block;
                 start=end;
             }
@@ -566,6 +569,7 @@ int main(int argc, char **argv) {
             else if (!strcmp(mode, "math")) qimg21_attention_reverse64 = 0;
             else if (!strcmp(mode, "mma64")) {qimg21_attention_mma64=1;qimg21_attention_reverse64=0;}
             else if (!strcmp(mode, "mma64-flash")) {qimg21_attention_mma64=2;qimg21_attention_reverse64=0;}
+            else if (!strcmp(mode, "mma64-mixed")) {qimg21_attention_mma64=3;qimg21_attention_reverse64=0;}
             else { fprintf(stderr, "native: attention must be math, reverse64, or mma64\n"); return 2; }
         }
         else if (!strcmp(argv[i], "--prompt-embeds") && i + 1 < argc) prompt_path = argv[++i];
@@ -674,15 +678,26 @@ int main(int argc, char **argv) {
            cuModuleGetFunction(&k.final_ln,norm_module,"final_ln_vector"))return 1;
         k.norm_threads=128;
     }
+    CUmodule text_mma_module=NULL;
     if(qimg21_attention_mma64) {
         size_t length=strlen(q21_mma64_src)+64;
         char *source=malloc(length);
         if(!source)return 1;
-        snprintf(source,length,"#define Q21_FLASH_SOFTMAX %d\n%s",qimg21_attention_mma64==2,q21_mma64_src);
+        snprintf(source,length,"#define Q21_FLASH_SOFTMAX %d\n%s",qimg21_attention_mma64>=2,q21_mma64_src);
         int compiled=cu_compile_kernels(&mma_module,r->device,source,"qimg21_mma64.cu",verbose,"qimg21_mma64");
         free(source);
         if(compiled<0 || cuModuleGetFunction(&k.mma_attention,mma_module,"q21_flash_reverse64") ||
            cuFuncSetAttribute(k.mma_attention,CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,4*64*136*2))return 1;
+    }
+    if(qimg21_attention_mma64==3) {
+        size_t length=strlen(q21_mma64_src)+128;
+        char *source=malloc(length);
+        if(!source)return 1;
+        snprintf(source,length,"#define Q21_FORWARD_KEYS 1\n#define Q21_FLASH_SOFTMAX 0\n%s",q21_mma64_src);
+        int compiled=cu_compile_kernels(&text_mma_module,r->device,source,"qimg21_mma_text.cu",verbose,"qimg21_mma_text");
+        free(source);
+        if(compiled<0 || cuModuleGetFunction(&k.mma_text,text_mma_module,"q21_flash_reverse64") ||
+           cuFuncSetAttribute(k.mma_text,CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,4*64*136*2))return 1;
     }
     if (dump_dir) mkdir(dump_dir, 0755);
     if (pred_dir) mkdir(pred_dir, 0755);
@@ -733,6 +748,7 @@ int main(int argc, char **argv) {
     free(pred); free(neg_pred); free(sigmas); cuModuleUnload(m); for(int i=0;i<s.n;i++)safetensors_close(s.st[i]);
     q21_edit_free(&edit);q21_edit_free(&negative_edit);free(packed);npy_free(&condition);
     if(mma_module)cuModuleUnload(mma_module);
+    if(text_mma_module)cuModuleUnload(text_mma_module);
     if(norm_module)cuModuleUnload(norm_module);
     if(rope_module)cuModuleUnload(rope_module);
     cuda_qimg_free(r); npy_free(&pe); npy_free(&neg); npy_free(&la); return rc;
