@@ -386,6 +386,22 @@ they do not establish full-model parity. The attention probe also reports
 prefix and target errors separately to avoid hiding target drift in a large
 condition prefix.
 
+`test_bf16_attention` is a diagnostic replay using the existing custom
+`flash_attn_bf16_xq` tensor-core kernel (not PyTorch). It processes each image
+block with its permitted key prefix and each causal text query separately,
+then rounds output to BF16. This checks whether tensor-core accumulation is
+closer to default SDPA before changing production dispatch:
+
+```sh
+make -C cuda/qimg21 test_bf16_attention
+cuda/qimg21/test_bf16_attention tmp/qimg21-edit-attn0 \
+  tmp/qimg21-edit-fixture-256-s2-mask/layout.txt \
+  tmp/qimg21-edit-attn0/mma_attention.npy
+```
+
+The replay builds; GPU parity is queued behind guided-editing validation.
+It does not alter default denoiser attention or imply full-model acceptance.
+
 `edit_kernels.h` adds experimental CUDA primitives for that layout:
 interleaved text/image scatter, Q/K RMSNorm plus layout-driven three-axis
 RoPE, and block-causal attention that keeps adjacent images separate.
