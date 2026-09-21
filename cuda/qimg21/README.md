@@ -870,6 +870,18 @@ only **0.999868168**, so the run still fails overall. Artifacts:
 `tmp/qimg21-edit-low-block17-v3` and
 `tmp/qimg21-edit-forward-flash-vector-ln/results.json`.
 
+Current upstream FlashAttention source reduces each 64-key tile's probability
+sum across its four-lane row group before updating the running denominator. An
+experimental native implementation of that ordering made the exact-Q/K/V
+block-17 target replay only marginally closer (relative L2
+**4.40802e-4 -> 4.40712e-4**, exact fraction **98.0930% -> 98.0945%**), but
+regressed the complete two-step editing run: predictions became
+**0.999951407 / 0.999846603** and trajectories became
+**0.999934909 / 0.999935189**. The kernel change was therefore removed. This
+also cautions against assuming the installed PyTorch 2.14 kernel has identical
+rounding to the current upstream implementation. Diagnostic artifact:
+`tmp/qimg21-edit-forward-flash-tile-reduce/results.json`.
+
 The same low-step block replay with its matched PyTorch hidden state shows
 where long-sequence error enters: target Q/K after RMS+RoPE have relative L2
 1.15e-5 / 2.15e-6, while ordinary MMA64 attention reaches 8.22e-4 and the
