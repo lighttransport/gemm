@@ -461,18 +461,12 @@ static void hllm_dense_mtp_ssm(hip_llm_runner *r, hip_layer *cl, int l, int rows
                         m->verify_conv[l], m->verify_ssm_qkv, cl->ssm_conv1d_w,
                         qkv_dim, conv_k, qkv_dim, rows);
 
-    /* Grid-Y batches independent rows while each block retains the scalar
-     * head reduction and normalization order. */
-    launch_l2_norm_heads_batch(r,r->d_ssm_conv_out_batch,n_group,ds,
-                               qkv_dim,rows,eps);
-    launch_l2_norm_heads_batch(r,
-        (float *)r->d_ssm_conv_out_batch+(size_t)n_group*ds,
-        n_group,ds,qkv_dim,rows,eps);
-    launch_repeat_tile_batch(r, r->d_ssm_Q_exp_batch, r->d_ssm_conv_out_batch,
-                             dt, ds, n_group, qkv_dim, d_inner, rows);
-    launch_repeat_tile_batch(r, r->d_ssm_K_exp_batch,
-                             (float *)r->d_ssm_conv_out_batch+(size_t)n_group*ds,
-                             dt, ds, n_group, qkv_dim, d_inner, rows);
+    /* Normalize Q/K and broadcast the group heads to dt_rank in one launch.
+     * The fused kernel keeps the original per-head reduction and rsqrt order,
+     * while avoiding three intermediate launches and round trips. */
+    launch_l2_norm_repeat_qk_batch(r, r->d_ssm_Q_exp_batch,
+        r->d_ssm_K_exp_batch, r->d_ssm_conv_out_batch,
+        n_group, ds, dt, qkv_dim, d_inner, rows, eps);
 
     float *v = (float *)r->d_ssm_conv_out_batch+(size_t)2*n_group*ds;
     launch_deltanet_step_batch_verify(r, cl->d_recurrent_state, m->verify_rec[l],

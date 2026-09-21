@@ -330,6 +330,9 @@ reflects the remaining measured costs.
    strides explicit, so a DFlash window commits only its accepted row. GPU
    HTTP and pinned llama.cpp gates retain greedy and seeded-sampled token/byte
    parity after this hardening.
+   The verifier now also uses the existing fused Q/K normalize-and-expand
+   kernel, removing three intermediate launches per recurrent layer while
+   preserving the same per-head reduction order.
 4. **Kernel and graph count.** Q/gate deinterleave, QK normalization, RoPE
    and Q8/Q8 KV storage are now fused exactly. The remaining small launches
    include SiLU/gating and state preparation. Fuse adjacent operations when

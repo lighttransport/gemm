@@ -236,6 +236,11 @@ convolution and recurrent snapshots. DFlash window commit/rollback copies only
 the accepted row into live state; the GPU HTTP gate and pinned llama.cpp
 comparison retain exact greedy and seeded-sampled token/byte parity.
 
+The batched SSM verifier also uses the existing fused Q/K normalize-and-expand
+kernel, removing three intermediate launches per recurrent layer. Exact token
+and byte hashes remain unchanged and warm prefill/decode throughput stays above
+the established targets.
+
 CLI: `--qwen35-dflash2 SIDECAR --qwen35-dflash2-draft 1..7`; it currently
 requires benchmark mode, `--qwen35-batched-prefill`, `--qwen35-decode-graph`
 and `--kv-cache q8q8`.  `validate_qwen38_reference.py` accepts `--dflash2`
