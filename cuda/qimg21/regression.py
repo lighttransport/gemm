@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import argparse
-import math
+import json
 import shutil
 import subprocess
 import sys
@@ -34,21 +34,18 @@ DEFAULT_CASES = (
 FULL_CASE = Case(1024, 1024, 40, 42)
 
 
-def _flow_sigmas(steps: int, image_tokens: int) -> list[float]:
-    """Mirror FlowMatchEulerDiscreteScheduler's dynamic-shift schedule."""
-    base_seq, max_seq = 256.0, 8192.0
-    base_shift, max_shift = 0.5, 0.9
-    mu = image_tokens * (max_shift - base_shift) / (max_seq - base_seq)
-    mu += base_shift - (max_shift - base_shift) / (max_seq - base_seq) * base_seq
-    emu = math.exp(mu)
-    sigmas = []
-    for i in range(steps):
-        u = 1.0 - i / steps
-        sigmas.append(emu / (emu + (1.0 / u - 1.0)))
-    if steps == 1:
-        return [1.0]
-    scale = (1.0 - sigmas[-1]) / (1.0 - 0.02)
-    return [1.0 - (1.0 - sigma) / scale for sigma in sigmas]
+def _load_timesteps(reference: Path, steps: int) -> list[float]:
+    """Require captured model inputs, never substitute unrounded sigmas."""
+    expected = [f"timestep_{step:03d}.npy" for step in range(steps)]
+    if sorted(path.name for path in reference.glob("timestep_*.npy")) != expected:
+        raise ValueError("reference timestep fixture set does not match requested steps")
+    values = []
+    for name in expected:
+        value = np.load(reference / name, allow_pickle=False)
+        if value.size != 1 or not np.isfinite(value).all() or not 0 <= float(value.reshape(-1)[0]) <= 1:
+            raise ValueError(f"invalid captured model timestep: {name}")
+        values.append(float(value.reshape(-1)[0]))
+    return values
 
 
 def _parse_case(value: str) -> Case:
@@ -99,10 +96,13 @@ def main() -> int:
         help="run the native C/NVRTC denoiser against the PyTorch reference checkpoints",
     )
     ap.add_argument("--native-bin", default="cuda/qimg21/test_cuda_qimg21_native")
+    ap.add_argument("--native-attention", choices=("math", "reverse64"), default="math")
     ap.add_argument("--quantized", action="store_true")
     ap.add_argument("--quantized-transformer", type=Path, help="Optional native row-INT8 package")
     ap.add_argument("--cosine-threshold", type=float)
     args = ap.parse_args()
+    if args.native_attention != "math" and not args.native:
+        ap.error("--native-attention requires --native")
     if args.quantized_transformer:
         if not args.native:
             ap.error("--quantized-transformer requires --native")
@@ -177,20 +177,20 @@ def main() -> int:
             _run(reference_command, root)
             if args.native:
                 run_dir.mkdir(parents=True, exist_ok=True)
-                guidance = []
+                guidance = ["--attention", args.native_attention]
                 if args.negative_prompt is not None:
-                    guidance = ["--negative-prompt-embeds", str(ref_dir / "negative_prompt_embeds.npy"),
-                                "--guidance-scale", str(args.true_cfg_scale)]
+                    guidance.extend(["--negative-prompt-embeds", str(ref_dir / "negative_prompt_embeds.npy"),
+                                     "--guidance-scale", str(args.true_cfg_scale)])
                 if args.quantized_transformer:
                     guidance.extend(["--quantized-transformer", str(args.quantized_transformer.resolve())])
-                fallback_sigmas = _flow_sigmas(case.steps, (case.height // 16) * (case.width // 16))
-                timesteps = []
-                for step, fallback in enumerate(fallback_sigmas):
-                    timestep_path = ref_dir / f"timestep_{step:03d}.npy"
-                    if timestep_path.exists():
-                        timesteps.append(float(np.load(timestep_path).reshape(-1)[0]))
-                    else:
-                        timesteps.append(fallback)
+                timesteps = _load_timesteps(ref_dir, case.steps)
+                (run_dir / "native_config.json").write_text(json.dumps({
+                    "attention": args.native_attention, "model": str(model),
+                    "quantized_transformer": str(args.quantized_transformer.resolve()) if args.quantized_transformer else None,
+                    "dtype": args.dtype, "timesteps": timesteps,
+                    "case": case.name, "prompt": args.prompt,
+                    "negative_prompt": args.negative_prompt, "true_cfg_scale": args.true_cfg_scale,
+                }, indent=2) + "\n")
                 for step, sigma in enumerate(timesteps):
                     step_pred_dir = run_dir / f"pred-step-{step:03d}"
                     _run(
@@ -277,9 +277,9 @@ def main() -> int:
             if comparison_failed:
                 failed.append(case.name)
                 print(f"FAIL: {case.name}", file=sys.stderr)
-        except subprocess.CalledProcessError:
+        except (subprocess.CalledProcessError, ValueError, OSError) as exc:
             failed.append(case.name)
-            print(f"FAIL: {case.name}", file=sys.stderr)
+            print(f"FAIL: {case.name}: {exc}", file=sys.stderr)
 
     if failed:
         print("\nREGRESSION FAIL: " + ", ".join(failed), file=sys.stderr)

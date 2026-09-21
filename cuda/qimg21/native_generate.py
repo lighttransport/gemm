@@ -88,6 +88,7 @@ def main() -> int:
     ap.add_argument("--work-dir", default="tmp/qimg21-native-generate")
     ap.add_argument("--out", default="tmp/qimg21-native-generate.png")
     ap.add_argument("--native-bin", default="cuda/qimg21/test_cuda_qimg21_native")
+    ap.add_argument("--native-attention", choices=("math", "reverse64"), default="math")
     ap.add_argument("--quantized-transformer", type=Path,
                     help="Optional experimental row-INT8 transformer package")
     ap.add_argument("--native-vae", action="store_true", help="Decode with the native F32 CUDA VAE (experimental)")
@@ -180,6 +181,7 @@ def main() -> int:
     native_latents = work / "native_latents.npy"
     native_command = [
             str(native_bin),
+            "--attention", args.native_attention,
             "--model",
             str(model),
             "--prompt-embeds",

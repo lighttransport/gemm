@@ -128,6 +128,12 @@ This is an inference from saved outputs, not proof of PyTorch's dispatch.
 The native executable exposes an experimental `--attention reverse64` kernel
 for full-denoiser validation; default `--attention math` remains unchanged.
 Native GPU accuracy/performance for the new kernel has not yet been measured.
+Both `regression.py` and `native_generate.py` accept
+`--native-attention reverse64`; regression records the choice in
+`native_config.json` and uses it for isolated denoiser and trajectory tests.
+Matched-input regression now requires every captured `timestep_NNN.npy`
+exactly: missing, extra, or invalid timesteps fail instead of falling back
+to a reconstructed, potentially differently rounded schedule.
 
 The native Euler update rounds its BF16 prediction-times-step product and
 casts the updated sample back to BF16, matching the CUDA PyTorch scheduler.
