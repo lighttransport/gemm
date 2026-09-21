@@ -1,5 +1,23 @@
 # Qwen3.8 27B HIP runner vs llama.cpp — resume state
 
+## 2026-09-22 continuation: IQ1_M micro-tuning and fusion audit
+
+The default one-row IQ1_M F32 kernel now marks its output, weight and
+activation buffers non-aliasing and explicitly unrolls both four-value FMA
+halves.  This leaves the reduction and FMA order unchanged.  A matched 4K
+random-token run moved from 43.64 to 43.72 tok/s with the same sequence hash
+`8b48e9c489798cfe`; the short exact C++ gate remained byte-identical to the
+pinned output (`44915ec1039a64c8`).  The 64K block-size A/B was neutral
+(35.77 tok/s at 256 threads versus 35.74--35.80 at the tested alternatives),
+so the runner's production launch geometry remains unchanged.
+
+I also tested a one-launch IQ1_S Q8_1 gate plus IQ1_M F32 up fusion.  It was
+bit-identical to the non-fused control, but the exact 4K C++ gate measured
+41.74 tok/s versus 41.90 tok/s control, so the kernel was removed rather than
+adding a slower opt-in path.  The launcher now forwards the existing decode
+and prefill profile diagnostics through the production wrapper, making stage
+timing reproducible without changing serving defaults.
+
 ## 2026-09-22 continuation: bounded overlap and rejected candidates
 
 The ordinary IQ1 audit now reuses the exact Q8_1 activation bytes and FP16

@@ -439,6 +439,12 @@ reflects the remaining measured costs.
    logit matrix is complete. A WMMA or reordered
    reduction path needs full output-token and logit validation because the
    current kernels preserve the target arithmetic order.
+   The IQ1_M one-row F32 kernel now uses explicit non-aliasing qualifiers and
+   unrolled four-value FMA halves; a matched 4K random gate moved 43.64 to
+   43.72 tok/s with the same sequence hash.  A fused IQ1_S Q8_1 gate plus
+   IQ1_M F32 up kernel was exact but 41.74 versus 41.90 tok/s on the pinned
+   C++ gate, so it was removed.  The 64K ordinary 40 tok/s gap therefore
+   remains a grouped mixed-type projection problem.
 2. **Verifier attention tail.** The query-grid verifier now selects ordinary
    decode's split count independently for every causal row. Equal-split
    windows now select a dedicated captured shared-K/V graph; split boundaries

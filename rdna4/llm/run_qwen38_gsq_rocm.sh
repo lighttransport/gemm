@@ -317,7 +317,8 @@ fi
 # it improves the fresh comparison; the mixed-IQ3 profile overrides it below.
 diag_env=()
 for diag_name in LLM_LOGITS_PATH LLM_GEN_TEXT LLM_DEBUG_LAYERS \
-                 LLM_DEBUG_DUMP_DIR LLM_DEBUG_ATTN_LAYER LLM_DEBUG_DUMP_SEQUENCE; do
+                 LLM_DEBUG_DUMP_DIR LLM_DEBUG_ATTN_LAYER LLM_DEBUG_DUMP_SEQUENCE \
+                 LLM_QWEN35_PROFILE_DECODE LLM_QWEN35_PROFILE_PREFILL; do
     if [[ -v "${diag_name}" ]]; then
         diag_env+=("${diag_name}=${!diag_name}")
     fi
