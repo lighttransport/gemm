@@ -351,6 +351,8 @@ run passes repeatability and cache reuse, including after the
    A 65,536-context run with a roughly 60k-token prompt and a 65,536 snapshot
    budget also passes cache reuse without replay, including cancellation and
    concurrent-request checks.
+   Batched verifier SSM alpha/beta preparation now uses one elementwise launch
+   for softplus/scale and sigmoid, with exact llama.cpp hashes preserved.
 4. **Kernel and graph count.** Q/gate deinterleave, QK normalization, RoPE
    and Q8/Q8 KV storage are now fused exactly. The remaining small launches
    include SiLU/gating and state preparation. Fuse adjacent operations when

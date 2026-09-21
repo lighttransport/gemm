@@ -3106,6 +3106,17 @@ static const char *hip_kernel_source =
 "    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
 "    if (i < n) data[i] = 1.0f / (1.0f + expf(-data[i]));\n"
 "}\n"
+"__global__ void ssm_alpha_beta_prepare_batch_f32(float *alpha, float *beta,\n"
+"        const float *bias, const float *a, int dt_rank, int M) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    int total = M * dt_rank;\n"
+"    if (i >= total) return;\n"
+"    int h = i % dt_rank;\n"
+"    float x = alpha[i] + bias[h];\n"
+"    float sp = (x > 20.0f) ? x : logf(1.0f + expf(x));\n"
+"    alpha[i] = sp * a[h];\n"
+"    beta[i] = 1.0f / (1.0f + expf(-beta[i]));\n"
+"}\n"
 "\n"
 "/* ---- 21. conv1d_depthwise_silu_f32: depthwise causal conv1d + SiLU + state update ---- */\n"
 "__global__ void conv1d_depthwise_silu_f32(\n"
@@ -13172,6 +13183,7 @@ struct hip_llm_runner {
     hipFunction_t fn_softplus_mul_f32;
     hipFunction_t fn_softplus_mul_batch_f32;
     hipFunction_t fn_sigmoid_inplace_f32;
+    hipFunction_t fn_ssm_alpha_beta_prepare_batch_f32;
     hipFunction_t fn_silu_gate_mul_f32;
     hipFunction_t fn_rmsnorm_heads_inplace_f32;
     hipFunction_t fn_conv1d_depthwise_silu_f32;
@@ -14291,6 +14303,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(softplus_mul_f32);
     GET_FUNC(softplus_mul_batch_f32);
     GET_FUNC(sigmoid_inplace_f32);
+    GET_FUNC(ssm_alpha_beta_prepare_batch_f32);
     GET_FUNC(silu_gate_mul_f32);
     GET_FUNC(rmsnorm_heads_inplace_f32);
     GET_FUNC(conv1d_depthwise_silu_f32);
@@ -23036,6 +23049,14 @@ static inline void launch_softplus_mul_batch(hip_llm_runner *r, void *out,
     int total = M * dt_rank;
     LAUNCH(r->fn_softplus_mul_batch_f32, (total + 255) / 256, 1, 1, 256, 1, 1, 0,
            r->stream, args);
+}
+
+static inline void launch_ssm_alpha_beta_prepare_batch(hip_llm_runner *r,
+    void *alpha, void *beta, void *bias, void *a, int dt_rank, int M) {
+    void *args[] = { &alpha, &beta, &bias, &a, &dt_rank, &M };
+    int total = M * dt_rank;
+    LAUNCH(r->fn_ssm_alpha_beta_prepare_batch_f32, (total + 255) / 256, 1, 1,
+           256, 1, 1, 0, r->stream, args);
 }
 
 static inline void launch_sigmoid_inplace(hip_llm_runner *r, void *data, int n) {

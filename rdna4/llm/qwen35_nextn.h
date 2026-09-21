@@ -454,9 +454,8 @@ static void hllm_dense_mtp_ssm(hip_llm_runner *r, hip_layer *cl, int l, int rows
     else launch_matvec_llama_f16_batch(r,m->verify_ssm_beta,cl->ssm_beta_w,
                                        m->verify_norm,dt,ne,rows);
 
-    launch_softplus_mul_batch(r, m->verify_ssm_alpha, m->verify_ssm_alpha,
-                              cl->ssm_dt_bias, cl->ssm_a, dt, rows, 1);
-    launch_sigmoid_inplace(r, m->verify_ssm_beta, rows*dt);
+    launch_ssm_alpha_beta_prepare_batch(r, m->verify_ssm_alpha,
+        m->verify_ssm_beta, cl->ssm_dt_bias, cl->ssm_a, dt, rows);
     launch_conv1d_batch(r, r->d_ssm_conv_out_batch, cl->d_conv_state,
                         m->verify_conv[l], m->verify_ssm_qkv, cl->ssm_conv1d_w,
                         qkv_dim, conv_k, qkv_dim, rows);

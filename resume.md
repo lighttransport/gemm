@@ -258,6 +258,10 @@ Deployments that need a larger host snapshot budget can pass
 The same opt-in path now passes a roughly 60k-token prompt at 65,536 context
 with a 65,536 snapshot budget, reusing cached prompt state without replay.
 
+Verifier SSM alpha softplus/scale and beta sigmoid preparation now share one
+batched elementwise launch. The pinned greedy and sampled llama.cpp hashes and
+warm throughput targets remain unchanged.
+
 CLI: `--qwen35-dflash2 SIDECAR --qwen35-dflash2-draft 1..7`; it currently
 requires benchmark mode, `--qwen35-batched-prefill`, `--qwen35-decode-graph`
 and `--kv-cache q8q8`.  `validate_qwen38_reference.py` accepts `--dflash2`
