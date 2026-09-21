@@ -247,7 +247,9 @@ single mutable GPU context. `request_id` and `X-Request-ID` provide targeted
 IDs are reserved before SSE headers are committed, duplicate active IDs return
 HTTP 409, and idle unscoped cancellation returns 404. Malformed content
 lengths/message arrays and oversized stdio frames are rejected without
-desynchronizing the resident protocol.
+desynchronizing the resident protocol. Context trimming uses stable original
+indices and retains complete user/assistant/tool turn groups, preventing equal
+messages from being reordered or tool results from becoming orphaned.
 The GPU work remains serialized because target recurrent scratch and DFlash
 verification state are still single-context; no decode batching is enabled.
 
@@ -281,7 +283,7 @@ Coverage includes greedy and seeded sampling, targeted and disconnect
 cancellation, recovery, malformed cache metadata, concurrent distinct cache
 identities, LRU eviction, forced context restoration, and a two-turn C++ task
 whose generated programs are compiled and run. The CPU protocol/template/tool
-suite now passes 29 tests.
+suite now passes 31 tests.
 The sampled random-64K target gate now passes 32 suffix tokens with prefix hash
 `90178de69a24a76e`, suffix hash `34e2f6bc082bc49f`, and `Result: PASS` after a
 445.67 tok/s prefix.

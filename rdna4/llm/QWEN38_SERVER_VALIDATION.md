@@ -26,7 +26,9 @@ device state. Request IDs are reserved before SSE headers are sent, so a
 duplicate receives an ordinary HTTP 409 instead of corrupting an established
 event stream. Idle cancellation returns 404, malformed message shapes and
 content lengths are rejected before inference, and oversized direct stdio
-frames are drained as one failed transaction.
+frames are drained as one failed transaction. Context trimming preserves
+original ordering for duplicate-valued messages and removes complete user /
+assistant / tool turn groups, avoiding orphaned tool results.
 
 Portable snapshots contain prompt logits, hybrid convolution/recurrent state,
 target Q8/Q8 KV plus FP16 scales, and DFlash private state. Publication occurs
@@ -46,7 +48,7 @@ same greedy output, and reported a 448.3 MiB snapshot. It also passed direct
 stdio transactions, seeded sampling, LRU eviction, malformed cache metadata,
 targeted/disconnect cancellation with recovery, concurrent distinct
 identities, and a two-turn C++ generation whose programs compiled and printed
-the expected result. The CPU protocol/template/tool suite passes 29 tests.
+the expected result. The CPU protocol/template/tool suite passes 31 tests.
 
 The gate exposed and fixed two portability bugs: batched prefill left the host
 position stale, and Q8/Q8 FP16 scale rows were copied using an FP32 byte size.

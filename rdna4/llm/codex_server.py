@@ -261,24 +261,37 @@ def chat_prefix(messages):
 
 
 def fit_context(messages, context_tokens, output_tokens):
-    """Keep system/developer instructions and the newest turns.
+    """Keep system/developer instructions and the newest complete user turns.
 
     The tokenizer lives in the GPU child, so this uses a conservative 4-byte
     estimate and lets the child report the exact usage.  It prevents an agent
-    from silently pushing the system prompt out of the context window.
+    from silently pushing the system prompt out of the context window. User,
+    assistant, and tool messages are trimmed as turn groups so a tool result is
+    not retained without the request and call that produced it.
     """
     budget = max(128, context_tokens - output_tokens) * 4
     if len(chat_prompt(messages)) <= budget:
         return messages
-    pinned = [m for m in messages if m.get("role") in ("system", "developer")]
-    recent = [m for m in messages if m.get("role") not in ("system", "developer")]
+    indexed = list(enumerate(messages))
+    pinned = [(i, message) for i, message in indexed
+              if message.get("role") in ("system", "developer")]
+    recent = [(i, message) for i, message in indexed
+              if message.get("role") not in ("system", "developer")]
+    groups = []
+    for item in recent:
+        if item[1].get("role") == "user" and groups and groups[-1]:
+            groups.append([])
+        elif not groups:
+            groups.append([])
+        groups[-1].append(item)
     kept = list(pinned)
-    for message in reversed(recent):
-        trial = kept + [message]
+    for group in reversed(groups):
+        trial_items = sorted(kept + group, key=lambda item: item[0])
+        trial = [message for _, message in trial_items]
         if len(chat_prompt(trial)) > budget and len(kept) > len(pinned):
             break
-        kept.append(message)
-    return sorted(kept, key=lambda m: messages.index(m))
+        kept.extend(group)
+    return [message for _, message in sorted(kept, key=lambda item: item[0])]
 
 
 class Backend:

@@ -1,7 +1,7 @@
 """Non-thinking Qwen framing and byte-exact continuation-prefix regressions."""
 import unittest
 
-from codex_server import chat_prefix, chat_prompt
+from codex_server import chat_prefix, chat_prompt, fit_context
 
 
 class ChatTemplateTest(unittest.TestCase):
@@ -31,6 +31,25 @@ class ChatTemplateTest(unittest.TestCase):
         self.assertEqual(chat_prompt(messages),
                          "<|im_start|>user\nhello<|im_end|>\n"
                          "<|im_start|>assistant\n<think>\n\n</think>\n\n")
+
+    def test_context_trimming_preserves_equal_message_order(self):
+        old = {"role": "user", "content": "x" * 1000}
+        first = {"role": "user", "content": "same"}
+        second = {"role": "user", "content": "same"}
+        kept = fit_context([old, first, second], 128, 0)
+        self.assertEqual(len(kept), 2)
+        self.assertIs(kept[0], first)
+        self.assertIs(kept[1], second)
+
+    def test_context_trimming_keeps_tool_exchange_as_one_turn(self):
+        messages = [
+            {"role": "user", "content": "x" * 1000},
+            {"role": "user", "content": "Inspect the file."},
+            {"role": "assistant", "content": "<tool_call>read</tool_call>"},
+            {"role": "tool", "content": "file contents"},
+        ]
+        kept = fit_context(messages, 128, 0)
+        self.assertEqual(kept, messages[1:])
 
 
 if __name__ == "__main__":
