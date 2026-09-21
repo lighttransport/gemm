@@ -15,6 +15,35 @@ void qwen35_dflash2_capture(float *features, const float *hidden,
     features[((size_t)row * taps + tap) * hidden_size + dim] = hidden[gid];
 }
 
+extern "C" __global__ __launch_bounds__(256, 1)
+void qwen35_dflash2_capture_rmsnorm(float *norm, float *features,
+        const float *hidden, const float *weight, int rows, int hidden_size,
+        int tap, int taps, float eps) {
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    if (row >= rows) return;
+    const float *input = hidden + (size_t)row * hidden_size;
+    float *output = norm + (size_t)row * hidden_size;
+    extern __shared__ float reduction[];
+    float sum = 0.0f;
+    for (int i = tid; i < hidden_size; i += blockDim.x) {
+        float value = input[i];
+        sum += value * value;
+    }
+    reduction[tid] = sum;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) reduction[tid] += reduction[tid + stride];
+        __syncthreads();
+    }
+    float scale = rsqrtf(reduction[0] / (float)hidden_size + eps);
+    for (int i = tid; i < hidden_size; i += blockDim.x) {
+        float value = input[i];
+        output[i] = value * scale * weight[i];
+        features[((size_t)row * taps + tap) * hidden_size + i] = value;
+    }
+}
+
 extern "C" __global__
 void qwen35_dflash2_conv(float *out, const float *hidden,
         const float *dynamic, const float *base, int rows, int hidden_size,

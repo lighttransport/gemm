@@ -29885,7 +29885,13 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
     for (int l = 0; l < n_run_layers; l++) {
         r->active_layer = l;
         hip_layer *cl = &r->layers[l];
-        hllm_qwen35_dflash2_capture(r, l, r->d_x_batch, M);
+        int dflash_capture_norm = 0;
+        if (!qwen35_batch_rms_scalar && !r->fn_qwen35_rmsnorm_reference)
+            dflash_capture_norm = hllm_qwen35_dflash2_capture_rmsnorm(
+                r, l, r->d_xnorm_batch, r->d_x_batch, cl->attn_norm_w,
+                M, eps);
+        if (!dflash_capture_norm)
+            hllm_qwen35_dflash2_capture(r, l, r->d_x_batch, M);
         /* Keep recurrent SSM projections scalar unless the explicit BF16
          * prefill experiment is selected. Recompute these gates for the
          * interleaved attention and SSM blocks. */
@@ -30126,7 +30132,7 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
                         (char *)r->d_xnorm_batch + (size_t)m * n_embd * sizeof(float),
                         (char *)r->d_x_batch + (size_t)m * n_embd * sizeof(float),
                         cl->attn_norm_w, n_embd, eps);
-            } else {
+            } else if (!dflash_capture_norm) {
                 launch_rmsnorm_batch(r, r->d_xnorm_batch, r->d_x_batch,
                                      cl->attn_norm_w, n_embd, M, n_embd, eps);
             }

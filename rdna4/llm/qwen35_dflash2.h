@@ -35,7 +35,8 @@ typedef struct hllm_dflash_layer {
 typedef struct hllm_qwen35_dflash2 {
     gguf_shards *source;
     hipModule_t module;
-    hipFunction_t fn_capture, fn_conv, fn_attention, fn_attention_combine;
+    hipFunction_t fn_capture, fn_capture_rmsnorm;
+    hipFunction_t fn_conv, fn_attention, fn_attention_combine;
     hipFunction_t fn_topk, fn_select;
     void *fc, *fc_bf16, *enc_norm, *out_norm, *selector_hidden;
     int fc_type, selector_hidden_type;
@@ -120,6 +121,22 @@ static void hllm_qwen35_dflash2_capture(hip_llm_runner *r, int layer,
     LAUNCH(d->fn_capture, (total + 255) / 256, 1, 1, 256, 1, 1, 0,
            r->stream, a);
     d->feature_rows = rows;
+}
+
+static int hllm_qwen35_dflash2_capture_rmsnorm(hip_llm_runner *r, int layer,
+        void *norm, void *hidden, void *weight, int rows, float eps) {
+    hllm_qwen35_dflash2 *d = r ? r->qwen35_dflash2 : NULL;
+    if (!d || !norm || !hidden || !weight || rows < 1 ||
+        rows > r->batch_max || !d->fn_capture_rmsnorm) return 0;
+    int tap = hllm_dflash_tap(d, layer);
+    if (tap < 0) return 0;
+    int taps = HLLM_DFLASH_LAYERS;
+    void *a[] = { &norm, &d->features, &hidden, &weight, &rows,
+                  &r->n_embd, &tap, &taps, &eps };
+    LAUNCH(d->fn_capture_rmsnorm, rows, 1, 1, 256, 1, 1,
+           256 * sizeof(float), r->stream, a);
+    d->feature_rows = rows;
+    return 1;
 }
 
 static void hllm_dflash_project(hip_llm_runner *r, void *dst, void *weight,
@@ -287,6 +304,8 @@ int hip_llm_qwen35_dflash2_load(hip_llm_runner *r, const char *path,
             "qwen35_dflash2.hip", r->verbose, "qwen35_dflash2", 0) <= 0 ||
         hipModuleGetFunction(&d->fn_capture, d->module,
                              "qwen35_dflash2_capture") != hipSuccess ||
+        hipModuleGetFunction(&d->fn_capture_rmsnorm, d->module,
+                             "qwen35_dflash2_capture_rmsnorm") != hipSuccess ||
         hipModuleGetFunction(&d->fn_conv, d->module,
                              "qwen35_dflash2_conv") != hipSuccess ||
         hipModuleGetFunction(&d->fn_attention, d->module,
