@@ -35,6 +35,20 @@ class ProtocolTest(unittest.TestCase):
         self.assertEqual(dflash_command[-4:], ["--qwen35-dflash2", "draft.gguf",
                                                "--qwen35-dflash2-draft", "7"])
 
+    def test_qwen35_snapshot_budget_is_forwarded(self):
+        args = SimpleNamespace(
+            runner="./test_hip_llm", model="target.gguf", context=65536,
+            moe_cache_mb=0, coding=False, qwen4_coding_profile=False,
+            qwen4_exact=False, qwen4_mtp=None, qwen4_mtp_draft=1,
+            qwen4_mtp_cache_mb=128, qwen4_mtp_verify="scalar",
+            qwen35_server_profile=False, qwen35_dflash2="draft.gguf",
+            qwen35_dflash2_draft=7, qwen35_snapshot_max_tokens=65536,
+        )
+        command = runner_command(args)
+        self.assertIn("--qwen35-snapshot-max-tokens", command)
+        i = command.index("--qwen35-snapshot-max-tokens")
+        self.assertEqual(command[i + 1], "65536")
+
     def test_qwen35_profiles_are_mutually_exclusive(self):
         args = SimpleNamespace(
             runner="./test_hip_llm", model="target.gguf", context=4096,
