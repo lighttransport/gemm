@@ -764,6 +764,32 @@ The experiment was removed; ordinary ascending contraction order remains.
 This rules out simple contraction reversal as a local improvement, not other
 accumulation layouts or the unresolved full-denoiser parity failure.
 
+The saved exact-Q/K/V case now also has a real CUDA dispatch trace (not just
+CPU operator names). With PyTorch 2.14.0+cu130 on the RTX 5060 Ti:
+
+- Masked text: `fmha_cutlassF_bf16_aligned_64x128_rf_sm80`, grid `[1,32,1]`,
+  block `[32,8,1]`.
+- Image: `flash_fwd_kernel` with head dimension 128, query tile 128, key tile
+  64 and four warps, grid `[2,1,32]`, block `[128,1,1]`.
+
+The profiled output is bit-identical to the saved PyTorch block-17 attention.
+Reproduce this diagnostic with a fresh output directory:
+
+```sh
+OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=1 tmp/qimg21-ref-venv/bin/python cuda/qimg21/attention_dispatch_probe.py \
+  --stage-dir tmp/qimg21-exact-attention17 --prefix-tokens 15 \
+  --out-dir tmp/qimg21-dispatch-block17
+```
+
+The tool saves `trace.json`, `dispatch.json`, and `attention.npy`; it fails
+if no CUDA kernel events were captured. It profiles text-to-image segmentation
+only, not arbitrary editing layouts. For head dimension 128, float32 and
+double-intermediate construction of the exp2 softmax scale both round to
+`0x3e0293ee`, ruling out that constant difference. A separate native replay
+with `CUDA_RUNNER_NO_FMAD=1` retains 99.9712% equality and relative L2
+5.8744e-5 (versus 5.8743e-5 normally), so disabling scalar FMA is not a useful
+fix either. Artifacts: `tmp/qimg21-exact-attention17/no_fmad.{npy,json,log}`.
+
 Replaying attention directly from the saved **PyTorch** block-17 Q/K/V removes
 native RMS/RoPE from the comparison. Flash-style MMA attention still differs:
 cosine 0.999999998275, relative L2 5.87e-5, elementwise equality 99.9712%
