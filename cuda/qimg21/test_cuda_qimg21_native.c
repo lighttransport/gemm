@@ -1,0 +1,430 @@
+/*
+ * Native Qwen-Image 2.1 transformer bring-up.
+ *
+ * This is deliberately a small, inspectable C/CUDA path.  It uses the
+ * repository's dynamic CUDA/NVRTC loader and cuBLAS BF16 GEMM wrapper, but
+ * owns the Qwen-Image 2.1 block math (zero-centred RMSNorm, Ada modulation,
+ * 3-axis RoPE, block-causal attention, SwiGLU and the residual gates).
+ *
+ * The first native milestone consumes the text-encoder output from a .npy
+ * fixture.  Keeping tokenisation/text/VAE out of this executable makes the
+ * transformer kernel comparison deterministic and keeps the 12 GB card well
+ * below its memory limit.  The Python reference runner produces the fixture.
+ */
+
+#define SAFETENSORS_IMPLEMENTATION
+#define CUDA_QIMG_RUNNER_IMPLEMENTATION
+#include "../../common/safetensors.h"
+#include "../qimg/cuda_qimg_runner.h"
+
+#include <errno.h>
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+
+typedef struct {
+    st_context *st[2];
+    int n;
+} qimg21_shards;
+
+typedef struct {
+    float *data;
+    size_t n;
+    int ndim;
+    size_t shape[4];
+} npy_f32;
+
+static void npy_free(npy_f32 *a) { free(a->data); memset(a, 0, sizeof(*a)); }
+
+/* Minimal little-endian, C-order F32 .npy reader.  The fixtures are produced
+ * by numpy.save; rejecting everything else avoids silently transposing a
+ * prompt embedding. */
+static int npy_read_f32(const char *path, npy_f32 *out) {
+    FILE *fp = fopen(path, "rb");
+    char magic[6], header[65536];
+    uint8_t ver[2];
+    uint16_t h16 = 0;
+    uint32_t h32 = 0;
+    size_t hlen, pos, n = 1;
+    memset(out, 0, sizeof(*out));
+    if (!fp) { fprintf(stderr, "native: cannot open %s: %s\n", path, strerror(errno)); return -1; }
+    if (fread(magic, 1, 6, fp) != 6 || memcmp(magic, "\x93NUMPY", 6) != 0 ||
+        fread(ver, 1, 2, fp) != 2) { fclose(fp); return -1; }
+    if (ver[0] == 1) {
+        if (fread(&h16, 2, 1, fp) != 1) { fclose(fp); return -1; }
+        hlen = h16;
+    } else if (ver[0] == 2 || ver[0] == 3) {
+        if (fread(&h32, 4, 1, fp) != 1) { fclose(fp); return -1; }
+        hlen = h32;
+    } else { fclose(fp); return -1; }
+    if (hlen == 0 || hlen >= sizeof(header) || fread(header, 1, hlen, fp) != hlen) {
+        fclose(fp); return -1;
+    }
+    header[hlen] = 0;
+    if (!strstr(header, "'descr': '<f4'") && !strstr(header, "\"descr\": \"<f4\"")) {
+        fprintf(stderr, "native: %s is not little-endian F32\n", path); fclose(fp); return -1;
+    }
+    if (strstr(header, "fortran_order')") || strstr(header, "fortran_order\": True")) {
+        fprintf(stderr, "native: Fortran-order fixture is unsupported: %s\n", path); fclose(fp); return -1;
+    }
+    char *shape = strstr(header, "shape");
+    if (!shape) { fclose(fp); return -1; }
+    shape = strchr(shape, '(');
+    if (!shape) { fclose(fp); return -1; }
+    pos = (size_t)(shape - header) + 1;
+    out->ndim = 0;
+    while (pos < hlen && header[pos] != ')') {
+        char *end;
+        unsigned long long v;
+        while (pos < hlen && (header[pos] == ' ' || header[pos] == ',')) pos++;
+        if (header[pos] == ')') break;
+        v = strtoull(header + pos, &end, 10);
+        if (end == header + pos || out->ndim >= 4 || v == 0) { fclose(fp); return -1; }
+        out->shape[out->ndim++] = (size_t)v;
+        n *= (size_t)v;
+        pos = (size_t)(end - header);
+        while (pos < hlen && header[pos] != ',' && header[pos] != ')') pos++;
+    }
+    out->data = (float *)malloc(n * sizeof(float));
+    if (!out->data || fread(out->data, sizeof(float), n, fp) != n) {
+        fclose(fp); npy_free(out); return -1;
+    }
+    fclose(fp); out->n = n; return 0;
+}
+
+static int npy_write_f32(const char *path, const float *x, size_t n, int d0, int d1) {
+    FILE *fp = fopen(path, "wb");
+    if (!fp) return -1;
+    char hdr[256];
+    int len = snprintf(hdr, sizeof(hdr), "{'descr': '<f4', 'fortran_order': False, 'shape': (%d, %d), }", d0, d1);
+    int padded = ((len + 10 + 63) / 64) * 64 - 10;
+    if (padded >= (int)sizeof(hdr)) { fclose(fp); return -1; }
+    /* numpy v1 header: magic+version+uint16 length, then 16-byte aligned dict. */
+    char body[256];
+    memset(body, ' ', (size_t)padded);
+    memcpy(body, hdr, (size_t)len);
+    body[padded - 1] = '\n';
+    fwrite("\x93NUMPY\x01\x00", 1, 8, fp);
+    uint16_t h = (uint16_t)padded;
+    fwrite(&h, 2, 1, fp); fwrite(body, 1, (size_t)padded, fp);
+    int ok = fwrite(x, sizeof(float), n, fp) == n ? 0 : -1;
+    fclose(fp); return ok;
+}
+
+/* Optional full-tensor stage dumps used to close the native/PyTorch parity
+ * loop.  They are opt-in so normal runs do not copy 100+ MiB of activations
+ * back to the host. */
+static const char *qimg21_stage_dir;
+static int qimg21_stage_block = 0;
+
+static void dump_stage(const char *label, CUdeviceptr d, size_t n, int d0, int d1) {
+    if (!qimg21_stage_dir) return;
+    char path[1024];
+    float *h = (float *)malloc(n * sizeof(float));
+    if (!h) return;
+    if (cuMemcpyDtoH(h, d, n * sizeof(float)) == CUDA_SUCCESS) {
+        snprintf(path, sizeof(path), "%s/%s.npy", qimg21_stage_dir, label);
+        npy_write_f32(path, h, n, d0, d1);
+    }
+    free(h);
+}
+
+/* FlowMatchEulerDiscreteScheduler schedule used by the local qimg-21
+ * scheduler_config.json.  The pipeline supplies the transformer t as sigma
+ * in [0,1] (the scheduler's stored timestep is sigma*1000). */
+static void qimg21_flow_sigmas(int steps, int image_tokens, float *sigmas) {
+    const float base_seq = 256.0f, max_seq = 8192.0f;
+    const float base_shift = 0.5f, max_shift = 0.9f;
+    const float mu = image_tokens * (max_shift - base_shift) /
+                     (max_seq - base_seq) + base_shift -
+                     (max_shift - base_shift) / (max_seq - base_seq) * base_seq;
+    const float emu = expf(mu);
+    for (int i = 0; i < steps; i++) {
+        float u = (steps == 1) ? 1.0f : 1.0f - (float)i / (float)(steps - 1);
+        sigmas[i] = emu / (emu + (1.0f / u - 1.0f));
+    }
+    /* shift_terminal=0.02: stretch so the last requested sigma is .02. */
+    const float scale = (1.0f - sigmas[steps - 1]) / (1.0f - 0.02f);
+    for (int i = 0; i < steps; i++) sigmas[i] = 1.0f - (1.0f - sigmas[i]) / scale;
+    sigmas[steps] = 0.0f;
+}
+
+static st_context *find_tensor(const qimg21_shards *s, const char *name, int *idx) {
+    for (int i = 0; i < s->n; i++) {
+        int k = safetensors_find(s->st[i], name);
+        if (k >= 0) { if (idx) *idx = k; return s->st[i]; }
+    }
+    return NULL;
+}
+
+static CUdeviceptr upload_bf16(const qimg21_shards *s, const char *name) {
+    int idx; st_context *st = find_tensor(s, name, &idx);
+    if (!st) { fprintf(stderr, "native: missing tensor %s\n", name); return 0; }
+    const char *dt = safetensors_dtype(st, idx);
+    size_t nbytes = safetensors_nbytes(st, idx), n = nbytes / 2;
+    const uint8_t *src = (const uint8_t *)safetensors_data(st, idx);
+    uint16_t *tmp = (uint16_t *)malloc(n * sizeof(uint16_t));
+    if (!tmp) return 0;
+    if (!strcmp(dt, "BF16")) memcpy(tmp, src, n * 2);
+    else if (!strcmp(dt, "F32")) {
+        const float *f = (const float *)src;
+        for (size_t i = 0; i < n; i++) tmp[i] = qimg_f32_to_bf16_rne(f[i]);
+    } else { fprintf(stderr, "native: %s dtype %s is not BF16/F32\n", name, dt); free(tmp); return 0; }
+    CUdeviceptr d = checked_cuMemAlloc(n * 2);
+    if (d) cuMemcpyHtoD(d, tmp, n * 2);
+    free(tmp); return d;
+}
+
+static CUdeviceptr upload_f32(const qimg21_shards *s, const char *name) {
+    int idx; st_context *st = find_tensor(s, name, &idx);
+    if (!st) { fprintf(stderr, "native: missing tensor %s\n", name); return 0; }
+    const char *dt = safetensors_dtype(st, idx);
+    size_t n = safetensors_nbytes(st, idx) / (strcmp(dt, "F32") == 0 ? 4 : 2);
+    float *tmp = (float *)malloc(n * sizeof(float));
+    if (!tmp) return 0;
+    if (!strcmp(dt, "F32")) memcpy(tmp, safetensors_data(st, idx), n * 4);
+    else if (!strcmp(dt, "BF16")) {
+        const uint16_t *b = (const uint16_t *)safetensors_data(st, idx);
+        for (size_t i = 0; i < n; i++) { uint32_t u = (uint32_t)b[i] << 16; memcpy(&tmp[i], &u, 4); }
+    } else { fprintf(stderr, "native: %s dtype %s is not F32/BF16\n", name, dt); free(tmp); return 0; }
+    CUdeviceptr d = checked_cuMemAlloc(n * 4);
+    if (d) cuMemcpyHtoD(d, tmp, n * 4);
+    free(tmp); return d;
+}
+
+static void free_d(CUdeviceptr *p) { if (*p) { cuMemFree(*p); *p = 0; } }
+
+/* Model-specific kernels.  GEMMs are cuBLAS BF16; these kernels are the
+ * precision-sensitive pieces that are not delegated to a framework. */
+static const char *qimg21_src =
+"extern \"C\" {\n"
+"__global__ void zero_rms(float* y,const float* x,const float* w,int N,int D,float eps){int t=blockIdx.x, i=threadIdx.x; extern __shared__ float s[]; float z=0; for(int j=i;j<D;j+=blockDim.x){float v=x[t*D+j];z+=v*v;} s[i]=z; __syncthreads(); for(int q=blockDim.x/2;q;q>>=1){if(i<q)s[i]+=s[i+q];__syncthreads();} float inv=rsqrtf(s[0]/D+eps); for(int j=i;j<D;j+=blockDim.x)y[t*D+j]=x[t*D+j]*inv*(w[j]+1.f);}\n"
+"__global__ void gelu_tanh(float*x,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){float v=x[i];x[i]=.5f*v*(1.f+tanhf(0.7978845608f*(v+0.044715f*v*v*v)));}}\n"
+"__global__ void silu(float*x,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){float v=x[i];x[i]=v/(1.f+expf(-v));}}\n"
+"__global__ void round_bf16(float*x,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){unsigned u=__float_as_uint(x[i]);unsigned l=(u>>16)&1u;u=(u+0x7fffu+l)&0xffff0000u;x[i]=__uint_as_float(u);}}\n"
+"__global__ void mul_silu(float*y,const float*a,const float*b,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){float v=a[i];y[i]=(v/(1.f+expf(-v)))*b[i];}}\n"
+"__global__ void mod_ln(float*y,const float*x,const float*m,int N,int D,int prefix,int which){int t=blockIdx.x,i=threadIdx.x;extern __shared__ float s[];float z=0;for(int j=i;j<D;j+=blockDim.x)z+=x[t*D+j];s[i]=z;__syncthreads();for(int q=blockDim.x/2;q;q>>=1){if(i<q)s[i]+=s[i+q];__syncthreads();}float mean=s[0]/D;__syncthreads();z=0;for(int j=i;j<D;j+=blockDim.x){float d=x[t*D+j]-mean;z+=d*d;}s[i]=z;__syncthreads();for(int q=blockDim.x/2;q;q>>=1){if(i<q)s[i]+=s[i+q];__syncthreads();}float inv=rsqrtf(s[0]/D+1e-6f);int row=t<prefix?1:0;int base=which*2*D+row*4*D;for(int j=i;j<D;j+=blockDim.x){float n=(x[t*D+j]-mean)*inv;float scale=m[base+j];y[t*D+j]=n*(1.f+scale);}}\n"
+"__global__ void gate_res(float*x,const float*y,const float*m,int N,int D,int prefix,int which){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=N*D)return;int t=i/D,j=i%D,row=t<prefix?1:0;int base=row*4*D+which*2*D+D;x[i]+=tanhf(m[base+j])*y[i];}\n"
+"__global__ void qk_rope(float*q,float*k,const float*qw,const float*kw,int N,int D,int nh,int hd,int prefix,int ih,int iw){int t=blockIdx.x,h=blockIdx.y,j=threadIdx.x;if(t>=N||h>=nh)return;__shared__ float sq[128],sk[128];float aq=0,ak=0;for(int z=j;z<hd;z+=blockDim.x){float v=q[t*D+h*hd+z];aq+=v*v;v=k[t*D+h*hd+z];ak+=v*v;}sq[j]=aq;sk[j]=ak;__syncthreads();for(int z=64;z;z>>=1){if(j<z){sq[j]+=sq[j+z];sk[j]+=sk[j+z];}__syncthreads();}if(j&1)return;float iq=rsqrtf(sq[0]/hd+1e-6f),ik=rsqrtf(sk[0]/hd+1e-6f);int axis,off,pos;if(j<16){axis=16;off=0;pos=t<prefix?t:prefix;}else if(j<72){axis=56;off=16;pos=t<prefix?t:-(ih-ih/2)+(t-prefix)/iw;}else{axis=56;off=72;pos=t<prefix?t:-(iw-iw/2)+(t-prefix)%iw;}int pair=(j-off)&~1;float ang=(float)pos*exp2f(-log2f(10000.f)*(float)(pair)/(float)axis);float c=cosf(ang),sn=sinf(ang);int d0=h*hd+off+pair,d1=d0+1;float x0=q[t*D+d0]*iq*qw[off+pair],x1=q[t*D+d1]*iq*qw[off+pair+1];float y0=k[t*D+d0]*ik*kw[off+pair],y1=k[t*D+d1]*ik*kw[off+pair+1];q[t*D+d0]=x0*c-x1*sn;q[t*D+d1]=x0*sn+x1*c;k[t*D+d0]=y0*c-y1*sn;k[t*D+d1]=y0*sn+y1*c;}\n"
+"__global__ void masked_attn(float*o,const float*q,const float*k,const float*v,int N,int P,int nh,int hd){int h=blockIdx.x,warp=threadIdx.x/32,lane=threadIdx.x&31,qi=blockIdx.y*4+warp;if(h>=nh)return;int D=nh*hd;float qr[4],or_[4];for(int e=0;e<4;e++){int d=lane*4+e;qr[e]=(qi<N&&d<hd)?q[qi*D+h*hd+d]:0;or_[e]=0;}float mi=-1e30f,li=0;extern __shared__ float sm[];float*sk=sm,*sv=sm+32*128;for(int b=0;b<N;b+=32){for(int z=threadIdx.x;z<32*128;z+=128){int kk=z/128,d=z%128,t=b+kk;sk[z]=(t<N)?k[t*D+h*hd+d]:0;sv[z]=(t<N)?v[t*D+h*hd+d]:0;}__syncthreads();for(int kk=0;kk<32;kk++){int kt=b+kk;bool allow=kt<N&&qi<N&&(qi>=P||kt<=qi);if(!allow)continue;float dot=0;for(int e=0;e<4;e++)dot+=qr[e]*sk[kk*128+lane*4+e];for(int z=16;z;z>>=1)dot+=__shfl_xor_sync(0xffffffff,dot,z);float score=dot*rsqrtf((float)hd),nm=fmaxf(mi,score),a=expf(mi-nm),p=expf(score-nm);li=li*a+p;for(int e=0;e<4;e++)or_[e]=or_[e]*a+p*sv[kk*128+lane*4+e];mi=nm;}__syncthreads();}if(qi<N){float il=li>0?1.f/li:0;for(int e=0;e<4;e++){int d=lane*4+e;if(d<hd)o[qi*D+h*hd+d]=or_[e]*il;}}}\n"
+"__global__ void final_ln(float*y,const float*x,const float*s,int N,int D,int prefix){int t=blockIdx.x,i=threadIdx.x;extern __shared__ float z[];float a=0;for(int j=i;j<D;j+=blockDim.x)a+=x[t*D+j];z[i]=a;__syncthreads();for(int q=blockDim.x/2;q;q>>=1){if(i<q)z[i]+=z[i+q];__syncthreads();}float mu=z[0]/D;__syncthreads();a=0;for(int j=i;j<D;j+=blockDim.x){float d=x[t*D+j]-mu;a+=d*d;}z[i]=a;__syncthreads();for(int q=blockDim.x/2;q;q>>=1){if(i<q)z[i]+=z[i+q];__syncthreads();}float iv=rsqrtf(z[0]/D+1e-6f);int row=t<prefix?1:0;for(int j=i;j<D;j+=blockDim.x)y[t*D+j]=(x[t*D+j]-mu)*iv*(1.f+s[row*D+j]);}\n"
+"}\n";
+
+typedef struct {
+    CUmodule mod;
+    CUfunction zero_rms, gelu, silu, round_bf16, mul_silu, mod_ln, gate_res, qk_rope, attn, final_ln;
+} qimg21_kernels;
+
+static int get_kernel(qimg21_kernels *k, CUmodule m) {
+    k->mod = m;
+    return cuModuleGetFunction(&k->zero_rms, m, "zero_rms") ||
+           cuModuleGetFunction(&k->gelu, m, "gelu_tanh") ||
+           cuModuleGetFunction(&k->silu, m, "silu") ||
+           cuModuleGetFunction(&k->round_bf16, m, "round_bf16") ||
+           cuModuleGetFunction(&k->mul_silu, m, "mul_silu") ||
+           cuModuleGetFunction(&k->mod_ln, m, "mod_ln") ||
+           cuModuleGetFunction(&k->gate_res, m, "gate_res") ||
+           cuModuleGetFunction(&k->qk_rope, m, "qk_rope") ||
+           cuModuleGetFunction(&k->attn, m, "masked_attn") ||
+           cuModuleGetFunction(&k->final_ln, m, "final_ln");
+}
+
+static int launch_cast(cuda_qimg_runner *r, CUdeviceptr dst, CUdeviceptr src, int n) {
+    void *a[] = { &src, &dst, &n };
+    CUresult rc = cuLaunchKernel(r->cast_f32_to_bf16, (n + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, a, NULL);
+    if (rc == CUDA_SUCCESS) cuCtxSynchronize();
+    return (int)rc;
+}
+
+static int gemm(cuda_qimg_runner *r, CUdeviceptr y, CUdeviceptr w, CUdeviceptr x,
+                int nt, int no, int ni) {
+    int rc = cublasew_gemm_bf16_bf16_f32_rowmajor_nt(r->cublaslt_ctx, y, w, x, nt, no, ni);
+    if (rc == 0) cuCtxSynchronize();
+    return rc;
+}
+
+static int launch_vec(CUfunction f, CUstream st, int n, CUdeviceptr x) {
+    void *a[] = { &x, &n };
+    CUresult rc = cuLaunchKernel(f, (n + 255) / 256, 1, 1, 256, 1, 1, 0, st, a, NULL);
+    if (rc == CUDA_SUCCESS) cuCtxSynchronize();
+    return (int)rc;
+}
+
+static void probe(cuda_qimg_runner *r, const char *label, CUdeviceptr d, int n) {
+    if (r->verbose < 2) return;
+    int m = n < 4096 ? n : 4096, bad = 0;
+    float *h = (float *)malloc((size_t)m * sizeof(float));
+    if (!h) return;
+    cuStreamSynchronize(r->stream);
+    if (cuMemcpyDtoH(h, d, (size_t)m * sizeof(float)) == CUDA_SUCCESS) {
+        for (int i = 0; i < m; i++) if (!isfinite(h[i])) bad++;
+        fprintf(stderr, "native: %-12s first=%+.5e bad=%d/%d\n", label, h[0], bad, m);
+        if (getenv("QIMG21_PROBE_VALUES")) {
+            int show = m < 8 ? m : 8;
+            fprintf(stderr, "native: %-12s values", label);
+            for (int i = 0; i < show; i++) fprintf(stderr, " %+.5e", h[i]);
+            fputc('\n', stderr);
+        }
+    }
+    free(h);
+}
+
+static int native_step(cuda_qimg_runner *r, qimg21_kernels *k, const qimg21_shards *s,
+                       const float *prompt, int nt, const float *latent, int ni,
+                       int ih, int iw, float timestep, float *out) {
+    const int D=4096, HD=128, NH=32, N=nt+ni;
+    CUdeviceptr txt=0,img=0,hidden=0,tmp=0,tmp2=0,bf=0,q=0,kk=0,v=0,att=0,mlp0=0,mlp1=0,mod=0,temb=0,time0=0,timebf=0,scale=0;
+    CUdeviceptr wt_norm=0,wt_in=0,wt_out=0,wi=0,w_t1=0,w_t2=0,w_mod=0,w_img=0,w_proj=0;
+    int result = -1;
+    if (!r->cublaslt_ctx && cublasewCreate(&r->cublaslt_ctx, r->stream) != 0) { fprintf(stderr,"native: cuBLAS unavailable\n"); return -1; }
+    #define A(p,bytes) do { (p)=checked_cuMemAlloc(bytes); if(!(p)) goto fail; } while(0)
+    A(txt,(size_t)nt*D*4); A(img,(size_t)ni*64*4); A(hidden,(size_t)N*D*4);
+    /* tmp/bf are also the N*12288 SwiGLU activation hand-off buffers. */
+    A(tmp,(size_t)N*12288*4); A(tmp2,(size_t)N*D*4); A(bf,(size_t)N*12288*2);
+    A(q,(size_t)N*D*4); A(kk,(size_t)N*D*4); A(v,(size_t)N*D*4); A(att,(size_t)N*D*4); A(mlp0,(size_t)N*12288*4); A(mlp1,(size_t)N*12288*4);
+    A(temb,2*D*4); A(time0,256*4); A(timebf,256*2); A(mod,2*16384*4); A(scale,2*D*4);
+    cuMemcpyHtoD(txt,prompt,(size_t)nt*D*4); cuMemcpyHtoD(img,latent,(size_t)ni*64*4);
+    wt_norm=upload_f32(s,"txt_in.text_norm.weight"); wt_in=upload_bf16(s,"txt_in.in_layer.weight"); wt_out=upload_bf16(s,"txt_in.out_layer.weight"); wi=upload_bf16(s,"img_in.weight");
+    w_t1=upload_bf16(s,"time_text_embed.timestep_embedder.linear_1.weight"); w_t2=upload_bf16(s,"time_text_embed.timestep_embedder.linear_2.weight"); w_mod=upload_bf16(s,"modulation.1.weight");
+    if(!wt_norm||!wt_in||!wt_out||!wi||!w_t1||!w_t2||!w_mod)goto fail;
+    {void *a[]={&tmp,&txt,&wt_norm,&nt,&D,&(float){1e-6f}};cuLaunchKernel(k->zero_rms,nt,1,1,256,1,1,256*sizeof(float),r->stream,a,NULL);cuCtxSynchronize();}
+    if(launch_cast(r,bf,tmp,nt*D)!=CUDA_SUCCESS||gemm(r,txt,wt_in,bf,nt,D,D)!=0)goto fail;
+    if(launch_vec(k->gelu,r->stream,nt*D,txt)!=CUDA_SUCCESS||launch_cast(r,bf,txt,nt*D)!=CUDA_SUCCESS||gemm(r,tmp,wt_out,bf,nt,D,D)!=0||launch_vec(k->round_bf16,r->stream,nt*D,tmp)!=CUDA_SUCCESS)goto fail; probe(r,"txt_proj",tmp,nt*D); dump_stage("txt_proj",tmp,(size_t)nt*D,nt,D);
+    /* Save the completed text projection before reusing tmp for img_in.  The
+     * preceding txt buffer is only GELU(in_layer(...)); the model consumes
+     * out_layer(GELU(in_layer(...))). */
+    cuMemcpyDtoD(hidden, tmp, (size_t)nt*D*4); cuCtxSynchronize();
+    if(launch_cast(r,bf,img,ni*64)!=CUDA_SUCCESS||gemm(r,tmp,wi,bf,ni,D,64)!=0||launch_vec(k->round_bf16,r->stream,ni*D,tmp)!=CUDA_SUCCESS)goto fail; probe(r,"img_proj",tmp,ni*D); dump_stage("img_proj",tmp,(size_t)ni*D,ni,D);
+    /* The joint sequence is [text, image]. */
+    cuMemcpyDtoD(hidden + (size_t)nt*D*4, tmp, (size_t)ni*D*4); cuCtxSynchronize();
+    probe(r,"hidden",hidden,N*D); dump_stage("hidden0",hidden,(size_t)N*D,N,D);
+    /* sinusoidal timestep, cos half followed by sin half, time_factor=1000. */
+    float te[256]; for(int i=0;i<128;i++){float f=expf(-logf(10000.f)*(float)i/128.f),a=timestep*1000.f*f;te[i]=cosf(a);te[128+i]=sinf(a);} cuMemcpyHtoD(time0,te,sizeof(te));
+    if(launch_cast(r,timebf,time0,256)!=CUDA_SUCCESS||gemm(r,temb,w_t1,timebf,1,D,256)!=0||launch_vec(k->round_bf16,r->stream,D,temb)!=CUDA_SUCCESS)goto fail; probe(r,"time1",temb,D); dump_stage("time1",temb,D,1,D); if(launch_vec(k->silu,r->stream,D,temb)!=CUDA_SUCCESS||launch_vec(k->round_bf16,r->stream,D,temb)!=CUDA_SUCCESS)goto fail;
+    if(launch_cast(r,bf,temb,D)!=CUDA_SUCCESS||gemm(r,temb,w_t2,bf,1,D,D)!=0||launch_vec(k->round_bf16,r->stream,D,temb)!=CUDA_SUCCESS)goto fail; probe(r,"time2",temb,D); dump_stage("time2",temb,D,1,D);
+    /* modulation receives the real timestep in row 0 and a true t=0
+     * sinusoidal embedding in row 1.  TimestepEmbedding's modulation
+     * Sequential starts with SiLU, so keep the unsquashed temb intact for
+     * norm_out and apply that activation to a scratch copy for this GEMM. */
+    float zt[256]={0}; for (int i=0;i<128;i++) zt[i]=1.0f;
+    cuMemcpyHtoD(time0,zt,sizeof(zt));
+    if(launch_cast(r,timebf,time0,256)!=CUDA_SUCCESS||gemm(r,scale,w_t1,timebf,1,D,256)!=0||launch_vec(k->round_bf16,r->stream,D,scale)!=CUDA_SUCCESS)goto fail;
+    probe(r,"zero1",scale,D);
+    if(launch_vec(k->silu,r->stream,D,scale)!=CUDA_SUCCESS||launch_vec(k->round_bf16,r->stream,D,scale)!=CUDA_SUCCESS||launch_cast(r,bf,scale,D)!=CUDA_SUCCESS||gemm(r,scale,w_t2,bf,1,D,D)!=0||launch_vec(k->round_bf16,r->stream,D,scale)!=CUDA_SUCCESS)goto fail;
+    probe(r,"zero2",scale,D);
+    /* modulation.0 is a second SiLU after timestep_embedder.linear_2. */
+    if (launch_vec(k->silu,r->stream,D,scale)!=CUDA_SUCCESS||launch_vec(k->round_bf16,r->stream,D,scale)!=CUDA_SUCCESS) goto fail;
+    probe(r,"scale_zero",scale,D);
+    cuMemcpyDtoD(tmp2,temb,(size_t)D*4); cuCtxSynchronize();
+    probe(r,"temb_copy",tmp2,D);
+    if (launch_vec(k->silu,r->stream,D,tmp2)!=CUDA_SUCCESS || launch_vec(k->round_bf16,r->stream,D,tmp2)!=CUDA_SUCCESS || launch_cast(r,bf,tmp2,D)!=CUDA_SUCCESS || launch_cast(r,bf+D*2,scale,D)!=CUDA_SUCCESS) goto fail;
+    /* Keep the two causal-condition rows as separate GEMMs.  Besides making
+     * the row hand-off explicit, this avoids relying on a row-major cuBLAS
+     * stride for the tiny 2-row modulation matrix on older drivers. */
+    if (gemm(r,mod,w_mod,bf,1,16384,D)!=0 ||
+        gemm(r,mod+(size_t)16384*4,w_mod,bf+(size_t)D*2,1,16384,D)!=0 ||
+        launch_vec(k->round_bf16,r->stream,2*16384,mod)!=CUDA_SUCCESS) goto fail;
+    probe(r,"mod",mod,2*16384); dump_stage("mod",mod,2u*16384u,2,16384);
+    probe(r,"mod_zero",mod+(size_t)16384*4,16384);
+    for(int bidx=0;bidx<32;bidx++){
+        char nm[128];
+        snprintf(nm,sizeof(nm),"transformer_blocks.%d.attn.to_q.weight",bidx);CUdeviceptr wq=upload_bf16(s,nm);snprintf(nm,sizeof(nm),"transformer_blocks.%d.attn.to_k.weight",bidx);CUdeviceptr wk=upload_bf16(s,nm);snprintf(nm,sizeof(nm),"transformer_blocks.%d.attn.to_v.weight",bidx);CUdeviceptr wv=upload_bf16(s,nm);snprintf(nm,sizeof(nm),"transformer_blocks.%d.attn.to_out.0.weight",bidx);CUdeviceptr wo=upload_bf16(s,nm);snprintf(nm,sizeof(nm),"transformer_blocks.%d.img_mlp.gate_layer.weight",bidx);CUdeviceptr wg=upload_bf16(s,nm);snprintf(nm,sizeof(nm),"transformer_blocks.%d.img_mlp.proj.weight",bidx);CUdeviceptr wp=upload_bf16(s,nm);snprintf(nm,sizeof(nm),"transformer_blocks.%d.img_mlp.out.weight",bidx);CUdeviceptr wmlpo=upload_bf16(s,nm);snprintf(nm,sizeof(nm),"transformer_blocks.%d.attn.norm_q.weight",bidx);CUdeviceptr wqn=upload_f32(s,nm);snprintf(nm,sizeof(nm),"transformer_blocks.%d.attn.norm_k.weight",bidx);CUdeviceptr wkn=upload_f32(s,nm);
+        if(!wq||!wk||!wv||!wo||!wg||!wp||!wmlpo||!wqn||!wkn)goto fail_block;
+        void *a1[]={&tmp,&hidden,&mod,&N,&D,&nt,&(int){0}}; cuLaunchKernel(k->mod_ln,N,1,1,256,1,1,256*sizeof(float),r->stream,a1,NULL); cuCtxSynchronize(); if (launch_vec(k->round_bf16,r->stream,N*D,tmp)!=CUDA_SUCCESS) goto fail_block; probe(r,"mod_ln",tmp,N*D); if (qimg21_stage_block < 0 || bidx == qimg21_stage_block) dump_stage("mod_ln",tmp,(size_t)N*D,N,D); if(launch_cast(r,bf,tmp,N*D)!=CUDA_SUCCESS)goto fail_block;
+        if(gemm(r,q,wq,bf,N,D,D)!=0||gemm(r,kk,wk,bf,N,D,D)!=0||gemm(r,v,wv,bf,N,D,D)!=0||launch_vec(k->round_bf16,r->stream,N*D,q)!=CUDA_SUCCESS||launch_vec(k->round_bf16,r->stream,N*D,kk)!=CUDA_SUCCESS||launch_vec(k->round_bf16,r->stream,N*D,v)!=CUDA_SUCCESS)goto fail_block; probe(r,"q",q,N*D); probe(r,"v",v,N*D); if (qimg21_stage_block < 0 || bidx == qimg21_stage_block) { dump_stage("q",q,(size_t)N*D,N,D); dump_stage("v",v,(size_t)N*D,N,D); }
+        void *ar[]={&q,&kk,&wqn,&wkn,&N,&D,&NH,&HD,&nt,&ih,&iw}; cuLaunchKernel(k->qk_rope,N,NH,1,HD,1,1,0,r->stream,ar,NULL); cuCtxSynchronize(); if (launch_vec(k->round_bf16,r->stream,N*D,q)!=CUDA_SUCCESS||launch_vec(k->round_bf16,r->stream,N*D,kk)!=CUDA_SUCCESS) goto fail_block; probe(r,"rope_q",q,N*D);
+        void *aa[]={&att,&q,&kk,&v,&N,&nt,&NH,&HD};cuLaunchKernel(k->attn,NH,(N+3)/4,1,128,1,1,2*32*128*sizeof(float),r->stream,aa,NULL);cuCtxSynchronize(); if (launch_vec(k->round_bf16,r->stream,N*D,att)!=CUDA_SUCCESS) goto fail_block; probe(r,"attn",att,N*D); if(launch_cast(r,bf,att,N*D)!=CUDA_SUCCESS||gemm(r,tmp,wo,bf,N,D,D)!=0||launch_vec(k->round_bf16,r->stream,N*D,tmp)!=CUDA_SUCCESS)goto fail_block; probe(r,"attn_out",tmp,N*D); if (qimg21_stage_block < 0 || bidx == qimg21_stage_block) dump_stage("attn_out",tmp,(size_t)N*D,N,D);
+        void *ag[]={&hidden,&tmp,&mod,&N,&D,&nt,&(int){0}};cuLaunchKernel(k->gate_res,(N*D+255)/256,1,1,256,1,1,0,r->stream,ag,NULL);cuCtxSynchronize(); if (launch_vec(k->round_bf16,r->stream,N*D,hidden)!=CUDA_SUCCESS) goto fail_block;
+        void *a2[]={&tmp,&hidden,&mod,&N,&D,&nt,&(int){1}};cuLaunchKernel(k->mod_ln,N,1,1,256,1,1,256*sizeof(float),r->stream,a2,NULL);cuCtxSynchronize(); if (launch_vec(k->round_bf16,r->stream,N*D,tmp)!=CUDA_SUCCESS) goto fail_block; if (qimg21_stage_block < 0 || bidx == qimg21_stage_block) dump_stage("mod_ln2",tmp,(size_t)N*D,N,D); if(launch_cast(r,bf,tmp,N*D)!=CUDA_SUCCESS)goto fail_block;
+        if(gemm(r,mlp0,wg,bf,N,12288,D)!=0||gemm(r,mlp1,wp,bf,N,12288,D)!=0||launch_vec(k->round_bf16,r->stream,N*12288,mlp0)!=CUDA_SUCCESS||launch_vec(k->round_bf16,r->stream,N*12288,mlp1)!=CUDA_SUCCESS)goto fail_block; if (qimg21_stage_block < 0 || bidx == qimg21_stage_block) { dump_stage("mlp_gate",mlp0,(size_t)N*12288,N,12288); dump_stage("mlp_proj",mlp1,(size_t)N*12288,N,12288); } void *am[]={&tmp, &mlp0,&mlp1,&(int){N*12288}};cuLaunchKernel(k->mul_silu,(N*12288+255)/256,1,1,256,1,1,0,r->stream,am,NULL);cuCtxSynchronize(); if (launch_vec(k->round_bf16,r->stream,N*12288,tmp)!=CUDA_SUCCESS) goto fail_block; if (qimg21_stage_block < 0 || bidx == qimg21_stage_block) dump_stage("mlp_act",tmp,(size_t)N*12288,N,12288); if(launch_cast(r,bf,tmp,N*12288)!=CUDA_SUCCESS||gemm(r,tmp,wmlpo,bf,N,D,12288)!=0||launch_vec(k->round_bf16,r->stream,N*D,tmp)!=CUDA_SUCCESS)goto fail_block; if (qimg21_stage_block < 0 || bidx == qimg21_stage_block) dump_stage("mlp_out",tmp,(size_t)N*D,N,D); void *ag2[]={&hidden,&tmp,&mod,&N,&D,&nt,&(int){1}};cuLaunchKernel(k->gate_res,(N*D+255)/256,1,1,256,1,1,0,r->stream,ag2,NULL);cuCtxSynchronize(); if (launch_vec(k->round_bf16,r->stream,N*D,hidden)!=CUDA_SUCCESS) goto fail_block;
+        /* The block owns streamed weight allocations.  Synchronize before
+         * releasing them; this also makes the custom-kernel/cuBLAS hand-off
+         * deterministic on drivers that do not fully order external-stream
+         * work behind a cuBLAS call. */
+        cuCtxSynchronize();
+        probe(r,"block",hidden,N*D); if (qimg21_stage_block < 0 || bidx == qimg21_stage_block) { char label[32]; snprintf(label,sizeof(label),"block_%02d",bidx); dump_stage(label,hidden,(size_t)N*D,N,D); } free_d(&wq);free_d(&wk);free_d(&wv);free_d(&wo);free_d(&wg);free_d(&wp);free_d(&wmlpo);free_d(&wqn);free_d(&wkn); continue;
+fail_block: free_d(&wq);free_d(&wk);free_d(&wv);free_d(&wo);free_d(&wg);free_d(&wp);free_d(&wmlpo);free_d(&wqn);free_d(&wkn);goto fail;
+    }
+    w_img=upload_bf16(s,"norm_out.linear.weight");w_proj=upload_bf16(s,"proj_out.weight");if(!w_img||!w_proj)goto fail;
+    /* norm_out.linear(SiLU(temb)) is the scale for target rows. */
+    if(launch_vec(k->silu,r->stream,D,temb)!=CUDA_SUCCESS||launch_vec(k->round_bf16,r->stream,D,temb)!=CUDA_SUCCESS||launch_cast(r,bf,temb,D)!=CUDA_SUCCESS||gemm(r,scale,w_img,bf,1,D,D)!=0||launch_vec(k->round_bf16,r->stream,D,scale)!=CUDA_SUCCESS)goto fail;
+    {void *a[]={&tmp,&hidden,&scale,&N,&D,&nt};cuLaunchKernel(k->final_ln,N,1,1,256,1,1,256*sizeof(float),r->stream,a,NULL);cuCtxSynchronize(); if (launch_vec(k->round_bf16,r->stream,N*D,tmp)!=CUDA_SUCCESS) goto fail; dump_stage("final_ln",tmp,(size_t)N*D,N,D);}
+    {CUdeviceptr dout=checked_cuMemAlloc((size_t)ni*64*4);if(!dout)goto fail;if(launch_cast(r,bf,tmp+(size_t)nt*D*4,ni*D)!=CUDA_SUCCESS||gemm(r,dout,w_proj,bf,ni,64,D)!=0||launch_vec(k->round_bf16,r->stream,ni*64,dout)!=CUDA_SUCCESS){free_d(&dout);goto fail;}cuCtxSynchronize();cuMemcpyDtoH(out,dout,(size_t)ni*64*4); dump_stage("out",dout,(size_t)ni*64,ni,64);free_d(&dout);}
+    result = 0;
+    goto done;
+fail:
+    fprintf(stderr,"native: transformer step failed\n");
+done:
+    free_d(&txt);free_d(&img);free_d(&hidden);free_d(&tmp);free_d(&tmp2);free_d(&bf);free_d(&q);free_d(&kk);free_d(&v);free_d(&att);free_d(&mlp0);free_d(&mlp1);free_d(&mod);free_d(&temb);free_d(&time0);free_d(&timebf);free_d(&scale);free_d(&wt_norm);free_d(&wt_in);free_d(&wt_out);free_d(&wi);free_d(&w_t1);free_d(&w_t2);free_d(&w_mod);free_d(&w_img);free_d(&w_proj);
+    #undef A
+    return result;
+}
+
+int main(int argc, char **argv) {
+    const char *model = NULL, *prompt_path = NULL, *latent_path = NULL;
+    const char *out_path = "native_latents.npy", *dump_dir = NULL;
+    int ih = 16, iw = 16, steps = 1, verbose = 1;
+    float manual_t = -1.0f;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--model") && i + 1 < argc) model = argv[++i];
+        else if (!strcmp(argv[i], "--prompt-embeds") && i + 1 < argc) prompt_path = argv[++i];
+        else if (!strcmp(argv[i], "--latents") && i + 1 < argc) latent_path = argv[++i];
+        else if (!strcmp(argv[i], "--out") && i + 1 < argc) out_path = argv[++i];
+        else if (!strcmp(argv[i], "--dump-dir") && i + 1 < argc) dump_dir = argv[++i];
+        else if (!strcmp(argv[i], "--height-tokens") && i + 1 < argc) ih = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--width-tokens") && i + 1 < argc) iw = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--steps") && i + 1 < argc) steps = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--timestep") && i + 1 < argc) manual_t = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "--verbose")) verbose = 2;
+        else if (!strcmp(argv[i], "--quiet")) verbose = 0;
+        else {
+            fprintf(stderr, "usage: %s --model DIR --prompt-embeds E.npy --latents L.npy "
+                    "[--steps N --dump-dir DIR --height-tokens 16 --width-tokens 16 "
+                    "--timestep .5 --out O.npy --verbose]\n", argv[0]);
+            return 2;
+        }
+    }
+    if (steps < 1 || steps > 100 || (manual_t >= 0.0f && steps != 1)) return 2;
+    qimg21_stage_dir = getenv("QIMG21_STAGE_DIR");
+    if (qimg21_stage_dir) {
+        const char *b = getenv("QIMG21_STAGE_BLOCK");
+        if (b) qimg21_stage_block = atoi(b);
+        mkdir(qimg21_stage_dir, 0755);
+    }
+    if(!model||!prompt_path||!latent_path||ih*iw<=0)return 2;
+    npy_f32 pe,la;if(npy_read_f32(prompt_path,&pe)!=0||npy_read_f32(latent_path,&la)!=0)return 1;
+    int nt=(pe.ndim==3&&pe.shape[0]==1)?(int)pe.shape[1]:(pe.ndim==2?(int)pe.shape[0]:0), ni=(la.ndim==3&&la.shape[0]==1)?(int)(la.shape[1]*la.shape[2]):(la.ndim==2?(int)la.shape[0]:0);
+    if(nt<=0||pe.shape[pe.ndim-1]!=4096||ni!=ih*iw||la.shape[la.ndim-1]!=64){fprintf(stderr,"native: expected embeds [1,T,4096] and latents [N,64]\n");return 1;}
+    const float *p=pe.data; cuda_qimg_runner*r=cuda_qimg_init(0,verbose);if(!r)return 1;
+    qimg21_shards s={{0},0};char path[1024];for(int i=1;i<=2;i++){snprintf(path,sizeof(path),"%s/transformer/diffusion_pytorch_model-%05d-of-00002.safetensors",model,i);s.st[s.n]=safetensors_open(path);if(!s.st[s.n]){fprintf(stderr,"native: cannot open %s\n",path);cuda_qimg_free(r);return 1;}fprintf(stderr,"native: opened shard %d (%d tensors)\n",i,s.st[s.n]->n_tensors);s.n++;}
+    qimg21_kernels k;CUmodule m;if(cu_compile_kernels(&m,r->device,qimg21_src,"qimg21_native.cu",verbose,"qimg21_native")<0||get_kernel(&k,m)!=0){fprintf(stderr,"native: custom kernel compile failed\n");return 1;}fprintf(stderr,"native: custom kernels ready\n");
+    if (dump_dir) mkdir(dump_dir, 0755);
+    float *pred = (float *)malloc((size_t)ni * 64 * sizeof(float));
+    float *sigmas = (float *)malloc((size_t)(steps + 1) * sizeof(float));
+    if (!pred || !sigmas) return 1;
+    if (manual_t >= 0.0f) {
+        for (int i = 0; i <= steps; i++) sigmas[i] = (i == 0) ? manual_t : 0.0f;
+    } else qimg21_flow_sigmas(steps, ni, sigmas);
+    int rc = 0;
+    for (int i = 0; i < steps; i++) {
+        fprintf(stderr, "native: step %d/%d sigma=%.7f\n", i + 1, steps, sigmas[i]);
+        rc = native_step(r, &k, &s, p, nt, la.data, ni, ih, iw, sigmas[i], pred);
+        if (rc != 0) break;
+        for (size_t j = 0; j < (size_t)ni * 64; j++)
+            la.data[j] += (sigmas[i + 1] - sigmas[i]) * pred[j];
+        if (dump_dir) {
+            char step_path[1024];
+            snprintf(step_path, sizeof(step_path), "%s/step_%03d.npy", dump_dir, i);
+            npy_write_f32(step_path, la.data, (size_t)ni * 64, ni, 64);
+        }
+    }
+    if (rc == 0) {
+        npy_write_f32(out_path, la.data, (size_t)ni * 64, ni, 64);
+        fprintf(stderr, "native: wrote %s (%d tokens x 64, %d steps)\n", out_path, ni, steps);
+    }
+    free(pred); free(sigmas); cuModuleUnload(m); for(int i=0;i<s.n;i++)safetensors_close(s.st[i]);
+    cuda_qimg_free(r); npy_free(&pe); npy_free(&la); return rc;
+}

@@ -1,0 +1,93 @@
+# Qwen-Image 2.1 CUDA runner
+
+This directory adds Qwen-Image 2.1 support for the local Hugging Face
+snapshot. The runner uses the official Diffusers CUDA implementation with
+sequential CPU offload, which fits the 16 GB RTX 5060 Ti. A native C/NVRTC
+transformer path is included for kernel bring-up and direct PyTorch comparison.
+
+The model is never copied. Pass the existing snapshot directly:
+
+```sh
+make -C cuda/qimg21 setup
+make -C cuda/qimg21
+cuda/qimg21/test_cuda_qimg21 --generate \
+  --model /mnt/nvme01/models/qimg-21 \
+  --prompt "a red apple on a white table" \
+  --height 1024 --width 1024 --steps 40 --seed 42 \
+  --out tmp/qwen_image21.png
+```
+
+For a PyTorch fixture and runner trace:
+
+```sh
+cuda/qimg21/reference.py --model /mnt/nvme01/models/qimg-21 \
+  --height 256 --width 256 --steps 2 \
+  --dump-dir tmp/qimg21-reference
+cuda/qimg21/test_cuda_qimg21 --generate --model /mnt/nvme01/models/qimg-21 \
+  --height 256 --width 256 --steps 2 --dump-dir tmp/qimg21-runner \
+  --out tmp/qimg21-runner.png
+tmp/qimg21-ref-venv/bin/python cuda/qimg21/compare.py \
+  --reference-dir tmp/qimg21-reference --runner-dir tmp/qimg21-runner
+```
+
+The first deliverable is batch-1 text-to-image with the model’s recommended
+no-guidance path. Condition-image editing, true CFG, and quantized weights
+remain outside this runner. The native executable currently takes the text
+encoder output as an F32 `.npy` fixture; text-tokenisation and the Qwen3-VL
+text encoder remain at that Python boundary. The scheduler loop is native now,
+while the official Qwen-Image 2.1 VAE is used as a separate decode stage.
+
+## Native transformer step
+
+Build the C runner, dump prompt embeddings with the already validated Python
+runner, and make a deterministic latent fixture:
+
+```sh
+make -C cuda/qimg21 native
+tmp/qimg21-ref-venv/bin/python cuda/qimg21/test_cuda_qimg21.py --test-text \
+  --model /mnt/nvme01/models/qimg-21 --dump-dir tmp/qimg21-native-fixture
+tmp/qimg21-ref-venv/bin/python cuda/qimg21/make_native_fixture.py \
+  --prompt-embeds tmp/qimg21-native-fixture/prompt_embeds.npy \
+  --out-dir tmp/qimg21-native-fixture
+cuda/qimg21/test_cuda_qimg21_native \
+  --model /mnt/nvme01/models/qimg-21 \
+  --prompt-embeds tmp/qimg21-native-fixture/prompt_embeds.npy \
+  --latents tmp/qimg21-native-fixture/latents.npy \
+  --height-tokens 16 --width-tokens 16 --steps 4 \
+  --dump-dir tmp/qimg21-native-steps \
+  --out tmp/qimg21-native-fixture/native_latents.npy
+```
+
+The executable opens the two transformer safetensors shards directly and
+executes all 32 blocks for every denoising step using custom NVRTC kernels for
+zero-centred RMSNorm, Ada modulation, 3-axis RoPE, block-causal attention,
+residual gates and SwiGLU, with BF16 cuBLAS GEMMs for the large matrix
+products. Block weights are uploaded and released one block at a time, keeping
+the transformer resident set appropriate for a 12–16 GB GPU. The native
+scheduler mirrors FlowMatch Euler dynamic shifting from the local scheduler
+config, and activation boundaries are rounded to BF16 to match the PyTorch
+reference numerics. Add `--verbose` for finite-value stage probes.
+
+## Hybrid native image generation
+
+For an end-to-end smoke image, the orchestration script uses the validated
+Python text encoder, runs all denoising steps in the native executable, then
+decodes the final normalized latents with `AutoencoderKLQwenImage21` after that
+native subprocess exits. This process boundary prevents the transformer
+allocations from competing with the VAE on the 16 GB RTX 5060 Ti:
+
+```sh
+make -C cuda/qimg21 native
+tmp/qimg21-ref-venv/bin/python cuda/qimg21/native_generate.py \
+  --model /mnt/nvme01/models/qimg-21 \
+  --prompt "a red apple on a white table" \
+  --height 256 --width 256 --steps 2 --seed 42 \
+  --work-dir tmp/qimg21-native-generate \
+  --out tmp/qimg21-native-generate.png
+```
+
+The work directory contains `prompt/prompt_embeds.npy`, the deterministic
+initial `latents.npy`, one `steps/step_XXX.npy` file per Euler update, and the
+final `native_latents.npy`. These arrays are the hand-off points for comparing
+the native transformer/scheduler against the PyTorch reference before a native
+text encoder or VAE port is attempted.

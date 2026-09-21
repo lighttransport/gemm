@@ -92,6 +92,8 @@ cuda/*/test_cuda_*
 !cuda/*/test_cuda_*.c
 cuda/*/test_*
 !cuda/*/test_*.c
+!cuda/qimg21/test_cuda_qimg21.py
+!cuda/qimg21/test_cuda_qimg21
 cuda/*/test_paint_*
 !cuda/*/test_paint_*.c
 cuda/*/verify_*
