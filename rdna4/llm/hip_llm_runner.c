@@ -22833,14 +22833,12 @@ static inline void launch_attn_decode_native_q8(hip_llm_runner *r, void *out,
 static inline void launch_attn_verify_native_q8(hip_llm_runner *r, void *out,
         void *parts, void *meta, void *q, void *k, void *v, void *ks,
         void *vs, void *positions, void *gate, int queries, int group_queries) {
-    /* Expose the exact verifier window in one launch. Up to eight queries use
-     * the measured eight-split shared-K/V schedule; wider dense-NextN windows
-     * retain the scalar split selector. Each query reads its device-resident
-     * causal position, so the captured graph remains reusable. */
-    int occupancy = 11, forced_splits = group_queries ? 8 : 0;
+    /* The verifier owns separate captured graphs for equal and mixed adaptive
+     * split counts.  Equal-count windows share every K/V row; selector
+     * boundaries retain the ordinary per-query grid. */
+    int occupancy = 11, forced_splits = 0;
     int position_start = -1;
-    int launch_splits = forced_splits ? forced_splits :
-        r->q8_attention_max_splits;
+    int launch_splits = r->q8_attention_max_splits;
     void *a[] = { &out, &parts, &meta, &q, &k, &v, &ks, &vs, &positions,
         &r->n_heads, &r->n_kv_heads, &r->q8_attention_nsm, &occupancy,
         &forced_splits, &queries, &position_start };

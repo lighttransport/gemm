@@ -6,6 +6,31 @@ enum {
     HLLM_DENSE_MTP_SMALL_REUSE_ROWS = 4,
 };
 
+static int hllm_qwen35_attention_splits(const hip_llm_runner *r, int length) {
+    const int occupancy = 11;
+    int tiles = (length + 255) / 256;
+    if (length >= 16384) {
+        int splits = (length + 511) / 512;
+        if (splits < occupancy) splits = occupancy;
+        return splits > 128 ? 128 : splits;
+    }
+    int splits = occupancy < tiles ? occupancy : tiles;
+    int best = 0, waves_best = 0;
+    int blocks_per_wave = r->q8_attention_nsm * occupancy;
+    for (int trial = splits; trial <= tiles; ++trial) {
+        int blocks = r->n_heads * trial;
+        int waves = (blocks + blocks_per_wave - 1) / blocks_per_wave;
+        int efficiency = 100 * blocks / (waves * blocks_per_wave);
+        if (best >= 95 && waves > waves_best) break;
+        if (efficiency > best) {
+            best = efficiency;
+            waves_best = waves;
+            splits = trial;
+        }
+    }
+    return splits;
+}
+
 typedef struct hllm_qwen35_mtp {
     gguf_shards *source;
     qtensor embedding;
@@ -26,7 +51,10 @@ typedef struct hllm_qwen35_mtp {
     float *host_logits;
     hipGraph_t graphs[HLLM_DENSE_MTP_MAX_ROWS + 1];
     hipGraphExec_t executions[HLLM_DENSE_MTP_MAX_ROWS + 1];
+    hipGraph_t reuse_graphs[HLLM_DENSE_MTP_MAX_ROWS + 1];
+    hipGraphExec_t reuse_executions[HLLM_DENSE_MTP_MAX_ROWS + 1];
     int verify_capacity, verify_rows, verify_position, verify_ssm_layers;
+    int verify_attention_reuse;
 } hllm_qwen35_mtp;
 
 static void hllm_free_qwen35_mtp(hip_llm_runner *r) {
@@ -36,6 +64,8 @@ static void hllm_free_qwen35_mtp(hip_llm_runner *r) {
     for (int i = 0; i <= HLLM_DENSE_MTP_MAX_ROWS; ++i) {
         if (m->executions[i]) hipGraphExecDestroy(m->executions[i]);
         if (m->graphs[i]) hipGraphDestroy(m->graphs[i]);
+        if (m->reuse_executions[i]) hipGraphExecDestroy(m->reuse_executions[i]);
+        if (m->reuse_graphs[i]) hipGraphDestroy(m->reuse_graphs[i]);
     }
 #define DENSE_FREE(p) do { if (p) hipFree(p); } while (0)
     DENSE_FREE(m->verify_x); DENSE_FREE(m->verify_logits); DENSE_FREE(m->verify_positions);
@@ -550,15 +580,13 @@ static void hllm_dense_mtp_attention(hip_llm_runner *r, hip_layer *cl,
         LAUNCH(r->fn_kv_cache_store_q8q8_devp, r->n_kv_heads, 1, 1,
                256, 1, 1, 0, r->stream, a);
     }
-    /* The fixed-split reuse kernel is exact for a requested split count, but
-     * ordinary decode selects splits independently for each causal row.  The
-     * native query grid preserves that selector in one batched launch. */
+    /* The verifier chooses this graph only when every causal row has the same
+     * adaptive split count. Selector boundaries use the ordinary query grid. */
     launch_attn_verify_native_q8(r, r->d_attn_out_batch,
         m->verify_attn_parts, m->verify_attn_meta, r->d_q_batch,
         r->d_key_cache[l], r->d_value_cache[l], r->d_key_cache_scale[l],
         r->d_value_cache_scale[l], m->verify_positions, r->d_attn_gate_batch,
-        rows,
-        0);
+        rows, m->verify_attention_reuse);
     hllm_dense_mtp_projection(r, r->d_attn_proj_batch,
         cl->attn_output_w, r->d_attn_out_batch, rows,
         cl->attn_output_rows, cl->attn_output_cols, cl->attn_output_type);
@@ -636,10 +664,24 @@ static float *hllm_qwen35_mtp_verify_impl(hip_llm_runner *r,
         hllm_vram_sample(r);
     }
     if (rows > m->verify_capacity) return NULL;
+    int reuse_attention = rows > 1 && rows <= HLLM_DENSE_MTP_REUSE_ROWS &&
+                          r->fn_q8_attention_decode_reuse8;
+    if (reuse_attention) {
+        int shared_splits = hllm_qwen35_attention_splits(r, position + 1);
+        for (int i = 1; reuse_attention && i < rows; ++i) {
+            if (hllm_qwen35_attention_splits(r, position + i + 1) !=
+                shared_splits) reuse_attention = 0;
+        }
+    }
+    hipGraph_t *selected_graph = reuse_attention ?
+        &m->reuse_graphs[rows] : &m->graphs[rows];
+    hipGraphExec_t *selected_execution = reuse_attention ?
+        &m->reuse_executions[rows] : &m->executions[rows];
     void *saved_x = r->d_x;
     int saved_position = r->cur_position;
     int saved_layer = r->active_layer;
-    if (!m->executions[rows]) {
+    if (!*selected_execution) {
+        m->verify_attention_reuse = reuse_attention;
         if (hipStreamSynchronize(r->stream) ||
             hipStreamBeginCapture(r->stream, hipStreamCaptureModeThreadLocal)) return NULL;
         for (int l = 0; l < r->n_layers; ++l) {
@@ -698,8 +740,9 @@ static float *hllm_qwen35_mtp_verify_impl(hip_llm_runner *r,
         r->d_x = saved_x;
         r->cur_position = saved_position;
         r->active_layer = saved_layer;
-        if (hipStreamEndCapture(r->stream, &m->graphs[rows]) ||
-            hipGraphInstantiate(&m->executions[rows], m->graphs[rows], NULL, NULL, 0)) return NULL;
+        if (hipStreamEndCapture(r->stream, selected_graph) ||
+            hipGraphInstantiate(selected_execution, *selected_graph, NULL, NULL, 0)) return NULL;
+        m->verify_attention_reuse = 0;
     }
     int positions[HLLM_DENSE_MTP_MAX_ROWS];
     for (int i = 0; i < rows; ++i) positions[i] = position+i;
@@ -720,7 +763,7 @@ static float *hllm_qwen35_mtp_verify_impl(hip_llm_runner *r,
     }
     if (hipMemcpyAsync(m->verify_positions, positions, (size_t)rows*sizeof(int),
                        hipMemcpyHostToDevice, r->stream) ||
-        hipGraphLaunch(m->executions[rows], r->stream)) return NULL;
+        hipGraphLaunch(*selected_execution, r->stream)) return NULL;
     if (argmax) {
         void *a[] = { &m->verify_logits, &r->n_vocab, &rows, &m->verify_argmax };
         LAUNCH(r->fn_qwen4_argmax_batch, rows, 1, 1, 256, 1, 1, 0, r->stream, a);

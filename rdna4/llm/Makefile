@@ -95,7 +95,7 @@ qwen35_matvec_iq.inc: qwen35_matvec_iq.hip embed_hip_source.py qwen35_iq2xxs_gri
 	python3 embed_hip_source.py $< qwen35_matvec_iq_source > $@
 
 # Other test executables include the runner translation unit directly.
-HIPRTC_INCLUDES = qwen35_attention_q8.inc qwen35_dflash2.inc qwen35_matvec_q2k.inc qwen35_matvec_iq.inc qwen35_reference_math.h qwen35_nextn.h qwen35_dflash2.h
+HIPRTC_INCLUDES = qwen35_attention_q8.inc qwen35_attention_q8_gate.inc qwen35_dflash2.inc qwen35_matvec_q2k.inc qwen35_matvec_iq.inc qwen35_reference_math.h qwen35_nextn.h qwen35_dflash2.h
 $(TARGET) tmp/test_hip_qwen4_moe_stage tmp/test_hip_qwen4_moe_stage_large tmp/test_hip_qwen4_attention test_glm5next_nextn: $(HIPRTC_INCLUDES)
 
 LLAMA_REFERENCE ?= ../../tmp/qwen38/reference-build
