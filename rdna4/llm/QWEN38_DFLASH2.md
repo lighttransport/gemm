@@ -211,6 +211,14 @@ online softmax, packed-F16 accumulation and split-combine order.  The draft
 also reuses Q4_K weights and holds one K/V vector while evaluating four mask
 rows.
 
+The DFlash selector now decodes the predecessor's 256-rank Q4_K vector once
+per draft position into shared memory, then reuses it across all sixteen
+candidate lanes. This leaves the candidate accumulation order unchanged and
+keeps the greedy and seeded sampled verifier hashes identical. Repeated 4K
+K=4 runs measure about 53--55 ms for the complete draft phase; the remaining
+cost is in the five-layer projections and attention, so the selector change is
+kept as a low-risk cleanup rather than counted as a headline speedup.
+
 Sampled parity exposed three verifier-specific hazards. Non-FFN IQ1_S
 projections must use the scalar path's MMQ-scale interpretation, so their
 batched launch now uses the same MMQ-scale kernel with the candidate row in

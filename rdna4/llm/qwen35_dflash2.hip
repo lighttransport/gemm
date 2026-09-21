@@ -165,17 +165,24 @@ void qwen35_dflash2_select(const float *logits, const float *selector_gate,
     int k = threadIdx.x;
     if (blockIdx.x || k >= DFLASH_SELECTOR_TOPK) return;
     __shared__ float scores[DFLASH_SELECTOR_TOPK];
+    /* The predecessor is common to every candidate in a row.  Decode its
+     * rank vector once cooperatively instead of repeating the same Q4_K
+     * lookup in all sixteen candidate lanes. */
+    __shared__ float predecessor_values[DFLASH_SELECTOR_RANK];
     __shared__ int predecessor;
     if (k == 0) predecessor = anchor;
     __syncthreads();
     for (int row = 1; row < rows; ++row) {
+        for (int j = k; j < DFLASH_SELECTOR_RANK; j += DFLASH_SELECTOR_TOPK)
+            predecessor_values[j] = qwen35_dflash2_q4k_value(
+                predecessor_w, predecessor, j);
+        __syncthreads();
         int token = candidates[row * DFLASH_SELECTOR_TOPK + k];
         float score = logits[(size_t)row * vocab + token];
         const float *gate = selector_gate + (size_t)row * DFLASH_SELECTOR_RANK;
         for (int j = 0; j < DFLASH_SELECTOR_RANK; ++j) {
-            float prev = qwen35_dflash2_q4k_value(predecessor_w, predecessor, j);
             float next = qwen35_dflash2_q4k_value(successor_w, token, j);
-            score += prev * gate[j] * next;
+            score += predecessor_values[j] * gate[j] * next;
         }
         scores[k] = score;
         __syncthreads();

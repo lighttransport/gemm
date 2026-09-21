@@ -249,7 +249,11 @@ Remaining optimization items, in measured priority order:
    the split-partial/combine boundary.  Keep it in a verifier-only kernel so
    captured generic-decode graph ABIs remain stable.
 3. Reduce the remaining DFlash draft cost. Top-k and selector decisions are
-   already on the GPU; investigate position-parallel draft attention and a
+   already on the GPU; the selector now shares the predecessor's decoded
+   256-rank Q4_K vector across its sixteen candidate lanes without changing
+   accumulation order or output hashes. Repeated 4K K=4 runs remain about
+   53--55 ms for the draft phase, so projection and draft attention are still
+   the material cost. Investigate position-parallel draft attention and a
    cheaper draft-cache representation. K=7 already clears 60 tok/s, while
    K=4 remains below that target.
 4. Overlap sidecar cache injection with the next target prefill tile.  The
