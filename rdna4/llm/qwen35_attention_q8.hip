@@ -36,8 +36,17 @@ __device__ __forceinline__ q8_half2 q8_hfma(q8_half2 x, q8_half2 y, q8_half2 z) 
 __device__ __forceinline__ int q8_attention_splits(int length, int heads,
                                                  int nsm, int occupancy) {
     int tiles = (length + 255) / 256;
-    if (length >= 16384)
-        return min(128, max(occupancy, (length + 511) / 512));
+    if (length >= 16384) {
+        int long_splits = (length + 511) / 512;
+        /* On gfx1201, the 64K window is faster with fewer, larger K/V
+         * partitions: the saved split/combine work outweighs the lower
+         * block count while each partition still fits the long-context
+         * register budget. Keep the 128-way schedule outside the validated
+         * 64K serving window. */
+        if (length >= 65536 && length < 98304)
+            long_splits = min(long_splits, 64);
+        return min(128, max(occupancy, long_splits));
+    }
     int result = min(occupancy, tiles), best = 0, waves_best = 0;
     int blocks_per_wave = nsm * occupancy;
     for (int trial = result; trial <= tiles; ++trial) {
