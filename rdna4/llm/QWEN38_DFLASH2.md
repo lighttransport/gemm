@@ -333,6 +333,9 @@ reflects the remaining measured costs.
    The verifier now also uses the existing fused Q/K normalize-and-expand
    kernel, removing three intermediate launches per recurrent layer while
    preserving the same per-head reduction order.
+   Attention verifier Q/K RMS normalization is likewise paired into one launch;
+   its independent reductions retain the original order and exact output
+   hashes.
 4. **Kernel and graph count.** Q/gate deinterleave, QK normalization, RoPE
    and Q8/Q8 KV storage are now fused exactly. The remaining small launches
    include SiLU/gating and state preparation. Fuse adjacent operations when

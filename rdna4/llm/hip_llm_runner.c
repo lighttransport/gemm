@@ -625,6 +625,25 @@ static const char *hip_kernel_source =
 "    float scale = rsqrtf(sdata[0] / (float)head_dim + eps);\n"
 "    for (int d = tid; d < head_dim; d += NT) v[d] = v[d] * scale * w[d];\n"
 "}\n"
+"__global__ void qknorm_pair_batch_f32(float *q, const float *qw, int q_heads,\n"
+"        float *k, const float *kw, int k_heads, int head_dim,\n"
+"        int q_stride, int k_stride, float eps) {\n"
+"    extern __shared__ float sdata[];\n"
+"    int h=blockIdx.x, row=blockIdx.y, tid=threadIdx.x, NT=blockDim.x;\n"
+"    bool do_q=h<q_heads, do_k=h<k_heads;\n"
+"    float *qv=do_q ? q+(size_t)row*q_stride+(size_t)h*head_dim : (float *)0;\n"
+"    float *kv=do_k ? k+(size_t)row*k_stride+(size_t)h*head_dim : (float *)0;\n"
+"    float sq=0.0f, sk=0.0f;\n"
+"    for(int d=tid;d<head_dim;d+=NT){if(do_q){float x=qv[d];sq+=x*x;}\n"
+"        if(do_k){float x=kv[d];sk+=x*x;}}\n"
+"    sdata[tid]=sq; sdata[NT+tid]=sk; __syncthreads();\n"
+"    for(int s=NT/2;s>0;s>>=1){if(tid<s){sdata[tid]+=sdata[tid+s];\n"
+"        sdata[NT+tid]+=sdata[NT+tid+s];}__syncthreads();}\n"
+"    if(do_q){float z=rsqrtf(sdata[0]/(float)head_dim+eps);\n"
+"        for(int d=tid;d<head_dim;d+=NT)qv[d]=qv[d]*z*qw[d];}\n"
+"    if(do_k){float z=rsqrtf(sdata[NT]/(float)head_dim+eps);\n"
+"        for(int d=tid;d<head_dim;d+=NT)kv[d]=kv[d]*z*kw[d];}\n"
+"}\n"
 "\n"
 "/* Decode-only Qwen3.5 attention preparation.  Q heads first split the gated\n"
 " * projection, then Q and K heads independently run the same 256-thread\n"
@@ -13038,6 +13057,7 @@ struct hip_llm_runner {
     hipFunction_t fn_qknorm_f32;
     hipFunction_t fn_deinterleave_qgate_qknorm_mrope_pair_devp;
     hipFunction_t fn_qknorm_batch_f32;
+    hipFunction_t fn_qknorm_pair_batch_f32;
     hipFunction_t fn_rope_neox_f32;
     hipFunction_t fn_rope_mrope_f32;
     hipFunction_t fn_kv_cache_store;
@@ -14154,6 +14174,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(qknorm_f32);
     GET_FUNC(deinterleave_qgate_qknorm_mrope_pair_devp);
     GET_FUNC(qknorm_batch_f32);
+    GET_FUNC(qknorm_pair_batch_f32);
     GET_FUNC(rope_neox_f32);
     GET_FUNC(rope_mrope_f32);
     GET_FUNC(kv_cache_store);
@@ -19345,6 +19366,18 @@ static inline void launch_qknorm_batch(hip_llm_runner *r, void *vec, void *w,
     void *args[] = { &vec, &w, &n_heads, &head_dim, &row_stride, &eps };
     LAUNCH(r->fn_qknorm_batch_f32, n_heads, n_rows, 1, bdim, 1, 1,
            bdim * sizeof(float), r->stream, args);
+}
+
+static inline void launch_qknorm_pair_batch(hip_llm_runner *r, void *q, void *qw,
+    int q_heads, void *k, void *kw, int k_heads, int head_dim,
+    int q_stride, int k_stride, int n_rows, float eps) {
+    int bdim = 1;
+    while (bdim < head_dim) bdim <<= 1;
+    if (bdim > 256) bdim = 256;
+    void *args[] = { &q, &qw, &q_heads, &k, &kw, &k_heads, &head_dim,
+                     &q_stride, &k_stride, &eps };
+    LAUNCH(r->fn_qknorm_pair_batch_f32, q_heads > k_heads ? q_heads : k_heads,
+           n_rows, 1, bdim, 1, 1, 2 * bdim * sizeof(float), r->stream, args);
 }
 
 /* Weightless per-head RMS norm over n_rows (n_rows=1 for decode). Handles head_dim>256. */

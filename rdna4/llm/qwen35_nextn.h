@@ -516,10 +516,9 @@ static void hllm_dense_mtp_attention(hip_llm_runner *r, hip_layer *cl,
     hllm_dense_mtp_projection(r, r->d_v_batch, cl->attn_v_w,
         r->d_xnorm_batch, rows, cl->attn_v_rows, cl->attn_v_cols,
         cl->attn_v_type);
-    launch_qknorm_batch(r, r->d_q_batch, cl->attn_q_norm_w,
-                        r->n_heads, r->head_dim, rows, qd, eps);
-    launch_qknorm_batch(r, r->d_k_batch, cl->attn_k_norm_w,
-                        r->n_kv_heads, r->head_dim, rows, kd, eps);
+    launch_qknorm_pair_batch(r, r->d_q_batch, cl->attn_q_norm_w,
+        r->n_heads, r->d_k_batch, cl->attn_k_norm_w, r->n_kv_heads,
+        r->head_dim, qd, kd, rows, eps);
 
     if (r->use_mrope) {
         int s0=r->mrope_sections[0],s1=r->mrope_sections[1];
