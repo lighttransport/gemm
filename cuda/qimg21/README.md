@@ -426,10 +426,9 @@ additional coverage.
 
 The additional 512x512/seed42 F32 decoder comparison passed with cosine
 0.99999999951 (native subprocess including startup: 12.04 seconds). Native
-1024x1024 decoding completed, but the untiled F32 PyTorch reference ran out
-of VRAM on this GPU; its 1024 parity is therefore unverified. The separate
-1024x1024/40-step generation benchmark below has completed, but does not
-replace this missing full-resolution VAE reference comparison.
+1024x1024 native decoding completed, but the initial untiled F32 PyTorch
+reference ran out of VRAM while retaining unused temporal caches. The
+cache-bounded reference below now completes and validates 1024 parity.
 
 For memory-bounded untiled PyTorch comparison, `vae_regression.py` has an
 opt-in `--discard-frame-cache` mode. It executes the official decoder with
@@ -440,8 +439,21 @@ not change temporal upsampling behavior by setting `feat_cache=None`.
 Results explicitly record this reference mode. CPU tests are bit-exact for
 individual official modules and a reduced-width complete five-stage decoder:
 `OMP_NUM_THREADS=2 tmp/qimg21-ref-venv/bin/python cuda/qimg21/test_vae_reference.py`.
-Full-checkpoint GPU equivalence and the 1024-resolution memory benefit still
-need validation; this option does not yet resolve the unverified parity above.
+Full-checkpoint GPU validation now passes. At 256x256/seed42, this reference
+is bit-identical to the saved original cached PyTorch decode (maximum
+absolute difference zero). Native-vs-reference cosine is 0.9999999996157.
+At 1024x1024/seed42, the untiled cache-bounded reference completes without
+OOM; native cosine is **0.9999999996970**, MAE 1.8036e-6, with finite outputs.
+Native decode subprocess time was 45.8903 seconds. Reproduce with:
+
+```sh
+tmp/qimg21-ref-venv/bin/python cuda/qimg21/vae_regression.py \
+  --discard-frame-cache --case 256x256:42 --case 1024x1024:42 \
+  --work-dir tmp/qimg21-vae-cachebounded-regression
+```
+
+The reference model remains F32 with TF32 disabled. These are seeded
+single-frame decoder checks, not encoder/editing or denoiser parity evidence.
 
 ## Completed 1024x1024/40-step generation benchmark
 
