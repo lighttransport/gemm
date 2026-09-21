@@ -37,6 +37,7 @@ typedef struct hllm_qwen35_dflash2 {
     hipModule_t module;
     hipFunction_t fn_capture, fn_capture_rmsnorm;
     hipFunction_t fn_conv, fn_attention, fn_attention_combine;
+    hipFunction_t fn_attention_fused;
     hipFunction_t fn_topk, fn_select;
     void *fc, *fc_bf16, *enc_norm, *out_norm, *selector_hidden;
     int fc_type, selector_hidden_type;
@@ -349,6 +350,8 @@ int hip_llm_qwen35_dflash2_load(hip_llm_runner *r, const char *path,
                              "qwen35_dflash2_attention") != hipSuccess ||
         hipModuleGetFunction(&d->fn_attention_combine, d->module,
                              "qwen35_dflash2_attention_combine") != hipSuccess ||
+        hipModuleGetFunction(&d->fn_attention_fused, d->module,
+                             "qwen35_dflash2_attention_fused") != hipSuccess ||
         hipModuleGetFunction(&d->fn_topk, d->module,
                              "qwen35_dflash2_topk") != hipSuccess ||
         hipModuleGetFunction(&d->fn_select, d->module,
@@ -538,17 +541,33 @@ int hip_llm_qwen35_dflash2_propose(hip_llm_runner *r, int32_t anchor,
             if (forced >= 1 && forced <= HLLM_DFLASH_ATTN_MAX_SPLITS)
                 splits = forced;
         }
-        void *aa[]={&d->attn_partial,&d->q,&cl->key_cache,&cl->value_cache,&rows,
-            &position,&(int){HLLM_DFLASH_HEADS},&(int){HLLM_DFLASH_KV_HEADS},
-            &(int){HLLM_DFLASH_HEAD_DIM},&window,&splits};
-        LAUNCH(d->fn_attention, HLLM_DFLASH_HEADS,
-               (rows + HLLM_DFLASH_ATTN_ROWS_PER_WAVE - 1) /
-                   HLLM_DFLASH_ATTN_ROWS_PER_WAVE, splits,
-               32,1,1,0,r->stream,aa);
-        void *ac[]={&d->attn,&d->attn_partial,&rows,
-            &(int){HLLM_DFLASH_HEADS},&(int){HLLM_DFLASH_HEAD_DIM},&splits};
-        LAUNCH(d->fn_attention_combine,HLLM_DFLASH_HEADS,rows,1,
-               32,1,1,0,r->stream,ac);
+        int fused = d->fn_attention_fused != NULL && splits <= 12;
+        const char *fused_env = getenv("LLM_QWEN35_DFLASH_FUSED_ATTN");
+        if (fused_env) fused = atoi(fused_env) != 0 && splits <= 12;
+        if (fused) {
+            void *fa[]={&d->attn,&d->q,&cl->key_cache,&cl->value_cache,&rows,
+                &position,&(int){HLLM_DFLASH_HEADS},&(int){HLLM_DFLASH_KV_HEADS},
+                &(int){HLLM_DFLASH_HEAD_DIM},&window,&splits};
+            LAUNCH(d->fn_attention_fused, HLLM_DFLASH_HEADS,
+                   (rows + HLLM_DFLASH_ATTN_ROWS_PER_WAVE - 1) /
+                       HLLM_DFLASH_ATTN_ROWS_PER_WAVE, 1,
+                   32 * splits,1,1,
+                   (size_t)splits * HLLM_DFLASH_ATTN_ROWS_PER_WAVE *
+                       (HLLM_DFLASH_HEAD_DIM + 2) * sizeof(float),
+                   r->stream,fa);
+        } else {
+            void *aa[]={&d->attn_partial,&d->q,&cl->key_cache,&cl->value_cache,&rows,
+                &position,&(int){HLLM_DFLASH_HEADS},&(int){HLLM_DFLASH_KV_HEADS},
+                &(int){HLLM_DFLASH_HEAD_DIM},&window,&splits};
+            LAUNCH(d->fn_attention, HLLM_DFLASH_HEADS,
+                   (rows + HLLM_DFLASH_ATTN_ROWS_PER_WAVE - 1) /
+                       HLLM_DFLASH_ATTN_ROWS_PER_WAVE, splits,
+                   32,1,1,0,r->stream,aa);
+            void *ac[]={&d->attn,&d->attn_partial,&rows,
+                &(int){HLLM_DFLASH_HEADS},&(int){HLLM_DFLASH_HEAD_DIM},&splits};
+            LAUNCH(d->fn_attention_combine,HLLM_DFLASH_HEADS,rows,1,
+                   32,1,1,0,r->stream,ac);
+        }
         hllm_dflash_project(r,d->proj,cl->o,d->attn,rows,ne,qd,qd,cl->o_type);
         hllm_dflash_conv(r,d,d->conv,d->proj,d->dynamic,cl->attn_conv_base,rows,1);
         launch_add(r,d->x,d->conv,rows*ne);

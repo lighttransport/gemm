@@ -1,5 +1,26 @@
 # Qwen3.8 27B HIP runner vs llama.cpp — resume state
 
+## 2026-09-22 continuation: fused DFlash2 split merge
+
+DFlash2 attention now has a verifier-only fused path for the production
+short-window and twelve-split schedules.  One block assigns a warp to each
+split, keeps the partials in LDS, and performs the same increasing-split
+online-softmax merge before publishing the output.  This removes the global
+partial write/read and the separate combine launch without changing target
+verifier state or the captured target graph ABI.  The path is selected by
+default for at most twelve splits; `LLM_QWEN35_DFLASH_FUSED_ATTN=0` restores
+the previous two-kernel path for A/B testing.
+
+The exact 4K greedy K=7 gate measured 82.76 tok/s fused versus 82.68 tok/s
+with the control path and retained sequence hash `44915ec1039a64c8`.  Seeded
+sampled K=7 measured 70.89 versus 70.85 tok/s with hash
+`72a11474a3a222b5`; K=4 measured 55.90 versus 55.81 tok/s with the same
+sampled hash.  The full HTTP/stdio, context-cache, cancellation, concurrency,
+and multi-turn C++ quality harness passes.  Ordinary random-token 64K remains
+unaffected at 35.76 tok/s with prefix/suffix hashes
+`90178de69a24a76e`/`7463f176c9b85ba3`; the strict 40 tok/s ordinary target
+and target-verifier long-context fusion remain open.
+
 ## 2026-09-22 continuation: DFlash2 long-window split retune
 
 The DFlash2 sidecar now uses twelve attention partitions once its 2,048-token

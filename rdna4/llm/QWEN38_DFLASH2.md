@@ -1,5 +1,24 @@
 # Qwen3.8 DFlash2 on RDNA4
 
+## Fused sidecar attention merge (2026-09-22)
+
+The DFlash2 verifier now uses a fused attention kernel for schedules of up to
+twelve splits.  Each warp computes one split and four adjacent rows, writes
+its summary to LDS, and warp zero merges summaries in the same increasing
+split order as the former attention-plus-combine pair.  This removes global
+partial traffic and one launch while leaving target verification and captured
+target graph ABIs unchanged.  Set `LLM_QWEN35_DFLASH_FUSED_ATTN=0` to run the
+two-kernel control path; schedules above twelve splits always use that
+fallback.
+
+On the 4K IQ2_XS/Q8-Q8 gate, fused versus control measured 82.76/82.68 tok/s
+for greedy K=7 with hash `44915ec1039a64c8`, 70.89/70.85 tok/s for seeded
+sampled K=7 with hash `72a11474a3a222b5`, and 55.90/55.81 tok/s for sampled
+K=4 with the same hash.  The HTTP/stdio cache, cancellation, concurrency, and
+C++ quality checks all pass.  This is a small but repeatable sidecar win; the
+ordinary target's random-token 64K decode remains 35.76 tok/s, so the
+long-context 40 tok/s target still requires mixed projection work.
+
 ## DFlash2 long-window split retune (2026-09-22)
 
 The sidecar attention launch now uses twelve partitions once its 2,048-token
