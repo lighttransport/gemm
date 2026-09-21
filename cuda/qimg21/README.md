@@ -666,6 +666,38 @@ OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=1 tmp/qimg21-ref-venv/bin/python cuda/qim
 Results are recorded in `tmp/qimg21-tanh-regression/results.json` with Torch
 version and GPU identity. These checks do not waive the failing model gates.
 
+### Matched-input transformer-block replay
+
+To separate accumulated drift from a block's own arithmetic, set
+`QIMG21_REPLAY_HIDDEN=hidden.npy`, `QIMG21_STAGE_DIR`, and an explicit
+`QIMG21_STAGE_BLOCK` from 0 through 31. This diagnostic requires exactly one
+manual-timestep step and no CFG. It validates a finite BF16-valued F32 fixture
+of shape `[N,4096]` or `[1,N,4096]`, initializes normal prompt/timestep
+conditioning, skips preceding transformer blocks, and runs only the selected
+block from the supplied state. A successful replay intentionally exits with
+**status 3** and writes only stage captures—no denoiser prediction, scheduler
+update, or final latent. Capture/write failures return failure instead.
+Never use injected-state outputs as full-model acceptance evidence.
+
+On the saved low-timestep PyTorch block-17 input, with vector normalization,
+host-table/vector RMS and Flash-style MMA attention, native modulation, Q and
+V projections match exactly. Subsequent matched-block measurements are:
+
+| Stage | Cosine | Elementwise equality |
+| --- | ---: | ---: |
+| Q after RMS/RoPE | 0.999999999980 | 99.9993% |
+| Attention before output projection | 0.999999997024 | 99.9488% |
+| Attention after output projection | 0.999999950513 | 97.8368% |
+| MLP output | 0.999999778503 | 79.9929% |
+| Block output | 0.999999998057 | 88.9708% |
+
+Mixed text/image attention changes these results only slightly (block cosine
+0.999999998059). This narrows the remaining local discrepancy to the
+RMS/RoPE-attention boundary and its downstream propagation, rather than the
+already exact input projections. Artifacts are
+`tmp/qimg21-replay-block17` and `tmp/qimg21-replay-block17-mixed`.
+CLI guard coverage brings the CPU suite to 26 passing tests.
+
 Compare the replay without loading PyTorch or allocating GPU memory:
 
 ```sh

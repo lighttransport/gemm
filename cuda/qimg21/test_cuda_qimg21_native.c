@@ -129,6 +129,7 @@ static int npy_write_f32(const char *path, const float *x, size_t n, int d0, int
 static const char *qimg21_stage_dir;
 static int qimg21_stage_block = 0;
 static int qimg21_stage_error;
+static const char *qimg21_replay_hidden;
 
 static void dump_stage(const char *label, CUdeviceptr d, size_t n, int d0, int d1) {
     if (!qimg21_stage_dir) return;
@@ -468,6 +469,20 @@ static int native_step(cuda_qimg_runner *r, qimg21_kernels *k, const qimg21_shar
     probe(r,"mod",mod,2*16384); dump_stage("mod",mod,2u*16384u,2,16384);
     probe(r,"mod_zero",mod+(size_t)16384*4,16384);
     for(int bidx=0;bidx<32;bidx++){
+        if(qimg21_replay_hidden && bidx<qimg21_stage_block)continue;
+        if(qimg21_replay_hidden && bidx==qimg21_stage_block) {
+            npy_f32 replay={0};
+            if(npy_read_f32(qimg21_replay_hidden,&replay))goto fail;
+            int valid=(replay.ndim==2 && replay.shape[0]==(size_t)N && replay.shape[1]==(size_t)D) ||
+                      (replay.ndim==3 && replay.shape[0]==1 && replay.shape[1]==(size_t)N && replay.shape[2]==(size_t)D);
+            for(size_t i=0;valid && i<replay.n;i++)
+                if(!isfinite(replay.data[i]) || replay.data[i]!=qimg21_round_bf16_host(replay.data[i]))valid=0;
+            int error=!valid || cuMemcpyHtoD(hidden,replay.data,replay.n*sizeof(float)) || cuCtxSynchronize();
+            npy_free(&replay);
+            if(error){fprintf(stderr,"native: invalid or failed hidden-state replay\n");goto fail;}
+            fprintf(stderr,"native: DIAGNOSTIC ONLY: replaying block %d from external hidden state\n",bidx);
+            dump_stage("replay_hidden",hidden,(size_t)N*D,N,D);
+        }
         char nm[128];
         snprintf(nm,sizeof(nm),"transformer_blocks.%d.attn.to_q.weight",bidx);CUdeviceptr wq=upload_bf16(s,nm);snprintf(nm,sizeof(nm),"transformer_blocks.%d.attn.to_k.weight",bidx);CUdeviceptr wk=upload_bf16(s,nm);snprintf(nm,sizeof(nm),"transformer_blocks.%d.attn.to_v.weight",bidx);CUdeviceptr wv=upload_bf16(s,nm);snprintf(nm,sizeof(nm),"transformer_blocks.%d.attn.to_out.0.weight",bidx);CUdeviceptr wo=upload_bf16(s,nm);snprintf(nm,sizeof(nm),"transformer_blocks.%d.img_mlp.gate_layer.weight",bidx);CUdeviceptr wg=upload_bf16(s,nm);snprintf(nm,sizeof(nm),"transformer_blocks.%d.img_mlp.proj.weight",bidx);CUdeviceptr wp=upload_bf16(s,nm);snprintf(nm,sizeof(nm),"transformer_blocks.%d.img_mlp.out.weight",bidx);CUdeviceptr wmlpo=upload_bf16(s,nm);snprintf(nm,sizeof(nm),"transformer_blocks.%d.attn.norm_q.weight",bidx);CUdeviceptr wqn=upload_f32(s,nm);snprintf(nm,sizeof(nm),"transformer_blocks.%d.attn.norm_k.weight",bidx);CUdeviceptr wkn=upload_f32(s,nm);
         if(!wq||!wk||!wv||!wo||!wg||!wp||!wmlpo||!wqn||!wkn)goto fail_block;
@@ -512,7 +527,9 @@ static int native_step(cuda_qimg_runner *r, qimg21_kernels *k, const qimg21_shar
          * deterministic on drivers that do not fully order external-stream
          * work behind a cuBLAS call. */
         cuCtxSynchronize();
-        probe(r,"block",hidden,N*D); if (qimg21_stage_block < 0 || bidx == qimg21_stage_block) { char label[32]; snprintf(label,sizeof(label),"block_%02d",bidx); dump_stage(label,hidden,(size_t)N*D,N,D); } free_d(&wq);free_d(&wk);free_d(&wv);free_d(&wo);free_d(&wg);free_d(&wp);free_d(&wmlpo);free_d(&wqn);free_d(&wkn); continue;
+        probe(r,"block",hidden,N*D); if (qimg21_stage_block < 0 || bidx == qimg21_stage_block) { char label[32]; snprintf(label,sizeof(label),"block_%02d",bidx); dump_stage(label,hidden,(size_t)N*D,N,D); } free_d(&wq);free_d(&wk);free_d(&wv);free_d(&wo);free_d(&wg);free_d(&wp);free_d(&wmlpo);free_d(&wqn);free_d(&wkn);
+        if(qimg21_replay_hidden){result=3;goto fail;} /* Never emit a model prediction from injected state. */
+        continue;
 fail_block: free_d(&wq);free_d(&wk);free_d(&wv);free_d(&wo);free_d(&wg);free_d(&wp);free_d(&wmlpo);free_d(&wqn);free_d(&wkn);goto fail;
     }
     w_img=upload_bf16(s,"norm_out.linear.weight");w_proj=upload_bf16(s,"proj_out.weight");if(!w_img||!w_proj)goto fail;
@@ -525,7 +542,8 @@ fail_block: free_d(&wq);free_d(&wk);free_d(&wv);free_d(&wo);free_d(&wg);free_d(&
     result = 0;
     goto done;
 fail:
-    fprintf(stderr,"native: transformer step failed\n");
+    if(result==3)fprintf(stderr,"native: diagnostic block replay complete; no prediction emitted (status 3)\n");
+    else fprintf(stderr,"native: transformer step failed\n");
 done:
     free_d(&rope_table);
     free_d(&txt);free_d(&img);free_d(&hidden);free_d(&tmp);free_d(&tmp2);free_d(&bf);free_d(&q);free_d(&kk);free_d(&v);free_d(&att);free_d(&mlp0);free_d(&mlp1);free_d(&mod);free_d(&temb);free_d(&time0);free_d(&timebf);free_d(&scale);free_d(&wt_norm);free_d(&wt_in);free_d(&wt_out);free_d(&wi);free_d(&w_t1);free_d(&w_t2);free_d(&w_mod);free_d(&w_img);free_d(&w_proj);
@@ -570,7 +588,7 @@ int main(int argc, char **argv) {
             else if (!strcmp(mode, "mma64")) {qimg21_attention_mma64=1;qimg21_attention_reverse64=0;}
             else if (!strcmp(mode, "mma64-flash")) {qimg21_attention_mma64=2;qimg21_attention_reverse64=0;}
             else if (!strcmp(mode, "mma64-mixed")) {qimg21_attention_mma64=3;qimg21_attention_reverse64=0;}
-            else { fprintf(stderr, "native: attention must be math, reverse64, or mma64\n"); return 2; }
+            else { fprintf(stderr, "native: attention must be math, reverse64, mma64, mma64-flash, or mma64-mixed\n"); return 2; }
         }
         else if (!strcmp(argv[i], "--prompt-embeds") && i + 1 < argc) prompt_path = argv[++i];
         else if (!strcmp(argv[i], "--negative-prompt-embeds") && i + 1 < argc) negative_prompt_path = argv[++i];
@@ -620,6 +638,16 @@ int main(int argc, char **argv) {
         fprintf(stderr, "native: optional row-INT8 weights, BF16 dequantized compute (quality unvalidated)\n");
     }
     qimg21_stage_dir = getenv("QIMG21_STAGE_DIR");
+    qimg21_replay_hidden = getenv("QIMG21_REPLAY_HIDDEN");
+    if(qimg21_replay_hidden) {
+        const char *block=getenv("QIMG21_STAGE_BLOCK");char *end=NULL;
+        long number=block?strtol(block,&end,10):-1;
+        if(!qimg21_stage_dir || !block || end==block || *end || number<0 || number>=32 ||
+           steps!=1 || !isfinite(manual_t) || manual_t<0 || manual_t>1 || negative_prompt_path) {
+            fprintf(stderr,"native: hidden replay requires stage directory, block 0..31, one manual-timestep step and no CFG\n");
+            return 2;
+        }
+    }
     if (qimg21_stage_dir) {
         const char *b = getenv("QIMG21_STAGE_BLOCK");
         if (b) qimg21_stage_block = atoi(b);
