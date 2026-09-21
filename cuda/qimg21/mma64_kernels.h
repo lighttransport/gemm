@@ -58,8 +58,10 @@ static const char *q21_mma64_src =
 "    float m_state[2] = {-1e30f, -1e30f};\n"
 "    float l_state[2] = {0.0f, 0.0f};\n"
 "\n"
-"    float qk_scale = rsqrtf((float)head_dim);\n"
-"    float scale_log2 = qk_scale * 1.4426950408889634f;\n"
+/* PyTorch constructs the scale on the host in double, then casts to float.
+ * GPU approximate rsqrtf(128) is one ULP lower on sm_120. */
+"    float qk_scale = (float)(1.0 / sqrt((double)head_dim));\n"
+"    float scale_log2 = (float)((double)qk_scale * 1.4426950408889634);\n"
 "#if Q21_FLASH_SOFTMAX\n"
 "    qk_scale = 1.f;\n"
 "#endif\n"

@@ -808,6 +808,30 @@ At 256 tokens it is 99.9720% (relative L2 6.0026e-5). Therefore the online
 rescaling recurrence is not the sole cause; the single-tile QK/softmax/PV
 path must also be examined. Results: `tmp/qimg21-attention-tile-matrix/results.json`.
 
+The subsequent **GPU** scale check found what the CPU-only comparison above
+missed: on sm_120, `rsqrtf(128)` returns `0x3db504f2`, one ULP below the
+host-computed float scale. `mma64_kernels.h` now constructs the inverse square
+root in double and casts to float, then computes the exp2 scale with a double
+intermediate, matching the reference's host setup. This changes all MMA64
+variants; the scalar `math` and original `reverse64` kernels are unchanged.
+With the correction, the Flash-style 32/64/68/132-token tile tests are
+bit-exact; only one element differs at 128 tokens and three at 256. On saved
+exact block-17 Q/K/V, target equality improves from 99.9718% to **99.9997%**
+and target relative L2 from 6.0919e-5 to **5.2386e-6**. Artifacts:
+`tmp/qimg21-attention-tile-host-scale/results.json` and
+`tmp/qimg21-exact-attention17/host_scale.json`.
+
+The 256x512/seed123 low-timestep full-denoiser prediction improves from
+0.999948668832 to **0.999951535120**, but still **fails** 0.99996. This uses
+`--attention mma64-flash --normalization vector4 --rope host-table-vector4`.
+Artifact: `tmp/qimg21-host-scale-rect-low`. The local correction is therefore
+not a full-model acceptance claim. The CPU suite remains 35/35 passing.
+The 512x512/seed7 final checkpoint likewise improves from 0.999948430099 to
+**0.999952904755**, still failing; see `tmp/qimg21-host-scale-512-low`.
+Using `mma64-mixed` with the corrected scale on the rectangular checkpoint
+instead gives **0.999947326171**, so switching the text branch to the current
+forward variant does not close the gap (`tmp/qimg21-host-scale-mixed-rect-low`).
+
 Replaying attention directly from the saved **PyTorch** block-17 Q/K/V removes
 native RMS/RoPE from the comparison. Flash-style MMA attention still differs:
 cosine 0.999999998275, relative L2 5.87e-5, elementwise equality 99.9712%
