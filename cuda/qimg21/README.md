@@ -258,6 +258,21 @@ key-validity mask, and `img_shapes` layout. This is preparatory work only:
 the native denoiser does not yet consume editing layouts, and native VAE
 encoding/vision-conditioned text encoding remain unimplemented.
 
+`prepare_edit_fixture.py` converts a captured editing call into a native-ready
+fixture without re-encoding or renormalizing its inputs:
+
+```sh
+tmp/qimg21-ref-venv/bin/python cuda/qimg21/prepare_edit_fixture.py \
+  --reference-dir CAPTURE_DIR --out-dir NEW_FIXTURE_DIR --step 0 --branch positive
+```
+
+It writes the packed condition/target latents separately, prompt embeddings,
+an exact timestep manifest, and `layout.txt` for `q21_layout_read`. It rejects
+padding, malformed image blocks, nonfinite/unrepresentable inputs, and existing
+output directories. Four additional CPU tests cover round-trip loading and
+failure cases (19 CPU tests pass in total). This is a fixture boundary, not
+native editing integration; its manifest explicitly marks editing unvalidated.
+
 `edit_kernels.h` adds experimental CUDA primitives for that layout:
 interleaved text/image scatter, Q/K RMSNorm plus layout-driven three-axis
 RoPE, and block-causal attention that keeps adjacent images separate.

@@ -5,6 +5,9 @@
 #define QIMG21_JOINT_LAYOUT_H
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
+#include <errno.h>
+#include <limits.h>
 
 typedef struct {
     int n, prefix, image_tokens;
@@ -78,5 +81,41 @@ fail:
 static int q21_layout_attention_allowed(const q21_joint_layout *layout, int query, int key) {
     if(query<0 || key<0 || query>=layout->n || key>=layout->n)return 0;
     return query>=key || (layout->image_id[query]>=0 && layout->image_id[query]==layout->image_id[key]);
+}
+
+static int q21_layout_integer(FILE *fp, int *value) {
+    char token[64], *end;
+    if(fscanf(fp,"%63s",token)!=1)return -1;
+    errno=0;
+    long number=strtol(token,&end,10);
+    if(errno || *end || number<INT_MIN || number>INT_MAX)return -1;
+    *value=(int)number;
+    return 0;
+}
+
+/* Wire format: slots text_slots images; slot mask; image (height,width)
+ * pairs. Frame count is implicitly one; final image is the target. */
+static int q21_layout_read(const char *path, q21_joint_layout *out,
+                          int *text_slots, int *target_height, int *target_width) {
+    memset(out,0,sizeof(*out));
+    FILE *fp=fopen(path,"r");
+    if(!fp)return -1;
+    int slots,nt,images,rc=-1;
+    int *mask=NULL,*height=NULL,*width=NULL;
+    if(q21_layout_integer(fp,&slots) || q21_layout_integer(fp,&nt) || q21_layout_integer(fp,&images) ||
+       slots<1 || slots>262144 || nt<0 || nt>=slots || images<1 || images>slots)goto done;
+    mask=malloc((size_t)slots*sizeof(int));
+    height=malloc((size_t)images*sizeof(int));width=malloc((size_t)images*sizeof(int));
+    if(!mask || !height || !width)goto done;
+    for(int i=0;i<slots;i++)if(q21_layout_integer(fp,&mask[i]))goto done;
+    for(int i=0;i<images;i++)if(q21_layout_integer(fp,&height[i]) || q21_layout_integer(fp,&width[i]))goto done;
+    char extra[2];
+    if(fscanf(fp,"%1s",extra)!=EOF || ferror(fp))goto done;
+    if(q21_layout_build(out,mask,slots,nt,height,width,images))goto done;
+    *text_slots=nt;*target_height=height[images-1];*target_width=width[images-1];
+    rc=0;
+done:
+    fclose(fp);free(mask);free(height);free(width);
+    return rc;
 }
 #endif
