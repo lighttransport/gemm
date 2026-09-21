@@ -16,6 +16,7 @@ import json
 import os
 import sys
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
@@ -55,9 +56,13 @@ def _save_array(path: Path, value) -> None:
     np.save(path, np.ascontiguousarray(np.asarray(value)))
 
 
-def _dump_prompt(pipe, prompt: str, out_dir: Path, image=None, negative_prompt: str | None = None) -> None:
+def _dump_prompt(pipe, prompt: str, out_dir: Path, image=None, negative_prompt: str | None = None,
+                 dump_text_stages: bool = False) -> None:
     torch = _torch()
-    with torch.inference_mode():
+    from text_capture import capture_text_encoder
+
+    with torch.inference_mode(), (capture_text_encoder(pipe, out_dir / "text_positive")
+                                  if dump_text_stages else nullcontext()):
         embeds, mask, image_mask = pipe.encode_prompt(
             prompt=prompt,
             image=image,
@@ -68,7 +73,8 @@ def _dump_prompt(pipe, prompt: str, out_dir: Path, image=None, negative_prompt: 
     _save_array(out_dir / "prompt_mask.npy", mask if mask is not None else np.ones(embeds.shape[:2], dtype=np.bool_))
     _save_array(out_dir / "image_pad_mask.npy", image_mask)
     if negative_prompt is not None:
-        with torch.inference_mode():
+        with torch.inference_mode(), (capture_text_encoder(pipe, out_dir / "text_negative")
+                                      if dump_text_stages else nullcontext()):
             negative_embeds, negative_mask, negative_image_mask = pipe.encode_prompt(
                 prompt=negative_prompt,
                 image=image,
@@ -181,6 +187,8 @@ def main() -> int:
     ap.add_argument("--dtype", choices=("bf16", "fp16"), default="bf16")
     ap.add_argument("--out", default="qwen_image21.png")
     ap.add_argument("--dump-dir")
+    ap.add_argument("--dump-text-stages", action="store_true",
+                    help="With --test-text, capture token IDs and pre-final-norm encoder states")
     ap.add_argument("--init-latents")
     ap.add_argument(
         "--dump-initial-latents",
@@ -200,7 +208,8 @@ def main() -> int:
                 raise SystemExit("--test-text requires --dump-dir")
             pipe = _load_pipe(Path(args.model).resolve(), args.dtype)
             image = Image.open(args.image) if args.image else None
-            _dump_prompt(pipe, args.prompt, Path(args.dump_dir), image, args.negative_prompt)
+            _dump_prompt(pipe, args.prompt, Path(args.dump_dir), image, args.negative_prompt,
+                         args.dump_text_stages)
             del pipe
             return 0
         pipe = _load_pipe(Path(args.model).resolve(), args.dtype)

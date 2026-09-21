@@ -177,6 +177,19 @@ text encoder output as an F32 `.npy` fixture; tokenisation and the Qwen3-VL
 text encoder remain at that Python boundary. The scheduler loop is native now,
 while the official Qwen-Image 2.1 VAE is used as a separate decode stage.
 
+For native text-encoder bring-up, `test_cuda_qimg21.py --test-text
+--dump-text-stages --dump-dir DIR` additionally records `text_positive/`
+(and `text_negative/` when requested). Each directory contains exact integer
+input IDs/masks, the full padded `hidden_prenorm.npy`, and `capture.json`
+with the system-prefix crop index. Compare before final RMSNorm: the official
+2.1 pipeline bypasses that normalization before extracting prompt embeddings.
+The existing generic Qwen3 CUDA loader is not a drop-in replacement: this
+checkpoint uses Qwen3-VL tensor names, 5,000,000 RoPE theta, and a pre-norm
+output boundary. A native streamed encoder remains to be implemented.
+The CPU fixture test is
+`tmp/qimg21-ref-venv/bin/python cuda/qimg21/test_text_capture.py`; it verifies
+integer preservation, pre-norm capture, unchanged outputs, and hook cleanup.
+
 For native true CFG, pass `--negative-prompt` and `--true-cfg-scale` to
 `native_generate.py` (the negative embedding is exported beside the positive
 fixture):
