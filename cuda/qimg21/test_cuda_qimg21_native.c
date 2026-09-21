@@ -25,6 +25,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include "edit_runtime.h"
 
 typedef struct {
     st_context *st[4];
@@ -356,8 +357,9 @@ static void probe(cuda_qimg_runner *r, const char *label, CUdeviceptr d, int n) 
 
 static int native_step(cuda_qimg_runner *r, qimg21_kernels *k, const qimg21_shards *s,
                        const float *prompt, int nt, const float *latent, int ni,
-                       int ih, int iw, float timestep, float *out) {
-    const int D=4096, HD=128, NH=32, N=nt+ni;
+                       int ih, int iw, float timestep, float *out, const q21_edit_context *edit) {
+    const int D=4096, HD=128, NH=32, N=edit?edit->layout.n:nt+ni;
+    const int prefix=edit?edit->layout.prefix:nt, nout=N-prefix;
     CUdeviceptr txt=0,img=0,hidden=0,tmp=0,tmp2=0,bf=0,q=0,kk=0,v=0,att=0,mlp0=0,mlp1=0,mod=0,temb=0,time0=0,timebf=0,scale=0;
     CUdeviceptr wt_norm=0,wt_in=0,wt_out=0,wi=0,w_t1=0,w_t2=0,w_mod=0,w_img=0,w_proj=0;
     int result = -1;
@@ -383,10 +385,13 @@ static int native_step(cuda_qimg_runner *r, qimg21_kernels *k, const qimg21_shar
     /* Save the completed text projection before reusing tmp for img_in.  The
      * preceding txt buffer is only GELU(in_layer(...)); the model consumes
      * out_layer(GELU(in_layer(...))). */
-    cuMemcpyDtoD(hidden, tmp, (size_t)nt*D*4); cuCtxSynchronize();
+    cuMemcpyDtoD(edit?txt:hidden, tmp, (size_t)nt*D*4); cuCtxSynchronize();
     if(launch_cast(r,bf,img,ni*64)!=CUDA_SUCCESS||gemm(r,tmp,wi,bf,ni,D,64)!=0||launch_vec(k->round_bf16,r->stream,ni*D,tmp)!=CUDA_SUCCESS)goto fail; probe(r,"img_proj",tmp,ni*D); dump_stage("img_proj",tmp,(size_t)ni*D,ni,D);
-    /* The joint sequence is [text, image]. */
-    cuMemcpyDtoD(hidden + (size_t)nt*D*4, tmp, (size_t)ni*D*4); cuCtxSynchronize();
+    if(edit) {
+        void *args[]={&hidden,&txt,&tmp,(void *)&edit->text_index,(void *)&edit->image_index,(void *)&N,(void *)&D};
+        if(cuLaunchKernel(edit->scatter,(N*D+255)/256,1,1,256,1,1,0,r->stream,args,NULL))goto fail;
+    } else cuMemcpyDtoD(hidden + (size_t)nt*D*4, tmp, (size_t)ni*D*4);
+    cuCtxSynchronize();
     probe(r,"hidden",hidden,N*D); dump_stage("hidden0",hidden,(size_t)N*D,N,D);
     /* Match the model's [real timestep, zero timestep] two-row GEMMs.
      * Single-row GEMV dispatch has different reduction/rounding behavior. */
@@ -418,17 +423,21 @@ static int native_step(cuda_qimg_runner *r, qimg21_kernels *k, const qimg21_shar
         char nm[128];
         snprintf(nm,sizeof(nm),"transformer_blocks.%d.attn.to_q.weight",bidx);CUdeviceptr wq=upload_bf16(s,nm);snprintf(nm,sizeof(nm),"transformer_blocks.%d.attn.to_k.weight",bidx);CUdeviceptr wk=upload_bf16(s,nm);snprintf(nm,sizeof(nm),"transformer_blocks.%d.attn.to_v.weight",bidx);CUdeviceptr wv=upload_bf16(s,nm);snprintf(nm,sizeof(nm),"transformer_blocks.%d.attn.to_out.0.weight",bidx);CUdeviceptr wo=upload_bf16(s,nm);snprintf(nm,sizeof(nm),"transformer_blocks.%d.img_mlp.gate_layer.weight",bidx);CUdeviceptr wg=upload_bf16(s,nm);snprintf(nm,sizeof(nm),"transformer_blocks.%d.img_mlp.proj.weight",bidx);CUdeviceptr wp=upload_bf16(s,nm);snprintf(nm,sizeof(nm),"transformer_blocks.%d.img_mlp.out.weight",bidx);CUdeviceptr wmlpo=upload_bf16(s,nm);snprintf(nm,sizeof(nm),"transformer_blocks.%d.attn.norm_q.weight",bidx);CUdeviceptr wqn=upload_f32(s,nm);snprintf(nm,sizeof(nm),"transformer_blocks.%d.attn.norm_k.weight",bidx);CUdeviceptr wkn=upload_f32(s,nm);
         if(!wq||!wk||!wv||!wo||!wg||!wp||!wmlpo||!wqn||!wkn)goto fail_block;
-        void *a1[]={&tmp,&hidden,&mod,&N,&D,&nt,&(int){0}}; cuLaunchKernel(k->mod_ln,N,1,1,256,1,1,256*sizeof(float),r->stream,a1,NULL); cuCtxSynchronize(); if (launch_vec(k->round_bf16,r->stream,N*D,tmp)!=CUDA_SUCCESS) goto fail_block; probe(r,"mod_ln",tmp,N*D); if (qimg21_stage_block < 0 || bidx == qimg21_stage_block) dump_stage("mod_ln",tmp,(size_t)N*D,N,D); if(launch_cast(r,bf,tmp,N*D)!=CUDA_SUCCESS)goto fail_block;
+        void *a1[]={&tmp,&hidden,&mod,&N,&D,&prefix,&(int){0}}; cuLaunchKernel(k->mod_ln,N,1,1,256,1,1,256*sizeof(float),r->stream,a1,NULL); cuCtxSynchronize(); if (launch_vec(k->round_bf16,r->stream,N*D,tmp)!=CUDA_SUCCESS) goto fail_block; probe(r,"mod_ln",tmp,N*D); if (qimg21_stage_block < 0 || bidx == qimg21_stage_block) dump_stage("mod_ln",tmp,(size_t)N*D,N,D); if(launch_cast(r,bf,tmp,N*D)!=CUDA_SUCCESS)goto fail_block;
         if(gemm(r,q,wq,bf,N,D,D)!=0||gemm(r,kk,wk,bf,N,D,D)!=0||gemm(r,v,wv,bf,N,D,D)!=0||launch_vec(k->round_bf16,r->stream,N*D,q)!=CUDA_SUCCESS||launch_vec(k->round_bf16,r->stream,N*D,kk)!=CUDA_SUCCESS||launch_vec(k->round_bf16,r->stream,N*D,v)!=CUDA_SUCCESS)goto fail_block; probe(r,"q",q,N*D); probe(r,"v",v,N*D); if (qimg21_stage_block < 0 || bidx == qimg21_stage_block) { dump_stage("q",q,(size_t)N*D,N,D); dump_stage("v",v,(size_t)N*D,N,D); }
-        void *ar[]={&q,&kk,&wqn,&wkn,&N,&D,&NH,&HD,&nt,&ih,&iw}; cuLaunchKernel(k->qk_rope,N,NH,1,HD,1,1,0,r->stream,ar,NULL); cuCtxSynchronize(); if (launch_vec(k->round_bf16,r->stream,N*D,q)!=CUDA_SUCCESS||launch_vec(k->round_bf16,r->stream,N*D,kk)!=CUDA_SUCCESS) goto fail_block; probe(r,"rope_q",q,N*D);
+        if(edit) { void *ar[]={&q,&kk,&wqn,&wkn,(void *)&edit->position,(void *)&N,(void *)&NH}; if(cuLaunchKernel(edit->rope,N,NH,1,HD,1,1,0,r->stream,ar,NULL))goto fail_block; }
+        else { void *ar[]={&q,&kk,&wqn,&wkn,&N,&D,&NH,&HD,&nt,&ih,&iw}; cuLaunchKernel(k->qk_rope,N,NH,1,HD,1,1,0,r->stream,ar,NULL); }
+        cuCtxSynchronize(); if (launch_vec(k->round_bf16,r->stream,N*D,q)!=CUDA_SUCCESS||launch_vec(k->round_bf16,r->stream,N*D,kk)!=CUDA_SUCCESS) goto fail_block; probe(r,"rope_q",q,N*D);
         if (qimg21_stage_dir && (qimg21_stage_block < 0 || bidx == qimg21_stage_block)) {
             dump_stage("rope_q",q,(size_t)N*D,N,D);
             dump_stage("rope_k",kk,(size_t)N*D,N,D);
         }
-        void *aa[]={&att,&q,&kk,&v,&N,&nt,&NH,&HD};cuLaunchKernel(k->attn,NH,(N+3)/4,1,128,1,1,2*32*128*sizeof(float),r->stream,aa,NULL);cuCtxSynchronize(); if (launch_vec(k->round_bf16,r->stream,N*D,att)!=CUDA_SUCCESS) goto fail_block; probe(r,"attn",att,N*D); if (qimg21_stage_block < 0 || bidx == qimg21_stage_block) dump_stage("attn_raw",att,(size_t)N*D,N,D); if(launch_cast(r,bf,att,N*D)!=CUDA_SUCCESS||gemm(r,tmp,wo,bf,N,D,D)!=0||launch_vec(k->round_bf16,r->stream,N*D,tmp)!=CUDA_SUCCESS)goto fail_block; probe(r,"attn_out",tmp,N*D); if (qimg21_stage_block < 0 || bidx == qimg21_stage_block) dump_stage("attn_out",tmp,(size_t)N*D,N,D);
-        void *ag[]={&hidden,&tmp,&mod,&N,&D,&nt,&(int){0}};cuLaunchKernel(k->gate_res,(N*D+255)/256,1,1,256,1,1,0,r->stream,ag,NULL);cuCtxSynchronize(); if (launch_vec(k->round_bf16,r->stream,N*D,hidden)!=CUDA_SUCCESS) goto fail_block;
-        void *a2[]={&tmp,&hidden,&mod,&N,&D,&nt,&(int){1}};cuLaunchKernel(k->mod_ln,N,1,1,256,1,1,256*sizeof(float),r->stream,a2,NULL);cuCtxSynchronize(); if (launch_vec(k->round_bf16,r->stream,N*D,tmp)!=CUDA_SUCCESS) goto fail_block; if (qimg21_stage_block < 0 || bidx == qimg21_stage_block) dump_stage("mod_ln2",tmp,(size_t)N*D,N,D); if(launch_cast(r,bf,tmp,N*D)!=CUDA_SUCCESS)goto fail_block;
-        if(gemm(r,mlp0,wg,bf,N,12288,D)!=0||gemm(r,mlp1,wp,bf,N,12288,D)!=0||launch_vec(k->round_bf16,r->stream,N*12288,mlp0)!=CUDA_SUCCESS||launch_vec(k->round_bf16,r->stream,N*12288,mlp1)!=CUDA_SUCCESS)goto fail_block; if (qimg21_stage_block < 0 || bidx == qimg21_stage_block) { dump_stage("mlp_gate",mlp0,(size_t)N*12288,N,12288); dump_stage("mlp_proj",mlp1,(size_t)N*12288,N,12288); } void *am[]={&tmp, &mlp0,&mlp1,&(int){N*12288}};cuLaunchKernel(k->mul_silu,(N*12288+255)/256,1,1,256,1,1,0,r->stream,am,NULL);cuCtxSynchronize(); if (launch_vec(k->round_bf16,r->stream,N*12288,tmp)!=CUDA_SUCCESS) goto fail_block; if (qimg21_stage_block < 0 || bidx == qimg21_stage_block) dump_stage("mlp_act",tmp,(size_t)N*12288,N,12288); if(launch_cast(r,bf,tmp,N*12288)!=CUDA_SUCCESS||gemm(r,tmp,wmlpo,bf,N,D,12288)!=0||launch_vec(k->round_bf16,r->stream,N*D,tmp)!=CUDA_SUCCESS)goto fail_block; if (qimg21_stage_block < 0 || bidx == qimg21_stage_block) dump_stage("mlp_out",tmp,(size_t)N*D,N,D); void *ag2[]={&hidden,&tmp,&mod,&N,&D,&nt,&(int){1}};cuLaunchKernel(k->gate_res,(N*D+255)/256,1,1,256,1,1,0,r->stream,ag2,NULL);cuCtxSynchronize(); if (launch_vec(k->round_bf16,r->stream,N*D,hidden)!=CUDA_SUCCESS) goto fail_block;
+        if(edit) { void *aa[]={&att,&q,&kk,&v,(void *)&edit->image_id,(void *)&N,(void *)&NH}; if(cuLaunchKernel(edit->attention,NH,N,1,32,1,1,0,r->stream,aa,NULL))goto fail_block; }
+        else { void *aa[]={&att,&q,&kk,&v,&N,&nt,&NH,&HD};cuLaunchKernel(k->attn,NH,(N+3)/4,1,128,1,1,2*32*128*sizeof(float),r->stream,aa,NULL); }
+        cuCtxSynchronize(); if (launch_vec(k->round_bf16,r->stream,N*D,att)!=CUDA_SUCCESS) goto fail_block; probe(r,"attn",att,N*D); if (qimg21_stage_block < 0 || bidx == qimg21_stage_block) dump_stage("attn_raw",att,(size_t)N*D,N,D); if(launch_cast(r,bf,att,N*D)!=CUDA_SUCCESS||gemm(r,tmp,wo,bf,N,D,D)!=0||launch_vec(k->round_bf16,r->stream,N*D,tmp)!=CUDA_SUCCESS)goto fail_block; probe(r,"attn_out",tmp,N*D); if (qimg21_stage_block < 0 || bidx == qimg21_stage_block) dump_stage("attn_out",tmp,(size_t)N*D,N,D);
+        void *ag[]={&hidden,&tmp,&mod,&N,&D,&prefix,&(int){0}};cuLaunchKernel(k->gate_res,(N*D+255)/256,1,1,256,1,1,0,r->stream,ag,NULL);cuCtxSynchronize(); if (launch_vec(k->round_bf16,r->stream,N*D,hidden)!=CUDA_SUCCESS) goto fail_block;
+        void *a2[]={&tmp,&hidden,&mod,&N,&D,&prefix,&(int){1}};cuLaunchKernel(k->mod_ln,N,1,1,256,1,1,256*sizeof(float),r->stream,a2,NULL);cuCtxSynchronize(); if (launch_vec(k->round_bf16,r->stream,N*D,tmp)!=CUDA_SUCCESS) goto fail_block; if (qimg21_stage_block < 0 || bidx == qimg21_stage_block) dump_stage("mod_ln2",tmp,(size_t)N*D,N,D); if(launch_cast(r,bf,tmp,N*D)!=CUDA_SUCCESS)goto fail_block;
+        if(gemm(r,mlp0,wg,bf,N,12288,D)!=0||gemm(r,mlp1,wp,bf,N,12288,D)!=0||launch_vec(k->round_bf16,r->stream,N*12288,mlp0)!=CUDA_SUCCESS||launch_vec(k->round_bf16,r->stream,N*12288,mlp1)!=CUDA_SUCCESS)goto fail_block; if (qimg21_stage_block < 0 || bidx == qimg21_stage_block) { dump_stage("mlp_gate",mlp0,(size_t)N*12288,N,12288); dump_stage("mlp_proj",mlp1,(size_t)N*12288,N,12288); } void *am[]={&tmp, &mlp0,&mlp1,&(int){N*12288}};cuLaunchKernel(k->mul_silu,(N*12288+255)/256,1,1,256,1,1,0,r->stream,am,NULL);cuCtxSynchronize(); if (launch_vec(k->round_bf16,r->stream,N*12288,tmp)!=CUDA_SUCCESS) goto fail_block; if (qimg21_stage_block < 0 || bidx == qimg21_stage_block) dump_stage("mlp_act",tmp,(size_t)N*12288,N,12288); if(launch_cast(r,bf,tmp,N*12288)!=CUDA_SUCCESS||gemm(r,tmp,wmlpo,bf,N,D,12288)!=0||launch_vec(k->round_bf16,r->stream,N*D,tmp)!=CUDA_SUCCESS)goto fail_block; if (qimg21_stage_block < 0 || bidx == qimg21_stage_block) dump_stage("mlp_out",tmp,(size_t)N*D,N,D); void *ag2[]={&hidden,&tmp,&mod,&N,&D,&prefix,&(int){1}};cuLaunchKernel(k->gate_res,(N*D+255)/256,1,1,256,1,1,0,r->stream,ag2,NULL);cuCtxSynchronize(); if (launch_vec(k->round_bf16,r->stream,N*D,hidden)!=CUDA_SUCCESS) goto fail_block;
         /* The block owns streamed weight allocations.  Synchronize before
          * releasing them; this also makes the custom-kernel/cuBLAS hand-off
          * deterministic on drivers that do not fully order external-stream
@@ -442,8 +451,8 @@ fail_block: free_d(&wq);free_d(&wk);free_d(&wv);free_d(&wo);free_d(&wg);free_d(&
     if(launch_vec(k->silu,r->stream,2*D,temb)!=CUDA_SUCCESS||launch_vec(k->round_bf16,r->stream,2*D,temb)!=CUDA_SUCCESS||launch_cast(r,bf,temb,2*D)!=CUDA_SUCCESS||gemm(r,scale,w_img,bf,2,D,D)!=0||launch_vec(k->round_bf16,r->stream,2*D,scale)!=CUDA_SUCCESS)goto fail;
     dump_stage("final_hidden",hidden,(size_t)N*D,N,D);
     dump_stage("final_scale",scale,2u*D,2,D);
-    {void *a[]={&tmp,&hidden,&scale,&N,&D,&nt};cuLaunchKernel(k->final_ln,N,1,1,256,1,1,256*sizeof(double),r->stream,a,NULL);cuCtxSynchronize(); if (launch_vec(k->round_bf16,r->stream,N*D,tmp)!=CUDA_SUCCESS) goto fail; dump_stage("final_ln",tmp,(size_t)N*D,N,D);}
-    {CUdeviceptr dout=checked_cuMemAlloc((size_t)ni*64*4);if(!dout)goto fail;if(launch_cast(r,bf,tmp+(size_t)nt*D*4,ni*D)!=CUDA_SUCCESS){free_d(&dout);goto fail;} void *pa[]={&dout,&w_proj,&bf,&ni,&(int){64},&D}; if (cuLaunchKernel(k->proj,(ni*64+255)/256,1,1,256,1,1,0,r->stream,pa,NULL)!=CUDA_SUCCESS || launch_vec(k->round_bf16,r->stream,ni*64,dout)!=CUDA_SUCCESS){free_d(&dout);goto fail;}cuCtxSynchronize();cuMemcpyDtoH(out,dout,(size_t)ni*64*4); dump_stage("out",dout,(size_t)ni*64,ni,64);free_d(&dout);}
+    {void *a[]={&tmp,&hidden,&scale,&N,&D,&prefix};cuLaunchKernel(k->final_ln,N,1,1,256,1,1,256*sizeof(double),r->stream,a,NULL);cuCtxSynchronize(); if (launch_vec(k->round_bf16,r->stream,N*D,tmp)!=CUDA_SUCCESS) goto fail; dump_stage("final_ln",tmp,(size_t)N*D,N,D);}
+    {CUdeviceptr dout=checked_cuMemAlloc((size_t)nout*64*4);if(!dout)goto fail;if(launch_cast(r,bf,tmp+(size_t)prefix*D*4,nout*D)!=CUDA_SUCCESS){free_d(&dout);goto fail;} void *pa[]={&dout,&w_proj,&bf,&nout,&(int){64},&D}; if (cuLaunchKernel(k->proj,(nout*64+255)/256,1,1,256,1,1,0,r->stream,pa,NULL)!=CUDA_SUCCESS || launch_vec(k->round_bf16,r->stream,nout*64,dout)!=CUDA_SUCCESS){free_d(&dout);goto fail;}cuCtxSynchronize();cuMemcpyDtoH(out,dout,(size_t)nout*64*4); dump_stage("out",dout,(size_t)nout*64,nout,64);free_d(&dout);}
     result = 0;
     goto done;
 fail:
@@ -457,6 +466,7 @@ done:
 int main(int argc, char **argv) {
     const char *model = NULL, *prompt_path = NULL, *latent_path = NULL;
     const char *negative_prompt_path = NULL;
+    const char *editing_layout_path = NULL, *condition_path = NULL;
     const char *out_path = "native_latents.npy", *dump_dir = NULL, *pred_dir = NULL;
     int ih = 16, iw = 16, steps = 1, verbose = 1;
     float guidance_scale = 1.0f;
@@ -478,6 +488,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--negative-prompt-embeds") && i + 1 < argc) negative_prompt_path = argv[++i];
         else if (!strcmp(argv[i], "--guidance-scale") && i + 1 < argc) guidance_scale = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--latents") && i + 1 < argc) latent_path = argv[++i];
+        else if (!strcmp(argv[i], "--editing-layout") && i + 1 < argc) editing_layout_path = argv[++i];
+        else if (!strcmp(argv[i], "--condition-latents") && i + 1 < argc) condition_path = argv[++i];
         else if (!strcmp(argv[i], "--out") && i + 1 < argc) out_path = argv[++i];
         else if (!strcmp(argv[i], "--dump-dir") && i + 1 < argc) dump_dir = argv[++i];
         else if (!strcmp(argv[i], "--pred-dir") && i + 1 < argc) pred_dir = argv[++i];
@@ -490,12 +502,18 @@ int main(int argc, char **argv) {
         else {
             fprintf(stderr, "usage: %s --model DIR --prompt-embeds E.npy --latents L.npy "
                     "[--negative-prompt-embeds NEG.npy --guidance-scale S] "
+                    "[--editing-layout layout.txt --condition-latents C.npy] "
                     "[--steps N --dump-dir DIR --pred-dir DIR --height-tokens 16 --width-tokens 16 "
                     "--timestep .5 --out O.npy --verbose]\n", argv[0]);
             return 2;
         }
     }
     if (steps < 1 || steps > 100 || (manual_t >= 0.0f && steps != 1)) return 2;
+    if (!!editing_layout_path != !!condition_path ||
+        (editing_layout_path && (negative_prompt_path || qimg21_attention_reverse64))) {
+        fprintf(stderr,"native: editing requires layout plus condition latents; CFG/reverse64 editing not yet supported\n");
+        return 2;
+    }
     if (qimg21_quantize_on_load && qimg21_quantized_transformer) {
         fprintf(stderr,"native: choose a quantized package or quantize-on-load, not both\n"); return 2;
     }
@@ -516,7 +534,7 @@ int main(int argc, char **argv) {
         if (b) qimg21_stage_block = atoi(b);
         mkdir(qimg21_stage_dir, 0755);
     }
-    if(!model||!prompt_path||!latent_path||ih*iw<=0)return 2;
+    if(!model||!prompt_path||!latent_path||ih<1||iw<1||ih>1024||iw>1024)return 2;
     npy_f32 pe,neg,la; memset(&neg,0,sizeof(neg));
     if(npy_read_f32(prompt_path,&pe)!=0||npy_read_f32(latent_path,&la)!=0)return 1;
     if (negative_prompt_path && npy_read_f32(negative_prompt_path, &neg) != 0) { npy_free(&pe); npy_free(&la); return 1; }
@@ -528,7 +546,26 @@ int main(int argc, char **argv) {
         npy_free(&pe); npy_free(&neg); npy_free(&la); return 1;
     }
     if (negative_prompt_path && guidance_scale <= 1.0f) { fprintf(stderr,"native: guidance-scale must be > 1 with negative embeds\n"); npy_free(&pe); npy_free(&neg); npy_free(&la); return 1; }
+    npy_f32 condition={0};
+    float *packed=NULL;
+    int nc=0;
+    if(condition_path) {
+        if(npy_read_f32(condition_path,&condition))return 1;
+        nc=(condition.ndim==3&&condition.shape[0]==1)?(int)condition.shape[1]:
+           (condition.ndim==2?(int)condition.shape[0]:0);
+        if(nc<1 || nc>1048576-ni || condition.shape[condition.ndim-1]!=64)return 2;
+        for(size_t j=0;j<(size_t)nc*64;j++)if(!isfinite(condition.data[j]))return 2;
+        for(size_t j=0;j<(size_t)ni*64;j++)if(!isfinite(la.data[j]))return 2;
+        for(size_t j=0;j<(size_t)nt*4096;j++)if(!isfinite(pe.data[j]))return 2;
+        packed=malloc((size_t)(nc+ni)*64*sizeof(float));
+        if(!packed)return 1;
+        memcpy(packed,condition.data,(size_t)nc*64*sizeof(float));
+    }
     const float *p=pe.data; cuda_qimg_runner*r=cuda_qimg_init(0,verbose);if(!r)return 1;
+    q21_edit_context edit={0};
+    if(editing_layout_path && q21_edit_init(&edit,r,editing_layout_path,nt,nc+ni,ih,iw)) {
+        cuda_qimg_free(r);free(packed);npy_free(&condition);return 1;
+    }
     qimg21_shards s={{0},0};char path[1024];for(int i=1;i<=2;i++){snprintf(path,sizeof(path),"%s/transformer/diffusion_pytorch_model-%05d-of-00002.safetensors",model,i);s.st[s.n]=safetensors_open(path);if(!s.st[s.n]){fprintf(stderr,"native: cannot open %s\n",path);cuda_qimg_free(r);return 1;}fprintf(stderr,"native: opened shard %d (%d tensors)\n",i,s.st[s.n]->n_tensors);s.n++;}
     qimg21_kernels k;CUmodule m;if(cu_compile_kernels(&m,r->device,qimg21_src,"qimg21_native.cu",verbose,"qimg21_native")<0||get_kernel(&k,m)!=0){fprintf(stderr,"native: custom kernel compile failed\n");return 1;}fprintf(stderr,"native: custom kernels ready\n");
     if (dump_dir) mkdir(dump_dir, 0755);
@@ -547,9 +584,11 @@ int main(int argc, char **argv) {
          * then divides by 1000 in BF16 before calling the transformer. */
         float model_t=manual_t>=0.0f ? manual_t :
             qimg21_round_bf16_host(qimg21_round_bf16_host(sigmas[i]*1000.0f)/1000.0f);
-        rc = native_step(r, &k, &s, p, nt, la.data, ni, ih, iw, model_t, pred);
+        if(packed)memcpy(packed+(size_t)nc*64,la.data,(size_t)ni*64*sizeof(float));
+        rc = native_step(r, &k, &s, p, nt, packed?packed:la.data, nc+ni, ih, iw, model_t, pred,
+                         editing_layout_path?&edit:NULL);
         if (rc == 0 && negative_prompt_path) {
-            rc = native_step(r, &k, &s, neg.data, nnt, la.data, ni, ih, iw, model_t, neg_pred);
+            rc = native_step(r, &k, &s, neg.data, nnt, la.data, ni, ih, iw, model_t, neg_pred, NULL);
             if (rc == 0) for (size_t j = 0; j < (size_t)ni * 64; j++) {
                 float difference=qimg21_round_bf16_host(pred[j]-neg_pred[j]);
                 float guided=qimg21_round_bf16_host(guidance_scale*difference);
@@ -574,5 +613,6 @@ int main(int argc, char **argv) {
         fprintf(stderr, "native: wrote %s (%d tokens x 64, %d steps)\n", out_path, ni, steps);
     }
     free(pred); free(neg_pred); free(sigmas); cuModuleUnload(m); for(int i=0;i<s.n;i++)safetensors_close(s.st[i]);
+    q21_edit_free(&edit);free(packed);npy_free(&condition);
     cuda_qimg_free(r); npy_free(&pe); npy_free(&neg); npy_free(&la); return rc;
 }

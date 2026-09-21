@@ -1,5 +1,6 @@
-/* Native editing primitives. Host-side joint_layout.h validates every map.
- * Kept separate during bring-up; not yet selected by the denoiser runner. */
+#ifndef QIMG21_EDIT_KERNELS_H
+#define QIMG21_EDIT_KERNELS_H
+/* Native editing primitives. Host-side joint_layout.h validates every map. */
 static const char *q21_edit_src =
 "extern \"C\" {\n"
 "__device__ float edit_rb(float x){unsigned u=__float_as_uint(x);return __uint_as_float((u+0x7fff+((u>>16)&1))&0xffff0000);}\n"
@@ -32,3 +33,4 @@ static const char *q21_edit_src =
 " for(int e=0;e<4;e++)y[t*D+h*128+l*4+e]=edit_rb(out[e]/sum);\n"
 "}\n"
 "}\n";
+#endif

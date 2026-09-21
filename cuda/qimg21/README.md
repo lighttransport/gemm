@@ -286,8 +286,8 @@ OMP_NUM_THREADS=2 tmp/qimg21-ref-venv/bin/python cuda/qimg21/test_joint_layout.p
 ```
 
 Reference prediction captures also save each CFG branch's `img_mask`, text
-key-validity mask, and `img_shapes` layout. This is preparatory work only:
-the native denoiser does not yet consume editing layouts, and native VAE
+key-validity mask, and `img_shapes` layout. An omitted official key mask is
+captured as all-valid, matching the transformer semantics. Native VAE
 encoding/vision-conditioned text encoding remain unimplemented.
 
 `prepare_edit_fixture.py` converts a captured editing call into a native-ready
@@ -302,14 +302,38 @@ It writes the packed condition/target latents separately, prompt embeddings,
 an exact timestep manifest, and `layout.txt` for `q21_layout_read`. It rejects
 padding, malformed image blocks, nonfinite/unrepresentable inputs, and existing
 output directories. Four additional CPU tests cover round-trip loading and
-failure cases (19 CPU tests pass in total). This is a fixture boundary, not
-native editing integration; its manifest explicitly marks editing unvalidated.
+failure cases. Its manifest explicitly marks editing unvalidated.
+
+The native denoiser now accepts `--editing-layout layout.txt` together with
+`--condition-latents condition_latents.npy`, while `--latents` contains only
+the target latents. It assembles interleaved text/image tokens, applies the
+zero-timestep modulation to the condition prefix, predicts only the target
+tail, and leaves condition latents unchanged through Euler steps. The default
+text-to-image path is unchanged. Editing currently rejects CFG and reverse64
+attention; each requires separate layout-aware validation. This is experimental:
+the first full-model editing prediction (256x256 target, 1024x1024 condition,
+seed42, captured timestep 1) is finite with cosine **0.999932378** and relative
+L2 **0.011906675**. It **fails** the 0.99996 gate. A mid-run total GPU-memory
+snapshot was 5201 MiB; this is not a measured peak. All 20 CPU tests pass.
+
+```sh
+cuda/qimg21/test_cuda_qimg21_native --model /mnt/nvme01/models/qimg-21 \
+  --prompt-embeds FIXTURE/prompt_embeds.npy --latents FIXTURE/target_latents.npy \
+  --condition-latents FIXTURE/condition_latents.npy --editing-layout FIXTURE/layout.txt \
+  --height-tokens 16 --width-tokens 16 --steps 1 --timestep 1 \
+  --pred-dir NEW_PRED_DIR --out NEW_PRED_DIR/latents.npy
+```
+
+Use the exact captured timestep, not a guessed value. The installed official
+one-step editing scheduler produced nonfinite output; two-step capture is
+used instead. A native `--steps 1 --timestep T` call above is a matched-input
+prediction diagnostic, not the official one-step generation trajectory.
 
 `edit_kernels.h` adds experimental CUDA primitives for that layout:
 interleaved text/image scatter, Q/K RMSNorm plus layout-driven three-axis
 RoPE, and block-causal attention that keeps adjacent images separate.
-They are not selected by the denoiser yet. A synthetic, checkpoint-free
-GPU comparison is available:
+They are selected only by the explicit editing-layout path. A synthetic,
+checkpoint-free GPU comparison is available:
 
 ```sh
 make -C cuda/qimg21 test_edit_kernels
@@ -436,9 +460,9 @@ tmp/qimg21-ref-venv/bin/python cuda/qimg21/test_cuda_qimg21.py \
   --steps 40 --out tmp/qimg21-edit.png
 ```
 
-Editing remains a Python baseline: native condition-image tokens and the VAE
-image-conditioning hand-off still need to be ported and accepted against the
-same checkpoint gate. Row-INT8 native weights now have bounded text-to-image
+Editing remains an experimental fixture-driven native path: full-model parity
+and the native VAE/image-conditioned text hand-off still need to be accepted
+against the same checkpoint gate. Row-INT8 native weights now have bounded text-to-image
 calibration at the separate `0.999` gate above; quantized editing remains
 unvalidated.
 

@@ -70,6 +70,11 @@ def main() -> int:
                 branch = "negative" if is_negative else "positive"
                 for key in ("img_mask", "encoder_hidden_states_mask"):
                     value = kwargs.get(key)
+                    # An absent key mask means every text key is valid.
+                    # Persist that semantic value so native fixtures need
+                    # not guess whether a missing file means no padding.
+                    if key == "encoder_hidden_states_mask" and value is None:
+                        value = torch.ones(embeds.shape[:2], dtype=torch.bool)
                     if value is not None:
                         np.save(pred_dir / f"{branch}_{key}.npy", value.detach().cpu().numpy())
                 shapes = kwargs.get("img_shapes")
