@@ -22,6 +22,10 @@ test_cuda_qimg21_vae: test_cuda_qimg21_vae.c ../../cuda/cuew.c ../../cuda/cublas
 
 native-vae: test_cuda_qimg21_vae
 
+test_weight_upload: test_weight_upload.c test_cuda_qimg21_native.c ../../cuda/cuew.c ../../cuda/cublasew.c
+	$(CC) -O2 -std=c11 -D_GNU_SOURCE -Wall -Wextra -I../../common -I../../cuda -I../qimg \
+		-o $@ test_weight_upload.c ../../cuda/cuew.c ../../cuda/cublasew.c -ldl -lm -lpthread
+
 setup:
 	./setup_reference.sh
 
@@ -42,4 +46,4 @@ regress:
 	$(PYTHON) regression.py --model /mnt/nvme01/models/qimg-21
 
 clean:
-	rm -f test_cuda_qimg21 test_cuda_qimg21_native test_cuda_qimg21_vae qwen_image21.png
+	rm -f test_cuda_qimg21 test_cuda_qimg21_native test_cuda_qimg21_vae test_weight_upload qwen_image21.png

@@ -40,6 +40,25 @@ calibration set establishes a tighter measured threshold. Use
 The regression driver also records `initial_latents.npy`, preserving the exact
 PyTorch-packed noise input for native denoiser comparisons.
 
+Current native BF16 arithmetic explicitly rounds the text projection before
+GELU and Q/K normalization before multiplication by the learned RMS weights.
+On the saved 256x256/seed42 two-step reference, matched-input denoiser cosine
+is 0.999985586 at timestep 1 and 0.999948850 at timestep 0.02001953125.
+The latter **fails** the 0.99996 acceptance gate; full native parity remains
+unfinished. These are direct denoiser comparisons, not free-running trajectory
+or end-to-end quality guarantees.
+
+The F32-to-BF16 weight loader also has a guarded-memory regression:
+
+```sh
+make -C cuda/qimg21 test_weight_upload
+./cuda/qimg21/test_weight_upload
+```
+
+It checks both input dtypes and BF16 ties-to-even conversion. F32 element
+counts must use four bytes per element; using the BF16 divisor reads past
+the source tensor, which the guard page detects.
+
 Run the deterministic smoke matrix with:
 
 ```sh
