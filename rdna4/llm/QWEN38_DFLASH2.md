@@ -286,7 +286,19 @@ shared-K/V graph sustains 39.89--39.93 tok/s, with 443.45--444.22 tok/s
 prefill, prefix hash `90178de69a24a76e`, and current exact suffix hash
 `1c68ea2ff63ba5ab`.  All runs drafted 289 tokens and accepted 213; the final
 draft/verify/commit range was 532.352--533.268 / 5818.192--5821.733 /
-60.532--62.229 ms.  The remaining measured gap to 40 tok/s is about 0.2%.
+60.532--62.229 ms.  This is the pre-retune 16-split sidecar baseline; the
+eight-split sidecar result below clears 40 tok/s with the same exact hashes.
+
+The DFlash2 draft attention window now uses eight splits once its 2,048-token
+window is at least half full (shorter windows retain the existing 1/4-split
+schedule).  This is separate from the target verifier's adaptive split
+selector.  On the same random-token 64K K=7 gate, the exact target suffix hash
+remained `1c68ea2ff63ba5ab` and the prefix hash remained
+`90178de69a24a76e`; decode rose from the matched 16-split baseline of 39.91
+tok/s to 41.01 tok/s.  The run drafted 289 and accepted 213, with
+561.610/5617.379/62.382 ms draft/verify/commit.  A matched 4K K=7 run kept
+the `15f17d2640c1adfc` output hash.  The target verifier and its captured graph
+ABI are unchanged; only the sidecar proposal attention launch is retuned.
 
 The tested sidecar is
 `Qwen3.8-27B-DFlash2-Q4_K_M.gguf`, SHA-256
@@ -471,7 +483,9 @@ reflects the remaining measured costs.
    noise.
 5. **Remaining draft cost.** Top-k and selector decisions already run on the
    GPU, and packed Q4_K/Q8_1 projections cut draft work substantially.  The
-   current exact 64K suffix spends about 533 ms in the drafter.
+   current exact 64K suffix spends about 562 ms in the drafter after the
+   eight-split sidecar attention change; projection and selector work remain
+   the material cost.
    Position-parallel attention and
    cheaper draft-cache storage are the next candidates, provided K=4/K=7
    acceptance and authoritative output remain stable.

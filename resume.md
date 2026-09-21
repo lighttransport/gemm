@@ -222,6 +222,16 @@ accepted tokens, and 443.45--444.22 tok/s prefill.  The 4K K=7 gate retains
 greedy hash at 59.75 tok/s.  The sampled output, token, and full-logit SHA-256
 values remain pinned.
 
+On 2026-09-22 the DFlash2 sidecar attention schedule was retuned independently
+of the target verifier: a full 2,048-token draft window now uses eight splits
+instead of sixteen, while shorter windows keep the existing 1/4-split policy.
+The exact random-token 64K K=7 gate retained prefix hash
+`90178de69a24a76e` and suffix hash `1c68ea2ff63ba5ab`, drafted 289 and
+accepted 213, and improved from 39.91 tok/s to 41.01 tok/s.  The matched 4K
+K=7 run retained hash `15f17d2640c1adfc`.  This changes only the sidecar draft
+attention launch; target verifier arithmetic, graph ABI, and authoritative
+output remain unchanged.
+
 The host-side verifier split selector now mirrors the native Q8 kernel's
 64-split cap for the 64K--<96K window.  This prevents a shared captured graph
 from crossing the 96K transition with a stale 128-split assumption; the
@@ -235,7 +245,8 @@ per-thread verifier length arrays were also moved to LDS to test whether the
 eight-query accumulator was register-bound.  That variant kept the random-64K
 prefix/suffix hashes exact and raised prefill to 445.21 tok/s, but verifier
 time rose to 5927.105 ms and decode fell to 39.26 tok/s, so it was reverted.
-The remaining 64K gap to 40 tok/s is about 0.2%.
+The ordinary one-row path remains below 40 tok/s at 64K; the DFlash2 sidecar
+now clears 40 tok/s after its separate eight-split retune below.
 
 Remaining optimization items, in measured priority order:
 
@@ -252,8 +263,9 @@ Remaining optimization items, in measured priority order:
    already on the GPU; the selector now shares the predecessor's decoded
    256-rank Q4_K vector across its sixteen candidate lanes without changing
    accumulation order or output hashes. Repeated 4K K=4 runs remain about
-   53--55 ms for the draft phase, so projection and draft attention are still
-   the material cost. Investigate position-parallel draft attention and a
+   53--55 ms for the draft phase, so projection and selector work remain the
+   material cost after the eight-split 64K draft-attention change. Investigate
+   position-parallel draft attention and a
    cheaper draft-cache representation. K=7 already clears 60 tok/s, while
    K=4 remains below that target.
 4. Overlap sidecar cache injection with the next target prefill tile.  The

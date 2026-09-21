@@ -489,7 +489,7 @@ int hip_llm_qwen35_dflash2_propose(hip_llm_runner *r, int32_t anchor,
             position,rows,kd,kd,HLLM_DFLASH_WINDOW);
         int window=HLLM_DFLASH_WINDOW;
         int attention_length=position+rows < window ? position+rows : window;
-        int splits=attention_length >= 1024 ? 16 : attention_length >= 512 ? 4 : 1;
+        int splits=attention_length >= 1024 ? 8 : attention_length >= 512 ? 4 : 1;
         void *aa[]={&d->attn_partial,&d->q,&cl->key_cache,&cl->value_cache,&rows,
             &position,&(int){HLLM_DFLASH_HEADS},&(int){HLLM_DFLASH_KV_HEADS},
             &(int){HLLM_DFLASH_HEAD_DIM},&window,&splits};
