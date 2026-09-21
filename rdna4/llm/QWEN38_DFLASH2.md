@@ -1,5 +1,19 @@
 # Qwen3.8 DFlash2 on RDNA4
 
+## IQ2_XS launch-bounds probe (2026-09-22)
+
+The native one-row IQ2_XS decode kernel is compiled with
+`__launch_bounds__(512, 1)` for its existing 512-thread production shape.
+The kernel's arithmetic and reduction order are unchanged.  The 4K
+random-token gate measured 43.00 tok/s with prefix/suffix hashes
+`1c891c2232aa1b7f`/`f44846dacf013e9e`; the 64K random gate measured 35.84
+tok/s at 445.82 tok/s prefill with hashes
+`90178de69a24a76e`/`7463f176c9b85ba3`.  The exact C++17 gate remained
+byte-identical (`44915ec1039a64c8`, SHA-256
+`4a0cb461966fae9a9d9da3b73c1b0c686ce8ee9ac3895c228bc6a653bc99a354`) at
+41.95 tok/s.  This is a safe small scheduling improvement; the strict 40
+tok/s ordinary 64K target remains open.
+
 ## Packed Q8/Q8 KV scales (2026-09-21)
 
 Q8 K/V cache scales now use the same rounded FP16 contract as the stored

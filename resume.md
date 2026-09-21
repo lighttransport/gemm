@@ -1,5 +1,20 @@
 # Qwen3.8 27B HIP runner vs llama.cpp — resume state
 
+## 2026-09-22 continuation: IQ2_XS launch-bounds probe
+
+The native one-row IQ2_XS matvec now carries `__launch_bounds__(512, 1)` so
+the compiler can budget registers for the production 512-thread shape.  The
+change preserves the existing reduction and dequantization order.  A 4K
+random-token gate retained prefix `1c891c2232aa1b7f` and suffix
+`f44846dacf013e9e`, measuring 43.00 tok/s; the 64K gate retained prefix
+`90178de69a24a76e` and suffix `7463f176c9b85ba3`, measuring 35.84 tok/s at
+445.82 tok/s prefill.  The pinned C++17 merge-intervals gate remains
+byte-identical (`44915ec1039a64c8`, output SHA-256
+`4a0cb461966fae9a9d9da3b73c1b0c686ce8ee9ac3895c228bc6a653bc99a354`) and
+completed at 41.95 tok/s.  The small long-context gain is within run
+variance but the launch contract is quality-safe; keep it while continuing
+the larger grouped-projection and verifier-tail work.
+
 ## 2026-09-22 continuation: IQ1_M micro-tuning and fusion audit
 
 The default one-row IQ1_M F32 kernel now marks its output, weight and

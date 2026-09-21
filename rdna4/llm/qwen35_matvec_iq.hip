@@ -123,7 +123,7 @@ extern "C" __global__ void qwen35_matvec_iq2xxs(
     if (lane == 0) out[row] = sum;
 }
 
-extern "C" __global__ void qwen35_matvec_iq2xs(
+extern "C" __global__ __launch_bounds__(512, 1) void qwen35_matvec_iq2xs(
         float *__restrict__ out, const unsigned char *__restrict__ weights,
         const signed char *__restrict__ q, const float *__restrict__ scales,
         int rows, int cols) {
