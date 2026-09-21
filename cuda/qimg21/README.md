@@ -624,6 +624,27 @@ alone do not establish full denoiser acceptance. Compared with the earlier
 editing combination, this run also changes RMS and image softmax arithmetic,
 so its differences cannot be attributed solely to text traversal order.
 
+A controlled high-timestep editing ablation now separates these changes.
+Every row uses the same saved input, original weights and vector layer norm:
+
+| Attention | Q/K RMS | Prediction cosine | Gate |
+| --- | --- | ---: | --- |
+| MMA64 ordinary reverse | original tree | 0.999968976485 | pass |
+| MMA64 ordinary reverse | vector order | 0.999935711069 | fail |
+| MMA64 Flash-style reverse | original tree | 0.999954412383 | fail |
+| MMA64 Flash-style reverse | vector order | 0.999929380655 | fail |
+| Mixed forward text / Flash-style image | vector order | 0.999923131554 | fail |
+
+New artifacts are `tmp/qimg21-edit-{mma-vector,flash-tree,flash-vector}-high`.
+Both isolated RMS and softmax changes worsen this complete checkpoint despite
+their same-input operator improvements. Do not promote them based solely on
+operator similarity or the smaller text-to-image case. The earlier accepted
+high checkpoint still does not establish editing acceptance: its low checkpoint
+fails. A replay-only forward exp2 variant modeled on the masked backend's
+separate score/log2 scaling left text equality unchanged at 99.8853%; it was
+removed rather than adding another runner option. Its output remains in
+`tmp/qimg21-edit-attn0/efficient_softmax.npy` for diagnostics.
+
 Compare the replay without loading PyTorch or allocating GPU memory:
 
 ```sh
