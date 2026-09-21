@@ -151,11 +151,10 @@ OMP_NUM_THREADS=2 tmp/qimg21-ref-venv/bin/python cuda/qimg21/quant_quality.py \
 
 Current native BF16 arithmetic explicitly rounds the text projection before
 GELU and Q/K normalization before multiplication by the learned RMS weights.
-On the saved 256x256/seed42 two-step reference, matched-input denoiser cosine
-is 0.999981133 at timestep 1 and 0.999955009 at timestep 0.02001953125.
-The latter **fails** the 0.99996 acceptance gate; full native parity remains
-unfinished. These are direct denoiser comparisons, not free-running trajectory
-or end-to-end quality guarantees.
+An older automatic-SDPA fixture reached 0.999981133 at timestep 1 and
+0.999955009 at timestep 0.02001953125. That diagnostic result is superseded by
+the pinned efficient-SDPA acceptance path documented below; it remains useful
+evidence that CUDA's automatic backend mix is not a stable exact oracle.
 
 Timestep embedding, shared modulation, and final modulation use the same
 two-row `[real timestep, zero timestep]` GEMM shapes as PyTorch. Separate
@@ -1388,6 +1387,19 @@ The same two-step case with negative prompt `red apple, blurry` and true-CFG
 scale 4 also passes: prediction cosines `0.9999998485751089` and
 `0.9999994896000577`, with trajectory cosines `0.9999985850203311` and
 `0.9999975521106901`.
+
+The deterministic text-to-image matrix also passes all matched predictions
+and free-running checkpoints:
+
+| Case | Minimum prediction cosine | Minimum trajectory cosine |
+| --- | ---: | ---: |
+| 256x256, 2 steps, seed 7 | 1.000000000 | 0.999998204 |
+| 256x512, 2 steps, seed 123 | 0.999997464 | 0.999994666 |
+| 512x512, 4 steps, seed 42 | 0.999996859 | 0.999990533 |
+
+Run this matrix with `regression.py --native --reference-sdpa-backend
+efficient --native-attention cutlass-efficient --native-normalization vector4
+--native-rope host-table-exact` and the desired repeatable `--case` values.
 
 ## Completed 1024x1024/40-step generation benchmark
 

@@ -77,6 +77,7 @@ def main() -> int:
     ap.add_argument("--negative-prompt")
     ap.add_argument("--true-cfg-scale", type=float, default=1.0)
     ap.add_argument("--dtype", choices=("bf16", "fp16"), default="bf16")
+    ap.add_argument("--reference-sdpa-backend", choices=("default", "efficient"), default="default")
     ap.add_argument(
         "--case",
         dest="cases",
@@ -176,6 +177,8 @@ def main() -> int:
                 *common,
                 "--dtype",
                 args.dtype,
+                "--sdpa-backend",
+                args.reference_sdpa_backend,
                 "--dump-initial-latents",
             ]
             if args.native:
@@ -200,6 +203,7 @@ def main() -> int:
                     "quantized_transformer": str(args.quantized_transformer.resolve()) if args.quantized_transformer else None,
                     "quantize_on_load": args.quantize_on_load,
                     "dtype": args.dtype, "timesteps": timesteps,
+                    "reference_sdpa_backend": args.reference_sdpa_backend,
                     "case": case.name, "prompt": args.prompt,
                     "negative_prompt": args.negative_prompt, "true_cfg_scale": args.true_cfg_scale,
                 }, indent=2) + "\n")
