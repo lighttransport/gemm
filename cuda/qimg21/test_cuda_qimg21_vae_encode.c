@@ -1,5 +1,5 @@
-/* Native single-frame RGBA -> raw posterior moments. No image preprocessing,
- * sampling, temporal continuation, or latent normalization is performed. */
+/* Native single-frame RGBA -> raw posterior moments and optional normalized
+ * posterior-mode tokens. No image preprocessing, sampling or temporal continuation. */
 #define main q21_decoder_main
 #include "test_cuda_qimg21_vae.c"
 #undef main
@@ -81,14 +81,16 @@ done:
 }
 
 int main(int argc,char **argv) {
-    const char *model=NULL,*input=NULL,*output=NULL;
+    const char *model=NULL,*input=NULL,*output=NULL,*latent_output=NULL;
     for(int i=1;i<argc;i++) {
         if(!strcmp(argv[i],"--model")&&i+1<argc)model=argv[++i];
         else if(!strcmp(argv[i],"--image")&&i+1<argc)input=argv[++i];
         else if(!strcmp(argv[i],"--out")&&i+1<argc)output=argv[++i];
+        else if(!strcmp(argv[i],"--normalized-latents")&&i+1<argc)latent_output=argv[++i];
         else return 2;
     }
-    if(!model||!input||!output){fprintf(stderr,"usage: %s --model VAE_DIR --image RGBA_CHW.npy --out MOMENTS.npy\n",argv[0]);return 2;}
+    if(!model||!input||!output){fprintf(stderr,"usage: %s --model VAE_DIR --image RGBA_CHW.npy --out MOMENTS.npy [--normalized-latents TOKENS.npy]\n",argv[0]);return 2;}
+    if(latent_output && !strcmp(latent_output,output))return 2;
     q21_npy a={0};if(q21_npy_read_f32(input,&a))return 1;
     if(a.ndim!=3||a.shape[0]!=4||a.shape[1]>1024||a.shape[2]>1024||a.shape[1]%16||a.shape[2]%16){q21_npy_free(&a);return 2;}
     for(size_t i=0;i<a.n;i++)if(!isfinite(a.data[i])||a.data[i]<-1||a.data[i]>1){q21_npy_free(&a);return 2;}
@@ -104,6 +106,19 @@ int main(int argc,char **argv) {
     int rc=moments?q21_encode(r,st,a.data,h,w,moments):1;
     if(!rc)for(size_t i=0;i<count;i++)if(!isfinite(moments[i])){rc=1;break;}
     if(!rc)rc=q21_npy_write_chw(output,moments,count,128,h/16,w/16);
+    if(!rc && latent_output) {
+        int tokens=(h/16)*(w/16);
+        float mean[64],std[64];q21_latent_stats(mean,std);
+        float *latents=malloc((size_t)tokens*64*sizeof(float));
+        if(!latents)rc=1;
+        else {
+            for(int i=0;i<tokens;i++)for(int c=0;c<64;c++)
+                latents[i*64+c]=(moments[c*tokens+i]-mean[c])/std[c];
+            char shape[64];snprintf(shape,sizeof(shape),"(%d, 64)",tokens);
+            rc=q21_npy_write_shape(latent_output,latents,(size_t)tokens*64,shape);
+            free(latents);
+        }
+    }
     cuStreamSynchronize(r->stream);r->stream=original;
     free(moments);cuda_qimg_free(r);safetensors_close(st);q21_npy_free(&a);return rc?1:0;
 }

@@ -106,14 +106,12 @@ static int q21_npy_read_f32(const char *path, q21_npy *out) {
     return 0;
 }
 
-static int q21_npy_write_chw(const char *path, const float *x, size_t n,
-                             int c, int h, int w) {
+static int q21_npy_write_shape(const char *path, const float *x, size_t n, const char *shape) {
     FILE *fp = fopen(path, "wb");
     if (!fp) return -1;
     char hdr[256], body[256];
     int len = snprintf(hdr, sizeof(hdr),
-                       "{'descr': '<f4', 'fortran_order': False, 'shape': (%d, %d, %d), }",
-                       c, h, w);
+                       "{'descr': '<f4', 'fortran_order': False, 'shape': %s, }", shape);
     int padded = ((len + 10 + 63) / 64) * 64 - 10;
     if (padded >= (int)sizeof(body)) { fclose(fp); return -1; }
     memset(body, ' ', (size_t)padded);
@@ -126,6 +124,11 @@ static int q21_npy_write_chw(const char *path, const float *x, size_t n,
              fwrite(x, sizeof(float), n, fp) == n ? 0 : -1;
     if (fclose(fp) != 0) ok = -1;
     return ok;
+}
+
+static int q21_npy_write_chw(const char *path, const float *x, size_t n, int c, int h, int w) {
+    char shape[96];snprintf(shape,sizeof(shape),"(%d, %d, %d)",c,h,w);
+    return q21_npy_write_shape(path,x,n,shape);
 }
 
 static const char *q21_vae_dump_dir;
@@ -383,13 +386,7 @@ static CUdeviceptr q21_mid_attention(cuda_qimg_runner *r, const st_context *st,
     return q21_mid_attention_named(r,st,x,c,h,w,"decoder.mid_block.attentions.0");
 }
 
-static int qimg21_vae_decode(cuda_qimg_runner *r, const st_context *st,
-                             const float *latent, int h, int w, float *out) {
-    const int c0=64;
-    CUdeviceptr x=0;
-    x=checked_cuMemAlloc((size_t)c0*h*w*sizeof(float));
-    if(!x) return -1;
-    cuMemcpyHtoD(x,latent,(size_t)c0*h*w*sizeof(float));
+static void q21_latent_stats(float *out_mean, float *out_std) {
     /* qimg-21 stores normalized latent channels; decode expects z*std+mean. */
     static const float mean[64] = {
       0.5126f,0.7721f,-0.0631f,1.3506f,-0.7855f,-2.1025f,-0.3458f,1.3722f,
@@ -409,6 +406,15 @@ static int qimg21_vae_decode(cuda_qimg_runner *r, const st_context *st,
       3.5327f,4.7833f,3.1286f,4.1819f,3.8527f,3.8312f,3.5605f,4.3875f,
       3.9624f,4.0168f,3.5643f,4.055f,5.5614f,4.2963f,4.408f,3.4959f,
       3.8747f,3.7608f,3.5735f,3.149f,3.7662f,3.6746f,3.4563f,3.8161f };
+    memcpy(out_mean,mean,sizeof(mean));memcpy(out_std,std,sizeof(std));
+}
+
+static int qimg21_vae_decode(cuda_qimg_runner *r, const st_context *st,
+                             const float *latent, int h, int w, float *out) {
+    const int c0=64;
+    float mean[64],std[64];q21_latent_stats(mean,std);
+    CUdeviceptr x=checked_cuMemAlloc((size_t)c0*h*w*sizeof(float));
+    if(!x)return -1;
     /* A tiny host transform avoids another model-specific CUDA kernel. */
     float *z=(float *)malloc((size_t)c0*h*w*sizeof(float));
     if(!z){q21_free(&x);return -1;}

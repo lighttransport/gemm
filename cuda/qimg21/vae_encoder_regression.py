@@ -8,7 +8,7 @@ import subprocess
 
 import numpy as np
 import torch
-from diffusers import AutoencoderKLQwenImage21
+from diffusers import AutoencoderKLQwenImage21, QwenImage21Pipeline
 
 from compare import NONQUANTIZED_COSINE_THRESHOLD, _cosine_error
 
@@ -30,7 +30,7 @@ def main():
     args.work_dir.mkdir(parents=True, exist_ok=False)
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
-    results = {"scope": "single-frame F32 raw posterior moments", "threshold": NONQUANTIZED_COSINE_THRESHOLD,
+    results = {"scope": "single-frame F32 posterior moments and normalized mode tokens", "threshold": NONQUANTIZED_COSINE_THRESHOLD,
                "torch": torch.__version__, "model": str(args.model.resolve()), "cases": []}
     for h, w, seed in cases:
         directory = args.work_dir / f"{h}x{w}-seed{seed}"
@@ -42,19 +42,28 @@ def main():
         with torch.inference_mode():
             posterior = model.encode(torch.from_numpy(x)[None, :, None].cuda()).latent_dist
             expected = posterior.parameters[0, :, 0].float().cpu().numpy().copy()
+            mean = torch.tensor(model.config.latents_mean, device="cuda", dtype=torch.float32).view(1,64,1,1,1)
+            std = torch.tensor(model.config.latents_std, device="cuda", dtype=torch.float32).view(1,64,1,1,1)
+            latent = (posterior.mode() - mean) / std
+            expected_latent = QwenImage21Pipeline._pack_latents(latent,1,64,h//16,w//16)[0].cpu().numpy().copy()
         np.save(directory / "reference.npy", expected)
-        del posterior, model
+        np.save(directory / "reference_latents.npy", expected_latent)
+        del posterior, model, latent, mean, std
         gc.collect()
         torch.cuda.empty_cache()
         subprocess.run([str(args.native_bin.resolve()), "--model", str(args.model.resolve()),
-                        "--image", str(directory / "input.npy"), "--out", str(directory / "native.npy")], check=True)
+                        "--image", str(directory / "input.npy"), "--out", str(directory / "native.npy"),
+                        "--normalized-latents", str(directory / "native_latents.npy")], check=True)
         actual = np.load(directory / "native.npy", allow_pickle=False)
         cosine, relative_l2 = _cosine_error(expected, actual)
         mean_cosine, _ = _cosine_error(expected[:64], actual[:64])
+        actual_latent = np.load(directory / "native_latents.npy", allow_pickle=False)
+        latent_cosine, latent_relative_l2 = _cosine_error(expected_latent, actual_latent)
         result = {"height": h, "width": w, "seed": seed, "cosine": cosine,
                   "mean_cosine": mean_cosine, "relative_l2": relative_l2,
+                  "latent_cosine": latent_cosine, "latent_relative_l2": latent_relative_l2,
                   "max_absolute_error": float(np.max(np.abs(actual-expected))),
-                  "passed": min(cosine, mean_cosine) >= NONQUANTIZED_COSINE_THRESHOLD}
+                  "passed": min(cosine, mean_cosine, latent_cosine) >= NONQUANTIZED_COSINE_THRESHOLD}
         results["cases"].append(result)
         results["passed"] = all(case["passed"] for case in results["cases"])
         (args.work_dir / "results.json").write_text(json.dumps(results, indent=2) + "\n")

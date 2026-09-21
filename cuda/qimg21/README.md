@@ -1010,7 +1010,8 @@ padding is handled explicitly; video/temporal continuation is not supported.
 ```sh
 TMPDIR="$PWD/tmp" make -C cuda/qimg21 native-vae
 cuda/qimg21/test_cuda_qimg21_vae_encode \
-  --model /mnt/nvme01/models/qimg-21/vae --image normalized_rgba.npy --out moments.npy
+  --model /mnt/nvme01/models/qimg-21/vae --image normalized_rgba.npy --out moments.npy \
+  --normalized-latents condition_tokens.npy
 OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=1 tmp/qimg21-ref-venv/bin/python cuda/qimg21/vae_encoder_regression.py \
   --model /mnt/nvme01/models/qimg-21/vae --case 128x128:42 --case 64x128:123 \
   --case 256x256:7 --work-dir tmp/qimg21-encoder-matrix
@@ -1019,9 +1020,14 @@ OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=1 tmp/qimg21-ref-venv/bin/python cuda/qim
 Input is finite F32 `[4,H,W]` RGBA already normalized to `[-1,1]`, with both
 dimensions divisible by 16 and at most 1024. Output is raw F32 posterior
 parameters `[128,H/16,W/16]`: mean channels first, then log-variance channels.
-It does **not** resize/read image files, sample the posterior, clamp log
-variance, normalize latent channels, or pack transformer tokens. In particular,
-this output is not yet a condition-latent fixture for the denoiser.
+It does **not** resize/read image files, sample the posterior, or clamp log
+variance. The optional `--normalized-latents` output selects the deterministic
+posterior mean, applies `(mean - latents_mean) / latents_std`, and packs F32
+tokens as `[H/16 * W/16,64]`. Encoder and decoder share the original model's
+mean/std constants. This token file has the native denoiser's condition-latent
+format and can also be read directly by the native decoder; raw 128-channel
+posterior moments cannot. Image-conditioned text embeddings and matching
+joint-layout metadata are still required for an editing request.
 
 Against official PyTorch F32 encoding with TF32 disabled, all four synthetic
 RGBA cases pass: 64x64/seed17, 128x128/seed42, 64x128/seed123, and
@@ -1034,10 +1040,20 @@ refactor also passes at cosine 0.999999999347549 (128x128/seed17).
 
 CPU input guards reject wrong channel counts, unsupported dimensions,
 non-finite pixels and out-of-range pixels before CUDA initialization; the
-CPU suite is 27/27 passing. Larger encoder resolutions, peak VRAM, real-image
-preprocessing/normalization and native editing handoff remain unverified.
+CPU suite is now 28/28 passing. Larger encoder resolutions, peak VRAM,
+real-image preprocessing and end-to-end editing integration remain unverified.
 The initial downsampler computes a full convolution then samples odd spatial
 positions; it is correct but not yet optimized as a stride-2 convolution.
+
+The updated encoder regression independently gates normalized token cosine
+against PyTorch normalization and the official pipeline packing function.
+128x128/seed42, 64x128/seed123 and 256x256/seed7 all pass, minimum cosine
+**0.999999999990019**, maximum relative L2 4.47e-6. Artifacts are in
+`tmp/qimg21-encoder-handoff`. A direct native encoder-token -> native decoder
+round trip at 128x128/seed42 matches official PyTorch posterior-mode
+reconstruction at cosine **0.999999999429927** (relative L2 3.38e-5).
+The old decoder 128x128/seed17 output remains bit-identical after sharing the
+statistics helper. These are F32 VAE checks, not BF16 editing-pipeline parity.
 
 ## Completed 1024x1024/40-step generation benchmark
 

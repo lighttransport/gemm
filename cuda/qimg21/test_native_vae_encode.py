@@ -8,6 +8,14 @@ import numpy as np
 
 
 class NativeVaeEncodeTest(unittest.TestCase):
+    def test_reject_overlapping_outputs(self):
+        binary = Path(__file__).with_name("test_cuda_qimg21_vae_encode")
+        result = subprocess.run([str(binary), "--model", "missing-model", "--image", "missing.npy",
+                                 "--out", "same.npy", "--normalized-latents", "same.npy"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertNotIn("NVIDIA", result.stderr)
+
     def test_invalid_inputs_before_cuda(self):
         binary = Path(__file__).with_name("test_cuda_qimg21_vae_encode")
         root = Path(__file__).resolve().parents[2] / "tmp"
