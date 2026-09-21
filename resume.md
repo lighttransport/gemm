@@ -231,6 +231,11 @@ for grouped verifier windows.  The ordinary decode path is unchanged.  The
 full pinned reference validator preserves greedy and sampled token streams,
 EOS, and output bytes; warm DFlash K=7 decode remains above 60 tok/s.
 
+Verifier SSM checkpoint restore now passes explicit row-major strides for both
+convolution and recurrent snapshots. DFlash window commit/rollback copies only
+the accepted row into live state; the GPU HTTP gate and pinned llama.cpp
+comparison retain exact greedy and seeded-sampled token/byte parity.
+
 CLI: `--qwen35-dflash2 SIDECAR --qwen35-dflash2-draft 1..7`; it currently
 requires benchmark mode, `--qwen35-batched-prefill`, `--qwen35-decode-graph`
 and `--kv-cache q8q8`.  `validate_qwen38_reference.py` accepts `--dflash2`

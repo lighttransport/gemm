@@ -325,6 +325,11 @@ reflects the remaining measured costs.
    shares one exact launch per recurrent layer. DeltaNet, state preparation,
    checkpoint copies, and the remaining matrix-vector work remain visible;
    fuse preparation with the recurrence where exact row rollback is retained.
+
+   The checkpoint copy path now makes the row-major convolution and recurrent
+   strides explicit, so a DFlash window commits only its accepted row. GPU
+   HTTP and pinned llama.cpp gates retain greedy and seeded-sampled token/byte
+   parity after this hardening.
 4. **Kernel and graph count.** Q/gate deinterleave, QK normalization, RoPE
    and Q8/Q8 KV storage are now fused exactly. The remaining small launches
    include SiLU/gating and state preparation. Fuse adjacent operations when

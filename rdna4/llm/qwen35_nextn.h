@@ -756,10 +756,14 @@ int hip_llm_qwen35_mtp_commit(hip_llm_runner *r, int processed) {
     size_t conv = (size_t)(r->ssm_conv_kernel-1)*r->ssm_qkv_dim*sizeof(float);
     size_t rec = (size_t)r->ssm_dt_rank*r->ssm_d_state*r->ssm_d_state*sizeof(float);
     size_t conv_elements = conv/sizeof(float), rec_elements = rec/sizeof(float);
+    /* Verify snapshots are row-major [token][state], so each row advances
+     * by one state vector.  The destination is the live single-row state. */
+    size_t conv_stride = conv_elements;
+    size_t rec_stride = rec_elements;
     void *conv_args[] = { &m->verify_conv_dst_ptrs, &m->verify_conv_src_ptrs,
-        &conv_elements, &conv_elements, &last, &m->verify_ssm_layers };
+        &conv_elements, &conv_stride, &last, &m->verify_ssm_layers };
     void *rec_args[] = { &m->verify_rec_dst_ptrs, &m->verify_rec_src_ptrs,
-        &rec_elements, &rec_elements, &last, &m->verify_ssm_layers };
+        &rec_elements, &rec_stride, &last, &m->verify_ssm_layers };
     LAUNCH(r->fn_copy_state_row_f32, (conv_elements/4+255)/256,
            m->verify_ssm_layers, 1, 256, 1, 1, 0, r->stream, conv_args);
     LAUNCH(r->fn_copy_state_row_f32, (rec_elements/4+255)/256,
