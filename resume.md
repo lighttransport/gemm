@@ -2,6 +2,21 @@
 
 ## 2026-09-22 continuation: bounded overlap and rejected candidates
 
+The ordinary IQ1 audit now reuses the exact Q8_1 activation bytes and FP16
+block sums across the IQ1_S gate and IQ1_M up projections while the existing
+gate/up reuse scope is open.  The cache is keyed by the producer pointer and
+column count and is cleared when the scope closes, so pointer reuse across
+layers cannot consume stale data.  This remains selected by
+`LLM_QWEN35_FFN_IQ1_Q81=1` because the Q8_1 activation approximation changes
+full logits even though it retained the pinned greedy C++ output and token
+file byte-for-byte (`44915ec1039a64c8`, output SHA-256
+`4a0cb461966fae9a9d9da3b73c1b0c686ce8ee9ac3895c228bc6a653bc99a354`).  On the
+same 4K/64-token exact gate it measured 42.24 tok/s versus 39.74 tok/s for
+the disabled control, and the random-token 65,536-depth gate retained prefix
+hash `90178de69a24a76e`, suffix hash `4f46d4fe27743a5b`, and measured
+36.13 tok/s versus 34.18 tok/s.  Production defaults remain unchanged until
+the broader sampled/logit quality matrix is rerun.
+
 The sidecar commit path now has an opt-in event-ordered injection stream via
 `LLM_QWEN35_DFLASH_OVERLAP_INJECT=1`.  Injection runs on a nonblocking stream
 while the authoritative target publishes its accepted-row checkpoints; the

@@ -21578,6 +21578,10 @@ static inline void end_q8x2_reuse(hip_llm_runner *r) {
     r->q8x2_reuse_active = 0;
     r->q8x2_reuse_valid = 0;
     r->native_q81_valid = 0;
+    /* IQ1's exact Q8_1 route uses the same activation scratch, but its
+     * affine block sums are a distinct layout.  Do not let a pointer-stable
+     * d_xb survive into the next layer after the gate/up scope closes. */
+    r->iq1_q8_valid = 0;
 }
 
 /* Enter a one-projection reuse scope after a fused producer has already
@@ -21935,11 +21939,17 @@ static inline int launch_iq1_q81_scalar(hip_llm_runner *r, hipFunction_t fn,
         return 0;
     int one = 1, stride = n_cols;
     r->q8x2_reuse_valid = 0;
-    r->iq1_q8_valid = 0;
-    void *qa[] = { &r->d_act_q8, &r->d_act_scale, &r->d_act_scale_b,
-                   &x, &n_cols, &one, &stride };
-    LAUNCH(r->fn_quantize_q81_iq1_batch_32_exact, n_cols / 32, 1, 1,
-           32, 1, 1, 0, r->stream, qa);
+    int reuse = r->q8x2_reuse_active && r->iq1_q8_valid &&
+                r->iq1_q8_source == x && r->iq1_q8_n == n_cols;
+    if (!reuse) {
+        void *qa[] = { &r->d_act_q8, &r->d_act_scale, &r->d_act_scale_b,
+                       &x, &n_cols, &one, &stride };
+        LAUNCH(r->fn_quantize_q81_iq1_batch_32_exact, n_cols / 32, 1, 1,
+               32, 1, 1, 0, r->stream, qa);
+        r->iq1_q8_source = x;
+        r->iq1_q8_n = n_cols;
+        r->iq1_q8_valid = r->q8x2_reuse_active;
+    }
     void *args[] = { &dst, &mat, &r->d_act_q8, &r->d_act_scale,
                      &r->d_act_scale_b, &n_rows, &n_cols, &one };
     /* Measured exact geometries on gfx1201. IQ1_S benefits from two waves on

@@ -429,9 +429,13 @@ reflects the remaining measured costs.
    Fixed-eight Q2_K/IQ projections already share decoded weights, but
    ordinary decode still streams weights for one row at a time. Reuse the
    quantized input across gate/up projections and investigate cooperative
-   weight staging. A WMMA or reordered reduction path needs full
-   output-token and logit validation because the current kernels preserve the
-   target arithmetic order.
+   weight staging.  The opt-in IQ1 Q8_1 audit now reuses the activation bytes
+   and block sums across the IQ1_S gate and IQ1_M up pair; it raises the
+   measured 65,536-depth suffix from 34.18 to 36.13 tok/s with the same
+   prefix/suffix hashes, but changes full logits and therefore remains
+   diagnostic until the sampled matrix is complete. A WMMA or reordered
+   reduction path needs full output-token and logit validation because the
+   current kernels preserve the target arithmetic order.
 2. **Verifier attention tail.** The query-grid verifier now selects ordinary
    decode's split count independently for every causal row. Equal-split
    windows now select a dedicated captured shared-K/V graph; split boundaries
