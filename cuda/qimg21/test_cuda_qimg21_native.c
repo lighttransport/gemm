@@ -26,7 +26,7 @@
 #include <sys/stat.h>
 
 typedef struct {
-    st_context *st[2];
+    st_context *st[4];
     int n;
 } qimg21_shards;
 

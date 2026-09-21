@@ -185,10 +185,38 @@ with the system-prefix crop index. Compare before final RMSNorm: the official
 2.1 pipeline bypasses that normalization before extracting prompt embeddings.
 The existing generic Qwen3 CUDA loader is not a drop-in replacement: this
 checkpoint uses Qwen3-VL tensor names, 5,000,000 RoPE theta, and a pre-norm
-output boundary. A native streamed encoder remains to be implemented.
+output boundary.
 The CPU fixture test is
 `tmp/qimg21-ref-venv/bin/python cuda/qimg21/test_text_capture.py`; it verifies
 integer preservation, pre-norm capture, unchanged outputs, and hook cleanup.
+
+An experimental streamed native encoder is now available separately:
+
+```sh
+make -C cuda/qimg21 test_cuda_qimg21_text
+tmp/qimg21-ref-venv/bin/python cuda/qimg21/native_text.py \
+  --model /mnt/nvme01/models/qimg-21 --prompt "a red apple on a white table"
+```
+
+It gathers only requested embedding rows, streams one BF16 weight matrix at
+a time, and implements all 36 text blocks with native RMSNorm, split-half
+text RoPE, causal grouped-query attention, SwiGLU, and BF16 residual updates.
+It omits the final RMSNorm and LM head. The C executable requires unpadded,
+batch-one integer token IDs, rejects vision tokens, and limits inputs to
+4096 tokens. Python handles only processor/tokenization and system-prefix
+cropping; `--prepare-only` runs that stage without CUDA or model weights.
+The original checkpoint configuration is required; this is not a general
+Qwen3-VL loader. Host build and sm_120 NVRTC compilation pass, but **GPU
+execution and numerical parity are not yet validated**. It is deliberately
+not the default generation encoder until comparison against captured
+`hidden_prenorm.npy` and cropped prompt embeddings meets the strict gate.
+CPU tokenization checks against the installed official pipeline cover an
+English prompt, an empty negative prompt, and Unicode/newline text:
+
+```sh
+tmp/qimg21-ref-venv/bin/python cuda/qimg21/test_native_text.py \
+  --model /mnt/nvme01/models/qimg-21
+```
 
 For native true CFG, pass `--negative-prompt` and `--true-cfg-scale` to
 `native_generate.py` (the negative embedding is exported beside the positive
