@@ -54,12 +54,47 @@ typedef struct hllm_qwen35_dflash2 {
     void *selector_candidates, *selector_drafts;
     void *q81_source;
     int q81_rows, q81_cols;
+    /* Optional sidecar injection stream.  Injection is independent of target
+     * checkpoint publication, but the next proposal must wait before reusing
+     * the sidecar's feature/KV scratch. */
+    hipStream_t inject_stream;
+    hipEvent_t inject_done;
+    int inject_pending;
 } hllm_qwen35_dflash2;
+
+static int hllm_dflash_overlap_enabled(void) {
+    const char *env = getenv("LLM_QWEN35_DFLASH_OVERLAP_INJECT");
+    return env && atoi(env) != 0;
+}
+
+static int hllm_dflash_overlap_init(hllm_qwen35_dflash2 *d) {
+    if (!d) return -1;
+    if (!d->inject_stream &&
+        hipStreamCreateWithFlags(&d->inject_stream, hipStreamNonBlocking) != hipSuccess)
+        return -1;
+    if (!d->inject_done &&
+        hipEventCreateWithFlags(&d->inject_done, hipEventDisableTiming) != hipSuccess) {
+        hipStreamDestroy(d->inject_stream);
+        d->inject_stream = NULL;
+        return -1;
+    }
+    return 0;
+}
+
+static int hllm_dflash_overlap_wait(hip_llm_runner *r,
+                                    hllm_qwen35_dflash2 *d) {
+    if (!r || !d || !d->inject_pending) return 0;
+    if (hipStreamWaitEvent(r->stream, d->inject_done, 0) != hipSuccess)
+        return -1;
+    d->inject_pending = 0;
+    return 0;
+}
 
 static void hllm_qwen35_dflash2_free(hip_llm_runner *r) {
     hllm_qwen35_dflash2 *d = r ? r->qwen35_dflash2 : NULL;
     if (!d) return;
     if (r->stream) hipStreamSynchronize(r->stream);
+    if (d->inject_stream) hipStreamSynchronize(d->inject_stream);
 #define DFLASH_FREE(p) do { if (p) hipFree(p); } while (0)
     DFLASH_FREE(d->fc); DFLASH_FREE(d->fc_bf16);
     DFLASH_FREE(d->enc_norm); DFLASH_FREE(d->out_norm);
@@ -87,6 +122,8 @@ static void hllm_qwen35_dflash2_free(hip_llm_runner *r) {
     }
 #undef DFLASH_FREE
     if (d->module) hipModuleUnload(d->module);
+    if (d->inject_done) hipEventDestroy(d->inject_done);
+    if (d->inject_stream) hipStreamDestroy(d->inject_stream);
     if (d->source) gguf_close_shards(d->source);
     free(d);
     r->qwen35_dflash2 = NULL;
@@ -463,6 +500,7 @@ int hip_llm_qwen35_dflash2_propose(hip_llm_runner *r, int32_t anchor,
             anchor, position, d ? d->kv_end : -1);
         return -1;
     }
+    if (hllm_dflash_overlap_wait(r, d)) return -1;
     int rows=count+1, ne=r->n_embd, qd=HLLM_DFLASH_HEADS*HLLM_DFLASH_HEAD_DIM;
     int kd=HLLM_DFLASH_KV_HEADS*HLLM_DFLASH_HEAD_DIM;
     d->q81_source=NULL;
@@ -571,6 +609,14 @@ int hip_llm_qwen35_dflash2_commit(hip_llm_runner *r, int position,
                 m ? m->verify_rows : -1, d ? d->feature_rows : -1);
         return -1;
     }
-    if (hllm_qwen35_dflash2_inject(r,position,processed)) return -1;
+    if (hllm_dflash_overlap_enabled() && hllm_dflash_overlap_init(d) == 0) {
+        hipStream_t saved_stream = r->stream;
+        r->stream = d->inject_stream;
+        int inject_rc = hllm_qwen35_dflash2_inject(r, position, processed);
+        r->stream = saved_stream;
+        if (inject_rc || hipEventRecord(d->inject_done, d->inject_stream) != hipSuccess)
+            return -1;
+        d->inject_pending = 1;
+    } else if (hllm_qwen35_dflash2_inject(r,position,processed)) return -1;
     return hip_llm_qwen35_mtp_commit(r,processed);
 }

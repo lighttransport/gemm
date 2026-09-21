@@ -1,5 +1,27 @@
 # Qwen3.8 27B HIP runner vs llama.cpp — resume state
 
+## 2026-09-22 continuation: bounded overlap and rejected candidates
+
+The sidecar commit path now has an opt-in event-ordered injection stream via
+`LLM_QWEN35_DFLASH_OVERLAP_INJECT=1`.  Injection runs on a nonblocking stream
+while the authoritative target publishes its accepted-row checkpoints; the
+next DFlash proposal waits on the injection event before reusing sidecar
+features, K/V scratch, or the private cache.  The default remains serialized
+because the matched random-4K K=7 gate was exact but slightly slower with the
+extra stream/event work: serial `draft/verify/commit=158.810/1108.634/22.548`
+ms and 49.58 tok/s versus overlap `158.912/1110.527/22.636` ms and 49.51
+tok/s.  Both retained suffix hash `cd772dbc6c6e4776`.
+
+Two bounded optimization probes were rejected.  A fixed-count Q4_K draft
+projection for the eight-row K=7 window measured 158.834 ms versus 158.810 ms
+for the generic kernel with the same accepted rows and hash.  A 32-way fixed
+Q8 attention split at random 64K retained prefix/suffix hashes
+`90178de69a24a76e`/`7463f176c9b85ba3` but fell to 35.39 tok/s from the adaptive
+35.80 tok/s baseline.  The DeltaNet alias hint was also neutral at 42.21--42.26
+tok/s on the exact 4K gate.  These paths remain reverted or opt-in; the next
+high-value work is still a grouped mixed-type projection kernel and a
+verifier-only attention tail fusion.
+
 ## Q8/Q8 attention split cap at 64K (2026-09-21)
 
 The native gfx1201 Q8/Q8 decode selector now caps the validated 64K serving
