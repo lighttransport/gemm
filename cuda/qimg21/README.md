@@ -127,7 +127,10 @@ stage directory containing `pytorch_attn_matched.npy` from the CUDA probe.
 This is an inference from saved outputs, not proof of PyTorch's dispatch.
 The native executable exposes an experimental `--attention reverse64` kernel
 for full-denoiser validation; default `--attention math` remains unchanged.
-Native GPU accuracy/performance for the new kernel has not yet been measured.
+Native GPU replay of the saved 256x256/seed42 fixture scores 0.9999551703
+at the low timestep (**fails**) and 0.9999807856 at timestep 1 (passes).
+The much closer isolated attention arithmetic does not resolve accumulated
+full-denoiser error, so this remains an experiment, not the default.
 Both `regression.py` and `native_generate.py` accept
 `--native-attention reverse64`; regression records the choice in
 `native_config.json` and uses it for isolated denoiser and trajectory tests.
@@ -413,8 +416,9 @@ additional coverage.
 The additional 512x512/seed42 F32 decoder comparison passed with cosine
 0.99999999951 (native subprocess including startup: 12.04 seconds). Native
 1024x1024 decoding completed, but the untiled F32 PyTorch reference ran out
-of VRAM on this GPU; its 1024 parity is therefore unverified. This is not
-the requested 1024x1024/40-step generation benchmark, which remains pending.
+of VRAM on this GPU; its 1024 parity is therefore unverified. The separate
+1024x1024/40-step generation benchmark below has completed, but does not
+replace this missing full-resolution VAE reference comparison.
 
 For memory-bounded untiled PyTorch comparison, `vae_regression.py` has an
 opt-in `--discard-frame-cache` mode. It executes the official decoder with
@@ -427,3 +431,31 @@ individual official modules and a reduced-width complete five-stage decoder:
 `OMP_NUM_THREADS=2 tmp/qimg21-ref-venv/bin/python cuda/qimg21/test_vae_reference.py`.
 Full-checkpoint GPU equivalence and the 1024-resolution memory benefit still
 need validation; this option does not yet resolve the unverified parity above.
+
+## Completed 1024x1024/40-step generation benchmark
+
+Command (RTX 5060 Ti, 15.5 GiB reported by CUDA):
+
+```sh
+/usr/bin/time -v tmp/qimg21-ref-venv/bin/python cuda/qimg21/native_generate.py \
+  --model /mnt/nvme01/models/qimg-21 --prompt "a red apple on a white table" \
+  --height 1024 --width 1024 --steps 40 --seed 42 --native-vae \
+  --work-dir tmp/qimg21-native-1024-40-benchmark \
+  --out tmp/qimg21-native-1024-40-benchmark.png
+```
+
+Completed with exit status 0 in **44m 08.05s** wall time. This is end-to-end
+time including the Python text encoder, native BF16 denoiser (default `math`
+attention), and native F32 VAE; it is not denoiser-only timing. Maximum host
+RSS was 18,612,956 KiB, with zero swaps. CPU development/tests ran concurrently
+on the host, but no other GPU workload overlapped this run. One mid-denoising
+GPU snapshot showed 6,019 MiB used; this was **not** a peak-VRAM measurement
+and does not establish a hard 12 GiB limit for the entire pipeline.
+
+All 40 saved `[4096,64]` latent checkpoints are finite. The decoded
+`[4,1024,1024]` tensor is finite and within `[-1,1]`; the saved image is a
+1024x1024 RGBA PNG. Visual inspection shows a coherent red apple on a white
+surface, consistent with the prompt. Fixtures, image, and timing log remain
+under ignored `tmp/`, not in Git. No corresponding 40-step PyTorch trajectory
+was compared: successful generation does not establish the strict parity
+acceptance gate, which still fails on the small low-timestep denoiser case.
