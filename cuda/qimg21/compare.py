@@ -39,6 +39,8 @@ def _cosine_error(reference: np.ndarray, candidate: np.ndarray) -> tuple[float, 
         reference, candidate = squeezed_reference, squeezed_candidate
     ref = reference.astype(np.float64, copy=False).ravel()
     got = candidate.astype(np.float64, copy=False).ravel()
+    if not ref.size or not np.isfinite(ref).all() or not np.isfinite(got).all():
+        raise ValueError("empty or non-finite comparison fixture")
     denom = np.linalg.norm(ref) * np.linalg.norm(got)
     cosine = float(np.dot(ref, got) / max(denom, 1e-30))
     rel_l2 = float(np.linalg.norm(ref - got) / max(np.linalg.norm(ref), 1e-30))
@@ -135,6 +137,9 @@ def main() -> int:
         ref_steps = _step_names(ref_dir)
         if not ref_steps:
             failures.append(f"no reference step fixtures in {ref_dir}")
+        run_steps = sorted(set(_step_names(run_dir)) | set(_step_names(run_dir / "steps")))
+        if run_steps != ref_steps:
+            failures.append(f"trajectory fixture mismatch: reference={ref_steps} candidate={run_steps}")
         for name in ref_steps:
             rp = ref_dir / name
             gp = _step_path(run_dir, name)
