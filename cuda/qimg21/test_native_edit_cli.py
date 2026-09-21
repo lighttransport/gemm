@@ -10,9 +10,7 @@ class NativeEditCliTest(unittest.TestCase):
         for args in (["--editing-layout", "missing.txt"],
                      ["--condition-latents", "missing.npy"],
                      ["--editing-layout", "missing.txt", "--condition-latents", "missing.npy",
-                      "--negative-prompt-embeds", "negative.npy"],
-                     ["--editing-layout", "missing.txt", "--condition-latents", "missing.npy",
-                      "--attention", "reverse64"]):
+                      "--negative-prompt-embeds", "negative.npy"]):
             with self.subTest(args=args):
                 result = subprocess.run([str(binary), *args], capture_output=True, text=True)
                 self.assertEqual(result.returncode, 2)

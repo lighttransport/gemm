@@ -69,6 +69,18 @@ def main():
     result = dict(backend=args.backend, torch=torch.__version__, cosine=cosine,
                   relative_l2=float(np.linalg.norm(a-b)/np.linalg.norm(b)),
                   equal_fraction=float(np.mean(a==b)), finite=finite)
+    # The condition prefix can dwarf the target. Report both rather than
+    # letting a large, accurate condition block conceal target-only error.
+    result["regions"] = {}
+    for name, start, end in (("prefix", 0, prefix), ("target", prefix, len(ref))):
+        x, y = native[start:end].astype(np.float64).ravel(), ref[start:end].astype(np.float64).ravel()
+        if not x.size:
+            continue
+        result["regions"][name] = {
+            "cosine": float(x @ y / max(np.linalg.norm(x) * np.linalg.norm(y), 1e-30)),
+            "relative_l2": float(np.linalg.norm(x-y) / max(np.linalg.norm(y), 1e-30)),
+            "equal_fraction": float(np.mean(x == y)),
+        }
     np.save(folder / f"pytorch_attn_matched_{args.backend}.npy", ref)
     (folder / f"attention_probe_{args.backend}.json").write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result))

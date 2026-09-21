@@ -525,8 +525,8 @@ int main(int argc, char **argv) {
     }
     if (steps < 1 || steps > 100 || (manual_t >= 0.0f && steps != 1)) return 2;
     if (!!editing_layout_path != !!condition_path ||
-        (editing_layout_path && (negative_prompt_path || qimg21_attention_reverse64))) {
-        fprintf(stderr,"native: editing requires layout plus condition latents; CFG/reverse64 editing not yet supported\n");
+        (editing_layout_path && negative_prompt_path)) {
+        fprintf(stderr,"native: editing requires layout plus condition latents; CFG editing not yet supported\n");
         return 2;
     }
     if (qimg21_quantize_on_load && qimg21_quantized_transformer) {
@@ -578,7 +578,7 @@ int main(int argc, char **argv) {
     }
     const float *p=pe.data; cuda_qimg_runner*r=cuda_qimg_init(0,verbose);if(!r)return 1;
     q21_edit_context edit={0};
-    if(editing_layout_path && q21_edit_init(&edit,r,editing_layout_path,nt,nc+ni,ih,iw)) {
+    if(editing_layout_path && q21_edit_init(&edit,r,editing_layout_path,nt,nc+ni,ih,iw,qimg21_attention_reverse64)) {
         cuda_qimg_free(r);free(packed);npy_free(&condition);return 1;
     }
     qimg21_shards s={{0},0};char path[1024];for(int i=1;i<=2;i++){snprintf(path,sizeof(path),"%s/transformer/diffusion_pytorch_model-%05d-of-00002.safetensors",model,i);s.st[s.n]=safetensors_open(path);if(!s.st[s.n]){fprintf(stderr,"native: cannot open %s\n",path);cuda_qimg_free(r);return 1;}fprintf(stderr,"native: opened shard %d (%d tensors)\n",i,s.st[s.n]->n_tensors);s.n++;}

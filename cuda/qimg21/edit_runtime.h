@@ -22,7 +22,7 @@ static void q21_edit_free(q21_edit_context *edit) {
 
 /* The layout is validated before allocating CUDA memory. */
 static int q21_edit_init(q21_edit_context *edit, cuda_qimg_runner *r,
-                         const char *path, int nt, int image_tokens, int ih, int iw) {
+                         const char *path, int nt, int image_tokens, int ih, int iw, int reverse64) {
     memset(edit,0,sizeof(*edit));
     int slots,h,w;
     if(q21_layout_read(path,&edit->layout,&slots,&h,&w) || slots!=nt || h!=ih || w!=iw ||
@@ -30,7 +30,7 @@ static int q21_edit_init(q21_edit_context *edit, cuda_qimg_runner *r,
     if(cu_compile_kernels(&edit->module,r->device,q21_edit_src,"qimg21_edit.cu",1,"qimg21_edit")<0 ||
        cuModuleGetFunction(&edit->scatter,edit->module,"edit_scatter") ||
        cuModuleGetFunction(&edit->rope,edit->module,"edit_qk_rope") ||
-       cuModuleGetFunction(&edit->attention,edit->module,"edit_attention"))goto fail;
+       cuModuleGetFunction(&edit->attention,edit->module,reverse64?"edit_attention_reverse64":"edit_attention"))goto fail;
     int n=edit->layout.n;
     #define UPLOAD(field,source,count) do { \
         if(cuMemAlloc(&edit->field,(size_t)(count)*sizeof(int)) || \

@@ -315,8 +315,9 @@ The native denoiser now accepts `--editing-layout layout.txt` together with
 the target latents. It assembles interleaved text/image tokens, applies the
 zero-timestep modulation to the condition prefix, predicts only the target
 tail, and leaves condition latents unchanged through Euler steps. The default
-text-to-image path is unchanged. Editing currently rejects CFG and reverse64
-attention; each requires separate layout-aware validation. This is experimental:
+text-to-image path is unchanged. `--attention reverse64` is now available as
+an opt-in layout-aware arithmetic experiment, with full-model validation still
+pending. CFG editing remains unsupported. This is experimental:
 the first full-model editing prediction (256x256 target, 1024x1024 condition,
 seed42, captured timestep 1) is finite with cosine **0.999932378** and relative
 L2 **0.011906675**. It **fails** the 0.99996 gate. A mid-run total GPU-memory
@@ -357,6 +358,14 @@ cosines **0.999932378 / 0.999845282**, trajectory cosines
 **0.999911016 / 0.999911662**. All outputs are finite. Separately, disabling
 CUDA fast math and FMA for the original text-to-image low-timestep fixture
 gives **0.999953708**, also below the gate; neither diagnostic changes defaults.
+
+First-block editing attention replay on identical native Q/K/V yields cosine
+**0.999999823** versus PyTorch default segmented SDPA (93.7835% exact), and
+**0.999999983** versus math SDPA (99.7820% exact). Math target-only cosine is
+**0.999999997**. These measurements isolate attention from upstream drift;
+they do not establish full-model parity. The attention probe also reports
+prefix and target errors separately to avoid hiding target drift in a large
+condition prefix.
 
 `edit_kernels.h` adds experimental CUDA primitives for that layout:
 interleaved text/image scatter, Q/K RMSNorm plus layout-driven three-axis
