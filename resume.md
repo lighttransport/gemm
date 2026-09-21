@@ -266,6 +266,8 @@ Nonportable snapshots used by the older Qwen4 path remain eligible only while
 their matching device context is resident. They are tagged separately and
 discarded before a reset, identity switch, or portable restore, preserving
 same-context prefix reuse without treating incomplete KV state as portable.
+Exact restored prompts now touch and retain that committed entry instead of
+recapturing the same 234--448 MiB state after each response.
 
 This validation exposed two long-context snapshot bugs that immediate repeats
 had hidden: batched prefill did not publish its final host position, and Q8/Q8

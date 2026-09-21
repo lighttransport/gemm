@@ -39,7 +39,9 @@ its position equals its token-key length, and evicts entries that fail restore.
 Models whose snapshots omit positional KV retain same-resident-context prefix
 reuse, but those entries are marked resident-only and discarded before a
 reset, identity switch, or portable restore. They are never used as
-multi-context snapshots.
+multi-context snapshots. An exact restored prompt retains and touches its
+existing snapshot instead of taking an identical 234--448 MiB device-to-host
+copy after every response.
 
 The real-GPU harness now forces A/B/A switching rather than accepting an
 immediate same-context hit. On RX 9070 XT it restored an actual 6,535-token
@@ -48,7 +50,8 @@ same greedy output, and reported a 448.3 MiB snapshot. It also passed direct
 stdio transactions, seeded sampling, LRU eviction, malformed cache metadata,
 targeted/disconnect cancellation with recovery, concurrent distinct
 identities, and a two-turn C++ generation whose programs compiled and printed
-the expected result. The CPU protocol/template/tool suite passes 31 tests.
+the expected result. Repeated exact prompts restored one committed snapshot
+without republishing it. The CPU protocol/template/tool suite passes 31 tests.
 
 The gate exposed and fixed two portability bugs: batched prefill left the host
 position stale, and Q8/Q8 FP16 scale rows were copied using an FP32 byte size.

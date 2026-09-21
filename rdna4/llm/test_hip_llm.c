@@ -596,6 +596,15 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
             while (common < cache_n && common < n_tokens &&
                    cache[common] == tokens[common]) common++;
         int have_state = cache_n > 0 && common == cache_n;
+        int prompt_snapshot_present = 0;
+        if (have_state && common == n_tokens) {
+            int exact = stdio_snapshot_cache_find(&snapshot_cache,
+                cache_identity, tokens, n_tokens, 1);
+            if (exact >= 0 && snapshot_cache.entries[exact].n_tokens == n_tokens) {
+                snapshot_cache.entries[exact].age = ++snapshot_cache.clock;
+                prompt_snapshot_present = 1;
+            }
+        }
         if (!have_state) {
             int allow_resident = strcmp(active_identity, cache_identity) == 0;
             int hit = stdio_snapshot_cache_find(&snapshot_cache, cache_identity,
@@ -617,6 +626,7 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
                 fprintf(stderr,
                         "llm_server: context snapshot restored slot=%d tokens=%d\n",
                         hit, common);
+                prompt_snapshot_present = common == n_tokens;
                 have_state = 1;
             } else if (hit >= 0) {
                 fprintf(stderr,
@@ -718,7 +728,7 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
          * decoded to UTF-8 and may not re-tokenize to the original BPE pieces
          * on the next turn. If that happens, restore this boundary and replay
          * only the appended conversation suffix instead of resetting. */
-        if (snapshot_cache.entries)
+        if (snapshot_cache.entries && !prompt_snapshot_present)
             pending_prompt_snapshot = hip_llm_snapshot_state(gpu);
         hllm_sampler *sampler = use_reference ? hllm_sampler_create(&request_sampling, n_vocab) : NULL;
         if (use_reference && !sampler) {
