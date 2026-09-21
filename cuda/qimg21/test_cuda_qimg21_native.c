@@ -27,6 +27,7 @@
 #include <sys/stat.h>
 #include "edit_runtime.h"
 #include "mma64_kernels.h"
+#include "norm_vector_kernels.h"
 
 typedef struct {
     st_context *st[4];
@@ -312,14 +313,17 @@ typedef struct {
     CUmodule mod;
     CUfunction zero_rms, gelu, silu, round_bf16, mul_silu, mod_ln, mod_ln_precise, gate_res, qk_rope, attn, final_ln, proj;
     CUfunction mma_attention;
+    int norm_threads;
 } qimg21_kernels;
 
 static int qimg21_attention_reverse64;
 static int qimg21_attention_mma64;
+static int qimg21_norm_vector;
 
 static int get_kernel(qimg21_kernels *k, CUmodule m) {
     k->mod = m;
     k->mma_attention = NULL;
+    k->norm_threads = 256;
     return cuModuleGetFunction(&k->zero_rms, m, "zero_rms") ||
            cuModuleGetFunction(&k->gelu, m, "gelu_tanh") ||
            cuModuleGetFunction(&k->silu, m, "silu") ||
@@ -442,7 +446,7 @@ static int native_step(cuda_qimg_runner *r, qimg21_kernels *k, const qimg21_shar
         char nm[128];
         snprintf(nm,sizeof(nm),"transformer_blocks.%d.attn.to_q.weight",bidx);CUdeviceptr wq=upload_bf16(s,nm);snprintf(nm,sizeof(nm),"transformer_blocks.%d.attn.to_k.weight",bidx);CUdeviceptr wk=upload_bf16(s,nm);snprintf(nm,sizeof(nm),"transformer_blocks.%d.attn.to_v.weight",bidx);CUdeviceptr wv=upload_bf16(s,nm);snprintf(nm,sizeof(nm),"transformer_blocks.%d.attn.to_out.0.weight",bidx);CUdeviceptr wo=upload_bf16(s,nm);snprintf(nm,sizeof(nm),"transformer_blocks.%d.img_mlp.gate_layer.weight",bidx);CUdeviceptr wg=upload_bf16(s,nm);snprintf(nm,sizeof(nm),"transformer_blocks.%d.img_mlp.proj.weight",bidx);CUdeviceptr wp=upload_bf16(s,nm);snprintf(nm,sizeof(nm),"transformer_blocks.%d.img_mlp.out.weight",bidx);CUdeviceptr wmlpo=upload_bf16(s,nm);snprintf(nm,sizeof(nm),"transformer_blocks.%d.attn.norm_q.weight",bidx);CUdeviceptr wqn=upload_f32(s,nm);snprintf(nm,sizeof(nm),"transformer_blocks.%d.attn.norm_k.weight",bidx);CUdeviceptr wkn=upload_f32(s,nm);
         if(!wq||!wk||!wv||!wo||!wg||!wp||!wmlpo||!wqn||!wkn)goto fail_block;
-        void *a1[]={&tmp,&hidden,&mod,&N,&D,&prefix,&(int){0}}; cuLaunchKernel(k->mod_ln,N,1,1,256,1,1,256*sizeof(float),r->stream,a1,NULL); cuCtxSynchronize(); if (launch_vec(k->round_bf16,r->stream,N*D,tmp)!=CUDA_SUCCESS) goto fail_block; probe(r,"mod_ln",tmp,N*D); if (qimg21_stage_block < 0 || bidx == qimg21_stage_block) dump_stage("mod_ln",tmp,(size_t)N*D,N,D); if(launch_cast(r,bf,tmp,N*D)!=CUDA_SUCCESS)goto fail_block;
+        void *a1[]={&tmp,&hidden,&mod,&N,&D,&prefix,&(int){0}}; cuLaunchKernel(k->mod_ln,N,1,1,k->norm_threads,1,1,256*sizeof(float),r->stream,a1,NULL); cuCtxSynchronize(); if (launch_vec(k->round_bf16,r->stream,N*D,tmp)!=CUDA_SUCCESS) goto fail_block; probe(r,"mod_ln",tmp,N*D); if (qimg21_stage_block < 0 || bidx == qimg21_stage_block) dump_stage("mod_ln",tmp,(size_t)N*D,N,D); if(launch_cast(r,bf,tmp,N*D)!=CUDA_SUCCESS)goto fail_block;
         if(gemm(r,q,wq,bf,N,D,D)!=0||gemm(r,kk,wk,bf,N,D,D)!=0||gemm(r,v,wv,bf,N,D,D)!=0||launch_vec(k->round_bf16,r->stream,N*D,q)!=CUDA_SUCCESS||launch_vec(k->round_bf16,r->stream,N*D,kk)!=CUDA_SUCCESS||launch_vec(k->round_bf16,r->stream,N*D,v)!=CUDA_SUCCESS)goto fail_block; probe(r,"q",q,N*D); probe(r,"v",v,N*D); if (qimg21_stage_block < 0 || bidx == qimg21_stage_block) { dump_stage("q",q,(size_t)N*D,N,D); dump_stage("v",v,(size_t)N*D,N,D); }
         if(edit) { void *ar[]={&q,&kk,&wqn,&wkn,(void *)&edit->position,(void *)&N,(void *)&NH}; if(cuLaunchKernel(edit->rope,N,NH,1,HD,1,1,0,r->stream,ar,NULL))goto fail_block; }
         else { void *ar[]={&q,&kk,&wqn,&wkn,&N,&D,&NH,&HD,&nt,&ih,&iw}; cuLaunchKernel(k->qk_rope,N,NH,1,HD,1,1,0,r->stream,ar,NULL); }
@@ -473,7 +477,7 @@ static int native_step(cuda_qimg_runner *r, qimg21_kernels *k, const qimg21_shar
         else { void *aa[]={&att,&q,&kk,&v,&N,&nt,&NH,&HD};cuLaunchKernel(k->attn,NH,(N+3)/4,1,128,1,1,2*32*128*sizeof(float),r->stream,aa,NULL); }
         cuCtxSynchronize(); if (launch_vec(k->round_bf16,r->stream,N*D,att)!=CUDA_SUCCESS) goto fail_block; probe(r,"attn",att,N*D); if (qimg21_stage_block < 0 || bidx == qimg21_stage_block) dump_stage("attn_raw",att,(size_t)N*D,N,D); if(launch_cast(r,bf,att,N*D)!=CUDA_SUCCESS||gemm(r,tmp,wo,bf,N,D,D)!=0||launch_vec(k->round_bf16,r->stream,N*D,tmp)!=CUDA_SUCCESS)goto fail_block; probe(r,"attn_out",tmp,N*D); if (qimg21_stage_block < 0 || bidx == qimg21_stage_block) dump_stage("attn_out",tmp,(size_t)N*D,N,D);
         void *ag[]={&hidden,&tmp,&mod,&N,&D,&prefix,&(int){0}};cuLaunchKernel(k->gate_res,(N*D+255)/256,1,1,256,1,1,0,r->stream,ag,NULL);cuCtxSynchronize(); if (launch_vec(k->round_bf16,r->stream,N*D,hidden)!=CUDA_SUCCESS) goto fail_block;
-        void *a2[]={&tmp,&hidden,&mod,&N,&D,&prefix,&(int){1}};cuLaunchKernel(k->mod_ln,N,1,1,256,1,1,256*sizeof(float),r->stream,a2,NULL);cuCtxSynchronize(); if (launch_vec(k->round_bf16,r->stream,N*D,tmp)!=CUDA_SUCCESS) goto fail_block; if (qimg21_stage_block < 0 || bidx == qimg21_stage_block) dump_stage("mod_ln2",tmp,(size_t)N*D,N,D); if(launch_cast(r,bf,tmp,N*D)!=CUDA_SUCCESS)goto fail_block;
+        void *a2[]={&tmp,&hidden,&mod,&N,&D,&prefix,&(int){1}};cuLaunchKernel(k->mod_ln,N,1,1,k->norm_threads,1,1,256*sizeof(float),r->stream,a2,NULL);cuCtxSynchronize(); if (launch_vec(k->round_bf16,r->stream,N*D,tmp)!=CUDA_SUCCESS) goto fail_block; if (qimg21_stage_block < 0 || bidx == qimg21_stage_block) dump_stage("mod_ln2",tmp,(size_t)N*D,N,D); if(launch_cast(r,bf,tmp,N*D)!=CUDA_SUCCESS)goto fail_block;
         if(gemm(r,mlp0,wg,bf,N,12288,D)!=0||gemm(r,mlp1,wp,bf,N,12288,D)!=0||launch_vec(k->round_bf16,r->stream,N*12288,mlp0)!=CUDA_SUCCESS||launch_vec(k->round_bf16,r->stream,N*12288,mlp1)!=CUDA_SUCCESS)goto fail_block; if (qimg21_stage_block < 0 || bidx == qimg21_stage_block) { dump_stage("mlp_gate",mlp0,(size_t)N*12288,N,12288); dump_stage("mlp_proj",mlp1,(size_t)N*12288,N,12288); } void *am[]={&tmp, &mlp0,&mlp1,&(int){N*12288}};cuLaunchKernel(k->mul_silu,(N*12288+255)/256,1,1,256,1,1,0,r->stream,am,NULL);cuCtxSynchronize(); if (launch_vec(k->round_bf16,r->stream,N*12288,tmp)!=CUDA_SUCCESS) goto fail_block; if (qimg21_stage_block < 0 || bidx == qimg21_stage_block) dump_stage("mlp_act",tmp,(size_t)N*12288,N,12288); if(launch_cast(r,bf,tmp,N*12288)!=CUDA_SUCCESS||gemm(r,tmp,wmlpo,bf,N,D,12288)!=0||launch_vec(k->round_bf16,r->stream,N*D,tmp)!=CUDA_SUCCESS)goto fail_block; if (qimg21_stage_block < 0 || bidx == qimg21_stage_block) dump_stage("mlp_out",tmp,(size_t)N*D,N,D); void *ag2[]={&hidden,&tmp,&mod,&N,&D,&prefix,&(int){1}};cuLaunchKernel(k->gate_res,(N*D+255)/256,1,1,256,1,1,0,r->stream,ag2,NULL);cuCtxSynchronize(); if (launch_vec(k->round_bf16,r->stream,N*D,hidden)!=CUDA_SUCCESS) goto fail_block;
         /* The block owns streamed weight allocations.  Synchronize before
          * releasing them; this also makes the custom-kernel/cuBLAS hand-off
@@ -488,7 +492,7 @@ fail_block: free_d(&wq);free_d(&wk);free_d(&wv);free_d(&wo);free_d(&wg);free_d(&
     if(launch_vec(k->silu,r->stream,2*D,temb)!=CUDA_SUCCESS||launch_vec(k->round_bf16,r->stream,2*D,temb)!=CUDA_SUCCESS||launch_cast(r,bf,temb,2*D)!=CUDA_SUCCESS||gemm(r,scale,w_img,bf,2,D,D)!=0||launch_vec(k->round_bf16,r->stream,2*D,scale)!=CUDA_SUCCESS)goto fail;
     dump_stage("final_hidden",hidden,(size_t)N*D,N,D);
     dump_stage("final_scale",scale,2u*D,2,D);
-    {void *a[]={&tmp,&hidden,&scale,&N,&D,&prefix};cuLaunchKernel(k->final_ln,N,1,1,256,1,1,256*sizeof(double),r->stream,a,NULL);cuCtxSynchronize(); if (launch_vec(k->round_bf16,r->stream,N*D,tmp)!=CUDA_SUCCESS) goto fail; dump_stage("final_ln",tmp,(size_t)N*D,N,D);}
+    {void *a[]={&tmp,&hidden,&scale,&N,&D,&prefix};cuLaunchKernel(k->final_ln,N,1,1,k->norm_threads,1,1,256*sizeof(double),r->stream,a,NULL);cuCtxSynchronize(); if (launch_vec(k->round_bf16,r->stream,N*D,tmp)!=CUDA_SUCCESS) goto fail; dump_stage("final_ln",tmp,(size_t)N*D,N,D);}
     {CUdeviceptr dout=checked_cuMemAlloc((size_t)nout*64*4);if(!dout)goto fail;if(launch_cast(r,bf,tmp+(size_t)prefix*D*4,nout*D)!=CUDA_SUCCESS){free_d(&dout);goto fail;} void *pa[]={&dout,&w_proj,&bf,&nout,&(int){64},&D}; if (cuLaunchKernel(k->proj,(nout*64+255)/256,1,1,256,1,1,0,r->stream,pa,NULL)!=CUDA_SUCCESS || launch_vec(k->round_bf16,r->stream,nout*64,dout)!=CUDA_SUCCESS){free_d(&dout);goto fail;}cuCtxSynchronize();cuMemcpyDtoH(out,dout,(size_t)nout*64*4); dump_stage("out",dout,(size_t)nout*64,nout,64);free_d(&dout);}
     result = 0;
     goto done;
@@ -511,6 +515,12 @@ int main(int argc, char **argv) {
     float manual_t = -1.0f;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--model") && i + 1 < argc) model = argv[++i];
+        else if (!strcmp(argv[i], "--normalization") && i + 1 < argc) {
+            const char *mode=argv[++i];
+            if(!strcmp(mode,"vector4"))qimg21_norm_vector=1;
+            else if(!strcmp(mode,"default"))qimg21_norm_vector=0;
+            else return 2;
+        }
         else if (!strcmp(argv[i], "--quantized-transformer") && i + 1 < argc) qimg21_quantized_transformer = argv[++i];
         else if (!strcmp(argv[i], "--quantize-on-load") && i + 1 < argc) {
             if (strcmp(argv[++i], "int8-row")) return 2;
@@ -618,6 +628,13 @@ int main(int argc, char **argv) {
     qimg21_shards s={{0},0};char path[1024];for(int i=1;i<=2;i++){snprintf(path,sizeof(path),"%s/transformer/diffusion_pytorch_model-%05d-of-00002.safetensors",model,i);s.st[s.n]=safetensors_open(path);if(!s.st[s.n]){fprintf(stderr,"native: cannot open %s\n",path);cuda_qimg_free(r);return 1;}fprintf(stderr,"native: opened shard %d (%d tensors)\n",i,s.st[s.n]->n_tensors);s.n++;}
     qimg21_kernels k;CUmodule m;if(cu_compile_kernels(&m,r->device,qimg21_src,"qimg21_native.cu",verbose,"qimg21_native")<0||get_kernel(&k,m)!=0){fprintf(stderr,"native: custom kernel compile failed\n");return 1;}fprintf(stderr,"native: custom kernels ready\n");
     CUmodule mma_module=NULL;
+    CUmodule norm_module=NULL;
+    if(qimg21_norm_vector) {
+        if(cu_compile_kernels(&norm_module,r->device,q21_norm_vector_src,"qimg21_norm_vector.cu",verbose,"qimg21_norm_vector")<0 ||
+           cuModuleGetFunction(&k.mod_ln,norm_module,"mod_ln_vector") ||
+           cuModuleGetFunction(&k.final_ln,norm_module,"final_ln_vector"))return 1;
+        k.norm_threads=128;
+    }
     if(qimg21_attention_mma64 &&
        (cu_compile_kernels(&mma_module,r->device,q21_mma64_src,"qimg21_mma64.cu",verbose,"qimg21_mma64")<0 ||
         cuModuleGetFunction(&k.mma_attention,mma_module,"q21_flash_reverse64") ||
@@ -670,5 +687,6 @@ int main(int argc, char **argv) {
     free(pred); free(neg_pred); free(sigmas); cuModuleUnload(m); for(int i=0;i<s.n;i++)safetensors_close(s.st[i]);
     q21_edit_free(&edit);q21_edit_free(&negative_edit);free(packed);npy_free(&condition);
     if(mma_module)cuModuleUnload(mma_module);
+    if(norm_module)cuModuleUnload(norm_module);
     cuda_qimg_free(r); npy_free(&pe); npy_free(&neg); npy_free(&la); return rc;
 }

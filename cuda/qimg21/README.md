@@ -418,6 +418,26 @@ The editing timestep-1 prediction is **0.999918015**, also failing and worse
 than default scalar attention despite better first-block replay parity.
 Both full-model experiments completed; no default was changed.
 
+Normalization is separately isolated with `test_norm_vector` and `norm_probe.py`.
+The experimental `--normalization vector4` native option uses vector-four,
+four-warp Welford ordering based on [PyTorch's CUDA layer-normalization
+implementation](https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/native/cuda/layer_norm_kernel.cu).
+On identical saved first-block hidden/modulation tensors it is bit-exact with
+PyTorch across **1,110,016 values** (the default differs in 37 values). It is
+not the default: full low-timestep cosine is **0.999953908**, still failing.
+
+```sh
+make -C cuda/qimg21 test_norm_vector
+cuda/qimg21/test_norm_vector tmp/qimg21-batch2-low tmp/qimg21-norm-vector.npy
+OMP_NUM_THREADS=2 tmp/qimg21-ref-venv/bin/python cuda/qimg21/norm_probe.py \
+  --stage-dir tmp/qimg21-batch2-low --candidate tmp/qimg21-norm-vector.npy \
+  --out tmp/qimg21-norm-vector-results.json
+```
+
+This probe requires exact equality, not just a passing cosine. The native
+option changes block and final normalization; combined attention/normalization
+full-model validation remains necessary despite isolated exactness.
+
 Compare the replay without loading PyTorch or allocating GPU memory:
 
 ```sh
