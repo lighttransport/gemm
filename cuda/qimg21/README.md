@@ -63,7 +63,8 @@ Missing/invalid matrices fail rather than silently falling back to BF16.
 CPU tests compare native reconstruction bit-for-bit with PyTorch BF16 and
 reject invalid scales, shapes, and payloads:
 `make -C cuda/qimg21 test_quant_weights && tmp/qimg21-ref-venv/bin/python cuda/qimg21/test_quant_weights.py`.
-Full-checkpoint export and broad image-quality validation remain unverified.
+Full-checkpoint export and bounded GPU package validation now pass (below);
+broad image-quality validation remains unfinished.
 Streamed row-INT8 GPU calibration establishes a `0.999` model-output gate
 on the bounded matrix below. The regression driver
 selects it only when an actual quantized package or quantize-on-load mode is supplied; `--quantized`
@@ -81,7 +82,33 @@ creating its output directory. On the saved 256x256/seed42 matched-input
 fixture, streamed INT8 denoiser cosine is **0.9995792302** at the low timestep
 and **0.9999601303** at timestep 1, with finite outputs (relative L2 0.02904
 and 0.00896). Both clear the measured 0.999 gate. Full exported-model GPU
-loading remains untested because the workspace lacks space for the copy.
+loading was initially deferred for lack of disk space; the following check
+now covers that path.
+
+After space recovery, a complete original-checkpoint export produced **232
+matrices**, 7,121,043,712 payload bytes (about 6.7 GiB including files), with
+the completion marker written last. The package and streaming paths produce
+**bit-identical** predictions on the saved 256x256/seed42 low-timestep input.
+Both score **0.999569753579132** against PyTorch, relative L2
+**0.029346483906742**, finite and above the calibrated 0.999 INT8 gate.
+This measurement uses the current ordered-GELU implementation and default
+math attention, not the historical pre-GELU numbers above. Reproduce with:
+
+```sh
+OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=1 tmp/qimg21-ref-venv/bin/python cuda/qimg21/quantize_weights.py \
+  --model /mnt/nvme01/models/qimg-21 --out tmp/qimg21-int8-package
+OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=1 tmp/qimg21-ref-venv/bin/python cuda/qimg21/quant_package_regression.py \
+  --model /mnt/nvme01/models/qimg-21 --package tmp/qimg21-int8-package \
+  --reference-dir tmp/qimg21-blockref --step 1 --height-tokens 16 --width-tokens 16 \
+  --work-dir tmp/qimg21-int8-package-low
+```
+
+Export/output directories must be new. The checker requires both original-
+reference parity and package/stream bit equality; it rejects editing and CFG
+fixtures. Results are recorded in `tmp/qimg21-int8-package-low/results.json`.
+This proves full package loading and one matched prediction, not 40-step
+quality or broad packaged-weight regression. Original model files are
+unchanged and the generated package remains outside Git.
 
 The additional calibration matrix passed all eight matched-input predictions
 and eight free-running trajectory checkpoints, all finite:
@@ -697,6 +724,15 @@ RMS/RoPE-attention boundary and its downstream propagation, rather than the
 already exact input projections. Artifacts are
 `tmp/qimg21-replay-block17` and `tmp/qimg21-replay-block17-mixed`.
 CLI guard coverage brings the CPU suite to 26 passing tests.
+
+Replaying attention directly from the saved **PyTorch** block-17 Q/K/V removes
+native RMS/RoPE from the comparison. Flash-style MMA attention still differs:
+cosine 0.999999998275, relative L2 5.87e-5, elementwise equality 99.9712%
+(target equality 99.9718%). Thus RoPE is not the sole source of the local
+error. Disabling NVRTC fast math gives bit-identical output on this fixture.
+A fused score-scaling variant worsens equality to 99.9668% and was removed.
+Inputs, candidates and region metrics are under `tmp/qimg21-exact-attention17`;
+these operator results do not establish full-model acceptance.
 
 Compare the replay without loading PyTorch or allocating GPU memory:
 
