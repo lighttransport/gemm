@@ -13,12 +13,14 @@ normal K=4 gate measured 59.69 tok/s.  Greedy K=7 retained sequence hash
 `630b7cbc72230e0d`.  The production-default K=7 sampled run measured
 69.28 tok/s with `DFLASH2 sampled verifier=exact-window`.
 
-A fresh random-token 64K K=7 run with the same native Q8/Q8 target path also
-passed, but drafted 121 and accepted 45, so its 64-token suffix measured
-24.02 tok/s.  The ordinary target at the same depth remains about 35.7 tok/s.
-This is a context-sensitive acceptance/verification limit rather than a split
-kernel regression; adaptive sidecar disable or a lower-cost long-context
-proposal remains open while the short-context DFlash speedup is retained.
+A fresh random-token 64K K=7 run with the same native Q8/Q8 target path
+confirmed that low acceptance (45/121) made the sidecar reach only 24.02
+tok/s.  The generation harness now disables DFlash2 at target position 32,768
+and resumes ordinary target decode at the transaction boundary.  The guarded
+64K run retains prefix hash `90178de69a24a76e`, emits the same suffix hash
+`5821d77a630592cb`, and measures 35.67 tok/s.  Short greedy and sampled K=7
+gates remain 83.38 and 69.45 tok/s with hashes `44915ec1039a64c8` and
+`630b7cbc72230e0d`; the HTTP/stdio quality harness still passes.
 
 Two other small table-staging probes were rejected.  Staging the native IQ3_S
 512-entry grid measured 42.88 tok/s at 4K and 35.74 tok/s after a random 64K
