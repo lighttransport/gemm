@@ -615,9 +615,13 @@ reflects the remaining measured costs.
    The hipBLASLt bridge now allocates scratch lazily per HIP stream, so a
    target and sidecar stream can safely share a shape without racing a
    workspace.  A two-stream BF16 smoke test passes with identical outputs.
-   Scheduling the actual overlap remains open: retain explicit stream/event
-   dependencies and keep the serial path as the fallback until a measured
-   prefill gain is demonstrated.
+   The opt-in injection path now records a target-ready event before the
+   sidecar stream starts and retains an injection-done event before the next
+   proposal reuses sidecar scratch.  The corrected overlap quality suite
+   passes all HTTP/stdio and C++ checks.  A matched 4K K=7 run measured
+   27.03 tok/s overlap versus 27.21 tok/s serialized with the same sequence
+   hash, so the serial path remains the production default until overlap
+   demonstrates a real throughput gain.
 
 Each optimization should retain the exact sequence hash and response bytes at
 K=4 and K=7, compile the emitted program, and cover non-coding prompts plus

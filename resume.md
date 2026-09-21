@@ -24,6 +24,23 @@ HTTP/stdio, cancellation, cache, concurrency, and multi-turn C++ quality suite
 passes. The strict ordinary 64K target, target-tail fusion, and production
 cache-injection overlap default remain open.
 
+## 2026-09-22 continuation: sidecar overlap ordering hardening
+
+The opt-in `LLM_QWEN35_DFLASH_OVERLAP_INJECT=1` path now records a
+`target_ready` event on the authoritative stream and makes the injection
+stream wait before consuming captured features. The existing `inject_done`
+event still orders the next proposal before sidecar scratch is reused. Event
+creation failure falls back to the serialized injection path, and production
+defaults remain unchanged.
+
+The corrected overlap HTTP/stdio run passed the cancellation, cache,
+concurrency, and multi-turn C++ quality checks. A matched 4K K=7 benchmark
+kept the exact sequence hash `a36ee81632648a4d`; the overlap path measured
+27.03 tok/s (draft/verify/commit `839.592/4756.268/100.127` ms) versus
+27.21 tok/s serialized (`807.164/4762.647/89.550` ms). The dependency is
+therefore retained as safety hardening, while overlap stays opt-in pending a
+measured throughput win.
+
 ## 2026-09-22 continuation: long-context GQA reuse probe
 
 A six-query-head Q8 reuse kernel was prototyped for the 6:1 Qwen3.8 GQA

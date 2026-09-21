@@ -59,6 +59,7 @@ typedef struct hllm_qwen35_dflash2 {
      * checkpoint publication, but the next proposal must wait before reusing
      * the sidecar's feature/KV scratch. */
     hipStream_t inject_stream;
+    hipEvent_t target_ready;
     hipEvent_t inject_done;
     int inject_pending;
 } hllm_qwen35_dflash2;
@@ -73,8 +74,16 @@ static int hllm_dflash_overlap_init(hllm_qwen35_dflash2 *d) {
     if (!d->inject_stream &&
         hipStreamCreateWithFlags(&d->inject_stream, hipStreamNonBlocking) != hipSuccess)
         return -1;
+    if (!d->target_ready &&
+        hipEventCreateWithFlags(&d->target_ready, hipEventDisableTiming) != hipSuccess) {
+        hipStreamDestroy(d->inject_stream);
+        d->inject_stream = NULL;
+        return -1;
+    }
     if (!d->inject_done &&
         hipEventCreateWithFlags(&d->inject_done, hipEventDisableTiming) != hipSuccess) {
+        hipEventDestroy(d->target_ready);
+        d->target_ready = NULL;
         hipStreamDestroy(d->inject_stream);
         d->inject_stream = NULL;
         return -1;
@@ -123,6 +132,7 @@ static void hllm_qwen35_dflash2_free(hip_llm_runner *r) {
     }
 #undef DFLASH_FREE
     if (d->module) hipModuleUnload(d->module);
+    if (d->target_ready) hipEventDestroy(d->target_ready);
     if (d->inject_done) hipEventDestroy(d->inject_done);
     if (d->inject_stream) hipStreamDestroy(d->inject_stream);
     if (d->source) gguf_close_shards(d->source);
@@ -658,6 +668,13 @@ int hip_llm_qwen35_dflash2_commit(hip_llm_runner *r, int position,
     }
     if (hllm_dflash_overlap_enabled() && hllm_dflash_overlap_init(d) == 0) {
         hipStream_t saved_stream = r->stream;
+        /* The verifier normally synchronizes before returning, but keep the
+         * cross-stream dependency explicit: feature capture is produced on
+         * the target stream and injection must never observe a partially
+         * published row if a future verifier path becomes asynchronous. */
+        if (hipEventRecord(d->target_ready, saved_stream) != hipSuccess ||
+            hipStreamWaitEvent(d->inject_stream, d->target_ready, 0) != hipSuccess)
+            return -1;
         r->stream = d->inject_stream;
         int inject_rc = hllm_qwen35_dflash2_inject(r, position, processed);
         r->stream = saved_stream;
