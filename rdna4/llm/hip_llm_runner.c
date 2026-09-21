@@ -13488,6 +13488,7 @@ struct hip_llm_runner {
     int n_ff;
     int n_vocab;
     int max_seq_len;
+    int qwen35_snapshot_max_tokens;
     float rope_freq_base;
     int n_rope_pairs;
     int mrope_sections[4];  /* [temporal, height, width, pad] for M-RoPE */
@@ -33494,7 +33495,8 @@ hip_llm_state_snapshot *hip_llm_snapshot_state(hip_llm_runner *r) {
      * prompts; keep the host copy bounded so long-context serving does not
      * silently consume multiple gigabytes per cached conversation. */
     if (r->qwen35_dflash2 && r->kv_cache_type == HIP_LLM_KV_Q8_0_Q8_0 &&
-        s->position >= 0 && s->position + 1 <= 16384) {
+        s->position >= 0 && s->position + 1 <=
+            (r->qwen35_snapshot_max_tokens > 0 ? r->qwen35_snapshot_max_tokens : 16384)) {
         s->qwen35_kv_count = s->position + 1;
         s->qwen35_key_host = calloc((size_t)s->n_layers, sizeof(void *));
         s->qwen35_value_host = calloc((size_t)s->n_layers, sizeof(void *));
@@ -33684,6 +33686,13 @@ void hip_llm_set_decode_mode(hip_llm_runner *r, int enabled) {
         hipStreamSynchronize(r->stream);
     }
     r->decode_mode = enabled != 0;
+}
+
+void hip_llm_set_qwen35_snapshot_max_tokens(hip_llm_runner *r, int tokens) {
+    if (!r) return;
+    if (tokens < 0) tokens = 0;
+    if (tokens > r->max_seq_len) tokens = r->max_seq_len;
+    r->qwen35_snapshot_max_tokens = tokens;
 }
 
 int hip_llm_n_embd(const hip_llm_runner *r) { return r ? r->n_embd : 0; }

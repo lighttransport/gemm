@@ -252,6 +252,8 @@ tokens; a roughly 10k-token prompt in a 12k context passes repeatability and
 nonzero cache reuse after cancellation recovery. The 14k-token/16k-context
 boundary run also passes. The gate now sends two independent non-coding
 requests concurrently and verifies both answers remain isolated and coherent.
+Deployments that need a larger host snapshot budget can pass
+`--qwen35-snapshot-max-tokens N`; zero keeps the 16k default.
 
 CLI: `--qwen35-dflash2 SIDECAR --qwen35-dflash2-draft 1..7`; it currently
 requires benchmark mode, `--qwen35-batched-prefill`, `--qwen35-decode-graph`

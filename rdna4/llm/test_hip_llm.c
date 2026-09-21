@@ -1069,6 +1069,7 @@ int main(int argc, char **argv) {
     int qwen35_mtp_window = 0;
     const char *qwen35_dflash2_path = NULL;
     int qwen35_dflash2_draft = 4;
+    int qwen35_snapshot_max_tokens = 0;
     const char *load_qwen4_nextn_fusion = NULL;
     /* Q4_K/Q6_K exact verification is host-synchronization bound; recurrent
      * width-2 drafts minimize rejected-suffix work on the RX 9070 XT. */
@@ -1304,6 +1305,8 @@ int main(int argc, char **argv) {
             qwen35_dflash2_path = argv[++i];
         } else if (strcmp(argv[i], "--qwen35-dflash2-draft") == 0 && i + 1 < argc) {
             qwen35_dflash2_draft = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--qwen35-snapshot-max-tokens") == 0 && i + 1 < argc) {
+            qwen35_snapshot_max_tokens = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--inspect-qwen4-nextn") == 0 && i + 1 < argc) {
             inspect_qwen4_nextn = argv[++i];
         } else if (strcmp(argv[i], "--verify-qwen4-nextn") == 0 && i + 1 < argc) {
@@ -1355,6 +1358,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "       [--qwen35-mtp SIDECAR --qwen35-mtp-draft 1..16] (verified dense NextN, benchmark mode)\n");
             fprintf(stderr, "       [--qwen35-mtp-window] (exact Q8/Q8 target windows, draft <=15; requires decode graph)\n");
             fprintf(stderr, "       [--qwen35-dflash2 SIDECAR --qwen35-dflash2-draft 1..7] (exact DFlash2 windows)\n");
+            fprintf(stderr, "       [--qwen35-snapshot-max-tokens N] (bound Qwen3.8 Q8 prompt snapshots)\n");
             fprintf(stderr, "       [--qwen35-reference-math] (diagnostic; incomplete whole-model parity)\n");
             fprintf(stderr, "       [--sampling-profile llama] [--seed N] [--temp T] [--top-k K] [--top-p P] [--min-p P]\n");
             fprintf(stderr, "       [--repeat-penalty R] [--presence-penalty P] [--frequency-penalty F] [--penalty-last-n N]\n");
@@ -1841,6 +1845,8 @@ int main(int argc, char **argv) {
     int n_embd = hip_llm_n_embd(gpu);
     int n_vocab = hip_llm_n_vocab(gpu);
     int n_max_seq = hip_llm_max_seq_len(gpu);
+    if (qwen35_snapshot_max_tokens > 0)
+        hip_llm_set_qwen35_snapshot_max_tokens(gpu, qwen35_snapshot_max_tokens);
     int pass = 1;
 
     if (stdio_server) {

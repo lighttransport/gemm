@@ -307,6 +307,8 @@ void hip_llm_offload(hip_llm_runner *r);
 /* Reset all SSM state (conv + recurrent). Call between conversations for hybrid models. */
 void hip_llm_reset_state(hip_llm_runner *r);
 void hip_llm_set_decode_mode(hip_llm_runner *r, int enabled);
+/* Bound host-side Qwen3.8 Q8 KV snapshots; zero restores the 16K default. */
+void hip_llm_set_qwen35_snapshot_max_tokens(hip_llm_runner *r, int tokens);
 
 /* Save/restore request state at a prompt boundary. Hybrid SSM/PLE state and
  * DFlash2 sidecar state are always captured; bounded Qwen3.8 Q8 KV rows are

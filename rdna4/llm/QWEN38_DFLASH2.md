@@ -344,6 +344,9 @@ run passes repeatability and cache reuse, including after the
    cancellation/recovery sequence. The 14k-token/16k-context boundary run also
    passes. Two independent non-coding requests are also issued concurrently to
    check scheduler serialization and cache isolation.
+   The HTTP/stdio harness forwards `--qwen35-snapshot-max-tokens N` for
+   deployments that deliberately budget larger host-side Q8 KV snapshots; the
+   default remains 16k tokens.
 4. **Kernel and graph count.** Q/gate deinterleave, QK normalization, RoPE
    and Q8/Q8 KV storage are now fused exactly. The remaining small launches
    include SiLU/gating and state preparation. Fuse adjacent operations when

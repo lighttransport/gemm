@@ -44,6 +44,9 @@ def runner_command(args):
     if qwen35_mtp and qwen4_mtp:
         raise ValueError("--qwen35-mtp cannot be combined with --qwen4-mtp")
     cmd = [args.runner, args.model, "--stdio-server", "--gpu-only-bench", "-s", str(args.context)]
+    snapshot_limit = getattr(args, "qwen35_snapshot_max_tokens", 0)
+    if snapshot_limit:
+        cmd += ["--qwen35-snapshot-max-tokens", str(snapshot_limit)]
     if getattr(args, "moe_cache_mb", 0):
         cmd += ["--moe-cache-mb", str(args.moe_cache_mb)]
     trust_mtp = getattr(args, "qwen4_mtp_trust_draft", False)
@@ -818,6 +821,8 @@ def main():
     ap.add_argument("--qwen35-dflash2", metavar="SIDECAR",
                     help="exact Qwen3.8 DFlash2 sidecar for HTTP/stdio serving")
     ap.add_argument("--qwen35-dflash2-draft", type=int, choices=range(1, 8), default=7)
+    ap.add_argument("--qwen35-snapshot-max-tokens", type=int, default=0,
+                    help="bound host-side Qwen3.8 Q8 prompt snapshots (0=16K default)")
     args = ap.parse_args()
     Handler.backend = Backend(args)
     Handler.model = Handler.backend.model
