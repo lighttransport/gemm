@@ -218,6 +218,25 @@ tmp/qimg21-ref-venv/bin/python cuda/qimg21/test_native_text.py \
   --model /mnt/nvme01/models/qimg-21
 ```
 
+The native text acceptance driver captures the official BF16 encoder first,
+then releases that process before running the streamed C encoder:
+
+```sh
+tmp/qimg21-ref-venv/bin/python cuda/qimg21/text_regression.py \
+  --model /mnt/nvme01/models/qimg-21 --negative-prompt "" \
+  --work-dir tmp/qimg21-text-regression
+```
+
+Both the complete pre-final-RMSNorm hidden state and the cropped prompt
+embedding must independently meet cosine `>= 0.99996`. The driver saves
+cosine, relative L2, MAE, and gate results in `results.json`. It rejects
+non-finite outputs, shape mismatches, padded/vision inputs, and inconsistent
+reference cropping. Use a fresh work directory for each run; an explicit
+`--reference-dir` may reuse previously captured official fixtures, but native
+outputs must still be new. `test_text_regression.py` exercises the gate and
+fixture rejection paths without CUDA; passing that unit test does not prove
+the native model meets the gate.
+
 For native true CFG, pass `--negative-prompt` and `--true-cfg-scale` to
 `native_generate.py` (the negative embedding is exported beside the positive
 fixture):
