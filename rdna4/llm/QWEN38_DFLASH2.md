@@ -34,6 +34,17 @@ probe for the repeated mask rows was byte-stable but neutral at 55.51--56.19
 tok/s, so the existing ordered device copies remain the simpler production
 path.
 
+## Five-row Q4_K projection specialization (2026-09-22)
+
+K=4 has exactly five sidecar proposal rows. Its Q4_K/Q8_1 projection now uses
+a compile-time five-row kernel that preserves the multi8 dot-product and
+reduction order while dropping three unused accumulators and row-count tests.
+Two warm repeats kept 124/124 accepted rows and hash `44915ec1039a64c8`;
+`draft_ms` fell to 224.1--226.8 and decode rose to 56.75--57.06 tok/s,
+compared with 274.5--283.8 ms and 55.51--56.19 tok/s for the previous
+multi8 path. The K=7 path continues to use multi8: a sanity gate retained
+140/134, hash `44915ec1039a64c8`, and 74.79 tok/s.
+
 ## Fused sidecar attention merge (2026-09-22)
 
 The DFlash2 verifier now uses a fused attention kernel for schedules of up to

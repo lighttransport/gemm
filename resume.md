@@ -25,6 +25,18 @@ cache, concurrency, and multi-turn C++ quality suite passes. The strict
 ordinary 64K target, target-tail fusion, and production cache-injection
 overlap default remain open.
 
+## 2026-09-22 continuation: five-row Q4_K sidecar projection
+
+K=4 DFlash2 windows have five proposal rows (the anchor plus four mask rows),
+so their Q4_K/Q8_1 projection now uses a compile-time five-row HIP kernel. It
+keeps the multi8 arithmetic and output layout exact while removing the three
+unused accumulators and row-count branches. Two warm K=4 repeats retained
+124/124 acceptance and hash `44915ec1039a64c8`; draft time fell to
+224.1--226.8 ms and decode reached 56.75--57.06 tok/s, versus the prior
+274.5--283.8 ms and 55.51--56.19 tok/s. A K=7 sanity gate still produced
+140/134, hash `44915ec1039a64c8`, and 74.79 tok/s, so the specialization is
+limited to five-row sidecar projections.
+
 ## 2026-09-22 continuation: sidecar overlap ordering hardening
 
 The opt-in `LLM_QWEN35_DFLASH_OVERLAP_INJECT=1` path now records a
