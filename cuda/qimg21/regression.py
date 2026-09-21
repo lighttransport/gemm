@@ -98,7 +98,7 @@ def main() -> int:
     ap.add_argument("--native-bin", default="cuda/qimg21/test_cuda_qimg21_native")
     ap.add_argument("--native-attention", choices=("math", "reverse64", "mma64"), default="math")
     ap.add_argument("--native-normalization", choices=("default", "vector4"), default="default")
-    ap.add_argument("--native-rope", choices=("default", "host-table"), default="default")
+    ap.add_argument("--native-rope", choices=("default", "host-table", "host-table-vector4"), default="default")
     ap.add_argument("--quantized", action="store_true")
     ap.add_argument("--quantized-transformer", type=Path, help="Optional native row-INT8 package")
     ap.add_argument("--quantize-on-load", choices=("int8-row",), help="Quantize each matrix without a disk export")

@@ -550,6 +550,25 @@ TMPDIR="$PWD/tmp" make -C cuda/qimg21 test_scheduler
 tmp/qimg21-ref-venv/bin/python cuda/qimg21/test_native_output.py
 ```
 
+An additional opt-in `--rope host-table-vector4` (Python wrappers:
+`--native-rope host-table-vector4`) retains host frequencies and changes only
+Q/K RMS reduction to PyTorch's four-adjacent-values-per-lane, descending
+32-lane sum. `rope_probe.py` independently reproduces both reduction trees.
+On saved first-block Q, the old RMS tree differs in 9 values while the vector
+tree matches official RMSNorm exactly. Native combined RMS/RoPE leaves 5 tiny
+complex-arithmetic differences among 1,110,016 values (relative L2 9.58e-9).
+Original weights, `mma64` attention and `vector4` layer normalization give:
+
+| Matched low-timestep prediction | Host table | Host table + vector RMS | Gate |
+| --- | ---: | ---: | --- |
+| 256x256, seed42 | 0.999961807 | 0.999962479 | pass |
+| 256x512, seed123 | 0.999937836 | 0.999944498 | fail |
+| 512x512, seed7 | 0.999946099 | 0.999948000 | fail |
+
+Artifacts are `tmp/qimg21-rms-vector-{low,rect-low,512-low}`. These are isolated
+matched-input predictions, not a rerun of all trajectories or editing/CFG.
+No defaults or acceptance thresholds change. CPU tests remain 25/25 passing.
+
 Compare the replay without loading PyTorch or allocating GPU memory:
 
 ```sh

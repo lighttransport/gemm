@@ -34,7 +34,7 @@ def main():
     ap.add_argument("--work-dir", required=True, type=Path)
     ap.add_argument("--native-attention", choices=("math", "reverse64", "mma64"), default="math")
     ap.add_argument("--native-normalization", choices=("default", "vector4"), default="default")
-    ap.add_argument("--native-rope", choices=("default", "host-table"), default="default")
+    ap.add_argument("--native-rope", choices=("default", "host-table", "host-table-vector4"), default="default")
     args = ap.parse_args()
     ref = args.reference_dir.resolve()
     predictions = sorted(ref.glob("pred_*.npy"))

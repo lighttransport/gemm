@@ -544,6 +544,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--rope") && i+1<argc) {
             const char *mode=argv[++i];
             if(!strcmp(mode,"host-table"))qimg21_host_rope=1;
+            else if(!strcmp(mode,"host-table-vector4"))qimg21_host_rope=2;
             else if(!strcmp(mode,"default"))qimg21_host_rope=0;
             else return 2;
         }
@@ -664,7 +665,8 @@ int main(int argc, char **argv) {
     CUmodule rope_module=NULL;
     if(qimg21_host_rope &&
        (cu_compile_kernels(&rope_module,r->device,q21_rope_table_src,"qimg21_rope_table.cu",verbose,"qimg21_rope_table")<0 ||
-        cuModuleGetFunction(&k.table_rope,rope_module,"qk_rope_table")))return 1;
+        cuModuleGetFunction(&k.table_rope,rope_module,qimg21_host_rope==2?
+                            "qk_rope_table_vector4":"qk_rope_table")))return 1;
     if(qimg21_norm_vector) {
         if(cu_compile_kernels(&norm_module,r->device,q21_norm_vector_src,"qimg21_norm_vector.cu",verbose,"qimg21_norm_vector")<0 ||
            cuModuleGetFunction(&k.mod_ln,norm_module,"mod_ln_vector") ||

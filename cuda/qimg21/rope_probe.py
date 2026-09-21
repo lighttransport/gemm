@@ -47,6 +47,15 @@ def main():
             half = square.shape[-1] // 2
             square = square[..., :half] + square[..., half:]
         tree_normalized = (q.float() * torch.rsqrt(square / 128 + 1e-6)).bfloat16() * norm.weight
+        # PyTorch's contiguous mean reduction combines four adjacent values
+        # per lane, then reduces the 32 lanes in descending offset order.
+        grouped = q.float().square().reshape(*q.shape[:-1], 32, 4)
+        vector_sum = ((grouped[..., 0] + grouped[..., 1]) + grouped[..., 2]) + grouped[..., 3]
+        while vector_sum.shape[-1] > 1:
+            half = vector_sum.shape[-1] // 2
+            vector_sum = vector_sum[..., :half] + vector_sum[..., half:]
+        vector_normalized = (q.float() * torch.rsqrt(vector_sum / 128 + 1e-6)).bfloat16() * norm.weight
+        vector_mismatch = int(torch.count_nonzero(normalized != vector_normalized).item())
         tree_rotated = apply_rotary_emb_qwen(tree_normalized, frequencies, use_real=False).float().cpu().numpy().reshape(-1, 4096)
         norm_mismatch = int(torch.count_nonzero(normalized != tree_normalized).item())
     if args.export_replay:
@@ -60,6 +69,7 @@ def main():
     result = {"cosine": cosine, "relative_l2": relative_l2, "exact_fraction": float(np.mean(~mismatch)),
               "mismatches": int(mismatch.sum()), "per_channel": mismatch.sum(axis=(0, 1)).tolist(),
               "rms_reduction_mismatches": norm_mismatch,
+              "vector4_rms_reduction_mismatches": vector_mismatch,
               "tree_rms_official_rope_mismatches": int(np.count_nonzero(tree_rotated != expected)),
               "native_vs_tree_rms_official_rope_mismatches": int(np.count_nonzero(native != tree_rotated))}
     (folder / "rope_probe.json").write_text(json.dumps(result, indent=2) + "\n")
