@@ -19,6 +19,7 @@ import time
 from pathlib import Path
 
 import numpy as np
+from PIL import Image
 
 
 def _torch():
@@ -54,11 +55,14 @@ def _save_array(path: Path, value) -> None:
     np.save(path, np.asarray(value))
 
 
-def _dump_prompt(pipe, prompt: str, out_dir: Path) -> None:
+def _dump_prompt(pipe, prompt: str, out_dir: Path, image=None) -> None:
     torch = _torch()
     with torch.inference_mode():
         embeds, mask, image_mask = pipe.encode_prompt(
-            prompt=prompt, device=torch.device("cuda"), num_images_per_prompt=1
+            prompt=prompt,
+            image=image,
+            device=torch.device("cuda"),
+            num_images_per_prompt=1,
         )
     _save_array(out_dir / "prompt_embeds.npy", embeds)
     _save_array(out_dir / "prompt_mask.npy", mask if mask is not None else np.ones(embeds.shape[:2], dtype=np.bool_))
@@ -74,6 +78,7 @@ def generate(args) -> int:
     pipe = _load_pipe(model, args.dtype)
     if max(args.height, args.width) > 1024:
         pipe.vae.enable_tiling()
+    image = Image.open(args.image) if args.image else None
     out_dir = Path(args.dump_dir) if args.dump_dir else None
 
     generator = torch.Generator(device="cuda").manual_seed(args.seed)
@@ -118,6 +123,9 @@ def generate(args) -> int:
 
     result = pipe(
         prompt=args.prompt,
+        image=image,
+        negative_prompt=args.negative_prompt,
+        true_cfg_scale=args.true_cfg_scale,
         height=args.height,
         width=args.width,
         num_inference_steps=args.steps,
@@ -149,6 +157,9 @@ def main() -> int:
     ap.add_argument("--test-text", action="store_true", help="dump prompt embeddings")
     ap.add_argument("--model", required=True)
     ap.add_argument("--prompt", default="a red apple on a white table")
+    ap.add_argument("--image", help="optional condition image for editing")
+    ap.add_argument("--negative-prompt", default=None)
+    ap.add_argument("--true-cfg-scale", type=float, default=1.0)
     ap.add_argument("--height", type=int, default=1024)
     ap.add_argument("--width", type=int, default=1024)
     ap.add_argument("--steps", type=int, default=40)

@@ -64,12 +64,28 @@ Native mode compares every C/NVRTC scheduler checkpoint directly against the
 PyTorch reference using the exact `initial_latents.npy` fixture and does not
 require a VAE image decode.
 
-The first deliverable is batch-1 text-to-image with the model’s recommended
-no-guidance path. Condition-image editing, true CFG, and quantized weights
-remain outside this runner. The native executable currently takes the text
+The first native deliverable is batch-1 text-to-image with the model’s
+recommended no-guidance path. Condition-image editing, true CFG, and
+quantized weights remain outside the native path. The native executable takes the text
 encoder output as an F32 `.npy` fixture; text-tokenisation and the Qwen3-VL
 text encoder remain at that Python boundary. The scheduler loop is native now,
 while the official Qwen-Image 2.1 VAE is used as a separate decode stage.
+
+The Python reference/runner also expose the model’s editing and true-CFG
+controls for baseline comparisons:
+
+```sh
+tmp/qimg21-ref-venv/bin/python cuda/qimg21/test_cuda_qimg21.py \
+  --generate --model /mnt/nvme01/models/qimg-21 \
+  --prompt "change the background to a sunset beach" \
+  --image input.png --negative-prompt "blurry, distorted" \
+  --true-cfg-scale 4.0 --height 512 --width 512 \
+  --steps 40 --out tmp/qimg21-edit.png
+```
+
+These controls are currently a Python baseline; the native C denoiser remains
+text-only/no-guidance until image conditioning and the second CFG pass are
+ported and accepted against the same checkpoint gate.
 
 ## Native transformer step
 

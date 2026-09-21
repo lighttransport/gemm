@@ -55,6 +55,9 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model", required=True)
     ap.add_argument("--prompt", default="a red apple on a white table")
+    ap.add_argument("--image", help="optional condition image for Python editing cases")
+    ap.add_argument("--negative-prompt")
+    ap.add_argument("--true-cfg-scale", type=float, default=1.0)
     ap.add_argument("--dtype", choices=("bf16", "fp16"), default="bf16")
     ap.add_argument(
         "--case",
@@ -83,6 +86,8 @@ def main() -> int:
     model = Path(args.model).resolve()
     if not model.is_dir():
         raise SystemExit(f"model directory does not exist: {model}")
+    if args.native and (args.image or args.true_cfg_scale != 1.0):
+        raise SystemExit("--native currently supports text-to-image/no-guidance fixtures only")
     work = Path(args.work_dir)
     if not work.is_absolute():
         work = root / work
@@ -118,6 +123,12 @@ def main() -> int:
             "--seed",
             str(case.seed),
         ]
+        if args.image:
+            common.extend(["--image", str(Path(args.image).resolve())])
+        if args.negative_prompt is not None:
+            common.extend(["--negative-prompt", args.negative_prompt])
+        if args.true_cfg_scale != 1.0:
+            common.extend(["--true-cfg-scale", str(args.true_cfg_scale)])
         print(f"\n=== {case.name} ===", flush=True)
         try:
             _run(

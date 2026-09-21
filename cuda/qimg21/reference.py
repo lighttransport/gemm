@@ -10,12 +10,16 @@ import time
 from pathlib import Path
 
 import numpy as np
+from PIL import Image
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     ap.add_argument("--prompt", default="a red apple on a white table")
+    ap.add_argument("--image", help="optional condition image for editing")
+    ap.add_argument("--negative-prompt", default=None)
+    ap.add_argument("--true-cfg-scale", type=float, default=1.0)
     ap.add_argument("--height", type=int, default=256)
     ap.add_argument("--width", type=int, default=256)
     ap.add_argument("--steps", type=int, default=1)
@@ -36,6 +40,7 @@ def main() -> int:
         raise SystemExit("reference requires CUDA")
     out = Path(args.dump_dir)
     out.mkdir(parents=True, exist_ok=True)
+    image = Image.open(args.image) if args.image else None
     dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
     pipe = QwenImage21Pipeline.from_pretrained(
         str(Path(args.model).resolve()), dtype=dtype, local_files_only=True
@@ -71,6 +76,9 @@ def main() -> int:
     t0 = time.perf_counter()
     result = pipe(
         prompt=args.prompt,
+        image=image,
+        negative_prompt=args.negative_prompt,
+        true_cfg_scale=args.true_cfg_scale,
         height=args.height,
         width=args.width,
         num_inference_steps=args.steps,
