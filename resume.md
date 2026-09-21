@@ -41,6 +41,15 @@ kept the exact sequence hash `a36ee81632648a4d`; the overlap path measured
 therefore retained as safety hardening, while overlap stays opt-in pending a
 measured throughput win.
 
+## 2026-09-22 continuation: IQ2_XXS block-shape probe
+
+I tested 128- and 512-thread blocks for the native one-row IQ2_XXS kernel
+using the same 4K random-token gate and Q8/Q8 graph path. Both shapes kept
+the exact prefix/suffix hashes `1c891c2232aa1b7f`/`ab4dd24f5cdf0b2c`; three
+repeat decode means were 39.68 tok/s at the retained 256-thread shape and
+39.64 tok/s at 512 threads. The alternate launch geometry was removed, so
+the mixed projection traffic target remains open.
+
 ## 2026-09-22 continuation: long-context GQA reuse probe
 
 A six-query-head Q8 reuse kernel was prototyped for the 6:1 Qwen3.8 GQA

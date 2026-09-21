@@ -542,6 +542,12 @@ reflects the remaining measured costs.
    IQ1_M F32 up kernel was exact but 41.74 versus 41.90 tok/s on the pinned
    C++ gate, so it was removed.  The 64K ordinary 40 tok/s gap therefore
    remains a grouped mixed-type projection problem.
+   A 128- and 512-thread block-shape probe for the native IQ2_XXS one-row
+   kernel retained the 4K random prefix/suffix hashes
+   `1c891c2232aa1b7f`/`ab4dd24f5cdf0b2c`, but three-repeat decode means were
+   39.68 tok/s at 256 threads and 39.64 tok/s at 512. The alternate geometry
+   was removed; its extra rows per block did not reduce the long-context
+   projection cost.
 2. **Verifier attention tail.** The query-grid verifier now selects ordinary
    decode's split count independently for every causal row. Equal-split
    windows now select a dedicated captured shared-K/V graph; split boundaries
