@@ -507,23 +507,24 @@ int hip_llm_qwen35_dflash2_propose(hip_llm_runner *r, int32_t anchor,
     int rows=count+1, ne=r->n_embd, qd=HLLM_DFLASH_HEADS*HLLM_DFLASH_HEAD_DIM;
     int kd=HLLM_DFLASH_KV_HEADS*HLLM_DFLASH_HEAD_DIM;
     d->q81_source=NULL;
-    launch_embed_iq1_m(r,d->x,r->d_token_embd,anchor,ne);
-    if (rows > 1 && r->fn_embed_iq1_m_batch) {
-        /* The mask rows are identical for every proposal.  Publish their
-         * token ids into the sidecar scratch already owned by this stream and
-         * decode them with one exact IQ1_M batch launch.  The selector writes
-         * the same scratch only after this batch has consumed it. */
-        int mask_tokens[HLLM_DFLASH_MAX_BLOCK - 1];
-        for (int i = 0; i < rows - 1; ++i) mask_tokens[i] = d->mask_token;
-        if (hipMemcpyAsync(d->selector_drafts, mask_tokens,
-                           (size_t)(rows - 1) * sizeof(int),
+    if (r->fn_embed_iq1_m_batch) {
+        /* The anchor and mask rows use the same exact IQ1_M decode contract.
+         * Publish all row ids into the selector-candidate scratch (which is
+         * consumed by top-k only after this launch) and perform one batched
+         * embedding instead of a scalar anchor launch plus a mask launch. */
+        int row_tokens[HLLM_DFLASH_MAX_BLOCK];
+        row_tokens[0] = anchor;
+        for (int i = 1; i < rows; ++i) row_tokens[i] = d->mask_token;
+        if (hipMemcpyAsync(d->selector_candidates, row_tokens,
+                           (size_t)rows * sizeof(int),
                            hipMemcpyHostToDevice, r->stream) != hipSuccess) {
             r->qwen4_forward_error = 1;
             return -1;
         }
-        launch_embed_iq1_m_batch(r, (float *)d->x + ne, r->d_token_embd,
-                                 d->selector_drafts, ne, rows - 1);
+        launch_embed_iq1_m_batch(r, d->x, r->d_token_embd,
+                                 d->selector_candidates, ne, rows);
     } else {
+        launch_embed_iq1_m(r,d->x,r->d_token_embd,anchor,ne);
         for (int i=1;i<rows;++i)
             launch_embed_iq1_m(r,(float *)d->x+(size_t)i*ne,r->d_token_embd,d->mask_token,ne);
     }

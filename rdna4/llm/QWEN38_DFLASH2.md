@@ -1,14 +1,20 @@
 # Qwen3.8 DFlash2 on RDNA4
 
-## Draft mask embedding cleanup (2026-09-22)
+## Draft embedding launch cleanup (2026-09-22)
 
-Each DFlash2 proposal keeps the anchor embedding scalar and now decodes the
-remaining fixed mask-token rows with one exact `embed_iq1_m_batch` launch. The
-mask IDs use sidecar-owned scratch until the selector consumes and overwrites
-that buffer later in the same stream, so target verification and selector
-state are unchanged. The current K=7 coding gate remains exact (41/42 accepted,
-hash `15f17d2640c1adfc`) at 79.55 tok/s, and the full HTTP/stdio cache,
-cancellation, concurrency, and multi-turn C++ quality harness passes.
+Each DFlash2 proposal now publishes the anchor and fixed mask-token IDs into
+the selector-candidate scratch and decodes all rows with one exact
+`embed_iq1_m_batch` launch. The selector overwrites that scratch only after the
+embedding launch has consumed it on the same stream; the scalar embedding
+fallback remains available when the batch entry point is absent. Target
+verification, selector state, and captured graph arguments are unchanged.
+
+The pinned 4K C++ merge benchmark improved greedy K=7 from the previous
+79.88 tok/s run to 83.69 tok/s warm (140 drafted, 134 accepted), with stable
+hash `44915ec1039a64c8`; draft time fell to about 264 ms for 140 proposals.
+Seeded sampled K=7 measured 70.47 tok/s warm (140 drafted, 115 accepted) with
+stable hash `630b7cbc72230e0d` and about 250 ms draft time. The full HTTP/stdio
+cache, cancellation, concurrency, and multi-turn C++ quality harness passes.
 
 ## Fused sidecar attention merge (2026-09-22)
 

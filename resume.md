@@ -14,13 +14,25 @@
 5. Prepare safe sidecar cache-injection overlap with per-stream workspaces;
    production defaults remain unchanged until measured gains are demonstrated.
 
-The sidecar attention merge is landed, and this pass also batches the fixed
-mask-token IQ1_M embeddings into one exact row-batched launch. The current K=7
-coding gate remains exact (`15f17d2640c1adfc`, 41/42 accepted) at 79.55 tok/s;
-the full HTTP/stdio, cancellation, cache, and multi-turn C++ quality suite
-passes. The batch launch is a small launch-count cleanup rather than a claimed
-headline speedup; the strict ordinary 64K target, target-tail fusion, and
-production overlap default remain open.
+The sidecar attention merge is landed, and DFlash2 proposal embedding now uses
+one exact row-batched IQ1_M launch for the anchor plus fixed mask rows. The
+pinned 4K C++ merge gate is byte-stable: greedy K=7 is 83.69 tok/s warm with
+140 drafted/134 accepted and hash `44915ec1039a64c8`; seeded sampled K=7 is
+70.47 tok/s with 140 drafted/115 accepted and hash `630b7cbc72230e0d`. Draft
+time is about 264 ms (greedy) or 250 ms (sampled) for 140 proposals. The full
+HTTP/stdio, cancellation, cache, concurrency, and multi-turn C++ quality suite
+passes. The strict ordinary 64K target, target-tail fusion, and production
+cache-injection overlap default remain open.
+
+## 2026-09-22 continuation: long-context GQA reuse probe
+
+A six-query-head Q8 reuse kernel was prototyped for the 6:1 Qwen3.8 GQA
+layout. It retained the ordinary 4K and random-token 64K sequence hashes, but
+measured about 42.5 tok/s at 4K and 35.66 tok/s at 64K versus the established
+three-head path near 43.0 and 35.76 tok/s. The prototype was reverted; the
+existing exact three-head reuse path remains the production choice while the
+remaining 64K gap is addressed through grouped projection traffic and verifier
+tail work.
 
 ## 2026-09-22 continuation: fused DFlash2 split merge
 
