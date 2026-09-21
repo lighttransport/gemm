@@ -1,5 +1,17 @@
 # Qwen3.8 DFlash2 on RDNA4
 
+## Packed Q8/Q8 KV scales (2026-09-21)
+
+Q8 K/V cache scales now use the same rounded FP16 contract as the stored
+packed-F16 cache values.  The native attention kernels consume the 16-bit
+scales directly, halving scale-cache traffic and preserving the existing
+Q8/Q8 arithmetic.  The exact differential test passes 49,188,864 bitwise
+comparisons, including 64K split counts and the multi-query reuse paths.  A
+graph-captured 506-token zero-depth run completed at 43.1--43.2 tok/s with
+stable output and `Result: PASS`.  The long-context operator differential is
+also clean; a full 64K runner gate still needs to be rerun after the next
+long-context allocation cleanup.
+
 The Qwen3.8 runner can load the
 [IncoAI Qwen3.8-27B DFlash2 GGUF](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2-GGUF)
 as an opt-in draft sidecar.  The implementation is native HIP and does not

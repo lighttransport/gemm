@@ -1,5 +1,17 @@
 # Qwen3.8 27B HIP runner vs llama.cpp — resume state
 
+## Packed Q8/Q8 KV scales (2026-09-21)
+
+The Q8 K/V cache now stores its per-group scales as rounded FP16 values and
+the native attention path consumes those packed scales directly.  This halves
+scale-cache bandwidth without changing the quantization contract.  The
+reference attention gate remains bitwise clean across 49,188,864 comparisons,
+including 64K split and multi-query reuse cases.  A captured zero-depth decode
+completed 506 generated tokens at 43.1--43.2 tok/s with stable output.  The
+full random 64K runner gate should be repeated after the long-context
+allocation path is refreshed; the attention differential already covers the
+64K operator.
+
 ## Optimized native DFlash2 (2026-09-21)
 
 The runner now loads the IncoAI Qwen3.8-27B DFlash2 Q4_K_M sidecar and runs

@@ -40,6 +40,7 @@ int main() {
         int occupancy=queries==1?ref_occupancy:batch_occupancy;
         const int padded=(length+255)/256*256;
         std::vector<float> q(output_size),ks(padded*kv_heads*8),vs(ks.size());
+        std::vector<q8_half> ks16(ks.size()),vs16(ks.size());
         std::vector<signed char> k(padded*kv_heads*dim),v(k.size());
         std::vector<block_q8_0> rk(ks.size()),rv(ks.size());
         std::vector<half> mask(padded*queries);
@@ -48,6 +49,7 @@ int main() {
         for(size_t i=0;i<ks.size();++i) {
             ks[i]=__half2float(__float2half((rng()%1000+1)*.0001f));
             vs[i]=__half2float(__float2half((rng()%1000+1)*.0001f));
+            ks16[i]=(q8_half)ks[i];vs16[i]=(q8_half)vs[i];
             rk[i].d=__float2half(ks[i]);rv[i].d=__float2half(vs[i]);
             for(int j=0;j<32;++j) {
                 k[i*32+j]=rk[i].qs[j]=pattern==2 ? 0 : int(rng()%255)-127;
@@ -56,7 +58,7 @@ int main() {
         }
         for(int row=0;row<queries;++row)
             for(int i=0;i<padded;++i) mask[row*padded+i]=__float2half(i<length-queries+row+1?0.0f:-INFINITY);
-        float *dq=upload(q),*dks=upload(ks),*dvs=upload(vs);
+        float *dq=upload(q);auto *dks=upload(ks16),*dvs=upload(vs16);
         auto *dk=upload(k),*dv=upload(v);
         auto *drk=upload(rk),*drv=upload(rv);
         auto *dm=upload(mask);

@@ -105,6 +105,11 @@ static const char *hip_kernel_source =
 "    *((unsigned short*)&hv) = h;\n"
 "    return __half2float(hv);\n"
 "}\n"
+"__device__ __forceinline__ half_raw f32_to_half_raw(float x) {\n"
+"    unsigned int h;\n"
+"    asm volatile(\"v_cvt_f16_f32 %0, %1\" : \"=v\"(h) : \"v\"(x));\n"
+"    return (half_raw)h;\n"
+"}\n"
 "\n"
 "__device__ __forceinline__ unsigned char f32_to_fp8_e4m3_dev(float f) {\n"
 "    if (!(f==f)) return 0x7f; if (f==0.0f) return 0;\n"
@@ -630,7 +635,7 @@ static const char *hip_kernel_source =
 "        const float *qw, const float *kw, int n_q_heads, int n_kv_heads,\n"
 "        int head_dim, float eps, const int *pos_p, float freq_base,\n"
 "        int sect0, int sect1, int sect2, int sect3, int store_q8q8,\n"
-"        signed char *kc, signed char *vc, float *ks, float *vs) {\n"
+"        signed char *kc, signed char *vc, half_raw *ks, half_raw *vs) {\n"
 "    extern __shared__ float sdata[];\n"
 "    int bh = blockIdx.x, tid = threadIdx.x, NT = blockDim.x;\n"
 "    bool is_k = bh >= n_q_heads;\n"
@@ -700,8 +705,8 @@ static const char *hip_kernel_source =
 "            vc[o] = (signed char)roundf(qv);\n"
 "            if (lane == 0) {\n"
 "                size_t sg = ((size_t)pos * n_kv_heads + h) * groups + group;\n"
-"                ks[sg] = round_f16_contract(dk);\n"
-"                vs[sg] = round_f16_contract(dv);\n"
+"                ks[sg] = f32_to_half_raw(round_f16_contract(dk));\n"
+"                vs[sg] = f32_to_half_raw(round_f16_contract(dv));\n"
 "            }\n"
 "        }\n"
 "    }\n"
@@ -11111,14 +11116,14 @@ static const char *hip_kernel_source =
 "    }\n"
 "}\n"
 "__global__ void pack_kv_q8q4_f16(half_raw *dst, const void *src, const float *scales, int kv_len, int n_kv_heads, int head_dim, int is_v) {\n"
-"    int t=blockIdx.x,h=blockIdx.y,d=threadIdx.x;if(t>=kv_len||h>=n_kv_heads||d>=head_dim)return;int groups=(head_dim+31)/32;float v;if(is_v<=0){int g=d/32;float s=scales[((size_t)t*n_kv_heads+h)*groups+g];const signed char *p=(const signed char *)src;float q=(float)p[(size_t)t*n_kv_heads*head_dim+h*head_dim+d];if(is_v<0){asm volatile(\"v_mul_f32 %0, %1, %2\":\"=v\"(v):\"v\"(q),\"v\"(s));}else v=q*s;}else{int g=d/32,j=d&31,bi=g*16+(j&15);float s=scales[((size_t)t*n_kv_heads+h)*groups+g];const unsigned char *p=(const unsigned char *)src;unsigned char z=p[(size_t)t*n_kv_heads*(head_dim/2)+h*(head_dim/2)+bi];v=(float)(((j<16)?(z&15):(z>>4))-8)*s;}dst[((size_t)h*kv_len+t)*head_dim+d]=f32_to_f16_bits(v);\n"
+"    int t=blockIdx.x,h=blockIdx.y,d=threadIdx.x;if(t>=kv_len||h>=n_kv_heads||d>=head_dim)return;int groups=(head_dim+31)/32;float v;if(is_v<=0){int g=d/32;size_t si=((size_t)t*n_kv_heads+h)*groups+g;float s=is_v<0?half_to_float(((const half_raw *)scales)[si]):scales[si];const signed char *p=(const signed char *)src;float q=(float)p[(size_t)t*n_kv_heads*head_dim+h*head_dim+d];if(is_v<0){asm volatile(\"v_mul_f32 %0, %1, %2\":\"=v\"(v):\"v\"(q),\"v\"(s));}else v=q*s;}else{int g=d/32,j=d&31,bi=g*16+(j&15);float s=scales[((size_t)t*n_kv_heads+h)*groups+g];const unsigned char *p=(const unsigned char *)src;unsigned char z=p[(size_t)t*n_kv_heads*(head_dim/2)+h*(head_dim/2)+bi];v=(float)(((j<16)?(z&15):(z>>4))-8)*s;}dst[((size_t)h*kv_len+t)*head_dim+d]=f32_to_f16_bits(v);\n"
 "}\n"
 "__global__ void unpack_kv_q8q4_decode_f16(half_raw *dst, const void *src, const float *scales, int kv_len, int n_kv_heads, int head_dim, int is_v) {\n"
-"    int i=blockIdx.x*blockDim.x+threadIdx.x,total=kv_len*n_kv_heads*head_dim;if(i>=total)return;int t=i/(n_kv_heads*head_dim),z=i%(n_kv_heads*head_dim),h=z/head_dim,d=z%head_dim,groups=(head_dim+31)/32,g=d/32;float s=scales[((size_t)t*n_kv_heads+h)*groups+g],v;\n"
+"    int i=blockIdx.x*blockDim.x+threadIdx.x,total=kv_len*n_kv_heads*head_dim;if(i>=total)return;int t=i/(n_kv_heads*head_dim),z=i%(n_kv_heads*head_dim),h=z/head_dim,d=z%head_dim,groups=(head_dim+31)/32,g=d/32;size_t si=((size_t)t*n_kv_heads+h)*groups+g;float s=is_v<0?half_to_float(((const half_raw *)scales)[si]):scales[si],v;\n"
 "    if(is_v<=0){const signed char *p=(const signed char *)src;float q=(float)p[(size_t)t*n_kv_heads*head_dim+h*head_dim+d];if(is_v<0){asm volatile(\"v_mul_f32 %0, %1, %2\":\"=v\"(v):\"v\"(q),\"v\"(s));}else v=q*s;}else{int j=d&31,bi=g*16+(j&15);const unsigned char *p=(const unsigned char *)src;unsigned char q=p[(size_t)t*n_kv_heads*(head_dim/2)+h*(head_dim/2)+bi];v=(float)(((j<16)?(q&15):(q>>4))-8)*s;}dst[(size_t)t*n_kv_heads*head_dim+h*head_dim+d]=f32_to_f16_bits(v);\n"
 "}\n"
 "__global__ void unpack_kv_q8q4_decode_f16_devp(half_raw *dst, const void *src, const float *scales, const int *position, int n_kv_heads, int head_dim, int is_v) {\n"
-"    int kv_len=*position+1; int i=blockIdx.x*blockDim.x+threadIdx.x,total=kv_len*n_kv_heads*head_dim;if(i>=total)return;int t=i/(n_kv_heads*head_dim),z=i%(n_kv_heads*head_dim),h=z/head_dim,d=z%head_dim,groups=(head_dim+31)/32,g=d/32;float s=scales[((size_t)t*n_kv_heads+h)*groups+g],v;\n"
+"    int kv_len=*position+1; int i=blockIdx.x*blockDim.x+threadIdx.x,total=kv_len*n_kv_heads*head_dim;if(i>=total)return;int t=i/(n_kv_heads*head_dim),z=i%(n_kv_heads*head_dim),h=z/head_dim,d=z%head_dim,groups=(head_dim+31)/32,g=d/32;size_t si=((size_t)t*n_kv_heads+h)*groups+g;float s=is_v<0?half_to_float(((const half_raw *)scales)[si]):scales[si],v;\n"
 "    if(is_v<=0){const signed char *p=(const signed char *)src;float q=(float)p[(size_t)t*n_kv_heads*head_dim+h*head_dim+d];if(is_v<0){asm volatile(\"v_mul_f32 %0, %1, %2\":\"=v\"(v):\"v\"(q),\"v\"(s));}else v=q*s;}else{int j=d&31,bi=g*16+(j&15);const unsigned char *p=(const unsigned char *)src;unsigned char q=p[(size_t)t*n_kv_heads*(head_dim/2)+h*(head_dim/2)+bi];v=(float)(((j<16)?(q&15):(q>>4))-8)*s;}dst[(size_t)t*n_kv_heads*head_dim+h*head_dim+d]=f32_to_f16_bits(v);\n"
 "}\n"
 
@@ -12161,7 +12166,7 @@ static const char *hip_kernel_source =
 "    return q;\n"
 "}\n"
 "__global__ void kv_cache_store_q8q8_batch(signed char *kc, signed char *vc,\n"
-"    float *ks, float *vs, const float *k, const float *v, int n_kv_heads,\n"
+"    half_raw *ks, half_raw *vs, const float *k, const float *v, int n_kv_heads,\n"
 "    int head_dim, int position_start, int M) {\n"
 "    int m=blockIdx.x/n_kv_heads,h=blockIdx.x%n_kv_heads,tid=threadIdx.x;\n"
 "    int lane=tid&31,group=tid>>5,groups=head_dim/32,kv_dim=n_kv_heads*head_dim;\n"
@@ -12174,11 +12179,11 @@ static const char *hip_kernel_source =
 "    if(tid<head_dim){size_t o=(size_t)(position_start+m)*kv_dim+h*head_dim+tid;\n"
 "        float qk,qv;asm volatile(\"v_mul_f32 %0, %1, %2\":\"=v\"(qk):\"v\"(xk),\"v\"(ik));asm volatile(\"v_mul_f32 %0, %1, %2\":\"=v\"(qv):\"v\"(xv),\"v\"(iv));kc[o]=(signed char)roundf(qk);vc[o]=(signed char)roundf(qv);\n"
 "        if(lane==0){size_t sg=((size_t)(position_start+m)*n_kv_heads+h)*groups+group;\n"
-"            ks[sg]=round_f16_contract(dk);vs[sg]=round_f16_contract(dv);}\n"
+"            ks[sg]=f32_to_half_raw(round_f16_contract(dk));vs[sg]=f32_to_half_raw(round_f16_contract(dv));}\n"
 "    }\n"
 "}\n"
 "__global__ void kv_cache_store_q8q8_positions(signed char *kc, signed char *vc,\n"
-"    float *ks, float *vs, const float *k, const float *v, int n_kv_heads,\n"
+"    half_raw *ks, half_raw *vs, const float *k, const float *v, int n_kv_heads,\n"
 "    int head_dim, const int *positions, int M) {\n"
 "    int m=blockIdx.x/n_kv_heads,h=blockIdx.x%n_kv_heads,tid=threadIdx.x;\n"
 "    int lane=tid&31,group=tid>>5,groups=head_dim/32,kv_dim=n_kv_heads*head_dim;\n"
@@ -12191,11 +12196,11 @@ static const char *hip_kernel_source =
 "    if(tid<head_dim){int pos=positions[m];size_t o=(size_t)pos*kv_dim+h*head_dim+tid;\n"
 "        float qk,qv;asm volatile(\"v_mul_f32 %0, %1, %2\":\"=v\"(qk):\"v\"(xk),\"v\"(ik));asm volatile(\"v_mul_f32 %0, %1, %2\":\"=v\"(qv):\"v\"(xv),\"v\"(iv));kc[o]=(signed char)roundf(qk);vc[o]=(signed char)roundf(qv);\n"
 "        if(lane==0){size_t sg=((size_t)pos*n_kv_heads+h)*groups+group;\n"
-"            ks[sg]=round_f16_contract(dk);vs[sg]=round_f16_contract(dv);}\n"
+"            ks[sg]=f32_to_half_raw(round_f16_contract(dk));vs[sg]=f32_to_half_raw(round_f16_contract(dv));}\n"
 "    }\n"
 "}\n"
 "__global__ void kv_cache_store_q8q8_devp(signed char *kc, signed char *vc,\n"
-"    float *ks, float *vs, const float *k, const float *v, int n_kv_heads,\n"
+"    half_raw *ks, half_raw *vs, const float *k, const float *v, int n_kv_heads,\n"
 "    int head_dim, const int *position) {\n"
 "    int position_start=*position, M=1; int m=blockIdx.x/n_kv_heads,h=blockIdx.x%n_kv_heads,tid=threadIdx.x;\n"
 "    int lane=tid&31,group=tid>>5,groups=head_dim/32,kv_dim=n_kv_heads*head_dim;\n"
@@ -12208,7 +12213,7 @@ static const char *hip_kernel_source =
 "    if(tid<head_dim){size_t o=(size_t)(position_start+m)*kv_dim+h*head_dim+tid;\n"
 "        float qk,qv;asm volatile(\"v_mul_f32 %0, %1, %2\":\"=v\"(qk):\"v\"(xk),\"v\"(ik));asm volatile(\"v_mul_f32 %0, %1, %2\":\"=v\"(qv):\"v\"(xv),\"v\"(iv));kc[o]=(signed char)roundf(qk);vc[o]=(signed char)roundf(qv);\n"
 "        if(lane==0){size_t sg=((size_t)(position_start+m)*n_kv_heads+h)*groups+group;\n"
-"            ks[sg]=round_f16_contract(dk);vs[sg]=round_f16_contract(dv);}\n"
+"            ks[sg]=f32_to_half_raw(round_f16_contract(dk));vs[sg]=f32_to_half_raw(round_f16_contract(dv));}\n"
 "    }\n"
 "}\n"
 /* The max reduction and probability-sum reduction reuse red[]. Every wave
@@ -18039,7 +18044,9 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
         CHECK_HIP(hipMemset(r->d_value_cache[l], 0, value_cache_size));
         if ((r->is_qwen4exp && (r->qwen4_kv_i8 || r->qwen4_kv_fp8)) || r->kv_quantized) {
             size_t scale_bytes = (size_t)max_seq_len * r->n_kv_heads *
-                                 ((r->head_dim + 31) / 32) * sizeof(float);
+                                 ((r->head_dim + 31) / 32) *
+                                 (r->kv_cache_type == HIP_LLM_KV_Q8_0_Q8_0 ?
+                                  sizeof(uint16_t) : sizeof(float));
             CHECK_HIP(hipMalloc(&r->d_key_cache_scale[l], scale_bytes));
             CHECK_HIP(hipMalloc(&r->d_value_cache_scale[l], scale_bytes));
             CHECK_HIP(hipMemset(r->d_key_cache_scale[l], 0, scale_bytes));

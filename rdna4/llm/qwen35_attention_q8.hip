@@ -70,7 +70,7 @@ __device__ __forceinline__ float q8_attention_sum(float x) {
 extern "C" __global__ __launch_bounds__(512, 1)
 void qwen35_attention_q8_prefill_wmma(float *out, const float *q,
         const signed char *kc, const signed char *vc,
-        const float *ks, const float *vs, int heads, int kv_heads,
+        const q8_half *ks, const q8_half *vs, int heads, int kv_heads,
         int queries, int position_start) {
     constexpr int BQ = 128, BKV = 16, WMMA_K = 16, HD = 256, HALF_HD = 128;
     int head = blockIdx.x;
@@ -273,7 +273,7 @@ void qwen35_attention_q8_prefill_wmma(float *out, const float *q,
 extern "C" __global__ __launch_bounds__(128, 1)
 void qwen35_attention_q8_decode(float *out, float *parts, float2 *meta,
         const float *q, const signed char *kc, const signed char *vc,
-        const float *ks, const float *vs, const int *position,
+        const q8_half *ks, const q8_half *vs, const int *position,
     int heads, int kv_heads, int nsm, int occupancy, int forced_splits,
     int queries, int position_start) {
     int query = queries == 1 ? 0 : blockIdx.x;
@@ -340,7 +340,7 @@ void qwen35_attention_q8_decode(float *out, float *parts, float2 *meta,
             float dot = 0;
             if (row < length) {
                 const int *k = (const int *)(kc + (size_t)row * stride + kh * 256);
-                const float *d = ks + (size_t)row * scale_stride + kh * 8;
+                const q8_half *d = ks + (size_t)row * scale_stride + kh * 8;
                 float scale[8];
                 #pragma unroll
                 for (int i = 0; i < 8; ++i) scale[i] = d[i] * dr[i];
@@ -426,7 +426,7 @@ void qwen35_attention_q8_decode(float *out, float *parts, float2 *meta,
 extern "C" __global__ __launch_bounds__(384, 1)
 void qwen35_attention_q8_decode_gqa3(float *out, float *parts, float2 *meta,
         const float *q, const signed char *kc, const signed char *vc,
-        const float *ks, const float *vs, const int *position,
+        const q8_half *ks, const q8_half *vs, const int *position,
         int heads, int kv_heads, int nsm, int occupancy, int forced_splits,
         int queries, int position_start, int adaptive_long_context) {
     if (queries != 1 || heads != 6 * kv_heads) return;
@@ -495,7 +495,7 @@ void qwen35_attention_q8_decode_gqa3(float *out, float *parts, float2 *meta,
             float dot = 0.0f;
             if (row < length) {
                 const int *k = (const int *)(kc + (size_t)row * stride + kh * 256);
-                const float *d = ks + (size_t)row * scale_stride + kh * 8;
+                const q8_half *d = ks + (size_t)row * scale_stride + kh * 8;
                 float scale[8];
                 #pragma unroll
                 for (int i = 0; i < 8; ++i) scale[i] = d[i] * dr[i];
@@ -591,7 +591,7 @@ void qwen35_attention_q8_decode_gqa3(float *out, float *parts, float2 *meta,
 extern "C" __global__ __launch_bounds__(128, 1)
 void qwen35_attention_q8_decode_gqa3_reuse(float *out, float *parts,
         float2 *meta, const float *q, const signed char *kc,
-        const signed char *vc, const float *ks, const float *vs,
+        const signed char *vc, const q8_half *ks, const q8_half *vs,
         const int *position, int heads, int kv_heads, int nsm,
         int occupancy, int forced_splits, int queries,
         int position_start, int adaptive_long_context) {
@@ -666,7 +666,7 @@ void qwen35_attention_q8_decode_gqa3_reuse(float *out, float *parts,
             if (row < length) {
                 const int *key = (const int *)(kc +
                     (size_t)row * stride + kh * 256);
-                const float *key_scale = ks +
+                const q8_half *key_scale = ks +
                     (size_t)row * scale_stride + kh * 8;
                 #pragma unroll
                 for (int g = 0; g < 8; ++g) {
@@ -808,7 +808,7 @@ void qwen35_attention_q8_decode_gqa3_reuse(float *out, float *parts,
 extern "C" __global__ __launch_bounds__(128, 1)
 void qwen35_attention_q8_decode_reuse8(float *out, float *parts, float2 *meta,
         const float *q, const signed char *kc, const signed char *vc,
-        const float *ks, const float *vs, const int *position,
+        const q8_half *ks, const q8_half *vs, const int *position,
         int heads, int kv_heads, int nsm, int occupancy, int forced_splits,
         int queries, int position_start) {
     if (queries < 2 || queries > 8) return;
@@ -888,7 +888,7 @@ void qwen35_attention_q8_decode_reuse8(float *out, float *parts, float2 *meta,
             if (row < length[queries - 1]) {
                 const int *key = (const int *)(kc +
                     (size_t)row * stride + kh * 256);
-                const float *key_scale = ks +
+                const q8_half *key_scale = ks +
                     (size_t)row * scale_stride + kh * 8;
                 #pragma unroll
                 for (int i = 0; i < 32; ++i) {
