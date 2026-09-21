@@ -343,8 +343,10 @@ gets a separately validated layout and its own token count; both reuse the
 same fixed condition latents and target state, and combine target predictions
 with the existing BF16 CFG rounding. Missing branch-layout pairs are rejected.
 This branch-aware path builds and has CLI guard coverage, but guided editing
-GPU parity is not yet validated. The editing regression driver below still
-intentionally rejects CFG captures until its paired-fixture checks are added.
+GPU parity is not yet accepted. The editing regression driver below reads the
+captured CFG scale, validates paired branch dimensions/latents, and supplies
+each branch's own layout and embeddings. Guided editing validation is running;
+all 21 CPU tests pass, including invalid CFG metadata/CLI checks.
 
 The separate text-to-image true-CFG regression (256x256, two steps, seed42,
 empty negative prompt, scale4) runs to completion with finite outputs but
@@ -356,7 +358,7 @@ trajectory cosines **0.999956809 / 0.999956741**. Reproduce with
 For full fixture-driven editing validation, `editing_regression.py` checks
 every captured timestep at matched inputs, then runs an independent Euler
 trajectory from the first target latent. It requires unchanged conditioning
-and prompt/layout across calls, rejects CFG captures, writes per-checkpoint
+and prompt/layout across calls, validates CFG capture metadata, writes per-checkpoint
 results, and returns nonzero if any cosine is below 0.99996:
 
 ```sh

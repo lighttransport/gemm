@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Native editing predictions and trajectory against captured PyTorch calls.
 
-Requires an official batch-one, unpadded, positive-only editing capture.
+Requires an official batch-one, unpadded editing capture.
 Condition encoding stays in the reference; all transformer/Euler work is native.
 """
 import argparse
@@ -15,6 +15,18 @@ from compare import _cosine_error, NONQUANTIZED_COSINE_THRESHOLD
 from prepare_edit_fixture import prepare
 
 
+def guidance_scale(reference):
+    run = json.loads((reference / "run.json").read_text())
+    scale = run.get("true_cfg_scale", 1.0)
+    cfg = run.get("use_true_cfg", False)
+    if not isinstance(scale, (int, float)) or not np.isfinite(scale):
+        raise ValueError("invalid captured CFG scale")
+    has_negative = (reference / "negative_prompt_embeds.npy").exists()
+    if bool(cfg) != has_negative or (cfg and scale <= 1):
+        raise ValueError("inconsistent CFG capture metadata")
+    return float(scale) if cfg else 1.0
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model", required=True, type=Path)
@@ -26,25 +38,30 @@ def main():
     steps = len(predictions)
     if steps < 2 or [p.name for p in predictions] != [f"pred_{i:03d}.npy" for i in range(steps)]:
         raise ValueError("requires a contiguous capture with at least two steps")
-    if (ref / "negative_prompt_embeds.npy").exists():
-        raise ValueError("native editing CFG is not yet supported")
+    scale = guidance_scale(ref)
     work = args.work_dir.resolve()
     work.mkdir(parents=True, exist_ok=False)
     binary = str(Path(__file__).with_name("test_cuda_qimg21_native").resolve())
     results = {"threshold": NONQUANTIZED_COSINE_THRESHOLD, "quantized": False,
                "reference": str(ref), "model": str(args.model.resolve()),
-               "predictions": [], "trajectory": []}
+               "true_cfg_scale": scale, "predictions": [], "trajectory": []}
     first_condition = None
     first_fixture = None
 
     def command(fixture, metadata):
-        return [binary, "--model", str(args.model.resolve()),
+        cmd = [binary, "--model", str(args.model.resolve()),
                 "--prompt-embeds", str(fixture / "prompt_embeds.npy"),
                 "--latents", str(fixture / "target_latents.npy"),
                 "--condition-latents", str(fixture / "condition_latents.npy"),
                 "--editing-layout", str(fixture / "layout.txt"),
                 "--height-tokens", str(metadata["height_tokens"]),
                 "--width-tokens", str(metadata["width_tokens"])]
+        if scale > 1:
+            negative = fixture / "negative"
+            cmd.extend(["--negative-editing-layout", str(negative / "layout.txt"),
+                        "--negative-prompt-embeds", str(negative / "prompt_embeds.npy"),
+                        "--guidance-scale", repr(scale)])
+        return cmd
 
     def compare(reference, candidate):
         cosine, relative_l2 = _cosine_error(np.load(reference, allow_pickle=False),
@@ -55,6 +72,15 @@ def main():
     for i in range(steps):
         fixture = work / f"fixture-{i:03d}"
         metadata = prepare(ref, fixture, i)
+        if scale > 1:
+            negative = fixture / "negative"
+            negative_metadata = prepare(ref, negative, i, "negative")
+            for key in ("height_tokens", "width_tokens", "condition_tokens", "target_tokens", "timestep"):
+                if metadata[key] != negative_metadata[key]:
+                    raise ValueError(f"CFG branch mismatch: {key}")
+            for name in ("condition_latents.npy", "target_latents.npy"):
+                if not np.array_equal(np.load(fixture / name), np.load(negative / name)):
+                    raise ValueError(f"CFG branch latent mismatch: {name}")
         condition = np.load(fixture / "condition_latents.npy")
         if first_condition is None:
             first_condition, first_fixture = condition, fixture
