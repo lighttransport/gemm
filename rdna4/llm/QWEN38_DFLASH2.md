@@ -97,6 +97,17 @@ random 64K run retained prefix `90178de69a24a76e` and suffix
 `aed3c962c4a6525d`, measuring 35.47 tok/s versus 33.73 tok/s control. The
 captured graph arguments and Q8/Q8 arithmetic are unchanged.
 
+## Asynchronous accepted-row publication (2026-09-22)
+
+`hip_llm_qwen35_mtp_commit` now queues the selected recurrent and convolution
+state copies, hidden state, logits, and position update on the target stream
+without synchronizing the host before returning. Same-stream decode/propose
+work remains ordered, while request reset and verifier host-logit boundaries
+still synchronize. The complete DFlash2 HTTP/stdio quality matrix passed,
+including seeded sampling, cancellation, cache restore, concurrency, and
+multi-turn C++ output. Cached K=7 windows reported 0.23--0.57 ms commit times
+on the resident gate with unchanged target token streams.
+
 ## IQ2_XS launch-bounds probe (2026-09-22)
 
 The native one-row IQ2_XS decode kernel is compiled with

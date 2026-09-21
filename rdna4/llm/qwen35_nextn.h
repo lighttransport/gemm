@@ -817,8 +817,10 @@ int hip_llm_qwen35_mtp_commit(hip_llm_runner *r, int processed) {
     r->cur_position = m->verify_position+last;
     if (hipMemcpyAsync(r->d_x,(float *)m->verify_x+(size_t)last*r->n_embd,(size_t)r->n_embd*sizeof(float),hipMemcpyDeviceToDevice,r->stream) ||
         hipMemcpyAsync(r->d_logits,(float *)m->verify_logits+(size_t)last*r->n_vocab,(size_t)r->n_vocab*sizeof(float),hipMemcpyDeviceToDevice,r->stream) ||
-        hipMemcpyAsync(r->d_position,&r->cur_position,sizeof(int),hipMemcpyHostToDevice,r->stream) ||
-        hipStreamSynchronize(r->stream)) return -1;
+        hipMemcpyAsync(r->d_position,&r->cur_position,sizeof(int),hipMemcpyHostToDevice,r->stream)) return -1;
+    /* Commit only enqueues device-to-device publication.  All following
+     * decode/propose work uses the same stream, while request reset and the
+     * verifier's host-logit path still synchronize at their boundaries. */
     m->verify_rows = 0;
     r->q8x2_reuse_valid = r->iq1_q8_valid = 0;
     return 0;

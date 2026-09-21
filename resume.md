@@ -50,6 +50,17 @@ prefix hash `90178de69a24a76e`, suffix hash `aed3c962c4a6525d`, and measured
 35.47 tok/s versus 33.73 tok/s control. The graph ABI and Q8/Q8 arithmetic
 remain unchanged.
 
+## 2026-09-22 continuation: asynchronous accepted-row publication
+
+Speculative commit now enqueues the accepted recurrent/conv checkpoint, hidden
+state, logits, and position copies on the target stream and returns without a
+host-side `hipStreamSynchronize`. The next same-stream decode or proposal still
+observes the copies in order; reset and verifier host-logit boundaries retain
+their synchronization. The full DFlash2 HTTP/stdio cancellation, cache,
+concurrency, sampled, and multi-turn C++ quality suite passed. On the resident
+gate, repeated cached K=7 windows reported commit times around 0.23--0.57 ms;
+the authoritative token streams and cache restores remained stable.
+
 ## 2026-09-22 continuation: sidecar overlap ordering hardening
 
 The opt-in `LLM_QWEN35_DFLASH_OVERLAP_INJECT=1` path now records a
