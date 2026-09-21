@@ -2,6 +2,7 @@
 import base64
 import hashlib
 import io
+import json
 import os
 import queue
 import threading
@@ -11,10 +12,90 @@ from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from codex_server import Backend, responses_input_messages, runner_command
+from codex_server import Backend, Handler, responses_input_messages, runner_command
 
 
 class ProtocolTest(unittest.TestCase):
+    def test_http_rejects_malformed_and_duplicate_requests_before_streaming(self):
+        class FakeBackend:
+            def __init__(self):
+                self.cancel_lock = threading.Lock()
+                self.request_cancellations = {}
+                self.active_cancel = None
+                self.active_request_id = None
+                self.last_metrics = {}
+                self.generate_calls = 0
+
+            def register_request(self, request_id, cancellation):
+                return Backend.register_request(self, request_id, cancellation)
+
+            def unregister_request(self, request_id, cancellation):
+                Backend.unregister_request(self, request_id, cancellation)
+
+            def cancel(self, cancellation=None):
+                del cancellation
+                return False
+
+            def cancel_request(self, request_id):
+                del request_id
+                return False
+
+            def generate(self, *args, **kwargs):
+                del args, kwargs
+                self.generate_calls += 1
+                return "ok", 0, 1, 1, "stop"
+
+        backend = FakeBackend()
+        def post(path, body):
+            raw = json.dumps(body).encode()
+            handler = Handler.__new__(Handler)
+            handler.path = path
+            handler.headers = {"Content-Length": str(len(raw))}
+            handler.rfile = io.BytesIO(raw)
+            handler.backend = backend
+            handler.model = "test"
+            handler.max_tokens = 8
+            handler.context = 128
+            handler.coding = False
+            responses = []
+            handler.send_json = lambda status, payload: responses.append(
+                (status, payload, getattr(handler, "_request_id", None)))
+            handler.do_POST()
+            self.assertEqual(len(responses), 1)
+            return responses[0]
+
+        status, payload, _ = post("/v1/chat/completions", {"messages": {}})
+        self.assertEqual(status, 400)
+        self.assertIn("array of objects", payload["error"]["message"])
+        status, payload, _ = post("/v1/cancel", {})
+        self.assertEqual(status, 404)
+        self.assertEqual(payload["status"], "request_not_found")
+
+        owner = threading.Event()
+        self.assertTrue(backend.register_request("duplicate", owner))
+        status, payload, response_id = post("/v1/chat/completions", {
+            "messages": [{"role": "user", "content": "hello"}],
+            "request_id": "duplicate", "stream": True,
+        })
+        self.assertEqual(status, 409)
+        self.assertEqual(response_id, "duplicate")
+        self.assertIn("already active", payload["error"]["message"])
+        self.assertEqual(backend.generate_calls, 0)
+        backend.unregister_request("duplicate", owner)
+
+    def test_request_registration_is_owner_checked(self):
+        backend = Backend.__new__(Backend)
+        backend.cancel_lock = threading.Lock()
+        backend.request_cancellations = {}
+        first = threading.Event()
+        second = threading.Event()
+        self.assertTrue(backend.register_request("same", first))
+        self.assertFalse(backend.register_request("same", second))
+        backend.unregister_request("same", second)
+        self.assertIs(backend.request_cancellations["same"], first)
+        backend.unregister_request("same", first)
+        self.assertNotIn("same", backend.request_cancellations)
+
     def test_qwen35_runner_command_uses_exact_server_profile(self):
         args = SimpleNamespace(
             runner="./test_hip_llm", model="target.gguf", context=65536,

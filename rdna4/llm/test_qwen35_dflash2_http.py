@@ -41,9 +41,9 @@ def post(port, body):
         return json.load(response)
 
 
-def post_error(port, body, status):
+def post_error(port, body, status, path="/v1/chat/completions"):
     request = urllib.request.Request(
-        f"http://127.0.0.1:{port}/v1/chat/completions",
+        f"http://127.0.0.1:{port}{path}",
         data=json.dumps(body).encode(),
         headers={"Content-Type": "application/json"},
     )
@@ -301,6 +301,8 @@ def main():
                 f"http://127.0.0.1:{args.port}/health", timeout=2) as response:
             health = json.load(response)
         require(health.get("status") == "ready", health)
+        idle_cancel = post_error(args.port, {}, 404, "/v1/cancel")
+        require(idle_cancel.get("status") == "request_not_found", idle_cancel)
         bad_cache = post_error(args.port, {
             "messages": [{"role": "user", "content": "ignored"}],
             "prompt_cache_key": ["not", "a", "string"],
@@ -313,6 +315,9 @@ def main():
         }, 400)
         require(bad_request_id.get("error", {}).get("type") == "invalid_request_error",
                 bad_request_id)
+        bad_messages = post_error(args.port, {"messages": {"role": "user"}}, 400)
+        require(bad_messages.get("error", {}).get("type") == "invalid_request_error",
+                bad_messages)
 
         cases = (
             ("Write one short sentence about C++.", "C++"),

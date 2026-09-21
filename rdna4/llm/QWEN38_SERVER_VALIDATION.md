@@ -22,7 +22,11 @@ accepts `prompt_cache_key`, conversation/session metadata, and the
 the ID in responses, and supports targeted `POST /v1/cancel`. A queued
 cancellation never signals the active runner transaction. The GPU execution
 path stays serialized because the target and DFlash verifier share mutable
-device state.
+device state. Request IDs are reserved before SSE headers are sent, so a
+duplicate receives an ordinary HTTP 409 instead of corrupting an established
+event stream. Idle cancellation returns 404, malformed message shapes and
+content lengths are rejected before inference, and oversized direct stdio
+frames are drained as one failed transaction.
 
 Portable snapshots contain prompt logits, hybrid convolution/recurrent state,
 target Q8/Q8 KV plus FP16 scales, and DFlash private state. Publication occurs
@@ -42,7 +46,7 @@ same greedy output, and reported a 448.3 MiB snapshot. It also passed direct
 stdio transactions, seeded sampling, LRU eviction, malformed cache metadata,
 targeted/disconnect cancellation with recovery, concurrent distinct
 identities, and a two-turn C++ generation whose programs compiled and printed
-the expected result. The CPU protocol/template/tool suite passes 27 tests.
+the expected result. The CPU protocol/template/tool suite passes 29 tests.
 
 The gate exposed and fixed two portability bugs: batched prefill left the host
 position stale, and Q8/Q8 FP16 scale rows were copied using an FP32 byte size.

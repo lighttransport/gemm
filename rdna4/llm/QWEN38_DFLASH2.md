@@ -101,6 +101,10 @@ so a disconnected queued client cannot signal the request currently using the
 GPU. Execution is deliberately serialized: the target recurrent scratch,
 sampler transaction, and DFlash verifier are one mutable device context, and
 no exact multi-context decode batch has yet justified changing that contract.
+The server reserves a request ID before committing streaming headers;
+duplicates return HTTP 409, an idle unscoped cancellation returns 404, and an
+exception after SSE headers closes that response instead of appending a JSON
+body to the event stream.
 
 Snapshots are accepted only when their recorded position exactly equals the
 token-key length. Q8/Q8 scales are copied at their actual FP16 row size. This

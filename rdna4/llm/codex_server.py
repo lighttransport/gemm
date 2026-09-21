@@ -417,15 +417,30 @@ class Backend:
         """Request cooperative cancellation in the resident runner."""
         with self.cancel_lock:
             if self.active_cancel is None:
-                return
+                return False
             if cancellation is not None and cancellation is not self.active_cancel:
-                return
+                return False
             self.active_cancel.set()
             if self.proc.poll() is None:
                 try:
                     os.kill(self.proc.pid, signal.SIGUSR1)
                 except ProcessLookupError:
                     pass
+            return True
+
+    def register_request(self, request_id, cancellation):
+        """Reserve a request ID before HTTP streaming headers are committed."""
+        with self.cancel_lock:
+            if request_id in self.request_cancellations:
+                return False
+            self.request_cancellations[request_id] = cancellation
+            return True
+
+    def unregister_request(self, request_id, cancellation):
+        """Release a request ID only when the caller still owns it."""
+        with self.cancel_lock:
+            if self.request_cancellations.get(request_id) is cancellation:
+                self.request_cancellations.pop(request_id, None)
 
     def cancel_request(self, request_id):
         """Cancel one queued or active request without touching its peers."""
@@ -456,7 +471,7 @@ class Backend:
     def generate(self, prompt, max_tokens, temperature, top_p, top_k, presence, repetition, min_p,
                  prefix="", cancellation=None, on_token=None, seed=None,
                  frequency=0.0, penalty_last_n=64, cache_key="shared",
-                 request_id=None):
+                 request_id=None, request_registered=False):
         request_start = time.monotonic()
         cancellation = cancellation if cancellation is not None else threading.Event()
         prefix_payload = base64.b64encode(prefix.encode("utf-8")).decode("ascii") if prefix else "-"
@@ -473,10 +488,12 @@ class Backend:
         if not hasattr(self, "request_cancellations"):
             self.request_cancellations = {}
         request_id = request_id or "req-" + uuid.uuid4().hex
-        with self.cancel_lock:
-            if request_id in self.request_cancellations:
-                raise ValueError("duplicate active request_id")
-            self.request_cancellations[request_id] = cancellation
+        if request_registered:
+            with self.cancel_lock:
+                if self.request_cancellations.get(request_id) is not cancellation:
+                    raise RuntimeError("request_id reservation was lost")
+        elif not self.register_request(request_id, cancellation):
+            raise ValueError("duplicate active request_id")
         ticket = None
         try:
             ticket = self.request_gate.acquire(cancellation)
@@ -524,8 +541,8 @@ class Backend:
                         self.active_request_id = None
         finally:
             self.request_gate.release(ticket)
-            with self.cancel_lock:
-                self.request_cancellations.pop(request_id, None)
+            if not request_registered:
+                self.unregister_request(request_id, cancellation)
         if not result.startswith("OK "):
             raise RuntimeError(result)
         fields = result.split(" ", 7)
@@ -596,6 +613,7 @@ class Handler(BaseHTTPRequestHandler):
             return False
 
     def do_GET(self):
+        self._request_id = None
         path = urlsplit(self.path).path.rstrip("/") or "/"
         if path in ("/", "/ui"):
             self.send_file(WEB_DIR / "index.html", "text/html; charset=utf-8")
@@ -640,6 +658,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.backend.cancel(cancelled)
 
     def do_POST(self):
+        self._request_id = None
+        response_started = False
         path = urlsplit(self.path).path.rstrip("/") or "/"
         if path.startswith("/v1/"):
             api_path = path
@@ -668,10 +688,10 @@ class Handler(BaseHTTPRequestHandler):
                                                 "type": "invalid_request_error"}})
                 return
             if request_id is None:
-                self.backend.cancel()
-                found = True
+                found = self.backend.cancel()
             else:
-                found = isinstance(request_id, str) and self.backend.cancel_request(request_id)
+                self._request_id = request_id
+                found = self.backend.cancel_request(request_id)
             self.send_json(202 if found else 404, {
                 "status": "cancellation_requested" if found else "request_not_found",
                 "request_id": request_id,
@@ -682,7 +702,12 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(404, {"error": {"message": "not found", "type": "invalid_request_error"}})
             return
         try:
-            n = int(self.headers.get("Content-Length", "0"))
+            try:
+                n = int(self.headers.get("Content-Length", "0"))
+            except (TypeError, ValueError):
+                self.send_json(400, {"error": {"message": "invalid Content-Length",
+                                                "type": "invalid_request_error"}})
+                return
             if n <= 0:
                 self.send_json(400, {"error": {"message": "request body is required", "type": "invalid_request_error"}})
                 return
@@ -736,6 +761,12 @@ class Handler(BaseHTTPRequestHandler):
                 messages.extend(responses_input_messages(inp))
             else:
                 messages = req.get("messages", [])
+            if (not isinstance(messages, list) or
+                    any(not isinstance(message, dict) for message in messages)):
+                self.send_json(400, {"error": {
+                    "message": "messages must be an array of objects",
+                    "type": "invalid_request_error"}})
+                return
             registry = tool_registry(req.get("tools", []))
             if registry:
                 messages.insert(0, {"role": "system", "content": tool_instructions(registry)})
@@ -805,68 +836,79 @@ class Handler(BaseHTTPRequestHandler):
             stream_write_lock = threading.Lock()
             stream_response_id = "resp-" + uuid.uuid4().hex if req.get("stream") else None
             stream_created = int(time.time())
-            if req.get("stream"):
-                # Send headers before inference and periodically emit SSE
-                # comments.  Qwen3.8's long prompt prefill can otherwise
-                # leave Codex's streaming HTTP request silent for minutes.
-                self.send_response(200)
-                self.send_header("Content-Type", "text/event-stream")
-                self.send_header("Cache-Control", "no-cache")
-                self.send_header("Connection", "keep-alive")
-                self.send_header("X-Request-ID", request_id)
-                self.end_headers()
-                stream_base = {"id": stream_response_id, "object": "response",
-                               "created_at": stream_created, "status": "in_progress",
-                               "model": self.model, "output": []}
-                for sequence_number, event in enumerate(("response.created", "response.in_progress")):
-                    payload = {"type": event, "response": stream_base,
-                               "sequence_number": sequence_number}
-                    self.wfile.write(("event: " + event + "\ndata: " +
-                                     json.dumps(payload, ensure_ascii=False) + "\n\n").encode())
-                self.wfile.flush()
-
-                def keepalive():
-                    while not stream_keepalive_stop.wait(5.0):
-                        try:
-                            with stream_write_lock:
-                                self.wfile.write(b": keep-alive\n\n")
-                                self.wfile.flush()
-                        except (BrokenPipeError, ConnectionResetError, OSError):
-                            cancelled.set()
-                            self.backend.cancel(cancelled)
-                            return
-
-                stream_keepalive = threading.Thread(target=keepalive, daemon=True)
-                stream_keepalive.start()
-            def stream_token(token):
-                if not req.get("stream") or api_path != "/v1/chat/completions":
-                    return
-                obj = {"id": stream_response_id, "object": "chat.completion.chunk",
-                       "created": stream_created, "model": self.model,
-                       "choices": [{"index": 0, "delta": {"content": token},
-                                    "finish_reason": None}]}
-                try:
-                    with stream_write_lock:
-                        self.wfile.write(("data: " + json.dumps(obj, ensure_ascii=False) + "\n\n").encode())
-                        self.wfile.flush()
-                except (BrokenPipeError, ConnectionResetError, OSError):
-                    cancelled.set()
-                    self.backend.cancel(cancelled)
-            watcher = threading.Thread(target=self._watch_disconnect,
-                                       args=(stop_watcher, cancelled), daemon=True)
-            watcher.start()
+            if not self.backend.register_request(request_id, cancelled):
+                self.send_json(409, {"error": {
+                    "message": "request_id is already active",
+                    "type": "invalid_request_error"}})
+                return
+            watcher = None
             try:
+                if req.get("stream"):
+                    # Send headers only after reserving the ID. A duplicate
+                    # request must receive a normal 409 response rather than
+                    # an HTTP 200 followed by malformed SSE error bytes.
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Cache-Control", "no-cache")
+                    self.send_header("Connection", "keep-alive")
+                    self.send_header("X-Request-ID", request_id)
+                    self.end_headers()
+                    response_started = True
+                    stream_base = {"id": stream_response_id, "object": "response",
+                                   "created_at": stream_created, "status": "in_progress",
+                                   "model": self.model, "output": []}
+                    for sequence_number, event in enumerate(("response.created", "response.in_progress")):
+                        payload = {"type": event, "response": stream_base,
+                                   "sequence_number": sequence_number}
+                        self.wfile.write(("event: " + event + "\ndata: " +
+                                         json.dumps(payload, ensure_ascii=False) + "\n\n").encode())
+                    self.wfile.flush()
+
+                    def keepalive():
+                        while not stream_keepalive_stop.wait(5.0):
+                            try:
+                                with stream_write_lock:
+                                    self.wfile.write(b": keep-alive\n\n")
+                                    self.wfile.flush()
+                            except (BrokenPipeError, ConnectionResetError, OSError):
+                                cancelled.set()
+                                self.backend.cancel(cancelled)
+                                return
+
+                    stream_keepalive = threading.Thread(target=keepalive, daemon=True)
+                    stream_keepalive.start()
+
+                def stream_token(token):
+                    if not req.get("stream") or api_path != "/v1/chat/completions":
+                        return
+                    obj = {"id": stream_response_id, "object": "chat.completion.chunk",
+                           "created": stream_created, "model": self.model,
+                           "choices": [{"index": 0, "delta": {"content": token},
+                                        "finish_reason": None}]}
+                    try:
+                        with stream_write_lock:
+                            self.wfile.write(("data: " + json.dumps(obj, ensure_ascii=False) + "\n\n").encode())
+                            self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        cancelled.set()
+                        self.backend.cancel(cancelled)
+
+                watcher = threading.Thread(target=self._watch_disconnect,
+                                           args=(stop_watcher, cancelled), daemon=True)
+                watcher.start()
                 text, cached, ptok, ctok, finish = self.backend.generate(
                     prompt, limit, temp, top_p, top_k, presence, repetition, min_p, prefix, cancelled,
                     stream_token, seed=seed, frequency=frequency,
                     penalty_last_n=penalty_last_n, cache_key=cache_key,
-                    request_id=request_id)
+                    request_id=request_id, request_registered=True)
             finally:
                 stop_watcher.set()
-                watcher.join(timeout=0.2)
+                if watcher is not None:
+                    watcher.join(timeout=0.2)
                 stream_keepalive_stop.set()
                 if stream_keepalive is not None:
                     stream_keepalive.join(timeout=0.2)
+                self.backend.unregister_request(request_id, cancelled)
             if cancelled.is_set() or finish == "cancelled":
                 self.log_message("request cancelled: %s", self.path)
                 self.close_connection = True
@@ -986,6 +1028,11 @@ class Handler(BaseHTTPRequestHandler):
             return
         except Exception as exc:
             self.log_message("500 POST %s: %s", self.path, exc)
+            if response_started:
+                # HTTP status and SSE headers are already committed. Appending
+                # a JSON error response would corrupt the event stream.
+                self.close_connection = True
+                return
             self.send_json(500, {"error": {"message": str(exc), "type": "server_error"}})
 
 
@@ -1026,6 +1073,16 @@ def main():
     ap.add_argument("--context-cache-max-mib", type=int, default=2048,
                     help="host-memory budget for portable conversation snapshots")
     args = ap.parse_args()
+    if args.context <= 0:
+        ap.error("--context must be positive")
+    if args.max_output < 0:
+        ap.error("--max-output must be non-negative")
+    if args.moe_cache_mb < 0:
+        ap.error("--moe-cache-mb must be non-negative")
+    if args.qwen4_mtp_cache_mb < 0:
+        ap.error("--qwen4-mtp-cache-mb must be non-negative")
+    if args.qwen35_snapshot_max_tokens < 0:
+        ap.error("--qwen35-snapshot-max-tokens must be non-negative")
     if not 0 <= args.context_cache_entries <= 64:
         ap.error("--context-cache-entries must be 0..64")
     if not 0 <= args.context_cache_max_mib <= 65536:
