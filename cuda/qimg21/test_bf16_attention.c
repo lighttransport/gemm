@@ -7,8 +7,8 @@
 int main(int argc, char **argv) {
     if(argc!=4 && !(argc==5 && (!strcmp(argv[4],"--reverse64") || !strcmp(argv[4],"--flash-softmax") ||
                               !strcmp(argv[4],"--forward64") || !strcmp(argv[4],"--forward64-flash") ||
-                              !strcmp(argv[4],"--forward64-flash-raw")))){
-        fprintf(stderr,"usage: %s STAGE_DIR LAYOUT.txt OUT.npy [--reverse64|--flash-softmax|--forward64|--forward64-flash|--forward64-flash-raw]\n",argv[0]);return 2;
+                              !strcmp(argv[4],"--forward64-flash-raw") || !strcmp(argv[4],"--forward128-efficient")))){
+        fprintf(stderr,"usage: %s STAGE_DIR LAYOUT.txt OUT.npy [--reverse64|--flash-softmax|--forward64|--forward64-flash|--forward64-flash-raw|--forward128-efficient]\n",argv[0]);return 2;
     }
     q21_joint_layout layout={0};
     int nt,ih,iw,rc=1;
@@ -33,13 +33,14 @@ int main(int argc, char **argv) {
     if(cuModuleGetFunction(&attention,r->module,"flash_attn_bf16_xq"))goto done;
     if(argc==5) {
         shared_bytes=4*64*136*2;
-        char *source=malloc(strlen(q21_mma64_src)+128);
+        char *source=malloc(strlen(q21_mma64_src)+256);
         if(!source)goto done;
         int flash=!strcmp(argv[4],"--flash-softmax") || !strcmp(argv[4],"--forward64-flash") ||
-                  !strcmp(argv[4],"--forward64-flash-raw");
+                  !strcmp(argv[4],"--forward64-flash-raw") || !strcmp(argv[4],"--forward128-efficient");
         int forward=!strcmp(argv[4],"--forward64") || !strcmp(argv[4],"--forward64-flash") ||
-                    !strcmp(argv[4],"--forward64-flash-raw");
-        snprintf(source,strlen(q21_mma64_src)+128,"#define Q21_FLASH_SOFTMAX %d\n#define Q21_FORWARD_KEYS %d\n%s",flash,forward,q21_mma64_src);
+                    !strcmp(argv[4],"--forward64-flash-raw") || !strcmp(argv[4],"--forward128-efficient");
+        int efficient=!strcmp(argv[4],"--forward128-efficient");
+        snprintf(source,strlen(q21_mma64_src)+256,"#define Q21_FLASH_SOFTMAX %d\n#define Q21_FORWARD_KEYS %d\n#define Q21_BKV %d\n#define Q21_SINGLE_BUFFER %d\n%s",flash,forward,efficient?128:64,efficient,q21_mma64_src);
         int compiled=cu_compile_kernels(&mma_module,r->device,source,"qimg21_mma64.cu",1,"qimg21_mma64");
         free(source);
         if(compiled<0 ||

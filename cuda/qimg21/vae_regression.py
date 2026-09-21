@@ -75,7 +75,7 @@ def main():
         mae = float(np.mean(abs(a - b)))
         result = dict(case=case, cosine=cosine, mae=mae, finite=finite,
                       reference_discard_frame_cache=args.discard_frame_cache,
-                      native_seconds=elapsed, passed=finite and cosine >= 0.99995)
+                      native_seconds=elapsed, passed=finite and cosine >= 0.99996)
         results.append(result)
         (args.work_dir / "results.json").write_text(json.dumps(results, indent=2) + "\n")
         print(json.dumps(result), flush=True)

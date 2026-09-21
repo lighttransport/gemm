@@ -31,7 +31,7 @@ tmp/qimg21-ref-venv/bin/python cuda/qimg21/compare.py \
 ```
 
 `compare.py` treats parity as an acceptance test: every matched denoising
-checkpoint must reach cosine `>= 0.99995` for the non-quantized BF16/FP16
+checkpoint must reach cosine `>= 0.99996` for the non-quantized BF16/FP16
 weights. It exits non-zero on a missing checkpoint, shape mismatch, non-finite
 value, or threshold failure. For a quantized experiment, pass `--quantized`;
 that selects the measured row-INT8 `0.999` gate described below. Other
@@ -40,10 +40,10 @@ quantizers require their own calibration. Use
 The regression driver also records `initial_latents.npy`, preserving the exact
 PyTorch-packed noise input for native denoiser comparisons.
 
-The non-quantized acceptance target was revised from 0.99996 to **0.99995** on
-2026-09-22. Historical sections below retain the threshold and pass/fail
-language used when those experiments were recorded; current harness results
-use `compare.NONQUANTIZED_COSINE_THRESHOLD == 0.99995`.
+The non-quantized acceptance target is **0.99996**. Historical sections below
+retain the threshold and pass/fail language used when those experiments were
+recorded; current harness results use
+`compare.NONQUANTIZED_COSINE_THRESHOLD == 0.99996`.
 
 An optional **experimental** row-scaled INT8 transformer package can be
 exported without modifying the original snapshot:
@@ -956,6 +956,17 @@ accumulation order; matching FlashAttention tile order cannot close this gap.
 `attention_probe.py` accepts `--backend efficient` and `--backend cudnn` and
 forces only the unmasked target call, leaving masked prefix dispatch
 unchanged. Artifacts are in `tmp/qimg21-edit-low-block17-v3`.
+
+The native `mma128-efficient` experiment mirrors the identified 128-key tile
+shape using one 69.6-KiB K/V shared-memory buffer. On the same exact block-17
+Q/K/V replay it reaches cosine **0.999999989349**, relative L2
+**1.45985e-4**, and **99.8146%** BF16 element equality. This is a useful local
+advance but not an accepted full-model path: the best three-way dispatch
+(forward text, reverse-64 masked image prefix, forward-128 target) scores
+predictions **0.999944932 / 0.999860399** and trajectories
+**0.999926538 / 0.999927020**. It remains explicit and experimental while the
+strict non-quantized gate is 0.99996. Artifact:
+`tmp/qimg21-edit-mma128-efficient-v3/results.json`.
 
 Compare the replay without loading PyTorch or allocating GPU memory:
 
