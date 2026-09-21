@@ -249,7 +249,8 @@ The DFlash2 HTTP quality gate now requires repeated requests to report cached
 input tokens and accepts `--context N --long-prompt-tokens N` for deterministic
 longer-context cache reuse checks. The Q8 target snapshot bound is now 16,384
 tokens; a roughly 10k-token prompt in a 12k context passes repeatability and
-nonzero cache reuse after cancellation recovery.
+nonzero cache reuse after cancellation recovery. The 14k-token/16k-context
+boundary run also passes.
 
 CLI: `--qwen35-dflash2 SIDECAR --qwen35-dflash2-draft 1..7`; it currently
 requires benchmark mode, `--qwen35-batched-prefill`, `--qwen35-decode-graph`
