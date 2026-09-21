@@ -1274,8 +1274,9 @@ refactor also passes at cosine 0.999999999347549 (128x128/seed17).
 
 CPU input guards reject wrong channel counts, unsupported dimensions,
 non-finite pixels and out-of-range pixels before CUDA initialization; the
-CPU suite is now 35/35 passing. End-to-end editing parity remains unverified;
-the process-isolated 1024-square pipeline memory measurement is below.
+CPU suite is now 35/35 passing. Deterministic BF16 editing and true-CFG
+denoiser/scheduler parity is verified in the exact-backend section below;
+the process-isolated 1024-square pipeline memory measurement follows.
 The initial downsampler computes a full convolution then samples odd spatial
 positions; it is correct but not yet optimized as a stride-2 convolution.
 
