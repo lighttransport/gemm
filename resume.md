@@ -21,6 +21,11 @@ versus the 42.9--43.0 tok/s control, with the exact
 `1c891c2232aa1b7f`/`f44846dacf013e9e` hashes.  The bounds were removed; those
 formats retain their existing shape-specific occupancy choices.
 
+A separate 128-thread Q8 attention combine A/B kept the 4K suffix exact at
+42.97 tok/s and the 64K prefix/suffix hashes exact at 35.78 tok/s versus
+35.77 tok/s for the 256-thread merge.  The extra value load made it neutral,
+so the kernel and its opt-in dispatch were removed.
+
 ## 2026-09-22 continuation: IQ1_M micro-tuning and fusion audit
 
 The default one-row IQ1_M F32 kernel now marks its output, weight and

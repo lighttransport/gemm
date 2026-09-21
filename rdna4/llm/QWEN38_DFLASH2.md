@@ -19,6 +19,12 @@ one-row kernels retained the exact 4K hashes but measured 42.84 tok/s on two
 runs, slightly below the 42.9--43.0 tok/s control.  It was reverted so those
 formats keep their existing shape-specific occupancy choices.
 
+A separate 128-thread Q8 attention combine A/B also retained exact 4K and 64K
+hashes but measured 35.78 tok/s at 64K versus 35.77 tok/s for the validated
+256-thread merge.  It was removed as neutral; the long-context verifier tail
+still needs a fusion that removes partial traffic rather than only changing
+the combine width.
+
 ## Packed Q8/Q8 KV scales (2026-09-21)
 
 Q8 K/V cache scales now use the same rounded FP16 contract as the stored
