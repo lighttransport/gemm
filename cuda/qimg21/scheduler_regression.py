@@ -19,6 +19,20 @@ def main():
     args.work_dir.mkdir(parents=True, exist_ok=True)
     executable = Path(__file__).with_name("test_scheduler").resolve()
     results = []
+    for steps,tokens in [(2,256),(4,1024),(40,4096),(40,2048)]:
+        scheduler=FlowMatchEulerDiscreteScheduler(
+            use_dynamic_shifting=True,shift_terminal=0.02,
+            base_image_seq_len=256,max_image_seq_len=8192,
+            base_shift=0.5,max_shift=0.9)
+        mu=0.5+(tokens-256)*(0.9-0.5)/(8192-256)
+        scheduler.set_timesteps(sigmas=np.linspace(1,1/steps,steps),mu=mu)
+        path=args.work_dir / f"sigmas-{steps}-{tokens}.npy"
+        subprocess.run([str(executable),"--schedule",str(steps),str(tokens),str(path)],check=True)
+        actual=np.load(path).ravel();reference=scheduler.sigmas.numpy()
+        error=float(np.max(abs(actual-reference)))
+        print(json.dumps(dict(schedule_steps=steps,image_tokens=tokens,max_abs_error=error)))
+        if not np.isfinite(actual).all() or not np.allclose(actual,reference,rtol=0,atol=5e-7):
+            raise SystemExit("native sigma schedule differs from PyTorch")
     for seed, sigma, next_sigma in [(42,1.0,0.02),(17,0.63,0.37),(123,0.02,0.0)]:
         folder=args.work_dir / str(seed)
         folder.mkdir(exist_ok=True)

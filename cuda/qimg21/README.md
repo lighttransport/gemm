@@ -108,6 +108,12 @@ scheduler update from denoiser errors and does not validate a complete
 trajectory. CUDA is the acceptance reference: CPU PyTorch converts the
 scalar step to BF16 before multiplying, producing different rounding.
 
+The regression also checks dynamic-shift schedules against the pipeline's
+`linspace(1, 1/steps, steps)` convention before terminal stretching. Four
+cases (2/4/40 steps at 256/1024/2048/4096 image tokens) match within 1.2e-7
+maximum absolute sigma error. A zero endpoint before shifting is incorrect
+for interior timesteps and is no longer used.
+
 After these corrections, the native 256x256/seed42 two-step trajectory scored
 0.9999691665 and 0.9999702302 against the saved PyTorch scheduler checkpoints,
 passing the 0.99996 gate with finite outputs. The isolated matched-input
@@ -138,10 +144,12 @@ Native mode captures the exact PyTorch transformer input and BF16 timestep for
 each denoising iteration, then replays that single denoiser call in the native
 C/NVRTC runner. The acceptance gate is applied to every matched
 `pred_NNN.npy` output (`cosine >= 0.99996` for these non-quantized weights).
-The scheduler `step_NNN.npy` files are still emitted for diagnostics, but are
-not the denoiser acceptance metric: small arithmetic differences can compound
-through repeated scheduler updates. This direct check does not require a VAE
-image decode.
+It also runs a complete native trajectory from the shared initial latent
+and checks every scheduler checkpoint at the same 0.99996 gate. Both
+comparisons run even if the denoiser gate fails, and either failure fails
+the case. Native mode requires BF16 activation boundaries. Intermediate
+files from isolated denoiser replays are not trajectory checkpoints; the
+actual free-running sequence is saved under `native/trajectory/`.
 
 The native path is batch-1 text-to-image. It accepts either the model’s
 recommended no-guidance path or a second negative embedding fixture for true

@@ -43,10 +43,8 @@ def _flow_sigmas(steps: int, image_tokens: int) -> list[float]:
     emu = math.exp(mu)
     sigmas = []
     for i in range(steps):
-        u = 1.0 if steps == 1 else 1.0 - i / (steps - 1)
-        # The C implementation evaluates 1/0 as +inf for the terminal
-        # scheduler sample; its limiting sigma is exactly zero.
-        sigmas.append(0.0 if u == 0.0 else emu / (emu + (1.0 / u - 1.0)))
+        u = 1.0 - i / steps
+        sigmas.append(emu / (emu + (1.0 / u - 1.0)))
     if steps == 1:
         return [1.0]
     scale = (1.0 - sigmas[-1]) / (1.0 - 0.02)
@@ -111,6 +109,8 @@ def main() -> int:
         raise SystemExit(f"model directory does not exist: {model}")
     if args.native and (args.image or args.true_cfg_scale != 1.0):
         raise SystemExit("--native currently supports text-to-image/no-guidance fixtures only")
+    if args.native and args.dtype != "bf16":
+        raise SystemExit("the native runner currently implements BF16 activation boundaries only")
     work = Path(args.work_dir)
     if not work.is_absolute():
         work = root / work
@@ -205,6 +205,19 @@ def main() -> int:
                     shutil.copyfile(
                         step_pred_dir / "pred_000.npy", run_dir / f"pred_{step:03d}.npy"
                     )
+                # Free-running Euler trajectory: only the initial latent is
+                # shared; every later state comes from the native runner.
+                trajectory_dir = run_dir / "trajectory"
+                trajectory_dir.mkdir(parents=True, exist_ok=True)
+                _run([
+                    str(native_bin), "--model", str(model),
+                    "--prompt-embeds", str(ref_dir / "prompt_embeds.npy"),
+                    "--latents", str(ref_dir / "initial_latents.npy"),
+                    "--height-tokens", str(case.height // 16),
+                    "--width-tokens", str(case.width // 16),
+                    "--steps", str(case.steps), "--dump-dir", str(trajectory_dir),
+                    "--out", str(trajectory_dir / "final_latents.npy"),
+                ], root)
             else:
                 _run(
                     [
@@ -229,7 +242,25 @@ def main() -> int:
                 compare_command.append("--quantized")
             if args.cosine_threshold is not None:
                 compare_command.extend(["--cosine-threshold", str(args.cosine_threshold)])
-            _run(compare_command, root)
+            commands = [compare_command]
+            if args.native:
+                trajectory_compare = [sys.executable, str(compare), "--steps-only",
+                                      "--reference-dir", str(ref_dir),
+                                      "--runner-dir", str(trajectory_dir)]
+                if args.quantized:
+                    trajectory_compare.append("--quantized")
+                if args.cosine_threshold is not None:
+                    trajectory_compare.extend(["--cosine-threshold", str(args.cosine_threshold)])
+                commands.append(trajectory_compare)
+            comparison_failed = False
+            for command in commands:
+                try:
+                    _run(command, root)
+                except subprocess.CalledProcessError:
+                    comparison_failed = True
+            if comparison_failed:
+                failed.append(case.name)
+                print(f"FAIL: {case.name}", file=sys.stderr)
         except subprocess.CalledProcessError:
             failed.append(case.name)
             print(f"FAIL: {case.name}", file=sys.stderr)

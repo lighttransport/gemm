@@ -143,7 +143,9 @@ static void qimg21_flow_sigmas(int steps, int image_tokens, float *sigmas) {
                      (max_shift - base_shift) / (max_seq - base_seq) * base_seq;
     const float emu = expf(mu);
     for (int i = 0; i < steps; i++) {
-        float u = (steps == 1) ? 1.0f : 1.0f - (float)i / (float)(steps - 1);
+        /* Pipeline input is linspace(1, 1/steps, steps), not linspace(1,0).
+         * Terminal stretching happens after the nonlinear dynamic shift. */
+        float u = 1.0f - (float)i / (float)steps;
         sigmas[i] = emu / (emu + (1.0f / u - 1.0f));
     }
     /* With one inference step the scheduler has no interior endpoint to
