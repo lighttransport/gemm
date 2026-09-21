@@ -28,6 +28,7 @@
 #include "edit_runtime.h"
 #include "mma64_kernels.h"
 #include "norm_vector_kernels.h"
+#include "rope_table_kernels.h"
 
 typedef struct {
     st_context *st[4];
@@ -313,16 +314,19 @@ typedef struct {
     CUmodule mod;
     CUfunction zero_rms, gelu, silu, round_bf16, mul_silu, mod_ln, mod_ln_precise, gate_res, qk_rope, attn, final_ln, proj;
     CUfunction mma_attention;
+    CUfunction table_rope;
     int norm_threads;
 } qimg21_kernels;
 
 static int qimg21_attention_reverse64;
 static int qimg21_attention_mma64;
 static int qimg21_norm_vector;
+static int qimg21_host_rope;
 
 static int get_kernel(qimg21_kernels *k, CUmodule m) {
     k->mod = m;
     k->mma_attention = NULL;
+    k->table_rope = NULL;
     k->norm_threads = 256;
     return cuModuleGetFunction(&k->zero_rms, m, "zero_rms") ||
            cuModuleGetFunction(&k->gelu, m, "gelu_tanh") ||
@@ -386,8 +390,22 @@ static int native_step(cuda_qimg_runner *r, qimg21_kernels *k, const qimg21_shar
     CUdeviceptr txt=0,img=0,hidden=0,tmp=0,tmp2=0,bf=0,q=0,kk=0,v=0,att=0,mlp0=0,mlp1=0,mod=0,temb=0,time0=0,timebf=0,scale=0;
     CUdeviceptr wt_norm=0,wt_in=0,wt_out=0,wi=0,w_t1=0,w_t2=0,w_mod=0,w_img=0,w_proj=0;
     int result = -1;
+    CUdeviceptr rope_table=0;
     if (!r->cublaslt_ctx && cublasewCreate(&r->cublaslt_ctx, r->stream) != 0) { fprintf(stderr,"native: cuBLAS unavailable\n"); return -1; }
     #define A(p,bytes) do { (p)=checked_cuMemAlloc(bytes); if(!(p)) goto fail; } while(0)
+    if(k->table_rope) {
+        float *table=malloc((size_t)N*128*sizeof(float));if(!table)goto fail;
+        for(int t=0;t<N;t++)for(int j=0;j<128;j+=2) {
+            int axis=j<16?0:(j<72?1:2),dim=axis==0?16:56,off=axis==0?0:(axis==1?16:72);
+            int pos=edit?edit->layout.position[t*3+axis]:(t<nt?t:(axis==0?nt:
+                      (axis==1?-(ih-ih/2)+(t-nt)/iw:-(iw-iw/2)+(t-nt)%iw)));
+            float inverse=1.f/powf(10000.f,(float)(j-off)/(float)dim),angle=(float)pos*inverse;
+            table[t*128+j]=cosf(angle);table[t*128+j+1]=sinf(angle);
+        }
+        rope_table=checked_cuMemAlloc((size_t)N*128*sizeof(float));
+        int error=!rope_table || cuMemcpyHtoD(rope_table,table,(size_t)N*128*sizeof(float)) || cuCtxSynchronize();
+        free(table);if(error)goto fail;
+    }
     A(txt,(size_t)nt*D*4); A(img,(size_t)ni*64*4); A(hidden,(size_t)N*D*4);
     /* tmp/bf are also the N*12288 SwiGLU activation hand-off buffers. */
     A(tmp,(size_t)N*12288*4); A(tmp2,(size_t)N*D*4); A(bf,(size_t)N*12288*2);
@@ -448,7 +466,8 @@ static int native_step(cuda_qimg_runner *r, qimg21_kernels *k, const qimg21_shar
         if(!wq||!wk||!wv||!wo||!wg||!wp||!wmlpo||!wqn||!wkn)goto fail_block;
         void *a1[]={&tmp,&hidden,&mod,&N,&D,&prefix,&(int){0}}; cuLaunchKernel(k->mod_ln,N,1,1,k->norm_threads,1,1,256*sizeof(float),r->stream,a1,NULL); cuCtxSynchronize(); if (launch_vec(k->round_bf16,r->stream,N*D,tmp)!=CUDA_SUCCESS) goto fail_block; probe(r,"mod_ln",tmp,N*D); if (qimg21_stage_block < 0 || bidx == qimg21_stage_block) dump_stage("mod_ln",tmp,(size_t)N*D,N,D); if(launch_cast(r,bf,tmp,N*D)!=CUDA_SUCCESS)goto fail_block;
         if(gemm(r,q,wq,bf,N,D,D)!=0||gemm(r,kk,wk,bf,N,D,D)!=0||gemm(r,v,wv,bf,N,D,D)!=0||launch_vec(k->round_bf16,r->stream,N*D,q)!=CUDA_SUCCESS||launch_vec(k->round_bf16,r->stream,N*D,kk)!=CUDA_SUCCESS||launch_vec(k->round_bf16,r->stream,N*D,v)!=CUDA_SUCCESS)goto fail_block; probe(r,"q",q,N*D); probe(r,"v",v,N*D); if (qimg21_stage_block < 0 || bidx == qimg21_stage_block) { dump_stage("q",q,(size_t)N*D,N,D); dump_stage("v",v,(size_t)N*D,N,D); }
-        if(edit) { void *ar[]={&q,&kk,&wqn,&wkn,(void *)&edit->position,(void *)&N,(void *)&NH}; if(cuLaunchKernel(edit->rope,N,NH,1,HD,1,1,0,r->stream,ar,NULL))goto fail_block; }
+        if(k->table_rope) {void *ar[]={&q,&kk,&wqn,&wkn,(void *)&N,(void *)&D,(void *)&NH,(void *)&HD,&nt,&ih,&iw,&rope_table};if(cuLaunchKernel(k->table_rope,N,NH,1,HD,1,1,0,r->stream,ar,NULL))goto fail_block;}
+        else if(edit) { void *ar[]={&q,&kk,&wqn,&wkn,(void *)&edit->position,(void *)&N,(void *)&NH}; if(cuLaunchKernel(edit->rope,N,NH,1,HD,1,1,0,r->stream,ar,NULL))goto fail_block; }
         else { void *ar[]={&q,&kk,&wqn,&wkn,&N,&D,&NH,&HD,&nt,&ih,&iw}; cuLaunchKernel(k->qk_rope,N,NH,1,HD,1,1,0,r->stream,ar,NULL); }
         cuCtxSynchronize(); if (launch_vec(k->round_bf16,r->stream,N*D,q)!=CUDA_SUCCESS||launch_vec(k->round_bf16,r->stream,N*D,kk)!=CUDA_SUCCESS) goto fail_block; probe(r,"rope_q",q,N*D);
         if (qimg21_stage_dir && (qimg21_stage_block < 0 || bidx == qimg21_stage_block)) {
@@ -499,6 +518,7 @@ fail_block: free_d(&wq);free_d(&wk);free_d(&wv);free_d(&wo);free_d(&wg);free_d(&
 fail:
     fprintf(stderr,"native: transformer step failed\n");
 done:
+    free_d(&rope_table);
     free_d(&txt);free_d(&img);free_d(&hidden);free_d(&tmp);free_d(&tmp2);free_d(&bf);free_d(&q);free_d(&kk);free_d(&v);free_d(&att);free_d(&mlp0);free_d(&mlp1);free_d(&mod);free_d(&temb);free_d(&time0);free_d(&timebf);free_d(&scale);free_d(&wt_norm);free_d(&wt_in);free_d(&wt_out);free_d(&wi);free_d(&w_t1);free_d(&w_t2);free_d(&w_mod);free_d(&w_img);free_d(&w_proj);
     #undef A
     return result;
@@ -515,6 +535,12 @@ int main(int argc, char **argv) {
     float manual_t = -1.0f;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--model") && i + 1 < argc) model = argv[++i];
+        else if (!strcmp(argv[i], "--rope") && i+1<argc) {
+            const char *mode=argv[++i];
+            if(!strcmp(mode,"host-table"))qimg21_host_rope=1;
+            else if(!strcmp(mode,"default"))qimg21_host_rope=0;
+            else return 2;
+        }
         else if (!strcmp(argv[i], "--normalization") && i + 1 < argc) {
             const char *mode=argv[++i];
             if(!strcmp(mode,"vector4"))qimg21_norm_vector=1;
@@ -629,6 +655,10 @@ int main(int argc, char **argv) {
     qimg21_kernels k;CUmodule m;if(cu_compile_kernels(&m,r->device,qimg21_src,"qimg21_native.cu",verbose,"qimg21_native")<0||get_kernel(&k,m)!=0){fprintf(stderr,"native: custom kernel compile failed\n");return 1;}fprintf(stderr,"native: custom kernels ready\n");
     CUmodule mma_module=NULL;
     CUmodule norm_module=NULL;
+    CUmodule rope_module=NULL;
+    if(qimg21_host_rope &&
+       (cu_compile_kernels(&rope_module,r->device,q21_rope_table_src,"qimg21_rope_table.cu",verbose,"qimg21_rope_table")<0 ||
+        cuModuleGetFunction(&k.table_rope,rope_module,"qk_rope_table")))return 1;
     if(qimg21_norm_vector) {
         if(cu_compile_kernels(&norm_module,r->device,q21_norm_vector_src,"qimg21_norm_vector.cu",verbose,"qimg21_norm_vector")<0 ||
            cuModuleGetFunction(&k.mod_ln,norm_module,"mod_ln_vector") ||
@@ -688,5 +718,6 @@ int main(int argc, char **argv) {
     q21_edit_free(&edit);q21_edit_free(&negative_edit);free(packed);npy_free(&condition);
     if(mma_module)cuModuleUnload(mma_module);
     if(norm_module)cuModuleUnload(norm_module);
+    if(rope_module)cuModuleUnload(rope_module);
     cuda_qimg_free(r); npy_free(&pe); npy_free(&neg); npy_free(&la); return rc;
 }

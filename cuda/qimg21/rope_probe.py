@@ -20,6 +20,7 @@ def main():
     ap.add_argument("--height-tokens", type=int, required=True)
     ap.add_argument("--width-tokens", type=int, required=True)
     ap.add_argument("--block", type=int, default=0)
+    ap.add_argument("--export-replay", type=Path, help="Write normalized Q, official frequencies and expected output")
     args = ap.parse_args()
     folder = args.stage_dir
     q = torch.from_numpy(np.load(folder / "q.npy")).cuda().bfloat16().reshape(1, -1, 32, 128)
@@ -48,6 +49,11 @@ def main():
         tree_normalized = (q.float() * torch.rsqrt(square / 128 + 1e-6)).bfloat16() * norm.weight
         tree_rotated = apply_rotary_emb_qwen(tree_normalized, frequencies, use_real=False).float().cpu().numpy().reshape(-1, 4096)
         norm_mismatch = int(torch.count_nonzero(normalized != tree_normalized).item())
+    if args.export_replay:
+        args.export_replay.mkdir(parents=True, exist_ok=False)
+        np.save(args.export_replay / "normalized.npy", np.ascontiguousarray(normalized.float().cpu().numpy().reshape(-1, 4096)))
+        np.save(args.export_replay / "frequencies.npy", np.ascontiguousarray(torch.view_as_real(frequencies).cpu().numpy().reshape(-1, 128)))
+        np.save(args.export_replay / "expected.npy", np.ascontiguousarray(expected))
     native = np.load(folder / "rope_q.npy")
     cosine, relative_l2 = _cosine_error(expected, native)
     mismatch = (expected != native).reshape(-1, 32, 128)

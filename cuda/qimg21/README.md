@@ -456,6 +456,26 @@ differ between native output and that replay. This points to rotary frequency
 or complex arithmetic as the larger local discrepancy, not SwiGLU. These
 operator diagnostics do not establish whole-model parity.
 
+`rope_probe.py --export-replay DIR` also exports normalized Q and official
+complex frequencies for `test_rotary_arithmetic`. On the saved first-block
+fixture, fused arithmetic with official frequencies differs in just five
+values (max absolute error 0.0000152588); non-fused arithmetic differs in
+eight (max 0.0078125). A C host table using F32 `powf`/reciprocal/`cosf`/`sinf`
+reproduces the same five small output mismatches as official frequencies.
+
+```sh
+make -C cuda/qimg21 test_rotary_arithmetic
+cuda/qimg21/test_rotary_arithmetic tmp/qimg21-rotary-arithmetic 0
+cuda/qimg21/test_rotary_arithmetic tmp/qimg21-rotary-arithmetic 0 15 16 16
+```
+
+The second invocation regenerates frequencies for 15 text tokens and a
+16x16 target grid; modes 0/1/2 select fused/non-fused/double-intermediate math.
+The native denoiser exposes host frequencies as opt-in `--rope host-table`,
+supporting both ordinary and editing layouts without Python at runtime.
+Full low-timestep cosine is **0.999954723**, still failing 0.99996. Defaults
+remain unchanged; isolated rotary improvement is not model acceptance.
+
 Compare the replay without loading PyTorch or allocating GPU memory:
 
 ```sh

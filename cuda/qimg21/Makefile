@@ -10,7 +10,7 @@ test_cuda_qimg21: test_cuda_qimg21.py
 
 native: test_cuda_qimg21_native test_cuda_qimg21_vae
 
-test_cuda_qimg21_native: test_cuda_qimg21_native.c quant_weights.h edit_runtime.h edit_kernels.h mma64_kernels.h norm_vector_kernels.h joint_layout.h ../../cuda/cuew.c ../../cuda/cublasew.c
+test_cuda_qimg21_native: test_cuda_qimg21_native.c quant_weights.h edit_runtime.h edit_kernels.h mma64_kernels.h norm_vector_kernels.h rope_table_kernels.h joint_layout.h ../../cuda/cuew.c ../../cuda/cublasew.c
 	$(CC) -O2 -std=c11 -D_GNU_SOURCE -Wall -Wextra -I../../common -I../../cuda -I../qimg \
 		-o $@ test_cuda_qimg21_native.c ../../cuda/cuew.c ../../cuda/cublasew.c \
 		-ldl -lm -lpthread
@@ -43,6 +43,10 @@ test_bf16_attention: test_bf16_attention.c mma64_kernels.h test_cuda_qimg21_nati
 test_norm_vector: test_norm_vector.c norm_vector_kernels.h test_cuda_qimg21_native.c ../../cuda/cuew.c ../../cuda/cublasew.c
 	$(CC) -O2 -std=c11 -D_GNU_SOURCE -Wall -Wextra -I../../common -I../../cuda -I../qimg \
 		-o $@ test_norm_vector.c ../../cuda/cuew.c ../../cuda/cublasew.c -ldl -lm -lpthread
+
+test_rotary_arithmetic: test_rotary_arithmetic.c test_cuda_qimg21_native.c ../../cuda/cuew.c ../../cuda/cublasew.c
+	$(CC) -O2 -std=c11 -D_GNU_SOURCE -Wall -Wextra -I../../common -I../../cuda -I../qimg \
+		-o $@ test_rotary_arithmetic.c ../../cuda/cuew.c ../../cuda/cublasew.c -ldl -lm -lpthread
 
 test_scheduler: test_scheduler.c test_cuda_qimg21_native.c ../../cuda/cuew.c ../../cuda/cublasew.c
 	$(CC) -O2 -std=c11 -D_GNU_SOURCE -Wall -Wextra -I../../common -I../../cuda -I../qimg \
