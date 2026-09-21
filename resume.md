@@ -176,14 +176,14 @@ retained the sampled sequence hash `630b7cbc72230e0d` and output SHA-256
 Production defaults remain unchanged until the broader sampled/logit quality
 matrix is rerun.
 
-A DFlash2 proposal now replaces the seven fixed anchor-plus-mask IQ1_M
-embedding launches with one row-batched launch using the existing verifier
-kernel. The anchor remains scalar, the mask IDs are copied into sidecar-owned
+A DFlash2 proposal now replaces the anchor-plus-mask IQ1_M embedding launches
+with one exact row-batched launch. The anchor and mask IDs use selector-owned
 scratch, and selector output overwrites that scratch only after the embedding
-has consumed it. K=7 remains exact (`15f17d2640c1adfc`, 41/42 accepted) at
-79.55 tok/s on the current coding gate; the full HTTP/stdio and C++ quality
-matrix passes. This is retained as a launch-count and lifecycle cleanup while
-the larger draft projection cost remains under measurement.
+has consumed it. The pinned greedy K=7 gate is exact at 83.69 tok/s warm
+(140 drafted/134 accepted, hash `44915ec1039a64c8`); seeded sampled K=7 is
+exact at 70.47 tok/s (140 drafted/115 accepted, hash `630b7cbc72230e0d`).
+The full HTTP/stdio and C++ quality matrix passes; larger draft projection
+cost remains under measurement.
 
 The sidecar commit path now has an opt-in event-ordered injection stream via
 `LLM_QWEN35_DFLASH_OVERLAP_INJECT=1`.  Injection runs on a nonblocking stream

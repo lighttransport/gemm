@@ -604,10 +604,12 @@ reflects the remaining measured costs.
    cheaper draft-cache storage are the next candidates, provided K=4/K=7
    acceptance and authoritative output remain stable.
 
-   The fixed mask-token rows now use one exact row-batched IQ1_M embedding
-   launch. The current K=7 coding gate remains exact at 79.55 tok/s; this is
-   retained as a launch-count cleanup while the larger projection cost remains
-   the material draft target.
+   The anchor and fixed mask-token rows now use one exact row-batched IQ1_M
+   embedding launch. The pinned greedy K=7 gate is exact at 83.69 tok/s warm
+   (140 drafted/134 accepted, hash `44915ec1039a64c8`), and seeded sampled K=7
+   is exact at 70.47 tok/s (140 drafted/115 accepted, hash
+   `630b7cbc72230e0d`). Draft projection cost remains the material sidecar
+   target after this launch-count reduction.
 6. **Prompt-cache injection.**  Feature capture now shares the target
    RMSNorm kernel and both 4K and random-64K prefill retain their targets.
    The hipBLASLt bridge now allocates scratch lazily per HIP stream, so a
