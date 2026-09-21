@@ -166,6 +166,12 @@ class ProtocolTest(unittest.TestCase):
         self.assertEqual(command[-5:], ["--qwen35-mtp", "nextn.gguf",
                                         "--qwen35-mtp-draft", "3",
                                         "--qwen35-mtp-window"])
+        args.qwen35_mtp_window = False
+        self.assertEqual(runner_command(args)[-1], "--qwen35-mtp-window")
+        args.qwen35_mtp_draft = 16
+        with self.assertRaisesRegex(ValueError, "must be 1..15"):
+            runner_command(args)
+        args.qwen35_mtp_draft = 3
         args.qwen35_dflash2 = "dflash.gguf"
         with self.assertRaisesRegex(ValueError, "cannot be combined"):
             runner_command(args)

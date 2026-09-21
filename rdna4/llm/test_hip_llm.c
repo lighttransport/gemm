@@ -425,6 +425,7 @@ static int stdio_snapshot_cache_publish(stdio_snapshot_cache *cache,
 
 static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
                             int n_vocab, int max_seq_len, int bos_id, int mtp_draft,
+                            int dense_mtp_draft, int dense_mtp_window,
                             int dflash_draft,
                             int coding_mode, const hllm_sampler_config *sampling_defaults,
                             int context_cache_entries, size_t context_cache_bytes) {
@@ -653,6 +654,11 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
             common = 0;
             active_identity[0] = '\0';
         }
+        /* Dense NextN owns request-local draft KV. It does not consume prompt
+         * tokens, so even an append to a live target prefix must begin a new
+         * draft sequence from the completed prompt boundary. */
+        if (dense_mtp_draft > 0)
+            hip_llm_qwen35_mtp_reset(gpu);
         if (n_tokens > max_seq_len) n_tokens = max_seq_len;
         hip_llm_set_qwen4_batch_request_tokens(gpu, n_tokens);
         int batch_size = 128;
@@ -767,10 +773,17 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
         int mtp_index = 0, mtp_pending = -1, mtp_error = 0;
         int mtp_approx_fallback = 0;
         int mtp_adaptive_fallback = 0;
-        int32_t dflash_drafts[7], dflash_argmax[8];
-        int dflash_count = 0, dflash_index = 0, dflash_rows = 0;
-        int dflash_position = -1;
-        float *dflash_logits = NULL;
+        int32_t q35_drafts[16], q35_argmax[16];
+        int q35_count = 0, q35_index = 0, q35_rows = 0;
+        int q35_position = -1;
+        float *q35_logits = NULL;
+        const int q35_is_dflash = dflash_draft > 0;
+        const int q35_draft = q35_is_dflash ? dflash_draft :
+            (dense_mtp_draft > 0 && dense_mtp_window && temperature <= 0.0f ?
+             dense_mtp_draft : 0);
+        int q35_proposed = 0, q35_accepted = 0;
+        double q35_draft_ms = 0.0, q35_verify_ms = 0.0,
+               q35_commit_ms = 0.0;
         int32_t stops[] = { eos, eot, im_end };
         for (int k = 0; logits && k < max_tokens; k++) {
             if (g_stdio_cancel) { cancelled = 1; break; }
@@ -795,17 +808,17 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
                             mtp.accepted, mtp.drafted);
                 }
             }
-            int dflash_window = dflash_draft > 0 && dflash_rows > 0;
-            int next = dflash_window ?
-                (dflash_logits ?
+            int q35_window = q35_draft > 0 && q35_rows > 0;
+            int next = q35_window ?
+                (q35_logits ?
                     (sampler ? hllm_sampler_sample(sampler,
-                        dflash_logits + (size_t)dflash_index * n_vocab) :
+                        q35_logits + (size_t)q35_index * n_vocab) :
                      (temperature <= 0.0f ? argmax_logits(
-                        dflash_logits + (size_t)dflash_index * n_vocab, n_vocab) :
-                      sample_top_k_p(dflash_logits + (size_t)dflash_index * n_vocab,
+                        q35_logits + (size_t)q35_index * n_vocab, n_vocab) :
+                      sample_top_k_p(q35_logits + (size_t)q35_index * n_vocab,
                         n_vocab, top_k, top_p, temperature, presence,
                         repetition, min_p, seen, &rng))) :
-                 dflash_argmax[dflash_index]) :
+                 q35_argmax[q35_index]) :
                 use_mtp ? mtp.tokens[mtp_index++] : sampler ? hllm_sampler_sample(sampler, logits) : (temperature <= 0.0f) ? argmax_logits(logits, n_vocab) :
                 (coding_mode ? sample_top_k_p_coding(logits, n_vocab, top_k, top_p,
                                temperature, presence, repetition, min_p, seen, &rng, vocab) :
@@ -848,77 +861,103 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
                  * processed input, so publish inputs through that row before
                  * closing the transaction. */
                 cache_n--;
-                if (dflash_window) {
-                    int processed = dflash_index + 1;
-                    if (hip_llm_qwen35_dflash2_commit(gpu, dflash_position,
-                                                      processed)) {
+                if (q35_window) {
+                    int processed = q35_index + 1;
+                    double tc = get_time_ms();
+                    int commit_rc = q35_is_dflash ?
+                        hip_llm_qwen35_dflash2_commit(gpu, q35_position,
+                                                      processed) :
+                        hip_llm_qwen35_mtp_commit(gpu, processed);
+                    q35_commit_ms += get_time_ms() - tc;
+                    if (commit_rc) {
                         fprintf(stderr,
-                                "llm_server: DFlash stop commit failed pos=%d rows=%d\n",
-                                dflash_position, processed);
+                                "llm_server: Qwen3.8 speculative stop commit failed "
+                                "pos=%d rows=%d\n", q35_position, processed);
                         fflush(stderr);
                         mtp_error = 1;
                     }
-                    dflash_rows = dflash_index = dflash_count = 0;
-                    dflash_position = -1;
-                    dflash_logits = NULL;
+                    q35_rows = q35_index = q35_count = 0;
+                    q35_position = -1;
+                    q35_logits = NULL;
                 }
                 finish_eos = 1;
                 break;
             }
-            if (dflash_window) {
-                int matched = dflash_index < dflash_count && next == dflash_drafts[dflash_index];
-                dflash_index++;
-                if (!matched || dflash_index == dflash_rows) {
-                    if (hip_llm_qwen35_dflash2_commit(gpu, dflash_position,
-                                                      dflash_index)) {
-                        fprintf(stderr, "llm_server: DFlash commit failed pos=%d rows=%d\n",
-                                dflash_position, dflash_index);
+            if (q35_window) {
+                int matched = q35_index < q35_count &&
+                              next == q35_drafts[q35_index];
+                q35_index++;
+                if (matched) q35_accepted++;
+                if (!matched || q35_index == q35_rows) {
+                    double tc = get_time_ms();
+                    int commit_rc = q35_is_dflash ?
+                        hip_llm_qwen35_dflash2_commit(gpu, q35_position,
+                                                      q35_index) :
+                        hip_llm_qwen35_mtp_commit(gpu, q35_index);
+                    q35_commit_ms += get_time_ms() - tc;
+                    if (commit_rc) {
+                        fprintf(stderr,
+                                "llm_server: Qwen3.8 speculative commit failed "
+                                "pos=%d rows=%d\n", q35_position, q35_index);
                         fflush(stderr);
                         mtp_error = 1; break;
                     }
-                    dflash_rows = dflash_index = dflash_count = 0;
-                    dflash_position = -1;
-                    dflash_logits = NULL;
+                    q35_rows = q35_index = q35_count = 0;
+                    q35_position = -1;
+                    q35_logits = NULL;
                 }
             }
-            if (dflash_draft > 0 && !coding_mode &&
-                dflash_rows == 0 && k + 1 < max_tokens) {
+            if (q35_draft > 0 && (!q35_is_dflash || !coding_mode) &&
+                q35_rows == 0 && k + 1 < max_tokens) {
                 int count = max_tokens - k - 1;
-                if (count > dflash_draft) count = dflash_draft;
-                if (count > 0 && hip_llm_qwen35_dflash2_propose(gpu, next, cache_n - 1,
-                                                                  count, dflash_drafts)) {
-                    fprintf(stderr, "llm_server: DFlash propose failed pos=%d count=%d\n",
+                if (count > q35_draft) count = q35_draft;
+                double td = get_time_ms();
+                int propose_rc = count > 0 ? (q35_is_dflash ?
+                    hip_llm_qwen35_dflash2_propose(gpu, next, cache_n - 1,
+                                                   count, q35_drafts) :
+                    hip_llm_qwen35_mtp_propose(gpu, next, cache_n - 1,
+                                               count, q35_drafts)) : 0;
+                q35_draft_ms += get_time_ms() - td;
+                if (propose_rc) {
+                    fprintf(stderr,
+                            "llm_server: Qwen3.8 speculative propose failed "
+                            "pos=%d count=%d\n",
                             cache_n - 1, count);
                     fflush(stderr);
                     mtp_error = 1; break;
                 }
                 if (count > 0) {
-                    int32_t inputs[8]; inputs[0] = next;
-                    memcpy(inputs + 1, dflash_drafts, (size_t)count * sizeof(int32_t));
+                    int32_t inputs[16]; inputs[0] = next;
+                    memcpy(inputs + 1, q35_drafts,
+                           (size_t)count * sizeof(int32_t));
+                    double tv = get_time_ms();
                     if (sampler || temperature > 0.0f)
-                        dflash_logits = hip_llm_qwen35_mtp_verify(gpu, inputs,
-                                                                  count + 1, cache_n - 1);
+                        q35_logits = hip_llm_qwen35_mtp_verify(
+                            gpu, inputs, count + 1, cache_n - 1);
                     else
-                        dflash_logits = NULL;
-                    if (dflash_logits == NULL &&
+                        q35_logits = NULL;
+                    if (q35_logits == NULL &&
                         hip_llm_qwen35_mtp_verify_argmax(gpu, inputs, count + 1,
-                                                         cache_n - 1, dflash_argmax)) {
-                            fprintf(stderr, "llm_server: DFlash verify failed pos=%d rows=%d\n",
+                                                         cache_n - 1, q35_argmax)) {
+                            fprintf(stderr,
+                                    "llm_server: Qwen3.8 speculative verify failed "
+                                    "pos=%d rows=%d\n",
                                     cache_n - 1, count + 1);
                             fflush(stderr);
                             mtp_error = 1; break;
                     }
-                    dflash_count = count;
-                    dflash_rows = count + 1;
-                    dflash_index = 0;
-                    dflash_position = cache_n - 1;
+                    q35_verify_ms += get_time_ms() - tv;
+                    q35_proposed += count;
+                    q35_count = count;
+                    q35_rows = count + 1;
+                    q35_index = 0;
+                    q35_position = cache_n - 1;
                 }
             }
             /* If approximate MTP just fell back after a zero-accept batch,
              * replay the emitted anchor through the target so the ordinary
              * decode path resumes with fresh logits and state. */
-            if (!use_mtp && !dflash_window && !dflash_rows &&
-                (!dflash_draft || dflash_rows == 0))
+            if (!use_mtp && !q35_window && !q35_rows)
                 logits = hip_llm_forward_logits(gpu, next, cache_n - 1);
             double token_now = get_time_ms();
             double token_ms = token_now - t_decode0;
@@ -933,18 +972,22 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
         /* A length limit may cut through an accepted speculative window.
          * Publish exactly the rows whose tokens were emitted; later verifier
          * rows remain transaction-local and must not leak into the next turn. */
-        if (!cancelled && !mtp_error && dflash_rows > 0 && dflash_index > 0) {
-            if (hip_llm_qwen35_dflash2_commit(gpu, dflash_position,
-                                              dflash_index)) {
+        if (!cancelled && !mtp_error && q35_rows > 0 && q35_index > 0) {
+            double tc = get_time_ms();
+            int commit_rc = q35_is_dflash ?
+                hip_llm_qwen35_dflash2_commit(gpu, q35_position, q35_index) :
+                hip_llm_qwen35_mtp_commit(gpu, q35_index);
+            q35_commit_ms += get_time_ms() - tc;
+            if (commit_rc) {
                 fprintf(stderr,
-                        "llm_server: DFlash length commit failed pos=%d rows=%d\n",
-                        dflash_position, dflash_index);
+                        "llm_server: Qwen3.8 speculative length commit failed "
+                        "pos=%d rows=%d\n", q35_position, q35_index);
                 fflush(stderr);
                 mtp_error = 1;
             }
-            dflash_rows = dflash_index = dflash_count = 0;
-            dflash_position = -1;
-            dflash_logits = NULL;
+            q35_rows = q35_index = q35_count = 0;
+            q35_position = -1;
+            q35_logits = NULL;
         }
         if (mtp_error) {
             hip_llm_free_state_snapshot(pending_prefix_snapshot);
@@ -974,6 +1017,14 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
                 "llm_server: end-to-end=%d prompt-added + %d generated in %.2f ms (%.2f tok/s)\n",
                 prompt_added, generated, end_to_end_ms,
                 end_to_end_ms > 0.0 ? 1000.0 * end_to_end_tokens / end_to_end_ms : 0.0);
+        if (q35_draft > 0) {
+            fprintf(stderr,
+                    "llm_server: %s drafted=%d accepted=%d draft_ms=%.3f "
+                    "verify_ms=%.3f commit_ms=%.3f\n",
+                    q35_is_dflash ? "DFlash2" : "Dense NextN",
+                    q35_proposed, q35_accepted, q35_draft_ms,
+                    q35_verify_ms, q35_commit_ms);
+        }
         {
             hip_llm_moe_stats ms;
             if (hip_llm_get_moe_stats(gpu, &ms) == 0 &&
@@ -1996,8 +2047,12 @@ int main(int argc, char **argv) {
     }
     if (qwen35_mtp_path) {
         char error[192] = "invalid benchmark mode or draft width";
-        if (!bench_mode || stdio_server || qwen4_mtp || qwen35_mtp_draft < 1 || qwen35_mtp_draft > 16 ||
+        if ((!bench_mode && !stdio_server) || qwen4_mtp ||
+            qwen35_mtp_draft < 1 || qwen35_mtp_draft > 16 ||
             (qwen35_mtp_window && qwen35_mtp_draft > 15) ||
+            (stdio_server && (!qwen35_mtp_window || !qwen35_batched_prefill ||
+                              !qwen35_decode_graph ||
+                              kv_cache_type != HIP_LLM_KV_Q8_0_Q8_0)) ||
             hip_llm_qwen35_mtp_load(gpu, qwen35_mtp_path, error, sizeof(error))) {
             fprintf(stderr, "Dense NextN load/configuration failed: %s\n", error);
             hip_llm_free(gpu);
@@ -2105,6 +2160,8 @@ int main(int argc, char **argv) {
         int bos = prompt_bos_id(gguf);
         pass = run_stdio_server(gpu, vocab, n_vocab, n_max_seq, bos,
                                 qwen4_mtp ? qwen4_mtp_draft : 0,
+                                qwen35_mtp_path ? qwen35_mtp_draft : 0,
+                                qwen35_mtp_window,
                                 qwen35_dflash2_path ? qwen35_dflash2_draft : 0,
                                 coding_mode, reference_sampling ? &sampling : NULL,
                                 context_cache_entries,

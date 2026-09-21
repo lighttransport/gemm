@@ -817,3 +817,14 @@ int hip_llm_qwen35_mtp_commit(hip_llm_runner *r, int processed) {
     r->q8x2_reuse_valid = r->iq1_q8_valid = 0;
     return 0;
 }
+
+void hip_llm_qwen35_mtp_reset(hip_llm_runner *r) {
+    hllm_qwen35_mtp *m = r ? r->qwen35_mtp : NULL;
+    if (!m || !m->source) return;
+    if (r->stream) hipStreamSynchronize(r->stream);
+    m->origin = -1;
+    m->kv_end = 0;
+    m->pending_token = -1;
+    m->verify_rows = 0;
+    m->verify_position = 0;
+}

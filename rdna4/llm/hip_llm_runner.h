@@ -181,6 +181,9 @@ float *hip_llm_qwen35_mtp_verify(hip_llm_runner *r, const int32_t *tokens,
 int hip_llm_qwen35_mtp_verify_argmax(hip_llm_runner *r, const int32_t *tokens,
                                     int rows, int position, int32_t *argmax);
 int hip_llm_qwen35_mtp_commit(hip_llm_runner *r, int processed);
+/* Discard only the dense draft transaction/history. Target prompt state and
+ * logits remain live. Call at every independent serving request boundary. */
+void hip_llm_qwen35_mtp_reset(hip_llm_runner *r);
 
 /* Qwen3.8 DFlash2 block-diffusion drafter. Target verification remains exact;
  * only verified target tokens are committed to the caller. */

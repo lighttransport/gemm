@@ -125,14 +125,16 @@ def runner_command(args):
                 "--qwen4-mtp-cache-mb", str(getattr(args, "qwen4_mtp_cache_mb", 128)),
                 "--qwen4-mtp-verify", getattr(args, "qwen4_mtp_verify", "scalar")]
     if qwen35_mtp:
+        qwen35_mtp_draft = int(getattr(args, "qwen35_mtp_draft", 3))
+        if not 1 <= qwen35_mtp_draft <= 15:
+            raise ValueError("--qwen35-mtp-draft must be 1..15 for resident serving")
         if not server_profile:
             cmd += ["--kv-cache", "q8q8", "--qwen35-prefill-bf16",
                     "--qwen35-decode-graph", "--qwen35-native-q8-prefill",
                     "--qwen35-native-mmvq"]
         cmd += ["--qwen35-mtp", qwen35_mtp,
-                "--qwen35-mtp-draft", str(getattr(args, "qwen35_mtp_draft", 3))]
-        if getattr(args, "qwen35_mtp_window", False):
-            cmd.append("--qwen35-mtp-window")
+                "--qwen35-mtp-draft", str(qwen35_mtp_draft),
+                "--qwen35-mtp-window"]
     if server_profile:
         # Keep the resident Qwen3.8 HTTP/stdio route on the validated exact
         # Q8/Q8 profile. This only changes server command construction; the
@@ -1073,9 +1075,9 @@ def main():
                     help="use the validated exact Qwen3.8 Q8/Q8 HTTP/stdio profile")
     ap.add_argument("--qwen35-mtp", metavar="SIDECAR",
                     help="exact dense Qwen3.8 NextN sidecar for greedy serving")
-    ap.add_argument("--qwen35-mtp-draft", type=int, choices=range(1, 33), default=3)
+    ap.add_argument("--qwen35-mtp-draft", type=int, choices=range(1, 16), default=3)
     ap.add_argument("--qwen35-mtp-window", action="store_true",
-                    help="use the windowed dense NextN verifier")
+                    help="compatibility flag; resident Dense NextN always uses exact windows")
     ap.add_argument("--qwen35-dflash2", metavar="SIDECAR",
                     help="exact Qwen3.8 DFlash2 sidecar for HTTP/stdio serving")
     ap.add_argument("--qwen35-dflash2-draft", type=int, choices=range(1, 8), default=7)

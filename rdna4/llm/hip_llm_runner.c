@@ -33345,8 +33345,8 @@ struct hip_llm_state_snapshot {
     size_t *kv_bytes;
     int kv_start;
     int kv_count;
-    float *hc_host, *nextn_hc_host, *logits_host;
-    size_t hc_bytes, logits_bytes;
+    float *hc_host, *nextn_hc_host, *logits_host, *hidden_host;
+    size_t hc_bytes, logits_bytes, hidden_bytes;
     int position, nextn_start;
     void **index_host;
     size_t index_bytes;
@@ -33368,7 +33368,7 @@ struct hip_llm_state_snapshot {
 size_t hip_llm_state_snapshot_bytes(const hip_llm_state_snapshot *s) {
     if (!s) return 0;
     size_t bytes = sizeof(*s) + s->ple_bytes + s->hc_bytes +
-                   s->logits_bytes + s->nextn_kv_bytes +
+                   s->logits_bytes + s->hidden_bytes + s->nextn_kv_bytes +
                    s->dflash_feature_bytes;
     if (s->conv_host) bytes += (size_t)s->n_layers * sizeof(*s->conv_host);
     if (s->rec_host) bytes += (size_t)s->n_layers * sizeof(*s->rec_host);
@@ -33459,6 +33459,7 @@ void hip_llm_free_state_snapshot(hip_llm_state_snapshot *s) {
     if(s->index_host)for(int l=0;l<s->n_layers;++l)free(s->index_host[l]);
     free(s->index_host);free(s->nextn_key_host);free(s->nextn_value_host);
     free(s->hc_host);free(s->nextn_hc_host);free(s->logits_host);
+    free(s->hidden_host);
     free(s);
 }
 
@@ -33555,6 +33556,18 @@ hip_llm_state_snapshot *hip_llm_snapshot_state(hip_llm_runner *r) {
         if (!s->logits_host)
             goto fail;
         memcpy(s->logits_host, r->h_output, s->logits_bytes);
+    }
+    /* Dense NextN starts each request from the target hidden vector at the
+     * prompt boundary. Portable cache restore must therefore restore d_x as
+     * well as the logits and recurrent/KV state. DFlash owns prompt features
+     * separately and creates only a verifier-workspace shell here. */
+    if (r->qwen35_mtp && r->qwen35_mtp->source) {
+        s->hidden_bytes = (size_t)r->n_embd * sizeof(float);
+        s->hidden_host = malloc(s->hidden_bytes);
+        if (!s->hidden_host || hipMemcpy(s->hidden_host, r->d_x,
+                                         s->hidden_bytes,
+                                         hipMemcpyDeviceToHost) != hipSuccess)
+            goto fail;
     }
     for (int l = 0; l < r->n_layers; ++l) {
         hip_layer *cl = &r->layers[l];
@@ -33687,6 +33700,12 @@ int hip_llm_restore_state(hip_llm_runner *r, const hip_llm_state_snapshot *s) {
                                                    s->logits_bytes,
                                                    hipMemcpyHostToDevice)) return -1;
     if(s->logits_host)memcpy(r->h_output,s->logits_host,s->logits_bytes);
+    if (r->qwen35_mtp && r->qwen35_mtp->source) {
+        if (!s->hidden_host || s->hidden_bytes != (size_t)r->n_embd * sizeof(float) ||
+            hipMemcpy(r->d_x, s->hidden_host, s->hidden_bytes,
+                      hipMemcpyHostToDevice) != hipSuccess)
+            return -1;
+    }
     if(s->nextn_hc_host && (!r->d_qwen4_nextn_hc ||
        hipMemcpy(r->d_qwen4_nextn_hc,s->nextn_hc_host,s->hc_bytes,hipMemcpyHostToDevice)))return -1;
     r->cur_position=s->position;r->qwen4_nextn_start=s->nextn_start;
