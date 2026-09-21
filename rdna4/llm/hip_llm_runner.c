@@ -360,12 +360,16 @@ static const char *hip_kernel_source =
 "        (val[t+s]==val[t] && idx[t+s]<idx[t]))){val[t]=val[t+s];idx[t]=idx[t+s];}__syncthreads();}\n"
 "    if(t==0)out[row]=idx[0];\n"
 "}\n"
-"__global__ void copy_state_row_f32(float **dst, const float **src,\n"
-"        size_t elements, size_t row_stride, int row, int layers) {\n"
+"__global__ void copy_state_rows_f32(float **conv_dst, const float **conv_src,\n"
+"        size_t conv_elements, size_t conv_stride, float **rec_dst,\n"
+"        const float **rec_src, size_t rec_elements, size_t rec_stride,\n"
+"        int row, int layers) {\n"
 "    int layer=blockIdx.y; size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;\n"
-"    size_t vectors=elements/4,stride=row_stride/4;\n"
-"    if(layer<layers && i<vectors)((uint4 *)dst[layer])[i]=\n"
-"        ((const uint4 *)src[layer])[(size_t)row*stride+i];\n"
+"    if(layer>=layers)return;\n"
+"    if(i<conv_elements/4)((uint4 *)conv_dst[layer])[i]=\n"
+"        ((const uint4 *)conv_src[layer])[(size_t)row*(conv_stride/4)+i];\n"
+"    if(i<rec_elements/4)((uint4 *)rec_dst[layer])[i]=\n"
+"        ((const uint4 *)rec_src[layer])[(size_t)row*(rec_stride/4)+i];\n"
 "}\n"
 "__global__ void hc_norm_f32(float *dst, const float *x, const float *w,\n"
 "                            int n_embd, int n_stream, float eps) {\n"
@@ -13070,7 +13074,7 @@ struct hip_llm_runner {
     hipFunction_t fn_qwen4_selected_attn_i8_warp;
     hipFunction_t fn_qwen4_argmax;
     hipFunction_t fn_qwen4_argmax_batch;
-    hipFunction_t fn_copy_state_row_f32;
+    hipFunction_t fn_copy_state_rows_f32;
     hipFunction_t fn_qwen4_qsa_scores;
     hipFunction_t fn_qwen4_qsa_sort_blocks;
     hipFunction_t fn_qwen4_qsa_merge_ids;
@@ -14189,7 +14193,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(qwen4_selected_attn_i8_warp);
     GET_FUNC(qwen4_argmax);
     GET_FUNC(qwen4_argmax_batch);
-    GET_FUNC(copy_state_row_f32);
+    GET_FUNC(copy_state_rows_f32);
     GET_FUNC(qwen4_qsa_scores);
     GET_FUNC(qwen4_qsa_sort_blocks);
     GET_FUNC(qwen4_qsa_merge_ids);

@@ -757,14 +757,14 @@ int hip_llm_qwen35_mtp_commit(hip_llm_runner *r, int processed) {
      * by one state vector.  The destination is the live single-row state. */
     size_t conv_stride = conv_elements;
     size_t rec_stride = rec_elements;
-    void *conv_args[] = { &m->verify_conv_dst_ptrs, &m->verify_conv_src_ptrs,
-        &conv_elements, &conv_stride, &last, &m->verify_ssm_layers };
-    void *rec_args[] = { &m->verify_rec_dst_ptrs, &m->verify_rec_src_ptrs,
-        &rec_elements, &rec_stride, &last, &m->verify_ssm_layers };
-    LAUNCH(r->fn_copy_state_row_f32, (conv_elements/4+255)/256,
-           m->verify_ssm_layers, 1, 256, 1, 1, 0, r->stream, conv_args);
-    LAUNCH(r->fn_copy_state_row_f32, (rec_elements/4+255)/256,
-           m->verify_ssm_layers, 1, 256, 1, 1, 0, r->stream, rec_args);
+    void *state_args[] = { &m->verify_conv_dst_ptrs, &m->verify_conv_src_ptrs,
+        &conv_elements, &conv_stride, &m->verify_rec_dst_ptrs,
+        &m->verify_rec_src_ptrs, &rec_elements, &rec_stride, &last,
+        &m->verify_ssm_layers };
+    size_t state_vectors = rec_elements > conv_elements ?
+                           rec_elements/4 : conv_elements/4;
+    LAUNCH(r->fn_copy_state_rows_f32, (state_vectors+255)/256,
+           m->verify_ssm_layers, 1, 256, 1, 1, 0, r->stream, state_args);
     r->cur_position = m->verify_position+last;
     if (hipMemcpyAsync(r->d_x,(float *)m->verify_x+(size_t)last*r->n_embd,(size_t)r->n_embd*sizeof(float),hipMemcpyDeviceToDevice,r->stream) ||
         hipMemcpyAsync(r->d_logits,(float *)m->verify_logits+(size_t)last*r->n_vocab,(size_t)r->n_vocab*sizeof(float),hipMemcpyDeviceToDevice,r->stream) ||
