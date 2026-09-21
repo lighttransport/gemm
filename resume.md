@@ -1,5 +1,27 @@
 # Qwen3.8 27B HIP runner vs llama.cpp — resume state
 
+## Active optimization goal: remaining items 1–5 (2026-09-22)
+
+1. Raise ordinary random-token 64K decode from the current ~35.8 tok/s toward
+   40+ by reducing the dominant mixed IQ projection traffic without changing
+   logits or the seeded token stream.
+2. Fuse the long-context target verifier's attention split/combine tail while
+   keeping the captured graph ABI and exact Q8/Q8 arithmetic stable.
+3. Optimize the hybrid DeltaNet tail and accepted-row checkpoint publication
+   without changing rollback or committed-state semantics.
+4. Reduce DFlash2 draft cost while retaining exact target verification and the
+   K=4/K=7 quality gates.
+5. Prepare safe sidecar cache-injection overlap with per-stream workspaces;
+   production defaults remain unchanged until measured gains are demonstrated.
+
+The sidecar attention merge is landed, and this pass also batches the fixed
+mask-token IQ1_M embeddings into one exact row-batched launch. The current K=7
+coding gate remains exact (`15f17d2640c1adfc`, 41/42 accepted) at 79.55 tok/s;
+the full HTTP/stdio, cancellation, cache, and multi-turn C++ quality suite
+passes. The batch launch is a small launch-count cleanup rather than a claimed
+headline speedup; the strict ordinary 64K target, target-tail fusion, and
+production overlap default remain open.
+
 ## 2026-09-22 continuation: fused DFlash2 split merge
 
 DFlash2 attention now has a verifier-only fused path for the production
@@ -142,11 +164,14 @@ retained the sampled sequence hash `630b7cbc72230e0d` and output SHA-256
 Production defaults remain unchanged until the broader sampled/logit quality
 matrix is rerun.
 
-A DFlash2 proposal probe also replaced the anchor-plus-mask IQ1_M embedding
-loop with one row-batched launch using the existing verifier kernel.  K=7
-remained exact (`15f17d2640c1adfc`, 41/42 accepted), but matched 4K runs were
-79.51 tok/s batched versus 79.66 tok/s serialized, so the extra token-id
-upload and changed launch schedule were reverted.
+A DFlash2 proposal now replaces the seven fixed anchor-plus-mask IQ1_M
+embedding launches with one row-batched launch using the existing verifier
+kernel. The anchor remains scalar, the mask IDs are copied into sidecar-owned
+scratch, and selector output overwrites that scratch only after the embedding
+has consumed it. K=7 remains exact (`15f17d2640c1adfc`, 41/42 accepted) at
+79.55 tok/s on the current coding gate; the full HTTP/stdio and C++ quality
+matrix passes. This is retained as a launch-count and lifecycle cleanup while
+the larger draft projection cost remains under measurement.
 
 The sidecar commit path now has an opt-in event-ordered injection stream via
 `LLM_QWEN35_DFLASH_OVERLAP_INJECT=1`.  Injection runs on a nonblocking stream

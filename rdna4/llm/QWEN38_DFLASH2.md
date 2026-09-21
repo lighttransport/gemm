@@ -1,5 +1,15 @@
 # Qwen3.8 DFlash2 on RDNA4
 
+## Draft mask embedding cleanup (2026-09-22)
+
+Each DFlash2 proposal keeps the anchor embedding scalar and now decodes the
+remaining fixed mask-token rows with one exact `embed_iq1_m_batch` launch. The
+mask IDs use sidecar-owned scratch until the selector consumes and overwrites
+that buffer later in the same stream, so target verification and selector
+state are unchanged. The current K=7 coding gate remains exact (41/42 accepted,
+hash `15f17d2640c1adfc`) at 79.55 tok/s, and the full HTTP/stdio cache,
+cancellation, concurrency, and multi-turn C++ quality harness passes.
+
 ## Fused sidecar attention merge (2026-09-22)
 
 The DFlash2 verifier now uses a fused attention kernel for schedules of up to
@@ -588,9 +598,10 @@ reflects the remaining measured costs.
    cheaper draft-cache storage are the next candidates, provided K=4/K=7
    acceptance and authoritative output remain stable.
 
-   A row-batched IQ1_M embedding probe removed the per-mask-row launch loop,
-   but the matched K=7 4K gate measured 79.51 tok/s versus 79.66 tok/s for
-   the serialized embedding path, so it was reverted.
+   The fixed mask-token rows now use one exact row-batched IQ1_M embedding
+   launch. The current K=7 coding gate remains exact at 79.55 tok/s; this is
+   retained as a launch-count cleanup while the larger projection cost remains
+   the material draft target.
 6. **Prompt-cache injection.**  Feature capture now shares the target
    RMSNorm kernel and both 4K and random-64K prefill retain their targets.
    The hipBLASLt bridge now allocates scratch lazily per HIP stream, so a

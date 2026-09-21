@@ -508,8 +508,25 @@ int hip_llm_qwen35_dflash2_propose(hip_llm_runner *r, int32_t anchor,
     int kd=HLLM_DFLASH_KV_HEADS*HLLM_DFLASH_HEAD_DIM;
     d->q81_source=NULL;
     launch_embed_iq1_m(r,d->x,r->d_token_embd,anchor,ne);
-    for (int i=1;i<rows;++i)
-        launch_embed_iq1_m(r,(float *)d->x+(size_t)i*ne,r->d_token_embd,d->mask_token,ne);
+    if (rows > 1 && r->fn_embed_iq1_m_batch) {
+        /* The mask rows are identical for every proposal.  Publish their
+         * token ids into the sidecar scratch already owned by this stream and
+         * decode them with one exact IQ1_M batch launch.  The selector writes
+         * the same scratch only after this batch has consumed it. */
+        int mask_tokens[HLLM_DFLASH_MAX_BLOCK - 1];
+        for (int i = 0; i < rows - 1; ++i) mask_tokens[i] = d->mask_token;
+        if (hipMemcpyAsync(d->selector_drafts, mask_tokens,
+                           (size_t)(rows - 1) * sizeof(int),
+                           hipMemcpyHostToDevice, r->stream) != hipSuccess) {
+            r->qwen4_forward_error = 1;
+            return -1;
+        }
+        launch_embed_iq1_m_batch(r, (float *)d->x + ne, r->d_token_embd,
+                                 d->selector_drafts, ne, rows - 1);
+    } else {
+        for (int i=1;i<rows;++i)
+            launch_embed_iq1_m(r,(float *)d->x+(size_t)i*ne,r->d_token_embd,d->mask_token,ne);
+    }
     for (int l=0;l<HLLM_DFLASH_LAYERS;++l) {
         hllm_dflash_layer *cl=&d->layers[l];
         launch_rmsnorm_batch(r,d->norm,d->x,cl->attn_norm,ne,rows,ne,r->rms_norm_eps);
