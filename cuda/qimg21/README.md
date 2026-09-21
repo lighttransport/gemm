@@ -1105,8 +1105,8 @@ refactor also passes at cosine 0.999999999347549 (128x128/seed17).
 
 CPU input guards reject wrong channel counts, unsupported dimensions,
 non-finite pixels and out-of-range pixels before CUDA initialization; the
-CPU suite is now 32/32 passing. Encoder resolutions above 512, peak VRAM,
-and end-to-end editing parity remain unverified.
+CPU suite is now 35/35 passing. Full-pipeline peak VRAM and end-to-end editing
+parity remain unverified.
 The initial downsampler computes a full convolution then samples odd spatial
 positions; it is correct but not yet optimized as a stride-2 convolution.
 
@@ -1124,6 +1124,29 @@ The additional 512x512/seed42 encoder regression also passes: posterior cosine
 0.999999999998892, mean cosine 0.999999999985253, normalized-token cosine
 0.999999999987389 (relative L2 5.03e-6). Artifacts:
 `tmp/qimg21-encoder-512`.
+
+Full-resolution 1024x1024/seed42 encoding also passes against the unchanged
+official F32 encoder (no cache-discard workaround or tiling): posterior cosine
+**0.9999999999990085**, mean cosine **0.999999999994387**, normalized-token
+cosine **0.9999999999953705**, token relative L2 **3.0388e-6**. All outputs are
+finite. Reproduce with:
+
+```sh
+OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=1 tmp/qimg21-ref-venv/bin/python cuda/qimg21/vae_encoder_regression.py \
+  --model /mnt/nvme01/models/qimg-21/vae --case 1024x1024:42 \
+  --work-dir tmp/qimg21-encoder-1024
+```
+
+A native-only repeat was bit-identical for both posterior moments and
+normalized tokens, taking **9.28 seconds** wall time with **700424 KiB** maximum
+host RSS and zero swaps. An already-running `nvidia-smi` 100 ms process-memory
+sampler observed a maximum **1860 MiB** for that native encoder PID across
+90 samples. This is a sampled process-memory maximum, not a hard allocation
+bound or evidence for the complete pipeline's 12 GB requirement. The original
+comparison's sampler started late; only the fully covered native repeat is
+used for this memory figure. Artifacts: `tmp/qimg21-encoder-1024/results.json`,
+`tmp/qimg21-encoder-1024-repeat.log`, and
+`tmp/qimg21-encoder-1024-memory.csv` (native-repeat PID 1304832).
 
 ### Experimental single-image editing integration
 
