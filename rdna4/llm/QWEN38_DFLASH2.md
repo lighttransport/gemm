@@ -29,6 +29,10 @@ The IQ2_XS `__launch_bounds__(512, 2)` variant was also reverted after two
 exact 4K runs ranged from 42.82 to 42.91 tok/s; the committed `512, 1` bound
 remains the measured choice.
 
+Native IQ2_XXS was tested with `__launch_bounds__(256, 1)` as well.  The exact
+4K gate measured 42.94 and 42.87 tok/s across two runs, so that bound was
+reverted and the existing dispatch remains unchanged.
+
 ## Packed Q8/Q8 KV scales (2026-09-21)
 
 Q8 K/V cache scales now use the same rounded FP16 contract as the stored

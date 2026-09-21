@@ -30,6 +30,10 @@ Finally, `__launch_bounds__(512, 2)` on IQ2_XS was compared with the retained
 `512, 1` bound.  Two 4K runs ranged from 42.82 to 42.91 tok/s with the exact
 hash, so the stricter occupancy request was reverted as noise.
 
+The same bounded probe on native IQ2_XXS (`__launch_bounds__(256, 1)`) retained
+the 4K hash but measured 42.94 and 42.87 tok/s.  It was reverted; the mixed
+projection traffic remains the dominant open target.
+
 ## 2026-09-22 continuation: IQ1_M micro-tuning and fusion audit
 
 The default one-row IQ1_M F32 kernel now marks its output, weight and
