@@ -26,6 +26,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include "edit_runtime.h"
+#include "mma64_kernels.h"
 
 typedef struct {
     st_context *st[4];
@@ -310,12 +311,15 @@ static const char *qimg21_src =
 typedef struct {
     CUmodule mod;
     CUfunction zero_rms, gelu, silu, round_bf16, mul_silu, mod_ln, mod_ln_precise, gate_res, qk_rope, attn, final_ln, proj;
+    CUfunction mma_attention;
 } qimg21_kernels;
 
 static int qimg21_attention_reverse64;
+static int qimg21_attention_mma64;
 
 static int get_kernel(qimg21_kernels *k, CUmodule m) {
     k->mod = m;
+    k->mma_attention = NULL;
     return cuModuleGetFunction(&k->zero_rms, m, "zero_rms") ||
            cuModuleGetFunction(&k->gelu, m, "gelu_tanh") ||
            cuModuleGetFunction(&k->silu, m, "silu") ||
@@ -447,7 +451,25 @@ static int native_step(cuda_qimg_runner *r, qimg21_kernels *k, const qimg21_shar
             dump_stage("rope_q",q,(size_t)N*D,N,D);
             dump_stage("rope_k",kk,(size_t)N*D,N,D);
         }
-        if(edit) { void *aa[]={&att,&q,&kk,&v,(void *)&edit->image_id,(void *)&N,(void *)&NH}; if(cuLaunchKernel(edit->attention,NH,N,1,32,1,1,0,r->stream,aa,NULL))goto fail_block; }
+        if(k->mma_attention) {
+            /* Reuse the 3*D BF16 MLP hand-off allocation for Q/K/V. */
+            CUdeviceptr qb=bf,kb=bf+(size_t)N*D*2,vb=bf+(size_t)N*D*4;
+            if(launch_cast(r,qb,q,N*D) || launch_cast(r,kb,kk,N*D) || launch_cast(r,vb,v,N*D))goto fail_block;
+            for(int start=0;start<N;) {
+                int end=start+1;
+                if(edit) {
+                    if(edit->layout.image_id[start]>=0)
+                        while(end<N && edit->layout.image_id[end]==edit->layout.image_id[start])end++;
+                } else if(start>=nt)end=N;
+                int nq=end-start,nkv=end;
+                CUdeviceptr sq=qb+(size_t)start*D*2,so=att+(size_t)start*D*4;
+                void *aa[]={&so,&sq,&kb,&vb,&nq,&nkv,(void *)&NH,(void *)&HD};
+                if(cuLaunchKernel(k->mma_attention,NH,(nq+63)/64,1,128,1,1,4*64*136*2,r->stream,aa,NULL) ||
+                   cuCtxSynchronize())goto fail_block;
+                start=end;
+            }
+        }
+        else if(edit) { void *aa[]={&att,&q,&kk,&v,(void *)&edit->image_id,(void *)&N,(void *)&NH}; if(cuLaunchKernel(edit->attention,NH,N,1,32,1,1,0,r->stream,aa,NULL))goto fail_block; }
         else { void *aa[]={&att,&q,&kk,&v,&N,&nt,&NH,&HD};cuLaunchKernel(k->attn,NH,(N+3)/4,1,128,1,1,2*32*128*sizeof(float),r->stream,aa,NULL); }
         cuCtxSynchronize(); if (launch_vec(k->round_bf16,r->stream,N*D,att)!=CUDA_SUCCESS) goto fail_block; probe(r,"attn",att,N*D); if (qimg21_stage_block < 0 || bidx == qimg21_stage_block) dump_stage("attn_raw",att,(size_t)N*D,N,D); if(launch_cast(r,bf,att,N*D)!=CUDA_SUCCESS||gemm(r,tmp,wo,bf,N,D,D)!=0||launch_vec(k->round_bf16,r->stream,N*D,tmp)!=CUDA_SUCCESS)goto fail_block; probe(r,"attn_out",tmp,N*D); if (qimg21_stage_block < 0 || bidx == qimg21_stage_block) dump_stage("attn_out",tmp,(size_t)N*D,N,D);
         void *ag[]={&hidden,&tmp,&mod,&N,&D,&prefix,&(int){0}};cuLaunchKernel(k->gate_res,(N*D+255)/256,1,1,256,1,1,0,r->stream,ag,NULL);cuCtxSynchronize(); if (launch_vec(k->round_bf16,r->stream,N*D,hidden)!=CUDA_SUCCESS) goto fail_block;
@@ -496,9 +518,11 @@ int main(int argc, char **argv) {
         }
         else if (!strcmp(argv[i], "--attention") && i + 1 < argc) {
             const char *mode = argv[++i];
+            qimg21_attention_mma64=0;
             if (!strcmp(mode, "reverse64")) qimg21_attention_reverse64 = 1;
             else if (!strcmp(mode, "math")) qimg21_attention_reverse64 = 0;
-            else { fprintf(stderr, "native: attention must be math or reverse64\n"); return 2; }
+            else if (!strcmp(mode, "mma64")) {qimg21_attention_mma64=1;qimg21_attention_reverse64=0;}
+            else { fprintf(stderr, "native: attention must be math, reverse64, or mma64\n"); return 2; }
         }
         else if (!strcmp(argv[i], "--prompt-embeds") && i + 1 < argc) prompt_path = argv[++i];
         else if (!strcmp(argv[i], "--negative-prompt-embeds") && i + 1 < argc) negative_prompt_path = argv[++i];
@@ -593,6 +617,11 @@ int main(int argc, char **argv) {
     }
     qimg21_shards s={{0},0};char path[1024];for(int i=1;i<=2;i++){snprintf(path,sizeof(path),"%s/transformer/diffusion_pytorch_model-%05d-of-00002.safetensors",model,i);s.st[s.n]=safetensors_open(path);if(!s.st[s.n]){fprintf(stderr,"native: cannot open %s\n",path);cuda_qimg_free(r);return 1;}fprintf(stderr,"native: opened shard %d (%d tensors)\n",i,s.st[s.n]->n_tensors);s.n++;}
     qimg21_kernels k;CUmodule m;if(cu_compile_kernels(&m,r->device,qimg21_src,"qimg21_native.cu",verbose,"qimg21_native")<0||get_kernel(&k,m)!=0){fprintf(stderr,"native: custom kernel compile failed\n");return 1;}fprintf(stderr,"native: custom kernels ready\n");
+    CUmodule mma_module=NULL;
+    if(qimg21_attention_mma64 &&
+       (cu_compile_kernels(&mma_module,r->device,q21_mma64_src,"qimg21_mma64.cu",verbose,"qimg21_mma64")<0 ||
+        cuModuleGetFunction(&k.mma_attention,mma_module,"q21_flash_reverse64") ||
+        cuFuncSetAttribute(k.mma_attention,CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,4*64*136*2)))return 1;
     if (dump_dir) mkdir(dump_dir, 0755);
     if (pred_dir) mkdir(pred_dir, 0755);
     float *pred = (float *)malloc((size_t)ni * 64 * sizeof(float));
@@ -640,5 +669,6 @@ int main(int argc, char **argv) {
     }
     free(pred); free(neg_pred); free(sigmas); cuModuleUnload(m); for(int i=0;i<s.n;i++)safetensors_close(s.st[i]);
     q21_edit_free(&edit);q21_edit_free(&negative_edit);free(packed);npy_free(&condition);
+    if(mma_module)cuModuleUnload(mma_module);
     cuda_qimg_free(r); npy_free(&pe); npy_free(&neg); npy_free(&la); return rc;
 }

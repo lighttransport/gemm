@@ -10,7 +10,7 @@ test_cuda_qimg21: test_cuda_qimg21.py
 
 native: test_cuda_qimg21_native test_cuda_qimg21_vae
 
-test_cuda_qimg21_native: test_cuda_qimg21_native.c quant_weights.h edit_runtime.h edit_kernels.h joint_layout.h ../../cuda/cuew.c ../../cuda/cublasew.c
+test_cuda_qimg21_native: test_cuda_qimg21_native.c quant_weights.h edit_runtime.h edit_kernels.h mma64_kernels.h joint_layout.h ../../cuda/cuew.c ../../cuda/cublasew.c
 	$(CC) -O2 -std=c11 -D_GNU_SOURCE -Wall -Wextra -I../../common -I../../cuda -I../qimg \
 		-o $@ test_cuda_qimg21_native.c ../../cuda/cuew.c ../../cuda/cublasew.c \
 		-ldl -lm -lpthread
@@ -36,7 +36,7 @@ test_cuda_qimg21_text: test_cuda_qimg21_text.c text_kernels.h quant_weights.h te
 	$(CC) -O2 -std=c11 -D_GNU_SOURCE -Wall -Wextra -I../../common -I../../cuda -I../qimg \
 		-o $@ test_cuda_qimg21_text.c ../../cuda/cuew.c ../../cuda/cublasew.c -ldl -lm -lpthread
 
-test_bf16_attention: test_bf16_attention.c test_cuda_qimg21_native.c edit_runtime.h edit_kernels.h joint_layout.h ../../cuda/cuew.c ../../cuda/cublasew.c
+test_bf16_attention: test_bf16_attention.c mma64_kernels.h test_cuda_qimg21_native.c edit_runtime.h edit_kernels.h joint_layout.h ../../cuda/cuew.c ../../cuda/cublasew.c
 	$(CC) -O2 -std=c11 -D_GNU_SOURCE -Wall -Wextra -I../../common -I../../cuda -I../qimg \
 		-o $@ test_bf16_attention.c ../../cuda/cuew.c ../../cuda/cublasew.c -ldl -lm -lpthread
 

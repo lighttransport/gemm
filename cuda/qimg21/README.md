@@ -345,8 +345,11 @@ with the existing BF16 CFG rounding. Missing branch-layout pairs are rejected.
 This branch-aware path builds and has CLI guard coverage, but guided editing
 GPU parity is not yet accepted. The editing regression driver below reads the
 captured CFG scale, validates paired branch dimensions/latents, and supplies
-each branch's own layout and embeddings. Guided editing validation is running;
-all 21 CPU tests pass, including invalid CFG metadata/CLI checks.
+each branch's own layout and embeddings. Guided editing validation completed
+and fails the strict gate: prediction cosines **0.999770114 / 0.999445503**,
+trajectory cosines **0.999757280 / 0.999763197** (256x256 target, seed42,
+empty negative prompt, scale4). Outputs are finite. CLI and metadata guards
+are covered by CPU tests.
 
 The separate text-to-image true-CFG regression (256x256, two steps, seed42,
 empty negative prompt, scale4) runs to completion with finite outputs but
@@ -399,8 +402,21 @@ cuda/qimg21/test_bf16_attention tmp/qimg21-edit-attn0 \
   tmp/qimg21-edit-attn0/mma_attention.npy
 ```
 
-The replay builds; GPU parity is queued behind guided-editing validation.
-It does not alter default denoiser attention or imply full-model acceptance.
+The original forward-32 tensor-core replay passes isolated attention: aggregate
+cosine 0.999999898, target 0.999999496. The standalone reverse-64 variant in
+`mma64_kernels.h` improves these to **0.99999999708 / 0.99999999704** and
+**99.9478% exact overall**, using 64-key tiles, reversed key traversal, and
+BF16 probability fragments. Add `--reverse64` to the replay command to test it.
+
+The full native runner exposes this as opt-in `--attention mma64` (Python
+wrappers: `--native-attention mma64`). It reuses the BF16 MLP scratch space
+for packed Q/K/V and handles each image block and causal text query separately.
+It is not the default: the original-weight text-to-image low-timestep cosine
+is **0.999953858**, still below the required 0.99996. Improved isolated attention
+therefore does not establish full-model acceptance.
+The editing timestep-1 prediction is **0.999918015**, also failing and worse
+than default scalar attention despite better first-block replay parity.
+Both full-model experiments completed; no default was changed.
 
 Compare the replay without loading PyTorch or allocating GPU memory:
 
