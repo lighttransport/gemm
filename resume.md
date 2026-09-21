@@ -13,6 +13,13 @@ normal K=4 gate measured 59.69 tok/s.  Greedy K=7 retained sequence hash
 `630b7cbc72230e0d`.  The production-default K=7 sampled run measured
 69.28 tok/s with `DFLASH2 sampled verifier=exact-window`.
 
+A fresh random-token 64K K=7 run with the same native Q8/Q8 target path also
+passed, but drafted 121 and accepted 45, so its 64-token suffix measured
+24.02 tok/s.  The ordinary target at the same depth remains about 35.7 tok/s.
+This is a context-sensitive acceptance/verification limit rather than a split
+kernel regression; adaptive sidecar disable or a lower-cost long-context
+proposal remains open while the short-context DFlash speedup is retained.
+
 Two other small table-staging probes were rejected.  Staging the native IQ3_S
 512-entry grid measured 42.88 tok/s at 4K and 35.74 tok/s after a random 64K
 prefix, versus 43.00 and 35.84 controls.  Staging the larger IQ2_S 1,024-entry

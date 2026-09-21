@@ -13,6 +13,13 @@ K=4 retained `630b7cbc72230e0d`.  The production-default sampled K=7 run
 reported `DFLASH2 sampled verifier=exact-window`, 69.28 tok/s, and the same
 seeded hash.  The target verifier and captured graph ABI are unchanged.
 
+At random 64K depth the same Q8/Q8 target path passed with prefix hash
+`90178de69a24a76e`, but a K=7 suffix drafted 121 and accepted 45, measuring
+24.02 tok/s for 64 emitted tokens.  Ordinary target decode at that depth is
+about 35.7 tok/s.  The short-window sidecar win therefore does not generalize
+to this low-acceptance context; adaptive DFlash gating or a cheaper deep-context
+proposal remains an open optimization.
+
 ## IQ2_XS launch-bounds probe (2026-09-22)
 
 The native one-row IQ2_XS decode kernel is compiled with
