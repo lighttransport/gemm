@@ -209,11 +209,11 @@ MMVQ routes.  A loopback OpenAI-compatible request returned the exact
 protocol suite passes all 12 tests, including request cancellation, cache
 reuse, tool-call framing and diagnostic alignment.  DFlash2 is available with
 `--qwen35-dflash2 SIDECAR --qwen35-dflash2-draft 1..7`; its exact
-propose/verify/commit window is serialized per request and preserves
-prompt-cache reuse.  A real two-request loopback test returned identical
-`READY` output on both requests.  Sampled HTTP requests continue to use the
-ordinary exact target path until a sampler-aware DFlash window transaction is
-added.
+propose/verify/commit window is serialized per request.  A real two-request
+loopback test returned coherent output for both greedy and sampled requests;
+the DFlash sidecar currently replays each prompt because target snapshots do
+not yet include its private recurrent cache.  This favors output correctness
+over cache reuse until a sidecar snapshot is implemented.
 
 CLI: `--qwen35-dflash2 SIDECAR --qwen35-dflash2-draft 1..7`; it currently
 requires benchmark mode, `--qwen35-batched-prefill`, `--qwen35-decode-graph`

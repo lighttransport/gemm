@@ -57,10 +57,12 @@ Draft width may be 1 through 7.  The sidecar currently requires benchmark
 mode or the resident stdio server, batched Qwen3.8 prefill, the decode graph,
 and Q8 K plus Q8 V.  It is mutually exclusive with dense NextN and Qwen4 MTP.
 The HTTP shim enables it with `--qwen35-dflash2 SIDECAR`; each request is
-serialized through the exact propose/verify/commit window and reuses the
-ordinary prompt cache.  Temperature-zero requests use the exact argmax window;
-sampled HTTP requests remain on ordinary exact target decode until a
-sampler-aware DFlash transaction is added.
+serialized through the exact propose/verify/commit window.  Temperature-zero
+requests use the exact argmax window, while sampled requests verify full row
+logits with the existing sampler.  DFlash requests currently replay their
+prompt because the sidecar's private recurrent cache is not part of target
+snapshots; this preserves output correctness at the cost of prompt-cache
+reuse.
 
 The reference validator accepts the sidecar directly:
 

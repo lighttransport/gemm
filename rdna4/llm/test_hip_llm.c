@@ -418,6 +418,15 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
         int prefix_matches_cache = requested_prefix > 0 && requested_prefix == prefix_cache_n;
         for (int i = 0; prefix_matches_cache && i < requested_prefix; ++i)
             if (prefix_cache[i] != tokens[i]) prefix_matches_cache = 0;
+        /* DFlash owns a separate recurrent sidecar cache.  Target snapshots
+         * do not include those rows, so replay the prompt until a sidecar
+         * snapshot is available instead of mixing old draft state with a
+         * restored target prefix. */
+        if (dflash_draft > 0) {
+            prompt_matches_cache = 0;
+            prefix_matches_cache = 0;
+            common = 0;
+        }
         int restored_prefix = 0;
         int restored_prompt = 0;
         if (common != cache_n && prompt_matches_cache &&
@@ -572,6 +581,8 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
         int mtp_adaptive_fallback = 0;
         int32_t dflash_drafts[7], dflash_argmax[8];
         int dflash_count = 0, dflash_index = 0, dflash_rows = 0;
+        int dflash_position = -1;
+        float *dflash_logits = NULL;
         int32_t stops[] = { eos, eot, im_end };
         for (int k = 0; logits && k < max_tokens; k++) {
             if (g_stdio_cancel) { cancelled = 1; break; }
@@ -596,9 +607,17 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
                             mtp.accepted, mtp.drafted);
                 }
             }
-            int dflash_window = dflash_draft > 0 && temperature <= 0.0f && !sampler &&
-                                dflash_rows > 0;
-            int next = dflash_window ? dflash_argmax[dflash_index] :
+            int dflash_window = dflash_draft > 0 && dflash_rows > 0;
+            int next = dflash_window ?
+                (dflash_logits ?
+                    (sampler ? hllm_sampler_sample(sampler,
+                        dflash_logits + (size_t)dflash_index * n_vocab) :
+                     (temperature <= 0.0f ? argmax_logits(
+                        dflash_logits + (size_t)dflash_index * n_vocab, n_vocab) :
+                      sample_top_k_p(dflash_logits + (size_t)dflash_index * n_vocab,
+                        n_vocab, top_k, top_p, temperature, presence,
+                        repetition, min_p, seen, &rng))) :
+                 dflash_argmax[dflash_index]) :
                 use_mtp ? mtp.tokens[mtp_index++] : sampler ? hllm_sampler_sample(sampler, logits) : (temperature <= 0.0f) ? argmax_logits(logits, n_vocab) :
                 (coding_mode ? sample_top_k_p_coding(logits, n_vocab, top_k, top_p,
                                temperature, presence, repetition, min_p, seen, &rng, vocab) :
@@ -645,37 +664,55 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
                 int matched = dflash_index < dflash_count && next == dflash_drafts[dflash_index];
                 dflash_index++;
                 if (!matched || dflash_index == dflash_rows) {
-                    if (hip_llm_qwen35_dflash2_commit(gpu, cache_n - dflash_index,
+                    if (hip_llm_qwen35_dflash2_commit(gpu, dflash_position,
                                                       dflash_index)) {
+                        fprintf(stderr, "llm_server: DFlash commit failed pos=%d rows=%d\n",
+                                dflash_position, dflash_index);
+                        fflush(stderr);
                         mtp_error = 1; break;
                     }
                     dflash_rows = dflash_index = dflash_count = 0;
+                    dflash_position = -1;
+                    dflash_logits = NULL;
                 }
             }
-            if (dflash_draft > 0 && !sampler && temperature <= 0.0f &&
+            if (dflash_draft > 0 && !coding_mode &&
                 dflash_rows == 0 && k + 1 < max_tokens) {
                 int count = max_tokens - k - 1;
                 if (count > dflash_draft) count = dflash_draft;
                 if (count > 0 && hip_llm_qwen35_dflash2_propose(gpu, next, cache_n - 1,
                                                                   count, dflash_drafts)) {
+                    fprintf(stderr, "llm_server: DFlash propose failed pos=%d count=%d\n",
+                            cache_n - 1, count);
+                    fflush(stderr);
                     mtp_error = 1; break;
                 }
                 if (count > 0) {
                     int32_t inputs[8]; inputs[0] = next;
                     memcpy(inputs + 1, dflash_drafts, (size_t)count * sizeof(int32_t));
-                    if (hip_llm_qwen35_mtp_verify_argmax(gpu, inputs, count + 1,
+                    if (sampler || temperature > 0.0f)
+                        dflash_logits = hip_llm_qwen35_mtp_verify(gpu, inputs,
+                                                                  count + 1, cache_n - 1);
+                    else
+                        dflash_logits = NULL;
+                    if (dflash_logits == NULL &&
+                        hip_llm_qwen35_mtp_verify_argmax(gpu, inputs, count + 1,
                                                          cache_n - 1, dflash_argmax)) {
-                        mtp_error = 1; break;
+                            fprintf(stderr, "llm_server: DFlash verify failed pos=%d rows=%d\n",
+                                    cache_n - 1, count + 1);
+                            fflush(stderr);
+                            mtp_error = 1; break;
                     }
                     dflash_count = count;
                     dflash_rows = count + 1;
                     dflash_index = 0;
+                    dflash_position = cache_n - 1;
                 }
             }
             /* If approximate MTP just fell back after a zero-accept batch,
              * replay the emitted anchor through the target so the ordinary
              * decode path resumes with fresh logits and state. */
-            if (!use_mtp && !dflash_window &&
+            if (!use_mtp && !dflash_window && !dflash_rows &&
                 (!dflash_draft || dflash_rows == 0))
                 logits = hip_llm_forward_logits(gpu, next, cache_n - 1);
             double token_now = get_time_ms();
