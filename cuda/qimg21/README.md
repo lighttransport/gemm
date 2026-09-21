@@ -725,6 +725,15 @@ already exact input projections. Artifacts are
 `tmp/qimg21-replay-block17` and `tmp/qimg21-replay-block17-mixed`.
 CLI guard coverage brings the CPU suite to 26 passing tests.
 
+A subsequent exact-Q/K/V block-17 diagnostic reversed the eight 16-element
+Q/K contraction fragments while retaining reverse-64 Flash-style softmax.
+This worsened aggregate relative L2 from 5.8743e-5 to 1.0927e-4 and elementwise
+equality from 99.9712% to 99.8971% (target cosine 0.999999993574).
+Artifacts are `tmp/qimg21-exact-attention17/reverse_k.{npy,json,log}`.
+The experiment was removed; ordinary ascending contraction order remains.
+This rules out simple contraction reversal as a local improvement, not other
+accumulation layouts or the unresolved full-denoiser parity failure.
+
 Replaying attention directly from the saved **PyTorch** block-17 Q/K/V removes
 native RMS/RoPE from the comparison. Flash-style MMA attention still differs:
 cosine 0.999999998275, relative L2 5.87e-5, elementwise equality 99.9712%
