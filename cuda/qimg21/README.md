@@ -790,6 +790,24 @@ with `CUDA_RUNNER_NO_FMAD=1` retains 99.9712% equality and relative L2
 5.8744e-5 (versus 5.8743e-5 normally), so disabling scalar FMA is not a useful
 fix either. Artifacts: `tmp/qimg21-exact-attention17/no_fmad.{npy,json,log}`.
 
+`attention_tile_regression.py` further isolates intra-tile versus online
+softmax discrepancies. It crops saved model Q/K/V to 32, 64, 68, 128, 132 and
+256 tokens, rounds inputs to BF16, treats the sequence as one unmasked image,
+and compares ordinary reverse-64 and Flash-style native attention against
+explicit PyTorch FlashAttention. It is diagnostic, not denoiser acceptance.
+
+```sh
+OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=1 tmp/qimg21-ref-venv/bin/python cuda/qimg21/attention_tile_regression.py \
+  --stage-dir tmp/qimg21-exact-attention17 --work-dir tmp/qimg21-attention-tile-matrix
+```
+
+All 12 comparisons pass the isolated 0.99996 gate, but differences exist
+before any cross-tile update. Flash-style equality is 99.9924% at 32 tokens
+(relative L2 1.6996e-5) and 99.9756% at 64 tokens (relative L2 5.0615e-5).
+At 256 tokens it is 99.9720% (relative L2 6.0026e-5). Therefore the online
+rescaling recurrence is not the sole cause; the single-tile QK/softmax/PV
+path must also be examined. Results: `tmp/qimg21-attention-tile-matrix/results.json`.
+
 Replaying attention directly from the saved **PyTorch** block-17 Q/K/V removes
 native RMS/RoPE from the comparison. Flash-style MMA attention still differs:
 cosine 0.999999998275, relative L2 5.87e-5, elementwise equality 99.9712%
