@@ -52,6 +52,19 @@ def capture_text_encoder(pipe, folder: Path):
                 value = output[0] if isinstance(output, tuple) else output
                 _save(folder / f"layer_{index:02d}.npy", value)
             handles.append(layer.register_forward_hook(layer_hook))
+            if index == 0:
+                for name, child in layer.named_modules():
+                    if not name:
+                        continue
+                    def child_hook(module, args, output, name=name):
+                        value = output[0] if isinstance(output, tuple) else output
+                        if hasattr(value, "detach"):
+                            _save(folder / f"stage_{name}.npy", value)
+                    handles.append(child.register_forward_hook(child_hook))
+                def projection_input(module, args):
+                    _save(folder / "stage_self_attn.o_proj.input.npy", args[0])
+                if hasattr(layer, "self_attn"):
+                    handles.append(layer.self_attn.o_proj.register_forward_pre_hook(projection_input))
         yield
         if metadata["calls"] != 1 or metadata["norm_calls"] != 1:
             raise RuntimeError("text encoder did not execute the expected fixture boundaries")

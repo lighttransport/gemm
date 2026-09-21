@@ -280,7 +280,14 @@ copies before consuming each matrix. Explicit upload synchronization makes
 two native runs bit-exact and improves cosine to 0.9993278549 / 0.9994377151
 (full / cropped). BF16 rounding of unnormalized attention probabilities
 improves these further to **0.9994088823 / 0.9995524853**, still below the
-0.99996 gate. Further per-layer arithmetic diagnosis remains necessary.
+0.99996 gate. First-layer operator capture then identified a GEMM dispatch
+difference: BF16-output GEMM matches PyTorch Q projection and Q normalization
+bit-for-bit, whereas F32-output GEMM followed by rounding does not. The
+experimental encoder now defaults to BF16-output GEMM; full/cropped cosine
+is **0.9997771787 / 0.9994480992**, still failing. `--f32-gemm-output` on the
+C executable retains the old path for diagnostics. Further arithmetic
+diagnosis remains necessary; improving one operator does not establish
+end-to-end acceptance.
 It is deliberately
 not the default generation encoder until comparison against captured
 `hidden_prenorm.npy` and cropped prompt embeddings meets the strict gate.
@@ -312,6 +319,9 @@ fixture rejection paths without CUDA; passing that unit test does not prove
 the native model meets the gate.
 Text-stage reference captures now include `layer_NN.npy`; the native text
 executable can save matching boundaries with `--dump-dir DIR`.
+First-layer `stage_*.npy` files expose normalization, Q/K/V projections,
+Q/K normalization, attention output, and MLP projections for matched-stage
+comparisons.
 
 For native true CFG, pass `--negative-prompt` and `--true-cfg-scale` to
 `native_generate.py` (the negative embedding is exported beside the positive

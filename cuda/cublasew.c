@@ -1331,6 +1331,19 @@ int cublasew_gemm_bf16_bf16_f32_rowmajor_nt(cublasew_context *ctx,
                           CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) == CUBLAS_STATUS_SUCCESS ? 0 : -1;
 }
 
+int cublasew_gemm_bf16_bf16_bf16_rowmajor_nt(cublasew_context *ctx,
+                                           CUdeviceptr d_Y, CUdeviceptr d_W,
+                                           CUdeviceptr d_X, int n_tok, int n_out, int n_in) {
+    const float alpha = 1.0f, beta = 0.0f;
+    if (!ctx || !ctx->handle || n_tok <= 0 || n_out <= 0 || n_in <= 0) return -1;
+    return p_cublasGemmEx(ctx->handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                          n_out, n_tok, n_in, &alpha,
+                          (const void *)(uintptr_t)d_W, CUDA_R_16BF, n_in,
+                          (const void *)(uintptr_t)d_X, CUDA_R_16BF, n_in,
+                          &beta, (void *)(uintptr_t)d_Y, CUDA_R_16BF, n_out,
+                          CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP) == CUBLAS_STATUS_SUCCESS ? 0 : -1;
+}
+
 /* BF16xBF16->{F32|F16} GEMM with a fused bias (and optional tanh-GELU) epilogue.
  * y_f16=0: D is FP32; y_f16=1: D is FP16 (d_Y must point at an FP16 buffer). The
  * bias is always FP32 regardless of output type (BIAS_DATA_TYPE forced to F32).

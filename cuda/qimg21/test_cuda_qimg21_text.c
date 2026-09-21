@@ -7,6 +7,8 @@
 #undef main
 #include "text_kernels.h"
 
+static int text_bf16_gemm_output = 1;
+
 static int text_linear(cuda_qimg_runner *r, qimg21_kernels *k,
                        const qimg21_shards *s, const char *name,
                        CUdeviceptr out, CUdeviceptr in_bf, int n, int no, int ni) {
@@ -23,7 +25,17 @@ static int text_linear(cuda_qimg_runner *r, qimg21_kernels *k,
     /* The cuBLAS handle owns a separate stream. Pageable host-to-device
      * copies may return after staging, before the device transfer finishes. */
     int rc = cuCtxSynchronize();
-    if (!rc) rc = gemm(r, out, w, in_bf, n, no, ni);
+    if (!rc && text_bf16_gemm_output) {
+        CUdeviceptr result = checked_cuMemAlloc((size_t)n * no * 2), bias = 0;
+        if (!result) { free_d(&w); return -1; }
+        rc = cublasew_gemm_bf16_bf16_bf16_rowmajor_nt(r->cublaslt_ctx, result, w, in_bf, n, no, ni);
+        if (!rc) rc = cuCtxSynchronize();
+        void *args[] = {&out, &result, &bias, &no, &n};
+        if (!rc) rc = cuLaunchKernel(r->bf16_to_f32_add_bias, (n * no + 255) / 256, 1, 1,
+                                     256, 1, 1, 0, r->stream, args, NULL);
+        if (!rc) rc = cuCtxSynchronize();
+        free_d(&result);
+    } else if (!rc) rc = gemm(r, out, w, in_bf, n, no, ni);
     if (!rc) rc = launch_vec(k->round_bf16, r->stream, n * no, out);
     free_d(&w);
     return rc;
@@ -53,6 +65,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--tokens") && i + 1 < argc) tokens = argv[++i];
         else if (!strcmp(argv[i], "--out") && i + 1 < argc) out = argv[++i];
         else if (!strcmp(argv[i], "--dump-dir") && i + 1 < argc) dump_dir = argv[++i];
+        else if (!strcmp(argv[i], "--bf16-gemm-output")) text_bf16_gemm_output = 1;
+        else if (!strcmp(argv[i], "--f32-gemm-output")) text_bf16_gemm_output = 0;
         else if (!strcmp(argv[i], "--drop-prefix") && i + 1 < argc) drop = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--max-layers") && i + 1 < argc) layers = atoi(argv[++i]);
         else { fprintf(stderr, "text: unknown/incomplete option %s\n", argv[i]); return 2; }
@@ -121,33 +135,43 @@ int main(int argc, char **argv) {
     #define CHECK(call) do { if((call)!=0)goto done; } while(0)
     #define NAME(suffix) snprintf(name,sizeof(name),"model.language_model.layers.%d.%s",l,suffix)
     #define LINEAR(suffix,dst,no,ni) do { NAME(suffix); CHECK(text_linear(r,&base,&shards,name,dst,bf,n,no,ni)); } while(0)
+    #define DUMP(label,ptr,width) do { if(dump_dir && l==0) { CHECK(cuCtxSynchronize()); qimg21_stage_dir=dump_dir; dump_stage("stage_" label,ptr,(size_t)n*(width),n,width); } } while(0)
     for(int l=0;l<layers;l++) {
         fprintf(stderr,"text: layer %d/%d (%d tokens)\n",l+1,layers,n);
         NAME("input_layernorm.weight"); CHECK(text_norm(r,rms,&shards,name,norm,x,n,4096));
+        DUMP("input_layernorm",norm,4096);
         CHECK(launch_cast(r,bf,norm,n*4096));
         LINEAR("self_attn.q_proj.weight",q,4096,4096);
         LINEAR("self_attn.k_proj.weight",key,1024,4096);
         LINEAR("self_attn.v_proj.weight",v,1024,4096);
+        DUMP("self_attn.q_proj",q,4096); DUMP("self_attn.k_proj",key,1024); DUMP("self_attn.v_proj",v,1024);
         NAME("self_attn.q_norm.weight"); CHECK(text_norm(r,rms,&shards,name,q,q,n*32,128));
         NAME("self_attn.k_norm.weight"); CHECK(text_norm(r,rms,&shards,name,key,key,n*8,128));
+        DUMP("self_attn.q_norm",q,4096); DUMP("self_attn.k_norm",key,1024);
         int heads=32; void *qa[]={&q,&heads};
         CHECK(cuLaunchKernel(rope,n,32,1,64,1,1,0,r->stream,qa,NULL));
         heads=8; void *ka[]={&key,&heads};
         CHECK(cuLaunchKernel(rope,n,8,1,64,1,1,0,r->stream,ka,NULL));
         void *aa[]={&att,&q,&key,&v,&n};
         CHECK(cuLaunchKernel(attention,32,n,1,32,1,1,0,r->stream,aa,NULL));
+        CHECK(launch_vec(base.round_bf16,r->stream,n*4096,att));
+        DUMP("self_attn.o_proj.input",att,4096);
         CHECK(launch_cast(r,bf,att,n*4096));
         LINEAR("self_attn.o_proj.weight",tmp,4096,4096);
+        DUMP("self_attn.o_proj",tmp,4096);
         int count=n*4096; void *ra[]={&x,&tmp,&count};
         CHECK(cuLaunchKernel(add,(count+255)/256,1,1,256,1,1,0,r->stream,ra,NULL));
         NAME("post_attention_layernorm.weight"); CHECK(text_norm(r,rms,&shards,name,norm,x,n,4096));
+        DUMP("post_attention_layernorm",norm,4096);
         CHECK(launch_cast(r,bf,norm,n*4096));
         LINEAR("mlp.gate_proj.weight",gate,12288,4096);
         LINEAR("mlp.up_proj.weight",up,12288,4096);
+        DUMP("mlp.gate_proj",gate,12288); DUMP("mlp.up_proj",up,12288);
         int ffcount=n*12288; void *ma[]={&gate,&gate,&up,&ffcount};
         CHECK(cuLaunchKernel(base.mul_silu,(ffcount+255)/256,1,1,256,1,1,0,r->stream,ma,NULL));
         CHECK(launch_cast(r,bf,gate,ffcount));
         LINEAR("mlp.down_proj.weight",tmp,4096,12288);
+        DUMP("mlp.down_proj",tmp,4096);
         CHECK(cuLaunchKernel(add,(count+255)/256,1,1,256,1,1,0,r->stream,ra,NULL));
         if(dump_dir) {
             CHECK(cuStreamSynchronize(r->stream));
@@ -163,6 +187,7 @@ int main(int argc, char **argv) {
     #undef CHECK
     #undef NAME
     #undef LINEAR
+    #undef DUMP
 done:
     if(rc)fprintf(stderr,"text: encoder failed\n");
     free_d(&x);free_d(&norm);free_d(&bf);free_d(&q);free_d(&key);free_d(&v);
