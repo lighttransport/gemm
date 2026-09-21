@@ -14,6 +14,11 @@ byte-identical (`44915ec1039a64c8`, SHA-256
 41.95 tok/s.  This is a safe small scheduling improvement; the strict 40
 tok/s ordinary 64K target remains open.
 
+A matching `__launch_bounds__` probe on the native IQ2_S, IQ3_XXS and IQ3_S
+one-row kernels retained the exact 4K hashes but measured 42.84 tok/s on two
+runs, slightly below the 42.9--43.0 tok/s control.  It was reverted so those
+formats keep their existing shape-specific occupancy choices.
+
 ## Packed Q8/Q8 KV scales (2026-09-21)
 
 Q8 K/V cache scales now use the same rounded FP16 contract as the stored

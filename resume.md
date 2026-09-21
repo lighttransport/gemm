@@ -15,6 +15,12 @@ completed at 41.95 tok/s.  The small long-context gain is within run
 variance but the launch contract is quality-safe; keep it while continuing
 the larger grouped-projection and verifier-tail work.
 
+I also tried matching launch bounds on the native IQ2_S, IQ3_XXS and IQ3_S
+one-row kernels.  Two matched 4K random-token runs were 42.84 tok/s each,
+versus the 42.9--43.0 tok/s control, with the exact
+`1c891c2232aa1b7f`/`f44846dacf013e9e` hashes.  The bounds were removed; those
+formats retain their existing shape-specific occupancy choices.
+
 ## 2026-09-22 continuation: IQ1_M micro-tuning and fusion audit
 
 The default one-row IQ1_M F32 kernel now marks its output, weight and
