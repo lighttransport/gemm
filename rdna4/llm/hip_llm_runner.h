@@ -308,8 +308,9 @@ void hip_llm_offload(hip_llm_runner *r);
 void hip_llm_reset_state(hip_llm_runner *r);
 void hip_llm_set_decode_mode(hip_llm_runner *r, int enabled);
 
-/* Save/restore recurrent state at a prompt boundary. KV entries remain in
- * their positional device cache, so this snapshots only hybrid SSM/PLE state.
+/* Save/restore request state at a prompt boundary. Hybrid SSM/PLE state and
+ * DFlash2 sidecar state are always captured; bounded Qwen3.8 Q8 KV rows are
+ * included when available so a cache hit can resume without prompt replay.
  * The opaque snapshot is owned by the caller and may be reused across turns. */
 hip_llm_state_snapshot *hip_llm_snapshot_state(hip_llm_runner *r);
 /* Snapshot only the attention KV slots in [start_pos, start_pos+n_positions).
