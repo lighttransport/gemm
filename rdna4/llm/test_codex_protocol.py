@@ -27,12 +27,33 @@ class ProtocolTest(unittest.TestCase):
         self.assertIn("q8q8", command)
         self.assertEqual(command[-2:], ["--sampling-profile", "llama"])
 
+        args.qwen35_server_profile = False
         args.qwen35_dflash2 = "draft.gguf"
         args.qwen35_dflash2_draft = 7
         dflash_command = runner_command(args)
         self.assertIn("--qwen35-dflash2", dflash_command)
         self.assertEqual(dflash_command[-4:], ["--qwen35-dflash2", "draft.gguf",
                                                "--qwen35-dflash2-draft", "7"])
+
+    def test_qwen35_profiles_are_mutually_exclusive(self):
+        args = SimpleNamespace(
+            runner="./test_hip_llm", model="target.gguf", context=4096,
+            moe_cache_mb=0, coding=False, qwen4_coding_profile=False,
+            qwen4_exact=False, qwen4_mtp=None, qwen35_server_profile=True,
+            qwen35_dflash2="draft.gguf",
+        )
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            runner_command(args)
+
+    def test_dflash_rejects_qwen4_mtp(self):
+        args = SimpleNamespace(
+            runner="./test_hip_llm", model="target.gguf", context=4096,
+            moe_cache_mb=0, coding=False, qwen4_coding_profile=False,
+            qwen4_exact=False, qwen4_mtp="draft.gguf",
+            qwen35_server_profile=False, qwen35_dflash2="dflash.gguf",
+        )
+        with self.assertRaisesRegex(ValueError, "cannot be combined"):
+            runner_command(args)
 
     def test_seed_uses_versioned_reference_sampler_request(self):
         backend = Backend.__new__(Backend)
