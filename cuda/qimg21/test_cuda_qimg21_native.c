@@ -19,6 +19,7 @@
 #include "../qimg/cuda_qimg_runner.h"
 
 #include <errno.h>
+#include <dlfcn.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -128,6 +129,7 @@ static int npy_write_f32(const char *path, const float *x, size_t n, int d0, int
  * back to the host. */
 static const char *qimg21_stage_dir;
 static int qimg21_stage_block = 0;
+static int qimg21_stage_all_blocks;
 static int qimg21_stage_error;
 static const char *qimg21_replay_hidden;
 static const char *qimg21_replay_attention;
@@ -322,7 +324,7 @@ typedef struct {
     CUmodule mod;
     CUfunction zero_rms, gelu, silu, round_bf16, mul_silu, mod_ln, mod_ln_precise, gate_res, qk_rope, attn, final_ln, proj;
     CUfunction mma_attention;
-    CUfunction table_rope, mma_text, mma_prefix;
+    CUfunction table_rope, mma_text;
     int norm_threads;
 } qimg21_kernels;
 
@@ -330,13 +332,19 @@ static int qimg21_attention_reverse64;
 static int qimg21_attention_mma64;
 static int qimg21_norm_vector;
 static int qimg21_host_rope;
+static const char *qimg21_rope_base_path;
+typedef int (*qimg21_cutlass_attention_fn)(float *, const void *, const void *,
+                                           const void *, int, int, int, int, void *);
+static qimg21_cutlass_attention_fn qimg21_cutlass_attention;
+typedef int (*qimg21_exact_rope_fn)(float *, float *, const float *, const float *,
+                                    const float *, int, int, void *);
+static qimg21_exact_rope_fn qimg21_exact_rope;
 
 static int get_kernel(qimg21_kernels *k, CUmodule m) {
     k->mod = m;
     k->mma_attention = NULL;
     k->table_rope = NULL;
     k->mma_text = NULL;
-    k->mma_prefix = NULL;
     k->norm_threads = 256;
     return cuModuleGetFunction(&k->zero_rms, m, "zero_rms") ||
            cuModuleGetFunction(&k->gelu, m, "gelu_tanh_ordered") ||
@@ -405,14 +413,32 @@ static int native_step(cuda_qimg_runner *r, qimg21_kernels *k, const qimg21_shar
     #define A(p,bytes) do { (p)=checked_cuMemAlloc(bytes); if(!(p)) goto fail; } while(0)
     if(k->table_rope) {
         float *table=malloc((size_t)N*128*sizeof(float));if(!table)goto fail;
+        npy_f32 rope_base={0};
+        if(qimg21_rope_base_path && (npy_read_f32(qimg21_rope_base_path,&rope_base) ||
+           rope_base.ndim!=2 || rope_base.shape[0]!=9216 || rope_base.shape[1]!=128)) {
+            fprintf(stderr,"native: invalid exact RoPE frequency table\n");free(table);goto fail;
+        }
         for(int t=0;t<N;t++)for(int j=0;j<128;j+=2) {
             int axis=j<16?0:(j<72?1:2),dim=axis==0?16:56,off=axis==0?0:(axis==1?16:72);
             int pos=edit?edit->layout.position[t*3+axis]:(t<nt?t:(axis==0?nt:
                       (axis==1?-(ih-ih/2)+(t-nt)/iw:-(iw-iw/2)+(t-nt)%iw)));
-            float inverse=1.f/powf(10000.f,(float)(j-off)/(float)dim),angle=(float)pos*inverse;
-            table[t*128+j]=cosf(angle);table[t*128+j+1]=sinf(angle);
+            if(rope_base.data) {
+                int row=pos>=0?pos:8192+pos+1024;
+                if(row<0 || row>=9216) {npy_free(&rope_base);free(table);goto fail;}
+                table[t*128+j]=rope_base.data[(size_t)row*128+j];
+                table[t*128+j+1]=rope_base.data[(size_t)row*128+j+1];
+            } else {
+                float inverse=1.f/powf(10000.f,(float)(j-off)/(float)dim),angle=(float)pos*inverse;
+                table[t*128+j]=cosf(angle);table[t*128+j+1]=sinf(angle);
+            }
         }
+        npy_free(&rope_base);
         rope_table=checked_cuMemAlloc((size_t)N*128*sizeof(float));
+        if(qimg21_stage_dir && (qimg21_stage_block < 0 || qimg21_stage_block < 32)) {
+            char table_path[2048];
+            snprintf(table_path,sizeof(table_path),"%s/rope_table.npy",qimg21_stage_dir);
+            npy_write_f32(table_path,table,(size_t)N*128,N,128);
+        }
         int error=!rope_table || cuMemcpyHtoD(rope_table,table,(size_t)N*128*sizeof(float)) || cuCtxSynchronize();
         free(table);if(error)goto fail;
     }
@@ -489,8 +515,13 @@ static int native_step(cuda_qimg_runner *r, qimg21_kernels *k, const qimg21_shar
         snprintf(nm,sizeof(nm),"transformer_blocks.%d.attn.to_q.weight",bidx);CUdeviceptr wq=upload_bf16(s,nm);snprintf(nm,sizeof(nm),"transformer_blocks.%d.attn.to_k.weight",bidx);CUdeviceptr wk=upload_bf16(s,nm);snprintf(nm,sizeof(nm),"transformer_blocks.%d.attn.to_v.weight",bidx);CUdeviceptr wv=upload_bf16(s,nm);snprintf(nm,sizeof(nm),"transformer_blocks.%d.attn.to_out.0.weight",bidx);CUdeviceptr wo=upload_bf16(s,nm);snprintf(nm,sizeof(nm),"transformer_blocks.%d.img_mlp.gate_layer.weight",bidx);CUdeviceptr wg=upload_bf16(s,nm);snprintf(nm,sizeof(nm),"transformer_blocks.%d.img_mlp.proj.weight",bidx);CUdeviceptr wp=upload_bf16(s,nm);snprintf(nm,sizeof(nm),"transformer_blocks.%d.img_mlp.out.weight",bidx);CUdeviceptr wmlpo=upload_bf16(s,nm);snprintf(nm,sizeof(nm),"transformer_blocks.%d.attn.norm_q.weight",bidx);CUdeviceptr wqn=upload_f32(s,nm);snprintf(nm,sizeof(nm),"transformer_blocks.%d.attn.norm_k.weight",bidx);CUdeviceptr wkn=upload_f32(s,nm);
         if(!wq||!wk||!wv||!wo||!wg||!wp||!wmlpo||!wqn||!wkn)goto fail_block;
         void *a1[]={&tmp,&hidden,&mod,&N,&D,&prefix,&(int){0}}; cuLaunchKernel(k->mod_ln,N,1,1,k->norm_threads,1,1,256*sizeof(float),r->stream,a1,NULL); cuCtxSynchronize(); if (launch_vec(k->round_bf16,r->stream,N*D,tmp)!=CUDA_SUCCESS) goto fail_block; probe(r,"mod_ln",tmp,N*D); if (qimg21_stage_block < 0 || bidx == qimg21_stage_block) dump_stage("mod_ln",tmp,(size_t)N*D,N,D); if(launch_cast(r,bf,tmp,N*D)!=CUDA_SUCCESS)goto fail_block;
-        if(gemm(r,q,wq,bf,N,D,D)!=0||gemm(r,kk,wk,bf,N,D,D)!=0||gemm(r,v,wv,bf,N,D,D)!=0||launch_vec(k->round_bf16,r->stream,N*D,q)!=CUDA_SUCCESS||launch_vec(k->round_bf16,r->stream,N*D,kk)!=CUDA_SUCCESS||launch_vec(k->round_bf16,r->stream,N*D,v)!=CUDA_SUCCESS)goto fail_block; probe(r,"q",q,N*D); probe(r,"v",v,N*D); if (qimg21_stage_block < 0 || bidx == qimg21_stage_block) { dump_stage("q",q,(size_t)N*D,N,D); dump_stage("v",v,(size_t)N*D,N,D); }
-        if(k->table_rope) {void *ar[]={&q,&kk,&wqn,&wkn,(void *)&N,(void *)&D,(void *)&NH,(void *)&HD,&nt,&ih,&iw,&rope_table};if(cuLaunchKernel(k->table_rope,N,NH,1,HD,1,1,0,r->stream,ar,NULL))goto fail_block;}
+        if(gemm(r,q,wq,bf,N,D,D)!=0||gemm(r,kk,wk,bf,N,D,D)!=0||gemm(r,v,wv,bf,N,D,D)!=0||launch_vec(k->round_bf16,r->stream,N*D,q)!=CUDA_SUCCESS||launch_vec(k->round_bf16,r->stream,N*D,kk)!=CUDA_SUCCESS||launch_vec(k->round_bf16,r->stream,N*D,v)!=CUDA_SUCCESS)goto fail_block; probe(r,"q",q,N*D); probe(r,"v",v,N*D); if (qimg21_stage_block < 0 || bidx == qimg21_stage_block) { dump_stage("q",q,(size_t)N*D,N,D); dump_stage("k",kk,(size_t)N*D,N,D); dump_stage("v",v,(size_t)N*D,N,D); }
+        if(qimg21_exact_rope && qimg21_rope_base_path) {
+            if(qimg21_exact_rope((float *)(uintptr_t)q,(float *)(uintptr_t)kk,
+               (const float *)(uintptr_t)wqn,(const float *)(uintptr_t)wkn,
+               (const float *)(uintptr_t)rope_table,N,NH,(void *)r->stream))goto fail_block;
+        }
+        else if(k->table_rope) {void *ar[]={&q,&kk,&wqn,&wkn,(void *)&N,(void *)&D,(void *)&NH,(void *)&HD,&nt,&ih,&iw,&rope_table};if(cuLaunchKernel(k->table_rope,N,NH,1,HD,1,1,0,r->stream,ar,NULL))goto fail_block;}
         else if(edit) { void *ar[]={&q,&kk,&wqn,&wkn,(void *)&edit->position,(void *)&N,(void *)&NH}; if(cuLaunchKernel(edit->rope,N,NH,1,HD,1,1,0,r->stream,ar,NULL))goto fail_block; }
         else { void *ar[]={&q,&kk,&wqn,&wkn,&N,&D,&NH,&HD,&nt,&ih,&iw}; cuLaunchKernel(k->qk_rope,N,NH,1,HD,1,1,0,r->stream,ar,NULL); }
         cuCtxSynchronize(); if (launch_vec(k->round_bf16,r->stream,N*D,q)!=CUDA_SUCCESS||launch_vec(k->round_bf16,r->stream,N*D,kk)!=CUDA_SUCCESS) goto fail_block; probe(r,"rope_q",q,N*D);
@@ -510,7 +541,7 @@ static int native_step(cuda_qimg_runner *r, qimg21_kernels *k, const qimg21_shar
             if(error){fprintf(stderr,"native: invalid or failed attention-state replay\n");goto fail_block;}
             fprintf(stderr,"native: DIAGNOSTIC ONLY: injecting attention before output projection\n");
         }
-        else if(k->mma_attention) {
+        else if(k->mma_attention || qimg21_cutlass_attention) {
             /* Reuse the 3*D BF16 MLP hand-off allocation for Q/K/V. */
             CUdeviceptr qb=bf,kb=bf+(size_t)N*D*2,vb=bf+(size_t)N*D*4;
             if(launch_cast(r,qb,q,N*D) || launch_cast(r,kb,kk,N*D) || launch_cast(r,vb,v,N*D))goto fail_block;
@@ -524,18 +555,22 @@ static int native_step(cuda_qimg_runner *r, qimg21_kernels *k, const qimg21_shar
                 CUdeviceptr sq=qb+(size_t)start*D*2,so=att+(size_t)start*D*4;
                 void *aa[]={&so,&sq,&kb,&vb,&nq,&nkv,(void *)&NH,(void *)&HD};
                 int is_text=edit?edit->layout.image_id[start]<0:start<nt;
-                int is_prefix=qimg21_attention_mma64==5 && end<N && !is_text;
-                CUfunction attention=is_text && k->mma_text?k->mma_text:
-                                     is_prefix && k->mma_prefix?k->mma_prefix:k->mma_attention;
-                if(cuLaunchKernel(attention,NH,(nq+63)/64,1,128,1,1,4*64*136*2,r->stream,aa,NULL) ||
-                   cuCtxSynchronize())goto fail_block;
+                CUfunction attention=is_text && k->mma_text?k->mma_text:k->mma_attention;
+                if(qimg21_cutlass_attention) {
+                    int error=qimg21_cutlass_attention((float *)(uintptr_t)so,
+                        (const void *)(uintptr_t)sq,(const void *)(uintptr_t)kb,
+                        (const void *)(uintptr_t)vb,nq,nkv,NH,HD,(void *)r->stream);
+                    if(error || cuCtxSynchronize())goto fail_block;
+                } else if(cuLaunchKernel(attention,NH,(nq+63)/64,1,128,1,1,
+                                         4*64*136*2,r->stream,aa,NULL) ||
+                          cuCtxSynchronize())goto fail_block;
                 start=end;
             }
         }
         else if(edit) { void *aa[]={&att,&q,&kk,&v,(void *)&edit->image_id,(void *)&N,(void *)&NH}; if(cuLaunchKernel(edit->attention,NH,N,1,32,1,1,0,r->stream,aa,NULL))goto fail_block; }
         else { void *aa[]={&att,&q,&kk,&v,&N,&nt,&NH,&HD};cuLaunchKernel(k->attn,NH,(N+3)/4,1,128,1,1,2*32*128*sizeof(float),r->stream,aa,NULL); }
-        cuCtxSynchronize(); if (launch_vec(k->round_bf16,r->stream,N*D,att)!=CUDA_SUCCESS) goto fail_block; probe(r,"attn",att,N*D); if (qimg21_stage_block < 0 || bidx == qimg21_stage_block) dump_stage("attn_raw",att,(size_t)N*D,N,D); if(launch_cast(r,bf,att,N*D)!=CUDA_SUCCESS||gemm(r,tmp,wo,bf,N,D,D)!=0||launch_vec(k->round_bf16,r->stream,N*D,tmp)!=CUDA_SUCCESS)goto fail_block; probe(r,"attn_out",tmp,N*D); if (qimg21_stage_block < 0 || bidx == qimg21_stage_block) dump_stage("attn_out",tmp,(size_t)N*D,N,D);
-        void *ag[]={&hidden,&tmp,&mod,&N,&D,&prefix,&(int){0}};cuLaunchKernel(k->gate_res,(N*D+255)/256,1,1,256,1,1,0,r->stream,ag,NULL);cuCtxSynchronize(); if (launch_vec(k->round_bf16,r->stream,N*D,hidden)!=CUDA_SUCCESS) goto fail_block;
+        cuCtxSynchronize(); if (qimg21_stage_block < 0 || bidx == qimg21_stage_block) dump_stage("attn_pre_round",att,(size_t)N*D,N,D); if (launch_vec(k->round_bf16,r->stream,N*D,att)!=CUDA_SUCCESS) goto fail_block; probe(r,"attn",att,N*D); if (qimg21_stage_block < 0 || bidx == qimg21_stage_block) dump_stage("attn_raw",att,(size_t)N*D,N,D); if(launch_cast(r,bf,att,N*D)!=CUDA_SUCCESS||gemm(r,tmp,wo,bf,N,D,D)!=0||launch_vec(k->round_bf16,r->stream,N*D,tmp)!=CUDA_SUCCESS)goto fail_block; probe(r,"attn_out",tmp,N*D); if (qimg21_stage_block < 0 || bidx == qimg21_stage_block) dump_stage("attn_out",tmp,(size_t)N*D,N,D);
+        void *ag[]={&hidden,&tmp,&mod,&N,&D,&prefix,&(int){0}};cuLaunchKernel(k->gate_res,(N*D+255)/256,1,1,256,1,1,0,r->stream,ag,NULL);cuCtxSynchronize(); if (launch_vec(k->round_bf16,r->stream,N*D,hidden)!=CUDA_SUCCESS) goto fail_block; if (qimg21_stage_block < 0 || bidx == qimg21_stage_block) dump_stage("post_attn_hidden",hidden,(size_t)N*D,N,D);
         void *a2[]={&tmp,&hidden,&mod,&N,&D,&prefix,&(int){1}};cuLaunchKernel(k->mod_ln,N,1,1,k->norm_threads,1,1,256*sizeof(float),r->stream,a2,NULL);cuCtxSynchronize(); if (launch_vec(k->round_bf16,r->stream,N*D,tmp)!=CUDA_SUCCESS) goto fail_block; if (qimg21_stage_block < 0 || bidx == qimg21_stage_block) dump_stage("mod_ln2",tmp,(size_t)N*D,N,D); if(launch_cast(r,bf,tmp,N*D)!=CUDA_SUCCESS)goto fail_block;
         if(gemm(r,mlp0,wg,bf,N,12288,D)!=0||gemm(r,mlp1,wp,bf,N,12288,D)!=0||launch_vec(k->round_bf16,r->stream,N*12288,mlp0)!=CUDA_SUCCESS||launch_vec(k->round_bf16,r->stream,N*12288,mlp1)!=CUDA_SUCCESS)goto fail_block; if (qimg21_stage_block < 0 || bidx == qimg21_stage_block) { dump_stage("mlp_gate",mlp0,(size_t)N*12288,N,12288); dump_stage("mlp_proj",mlp1,(size_t)N*12288,N,12288); } void *am[]={&tmp, &mlp0,&mlp1,&(int){N*12288}};cuLaunchKernel(k->mul_silu,(N*12288+255)/256,1,1,256,1,1,0,r->stream,am,NULL);cuCtxSynchronize(); if (launch_vec(k->round_bf16,r->stream,N*12288,tmp)!=CUDA_SUCCESS) goto fail_block; if (qimg21_stage_block < 0 || bidx == qimg21_stage_block) dump_stage("mlp_act",tmp,(size_t)N*12288,N,12288); if(launch_cast(r,bf,tmp,N*12288)!=CUDA_SUCCESS||gemm(r,tmp,wmlpo,bf,N,D,12288)!=0||launch_vec(k->round_bf16,r->stream,N*D,tmp)!=CUDA_SUCCESS)goto fail_block; if (qimg21_stage_block < 0 || bidx == qimg21_stage_block) dump_stage("mlp_out",tmp,(size_t)N*D,N,D); void *ag2[]={&hidden,&tmp,&mod,&N,&D,&prefix,&(int){1}};cuLaunchKernel(k->gate_res,(N*D+255)/256,1,1,256,1,1,0,r->stream,ag2,NULL);cuCtxSynchronize(); if (launch_vec(k->round_bf16,r->stream,N*D,hidden)!=CUDA_SUCCESS) goto fail_block;
         /* The block owns streamed weight allocations.  Synchronize before
@@ -543,7 +578,7 @@ static int native_step(cuda_qimg_runner *r, qimg21_kernels *k, const qimg21_shar
          * deterministic on drivers that do not fully order external-stream
          * work behind a cuBLAS call. */
         cuCtxSynchronize();
-        probe(r,"block",hidden,N*D); if (qimg21_stage_block < 0 || bidx == qimg21_stage_block) { char label[32]; snprintf(label,sizeof(label),"block_%02d",bidx); dump_stage(label,hidden,(size_t)N*D,N,D); } free_d(&wq);free_d(&wk);free_d(&wv);free_d(&wo);free_d(&wg);free_d(&wp);free_d(&wmlpo);free_d(&wqn);free_d(&wkn);
+        probe(r,"block",hidden,N*D); if (qimg21_stage_block < 0 || bidx == qimg21_stage_block) { char label[32]; snprintf(label,sizeof(label),"block_%02d",bidx); dump_stage(label,hidden,(size_t)N*D,N,D); } if(qimg21_stage_all_blocks){char label[48];snprintf(label,sizeof(label),"block_%02d_target",bidx);dump_stage(label,hidden+(size_t)prefix*D*4,(size_t)nout*D,nout,D);} free_d(&wq);free_d(&wk);free_d(&wv);free_d(&wo);free_d(&wg);free_d(&wp);free_d(&wmlpo);free_d(&wqn);free_d(&wkn);
         if(qimg21_replay_hidden){result=3;goto fail;} /* Never emit a model prediction from injected state. */
         continue;
 fail_block: free_d(&wq);free_d(&wk);free_d(&wv);free_d(&wo);free_d(&wg);free_d(&wp);free_d(&wmlpo);free_d(&wqn);free_d(&wkn);goto fail;
@@ -554,7 +589,7 @@ fail_block: free_d(&wq);free_d(&wk);free_d(&wv);free_d(&wo);free_d(&wg);free_d(&
     dump_stage("final_hidden",hidden,(size_t)N*D,N,D);
     dump_stage("final_scale",scale,2u*D,2,D);
     {void *a[]={&tmp,&hidden,&scale,&N,&D,&prefix};cuLaunchKernel(k->final_ln,N,1,1,k->norm_threads,1,1,256*sizeof(double),r->stream,a,NULL);cuCtxSynchronize(); if (launch_vec(k->round_bf16,r->stream,N*D,tmp)!=CUDA_SUCCESS) goto fail; dump_stage("final_ln",tmp,(size_t)N*D,N,D);}
-    {CUdeviceptr dout=checked_cuMemAlloc((size_t)nout*64*4);if(!dout)goto fail;if(launch_cast(r,bf,tmp+(size_t)prefix*D*4,nout*D)!=CUDA_SUCCESS){free_d(&dout);goto fail;} void *pa[]={&dout,&w_proj,&bf,&nout,&(int){64},&D}; if (cuLaunchKernel(k->proj,(nout*64+255)/256,1,1,256,1,1,0,r->stream,pa,NULL)!=CUDA_SUCCESS || launch_vec(k->round_bf16,r->stream,nout*64,dout)!=CUDA_SUCCESS){free_d(&dout);goto fail;}cuCtxSynchronize();cuMemcpyDtoH(out,dout,(size_t)nout*64*4); dump_stage("out",dout,(size_t)nout*64,nout,64);free_d(&dout);}
+    {CUdeviceptr dout=checked_cuMemAlloc((size_t)nout*64*4);if(!dout)goto fail;if(launch_cast(r,bf,tmp+(size_t)prefix*D*4,nout*D)!=CUDA_SUCCESS||gemm(r,dout,w_proj,bf,nout,64,D)!=0||launch_vec(k->round_bf16,r->stream,nout*64,dout)!=CUDA_SUCCESS){free_d(&dout);goto fail;}cuCtxSynchronize();cuMemcpyDtoH(out,dout,(size_t)nout*64*4); dump_stage("out",dout,(size_t)nout*64,nout,64);free_d(&dout);}
     result = 0;
     goto done;
 fail:
@@ -572,6 +607,7 @@ int main(int argc, char **argv) {
     const char *negative_prompt_path = NULL;
     const char *editing_layout_path = NULL, *condition_path = NULL;
     const char *negative_editing_layout_path = NULL;
+    const char *cutlass_plugin_path = NULL;
     const char *out_path = "native_latents.npy", *dump_dir = NULL, *pred_dir = NULL;
     int ih = 16, iw = 16, steps = 1, verbose = 1;
     float guidance_scale = 1.0f;
@@ -582,6 +618,7 @@ int main(int argc, char **argv) {
             const char *mode=argv[++i];
             if(!strcmp(mode,"host-table"))qimg21_host_rope=1;
             else if(!strcmp(mode,"host-table-vector4"))qimg21_host_rope=2;
+            else if(!strcmp(mode,"host-table-exact")){qimg21_host_rope=2;qimg21_rope_base_path="cuda/qimg21/qwen21_rope_freqs.npy";}
             else if(!strcmp(mode,"default"))qimg21_host_rope=0;
             else return 2;
         }
@@ -606,9 +643,12 @@ int main(int argc, char **argv) {
             else if (!strcmp(mode, "mma64-mixed")) {qimg21_attention_mma64=3;qimg21_attention_reverse64=0;}
             else if (!strcmp(mode, "mma64-forward-flash")) {qimg21_attention_mma64=4;qimg21_attention_reverse64=0;}
             else if (!strcmp(mode, "mma128-efficient")) {qimg21_attention_mma64=5;qimg21_attention_reverse64=0;}
+            else if (!strcmp(mode, "cutlass-efficient")) {cutlass_plugin_path="cuda/qimg21/libq21_cutlass_attention.so";qimg21_attention_reverse64=0;}
             else { fprintf(stderr, "native: unsupported attention mode\n"); return 2; }
         }
         else if (!strcmp(argv[i], "--prompt-embeds") && i + 1 < argc) prompt_path = argv[++i];
+        else if (!strcmp(argv[i], "--cutlass-plugin") && i + 1 < argc) cutlass_plugin_path = argv[++i];
+        else if (!strcmp(argv[i], "--rope-table-base") && i + 1 < argc) qimg21_rope_base_path = argv[++i];
         else if (!strcmp(argv[i], "--negative-prompt-embeds") && i + 1 < argc) negative_prompt_path = argv[++i];
         else if (!strcmp(argv[i], "--guidance-scale") && i + 1 < argc) guidance_scale = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--latents") && i + 1 < argc) latent_path = argv[++i];
@@ -656,6 +696,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "native: optional row-INT8 weights, BF16 dequantized compute (quality unvalidated)\n");
     }
     qimg21_stage_dir = getenv("QIMG21_STAGE_DIR");
+    qimg21_stage_all_blocks = getenv("QIMG21_STAGE_ALL_BLOCKS") != NULL;
     qimg21_replay_hidden = getenv("QIMG21_REPLAY_HIDDEN");
     qimg21_replay_attention = getenv("QIMG21_REPLAY_ATTENTION");
     if(qimg21_replay_attention && !qimg21_replay_hidden) {
@@ -705,6 +746,19 @@ int main(int argc, char **argv) {
         memcpy(packed,condition.data,(size_t)nc*64*sizeof(float));
     }
     const float *p=pe.data; cuda_qimg_runner*r=cuda_qimg_init(0,verbose);if(!r)return 1;
+    void *cutlass_plugin=NULL;
+    if(cutlass_plugin_path) {
+        cutlass_plugin=dlopen(cutlass_plugin_path,RTLD_NOW|RTLD_LOCAL);
+        if(!cutlass_plugin || !(qimg21_cutlass_attention=(qimg21_cutlass_attention_fn)
+             dlsym(cutlass_plugin,"q21_cutlass_attention"))) {
+            fprintf(stderr,"native: cannot load CUTLASS attention plugin %s: %s\n",
+                    cutlass_plugin_path,dlerror());
+            if(cutlass_plugin)dlclose(cutlass_plugin);
+            cuda_qimg_free(r);return 1;
+        }
+        qimg21_exact_rope=(qimg21_exact_rope_fn)dlsym(cutlass_plugin,"q21_exact_qk_rope");
+        fprintf(stderr,"native: exact CUTLASS efficient attention enabled\n");
+    }
     q21_edit_context edit={0};
     q21_edit_context negative_edit={0};
     if(editing_layout_path && q21_edit_init(&edit,r,editing_layout_path,nt,nc+ni,ih,iw,qimg21_attention_reverse64)) {
@@ -729,7 +783,7 @@ int main(int argc, char **argv) {
            cuModuleGetFunction(&k.final_ln,norm_module,"final_ln_vector"))return 1;
         k.norm_threads=128;
     }
-    CUmodule text_mma_module=NULL, prefix_mma_module=NULL;
+    CUmodule text_mma_module=NULL;
     if(qimg21_attention_mma64) {
         size_t length=strlen(q21_mma64_src)+256;
         char *source=malloc(length);
@@ -743,7 +797,7 @@ int main(int argc, char **argv) {
         if(compiled<0 || cuModuleGetFunction(&k.mma_attention,mma_module,"q21_flash_reverse64") ||
            cuFuncSetAttribute(k.mma_attention,CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,4*64*136*2))return 1;
     }
-    if(qimg21_attention_mma64==3 || qimg21_attention_mma64==5) {
+    if(qimg21_attention_mma64==3) {
         size_t length=strlen(q21_mma64_src)+128;
         char *source=malloc(length);
         if(!source)return 1;
@@ -752,16 +806,6 @@ int main(int argc, char **argv) {
         free(source);
         if(compiled<0 || cuModuleGetFunction(&k.mma_text,text_mma_module,"q21_flash_reverse64") ||
            cuFuncSetAttribute(k.mma_text,CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,4*64*136*2))return 1;
-    }
-    if(qimg21_attention_mma64==5) {
-        size_t length=strlen(q21_mma64_src)+128;
-        char *source=malloc(length);
-        if(!source)return 1;
-        snprintf(source,length,"#define Q21_FORWARD_KEYS 0\n#define Q21_FLASH_SOFTMAX 1\n%s",q21_mma64_src);
-        int compiled=cu_compile_kernels(&prefix_mma_module,r->device,source,"qimg21_mma_prefix.cu",verbose,"qimg21_mma_prefix");
-        free(source);
-        if(compiled<0 || cuModuleGetFunction(&k.mma_prefix,prefix_mma_module,"q21_flash_reverse64") ||
-           cuFuncSetAttribute(k.mma_prefix,CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,4*64*136*2))return 1;
     }
     if (dump_dir) mkdir(dump_dir, 0755);
     if (pred_dir) mkdir(pred_dir, 0755);
@@ -813,8 +857,8 @@ int main(int argc, char **argv) {
     q21_edit_free(&edit);q21_edit_free(&negative_edit);free(packed);npy_free(&condition);
     if(mma_module)cuModuleUnload(mma_module);
     if(text_mma_module)cuModuleUnload(text_mma_module);
-    if(prefix_mma_module)cuModuleUnload(prefix_mma_module);
     if(norm_module)cuModuleUnload(norm_module);
     if(rope_module)cuModuleUnload(rope_module);
+    if(cutlass_plugin)dlclose(cutlass_plugin);
     cuda_qimg_free(r); npy_free(&pe); npy_free(&neg); npy_free(&la); return rc;
 }

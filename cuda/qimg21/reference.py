@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import json
 import os
 import time
@@ -25,6 +26,8 @@ def main() -> int:
     ap.add_argument("--steps", type=int, default=1)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--dtype", choices=("bf16", "fp16"), default="bf16")
+    ap.add_argument("--sdpa-backend", choices=("default", "efficient"), default="default",
+                    help="optionally pin CUDA SDPA for deterministic native parity")
     ap.add_argument(
         "--dump-initial-latents",
         action="store_true",
@@ -35,6 +38,7 @@ def main() -> int:
         help="save each transformer denoiser prediction as pred_NNN.npy",
     )
     ap.add_argument("--dump-dir", required=True)
+    ap.add_argument("--capture-block-dir", help="diagnostic block-0 tensors from the first denoiser call")
     args = ap.parse_args()
 
     import torch
@@ -50,6 +54,74 @@ def main() -> int:
         str(Path(args.model).resolve()), dtype=dtype, local_files_only=True
     )
     pipe.enable_sequential_cpu_offload(device="cuda")
+    if args.capture_block_dir:
+        import diffusers.models.transformers.transformer_qwenimage21 as qmod
+        capture_dir = Path(args.capture_block_dir)
+        capture_dir.mkdir(parents=True, exist_ok=False)
+        capture_calls = [0]
+        block0 = pipe.transformer.transformer_blocks[0]
+        def capture_tensor(name):
+            def hook(_module, _inputs, output):
+                if capture_calls[0] == 0:
+                    value = output[0] if isinstance(output, tuple) else output
+                    np.save(capture_dir / f"{name}.npy", value.detach().float().cpu().numpy())
+            return hook
+        def capture_input(name):
+            def hook(_module, inputs):
+                if capture_calls[0] == 0:
+                    np.save(capture_dir / f"{name}.npy", inputs[0].detach().float().cpu().numpy())
+            return hook
+        def capture_block_input(_module, inputs, kwargs):
+            if capture_calls[0] == 0:
+                value = inputs[0] if inputs else kwargs["hidden_states"]
+                np.save(capture_dir / "block_00_input.npy", value.detach().float().cpu().numpy())
+        def capture_block_output(_module, _inputs, kwargs, output):
+            if capture_calls[0] == 0:
+                value = output[0] if isinstance(output, tuple) else output
+                np.save(capture_dir / "block_00.npy", value.detach().float().cpu().numpy())
+            capture_calls[0] += 1
+        block0.register_forward_pre_hook(capture_block_input, with_kwargs=True)
+        block0.register_forward_hook(capture_block_output, with_kwargs=True)
+        block0.img_norm1.register_forward_hook(capture_tensor("norm1"))
+        block0.attn.to_q.register_forward_hook(capture_tensor("q_linear"))
+        block0.attn.to_k.register_forward_hook(capture_tensor("k_linear"))
+        block0.attn.to_v.register_forward_hook(capture_tensor("v_linear"))
+        block0.attn.norm_q.register_forward_hook(capture_tensor("q_norm"))
+        block0.attn.norm_k.register_forward_hook(capture_tensor("k_norm"))
+        block0.attn.to_out[0].register_forward_pre_hook(capture_input("attn_raw"))
+        block0.attn.register_forward_hook(capture_tensor("attn_out"))
+        block0.img_norm2.register_forward_pre_hook(capture_input("post_attn_hidden"))
+        block0.img_norm2.register_forward_hook(capture_tensor("norm2"))
+        block0.img_mlp.register_forward_pre_hook(capture_input("mlp_input"))
+        block0.img_mlp.register_forward_hook(capture_tensor("mlp_out"))
+        original_modulate = block0._modulate
+        modulation_calls = [0]
+        def capture_modulate(hidden_states, modulation, target_token_mask):
+            result = original_modulate(hidden_states, modulation, target_token_mask)
+            if capture_calls[0] == 0:
+                suffix = modulation_calls[0] + 1
+                np.save(capture_dir / f"modulated{suffix}.npy",
+                        result[0].detach().float().cpu().numpy())
+                np.save(capture_dir / f"gate{suffix}.npy",
+                        result[1].detach().float().cpu().numpy())
+            modulation_calls[0] += 1
+            return result
+        block0._modulate = capture_modulate
+        original_prepare_qkv = qmod._qwenimage21_prepare_qkv
+        prepare_calls = [0]
+        def capture_prepare_qkv(*positional, **keywords):
+            result = original_prepare_qkv(*positional, **keywords)
+            if prepare_calls[0] == 0:
+                rotary = positional[2] if len(positional) > 2 else keywords.get("rotary_emb")
+                if rotary is not None:
+                    np.save(capture_dir / "rope_table.npy",
+                            torch.view_as_real(rotary).flatten(-2).detach().float().cpu().numpy())
+                for name, value in zip(("rope_q", "rope_k", "v"), result[:3]):
+                    np.save(capture_dir / f"{name}.npy",
+                            value.flatten(2)[0].detach().float().cpu().numpy())
+            prepare_calls[0] += 1
+            return result
+        qmod._qwenimage21_prepare_qkv = capture_prepare_qkv
     if max(args.height, args.width) > 1024:
         pipe.vae.enable_tiling()
     gen = torch.Generator(device="cuda").manual_seed(args.seed)
@@ -155,24 +227,30 @@ def main() -> int:
         return kwargs
 
     t0 = time.perf_counter()
-    result = pipe(
-        prompt=args.prompt,
-        image=image,
-        negative_prompt=args.negative_prompt,
-        true_cfg_scale=args.true_cfg_scale,
-        height=args.height,
-        width=args.width,
-        num_inference_steps=args.steps,
-        generator=None if initial_latents is not None else gen,
-        latents=initial_latents,
-        # Native denoiser parity replays every step through the same full
-        # prefill path.  The cache path is numerically equivalent but uses a
-        # different attention execution route, which would measure cache
-        # drift instead of kernel parity in the per-step fixtures.
-        use_kv_cache=pred_dir is None,
-        callback_on_step_end=callback,
-        callback_on_step_end_tensor_inputs=["latents", "prompt_embeds"],
-    )
+    if args.sdpa_backend == "efficient":
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+        backend_context = sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION)
+    else:
+        backend_context = nullcontext()
+    with backend_context:
+        result = pipe(
+            prompt=args.prompt,
+            image=image,
+            negative_prompt=args.negative_prompt,
+            true_cfg_scale=args.true_cfg_scale,
+            height=args.height,
+            width=args.width,
+            num_inference_steps=args.steps,
+            generator=None if initial_latents is not None else gen,
+            latents=initial_latents,
+            # Native denoiser parity replays every step through the same full
+            # prefill path.  The cache path is numerically equivalent but uses a
+            # different attention execution route, which would measure cache
+            # drift instead of kernel parity in the per-step fixtures.
+            use_kv_cache=pred_dir is None,
+            callback_on_step_end=callback,
+            callback_on_step_end_tensor_inputs=["latents", "prompt_embeds"],
+        )
     torch.cuda.synchronize()
     result.images[0].save(out / "reference.png")
     np.save(out / "reference_rgba.npy", np.asarray(result.images[0].convert("RGBA")))
@@ -188,6 +266,7 @@ def main() -> int:
         "seed": args.seed,
         "elapsed_seconds": time.perf_counter() - t0,
         "torch": torch.__version__,
+        "sdpa_backend": args.sdpa_backend,
     }, indent=2) + "\n")
     print(f"saved {out / 'reference.png'}")
     return 0

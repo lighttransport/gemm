@@ -16,7 +16,7 @@ static const char *q21_rope_table_src =
 " float x0=q21_rne(q21_rne(q[base+j]*iq)*qw[j]),x1=q21_rne(q21_rne(q[base+j+1]*iq)*qw[j+1]);\n"
 " float y0=q21_rne(q21_rne(k[base+j]*ik)*kw[j]),y1=q21_rne(q21_rne(k[base+j+1]*ik)*kw[j+1]);\n"
 " float c=table[t*128+j],s=table[t*128+j+1];\n"
-" q[base+j]=x0*c-x1*s;q[base+j+1]=x0*s+x1*c;k[base+j]=y0*c-y1*s;k[base+j+1]=y0*s+y1*c;\n"
+" q[base+j]=__fmaf_rn(x0,c,-__fmul_rn(x1,s));q[base+j+1]=__fmaf_rn(x1,c,__fmul_rn(x0,s));k[base+j]=__fmaf_rn(y0,c,-__fmul_rn(y1,s));k[base+j+1]=__fmaf_rn(y1,c,__fmul_rn(y0,s));\n"
 "}\n"
 "}\n"
 "\n";

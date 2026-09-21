@@ -14,6 +14,7 @@ def main():
     ap.add_argument("--step", required=True, type=int)
     ap.add_argument("--block", required=True, type=int, choices=range(32))
     ap.add_argument("--out-dir", required=True, type=Path)
+    ap.add_argument("--all-block-targets", action="store_true")
     args = ap.parse_args()
     if args.step < 0:
         raise ValueError("step must be nonnegative")
@@ -41,38 +42,75 @@ def main():
     pipe.enable_sequential_cpu_offload(device="cuda")
     transformer = pipe.transformer
     block = transformer.transformer_blocks[args.block]
+    target_tokens = int(np.prod(layout["img_shapes"][0][-1]))
+    captured = {}
 
     def save(name):
         def hook(_module, _inputs, output):
             value = output[0] if isinstance(output, tuple) else output
-            np.save(args.out_dir / f"{name}.npy", value.detach().float().cpu().numpy())
+            captured[name] = value.detach()
         return hook
 
     def save_input(name):
         def hook(_module, inputs):
-            np.save(args.out_dir / f"{name}.npy", inputs[0].detach().float().cpu().numpy())
+            captured[name] = inputs[0].detach()
         return hook
 
     block.img_norm1.register_forward_pre_hook(save_input("hidden"))
+    block.img_norm1.register_forward_hook(save("norm1"))
+    block.img_norm2.register_forward_pre_hook(save_input("post_attn_hidden"))
+    block.img_norm2.register_forward_hook(save("norm2"))
     block.attn.to_out[0].register_forward_pre_hook(save_input("attn_raw"))
+    block.attn.to_q.register_forward_hook(save("q_linear"))
+    block.attn.to_k.register_forward_hook(save("k_linear"))
+    block.attn.to_v.register_forward_hook(save("v_linear"))
+    block.attn.norm_q.register_forward_hook(save("q_norm"))
+    block.attn.norm_k.register_forward_hook(save("k_norm"))
+    block.img_mlp.register_forward_pre_hook(save_input("mlp_input"))
     for name, module in (("attn_out", block.attn), ("mlp_gate", block.img_mlp.gate_layer),
                          ("mlp_proj", block.img_mlp.proj), ("mlp_out", block.img_mlp.out),
                          (f"block_{args.block:02d}", block)):
         module.register_forward_hook(save(name))
+
+    original_modulate = block._modulate
+    modulation_calls = [0]
+    def capture_modulate(hidden_states, modulation, target_token_mask):
+        modulated, gate = original_modulate(hidden_states, modulation, target_token_mask)
+        suffix = modulation_calls[0] + 1
+        captured[f"modulated{suffix}"] = modulated.detach()
+        captured[f"gate{suffix}"] = gate.detach()
+        modulation_calls[0] += 1
+        return modulated, gate
+    block._modulate = capture_modulate
+    if args.all_block_targets:
+        for index, selected_block in enumerate(transformer.transformer_blocks):
+            def save_target(_module, _inputs, output, index=index):
+                value = output[0] if isinstance(output, tuple) else output
+                captured[f"block_{index:02d}_target"] = value[:, -target_tokens:].detach()
+            selected_block.register_forward_hook(save_target)
+        transformer.norm_out.linear.register_forward_hook(save("final_scale"))
+        transformer.norm_out.norm.register_forward_hook(save("final_norm_base"))
+        transformer.norm_out.register_forward_pre_hook(save_input("final_hidden"))
+        transformer.norm_out.register_forward_hook(save("final_ln"))
+        transformer.proj_out.register_forward_hook(save("out"))
 
     original_prepare = qmod._qwenimage21_prepare_qkv
     calls = [0]
     def capture_qkv(*positional, **keywords):
         output = original_prepare(*positional, **keywords)
         if calls[0] == args.block:
+            rotary = positional[2] if len(positional) > 2 else keywords.get("rotary_emb")
+            if rotary is not None:
+                rotary_real = torch.view_as_real(rotary).flatten(-2)
+                captured["rope_table"] = rotary_real.detach()
             for name, value in zip(("rope_q", "rope_k", "v"), output[:3]):
                 value = value.flatten(2)
-                np.save(args.out_dir / f"{name}.npy", value.detach().float().cpu().numpy()[0])
+                captured[name] = value.detach().flatten(2)[0]
         calls[0] += 1
         return output
     qmod._qwenimage21_prepare_qkv = capture_qkv
     device = torch.device("cuda")
-    with torch.inference_mode():
+    with torch.no_grad(), transformer.cache_context("cond"):
         output = transformer(
             hidden_states=torch.from_numpy(hidden).to(device, torch.bfloat16),
             encoder_hidden_states=torch.from_numpy(prompt).to(device, torch.bfloat16),
@@ -80,10 +118,14 @@ def main():
             img_shapes=layout["img_shapes"],
             img_mask=torch.from_numpy(image_mask).to(device),
             encoder_hidden_states_mask=torch.from_numpy(key_mask).to(device),
+            attention_kwargs={},
             return_dict=False,
         )[0]
     torch.cuda.synchronize()
-    if calls[0] != 32 or not torch.isfinite(output).all():
+    np.save(args.out_dir / "output.npy", output.detach().float().cpu().numpy())
+    for name, value in captured.items():
+        np.save(args.out_dir / f"{name}.npy", value.float().cpu().numpy())
+    if calls[0] != 32 or modulation_calls[0] != 2 or not torch.isfinite(output).all():
         raise RuntimeError("incomplete/nonfinite transformer capture")
     metadata = {"diagnostic_only": True, "full_model_acceptance": False,
                 "step": args.step, "block": args.block, "torch": torch.__version__,

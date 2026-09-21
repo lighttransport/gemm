@@ -92,9 +92,9 @@ def main() -> int:
     ap.add_argument("--work-dir", default="tmp/qimg21-native-generate")
     ap.add_argument("--out", default="tmp/qimg21-native-generate.png")
     ap.add_argument("--native-bin", default="cuda/qimg21/test_cuda_qimg21_native")
-    ap.add_argument("--native-attention", choices=("math", "reverse64", "mma64", "mma64-flash", "mma64-mixed", "mma64-forward-flash", "mma128-efficient"), default="math")
+    ap.add_argument("--native-attention", choices=("math", "reverse64", "mma64", "mma64-flash", "mma64-mixed", "mma64-forward-flash", "mma128-efficient", "cutlass-efficient"), default="math")
     ap.add_argument("--native-normalization", choices=("default", "vector4"), default="default")
-    ap.add_argument("--native-rope", choices=("default", "host-table", "host-table-vector4"), default="default")
+    ap.add_argument("--native-rope", choices=("default", "host-table", "host-table-vector4", "host-table-exact"), default="default")
     ap.add_argument("--quantized-transformer", type=Path,
                     help="Optional experimental row-INT8 transformer package")
     ap.add_argument("--quantize-on-load", choices=("int8-row",))

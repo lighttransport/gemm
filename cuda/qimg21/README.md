@@ -1339,11 +1339,55 @@ OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=1 tmp/qimg21-ref-venv/bin/python cuda/qim
 
 This completed with finite condition tokens, both Euler checkpoints, final
 latents and decoded RGBA pixels. The 128x128 preview depicts a green apple,
-but is only a two-step integration smoke test. No matched PyTorch comparison
-was performed for this request. Native F32 encoding is not equivalent to
-claiming parity with a BF16 reference pipeline; strict denoiser editing parity
-still fails on previously documented fixtures. Python vision/text remains a
-fallback, and a hard 12 GB peak-memory limit has not been demonstrated.
+but is only a two-step integration smoke test. Python vision/text remains a
+fallback.
+
+### Exact BF16 editing parity
+
+The strict non-quantized comparison pins PyTorch SDPA to its efficient
+backend. CUDA's automatic SDPA choice mixes memory-efficient attention for
+masked text segments with Flash Attention for unmasked image segments; the
+last-bit choice is hardware dependent and is therefore not a reproducible
+kernel oracle. The native path uses the exact PyTorch 2.14 CUTLASS
+memory-efficient specialization plus PyTorch's CPU-generated RoPE table.
+
+Build the exact native components after checking out PyTorch commit
+`08187d9e0fba026dc8217405802ab5381dc88d90` at `tmp/pytorch-src` and its
+FlashAttention/CUTLASS gitlink commit
+`14c377950125c70b7a9dabf9c561fca53715ac7d` at
+`tmp/flash-attention-src`:
+
+```sh
+make -C cuda/qimg21 native-exact
+```
+
+Capture and compare a deterministic two-step editing case:
+
+```sh
+tmp/qimg21-ref-venv/bin/python cuda/qimg21/reference.py \
+  --model /mnt/nvme01/models/qimg-21 --image input.png \
+  --prompt 'change the apple color to green' --height 256 --width 256 \
+  --steps 2 --seed 42 --sdpa-backend efficient --dump-initial-latents \
+  --dump-pred-dir tmp/qimg21-edit-reference --dump-dir tmp/qimg21-edit-reference
+
+tmp/qimg21-ref-venv/bin/python cuda/qimg21/editing_regression.py \
+  --model /mnt/nvme01/models/qimg-21 \
+  --reference-dir tmp/qimg21-edit-reference \
+  --work-dir tmp/qimg21-edit-native \
+  --native-attention cutlass-efficient --native-normalization vector4 \
+  --native-rope host-table-exact
+```
+
+On the RTX 5060 Ti, the measured prediction cosines were
+`0.9999999818465785` and `0.9999999912661135`; the matched two-step Euler
+trajectory cosines were `0.999998675096587` and `0.9999982127383727`. All
+four pass the required `0.99996` threshold. Generated tables, libraries, and
+fixtures remain ignored.
+
+The same two-step case with negative prompt `red apple, blurry` and true-CFG
+scale 4 also passes: prediction cosines `0.9999998485751089` and
+`0.9999994896000577`, with trajectory cosines `0.9999985850203311` and
+`0.9999975521106901`.
 
 ## Completed 1024x1024/40-step generation benchmark
 
@@ -1391,6 +1435,6 @@ All 40 saved `[4096,64]` latent checkpoints are finite. The decoded
 1024x1024 RGBA PNG. Visual inspection shows a coherent red apple on a white
 surface, consistent with the prompt. Fixtures, image, and timing log remain
 under ignored `tmp/`, not in Git. No corresponding 40-step PyTorch trajectory
-was compared: successful generation does not establish the strict parity
-acceptance gate, which still fails on editing and true-CFG low-timestep
-predictions.
+was compared; that benchmark is performance and quality evidence rather than
+the strict parity gate. The deterministic efficient-SDPA editing gate is
+documented above. True-CFG parity remains a separate required validation.

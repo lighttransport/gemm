@@ -16,6 +16,8 @@ def main():
     ap.add_argument("--stage-dir", type=Path, required=True)
     ap.add_argument("--backend", choices=("default", "math", "flash", "efficient", "cudnn"),
                     default="default")
+    ap.add_argument("--prefix-backend", choices=("default", "math", "flash", "efficient", "cudnn"),
+                    default="default", help="force each segmented editing-prefix call")
     ap.add_argument("--editing-reference", type=Path,
                     help="Use official segmented editing attention from a positive-branch capture")
     args = ap.parse_args()
@@ -36,6 +38,8 @@ def main():
         "cudnn": SDPBackend.CUDNN_ATTENTION,
     }
     target_backend = nullcontext() if args.backend == "default" else sdpa_kernel(selected[args.backend])
+    def backend_context(name):
+        return nullcontext() if name == "default" else sdpa_kernel(selected[name])
     with torch.inference_mode():
         if args.editing_reference:
             from diffusers.models.transformers.transformer_qwenimage21 import (
@@ -56,8 +60,9 @@ def main():
                 if is_text:
                     mask = torch.cat([torch.ones(end-start, start, device="cuda", dtype=torch.bool),
                                       torch.ones(end-start, end-start, device="cuda", dtype=torch.bool).tril()], dim=1)
-                outputs.append(F.scaled_dot_product_attention(q[:, :, start:end], k[:, :, :end],
-                                                              v[:, :, :end], attn_mask=mask))
+                with backend_context(args.prefix_backend):
+                    outputs.append(F.scaled_dot_product_attention(q[:, :, start:end], k[:, :, :end],
+                                                                  v[:, :, :end], attn_mask=mask))
             with target_backend:
                 outputs.append(F.scaled_dot_product_attention(q[:, :, prefix:], k, v))
             ref = torch.cat(outputs, dim=2).transpose(1, 2).flatten(2)
@@ -77,11 +82,13 @@ def main():
     result = metrics(ref, native, len(ref)-prefix)
     # Preserve the existing top-level aggregate fields for older notebooks.
     aggregate = result["regions"]["all"]
-    result.update(backend=args.backend, torch=torch.__version__, finite=True,
+    result.update(backend=args.backend, prefix_backend=args.prefix_backend,
+                  torch=torch.__version__, finite=True,
                   cosine=aggregate["cosine"], relative_l2=aggregate["relative_l2"],
                   equal_fraction=aggregate["equal_fraction"])
-    np.save(folder / f"pytorch_attn_matched_{args.backend}.npy", ref)
-    (folder / f"attention_probe_{args.backend}.json").write_text(json.dumps(result, indent=2) + "\n")
+    suffix = args.backend if args.prefix_backend == "default" else f"{args.backend}_prefix_{args.prefix_backend}"
+    np.save(folder / f"pytorch_attn_matched_{suffix}.npy", ref)
+    (folder / f"attention_probe_{suffix}.json").write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result))
     return 0 if result["passed"] else 1
 
