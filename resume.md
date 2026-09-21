@@ -176,6 +176,28 @@ sidecar-cache injection are secondary prefill targets now that both 4K and
 random 64K prefill clear their goals.  Detailed priorities and validation
 gates are in the linked DFlash2 document.
 
+Remaining optimization items, in measured priority order:
+
+1. Raise ordinary random-64K decode from 35.52 tok/s to 40+ tok/s.  The
+   dominant cost is still one-row IQ2/IQ3/IQ1/IQ4 and Q2_K projection traffic;
+   evaluate exact grouped or multi-row mixed-type kernels with shared
+   activation staging and codebook layout changes.
+2. Fuse the long-context verifier attention split/combine tail while keeping
+   the pinned logits and sampled output bit-identical.
+3. Batch exact SSM recurrence updates and reduce checkpoint/rollback copies;
+   revalidate K=4/K=7 acceptance, retrieval, and random 64K hashes.
+4. Fuse remaining verifier preparation launches where mixed-type grouping has
+   enough coverage to pay for its dispatch and synchronization cost.
+5. Move DFlash top-k/selector work and draft-cache overhead onto the GPU;
+   K=7 already clears 60 tok/s, while K=4 remains below that target.
+6. Fuse prompt feature capture with target hidden writes and overlap sidecar
+   cache injection with the next prefill tile.  This is secondary because
+   4K/512 and random-64K prefill already exceed 400 tok/s.
+7. Revisit dense NextN/MTP scheduling; the current exact implementation is
+   slower than ordinary decode and remains below 60 tok/s.
+8. Add HTTP/stdio serving integration and broaden long-context sampled and
+   quality coverage once the performance work stabilizes.
+
 CLI: `--qwen35-dflash2 SIDECAR --qwen35-dflash2-draft 1..7`; it currently
 requires benchmark mode, `--qwen35-batched-prefill`, `--qwen35-decode-graph`
 and `--kv-cache q8q8`.  `validate_qwen38_reference.py` accepts `--dflash2`
