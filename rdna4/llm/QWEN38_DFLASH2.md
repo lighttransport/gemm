@@ -329,12 +329,16 @@ The 4K K=7 gate measures 82.67 tok/s greedy and 66.46 tok/s sampled with
 trace I/O; K=4 remains exact at 59.75 tok/s.  A selector-boundary window uses
 the generic graph, so graph reuse never changes a row's split count.
 
-Three follow-up variants were rejected.  Device guards that launched both
+Four follow-up variants were rejected.  Device guards that launched both
 attention grids reached only 39.55 tok/s at 64K.  Pinning a captured graph's
 split count and sharing combine scales did not improve verifier time.  A
 one-wave combine and a fused draft/verify synchronization path were both
 byte-identical but slower on the traced 4K gate.  The retained graph selector
-is the only measured win.
+is the only measured win.  Moving the eight-query length metadata from
+per-thread arrays to LDS also retained exact random-64K prefix/suffix hashes
+and raised prefill to 445.21 tok/s, but verifier time increased to 5927.105 ms
+and decode dropped to 39.26 tok/s; the register-pressure experiment was
+therefore reverted.
 
 ## Remaining optimization opportunities
 

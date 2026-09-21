@@ -212,7 +212,11 @@ values remain pinned.
 Device-guard dual launches, fixed split pinning, shared combine scales, a
 one-wave combine, and fused draft/verify synchronization were all measured
 and rejected.  They were exact, but none beat the selected-graph result.  The
-remaining 64K gap to 40 tok/s is about 0.2%.
+per-thread verifier length arrays were also moved to LDS to test whether the
+eight-query accumulator was register-bound.  That variant kept the random-64K
+prefix/suffix hashes exact and raised prefill to 445.21 tok/s, but verifier
+time rose to 5927.105 ms and decode fell to 39.26 tok/s, so it was reverted.
+The remaining 64K gap to 40 tok/s is about 0.2%.
 
 Remaining optimization items, in measured priority order:
 
