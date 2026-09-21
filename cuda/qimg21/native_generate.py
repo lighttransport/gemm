@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Run native Qwen-Image 2.1 denoising with an optional native CUDA VAE.
 
-The text encoder remains the validated Diffusers boundary for now.  This
+The text/vision encoder remains the Diffusers boundary for now. This
 driver turns its prompt embedding into an F32 fixture, invokes the native
 NVRTC/CUDA transformer for the complete FlowMatch schedule, and only loads the
 Qwen-Image 2.1 VAE after the native subprocess exits.  That process boundary
 lets the transformer release all of its allocations before the decoder claims
 VRAM on a 12–16 GB card.
+Single-image editing additionally runs native F32 VAE encoding before text
+encoding; end-to-end editing parity is still experimental.
 """
 
 from __future__ import annotations
@@ -79,7 +81,9 @@ def main() -> int:
     ap.add_argument("--prompt", default="a red apple on a white table")
     ap.add_argument("--negative-prompt")
     ap.add_argument("--true-cfg-scale", type=float, default=1.0)
-    ap.add_argument("--image", help="editing image (native denoiser does not support image conditioning yet)")
+    ap.add_argument("--image", help="Experimental single-image editing with native F32 VAE encoding")
+    ap.add_argument("--condition-resolution", type=int, default=1024,
+                    help="Condition image target-area side length, matching the reference output_resolution")
     ap.add_argument("--height", type=int, default=256)
     ap.add_argument("--width", type=int, default=256)
     ap.add_argument("--steps", type=int, default=2)
@@ -122,8 +126,17 @@ def main() -> int:
         raise SystemExit("steps must be between 1 and 100")
     if args.negative_prompt is not None and args.true_cfg_scale <= 1.0:
         raise SystemExit("--true-cfg-scale must be > 1 when --negative-prompt is used")
+    condition_hw = None
+    condition_dir = work / "condition"
     if args.image:
-        raise SystemExit("native image conditioning is not yet supported; use test_cuda_qimg21.py for editing")
+        from editing_inputs import prepare_image
+        encoder = root / "cuda/qimg21/test_cuda_qimg21_vae_encode"
+        if not encoder.exists():
+            raise SystemExit("native encoder missing; run `make -C cuda/qimg21 native-vae`")
+        condition_hw = prepare_image(Path(args.image).resolve(), condition_dir, args.condition_resolution)
+        _run([str(encoder), "--model", str(model / "vae"), "--image", str(condition_dir / "image.npy"),
+              "--out", str(condition_dir / "moments.npy"),
+              "--normalized-latents", str(condition_dir / "latents.npy")], cwd=root)
 
     prompt_dir = work / "prompt"
     steps_dir = work / "steps"
@@ -150,6 +163,8 @@ def main() -> int:
         ]
     if args.negative_prompt is not None:
         text_command.extend(["--negative-prompt", args.negative_prompt])
+    if args.image:
+        text_command.extend(["--image", str(condition_dir / "resized.png")])
     _run(text_command, cwd=root)
     prompt_path = prompt_dir / "prompt_embeds.npy"
     if not prompt_path.exists():
@@ -205,6 +220,16 @@ def main() -> int:
             str(native_latents),
         ]
     native_command.extend(["--normalization", args.native_normalization, "--rope", args.native_rope])
+    if args.image:
+        from editing_inputs import write_layout
+        layout = condition_dir / "positive_layout.txt"
+        write_layout(prompt_dir, layout, condition_hw, (h_tokens, w_tokens))
+        native_command.extend(["--condition-latents", str(condition_dir / "latents.npy"),
+                               "--editing-layout", str(layout)])
+        if args.negative_prompt is not None:
+            negative_layout = condition_dir / "negative_layout.txt"
+            write_layout(prompt_dir, negative_layout, condition_hw, (h_tokens, w_tokens), negative=True)
+            native_command.extend(["--negative-editing-layout", str(negative_layout)])
     if args.negative_prompt is not None:
         native_command.extend([
             "--negative-prompt-embeds",

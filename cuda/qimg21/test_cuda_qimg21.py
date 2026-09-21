@@ -61,6 +61,10 @@ def _dump_prompt(pipe, prompt: str, out_dir: Path, image=None, negative_prompt: 
     torch = _torch()
     from text_capture import capture_text_encoder
 
+    # Unlike pipeline.__call__, encode_prompt expects an image sequence.
+    if image is not None and not isinstance(image, (list, tuple)):
+        image = [image]
+
     with torch.inference_mode(), (capture_text_encoder(pipe, out_dir / "text_positive")
                                   if dump_text_stages else nullcontext()):
         embeds, mask, image_mask = pipe.encode_prompt(

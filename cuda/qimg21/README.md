@@ -947,7 +947,7 @@ Add `--native-vae` to use the native F32 CUDA decoder. It reads the original
 VAE safetensors, applies latent denormalization and the learned post-quant
 convolution, then runs the residual/attention/upsampling graph and clamps the
 RGBA result. Text encoding still uses Python. This decoder supports single
-images; integrated editing and peak-memory validation remain work in progress.
+images; editing parity and peak-memory validation remain work in progress.
 The separate single-frame encoder is described below. Decoder kernels and residual copies share the default CUDA stream
 to avoid races with the shared VAE helpers' synchronous device copies.
 
@@ -1040,8 +1040,8 @@ refactor also passes at cosine 0.999999999347549 (128x128/seed17).
 
 CPU input guards reject wrong channel counts, unsupported dimensions,
 non-finite pixels and out-of-range pixels before CUDA initialization; the
-CPU suite is now 28/28 passing. Larger encoder resolutions, peak VRAM,
-real-image preprocessing and end-to-end editing integration remain unverified.
+CPU suite is now 32/32 passing. Encoder resolutions above 512, peak VRAM,
+and end-to-end editing parity remain unverified.
 The initial downsampler computes a full convolution then samples odd spatial
 positions; it is correct but not yet optimized as a stride-2 convolution.
 
@@ -1054,6 +1054,38 @@ round trip at 128x128/seed42 matches official PyTorch posterior-mode
 reconstruction at cosine **0.999999999429927** (relative L2 3.38e-5).
 The old decoder 128x128/seed17 output remains bit-identical after sharing the
 statistics helper. These are F32 VAE checks, not BF16 editing-pipeline parity.
+
+The additional 512x512/seed42 encoder regression also passes: posterior cosine
+0.999999999998892, mean cosine 0.999999999985253, normalized-token cosine
+0.999999999987389 (relative L2 5.03e-6). Artifacts:
+`tmp/qimg21-encoder-512`.
+
+### Experimental single-image editing integration
+
+`native_generate.py --image IMAGE --condition-resolution 256 --native-vae`
+now connects official CPU RGBA preprocessing, native F32 VAE encoding and
+normalization, Diffusers vision/text encoding, checked native joint layouts,
+native denoising, and native decoding. Negative prompts get their own layout.
+The text helper wraps the image in the sequence required by `encode_prompt`.
+Only one condition image is supported; resized sides must be within 32..1024.
+Use a fresh work directory for each editing request.
+
+```sh
+OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=1 tmp/qimg21-ref-venv/bin/python cuda/qimg21/native_generate.py \
+  --model /mnt/nvme01/models/qimg-21 \
+  --image tmp/qimg21-native-1024-40-benchmark.png --condition-resolution 256 \
+  --prompt 'change the apple to green' --height 128 --width 128 --steps 2 --seed 42 \
+  --native-vae --native-attention mma64 --native-normalization vector4 --native-rope host-table \
+  --work-dir tmp/qimg21-native-edit-smoke-v2 --out tmp/qimg21-native-edit-smoke-v2.png
+```
+
+This completed with finite condition tokens, both Euler checkpoints, final
+latents and decoded RGBA pixels. The 128x128 preview depicts a green apple,
+but is only a two-step integration smoke test. No matched PyTorch comparison
+was performed for this request. Native F32 encoding is not equivalent to
+claiming parity with a BF16 reference pipeline; strict denoiser editing parity
+still fails on previously documented fixtures. Python vision/text remains a
+fallback, and a hard 12 GB peak-memory limit has not been demonstrated.
 
 ## Completed 1024x1024/40-step generation benchmark
 
