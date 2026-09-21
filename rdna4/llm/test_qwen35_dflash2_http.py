@@ -7,13 +7,18 @@ import argparse
 import concurrent.futures
 import http.client
 import json
-import os
-import subprocess
+import signal
+import threading
 import time
 import urllib.request
+from http.server import ThreadingHTTPServer
+from types import SimpleNamespace
+
+from codex_server import Backend, Handler, chat_prefix, chat_prompt
 
 
 HTTP_TIMEOUT = 180
+_active_backend = None
 
 
 def require(condition, message):
@@ -48,10 +53,10 @@ def concurrent_quality_cases(port):
         require(expected in text, text)
 
 
-def cancel_stream(port):
+def cancel_stream(port, prompt="List ten facts about C++."):
     """Close an active stream after its first token and verify cleanup later."""
     body = {
-        "messages": [{"role": "user", "content": "List ten facts about C++."}],
+        "messages": [{"role": "user", "content": prompt}],
         "temperature": 0, "max_tokens": 64, "stream": True,
     }
     connection = http.client.HTTPConnection("127.0.0.1", port, timeout=HTTP_TIMEOUT)
@@ -61,14 +66,91 @@ def cancel_stream(port):
                            headers={"Content-Type": "application/json"})
         response = connection.getresponse()
         require(response.status == 200, response.status)
-        while response.readline():
-            # Closing the connection exercises the server's disconnect watcher.
-            break
+        saw_token = False
+        while True:
+            line = response.readline()
+            if not line:
+                break
+            if not line.startswith(b"data: "):
+                continue
+            payload = line[6:].strip()
+            if payload == b"[DONE]":
+                break
+            chunk = json.loads(payload)
+            content = chunk.get("choices", [{}])[0].get("delta", {}).get("content", "")
+            if content:
+                saw_token = True
+                break
+        require(saw_token, "stream ended before the first generated token")
+        # Closing after a real token leaves a DFlash window transaction active
+        # and exercises cooperative rollback in the resident stdio child.
     finally:
         connection.close()
 
 
+def direct_stdio_cases(backend):
+    """Exercise the JSONL child independently of HTTP request formatting."""
+    messages = [{"role": "user", "content": "What is 8+5? Answer with just 13."}]
+    prompt = chat_prompt(messages)
+    prefix = chat_prefix(messages)
+    greedy = backend.generate(prompt, 8, 0, 0.95, 20, 0, 1, 0,
+                              prefix=prefix, seed=42)
+    repeated = backend.generate(prompt, 8, 0, 0.95, 20, 0, 1, 0,
+                                prefix=prefix, seed=42)
+    require(greedy[0] == repeated[0] and "13" in greedy[0], greedy)
+    require(greedy[3] > 0 and repeated[1] > 0, repeated)
+
+    sampled = backend.generate(prompt, 8, 0.7, 0.95, 20, 0, 1, 0,
+                               prefix=prefix, seed=42)
+    sampled_repeat = backend.generate(prompt, 8, 0.7, 0.95, 20, 0, 1, 0,
+                                      prefix=prefix, seed=42)
+    require(sampled[0] == sampled_repeat[0] and sampled[3] > 0, sampled)
+    require(sampled_repeat[1] > 0, sampled_repeat)
+
+    cancellation = threading.Event()
+
+    def cancel_after_token(piece):
+        if piece:
+            backend.cancel(cancellation)
+
+    cancelled = backend.generate(
+        chat_prompt([{"role": "user", "content": "List twenty C++ language features."}]),
+        64, 0, 0.95, 20, 0, 1, 0, cancellation=cancellation,
+        on_token=cancel_after_token, seed=42)
+    require(cancellation.is_set() and cancelled[-1] == "cancelled", cancelled)
+    recovered = backend.generate(prompt, 8, 0, 0.95, 20, 0, 1, 0,
+                                 prefix=prefix, seed=42)
+    require(recovered[0] == greedy[0], recovered)
+
+    cases = (
+        ("Answer 6+6 with just 12.", "12"),
+        ("Answer 9+9 with just 18.", "18"),
+    )
+
+    def run_case(item):
+        text, expected = item
+        result = backend.generate(
+            chat_prompt([{"role": "user", "content": text}]),
+            8, 0, 0.95, 20, 0, 1, 0, seed=42)
+        return result, expected
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(run_case, cases))
+    for result, expected in results:
+        require(result[3] > 0 and expected in result[0], result)
+    print("DFlash2 stdio window/cache/sampling/cancel/concurrency: PASS")
+
+
+def cleanup_on_signal(signum, _frame):
+    global _active_backend
+    if _active_backend is not None:
+        _active_backend.close()
+        _active_backend = None
+    raise SystemExit(128 + signum)
+
+
 def main():
+    global _active_backend
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
     parser.add_argument("--sidecar", required=True)
@@ -79,39 +161,33 @@ def main():
     parser.add_argument("--long-prompt-tokens", type=int, default=0,
                         help="also exercise a deterministic longer cached prompt")
     args = parser.parse_args()
-    command = [
-        "python3", "rdna4/llm/codex_server.py", args.model,
-        "--runner", args.runner, "--context", str(args.context), "--port", str(args.port),
-        "--max-output", "8", "--qwen35-dflash2", args.sidecar,
-        "--qwen35-dflash2-draft", "7",
-    ]
-    if args.snapshot_max_tokens:
-        command += ["--qwen35-snapshot-max-tokens", str(args.snapshot_max_tokens)]
-    os.makedirs("tmp/qwen38/dflash-http-quality", exist_ok=True)
-    server_log_path = os.path.join(
-        "tmp/qwen38/dflash-http-quality", f"server-{args.port}.log")
-    server_log = open(server_log_path, "w", encoding="utf-8")
-    # Keep diagnostics in a repository-local file so long GPU runs cannot
-    # deadlock on an undrained subprocess pipe, while failures remain useful.
-    process = subprocess.Popen(command, stdout=subprocess.DEVNULL,
-                                stderr=server_log, text=True)
+    options = SimpleNamespace(
+        runner=args.runner, model=args.model, context=args.context,
+        moe_cache_mb=0, coding=False, qwen4_coding_profile=False,
+        qwen4_exact=False, qwen4_mtp=None, qwen35_mtp=None,
+        qwen35_server_profile=False, qwen35_dflash2=args.sidecar,
+        qwen35_dflash2_draft=7,
+        qwen35_snapshot_max_tokens=args.snapshot_max_tokens,
+    )
+    backend = Backend(options)
+    _active_backend = backend
+    direct_stdio_cases(backend)
+
+    class TestHandler(Handler):
+        pass
+
+    TestHandler.backend = backend
+    TestHandler.model = backend.model
+    TestHandler.max_tokens = 64
+    TestHandler.context = args.context
+    TestHandler.coding = False
+    server = ThreadingHTTPServer(("127.0.0.1", args.port), TestHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
     try:
-        for _ in range(180):
-            try:
-                with urllib.request.urlopen(
-                        f"http://127.0.0.1:{args.port}/health", timeout=2) as response:
-                    health = json.load(response)
-                break
-            except Exception:
-                if process.poll() is not None:
-                    server_log.flush()
-                    with open(server_log_path, encoding="utf-8") as diagnostics:
-                        tail = diagnostics.read()[-4000:]
-                    raise RuntimeError(
-                        f"DFlash2 server exited before readiness (status {process.returncode})\n{tail}")
-                time.sleep(1)
-        else:
-            raise RuntimeError("DFlash2 server did not become ready")
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{args.port}/health", timeout=2) as response:
+            health = json.load(response)
         require(health.get("status") == "ready", health)
 
         cases = (
@@ -123,14 +199,20 @@ def main():
             greedy = {"messages": prompt, "temperature": 0, "max_tokens": 8}
             first = post(args.port, greedy)
             second = post(args.port, greedy)
+            third = post(args.port, greedy)
             first_text = first["choices"][0]["message"]["content"]
             require(first.get("usage", {}).get("completion_tokens", 0) > 0, first)
             require(first_text == second["choices"][0]["message"]["content"],
                     "greedy request was not repeatable")
+            require(first_text == third["choices"][0]["message"]["content"],
+                    "third greedy request was not repeatable")
             require(second.get("usage", {}).get("cached_tokens", 0) > 0,
                     "repeated prompt did not report cache reuse")
+            require(third.get("usage", {}).get("cached_tokens", 0) > 0,
+                    "third prompt did not report cache reuse")
             require(expected in first_text, first_text)
 
+        long_text = ""
         if args.long_prompt_tokens:
             require(args.long_prompt_tokens > 0, args.long_prompt_tokens)
             require(args.long_prompt_tokens + 32 < args.context,
@@ -149,7 +231,19 @@ def main():
             require(long_b.get("usage", {}).get("cached_tokens", 0) > 0,
                     "long prompt did not report cache reuse")
 
-        cancel_stream(args.port)
+            long_sampled = dict(long_body, temperature=0.7, top_p=0.95,
+                                top_k=20, seed=42)
+            sampled_a = post(args.port, long_sampled)
+            sampled_b = post(args.port, long_sampled)
+            require(sampled_a["choices"][0]["message"]["content"] ==
+                    sampled_b["choices"][0]["message"]["content"],
+                    "long seeded-sampled prompt was not repeatable")
+            require(sampled_a.get("usage", {}).get("completion_tokens", 0) > 0,
+                    sampled_a)
+            require(sampled_b.get("usage", {}).get("cached_tokens", 0) > 0,
+                    "long sampled prompt did not reuse the cached transaction")
+
+        cancel_stream(args.port, long_text or "List ten facts about C++.")
         time.sleep(1)
         recovery = post(args.port, {
             "messages": [{"role": "user", "content": "Answer 3+3 with 6."}],
@@ -176,14 +270,15 @@ def main():
         require("C++" in sampled_text, sampled_text)
         print("DFlash2 HTTP greedy/sampled repeatability and quality: PASS")
     finally:
-        process.terminate()
-        try:
-            process.wait(timeout=15)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait()
-        server_log.close()
+        server.shutdown()
+        server.server_close()
+        thread.join()
+        backend.close()
+        if _active_backend is backend:
+            _active_backend = None
 
 
 if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, cleanup_on_signal)
+    signal.signal(signal.SIGINT, cleanup_on_signal)
     main()
