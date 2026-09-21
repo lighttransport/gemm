@@ -33,6 +33,10 @@ Native IQ2_XXS was tested with `__launch_bounds__(256, 1)` as well.  The exact
 4K gate measured 42.94 and 42.87 tok/s across two runs, so that bound was
 reverted and the existing dispatch remains unchanged.
 
+The native Q2_K one-row kernel received the same `256, 1` bound for an A/B;
+it retained the exact 4K hashes at 42.91 tok/s without exceeding control, so
+the change was reverted.
+
 ## Packed Q8/Q8 KV scales (2026-09-21)
 
 Q8 K/V cache scales now use the same rounded FP16 contract as the stored

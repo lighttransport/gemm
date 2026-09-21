@@ -34,6 +34,10 @@ The same bounded probe on native IQ2_XXS (`__launch_bounds__(256, 1)`) retained
 the 4K hash but measured 42.94 and 42.87 tok/s.  It was reverted; the mixed
 projection traffic remains the dominant open target.
 
+Native Q2_K was similarly tested with `__launch_bounds__(256, 1)`.  The 4K
+random gate retained `1c891c2232aa1b7f`/`f44846dacf013e9e` at 42.91 tok/s,
+which did not exceed the control, so it was reverted.
+
 ## 2026-09-22 continuation: IQ1_M micro-tuning and fusion audit
 
 The default one-row IQ1_M F32 kernel now marks its output, weight and
