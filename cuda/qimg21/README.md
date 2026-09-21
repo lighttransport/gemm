@@ -959,14 +959,15 @@ unchanged. Artifacts are in `tmp/qimg21-edit-low-block17-v3`.
 
 The native `mma128-efficient` experiment mirrors the identified 128-key tile
 shape using one 69.6-KiB K/V shared-memory buffer. On the same exact block-17
-Q/K/V replay it reaches cosine **0.999999989349**, relative L2
-**1.45985e-4**, and **99.8146%** BF16 element equality. This is a useful local
+Q/K/V replay it reaches cosine **0.999999991281**, relative L2
+**1.32071e-4**, and **99.8283%** BF16 element equality after matching CUTLASS's
+pre-scaled score state and per-tile denominator reduction. This is a useful local
 advance but not an accepted full-model path: the best three-way dispatch
 (forward text, reverse-64 masked image prefix, forward-128 target) scores
-predictions **0.999944932 / 0.999860399** and trajectories
-**0.999926538 / 0.999927020**. It remains explicit and experimental while the
+predictions **0.999946048 / 0.999853441** and trajectories
+**0.999927566 / 0.999928472**. It remains explicit and experimental while the
 strict non-quantized gate is 0.99996. Artifact:
-`tmp/qimg21-edit-mma128-efficient-v3/results.json`.
+`tmp/qimg21-edit-mma128-cutlass-softmax/results.json`.
 
 Compare the replay without loading PyTorch or allocating GPU memory:
 

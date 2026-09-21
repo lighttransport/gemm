@@ -734,9 +734,10 @@ int main(int argc, char **argv) {
         size_t length=strlen(q21_mma64_src)+256;
         char *source=malloc(length);
         if(!source)return 1;
-        snprintf(source,length,"#define Q21_FLASH_SOFTMAX %d\n#define Q21_FORWARD_KEYS %d\n#define Q21_BKV %d\n#define Q21_SINGLE_BUFFER %d\n%s",
+        snprintf(source,length,"#define Q21_FLASH_SOFTMAX %d\n#define Q21_FORWARD_KEYS %d\n#define Q21_BKV %d\n#define Q21_SINGLE_BUFFER %d\n#define Q21_PRE_SCALE_SCORES %d\n%s",
                  qimg21_attention_mma64>=2, qimg21_attention_mma64>=4,
-                 qimg21_attention_mma64==5?128:64, qimg21_attention_mma64==5, q21_mma64_src);
+                 qimg21_attention_mma64==5?128:64, qimg21_attention_mma64==5,
+                 qimg21_attention_mma64==5, q21_mma64_src);
         int compiled=cu_compile_kernels(&mma_module,r->device,source,"qimg21_mma64.cu",verbose,"qimg21_mma64");
         free(source);
         if(compiled<0 || cuModuleGetFunction(&k.mma_attention,mma_module,"q21_flash_reverse64") ||

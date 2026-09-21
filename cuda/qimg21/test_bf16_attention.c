@@ -40,7 +40,7 @@ int main(int argc, char **argv) {
         int forward=!strcmp(argv[4],"--forward64") || !strcmp(argv[4],"--forward64-flash") ||
                     !strcmp(argv[4],"--forward64-flash-raw") || !strcmp(argv[4],"--forward128-efficient");
         int efficient=!strcmp(argv[4],"--forward128-efficient");
-        snprintf(source,strlen(q21_mma64_src)+256,"#define Q21_FLASH_SOFTMAX %d\n#define Q21_FORWARD_KEYS %d\n#define Q21_BKV %d\n#define Q21_SINGLE_BUFFER %d\n%s",flash,forward,efficient?128:64,efficient,q21_mma64_src);
+        snprintf(source,strlen(q21_mma64_src)+256,"#define Q21_FLASH_SOFTMAX %d\n#define Q21_FORWARD_KEYS %d\n#define Q21_BKV %d\n#define Q21_SINGLE_BUFFER %d\n#define Q21_PRE_SCALE_SCORES %d\n%s",flash,forward,efficient?128:64,efficient,efficient,q21_mma64_src);
         int compiled=cu_compile_kernels(&mma_module,r->device,source,"qimg21_mma64.cu",1,"qimg21_mma64");
         free(source);
         if(compiled<0 ||
