@@ -34,8 +34,8 @@ tmp/qimg21-ref-venv/bin/python cuda/qimg21/compare.py \
 checkpoint must reach cosine `>= 0.99996` for the non-quantized BF16/FP16
 weights. It exits non-zero on a missing checkpoint, shape mismatch, non-finite
 value, or threshold failure. For a quantized experiment, pass `--quantized`;
-that selects the provisional `0.995` gate until a quantizer-specific
-calibration set establishes a tighter measured threshold. Use
+that selects the measured row-INT8 `0.999` gate described below. Other
+quantizers require their own calibration. Use
 `--cosine-threshold X` to record an explicit threshold in benchmark logs.
 The regression driver also records `initial_latents.npy`, preserving the exact
 PyTorch-packed noise input for native denoiser comparisons.
@@ -63,9 +63,9 @@ Missing/invalid matrices fail rather than silently falling back to BF16.
 CPU tests compare native reconstruction bit-for-bit with PyTorch BF16 and
 reject invalid scales, shapes, and payloads:
 `make -C cuda/qimg21 test_quant_weights && tmp/qimg21-ref-venv/bin/python cuda/qimg21/test_quant_weights.py`.
-Full-checkpoint export, GPU model parity, image quality, and quantizer-specific
-threshold calibration remain unverified. The `0.995` quantized model-output
-gate is still provisional, not measured acceptance. The regression driver
+Full-checkpoint export and broad image-quality validation remain unverified.
+Streamed row-INT8 GPU calibration establishes a `0.999` model-output gate
+on the bounded matrix below. The regression driver
 selects it only when an actual quantized package or quantize-on-load mode is supplied; `--quantized`
 alone cannot relabel a BF16 run as a quantized experiment.
 
@@ -80,10 +80,42 @@ re-quantized on each load. Package export checks available disk space before
 creating its output directory. On the saved 256x256/seed42 matched-input
 fixture, streamed INT8 denoiser cosine is **0.9995792302** at the low timestep
 and **0.9999601303** at timestep 1, with finite outputs (relative L2 0.02904
-and 0.00896). Both clear the provisional 0.995 gate. A tighter 0.999 candidate
-gate is being tested on additional seeds/resolutions; these first two cases
-alone do not establish calibration or image quality. Full exported-model GPU
+and 0.00896). Both clear the measured 0.999 gate. Full exported-model GPU
 loading remains untested because the workspace lacks space for the copy.
+
+The additional calibration matrix passed all eight matched-input predictions
+and eight free-running trajectory checkpoints, all finite:
+
+| Case | Minimum prediction cosine | Maximum prediction relative L2 | Minimum trajectory cosine |
+| --- | ---: | ---: | ---: |
+| 256x256, 2 steps, seed 7 | 0.999476820 | 0.032350584 | 0.999919228 |
+| 256x512, 2 steps, seed 123 | 0.999172219 | 0.040695879 | 0.999931849 |
+| 512x512, 4 steps, seed 42 | 0.999486525 | 0.032055460 | 0.999937582 |
+
+```sh
+OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=1 tmp/qimg21-ref-venv/bin/python cuda/qimg21/regression.py \
+  --native --model /mnt/nvme01/models/qimg-21 --quantize-on-load int8-row \
+  --cosine-threshold 0.999 --case 256x256:2:7 --case 256x512:2:123 \
+  --case 512x512:4:42 --work-dir tmp/qimg21-int8-calibration
+```
+
+This supports a row-INT8 gate with margin below the measured minimum; it does
+not establish 40-step quality, editing, CFG, or other quantization schemes.
+`quant_quality.py` decodes paired final latents with the same validated native
+F32 VAE, saves reference/quantized PNGs, and reports RGB error for visual review.
+For the 512x512/four-step seed42 pair, both decoded images are finite: RGB
+cosine **0.999994245**, MAE **0.00162609** on [0,1], PSNR **50.62 dB**,
+alpha MAE **0.0000219955**. Visual review found the same red apple and white
+background without an obvious quantization-specific artifact. Both are soft
+four-step outputs, so this is not evidence of production 40-step image quality.
+
+```sh
+OMP_NUM_THREADS=2 tmp/qimg21-ref-venv/bin/python cuda/qimg21/quant_quality.py \
+  --model /mnt/nvme01/models/qimg-21 --height 512 --width 512 \
+  --reference-latents tmp/qimg21-int8-calibration/512x512-s4-seed42/reference/step_003.npy \
+  --quantized-latents tmp/qimg21-int8-calibration/512x512-s4-seed42/native/trajectory/final_latents.npy \
+  --out-dir tmp/qimg21-int8-quality-512-v2
+```
 
 Current native BF16 arithmetic explicitly rounds the text projection before
 GELU and Q/K normalization before multiplication by the learned RMS weights.
@@ -286,8 +318,9 @@ OMP_NUM_THREADS=2 tmp/qimg21-ref-venv/bin/python cuda/qimg21/editing_kernel_regr
 
 The harness checks exact scatter and applies the 0.99996 gate to RoPE and
 attention against official Diffusers metadata/RoPE and PyTorch math. Host
-build and sm_120 NVRTC compilation pass; GPU comparison is queued and remains
-unverified. Passing this synthetic test would not establish model editing
+build and sm_120 NVRTC compilation pass. The RTX 5060 Ti synthetic GPU run
+passed with bit-exact scatter, Q/K RoPE, and attention versus the reference.
+This synthetic test does not establish model editing
 parity or implement the still-missing conditioning pipeline.
 
 For native text-encoder bring-up, `test_cuda_qimg21.py --test-text
@@ -405,9 +438,9 @@ tmp/qimg21-ref-venv/bin/python cuda/qimg21/test_cuda_qimg21.py \
 
 Editing remains a Python baseline: native condition-image tokens and the VAE
 image-conditioning hand-off still need to be ported and accepted against the
-same checkpoint gate. Quantized native weights likewise remain a separate
-calibration task; use the provisional `--quantized` comparator threshold until
-that work is measured.
+same checkpoint gate. Row-INT8 native weights now have bounded text-to-image
+calibration at the separate `0.999` gate above; quantized editing remains
+unvalidated.
 
 ## Native transformer step
 

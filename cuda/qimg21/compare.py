@@ -13,10 +13,11 @@ from PIL import Image
 
 
 NONQUANTIZED_COSINE_THRESHOLD = 0.99996
-# Quantization error depends on the quantizer and calibration set.  Keep this
-# as a deliberately explicit provisional gate instead of pretending that the
-# non-quantized threshold applies unchanged to reduced-precision weights.
-QUANTIZED_COSINE_THRESHOLD = 0.995
+# Measured for symmetric row-INT8 -> BF16 on three seeds/resolutions, eight
+# matched predictions and eight trajectory checkpoints. Minimum prediction
+# cosine 0.999172219, maximum relative L2 0.040695879. Other quantizers require
+# their own calibration; this is not the original-weight acceptance gate.
+QUANTIZED_COSINE_THRESHOLD = 0.999
 
 
 def _step_path(directory: Path, name: str) -> Path:
@@ -70,7 +71,7 @@ def main() -> int:
     ap.add_argument(
         "--quantized",
         action="store_true",
-        help=f"use the provisional quantized cosine gate ({QUANTIZED_COSINE_THRESHOLD:.6f})",
+        help=f"use the calibrated row-INT8 cosine gate ({QUANTIZED_COSINE_THRESHOLD:.6f})",
     )
     ap.add_argument(
         "--cosine-threshold",
