@@ -883,6 +883,16 @@ reverse-Flash after blocks 8, 16, or 24. Low-prediction cosines were
 reverse MMA64 at 0.999881718. The switch implementation was removed; artifacts
 are `tmp/qimg21-edit-hybrid-cut{8,16,24}-low`.
 
+Forward/reverse output blending was also evaluated on exact Q/K/V captures at
+blocks 0, 17, and 31. Least-squares forward weights were 0.918, 0.803, and
+0.860, and improved local target-attention relative L2 versus forward alone.
+A native dual-kernel 0.875 blend improved the full low prediction only from
+0.999881718 to **0.999887621**; a 0.5 blend fell to **0.999870922**. This is
+far short of 0.99995 while doubling image-attention work and adding an extra
+activation buffer, so the blend mode was removed. Artifacts:
+`tmp/qimg21-edit-low-block{0,31}`, `tmp/qimg21-edit-blend-low`, and
+`tmp/qimg21-edit-blend-half-low`.
+
 ### Revised-gate true-CFG editing status
 
 A fresh scale-4 two-step editing run with forward-Flash, vector4 LayerNorm and
