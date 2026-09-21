@@ -112,7 +112,7 @@ def main() -> int:
         raise SystemExit("height and width must be divisible by 32")
     if args.steps < 1 or args.steps > 100:
         raise SystemExit("steps must be between 1 and 100")
-    if args.negative_prompt and args.true_cfg_scale <= 1.0:
+    if args.negative_prompt is not None and args.true_cfg_scale <= 1.0:
         raise SystemExit("--true-cfg-scale must be > 1 when --negative-prompt is used")
     if args.image:
         raise SystemExit("native image conditioning is not yet supported; use test_cuda_qimg21.py for editing")
@@ -140,7 +140,7 @@ def main() -> int:
             "--out",
             str(prompt_dir / "text_smoke.png"),
         ]
-    if args.negative_prompt:
+    if args.negative_prompt is not None:
         text_command.extend(["--negative-prompt", args.negative_prompt])
     _run(text_command, cwd=root)
     prompt_path = prompt_dir / "prompt_embeds.npy"
@@ -195,7 +195,7 @@ def main() -> int:
             "--out",
             str(native_latents),
         ]
-    if args.negative_prompt:
+    if args.negative_prompt is not None:
         native_command.extend([
             "--negative-prompt-embeds",
             str(prompt_dir / "negative_prompt_embeds.npy"),

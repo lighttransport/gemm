@@ -107,8 +107,10 @@ def main() -> int:
     model = Path(args.model).resolve()
     if not model.is_dir():
         raise SystemExit(f"model directory does not exist: {model}")
-    if args.native and (args.image or args.true_cfg_scale != 1.0):
-        raise SystemExit("--native currently supports text-to-image/no-guidance fixtures only")
+    if args.native and args.image:
+        raise SystemExit("--native image conditioning is not implemented yet")
+    if args.native and ((args.negative_prompt is not None) != (args.true_cfg_scale > 1.0)):
+        raise SystemExit("native true CFG requires --negative-prompt and --true-cfg-scale > 1 together")
     if args.native and args.dtype != "bf16":
         raise SystemExit("the native runner currently implements BF16 activation boundaries only")
     work = Path(args.work_dir)
@@ -168,6 +170,10 @@ def main() -> int:
             _run(reference_command, root)
             if args.native:
                 run_dir.mkdir(parents=True, exist_ok=True)
+                guidance = []
+                if args.negative_prompt is not None:
+                    guidance = ["--negative-prompt-embeds", str(ref_dir / "negative_prompt_embeds.npy"),
+                                "--guidance-scale", str(args.true_cfg_scale)]
                 fallback_sigmas = _flow_sigmas(case.steps, (case.height // 16) * (case.width // 16))
                 timesteps = []
                 for step, fallback in enumerate(fallback_sigmas):
@@ -181,6 +187,7 @@ def main() -> int:
                     _run(
                         [
                             str(native_bin),
+                            *guidance,
                             "--model",
                             str(model),
                             "--prompt-embeds",
@@ -210,7 +217,7 @@ def main() -> int:
                 trajectory_dir = run_dir / "trajectory"
                 trajectory_dir.mkdir(parents=True, exist_ok=True)
                 _run([
-                    str(native_bin), "--model", str(model),
+                    str(native_bin), *guidance, "--model", str(model),
                     "--prompt-embeds", str(ref_dir / "prompt_embeds.npy"),
                     "--latents", str(ref_dir / "initial_latents.npy"),
                     "--height-tokens", str(case.height // 16),

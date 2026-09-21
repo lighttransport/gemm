@@ -57,21 +57,33 @@ def main() -> int:
     if pred_dir:
         pred_dir.mkdir(parents=True, exist_ok=True)
     pred_index = [0]
+    use_cfg = args.negative_prompt is not None and args.true_cfg_scale > 1.0
+    conditional_prediction = [None]
     if pred_dir:
         def dump_timestep(_module, _inputs, kwargs):
+            step = pred_index[0] // 2 if use_cfg else pred_index[0]
+            is_negative = use_cfg and pred_index[0] % 2 == 1
+            embeds = kwargs.get("encoder_hidden_states")
+            if step == 0 and embeds is not None:
+                name = "negative_prompt_embeds.npy" if is_negative else "prompt_embeds.npy"
+                np.save(out / name, embeds.detach().float().cpu().numpy())
+            if is_negative:
+                return
             value = kwargs.get("timestep")
             if value is not None:
                 np.save(
-                    pred_dir / f"timestep_{pred_index[0]:03d}.npy",
+                    pred_dir / f"timestep_{step:03d}.npy",
                     np.ascontiguousarray(value.detach().float().cpu().numpy()),
                 )
 
         def dump_input(_module, inputs):
+            if use_cfg and pred_index[0] % 2:
+                return
             if not inputs:
                 return
             value = inputs[0]
             np.save(
-                pred_dir / f"input_{pred_index[0]:03d}.npy",
+                pred_dir / f"input_{pred_index[0] // 2 if use_cfg else pred_index[0]:03d}.npy",
                 np.ascontiguousarray(value.detach().float().cpu().numpy()),
             )
 
@@ -79,8 +91,20 @@ def main() -> int:
             value = output[0] if isinstance(output, tuple) else output
             target_tokens = (args.height // 16) * (args.width // 16)
             value = value[:, -target_tokens:]
+            step = pred_index[0] // 2 if use_cfg else pred_index[0]
+            if use_cfg:
+                branch = "negative" if pred_index[0] % 2 else "positive"
+                np.save(pred_dir / f"{branch}_{step:03d}.npy", value.detach().float().cpu().numpy())
+                if pred_index[0] % 2 == 0:
+                    conditional_prediction[0] = value.detach().clone()
+                    pred_index[0] += 1
+                    return
+                # Keep the arithmetic on the same device and dtype as the
+                # pipeline, including the BF16 intermediate boundaries.
+                value = value + args.true_cfg_scale * (conditional_prediction[0] - value)
+                conditional_prediction[0] = None
             np.save(
-                pred_dir / f"pred_{pred_index[0]:03d}.npy",
+                pred_dir / f"pred_{step:03d}.npy",
                 np.ascontiguousarray(value.detach().float().cpu().numpy()),
             )
             pred_index[0] += 1
@@ -139,6 +163,9 @@ def main() -> int:
     (out / "run.json").write_text(json.dumps({
         "model": str(Path(args.model).resolve()),
         "prompt": args.prompt,
+        "negative_prompt": args.negative_prompt,
+        "true_cfg_scale": args.true_cfg_scale,
+        "use_true_cfg": use_cfg,
         "height": args.height,
         "width": args.width,
         "steps": args.steps,

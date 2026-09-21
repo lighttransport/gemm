@@ -151,6 +151,24 @@ the case. Native mode requires BF16 activation boundaries. Intermediate
 files from isolated denoiser replays are not trajectory checkpoints; the
 actual free-running sequence is saved under `native/trajectory/`.
 
+Native true-CFG regression uses an explicit negative prompt (including an
+empty string) and scale greater than one:
+
+```sh
+tmp/qimg21-ref-venv/bin/python cuda/qimg21/regression.py \
+  --native --model /mnt/nvme01/models/qimg-21 --case 256x256:2:42 \
+  --negative-prompt "" --true-cfg-scale 3 \
+  --work-dir tmp/qimg21-cfg-regression
+```
+
+The reference records positive and negative branches separately, plus one
+combined `pred_NNN.npy` per scheduler step using the pipeline's BF16 CFG
+arithmetic. Native replay receives both embedding fixtures. Fixture indexing
+and empty-negative-prompt handling have a CPU-only test:
+`tmp/qimg21-ref-venv/bin/python cuda/qimg21/test_reference_capture.py`.
+That bookkeeping test is not model parity evidence; the CUDA CFG regression
+still needs to meet both numerical gates.
+
 The native path is batch-1 text-to-image. It accepts either the model’s
 recommended no-guidance path or a second negative embedding fixture for true
 CFG; the latter runs two native denoiser passes per step and applies the same
