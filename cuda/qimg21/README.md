@@ -1228,8 +1228,8 @@ refactor also passes at cosine 0.999999999347549 (128x128/seed17).
 
 CPU input guards reject wrong channel counts, unsupported dimensions,
 non-finite pixels and out-of-range pixels before CUDA initialization; the
-CPU suite is now 35/35 passing. Full-pipeline peak VRAM and end-to-end editing
-parity remain unverified.
+CPU suite is now 35/35 passing. End-to-end editing parity remains unverified;
+the process-isolated 1024-square pipeline memory measurement is below.
 The initial downsampler computes a full convolution then samples odd spatial
 positions; it is correct but not yet optimized as a stride-2 convolution.
 
@@ -1315,8 +1315,29 @@ time including the Python text encoder, native BF16 denoiser (default `math`
 attention), and native F32 VAE; it is not denoiser-only timing. Maximum host
 RSS was 18,612,956 KiB, with zero swaps. CPU development/tests ran concurrently
 on the host, but no other GPU workload overlapped this run. One mid-denoising
-GPU snapshot showed 6,019 MiB used; this was **not** a peak-VRAM measurement
-and does not establish a hard 12 GiB limit for the entire pipeline.
+GPU snapshot showed 6,019 MiB used; this was not a peak measurement.
+
+A subsequent one-step 1024x1024 run sampled per-process GPU memory every 50 ms,
+with the sampler active before orchestration launch. Observed maxima were:
+
+| Stage (separate process) | Samples | Maximum MiB |
+| --- | ---: | ---: |
+| Python text/vision helper | 238 | 1,422 |
+| PyTorch noise-fixture helper | 12 | 158 |
+| Native BF16 denoiser | 1,262 | 1,948 |
+| Native F32 decoder | 908 | 3,112 |
+
+No pipeline stages overlap by design, so the largest observed stage is
+**3,112 MiB**, comfortably under the requested ~12 GB limit. The complete run
+finished in **2m 17.24s**, with finite `[4096,64]` step/final latents, finite
+`[4,1024,1024]` decoded pixels, and a 1024x1024 RGBA output. The native-only
+denoiser was also measured separately from pre-launch through exit: 1,343
+samples, **1,948 MiB** maximum, 69.78 seconds, 14,419,764 KiB host RSS and zero
+swaps. Artifacts are `tmp/qimg21-native-1024-memory{.csv,-run}` and
+`tmp/qimg21-native-1024-pipeline-memory.csv` plus
+`tmp/qimg21-native-1024-memory-pipeline`. These are dense sampled observations,
+not an allocator-enforced hard cap; the earlier successful 40-step run provides
+the long-run stability evidence.
 
 All 40 saved `[4096,64]` latent checkpoints are finite. The decoded
 `[4,1024,1024]` tensor is finite and within `[-1,1]`; the saved image is a
