@@ -41,5 +41,8 @@ static const char qwen35_attention_q8_gate_source[] =
 "        value = numerator / denominator;\n"
 "    }\n"
 "    float g = gate[head * 256 + tid];\n"
-"    out[head * 256 + tid] = value * (1.0f / (1.0f + expf(-g)));\n"
+"    /* This module is compiled with precise math so split-combine retains\n"
+"     * the native Q8 attention contract.  The standalone sigmoid kernel is\n"
+"     * compiled with fast math, whose expf maps to the native intrinsic. */\n"
+"    out[head * 256 + tid] = value * (1.0f / (1.0f + __expf(-g)));\n"
 "}\n";

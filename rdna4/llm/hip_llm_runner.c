@@ -3114,7 +3114,7 @@ static const char *hip_kernel_source =
 "    int h = i % dt_rank;\n"
 "    float x = alpha[i] + bias[h];\n"
 "    float sp = (x > 20.0f) ? x : logf(1.0f + expf(x));\n"
-"    alpha[i] = sp * a[h];\n"
+"    alpha[i] = expf(sp * a[h]);\n"
 "    beta[i] = 1.0f / (1.0f + expf(-beta[i]));\n"
 "}\n"
 "\n"
@@ -17948,7 +17948,7 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
                   r->q8_attention_module, "qwen35_attention_q8_combine"));
         if (hip_compile_kernels_ex(&r->q8_gate_module, r->device,
                 qwen35_attention_q8_gate_source, "qwen35_attention_q8_gate.hip",
-                r->verbose, "qwen35_attention_q8_gate", 0) <= 0) return -1;
+                r->verbose, "qwen35_attention_q8_gate", 1) <= 0) return -1;
         CHECK_HIP(hipModuleGetFunction(&r->fn_q8_attention_combine_gate,
                   r->q8_gate_module, "qwen35_attention_q8_combine_gate"));
         if (hip_compile_kernels_ex(&r->q8_prefill_module, r->device,
