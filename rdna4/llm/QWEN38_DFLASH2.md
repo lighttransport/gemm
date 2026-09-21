@@ -452,6 +452,10 @@ reflects the remaining measured costs.
    being treated as portable-cache validation.
    Batched verifier SSM alpha/beta preparation now uses one elementwise launch
    for softplus/scale and sigmoid, with exact llama.cpp hashes preserved.
+   A verifier-only eight-row combine kernel was also tested against the
+   random-token 64K gate.  It remained exact but measured 28.52 tok/s versus
+   the retained 28.82 tok/s dense-MTP control, so the generic captured combine
+   remains in production.
 4. **Kernel and graph count.** Q/gate deinterleave, QK normalization, RoPE,
    Q8/Q8 KV storage, SSM alpha/beta preparation, and IQ1_M verifier embedding
    are now fused or batched exactly. Profile again before joining another
