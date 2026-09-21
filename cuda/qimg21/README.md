@@ -476,6 +476,29 @@ supporting both ordinary and editing layouts without Python at runtime.
 Full low-timestep cosine is **0.999954723**, still failing 0.99996. Defaults
 remain unchanged; isolated rotary improvement is not model acceptance.
 
+The denoiser text projection now uses ordered cubic evaluation and a
+double-evaluated tanh rounded to F32 before the BF16 activation boundary.
+This matches all four isolated stages (zero-centered RMSNorm, input GEMM,
+GELU, output GEMM) bit-for-bit with PyTorch on the saved 15-token fixture.
+The earlier fast GELU differed in 3,002 values, propagating to 5,896 output
+projection mismatches. The full low-timestep cosine improves from 0.999955009
+to **0.999955965**, but still **fails** 0.99996. This fixes a demonstrated
+operator discrepancy; it does not close model acceptance.
+
+```sh
+make -C cuda/qimg21 test_text_projection
+cuda/qimg21/test_text_projection /mnt/nvme01/models/qimg-21 \
+  tmp/qimg21-batch2-low/txt_input.npy NEW_PROJECTION_DIR
+OMP_NUM_THREADS=2 tmp/qimg21-ref-venv/bin/python cuda/qimg21/text_projection_probe.py \
+  --model /mnt/nvme01/models/qimg-21 --input tmp/qimg21-batch2-low/txt_input.npy \
+  --native-dir NEW_PROJECTION_DIR
+```
+
+The C replay accepts `--legacy-gelu` for the previous arithmetic. It tests
+the denoiser's projection, not the separate Qwen3-VL text encoder. The prior
+host-table/vector-normalization/MMA64 combination (before this GELU fix)
+completed at cosine 0.999952815 and did not meet acceptance either.
+
 Compare the replay without loading PyTorch or allocating GPU memory:
 
 ```sh

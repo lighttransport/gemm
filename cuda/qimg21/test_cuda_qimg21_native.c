@@ -270,6 +270,7 @@ static const char *qimg21_src =
 "extern \"C\" {\n"
 "__global__ void zero_rms(float* y,const float* x,const float* w,int N,int D,float eps){int t=blockIdx.x, i=threadIdx.x; extern __shared__ float s[]; float z=0; for(int j=i;j<D;j+=blockDim.x){float v=x[t*D+j];z+=v*v;} s[i]=z; __syncthreads(); for(int q=blockDim.x/2;q;q>>=1){if(i<q)s[i]+=s[i+q];__syncthreads();} float inv=rsqrtf(s[0]/D+eps); for(int j=i;j<D;j+=blockDim.x)y[t*D+j]=x[t*D+j]*inv*(w[j]+1.f);}\n"
 "__global__ void gelu_tanh(float*x,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){float v=x[i];x[i]=.5f*v*(1.f+tanhf(0.7978845608f*(v+0.044715f*v*v*v)));}}\n"
+"__global__ void gelu_tanh_ordered(float*x,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){float v=x[i],cube=v*v*v,inner=0.7978845608f*fmaf(0.044715f,cube,v);float t=(float)tanh((double)inner);x[i]=(.5f*v)*(1.f+t);}}\n"
 "__global__ void silu(float*x,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){float v=x[i];x[i]=v/(1.f+expf(-v));}}\n"
 "__global__ void round_bf16(float*x,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){unsigned u=__float_as_uint(x[i]);unsigned l=(u>>16)&1u;u=(u+0x7fffu+l)&0xffff0000u;x[i]=__uint_as_float(u);}}\n"
 "__global__ void mul_silu(float*y,const float*a,const float*b,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){float v=a[i];y[i]=(v/(1.f+expf(-v)))*b[i];}}\n"
@@ -329,7 +330,7 @@ static int get_kernel(qimg21_kernels *k, CUmodule m) {
     k->table_rope = NULL;
     k->norm_threads = 256;
     return cuModuleGetFunction(&k->zero_rms, m, "zero_rms") ||
-           cuModuleGetFunction(&k->gelu, m, "gelu_tanh") ||
+           cuModuleGetFunction(&k->gelu, m, "gelu_tanh_ordered") ||
            cuModuleGetFunction(&k->silu, m, "silu") ||
            cuModuleGetFunction(&k->round_bf16, m, "round_bf16") ||
            cuModuleGetFunction(&k->mul_silu, m, "mul_silu_bf16") ||

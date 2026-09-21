@@ -48,6 +48,10 @@ test_rotary_arithmetic: test_rotary_arithmetic.c test_cuda_qimg21_native.c ../..
 	$(CC) -O2 -std=c11 -D_GNU_SOURCE -Wall -Wextra -I../../common -I../../cuda -I../qimg \
 		-o $@ test_rotary_arithmetic.c ../../cuda/cuew.c ../../cuda/cublasew.c -ldl -lm -lpthread
 
+test_text_projection: test_text_projection.c test_cuda_qimg21_native.c ../../cuda/cuew.c ../../cuda/cublasew.c
+	$(CC) -O2 -std=c11 -D_GNU_SOURCE -Wall -Wextra -I../../common -I../../cuda -I../qimg \
+		-o $@ test_text_projection.c ../../cuda/cuew.c ../../cuda/cublasew.c -ldl -lm -lpthread
+
 test_scheduler: test_scheduler.c test_cuda_qimg21_native.c ../../cuda/cuew.c ../../cuda/cublasew.c
 	$(CC) -O2 -std=c11 -D_GNU_SOURCE -Wall -Wextra -I../../common -I../../cuda -I../qimg \
 		-o $@ test_scheduler.c ../../cuda/cuew.c ../../cuda/cublasew.c -ldl -lm -lpthread
