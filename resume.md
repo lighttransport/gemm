@@ -96,11 +96,16 @@ and 10,000 randomized cases. Zero-depth ordinary decode remains effectively
 flat at 42.53--42.65 tok/s; the 4K sampled exact-target path now clears 40
 tok/s. Artifacts: `tmp/qwen38/dflash2-qkprep-{k4,k7}/`.
 
-After a fully processed 65,536-token random prefix, DFlash K=7 now sustains
-**49.74 tok/s** for a 256-token suffix. The prefix sustains 443.57 tok/s and
-has hash `90178de69a24a76e`; the suffix retains hash `2ddd068dca63669a`.
-It drafted 259 tokens, accepted 217, and spent 474.117/4585.996/56.181 ms in
-draft/verify/commit.  This meets the random-depth 40 tok/s goal.  Ordinary
+The historical fixed-eight-split DFlash K=7 path sustained 49.74 tok/s after a
+fully processed 65,536-token random prefix, with suffix hash
+`2ddd068dca63669a`.  That run predates exact per-query adaptive split
+selection and is not the current output oracle.  The current generic exact
+baseline is 33.25 tok/s.  A dedicated captured shared-K/V graph is now chosen
+only when every adjacent row has the same adaptive split count; selector
+boundaries use the generic per-query graph.  This raises exact random-64K
+decode to 39.89--39.93 tok/s while retaining prefix hash
+`90178de69a24a76e`, current suffix hash `1c68ea2ff63ba5ab`, and 289 drafted / 213
+accepted tokens.  Prefix processing remains 443.45--444.22 tok/s.  Ordinary
 scalar decode now stages the IQ2_XXS, IQ2_XS and IQ3_XXS codebooks in LDS. A
 512-token zero-depth run sustains 41.90--42.03 tok/s with unchanged hash
 `c08c332d32a63532`. The exact three-head attention kernel now computes each
@@ -167,14 +172,47 @@ run keeps prefix/suffix hashes `90178de69a24a76e`/`f4b35758fb99e6db` and
 measures 441.44 tok/s prefill plus 34.98 tok/s ordinary decode. Use
 `LLM_QWEN35_IQ_SHAPE_THREADS=0` only for the eight-wave diagnostic fallback.
 
-Prioritize ordinary one-row target projection traffic first, followed by an
-exact in-kernel combine for the long-context verifier attention tail and
-fusion of the remaining activation/state-preparation launches.
-The shared-K/V attention path already uses the ordinary adaptive split policy.
-DFlash prompt feature capture and
-sidecar-cache injection are secondary prefill targets now that both 4K and
-random 64K prefill clear their goals.  Detailed priorities and validation
-gates are in the linked DFlash2 document.
+The latest verifier pass batches the target's IQ1_M token embeddings into one
+two-dimensional launch and publishes accepted convolution plus recurrent
+checkpoints with one kernel across all recurrent layers.  K=4 and K=7 retain
+the pinned greedy sequence hash `44915ec1039a64c8`; the seeded-sampled gate
+retains sequence hash `630b7cbc72230e0d`, output SHA-256
+`ddd1752b6c2a44251b659516b5937fdaa0e84f464530607e493abf8bbc37c9ac`,
+and token SHA-256
+`fb7d8aeda396cdba5dd65b492a396ed3f91ae4312ea0a52d77be86355b4c7ee0`.
+K=7 measures 81.20 tok/s in the post-change exact gate; the three warm
+embedding-batch runs measured 81.42--82.49 tok/s.
+
+Prompt feature capture now shares the tapped layer's exact RMSNorm kernel,
+removing one standalone capture launch at each of the five taps.  The pinned
+4K response stays byte-identical and measures 536.17 tok/s cold,
+610.86--612.05 tok/s warm, and 81.12--82.37 tok/s decode.  A fully processed
+65,536-token random prefix retained hash `90178de69a24a76e` at 444.17 tok/s,
+so the fusion does not reduce the long-context prefill result.
+
+Two broader experiments were rejected.  Extending the generic native
+attention kernel ABI for an in-kernel verifier combine caused a graph-time GPU
+fault even when its new body was disabled; a future attempt must use a
+separate verifier-only kernel.  Skipping the final recurrent checkpoint copy
+when every verifier row was processed diverged after 26 generated tokens,
+because the live recurrent state is deliberately left at the transaction
+origin.  The exact checkpoint publication stays in place.
+
+The exact long-context verifier now owns separate captured graphs for
+equal-split and selector-boundary windows.  The shared-K/V graph runs only
+when all adjacent causal rows select the same ordinary adaptive split count;
+otherwise the generic per-query graph remains authoritative.  At random-64K
+depth this raises decode from 33.25 to 39.89--39.93 tok/s while preserving
+prefix/suffix hashes `90178de69a24a76e`/`1c68ea2ff63ba5ab`, 289 drafted / 213
+accepted tokens, and 443.45--444.22 tok/s prefill.  The 4K K=7 gate retains
+82.67 tok/s greedy and 66.46 tok/s sampled with trace I/O; K=4 retains the
+greedy hash at 59.75 tok/s.  The sampled output, token, and full-logit SHA-256
+values remain pinned.
+
+Device-guard dual launches, fixed split pinning, shared combine scales, a
+one-wave combine, and fused draft/verify synchronization were all measured
+and rejected.  They were exact, but none beat the selected-graph result.  The
+remaining 64K gap to 40 tok/s is about 0.2%.
 
 Remaining optimization items, in measured priority order:
 
@@ -183,21 +221,18 @@ Remaining optimization items, in measured priority order:
    evaluate exact grouped or multi-row mixed-type kernels with shared
    activation staging and codebook layout changes.
 2. Fuse the long-context verifier attention split/combine tail while keeping
-   the pinned logits and sampled output bit-identical.
-3. Batch exact SSM recurrence updates and reduce checkpoint/rollback copies;
-   revalidate K=4/K=7 acceptance, retrieval, and random 64K hashes.
-4. Fuse remaining verifier preparation launches where mixed-type grouping has
-   enough coverage to pay for its dispatch and synchronization cost.
-5. Move DFlash top-k/selector work and draft-cache overhead onto the GPU;
+   the pinned logits and sampled output bit-identical.  Equal-split windows
+   already use the dedicated captured shared-K/V graph; the remaining work is
+   the split-partial/combine boundary.  Keep it in a verifier-only kernel so
+   captured generic-decode graph ABIs remain stable.
+3. Move DFlash top-k/selector work and draft-cache overhead onto the GPU;
    K=7 already clears 60 tok/s, while K=4 remains below that target.
-6. Fuse prompt feature capture with target hidden writes and overlap sidecar
-   cache injection with the next prefill tile.  This is secondary because
-   4K/512 and random-64K prefill already exceed 400 tok/s.
-7. Revisit dense NextN/MTP scheduling; the current exact implementation is
+4. Overlap sidecar cache injection with the next target prefill tile.  The
+   capture half is complete.  Safe overlap first requires a per-stream
+   hipBLASLt plan/workspace because the target and sidecar currently share the
+   same shape-keyed workspace; concurrent use would race it.
+5. Revisit dense NextN/MTP scheduling; the current exact implementation is
    slower than ordinary decode and remains below 60 tok/s.
-8. Extend HTTP/stdio serving coverage to DFlash2 window transactions and
-   broaden long-context sampled and quality coverage once the performance work
-   stabilizes.
 
 The first serving step is now complete for the ordinary Qwen3.8 target, and
 the exact DFlash2 window transaction is now available through the same
@@ -215,8 +250,13 @@ Target prompt snapshots now include the DFlash sidecar's private recurrent K/V
 cache and target Q8 KV rows, so repeated short prompts restore target and draft
 state without replaying the prompt.  Long prompts above the bounded snapshot
 budget continue to replay for memory safety.
-The reproducible GPU gate is `test_qwen35_dflash2_http.py`; it checks greedy
-and seeded sampled repeatability plus a coherent C++ response.
+The reproducible GPU gate is `test_qwen35_dflash2_http.py`. It now drives the
+resident JSONL protocol directly before serving the same backend over HTTP.
+Both routes cover greedy and seeded-sampled repeatability, repeated cache
+reuse, cancellation after a real streamed DFlash token, deterministic
+recovery, and serialized concurrent-request isolation.  The short gate and a
+6,600-token actual long-prompt run pass; the long run also reuses the cached
+prompt for sampled generation and cancellation without replay.
 The sampled random-64K target gate now passes 32 suffix tokens with prefix hash
 `90178de69a24a76e`, suffix hash `34e2f6bc082bc49f`, and `Result: PASS` after a
 445.67 tok/s prefix.
@@ -320,12 +360,14 @@ tok/s after processing the same prefix at 443.44 tok/s; its hash is the
 retained `051e7338c23a544e`.
 The prior 27.94 tok/s result used zero cache values and is superseded.
 
-The optimized DFlash K=7 path processes the same random prefix in 147.747
-seconds at 443.57 tok/s, then sustains 49.74 tok/s for 256 tokens with suffix
-hash `2ddd068dca63669a`.  Its exact eight-query shared-K/V attention kernel
-takes 3.077 ms per layer at 64K, compared with 8.654 ms for the generic
-verifier at the same eight-split schedule.  DFlash therefore meets the 40
-tok/s random-depth target. Ordinary decode remains below 40 tok/s. Its exact
+The former fixed-eight-split DFlash K=7 path processed the same random prefix
+at 443.57 tok/s and reported 49.74 tok/s with suffix hash
+`2ddd068dca63669a`.  Exact per-query adaptive split selection supersedes that
+result.  The selected shared-K/V graph now preserves the current exact suffix
+`1c68ea2ff63ba5ab` and measures 39.89--39.93 tok/s after a 443.45--444.22
+tok/s prefix.  It restores most of the generic exact verifier's 33.25 tok/s,
+but the 40 tok/s random-depth target remains open by about 0.2%. Ordinary
+decode also remains below 40 tok/s. Its exact
 three-head K/V-reuse kernel cuts the 128-split attention operator from about
 606 to about 348 microseconds per layer after the grouped scale-product
 change, leaving about 5.6 ms/token in attention and
@@ -360,8 +402,8 @@ timing excludes trace I/O. Sampled mode uses temperature 0.6 and seed 42.
 | IQ3 / MTP K=3 / greedy | 33.76 | 572.32–573.07 |
 | IQ3 / MTP K=3 / sampled | 34.99–35.01 | 571.43–571.59 |
 
-**Ordinary 40 tok/s and dense NextN 60 tok/s remain unmet; DFlash2 now clears
-60 tok/s at 4K and 40 tok/s at random-token 64K depth.** Ordinary
+**Ordinary 40 tok/s and dense NextN 60 tok/s remain unmet; DFlash2 clears
+60 tok/s at 4K and reaches 39.89--39.93 tok/s at random-token 64K depth.** Ordinary
 greedy decode improved from 33.8 to 38.0 tok/s on IQ2 and 32.1 to 36.1 on
 IQ3 (about 12–13%). MTP is opt-in because this verified implementation is
 slower on the tested coding response. The next performance work belongs in

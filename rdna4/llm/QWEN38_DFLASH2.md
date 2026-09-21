@@ -66,8 +66,9 @@ replaying the prompt.  Long prompts fall back to replay to avoid multi-gigabyte
 host snapshots.
 
 The opt-in HTTP quality gate covers deterministic greedy and seeded sampled
-requests, repeated-request state isolation, disconnect cancellation followed
-by recovery, and coherent coding and non-coding responses:
+requests, direct stdio transactions, repeated-request state isolation,
+disconnect cancellation after a generated token followed by recovery, and
+concurrent request isolation:
 
 ```sh
 python3 rdna4/llm/test_qwen35_dflash2_http.py \
@@ -145,8 +146,7 @@ same prompt, but measured 16.54 tok/s versus its 25.88 tok/s ordinary path.
 The native K=4 implementation reproduces that acceptance exactly and is 3.29
 times as fast.  K=7 is 105 percent faster than the retained recent ordinary
 native baseline on this prompt.  DFlash prefill also clears the 500 tok/s
-target.  The feature remains opt-in while serving integration and broader
-quality coverage remain incomplete.
+target.  The feature remains opt-in.
 
 The optimized target verifier decodes IQ and Q2_K weights once for up to eight
 candidate rows.  Quantization-format-specific kernels remove runtime codebook
@@ -220,14 +220,22 @@ exact sampled window sustains 68.67--68.78 tok/s instead of the former
 shorter draft does less useful work per verifier launch and remains below the
 60 tok/s speculative target.
 
-The same K=7 path was measured after a fully processed 65,536-token random
-prefix. Prefix processing sustained 443.57 tok/s with hash
-`90178de69a24a76e`; the following 256 generated tokens sustained **49.74
-tok/s** with hash `2ddd068dca63669a`. It drafted 259 tokens and accepted 217.
-The draft/verify/commit split was 474.117/4585.996/56.181 ms. The final suffix
-hash is unchanged from the earlier exact verifier.  The fixed eight-split
-grouping can change rejected draft proposals at synthetic depth through
-floating-point grouping, but it does not change authoritative target output.
+The earlier fixed-eight-split K=7 path measured 49.74 tok/s after a fully
+processed 65,536-token random prefix, with suffix hash `2ddd068dca63669a`.
+That result predates exact per-query adaptive split selection and is retained
+only as a historical ceiling; it is not the current exact oracle.
+
+The current verifier chooses between two captured graphs.  When every
+adjacent causal row selects the same ordinary adaptive split count, the exact
+eight-query kernel loads each K/V row once.  At a split-selector boundary it
+uses the generic per-query grid.  This removes the fixed-eight arithmetic
+shortcut without launching a full generic grid merely to return.  On the
+random-64K gate, the generic exact baseline was 33.25 tok/s.  The selected
+shared-K/V graph sustains 39.89--39.93 tok/s, with 443.45--444.22 tok/s
+prefill, prefix hash `90178de69a24a76e`, and current exact suffix hash
+`1c68ea2ff63ba5ab`.  All runs drafted 289 tokens and accepted 213; the final
+draft/verify/commit range was 532.352--533.268 / 5818.192--5821.733 /
+60.532--62.229 ms.  The remaining measured gap to 40 tok/s is about 0.2%.
 
 The tested sidecar is
 `Qwen3.8-27B-DFlash2-Q4_K_M.gguf`, SHA-256
@@ -286,11 +294,53 @@ The authoritative 64K run keeps prefix/suffix hashes
 `90178de69a24a76e`/`f4b35758fb99e6db` at 441.44 prefill and 34.98 decode
 tok/s. `LLM_QWEN35_IQ_SHAPE_THREADS=0` restores the diagnostic fallback.
 
+The verifier now embeds all IQ1_M candidate tokens with one two-dimensional
+launch.  Accepted convolution and recurrent checkpoints are also published by
+one kernel across every recurrent layer, replacing the former pair of commit
+launches.  The post-change K=4/K=7 greedy gates retain sequence hash
+`44915ec1039a64c8`; seeded K=7 retains sequence hash `630b7cbc72230e0d` and
+the pinned output/token SHA-256 values.  K=7 measures 81.20 tok/s in the exact
+gate, while the three warm embedding-batch runs measured 81.42--82.49 tok/s.
+
+At each of the five target feature taps, capture now shares the existing exact
+RMSNorm reduction and output loop.  The 4K gate remains byte-identical and
+measures 536.17 tok/s cold, 610.86--612.05 tok/s warm, and 81.12--82.37 tok/s
+decode.  A complete 65,536-token random prefix retains hash
+`90178de69a24a76e` at 444.17 tok/s.  Overlapping sidecar injection with the
+next tile is not yet safe: the target and injection GEMMs can select the same
+shape-keyed hipBLASLt plan and workspace, so a second stream would race that
+workspace until plans become stream-specific.
+
+The real-GPU quality harness now runs the resident JSONL protocol directly and
+then exposes the same backend through HTTP.  It checks greedy and seeded
+sampling, three repeated cache hits, cancellation after a real streamed token,
+recovery, and two concurrent callers.  The short gate passes, and a
+6,600-token actual long prompt passes greedy and sampled reuse, active-window
+cancellation, recovery, and request isolation.
+
+Adaptive shared-K/V verifier graphs retain the complete pinned sampled trace:
+sequence hash `630b7cbc72230e0d`, output SHA-256
+`ddd1752b6c2a44251b659516b5937fdaa0e84f464530607e493abf8bbc37c9ac`,
+token SHA-256
+`fb7d8aeda396cdba5dd65b492a396ed3f91ae4312ea0a52d77be86355b4c7ee0`,
+and logits SHA-256
+`4b3489e92bcaf7f442b0f86722e88a5576cf7e16ea52193d73eecad12835ac3d`.
+The 4K K=7 gate measures 82.67 tok/s greedy and 66.46 tok/s sampled with
+trace I/O; K=4 remains exact at 59.75 tok/s.  A selector-boundary window uses
+the generic graph, so graph reuse never changes a row's split count.
+
+Three follow-up variants were rejected.  Device guards that launched both
+attention grids reached only 39.55 tok/s at 64K.  Pinning a captured graph's
+split count and sharing combine scales did not improve verifier time.  A
+one-wave combine and a fused draft/verify synchronization path were both
+byte-identical but slower on the traced 4K gate.  The retained graph selector
+is the only measured win.
+
 ## Remaining optimization opportunities
 
-The current 4K C++ gate sustains 68.67--68.78 tok/s for sampled K=7 and
-81.68--81.82 tok/s for greedy K=7, clearing the 60 tok/s target. DFlash also
-clears 40 tok/s after a real random-token 64K prefix. Ordinary one-token decode now
+The current 4K gate sustains 66.46 tok/s for traced sampled K=7 and 82.67
+tok/s for greedy K=7, clearing the 60 tok/s target.  DFlash reaches
+39.89--39.93 tok/s after a real random-token 64K prefix. Ordinary one-token decode now
 reaches 34.98 tok/s at 64K after exact GQA reuse, grouped K/Q scale products,
 packed-probability reuse and scalar IQ codebook staging, so work that helps
 both ordinary and verifier execution remains useful. The following order
@@ -316,15 +366,23 @@ reflects the remaining measured costs.
    output-token and logit validation because the current kernels preserve the
    target arithmetic order.
 2. **Verifier attention tail.** The query-grid verifier now selects ordinary
-   decode's split count independently for every causal row. It still writes
-   split partials for a second combine launch, and that shared-K/V pass
-   dominates the long-context verifier tail. Fuse the combine only if the
-   selected split count and packed-F16 accumulation order remain exact.
+   decode's split count independently for every causal row. Equal-split
+   windows now select a dedicated captured shared-K/V graph; split boundaries
+   select the generic graph. The kernel still writes split partials for a
+   second combine launch, and that pass dominates the long-context verifier
+   tail. A prototype that extended the
+   generic attention kernel ABI faulted under captured graph replay, even when
+   the new body was disabled.  Use a separate verifier-only kernel and fuse
+   the combine only if the selected split count and packed-F16 accumulation
+   order remain exact.
 3. **Hybrid recurrent tail.** Sequential candidate recurrence and rollback
    checkpoints are already batched and device-local. Alpha/beta F16 work now
-   shares one exact launch per recurrent layer. DeltaNet, state preparation,
-   checkpoint copies, and the remaining matrix-vector work remain visible;
-   fuse preparation with the recurrence where exact row rollback is retained.
+   shares one exact launch per recurrent layer, and convolution plus recurrent
+   state publication now shares one commit launch across all recurrent layers.
+   DeltaNet checkpoint writes and the remaining matrix-vector work remain
+   visible.  An attempted final-row copy elision changed target output after
+   26 tokens because live state remains at the transaction origin; retain
+   explicit accepted-row publication.
 
    The checkpoint copy path now makes the row-major convolution and recurrent
    strides explicit, so a DFlash window commits only its accepted row. GPU
@@ -353,22 +411,24 @@ run passes repeatability and cache reuse, including after the
    concurrent-request checks.
    Batched verifier SSM alpha/beta preparation now uses one elementwise launch
    for softplus/scale and sigmoid, with exact llama.cpp hashes preserved.
-4. **Kernel and graph count.** Q/gate deinterleave, QK normalization, RoPE
-   and Q8/Q8 KV storage are now fused exactly. The remaining small launches
-   include SiLU/gating and state preparation. Fuse adjacent operations when
-   their intermediate values need no external checkpoint.
+4. **Kernel and graph count.** Q/gate deinterleave, QK normalization, RoPE,
+   Q8/Q8 KV storage, SSM alpha/beta preparation, and IQ1_M verifier embedding
+   are now fused or batched exactly. Profile again before joining another
+   mixed-type preparation boundary; retain only savings larger than dispatch
+   noise.
 5. **Remaining draft cost.** Top-k and selector decisions already run on the
-   GPU, and packed Q4_K/Q8_1 projections cut draft work to 77.239 ms at 4K and
-   474.117 ms across the 256-token 64K suffix. Position-parallel attention and
+   GPU, and packed Q4_K/Q8_1 projections cut draft work substantially.  The
+   current exact 64K suffix spends about 533 ms in the drafter.
+   Position-parallel attention and
    cheaper draft-cache storage are the next candidates, provided K=4/K=7
    acceptance and authoritative output remain stable.
-6. **Prompt-cache injection.**  The 4K and random 64K prefill targets are now
-   met, but the five feature taps and sidecar K/V injection still consume
-   avoidable bandwidth.  Fuse tap capture with target hidden writes, batch the
-   five sidecar injections, and overlap independent sidecar work with the next
-   target tile.
+6. **Prompt-cache injection.**  Feature capture now shares the target
+   RMSNorm kernel and both 4K and random-64K prefill retain their targets.
+   Sidecar K/V injection remains serial.  Add per-stream hipBLASLt
+   plans/workspaces before overlapping it with the next target tile; the
+   current global shape cache cannot be used concurrently.
 
 Each optimization should retain the exact sequence hash and response bytes at
 K=4 and K=7, compile the emitted program, and cover non-coding prompts plus
-random-token 64K depth.  HTTP/stdio scheduling remains a separate integration
-task after the benchmark path has broader quality coverage.
+random-token 64K depth.  The HTTP/stdio quality gate now covers direct and
+OpenAI-compatible window transactions at short and long prompt lengths.
