@@ -4,7 +4,7 @@ PYTORCH_SOURCE ?= ../../tmp/pytorch-src
 FLASH_ATTN_SOURCE ?= ../../tmp/flash-attention-src
 TORCH_INCLUDE ?= ../../tmp/qimg21-ref-venv/lib/python3.12/site-packages/torch/include
 
-.PHONY: all setup generate reference compare regress native native-exact native-text-exact native-vae clean
+.PHONY: all setup setup-exact-sources verify-exact-sources verify-generated-artifacts generate reference compare regress native native-exact native-text-exact native-vae clean
 
 all: test_cuda_qimg21 native
 
@@ -18,14 +18,14 @@ native-exact: test_cuda_qimg21_native libq21_cutlass_attention.so libq21_flash_a
 
 native-text-exact: test_cuda_qimg21_text libq21_flash_attention.so qwen21_text_rope.npy
 
-libq21_cutlass_attention.so: cutlass_attention_plugin.cu
+libq21_cutlass_attention.so: cutlass_attention_plugin.cu | verify-exact-sources
 	@test -f $(PYTORCH_SOURCE)/aten/src/ATen/native/transformers/cuda/mem_eff_attention/kernel_forward.h
 	@test -f $(FLASH_ATTN_SOURCE)/csrc/cutlass/include/cutlass/cutlass.h
 	$(CUDA_HOME)/bin/nvcc -O3 -std=c++17 --expt-relaxed-constexpr --shared -Xcompiler=-fPIC \
 		-gencode arch=compute_120,code=sm_120 -I$(PYTORCH_SOURCE) -I$(TORCH_INCLUDE) \
 		-I$(FLASH_ATTN_SOURCE)/csrc/cutlass/include -o $@ $<
 
-libq21_flash_attention.so: flash_attention_plugin.cu
+libq21_flash_attention.so: flash_attention_plugin.cu | verify-exact-sources
 	@test -f $(FLASH_ATTN_SOURCE)/csrc/flash_attn/src/flash_fwd_kernel.h
 	$(CUDA_HOME)/bin/nvcc -O3 -std=c++17 --expt-relaxed-constexpr --shared -Xcompiler=-fPIC \
 		-gencode arch=compute_120,code=sm_120 -I$(FLASH_ATTN_SOURCE) \
@@ -97,6 +97,16 @@ test_weight_upload: test_weight_upload.c test_cuda_qimg21_native.c ../../cuda/cu
 
 setup:
 	./setup_reference.sh
+
+setup-exact-sources:
+	./setup_exact_sources.sh
+
+verify-exact-sources:
+	PYTORCH_SOURCE=$(abspath $(PYTORCH_SOURCE)) FLASH_ATTN_SOURCE=$(abspath $(FLASH_ATTN_SOURCE)) \
+		./setup_exact_sources.sh --verify
+
+verify-generated-artifacts: qwen21_rope_freqs.npy qwen21_text_rope.npy
+	sha256sum -c generated-artifacts.sha256
 
 generate: test_cuda_qimg21
 	$(PYTHON) test_cuda_qimg21.py --generate --model /mnt/nvme01/models/qimg-21 \

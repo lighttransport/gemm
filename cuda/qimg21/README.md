@@ -1338,14 +1338,27 @@ last-bit choice is hardware dependent and is therefore not a reproducible
 kernel oracle. The native path uses the exact PyTorch 2.14 CUTLASS
 memory-efficient specialization plus PyTorch's CPU-generated RoPE table.
 
-Build the exact native components after checking out PyTorch commit
-`08187d9e0fba026dc8217405802ab5381dc88d90` at `tmp/pytorch-src` and its
-FlashAttention/CUTLASS gitlink commit
-`14c377950125c70b7a9dabf9c561fca53715ac7d` at
-`tmp/flash-attention-src`:
+Install the fully pinned Python reference environment and source checkouts,
+then build the exact native components:
 
 ```sh
+make -C cuda/qimg21 setup
+make -C cuda/qimg21 setup-exact-sources
 make -C cuda/qimg21 native-exact
+```
+
+`setup_exact_sources.sh` pins PyTorch at
+`08187d9e0fba026dc8217405802ab5381dc88d90`, FlashAttention at
+`14c377950125c70b7a9dabf9c561fca53715ac7d`, and its CUTLASS checkout at
+`e05f953a5b3d38adc240df2ff928e0421c2abba3` (the SM120-capable revision used
+for validation). The plugin build verifies all three revisions before
+compiling. Override `PYTORCH_SOURCE` or `FLASH_ATTN_SOURCE` when keeping the
+checkouts outside the repository-local `tmp/` directory.
+
+The generated transformer and text RoPE tables are also pinned byte-for-byte:
+
+```sh
+make -C cuda/qimg21 verify-generated-artifacts
 ```
 
 Capture and compare a deterministic two-step editing case:
