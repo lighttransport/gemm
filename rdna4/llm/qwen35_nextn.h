@@ -702,8 +702,13 @@ static float *hllm_qwen35_mtp_verify_impl(hip_llm_runner *r,
             hipGraphInstantiate(&m->executions[rows], m->graphs[rows], NULL, NULL, 0)) return NULL;
     }
     int positions[HLLM_DENSE_MTP_MAX_ROWS];
-    for (int i = 0; i < rows; ++i) {
-        positions[i] = position+i;
+    for (int i = 0; i < rows; ++i) positions[i] = position+i;
+    if (r->token_embd_type == GGML_TYPE_IQ1_M && r->fn_embed_iq1_m_batch) {
+        if (hipMemcpyAsync(m->verify_argmax, tokens, (size_t)rows*sizeof(int32_t),
+                           hipMemcpyHostToDevice, r->stream)) return NULL;
+        launch_embed_iq1_m_batch(r, m->verify_x, r->d_token_embd,
+                                 m->verify_argmax, r->n_embd, rows);
+    } else for (int i = 0; i < rows; ++i) {
         void *x = (float *)m->verify_x + (size_t)i*r->n_embd;
         int t = tokens[i];
         if (r->token_embd_type == GGML_TYPE_Q8_0) launch_embed_q8_0(r,x,r->d_token_embd,t,r->n_embd);

@@ -5393,6 +5393,30 @@ static const char *hip_kernel_source =
 "    const signed char *grid = (const signed char *)&iq1s_grid_dev[idx];\n"
 "    dst[i] = dl * ((float)grid[j] + corr);\n"
 "}\n"
+"__global__ void embed_iq1_m_batch(float *dst, const unsigned char *embd_table,\n"
+"                                  const int *tokens, int n_embd, int rows) {\n"
+"    int row = blockIdx.y;\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (row >= rows || i >= n_embd) return;\n"
+"    int nb = n_embd / 256, b = i / 256, e = i % 256;\n"
+"    int ib = e / 32, l = (e % 32) / 8, j = e % 8;\n"
+"    const unsigned char *bp = embd_table +\n"
+"        ((size_t)tokens[row] * nb + b) * 56;\n"
+"    const unsigned char *qs = bp, *qh = bp + 32;\n"
+"    const unsigned short *sc = (const unsigned short *)(bp + 48);\n"
+"    unsigned short su = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0u) |\n"
+"                       ((sc[2] >> 4) & 0x0f00u) | (sc[3] & 0xf000u);\n"
+"    float d = half_to_float(*(const half_raw *)&su);\n"
+"    unsigned short sw = sc[ib / 2];\n"
+"    int shift = 6 * (ib % 2) + (l >= 2 ? 3 : 0);\n"
+"    float dl = d * (float)(2 * ((sw >> shift) & 7) + 1);\n"
+"    unsigned char hv = qh[2 * ib + (l >> 1)];\n"
+"    unsigned short idx = qs[4 * ib + l] |\n"
+"                         ((unsigned short)(hv << ((l & 1) ? 4 : 8)) & 0x700u);\n"
+"    float corr = (hv & ((l & 1) ? 0x80 : 0x08)) ? -0.125f : 0.125f;\n"
+"    const signed char *grid = (const signed char *)&iq1s_grid_dev[idx];\n"
+"    dst[(size_t)row * n_embd + i] = dl * ((float)grid[j] + corr);\n"
+"}\n"
 
 "/* llama.cpp's CUDA/HIP IQ1_S GPU codebook.  This is intentionally separate\n"
 " * from iq1s_grid_dev above: the latter is the signed CPU dequant table,\n"
@@ -13178,7 +13202,7 @@ struct hip_llm_runner {
     hipFunction_t fn_matvec_q6_K_batch_reuse8;
     hipFunction_t fn_embed_q2_K;
     hipFunction_t fn_embed_q2_K_devtoken;
-    hipFunction_t fn_embed_iq1_m;
+    hipFunction_t fn_embed_iq1_m, fn_embed_iq1_m_batch;
     /* SSM kernels */
     hipFunction_t fn_softplus_mul_f32;
     hipFunction_t fn_softplus_mul_batch_f32;
@@ -14299,6 +14323,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(embed_q2_K);
     GET_FUNC(embed_q2_K_devtoken);
     GET_FUNC(embed_iq1_m);
+    GET_FUNC(embed_iq1_m_batch);
     /* SSM kernels */
     GET_FUNC(softplus_mul_f32);
     GET_FUNC(softplus_mul_batch_f32);
@@ -22022,6 +22047,13 @@ static inline void launch_embed_iq1_m(hip_llm_runner *r, void *dst,
                                       void *embd_table, int token_id, int n_embd) {
     void *args[] = { &dst, &embd_table, &token_id, &n_embd };
     LAUNCH(r->fn_embed_iq1_m, (n_embd + 255) / 256, 1, 1,
+           256, 1, 1, 0, r->stream, args);
+}
+
+static inline void launch_embed_iq1_m_batch(hip_llm_runner *r, void *dst,
+        void *embd_table, void *tokens, int n_embd, int rows) {
+    void *args[] = { &dst, &embd_table, &tokens, &n_embd, &rows };
+    LAUNCH(r->fn_embed_iq1_m_batch, (n_embd + 255) / 256, rows, 1,
            256, 1, 1, 0, r->stream, args);
 }
 
