@@ -61,6 +61,8 @@ export TF_KV_DTYPE=${TF_KV_DTYPE:-f16}
 export TF_HIER_BARRIER=${TF_HIER_BARRIER:-0}
 export TF_BARRIER_BUSY_WAIT=${TF_BARRIER_BUSY_WAIT:-1}
 
-exec numactl --physcpubind=12-59 --membind=4-7 \
+# Spread auxiliary hugepage allocations; packed arenas and SSM state apply
+# their own explicit per-CMG mbind policies after allocation.
+exec numactl --physcpubind=12-59 --interleave=4-7 \
     "$HERE/build/qwen38_runner" "$LOCAL_MODEL" --threads 48 \
     --q8-mode cmg4 "$@"

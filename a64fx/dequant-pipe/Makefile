@@ -84,3 +84,7 @@ e4_pack_c.o: e4_pack.c e4_pack.h w8.h
 
 test_e4_pack: test_e4_pack.c e4_pack.h w8.h e4_pack.o e4_pack_c.o w8.o
 	$(CC) $(CFLAGS) test_e4_pack.c e4_pack.o e4_pack_c.o w8.o $(LDFLAGS) -o $@
+
+# Opt-in A15 activation quantization correctness gate.
+test_q8_k128_a15: test_q8_k128_a15.c q8_k128.h q8_k128.o
+	$(CC) $(CFLAGS) test_q8_k128_a15.c q8_k128.o $(LDFLAGS) -o $@

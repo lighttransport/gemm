@@ -151,9 +151,14 @@ all: $(BUILD)/llm_runner
 llm_runner: $(BUILD)/llm_runner
 
 qwen38_runner: $(BUILD)/qwen38_runner
-$(BUILD)/qwen38_runner: $(LLM_DIR)qwen38_runner.c $(COMMON)/transformer.h $(COMMON)/gguf_loader.h $(ROOT)/dequant-pipe/q8_k128.h $(Q8K128_KERNEL) | $(BUILD)
+$(BUILD)/qwen38_runner: $(LLM_DIR)qwen38_runner.c $(COMMON)/transformer.h $(COMMON)/gguf_loader.h $(LLM_DIR)kv_f16_sve.h $(LLM_DIR)swiglu_sve.h $(ROOT)/dequant-pipe/q8_k128.h $(Q8K128_KERNEL) | $(BUILD)
 	$(CC) $(CFLAGS) $(QWEN_CFLAGS) -DTF_LINK_Q8_K128 -o $@ \
 		$(LLM_DIR)qwen38_runner.c $(Q8K128_KERNEL) $(LDFLAGS)
+
+.PHONY: test_kv_f16_sve
+test_kv_f16_sve: $(BUILD)/test_kv_f16_sve
+$(BUILD)/test_kv_f16_sve: $(LLM_DIR)test_kv_f16_sve.c $(LLM_DIR)kv_f16_sve.h $(COMMON)/ggml_dequant.h | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $(LLM_DIR)test_kv_f16_sve.c $(LDFLAGS)
 
 qwen38_kquant_bench: $(BUILD)/bench_qwen38_kquants
 $(BUILD)/bench_qwen38_kquants: $(LLM_DIR)bench_qwen38_kquants.c $(LLM_DIR)kquant_decode_cache.h $(COMMON)/transformer.h $(COMMON)/gguf_loader.h $(COMMON)/ggml_dequant.h | $(BUILD)
@@ -301,3 +306,13 @@ $(BUILD)/ds4f_bake: $(LLM_DIR)ds4f_bake.c $(DS4F_HDRS) $(COMMON)/safetensors.h |
 
 clean:
 	rm -rf $(BUILD)
+
+.PHONY: test_swiglu_sve
+test_swiglu_sve: $(BUILD)/test_swiglu_sve
+$(BUILD)/test_swiglu_sve: $(LLM_DIR)test_swiglu_sve.c $(LLM_DIR)swiglu_sve.h | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $(LLM_DIR)test_swiglu_sve.c $(LDFLAGS)
+
+.PHONY: test_qwen38_a15_state
+test_qwen38_a15_state: $(BUILD)/test_qwen38_a15_state
+$(BUILD)/test_qwen38_a15_state: $(LLM_DIR)test_qwen38_a15_state.c $(COMMON)/transformer.h $(LLM_DIR)swiglu_sve.h $(LLM_DIR)kv_f16_sve.h $(ROOT)/dequant-pipe/q8_k128.h $(Q8K128_KERNEL) | $(BUILD)
+	$(CC) $(CFLAGS) -O1 -DTF_LINK_Q8_K128 -o $@ $(LLM_DIR)test_qwen38_a15_state.c $(Q8K128_KERNEL) $(LDFLAGS)

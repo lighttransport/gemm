@@ -52,9 +52,59 @@ static int test_cmg_partition(void)
     return 0;
 }
 
+/* Exercise repeated read/modify/write calls with nonzero initial outputs.
+ * The scalar oracle retains each original 32-element Q8 block's FMA order. */
+static int test_accumulated_records(void)
+{
+    uint8_t *record = NULL;
+    if (posix_memalign((void **)&record, 256, Q8_K128_RECORD_BYTES)) return 1;
+    uint16_t *scales = (uint16_t *)record;
+    int8_t *weights = (int8_t *)(record + Q8_K128_SCALE_BYTES);
+    float x[Q8_K128_K], got[Q8_K128_N], ref[Q8_K128_N];
+    uint32_t rng = 923;
+    for (int trial = 0; trial < 64; trial++) {
+        for (int n = 0; n < Q8_K128_N; n++)
+            got[n] = ref[n] = (float)(n - Q8_K128_N / 2) / 97.0f;
+        for (int tile = 0; tile < 4; tile++) {
+            for (int k = 0; k < Q8_K128_K; k++) {
+                rng = rng * 1664525u + 1013904223u;
+                x[k] = (float)((int)(rng >> 24) - 128) / 97.0f;
+            }
+            for (int i = 0; i < Q8_K128_SCALE_BYTES / 2; i++) {
+                rng = rng * 1664525u + 1013904223u;
+                scales[i] = f32_to_f16((float)(1 + (rng % 31)) / 257.0f);
+            }
+            for (int i = 0; i < Q8_K128_WEIGHT_BYTES; i++) {
+                rng = rng * 1664525u + 1013904223u;
+                weights[i] = (int8_t)(rng >> 24);
+            }
+            q8_k128_f32(record, x, got);
+            for (int b = 0; b < 4; b++) for (int n = 0; n < Q8_K128_N; n++) {
+                float block = 0.0f;
+                for (int j = 0; j < 32; j++) {
+                    int k = b * 32 + j;
+                    block = fmaf((float)weights[k * Q8_K128_N + n], x[k], block);
+                }
+                ref[n] = fmaf(block, f16_to_f32(scales[b * Q8_K128_N + n]), ref[n]);
+            }
+            for (int n = 0; n < Q8_K128_N; n++) {
+                if (memcmp(got + n, ref + n, sizeof(float))) {
+                    fprintf(stderr, "q8 accumulated mismatch trial=%d tile=%d row=%d "
+                            "got=%a ref=%a\n", trial, tile, n, got[n], ref[n]);
+                    free(record);
+                    return 1;
+                }
+            }
+        }
+    }
+    free(record);
+    puts("q8_k128 accumulated records: exact PASS (64 trials x 4 tiles)");
+    return 0;
+}
+
 int main(void)
 {
-    if (test_cmg_partition()) return 1;
+    if (test_cmg_partition() || test_accumulated_records()) return 1;
     uint8_t *record = NULL;
     float x[Q8_K128_K], got[Q8_K128_N], ref[Q8_K128_N];
     uint32_t rng = 0x38a64f27u;
@@ -130,7 +180,7 @@ int main(void)
         return 1;
     }
     free(rows); free(packed);
-    puts("q8_k128 correctness: PASS (64x128, FP16 scales, block-reassociated FP32 FMA; "
+    puts("q8_k128 correctness: PASS (128x128, FP16 scales, block-reassociated FP32 FMA; "
          "48-worker CMG partition PASS)");
     free(record);
     return 0;

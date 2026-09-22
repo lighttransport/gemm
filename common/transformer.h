@@ -52,7 +52,9 @@ typedef struct {
     int8_t  *i8;          /* optional int8 W8A8 weights [n_rows*n_cols], row-major */
     float   *i8s;         /* per-row int8 scale [n_rows] (w ~= i8 * i8s[row]) */
     int      q8_block64;  /* 1/2=Q8 original layout, 3=compact W8A8 groups */
-    int      q8_k128;     /* lossless Q8_0 K-major 128x128 decode records */
+    int      q8_k128;     /* 1=exact K-major, 2=interleaved A15 SDOT */
+    void    *q8_a15_shared[TF_CMG4_LANES];
+    int      q8_a15_reuse; /* persistent projection consumes its preceding producer's activation */
     uint8_t *q8_cmg4[TF_CMG4_LANES]; /* 256-byte-aligned CMG-local group segments */
     void    *mixed_iq_cache; /* optional lossless A64FX decode-only expanded codebook */
     void    *iq4_cache;   /* optional lossless signed-palette worker-local cache */
@@ -185,6 +187,8 @@ typedef struct {
     int ssm_qkv_dim;         /* combined QKV dim (10240) */
     float **conv_state;      /* [n_layers] -> [conv_kernel-1, qkv_dim] per SSM layer */
     int *conv_state_pos;     /* [n_layers] circular buffer write position per SSM layer */
+    uint8_t *recurrent_state_mapped;
+    size_t recurrent_state_map_bytes;
     float **recurrent_state; /* [n_layers] -> [n_v_heads, d_state, d_state] per SSM layer */
     float *conv_w_trans;     /* compatibility scratch for non-hybrid callers */
     float **conv_w_trans_layers; /* cached [layer][conv_k * qkv_dim] SSM weights */
@@ -255,6 +259,8 @@ typedef struct {
     int tp_stage_is_mmap;
     void *q8_bf16_arena; /* anonymous System-V expansion arena, if enabled */
     size_t q8_bf16_arena_bytes;
+    void *q8_a15_workspace[TF_CMG4_LANES];
+    size_t q8_a15_workspace_bytes, q8_a15_workspace_off;
     void *q8_cmg4_arena; /* one hugepage-backed native-Q8 decode arena */
     size_t q8_cmg4_arena_bytes, q8_cmg4_arena_off;
     uint8_t *q8_cmg4_base[TF_CMG4_LANES];
@@ -262,6 +268,7 @@ typedef struct {
     float *matvec_tmp; /* max(n_embd, n_ff) for row dequant (thread 0) */
     float ssm_alpha_tmp[64]; /* shared persistent-worker SSM scalars */
     float ssm_beta_tmp[64];
+    int decode_swiglu_approx; /* opt-in SVE exp/reciprocal approximation */
     int trace_hidden_norms; /* print per-layer hidden norms during forward */
 
     /* Multi-threading */
@@ -738,15 +745,28 @@ static void tf_kv_store_value(transformer_model *m, int layer, size_t offset,
     }
 }
 
+#if defined(__ARM_FEATURE_SVE)
+#include "../a64fx/llm/kv_f16_sve.h"
+#include "../a64fx/llm/swiglu_sve.h"
+#endif
+
+static inline float tf_kv_f16_to_f32(uint16_t bits) {
+#if defined(__ARM_FEATURE_SVE)
+    return tf_kv_f16_to_f32_sve(bits);
+#else
+    return ggml_fp16_to_fp32(bits);
+#endif
+}
+
 static inline float tf_kv_load_key(const transformer_model *m, int layer, size_t idx) {
     if (m->kv_cache_type == 1)
-        return ggml_fp16_to_fp32(((const uint16_t *)m->key_cache_raw[layer])[idx]);
+        return tf_kv_f16_to_f32(((const uint16_t *)m->key_cache_raw[layer])[idx]);
     return m->key_cache[layer][idx];
 }
 
 static inline float tf_kv_load_value(const transformer_model *m, int layer, size_t idx) {
     if (m->kv_cache_type == 1)
-        return ggml_fp16_to_fp32(((const uint16_t *)m->value_cache_raw[layer])[idx]);
+        return tf_kv_f16_to_f32(((const uint16_t *)m->value_cache_raw[layer])[idx]);
     return m->value_cache[layer][idx];
 }
 
@@ -1497,12 +1517,21 @@ static void *tf_qmatvec_worker(void *arg) {
         int g0 = groups * t->row_start / t->mat->n_rows;
         int g1 = (groups * t->row_end + t->mat->n_rows - 1) / t->mat->n_rows;
         size_t group_bytes = (size_t)tiles * Q8_K128_RECORD_BYTES;
+        /* Quantize once per worker/matrix, reuse across all output groups. */
+        q8_k128_a15_activation aq[t->mat->q8_k128 == 2 ? tiles : 1];
+        if (t->mat->q8_k128 == 2)
+            for (int k = 0; k < tiles; k++)
+                q8_k128_quantize_a15(t->x + (size_t)k * Q8_K128_K, &aq[k]);
         for (int g = g0; g < g1; g++) {
             float out[Q8_K128_N] = {0};
             const uint8_t *group = tf_q8_k128_group_ptr(t->mat, g, group_bytes);
-            for (int k = 0; k < tiles; k++)
-                q8_k128_f32(group + (size_t)k * Q8_K128_RECORD_BYTES,
-                            t->x + (size_t)k * Q8_K128_K, out);
+            for (int k = 0; k < tiles; k++) {
+                const uint8_t *record = group + (size_t)k * Q8_K128_RECORD_BYTES;
+                if (t->mat->q8_k128 == 2)
+                    q8_k128_a15_dot(record, aq[k].hi, aq[k].lo, aq[k].scales, out);
+                else
+                    q8_k128_f32(record, t->x + (size_t)k * Q8_K128_K, out);
+            }
             int r0 = g * Q8_K128_N, r1 = r0 + Q8_K128_N;
             if (r0 < t->row_start) r0 = t->row_start;
             if (r1 > t->row_end) r1 = t->row_end;
@@ -3000,6 +3029,7 @@ static int tf_g4p_did_logits = 0;    /* worker -> caller: logits computed (softc
 double tf_decode_matvec_bytes = 0.0;
 long tf_decode_matvec_cnt = 0;
 double tf_decode_null_bytes = 0.0;
+double tf_decode_attn_core_ms = 0.0;
 double tf_decode_attn_qkv_ms = 0.0;
 double tf_decode_attn_out_ms = 0.0;
 double tf_decode_ssm_in_ms = 0.0;
@@ -3431,7 +3461,18 @@ typedef struct {
 static void tf_matvec_qtensor_rows(float *dst, const qtensor *mat, const float *x,
                                     int row_start, int row_end) {
     int n_cols = mat->n_cols;
-    if (mat->type == GGML_TYPE_F16) {
+    if (mat->type == GGML_TYPE_F32) {
+        const float *base = mat->data;
+        for (int i = row_start; i < row_end; i++) {
+#if defined(__ARM_FEATURE_SVE)
+            dst[i] = tf_f32_dot_sve(base + (size_t)i * n_cols, x, n_cols);
+#else
+            float sum = 0.0f;
+            for (int j = 0; j < n_cols; j++) sum += base[(size_t)i * n_cols + j] * x[j];
+            dst[i] = sum;
+#endif
+        }
+    } else if (mat->type == GGML_TYPE_F16) {
         size_t rb = (size_t)n_cols * 2;
         tf_matvec_f16_rows(dst, (const uint8_t *)mat->data, rb, x, n_cols, row_start, row_end);
     } else if (mat->type == GGML_TYPE_BF16) {
@@ -3569,13 +3610,22 @@ static void tf_qmatvec(float *dst, const qtensor *mat, const float *x, int n_row
         int groups = n_rows / Q8_K128_N;
         int tiles = n_cols / Q8_K128_K;
         size_t group_bytes = (size_t)tiles * Q8_K128_RECORD_BYTES;
+        /* Quantize once per worker/matrix, reuse across all output groups. */
+        q8_k128_a15_activation aq[mat->q8_k128 == 2 ? tiles : 1];
+        if (mat->q8_k128 == 2)
+            for (int k = 0; k < tiles; k++)
+                q8_k128_quantize_a15(x + (size_t)k * Q8_K128_K, &aq[k]);
         for (int g = 0; g < groups; g++) {
             float *out = dst + g * Q8_K128_N;
             memset(out, 0, Q8_K128_N * sizeof(float));
             const uint8_t *group = tf_q8_k128_group_ptr(mat, g, group_bytes);
-            for (int k = 0; k < tiles; k++)
-                q8_k128_f32(group + (size_t)k * Q8_K128_RECORD_BYTES,
-                            x + (size_t)k * Q8_K128_K, out);
+            for (int k = 0; k < tiles; k++) {
+                const uint8_t *record = group + (size_t)k * Q8_K128_RECORD_BYTES;
+                if (mat->q8_k128 == 2)
+                    q8_k128_a15_dot(record, aq[k].hi, aq[k].lo, aq[k].scales, out);
+                else
+                    q8_k128_f32(record, x + (size_t)k * Q8_K128_K, out);
+            }
         }
         return;
     }
@@ -4073,7 +4123,17 @@ static void *tf_attn_worker_f16(tf_attn_task *t) {
         float *att_h = t->att + (size_t)h * t->max_seq_len;
         int p0 = t->phase == 1 ? t->seq_start : 0;
         int p1 = t->phase == 1 ? t->seq_end : t->seq_len;
-        for (int p = p0; p < p1; p++) {
+        int p = p0;
+#if defined(__ARM_FEATURE_SVE)
+        for (; p + 3 < p1; p += 4) {
+            size_t off = (size_t)p * t->kv_dim + (size_t)kv_h * hd;
+            float scores[4];
+            tf_kv_f16_dot4_sve(scores, q_h,
+                (const uint16_t *)m->key_cache_raw[t->layer] + off, t->kv_dim, hd);
+            for (int j = 0; j < 4; j++) att_h[p + j] = scores[j] * t->scale;
+        }
+#endif
+        for (; p < p1; p++) {
             size_t off = (size_t)p * t->kv_dim + (size_t)kv_h * hd;
             float score = 0.0f;
             for (int d = 0; d < hd; d++)
@@ -4087,8 +4147,13 @@ static void *tf_attn_worker_f16(tf_attn_task *t) {
         for (int p = 0; p < t->seq_len; p++) {
             size_t off = (size_t)p * t->kv_dim + (size_t)kv_h * hd;
             float a = att_h[p];
+#if defined(__ARM_FEATURE_SVE)
+            tf_kv_f16_axpy_sve(out_h,
+                (const uint16_t *)m->value_cache_raw[t->layer] + off, a, hd);
+#else
             for (int d = 0; d < hd; d++)
                 out_h[d] += a * tf_kv_load_value(m, t->layer, off + (size_t)d);
+#endif
         }
     }
     return NULL;
@@ -5267,6 +5332,17 @@ transformer_model *transformer_load(gguf_context *gguf, int max_seq_len) {
     return m;
 }
 
+static void tf_free_recurrent_state(transformer_model *model, int l) {
+    if (!model->recurrent_state || !model->recurrent_state[l]) return;
+    if (model->recurrent_state_mapped && model->recurrent_state_mapped[l]) {
+        munmap(model->recurrent_state[l], model->recurrent_state_map_bytes);
+        model->recurrent_state_mapped[l] = 0;
+    } else {
+        free(model->recurrent_state[l]);
+    }
+    model->recurrent_state[l] = NULL;
+}
+
 void transformer_free(transformer_model *model) {
     if (!model) return;
     if (model->mpool.base) { munmap(model->mpool.base, model->mpool.cap); model->mpool.base = NULL; }
@@ -5318,8 +5394,9 @@ void transformer_free(transformer_model *model) {
         free(model->conv_w_trans_layers);
     }
     if (model->recurrent_state) {
-        for (int l = 0; l < model->n_layers; l++) free(model->recurrent_state[l]);
+        for (int l = 0; l < model->n_layers; l++) tf_free_recurrent_state(model, l);
         free(model->recurrent_state);
+        free(model->recurrent_state_mapped);
     }
     free(model->x);
     free(model->xb);
@@ -5332,6 +5409,7 @@ void transformer_free(transformer_model *model) {
     free(model->ffn_buf2);
     free(model->ffn_buf3);
     free(model->logits);
+    for (int c = 0; c < TF_CMG4_LANES; c++) free(model->q8_a15_workspace[c]);
     free(model->lm_head_best_idx);
     free(model->lm_head_best_val);
     if (model->tp_stage_data) {
@@ -5812,6 +5890,10 @@ transformer_model *transformer_nextn_context_create(
     ctx->conv_state = NULL;
     ctx->conv_state_pos = NULL;
     ctx->recurrent_state = NULL;
+    ctx->recurrent_state_mapped = NULL;
+    ctx->recurrent_state_map_bytes = 0;
+    memset(ctx->q8_a15_workspace, 0, sizeof(ctx->q8_a15_workspace));
+    ctx->q8_a15_workspace_bytes = ctx->q8_a15_workspace_off = 0;
     ctx->conv_w_trans = NULL;
     ctx->conv_w_trans_layers = NULL;
     ctx->ple_buf = ctx->ple_proj_buf = NULL;
@@ -5929,6 +6011,7 @@ void transformer_pool_profile_reset(void) {
     tf_decode_matvec_bytes = 0.0;
     tf_decode_matvec_cnt = 0;
     tf_decode_null_bytes = 0.0;
+    tf_decode_attn_core_ms = 0.0;
     tf_decode_attn_qkv_ms = 0.0;
     tf_decode_attn_out_ms = 0.0;
     tf_decode_ssm_in_ms = 0.0;
@@ -6948,7 +7031,7 @@ static size_t tf_materialize_q8_cmg4_reference_tensor(transformer_model *m,
 typedef struct {
     const block_q8_0 *src;
     uint8_t *dst;
-    int n_cols, dst_group_start, group_start, group_end;
+    int n_cols, dst_group_start, group_start, group_end, a15;
 } tf_q8_k128_pack_task;
 
 static void *tf_q8_k128_pack_worker(void *arg) {
@@ -6967,7 +7050,9 @@ static void *tf_q8_k128_pack_worker(void *arg) {
                     (size_t)(g * Q8_K128_N + r) * src_nb + kt * 4 + b;
                 scales[b * Q8_K128_N + r] = src->d;
                 for (int j = 0; j < 32; j++)
-                    q[(b * 32 + j) * Q8_K128_N + r] = src->qs[j];
+                    q[t->a15 ?
+                      ((b * 8 + j / 4) * Q8_K128_N + r) * 4 + j % 4 :
+                      (b * 32 + j) * Q8_K128_N + r] = src->qs[j];
             }
         }
     }
@@ -6986,8 +7071,50 @@ static inline const uint8_t *tf_q8_k128_group_ptr(const qtensor *t, int g,
     return (const uint8_t *)t->data + (size_t)g * group_bytes;
 }
 
-static size_t tf_materialize_q8_k128_tensor(transformer_model *m, qtensor *t) {
+typedef struct {
+    const qtensor *src;
+    float *dst;
+    int begin, end;
+} tf_q8_small_f32_task;
+
+static void *tf_q8_small_f32_worker(void *arg) {
+    tf_q8_small_f32_task *t = arg;
+    for (int r = t->begin; r < t->end; r++)
+        tf_dequant_row(t->src, r, t->dst + (size_t)r * t->src->n_cols);
+    return NULL;
+}
+
+/* The 48-row SSM alpha/beta matrices are too narrow for packed row groups.
+ * Losslessly materialize their Q8 weights as FP32 so all 48 workers can own
+ * one row without repeating Q8 dequantization on every token. */
+static size_t tf_materialize_q8_small_f32(transformer_model *m, qtensor *t) {
+    size_t bytes = (size_t)t->n_rows * t->n_cols * sizeof(float);
+    size_t source_bytes = (size_t)t->n_rows * tf_row_bytes(t->type, t->n_cols);
+    float *p = tf_aligned_alloc_notouch(256, bytes);
+    if (!p || tf_decode_owned_add(m, p) != 0) { free(p); return (size_t)-1; }
+    int nt = m->pool_alive && m->n_threads > 0 ? m->n_threads : 1;
+    tf_q8_small_f32_task tasks[nt];
+    for (int i = 0; i < nt; i++)
+        tasks[i] = (tf_q8_small_f32_task){t, p, t->n_rows * i / nt, t->n_rows * (i + 1) / nt};
+    if (nt > 1 && m->pool_alive)
+        tf_pool_dispatch(m, tf_q8_small_f32_worker, tasks, sizeof(tasks[0]));
+    else
+        tf_q8_small_f32_worker(&tasks[0]);
+#if defined(MADV_DONTNEED)
+    long page = sysconf(_SC_PAGESIZE);
+    uintptr_t lo = (uintptr_t)t->data & ~((uintptr_t)page - 1);
+    uintptr_t hi = ((uintptr_t)t->data + source_bytes + page - 1) & ~((uintptr_t)page - 1);
+    madvise((void *)lo, hi - lo, MADV_DONTNEED);
+#endif
+    t->data = p;
+    t->type = GGML_TYPE_F32;
+    return bytes;
+}
+
+static size_t tf_materialize_q8_k128_tensor(transformer_model *m, qtensor *t, int a15) {
     if (!t || !t->data || t->type != GGML_TYPE_Q8_0 || t->n_rows <= 0) return 0;
+    if (a15 && t->n_rows <= 64 && t->n_cols % 32 == 0)
+        return tf_materialize_q8_small_f32(m, t);
     if ((t->n_rows % Q8_K128_N) || (t->n_cols % Q8_K128_K))
         return tf_materialize_q8_cmg4_reference_tensor(m, t);
     int groups = t->n_rows / Q8_K128_N;
@@ -7014,7 +7141,7 @@ static size_t tf_materialize_q8_k128_tensor(transformer_model *m, qtensor *t) {
         int cg0 = groups * lane / TF_CMG4_LANES;
         int g0 = groups * i / nt, g1 = groups * (i + 1) / nt;
         tasks[i] = (tf_q8_k128_pack_task){(const block_q8_0 *)t->data,
-            dst[lane], t->n_cols, cg0, g0, g1};
+            dst[lane], t->n_cols, cg0, g0, g1, a15};
     }
     if (nt > 1 && m->pool_alive)
         tf_pool_dispatch(m, tf_q8_k128_pack_worker, tasks, sizeof(*tasks));
@@ -7031,7 +7158,15 @@ static size_t tf_materialize_q8_k128_tensor(transformer_model *m, qtensor *t) {
     }
 #endif
     t->data = dst[0];
-    t->q8_k128 = 1;
+    t->q8_k128 = a15 ? 2 : 1;
+    if (a15) {
+        size_t need = q8_k128_a15_shared_bytes(tiles);
+        if (m->q8_a15_workspace_off + need > m->q8_a15_workspace_bytes)
+            return (size_t)-1;
+        for (int c = 0; c < TF_CMG4_LANES; c++)
+            t->q8_a15_shared[c] = (uint8_t *)m->q8_a15_workspace[c] + m->q8_a15_workspace_off;
+        m->q8_a15_workspace_off += need;
+    }
     for (int c = 0; c < TF_CMG4_LANES; c++) {
         int g0 = groups * c / TF_CMG4_LANES;
         int g1 = groups * (c + 1) / TF_CMG4_LANES;
@@ -7050,19 +7185,81 @@ static size_t tf_materialize_q8_k128_tensor(transformer_model *m, qtensor *t) {
     return bytes;
 }
 #else
-static size_t tf_materialize_q8_k128_tensor(transformer_model *m, qtensor *t) {
-    (void)m; (void)t;
+static size_t tf_materialize_q8_k128_tensor(transformer_model *m, qtensor *t, int a15) {
+    (void)m; (void)t; (void)a15;
     return (size_t)-1;
 }
 #endif
+
+/* Qwen's 64 KiB state per head fits base pages, but not 2 MiB pages per
+ * CMG. Use an explicit base-page mapping so each head partition can be bound
+ * to its owning CMG without changing arithmetic or the contiguous API. */
+static int tf_ssm_state_bind_cmg(transformer_model *m) {
+#if defined(__linux__) && defined(SYS_mmap) && defined(SYS_mbind)
+    if (!m->is_hybrid || !m->recurrent_state || m->ssm_dt_rank % 4) return 0;
+    size_t bytes = (size_t)m->ssm_dt_rank * m->ssm_d_state * m->ssm_d_state * sizeof(float);
+    size_t part = bytes / 4, page = (size_t)sysconf(_SC_PAGESIZE);
+    if (!bytes || part % page) return 0;
+    if (!m->recurrent_state_mapped)
+        m->recurrent_state_mapped = calloc((size_t)m->n_layers, 1);
+    if (!m->recurrent_state_mapped) return -1;
+    m->recurrent_state_map_bytes = bytes;
+    int count = 0;
+    for (int l = 0; l < m->n_layers; l++) {
+        if (!m->recurrent_state[l] || m->recurrent_state_mapped[l]) continue;
+        void *p = (void *)syscall(SYS_mmap, NULL, bytes, PROT_READ | PROT_WRITE,
+                                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (p == MAP_FAILED) return -1;
+#ifdef MADV_NOHUGEPAGE
+        madvise(p, bytes, MADV_NOHUGEPAGE);
+#endif
+        for (int c = 0; c < 4; c++) {
+            unsigned long mask = 1ul << (4 + c);
+            if (syscall(SYS_mbind, (uint8_t *)p + c * part, part,
+                        2, &mask, 64ul, 0ul) != 0) {
+                munmap(p, bytes);
+                return -1;
+            }
+        }
+        memcpy(p, m->recurrent_state[l], bytes);
+        tf_free_recurrent_state(m, l);
+        m->recurrent_state[l] = p;
+        m->recurrent_state_mapped[l] = 1;
+        if (!count && getenv("NUMA_REPORT")) {
+            for (int c = 0; c < 4; c++) {
+                char label[64];
+                snprintf(label, sizeof(label), "recurrent.cmg%d", c);
+                tf_numa_report_mapping(label, (uint8_t *)p + c * part);
+            }
+        }
+        count++;
+    }
+    fprintf(stderr, "cmg4: SSM state bound by head on base pages: %d layers, %.1f MiB\n",
+            count, count * bytes / 1048576.0);
+#else
+    (void)m;
+#endif
+    return 0;
+}
+
+static void tf_q8_a15_reuse_activation(qtensor *consumer, const qtensor *producer) {
+    if (consumer->q8_k128 != 2 || producer->q8_k128 != 2 ||
+        consumer->n_cols != producer->n_cols) return;
+    for (int c = 0; c < TF_CMG4_LANES; c++)
+        consumer->q8_a15_shared[c] = producer->q8_a15_shared[c];
+    consumer->q8_a15_reuse = 1;
+}
 
 size_t transformer_materialize_q8_decode(transformer_model *m,
                                           const gguf_context *gguf,
                                           int q8_mode) {
     (void)gguf;
     if (!m || !m->layers || !m->pool_alive) return 0;
-    if (q8_mode == 5) {
-        size_t planned = 0;
+    if (q8_mode == 6)
+        fprintf(stderr, "q8 resident: opt-in A15 activation quantization enabled\n");
+#if defined(TF_LINK_Q8_K128) && defined(__ARM_FEATURE_SVE)
+    if (q8_mode == 5 || q8_mode == 6) {
+        size_t planned = 0, a15_need = 0;
         size_t cmg_need[TF_CMG4_LANES] = {0};
 #define TF_CMG4_PLAN(t_) do { \
             size_t _n = tf_qtensor_bytes((t_)); \
@@ -7079,6 +7276,7 @@ size_t transformer_materialize_q8_decode(transformer_model *m,
                         cmg_need[_c] += (size_t)(_g1 - _g0) * _gb; \
                     } \
                     planned += _n; \
+                    if (q8_mode == 6) a15_need += q8_k128_a15_shared_bytes((t_)->n_cols / Q8_K128_K); \
                 } \
             } \
         } while (0)
@@ -7095,6 +7293,23 @@ size_t transformer_materialize_q8_decode(transformer_model *m,
         }
         TF_CMG4_PLAN(&m->output);
 #undef TF_CMG4_PLAN
+        if (a15_need) {
+            const size_t ahp = 2u * 1024u * 1024u;
+            size_t cap = (a15_need + ahp - 1) & ~(ahp - 1);
+            for (int c = 0; c < TF_CMG4_LANES; c++) {
+                m->q8_a15_workspace[c] = tf_aligned_alloc_notouch(ahp, cap);
+                if (!m->q8_a15_workspace[c]) return 0;
+#if defined(__linux__) && defined(SYS_mbind)
+                unsigned long mask = 1ul << (4 + c);
+                if (syscall(SYS_mbind, m->q8_a15_workspace[c], cap,
+                            2, &mask, 64ul, 0ul) != 0) return 0;
+#endif
+                memset(m->q8_a15_workspace[c], 0, cap);
+            }
+            m->q8_a15_workspace_bytes = cap;
+            m->q8_a15_workspace_off = 0;
+            fprintf(stderr, "cmg4: CMG-local A15 scratch %.3f MiB total\n", cap * 4 / 1048576.0);
+        }
         const size_t hp = 2u * 1024u * 1024u;
         size_t arena_bytes = 0;
         for (int c = 0; c < TF_CMG4_LANES; c++) {
@@ -7137,6 +7352,10 @@ size_t transformer_materialize_q8_decode(transformer_model *m,
                 }
             }
 #endif
+            /* Reserve every packed hugepage before smaller allocations or
+             * base-page state mappings can fragment the remaining CMG space.
+             * The complete arena plus reserve was capacity-checked above. */
+            memset(m->q8_cmg4_base[c], 0, cmg_need[c]);
         }
         m->q8_cmg4_arena = m->q8_cmg4_base[0]; /* mode-active sentinel */
         fprintf(stderr, "cmg4: four independent NUMA arenas planned=%.3fGB "
@@ -7145,10 +7364,16 @@ size_t transformer_materialize_q8_decode(transformer_model *m,
                 (double)cmg_need[0] / 1e9, (double)cmg_need[1] / 1e9,
                 (double)cmg_need[2] / 1e9, (double)cmg_need[3] / 1e9);
     }
+#else
+    if (q8_mode >= 5) {
+        fprintf(stderr, "q8 resident: CMG4 requires the linked A64FX kernel\n");
+        return 0;
+    }
+#endif
     size_t total = 0;
 #define TF_Q8_RESIDENT_MODE(t_, mode_) do { \
         size_t _n = (mode_) == 1 ? tf_materialize_q8_row_tensor(m, (t_)) : \
-                    (mode_) == 5 ? tf_materialize_q8_k128_tensor(m, (t_)) : \
+                    ((mode_) == 5 || (mode_) == 6) ? tf_materialize_q8_k128_tensor(m, (t_), (mode_) == 6) : \
                     ((mode_) == 2 || (mode_) == 4) ? \
                         tf_materialize_q8_block64_tensor(m, (t_), (mode_) == 4) : \
                                    tf_materialize_q8_tensor(m, (t_)); \
@@ -7175,15 +7400,25 @@ size_t transformer_materialize_q8_decode(transformer_model *m,
             int mode = q8_mode == 3 ? ((i >= 4 && i <= 6) ? 2 : 0) : q8_mode;
             TF_Q8_RESIDENT_MODE(weights[i], mode);
         }
+        if (q8_mode == 6) {
+            tf_q8_a15_reuse_activation(&L->ffn_up, &L->ffn_gate);
+            if (L->is_ssm) tf_q8_a15_reuse_activation(&L->ssm_gate, &L->ssm_qkv);
+            else {
+                tf_q8_a15_reuse_activation(&L->attn_k, &L->attn_q);
+                tf_q8_a15_reuse_activation(&L->attn_v, &L->attn_q);
+            }
+        }
     }
     TF_Q8_RESIDENT_MODE(&m->output, q8_mode == 3 ? 0 : q8_mode);
 #undef TF_Q8_RESIDENT_MODE
+    if (q8_mode == 6 && tf_ssm_state_bind_cmg(m) != 0) return 0;
     fprintf(stderr, "q8 resident: %.3fGB decode weights (%s), embedding/NextN mmap-backed, "
                     "MemAvailable=%.1fMB\n",
             (double)total / 1e9, q8_mode == 1 ? "row-int8" :
                                   q8_mode == 2 ? "block64-int8" :
                                   q8_mode == 3 ? "block64-ffn" :
                                   q8_mode == 4 ? "block64-exact" :
+                                  q8_mode == 6 ? "cmg4-k128-a15" :
                                   q8_mode == 5 ? "cmg4-k128" : "reference-q8",
             (double)tf_mem_available_kb() / 1024.0);
     if (getenv("NUMA_REPORT")) {
@@ -7196,7 +7431,7 @@ size_t transformer_materialize_q8_decode(transformer_model *m,
         tf_numa_report_tensor_quarters("Lmid.ffn_gate", &m->layers[mid].ffn_gate);
         tf_numa_report_tensor_quarters("output", &m->output);
     }
-    if (q8_mode == 5 && getenv("TF_CMG4_STRICT")) {
+    if ((q8_mode == 5 || q8_mode == 6) && getenv("TF_CMG4_STRICT")) {
         const void *sample = m->layers[0].ffn_gate.data;
         if (tf_cmg4_verify_large_pages(sample) != 0) {
             fprintf(stderr, "cmg4: strict 2MiB hugepage validation failed\n");
@@ -7702,6 +7937,17 @@ static void tf_ssm_finish_heads(transformer_model *m, int layer_idx,
         for (int i = 0; i < ds; i++) ss += o[i] * o[i];
 #endif
         float scale = 1.0f / sqrtf(ss / ds + m->rms_norm_eps);
+#if defined(__ARM_FEATURE_SVE)
+        if (m->decode_swiglu_approx) {
+            for (int i = 0; i < ds; i += (int)svcntw()) {
+                svbool_t pg = svwhilelt_b32(i, ds);
+                svfloat32_t v = svmul_n_f32_x(pg, svld1(pg, o + i), scale);
+                svst1(pg, o + i, svmul_f32_x(pg, v, svld1(pg, norm_w + i)));
+            }
+            tf_swiglu_approx_sve(o, z, o, ds);
+            continue;
+        }
+#endif
         for (int i = 0; i < ds; i++) {
             float zi = z[i];
             o[i] = o[i] * scale * norm_w[i] *
@@ -7745,7 +7991,12 @@ static void tf_ssm_prepare_conv_worker(transformer_model *m, int layer_idx,
         out[j] = sum;
     }
 #endif
-    for (int j = j0; j < j1; j++) out[j] /= 1.0f + expf(-out[j]);
+#if defined(__ARM_FEATURE_SVE)
+    if (m->decode_swiglu_approx)
+        tf_swiglu_approx_sve(out + j0, out + j0, NULL, j1 - j0);
+    else
+#endif
+        for (int j = j0; j < j1; j++) out[j] /= 1.0f + expf(-out[j]);
 
     /* Channels are independent throughout the depthwise convolution.  Publish
      * this worker's original input to its ring-state slice, then replace only
@@ -8561,13 +8812,31 @@ compact_fallback:
         int tiles = mat->n_cols / Q8_K128_K;
         int g0 = groups * tid / nt, g1 = groups * (tid + 1) / nt;
         size_t group_bytes = (size_t)tiles * Q8_K128_RECORD_BYTES;
+        const q8_k128_a15_activation *aq = NULL;
+        if (mat->q8_k128 == 2) {
+            int lanes = nt >= 4 && nt % 4 == 0 ? 4 : 1;
+            int per = nt / lanes, lane = tid / per;
+            q8_k128_a15_shared *cache = (q8_k128_a15_shared *)mat->q8_a15_shared[lane];
+            if (mat->q8_a15_reuse) {
+                /* The producer is the immediately preceding persistent projection.
+                 * Its immutable activation remains valid until the next layer/token. */
+                int generation = __atomic_load_n(&cache->sense, __ATOMIC_ACQUIRE);
+                aq = cache->data + (size_t)generation * tiles;
+            } else {
+                aq = q8_k128_quantize_a15_shared(cache, x, tiles, tid % per, per);
+            }
+        }
         for (int g = g0; g < g1; g++) {
             float *out = dst + g * Q8_K128_N;
             memset(out, 0, Q8_K128_N * sizeof(float));
             const uint8_t *group = tf_q8_k128_group_ptr(mat, g, group_bytes);
-            for (int k = 0; k < tiles; k++)
-                q8_k128_f32(group + (size_t)k * Q8_K128_RECORD_BYTES,
-                            x + (size_t)k * Q8_K128_K, out);
+            for (int k = 0; k < tiles; k++) {
+                const uint8_t *record = group + (size_t)k * Q8_K128_RECORD_BYTES;
+                if (mat->q8_k128 == 2)
+                    q8_k128_a15_dot(record, aq[k].hi, aq[k].lo, aq[k].scales, out);
+                else
+                    q8_k128_f32(record, x + (size_t)k * Q8_K128_K, out);
+            }
         }
         return;
     }
@@ -9178,8 +9447,11 @@ static void *tf_persistent_worker(void *arg) {
                 }
             }
             tf_spin_barrier(m, &local_sense, nt);  /* B2: Q/K/V ready */
-            if (tid == 0 && tf_dprof > 0)
-                tf_decode_attn_qkv_ms += tf_time_ms() - attn_t0;
+            if (tid == 0 && tf_dprof > 0) {
+                double now = tf_time_ms();
+                tf_decode_attn_qkv_ms += now - attn_t0;
+                attn_t0 = now;
+            }
 
             /* Q heads are independent through de-interleave, normalization,
              * bias, and RoPE.  The optional head-owned path leaves K/V and
@@ -9375,7 +9647,11 @@ static void *tf_persistent_worker(void *arg) {
             tf_spin_barrier(m, &local_sense, nt);  /* B4: xb2 ready */
 
             /* Output projection: all threads compute their row partition */
-            attn_t0 = (tid == 0 && tf_dprof > 0) ? tf_time_ms() : 0.0;
+            if (tid == 0 && tf_dprof > 0) {
+                double now = tf_time_ms();
+                tf_decode_attn_core_ms += now - attn_t0;
+                attn_t0 = now;
+            }
             tf_thread_matvec_overlap_reduce(m, m->xb, &layer->attn_output,
                                             m->xb2, n_embd, tid, nt,
                                             m->tp_attn_sharded, &local_sense);
@@ -9416,7 +9692,18 @@ static void *tf_persistent_worker(void *arg) {
                 tf_thread_matvec(m->ffn_buf2, &layer->ffn_up, m->xb, n_ff, tid, nt);
             }
 
-            /* SiLU×mul on this thread's row partition (no barrier needed) */
+#if defined(__ARM_FEATURE_SVE)
+            /* The reference/fused Q8 and block64 paths also partition row
+             * groups, but their group size depends on runtime kernel options.
+             * Synchronize before the generic row-wise consumer.  Packed K128
+             * keeps matching producer/consumer groups below without a barrier. */
+            if ((layer->ffn_gate.type == GGML_TYPE_Q8_0 ||
+                 layer->ffn_up.type == GGML_TYPE_Q8_0) &&
+                !(layer->ffn_gate.q8_k128 && layer->ffn_up.q8_k128))
+                tf_spin_barrier(m, &local_sense, nt);
+#endif
+
+            /* SiLU×mul on this thread's matching or synchronized row partition. */
             {
                 int rp = n_ff / nt, re = n_ff % nt;
                 int rs = tid * rp + (tid < re ? tid : re);
@@ -9425,10 +9712,28 @@ static void *tf_persistent_worker(void *arg) {
                  * rows. Consume the same groups here: there is deliberately
                  * no barrier between the projections and this activation. */
 #if defined(__ARM_FEATURE_SVE)
+#if defined(TF_LINK_Q8_K128)
+                /* Packed Q8 producers own complete Q8_K128_N-row groups.  Consume
+                 * exactly those rows before the barrier; the ordinary row
+                 * split can otherwise read a neighboring worker's unfinished
+                 * gate/up outputs. */
+                if (layer->ffn_gate.q8_k128 && layer->ffn_up.q8_k128) {
+                    int groups = n_ff / Q8_K128_N;
+                    rs = (groups * tid / nt) * Q8_K128_N;
+                    rc = (groups * (tid + 1) / nt) * Q8_K128_N - rs;
+                }
+#endif
                 if (layer->ffn_gate.type == GGML_TYPE_BF16 && layer->ffn_gate.bf16_pv &&
                     layer->ffn_up.type == GGML_TYPE_BF16 && layer->ffn_up.bf16_pv) {
                     tf_swiglu_pv_worker(m->ffn_buf3, m->ffn_buf1, m->ffn_buf2,
                                          n_ff, tid, nt);
+                    rc = 0;
+                }
+#endif
+#if defined(__ARM_FEATURE_SVE)
+                if (m->decode_swiglu_approx) {
+                    tf_swiglu_approx_sve(m->ffn_buf3 + rs, m->ffn_buf1 + rs,
+                                         m->ffn_buf2 + rs, rc);
                     rc = 0;
                 }
 #endif
@@ -11064,7 +11369,7 @@ void transformer_free_unused_kv(transformer_model *model, int layer_start, int l
         for (int l = 0; l < model->n_layers; l++) {
             if (l < layer_start || l >= layer_end) {
                 free(model->conv_state[l]);     model->conv_state[l] = NULL;
-                free(model->recurrent_state[l]); model->recurrent_state[l] = NULL;
+                tf_free_recurrent_state(model, l);
             }
         }
     }

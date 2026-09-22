@@ -27,7 +27,7 @@ extern double tf_decode_matvec_ms;
 extern double tf_decode_matvec_bytes;
 extern double tf_decode_null_bytes;
 extern long tf_decode_matvec_cnt;
-extern double tf_decode_attn_qkv_ms, tf_decode_attn_out_ms;
+extern double tf_decode_attn_qkv_ms, tf_decode_attn_core_ms, tf_decode_attn_out_ms;
 extern double tf_decode_ssm_in_ms, tf_decode_ssm_prepare_ms, tf_decode_ssm_core_ms, tf_decode_ssm_out_ms;
 extern double tf_decode_ffn_gateup_ms, tf_decode_ffn_down_ms;
 extern double tf_decode_lm_head_ms;
@@ -115,21 +115,47 @@ static int run_benchmark(transformer_model *m, bpe_vocab *v, int32_t *tok,
             }
             for (int i = 0; i < pn; i++) tok[i] = base[i % base_nt];
 
+            int dump_tokens = getenv("TF_DUMP_TOKENS") && atoi(getenv("TF_DUMP_TOKENS"));
+            float trace_logits[gn];
             for (int trial = 0; trial < total_trials; trial++) {
                 transformer_reset_runtime_state(m);
                 bench_profile_reset();
                 double pf0 = now_sec();
+                float *logits = NULL;
                 for (int pos = 0; pos < pn; pos++)
-                    transformer_forward_logits(m, tok[pos], pos);
+                    logits = transformer_forward_logits(m, tok[pos], pos);
                 double pf = now_sec() - pf0;
 
                 int32_t cur = transformer_last_argmax(m);
+                bench_profile_reset(); /* Exclude prefill from decode stage counters. */
                 double dec0 = now_sec();
                 for (int n = 0; n < gn; n++) {
-                    transformer_forward_logits(m, cur, pn + n);
+                    if (dump_tokens) {
+                        tok[pn + n] = cur;
+                        trace_logits[n] = logits[cur];
+                    }
+                    logits = transformer_forward_logits(m, cur, pn + n);
                     cur = transformer_last_argmax(m);
                 }
                 double dec = now_sec() - dec0;
+                if (dump_tokens) {
+                    for (int n = 0; n < gn; n++)
+                        fprintf(stderr, "qwen38: bench-token trial=%d warmup=%d n=%d pos=%d id=%d logit=%a\n",
+                                trial, trial < warmup, n, pn + n, tok[pn + n], trace_logits[n]);
+                }
+                if (getenv("TF_DPROF")) {
+                    fprintf(stderr, "qwen38: bench trial=%d warmup=%d decode=%.3f tok/s "
+                            "stages ms/tok attn_qkv=%.3f attn_core=%.3f attn_out=%.3f "
+                            "ssm_in=%.3f ssm_prepare=%.3f ssm_core=%.3f ssm_out=%.3f "
+                            "ffn_gateup=%.3f ffn_down=%.3f lm_head=%.3f\n",
+                            trial, trial < warmup, gn / dec,
+                            tf_decode_attn_qkv_ms / gn, tf_decode_attn_core_ms / gn,
+                            tf_decode_attn_out_ms / gn,
+                            tf_decode_ssm_in_ms / gn, tf_decode_ssm_prepare_ms / gn,
+                            tf_decode_ssm_core_ms / gn, tf_decode_ssm_out_ms / gn,
+                            tf_decode_ffn_gateup_ms / gn, tf_decode_ffn_down_ms / gn,
+                            tf_decode_lm_head_ms / gn);
+                }
 
                 if (trial >= warmup) {
                     pf_sum += pf;
@@ -175,7 +201,7 @@ static int run_benchmark(transformer_model *m, bpe_vocab *v, int32_t *tok,
 static void usage(const char *p) {
     fprintf(stderr, "usage: %s MODEL --prompt TEXT [--max-gen N] [--max-seq N] "
                     "[--threads N] [--spec-k 0..4] [--mmap] "
-                    "[--q8-mode auto|reference|cmg4|block64|block64-ffn|block64-exact|row] "
+                    "[--fast-swiglu] [--q8-mode auto|reference|cmg4|cmg4-a15|block64|block64-ffn|block64-exact|row] "
                     "[--bench --bench-prompt N[,N...] --bench-gen N[,N...] "
                     "--bench-runs N --bench-warmup N --bench-csv]\n", p);
 }
@@ -186,6 +212,7 @@ int main(int argc, char **argv) {
     const char *bench_prompt_arg = "512";
     const char *bench_gen_arg = "128";
     int max_gen = 16, max_seq = 512, threads = 48, spec_k = 0, mmap_weights = 0;
+    int fast_swiglu = 0;
     int bench = 0, bench_runs = 3, bench_warmup = 1, bench_csv = 0;
     int bench_prompt_sizes[QWEN38_BENCH_MAX_CASES];
     int bench_gen_sizes[QWEN38_BENCH_MAX_CASES];
@@ -203,6 +230,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--bench-gen") && ++i < argc) bench_gen_arg = argv[i];
         else if (!strcmp(argv[i], "--bench-runs") && ++i < argc) bench_runs = atoi(argv[i]);
         else if (!strcmp(argv[i], "--bench-warmup") && ++i < argc) bench_warmup = atoi(argv[i]);
+        else if (!strcmp(argv[i], "--fast-swiglu")) fast_swiglu = 1;
         else if (!strcmp(argv[i], "--bench-csv")) bench_csv = 1;
         else if (argv[i][0] != '-' && !path) path = argv[i];
         else { usage(argv[0]); return 2; }
@@ -215,6 +243,7 @@ int main(int argc, char **argv) {
     if (strcmp(q8_mode, "auto") && strcmp(q8_mode, "reference") &&
         strcmp(q8_mode, "block64") && strcmp(q8_mode, "block64-ffn") &&
         strcmp(q8_mode, "block64-exact") && strcmp(q8_mode, "cmg4") &&
+        strcmp(q8_mode, "cmg4-a15") &&
         strcmp(q8_mode, "row")) {
         usage(argv[0]); return 2;
     }
@@ -231,11 +260,11 @@ int main(int argc, char **argv) {
         n_bench_gen = parse_int_list(bench_gen_arg, bench_gen_sizes,
                                      QWEN38_BENCH_MAX_CASES);
     }
-    if (!strcmp(q8_mode, "cmg4") && threads != 48) {
+    if ((!strcmp(q8_mode, "cmg4") || !strcmp(q8_mode, "cmg4-a15")) && threads != 48) {
         fprintf(stderr, "qwen38: --q8-mode cmg4 requires --threads 48\n");
         return 2;
     }
-    if (!strcmp(q8_mode, "cmg4")) {
+    if ((!strcmp(q8_mode, "cmg4") || !strcmp(q8_mode, "cmg4-a15"))) {
         char *resolved = realpath(path, NULL);
         if (!resolved || strncmp(resolved, "/local/", 7) != 0) {
             fprintf(stderr, "qwen38: cmg4 weights must first be staged under /local\n");
@@ -266,6 +295,7 @@ int main(int argc, char **argv) {
     bpe_vocab *v = bpe_vocab_load(g);
     transformer_model *m = transformer_load(g, max_seq);
     if (!v || !m) return 1;
+    m->decode_swiglu_approx = fast_swiglu;
     if (threads > 1) transformer_set_threads(m, threads);
     size_t q8_resident = 0;
     if (q8_model && !mmap_weights) {
@@ -277,7 +307,8 @@ int main(int argc, char **argv) {
                             !strcmp(q8_mode, "block64") ? 2 :
                             !strcmp(q8_mode, "block64-ffn") ? 3 :
                             !strcmp(q8_mode, "block64-exact") ? 4 :
-                            !strcmp(q8_mode, "cmg4") ? 5 : 0;
+                            !strcmp(q8_mode, "cmg4") ? 5 :
+                            !strcmp(q8_mode, "cmg4-a15") ? 6 : 0;
         q8_resident = transformer_materialize_q8_decode(m, g, resident_mode);
         if (!q8_resident) return 1;
     } else if (!mmap_weights) {
@@ -329,6 +360,7 @@ int main(int argc, char **argv) {
     if (module_profile) setenv("TF_DPROF", "1", 1);
     tf_decode_matvec_ms = tf_decode_matvec_bytes = 0.0;
     tf_decode_matvec_cnt = 0;
+    tf_decode_attn_core_ms = 0.0;
     tf_decode_attn_qkv_ms = tf_decode_attn_out_ms = 0.0;
     tf_decode_ssm_in_ms = tf_decode_ssm_prepare_ms = tf_decode_ssm_core_ms = tf_decode_ssm_out_ms = 0.0;
     tf_decode_ffn_gateup_ms = tf_decode_ffn_down_ms = tf_decode_lm_head_ms = 0.0;
@@ -352,6 +384,7 @@ int main(int argc, char **argv) {
     tf_decode_matvec_bytes = 0.0;
     tf_decode_null_bytes = 0.0;
     tf_decode_matvec_cnt = 0;
+    tf_decode_attn_core_ms = 0.0;
     tf_decode_attn_qkv_ms = tf_decode_attn_out_ms = 0.0;
     tf_decode_ssm_in_ms = tf_decode_ssm_prepare_ms = tf_decode_ssm_core_ms = tf_decode_ssm_out_ms = 0.0;
     tf_decode_ffn_gateup_ms = tf_decode_ffn_down_ms = 0.0;
