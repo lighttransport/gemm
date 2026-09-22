@@ -78,7 +78,7 @@ fail:
     return -1;
 }
 
-static int q21_layout_attention_allowed(const q21_joint_layout *layout, int query, int key) {
+static inline int q21_layout_attention_allowed(const q21_joint_layout *layout, int query, int key) {
     if(query<0 || key<0 || query>=layout->n || key>=layout->n)return 0;
     return query>=key || (layout->image_id[query]>=0 && layout->image_id[query]==layout->image_id[key]);
 }

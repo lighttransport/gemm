@@ -1828,17 +1828,6 @@ static CUdeviceptr qimg_st_upload_bf16_gpucast(cuda_qimg_runner *r,
 /* Forward decl: pinned host source override for streamed block tensors. */
 static const void *qimg_tensor_host_src(struct cuda_qimg_runner *r, st_context *st, int idx);
 
-static int qimg_st_upload_fp8_raw_async(st_context *st, const char *name,
-                                         CUdeviceptr dst, size_t dst_nbytes,
-                                         CUstream s) {
-    int idx = safetensors_find(st, name);
-    if (idx < 0) return -1;
-    size_t nbytes = safetensors_nbytes(st, idx);
-    if (nbytes != dst_nbytes) return -1;
-    cuMemcpyHtoDAsync(dst, safetensors_data(st, idx), nbytes, s);
-    return 0;
-}
-
 /* Pinned-aware variant — used by streaming hot path. Passes runner so the
  * helper can substitute a pinned host source when one was pre-staged. */
 static int qimg_st_upload_fp8_raw_async_r(struct cuda_qimg_runner *r,
@@ -3200,7 +3189,7 @@ static int qimg_f32_split_apply_tensor_attn_priority(const char *env, int split_
     return (qimg_f32_split_env_is_auto(env) && tensor_attn_active) ? 0 : split_kv;
 }
 
-static int qimg_bf16_split_kv_from_env(const char *env, int n_tok) {
+static int qimg_bf16_split_kv_from_env(const char *env) {
     if (!env || env[0] == '\0' || env[0] == '0') return 0;
     if (strcmp(env, "auto") == 0) {
         return 0;
@@ -3272,7 +3261,7 @@ static void op_attn(cuda_qimg_runner *r, CUdeviceptr d_out, CUdeviceptr d_q,
             cast_buf_f32_to_bf16(r, r->d_q_bf16, d_q, n_elem);
             cast_buf_f32_to_bf16(r, r->d_k_bf16, d_k, n_elem);
             cast_buf_f32_to_bf16(r, r->d_v_bf16, d_v, n_elem);
-            int bf16_split_kv = qimg_bf16_split_kv_from_env(getenv("QIMG_BF16_SPLIT_KV"), n_tok);
+            int bf16_split_kv = qimg_bf16_split_kv_from_env(getenv("QIMG_BF16_SPLIT_KV"));
             if (bf16_split_kv > 0 && head_dim == 128 &&
                 r->flash_attn_bf16_tc_split_partials && r->attn_split_merge_f32) {
                 int n_splits = (n_tok + bf16_split_kv - 1) / bf16_split_kv;

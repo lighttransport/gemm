@@ -261,7 +261,7 @@ static inline uint8_t cu_f32_to_fp8_e4m3(float f) {
 
 /* ---- Raw GPU upload (synchronous) ---- */
 
-static CUdeviceptr cu_upload_raw(const void *data, size_t bytes) {
+static inline CUdeviceptr cu_upload_raw(const void *data, size_t bytes) {
     if (!data || bytes == 0) return 0;
     CUdeviceptr d;
     if (cuMemAlloc(&d, bytes) != CUDA_SUCCESS) return 0;
