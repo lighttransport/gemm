@@ -1204,8 +1204,9 @@ input. Add `--verbose` for finite-value stage probes.
 
 ## Hybrid native image generation
 
-For an end-to-end smoke image, the orchestration script uses the validated
-Python text encoder, runs all denoising steps in the native executable, then
+For a text-to-image smoke image, the orchestration script uses the native
+Hugging Face JSON tokenizer and validated CUDA text encoder, runs all
+denoising steps in the native executable, then
 decodes the final normalized latents with `AutoencoderKLQwenImage21` after that
 native subprocess exits. This process boundary prevents the transformer
 allocations from competing with the VAE on the 16 GB RTX 5060 Ti:
@@ -1220,6 +1221,22 @@ tmp/qimg21-ref-venv/bin/python cuda/qimg21/native_generate.py \
   --out tmp/qimg21-native-generate.png
 ```
 
+The native tokenizer reproduces the processor's Qwen ChatML template and
+system-prefix crop. For `a red apple on a white table`, all 29 pre-crop token
+IDs match the official processor exactly and the 15-token native embedding is
+bit-identical to the pinned PyTorch reference (cosine 1.0, maximum absolute
+error 0). The empty negative prompt likewise matches all 23 token IDs and its
+9-token embedding bit-for-bit. A CPU-only token check is available without
+loading model weights:
+
+```sh
+cuda/qimg21/test_cuda_qimg21_text \
+  --model /mnt/nvme01/models/qimg-21 \
+  --prompt "a red apple on a white table" \
+  --dump-tokens tmp/qimg21-native-tokens.txt
+diff -u tmp/qimg21-token-ref/tokens.txt tmp/qimg21-native-tokens.txt
+```
+
 The work directory contains `prompt/prompt_embeds.npy`, the deterministic
 initial `latents.npy`, one `steps/step_XXX.npy` file per Euler update, and the
 final `native_latents.npy`. These arrays are the hand-off points for comparing
@@ -1228,8 +1245,9 @@ the native transformer/scheduler against the PyTorch reference.
 Add `--native-vae` to use the native F32 CUDA decoder. It reads the original
 VAE safetensors, applies latent denormalization and the learned post-quant
 convolution, then runs the residual/attention/upsampling graph and clamps the
-RGBA result. Text encoding still uses Python. This decoder supports single
-images; editing parity and peak-memory validation remain work in progress.
+RGBA result. Text-only prompt encoding is native; image editing still uses
+the Python multimodal processor/vision encoder boundary. This decoder supports
+single images; editing parity and peak-memory validation remain work in progress.
 The separate single-frame encoder is described below. Decoder kernels and residual copies share the default CUDA stream
 to avoid races with the shared VAE helpers' synchronous device copies.
 

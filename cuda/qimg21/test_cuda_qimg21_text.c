@@ -1,11 +1,16 @@
-/* Experimental streamed Qwen3-VL text encoder, original BF16 checkpoint.
- * Tokenization stays external. Input is unpadded text-only token IDs, one
- * whitespace-separated integer per token. No vision, KV cache, or LM head.
+/* Streamed Qwen3-VL text encoder, original BF16 checkpoint. Input may be a
+ * native-tokenized prompt or unpadded text-only token IDs. No vision, KV
+ * cache, or LM head.
  * Reuse the denoiser's checked weight upload and BF16 GEMM infrastructure. */
 #define main qimg21_denoiser_main
 #include "test_cuda_qimg21_native.c"
 #undef main
 #include "text_kernels.h"
+#define GGUF_LOADER_IMPLEMENTATION
+#include "../../common/gguf_loader.h"
+#define BPE_TOKENIZER_IMPLEMENTATION
+#include "../../common/bpe_tokenizer.h"
+#include "qwen_tokenizer_json.h"
 
 static int text_bf16_gemm_output = 1;
 typedef int (*q21_cutlass_text_attention_fn)(float *, const void *, const void *,
@@ -62,12 +67,16 @@ static int text_norm(cuda_qimg_runner *r, CUfunction fn, const qimg21_shards *s,
 
 int main(int argc, char **argv) {
     const char *model = NULL, *tokens = NULL, *out = NULL, *dump_dir = NULL;
+    const char *dump_tokens = NULL;
+    const char *prompt = NULL;
     const char *attention_mode = "custom";
     int drop = 0, layers = 36, dump_layer = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--model") && i + 1 < argc) model = argv[++i];
         else if (!strcmp(argv[i], "--tokens") && i + 1 < argc) tokens = argv[++i];
+        else if (!strcmp(argv[i], "--prompt") && i + 1 < argc) prompt = argv[++i];
         else if (!strcmp(argv[i], "--out") && i + 1 < argc) out = argv[++i];
+        else if (!strcmp(argv[i], "--dump-tokens") && i + 1 < argc) dump_tokens = argv[++i];
         else if (!strcmp(argv[i], "--dump-dir") && i + 1 < argc) dump_dir = argv[++i];
         else if (!strcmp(argv[i], "--attention") && i + 1 < argc) attention_mode = argv[++i];
         else if (!strcmp(argv[i], "--bf16-gemm-output")) text_bf16_gemm_output = 1;
@@ -77,32 +86,50 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--dump-layer") && i + 1 < argc) dump_layer = atoi(argv[++i]);
         else { fprintf(stderr, "text: unknown/incomplete option %s\n", argv[i]); return 2; }
     }
-    if (!model || !tokens || !out ||
+    if (!model || (!!tokens == !!prompt) || (!out && !dump_tokens) ||
         (strcmp(attention_mode, "custom") && strcmp(attention_mode, "cutlass-efficient") &&
          strcmp(attention_mode, "flash-exact")) ||
         drop < 0 || layers < 1 || layers > 36 ||
         dump_layer < 0 || dump_layer >= layers) {
-        fprintf(stderr, "usage: %s --model DIR --tokens ids.txt --out embeds.npy "
+        fprintf(stderr, "usage: %s --model DIR (--tokens ids.txt | --prompt TEXT) "
+                        "[--out embeds.npy] [--dump-tokens ids.txt] "
                         "[--attention custom|cutlass-efficient|flash-exact --drop-prefix N "
                         "--max-layers 36 --dump-layer N]\n", argv[0]); return 2;
     }
-    int ids[4096], n = 0, scanned;
-    char word[64];
-    FILE *fp = fopen(tokens, "r");
-    if (!fp) return 1;
-    while ((scanned = fscanf(fp, "%63s", word)) == 1) {
-        char *end;
-        errno = 0;
-        long token = strtol(word, &end, 10);
-        if (errno || *end || n == 4096 || token < 0 || token >= 151936 ||
-            token == 151655 || token == 151656 || token == 151652 || token == 151653) {
-            fprintf(stderr, "text: invalid token/vision input or more than 4096 tokens\n");
-            fclose(fp); return 1;
+    int ids[4096], n = 0, scanned = EOF;
+    if (prompt) {
+        char tokenizer_path[2048];
+        int length = snprintf(tokenizer_path, sizeof(tokenizer_path),
+                              "%s/processor/tokenizer.json", model);
+        n = length < 0 || length >= (int)sizeof(tokenizer_path) ? -1 :
+            q21_build_prompt_tokens(tokenizer_path, prompt, ids, 4096, &drop);
+        if (n < 0) { fprintf(stderr,"text: native tokenization failed\n"); return 1; }
+        fprintf(stderr,"text: native tokenizer produced %d tokens, drop-prefix=%d\n",n,drop);
+    } else {
+        char word[64];
+        FILE *fp = fopen(tokens, "r");
+        if (!fp) return 1;
+        while ((scanned = fscanf(fp, "%63s", word)) == 1) {
+            char *end;
+            errno = 0;
+            long token = strtol(word, &end, 10);
+            if (errno || *end || n == 4096 || token < 0 || token >= 151936 ||
+                token == 151655 || token == 151656 || token == 151652 || token == 151653) {
+                fprintf(stderr, "text: invalid token/vision input or more than 4096 tokens\n");
+                fclose(fp); return 1;
+            }
+            ids[n++] = token;
         }
-        ids[n++] = token;
+        fclose(fp);
     }
-    fclose(fp);
     if (scanned != EOF || n <= drop) return 1;
+    if (dump_tokens) {
+        FILE *fp = fopen(dump_tokens, "w");
+        if (!fp) { perror("text: open token dump"); return 1; }
+        for (int i = 0; i < n; i++) fprintf(fp, "%d\n", ids[i]);
+        if (fclose(fp)) { perror("text: close token dump"); return 1; }
+    }
+    if (!out) return 0;
 
     int rc = 1;
     qimg21_shards shards = {{0}, 0};

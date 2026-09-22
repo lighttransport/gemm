@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Run native Qwen-Image 2.1 denoising with an optional native CUDA VAE.
 
-The text/vision encoder remains the Diffusers boundary for now. This
-driver turns its prompt embedding into an F32 fixture, invokes the native
+Text-only generation uses the native tokenizer and CUDA text encoder. Image
+editing retains the Diffusers vision-encoder boundary for now. This driver
+turns the prompt embedding into an F32 fixture, invokes the native
 NVRTC/CUDA transformer for the complete FlowMatch schedule, and only loads the
 Qwen-Image 2.1 VAE after the native subprocess exits.  That process boundary
 lets the transformer release all of its allocations before the decoder claims
@@ -147,10 +148,25 @@ def main() -> int:
     prompt_dir.mkdir(parents=True, exist_ok=True)
     steps_dir.mkdir(parents=True, exist_ok=True)
 
-    # --test-text uses the exact Qwen3-VL tokenizer/text encoder from the
-    # reference runner and writes prompt_embeds.npy.  With a negative prompt
-    # it also writes a second embedding fixture for native true CFG.
-    text_command = [
+    prompt_path = prompt_dir / "prompt_embeds.npy"
+    if not args.image:
+        text_encoder = root / "cuda/qimg21/test_cuda_qimg21_text"
+        if not text_encoder.exists():
+            raise SystemExit("native text encoder missing; run `make -C cuda/qimg21 native-text-exact`")
+        _run([
+            str(text_encoder), "--model", str(model), "--prompt", args.prompt,
+            "--attention", "flash-exact", "--out", str(prompt_path),
+        ], cwd=root)
+        if args.negative_prompt is not None:
+            _run([
+                str(text_encoder), "--model", str(model), "--prompt", args.negative_prompt,
+                "--attention", "flash-exact", "--out",
+                str(prompt_dir / "negative_prompt_embeds.npy"),
+            ], cwd=root)
+    else:
+        # Image editing still needs the reference multimodal processor and
+        # vision encoder; the language-only encoder above is fully native.
+        text_command = [
             sys.executable,
             str(root / "cuda/qimg21/test_cuda_qimg21.py"),
             "--test-text",
@@ -165,12 +181,10 @@ def main() -> int:
             "--out",
             str(prompt_dir / "text_smoke.png"),
         ]
-    if args.negative_prompt is not None:
-        text_command.extend(["--negative-prompt", args.negative_prompt])
-    if args.image:
+        if args.negative_prompt is not None:
+            text_command.extend(["--negative-prompt", args.negative_prompt])
         text_command.extend(["--image", str(condition_dir / "resized.png")])
-    _run(text_command, cwd=root)
-    prompt_path = prompt_dir / "prompt_embeds.npy"
+        _run(text_command, cwd=root)
     if not prompt_path.exists():
         raise SystemExit(f"text runner did not produce {prompt_path}")
 

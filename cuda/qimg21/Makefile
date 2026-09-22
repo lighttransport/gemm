@@ -63,7 +63,7 @@ test_edit_kernels: test_edit_kernels.c edit_kernels.h joint_layout.h test_cuda_q
 	$(CC) -O2 -std=c11 -D_GNU_SOURCE -Wall -Wextra -I../../common -I../../cuda -I../qimg \
 		-o $@ test_edit_kernels.c ../../cuda/cuew.c ../../cuda/cublasew.c -ldl -lm -lpthread
 
-test_cuda_qimg21_text: test_cuda_qimg21_text.c text_kernels.h quant_weights.h test_cuda_qimg21_native.c ../../cuda/cuew.c ../../cuda/cublasew.c
+test_cuda_qimg21_text: test_cuda_qimg21_text.c qwen_tokenizer_json.h text_kernels.h quant_weights.h test_cuda_qimg21_native.c ../../common/bpe_tokenizer.h ../../common/glm5_bpe.h ../../common/gguf_loader.h ../../cuda/cuew.c ../../cuda/cublasew.c
 	$(CC) -O2 -std=c11 -D_GNU_SOURCE -Wall -Wextra -I../../common -I../../cuda -I../qimg \
 		-o $@ test_cuda_qimg21_text.c ../../cuda/cuew.c ../../cuda/cublasew.c -ldl -lm -lpthread
 
