@@ -1501,6 +1501,10 @@ uses the exact separate deinterleave, Q/K norm, and RoPE sequence.  The scalar
 control and fast profile both now complete with identical hash
 `8a44087a5472a2e2` (29.42 and 29.25 decode tok/s respectively at the 512-token
 smoke gate), so the setup crash is fixed without changing output quality.
+The launcher now forwards the existing mixed-IQ QKV and gate/up A/B controls.
+At randomized 64K, enabling both fused candidates retained suffix hash
+`7463f176c9b85ba3` but measured 35.00 tok/s versus 35.59 tok/s for the default
+path, so the candidates remain opt-in.
 
 2026-09-22 continuation: the one-row IQ2/IQ3/IQ4 kernels now declare their
 output, weight, activation, and scale buffers non-aliasing.  This preserves

@@ -1553,6 +1553,10 @@ retain the scalar I/O fallback.
    deinterleave/QK-norm/RoPE sequence is the default.  Scalar and fast profile
    smoke gates now both pass with hash `8a44087a5472a2e2` (29.42 and 29.25
    decode tok/s), fixing setup without changing output quality.
+   The launcher now forwards the mixed-IQ QKV and gate/up A/B controls.  A
+   randomized 64K run with both candidates preserved suffix hash
+   `7463f176c9b85ba3` but reached 35.00 tok/s versus 35.59 tok/s for the
+   default path, so neither is promoted.
 
 Each optimization should retain the exact sequence hash and response bytes at
 K=4 and K=7, compile the emitted program, and cover non-coding prompts plus

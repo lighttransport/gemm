@@ -318,7 +318,10 @@ fi
 diag_env=()
 for diag_name in LLM_LOGITS_PATH LLM_GEN_TEXT LLM_DEBUG_LAYERS \
                  LLM_DEBUG_DUMP_DIR LLM_DEBUG_ATTN_LAYER LLM_DEBUG_DUMP_SEQUENCE \
-                 LLM_QWEN35_PROFILE_DECODE LLM_QWEN35_PROFILE_PREFILL; do
+                 LLM_QWEN35_PROFILE_DECODE LLM_QWEN35_PROFILE_PREFILL \
+                 LLM_QWEN35_QK_FUSED LLM_QWEN35_IQ_SHAPE_THREADS \
+                 LLM_QWEN35_IQ_MIXED_THREADS LLM_QWEN35_IQ_MIXED_QKV_FUSED \
+                 LLM_QWEN35_IQ_MIXED_GATEUP_FUSED; do
     if [[ -v "${diag_name}" ]]; then
         diag_env+=("${diag_name}=${!diag_name}")
     fi
