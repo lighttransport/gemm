@@ -31,6 +31,7 @@ static const char *vision_front_src =
 "__device__ LNStat ln_combine(LNStat dataB,LNStat dataA){float count=dataA.count+dataB.count;if(count<=0.f)return {0.f,0.f,0.f};float coef=__frcp_rn(count),nA=dataA.count*coef,nB=dataB.count*coef,delta=dataB.mean-dataA.mean;return {nA*dataA.mean+nB*dataB.mean,dataA.var+dataB.var+delta*delta*dataA.count*nB,count};}\n"
 "__global__ void layer_norm(float*y,const float*x,const float*w,const float*b,int d){int r=blockIdx.x,t=threadIdx.x,l=t&31,warp=t>>5;__shared__ float sm[12];LNStat s={0.f,0.f,0.f};int nv=d/4;for(int vi=t;vi<nv;vi+=256){int j=vi*4;s=ln_add(s,x[r*d+j]);s=ln_add(s,x[r*d+j+1]);s=ln_add(s,x[r*d+j+2]);s=ln_add(s,x[r*d+j+3]);}for(int off=16;off;off>>=1){LNStat q={__shfl_down_sync(0xffffffff,s.mean,off),__shfl_down_sync(0xffffffff,s.var,off),__shfl_down_sync(0xffffffff,s.count,off)};s=ln_combine(s,q);}for(int off=4;off;off>>=1){if(l==0&&warp>=off&&warp<2*off){int z=warp-off;sm[2*z]=s.mean;sm[2*z+1]=s.var;sm[8+z]=s.count;}__syncthreads();if(l==0&&warp<off){LNStat q={sm[2*warp],sm[2*warp+1],sm[8+warp]};s=ln_combine(s,q);}__syncthreads();}if(t==0){sm[0]=s.mean;sm[1]=s.var*__frcp_rn((float)d);}__syncthreads();float mean=sm[0],iv=rsqrtf(sm[1]+1e-6f);for(int j=t;j<d;j+=256)y[r*d+j]=rb(w[j]*(iv*(x[r*d+j]-mean))+b[j]);}\n"
 "__global__ void linear_epilogue(float*y,const float*x,const float*b,int d,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n*d)y[i]=rb(x[i]+b[i%d]);}\n"
+"__global__ void patch_epilogue(float*y,const float*x,const float*b,int d,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n*d)y[i]=rb(rb(x[i])+b[i%d]);}\n"
 "__global__ void bf16_epilogue(float*y,const unsigned short*x,const float*b,int d,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n*d)y[i]=rb(__uint_as_float(((unsigned)x[i])<<16)+b[i%d]);}\n"
 "__global__ void vision_rope(float*qkv,const float*table,int n,int gh,int gw){int t=blockIdx.x,h=blockIdx.y,j=threadIdx.x;if(t>=n||h>=16||j>=36)return;int ic=t%2,ir=(t/2)%2,bc=(t/4)%(gw/2),br=t/(4*(gw/2));int coord=j<18?br*2+ir:bc*2+ic,k=j%18;float c=table[(coord*18+k)*2],s=table[(coord*18+k)*2+1];for(int z=0;z<2;z++){int base=t*3456+z*1152+h*72;float u=qkv[base+j],v=qkv[base+j+36];qkv[base+j]=rb(__fadd_rn(__fmul_rn(u,c),__fmul_rn(-v,s)));qkv[base+j+36]=rb(__fadd_rn(__fmul_rn(v,c),__fmul_rn(u,s)));}}\n"
 "__global__ void vision_attn(float*o,const float*qkv,int n){int q=blockIdx.x,h=blockIdx.y,l=threadIdx.x;float qr[3]={0},acc[3]={0};for(int e=0;e<3;e++){int d=l+32*e;if(d<72)qr[e]=qkv[q*3456+h*72+d];}float mx=-1e30f;for(int k=0;k<n;k++){float z=0;for(int e=0;e<3;e++){int d=l+32*e;if(d<72)z+=qr[e]*qkv[k*3456+1152+h*72+d];}for(int s=16;s;s>>=1)z+=__shfl_xor_sync(0xffffffff,z,s);mx=fmaxf(mx,z*0.11785113019775793f);}float den=0;for(int k=0;k<n;k++){float z=0;for(int e=0;e<3;e++){int d=l+32*e;if(d<72)z+=qr[e]*qkv[k*3456+1152+h*72+d];}for(int s=16;s;s>>=1)z+=__shfl_xor_sync(0xffffffff,z,s);float p=expf(z*0.11785113019775793f-mx);den+=p;for(int e=0;e<3;e++){int d=l+32*e;if(d<72)acc[e]+=p*qkv[k*3456+2304+h*72+d];}}for(int e=0;e<3;e++){int d=l+32*e;if(d<72)o[q*1152+h*72+d]=rb(acc[e]/den);}}\n"
@@ -306,7 +307,7 @@ int main(int argc, char **argv) {
     cuda_qimg_runner *r = cuda_qimg_init(0, 1);
     CUmodule module = NULL;
     CUfunction add_pos = NULL, layer_norm = NULL;
-    CUfunction linear_epilogue = NULL, bf16_epilogue = NULL, vision_rope = NULL, vision_attn = NULL;
+    CUfunction linear_epilogue = NULL, patch_epilogue = NULL, bf16_epilogue = NULL, vision_rope = NULL, vision_attn = NULL;
     CUfunction residual = NULL, gelu_tanh = NULL, gelu_exact = NULL;
     CUdeviceptr x = 0, bf = 0, projected = 0, weight = 0, bias = 0, pos = 0, vision_rope_d = 0;
     CUdeviceptr norm = 0, norm_bf = 0, qkv = 0, qkv_bf = 0, att = 0, tmp = 0, mlp = 0;
@@ -335,6 +336,7 @@ int main(int argc, char **argv) {
         cuModuleGetFunction(&add_pos, module, "add_pos") ||
         cuModuleGetFunction(&layer_norm, module, "layer_norm") ||
         cuModuleGetFunction(&linear_epilogue, module, "linear_epilogue") ||
+        cuModuleGetFunction(&patch_epilogue, module, "patch_epilogue") ||
         cuModuleGetFunction(&bf16_epilogue, module, "bf16_epilogue") ||
         cuModuleGetFunction(&vision_rope, module, "vision_rope") ||
         cuModuleGetFunction(&vision_attn, module, "vision_attn") ||
@@ -404,7 +406,7 @@ int main(int argc, char **argv) {
         cuCtxSynchronize()) goto done;
     if (gemm(r, x, weight, bf, n, 1152, 1536)) goto done;
     void *bias_args[] = {&x, &x, &bias, &(int){1152}, &n};
-    if (cuLaunchKernel(linear_epilogue, (count + 255) / 256, 1, 1, 256, 1, 1, 0,
+    if (cuLaunchKernel(patch_epilogue, (count + 255) / 256, 1, 1, 256, 1, 1, 0,
                        r->stream, bias_args, NULL) || cuStreamSynchronize(r->stream)) goto done;
     if (patch_out && (cuMemcpyDtoH(host_out, x, (size_t)count * 4) ||
                       npy_write_f32(patch_out, host_out, (size_t)count, n, 1152))) goto done;

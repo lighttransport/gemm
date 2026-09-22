@@ -114,38 +114,40 @@ For the saved two-step 1024-condition/256-target capture, prediction cosines
 were 0.999891917 and 0.999873082; the trajectory minimum was 0.999863032.
 All are below the 0.99996 gate, so editing parity is not yet established.
 
-The 1024-condition native vision path uses BF16 checkpoint biases converted
-to F32 before its F32 linear epilogue. With the same 1024x1024 input, block-0
-QKV cosine versus CUDA flash vision is 0.9999986. After 27 blocks, merged
-vision features have cosine 0.99545964, and the resulting multimodal prompt
-embedding has cosine 0.93467182 versus CUDA; the latter is not a strict
-text-encoder parity result. Before the bias conversion, merged vision and
-prompt cosines were only 0.17442450 and 0.18132024, respectively. CUDA's
+The 1024-condition native vision path converts BF16 checkpoint biases to F32
+for its F32 linear epilogue and rounds the patch GEMM output to BF16 before
+adding the bias, matching CUDA's two activation boundaries. On the same
+1024x1024 input, patch-projection relative L2 versus CUDA fell from 0.002067
+to 0.000076, and block-0 QKV cosine rose to 0.99999999. After 27 blocks,
+merged vision cosine rose from 0.99545964 to 0.99686712; multimodal prompt
+cosine rose from 0.93467182 to 0.95263400. Before either vision fix,
+merged-vision and prompt cosines were only 0.17442450 and 0.18132024.
+These are CUDA comparisons, not a strict text-encoder parity result. CUDA's
 own flash-versus-scalar vision merged-feature cosine is 0.99794674 on this
 input, so those attention algorithms also differ numerically. The RDNA4
 vision executable defaults to HIP GEMM and scalar HIP attention and does not
 require CUDA/cuDNN plugins; a default-options first-block smoke test is
 byte-identical to the explicit `--attention math` run. Feeding the same
-corrected ROCm vision features to both native text encoders yields prompt
+post-bias-fix ROCm vision features to both native text encoders yields prompt
 cosine 0.99789171. Keeping CUDA text execution but swapping CUDA vision
 features for ROCm vision features yields 0.93445386, locating most of the
 remaining multimodal difference in the vision stack.
 
 For the same 1024x1024 condition and target dimensions, a two-step standalone
-edit took 62.13 seconds end-to-end on the RX 9070 XT with the corrected
+edit took 62.84 seconds end-to-end on the RX 9070 XT with the corrected
 vision encoder, versus 72.87 seconds on
 the RTX 5060 Ti (CUDA `cutlass-efficient` attention). This is a throughput
 comparison, not a same-noise output comparison: CUDA uses PyTorch's seed-42
 noise while ROCm uses NumPy's seed-42 noise.
 
-After correcting the vision bias upload, a standalone 1024x1024/40-step edit
-with native vision, text, denoiser, and VAE completed in 524.20 seconds,
-peaking at 14,123,984 KiB host RSS. All 40 saved latent checkpoints are finite
+With both vision arithmetic fixes, a standalone 1024x1024/40-step edit
+with native vision, text, denoiser, and VAE completed in 521.28 seconds,
+peaking at 14,123,724 KiB host RSS. All 40 saved latent checkpoints are finite
 and the 1024x1024 PNG is valid. With the house source image and the prompt
 "a red apple on a white table", the edit retains the house and adds a small
 apple beside it. This is an execution/visual check, not a matched PyTorch
 editing-parity pass; artifacts are under
-`tmp/qimg21-rdna4-fused-edit-40-1024-biasfix/`.
+`tmp/qimg21-rdna4-fused-edit-40-1024-patchround/`.
 
 This acceptance run uses the saved reference text embedding, so it verifies
 the ROCm denoiser and VAE, not the full native text-encoder accuracy. Native
