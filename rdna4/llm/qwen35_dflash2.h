@@ -38,6 +38,7 @@ typedef struct hllm_qwen35_dflash2 {
     hipFunction_t fn_capture, fn_capture_rmsnorm;
     hipFunction_t fn_conv, fn_attention, fn_attention_combine;
     hipFunction_t fn_attention_fused;
+    hipFunction_t fn_attention_fused_128;
     hipFunction_t fn_topk, fn_select;
     void *fc, *fc_bf16, *enc_norm, *out_norm, *selector_hidden;
     int fc_type, selector_hidden_type;
@@ -365,6 +366,8 @@ int hip_llm_qwen35_dflash2_load(hip_llm_runner *r, const char *path,
                              "qwen35_dflash2_attention_combine") != hipSuccess ||
         hipModuleGetFunction(&d->fn_attention_fused, d->module,
                              "qwen35_dflash2_attention_fused") != hipSuccess ||
+        hipModuleGetFunction(&d->fn_attention_fused_128, d->module,
+                             "qwen35_dflash2_attention_fused_128") != hipSuccess ||
         hipModuleGetFunction(&d->fn_topk, d->module,
                              "qwen35_dflash2_topk") != hipSuccess ||
         hipModuleGetFunction(&d->fn_select, d->module,
@@ -600,7 +603,13 @@ int hip_llm_qwen35_dflash2_propose(hip_llm_runner *r, int32_t anchor,
             void *fa[]={&d->attn,&d->q,&cl->key_cache,&cl->value_cache,&rows,
                 &position,&(int){HLLM_DFLASH_HEADS},&(int){HLLM_DFLASH_KV_HEADS},
                 &(int){HLLM_DFLASH_HEAD_DIM},&window,&splits};
-            LAUNCH(d->fn_attention_fused, HLLM_DFLASH_HEADS,
+            const char *fixed_env = getenv("LLM_QWEN35_DFLASH_FUSED_128");
+            int use_fixed = d->fn_attention_fused_128 &&
+                HLLM_DFLASH_HEAD_DIM == 128 &&
+                fixed_env && atoi(fixed_env) != 0;
+            hipFunction_t fused_fn = use_fixed ? d->fn_attention_fused_128 :
+                d->fn_attention_fused;
+            LAUNCH(fused_fn, HLLM_DFLASH_HEADS,
                    (rows + HLLM_DFLASH_ATTN_ROWS_PER_WAVE - 1) /
                        HLLM_DFLASH_ATTN_ROWS_PER_WAVE, 1,
                    32 * splits,1,1,

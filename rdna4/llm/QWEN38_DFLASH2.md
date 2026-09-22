@@ -64,6 +64,17 @@ C++ quality checks all pass.  This is a small but repeatable sidecar win; the
 ordinary target's random-token 64K decode remains 35.76 tok/s, so the
 long-context 40 tok/s target still requires mixed projection work.
 
+## Fixed-head attention candidate
+
+The sidecar's head dimension is fixed at 128, so an opt-in
+`qwen35_dflash2_attention_fused_128` kernel removes dynamic dimension bounds
+from the fused cache walk without changing the dot, online-softmax, or
+split-merge order. Set `LLM_QWEN35_DFLASH_FUSED_128=1` for an A/B run; the
+validated generic fused kernel remains the default until a resident-device
+quality and throughput gate is available. HIPRTC syntax and host/profile
+checks pass; this environment currently has no `/dev/kfd`, so runtime numbers
+are intentionally pending.
+
 ## DFlash2 long-window split retune (2026-09-22)
 
 The sidecar attention launch now uses twelve partitions once its 2,048-token

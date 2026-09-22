@@ -85,6 +85,19 @@ measuring 35.44 tok/s decode. That is within the established 35.5 tok/s band,
 so the ordinary 40 tok/s target remains open and no IQ1 approximation default
 was changed.
 
+## 2026-09-22 continuation: fixed-head DFlash2 attention candidate
+
+The DFlash2 sidecar has a fixed head dimension of 128. I added an opt-in
+`qwen35_dflash2_attention_fused_128` kernel that keeps the generic fused
+kernel's per-lane dot order, online-softmax update order, and increasing-split
+merge, while removing dynamic head-dimension bounds from the cache walk.
+`LLM_QWEN35_DFLASH_FUSED_128=1` selects it; the validated generic fused
+kernel remains the default until a resident-device A/B confirms both output
+quality and a sustained draft-time gain. HIPRTC device syntax, the C build,
+and profile checks pass here. The runtime harness could not be rerun because
+`/dev/kfd` and the AMD render node are unavailable, so no throughput or
+quality claim is made yet.
+
 ## 2026-09-22 continuation: sidecar overlap ordering hardening
 
 The opt-in `LLM_QWEN35_DFLASH_OVERLAP_INJECT=1` path now records a

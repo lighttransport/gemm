@@ -452,3 +452,121 @@ void qwen35_dflash2_attention_fused(float *out, const float *query,
         }
     }
 }
+
+/* Fixed DFlash2 head shape.  The sidecar is permanently HD=128, so the
+ * bounds checks and dynamic stride arithmetic in the generic fused kernel
+ * only add control pressure to every cache row.  This keeps the same
+ * per-lane dot/reduction order and increasing-split merge, but makes the
+ * four 32-value lanes compile-time complete. */
+extern "C" __global__ __launch_bounds__(512, 1)
+void qwen35_dflash2_attention_fused_128(float *out, const float *query,
+        const float *key_cache, const float *value_cache,
+        int rows, int position_start, int n_heads, int n_kv_heads,
+        int head_dim, int window, int splits) {
+    (void)head_dim;
+    constexpr int HD = 128;
+    constexpr int ROWS = DFLASH_ATTN_ROWS_PER_WAVE;
+    constexpr int TILE = HD + 2;
+    int head = blockIdx.x;
+    int row0 = blockIdx.y * ROWS;
+    int split = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    if (head >= n_heads || row0 >= rows || split >= splits || lane >= 32 ||
+        splits < 1 || splits > 12) return;
+    int ratio = n_heads / n_kv_heads;
+    int kv_head = head / ratio;
+    int q_stride = n_heads * HD;
+    int kv_stride = n_kv_heads * HD;
+    int end = position_start + rows;
+    int begin = end > window ? end - window : 0;
+    int length = end - begin;
+    int split_begin = begin + (length * split) / splits;
+    int split_end = begin + (length * (split + 1)) / splits;
+    float maximum[ROWS] = {-3.402823466e+38f, -3.402823466e+38f,
+                           -3.402823466e+38f, -3.402823466e+38f};
+    float normalizer[ROWS] = {};
+    float accum[ROWS][4] = {};
+    const float scale = rsqrtf((float)HD);
+
+    for (int pos = split_begin; pos < split_end; ++pos) {
+        int slot = pos % window;
+        size_t cache = (size_t)slot * kv_stride + kv_head * HD;
+        float kval[4], vval[4];
+#pragma unroll
+        for (int part = 0; part < 4; ++part) {
+            int dim = lane + part * 32;
+            kval[part] = key_cache[cache + dim];
+            vval[part] = value_cache[cache + dim];
+        }
+#pragma unroll
+        for (int r = 0; r < ROWS; ++r) {
+            if (row0 + r < rows) {
+                size_t qbase = (size_t)(row0 + r) * q_stride + head * HD;
+                float dot = 0.0f;
+#pragma unroll
+                for (int part = 0; part < 4; ++part)
+                    dot += query[qbase + lane + part * 32] * kval[part];
+                dot += __shfl_xor(dot, 16, 32);
+                dot += __shfl_xor(dot, 8, 32);
+                dot += __shfl_xor(dot, 4, 32);
+                dot += __shfl_xor(dot, 2, 32);
+                dot += __shfl_xor(dot, 1, 32);
+                float score = dot * scale;
+                float next_max = fmaxf(maximum[r], score);
+                float alpha = maximum[r] < -1.0e30f ? 0.0f :
+                              expf(maximum[r] - next_max);
+                float probability = expf(score - next_max);
+                normalizer[r] = normalizer[r] * alpha + probability;
+#pragma unroll
+                for (int part = 0; part < 4; ++part)
+                    accum[r][part] = accum[r][part] * alpha +
+                                     probability * vval[part];
+                maximum[r] = next_max;
+            }
+        }
+    }
+
+    extern __shared__ float merged[];
+    for (int r = 0; r < ROWS; ++r) {
+        if (row0 + r < rows) {
+            size_t base = ((size_t)split * ROWS + r) * TILE;
+#pragma unroll
+            for (int part = 0; part < 4; ++part)
+                merged[base + lane + part * 32] = accum[r][part];
+            if (lane == 0) {
+                merged[base + HD] = maximum[r];
+                merged[base + HD + 1] = normalizer[r];
+            }
+        }
+    }
+    __syncthreads();
+    if (split != 0) return;
+    for (int r = 0; r < ROWS; ++r) {
+        if (row0 + r >= rows) continue;
+        float final_max = -3.402823466e+38f;
+        float final_norm = 0.0f;
+        float final_accum[4] = {};
+        for (int s = 0; s < 12; ++s) {
+            if (s >= splits) break;
+            size_t base = ((size_t)s * ROWS + r) * TILE;
+            float part_max = merged[base + HD];
+            float part_norm = merged[base + HD + 1];
+            float next_max = fmaxf(final_max, part_max);
+            float alpha = final_max < -1.0e30f ? 0.0f :
+                          expf(final_max - next_max);
+            float beta = part_max < -1.0e30f ? 0.0f :
+                         expf(part_max - next_max);
+            final_norm = final_norm * alpha + part_norm * beta;
+#pragma unroll
+            for (int part = 0; part < 4; ++part)
+                final_accum[part] = final_accum[part] * alpha +
+                                    merged[base + lane + part * 32] * beta;
+            final_max = next_max;
+        }
+        size_t out_base = ((size_t)(row0 + r) * n_heads + head) * HD;
+#pragma unroll
+        for (int part = 0; part < 4; ++part)
+            out[out_base + lane + part * 32] = final_accum[part] /
+                (final_norm > 0.0f ? final_norm : 1.0f);
+    }
+}
