@@ -1565,6 +1565,10 @@ retain the scalar I/O fallback.
    The real batched-SSM dispatch (`LLM_QWEN35_BATCH_SSM=1`) likewise retained
    the exact suffix but measured 35.44 tok/s decode and 443.74 tok/s prefill
    on the repeated 64K gate, so it is rejected for the production default.
+   SSM preparation fusion (`LLM_SSM_BATCH_PREP_FUSE=1`) measured 35.52/443.62
+   tok/s and SSM warp geometry (`LLM_SSM_BATCH_WARP=1`) measured 35.42 tok/s
+   at the repeated-gate minimum; both retained the exact suffix but failed to
+   improve the control and remain diagnostic.
 
 Each optimization should retain the exact sequence hash and response bytes at
 K=4 and K=7, compile the emitted program, and cover non-coding prompts plus
