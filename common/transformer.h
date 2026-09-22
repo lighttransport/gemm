@@ -1281,7 +1281,7 @@ static inline void tf_nvfp4_dot4_w4a8_sve(float *o0, float *o1, float *o2, float
                                            const block_nvfp4 *b2, const block_nvfp4 *b3,
                                            const int8_t *xq, const float *xs, int n) {
     static const int8_t codes[16] = {0,1,2,3,4,6,8,12,0,-1,-2,-3,-4,-6,-8,-12};
-    const svbool_t p32 = svwhilelt_b32((uint64_t)0, (uint64_t)8);
+    const svbool_t p32 = svwhilelt_b32((uint64_t)0, (uint64_t)4);
     const svbool_t p8 = svwhilelt_b8((uint64_t)0, (uint64_t)8);
     const svint8_t lut = svld1_s8(svptrue_b8(), codes);
     svfloat32_t a0=svdup_f32(0.f), a1=a0, a2=a0, a3=a0;
@@ -1306,10 +1306,11 @@ static inline void tf_nvfp4_dot4_w4a8_sve(float *o0, float *o1, float *o2, float
             svint8_t h3=svtbl_s8(lut,svlsr_n_u8_x(p8,z3,4));
             const int base=ib*64+s*16;
             svint8_t xl=svld1_s8(p8,xq+base),xh=svld1_s8(p8,xq+base+8);
-            svint32_t d0=svadd_s32_x(p32,svdot_s32(svdup_s32(0),l0,xl),svdot_s32(svdup_s32(0),h0,xh));
-            svint32_t d1=svadd_s32_x(p32,svdot_s32(svdup_s32(0),l1,xl),svdot_s32(svdup_s32(0),h1,xh));
-            svint32_t d2=svadd_s32_x(p32,svdot_s32(svdup_s32(0),l2,xl),svdot_s32(svdup_s32(0),h2,xh));
-            svint32_t d3=svadd_s32_x(p32,svdot_s32(svdup_s32(0),l3,xl),svdot_s32(svdup_s32(0),h3,xh));
+            svint8_t xv=svzip1_s8(xl,xh);
+            svint32_t d0=svdot_s32(svdup_s32(0),svzip1_s8(l0,h0),xv);
+            svint32_t d1=svdot_s32(svdup_s32(0),svzip1_s8(l1,h1),xv);
+            svint32_t d2=svdot_s32(svdup_s32(0),svzip1_s8(l2,h2),xv);
+            svint32_t d3=svdot_s32(svdup_s32(0),svzip1_s8(l3,h3),xv);
             a0=svmla_x(p32,a0,svcvt_f32_s32_x(p32,d0),scale0);
             a1=svmla_x(p32,a1,svcvt_f32_s32_x(p32,d1),scale1);
             a2=svmla_x(p32,a2,svcvt_f32_s32_x(p32,d2),scale2);
