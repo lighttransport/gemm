@@ -1511,6 +1511,11 @@ and sustained 20.50 tok/s with exact hash `b63380a1a3e5d3b2`. Enabling both
 exact MTP pair-batch projection switches was neutral on the 4K fixture
 (49.04 versus 49.07 tok/s, identical hash `96b92d606dde5e28`), so those
 switches remain opt-in.
+The next exact candidate sweep was also negative: MTP IQ1/Q81 reuse measured
+48.99 tok/s versus 49.07 tok/s control, and split residual RMSNorm measured
+48.15 tok/s; both retained hash `96b92d606dde5e28`. DFlash K=4 QKV + gate/up
++ SiLU fusion retained hash `15f17d2640c1adfc` but measured 55.61--58.19
+tok/s, below the serialized/fused control range, so all remain opt-in.
 
 2026-09-22 continuation: the one-row IQ2/IQ3/IQ4 kernels now declare their
 output, weight, activation, and scale buffers non-aliasing.  This preserves
