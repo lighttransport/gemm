@@ -366,6 +366,43 @@ replace the slow attention fusion design; evaluate additional draft projection
 candidates; measure sustained overlap benefit before promotion; broaden
 long-context quality beyond this bounded coding workload.
 
+## Restored GPU validation (2026-09-22)
+
+DFlash2 K=7 GPU check (same 4096-token coding prompt, Q8/Q8, chunk 512,
+greedy seed 42, up to 64 generated tokens, two repeats per configuration):
+
+| Configuration | Cold / warm decode tok/s |
+| --- | --- |
+| Control | 79.38 / 83.57 |
+| Grouped combine mode 3 | 81.61 / 83.27 |
+| Fused split/combine | 72.76 / 76.22 |
+| Fused checkpoint copy | 81.75 / 83.66 |
+
+All eight runs stopped at EOS after 46 emitted tokens, retained sequence hash
+`15f17d2640c1adfc`, and produced byte-identical text to a fresh pinned
+llama.cpp Q8/Q8 reference run. Text SHA-256 (between generation markers):
+`c6c83e1a21f5e487b27bb7bbf08e778e7bc20d3d4d67d1dd05a940178804eef1`.
+The generated clamp function compiled as C++17 and passed ten boundary cases.
+This validates this bounded greedy workload, not general logit equivalence or
+seeded sampling. Earlier 64-token hashes are not directly comparable to these shorter
+EOS-aware runs. No candidate merits promotion
+from these timings; long-context verifier and sampled K=4/K=7 gates remain.
+Commands and logs are in `rdna4/llm/tmp/gpu-access-dflash-ab.sh`,
+`gpu-access-dflash-tail.sh`, `gpu-access-dflash-{control,grouped,fused,commit}.log`,
+and `gpu-access-llama.log` in that same directory.
+
+The RX 9070 XT is accessible outside the execution sandbox. The rebuilt
+ordinary Q8/Q8 runner passed the random-token 64K gate at 446.81 tok/s
+prefill and 35.42/35.40/32.21 tok/s decode, with identical token hashes.
+
+GPU A/B with `LLM_QWEN35_IQ_MIXED_QKV_FUSED=1` and
+`LLM_QWEN35_IQ_MIXED_GATEUP_FUSED=1` (default 256 threads) retained depth
+hash `90178de69a24a76e` and all three 512-token suffix hashes
+`36a22439594d4e43`. Prefill was 445.07 tok/s; decode was
+34.78/34.74/34.73 tok/s, below the control's first two 35.42/35.40 runs
+(control third run 32.21). This does not justify promotion; retain opt-in.
+Log: `rdna4/llm/tmp/gpu-access-64k-mixed256.log`.
+
 ## IQ4_XS sidecar projection staging reuse (2026-09-22)
 
 The multi-row IQ4_XS sidecar dispatcher now reuses its exact Q8_1 activation
@@ -431,6 +468,18 @@ compared with 274.5--283.8 ms and 55.51--56.19 tok/s for the previous
 multi8 path. The K=7 path continues to use multi8: a sanity gate retained
 140/134, hash `44915ec1039a64c8`, and 74.79 tok/s.
 
+The K=7 window has a fixed eight-row shape (one anchor plus seven mask rows).
+An opt-in `LLM_QWEN35_DFLASH_Q4K_FIXED8=1` candidate now removes the
+multi8 kernel's runtime row-count predicates while retaining its Q4_K affine
+correction, packed dot order, and warp reduction. The reference multi8 path
+remains the default until a resident K=7 hash and draft-time A/B run show a
+repeatable gain.
+
+The same fixed-row specialization is available to the opt-in fused Q/K/V and
+gate/up projection path as `LLM_QWEN35_DFLASH_QKV_FIXED8=1`. It only changes
+the activation-row predicate in the existing fused kernel; output row ranges,
+weight decoding, and reduction order are unchanged.
+
 ## Fused sidecar attention merge (2026-09-22)
 
 The DFlash2 verifier now uses a fused attention kernel for schedules of up to
@@ -486,6 +535,13 @@ row grid, but preserves the standalone kernel's arithmetic for each row.
 Defaults remain unchanged until a resident-device A/B validates exact token and
 logit hashes together with a sustained 64K decode improvement.
 
+All native Q2/IQ projection and opt-in Q/K/V or gate/up fusion entry points now
+share an explicit Q8_1 readiness guard.  A partial diagnostic load or failed
+scratch allocation therefore falls back to the reference projection dispatcher
+instead of launching a native kernel with an incomplete activation tile.  This
+is a fail-closed robustness change; successful launches and production defaults
+are unchanged.
+
 The dense FFN path also exposes `LLM_QWEN35_IQ3_GATEUP_FUSED=1` when gate and
 up are matching IQ3_XXS matrices. It reuses the Q/K/V kernel with the V range
 disabled, so both one-token projections share codebook staging and one launch
@@ -507,8 +563,12 @@ reduction order. This remains diagnostic pending resident parity and 64K timing.
 The verifier combine tail exposes
 `LLM_QWEN35_VERIFY_COMBINE_GROUPED=3` for a sixteen-row block. It covers the
 full verifier batch in one metadata tile and retains the existing row-wise
-split arithmetic, including the gated form. The four-row default remains the
-production choice until resident long-context parity and timing are measured.
+split arithmetic, including the gated form. Shorter windows select the four- or eight-row kernel. The serialized combine
+remains the production choice until resident parity and timing are measured.
+The grouped launch now supplies the gate pointer required by gated kernels;
+previously it passed the ungated argument layout.
+`python3 rdna4/llm/test_verifier_launch.py` covers 36 host dispatch cases and
+rejects the original missing-gate layout; GPU parity is checked separately.
 
 Mixed-IQ attention layers can also opt into
 `LLM_QWEN35_IQ3S_QKV_FUSED=1` when Q, K, and V are all IQ3_S with a common
@@ -618,6 +678,23 @@ eight-row block candidate with the same exact reduction order. It remains an
 explicit probe until resident long-context hashes and timing justify it. The
 grouped launch uses only the kernel's static metadata tile, so no redundant
 dynamic shared-memory reservation is requested.
+
+The grouped selector now also uses the captured query count: four-row and
+eight-row windows select the narrowest exact metadata tile even when mode `3`
+is enabled, while a full sixteen-row window retains the sixteen-row candidate.
+This removes unused shared rows and allocation for short K=4/K=7 verifier
+graphs without changing the kernel ABI or split-combine arithmetic.
+
+The verifier also exposes an experimental
+`LLM_QWEN35_VERIFY_FUSED_SPLIT_COMBINE=1` path. A verifier-only block owns one
+head and four adjacent rows, walks each split, writes the existing partial
+buffers, and performs the same increasing-split merge before publishing the
+gated output. The captured parts/meta workspace ABI remains unchanged. This
+path serializes split work inside a block and therefore remains disabled by
+default pending resident long-context hashes and timing. A one-split window
+publishes directly from the local reduction and applies the gate in place,
+avoiding a needless partial-buffer round trip while retaining the same
+single-split arithmetic.
 
 Both grouped candidates now calculate each query's adaptive split count once
 into shared metadata before loading or merging that query. The gated recurrent
@@ -1089,7 +1166,17 @@ the K and V ranges into a private strided tile; the existing exact Q/K norm,
 RoPE, and cache-store kernels consume that tile without a split copy. Layers
 with unsupported weight types keep the separate BF16 GEMMs. This changes only
 the opt-in injection path and still needs resident cache-hash and quality
-validation before it can be considered for a serving default.
+validation before it can be considered for a serving default. The overlap
+workspace check accepts either this fused K/V allocation or a complete
+separate K/V pair, while rejecting incomplete layer workspaces before the
+private stream is used.
+
+The sidecar also exposes the diagnostic
+`LLM_QWEN35_DFLASH_QKNORM_ROPE_FUSED=1` path. It combines K RMSNorm and
+M-RoPE after injection, retaining the reference reduction and rotation order
+while removing one intermediate read/write and launch per layer. The
+two-launch path remains the default until resident cache hashes and draft-time
+measurements validate the candidate.
 
 The real-GPU quality harness now runs the resident JSONL protocol directly and
 then exposes the same backend through HTTP.  It checks greedy and seeded
@@ -1156,6 +1243,11 @@ reflects the remaining measured costs.
    logit matrix is complete. A WMMA or reordered
    reduction path needs full output-token and logit validation because the
    current kernels preserve the target arithmetic order.
+   The mixed IQ1 gate/up candidate now stages the packed 2K-entry IQ1 codebook
+   once per block in LDS before evaluating either output range. This removes
+   repeated global codebook reads while preserving the existing IQ1_S and
+   IQ1_M dot, affine, and warp-reduction order; it remains behind the same
+   diagnostic fusion switch pending resident parity and timing.
    The IQ1_M one-row F32 kernel now uses explicit non-aliasing qualifiers and
    unrolled four-value FMA halves; a matched 4K random gate moved 43.64 to
    43.72 tok/s with the same sequence hash.  A fused IQ1_S Q8_1 gate plus
@@ -1188,6 +1280,72 @@ reflects the remaining measured costs.
    retains the tall 128-thread geometry used by standalone 5120-column FFN
    rows. The fused path still runs the ordinary SiLU stage separately and is
    diagnostic until resident logits, hashes, and 64K timing prove a gain.
+   Ordinary all-Q4_K attention has a separate diagnostic
+   `LLM_QWEN35_Q4K_QKV_FUSED=1` candidate. It reuses the DFlash Q4_K/Q8_1
+   multi-output kernel for a single Q/K/V row and one activation-quantization
+   launch, removing two projection launch boundaries. It remains opt-in
+   because Q8_1 staging changes the serialized Q4_K arithmetic contract and
+   needs resident logits, hashes, and sustained 64K validation. The launcher
+   checks the Q8_1 batch scratch pointers before selecting it, so allocation
+   failure falls back to the serialized projection path safely.
+   Mixed native IQ2/IQ3/IQ4 attention has a separate diagnostic
+   `LLM_QWEN35_IQ_MIXED_QKV_FUSED=1` path. It shares one Q8_1 activation and
+   stages all supported small codebooks once per block, while selecting the
+   exact standalone arithmetic for each Q, K, and V row range. The serialized
+   dispatcher remains the default until resident mixed-format logits, token
+   hashes, and random-64K timing validate the launch reduction. LDS staging is
+   format-aware, so each block loads only the codebooks selected by its Q/K/V
+   row kinds. `LLM_QWEN35_IQ_MIXED_THREADS=512` is an additional cached
+   geometry probe; unset or invalid values retain 256 threads and all
+   production defaults remain unchanged.
+   Heterogeneous dense FFN gate/up pairs can use the related diagnostic
+   `LLM_QWEN35_IQ_MIXED_GATEUP_FUSED=1` path. It uses the same format-aware
+   kernel with an empty V range, so only the gate and up row ranges execute;
+   equal-format pairs and unsupported metadata retain their existing
+   format-specific or serialized dispatch.
+   Same-format IQ2_S gate/up pairs have a separate diagnostic
+   `LLM_QWEN35_IQ2S_GATEUP_FUSED=1` switch because they have no existing
+   dedicated native gate/up entry point.
+   Same-format IQ2_S attention rows can use
+   `LLM_QWEN35_IQ2S_QKV_FUSED=1` for the analogous one-launch Q/K/V candidate;
+   the serialized three-projection path remains the default.
+   The fused selector also specializes the common K=4 proposal window with
+   `qwen35_matvec_q4k_q81_qkv_fixed4`, matching the existing fixed-seven
+   candidate and preserving the generic vocabulary/rank output layout.
+   The opt-in one-row projection helpers also reject zero-width metadata before
+   launching activation quantization, keeping malformed shapes on fallback.
+   The shared hipBLASLt bridge rejects non-positive M/N/K or batch dimensions
+   before plan creation, so malformed sidecar shapes cannot reach the library.
+   Its strided-batch entry point rejects non-positive batch counts before the
+   batch-1 fast path, so invalid metadata cannot be silently reinterpreted as
+   a single-row GEMM.
+   Its initialization path rolls back partially-created hipBLAS and hipBLASLt
+   objects when a handle, preference, or preference-attribute call fails, so an
+   optional retry cannot inherit stale library state.
+   The lazy per-stream workspace map is protected by a narrow mutex; target
+   and sidecar launches still execute on their own HIP streams, while
+   concurrent first-use allocation cannot race or duplicate a scratch pointer.
+   Plan initialization and cache insertion use a separate short-lived lock, so
+   concurrent shape misses cannot corrupt the shared plan map or duplicate a
+   heuristic query; heap-stable plan entries prevent a later unordered-map
+   rehash from invalidating a plan already being submitted; matmul submission
+   remains outside both cache locks.
+   The shared-handle F16 fallback similarly guards stream selection through
+   enqueue, avoiding cross-context stream substitution while leaving device
+   work asynchronous.
+   Mutable bias and epilogue descriptor attributes are protected through their
+   enqueue transaction as well, preserving per-request bias pointers when
+   target and sidecar contexts submit concurrently.
+   Reset and MTP rollback now skip the pre-wait target synchronize when an
+   injection is pending; the overlap helper inserts the event dependency and
+   one host-visible fence, while the no-overlap path retains its original
+   fence.
+   The other DFlash Q8_1 projection and fused-SiLU candidates use the same
+   scratch guard, keeping partial allocator failures on their native fallback.
+   The one-row IQ dispatch snapshots the immutable MMQ-D4 quantizer and
+   IQ-shape-thread options once per process instead of re-reading the
+   environment for every projection. Default selection and arithmetic are
+   unchanged; this only removes repeated host-side option parsing.
 2. **Verifier attention tail.** The query-grid verifier now selects ordinary
    decode's split count independently for every causal row. Equal-split
    windows now select a dedicated captured shared-K/V graph; split boundaries
@@ -1209,6 +1367,12 @@ reflects the remaining measured costs.
    26 tokens because live state remains at the transaction origin; retain
    explicit accepted-row publication.
 
+   The opt-in fused publication's unaligned hidden/logit scalar loops now
+   copy every element, fixing a stride-of-four indexing bug. Run
+   `python3 rdna4/llm/test_verifier_commit_copy.py` for 256 CPU cases executing
+   the production copy bodies against full-row references and destination
+   sentinels; this does not replace resident GPU parity or timing tests.
+
    The checkpoint copy path now makes the row-major convolution and recurrent
    strides explicit, so a DFlash window commits only its accepted row. GPU
    HTTP and pinned llama.cpp gates retain greedy and seeded-sampled token/byte
@@ -1224,7 +1388,19 @@ reflects the remaining measured costs.
    The opt-in fused recurrent commit copy now sizes its grid for the largest
    recurrent state, hidden row, or vocabulary-logits row. This prevents a
    large vocabulary from leaving the tail of the accepted logits row
-   unpublished; the ordinary two-launch publication remains unchanged.
+   unpublished; the ordinary two-launch publication remains unchanged. The
+   copy kernel also avoids rewriting the scalar tail after its unaligned-stride
+   path has already covered the row, while retaining the same accepted-row
+   ordering and checkpoint publication semantics. It also publishes a final
+   1--3-float tail for convolution and recurrent snapshots when a state length
+   is not divisible by four; aligned shapes stay on the vector path, while
+   genuinely unaligned strides use a complete scalar copy so a vector load
+never crosses a row boundary. The host grid uses ceil division, keeping
+that tail path reachable for sub-four-float states too; an empty state is
+clamped to one block rather than issuing a zero-grid launch. The fused
+selector now requires at least one recurrent layer because its layer-zero
+branch publishes the accepted hidden/logits row; zero-layer configurations
+retain the scalar I/O fallback.
 
    A three-repeat DeltaNet warp-per-row batch probe averaged 38.99 tok/s on
    the seeded sampled 4K gate versus 38.94 tok/s for the reference-order
@@ -1242,6 +1418,18 @@ reflects the remaining measured costs.
    being treated as portable-cache validation.
    Batched verifier SSM alpha/beta preparation now uses one elementwise launch
    for softplus/scale and sigmoid, with exact llama.cpp hashes preserved.
+   When both alpha and beta weights are F16 with matching shapes, the verifier
+   now also has an exact batched pair matvec behind
+   `LLM_QWEN35_MTP_F16_PAIR_BATCH=1`. It flattens both output ranges into one
+   launch over the same verifier rows while retaining the standalone half2 FMA
+   and XOR reduction order. BF16 or mismatched shapes retain the independent
+   kernels, and the new path is covered by the profile guard but remains
+   unmeasured on gfx1201 until a resident run is available.
+   Matching BF16 alpha/beta projections have the corresponding opt-in
+   `LLM_QWEN35_MTP_BF16_PAIR_BATCH=1` path. It retains the standalone BF16
+   conversion/FMA/XOR order and llama.cpp block-size heuristic while removing
+   the second launch; F16 and mismatched shapes are unchanged, and resident
+   parity/timing is still required before changing defaults.
    A verifier-only eight-row combine kernel was also tested against the
    random-token 64K gate.  It remained exact but measured 28.52 tok/s versus
    the retained 28.82 tok/s dense-MTP control, so the generic captured combine
@@ -1299,6 +1487,20 @@ reflects the remaining measured costs.
    available through `LLM_QWEN35_DFLASH_SELECTOR_WARP=1`; both variants are
    diagnostic until resident K=4/K=7 hashes and draft-time measurements show a
    quality-safe gain.
+   An opt-in `LLM_QWEN35_DFLASH_SELECTOR_FUSED=1` candidate combines the
+   vocabulary-logit and rank-256 selector-hidden Q4_K projections after one
+   Q8_1 activation staging. The two output ranges keep their independent row
+   layouts and reduction order; the serialized projections remain the default
+   until resident selector hashes and draft timing validate the launch saving.
+   The K=7 selector shape selects a fixed-seven activation-count variant of
+   the same kernel, removing its final runtime row predicate without changing
+   the output layout.
+   The proposal Q/K preparation now has a separate
+   `LLM_QWEN35_DFLASH_QKNORM_ROPE_PAIR_FUSED=1` candidate. It combines the
+   paired Q/K norm reductions and both M-RoPE transforms after the projection
+   grid, retaining the normalized global store barrier and rotation order
+   while replacing four launches with one. The established four-launch path
+   remains the serving default pending resident K=4/K=7 hash and timing gates.
 6. **Prompt-cache injection.**  Feature capture now shares the target
    RMSNorm kernel and both 4K and random-64K prefill retain their targets.
    The hipBLASLt bridge now allocates scratch lazily per HIP stream, so a
@@ -1310,7 +1512,21 @@ reflects the remaining measured costs.
    passes all HTTP/stdio and C++ checks.  A matched 4K K=7 run measured
    27.03 tok/s overlap versus 27.21 tok/s serialized with the same sequence
    hash, so the serial path remains the production default until overlap
-   demonstrates a real throughput gain.
+   demonstrates a real throughput gain.  If injection or event recording
+   fails after enqueue, the private stream is now synchronized and marked
+   idle before the error escapes, preventing a later proposal from reusing
+   live scratch.  Permanent overlap setup failures also set a runner-local
+   disabled bit, so later commits immediately use serialized injection
+   instead of retrying failed stream, event, or workspace allocation.
+   A request that exceeds the private eight-row overlap tile also falls back
+   to the serialized injector after retiring any pending private work, so the
+   optional overlap path cannot turn a larger future batch into a request
+   failure. The public commit entry point also waits on any prior pending
+   injection, protecting private scratch if a caller skips a proposal
+   boundary. MTP and full runner reset paths retire pending overlap work before
+   snapshot restore or new-request cache initialization; their reset-only wait
+   synchronizes the target stream so completion is host-visible before
+   synchronous restore copies.
 
 Each optimization should retain the exact sequence hash and response bytes at
 K=4 and K=7, compile the emitted program, and cover non-coding prompts plus
