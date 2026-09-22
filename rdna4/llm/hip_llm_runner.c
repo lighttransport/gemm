@@ -371,6 +371,39 @@ static const char *hip_kernel_source =
 "    if(i<rec_elements/4)((uint4 *)rec_dst[layer])[i]=\n"
 "        ((const uint4 *)rec_src[layer])[(size_t)row*(rec_stride/4)+i];\n"
 "}\n"
+"__global__ void copy_state_rows_commit_f32(float **conv_dst,\n"
+"        const float **conv_src, size_t conv_elements, size_t conv_stride,\n"
+"        float **rec_dst, const float **rec_src, size_t rec_elements,\n"
+"        size_t rec_stride, int row, int layers, float *x_dst,\n"
+"        const float *x_src, size_t x_elements, size_t x_stride,\n"
+"        float *logits_dst, const float *logits_src, size_t logits_elements,\n"
+"        size_t logits_stride) {\n"
+"    int layer=blockIdx.y; size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;\n"
+"    if(layer>=layers)return;\n"
+"    if(i<conv_elements/4)((uint4 *)conv_dst[layer])[i]=\n"
+"        ((const uint4 *)conv_src[layer])[(size_t)row*(conv_stride/4)+i];\n"
+"    if(i<rec_elements/4)((uint4 *)rec_dst[layer])[i]=\n"
+"        ((const uint4 *)rec_src[layer])[(size_t)row*(rec_stride/4)+i];\n"
+"    if(layer==0){\n"
+"        size_t nt=(size_t)gridDim.x*blockDim.x;\n"
+"        if(!(x_stride&3)){\n"
+"            for(size_t j=i;j<x_elements/4;j+=nt)\n"
+"                ((uint4 *)x_dst)[j]=((const uint4 *)x_src)[(size_t)row*(x_stride/4)+j];\n"
+"        } else for(size_t j=i*4;j<x_elements;j+=nt*4)\n"
+"            x_dst[j]=x_src[(size_t)row*x_stride+j];\n"
+"        if(!(logits_stride&3)){\n"
+"            for(size_t j=i;j<logits_elements/4;j+=nt)\n"
+"                ((uint4 *)logits_dst)[j]=((const uint4 *)logits_src)[(size_t)row*(logits_stride/4)+j];\n"
+"        } else for(size_t j=i*4;j<logits_elements;j+=nt*4)\n"
+"            logits_dst[j]=logits_src[(size_t)row*logits_stride+j];\n"
+"        size_t x_tail=(x_elements/4)*4;\n"
+"        for(size_t j=x_tail+i;j<x_elements;j+=nt)\n"
+"            x_dst[j]=x_src[(size_t)row*x_stride+j];\n"
+"        size_t logits_tail=(logits_elements/4)*4;\n"
+"        for(size_t j=logits_tail+i;j<logits_elements;j+=nt)\n"
+"            logits_dst[j]=logits_src[(size_t)row*logits_stride+j];\n"
+"    }\n"
+"}\n"
 "__global__ void hc_norm_f32(float *dst, const float *x, const float *w,\n"
 "                            int n_embd, int n_stream, float eps) {\n"
 "    int s = blockIdx.x; if (s >= n_stream) return;\n"
@@ -13076,7 +13109,7 @@ struct hip_llm_runner {
     hipFunction_t fn_qwen4_selected_attn_i8_warp;
     hipFunction_t fn_qwen4_argmax;
     hipFunction_t fn_qwen4_argmax_batch;
-    hipFunction_t fn_copy_state_rows_f32;
+    hipFunction_t fn_copy_state_rows_f32, fn_copy_state_rows_commit_f32;
     hipFunction_t fn_qwen4_qsa_scores;
     hipFunction_t fn_qwen4_qsa_sort_blocks;
     hipFunction_t fn_qwen4_qsa_merge_ids;
@@ -14202,6 +14235,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(qwen4_argmax);
     GET_FUNC(qwen4_argmax_batch);
     GET_FUNC(copy_state_rows_f32);
+    GET_FUNC(copy_state_rows_commit_f32);
     GET_FUNC(qwen4_qsa_scores);
     GET_FUNC(qwen4_qsa_sort_blocks);
     GET_FUNC(qwen4_qsa_merge_ids);

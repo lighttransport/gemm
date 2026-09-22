@@ -170,6 +170,13 @@ accumulation still visits all 256 terms in the original order. The selector
 tie break and predecessor chain are unchanged; the serialized 32-thread path
 remains the default pending resident K=4/K=7 hashes and draft-time A/B data.
 
+The verifier commit boundary also has an opt-in
+`LLM_QWEN35_COMMIT_FUSED_COPY=1` kernel. It retains the existing per-layer
+checkpoint pointer-table copies and folds the accepted hidden/logit device
+copies into that launch; position publication remains ordered by the existing
+host-to-device copy. The reference three-copy path remains the default until
+resident accepted-row hashes and commit timing are measured.
+
 ## 2026-09-22 continuation: IQ2_XXS block-shape probe
 
 I tested 128- and 512-thread blocks for the native one-row IQ2_XXS kernel

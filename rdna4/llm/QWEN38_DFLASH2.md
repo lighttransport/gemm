@@ -148,6 +148,11 @@ preserves selector tie breaks and the predecessor chain; the serialized
 32-thread path remains the default pending resident K=4/K=7 hash and draft-time
 A/B measurements.
 
+The verifier commit boundary has an opt-in
+`LLM_QWEN35_COMMIT_FUSED_COPY=1` path that copies checkpoint state plus the
+accepted hidden/logit rows in one device launch. It leaves position publication
+and the default reference ordering unchanged pending resident commit/hash A/B.
+
 The opt-in cache-injection overlap path now consumes captured feature rows
 directly after the target-ready event, eliminating a redundant device copy.
 Sidecar `x`/norm/K/V workspaces remain stream-private, and the inject-done
