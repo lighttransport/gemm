@@ -1516,6 +1516,11 @@ tested geometries: 4 splits reached 55.10 tok/s, 8 reached 56.80 tok/s, and
 12 reached 56.94 tok/s, confirming the 12-split default. The exact ordinary
 SSM-fused decode candidate also retained the 64K hash `7463f176c9b85ba3` but
 measured 35.57 tok/s, so it remains opt-in.
+The post-change llama.cpp HIP differential was rerun successfully: all
+49,188,864 bitwise Q8/Q8 comparisons passed, including random-like 64K K/V
+patterns, adaptive split counts, and multi-query reuse shapes. This keeps the
+Q8/Q8 attention and cache contract intact while the ordinary single-query
+projection/SSM bottleneck remains open.
 The next exact candidate sweep was also negative: MTP IQ1/Q81 reuse measured
 48.99 tok/s versus 49.07 tok/s control, and split residual RMSNorm measured
 48.15 tok/s; both retained hash `96b92d606dde5e28`. DFlash K=4 QKV + gate/up
