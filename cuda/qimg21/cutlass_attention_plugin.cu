@@ -183,6 +183,59 @@ extern "C" int q21_cutlass_attention(float *out, const void *q, const void *k,
     return error;
 }
 
+/* Qwen3-VL vision attention. Q/K/V are interleaved per token as
+ * [token, 3, heads, head_dim] BF16. The sm80 PyTorch kernel specialization
+ * supports runtime head dimensions up to its 128-element template bound. */
+extern "C" int q21_cutlass_vision_attention(float *out, const void *qkv,
+                                              int tokens, int heads,
+                                              int head_dim,
+                                              cudaStream_t stream) {
+    if (!out || !qkv || tokens <= 0 || heads <= 0 || head_dim <= 0 || head_dim > 128)
+        return cudaErrorInvalidValue;
+    typename q21_kernel::Params params;
+    const auto *base = static_cast<const cutlass::bfloat16_t *>(qkv);
+    int plane = heads * head_dim;
+    params.query_ptr = base;
+    params.key_ptr = base + plane;
+    params.value_ptr = base + 2 * plane;
+    int lse_queries = ((tokens + q21_kernel::kAlignLSE - 1) /
+                       q21_kernel::kAlignLSE) * q21_kernel::kAlignLSE;
+    size_t output_bytes = static_cast<size_t>(tokens) * plane * sizeof(*workspace.output);
+    size_t lse_bytes = static_cast<size_t>(lse_queries) * heads * sizeof(*workspace.lse);
+    cudaError_t error = q21_reserve_workspace(output_bytes, lse_bytes);
+    if (error != cudaSuccess) return error;
+    params.output_ptr = workspace.output;
+    params.logsumexp_ptr = workspace.lse;
+    params.scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(head_dim)));
+    params.head_dim = params.head_dim_value = head_dim;
+    params.num_queries = tokens;
+    params.num_keys = params.num_keys_absolute = tokens;
+    params.q_strideM = params.k_strideM = params.v_strideM = 3 * plane;
+    params.o_strideM = plane;
+    params.q_strideH = params.k_strideH = params.v_strideH = head_dim;
+    params.q_strideB = params.k_strideB = params.v_strideB =
+        static_cast<int64_t>(tokens) * 3 * plane;
+    params.num_batches = 1;
+    params.num_heads = heads;
+    params.q_heads_per_kv = 1;
+    size_t shared_bytes = sizeof(typename q21_kernel::SharedStorage);
+    error = cudaFuncSetAttribute(q21_cutlass_attention_kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(shared_bytes));
+    if (error == cudaSuccess) {
+        dim3 grid((tokens + q21_kernel::kQueriesPerBlock - 1) /
+                  q21_kernel::kQueriesPerBlock, heads, 1);
+        q21_cutlass_attention_kernel<<<grid, params.getThreadsGrid(), shared_bytes, stream>>>(params);
+        error = cudaGetLastError();
+    }
+    if (error == cudaSuccess) {
+        int count = tokens * plane;
+        q21_cutlass_bf16_to_f32<<<(count + 255) / 256, 256, 0, stream>>>(
+            out, workspace.output, count);
+        error = cudaGetLastError();
+    }
+    return error;
+}
+
 /* Text-only causal GQA entry point. Q is [N,32,128], K/V are [N,8,128]. */
 extern "C" int q21_cutlass_text_attention(float *out, const void *q,
                                             const void *k, const void *v,

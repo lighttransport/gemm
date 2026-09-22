@@ -1242,8 +1242,14 @@ The native Qwen3-VL vision front end is available as
 matrix, performs the BF16 3D patch projection with a custom CUDA epilogue,
 and interpolates the learned 48x48 position table in native code. Against a
 16x16-patch official capture, patch-projection cosine is 0.9999999952 and the
-first-block input cosine is 0.9999980129, both above the 0.99996 gate. The
-27 vision blocks and merger are not wired into the generation driver yet.
+first-block input cosine is 0.9999980129, both above the 0.99996 gate.
+The executable also contains the 27 custom CUDA vision blocks, the pinned
+PyTorch CUTLASS efficient-attention specialization at head dimension 72,
+three deep-stack mergers, and the final merger. Teacher-forced replay proves
+every block independently exceeds 0.99996 (minimum 0.999968714 at block 23).
+Free-running errors still compound: block 27 scores 0.998034349 with CUTLASS,
+and the final merger is therefore not accepted or wired into generation yet.
+Use `--hidden ... --block-index N --max-blocks 1` for isolated replay.
 
 ```sh
 make -C cuda/qimg21 test_cuda_qimg21_vision

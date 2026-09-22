@@ -65,6 +65,11 @@ def capture_text_encoder(pipe, folder: Path, stage_layer: int = 0):
                     def vision_input_hook(module, args):
                         _save(folder / "vision_block_input.npy", args[0])
                     handles.append(block.register_forward_pre_hook(vision_input_hook))
+                    for name, child in block.named_modules():
+                        if not name:
+                            continue
+                        handles.append(child.register_forward_hook(
+                            save_visual("stage_" + name.replace(".", "_"))))
                 handles.append(block.register_forward_hook(save_visual(f"block_{index:02d}")))
             handles.append(visual.merger.register_forward_hook(save_visual("merger")))
             for index, merger in enumerate(visual.deepstack_merger_list):
