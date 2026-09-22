@@ -1063,3 +1063,42 @@ void qwen35_attention_q8_combine(float *out, const float *parts, const float2 *m
     }
     out[head * 256 + tid] = numerator / denominator;
 }
+
+/* Verifier-only combine geometry. Four adjacent causal rows share one block
+ * and the metadata tile, while each row retains the reference split order and
+ * per-dimension numerator/denominator arithmetic. The split kernel and its
+ * captured ABI are unchanged. */
+extern "C" __global__ __launch_bounds__(256, 1)
+void qwen35_attention_q8_combine_verify4(float *out, const float *parts,
+        const float2 *meta, const int *position, int heads, int nsm,
+        int occupancy, int forced_splits, int queries) {
+    int head = blockIdx.x, q0 = blockIdx.y * 4, tid = threadIdx.x;
+    __shared__ float2 shared_meta[4][128];
+    for (int q = 0; q < 4; ++q) {
+        int query = q0 + q;
+        int splits = query < queries ?
+            (forced_splits ? forced_splits :
+             q8_attention_splits(position[query] + 1, heads, nsm, occupancy)) : 0;
+        if (splits > 1) {
+            const float2 *src = meta + ((size_t)query * heads + head) * splits;
+            for (int i = tid; i < splits; i += 256)
+                shared_meta[q][i] = src[i];
+        }
+        __syncthreads();
+        if (splits > 1) {
+            const float *src = parts + ((size_t)query * heads + head) * splits * 256;
+            float maximum = shared_meta[q][0].x;
+            for (int i = 1; i < splits; ++i)
+                maximum = fmaxf(maximum, shared_meta[q][i].x);
+            float numerator = 0.0f, denominator = 0.0f;
+            for (int i = 0; i < splits; ++i) {
+                float scale = expf(shared_meta[q][i].x - maximum);
+                numerator += scale * src[(size_t)i * 256 + tid];
+                denominator += scale * shared_meta[q][i].y;
+            }
+            out[((size_t)query * heads + head) * 256 + tid] =
+                numerator / denominator;
+        }
+        __syncthreads();
+    }
+}

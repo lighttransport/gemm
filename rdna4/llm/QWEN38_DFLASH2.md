@@ -153,6 +153,11 @@ The verifier commit boundary has an opt-in
 accepted hidden/logit rows in one device launch. It leaves position publication
 and the default reference ordering unchanged pending resident commit/hash A/B.
 
+An opt-in `LLM_QWEN35_VERIFY_COMBINE_GROUPED=1` verifier combine kernel now
+handles four adjacent rows per block. It retains the existing split partial
+layout and per-row combine arithmetic, so captured generic decode graphs remain
+untouched until resident long-context hash and timing A/B validation.
+
 The opt-in cache-injection overlap path now consumes captured feature rows
 directly after the target-ready event, eliminating a redundant device copy.
 Sidecar `x`/norm/K/V workspaces remain stream-private, and the inject-done

@@ -177,6 +177,13 @@ copies into that launch; position publication remains ordered by the existing
 host-to-device copy. The reference three-copy path remains the default until
 resident accepted-row hashes and commit timing are measured.
 
+The long-context verifier also has an opt-in
+`LLM_QWEN35_VERIFY_COMBINE_GROUPED=1` combine geometry. Four adjacent rows
+share one verifier block and metadata tile while retaining the existing
+per-row split order and arithmetic. The split kernel and captured generic
+decode ABI are unchanged; the reference combine remains the default pending
+resident verifier hashes and timing.
+
 ## 2026-09-22 continuation: IQ2_XXS block-shape probe
 
 I tested 128- and 512-thread blocks for the native one-row IQ2_XXS kernel
