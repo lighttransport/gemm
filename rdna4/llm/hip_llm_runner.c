@@ -14095,6 +14095,7 @@ struct hip_llm_runner {
     hipFunction_t fn_qwen35_matvec_iq2xxs, fn_qwen35_matvec_iq2xs;
     hipFunction_t fn_qwen35_matvec_iq2s, fn_qwen35_matvec_iq3xxs, fn_qwen35_matvec_iq3s;
     hipFunction_t fn_qwen35_matvec_iq3xxs_qkv;
+    hipFunction_t fn_qwen35_matvec_iq2xxs_qkv;
     hipFunction_t fn_qwen35_matvec_iq2xs_qkv;
     hipFunction_t fn_qwen35_matvec_iq2xs_down_residual;
     hipFunction_t fn_qwen35_matvec_iq4xs, fn_qwen35_matvec_iq4xs_multi8;
@@ -17987,6 +17988,8 @@ int hip_llm_load_weights_sharded(hip_llm_runner *r, gguf_shards *model,
                           r->iq_module, "qwen35_matvec_iq3xxs"));
                 CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq3xxs_qkv,
                           r->iq_module, "qwen35_matvec_iq3xxs_qkv"));
+                CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq2xxs_qkv,
+                          r->iq_module, "qwen35_matvec_iq2xxs_qkv"));
                 CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq2xs_qkv,
                           r->iq_module, "qwen35_matvec_iq2xs_qkv"));
                 CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq3s,
@@ -21617,6 +21620,28 @@ static inline int launch_qwen35_iq3xxs_qkv_fused(hip_llm_runner *r,
                   &r->d_native_q81, &r->d_native_scale,
                   &qrows, &krows, &vrows, &n_cols };
     LAUNCH(r->fn_qwen35_matvec_iq3xxs_qkv, (total + 7) / 8, 1, 1,
+           256, 1, 1, 0, r->stream, a);
+    return 1;
+}
+
+/* Opt-in native IQ2_XXS Q/K/V fusion. The kernel shares its staged 256-entry
+ * codebook and the prepared Q8_1 activation while retaining each standalone
+ * row's dot, affine scale, and reduction order. */
+static inline int launch_qwen35_iq2xxs_qkv_fused(hip_llm_runner *r,
+        void *qout, void *kout, void *vout,
+        void *qw, void *kw, void *vw, void *x,
+        int qrows, int krows, int vrows, int n_cols) {
+    const char *env = getenv("LLM_QWEN35_IQ2XXS_QKV_FUSED");
+    if (!env || atoi(env) == 0 || !r->fn_qwen35_matvec_iq2xxs_qkv ||
+        qrows < 1 || krows < 1 || vrows < 1 || n_cols > 17408 ||
+        (n_cols % 256) != 0)
+        return 0;
+    launch_native_q81(r, x, n_cols);
+    int total = qrows + krows + vrows;
+    void *a[] = { &qout, &kout, &vout, &qw, &kw, &vw,
+                  &r->d_native_q81, &r->d_native_scale,
+                  &qrows, &krows, &vrows, &n_cols };
+    LAUNCH(r->fn_qwen35_matvec_iq2xxs_qkv, (total + 7) / 8, 1, 1,
            256, 1, 1, 0, r->stream, a);
     return 1;
 }
@@ -29062,6 +29087,16 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
                 void *a[] = { &r->d_xb2, &r->d_k, &r->d_v, &cl->attn_q_w, &cl->attn_k_w, &cl->attn_v_w,
                               &qr, &kr, &vr, &nc, &r->d_xb };
                 LAUNCH(r->fn_matvec_qkv_iq3xxs, qr + kr + vr, 1, 1, 256, 1, 1, 0, r->stream, a);
+            } else if (cl->attn_q_type == GGML_TYPE_IQ2_XXS &&
+                       cl->attn_k_type == GGML_TYPE_IQ2_XXS &&
+                       cl->attn_v_type == GGML_TYPE_IQ2_XXS &&
+                       cl->attn_q_cols == cl->attn_k_cols &&
+                       cl->attn_q_cols == cl->attn_v_cols &&
+                       launch_qwen35_iq2xxs_qkv_fused(r, r->d_xb2, r->d_k, r->d_v,
+                           cl->attn_q_w, cl->attn_k_w, cl->attn_v_w, r->d_xb,
+                           cl->attn_q_rows, cl->attn_k_rows, cl->attn_v_rows,
+                           cl->attn_q_cols)) {
+                /* The opt-in native IQ2_XXS candidate owns all projections. */
             } else if (cl->attn_q_type == GGML_TYPE_IQ2_XS &&
                        cl->attn_k_type == GGML_TYPE_IQ2_XS &&
                        cl->attn_v_type == GGML_TYPE_IQ2_XS &&
@@ -29286,6 +29321,16 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
                 void *a[] = { &r->d_q, &r->d_k, &r->d_v, &cl->attn_q_w, &cl->attn_k_w, &cl->attn_v_w,
                               &qr, &kr, &vr, &nc, &r->d_xb };
                 LAUNCH(r->fn_matvec_qkv_iq3xxs, qr + kr + vr, 1, 1, 256, 1, 1, 0, r->stream, a);
+            } else if (cl->attn_q_type == GGML_TYPE_IQ2_XXS &&
+                       cl->attn_k_type == GGML_TYPE_IQ2_XXS &&
+                       cl->attn_v_type == GGML_TYPE_IQ2_XXS &&
+                       cl->attn_q_cols == cl->attn_k_cols &&
+                       cl->attn_q_cols == cl->attn_v_cols &&
+                       launch_qwen35_iq2xxs_qkv_fused(r, r->d_q, r->d_k, r->d_v,
+                           cl->attn_q_w, cl->attn_k_w, cl->attn_v_w, r->d_xb,
+                           cl->attn_q_rows, cl->attn_k_rows, cl->attn_v_rows,
+                           cl->attn_q_cols)) {
+                /* The opt-in native IQ2_XXS candidate owns all projections. */
             } else if (cl->attn_q_type == GGML_TYPE_IQ2_XS &&
                        cl->attn_k_type == GGML_TYPE_IQ2_XS &&
                        cl->attn_v_type == GGML_TYPE_IQ2_XS &&

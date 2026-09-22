@@ -212,6 +212,12 @@ order while dropping the four unused accumulators. The five-row proposal
 projection and K=7 path retain their existing kernels, and the default remains
 unchanged pending resident K=4 hash and draft-time measurements.
 
+The ordinary target also has an opt-in
+`LLM_QWEN35_IQ2XXS_QKV_FUSED=1` kernel for matching IQ2_XXS Q/K/V matrices. It
+shares the native codebook tile and Q8₁ activation while preserving each
+standalone row's arithmetic and reduction order. The independent launches stay
+the default until resident 4K/64K hash and throughput gates validate it.
+
 The opt-in cache-injection overlap path now consumes captured feature rows
 directly after the target-ready event, eliminating a redundant device copy.
 Sidecar `x`/norm/K/V workspaces remain stream-private, and the inject-done

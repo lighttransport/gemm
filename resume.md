@@ -203,6 +203,16 @@ K=7 path, and serving defaults are unchanged. Host build, profile tests, and
 gfx1201 HIP syntax checks pass; resident hash and draft-time A/B validation is
 still required.
 
+## 2026-09-22 continuation: opt-in IQ2_XXS Q/K/V projection fusion
+
+The ordinary one-token path now exposes
+`LLM_QWEN35_IQ2XXS_QKV_FUSED=1` for layers whose Q, K, and V matrices are all
+IQ2_XXS with a common input width. One native grid shares the 256-entry
+codebook staging and prepared Q8₁ activation; each row retains the standalone
+IQ2_XXS lookup, scale, integer correction, and warp reduction order. The
+serialized dispatch and production defaults remain unchanged pending resident
+4K/64K hashes and throughput.
+
 ## 2026-09-22 continuation: device-resident accepted-position publication
 
 MTP commit now publishes `d_position` from the accepted row in the verifier's
