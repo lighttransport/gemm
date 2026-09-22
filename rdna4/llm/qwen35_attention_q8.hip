@@ -1110,3 +1110,48 @@ void qwen35_attention_q8_combine_verify4(float *out, const float *parts,
         }
     }
 }
+
+/* Eight-row verifier-only combine candidate.  This is the same exact
+ * per-row reduction as combine_verify4, with a larger metadata tile so one
+ * block can publish up to eight adjacent rows.  Keep it separate from the
+ * captured generic decode ABI; the runner selects it only with the explicit
+ * grouped-combine mode 2 probe. */
+extern "C" __global__ __launch_bounds__(256, 1)
+void qwen35_attention_q8_combine_verify8(float *out, const float *parts,
+        const float2 *meta, const int *position, int heads, int nsm,
+        int occupancy, int forced_splits, int queries) {
+    int head = blockIdx.x, q0 = blockIdx.y * 8, tid = threadIdx.x;
+    __shared__ float2 shared_meta[8][128];
+    for (int q = 0; q < 8; ++q) {
+        int query = q0 + q;
+        int splits = query < queries ?
+            (forced_splits ? forced_splits :
+             q8_attention_splits(position[query] + 1, heads, nsm, occupancy)) : 0;
+        if (splits > 1) {
+            const float2 *src = meta + ((size_t)query * heads + head) * splits;
+            for (int i = tid; i < splits; i += 256)
+                shared_meta[q][i] = src[i];
+        }
+    }
+    __syncthreads();
+    for (int q = 0; q < 8; ++q) {
+        int query = q0 + q;
+        int splits = query < queries ?
+            (forced_splits ? forced_splits :
+             q8_attention_splits(position[query] + 1, heads, nsm, occupancy)) : 0;
+        if (splits > 1) {
+            const float *src = parts + ((size_t)query * heads + head) * splits * 256;
+            float maximum = shared_meta[q][0].x;
+            for (int i = 1; i < splits; ++i)
+                maximum = fmaxf(maximum, shared_meta[q][i].x);
+            float numerator = 0.0f, denominator = 0.0f;
+            for (int i = 0; i < splits; ++i) {
+                float scale = expf(shared_meta[q][i].x - maximum);
+                numerator += scale * src[(size_t)i * 256 + tid];
+                denominator += scale * shared_meta[q][i].y;
+            }
+            out[((size_t)query * heads + head) * 256 + tid] =
+                numerator / denominator;
+        }
+    }
+}

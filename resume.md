@@ -209,6 +209,14 @@ instead of synchronizing after each row. This is an exact barrier-hoist
 micro-optimization: the per-row maximum/scale/reduction order is unchanged,
 and the opt-in/default boundary remains unchanged.
 
+`LLM_QWEN35_VERIFY_COMBINE_GROUPED=2` now exposes an eight-row verifier-only
+combine probe using the same arithmetic and one post-load barrier. Mode `1`
+continues to select the four-row candidate; unset or `0` retains the reference
+per-row combine. The eight-row mode is intentionally unvalidated and does not
+change the serving default. Both grouped launches now pass zero dynamic shared
+memory because their metadata tiles are statically allocated; this avoids
+reserving an unused duplicate tile in the launch configuration.
+
 ## 2026-09-22 continuation: IQ2_XXS block-shape probe
 
 I tested 128- and 512-thread blocks for the native one-row IQ2_XXS kernel

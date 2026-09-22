@@ -172,6 +172,11 @@ layout and per-row combine arithmetic, so captured generic decode graphs remain
 untouched until resident long-context hash and timing A/B validation.
 The kernel hoists its metadata synchronization to one barrier after all four
 rows are loaded; reduction order and output bits remain unchanged.
+Mode `2` of `LLM_QWEN35_VERIFY_COMBINE_GROUPED` additionally exposes an
+eight-row block candidate with the same exact reduction order. It remains an
+explicit probe until resident long-context hashes and timing justify it. The
+grouped launch uses only the kernel's static metadata tile, so no redundant
+dynamic shared-memory reservation is requested.
 
 The opt-in cache-injection overlap path now consumes captured feature rows
 directly after the target-ready event, eliminating a redundant device copy.
