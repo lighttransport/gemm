@@ -1847,7 +1847,17 @@ static void *tf_qmatvec_worker(void *arg) {
     if (t->mat->type == GGML_TYPE_NVFP4) {
         size_t row_bytes = (size_t)(n_cols / 64) * sizeof(block_nvfp4);
         const uint8_t *base = (const uint8_t *)t->mat->data;
-        for (int i = t->row_start; i < t->row_end; i++)
+        int i = t->row_start;
+        for (; i + 3 < t->row_end; i += 4) {
+            float a,b,c,d;
+            tf_nvfp4_dot4_sve(&a,&b,&c,&d,
+                (const block_nvfp4 *)(base + (size_t)i * row_bytes),
+                (const block_nvfp4 *)(base + (size_t)(i+1) * row_bytes),
+                (const block_nvfp4 *)(base + (size_t)(i+2) * row_bytes),
+                (const block_nvfp4 *)(base + (size_t)(i+3) * row_bytes), t->x, n_cols);
+            t->dst[i]=a; t->dst[i+1]=b; t->dst[i+2]=c; t->dst[i+3]=d;
+        }
+        for (; i < t->row_end; i++)
             t->dst[i] = tf_nvfp4_dot_sve((const block_nvfp4 *)(base + (size_t)i * row_bytes), t->x, n_cols);
         return NULL;
     }
@@ -3946,7 +3956,17 @@ static void tf_qmatvec(float *dst, const qtensor *mat, const float *x, int n_row
     if (mat->type == GGML_TYPE_NVFP4) {
         size_t row_bytes = (size_t)(n_cols / 64) * sizeof(block_nvfp4);
         const uint8_t *base = (const uint8_t *)mat->data;
-        for (int i = 0; i < n_rows; i++)
+        int i = 0;
+        for (; i + 3 < n_rows; i += 4) {
+            float a,b,c,d;
+            tf_nvfp4_dot4_sve(&a,&b,&c,&d,
+                (const block_nvfp4 *)(base + (size_t)i * row_bytes),
+                (const block_nvfp4 *)(base + (size_t)(i+1) * row_bytes),
+                (const block_nvfp4 *)(base + (size_t)(i+2) * row_bytes),
+                (const block_nvfp4 *)(base + (size_t)(i+3) * row_bytes), x, n_cols);
+            dst[i]=a; dst[i+1]=b; dst[i+2]=c; dst[i+3]=d;
+        }
+        for (; i < n_rows; i++)
             dst[i] = tf_nvfp4_dot_sve((const block_nvfp4 *)(base + (size_t)i * row_bytes), x, n_cols);
         return;
     }
