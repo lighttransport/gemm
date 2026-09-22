@@ -96,7 +96,7 @@ def capture_text_encoder(pipe, folder: Path, stage_layer: int = 0):
                     def save_layer_norm_stats(name, layer_norm):
                         def hook(module, args):
                             torch = __import__("torch")
-                            _, mean, rstd = torch.native_layer_norm(
+                            _, mean, rstd = torch.ops.aten.native_layer_norm.default(
                                 args[0], layer_norm.normalized_shape,
                                 None, None, layer_norm.eps)
                             _save(folder / f"vision_stage_{name}_mean.npy", mean)
