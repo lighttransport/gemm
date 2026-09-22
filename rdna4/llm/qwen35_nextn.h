@@ -857,6 +857,13 @@ int hip_llm_qwen35_mtp_commit(hip_llm_runner *r, int processed) {
     if (fused_copy) {
         size_t x_elements = (size_t)r->n_embd;
         size_t logits_elements = (size_t)r->n_vocab;
+        /* The fused kernel also copies the accepted hidden/logits row from
+         * blockIdx.y == 0.  Size the grid for that payload as well as the
+         * recurrent and convolution state; otherwise a large vocabulary can
+         * leave the tail of the logits row unpublished. */
+        size_t io_vectors = ((x_elements > logits_elements ?
+                              x_elements : logits_elements) + 3) / 4;
+        if (io_vectors > state_vectors) state_vectors = io_vectors;
         size_t x_stride = x_elements, logits_stride = logits_elements;
         void *a[] = { &m->verify_conv_dst_ptrs, &m->verify_conv_src_ptrs,
             &conv_elements, &conv_stride, &m->verify_rec_dst_ptrs,

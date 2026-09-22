@@ -32,6 +32,11 @@ RoPE, and cache store; mixed or unsupported layer types retain the two-GEMM
 path. The candidate remains opt-in until resident cache hashes and HTTP/C++
 quality gates prove that the changed GEMM shape is exact and beneficial.
 
+The opt-in fused recurrent commit copy now sizes its grid for the largest of
+the recurrent state, hidden row, and vocabulary-logits row. This closes a
+large-vocabulary tail omission in the diagnostic path; the serialized commit
+copy and all production defaults are unchanged.
+
 ## 2026-09-22 continuation: opt-in native Q2_K Q/K/V projection fusion
 
 The ordinary one-token attention dispatcher now exposes

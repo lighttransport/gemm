@@ -817,6 +817,10 @@ reflects the remaining measured costs.
    Attention verifier Q/K RMS normalization is likewise paired into one launch;
    its independent reductions retain the original order and exact output
    hashes.
+   The opt-in fused recurrent commit copy now sizes its grid for the largest
+   recurrent state, hidden row, or vocabulary-logits row. This prevents a
+   large vocabulary from leaving the tail of the accepted logits row
+   unpublished; the ordinary two-launch publication remains unchanged.
 
    A three-repeat DeltaNet warp-per-row batch probe averaged 38.99 tok/s on
    the seeded sampled 4K gate versus 38.94 tok/s for the reference-order
