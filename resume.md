@@ -95,6 +95,12 @@ row-major checkpoint order. The argument ABI is unchanged, so captured graph
 selection remains stable; the generic kernel remains the default pending a
 resident rollback/hash and sustained decode comparison.
 
+Verifier workspace allocation is now transactional on first use. If a device
+or host allocation fails, queued pointer-table copies are synchronized before
+all partial buffers are released and the capacity returns to zero, so a later
+request can retry cleanly. Successful graph and checkpoint paths are
+unchanged.
+
 ## 2026-09-22 continuation: verifier IQ1 Q8₁ activation reuse
 
 The grouped target verifier's IQ1_S gate and IQ1_M up projections consume the

@@ -819,6 +819,11 @@ reflects the remaining measured costs.
    random-token 64K gate.  It remained exact but measured 28.52 tok/s versus
    the retained 28.82 tok/s dense-MTP control, so the generic captured combine
    remains in production.
+   First-use verifier workspace allocation is transactional as well: a failed
+   device or host allocation synchronizes any queued pointer-table copies,
+   releases the partial buffer set, and resets capacity so a later request can
+   retry without recreating the runner. This is failure-path hardening only;
+   successful checkpoint and graph execution is unchanged.
 4. **Kernel and graph count.** Q/gate deinterleave, QK normalization, RoPE,
    Q8/Q8 KV storage, SSM alpha/beta preparation, and IQ1_M verifier embedding
    are now fused or batched exactly. Profile again before joining another

@@ -63,6 +63,34 @@ typedef struct hllm_qwen35_mtp {
     int verify_attention_reuse;
 } hllm_qwen35_mtp;
 
+/* Verification buffers are allocated lazily because DFlash2 only needs the
+ * transaction shell until its first proposal. Keep failed first-use growth
+ * retryable: callers may recover from a transient allocation error without
+ * leaving a partial pointer set behind. The caller synchronizes the stream
+ * before using this helper when async copies may already be queued. */
+static void hllm_qwen35_mtp_verify_workspace_free(hllm_qwen35_mtp *m) {
+    if (!m) return;
+#define VERIFY_FREE(p) do { if (p) { hipFree(p); (p) = NULL; } } while (0)
+    VERIFY_FREE(m->verify_x); VERIFY_FREE(m->verify_logits);
+    VERIFY_FREE(m->verify_positions); VERIFY_FREE(m->verify_argmax);
+    VERIFY_FREE(m->verify_norm); VERIFY_FREE(m->verify_gate);
+    VERIFY_FREE(m->verify_up); VERIFY_FREE(m->verify_q);
+    VERIFY_FREE(m->verify_scales); VERIFY_FREE(m->verify_ssm_qkv);
+    VERIFY_FREE(m->verify_ssm_z); VERIFY_FREE(m->verify_ssm_alpha);
+    VERIFY_FREE(m->verify_ssm_beta); VERIFY_FREE(m->verify_ssm_out);
+    VERIFY_FREE(m->verify_attn_parts); VERIFY_FREE(m->verify_attn_meta);
+    VERIFY_FREE(m->verify_conv_dst_ptrs); VERIFY_FREE(m->verify_conv_src_ptrs);
+    VERIFY_FREE(m->verify_rec_dst_ptrs); VERIFY_FREE(m->verify_rec_src_ptrs);
+    for (int i = 0; i < 128; ++i) {
+        VERIFY_FREE(m->verify_conv[i]); VERIFY_FREE(m->verify_rec[i]);
+    }
+#undef VERIFY_FREE
+    free(m->host_logits);
+    m->host_logits = NULL;
+    m->verify_capacity = 0;
+    m->verify_ssm_layers = 0;
+}
+
 static void hllm_free_qwen35_mtp(hip_llm_runner *r) {
     hllm_qwen35_mtp *m = r->qwen35_mtp;
     if (!m) return;
@@ -73,19 +101,8 @@ static void hllm_free_qwen35_mtp(hip_llm_runner *r) {
         if (m->reuse_executions[i]) hipGraphExecDestroy(m->reuse_executions[i]);
         if (m->reuse_graphs[i]) hipGraphDestroy(m->reuse_graphs[i]);
     }
+    hllm_qwen35_mtp_verify_workspace_free(m);
 #define DENSE_FREE(p) do { if (p) hipFree(p); } while (0)
-    DENSE_FREE(m->verify_x); DENSE_FREE(m->verify_logits); DENSE_FREE(m->verify_positions);
-    DENSE_FREE(m->verify_argmax);
-    DENSE_FREE(m->verify_norm); DENSE_FREE(m->verify_gate); DENSE_FREE(m->verify_up);
-    DENSE_FREE(m->verify_q); DENSE_FREE(m->verify_scales);
-    DENSE_FREE(m->verify_ssm_qkv); DENSE_FREE(m->verify_ssm_z);
-    DENSE_FREE(m->verify_ssm_alpha); DENSE_FREE(m->verify_ssm_beta); DENSE_FREE(m->verify_ssm_out);
-    DENSE_FREE(m->verify_attn_parts); DENSE_FREE(m->verify_attn_meta);
-    DENSE_FREE(m->verify_conv_dst_ptrs); DENSE_FREE(m->verify_conv_src_ptrs);
-    DENSE_FREE(m->verify_rec_dst_ptrs); DENSE_FREE(m->verify_rec_src_ptrs);
-    for (int i = 0; i < 128; ++i) {
-        DENSE_FREE(m->verify_conv[i]); DENSE_FREE(m->verify_rec[i]);
-    }
     DENSE_FREE(m->enorm); DENSE_FREE(m->hnorm); DENSE_FREE(m->eh);
     DENSE_FREE(m->head_norm); DENSE_FREE(m->head);
     DENSE_FREE(m->x); DENSE_FREE(m->fusion); DENSE_FREE(m->key);
@@ -637,7 +654,12 @@ static float *hllm_qwen35_mtp_verify_impl(hip_llm_runner *r,
         /* Fixed capacity keeps captured graph pointers stable.  A loaded
          * draft backend uses one fixed verification width for its lifetime. */
         int capacity = rows;
-        m->verify_capacity = -1; /* A partial allocation cannot be retried over live pointers. */
+        m->verify_capacity = -1;
+#define VERIFY_ALLOC_FAIL() do { \
+            hipStreamSynchronize(r->stream); \
+            hllm_qwen35_mtp_verify_workspace_free(m); \
+            return NULL; \
+        } while (0)
         if (hipMalloc(&m->verify_x, (size_t)capacity*r->n_embd*sizeof(float)) ||
             hipMalloc(&m->verify_norm, (size_t)capacity*r->n_embd*sizeof(float)) ||
             hipMalloc(&m->verify_gate, (size_t)capacity*r->n_ff*sizeof(float)) ||
@@ -655,14 +677,16 @@ static float *hllm_qwen35_mtp_verify_impl(hip_llm_runner *r,
                 r->q8_attention_max_splits*2*sizeof(float)) ||
             hipMalloc(&m->verify_logits, (size_t)capacity*r->n_vocab*sizeof(float)) ||
             hipMalloc(&m->verify_positions, (size_t)capacity*sizeof(int)) ||
-            hipMalloc(&m->verify_argmax, (size_t)capacity*sizeof(int32_t))) return NULL;
+            hipMalloc(&m->verify_argmax, (size_t)capacity*sizeof(int32_t)))
+            VERIFY_ALLOC_FAIL();
         m->host_logits = malloc((size_t)capacity*r->n_vocab*sizeof(float));
-        if (!m->host_logits) return NULL;
+        if (!m->host_logits) VERIFY_ALLOC_FAIL();
         void *conv_dst[128], *conv_src[128], *rec_dst[128], *rec_src[128];
         int ssm_layers = 0;
         for (int l = 0; l < r->n_layers; ++l) if (r->layers[l].is_ssm) {
             if (hipMalloc(&m->verify_conv[l], (size_t)capacity*conv) ||
-                hipMalloc(&m->verify_rec[l], (size_t)capacity*rec)) return NULL;
+                hipMalloc(&m->verify_rec[l], (size_t)capacity*rec))
+                VERIFY_ALLOC_FAIL();
             conv_dst[ssm_layers] = r->layers[l].d_conv_state;
             conv_src[ssm_layers] = m->verify_conv[l];
             rec_dst[ssm_layers] = r->layers[l].d_recurrent_state;
@@ -681,9 +705,11 @@ static float *hllm_qwen35_mtp_verify_impl(hip_llm_runner *r,
             hipMemcpyAsync(m->verify_rec_dst_ptrs, rec_dst, ptr_bytes,
                            hipMemcpyHostToDevice, r->stream) ||
             hipMemcpyAsync(m->verify_rec_src_ptrs, rec_src, ptr_bytes,
-                           hipMemcpyHostToDevice, r->stream)) return NULL;
+                           hipMemcpyHostToDevice, r->stream))
+            VERIFY_ALLOC_FAIL();
         m->verify_ssm_layers = ssm_layers;
         m->verify_capacity = capacity;
+#undef VERIFY_ALLOC_FAIL
         hllm_vram_sample(r);
     }
     if (rows > m->verify_capacity) return NULL;
