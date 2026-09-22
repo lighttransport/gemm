@@ -14185,6 +14185,7 @@ struct hip_llm_runner {
     hipFunction_t fn_q8_attention_decode, fn_q8_attention_decode_gqa3;
     hipFunction_t fn_q8_attention_decode_gqa3_reuse;
     hipFunction_t fn_q8_attention_decode_reuse8;
+    hipFunction_t fn_q8_attention_decode_reuse_fixed8;
     hipFunction_t fn_q8_attention_combine, fn_q8_attention_combine_verify4;
     hipFunction_t fn_q8_attention_combine_verify8;
     hipFunction_t fn_q8_attention_combine_verify16;
@@ -18230,6 +18231,9 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
         CHECK_HIP(hipModuleGetFunction(&r->fn_q8_attention_decode_reuse8,
                   r->q8_attention_module,
                   "qwen35_attention_q8_decode_reuse8"));
+        CHECK_HIP(hipModuleGetFunction(&r->fn_q8_attention_decode_reuse_fixed8,
+                  r->q8_attention_module,
+                  "qwen35_attention_q8_decode_reuse_fixed8"));
         CHECK_HIP(hipModuleGetFunction(&r->fn_q8_attention_combine,
                   r->q8_attention_module, "qwen35_attention_q8_combine"));
         CHECK_HIP(hipModuleGetFunction(&r->fn_q8_attention_combine_verify4,
@@ -23494,7 +23498,11 @@ static inline void launch_attn_verify_native_q8(hip_llm_runner *r, void *out,
         &forced_splits, &queries, &position_start };
     if (group_queries && queries > 1 && queries <= 8 &&
         r->fn_q8_attention_decode_reuse8) {
-        LAUNCH(r->fn_q8_attention_decode_reuse8, 1,
+        const char *fixed8_env = getenv("LLM_QWEN35_VERIFY_ATTN_FIXED8");
+        hipFunction_t fn = queries == 8 && (!fixed8_env || atoi(fixed8_env) != 0) &&
+            r->fn_q8_attention_decode_reuse_fixed8 ?
+            r->fn_q8_attention_decode_reuse_fixed8 : r->fn_q8_attention_decode_reuse8;
+        LAUNCH(fn, 1,
                launch_splits, r->n_heads,
                32, 4, 1, 0, r->stream, a);
     } else {

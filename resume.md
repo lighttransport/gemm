@@ -1,5 +1,57 @@
 # Qwen3.8 27B HIP runner vs llama.cpp — resume state
 
+## Eight-query verifier attention follow-up (2026-09-22)
+
+The default verifier now uses a fixed-eight-query Q8/Q8 split kernel when
+all eight causal rows share the adaptive split count. Other window sizes and
+split-count boundaries retain the original generic kernel, whose body is
+unchanged. The specialization keeps split parallelism and the exact merge
+order. `LLM_QWEN35_VERIFY_ATTN_FIXED8=0` is the diagnostic opt-out.
+The slower single-block split/combine fusion remains opt-in.
+
+Warm full-model A/B (IQ2_XS, Q8/Q8, chunk 512, K=7, seed 42):
+
+| Coding context / sampling | Previous default | Fixed-eight attention |
+| --- | ---: | ---: |
+| 4096 tokens, greedy | 87.01 | 88.18 |
+| 4096 tokens, temperature 0.8 | 83.43 | 84.61 |
+| 16096 tokens, greedy | 77.56 | 80.40 |
+| 16096 tokens, temperature 0.8 | 74.53 | 76.97 |
+
+Rates are tok/s, with two repeats per configuration. All 16 generations
+retained hash `15f17d2640c1adfc` and byte-identical text, also matching the saved
+pinned llama.cpp reference output. This simple clamp prompt stops after 46
+tokens; the HTTP suite separately covers sampled and multi-turn C++ quality.
+Prefill dispatch is unchanged.
+
+`test_verifier_attention.py` now tests generic, grouped, and fixed-eight paths:
+21 GPU comparisons at 4K/16K/64K were bit-identical, including the staged
+source checked independently of uncommitted experiments. At 64K/eight rows,
+the integrated isolated test measured 3.722 ms generic versus 2.866 ms fixed.
+These are kernel timings. Normal DFlash still falls back to target-only
+decode at 32K, so this is not a claim of 64K speculative throughput.
+`test_verifier_launch.py` passes 216 cases covering default/on/off selection,
+gated/ungated output, short windows, and non-reusable split-boundary windows.
+The rebuilt default passes the HTTP/stdio cached-prefix, cancellation,
+concurrency, sampled-repeatability, and multi-turn C++ compile/run suite.
+Runner builds and profile checks pass.
+
+Further projection probes retained output but did not improve throughput:
+control 87.26 tok/s; fixed-eight fused QKV 87.08; fused gate/up 87.03; paired
+BF16 alpha/beta 86.87. These remain diagnostic candidates. Injection overlap
+also remains opt-in based on the prior neutral timing result.
+
+Artifacts under `rdna4/llm/tmp/`: `dflash-followup.sh` and its logs;
+`attention-fixed8-quality.sh` and its eight per-configuration logs;
+`attention-fixed8-integrated.log`, `attention-fixed8-index-gpu.log`, and
+`attention-fixed8-http.log`. The A/B script explicitly sets the attention
+opt-out for controls and remains valid after promotion.
+
+Remaining: evaluate shorter full-window attention specializations, extend
+long-context quality beyond the bounded clamp workload, and investigate a
+larger useful overlap interval before changing injection defaults. Keep
+ordinary 40+ tok/s target-only decode outside this goal batch.
+
 ## Items 2–5: goal and validated progress (2026-09-22)
 
 Goal prompt: improve long-context verifier attention; optimize DeltaNet and
