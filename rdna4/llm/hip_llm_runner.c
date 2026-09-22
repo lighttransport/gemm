@@ -21703,6 +21703,32 @@ static inline int launch_qwen35_q2k_qkv_fused(hip_llm_runner *r,
     return 1;
 }
 
+/* Opt-in native Q2_K gate/up fusion for dense FFN layers. The two matrices
+ * consume the same one-token activation and the Q2_K kernel already supports
+ * a zero V range, so share its exact Q8_1 tile and row arithmetic without
+ * changing the standalone reduction order. */
+static inline int launch_qwen35_q2k_gateup_fused(hip_llm_runner *r,
+        void *gout, void *uout, void *gw, void *uw, void *x,
+        int rows, int n_cols) {
+    const char *env = getenv("LLM_QWEN35_Q2K_GATEUP_FUSED");
+    if (!env || atoi(env) == 0 || !r->fn_qwen35_matvec_q2k_qkv ||
+        rows < 1 || n_cols > 17408 || (n_cols % 256) != 0)
+        return 0;
+    launch_native_q81(r, x, n_cols);
+    int qrows = rows, krows = rows, vrows = 0;
+    int total = qrows + krows;
+    int threads = n_cols == 5120 && total >= 16000 ? 128 : 256;
+    int rows_per_block = threads / 32;
+    void *vout = NULL, *vw = NULL;
+    void *a[] = { &gout, &uout, &vout, &gw, &uw, &vw,
+                  &r->d_native_q81, &r->d_native_scale,
+                  &qrows, &krows, &vrows, &n_cols };
+    LAUNCH(r->fn_qwen35_matvec_q2k_qkv,
+           (total + rows_per_block - 1) / rows_per_block, 1, 1,
+           (unsigned)threads, 1, 1, 0, r->stream, a);
+    return 1;
+}
+
 /* Opt-in native IQ3_S Q/K/V fusion for mixed-IQ attention.  The fused
  * kernel preserves the standalone IQ3_S code decode, affine scale, and warp
  * reduction order while sharing the Q8_1 activation quantization launch. */
@@ -29688,7 +29714,16 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
                 } else
                     LAUNCH(r->fn_ffn_gate_up_silu_iq3xxs, n_ff, 1, 1, 256, 1, 1, 0, r->stream, a);
             } else {
-                int fused_iq2_gateup =
+                int fused_q2k_gateup =
+                    cl->ffn_gate_type == GGML_TYPE_Q2_K &&
+                    cl->ffn_up_type == GGML_TYPE_Q2_K &&
+                    cl->ffn_gate_rows == cl->ffn_up_rows &&
+                    cl->ffn_gate_cols == cl->ffn_up_cols &&
+                    launch_qwen35_q2k_gateup_fused(
+                        r, r->d_gate, r->d_up, cl->ffn_gate_w,
+                        cl->ffn_up_w, r->d_xb, cl->ffn_gate_rows,
+                        cl->ffn_gate_cols);
+                int fused_iq2_gateup = !fused_q2k_gateup &&
                     cl->ffn_gate_type == GGML_TYPE_IQ2_XS &&
                     cl->ffn_up_type == GGML_TYPE_IQ2_XS &&
                     cl->ffn_gate_rows == cl->ffn_up_rows &&
@@ -29697,7 +29732,7 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
                         r, r->d_gate, r->d_up, cl->ffn_gate_w,
                         cl->ffn_up_w, r->d_xb, cl->ffn_gate_rows,
                         cl->ffn_gate_cols);
-                int fused_iq3_gateup = !fused_iq2_gateup &&
+                int fused_iq3_gateup = !fused_q2k_gateup && !fused_iq2_gateup &&
                     cl->ffn_gate_type == GGML_TYPE_IQ3_XXS &&
                     cl->ffn_up_type == GGML_TYPE_IQ3_XXS &&
                     cl->ffn_gate_rows == cl->ffn_up_rows &&
@@ -29706,7 +29741,7 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
                         r, r->d_gate, r->d_up, cl->ffn_gate_w,
                         cl->ffn_up_w, r->d_xb, cl->ffn_gate_rows,
                         cl->ffn_gate_cols);
-                int fused_iq1_gateup = !fused_iq3_gateup &&
+                int fused_iq1_gateup = !fused_q2k_gateup && !fused_iq3_gateup &&
                     cl->ffn_gate_type == GGML_TYPE_IQ1_S &&
                     cl->ffn_up_type == GGML_TYPE_IQ1_M &&
                     cl->ffn_gate_rows == cl->ffn_up_rows &&
@@ -29715,7 +29750,8 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
                         r, r->d_gate, r->d_up, cl->ffn_gate_w,
                         cl->ffn_up_w, r->d_xb, cl->ffn_gate_rows,
                         cl->ffn_gate_cols);
-                if (!fused_iq2_gateup && !fused_iq3_gateup && !fused_iq1_gateup) {
+                if (!fused_q2k_gateup && !fused_iq2_gateup &&
+                    !fused_iq3_gateup && !fused_iq1_gateup) {
                     begin_q8x2_reuse(r);
                     launch_matvec_ffn_auto(r, r->d_gate, cl->ffn_gate_w, r->d_xb,
                                           cl->ffn_gate_rows, cl->ffn_gate_cols,
@@ -29729,7 +29765,8 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
                     debug_f32_state(r, l, "scalar ffn_gate_raw", r->d_gate, n_ff);
                     debug_f32_state(r, l, "scalar ffn_up_raw", r->d_up, n_ff);
                 }
-                int native_down_q81 = n_ff <= 17408 && (n_ff % 256) == 0 &&
+                int native_down_q81 = !fused_q2k_gateup &&
+                    n_ff <= 17408 && (n_ff % 256) == 0 &&
                     qwen35_native_q81_matvec_type(r, cl->ffn_down_type);
                 const char *split_silu_q81 = getenv("LLM_QWEN35_SPLIT_SILU_Q81");
                 if (split_silu_q81 && atoi(split_silu_q81) != 0)

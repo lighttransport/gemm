@@ -765,6 +765,12 @@ reflects the remaining measured costs.
    serialized launches as the default until resident 4K/64K logits, hashes,
    and throughput are measured; the kernel and host build pass without a
    resident gfx1201 device in this environment.
+   Dense Q2_K gate/up pairs have a matching opt-in
+   `LLM_QWEN35_Q2K_GATEUP_FUSED=1` dispatch. It uses the same Q2_K QKV kernel
+   with a zero V range, shares one exact Q8_1 activation quantization, and
+   retains the tall 128-thread geometry used by standalone 5120-column FFN
+   rows. The fused path still runs the ordinary SiLU stage separately and is
+   diagnostic until resident logits, hashes, and 64K timing prove a gain.
 2. **Verifier attention tail.** The query-grid verifier now selects ordinary
    decode's split count independently for every causal row. Equal-split
    windows now select a dedicated captured shared-K/V graph; split boundaries

@@ -39,6 +39,13 @@ the default pending resident 4K/64K logits, hashes, and throughput checks.
 HIP device syntax, the host build, and profile checks pass; the resident GPU
 gate is unavailable in this environment (`/dev/kfd` is absent).
 
+The same native Q2_K kernel now has an opt-in
+`LLM_QWEN35_Q2K_GATEUP_FUSED=1` dense gate/up form. It shares the exact Q8_1
+activation tile, selects the two output ranges in one grid, and keeps the
+standalone 128-thread geometry for the tall 5120-column FFN shape. SiLU stays
+as a separate exact stage; the serialized gate/up path remains the default
+pending resident 4K/64K logit, hash, and timing validation.
+
 ## 2026-09-22 continuation: sixteen-way DFlash selector candidate
 
 The opt-in `LLM_QWEN35_DFLASH_SELECTOR_WARP16=1` path assigns one warp to
