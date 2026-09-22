@@ -1542,6 +1542,11 @@ retain the scalar I/O fallback.
    cancellation/concurrency, greedy and sampled repeatability, and both
    multi-turn and algorithmic C++ compile/run quality checks; its 121-token
    window measured 59.58 tok/s end-to-end with 93/108 accepted.
+   Follow-up crash isolation mapped the CPU fault to
+   `hllm_qwen35_mtp_verify_impl` during graph setup. It reproduced with scalar
+   settings and reduced cache/BMAX values while VRAM was only 57 MiB in use,
+   pointing to invalid MTP verifier state or a stale graph pointer rather than
+   capacity.
 
 Each optimization should retain the exact sequence hash and response bytes at
 K=4 and K=7, compile the emitted program, and cover non-coding prompts plus

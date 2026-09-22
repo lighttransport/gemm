@@ -1490,6 +1490,10 @@ The K=4 resident HTTP/stdio run then passed context-cache restore, greedy and
 sampled repeatability, cancellation/concurrency, and both multi-turn and
 algorithmic C++ compile/run quality checks; its 121-token window measured
 59.58 tok/s end-to-end (93/108 accepted).
+Follow-up crash isolation mapped the CPU fault to `hllm_qwen35_mtp_verify_impl`
+during graph setup.  It reproduced with scalar settings and reduced
+cache/BMAX values while VRAM was only 57 MiB in use afterward, pointing to
+invalid MTP verifier state or a stale graph pointer rather than capacity.
 
 2026-09-22 continuation: the one-row IQ2/IQ3/IQ4 kernels now declare their
 output, weight, activation, and scale buffers non-aliasing.  This preserves
