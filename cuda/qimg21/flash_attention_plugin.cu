@@ -58,26 +58,33 @@ struct alignas(8) q21_bf16x4 {
     cutlass::bfloat16_t val[4];
 };
 
-__device__ q21_ln_stat q21_ln_add(q21_ln_stat a, float value) {
-    float delta = value - a.mean;
-    float count = a.count + 1.0f;
-    float mean = a.mean + delta * (1.0f / count);
-    a.var = a.var + delta * (value - mean);
-    a.mean = mean;
-    a.count = count;
-    return a;
+__device__ q21_ln_stat q21_ln_add(const float value, const q21_ln_stat &current) {
+    float delta = value - current.mean;
+    float count = current.count + 1.0f;
+    auto reciprocal_multiply = [](auto a, auto b) { return a * (1.0f / b); };
+    float mean = current.mean + reciprocal_multiply(delta, count);
+    return {mean, current.var + delta * (value - mean), count};
 }
 
-__device__ q21_ln_stat q21_ln_combine(q21_ln_stat data_b, q21_ln_stat data_a) {
-    float count = data_a.count + data_b.count;
-    if (count <= 0.0f) return {0.0f, 0.0f, 0.0f};
-    float coefficient = 1.0f / count;
-    float n_a = data_a.count * coefficient;
-    float n_b = data_b.count * coefficient;
-    float delta = data_b.mean - data_a.mean;
-    return {n_a * data_a.mean + n_b * data_b.mean,
-            data_a.var + data_b.var + delta * delta * data_a.count * n_b,
-            count};
+__device__ q21_ln_stat q21_ln_combine(const q21_ln_stat data_b,
+                                       const q21_ln_stat data_a) {
+    using value_type = decltype(data_b.count);
+    value_type delta = data_b.mean - data_a.mean;
+    value_type count = data_a.count + data_b.count;
+    value_type mean, variance;
+    if (count > value_type{0}) {
+        auto reciprocal = [](auto a) { return 1.0f / a; };
+        auto coefficient = reciprocal(count);
+        auto n_a = data_a.count * coefficient;
+        auto n_b = data_b.count * coefficient;
+        mean = n_a * data_a.mean + n_b * data_b.mean;
+        variance = data_a.var + data_b.var +
+                   delta * delta * data_a.count * n_b;
+    } else {
+        mean = value_type(0);
+        variance = value_type(0);
+    }
+    return {mean, variance, count};
 }
 
 __device__ float q21_round_bf16(float value) {
@@ -97,7 +104,7 @@ __global__ void q21_vision_layer_norm_kernel(float *out, const float *input,
     for (int vector = thread; vector < vectors; vector += blockDim.x * blockDim.y) {
         q21_float4 data = input_vec[vector];
 #pragma unroll
-        for (int i = 0; i < 4; ++i) stat = q21_ln_add(stat, data.val[i]);
+        for (int i = 0; i < 4; ++i) stat = q21_ln_add(data.val[i], stat);
     }
     for (int offset = 16; offset; offset >>= 1) {
         q21_ln_stat other{__shfl_down_sync(0xffffffff, stat.mean, offset),
@@ -143,7 +150,7 @@ __global__ void q21_vision_layer_norm_stats_kernel(float *out, const float *inpu
     for (int vector = thread; vector < vectors; vector += blockDim.x * blockDim.y) {
         q21_float4 data = input_vec[vector];
 #pragma unroll
-        for (int i = 0; i < 4; ++i) stat = q21_ln_add(stat, data.val[i]);
+        for (int i = 0; i < 4; ++i) stat = q21_ln_add(data.val[i], stat);
     }
     for (int offset = 16; offset; offset >>= 1) {
         q21_ln_stat other{__shfl_down_sync(0xffffffff, stat.mean, offset),
@@ -186,7 +193,7 @@ __global__ void q21_vision_layer_norm_bf16_kernel(
         q21_bf16x4 data = input_vec[vector];
 #pragma unroll
         for (int i = 0; i < 4; ++i)
-            stat = q21_ln_add(stat, static_cast<float>(data.val[i]));
+            stat = q21_ln_add(static_cast<float>(data.val[i]), stat);
     }
     for (int offset = 16; offset; offset >>= 1) {
         q21_ln_stat other{__shfl_down_sync(0xffffffff, stat.mean, offset),
@@ -235,7 +242,7 @@ __global__ void q21_vision_layer_norm_bf16_stats_kernel(
         q21_bf16x4 data = input_vec[vector];
 #pragma unroll
         for (int i = 0; i < 4; ++i)
-            stat = q21_ln_add(stat, static_cast<float>(data.val[i]));
+            stat = q21_ln_add(static_cast<float>(data.val[i]), stat);
     }
     for (int offset = 16; offset; offset >>= 1) {
         q21_ln_stat other{__shfl_down_sync(0xffffffff, stat.mean, offset),
