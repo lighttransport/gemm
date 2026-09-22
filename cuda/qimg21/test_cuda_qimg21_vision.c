@@ -202,8 +202,10 @@ static int build_position_embedding(const qimg21_shards *shards, int h, int w, f
 
 int main(int argc, char **argv) {
     const char *model = NULL, *pixels = NULL, *image = NULL, *hidden = NULL, *out = NULL;
+    const char *norm1_override = NULL;
     const char *patch_out = NULL, *dump_dir = NULL, *merged_out = NULL, *deepstack_dir = NULL;
     const char *attention_mode = "flash";
+    const char *flash_plugin_path = "cuda/qimg21/libq21_flash_attention.so";
     const char *layer_norm_mode = "nvcc";
     int h = 0, w = 0, max_blocks = 0, block_index = 0;
     for (int i = 1; i < argc; i++) {
@@ -221,7 +223,9 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--merged-out") && i + 1 < argc) merged_out = argv[++i];
         else if (!strcmp(argv[i], "--deepstack-dir") && i + 1 < argc) deepstack_dir = argv[++i];
         else if (!strcmp(argv[i], "--attention") && i + 1 < argc) attention_mode = argv[++i];
+        else if (!strcmp(argv[i], "--flash-plugin") && i + 1 < argc) flash_plugin_path = argv[++i];
         else if (!strcmp(argv[i], "--layer-norm") && i + 1 < argc) layer_norm_mode = argv[++i];
+        else if (!strcmp(argv[i], "--norm1-override") && i + 1 < argc) norm1_override = argv[++i];
         else return 2;
     }
     if (!model || ((!!pixels + !!image + !!hidden) != 1) || !out ||
@@ -234,16 +238,21 @@ int main(int argc, char **argv) {
          strcmp(layer_norm_mode, "nvrtc"))) {
         fprintf(stderr, "usage: %s --model DIR (--pixel-values PATCHES.npy | --image IMAGE | --hidden BLOCK_INPUT.npy) "
                         "--grid-height H --grid-width W [--block-index N --max-blocks N] "
-                        "[--layer-norm nvcc|nvcc-pytorch|nvrtc] --out OUTPUT.npy\n", argv[0]);
+                        "[--layer-norm nvcc|nvcc-pytorch|nvrtc] [--norm1-override NORM.npy] "
+                        "[--flash-plugin PLUGIN.so] "
+                        "--out OUTPUT.npy\n", argv[0]);
         return 2;
     }
-    npy_f32 input = {0}, vision_rope_table = {0};
+    npy_f32 input = {0}, vision_rope_table = {0}, norm1_input = {0};
     if ((image ? load_vision_patches(image, &input, &h, &w) :
          npy_read_f32(pixels ? pixels : hidden, &input)) || input.ndim != 2 ||
         input.shape[0] != (size_t)h * w || input.shape[1] != (size_t)((pixels || image) ? 1536 : 1152) ||
         npy_read_f32("cuda/qimg21/qwen21_vision_rope.npy", &vision_rope_table) ||
         vision_rope_table.ndim != 3 || vision_rope_table.shape[1] != 18 ||
-        vision_rope_table.shape[2] != 2 || vision_rope_table.shape[0] < (size_t)(h > w ? h : w)) return 1;
+        vision_rope_table.shape[2] != 2 || vision_rope_table.shape[0] < (size_t)(h > w ? h : w) ||
+        (norm1_override && (npy_read_f32(norm1_override, &norm1_input) || norm1_input.ndim != 2 ||
+                            norm1_input.shape[0] != (size_t)h * w ||
+                            norm1_input.shape[1] != 1152))) return 1;
     qimg21_shards shards = {{0}, 0};
     char path[2048];
     for (int i = 1; i <= 4; i++) {
@@ -290,7 +299,7 @@ int main(int argc, char **argv) {
         cuModuleGetFunction(&gelu_exact, module, "gelu_exact")) goto done;
     if (!strcmp(attention_mode, "cutlass") || !strcmp(attention_mode, "flash")) {
         const char *plugin_path = !strcmp(attention_mode, "flash")
-            ? "cuda/qimg21/libq21_flash_attention.so"
+            ? flash_plugin_path
             : "cuda/qimg21/libq21_cutlass_attention.so";
         cutlass_plugin = dlopen(plugin_path, RTLD_NOW | RTLD_LOCAL);
         if (!strcmp(attention_mode, "flash")) {
@@ -387,6 +396,9 @@ blocks_ready:
         if (ln_status ||
             cuStreamSynchronize(r->stream)) { free_d(&nw); free_d(&nb); goto done; }
         free_d(&nw); free_d(&nb);
+        if (block == block_index && norm1_override &&
+            (cuMemcpyHtoD(norm, norm1_input.data, (size_t)count * sizeof(float)) ||
+             cuCtxSynchronize())) goto done;
         if (block == block_index && dump_vision(dump_dir, "norm1", norm, (size_t)count, n, 1152)) goto done;
         snprintf(name, sizeof(name), "model.visual.blocks.%d.attn.qkv", block);
         if (vision_linear(r, linear_epilogue, &shards, name, qkv, norm, n, 3456, 1152)) goto done;
@@ -486,10 +498,10 @@ done:
     if (module) cuModuleUnload(module);
     if (r) cuda_qimg_free(r);
     for (int i = 0; i < shards.n; i++) safetensors_close(shards.st[i]);
-    npy_free(&input); npy_free(&vision_rope_table);
+    npy_free(&input); npy_free(&vision_rope_table); npy_free(&norm1_input);
     return rc;
 fail:
     for (int i = 0; i < shards.n; i++) safetensors_close(shards.st[i]);
-    npy_free(&input); npy_free(&vision_rope_table);
+    npy_free(&input); npy_free(&vision_rope_table); npy_free(&norm1_input);
     return 1;
 }

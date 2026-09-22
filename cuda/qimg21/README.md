@@ -1293,6 +1293,17 @@ Testing unfused online/combine arithmetic, native BF16 conversion, PyTorch's
 the full recurrence, so the accepted kernel retains the literal pinned
 PyTorch Welford expressions.
 
+For boundary isolation, `--norm1-override NORM.npy` replaces the first
+executed block's computed normalization output after still running the native
+kernel, and `--flash-plugin PATH` selects an alternate ABI-compatible pinned
+attention build.  Replaying block 0 with the captured PyTorch normalization
+makes all 884,736 QKV values and both rotary Q/K tensors bit-exact.  The first
+remaining difference is then the FlashAttention output: 56 of 294,912 BF16
+values differ by one representable step (maximum absolute error 0.0009765625).
+Official FlashAttention `--use_fast_math`, fused softmax FMA, and CUDA 12.9
+build variants do not improve that result; the default unfused CUDA 13.1 build
+has the fewest mismatches.
+
 ```sh
 make -C cuda/qimg21 test_cuda_qimg21_vision
 cuda/qimg21/test_cuda_qimg21_vision \

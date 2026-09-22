@@ -4,7 +4,9 @@
 #define FLASHATTENTION_DISABLE_DROPOUT
 #define FLASHATTENTION_DISABLE_ALIBI
 #define FLASHATTENTION_DISABLE_SOFTCAP
+#ifndef Q21_FLASH_FUSE_FMA
 #define UNFUSE_FMA
+#endif
 
 #include <cstring>
 #include "csrc/flash_attn/src/flash.h"
