@@ -1254,7 +1254,7 @@ pinned FlashAttention forward specialization selected by PyTorch Flash SDPA
 for BF16 head dimension 72; `--attention cutlass` and `math` retain diagnostic
 alternatives. Vision linears use BF16-output cuBLAS-LT bias epilogues, including
 the PyTorch-selected algo 21 tile/stage and split-K configurations for the
-256-token block shapes. LayerNorm uses PyTorch's vector-four, eight-warp
+256-token block shapes. LayerNorm uses a vector-four, eight-warp
 Welford topology in the pinned NVCC plugin rather than NVRTC. Teacher-forced
 block 0 reaches cosine 0.999999824. Vision RoPE uses a checked CUDA-generated
 cosine/sine artifact and separate multiply/add operations matching PyTorch;
@@ -1262,13 +1262,18 @@ this raises the full block-26 cosine from 0.999461003 to 0.999691509. The
 recurrent result remains below the 0.99996 acceptance target. The merger uses the same
 pinned Welford implementation as the blocks. With the exact PyTorch block-26
 output injected, its local cosine is 0.999990332 and passes the 0.99996 gate;
-the accumulated full-run merger cosine remains 0.999079087, so the recurrent
+the exact-RoPE accumulated full-run merger cosine is 0.999551090, so the recurrent
 vision stack is not yet accepted for strict parity. It is wired into the
 experimental editing integration to exercise the complete native path. Use `--hidden ... --block-index N
 --max-blocks 1` for isolated block replay, or `--max-blocks 0 --merged-out ...`
 for merger-only replay, and `--dump-dir DIR` to save every executed block.
 `--layer-norm nvrtc` retains the in-module Welford implementation for
-diagnosis while `nvcc` remains the default. With the same FlashAttention path,
+diagnosis while `nvcc` remains the default. `nvcc-pytorch` selects the literal
+128-thread/four-warp launch used by pinned ATen: its block-0 LayerNorm rstd is
+bit-exact, LayerNorm output is 99.9986% elementwise exact, and teacher-forced
+block-0 cosine improves to 0.999999933. Its full block-26 cosine is
+0.999687034, slightly below the eight-warp default's 0.999691509, so it remains
+a diagnostic rather than the generation default. With the same FlashAttention path,
 the all-NVRTC run improves final block cosine from 0.999461003 to 0.999620834
 but still fails the gate. A greedy per-block oracle over both implementations
 first fails at block 5 (0.999954165), showing that LayerNorm-path selection
@@ -1279,10 +1284,12 @@ alone cannot resolve the recurrent vision error.
 `text_capture.py --dump-text-stages` records the corresponding PyTorch
 `vision_stage_norm{1,2}_{mean,rstd}.npy` arrays. On exact block-0 input, native
 means are bit-identical for 130/256 rows and differ by at most 7.45e-9;
-rstd is identical for 203/256 rows and differs by at most 2.38e-7. These F32
+rstd is identical for 203/256 rows and differs by at most 2.38e-7. The
+four-warp diagnostic makes rstd bit-exact for all rows and means exact for
+157/256 rows. These F32
 reduction differences explain the sparse LayerNorm BF16 discrepancies.
 Testing unfused online/combine arithmetic, native BF16 conversion, PyTorch's
-2D launch shape, O2 compilation, and CUDA 12.9 code generation did not improve
+2D thread indexing, O2 compilation, and CUDA 12.9 code generation did not improve
 the full recurrence, so the accepted kernel retains the literal pinned
 PyTorch Welford expressions.
 

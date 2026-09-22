@@ -230,10 +230,11 @@ int main(int argc, char **argv) {
         block_index + max_blocks > 27 ||
         (strcmp(attention_mode, "math") && strcmp(attention_mode, "cutlass") &&
          strcmp(attention_mode, "flash")) ||
-        (strcmp(layer_norm_mode, "nvcc") && strcmp(layer_norm_mode, "nvrtc"))) {
+        (strcmp(layer_norm_mode, "nvcc") && strcmp(layer_norm_mode, "nvcc-pytorch") &&
+         strcmp(layer_norm_mode, "nvrtc"))) {
         fprintf(stderr, "usage: %s --model DIR (--pixel-values PATCHES.npy | --image IMAGE | --hidden BLOCK_INPUT.npy) "
                         "--grid-height H --grid-width W [--block-index N --max-blocks N] "
-                        "[--layer-norm nvcc|nvrtc] --out OUTPUT.npy\n", argv[0]);
+                        "[--layer-norm nvcc|nvcc-pytorch|nvrtc] --out OUTPUT.npy\n", argv[0]);
         return 2;
     }
     npy_f32 input = {0}, vision_rope_table = {0};
@@ -299,6 +300,12 @@ int main(int argc, char **argv) {
                 dlsym(cutlass_plugin, "q21_flash_vision_layer_norm") : NULL;
             flash_layer_norm_stats = cutlass_plugin ? (q21_flash_vision_layer_norm_stats_fn)
                 dlsym(cutlass_plugin, "q21_flash_vision_layer_norm_stats") : NULL;
+            if (!strcmp(layer_norm_mode, "nvcc-pytorch")) {
+                flash_layer_norm = (q21_flash_vision_layer_norm_fn)
+                    dlsym(cutlass_plugin, "q21_flash_vision_layer_norm_pytorch");
+                flash_layer_norm_stats = (q21_flash_vision_layer_norm_stats_fn)
+                    dlsym(cutlass_plugin, "q21_flash_vision_layer_norm_stats_pytorch");
+            }
         } else {
             cutlass_attention = cutlass_plugin ? (q21_cutlass_vision_attention_fn)
                 dlsym(cutlass_plugin, "q21_cutlass_vision_attention") : NULL;
