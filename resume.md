@@ -1,5 +1,98 @@
 # Qwen3.8 27B HIP runner vs llama.cpp — resume state
 
+## Prefill arithmetic gap isolation and correction probes (2026-09-22)
+
+Implemented opt-in prefill diagnostics that preserve production defaults:
+
+- `LLM_QWEN35_PREFILL_REFERENCE_NORM=1`: use the existing precise reference
+  RMSNorm kernel for target prefill only. Scalar decode, draft/verifier norm,
+  and BF16 projection selection remain unchanged. Fused DFlash feature/norm
+  capture is bypassed so the diagnostic actually controls target prefill norm.
+- `LLM_QWEN35_PREFILL_IQ3S_D4=1`: use Q8 activations with FP32 D4 scales for
+  IQ3_S SSM QKV/gate projections, keeping the other BF16 paths. Mode `2`
+  shares IQ3_S weight decoding across eight token rows. It matches native
+  scalar arithmetic but has a different reduction order from mode 1.
+- `LLM_QWEN35_PREFILL_IQ4XS_D4=1`: apply the D4 activation contract to the
+  IQ4_XS SSM output projection, independently of QKV/gate selection.
+
+These are numerical diagnostics, not production tuning defaults. The generic
+fallback remains available for other tensor formats. No token forcing, output
+normalization, prompt modification, or sampler bias is used to hide differences.
+
+A single 189-token prefill chunk / decode=1 capture against the pinned llama.cpp
+isolates layer zero. Columns below are relative L2 on its last token:
+
+| Stage | Production | Reference norm + IQ3_S D4 | Add IQ4_XS D4 |
+| --- | ---: | ---: | ---: |
+| Input RMSNorm | 1.27e-7 | **bit-identical** | **bit-identical** |
+| SSM QKV | 2.80e-3 | 1.85e-7 | 1.85e-7 |
+| SSM gate projection | 3.75e-3 | 2.03e-7 | 2.03e-7 |
+| Gated recurrent output | 1.12e-3 | 3.96e-7 | 3.96e-7 |
+| SSM output projection | 2.31e-3 | 2.21e-3 | 1.21e-7 |
+| FFN input norm | 1.89e-2 | 1.88e-2 | 1.18e-6 |
+| Complete layer output | 2.32e-3 | 2.25e-3 | 3.55e-4 |
+
+The alpha projection is already bit-identical and was not changed. These
+measurements localize the substantial remaining layer-zero gap to the FFN
+once the SSM projection contracts are corrected; they do not establish exact
+recurrent-state or whole-model equivalence.
+
+Full 16173-token lower-bound task (same model/Q8-Q8/chunk512/greedy/seed42):
+
+| Diagnostic | Exact initial output tokens | Relative L2, common first 14 logit rows | Prefill tok/s |
+| --- | ---: | ---: | ---: |
+| Production control | 13 | 0.0452612 | 595.39 |
+| Reference norm only | 13 | 0.0452336 | 595.79 |
+| IQ3_S D4 mode 1 | 40 | 0.0461942 | 576.90 |
+| IQ3_S D4 mode 2 | 13 | 0.0454443 | 588.48 |
+| IQ3_S mode 1 + IQ4_XS D4 | 40 | 0.0438669 | 573.10 |
+
+The longer exact prefix alone does not prove lower aggregate error: mode 1
+alone slightly worsens the comparable 14-row metric. Combined SSM corrections
+improve it about 3.1%, and improve first-selection relative L2 from 0.146984
+to 0.136640. None achieves full cross-engine byte parity. Reference norm plus
+IQ3_S mode 1 also remains at 13 matching tokens. Norm-only first-selection
+relative L2 worsens to 0.151340 despite removing the local norm mismatch.
+
+These are one-pass traced-run prefill measurements, not a repeatability-backed
+performance promotion. Decode trace I/O is excluded from throughput claims.
+The changes remain opt-in: the faster D4 tile still changes the near-tie and
+the combined correction costs roughly 4% prefill in this probe. All completed
+coding answers pass the C++17 checker and 30000 ASan/UBSan boundary/random cases.
+
+Sampled seed-42/temperature-0.8 combined-SSM runs also retain exact target-only/
+DFlash2 bytes and hash `3dcbfc4759dbed36`, with 124 emitted tokens. Their
+prefill measured 571.59 / 568.51 tok/s and decode 38.23 / 49.40 tok/s. Both
+answers pass the same 30000-case C++ checker; this is runner/DFlash parity,
+not sampled llama.cpp parity.
+
+Final default-path rebuild check retains the original bytes/hash on both
+16K repeats and on the 189-token boundary case. Prefill is 595.30 / 587.92
+tok/s; decode is 38.87 / 38.86 tok/s. The second prefill result is below the
+previous warm 613.74 measurement despite unchanged default dispatch. Treat
+this timing variation as unresolved until a controlled binary A/B; do not
+claim a production speedup or strict no-regression result from these probes.
+
+Validation: runner build; profile tests; 192 prefill-norm CPU dispatch cases;
+24 GPU IQ3_S row-tiling cases bit-identical to the scalar native kernel,
+including partial tiles (counts 1/7/8/9/189/512); existing 756 verifier and
+54 captured-decode dispatch cases. Added `compare_qwen35_prefill_layer.py`
+with five CPU tests: it verifies metadata/layout, compares corresponding
+last-token stages, and rejects wrong shapes, nonfinite data, and ambiguous
+multi-chunk captures instead of silently comparing unrelated tensor tails.
+
+Artifacts: `rdna4/llm/tmp/parity-layer0/` contains capture scripts, staged
+comparisons, and GPU logs; `rdna4/llm/tmp/cross-engine-16k/` contains full-model
+logs, comparisons, token/byte evidence, and traces. To conserve disk, norm-only,
+combined-norm, and mode-2 traces retain only common-prefix logits in NPZ files;
+mode-1 and combined-SSM full traces are retained. Use the new layer comparator
+on `runner`, `runner-norm`, `runner-d4`, or `runner-ssm-d4` against `llama`.
+
+Next: match the FFN IQ1_S/IQ1_M/IQ2_XXS prefill arithmetic, then examine the first
+attention layer. Preserve MMQ/D4 scale precision and reduction order when
+optimizing token reuse; confirm full greedy/sampled reference parity and
+controlled prefill/HTTP measurements before promoting any diagnostic.
+
 ## Cross-engine exact-parity audit (2026-09-22)
 
 **FAIL for exact tokens/bytes on the 16173-token lower-bound coding task.**

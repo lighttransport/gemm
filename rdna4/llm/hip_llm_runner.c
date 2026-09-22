@@ -14177,6 +14177,7 @@ struct hip_llm_runner {
     int requested_qwen35_decode_graph;
     hipModule_t reference_math_module;
     hipFunction_t fn_qwen35_rmsnorm_reference;
+    hipFunction_t fn_qwen35_prefill_rmsnorm_reference;
     hipFunction_t fn_qwen35_conv_reference, fn_qwen35_silu_gate_reference;
     int requested_qwen35_native_q8_attention;
     hipModule_t q8_attention_module;
@@ -14232,6 +14233,7 @@ struct hip_llm_runner {
     hipFunction_t fn_qwen35_matvec_iq2xxs_multi8, fn_qwen35_matvec_iq2xs_multi8;
     hipFunction_t fn_qwen35_matvec_iq2s_multi8, fn_qwen35_matvec_iq3xxs_multi8;
     hipFunction_t fn_qwen35_matvec_iq3s_multi8;
+    hipFunction_t fn_qwen35_matvec_iq3s_prefill8;
     hipFunction_t fn_qwen35_matvec_iq2xxs_fixed8, fn_qwen35_matvec_iq2xs_fixed8;
     hipFunction_t fn_qwen35_matvec_iq2s_fixed8, fn_qwen35_matvec_iq3xxs_fixed8;
     hipFunction_t fn_qwen35_matvec_iq3s_fixed8;
@@ -18051,6 +18053,17 @@ int hip_llm_load_weights_sharded(hip_llm_runner *r, gguf_shards *model,
                       r->reference_math_module, "qwen35_silu_gate_reference"));
             r->ssm_fused_decode = 0;
         }
+        /* Diagnostic: isolate prefill normalization without changing scalar
+         * decode arithmetic or disabling the production BF16 projections. */
+        const char *prefill_norm_env = getenv("LLM_QWEN35_PREFILL_REFERENCE_NORM");
+        if (prefill_norm_env && atoi(prefill_norm_env) != 0) {
+            if (!r->reference_math_module &&
+                hip_compile_kernels_ex(&r->reference_math_module, r->device,
+                    qwen35_reference_math_source, "qwen35_reference.hip", r->verbose,
+                    "qwen35_reference", 1) <= 0) return -1;
+            CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_prefill_rmsnorm_reference,
+                      r->reference_math_module, "qwen35_rmsnorm_reference"));
+        }
         int native_mmvq = (options->struct_size == 0 ||
             options->struct_size >= offsetof(hip_llm_load_options, qwen35_native_mmvq) +
                                     sizeof(options->qwen35_native_mmvq)) && options->qwen35_native_mmvq;
@@ -18150,6 +18163,8 @@ int hip_llm_load_weights_sharded(hip_llm_runner *r, gguf_shards *model,
                           r->iq_module, "qwen35_matvec_iq3xxs_multi8"));
                 CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq3s_multi8,
                           r->iq_module, "qwen35_matvec_iq3s_multi8"));
+                CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq3s_prefill8,
+                          r->iq_module, "qwen35_matvec_iq3s_prefill8"));
                 CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq2xxs_fixed8,
                           r->iq_module, "qwen35_matvec_iq2xxs_fixed8"));
                 CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq2xs_fixed8,
@@ -19585,6 +19600,20 @@ static inline void launch_rmsnorm_batch(hip_llm_runner *r, void *dst, void *x,
     void *args[] = { &dst, &x, &w, &n, &row_stride, &eps };
     LAUNCH(r->fn_rmsnorm_batch_f32, n_rows, 1, 1, 256, 1, 1, 256 * sizeof(float),
            r->stream, args);
+}
+
+/* Prefill-only diagnostic; verifier/draft and scalar decode retain their
+ * existing arithmetic. The reference module is compiled without fast-math. */
+static inline void launch_qwen35_prefill_rmsnorm(hip_llm_runner *r, void *dst,
+        void *x, void *w, int n, int rows, int stride, float eps) {
+    if (r->fn_qwen35_prefill_rmsnorm_reference &&
+        r->is_hybrid && !r->is_qwen4exp) {
+        void *args[] = { &dst, &x, &w, &n, &stride, &eps };
+        LAUNCH(r->fn_qwen35_prefill_rmsnorm_reference, rows, 1, 1,
+               n < 1024 ? 256 : 1024, 1, 1, 0, r->stream, args);
+    } else {
+        launch_rmsnorm_batch(r, dst, x, w, n, rows, stride, eps);
+    }
 }
 
 static inline void launch_matvec(hip_llm_runner *r, void *dst, void *mat,
@@ -30802,7 +30831,8 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
         r->active_layer = l;
         hip_layer *cl = &r->layers[l];
         int dflash_capture_norm = 0;
-        if (!qwen35_batch_rms_scalar && !r->fn_qwen35_rmsnorm_reference)
+        if (!qwen35_batch_rms_scalar && !r->fn_qwen35_rmsnorm_reference &&
+            !r->fn_qwen35_prefill_rmsnorm_reference)
             dflash_capture_norm = hllm_qwen35_dflash2_capture_rmsnorm(
                 r, l, r->d_xnorm_batch, r->d_x_batch, cl->attn_norm_w,
                 M, eps);
@@ -31049,7 +31079,7 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
                         (char *)r->d_x_batch + (size_t)m * n_embd * sizeof(float),
                         cl->attn_norm_w, n_embd, eps);
             } else if (!dflash_capture_norm) {
-                launch_rmsnorm_batch(r, r->d_xnorm_batch, r->d_x_batch,
+                launch_qwen35_prefill_rmsnorm(r, r->d_xnorm_batch, r->d_x_batch,
                                      cl->attn_norm_w, n_embd, M, n_embd, eps);
             }
             if (r->debug_layers && l < 6)
@@ -31473,8 +31503,37 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
                 if (gemm_run_bf16_w(r, dst, _w, r->d_xnorm_batch_bf16, M,                 \
                                        cl->rows_field, n_embd, r->stream) != 0) return -1;\
             } while(0)
-            SSM_GEMM(r->d_ssm_qkv_batch,   ssm_qkv_w,   ssm_qkv_type,   ssm_qkv_rows,   ssm_qkv_cols);
-            SSM_GEMM(r->d_ssm_z_batch,     ssm_gate_w,  ssm_gate_type,  ssm_gate_rows,  ssm_gate_cols);
+            /* Diagnostic isolation of the IQ3_S MMQ input contract while
+             * retaining BF16 for the other projection families. */
+            const char *iq3_prefill_env = getenv("LLM_QWEN35_PREFILL_IQ3S_D4");
+            int iq3_prefill_d4 = iq3_prefill_env && atoi(iq3_prefill_env) != 0 &&
+                cl->ssm_qkv_type == GGML_TYPE_IQ3_S &&
+                cl->ssm_gate_type == GGML_TYPE_IQ3_S &&
+                cl->ssm_qkv_cols == n_embd && cl->ssm_gate_cols == n_embd &&
+                n_embd % 256 == 0;
+            if (iq3_prefill_d4) {
+                launch_quantize_mmq_d4_batch(r, r->d_xnorm_batch, n_embd, M, n_embd);
+                int reuse = atoi(iq3_prefill_env) >= 2 &&
+                            r->fn_qwen35_matvec_iq3s_prefill8;
+                hipFunction_t fn = reuse ? r->fn_qwen35_matvec_iq3s_prefill8 :
+                                          r->fn_matvec_iq3_s_q81_batch;
+                int threads = reuse ? 128 : 256;
+                int row_tile = threads / 32;
+                int token_tiles = reuse ? (M + 7) / 8 : M;
+                void *qa[] = { &r->d_ssm_qkv_batch, &cl->ssm_qkv_w,
+                    &r->d_act_q8_batch, &r->d_act_scale_batch,
+                    &cl->ssm_qkv_rows, &cl->ssm_qkv_cols, &M };
+                LAUNCH(fn, (cl->ssm_qkv_rows + row_tile - 1) / row_tile,
+                       token_tiles, 1, threads, 1, 1, 0, r->stream, qa);
+                void *ga[] = { &r->d_ssm_z_batch, &cl->ssm_gate_w,
+                    &r->d_act_q8_batch, &r->d_act_scale_batch,
+                    &cl->ssm_gate_rows, &cl->ssm_gate_cols, &M };
+                LAUNCH(fn, (cl->ssm_gate_rows + row_tile - 1) / row_tile,
+                       token_tiles, 1, threads, 1, 1, 0, r->stream, ga);
+            } else {
+                SSM_GEMM(r->d_ssm_qkv_batch, ssm_qkv_w, ssm_qkv_type, ssm_qkv_rows, ssm_qkv_cols);
+                SSM_GEMM(r->d_ssm_z_batch, ssm_gate_w, ssm_gate_type, ssm_gate_rows, ssm_gate_cols);
+            }
             SSM_GEMM(r->d_ssm_alpha_batch, ssm_alpha_w, ssm_alpha_type, ssm_alpha_rows, ssm_alpha_cols);
             SSM_GEMM(r->d_ssm_beta_batch,  ssm_beta_w,  ssm_beta_type,  ssm_beta_rows,  ssm_beta_cols);
             #undef SSM_GEMM
@@ -31713,14 +31772,20 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
             const char *iq4_q81_max_env = getenv("LLM_QWEN35_IQ4_SSM_OUT_Q81_MAX_LAYER");
             if (qwen35_iq4_q81_out && iq4_q81_max_env && l > atoi(iq4_q81_max_env))
                 qwen35_iq4_q81_out = 0;
-            if (qwen35_iq4_q81_out && cl->ssm_out_type == GGML_TYPE_IQ4_XS &&
-                d_inner % 32 == 0) {
-                /* This is the single-term llama.cpp Q8_1 contract, not the
-                 * runner's two-term Q8x2 approximation.  In particular, the
-                 * stored activation scale is rounded through half precision
-                 * before the IQ4_XS dot consumes it. */
-                launch_quantize_q81_batch_cached(r, r->d_ssm_out_batch,
+            const char *iq4_d4_env = getenv("LLM_QWEN35_PREFILL_IQ4XS_D4");
+            int iq4_prefill_d4 = iq4_d4_env && atoi(iq4_d4_env) != 0 &&
+                                 d_inner % 256 == 0;
+            if ((qwen35_iq4_q81_out || iq4_prefill_d4) &&
+                cl->ssm_out_type == GGML_TYPE_IQ4_XS && d_inner % 32 == 0) {
+                /* D4 keeps FP32 activation scales for the prefill MMQ
+                 * diagnostic. The existing Q8_1 route rounds scales through
+                 * half precision for the MMVQ contract. */
+                if (iq4_prefill_d4)
+                    launch_quantize_mmq_d4_batch(r, r->d_ssm_out_batch,
                                                  d_inner, M, d_inner);
+                else
+                    launch_quantize_q81_batch_cached(r, r->d_ssm_out_batch,
+                                                     d_inner, M, d_inner);
                 launch_matvec_iq4_xs_q81_batch(r, r->d_attn_proj_batch,
                     cl->ssm_out_w, r->d_act_q8_batch, r->d_act_scale_batch,
                     n_embd, d_inner, M);
@@ -32339,7 +32404,7 @@ ffn_section:
                         (char *)r->d_x_batch + (size_t)m * n_embd * sizeof(float),
                         cl->ffn_norm_w, n_embd, eps);
             } else {
-                launch_rmsnorm_batch(r, r->d_xnorm_batch, r->d_x_batch,
+                launch_qwen35_prefill_rmsnorm(r, r->d_xnorm_batch, r->d_x_batch,
                                      cl->ffn_norm_w, n_embd, M, n_embd, eps);
             }
         }
@@ -32593,7 +32658,7 @@ ffn_section:
         r->d_x = saved_d_x;
         r->d_hc = saved_d_hc;
     } else {
-        launch_rmsnorm_batch(r, r->d_x_batch, r->d_x_batch,
+        launch_qwen35_prefill_rmsnorm(r, r->d_x_batch, r->d_x_batch,
                              r->d_output_norm, n_embd, M, n_embd, eps);
     }
 

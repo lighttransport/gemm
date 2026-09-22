@@ -782,6 +782,19 @@ extern "C" __global__ void qwen35_matvec_iq3s_multi8(
     qwen35_matvec_iq_multi<8>(out,weights,q,scales,rows,cols,4,count);
 }
 
+/* Prefill tiles share IQ3_S weight decode across eight activation rows.
+ * The caller supplies the MMQ D4 (FP32) activation scales. */
+extern "C" __global__ void qwen35_matvec_iq3s_prefill8(
+        float *out, const unsigned char *weights, const signed char *q,
+        const float *scales, int rows, int cols, int count) {
+    int first = blockIdx.y * 8;
+    int remaining = count - first;
+    if (remaining <= 0) return;
+    qwen35_matvec_iq_multi<8>(out + (size_t)first * rows, weights,
+        q + (size_t)first * cols, scales + (size_t)first * (cols / 32),
+        rows, cols, 4, remaining < 8 ? remaining : 8);
+}
+
 /* Decode the four grids first, then finish one activation row at a time.
  * This keeps only two dot accumulators live instead of sixteen while still
  * sharing every codebook lookup across all eight verifier rows. */
