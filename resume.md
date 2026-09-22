@@ -150,6 +150,14 @@ and per-row reduction arithmetic unchanged. It is diagnostic only pending a
 resident 4K/64K hash and throughput comparison; the ordinary two-launch path
 remains the default.
 
+Mixed-IQ attention layers also expose
+`LLM_QWEN35_IQ3S_QKV_FUSED=1` when Q, K, and V are all IQ3_S with a common
+input width. The native kernel retains IQ3_S code decoding, scale correction,
+and warp reduction order while sharing the Q8_1 activation launch across the
+three output ranges. It remains diagnostic until a resident gfx1201 run
+confirms exact logits/tokens and a sustained 64K projection improvement;
+standalone IQ3_S dispatch remains the default.
+
 ## 2026-09-22 continuation: opt-in DFlash2 Q/K/V projection fusion
 
 DFlash2 proposal rows now have an opt-in `LLM_QWEN35_DFLASH_QKV_FUSED=1` path

@@ -541,6 +541,69 @@ extern "C" __global__ void qwen35_matvec_iq3s(
     if (lane == 0) out[row] = sum;
 }
 
+/* One-token IQ3_S Q/K/V fusion.  IQ3_S appears in mixed-IQ attention
+ * layers; keep this candidate opt-in because the quality-safe default uses
+ * the standalone path until resident hashes and throughput are measured. */
+extern "C" __global__ void qwen35_matvec_iq3s_qkv(
+        float *__restrict__ qout, float *__restrict__ kout,
+        float *__restrict__ vout,
+        const unsigned char *__restrict__ qw,
+        const unsigned char *__restrict__ kw,
+        const unsigned char *__restrict__ vw,
+        const signed char *__restrict__ q, const float *__restrict__ scales,
+        int qrows, int krows, int vrows, int cols) {
+    int lane = threadIdx.x & 31;
+    int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    int total_rows = qrows + krows + vrows;
+    if (row >= total_rows) return;
+
+    float *out;
+    const unsigned char *weights;
+    int local_row;
+    if (row < qrows) {
+        out = qout;
+        weights = qw;
+        local_row = row;
+    } else if (row < qrows + krows) {
+        out = kout;
+        weights = kw;
+        local_row = row - qrows;
+    } else {
+        out = vout;
+        weights = vw;
+        local_row = row - qrows - krows;
+    }
+
+    int blocks = cols / 256;
+    const unsigned char *w = weights + (size_t)local_row * blocks * 110;
+    float sum = 0.0f;
+    for (int qb = lane; qb < blocks * 8; qb += 32) {
+        int b = qb / 8, ib = qb & 7;
+        const unsigned char *p = w + b * 110;
+        const int *u = (const int *)(q + qb * 32);
+        unsigned int qh = p[66 + ib];
+        unsigned long long codes = *(const unsigned long long *)(p + 2 + ib * 8);
+        unsigned int packed_signs = *(const unsigned int *)(p + 74 + ib * 4);
+        int z = 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            unsigned int signs = (packed_signs >> (8*j)) & 255;
+            int il = ((codes >> (16*j)) & 255) | ((qh << (8 - 2*j)) & 0x100);
+            int ih = ((codes >> (16*j+8)) & 255) | ((qh << (7 - 2*j)) & 0x100);
+            int lo = qwen35_signed_grid(qwen35_iq3s_grid[il], signs, 0);
+            int hi = qwen35_signed_grid(qwen35_iq3s_grid[ih], signs, 4);
+            z = qwen35_dot4(lo, u[2*j], z);
+            z = qwen35_dot4(hi, u[2*j+1], z);
+        }
+        z *= 1 + 2 * ((p[106 + ib/2] >> ((ib & 1) * 4)) & 15);
+        float d = (float)*(const _Float16 *)p * scales[qb];
+        sum += d * z;
+    }
+    for (int offset = 16; offset; offset >>= 1)
+        sum += __shfl_xor(sum, offset, 32);
+    if (lane == 0) out[local_row] = sum;
+}
+
 /* Decode each IQ grid once for several speculative activation rows.  DFlash2
  * verifies five or eight rows at a time, so keep a wider specialization in
  * addition to the lower-register four-row kernel used by dense NextN. */

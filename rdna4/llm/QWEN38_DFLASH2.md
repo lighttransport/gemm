@@ -101,6 +101,13 @@ disabled, so both one-token projections share codebook staging and one launch
 while retaining the standalone row arithmetic. This remains opt-in pending
 resident hash, quality, and throughput checks.
 
+Mixed-IQ attention layers can also opt into
+`LLM_QWEN35_IQ3S_QKV_FUSED=1` when Q, K, and V are all IQ3_S with a common
+input width. The kernel keeps IQ3_S code decoding, scale correction, and warp
+reduction order exact while sharing the Q8_1 activation launch. This remains a
+diagnostic candidate until resident gfx1201 token/logit hashes and sustained
+64K timing show a gain; standalone IQ3_S launches remain the default.
+
 The IQ2_XS target's usual IQ1_S gate/IQ1_M up pair has a corresponding
 `LLM_QWEN35_IQ1_GATEUP_FUSED=1` candidate. It shares the exact Q8_1 activation
 and dispatches both differing IQ1 layouts in one warp-per-row kernel. The
