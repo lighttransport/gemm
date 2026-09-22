@@ -23479,9 +23479,12 @@ static inline void launch_attn_decode_native_q8(hip_llm_runner *r, void *out,
     }
     /* The decode kernel writes final output directly when its adaptive split
      * count is one; avoid enqueueing the combine no-op while the causal
-     * length is at most one 256-token tile. Host cur_position is published
-     * to d_position before this layer, so this guard follows that decision. */
-    if (r->cur_position >= 0 && r->cur_position < 256) return;
+     * length is at most one 256-token tile for uncaptured decode. Captured
+     * graphs must retain combine: capture starts at position zero, but replay
+     * reads a changing device position and may require multiple splits. The
+     * combine kernel itself returns immediately when the split count is one. */
+    if (!r->requested_qwen35_decode_graph &&
+        r->cur_position >= 0 && r->cur_position < 256) return;
     void *b[] = { &out, &r->d_q8_attention_parts, &r->d_q8_attention_meta,
         &r->d_position, &r->n_heads, &r->q8_attention_nsm, &occupancy, &forced_splits };
     LAUNCH(r->fn_q8_attention_combine, r->n_heads, 1, 1, 256, 1, 1,

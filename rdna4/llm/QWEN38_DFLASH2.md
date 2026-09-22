@@ -1,5 +1,43 @@
 # Qwen3.8 DFlash2 on RDNA4
 
+## Captured target-only attention correctness repair (2026-09-22)
+
+Fixed the quality failure discovered by the broader 16K binary-search task.
+`launch_attn_decode_native_q8` previously omitted combine when the host
+position was below 256. Decode graphs are captured at position zero, so their
+later multi-split replays never combined attention partials. The failed
+captured target-only run emitted eight corrupted tokens. This was not caused
+by the new five-query verifier, which uses its own launch path.
+
+Graph-enabled launches now always retain combine; the kernel reads the
+current device position and returns when there is only one split. Uncaptured
+short-context launches retain their existing no-op avoidance. This preserves
+capture performance without replaying a short-position host decision.
+
+The corrected 16173-token greedy run emits 128 correct tokens in both repeats,
+byte-identical to uncaptured target decode and K=4 DFlash2, hash
+`41b94b5f8a941e8d`. Decode is 38.96 / 38.90 tok/s versus 37.92 uncaptured;
+prefill is 595.17 / 613.74 tok/s. A 189-token prompt plus 128 generated tokens
+crosses the 256-position boundary with exact graph/uncaptured text and token
+parity (42.86 versus 41.65 tok/s). The sampled 16K graph run emits 124
+tokens at 38.22 tok/s, exactly matching the sampled DFlash2 answer and hash
+`3dcbfc4759dbed36`. These are quality-valid measured rates;
+the previous corrupted-output timing is not a performance baseline.
+
+`test_decode_attention_launch.py` checks 54 combinations of kernel fallback,
+graph selection, and short/long/boundary position. It rejects the old guard
+and passes the repaired one. Full-model answers pass the C++ lower-bound
+checker. Build and the existing verifier dispatch checks pass.
+Artifacts: `rdna4/llm/tmp/lower-bound-target-{uncaptured,graph-fixed}.log`,
+`attention-capture-quality.sh`, and `attention-capture-*.log`.
+
+The llama.cpp reference answer still differs in bytes, although all generated
+implementations pass the same boundary/random correctness checks. Remaining:
+isolate that first cross-engine logit divergence, broaden coding workloads,
+and measure a useful injection overlap interval before enabling overlap.
+Ordinary target-only throughput optimization remains outside the items 2–5
+batch; fixing a demonstrated correctness failure is included.
+
 ## Five-query verifier and broader coding quality (2026-09-22)
 
 Full K=4 verifier windows now use a fixed-five-query Q8/Q8 attention kernel
