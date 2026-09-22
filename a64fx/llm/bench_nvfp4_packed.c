@@ -110,11 +110,23 @@ int main(void) {
     if (sizeof(source_block) != 36 || sizeof(packed_block) != 384) return 2;
     size_t source_size = (size_t)ROWS * NB * sizeof(source_block);
     size_t packed_size = (size_t)(ROWS / NR) * NB * sizeof(packed_block);
-    source_block *src = aligned_alloc(256, source_size);
-    packed_block *packed = aligned_alloc(256, packed_size);
+    /* Reserve the expanded layout once, then repack from the last tile back.
+     * A tile-sized scratch buffer prevents writes from clobbering its unread
+     * row-major source; higher tiles are already packed when overlap occurs. */
+    uint8_t *arena = aligned_alloc(256, packed_size);
+    source_block *src = (source_block *)arena;
+    packed_block *packed = (packed_block *)arena;
+    packed_block *scratch = aligned_alloc(256, NB * sizeof(*scratch));
+    source_block *check_src = aligned_alloc(256, NR * NB * sizeof(*check_src));
+    source_block *check_last = aligned_alloc(256, NR * NB * sizeof(*check_last));
     activation_block *act = aligned_alloc(256, (K / 16) * sizeof(*act));
     float *output = aligned_alloc(256, ROWS * sizeof(float));
-    if (!src || !packed || !act || !output) return 3;
+    if (!arena || !scratch || !check_src || !check_last || !act || !output) return 3;
+    /* Match the later static row partition: each worker owns contiguous
+     * packed pages on its CMG before the serial backward copy touches them. */
+#pragma omp parallel for schedule(static)
+    for (size_t page = 0; page < packed_size / (2u * 1024 * 1024); page++)
+        arena[page * (2u * 1024 * 1024)] = 0;
     uint32_t rng = 1;
     uint8_t *bytes = (uint8_t *)src;
     for (size_t i = 0; i < source_size; i++) {
@@ -123,21 +135,28 @@ int main(void) {
     }
     for (size_t i = 0; i < (size_t)ROWS * NB; i++)
         for (int s = 0; s < NS; s++) src[i].d[s] &= 7;
+    memcpy(check_src, src, NR * NB * sizeof(*check_src));
+    memcpy(check_last, src + (ROWS - NR) * NB,
+           NR * NB * sizeof(*check_last));
     float x[K];
     for (int j = 0; j < K; j++) x[j] = sinf((float)j * 0.013f);
     quantize_activation(act, x);
     double p0 = wall_sec();
-#pragma omp parallel for schedule(static)
-    for (int tile = 0; tile < ROWS / NR; tile++)
-        pack_tile(packed + (size_t)tile * NB, src, tile);
+    for (int tile = ROWS / NR - 1; tile >= 0; tile--) {
+        pack_tile(scratch, src, tile);
+        memcpy(packed + (size_t)tile * NB, scratch, NB * sizeof(*scratch));
+    }
     double p1 = wall_sec();
     packed_dot8(output, packed, act);
+    packed_dot8(output + ROWS - NR, packed + (ROWS / NR - 1) * NB, act);
     static const int8_t codes[16] = {0,1,2,3,4,6,8,12,0,-1,-2,-3,-4,-6,-8,-12};
     double err2 = 0, ref2 = 0;
-    for (int r = 0; r < NR; r++) {
+    for (int r = 0; r < 2 * NR; r++) {
+        int row = r < NR ? r : ROWS - NR + r - NR;
         double ref = 0;
         for (int b = 0; b < NB; b++) {
-            const source_block *q = src + (size_t)r * NB + b;
+            const source_block *q = (r < NR ? check_src : check_last) +
+                                    (size_t)(r % NR) * NB + b;
             for (int s = 0; s < NS; s++) {
                 float scale = scale_ref(q->d[s]);
                 for (int j = 0; j < 8; j++) {
@@ -147,7 +166,7 @@ int main(void) {
                 }
             }
         }
-        double e = output[r] - ref;
+        double e = output[row] - ref;
         err2 += e * e; ref2 += ref * ref;
     }
     double best = 1e100;
@@ -166,6 +185,7 @@ int main(void) {
     printf("rows=%d K=%d packed_GB=%.3f pack_seconds=%.3f rel_l2=%.6g best_source_GBps=%.1f\n",
            ROWS, K, packed_size / 1e9, p1-p0, sqrt(err2 / ref2),
            source_size / best / 1e9);
-    free(src); free(packed); free(act); free(output);
+    free(arena); free(scratch); free(check_src); free(check_last);
+    free(act); free(output);
     return 0;
 }

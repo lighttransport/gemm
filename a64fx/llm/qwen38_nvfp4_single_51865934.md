@@ -97,17 +97,31 @@ path is not a performance improvement.
 
 `bench_nvfp4_packed.c` explores a K-major eight-row W4A8 layout with SVE
 `TBL` + `SDOT`. It predecodes the eight UE4M3 scales per subblock to FP32;
-the packed bytes are 4/3 the original GGUF weight bytes. On a synthetic
-131,072-row by 5,120-column matrix, 48 threads across four CMGs, 2 MiB
-hugepages, and CMG-local first touch, the best trial streamed 0.503 GB of
-packed weights in 0.965 ms: 521.5 GB/s physical or 391.1 GB/s of original
-GGUF bytes. Its relative L2 error against a scalar FP32 reference was
-0.001794 for the first eight rows. FP16 predecoded scales reduced storage but
-measured 375.6 GB/s original-byte equivalent. This is a synthetic kernel
-measurement, not end-to-end model speed or token validation. At 14.754 GB of
-weights per token, 391.1 GB/s would bound a perfect packed model at about
-26.5 tok/s before all non-matvec work; reaching 40 tok/s still requires a
-faster format/kernel and safe in-memory repacking of the model.
+the packed bytes are 4/3 the original GGUF weight bytes. The benchmark now
+reserves one expanded arena and packs it **backward in place** with only a
+30 KiB tile scratch, avoiding a second full weight allocation. Before the
+serial packing pass, 48 workers first-touch the 2 MiB pages so the later
+static decode partition reads CMG-local HBM. Without that placement, packed
+read throughput collapsed to 77.8 GB/s original-byte equivalent; with it,
+the final first/last-tile-checked trial streamed 0.503 GB packed in 0.973 ms:
+517.2 GB/s physical or 387.9 GB/s original-byte equivalent. The synthetic
+131,072-row by 5,120-column matrix packed in 1.091 seconds; first and last
+eight-row tiles had relative L2 error 0.001628 against a scalar FP32 oracle.
+FP16 predecoded scales reduced storage but measured 375.6 GB/s original-byte
+equivalent. This is a synthetic kernel measurement, not end-to-end model speed
+or token validation. At 14.754 GB of weights per token, 387.9 GB/s would
+bound a perfect packed model at about 26.3 tok/s before non-matvec work;
+reaching 40 tok/s still requires a faster format/kernel and full-model
+integration of the in-place layout.
+
+A metadata-only scan of the staged GGUF found 371 eligible NVFP4 tensors:
+13.740 GB original bytes become 18.320 GB packed. Including the remaining
+tensors, the expanded data arena would be approximately **20.627 GB** versus
+16.048 GB today, within the node's 32 GB HBM before runtime buffers. The
+largest original eligible tensor is 50.1 MB. Full-model integration still
+needs reverse-order movement across GGUF tensors and remapping every loaded
+`qtensor.data` pointer; this scan is a capacity calculation, not a successful
+model repack.
 
 ## Reproduce
 
