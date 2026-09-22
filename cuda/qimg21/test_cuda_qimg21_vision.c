@@ -167,6 +167,7 @@ int main(int argc, char **argv) {
     const char *model = NULL, *pixels = NULL, *hidden = NULL, *out = NULL;
     const char *patch_out = NULL, *dump_dir = NULL, *merged_out = NULL, *deepstack_dir = NULL;
     const char *attention_mode = "flash";
+    const char *layer_norm_mode = "nvcc";
     int h = 0, w = 0, max_blocks = 0, block_index = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--model") && i + 1 < argc) model = argv[++i];
@@ -182,15 +183,18 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--merged-out") && i + 1 < argc) merged_out = argv[++i];
         else if (!strcmp(argv[i], "--deepstack-dir") && i + 1 < argc) deepstack_dir = argv[++i];
         else if (!strcmp(argv[i], "--attention") && i + 1 < argc) attention_mode = argv[++i];
+        else if (!strcmp(argv[i], "--layer-norm") && i + 1 < argc) layer_norm_mode = argv[++i];
         else return 2;
     }
     if (!model || (!!pixels == !!hidden) || !out || h < 1 || w < 1 || h % 2 || w % 2 ||
         h * w > 4096 || max_blocks < 0 || block_index < 0 || block_index > 26 ||
         block_index + max_blocks > 27 ||
         (strcmp(attention_mode, "math") && strcmp(attention_mode, "cutlass") &&
-         strcmp(attention_mode, "flash"))) {
+         strcmp(attention_mode, "flash")) ||
+        (strcmp(layer_norm_mode, "nvcc") && strcmp(layer_norm_mode, "nvrtc"))) {
         fprintf(stderr, "usage: %s --model DIR (--pixel-values PATCHES.npy | --hidden BLOCK_INPUT.npy) "
-                        "--grid-height H --grid-width W [--block-index N --max-blocks N] --out OUTPUT.npy\n", argv[0]);
+                        "--grid-height H --grid-width W [--block-index N --max-blocks N] "
+                        "[--layer-norm nvcc|nvrtc] --out OUTPUT.npy\n", argv[0]);
         return 2;
     }
     npy_f32 input = {0};
@@ -256,6 +260,7 @@ int main(int argc, char **argv) {
             goto done;
         }
     }
+    if (!strcmp(layer_norm_mode, "nvrtc")) flash_layer_norm = NULL;
     if (hidden) {
         x = checked_cuMemAlloc((size_t)count * 4);
         host_out = malloc((size_t)count * 4);

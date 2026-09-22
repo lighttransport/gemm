@@ -55,6 +55,14 @@ def capture_text_encoder(pipe, folder: Path, stage_layer: int = 0):
     try:
         handles.append(encoder.register_forward_pre_hook(inputs_hook, with_kwargs=True))
         handles.append(model.norm.register_forward_pre_hook(norm_hook))
+        if hasattr(model, "rotary_emb"):
+            def rotary_hook(module, args, output):
+                cos, sin = output
+                table = __import__("torch").stack((cos, sin), dim=-1)
+                if table.ndim == 4 and table.shape[0] == 1:
+                    table = table[0]
+                _save(folder / "rope_table.npy", table)
+            handles.append(model.rotary_emb.register_forward_hook(rotary_hook))
         if visual is not None:
             vision_module = importlib.import_module(type(visual).__module__)
             original_vision_rope = vision_module.apply_rotary_pos_emb_vision
@@ -99,6 +107,9 @@ def capture_text_encoder(pipe, folder: Path, stage_layer: int = 0):
             for index, merger in enumerate(visual.deepstack_merger_list):
                 handles.append(merger.register_forward_hook(save_visual(f"deepstack_{index}")))
         for index, layer in enumerate(layers):
+            def layer_input_hook(module, args, index=index):
+                _save(folder / f"layer_{index:02d}_input.npy", args[0])
+            handles.append(layer.register_forward_pre_hook(layer_input_hook))
             def layer_hook(module, args, output, index=index):
                 value = output[0] if isinstance(output, tuple) else output
                 _save(folder / f"layer_{index:02d}.npy", value)
@@ -116,6 +127,10 @@ def capture_text_encoder(pipe, folder: Path, stage_layer: int = 0):
                     _save(folder / "stage_self_attn.o_proj.input.npy", args[0])
                 if hasattr(layer, "self_attn"):
                     handles.append(layer.self_attn.o_proj.register_forward_pre_hook(projection_input))
+                def post_attention_input(module, args):
+                    _save(folder / "stage_post_attention_hidden.npy", args[0])
+                if hasattr(layer, "post_attention_layernorm"):
+                    handles.append(layer.post_attention_layernorm.register_forward_pre_hook(post_attention_input))
         yield
         if metadata["calls"] != 1 or metadata["norm_calls"] != 1:
             raise RuntimeError("text encoder did not execute the expected fixture boundaries")

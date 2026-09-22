@@ -1088,8 +1088,9 @@ It gathers only requested embedding rows, streams one BF16 weight matrix at
 a time, and implements all 36 text blocks with native RMSNorm, split-half
 text RoPE, causal grouped-query attention, SwiGLU, and BF16 residual updates.
 It omits the final RMSNorm and LM head. The C executable requires unpadded,
-batch-one integer token IDs, rejects vision tokens, and limits inputs to
-4096 tokens. Python handles only processor/tokenization and system-prefix
+batch-one integer token IDs and limits inputs to 4096 tokens. Vision tokens
+require the explicitly supplied merger, deep-stack, and MRoPE fixtures
+described below. Python handles only processor/tokenization and system-prefix
 cropping; `--prepare-only` runs that stage without CUDA or model weights.
 The original checkpoint configuration is required; this is not a general
 Qwen3-VL loader. The validated default uses the pinned FlashAttention forward
@@ -1260,6 +1261,12 @@ the accumulated full-run merger cosine remains 0.999079087, so it is not
 accepted or wired into generation yet. Use `--hidden ... --block-index N
 --max-blocks 1` for isolated block replay, or `--max-blocks 0 --merged-out ...`
 for merger-only replay, and `--dump-dir DIR` to save every executed block.
+`--layer-norm nvrtc` retains the in-module Welford implementation for
+diagnosis while `nvcc` remains the default. With the same FlashAttention path,
+the all-NVRTC run improves final block cosine from 0.999461003 to 0.999620834
+but still fails the gate. A greedy per-block oracle over both implementations
+first fails at block 5 (0.999954165), showing that LayerNorm-path selection
+alone cannot resolve the recurrent vision error.
 
 ```sh
 make -C cuda/qimg21 test_cuda_qimg21_vision
@@ -1275,6 +1282,18 @@ The work directory contains `prompt/prompt_embeds.npy`, the deterministic
 initial `latents.npy`, one `steps/step_XXX.npy` file per Euler update, and the
 final `native_latents.npy`. These arrays are the hand-off points for comparing
 the native transformer/scheduler against the PyTorch reference.
+
+The native text executable can now consume multimodal fixtures directly:
+`--vision-merged` replaces image-pad token embeddings, and
+`--vision-deepstack-dir` adds the three visual features after language layers
+0, 1, and 2. `--rope-table` supplies the corresponding MRoPE cosine/sine table.
+The visual feature upload is explicitly synchronized with the CUDA execution
+stream; without that dependency, successive layers could consume overwritten
+deep-stack storage. On the captured 96-token/16x16-patch case, language layers
+0 through 19 and all three deep-stack additions are bit-exact. Every layer
+through 34 passes 0.99996, but layer 35 falls to 0.999906556 and the cropped
+prompt embedding scores 0.999826711. This fixture-driven multimodal path is
+therefore diagnostic, not yet accepted or selected by `native_generate.py`.
 
 Add `--native-vae` to use the native F32 CUDA decoder. It reads the original
 VAE safetensors, applies latent denormalization and the learned post-quant

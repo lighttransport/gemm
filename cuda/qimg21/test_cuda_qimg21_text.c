@@ -68,6 +68,7 @@ static int text_norm(cuda_qimg_runner *r, CUfunction fn, const qimg21_shards *s,
 int main(int argc, char **argv) {
     const char *model = NULL, *tokens = NULL, *out = NULL, *dump_dir = NULL;
     const char *dump_tokens = NULL;
+    const char *vision_merged = NULL, *vision_deepstack_dir = NULL, *rope_table_path = NULL;
     const char *prompt = NULL;
     const char *attention_mode = "custom";
     int drop = 0, layers = 36, dump_layer = 0;
@@ -78,6 +79,9 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--out") && i + 1 < argc) out = argv[++i];
         else if (!strcmp(argv[i], "--dump-tokens") && i + 1 < argc) dump_tokens = argv[++i];
         else if (!strcmp(argv[i], "--dump-dir") && i + 1 < argc) dump_dir = argv[++i];
+        else if (!strcmp(argv[i], "--vision-merged") && i + 1 < argc) vision_merged = argv[++i];
+        else if (!strcmp(argv[i], "--vision-deepstack-dir") && i + 1 < argc) vision_deepstack_dir = argv[++i];
+        else if (!strcmp(argv[i], "--rope-table") && i + 1 < argc) rope_table_path = argv[++i];
         else if (!strcmp(argv[i], "--attention") && i + 1 < argc) attention_mode = argv[++i];
         else if (!strcmp(argv[i], "--bf16-gemm-output")) text_bf16_gemm_output = 1;
         else if (!strcmp(argv[i], "--f32-gemm-output")) text_bf16_gemm_output = 0;
@@ -87,12 +91,14 @@ int main(int argc, char **argv) {
         else { fprintf(stderr, "text: unknown/incomplete option %s\n", argv[i]); return 2; }
     }
     if (!model || (!!tokens == !!prompt) || (!out && !dump_tokens) ||
+        (vision_deepstack_dir && !vision_merged) ||
         (strcmp(attention_mode, "custom") && strcmp(attention_mode, "cutlass-efficient") &&
          strcmp(attention_mode, "flash-exact")) ||
         drop < 0 || layers < 1 || layers > 36 ||
         dump_layer < 0 || dump_layer >= layers) {
         fprintf(stderr, "usage: %s --model DIR (--tokens ids.txt | --prompt TEXT) "
                         "[--out embeds.npy] [--dump-tokens ids.txt] "
+                        "[--vision-merged FILE --vision-deepstack-dir DIR --rope-table FILE] "
                         "[--attention custom|cutlass-efficient|flash-exact --drop-prefix N "
                         "--max-layers 36 --dump-layer N]\n", argv[0]); return 2;
     }
@@ -114,7 +120,8 @@ int main(int argc, char **argv) {
             errno = 0;
             long token = strtol(word, &end, 10);
             if (errno || *end || n == 4096 || token < 0 || token >= 151936 ||
-                token == 151655 || token == 151656 || token == 151652 || token == 151653) {
+                ((!vision_merged) &&
+                 (token == 151655 || token == 151656 || token == 151652 || token == 151653))) {
                 fprintf(stderr, "text: invalid token/vision input or more than 4096 tokens\n");
                 fclose(fp); return 1;
             }
@@ -137,6 +144,7 @@ int main(int argc, char **argv) {
     CUmodule module = NULL, base_module = NULL;
     CUdeviceptr x=0, norm=0, bf=0, q=0, key=0, v=0, att=0, tmp=0, gate=0, up=0;
     CUdeviceptr q_bf=0, key_bf=0, v_bf=0, rope_table=0;
+    CUdeviceptr visual_rows_d=0, visual_embed_d=0;
     void *cutlass_plugin = NULL;
     q21_cutlass_text_attention_fn cutlass_attention = NULL;
     float *host = calloc((size_t)n * 4096, sizeof(float));
@@ -157,6 +165,24 @@ int main(int argc, char **argv) {
         uint32_t bits = (uint32_t)embedding[(size_t)ids[t]*4096+j] << 16;
         memcpy(host+(size_t)t*4096+j, &bits, 4);
     }
+    int visual_rows[4096], visual_count = 0;
+    for (int t = 0; t < n; t++) if (ids[t] == 151655) visual_rows[visual_count++] = t;
+    if (!!vision_merged != (visual_count > 0)) {
+        fprintf(stderr, "text: image-pad tokens and --vision-merged must be supplied together\n");
+        goto done;
+    }
+    if (vision_merged) {
+        npy_f32 merged = {0};
+        if (npy_read_f32(vision_merged, &merged) || merged.ndim != 2 ||
+            merged.shape[0] != (size_t)visual_count || merged.shape[1] != 4096) {
+            fprintf(stderr, "text: invalid merged vision embedding\n");
+            npy_free(&merged); goto done;
+        }
+        for (int i = 0; i < visual_count; i++)
+            memcpy(host + (size_t)visual_rows[i] * 4096,
+                   merged.data + (size_t)i * 4096, 4096 * sizeof(float));
+        npy_free(&merged);
+    }
     r = cuda_qimg_init(0, 1);
     if (!r) goto done;
     if (strcmp(attention_mode, "custom")) {
@@ -174,13 +200,14 @@ int main(int argc, char **argv) {
         fprintf(stderr, "text: %s causal GQA attention enabled\n", attention_mode);
     }
     qimg21_kernels base;
-    CUfunction rms, rms128, rms4, rope_lookup, add, attention, mul_silu;
+    CUfunction rms, rms128, rms4, rope_lookup, add, add_visual, attention, mul_silu;
     if (cu_compile_kernels(&module,r->device,q21_text_src,"qimg21_text.cu",0,"qimg21_text")<0 ||
         cu_compile_kernels(&base_module,r->device,qimg21_src,"qimg21_native.cu",1,"qimg21_native")<0 ||
         get_kernel(&base,base_module) || cuModuleGetFunction(&rms,module,"text_rms") ||
         cuModuleGetFunction(&rms128,module,"text_rms128") ||
         cuModuleGetFunction(&rms4,module,"text_rms4") ||
         cuModuleGetFunction(&add,module,"text_add") ||
+        cuModuleGetFunction(&add_visual,module,"text_add_visual") ||
         cuModuleGetFunction(&rope_lookup,module,"text_rope_table") ||
         cuModuleGetFunction(&attention,module,"text_attn") ||
         cuModuleGetFunction(&mul_silu,module,"text_mul_silu")) goto done;
@@ -190,7 +217,8 @@ int main(int argc, char **argv) {
     ALLOC(att,n*4096,4); ALLOC(tmp,n*4096,4); ALLOC(gate,n*12288,4); ALLOC(up,n*12288,4);
     {
         npy_f32 table={0};
-        if(npy_read_f32("cuda/qimg21/qwen21_text_rope.npy",&table) || table.ndim!=3 ||
+        const char *table_path = rope_table_path ? rope_table_path : "cuda/qimg21/qwen21_text_rope.npy";
+        if(npy_read_f32(table_path,&table) || table.ndim!=3 ||
            table.shape[0]<(size_t)n || table.shape[1]!=128 || table.shape[2]!=2) {
             fprintf(stderr,"text: invalid/missing qwen21_text_rope.npy\n"); npy_free(&table); goto done;
         }
@@ -203,6 +231,12 @@ int main(int argc, char **argv) {
     }
     #undef ALLOC
     if(cuMemcpyHtoD(x,host,(size_t)n*4096*4))goto done;
+    if (visual_count) {
+        visual_rows_d=checked_cuMemAlloc((size_t)visual_count*sizeof(int));
+        visual_embed_d=checked_cuMemAlloc((size_t)visual_count*4096*4);
+        if(!visual_rows_d||!visual_embed_d||
+           cuMemcpyHtoD(visual_rows_d,visual_rows,(size_t)visual_count*sizeof(int)))goto done;
+    }
     if(dump_dir && mkdir(dump_dir,0755) && errno!=EEXIST)goto done;
     #define CHECK(call) do { if((call)!=0)goto done; } while(0)
     #define NAME(suffix) snprintf(name,sizeof(name),"model.language_model.layers.%d.%s",l,suffix)
@@ -247,6 +281,7 @@ int main(int argc, char **argv) {
         DUMP("self_attn.o_proj",tmp,4096);
         int count=n*4096; void *ra[]={&x,&tmp,&count};
         CHECK(cuLaunchKernel(add,(count+255)/256,1,1,256,1,1,0,r->stream,ra,NULL));
+        DUMP("post_attention_hidden",x,4096);
         NAME("post_attention_layernorm.weight"); CHECK(text_norm(r,rms,&shards,name,norm,x,n,4096));
         DUMP("post_attention_layernorm",norm,4096);
         CHECK(launch_cast(r,bf,norm,n*4096));
@@ -259,6 +294,24 @@ int main(int argc, char **argv) {
         LINEAR("mlp.down_proj.weight",tmp,4096,12288);
         DUMP("mlp.down_proj",tmp,4096);
         CHECK(cuLaunchKernel(add,(count+255)/256,1,1,256,1,1,0,r->stream,ra,NULL));
+        if (vision_deepstack_dir && l < 3) {
+            npy_f32 deep = {0};
+            snprintf(path,sizeof(path),"%s/deepstack_%d.npy",vision_deepstack_dir,l);
+            if (access(path,R_OK)) {
+                snprintf(path,sizeof(path),"%s/vision_deepstack_%d.npy",vision_deepstack_dir,l);
+            }
+            if(npy_read_f32(path,&deep)||deep.ndim!=2||
+               deep.shape[0]!=(size_t)visual_count||deep.shape[1]!=4096){
+                npy_free(&deep);goto done;
+            }
+            CHECK(cuMemcpyHtoD(visual_embed_d,deep.data,(size_t)visual_count*4096*4));
+            CHECK(cuCtxSynchronize());
+            npy_free(&deep);
+            int visual_values=visual_count*4096;
+            void *va[]={&x,&visual_embed_d,&visual_rows_d,&visual_values,&(int){4096}};
+            CHECK(cuLaunchKernel(add_visual,(visual_values+255)/256,1,1,256,1,1,0,
+                                 r->stream,va,NULL));
+        }
         if(dump_dir) {
             CHECK(cuStreamSynchronize(r->stream));
             CHECK(cuMemcpyDtoH(host,x,(size_t)n*4096*4));
@@ -280,6 +333,7 @@ done:
     free_d(&att);free_d(&tmp);free_d(&gate);free_d(&up);
     free_d(&q_bf);free_d(&key_bf);free_d(&v_bf);
     free_d(&rope_table);
+    free_d(&visual_rows_d);free_d(&visual_embed_d);
     if(module)cuModuleUnload(module);
     if(base_module)cuModuleUnload(base_module);
     if(r)cuda_qimg_free(r);
