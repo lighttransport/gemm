@@ -7,9 +7,16 @@ import subprocess
 
 
 def extract(source, name):
-    marker = source.index(name)
+    """Extract a definition, skipping forward declarations and call sites."""
+    marker = -1
+    while True:
+        marker = source.index(name, marker + 1)
+        brace = source.find("{", marker)
+        semicolon = source.find(";", marker)
+        if brace >= 0 and (semicolon < 0 or brace < semicolon):
+            break
     start = source.rfind("\n", 0, marker) + 1
-    end = source.index("{", marker) + 1
+    end = brace + 1
     depth = 1
     while depth:
         depth += (source[end] == "{") - (source[end] == "}")
@@ -29,15 +36,15 @@ def main():
                      (here / "hip_llm_runner.c").read_text().splitlines()
                      if line.startswith('"'))
     names = ("round_f16_contract", "half_to_float", "f32_to_f16_bits",
+             "f32_to_half_raw", "q8_recip_contract", "q8_div_contract",
              "kv_cache_store_q8q8_batch", "pack_kv_q8q4_f16",
              "unpack_kv_q8q4_decode_f16")
     pieces = [extract(source, name) for name in names]
     runner = args.out / "runner.cu"
     runner.write_text('#include <hip/hip_runtime.h>\n#include <hip/hip_fp16.h>\n'
                       'typedef unsigned short half_raw;\n'
-                      + extract(source, "q8_recip_contract") +
-                      extract(source, "q8_div_contract") + "\n".join(pieces))
-    declarations = "\n".join(p[:p.index("{")] + ";" for p in pieces[3:])
+                      + "\n".join(pieces))
+    declarations = "\n".join(p[:p.index("{")] + ";" for p in pieces[6:])
     harness = args.out / "test.cu"
     harness.write_text((here / "test_kv_q8q8.cu").read_text().replace(
         "// RUNNER_DECLARATIONS", declarations))

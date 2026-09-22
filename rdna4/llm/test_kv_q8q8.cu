@@ -33,17 +33,17 @@ int main() {
             }
             input[i]=x;
         }
-        float *x,*ks,*vs; signed char *kc,*vc; half_raw *packed;
+        float *x; half_raw *ks,*vs; signed char *kc,*vc; half_raw *packed;
         block_q8_0 *ref;
         CHECK(hipMalloc(&x,2*n*sizeof(float)));
-        CHECK(hipMalloc(&ks,(S+G)*sizeof(float))); CHECK(hipMalloc(&vs,(S+G)*sizeof(float)));
+        CHECK(hipMalloc(&ks,(S+G)*sizeof(half_raw))); CHECK(hipMalloc(&vs,(S+G)*sizeof(half_raw)));
         CHECK(hipMalloc(&kc,N+G)); CHECK(hipMalloc(&vc,N+G));
         CHECK(hipMalloc(&packed,(N+G)*sizeof(half_raw)));
         CHECK(hipMalloc(&ref,2*n/32*sizeof(block_q8_0)));
-        std::vector<float> init(S+G,1.0f);
+        std::vector<half_raw> init(S+G,0x3c00);
         CHECK(hipMemcpy(x,input.data(),2*n*sizeof(float),hipMemcpyHostToDevice));
-        CHECK(hipMemcpy(ks,init.data(),init.size()*4,hipMemcpyHostToDevice));
-        CHECK(hipMemcpy(vs,init.data(),init.size()*4,hipMemcpyHostToDevice));
+        CHECK(hipMemcpy(ks,init.data(),init.size()*sizeof(half_raw),hipMemcpyHostToDevice));
+        CHECK(hipMemcpy(vs,init.data(),init.size()*sizeof(half_raw),hipMemcpyHostToDevice));
         CHECK(hipMemset(kc,85,N+G)); CHECK(hipMemset(vc,85,N+G));
         hipLaunchKernelGGL(kv_cache_store_q8q8_batch,dim3(M*H),dim3(256),0,0,kc,vc,ks,vs,x,x+n,H,D,P,M);
         hipLaunchKernelGGL(reference_quant,dim3((2*n/32+255)/256),dim3(256),0,0,x,ref,2*n/32);
@@ -51,10 +51,10 @@ int main() {
         std::vector<block_q8_0> oracle(2*n/32);
         CHECK(hipMemcpy(oracle.data(),ref,oracle.size()*sizeof(block_q8_0),hipMemcpyDeviceToHost));
         for(int v=0;v<2;++v) {
-            signed char *cache=v?vc:kc; float *scale=v?vs:ks;
-            std::vector<signed char> codes(N+G); std::vector<float> scales(S+G);
+            signed char *cache=v?vc:kc; half_raw *scale=v?vs:ks;
+            std::vector<signed char> codes(N+G); std::vector<half_raw> scales(S+G);
             CHECK(hipMemcpy(codes.data(),cache,N+G,hipMemcpyDeviceToHost));
-            CHECK(hipMemcpy(scales.data(),scale,(S+G)*4,hipMemcpyDeviceToHost));
+            CHECK(hipMemcpy(scales.data(),scale,(S+G)*sizeof(half_raw),hipMemcpyDeviceToHost));
             for(int i=0;i<N+G;++i) {
                 int j=i-P*dim;
                 int expected=(j>=0&&j<n)?oracle[v*n/32+j/32].qs[j%32]:85;
@@ -66,15 +66,16 @@ int main() {
             }
             for(int i=0;i<S+G;++i) {
                 int b=i-P*dim/32;
-                float expected=(b>=0&&b<n/32)?__half2float(oracle[v*n/32+b].d):1.0f;
-                if(memcmp(&scales[i],&expected,4)) {++errors; ++scale_errors; if(scale_errors<4) printf("scale D=%d M=%d i=%d got=%g ref=%g\n",D,M,i,scales[i],expected);} ++checked;
+                half_raw expected=0x3c00;
+                if(b>=0&&b<n/32) memcpy(&expected,&oracle[v*n/32+b].d,2);
+                if(scales[i]!=expected) {++errors; ++scale_errors; if(scale_errors<4) printf("scale D=%d M=%d i=%d got=%x ref=%x\n",D,M,i,scales[i],expected);} ++checked;
             }
             for(int transpose=0;transpose<2;++transpose) {
                 CHECK(hipMemset(packed,85,(N+G)*2));
                 if(transpose) {
-                    hipLaunchKernelGGL(pack_kv_q8q4_f16,dim3(T,H),dim3(D),0,0,packed,cache,scale,T,H,D,-1);
+                    hipLaunchKernelGGL(pack_kv_q8q4_f16,dim3(T,H),dim3(D),0,0,packed,cache,(const float *)scale,T,H,D,-1);
                 } else {
-                    hipLaunchKernelGGL(unpack_kv_q8q4_decode_f16,dim3((N+255)/256),dim3(256),0,0,packed,cache,scale,T,H,D,-1);
+                    hipLaunchKernelGGL(unpack_kv_q8q4_decode_f16,dim3((N+255)/256),dim3(256),0,0,packed,cache,(const float *)scale,T,H,D,-1);
                 }
                 CHECK(hipGetLastError());
                 std::vector<half_raw> values(N+G);
@@ -82,7 +83,8 @@ int main() {
                 for(int i=0;i<N;++i) {
                     int t=i/dim,h=i%dim/D,d=i%D;
                     int out=transpose?(h*T+t)*D+d:i;
-                    __half expected=__float2half((float)codes[i]*scales[i/32]);
+                    __half sh; memcpy(&sh,&scales[i/32],2);
+                    __half expected=__float2half((float)codes[i]*__half2float(sh));
                     half_raw bits; memcpy(&bits,&expected,2);
                     if(values[out]!=bits) {++errors; ++pack_errors; if(pack_errors<4) printf("pack D=%d M=%d i=%d got=%x ref=%x\n",D,M,i,values[out],bits);} ++checked;
                 }
