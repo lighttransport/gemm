@@ -95,21 +95,32 @@ static int hllm_dflash_overlap_init(hip_llm_runner *r,
     for (int l = 0; l < HLLM_DFLASH_LAYERS; ++l)
         if (!d->layers[l].inject_k_bf16 || !d->layers[l].inject_v_bf16)
             return -1;
-    if (!d->inject_stream &&
-        hipStreamCreateWithFlags(&d->inject_stream, hipStreamNonBlocking) != hipSuccess)
-        return -1;
-    if (!d->target_ready &&
-        hipEventCreateWithFlags(&d->target_ready, hipEventDisableTiming) != hipSuccess) {
-        hipStreamDestroy(d->inject_stream);
-        d->inject_stream = NULL;
-        return -1;
+    int created_stream = 0, created_target = 0;
+    if (!d->inject_stream) {
+        if (hipStreamCreateWithFlags(&d->inject_stream, hipStreamNonBlocking) != hipSuccess)
+            return -1;
+        created_stream = 1;
+    }
+    if (!d->target_ready) {
+        if (hipEventCreateWithFlags(&d->target_ready, hipEventDisableTiming) != hipSuccess) {
+            if (created_stream) {
+                hipStreamDestroy(d->inject_stream);
+                d->inject_stream = NULL;
+            }
+            return -1;
+        }
+        created_target = 1;
     }
     if (!d->inject_done &&
         hipEventCreateWithFlags(&d->inject_done, hipEventDisableTiming) != hipSuccess) {
-        hipEventDestroy(d->target_ready);
-        d->target_ready = NULL;
-        hipStreamDestroy(d->inject_stream);
-        d->inject_stream = NULL;
+        if (created_target) {
+            hipEventDestroy(d->target_ready);
+            d->target_ready = NULL;
+        }
+        if (created_stream) {
+            hipStreamDestroy(d->inject_stream);
+            d->inject_stream = NULL;
+        }
         return -1;
     }
     if (!d->inject_capacity) {
@@ -149,8 +160,7 @@ static void hllm_qwen35_dflash2_free(hip_llm_runner *r) {
     DFLASH_FREE(d->enc_norm); DFLASH_FREE(d->out_norm);
     DFLASH_FREE(d->selector_hidden);
     DFLASH_FREE(d->selector_prev_w); DFLASH_FREE(d->selector_next_w);
-    DFLASH_FREE(d->inject_x); DFLASH_FREE(d->inject_x_bf16);
-    DFLASH_FREE(d->inject_norm); DFLASH_FREE(d->inject_k); DFLASH_FREE(d->inject_v);
+    hllm_dflash_overlap_workspace_free(d);
     DFLASH_FREE(d->features); DFLASH_FREE(d->features_bf16);
     DFLASH_FREE(d->x); DFLASH_FREE(d->x_bf16); DFLASH_FREE(d->norm);
     DFLASH_FREE(d->dynamic); DFLASH_FREE(d->conv); DFLASH_FREE(d->q);

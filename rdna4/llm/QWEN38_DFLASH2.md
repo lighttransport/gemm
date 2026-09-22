@@ -86,6 +86,10 @@ guards sidecar KV reuse. The overlap path requires the BF16 injection plans;
 allocation failure falls back to serialized injection and leaves production
 defaults unchanged. Partial workspace cleanup nulls each freed pointer, so a
 retry or teardown after allocation failure cannot double-free sidecar buffers.
+Initialization now records ownership of handles created during the current
+attempt, so a retry after partial stream/event setup does not destroy valid
+pre-existing resources. Final teardown uses the same pointer-nulling workspace
+helper; this changes lifecycle safety only and leaves overlap opt-in.
 
 ## Native IQ3 Q/K/V projection candidate
 

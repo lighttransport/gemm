@@ -149,6 +149,11 @@ so a partial allocation failure can safely retry or fall back without a
 double-free during teardown. It remains opt-in pending a resident-GPU
 throughput and quality run.
 
+Overlap initialization now tracks which stream and events were created by the
+current attempt. A retry after partial setup preserves valid pre-existing
+handles, and final teardown uses the same pointer-nulling workspace helper.
+This is lifecycle hardening only; scheduling and the opt-in gate are unchanged.
+
 ## 2026-09-22 continuation: native IQ3 Q/K/V projection candidate
 
 The ordinary one-token attention path now has an opt-in
