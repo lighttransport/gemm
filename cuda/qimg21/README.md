@@ -1251,11 +1251,15 @@ alternatives. Vision linears use BF16-output cuBLAS-LT bias epilogues, including
 the PyTorch-selected algo 21 tile/stage and split-K configurations for the
 256-token block shapes. LayerNorm uses PyTorch's vector-four, eight-warp
 Welford topology in the pinned NVCC plugin rather than NVRTC. Teacher-forced
-block 0 reaches cosine 0.999999578. Free-running errors still compound: blocks 0/1/2 pass at
-0.999997719/0.999984180/0.999970628, block 3 is the first miss at
-0.999957879, and block 26 scores 0.999620834. The final merger is therefore
-not accepted or wired into generation yet. Use `--hidden ... --block-index N
---max-blocks 1` for isolated replay and `--dump-dir DIR` to save every block.
+block 0 reaches cosine 0.999999578. Free-running errors still compound: blocks
+0/1/2 pass at 0.999997715/0.999984273/0.999970773, block 3 is the first miss
+at 0.999957891, and block 26 scores 0.999461003. The merger now uses the same
+pinned Welford implementation as the blocks. With the exact PyTorch block-26
+output injected, its local cosine is 0.999990332 and passes the 0.99996 gate;
+the accumulated full-run merger cosine remains 0.999079087, so it is not
+accepted or wired into generation yet. Use `--hidden ... --block-index N
+--max-blocks 1` for isolated block replay, or `--max-blocks 0 --merged-out ...`
+for merger-only replay, and `--dump-dir DIR` to save every executed block.
 
 ```sh
 make -C cuda/qimg21 test_cuda_qimg21_vision

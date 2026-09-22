@@ -87,6 +87,7 @@ static int dump_vision(const char *directory, const char *name, CUdeviceptr data
 }
 
 static int run_merger(cuda_qimg_runner *r, CUfunction layer_norm,
+                      q21_flash_vision_layer_norm_fn flash_layer_norm,
                       CUfunction linear_epilogue, CUfunction gelu_exact,
                       const qimg21_shards *shards, CUdeviceptr x, int tokens,
                       const char *base, int postshuffle, const char *output) {
@@ -103,7 +104,13 @@ static int run_merger(cuda_qimg_runner *r, CUfunction layer_norm,
     if (!norm || !hidden || !merged || !nw || !nb || cuCtxSynchronize()) goto done;
     int norm_rows = postshuffle ? rows : tokens;
     void *ln[] = {&norm, &x, &nw, &nb, &norm_dim};
-    if (cuLaunchKernel(layer_norm, norm_rows, 1, 1, 256, 1, 1, 0, r->stream, ln, NULL) ||
+    int ln_status = flash_layer_norm
+        ? flash_layer_norm((float *)(uintptr_t)norm, (const float *)(uintptr_t)x,
+                           (const float *)(uintptr_t)nw, (const float *)(uintptr_t)nb,
+                           norm_rows, norm_dim, r->stream)
+        : (int)cuLaunchKernel(layer_norm, norm_rows, 1, 1, 256, 1, 1, 0,
+                              r->stream, ln, NULL);
+    if (ln_status ||
         cuStreamSynchronize(r->stream)) goto done;
     free_d(&nw); free_d(&nb);
     snprintf(name, sizeof(name), "%s.linear_fc1", base);
@@ -179,7 +186,7 @@ int main(int argc, char **argv) {
     }
     if (!model || (!!pixels == !!hidden) || !out || h < 1 || w < 1 || h % 2 || w % 2 ||
         h * w > 4096 || max_blocks < 0 || block_index < 0 || block_index > 26 ||
-        block_index + max_blocks > 27 || (hidden && max_blocks < 1) ||
+        block_index + max_blocks > 27 ||
         (strcmp(attention_mode, "math") && strcmp(attention_mode, "cutlass") &&
          strcmp(attention_mode, "flash"))) {
         fprintf(stderr, "usage: %s --model DIR (--pixel-values PATCHES.npy | --hidden BLOCK_INPUT.npy) "
@@ -376,12 +383,14 @@ blocks_ready:
             char base[256], destination[2048];
             snprintf(base, sizeof(base), "model.visual.deepstack_merger_list.%d", merger);
             snprintf(destination, sizeof(destination), "%s/deepstack_%d.npy", deepstack_dir, merger);
-            if (run_merger(r, layer_norm, linear_epilogue, gelu_exact, &shards, x, n,
+            if (run_merger(r, layer_norm, flash_layer_norm, linear_epilogue, gelu_exact,
+                           &shards, x, n,
                            base, 1, destination)) goto done;
         }
         fprintf(stderr, "vision: block %d/27\n", block + 1);
     }
-    if (merged_out && run_merger(r, layer_norm, linear_epilogue, gelu_exact, &shards, x, n,
+    if (merged_out && run_merger(r, layer_norm, flash_layer_norm, linear_epilogue,
+                                 gelu_exact, &shards, x, n,
                                  "model.visual.merger", 0, merged_out)) goto done;
     if (cuMemcpyDtoH(host_out, x, (size_t)count * 4) ||
         npy_write_f32(out, host_out, (size_t)count, n, 1152)) goto done;
