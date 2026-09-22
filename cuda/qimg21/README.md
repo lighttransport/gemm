@@ -1166,9 +1166,10 @@ tmp/qimg21-ref-venv/bin/python cuda/qimg21/test_cuda_qimg21.py \
 
 Editing remains an experimental fixture-driven native path: full-model parity
 and the native VAE/image-conditioned text hand-off still need to be accepted
-against the same checkpoint gate. Row-INT8 native weights now have bounded text-to-image
-calibration at the separate `0.999` gate above; quantized editing remains
-unvalidated.
+against the same checkpoint gate. Row-INT8 and W8A8 editing, true-CFG, and
+40-step generation use the calibrated MRE gates and are validated above; that
+quantized denoiser evidence does not waive the original-weight conditioning
+handoff gate.
 
 ## Native transformer step
 
@@ -1562,9 +1563,20 @@ tokens, both Euler checkpoints, final latents and decoded RGBA pixels. A newer
 one-step 256x256 run exercised native VAE encode, all 27 vision blocks, native
 multimodal text, denoising, and native VAE decode and produced finite
 `(82,4096)` prompt embeddings, `(64,4096)` merged vision features, and
-`(256,64)` output latents plus a 256x256 PNG. This is an integration smoke
-test, not an accuracy acceptance result: the recurrent vision error documented
-above remains below the 0.99996 cosine target.
+`(256,64)` output latents plus a 256x256 PNG.
+
+Full-resolution conditioning exposed two additional parity boundaries. The
+native image loader now matches the official processor's integer RGBA-over-white
+composition and F32 normalization exactly; `--pixels-out` dumps this boundary,
+and all 6,291,456 values match the official 1024x1024 capture bit-for-bit. The
+remaining end-to-end blocker is the BF16 patch projection: native cuBLAS differs
+from PyTorch Conv3d in 1,116 of 4,718,592 values (maximum 0.03125, cosine
+0.9999999963). That sparse error is recurrently amplified by the 27 vision
+blocks, so a fresh two-step 256x256 edit with a 1024x1024 condition reaches only
+0.9998051 final-latent cosine. This integration path therefore remains a smoke
+test until the projection reduction/epilogue ordering is matched; the
+teacher-forced vision blocks themselves meet the strict gate as documented
+above.
 
 ### Exact BF16 editing parity
 

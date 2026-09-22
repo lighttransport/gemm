@@ -43,7 +43,12 @@ static float bf16_host(uint16_t value) {
 
 static int load_vision_patches(const char *path, npy_f32 *out, int *grid_h, int *grid_w) {
     int width = 0, height = 0, channels = 0;
-    unsigned char *pixels = stbi_load(path, &width, &height, &channels, 3);
+    /* The official image processor converts RGBA inputs to RGB on a white
+     * background.  Asking stb for three channels merely drops alpha, which
+     * differs by one code point for nearly-opaque generated PNGs.  Keep the
+     * integer compositing here so the subsequent 2/255 normalization sees
+     * exactly the same byte values as the PyTorch fixture. */
+    unsigned char *pixels = stbi_load(path, &width, &height, &channels, 4);
     if (!pixels || width < 32 || height < 32 || width % 32 || height % 32) {
         fprintf(stderr, "vision: input image must be RGB-convertible and divisible by 32\n");
         stbi_image_free(pixels);
@@ -64,7 +69,15 @@ static int load_vision_patches(const char *path, npy_f32 *out, int *grid_h, int 
                         for (int py = 0; py < 16; py++) for (int px = 0; px < 16; px++) {
                             int source_y = patch_y * 16 + py, source_x = patch_x * 16 + px;
                             int d = (((c * 2 + temporal) * 16 + py) * 16 + px);
-                            dst[d] = (2.0f / 255.0f) * pixels[(source_y * width + source_x) * 3 + c] - 1.0f;
+                            const unsigned char *src = pixels +
+                                (size_t)(source_y * width + source_x) * 4;
+                            int alpha = src[3];
+                            int rgb = (src[c] * alpha + 255 * (255 - alpha) + 127) / 255;
+                            /* Match the processor's Normalize(mean=.5,
+                             * std=.5) evaluation order.  Folding this into a
+                             * precomputed 2/255 constant changes most pixels
+                             * by one F32 ulp and amplifies through 27 blocks. */
+                            dst[d] = (float)(((double)rgb - 127.5) / 127.5);
                         }
                 }
     stbi_image_free(pixels);
@@ -207,7 +220,8 @@ static int build_position_embedding(const qimg21_shards *shards, int h, int w, f
 int main(int argc, char **argv) {
     const char *model = NULL, *pixels = NULL, *image = NULL, *hidden = NULL, *out = NULL;
     const char *norm1_override = NULL, *norm2_override = NULL;
-    const char *patch_out = NULL, *dump_dir = NULL, *merged_out = NULL, *deepstack_dir = NULL;
+    const char *pixels_out = NULL, *patch_out = NULL, *dump_dir = NULL;
+    const char *merged_out = NULL, *deepstack_dir = NULL;
     const char *attention_mode = "flash";
     const char *flash_plugin_path = "cuda/qimg21/libq21_flash_attention.so";
     const char *layer_norm_mode = "nvcc-pytorch";
@@ -220,6 +234,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--grid-height") && i + 1 < argc) h = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--grid-width") && i + 1 < argc) w = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--out") && i + 1 < argc) out = argv[++i];
+        else if (!strcmp(argv[i], "--pixels-out") && i + 1 < argc) pixels_out = argv[++i];
         else if (!strcmp(argv[i], "--patch-out") && i + 1 < argc) patch_out = argv[++i];
         else if (!strcmp(argv[i], "--max-blocks") && i + 1 < argc) max_blocks = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--block-index") && i + 1 < argc) block_index = atoi(argv[++i]);
@@ -248,7 +263,7 @@ int main(int argc, char **argv) {
                         "[--norm1-override NORM.npy] "
                         "[--norm2-override NORM.npy] "
                         "[--flash-plugin PLUGIN.so] "
-                        "--out OUTPUT.npy\n", argv[0]);
+                        "[--pixels-out PATCHES.npy] --out OUTPUT.npy\n", argv[0]);
         return 2;
     }
     npy_f32 input = {0}, vision_rope_table = {0}, norm1_input = {0}, norm2_input = {0};
@@ -264,6 +279,14 @@ int main(int argc, char **argv) {
         (norm2_override && (npy_read_f32(norm2_override, &norm2_input) || norm2_input.ndim != 2 ||
                             norm2_input.shape[0] != (size_t)h * w ||
                             norm2_input.shape[1] != 1152))) return 1;
+    if (pixels_out && npy_write_f32(pixels_out, input.data, input.n,
+                                     input.shape[0], input.shape[1])) {
+        npy_free(&input);
+        npy_free(&vision_rope_table);
+        npy_free(&norm1_input);
+        npy_free(&norm2_input);
+        return 1;
+    }
     qimg21_shards shards = {{0}, 0};
     char path[2048];
     for (int i = 1; i <= 4; i++) {
