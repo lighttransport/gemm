@@ -23431,7 +23431,16 @@ static inline void launch_attn_verify_native_q8(hip_llm_runner *r, void *out,
     }
     const char *group_combine_env = getenv("LLM_QWEN35_VERIFY_COMBINE_GROUPED");
     int grouped_mode = group_combine_env ? atoi(group_combine_env) : 0;
-    int grouped_width = grouped_mode >= 3 ? 16 : grouped_mode >= 2 ? 8 : 4;
+    /* Keep malformed diagnostic values on the serialized reference path or
+     * the highest explicitly supported grouped mode. */
+    if (grouped_mode < 0) grouped_mode = 0;
+    if (grouped_mode > 3) grouped_mode = 3;
+    /* Do not pay the 16-row shared tile for a short captured window.  The
+     * narrower kernels retain identical per-row arithmetic and reduce both
+     * shared allocation and idle row loops for the common K=4/K=7 graphs. */
+    int grouped_width = queries <= 4 ? 4 :
+        queries <= 8 ? (grouped_mode >= 2 ? 8 : 4) :
+        (grouped_mode >= 3 ? 16 : grouped_mode >= 2 ? 8 : 4);
     hipFunction_t grouped_fn = grouped_width == 16 ?
         (gate ? r->fn_q8_attention_combine_verify16_gate :
                 r->fn_q8_attention_combine_verify16) :
@@ -23443,12 +23452,14 @@ static inline void launch_attn_verify_native_q8(hip_llm_runner *r, void *out,
     int grouped_combine = grouped_mode != 0 && group_queries && queries > 1 &&
         grouped_fn;
     if (grouped_combine) {
-        void *b[] = { &out, &parts, &meta, &positions, &r->n_heads,
+        void *ungated[] = { &out, &parts, &meta, &positions, &r->n_heads,
+            &r->q8_attention_nsm, &occupancy, &forced_splits, &queries };
+        void *gated[] = { &out, &parts, &meta, &gate, &positions, &r->n_heads,
             &r->q8_attention_nsm, &occupancy, &forced_splits, &queries };
         LAUNCH(grouped_fn, r->n_heads,
                (queries + grouped_width - 1) / grouped_width, 1,
                256, 1, 1, 0,
-               r->stream, b);
+               r->stream, gate ? gated : ungated);
     } else if (gate && r->fn_q8_attention_combine_gate) {
         void *b[] = { &out, &parts, &meta, &gate, &positions, &r->n_heads,
             &r->q8_attention_nsm, &occupancy, &forced_splits };
