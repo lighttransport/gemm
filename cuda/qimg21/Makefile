@@ -6,9 +6,12 @@ FLASH_ATTN_SOURCE ?= ../../tmp/flash-attention-src
 TORCH_INCLUDE ?= ../../tmp/qimg21-ref-venv/lib/python3.12/site-packages/torch/include
 CUDNN_ROOT ?= ../../tmp/qimg21-ref-venv/lib/python3.12/site-packages/nvidia/cudnn
 
-.PHONY: all setup setup-exact-sources verify-exact-sources verify-generated-artifacts generate reference compare regress native native-exact native-text-exact native-vae clean
+.PHONY: all setup setup-cuda130 setup-exact-sources verify-exact-sources verify-generated-artifacts generate reference compare regress native native-exact native-text-exact native-vae clean
 
 all: test_cuda_qimg21 native
+
+setup-cuda130:
+	./setup_cuda130.sh
 
 test_cuda_qimg21: test_cuda_qimg21.py
 	@chmod +x test_cuda_qimg21.py

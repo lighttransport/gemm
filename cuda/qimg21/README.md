@@ -1600,9 +1600,16 @@ then build the exact native components:
 
 ```sh
 make -C cuda/qimg21 setup
+make -C cuda/qimg21 setup-cuda130
 make -C cuda/qimg21 setup-exact-sources
 make -C cuda/qimg21 native-exact
 ```
+
+`setup-cuda130` downloads NVIDIA's five redistributable compiler components,
+checks pinned SHA-256 digests, and assembles CUDA 13.0.88 under
+`tmp/cuda130` without modifying the system toolkit. This wheel-matched NVCC is
+used only for exact GELU code generation; set `PYTORCH_CUDA_HOME` to install
+or use the pinned toolkit elsewhere.
 
 `setup_exact_sources.sh` pins PyTorch at
 `08187d9e0fba026dc8217405802ab5381dc88d90`, FlashAttention at
