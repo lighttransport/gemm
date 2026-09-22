@@ -61,6 +61,30 @@ concurrency, sampled, and multi-turn C++ quality suite passed. On the resident
 gate, repeated cached K=7 windows reported commit times around 0.23--0.57 ms;
 the authoritative token streams and cache restores remained stable.
 
+## 2026-09-22 continuation: verifier IQ1 Q8₁ activation reuse
+
+The grouped target verifier's IQ1_S gate and IQ1_M up projections consume the
+same normalized row block, but each projection used to launch the exact Q8₁
+quantizer independently. The verifier now caches the produced activation bytes
+and FP16 block sums by source pointer, width, and row count, so the second
+projection reuses them. A source-shape change invalidates the cache; layer
+entry also clears it because the normalized scratch buffer is reused for the
+next layer. `LLM_QWEN35_MTP_IQ1_Q81_REUSE=0` restores the two-quantizer
+control for A/B measurements.
+
+The resident DFlash2 gate passes with reuse enabled and disabled: stdio
+window/cache/sampling/cancellation/concurrency, multi-turn C++ compile/run,
+and HTTP greedy/sampled repeatability all remain PASS. In matched short
+resident runs the 113-token cached request reported 433.458 ms verifier time
+with reuse and 432.478 ms with the control, within run-to-run noise, so this is
+retained as a launch reduction without claiming an end-to-end throughput win.
+
+A fresh random-token 64K run with both IQ1 roles enabled retained prefix
+`90178de69a24a76e`, suffix `aed3c962c4a6525d`, and 443.11 tok/s prefill while
+measuring 35.44 tok/s decode. That is within the established 35.5 tok/s band,
+so the ordinary 40 tok/s target remains open and no IQ1 approximation default
+was changed.
+
 ## 2026-09-22 continuation: sidecar overlap ordering hardening
 
 The opt-in `LLM_QWEN35_DFLASH_OVERLAP_INJECT=1` path now records a

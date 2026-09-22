@@ -355,10 +355,22 @@ static void hllm_dense_mtp_projection(hip_llm_runner *r, void *dst, void *w,
         &r->layers[r->active_layer] : NULL;
     if (rows <= HLLM_DENSE_MTP_REUSE_ROWS && nc % 256 == 0 && nc <= r->n_ff &&
         (type == GGML_TYPE_IQ1_S || type == GGML_TYPE_IQ1_M)) {
-        /* The generic batch scratch is shared by mixed-format projections.
-         * Requantize every IQ1 launch so a Q/K/V format change cannot leave
-         * stale Q8_1 sums behind under graph replay. */
-        launch_quantize_q81_iq1_batch(r, x, nc, rows, nc);
+        /* Gate and up projections consume the same normalized rows.  Reuse
+         * the exact Q8_1 bytes and block sums when the immediately preceding
+         * IQ1 projection used the same source shape; a different source or
+         * row count still forces a fresh quantization before graph replay. */
+        const char *reuse_env = getenv("LLM_QWEN35_MTP_IQ1_Q81_REUSE");
+        int reuse_enabled = !reuse_env || atoi(reuse_env) != 0;
+        int reuse_q81 = reuse_enabled && r->iq1_q8_valid &&
+                        r->iq1_q8_source == x &&
+                        r->iq1_q8_n == nc && r->iq1_q8_rows == rows;
+        if (!reuse_q81) {
+            launch_quantize_q81_iq1_batch(r, x, nc, rows, nc);
+            r->iq1_q8_source = x;
+            r->iq1_q8_n = nc;
+            r->iq1_q8_rows = rows;
+            r->iq1_q8_valid = 1;
+        }
         hipFunction_t iq1_fn = type == GGML_TYPE_IQ1_S ?
             r->fn_matvec_iq1_s_q81_reuse8 : r->fn_matvec_iq1_m_q81_reuse8;
         void *a[] = { &dst, &w, &r->d_act_q8_batch,
@@ -378,7 +390,7 @@ static void hllm_dense_mtp_projection(hip_llm_runner *r, void *dst, void *w,
         } else {
             LAUNCH(iq1_fn, (nr+7)/8, 1, 1, 256, 1, 1, 0, r->stream, a);
         }
-        r->q8x2_reuse_valid = r->iq1_q8_valid = r->batch_q8_valid = 0;
+        r->q8x2_reuse_valid = r->batch_q8_valid = 0;
         return;
     }
     hipFunction_t fn = NULL;
@@ -473,6 +485,10 @@ static void hllm_dense_mtp_ssm(hip_llm_runner *r, hip_layer *cl, int l, int rows
     float eps = r->rms_norm_eps;
     (void)conv;
     (void)rec;
+    /* verify_norm is reused for every layer.  Its contents change at the
+     * norm below, so an IQ1 cache from the previous layer cannot survive
+     * into this projection pair merely because the pointer is unchanged. */
+    r->iq1_q8_valid = 0;
     launch_rmsnorm_batch(r, m->verify_norm, m->verify_x, cl->attn_norm_w,
                          ne, rows, ne, eps);
     hllm_dense_mtp_projection(r, m->verify_ssm_qkv, cl->ssm_qkv_w, m->verify_norm,
@@ -536,6 +552,7 @@ static void hllm_dense_mtp_attention(hip_llm_runner *r, hip_layer *cl,
     int ne = r->n_embd, qd = r->n_heads*r->head_dim;
     int kd = r->n_kv_heads*r->head_dim;
     float eps = r->rms_norm_eps;
+    r->iq1_q8_valid = 0;
     launch_rmsnorm_batch(r, r->d_xnorm_batch, m->verify_x,
                          cl->attn_norm_w, ne, rows, ne, eps);
 

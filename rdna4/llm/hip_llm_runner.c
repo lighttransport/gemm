@@ -13392,6 +13392,7 @@ struct hip_llm_runner {
     void *d_act_scale_batch_b;
     void *iq1_q8_source; /* source represented in d_act_q8 for the current callback */
     int   iq1_q8_n;
+    int   iq1_q8_rows;
     int   iq1_q8_valid;
     void *q8x2_reuse_source;
     int   q8x2_reuse_n;

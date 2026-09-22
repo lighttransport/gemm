@@ -514,6 +514,16 @@ launches.  The post-change K=4/K=7 greedy gates retain sequence hash
 the pinned output/token SHA-256 values.  K=7 measures 81.20 tok/s in the exact
 gate, while the three warm embedding-batch runs measured 81.42--82.49 tok/s.
 
+The grouped target verifier's IQ1_S gate and IQ1_M up projections now share
+their exact Q8₁ activation quantization when the normalized source, width, and
+row count match. Layer entry clears the source cache because the normalized
+scratch buffer is reused for the next layer, and
+`LLM_QWEN35_MTP_IQ1_Q81_REUSE=0` restores the independent-quantizer control.
+The resident DFlash2 HTTP/stdio and multi-turn C++ quality suite passes in
+both modes. The matched 113-token cached request measured 433.458 ms verifier
+time with reuse versus 432.478 ms control, so this is currently a safe launch
+reduction with no claimed end-to-end gain.
+
 At each of the five target feature taps, capture now shares the existing exact
 RMSNorm reduction and output loop.  The 4K gate remains byte-identical and
 measures 536.17 tok/s cold, 610.86--612.05 tok/s warm, and 81.12--82.37 tok/s
