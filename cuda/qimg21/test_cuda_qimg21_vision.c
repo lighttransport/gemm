@@ -5,6 +5,7 @@
 #undef main
 
 typedef int (*q21_cutlass_vision_attention_fn)(float *, const void *, int, int, int, CUstream);
+typedef int (*q21_flash_vision_attention_fn)(float *, const void *, int, CUstream);
 
 static const char *vision_front_src =
 "extern \"C\" {\n"
@@ -16,7 +17,7 @@ static const char *vision_front_src =
 "__global__ void vision_rope(float*qkv,int n,int gh,int gw){int t=blockIdx.x,h=blockIdx.y,j=threadIdx.x;if(t>=n||h>=16||j>=36)return;int ic=t%2,ir=(t/2)%2,bc=(t/4)%(gw/2),br=t/(4*(gw/2));int row=br*2+ir,col=bc*2+ic,coord=j<18?row:col,k=j%18;float inv=1.f/powf(10000.f,(float)(2*k)/36.f),a=coord*inv,c=cosf(a),s=sinf(a);for(int z=0;z<2;z++){int base=t*3456+z*1152+h*72;float u=qkv[base+j],v=qkv[base+j+36];qkv[base+j]=rb(u*c-v*s);qkv[base+j+36]=rb(v*c+u*s);}}\n"
 "__global__ void vision_attn(float*o,const float*qkv,int n){int q=blockIdx.x,h=blockIdx.y,l=threadIdx.x;float qr[3]={0},acc[3]={0};for(int e=0;e<3;e++){int d=l+32*e;if(d<72)qr[e]=qkv[q*3456+h*72+d];}float mx=-1e30f;for(int k=0;k<n;k++){float z=0;for(int e=0;e<3;e++){int d=l+32*e;if(d<72)z+=qr[e]*qkv[k*3456+1152+h*72+d];}for(int s=16;s;s>>=1)z+=__shfl_xor_sync(0xffffffff,z,s);mx=fmaxf(mx,z*0.11785113019775793f);}float den=0;for(int k=0;k<n;k++){float z=0;for(int e=0;e<3;e++){int d=l+32*e;if(d<72)z+=qr[e]*qkv[k*3456+1152+h*72+d];}for(int s=16;s;s>>=1)z+=__shfl_xor_sync(0xffffffff,z,s);float p=expf(z*0.11785113019775793f-mx);den+=p;for(int e=0;e<3;e++){int d=l+32*e;if(d<72)acc[e]+=p*qkv[k*3456+2304+h*72+d];}}for(int e=0;e<3;e++){int d=l+32*e;if(d<72)o[q*1152+h*72+d]=rb(acc[e]/den);}}\n"
 "__global__ void residual(float*x,const float*y,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)x[i]=rb(x[i]+y[i]);}\n"
-"__global__ void gelu_tanh(float*x,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){float v=x[i];x[i]=rb(.5f*v*(1.f+tanhf(.7978845608028654f*(v+.044715f*v*v*v))));}}\n"
+"__global__ void gelu_tanh(float*x,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){float v=x[i],cube=v*v*v,inner=.7978845608028654f*(v+.044715f*cube);x[i]=rb(.5f*v*(1.f+tanhf(inner)));}}\n"
 "__global__ void gelu_exact(float*x,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){float v=x[i];x[i]=rb(.5f*v*(1.f+erff(v*.7071067811865475f)));}}\n"
 "}\n";
 
@@ -48,17 +49,19 @@ static int vision_linear(cuda_qimg_runner *r, CUfunction epilogue,
     snprintf(name, sizeof(name), "%s.weight", base);
     CUdeviceptr weight = upload_bf16_raw(shards, name);
     snprintf(name, sizeof(name), "%s.bias", base);
-    CUdeviceptr bias = upload_f32(shards, name);
+    CUdeviceptr bias = upload_bf16_raw(shards, name);
     CUdeviceptr in_bf = checked_cuMemAlloc((size_t)rows * ni * 2);
-    CUdeviceptr result = checked_cuMemAlloc((size_t)rows * no * 4);
+    CUdeviceptr result = checked_cuMemAlloc((size_t)rows * no * 2);
     int rc = 1;
     if (!weight || !bias || !in_bf || !result || launch_cast(r, in_bf, in, rows * ni) ||
-        cublasew_gemm_bf16_bf16_f32_rowmajor_nt(r->cublaslt_ctx, result, weight,
-                                                 in_bf, rows, no, ni) ||
-        cuCtxSynchronize()) goto done;
-    void *args[] = {&out, &result, &bias, &no, &rows};
-    if (cuLaunchKernel(epilogue, (rows * no + 255) / 256, 1, 1, 256, 1, 1, 0,
-                       r->stream, args, NULL) || cuStreamSynchronize(r->stream)) goto done;
+        cublasew_gemm_bf16_bf16_f32_lt_bias_rowmajor_nt(r->cublaslt_ctx, result,
+                                                         weight, in_bf, bias, 0, 2,
+                                                         rows, no, ni) ||
+        cuLaunchKernel(r->bf16_to_f32_add_bias, (rows * no + 255) / 256, 1, 1,
+                       256, 1, 1, 0, r->stream,
+                       (void *[]){&out, &result, &(CUdeviceptr){0}, &no, &rows}, NULL) ||
+        cuStreamSynchronize(r->stream)) goto done;
+    (void)epilogue;
     rc = 0;
 done:
     free_d(&weight); free_d(&bias); free_d(&in_bf); free_d(&result);
@@ -151,7 +154,7 @@ static int build_position_embedding(const qimg21_shards *shards, int h, int w, f
 int main(int argc, char **argv) {
     const char *model = NULL, *pixels = NULL, *hidden = NULL, *out = NULL;
     const char *patch_out = NULL, *dump_dir = NULL, *merged_out = NULL, *deepstack_dir = NULL;
-    const char *attention_mode = "cutlass";
+    const char *attention_mode = "flash";
     int h = 0, w = 0, max_blocks = 0, block_index = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--model") && i + 1 < argc) model = argv[++i];
@@ -172,7 +175,8 @@ int main(int argc, char **argv) {
     if (!model || (!!pixels == !!hidden) || !out || h < 1 || w < 1 || h % 2 || w % 2 ||
         h * w > 4096 || max_blocks < 0 || block_index < 0 || block_index > 26 ||
         block_index + max_blocks > 27 || (hidden && max_blocks < 1) ||
-        (strcmp(attention_mode, "math") && strcmp(attention_mode, "cutlass"))) {
+        (strcmp(attention_mode, "math") && strcmp(attention_mode, "cutlass") &&
+         strcmp(attention_mode, "flash"))) {
         fprintf(stderr, "usage: %s --model DIR (--pixel-values PATCHES.npy | --hidden BLOCK_INPUT.npy) "
                         "--grid-height H --grid-width W [--block-index N --max-blocks N] --out OUTPUT.npy\n", argv[0]);
         return 2;
@@ -197,6 +201,7 @@ int main(int argc, char **argv) {
     CUdeviceptr norm = 0, qkv = 0, qkv_bf = 0, att = 0, tmp = 0, mlp = 0;
     void *cutlass_plugin = NULL;
     q21_cutlass_vision_attention_fn cutlass_attention = NULL;
+    q21_flash_vision_attention_fn flash_attention = NULL;
     float *host_pos = NULL, *host_out = NULL;
     int rc = 1, n = h * w, count = n * 1152;
     if (!r || cu_compile_kernels(&module, r->device, vision_front_src,
@@ -210,11 +215,21 @@ int main(int argc, char **argv) {
         cuModuleGetFunction(&residual, module, "residual") ||
         cuModuleGetFunction(&gelu_tanh, module, "gelu_tanh") ||
         cuModuleGetFunction(&gelu_exact, module, "gelu_exact")) goto done;
-    if (!strcmp(attention_mode, "cutlass")) {
-        cutlass_plugin = dlopen("cuda/qimg21/libq21_cutlass_attention.so", RTLD_NOW | RTLD_LOCAL);
-        if (!cutlass_plugin || !(cutlass_attention = (q21_cutlass_vision_attention_fn)
-              dlsym(cutlass_plugin, "q21_cutlass_vision_attention"))) {
-            fprintf(stderr, "vision: CUTLASS attention plugin unavailable\n");
+    if (!strcmp(attention_mode, "cutlass") || !strcmp(attention_mode, "flash")) {
+        const char *plugin_path = !strcmp(attention_mode, "flash")
+            ? "cuda/qimg21/libq21_flash_attention.so"
+            : "cuda/qimg21/libq21_cutlass_attention.so";
+        cutlass_plugin = dlopen(plugin_path, RTLD_NOW | RTLD_LOCAL);
+        if (!strcmp(attention_mode, "flash")) {
+            flash_attention = cutlass_plugin ? (q21_flash_vision_attention_fn)
+                dlsym(cutlass_plugin, "q21_flash_vision_attention") : NULL;
+        } else {
+            cutlass_attention = cutlass_plugin ? (q21_cutlass_vision_attention_fn)
+                dlsym(cutlass_plugin, "q21_cutlass_vision_attention") : NULL;
+        }
+        if (!cutlass_plugin || (!strcmp(attention_mode, "cutlass") && !cutlass_attention) ||
+            (!strcmp(attention_mode, "flash") && !flash_attention)) {
+            fprintf(stderr, "vision: %s attention plugin unavailable\n", attention_mode);
             goto done;
         }
     }
@@ -279,7 +294,11 @@ blocks_ready:
         if (cuLaunchKernel(vision_rope, n, 16, 1, 36, 1, 1, 0, r->stream, rope_args, NULL)) goto done;
         if (block == block_index && dump_vision(dump_dir, "qkv_rope", qkv,
                                                  (size_t)n * 3456, n, 3456)) goto done;
-        if (cutlass_attention) {
+        if (flash_attention) {
+            if (launch_cast(r, qkv_bf, qkv, n * 3456) ||
+                flash_attention((float *)(uintptr_t)att, (const void *)(uintptr_t)qkv_bf,
+                                n, r->stream) || cuStreamSynchronize(r->stream)) goto done;
+        } else if (cutlass_attention) {
             if (launch_cast(r, qkv_bf, qkv, n * 3456) ||
                 cutlass_attention((float *)(uintptr_t)att, (const void *)(uintptr_t)qkv_bf,
                                   n, 16, 72, r->stream) || cuStreamSynchronize(r->stream)) goto done;

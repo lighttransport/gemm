@@ -82,6 +82,14 @@ enum {
     CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_C_BYTES = 7,
     CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_D_BYTES = 8,
 
+    CUBLASLT_ALGO_CONFIG_TILE_ID = 1,
+    CUBLASLT_ALGO_CONFIG_SPLITK_NUM = 2,
+    CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME = 3,
+    CUBLASLT_ALGO_CONFIG_STAGES_ID = 6,
+    CUBLASLT_MATMUL_TILE_64x64 = 15,
+    CUBLASLT_MATMUL_STAGES_32x6 = 12,
+    CUBLASLT_REDUCTION_SCHEME_INPLACE = 1,
+
     CUBLASLT_EPILOGUE_DEFAULT = 1,
     CUBLASLT_EPILOGUE_BIAS = 4,
     CUBLASLT_EPILOGUE_GELU = 32,
@@ -197,6 +205,17 @@ typedef cublasStatus_t (*tcublasLtMatmulAlgoGetHeuristic)(cublasLtHandle_t,
                                                           int,
                                                           cublasLtMatmulHeuristicResult_t *,
                                                           int *);
+typedef cublasStatus_t (*tcublasLtMatmulAlgoInit)(cublasLtHandle_t,
+                                                  cublasComputeType_t,
+                                                  cudaDataType_t,
+                                                  cudaDataType_t,
+                                                  cudaDataType_t,
+                                                  cudaDataType_t,
+                                                  cudaDataType_t,
+                                                  int,
+                                                  cublasLtMatmulAlgo_t *);
+typedef cublasStatus_t (*tcublasLtMatmulAlgoConfigSetAttribute)(cublasLtMatmulAlgo_t *,
+                                                                int, const void *, size_t);
 typedef cublasStatus_t (*tcublasLtMatmul)(cublasLtHandle_t,
                                           cublasLtMatmulDesc_t,
                                           const void *,
@@ -222,6 +241,8 @@ static tcublasLtMatmulPreferenceCreate p_cublasLtMatmulPreferenceCreate;
 static tcublasLtMatmulPreferenceDestroy p_cublasLtMatmulPreferenceDestroy;
 static tcublasLtMatmulPreferenceSetAttribute p_cublasLtMatmulPreferenceSetAttribute;
 static tcublasLtMatmulAlgoGetHeuristic p_cublasLtMatmulAlgoGetHeuristic;
+static tcublasLtMatmulAlgoInit p_cublasLtMatmulAlgoInit;
+static tcublasLtMatmulAlgoConfigSetAttribute p_cublasLtMatmulAlgoConfigSetAttribute;
 static tcublasLtMatmul p_cublasLtMatmul;
 static int g_cublaslt_init_done;
 static int g_cublaslt_available;
@@ -405,6 +426,8 @@ static int cublasewLtInit(void) {
         cublaslt_load_symbol((void **)&p_cublasLtMatmulPreferenceDestroy, "cublasLtMatmulPreferenceDestroy") != 0 ||
         cublaslt_load_symbol((void **)&p_cublasLtMatmulPreferenceSetAttribute, "cublasLtMatmulPreferenceSetAttribute") != 0 ||
         cublaslt_load_symbol((void **)&p_cublasLtMatmulAlgoGetHeuristic, "cublasLtMatmulAlgoGetHeuristic") != 0 ||
+        cublaslt_load_symbol((void **)&p_cublasLtMatmulAlgoInit, "cublasLtMatmulAlgoInit") != 0 ||
+        cublaslt_load_symbol((void **)&p_cublasLtMatmulAlgoConfigSetAttribute, "cublasLtMatmulAlgoConfigSetAttribute") != 0 ||
         cublaslt_load_symbol((void **)&p_cublasLtMatmul, "cublasLtMatmul") != 0) {
         cublas_close(g_cublaslt_lib);
         g_cublaslt_lib = NULL;
@@ -1363,11 +1386,13 @@ int cublasew_gemm_bf16_bf16_f32_lt_bias_rowmajor_nt(cublasew_context *ctx,
     cublasLtMatmulDesc_t desc = NULL;
     cublasLtMatrixLayout_t a_layout = NULL, b_layout = NULL, d_layout = NULL;
     cublasLtMatmulHeuristicResult_t heur;
+    cublasLtMatmulAlgo_t torch_algo;
+    const cublasLtMatmulAlgo_t *selected_algo = &heur.algo;
     cublasStatus_t st;
     int op_t = CUBLAS_OP_T, op_n = CUBLAS_OP_N;
     int epilogue = gelu ? CUBLASLT_EPILOGUE_GELU_BIAS : CUBLASLT_EPILOGUE_BIAS;
-    int bias_dt = CUDA_R_32F;
-    int y_dt = y_f16 ? CUDA_R_16F : CUDA_R_32F;
+    int bias_dt = y_f16 == 2 ? CUDA_R_16BF : CUDA_R_32F;
+    int y_dt = y_f16 == 2 ? CUDA_R_16BF : y_f16 ? CUDA_R_16F : CUDA_R_32F;
     void *biasp = (void *)(uintptr_t)d_bias_f32;
     void *Wp = (void *)(uintptr_t)d_W_bf16;
     void *Xp = (void *)(uintptr_t)d_X_bf16;
@@ -1390,8 +1415,9 @@ int cublasew_gemm_bf16_bf16_f32_lt_bias_rowmajor_nt(cublasew_context *ctx,
     if (p_cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_BIAS_POINTER,
                                           &biasp, sizeof(biasp)) != CUBLAS_STATUS_SUCCESS)
         goto fail;
-    if (p_cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE,
-                                          &bias_dt, sizeof(bias_dt)) != CUBLAS_STATUS_SUCCESS)
+    if (y_f16 != 2 &&
+        p_cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE,
+                                         &bias_dt, sizeof(bias_dt)) != CUBLAS_STATUS_SUCCESS)
         goto fail;
 
     /* W is BF16 [n_out, n_in] row-major -> column-major [n_in, n_out], ld n_in. */
@@ -1411,13 +1437,34 @@ int cublasew_gemm_bf16_bf16_f32_lt_bias_rowmajor_nt(cublasew_context *ctx,
         goto fail;
 
     memset(&heur, 0, sizeof(heur));
-    if (cublasewLtGetHeuristic(ctx->lt_handle, desc,
-                               a_layout, b_layout,
-                               d_layout, d_layout,
-                               ctx->pref, &heur,
-                               gelu ? "bf16_gelubias_nt" : "bf16_bias_nt",
-                               n_tok, n_out, n_in) != 0)
+    memset(&torch_algo, 0, sizeof(torch_algo));
+    if (y_f16 == 2 && n_tok == 256 && (n_in == 1152 || n_in == 4304)) {
+        int tile = CUBLASLT_MATMUL_TILE_64x64;
+        int stages = CUBLASLT_MATMUL_STAGES_32x6;
+        int split_k = n_out <= 1152 ? (n_in == 4304 ? 5 : 3) : 1;
+        int reduction = CUBLASLT_REDUCTION_SCHEME_INPLACE;
+        if (p_cublasLtMatmulAlgoInit(ctx->lt_handle, CUBLAS_COMPUTE_32F, CUDA_R_32F,
+                                     CUDA_R_16BF, CUDA_R_16BF, CUDA_R_16BF, CUDA_R_16BF,
+                                     21, &torch_algo) != CUBLAS_STATUS_SUCCESS ||
+            p_cublasLtMatmulAlgoConfigSetAttribute(&torch_algo, CUBLASLT_ALGO_CONFIG_TILE_ID,
+                                                    &tile, sizeof(tile)) != CUBLAS_STATUS_SUCCESS ||
+            p_cublasLtMatmulAlgoConfigSetAttribute(&torch_algo, CUBLASLT_ALGO_CONFIG_STAGES_ID,
+                                                    &stages, sizeof(stages)) != CUBLAS_STATUS_SUCCESS ||
+            (split_k > 1 &&
+             (p_cublasLtMatmulAlgoConfigSetAttribute(&torch_algo, CUBLASLT_ALGO_CONFIG_SPLITK_NUM,
+                                                      &split_k, sizeof(split_k)) != CUBLAS_STATUS_SUCCESS ||
+              p_cublasLtMatmulAlgoConfigSetAttribute(&torch_algo, CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME,
+                                                      &reduction, sizeof(reduction)) != CUBLAS_STATUS_SUCCESS)))
+            goto fail;
+        selected_algo = &torch_algo;
+    } else if (cublasewLtGetHeuristic(ctx->lt_handle, desc,
+                                      a_layout, b_layout,
+                                      d_layout, d_layout,
+                                      ctx->pref, &heur,
+                                      gelu ? "bf16_gelubias_nt" : "bf16_bias_nt",
+                                      n_tok, n_out, n_in) != 0) {
         goto fail;
+    }
 
     st = p_cublasLtMatmul(ctx->lt_handle, desc,
                           &alpha,
@@ -1426,7 +1473,7 @@ int cublasew_gemm_bf16_bf16_f32_lt_bias_rowmajor_nt(cublasew_context *ctx,
                           &beta,
                           Yp, d_layout,
                           Yp, d_layout,
-                          (const void *)&heur.algo,
+                          (const void *)selected_algo,
                           (void *)(uintptr_t)ctx->d_workspace,
                           ctx->workspace_bytes,
                           ctx->stream);
