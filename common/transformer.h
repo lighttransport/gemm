@@ -1195,6 +1195,23 @@ static inline float tf_q4_k_dot_sve(const block_q4_K *blocks, const float *x, in
     return svaddv_f32(pg, acc);
 }
 
+/* UE4M3 scales in GGUF NVFP4 are overwhelmingly subnormal.  Decode those
+ * seven nonzero values directly and use IEEE-754 bits for normal values,
+ * avoiding a libm call for every 16 weights. */
+static inline float tf_nvfp4_scale_fast(uint8_t x) {
+    static const float subnormal[8] = {
+        0.0f, 0x1p-10f, 0x1p-9f, 0x1.8p-9f,
+        0x1p-8f, 0x1.4p-8f, 0x1.8p-8f, 0x1.cp-8f
+    };
+    if ((x & 0x78u) == 0) return subnormal[x & 7u];
+    if (x == 0x7f) return 0.0f;
+    uint32_t bits = ((((uint32_t)x >> 3) & 15u) + 119u) << 23;
+    bits |= ((uint32_t)x & 7u) << 20;
+    float out;
+    memcpy(&out, &bits, sizeof(out));
+    return out;
+}
+
 /* Exact GGUF NVFP4 dot.  Each 64-value block contains four 16-value
  * sub-blocks, with one UE4M3 scale and eight packed E2M1 pairs per
  * sub-block.  Decode the nibbles in SVE registers so the fallback never
@@ -1207,7 +1224,7 @@ static inline float tf_nvfp4_dot_sve(const block_nvfp4 *blocks, const float *x, 
     for (int ib = 0; ib < n / 64; ib++) {
         const block_nvfp4 *b = blocks + ib;
         for (int s = 0; s < 4; s++) {
-            const svfloat32_t scale = svdup_f32(ggml_ue4m3_to_fp32(b->d[s]));
+            const svfloat32_t scale = svdup_f32(tf_nvfp4_scale_fast(b->d[s]));
             const uint8_t *q = b->qs + s * 8;
             const int base = ib * 64 + s * 16;
             for (int k = 0; k < 8; k += vl) {
@@ -1240,37 +1257,30 @@ static inline int tf_nvfp4_w4a8_prepare(const float *x, int n,
     static _Thread_local int8_t *qbuf;
     static _Thread_local float *sbuf;
     static _Thread_local int cap;
-    static _Thread_local const float *src;
-    static _Thread_local int src_n;
-    static _Thread_local float tag0, tag1, tag2, tag3;
     if (n <= 0 || (n & 15)) return -1;
     if (cap < n) {
         int8_t *q = (int8_t *)malloc((size_t)n);
         float *s = (float *)malloc((size_t)(n / 16) * sizeof(float));
         if (!q || !s) { free(q); free(s); return -1; }
         free(qbuf); free(sbuf);
-        qbuf = q; sbuf = s; cap = n; src = NULL;
+        qbuf = q; sbuf = s; cap = n;
     }
-    int same = src == x && src_n == n && tag0 == x[0] &&
-               tag1 == x[n / 3] && tag2 == x[(2 * n) / 3] && tag3 == x[n - 1];
-    if (!same) {
-        for (int b = 0; b < n / 16; b++) {
-            float mx = 0.0f;
-            for (int j = 0; j < 16; j++) {
-                float a = fabsf(x[b * 16 + j]);
-                if (a > mx) mx = a;
-            }
-            float sc = mx / 127.0f;
-            sbuf[b] = sc;
-            float inv = sc > 0.0f ? 1.0f / sc : 0.0f;
-            for (int j = 0; j < 16; j++) {
-                int q = (int)lrintf(x[b * 16 + j] * inv);
-                if (q < -127) q = -127; else if (q > 127) q = 127;
-                qbuf[b * 16 + j] = (int8_t)q;
-            }
+    /* Callers reuse scratch addresses across tokens.  Checking a few sampled
+     * elements can miss changes elsewhere, so always quantize the full input. */
+    for (int b = 0; b < n / 16; b++) {
+        float mx = 0.0f;
+        for (int j = 0; j < 16; j++) {
+            float a = fabsf(x[b * 16 + j]);
+            if (a > mx) mx = a;
         }
-        src = x; src_n = n;
-        tag0 = x[0]; tag1 = x[n / 3]; tag2 = x[(2 * n) / 3]; tag3 = x[n - 1];
+        float sc = mx / 127.0f;
+        sbuf[b] = sc;
+        float inv = sc > 0.0f ? 1.0f / sc : 0.0f;
+        for (int j = 0; j < 16; j++) {
+            int q = (int)lrintf(x[b * 16 + j] * inv);
+            if (q < -127) q = -127; else if (q > 127) q = 127;
+            qbuf[b * 16 + j] = (int8_t)q;
+        }
     }
     *out_q = qbuf; *out_s = sbuf;
     return 0;
@@ -1290,10 +1300,10 @@ static inline void tf_nvfp4_dot4_w4a8_sve(float *o0, float *o1, float *o2, float
         for (int s = 0; s < 4; s++) {
             const uint8_t *q0=r0->qs+s*8,*q1=r1->qs+s*8;
             const uint8_t *q2=r2->qs+s*8,*q3=r3->qs+s*8;
-            svfloat32_t scale0=svdup_f32(ggml_ue4m3_to_fp32(r0->d[s]) * xs[ib*4+s]);
-            svfloat32_t scale1=svdup_f32(ggml_ue4m3_to_fp32(r1->d[s]) * xs[ib*4+s]);
-            svfloat32_t scale2=svdup_f32(ggml_ue4m3_to_fp32(r2->d[s]) * xs[ib*4+s]);
-            svfloat32_t scale3=svdup_f32(ggml_ue4m3_to_fp32(r3->d[s]) * xs[ib*4+s]);
+            svfloat32_t scale0=svdup_f32(tf_nvfp4_scale_fast(r0->d[s]) * xs[ib*4+s]);
+            svfloat32_t scale1=svdup_f32(tf_nvfp4_scale_fast(r1->d[s]) * xs[ib*4+s]);
+            svfloat32_t scale2=svdup_f32(tf_nvfp4_scale_fast(r2->d[s]) * xs[ib*4+s]);
+            svfloat32_t scale3=svdup_f32(tf_nvfp4_scale_fast(r3->d[s]) * xs[ib*4+s]);
             svuint8_t z0=svld1_u8(p8,q0),z1=svld1_u8(p8,q1);
             svuint8_t z2=svld1_u8(p8,q2),z3=svld1_u8(p8,q3);
             svint8_t l0=svtbl_s8(lut,svand_n_u8_x(p8,z0,15));
@@ -1321,6 +1331,62 @@ static inline void tf_nvfp4_dot4_w4a8_sve(float *o0, float *o1, float *o2, float
     *o2=svaddv_f32(p32,a2); *o3=svaddv_f32(p32,a3);
 }
 
+/* Eight independent rows share each activation load.  The per-row K order
+ * matches the four-row exact kernel. */
+static inline void tf_nvfp4_dot8_sve(float *dst, const uint8_t *base, size_t rb,
+                                     const float *x, int n) {
+    const svbool_t pg = svptrue_b32();
+    const svfloat32_t lut = svld1(pg, ds4f_kvalues_mxfp4_f32);
+    const int vl = (int)svcntw();
+    const block_nvfp4 *r0 = (const block_nvfp4 *)(base + 0 * rb);
+    const block_nvfp4 *r1 = (const block_nvfp4 *)(base + 1 * rb);
+    const block_nvfp4 *r2 = (const block_nvfp4 *)(base + 2 * rb);
+    const block_nvfp4 *r3 = (const block_nvfp4 *)(base + 3 * rb);
+    const block_nvfp4 *r4 = (const block_nvfp4 *)(base + 4 * rb);
+    const block_nvfp4 *r5 = (const block_nvfp4 *)(base + 5 * rb);
+    const block_nvfp4 *r6 = (const block_nvfp4 *)(base + 6 * rb);
+    const block_nvfp4 *r7 = (const block_nvfp4 *)(base + 7 * rb);
+    svfloat32_t a0=svdup_f32(0), a1=a0, a2=a0, a3=a0;
+    svfloat32_t a4=a0, a5=a0, a6=a0, a7=a0;
+    for (int ib = 0; ib < n / 64; ib++) {
+        const block_nvfp4 *b0=r0+ib,*b1=r1+ib,*b2=r2+ib,*b3=r3+ib;
+        const block_nvfp4 *b4=r4+ib,*b5=r5+ib,*b6=r6+ib,*b7=r7+ib;
+        for (int s = 0; s < 4; s++) {
+            svfloat32_t d0=svdup_f32(tf_nvfp4_scale_fast(b0->d[s]));
+            svfloat32_t d1=svdup_f32(tf_nvfp4_scale_fast(b1->d[s]));
+            svfloat32_t d2=svdup_f32(tf_nvfp4_scale_fast(b2->d[s]));
+            svfloat32_t d3=svdup_f32(tf_nvfp4_scale_fast(b3->d[s]));
+            svfloat32_t d4=svdup_f32(tf_nvfp4_scale_fast(b4->d[s]));
+            svfloat32_t d5=svdup_f32(tf_nvfp4_scale_fast(b5->d[s]));
+            svfloat32_t d6=svdup_f32(tf_nvfp4_scale_fast(b6->d[s]));
+            svfloat32_t d7=svdup_f32(tf_nvfp4_scale_fast(b7->d[s]));
+            int xbase=ib*64+s*16;
+            for (int k=0; k<8; k+=vl) {
+                svbool_t pt=svwhilelt_b32((uint64_t)k,(uint64_t)8);
+                svfloat32_t xv=svld1(pt,x+xbase+k);
+                svfloat32_t xh=svld1(pt,x+xbase+8+k);
+#define TF_NVFP4_DOT8_ROW(B, A, D) do { \
+                    const uint8_t *q=(B)->qs+s*8+k; \
+                    svuint32_t z=svld1ub_u32(pt,q); \
+                    svfloat32_t lo=svtbl_f32(lut,svand_n_u32_x(pt,z,15)); \
+                    (A)=svmla_m(pt,(A),svmul_x(pt,lo,(D)),xv); \
+                    svfloat32_t hi=svtbl_f32(lut,svlsr_n_u32_x(pt,z,4)); \
+                    (A)=svmla_m(pt,(A),svmul_x(pt,hi,(D)),xh); \
+                } while (0)
+                TF_NVFP4_DOT8_ROW(b0,a0,d0); TF_NVFP4_DOT8_ROW(b1,a1,d1);
+                TF_NVFP4_DOT8_ROW(b2,a2,d2); TF_NVFP4_DOT8_ROW(b3,a3,d3);
+                TF_NVFP4_DOT8_ROW(b4,a4,d4); TF_NVFP4_DOT8_ROW(b5,a5,d5);
+                TF_NVFP4_DOT8_ROW(b6,a6,d6); TF_NVFP4_DOT8_ROW(b7,a7,d7);
+#undef TF_NVFP4_DOT8_ROW
+            }
+        }
+    }
+    dst[0]=svaddv_f32(pg,a0); dst[1]=svaddv_f32(pg,a1);
+    dst[2]=svaddv_f32(pg,a2); dst[3]=svaddv_f32(pg,a3);
+    dst[4]=svaddv_f32(pg,a4); dst[5]=svaddv_f32(pg,a5);
+    dst[6]=svaddv_f32(pg,a6); dst[7]=svaddv_f32(pg,a7);
+}
+
 static inline void tf_nvfp4_dot4_sve(float *o0, float *o1, float *o2, float *o3,
                                      const block_nvfp4 *b0, const block_nvfp4 *b1,
                                      const block_nvfp4 *b2, const block_nvfp4 *b3,
@@ -1344,24 +1410,33 @@ static inline void tf_nvfp4_dot4_sve(float *o0, float *o1, float *o2, float *o3,
 #pragma clang loop unroll_count(4)
 #endif
         for (int s=0;s<4;s++) {
-            svfloat32_t d0=svdup_f32(ggml_ue4m3_to_fp32(r0->d[s]));
-            svfloat32_t d1=svdup_f32(ggml_ue4m3_to_fp32(r1->d[s]));
-            svfloat32_t d2=svdup_f32(ggml_ue4m3_to_fp32(r2->d[s]));
-            svfloat32_t d3=svdup_f32(ggml_ue4m3_to_fp32(r3->d[s]));
+            svfloat32_t d0=svdup_f32(tf_nvfp4_scale_fast(r0->d[s]));
+            svfloat32_t d1=svdup_f32(tf_nvfp4_scale_fast(r1->d[s]));
+            svfloat32_t d2=svdup_f32(tf_nvfp4_scale_fast(r2->d[s]));
+            svfloat32_t d3=svdup_f32(tf_nvfp4_scale_fast(r3->d[s]));
             const uint8_t *q0=r0->qs+s*8,*q1=r1->qs+s*8,*q2=r2->qs+s*8,*q3=r3->qs+s*8;
             int base=ib*64+s*16;
-            for(int k=0;k<8;k+=vl){
+            for (int k=0;k<8;k+=vl) {
                 svbool_t pt=svwhilelt_b32((uint64_t)k,(uint64_t)8);
-                svfloat32_t xv=svld1(pt,x+base+k), xh=svld1(pt,x+base+8+k);
-                svuint32_t z0=svld1ub_u32(pt,q0+k),z1=svld1ub_u32(pt,q1+k),z2=svld1ub_u32(pt,q2+k),z3=svld1ub_u32(pt,q3+k);
-                svfloat32_t l0=svtbl_f32(lut,svand_n_u32_x(pt,z0,15)),l1=svtbl_f32(lut,svand_n_u32_x(pt,z1,15));
-                svfloat32_t l2=svtbl_f32(lut,svand_n_u32_x(pt,z2,15)),l3=svtbl_f32(lut,svand_n_u32_x(pt,z3,15));
-                a0=svmla_m(pt,a0,svmul_x(pt,l0,d0),xv); a1=svmla_m(pt,a1,svmul_x(pt,l1,d1),xv);
-                a2=svmla_m(pt,a2,svmul_x(pt,l2,d2),xv); a3=svmla_m(pt,a3,svmul_x(pt,l3,d3),xv);
-                l0=svtbl_f32(lut,svlsr_n_u32_x(pt,z0,4)); l1=svtbl_f32(lut,svlsr_n_u32_x(pt,z1,4));
-                l2=svtbl_f32(lut,svlsr_n_u32_x(pt,z2,4)); l3=svtbl_f32(lut,svlsr_n_u32_x(pt,z3,4));
-                a0=svmla_m(pt,a0,svmul_x(pt,l0,d0),xh); a1=svmla_m(pt,a1,svmul_x(pt,l1,d1),xh);
-                a2=svmla_m(pt,a2,svmul_x(pt,l2,d2),xh); a3=svmla_m(pt,a3,svmul_x(pt,l3,d3),xh);
+                svfloat32_t xv=svld1(pt,x+base+k),xh=svld1(pt,x+base+8+k);
+                svuint32_t z0=svld1ub_u32(pt,q0+k),z1=svld1ub_u32(pt,q1+k);
+                svuint32_t z2=svld1ub_u32(pt,q2+k),z3=svld1ub_u32(pt,q3+k);
+                svfloat32_t l0=svtbl_f32(lut,svand_n_u32_x(pt,z0,15));
+                svfloat32_t l1=svtbl_f32(lut,svand_n_u32_x(pt,z1,15));
+                svfloat32_t l2=svtbl_f32(lut,svand_n_u32_x(pt,z2,15));
+                svfloat32_t l3=svtbl_f32(lut,svand_n_u32_x(pt,z3,15));
+                a0=svmla_m(pt,a0,svmul_x(pt,l0,d0),xv);
+                a1=svmla_m(pt,a1,svmul_x(pt,l1,d1),xv);
+                a2=svmla_m(pt,a2,svmul_x(pt,l2,d2),xv);
+                a3=svmla_m(pt,a3,svmul_x(pt,l3,d3),xv);
+                l0=svtbl_f32(lut,svlsr_n_u32_x(pt,z0,4));
+                l1=svtbl_f32(lut,svlsr_n_u32_x(pt,z1,4));
+                l2=svtbl_f32(lut,svlsr_n_u32_x(pt,z2,4));
+                l3=svtbl_f32(lut,svlsr_n_u32_x(pt,z3,4));
+                a0=svmla_m(pt,a0,svmul_x(pt,l0,d0),xh);
+                a1=svmla_m(pt,a1,svmul_x(pt,l1,d1),xh);
+                a2=svmla_m(pt,a2,svmul_x(pt,l2,d2),xh);
+                a3=svmla_m(pt,a3,svmul_x(pt,l3,d3),xh);
             }
         }
     }
@@ -3348,7 +3423,7 @@ double tf_decode_ssm_out_ms = 0.0;
 double tf_decode_ffn_gateup_ms = 0.0;
 double tf_decode_ffn_down_ms = 0.0;
 double tf_decode_lm_head_ms = 0.0;
-long tf_nvfp4_group4_rows = 0;
+long tf_nvfp4_grouped_rows = 0;
 long tf_nvfp4_scalar_rows = 0;
 static int tf_dprof = -1;
 static int tf_null_gemm = -1;
@@ -3820,12 +3895,20 @@ static void tf_matvec_qtensor_rows(float *dst, const qtensor *mat, const float *
                        tf_nvfp4_w4a8_prepare(x, n_cols, &xq, &xs) == 0;
         int i = row_start;
         int scalar_rows = 0;
+        int grouped_rows = 0;
         /* The persistent decode worker lands here directly.  Keep its hot
          * path grouped exactly like tf_qmatvec_worker; the old scalar loop
          * made the full-model NVFP4 run ~24x slower than the Q8 path. */
         for (; i < row_end && (i & 3); i++, scalar_rows++)
             dst[i] = tf_nvfp4_dot_sve(
                 (const block_nvfp4 *)(base + (size_t)i * rb), x, n_cols);
+        if (!use_w4a8) {
+            for (; i + 7 < row_end; i += 8) {
+                tf_nvfp4_dot8_sve(dst + i, base + (size_t)i * rb,
+                                   rb, x, n_cols);
+                grouped_rows += 8;
+            }
+        }
         for (; i + 3 < row_end; i += 4) {
             float a, b, c, d;
             if (use_w4a8)
@@ -3841,12 +3924,13 @@ static void tf_matvec_qtensor_rows(float *dst, const qtensor *mat, const float *
                     (const block_nvfp4 *)(base + (size_t)(i + 2) * rb),
                     (const block_nvfp4 *)(base + (size_t)(i + 3) * rb), x, n_cols);
             dst[i] = a; dst[i + 1] = b; dst[i + 2] = c; dst[i + 3] = d;
-            tf_nvfp4_group4_rows += 4;
+            grouped_rows += 4;
         }
         for (; i < row_end; i++, scalar_rows++)
             dst[i] = tf_nvfp4_dot_sve(
                 (const block_nvfp4 *)(base + (size_t)i * rb), x, n_cols);
-        tf_nvfp4_scalar_rows += scalar_rows;
+        __atomic_fetch_add(&tf_nvfp4_grouped_rows, grouped_rows, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&tf_nvfp4_scalar_rows, scalar_rows, __ATOMIC_RELAXED);
     } else if (mat->type == GGML_TYPE_Q5_K) {
         size_t rb = (size_t)(n_cols / 256) * sizeof(block_q5_K);
         for (int i = row_start; i < row_end; i++) {

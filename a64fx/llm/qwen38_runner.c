@@ -31,7 +31,7 @@ extern double tf_decode_attn_qkv_ms, tf_decode_attn_core_ms, tf_decode_attn_out_
 extern double tf_decode_ssm_in_ms, tf_decode_ssm_prepare_ms, tf_decode_ssm_core_ms, tf_decode_ssm_out_ms;
 extern double tf_decode_ffn_gateup_ms, tf_decode_ffn_down_ms;
 extern double tf_decode_lm_head_ms;
-extern long tf_nvfp4_group4_rows, tf_nvfp4_scalar_rows;
+extern long tf_nvfp4_grouped_rows, tf_nvfp4_scalar_rows;
 
 static double now_sec(void) {
     struct timespec t;
@@ -365,7 +365,7 @@ int main(int argc, char **argv) {
     tf_decode_attn_qkv_ms = tf_decode_attn_out_ms = 0.0;
     tf_decode_ssm_in_ms = tf_decode_ssm_prepare_ms = tf_decode_ssm_core_ms = tf_decode_ssm_out_ms = 0.0;
     tf_decode_ffn_gateup_ms = tf_decode_ffn_down_ms = tf_decode_lm_head_ms = 0.0;
-    tf_nvfp4_group4_rows = tf_nvfp4_scalar_rows = 0;
+    tf_nvfp4_grouped_rows = tf_nvfp4_scalar_rows = 0;
     double prefill_t0 = now_sec();
     float *logits = NULL;
     int pos = 0;
@@ -391,7 +391,7 @@ int main(int argc, char **argv) {
     tf_decode_ssm_in_ms = tf_decode_ssm_prepare_ms = tf_decode_ssm_core_ms = tf_decode_ssm_out_ms = 0.0;
     tf_decode_ffn_gateup_ms = tf_decode_ffn_down_ms = 0.0;
     tf_decode_lm_head_ms = 0.0;
-    tf_nvfp4_group4_rows = tf_nvfp4_scalar_rows = 0;
+    tf_nvfp4_grouped_rows = tf_nvfp4_scalar_rows = 0;
     double dec0 = now_sec();
     fapp_start("qwen38_decode", 1, 0);
     long mtp_match = 0, mtp_total = 0;
@@ -449,7 +449,7 @@ int main(int argc, char **argv) {
                 tf_decode_ffn_gateup_ms / (pos - nt), tf_decode_ffn_down_ms / (pos - nt),
                 tf_decode_lm_head_ms / (pos - nt));
         fprintf(stderr, "qwen38: nvfp4 grouped_rows=%ld scalar_rows=%ld\n",
-                tf_nvfp4_group4_rows, tf_nvfp4_scalar_rows);
+                tf_nvfp4_grouped_rows, tf_nvfp4_scalar_rows);
     }
     if (module_profile) {
         double p = nt > 0 ? (double)nt : 1.0;
