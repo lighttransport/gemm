@@ -22004,24 +22004,26 @@ static inline void begin_native_q81_prepared(hip_llm_runner *r) {
 /* Batched projections commonly share the same activation matrix (Q/K/V and
  * gate/up). Reuse its Q8x2 representation until the next layer changes the
  * producer buffer. The key includes the complete batch shape and stride. */
-static inline void launch_quantize_q8x2_batch_cached(hip_llm_runner *r,
-        void *x, int n, int M, int stride) {
+static inline int ensure_batch_q8_scratch(hip_llm_runner *r, int n, int M) {
     const size_t QCAP = 17408;
     if (n > (int)QCAP || M < 1) {
         fprintf(stderr, "hip_llm: batch Q8 scratch shape unsupported (M=%d K=%d)\n", M, n);
         r->batch_q8_valid = 0;
         r->qwen4_forward_error = 1;
-        return;
+        return 0;
     }
-    if (M > r->batch_q8_capacity) {
+    if (M > r->batch_q8_capacity || !r->d_act_q8_batch ||
+        !r->d_act_scale_batch || !r->d_act_q8_batch_b ||
+        !r->d_act_scale_batch_b) {
         int capacity = r->batch_max > M ? r->batch_max : M;
         if (capacity < 512) capacity = 512;
         if (capacity > 8192) capacity = 8192;
-        if (capacity < M || hipStreamSynchronize(r->stream) != hipSuccess) {
+        if (capacity < M ||
+            (r->d_act_q8_batch && hipStreamSynchronize(r->stream) != hipSuccess)) {
             fprintf(stderr, "hip_llm: cannot grow batch Q8 scratch to M=%d\n", M);
             r->batch_q8_valid = 0;
             r->qwen4_forward_error = 1;
-            return;
+            return 0;
         }
         void *q8 = NULL, *sc = NULL, *q8b = NULL, *scb = NULL;
         if (hipMalloc(&q8, (size_t)capacity * QCAP) != hipSuccess ||
@@ -22032,7 +22034,7 @@ static inline void launch_quantize_q8x2_batch_cached(hip_llm_runner *r,
             fprintf(stderr, "hip_llm: batch Q8 scratch growth failed (capacity=%d)\n", capacity);
             r->batch_q8_valid = 0;
             r->qwen4_forward_error = 1;
-            return;
+            return 0;
         }
         if (r->d_act_q8_batch) hipFree(r->d_act_q8_batch);
         if (r->d_act_scale_batch) hipFree(r->d_act_scale_batch);
@@ -22043,6 +22045,12 @@ static inline void launch_quantize_q8x2_batch_cached(hip_llm_runner *r,
         r->batch_q8_capacity = capacity;
         r->batch_q8_valid = 0;
     }
+    return 1;
+}
+
+static inline void launch_quantize_q8x2_batch_cached(hip_llm_runner *r,
+        void *x, int n, int M, int stride) {
+    if (!ensure_batch_q8_scratch(r, n, M)) return;
     /* This helper owns the two-term Q8x2 layout.  Do not inherit the
      * producer's previous Q8_1/MMQ mode: those layouts share storage but
      * have different scale contracts, and the next generic projection must
@@ -22189,6 +22197,7 @@ static inline void launch_quantize_q81_iq1_batch(hip_llm_runner *r, void *x,
      * overwritten and can also leave the shared batch-cache metadata claiming
      * that q1/s1 still hold a valid Q8x2 tile.  Mixed SSM roles that need both
      * formats use the explicit preserving helper below. */
+    if (!ensure_batch_q8_scratch(r, n, M)) return;
     void *args[] = { &r->d_act_q8_batch, &r->d_act_scale_batch,
                      &r->d_act_scale_batch_b, &x, &n, &M, &stride };
     LAUNCH(r->fn_quantize_q81_iq1_batch_32_exact, (n + 31) / 32, M, 1,
@@ -22197,9 +22206,9 @@ static inline void launch_quantize_q81_iq1_batch(hip_llm_runner *r, void *x,
     r->q8x2_reuse_valid = 0;
 }
 
-/* Preserve the Q8x2 bytes for a mixed-format batch.  The IQ1 quantizer
- * intentionally overwrites q0/s0/s1, so the caller must consume both formats
- * before asking another producer to refresh the shared scratch. */
+/* Seed the common two-term layout for a mixed-format batch.  The IQ1
+ * quantizer intentionally overwrites q0/s0/s1, so the caller must consume its
+ * Q8_1 projections before asking another producer to refresh the scratch. */
 static inline void launch_quantize_q81_iq1_batch_preserve_q8x2(
         hip_llm_runner *r, void *x, int n, int M, int stride) {
     launch_quantize_q8x2_batch_cached(r, x, n, M, stride);
@@ -30951,16 +30960,18 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
                                use_iq1_m_q81 && cl->ssm_qkv_type == GGML_TYPE_IQ1_M;
             int gate_q81_iq1m = (ssm_q81_all || ssm_q81_gate) && exact_q81_enabled &&
                                 use_iq1_m_q81 && cl->ssm_gate_type == GGML_TYPE_IQ1_M;
-            if (use_ssm_in_q81)
-                if (qkv_q81_iq1s || gate_q81_iq1s || qkv_q81_iq1m || gate_q81_iq1m)
+            if (use_ssm_in_q81) {
+                if (qkv_q81_iq1s || gate_q81_iq1s || qkv_q81_iq1m || gate_q81_iq1m) {
                     /* QKV/gate can be mixed IQ1 and Q8x2.  Keep the old
                      * two-format staging contract for this dispatcher; the
                      * IQ1-only projection paths use the cheaper direct helper. */
                     launch_quantize_q81_iq1_batch_preserve_q8x2(
                         r, r->d_xnorm_batch, n_embd, M, n_embd);
-                else
+                } else {
                     launch_quantize_q8x2_batch_cached(r, r->d_xnorm_batch,
                                                       n_embd, M, n_embd);
+                }
+            }
             const char *ssm_native_env = getenv("LLM_QWEN4_BATCH_SSM_NATIVE");
             int ssm_native = ssm_native_env && atoi(ssm_native_env) != 0 &&
                              qwen4_ssm_native_supported(cl);
