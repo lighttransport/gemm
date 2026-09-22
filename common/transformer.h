@@ -873,6 +873,13 @@ static size_t tf_row_bytes(uint32_t type, int n_cols) {
 }
 
 /* Matvec for a single expert slice from 3D tensor [cols, rows_per_expert, n_expert]. */
+#if defined(__ARM_FEATURE_SVE)
+static inline float tf_nvfp4_dot_sve(const block_nvfp4 *blocks, const float *x, int n);
+static inline void tf_nvfp4_dot4_sve(float *, float *, float *, float *,
+                                     const block_nvfp4 *, const block_nvfp4 *,
+                                     const block_nvfp4 *, const block_nvfp4 *,
+                                     const float *, int);
+#endif
 static void tf_qmatvec_expert(float *dst, const qtensor *mat, int expert, const float *x,
                               int rows_per_expert, float *tmp) {
     size_t row_bytes = tf_row_bytes(mat->type, mat->n_cols);
@@ -895,6 +902,25 @@ static void tf_qmatvec_expert(float *dst, const qtensor *mat, int expert, const 
             dst[i] = vec_dot_bf16_f32(row, x, mat->n_cols);
         }
         return;
+    }
+    if (mat->type == GGML_TYPE_NVFP4) {
+#if defined(__ARM_FEATURE_SVE)
+        int i = 0;
+        for (; i + 3 < rows_per_expert; i += 4) {
+            float a,b,c,d;
+            tf_nvfp4_dot4_sve(&a,&b,&c,&d,
+                (const block_nvfp4 *)(base + (size_t)i * row_bytes),
+                (const block_nvfp4 *)(base + (size_t)(i+1) * row_bytes),
+                (const block_nvfp4 *)(base + (size_t)(i+2) * row_bytes),
+                (const block_nvfp4 *)(base + (size_t)(i+3) * row_bytes), x, mat->n_cols);
+            dst[i]=a; dst[i+1]=b; dst[i+2]=c; dst[i+3]=d;
+        }
+        for (; i < rows_per_expert; i++) {
+            const block_nvfp4 *row = (const block_nvfp4 *)(base + (size_t)i * row_bytes);
+            dst[i] = tf_nvfp4_dot_sve(row, x, mat->n_cols);
+        }
+        return;
+#endif
     }
 
     for (int i = 0; i < rows_per_expert; i++) {
@@ -1178,6 +1204,41 @@ static inline float tf_nvfp4_dot_sve(const block_nvfp4 *blocks, const float *x, 
         }
     }
     return svaddv_f32(pg, acc);
+}
+
+static inline void tf_nvfp4_dot4_sve(float *o0, float *o1, float *o2, float *o3,
+                                     const block_nvfp4 *b0, const block_nvfp4 *b1,
+                                     const block_nvfp4 *b2, const block_nvfp4 *b3,
+                                     const float *x, int n) {
+    const svbool_t pg = svptrue_b32();
+    const svfloat32_t lut = svld1(pg, ds4f_kvalues_mxfp4_f32);
+    svfloat32_t a0=svdup_f32(0.0f), a1=a0, a2=a0, a3=a0;
+    const int vl = (int)svcntw();
+    for (int ib=0; ib<n/64; ib++) {
+        const block_nvfp4 *r0=b0+ib,*r1=b1+ib,*r2=b2+ib,*r3=b3+ib;
+        for (int s=0;s<4;s++) {
+            svfloat32_t d0=svdup_f32(ggml_ue4m3_to_fp32(r0->d[s]));
+            svfloat32_t d1=svdup_f32(ggml_ue4m3_to_fp32(r1->d[s]));
+            svfloat32_t d2=svdup_f32(ggml_ue4m3_to_fp32(r2->d[s]));
+            svfloat32_t d3=svdup_f32(ggml_ue4m3_to_fp32(r3->d[s]));
+            const uint8_t *q0=r0->qs+s*8,*q1=r1->qs+s*8,*q2=r2->qs+s*8,*q3=r3->qs+s*8;
+            int base=ib*64+s*16;
+            for(int k=0;k<8;k+=vl){
+                svbool_t pt=svwhilelt_b32((uint64_t)k,(uint64_t)8);
+                svfloat32_t xv=svld1(pt,x+base+k), xh=svld1(pt,x+base+8+k);
+                svuint32_t z0=svld1ub_u32(pt,q0+k),z1=svld1ub_u32(pt,q1+k),z2=svld1ub_u32(pt,q2+k),z3=svld1ub_u32(pt,q3+k);
+                svfloat32_t l0=svtbl_f32(lut,svand_n_u32_x(pt,z0,15)),l1=svtbl_f32(lut,svand_n_u32_x(pt,z1,15));
+                svfloat32_t l2=svtbl_f32(lut,svand_n_u32_x(pt,z2,15)),l3=svtbl_f32(lut,svand_n_u32_x(pt,z3,15));
+                a0=svmla_m(pt,a0,svmul_x(pt,l0,d0),xv); a1=svmla_m(pt,a1,svmul_x(pt,l1,d1),xv);
+                a2=svmla_m(pt,a2,svmul_x(pt,l2,d2),xv); a3=svmla_m(pt,a3,svmul_x(pt,l3,d3),xv);
+                l0=svtbl_f32(lut,svlsr_n_u32_x(pt,z0,4)); l1=svtbl_f32(lut,svlsr_n_u32_x(pt,z1,4));
+                l2=svtbl_f32(lut,svlsr_n_u32_x(pt,z2,4)); l3=svtbl_f32(lut,svlsr_n_u32_x(pt,z3,4));
+                a0=svmla_m(pt,a0,svmul_x(pt,l0,d0),xh); a1=svmla_m(pt,a1,svmul_x(pt,l1,d1),xh);
+                a2=svmla_m(pt,a2,svmul_x(pt,l2,d2),xh); a3=svmla_m(pt,a3,svmul_x(pt,l3,d3),xh);
+            }
+        }
+    }
+    *o0=svaddv_f32(pg,a0);*o1=svaddv_f32(pg,a1);*o2=svaddv_f32(pg,a2);*o3=svaddv_f32(pg,a3);
 }
 
 static inline int tf_kq_pair_enabled(void) {
