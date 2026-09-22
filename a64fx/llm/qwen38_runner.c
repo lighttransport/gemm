@@ -7,6 +7,7 @@
 #include "bpe_tokenizer.h"
 #define TRANSFORMER_IMPLEMENTATION
 #include "transformer.h"
+#include "qwen38_nvfp4_pack.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -202,7 +203,7 @@ static int run_benchmark(transformer_model *m, bpe_vocab *v, int32_t *tok,
 static void usage(const char *p) {
     fprintf(stderr, "usage: %s MODEL --prompt TEXT [--max-gen N] [--max-seq N] "
                     "[--threads N] [--spec-k 0..4] [--mmap] "
-                    "[--fast-swiglu] [--nvfp4-fast] [--q8-mode auto|reference|cmg4|cmg4-a15|block64|block64-ffn|block64-exact|row] "
+                    "[--fast-swiglu] [--nvfp4-fast] [--nvfp4-packed] [--q8-mode auto|reference|cmg4|cmg4-a15|block64|block64-ffn|block64-exact|row] "
                     "[--bench --bench-prompt N[,N...] --bench-gen N[,N...] "
                     "--bench-runs N --bench-warmup N --bench-csv]\n", p);
 }
@@ -213,7 +214,7 @@ int main(int argc, char **argv) {
     const char *bench_prompt_arg = "512";
     const char *bench_gen_arg = "128";
     int max_gen = 16, max_seq = 512, threads = 48, spec_k = 0, mmap_weights = 0;
-    int fast_swiglu = 0, nvfp4_fast = 0;
+    int fast_swiglu = 0, nvfp4_fast = 0, nvfp4_packed = 0;
     int bench = 0, bench_runs = 3, bench_warmup = 1, bench_csv = 0;
     int bench_prompt_sizes[QWEN38_BENCH_MAX_CASES];
     int bench_gen_sizes[QWEN38_BENCH_MAX_CASES];
@@ -233,6 +234,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--bench-warmup") && ++i < argc) bench_warmup = atoi(argv[i]);
         else if (!strcmp(argv[i], "--fast-swiglu")) fast_swiglu = 1;
         else if (!strcmp(argv[i], "--nvfp4-fast")) nvfp4_fast = 1;
+        else if (!strcmp(argv[i], "--nvfp4-packed")) nvfp4_packed = 1;
         else if (!strcmp(argv[i], "--bench-csv")) bench_csv = 1;
         else if (argv[i][0] != '-' && !path) path = argv[i];
         else { usage(argv[0]); return 2; }
@@ -291,6 +293,7 @@ int main(int argc, char **argv) {
     int q8_model = q8_tensors > 100;
     if (!q8_model && !mmap_weights) {
         gguf_close(g);
+        if (nvfp4_packed) setenv("TF_NVFP4_PACK_SPACE", "1", 1);
         g = gguf_open_multi(path, 0);
         if (!g) return 1;
     }
@@ -300,6 +303,29 @@ int main(int argc, char **argv) {
     m->decode_swiglu_approx = fast_swiglu;
     transformer_set_nvfp4_fast(nvfp4_fast);
     if (threads > 1) transformer_set_threads(m, threads);
+#if defined(__ARM_FEATURE_SVE)
+    q38_nvfp4_layout *pack_layout = NULL;
+    size_t pack_bytes = 0;
+    int pack_count = 0;
+    if (nvfp4_packed) {
+        if (mmap_weights || q8_model || spec_k || m->use_moe ||
+            threads != 48 || !getenv("NUMA_DISTRIBUTE") || g->fd < 0 ||
+            q38_nvfp4_plan(g, &pack_layout, &pack_bytes, &pack_count) ||
+            pack_count == 0) {
+            fprintf(stderr, "qwen38: --nvfp4-packed requires dense, anonymous "
+                            "single-node NVFP4 with 48 NUMA workers\n");
+            return 1;
+        }
+        q38_nvfp4_touch(g, pack_layout, (size_t)g->n_tensors, threads);
+        fprintf(stderr, "qwen38: NVFP4 packed first touch %.3fGB (%d tensors)\n",
+                pack_bytes / 1e9, pack_count);
+    }
+#else
+    if (nvfp4_packed) {
+        fprintf(stderr, "qwen38: --nvfp4-packed requires A64FX SVE\n");
+        return 1;
+    }
+#endif
     size_t q8_resident = 0;
     if (q8_model && !mmap_weights) {
         if (spec_k) {
@@ -317,6 +343,20 @@ int main(int argc, char **argv) {
     } else if (!mmap_weights) {
         transformer_numa_setup(m, g);
     }
+#if defined(__ARM_FEATURE_SVE)
+    if (nvfp4_packed) {
+        double pack_t0 = now_sec();
+        if (!m->numa.enabled ||
+            q38_nvfp4_pack_model(g, m, pack_layout, (size_t)g->n_tensors,
+                                   pack_bytes)) {
+            fprintf(stderr, "qwen38: NVFP4 in-place model pack failed\n");
+            return 1;
+        }
+        fprintf(stderr, "qwen38: NVFP4 packed %d tensors %.3fGB in %.3fs\n",
+                pack_count, pack_bytes / 1e9, now_sec() - pack_t0);
+        free(pack_layout);
+    }
+#endif
     if (!getenv("TF_NO_PANEL")) transformer_build_panels(m);
     fprintf(stderr, "qwen38: load=%.3fs trunk=%d nextn=%d format=%s\n",
             now_sec() - load0, m->n_layers, m->n_nextn_layers,

@@ -132,6 +132,7 @@ typedef struct gguf_context_s {
     size_t data_offset; /* byte offset in file where tensor data starts */
     uint8_t *data;      /* pointer to tensor data (mmap'd or malloc'd) */
     size_t data_size;
+    size_t data_alloc_size; /* anonymous capacity; may reserve decode repack space */
     int use_mmap;
     /* Split-GGUF support.  A merged context owns the metadata/tensor catalogue,
      * while each tensor remains backed by the mmap belonging to its source
@@ -468,6 +469,7 @@ gguf_context *gguf_open(const char *path, int use_mmap) {
             if (end > max_end) max_end = end;
         }
         ctx->data_size = max_end;
+        ctx->data_alloc_size = max_end;
     }
 
     /* Metadata-only mode keeps the source fd for explicit chunked pread but
@@ -552,7 +554,26 @@ gguf_context *gguf_open(const char *path, int use_mmap) {
         /* Aligned allocation for hugepage compatibility and SVE alignment.
          * 2MB alignment ensures hugepage-friendly boundaries with libmpg. */
         size_t align = (ctx->data_size >= 2 * 1024 * 1024) ? (2 * 1024 * 1024) : 256;
-        size_t alloc_size = (ctx->data_size + align - 1) & ~(align - 1);
+        size_t reserve = ctx->data_size;
+        if (getenv("TF_NVFP4_PACK_SPACE") && atoi(getenv("TF_NVFP4_PACK_SPACE"))) {
+            for (uint64_t i = 0; i < ctx->n_tensors; i++) {
+                gguf_tensor_info *ti = &ctx->tensors[i];
+                if (ti->type != GGML_TYPE_NVFP4 || ti->n_dims < 2 ||
+                    ti->dims[0] % 64) continue;
+                uint64_t rows = 1;
+                for (uint32_t d = 1; d < ti->n_dims; d++) rows *= ti->dims[d];
+                if (rows % 8) continue;
+                size_t sz = gguf_tensor_size(ctx, (int)i);
+                size_t extra = sz / 3 + ctx->alignment;
+                if (extra > SIZE_MAX - reserve) goto fail;
+                reserve += extra;
+            }
+            fprintf(stderr, "gguf: NVFP4 pack reserve %.3fGB (source %.3fGB)\n",
+                    reserve / 1e9, ctx->data_size / 1e9);
+        }
+        if (reserve > SIZE_MAX - (align - 1)) goto fail;
+        size_t alloc_size = (reserve + align - 1) & ~(align - 1);
+        ctx->data_alloc_size = alloc_size;
         if (posix_memalign((void **)&ctx->data, align, alloc_size) != 0) {
             ctx->data = NULL; goto fail;
         }

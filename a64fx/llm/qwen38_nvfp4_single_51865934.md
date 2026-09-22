@@ -121,7 +121,42 @@ tensors, the expanded data arena would be approximately **20.627 GB** versus
 largest original eligible tensor is 50.1 MB. Full-model integration still
 needs reverse-order movement across GGUF tensors and remapping every loaded
 `qtensor.data` pointer; this scan is a capacity calculation, not a successful
-model repack.
+model repack. The following experiment completed that integration on the
+replacement job described below.
+
+## Packed full-model decode (job 51869188)
+
+On node `l01-3209c`, `--nvfp4-packed` reserves the expanded anonymous GGUF
+arena, first-touches it across four CMGs, repacks the 371 NVFP4 tensors in
+reverse offset order with one tile of scratch, and updates loaded tensor
+pointers. The pack took 7.88 seconds; the 20.627 GB arena left approximately
+10 GB `MemAvailable`. The SVE kernel uses `TBL` to decode FP4 nibbles and
+`SDOT` for eight output rows. It quantizes activations in groups of four to
+keep the tested token traces identical to exact decode. The old 16-value
+groups diverged on the compass prompt at token 7. Eight-value groups diverged
+at token 17 and offered no speed benefit, so both were discarded.
+
+| Prompt | Exact | Packed | Token IDs | Max selected-logit error |
+| --- | ---: | ---: | ---: | ---: |
+| `hi`, 128 generated | 4.654 tok/s | 8.454 tok/s | 128/128 | 0.061661 |
+| Compass explanation, 128 generated | ~4.65 tok/s | 8.446 tok/s | 128/128 | 0.032745 |
+| C Fibonacci function, 256 generated | 4.668 tok/s | 8.332 tok/s | 256/256 | 0.146685 |
+
+The three completed traces match **512/512 generated token IDs**. This is
+bounded validation, not a guarantee for all prompts. The packed path remains
+opt-in because activation quantization changes logits. It is approximately
+1.8 times the exact decode rate, still far below 40 tok/s. On the compass
+run, FFN gate/up and down take 29.8 and 30.1 ms/token; the Q6_K vocabulary
+head alone takes 20.6 ms/token. The head cost caps throughput below 49 tok/s
+even if all other stages were free. Further progress requires a substantially
+faster packed projection kernel and head.
+
+Validation used the existing `test_qwen38_token_trace.py` with exact and
+packed logs, `--tokens 128` or `256`, and `--max-logit-error 0.2`. The longer
+code-prompt logs are `/local/u14346/q27b-exact-code256.log` and
+`/local/u14346/q27b-packed-per4-code256.log`. Reproduce with the same command
+below and append `--nvfp4-packed`; this option requires 48 NUMA workers,
+anonymous weights, a dense NVFP4 model, and `--spec-k 0`.
 
 ## Reproduce
 

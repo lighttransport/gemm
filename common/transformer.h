@@ -61,6 +61,7 @@ typedef struct {
     void    *kquant_cache; /* optional validated Q5R/IQ4R rank-local decode sidecar */
     uint32_t kquant_cache_format;
     void    *tp_owned_data; /* owned contiguous TP column repack, if any */
+    int      nvfp4_packed; /* K-major eight-row NVFP4 decode layout */
 } qtensor;
 
 typedef struct {
@@ -1492,6 +1493,135 @@ static inline void tf_nvfp4_dot8_fast_sve(float *dst, const uint8_t *base, size_
     dst[6]=svaddv_f32(pg,a6); dst[7]=svaddv_f32(pg,a7);
 }
 
+/* One block of eight rows, grouped by 64 input values and four 16-value
+ * scales. The packed format keeps each subblock's eight FP32 scales adjacent
+ * to the corresponding 64 FP4 bytes. */
+typedef struct { float d[8]; uint8_t qs[64]; } tf_nvfp4_packed_subblock;
+typedef struct { tf_nvfp4_packed_subblock s[4]; } tf_nvfp4_packed_block;
+typedef struct {
+    int8_t lo[64], hi[64];
+    float lo_scale[16], hi_scale[16];
+} tf_nvfp4_packed_act;
+
+static inline void tf_nvfp4_packed_quantize(tf_nvfp4_packed_act *out,
+                                             const float *x, int n) {
+    for (int b = 0; b < n / 16; b++) {
+        int8_t q[16];
+        float scale[4];
+        for (int g = 0; g < 4; g++) {
+            float maxabs = 0.0f;
+            for (int j = 0; j < 4; j++) {
+                float v = fabsf(x[b * 16 + g * 4 + j]);
+                if (v > maxabs) maxabs = v;
+            }
+            scale[g] = maxabs / 127.0f;
+            float inv = scale[g] > 0 ? 1.0f / scale[g] : 0.0f;
+            for (int j = 0; j < 4; j++)
+                q[g * 4 + j] = (int8_t)lrintf(x[b * 16 + g * 4 + j] * inv);
+        }
+        int8_t lo[8], hi[8];
+        for (int j = 0; j < 8; j++) {
+            lo[j] = q[j];
+            hi[j] = q[8 + j];
+        }
+        for (int r = 0; r < 8; r++) {
+            memcpy(out[b].lo + r * 8, lo, 8);
+            memcpy(out[b].hi + r * 8, hi, 8);
+            out[b].lo_scale[r * 2] = scale[0];
+            out[b].lo_scale[r * 2 + 1] = scale[1];
+            out[b].hi_scale[r * 2] = scale[2];
+            out[b].hi_scale[r * 2 + 1] = scale[3];
+        }
+    }
+}
+
+static inline tf_nvfp4_packed_act *tf_nvfp4_packed_prepare(const float *x, int n) {
+    static __thread tf_nvfp4_packed_act *buf;
+    static __thread float *last_x;
+    static __thread size_t cap, last_cap;
+    static __thread int last_n;
+    size_t need = (size_t)n / 16;
+    if (cap < need) {
+        tf_nvfp4_packed_act *p = realloc(buf, need * sizeof(*p));
+        if (!p) return NULL;
+        buf = p; cap = need;
+    }
+    if (last_n == n && last_x &&
+        memcmp(last_x, x, (size_t)n * sizeof(float)) == 0) return buf;
+    if (last_cap < (size_t)n) {
+        float *p = realloc(last_x, (size_t)n * sizeof(*p));
+        if (!p) return NULL;
+        last_x = p; last_cap = (size_t)n;
+    }
+    tf_nvfp4_packed_quantize(buf, x, n);
+    memcpy(last_x, x, (size_t)n * sizeof(float));
+    last_n = n;
+    return buf;
+}
+
+static inline void tf_nvfp4_packed_dot8(float *dst,
+                                        const tf_nvfp4_packed_block *w,
+                                        const tf_nvfp4_packed_act *a, int nb) {
+    static const int8_t lut_data[64] = {
+        0,1,2,3,4,6,8,12,0,-1,-2,-3,-4,-6,-8,-12
+    };
+    const svbool_t pb = svptrue_b8();
+    const svbool_t pg = svptrue_b32();
+    const svbool_t p8 = svwhilelt_b32((uint64_t)0, (uint64_t)8);
+    svint8_t lut = svld1_s8(pb, lut_data);
+    svfloat32_t acc0 = svdup_f32(0), acc1 = acc0, acc2 = acc0, acc3 = acc0;
+    for (int b = 0; b < nb; b++) {
+        for (int s = 0; s < 4; s++) {
+            const tf_nvfp4_packed_subblock *p = &w[b].s[s];
+            const tf_nvfp4_packed_act *xq = &a[b * 4 + s];
+            svuint8_t bytes = svld1_u8(pb, p->qs);
+            svint8_t lo = svtbl_s8(lut, svand_n_u8_x(pb, bytes, 15));
+            svint8_t hi = svtbl_s8(lut, svlsr_n_u8_x(pb, bytes, 4));
+            svint8_t al = svld1_s8(pb, xq->lo);
+            svint8_t ah = svld1_s8(pb, xq->hi);
+            svint32_t dot_lo = svdot_s32(svdup_s32(0), lo, al);
+            svint32_t dot_hi = svdot_s32(svdup_s32(0), hi, ah);
+            svfloat32_t weight_scale = svzip1_f32(svld1(p8, p->d), svld1(p8, p->d));
+            svfloat32_t scale_lo = svmul_f32_x(pg, weight_scale,
+                                               svld1(pg, xq->lo_scale));
+            svfloat32_t scale_hi = svmul_f32_x(pg, weight_scale,
+                                               svld1(pg, xq->hi_scale));
+            svfloat32_t vals = svmul_f32_x(pg, svcvt_f32_s32_x(pg, dot_lo), scale_lo);
+            vals = svmla_x(pg, vals, svcvt_f32_s32_x(pg, dot_hi), scale_hi);
+            switch (s) {
+            case 0: acc0 = svadd_f32_x(pg, acc0, vals); break;
+            case 1: acc1 = svadd_f32_x(pg, acc1, vals); break;
+            case 2: acc2 = svadd_f32_x(pg, acc2, vals); break;
+            default: acc3 = svadd_f32_x(pg, acc3, vals); break;
+            }
+        }
+    }
+    svfloat32_t sum = svadd_f32_x(pg, svadd_f32_x(pg, acc0, acc1),
+                                     svadd_f32_x(pg, acc2, acc3));
+    svst1(p8, dst, svadd_f32_x(p8, svuzp1_f32(sum, sum),
+                                     svuzp2_f32(sum, sum)));
+}
+
+static inline void tf_nvfp4_packed_matvec_rows(float *dst, const qtensor *mat,
+                                                const float *x, int row_start,
+                                                int row_end) {
+    int nb = mat->n_cols / 64;
+    const tf_nvfp4_packed_block *w = (const tf_nvfp4_packed_block *)mat->data;
+    tf_nvfp4_packed_act *act = tf_nvfp4_packed_prepare(x, mat->n_cols);
+    if (!act || svcntb() != 64) {
+        fprintf(stderr, "nvfp4 packed: activation allocation or SVE width failed\n");
+        abort();
+    }
+    for (int i = row_start; i < row_end;) {
+        int tile = i / 8;
+        float values[8];
+        tf_nvfp4_packed_dot8(values, w + (size_t)tile * nb, act, nb);
+        int end = (tile + 1) * 8;
+        if (end > row_end) end = row_end;
+        for (; i < end; i++) dst[i] = values[i % 8];
+    }
+}
+
 static inline void tf_nvfp4_dot4_sve(float *o0, float *o1, float *o2, float *o3,
                                      const block_nvfp4 *b0, const block_nvfp4 *b1,
                                      const block_nvfp4 *b2, const block_nvfp4 *b3,
@@ -2152,6 +2282,11 @@ static void *tf_qmatvec_worker(void *arg) {
         return NULL;
     }
     if (t->mat->type == GGML_TYPE_NVFP4) {
+        if (t->mat->nvfp4_packed) {
+            tf_nvfp4_packed_matvec_rows(t->dst, t->mat, t->x,
+                                         t->row_start, t->row_end);
+            return NULL;
+        }
         size_t row_bytes = (size_t)(n_cols / 64) * sizeof(block_nvfp4);
         const uint8_t *base = (const uint8_t *)t->mat->data;
         int i = t->row_start;
@@ -3993,6 +4128,10 @@ static void tf_matvec_qtensor_rows(float *dst, const qtensor *mat, const float *
         for (int i = row_start; i < row_end; i++)
             dst[i] = tf_q4_k_dot_sve((const block_q4_K *)((const uint8_t *)base + (size_t)i * rb), x, n_cols);
     } else if (mat->type == GGML_TYPE_NVFP4) {
+        if (mat->nvfp4_packed) {
+            tf_nvfp4_packed_matvec_rows(dst, mat, x, row_start, row_end);
+            return;
+        }
         size_t rb = (size_t)(n_cols / 64) * sizeof(block_nvfp4);
         const uint8_t *base = (const uint8_t *)mat->data;
         int8_t *xq = NULL; float *xs = NULL;
@@ -4311,6 +4450,10 @@ static void tf_qmatvec(float *dst, const qtensor *mat, const float *x, int n_row
         return;
     }
     if (mat->type == GGML_TYPE_NVFP4) {
+        if (mat->nvfp4_packed) {
+            tf_nvfp4_packed_matvec_rows(dst, mat, x, 0, n_rows);
+            return;
+        }
         size_t row_bytes = (size_t)(n_cols / 64) * sizeof(block_nvfp4);
         const uint8_t *base = (const uint8_t *)mat->data;
         int i = 0;
