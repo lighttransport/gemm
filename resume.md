@@ -815,11 +815,12 @@ Remaining optimization items, in measured priority order:
    position-parallel draft attention and a
    cheaper draft-cache representation. K=7 already clears 60 tok/s, while
    K=4 remains below that target.
-4. Overlap sidecar cache injection with the next target prefill tile.  The
-   capture half is complete, and the hipBLASLt bridge now owns scratch lazily
-   per HIP stream (validated by a two-stream BF16 smoke test).  Add explicit
-   event dependencies and measure the overlap before enabling it; the serial
-   injection path remains the fallback.
+4. Measure the opt-in sidecar cache-injection overlap on resident gfx1201.
+   The capture half is complete, the hipBLASLt bridge owns scratch lazily per
+   HIP stream, and explicit target-ready/injection-done events protect feature
+   and KV reuse.  Fused K/V injection and mask broadcasting are additional
+   diagnostics; retain the serial injection path as the fallback until cache
+   hashes, HTTP/C++ quality, and throughput all prove a gain.
 5. Revisit dense NextN/MTP scheduling. The current exact implementation now
    improves the pinned 4K IQ2 coding fixture from 38.97 tok/s ordinary to
    47.87--47.93 tok/s, but remains below 60 tok/s and falls to 28.82 tok/s at
