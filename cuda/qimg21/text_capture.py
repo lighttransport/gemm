@@ -72,6 +72,8 @@ def capture_text_encoder(pipe, folder: Path, stage_layer: int = 0):
                 nonlocal rope_calls
                 q_out, k_out = original_vision_rope(q, k, cos, sin)
                 if rope_calls == min(stage_layer, len(visual.blocks) - 1):
+                    _save(folder / "vision_stage_rope_cos.npy", cos)
+                    _save(folder / "vision_stage_rope_sin.npy", sin)
                     _save(folder / "vision_stage_attn_q_rope.npy", q_out)
                     _save(folder / "vision_stage_attn_k_rope.npy", k_out)
                 rope_calls += 1

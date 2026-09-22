@@ -21,7 +21,7 @@ static const char *vision_front_src =
 "__global__ void layer_norm(float*y,const float*x,const float*w,const float*b,int d){int r=blockIdx.x,t=threadIdx.x,l=t&31,warp=t>>5;__shared__ float sm[12];LNStat s={0.f,0.f,0.f};int nv=d/4;for(int vi=t;vi<nv;vi+=256){int j=vi*4;s=ln_add(s,x[r*d+j]);s=ln_add(s,x[r*d+j+1]);s=ln_add(s,x[r*d+j+2]);s=ln_add(s,x[r*d+j+3]);}for(int off=16;off;off>>=1){LNStat q={__shfl_down_sync(0xffffffff,s.mean,off),__shfl_down_sync(0xffffffff,s.var,off),__shfl_down_sync(0xffffffff,s.count,off)};s=ln_combine(s,q);}for(int off=4;off;off>>=1){if(l==0&&warp>=off&&warp<2*off){int z=warp-off;sm[2*z]=s.mean;sm[2*z+1]=s.var;sm[8+z]=s.count;}__syncthreads();if(l==0&&warp<off){LNStat q={sm[2*warp],sm[2*warp+1],sm[8+warp]};s=ln_combine(s,q);}__syncthreads();}if(t==0){sm[0]=s.mean;sm[1]=s.var*__frcp_rn((float)d);}__syncthreads();float mean=sm[0],iv=rsqrtf(sm[1]+1e-6f);for(int j=t;j<d;j+=256)y[r*d+j]=rb(w[j]*(iv*(x[r*d+j]-mean))+b[j]);}\n"
 "__global__ void linear_epilogue(float*y,const float*x,const float*b,int d,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n*d)y[i]=rb(x[i]+b[i%d]);}\n"
 "__global__ void bf16_epilogue(float*y,const unsigned short*x,const float*b,int d,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n*d)y[i]=rb(__uint_as_float(((unsigned)x[i])<<16)+b[i%d]);}\n"
-"__global__ void vision_rope(float*qkv,int n,int gh,int gw){int t=blockIdx.x,h=blockIdx.y,j=threadIdx.x;if(t>=n||h>=16||j>=36)return;int ic=t%2,ir=(t/2)%2,bc=(t/4)%(gw/2),br=t/(4*(gw/2));int row=br*2+ir,col=bc*2+ic,coord=j<18?row:col,k=j%18;float inv=1.f/powf(10000.f,(float)(2*k)/36.f),a=coord*inv,c=cosf(a),s=sinf(a);for(int z=0;z<2;z++){int base=t*3456+z*1152+h*72;float u=qkv[base+j],v=qkv[base+j+36];qkv[base+j]=rb(u*c-v*s);qkv[base+j+36]=rb(v*c+u*s);}}\n"
+"__global__ void vision_rope(float*qkv,const float*table,int n,int gh,int gw){int t=blockIdx.x,h=blockIdx.y,j=threadIdx.x;if(t>=n||h>=16||j>=36)return;int ic=t%2,ir=(t/2)%2,bc=(t/4)%(gw/2),br=t/(4*(gw/2));int coord=j<18?br*2+ir:bc*2+ic,k=j%18;float c=table[(coord*18+k)*2],s=table[(coord*18+k)*2+1];for(int z=0;z<2;z++){int base=t*3456+z*1152+h*72;float u=qkv[base+j],v=qkv[base+j+36];qkv[base+j]=rb(__fadd_rn(__fmul_rn(u,c),__fmul_rn(-v,s)));qkv[base+j+36]=rb(__fadd_rn(__fmul_rn(v,c),__fmul_rn(u,s)));}}\n"
 "__global__ void vision_attn(float*o,const float*qkv,int n){int q=blockIdx.x,h=blockIdx.y,l=threadIdx.x;float qr[3]={0},acc[3]={0};for(int e=0;e<3;e++){int d=l+32*e;if(d<72)qr[e]=qkv[q*3456+h*72+d];}float mx=-1e30f;for(int k=0;k<n;k++){float z=0;for(int e=0;e<3;e++){int d=l+32*e;if(d<72)z+=qr[e]*qkv[k*3456+1152+h*72+d];}for(int s=16;s;s>>=1)z+=__shfl_xor_sync(0xffffffff,z,s);mx=fmaxf(mx,z*0.11785113019775793f);}float den=0;for(int k=0;k<n;k++){float z=0;for(int e=0;e<3;e++){int d=l+32*e;if(d<72)z+=qr[e]*qkv[k*3456+1152+h*72+d];}for(int s=16;s;s>>=1)z+=__shfl_xor_sync(0xffffffff,z,s);float p=expf(z*0.11785113019775793f-mx);den+=p;for(int e=0;e<3;e++){int d=l+32*e;if(d<72)acc[e]+=p*qkv[k*3456+2304+h*72+d];}}for(int e=0;e<3;e++){int d=l+32*e;if(d<72)o[q*1152+h*72+d]=rb(acc[e]/den);}}\n"
 "__global__ void residual(float*x,const float*y,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)x[i]=rb(x[i]+y[i]);}\n"
 "__global__ void gelu_tanh(float*x,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){float v=x[i],cube=__fmul_rn(__fmul_rn(v,v),v),inner=__fmul_rn(.7978845608028654f,__fadd_rn(v,__fmul_rn(.044715f,cube)));x[i]=rb(__fmul_rn(__fmul_rn(.5f,v),__fadd_rn(1.f,tanhf(inner))));}}\n"
@@ -234,10 +234,13 @@ int main(int argc, char **argv) {
                         "[--layer-norm nvcc|nvrtc] --out OUTPUT.npy\n", argv[0]);
         return 2;
     }
-    npy_f32 input = {0};
+    npy_f32 input = {0}, vision_rope_table = {0};
     if ((image ? load_vision_patches(image, &input, &h, &w) :
          npy_read_f32(pixels ? pixels : hidden, &input)) || input.ndim != 2 ||
-        input.shape[0] != (size_t)h * w || input.shape[1] != (size_t)((pixels || image) ? 1536 : 1152)) return 1;
+        input.shape[0] != (size_t)h * w || input.shape[1] != (size_t)((pixels || image) ? 1536 : 1152) ||
+        npy_read_f32("cuda/qimg21/qwen21_vision_rope.npy", &vision_rope_table) ||
+        vision_rope_table.ndim != 3 || vision_rope_table.shape[1] != 18 ||
+        vision_rope_table.shape[2] != 2 || vision_rope_table.shape[0] < (size_t)(h > w ? h : w)) return 1;
     qimg21_shards shards = {{0}, 0};
     char path[2048];
     for (int i = 1; i <= 4; i++) {
@@ -251,7 +254,7 @@ int main(int argc, char **argv) {
     CUfunction add_pos = NULL, layer_norm = NULL;
     CUfunction linear_epilogue = NULL, bf16_epilogue = NULL, vision_rope = NULL, vision_attn = NULL;
     CUfunction residual = NULL, gelu_tanh = NULL, gelu_exact = NULL;
-    CUdeviceptr x = 0, bf = 0, projected = 0, weight = 0, bias = 0, pos = 0;
+    CUdeviceptr x = 0, bf = 0, projected = 0, weight = 0, bias = 0, pos = 0, vision_rope_d = 0;
     CUdeviceptr norm = 0, qkv = 0, qkv_bf = 0, att = 0, tmp = 0, mlp = 0;
     void *cutlass_plugin = NULL;
     q21_cutlass_vision_attention_fn cutlass_attention = NULL;
@@ -268,7 +271,10 @@ int main(int argc, char **argv) {
                                              "qimg21_vision_front");
         if (!precise_math) unsetenv("CUDA_RUNNER_PRECISE_MATH");
     }
-    if (!r || vision_compile < 0 ||
+    vision_rope_d = checked_cuMemAlloc(vision_rope_table.n * sizeof(float));
+    if (!r || !vision_rope_d || cuMemcpyHtoD(vision_rope_d, vision_rope_table.data,
+                                              vision_rope_table.n * sizeof(float)) ||
+        vision_compile < 0 ||
         cuModuleGetFunction(&add_pos, module, "add_pos") ||
         cuModuleGetFunction(&layer_norm, module, "layer_norm") ||
         cuModuleGetFunction(&linear_epilogue, module, "linear_epilogue") ||
@@ -362,7 +368,7 @@ blocks_ready:
         snprintf(name, sizeof(name), "model.visual.blocks.%d.attn.qkv", block);
         if (vision_linear(r, linear_epilogue, &shards, name, qkv, norm, n, 3456, 1152)) goto done;
         if (block == block_index && dump_vision(dump_dir, "qkv", qkv, (size_t)n * 3456, n, 3456)) goto done;
-        void *rope_args[] = {&qkv, &n, &h, &w};
+        void *rope_args[] = {&qkv, &vision_rope_d, &n, &h, &w};
         if (cuLaunchKernel(vision_rope, n, 16, 1, 36, 1, 1, 0, r->stream, rope_args, NULL)) goto done;
         if (block == block_index && dump_vision(dump_dir, "qkv_rope", qkv,
                                                  (size_t)n * 3456, n, 3456)) goto done;
@@ -440,16 +446,16 @@ blocks_ready:
     rc = 0;
 done:
     free(host_pos); free(host_out);
-    free_d(&x); free_d(&bf); free_d(&projected); free_d(&weight); free_d(&bias); free_d(&pos);
+    free_d(&x); free_d(&bf); free_d(&projected); free_d(&weight); free_d(&bias); free_d(&pos); free_d(&vision_rope_d);
     free_d(&norm); free_d(&qkv); free_d(&qkv_bf); free_d(&att); free_d(&tmp); free_d(&mlp);
     if (cutlass_plugin) dlclose(cutlass_plugin);
     if (module) cuModuleUnload(module);
     if (r) cuda_qimg_free(r);
     for (int i = 0; i < shards.n; i++) safetensors_close(shards.st[i]);
-    npy_free(&input);
+    npy_free(&input); npy_free(&vision_rope_table);
     return rc;
 fail:
     for (int i = 0; i < shards.n; i++) safetensors_close(shards.st[i]);
-    npy_free(&input);
+    npy_free(&input); npy_free(&vision_rope_table);
     return 1;
 }

@@ -1256,9 +1256,10 @@ alternatives. Vision linears use BF16-output cuBLAS-LT bias epilogues, including
 the PyTorch-selected algo 21 tile/stage and split-K configurations for the
 256-token block shapes. LayerNorm uses PyTorch's vector-four, eight-warp
 Welford topology in the pinned NVCC plugin rather than NVRTC. Teacher-forced
-block 0 reaches cosine 0.999999578. Free-running errors still compound: blocks
-0/1/2 pass at 0.999997715/0.999984273/0.999970773, block 3 is the first miss
-at 0.999957891, and block 26 scores 0.999461003. The merger now uses the same
+block 0 reaches cosine 0.999999824. Vision RoPE uses a checked CUDA-generated
+cosine/sine artifact and separate multiply/add operations matching PyTorch;
+this raises the full block-26 cosine from 0.999461003 to 0.999691509. The
+recurrent result remains below the 0.99996 acceptance target. The merger uses the same
 pinned Welford implementation as the blocks. With the exact PyTorch block-26
 output injected, its local cosine is 0.999990332 and passes the 0.99996 gate;
 the accumulated full-run merger cosine remains 0.999079087, so the recurrent
@@ -1526,7 +1527,7 @@ for validation). The plugin build verifies all three revisions before
 compiling. Override `PYTORCH_SOURCE` or `FLASH_ATTN_SOURCE` when keeping the
 checkouts outside the repository-local `tmp/` directory.
 
-The generated transformer and text RoPE tables are also pinned byte-for-byte:
+The generated transformer, text, and vision RoPE tables are also pinned byte-for-byte:
 
 ```sh
 make -C cuda/qimg21 verify-generated-artifacts

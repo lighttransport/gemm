@@ -14,7 +14,7 @@ test_cuda_qimg21: test_cuda_qimg21.py
 
 native: test_cuda_qimg21_native test_cuda_qimg21_vae test_cuda_qimg21_vae_encode
 
-native-exact: test_cuda_qimg21_native libq21_cutlass_attention.so libq21_flash_attention.so qwen21_rope_freqs.npy qwen21_text_rope.npy
+native-exact: test_cuda_qimg21_native libq21_cutlass_attention.so libq21_flash_attention.so qwen21_rope_freqs.npy qwen21_text_rope.npy qwen21_vision_rope.npy
 
 native-text-exact: test_cuda_qimg21_text libq21_flash_attention.so qwen21_text_rope.npy
 
@@ -35,6 +35,9 @@ qwen21_rope_freqs.npy: export_rope_frequencies.py
 	$(PYTHON) $< --out $@
 
 qwen21_text_rope.npy: export_text_rope.py
+	$(PYTHON) $< --out $@
+
+qwen21_vision_rope.npy: export_vision_rope.py
 	$(PYTHON) $< --out $@
 
 test_cuda_qimg21_native: test_cuda_qimg21_native.c quant_weights.h edit_runtime.h edit_kernels.h mma64_kernels.h norm_vector_kernels.h rope_table_kernels.h joint_layout.h ../../cuda/cuew.c ../../cuda/cublasew.c
@@ -67,7 +70,7 @@ test_cuda_qimg21_text: test_cuda_qimg21_text.c qwen_tokenizer_json.h text_kernel
 	$(CC) -O2 -std=c11 -D_GNU_SOURCE -Wall -Wextra -I../../common -I../../cuda -I../qimg \
 		-o $@ test_cuda_qimg21_text.c ../../cuda/cuew.c ../../cuda/cublasew.c -ldl -lm -lpthread
 
-test_cuda_qimg21_vision: test_cuda_qimg21_vision.c test_cuda_qimg21_native.c quant_weights.h libq21_cutlass_attention.so libq21_flash_attention.so ../../common/stb_image.h ../../cuda/cuew.c ../../cuda/cublasew.c
+test_cuda_qimg21_vision: test_cuda_qimg21_vision.c test_cuda_qimg21_native.c quant_weights.h libq21_cutlass_attention.so libq21_flash_attention.so qwen21_vision_rope.npy ../../common/stb_image.h ../../cuda/cuew.c ../../cuda/cublasew.c
 	$(CC) -O2 -std=c11 -D_GNU_SOURCE -Wall -Wextra -I../../common -I../../cuda -I../qimg \
 		-o $@ test_cuda_qimg21_vision.c ../../cuda/cuew.c ../../cuda/cublasew.c -ldl -lm -lpthread
 
@@ -109,7 +112,7 @@ verify-exact-sources:
 	PYTORCH_SOURCE=$(abspath $(PYTORCH_SOURCE)) FLASH_ATTN_SOURCE=$(abspath $(FLASH_ATTN_SOURCE)) \
 		./setup_exact_sources.sh --verify
 
-verify-generated-artifacts: qwen21_rope_freqs.npy qwen21_text_rope.npy
+verify-generated-artifacts: qwen21_rope_freqs.npy qwen21_text_rope.npy qwen21_vision_rope.npy
 	sha256sum -c generated-artifacts.sha256
 
 generate: test_cuda_qimg21
@@ -129,4 +132,4 @@ regress:
 	$(PYTHON) regression.py --model /mnt/nvme01/models/qimg-21
 
 clean:
-	rm -f test_cuda_qimg21 test_cuda_qimg21_native test_cuda_qimg21_vae test_cuda_qimg21_vae_encode test_cuda_qimg21_text test_cuda_qimg21_vision test_weight_upload test_quant_weights test_joint_layout test_edit_kernels test_scheduler libq21_cutlass_attention.so libq21_flash_attention.so qwen21_rope_freqs.npy qwen21_text_rope.npy qwen_image21.png
+	rm -f test_cuda_qimg21 test_cuda_qimg21_native test_cuda_qimg21_vae test_cuda_qimg21_vae_encode test_cuda_qimg21_text test_cuda_qimg21_vision test_weight_upload test_quant_weights test_joint_layout test_edit_kernels test_scheduler libq21_cutlass_attention.so libq21_flash_attention.so qwen21_rope_freqs.npy qwen21_text_rope.npy qwen21_vision_rope.npy qwen_image21.png
