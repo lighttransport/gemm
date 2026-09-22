@@ -1304,7 +1304,9 @@ outputs makes the complete block bit-identical. The native diagnostic accepts
 Testing unfused online/combine arithmetic, native BF16 conversion, PyTorch's
 2D thread indexing, O2 compilation, and CUDA 12.9 code generation did not improve
 the full recurrence, so the accepted kernel retains the literal pinned
-PyTorch Welford expressions.
+PyTorch Welford expressions. Recompiling with the wheel's recorded CUDA 13.0
+flags (`-O2`, C++20, extended lambdas, and the half/BF16 conversion-disable
+macros) leaves the same four block-1 Norm1 output differences.
 
 For boundary isolation, `--norm1-override NORM.npy` replaces the first
 executed block's computed normalization output after still running the native
