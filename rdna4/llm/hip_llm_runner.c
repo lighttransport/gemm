@@ -9264,6 +9264,43 @@ static const char *hip_kernel_source =
 "    }\n"
 "    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o); if(lane==0)dst[(size_t)token*n_rows+row]=sum;\n"
 "}\n"
+"/* One-token IQ1_S gate + IQ1_M up projections over the shared Q8_1 input.\n"
+" * The two matrices have different block layouts, so each warp keeps an\n"
+" * independent accumulator for each output while retaining the standalone\n"
+" * IQ1 affine/codebook arithmetic and reduction order. */\n"
+"__global__ void ffn_gate_up_iq1s_m_q81(float *gdst,float *udst,\n"
+"        const unsigned char *gmat,const unsigned char *umat,\n"
+"        const signed char *q,const float *sd,const float *ss,\n"
+"        int n_rows,int n_cols){\n"
+"    int lane=threadIdx.x&31,warp=threadIdx.x>>5,row=blockIdx.x*8+warp;\n"
+"    if(row>=n_rows)return;\n"
+"    int nb=n_cols/256,gs=nb*8,gm=nb*32;float gsum=0.0f,usum=0.0f;\n"
+"    const unsigned char *gr=gmat+(size_t)row*nb*50;\n"
+"    for(int qb=lane;qb<gs;qb+=32){int b=qb>>3,ib=qb&7;const unsigned char *bp=gr+b*50;\n"
+"        const unsigned short *qh=(const unsigned short*)(bp+34);const unsigned char *qs=bp+2;\n"
+"        float dw=half_to_float(*(const half_raw*)bp)*(float)(2*((qh[ib]>>12)&7)+1);\n"
+"        float delta=(qh[ib]&0x8000)?(-1.0f-0.125f):(-1.0f+0.125f);\n"
+"        const signed char *xp=q+(size_t)qb*32;int z=0;\n"
+"        for(int l=0;l<4;++l){int gi=qs[ib*4+l]|(((qh[ib]>>(3*l))&7)<<8);unsigned int grid=iq1s_grid_gpu_dev[gi];\n"
+"            int w0=(int)(grid&0x0f0f0f0fu),w1=(int)((grid>>4)&0x0f0f0f0fu);const int *u=(const int*)(xp+l*8);\n"
+"            z=dp4a_hw(w0,u[0],z);z=dp4a_hw(w1,u[1],z);}\n"
+"        gsum+=dw*(sd[qb]*(float)z+ss[qb]*delta);\n"
+"    }\n"
+"    const unsigned char *ur=umat+(size_t)row*nb*56;\n"
+"    for(int g=lane;g<gm;g+=32){int b=g>>5,rem=g&31,ib=rem>>2,l=rem&3,qb=b*8+ib;const unsigned char *bp=ur+b*56;\n"
+"        const unsigned char *qs=bp,*qh=bp+32;const unsigned short *sc=(const unsigned short*)(bp+48);\n"
+"        unsigned short su=(sc[0]>>12)|((sc[1]>>8)&0x00f0u)|((sc[2]>>4)&0x0f00u)|(sc[3]&0xf000u);\n"
+"        float base=half_to_float(*(const half_raw*)&su);unsigned short sw=sc[ib/2];int sh=6*(ib%2);\n"
+"        int scode=2*((sw>>(sh+(l>=2?3:0)))&7)+1;unsigned char hv=qh[2*ib+(l>>1)];int qshift=(l&1)?4:8;\n"
+"        unsigned short gi=qs[4*ib+l]|((unsigned short)(hv<<qshift)&0x700u);\n"
+"        float delta=(hv&((l&1)?0x80:0x08))?(-1.0f-0.125f):(-1.0f+0.125f);unsigned int grid=iq1s_grid_gpu_dev[gi];\n"
+"        int w0=(int)(grid&0x0f0f0f0fu),w1=(int)((grid>>4)&0x0f0f0f0fu);const int *u=(const int*)(q+(size_t)qb*32+l*8);\n"
+"        int z=dp4a_hw(w0,u[0],0);z=dp4a_hw(w1,u[1],z);int qsum=dp4a_hw(0x01010101,u[0],0);qsum=dp4a_hw(0x01010101,u[1],qsum);\n"
+"        usum+=base*(float)scode*sd[qb]*((float)z+delta*(float)qsum);\n"
+"    }\n"
+"    for(int o=16;o>0;o>>=1){gsum+=__shfl_down(gsum,o);usum+=__shfl_down(usum,o);}\n"
+"    if(lane==0){gdst[row]=gsum;udst[row]=usum;}\n"
+"}\n"
 "/* Exact Q8_1 IQ1_M verification with the same per-row accumulation order as\n"
 " * matvec_iq1_m_q81_batch and one shared weight decode for up to eight rows. */\n"
 "__global__ void matvec_iq1_m_q81_reuse8(float *dst,const unsigned char *mat,\n"
@@ -13497,6 +13534,7 @@ struct hip_llm_runner {
     hipFunction_t fn_matvec_iq1_s_q81_reuse8;
     hipFunction_t fn_matvec_iq1_s_mmq_scales;
     hipFunction_t fn_matvec_iq1_s_dp4a2_batch_reuse4;
+    hipFunction_t fn_ffn_gate_up_iq1s_m_q81;
     hipFunction_t fn_matvec_iq1_m_f32;
     hipFunction_t fn_matvec_iq1_m_batch_f32;
     hipFunction_t fn_matvec_iq1_m_dp4a2_batch;
@@ -14514,6 +14552,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(matvec_iq1_s_q81_batch);
     GET_FUNC(matvec_iq1_s_q81_reuse8);
     GET_FUNC(matvec_iq1_s_mmq_scales);
+    GET_FUNC(ffn_gate_up_iq1s_m_q81);
     GET_FUNC(matvec_iq1_m_q81_batch);
     GET_FUNC(matvec_iq1_m_q81_reuse8);
     GET_FUNC(matvec_iq2_xs_q81_batch);
@@ -22081,6 +22120,50 @@ static inline int launch_iq1_q81_scalar(hip_llm_runner *r, hipFunction_t fn,
            threads, 1, 1, 0, r->stream, args);
     return 1;
 }
+
+/* Optional dense FFN IQ1_S/IQ1_M gate/up fusion.  Keep the same role-level
+ * Q8_1 gates as launch_matvec_ffn_auto and leave MMQ scale variants on the
+ * standalone path until a resident parity run covers both contracts. */
+static inline int launch_iq1_gateup_q81_fused(hip_llm_runner *r,
+        void *gate, void *up, void *gate_w, void *up_w, void *x,
+        int rows, int n_cols) {
+    const char *fuse = getenv("LLM_QWEN35_IQ1_GATEUP_FUSED");
+    if (!fuse || atoi(fuse) == 0 || !r->fn_ffn_gate_up_iq1s_m_q81 ||
+        rows < 1 || n_cols > 17408 || (n_cols % 256) != 0)
+        return 0;
+    const char *all = getenv("LLM_QWEN35_FFN_IQ1_Q81");
+    const char *ge = getenv("LLM_QWEN35_FFN_GATE_IQ1_Q81");
+    const char *ue = getenv("LLM_QWEN35_FFN_UP_IQ1_Q81");
+    int gate_q81 = ge ? atoi(ge) : (all && atoi(all) != 0);
+    int up_q81 = ue ? atoi(ue) : (all && atoi(all) != 0);
+    const char *gm = getenv("LLM_QWEN35_FFN_GATE_IQ1_MMQ");
+    const char *um = getenv("LLM_QWEN35_FFN_UP_IQ1_MMQ");
+    if (!gate_q81 || !up_q81 || (gm && atoi(gm) != 0) ||
+        (um && atoi(um) != 0))
+        return 0;
+    const char *max_env = getenv("LLM_QWEN35_FFN_IQ1_Q81_MAX_LAYER");
+    if (max_env && *max_env &&
+        (r->active_layer < 0 || r->active_layer > atoi(max_env)))
+        return 0;
+    int one = 1, stride = n_cols;
+    int reuse = r->q8x2_reuse_active && r->iq1_q8_valid &&
+                r->iq1_q8_source == x && r->iq1_q8_n == n_cols;
+    if (!reuse) {
+        void *qa[] = { &r->d_act_q8, &r->d_act_scale, &r->d_act_scale_b,
+                       &x, &n_cols, &one, &stride };
+        LAUNCH(r->fn_quantize_q81_iq1_batch_32_exact, n_cols / 32, 1, 1,
+               32, 1, 1, 0, r->stream, qa);
+        r->iq1_q8_source = x;
+        r->iq1_q8_n = n_cols;
+        r->iq1_q8_valid = r->q8x2_reuse_active;
+    }
+    void *a[] = { &gate, &up, &gate_w, &up_w, &r->d_act_q8,
+                  &r->d_act_scale, &r->d_act_scale_b, &rows, &n_cols };
+    LAUNCH(r->fn_ffn_gate_up_iq1s_m_q81, (rows + 7) / 8, 1, 1,
+           256, 1, 1, 0, r->stream, a);
+    return 1;
+}
+
 static inline void launch_matvec_iq1_s(hip_llm_runner *r, void *dst, void *mat,
                                        void *x, int n_rows, int n_cols) {
     const char *mmq_env = getenv("LLM_IQ1S_MMQ_SCALES");
@@ -29277,7 +29360,16 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
                         r, r->d_gate, r->d_up, cl->ffn_gate_w,
                         cl->ffn_up_w, r->d_xb, cl->ffn_gate_rows,
                         cl->ffn_gate_cols);
-                if (!fused_iq3_gateup) {
+                int fused_iq1_gateup = !fused_iq3_gateup &&
+                    cl->ffn_gate_type == GGML_TYPE_IQ1_S &&
+                    cl->ffn_up_type == GGML_TYPE_IQ1_M &&
+                    cl->ffn_gate_rows == cl->ffn_up_rows &&
+                    cl->ffn_gate_cols == cl->ffn_up_cols &&
+                    launch_iq1_gateup_q81_fused(
+                        r, r->d_gate, r->d_up, cl->ffn_gate_w,
+                        cl->ffn_up_w, r->d_xb, cl->ffn_gate_rows,
+                        cl->ffn_gate_cols);
+                if (!fused_iq3_gateup && !fused_iq1_gateup) {
                     begin_q8x2_reuse(r);
                     launch_matvec_ffn_auto(r, r->d_gate, cl->ffn_gate_w, r->d_xb,
                                           cl->ffn_gate_rows, cl->ffn_gate_cols,

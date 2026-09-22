@@ -101,6 +101,13 @@ disabled, so both one-token projections share codebook staging and one launch
 while retaining the standalone row arithmetic. This remains opt-in pending
 resident hash, quality, and throughput checks.
 
+The IQ2_XS target's usual IQ1_S gate/IQ1_M up pair has a corresponding
+`LLM_QWEN35_IQ1_GATEUP_FUSED=1` candidate. It shares the exact Q8_1 activation
+and dispatches both differing IQ1 layouts in one warp-per-row kernel. The
+candidate requires both role-level IQ1 Q8_1 switches, leaves MMQ overrides on
+the standalone path, and remains opt-in pending resident parity and 64K
+throughput measurements.
+
 ## DFlash2 long-window split retune (2026-09-22)
 
 The sidecar attention launch now uses twelve partitions once its 2,048-token

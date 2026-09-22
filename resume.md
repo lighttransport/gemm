@@ -135,6 +135,13 @@ output ranges while retaining the existing per-row dot and reduction order.
 The production path remains on the three-launch dispatch until a resident
 gfx1201 run proves identical 4K/64K hashes and a sustained projection win.
 
+For the IQ2_XS target's common IQ1_S gate/IQ1_M up pair, dense FFN decode also
+has an opt-in `LLM_QWEN35_IQ1_GATEUP_FUSED=1` Q8_1 kernel. It shares the
+quantized activation and one launch while keeping each IQ1 layout, affine
+correction, and warp reduction separate. The candidate is enabled only when
+both role-level IQ1 Q8_1 switches are already active and MMQ scale overrides
+are absent; all defaults and the validated MMQ path remain unchanged.
+
 The same native kernel now has an opt-in
 `LLM_QWEN35_IQ3_GATEUP_FUSED=1` gate/up form for dense FFN layers where both
 projections are IQ3_XXS with matching shapes. It covers the two output ranges
