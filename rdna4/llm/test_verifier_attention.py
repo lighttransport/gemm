@@ -62,16 +62,20 @@ int main() {
     hipEvent_t begin, end; HIP(hipEventCreate(&begin)); HIP(hipEventCreate(&end));
     int cases=0;
     for (int depth: {4096,16384,65536})
-    for (int rows: {4,8,16}) {
+    for (int rows: {4,5,8,16}) {
         std::vector<int> pos(rows);
         for (int i=0;i<rows;++i) pos[i]=depth+i;
         positions.upload(pos);
         std::vector<float> reference(size_t(rows)*heads*256), actual(reference.size());
         for (int mode=0;mode<3;++mode) {
-            if (mode==2 && rows!=8) continue;
+            if (mode==2 && rows!=5 && rows!=8) continue;
             auto launch = [&]() {
                 if (mode==2) {
-                    qwen35_attention_q8_decode_reuse_fixed8<<<dim3(1,splits,heads),dim3(32,4)>>>(
+                    if (rows==5)
+                        qwen35_attention_q8_decode_reuse_fixed5<<<dim3(1,splits,heads),dim3(32,4)>>>(
+                            out.p,parts.p,meta.p,q.p,k.p,v.p,ks.p,vs.p,positions.p,
+                            heads,kvheads,props.multiProcessorCount,11,0,rows,-1);
+                    else qwen35_attention_q8_decode_reuse_fixed8<<<dim3(1,splits,heads),dim3(32,4)>>>(
                         out.p,parts.p,meta.p,q.p,k.p,v.p,ks.p,vs.p,positions.p,
                         heads,kvheads,props.multiProcessorCount,11,0,rows,-1);
                     qwen35_attention_q8_combine_gate<<<dim3(heads,rows),256,splits*2*sizeof(float)>>>(
@@ -91,7 +95,7 @@ int main() {
                     else if (rows==4)
                         qwen35_attention_q8_combine_verify4_gate<<<heads,256>>>(
                             out.p,parts.p,meta.p,gate.p,positions.p,heads,props.multiProcessorCount,11,0,rows);
-                    else if (rows==8)
+                    else if (rows<=8)
                         qwen35_attention_q8_combine_verify8_gate<<<heads,256>>>(
                             out.p,parts.p,meta.p,gate.p,positions.p,heads,props.multiProcessorCount,11,0,rows);
                     else

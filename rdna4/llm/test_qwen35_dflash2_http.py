@@ -295,6 +295,8 @@ def main():
     sidecars.add_argument("--sidecar", help="DFlash2 GGUF")
     sidecars.add_argument("--mtp", help="dense NextN GGUF")
     parser.add_argument("--runner", default="./rdna4/llm/test_hip_llm")
+    parser.add_argument("--dflash2-draft", type=int, choices=(4, 7), default=7,
+                        help="DFlash2 proposal count for K=4/K=7 regression coverage")
     parser.add_argument("--port", type=int, default=18090)
     parser.add_argument("--context", type=int, default=512)
     parser.add_argument("--snapshot-max-tokens", type=int, default=0)
@@ -308,7 +310,7 @@ def main():
         qwen4_exact=False, qwen4_mtp=None, qwen35_mtp=args.mtp,
         qwen35_mtp_draft=3, qwen35_mtp_window=bool(args.mtp),
         qwen35_server_profile=False, qwen35_dflash2=args.sidecar,
-        qwen35_dflash2_draft=7,
+        qwen35_dflash2_draft=args.dflash2_draft,
         qwen35_snapshot_max_tokens=args.snapshot_max_tokens,
         context_cache_entries=2, context_cache_max_mib=2048,
     )

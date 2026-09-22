@@ -1,5 +1,62 @@
 # Qwen3.8 DFlash2 on RDNA4
 
+## Five-query verifier and broader coding quality (2026-09-22)
+
+Full K=4 verifier windows now use a fixed-five-query Q8/Q8 attention kernel
+(anchor plus four proposals) when their adaptive split counts agree.
+`LLM_QWEN35_VERIFY_ATTN_FIXED5=0` is the diagnostic opt-out. The generic and
+fixed-eight kernel bodies are unchanged; short windows and split-count
+boundaries retain their fallback. Prefill dispatch is unchanged.
+
+A/B on a 16173-token C++ binary-search prompt, IQ2_XS, Q8/Q8, chunk 512,
+K=4, seed 42, two repeats per configuration:
+
+| Sampling | Previous default decode | Fixed-five decode |
+| --- | ---: | ---: |
+| Greedy (128 tokens) | 55.56 / 55.91 | 56.51 / 56.68 |
+| Temperature 0.8 (124 tokens) | 48.58 / 48.91 | 49.52 / 49.79 |
+
+Rates are tok/s. All eight answers preserve control token hashes and bytes:
+greedy `41b94b5f8a941e8d`, sampled `3dcbfc4759dbed36`. Prefill measured
+590–615 tok/s across these runs; this change does not select a new prefill path.
+
+The prompt requests C++17 `lower_index(const std::vector<int>&, int)`, an
+explicit overflow-safe binary search, including empty arrays, duplicates,
+and integer extremes. `test_cpp_lower_bound_output.py` compiles each distinct
+answer separately from its driver, then checks 30000 boundary/random cases
+against `std::lower_bound` with ASan/UBSan. Both runner implementations and
+the pinned llama.cpp reference implementation pass. The greedy reference
+answer is **not byte-identical** on this broader 16K workload: it adds an
+explicit empty-array check, an extra header, and whitespace. This is correct
+code, but cross-engine byte parity remains an open quality target; the new
+specialization has exact parity with the prior runner. Uncaptured target-only
+decode also matches the DFlash answer (128 tokens, same hash, 37.92 tok/s).
+A separate captured target-only run emitted a corrupted eight-token answer;
+its short-position host guard skips attention combine during graph capture.
+Repair and validate that capture guard next; do not use the failed run as a
+quality-valid performance result.
+
+Validation: 30 direct GPU comparisons at 4K/16K/64K are bit-identical;
+756 CPU dispatch cases pass; runner build and profile checks pass.
+The HTTP harness now accepts `--dflash2-draft 4` or `7` (default 7).
+The K=4 run with context 8192, snapshot limit 4096 and cached prompt 3072
+passes stdio, HTTP, cached-prefix, cancellation, concurrency, sampled
+repeatability, and multi-turn C++ compile/run coverage. At 64K/five rows,
+the integrated kernel probe measured 3.086 ms generic versus 2.627 ms fixed.
+This is a kernel result: normal DFlash still falls back to target-only at 32K.
+
+Reproduction artifacts in `rdna4/llm/tmp/`: `attention-fixed5-quality.sh`,
+`lower-bound-long-prompt.txt`, `attention-fixed5-{integrated,quality,http}.log`,
+per-configuration `attention-fixed5-16k-*.log`, and `lower-bound-llama.log`.
+Run the new checker on these generation logs. The quality script explicitly
+sets control/candidate selection, so it remains usable after promotion.
+
+Remaining: fix captured target-only attention combine, then isolate the first
+long-context llama.cpp/runner logit divergence;
+expand coding-task coverage; investigate a useful injection overlap interval
+before changing its default. Keep ordinary 40+ tok/s target-only optimization
+outside this goal batch. Slower fusion/projection probes remain opt-in.
+
 ## Eight-query verifier attention follow-up (2026-09-22)
 
 The default verifier now uses a fixed-eight-query Q8/Q8 split kernel when

@@ -24,12 +24,13 @@ struct hip_llm_runner {
 static hip_llm_runner runner;
 static void *expected_gate, *expected_positions;
 static int expected_queries, expected_width, calls;
-static bool expected_specialized, expected_reuse;
+static bool expected_specialized, expected_specialized5, expected_reuse;
 static void record(int fn, int gx, int gy, int, int bx, int, int,
                    size_t, int, void **args) {
     if (fn < 100) {
         assert(fn == (!expected_reuse ? 1 :
                       expected_queries == 8 && expected_specialized ? 3 :
+                      expected_queries == 5 && expected_specialized5 ? 4 :
                       expected_queries <= 8 ? 2 : 1));
         return;
     }
@@ -58,6 +59,7 @@ int main() {
     runner.fn_q8_attention_decode = 1;
     runner.fn_q8_attention_decode_reuse8 = 2;
     runner.fn_q8_attention_decode_reuse_fixed8 = 3;
+    runner.fn_q8_attention_decode_reuse_fixed5 = 4;
     runner.fn_q8_attention_combine_gate = 301;
     runner.fn_q8_attention_combine = 302;
     runner.fn_q8_attention_combine_verify4_gate = 104;
@@ -70,10 +72,14 @@ int main() {
     expected_positions = &positions;
     int cases = 0;
     for (int mode : {1, 2, 3})
-    for (int queries : {2, 4, 7, 8, 9, 16})
+    for (int queries : {2, 4, 5, 7, 8, 9, 16})
     for (bool gated : {false, true})
     for (int specialization : {-1, 0, 1})
+    for (int specialization5 : {-1, 0, 1})
     for (bool reuse : {false, true}) {
+        expected_specialized5 = specialization5 != 0;
+        if (specialization5 < 0) unsetenv("LLM_QWEN35_VERIFY_ATTN_FIXED5");
+        else setenv("LLM_QWEN35_VERIFY_ATTN_FIXED5", specialization5 ? "1" : "0", 1);
         expected_reuse = reuse;
         expected_specialized = specialization != 0;
         if (specialization < 0) unsetenv("LLM_QWEN35_VERIFY_ATTN_FIXED8");
