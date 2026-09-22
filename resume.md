@@ -192,6 +192,17 @@ arithmetic are unchanged; the captured generic combine path is untouched.
 Host build and gfx1201 HIP syntax checks pass. Resident hash and timing A/B
 results remain pending because this environment has no `/dev/kfd` device.
 
+## 2026-09-22 continuation: DFlash K=4 four-row projection candidate
+
+K=4 DFlash2 selector/output projections have four rows after the anchor is
+removed, but the generic Q4_K/Q8_1 sidecar kernel kept eight accumulators live.
+An opt-in `LLM_QWEN35_DFLASH_Q4K_MULTI4=1` kernel specializes that exact
+arithmetic to four rows, preserving weight decode, affine correction, output
+layout, and warp reduction order. The existing five-row K=4 proposal kernel,
+K=7 path, and serving defaults are unchanged. Host build, profile tests, and
+gfx1201 HIP syntax checks pass; resident hash and draft-time A/B validation is
+still required.
+
 ## 2026-09-22 continuation: opt-in parallel DFlash2 selector
 
 The DFlash2 selector now has an opt-in

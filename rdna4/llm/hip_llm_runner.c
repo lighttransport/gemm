@@ -14077,6 +14077,7 @@ struct hip_llm_runner {
     size_t q8_prefill_capacity;
     hipModule_t q2k_module;
     hipFunction_t fn_qwen35_quantize_q81, fn_qwen35_matvec_q2k;
+    hipFunction_t fn_qwen35_matvec_q4k_q81_multi4;
     hipFunction_t fn_qwen35_matvec_q4k_q81_multi5;
     hipFunction_t fn_qwen35_matvec_q4k_q81_multi8;
     hipFunction_t fn_qwen35_matvec_q4k_q81_qkv;
@@ -17953,6 +17954,8 @@ int hip_llm_load_weights_sharded(hip_llm_runner *r, gguf_shards *model,
                       r->q2k_module, "qwen35_matvec_q2k_fixed8"));
             CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_q4k_q81_multi5,
                       r->q2k_module, "qwen35_matvec_q4k_q81_multi5"));
+            CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_q4k_q81_multi4,
+                      r->q2k_module, "qwen35_matvec_q4k_q81_multi4"));
             CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_q4k_q81_multi8,
                       r->q2k_module, "qwen35_matvec_q4k_q81_multi8"));
             CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_q4k_q81_qkv,

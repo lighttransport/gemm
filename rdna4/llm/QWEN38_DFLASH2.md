@@ -197,6 +197,15 @@ accumulation, or output bytes. The generic captured combine ABI and production
 defaults remain unchanged; resident-device hash and timing validation is still
 required before enabling either candidate.
 
+## K=4 four-row Q4_K projection candidate
+
+After the anchor row is removed, K=4 selector/output projections consume four
+rows. `LLM_QWEN35_DFLASH_Q4K_MULTI4=1` selects a four-row Q4_K/Q8_1 kernel that
+keeps the multi8 dot, affine correction, output layout, and warp reduction
+order while dropping the four unused accumulators. The five-row proposal
+projection and K=7 path retain their existing kernels, and the default remains
+unchanged pending resident K=4 hash and draft-time measurements.
+
 The opt-in cache-injection overlap path now consumes captured feature rows
 directly after the target-ready event, eliminating a redundant device copy.
 Sidecar `x`/norm/K/V workspaces remain stream-private, and the inject-done

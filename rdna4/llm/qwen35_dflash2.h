@@ -232,6 +232,7 @@ static void hllm_dflash_project(hip_llm_runner *r, void *dst, void *weight,
     int q4_q81=type==GGML_TYPE_Q4_K && rows>1 &&
         rows<=HLLM_DFLASH_MAX_BLOCK && stride==nc && nc%256==0 &&
         r->fn_qwen35_quantize_q81 && r->fn_qwen35_matvec_q4k_q81_multi8 &&
+        (rows != 4 || r->fn_qwen35_matvec_q4k_q81_multi4) &&
         (rows != 5 || r->fn_qwen35_matvec_q4k_q81_multi5);
     if(!q4_q81)d->q81_source=NULL;
     if (type == GGML_TYPE_Q2_K && rows > 1 &&
@@ -269,8 +270,13 @@ static void hllm_dflash_project(hip_llm_runner *r, void *dst, void *weight,
         }
         void *ma[]={&dst,&weight,&r->d_act_q8_batch,
                     &r->d_act_scale_batch,&nr,&nc,&rows};
-        hipFunction_t q4_fn = rows == 5 ? r->fn_qwen35_matvec_q4k_q81_multi5 :
-                                          r->fn_qwen35_matvec_q4k_q81_multi8;
+        hipFunction_t q4_fn = r->fn_qwen35_matvec_q4k_q81_multi8;
+        const char *multi4_env = getenv("LLM_QWEN35_DFLASH_Q4K_MULTI4");
+        if (rows == 4 && multi4_env && atoi(multi4_env) != 0 &&
+            r->fn_qwen35_matvec_q4k_q81_multi4)
+            q4_fn = r->fn_qwen35_matvec_q4k_q81_multi4;
+        else if (rows == 5 && r->fn_qwen35_matvec_q4k_q81_multi5)
+            q4_fn = r->fn_qwen35_matvec_q4k_q81_multi5;
         LAUNCH(q4_fn,(nr+7)/8,1,1,
                256,1,1,0,r->stream,ma);
     } else if (type == GGML_TYPE_Q4_K && rows > 1) {
