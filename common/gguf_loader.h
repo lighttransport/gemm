@@ -252,7 +252,7 @@ static const struct { int block_size; int type_size; } ggml_type_info[] = {
     [GGML_TYPE_Q1_0]    = {128, 18},
 };
 
-static const char *gguf_type_name(uint32_t type) {
+static inline const char *gguf_type_name(uint32_t type) {
     static const char *names[] = {
         "uint8","int8","uint16","int16","uint32","int32","float32",
         "bool","string","array","uint64","int64","float64"
@@ -261,7 +261,7 @@ static const char *gguf_type_name(uint32_t type) {
     return "unknown";
 }
 
-static const char *ggml_type_name(uint32_t type) {
+static inline const char *ggml_type_name(uint32_t type) {
     static const char *names[GGML_TYPE_COUNT] = {
         [GGML_TYPE_F32] = "F32", [GGML_TYPE_F16] = "F16",
         [GGML_TYPE_Q4_0] = "Q4_0", [GGML_TYPE_Q4_1] = "Q4_1",
@@ -634,7 +634,8 @@ gguf_context *gguf_open_multi(const char *path, int use_mmap) {
         return gguf_open(path, use_mmap);
     int idx_width = (int)(of - idx_dash);
     int total_width = (int)(endp - tot_begin);
-    if (idx_width < 1 || total_width < 1 || total > 10000)
+    if (idx_width < 1 || idx_width > 32 || total_width < 1 || total_width > 32 ||
+        total > 10000)
         return gguf_open(path, use_mmap);
 
     size_t dir_len = (size_t)(base - path);

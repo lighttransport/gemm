@@ -91,7 +91,7 @@ static size_t glm5_bpe_utf8_len(unsigned char c) {
     return c < 0x80 ? 1 : (c < 0xe0 ? 2 : (c < 0xf0 ? 3 : 4));
 }
 
-static int glm5_bpe_decode_token(const glm5_bpe *b, int id, char *out, size_t cap) {
+static inline int glm5_bpe_decode_token(const glm5_bpe *b, int id, char *out, size_t cap) {
     const char *text = NULL; size_t pos = 0;
     if (!b || !out || cap == 0) return -1;
     for (size_t i = 0; i < b->n_vocab; ++i) if (b->vocab[i].id == id) { text = b->vocab[i].text; break; }
@@ -154,7 +154,7 @@ static int glm5_bpe_load(const char *path, glm5_bpe *b) {
  * and recognizes GLM5 role/special tokens as atomic vocab entries. It is
  * intentionally conservative for Unicode pre-tokenization; unknown pieces
  * are emitted as their individual byte-level vocab symbols. */
-static int glm5_bpe_encode(const glm5_bpe *b,const char *text,int *out,int cap) {
+static inline int glm5_bpe_encode(const glm5_bpe *b,const char *text,int *out,int cap) {
     int n=0; const char *p=text; char piece[4096], bu[8192];
     while(*p){
         const char *specials[]={"[gMASK]","<sop>","<|system|>","<|user|>","<|assistant|>","<|observation|>","<|im_start|>","<|im_end|>","<think>","</think>","<|endoftext|>",NULL}; int sid[]={b->gmask,b->sop,b->system,b->user,b->assistant,b->observation,b->im_start,b->im_end,b->think,b->end_think,b->endoftext};int found=-1;
