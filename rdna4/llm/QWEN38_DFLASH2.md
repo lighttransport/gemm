@@ -1528,6 +1528,17 @@ retain the scalar I/O fallback.
    synchronizes the target stream so completion is host-visible before
    synchronous restore copies.
 
+   A resident A/B rerun on gfx1201 with the 4K/512 Q8/Q8 coding fixture
+   measured K=4 control at 56.25--58.09 tok/s (draft 85.8--86.5 ms), the
+   opt-in selector-fused projection at 56.57--58.26 tok/s, and the opt-in
+   overlap injector at 55.46--57.76 tok/s. All three produced the exact
+   `15f17d2640c1adfc` sequence hash; the selector result is noise-level and
+   overlap is slower, so neither changes the serving default. K=7 measured
+   83.65--88.14 tok/s with 68.9--70.0 ms draft time, confirming the remaining
+   K=4 gap is draft-side work. The existing `fast` target profile also
+   segfaulted during graph setup with the GSQ IQ2 model and remains an
+   unsupported diagnostic combination pending isolation.
+
 Each optimization should retain the exact sequence hash and response bytes at
 K=4 and K=7, compile the emitted program, and cover non-coding prompts plus
 random-token 64K depth.  The HTTP/stdio quality gate now covers direct and

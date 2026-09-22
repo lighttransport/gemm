@@ -1473,6 +1473,20 @@ Remaining optimization items, in measured priority order:
    47.87--47.93 tok/s, but remains below 60 tok/s and falls to 28.82 tok/s at
    real random-token 64K depth.
 
+2026-09-22 continuation: resident DFlash2 A/B measurements used the same
+4K/512 Q8/Q8 coding fixture and two repeats.  K=4 control produced
+56.25--58.09 tok/s with draft times 85.8--86.5 ms and hash
+`15f17d2640c1adfc`; the opt-in selector projection fusion produced
+56.57--58.26 tok/s with the same hash, which is within run-to-run noise and
+does not justify changing the default.  The opt-in cache-injection overlap
+path was slower at 55.46--57.76 tok/s (same hash), so serial injection remains
+the production path.  K=7 measured 83.65--88.14 tok/s with draft times
+68.9--70.0 ms and the same exact hash, confirming that the remaining K=4
+shortfall is draft cost rather than verifier correctness.  A separate opt-in
+`fast` target profile run with the GSQ IQ2 model terminated in a segmentation
+fault during graph setup; it is not promoted and is now treated as an
+unsupported diagnostic combination until the failing setup path is isolated.
+
 2026-09-22 continuation: the one-row IQ2/IQ3/IQ4 kernels now declare their
 output, weight, activation, and scale buffers non-aliasing.  This preserves
 the existing dot and reduction order while giving HIPRTC safe load scheduling.
