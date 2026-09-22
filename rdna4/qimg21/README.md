@@ -137,6 +137,17 @@ editing gate, so broader numeric or attention differences remain. Set
 `QIMG21_STAGE_KEYS=time2_pre_round` to dump the FP32 projection before its
 BF16 rounding for further diagnosis.
 
+Matched block-0 replay further separates accumulated input drift from local
+kernel error. Injecting the saved CUDA `hidden0.npy` and `mod.npy` with
+`QIMG21_REPLAY_HIDDEN`, `QIMG21_REPLAY_MOD`, and `QIMG21_STAGE_BLOCK=0` into
+the HIP runner gives block-0 attention cosine 0.999999902 overall and
+0.999999787 on the 256 target rows. The sampled block-output relative L2 is
+0.0004035. Replaying CUDA `attn_raw.npy` as well lowers that sampled
+block-output relative L2 to 0.0002883, so attention contributes, but the
+output projection and MLP still introduce BF16 differences. These are
+diagnostic injected-state comparisons, not model acceptance; the free-running
+editing predictions above remain below the gate.
+
 The 1024-condition native vision path converts BF16 checkpoint biases to F32
 for its F32 linear epilogue and rounds the patch GEMM output to BF16 before
 adding the bias, matching CUDA's two activation boundaries. On the same
