@@ -68,6 +68,12 @@ native Q8_1 tile and codebook staging while retaining the standalone integer
 dot and reduction order. This remains opt-in pending resident parity and 64K
 throughput validation.
 
+Matching IQ3_S gate/up matrices have the corresponding
+`LLM_QWEN35_IQ3S_GATEUP_FUSED=1` candidate. It shares native Q8_1 staging and
+one row-range launch through the existing IQ3_S fusion kernel, retaining the
+standalone code decode and reduction order. Resident parity and sustained 64K
+timing are still required before enabling it by default.
+
 ## 2026-09-22 continuation: opt-in native Q2_K Q/K/V projection fusion
 
 The ordinary one-token attention dispatcher now exposes

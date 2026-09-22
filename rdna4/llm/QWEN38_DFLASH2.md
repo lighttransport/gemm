@@ -133,6 +133,11 @@ the standalone integer dot, scale, and reduction order preserved. Production
 dispatch remains unchanged until resident hashes and sustained 64K timing are
 available.
 
+Matching IQ3_S dense gate/up matrices can opt into
+`LLM_QWEN35_IQ3S_GATEUP_FUSED=1` as well. It reuses the IQ3_S fused row-range
+kernel and native Q8_1 staging while preserving the standalone code decode and
+reduction order. This remains diagnostic pending resident parity and 64K timing.
+
 Mixed-IQ attention layers can also opt into
 `LLM_QWEN35_IQ3S_QKV_FUSED=1` when Q, K, and V are all IQ3_S with a common
 input width. The kernel keeps IQ3_S code decoding, scale correction, and warp

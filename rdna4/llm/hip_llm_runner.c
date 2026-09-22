@@ -21822,6 +21822,27 @@ static inline int launch_qwen35_iq3xxs_gateup_fused(hip_llm_runner *r,
     return 1;
 }
 
+/* The mixed-IQ3_S FFN gate and up matrices share the same one-token input.
+ * Keep the standalone code decode and row reduction exact while combining
+ * their launch and activation staging under an explicit diagnostic switch. */
+static inline int launch_qwen35_iq3s_gateup_fused(hip_llm_runner *r,
+        void *gate, void *up, void *gate_w, void *up_w, void *x,
+        int rows, int n_cols) {
+    const char *env = getenv("LLM_QWEN35_IQ3S_GATEUP_FUSED");
+    if (!env || atoi(env) == 0 || !r->fn_qwen35_matvec_iq3s_qkv ||
+        rows < 1 || n_cols > 17408 || (n_cols % 256) != 0)
+        return 0;
+    launch_native_q81(r, x, n_cols);
+    int qrows = rows, krows = rows, vrows = 0;
+    void *vout = NULL, *vw = NULL;
+    void *a[] = { &gate, &up, &vout, &gate_w, &up_w, &vw,
+                  &r->d_native_q81, &r->d_native_scale,
+                  &qrows, &krows, &vrows, &n_cols };
+    LAUNCH(r->fn_qwen35_matvec_iq3s_qkv,
+           (qrows + krows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, a);
+    return 1;
+}
+
 /* The IQ4_XS FFN gate and up matrices consume the same one-token activation.
  * Reuse the native Q8_1 tile and the exact eight-pass row arithmetic of the
  * Q/K/V kernel; keep this separate and opt-in until resident parity data is
@@ -29828,9 +29849,20 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
                         r, r->d_gate, r->d_up, cl->ffn_gate_w,
                         cl->ffn_up_w, r->d_xb, cl->ffn_gate_rows,
                         cl->ffn_gate_cols);
-                int fused_iq4_gateup = !fused_q2k_gateup &&
+                int fused_iq3s_gateup = !fused_q2k_gateup &&
                     !fused_iq2xxs_gateup && !fused_iq2_gateup &&
                     !fused_iq3_gateup &&
+                    cl->ffn_gate_type == GGML_TYPE_IQ3_S &&
+                    cl->ffn_up_type == GGML_TYPE_IQ3_S &&
+                    cl->ffn_gate_rows == cl->ffn_up_rows &&
+                    cl->ffn_gate_cols == cl->ffn_up_cols &&
+                    launch_qwen35_iq3s_gateup_fused(
+                        r, r->d_gate, r->d_up, cl->ffn_gate_w,
+                        cl->ffn_up_w, r->d_xb, cl->ffn_gate_rows,
+                        cl->ffn_gate_cols);
+                int fused_iq4_gateup = !fused_q2k_gateup &&
+                    !fused_iq2xxs_gateup && !fused_iq2_gateup &&
+                    !fused_iq3_gateup && !fused_iq3s_gateup &&
                     cl->ffn_gate_type == GGML_TYPE_IQ4_XS &&
                     cl->ffn_up_type == GGML_TYPE_IQ4_XS &&
                     cl->ffn_gate_rows == cl->ffn_up_rows &&
@@ -29841,7 +29873,8 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
                         cl->ffn_gate_cols);
                 int fused_iq1_gateup = !fused_q2k_gateup &&
                     !fused_iq2xxs_gateup && !fused_iq2_gateup &&
-                    !fused_iq3_gateup && !fused_iq4_gateup &&
+                    !fused_iq3_gateup && !fused_iq3s_gateup &&
+                    !fused_iq4_gateup &&
                     cl->ffn_gate_type == GGML_TYPE_IQ1_S &&
                     cl->ffn_up_type == GGML_TYPE_IQ1_M &&
                     cl->ffn_gate_rows == cl->ffn_up_rows &&
@@ -29852,7 +29885,8 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
                         cl->ffn_gate_cols);
                 if (!fused_q2k_gateup && !fused_iq2xxs_gateup &&
                     !fused_iq2_gateup &&
-                    !fused_iq3_gateup && !fused_iq4_gateup &&
+                    !fused_iq3_gateup && !fused_iq3s_gateup &&
+                    !fused_iq4_gateup &&
                     !fused_iq1_gateup) {
                     begin_q8x2_reuse(r);
                     launch_matvec_ffn_auto(r, r->d_gate, cl->ffn_gate_w, r->d_xb,
