@@ -74,6 +74,13 @@ one row-range launch through the existing IQ3_S fusion kernel, retaining the
 standalone code decode and reduction order. Resident parity and sustained 64K
 timing are still required before enabling it by default.
 
+Verifier attention now also has an opt-in
+`LLM_QWEN35_VERIFY_COMBINE_GROUPED=3` sixteen-row combine candidate. It matches
+the verifier's maximum batch, loads all split metadata once, and preserves the
+per-row split-order max, numerator, denominator, and gate arithmetic. The
+four-row default and eight-row mode remain unchanged pending long-context
+resident hashes and timing.
+
 ## 2026-09-22 continuation: opt-in native Q2_K Q/K/V projection fusion
 
 The ordinary one-token attention dispatcher now exposes

@@ -14111,8 +14111,10 @@ struct hip_llm_runner {
     hipFunction_t fn_q8_attention_decode_reuse8;
     hipFunction_t fn_q8_attention_combine, fn_q8_attention_combine_verify4;
     hipFunction_t fn_q8_attention_combine_verify8;
+    hipFunction_t fn_q8_attention_combine_verify16;
     hipFunction_t fn_q8_attention_combine_gate, fn_q8_attention_combine_verify4_gate;
     hipFunction_t fn_q8_attention_combine_verify8_gate;
+    hipFunction_t fn_q8_attention_combine_verify16_gate;
     hipFunction_t fn_q8_attention_prefill_wmma;
     void *d_q8_attention_parts, *d_q8_attention_meta;
     int q8_attention_max_splits, q8_attention_nsm;
@@ -18154,6 +18156,8 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
                   r->q8_attention_module, "qwen35_attention_q8_combine_verify4"));
         CHECK_HIP(hipModuleGetFunction(&r->fn_q8_attention_combine_verify8,
                   r->q8_attention_module, "qwen35_attention_q8_combine_verify8"));
+        CHECK_HIP(hipModuleGetFunction(&r->fn_q8_attention_combine_verify16,
+                  r->q8_attention_module, "qwen35_attention_q8_combine_verify16"));
         if (hip_compile_kernels_ex(&r->q8_gate_module, r->device,
                 qwen35_attention_q8_gate_source, "qwen35_attention_q8_gate.hip",
                 r->verbose, "qwen35_attention_q8_gate", 1) <= 0) return -1;
@@ -18163,6 +18167,8 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
                   r->q8_gate_module, "qwen35_attention_q8_combine_verify4_gate"));
         CHECK_HIP(hipModuleGetFunction(&r->fn_q8_attention_combine_verify8_gate,
                   r->q8_gate_module, "qwen35_attention_q8_combine_verify8_gate"));
+        CHECK_HIP(hipModuleGetFunction(&r->fn_q8_attention_combine_verify16_gate,
+                  r->q8_gate_module, "qwen35_attention_q8_combine_verify16_gate"));
         if (hip_compile_kernels_ex(&r->q8_prefill_module, r->device,
                 qwen35_attention_q8_source, "qwen35_attention_q8_prefill.hip", r->verbose,
                 "qwen35_attention_q8_prefill", 0) <= 0) return -1;
@@ -23418,12 +23424,15 @@ static inline void launch_attn_verify_native_q8(hip_llm_runner *r, void *out,
     }
     const char *group_combine_env = getenv("LLM_QWEN35_VERIFY_COMBINE_GROUPED");
     int grouped_mode = group_combine_env ? atoi(group_combine_env) : 0;
-    int grouped_width = grouped_mode >= 2 ? 8 : 4;
-    hipFunction_t grouped_fn = grouped_width == 8 ?
-        (gate ? r->fn_q8_attention_combine_verify8_gate :
-                r->fn_q8_attention_combine_verify8) :
-        (gate ? r->fn_q8_attention_combine_verify4_gate :
-                r->fn_q8_attention_combine_verify4);
+    int grouped_width = grouped_mode >= 3 ? 16 : grouped_mode >= 2 ? 8 : 4;
+    hipFunction_t grouped_fn = grouped_width == 16 ?
+        (gate ? r->fn_q8_attention_combine_verify16_gate :
+                r->fn_q8_attention_combine_verify16) :
+        grouped_width == 8 ?
+            (gate ? r->fn_q8_attention_combine_verify8_gate :
+                    r->fn_q8_attention_combine_verify8) :
+            (gate ? r->fn_q8_attention_combine_verify4_gate :
+                    r->fn_q8_attention_combine_verify4);
     int grouped_combine = grouped_mode != 0 && group_queries && queries > 1 &&
         grouped_fn;
     if (grouped_combine) {

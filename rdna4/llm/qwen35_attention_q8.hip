@@ -1163,3 +1163,52 @@ void qwen35_attention_q8_combine_verify8(float *out, const float *parts,
         }
     }
 }
+
+/* Sixteen-row verifier combine candidate. The dense verifier allocates at
+ * most sixteen rows, so one block can consume the full window's metadata and
+ * publish every row in one launch. Each row still uses the same split-order
+ * max, numerator, and denominator arithmetic as the four/eight-row kernels;
+ * this mode is opt-in because the larger shared tile needs an A/B run. */
+extern "C" __global__ __launch_bounds__(256, 1)
+void qwen35_attention_q8_combine_verify16(float *out, const float *parts,
+        const float2 *meta, const int *position, int heads, int nsm,
+        int occupancy, int forced_splits, int queries) {
+    int head = blockIdx.x, q0 = blockIdx.y * 16, tid = threadIdx.x;
+    __shared__ float2 shared_meta[16][128];
+    __shared__ int split_count[16];
+    if (tid < 16) {
+        int query = q0 + tid;
+        split_count[tid] = query < queries ?
+            (forced_splits ? forced_splits :
+             q8_attention_splits(position[query] + 1, heads, nsm, occupancy)) : 0;
+    }
+    __syncthreads();
+    for (int q = 0; q < 16; ++q) {
+        int splits = split_count[q];
+        if (splits > 1) {
+            int query = q0 + q;
+            const float2 *src = meta + ((size_t)query * heads + head) * splits;
+            for (int i = tid; i < splits; i += 256)
+                shared_meta[q][i] = src[i];
+        }
+    }
+    __syncthreads();
+    for (int q = 0; q < 16; ++q) {
+        int query = q0 + q;
+        int splits = split_count[q];
+        if (splits > 1) {
+            const float *src = parts + ((size_t)query * heads + head) * splits * 256;
+            float maximum = shared_meta[q][0].x;
+            for (int i = 1; i < splits; ++i)
+                maximum = fmaxf(maximum, shared_meta[q][i].x);
+            float numerator = 0.0f, denominator = 0.0f;
+            for (int i = 0; i < splits; ++i) {
+                float scale = expf(shared_meta[q][i].x - maximum);
+                numerator += scale * src[(size_t)i * 256 + tid];
+                denominator += scale * shared_meta[q][i].y;
+            }
+            out[((size_t)query * heads + head) * 256 + tid] =
+                numerator / denominator;
+        }
+    }
+}

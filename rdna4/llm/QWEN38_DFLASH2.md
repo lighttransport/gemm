@@ -138,6 +138,12 @@ Matching IQ3_S dense gate/up matrices can opt into
 kernel and native Q8_1 staging while preserving the standalone code decode and
 reduction order. This remains diagnostic pending resident parity and 64K timing.
 
+The verifier combine tail exposes
+`LLM_QWEN35_VERIFY_COMBINE_GROUPED=3` for a sixteen-row block. It covers the
+full verifier batch in one metadata tile and retains the existing row-wise
+split arithmetic, including the gated form. The four-row default remains the
+production choice until resident long-context parity and timing are measured.
+
 Mixed-IQ attention layers can also opt into
 `LLM_QWEN35_IQ3S_QKV_FUSED=1` when Q, K, and V are all IQ3_S with a common
 input width. The kernel keeps IQ3_S code decoding, scale correction, and warp
