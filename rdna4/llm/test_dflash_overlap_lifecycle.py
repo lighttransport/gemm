@@ -77,6 +77,40 @@ int main() {
             release(d); ++cases;
         }
     }
+    /* A layer exposing both or neither injection representation is malformed
+       and must fail closed before allocating stream/event resources. */
+    for(int malformed=0;malformed<2;++malformed) {
+        hllm_qwen35_dflash2 d{};
+        d.fc_bf16=d.features_bf16=d.x_bf16=&sentinel;
+        for(auto &l:d.layers) l.inject_k_bf16=l.inject_v_bf16=&sentinel;
+        if(malformed==0) d.layers[2].inject_kv_bf16=&sentinel;
+        else d.layers[2].inject_k_bf16=d.layers[2].inject_v_bf16=nullptr;
+        hip_llm_runner r{5120,1,0,&d}; calls=0; fail_at=0;
+        assert(hllm_dflash_overlap_init(&r,&d)==-1);
+        assert(d.inject_disabled && calls==0 && !allocations && !handles);
+        ++cases;
+    }
+    /* Failed enqueue retirement is idempotent and permits scratch reuse. */
+    {
+        hllm_qwen35_dflash2 d{}; d.inject_pending=1; d.inject_stream=9;
+        syncs=0; last_synced=-1;
+        hllm_dflash_overlap_abort(&d);
+        assert(!d.inject_pending && syncs==1 && last_synced==9);
+        hllm_dflash_overlap_abort(&d);
+        assert(!d.inject_pending && syncs==2);
+        ++cases;
+    }
+    /* Teardown can run repeatedly after a partial allocation rollback. */
+    {
+        hllm_qwen35_dflash2 d{};
+        assert(hipMalloc(&d.inject_x,64)==0);
+        assert(hipMalloc(&d.inject_norm,64)==0);
+        d.inject_capacity=8;
+        hllm_dflash_overlap_workspace_free(&d);
+        hllm_dflash_overlap_workspace_free(&d);
+        assert(!allocations && !d.inject_x && !d.inject_norm && !d.inject_capacity);
+        ++cases;
+    }
     for(int stream=0;stream<=1;++stream)
     for(int error=0;error<3;++error) {
         hllm_qwen35_dflash2 d{}; d.inject_pending=1; d.inject_stream=9; d.inject_done=8;

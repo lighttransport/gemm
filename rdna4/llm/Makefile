@@ -29,7 +29,7 @@ TARGET = test_hip_llm
 QWEN38_MODEL ?= /mnt/nvme01/models/q38nf/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf
 QSA_MOE_CACHE_MB ?= 128
 
-.PHONY: all clean run api gsq gsq-target iq2-bw profile-test bench-256k target-gate target-gate-fast target-gate-batch target-gate-4k hipblaslt-status qsa-256k qsa-256k-device qsa-256k-device-warp approx-coherence fp8-test cpu-expert-bench glm5next-contract glm5next-ref glm5next-cpu-kda glm5next-cpu-full glm5next-cpu-runtime glm5next-nextn glm5next-hip-kda half2-test help
+.PHONY: all clean run api gsq gsq-target iq2-bw profile-test long-context-gate lifecycle-test bench-256k target-gate target-gate-fast target-gate-batch target-gate-4k hipblaslt-status qsa-256k qsa-256k-device qsa-256k-device-warp approx-coherence fp8-test cpu-expert-bench glm5next-contract glm5next-ref glm5next-cpu-kda glm5next-cpu-full glm5next-cpu-runtime glm5next-nextn glm5next-hip-kda half2-test help
 
 all: $(TARGET)
 
@@ -174,6 +174,12 @@ iq2-bw: $(TARGET)
 
 profile-test:
 	./test_qwen38_profiles.sh
+
+long-context-gate: $(TARGET)
+	./test_qwen38_long_context.sh
+
+lifecycle-test:
+	python3 test_dflash_overlap_lifecycle.py
 
 approx-coherence: $(TARGET)
 	./test_qwen38_approx_coherence.sh

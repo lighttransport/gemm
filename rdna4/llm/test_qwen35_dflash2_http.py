@@ -226,7 +226,7 @@ def extract_cpp(text):
     return text.strip()
 
 
-def compile_cpp_answer(text):
+def compile_cpp_answer(text, expected_stdout="42", stdin=""):
     source = extract_cpp(text)
     scratch_root = Path(__file__).with_name("tmp")
     scratch_root.mkdir(exist_ok=True)
@@ -241,10 +241,49 @@ def compile_cpp_answer(text):
             capture_output=True, text=True, timeout=30)
         require(build.returncode == 0,
                 f"generated C++ did not compile:\n{build.stderr}\n{source}")
-        run = subprocess.run([str(binary_path)], capture_output=True,
+        run = subprocess.run([str(binary_path)], input=stdin, capture_output=True,
                              text=True, timeout=5)
-        require(run.returncode == 0 and run.stdout.strip() == "42",
+        require(run.returncode == 0 and run.stdout.strip() == expected_stdout,
                 f"generated C++ returned {run.returncode}: {run.stdout!r} {run.stderr!r}")
+
+
+def algorithmic_cpp_cases(port, label="DFlash2"):
+    """Compile and execute deterministic algorithmic answers, not just syntax."""
+    cases = (
+        (
+            "Return only valid C++17 source code, without Markdown. Read n, then n "
+            "sorted integers, then q. For each query print the zero-based index "
+            "returned by lower_bound, one per line. Use 64-bit integers.",
+            "6\n1 2 2 4 9 12\n5\n0\n2\n3\n12\n20\n",
+            "0\n1\n3\n5\n6",
+        ),
+        (
+            "Return only valid C++17 source code, without Markdown. Read integers "
+            "lo, hi, and n followed by n integers. Print each value clamped to the "
+            "inclusive range [lo, hi], separated by single spaces and ending with "
+            "a newline. Handle lo equal to hi.",
+            "-3 5 7\n-10 -3 -2 0 5 6 100\n",
+            "-3 -3 -2 0 5 5 5",
+        ),
+        (
+            "Return only valid C++17 source code, without Markdown. Read n followed "
+            "by n strings. Preserve first occurrence order, remove duplicates, and "
+            "print the remaining strings one per line. Comparisons are case-sensitive.",
+            "8\nbeta\nalpha\nbeta\nGamma\nalpha\ngamma\nGamma\ndelta\n",
+            "beta\nalpha\nGamma\ngamma\ndelta",
+        ),
+    )
+    for index, (prompt_text, stdin, expected) in enumerate(cases):
+        response = post(port, {
+            "messages": [{"role": "user", "content": prompt_text}],
+            "temperature": 0, "max_tokens": 384,
+            "prompt_cache_key": f"coding-algorithm-{index}",
+        })
+        text = response["choices"][0]["message"]["content"]
+        require(response.get("usage", {}).get("completion_tokens", 0) > 0,
+                response)
+        compile_cpp_answer(text, expected_stdout=expected, stdin=stdin)
+    print(f"{label} algorithmic C++ compile/run quality: PASS")
 
 
 def coding_agent_cases(port, label="DFlash2"):
@@ -299,6 +338,8 @@ def main():
                         help="DFlash2 proposal count for K=4/K=7 regression coverage")
     parser.add_argument("--port", type=int, default=18090)
     parser.add_argument("--context", type=int, default=512)
+    parser.add_argument("--server-max-tokens", type=int, default=512,
+                        help="HTTP response ceiling; coding cases need more than 64 tokens")
     parser.add_argument("--snapshot-max-tokens", type=int, default=0)
     parser.add_argument("--long-prompt-tokens", type=int, default=0,
                         help="target token count for a deterministic longer cached prompt")
@@ -338,7 +379,9 @@ def main():
 
     TestHandler.backend = backend
     TestHandler.model = backend.model
-    TestHandler.max_tokens = 64
+    require(args.server_max_tokens >= 384,
+            "--server-max-tokens must allow the algorithmic coding gate")
+    TestHandler.max_tokens = args.server_max_tokens
     TestHandler.context = args.context
     TestHandler.coding = False
     server = ThreadingHTTPServer(("127.0.0.1", args.port), TestHandler)
@@ -478,6 +521,7 @@ def main():
                 "LRU did not evict the oldest context")
 
         coding_agent_cases(args.port, label)
+        algorithmic_cpp_cases(args.port, label)
 
         prompt = [{"role": "user", "content": cases[0][0]}]
         sampled = {
