@@ -100,7 +100,7 @@ def main() -> int:
     ap.add_argument("--native-vision-bin", default=None)
     ap.add_argument("--native-vae-bin", default=None)
     ap.add_argument("--native-vae-encode-bin", default=None)
-    ap.add_argument("--native-attention", choices=("math", "reverse64", "wmma", "mma64", "mma64-flash", "mma64-mixed", "mma64-forward-flash", "mma128-efficient", "cutlass-efficient"), default="math")
+    ap.add_argument("--native-attention", choices=("math", "reverse64", "wmma", "wmma-fused", "mma64", "mma64-flash", "mma64-mixed", "mma64-forward-flash", "mma128-efficient", "cutlass-efficient"), default=None)
     ap.add_argument("--native-normalization", choices=("default", "vector4"), default="default")
     ap.add_argument("--native-rope", choices=("default", "host-table", "host-table-vector4", "host-table-exact"), default="default")
     ap.add_argument("--quantized-transformer", type=Path,
@@ -116,6 +116,13 @@ def main() -> int:
     # installation. CUDA keeps its existing reference VAE default.
     if args.backend == "rocm":
         args.native_vae = True
+    if args.native_attention is None:
+        args.native_attention = "wmma-fused" if args.backend == "rocm" and not args.image else "math"
+    if args.native_attention == "wmma-fused":
+        if args.backend != "rocm" or args.image:
+            ap.error("wmma-fused attention supports ROCm text-to-image only")
+        if not (Path(__file__).resolve().parents[2] / "rdna4/qimg21/libq21_hip_attention.so").is_file():
+            ap.error("wmma-fused attention plugin missing; run `make -C rdna4/qimg21 fused`")
     if args.quantized_transformer and args.quantize_on_load:
         ap.error("choose a quantized package or quantize-on-load, not both")
     if args.int8_tensor_core and not args.quantized_transformer:

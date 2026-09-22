@@ -373,6 +373,9 @@ static const char *qimg21_rope_base_path;
 typedef int (*qimg21_cutlass_attention_fn)(float *, const void *, const void *,
                                            const void *, int, int, int, int, void *);
 static qimg21_cutlass_attention_fn qimg21_cutlass_attention;
+typedef int (*qimg21_hip_fused_attention_fn)(float *, const float *, const float *,
+                                              const float *, int, int, int, void *);
+static qimg21_hip_fused_attention_fn qimg21_hip_fused_attention;
 typedef int (*qimg21_cutlass_workspace_release_fn)(void);
 typedef unsigned (*qimg21_cutlass_workspace_allocations_fn)(void);
 static qimg21_cutlass_workspace_release_fn qimg21_cutlass_workspace_release;
@@ -604,6 +607,12 @@ static int native_step(cuda_qimg_runner *r, qimg21_kernels *k, const qimg21_shar
             if(error){fprintf(stderr,"native: invalid or failed attention-state replay\n");goto fail_block;}
             fprintf(stderr,"native: DIAGNOSTIC ONLY: injecting attention before output projection\n");
         }
+        else if(qimg21_hip_fused_attention && !edit) {
+            if(qimg21_hip_fused_attention((float *)(uintptr_t)att,
+               (const float *)(uintptr_t)q,(const float *)(uintptr_t)kk,
+               (const float *)(uintptr_t)v,N,nt,NH,(void *)r->stream) ||
+               cuCtxSynchronize())goto fail_block;
+        }
         else if(k->mma_attention || qimg21_cutlass_attention) {
             /* Reuse the 3*D BF16 MLP hand-off allocation for Q/K/V. */
             CUdeviceptr qb=bf,kb=bf+(size_t)N*D*2,vb=bf+(size_t)N*D*4;
@@ -684,6 +693,7 @@ int main(int argc, char **argv) {
     const char *editing_layout_path = NULL, *condition_path = NULL;
     const char *negative_editing_layout_path = NULL;
     const char *cutlass_plugin_path = NULL;
+    const char *hip_fused_plugin_path = NULL;
     const char *out_path = "native_latents.npy", *dump_dir = NULL, *pred_dir = NULL;
     int ih = 16, iw = 16, steps = 1, verbose = 1;
     float guidance_scale = 1.0f;
@@ -717,6 +727,7 @@ int main(int argc, char **argv) {
             qimg21_attention_mma64=0;
             if (!strcmp(mode, "reverse64")) qimg21_attention_reverse64 = 1;
             else if (!strcmp(mode, "wmma")) { qimg21_use_wmma = 1; qimg21_attention_reverse64 = 0; }
+            else if (!strcmp(mode, "wmma-fused")) { hip_fused_plugin_path="rdna4/qimg21/libq21_hip_attention.so"; qimg21_attention_reverse64=0; }
             else if (!strcmp(mode, "math")) qimg21_attention_reverse64 = 0;
             else if (!strcmp(mode, "mma64")) {qimg21_attention_mma64=1;qimg21_attention_reverse64=0;}
             else if (!strcmp(mode, "mma64-flash")) {qimg21_attention_mma64=2;qimg21_attention_reverse64=0;}
@@ -858,6 +869,22 @@ int main(int argc, char **argv) {
             dlsym(cutlass_plugin,"q21_cutlass_workspace_allocations");
         fprintf(stderr,"native: exact CUTLASS efficient attention enabled\n");
     }
+    void *hip_fused_plugin=NULL;
+    if(hip_fused_plugin_path) {
+        if(editing_layout_path) {
+            fprintf(stderr,"native: fused HIP attention currently supports text-to-image only\n");
+            cuda_qimg_free(r);return 2;
+        }
+        hip_fused_plugin=dlopen(hip_fused_plugin_path,RTLD_NOW|RTLD_LOCAL);
+        if(!hip_fused_plugin || !(qimg21_hip_fused_attention=(qimg21_hip_fused_attention_fn)
+             dlsym(hip_fused_plugin,"q21_hip_fused_attention"))) {
+            fprintf(stderr,"native: cannot load HIP fused attention plugin %s: %s\n",
+                    hip_fused_plugin_path,dlerror());
+            if(hip_fused_plugin)dlclose(hip_fused_plugin);
+            cuda_qimg_free(r);return 1;
+        }
+        fprintf(stderr,"native: RDNA4 fused WMMA image attention enabled\n");
+    }
     q21_edit_context edit={0};
     q21_edit_context negative_edit={0};
     if(editing_layout_path && q21_edit_init(&edit,r,editing_layout_path,nt,nc+ni,ih,iw,qimg21_attention_reverse64)) {
@@ -965,6 +992,7 @@ int main(int argc, char **argv) {
         if(qimg21_cutlass_workspace_release)qimg21_cutlass_workspace_release();
         dlclose(cutlass_plugin);
     }
+    if(hip_fused_plugin)dlclose(hip_fused_plugin);
     if(qimg21_int8_input_f32) {
         cuMemFree(qimg21_int8_input_f32);
         qimg21_int8_input_f32=0;qimg21_int8_input_f32_bytes=0;

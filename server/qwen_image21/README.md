@@ -26,7 +26,8 @@ make -C cuda/qimg21 native
 server/qwen_image21/run.sh --host 127.0.0.1 --port 8091
 ```
 
-Select the RDNA4 path explicitly after building its native binaries:
+Select the RDNA4 path explicitly after building its native binaries and fused
+WMMA attention plugin with `make -C rdna4/qimg21`:
 
 ```sh
 server/qwen_image21/run.sh \

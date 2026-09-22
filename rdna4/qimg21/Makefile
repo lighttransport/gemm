@@ -1,15 +1,27 @@
 # Native Qwen Image 2.1 denoiser for RDNA4.
 # Host code is plain C; HIP and HIPRTC are loaded dynamically through rocew.
 CC ?= gcc
+HIPCC ?= hipcc
+GPU_ARCH ?= gfx1201
 CFLAGS ?= -O3 -Wall -Wextra -Wpedantic -I.. -I../../common
 LDFLAGS ?= -ldl -lm -lpthread
 
 TARGET = test_hip_qimg21_native test_hip_qimg21_text test_hip_qimg21_vision test_hip_qimg21_vae test_hip_qimg21_vae_encode test_hip_qimg21_wmma
 SRC = test_hip_qimg21_native.c ../rocew.c
 
-.PHONY: all clean probe rocew-probe
+.PHONY: all clean probe rocew-probe fused
 
-all: $(TARGET)
+all: $(TARGET) libq21_hip_attention.so
+
+fused: libq21_hip_attention.so
+
+../../tmp/pixal3d/wmma_attention.inc: ../pixal3d/extract_attention.py ../trellis2/hip_trellis2_kernels.h
+	mkdir -p ../../tmp/pixal3d
+	python3 ../pixal3d/extract_attention.py $@
+
+libq21_hip_attention.so: hip_attention_plugin.hip ../../tmp/pixal3d/wmma_attention.inc
+	$(HIPCC) -std=c++17 -O3 -ffp-contract=off --offload-arch=$(GPU_ARCH) -fPIC -shared $< -o $@.new
+	mv $@.new $@
 
 test_hip_qimg21_native: $(SRC) hip_qimg21_runner.h edit_runtime.h edit_kernels.h mma64_kernels.h \
            norm_vector_kernels.h rope_table_kernels.h quant_weights.h \
@@ -47,4 +59,4 @@ rocew-probe: ../rocew_probe.c ../rocew.c ../rocew.h
 	$(CC) $(CFLAGS) -o ../rocew_probe ../rocew_probe.c ../rocew.c $(LDFLAGS)
 
 clean:
-	rm -f $(TARGET)
+	rm -f $(TARGET) libq21_hip_attention.so

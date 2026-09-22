@@ -24,13 +24,15 @@ rdna4/qimg21/test_hip_qimg21_native \
   --model /mnt/disk2/models/qimg-21 \
   --prompt-embeds prompt_embeds.npy --latents latents.npy \
   --height-tokens 16 --width-tokens 16 --steps 2 \
-  --attention wmma --out native_latents.npy
+  --attention wmma-fused --out native_latents.npy
 ```
 
 The RDNA4 runner uses WMMA GEMMs by default when the GPU supports them.
-`--attention wmma` explicitly requests that same GEMM path; attention itself
-currently uses the portable scalar implementation. `--attention math` also
-uses WMMA GEMMs by default. The runner covers the 32-layer
+`--attention wmma-fused` adds the shared Pixal3D/TRELLIS gfx12 WMMA attention
+kernel for image queries and a separate causal text-prefix correction. It
+supports text-to-image; editing retains the scalar mask-aware attention path.
+`--attention wmma` and `--attention math` use WMMA GEMMs with scalar attention.
+The runner covers the 32-layer
 denoiser ABI, CFG inputs, editing layout inputs, stage dumps, and FlowMatch
 latent updates. Matching native text, vision, VAE decoder, and VAE encoder
 executables are built by the same Makefile. ROCm web generation uses the
@@ -43,11 +45,10 @@ For standalone generation with only NumPy and Pillow installed, run
 The ROCm path defaults to native VAE decode and uses a deterministic NumPy
 latent seed. CUDA keeps its PyTorch CUDA RNG seed path, so identical seed
 numbers across the two backends do not produce identical initial noise.
-Both text-to-image and image-editing paths have been smoke-tested at 256x256
-with one denoising step on an RX 9070 XT. This verifies execution, not
-multi-step image quality or CUDA parity. The current matched-input 256x256
-denoiser prediction has cosine similarity about 0.99995 against the saved
-PyTorch reference, below the CUDA runner's 0.99996 regression gate.
+Both text-to-image and image-editing paths passed initial 256x256 one-step
+smoke tests. The scalar path's matched low-timestep 256x256 denoiser prediction
+has cosine about 0.99995 against the saved PyTorch reference, below the CUDA
+runner's 0.99996 regression gate.
 
 On the RX 9070 XT with the installed HIPRTC 9.0 runtime, a matched-input
 256x256 two-step denoiser run takes 6.76 seconds (14,102,172 KiB peak host RSS) and
@@ -66,6 +67,25 @@ VAE decoding took another 19.74 seconds and yielded a coherent 1024x1024
 apple image. Compared with the saved PyTorch reference PNG, the decoded RGB
 has cosine 0.99999435 and mean absolute channel error 0.373/255. Artifacts
 are under `tmp/qimg21-rdna4-1024-40/`.
+
+With `--attention wmma-fused`, the same 1024x1024/40-step denoiser run took
+238.50 seconds (3m59s) and peaked at 14,103,924 KiB host RSS. Every saved
+checkpoint is finite and passes the 0.99996 cosine gate; minimum cosine is
+0.99998877 and maximum relative L2 is 0.004739 at the final step. Native VAE
+decode took 17.79 seconds. The resulting RGB image has cosine 0.99999437 and
+mean absolute channel error 0.385/255 versus the saved PyTorch reference PNG.
+This is faster than the repository's 5060 Ti W8A8 transformer measurement of
+8m12s, though the AMD run uses BF16 weights and a different attention kernel.
+Artifacts are under `tmp/qimg21-rdna4-fused-1024-40/`.
+
+The public `native_generate.py --backend rocm` path now selects fused WMMA
+attention for text-to-image and scalar mask-aware attention for editing. A
+standalone 1024x1024/40-step generation with native text encoding, NumPy
+seed-42 noise, fused denoising, native VAE decode, and PNG output completed in
+265.88 seconds (4m26s), peak host RSS 14,103,212 KiB, on the RX 9070 XT.
+The resulting image is a coherent red apple on a white table; it is not
+pixel-comparable to CUDA seed 42 because the initial-noise RNG differs.
+Artifacts are under `tmp/qimg21-rdna4-fused-e2e-1024-40/`.
 
 This acceptance run uses the saved reference text embedding, so it verifies
 the ROCm denoiser and VAE, not the full native text-encoder accuracy. Native

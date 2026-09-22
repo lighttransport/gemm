@@ -55,6 +55,7 @@ class Demo:
             "vision": root / ("test_cuda_qimg21_vision" if backend == "cuda" else "test_hip_qimg21_vision"),
             "vae": root / ("test_cuda_qimg21_vae" if backend == "cuda" else "test_hip_qimg21_vae"),
             "vae_encode": root / ("test_cuda_qimg21_vae_encode" if backend == "cuda" else "test_hip_qimg21_vae_encode"),
+            "attention": root / ("libq21_cutlass_attention.so" if backend == "cuda" else "libq21_hip_attention.so"),
         }
 
     def _validate(self, request: dict) -> dict:
@@ -110,7 +111,7 @@ class Demo:
         native = self.native if backend == "cuda" else self.native_rocm
         image = out / f"{backend}.png"
         work = out / f"{backend}-work"
-        attention = "cutlass-efficient" if backend == "cuda" else "wmma"
+        attention = "cutlass-efficient" if backend == "cuda" else "wmma-fused"
         native_vae = (backend == "cuda" or
                       (ROOT / "rdna4/qimg21/test_hip_qimg21_vae").is_file())
         command = [str(python), "cuda/qimg21/native_generate.py", "--backend", backend,
@@ -197,8 +198,8 @@ class Handler(BaseHTTPRequestHandler):
                           for backend in ("cuda", "rocm")}
             self._json(200, {"ok": True, "model": str(demo.model),
                              "quantized_available": demo.quant.is_dir(),
-                             "native": {"cuda": demo.native.is_file(),
-                                        "rocm": demo.native_rocm.is_file()},
+                             "native": {backend: all(components[backend].values())
+                                        for backend in ("cuda", "rocm")},
                              "native_components": components,
                              "reference": {"cuda": demo.python.is_file(),
                                            "rocm": demo.python_rocm.is_file()}})

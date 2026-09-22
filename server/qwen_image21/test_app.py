@@ -24,6 +24,14 @@ class QwenImage21RoutingTest(unittest.TestCase):
             compare = demo._validate({"prompt": "apple", "backend": "rocm", "mode": "compare"})
             self.assertEqual((compare["backend"], compare["mode"]), ("rocm", "compare"))
 
+    def test_native_components_include_attention_plugin(self):
+        with tempfile.TemporaryDirectory(dir=ROOT / "tmp", prefix="qimg21-test-") as td:
+            demo = self.make_demo(Path(td))
+            self.assertEqual(demo.native_components("rocm")["attention"].name,
+                             "libq21_hip_attention.so")
+            self.assertEqual(demo.native_components("cuda")["attention"].name,
+                             "libq21_cutlass_attention.so")
+
     def test_native_command_selects_rocm_driver(self):
         with tempfile.TemporaryDirectory(dir=ROOT / "tmp", prefix="qimg21-test-") as td:
             root = Path(td)
@@ -37,7 +45,7 @@ class QwenImage21RoutingTest(unittest.TestCase):
             self.assertIn("--backend", command)
             self.assertEqual(command[command.index("--backend") + 1], "rocm")
             self.assertEqual(command[command.index("--native-bin") + 1], str(root / "rocm-native"))
-            self.assertEqual(command[command.index("--native-attention") + 1], "wmma")
+            self.assertEqual(command[command.index("--native-attention") + 1], "wmma-fused")
             self.assertEqual(command[0], sys.executable)
 
     def test_rocm_quantized_uses_bf16_wmma_not_cuda_int8(self):
