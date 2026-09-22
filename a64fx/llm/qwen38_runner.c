@@ -202,7 +202,7 @@ static int run_benchmark(transformer_model *m, bpe_vocab *v, int32_t *tok,
 static void usage(const char *p) {
     fprintf(stderr, "usage: %s MODEL --prompt TEXT [--max-gen N] [--max-seq N] "
                     "[--threads N] [--spec-k 0..4] [--mmap] "
-                    "[--fast-swiglu] [--q8-mode auto|reference|cmg4|cmg4-a15|block64|block64-ffn|block64-exact|row] "
+                    "[--fast-swiglu] [--nvfp4-fast] [--q8-mode auto|reference|cmg4|cmg4-a15|block64|block64-ffn|block64-exact|row] "
                     "[--bench --bench-prompt N[,N...] --bench-gen N[,N...] "
                     "--bench-runs N --bench-warmup N --bench-csv]\n", p);
 }
@@ -213,7 +213,7 @@ int main(int argc, char **argv) {
     const char *bench_prompt_arg = "512";
     const char *bench_gen_arg = "128";
     int max_gen = 16, max_seq = 512, threads = 48, spec_k = 0, mmap_weights = 0;
-    int fast_swiglu = 0;
+    int fast_swiglu = 0, nvfp4_fast = 0;
     int bench = 0, bench_runs = 3, bench_warmup = 1, bench_csv = 0;
     int bench_prompt_sizes[QWEN38_BENCH_MAX_CASES];
     int bench_gen_sizes[QWEN38_BENCH_MAX_CASES];
@@ -232,6 +232,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--bench-runs") && ++i < argc) bench_runs = atoi(argv[i]);
         else if (!strcmp(argv[i], "--bench-warmup") && ++i < argc) bench_warmup = atoi(argv[i]);
         else if (!strcmp(argv[i], "--fast-swiglu")) fast_swiglu = 1;
+        else if (!strcmp(argv[i], "--nvfp4-fast")) nvfp4_fast = 1;
         else if (!strcmp(argv[i], "--bench-csv")) bench_csv = 1;
         else if (argv[i][0] != '-' && !path) path = argv[i];
         else { usage(argv[0]); return 2; }
@@ -297,6 +298,7 @@ int main(int argc, char **argv) {
     transformer_model *m = transformer_load(g, max_seq);
     if (!v || !m) return 1;
     m->decode_swiglu_approx = fast_swiglu;
+    transformer_set_nvfp4_fast(nvfp4_fast);
     if (threads > 1) transformer_set_threads(m, threads);
     size_t q8_resident = 0;
     if (q8_model && !mmap_weights) {

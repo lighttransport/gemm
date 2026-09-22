@@ -40,6 +40,8 @@ reusing a scratch address and four sampled values across tokens.
 | Exact eight-row, original FMA order | **3.617 tok/s (35.391 s)** | **128/128** | **0 bitwise** |
 | Exact eight-row, eight-block prefetch | **4.321 tok/s (29.624 s)** | **128/128** | **0 bitwise** |
 | Exact eight-row, prefetch and scale table | **4.464 tok/s (28.674 s)** | **128/128** | **0 bitwise** |
+| Combined runner, exact default | **4.698 tok/s (27.243 s)** | **128/128** | **0 bitwise** |
+| Combined runner, `--nvfp4-fast` | **4.858 tok/s (26.350 s)** | **128/128** | **0.000395 max** |
 
 The first two runs used prompt `hi`, `--max-seq 256 --max-gen 128 --spec-k 0`,
 48 threads, `TF_DUMP_TOKENS=1 TF_DPROF=1`, the same staged GGUF, and the
@@ -60,16 +62,32 @@ The scale-table run used the same 128-token settings without profiling and
 repeated at 28.676 and 28.674 seconds, both with 128/128 token IDs and zero
 selected-logit error against the exact reference.
 
+`--nvfp4-fast` selects a full-width nibble-interleaved SVE reduction for the
+eight-row decode path. It changes FP32 accumulation order; the exact kernel
+remains the default. The combined runner matched all 128 token IDs on `hi`
+within the strict 0.001 selected-logit tolerance (maximum 0.000395). On a
+second prompt, `Explain why a compass needle points north even though Earth
+is not a perfect bar magnet.`, a fast-only build reached 4.987 tok/s versus
+4.461 exact, with 128/128 IDs matching and maximum selected-logit error
+0.000280. The fast-only build reached 4.995 tok/s on `hi`; the combined
+opt-in runner is somewhat slower, so its 4.858 tok/s result is the usable
+headline. A third prompt requesting Python binary-search-tree code was run for
+256 generated tokens with the combined runner: exact 4.676 tok/s, fast
+4.836 tok/s, **256/256 IDs matched**, and selected-logit maximum error
+0.000870. Across these three prompts 512/512 generated IDs matched. This does
+not prove token identity for every prompt or a longer context.
+
 The original eight-row stage costs were approximately 123.6 ms/token for FFN
 gate/up, 49.1 for FFN down, 44.2 for SSM input, 15.0 for SSM output, and
 20.5 for the vocabulary head. The kernel improvement is still far from the
 40 tok/s goal. The 128-token result establishes this prompt and short context;
 it does not establish longer-context or other-prompt performance.
 
-A full-width nibble-interleaved variant reached 3.962 tok/s but changed the
-FP32 reduction order; 128/128 token IDs matched while selected logits differed
-by up to 0.00256, above the repository's 0.001 validation tolerance. It was
-not retained.
+An earlier full-width build without the later lookup/prefetch changes reached
+3.962 tok/s; 128/128 token IDs matched but selected logits differed by up to
+0.00256, above the repository's 0.001 validation tolerance. That build was
+discarded; the current opt-in build passes the strict tolerance on the two
+prompts measured above.
 
 The opt-in row-major W4A8 path kept all 128 token IDs on this prompt, but
 ran at 3.085 tok/s (41.493 s) and changed selected logits by up to 0.13878.
@@ -100,6 +118,9 @@ TF_DPROF=1 TF_DUMP_TOKENS=1 \
   /local/u14346/Qwen3.8-27B-NVFP4-Quality-v2.gguf \
   --prompt hi --max-seq 256 --max-gen 128 --spec-k 0
 ```
+
+Append `--nvfp4-fast` to opt into the faster reduction. The benchmark numbers
+above omit `TF_DPROF`; setting it prints stage costs but changes timing.
 
 The build used Fujitsu `fcc -Nclang -O3 -march=armv8.2-a+sve -Kfast`.
 Known TLS debug-relocation linker warnings remain.

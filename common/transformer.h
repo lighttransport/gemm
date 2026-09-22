@@ -427,6 +427,8 @@ double transformer_null_stream_bench(transformer_model *model, int passes);
  * Env vars: NUMA_DISTRIBUTE=1 (enable), NUMA_N_CMGS (default 4),
  *           NUMA_CMG_BUDGET_GB (default 7), NUMA_ALIGNMENT (default 2MB). */
 void transformer_numa_setup(transformer_model *m, const gguf_context *gguf);
+/* Select the faster full-width NVFP4 reduction (approximate FP32 order). */
+void transformer_set_nvfp4_fast(int enabled);
 /* Copy Q8 decode weights out of a lazy mmap without materializing embeddings or
  * the optional NextN block. Returns resident bytes, or 0 on failure. */
 size_t transformer_materialize_q8_decode(transformer_model *m,
@@ -587,6 +589,9 @@ int32_t transformer_sample_topk(const float *logits, int n_vocab, float temperat
 
 /* ======================================================================== */
 #ifdef TRANSFORMER_IMPLEMENTATION
+
+static int tf_nvfp4_fast_mode = 0;
+void transformer_set_nvfp4_fast(int enabled) { tf_nvfp4_fast_mode = enabled != 0; }
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -1405,6 +1410,73 @@ static inline void tf_nvfp4_dot8_sve(float *dst, const uint8_t *base, size_t rb,
                     (A)=svmla_m(pt,(A),svmul_x(pt,lo,(D)),xv); \
                     svfloat32_t hi=svtbl_f32(lut,svlsr_n_u32_x(pt,z,4)); \
                     (A)=svmla_m(pt,(A),svmul_x(pt,hi,(D)),xh); \
+                } while (0)
+                TF_NVFP4_DOT8_ROW(b0,a0,d0); TF_NVFP4_DOT8_ROW(b1,a1,d1);
+                TF_NVFP4_DOT8_ROW(b2,a2,d2); TF_NVFP4_DOT8_ROW(b3,a3,d3);
+                TF_NVFP4_DOT8_ROW(b4,a4,d4); TF_NVFP4_DOT8_ROW(b5,a5,d5);
+                TF_NVFP4_DOT8_ROW(b6,a6,d6); TF_NVFP4_DOT8_ROW(b7,a7,d7);
+#undef TF_NVFP4_DOT8_ROW
+            }
+        }
+    }
+    dst[0]=svaddv_f32(pg,a0); dst[1]=svaddv_f32(pg,a1);
+    dst[2]=svaddv_f32(pg,a2); dst[3]=svaddv_f32(pg,a3);
+    dst[4]=svaddv_f32(pg,a4); dst[5]=svaddv_f32(pg,a5);
+    dst[6]=svaddv_f32(pg,a6); dst[7]=svaddv_f32(pg,a7);
+}
+
+/* Opt-in full-width nibble pairing uses one FMA per weight pair. It changes
+ * the FP32 reduction order, so the ordered kernel above remains the default. */
+static inline void tf_nvfp4_dot8_fast_sve(float *dst, const uint8_t *base, size_t rb,
+                                     const float *x, int n) {
+    const svbool_t pg = svptrue_b32();
+    const svfloat32_t lut = svld1(pg, ds4f_kvalues_mxfp4_f32);
+    const int half = (int)svcntw() / 2;
+    const block_nvfp4 *r0 = (const block_nvfp4 *)(base + 0 * rb);
+    const block_nvfp4 *r1 = (const block_nvfp4 *)(base + 1 * rb);
+    const block_nvfp4 *r2 = (const block_nvfp4 *)(base + 2 * rb);
+    const block_nvfp4 *r3 = (const block_nvfp4 *)(base + 3 * rb);
+    const block_nvfp4 *r4 = (const block_nvfp4 *)(base + 4 * rb);
+    const block_nvfp4 *r5 = (const block_nvfp4 *)(base + 5 * rb);
+    const block_nvfp4 *r6 = (const block_nvfp4 *)(base + 6 * rb);
+    const block_nvfp4 *r7 = (const block_nvfp4 *)(base + 7 * rb);
+    svfloat32_t a0=svdup_f32(0), a1=a0, a2=a0, a3=a0;
+    svfloat32_t a4=a0, a5=a0, a6=a0, a7=a0;
+    for (int ib = 0; ib < n / 64; ib++) {
+        const block_nvfp4 *b0=r0+ib,*b1=r1+ib,*b2=r2+ib,*b3=r3+ib;
+        const block_nvfp4 *b4=r4+ib,*b5=r5+ib,*b6=r6+ib,*b7=r7+ib;
+        if (ib + 8 < n / 64) {
+            __builtin_prefetch(r0 + ib + 8, 0, 0);
+            __builtin_prefetch(r1 + ib + 8, 0, 0);
+            __builtin_prefetch(r2 + ib + 8, 0, 0);
+            __builtin_prefetch(r3 + ib + 8, 0, 0);
+            __builtin_prefetch(r4 + ib + 8, 0, 0);
+            __builtin_prefetch(r5 + ib + 8, 0, 0);
+            __builtin_prefetch(r6 + ib + 8, 0, 0);
+            __builtin_prefetch(r7 + ib + 8, 0, 0);
+        }
+        for (int s = 0; s < 4; s++) {
+            svfloat32_t d0=svdup_f32(tf_nvfp4_scale_fast(b0->d[s]));
+            svfloat32_t d1=svdup_f32(tf_nvfp4_scale_fast(b1->d[s]));
+            svfloat32_t d2=svdup_f32(tf_nvfp4_scale_fast(b2->d[s]));
+            svfloat32_t d3=svdup_f32(tf_nvfp4_scale_fast(b3->d[s]));
+            svfloat32_t d4=svdup_f32(tf_nvfp4_scale_fast(b4->d[s]));
+            svfloat32_t d5=svdup_f32(tf_nvfp4_scale_fast(b5->d[s]));
+            svfloat32_t d6=svdup_f32(tf_nvfp4_scale_fast(b6->d[s]));
+            svfloat32_t d7=svdup_f32(tf_nvfp4_scale_fast(b7->d[s]));
+            int xbase=ib*64+s*16;
+            for (int k=0; k<8; k+=half) {
+                int count=8-k < half ? 8-k : half;
+                svbool_t pq=svwhilelt_b32((uint64_t)0,(uint64_t)count);
+                svbool_t pt=svwhilelt_b32((uint64_t)0,(uint64_t)(2*count));
+                svfloat32_t xv=svzip1_f32(svld1(pq,x+xbase+k),
+                                          svld1(pq,x+xbase+8+k));
+#define TF_NVFP4_DOT8_ROW(B, A, D) do { \
+                    const uint8_t *q=(B)->qs+s*8+k; \
+                    svuint32_t z=svld1ub_u32(pq,q); \
+                    svuint32_t ix=svzip1_u32(svand_n_u32_x(pq,z,15), \
+                                              svlsr_n_u32_x(pq,z,4)); \
+                    (A)=svmla_m(pt,(A),svmul_x(pt,svtbl_f32(lut,ix),(D)),xv); \
                 } while (0)
                 TF_NVFP4_DOT8_ROW(b0,a0,d0); TF_NVFP4_DOT8_ROW(b1,a1,d1);
                 TF_NVFP4_DOT8_ROW(b2,a2,d2); TF_NVFP4_DOT8_ROW(b3,a3,d3);
@@ -3936,10 +4008,18 @@ static void tf_matvec_qtensor_rows(float *dst, const qtensor *mat, const float *
             dst[i] = tf_nvfp4_dot_sve(
                 (const block_nvfp4 *)(base + (size_t)i * rb), x, n_cols);
         if (!use_w4a8) {
-            for (; i + 7 < row_end; i += 8) {
-                tf_nvfp4_dot8_sve(dst + i, base + (size_t)i * rb,
-                                   rb, x, n_cols);
-                grouped_rows += 8;
+            if (tf_nvfp4_fast_mode) {
+                for (; i + 7 < row_end; i += 8) {
+                    tf_nvfp4_dot8_fast_sve(dst + i, base + (size_t)i * rb,
+                                            rb, x, n_cols);
+                    grouped_rows += 8;
+                }
+            } else {
+                for (; i + 7 < row_end; i += 8) {
+                    tf_nvfp4_dot8_sve(dst + i, base + (size_t)i * rb,
+                                       rb, x, n_cols);
+                    grouped_rows += 8;
+                }
             }
         }
         for (; i + 3 < row_end; i += 4) {
