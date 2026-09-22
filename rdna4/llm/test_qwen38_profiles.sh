@@ -67,6 +67,22 @@ grep -q 'matvec_q2_K_q81' "${runner_c}" || {
     echo 'profile test: llama.cpp Q2_K Q8_1 A/B kernel missing' >&2
     exit 1
 }
+grep -q 'cur_position >= 0 && r->cur_position < 256' "${runner_c}" || {
+    echo 'profile test: short-window Q8 combine elision missing' >&2
+    exit 1
+}
+grep -q 'LLM_QWEN35_DFLASH_INJECT_KV_FUSED' "${root_dir}/qwen35_dflash2.h" || {
+    echo 'profile test: DFlash fused injection candidate missing' >&2
+    exit 1
+}
+grep -q 'LLM_QWEN35_DFLASH_EMBED_BROADCAST_KERNEL' "${root_dir}/qwen35_dflash2.h" || {
+    echo 'profile test: DFlash mask broadcast candidate missing' >&2
+    exit 1
+}
+grep -q 'io_vectors' "${root_dir}/qwen35_nextn.h" || {
+    echo 'profile test: fused commit IO coverage guard missing' >&2
+    exit 1
+}
 grep -q 'QWEN38_GSQ_DECODE_TARGET:-30' "${root_dir}/bench_qwen38_gsq_decode.sh" || {
     echo 'profile test: GSQ 30 tok/s target gate missing' >&2
     exit 1
