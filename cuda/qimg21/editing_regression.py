@@ -41,6 +41,8 @@ def main():
     quant.add_argument("--quantize-on-load", choices=("int8-row",))
     ap.add_argument("--int8-tensor-core", action="store_true",
                     help="use dynamic W8A8 native tensor-core GEMM")
+    ap.add_argument("--int8-bf16-tail-blocks", type=int, default=0,
+                    help="reconstruct this many final transformer blocks to BF16")
     args = ap.parse_args()
     ref = args.reference_dir.resolve()
     predictions = sorted(ref.glob("pred_*.npy"))
@@ -54,11 +56,14 @@ def main():
     is_quantized = bool(args.quantized_transformer or args.quantize_on_load)
     if args.int8_tensor_core and not args.quantized_transformer:
         ap.error("--int8-tensor-core requires --quantized-transformer")
+    if not 0 <= args.int8_bf16_tail_blocks <= 32:
+        ap.error("--int8-bf16-tail-blocks must be in [0, 32]")
     mre_threshold = W8A8_MRE_THRESHOLD if args.int8_tensor_core else QUANTIZED_MRE_THRESHOLD
     cosine_threshold = None if is_quantized else NONQUANTIZED_COSINE_THRESHOLD
     results = {"threshold": cosine_threshold,
                "mre_threshold": mre_threshold if is_quantized else None,
                "int8_tensor_core": args.int8_tensor_core,
+               "int8_bf16_tail_blocks": args.int8_bf16_tail_blocks,
                "quantized": is_quantized,
                "reference": str(ref), "model": str(args.model.resolve()),
                "true_cfg_scale": scale, "predictions": [], "trajectory": [],
@@ -82,7 +87,8 @@ def main():
         elif args.quantize_on_load:
             cmd.extend(["--quantize-on-load", args.quantize_on_load])
         if args.int8_tensor_core:
-            cmd.append("--int8-tensor-core")
+            cmd.extend(["--int8-tensor-core", "--int8-bf16-tail-blocks",
+                        str(args.int8_bf16_tail_blocks)])
         if scale > 1:
             negative = fixture / "negative"
             cmd.extend(["--negative-editing-layout", str(negative / "layout.txt"),

@@ -201,6 +201,8 @@ static st_context *find_tensor(const qimg21_shards *s, const char *name, int *id
 static const char *qimg21_quantized_transformer;
 static int qimg21_quantize_on_load;
 static int qimg21_int8_tensor_core;
+static int qimg21_int8_bf16_tail_blocks;
+static int qimg21_int8_force_bf16;
 static CUdeviceptr qimg21_int8_input_f32;
 static size_t qimg21_int8_input_f32_bytes;
 static unsigned long long qimg21_int8_mma_calls;
@@ -212,7 +214,7 @@ static CUdeviceptr upload_bf16(const qimg21_shards *s, const char *name) {
         const uint64_t *shape = safetensors_shape(st, idx);
         char path[2048];
         uint16_t *data;
-        if (qimg21_int8_tensor_core) {
+        if (qimg21_int8_tensor_core && !qimg21_int8_force_bf16) {
             int len = snprintf(path, sizeof(path), "%s/%s.safetensors", qimg21_quantized_transformer, name);
             size_t bytes = 0;
             void *fat = len < 0 || len >= (int)sizeof(path) ? NULL :
@@ -387,7 +389,7 @@ static int launch_cast(cuda_qimg_runner *r, CUdeviceptr dst, CUdeviceptr src, in
 
 static int gemm(cuda_qimg_runner *r, CUdeviceptr y, CUdeviceptr w, CUdeviceptr x,
                 int nt, int no, int ni) {
-    if (qimg21_int8_tensor_core) {
+    if (qimg21_int8_tensor_core && !qimg21_int8_force_bf16) {
         size_t input_bytes = (size_t)nt * ni * sizeof(float);
         if (input_bytes > qimg21_int8_input_f32_bytes) {
             if (qimg21_int8_input_f32) cuMemFree(qimg21_int8_input_f32);
@@ -539,6 +541,8 @@ static int native_step(cuda_qimg_runner *r, qimg21_kernels *k, const qimg21_shar
     probe(r,"mod",mod,2*16384); dump_stage("mod",mod,2u*16384u,2,16384);
     probe(r,"mod_zero",mod+(size_t)16384*4,16384);
     for(int bidx=0;bidx<32;bidx++){
+        qimg21_int8_force_bf16 = qimg21_int8_tensor_core &&
+                                 bidx >= 32 - qimg21_int8_bf16_tail_blocks;
         if(qimg21_replay_hidden && bidx<qimg21_stage_block)continue;
         if(qimg21_replay_hidden && bidx==qimg21_stage_block) {
             npy_f32 replay={0};
@@ -627,6 +631,7 @@ static int native_step(cuda_qimg_runner *r, qimg21_kernels *k, const qimg21_shar
         continue;
 fail_block: free_d(&wq);free_d(&wk);free_d(&wv);free_d(&wo);free_d(&wg);free_d(&wp);free_d(&wmlpo);free_d(&wqn);free_d(&wkn);goto fail;
     }
+    qimg21_int8_force_bf16 = 0;
     w_img=upload_bf16(s,"norm_out.linear.weight");w_proj=upload_bf16(s,"proj_out.weight");if(!w_img||!w_proj)goto fail;
     /* Preserve both real and zero timestep rows through final modulation. */
     if(launch_vec(k->silu,r->stream,2*D,temb)!=CUDA_SUCCESS||launch_vec(k->round_bf16,r->stream,2*D,temb)!=CUDA_SUCCESS||launch_cast(r,bf,temb,2*D)!=CUDA_SUCCESS||gemm(r,scale,w_img,bf,2,D,D)!=0||launch_vec(k->round_bf16,r->stream,2*D,scale)!=CUDA_SUCCESS)goto fail;
@@ -678,6 +683,8 @@ int main(int argc, char **argv) {
             qimg21_quantize_on_load = 1;
         }
         else if (!strcmp(argv[i], "--int8-tensor-core")) qimg21_int8_tensor_core = 1;
+        else if (!strcmp(argv[i], "--int8-bf16-tail-blocks") && i + 1 < argc)
+            qimg21_int8_bf16_tail_blocks = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--attention") && i + 1 < argc) {
             const char *mode = argv[++i];
             qimg21_attention_mma64=0;
@@ -712,6 +719,7 @@ int main(int argc, char **argv) {
         else {
             fprintf(stderr, "usage: %s --model DIR --prompt-embeds E.npy --latents L.npy "
                     "[--negative-prompt-embeds NEG.npy --guidance-scale S] "
+                    "[--int8-tensor-core --int8-bf16-tail-blocks N] "
                     "[--editing-layout layout.txt --condition-latents C.npy] "
                     "[--negative-editing-layout negative_layout.txt] "
                     "[--steps N --dump-dir DIR --pred-dir DIR --height-tokens 16 --width-tokens 16 "
@@ -731,6 +739,9 @@ int main(int argc, char **argv) {
     }
     if (qimg21_int8_tensor_core && !qimg21_quantized_transformer) {
         fprintf(stderr,"native: --int8-tensor-core requires --quantized-transformer\n"); return 2;
+    }
+    if (qimg21_int8_bf16_tail_blocks < 0 || qimg21_int8_bf16_tail_blocks > 32) {
+        fprintf(stderr,"native: --int8-bf16-tail-blocks must be in [0,32]\n"); return 2;
     }
     if (qimg21_quantize_on_load) fprintf(stderr,"native: row-INT8 quantization on load; BF16 compute, no exported copy\n");
     if (qimg21_quantized_transformer) {

@@ -198,9 +198,15 @@ quantization is materially noisier than row-INT8 weights with BF16 compute.
 In exact two-step editing, prediction MREs are `0.072323` and `0.202099`, and
 trajectory MREs are `0.082492` and `0.081736`. True-CFG scale 4 trajectory MRE
 peaks at `0.196597`; its isolated low-timestep guided prediction reaches
-`0.333089` and is explicitly outside the 0.25 gate. SmoothQuant or a similarly
-calibrated activation scheme remains desirable for strict CFG prediction
-quality.
+`0.333089` with every block in W8A8. For strict CFG prediction quality, pass
+`--int8-bf16-tail-blocks 16`. This reconstructs the final 16 transformer
+blocks from the row-INT8 package for BF16 GEMM while retaining the custom
+fused-scale INT8 tensor-core path in the first 16 blocks and the surrounding
+projections. The calibrated true-CFG prediction MREs are `0.177098` and
+`0.249895`, and trajectory MREs are `0.190641` and `0.189244`, all within the
+`<= 0.25` gate. Each CFG prediction still executes 230 custom INT8 MMA GEMMs.
+The option is explicit because the accuracy/speed tradeoff is specific to
+high-guidance editing; ordinary generation remains fully W8A8 by default.
 
 The full 1024x1024, 40-step W8A8 trajectory passes all checkpoints, with MRE
 rising smoothly to `0.041948` and final latent cosine `0.998980616`. It ran in
