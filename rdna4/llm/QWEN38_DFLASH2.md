@@ -84,7 +84,8 @@ previous activation-buffer alias with the next target proposal. The target
 and injection streams are ordered by `target_ready`, and `inject_done` still
 guards sidecar KV reuse. The overlap path requires the BF16 injection plans;
 allocation failure falls back to serialized injection and leaves production
-defaults unchanged.
+defaults unchanged. Partial workspace cleanup nulls each freed pointer, so a
+retry or teardown after allocation failure cannot double-free sidecar buffers.
 
 ## Native IQ3 Q/K/V projection candidate
 

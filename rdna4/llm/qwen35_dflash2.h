@@ -78,7 +78,9 @@ static int hllm_dflash_overlap_enabled(void) {
 
 static void hllm_dflash_overlap_workspace_free(hllm_qwen35_dflash2 *d) {
     if (!d) return;
-#define DFLASH_WS_FREE(p) do { if (p) hipFree(p); } while (0)
+#define DFLASH_WS_FREE(p) do { \
+        if (p) { hipFree(p); (p) = NULL; } \
+    } while (0)
     DFLASH_WS_FREE(d->inject_x); DFLASH_WS_FREE(d->inject_x_bf16);
     DFLASH_WS_FREE(d->inject_norm);
     DFLASH_WS_FREE(d->inject_k); DFLASH_WS_FREE(d->inject_v);

@@ -130,7 +130,9 @@ feature, BF16, normalized, and K/V buffers, while the next target proposal can
 reuse its normal scratch. The injection stream still publishes `inject_done`
 before any sidecar proposal can read the updated KV cache. The path requires
 the loaded BF16 injection plans and falls back to serialized injection if the
-workspaces cannot be created. It remains opt-in pending a resident-GPU
+workspaces cannot be created. Workspace cleanup now nulls each freed pointer,
+so a partial allocation failure can safely retry or fall back without a
+double-free during teardown. It remains opt-in pending a resident-GPU
 throughput and quality run.
 
 ## 2026-09-22 continuation: native IQ3 Q/K/V projection candidate
