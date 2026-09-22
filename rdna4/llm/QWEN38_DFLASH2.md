@@ -613,6 +613,13 @@ tok/s fused mean.  The kernel trace is under
 `tmp/qwen38/ordinary-decode-profile-siluq81/`; set the diagnostic
 `LLM_QWEN35_SPLIT_SILU_Q81=1` to restore the two-launch boundary.
 
+For native Q8 attention, the host now skips the separate combine dispatch when
+the causal window is no more than one 256-token tile. The decode and prefill
+kernels already store the final normalized row for `splits == 1`, so this is a
+dispatch-only cleanup: Q8/Q8 arithmetic, output layout, and the captured
+long-context graph are unchanged. Long-context windows still use the existing
+split/combine path.
+
 The 48 recurrent output layers now fold native Q8_1 staging into their
 per-head gated RMSNorm/SiLU kernel.  The fused kernel retains the original
 128-thread reduction, load loop, and stored activation boundary before four

@@ -23292,6 +23292,11 @@ static inline void launch_attn_decode_native_q8(hip_llm_runner *r, void *out,
                r->n_heads * r->q8_attention_max_splits, 1, 1,
                32, 4, 1, 0, r->stream, a);
     }
+    /* The decode kernel writes final output directly when its adaptive split
+     * count is one; avoid enqueueing the combine no-op while the causal
+     * length is at most one 256-token tile. Host cur_position is published
+     * to d_position before this layer, so this guard follows that decision. */
+    if (r->cur_position >= 0 && r->cur_position < 256) return;
     void *b[] = { &out, &r->d_q8_attention_parts, &r->d_q8_attention_meta,
         &r->d_position, &r->n_heads, &r->q8_attention_nsm, &occupancy, &forced_splits };
     LAUNCH(r->fn_q8_attention_combine, r->n_heads, 1, 1, 256, 1, 1,
@@ -23395,6 +23400,7 @@ static int launch_attn_prefill_native_q8(hip_llm_runner *r, void *out,
         &q, &k, &v, &ks, &vs, &r->d_position, &r->n_heads, &r->n_kv_heads,
         &r->q8_attention_nsm, &occupancy, &splits, &queries, &position_start };
     CHECK_HIP(LAUNCH(r->fn_q8_attention_decode, queries, splits, r->n_heads, 32, 4, 1, 0, r->stream, a));
+    if (splits == 1) return 0;
     void *b[] = { &out, &r->d_q8_prefill_parts, &r->d_q8_prefill_meta,
         &r->d_position, &r->n_heads, &r->q8_attention_nsm, &occupancy, &splits };
     CHECK_HIP(LAUNCH(r->fn_q8_attention_combine, r->n_heads, queries, 1, 256, 1, 1,

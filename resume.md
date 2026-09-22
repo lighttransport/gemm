@@ -46,6 +46,15 @@ standalone 128-thread geometry for the tall 5120-column FFN shape. SiLU stays
 as a separate exact stage; the serialized gate/up path remains the default
 pending resident 4K/64K logit, hash, and timing validation.
 
+## 2026-09-22 continuation: skip no-op short-window attention combine
+
+Native Q8 decode and prefill now omit the separate split-combine launch when
+the causal window has at most one 256-token tile. The attention kernel already
+writes the normalized result directly for `splits == 1`; the host guard only
+removes the no-op dispatch and leaves the split arithmetic, output buffer, and
+captured long-context graph unchanged. The production path remains otherwise
+unchanged pending resident hash and throughput measurements.
+
 ## 2026-09-22 continuation: sixteen-way DFlash selector candidate
 
 The opt-in `LLM_QWEN35_DFLASH_SELECTOR_WARP16=1` path assigns one warp to
