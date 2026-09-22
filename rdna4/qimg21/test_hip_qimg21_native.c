@@ -1,15 +1,15 @@
 /*
  * Native Qwen-Image 2.1 transformer bring-up.
  *
- * This is deliberately a small, inspectable C/CUDA path.  It uses the
- * repository's dynamic CUDA/NVRTC loader and cuBLAS BF16 GEMM wrapper, but
- * owns the Qwen-Image 2.1 block math (zero-centred RMSNorm, Ada modulation,
+ * This is deliberately a small, inspectable C/HIP path. It uses the
+ * repository's dynamic HIP/HIPRTC loader and gfx12 BF16 WMMA GEMM kernels,
+ * while owning the Qwen-Image 2.1 block math (zero-centred RMSNorm, Ada modulation,
  * 3-axis RoPE, block-causal attention, SwiGLU and the residual gates).
  *
  * The first native milestone consumes the text-encoder output from a .npy
  * fixture.  Keeping tokenisation/text/VAE out of this executable makes the
- * transformer kernel comparison deterministic and keeps the 12 GB card well
- * below its memory limit.  The Python reference runner produces the fixture.
+ * transformer kernel comparison deterministic and fits the 16 GB RDNA4 card.
+ * The Python reference runner produces the fixture.
  */
 
 #define SAFETENSORS_IMPLEMENTATION

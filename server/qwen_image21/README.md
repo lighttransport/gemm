@@ -12,10 +12,12 @@ application. It exposes three run modes and two accelerator backends:
 - `Compare` runs both sequentially under one device lock and renders them
   side-by-side.
 
-The quantization switch applies the exported row-INT8 package to the CUDA
-runner, enables custom INT8 tensor-core GEMMs, and uses the calibrated
-16-block BF16 tail for true-CFG quality. The PyTorch reference remains
-unquantized so it stays an arithmetic reference.
+The quantization switch applies the exported row-INT8 package. CUDA enables
+custom INT8 tensor-core GEMMs and the calibrated 16-block BF16 tail; ROCm
+dequantizes each streamed matrix to BF16 for its WMMA GEMMs. The PyTorch
+reference remains unquantized so it stays an arithmetic reference. On the RX
+9070 XT the dequantized ROCm route is currently slower than the native BF16
+checkpoint; leave the switch off for performance runs.
 
 Start it after building the native binaries:
 
