@@ -67,11 +67,12 @@ __device__ float q21_round_bf16(float value) {
 __global__ void q21_vision_layer_norm_kernel(float *out, const float *input,
                                               const float *weight, const float *bias,
                                               int width) {
-    int row = blockIdx.x, thread = threadIdx.x, lane = thread & 31, warp = thread >> 5;
+    int row = blockIdx.x, thread = threadIdx.x + threadIdx.y * blockDim.x;
+    int lane = threadIdx.x & 31, warp = thread >> 5;
     __shared__ float shared[12];
     q21_ln_stat stat{0.0f, 0.0f, 0.0f};
     int vectors = width / 4;
-    for (int vector = thread; vector < vectors; vector += blockDim.x) {
+    for (int vector = thread; vector < vectors; vector += blockDim.x * blockDim.y) {
         int column = vector * 4;
 #pragma unroll
         for (int i = 0; i < 4; ++i) stat = q21_ln_add(stat, input[row * width + column + i]);
@@ -82,7 +83,7 @@ __global__ void q21_vision_layer_norm_kernel(float *out, const float *input,
                           __shfl_down_sync(0xffffffff, stat.count, offset)};
         stat = q21_ln_combine(stat, other);
     }
-    for (int offset = blockDim.x / 64; offset; offset >>= 1) {
+    for (int offset = blockDim.x * blockDim.y / 64; offset; offset >>= 1) {
         if (lane == 0 && warp >= offset && warp < 2 * offset) {
             int index = warp - offset;
             shared[2 * index] = stat.mean;
@@ -102,7 +103,7 @@ __global__ void q21_vision_layer_norm_kernel(float *out, const float *input,
     }
     __syncthreads();
     float mean = shared[0], inverse = rsqrtf(shared[1] + 1.0e-6f);
-    for (int column = thread; column < width; column += blockDim.x) {
+    for (int column = thread; column < width; column += blockDim.x * blockDim.y) {
         float value = weight[column] * (inverse * (input[row * width + column] - mean)) + bias[column];
         out[row * width + column] = q21_round_bf16(value);
     }
@@ -110,11 +111,12 @@ __global__ void q21_vision_layer_norm_kernel(float *out, const float *input,
 
 __global__ void q21_vision_layer_norm_stats_kernel(float *out, const float *input,
                                                     int width) {
-    int row = blockIdx.x, thread = threadIdx.x, lane = thread & 31, warp = thread >> 5;
+    int row = blockIdx.x, thread = threadIdx.x + threadIdx.y * blockDim.x;
+    int lane = threadIdx.x & 31, warp = thread >> 5;
     __shared__ float shared[12];
     q21_ln_stat stat{0.0f, 0.0f, 0.0f};
     int vectors = width / 4;
-    for (int vector = thread; vector < vectors; vector += blockDim.x) {
+    for (int vector = thread; vector < vectors; vector += blockDim.x * blockDim.y) {
         int column = vector * 4;
 #pragma unroll
         for (int i = 0; i < 4; ++i) stat = q21_ln_add(stat, input[row * width + column + i]);
@@ -125,7 +127,7 @@ __global__ void q21_vision_layer_norm_stats_kernel(float *out, const float *inpu
                           __shfl_down_sync(0xffffffff, stat.count, offset)};
         stat = q21_ln_combine(stat, other);
     }
-    for (int offset = blockDim.x / 64; offset; offset >>= 1) {
+    for (int offset = blockDim.x * blockDim.y / 64; offset; offset >>= 1) {
         if (lane == 0 && warp >= offset && warp < 2 * offset) {
             int index = warp - offset;
             shared[2 * index] = stat.mean;
@@ -160,7 +162,8 @@ extern "C" int q21_flash_vision_layer_norm_pytorch(float *out, const float *inpu
                                                      cudaStream_t stream) {
     if (!out || !input || !weight || !bias || rows <= 0 || width <= 0 || width % 4)
         return cudaErrorInvalidValue;
-    q21_vision_layer_norm_kernel<<<rows, 128, 0, stream>>>(out, input, weight, bias, width);
+    q21_vision_layer_norm_kernel<<<rows, dim3(32, 4), 0, stream>>>(
+        out, input, weight, bias, width);
     return cudaGetLastError();
 }
 
@@ -179,7 +182,8 @@ extern "C" int q21_flash_vision_layer_norm_stats_pytorch(float *out,
                                                            cudaStream_t stream) {
     if (!out || !input || rows <= 0 || width <= 0 || width % 4)
         return cudaErrorInvalidValue;
-    q21_vision_layer_norm_stats_kernel<<<rows, 128, 0, stream>>>(out, input, width);
+    q21_vision_layer_norm_stats_kernel<<<rows, dim3(32, 4), 0, stream>>>(
+        out, input, width);
     return cudaGetLastError();
 }
 

@@ -1269,7 +1269,7 @@ experimental editing integration to exercise the complete native path. Use `--hi
 for merger-only replay, and `--dump-dir DIR` to save every executed block.
 `--layer-norm nvrtc` retains the in-module Welford implementation for
 diagnosis while `nvcc` remains the default. `nvcc-pytorch` selects the literal
-128-thread/four-warp launch used by pinned ATen: its block-0 LayerNorm rstd is
+`dim3(32,4)` 128-thread/four-warp launch used by pinned ATen: its block-0 LayerNorm rstd is
 bit-exact, LayerNorm output is 99.9986% elementwise exact, and teacher-forced
 block-0 cosine improves to 0.999999933. Its full block-26 cosine is
 0.999687034, slightly below the eight-warp default's 0.999691509, so it remains
