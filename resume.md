@@ -1521,6 +1521,11 @@ The post-change llama.cpp HIP differential was rerun successfully: all
 patterns, adaptive split counts, and multi-query reuse shapes. This keeps the
 Q8/Q8 attention and cache contract intact while the ordinary single-query
 projection/SSM bottleneck remains open.
+The current binary also passes the resident K=4 DFlash quality suite after
+the GSQ guard: HTTP/stdio cache restore, greedy and sampled repeatability,
+cancellation/concurrency, multi-turn C++, and algorithmic C++ compile/run all
+pass. The 121-token window measured 74.23 tok/s end-to-end with 93/108
+accepted.
 The next exact candidate sweep was also negative: MTP IQ1/Q81 reuse measured
 48.99 tok/s versus 49.07 tok/s control, and split residual RMSNorm measured
 48.15 tok/s; both retained hash `96b92d606dde5e28`. DFlash K=4 QKV + gate/up
