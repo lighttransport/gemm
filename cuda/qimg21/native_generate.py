@@ -141,6 +141,7 @@ def main() -> int:
         _run([str(encoder), "--model", str(model / "vae"),
               "--input-image", str(Path(args.image).resolve()),
               "--resolution", str(args.condition_resolution),
+              "--pipeline-bf16",
               "--preprocessed-out", str(condition_dir / "image.npy"),
               "--resized-out", str(condition_dir / "resized.png"),
               "--out", str(condition_dir / "moments.npy"),

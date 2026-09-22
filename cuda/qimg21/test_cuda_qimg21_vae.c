@@ -135,6 +135,18 @@ static const char *q21_vae_dump_dir;
 static void q21_dump(cuda_qimg_runner *r, CUdeviceptr x, int c, int h, int w,
                      const char *label) {
     if (!q21_vae_dump_dir) return;
+    if (getenv("QIMG21_VAE_DUMP_STAGES")) {
+        int keep = 0;
+        for (int stage = 0; stage < 5; stage++) {
+            char expected[32];
+            snprintf(expected, sizeof(expected), "encoder_down_%d", stage);
+            if (!strcmp(label, expected)) keep = 1;
+        }
+        if (!keep) return;
+    }
+    const char *match = getenv("QIMG21_VAE_DUMP_MATCH");
+    if (match && (getenv("QIMG21_VAE_DUMP_EXACT") ? strcmp(label, match) != 0
+                                                   : !strstr(label, match))) return;
     size_t n = (size_t)c * h * w;
     float *host = (float *)malloc(n * sizeof(float));
     if (!host) return;
@@ -156,6 +168,18 @@ static float q21_bf16(uint16_t x) {
     float f;
     memcpy(&f, &u, sizeof(f));
     return f;
+}
+
+static int q21_vae_bf16_mode;
+typedef int (*q21_cutlass_vae_attention_fn)(float*,const float*,const float*,const float*,int,int,void*);
+static q21_cutlass_vae_attention_fn q21_cutlass_vae_attention;
+
+static float q21_round_bf16(float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    bits = (bits + 0x7fffu + ((bits >> 16) & 1u)) & 0xffff0000u;
+    memcpy(&value, &bits, sizeof(value));
+    return value;
 }
 
 /* Upload a qimg-21 F32/BF16 tensor and return its 4-D conv shape. */
@@ -187,6 +211,8 @@ static CUdeviceptr q21_upload(const st_context *st, const char *name,
         free(host);
         return 0;
     }
+    if (q21_vae_bf16_mode)
+        for (size_t i = 0; i < n; i++) host[i] = q21_round_bf16(host[i]);
     CUdeviceptr d = checked_cuMemAlloc(n * sizeof(float));
     if (d) cuMemcpyHtoD(d, host, n * sizeof(float));
     free(host);
@@ -253,18 +279,20 @@ static CUdeviceptr q21_resblock_trace(cuda_qimg_runner *r, CUdeviceptr x,
     q21_dump(r,x,ci,h,w,"trace_input");
     q21_dump(r,n1,ci,1,1,"trace_gamma1");
     tmp=checked_cuMemAlloc((size_t)ci*sp*sizeof(float)); if(!tmp) goto fail;
-    vae_op_gn(r,tmp,x,n1,ci,sp); q21_dump(r,tmp,ci,h,w,"trace_norm1");
-    vae_op_silu(r,tmp,ci*sp); q21_dump(r,tmp,ci,h,w,"trace_silu1");
+    vae_op_gn(r,tmp,x,n1,ci,sp); vae_bf16(r,tmp,ci*sp); q21_dump(r,tmp,ci,h,w,"trace_norm1");
+    vae_op_silu(r,tmp,ci*sp); vae_bf16(r,tmp,ci*sp); q21_dump(r,tmp,ci,h,w,"trace_silu1");
     c1o=checked_cuMemAlloc((size_t)co*sp*sizeof(float)); if(!c1o) goto fail;
-    vae_op_conv2d(r,c1o,tmp,c1,b1,ci,h,w,co,3,3,0); q21_dump(r,c1o,co,h,w,"trace_conv1");
+    vae_op_conv2d(r,c1o,tmp,c1,b1,ci,h,w,co,3,3,0); vae_bf16(r,c1o,co*sp); q21_dump(r,c1o,co,h,w,"trace_conv1");
     q21_free(&tmp); tmp=checked_cuMemAlloc((size_t)co*sp*sizeof(float)); if(!tmp) goto fail;
-    vae_op_gn(r,tmp,c1o,n2,co,sp); q21_dump(r,tmp,co,h,w,"trace_norm2");
-    vae_op_silu(r,tmp,co*sp); q21_dump(r,tmp,co,h,w,"trace_silu2");
+    vae_op_gn(r,tmp,c1o,n2,co,sp); vae_bf16(r,tmp,co*sp); q21_dump(r,tmp,co,h,w,"trace_norm2");
+    vae_op_silu(r,tmp,co*sp); vae_bf16(r,tmp,co*sp); q21_dump(r,tmp,co,h,w,"trace_silu2");
     c2o=checked_cuMemAlloc((size_t)co*sp*sizeof(float)); if(!c2o) goto fail;
-    vae_op_conv2d(r,c2o,tmp,c2,b2,co,h,w,co,3,3,0); q21_dump(r,c2o,co,h,w,"trace_conv2");
+    vae_op_conv2d(r,c2o,tmp,c2,b2,co,h,w,co,3,3,0); vae_bf16(r,c2o,co*sp); q21_dump(r,c2o,co,h,w,"trace_conv2");
     out=checked_cuMemAlloc((size_t)co*sp*sizeof(float)); if(!out) goto fail;
     if(scw) vae_op_conv2d(r,out,x,scw,scb,ci,h,w,co,1,1,0); else cuMemcpyDtoD(out,x,(size_t)co*sp*sizeof(float));
+    q21_dump(r,out,co,h,w,"trace_shortcut");
     { int n=co*sp; float one=1.0f; void *a[]={&out,&c2o,&one,&n}; cuLaunchKernel(r->euler_step,(n+255)/256,1,1,256,1,1,0,r->stream,a,NULL); }
+    vae_bf16(r,out,co*sp);
     q21_dump(r,out,co,h,w,"trace_out");
     q21_free_resblock(&n1,&c1,&b1,&n2,&c2,&b2,&scw,&scb); q21_free(&tmp);q21_free(&c1o);q21_free(&c2o); return out;
 fail:
@@ -346,7 +374,10 @@ static CUdeviceptr q21_mid_attention_named(cuda_qimg_runner *r, const st_context
     qkv=checked_cuMemAlloc((size_t)3*c*spatial*sizeof(float));
     if(!norm||!qkv) goto fail;
     vae_op_gn(r,norm,x,gn,c,spatial);
+    vae_bf16(r,norm,c*spatial);
     vae_op_conv2d(r,qkv,norm,qkvw,qkvb,c,h,w,3*c,1,1,0);
+    vae_bf16(r,qkv,3*c*spatial);
+    q21_dump(r,qkv,3*c,h,w,"mid_qkv");
     q21_free(&gn); q21_free(&qkvw); q21_free(&qkvb); q21_free(&norm);
     qs=checked_cuMemAlloc((size_t)spatial*c*sizeof(float));
     ks=checked_cuMemAlloc((size_t)spatial*c*sizeof(float));
@@ -360,8 +391,13 @@ static CUdeviceptr q21_mid_attention_named(cuda_qimg_runner *r, const st_context
     q21_free(&qkv);
     as=checked_cuMemAlloc((size_t)spatial*c*sizeof(float));
     if(!as) goto fail;
-    { float scale=1.0f/sqrtf((float)c); int sp=spatial; size_t smem=(size_t)2*c*sizeof(float);
+    if(q21_cutlass_vae_attention) {
+      if(q21_cutlass_vae_attention((float*)(uintptr_t)as,(float*)(uintptr_t)qs,
+          (float*)(uintptr_t)ks,(float*)(uintptr_t)vs,spatial,c,(void*)(uintptr_t)r->stream))goto fail;
+    } else { float scale=1.0f/sqrtf((float)c); int sp=spatial; size_t smem=(size_t)2*c*sizeof(float);
       void *a[]={&as,&qs,&ks,&vs,&sp,&c,&scale}; cuLaunchKernel(r->vae_attn_sc,(unsigned)spatial,1,1,32,1,1,smem,r->stream,a,NULL); }
+    vae_bf16(r,as,c*spatial);
+    q21_dump(r,as,c,1,spatial,"mid_attn_raw");
     q21_free(&qs); q21_free(&ks); q21_free(&vs);
     ach=checked_cuMemAlloc((size_t)c*spatial*sizeof(float));
     if(!ach) goto fail;
@@ -371,8 +407,11 @@ static CUdeviceptr q21_mid_attention_named(cuda_qimg_runner *r, const st_context
     po=checked_cuMemAlloc((size_t)c*spatial*sizeof(float));
     if(!po) goto fail;
     vae_op_conv2d(r,po,ach,pw,pb,c,h,w,c,1,1,0);
+    vae_bf16(r,po,c*spatial);
+    q21_dump(r,po,c,h,w,"mid_proj");
     q21_free(&ach); q21_free(&pw); q21_free(&pb);
     { int n=c*spatial; float one=1.0f; void *a[]={&x,&po,&one,&n}; cuLaunchKernel(r->euler_step,(n+255)/256,1,1,256,1,1,0,r->stream,a,NULL); }
+    vae_bf16(r,x,c*spatial);
     q21_free(&po);
     return x;
 fail:

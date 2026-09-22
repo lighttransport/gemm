@@ -3,6 +3,7 @@
 #define main q21_decoder_main
 #include "test_cuda_qimg21_vae.c"
 #undef main
+#include <dlfcn.h>
 #define STB_IMAGE_IMPLEMENTATION
 #include "../../common/stb_image.h"
 #define STB_IMAGE_RESIZE_IMPLEMENTATION
@@ -98,7 +99,7 @@ fail:
 }
 
 static int q21_load_image(const char *path, int resolution, const char *resized_output,
-                          float **out, int *oh, int *ow) {
+                          int bf16_input, float **out, int *oh, int *ow) {
     int sw, sh, channels;
     unsigned char *source = stbi_load(path, &sw, &sh, &channels, 4);
     if (!source || sw < 1 || sh < 1 || resolution < 32 || resolution > 1024) {
@@ -116,9 +117,10 @@ static int q21_load_image(const char *path, int resolution, const char *resized_
     if (resized_output && !stbi_write_png(resized_output, w, h, 4, resized, w * 4)) {
         free(resized); free(chw); stbi_image_free(source); return -1;
     }
-    for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) for (int c = 0; c < 4; c++)
-        chw[((size_t)c * h + y) * w + x] =
-            ((float)resized[((size_t)y * w + x) * 4 + c] / 255.0f) * 2.0f - 1.0f;
+    for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) for (int c = 0; c < 4; c++) {
+        float value = ((float)resized[((size_t)y * w + x) * 4 + c] / 255.0f) * 2.0f - 1.0f;
+        chw[((size_t)c * h + y) * w + x] = bf16_input ? q21_round_bf16(value) : value;
+    }
     free(resized); stbi_image_free(source);
     *out = chw; *oh = h; *ow = w;
     return 0;
@@ -137,34 +139,47 @@ static const char *q21_encoder_src =
 " for(int ic=0;ic<c;ic++)for(int fy=0;fy<3;fy++)for(int fx=0;fx<3;fx++){int iy=oy+fy-1,ix=ox+fx-1;\n"
 "  if(iy>=0&&iy<h&&ix>=0&&ix<w)sum+=inp[(ic*h+iy)*w+ix]*weight[((oc*c+ic)*3+fy)*3+fx];}\n"
 " out[idx]=sum;}\n"
+"__global__ void pad_bottom_right(float*out,const float*inp,int c,int h,int w){\n"
+" int i=blockIdx.x*blockDim.x+threadIdx.x,hp=h+1,wp=w+1,total=c*hp*wp;if(i>=total)return;\n"
+" int ch=i/(hp*wp),p=i%(hp*wp),y=p/wp,x=p%wp;out[i]=(y<h&&x<w)?inp[(ch*h+y)*w+x]:0.0f;}\n"
 "}\n";
+
+typedef int (*q21_cudnn_vae_conv2d_ex_fn)(float *,const float *,const float *,const float *,
+                                           int,int,int,int,int,int,int,int,int,int,void *);
+static q21_cudnn_vae_conv2d_ex_fn q21_cudnn_vae_conv2d_ex;
 
 static int q21_encode(cuda_qimg_runner *r, const st_context *st,
                       const float *input, int h, int w, float *output) {
     CUmodule module=NULL;
-    CUfunction avg, stride2;
+    CUfunction avg, stride2, pad_bottom_right;
     CUdeviceptr x=0,y=0,shortcut=0,gamma=0;
     int rc=1,c=96;
     if(cu_compile_kernels(&module,r->device,q21_encoder_src,"qimg21_encoder.cu",1,"qimg21_encoder")<0 ||
        cuModuleGetFunction(&avg,module,"avg_first") ||
-       cuModuleGetFunction(&stride2,module,"conv_stride2"))goto done;
+       cuModuleGetFunction(&stride2,module,"conv_stride2") ||
+       cuModuleGetFunction(&pad_bottom_right,module,"pad_bottom_right"))goto done;
     x=checked_cuMemAlloc((size_t)4*h*w*4);
     if(!x || cuMemcpyHtoD(x,input,(size_t)4*h*w*4) || cuCtxSynchronize())goto done;
     y=q21_conv(r,st,x,4,h,w,c,"encoder.conv_in.weight","encoder.conv_in.bias");
-    q21_free(&x);x=y;y=0;if(!x)goto done;
+    q21_free(&x);x=y;y=0;if(!x)goto done;vae_bf16(r,x,c*h*w);
     q21_dump(r,x,c,h,w,"encoder_conv_in");
     const int channels[5]={96,192,384,768,768};
     for(int stage=0;stage<5;stage++) {
+        r->vae_rms_contiguous_channels=stage==0;
         int co=channels[stage],fs=stage<4?2:1,ft=stage>0 && stage<4?2:1;
         int oh=h/fs,ow=w/fs,n=co*oh*ow;
         shortcut=checked_cuMemAlloc((size_t)n*4);if(!shortcut)goto done;
         void *args[]={&shortcut,&x,&c,&co,&h,&w,&ft,&fs};
         if(cuLaunchKernel(avg,(n+255)/256,1,1,256,1,1,0,r->stream,args,NULL) || cuCtxSynchronize())goto done;
+        vae_bf16(r,shortcut,n);
         char name[256],bias[256];
         for(int block=0;block<2;block++) {
             snprintf(name,sizeof(name),"encoder.down_blocks.%d.resnets.%d",stage,block);
-            y=q21_resblock(r,x,st,name,c,co,h,w);
+            y=((stage==4&&block==0&&getenv("QIMG21_VAE_TRACE"))||(stage==0&&block==0&&getenv("QIMG21_VAE_TRACE_STAGE0")))&&q21_vae_dump_dir
+                ?q21_resblock_trace(r,x,st,name,c,co,h,w):q21_resblock(r,x,st,name,c,co,h,w);
             q21_free(&x);x=y;y=0;if(!x)goto done;c=co;
+            snprintf(name,sizeof(name),"encoder_down_%d_resnet_%d",stage,block);
+            q21_dump(r,x,c,h,w,name);
         }
         if(fs==2) {
             snprintf(name,sizeof(name),"encoder.down_blocks.%d.downsampler.resample.1.weight",stage);
@@ -172,29 +187,47 @@ static int q21_encode(cuda_qimg_runner *r, const st_context *st,
             CUdeviceptr dw=q21_load_weight(st,name),db=q21_load_weight(st,bias);
             y=checked_cuMemAlloc((size_t)n*4);
             if(!dw||!db||!y){q21_free(&dw);q21_free(&db);goto done;}
-            void *a[]={&y,&x,&dw,&db,&c,&h,&w};
-            if(cuLaunchKernel(stride2,(n+255)/256,1,1,256,1,1,0,r->stream,a,NULL)||
-               cuStreamSynchronize(r->stream)){q21_free(&dw);q21_free(&db);goto done;}
+            if(q21_cudnn_vae_conv2d_ex) {
+                CUdeviceptr padded=checked_cuMemAlloc((size_t)c*(h+1)*(w+1)*4);
+                int pn=c*(h+1)*(w+1);void *pa[]={&padded,&x,&c,&h,&w};
+                if(!padded||cuLaunchKernel(pad_bottom_right,(pn+255)/256,1,1,256,1,1,0,r->stream,pa,NULL)||
+                   q21_cudnn_vae_conv2d_ex((float*)(uintptr_t)y,(float*)(uintptr_t)padded,
+                     (float*)(uintptr_t)dw,(float*)(uintptr_t)db,c,h+1,w+1,c,3,3,2,0,oh,ow,
+                     (void*)(uintptr_t)r->stream)){q21_free(&padded);q21_free(&dw);q21_free(&db);goto done;}
+                q21_free(&padded);
+            } else {
+                void *a[]={&y,&x,&dw,&db,&c,&h,&w};
+                if(cuLaunchKernel(stride2,(n+255)/256,1,1,256,1,1,0,r->stream,a,NULL)||
+                   cuStreamSynchronize(r->stream)){q21_free(&dw);q21_free(&db);goto done;}
+            }
+            vae_bf16(r,y,n);
+            snprintf(name,sizeof(name),"encoder_down_%d_downsample",stage);
+            q21_dump(r,y,c,oh,ow,name);
             q21_free(&dw);q21_free(&db);q21_free(&x);x=y;y=0;h=oh;w=ow;
         }
         float one=1;
         void *a[]={&x,&shortcut,&one,&n};
         if(cuLaunchKernel(r->euler_step,(n+255)/256,1,1,256,1,1,0,r->stream,a,NULL)||cuCtxSynchronize())goto done;
+        vae_bf16(r,x,n);
         q21_free(&shortcut);
         snprintf(name,sizeof(name),"encoder_down_%d",stage);q21_dump(r,x,c,h,w,name);
     }
+    r->vae_rms_contiguous_channels=0;
     y=q21_resblock(r,x,st,"encoder.mid_block.resnets.0",c,c,h,w);
-    q21_free(&x);x=y;y=0;if(!x)goto done;
+    q21_free(&x);x=y;y=0;if(!x)goto done;q21_dump(r,x,c,h,w,"mid_res0");
     if(!q21_mid_attention_named(r,st,x,c,h,w,"encoder.mid_block.attentions.0"))goto done;
+    q21_dump(r,x,c,h,w,"mid_attention");
     y=q21_resblock(r,x,st,"encoder.mid_block.resnets.1",c,c,h,w);
-    q21_free(&x);x=y;y=0;if(!x)goto done;
+    q21_free(&x);x=y;y=0;if(!x)goto done;q21_dump(r,x,c,h,w,"mid_res1");
     gamma=q21_load_weight(st,"encoder.norm_out.gamma");
     y=checked_cuMemAlloc((size_t)c*h*w*4);if(!gamma||!y)goto done;
-    vae_op_gn(r,y,x,gamma,c,h*w);vae_op_silu(r,y,c*h*w);
+    vae_op_gn(r,y,x,gamma,c,h*w);vae_bf16(r,y,c*h*w);
+    vae_op_silu(r,y,c*h*w);vae_bf16(r,y,c*h*w);
     q21_free(&x);q21_free(&gamma);x=y;y=0;
     y=q21_conv(r,st,x,c,h,w,128,"encoder.conv_out.weight","encoder.conv_out.bias");
-    q21_free(&x);x=y;y=0;if(!x)goto done;
+    q21_free(&x);x=y;y=0;if(!x)goto done;vae_bf16(r,x,128*h*w);
     y=q21_conv1(r,st,x,128,h,w,128,"quant_conv.weight","quant_conv.bias");
+    vae_bf16(r,y,128*h*w);
     if(!y||cuCtxSynchronize()||cuMemcpyDtoH(output,y,(size_t)128*h*w*4))goto done;
     rc=0;
 done:
@@ -206,7 +239,7 @@ done:
 int main(int argc,char **argv) {
     const char *model=NULL,*input=NULL,*input_image=NULL,*output=NULL,*latent_output=NULL;
     const char *preprocessed_output=NULL,*resized_output=NULL;
-    int resolution=1024,preprocess_only=0;
+    int resolution=1024,preprocess_only=0,pipeline_bf16=0;
     for(int i=1;i<argc;i++) {
         if(!strcmp(argv[i],"--model")&&i+1<argc)model=argv[++i];
         else if(!strcmp(argv[i],"--image")&&i+1<argc)input=argv[++i];
@@ -215,6 +248,7 @@ int main(int argc,char **argv) {
         else if(!strcmp(argv[i],"--preprocessed-out")&&i+1<argc)preprocessed_output=argv[++i];
         else if(!strcmp(argv[i],"--resized-out")&&i+1<argc)resized_output=argv[++i];
         else if(!strcmp(argv[i],"--preprocess-only"))preprocess_only=1;
+        else if(!strcmp(argv[i],"--pipeline-bf16"))pipeline_bf16=1;
         else if(!strcmp(argv[i],"--out")&&i+1<argc)output=argv[++i];
         else if(!strcmp(argv[i],"--normalized-latents")&&i+1<argc)latent_output=argv[++i];
         else return 2;
@@ -228,7 +262,8 @@ int main(int argc,char **argv) {
     q21_npy a={0};
     if(input_image) {
         int image_h,image_w;
-        if(q21_load_image(input_image,resolution,resized_output,&a.data,&image_h,&image_w))return 1;
+        if(q21_load_image(input_image,resolution,resized_output,pipeline_bf16,
+                          &a.data,&image_h,&image_w))return 1;
         a.n=(size_t)4*image_h*image_w;a.ndim=3;
         a.shape[0]=4;a.shape[1]=image_h;a.shape[2]=image_w;
     } else if(q21_npy_read_f32(input,&a))return 1;
@@ -240,6 +275,24 @@ int main(int argc,char **argv) {
     char path[2048];snprintf(path,sizeof(path),"%s/diffusion_pytorch_model.safetensors",model);
     st_context *st=safetensors_open(path);if(!st){q21_npy_free(&a);return 1;}
     cuda_qimg_runner *r=cuda_qimg_init(0,1);if(!r){safetensors_close(st);q21_npy_free(&a);return 1;}
+    q21_vae_bf16_mode=pipeline_bf16;
+    r->use_bf16_trunc=pipeline_bf16;
+    void *cudnn_vae_plugin=NULL;
+    if(pipeline_bf16) {
+        cudnn_vae_plugin=dlopen("cuda/qimg21/libq21_cudnn_vae.so",RTLD_NOW|RTLD_LOCAL);
+        qimg_vae_bf16_conv2d=cudnn_vae_plugin?(qimg_vae_bf16_conv2d_fn)
+            dlsym(cudnn_vae_plugin,"q21_cudnn_vae_conv2d"):NULL;
+        q21_cudnn_vae_conv2d_ex=cudnn_vae_plugin?(q21_cudnn_vae_conv2d_ex_fn)
+            dlsym(cudnn_vae_plugin,"q21_cudnn_vae_conv2d_ex"):NULL;
+        if(!qimg_vae_bf16_conv2d||!q21_cudnn_vae_conv2d_ex) {
+            fprintf(stderr,"failed to load BF16 cuDNN VAE convolution: %s\n",dlerror());
+            cuda_qimg_free(r);safetensors_close(st);q21_npy_free(&a);return 1;
+        }
+        void *cutlass_vae_plugin=dlopen("cuda/qimg21/libq21_cutlass_attention.so",RTLD_NOW|RTLD_LOCAL);
+        q21_cutlass_vae_attention=cutlass_vae_plugin?(q21_cutlass_vae_attention_fn)
+            dlsym(cutlass_vae_plugin,"q21_cutlass_vae_attention"):NULL;
+        if(!q21_cutlass_vae_attention){fprintf(stderr,"failed to load BF16 CUTLASS VAE attention: %s\n",dlerror());return 1;}
+    }
     r->use_fp8_pipe=0;r->use_fp8_pipe_perrow=0;
     CUstream original=r->stream;cuStreamSynchronize(original);r->stream=NULL;
     q21_vae_dump_dir=getenv("QIMG21_VAE_DUMP_DIR");if(q21_vae_dump_dir)mkdir(q21_vae_dump_dir,0755);
@@ -255,12 +308,16 @@ int main(int argc,char **argv) {
         if(!latents)rc=1;
         else {
             for(int i=0;i<tokens;i++)for(int c=0;c<64;c++)
-                latents[i*64+c]=(moments[c*tokens+i]-mean[c])/std[c];
+                latents[i*64+c]=pipeline_bf16
+                    ? q21_round_bf16(q21_round_bf16(q21_round_bf16(moments[c*tokens+i])-
+                                      q21_round_bf16(mean[c]))/q21_round_bf16(std[c]))
+                    : (moments[c*tokens+i]-mean[c])/std[c];
             char shape[64];snprintf(shape,sizeof(shape),"(%d, 64)",tokens);
             rc=q21_npy_write_shape(latent_output,latents,(size_t)tokens*64,shape);
             free(latents);
         }
     }
     cuStreamSynchronize(r->stream);r->stream=original;
-    free(moments);cuda_qimg_free(r);safetensors_close(st);q21_npy_free(&a);return rc?1:0;
+    free(moments);cuda_qimg_free(r);if(cudnn_vae_plugin)dlclose(cudnn_vae_plugin);
+    safetensors_close(st);q21_npy_free(&a);return rc?1:0;
 }

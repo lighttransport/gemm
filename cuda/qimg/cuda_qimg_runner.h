@@ -431,23 +431,58 @@ static const char *qimg_kernel_src =
  * Grid: (ceil(spatial/blockDim.x)), Block: (256) — one thread per spatial pos */
 "__global__ void vae_rmsnorm_f32(float *__restrict__ out,\n"
 "    const float *__restrict__ inp, const float *__restrict__ gamma,\n"
-"    int C, int spatial) {\n"
+"    int C, int spatial, int bf16_boundaries, int contiguous_channels) {\n"
 "    int s = blockIdx.x * blockDim.x + threadIdx.x;\n"
 "    if (s >= spatial) return;\n"
 "    /* Compute L2 norm across channels at this spatial position */\n"
 "    float sum_sq = 0.0f;\n"
-"    for (int c = 0; c < C; c++) {\n"
-"        float v = inp[c * spatial + s];\n"
-"        sum_sq += v * v;\n"
+"    if (bf16_boundaries) {\n"
+"        if (contiguous_channels) {\n"
+"            float lane[32];\n"
+"            for (int t=0;t<32;t++) {\n"
+"                float v0=inp[t*spatial+s],v1=inp[(t+32)*spatial+s],v2=inp[(t+64)*spatial+s];\n"
+"                lane[t]=__fadd_rn(__fadd_rn(__fmul_rn(v0,v0),__fmul_rn(v1,v1)),__fmul_rn(v2,v2));\n"
+"            }\n"
+"            for (int off=16;off;off>>=1) for (int t=0;t<off;t++)\n"
+"                lane[t]=__fadd_rn(lane[t],lane[t+off]);\n"
+"            sum_sq=lane[0];\n"
+"        } else {\n"
+"        float py[4];\n"
+"        for (int y=0;y<4;y++) {\n"
+"            float a0=0.0f,a1=0.0f,a2=0.0f,a3=0.0f;\n"
+"            for (int base=y;base<C;base+=16) {\n"
+"                float v=inp[base*spatial+s]; a0=__fadd_rn(a0,__fmul_rn(v,v));\n"
+"                if(base+4<C){v=inp[(base+4)*spatial+s];a1=__fadd_rn(a1,__fmul_rn(v,v));}\n"
+"                if(base+8<C){v=inp[(base+8)*spatial+s];a2=__fadd_rn(a2,__fmul_rn(v,v));}\n"
+"                if(base+12<C){v=inp[(base+12)*spatial+s];a3=__fadd_rn(a3,__fmul_rn(v,v));}\n"
+"            }\n"
+"            py[y]=__fadd_rn(__fadd_rn(__fadd_rn(a0,a1),a2),a3);\n"
+"        }\n"
+"        sum_sq=__fadd_rn(__fadd_rn(py[0],py[2]),__fadd_rn(py[1],py[3]));\n"
+"        }\n"
+"    } else for (int c = 0; c < C; c++) {\n"
+"        float v = inp[c * spatial + s]; sum_sq += v * v;\n"
 "    }\n"
-"    float inv_norm = rsqrtf(sum_sq + 1e-12f);\n"
+"    float norm = bf16_boundaries ? __fsqrt_rn(sum_sq) : sqrtf(sum_sq);\n"
 "    float scale = sqrtf((float)C);\n"
 "    for (int c = 0; c < C; c++) {\n"
 "        float gv = gamma ? gamma[c] : 1.0f;\n"
-"        out[c * spatial + s] = inp[c * spatial + s] * inv_norm * scale * gv;\n"
+"        float value = bf16_boundaries ? __fdiv_rn(inp[c * spatial + s], norm)\n"
+"                                      : inp[c * spatial + s] * rsqrtf(sum_sq);\n"
+"        if (bf16_boundaries) {\n"
+"            unsigned int bits; memcpy(&bits, &value, 4);\n"
+"            bits = (bits + 0x7fffu + ((bits >> 16) & 1u)) & 0xffff0000u;\n"
+"            memcpy(&value, &bits, 4);\n"
+"            value = __fmul_rn(value,scale); memcpy(&bits, &value, 4);\n"
+"            bits = (bits + 0x7fffu + ((bits >> 16) & 1u)) & 0xffff0000u;\n"
+"            memcpy(&value, &bits, 4);\n"
+"            value = __fmul_rn(value,gv); memcpy(&bits, &value, 4);\n"
+"            bits = (bits + 0x7fffu + ((bits >> 16) & 1u)) & 0xffff0000u;\n"
+"            memcpy(&value, &bits, 4);\n"
+"        } else value *= scale * gv;\n"
+"        out[c * spatial + s] = value;\n"
 "    }\n"
 "}\n"
-
 /* gemm_fp8w_f32: FP8 weights dequanted via LUT in registers, F32 inputs+accumulation.
  * W is raw FP8 bytes [n_out, n_in], X is F32 [n_tok, n_in].
  * Uses the constant memory LUT d_fp8_to_f16_lut but converts to F32.
@@ -1426,6 +1461,7 @@ struct cuda_qimg_runner {
     CUfunction truncate_bf16;
     CUfunction quantize_fp8_rt;  /* FP8 roundtrip quantization */
     int use_bf16_trunc;  /* 1 to truncate intermediates to BF16 precision */
+    int vae_rms_contiguous_channels; /* encoder channels-last RMS reduction topology */
     int use_old_gemm;    /* 1 to use old 16×16 tiled GEMM (for A/B testing) */
     CUfunction gated_add;
     CUfunction patchify;
@@ -5878,9 +5914,22 @@ static void vae_op_conv2d_mma(cuda_qimg_runner *r,
                               CUdeviceptr w_fp8, CUdeviceptr w_f32, CUdeviceptr bias,
                               int ci, int h, int w_s, int co, int kh, int kw,
                               int rep_pad, int pad_co, int n_in_pad);
+typedef int (*qimg_vae_bf16_conv2d_fn)(float *, const float *, const float *,
+                                       const float *, int, int, int, int, int,
+                                       int, void *);
+static qimg_vae_bf16_conv2d_fn qimg_vae_bf16_conv2d;
 static void vae_op_conv2d(cuda_qimg_runner *r, CUdeviceptr out, CUdeviceptr inp,
                           CUdeviceptr w, CUdeviceptr b,
                           int ci, int h, int w_s, int co, int kh, int kw, int rep_pad) {
+    if (r->use_bf16_trunc && !rep_pad && qimg_vae_bf16_conv2d) {
+        int failed = qimg_vae_bf16_conv2d((float *)(uintptr_t)out,
+                                          (float *)(uintptr_t)inp,
+                                          (float *)(uintptr_t)w,
+                                          (float *)(uintptr_t)b,
+                                          ci,h,w_s,co,kh,kw,
+                                          (void *)(uintptr_t)r->stream);
+        if (!failed) return;
+    }
     int n_tok = h * w_s;
     int n_in = ci * kh * kw;
     int n_in_pad = (n_in + 31) / 32 * 32;
@@ -5992,7 +6041,10 @@ static void vae_op_conv2d_mma(cuda_qimg_runner *r,
 /* GPU VAE RMS norm launch: L2-normalize along channels, scale by sqrt(C) * gamma */
 static void vae_op_gn(cuda_qimg_runner *r, CUdeviceptr out, CUdeviceptr inp,
                       CUdeviceptr gamma, int C, int spatial) {
-    void *args[] = {&out, &inp, &gamma, &C, &spatial};
+    int bf16_boundaries = r->use_bf16_trunc;
+    int contiguous_channels = r->vae_rms_contiguous_channels;
+    void *args[] = {&out, &inp, &gamma, &C, &spatial, &bf16_boundaries,
+                    &contiguous_channels};
     cuLaunchKernel(r->vae_rmsnorm, (unsigned)((spatial + 255) / 256), 1, 1,
                    256, 1, 1, 0, r->stream, args, NULL);
 }
@@ -6017,9 +6069,12 @@ static CUdeviceptr vae_op_upsample(cuda_qimg_runner *r, CUdeviceptr inp,
     return out;
 }
 
-/* BF16 truncation for VAE intermediates — DISABLED (ComfyUI F32=BF16). */
+/* Optional BF16 activation boundaries for matching BF16 Diffusers VAE runs. */
 static void vae_bf16(cuda_qimg_runner *r, CUdeviceptr x, int n) {
-    (void)r; (void)x; (void)n;  /* no-op: F32 is correct */
+    if (!r->use_bf16_trunc) return;
+    void *args[] = {&x, &n};
+    cuLaunchKernel(r->truncate_bf16, (unsigned)((n + 255) / 256), 1, 1,
+                   256, 1, 1, 0, r->stream, args, NULL);
 }
 
 /* GPU VAE ResBlock: GroupNorm→SiLU→Conv→GroupNorm→SiLU→Conv + shortcut */

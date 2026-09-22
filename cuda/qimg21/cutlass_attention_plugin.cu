@@ -9,12 +9,21 @@
 
 using q21_kernel = PyTorchMemEffAttention::AttentionKernel<
     cutlass::bfloat16_t, cutlass::arch::Sm80, true, 64, 128, 128, true, true>;
+using q21_vae_kernel = PyTorchMemEffAttention::AttentionKernel<
+    cutlass::bfloat16_t, cutlass::arch::Sm80, true, 32, 128, 65536, true, true>;
 
 __global__ void __launch_bounds__(q21_kernel::kNumThreads,
                                   q21_kernel::kMinBlocksPerSm)
 q21_cutlass_attention_kernel(typename q21_kernel::Params params) {
     if (!params.advance_to_block()) return;
     q21_kernel::attention_kernel(params);
+}
+
+__global__ void __launch_bounds__(q21_vae_kernel::kNumThreads,
+                                  q21_vae_kernel::kMinBlocksPerSm)
+q21_cutlass_vae_attention_kernel(typename q21_vae_kernel::Params params) {
+    if (!params.advance_to_block()) return;
+    q21_vae_kernel::attention_kernel(params);
 }
 
 /* The runners are single-stream, single-threaded processes.  Retain the two
@@ -78,6 +87,45 @@ __global__ void q21_cutlass_bf16_to_f32(float *out,
                                          int count) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < count) out[i] = static_cast<float>(in[i]);
+}
+
+__global__ void q21_cutlass_f32_to_bf16(cutlass::bfloat16_t *out,
+                                         const float *in, int count) {
+    int i=blockIdx.x*blockDim.x+threadIdx.x;
+    if(i<count)out[i]=cutlass::bfloat16_t(in[i]);
+}
+
+extern "C" int q21_cutlass_vae_attention(float *out, const float *q,
+                                           const float *k, const float *v,
+                                           int tokens, int head_dim,
+                                           cudaStream_t stream) {
+    if(!out||!q||!k||!v||tokens<=0||head_dim<=0||head_dim>65536)return cudaErrorInvalidValue;
+    cutlass::bfloat16_t *qb=nullptr,*kb=nullptr,*vb=nullptr;float *accum=nullptr;int count=tokens*head_dim;
+    size_t bytes=(size_t)count*sizeof(*qb);cudaError_t error;
+    if((error=cudaMalloc(&qb,bytes))!=cudaSuccess||(error=cudaMalloc(&kb,bytes))!=cudaSuccess||
+       (error=cudaMalloc(&vb,bytes))!=cudaSuccess||
+       (error=cudaMalloc(&accum,(size_t)count*sizeof(*accum)))!=cudaSuccess)goto done;
+    q21_cutlass_f32_to_bf16<<<(count+255)/256,256,0,stream>>>(qb,q,count);
+    q21_cutlass_f32_to_bf16<<<(count+255)/256,256,0,stream>>>(kb,k,count);
+    q21_cutlass_f32_to_bf16<<<(count+255)/256,256,0,stream>>>(vb,v,count);
+    { typename q21_vae_kernel::Params params;params.query_ptr=qb;params.key_ptr=kb;params.value_ptr=vb;
+      int lse_queries=((tokens+q21_vae_kernel::kAlignLSE-1)/q21_vae_kernel::kAlignLSE)*q21_vae_kernel::kAlignLSE;
+      error=q21_reserve_workspace(bytes,(size_t)lse_queries*sizeof(*workspace.lse));if(error!=cudaSuccess)goto done;
+      params.output_ptr=workspace.output;params.output_accum_ptr=accum;params.logsumexp_ptr=workspace.lse;
+      params.scale=static_cast<float>(1.0/std::sqrt(static_cast<double>(head_dim)));
+      params.head_dim=params.head_dim_value=head_dim;params.num_queries=tokens;
+      params.num_keys=params.num_keys_absolute=tokens;params.q_strideM=params.k_strideM=params.v_strideM=head_dim;
+      params.o_strideM=head_dim;params.q_strideH=params.k_strideH=params.v_strideH=head_dim;
+      params.q_strideB=params.k_strideB=params.v_strideB=(int64_t)tokens*head_dim;
+      params.num_batches=1;params.num_heads=1;params.q_heads_per_kv=1;
+      size_t shared_bytes=sizeof(typename q21_vae_kernel::SharedStorage);
+      error=cudaFuncSetAttribute(q21_cutlass_vae_attention_kernel,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)shared_bytes);
+      if(error==cudaSuccess){dim3 grid((tokens+q21_vae_kernel::kQueriesPerBlock-1)/q21_vae_kernel::kQueriesPerBlock,1,1);
+        q21_cutlass_vae_attention_kernel<<<grid,params.getThreadsGrid(),shared_bytes,stream>>>(params);error=cudaGetLastError();}
+      if(error==cudaSuccess)q21_cutlass_bf16_to_f32<<<(count+255)/256,256,0,stream>>>(out,workspace.output,count);
+      if(error==cudaSuccess)error=cudaGetLastError(); }
+done:
+    if(accum)cudaFree(accum);if(vb)cudaFree(vb);if(kb)cudaFree(kb);if(qb)cudaFree(qb);return error;
 }
 
 __device__ float q21_bf16_round(float value) {

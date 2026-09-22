@@ -39,6 +39,7 @@ def main() -> int:
     )
     ap.add_argument("--dump-dir", required=True)
     ap.add_argument("--capture-block-dir", help="diagnostic block-0 tensors from the first denoiser call")
+    ap.add_argument("--dump-vae-dir", help="save the condition VAE input and posterior moments")
     args = ap.parse_args()
 
     import torch
@@ -54,6 +55,31 @@ def main() -> int:
         str(Path(args.model).resolve()), dtype=dtype, local_files_only=True
     )
     pipe.enable_sequential_cpu_offload(device="cuda")
+    vae_handles = []
+    if args.dump_vae_dir:
+        vae_dir = Path(args.dump_vae_dir)
+        vae_dir.mkdir(parents=True, exist_ok=False)
+
+        def dump_vae_input(_module, inputs):
+            np.save(vae_dir / "input.npy", inputs[0].detach().float().cpu().numpy())
+
+        def dump_vae_moments(_module, _inputs, output):
+            value = output[0] if isinstance(output, tuple) else output
+            np.save(vae_dir / "moments.npy", value.detach().float().cpu().numpy())
+
+        vae_handles.append(pipe.vae.encoder.register_forward_pre_hook(dump_vae_input))
+        vae_handles.append(pipe.vae.encoder.conv_in.register_forward_hook(
+            lambda _module, _inputs, output: np.save(
+                vae_dir / "encoder_conv_in.npy", output.detach().float().cpu().numpy()
+            )
+        ))
+        for stage, block in enumerate(pipe.vae.encoder.down_blocks):
+            vae_handles.append(block.register_forward_hook(
+                lambda _module, _inputs, output, stage=stage: np.save(
+                    vae_dir / f"encoder_down_{stage}.npy", output.detach().float().cpu().numpy()
+                )
+            ))
+        vae_handles.append(pipe.vae.quant_conv.register_forward_hook(dump_vae_moments))
     if args.capture_block_dir:
         import diffusers.models.transformers.transformer_qwenimage21 as qmod
         capture_dir = Path(args.capture_block_dir)
@@ -251,6 +277,8 @@ def main() -> int:
             callback_on_step_end=callback,
             callback_on_step_end_tensor_inputs=["latents", "prompt_embeds"],
         )
+    for handle in vae_handles:
+        handle.remove()
     torch.cuda.synchronize()
     result.images[0].save(out / "reference.png")
     np.save(out / "reference_rgba.npy", np.asarray(result.images[0].convert("RGBA")))
