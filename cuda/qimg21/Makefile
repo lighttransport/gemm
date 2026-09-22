@@ -5,6 +5,13 @@ PYTORCH_SOURCE ?= ../../tmp/pytorch-src
 FLASH_ATTN_SOURCE ?= ../../tmp/flash-attention-src
 TORCH_INCLUDE ?= ../../tmp/qimg21-ref-venv/lib/python3.12/site-packages/torch/include
 CUDNN_ROOT ?= ../../tmp/qimg21-ref-venv/lib/python3.12/site-packages/nvidia/cudnn
+GPU_ARCH ?= sm_120
+SUPPORTED_GPU_ARCHS := sm_80 sm_89 sm_120
+ifeq ($(filter $(GPU_ARCH),$(SUPPORTED_GPU_ARCHS)),)
+$(error GPU_ARCH must be one of $(SUPPORTED_GPU_ARCHS))
+endif
+CUDA_COMPUTE := $(patsubst sm_%,compute_%,$(GPU_ARCH))
+PLUGIN_ARCH_STAMP := ../../tmp/qimg21-plugin-arch
 
 .PHONY: all setup setup-cuda130 setup-exact-sources verify-exact-sources verify-generated-artifacts generate reference compare regress native native-exact native-text-exact native-vae clean
 
@@ -23,36 +30,36 @@ native-exact: test_cuda_qimg21_native libq21_cutlass_attention.so libq21_flash_a
 
 native-text-exact: test_cuda_qimg21_text libq21_flash_attention.so qwen21_text_rope.npy
 
-libq21_cutlass_attention.so: cutlass_attention_plugin.cu | verify-exact-sources
+libq21_cutlass_attention.so: cutlass_attention_plugin.cu $(PLUGIN_ARCH_STAMP) | verify-exact-sources
 	@test -f $(PYTORCH_SOURCE)/aten/src/ATen/native/transformers/cuda/mem_eff_attention/kernel_forward.h
 	@test -f $(FLASH_ATTN_SOURCE)/csrc/cutlass/include/cutlass/cutlass.h
 	$(CUDA_HOME)/bin/nvcc -O3 -std=c++17 --expt-relaxed-constexpr --shared -Xcompiler=-fPIC \
-		-gencode arch=compute_120,code=sm_120 -I$(PYTORCH_SOURCE) -I$(TORCH_INCLUDE) \
+		-gencode arch=$(CUDA_COMPUTE),code=$(GPU_ARCH) -I$(PYTORCH_SOURCE) -I$(TORCH_INCLUDE) \
 		-I$(FLASH_ATTN_SOURCE)/csrc/cutlass/include -o $@ $<
 
-libq21_flash_attention.so: flash_attention_plugin.cu | verify-exact-sources
+libq21_flash_attention.so: flash_attention_plugin.cu $(PLUGIN_ARCH_STAMP) | verify-exact-sources
 	@test -f $(FLASH_ATTN_SOURCE)/csrc/flash_attn/src/flash_fwd_kernel.h
 	$(CUDA_HOME)/bin/nvcc -O3 -std=c++17 --expt-relaxed-constexpr --shared -Xcompiler=-fPIC \
-		-gencode arch=compute_120,code=sm_120 -I$(FLASH_ATTN_SOURCE) \
+		-gencode arch=$(CUDA_COMPUTE),code=$(GPU_ARCH) -I$(FLASH_ATTN_SOURCE) \
 		-I$(FLASH_ATTN_SOURCE)/csrc/cutlass/include -o $@ $<
 
-libq21_cudnn_patch.so: cudnn_patch_plugin.cu
+libq21_cudnn_patch.so: cudnn_patch_plugin.cu $(PLUGIN_ARCH_STAMP)
 	$(CUDA_HOME)/bin/nvcc -O3 -std=c++17 --shared -Xcompiler=-fPIC \
-		-gencode arch=compute_120,code=sm_120 -I$(CUDNN_ROOT)/include \
+		-gencode arch=$(CUDA_COMPUTE),code=$(GPU_ARCH) -I$(CUDNN_ROOT)/include \
 		-L$(CUDNN_ROOT)/lib -Xlinker -rpath -Xlinker $(abspath $(CUDNN_ROOT)/lib) \
 		-o $@ $< -l:libcudnn.so.9
 
-libq21_cudnn_vae.so: cudnn_vae_plugin.cu
+libq21_cudnn_vae.so: cudnn_vae_plugin.cu $(PLUGIN_ARCH_STAMP)
 	$(CUDA_HOME)/bin/nvcc -O3 -std=c++17 --shared -Xcompiler=-fPIC \
-		-gencode arch=compute_120,code=sm_120 -I$(CUDNN_ROOT)/include \
+		-gencode arch=$(CUDA_COMPUTE),code=$(GPU_ARCH) -I$(CUDNN_ROOT)/include \
 		-L$(CUDNN_ROOT)/lib -Xlinker -rpath -Xlinker $(abspath $(CUDNN_ROOT)/lib) \
 		-o $@ $< -l:libcudnn.so.9
 
-libq21_gelu.so: gelu_plugin.cu
+libq21_gelu.so: gelu_plugin.cu $(PLUGIN_ARCH_STAMP)
 	@test -x $(PYTORCH_CUDA_HOME)/bin/nvcc || \
 		(echo "missing pinned PyTorch CUDA compiler: $(PYTORCH_CUDA_HOME)/bin/nvcc" >&2; exit 1)
 	$(PYTORCH_CUDA_HOME)/bin/nvcc -O3 -std=c++17 --shared --cudart shared -Xcompiler=-fPIC \
-		-gencode arch=compute_120,code=sm_120 -L$(PYTORCH_CUDA_HOME)/lib -o $@ $<
+		-gencode arch=$(CUDA_COMPUTE),code=$(GPU_ARCH) -L$(PYTORCH_CUDA_HOME)/lib -o $@ $<
 
 qwen21_rope_freqs.npy: export_rope_frequencies.py
 	$(PYTHON) $< --out $@
@@ -138,6 +145,10 @@ verify-exact-sources:
 verify-generated-artifacts: qwen21_rope_freqs.npy qwen21_text_rope.npy qwen21_vision_rope.npy
 	sha256sum -c generated-artifacts.sha256
 
+$(PLUGIN_ARCH_STAMP): FORCE
+	@mkdir -p $(dir $@)
+	@if ! test -f $@ || ! test "`cat $@`" = "$(GPU_ARCH)"; then echo $(GPU_ARCH) > $@; fi
+
 generate: test_cuda_qimg21
 	$(PYTHON) test_cuda_qimg21.py --generate --model /mnt/nvme01/models/qimg-21 \
 		--prompt "a red apple on a white table" --height 1024 --width 1024 \
@@ -155,4 +166,7 @@ regress:
 	$(PYTHON) regression.py --model /mnt/nvme01/models/qimg-21
 
 clean:
-	rm -f test_cuda_qimg21 test_cuda_qimg21_native test_cuda_qimg21_vae test_cuda_qimg21_vae_encode test_cuda_qimg21_text test_cuda_qimg21_vision test_weight_upload test_quant_weights test_joint_layout test_edit_kernels test_scheduler libq21_cutlass_attention.so libq21_flash_attention.so libq21_cudnn_patch.so libq21_cudnn_vae.so libq21_gelu.so qwen21_rope_freqs.npy qwen21_text_rope.npy qwen21_vision_rope.npy qwen_image21.png
+	rm -f test_cuda_qimg21 test_cuda_qimg21_native test_cuda_qimg21_vae test_cuda_qimg21_vae_encode test_cuda_qimg21_text test_cuda_qimg21_vision test_weight_upload test_quant_weights test_joint_layout test_edit_kernels test_scheduler libq21_cutlass_attention.so libq21_flash_attention.so libq21_cudnn_patch.so libq21_cudnn_vae.so libq21_gelu.so qwen21_rope_freqs.npy qwen21_text_rope.npy qwen21_vision_rope.npy qwen_image21.png $(PLUGIN_ARCH_STAMP)
+
+FORCE:
+.PHONY: FORCE

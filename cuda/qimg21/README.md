@@ -1611,6 +1611,14 @@ make -C cuda/qimg21 setup-exact-sources
 make -C cuda/qimg21 native-exact
 ```
 
+Plugin builds default to `GPU_ARCH=sm_120`. CUDA Ampere and Ada builds can be
+selected without editing sources, for example `make -C cuda/qimg21
+GPU_ARCH=sm_89 native-exact`; accepted values are `sm_80`, `sm_89`, and
+`sm_120`. Runtime kernels are compiled for the detected device. The strict
+`>= 0.99996` reference results in this document were measured on SM120, so a
+different architecture must run the same regressions before claiming exact
+parity.
+
 `setup-cuda130` downloads NVIDIA's five redistributable compiler components,
 checks pinned SHA-256 digests, and assembles CUDA 13.0.88 under
 `tmp/cuda130` without modifying the system toolkit. This wheel-matched NVCC is
