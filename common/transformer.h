@@ -317,6 +317,12 @@ typedef struct {
 } transformer_model;
 
 transformer_model *transformer_load(gguf_context *gguf, int max_seq_len);
+/* Attach a standalone Qwen3.5/3.8 NextN block to an already-loaded trunk.
+ * The sidecar mapping must remain alive until transformer_materialize_nextn()
+ * has completed (or until the model is freed). */
+int transformer_load_nextn_sidecar(transformer_model *model,
+                                   const gguf_shards *sidecar,
+                                   char *error, size_t error_cap);
 void transformer_free(transformer_model *model);
 
 /* Set number of threads for parallel matmul/attention (default: 1) */
@@ -457,6 +463,16 @@ float *transformer_nextn_logits(transformer_model *model, int32_t prev_token,
 const float *transformer_nextn_hidden(const transformer_model *model);
 const float *transformer_nextn_target_hidden(const transformer_model *model);
 int transformer_nextn_local_argmax(const transformer_model *model, float *value);
+/* Greedy speculative transaction.  Generates up to max_draft tokens with an
+ * isolated NextN context and verifies them against the target trunk.  The
+ * target is left advanced by the accepted prefix plus one replacement token;
+ * next_token is that replacement (or the last accepted token when all drafts
+ * match).  Returns the number of accepted draft tokens, or -1 on error. */
+int transformer_nextn_speculate_greedy(transformer_model *target,
+                                       transformer_model *nextn,
+                                       int32_t prev_token, int position,
+                                       int max_draft, int *accepted,
+                                       int32_t *next_token);
 /* Create a weights-sharing NextN-only runtime.  It owns independent scratch,
  * KV state, logits, and worker threads, but never owns the trunk/staged weights.
  * This is the isolation boundary needed to overlap a speculative NextN chain
@@ -5756,6 +5772,140 @@ size_t transformer_materialize_nextn(transformer_model *m) {
     fprintf(stderr, "transformer: NextN materialized %.3fGB MemAvailable=%.2fGB\n",
             (double)total / 1e9, (double)tf_mem_available_kb() / (1024.0 * 1024.0));
     return total;
+}
+
+int transformer_load_nextn_sidecar(transformer_model *m,
+                                   const gguf_shards *sidecar,
+                                   char *error, size_t error_cap) {
+    if (error && error_cap) error[0] = '\0';
+    if (!m || !sidecar) goto bad;
+    if (!m->is_hybrid || m->n_nextn_layers || m->nextn.loaded) goto bad;
+    transformer_nextn *nn = &m->nextn;
+    transformer_layer *L = &nn->layer;
+    const gguf_context *ctx = NULL;
+    char name[128];
+#define NN_SIDE_LOAD(field, suffix) do { \
+        snprintf(name, sizeof(name), "blk.%d." suffix ".weight", m->n_layers); \
+        if (gguf_shards_find_tensor(sidecar, name, &ctx, NULL) != 0) goto bad; \
+        (field) = tf_load_tensor(ctx, name, 1); \
+        if (!(field).data) goto bad; \
+    } while (0)
+    NN_SIDE_LOAD(L->attn_norm, "attn_norm");
+    NN_SIDE_LOAD(L->attn_q, "attn_q");
+    NN_SIDE_LOAD(L->attn_k, "attn_k");
+    NN_SIDE_LOAD(L->attn_v, "attn_v");
+    NN_SIDE_LOAD(L->attn_q_norm, "attn_q_norm");
+    NN_SIDE_LOAD(L->attn_k_norm, "attn_k_norm");
+    NN_SIDE_LOAD(L->attn_output, "attn_output");
+    NN_SIDE_LOAD(L->ffn_norm, "post_attention_norm");
+    NN_SIDE_LOAD(L->ffn_gate, "ffn_gate");
+    NN_SIDE_LOAD(L->ffn_up, "ffn_up");
+    NN_SIDE_LOAD(L->ffn_down, "ffn_down");
+    NN_SIDE_LOAD(nn->eh_proj, "nextn.eh_proj");
+    NN_SIDE_LOAD(nn->enorm, "nextn.enorm");
+    NN_SIDE_LOAD(nn->hnorm, "nextn.hnorm");
+#undef NN_SIDE_LOAD
+    nn->layer_index = m->n_layers;
+    nn->loaded = 1;
+    m->n_nextn_layers = 1;
+    m->n_layers_all = m->n_layers + 1;
+    return 0;
+bad:
+    if (error && error_cap)
+        snprintf(error, error_cap, "standalone NextN sidecar is incomplete or incompatible");
+    return -1;
+}
+
+int transformer_nextn_speculate_greedy(transformer_model *target,
+                                       transformer_model *nextn,
+                                       int32_t prev_token, int position,
+                                       int max_draft, int *accepted,
+                                       int32_t *next_token) {
+    if (accepted) *accepted = 0;
+    if (next_token) *next_token = -1;
+    if (!target || !nextn || !nextn->nextn.loaded || max_draft < 1 ||
+        position < 0 || position >= target->max_seq_len) return -1;
+    if (target->n_vocab <= 0 || nextn->n_vocab != target->n_vocab) return -1;
+
+    /* The shadow starts with the same auxiliary KV state as the last
+     * committed transaction.  Its recurrent hidden is overwritten by the
+     * first call, while its independent KV cache is extended speculatively. */
+    const float *target_hidden = transformer_get_hidden(target);
+    if (!target_hidden) return -1;
+    int32_t drafts[32];
+    float *draft_hidden = (float *)malloc((size_t)max_draft * nextn->n_embd * sizeof(float));
+    if (!draft_hidden) return -1;
+    if (max_draft > (int)(sizeof(drafts) / sizeof(drafts[0]))) max_draft = 32;
+    int32_t token = prev_token;
+    for (int i = 0; i < max_draft; i++) {
+        float *logits = transformer_nextn_logits(nextn, token, target_hidden,
+                                                 position + i);
+        if (!logits) { free(draft_hidden); return -1; }
+        float best = 0.0f;
+        int d = transformer_nextn_local_argmax(nextn, &best);
+        if (d < 0) { free(draft_hidden); return -1; }
+        drafts[i] = (int32_t)d;
+        token = drafts[i];
+        target_hidden = transformer_nextn_hidden(nextn);
+        memcpy(draft_hidden + (size_t)i * nextn->n_embd, target_hidden,
+               (size_t)nextn->n_embd * sizeof(float));
+    }
+
+    size_t state_size = transformer_runtime_state_size(target, 0, target->n_layers,
+                                                       position);
+    void *state = state_size ? malloc(state_size) : NULL;
+    if (!state || transformer_runtime_state_pack(target, 0, target->n_layers,
+                                                  position, state, state_size) != 0) {
+        free(state);
+        return -1;
+    }
+    int nacc = 0;
+    token = prev_token;
+    for (int i = 0; i < max_draft; i++) {
+        float *logits = transformer_forward_logits(target, drafts[i], position + i);
+        if (!logits) { free(state); free(draft_hidden); return -1; }
+        float best = logits[0];
+        int32_t actual = 0;
+        for (int v = 1; v < target->n_vocab; v++) {
+            if (logits[v] > best) { best = logits[v]; actual = v; }
+        }
+        token = actual;
+        if (actual != drafts[i]) {
+            int restored_pos = -1;
+            if (transformer_runtime_state_unpack(target, state, state_size,
+                                                 &restored_pos) != 0) {
+                free(state);
+                free(draft_hidden);
+                return -1;
+            }
+            /* The replacement token must be committed at the mismatch slot;
+             * verification above intentionally evaluated the draft only. */
+            if (!transformer_forward_logits(target, actual, position + i)) {
+                free(state);
+                free(draft_hidden);
+                return -1;
+            }
+            /* Discard the rejected suffix in the auxiliary stream.  The
+             * cache is append-only and future attention only reads through
+             * the committed position; restore the recurrent hidden to the
+             * last accepted draft so the next transaction chains correctly. */
+            if (nacc > 0)
+                memcpy(nextn->nextn.hidden,
+                       draft_hidden + (size_t)(nacc - 1) * nextn->n_embd,
+                       (size_t)nextn->n_embd * sizeof(float));
+            if (accepted) *accepted = nacc;
+            if (next_token) *next_token = actual;
+            free(state);
+            free(draft_hidden);
+            return nacc;
+        }
+        nacc++;
+    }
+    if (accepted) *accepted = nacc;
+    if (next_token) *next_token = token;
+    free(state);
+    free(draft_hidden);
+    return nacc;
 }
 
 size_t transformer_materialize_pp(transformer_model *m, int layer_start, int layer_end) {
