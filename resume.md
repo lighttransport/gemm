@@ -51,6 +51,11 @@ This is a code-level reduction in draft/verify launch work; resident logits,
 hashes, and 64K timing are still required before changing any production
 selector.
 
+The DFlash multi-row dispatcher also reuses exact Q8_1 activation staging for
+IQ4_XS Q/K/V rows, with the cached source shape and weight type checked before
+reuse. This is a sidecar-only launch reduction and remains unmeasured on the
+resident device.
+
 ## 2026-09-22 continuation: opt-in native Q2_K Q/K/V projection fusion
 
 The ordinary one-token attention dispatcher now exposes

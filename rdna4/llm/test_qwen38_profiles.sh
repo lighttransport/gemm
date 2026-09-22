@@ -75,6 +75,10 @@ grep -q 'LLM_QWEN35_DFLASH_INJECT_KV_FUSED' "${root_dir}/qwen35_dflash2.h" || {
     echo 'profile test: DFlash fused injection candidate missing' >&2
     exit 1
 }
+grep -q 'q81_type' "${root_dir}/qwen35_dflash2.h" || {
+    echo 'profile test: DFlash Q8_1 projection cache type guard missing' >&2
+    exit 1
+}
 grep -q 'LLM_QWEN35_DFLASH_EMBED_BROADCAST_KERNEL' "${root_dir}/qwen35_dflash2.h" || {
     echo 'profile test: DFlash mask broadcast candidate missing' >&2
     exit 1

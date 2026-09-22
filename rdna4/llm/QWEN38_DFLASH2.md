@@ -1,5 +1,14 @@
 # Qwen3.8 DFlash2 on RDNA4
 
+## IQ4_XS sidecar projection staging reuse (2026-09-22)
+
+The multi-row IQ4_XS sidecar dispatcher now reuses its exact Q8_1 activation
+tile across Q/K/V projections, matching the existing Q4_K cache. The cache
+records the source shape and weight type, so a mixed Q4_K/IQ4_XS sequence
+cannot consume a tile produced for the other contract. This removes repeated
+quantization launches when an IQ4_XS sidecar is selected; Q4_K behavior and
+serving defaults remain unchanged pending resident K=4/K=7 timing and hashes.
+
 ## IQ1-only batch staging cleanup (2026-09-22)
 
 The IQ1 Q8_1 batch quantizer no longer launches a Q8x2 producer that is

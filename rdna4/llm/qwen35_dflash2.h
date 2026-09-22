@@ -55,7 +55,7 @@ typedef struct hllm_qwen35_dflash2 {
     void *logits, *selector_gate;
     void *selector_candidates, *selector_drafts;
     void *q81_source;
-    int q81_rows, q81_cols;
+    int q81_rows, q81_cols, q81_type;
     /* Optional sidecar injection stream.  Injection is independent of target
      * checkpoint publication, but the next proposal must wait before reusing
      * the sidecar's feature/KV scratch. */
@@ -256,7 +256,12 @@ static void hllm_dflash_project(hip_llm_runner *r, void *dst, void *weight,
         r->fn_qwen35_quantize_q81 && r->fn_qwen35_matvec_q4k_q81_multi8 &&
         (rows != 4 || r->fn_qwen35_matvec_q4k_q81_multi4) &&
         (rows != 5 || r->fn_qwen35_matvec_q4k_q81_multi5);
-    if(!q4_q81)d->q81_source=NULL;
+    int iq4_q81=type==GGML_TYPE_IQ4_XS &&
+        rows >= HLLM_DFLASH_ATTN_ROWS_PER_WAVE &&
+        rows <= HLLM_DFLASH_MAX_BLOCK && stride == nc &&
+        nc % 256 == 0 && r->fn_qwen35_quantize_q81 &&
+        r->fn_qwen35_matvec_iq4xs_multi8;
+    if(!q4_q81 && !iq4_q81)d->q81_source=NULL;
     if (type == GGML_TYPE_Q2_K && rows > 1 &&
         rows <= HLLM_DENSE_MTP_REUSE_ROWS && stride == nc && nc <= 6144 &&
         nc % 256 == 0 && r->fn_qwen35_matvec_q2k_multi4) {
@@ -266,15 +271,17 @@ static void hllm_dflash_project(hip_llm_runner *r, void *dst, void *weight,
         void *a[]={&dst,&weight,&x,&rows,&nr,&nc,&stride};
         LAUNCH(r->fn_matvec_q6_K_batch_reuse8,nr,(rows+7)/8,1,
                64,1,1,0,r->stream,a);
-    } else if (type == GGML_TYPE_IQ4_XS &&
-        rows >= HLLM_DFLASH_ATTN_ROWS_PER_WAVE &&
-        rows <= HLLM_DFLASH_MAX_BLOCK && stride == nc &&
-        nc % 256 == 0 && r->fn_qwen35_quantize_q81 &&
-        r->fn_qwen35_matvec_iq4xs_multi8) {
-        int total = rows*nc;
-        void *qa[] = { &r->d_act_q8_batch, &r->d_act_scale_batch, &x, &total };
-        LAUNCH(r->fn_qwen35_quantize_q81, total/32, 1, 1, 32, 1, 1, 0,
-               r->stream, qa);
+    } else if (iq4_q81) {
+        if (d->q81_source != x || d->q81_rows != rows ||
+            d->q81_cols != nc || d->q81_type != type) {
+            int total = rows*nc;
+            void *qa[] = { &r->d_act_q8_batch, &r->d_act_scale_batch,
+                           &x, &total };
+            LAUNCH(r->fn_qwen35_quantize_q81, total/32, 1, 1, 32, 1, 1,
+                   0, r->stream, qa);
+            d->q81_source = x; d->q81_rows = rows;
+            d->q81_cols = nc; d->q81_type = type;
+        }
         void *ma[] = { &dst, &weight, &r->d_act_q8_batch,
                        &r->d_act_scale_batch, &nr, &nc, &rows };
         hipFunction_t iq4_fn = nc == 5120 ?
@@ -283,12 +290,14 @@ static void hllm_dflash_project(hip_llm_runner *r, void *dst, void *weight,
         LAUNCH(iq4_fn, (nr+7)/8, 1, 1,
                256, 1, 1, 0, r->stream, ma);
     } else if (q4_q81) {
-        if(d->q81_source!=x||d->q81_rows!=rows||d->q81_cols!=nc){
+        if(d->q81_source!=x||d->q81_rows!=rows||d->q81_cols!=nc||
+           d->q81_type!=type){
             int total=rows*nc;
             void *qa[]={&r->d_act_q8_batch,&r->d_act_scale_batch,&x,&total};
             LAUNCH(r->fn_qwen35_quantize_q81,total/32,1,1,32,1,1,0,
                    r->stream,qa);
             d->q81_source=x;d->q81_rows=rows;d->q81_cols=nc;
+            d->q81_type=type;
         }
         void *ma[]={&dst,&weight,&r->d_act_q8_batch,
                     &r->d_act_scale_batch,&nr,&nc,&rows};
@@ -333,7 +342,8 @@ static int hllm_dflash_project_qkv_fused(hip_llm_runner *r,
     hipFunction_t fn = r->fn_qwen35_matvec_q4k_q81_qkv;
     if (rows == 5 && r->fn_qwen35_matvec_q4k_q81_qkv5)
         fn = r->fn_qwen35_matvec_q4k_q81_qkv5;
-    if (d->q81_source != x || d->q81_rows != rows || d->q81_cols != nc) {
+    if (d->q81_source != x || d->q81_rows != rows ||
+        d->q81_cols != nc || d->q81_type != GGML_TYPE_Q4_K) {
         int total = rows * nc;
         void *qa[] = { &r->d_act_q8_batch, &r->d_act_scale_batch, &x,
                        &total };
@@ -342,6 +352,7 @@ static int hllm_dflash_project_qkv_fused(hip_llm_runner *r,
         d->q81_source = x;
         d->q81_rows = rows;
         d->q81_cols = nc;
+        d->q81_type = GGML_TYPE_Q4_K;
     }
     int total_rows = qrows + krows + vrows;
     void *a[] = { &qout, &kout, &vout, &qw, &kw, &vw,
@@ -370,7 +381,8 @@ static int hllm_dflash_project_gateup_fused(hip_llm_runner *r,
         grows < 1 || urows < 1 || nc <= 0 || stride != nc ||
         (nc % 256) != 0)
         return 0;
-    if (d->q81_source != x || d->q81_rows != rows || d->q81_cols != nc) {
+    if (d->q81_source != x || d->q81_rows != rows ||
+        d->q81_cols != nc || d->q81_type != GGML_TYPE_Q4_K) {
         int total = rows * nc;
         void *qa[] = { &r->d_act_q8_batch, &r->d_act_scale_batch, &x,
                        &total };
@@ -379,6 +391,7 @@ static int hllm_dflash_project_gateup_fused(hip_llm_runner *r,
         d->q81_source = x;
         d->q81_rows = rows;
         d->q81_cols = nc;
+        d->q81_type = GGML_TYPE_Q4_K;
     }
     int vrows = 0;
     void *vout = NULL, *vw = NULL;
@@ -416,6 +429,7 @@ static int hllm_dflash_silu_q81_fused(hip_llm_runner *r,
     d->q81_source = gate;
     d->q81_rows = rows;
     d->q81_cols = n_ff;
+    d->q81_type = GGML_TYPE_Q4_K;
     return 1;
 }
 
