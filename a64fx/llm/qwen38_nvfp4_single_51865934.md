@@ -22,6 +22,11 @@ result rose to 2.838 tok/s over 128 tokens.
 
 The persistent decode path now groups eight rows per call, sharing activation
 loads while keeping each row's original low-nibble/high-nibble FP32 FMA order.
+Prefetching each of those eight row streams eight 64-value blocks ahead
+reduced the full decode from 35.388 to 29.624 seconds under identical
+non-profiled settings. Four-block prefetch measured 29.649 seconds, within
+run-to-run noise of the eight-block result. Sixteen-block prefetch
+regressed to 30.926 seconds / 4.139 tok/s and was discarded.
 The shared diagnostic counter is accumulated locally and updated atomically
 once per matrix slice. The opt-in W4A8 path requantizes each input rather than
 reusing a scratch address and four sampled values across tokens.
@@ -32,19 +37,24 @@ reusing a scratch address and four sampled values across tokens.
 | --- | ---: | ---: | ---: |
 | Exact four-row reference with fast scales | 2.838 tok/s (45.110 s) | reference | — |
 | Exact eight-row, original FMA order | **3.617 tok/s (35.391 s)** | **128/128** | **0 bitwise** |
+| Exact eight-row, eight-block prefetch | **4.321 tok/s (29.624 s)** | **128/128** | **0 bitwise** |
 
-Both runs used prompt `hi`, `--max-seq 256 --max-gen 128 --spec-k 0`, 48
-threads, `TF_DUMP_TOKENS=1 TF_DPROF=1`, the same staged GGUF, and the
-four-CMG environment in `run_qwen38_nvfp4_cmg4.sh`. The token comparison was:
+The first two runs used prompt `hi`, `--max-seq 256 --max-gen 128 --spec-k 0`,
+48 threads, `TF_DUMP_TOKENS=1 TF_DPROF=1`, the same staged GGUF, and the
+four-CMG environment in `run_qwen38_nvfp4_cmg4.sh`. The prefetch comparison
+used the same inputs with `TF_DUMP_TOKENS=1` and profiling disabled in both
+cases: saved baseline 35.388 s / 3.617 tok/s, four-block prefetch 29.649 s /
+4.317 tok/s, eight-block prefetch 29.624 s / 4.321 tok/s. The eight-block
+token comparison was:
 
 ```sh
 python3 a64fx/llm/test_qwen38_token_trace.py \
-  /local/u14346/q27b-ref128.log /local/u14346/q27b-8row-ordered128.log \
+  /local/u14346/q27b-ref128.log /local/u14346/q27b-prefetchdist8-128.log \
   --tokens 128 --max-logit-error 0
 # PASS: tokens=128/128, selected_logit_max_abs=0, rms=0
 ```
 
-The final eight-row stage costs are approximately 123.6 ms/token for FFN
+The original eight-row stage costs were approximately 123.6 ms/token for FFN
 gate/up, 49.1 for FFN down, 44.2 for SSM input, 15.0 for SSM output, and
 20.5 for the vocabulary head. The kernel improvement is still far from the
 40 tok/s goal. The 128-token result establishes this prompt and short context;
@@ -54,6 +64,26 @@ A full-width nibble-interleaved variant reached 3.962 tok/s but changed the
 FP32 reduction order; 128/128 token IDs matched while selected logits differed
 by up to 0.00256, above the repository's 0.001 validation tolerance. It was
 not retained.
+
+The opt-in row-major W4A8 path kept all 128 token IDs on this prompt, but
+ran at 3.085 tok/s (41.493 s) and changed selected logits by up to 0.13878.
+Its activation scratch now always requantizes the current input, so there is
+no cross-token reuse through a sampled-address cache. The row-major W4A8
+path is not a performance improvement.
+
+`bench_nvfp4_packed.c` explores a K-major eight-row W4A8 layout with SVE
+`TBL` + `SDOT`. It predecodes the eight UE4M3 scales per subblock to FP32;
+the packed bytes are 4/3 the original GGUF weight bytes. On a synthetic
+131,072-row by 5,120-column matrix, 48 threads across four CMGs, 2 MiB
+hugepages, and CMG-local first touch, the best trial streamed 0.503 GB of
+packed weights in 0.965 ms: 521.5 GB/s physical or 391.1 GB/s of original
+GGUF bytes. Its relative L2 error against a scalar FP32 reference was
+0.001794 for the first eight rows. FP16 predecoded scales reduced storage but
+measured 375.6 GB/s original-byte equivalent. This is a synthetic kernel
+measurement, not end-to-end model speed or token validation. At 14.754 GB of
+weights per token, 391.1 GB/s would bound a perfect packed model at about
+26.5 tok/s before all non-matvec work; reaching 40 tok/s still requires a
+faster format/kernel and safe in-memory repacking of the model.
 
 ## Reproduce
 

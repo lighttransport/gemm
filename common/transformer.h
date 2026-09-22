@@ -1351,6 +1351,16 @@ static inline void tf_nvfp4_dot8_sve(float *dst, const uint8_t *base, size_t rb,
     for (int ib = 0; ib < n / 64; ib++) {
         const block_nvfp4 *b0=r0+ib,*b1=r1+ib,*b2=r2+ib,*b3=r3+ib;
         const block_nvfp4 *b4=r4+ib,*b5=r5+ib,*b6=r6+ib,*b7=r7+ib;
+        if (ib + 8 < n / 64) {
+            __builtin_prefetch(r0 + ib + 8, 0, 0);
+            __builtin_prefetch(r1 + ib + 8, 0, 0);
+            __builtin_prefetch(r2 + ib + 8, 0, 0);
+            __builtin_prefetch(r3 + ib + 8, 0, 0);
+            __builtin_prefetch(r4 + ib + 8, 0, 0);
+            __builtin_prefetch(r5 + ib + 8, 0, 0);
+            __builtin_prefetch(r6 + ib + 8, 0, 0);
+            __builtin_prefetch(r7 + ib + 8, 0, 0);
+        }
         for (int s = 0; s < 4; s++) {
             svfloat32_t d0=svdup_f32(tf_nvfp4_scale_fast(b0->d[s]));
             svfloat32_t d1=svdup_f32(tf_nvfp4_scale_fast(b1->d[s]));
