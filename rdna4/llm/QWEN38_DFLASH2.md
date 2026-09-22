@@ -1576,6 +1576,9 @@ retain the scalar I/O fallback.
    Native IQ1S and IQ1M DP4A batches likewise retained the exact suffix but
    measured 35.55/443.93 and 35.55/443.86 tok/s (decode/prefill), respectively;
    neither improves the production projection schedule.
+   The native IQ4 DP4A batch was neutral as well at 35.55 tok/s decode and
+   443.91 tok/s prefill with the exact suffix, completing the current DP4A
+   toggle sweep without a production winner.
 
 Each optimization should retain the exact sequence hash and response bytes at
 K=4 and K=7, compile the emitted program, and cover non-coding prompts plus
