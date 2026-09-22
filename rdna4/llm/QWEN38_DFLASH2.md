@@ -86,6 +86,15 @@ guards sidecar KV reuse. The overlap path requires the BF16 injection plans;
 allocation failure falls back to serialized injection and leaves production
 defaults unchanged.
 
+## Native IQ3 Q/K/V projection candidate
+
+`LLM_QWEN35_IQ3_QKV_FUSED=1` enables a diagnostic ordinary-decode kernel when
+Q, K, and V are all IQ3_XXS with a common input width. It uses the native Q8_1
+activation contract and one IQ3 codebook staging load for the combined output
+row grid, but preserves the standalone kernel's arithmetic for each row.
+Defaults remain unchanged until a resident-device A/B validates exact token and
+logit hashes together with a sustained 64K decode improvement.
+
 ## DFlash2 long-window split retune (2026-09-22)
 
 The sidecar attention launch now uses twelve partitions once its 2,048-token

@@ -125,6 +125,16 @@ the loaded BF16 injection plans and falls back to serialized injection if the
 workspaces cannot be created. It remains opt-in pending a resident-GPU
 throughput and quality run.
 
+## 2026-09-22 continuation: native IQ3 Q/K/V projection candidate
+
+The ordinary one-token attention path now has an opt-in
+`LLM_QWEN35_IQ3_QKV_FUSED=1` candidate for layers whose Q, K, and V matrices
+are all IQ3_XXS with the same input width. A single native kernel shares the
+staged IQ3 codebook and the already-quantized Q8_1 activation across the three
+output ranges while retaining the existing per-row dot and reduction order.
+The production path remains on the three-launch dispatch until a resident
+gfx1201 run proves identical 4K/64K hashes and a sustained projection win.
+
 ## 2026-09-22 continuation: IQ2_XXS block-shape probe
 
 I tested 128- and 512-thread blocks for the native one-row IQ2_XXS kernel

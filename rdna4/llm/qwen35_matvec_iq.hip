@@ -246,6 +246,72 @@ extern "C" __global__ void qwen35_matvec_iq3xxs(
     if (lane == 0) out[row] = sum;
 }
 
+/* Fused one-token Q/K/V projection for the native IQ3_XXS path.  The three
+ * matrices still have independent output row ranges and therefore retain the
+ * exact scalar row arithmetic above; a single block grid shares codebook
+ * staging and the one activation-quantization launch across all three.
+ * Keep this candidate opt-in until resident-device hashes and throughput are
+ * measured against the three-launch reference. */
+extern "C" __global__ void qwen35_matvec_iq3xxs_qkv(
+        float *__restrict__ qout, float *__restrict__ kout,
+        float *__restrict__ vout,
+        const unsigned char *__restrict__ qw,
+        const unsigned char *__restrict__ kw,
+        const unsigned char *__restrict__ vw,
+        const signed char *__restrict__ q, const float *__restrict__ scales,
+        int qrows, int krows, int vrows, int cols) {
+    __shared__ unsigned int grid_cache[256];
+    for (int i = threadIdx.x; i < 256; i += blockDim.x)
+        grid_cache[i] = qwen35_iq3xxs_grid[i];
+    __syncthreads();
+
+    int lane = threadIdx.x & 31;
+    int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    int total_rows = qrows + krows + vrows;
+    if (row >= total_rows) return;
+
+    float *out;
+    const unsigned char *weights;
+    int local_row;
+    if (row < qrows) {
+        out = qout;
+        weights = qw;
+        local_row = row;
+    } else if (row < qrows + krows) {
+        out = kout;
+        weights = kw;
+        local_row = row - qrows;
+    } else {
+        out = vout;
+        weights = vw;
+        local_row = row - qrows - krows;
+    }
+
+    int blocks = cols / 256;
+    const unsigned char *w = weights + (size_t)local_row * blocks * 98;
+    float sum = 0.0f;
+    for (int qb = lane; qb < blocks * 8; qb += 32) {
+        int b = qb / 8, ib = qb & 7;
+        const unsigned char *p = w + b * 98;
+        const int *u = (const int *)(q + qb * 32);
+        unsigned int aux = *(const unsigned int *)(p + 66 + ib * 4);
+        int z = 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            unsigned int signs = qwen35_parity_signs((aux >> (7*j)) & 127);
+            int lo = qwen35_signed_grid(grid_cache[p[2 + ib*8 + 2*j]], signs, 0);
+            int hi = qwen35_signed_grid(grid_cache[p[3 + ib*8 + 2*j]], signs, 4);
+            z = qwen35_dot4(lo, u[2*j], z);
+            z = qwen35_dot4(hi, u[2*j+1], z);
+        }
+        z = ((int)(aux >> 28) * z + z/2) / 2;
+        float d = (float)*(const _Float16 *)p * scales[qb];
+        sum += d * z;
+    }
+    for (int offset = 16; offset; offset >>= 1) sum += __shfl_xor(sum, offset, 32);
+    if (lane == 0) out[local_row] = sum;
+}
+
 extern "C" __global__ void qwen35_matvec_iq3s(
         float *__restrict__ out, const unsigned char *__restrict__ weights,
         const signed char *__restrict__ q, const float *__restrict__ scales,
