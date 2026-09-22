@@ -1291,6 +1291,12 @@ rstd is identical for 203/256 rows and differs by at most 2.38e-7. The
 four-warp diagnostic makes rstd bit-exact for all rows and means exact for
 157/256 rows. These F32
 reduction differences explain the sparse LayerNorm BF16 discrepancies.
+With the corrected attention scale, block 0 is bit-exact and therefore gives
+block 1 an exact input.  Direct BF16 ATen replay of block-1 Norm1 differs from
+the four-warp native output in only 4 of 294,912 values (maximum 0.001953125).
+Injecting that exact Norm1 raises the isolated block-1 cosine from
+0.999999321935 to 0.999999999602 and leaves only 21 differing output values,
+confirming that sparse LayerNorm rounding remains the next recurrence source.
 Testing unfused online/combine arithmetic, native BF16 conversion, PyTorch's
 2D thread indexing, O2 compilation, and CUDA 12.9 code generation did not improve
 the full recurrence, so the accepted kernel retains the literal pinned
