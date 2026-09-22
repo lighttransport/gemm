@@ -39,7 +39,7 @@ typedef struct hllm_qwen35_dflash2 {
     hipFunction_t fn_conv, fn_attention, fn_attention_combine;
     hipFunction_t fn_attention_fused;
     hipFunction_t fn_attention_fused_128;
-    hipFunction_t fn_topk, fn_select, fn_select_warp;
+    hipFunction_t fn_topk, fn_select, fn_select_warp, fn_select_warp16;
     void *fc, *fc_bf16, *enc_norm, *out_norm, *selector_hidden;
     int fc_type, selector_hidden_type;
     qtensor selector_prev, selector_next;
@@ -546,7 +546,9 @@ int hip_llm_qwen35_dflash2_load(hip_llm_runner *r, const char *path,
         hipModuleGetFunction(&d->fn_select, d->module,
                              "qwen35_dflash2_select") != hipSuccess ||
         hipModuleGetFunction(&d->fn_select_warp, d->module,
-                             "qwen35_dflash2_select_warp") != hipSuccess) goto fail;
+                             "qwen35_dflash2_select_warp") != hipSuccess ||
+        hipModuleGetFunction(&d->fn_select_warp16, d->module,
+                             "qwen35_dflash2_select_warp16") != hipSuccess) goto fail;
 
     if (hllm_dflash_upload_matrix(g, "fc.weight", &d->fc, &d->fc_type,
             r->n_embd, HLLM_DFLASH_LAYERS*r->n_embd) ||
@@ -850,8 +852,14 @@ int hip_llm_qwen35_dflash2_propose(hip_llm_runner *r, int32_t anchor,
         &anchor,&rows,&r->n_vocab};
     hipFunction_t select_fn = d->fn_select;
     unsigned select_threads = 32;
+    const char *selector_warp16_env =
+        getenv("LLM_QWEN35_DFLASH_SELECTOR_WARP16");
     const char *selector_warp_env = getenv("LLM_QWEN35_DFLASH_SELECTOR_WARP");
-    if (selector_warp_env && atoi(selector_warp_env) != 0 &&
+    if (selector_warp16_env && atoi(selector_warp16_env) != 0 &&
+        d->fn_select_warp16) {
+        select_fn = d->fn_select_warp16;
+        select_threads = 512;
+    } else if (selector_warp_env && atoi(selector_warp_env) != 0 &&
         d->fn_select_warp) {
         select_fn = d->fn_select_warp;
         select_threads = 256;

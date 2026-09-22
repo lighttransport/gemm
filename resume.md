@@ -39,6 +39,18 @@ the default pending resident 4K/64K logits, hashes, and throughput checks.
 HIP device syntax, the host build, and profile checks pass; the resident GPU
 gate is unavailable in this environment (`/dev/kfd` is absent).
 
+## 2026-09-22 continuation: sixteen-way DFlash selector candidate
+
+The opt-in `LLM_QWEN35_DFLASH_SELECTOR_WARP16=1` path assigns one warp to
+each of the selector's sixteen candidates in a single 512-thread block. It
+removes the two eight-candidate batches and their extra shared-memory pass,
+while preserving the predecessor decode, each candidate's ordered 256-term
+score accumulation, and the existing first-max tie break. The previous
+256-thread probe remains available as `LLM_QWEN35_DFLASH_SELECTOR_WARP=1`;
+the serialized selector remains the default pending resident K=4/K=7 hash,
+acceptance, and draft-time checks. HIP device syntax and the host build pass;
+no resident gfx1201 runtime is available here.
+
 ## 2026-09-22 continuation: five-row Q4_K sidecar projection
 
 K=4 DFlash2 windows have five proposal rows (the anchor plus four mask rows),

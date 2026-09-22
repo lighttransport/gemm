@@ -854,6 +854,14 @@ reflects the remaining measured costs.
    `LLM_QWEN35_DFLASH_GATEUP_FUSED=1` similarly reuses that exact kernel for
    the dense Q4_K gate/up pair with no V range. It is a separate opt-in probe;
    the ordinary gate/up/SiLU sequence remains the serving default.
+   The selector also has an opt-in `LLM_QWEN35_DFLASH_SELECTOR_WARP16=1`
+   geometry. It assigns one warp to each of the sixteen candidates in a
+   single 512-thread block, removing the two eight-candidate batches while
+   retaining the predecessor decode, ordered 256-term score accumulation, and
+   first-max tie break. The existing 256-thread selector probe remains
+   available through `LLM_QWEN35_DFLASH_SELECTOR_WARP=1`; both variants are
+   diagnostic until resident K=4/K=7 hashes and draft-time measurements show a
+   quality-safe gain.
 6. **Prompt-cache injection.**  Feature capture now shares the target
    RMSNorm kernel and both 4K and random-64K prefill retain their targets.
    The hipBLASLt bridge now allocates scratch lazily per HIP stream, so a
