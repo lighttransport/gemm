@@ -12,6 +12,10 @@ typedef int (*q21_flash_vision_layer_norm_fn)(float *, const float *, const floa
                                               const float *, int, int, CUstream);
 typedef int (*q21_flash_vision_layer_norm_stats_fn)(float *, const float *, int, int,
                                                     CUstream);
+typedef int (*q21_flash_vision_layer_norm_bf16_fn)(float *, const void *, const void *,
+                                                   const void *, int, int, CUstream);
+typedef int (*q21_flash_vision_layer_norm_bf16_stats_fn)(float *, const void *, int, int,
+                                                         CUstream);
 
 static const char *vision_front_src =
 "extern \"C\" {\n"
@@ -236,10 +240,12 @@ int main(int argc, char **argv) {
         (strcmp(attention_mode, "math") && strcmp(attention_mode, "cutlass") &&
          strcmp(attention_mode, "flash")) ||
         (strcmp(layer_norm_mode, "nvcc") && strcmp(layer_norm_mode, "nvcc-pytorch") &&
+         strcmp(layer_norm_mode, "nvcc-pytorch-bf16") &&
          strcmp(layer_norm_mode, "nvrtc"))) {
         fprintf(stderr, "usage: %s --model DIR (--pixel-values PATCHES.npy | --image IMAGE | --hidden BLOCK_INPUT.npy) "
                         "--grid-height H --grid-width W [--block-index N --max-blocks N] "
-                        "[--layer-norm nvcc|nvcc-pytorch|nvrtc] [--norm1-override NORM.npy] "
+                        "[--layer-norm nvcc|nvcc-pytorch|nvcc-pytorch-bf16|nvrtc] "
+                        "[--norm1-override NORM.npy] "
                         "[--norm2-override NORM.npy] "
                         "[--flash-plugin PLUGIN.so] "
                         "--out OUTPUT.npy\n", argv[0]);
@@ -272,12 +278,14 @@ int main(int argc, char **argv) {
     CUfunction linear_epilogue = NULL, bf16_epilogue = NULL, vision_rope = NULL, vision_attn = NULL;
     CUfunction residual = NULL, gelu_tanh = NULL, gelu_exact = NULL;
     CUdeviceptr x = 0, bf = 0, projected = 0, weight = 0, bias = 0, pos = 0, vision_rope_d = 0;
-    CUdeviceptr norm = 0, qkv = 0, qkv_bf = 0, att = 0, tmp = 0, mlp = 0;
+    CUdeviceptr norm = 0, norm_bf = 0, qkv = 0, qkv_bf = 0, att = 0, tmp = 0, mlp = 0;
     void *cutlass_plugin = NULL;
     q21_cutlass_vision_attention_fn cutlass_attention = NULL;
     q21_flash_vision_attention_fn flash_attention = NULL;
     q21_flash_vision_layer_norm_fn flash_layer_norm = NULL;
     q21_flash_vision_layer_norm_stats_fn flash_layer_norm_stats = NULL;
+    q21_flash_vision_layer_norm_bf16_fn flash_layer_norm_bf16 = NULL;
+    q21_flash_vision_layer_norm_bf16_stats_fn flash_layer_norm_bf16_stats = NULL;
     float *host_pos = NULL, *host_out = NULL;
     int rc = 1, n = h * w, count = n * 1152;
     int vision_compile = -1;
@@ -314,18 +322,27 @@ int main(int argc, char **argv) {
                 dlsym(cutlass_plugin, "q21_flash_vision_layer_norm") : NULL;
             flash_layer_norm_stats = cutlass_plugin ? (q21_flash_vision_layer_norm_stats_fn)
                 dlsym(cutlass_plugin, "q21_flash_vision_layer_norm_stats") : NULL;
-            if (!strcmp(layer_norm_mode, "nvcc-pytorch")) {
+            if (!strcmp(layer_norm_mode, "nvcc-pytorch") ||
+                !strcmp(layer_norm_mode, "nvcc-pytorch-bf16")) {
                 flash_layer_norm = (q21_flash_vision_layer_norm_fn)
                     dlsym(cutlass_plugin, "q21_flash_vision_layer_norm_pytorch");
                 flash_layer_norm_stats = (q21_flash_vision_layer_norm_stats_fn)
                     dlsym(cutlass_plugin, "q21_flash_vision_layer_norm_stats_pytorch");
+            }
+            if (!strcmp(layer_norm_mode, "nvcc-pytorch-bf16")) {
+                flash_layer_norm_bf16 = (q21_flash_vision_layer_norm_bf16_fn)
+                    dlsym(cutlass_plugin, "q21_flash_vision_layer_norm_bf16_pytorch");
+                flash_layer_norm_bf16_stats = (q21_flash_vision_layer_norm_bf16_stats_fn)
+                    dlsym(cutlass_plugin, "q21_flash_vision_layer_norm_bf16_stats_pytorch");
             }
         } else {
             cutlass_attention = cutlass_plugin ? (q21_cutlass_vision_attention_fn)
                 dlsym(cutlass_plugin, "q21_cutlass_vision_attention") : NULL;
         }
         if (!cutlass_plugin || (!strcmp(attention_mode, "cutlass") && !cutlass_attention) ||
-            (!strcmp(attention_mode, "flash") && (!flash_attention || !flash_layer_norm))) {
+            (!strcmp(attention_mode, "flash") && (!flash_attention || !flash_layer_norm)) ||
+            (!strcmp(layer_norm_mode, "nvcc-pytorch-bf16") &&
+             (!flash_layer_norm_bf16 || !flash_layer_norm_bf16_stats))) {
             fprintf(stderr, "vision: %s attention plugin unavailable\n", attention_mode);
             goto done;
         }
@@ -367,24 +384,33 @@ int main(int argc, char **argv) {
         cuStreamSynchronize(r->stream)) goto done;
 blocks_ready:
     norm = checked_cuMemAlloc((size_t)count * 4);
+    norm_bf = checked_cuMemAlloc((size_t)count * 2);
     qkv = checked_cuMemAlloc((size_t)n * 3456 * 4);
     qkv_bf = checked_cuMemAlloc((size_t)n * 3456 * 2);
     att = checked_cuMemAlloc((size_t)count * 4);
     tmp = checked_cuMemAlloc((size_t)count * 4);
     mlp = checked_cuMemAlloc((size_t)n * 4304 * 4);
-    if (max_blocks && (!norm || !qkv || !qkv_bf || !att || !tmp || !mlp)) goto done;
+    if (max_blocks && (!norm || !norm_bf || !qkv || !qkv_bf || !att || !tmp || !mlp)) goto done;
     for (int block = block_index; block < block_index + max_blocks; block++) {
         char name[256];
         snprintf(name, sizeof(name), "model.visual.blocks.%d.norm1.weight", block);
-        CUdeviceptr nw = upload_f32(&shards, name);
+        CUdeviceptr nw = flash_layer_norm_bf16 ? upload_bf16_raw(&shards, name) : upload_f32(&shards, name);
         snprintf(name, sizeof(name), "model.visual.blocks.%d.norm1.bias", block);
-        CUdeviceptr nb = upload_f32(&shards, name);
+        CUdeviceptr nb = flash_layer_norm_bf16 ? upload_bf16_raw(&shards, name) : upload_f32(&shards, name);
         if (!nw || !nb || cuCtxSynchronize()) { free_d(&nw); free_d(&nb); goto done; }
+        if (flash_layer_norm_bf16 && launch_cast(r, norm_bf, x, count)) {
+            free_d(&nw); free_d(&nb); goto done;
+        }
         if (block == block_index && dump_dir && flash_layer_norm_stats) {
             CUdeviceptr stats = checked_cuMemAlloc((size_t)n * 2 * sizeof(float));
-            if (!stats || flash_layer_norm_stats((float *)(uintptr_t)stats,
-                                                 (const float *)(uintptr_t)x,
-                                                 n, 1152, r->stream) ||
+            int stats_status = flash_layer_norm_bf16_stats
+                ? flash_layer_norm_bf16_stats((float *)(uintptr_t)stats,
+                                              (const void *)(uintptr_t)norm_bf,
+                                              n, 1152, r->stream)
+                : flash_layer_norm_stats((float *)(uintptr_t)stats,
+                                         (const float *)(uintptr_t)x,
+                                         n, 1152, r->stream);
+            if (!stats || stats_status ||
                 cuStreamSynchronize(r->stream) ||
                 dump_vision(dump_dir, "norm1_stats", stats, (size_t)n * 2, n, 2)) {
                 free_d(&stats); free_d(&nw); free_d(&nb); goto done;
@@ -392,7 +418,13 @@ blocks_ready:
             free_d(&stats);
         }
         void *ln1[] = {&norm, &x, &nw, &nb, &(int){1152}};
-        int ln_status = flash_layer_norm
+        int ln_status = flash_layer_norm_bf16
+            ? flash_layer_norm_bf16((float *)(uintptr_t)norm,
+                                    (const void *)(uintptr_t)norm_bf,
+                                    (const void *)(uintptr_t)nw,
+                                    (const void *)(uintptr_t)nb,
+                                    n, 1152, r->stream)
+            : flash_layer_norm
             ? flash_layer_norm((float *)(uintptr_t)norm, (const float *)(uintptr_t)x,
                                (const float *)(uintptr_t)nw, (const float *)(uintptr_t)nb,
                                n, 1152, r->stream)
@@ -435,15 +467,23 @@ blocks_ready:
         if (block == block_index && dump_vision(dump_dir, "post_attn", x,
                                                  (size_t)count, n, 1152)) goto done;
         snprintf(name, sizeof(name), "model.visual.blocks.%d.norm2.weight", block);
-        nw = upload_f32(&shards, name);
+        nw = flash_layer_norm_bf16 ? upload_bf16_raw(&shards, name) : upload_f32(&shards, name);
         snprintf(name, sizeof(name), "model.visual.blocks.%d.norm2.bias", block);
-        nb = upload_f32(&shards, name);
+        nb = flash_layer_norm_bf16 ? upload_bf16_raw(&shards, name) : upload_f32(&shards, name);
         if (!nw || !nb || cuCtxSynchronize()) { free_d(&nw); free_d(&nb); goto done; }
+        if (flash_layer_norm_bf16 && launch_cast(r, norm_bf, x, count)) {
+            free_d(&nw); free_d(&nb); goto done;
+        }
         if (block == block_index && dump_dir && flash_layer_norm_stats) {
             CUdeviceptr stats = checked_cuMemAlloc((size_t)n * 2 * sizeof(float));
-            if (!stats || flash_layer_norm_stats((float *)(uintptr_t)stats,
-                                                 (const float *)(uintptr_t)x,
-                                                 n, 1152, r->stream) ||
+            int stats_status = flash_layer_norm_bf16_stats
+                ? flash_layer_norm_bf16_stats((float *)(uintptr_t)stats,
+                                              (const void *)(uintptr_t)norm_bf,
+                                              n, 1152, r->stream)
+                : flash_layer_norm_stats((float *)(uintptr_t)stats,
+                                         (const float *)(uintptr_t)x,
+                                         n, 1152, r->stream);
+            if (!stats || stats_status ||
                 cuStreamSynchronize(r->stream) ||
                 dump_vision(dump_dir, "norm2_stats", stats, (size_t)n * 2, n, 2)) {
                 free_d(&stats); free_d(&nw); free_d(&nb); goto done;
@@ -451,7 +491,13 @@ blocks_ready:
             free_d(&stats);
         }
         void *ln2[] = {&norm, &x, &nw, &nb, &(int){1152}};
-        ln_status = flash_layer_norm
+        ln_status = flash_layer_norm_bf16
+            ? flash_layer_norm_bf16((float *)(uintptr_t)norm,
+                                    (const void *)(uintptr_t)norm_bf,
+                                    (const void *)(uintptr_t)nw,
+                                    (const void *)(uintptr_t)nb,
+                                    n, 1152, r->stream)
+            : flash_layer_norm
             ? flash_layer_norm((float *)(uintptr_t)norm, (const float *)(uintptr_t)x,
                                (const float *)(uintptr_t)nw, (const float *)(uintptr_t)nb,
                                n, 1152, r->stream)
@@ -501,7 +547,7 @@ blocks_ready:
 done:
     free(host_pos); free(host_out);
     free_d(&x); free_d(&bf); free_d(&projected); free_d(&weight); free_d(&bias); free_d(&pos); free_d(&vision_rope_d);
-    free_d(&norm); free_d(&qkv); free_d(&qkv_bf); free_d(&att); free_d(&tmp); free_d(&mlp);
+    free_d(&norm); free_d(&norm_bf); free_d(&qkv); free_d(&qkv_bf); free_d(&att); free_d(&tmp); free_d(&mlp);
     if (cutlass_plugin) dlclose(cutlass_plugin);
     if (module) cuModuleUnload(module);
     if (r) cuda_qimg_free(r);

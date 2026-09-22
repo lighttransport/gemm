@@ -1307,6 +1307,10 @@ the full recurrence, so the accepted kernel retains the literal pinned
 PyTorch Welford expressions. Recompiling with the wheel's recorded CUDA 13.0
 flags (`-O2`, C++20, extended lambdas, and the half/BF16 conversion-disable
 macros) leaves the same four block-1 Norm1 output differences.
+`--layer-norm nvcc-pytorch-bf16` additionally casts hidden states to actual
+BF16 storage and runs BF16-vector input/weight/bias kernels. It produces the
+same four differences and is retained only as a diagnostic; the default avoids
+its extra cast and buffer.
 
 For boundary isolation, `--norm1-override NORM.npy` replaces the first
 executed block's computed normalization output after still running the native

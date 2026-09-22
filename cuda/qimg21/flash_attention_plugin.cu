@@ -54,6 +54,10 @@ struct alignas(16) q21_float4 {
     float val[4];
 };
 
+struct alignas(8) q21_bf16x4 {
+    cutlass::bfloat16_t val[4];
+};
+
 __device__ q21_ln_stat q21_ln_add(q21_ln_stat a, float value) {
     float delta = value - a.mean;
     float count = a.count + 1.0f;
@@ -168,6 +172,98 @@ __global__ void q21_vision_layer_norm_stats_kernel(float *out, const float *inpu
     }
 }
 
+__global__ void q21_vision_layer_norm_bf16_kernel(
+        float *out, const cutlass::bfloat16_t *input,
+        const cutlass::bfloat16_t *weight, const cutlass::bfloat16_t *bias,
+        int width) {
+    int row = blockIdx.x, thread = threadIdx.x + threadIdx.y * blockDim.x;
+    int lane = threadIdx.x & 31, warp = thread >> 5;
+    __shared__ float shared[12];
+    q21_ln_stat stat{0.0f, 0.0f, 0.0f};
+    int vectors = width / 4;
+    const q21_bf16x4 *input_vec = reinterpret_cast<const q21_bf16x4 *>(input + row * width);
+    for (int vector = thread; vector < vectors; vector += blockDim.x * blockDim.y) {
+        q21_bf16x4 data = input_vec[vector];
+#pragma unroll
+        for (int i = 0; i < 4; ++i)
+            stat = q21_ln_add(stat, static_cast<float>(data.val[i]));
+    }
+    for (int offset = 16; offset; offset >>= 1) {
+        q21_ln_stat other{__shfl_down_sync(0xffffffff, stat.mean, offset),
+                          __shfl_down_sync(0xffffffff, stat.var, offset),
+                          __shfl_down_sync(0xffffffff, stat.count, offset)};
+        stat = q21_ln_combine(stat, other);
+    }
+    for (int offset = blockDim.y / 2; offset; offset >>= 1) {
+        if (lane == 0 && warp >= offset && warp < 2 * offset) {
+            int index = warp - offset;
+            shared[2 * index] = stat.mean;
+            shared[2 * index + 1] = stat.var;
+            shared[blockDim.y + index] = stat.count;
+        }
+        __syncthreads();
+        if (lane == 0 && warp < offset) {
+            q21_ln_stat other{shared[2 * warp], shared[2 * warp + 1],
+                              shared[blockDim.y + warp]};
+            stat = q21_ln_combine(stat, other);
+        }
+        __syncthreads();
+    }
+    if (thread == 0) {
+        shared[0] = stat.mean;
+        shared[1] = stat.var / static_cast<float>(width);
+    }
+    __syncthreads();
+    float mean = shared[0], inverse = rsqrtf(shared[1] + 1.0e-6f);
+    for (int column = thread; column < width; column += blockDim.x * blockDim.y) {
+        float value = static_cast<float>(weight[column]) *
+                      (inverse * (static_cast<float>(input[row * width + column]) - mean)) +
+                      static_cast<float>(bias[column]);
+        out[row * width + column] = q21_round_bf16(value);
+    }
+}
+
+__global__ void q21_vision_layer_norm_bf16_stats_kernel(
+        float *out, const cutlass::bfloat16_t *input, int width) {
+    int row = blockIdx.x, thread = threadIdx.x + threadIdx.y * blockDim.x;
+    int lane = threadIdx.x & 31, warp = thread >> 5;
+    __shared__ float shared[12];
+    q21_ln_stat stat{0.0f, 0.0f, 0.0f};
+    int vectors = width / 4;
+    const q21_bf16x4 *input_vec = reinterpret_cast<const q21_bf16x4 *>(input + row * width);
+    for (int vector = thread; vector < vectors; vector += blockDim.x * blockDim.y) {
+        q21_bf16x4 data = input_vec[vector];
+#pragma unroll
+        for (int i = 0; i < 4; ++i)
+            stat = q21_ln_add(stat, static_cast<float>(data.val[i]));
+    }
+    for (int offset = 16; offset; offset >>= 1) {
+        q21_ln_stat other{__shfl_down_sync(0xffffffff, stat.mean, offset),
+                          __shfl_down_sync(0xffffffff, stat.var, offset),
+                          __shfl_down_sync(0xffffffff, stat.count, offset)};
+        stat = q21_ln_combine(stat, other);
+    }
+    for (int offset = blockDim.y / 2; offset; offset >>= 1) {
+        if (lane == 0 && warp >= offset && warp < 2 * offset) {
+            int index = warp - offset;
+            shared[2 * index] = stat.mean;
+            shared[2 * index + 1] = stat.var;
+            shared[blockDim.y + index] = stat.count;
+        }
+        __syncthreads();
+        if (lane == 0 && warp < offset) {
+            q21_ln_stat other{shared[2 * warp], shared[2 * warp + 1],
+                              shared[blockDim.y + warp]};
+            stat = q21_ln_combine(stat, other);
+        }
+        __syncthreads();
+    }
+    if (thread == 0) {
+        out[2 * row] = stat.mean;
+        out[2 * row + 1] = rsqrtf(stat.var / static_cast<float>(width) + 1.0e-6f);
+    }
+}
+
 extern "C" int q21_flash_vision_layer_norm(float *out, const float *input,
                                              const float *weight, const float *bias,
                                              int rows, int width, cudaStream_t stream) {
@@ -205,6 +301,27 @@ extern "C" int q21_flash_vision_layer_norm_stats_pytorch(float *out,
         return cudaErrorInvalidValue;
     q21_vision_layer_norm_stats_kernel<<<rows, dim3(32, 4), 0, stream>>>(
         out, input, width);
+    return cudaGetLastError();
+}
+
+extern "C" int q21_flash_vision_layer_norm_bf16_pytorch(
+        float *out, const void *input, const void *weight, const void *bias,
+        int rows, int width, cudaStream_t stream) {
+    if (!out || !input || !weight || !bias || rows <= 0 || width <= 0 || width % 4)
+        return cudaErrorInvalidValue;
+    q21_vision_layer_norm_bf16_kernel<<<rows, dim3(32, 4), 0, stream>>>(
+        out, static_cast<const cutlass::bfloat16_t *>(input),
+        static_cast<const cutlass::bfloat16_t *>(weight),
+        static_cast<const cutlass::bfloat16_t *>(bias), width);
+    return cudaGetLastError();
+}
+
+extern "C" int q21_flash_vision_layer_norm_bf16_stats_pytorch(
+        float *out, const void *input, int rows, int width, cudaStream_t stream) {
+    if (!out || !input || rows <= 0 || width <= 0 || width % 4)
+        return cudaErrorInvalidValue;
+    q21_vision_layer_norm_bf16_stats_kernel<<<rows, dim3(32, 4), 0, stream>>>(
+        out, static_cast<const cutlass::bfloat16_t *>(input), width);
     return cudaGetLastError();
 }
 
