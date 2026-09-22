@@ -182,6 +182,16 @@ the target-ready event instead of copying them into a second buffer. The
 injection stream retains private `x`/norm/K/V workspaces and its inject-done
 event still gates the next proposal before target scratch can be reused.
 
+## 2026-09-22 continuation: grouped verifier split-count hoist
+
+The verifier-only four- and eight-row combine candidates now compute each
+adaptive split count once during shared metadata setup and reuse it for both
+metadata loading and the final merge. The gated recurrent variant has the same
+hoist. Split selection, metadata order, packed-F16 accumulation, and output
+arithmetic are unchanged; the captured generic combine path is untouched.
+Host build and gfx1201 HIP syntax checks pass. Resident hash and timing A/B
+results remain pending because this environment has no `/dev/kfd` device.
+
 ## 2026-09-22 continuation: opt-in parallel DFlash2 selector
 
 The DFlash2 selector now has an opt-in

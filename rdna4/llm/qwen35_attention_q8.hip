@@ -1074,12 +1074,18 @@ void qwen35_attention_q8_combine_verify4(float *out, const float *parts,
         int occupancy, int forced_splits, int queries) {
     int head = blockIdx.x, q0 = blockIdx.y * 4, tid = threadIdx.x;
     __shared__ float2 shared_meta[4][128];
-    for (int q = 0; q < 4; ++q) {
-        int query = q0 + q;
-        int splits = query < queries ?
+    __shared__ int split_count[4];
+    if (tid < 4) {
+        int query = q0 + tid;
+        split_count[tid] = query < queries ?
             (forced_splits ? forced_splits :
              q8_attention_splits(position[query] + 1, heads, nsm, occupancy)) : 0;
+    }
+    __syncthreads();
+    for (int q = 0; q < 4; ++q) {
+        int splits = split_count[q];
         if (splits > 1) {
+            int query = q0 + q;
             const float2 *src = meta + ((size_t)query * heads + head) * splits;
             for (int i = tid; i < splits; i += 256)
                 shared_meta[q][i] = src[i];
@@ -1091,9 +1097,7 @@ void qwen35_attention_q8_combine_verify4(float *out, const float *parts,
     __syncthreads();
     for (int q = 0; q < 4; ++q) {
         int query = q0 + q;
-        int splits = query < queries ?
-            (forced_splits ? forced_splits :
-             q8_attention_splits(position[query] + 1, heads, nsm, occupancy)) : 0;
+        int splits = split_count[q];
         if (splits > 1) {
             const float *src = parts + ((size_t)query * heads + head) * splits * 256;
             float maximum = shared_meta[q][0].x;
@@ -1122,12 +1126,18 @@ void qwen35_attention_q8_combine_verify8(float *out, const float *parts,
         int occupancy, int forced_splits, int queries) {
     int head = blockIdx.x, q0 = blockIdx.y * 8, tid = threadIdx.x;
     __shared__ float2 shared_meta[8][128];
-    for (int q = 0; q < 8; ++q) {
-        int query = q0 + q;
-        int splits = query < queries ?
+    __shared__ int split_count[8];
+    if (tid < 8) {
+        int query = q0 + tid;
+        split_count[tid] = query < queries ?
             (forced_splits ? forced_splits :
              q8_attention_splits(position[query] + 1, heads, nsm, occupancy)) : 0;
+    }
+    __syncthreads();
+    for (int q = 0; q < 8; ++q) {
+        int splits = split_count[q];
         if (splits > 1) {
+            int query = q0 + q;
             const float2 *src = meta + ((size_t)query * heads + head) * splits;
             for (int i = tid; i < splits; i += 256)
                 shared_meta[q][i] = src[i];
@@ -1136,9 +1146,7 @@ void qwen35_attention_q8_combine_verify8(float *out, const float *parts,
     __syncthreads();
     for (int q = 0; q < 8; ++q) {
         int query = q0 + q;
-        int splits = query < queries ?
-            (forced_splits ? forced_splits :
-             q8_attention_splits(position[query] + 1, heads, nsm, occupancy)) : 0;
+        int splits = split_count[q];
         if (splits > 1) {
             const float *src = parts + ((size_t)query * heads + head) * splits * 256;
             float maximum = shared_meta[q][0].x;

@@ -189,6 +189,14 @@ explicit probe until resident long-context hashes and timing justify it. The
 grouped launch uses only the kernel's static metadata tile, so no redundant
 dynamic shared-memory reservation is requested.
 
+Both grouped candidates now calculate each query's adaptive split count once
+into shared metadata before loading or merging that query. The gated recurrent
+verifier kernels use the same arrangement. This removes duplicate split
+selection work without changing split boundaries, metadata ordering, packed-F16
+accumulation, or output bytes. The generic captured combine ABI and production
+defaults remain unchanged; resident-device hash and timing validation is still
+required before enabling either candidate.
+
 The opt-in cache-injection overlap path now consumes captured feature rows
 directly after the target-ready event, eliminating a redundant device copy.
 Sidecar `x`/norm/K/V workspaces remain stream-private, and the inject-done
