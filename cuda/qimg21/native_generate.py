@@ -134,14 +134,21 @@ def main() -> int:
     condition_hw = None
     condition_dir = work / "condition"
     if args.image:
-        from editing_inputs import prepare_image
         encoder = root / "cuda/qimg21/test_cuda_qimg21_vae_encode"
         if not encoder.exists():
             raise SystemExit("native encoder missing; run `make -C cuda/qimg21 native-vae`")
-        condition_hw = prepare_image(Path(args.image).resolve(), condition_dir, args.condition_resolution)
-        _run([str(encoder), "--model", str(model / "vae"), "--image", str(condition_dir / "image.npy"),
+        condition_dir.mkdir(parents=True, exist_ok=False)
+        _run([str(encoder), "--model", str(model / "vae"),
+              "--input-image", str(Path(args.image).resolve()),
+              "--resolution", str(args.condition_resolution),
+              "--preprocessed-out", str(condition_dir / "image.npy"),
+              "--resized-out", str(condition_dir / "resized.png"),
               "--out", str(condition_dir / "moments.npy"),
               "--normalized-latents", str(condition_dir / "latents.npy")], cwd=root)
+        image_tensor = np.load(condition_dir / "image.npy", mmap_mode="r")
+        if image_tensor.ndim != 3 or image_tensor.shape[0] != 4:
+            raise SystemExit("native image processor returned an invalid RGBA tensor")
+        condition_hw = image_tensor.shape[1] // 16, image_tensor.shape[2] // 16
 
     prompt_dir = work / "prompt"
     steps_dir = work / "steps"

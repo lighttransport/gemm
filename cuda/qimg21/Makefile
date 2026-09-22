@@ -49,7 +49,7 @@ test_cuda_qimg21_vae: test_cuda_qimg21_vae.c ../../cuda/cuew.c ../../cuda/cublas
 
 native-vae: test_cuda_qimg21_vae test_cuda_qimg21_vae_encode
 
-test_cuda_qimg21_vae_encode: test_cuda_qimg21_vae_encode.c test_cuda_qimg21_vae.c ../../cuda/cuew.c ../../cuda/cublasew.c
+test_cuda_qimg21_vae_encode: test_cuda_qimg21_vae_encode.c test_cuda_qimg21_vae.c ../../common/stb_image.h ../../common/stb_image_resize2.h ../../common/stb_image_write.h ../../cuda/cuew.c ../../cuda/cublasew.c
 	$(CC) -O2 -std=c11 -D_GNU_SOURCE -Wall -Wextra -I../../common -I../../cuda -I../qimg \
 		-o $@ test_cuda_qimg21_vae_encode.c ../../cuda/cuew.c ../../cuda/cublasew.c -ldl -lm -lpthread
 

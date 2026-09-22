@@ -1341,11 +1341,17 @@ OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=1 tmp/qimg21-ref-venv/bin/python cuda/qim
   --case 256x256:7 --work-dir tmp/qimg21-encoder-matrix
 ```
 
-Input is finite F32 `[4,H,W]` RGBA already normalized to `[-1,1]`, with both
-dimensions divisible by 16 and at most 1024. Output is raw F32 posterior
+Input may be finite F32 `[4,H,W]` RGBA already normalized to `[-1,1]`, or an
+image file supplied with `--input-image` and `--resolution`. The native image
+path decodes with stb, reproduces Pillow's premultiplied-alpha fixed-point
+Lanczos resize and Diffusers normalization, and can emit `--resized-out` plus
+`--preprocessed-out`. For the 1024-to-256 editing fixture, the native F32
+tensor and resulting normalized VAE latents are bit-identical to the former
+Python/Pillow path (maximum error 0). `--preprocess-only` needs no model or GPU.
+Dimensions are divisible by 16 and at most 1024. Output is raw F32 posterior
 parameters `[128,H/16,W/16]`: mean channels first, then log-variance channels.
-It does **not** resize/read image files, sample the posterior, or clamp log
-variance. The optional `--normalized-latents` output selects the deterministic
+It does not sample the posterior or clamp log variance. The optional
+`--normalized-latents` output selects the deterministic
 posterior mean, applies `(mean - latents_mean) / latents_std`, and packs F32
 tokens as `[H/16 * W/16,64]`. Encoder and decoder share the original model's
 mean/std constants. This token file has the native denoiser's condition-latent
@@ -1411,7 +1417,7 @@ used for this memory figure. Artifacts: `tmp/qimg21-encoder-1024/results.json`,
 ### Experimental single-image editing integration
 
 `native_generate.py --image IMAGE --condition-resolution 256 --native-vae`
-now connects official CPU RGBA preprocessing, native F32 VAE encoding and
+now connects native CPU RGBA decoding/Pillow-compatible preprocessing, native F32 VAE encoding and
 normalization, Diffusers vision/text encoding, checked native joint layouts,
 native denoising, and native decoding. Negative prompts get their own layout.
 The text helper wraps the image in the sequence required by `encode_prompt`.
