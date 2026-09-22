@@ -135,6 +135,14 @@ output ranges while retaining the existing per-row dot and reduction order.
 The production path remains on the three-launch dispatch until a resident
 gfx1201 run proves identical 4K/64K hashes and a sustained projection win.
 
+The same native kernel now has an opt-in
+`LLM_QWEN35_IQ3_GATEUP_FUSED=1` gate/up form for dense FFN layers where both
+projections are IQ3_XXS with matching shapes. It covers the two output ranges
+in one launch, stages the IQ3 codebook once, and leaves the native Q8_1 input
+and per-row reduction arithmetic unchanged. It is diagnostic only pending a
+resident 4K/64K hash and throughput comparison; the ordinary two-launch path
+remains the default.
+
 ## 2026-09-22 continuation: opt-in DFlash2 Q/K/V projection fusion
 
 DFlash2 proposal rows now have an opt-in `LLM_QWEN35_DFLASH_QKV_FUSED=1` path

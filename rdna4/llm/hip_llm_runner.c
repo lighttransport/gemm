@@ -21551,6 +21551,31 @@ static inline int launch_qwen35_iq3xxs_qkv_fused(hip_llm_runner *r,
     return 1;
 }
 
+/* The dense FFN gate and up projections have the same one-token activation
+ * and, on the IQ3_XXS layers used by the long-context target, the same input
+ * width.  Reuse the native Q/K/V kernel with its V range disabled so the
+ * codebook is staged once and the two output ranges are covered by one
+ * launch.  The kernel keeps the standalone per-row dot and reduction order;
+ * this is deliberately opt-in until resident-device hashes and throughput
+ * are measured. */
+static inline int launch_qwen35_iq3xxs_gateup_fused(hip_llm_runner *r,
+        void *gate, void *up, void *gate_w, void *up_w, void *x,
+        int rows, int n_cols) {
+    const char *env = getenv("LLM_QWEN35_IQ3_GATEUP_FUSED");
+    if (!env || atoi(env) == 0 || !r->fn_qwen35_matvec_iq3xxs_qkv ||
+        rows < 1 || n_cols > 17408 || (n_cols % 256) != 0)
+        return 0;
+    launch_native_q81(r, x, n_cols);
+    int qrows = rows, krows = rows, vrows = 0;
+    void *vout = NULL, *v_w = NULL;
+    void *a[] = { &gate, &up, &vout, &gate_w, &up_w, &v_w,
+                  &r->d_native_q81, &r->d_native_scale,
+                  &qrows, &krows, &vrows, &n_cols };
+    LAUNCH(r->fn_qwen35_matvec_iq3xxs_qkv,
+           (qrows + krows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, a);
+    return 1;
+}
+
 static inline void launch_matvec_iq3_xxs_ptrs(hip_llm_runner *r, void *dst,
         void *mats, void *x, int n_rows, int n_cols, int x_stride, int slots) {
     void *args[] = { &dst, &mats, &x, &n_rows, &n_cols, &x_stride };
@@ -29243,14 +29268,25 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
                 } else
                     LAUNCH(r->fn_ffn_gate_up_silu_iq3xxs, n_ff, 1, 1, 256, 1, 1, 0, r->stream, a);
             } else {
-                begin_q8x2_reuse(r);
-                launch_matvec_ffn_auto(r, r->d_gate, cl->ffn_gate_w, r->d_xb,
-                                      cl->ffn_gate_rows, cl->ffn_gate_cols,
-                                      cl->ffn_gate_type, 0);
-                launch_matvec_ffn_auto(r, r->d_up, cl->ffn_up_w, r->d_xb,
-                                      cl->ffn_up_rows, cl->ffn_up_cols,
-                                      cl->ffn_up_type, 0);
-                end_q8x2_reuse(r);
+                int fused_iq3_gateup =
+                    cl->ffn_gate_type == GGML_TYPE_IQ3_XXS &&
+                    cl->ffn_up_type == GGML_TYPE_IQ3_XXS &&
+                    cl->ffn_gate_rows == cl->ffn_up_rows &&
+                    cl->ffn_gate_cols == cl->ffn_up_cols &&
+                    launch_qwen35_iq3xxs_gateup_fused(
+                        r, r->d_gate, r->d_up, cl->ffn_gate_w,
+                        cl->ffn_up_w, r->d_xb, cl->ffn_gate_rows,
+                        cl->ffn_gate_cols);
+                if (!fused_iq3_gateup) {
+                    begin_q8x2_reuse(r);
+                    launch_matvec_ffn_auto(r, r->d_gate, cl->ffn_gate_w, r->d_xb,
+                                          cl->ffn_gate_rows, cl->ffn_gate_cols,
+                                          cl->ffn_gate_type, 0);
+                    launch_matvec_ffn_auto(r, r->d_up, cl->ffn_up_w, r->d_xb,
+                                          cl->ffn_up_rows, cl->ffn_up_cols,
+                                          cl->ffn_up_type, 0);
+                    end_q8x2_reuse(r);
+                }
                 if (r->debug_layers && debug_attention_layer_selected(l)) {
                     debug_f32_state(r, l, "scalar ffn_gate_raw", r->d_gate, n_ff);
                     debug_f32_state(r, l, "scalar ffn_up_raw", r->d_up, n_ff);

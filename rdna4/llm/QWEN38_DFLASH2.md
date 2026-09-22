@@ -95,6 +95,12 @@ row grid, but preserves the standalone kernel's arithmetic for each row.
 Defaults remain unchanged until a resident-device A/B validates exact token and
 logit hashes together with a sustained 64K decode improvement.
 
+The dense FFN path also exposes `LLM_QWEN35_IQ3_GATEUP_FUSED=1` when gate and
+up are matching IQ3_XXS matrices. It reuses the Q/K/V kernel with the V range
+disabled, so both one-token projections share codebook staging and one launch
+while retaining the standalone row arithmetic. This remains opt-in pending
+resident hash, quality, and throughput checks.
+
 ## DFlash2 long-window split retune (2026-09-22)
 
 The sidecar attention launch now uses twelve partitions once its 2,048-token
