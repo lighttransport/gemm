@@ -1250,8 +1250,8 @@ for BF16 head dimension 72; `--attention cutlass` and `math` retain diagnostic
 alternatives. Vision linears use BF16-output cuBLAS-LT bias epilogues, including
 the PyTorch-selected algo 21 tile/stage and split-K configurations for the
 256-token block shapes. LayerNorm uses PyTorch's vector-four, eight-warp
-Welford topology and precise CUDA arithmetic. Teacher-forced block 0 reaches
-cosine 0.999998968. Free-running errors still compound: blocks 0/1/2 pass at
+Welford topology in the pinned NVCC plugin rather than NVRTC. Teacher-forced
+block 0 reaches cosine 0.999999578. Free-running errors still compound: blocks 0/1/2 pass at
 0.999997719/0.999984180/0.999970628, block 3 is the first miss at
 0.999957879, and block 26 scores 0.999620834. The final merger is therefore
 not accepted or wired into generation yet. Use `--hidden ... --block-index N

@@ -6,6 +6,8 @@
 
 typedef int (*q21_cutlass_vision_attention_fn)(float *, const void *, int, int, int, CUstream);
 typedef int (*q21_flash_vision_attention_fn)(float *, const void *, int, CUstream);
+typedef int (*q21_flash_vision_layer_norm_fn)(float *, const float *, const float *,
+                                              const float *, int, int, CUstream);
 
 static const char *vision_front_src =
 "extern \"C\" {\n"
@@ -205,6 +207,7 @@ int main(int argc, char **argv) {
     void *cutlass_plugin = NULL;
     q21_cutlass_vision_attention_fn cutlass_attention = NULL;
     q21_flash_vision_attention_fn flash_attention = NULL;
+    q21_flash_vision_layer_norm_fn flash_layer_norm = NULL;
     float *host_pos = NULL, *host_out = NULL;
     int rc = 1, n = h * w, count = n * 1152;
     int vision_compile = -1;
@@ -234,12 +237,14 @@ int main(int argc, char **argv) {
         if (!strcmp(attention_mode, "flash")) {
             flash_attention = cutlass_plugin ? (q21_flash_vision_attention_fn)
                 dlsym(cutlass_plugin, "q21_flash_vision_attention") : NULL;
+            flash_layer_norm = cutlass_plugin ? (q21_flash_vision_layer_norm_fn)
+                dlsym(cutlass_plugin, "q21_flash_vision_layer_norm") : NULL;
         } else {
             cutlass_attention = cutlass_plugin ? (q21_cutlass_vision_attention_fn)
                 dlsym(cutlass_plugin, "q21_cutlass_vision_attention") : NULL;
         }
         if (!cutlass_plugin || (!strcmp(attention_mode, "cutlass") && !cutlass_attention) ||
-            (!strcmp(attention_mode, "flash") && !flash_attention)) {
+            (!strcmp(attention_mode, "flash") && (!flash_attention || !flash_layer_norm))) {
             fprintf(stderr, "vision: %s attention plugin unavailable\n", attention_mode);
             goto done;
         }
@@ -294,7 +299,13 @@ blocks_ready:
         CUdeviceptr nb = upload_f32(&shards, name);
         if (!nw || !nb || cuCtxSynchronize()) { free_d(&nw); free_d(&nb); goto done; }
         void *ln1[] = {&norm, &x, &nw, &nb, &(int){1152}};
-        if (cuLaunchKernel(layer_norm, n, 1, 1, 256, 1, 1, 0, r->stream, ln1, NULL) ||
+        int ln_status = flash_layer_norm
+            ? flash_layer_norm((float *)(uintptr_t)norm, (const float *)(uintptr_t)x,
+                               (const float *)(uintptr_t)nw, (const float *)(uintptr_t)nb,
+                               n, 1152, r->stream)
+            : (int)cuLaunchKernel(layer_norm, n, 1, 1, 256, 1, 1, 0,
+                                  r->stream, ln1, NULL);
+        if (ln_status ||
             cuStreamSynchronize(r->stream)) { free_d(&nw); free_d(&nb); goto done; }
         free_d(&nw); free_d(&nb);
         if (block == block_index && dump_vision(dump_dir, "norm1", norm, (size_t)count, n, 1152)) goto done;
@@ -333,7 +344,13 @@ blocks_ready:
         nb = upload_f32(&shards, name);
         if (!nw || !nb || cuCtxSynchronize()) { free_d(&nw); free_d(&nb); goto done; }
         void *ln2[] = {&norm, &x, &nw, &nb, &(int){1152}};
-        if (cuLaunchKernel(layer_norm, n, 1, 1, 256, 1, 1, 0, r->stream, ln2, NULL) ||
+        ln_status = flash_layer_norm
+            ? flash_layer_norm((float *)(uintptr_t)norm, (const float *)(uintptr_t)x,
+                               (const float *)(uintptr_t)nw, (const float *)(uintptr_t)nb,
+                               n, 1152, r->stream)
+            : (int)cuLaunchKernel(layer_norm, n, 1, 1, 256, 1, 1, 0,
+                                  r->stream, ln2, NULL);
+        if (ln_status ||
             cuStreamSynchronize(r->stream)) { free_d(&nw); free_d(&nb); goto done; }
         free_d(&nw); free_d(&nb);
         if (block == block_index && dump_vision(dump_dir, "norm2", norm, (size_t)count, n, 1152)) goto done;
