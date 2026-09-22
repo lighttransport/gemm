@@ -3,6 +3,7 @@ CUDA_HOME ?= /usr/local/cuda-13.1
 PYTORCH_SOURCE ?= ../../tmp/pytorch-src
 FLASH_ATTN_SOURCE ?= ../../tmp/flash-attention-src
 TORCH_INCLUDE ?= ../../tmp/qimg21-ref-venv/lib/python3.12/site-packages/torch/include
+CUDNN_ROOT ?= ../../tmp/qimg21-ref-venv/lib/python3.12/site-packages/nvidia/cudnn
 
 .PHONY: all setup setup-exact-sources verify-exact-sources verify-generated-artifacts generate reference compare regress native native-exact native-text-exact native-vae clean
 
@@ -30,6 +31,12 @@ libq21_flash_attention.so: flash_attention_plugin.cu | verify-exact-sources
 	$(CUDA_HOME)/bin/nvcc -O3 -std=c++17 --expt-relaxed-constexpr --shared -Xcompiler=-fPIC \
 		-gencode arch=compute_120,code=sm_120 -I$(FLASH_ATTN_SOURCE) \
 		-I$(FLASH_ATTN_SOURCE)/csrc/cutlass/include -o $@ $<
+
+libq21_cudnn_patch.so: cudnn_patch_plugin.cu
+	$(CUDA_HOME)/bin/nvcc -O3 -std=c++17 --shared -Xcompiler=-fPIC \
+		-gencode arch=compute_120,code=sm_120 -I$(CUDNN_ROOT)/include \
+		-L$(CUDNN_ROOT)/lib -Xlinker -rpath -Xlinker $(abspath $(CUDNN_ROOT)/lib) \
+		-o $@ $< -l:libcudnn.so.9
 
 qwen21_rope_freqs.npy: export_rope_frequencies.py
 	$(PYTHON) $< --out $@
@@ -70,7 +77,7 @@ test_cuda_qimg21_text: test_cuda_qimg21_text.c qwen_tokenizer_json.h text_kernel
 	$(CC) -O2 -std=c11 -D_GNU_SOURCE -Wall -Wextra -I../../common -I../../cuda -I../qimg \
 		-o $@ test_cuda_qimg21_text.c ../../cuda/cuew.c ../../cuda/cublasew.c -ldl -lm -lpthread
 
-test_cuda_qimg21_vision: test_cuda_qimg21_vision.c test_cuda_qimg21_native.c quant_weights.h libq21_cutlass_attention.so libq21_flash_attention.so qwen21_vision_rope.npy ../../common/stb_image.h ../../cuda/cuew.c ../../cuda/cublasew.c
+test_cuda_qimg21_vision: test_cuda_qimg21_vision.c test_cuda_qimg21_native.c quant_weights.h libq21_cutlass_attention.so libq21_flash_attention.so libq21_cudnn_patch.so qwen21_vision_rope.npy ../../common/stb_image.h ../../cuda/cuew.c ../../cuda/cublasew.c
 	$(CC) -O2 -std=c11 -D_GNU_SOURCE -Wall -Wextra -I../../common -I../../cuda -I../qimg \
 		-o $@ test_cuda_qimg21_vision.c ../../cuda/cuew.c ../../cuda/cublasew.c -ldl -lm -lpthread
 
@@ -132,4 +139,4 @@ regress:
 	$(PYTHON) regression.py --model /mnt/nvme01/models/qimg-21
 
 clean:
-	rm -f test_cuda_qimg21 test_cuda_qimg21_native test_cuda_qimg21_vae test_cuda_qimg21_vae_encode test_cuda_qimg21_text test_cuda_qimg21_vision test_weight_upload test_quant_weights test_joint_layout test_edit_kernels test_scheduler libq21_cutlass_attention.so libq21_flash_attention.so qwen21_rope_freqs.npy qwen21_text_rope.npy qwen21_vision_rope.npy qwen_image21.png
+	rm -f test_cuda_qimg21 test_cuda_qimg21_native test_cuda_qimg21_vae test_cuda_qimg21_vae_encode test_cuda_qimg21_text test_cuda_qimg21_vision test_weight_upload test_quant_weights test_joint_layout test_edit_kernels test_scheduler libq21_cutlass_attention.so libq21_flash_attention.so libq21_cudnn_patch.so qwen21_rope_freqs.npy qwen21_text_rope.npy qwen21_vision_rope.npy qwen_image21.png

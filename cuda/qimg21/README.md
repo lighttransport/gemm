@@ -1243,27 +1243,29 @@ The native Qwen3-VL vision front end is available as
 `test_cuda_qimg21_vision`. It consumes either the processor's flattened F32
 patch matrix or an RGB-convertible image whose sides are divisible by 32.
 The `--image` path normalizes pixels to [-1,1] and emits the exact merged-patch
-ordering natively. It then performs the BF16 3D patch projection with a custom CUDA epilogue,
-and interpolates the learned 48x48 position table in native code. Against a
-16x16-patch official capture, patch-projection cosine is 0.9999999952 and the
-first-block input cosine is 0.9999980129, both above the 0.99996 gate.
-For the native 256x256 image path, patch-projection cosine is 0.9999959485 and
-first-block input cosine is 0.9999965657, also above the gate.
+ordering natively. Its default `--patch-projection cudnn-engine23` recreates
+the pinned PyTorch cuDNN Conv3d plan (engine 23, tile 7, four stages and
+split-K 3); `cublas` retains the earlier diagnostic path. The custom CUDA
+epilogue and interpolated learned 48x48 position table remain native. At full
+1024x1024 conditioning resolution, all 4,718,592 patch-projection values and
+the complete 27-block output are bit-identical to the official capture.
 The executable also contains the 27 custom CUDA vision blocks, three
 deep-stack mergers, and the final merger. Its acceptance default is the
 pinned FlashAttention forward specialization selected by PyTorch Flash SDPA
 for BF16 head dimension 72; `--attention cutlass` and `math` retain diagnostic
 alternatives. Vision linears use BF16-output cuBLAS-LT bias epilogues, including
-the PyTorch-selected algo 21 tile/stage and split-K configurations for the
-256-token block shapes. LayerNorm defaults to the literal vector-four,
+the PyTorch-selected algo 21 tile/stage and split-K configurations. The
+full-resolution FC2 and merger shapes use the captured split-K 6 and 5 plans,
+respectively. LayerNorm defaults to the literal vector-four,
 four-warp topology used by pinned ATen. With the exact attention scale,
 teacher-forced block 0 is bit-identical. Vision RoPE uses a checked CUDA-generated
 cosine/sine artifact and separate multiply/add operations matching PyTorch;
 correcting its table, the FlashAttention scale, and ATen's exact Welford
 expression structure makes every one of the 27 recurrent block outputs
-elementwise bit-identical. The three accumulated deep-stack merger cosines are
-0.999989172220, 0.999988122211, and 0.999987980520; the final merger cosine is
-0.999990332697. All vision checkpoints therefore pass the 0.99996 gate. The
+elementwise bit-identical. On the 4096-token full-resolution capture, the three
+deep-stack merger cosines are 0.999999994689, 0.999999997178, and
+0.999999997502; the final merger cosine is 0.999999999999. All vision
+checkpoints therefore pass the 0.99996 gate. The
 accepted path is wired into the
 experimental editing integration to exercise the complete native path. Use `--hidden ... --block-index N
 --max-blocks 1` for isolated block replay, or `--max-blocks 0 --merged-out ...`
@@ -1565,18 +1567,16 @@ multimodal text, denoising, and native VAE decode and produced finite
 `(82,4096)` prompt embeddings, `(64,4096)` merged vision features, and
 `(256,64)` output latents plus a 256x256 PNG.
 
-Full-resolution conditioning exposed two additional parity boundaries. The
+Full-resolution conditioning exposed additional parity boundaries. The
 native image loader now matches the official processor's integer RGBA-over-white
 composition and F32 normalization exactly; `--pixels-out` dumps this boundary,
-and all 6,291,456 values match the official 1024x1024 capture bit-for-bit. The
-remaining end-to-end blocker is the BF16 patch projection: native cuBLAS differs
-from PyTorch Conv3d in 1,116 of 4,718,592 values (maximum 0.03125, cosine
-0.9999999963). That sparse error is recurrently amplified by the 27 vision
-blocks, so a fresh two-step 256x256 edit with a 1024x1024 condition reaches only
-0.9998051 final-latent cosine. This integration path therefore remains a smoke
-test until the projection reduction/epilogue ordering is matched; the
-teacher-forced vision blocks themselves meet the strict gate as documented
-above.
+and all 6,291,456 values match the official 1024x1024 capture bit-for-bit.
+The cuDNN patch plan and long-shape cuBLASLt dispatch now make the patch and
+all 27 recurrent vision blocks bit-exact; the merger and deep-stack outputs
+remain above 0.99999999 cosine. The remaining full-resolution conditioning
+blocker is the 1058-token text path: separately compiled FlashAttention differs
+sparsely from PyTorch's identical kernel specialization, and recurrence can
+amplify that difference below the 0.99996 final prompt-embedding gate.
 
 ### Exact BF16 editing parity
 

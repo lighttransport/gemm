@@ -368,7 +368,7 @@ extern "C" int q21_flash_text_attention(float *out, const void *q,
     p.h_h_k_ratio = query_heads / kv_heads;
     p.seqlen_q = p.seqlen_k = tokens;
     p.d = p.d_rounded = head_dim;
-    p.seqlen_q_rounded = p.seqlen_k_rounded = 128;
+    p.seqlen_q_rounded = p.seqlen_k_rounded = ((tokens + 127) / 128) * 128;
     p.scale_softmax = static_cast<float>(1.0 / sqrt(static_cast<double>(head_dim)));
     p.scale_softmax_log2 = p.scale_softmax * static_cast<float>(M_LOG2E);
     p.p_dropout = 1.0f;

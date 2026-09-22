@@ -1438,10 +1438,14 @@ int cublasew_gemm_bf16_bf16_f32_lt_bias_rowmajor_nt(cublasew_context *ctx,
 
     memset(&heur, 0, sizeof(heur));
     memset(&torch_algo, 0, sizeof(torch_algo));
-    if (y_f16 == 2 && n_tok == 256 && (n_in == 1152 || n_in == 4304)) {
+    if (y_f16 == 2 &&
+        ((n_tok == 256 && (n_in == 1152 || n_in == 4304)) ||
+         (n_tok == 4096 && n_in == 4304 && n_out == 1152) ||
+         (n_tok == 1024 && n_in == 4608 && n_out == 4608))) {
         int tile = CUBLASLT_MATMUL_TILE_64x64;
         int stages = CUBLASLT_MATMUL_STAGES_32x6;
-        int split_k = n_out <= 1152 ? (n_in == 4304 ? 5 : 3) : 1;
+        int split_k = n_tok == 4096 ? 6 : n_tok == 1024 ? 5 :
+            (n_out <= 1152 ? (n_in == 4304 ? 5 : 3) : 1);
         int reduction = CUBLASLT_REDUCTION_SCHEME_INPLACE;
         if (p_cublasLtMatmulAlgoInit(ctx->lt_handle, CUBLAS_COMPUTE_32F, CUDA_R_32F,
                                      CUDA_R_16BF, CUDA_R_16BF, CUDA_R_16BF, CUDA_R_16BF,
