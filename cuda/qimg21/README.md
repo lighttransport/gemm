@@ -1297,6 +1297,10 @@ the four-warp native output in only 4 of 294,912 values (maximum 0.001953125).
 Injecting that exact Norm1 raises the isolated block-1 cosine from
 0.999999321935 to 0.999999999602 and leaves only 21 differing output values,
 confirming that sparse LayerNorm rounding remains the next recurrence source.
+On the matched post-attention state, block-1 Norm2 differs in only 1 of
+294,912 values (maximum 0.000244140625). Injecting both exact normalization
+outputs makes the complete block bit-identical. The native diagnostic accepts
+`--norm2-override` alongside `--norm1-override` for this boundary proof.
 Testing unfused online/combine arithmetic, native BF16 conversion, PyTorch's
 2D thread indexing, O2 compilation, and CUDA 12.9 code generation did not improve
 the full recurrence, so the accepted kernel retains the literal pinned

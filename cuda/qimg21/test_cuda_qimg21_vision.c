@@ -202,7 +202,7 @@ static int build_position_embedding(const qimg21_shards *shards, int h, int w, f
 
 int main(int argc, char **argv) {
     const char *model = NULL, *pixels = NULL, *image = NULL, *hidden = NULL, *out = NULL;
-    const char *norm1_override = NULL;
+    const char *norm1_override = NULL, *norm2_override = NULL;
     const char *patch_out = NULL, *dump_dir = NULL, *merged_out = NULL, *deepstack_dir = NULL;
     const char *attention_mode = "flash";
     const char *flash_plugin_path = "cuda/qimg21/libq21_flash_attention.so";
@@ -226,6 +226,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--flash-plugin") && i + 1 < argc) flash_plugin_path = argv[++i];
         else if (!strcmp(argv[i], "--layer-norm") && i + 1 < argc) layer_norm_mode = argv[++i];
         else if (!strcmp(argv[i], "--norm1-override") && i + 1 < argc) norm1_override = argv[++i];
+        else if (!strcmp(argv[i], "--norm2-override") && i + 1 < argc) norm2_override = argv[++i];
         else return 2;
     }
     if (!model || ((!!pixels + !!image + !!hidden) != 1) || !out ||
@@ -239,11 +240,12 @@ int main(int argc, char **argv) {
         fprintf(stderr, "usage: %s --model DIR (--pixel-values PATCHES.npy | --image IMAGE | --hidden BLOCK_INPUT.npy) "
                         "--grid-height H --grid-width W [--block-index N --max-blocks N] "
                         "[--layer-norm nvcc|nvcc-pytorch|nvrtc] [--norm1-override NORM.npy] "
+                        "[--norm2-override NORM.npy] "
                         "[--flash-plugin PLUGIN.so] "
                         "--out OUTPUT.npy\n", argv[0]);
         return 2;
     }
-    npy_f32 input = {0}, vision_rope_table = {0}, norm1_input = {0};
+    npy_f32 input = {0}, vision_rope_table = {0}, norm1_input = {0}, norm2_input = {0};
     if ((image ? load_vision_patches(image, &input, &h, &w) :
          npy_read_f32(pixels ? pixels : hidden, &input)) || input.ndim != 2 ||
         input.shape[0] != (size_t)h * w || input.shape[1] != (size_t)((pixels || image) ? 1536 : 1152) ||
@@ -252,7 +254,10 @@ int main(int argc, char **argv) {
         vision_rope_table.shape[2] != 2 || vision_rope_table.shape[0] < (size_t)(h > w ? h : w) ||
         (norm1_override && (npy_read_f32(norm1_override, &norm1_input) || norm1_input.ndim != 2 ||
                             norm1_input.shape[0] != (size_t)h * w ||
-                            norm1_input.shape[1] != 1152))) return 1;
+                            norm1_input.shape[1] != 1152)) ||
+        (norm2_override && (npy_read_f32(norm2_override, &norm2_input) || norm2_input.ndim != 2 ||
+                            norm2_input.shape[0] != (size_t)h * w ||
+                            norm2_input.shape[1] != 1152))) return 1;
     qimg21_shards shards = {{0}, 0};
     char path[2048];
     for (int i = 1; i <= 4; i++) {
@@ -455,6 +460,9 @@ blocks_ready:
         if (ln_status ||
             cuStreamSynchronize(r->stream)) { free_d(&nw); free_d(&nb); goto done; }
         free_d(&nw); free_d(&nb);
+        if (block == block_index && norm2_override &&
+            (cuMemcpyHtoD(norm, norm2_input.data, (size_t)count * sizeof(float)) ||
+             cuCtxSynchronize())) goto done;
         if (block == block_index && dump_vision(dump_dir, "norm2", norm, (size_t)count, n, 1152)) goto done;
         snprintf(name, sizeof(name), "model.visual.blocks.%d.mlp.linear_fc1", block);
         if (vision_linear(r, linear_epilogue, &shards, name, mlp, norm, n, 4304, 1152)) goto done;
@@ -498,10 +506,10 @@ done:
     if (module) cuModuleUnload(module);
     if (r) cuda_qimg_free(r);
     for (int i = 0; i < shards.n; i++) safetensors_close(shards.st[i]);
-    npy_free(&input); npy_free(&vision_rope_table); npy_free(&norm1_input);
+    npy_free(&input); npy_free(&vision_rope_table); npy_free(&norm1_input); npy_free(&norm2_input);
     return rc;
 fail:
     for (int i = 0; i < shards.n; i++) safetensors_close(shards.st[i]);
-    npy_free(&input); npy_free(&vision_rope_table); npy_free(&norm1_input);
+    npy_free(&input); npy_free(&vision_rope_table); npy_free(&norm1_input); npy_free(&norm2_input);
     return 1;
 }

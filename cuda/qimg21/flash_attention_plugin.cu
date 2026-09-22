@@ -50,6 +50,10 @@ struct q21_ln_stat {
     float mean, var, count;
 };
 
+struct alignas(16) q21_float4 {
+    float val[4];
+};
+
 __device__ q21_ln_stat q21_ln_add(q21_ln_stat a, float value) {
     float delta = value - a.mean;
     float count = a.count + 1.0f;
@@ -85,10 +89,11 @@ __global__ void q21_vision_layer_norm_kernel(float *out, const float *input,
     __shared__ float shared[12];
     q21_ln_stat stat{0.0f, 0.0f, 0.0f};
     int vectors = width / 4;
+    const q21_float4 *input_vec = reinterpret_cast<const q21_float4 *>(input + row * width);
     for (int vector = thread; vector < vectors; vector += blockDim.x * blockDim.y) {
-        int column = vector * 4;
+        q21_float4 data = input_vec[vector];
 #pragma unroll
-        for (int i = 0; i < 4; ++i) stat = q21_ln_add(stat, input[row * width + column + i]);
+        for (int i = 0; i < 4; ++i) stat = q21_ln_add(stat, data.val[i]);
     }
     for (int offset = 16; offset; offset >>= 1) {
         q21_ln_stat other{__shfl_down_sync(0xffffffff, stat.mean, offset),
@@ -101,11 +106,12 @@ __global__ void q21_vision_layer_norm_kernel(float *out, const float *input,
             int index = warp - offset;
             shared[2 * index] = stat.mean;
             shared[2 * index + 1] = stat.var;
-            shared[8 + index] = stat.count;
+            shared[blockDim.y + index] = stat.count;
         }
         __syncthreads();
         if (lane == 0 && warp < offset) {
-            q21_ln_stat other{shared[2 * warp], shared[2 * warp + 1], shared[8 + warp]};
+            q21_ln_stat other{shared[2 * warp], shared[2 * warp + 1],
+                              shared[blockDim.y + warp]};
             stat = q21_ln_combine(stat, other);
         }
         __syncthreads();
@@ -129,10 +135,11 @@ __global__ void q21_vision_layer_norm_stats_kernel(float *out, const float *inpu
     __shared__ float shared[12];
     q21_ln_stat stat{0.0f, 0.0f, 0.0f};
     int vectors = width / 4;
+    const q21_float4 *input_vec = reinterpret_cast<const q21_float4 *>(input + row * width);
     for (int vector = thread; vector < vectors; vector += blockDim.x * blockDim.y) {
-        int column = vector * 4;
+        q21_float4 data = input_vec[vector];
 #pragma unroll
-        for (int i = 0; i < 4; ++i) stat = q21_ln_add(stat, input[row * width + column + i]);
+        for (int i = 0; i < 4; ++i) stat = q21_ln_add(stat, data.val[i]);
     }
     for (int offset = 16; offset; offset >>= 1) {
         q21_ln_stat other{__shfl_down_sync(0xffffffff, stat.mean, offset),
@@ -145,11 +152,12 @@ __global__ void q21_vision_layer_norm_stats_kernel(float *out, const float *inpu
             int index = warp - offset;
             shared[2 * index] = stat.mean;
             shared[2 * index + 1] = stat.var;
-            shared[8 + index] = stat.count;
+            shared[blockDim.y + index] = stat.count;
         }
         __syncthreads();
         if (lane == 0 && warp < offset) {
-            q21_ln_stat other{shared[2 * warp], shared[2 * warp + 1], shared[8 + warp]};
+            q21_ln_stat other{shared[2 * warp], shared[2 * warp + 1],
+                              shared[blockDim.y + warp]};
             stat = q21_ln_combine(stat, other);
         }
         __syncthreads();
