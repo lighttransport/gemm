@@ -1,5 +1,6 @@
 PYTHON ?= ../../tmp/qimg21-ref-venv/bin/python
 CUDA_HOME ?= /usr/local/cuda-13.1
+PYTORCH_CUDA_HOME ?= ../../tmp/cuda130
 PYTORCH_SOURCE ?= ../../tmp/pytorch-src
 FLASH_ATTN_SOURCE ?= ../../tmp/flash-attention-src
 TORCH_INCLUDE ?= ../../tmp/qimg21-ref-venv/lib/python3.12/site-packages/torch/include
@@ -37,6 +38,12 @@ libq21_cudnn_patch.so: cudnn_patch_plugin.cu
 		-gencode arch=compute_120,code=sm_120 -I$(CUDNN_ROOT)/include \
 		-L$(CUDNN_ROOT)/lib -Xlinker -rpath -Xlinker $(abspath $(CUDNN_ROOT)/lib) \
 		-o $@ $< -l:libcudnn.so.9
+
+libq21_gelu.so: gelu_plugin.cu
+	@test -x $(PYTORCH_CUDA_HOME)/bin/nvcc || \
+		(echo "missing pinned PyTorch CUDA compiler: $(PYTORCH_CUDA_HOME)/bin/nvcc" >&2; exit 1)
+	$(PYTORCH_CUDA_HOME)/bin/nvcc -O3 -std=c++17 --shared --cudart shared -Xcompiler=-fPIC \
+		-gencode arch=compute_120,code=sm_120 -L$(PYTORCH_CUDA_HOME)/lib -o $@ $<
 
 qwen21_rope_freqs.npy: export_rope_frequencies.py
 	$(PYTHON) $< --out $@
@@ -77,7 +84,7 @@ test_cuda_qimg21_text: test_cuda_qimg21_text.c qwen_tokenizer_json.h text_kernel
 	$(CC) -O2 -std=c11 -D_GNU_SOURCE -Wall -Wextra -I../../common -I../../cuda -I../qimg \
 		-o $@ test_cuda_qimg21_text.c ../../cuda/cuew.c ../../cuda/cublasew.c -ldl -lm -lpthread
 
-test_cuda_qimg21_vision: test_cuda_qimg21_vision.c test_cuda_qimg21_native.c quant_weights.h libq21_cutlass_attention.so libq21_flash_attention.so libq21_cudnn_patch.so qwen21_vision_rope.npy ../../common/stb_image.h ../../cuda/cuew.c ../../cuda/cublasew.c
+test_cuda_qimg21_vision: test_cuda_qimg21_vision.c test_cuda_qimg21_native.c quant_weights.h libq21_cutlass_attention.so libq21_flash_attention.so libq21_cudnn_patch.so libq21_gelu.so qwen21_vision_rope.npy ../../common/stb_image.h ../../cuda/cuew.c ../../cuda/cublasew.c
 	$(CC) -O2 -std=c11 -D_GNU_SOURCE -Wall -Wextra -I../../common -I../../cuda -I../qimg \
 		-o $@ test_cuda_qimg21_vision.c ../../cuda/cuew.c ../../cuda/cublasew.c -ldl -lm -lpthread
 
@@ -139,4 +146,4 @@ regress:
 	$(PYTHON) regression.py --model /mnt/nvme01/models/qimg-21
 
 clean:
-	rm -f test_cuda_qimg21 test_cuda_qimg21_native test_cuda_qimg21_vae test_cuda_qimg21_vae_encode test_cuda_qimg21_text test_cuda_qimg21_vision test_weight_upload test_quant_weights test_joint_layout test_edit_kernels test_scheduler libq21_cutlass_attention.so libq21_flash_attention.so libq21_cudnn_patch.so qwen21_rope_freqs.npy qwen21_text_rope.npy qwen21_vision_rope.npy qwen_image21.png
+	rm -f test_cuda_qimg21 test_cuda_qimg21_native test_cuda_qimg21_vae test_cuda_qimg21_vae_encode test_cuda_qimg21_text test_cuda_qimg21_vision test_weight_upload test_quant_weights test_joint_layout test_edit_kernels test_scheduler libq21_cutlass_attention.so libq21_flash_attention.so libq21_cudnn_patch.so libq21_gelu.so qwen21_rope_freqs.npy qwen21_text_rope.npy qwen21_vision_rope.npy qwen_image21.png

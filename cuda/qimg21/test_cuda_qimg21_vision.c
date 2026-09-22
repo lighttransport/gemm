@@ -16,6 +16,7 @@ typedef int (*q21_flash_vision_layer_norm_bf16_fn)(float *, const void *, const 
                                                    const void *, int, int, CUstream);
 typedef int (*q21_flash_vision_layer_norm_bf16_stats_fn)(float *, const void *, int, int,
                                                          CUstream);
+typedef int (*q21_vision_gelu_exact_fn)(float *, int, CUstream);
 typedef int (*q21_cudnn_patch_projection_fn)(void *, const void *, const void *, int,
                                              CUstream);
 
@@ -145,6 +146,7 @@ static int dump_vision(const char *directory, const char *name, CUdeviceptr data
 static int run_merger(cuda_qimg_runner *r, CUfunction layer_norm,
                       q21_flash_vision_layer_norm_fn flash_layer_norm,
                       CUfunction linear_epilogue, CUfunction gelu_exact,
+                      q21_vision_gelu_exact_fn plugin_gelu_exact,
                       const qimg21_shards *shards, CUdeviceptr x, int tokens,
                       const char *base, int postshuffle, const char *output) {
     int rows = tokens / 4, norm_dim = postshuffle ? 4608 : 1152;
@@ -173,8 +175,11 @@ static int run_merger(cuda_qimg_runner *r, CUfunction layer_norm,
     if (vision_linear(r, linear_epilogue, shards, name, hidden, norm, rows, 4608, 4608)) goto done;
     int hidden_count = rows * 4608;
     void *ga[] = {&hidden, &hidden_count};
-    if (cuLaunchKernel(gelu_exact, (hidden_count + 255) / 256, 1, 1, 256, 1, 1, 0,
-                       r->stream, ga, NULL)) goto done;
+    int gelu_status = plugin_gelu_exact
+        ? plugin_gelu_exact((float *)(uintptr_t)hidden, hidden_count, r->stream)
+        : (int)cuLaunchKernel(gelu_exact, (hidden_count + 255) / 256, 1, 1,
+                             256, 1, 1, 0, r->stream, ga, NULL);
+    if (gelu_status) goto done;
     snprintf(name, sizeof(name), "%s.linear_fc2", base);
     if (vision_linear(r, linear_epilogue, shards, name, merged, hidden, rows, 4096, 4608)) goto done;
     host = malloc((size_t)rows * 4096 * 4);
@@ -308,7 +313,7 @@ int main(int argc, char **argv) {
     CUfunction residual = NULL, gelu_tanh = NULL, gelu_exact = NULL;
     CUdeviceptr x = 0, bf = 0, projected = 0, weight = 0, bias = 0, pos = 0, vision_rope_d = 0;
     CUdeviceptr norm = 0, norm_bf = 0, qkv = 0, qkv_bf = 0, att = 0, tmp = 0, mlp = 0;
-    void *cutlass_plugin = NULL, *cudnn_plugin = NULL;
+    void *cutlass_plugin = NULL, *cudnn_plugin = NULL, *gelu_plugin = NULL;
     q21_cudnn_patch_projection_fn cudnn_patch_projection = NULL;
     q21_cutlass_vision_attention_fn cutlass_attention = NULL;
     q21_flash_vision_attention_fn flash_attention = NULL;
@@ -316,6 +321,7 @@ int main(int argc, char **argv) {
     q21_flash_vision_layer_norm_stats_fn flash_layer_norm_stats = NULL;
     q21_flash_vision_layer_norm_bf16_fn flash_layer_norm_bf16 = NULL;
     q21_flash_vision_layer_norm_bf16_stats_fn flash_layer_norm_bf16_stats = NULL;
+    q21_vision_gelu_exact_fn plugin_gelu_exact = NULL;
     float *host_pos = NULL, *host_out = NULL;
     int rc = 1, n = h * w, count = n * 1152;
     int vision_compile = -1;
@@ -386,6 +392,16 @@ int main(int argc, char **argv) {
             fprintf(stderr, "vision: %s attention plugin unavailable\n", attention_mode);
             goto done;
         }
+    }
+    gelu_plugin = dlopen("cuda/qimg21/libq21_gelu.so", RTLD_NOW | RTLD_LOCAL);
+    if (gelu_plugin) {
+        q21_vision_gelu_exact_fn exact = (q21_vision_gelu_exact_fn)
+            dlsym(gelu_plugin, "q21_vision_gelu_exact");
+        if (exact) plugin_gelu_exact = exact;
+    }
+    if ((merged_out || deepstack_dir) && !plugin_gelu_exact) {
+        fprintf(stderr, "vision: pinned exact-GELU plugin unavailable\n");
+        goto done;
     }
     if (!strcmp(layer_norm_mode, "nvrtc")) flash_layer_norm = NULL;
     if (hidden) {
@@ -579,13 +595,14 @@ blocks_ready:
             snprintf(base, sizeof(base), "model.visual.deepstack_merger_list.%d", merger);
             snprintf(destination, sizeof(destination), "%s/deepstack_%d.npy", deepstack_dir, merger);
             if (run_merger(r, layer_norm, flash_layer_norm, linear_epilogue, gelu_exact,
+                           plugin_gelu_exact,
                            &shards, x, n,
                            base, 1, destination)) goto done;
         }
         fprintf(stderr, "vision: block %d/27\n", block + 1);
     }
     if (merged_out && run_merger(r, layer_norm, flash_layer_norm, linear_epilogue,
-                                 gelu_exact, &shards, x, n,
+                                 gelu_exact, plugin_gelu_exact, &shards, x, n,
                                  "model.visual.merger", 0, merged_out)) goto done;
     if (cuMemcpyDtoH(host_out, x, (size_t)count * 4) ||
         npy_write_f32(out, host_out, (size_t)count, n, 1152)) goto done;
@@ -596,6 +613,7 @@ done:
     free_d(&norm); free_d(&norm_bf); free_d(&qkv); free_d(&qkv_bf); free_d(&att); free_d(&tmp); free_d(&mlp);
     if (cutlass_plugin) dlclose(cutlass_plugin);
     if (cudnn_plugin) dlclose(cudnn_plugin);
+    if (gelu_plugin) dlclose(gelu_plugin);
     if (module) cuModuleUnload(module);
     if (r) cuda_qimg_free(r);
     for (int i = 0; i < shards.n; i++) safetensors_close(shards.st[i]);

@@ -1572,14 +1572,19 @@ native image loader now matches the official processor's integer RGBA-over-white
 composition and F32 normalization exactly; `--pixels-out` dumps this boundary,
 and all 6,291,456 values match the official 1024x1024 capture bit-for-bit.
 The cuDNN patch plan and long-shape cuBLASLt dispatch now make the patch and
-all 27 recurrent vision blocks bit-exact; the merger and deep-stack outputs
-remain above 0.99999999 cosine. The 1058-token text path uses the literal
+all 27 recurrent vision blocks bit-exact. The merger LayerNorm and first GEMM
+were already exact, but CUDA 13.1's exact-GELU code generation differed from
+the CUDA 13.0 PyTorch wheel at sparse negative inputs. `libq21_gelu.so` is
+therefore built with the wheel-matched compiler at `PYTORCH_CUDA_HOME`
+(default `tmp/cuda130`); all three deep-stack mergers and the final merger are
+now bit-exact through GELU and FC2. The 1058-token text path uses the literal
 contiguous ATen F32 mean-reduction topology for both wide RMSNorm boundaries:
 16 independent warps per CTA, four vector-lane accumulators, and one output
 row per warp. With the standard CUDA 13.1 FlashAttention plugin, the resulting
 full-resolution cropped prompt embedding is bit-identical to the pinned
-PyTorch capture (cosine 1.0, zero relative L2 and MAE). The 29-token positive
-and 23-token negative branches also remain bit-identical.
+PyTorch capture both with reference vision features and with the native vision
+encoder (cosine 1.0, zero relative L2 and MAE, 100% exact elements). The
+29-token positive and 23-token negative branches also remain bit-identical.
 
 ### Exact BF16 editing parity
 
