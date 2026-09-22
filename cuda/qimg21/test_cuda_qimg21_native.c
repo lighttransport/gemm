@@ -527,8 +527,9 @@ static int native_step(cuda_qimg_runner *r, qimg21_kernels *k, const qimg21_shar
        launch_vec(k->round_bf16,r->stream,2*D,temb)!=CUDA_SUCCESS) goto fail;
     dump_stage("time1",temb,2u*D,2,D);
     if(launch_vec(k->silu,r->stream,2*D,temb)!=CUDA_SUCCESS ||
-       launch_vec(k->round_bf16,r->stream,2*D,temb)!=CUDA_SUCCESS ||
-       launch_cast(r,bf,temb,2*D)!=CUDA_SUCCESS ||
+       launch_vec(k->round_bf16,r->stream,2*D,temb)!=CUDA_SUCCESS) goto fail;
+    dump_stage("time_silu",temb,2u*D,2,D);
+    if(launch_cast(r,bf,temb,2*D)!=CUDA_SUCCESS ||
        gemm(r,temb,w_t2,bf,2,D,D)!=0 ||
        launch_vec(k->round_bf16,r->stream,2*D,temb)!=CUDA_SUCCESS) goto fail;
     dump_stage("time2",temb,2u*D,2,D);

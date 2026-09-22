@@ -138,6 +138,8 @@ static const char *qimg21_stage_dir;
 static int qimg21_stage_block = 0;
 static int qimg21_stage_all_blocks;
 static int qimg21_stage_error;
+static const char *qimg21_replay_time2;
+static const char *qimg21_replay_mod;
 static const char *qimg21_replay_hidden;
 static const char *qimg21_replay_attention;
 
@@ -551,11 +553,23 @@ static int native_step(cuda_qimg_runner *r, qimg21_kernels *k, const qimg21_shar
        launch_vec(k->round_bf16,r->stream,2*D,temb)!=CUDA_SUCCESS) goto fail;
     dump_stage("time1",temb,2u*D,2,D);
     if(launch_vec(k->silu,r->stream,2*D,temb)!=CUDA_SUCCESS ||
-       launch_vec(k->round_bf16,r->stream,2*D,temb)!=CUDA_SUCCESS ||
-       launch_cast(r,bf,temb,2*D)!=CUDA_SUCCESS ||
+       launch_vec(k->round_bf16,r->stream,2*D,temb)!=CUDA_SUCCESS) goto fail;
+    dump_stage("time_silu",temb,2u*D,2,D);
+    if(launch_cast(r,bf,temb,2*D)!=CUDA_SUCCESS ||
        gemm(r,temb,w_t2,bf,2,D,D)!=0 ||
        launch_vec(k->round_bf16,r->stream,2*D,temb)!=CUDA_SUCCESS) goto fail;
     dump_stage("time2",temb,2u*D,2,D);
+    if(qimg21_replay_time2) {
+        npy_f32 replay={0};
+        if(npy_read_f32(qimg21_replay_time2,&replay))goto fail;
+        int valid=replay.ndim==2 && replay.shape[0]==2 && replay.shape[1]==(size_t)D;
+        for(size_t i=0;valid && i<replay.n;i++)
+            if(!isfinite(replay.data[i]) || replay.data[i]!=qimg21_round_bf16_host(replay.data[i]))valid=0;
+        int error=!valid || cuMemcpyHtoD(temb,replay.data,2u*D*sizeof(float)) || cuCtxSynchronize();
+        npy_free(&replay);
+        if(error){fprintf(stderr,"native: invalid or failed timestep-state replay\n");goto fail;}
+        fprintf(stderr,"native: DIAGNOSTIC ONLY: replaying external timestep state\n");
+    }
     cuMemcpyDtoD(tmp2,temb,(size_t)2*D*4); cuCtxSynchronize();
     if(launch_vec(k->silu,r->stream,2*D,tmp2)!=CUDA_SUCCESS ||
        launch_vec(k->round_bf16,r->stream,2*D,tmp2)!=CUDA_SUCCESS ||
@@ -563,6 +577,23 @@ static int native_step(cuda_qimg_runner *r, qimg21_kernels *k, const qimg21_shar
        gemm(r,mod,w_mod,bf,2,16384,D)!=0 ||
        launch_vec(k->round_bf16,r->stream,2*16384,mod)!=CUDA_SUCCESS) goto fail;
     probe(r,"mod",mod,2*16384); dump_stage("mod",mod,2u*16384u,2,16384);
+    if(qimg21_replay_mod) {
+        npy_f32 replay={0};
+        if(npy_read_f32(qimg21_replay_mod,&replay))goto fail;
+        int valid=replay.ndim==2 && replay.shape[0]==2 && replay.shape[1]==16384;
+        for(size_t i=0;valid && i<replay.n;i++)
+            if(!isfinite(replay.data[i]) || replay.data[i]!=qimg21_round_bf16_host(replay.data[i]))valid=0;
+        const char *row_env=getenv("QIMG21_REPLAY_MOD_ROW");
+        if(row_env && strcmp(row_env,"0") && strcmp(row_env,"1"))valid=0;
+        int row=row_env ? atoi(row_env) : -1;
+        CUdeviceptr dst=mod+(size_t)(row<0?0:row)*16384u*sizeof(float);
+        const float *src=replay.data+(size_t)(row<0?0:row)*16384u;
+        size_t bytes=(size_t)(row<0?2:1)*16384u*sizeof(float);
+        int error=!valid || cuMemcpyHtoD(dst,src,bytes) || cuCtxSynchronize();
+        npy_free(&replay);
+        if(error){fprintf(stderr,"native: invalid or failed modulation-state replay\n");goto fail;}
+        fprintf(stderr,"native: DIAGNOSTIC ONLY: replaying external modulation state\n");
+    }
     probe(r,"mod_zero",mod+(size_t)16384*4,16384);
     int profile = getenv("QIMG21_PROFILE") != NULL;
     double profile_upload = 0.0, profile_compute = 0.0, profile_release = 0.0;
@@ -809,6 +840,8 @@ int main(int argc, char **argv) {
     }
     qimg21_stage_dir = getenv("QIMG21_STAGE_DIR");
     qimg21_stage_all_blocks = getenv("QIMG21_STAGE_ALL_BLOCKS") != NULL;
+    qimg21_replay_time2 = getenv("QIMG21_REPLAY_TIME2");
+    qimg21_replay_mod = getenv("QIMG21_REPLAY_MOD");
     qimg21_replay_hidden = getenv("QIMG21_REPLAY_HIDDEN");
     qimg21_replay_attention = getenv("QIMG21_REPLAY_ATTENTION");
     if(qimg21_replay_attention && !qimg21_replay_hidden) {

@@ -113,6 +113,16 @@ ROCEW_ROCM_LIB=/opt/rocm/core/lib python3 cuda/qimg21/editing_regression.py \
 For the saved two-step 1024-condition/256-target capture, prediction cosines
 were 0.999891917 and 0.999873082; the trajectory minimum was 0.999863032.
 All are below the 0.99996 gate, so editing parity is not yet established.
+The matched first-step trace has byte-identical BF16 timestep SiLU inputs on
+CUDA and ROCm; the second projection differs in 78 of 8192 BF16 values.
+Those differences propagate into 24 image-row and 233 text-row modulation
+values. For diagnosis only, `QIMG21_REPLAY_TIME2=PATH` and
+`QIMG21_REPLAY_MOD=PATH` accept saved F32 `.npy` stage tensors containing
+BF16 values; `QIMG21_REPLAY_MOD_ROW=0|1` limits modulation replay to one row.
+On the first editing prediction, replaying the CUDA timestep state raised
+cosine from 0.999891917 to 0.999924535; replaying CUDA modulation raised it
+to 0.999950087, still below the gate. Scalar HIP and hipBLAS two-row GEMM
+diagnostics also missed the gate, so they are not production paths.
 
 The 1024-condition native vision path converts BF16 checkpoint biases to F32
 for its F32 linear epilogue and rounds the patch GEMM output to BF16 before
