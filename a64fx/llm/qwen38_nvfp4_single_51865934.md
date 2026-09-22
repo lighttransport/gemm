@@ -158,6 +158,14 @@ code-prompt logs are `/local/u14346/q27b-exact-code256.log` and
 below and append `--nvfp4-packed`; this option requires 48 NUMA workers,
 anonymous weights, a dense NVFP4 model, and `--spec-k 0`.
 
+Vectorizing the four-value activation conversion while retaining the same
+scalar group maxima and scales reduced the profiled `hi` run from 118.3 to
+110.7 ms/token (8.45 to 9.03 tok/s). The non-profiled compass and code runs
+reached 8.980 and 8.891 tok/s. Against the earlier scalar four-value packed
+logs, all 512 token IDs and selected logits matched **bitwise**. The code
+prompt remained 256/256 against exact decode with 0.146685 maximum selected-
+logit error. The vectorized conversion is the retained packed implementation.
+
 ## Reproduce
 
 ```sh

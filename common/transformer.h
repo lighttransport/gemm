@@ -1505,9 +1505,11 @@ typedef struct {
 
 static inline void tf_nvfp4_packed_quantize(tf_nvfp4_packed_act *out,
                                              const float *x, int n) {
+    const svbool_t pg = svptrue_b32();
     for (int b = 0; b < n / 16; b++) {
         int8_t q[16];
         float scale[4];
+        float inv_scale[16];
         for (int g = 0; g < 4; g++) {
             float maxabs = 0.0f;
             for (int j = 0; j < 4; j++) {
@@ -1517,8 +1519,14 @@ static inline void tf_nvfp4_packed_quantize(tf_nvfp4_packed_act *out,
             scale[g] = maxabs / 127.0f;
             float inv = scale[g] > 0 ? 1.0f / scale[g] : 0.0f;
             for (int j = 0; j < 4; j++)
-                q[g * 4 + j] = (int8_t)lrintf(x[b * 16 + g * 4 + j] * inv);
+                inv_scale[g * 4 + j] = inv;
         }
+        svfloat32_t xv = svld1(pg, x + b * 16);
+        svfloat32_t iv = svld1(pg, inv_scale);
+        svfloat32_t rounded = svrintn_f32_x(pg, svmul_f32_x(pg, xv, iv));
+        int32_t qi[16];
+        svst1_s32(pg, qi, svcvt_s32_f32_x(pg, rounded));
+        for (int j = 0; j < 16; j++) q[j] = (int8_t)qi[j];
         int8_t lo[8], hi[8];
         for (int j = 0; j < 8; j++) {
             lo[j] = q[j];
