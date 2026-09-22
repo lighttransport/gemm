@@ -166,6 +166,56 @@ extern "C" __global__ __launch_bounds__(512, 1) void qwen35_matvec_iq2xs(
     if (lane == 0) out[row] = sum;
 }
 
+/* Diagnostic ordinary-decode path: add the IQ2_XS down projection directly
+ * to the residual.  The dot, per-block scale, codebook, and warp reduction
+ * order match qwen35_matvec_iq2xs; only the final store is combined with the
+ * already-resident residual vector. */
+extern "C" __global__ __launch_bounds__(512, 1)
+void qwen35_matvec_iq2xs_down_residual(
+        float *__restrict__ residual, const unsigned char *__restrict__ weights,
+        const signed char *__restrict__ q, const float *__restrict__ scales,
+        int rows, int cols) {
+    __shared__ unsigned long long grid_cache[512];
+    for (int i = threadIdx.x; i < 512; i += blockDim.x)
+        grid_cache[i] = qwen35_iq2xs_grid[i];
+    __syncthreads();
+    int lane = threadIdx.x & 31;
+    int row = (blockIdx.x * (blockDim.x / 32)) + threadIdx.x / 32;
+    if (row >= rows) return;
+    int blocks = cols / 256;
+    const unsigned char *w = weights + (size_t)row * blocks * 74;
+    float sum = 0.0f;
+    for (int qb = lane; qb < blocks * 8; qb += 32) {
+        int b = qb / 8, ib = qb & 7;
+        const unsigned char *p = w + b * 74;
+        const int *u = (const int *)(q + qb * 32);
+        int z0 = 0, z1 = 0;
+        unsigned int sc = p[66 + ib];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            unsigned int code = ((const unsigned short *)(p + 2))[ib * 4 + j];
+            unsigned long long grid = grid_cache[code & 511];
+            unsigned int signs = qwen35_parity_signs(code >> 9);
+            int lo = qwen35_signed_grid((unsigned int)grid, signs, 0);
+            int hi = qwen35_signed_grid((unsigned int)(grid >> 32), signs, 4);
+            if (j < 2) {
+                z0 = qwen35_dot4(lo, u[2*j], z0);
+                z0 = qwen35_dot4(hi, u[2*j+1], z0);
+            } else {
+                z1 = qwen35_dot4(lo, u[2*j], z1);
+                z1 = qwen35_dot4(hi, u[2*j+1], z1);
+            }
+        }
+        int z = (z0 * (int)(sc & 15) + z1 * (int)(sc >> 4) +
+                 (z0 + z1) / 2) / 4;
+        float d = (float)*(const _Float16 *)p * scales[qb];
+        sum += d * z;
+    }
+    for (int offset = 16; offset; offset >>= 1)
+        sum += __shfl_xor(sum, offset, 32);
+    if (lane == 0) residual[row] = residual[row] + sum;
+}
+
 extern "C" __global__ void qwen35_matvec_iq2s(
         float *__restrict__ out, const unsigned char *__restrict__ weights,
         const signed char *__restrict__ q, const float *__restrict__ scales,

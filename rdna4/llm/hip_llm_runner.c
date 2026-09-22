@@ -14003,6 +14003,7 @@ struct hip_llm_runner {
     hipFunction_t fn_qwen35_matvec_iq2xxs, fn_qwen35_matvec_iq2xs;
     hipFunction_t fn_qwen35_matvec_iq2s, fn_qwen35_matvec_iq3xxs, fn_qwen35_matvec_iq3s;
     hipFunction_t fn_qwen35_matvec_iq3xxs_qkv;
+    hipFunction_t fn_qwen35_matvec_iq2xs_down_residual;
     hipFunction_t fn_qwen35_matvec_iq4xs, fn_qwen35_matvec_iq4xs_multi8;
     hipFunction_t fn_qwen35_matvec_iq4xs_5120_multi8;
     hipFunction_t fn_qwen35_matvec_iq_multi4;
@@ -17882,6 +17883,8 @@ int hip_llm_load_weights_sharded(hip_llm_runner *r, gguf_shards *model,
                           r->iq_module, "qwen35_matvec_iq2xxs"));
                 CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq2xs,
                           r->iq_module, "qwen35_matvec_iq2xs"));
+                CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq2xs_down_residual,
+                          r->iq_module, "qwen35_matvec_iq2xs_down_residual"));
                 CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq3xxs,
                           r->iq_module, "qwen35_matvec_iq3xxs"));
                 CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq3xxs_qkv,
@@ -20604,6 +20607,20 @@ static inline void launch_matvec_iq2_xs(hip_llm_runner *r, void *dst,
                (n_rows + rows_per_block - 1) / rows_per_block, 1, 1,
                (unsigned)r->mw_threads, 1, 1, 0, r->stream, args);
     }
+}
+static inline int launch_matvec_iq2xs_down_residual(hip_llm_runner *r,
+        void *residual, void *mat, int n_rows, int n_cols) {
+    const char *env = getenv("LLM_QWEN35_FUSED_DOWN_RESIDUAL");
+    if (!env || atoi(env) == 0 || !r->fn_qwen35_matvec_iq2xs_down_residual ||
+        !r->native_q81_valid || r->native_q81_source != r->d_gate ||
+        r->native_q81_n != n_cols || n_rows < 1 || n_cols <= 0 ||
+        n_cols > 17408 || (n_cols % 256) != 0)
+        return 0;
+    void *a[] = { &residual, &mat, &r->d_native_q81,
+                  &r->d_native_scale, &n_rows, &n_cols };
+    LAUNCH(r->fn_qwen35_matvec_iq2xs_down_residual,
+           (n_rows + 15) / 16, 1, 1, 512, 1, 1, 0, r->stream, a);
+    return 1;
 }
 static inline void launch_matvec_iq2_xs_ptrs(hip_llm_runner *r, void *dst,
         void *mats, void *x, int n_rows, int n_cols, int slots) {
@@ -29214,6 +29231,13 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
                     LAUNCH(r->fn_matvec_down_residual_iq3xxs_splitk, (nr + 7) / 8, (unsigned)r->down_ksplit, 1, 256, 1, 1, 0, r->stream, a);
                 else
                     LAUNCH(r->fn_matvec_down_residual_iq3xxs, nr, 1, 1, 256, 1, 1, 0, r->stream, a);
+            } else if (cl->ffn_down_type == GGML_TYPE_IQ2_XS &&
+                       launch_matvec_iq2xs_down_residual(r, r->d_x,
+                           cl->ffn_down_w, cl->ffn_down_rows,
+                           cl->ffn_down_cols)) {
+                /* The opt-in kernel adds the exact native IQ2_XS sum to the
+                 * live residual and therefore replaces d_xb plus launch_add. */
+                end_q8x2_reuse(r);
             } else {
                 launch_matvec_ffn_auto(r, r->d_xb, cl->ffn_down_w, r->d_gate,
                                       cl->ffn_down_rows, cl->ffn_down_cols,

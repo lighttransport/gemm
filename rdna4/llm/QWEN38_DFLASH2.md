@@ -641,6 +641,11 @@ reflects the remaining measured costs.
    39.68 tok/s at 256 threads and 39.64 tok/s at 512. The alternate geometry
    was removed; its extra rows per block did not reduce the long-context
    projection cost.
+   An opt-in `LLM_QWEN35_FUSED_DOWN_RESIDUAL=1` IQ2_XS down kernel now adds
+   the native Q8_1 projection directly to the live residual, removing the
+   temporary output and separate add launch. It preserves the native IQ2_XS
+   reduction order and remains disabled until resident random-64K hashes and
+   throughput show a quality-safe gain.
 2. **Verifier attention tail.** The query-grid verifier now selects ordinary
    decode's split count independently for every causal row. Equal-split
    windows now select a dedicated captured shared-K/V graph; split boundaries

@@ -145,6 +145,17 @@ five-row specialization; other proposal widths use the eight-row-capable
 kernel. The default sidecar path remains three launches until a resident
 gfx1201 run confirms identical K=4/K=7 hashes and a sustained draft-time win.
 
+## 2026-09-22 continuation: opt-in IQ2_XS down/residual fusion
+
+The ordinary FFN down path now has an opt-in
+`LLM_QWEN35_FUSED_DOWN_RESIDUAL=1` IQ2_XS kernel for the native Q8_1 route.
+It keeps the existing IQ2_XS codebook, per-block scale, dot, and warp
+reduction order, then adds the result directly to the live residual instead of
+writing `d_xb` followed by a separate add launch. The helper requires the
+prepared native Q8_1 activation and otherwise falls back automatically. The
+default path is unchanged until a resident random-64K hash/performance A/B
+proves the launch and temporary traffic savings.
+
 ## 2026-09-22 continuation: IQ2_XXS block-shape probe
 
 I tested 128- and 512-thread blocks for the native one-row IQ2_XXS kernel
