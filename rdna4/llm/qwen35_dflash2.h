@@ -357,6 +357,10 @@ static void hllm_dflash_project(hip_llm_runner *r, void *dst, void *weight,
         void *ma[]={&dst,&weight,&r->d_act_q8_batch,
                     &r->d_act_scale_batch,&nr,&nc,&rows};
         hipFunction_t q4_fn = r->fn_qwen35_matvec_q4k_q81_multi8;
+        const char *fixed8_env = getenv("LLM_QWEN35_DFLASH_Q4K_FIXED8");
+        if (rows == 8 && (!fixed8_env || atoi(fixed8_env) != 0) &&
+            r->fn_qwen35_matvec_q4k_q81_fixed8)
+            q4_fn = r->fn_qwen35_matvec_q4k_q81_fixed8;
         const char *multi4_env = getenv("LLM_QWEN35_DFLASH_Q4K_MULTI4");
         if (rows == 4 && multi4_env && atoi(multi4_env) != 0 &&
             r->fn_qwen35_matvec_q4k_q81_multi4)

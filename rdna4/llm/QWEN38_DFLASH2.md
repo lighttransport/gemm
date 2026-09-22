@@ -1,5 +1,78 @@
 # Qwen3.8 DFlash2 on RDNA4
 
+## Items 2–5: goal and validated progress (2026-09-22)
+
+Goal prompt: improve long-context verifier attention; optimize DeltaNet and
+checkpoint publication without changing rollback/accepted state; reduce
+DFlash2 draft cost; and validate safe per-stream cache-injection overlap.
+Require controlled GPU measurements, exact output, seeded K=4/K=7 quality,
+long-context checks, and HTTP/stdio lifecycle coverage before changing defaults.
+Ordinary 40+ tok/s target-only decode is outside this batch. The goal API
+cannot replace its older paused unfinished goal; this is the active scope.
+
+**Promoted defaults:** eight-row Q4_K draft projection and d_state=128
+DeltaNet verifier specialization. Diagnostic opt-outs are
+`LLM_QWEN35_DFLASH_Q4K_FIXED8=0` and
+`LLM_QWEN35_DELTANET_VERIFY_FIXED128=0`. Unsupported shapes retain their
+existing paths. This supersedes older pending/opt-in notes for these two paths.
+Attention fusion and injection overlap remain opt-in.
+
+Warm 4K coding measurements (Q8/Q8, chunk 512, seed 42; 46 tokens to EOS):
+
+| Window / sampling | Control | Fixed-eight draft | Fixed-128 DeltaNet |
+| --- | ---: | ---: | ---: |
+| K=4 greedy | 56.94 | 56.94 | 57.74 |
+| K=4 temperature 0.8 | 55.26 | 55.40 | 56.06 |
+| K=7 greedy | 83.58 | 85.59 | 84.45 |
+| K=7 temperature 0.8 | 80.12 | 82.27 | 81.28 |
+
+Rates are tok/s. K=7 fixed-eight draft time fell from 84.75 to 70.01 ms
+(greedy) and 80.57 to 66.45 ms (sampled). All 24 generations in this matrix
+retained hash `15f17d2640c1adfc` and identical text. This simple prompt
+produces the same text at both temperatures; broader sampled/coding behavior
+is covered by the separate HTTP suite below.
+
+At 16,096 coding tokens, combined fixed-eight/DeltaNet improved warm decode
+75.15 -> 77.44 tok/s with byte-identical output. Prefill ranged 573–612 tok/s
+across the matched runs; these specializations do not change prefill dispatch.
+The rebuilt default path (no candidate overrides) retained exact output in
+three sampled repeats, with warm decode 83.41/83.38 tok/s and prefill
+609.13/608.35 tok/s. Log: `rdna4/llm/tmp/dflash-goal-default.log`.
+The 64K direct attention test bypasses the normal DFlash >=32K target-only
+fallback. All 27 production-kernel comparisons were bit-identical, but fused
+split/combine was slower: for eight query rows at 64K, serialized/grouped/fused
+measured 3.383/3.734/13.875 ms. These are isolated kernel timings, not full-model
+throughput. Do not promote the current fusion design.
+
+Validation:
+- `python3 rdna4/llm/test_dflash_fixed8.py`: 15 GPU shapes, all values exact,
+  including partial output blocks and untouched guards.
+- `python3 rdna4/llm/test_deltanet_verifier.py`: 20 GPU cases; every output and
+  rollback checkpoint exact, canonical state unchanged.
+- `python3 rdna4/llm/test_verifier_attention.py`: 27 GPU cases at 4K/16K/64K
+  in the experimental working tree (the fused candidate remains uncommitted).
+- `python3 rdna4/llm/test_verifier_commit_copy.py`: 256 CPU coverage cases.
+- `python3 rdna4/llm/test_dflash_overlap_lifecycle.py`: 23 setup/failure/reset
+  cases, including HIP's default stream. Reset must fence it too.
+- `test_qwen35_dflash2_http.py` with fixed-eight, fixed-128, overlap, and fused
+  injection enabled: stdio, cached 3072-token prefix, cancellation, concurrent
+  clients, sampled repeatability, and multi-turn C++ compile/run all PASS.
+- Runner rebuild and `bash rdna4/llm/test_qwen38_profiles.sh`: PASS.
+
+Reproduction scripts/logs live under `rdna4/llm/tmp/`: `dflash-goal-quality.sh`,
+`dflash-goal-long.sh`, `dflash-goal-http.log`, `verifier-attention-goal.log`,
+`dflash-fixed8-gpu.log`, and `deltanet-verifier-gpu.log`. The A/B scripts now set
+both opt-outs to zero for controls so future runs remain valid after promotion.
+GPU tests require host KFD access. No external network/model downloads needed.
+
+Correctness commits: `8d452760` fixes checkpoint copy tails/unaligned rows;
+`7c147490` hardens injection failure cleanup, retry suppression, and reset
+fencing. Injection overlap retained output and passed lifecycle checks, but
+showed no measurable throughput benefit and remains opt-in. Remaining work:
+replace the slow attention fusion design; evaluate additional draft projection
+candidates; measure sustained overlap benefit before promotion; broaden
+long-context quality beyond this bounded coding workload.
+
 ## IQ4_XS sidecar projection staging reuse (2026-09-22)
 
 The multi-row IQ4_XS sidecar dispatcher now reuses its exact Q8_1 activation
