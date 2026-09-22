@@ -849,11 +849,20 @@ int hip_llm_qwen35_mtp_commit(hip_llm_runner *r, int processed) {
      * by one state vector.  The destination is the live single-row state. */
     size_t conv_stride = conv_elements;
     size_t rec_stride = rec_elements;
-    size_t state_vectors = rec_elements > conv_elements ?
-                           rec_elements/4 : conv_elements/4;
+    size_t state_elements = rec_elements > conv_elements ?
+                            rec_elements : conv_elements;
+    /* The copy kernels vectorize complete groups and publish a scalar tail;
+     * ceil here keeps a block available even for a state shorter than four
+     * floats. */
+    size_t state_vectors = (state_elements + 3) / 4;
+    if (!state_vectors) state_vectors = 1;
     const char *fused_env = getenv("LLM_QWEN35_COMMIT_FUSED_COPY");
+    /* The fused kernel publishes x/logits from its layer-zero branch.  A
+     * model with no recurrent layers must retain the scalar I/O copies so a
+     * diagnostic switch cannot silently leave the accepted row stale. */
     int fused_copy = fused_env && atoi(fused_env) != 0 &&
-                     r->fn_copy_state_rows_commit_f32;
+                     r->fn_copy_state_rows_commit_f32 &&
+                     m->verify_ssm_layers > 0;
     if (fused_copy) {
         size_t x_elements = (size_t)r->n_embd;
         size_t logits_elements = (size_t)r->n_vocab;
