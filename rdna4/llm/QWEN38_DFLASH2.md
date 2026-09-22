@@ -1569,6 +1569,10 @@ retain the scalar I/O fallback.
    tok/s and SSM warp geometry (`LLM_SSM_BATCH_WARP=1`) measured 35.42 tok/s
    at the repeated-gate minimum; both retained the exact suffix but failed to
    improve the control and remain diagnostic.
+   The native IQ3_XXS projection batch (`LLM_QWEN35_NATIVE_IQ3XXS_BATCH=1`)
+   also retained `7463f176c9b85ba3` but measured 35.54 tok/s decode and
+   443.68 tok/s prefill, so it remains diagnostic pending a better projection
+   schedule.
 
 Each optimization should retain the exact sequence hash and response bytes at
 K=4 and K=7, compile the emitted program, and cover non-coding prompts plus
