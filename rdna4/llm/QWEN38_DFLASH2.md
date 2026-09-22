@@ -1535,9 +1535,11 @@ retain the scalar I/O fallback.
    `15f17d2640c1adfc` sequence hash; the selector result is noise-level and
    overlap is slower, so neither changes the serving default. K=7 measured
    83.65--88.14 tok/s with 68.9--70.0 ms draft time, confirming the remaining
-   K=4 gap is draft-side work. The existing `fast` target profile also
-   segfaulted during graph setup with the GSQ IQ2 model and remains an
-   unsupported diagnostic combination pending isolation.
+   K=4 gap is draft-side work. The existing `fast` target profile previously
+   segfaulted during graph setup with the GSQ IQ2 model.  The fused Q/K norm +
+   M-RoPE launch is now opt-in only, so both scalar and fast-profile setup
+   smoke tests complete with the same `8a44087a5472a2e2` hash; the fast
+   profile is safe as a fallback while the fused launch remains diagnostic.
    The resident K=4 HTTP/stdio run also passed context-cache restore,
    cancellation/concurrency, greedy and sampled repeatability, and both
    multi-turn and algorithmic C++ compile/run quality checks; its 121-token
@@ -1556,7 +1558,10 @@ retain the scalar I/O fallback.
    The launcher now forwards the mixed-IQ QKV and gate/up A/B controls.  A
    randomized 64K run with both candidates preserved suffix hash
    `7463f176c9b85ba3` but reached 35.00 tok/s versus 35.59 tok/s for the
-   default path, so neither is promoted.
+   default path, so neither is promoted.  The verifier fused split/combine
+   candidate was also checked through the same gate: it retained the exact
+   `7463f176c9b85ba3` suffix but measured 35.56 tok/s (prefill 444.44
+   tok/s), slightly below the 35.59 tok/s default, and remains opt-in.
 
 Each optimization should retain the exact sequence hash and response bytes at
 K=4 and K=7, compile the emitted program, and cover non-coding prompts plus
