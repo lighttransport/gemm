@@ -1379,8 +1379,13 @@ non-finite pixels and out-of-range pixels before CUDA initialization; the
 CPU suite is now 35/35 passing. Deterministic BF16 editing and true-CFG
 denoiser/scheduler parity is verified in the exact-backend section below;
 the process-isolated 1024-square pipeline memory measurement follows.
-The initial downsampler computes a full convolution then samples odd spatial
-positions; it is correct but not yet optimized as a stride-2 convolution.
+The encoder downsamplers use a native stride-2 CUDA convolution. It evaluates
+only the retained odd-position outputs and no longer allocates a full-resolution
+convolution result before sampling. The optimized path is bit-identical to the
+previous native output at both 256x256 and 1024x1024. At 1024x1024 on the RTX
+5060 Ti, the complete encoder subprocess takes 7.74 seconds (700,320 KiB host
+maximum RSS); posterior cosine against the pinned PyTorch reference is
+0.999999999999038 with MAE 9.41e-6 and maximum error 4.80e-4.
 
 The updated encoder regression independently gates normalized token cosine
 against PyTorch normalization and the official pipeline packing function.

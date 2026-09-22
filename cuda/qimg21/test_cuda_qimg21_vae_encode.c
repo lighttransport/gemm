@@ -131,19 +131,23 @@ static const char *q21_encoder_src =
 " int c=i/(oh*ow),py=(i/ow)%oh,px=i%ow,factor=ft*fs*fs,group=ci*factor/co;float sum=0;\n"
 " for(int g=0;g<group;g++){int e=c*group+g,ic=e/factor,tf=(e/(fs*fs))%ft;\n"
 " if(tf==ft-1)sum+=x[(ic*h+py*fs+(e/fs)%fs)*w+px*fs+e%fs];}y[i]=sum/group;}\n"
-"__global__ void sample_odd(float*y,const float*x,int c,int h,int w){\n"
-" int i=blockIdx.x*blockDim.x+threadIdx.x,oh=h/2,ow=w/2;if(i>=c*oh*ow)return;\n"
-" int ch=i/(oh*ow),py=(i/ow)%oh,px=i%ow;y[i]=x[(ch*h+2*py+1)*w+2*px+1];}\n"
+"__global__ void conv_stride2(float*out,const float*inp,const float*weight,const float*bias,int c,int h,int w){\n"
+" int idx=blockIdx.x*blockDim.x+threadIdx.x,oh=h/2,ow=w/2,total=c*oh*ow;if(idx>=total)return;\n"
+" int oc=idx/(oh*ow),rem=idx%(oh*ow),oy=(rem/ow)*2+1,ox=(rem%ow)*2+1;float sum=bias[oc];\n"
+" for(int ic=0;ic<c;ic++)for(int fy=0;fy<3;fy++)for(int fx=0;fx<3;fx++){int iy=oy+fy-1,ix=ox+fx-1;\n"
+"  if(iy>=0&&iy<h&&ix>=0&&ix<w)sum+=inp[(ic*h+iy)*w+ix]*weight[((oc*c+ic)*3+fy)*3+fx];}\n"
+" out[idx]=sum;}\n"
 "}\n";
 
 static int q21_encode(cuda_qimg_runner *r, const st_context *st,
                       const float *input, int h, int w, float *output) {
     CUmodule module=NULL;
-    CUfunction avg, sample;
+    CUfunction avg, stride2;
     CUdeviceptr x=0,y=0,shortcut=0,gamma=0;
     int rc=1,c=96;
     if(cu_compile_kernels(&module,r->device,q21_encoder_src,"qimg21_encoder.cu",1,"qimg21_encoder")<0 ||
-       cuModuleGetFunction(&avg,module,"avg_first") || cuModuleGetFunction(&sample,module,"sample_odd"))goto done;
+       cuModuleGetFunction(&avg,module,"avg_first") ||
+       cuModuleGetFunction(&stride2,module,"conv_stride2"))goto done;
     x=checked_cuMemAlloc((size_t)4*h*w*4);
     if(!x || cuMemcpyHtoD(x,input,(size_t)4*h*w*4) || cuCtxSynchronize())goto done;
     y=q21_conv(r,st,x,4,h,w,c,"encoder.conv_in.weight","encoder.conv_in.bias");
@@ -165,14 +169,13 @@ static int q21_encode(cuda_qimg_runner *r, const st_context *st,
         if(fs==2) {
             snprintf(name,sizeof(name),"encoder.down_blocks.%d.downsampler.resample.1.weight",stage);
             snprintf(bias,sizeof(bias),"encoder.down_blocks.%d.downsampler.resample.1.bias",stage);
-            /* Stride-2 with right/bottom padding equals odd-position samples
-             * of the same convolution with symmetric one-pixel padding. */
-            y=q21_conv(r,st,x,c,h,w,c,name,bias);
-            q21_free(&x);if(!y)goto done;
-            x=checked_cuMemAlloc((size_t)n*4);if(!x)goto done;
-            void *a[]={&x,&y,&c,&h,&w};
-            if(cuLaunchKernel(sample,(n+255)/256,1,1,256,1,1,0,r->stream,a,NULL)||cuCtxSynchronize())goto done;
-            q21_free(&y);h=oh;w=ow;
+            CUdeviceptr dw=q21_load_weight(st,name),db=q21_load_weight(st,bias);
+            y=checked_cuMemAlloc((size_t)n*4);
+            if(!dw||!db||!y){q21_free(&dw);q21_free(&db);goto done;}
+            void *a[]={&y,&x,&dw,&db,&c,&h,&w};
+            if(cuLaunchKernel(stride2,(n+255)/256,1,1,256,1,1,0,r->stream,a,NULL)||
+               cuStreamSynchronize(r->stream)){q21_free(&dw);q21_free(&db);goto done;}
+            q21_free(&dw);q21_free(&db);q21_free(&x);x=y;y=0;h=oh;w=ow;
         }
         float one=1;
         void *a[]={&x,&shortcut,&one,&n};
