@@ -29,7 +29,7 @@ typedef struct hllm_dflash_layer {
     /* Prompt injection is a large-M operation.  Keep only its K/V weights in
      * BF16; draft decode continues to use the authoritative quantized
      * matrices above. */
-    void *inject_k_bf16, *inject_v_bf16;
+    void *inject_k_bf16, *inject_v_bf16, *inject_kv_bf16;
 } hllm_dflash_layer;
 
 typedef struct hllm_qwen35_dflash2 {
@@ -51,7 +51,7 @@ typedef struct hllm_qwen35_dflash2 {
 
     /* All activation storage is row-major F32. */
     void *features, *features_bf16, *x, *x_bf16, *norm, *dynamic, *conv;
-    void *q, *k, *v, *attn, *attn_partial, *proj, *gate, *up;
+    void *q, *k, *v, *kv, *attn, *attn_partial, *proj, *gate, *up;
     void *logits, *selector_gate;
     void *selector_candidates, *selector_drafts;
     void *q81_source;
@@ -67,7 +67,7 @@ typedef struct hllm_qwen35_dflash2 {
      * feature rows remain read-only until inject_done; x/norm/K/V are private
      * so the sidecar stream never races target proposal scratch. */
     void *inject_x, *inject_x_bf16, *inject_norm;
-    void *inject_k, *inject_v;
+    void *inject_k, *inject_v, *inject_kv;
     int inject_capacity;
 } hllm_qwen35_dflash2;
 
@@ -84,6 +84,7 @@ static void hllm_dflash_overlap_workspace_free(hllm_qwen35_dflash2 *d) {
     DFLASH_WS_FREE(d->inject_x); DFLASH_WS_FREE(d->inject_x_bf16);
     DFLASH_WS_FREE(d->inject_norm);
     DFLASH_WS_FREE(d->inject_k); DFLASH_WS_FREE(d->inject_v);
+    DFLASH_WS_FREE(d->inject_kv);
 #undef DFLASH_WS_FREE
     d->inject_capacity = 0;
 }
@@ -127,12 +128,21 @@ static int hllm_dflash_overlap_init(hip_llm_runner *r,
         const size_t cap = HLLM_DFLASH_MAX_BLOCK;
         const size_t ne = (size_t)r->n_embd;
         const size_t kd = (size_t)HLLM_DFLASH_KV_HEADS * HLLM_DFLASH_HEAD_DIM;
+        int need_separate = 0, need_fused = 0;
+        for (int l = 0; l < HLLM_DFLASH_LAYERS; ++l) {
+            if (d->layers[l].inject_kv_bf16) need_fused = 1;
+            else need_separate = 1;
+        }
         if (hipMalloc(&d->inject_x, cap * ne * sizeof(float)) != hipSuccess ||
             (d->x_bf16 && hipMalloc(&d->inject_x_bf16,
                 cap * ne * sizeof(uint16_t)) != hipSuccess) ||
             hipMalloc(&d->inject_norm, cap * ne * sizeof(float)) != hipSuccess ||
-            hipMalloc(&d->inject_k, cap * kd * sizeof(float)) != hipSuccess ||
-            hipMalloc(&d->inject_v, cap * kd * sizeof(float)) != hipSuccess) {
+            (need_separate && hipMalloc(&d->inject_k,
+                cap * kd * sizeof(float)) != hipSuccess) ||
+            (need_separate && hipMalloc(&d->inject_v,
+                cap * kd * sizeof(float)) != hipSuccess) ||
+            (need_fused && hipMalloc(&d->inject_kv,
+                cap * 2 * kd * sizeof(float)) != hipSuccess)) {
             hllm_dflash_overlap_workspace_free(d);
             return -1;
         }
@@ -164,7 +174,7 @@ static void hllm_qwen35_dflash2_free(hip_llm_runner *r) {
     DFLASH_FREE(d->features); DFLASH_FREE(d->features_bf16);
     DFLASH_FREE(d->x); DFLASH_FREE(d->x_bf16); DFLASH_FREE(d->norm);
     DFLASH_FREE(d->dynamic); DFLASH_FREE(d->conv); DFLASH_FREE(d->q);
-    DFLASH_FREE(d->k); DFLASH_FREE(d->v); DFLASH_FREE(d->attn);
+    DFLASH_FREE(d->k); DFLASH_FREE(d->v); DFLASH_FREE(d->kv); DFLASH_FREE(d->attn);
     DFLASH_FREE(d->attn_partial);
     DFLASH_FREE(d->proj); DFLASH_FREE(d->gate); DFLASH_FREE(d->up);
     DFLASH_FREE(d->logits); DFLASH_FREE(d->selector_gate);
@@ -179,7 +189,7 @@ static void hllm_qwen35_dflash2_free(hip_llm_runner *r) {
         DFLASH_FREE(cl->attn_conv_proj); DFLASH_FREE(cl->ffn_conv_base);
         DFLASH_FREE(cl->ffn_conv_proj); DFLASH_FREE(cl->key_cache);
         DFLASH_FREE(cl->value_cache); DFLASH_FREE(cl->inject_k_bf16);
-        DFLASH_FREE(cl->inject_v_bf16);
+        DFLASH_FREE(cl->inject_v_bf16); DFLASH_FREE(cl->inject_kv_bf16);
     }
 #undef DFLASH_FREE
     if (d->module) hipModuleUnload(d->module);
@@ -411,9 +421,10 @@ static int hllm_dflash_silu_q81_fused(hip_llm_runner *r,
 
 static int hllm_qwen35_dflash2_inject_impl(hip_llm_runner *r, int position,
         int rows, void *features, void *features_bf16, void *x,
-        void *x_bf16, void *norm, void *k, void *v) {
+        void *x_bf16, void *norm, void *k, void *v, void *kv) {
     hllm_qwen35_dflash2 *d = r ? r->qwen35_dflash2 : NULL;
-    if (!d || !features || !x || !norm || !k || !v || rows < 1 ||
+    if (!d || !features || !x || !norm || (!k && !kv) || (!v && !kv) ||
+        rows < 1 ||
         rows > d->feature_rows) return -1;
     int ne = r->n_embd, kd = HLLM_DFLASH_KV_HEADS * HLLM_DFLASH_HEAD_DIM;
     if (d->fc_bf16 && features_bf16) {
@@ -433,7 +444,15 @@ static int hllm_qwen35_dflash2_inject_impl(hip_llm_runner *r, int position,
         launch_pack_bf16_from_f32(r, x_bf16, x, rows * ne);
     for (int l = 0; l < HLLM_DFLASH_LAYERS; ++l) {
         hllm_dflash_layer *cl = &d->layers[l];
-        if (x_bf16 && cl->inject_k_bf16 && cl->inject_v_bf16) {
+        void *layer_k = k, *layer_v = v;
+        int batch_stride = kd;
+        if (x_bf16 && kv && cl->inject_kv_bf16) {
+            if (gemm_run_bf16_w(r, kv, cl->inject_kv_bf16, x_bf16,
+                                rows, 2 * kd, ne, r->stream) != 0) return -1;
+            layer_k = kv;
+            layer_v = (char *)kv + kd * sizeof(float);
+            batch_stride = 2 * kd;
+        } else if (x_bf16 && cl->inject_k_bf16 && cl->inject_v_bf16) {
             if (gemm_run_bf16_w(r, k, cl->inject_k_bf16, x_bf16,
                                 rows, kd, ne, r->stream) != 0 ||
                 gemm_run_bf16_w(r, v, cl->inject_v_bf16, x_bf16,
@@ -444,13 +463,13 @@ static int hllm_qwen35_dflash2_inject_impl(hip_llm_runner *r, int position,
             hllm_dflash_project(r, v, cl->v, x, rows, kd, ne, ne,
                                 cl->v_type);
         }
-        launch_qknorm_batch(r, k, cl->k_norm, HLLM_DFLASH_KV_HEADS,
-                            HLLM_DFLASH_HEAD_DIM, rows, kd, r->rms_norm_eps);
-        launch_rope_mrope_batch(r, k, HLLM_DFLASH_KV_HEADS, HLLM_DFLASH_HEAD_DIM,
+        launch_qknorm_batch(r, layer_k, cl->k_norm, HLLM_DFLASH_KV_HEADS,
+                            HLLM_DFLASH_HEAD_DIM, rows, batch_stride, r->rms_norm_eps);
+        launch_rope_mrope_batch(r, layer_k, HLLM_DFLASH_KV_HEADS, HLLM_DFLASH_HEAD_DIM,
             position, r->rope_freq_base, HLLM_DFLASH_HEAD_DIM / 2, 0, 0, 0,
-            kd, rows);
+            batch_stride, rows);
         launch_kv_store_batch_strided(r, cl->key_cache, cl->value_cache,
-            k, v, position, rows, kd, kd, HLLM_DFLASH_WINDOW);
+            layer_k, layer_v, position, rows, kd, batch_stride, HLLM_DFLASH_WINDOW);
     }
     d->kv_end = position + rows;
     return r->qwen4_forward_error ? -1 : 0;
@@ -461,7 +480,7 @@ static int hllm_qwen35_dflash2_inject(hip_llm_runner *r, int position,
     hllm_qwen35_dflash2 *d = r ? r->qwen35_dflash2 : NULL;
     if (!d) return -1;
     return hllm_qwen35_dflash2_inject_impl(r, position, rows,
-        d->features, d->features_bf16, d->x, d->x_bf16, d->norm, d->k, d->v);
+        d->features, d->features_bf16, d->x, d->x_bf16, d->norm, d->k, d->v, d->kv);
 }
 
 static int hllm_dflash_upload_matrix(const gguf_context *g, const char *name,
@@ -635,19 +654,39 @@ int hip_llm_qwen35_dflash2_load(hip_llm_runner *r, const char *path,
             hipMalloc(&d->features_bf16,
                       cap * HLLM_DFLASH_LAYERS * ne * sizeof(uint16_t)) ||
             hipMalloc(&d->x_bf16, cap * ne * sizeof(uint16_t))) goto fail;
+        const char *inject_kv_env = getenv("LLM_QWEN35_DFLASH_INJECT_KV_FUSED");
+        int want_inject_kv = inject_kv_env && atoi(inject_kv_env) != 0;
+        int any_inject_kv = 0;
         for (int l = 0; l < HLLM_DFLASH_LAYERS; ++l) {
             hllm_dflash_layer *cl = &d->layers[l];
             size_t kv_elems = (size_t)HLLM_DFLASH_KV_HEADS *
                               HLLM_DFLASH_HEAD_DIM * ne;
-            if (hipMalloc(&cl->inject_k_bf16, kv_elems * sizeof(uint16_t)) ||
-                hipMalloc(&cl->inject_v_bf16, kv_elems * sizeof(uint16_t)) ||
-                hllm_dflash_dequant_bf16(r, cl->inject_k_bf16, cl->k,
-                    cl->k_type, HLLM_DFLASH_KV_HEADS * HLLM_DFLASH_HEAD_DIM,
-                    ne) ||
-                hllm_dflash_dequant_bf16(r, cl->inject_v_bf16, cl->v,
-                    cl->v_type, HLLM_DFLASH_KV_HEADS * HLLM_DFLASH_HEAD_DIM,
-                    ne)) goto fail;
+            int can_fuse = want_inject_kv &&
+                (cl->k_type == GGML_TYPE_Q4_K || cl->k_type == GGML_TYPE_Q6_K) &&
+                (cl->v_type == GGML_TYPE_Q4_K || cl->v_type == GGML_TYPE_Q6_K);
+            if (can_fuse) {
+                any_inject_kv = 1;
+                if (hipMalloc(&cl->inject_kv_bf16,
+                              2 * kv_elems * sizeof(uint16_t)) ||
+                    hllm_dflash_dequant_bf16(r, cl->inject_kv_bf16, cl->k,
+                        cl->k_type, HLLM_DFLASH_KV_HEADS * HLLM_DFLASH_HEAD_DIM,
+                        ne) ||
+                    hllm_dflash_dequant_bf16(r,
+                        (char *)cl->inject_kv_bf16 + kv_elems * sizeof(uint16_t),
+                        cl->v, cl->v_type,
+                        HLLM_DFLASH_KV_HEADS * HLLM_DFLASH_HEAD_DIM, ne)) goto fail;
+            } else if (hipMalloc(&cl->inject_k_bf16, kv_elems * sizeof(uint16_t)) ||
+                       hipMalloc(&cl->inject_v_bf16, kv_elems * sizeof(uint16_t)) ||
+                       hllm_dflash_dequant_bf16(r, cl->inject_k_bf16, cl->k,
+                           cl->k_type, HLLM_DFLASH_KV_HEADS * HLLM_DFLASH_HEAD_DIM,
+                           ne) ||
+                       hllm_dflash_dequant_bf16(r, cl->inject_v_bf16, cl->v,
+                           cl->v_type, HLLM_DFLASH_KV_HEADS * HLLM_DFLASH_HEAD_DIM,
+                           ne)) goto fail;
         }
+        if (any_inject_kv && hipMalloc(&d->kv,
+                cap * 2 * (size_t)HLLM_DFLASH_KV_HEADS * HLLM_DFLASH_HEAD_DIM *
+                sizeof(float)) != hipSuccess) goto fail;
         if (hipStreamSynchronize(r->stream) != hipSuccess) goto fail;
         if (r->verbose >= 1)
             fprintf(stderr,
@@ -915,7 +954,7 @@ int hip_llm_qwen35_dflash2_commit(hip_llm_runner *r, int position,
         int inject_rc = hllm_qwen35_dflash2_inject_impl(r, position, processed,
             d->features, d->features_bf16,
             d->inject_x, d->inject_x_bf16, d->inject_norm,
-            d->inject_k, d->inject_v);
+            d->inject_k, d->inject_v, d->inject_kv);
         r->stream = saved_stream;
         if (inject_rc || hipEventRecord(d->inject_done, d->inject_stream) != hipSuccess)
             return -1;

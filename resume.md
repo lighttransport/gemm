@@ -25,6 +25,13 @@ cache, concurrency, and multi-turn C++ quality suite passes. The strict
 ordinary 64K target, target-tail fusion, and production cache-injection
 overlap default remain open.
 
+The overlap candidate now accepts `LLM_QWEN35_DFLASH_INJECT_KV_FUSED=1` at
+sidecar load time. For compatible BF16-cached K/V weights it uses one wider
+per-layer injection GEMM and keeps the K/V row stride explicit through norm,
+RoPE, and cache store; mixed or unsupported layer types retain the two-GEMM
+path. The candidate remains opt-in until resident cache hashes and HTTP/C++
+quality gates prove that the changed GEMM shape is exact and beneficial.
+
 ## 2026-09-22 continuation: opt-in native Q2_K Q/K/V projection fusion
 
 The ordinary one-token attention dispatcher now exposes

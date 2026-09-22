@@ -677,9 +677,15 @@ RMSNorm reduction and output loop.  The 4K gate remains byte-identical and
 measures 536.17 tok/s cold, 610.86--612.05 tok/s warm, and 81.12--82.37 tok/s
 decode.  A complete 65,536-token random prefix retains hash
 `90178de69a24a76e` at 444.17 tok/s.  Overlapping sidecar injection with the
-next tile is not yet safe: the target and injection GEMMs can select the same
-shape-keyed hipBLASLt plan and workspace, so a second stream would race that
-workspace until plans become stream-specific.
+next tile is now stream-safe for the existing per-stream hipBLASLt workspace
+cache. The overlap stream has an additional diagnostic,
+`LLM_QWEN35_DFLASH_INJECT_KV_FUSED=1`, which must be set before sidecar load.
+When the prompt-only K/V weights support the BF16 cache, one wider GEMM writes
+the K and V ranges into a private strided tile; the existing exact Q/K norm,
+RoPE, and cache-store kernels consume that tile without a split copy. Layers
+with unsupported weight types keep the separate BF16 GEMMs. This changes only
+the opt-in injection path and still needs resident cache-hash and quality
+validation before it can be considered for a serving default.
 
 The real-GPU quality harness now runs the resident JSONL protocol directly and
 then exposes the same backend through HTTP.  It checks greedy and seeded
