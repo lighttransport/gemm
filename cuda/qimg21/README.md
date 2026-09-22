@@ -174,6 +174,42 @@ PSNR `46.58 dB`, and alpha MAE `0.00002860`. Both finite images show the same
 photorealistic red apple and table, with no visually apparent
 quantization-specific artifact.
 
+### Native W8A8 tensor-core execution
+
+Pass `--int8-tensor-core` with an exported row-INT8 package to keep weights as
+INT8 on device, dynamically quantize each BF16 activation row to INT8, execute
+signed `mma.sync.m16n8k32.s32.s8.s8.s32` dot products, and fuse the activation
+and weight row scales into the F32 output epilogue. This is genuine W8A8
+tensor-core execution; it does not reconstruct BF16 weights before GEMM. The
+option is supported by the native executable, `native_generate.py`,
+`regression.py`, and `editing_regression.py`.
+
+```sh
+tmp/qimg21-ref-venv/bin/python cuda/qimg21/regression.py --native \
+  --model /mnt/nvme01/models/qimg-21 \
+  --quantized-transformer tmp/qimg21-int8-package --int8-tensor-core \
+  --native-attention cutlass-efficient --native-normalization vector4 \
+  --native-rope host-table-exact --include-full \
+  --work-dir tmp/qimg21-w8a8-regression
+```
+
+W8A8 has a separate calibrated MRE gate of `<= 0.25`; dynamic activation
+quantization is materially noisier than row-INT8 weights with BF16 compute.
+In exact two-step editing, prediction MREs are `0.072323` and `0.202099`, and
+trajectory MREs are `0.082492` and `0.081736`. True-CFG scale 4 trajectory MRE
+peaks at `0.196597`; its isolated low-timestep guided prediction reaches
+`0.333089` and is explicitly outside the 0.25 gate. SmoothQuant or a similarly
+calibrated activation scheme remains desirable for strict CFG prediction
+quality.
+
+The full 1024x1024, 40-step W8A8 trajectory passes all checkpoints, with MRE
+rising smoothly to `0.041948` and final latent cosine `0.998980616`. It ran in
+`8:12.02`, versus `17:35.90` for BF16-compute row-INT8 (2.15x faster), executed
+9,000 custom INT8 MMA GEMMs, and sampled at `2148 MiB` peak process VRAM.
+Shared native-VAE decoding gave RGB cosine `0.999871005`, MAE `0.00668258`,
+PSNR `37.87 dB`, and no visually apparent change to the generated red apple.
+Compute Sanitizer reports zero errors for the complete 227-GEMM editing step.
+
 Current native BF16 arithmetic explicitly rounds the text projection before
 GELU and Q/K normalization before multiplication by the learned RMS weights.
 An older automatic-SDPA fixture reached 0.999981133 at timestep 1 and

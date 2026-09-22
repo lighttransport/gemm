@@ -93,4 +93,39 @@ done:
     safetensors_close(st);
     return out;
 }
+
+/* Device W8A8 layout: [row scale F32][row-major signed INT8 weights]. */
+static void *q21_read_int8_fat(const char *path, size_t rows, size_t cols,
+                              size_t *out_bytes) {
+    if (!rows || !cols || rows > SIZE_MAX / cols || rows > SIZE_MAX / 4 ||
+        rows * cols > SIZE_MAX - rows * 4) return NULL;
+    st_context *st = safetensors_open(path);
+    if (!st) return NULL;
+    void *out = NULL;
+    int wi = safetensors_find(st, "weight"), si = safetensors_find(st, "scale");
+    if (wi < 0 || si < 0 || strcmp(safetensors_dtype(st, wi), "I8") ||
+        strcmp(safetensors_dtype(st, si), "F32") || safetensors_ndims(st, wi) != 2 ||
+        safetensors_ndims(st, si) != 1 || safetensors_shape(st, wi)[0] != rows ||
+        safetensors_shape(st, wi)[1] != cols || safetensors_shape(st, si)[0] != rows ||
+        safetensors_nbytes(st, wi) != rows * cols || safetensors_nbytes(st, si) != rows * 4)
+        goto done;
+    const int8_t *weight = safetensors_data(st, wi);
+    const float *scale = safetensors_data(st, si);
+    size_t bytes = rows * 4 + rows * cols;
+    out = malloc(bytes);
+    if (!out) goto done;
+    for (size_t r = 0; r < rows; r++)
+        if (!(scale[r] > 0) || !isfinite(scale[r])) goto invalid;
+    for (size_t i = 0; i < rows * cols; i++)
+        if (weight[i] == -128) goto invalid;
+    memcpy(out, scale, rows * 4);
+    memcpy((uint8_t *)out + rows * 4, weight, rows * cols);
+    if (out_bytes) *out_bytes = bytes;
+    goto done;
+invalid:
+    free(out); out = NULL;
+done:
+    safetensors_close(st);
+    return out;
+}
 #endif

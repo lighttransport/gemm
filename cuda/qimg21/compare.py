@@ -23,6 +23,9 @@ QUANTIZED_COSINE_THRESHOLD = 0.999
 # checkpoints peaked at 0.036572; exact editing peaked at 0.045095 and true-CFG
 # editing at 0.083975.  A 0.10 gate retains about 19% margin for CFG.
 QUANTIZED_MRE_THRESHOLD = 0.10
+# Dynamic per-token activation quantization adds another error source.  The
+# first exact editing calibration peaks at 0.20210, so W8A8 uses 0.25.
+W8A8_MRE_THRESHOLD = 0.25
 
 
 def _step_path(directory: Path, name: str) -> Path:
@@ -93,6 +96,8 @@ def main() -> int:
         type=float,
         help="override the cosine acceptance gate (default: 0.999960 non-quantized)",
     )
+    ap.add_argument("--mre-threshold", type=float,
+                    help="override the quantized normalized-MAE gate")
     ap.add_argument(
         "--steps-only",
         action="store_true",
@@ -112,8 +117,11 @@ def main() -> int:
         threshold = QUANTIZED_COSINE_THRESHOLD if args.quantized else NONQUANTIZED_COSINE_THRESHOLD
     if not 0.0 < threshold <= 1.0:
         raise SystemExit("--cosine-threshold must be in (0, 1]")
+    mre_threshold = args.mre_threshold if args.mre_threshold is not None else QUANTIZED_MRE_THRESHOLD
+    if not 0.0 < mre_threshold:
+        raise SystemExit("--mre-threshold must be positive")
     if args.quantized:
-        print(f"acceptance MRE threshold={QUANTIZED_MRE_THRESHOLD:.9f} (row-INT8; cosine is diagnostic)")
+        print(f"acceptance MRE threshold={mre_threshold:.9f} (quantized; cosine is diagnostic)")
     else:
         print(f"acceptance cosine threshold={threshold:.9f} (non-quantized)")
 
@@ -150,8 +158,8 @@ def main() -> int:
             else:
                 if not args.quantized and name in ("initial_latents.npy", "prompt_embeds.npy") and cosine < threshold:
                     failures.append(f"{name} cosine {cosine:.9f} < {threshold:.9f}")
-                if args.quantized and mre > QUANTIZED_MRE_THRESHOLD:
-                    failures.append(f"{name} MRE {mre:.9f} > {QUANTIZED_MRE_THRESHOLD:.9f}")
+                if args.quantized and mre > mre_threshold:
+                    failures.append(f"{name} MRE {mre:.9f} > {mre_threshold:.9f}")
 
     ref_steps: list[str] = []
     if not args.denoiser_only:
@@ -171,8 +179,8 @@ def main() -> int:
             else:
                 if not np.isfinite(cosine) or (not args.quantized and cosine < threshold):
                     failures.append(f"{name} cosine {cosine:.9f} < {threshold:.9f}")
-                if args.quantized and mre > QUANTIZED_MRE_THRESHOLD:
-                    failures.append(f"{name} MRE {mre:.9f} > {QUANTIZED_MRE_THRESHOLD:.9f}")
+                if args.quantized and mre > mre_threshold:
+                    failures.append(f"{name} MRE {mre:.9f} > {mre_threshold:.9f}")
 
     ref_predictions = []
     if args.denoiser_only:
@@ -192,8 +200,8 @@ def main() -> int:
             else:
                 if not np.isfinite(cosine) or (not args.quantized and cosine < threshold):
                     failures.append(f"{name} cosine {cosine:.9f} < {threshold:.9f}")
-                if args.quantized and mre > QUANTIZED_MRE_THRESHOLD:
-                    failures.append(f"{name} MRE {mre:.9f} > {QUANTIZED_MRE_THRESHOLD:.9f}")
+                if args.quantized and mre > mre_threshold:
+                    failures.append(f"{name} MRE {mre:.9f} > {mre_threshold:.9f}")
 
     if failures:
         print("PARITY FAIL", file=sys.stderr)

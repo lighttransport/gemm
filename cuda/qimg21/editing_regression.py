@@ -12,7 +12,7 @@ import subprocess
 import numpy as np
 
 from compare import (_cosine_error, _relative_mae, NONQUANTIZED_COSINE_THRESHOLD,
-                     QUANTIZED_MRE_THRESHOLD)
+                     QUANTIZED_MRE_THRESHOLD, W8A8_MRE_THRESHOLD)
 from prepare_edit_fixture import prepare
 
 
@@ -39,6 +39,8 @@ def main():
     quant = ap.add_mutually_exclusive_group()
     quant.add_argument("--quantized-transformer", type=Path)
     quant.add_argument("--quantize-on-load", choices=("int8-row",))
+    ap.add_argument("--int8-tensor-core", action="store_true",
+                    help="use dynamic W8A8 native tensor-core GEMM")
     args = ap.parse_args()
     ref = args.reference_dir.resolve()
     predictions = sorted(ref.glob("pred_*.npy"))
@@ -50,9 +52,13 @@ def main():
     work.mkdir(parents=True, exist_ok=False)
     binary = str(Path(__file__).with_name("test_cuda_qimg21_native").resolve())
     is_quantized = bool(args.quantized_transformer or args.quantize_on_load)
+    if args.int8_tensor_core and not args.quantized_transformer:
+        ap.error("--int8-tensor-core requires --quantized-transformer")
+    mre_threshold = W8A8_MRE_THRESHOLD if args.int8_tensor_core else QUANTIZED_MRE_THRESHOLD
     cosine_threshold = None if is_quantized else NONQUANTIZED_COSINE_THRESHOLD
     results = {"threshold": cosine_threshold,
-               "mre_threshold": QUANTIZED_MRE_THRESHOLD if is_quantized else None,
+               "mre_threshold": mre_threshold if is_quantized else None,
+               "int8_tensor_core": args.int8_tensor_core,
                "quantized": is_quantized,
                "reference": str(ref), "model": str(args.model.resolve()),
                "true_cfg_scale": scale, "predictions": [], "trajectory": [],
@@ -75,6 +81,8 @@ def main():
             cmd.extend(["--quantized-transformer", str(args.quantized_transformer.resolve())])
         elif args.quantize_on_load:
             cmd.extend(["--quantize-on-load", args.quantize_on_load])
+        if args.int8_tensor_core:
+            cmd.append("--int8-tensor-core")
         if scale > 1:
             negative = fixture / "negative"
             cmd.extend(["--negative-editing-layout", str(negative / "layout.txt"),
@@ -87,7 +95,7 @@ def main():
         candidate_array = np.load(candidate, allow_pickle=False)
         cosine, relative_l2 = _cosine_error(reference_array, candidate_array)
         mre = _relative_mae(reference_array, candidate_array)
-        passed = mre <= QUANTIZED_MRE_THRESHOLD if is_quantized else cosine >= cosine_threshold
+        passed = mre <= mre_threshold if is_quantized else cosine >= cosine_threshold
         return {"cosine": cosine, "relative_l2": relative_l2, "mre": mre,
                 "passed": passed}
 

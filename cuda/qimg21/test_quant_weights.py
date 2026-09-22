@@ -77,6 +77,11 @@ class QuantizedWeightsTest(unittest.TestCase):
             expected = torch.from_numpy(quantized.astype(np.float32) * scale[:, None]).bfloat16()
             np.testing.assert_array_equal(np.fromfile(output, dtype=np.uint16).reshape(weight.shape),
                                           expected.view(torch.uint16).numpy())
+            subprocess.run([str(binary), str(source), "5", "129", str(output), "--fat"], check=True)
+            raw = output.read_bytes()
+            np.testing.assert_array_equal(np.frombuffer(raw[:20], dtype=np.float32), scale)
+            np.testing.assert_array_equal(np.frombuffer(raw[20:], dtype=np.int8).reshape(weight.shape),
+                                          quantized)
             self.assertNotEqual(invoke(rows=4), 0)
             for bad in (np.nan, np.inf, 0, -1):
                 invalid = scale.copy(); invalid[2] = bad

@@ -200,6 +200,10 @@ static st_context *find_tensor(const qimg21_shards *s, const char *name, int *id
 
 static const char *qimg21_quantized_transformer;
 static int qimg21_quantize_on_load;
+static int qimg21_int8_tensor_core;
+static CUdeviceptr qimg21_int8_input_f32;
+static size_t qimg21_int8_input_f32_bytes;
+static unsigned long long qimg21_int8_mma_calls;
 
 static CUdeviceptr upload_bf16(const qimg21_shards *s, const char *name) {
     int idx; st_context *st = find_tensor(s, name, &idx);
@@ -208,7 +212,17 @@ static CUdeviceptr upload_bf16(const qimg21_shards *s, const char *name) {
         const uint64_t *shape = safetensors_shape(st, idx);
         char path[2048];
         uint16_t *data;
-        if (qimg21_quantize_on_load) data = q21_quantize_matrix_on_load(st, idx);
+        if (qimg21_int8_tensor_core) {
+            int len = snprintf(path, sizeof(path), "%s/%s.safetensors", qimg21_quantized_transformer, name);
+            size_t bytes = 0;
+            void *fat = len < 0 || len >= (int)sizeof(path) ? NULL :
+                        q21_read_int8_fat(path, shape[0], shape[1], &bytes);
+            if (!fat) { fprintf(stderr, "native: invalid/missing INT8 matrix %s\n", name); return 0; }
+            CUdeviceptr d = checked_cuMemAlloc(bytes);
+            if (d && cuMemcpyHtoD(d, fat, bytes) != CUDA_SUCCESS) { cuMemFree(d); d = 0; }
+            free(fat);
+            return d;
+        } else if (qimg21_quantize_on_load) data = q21_quantize_matrix_on_load(st, idx);
         else {
             int len = snprintf(path, sizeof(path), "%s/%s.safetensors", qimg21_quantized_transformer, name);
             if (len < 0 || len >= (int)sizeof(path)) return 0;
@@ -373,6 +387,28 @@ static int launch_cast(cuda_qimg_runner *r, CUdeviceptr dst, CUdeviceptr src, in
 
 static int gemm(cuda_qimg_runner *r, CUdeviceptr y, CUdeviceptr w, CUdeviceptr x,
                 int nt, int no, int ni) {
+    if (qimg21_int8_tensor_core) {
+        size_t input_bytes = (size_t)nt * ni * sizeof(float);
+        if (input_bytes > qimg21_int8_input_f32_bytes) {
+            if (qimg21_int8_input_f32) cuMemFree(qimg21_int8_input_f32);
+            qimg21_int8_input_f32 = checked_cuMemAlloc(input_bytes);
+            if (!qimg21_int8_input_f32) { qimg21_int8_input_f32_bytes = 0; return -1; }
+            qimg21_int8_input_f32_bytes = input_bytes;
+        }
+        CUdeviceptr no_bias = 0;
+        void *cast_args[] = { &qimg21_int8_input_f32, &x, &no_bias, &ni, &nt };
+        if (cuLaunchKernel(r->bf16_to_f32_add_bias, (nt * ni + 255) / 256, 1, 1,
+                           256, 1, 1, 0, r->stream, cast_args, NULL) != CUDA_SUCCESS)
+            return -1;
+        op_gemm(r, y, w, qimg21_int8_input_f32, 0, no, ni, nt);
+        if (nt >= 16 && no % 256 == 0 && ni % 32 == 0 && r->gemm_int8_s32)
+            qimg21_int8_mma_calls++;
+        CUresult result = cuCtxSynchronize();
+        if (result != CUDA_SUCCESS)
+            fprintf(stderr, "native: INT8 GEMM failed M=%d N=%d K=%d CUDA=%d\n",
+                    nt, no, ni, (int)result);
+        return (int)result;
+    }
     int rc = cublasew_gemm_bf16_bf16_f32_rowmajor_nt(r->cublaslt_ctx, y, w, x, nt, no, ni);
     if (rc == 0) cuCtxSynchronize();
     return rc;
@@ -637,6 +673,7 @@ int main(int argc, char **argv) {
             if (strcmp(argv[++i], "int8-row")) return 2;
             qimg21_quantize_on_load = 1;
         }
+        else if (!strcmp(argv[i], "--int8-tensor-core")) qimg21_int8_tensor_core = 1;
         else if (!strcmp(argv[i], "--attention") && i + 1 < argc) {
             const char *mode = argv[++i];
             qimg21_attention_mma64=0;
@@ -688,6 +725,9 @@ int main(int argc, char **argv) {
     if (qimg21_quantize_on_load && qimg21_quantized_transformer) {
         fprintf(stderr,"native: choose a quantized package or quantize-on-load, not both\n"); return 2;
     }
+    if (qimg21_int8_tensor_core && !qimg21_quantized_transformer) {
+        fprintf(stderr,"native: --int8-tensor-core requires --quantized-transformer\n"); return 2;
+    }
     if (qimg21_quantize_on_load) fprintf(stderr,"native: row-INT8 quantization on load; BF16 compute, no exported copy\n");
     if (qimg21_quantized_transformer) {
         char path[2048], format[64];
@@ -697,7 +737,9 @@ int main(int argc, char **argv) {
         int valid = fp && fgets(format, sizeof(format), fp) && !strcmp(format, "qimg21-int8-row-v1\n");
         if (fp) fclose(fp);
         if (!valid) { fprintf(stderr, "native: incomplete/unsupported quantized package\n"); return 2; }
-        fprintf(stderr, "native: row-INT8 weights, BF16 dequantized compute (MRE <= 0.10 validated)\n");
+        fprintf(stderr, qimg21_int8_tensor_core ?
+                "native: row-INT8 W8A8 tensor-core compute enabled\n" :
+                "native: row-INT8 weights, BF16 dequantized compute (MRE <= 0.10 validated)\n");
     }
     qimg21_stage_dir = getenv("QIMG21_STAGE_DIR");
     qimg21_stage_all_blocks = getenv("QIMG21_STAGE_ALL_BLOCKS") != NULL;
@@ -750,6 +792,12 @@ int main(int argc, char **argv) {
         memcpy(packed,condition.data,(size_t)nc*64*sizeof(float));
     }
     const float *p=pe.data; cuda_qimg_runner*r=cuda_qimg_init(0,verbose);if(!r)return 1;
+    if(qimg21_int8_tensor_core) {
+        if(!r->gemm_int8_s32 || !r->quant_act_perrow_int8 || !r->dequant_int32_to_bf16) {
+            fprintf(stderr,"native: INT8 tensor-core kernels unavailable\n");cuda_qimg_free(r);return 1;
+        }
+        r->use_int8=1;
+    }
     void *cutlass_plugin=NULL;
     if(cutlass_plugin_path) {
         cutlass_plugin=dlopen(cutlass_plugin_path,RTLD_NOW|RTLD_LOCAL);
@@ -874,5 +922,11 @@ int main(int argc, char **argv) {
         if(qimg21_cutlass_workspace_release)qimg21_cutlass_workspace_release();
         dlclose(cutlass_plugin);
     }
+    if(qimg21_int8_input_f32) {
+        cuMemFree(qimg21_int8_input_f32);
+        qimg21_int8_input_f32=0;qimg21_int8_input_f32_bytes=0;
+    }
+    if(qimg21_int8_tensor_core)
+        fprintf(stderr,"native: custom INT8 MMA GEMM calls=%llu\n",qimg21_int8_mma_calls);
     cuda_qimg_free(r); npy_free(&pe); npy_free(&neg); npy_free(&la); return rc;
 }

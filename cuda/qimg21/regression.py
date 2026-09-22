@@ -103,6 +103,8 @@ def main() -> int:
     ap.add_argument("--quantized", action="store_true")
     ap.add_argument("--quantized-transformer", type=Path, help="Optional native row-INT8 package")
     ap.add_argument("--quantize-on-load", choices=("int8-row",), help="Quantize each matrix without a disk export")
+    ap.add_argument("--int8-tensor-core", action="store_true",
+                    help="dynamic W8A8 custom tensor-core execution (requires package)")
     ap.add_argument("--cosine-threshold", type=float)
     args = ap.parse_args()
     if args.native_attention != "math" and not args.native:
@@ -117,6 +119,8 @@ def main() -> int:
         args.quantized = True
     elif args.quantized:
         ap.error("--quantized requires --quantized-transformer or --quantize-on-load")
+    if args.int8_tensor_core and not args.quantized_transformer:
+        ap.error("--int8-tensor-core requires --quantized-transformer")
 
     root = Path(__file__).resolve().parents[2]
     model = Path(args.model).resolve()
@@ -194,6 +198,8 @@ def main() -> int:
                                      "--guidance-scale", str(args.true_cfg_scale)])
                 if args.quantized_transformer:
                     guidance.extend(["--quantized-transformer", str(args.quantized_transformer.resolve())])
+                if args.int8_tensor_core:
+                    guidance.append("--int8-tensor-core")
                 if args.quantize_on_load:
                     guidance.extend(["--quantize-on-load", args.quantize_on_load])
                 timesteps = _load_timesteps(ref_dir, case.steps)
@@ -202,6 +208,7 @@ def main() -> int:
                     "normalization": args.native_normalization, "rope": args.native_rope,
                     "quantized_transformer": str(args.quantized_transformer.resolve()) if args.quantized_transformer else None,
                     "quantize_on_load": args.quantize_on_load,
+                    "int8_tensor_core": args.int8_tensor_core,
                     "dtype": args.dtype, "timesteps": timesteps,
                     "reference_sdpa_backend": args.reference_sdpa_backend,
                     "case": case.name, "prompt": args.prompt,
@@ -272,6 +279,8 @@ def main() -> int:
                 compare_command.append("--denoiser-only")
             if args.quantized:
                 compare_command.append("--quantized")
+            if args.int8_tensor_core:
+                compare_command.extend(["--mre-threshold", "0.25"])
             if args.cosine_threshold is not None:
                 compare_command.extend(["--cosine-threshold", str(args.cosine_threshold)])
             commands = [compare_command]
@@ -281,6 +290,8 @@ def main() -> int:
                                       "--runner-dir", str(trajectory_dir)]
                 if args.quantized:
                     trajectory_compare.append("--quantized")
+                if args.int8_tensor_core:
+                    trajectory_compare.extend(["--mre-threshold", "0.25"])
                 if args.cosine_threshold is not None:
                     trajectory_compare.extend(["--cosine-threshold", str(args.cosine_threshold)])
                 commands.append(trajectory_compare)
