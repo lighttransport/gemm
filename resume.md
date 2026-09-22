@@ -1505,6 +1505,12 @@ The launcher now forwards the existing mixed-IQ QKV and gate/up A/B controls.
 At randomized 64K, enabling both fused candidates retained suffix hash
 `7463f176c9b85ba3` but measured 35.00 tok/s versus 35.59 tok/s for the default
 path, so the candidates remain opt-in.
+Fresh dense NextN evidence confirms the long-context bottleneck: K=3 at
+randomized 64K drafted 77 rows, accepted 36, spent 2.894 s in verification,
+and sustained 20.50 tok/s with exact hash `b63380a1a3e5d3b2`. Enabling both
+exact MTP pair-batch projection switches was neutral on the 4K fixture
+(49.04 versus 49.07 tok/s, identical hash `96b92d606dde5e28`), so those
+switches remain opt-in.
 
 2026-09-22 continuation: the one-row IQ2/IQ3/IQ4 kernels now declare their
 output, weight, activation, and scale buffers non-aliasing.  This preserves

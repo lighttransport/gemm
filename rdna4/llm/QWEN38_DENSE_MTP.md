@@ -210,3 +210,10 @@ older zero-cache MTP number is obsolete. A real 65,536-token run now records
 retains prefix hash `90178de69a24a76e`, suffix hash `f4b35758fb99e6db`, and
 `Result: PASS`. This is slower than ordinary and DFlash2 decode at that depth,
 so Dense NextN remains opt-in.
+
+A fresh Q8/Q8 rerun with the current verifier drafted 77 rows, accepted 36,
+spent 2.894 s in verification, and sustained 20.50 tok/s for 64 decoded
+tokens at randomized 64K depth (hash `b63380a1a3e5d3b2`). The exact F16/BF16
+pair-batch projection candidates were also compared at 4K: 49.04 tok/s with
+both enabled versus 49.07 tok/s control, with identical hash
+`96b92d606dde5e28`; they remain diagnostic only.
