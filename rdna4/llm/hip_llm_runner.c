@@ -20801,6 +20801,8 @@ static inline void launch_quantize_q81_batch_cached(hip_llm_runner *r,
         void *x, int n, int M, int stride);
 static inline void launch_quantize_q81_iq1_batch(hip_llm_runner *r,
         void *x, int n, int M, int stride);
+static inline void launch_quantize_q81_iq1_batch_preserve_q8x2(
+        hip_llm_runner *r, void *x, int n, int M, int stride);
 static inline void launch_matvec_iq_q81_batch(hip_llm_runner *r,
         hipFunction_t fn, void *dst, void *mat, int n_rows, int n_cols, int M);
 static inline void *get_bf16_weight(hip_llm_runner *r, void *raw_w, void *bf16_w,
@@ -22182,8 +22184,24 @@ static inline int launch_qwen35_attn_q81_batch(hip_llm_runner *r, void *dst,
 }
 static inline void launch_quantize_q81_iq1_batch(hip_llm_runner *r, void *x,
         int n, int M, int stride) {
-    /* Keep the common cache allocation/lifetime path, then replace the
-     * second scale array with llama.cpp's FP16 block sum for IQ1. */
+    /* IQ1 consumes q0/s0 plus the original-input block sum in s1.  Do not
+     * launch the two-term Q8x2 producer first: that work is immediately
+     * overwritten and can also leave the shared batch-cache metadata claiming
+     * that q1/s1 still hold a valid Q8x2 tile.  Mixed SSM roles that need both
+     * formats use the explicit preserving helper below. */
+    void *args[] = { &r->d_act_q8_batch, &r->d_act_scale_batch,
+                     &r->d_act_scale_batch_b, &x, &n, &M, &stride };
+    LAUNCH(r->fn_quantize_q81_iq1_batch_32_exact, (n + 31) / 32, M, 1,
+           32, 1, 1, 0, r->stream, args);
+    r->batch_q8_valid = 0;
+    r->q8x2_reuse_valid = 0;
+}
+
+/* Preserve the Q8x2 bytes for a mixed-format batch.  The IQ1 quantizer
+ * intentionally overwrites q0/s0/s1, so the caller must consume both formats
+ * before asking another producer to refresh the shared scratch. */
+static inline void launch_quantize_q81_iq1_batch_preserve_q8x2(
+        hip_llm_runner *r, void *x, int n, int M, int stride) {
     launch_quantize_q8x2_batch_cached(r, x, n, M, stride);
     void *args[] = { &r->d_act_q8_batch, &r->d_act_scale_batch,
                      &r->d_act_scale_batch_b, &x, &n, &M, &stride };
@@ -30935,7 +30953,11 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
                                 use_iq1_m_q81 && cl->ssm_gate_type == GGML_TYPE_IQ1_M;
             if (use_ssm_in_q81)
                 if (qkv_q81_iq1s || gate_q81_iq1s || qkv_q81_iq1m || gate_q81_iq1m)
-                    launch_quantize_q81_iq1_batch(r, r->d_xnorm_batch, n_embd, M, n_embd);
+                    /* QKV/gate can be mixed IQ1 and Q8x2.  Keep the old
+                     * two-format staging contract for this dispatcher; the
+                     * IQ1-only projection paths use the cheaper direct helper. */
+                    launch_quantize_q81_iq1_batch_preserve_q8x2(
+                        r, r->d_xnorm_batch, n_embd, M, n_embd);
                 else
                     launch_quantize_q8x2_batch_cached(r, r->d_xnorm_batch,
                                                       n_embd, M, n_embd);

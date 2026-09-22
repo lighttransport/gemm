@@ -1,5 +1,16 @@
 # Qwen3.8 DFlash2 on RDNA4
 
+## IQ1-only batch staging cleanup (2026-09-22)
+
+The IQ1 Q8_1 batch quantizer no longer launches a Q8x2 producer that is
+immediately overwritten. MTP gate/up reuse and standalone IQ1 batch
+projections now write only the Q8_1 payload, FP16 scale, and original-input
+block sum they consume, then invalidate the shared Q8x2 cache metadata. The
+mixed SSM dispatcher uses a separate preserving helper when another projection
+still needs the two-term Q8x2 bytes. This removes redundant staging work while
+keeping the mixed-format arithmetic and production defaults unchanged; resident
+quality/hash and 64K timing validation remain pending.
+
 ## Draft embedding launch cleanup (2026-09-22)
 
 Each DFlash2 proposal now decodes one anchor row and one fixed mask-token row

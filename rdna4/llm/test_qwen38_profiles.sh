@@ -83,6 +83,16 @@ grep -q 'io_vectors' "${root_dir}/qwen35_nextn.h" || {
     echo 'profile test: fused commit IO coverage guard missing' >&2
     exit 1
 }
+# IQ1-only batch/MTP projections must not pay for a discarded Q8x2 tile;
+# mixed SSM roles retain an explicit preserving helper for both contracts.
+grep -q 'launch_quantize_q81_iq1_batch_preserve_q8x2' "${runner_c}" || {
+    echo 'profile test: mixed IQ1/Q8x2 staging helper missing' >&2
+    exit 1
+}
+grep -q 'r->batch_q8_valid = 0;' "${runner_c}" || {
+    echo 'profile test: direct IQ1 staging cache invalidation missing' >&2
+    exit 1
+}
 grep -q 'QWEN38_GSQ_DECODE_TARGET:-30' "${root_dir}/bench_qwen38_gsq_decode.sh" || {
     echo 'profile test: GSQ 30 tok/s target gate missing' >&2
     exit 1

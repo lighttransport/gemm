@@ -42,6 +42,15 @@ The DFlash2 mask-row broadcast also has an opt-in
 row-repeat kernel for all repeated mask rows after the anchor and first mask
 row, while the established device-copy loop remains the default.
 
+The IQ1 Q8_1 batch staging path now skips a redundant Q8x2 quantizer when the
+consumer set is IQ1-only, which is the common MTP gate/up reuse case. It
+invalidates the shared Q8x2 metadata after writing the IQ1 block-sum layout so
+graph replay cannot consume stale second-term bytes. Mixed SSM Q8x2/IQ1 roles
+keep an explicit preserving helper and their previous two-format contract.
+This is a code-level reduction in draft/verify launch work; resident logits,
+hashes, and 64K timing are still required before changing any production
+selector.
+
 ## 2026-09-22 continuation: opt-in native Q2_K Q/K/V projection fusion
 
 The ordinary one-token attention dispatcher now exposes
