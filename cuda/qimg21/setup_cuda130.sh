@@ -5,6 +5,21 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 DEST="${PYTORCH_CUDA_HOME:-$ROOT/tmp/cuda130}"
 CACHE="${QIMG21_CUDA_CACHE:-$ROOT/tmp/cuda130-download}"
 BASE=https://developer.download.nvidia.com/compute/cuda/redist
+OFFLINE=0
+
+usage() {
+    echo "usage: $0 [--offline] [--dest DIR] [--cache-dir DIR]" >&2
+}
+
+while (($#)); do
+    case "$1" in
+        --offline) OFFLINE=1; shift ;;
+        --dest) [[ $# -ge 2 ]] || { usage; exit 2; }; DEST="$2"; shift 2 ;;
+        --cache-dir) [[ $# -ge 2 ]] || { usage; exit 2; }; CACHE="$2"; shift 2 ;;
+        -h|--help) usage; exit 0 ;;
+        *) usage; exit 2 ;;
+    esac
+done
 
 if [[ -x "$DEST/bin/nvcc" ]] &&
    "$DEST/bin/nvcc" --version | grep -F 'release 13.0, V13.0.88' >/dev/null; then
@@ -32,7 +47,14 @@ for entry in "${components[@]}"; do
     read -r component archive checksum <<<"$entry"
     cached="$CACHE/${component}.tar.xz"
     if [[ ! -f "$cached" ]]; then
-        curl -fL "$BASE/$component/linux-x86_64/$archive" -o "$cached"
+        if ((OFFLINE)); then
+            echo "setup_cuda130: offline cache miss: $cached" >&2
+            exit 1
+        fi
+        partial="$cached.part"
+        rm -f "$partial"
+        curl -fL "$BASE/$component/linux-x86_64/$archive" -o "$partial"
+        mv "$partial" "$cached"
     fi
     echo "$checksum  $cached" | sha256sum --check --status || {
         echo "setup_cuda130: checksum mismatch: $cached" >&2

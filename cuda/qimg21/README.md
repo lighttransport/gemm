@@ -1615,7 +1615,16 @@ make -C cuda/qimg21 native-exact
 checks pinned SHA-256 digests, and assembles CUDA 13.0.88 under
 `tmp/cuda130` without modifying the system toolkit. This wheel-matched NVCC is
 used only for exact GELU code generation; set `PYTORCH_CUDA_HOME` to install
-or use the pinned toolkit elsewhere.
+or use the pinned toolkit elsewhere. Once the five verified archives are in
+`tmp/cuda130-download`, a clean machine can require cache-only installation:
+
+```sh
+cuda/qimg21/setup_cuda130.sh --offline
+```
+
+Use `--cache-dir DIR` and `--dest DIR` to stage or consume a portable cache.
+Downloads use a `.part` file and are renamed only after completion; every
+online or offline install verifies the pinned SHA-256 digest before unpacking.
 
 `setup_exact_sources.sh` pins PyTorch at
 `08187d9e0fba026dc8217405802ab5381dc88d90`, FlashAttention at
