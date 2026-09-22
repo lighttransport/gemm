@@ -1155,6 +1155,65 @@ static inline int tf_kq_pair_enabled(void) {
     return mode;
 }
 
+static inline int tf_kq_rows_mode(void) {
+    static int mode = -1;
+    if (mode < 0) {
+        const char *v = getenv("TF_KQ_ROWS");
+        int m = getenv("TF_KQ_ROWS1") ? 1 : (v ? atoi(v) : 2);
+        if (m != 1 && m != 2 && m != 4) m = 2;
+        (void)__sync_bool_compare_and_swap(&mode, -1, m);
+    }
+    return mode;
+}
+
+/* Four-row Q4_K dot.  The activation stream is shared across four rows;
+ * this keeps the HBM-bound decode path from loading x four times while
+ * retaining the scalar dequantization order of the one-row kernel. */
+static inline void tf_q4_k_dot4_sve(float *out0, float *out1, float *out2, float *out3,
+                                    const block_q4_K *b0, const block_q4_K *b1,
+                                    const block_q4_K *b2, const block_q4_K *b3,
+                                    const float *x, int n) {
+    const svbool_t pg = svptrue_b32();
+    const int vl = (int)svcntw();
+    svfloat32_t a0 = svdup_f32(0.0f), a1 = a0, a2 = a0, a3 = a0;
+    for (int ib = 0; ib < n / 256; ib++) {
+        const block_q4_K *r0 = b0 + ib, *r1 = b1 + ib, *r2 = b2 + ib, *r3 = b3 + ib;
+        const float d0 = ggml_fp16_to_fp32(r0->d), m0 = ggml_fp16_to_fp32(r0->dmin);
+        const float d1 = ggml_fp16_to_fp32(r1->d), m1 = ggml_fp16_to_fp32(r1->dmin);
+        const float d2 = ggml_fp16_to_fp32(r2->d), m2 = ggml_fp16_to_fp32(r2->dmin);
+        const float d3 = ggml_fp16_to_fp32(r3->d), m3 = ggml_fp16_to_fp32(r3->dmin);
+        for (int g = 0, is = 0; g < 256; g += 64, is += 2) {
+            uint8_t s, mv;
+            get_scale_min_k4(is, r0->scales, &s, &mv); float d00=d0*s,m00=m0*mv;
+            get_scale_min_k4(is+1, r0->scales, &s, &mv); float d01=d0*s,m01=m0*mv;
+            get_scale_min_k4(is, r1->scales, &s, &mv); float d10=d1*s,m10=m1*mv;
+            get_scale_min_k4(is+1, r1->scales, &s, &mv); float d11=d1*s,m11=m1*mv;
+            get_scale_min_k4(is, r2->scales, &s, &mv); float d20=d2*s,m20=m2*mv;
+            get_scale_min_k4(is+1, r2->scales, &s, &mv); float d21=d2*s,m21=m2*mv;
+            get_scale_min_k4(is, r3->scales, &s, &mv); float d30=d3*s,m30=m3*mv;
+            get_scale_min_k4(is+1, r3->scales, &s, &mv); float d31=d3*s,m31=m3*mv;
+            const uint8_t *q0=r0->qs+(g/64)*32, *q1=r1->qs+(g/64)*32;
+            const uint8_t *q2=r2->qs+(g/64)*32, *q3=r3->qs+(g/64)*32;
+            for (int k = 0; k < 32; k += vl) {
+                svbool_t pt = k + vl <= 32 ? pg : svwhilelt_b32((uint64_t)k, (uint64_t)32);
+                svfloat32_t xv = svld1(pt, x + ib*256 + g + k);
+                svuint32_t z0=svld1ub_u32(pt,q0+k), z1=svld1ub_u32(pt,q1+k), z2=svld1ub_u32(pt,q2+k), z3=svld1ub_u32(pt,q3+k);
+                a0=svmla_m(pt,a0,svsub_x(pt,svmul_n_f32_x(pt,svcvt_f32_u32_x(pt,svand_n_u32_x(pt,z0,15)),d00),m00),xv);
+                a1=svmla_m(pt,a1,svsub_x(pt,svmul_n_f32_x(pt,svcvt_f32_u32_x(pt,svand_n_u32_x(pt,z1,15)),d10),m10),xv);
+                a2=svmla_m(pt,a2,svsub_x(pt,svmul_n_f32_x(pt,svcvt_f32_u32_x(pt,svand_n_u32_x(pt,z2,15)),d20),m20),xv);
+                a3=svmla_m(pt,a3,svsub_x(pt,svmul_n_f32_x(pt,svcvt_f32_u32_x(pt,svand_n_u32_x(pt,z3,15)),d30),m30),xv);
+                xv=svld1(pt,x+ib*256+g+32+k);
+                z0=svlsr_n_u32_x(pt,z0,4); z1=svlsr_n_u32_x(pt,z1,4); z2=svlsr_n_u32_x(pt,z2,4); z3=svlsr_n_u32_x(pt,z3,4);
+                a0=svmla_m(pt,a0,svsub_x(pt,svmul_n_f32_x(pt,svcvt_f32_u32_x(pt,z0),d01),m01),xv);
+                a1=svmla_m(pt,a1,svsub_x(pt,svmul_n_f32_x(pt,svcvt_f32_u32_x(pt,z1),d11),m11),xv);
+                a2=svmla_m(pt,a2,svsub_x(pt,svmul_n_f32_x(pt,svcvt_f32_u32_x(pt,z2),d21),m21),xv);
+                a3=svmla_m(pt,a3,svsub_x(pt,svmul_n_f32_x(pt,svcvt_f32_u32_x(pt,z3),d31),m31),xv);
+            }
+        }
+    }
+    *out0=svaddv_f32(pg,a0); *out1=svaddv_f32(pg,a1); *out2=svaddv_f32(pg,a2); *out3=svaddv_f32(pg,a3);
+}
+
 /* Two-row K-quant dot.  The weight streams remain independent, but the
  * activation vector is loaded once and fed to both accumulators.  This is
  * important for decode: every row rereads the same hidden state while the
@@ -1665,7 +1724,18 @@ static void *tf_qmatvec_worker(void *arg) {
         size_t row_bytes = (size_t)(n_cols / 256) * sizeof(block_q4_K);
         const block_q4_K *base = (const block_q4_K *)t->mat->data;
         int i = t->row_start;
-        if (tf_kq_pair_enabled()) {
+        if (tf_kq_rows_mode() == 4) {
+            for (; i + 3 < t->row_end; i += 4) {
+                float a, b, c, d;
+                tf_q4_k_dot4_sve(&a, &b, &c, &d,
+                    (const block_q4_K *)((const uint8_t *)base + (size_t)i * row_bytes),
+                    (const block_q4_K *)((const uint8_t *)base + (size_t)(i + 1) * row_bytes),
+                    (const block_q4_K *)((const uint8_t *)base + (size_t)(i + 2) * row_bytes),
+                    (const block_q4_K *)((const uint8_t *)base + (size_t)(i + 3) * row_bytes), t->x, n_cols);
+                t->dst[i] = a; t->dst[i + 1] = b; t->dst[i + 2] = c; t->dst[i + 3] = d;
+            }
+        }
+        if (tf_kq_rows_mode() == 2) {
             for (; i + 1 < t->row_end; i += 2) {
                 float a, b;
                 tf_q4_k_dot2_sve(&a, &b,
@@ -3742,7 +3812,18 @@ static void tf_qmatvec(float *dst, const qtensor *mat, const float *x, int n_row
         size_t row_bytes = (size_t)(n_cols / 256) * sizeof(block_q4_K);
         const block_q4_K *base = (const block_q4_K *)mat->data;
         int i = 0;
-        if (tf_kq_pair_enabled()) {
+        if (tf_kq_rows_mode() == 4) {
+            for (; i + 3 < n_rows; i += 4) {
+                float a, b, c, d;
+                tf_q4_k_dot4_sve(&a, &b, &c, &d,
+                    (const block_q4_K *)((const uint8_t *)base + (size_t)i * row_bytes),
+                    (const block_q4_K *)((const uint8_t *)base + (size_t)(i + 1) * row_bytes),
+                    (const block_q4_K *)((const uint8_t *)base + (size_t)(i + 2) * row_bytes),
+                    (const block_q4_K *)((const uint8_t *)base + (size_t)(i + 3) * row_bytes), x, n_cols);
+                dst[i] = a; dst[i + 1] = b; dst[i + 2] = c; dst[i + 3] = d;
+            }
+        }
+        if (tf_kq_rows_mode() == 2) {
             for (; i + 1 < n_rows; i += 2) {
                 float a, b;
                 tf_q4_k_dot2_sve(&a, &b,
