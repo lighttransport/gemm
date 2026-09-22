@@ -1656,6 +1656,34 @@ scale 4 also passes: prediction cosines `0.9999998485751089` and
 `0.9999994896000577`, with trajectory cosines `0.9999985850203311` and
 `0.9999975521106901`.
 
+The full single-image native path is covered by
+`native_edit_e2e_regression.py`.  Generate the PyTorch trajectory with an
+explicit pre-final-RMSNorm prompt fixture, then run the native image loader,
+BF16 VAE encoder, vision encoder, multimodal text encoder, denoiser, and VAE
+decoder in one regression:
+
+```sh
+tmp/qimg21-ref-venv/bin/python cuda/qimg21/reference.py \
+  --model /mnt/nvme01/models/qimg-21 --image input.png \
+  --prompt 'change the apple color to green' \
+  --prompt-fixture-dir TEXT_CAPTURE --height 256 --width 256 --steps 2 \
+  --seed 42 --sdpa-backend efficient --dump-initial-latents \
+  --dump-pred-dir REFERENCE --dump-dir REFERENCE
+
+tmp/qimg21-ref-venv/bin/python cuda/qimg21/native_edit_e2e_regression.py \
+  --model /mnt/nvme01/models/qimg-21 --image input.png \
+  --reference-dir REFERENCE --text-reference-dir TEXT_CAPTURE \
+  --work-dir NATIVE_WORK
+```
+
+The RTX 5060 Ti acceptance run was exact at the condition-latent,
+multimodal-prompt, and initial-noise boundaries.  Two-step trajectory cosines
+were **0.9999986390 / 0.9999981952**, and native decoded RGBA cosine was
+**0.9999974887**.  Every boundary clears the `0.99996` non-quantized gate.
+The explicit prompt fixture avoids Transformers 5 output-capturing aliasing:
+the fixture itself is independently captured from the input of the final text
+RMSNorm, which is the conditioning boundary consumed by Qwen-Image 2.1.
+
 The deterministic text-to-image matrix also passes all matched predictions
 and free-running checkpoints:
 

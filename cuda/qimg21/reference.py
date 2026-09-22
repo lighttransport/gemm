@@ -40,6 +40,9 @@ def main() -> int:
     ap.add_argument("--dump-dir", required=True)
     ap.add_argument("--capture-block-dir", help="diagnostic block-0 tensors from the first denoiser call")
     ap.add_argument("--dump-vae-dir", help="save the condition VAE input and posterior moments")
+    ap.add_argument("--dump-text-inputs-dir", help="save token IDs and masks passed to the text encoder")
+    ap.add_argument("--prompt-fixture-dir", type=Path,
+                    help="use captured pre-final-RMSNorm prompt embeddings and image-pad mask")
     args = ap.parse_args()
 
     import torch
@@ -55,6 +58,44 @@ def main() -> int:
         str(Path(args.model).resolve()), dtype=dtype, local_files_only=True
     )
     pipe.enable_sequential_cpu_offload(device="cuda")
+    if args.prompt_fixture_dir:
+        fixture = args.prompt_fixture_dir
+        prompt_array = np.load(fixture / "prompt_embeds.npy", allow_pickle=False)
+        prompt_mask_array = np.load(fixture / "prompt_mask.npy", allow_pickle=False)
+        image_mask_array = np.load(fixture / "image_pad_mask.npy", allow_pickle=False)
+        if (prompt_array.ndim != 3 or prompt_array.shape[0] != 1 or
+                prompt_mask_array.shape != prompt_array.shape[:2] or
+                image_mask_array.shape != prompt_array.shape[:2]):
+            raise ValueError("invalid prompt fixture shapes")
+        if not np.isfinite(prompt_array).all() or not np.all(prompt_mask_array):
+            raise ValueError("invalid prompt fixture values")
+
+        def fixture_encode_prompt(*_args, device=None, num_images_per_prompt=1, **_kwargs):
+            target = device or pipe._execution_device
+            embeddings = torch.from_numpy(prompt_array).to(device=target, dtype=dtype)
+            prompt_mask = torch.from_numpy(prompt_mask_array).to(device=target, dtype=torch.bool)
+            image_mask = torch.from_numpy(image_mask_array).to(device=target, dtype=torch.bool)
+            if num_images_per_prompt != 1:
+                embeddings = embeddings.repeat_interleave(num_images_per_prompt, dim=0)
+                prompt_mask = prompt_mask.repeat_interleave(num_images_per_prompt, dim=0)
+                image_mask = image_mask.repeat_interleave(num_images_per_prompt, dim=0)
+            return embeddings, None if prompt_mask.all() else prompt_mask, image_mask
+
+        pipe.encode_prompt = fixture_encode_prompt
+    text_input_handles = []
+    if args.dump_text_inputs_dir:
+        text_inputs_dir = Path(args.dump_text_inputs_dir)
+        text_inputs_dir.mkdir(parents=True, exist_ok=False)
+
+        def dump_text_inputs(_module, inputs, kwargs):
+            for name in ("input_ids", "attention_mask", "pixel_values", "image_grid_thw"):
+                value = kwargs.get(name)
+                if value is not None:
+                    np.save(text_inputs_dir / f"{name}.npy", value.detach().cpu().numpy())
+
+        text_input_handles.append(
+            pipe.text_encoder.register_forward_pre_hook(dump_text_inputs, with_kwargs=True)
+        )
     vae_handles = []
     if args.dump_vae_dir:
         vae_dir = Path(args.dump_vae_dir)
@@ -279,6 +320,8 @@ def main() -> int:
         )
     for handle in vae_handles:
         handle.remove()
+    for handle in text_input_handles:
+        handle.remove()
     torch.cuda.synchronize()
     result.images[0].save(out / "reference.png")
     np.save(out / "reference_rgba.npy", np.asarray(result.images[0].convert("RGBA")))
@@ -295,6 +338,7 @@ def main() -> int:
         "elapsed_seconds": time.perf_counter() - t0,
         "torch": torch.__version__,
         "sdpa_backend": args.sdpa_backend,
+        "prompt_fixture_dir": str(args.prompt_fixture_dir.resolve()) if args.prompt_fixture_dir else None,
     }, indent=2) + "\n")
     print(f"saved {out / 'reference.png'}")
     return 0
