@@ -1237,6 +1237,24 @@ cuda/qimg21/test_cuda_qimg21_text \
 diff -u tmp/qimg21-token-ref/tokens.txt tmp/qimg21-native-tokens.txt
 ```
 
+The native Qwen3-VL vision front end is available as
+`test_cuda_qimg21_vision`. It consumes the processor's flattened F32 patch
+matrix, performs the BF16 3D patch projection with a custom CUDA epilogue,
+and interpolates the learned 48x48 position table in native code. Against a
+16x16-patch official capture, patch-projection cosine is 0.9999999952 and the
+first-block input cosine is 0.9999980129, both above the 0.99996 gate. The
+27 vision blocks and merger are not wired into the generation driver yet.
+
+```sh
+make -C cuda/qimg21 test_cuda_qimg21_vision
+cuda/qimg21/test_cuda_qimg21_vision \
+  --model /mnt/nvme01/models/qimg-21 \
+  --pixel-values tmp/qimg21-vision-boundaries2/text_positive/pixel_values.npy \
+  --grid-height 16 --grid-width 16 \
+  --patch-out tmp/qimg21-native-vision-patch.npy \
+  --out tmp/qimg21-native-vision-block-input.npy
+```
+
 The work directory contains `prompt/prompt_embeds.npy`, the deterministic
 initial `latents.npy`, one `steps/step_XXX.npy` file per Euler update, and the
 final `native_latents.npy`. These arrays are the hand-off points for comparing

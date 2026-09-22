@@ -25,6 +25,7 @@ def capture_text_encoder(pipe, folder: Path, stage_layer: int = 0):
     folder.mkdir(parents=True, exist_ok=True)
     encoder = pipe.text_encoder
     model = getattr(encoder.model, "language_model", encoder.model)
+    visual = getattr(encoder.model, "visual", None)
     layers = tuple(getattr(model, "layers", ()))
     if not 0 <= stage_layer < len(layers):
         raise ValueError(f"stage_layer must be in [0, {len(layers)})")
@@ -51,6 +52,23 @@ def capture_text_encoder(pipe, folder: Path, stage_layer: int = 0):
     try:
         handles.append(encoder.register_forward_pre_hook(inputs_hook, with_kwargs=True))
         handles.append(model.norm.register_forward_pre_hook(norm_hook))
+        if visual is not None:
+            def save_visual(name):
+                def hook(module, args, output):
+                    value = output[0] if isinstance(output, tuple) else output
+                    if hasattr(value, "detach"):
+                        _save(folder / f"vision_{name}.npy", value)
+                return hook
+            handles.append(visual.patch_embed.register_forward_hook(save_visual("patch_embed")))
+            for index, block in enumerate(visual.blocks):
+                if index == 0:
+                    def vision_input_hook(module, args):
+                        _save(folder / "vision_block_input.npy", args[0])
+                    handles.append(block.register_forward_pre_hook(vision_input_hook))
+                handles.append(block.register_forward_hook(save_visual(f"block_{index:02d}")))
+            handles.append(visual.merger.register_forward_hook(save_visual("merger")))
+            for index, merger in enumerate(visual.deepstack_merger_list):
+                handles.append(merger.register_forward_hook(save_visual(f"deepstack_{index}")))
         for index, layer in enumerate(layers):
             def layer_hook(module, args, output, index=index):
                 value = output[0] if isinstance(output, tuple) else output
