@@ -226,6 +226,10 @@ Qwen CUDA, and PyTorch reference processes never compete for the same GPU.
 The default retained-job limit is four; increase `--retained-jobs` when a
 larger batch or multiple concurrent batches must be admitted.
 
+The reusable stdlib client is `server/pixal3d/batch_client.py`; start it with
+`python server/pixal3d/batch_client.py server/pixal3d/batch_example.json`.
+Replace the two base64 placeholders in that example before submitting.
+
 ## Deployment
 
 The built-in server is intended for a trusted workstation or an application
@@ -233,7 +237,10 @@ behind an authenticated reverse proxy. It binds to loopback by default. When
 exposing it through a proxy, keep the 256 MiB request limit, allow multi-hour
 upstream timeouts, disable proxy response buffering for job polling, and add
 TLS and authentication at the proxy. Do not expose an unauthenticated
-`--bind 0.0.0.0` endpoint.
+`--bind 0.0.0.0` endpoint. For direct controlled exposure, set
+`--api-token SECRET` (or `PIXAL3D_API_TOKEN`) and optionally
+`--api-rate-limit 2 --api-rate-burst 8`. The token protects `/health` and all
+`/v1` routes; the rate limiter applies to mutating API calls and returns 429.
 
 CUDA inference is serialized across processes with Linux `flock` files under
 `tmp/pixal3d/device-locks` by default. Select a shared local directory with

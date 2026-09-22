@@ -1,0 +1,6 @@
+{
+  "jobs": [
+    {"kind": "qwen-image", "request": {"prompt": "a studio product photograph of a red ceramic vase", "mode": "cuda", "width": 256, "height": 256, "steps": 2, "seed": 42}},
+    {"kind": "pixal3d", "request": {"backend": "cuda", "image_b64": "REPLACE_WITH_BASE64_PNG", "mask_b64": "REPLACE_WITH_BASE64_MASK_PNG", "seed": 42}}
+  ]
+}

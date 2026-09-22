@@ -15,6 +15,7 @@ encoding; end-to-end editing parity is still experimental.
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 import time
@@ -228,7 +229,7 @@ def main() -> int:
     latent_path = work / "latents.npy"
     _run(
         [
-            sys.executable,
+            os.environ.get("QIMG21_PYTHON", sys.executable),
             str(root / "cuda/qimg21/make_native_fixture.py"),
             "--prompt-embeds",
             str(prompt_path),

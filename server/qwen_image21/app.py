@@ -33,7 +33,9 @@ class Demo:
                  native: Path, host: str, port: int):
         self.model = model.resolve()
         self.quant = quant.resolve()
-        self.python = python.resolve()
+        # Preserve a venv/uv launcher symlink; Path.resolve() would collapse it
+        # to the host interpreter and lose the environment's Torch packages.
+        self.python = python.absolute()
         self.work = work.resolve()
         self.native = native.resolve()
         self.host, self.port = host, port
@@ -62,10 +64,11 @@ class Demo:
                 "width": width, "height": height, "steps": steps, "seed": seed,
                 "quantized": quantized}
 
-    def _run(self, command: list[str], cwd: Path, log: Path) -> None:
+    def _run(self, command: list[str], cwd: Path, log: Path,
+             env: dict[str, str] | None = None) -> None:
         with log.open("w", encoding="utf-8") as stream:
             result = subprocess.run(command, cwd=cwd, stdout=stream, stderr=subprocess.STDOUT,
-                                    timeout=3600, check=False)
+                                    timeout=3600, check=False, env=env)
         if result.returncode:
             tail = log.read_text(encoding="utf-8", errors="replace")[-4000:]
             raise RuntimeError(f"inference exited with {result.returncode}: {tail}")
@@ -86,7 +89,12 @@ class Demo:
                 raise RuntimeError(f"quantized package is unavailable: {self.quant}")
             command += ["--quantized-transformer", str(self.quant), "--int8-tensor-core",
                         "--int8-bf16-tail-blocks", "16"]
-        self._run(command, ROOT, out / "cuda.log")
+        # uv-managed reference environments can expose the host interpreter as
+        # sys.executable from a child process; carry the selected interpreter
+        # explicitly to the fixture helper so it retains Torch/CUDA imports.
+        env = os.environ.copy()
+        env["QIMG21_PYTHON"] = str(self.python)
+        self._run(command, ROOT, out / "cuda.log", env=env)
         return image
 
     def _reference(self, cfg: dict, out: Path) -> Path:
@@ -106,7 +114,7 @@ class Demo:
         mime = mimetypes.guess_type(path.name)[0] or "image/png"
         return f"data:{mime};base64," + base64.b64encode(path.read_bytes()).decode("ascii")
 
-    def generate(self, request: dict) -> dict:
+    def generate(self, request: dict, progress=None) -> dict:
         cfg = self._validate(request)
         job = self.work / uuid.uuid4().hex
         job.mkdir(parents=True, exist_ok=False)
@@ -114,9 +122,15 @@ class Demo:
         results: dict = {"request": cfg, "job": job.name}
         with self.lock:
             if cfg["mode"] in {"cuda", "compare"}:
-                path = self._cuda(cfg, job); results["cuda"] = {"image": self._data_url(path)}
+                if progress: progress("Qwen CUDA native", 12)
+                path = self._cuda(cfg, job)
+                if progress: progress("Qwen CUDA native complete", 72 if cfg["mode"] == "compare" else 96)
+                results["cuda"] = {"image": self._data_url(path)}
             if cfg["mode"] in {"reference", "compare"}:
-                path = self._reference(cfg, job); results["reference"] = {"image": self._data_url(path)}
+                if progress: progress("Qwen PyTorch reference", 78)
+                path = self._reference(cfg, job)
+                if progress: progress("Qwen PyTorch reference complete", 96)
+                results["reference"] = {"image": self._data_url(path)}
         results["elapsed_ms"] = round((time.monotonic() - started) * 1000)
         return results
 

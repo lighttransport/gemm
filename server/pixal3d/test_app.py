@@ -33,7 +33,8 @@ class PixalServerTest(unittest.TestCase):
             def __init__(self, work_dir): self.work_dir = Path(work_dir)
             def infer(self, request, cancel=None, progress=None):
                 return {"ok": True, "glb_b64": base64.b64encode(b"glTF").decode()}
-            def qwen_generate(self, request, cancel=None):
+            def qwen_generate(self, request, cancel=None, progress=None):
+                if progress: progress("Qwen test", 50)
                 return {"ok": True, "cuda": {"image": "data:image/png;base64,AA=="}}
         with tempfile.TemporaryDirectory(prefix="batch-", dir=scratch) as td:
             jobs = app.JobQueue(FakePixal(td), retained=4, min_free_disk_mib=0)
@@ -52,6 +53,13 @@ class PixalServerTest(unittest.TestCase):
                 self.assertTrue(status["jobs"][0]["result"]["cuda"]["image"].startswith("data:"))
             finally:
                 jobs.shutdown()
+            recovered = app.JobQueue(FakePixal(td), retained=4, min_free_disk_mib=0)
+            try:
+                restored = recovered.batch_status(batch["batch_id"])
+                self.assertEqual(restored["state"], "complete")
+                self.assertEqual(restored["completed"], 2)
+            finally:
+                recovered.shutdown()
 
     def test_multiview_manifest_and_command(self):
         scratch = app.ROOT / "tmp/pixal3d/tests"

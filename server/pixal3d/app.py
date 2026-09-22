@@ -21,6 +21,7 @@ import queue
 import re
 import shutil
 import signal
+import secrets
 import struct
 import subprocess
 import sys
@@ -66,6 +67,25 @@ class StorageFull(Exception):
 
 class ServerShuttingDown(Exception):
     pass
+
+
+class ApiRateLimiter:
+    def __init__(self, rate: float, burst: int):
+        self.rate, self.burst, self.lock = rate, burst, threading.Lock()
+        self.buckets: dict[str, tuple[float, float]] = {}
+
+    def allow(self, key: str) -> bool:
+        if self.rate <= 0:
+            return True
+        now = time.monotonic()
+        with self.lock:
+            tokens, updated = self.buckets.get(key, (float(self.burst), now))
+            tokens = min(float(self.burst), tokens + (now - updated) * self.rate)
+            if tokens < 1:
+                self.buckets[key] = (tokens, now)
+                return False
+            self.buckets[key] = (tokens - 1, now)
+            return True
 
 
 def error_payload(code: str, message: str) -> dict:
@@ -561,11 +581,11 @@ class PixalServer:
                            "glb_bytes": MAX_GLB_BYTES, "views": 16}, "backends": out}
 
     def qwen_generate(self, request: dict,
-                      cancel: threading.Event | None = None) -> dict:
+                      cancel: threading.Event | None = None, progress=None) -> dict:
         """Run Qwen Image through the shared CUDA device lock."""
         device = bounded_integer(request.get("device", 0), "device", 0, 255)
         with self.execution_lock("cuda", device, self.args.timeout, cancel):
-            return self.qwen_image.generate(request)
+            return self.qwen_image.generate(request, progress)
 
     def infer(self, request: dict, cancel: threading.Event | None = None, progress=None) -> dict:
         backend = request.get("backend", self.args.backend)
@@ -613,9 +633,11 @@ class PixalServer:
             artifact_dir = retained_artifact_dir(request)
             if artifact_dir is not None:
                 artifact_dir.mkdir(parents=True, exist_ok=True)
-            output_path = ((artifact_dir / ".native.glb.partial") if artifact_dir
+            # Keep the native file extension visible to the runner; its CLI
+            # rejects names ending in `.partial` before writing the artifact.
+            output_path = ((artifact_dir / ".native.partial.glb") if artifact_dir
                            else run_dir / "output.glb")
-            ply_path = ((artifact_dir / ".native.ply.partial") if artifact_dir
+            ply_path = ((artifact_dir / ".native.partial.ply") if artifact_dir
                         else run_dir / "output.ply")
             preparation = None
             mask_path = None
@@ -949,8 +971,11 @@ class JobQueue:
         self.log_lock = threading.Lock()
         work_dir = getattr(pixal, "work_dir", None)
         self.result_root = Path(work_dir) / "results" if work_dir is not None else None
+        self.batch_root = None
         if self.result_root is not None:
             self.result_root.mkdir(parents=True, exist_ok=True)
+            self.batch_root = self.result_root / "batch-manifests"
+            self.batch_root.mkdir(parents=True, exist_ok=True)
             self._recover()
         self.worker = threading.Thread(
             target=self._worker, daemon=True, name="pixal3d-jobs")
@@ -984,10 +1009,34 @@ class JobQueue:
         finally:
             temporary.unlink(missing_ok=True)
 
+    def _persist_batch_locked(self, batch_id: str) -> None:
+        if self.batch_root is None or batch_id not in self.batches:
+            return
+        path = self.batch_root / f"{batch_id}.json"
+        temporary = self.batch_root / f".{batch_id}.{uuid.uuid4().hex}.tmp"
+        payload = {"version": 1, "batch_id": batch_id,
+                   "job_ids": self.batches[batch_id], "updated_at": time.time()}
+        try:
+            with temporary.open("x") as handle:
+                json.dump(payload, handle, separators=(",", ":")); handle.write("\n")
+                handle.flush(); os.fsync(handle.fileno())
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
     @staticmethod
     def _artifact_paths(directory: Path, result: dict) -> dict[str, Path]:
         stored = {}
-        expected = [(result, "glb", "native.glb", True),
+        # Qwen jobs retain inline image data and intentionally have no GLB;
+        # Pixal jobs identify themselves with a backend or native artifact.
+        qwen_result = (("request" in result and "job" in result) or
+                       "cuda" in result or "reference" in result)
+        native_artifacts = (not qwen_result and
+                            ("backend" in result or "glb_b64" in result or
+                             (isinstance(result.get("artifacts"), dict) and bool(result["artifacts"]))))
+        if not qwen_result and not native_artifacts:
+            raise ValueError("recovered result has no native artifact")
+        expected = [(result, "glb", "native.glb", native_artifacts),
                     (result, "ply", "native.ply", False)]
         if isinstance(result.get("reference"), dict):
             expected.append((result["reference"], "glb", "reference.glb", True))
@@ -1014,6 +1063,8 @@ class JobQueue:
         now = time.time()
         recovered = []
         for directory in self.result_root.iterdir():
+            if self.batch_root is not None and directory == self.batch_root:
+                continue
             if (not directory.is_dir() or
                     re.fullmatch(r"[0-9a-f]{32}", directory.name) is None):
                 if directory.is_dir():
@@ -1062,6 +1113,18 @@ class JobQueue:
                 self._persist_locked(job)
         for job in recovered[self.retained:]:
             shutil.rmtree(job["_artifact_dir"], ignore_errors=True)
+        if self.batch_root is not None:
+            for path in self.batch_root.glob("*.json"):
+                try:
+                    payload = json.loads(path.read_text())
+                    batch_id = payload["batch_id"]
+                    ids = [job_id for job_id in payload["job_ids"] if job_id in self.jobs]
+                    if not re.fullmatch(r"[0-9a-f]{32}", batch_id) or not ids:
+                        raise ValueError("invalid batch manifest")
+                    self.batches[batch_id] = ids
+                    self._persist_batch_locked(batch_id)
+                except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError):
+                    path.unlink(missing_ok=True)
 
     def _remove_artifacts_locked(self, job: dict) -> None:
         directory = job.get("_artifact_dir")
@@ -1170,6 +1233,14 @@ class JobQueue:
                     job.get("updated_at", job["created_at"]) < cutoff):
                 self._remove_artifacts_locked(job)
                 self.jobs.pop(job_id, None)
+                for batch_id, ids in list(self.batches.items()):
+                    if job_id in ids:
+                        ids.remove(job_id)
+                        if ids: self._persist_batch_locked(batch_id)
+                        else:
+                            self.batches.pop(batch_id, None)
+                            if self.batch_root is not None:
+                                (self.batch_root / f"{batch_id}.json").unlink(missing_ok=True)
 
     def submit(self, request: dict, *, kind: str = "pixal3d",
                batch_id: str | None = None) -> dict:
@@ -1243,6 +1314,7 @@ class JobQueue:
             raise
         with self.lock:
             self.batches[batch_id] = submitted
+            self._persist_batch_locked(batch_id)
         return {"batch_id": batch_id, "jobs": [self.status(job_id) for job_id in submitted]}
 
     def batch_status(self, batch_id: str, include_results: bool = False) -> dict:
@@ -1403,7 +1475,10 @@ class JobQueue:
                 if kind == "qwen-image":
                     self._update(job_id, phase="Qwen Image 2.1", progress=10)
                     self._append_log(job_id, "starting Qwen Image 2.1")
-                    result = self.pixal.qwen_generate(request, cancel)
+                    def qwen_report(phase, percent):
+                        self._append_log(job_id, phase)
+                        self._update(job_id, phase=phase, progress=percent)
+                    result = self.pixal.qwen_generate(request, cancel, qwen_report)
                 else:
                     result = self.pixal.infer(request, cancel, report)
                 with self.lock:
@@ -1455,7 +1530,7 @@ class JobQueue:
                 artifact_dir = retained_artifact_dir(request) if request is not None else None
                 if artifact_dir is not None:
                     shutil.rmtree(artifact_dir / ".reference-inputs", ignore_errors=True)
-                    for partial in artifact_dir.glob(".*.partial"):
+                    for partial in artifact_dir.glob(".*.partial*"):
                         partial.unlink(missing_ok=True)
                 self.pending.task_done()
 
@@ -1482,13 +1557,33 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         with path.open("rb") as handle:
             shutil.copyfileobj(handle, self.wfile, length=1024 * 1024)
+    def _api_guard(self, mutating=False) -> bool:
+        path = urlparse(self.path).path
+        if not (path == "/health" or path.startswith("/v1/")):
+            return True
+        token = getattr(self.server, "api_token", "")
+        supplied = self.headers.get("Authorization", "")
+        if token and (not supplied.startswith("Bearer ") or
+                      not secrets.compare_digest(supplied[7:], token)):
+            self.send_response(401); self.send_header("WWW-Authenticate", "Bearer")
+            self.send_header("Content-Type", "application/json"); self.end_headers()
+            self.wfile.write(json.dumps(error_payload("unauthorized", "valid bearer token required")).encode())
+            return False
+        limiter = getattr(self.server, "rate_limiter", None)
+        if mutating and limiter is not None and not limiter.allow(self.client_address[0]):
+            self.send_response(429); self.send_header("Retry-After", "1")
+            self.send_header("Content-Type", "application/json"); self.end_headers()
+            self.wfile.write(json.dumps(error_payload("rate_limited", "request rate limit exceeded")).encode())
+            return False
+        return True
     def do_OPTIONS(self):
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
         self.end_headers()
     def do_GET(self):
+        if not self._api_guard(): return
         path = urlparse(self.path).path
         if path == "/health":
             health = self.server.pixal.health()
@@ -1523,6 +1618,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.json_response(404, error_payload("not_found", "not found"))
     def do_POST(self):
+        if not self._api_guard(mutating=True): return
         path = urlparse(self.path).path
         if path == "/v1/batches":
             try:
@@ -1599,6 +1695,7 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, json.JSONDecodeError) as exc: self.json_response(400, error_payload("invalid_request", str(exc)))
         except Exception as exc: self.json_response(500, error_payload("internal_error", str(exc)))
     def do_DELETE(self):
+        if not self._api_guard(mutating=True): return
         path = urlparse(self.path).path
         if path.startswith("/v1/batches/"):
             try:
@@ -1646,7 +1743,16 @@ def main() -> None:
     p.add_argument("--min-free-disk-mib", type=int, default=1024)
     p.add_argument("--job-log-bytes", type=int, default=65536)
     p.add_argument("--shutdown-timeout", type=float, default=30)
-    args = p.parse_args(); srv = ThreadingHTTPServer((args.bind, args.port), Handler); srv.daemon_threads = True; srv.pixal = PixalServer(args)
+    p.add_argument("--api-token", default=os.environ.get("PIXAL3D_API_TOKEN", ""),
+                   help="Bearer token required for /health and /v1 (or PIXAL3D_API_TOKEN)")
+    p.add_argument("--api-rate-limit", type=float, default=0.0,
+                   help="mutating API requests per second per client; 0 disables")
+    p.add_argument("--api-rate-burst", type=int, default=8)
+    args = p.parse_args(); srv = ThreadingHTTPServer((args.bind, args.port), Handler); srv.daemon_threads = True; srv.api_token = args.api_token
+    if args.api_rate_limit < 0 or args.api_rate_burst < 1:
+        p.error("api rate limit must be >= 0 and burst must be >= 1")
+    srv.rate_limiter = ApiRateLimiter(args.api_rate_limit, args.api_rate_burst)
+    srv.pixal = PixalServer(args)
     srv.uploads = UploadStore(srv.pixal.work_dir / "uploads",
                               bounded_integer(args.retained_uploads, "retained_uploads", 1, 256),
                               finite_number(args.upload_ttl, "upload_ttl", 1, 604800))
