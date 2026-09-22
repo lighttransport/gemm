@@ -1538,6 +1538,10 @@ retain the scalar I/O fallback.
    K=4 gap is draft-side work. The existing `fast` target profile also
    segfaulted during graph setup with the GSQ IQ2 model and remains an
    unsupported diagnostic combination pending isolation.
+   The resident K=4 HTTP/stdio run also passed context-cache restore,
+   cancellation/concurrency, greedy and sampled repeatability, and both
+   multi-turn and algorithmic C++ compile/run quality checks; its 121-token
+   window measured 59.58 tok/s end-to-end with 93/108 accepted.
 
 Each optimization should retain the exact sequence hash and response bytes at
 K=4 and K=7, compile the emitted program, and cover non-coding prompts plus

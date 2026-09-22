@@ -1486,6 +1486,10 @@ shortfall is draft cost rather than verifier correctness.  A separate opt-in
 `fast` target profile run with the GSQ IQ2 model terminated in a segmentation
 fault during graph setup; it is not promoted and is now treated as an
 unsupported diagnostic combination until the failing setup path is isolated.
+The K=4 resident HTTP/stdio run then passed context-cache restore, greedy and
+sampled repeatability, cancellation/concurrency, and both multi-turn and
+algorithmic C++ compile/run quality checks; its 121-token window measured
+59.58 tok/s end-to-end (93/108 accepted).
 
 2026-09-22 continuation: the one-row IQ2/IQ3/IQ4 kernels now declare their
 output, weight, activation, and scale buffers non-aliasing.  This preserves
