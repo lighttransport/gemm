@@ -1573,10 +1573,13 @@ composition and F32 normalization exactly; `--pixels-out` dumps this boundary,
 and all 6,291,456 values match the official 1024x1024 capture bit-for-bit.
 The cuDNN patch plan and long-shape cuBLASLt dispatch now make the patch and
 all 27 recurrent vision blocks bit-exact; the merger and deep-stack outputs
-remain above 0.99999999 cosine. The remaining full-resolution conditioning
-blocker is the 1058-token text path: separately compiled FlashAttention differs
-sparsely from PyTorch's identical kernel specialization, and recurrence can
-amplify that difference below the 0.99996 final prompt-embedding gate.
+remain above 0.99999999 cosine. The 1058-token text path uses the literal
+contiguous ATen F32 mean-reduction topology for both wide RMSNorm boundaries:
+16 independent warps per CTA, four vector-lane accumulators, and one output
+row per warp. With the standard CUDA 13.1 FlashAttention plugin, the resulting
+full-resolution cropped prompt embedding is bit-identical to the pinned
+PyTorch capture (cosine 1.0, zero relative L2 and MAE). The 29-token positive
+and 23-token negative branches also remain bit-identical.
 
 ### Exact BF16 editing parity
 

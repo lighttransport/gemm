@@ -49,17 +49,20 @@ static int text_linear(cuda_qimg_runner *r, qimg21_kernels *k,
 }
 
 static int text_norm(cuda_qimg_runner *r, CUfunction fn, const qimg21_shards *s,
-                     const char *name, CUdeviceptr out, CUdeviceptr in, int rows, int d) {
+                     const char *name, CUdeviceptr out, CUdeviceptr in, int rows, int d,
+                     int aten_reduce) {
     int idx;
     st_context *st = find_tensor(s, name, &idx);
     if (!st || strcmp(safetensors_dtype(st, idx), "BF16") ||
         safetensors_nbytes(st, idx) != (size_t)d * 2) return -1;
     CUdeviceptr w = upload_f32(s, name);
     if (!w) return -1;
-    void *a[] = {&out, &in, &w, &d};
+    void *a[] = {&out, &in, &w, &d, &rows};
     int threads = d == 128 ? 32 : 256;
     int rc = cuCtxSynchronize();
-    if (!rc) rc = cuLaunchKernel(fn, rows, 1, 1, threads, 1, 1, 0, r->stream, a, NULL);
+    if (!rc) rc = aten_reduce
+        ? cuLaunchKernel(fn, (rows + 15) / 16, 1, 1, 32, 16, 1, 0, r->stream, a, NULL)
+        : cuLaunchKernel(fn, rows, 1, 1, threads, 1, 1, 0, r->stream, a, NULL);
     if (!rc) rc = cuStreamSynchronize(r->stream);
     free_d(&w);
     return rc;
@@ -240,11 +243,12 @@ int main(int argc, char **argv) {
         fprintf(stderr, "text: %s causal GQA attention enabled\n", attention_mode);
     }
     qimg21_kernels base;
-    CUfunction rms, rms128, rms2, rms4, rms8, rms16, rope_lookup;
+    CUfunction rms, rms_aten, rms128, rms2, rms4, rms8, rms16, rope_lookup;
     CUfunction add, add_visual, attention, mul_silu;
     if (cu_compile_kernels(&module,r->device,q21_text_src,"qimg21_text.cu",0,"qimg21_text")<0 ||
         cu_compile_kernels(&base_module,r->device,qimg21_src,"qimg21_native.cu",1,"qimg21_native")<0 ||
         get_kernel(&base,base_module) || cuModuleGetFunction(&rms,module,"text_rms") ||
+        cuModuleGetFunction(&rms_aten,module,"text_rms_aten") ||
         cuModuleGetFunction(&rms128,module,"text_rms128") ||
         cuModuleGetFunction(&rms2,module,"text_rms2") ||
         cuModuleGetFunction(&rms4,module,"text_rms4") ||
@@ -322,22 +326,22 @@ int main(int argc, char **argv) {
     #define DUMP(label,ptr,width) do { if(dump_dir && l==dump_layer) { CHECK(cuCtxSynchronize()); qimg21_stage_dir=dump_dir; dump_stage("stage_" label,ptr,(size_t)n*(width),n,width); } } while(0)
     for(int l=start_layer;l<layers;l++) {
         fprintf(stderr,"text: layer %d/%d (%d tokens)\n",l+1,layers,n);
-        /* The official sequential-offload execution dispatches layer 34's
-         * wide reduction through its vector-four CUDA topology. */
+        /* ATen's contiguous F32 mean reduction uses 16 independent warps per
+         * CTA, four vector lanes per accumulator, and one output per warp. */
         CUfunction input_rms = !strcmp(rms_mode,"scalar") ? rms :
             !strcmp(rms_mode,"vector2") ? rms2 : !strcmp(rms_mode,"vector4") ? rms4 :
             !strcmp(rms_mode,"vector8") ? rms8 : !strcmp(rms_mode,"vector16") ? rms16 :
-            (l == 20 ? rms8 : (l == 24 || l == 27 || l == 29 || l == 32) ? rms16 :
-             l == 34 ? rms2 : rms);
-        NAME("input_layernorm.weight"); CHECK(text_norm(r,input_rms,&shards,name,norm,x,n,4096));
+            rms_aten;
+        NAME("input_layernorm.weight"); CHECK(text_norm(r,input_rms,&shards,name,norm,x,n,4096,
+                                                         input_rms == rms_aten));
         DUMP("input_layernorm",norm,4096);
         CHECK(launch_cast(r,bf,norm,n*4096));
         LINEAR("self_attn.q_proj.weight",q,4096,4096);
         LINEAR("self_attn.k_proj.weight",key,1024,4096);
         LINEAR("self_attn.v_proj.weight",v,1024,4096);
         DUMP("self_attn.q_proj",q,4096); DUMP("self_attn.k_proj",key,1024); DUMP("self_attn.v_proj",v,1024);
-        NAME("self_attn.q_norm.weight"); CHECK(text_norm(r,rms128,&shards,name,q,q,n*32,128));
-        NAME("self_attn.k_norm.weight"); CHECK(text_norm(r,rms128,&shards,name,key,key,n*8,128));
+        NAME("self_attn.q_norm.weight"); CHECK(text_norm(r,rms128,&shards,name,q,q,n*32,128,0));
+        NAME("self_attn.k_norm.weight"); CHECK(text_norm(r,rms128,&shards,name,key,key,n*8,128,0));
         DUMP("self_attn.q_norm",q,4096); DUMP("self_attn.k_norm",key,1024);
         int heads=32; void *qa[]={&q,&rope_table,&heads};
         CHECK(cuLaunchKernel(rope_lookup,n,32,1,64,1,1,0,r->stream,qa,NULL));
@@ -368,8 +372,9 @@ int main(int argc, char **argv) {
         CUfunction post_rms = !strcmp(post_rms_mode,"vector2") ? rms2 :
             !strcmp(post_rms_mode,"vector4") ? rms4 : !strcmp(post_rms_mode,"vector8") ? rms8 :
             !strcmp(post_rms_mode,"vector16") ? rms16 :
-            (l == 27 ? rms2 : l == 29 ? rms4 : l == 32 ? rms2 : rms);
-        NAME("post_attention_layernorm.weight"); CHECK(text_norm(r,post_rms,&shards,name,norm,x,n,4096));
+            rms_aten;
+        NAME("post_attention_layernorm.weight"); CHECK(text_norm(r,post_rms,&shards,name,norm,x,n,4096,
+                                                                  post_rms == rms_aten));
         DUMP("post_attention_layernorm",norm,4096);
         CHECK(launch_cast(r,bf,norm,n*4096));
         LINEAR("mlp.gate_proj.weight",gate,12288,4096);
