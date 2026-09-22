@@ -1,5 +1,5 @@
-/* Native Qwen3-VL vision front end.  This first-stage validator covers patch
- * projection plus learned-position interpolation before the 27 vision blocks. */
+/* Native Qwen3-VL vision encoder: patch projection, 27 vision blocks,
+ * multimodal merger, and deepstack features on the HIP backend. */
 #define main q21_denoise_main
 #include "test_hip_qimg21_native.c"
 #undef main
@@ -16,8 +16,6 @@ typedef int (*q21_flash_vision_layer_norm_bf16_fn)(float *, const void *, const 
                                                    const void *, int, int, CUstream);
 typedef int (*q21_flash_vision_layer_norm_bf16_stats_fn)(float *, const void *, int, int,
                                                          CUstream);
-typedef int (*q21_cudnn_patch_projection_fn)(void *, const void *, const void *, int,
-                                             CUstream);
 
 static const char *vision_front_src =
 "#ifndef __shfl_down_sync\n#define __shfl_down_sync(mask,val,delta) __shfl_down(val,delta)\n#endif\n"
@@ -115,7 +113,8 @@ static int vision_linear(cuda_qimg_runner *r, CUfunction epilogue,
     snprintf(name, sizeof(name), "%s.weight", base);
     CUdeviceptr weight = upload_bf16_raw(shards, name);
     snprintf(name, sizeof(name), "%s.bias", base);
-    CUdeviceptr bias = upload_bf16_raw(shards, name);
+    /* linear_epilogue reads F32; keep the BF16 checkpoint bias as F32 values. */
+    CUdeviceptr bias = upload_f32(shards, name);
     CUdeviceptr in_bf = checked_cuMemAlloc((size_t)rows * ni * 2);
     int rc = 1;
     if (!weight || !bias || !in_bf || launch_cast(r, in_bf, in, rows * ni) ||
@@ -227,10 +226,10 @@ int main(int argc, char **argv) {
     const char *norm1_override = NULL, *norm2_override = NULL;
     const char *pixels_out = NULL, *patch_out = NULL, *dump_dir = NULL;
     const char *merged_out = NULL, *deepstack_dir = NULL;
-    const char *attention_mode = "flash";
+    const char *attention_mode = "math";
     const char *flash_plugin_path = "cuda/qimg21/libq21_flash_attention.so";
-    const char *patch_projection = "cudnn-engine23";
-    const char *layer_norm_mode = "nvcc-pytorch";
+    const char *patch_projection = "hip-wmma";
+    const char *layer_norm_mode = "nvrtc";
     int h = 0, w = 0, max_blocks = 0, block_index = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--model") && i + 1 < argc) model = argv[++i];
@@ -261,7 +260,7 @@ int main(int argc, char **argv) {
         block_index + max_blocks > 27 ||
         (strcmp(attention_mode, "math") && strcmp(attention_mode, "cutlass") &&
          strcmp(attention_mode, "flash")) ||
-        (strcmp(patch_projection, "cublas") && strcmp(patch_projection, "cudnn-engine23")) ||
+        (strcmp(patch_projection, "cublas") && strcmp(patch_projection, "hip-wmma")) ||
         (strcmp(layer_norm_mode, "nvcc") && strcmp(layer_norm_mode, "nvcc-pytorch") &&
          strcmp(layer_norm_mode, "nvcc-pytorch-bf16") &&
          strcmp(layer_norm_mode, "nvrtc"))) {
@@ -271,7 +270,7 @@ int main(int argc, char **argv) {
                         "[--norm1-override NORM.npy] "
                         "[--norm2-override NORM.npy] "
                         "[--flash-plugin PLUGIN.so] "
-                        "[--pixels-out PATCHES.npy] [--patch-projection cublas|cudnn-engine23] "
+                        "[--pixels-out PATCHES.npy] [--patch-projection hip-wmma] "
                         "--out OUTPUT.npy\n", argv[0]);
         return 2;
     }
@@ -311,8 +310,7 @@ int main(int argc, char **argv) {
     CUfunction residual = NULL, gelu_tanh = NULL, gelu_exact = NULL;
     CUdeviceptr x = 0, bf = 0, projected = 0, weight = 0, bias = 0, pos = 0, vision_rope_d = 0;
     CUdeviceptr norm = 0, norm_bf = 0, qkv = 0, qkv_bf = 0, att = 0, tmp = 0, mlp = 0;
-    void *cutlass_plugin = NULL, *cudnn_plugin = NULL;
-    q21_cudnn_patch_projection_fn cudnn_patch_projection = NULL;
+    void *cutlass_plugin = NULL;
     q21_cutlass_vision_attention_fn cutlass_attention = NULL;
     q21_flash_vision_attention_fn flash_attention = NULL;
     q21_flash_vision_layer_norm_fn flash_layer_norm = NULL;
@@ -343,16 +341,6 @@ int main(int argc, char **argv) {
         cuModuleGetFunction(&residual, module, "residual") ||
         cuModuleGetFunction(&gelu_tanh, module, "gelu_tanh") ||
         cuModuleGetFunction(&gelu_exact, module, "gelu_exact")) goto done;
-    if (!strcmp(patch_projection, "cudnn-engine23")) {
-        cudnn_plugin = dlopen("cuda/qimg21/libq21_cudnn_patch.so", RTLD_NOW | RTLD_LOCAL);
-        cudnn_patch_projection = cudnn_plugin ? (q21_cudnn_patch_projection_fn)
-            dlsym(cudnn_plugin, "q21_cudnn_patch_projection") : NULL;
-        if (!cudnn_patch_projection) {
-            fprintf(stderr, "vision: cuDNN patch projection plugin unavailable: %s\n",
-                    dlerror());
-            goto done;
-        }
-    }
     if (!strcmp(attention_mode, "cutlass") || !strcmp(attention_mode, "flash")) {
         const char *plugin_path = !strcmp(attention_mode, "flash")
             ? flash_plugin_path
@@ -590,7 +578,6 @@ done:
     free_d(&x); free_d(&bf); free_d(&projected); free_d(&weight); free_d(&bias); free_d(&pos); free_d(&vision_rope_d);
     free_d(&norm); free_d(&norm_bf); free_d(&qkv); free_d(&qkv_bf); free_d(&att); free_d(&tmp); free_d(&mlp);
     if (cutlass_plugin) dlclose(cutlass_plugin);
-    if (cudnn_plugin) dlclose(cudnn_plugin);
     if (module) cuModuleUnload(module);
     if (r) cuda_qimg_free(r);
     for (int i = 0; i < shards.n; i++) safetensors_close(shards.st[i]);

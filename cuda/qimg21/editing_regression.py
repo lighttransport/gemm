@@ -33,7 +33,9 @@ def main():
     ap.add_argument("--model", required=True, type=Path)
     ap.add_argument("--reference-dir", required=True, type=Path)
     ap.add_argument("--work-dir", required=True, type=Path)
-    ap.add_argument("--native-attention", choices=("math", "reverse64", "mma64", "mma64-flash", "mma64-mixed", "mma64-forward-flash", "mma128-efficient", "cutlass-efficient"), default="math")
+    ap.add_argument("--native-binary", type=Path,
+                    help="native runner to validate (default: CUDA runner beside this script)")
+    ap.add_argument("--native-attention", choices=("math", "reverse64", "mma64", "mma64-flash", "mma64-mixed", "mma64-forward-flash", "mma128-efficient", "cutlass-efficient", "wmma", "wmma-fused"), default="math")
     ap.add_argument("--native-normalization", choices=("default", "vector4"), default="default")
     ap.add_argument("--native-rope", choices=("default", "host-table", "host-table-vector4", "host-table-exact"), default="default")
     quant = ap.add_mutually_exclusive_group()
@@ -50,9 +52,11 @@ def main():
     if steps < 2 or [p.name for p in predictions] != [f"pred_{i:03d}.npy" for i in range(steps)]:
         raise ValueError("requires a contiguous capture with at least two steps")
     scale = guidance_scale(ref)
+    binary = (args.native_binary or Path(__file__).with_name("test_cuda_qimg21_native")).resolve()
+    if not binary.is_file():
+        ap.error(f"native binary not found: {binary}")
     work = args.work_dir.resolve()
     work.mkdir(parents=True, exist_ok=False)
-    binary = str(Path(__file__).with_name("test_cuda_qimg21_native").resolve())
     is_quantized = bool(args.quantized_transformer or args.quantize_on_load)
     if args.int8_tensor_core and not args.quantized_transformer:
         ap.error("--int8-tensor-core requires --quantized-transformer")
@@ -60,7 +64,7 @@ def main():
         ap.error("--int8-bf16-tail-blocks must be in [0, 32]")
     mre_threshold = W8A8_MRE_THRESHOLD if args.int8_tensor_core else QUANTIZED_MRE_THRESHOLD
     cosine_threshold = None if is_quantized else NONQUANTIZED_COSINE_THRESHOLD
-    results = {"threshold": cosine_threshold,
+    results = {"threshold": cosine_threshold, "native_binary": str(binary),
                "mre_threshold": mre_threshold if is_quantized else None,
                "int8_tensor_core": args.int8_tensor_core,
                "int8_bf16_tail_blocks": args.int8_bf16_tail_blocks,
@@ -73,7 +77,7 @@ def main():
     first_fixture = None
 
     def command(fixture, metadata):
-        cmd = [binary, "--model", str(args.model.resolve()),
+        cmd = [str(binary), "--model", str(args.model.resolve()),
                 "--attention", args.native_attention, "--normalization", args.native_normalization,
                 "--rope", args.native_rope,
                 "--prompt-embeds", str(fixture / "prompt_embeds.npy"),
