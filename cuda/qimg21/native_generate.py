@@ -119,8 +119,8 @@ def main() -> int:
     if args.native_attention is None:
         args.native_attention = "wmma-fused" if args.backend == "rocm" and not args.image else "math"
     if args.native_attention == "wmma-fused":
-        if args.backend != "rocm" or args.image:
-            ap.error("wmma-fused attention supports ROCm text-to-image only")
+        if args.backend != "rocm":
+            ap.error("wmma-fused attention supports ROCm only")
         if not (Path(__file__).resolve().parents[2] / "rdna4/qimg21/libq21_hip_attention.so").is_file():
             ap.error("wmma-fused attention plugin missing; run `make -C rdna4/qimg21 fused`")
     if args.quantized_transformer and args.quantize_on_load:

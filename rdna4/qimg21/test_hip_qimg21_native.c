@@ -374,7 +374,8 @@ typedef int (*qimg21_cutlass_attention_fn)(float *, const void *, const void *,
                                            const void *, int, int, int, int, void *);
 static qimg21_cutlass_attention_fn qimg21_cutlass_attention;
 typedef int (*qimg21_hip_fused_attention_fn)(float *, const float *, const float *,
-                                              const float *, int, int, int, void *);
+                                              const float *, int, int, int, void *,
+                                              const int *, int, const int *);
 static qimg21_hip_fused_attention_fn qimg21_hip_fused_attention;
 typedef int (*qimg21_cutlass_workspace_release_fn)(void);
 typedef unsigned (*qimg21_cutlass_workspace_allocations_fn)(void);
@@ -463,6 +464,15 @@ static int native_step(cuda_qimg_runner *r, qimg21_kernels *k, const qimg21_shar
     CUdeviceptr wt_norm=0,wt_in=0,wt_out=0,wi=0,w_t1=0,w_t2=0,w_mod=0,w_img=0,w_proj=0;
     int result = -1;
     CUdeviceptr rope_table=0;
+    int *fused_ends=NULL, fused_segments=0;
+    if(qimg21_hip_fused_attention && edit) {
+        fused_ends=malloc((size_t)N*sizeof(int));
+        if(!fused_ends)goto fail;
+        for(int t=0;t<N;t++)if(edit->layout.image_id[t]>=0 &&
+            (t+1==N || edit->layout.image_id[t+1]!=edit->layout.image_id[t]))
+            fused_ends[fused_segments++]=t+1;
+        if(!fused_segments || fused_ends[fused_segments-1]!=N)goto fail;
+    }
     #define A(p,bytes) do { (p)=checked_cuMemAlloc(bytes); if(!(p)) goto fail; } while(0)
     if(k->table_rope) {
         float *table=malloc((size_t)N*128*sizeof(float));if(!table)goto fail;
@@ -607,10 +617,11 @@ static int native_step(cuda_qimg_runner *r, qimg21_kernels *k, const qimg21_shar
             if(error){fprintf(stderr,"native: invalid or failed attention-state replay\n");goto fail_block;}
             fprintf(stderr,"native: DIAGNOSTIC ONLY: injecting attention before output projection\n");
         }
-        else if(qimg21_hip_fused_attention && !edit) {
+        else if(qimg21_hip_fused_attention) {
             if(qimg21_hip_fused_attention((float *)(uintptr_t)att,
                (const float *)(uintptr_t)q,(const float *)(uintptr_t)kk,
-               (const float *)(uintptr_t)v,N,nt,NH,(void *)r->stream) ||
+               (const float *)(uintptr_t)v,N,nt,NH,(void *)r->stream,
+               fused_ends,fused_segments,edit?(const int *)(uintptr_t)edit->image_id:NULL) ||
                cuCtxSynchronize())goto fail_block;
         }
         else if(k->mma_attention || qimg21_cutlass_attention) {
@@ -681,6 +692,7 @@ fail:
     if(result==3)fprintf(stderr,"native: diagnostic block replay complete; no prediction emitted (status 3)\n");
     else fprintf(stderr,"native: transformer step failed\n");
 done:
+    free(fused_ends);
     free_d(&rope_table);
     free_d(&txt);free_d(&img);free_d(&hidden);free_d(&tmp);free_d(&tmp2);free_d(&bf);free_d(&q);free_d(&kk);free_d(&v);free_d(&att);free_d(&mlp0);free_d(&mlp1);free_d(&mod);free_d(&temb);free_d(&time0);free_d(&timebf);free_d(&scale);free_d(&wt_norm);free_d(&wt_in);free_d(&wt_out);free_d(&wi);free_d(&w_t1);free_d(&w_t2);free_d(&w_mod);free_d(&w_img);free_d(&w_proj);
     #undef A
@@ -871,10 +883,6 @@ int main(int argc, char **argv) {
     }
     void *hip_fused_plugin=NULL;
     if(hip_fused_plugin_path) {
-        if(editing_layout_path) {
-            fprintf(stderr,"native: fused HIP attention currently supports text-to-image only\n");
-            cuda_qimg_free(r);return 2;
-        }
         hip_fused_plugin=dlopen(hip_fused_plugin_path,RTLD_NOW|RTLD_LOCAL);
         if(!hip_fused_plugin || !(qimg21_hip_fused_attention=(qimg21_hip_fused_attention_fn)
              dlsym(hip_fused_plugin,"q21_hip_fused_attention"))) {

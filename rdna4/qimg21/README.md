@@ -29,8 +29,9 @@ rdna4/qimg21/test_hip_qimg21_native \
 
 The RDNA4 runner uses WMMA GEMMs by default when the GPU supports them.
 `--attention wmma-fused` adds the shared Pixal3D/TRELLIS gfx12 WMMA attention
-kernel for image queries and a separate causal text-prefix correction. It
-supports text-to-image; editing retains the scalar mask-aware attention path.
+kernel for image queries and a separate causal text-prefix correction. Editing
+is supported experimentally by processing image groups in reverse order and
+correcting interleaved causal text rows; the editing default remains scalar.
 `--attention wmma` and `--attention math` use WMMA GEMMs with scalar attention.
 The runner covers the 32-layer
 denoiser ABI, CFG inputs, editing layout inputs, stage dumps, and FlowMatch
@@ -86,6 +87,15 @@ seed-42 noise, fused denoising, native VAE decode, and PNG output completed in
 The resulting image is a coherent red apple on a white table; it is not
 pixel-comparable to CUDA seed 42 because the initial-noise RNG differs.
 Artifacts are under `tmp/qimg21-rdna4-fused-e2e-1024-40/`.
+
+For editing, pass `--native-attention wmma-fused` explicitly to the standalone
+generator. On a two-step 256x256 target with a 1024-condition image, this took
+16.89 seconds versus 30.47 seconds for scalar ROCm attention. Final latent
+cosine versus a saved CUDA native run was 0.99992565 (scalar ROCm: 0.99990237),
+below the strict 0.99996 gate. A 40-step 256x256 fused edit produced a visually
+similar apple to scalar editing, but final latent cosine between the two was
+0.99680; therefore fused editing is opt-in pending a matched PyTorch parity
+run. It is not part of the validated text-to-image speed claim.
 
 This acceptance run uses the saved reference text embedding, so it verifies
 the ROCm denoiser and VAE, not the full native text-encoder accuracy. Native

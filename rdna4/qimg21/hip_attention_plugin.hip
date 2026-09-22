@@ -1,6 +1,6 @@
-/* Noncausal image-query WMMA attention plus causal text-prefix correction.
- * The image rows of Qwen Image 2.1 attend to all text and image keys; only
- * the text prefix needs the triangular mask. SPDX-License-Identifier: MIT */
+/* Segment-prefix WMMA attention plus causal text-row correction.
+ * Each image group attends to all preceding rows and its entire own group;
+ * interleaved text rows retain their triangular mask. SPDX-License-Identifier: MIT */
 #include <hip/hip_runtime.h>
 #include <cstring>
 
@@ -16,9 +16,10 @@ __device__ float round_bfloat(float x) {
 
 __global__ void q21_causal_text_prefix(float *out, const float *q,
                                        const float *k, const float *v,
-                                       int prefix, int heads) {
+                                       int text_rows, int heads,
+                                       const int *image_ids) {
     int h = blockIdx.x, qi = blockIdx.y, lane = threadIdx.x;
-    if (qi >= prefix || h >= heads) return;
+    if (qi >= text_rows || h >= heads || (image_ids && image_ids[qi] >= 0)) return;
     int stride = heads * 128;
     float qr[4], acc[4] = {0, 0, 0, 0};
     for (int e = 0; e < 4; e++) qr[e] = q[(long)qi * stride + h * 128 + lane + 32 * e];
@@ -45,18 +46,33 @@ __global__ void q21_causal_text_prefix(float *out, const float *q,
 extern "C" int q21_hip_fused_attention(float *out, const float *q,
                                          const float *k, const float *v,
                                          int tokens, int prefix, int heads,
-                                         void *stream_handle) {
+                                         void *stream_handle,
+                                         const int *segment_ends, int segments,
+                                         const int *image_ids) {
     if (!out || !q || !k || !v || tokens < 1 || prefix < 0 || prefix > tokens ||
         heads < 1 || heads > 64) return hipErrorInvalidValue;
+    if (segments < 0 || (segments && (!segment_ends || !image_ids ||
+                                      segment_ends[segments - 1] != tokens)))
+        return hipErrorInvalidValue;
     hipStream_t stream = static_cast<hipStream_t>(stream_handle);
-    px_trellis_attention<<<dim3(heads, (tokens + 63) / 64), 128, 0, stream>>>(
-        out, q, k, v, tokens, heads, 128, nullptr, 0);
-    hipError_t rc = hipGetLastError();
-    if (rc != hipSuccess) return rc;
-    if (prefix) {
-        q21_causal_text_prefix<<<dim3(heads, prefix), 32, 0, stream>>>(
-            out, q, k, v, prefix, heads);
-        rc = hipGetLastError();
+    /* Later image groups are computed first. Recomputing shorter prefixes
+     * then corrects earlier groups without overwriting later output rows. */
+    int previous = tokens + 1;
+    for (int i = segments ? segments - 1 : 0; i >= 0; i--) {
+        int end = segments ? segment_ends[i] : tokens;
+        if (end < 1 || end >= previous) return hipErrorInvalidValue;
+        previous = end;
+        px_trellis_attention<<<dim3(heads, (end + 63) / 64), 128, 0, stream>>>(
+            out, q, k, v, end, heads, 128, nullptr, 0);
+        hipError_t rc = hipGetLastError();
+        if (rc != hipSuccess) return rc;
+        if (!segments) break;
     }
-    return rc;
+    int text_rows = image_ids ? tokens : prefix;
+    if (text_rows) {
+        q21_causal_text_prefix<<<dim3(heads, text_rows), 32, 0, stream>>>(
+            out, q, k, v, text_rows, heads, image_ids);
+        return hipGetLastError();
+    }
+    return hipSuccess;
 }
