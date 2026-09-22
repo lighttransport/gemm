@@ -218,6 +218,22 @@ static DynamicLibrary dynamic_library_open_env(const char *env_name,
     return dynamic_library_open(path);
 }
 
+static DynamicLibrary dynamic_library_open_env_versions(const char *env_name,
+                                                        const char *soname)
+{
+    DynamicLibrary lib = dynamic_library_open_env(env_name, soname);
+    if (lib) return lib;
+    static const char *versions[] = { ".10", ".9", ".7", ".6", ".5" };
+    char versioned[128];
+    for (size_t i = 0; i < sizeof(versions) / sizeof(versions[0]); i++) {
+        int n = snprintf(versioned, sizeof(versioned), "%s%s", soname, versions[i]);
+        if (n < 0 || (size_t)n >= sizeof(versioned)) break;
+        lib = dynamic_library_open_env(env_name, versioned);
+        if (lib) return lib;
+    }
+    return NULL;
+}
+
 static void rocewExit(void)
 {
     if (hip_lib != NULL) {
@@ -249,6 +265,9 @@ static int loadHIP(void)
 #else
     const char* hip_paths[] = {
         "libamdhip64.so",
+        "libamdhip64.so.10",
+        "libamdhip64.so.9",
+        "libamdhip64.so.7",
         "libamdhip64.so.6",
         "libamdhip64.so.5",
         "/opt/rocm/lib/libamdhip64.so",
@@ -263,7 +282,7 @@ static int loadHIP(void)
     };
 #endif
 
-    hip_lib = dynamic_library_open_env("ROCEW_ROCM_LIB", "libamdhip64.so");
+    hip_lib = dynamic_library_open_env_versions("ROCEW_ROCM_LIB", "libamdhip64.so");
     if (hip_lib == NULL) {
         const char *path = getenv("ROCEW_HIP_LIB");
         if (path && *path) hip_lib = dynamic_library_open(path);
@@ -410,6 +429,9 @@ static int loadHIPRTC(void)
 #else
     const char* hiprtc_paths[] = {
         "libhiprtc.so",
+        "libhiprtc.so.10",
+        "libhiprtc.so.9",
+        "libhiprtc.so.7",
         "libhiprtc.so.6",
         "libhiprtc.so.5",
         "/opt/rocm/lib/libhiprtc.so",
@@ -424,7 +446,7 @@ static int loadHIPRTC(void)
     };
 #endif
 
-    hiprtc_lib = dynamic_library_open_env("ROCEW_ROCM_LIB", "libhiprtc.so");
+    hiprtc_lib = dynamic_library_open_env_versions("ROCEW_ROCM_LIB", "libhiprtc.so");
     if (hiprtc_lib == NULL) {
         const char *path = getenv("ROCEW_HIPRTC_LIB");
         if (path && *path) hiprtc_lib = dynamic_library_open(path);
