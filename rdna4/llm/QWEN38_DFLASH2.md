@@ -1,5 +1,58 @@
 # Qwen3.8 DFlash2 on RDNA4
 
+## Cross-engine exact-parity audit (2026-09-22)
+
+**FAIL for exact tokens/bytes on the 16173-token lower-bound coding task.**
+Fresh full-logit traces compare the repaired ordinary runner against pinned
+llama.cpp `1859b520910af6f682256fd7299797774111a27a`, using the same IQ2_XS
+GGUF, Q8 K and Q8 V, context 32768, chunk 512, greedy sampling, seed 42,
+and a 192-token generation limit. All nine reference manifest artifacts
+match their recorded SHA-256. Prompt IDs match exactly. Both engines finish
+normally at EOS: runner selects 129 tokens (128 emitted), reference 155
+(154 emitted). Traced runner output also matches the prior untraced result.
+
+The first 13 generated tokens agree. At zero-based row 13 (token 14):
+
+| Token | Runner logit | llama.cpp logit |
+| --- | ---: | ---: |
+| 198 (one newline) | 23.9562073 | 24.0388412 |
+| 271 (two newlines) | 23.9779339 | 24.0382385 |
+
+Each engine selects its own exact argmax: runner 271, reference 198.
+The reference margin is only 0.0006027; the runner prefers 271 by 0.0217266.
+The first differing output byte is offset 44, where the reference continues
+with `#include <climits>` and the runner starts the function after a blank
+line. This is a numerical rank reversal, not a tokenizer or greedy-sampler
+mismatch. No output normalization was used.
+
+Logits already differ immediately after prefill (before the first decode
+step): max absolute difference 1.84306, relative L2 0.146984. At the first
+token divergence the relative L2 is 0.020516. Across the 14 rows with matching
+preceding input IDs, relative L2 is 0.045261. Later rows are not compared
+numerically because the generated input histories differ. The production
+BF16 prefill is approximate, but this check does not isolate which operation
+causes the discrepancy or exclude additional decode numerical differences.
+
+Both fresh answers compile and pass 30000 `std::lower_bound` boundary/random
+checks with ASan/UBSan. Functional correctness passes; cross-engine exact
+parity does not. The earlier target-only/DFlash exact-output checks remain
+valid and are a separate claim. This audit covers greedy generation; it does
+not establish sampled cross-engine parity or general workload equivalence.
+
+Artifacts under `rdna4/llm/tmp/cross-engine-16k/`: `run.sh` (exact commands),
+`reference-audit.json`, `analysis.json`, `comparison.json`, both logs, prompt
+IDs, selected IDs including EOS, raw bytes, and full F32 logits. Recheck with:
+
+```sh
+python3 rdna4/llm/compare_generation.py rdna4/llm/tmp/cross-engine-16k/runner rdna4/llm/tmp/cross-engine-16k/llama
+```
+
+Expected exit status is 1 for the recorded mismatch. Next numerical work:
+compare prefill layer outputs at identical positions to isolate the first
+operation that drifts; preserve this sensitive fixture rather than changing
+the prompt or sampler to hide the rank reversal. No production path changed
+for this audit, and trace-I/O timings are not performance measurements.
+
 ## Captured target-only attention correctness repair (2026-09-22)
 
 Fixed the quality failure discovered by the broader 16K binary-search task.
