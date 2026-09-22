@@ -14076,6 +14076,7 @@ struct hip_llm_runner {
     hipFunction_t fn_qwen35_matvec_iq2xxs, fn_qwen35_matvec_iq2xs;
     hipFunction_t fn_qwen35_matvec_iq2s, fn_qwen35_matvec_iq3xxs, fn_qwen35_matvec_iq3s;
     hipFunction_t fn_qwen35_matvec_iq3xxs_qkv;
+    hipFunction_t fn_qwen35_matvec_iq2xs_qkv;
     hipFunction_t fn_qwen35_matvec_iq2xs_down_residual;
     hipFunction_t fn_qwen35_matvec_iq4xs, fn_qwen35_matvec_iq4xs_multi8;
     hipFunction_t fn_qwen35_matvec_iq4xs_5120_multi8;
@@ -17964,6 +17965,8 @@ int hip_llm_load_weights_sharded(hip_llm_runner *r, gguf_shards *model,
                           r->iq_module, "qwen35_matvec_iq3xxs"));
                 CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq3xxs_qkv,
                           r->iq_module, "qwen35_matvec_iq3xxs_qkv"));
+                CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq2xs_qkv,
+                          r->iq_module, "qwen35_matvec_iq2xs_qkv"));
                 CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq3s,
                           r->iq_module, "qwen35_matvec_iq3s"));
                 CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq4xs,
@@ -21618,6 +21621,53 @@ static inline int launch_qwen35_iq3xxs_gateup_fused(hip_llm_runner *r,
                   &qrows, &krows, &vrows, &n_cols };
     LAUNCH(r->fn_qwen35_matvec_iq3xxs_qkv,
            (qrows + krows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, a);
+    return 1;
+}
+
+/* Opt-in native IQ2_XS Q/K/V fusion.  The shared Q8_1 tile is quantized once;
+ * the device kernel preserves the independent IQ2_XS row arithmetic. */
+static inline int launch_qwen35_iq2xs_qkv_fused(hip_llm_runner *r,
+        void *qout, void *kout, void *vout,
+        void *qw, void *kw, void *vw, void *x,
+        int qrows, int krows, int vrows, int n_cols) {
+    const char *env = getenv("LLM_QWEN35_IQ2_QKV_FUSED");
+    if (!env || atoi(env) == 0 || !r->fn_qwen35_matvec_iq2xs_qkv ||
+        qrows < 1 || krows < 1 || vrows < 1 || n_cols > 17408 ||
+        (n_cols % 256) != 0)
+        return 0;
+    launch_native_q81(r, x, n_cols);
+    int total = qrows + krows + vrows;
+    int threads = qwen35_iq_shape_threads_enabled() ? 512 : 256;
+    int rows_per_block = threads / 32;
+    void *a[] = { &qout, &kout, &vout, &qw, &kw, &vw,
+                  &r->d_native_q81, &r->d_native_scale,
+                  &qrows, &krows, &vrows, &n_cols };
+    LAUNCH(r->fn_qwen35_matvec_iq2xs_qkv,
+           (total + rows_per_block - 1) / rows_per_block, 1, 1,
+           (unsigned)threads, 1, 1, 0, r->stream, a);
+    return 1;
+}
+
+/* The same kernel can cover an equal-width dense FFN gate/up pair.  V is
+ * disabled by a zero row count, so no null output is dereferenced. */
+static inline int launch_qwen35_iq2xs_gateup_fused(hip_llm_runner *r,
+        void *gate, void *up, void *gate_w, void *up_w, void *x,
+        int rows, int n_cols) {
+    const char *env = getenv("LLM_QWEN35_IQ2_GATEUP_FUSED");
+    if (!env || atoi(env) == 0 || !r->fn_qwen35_matvec_iq2xs_qkv ||
+        rows < 1 || n_cols > 17408 || (n_cols % 256) != 0)
+        return 0;
+    launch_native_q81(r, x, n_cols);
+    int qrows = rows, krows = rows, vrows = 0;
+    int threads = qwen35_iq_shape_threads_enabled() ? 512 : 256;
+    int rows_per_block = threads / 32;
+    void *vout = NULL, *v_w = NULL;
+    void *a[] = { &gate, &up, &vout, &gate_w, &up_w, &v_w,
+                  &r->d_native_q81, &r->d_native_scale,
+                  &qrows, &krows, &vrows, &n_cols };
+    LAUNCH(r->fn_qwen35_matvec_iq2xs_qkv,
+           (qrows + krows + rows_per_block - 1) / rows_per_block,
+           1, 1, (unsigned)threads, 1, 1, 0, r->stream, a);
     return 1;
 }
 
@@ -28990,6 +29040,16 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
                 void *a[] = { &r->d_xb2, &r->d_k, &r->d_v, &cl->attn_q_w, &cl->attn_k_w, &cl->attn_v_w,
                               &qr, &kr, &vr, &nc, &r->d_xb };
                 LAUNCH(r->fn_matvec_qkv_iq3xxs, qr + kr + vr, 1, 1, 256, 1, 1, 0, r->stream, a);
+            } else if (cl->attn_q_type == GGML_TYPE_IQ2_XS &&
+                       cl->attn_k_type == GGML_TYPE_IQ2_XS &&
+                       cl->attn_v_type == GGML_TYPE_IQ2_XS &&
+                       cl->attn_q_cols == cl->attn_k_cols &&
+                       cl->attn_q_cols == cl->attn_v_cols &&
+                       launch_qwen35_iq2xs_qkv_fused(r, r->d_xb2, r->d_k, r->d_v,
+                           cl->attn_q_w, cl->attn_k_w, cl->attn_v_w, r->d_xb,
+                           cl->attn_q_rows, cl->attn_k_rows, cl->attn_v_rows,
+                           cl->attn_q_cols)) {
+                /* The opt-in native IQ2_XS candidate owns all projections. */
             } else if (cl->attn_q_type == GGML_TYPE_IQ3_XXS &&
                        cl->attn_k_type == GGML_TYPE_IQ3_XXS &&
                        cl->attn_v_type == GGML_TYPE_IQ3_XXS &&
@@ -29204,6 +29264,16 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
                 void *a[] = { &r->d_q, &r->d_k, &r->d_v, &cl->attn_q_w, &cl->attn_k_w, &cl->attn_v_w,
                               &qr, &kr, &vr, &nc, &r->d_xb };
                 LAUNCH(r->fn_matvec_qkv_iq3xxs, qr + kr + vr, 1, 1, 256, 1, 1, 0, r->stream, a);
+            } else if (cl->attn_q_type == GGML_TYPE_IQ2_XS &&
+                       cl->attn_k_type == GGML_TYPE_IQ2_XS &&
+                       cl->attn_v_type == GGML_TYPE_IQ2_XS &&
+                       cl->attn_q_cols == cl->attn_k_cols &&
+                       cl->attn_q_cols == cl->attn_v_cols &&
+                       launch_qwen35_iq2xs_qkv_fused(r, r->d_q, r->d_k, r->d_v,
+                           cl->attn_q_w, cl->attn_k_w, cl->attn_v_w, r->d_xb,
+                           cl->attn_q_rows, cl->attn_k_rows, cl->attn_v_rows,
+                           cl->attn_q_cols)) {
+                /* The opt-in native IQ2_XS candidate owns all projections. */
             } else if (cl->attn_q_type == GGML_TYPE_IQ3_XXS &&
                        cl->attn_k_type == GGML_TYPE_IQ3_XXS &&
                        cl->attn_v_type == GGML_TYPE_IQ3_XXS &&
@@ -29361,7 +29431,16 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
                 } else
                     LAUNCH(r->fn_ffn_gate_up_silu_iq3xxs, n_ff, 1, 1, 256, 1, 1, 0, r->stream, a);
             } else {
-                int fused_iq3_gateup =
+                int fused_iq2_gateup =
+                    cl->ffn_gate_type == GGML_TYPE_IQ2_XS &&
+                    cl->ffn_up_type == GGML_TYPE_IQ2_XS &&
+                    cl->ffn_gate_rows == cl->ffn_up_rows &&
+                    cl->ffn_gate_cols == cl->ffn_up_cols &&
+                    launch_qwen35_iq2xs_gateup_fused(
+                        r, r->d_gate, r->d_up, cl->ffn_gate_w,
+                        cl->ffn_up_w, r->d_xb, cl->ffn_gate_rows,
+                        cl->ffn_gate_cols);
+                int fused_iq3_gateup = !fused_iq2_gateup &&
                     cl->ffn_gate_type == GGML_TYPE_IQ3_XXS &&
                     cl->ffn_up_type == GGML_TYPE_IQ3_XXS &&
                     cl->ffn_gate_rows == cl->ffn_up_rows &&
@@ -29379,7 +29458,7 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
                         r, r->d_gate, r->d_up, cl->ffn_gate_w,
                         cl->ffn_up_w, r->d_xb, cl->ffn_gate_rows,
                         cl->ffn_gate_cols);
-                if (!fused_iq3_gateup && !fused_iq1_gateup) {
+                if (!fused_iq2_gateup && !fused_iq3_gateup && !fused_iq1_gateup) {
                     begin_q8x2_reuse(r);
                     launch_matvec_ffn_auto(r, r->d_gate, cl->ffn_gate_w, r->d_xb,
                                           cl->ffn_gate_rows, cl->ffn_gate_cols,

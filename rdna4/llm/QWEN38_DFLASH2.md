@@ -108,6 +108,12 @@ candidate requires both role-level IQ1 Q8_1 switches, leaves MMQ overrides on
 the standalone path, and remains opt-in pending resident parity and 64K
 throughput measurements.
 
+Ordinary IQ2_XS attention and dense FFN projections have matching opt-in launch
+fusions (`LLM_QWEN35_IQ2_QKV_FUSED=1` and
+`LLM_QWEN35_IQ2_GATEUP_FUSED=1`). They stage the native IQ2_XS codebook once
+while preserving each row's Q8_1 arithmetic and reduction order; production
+dispatch remains unchanged until resident hashes and timing are available.
+
 ## DFlash2 long-window split retune (2026-09-22)
 
 The sidecar attention launch now uses twelve partitions once its 2,048-token

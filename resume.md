@@ -700,6 +700,14 @@ exact at 35.80 tok/s (prefill 443.99 tok/s, prefix `90178de69a24a76e`, suffix
 `7463f176c9b85ba3`).  The gain is small, so the grouped/mixed projection work
 in item 1 remains open; no production tuning defaults changed.
 
+The ordinary one-token IQ2_XS path now has opt-in Q/K/V and dense gate/up
+fusion probes (`LLM_QWEN35_IQ2_QKV_FUSED=1` and
+`LLM_QWEN35_IQ2_GATEUP_FUSED=1`).  The fused kernel stages the 512-entry
+IQ2_XS codebook once and joins only the launch; every row retains the
+standalone Q8_1 dot, split-scale rounding, and warp reduction order.  The
+independent IQ2_XS launches remain the default pending resident 64K hashes and
+timing.
+
 The DFlash2 mask rows now use a safe default fast path. Every non-anchor
 proposal row has the same mask token, so the runner embeds one anchor and one
 mask row with the exact IQ1_M scalar kernel, then copies the mask row on-device
