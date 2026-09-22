@@ -34070,7 +34070,10 @@ void hip_llm_reset_state(hip_llm_runner *r) {
      * previous request quiescent before clearing persistent hybrid state;
      * this is important for the batched conv path, which keeps the conv
      * history live across all rows of a tile. */
-    if (r->stream) hipStreamSynchronize(r->stream);
+    int overlap_pending = hllm_qwen35_dflash2_overlap_pending(r);
+    if (!overlap_pending && r->stream &&
+        hipStreamSynchronize(r->stream) != hipSuccess) return;
+    if (hllm_qwen35_dflash2_overlap_wait_reset(r)) return;
     r->qwen4_forward_error = 0;
     r->qwen4_nextn_start = -1;
     if (r->qwen35_mtp) { r->qwen35_mtp->origin = -1; r->qwen35_mtp->verify_rows = 0; }

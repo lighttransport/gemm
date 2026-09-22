@@ -63,6 +63,7 @@ typedef struct hllm_qwen35_dflash2 {
     hipEvent_t target_ready;
     hipEvent_t inject_done;
     int inject_pending;
+    int inject_disabled;
     /* Private activation scratch for the optional injection stream. Captured
      * feature rows remain read-only until inject_done; x/norm/K/V are private
      * so the sidecar stream never races target proposal scratch. */
@@ -93,13 +94,26 @@ static int hllm_dflash_overlap_init(hip_llm_runner *r,
                                     hllm_qwen35_dflash2 *d) {
     if (!r || !d || !d->fc_bf16 || !d->features_bf16 || !d->x_bf16)
         return -1;
-    for (int l = 0; l < HLLM_DFLASH_LAYERS; ++l)
-        if (!d->layers[l].inject_k_bf16 || !d->layers[l].inject_v_bf16)
+    if (d->inject_disabled) return -1;
+    for (int l = 0; l < HLLM_DFLASH_LAYERS; ++l) {
+        hllm_dflash_layer *cl = &d->layers[l];
+        /* Fused prompt injection owns one contiguous [K,V] BF16 matrix;
+         * mixed/legacy layers retain separate K and V matrices.  Both forms
+         * are valid overlap inputs, but a layer must expose exactly one
+         * complete pair before its private workspace can be used. */
+        int fused = cl->inject_kv_bf16 != NULL;
+        int split = cl->inject_k_bf16 != NULL && cl->inject_v_bf16 != NULL;
+        if (fused == split) {
+            d->inject_disabled = 1;
             return -1;
+        }
+    }
     int created_stream = 0, created_target = 0;
     if (!d->inject_stream) {
-        if (hipStreamCreateWithFlags(&d->inject_stream, hipStreamNonBlocking) != hipSuccess)
+        if (hipStreamCreateWithFlags(&d->inject_stream, hipStreamNonBlocking) != hipSuccess) {
+            d->inject_disabled = 1;
             return -1;
+        }
         created_stream = 1;
     }
     if (!d->target_ready) {
@@ -108,6 +122,7 @@ static int hllm_dflash_overlap_init(hip_llm_runner *r,
                 hipStreamDestroy(d->inject_stream);
                 d->inject_stream = NULL;
             }
+            d->inject_disabled = 1;
             return -1;
         }
         created_target = 1;
@@ -122,6 +137,7 @@ static int hllm_dflash_overlap_init(hip_llm_runner *r,
             hipStreamDestroy(d->inject_stream);
             d->inject_stream = NULL;
         }
+        d->inject_disabled = 1;
         return -1;
     }
     if (!d->inject_capacity) {
@@ -144,6 +160,7 @@ static int hllm_dflash_overlap_init(hip_llm_runner *r,
             (need_fused && hipMalloc(&d->inject_kv,
                 cap * 2 * kd * sizeof(float)) != hipSuccess)) {
             hllm_dflash_overlap_workspace_free(d);
+            d->inject_disabled = 1;
             return -1;
         }
         d->inject_capacity = (int)cap;
@@ -151,13 +168,49 @@ static int hllm_dflash_overlap_init(hip_llm_runner *r,
     return 0;
 }
 
+/* A failed enqueue or completion record may leave partially queued work on
+ * the private stream.  Retire it before the next proposal can reuse the
+ * scratch buffers; successful overlap never takes this synchronization path. */
+static void hllm_dflash_overlap_abort(hllm_qwen35_dflash2 *d) {
+    if (!d) return;
+    if (d->inject_stream) (void)hipStreamSynchronize(d->inject_stream);
+    d->inject_pending = 0;
+}
+
 static int hllm_dflash_overlap_wait(hip_llm_runner *r,
                                     hllm_qwen35_dflash2 *d) {
     if (!r || !d || !d->inject_pending) return 0;
-    if (hipStreamWaitEvent(r->stream, d->inject_done, 0) != hipSuccess)
+    if (hipStreamWaitEvent(r->stream, d->inject_done, 0) != hipSuccess) {
+        hllm_dflash_overlap_abort(d);
+        r->qwen4_forward_error = 1;
         return -1;
+    }
     d->inject_pending = 0;
     return 0;
+}
+
+/* Reset and snapshot restore paths can run without entering propose().  Keep
+ * those boundaries ordered with the optional sidecar stream as well. */
+static int hllm_qwen35_dflash2_overlap_wait_reset(hip_llm_runner *r) {
+    hllm_qwen35_dflash2 *d = r ? r->qwen35_dflash2 : NULL;
+    if (!d || !d->inject_pending) return 0;
+    if (hllm_dflash_overlap_wait(r, d)) return -1;
+    /* Reset and snapshot restore can issue synchronous copies immediately
+     * after this helper returns; make the event dependency host-visible at
+     * that boundary instead of leaving it queued on the target stream. */
+    /* NULL is HIP's valid default stream, and needs the same host-visible
+     * completion fence before snapshot copies as an explicit stream. */
+    if (hipStreamSynchronize(r->stream) != hipSuccess) {
+        hllm_dflash_overlap_abort(d);
+        r->qwen4_forward_error = 1;
+        return -1;
+    }
+    return 0;
+}
+
+static int hllm_qwen35_dflash2_overlap_pending(hip_llm_runner *r) {
+    hllm_qwen35_dflash2 *d = r ? r->qwen35_dflash2 : NULL;
+    return d && d->inject_pending;
 }
 
 static void hllm_qwen35_dflash2_free(hip_llm_runner *r) {
@@ -165,7 +218,9 @@ static void hllm_qwen35_dflash2_free(hip_llm_runner *r) {
     if (!d) return;
     if (r->stream) hipStreamSynchronize(r->stream);
     if (d->inject_stream) hipStreamSynchronize(d->inject_stream);
-#define DFLASH_FREE(p) do { if (p) hipFree(p); } while (0)
+#define DFLASH_FREE(p) do { \
+        if (p) { hipFree(p); (p) = NULL; } \
+    } while (0)
     DFLASH_FREE(d->fc); DFLASH_FREE(d->fc_bf16);
     DFLASH_FREE(d->enc_norm); DFLASH_FREE(d->out_norm);
     DFLASH_FREE(d->selector_hidden);
@@ -965,26 +1020,44 @@ int hip_llm_qwen35_dflash2_commit(hip_llm_runner *r, int position,
                 m ? m->verify_rows : -1, d ? d->feature_rows : -1);
         return -1;
     }
-    if (hllm_dflash_overlap_enabled() && hllm_dflash_overlap_init(r, d) == 0) {
+    /* Keep the public commit entry point safe even if a caller skips the
+     * usual propose boundary: a prior sidecar injection must retire before
+     * its private scratch can be scheduled again. */
+    if (d->inject_pending && hllm_dflash_overlap_wait(r, d)) return -1;
+    int overlap_ready = hllm_dflash_overlap_enabled() &&
+        hllm_dflash_overlap_init(r, d) == 0;
+    if (overlap_ready && processed <= d->inject_capacity) {
         hipStream_t saved_stream = r->stream;
-        if (processed > d->inject_capacity)
-            return -1;
         /* The verifier normally synchronizes before returning, but keep the
          * cross-stream dependency explicit: feature capture is produced on
          * the target stream and injection must never observe a partially
          * published row if a future verifier path becomes asynchronous. */
         if (hipEventRecord(d->target_ready, saved_stream) != hipSuccess ||
-            hipStreamWaitEvent(d->inject_stream, d->target_ready, 0) != hipSuccess)
+            hipStreamWaitEvent(d->inject_stream, d->target_ready, 0) != hipSuccess) {
+            hllm_dflash_overlap_abort(d);
+            r->qwen4_forward_error = 1;
             return -1;
+        }
         r->stream = d->inject_stream;
         int inject_rc = hllm_qwen35_dflash2_inject_impl(r, position, processed,
             d->features, d->features_bf16,
             d->inject_x, d->inject_x_bf16, d->inject_norm,
             d->inject_k, d->inject_v, d->inject_kv);
         r->stream = saved_stream;
-        if (inject_rc || hipEventRecord(d->inject_done, d->inject_stream) != hipSuccess)
+        hipError_t done_rc = inject_rc ? hipErrorUnknown :
+            hipEventRecord(d->inject_done, d->inject_stream);
+        if (inject_rc || done_rc != hipSuccess) {
+            hllm_dflash_overlap_abort(d);
+            r->qwen4_forward_error = 1;
             return -1;
+        }
         d->inject_pending = 1;
-    } else if (hllm_qwen35_dflash2_inject(r,position,processed)) return -1;
+    } else {
+        /* A future sidecar shape may exceed the private overlap tile.  Do not
+         * turn that into a request failure; retire any private work and use
+         * the capacity-independent serialized injector instead. */
+        if (d->inject_pending) hllm_dflash_overlap_abort(d);
+        if (hllm_qwen35_dflash2_inject(r,position,processed)) return -1;
+    }
     return hip_llm_qwen35_mtp_commit(r,processed);
 }

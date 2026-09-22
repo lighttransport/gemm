@@ -6,6 +6,10 @@ enum {
     HLLM_DENSE_MTP_SMALL_REUSE_ROWS = 4,
 };
 
+/* Defined by qwen35_dflash2.h, which is included later in the runner TU. */
+static int hllm_qwen35_dflash2_overlap_wait_reset(hip_llm_runner *r);
+static int hllm_qwen35_dflash2_overlap_pending(hip_llm_runner *r);
+
 static int hllm_qwen35_attention_splits(const hip_llm_runner *r, int length) {
     const int occupancy = 11;
     int tiles = (length + 255) / 256;
@@ -917,7 +921,10 @@ int hip_llm_qwen35_mtp_commit(hip_llm_runner *r, int processed) {
 void hip_llm_qwen35_mtp_reset(hip_llm_runner *r) {
     hllm_qwen35_mtp *m = r ? r->qwen35_mtp : NULL;
     if (!m || !m->source) return;
-    if (r->stream) hipStreamSynchronize(r->stream);
+    int overlap_pending = hllm_qwen35_dflash2_overlap_pending(r);
+    if (!overlap_pending && r->stream &&
+        hipStreamSynchronize(r->stream) != hipSuccess) return;
+    if (hllm_qwen35_dflash2_overlap_wait_reset(r)) return;
     m->origin = -1;
     m->kv_end = 0;
     m->pending_token = -1;
