@@ -101,12 +101,16 @@ def main() -> int:
     ap.add_argument("--quantize-on-load", choices=("int8-row",))
     ap.add_argument("--int8-tensor-core", action="store_true",
                     help="dynamic W8A8 custom tensor-core execution (requires package)")
+    ap.add_argument("--int8-bf16-tail-blocks", type=int, default=0,
+                    help="reconstruct this many final transformer blocks to BF16")
     ap.add_argument("--native-vae", action="store_true", help="Decode with the native F32 CUDA VAE (experimental)")
     args = ap.parse_args()
     if args.quantized_transformer and args.quantize_on_load:
         ap.error("choose a quantized package or quantize-on-load, not both")
     if args.int8_tensor_core and not args.quantized_transformer:
         ap.error("--int8-tensor-core requires --quantized-transformer")
+    if args.int8_bf16_tail_blocks < 0 or args.int8_bf16_tail_blocks > 32:
+        ap.error("--int8-bf16-tail-blocks must be in [0, 32]")
 
     root = Path(__file__).resolve().parents[2]
     model = Path(args.model).resolve()
@@ -286,7 +290,8 @@ def main() -> int:
     if args.quantize_on_load:
         native_command.extend(["--quantize-on-load", args.quantize_on_load])
     if args.int8_tensor_core:
-        native_command.append("--int8-tensor-core")
+        native_command.extend(["--int8-tensor-core", "--int8-bf16-tail-blocks",
+                               str(args.int8_bf16_tail_blocks)])
     _run(native_command, cwd=root)
     if args.native_vae:
         from PIL import Image
