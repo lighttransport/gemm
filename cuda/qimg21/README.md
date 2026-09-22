@@ -1249,10 +1249,11 @@ pinned FlashAttention forward specialization selected by PyTorch Flash SDPA
 for BF16 head dimension 72; `--attention cutlass` and `math` retain diagnostic
 alternatives. Vision linears use BF16-output cuBLAS-LT bias epilogues, including
 the PyTorch-selected algo 21 tile/stage and split-K configurations for the
-256-token block shapes. Teacher-forced block 0 now reaches cosine
-0.999998760. Free-running errors still compound: blocks 0/1/2 pass at
-0.999997662/0.999983743/0.999970145, block 3 is the first miss at
-0.999957043, and block 26 scores 0.999426130. The final merger is therefore
+256-token block shapes. LayerNorm uses PyTorch's vector-four, eight-warp
+Welford topology and precise CUDA arithmetic. Teacher-forced block 0 reaches
+cosine 0.999998968. Free-running errors still compound: blocks 0/1/2 pass at
+0.999997719/0.999984180/0.999970628, block 3 is the first miss at
+0.999957879, and block 26 scores 0.999620834. The final merger is therefore
 not accepted or wired into generation yet. Use `--hidden ... --block-index N
 --max-blocks 1` for isolated replay and `--dump-dir DIR` to save every block.
 

@@ -11,7 +11,10 @@ static const char *vision_front_src =
 "extern \"C\" {\n"
 "__device__ float rb(float x){unsigned u=__float_as_uint(x);return __uint_as_float((u+0x7fff+((u>>16)&1))&0xffff0000);}\n"
 "__global__ void add_pos(float*x,const float*p,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)x[i]=rb(x[i]+p[i]);}\n"
-"__global__ void layer_norm(float*y,const float*x,const float*w,const float*b,int d){int r=blockIdx.x,t=threadIdx.x;__shared__ float m,iv;if(t==0){float s=0,q=0;for(int i=0;i<d;i++){float v=x[r*d+i];s+=v;q+=v*v;}m=s/d;iv=rsqrtf(q/d-m*m+1e-6f);}__syncthreads();for(int i=t;i<d;i+=256)y[r*d+i]=rb((x[r*d+i]-m)*iv*w[i]+b[i]);}\n"
+"struct LNStat{float mean,var,count;};\n"
+"__device__ LNStat ln_add(LNStat a,float v){float delta=v-a.mean,n=a.count+1.f,nm=fmaf(delta,__frcp_rn(n),a.mean);a.var=fmaf(delta,v-nm,a.var);a.mean=nm;a.count=n;return a;}\n"
+"__device__ LNStat ln_combine(LNStat dataB,LNStat dataA){float count=dataA.count+dataB.count;if(count<=0.f)return {0.f,0.f,0.f};float coef=__frcp_rn(count),nA=dataA.count*coef,nB=dataB.count*coef,delta=dataB.mean-dataA.mean;return {nA*dataA.mean+nB*dataB.mean,dataA.var+dataB.var+delta*delta*dataA.count*nB,count};}\n"
+"__global__ void layer_norm(float*y,const float*x,const float*w,const float*b,int d){int r=blockIdx.x,t=threadIdx.x,l=t&31,warp=t>>5;__shared__ float sm[12];LNStat s={0.f,0.f,0.f};int nv=d/4;for(int vi=t;vi<nv;vi+=256){int j=vi*4;s=ln_add(s,x[r*d+j]);s=ln_add(s,x[r*d+j+1]);s=ln_add(s,x[r*d+j+2]);s=ln_add(s,x[r*d+j+3]);}for(int off=16;off;off>>=1){LNStat q={__shfl_down_sync(0xffffffff,s.mean,off),__shfl_down_sync(0xffffffff,s.var,off),__shfl_down_sync(0xffffffff,s.count,off)};s=ln_combine(s,q);}for(int off=4;off;off>>=1){if(l==0&&warp>=off&&warp<2*off){int z=warp-off;sm[2*z]=s.mean;sm[2*z+1]=s.var;sm[8+z]=s.count;}__syncthreads();if(l==0&&warp<off){LNStat q={sm[2*warp],sm[2*warp+1],sm[8+warp]};s=ln_combine(s,q);}__syncthreads();}if(t==0){sm[0]=s.mean;sm[1]=s.var*__frcp_rn((float)d);}__syncthreads();float mean=sm[0],iv=rsqrtf(sm[1]+1e-6f);for(int j=t;j<d;j+=256)y[r*d+j]=rb(w[j]*(iv*(x[r*d+j]-mean))+b[j]);}\n"
 "__global__ void linear_epilogue(float*y,const float*x,const float*b,int d,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n*d)y[i]=rb(x[i]+b[i%d]);}\n"
 "__global__ void bf16_epilogue(float*y,const unsigned short*x,const float*b,int d,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n*d)y[i]=rb(__uint_as_float(((unsigned)x[i])<<16)+b[i%d]);}\n"
 "__global__ void vision_rope(float*qkv,int n,int gh,int gw){int t=blockIdx.x,h=blockIdx.y,j=threadIdx.x;if(t>=n||h>=16||j>=36)return;int ic=t%2,ir=(t/2)%2,bc=(t/4)%(gw/2),br=t/(4*(gw/2));int row=br*2+ir,col=bc*2+ic,coord=j<18?row:col,k=j%18;float inv=1.f/powf(10000.f,(float)(2*k)/36.f),a=coord*inv,c=cosf(a),s=sinf(a);for(int z=0;z<2;z++){int base=t*3456+z*1152+h*72;float u=qkv[base+j],v=qkv[base+j+36];qkv[base+j]=rb(u*c-v*s);qkv[base+j+36]=rb(v*c+u*s);}}\n"
@@ -204,8 +207,16 @@ int main(int argc, char **argv) {
     q21_flash_vision_attention_fn flash_attention = NULL;
     float *host_pos = NULL, *host_out = NULL;
     int rc = 1, n = h * w, count = n * 1152;
-    if (!r || cu_compile_kernels(&module, r->device, vision_front_src,
-                                  "qimg21_vision_front.cu", 1, "qimg21_vision_front") < 0 ||
+    int vision_compile = -1;
+    const char *precise_math = getenv("CUDA_RUNNER_PRECISE_MATH");
+    if (r) {
+        if (!precise_math) setenv("CUDA_RUNNER_PRECISE_MATH", "1", 1);
+        vision_compile = cu_compile_kernels(&module, r->device, vision_front_src,
+                                             "qimg21_vision_front.cu", 1,
+                                             "qimg21_vision_front");
+        if (!precise_math) unsetenv("CUDA_RUNNER_PRECISE_MATH");
+    }
+    if (!r || vision_compile < 0 ||
         cuModuleGetFunction(&add_pos, module, "add_pos") ||
         cuModuleGetFunction(&layer_norm, module, "layer_norm") ||
         cuModuleGetFunction(&linear_epilogue, module, "linear_epilogue") ||
