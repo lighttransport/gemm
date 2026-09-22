@@ -1330,6 +1330,15 @@ static inline void tf_nvfp4_dot4_sve(float *o0, float *o1, float *o2, float *o3,
     const int vl = (int)svcntw();
     for (int ib=0; ib<n/64; ib++) {
         const block_nvfp4 *r0=b0+ib,*r1=b1+ib,*r2=b2+ib,*r3=b3+ib;
+        if (ib + 1 < n / 64) {
+            __builtin_prefetch(r0 + 1, 0, 0);
+            __builtin_prefetch(r1 + 1, 0, 0);
+            __builtin_prefetch(r2 + 1, 0, 0);
+            __builtin_prefetch(r3 + 1, 0, 0);
+        }
+#if defined(__clang__)
+#pragma clang loop unroll_count(4)
+#endif
         for (int s=0;s<4;s++) {
             svfloat32_t d0=svdup_f32(ggml_ue4m3_to_fp32(r0->d[s]));
             svfloat32_t d1=svdup_f32(ggml_ue4m3_to_fp32(r1->d[s]));
