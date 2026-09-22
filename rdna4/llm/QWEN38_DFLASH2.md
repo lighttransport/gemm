@@ -752,6 +752,15 @@ reflects the remaining measured costs.
    temporary output and separate add launch. It preserves the native IQ2_XS
    reduction order and remains disabled until resident random-64K hashes and
    throughput show a quality-safe gain.
+
+   An opt-in `LLM_QWEN35_Q2K_QKV_FUSED=1` candidate now covers ordinary
+   attention layers whose Q/K/V matrices are all Q2_K with a common input
+   width. It shares the exact Q8_1 activation quantization and selects the
+   three output ranges in one native grid while retaining the standalone
+   eight-virtual-warp Q2_K partial and reduction order. The host keeps the
+   serialized launches as the default until resident 4K/64K logits, hashes,
+   and throughput are measured; the kernel and host build pass without a
+   resident gfx1201 device in this environment.
 2. **Verifier attention tail.** The query-grid verifier now selects ordinary
    decode's split count independently for every causal row. Equal-split
    windows now select a dedicated captured shared-K/V graph; split boundaries

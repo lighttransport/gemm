@@ -25,6 +25,20 @@ cache, concurrency, and multi-turn C++ quality suite passes. The strict
 ordinary 64K target, target-tail fusion, and production cache-injection
 overlap default remain open.
 
+## 2026-09-22 continuation: opt-in native Q2_K Q/K/V projection fusion
+
+The ordinary one-token attention dispatcher now exposes
+`LLM_QWEN35_Q2K_QKV_FUSED=1` for layers whose Q, K, and V matrices are all
+Q2_K with one input width. The new native kernel keeps the standalone
+Q2_K eight-virtual-warp partials, affine correction, and warp reduction order;
+it only selects the three output row ranges in one grid after a shared exact
+Q8_1 activation quantization. The 128-thread geometry is retained for the
+same very-wide shape where the standalone path uses it. Both hybrid and
+standard attention dispatches are covered, while the serialized path remains
+the default pending resident 4K/64K logits, hashes, and throughput checks.
+HIP device syntax, the host build, and profile checks pass; the resident GPU
+gate is unavailable in this environment (`/dev/kfd` is absent).
+
 ## 2026-09-22 continuation: five-row Q4_K sidecar projection
 
 K=4 DFlash2 windows have five proposal rows (the anchor plus four mask rows),

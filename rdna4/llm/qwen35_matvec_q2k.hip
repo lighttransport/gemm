@@ -420,6 +420,70 @@ extern "C" __global__ void qwen35_matvec_q2k_rows(
     if (lane == 0) out[row] = sum;
 }
 
+/* Ordinary one-token Q2_K attention projections use the same Q8_1 activation
+ * but often arrive as three separate matrices. Keep the exact eight virtual
+ * warp partials and reduction order of qwen35_matvec_q2k_rows while selecting
+ * the Q/K/V weight range from one grid. The host enables this only for an
+ * explicit A/B run; serialized native launches remain the default until
+ * resident 4K/64K logits and throughput are rechecked. */
+extern "C" __global__ void qwen35_matvec_q2k_qkv(
+        float *qout, float *kout, float *vout,
+        const unsigned char *qw, const unsigned char *kw,
+        const unsigned char *vw, const signed char *q,
+        const float *scales, int qrows, int krows, int vrows, int cols) {
+    int lane = threadIdx.x & 31;
+    int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    int total = qrows + krows + vrows;
+    if (row >= total) return;
+
+    float *out;
+    const unsigned char *weights;
+    int local_row;
+    if (row < qrows) {
+        out = qout; weights = qw; local_row = row;
+    } else if (row < qrows + krows) {
+        out = kout; weights = kw;
+        local_row = row - qrows;
+    } else {
+        out = vout; weights = vw;
+        local_row = row - qrows - krows;
+    }
+
+    int blocks = cols / 256, iqs = lane & 15;
+    const unsigned char *w = weights + (size_t)local_row * blocks * 84;
+    float parts[8] = {};
+#pragma unroll
+    for (int vw_idx = 0; vw_idx < 8; ++vw_idx) {
+        for (int b = lane / 16 + 2 * vw_idx; b < blocks; b += 16) {
+            const unsigned char *p = w + b * 84;
+            const unsigned char *s = p + (iqs & ~7) + (iqs & 7) / 4;
+            int v = ((const int *)(p + 16))[iqs];
+            float sd = 0.0f, sm = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                int qb = b * 8 + 4 * (iqs / 8) + j;
+                int u = ((const int *)(q + qb * 32))[iqs & 7];
+                int z = __builtin_amdgcn_sudot4(true,
+                    (v >> (2 * j)) & 0x03030303, true, u, 0, false);
+                sd += scales[qb] * (z * (s[2 * j] & 15));
+                int m = s[2 * j] >> 4;
+                m |= m << 8; m |= m << 16;
+                int zm = __builtin_amdgcn_sudot4(true, m, true, u, 0, false);
+                sm += scales[qb] * zm;
+            }
+            float d = (float)*(const _Float16 *)(p + 80);
+            float dm = (float)*(const _Float16 *)(p + 82);
+            parts[vw_idx] += d * sd - dm * sm;
+        }
+    }
+    float sum = parts[0];
+#pragma unroll
+    for (int vw_idx = 1; vw_idx < 8; ++vw_idx) sum += parts[vw_idx];
+    for (int offset = 16; offset; offset >>= 1)
+        sum += __shfl_xor(sum, offset, 32);
+    if (lane == 0) out[local_row] = sum;
+}
+
 template<int MAX_COUNT>
 __device__ __forceinline__ void qwen35_matvec_q2k_multi(
         float *out, const unsigned char *weights, const signed char *q,
