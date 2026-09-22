@@ -69,9 +69,12 @@ int main(int argc, char **argv) {
     const char *model = NULL, *tokens = NULL, *out = NULL, *dump_dir = NULL;
     const char *dump_tokens = NULL;
     const char *vision_merged = NULL, *vision_deepstack_dir = NULL, *rope_table_path = NULL;
+    const char *hidden_input = NULL;
     const char *prompt = NULL;
     const char *attention_mode = "custom";
-    int drop = 0, layers = 36, dump_layer = 0;
+    const char *rms_mode = "auto";
+    const char *post_rms_mode = "auto";
+    int drop = 0, start_layer = 0, layers = 36, dump_layer = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--model") && i + 1 < argc) model = argv[++i];
         else if (!strcmp(argv[i], "--tokens") && i + 1 < argc) tokens = argv[++i];
@@ -82,11 +85,15 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--vision-merged") && i + 1 < argc) vision_merged = argv[++i];
         else if (!strcmp(argv[i], "--vision-deepstack-dir") && i + 1 < argc) vision_deepstack_dir = argv[++i];
         else if (!strcmp(argv[i], "--rope-table") && i + 1 < argc) rope_table_path = argv[++i];
+        else if (!strcmp(argv[i], "--hidden") && i + 1 < argc) hidden_input = argv[++i];
         else if (!strcmp(argv[i], "--attention") && i + 1 < argc) attention_mode = argv[++i];
+        else if (!strcmp(argv[i], "--rms") && i + 1 < argc) rms_mode = argv[++i];
+        else if (!strcmp(argv[i], "--post-rms") && i + 1 < argc) post_rms_mode = argv[++i];
         else if (!strcmp(argv[i], "--bf16-gemm-output")) text_bf16_gemm_output = 1;
         else if (!strcmp(argv[i], "--f32-gemm-output")) text_bf16_gemm_output = 0;
         else if (!strcmp(argv[i], "--drop-prefix") && i + 1 < argc) drop = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--max-layers") && i + 1 < argc) layers = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--start-layer") && i + 1 < argc) start_layer = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--dump-layer") && i + 1 < argc) dump_layer = atoi(argv[++i]);
         else { fprintf(stderr, "text: unknown/incomplete option %s\n", argv[i]); return 2; }
     }
@@ -94,11 +101,18 @@ int main(int argc, char **argv) {
         (vision_deepstack_dir && !vision_merged) ||
         (strcmp(attention_mode, "custom") && strcmp(attention_mode, "cutlass-efficient") &&
          strcmp(attention_mode, "flash-exact")) ||
-        drop < 0 || layers < 1 || layers > 36 ||
-        dump_layer < 0 || dump_layer >= layers) {
+        (strcmp(rms_mode,"auto") && strcmp(rms_mode,"scalar") &&
+         strcmp(rms_mode,"vector2") && strcmp(rms_mode,"vector4") &&
+         strcmp(rms_mode,"vector8") && strcmp(rms_mode,"vector16")) ||
+        (strcmp(post_rms_mode,"auto") && strcmp(post_rms_mode,"scalar") &&
+         strcmp(post_rms_mode,"vector2") && strcmp(post_rms_mode,"vector4") &&
+         strcmp(post_rms_mode,"vector8") && strcmp(post_rms_mode,"vector16")) ||
+        drop < 0 || layers < 1 || layers > 36 || start_layer < 0 || start_layer >= layers ||
+        dump_layer < start_layer || dump_layer >= layers) {
         fprintf(stderr, "usage: %s --model DIR (--tokens ids.txt | --prompt TEXT) "
                         "[--out embeds.npy] [--dump-tokens ids.txt] "
                         "[--vision-merged FILE --vision-deepstack-dir DIR --rope-table FILE] "
+                        "[--hidden FILE --start-layer N] "
                         "[--attention custom|cutlass-efficient|flash-exact --drop-prefix N "
                         "--max-layers 36 --dump-layer N]\n", argv[0]); return 2;
     }
@@ -120,7 +134,7 @@ int main(int argc, char **argv) {
             errno = 0;
             long token = strtol(word, &end, 10);
             if (errno || *end || n == 4096 || token < 0 || token >= 151936 ||
-                ((!vision_merged) &&
+                ((!vision_merged && !hidden_input) &&
                  (token == 151655 || token == 151656 || token == 151652 || token == 151653))) {
                 fprintf(stderr, "text: invalid token/vision input or more than 4096 tokens\n");
                 fclose(fp); return 1;
@@ -167,7 +181,7 @@ int main(int argc, char **argv) {
     }
     int visual_rows[4096], visual_count = 0;
     for (int t = 0; t < n; t++) if (ids[t] == 151655) visual_rows[visual_count++] = t;
-    if (!!vision_merged != (visual_count > 0)) {
+    if (!hidden_input && (!!vision_merged != (visual_count > 0))) {
         fprintf(stderr, "text: image-pad tokens and --vision-merged must be supplied together\n");
         goto done;
     }
@@ -182,6 +196,18 @@ int main(int argc, char **argv) {
             memcpy(host + (size_t)visual_rows[i] * 4096,
                    merged.data + (size_t)i * 4096, 4096 * sizeof(float));
         npy_free(&merged);
+    }
+    if (hidden_input) {
+        npy_f32 hidden = {0};
+        if (npy_read_f32(hidden_input, &hidden) ||
+            !((hidden.ndim == 2 && hidden.shape[0] == (size_t)n && hidden.shape[1] == 4096) ||
+              (hidden.ndim == 3 && hidden.shape[0] == 1 &&
+               hidden.shape[1] == (size_t)n && hidden.shape[2] == 4096))) {
+            fprintf(stderr, "text: invalid hidden-state replay input\n");
+            npy_free(&hidden); goto done;
+        }
+        memcpy(host, hidden.data, (size_t)n * 4096 * sizeof(float));
+        npy_free(&hidden);
     }
     r = cuda_qimg_init(0, 1);
     if (!r) goto done;
@@ -200,12 +226,15 @@ int main(int argc, char **argv) {
         fprintf(stderr, "text: %s causal GQA attention enabled\n", attention_mode);
     }
     qimg21_kernels base;
-    CUfunction rms, rms128, rms4, rope_lookup, add, add_visual, attention, mul_silu;
+    CUfunction rms, rms128, rms2, rms4, rms8, rms16, rope_lookup, add, add_visual, attention, mul_silu;
     if (cu_compile_kernels(&module,r->device,q21_text_src,"qimg21_text.cu",0,"qimg21_text")<0 ||
         cu_compile_kernels(&base_module,r->device,qimg21_src,"qimg21_native.cu",1,"qimg21_native")<0 ||
         get_kernel(&base,base_module) || cuModuleGetFunction(&rms,module,"text_rms") ||
         cuModuleGetFunction(&rms128,module,"text_rms128") ||
+        cuModuleGetFunction(&rms2,module,"text_rms2") ||
         cuModuleGetFunction(&rms4,module,"text_rms4") ||
+        cuModuleGetFunction(&rms8,module,"text_rms8") ||
+        cuModuleGetFunction(&rms16,module,"text_rms16") ||
         cuModuleGetFunction(&add,module,"text_add") ||
         cuModuleGetFunction(&add_visual,module,"text_add_visual") ||
         cuModuleGetFunction(&rope_lookup,module,"text_rope_table") ||
@@ -242,11 +271,16 @@ int main(int argc, char **argv) {
     #define NAME(suffix) snprintf(name,sizeof(name),"model.language_model.layers.%d.%s",l,suffix)
     #define LINEAR(suffix,dst,no,ni) do { NAME(suffix); CHECK(text_linear(r,&base,&shards,name,dst,bf,n,no,ni)); } while(0)
     #define DUMP(label,ptr,width) do { if(dump_dir && l==dump_layer) { CHECK(cuCtxSynchronize()); qimg21_stage_dir=dump_dir; dump_stage("stage_" label,ptr,(size_t)n*(width),n,width); } } while(0)
-    for(int l=0;l<layers;l++) {
+    for(int l=start_layer;l<layers;l++) {
         fprintf(stderr,"text: layer %d/%d (%d tokens)\n",l+1,layers,n);
         /* The official sequential-offload execution dispatches layer 34's
          * wide reduction through its vector-four CUDA topology. */
-        NAME("input_layernorm.weight"); CHECK(text_norm(r,l==34?rms4:rms,&shards,name,norm,x,n,4096));
+        CUfunction input_rms = !strcmp(rms_mode,"scalar") ? rms :
+            !strcmp(rms_mode,"vector2") ? rms2 : !strcmp(rms_mode,"vector4") ? rms4 :
+            !strcmp(rms_mode,"vector8") ? rms8 : !strcmp(rms_mode,"vector16") ? rms16 :
+            (l == 20 ? rms8 : (l == 24 || l == 27 || l == 29 || l == 32) ? rms16 :
+             l == 34 ? rms2 : rms);
+        NAME("input_layernorm.weight"); CHECK(text_norm(r,input_rms,&shards,name,norm,x,n,4096));
         DUMP("input_layernorm",norm,4096);
         CHECK(launch_cast(r,bf,norm,n*4096));
         LINEAR("self_attn.q_proj.weight",q,4096,4096);
@@ -282,7 +316,11 @@ int main(int argc, char **argv) {
         int count=n*4096; void *ra[]={&x,&tmp,&count};
         CHECK(cuLaunchKernel(add,(count+255)/256,1,1,256,1,1,0,r->stream,ra,NULL));
         DUMP("post_attention_hidden",x,4096);
-        NAME("post_attention_layernorm.weight"); CHECK(text_norm(r,rms,&shards,name,norm,x,n,4096));
+        CUfunction post_rms = !strcmp(post_rms_mode,"vector2") ? rms2 :
+            !strcmp(post_rms_mode,"vector4") ? rms4 : !strcmp(post_rms_mode,"vector8") ? rms8 :
+            !strcmp(post_rms_mode,"vector16") ? rms16 :
+            (l == 27 ? rms2 : l == 29 ? rms4 : l == 32 ? rms2 : rms);
+        NAME("post_attention_layernorm.weight"); CHECK(text_norm(r,post_rms,&shards,name,norm,x,n,4096));
         DUMP("post_attention_layernorm",norm,4096);
         CHECK(launch_cast(r,bf,norm,n*4096));
         LINEAR("mlp.gate_proj.weight",gate,12288,4096);

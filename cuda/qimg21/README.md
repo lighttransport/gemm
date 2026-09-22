@@ -1289,11 +1289,16 @@ The native text executable can now consume multimodal fixtures directly:
 0, 1, and 2. `--rope-table` supplies the corresponding MRoPE cosine/sine table.
 The visual feature upload is explicitly synchronized with the CUDA execution
 stream; without that dependency, successive layers could consume overwritten
-deep-stack storage. On the captured 96-token/16x16-patch case, language layers
-0 through 19 and all three deep-stack additions are bit-exact. Every layer
-through 34 passes 0.99996, but layer 35 falls to 0.999906556 and the cropped
-prompt embedding scores 0.999826711. This fixture-driven multimodal path is
-therefore diagnostic, not yet accepted or selected by `native_generate.py`.
+deep-stack storage. PyTorch's generic reduction selects different contiguous
+vector widths at sensitive input and post-attention RMSNorm boundaries; the
+native exact default mirrors those layer-specific topologies and retains
+`--rms`/`--post-rms` overrides for diagnosis. On the captured
+96-token/16x16-patch case, all 36 language layers, all three deep-stack
+additions, and the cropped prompt embedding are bit-exact: cosine
+0.9999999999999998, zero MAE, and 100% elementwise equality. The accepted
+29-token text-only path remains bit-exact as well. The fixture-driven interface
+still needs native multimodal token/MRoPE construction before it can replace
+the helper in `native_generate.py`.
 
 Add `--native-vae` to use the native F32 CUDA decoder. It reads the original
 VAE safetensors, applies latent denormalization and the learned post-quant
