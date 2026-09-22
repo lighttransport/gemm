@@ -89,6 +89,10 @@ grep -q 'launch_quantize_q81_iq1_batch_preserve_q8x2' "${runner_c}" || {
     echo 'profile test: mixed IQ1/Q8x2 staging helper missing' >&2
     exit 1
 }
+grep -q 'ensure_batch_q8_scratch' "${runner_c}" || {
+    echo 'profile test: shared batch Q8 capacity guard missing' >&2
+    exit 1
+}
 grep -q 'r->batch_q8_valid = 0;' "${runner_c}" || {
     echo 'profile test: direct IQ1 staging cache invalidation missing' >&2
     exit 1
