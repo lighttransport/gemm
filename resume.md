@@ -1494,6 +1494,13 @@ Follow-up crash isolation mapped the CPU fault to `hllm_qwen35_mtp_verify_impl`
 during graph setup.  It reproduced with scalar settings and reduced
 cache/BMAX values while VRAM was only 57 MiB in use afterward, pointing to
 invalid MTP verifier state or a stale graph pointer rather than capacity.
+The root cause was the fused Q/K norm + M-RoPE launch being selected for a
+GSQ layer whose runtime kernel path was not safe on this code object.  The
+fusion is now explicitly opt-in through `LLM_QWEN35_QK_FUSED=1`; the default
+uses the exact separate deinterleave, Q/K norm, and RoPE sequence.  The scalar
+control and fast profile both now complete with identical hash
+`8a44087a5472a2e2` (29.42 and 29.25 decode tok/s respectively at the 512-token
+smoke gate), so the setup crash is fixed without changing output quality.
 
 2026-09-22 continuation: the one-row IQ2/IQ3/IQ4 kernels now declare their
 output, weight, activation, and scale buffers non-aliasing.  This preserves

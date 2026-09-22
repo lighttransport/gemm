@@ -1547,6 +1547,12 @@ retain the scalar I/O fallback.
    settings and reduced cache/BMAX values while VRAM was only 57 MiB in use,
    pointing to invalid MTP verifier state or a stale graph pointer rather than
    capacity.
+   The underlying failure was the fused Q/K norm + M-RoPE launch selected for
+   a GSQ layer whose runtime kernel path was unsafe on this code object.  It is
+   now explicitly opt-in as `LLM_QWEN35_QK_FUSED=1`; the exact separate
+   deinterleave/QK-norm/RoPE sequence is the default.  Scalar and fast profile
+   smoke gates now both pass with hash `8a44087a5472a2e2` (29.42 and 29.25
+   decode tok/s), fixing setup without changing output quality.
 
 Each optimization should retain the exact sequence hash and response bytes at
 K=4 and K=7, compile the emitted program, and cover non-coding prompts plus

@@ -30018,8 +30018,11 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
                 launch_matvec_auto(r, r->d_v, cl->attn_v_w, r->d_xb, cl->attn_v_rows, cl->attn_v_cols, cl->attn_v_type);
                 end_q8x2_reuse(r);
             }
-            int fused_qk_prep = r->use_mrope && cl->has_qk_norm &&
+            const char *qk_fused_env = getenv("LLM_QWEN35_QK_FUSED");
+            int qk_fused_requested = qk_fused_env && atoi(qk_fused_env) != 0;
+            int fused_qk_prep = qk_fused_requested && r->use_mrope && cl->has_qk_norm &&
                 cl->attn_q_norm_w && cl->attn_k_norm_w && !r->is_qwen4exp &&
+                r->fn_deinterleave_qgate_qknorm_mrope_pair_devp &&
                 !(r->debug_layers && debug_attention_layer_selected(l));
             int fused_qk_store = fused_qk_prep && r->kv_quantized &&
                 r->requested_qwen35_decode_graph &&
