@@ -1041,6 +1041,7 @@ void qwen35_attention_q8_decode_reuse8(float *out, float *parts, float2 *meta,
     }
 }
 
+
 /* Full-window specialization of decode_reuse8. Keep the original generic
  * kernel intact so other window sizes retain their established code generation.
  * Arithmetic and parallel split scheduling are identical; only the query
@@ -1273,7 +1274,6 @@ void qwen35_attention_q8_decode_reuse_fixed8(float *out, float *parts, float2 *m
 }
 
 
-
 /* Full K=4 verifier window: anchor plus four proposals. Preserve the
  * generic arithmetic and split schedule with a constant five-query count. */
 extern "C" __global__ __launch_bounds__(128, 1)
@@ -1503,6 +1503,294 @@ void qwen35_attention_q8_decode_reuse_fixed5(float *out, float *parts, float2 *m
     }
 }
 
+
+/* Verifier-only split/combine candidate.  A block owns one head and up to
+ * four adjacent verifier rows, walks every split in increasing order, and
+ * merges the partials before returning.  The split arithmetic is copied from
+ * decode_reuse8: Q8 quantization, online softmax, packed-F16 accumulation,
+ * and the final split-order numerator/denominator reduction are unchanged.
+ * Global parts/meta buffers are retained so the captured workspace ABI stays
+ * compatible with the reference graph.  This is intentionally opt-in: one
+ * block serializes split work, so resident long-context A/B data must prove
+ * that launch and partial-merge savings outweigh lost split parallelism. */
+extern "C" __global__ __launch_bounds__(128, 1)
+void qwen35_attention_q8_decode_verify_fused(float *out, float *parts,
+        float2 *meta, const float *q, const signed char *kc,
+        const signed char *vc, const q8_half *ks, const q8_half *vs,
+        const float *gate, const int *position, int heads, int kv_heads,
+        int nsm, int occupancy, int forced_splits, int queries,
+        int position_start) {
+    if (queries < 1 || queries > 16) return;
+    int q0 = blockIdx.y * 4;
+    if (q0 >= queries) return;
+    int local_queries = min(4, queries - q0);
+    int lane = threadIdx.x, warp = threadIdx.y;
+    int tid = warp * 32 + lane;
+    int head = blockIdx.x;
+    int length[4], padded[4], max_padded = 0;
+    #pragma unroll
+    for (int query = 0; query < 4; ++query) {
+        if (query < local_queries) {
+            int global_query = q0 + query;
+            length[query] = position_start < 0 ? position[global_query] + 1 :
+                              position_start + global_query + 1;
+            padded[query] = (length[query] + 255) / 256 * 256;
+            max_padded = max(max_padded, padded[query]);
+        } else {
+            length[query] = padded[query] = 0;
+        }
+    }
+    int splits = forced_splits ? forced_splits :
+        q8_attention_splits(length[local_queries - 1], heads, nsm, occupancy);
+    if (splits < 1 || splits > 128) return;
+    int kh = head / (heads / kv_heads);
+    int stride = kv_heads * 256, scale_stride = kv_heads * 8;
+    __shared__ int qi[4][64];
+    __shared__ float qd[4][8];
+    __shared__ q8_half probabilities[4][1024];
+    __shared__ float maxima[4][32], sums[4][32];
+    __shared__ float2 fused_meta[4][128];
+
+    for (int query = warp; query < local_queries; query += 4) {
+        const float *query_data = q +
+            ((size_t)(q0 + query) * heads + head) * 256;
+        #pragma unroll
+        for (int base = 0; base < 64; base += 32) {
+            float value[4];
+            #pragma unroll
+            for (int i = 0; i < 4; ++i)
+                value[i] = .0625f * query_data[4 * (base + lane) + i];
+            float amax = fabsf(value[0]);
+            #pragma unroll
+            for (int i = 1; i < 4; ++i)
+                amax = fmaxf(amax, fabsf(value[i]));
+            #pragma unroll
+            for (int offset = 4; offset; offset >>= 1)
+                amax = fmaxf(amax, __shfl_xor(amax, offset, 32));
+            float d = amax / 127;
+            int packed = 0;
+            signed char *bytes = (signed char *)&packed;
+            if (d != 0.0f) {
+                #pragma unroll
+                for (int i = 0; i < 4; ++i)
+                    bytes[i] = roundf(value[i] / d);
+            }
+            qi[query][base + lane] = packed;
+            if (lane % 8 == 0) qd[query][(base + lane) / 8] = d;
+        }
+    }
+    __syncthreads();
+
+    for (int split = 0; split < splits; ++split) {
+        q8_half2 acc[4][4] = {};
+        float maximum[4], sum[4];
+        #pragma unroll
+        for (int query = 0; query < 4; ++query) {
+            maximum[query] = -3.402823466e+38f / 2;
+            sum[query] = 0.0f;
+        }
+        for (int base = split * 128; base < max_padded;
+             base += splits * 128) {
+            float score[4] = {};
+            float next_max[4];
+            #pragma unroll
+            for (int query = 0; query < 4; ++query)
+                next_max[query] = maximum[query];
+            #pragma unroll
+            for (int pair = 0; pair < 2; ++pair) {
+                int row = base + warp * 32 + (lane & ~1) + pair;
+                float dot[4] = {};
+                if (row < length[local_queries - 1]) {
+                    const int *key = (const int *)(kc +
+                        (size_t)row * stride + kh * 256);
+                    const q8_half *key_scale = ks +
+                        (size_t)row * scale_stride + kh * 8;
+                    #pragma unroll
+                    for (int i = 0; i < 32; ++i) {
+                        int word = 2 * i + lane % 2;
+                        int key_word = key[word];
+                        #pragma unroll
+                        for (int query = 0; query < 4; ++query) {
+                            if (query < local_queries && row < length[query]) {
+                                int product = __builtin_amdgcn_sudot4(
+                                    true, key_word, true,
+                                    qi[query][2 * i + lane % 2], 0, false);
+                                float scale = key_scale[i / 4] * qd[query][i / 4];
+                                dot[query] += scale * (float)product;
+                            }
+                        }
+                    }
+                }
+                #pragma unroll
+                for (int query = 0; query < 4; ++query) {
+                    if (query < local_queries) {
+                        dot[query] += __shfl_xor(dot[query], 1, 32);
+                        if (row >= length[query]) dot[query] = -__builtin_inff();
+                        next_max[query] = fmaxf(next_max[query],
+                            dot[query] + (3.0f * .6931f));
+                        if (lane % 2 == pair) score[query] = dot[query];
+                    }
+                }
+            }
+            #pragma unroll
+            for (int query = 0; query < 4; ++query) {
+                if (query < local_queries) {
+                    #pragma unroll
+                    for (int offset = 2; offset < 32; offset <<= 1)
+                        next_max[query] = fmaxf(next_max[query],
+                            __shfl_xor(next_max[query], offset, 32));
+                    float rescale = expf(maximum[query] - next_max[query]);
+                    maximum[query] = next_max[query];
+                    score[query] = expf(score[query] - maximum[query]);
+                    sum[query] = sum[query] * rescale + score[query];
+                    probabilities[query][tid] = (q8_half)score[query];
+                    q8_half2 rescale_h = q8_hsplat(rescale);
+                    #pragma unroll
+                    for (int i = 0; i < 4; ++i)
+                        acc[query][i] = q8_hmul(acc[query][i], rescale_h);
+                }
+            }
+            __builtin_amdgcn_wave_barrier();
+            #pragma unroll
+            for (int col = 0; col < 32; ++col) {
+                int row = base + warp * 32 + col;
+                #pragma unroll
+                for (int tile = 0; tile < 2; ++tile) {
+                    int dim = tile * 128 + lane * 4;
+                    q8_half2 value0 = {}, value1 = {};
+                    if (row < length[local_queries - 1]) {
+                        const signed char *value = vc +
+                            (size_t)row * stride + kh * 256 + dim;
+                        unsigned int packed = *(const unsigned int *)value;
+                        q8_half2 d = q8_hsplat(vs[(size_t)row * scale_stride +
+                                                      kh * 8 + dim / 32]);
+                        value0 = q8_hmul(d, q8_hpair(
+                            (signed char)packed, (signed char)(packed >> 8)));
+                        value1 = q8_hmul(d, q8_hpair(
+                            (signed char)(packed >> 16),
+                            (signed char)(packed >> 24)));
+                    }
+                    #pragma unroll
+                    for (int query = 0; query < 4; ++query) {
+                        if (query < local_queries) {
+                            q8_half2 probability = q8_hsplat(
+                                probabilities[query][warp * 32 + col]);
+                            acc[query][2 * tile] = q8_hfma(
+                                value0, probability, acc[query][2 * tile]);
+                            acc[query][2 * tile + 1] = q8_hfma(
+                                value1, probability, acc[query][2 * tile + 1]);
+                        }
+                    }
+                }
+            }
+        }
+        if (warp == 0) {
+            #pragma unroll
+            for (int query = 0; query < 4; ++query) {
+                maxima[query][lane] = -3.402823466e+38f / 2;
+                sums[query][lane] = 0.0f;
+            }
+        }
+        __syncthreads();
+        if (lane == 0) {
+            #pragma unroll
+            for (int query = 0; query < 4; ++query)
+                if (query < local_queries) maxima[query][warp] = maximum[query];
+        }
+        __syncthreads();
+        float final_max[4], final_sum[4];
+        #pragma unroll
+        for (int query = 0; query < 4; ++query) {
+            if (query < local_queries) {
+                final_max[query] = maxima[query][lane];
+                #pragma unroll
+                for (int offset = 16; offset; offset >>= 1)
+                    final_max[query] = fmaxf(final_max[query],
+                        __shfl_xor(final_max[query], offset, 32));
+                float rescale = expf(maximum[query] - final_max[query]);
+                q8_half2 rescale_h = q8_hsplat(rescale);
+                #pragma unroll
+                for (int tile = 0; tile < 2; ++tile) {
+                    q8_half2 *probability = (q8_half2 *)(
+                        probabilities[query] + warp * 256 +
+                        tile * 128 + lane * 4);
+                    probability[0] = q8_hmul(acc[query][2 * tile], rescale_h);
+                    probability[1] = q8_hmul(acc[query][2 * tile + 1], rescale_h);
+                }
+                final_sum[query] = q8_attention_sum(sum[query] * rescale);
+                if (lane == 0) sums[query][warp] = final_sum[query];
+            }
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int query = 0; query < 4; ++query) {
+            if (query < local_queries) {
+                final_sum[query] = q8_attention_sum(sums[query][lane]);
+                #pragma unroll
+                for (int base = 0; base < 256; base += 128) {
+                    float result = 0.0f;
+                    #pragma unroll
+                    for (int w = 0; w < 4; ++w)
+                        result += (float)probabilities[query][
+                            w * 256 + base + tid];
+                    if (splits == 1) {
+                        /* Match the ordinary single-split path: avoid a
+                         * global partial write/read when there is nothing to
+                         * merge, then apply the verifier gate in place. */
+                        result /= final_sum[query];
+                        if (gate) {
+                            float g = gate[((size_t)(q0 + query) * heads + head) *
+                                           256 + base + tid];
+                            result *= 1.0f / (1.0f + __expf(-g));
+                        }
+                        out[((size_t)(q0 + query) * heads + head) * 256 +
+                            base + tid] = result;
+                    } else {
+                        size_t head_base = ((size_t)(q0 + query) * heads + head) *
+                                           splits * 256;
+                        parts[head_base + (size_t)split * 256 + base + tid] = result;
+                    }
+                }
+                if (tid == 0 && splits > 1) {
+                    float2 summary = make_float2(final_max[query], final_sum[query]);
+                    fused_meta[query][split] = summary;
+                    meta[((size_t)(q0 + query) * heads + head) * splits + split] =
+                        summary;
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int query = 0; query < 4; ++query) {
+        if (query < local_queries) {
+            if (splits == 1) continue;
+            float maximum = fused_meta[query][0].x;
+            for (int i = 1; i < splits; ++i)
+                maximum = fmaxf(maximum, fused_meta[query][i].x);
+            #pragma unroll
+            for (int base = 0; base < 256; base += 128) {
+                float numerator = 0.0f, denominator = 0.0f;
+                for (int i = 0; i < splits; ++i) {
+                    float scale = expf(fused_meta[query][i].x - maximum);
+                    size_t head_base = ((size_t)(q0 + query) * heads + head) *
+                                       splits * 256;
+                    numerator += scale * parts[head_base + (size_t)i * 256 +
+                                              base + tid];
+                    denominator += scale * fused_meta[query][i].y;
+                }
+                float value = numerator / denominator;
+                if (gate) {
+                    float g = gate[((size_t)(q0 + query) * heads + head) *
+                                   256 + base + tid];
+                    value *= 1.0f / (1.0f + __expf(-g));
+                }
+                out[((size_t)(q0 + query) * heads + head) * 256 + base + tid] = value;
+            }
+        }
+    }
+}
 
 extern "C" __global__ __launch_bounds__(256, 1)
 void qwen35_attention_q8_combine(float *out, const float *parts, const float2 *meta,

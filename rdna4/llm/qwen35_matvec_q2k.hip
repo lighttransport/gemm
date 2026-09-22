@@ -253,7 +253,7 @@ extern "C" __global__ void qwen35_matvec_q4k_q81_multi4(
  * one launch after the shared Q8_1 quantization.  Each output warp retains
  * qwen35_matvec_q4k_q81_multi8's ordered dot, affine correction, and
  * __shfl_down reduction; only the selected output range changes. */
-template<int MAX_COUNT>
+template<int MAX_COUNT, int FIXED_COUNT = 0>
 __device__ __forceinline__ void qwen35_matvec_q4k_q81_qkv_impl(
         float *qout, float *kout, float *vout,
         const unsigned char *qw, const unsigned char *kw,
@@ -307,7 +307,7 @@ __device__ __forceinline__ void qwen35_matvec_q4k_q81_qkv_impl(
             int lo = (int)(packed & 0x0f0f0f0fu);
             int hi = (int)((packed >> 4) & 0x0f0f0f0fu);
 #pragma unroll
-            for (int m = 0; m < MAX_COUNT; ++m) if (m < count) {
+            for (int m = 0; m < MAX_COUNT; ++m) if (FIXED_COUNT || m < count) {
                 const int *u = (const int *)(q + (size_t)m * cols +
                                              b * 256 + c * 64);
                 dot0[m] = __builtin_amdgcn_sudot4(true, lo, true, u[j],
@@ -323,14 +323,14 @@ __device__ __forceinline__ void qwen35_matvec_q4k_q81_qkv_impl(
         float d = (float)*(const _Float16 *)p;
         float dm = (float)*(const _Float16 *)(p + 2);
 #pragma unroll
-        for (int m = 0; m < MAX_COUNT; ++m) if (m < count) {
+        for (int m = 0; m < MAX_COUNT; ++m) if (FIXED_COUNT || m < count) {
             const float *sx = scales + (size_t)m * (cols / 32) + b * 8 + is;
             sum[m] += sx[0] * (d * sv0 * dot0[m] - dm * mv0 * xsum0[m]) +
                       sx[1] * (d * sv1 * dot1[m] - dm * mv1 * xsum1[m]);
         }
     }
 #pragma unroll
-    for (int m = 0; m < MAX_COUNT; ++m) if (m < count) {
+    for (int m = 0; m < MAX_COUNT; ++m) if (FIXED_COUNT || m < count) {
         for (int offset = 16; offset; offset >>= 1)
             sum[m] += __shfl_down(sum[m], offset, 32);
         if (lane == 0) out[(size_t)m * output_rows + local_row] = sum[m];
@@ -348,6 +348,50 @@ extern "C" __global__ void qwen35_matvec_q4k_q81_qkv(
                                       count);
 }
 
+/* The K=7 sidecar has eight input rows. Keep the three-output launch shape
+ * of qwen35_matvec_q4k_q81_qkv, but specialize its activation count so the
+ * inner dot loop has no runtime row predicates. */
+extern "C" __global__ void qwen35_matvec_q4k_q81_qkv_fixed8(
+        float *qout, float *kout, float *vout,
+        const unsigned char *qw, const unsigned char *kw,
+        const unsigned char *vw, const signed char *q,
+        const float *scales, int qrows, int krows, int vrows,
+        int cols, int count) {
+    (void)count;
+    qwen35_matvec_q4k_q81_qkv_impl<8, 8>(qout, kout, vout, qw, kw, vw, q,
+                                         scales, qrows, krows, vrows, cols,
+                                         8);
+}
+
+/* The selector's K=7 window evaluates seven normalized rows.  Keep the same
+ * output ranges as the generic Q/K/V helper but specialize its activation
+ * count so the inner dot loop has no seventh-row predicate. */
+extern "C" __global__ void qwen35_matvec_q4k_q81_qkv_fixed7(
+        float *qout, float *kout, float *vout,
+        const unsigned char *qw, const unsigned char *kw,
+        const unsigned char *vw, const signed char *q,
+        const float *scales, int qrows, int krows, int vrows,
+        int cols, int count) {
+    (void)count;
+    qwen35_matvec_q4k_q81_qkv_impl<8, 7>(qout, kout, vout, qw, kw, vw, q,
+                                         scales, qrows, krows, vrows, cols, 7);
+}
+
+/* The K=4 selector window is common in the low-latency DFlash2 profile.
+ * Specialize its activation count as well, removing the inner predicate for
+ * the four normalized proposal rows while retaining the generic output row
+ * ranges and reduction order. */
+extern "C" __global__ void qwen35_matvec_q4k_q81_qkv_fixed4(
+        float *qout, float *kout, float *vout,
+        const unsigned char *qw, const unsigned char *kw,
+        const unsigned char *vw, const signed char *q,
+        const float *scales, int qrows, int krows, int vrows,
+        int cols, int count) {
+    (void)count;
+    qwen35_matvec_q4k_q81_qkv_impl<4, 4>(qout, kout, vout, qw, kw, vw, q,
+                                         scales, qrows, krows, vrows, cols, 4);
+}
+
 extern "C" __global__ void qwen35_matvec_q4k_q81_qkv5(
         float *qout, float *kout, float *vout,
         const unsigned char *qw, const unsigned char *kw,
@@ -355,8 +399,8 @@ extern "C" __global__ void qwen35_matvec_q4k_q81_qkv5(
         const float *scales, int qrows, int krows, int vrows,
         int cols, int count) {
     (void)count;
-    qwen35_matvec_q4k_q81_qkv_impl<5>(qout, kout, vout, qw, kw, vw, q,
-                                      scales, qrows, krows, vrows, cols, 5);
+    qwen35_matvec_q4k_q81_qkv_impl<5, 5>(qout, kout, vout, qw, kw, vw, q,
+                                         scales, qrows, krows, vrows, cols, 5);
 }
 
 extern "C" __global__ void qwen35_argmax_parts(const float *x, int n,

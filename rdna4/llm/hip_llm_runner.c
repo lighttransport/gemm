@@ -595,6 +595,42 @@ static const char *hip_kernel_source =
 "    }\n"
 "    if (tid == 0) dst[row] = sumf;\n"
 "}\n"
+"/* Batched form of the exact F16 pair above.  The two matrices share every\n"
+" * activation row, so flatten their output rows into one grid while keeping\n"
+" * each token/row's half2 FMA and XOR reduction unchanged. */\n"
+"__global__ void matvec_f16_llama_pair_batch_f32(float *dst0, float *dst1,\n"
+"        const half_raw *mat0, const half_raw *mat1, const float *x,\n"
+"        int n_rows, int n_cols, int M) {\n"
+"    int flat = blockIdx.x, token = blockIdx.y;\n"
+"    if (token >= M || flat >= 2 * n_rows) return;\n"
+"    int row = flat < n_rows ? flat : flat - n_rows;\n"
+"    float *dst = (flat < n_rows ? dst0 : dst1) + (size_t)token * n_rows;\n"
+"    const half_raw *mat = (flat < n_rows ? mat0 : mat1);\n"
+"    const float *xp = x + (size_t)token * n_cols;\n"
+"    int tid = threadIdx.x, ncols2 = n_cols >> 1;\n"
+"    const unsigned int *rp = (const unsigned int *)(mat + (size_t)row * n_cols);\n"
+"    float sumf = 0.0f;\n"
+"    for (int col2 = tid; col2 < ncols2; col2 += blockDim.x) {\n"
+"        unsigned int tmpx = rp[col2];\n"
+"        float2 w = __half22float2(*(const __half2 *)&tmpx);\n"
+"        sumf = fmaf(w.x, xp[2 * col2], sumf);\n"
+"        sumf = fmaf(w.y, xp[2 * col2 + 1], sumf);\n"
+"    }\n"
+"    for (int off = 16; off > 0; off >>= 1) sumf += __shfl_xor(sumf, off);\n"
+"    __shared__ float buf_iw[32];\n"
+"    if (blockDim.x > 32) {\n"
+"        if (tid < 32) buf_iw[tid] = 0.0f;\n"
+"        __syncthreads();\n"
+"        buf_iw[tid >> 5] = sumf;\n"
+"        __syncthreads();\n"
+"        if (tid < 32) {\n"
+"            sumf = buf_iw[tid];\n"
+"            for (int off = 16; off > 0; off >>= 1) sumf += __shfl_xor(sumf, off);\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    if (tid == 0) dst[row] = sumf;\n"
+"}\n"
 "/* Bit-exact port of llama.cpp ggml-cuda/mmvf.cu mul_mat_vec_f for\n"
 " * T=nv_bfloat16, type_acc=float on AMD HIP.  Accumulation uses f32 FMA over\n"
 " * (bf16,bf16) pairs, then an XOR warp reduction and the warp-level block fold\n"
@@ -616,6 +652,47 @@ static const char *hip_kernel_source =
 "        __builtin_memcpy(&w1, &f1, sizeof(w1));\n"
 "        sumf = fmaf(w0, x[2 * col2], sumf);\n"
 "        sumf = fmaf(w1, x[2 * col2 + 1], sumf);\n"
+"    }\n"
+"    for (int off = 16; off > 0; off >>= 1) sumf += __shfl_xor(sumf, off);\n"
+"    __shared__ float buf_iw[32];\n"
+"    if (blockDim.x > 32) {\n"
+"        if (tid < 32) buf_iw[tid] = 0.0f;\n"
+"        __syncthreads();\n"
+"        buf_iw[tid >> 5] = sumf;\n"
+"        __syncthreads();\n"
+"        if (tid < 32) {\n"
+"            sumf = buf_iw[tid];\n"
+"            for (int off = 16; off > 0; off >>= 1) sumf += __shfl_xor(sumf, off);\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    if (tid == 0) dst[row] = sumf;\n"
+"}\n"
+"/* Batched pair form of the llama.cpp BF16 MMVF kernel.  Alpha and beta\n"
+" * share the same verifier activation rows; flattening their output rows\n"
+" * removes one launch while retaining the per-row BF16 conversion, FMA, and\n"
+" * XOR reduction order of the standalone kernel. */\n"
+"__global__ void matvec_bf16_llama_pair_batch_f32(float *dst0, float *dst1,\n"
+"        const unsigned short *mat0, const unsigned short *mat1,\n"
+"        const float *x, int n_rows, int n_cols, int M) {\n"
+"    int flat = blockIdx.x, token = blockIdx.y;\n"
+"    if (token >= M || flat >= 2 * n_rows) return;\n"
+"    int row = flat < n_rows ? flat : flat - n_rows;\n"
+"    float *dst = (flat < n_rows ? dst0 : dst1) + (size_t)token * n_rows;\n"
+"    const unsigned short *mat = (flat < n_rows ? mat0 : mat1);\n"
+"    const float *xp = x + (size_t)token * n_cols;\n"
+"    int tid = threadIdx.x, ncols2 = n_cols >> 1;\n"
+"    const int *rp = (const int *)(mat + (size_t)row * n_cols);\n"
+"    float sumf = 0.0f;\n"
+"    for (int col2 = tid; col2 < ncols2; col2 += blockDim.x) {\n"
+"        int tmpx = rp[col2];\n"
+"        unsigned int b0 = (unsigned int)tmpx & 0xffffu;\n"
+"        unsigned int b1 = (unsigned int)tmpx >> 16;\n"
+"        unsigned int f0 = b0 << 16, f1 = b1 << 16;\n"
+"        float w0, w1; __builtin_memcpy(&w0, &f0, sizeof(w0));\n"
+"        __builtin_memcpy(&w1, &f1, sizeof(w1));\n"
+"        sumf = fmaf(w0, xp[2 * col2], sumf);\n"
+"        sumf = fmaf(w1, xp[2 * col2 + 1], sumf);\n"
 "    }\n"
 "    for (int off = 16; off > 0; off >>= 1) sumf += __shfl_xor(sumf, off);\n"
 "    __shared__ float buf_iw[32];\n"
@@ -712,6 +789,45 @@ static const char *hip_kernel_source =
 "        for(int d=tid;d<head_dim;d+=NT)qv[d]=qv[d]*z*qw[d];}\n"
 "    if(do_k){float z=rsqrtf(sdata[NT]/(float)head_dim+eps);\n"
 "        for(int d=tid;d<head_dim;d+=NT)kv[d]=kv[d]*z*kw[d];}\n"
+"}\n"
+"\n"
+"/* Opt-in DFlash2 proposal Q/K norm + M-RoPE fusion.  The normalized values\n"
+" * are committed before the rotation barrier so the reference qknorm-pair\n"
+" * store/read boundary and per-row operation order remain explicit. */\n"
+"__global__ void qknorm_rope_pair_batch_f32(float *q, const float *qw, int q_heads,\n"
+"        float *k, const float *kw, int k_heads, int head_dim,\n"
+"        int q_stride, int k_stride, int position_start, float freq_base,\n"
+"        int sect0, int sect1, int sect2, int sect3, float eps) {\n"
+"    extern __shared__ float sdata[];\n"
+"    int h=blockIdx.x, row=blockIdx.y, tid=threadIdx.x, NT=blockDim.x;\n"
+"    bool do_q=h<q_heads, do_k=h<k_heads;\n"
+"    float *qv=do_q ? q+(size_t)row*q_stride+(size_t)h*head_dim : (float *)0;\n"
+"    float *kv=do_k ? k+(size_t)row*k_stride+(size_t)h*head_dim : (float *)0;\n"
+"    float sq=0.0f, sk=0.0f;\n"
+"    for(int d=tid;d<head_dim;d+=NT){\n"
+"        if(do_q){float x=qv[d];sq+=x*x;}\n"
+"        if(do_k){float x=kv[d];sk+=x*x;}\n"
+"    }\n"
+"    sdata[tid]=sq; sdata[NT+tid]=sk; __syncthreads();\n"
+"    for(int s=NT/2;s>0;s>>=1){\n"
+"        if(tid<s){sdata[tid]+=sdata[tid+s];sdata[NT+tid]+=sdata[NT+tid+s];}\n"
+"        __syncthreads();\n"
+"    }\n"
+"    if(do_q){float z=rsqrtf(sdata[0]/(float)head_dim+eps);\n"
+"        for(int d=tid;d<head_dim;d+=NT)qv[d]=qv[d]*z*qw[d];}\n"
+"    if(do_k){float z=rsqrtf(sdata[NT]/(float)head_dim+eps);\n"
+"        for(int d=tid;d<head_dim;d+=NT)kv[d]=kv[d]*z*kw[d];}\n"
+"    __syncthreads();\n"
+"    int half_dim=sect0+sect1+sect2+sect3;\n"
+"    if(tid>=half_dim) return;\n"
+"    int rope_dim=2*half_dim, pos=position_start+row;\n"
+"    if(tid>=sect0+sect1+sect2) pos=0;\n"
+"    float freq=1.0f/powf(freq_base,(float)(2*tid)/(float)rope_dim);\n"
+"    float theta=(float)pos*freq, ct=cosf(theta), st=sinf(theta);\n"
+"    if(do_q){float v0=qv[tid],v1=qv[tid+half_dim];\n"
+"        qv[tid]=v0*ct-v1*st;qv[tid+half_dim]=v0*st+v1*ct;}\n"
+"    if(do_k){float v0=kv[tid],v1=kv[tid+half_dim];\n"
+"        kv[tid]=v0*ct-v1*st;kv[tid+half_dim]=v0*st+v1*ct;}\n"
 "}\n"
 "\n"
 "/* Decode-only Qwen3.5 attention preparation.  Q heads first split the gated\n"
@@ -823,6 +939,47 @@ static const char *hip_kernel_source =
 "    }\n"
 "    float scale = rsqrtf(sdata[0] / (float)head_dim + eps);\n"
 "    for (int d = tid; d < head_dim; d += NT) v[d] = v[d] * scale * w[d];\n"
+"}\n"
+"\n"
+"/* Opt-in DFlash2 sidecar K-norm + M-RoPE fusion.  The normalization and\n"
+" * rotation retain the same per-row reduction and scalar operation order as\n"
+" * qknorm_batch_f32 followed by rope_mrope_batch_f32; only the intermediate\n"
+" * global-memory round trip and launch boundary are removed.\n"
+" * Grid: (n_heads, M), block: a power-of-two head dimension. */\n"
+"__global__ void qknorm_rope_mrope_batch_f32(float *vec_batch, const float *w,\n"
+"        int n_heads, int head_dim, int position_start, float freq_base,\n"
+"        int sect0, int sect1, int sect2, int sect3, int row_stride,\n"
+"        float eps) {\n"
+"    extern __shared__ float sdata[];\n"
+"    int h = blockIdx.x, row = blockIdx.y, tid = threadIdx.x;\n"
+"    int NT = blockDim.x;\n"
+"    if (h >= n_heads) return;\n"
+"    float *v = vec_batch + (size_t)row * row_stride + h * head_dim;\n"
+"    float sum = 0.0f;\n"
+"    for (int d = tid; d < head_dim; d += NT) {\n"
+"        float x = v[d]; sum += x * x;\n"
+"    }\n"
+"    sdata[tid] = sum; __syncthreads();\n"
+"    for (int s = NT / 2; s > 0; s >>= 1) {\n"
+"        if (tid < s) sdata[tid] += sdata[tid + s];\n"
+"        __syncthreads();\n"
+"    }\n"
+"    float scale = rsqrtf(sdata[0] / (float)head_dim + eps);\n"
+"    int half_dim = sect0 + sect1 + sect2 + sect3;\n"
+"    if (tid >= half_dim) return;\n"
+"    int rope_dim = 2 * half_dim;\n"
+"    int pos_base = position_start + row, pos;\n"
+"    if (tid < sect0) pos = pos_base;\n"
+"    else if (tid < sect0 + sect1) pos = pos_base;\n"
+"    else if (tid < sect0 + sect1 + sect2) pos = pos_base;\n"
+"    else pos = 0;\n"
+"    float freq = 1.0f / powf(freq_base, (float)(2 * tid) / (float)rope_dim);\n"
+"    float theta = (float)pos * freq;\n"
+"    float ct = cosf(theta), st = sinf(theta);\n"
+"    float v0 = v[tid] * scale * w[tid];\n"
+"    float v1 = v[tid + half_dim] * scale * w[tid + half_dim];\n"
+"    v[tid] = v0 * ct - v1 * st;\n"
+"    v[tid + half_dim] = v0 * st + v1 * ct;\n"
 "}\n"
 "\n"
 "/* ---- 5. rope_neox_f32: NeoX-style RoPE, pairs (j, j+pair_offset) ---- */\n"
@@ -3646,49 +3803,6 @@ static const char *hip_kernel_source =
 "            if (i < d_state)\n"
 "                checkpoints[(size_t)m * per_state +\n"
 "                            ((size_t)h * d_state + col) * d_state + i] = s[rr];\n"
-"        }\n"
-"        for (int off = 16; off > 0; off >>= 1) y += __shfl_xor(y, off);\n"
-"        if (lane == 0) out_batch[base + col] = y * scale;\n"
-"    }\n"
-"}\n"
-"/* Fixed d_state=128 verifier probe.  It has the same checkpoint layout and\n"
-" * recurrence order as the generic kernel, but removes the per-row bounds\n"
-" * checks from the four values owned by each lane. */\n"
-"__global__ void deltanet_step_batch_gda_verify_128_f32(\n"
-"    const float *state, float *checkpoints, float *out_batch,\n"
-"    const float *Q_batch, const float *K_batch, const float *V_batch,\n"
-"    const float *alpha_batch, const float *beta_batch,\n"
-"    int dt_rank, int d_state, int v_row_stride, int M) {\n"
-"    (void)d_state;\n"
-"    int h = blockIdx.x, lane = threadIdx.x;\n"
-"    int col = blockIdx.z * blockDim.y + threadIdx.y;\n"
-"    if (h >= dt_rank || col >= 128 || lane >= 32) return;\n"
-"    const float *S = state + (size_t)h * 128 * 128 + (size_t)col * 128;\n"
-"    float s[4];\n"
-"    for (int rr = 0; rr < 4; ++rr) s[rr] = S[rr * 32 + lane];\n"
-"    const float scale = rsqrtf(128.0f);\n"
-"    const size_t per_tok = (size_t)dt_rank * 128;\n"
-"    const size_t per_state = per_tok * 128;\n"
-"    for (int m = 0; m < M; ++m) {\n"
-"        size_t base = (size_t)m * per_tok + (size_t)h * 128;\n"
-"        const float decay = alpha_batch[(size_t)m * dt_rank + h];\n"
-"        float k[4], q[4];\n"
-"        float kv = 0.0f;\n"
-"        for (int rr = 0; rr < 4; ++rr) {\n"
-"            k[rr] = K_batch[base + rr * 32 + lane];\n"
-"            q[rr] = Q_batch[base + rr * 32 + lane];\n"
-"            kv += s[rr] * k[rr];\n"
-"        }\n"
-"        for (int off = 16; off > 0; off >>= 1) kv += __shfl_xor(kv, off);\n"
-"        const float delta = (V_batch[(size_t)m * v_row_stride +\n"
-"                                      (size_t)h * 128 + col] - decay * kv) *\n"
-"                            beta_batch[(size_t)m * dt_rank + h];\n"
-"        float y = 0.0f;\n"
-"        for (int rr = 0; rr < 4; ++rr) {\n"
-"            s[rr] = decay * s[rr] + k[rr] * delta;\n"
-"            y += s[rr] * q[rr];\n"
-"            checkpoints[(size_t)m * per_state +\n"
-"                        ((size_t)h * 128 + col) * 128 + rr * 32 + lane] = s[rr];\n"
 "        }\n"
 "        for (int off = 16; off > 0; off >>= 1) y += __shfl_xor(y, off);\n"
 "        if (lane == 0) out_batch[base + col] = y * scale;\n"
@@ -9408,6 +9522,10 @@ static const char *hip_kernel_source =
 "        const signed char *q,const float *sd,const float *ss,\n"
 "        int n_rows,int n_cols){\n"
 "    int lane=threadIdx.x&31,warp=threadIdx.x>>5,row=blockIdx.x*8+warp;\n"
+"    __shared__ unsigned int grid_cache[2048];\n"
+"    for(int i=threadIdx.x;i<2048;i+=blockDim.x)\n"
+"        grid_cache[i]=iq1s_grid_gpu_dev[i];\n"
+"    __syncthreads();\n"
 "    if(row>=n_rows)return;\n"
 "    int nb=n_cols/256,gs=nb*8,gm=nb*32;float gsum=0.0f,usum=0.0f;\n"
 "    const unsigned char *gr=gmat+(size_t)row*nb*50;\n"
@@ -9416,7 +9534,7 @@ static const char *hip_kernel_source =
 "        float dw=half_to_float(*(const half_raw*)bp)*(float)(2*((qh[ib]>>12)&7)+1);\n"
 "        float delta=(qh[ib]&0x8000)?(-1.0f-0.125f):(-1.0f+0.125f);\n"
 "        const signed char *xp=q+(size_t)qb*32;int z=0;\n"
-"        for(int l=0;l<4;++l){int gi=qs[ib*4+l]|(((qh[ib]>>(3*l))&7)<<8);unsigned int grid=iq1s_grid_gpu_dev[gi];\n"
+"        for(int l=0;l<4;++l){int gi=qs[ib*4+l]|(((qh[ib]>>(3*l))&7)<<8);unsigned int grid=grid_cache[gi];\n"
 "            int w0=(int)(grid&0x0f0f0f0fu),w1=(int)((grid>>4)&0x0f0f0f0fu);const int *u=(const int*)(xp+l*8);\n"
 "            z=dp4a_hw(w0,u[0],z);z=dp4a_hw(w1,u[1],z);}\n"
 "        gsum+=dw*(sd[qb]*(float)z+ss[qb]*delta);\n"
@@ -9428,7 +9546,7 @@ static const char *hip_kernel_source =
 "        float base=half_to_float(*(const half_raw*)&su);unsigned short sw=sc[ib/2];int sh=6*(ib%2);\n"
 "        int scode=2*((sw>>(sh+(l>=2?3:0)))&7)+1;unsigned char hv=qh[2*ib+(l>>1)];int qshift=(l&1)?4:8;\n"
 "        unsigned short gi=qs[4*ib+l]|((unsigned short)(hv<<qshift)&0x700u);\n"
-"        float delta=(hv&((l&1)?0x80:0x08))?(-1.0f-0.125f):(-1.0f+0.125f);unsigned int grid=iq1s_grid_gpu_dev[gi];\n"
+"        float delta=(hv&((l&1)?0x80:0x08))?(-1.0f-0.125f):(-1.0f+0.125f);unsigned int grid=grid_cache[gi];\n"
 "        int w0=(int)(grid&0x0f0f0f0fu),w1=(int)((grid>>4)&0x0f0f0f0fu);const int *u=(const int*)(q+(size_t)qb*32+l*8);\n"
 "        int z=dp4a_hw(w0,u[0],0);z=dp4a_hw(w1,u[1],z);int qsum=dp4a_hw(0x01010101,u[0],0);qsum=dp4a_hw(0x01010101,u[1],qsum);\n"
 "        usum+=base*(float)scode*sd[qb]*((float)z+delta*(float)qsum);\n"
@@ -13298,12 +13416,16 @@ struct hip_llm_runner {
     hipFunction_t fn_matvec_f16_f32;
     hipFunction_t fn_matvec_f16_llama_f32;
     hipFunction_t fn_matvec_f16_llama_pair_f32;
+    hipFunction_t fn_matvec_f16_llama_pair_batch_f32;
     hipFunction_t fn_matvec_bf16_llama_f32;
+    hipFunction_t fn_matvec_bf16_llama_pair_batch_f32;
     hipFunction_t fn_matvec_bf16_f32;
     hipFunction_t fn_qknorm_f32;
     hipFunction_t fn_deinterleave_qgate_qknorm_mrope_pair_devp;
     hipFunction_t fn_qknorm_batch_f32;
+    hipFunction_t fn_qknorm_rope_mrope_batch_f32;
     hipFunction_t fn_qknorm_pair_batch_f32;
+    hipFunction_t fn_qknorm_rope_pair_batch_f32;
     hipFunction_t fn_rope_neox_f32;
     hipFunction_t fn_rope_mrope_f32;
     hipFunction_t fn_kv_cache_store;
@@ -13436,7 +13558,6 @@ struct hip_llm_runner {
     hipFunction_t fn_deltanet_step_batch_gda_ref_f32;
     hipFunction_t fn_deltanet_step_batch_gda_ref_128_f32;
     hipFunction_t fn_deltanet_step_batch_gda_verify_f32;
-    hipFunction_t fn_deltanet_step_batch_gda_verify_128_f32;
     hipFunction_t fn_deltanet_step_batch_gda_verify_128_f32;
     hipFunction_t fn_l2_norm_heads_batch_f32;
     hipFunction_t fn_l2_norm_repeat_qk_batch_f32;
@@ -14188,6 +14309,7 @@ struct hip_llm_runner {
     hipFunction_t fn_q8_attention_decode_reuse8;
     hipFunction_t fn_q8_attention_decode_reuse_fixed8;
     hipFunction_t fn_q8_attention_decode_reuse_fixed5;
+    hipFunction_t fn_q8_attention_decode_verify_fused;
     hipFunction_t fn_q8_attention_combine, fn_q8_attention_combine_verify4;
     hipFunction_t fn_q8_attention_combine_verify8;
     hipFunction_t fn_q8_attention_combine_verify16;
@@ -14208,6 +14330,9 @@ struct hip_llm_runner {
     hipFunction_t fn_qwen35_matvec_q4k_q81_multi8;
     hipFunction_t fn_qwen35_matvec_q4k_q81_fixed8;
     hipFunction_t fn_qwen35_matvec_q4k_q81_qkv;
+    hipFunction_t fn_qwen35_matvec_q4k_q81_qkv_fixed8;
+    hipFunction_t fn_qwen35_matvec_q4k_q81_qkv_fixed7;
+    hipFunction_t fn_qwen35_matvec_q4k_q81_qkv_fixed4;
     hipFunction_t fn_qwen35_matvec_q4k_q81_qkv5;
     hipFunction_t fn_qwen35_matvec_q2k_rows;
     hipFunction_t fn_qwen35_matvec_q2k_multi4, fn_qwen35_matvec_q2k_multi8;
@@ -14226,6 +14351,7 @@ struct hip_llm_runner {
     hipFunction_t fn_qwen35_matvec_iq4xs_qkv;
     hipFunction_t fn_qwen35_matvec_iq2xxs_qkv;
     hipFunction_t fn_qwen35_matvec_iq2xs_qkv;
+    hipFunction_t fn_qwen35_matvec_iq_mixed_qkv;
     hipFunction_t fn_qwen35_matvec_iq2xs_down_residual;
     hipFunction_t fn_qwen35_matvec_iq4xs, fn_qwen35_matvec_iq4xs_multi8;
     hipFunction_t fn_qwen35_matvec_iq4xs_5120_multi8;
@@ -14443,12 +14569,16 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(matvec_f16_f32);
     GET_FUNC(matvec_f16_llama_f32);
     GET_FUNC(matvec_f16_llama_pair_f32);
+    GET_FUNC(matvec_f16_llama_pair_batch_f32);
     GET_FUNC(matvec_bf16_llama_f32);
+    GET_FUNC(matvec_bf16_llama_pair_batch_f32);
     GET_FUNC(matvec_bf16_f32);
     GET_FUNC(qknorm_f32);
     GET_FUNC(deinterleave_qgate_qknorm_mrope_pair_devp);
     GET_FUNC(qknorm_batch_f32);
+    GET_FUNC(qknorm_rope_mrope_batch_f32);
     GET_FUNC(qknorm_pair_batch_f32);
+    GET_FUNC(qknorm_rope_pair_batch_f32);
     GET_FUNC(rope_neox_f32);
     GET_FUNC(rope_mrope_f32);
     GET_FUNC(kv_cache_store);
@@ -14583,7 +14713,6 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(deltanet_step_batch_gda_ref_f32);
     GET_FUNC(deltanet_step_batch_gda_ref_128_f32);
     GET_FUNC(deltanet_step_batch_gda_verify_f32);
-    GET_FUNC(deltanet_step_batch_gda_verify_128_f32);
     GET_FUNC(deltanet_step_batch_gda_verify_128_f32);
     GET_FUNC(l2_norm_heads_batch_f32);
     GET_FUNC(l2_norm_repeat_qk_batch_f32);
@@ -18108,6 +18237,12 @@ int hip_llm_load_weights_sharded(hip_llm_runner *r, gguf_shards *model,
                       r->q2k_module, "qwen35_matvec_q4k_q81_fixed8"));
             CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_q4k_q81_qkv,
                       r->q2k_module, "qwen35_matvec_q4k_q81_qkv"));
+            CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_q4k_q81_qkv_fixed8,
+                      r->q2k_module, "qwen35_matvec_q4k_q81_qkv_fixed8"));
+            CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_q4k_q81_qkv_fixed7,
+                      r->q2k_module, "qwen35_matvec_q4k_q81_qkv_fixed7"));
+            CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_q4k_q81_qkv_fixed4,
+                      r->q2k_module, "qwen35_matvec_q4k_q81_qkv_fixed4"));
             CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_q4k_q81_qkv5,
                       r->q2k_module, "qwen35_matvec_q4k_q81_qkv5"));
             if (!r->d_native_q81) CHECK_HIP(hipMalloc(&r->d_native_q81, 17408));
@@ -18143,6 +18278,8 @@ int hip_llm_load_weights_sharded(hip_llm_runner *r, gguf_shards *model,
                           r->iq_module, "qwen35_matvec_iq2xxs_qkv"));
                 CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq2xs_qkv,
                           r->iq_module, "qwen35_matvec_iq2xs_qkv"));
+                CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq_mixed_qkv,
+                          r->iq_module, "qwen35_matvec_iq_mixed_qkv"));
                 CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq3s,
                           r->iq_module, "qwen35_matvec_iq3s"));
                 CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq4xs,
@@ -18253,6 +18390,9 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
         CHECK_HIP(hipModuleGetFunction(&r->fn_q8_attention_decode_reuse_fixed5,
                   r->q8_attention_module,
                   "qwen35_attention_q8_decode_reuse_fixed5"));
+        CHECK_HIP(hipModuleGetFunction(&r->fn_q8_attention_decode_verify_fused,
+                  r->q8_attention_module,
+                  "qwen35_attention_q8_decode_verify_fused"));
         CHECK_HIP(hipModuleGetFunction(&r->fn_q8_attention_combine,
                   r->q8_attention_module, "qwen35_attention_q8_combine"));
         CHECK_HIP(hipModuleGetFunction(&r->fn_q8_attention_combine_verify4,
@@ -19643,6 +19783,14 @@ static inline void launch_matvec_llama_f16_pair(hip_llm_runner *r,
     LAUNCH(r->fn_matvec_f16_llama_pair_f32, 2 * n_rows, 1, 1,
            256, 1, 1, 0, r->stream, args);
 }
+static inline void launch_matvec_llama_f16_pair_batch(hip_llm_runner *r,
+        void *dst0, void *dst1, void *mat0, void *mat1, void *x,
+        int n_rows, int n_cols, int rows) {
+    void *args[] = { &dst0, &dst1, &mat0, &mat1, &x,
+                     &n_rows, &n_cols, &rows };
+    LAUNCH(r->fn_matvec_f16_llama_pair_batch_f32, 2 * n_rows, rows, 1,
+           256, 1, 1, 0, r->stream, args);
+}
 static inline void launch_matvec_llama_f16_batch(hip_llm_runner *r, void *dst,
         void *mat, void *x, int n_rows, int n_cols, int rows) {
     void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
@@ -19676,6 +19824,19 @@ static inline void launch_matvec_llama_bf16_batch(hip_llm_runner *r, void *dst,
     }
     void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
     LAUNCH(r->fn_matvec_bf16_llama_f32, n_rows, rows, 1,
+           (unsigned)bs, 1, 1, 0, r->stream, args);
+}
+static inline void launch_matvec_llama_bf16_pair_batch(hip_llm_runner *r,
+        void *dst0, void *dst1, void *mat0, void *mat1, void *x,
+        int n_rows, int n_cols, int rows) {
+    int64_t bs = 32, niter_best = (n_cols + 63) / 64;
+    for (int64_t b = 64; b <= 256; b += 32) {
+        int64_t niter = (n_cols + 2 * b - 1) / (2 * b);
+        if (niter < niter_best) { niter_best = niter; bs = b; }
+    }
+    void *args[] = { &dst0, &dst1, &mat0, &mat1, &x,
+                     &n_rows, &n_cols, &rows };
+    LAUNCH(r->fn_matvec_bf16_llama_pair_batch_f32, 2 * n_rows, rows, 1,
            (unsigned)bs, 1, 1, 0, r->stream, args);
 }
 
@@ -19717,6 +19878,29 @@ static inline void launch_qknorm_batch(hip_llm_runner *r, void *vec, void *w,
            bdim * sizeof(float), r->stream, args);
 }
 
+/* DFlash2 sidecar-only K-norm + M-RoPE candidate.  Keep it opt-in because
+ * resident hash/timing gates must prove that the fused register path matches
+ * the two-launch reference on the target GPU. */
+static inline int launch_qknorm_rope_mrope_batch(hip_llm_runner *r,
+        void *vec, void *w, int n_heads, int head_dim, int position_start,
+        float freq_base, int s0, int s1, int s2, int s3, int row_stride,
+        int n_rows, float eps) {
+    const char *env = getenv("LLM_QWEN35_DFLASH_QKNORM_ROPE_FUSED");
+    int half_dim = s0 + s1 + s2 + s3;
+    if (!env || atoi(env) == 0 || !r ||
+        !r->fn_qknorm_rope_mrope_batch_f32 || half_dim < 1 ||
+        head_dim != 2 * half_dim)
+        return 0;
+    int bdim = 1;
+    while (bdim < head_dim) bdim <<= 1;
+    if (bdim > 256) bdim = 256;
+    void *args[] = { &vec, &w, &n_heads, &head_dim, &position_start,
+                     &freq_base, &s0, &s1, &s2, &s3, &row_stride, &eps };
+    LAUNCH(r->fn_qknorm_rope_mrope_batch_f32, n_heads, n_rows, 1, bdim, 1, 1,
+           bdim * sizeof(float), r->stream, args);
+    return 1;
+}
+
 static inline void launch_qknorm_pair_batch(hip_llm_runner *r, void *q, void *qw,
     int q_heads, void *k, void *kw, int k_heads, int head_dim,
     int q_stride, int k_stride, int n_rows, float eps) {
@@ -19727,6 +19911,31 @@ static inline void launch_qknorm_pair_batch(hip_llm_runner *r, void *q, void *qw
                      &q_stride, &k_stride, &eps };
     LAUNCH(r->fn_qknorm_pair_batch_f32, q_heads > k_heads ? q_heads : k_heads,
            n_rows, 1, bdim, 1, 1, 2 * bdim * sizeof(float), r->stream, args);
+}
+
+/* DFlash2 proposal-only Q/K norm + M-RoPE candidate.  The separate pair and
+ * RoPE launches remain the default until resident K=4/K=7 hashes and timing
+ * prove that the launch reduction is quality-safe. */
+static inline int launch_qknorm_rope_pair_batch(hip_llm_runner *r, void *q,
+        void *qw, int q_heads, void *k, void *kw, int k_heads, int head_dim,
+        int q_stride, int k_stride, int position_start, float freq_base,
+        int s0, int s1, int s2, int s3, int n_rows, float eps) {
+    const char *env = getenv("LLM_QWEN35_DFLASH_QKNORM_ROPE_PAIR_FUSED");
+    int half_dim = s0 + s1 + s2 + s3;
+    if (!env || atoi(env) == 0 || !r ||
+        !r->fn_qknorm_rope_pair_batch_f32 || half_dim < 1 ||
+        head_dim != 2 * half_dim)
+        return 0;
+    int bdim = 1;
+    while (bdim < head_dim) bdim <<= 1;
+    if (bdim > 256) bdim = 256;
+    void *args[] = { &q, &qw, &q_heads, &k, &kw, &k_heads, &head_dim,
+                     &q_stride, &k_stride, &position_start, &freq_base,
+                     &s0, &s1, &s2, &s3, &eps };
+    LAUNCH(r->fn_qknorm_rope_pair_batch_f32,
+           q_heads > k_heads ? q_heads : k_heads, n_rows, 1, bdim, 1, 1,
+           2 * bdim * sizeof(float), r->stream, args);
+    return 1;
 }
 
 /* Weightless per-head RMS norm over n_rows (n_rows=1 for decode). Handles head_dim>256. */
@@ -20561,9 +20770,21 @@ static inline void launch_matvec_##name(hip_llm_runner *r, void *dst, void *mat,
 
 static inline void launch_quantize_q8x2(hip_llm_runner *r, void *x, int n);
 
+/* The native IQ/Q2 projection entry points are loaded as one module, but keep
+ * the activation quantizer and its two output buffers in the readiness check.
+ * This matters for partial/diagnostic loads: an opt-in fused path must fall
+ * back to the reference dispatcher instead of launching with a null Q8_1
+ * argument after a failed optional allocation. */
+static inline int qwen35_native_q81_ready(const hip_llm_runner *r) {
+    return r && r->fn_qwen35_quantize_q81 && r->d_native_q81 &&
+           r->d_native_scale;
+}
+
 /* A dedicated buffer makes scoped native Q8_1 reuse independent of legacy
  * IQ/Q8x2 scratch. Callers delimit immutable Q/K/V or gate/up inputs. */
 static inline void launch_native_q81(hip_llm_runner *r, void *x, int n) {
+    if (!qwen35_native_q81_ready(r) || !x || n <= 0 || (n % 32) != 0)
+        return;
     if (r->q8x2_reuse_active && r->native_q81_valid &&
         r->native_q81_source == x && r->native_q81_n == n) return;
     void *a[] = { &r->d_native_q81, &r->d_native_scale, &x, &n };
@@ -20593,9 +20814,42 @@ static inline int qwen35_native_q81_matvec_type(hip_llm_runner *r, int type) {
            (type == GGML_TYPE_IQ4_XS && r->fn_qwen35_matvec_iq4xs);
 }
 
+/* Format ids consumed by qwen35_matvec_iq_mixed_qkv.  Keep this mapping
+ * explicit so unsupported/malformed row types fall back to the serialized
+ * dispatcher instead of entering the diagnostic kernel. */
+static inline int qwen35_iq_mixed_kind(int type) {
+    switch (type) {
+    case GGML_TYPE_IQ2_XXS: return 0;
+    case GGML_TYPE_IQ2_XS:  return 1;
+    case GGML_TYPE_IQ2_S:   return 2;
+    case GGML_TYPE_IQ3_XXS: return 3;
+    case GGML_TYPE_IQ3_S:   return 4;
+    case GGML_TYPE_IQ4_XS:  return 5;
+    default:                return -1;
+    }
+}
+
 static inline int qwen35_iq_shape_threads_enabled(void) {
-    const char *env = getenv("LLM_QWEN35_IQ_SHAPE_THREADS");
-    return !env || atoi(env) != 0;
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *env = getenv("LLM_QWEN35_IQ_SHAPE_THREADS");
+        enabled = !env || atoi(env) != 0;
+    }
+    return enabled;
+}
+
+/* The mixed Q/K/V kernel stages its selected codebooks once per block.  A
+ * wider block amortizes that staging on some mixed shapes, but can lose
+ * occupancy on others, so keep the measured 256-thread default and expose a
+ * cached 512-thread A/B choice without rereading the environment per launch. */
+static inline int qwen35_iq_mixed_threads(void) {
+    static int threads = -1;
+    if (threads < 0) {
+        const char *env = getenv("LLM_QWEN35_IQ_MIXED_THREADS");
+        int value = env ? atoi(env) : 256;
+        threads = value == 512 ? 512 : 256;
+    }
+    return threads;
 }
 
 static inline void launch_qwen35_argmax(hip_llm_runner *r, void *x, void *out) {
@@ -20613,7 +20867,8 @@ static inline void launch_qwen35_argmax(hip_llm_runner *r, void *x, void *out) {
 
 static inline void launch_matvec_q2_K(hip_llm_runner *r, void *dst, void *mat,
                                       void *x, int n_rows, int n_cols) {
-    if (r->fn_qwen35_matvec_q2k && n_cols <= 17408 && n_cols % 256 == 0) {
+    if (qwen35_native_q81_ready(r) && r->fn_qwen35_matvec_q2k &&
+        n_cols <= 17408 && n_cols % 256 == 0) {
         r->q8x2_reuse_valid = 0;
         r->iq1_q8_valid = 0;
         launch_native_q81(r, x, n_cols);
@@ -20733,15 +20988,20 @@ static inline void launch_matvec_q6_K(hip_llm_runner *r, void *dst, void *mat,
     LAUNCH(r->fn_matvec_q6_K_f32, n_rows, 1, 1, 64, 1, 1, 0, r->stream, args);
 }
 static inline hipFunction_t iq_d4_or_q81_quantizer(hip_llm_runner *r) {
-    const char *d4 = getenv("LLM_IQ_MMQ_D4");
+    static int d4_cached = -1;
+    if (d4_cached < 0) {
+        const char *d4 = getenv("LLM_IQ_MMQ_D4");
+        d4_cached = d4 && atoi(d4) != 0;
+    }
     r->q8x2_reuse_valid = 0;
     r->iq1_q8_valid = 0;
-    return d4 && atoi(d4) != 0 ? r->fn_quantize_mmq_d4_batch :
+    return d4_cached ? r->fn_quantize_mmq_d4_batch :
                                 r->fn_quantize_q81_batch_32_exact;
 }
 static inline void launch_matvec_iq2_xxs(hip_llm_runner *r, void *dst,
         void *mat, void *x, int n_rows, int n_cols) {
-    if (r->fn_qwen35_matvec_iq2xxs && n_cols <= 17408 && n_cols % 256 == 0) {
+    if (qwen35_native_q81_ready(r) && r->fn_qwen35_matvec_iq2xxs &&
+        n_cols <= 17408 && n_cols % 256 == 0) {
         r->q8x2_reuse_valid = 0;
         r->iq1_q8_valid = 0;
         launch_native_q81(r, x, n_cols);
@@ -20808,7 +21068,8 @@ DEFINE_LAUNCH_MATVEC(q5_1, fn_matvec_q5_1_f32)
 DEFINE_LAUNCH_MATVEC_MW(iq4_nl, fn_matvec_iq4_nl_f32)
 static inline void launch_matvec_iq4_xs(hip_llm_runner *r, void *dst,
         void *mat, void *x, int n_rows, int n_cols) {
-    if (r->fn_qwen35_matvec_iq4xs && n_cols <= 17408 && n_cols % 256 == 0) {
+    if (qwen35_native_q81_ready(r) && r->fn_qwen35_matvec_iq4xs &&
+        n_cols <= 17408 && n_cols % 256 == 0) {
         r->q8x2_reuse_valid = r->iq1_q8_valid = 0;
         launch_native_q81(r, x, n_cols);
         void *a[] = { &dst, &mat, &r->d_native_q81, &r->d_native_scale, &n_rows, &n_cols };
@@ -20849,7 +21110,8 @@ static inline void launch_matvec_iq4_xs(hip_llm_runner *r, void *dst,
 }
 static inline void launch_matvec_iq2_xs(hip_llm_runner *r, void *dst,
         void *mat, void *x, int n_rows, int n_cols) {
-    if (r->fn_qwen35_matvec_iq2xs && n_cols <= 17408 && n_cols % 256 == 0) {
+    if (qwen35_native_q81_ready(r) && r->fn_qwen35_matvec_iq2xs &&
+        n_cols <= 17408 && n_cols % 256 == 0) {
         r->q8x2_reuse_valid = 0;
         r->iq1_q8_valid = 0;
         launch_native_q81(r, x, n_cols);
@@ -21695,7 +21957,8 @@ static inline void launch_matvec_qwen35_native_batch(hip_llm_runner *r,
 }
 static inline void launch_matvec_iq3_xxs(hip_llm_runner *r, void *dst,
         void *mat, void *x, int n_rows, int n_cols) {
-    if (r->fn_qwen35_matvec_iq3xxs && n_cols <= 17408 && n_cols % 256 == 0) {
+    if (qwen35_native_q81_ready(r) && r->fn_qwen35_matvec_iq3xxs &&
+        n_cols <= 17408 && n_cols % 256 == 0) {
         r->q8x2_reuse_valid = 0;
         r->iq1_q8_valid = 0;
         launch_native_q81(r, x, n_cols);
@@ -21789,8 +22052,9 @@ static inline int launch_qwen35_iq3xxs_qkv_fused(hip_llm_runner *r,
         void *qw, void *kw, void *vw, void *x,
         int qrows, int krows, int vrows, int n_cols) {
     const char *env = getenv("LLM_QWEN35_IQ3_QKV_FUSED");
-    if (!env || atoi(env) == 0 || !r->fn_qwen35_matvec_iq3xxs_qkv ||
-        qrows < 1 || krows < 1 || vrows < 1 || n_cols > 17408 ||
+    if (!env || atoi(env) == 0 || !qwen35_native_q81_ready(r) ||
+        !r->fn_qwen35_matvec_iq3xxs_qkv ||
+        qrows < 1 || krows < 1 || vrows < 1 || n_cols <= 0 || n_cols > 17408 ||
         (n_cols % 256) != 0)
         return 0;
     launch_native_q81(r, x, n_cols);
@@ -21803,6 +22067,32 @@ static inline int launch_qwen35_iq3xxs_qkv_fused(hip_llm_runner *r,
     return 1;
 }
 
+/* Opt-in ordinary-decode Q4_K Q/K/V fusion.  The Q4_K/Q8_1 kernel already
+ * used by DFlash can cover a single row; share its activation quantization and
+ * projection grid while leaving the F32 reference dispatcher as the default. */
+static inline int launch_qwen35_q4k_qkv_fused(hip_llm_runner *r,
+        void *qout, void *kout, void *vout,
+        void *qw, void *kw, void *vw, void *x,
+        int qrows, int krows, int vrows, int n_cols) {
+    const char *env = getenv("LLM_QWEN35_Q4K_QKV_FUSED");
+    if (!env || atoi(env) == 0 || !r ||
+        !r->fn_qwen35_matvec_q4k_q81_qkv ||
+        !r->fn_qwen35_quantize_q81 || !r->d_act_q8_batch ||
+        !r->d_act_scale_batch || qrows < 1 || krows < 1 || vrows < 1 ||
+        n_cols <= 0 || n_cols > 17408 || (n_cols % 256) != 0)
+        return 0;
+    int count = 1, total = qrows + krows + vrows;
+    void *qa[] = { &r->d_act_q8_batch, &r->d_act_scale_batch, &x, &n_cols };
+    LAUNCH(r->fn_qwen35_quantize_q81, n_cols / 32, 1, 1,
+           32, 1, 1, 0, r->stream, qa);
+    void *a[] = { &qout, &kout, &vout, &qw, &kw, &vw,
+                  &r->d_act_q8_batch, &r->d_act_scale_batch,
+                  &qrows, &krows, &vrows, &n_cols, &count };
+    LAUNCH(r->fn_qwen35_matvec_q4k_q81_qkv, (total + 7) / 8, 1, 1,
+           256, 1, 1, 0, r->stream, a);
+    return 1;
+}
+
 /* Opt-in native Q2_K Q/K/V fusion for ordinary one-token attention.  The
  * Q2_K kernel keeps the standalone eight-virtual-warp arithmetic and only
  * combines the row ranges after one shared Q8_1 activation quantization. */
@@ -21811,8 +22101,9 @@ static inline int launch_qwen35_q2k_qkv_fused(hip_llm_runner *r,
         void *qw, void *kw, void *vw, void *x,
         int qrows, int krows, int vrows, int n_cols) {
     const char *env = getenv("LLM_QWEN35_Q2K_QKV_FUSED");
-    if (!env || atoi(env) == 0 || !r->fn_qwen35_matvec_q2k_qkv ||
-        qrows < 1 || krows < 1 || vrows < 1 || n_cols > 17408 ||
+    if (!env || atoi(env) == 0 || !qwen35_native_q81_ready(r) ||
+        !r->fn_qwen35_matvec_q2k_qkv ||
+        qrows < 1 || krows < 1 || vrows < 1 || n_cols <= 0 || n_cols > 17408 ||
         (n_cols % 256) != 0)
         return 0;
     launch_native_q81(r, x, n_cols);
@@ -21836,8 +22127,9 @@ static inline int launch_qwen35_q2k_gateup_fused(hip_llm_runner *r,
         void *gout, void *uout, void *gw, void *uw, void *x,
         int rows, int n_cols) {
     const char *env = getenv("LLM_QWEN35_Q2K_GATEUP_FUSED");
-    if (!env || atoi(env) == 0 || !r->fn_qwen35_matvec_q2k_qkv ||
-        rows < 1 || n_cols > 17408 || (n_cols % 256) != 0)
+    if (!env || atoi(env) == 0 || !qwen35_native_q81_ready(r) ||
+        !r->fn_qwen35_matvec_q2k_qkv ||
+        rows < 1 || n_cols <= 0 || n_cols > 17408 || (n_cols % 256) != 0)
         return 0;
     launch_native_q81(r, x, n_cols);
     int qrows = rows, krows = rows, vrows = 0;
@@ -21862,8 +22154,9 @@ static inline int launch_qwen35_iq3s_qkv_fused(hip_llm_runner *r,
         void *qw, void *kw, void *vw, void *x,
         int qrows, int krows, int vrows, int n_cols) {
     const char *env = getenv("LLM_QWEN35_IQ3S_QKV_FUSED");
-    if (!env || atoi(env) == 0 || !r->fn_qwen35_matvec_iq3s_qkv ||
-        qrows < 1 || krows < 1 || vrows < 1 || n_cols > 17408 ||
+    if (!env || atoi(env) == 0 || !qwen35_native_q81_ready(r) ||
+        !r->fn_qwen35_matvec_iq3s_qkv ||
+        qrows < 1 || krows < 1 || vrows < 1 || n_cols <= 0 || n_cols > 17408 ||
         (n_cols % 256) != 0)
         return 0;
     launch_native_q81(r, x, n_cols);
@@ -21884,8 +22177,9 @@ static inline int launch_qwen35_iq4xs_qkv_fused(hip_llm_runner *r,
         void *qw, void *kw, void *vw, void *x,
         int qrows, int krows, int vrows, int n_cols) {
     const char *env = getenv("LLM_QWEN35_IQ4XS_QKV_FUSED");
-    if (!env || atoi(env) == 0 || !r->fn_qwen35_matvec_iq4xs_qkv ||
-        qrows < 1 || krows < 1 || vrows < 1 || n_cols > 17408 ||
+    if (!env || atoi(env) == 0 || !qwen35_native_q81_ready(r) ||
+        !r->fn_qwen35_matvec_iq4xs_qkv ||
+        qrows < 1 || krows < 1 || vrows < 1 || n_cols <= 0 || n_cols > 17408 ||
         (n_cols % 256) != 0)
         return 0;
     launch_native_q81(r, x, n_cols);
@@ -21906,8 +22200,9 @@ static inline int launch_qwen35_iq2xxs_qkv_fused(hip_llm_runner *r,
         void *qw, void *kw, void *vw, void *x,
         int qrows, int krows, int vrows, int n_cols) {
     const char *env = getenv("LLM_QWEN35_IQ2XXS_QKV_FUSED");
-    if (!env || atoi(env) == 0 || !r->fn_qwen35_matvec_iq2xxs_qkv ||
-        qrows < 1 || krows < 1 || vrows < 1 || n_cols > 17408 ||
+    if (!env || atoi(env) == 0 || !qwen35_native_q81_ready(r) ||
+        !r->fn_qwen35_matvec_iq2xxs_qkv ||
+        qrows < 1 || krows < 1 || vrows < 1 || n_cols <= 0 || n_cols > 17408 ||
         (n_cols % 256) != 0)
         return 0;
     launch_native_q81(r, x, n_cols);
@@ -21931,8 +22226,9 @@ static inline int launch_qwen35_iq3xxs_gateup_fused(hip_llm_runner *r,
         void *gate, void *up, void *gate_w, void *up_w, void *x,
         int rows, int n_cols) {
     const char *env = getenv("LLM_QWEN35_IQ3_GATEUP_FUSED");
-    if (!env || atoi(env) == 0 || !r->fn_qwen35_matvec_iq3xxs_qkv ||
-        rows < 1 || n_cols > 17408 || (n_cols % 256) != 0)
+    if (!env || atoi(env) == 0 || !qwen35_native_q81_ready(r) ||
+        !r->fn_qwen35_matvec_iq3xxs_qkv ||
+        rows < 1 || n_cols <= 0 || n_cols > 17408 || (n_cols % 256) != 0)
         return 0;
     launch_native_q81(r, x, n_cols);
     int qrows = rows, krows = rows, vrows = 0;
@@ -21952,8 +22248,9 @@ static inline int launch_qwen35_iq3s_gateup_fused(hip_llm_runner *r,
         void *gate, void *up, void *gate_w, void *up_w, void *x,
         int rows, int n_cols) {
     const char *env = getenv("LLM_QWEN35_IQ3S_GATEUP_FUSED");
-    if (!env || atoi(env) == 0 || !r->fn_qwen35_matvec_iq3s_qkv ||
-        rows < 1 || n_cols > 17408 || (n_cols % 256) != 0)
+    if (!env || atoi(env) == 0 || !qwen35_native_q81_ready(r) ||
+        !r->fn_qwen35_matvec_iq3s_qkv ||
+        rows < 1 || n_cols <= 0 || n_cols > 17408 || (n_cols % 256) != 0)
         return 0;
     launch_native_q81(r, x, n_cols);
     int qrows = rows, krows = rows, vrows = 0;
@@ -21974,8 +22271,9 @@ static inline int launch_qwen35_iq4xs_gateup_fused(hip_llm_runner *r,
         void *gate, void *up, void *gate_w, void *up_w, void *x,
         int rows, int n_cols) {
     const char *env = getenv("LLM_QWEN35_IQ4XS_GATEUP_FUSED");
-    if (!env || atoi(env) == 0 || !r->fn_qwen35_matvec_iq4xs_qkv ||
-        rows < 1 || n_cols > 17408 || (n_cols % 256) != 0)
+    if (!env || atoi(env) == 0 || !qwen35_native_q81_ready(r) ||
+        !r->fn_qwen35_matvec_iq4xs_qkv ||
+        rows < 1 || n_cols <= 0 || n_cols > 17408 || (n_cols % 256) != 0)
         return 0;
     launch_native_q81(r, x, n_cols);
     int qrows = rows, krows = rows, vrows = 0;
@@ -21995,8 +22293,9 @@ static inline int launch_qwen35_iq2xxs_gateup_fused(hip_llm_runner *r,
         void *gate, void *up, void *gate_w, void *up_w, void *x,
         int rows, int n_cols) {
     const char *env = getenv("LLM_QWEN35_IQ2XXS_GATEUP_FUSED");
-    if (!env || atoi(env) == 0 || !r->fn_qwen35_matvec_iq2xxs_qkv ||
-        rows < 1 || n_cols > 17408 || (n_cols % 256) != 0)
+    if (!env || atoi(env) == 0 || !qwen35_native_q81_ready(r) ||
+        !r->fn_qwen35_matvec_iq2xxs_qkv ||
+        rows < 1 || n_cols <= 0 || n_cols > 17408 || (n_cols % 256) != 0)
         return 0;
     launch_native_q81(r, x, n_cols);
     int qrows = rows, krows = rows, vrows = 0;
@@ -22016,8 +22315,9 @@ static inline int launch_qwen35_iq2xs_qkv_fused(hip_llm_runner *r,
         void *qw, void *kw, void *vw, void *x,
         int qrows, int krows, int vrows, int n_cols) {
     const char *env = getenv("LLM_QWEN35_IQ2_QKV_FUSED");
-    if (!env || atoi(env) == 0 || !r->fn_qwen35_matvec_iq2xs_qkv ||
-        qrows < 1 || krows < 1 || vrows < 1 || n_cols > 17408 ||
+    if (!env || atoi(env) == 0 || !qwen35_native_q81_ready(r) ||
+        !r->fn_qwen35_matvec_iq2xs_qkv ||
+        qrows < 1 || krows < 1 || vrows < 1 || n_cols <= 0 || n_cols > 17408 ||
         (n_cols % 256) != 0)
         return 0;
     launch_native_q81(r, x, n_cols);
@@ -22039,8 +22339,9 @@ static inline int launch_qwen35_iq2xs_gateup_fused(hip_llm_runner *r,
         void *gate, void *up, void *gate_w, void *up_w, void *x,
         int rows, int n_cols) {
     const char *env = getenv("LLM_QWEN35_IQ2_GATEUP_FUSED");
-    if (!env || atoi(env) == 0 || !r->fn_qwen35_matvec_iq2xs_qkv ||
-        rows < 1 || n_cols > 17408 || (n_cols % 256) != 0)
+    if (!env || atoi(env) == 0 || !qwen35_native_q81_ready(r) ||
+        !r->fn_qwen35_matvec_iq2xs_qkv ||
+        rows < 1 || n_cols <= 0 || n_cols > 17408 || (n_cols % 256) != 0)
         return 0;
     launch_native_q81(r, x, n_cols);
     int qrows = rows, krows = rows, vrows = 0;
@@ -22053,6 +22354,131 @@ static inline int launch_qwen35_iq2xs_gateup_fused(hip_llm_runner *r,
     LAUNCH(r->fn_qwen35_matvec_iq2xs_qkv,
            (qrows + krows + rows_per_block - 1) / rows_per_block,
            1, 1, (unsigned)threads, 1, 1, 0, r->stream, a);
+    return 1;
+}
+
+/* Opt-in mixed-IQ ordinary attention fusion.  Q/K/V may use different native
+ * IQ2/IQ3/IQ4 formats, but must share the input width.  The device kernel
+ * stages one Q8_1 activation and all small codebooks per block, then keeps the
+ * exact format-specific row arithmetic. */
+static inline int launch_qwen35_iq_mixed_qkv(hip_llm_runner *r,
+        void *qout, void *kout, void *vout,
+        void *qw, void *kw, void *vw, void *x,
+        int qrows, int krows, int vrows, int n_cols,
+        int qtype, int ktype, int vtype) {
+    const char *env = getenv("LLM_QWEN35_IQ_MIXED_QKV_FUSED");
+    if (!env || atoi(env) == 0 || !qwen35_native_q81_ready(r) ||
+        !r->fn_qwen35_matvec_iq_mixed_qkv || !x ||
+        qrows < 1 || krows < 1 || vrows < 1 || n_cols <= 0 ||
+        n_cols > 17408 || (n_cols % 256) != 0)
+        return 0;
+    int qkind = qwen35_iq_mixed_kind(qtype);
+    int kkind = qwen35_iq_mixed_kind(ktype);
+    int vkind = qwen35_iq_mixed_kind(vtype);
+    if (qkind < 0 || kkind < 0 || vkind < 0)
+        return 0;
+    launch_native_q81(r, x, n_cols);
+    int total = qrows + krows + vrows;
+    void *a[] = { &qout, &kout, &vout, &qw, &kw, &vw,
+                  &r->d_native_q81, &r->d_native_scale,
+                  &qrows, &krows, &vrows, &n_cols,
+                  &qkind, &kkind, &vkind };
+    int threads = qwen35_iq_mixed_threads();
+    int rows_per_block = threads / 32;
+    LAUNCH(r->fn_qwen35_matvec_iq_mixed_qkv,
+           (total + rows_per_block - 1) / rows_per_block, 1, 1,
+           (unsigned)threads, 1, 1, 0, r->stream, a);
+    return 1;
+}
+
+/* Same-format IQ2_S attention still pays three one-row launches because it
+ * has no dedicated Q/K/V entry point. Keep this diagnostic separate from the
+ * heterogeneous switch while sharing the exact IQ2_S branch and Q8_1 tile. */
+static inline int launch_qwen35_iq2s_qkv_fused(hip_llm_runner *r,
+        void *qout, void *kout, void *vout,
+        void *qw, void *kw, void *vw, void *x,
+        int qrows, int krows, int vrows, int n_cols) {
+    const char *env = getenv("LLM_QWEN35_IQ2S_QKV_FUSED");
+    if (!env || atoi(env) == 0 || !qwen35_native_q81_ready(r) ||
+        !r->fn_qwen35_matvec_iq_mixed_qkv || !x || qrows < 1 ||
+        krows < 1 || vrows < 1 || n_cols <= 0 || n_cols > 17408 ||
+        (n_cols % 256) != 0)
+        return 0;
+    launch_native_q81(r, x, n_cols);
+    int qkind = 2, kkind = 2, vkind = 2;
+    int total = qrows + krows + vrows;
+    void *a[] = { &qout, &kout, &vout, &qw, &kw, &vw,
+                  &r->d_native_q81, &r->d_native_scale,
+                  &qrows, &krows, &vrows, &n_cols,
+                  &qkind, &kkind, &vkind };
+    int threads = qwen35_iq_mixed_threads();
+    int rows_per_block = threads / 32;
+    LAUNCH(r->fn_qwen35_matvec_iq_mixed_qkv,
+           (total + rows_per_block - 1) / rows_per_block, 1, 1,
+           (unsigned)threads, 1, 1, 0, r->stream, a);
+    return 1;
+}
+
+/* The same mixed-IQ kernel can cover a heterogeneous dense FFN gate/up pair.
+ * Keep the V range empty so the device path only visits the two requested row
+ * ranges; the null V pointers are therefore never dereferenced.  This joins
+ * the activation quantization and launch for mixed IQ2/IQ3/IQ4 pairs while
+ * retaining each format's exact row arithmetic. */
+static inline int launch_qwen35_iq_mixed_gateup_fused(hip_llm_runner *r,
+        void *gate, void *up, void *gate_w, void *up_w, void *x,
+        int gate_rows, int up_rows, int n_cols,
+        int gate_type, int up_type) {
+    const char *env = getenv("LLM_QWEN35_IQ_MIXED_GATEUP_FUSED");
+    if (!env || atoi(env) == 0 || !qwen35_native_q81_ready(r) ||
+        !r->fn_qwen35_matvec_iq_mixed_qkv || !x || gate_rows < 1 ||
+        up_rows < 1 || n_cols <= 0 || n_cols > 17408 ||
+        (n_cols % 256) != 0 || gate_rows != up_rows ||
+        gate_type == up_type)
+        return 0;
+    int gate_kind = qwen35_iq_mixed_kind(gate_type);
+    int up_kind = qwen35_iq_mixed_kind(up_type);
+    if (gate_kind < 0 || up_kind < 0)
+        return 0;
+    launch_native_q81(r, x, n_cols);
+    int qrows = gate_rows, krows = up_rows, vrows = 0;
+    int vkind = gate_kind;
+    void *vout = NULL, *vw = NULL;
+    void *a[] = { &gate, &up, &vout, &gate_w, &up_w, &vw,
+                  &r->d_native_q81, &r->d_native_scale,
+                  &qrows, &krows, &vrows, &n_cols,
+                  &gate_kind, &up_kind, &vkind };
+    int threads = qwen35_iq_mixed_threads();
+    int rows_per_block = threads / 32;
+    LAUNCH(r->fn_qwen35_matvec_iq_mixed_qkv,
+           (qrows + krows + rows_per_block - 1) / rows_per_block, 1, 1,
+           (unsigned)threads, 1, 1, 0, r->stream, a);
+    return 1;
+}
+
+/* IQ2_S is the one common same-format FFN pair without a dedicated native
+ * gate/up kernel. Reuse the mixed-IQ implementation under its own switch so
+ * the diagnostic can be measured independently from heterogeneous pairs. */
+static inline int launch_qwen35_iq2s_gateup_fused(hip_llm_runner *r,
+        void *gate, void *up, void *gate_w, void *up_w, void *x,
+        int rows, int n_cols) {
+    const char *env = getenv("LLM_QWEN35_IQ2S_GATEUP_FUSED");
+    if (!env || atoi(env) == 0 || !qwen35_native_q81_ready(r) ||
+        !r->fn_qwen35_matvec_iq_mixed_qkv || !x || rows < 1 ||
+        n_cols <= 0 || n_cols > 17408 || (n_cols % 256) != 0)
+        return 0;
+    launch_native_q81(r, x, n_cols);
+    int qrows = rows, krows = rows, vrows = 0;
+    int qkind = 2, kkind = 2, vkind = 2;
+    void *vout = NULL, *vw = NULL;
+    void *a[] = { &gate, &up, &vout, &gate_w, &up_w, &vw,
+                  &r->d_native_q81, &r->d_native_scale,
+                  &qrows, &krows, &vrows, &n_cols,
+                  &qkind, &kkind, &vkind };
+    int threads = qwen35_iq_mixed_threads();
+    int rows_per_block = threads / 32;
+    LAUNCH(r->fn_qwen35_matvec_iq_mixed_qkv,
+           (qrows + krows + rows_per_block - 1) / rows_per_block, 1, 1,
+           (unsigned)threads, 1, 1, 0, r->stream, a);
     return 1;
 }
 
@@ -22416,7 +22842,8 @@ static inline void launch_matvec_iq2_s_dp4a_prequant(hip_llm_runner *r,
  * full-utilization F32 fallback. Used by launch_matvec_auto + verify harness. */
 static inline void launch_matvec_iq2_s(hip_llm_runner *r, void *dst, void *mat,
                                        void *x, int n_rows, int n_cols) {
-    if (r->fn_qwen35_matvec_iq2s && n_cols <= 17408 && n_cols % 256 == 0) {
+    if (qwen35_native_q81_ready(r) && r->fn_qwen35_matvec_iq2s &&
+        n_cols <= 17408 && n_cols % 256 == 0) {
         r->q8x2_reuse_valid = 0;
         r->iq1_q8_valid = 0;
         launch_native_q81(r, x, n_cols);
@@ -22487,7 +22914,8 @@ static inline void launch_matvec_iq2_s(hip_llm_runner *r, void *dst, void *mat,
 }
 static inline void launch_matvec_iq3_s(hip_llm_runner *r, void *dst, void *mat,
                                        void *x, int n_rows, int n_cols) {
-    if (r->fn_qwen35_matvec_iq3s && n_cols <= 17408 && n_cols % 256 == 0) {
+    if (qwen35_native_q81_ready(r) && r->fn_qwen35_matvec_iq3s &&
+        n_cols <= 17408 && n_cols % 256 == 0) {
         r->q8x2_reuse_valid = 0;
         r->iq1_q8_valid = 0;
         launch_native_q81(r, x, n_cols);
@@ -23532,6 +23960,19 @@ static inline void launch_attn_verify_native_q8(hip_llm_runner *r, void *out,
     void *a[] = { &out, &parts, &meta, &q, &k, &v, &ks, &vs, &positions,
         &r->n_heads, &r->n_kv_heads, &r->q8_attention_nsm, &occupancy,
         &forced_splits, &queries, &position_start };
+    const char *fused_split_env = getenv("LLM_QWEN35_VERIFY_FUSED_SPLIT_COMBINE");
+    int fused_split = fused_split_env && atoi(fused_split_env) != 0 &&
+        group_queries && queries > 1 && queries <= 16 &&
+        r->fn_q8_attention_decode_verify_fused;
+    if (fused_split) {
+        void *fa[] = { &out, &parts, &meta, &q, &k, &v, &ks, &vs,
+            &gate, &positions, &r->n_heads, &r->n_kv_heads,
+            &r->q8_attention_nsm, &occupancy, &forced_splits, &queries,
+            &position_start };
+        LAUNCH(r->fn_q8_attention_decode_verify_fused, r->n_heads,
+               (queries + 3) / 4, 1, 32, 4, 1, 0, r->stream, fa);
+        return;
+    }
     if (group_queries && queries > 1 && queries <= 8 &&
         r->fn_q8_attention_decode_reuse8) {
         const char *fixed8_env = getenv("LLM_QWEN35_VERIFY_ATTN_FIXED8");
@@ -29470,6 +29911,28 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
                                      cl->attn_q_w, cl->attn_k_w, cl->attn_v_w,
                                      r->d_xb, cl->attn_q_rows, cl->attn_k_rows,
                                      cl->attn_v_rows, cl->attn_q_cols);
+            } else if (cl->attn_q_type == GGML_TYPE_IQ2_S &&
+                       cl->attn_k_type == GGML_TYPE_IQ2_S &&
+                       cl->attn_v_type == GGML_TYPE_IQ2_S &&
+                       cl->attn_q_cols == cl->attn_k_cols &&
+                       cl->attn_q_cols == cl->attn_v_cols &&
+                       launch_qwen35_iq2s_qkv_fused(
+                           r, r->d_xb2, r->d_k, r->d_v,
+                           cl->attn_q_w, cl->attn_k_w, cl->attn_v_w,
+                           r->d_xb, cl->attn_q_rows, cl->attn_k_rows,
+                           cl->attn_v_rows, cl->attn_q_cols)) {
+                /* The opt-in same-format IQ2_S candidate owns all projections. */
+            } else if (cl->attn_q_cols == cl->attn_k_cols &&
+                       cl->attn_q_cols == cl->attn_v_cols &&
+                       !(cl->attn_q_type == cl->attn_k_type &&
+                         cl->attn_q_type == cl->attn_v_type) &&
+                       launch_qwen35_iq_mixed_qkv(
+                           r, r->d_xb2, r->d_k, r->d_v,
+                           cl->attn_q_w, cl->attn_k_w, cl->attn_v_w,
+                           r->d_xb, cl->attn_q_rows, cl->attn_k_rows,
+                           cl->attn_v_rows, cl->attn_q_cols,
+                           cl->attn_q_type, cl->attn_k_type, cl->attn_v_type)) {
+                /* The opt-in mixed-IQ candidate owns all three projections. */
             } else if (cl->attn_q_type == GGML_TYPE_Q2_K &&
                        cl->attn_k_type == GGML_TYPE_Q2_K &&
                        cl->attn_v_type == GGML_TYPE_Q2_K &&
@@ -29735,6 +30198,28 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
                                      cl->attn_q_w, cl->attn_k_w, cl->attn_v_w,
                                      r->d_xb, cl->attn_q_rows, cl->attn_k_rows,
                                      cl->attn_v_rows, cl->attn_q_cols);
+            } else if (cl->attn_q_cols == cl->attn_k_cols &&
+                       cl->attn_q_cols == cl->attn_v_cols &&
+                       !(cl->attn_q_type == cl->attn_k_type &&
+                         cl->attn_q_type == cl->attn_v_type) &&
+                       launch_qwen35_iq_mixed_qkv(
+                           r, r->d_q, r->d_k, r->d_v,
+                           cl->attn_q_w, cl->attn_k_w, cl->attn_v_w,
+                           r->d_xb, cl->attn_q_rows, cl->attn_k_rows,
+                           cl->attn_v_rows, cl->attn_q_cols,
+                           cl->attn_q_type, cl->attn_k_type, cl->attn_v_type)) {
+                /* The opt-in mixed-IQ candidate owns all three projections. */
+            } else if (cl->attn_q_type == GGML_TYPE_Q4_K &&
+                       cl->attn_k_type == GGML_TYPE_Q4_K &&
+                       cl->attn_v_type == GGML_TYPE_Q4_K &&
+                       cl->attn_q_cols == cl->attn_k_cols &&
+                       cl->attn_q_cols == cl->attn_v_cols &&
+                       launch_qwen35_q4k_qkv_fused(
+                           r, r->d_q, r->d_k, r->d_v,
+                           cl->attn_q_w, cl->attn_k_w, cl->attn_v_w,
+                           r->d_xb, cl->attn_q_rows, cl->attn_k_rows,
+                           cl->attn_v_rows, cl->attn_q_cols)) {
+                /* The opt-in Q4_K/Q8_1 candidate owns all projections. */
             } else if (cl->attn_q_type == GGML_TYPE_Q2_K &&
                        cl->attn_k_type == GGML_TYPE_Q2_K &&
                        cl->attn_v_type == GGML_TYPE_Q2_K &&
@@ -29959,6 +30444,24 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
                 } else
                     LAUNCH(r->fn_ffn_gate_up_silu_iq3xxs, n_ff, 1, 1, 256, 1, 1, 0, r->stream, a);
             } else {
+                int fused_mixed_iq_gateup =
+                    cl->ffn_gate_type != cl->ffn_up_type &&
+                    cl->ffn_gate_rows == cl->ffn_up_rows &&
+                    cl->ffn_gate_cols == cl->ffn_up_cols &&
+                    launch_qwen35_iq_mixed_gateup_fused(
+                        r, r->d_gate, r->d_up, cl->ffn_gate_w,
+                        cl->ffn_up_w, r->d_xb, cl->ffn_gate_rows,
+                        cl->ffn_up_rows, cl->ffn_gate_cols,
+                        cl->ffn_gate_type, cl->ffn_up_type);
+                int fused_iq2s_gateup = !fused_mixed_iq_gateup &&
+                    cl->ffn_gate_type == GGML_TYPE_IQ2_S &&
+                    cl->ffn_up_type == GGML_TYPE_IQ2_S &&
+                    cl->ffn_gate_rows == cl->ffn_up_rows &&
+                    cl->ffn_gate_cols == cl->ffn_up_cols &&
+                    launch_qwen35_iq2s_gateup_fused(
+                        r, r->d_gate, r->d_up, cl->ffn_gate_w,
+                        cl->ffn_up_w, r->d_xb, cl->ffn_gate_rows,
+                        cl->ffn_gate_cols);
                 int fused_q2k_gateup =
                     cl->ffn_gate_type == GGML_TYPE_Q2_K &&
                     cl->ffn_up_type == GGML_TYPE_Q2_K &&
@@ -30035,7 +30538,8 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
                     !fused_iq2_gateup &&
                     !fused_iq3_gateup && !fused_iq3s_gateup &&
                     !fused_iq4_gateup &&
-                    !fused_iq1_gateup) {
+                    !fused_iq1_gateup && !fused_mixed_iq_gateup &&
+                    !fused_iq2s_gateup) {
                     begin_q8x2_reuse(r);
                     launch_matvec_ffn_auto(r, r->d_gate, cl->ffn_gate_w, r->d_xb,
                                           cl->ffn_gate_rows, cl->ffn_gate_cols,

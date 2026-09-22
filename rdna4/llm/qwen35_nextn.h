@@ -516,12 +516,43 @@ static void hllm_dense_mtp_ssm(hip_llm_runner *r, hip_layer *cl, int l, int rows
         rows, cl->ssm_qkv_rows, cl->ssm_qkv_cols, cl->ssm_qkv_type);
     hllm_dense_mtp_projection(r, m->verify_ssm_z, cl->ssm_gate_w, m->verify_norm,
         rows, cl->ssm_gate_rows, cl->ssm_gate_cols, cl->ssm_gate_type);
-    if (cl->ssm_alpha_type == GGML_TYPE_BF16)
+    const char *pair_env = getenv("LLM_QWEN35_MTP_F16_PAIR_BATCH");
+    int pair_f16 = pair_env && atoi(pair_env) != 0 &&
+        cl->ssm_alpha_type == GGML_TYPE_F16 &&
+        cl->ssm_beta_type == GGML_TYPE_F16 &&
+        cl->ssm_alpha_rows == cl->ssm_beta_rows &&
+        cl->ssm_alpha_cols == cl->ssm_beta_cols &&
+        cl->ssm_alpha_rows == dt && cl->ssm_alpha_cols == ne &&
+        r->fn_matvec_f16_llama_pair_batch_f32;
+    const char *pair_bf16_env = getenv("LLM_QWEN35_MTP_BF16_PAIR_BATCH");
+    int pair_bf16 = pair_bf16_env && atoi(pair_bf16_env) != 0 &&
+        cl->ssm_alpha_type == GGML_TYPE_BF16 &&
+        cl->ssm_beta_type == GGML_TYPE_BF16 &&
+        cl->ssm_alpha_rows == cl->ssm_beta_rows &&
+        cl->ssm_alpha_cols == cl->ssm_beta_cols &&
+        cl->ssm_alpha_rows == dt && cl->ssm_alpha_cols == ne &&
+        r->fn_matvec_bf16_llama_pair_batch_f32;
+    if (pair_f16) {
+        /* Alpha and beta use the same verifier rows and F16 MMVF contract.
+         * Flatten both output matrices into one grid to remove a launch per
+         * recurrent layer without changing either row's FMA/reduction order. */
+        launch_matvec_llama_f16_pair_batch(r, m->verify_ssm_alpha,
+            m->verify_ssm_beta, cl->ssm_alpha_w, cl->ssm_beta_w,
+            m->verify_norm, cl->ssm_alpha_rows, cl->ssm_alpha_cols, rows);
+    } else if (pair_bf16) {
+        /* BF16 uses the same exact llama.cpp block-size heuristic and
+         * reduction order as the standalone projection. */
+        launch_matvec_llama_bf16_pair_batch(r, m->verify_ssm_alpha,
+            m->verify_ssm_beta, cl->ssm_alpha_w, cl->ssm_beta_w,
+            m->verify_norm, cl->ssm_alpha_rows, cl->ssm_alpha_cols, rows);
+    } else if (cl->ssm_alpha_type == GGML_TYPE_BF16)
         launch_matvec_llama_bf16_batch(r,m->verify_ssm_alpha,cl->ssm_alpha_w,
                                        m->verify_norm,dt,ne,rows);
     else launch_matvec_llama_f16_batch(r,m->verify_ssm_alpha,cl->ssm_alpha_w,
                                        m->verify_norm,dt,ne,rows);
-    if (cl->ssm_beta_type == GGML_TYPE_BF16)
+    if (pair_f16 || pair_bf16) {
+        /* The paired launch above already produced beta. */
+    } else if (cl->ssm_beta_type == GGML_TYPE_BF16)
         launch_matvec_llama_bf16_batch(r,m->verify_ssm_beta,cl->ssm_beta_w,
                                        m->verify_norm,dt,ne,rows);
     else launch_matvec_llama_f16_batch(r,m->verify_ssm_beta,cl->ssm_beta_w,

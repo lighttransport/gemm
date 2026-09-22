@@ -667,6 +667,192 @@ extern "C" __global__ void qwen35_matvec_iq3s_qkv(
     if (lane == 0) out[local_row] = sum;
 }
 
+/* One-token mixed-IQ Q/K/V projection.  Qwen3.8 attention commonly mixes
+ * IQ2/IQ3/IQ4 row formats across Q, K, and V.  Keep one row per warp, but
+ * select the format once for that row so the shared Q8_1 activation and all
+ * relevant codebooks are staged once per block.  Each format branch mirrors
+ * its standalone kernel's dot, scale, and warp-reduction order; this is a
+ * diagnostic candidate until resident hashes and long-context timing prove
+ * that the launch reduction outweighs the extra format branch.
+ *
+ * kind: 0=IQ2_XXS, 1=IQ2_XS, 2=IQ2_S, 3=IQ3_XXS, 4=IQ3_S, 5=IQ4_XS. */
+extern "C" __global__ void qwen35_matvec_iq_mixed_qkv(
+        float *__restrict__ qout, float *__restrict__ kout,
+        float *__restrict__ vout,
+        const unsigned char *__restrict__ qw,
+        const unsigned char *__restrict__ kw,
+        const unsigned char *__restrict__ vw,
+        const signed char *__restrict__ q, const float *__restrict__ scales,
+        int qrows, int krows, int vrows, int cols,
+        int qkind, int kkind, int vkind) {
+    __shared__ unsigned long long grid2xxs[256];
+    __shared__ unsigned long long grid2xs[512];
+    __shared__ unsigned long long grid2s[1024];
+    __shared__ unsigned int grid3xxs[256];
+    __shared__ unsigned int grid3s[512];
+    /* Mixed attention usually uses only two or three formats.  Stage just
+     * the codebooks selected by Q/K/V; all lanes take the same branches, so
+     * the barrier remains uniform while LDS traffic and setup work shrink. */
+    int need2s = qkind == 2 || kkind == 2 || vkind == 2;
+    int need2xs = qkind == 1 || kkind == 1 || vkind == 1;
+    int need3xxs = qkind == 3 || kkind == 3 || vkind == 3;
+    int need3s = qkind == 4 || kkind == 4 || vkind == 4;
+    int need2xxs = qkind == 0 || kkind == 0 || vkind == 0;
+    if (need2s)
+        for (int i = threadIdx.x; i < 1024; i += blockDim.x)
+            grid2s[i] = qwen35_iq2s_grid[i];
+    if (need2xs || need3s)
+        for (int i = threadIdx.x; i < 512; i += blockDim.x) {
+            if (need2xs) grid2xs[i] = qwen35_iq2xs_grid[i];
+            if (need3s) grid3s[i] = qwen35_iq3s_grid[i];
+        }
+    if (need2xxs || need3xxs)
+        for (int i = threadIdx.x; i < 256; i += blockDim.x) {
+            if (need2xxs) grid2xxs[i] = qwen35_iq2xxs_grid[i];
+            if (need3xxs) grid3xxs[i] = qwen35_iq3xxs_grid[i];
+        }
+    __syncthreads();
+
+    int lane = threadIdx.x & 31;
+    int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    int total_rows = qrows + krows + vrows;
+    if (row >= total_rows) return;
+
+    float *out;
+    const unsigned char *weights;
+    int local_row, kind;
+    if (row < qrows) {
+        out = qout; weights = qw; local_row = row; kind = qkind;
+    } else if (row < qrows + krows) {
+        out = kout; weights = kw; local_row = row - qrows; kind = kkind;
+    } else {
+        out = vout; weights = vw;
+        local_row = row - qrows - krows; kind = vkind;
+    }
+
+    int blocks = cols / 256;
+    int block_bytes = kind == 0 ? 66 : kind == 1 ? 74 :
+                       kind == 2 ? 82 : kind == 3 ? 98 :
+                       kind == 4 ? 110 : 136;
+    const unsigned char *w = weights + (size_t)local_row * blocks * block_bytes;
+    float sum = 0.0f;
+
+    if (kind == 5) {
+        /* IQ4_XS retains its eight virtual warp passes and accumulation order. */
+        for (int virtual_warp = 0; virtual_warp < 8; ++virtual_warp) {
+            float partial = 0.0f;
+            for (int qb = lane + 32 * virtual_warp;
+                 qb < blocks * 8; qb += 256) {
+                int ib = qb & 7;
+                const unsigned char *p = w + (qb / 8) * 136;
+                const int *u = (const int *)(q + qb * 32);
+                const unsigned int *v = (const unsigned int *)(p + 8 + ib * 16);
+                int z = 0;
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    z = qwen35_dot4(qwen35_iq4_lookup(v[j]), u[j], z);
+                    z = qwen35_dot4(qwen35_iq4_lookup(v[j] >> 4), u[j + 4], z);
+                }
+                int ls = ((p[4 + ib / 2] >> (4 * (ib & 1))) & 15) |
+                    (((*(const unsigned short *)(p + 2) >> (2 * ib)) & 3) << 4);
+                z *= ls - 32;
+                float d = (float)*(const _Float16 *)p * scales[qb];
+                partial += d * z;
+            }
+            sum += partial;
+        }
+    } else {
+        for (int qb = lane; qb < blocks * 8; qb += 32) {
+            int ib = qb & 7;
+            const unsigned char *p = w + (qb / 8) * block_bytes;
+            const int *u = (const int *)(q + qb * 32);
+            int z0 = 0, z1 = 0, z = 0;
+            if (kind == 0) {
+                unsigned int aux = *(const unsigned int *)(p + 6 + ib * 8);
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    unsigned long long grid = grid2xxs[p[2 + ib * 8 + j]];
+                    unsigned int signs = qwen35_parity_signs((aux >> (7 * j)) & 127);
+                    z = qwen35_dot4(qwen35_signed_grid((unsigned int)grid, signs, 0),
+                                    u[2 * j], z);
+                    z = qwen35_dot4(qwen35_signed_grid((unsigned int)(grid >> 32), signs, 4),
+                                    u[2 * j + 1], z);
+                }
+                z = z * (int)((aux >> 27) | 1) / 8;
+            } else if (kind == 1) {
+                unsigned int sc = p[66 + ib];
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    unsigned int code = ((const unsigned short *)(p + 2))[ib * 4 + j];
+                    unsigned long long grid = grid2xs[code & 511];
+                    unsigned int signs = qwen35_parity_signs(code >> 9);
+                    int lo = qwen35_signed_grid((unsigned int)grid, signs, 0);
+                    int hi = qwen35_signed_grid((unsigned int)(grid >> 32), signs, 4);
+                    if (j < 2) {
+                        z0 = qwen35_dot4(lo, u[2 * j], z0);
+                        z0 = qwen35_dot4(hi, u[2 * j + 1], z0);
+                    } else {
+                        z1 = qwen35_dot4(lo, u[2 * j], z1);
+                        z1 = qwen35_dot4(hi, u[2 * j + 1], z1);
+                    }
+                }
+                z = (z0 * (int)(sc & 15) + z1 * (int)(sc >> 4) +
+                     (z0 + z1) / 2) / 4;
+            } else if (kind == 2) {
+                unsigned int qh = p[66 + ib], sc = p[74 + ib];
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    int index = p[2 + ib * 4 + j] | ((qh << (8 - 2 * j)) & 0x300);
+                    unsigned long long grid = grid2s[index];
+                    unsigned int signs = p[34 + ib * 4 + j];
+                    int lo = qwen35_signed_grid((unsigned int)grid, signs, 0);
+                    int hi = qwen35_signed_grid((unsigned int)(grid >> 32), signs, 4);
+                    if (j < 2) {
+                        z0 = qwen35_dot4(lo, u[2 * j], z0);
+                        z0 = qwen35_dot4(hi, u[2 * j + 1], z0);
+                    } else {
+                        z1 = qwen35_dot4(lo, u[2 * j], z1);
+                        z1 = qwen35_dot4(hi, u[2 * j + 1], z1);
+                    }
+                }
+                z = (z0 * (int)(sc & 15) + z1 * (int)(sc >> 4) +
+                     (z0 + z1) / 2) / 4;
+            } else if (kind == 3) {
+                unsigned int aux = *(const unsigned int *)(p + 66 + ib * 4);
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    unsigned int signs = qwen35_parity_signs((aux >> (7 * j)) & 127);
+                    int lo = qwen35_signed_grid(grid3xxs[p[2 + ib * 8 + 2 * j]], signs, 0);
+                    int hi = qwen35_signed_grid(grid3xxs[p[3 + ib * 8 + 2 * j]], signs, 4);
+                    z = qwen35_dot4(lo, u[2 * j], z);
+                    z = qwen35_dot4(hi, u[2 * j + 1], z);
+                }
+                z = ((int)(aux >> 28) * z + z / 2) / 2;
+            } else {
+                unsigned int qh = p[66 + ib];
+                unsigned long long codes = *(const unsigned long long *)(p + 2 + ib * 8);
+                unsigned int packed_signs = *(const unsigned int *)(p + 74 + ib * 4);
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    unsigned int signs = (packed_signs >> (8 * j)) & 255;
+                    int il = ((codes >> (16 * j)) & 255) | ((qh << (8 - 2 * j)) & 0x100);
+                    int ih = ((codes >> (16 * j + 8)) & 255) | ((qh << (7 - 2 * j)) & 0x100);
+                    int lo = qwen35_signed_grid(grid3s[il], signs, 0);
+                    int hi = qwen35_signed_grid(grid3s[ih], signs, 4);
+                    z = qwen35_dot4(lo, u[2 * j], z);
+                    z = qwen35_dot4(hi, u[2 * j + 1], z);
+                }
+                z *= 1 + 2 * ((p[106 + ib / 2] >> ((ib & 1) * 4)) & 15);
+            }
+            float d = (float)*(const _Float16 *)p * scales[qb];
+            sum += d * z;
+        }
+    }
+    for (int offset = 16; offset; offset >>= 1)
+        sum += __shfl_xor(sum, offset, 32);
+    if (lane == 0) out[local_row] = sum;
+}
+
 /* Decode each IQ grid once for several speculative activation rows.  DFlash2
  * verifies five or eight rows at a time, so keep a wider specialization in
  * addition to the lower-register four-row kernel used by dense NextN. */

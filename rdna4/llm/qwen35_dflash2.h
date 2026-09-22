@@ -308,13 +308,15 @@ static void hllm_dflash_project(hip_llm_runner *r, void *dst, void *weight,
     hllm_qwen35_dflash2 *d=r->qwen35_dflash2;
     int q4_q81=type==GGML_TYPE_Q4_K && rows>1 &&
         rows<=HLLM_DFLASH_MAX_BLOCK && stride==nc && nc%256==0 &&
-        r->fn_qwen35_quantize_q81 && r->fn_qwen35_matvec_q4k_q81_multi8 &&
+        r->fn_qwen35_quantize_q81 && r->d_act_q8_batch &&
+        r->d_act_scale_batch && r->fn_qwen35_matvec_q4k_q81_multi8 &&
         (rows != 4 || r->fn_qwen35_matvec_q4k_q81_multi4) &&
         (rows != 5 || r->fn_qwen35_matvec_q4k_q81_multi5);
     int iq4_q81=type==GGML_TYPE_IQ4_XS &&
         rows >= HLLM_DFLASH_ATTN_ROWS_PER_WAVE &&
         rows <= HLLM_DFLASH_MAX_BLOCK && stride == nc &&
         nc % 256 == 0 && r->fn_qwen35_quantize_q81 &&
+        r->d_act_q8_batch && r->d_act_scale_batch &&
         r->fn_qwen35_matvec_iq4xs_multi8;
     if(!q4_q81 && !iq4_q81)d->q81_source=NULL;
     if (type == GGML_TYPE_Q2_K && rows > 1 &&
@@ -393,12 +395,17 @@ static int hllm_dflash_project_qkv_fused(hip_llm_runner *r,
     const char *env = getenv("LLM_QWEN35_DFLASH_QKV_FUSED");
     if (!env || atoi(env) == 0 || !r || !d ||
         !r->fn_qwen35_matvec_q4k_q81_qkv || !r->fn_qwen35_quantize_q81 ||
+        !r->d_act_q8_batch || !r->d_act_scale_batch ||
         qtype != GGML_TYPE_Q4_K || ktype != GGML_TYPE_Q4_K ||
         vtype != GGML_TYPE_Q4_K || rows < 1 || rows > HLLM_DFLASH_MAX_BLOCK ||
         qrows < 1 || krows < 1 || vrows < 1 || nc <= 0 ||
         stride != nc || (nc % 256) != 0)
         return 0;
     hipFunction_t fn = r->fn_qwen35_matvec_q4k_q81_qkv;
+    const char *fixed8_env = getenv("LLM_QWEN35_DFLASH_QKV_FIXED8");
+    if (rows == 8 && fixed8_env && atoi(fixed8_env) != 0 &&
+        r->fn_qwen35_matvec_q4k_q81_qkv_fixed8)
+        fn = r->fn_qwen35_matvec_q4k_q81_qkv_fixed8;
     if (rows == 5 && r->fn_qwen35_matvec_q4k_q81_qkv5)
         fn = r->fn_qwen35_matvec_q4k_q81_qkv5;
     if (d->q81_source != x || d->q81_rows != rows ||
@@ -435,6 +442,7 @@ static int hllm_dflash_project_gateup_fused(hip_llm_runner *r,
     const char *env = getenv("LLM_QWEN35_DFLASH_GATEUP_FUSED");
     if (!env || atoi(env) == 0 || !r || !d ||
         !r->fn_qwen35_matvec_q4k_q81_qkv || !r->fn_qwen35_quantize_q81 ||
+        !r->d_act_q8_batch || !r->d_act_scale_batch ||
         gtype != GGML_TYPE_Q4_K || utype != GGML_TYPE_Q4_K ||
         rows < 1 || rows > HLLM_DFLASH_MAX_BLOCK ||
         grows < 1 || urows < 1 || nc <= 0 || stride != nc ||
@@ -455,6 +463,10 @@ static int hllm_dflash_project_gateup_fused(hip_llm_runner *r,
     int vrows = 0;
     void *vout = NULL, *vw = NULL;
     hipFunction_t fn = r->fn_qwen35_matvec_q4k_q81_qkv;
+    const char *fixed8_env = getenv("LLM_QWEN35_DFLASH_QKV_FIXED8");
+    if (rows == 8 && fixed8_env && atoi(fixed8_env) != 0 &&
+        r->fn_qwen35_matvec_q4k_q81_qkv_fixed8)
+        fn = r->fn_qwen35_matvec_q4k_q81_qkv_fixed8;
     if (rows == 5 && r->fn_qwen35_matvec_q4k_q81_qkv5)
         fn = r->fn_qwen35_matvec_q4k_q81_qkv5;
     void *a[] = { &gout, &uout, &vout, &gw, &uw, &vw,
@@ -463,6 +475,55 @@ static int hllm_dflash_project_gateup_fused(hip_llm_runner *r,
     LAUNCH(fn,
            (grows + urows + 7) / 8, 1, 1,
            256, 1, 1, 0, r->stream, a);
+    r->q8x2_reuse_valid = r->iq1_q8_valid = r->batch_q8_valid = 0;
+    return 1;
+}
+
+/* The selector consumes the same normalized proposal rows for vocabulary
+ * logits and its rank-sized hidden projection. Keep both Q4_K output ranges
+ * in one grid so activation quantization and launch setup are shared. Each
+ * output row retains qwen35_matvec_q4k_q81_qkv's dot, affine correction, and
+ * warp reduction order; this remains an explicit A/B switch until resident
+ * selector hashes and draft timing are measured. */
+static int hllm_dflash_project_selector_fused(hip_llm_runner *r,
+        hllm_qwen35_dflash2 *d, void *logits, void *gate,
+        void *logits_w, void *hidden_w, void *x, int rows, int nc) {
+    const char *env = getenv("LLM_QWEN35_DFLASH_SELECTOR_FUSED");
+    if (!env || atoi(env) == 0 || !r || !d || !x || !logits || !gate ||
+        !logits_w || !hidden_w ||
+        !r->fn_qwen35_matvec_q4k_q81_qkv || !r->fn_qwen35_quantize_q81 ||
+        !r->d_act_q8_batch || !r->d_act_scale_batch ||
+        r->output_w_type != GGML_TYPE_Q4_K ||
+        d->selector_hidden_type != GGML_TYPE_Q4_K || rows < 3 ||
+        rows > HLLM_DFLASH_MAX_BLOCK || nc <= 0 || (nc % 256) != 0 ||
+        r->n_vocab <= 0 || HLLM_DFLASH_RANK <= 0)
+        return 0;
+    int count = rows - 1;
+    if (d->q81_source != x || d->q81_rows != count ||
+        d->q81_cols != nc || d->q81_type != GGML_TYPE_Q4_K) {
+        int total = count * nc;
+        void *qa[] = { &r->d_act_q8_batch, &r->d_act_scale_batch,
+                       &x, &total };
+        LAUNCH(r->fn_qwen35_quantize_q81, total / 32, 1, 1,
+               32, 1, 1, 0, r->stream, qa);
+        d->q81_source = x;
+        d->q81_rows = count;
+        d->q81_cols = nc;
+        d->q81_type = GGML_TYPE_Q4_K;
+    }
+    int qrows = r->n_vocab, krows = HLLM_DFLASH_RANK, vrows = 0;
+    void *vout = NULL, *vweight = NULL;
+    hipFunction_t fn = count == 7 && r->fn_qwen35_matvec_q4k_q81_qkv_fixed7 ?
+        r->fn_qwen35_matvec_q4k_q81_qkv_fixed7 :
+        (count == 4 && r->fn_qwen35_matvec_q4k_q81_qkv_fixed4 ?
+         r->fn_qwen35_matvec_q4k_q81_qkv_fixed4 :
+         r->fn_qwen35_matvec_q4k_q81_qkv);
+    void *a[] = { &logits, &gate, &vout, &logits_w, &hidden_w, &vweight,
+                  &r->d_act_q8_batch, &r->d_act_scale_batch,
+                  &qrows, &krows, &vrows, &nc, &count };
+    LAUNCH(fn,
+           (qrows + krows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, a);
+    d->q81_source = NULL;
     r->q8x2_reuse_valid = r->iq1_q8_valid = r->batch_q8_valid = 0;
     return 1;
 }
@@ -476,7 +537,8 @@ static int hllm_dflash_silu_q81_fused(hip_llm_runner *r,
         int rows, int n_ff, int down_type) {
     const char *env = getenv("LLM_QWEN35_DFLASH_SILU_Q81_FUSED");
     if (!env || atoi(env) == 0 || !r || !d || !gate || !up ||
-        !r->fn_silu_mul_q81_batch_f32 || down_type != GGML_TYPE_Q4_K ||
+        !r->fn_silu_mul_q81_batch_f32 || !r->d_act_q8_batch ||
+        !r->d_act_scale_batch || down_type != GGML_TYPE_Q4_K ||
         rows < 2 || rows > HLLM_DFLASH_MAX_BLOCK || n_ff <= 0 ||
         (n_ff % 256) != 0)
         return 0;
@@ -536,11 +598,17 @@ static int hllm_qwen35_dflash2_inject_impl(hip_llm_runner *r, int position,
             hllm_dflash_project(r, v, cl->v, x, rows, kd, ne, ne,
                                 cl->v_type);
         }
-        launch_qknorm_batch(r, layer_k, cl->k_norm, HLLM_DFLASH_KV_HEADS,
-                            HLLM_DFLASH_HEAD_DIM, rows, batch_stride, r->rms_norm_eps);
-        launch_rope_mrope_batch(r, layer_k, HLLM_DFLASH_KV_HEADS, HLLM_DFLASH_HEAD_DIM,
-            position, r->rope_freq_base, HLLM_DFLASH_HEAD_DIM / 2, 0, 0, 0,
-            batch_stride, rows);
+        if (!launch_qknorm_rope_mrope_batch(r, layer_k, cl->k_norm,
+                HLLM_DFLASH_KV_HEADS, HLLM_DFLASH_HEAD_DIM, position,
+                r->rope_freq_base, HLLM_DFLASH_HEAD_DIM / 2, 0, 0, 0,
+                batch_stride, rows, r->rms_norm_eps)) {
+            launch_qknorm_batch(r, layer_k, cl->k_norm, HLLM_DFLASH_KV_HEADS,
+                                HLLM_DFLASH_HEAD_DIM, rows, batch_stride,
+                                r->rms_norm_eps);
+            launch_rope_mrope_batch(r, layer_k, HLLM_DFLASH_KV_HEADS,
+                HLLM_DFLASH_HEAD_DIM, position, r->rope_freq_base,
+                HLLM_DFLASH_HEAD_DIM / 2, 0, 0, 0, batch_stride, rows);
+        }
         launch_kv_store_batch_strided(r, cl->key_cache, cl->value_cache,
             layer_k, layer_v, position, rows, kd, batch_stride, HLLM_DFLASH_WINDOW);
     }
@@ -880,12 +948,18 @@ int hip_llm_qwen35_dflash2_propose(hip_llm_runner *r, int32_t anchor,
             hllm_dflash_project(r,d->k,cl->k,d->conv,rows,kd,ne,ne,cl->k_type);
             hllm_dflash_project(r,d->v,cl->v,d->conv,rows,kd,ne,ne,cl->v_type);
         }
-        launch_qknorm_batch(r,d->q,cl->q_norm,HLLM_DFLASH_HEADS,HLLM_DFLASH_HEAD_DIM,rows,qd,r->rms_norm_eps);
-        launch_qknorm_batch(r,d->k,cl->k_norm,HLLM_DFLASH_KV_HEADS,HLLM_DFLASH_HEAD_DIM,rows,kd,r->rms_norm_eps);
-        launch_rope_mrope_batch(r,d->q,HLLM_DFLASH_HEADS,HLLM_DFLASH_HEAD_DIM,position,
-            r->rope_freq_base,HLLM_DFLASH_HEAD_DIM/2,0,0,0,qd,rows);
-        launch_rope_mrope_batch(r,d->k,HLLM_DFLASH_KV_HEADS,HLLM_DFLASH_HEAD_DIM,position,
-            r->rope_freq_base,HLLM_DFLASH_HEAD_DIM/2,0,0,0,kd,rows);
+        if (!launch_qknorm_rope_pair_batch(r, d->q, cl->q_norm,
+                HLLM_DFLASH_HEADS, d->k, cl->k_norm, HLLM_DFLASH_KV_HEADS,
+                HLLM_DFLASH_HEAD_DIM, qd, kd, position, r->rope_freq_base,
+                HLLM_DFLASH_HEAD_DIM / 2, 0, 0, 0, rows,
+                r->rms_norm_eps)) {
+            launch_qknorm_batch(r,d->q,cl->q_norm,HLLM_DFLASH_HEADS,HLLM_DFLASH_HEAD_DIM,rows,qd,r->rms_norm_eps);
+            launch_qknorm_batch(r,d->k,cl->k_norm,HLLM_DFLASH_KV_HEADS,HLLM_DFLASH_HEAD_DIM,rows,kd,r->rms_norm_eps);
+            launch_rope_mrope_batch(r,d->q,HLLM_DFLASH_HEADS,HLLM_DFLASH_HEAD_DIM,position,
+                r->rope_freq_base,HLLM_DFLASH_HEAD_DIM/2,0,0,0,qd,rows);
+            launch_rope_mrope_batch(r,d->k,HLLM_DFLASH_KV_HEADS,HLLM_DFLASH_HEAD_DIM,position,
+                r->rope_freq_base,HLLM_DFLASH_HEAD_DIM/2,0,0,0,kd,rows);
+        }
         launch_kv_store_batch_strided(r,cl->key_cache,cl->value_cache,d->k,d->v,
             position,rows,kd,kd,HLLM_DFLASH_WINDOW);
         int window=HLLM_DFLASH_WINDOW;
@@ -965,10 +1039,14 @@ int hip_llm_qwen35_dflash2_propose(hip_llm_runner *r, int32_t anchor,
     void *selected_norm=(float *)d->norm+ne;
     void *selected_logits=(float *)d->logits+r->n_vocab;
     void *selected_gate=(float *)d->selector_gate+HLLM_DFLASH_RANK;
-    hllm_dflash_project(r,selected_logits,r->d_output_w,selected_norm,
-        selected_rows,r->n_vocab,ne,ne,r->output_w_type);
-    hllm_dflash_project(r,selected_gate,d->selector_hidden,selected_norm,
-        selected_rows,HLLM_DFLASH_RANK,ne,ne,d->selector_hidden_type);
+    if (!hllm_dflash_project_selector_fused(r, d, selected_logits,
+            selected_gate, r->d_output_w, d->selector_hidden,
+            selected_norm, rows, ne)) {
+        hllm_dflash_project(r,selected_logits,r->d_output_w,selected_norm,
+            selected_rows,r->n_vocab,ne,ne,r->output_w_type);
+        hllm_dflash_project(r,selected_gate,d->selector_hidden,selected_norm,
+            selected_rows,HLLM_DFLASH_RANK,ne,ne,d->selector_hidden_type);
+    }
     void *ta[]={&d->logits,&d->selector_candidates,&rows,&r->n_vocab};
     LAUNCH(d->fn_topk,rows-1,1,1,256,1,1,0,r->stream,ta);
     void *sa[]={&d->logits,&d->selector_gate,&d->selector_prev_w,
