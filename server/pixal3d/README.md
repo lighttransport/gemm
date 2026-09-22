@@ -203,6 +203,29 @@ server/pixal3d/run.sh --backend cuda \
 
 The Qwen readiness state is reported under `qwen_image21` in `GET /health`.
 
+## Batch JSON API
+
+Automation can submit Pixal3D and Qwen Image jobs through one bounded queue.
+Each item is tagged with `kind` and carries the same request object accepted by
+the corresponding single-run API:
+
+```sh
+curl -sS -X POST http://127.0.0.1:8765/v1/batches \
+  -H 'content-type: application/json' \
+  -d '{"jobs":[
+    {"kind":"qwen-image","request":{"prompt":"a red apple","mode":"cuda","width":256,"height":256,"steps":2,"seed":42}},
+    {"kind":"pixal3d","request":{"backend":"cuda","image_b64":"...","seed":42}}
+  ]}'
+```
+
+The response contains a `batch_id` and individual job IDs. Poll
+`GET /v1/batches/{batch_id}` until `state` is `complete` or `failed`; pass
+`?results=1` to include completed results. Cancel queued or running work with
+`DELETE /v1/batches/{batch_id}`. Batch jobs run sequentially so native Pixal3D,
+Qwen CUDA, and PyTorch reference processes never compete for the same GPU.
+The default retained-job limit is four; increase `--retained-jobs` when a
+larger batch or multiple concurrent batches must be admitted.
+
 ## Deployment
 
 The built-in server is intended for a trusted workstation or an application

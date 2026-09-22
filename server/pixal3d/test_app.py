@@ -26,6 +26,33 @@ class PixalServerTest(unittest.TestCase):
             gpu_kernels="auto", gpu_flow_precision="mixed", threads=0,
             timeout=30, reference_timeout=30))
 
+    def test_batch_runs_qwen_and_pixal_jobs(self):
+        scratch = app.ROOT / "tmp/pixal3d/tests"
+        scratch.mkdir(parents=True, exist_ok=True)
+        class FakePixal:
+            def __init__(self, work_dir): self.work_dir = Path(work_dir)
+            def infer(self, request, cancel=None, progress=None):
+                return {"ok": True, "glb_b64": base64.b64encode(b"glTF").decode()}
+            def qwen_generate(self, request, cancel=None):
+                return {"ok": True, "cuda": {"image": "data:image/png;base64,AA=="}}
+        with tempfile.TemporaryDirectory(prefix="batch-", dir=scratch) as td:
+            jobs = app.JobQueue(FakePixal(td), retained=4, min_free_disk_mib=0)
+            try:
+                batch = jobs.submit_batch([
+                    {"kind": "qwen-image", "request": {"prompt": "a red apple"}},
+                    {"kind": "pixal3d", "request": {}},
+                ])
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline:
+                    status = jobs.batch_status(batch["batch_id"], include_results=True)
+                    if status["state"] == "complete":
+                        break
+                    time.sleep(0.01)
+                self.assertEqual((status["completed"], status["failed"]), (2, 0))
+                self.assertTrue(status["jobs"][0]["result"]["cuda"]["image"].startswith("data:"))
+            finally:
+                jobs.shutdown()
+
     def test_multiview_manifest_and_command(self):
         scratch = app.ROOT / "tmp/pixal3d/tests"
         scratch.mkdir(parents=True, exist_ok=True)

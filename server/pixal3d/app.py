@@ -943,6 +943,7 @@ class JobQueue:
         self.job_log_bytes = job_log_bytes
         self.accepting = True
         self.jobs: dict[str, dict] = {}
+        self.batches: dict[str, list[str]] = {}
         self.pending: queue.Queue[str] = queue.Queue()
         self.lock = threading.Lock()
         self.log_lock = threading.Lock()
@@ -1170,7 +1171,14 @@ class JobQueue:
                 self._remove_artifacts_locked(job)
                 self.jobs.pop(job_id, None)
 
-    def submit(self, request: dict) -> dict:
+    def submit(self, request: dict, *, kind: str = "pixal3d",
+               batch_id: str | None = None) -> dict:
+        if kind not in ("pixal3d", "qwen-image"):
+            raise ValueError("kind must be pixal3d or qwen-image")
+        request = dict(request)
+        request["_kind"] = kind
+        if batch_id is not None:
+            request["_batch_id"] = batch_id
         if not self.accepting:
             raise ServerShuttingDown("server is shutting down")
         if (self.result_root is not None and
@@ -1209,6 +1217,52 @@ class JobQueue:
         self.pending.put(job_id)
         self._append_log(job_id, "queued")
         return self.status(job_id)
+
+    def submit_batch(self, specifications: list[dict]) -> dict:
+        if not specifications or len(specifications) > 32:
+            raise ValueError("batch jobs must contain 1 to 32 items")
+        if len(specifications) > self.retained:
+            raise ValueError(
+                f"batch contains {len(specifications)} jobs but retained-job limit is {self.retained}; "
+                "increase --retained-jobs")
+        batch_id = uuid.uuid4().hex
+        submitted: list[str] = []
+        try:
+            for item in specifications:
+                if not isinstance(item, dict) or not isinstance(item.get("request"), dict):
+                    raise ValueError("each batch item needs a request object")
+                job = self.submit(item["request"], kind=item.get("kind", "pixal3d"),
+                                  batch_id=batch_id)
+                submitted.append(job["id"])
+        except Exception:
+            for job_id in submitted:
+                try:
+                    self.cancel(job_id)
+                except KeyError:
+                    pass
+            raise
+        with self.lock:
+            self.batches[batch_id] = submitted
+        return {"batch_id": batch_id, "jobs": [self.status(job_id) for job_id in submitted]}
+
+    def batch_status(self, batch_id: str, include_results: bool = False) -> dict:
+        with self.lock:
+            job_ids = list(self.batches.get(batch_id, ()))
+        if not job_ids:
+            raise KeyError(batch_id)
+        jobs = [self.status(job_id, include_results) for job_id in job_ids]
+        terminal = sum(job["state"] in self.TERMINAL for job in jobs)
+        failed = sum(job["state"] == "failed" for job in jobs)
+        return {"batch_id": batch_id, "count": len(jobs), "completed": terminal,
+                "failed": failed, "state": ("failed" if failed else
+                    "complete" if terminal == len(jobs) else "running"), "jobs": jobs}
+
+    def cancel_batch(self, batch_id: str) -> dict:
+        with self.lock:
+            job_ids = list(self.batches.get(batch_id, ()))
+        if not job_ids:
+            raise KeyError(batch_id)
+        return {"batch_id": batch_id, "jobs": [self.cancel(job_id) for job_id in job_ids]}
 
     def status(self, job_id: str, include_result: bool = False) -> dict:
         with self.lock:
@@ -1345,13 +1399,19 @@ class JobQueue:
                         with self.lock:
                             previous = self.jobs[job_id].get("progress", 0)
                         self._update(job_id, phase=phase, progress=max(previous, percent))
-                result = self.pixal.infer(request, cancel, report)
+                kind = request.get("_kind", "pixal3d")
+                if kind == "qwen-image":
+                    self._update(job_id, phase="Qwen Image 2.1", progress=10)
+                    self._append_log(job_id, "starting Qwen Image 2.1")
+                    result = self.pixal.qwen_generate(request, cancel)
+                else:
+                    result = self.pixal.infer(request, cancel, report)
                 with self.lock:
                     cancelled = self.jobs[job_id].get("cancel_requested", False)
                 if cancelled:
                     self._update(job_id, state="cancelled", phase="cancelled")
                     continue
-                if request.get("reference"):
+                if kind == "pixal3d" and request.get("reference"):
                     self._update(job_id, phase="PyTorch reference", progress=98)
                     self._append_log(job_id, "starting PyTorch reference")
                     result["reference"] = self.pixal.reference(reference_request(request, result), cancel)
@@ -1435,6 +1495,14 @@ class Handler(BaseHTTPRequestHandler):
             health["admission"] = self.server.jobs.health()
             self.json_response(200, health)
             return
+        if path.startswith("/v1/batches/"):
+            batch_id = path[len("/v1/batches/"):]
+            try:
+                include_results = urlparse(self.path).query == "results=1"
+                self.json_response(200, self.server.jobs.batch_status(batch_id, include_results))
+            except KeyError:
+                self.json_response(404, error_payload("not_found", "batch not found"))
+            return
         if path in ("/", "/index.html"):
             data = (ROOT / "web/pixal3d.html").read_bytes()
             self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)
@@ -1456,6 +1524,21 @@ class Handler(BaseHTTPRequestHandler):
         self.json_response(404, error_payload("not_found", "not found"))
     def do_POST(self):
         path = urlparse(self.path).path
+        if path == "/v1/batches":
+            try:
+                length = int(self.headers.get("Content-Length", "-1"))
+                if length < 0 or length > MAX_BODY_BYTES:
+                    raise ValueError("request body too large")
+                payload = json.loads(self.rfile.read(length))
+                specifications = payload.get("jobs") if isinstance(payload, dict) else None
+                if not isinstance(specifications, list):
+                    raise ValueError("batch body needs a jobs array")
+                self.json_response(202, self.server.jobs.submit_batch(specifications))
+            except QueueFull as exc: self.json_response(429, error_payload("queue_full", str(exc)))
+            except StorageFull as exc: self.json_response(507, error_payload("storage_full", str(exc)))
+            except (ValueError, json.JSONDecodeError) as exc:
+                self.json_response(400, error_payload("invalid_request", str(exc)))
+            return
         if path == "/v1/qwen-image":
             try:
                 length = int(self.headers.get("Content-Length", "-1"))
@@ -1517,6 +1600,12 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc: self.json_response(500, error_payload("internal_error", str(exc)))
     def do_DELETE(self):
         path = urlparse(self.path).path
+        if path.startswith("/v1/batches/"):
+            try:
+                self.json_response(200, self.server.jobs.cancel_batch(path[len("/v1/batches/"):]))
+            except KeyError:
+                self.json_response(404, error_payload("not_found", "batch not found"))
+            return
         if path.startswith("/v1/uploads/"):
             upload_id = path[len("/v1/uploads/"):]
             if self.server.uploads.delete(upload_id):
