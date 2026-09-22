@@ -776,6 +776,9 @@ reflects the remaining measured costs.
    per-row dot and reduction order. The serialized three-launch path remains
    the default until resident K=4/K=7 hash and draft-time measurements prove
    the launch reduction is beneficial.
+   `LLM_QWEN35_DFLASH_GATEUP_FUSED=1` similarly reuses that exact kernel for
+   the dense Q4_K gate/up pair with no V range. It is a separate opt-in probe;
+   the ordinary gate/up/SiLU sequence remains the serving default.
 6. **Prompt-cache injection.**  Feature capture now shares the target
    RMSNorm kernel and both 4K and random-64K prefill retain their targets.
    The hipBLASLt bridge now allocates scratch lazily per HIP stream, so a

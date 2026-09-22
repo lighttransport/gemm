@@ -160,6 +160,12 @@ five-row specialization; other proposal widths use the eight-row-capable
 kernel. The default sidecar path remains three launches until a resident
 gfx1201 run confirms identical K=4/K=7 hashes and a sustained draft-time win.
 
+An opt-in `LLM_QWEN35_DFLASH_GATEUP_FUSED=1` path reuses the same exact fused
+kernel for the dense Q4_K gate/up pair, with the V output range disabled. It
+preserves the five-row specialization for K=4 and the eight-row arithmetic for
+K=7 while removing one gate/up launch. The serialized gate, up, and SiLU path
+remains the default pending resident hash and draft-time A/B data.
+
 ## 2026-09-22 continuation: opt-in IQ2_XS down/residual fusion
 
 The ordinary FFN down path now has an opt-in

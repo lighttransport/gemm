@@ -324,6 +324,49 @@ static int hllm_dflash_project_qkv_fused(hip_llm_runner *r,
     return 1;
 }
 
+/* DFlash2's dense FFN gate and up matrices have the same input tile and
+ * Q4_K/Q8_1 contract. Reuse the exact Q/K/V fused kernel with its V range
+ * disabled, preserving each projection's row order while removing one launch
+ * and one redundant activation-staging decision. This is deliberately a
+ * separate opt-in from attention QKV fusion because resident draft quality and
+ * timing must be measured independently. */
+static int hllm_dflash_project_gateup_fused(hip_llm_runner *r,
+        hllm_qwen35_dflash2 *d, void *gout, void *uout,
+        void *gw, void *uw, int gtype, int utype, void *x,
+        int rows, int grows, int urows, int nc, int stride) {
+    const char *env = getenv("LLM_QWEN35_DFLASH_GATEUP_FUSED");
+    if (!env || atoi(env) == 0 || !r || !d ||
+        !r->fn_qwen35_matvec_q4k_q81_qkv || !r->fn_qwen35_quantize_q81 ||
+        gtype != GGML_TYPE_Q4_K || utype != GGML_TYPE_Q4_K ||
+        rows < 1 || rows > HLLM_DFLASH_MAX_BLOCK ||
+        grows < 1 || urows < 1 || nc <= 0 || stride != nc ||
+        (nc % 256) != 0)
+        return 0;
+    if (d->q81_source != x || d->q81_rows != rows || d->q81_cols != nc) {
+        int total = rows * nc;
+        void *qa[] = { &r->d_act_q8_batch, &r->d_act_scale_batch, &x,
+                       &total };
+        LAUNCH(r->fn_qwen35_quantize_q81, total / 32, 1, 1,
+               32, 1, 1, 0, r->stream, qa);
+        d->q81_source = x;
+        d->q81_rows = rows;
+        d->q81_cols = nc;
+    }
+    int vrows = 0;
+    void *vout = NULL, *vw = NULL;
+    hipFunction_t fn = r->fn_qwen35_matvec_q4k_q81_qkv;
+    if (rows == 5 && r->fn_qwen35_matvec_q4k_q81_qkv5)
+        fn = r->fn_qwen35_matvec_q4k_q81_qkv5;
+    void *a[] = { &gout, &uout, &vout, &gw, &uw, &vw,
+                  &r->d_act_q8_batch, &r->d_act_scale_batch,
+                  &grows, &urows, &vrows, &nc, &rows };
+    LAUNCH(fn,
+           (grows + urows + 7) / 8, 1, 1,
+           256, 1, 1, 0, r->stream, a);
+    r->q8x2_reuse_valid = r->iq1_q8_valid = r->batch_q8_valid = 0;
+    return 1;
+}
+
 static int hllm_qwen35_dflash2_inject_impl(hip_llm_runner *r, int position,
         int rows, void *features, void *features_bf16, void *x,
         void *x_bf16, void *norm, void *k, void *v) {
@@ -731,8 +774,12 @@ int hip_llm_qwen35_dflash2_propose(hip_llm_runner *r, int32_t anchor,
         hllm_dflash_project(r,d->dynamic,cl->ffn_conv_proj,d->norm,rows,
             HLLM_DFLASH_DYNAMIC,ne,ne,cl->ffn_conv_proj_type);
         hllm_dflash_conv(r,d,d->conv,d->norm,d->dynamic,cl->ffn_conv_base,rows,0);
-        hllm_dflash_project(r,d->gate,cl->gate,d->conv,rows,r->n_ff,ne,ne,cl->gate_type);
-        hllm_dflash_project(r,d->up,cl->up,d->conv,rows,r->n_ff,ne,ne,cl->up_type);
+        if (!hllm_dflash_project_gateup_fused(r, d, d->gate, d->up,
+                cl->gate, cl->up, cl->gate_type, cl->up_type, d->conv,
+                rows, r->n_ff, r->n_ff, ne, ne)) {
+            hllm_dflash_project(r,d->gate,cl->gate,d->conv,rows,r->n_ff,ne,ne,cl->gate_type);
+            hllm_dflash_project(r,d->up,cl->up,d->conv,rows,r->n_ff,ne,ne,cl->up_type);
+        }
         launch_silu_mul(r,d->gate,d->up,rows*r->n_ff);
         hllm_dflash_project(r,d->proj,cl->down,d->gate,rows,ne,r->n_ff,r->n_ff,cl->down_type);
         hllm_dflash_conv(r,d,d->conv,d->proj,d->dynamic,cl->ffn_conv_base,rows,1);
