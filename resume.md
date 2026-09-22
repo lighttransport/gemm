@@ -115,6 +115,16 @@ kept the exact sequence hash `a36ee81632648a4d`; the overlap path measured
 therefore retained as safety hardening, while overlap stays opt-in pending a
 measured throughput win.
 
+The overlap path now also allocates bounded per-stream activation workspaces
+for the DFlash2 injection stream. Accepted feature rows are copied on the
+authoritative stream before `target_ready`; injection consumes private
+feature, BF16, normalized, and K/V buffers, while the next target proposal can
+reuse its normal scratch. The injection stream still publishes `inject_done`
+before any sidecar proposal can read the updated KV cache. The path requires
+the loaded BF16 injection plans and falls back to serialized injection if the
+workspaces cannot be created. It remains opt-in pending a resident-GPU
+throughput and quality run.
+
 ## 2026-09-22 continuation: IQ2_XXS block-shape probe
 
 I tested 128- and 512-thread blocks for the native one-row IQ2_XXS kernel

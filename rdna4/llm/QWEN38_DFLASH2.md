@@ -75,6 +75,17 @@ quality and throughput gate is available. HIPRTC syntax and host/profile
 checks pass; this environment currently has no `/dev/kfd`, so runtime numbers
 are intentionally pending.
 
+## Per-stream cache-injection workspace
+
+When `LLM_QWEN35_DFLASH_OVERLAP_INJECT=1` is selected, accepted feature rows
+are first copied on the target stream and then injected through bounded,
+request-independent scratch owned by the injection stream. This removes the
+previous activation-buffer alias with the next target proposal. The target
+and injection streams are ordered by `target_ready`, and `inject_done` still
+guards sidecar KV reuse. The overlap path requires the BF16 injection plans;
+allocation failure falls back to serialized injection and leaves production
+defaults unchanged.
+
 ## DFlash2 long-window split retune (2026-09-22)
 
 The sidecar attention launch now uses twelve partitions once its 2,048-token
