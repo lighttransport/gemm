@@ -1562,6 +1562,9 @@ retain the scalar I/O fallback.
    candidate was also checked through the same gate: it retained the exact
    `7463f176c9b85ba3` suffix but measured 35.56 tok/s (prefill 444.44
    tok/s), slightly below the 35.59 tok/s default, and remains opt-in.
+   The real batched-SSM dispatch (`LLM_QWEN35_BATCH_SSM=1`) likewise retained
+   the exact suffix but measured 35.44 tok/s decode and 443.74 tok/s prefill
+   on the repeated 64K gate, so it is rejected for the production default.
 
 Each optimization should retain the exact sequence hash and response bytes at
 K=4 and K=7, compile the emitted program, and cover non-coding prompts plus
