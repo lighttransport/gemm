@@ -67,7 +67,7 @@ static int text_norm(cuda_qimg_runner *r, CUfunction fn, const qimg21_shards *s,
 
 int main(int argc, char **argv) {
     const char *model = NULL, *tokens = NULL, *out = NULL, *dump_dir = NULL;
-    const char *dump_tokens = NULL;
+    const char *dump_tokens = NULL, *dump_rope_table = NULL;
     const char *vision_merged = NULL, *vision_deepstack_dir = NULL, *rope_table_path = NULL;
     const char *hidden_input = NULL;
     const char *prompt = NULL;
@@ -75,17 +75,21 @@ int main(int argc, char **argv) {
     const char *rms_mode = "auto";
     const char *post_rms_mode = "auto";
     int drop = 0, start_layer = 0, layers = 36, dump_layer = 0;
+    int image_grid_h = 0, image_grid_w = 0, image_start = -1;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--model") && i + 1 < argc) model = argv[++i];
         else if (!strcmp(argv[i], "--tokens") && i + 1 < argc) tokens = argv[++i];
         else if (!strcmp(argv[i], "--prompt") && i + 1 < argc) prompt = argv[++i];
         else if (!strcmp(argv[i], "--out") && i + 1 < argc) out = argv[++i];
         else if (!strcmp(argv[i], "--dump-tokens") && i + 1 < argc) dump_tokens = argv[++i];
+        else if (!strcmp(argv[i], "--dump-rope-table") && i + 1 < argc) dump_rope_table = argv[++i];
         else if (!strcmp(argv[i], "--dump-dir") && i + 1 < argc) dump_dir = argv[++i];
         else if (!strcmp(argv[i], "--vision-merged") && i + 1 < argc) vision_merged = argv[++i];
         else if (!strcmp(argv[i], "--vision-deepstack-dir") && i + 1 < argc) vision_deepstack_dir = argv[++i];
         else if (!strcmp(argv[i], "--rope-table") && i + 1 < argc) rope_table_path = argv[++i];
         else if (!strcmp(argv[i], "--hidden") && i + 1 < argc) hidden_input = argv[++i];
+        else if (!strcmp(argv[i], "--image-grid-height") && i + 1 < argc) image_grid_h = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--image-grid-width") && i + 1 < argc) image_grid_w = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--attention") && i + 1 < argc) attention_mode = argv[++i];
         else if (!strcmp(argv[i], "--rms") && i + 1 < argc) rms_mode = argv[++i];
         else if (!strcmp(argv[i], "--post-rms") && i + 1 < argc) post_rms_mode = argv[++i];
@@ -122,6 +126,9 @@ int main(int argc, char **argv) {
         int length = snprintf(tokenizer_path, sizeof(tokenizer_path),
                               "%s/processor/tokenizer.json", model);
         n = length < 0 || length >= (int)sizeof(tokenizer_path) ? -1 :
+            vision_merged ? q21_build_multimodal_prompt_tokens(
+                tokenizer_path, prompt, image_grid_h * image_grid_w / 4,
+                ids, 4096, &drop, &image_start) :
             q21_build_prompt_tokens(tokenizer_path, prompt, ids, 4096, &drop);
         if (n < 0) { fprintf(stderr,"text: native tokenization failed\n"); return 1; }
         fprintf(stderr,"text: native tokenizer produced %d tokens, drop-prefix=%d\n",n,drop);
@@ -181,8 +188,15 @@ int main(int argc, char **argv) {
     }
     int visual_rows[4096], visual_count = 0;
     for (int t = 0; t < n; t++) if (ids[t] == 151655) visual_rows[visual_count++] = t;
+    if (visual_count && image_start < 0) image_start = visual_rows[0];
     if (!hidden_input && (!!vision_merged != (visual_count > 0))) {
         fprintf(stderr, "text: image-pad tokens and --vision-merged must be supplied together\n");
+        goto done;
+    }
+    if (visual_count && (!rope_table_path) &&
+        (image_grid_h < 2 || image_grid_w < 2 || image_grid_h % 2 || image_grid_w % 2 ||
+         image_grid_h / 2 * (image_grid_w / 2) != visual_count)) {
+        fprintf(stderr, "text: native multimodal MRoPE requires matching even image grid dimensions\n");
         goto done;
     }
     if (vision_merged) {
@@ -226,7 +240,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "text: %s causal GQA attention enabled\n", attention_mode);
     }
     qimg21_kernels base;
-    CUfunction rms, rms128, rms2, rms4, rms8, rms16, rope_lookup, add, add_visual, attention, mul_silu;
+    CUfunction rms, rms128, rms2, rms4, rms8, rms16, rope_lookup;
+    CUfunction add, add_visual, attention, mul_silu;
     if (cu_compile_kernels(&module,r->device,q21_text_src,"qimg21_text.cu",0,"qimg21_text")<0 ||
         cu_compile_kernels(&base_module,r->device,qimg21_src,"qimg21_native.cu",1,"qimg21_native")<0 ||
         get_kernel(&base,base_module) || cuModuleGetFunction(&rms,module,"text_rms") ||
@@ -244,7 +259,32 @@ int main(int argc, char **argv) {
     ALLOC(x,n*4096,4); ALLOC(norm,n*4096,4); ALLOC(bf,n*12288,2);
     ALLOC(q,n*4096,4); ALLOC(key,n*1024,4); ALLOC(v,n*1024,4);
     ALLOC(att,n*4096,4); ALLOC(tmp,n*4096,4); ALLOC(gate,n*12288,4); ALLOC(up,n*12288,4);
-    {
+    if (visual_count && !rope_table_path) {
+        npy_f32 base={0};
+        float *composed=NULL;
+        if(npy_read_f32("cuda/qimg21/qwen21_text_rope.npy",&base)||base.ndim!=3||
+           base.shape[1]!=128||base.shape[2]!=2) {npy_free(&base);goto done;}
+        composed=malloc((size_t)n*128*2*4);
+        if(!composed){npy_free(&base);goto done;}
+        int hh=image_grid_h/2,ww=image_grid_w/2,after=image_start+(hh>ww?hh:ww);
+        for(int t=0;t<n;t++)for(int j=0;j<128;j++) {
+            int k=j&63,pos;
+            if(t<image_start)pos=t;
+            else if(t<image_start+visual_count) {
+                int q=t-image_start;
+                pos=k<60&&k%3==1?image_start+q/ww:
+                    k<60&&k%3==2?image_start+q%ww:image_start;
+            } else pos=after+t-image_start-visual_count;
+            if(pos<0||pos>=(int)base.shape[0]){free(composed);npy_free(&base);goto done;}
+            composed[((size_t)t*128+j)*2]=base.data[((size_t)pos*128+j)*2];
+            composed[((size_t)t*128+j)*2+1]=base.data[((size_t)pos*128+j)*2+1];
+        }
+        rope_table=checked_cuMemAlloc((size_t)n*128*2*4);
+        if(!rope_table||cuMemcpyHtoD(rope_table,composed,(size_t)n*128*2*4)) {
+            free(composed);npy_free(&base);goto done;
+        }
+        free(composed);npy_free(&base);
+    } else {
         npy_f32 table={0};
         const char *table_path = rope_table_path ? rope_table_path : "cuda/qimg21/qwen21_text_rope.npy";
         if(npy_read_f32(table_path,&table) || table.ndim!=3 ||
@@ -254,6 +294,15 @@ int main(int argc, char **argv) {
         rope_table=checked_cuMemAlloc((size_t)n*128*2*4);
         if(!rope_table || cuMemcpyHtoD(rope_table,table.data,(size_t)n*128*2*4)) {npy_free(&table);goto done;}
         npy_free(&table);
+    }
+    if (dump_rope_table) {
+        float *table_host = malloc((size_t)n * 128 * 2 * sizeof(float));
+        if (!table_host || cuCtxSynchronize() ||
+            cuMemcpyDtoH(table_host, rope_table, (size_t)n * 128 * 2 * sizeof(float)) ||
+            npy_write_f32(dump_rope_table, table_host, (size_t)n * 128 * 2, n * 128, 2)) {
+            free(table_host); goto done;
+        }
+        free(table_host);
     }
     if (cutlass_attention) {
         ALLOC(q_bf,n*4096,2); ALLOC(key_bf,n*1024,2); ALLOC(v_bf,n*1024,2);

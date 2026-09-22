@@ -1296,9 +1296,23 @@ native exact default mirrors those layer-specific topologies and retains
 96-token/16x16-patch case, all 36 language layers, all three deep-stack
 additions, and the cropped prompt embedding are bit-exact: cosine
 0.9999999999999998, zero MAE, and 100% elementwise equality. The accepted
-29-token text-only path remains bit-exact as well. The fixture-driven interface
-still needs native multimodal token/MRoPE construction before it can replace
-the helper in `native_generate.py`.
+29-token text-only path remains bit-exact as well. Multimodal `--prompt` now
+constructs the image-aware ChatML sequence itself from the native tokenizer;
+`--image-grid-height/--image-grid-width` generate the 3D MRoPE layout by
+recomposing rows from the checked exact text-RoPE artifact, without Python or
+runtime trigonometry. For the same editing fixture, all 96 token IDs and the
+entire MRoPE table are bit-exact, and the resulting prompt embedding retains
+cosine 0.9999999999999998, zero MAE, and 100% equality. Wiring image
+patchification and the native vision outputs into `native_generate.py` remains.
+
+```sh
+cuda/qimg21/test_cuda_qimg21_text \
+  --model /mnt/nvme01/models/qimg-21 --prompt "make the apple blue" \
+  --vision-merged tmp/qimg21-vision-boundaries2/text_positive/vision_merger.npy \
+  --vision-deepstack-dir tmp/qimg21-vision-boundaries2/text_positive \
+  --image-grid-height 16 --image-grid-width 16 --attention flash-exact \
+  --out tmp/qimg21-native-multimodal-text/native-full-exact.npy
+```
 
 Add `--native-vae` to use the native F32 CUDA decoder. It reads the original
 VAE safetensors, applies latent denormalization and the learned post-quant

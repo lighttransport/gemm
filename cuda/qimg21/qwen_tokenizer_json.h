@@ -88,4 +88,41 @@ static int q21_build_prompt_tokens(const char *tokenizer_json, const char *promp
     *drop_prefix = drop;
     return n;
 }
+
+static int q21_build_multimodal_prompt_tokens(const char *tokenizer_json,
+                                               const char *prompt, int image_tokens,
+                                               int32_t *tokens, int capacity,
+                                               int *drop_prefix, int *image_start) {
+    static const char system[] = "Comprehend and analyze the provided prompt.";
+    if (image_tokens <= 0 || capacity <= image_tokens + 8) return -1;
+    bpe_vocab *v = q21_bpe_load_json(tokenizer_json);
+    if (!v) return -1;
+    size_t needed = strlen(system) + strlen(prompt) + 192;
+    char *text = (char *)malloc(needed);
+    if (!text) { bpe_vocab_free(v); return -1; }
+    snprintf(text, needed,
+             "<|im_start|>system\n%s<|im_end|>\n"
+             "<|im_start|>user\n<image1>", system);
+    int n = bpe_tokenize(v, text, -1, tokens, capacity);
+    snprintf(text, needed, "<|im_start|>system\n%s<|im_end|>\n", system);
+    int drop = bpe_tokenize(v, text, -1, NULL, 0);
+    if (n < 0 || drop < 0 || n + image_tokens + 2 > capacity) goto fail;
+    tokens[n++] = 151652; /* <|vision_start|> */
+    *image_start = n;
+    for (int i = 0; i < image_tokens; i++) tokens[n++] = 151655; /* <|image_pad|> */
+    tokens[n++] = 151653; /* <|vision_end|> */
+    snprintf(text, needed, "%s<|im_end|>\n<|im_start|>assistant\n",
+             *prompt ? prompt : " ");
+    int suffix = bpe_tokenize(v, text, -1, tokens + n, capacity - n);
+    if (suffix < 0 || n + suffix > capacity) goto fail;
+    n += suffix;
+    free(text);
+    bpe_vocab_free(v);
+    *drop_prefix = drop;
+    return n;
+fail:
+    free(text);
+    bpe_vocab_free(v);
+    return -1;
+}
 #endif
