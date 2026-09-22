@@ -185,6 +185,24 @@ manifest. Automatic and explicit per-view masks are resolved once; the exact
 prepared RGBA files are passed to both native and PyTorch pipelines. Enabling
 the comparison can add several minutes to a request.
 
+## Qwen Image 2.1 tab
+
+The Pixal3D page also includes a Qwen Image 2.1 generation tab. It reuses this
+server's CUDA device lock and serves `POST /v1/qwen-image` alongside the GLB
+job API. The tab can run the native CUDA generator, the pinned PyTorch
+reference, or both side by side. Its quantized switch selects the validated
+row-INT8 tensor-core package and calibrated BF16 tail.
+
+The Qwen paths are configurable when starting the server:
+
+```sh
+server/pixal3d/run.sh --backend cuda \
+  --qwen-model /mnt/nvme01/models/qimg-21 \
+  --qwen-quant-package tmp/qimg21-int8-package
+```
+
+The Qwen readiness state is reported under `qwen_image21` in `GET /health`.
+
 ## Deployment
 
 The built-in server is intended for a trusted workstation or an application

@@ -23,6 +23,7 @@ import shutil
 import signal
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -31,6 +32,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from server.qwen_image21.app import Demo as QwenImage21Demo
+
 DEFAULT_MODEL_DIR = Path("/mnt/disk2/models/Pixal3D")
 DEFAULT_DINOV3 = Path("/mnt/disk2/models/dinov3-vitl16/model.safetensors")
 DEFAULT_NAF = ROOT / "ref/pixal3d/weights/naf_release.safetensors"
@@ -473,6 +479,13 @@ class PixalServer:
         self.compare_script = ROOT / "ref/pixal3d/compare_outputs.py"
         self.preview_script = ROOT / "ref/pixal3d/preview_glb.py"
         self.preview_renderer = ROOT / "ref/pixal3d/.cache/preview_render"
+        self.qwen_image = QwenImage21Demo(
+            Path(getattr(args, "qwen_model", "/mnt/nvme01/models/qimg-21")),
+            Path(getattr(args, "qwen_quant_package", ROOT / "tmp/qimg21-int8-package")),
+            Path(getattr(args, "qwen_python", ROOT / "tmp/qimg21-ref-venv/bin/python")),
+            self.work_dir / "qwen-image21",
+            Path(getattr(args, "qwen_native", ROOT / "cuda/qimg21/test_cuda_qimg21_native")),
+            getattr(args, "bind", "127.0.0.1"), getattr(args, "port", 8765))
 
     @contextmanager
     def execution_lock(self, backend: str, device: int, timeout: float,
@@ -538,8 +551,21 @@ class PixalServer:
                                     self.preview_script.is_file() and
                                     self.preview_renderer.is_file())},
                 "reference": reference,
+                "qwen_image21": {
+                    "model_ready": self.qwen_image.model.is_dir(),
+                    "native_ready": self.qwen_image.native.is_file(),
+                    "reference_ready": self.qwen_image.python.is_file(),
+                    "quantized_available": self.qwen_image.quant.is_dir(),
+                },
                 "limits": {"body_bytes": MAX_BODY_BYTES, "image_bytes": MAX_IMAGE_BYTES,
                            "glb_bytes": MAX_GLB_BYTES, "views": 16}, "backends": out}
+
+    def qwen_generate(self, request: dict,
+                      cancel: threading.Event | None = None) -> dict:
+        """Run Qwen Image through the shared CUDA device lock."""
+        device = bounded_integer(request.get("device", 0), "device", 0, 255)
+        with self.execution_lock("cuda", device, self.args.timeout, cancel):
+            return self.qwen_image.generate(request)
 
     def infer(self, request: dict, cancel: threading.Event | None = None, progress=None) -> dict:
         backend = request.get("backend", self.args.backend)
@@ -1430,6 +1456,22 @@ class Handler(BaseHTTPRequestHandler):
         self.json_response(404, error_payload("not_found", "not found"))
     def do_POST(self):
         path = urlparse(self.path).path
+        if path == "/v1/qwen-image":
+            try:
+                length = int(self.headers.get("Content-Length", "-1"))
+                if length < 0 or length > MAX_BODY_BYTES:
+                    raise ValueError("request body too large")
+                request = json.loads(self.rfile.read(length))
+                if not isinstance(request, dict):
+                    raise ValueError("request body must be a JSON object")
+                self.json_response(200, self.server.pixal.qwen_generate(request))
+            except DeviceBusy as exc: self.json_response(503, error_payload("device_busy", str(exc)))
+            except TimeoutError as exc: self.json_response(504, error_payload("timeout", str(exc)))
+            except (ValueError, json.JSONDecodeError) as exc:
+                self.json_response(400, error_payload("invalid_request", str(exc)))
+            except Exception as exc:
+                self.json_response(500, error_payload("internal_error", str(exc)))
+            return
         if path == "/v1/uploads":
             try:
                 if not self.server.jobs.accepting:
@@ -1508,6 +1550,10 @@ def main() -> None:
     p.add_argument("--job-ttl", type=float, default=86400)
     p.add_argument("--upload-ttl", type=float, default=3600)
     p.add_argument("--device-lock-dir", default=str(ROOT / "tmp/pixal3d/device-locks"))
+    p.add_argument("--qwen-model", default="/mnt/nvme01/models/qimg-21")
+    p.add_argument("--qwen-quant-package", default=str(ROOT / "tmp/qimg21-int8-package"))
+    p.add_argument("--qwen-python", default=str(ROOT / "tmp/qimg21-ref-venv/bin/python"))
+    p.add_argument("--qwen-native", default=str(ROOT / "cuda/qimg21/test_cuda_qimg21_native"))
     p.add_argument("--min-free-disk-mib", type=int, default=1024)
     p.add_argument("--job-log-bytes", type=int, default=65536)
     p.add_argument("--shutdown-timeout", type=float, default=30)
