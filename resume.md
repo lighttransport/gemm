@@ -203,6 +203,14 @@ K=7 path, and serving defaults are unchanged. Host build, profile tests, and
 gfx1201 HIP syntax checks pass; resident hash and draft-time A/B validation is
 still required.
 
+## 2026-09-22 continuation: device-resident accepted-position publication
+
+MTP commit now publishes `d_position` from the accepted row in the verifier's
+device position scratch, avoiding a redundant host-to-device upload. The host
+`cur_position` value, state-row copies, hidden/logit publication, stream order,
+and rollback semantics are unchanged; a host upload remains as a defensive
+fallback if position scratch is absent. Host build and profile checks pass.
+
 ## 2026-09-22 continuation: opt-in parallel DFlash2 selector
 
 The DFlash2 selector now has an opt-in

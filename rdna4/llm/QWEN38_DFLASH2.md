@@ -197,6 +197,12 @@ accumulation, or output bytes. The generic captured combine ABI and production
 defaults remain unchanged; resident-device hash and timing validation is still
 required before enabling either candidate.
 
+MTP commit now copies the accepted position from verifier device scratch into
+`d_position` on the same stream. This removes a redundant host upload while
+preserving the host position value, state publication order, and rollback
+semantics; callers without position scratch use the previous host-copy
+fallback.
+
 ## K=4 four-row Q4_K projection candidate
 
 After the anchor row is removed, K=4 selector/output projections consume four

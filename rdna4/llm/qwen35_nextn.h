@@ -853,7 +853,17 @@ int hip_llm_qwen35_mtp_commit(hip_llm_runner *r, int processed) {
                            (size_t)r->n_vocab*sizeof(float),hipMemcpyDeviceToDevice,r->stream)) return -1;
     }
     r->cur_position = m->verify_position+last;
-    if (hipMemcpyAsync(r->d_position,&r->cur_position,sizeof(int),hipMemcpyHostToDevice,r->stream)) return -1;
+    /* The verifier already published every candidate position into device
+     * scratch before graph replay. Reuse the accepted row directly so commit
+     * does not enqueue a host upload or depend on host staging; keep the old
+     * upload as a defensive fallback for callers with no position scratch. */
+    if (m->verify_positions) {
+        if (hipMemcpyAsync(r->d_position,
+                           (int *)m->verify_positions + last,
+                           sizeof(int), hipMemcpyDeviceToDevice,
+                           r->stream)) return -1;
+    } else if (hipMemcpyAsync(r->d_position, &r->cur_position, sizeof(int),
+                              hipMemcpyHostToDevice, r->stream)) return -1;
     /* Commit only enqueues device-to-device publication.  All following
      * decode/propose work uses the same stream, while request reset and the
      * verifier's host-logit path still synchronize at their boundaries. */
