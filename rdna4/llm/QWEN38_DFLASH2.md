@@ -139,6 +139,15 @@ including seeded sampling, cancellation, cache restore, concurrency, and
 multi-turn C++ output. Cached K=7 windows reported 0.23--0.57 ms commit times
 on the resident gate with unchanged target token streams.
 
+## Parallel selector candidate (opt-in)
+
+`LLM_QWEN35_DFLASH_SELECTOR_WARP=1` selects an eight-group, 256-thread
+selector geometry. Successor Q4_K rank values are decoded in parallel, while
+lane zero accumulates each candidate's 256 terms in the original order. This
+preserves selector tie breaks and the predecessor chain; the serialized
+32-thread path remains the default pending resident K=4/K=7 hash and draft-time
+A/B measurements.
+
 ## IQ2_XS launch-bounds probe (2026-09-22)
 
 The native one-row IQ2_XS decode kernel is compiled with

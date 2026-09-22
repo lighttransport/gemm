@@ -39,7 +39,7 @@ typedef struct hllm_qwen35_dflash2 {
     hipFunction_t fn_conv, fn_attention, fn_attention_combine;
     hipFunction_t fn_attention_fused;
     hipFunction_t fn_attention_fused_128;
-    hipFunction_t fn_topk, fn_select;
+    hipFunction_t fn_topk, fn_select, fn_select_warp;
     void *fc, *fc_bf16, *enc_norm, *out_norm, *selector_hidden;
     int fc_type, selector_hidden_type;
     qtensor selector_prev, selector_next;
@@ -467,7 +467,9 @@ int hip_llm_qwen35_dflash2_load(hip_llm_runner *r, const char *path,
         hipModuleGetFunction(&d->fn_topk, d->module,
                              "qwen35_dflash2_topk") != hipSuccess ||
         hipModuleGetFunction(&d->fn_select, d->module,
-                             "qwen35_dflash2_select") != hipSuccess) goto fail;
+                             "qwen35_dflash2_select") != hipSuccess ||
+        hipModuleGetFunction(&d->fn_select_warp, d->module,
+                             "qwen35_dflash2_select_warp") != hipSuccess) goto fail;
 
     if (hllm_dflash_upload_matrix(g, "fc.weight", &d->fc, &d->fc_type,
             r->n_embd, HLLM_DFLASH_LAYERS*r->n_embd) ||
@@ -763,7 +765,15 @@ int hip_llm_qwen35_dflash2_propose(hip_llm_runner *r, int32_t anchor,
     void *sa[]={&d->logits,&d->selector_gate,&d->selector_prev_w,
         &d->selector_next_w,&d->selector_candidates,&d->selector_drafts,
         &anchor,&rows,&r->n_vocab};
-    LAUNCH(d->fn_select,1,1,1,32,1,1,0,r->stream,sa);
+    hipFunction_t select_fn = d->fn_select;
+    unsigned select_threads = 32;
+    const char *selector_warp_env = getenv("LLM_QWEN35_DFLASH_SELECTOR_WARP");
+    if (selector_warp_env && atoi(selector_warp_env) != 0 &&
+        d->fn_select_warp) {
+        select_fn = d->fn_select_warp;
+        select_threads = 256;
+    }
+    LAUNCH(select_fn,1,1,1,select_threads,1,1,0,r->stream,sa);
     hipError_t copy_error = hipMemcpyAsync(drafts, d->selector_drafts,
         (size_t)count * sizeof(int), hipMemcpyDeviceToHost, r->stream);
     hipError_t sync_error = copy_error == hipSuccess ?

@@ -197,6 +197,61 @@ void qwen35_dflash2_select(const float *logits, const float *selector_gate,
     }
 }
 
+/* Diagnostic selector geometry: eight candidate groups share one block.
+ * Each candidate still has its score accumulated by lane zero in the exact
+ * 0..255 order used above; the other lanes only parallelize the Q4_K decode
+ * into shared memory. Two batches cover the sixteen candidates without
+ * changing the host-visible tie break or predecessor chain. */
+extern "C" __global__ __launch_bounds__(256, 1)
+void qwen35_dflash2_select_warp(const float *logits,
+        const float *selector_gate, const unsigned char *predecessor_w,
+        const unsigned char *successor_w, const int *candidates, int *drafts,
+        int anchor, int rows, int vocab) {
+    int tid = threadIdx.x;
+    int lane = tid & 31;
+    int group = tid >> 5;
+    if (blockIdx.x || group >= 8) return;
+    __shared__ float predecessor_values[DFLASH_SELECTOR_RANK];
+    __shared__ float candidate_values[8][DFLASH_SELECTOR_RANK];
+    __shared__ float scores[DFLASH_SELECTOR_TOPK];
+    __shared__ int predecessor;
+    if (tid == 0) predecessor = anchor;
+    __syncthreads();
+    for (int row = 1; row < rows; ++row) {
+        for (int j = lane; j < DFLASH_SELECTOR_RANK; j += 32)
+            predecessor_values[j] = qwen35_dflash2_q4k_value(
+                predecessor_w, predecessor, j);
+        __syncthreads();
+        for (int batch = 0; batch < 2; ++batch) {
+            int k = batch * 8 + group;
+            int token = candidates[row * DFLASH_SELECTOR_TOPK + k];
+            for (int j = lane; j < DFLASH_SELECTOR_RANK; j += 32)
+                candidate_values[group][j] = qwen35_dflash2_q4k_value(
+                    successor_w, token, j);
+            __syncthreads();
+            if (lane == 0) {
+                float score = logits[(size_t)row * vocab + token];
+                const float *gate = selector_gate +
+                    (size_t)row * DFLASH_SELECTOR_RANK;
+                for (int j = 0; j < DFLASH_SELECTOR_RANK; ++j)
+                    score += predecessor_values[j] * gate[j] *
+                             candidate_values[group][j];
+                scores[k] = score;
+            }
+            __syncthreads();
+        }
+        if (tid == 0) {
+            int selected = 0;
+            for (int i = 1; i < DFLASH_SELECTOR_TOPK; ++i)
+                if (scores[i] > scores[selected]) selected = i;
+            predecessor = candidates[row * DFLASH_SELECTOR_TOPK + selected];
+            drafts[row - 1] = predecessor;
+        }
+        __syncthreads();
+    }
+    (void)vocab;
+}
+
 /* One wave owns four query rows for one head and one contiguous position
  * split.  Splitting the 2K window supplies enough independent waves to hide
  * cache latency while each partial retains position order.  DFlash2 is a

@@ -156,6 +156,15 @@ prepared native Q8_1 activation and otherwise falls back automatically. The
 default path is unchanged until a resident random-64K hash/performance A/B
 proves the launch and temporary traffic savings.
 
+## 2026-09-22 continuation: opt-in parallel DFlash2 selector
+
+The DFlash2 selector now has an opt-in
+`LLM_QWEN35_DFLASH_SELECTOR_WARP=1` geometry. Eight 32-thread candidate groups
+decode successor Q4_K rank values in parallel, while each candidate's lane-zero
+accumulation still visits all 256 terms in the original order. The selector
+tie break and predecessor chain are unchanged; the serialized 32-thread path
+remains the default pending resident K=4/K=7 hashes and draft-time A/B data.
+
 ## 2026-09-22 continuation: IQ2_XXS block-shape probe
 
 I tested 128- and 512-thread blocks for the native one-row IQ2_XXS kernel
