@@ -1328,6 +1328,9 @@ static inline void tf_nvfp4_dot4_sve(float *o0, float *o1, float *o2, float *o3,
     const svfloat32_t lut = svld1(pg, ds4f_kvalues_mxfp4_f32);
     svfloat32_t a0=svdup_f32(0.0f), a1=a0, a2=a0, a3=a0;
     const int vl = (int)svcntw();
+#if defined(__clang__)
+#pragma clang loop unroll_count(2)
+#endif
     for (int ib=0; ib<n/64; ib++) {
         const block_nvfp4 *r0=b0+ib,*r1=b1+ib,*r2=b2+ib,*r3=b3+ib;
         if (ib + 1 < n / 64) {
