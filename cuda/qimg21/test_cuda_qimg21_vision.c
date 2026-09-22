@@ -12,6 +12,7 @@ static const char *vision_front_src =
 "__global__ void add_pos(float*x,const float*p,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)x[i]=rb(x[i]+p[i]);}\n"
 "__global__ void layer_norm(float*y,const float*x,const float*w,const float*b,int d){int r=blockIdx.x,t=threadIdx.x;__shared__ float m,iv;if(t==0){float s=0,q=0;for(int i=0;i<d;i++){float v=x[r*d+i];s+=v;q+=v*v;}m=s/d;iv=rsqrtf(q/d-m*m+1e-6f);}__syncthreads();for(int i=t;i<d;i+=256)y[r*d+i]=rb((x[r*d+i]-m)*iv*w[i]+b[i]);}\n"
 "__global__ void linear_epilogue(float*y,const float*x,const float*b,int d,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n*d)y[i]=rb(x[i]+b[i%d]);}\n"
+"__global__ void bf16_epilogue(float*y,const unsigned short*x,const float*b,int d,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n*d)y[i]=rb(__uint_as_float(((unsigned)x[i])<<16)+b[i%d]);}\n"
 "__global__ void vision_rope(float*qkv,int n,int gh,int gw){int t=blockIdx.x,h=blockIdx.y,j=threadIdx.x;if(t>=n||h>=16||j>=36)return;int ic=t%2,ir=(t/2)%2,bc=(t/4)%(gw/2),br=t/(4*(gw/2));int row=br*2+ir,col=bc*2+ic,coord=j<18?row:col,k=j%18;float inv=1.f/powf(10000.f,(float)(2*k)/36.f),a=coord*inv,c=cosf(a),s=sinf(a);for(int z=0;z<2;z++){int base=t*3456+z*1152+h*72;float u=qkv[base+j],v=qkv[base+j+36];qkv[base+j]=rb(u*c-v*s);qkv[base+j+36]=rb(v*c+u*s);}}\n"
 "__global__ void vision_attn(float*o,const float*qkv,int n){int q=blockIdx.x,h=blockIdx.y,l=threadIdx.x;float qr[3]={0},acc[3]={0};for(int e=0;e<3;e++){int d=l+32*e;if(d<72)qr[e]=qkv[q*3456+h*72+d];}float mx=-1e30f;for(int k=0;k<n;k++){float z=0;for(int e=0;e<3;e++){int d=l+32*e;if(d<72)z+=qr[e]*qkv[k*3456+1152+h*72+d];}for(int s=16;s;s>>=1)z+=__shfl_xor_sync(0xffffffff,z,s);mx=fmaxf(mx,z*0.11785113019775793f);}float den=0;for(int k=0;k<n;k++){float z=0;for(int e=0;e<3;e++){int d=l+32*e;if(d<72)z+=qr[e]*qkv[k*3456+1152+h*72+d];}for(int s=16;s;s>>=1)z+=__shfl_xor_sync(0xffffffff,z,s);float p=expf(z*0.11785113019775793f-mx);den+=p;for(int e=0;e<3;e++){int d=l+32*e;if(d<72)acc[e]+=p*qkv[k*3456+2304+h*72+d];}}for(int e=0;e<3;e++){int d=l+32*e;if(d<72)o[q*1152+h*72+d]=rb(acc[e]/den);}}\n"
 "__global__ void residual(float*x,const float*y,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)x[i]=rb(x[i]+y[i]);}\n"
@@ -190,7 +191,7 @@ int main(int argc, char **argv) {
     cuda_qimg_runner *r = cuda_qimg_init(0, 1);
     CUmodule module = NULL;
     CUfunction add_pos = NULL, layer_norm = NULL;
-    CUfunction linear_epilogue = NULL, vision_rope = NULL, vision_attn = NULL;
+    CUfunction linear_epilogue = NULL, bf16_epilogue = NULL, vision_rope = NULL, vision_attn = NULL;
     CUfunction residual = NULL, gelu_tanh = NULL, gelu_exact = NULL;
     CUdeviceptr x = 0, bf = 0, projected = 0, weight = 0, bias = 0, pos = 0;
     CUdeviceptr norm = 0, qkv = 0, qkv_bf = 0, att = 0, tmp = 0, mlp = 0;
@@ -203,6 +204,7 @@ int main(int argc, char **argv) {
         cuModuleGetFunction(&add_pos, module, "add_pos") ||
         cuModuleGetFunction(&layer_norm, module, "layer_norm") ||
         cuModuleGetFunction(&linear_epilogue, module, "linear_epilogue") ||
+        cuModuleGetFunction(&bf16_epilogue, module, "bf16_epilogue") ||
         cuModuleGetFunction(&vision_rope, module, "vision_rope") ||
         cuModuleGetFunction(&vision_attn, module, "vision_attn") ||
         cuModuleGetFunction(&residual, module, "residual") ||
@@ -229,7 +231,7 @@ int main(int argc, char **argv) {
         launch_cast(r, bf, x, n * 1536)) goto done;
     free_d(&x);
     x = checked_cuMemAlloc((size_t)count * 4);
-    projected = checked_cuMemAlloc((size_t)count * 4);
+    projected = checked_cuMemAlloc((size_t)count * 2);
     weight = upload_bf16_raw(&shards, "model.visual.patch_embed.proj.weight");
     bias = upload_f32(&shards, "model.visual.patch_embed.proj.bias");
     pos = checked_cuMemAlloc((size_t)count * 4);
@@ -239,11 +241,11 @@ int main(int argc, char **argv) {
         cuCtxSynchronize() ||
         build_position_embedding(&shards, h, w, host_pos) ||
         cuMemcpyHtoD(pos, host_pos, (size_t)count * 4) ||
-        cublasew_gemm_bf16_bf16_f32_rowmajor_nt(r->cublaslt_ctx, projected, weight,
-                                                 bf, n, 1152, 1536) ||
+        cublasew_gemm_bf16_bf16_bf16_rowmajor_nt(r->cublaslt_ctx, projected, weight,
+                                                  bf, n, 1152, 1536) ||
         cuCtxSynchronize()) goto done;
     void *bias_args[] = {&x, &projected, &bias, &(int){1152}, &n};
-    if (cuLaunchKernel(linear_epilogue, (count + 255) / 256, 1, 1, 256, 1, 1, 0,
+    if (cuLaunchKernel(bf16_epilogue, (count + 255) / 256, 1, 1, 256, 1, 1, 0,
                        r->stream, bias_args, NULL) || cuStreamSynchronize(r->stream)) goto done;
     if (patch_out && (cuMemcpyDtoH(host_out, x, (size_t)count * 4) ||
                       npy_write_f32(patch_out, host_out, (size_t)count, n, 1152))) goto done;
@@ -275,6 +277,8 @@ blocks_ready:
         if (block == block_index && dump_vision(dump_dir, "qkv", qkv, (size_t)n * 3456, n, 3456)) goto done;
         void *rope_args[] = {&qkv, &n, &h, &w};
         if (cuLaunchKernel(vision_rope, n, 16, 1, 36, 1, 1, 0, r->stream, rope_args, NULL)) goto done;
+        if (block == block_index && dump_vision(dump_dir, "qkv_rope", qkv,
+                                                 (size_t)n * 3456, n, 3456)) goto done;
         if (cutlass_attention) {
             if (launch_cast(r, qkv_bf, qkv, n * 3456) ||
                 cutlass_attention((float *)(uintptr_t)att, (const void *)(uintptr_t)qkv_bf,
@@ -291,6 +295,8 @@ blocks_ready:
         void *res1[] = {&x, &tmp, &count};
         if (cuLaunchKernel(residual, (count + 255) / 256, 1, 1, 256, 1, 1, 0,
                            r->stream, res1, NULL)) goto done;
+        if (block == block_index && dump_vision(dump_dir, "post_attn", x,
+                                                 (size_t)count, n, 1152)) goto done;
         snprintf(name, sizeof(name), "model.visual.blocks.%d.norm2.weight", block);
         nw = upload_f32(&shards, name);
         snprintf(name, sizeof(name), "model.visual.blocks.%d.norm2.bias", block);
@@ -313,6 +319,11 @@ blocks_ready:
         if (block == block_index && dump_vision(dump_dir, "mlp_fc2", tmp, (size_t)count, n, 1152)) goto done;
         if (cuLaunchKernel(residual, (count + 255) / 256, 1, 1, 256, 1, 1, 0,
                            r->stream, res1, NULL) || cuStreamSynchronize(r->stream)) goto done;
+        if (dump_dir) {
+            char dump_name[32];
+            snprintf(dump_name, sizeof(dump_name), "block_%02d", block);
+            if (dump_vision(dump_dir, dump_name, x, (size_t)count, n, 1152)) goto done;
+        }
         if (deepstack_dir && (block == 8 || block == 16 || block == 24)) {
             int merger = block == 8 ? 0 : block == 16 ? 1 : 2;
             char base[256], destination[2048];
