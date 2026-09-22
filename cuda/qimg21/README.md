@@ -1258,11 +1258,13 @@ the PyTorch-selected algo 21 tile/stage and split-K configurations for the
 Welford topology in the pinned NVCC plugin rather than NVRTC. Teacher-forced
 block 0 reaches cosine 0.999999824. Vision RoPE uses a checked CUDA-generated
 cosine/sine artifact and separate multiply/add operations matching PyTorch;
-this raises the full block-26 cosine from 0.999461003 to 0.999691509. The
-recurrent result remains below the 0.99996 acceptance target. The merger uses the same
+this originally raised the full block-26 cosine from 0.999461003 to
+0.999691509.  After correcting the FlashAttention scale to make the isolated
+operator bit-exact, the full block-26 cosine is 0.999665887832. The recurrent
+result remains below the 0.99996 acceptance target. The merger uses the same
 pinned Welford implementation as the blocks. With the exact PyTorch block-26
 output injected, its local cosine is 0.999990332 and passes the 0.99996 gate;
-the exact-RoPE accumulated full-run merger cosine is 0.999551090, so the recurrent
+the exact-attention accumulated full-run merger cosine is 0.999341086920, so the recurrent
 vision stack is not yet accepted for strict parity. It is wired into the
 experimental editing integration to exercise the complete native path. Use `--hidden ... --block-index N
 --max-blocks 1` for isolated block replay, or `--max-blocks 0 --merged-out ...`
@@ -1272,7 +1274,8 @@ diagnosis while `nvcc` remains the default. `nvcc-pytorch` selects the literal
 `dim3(32,4)` 128-thread/four-warp launch used by pinned ATen: its block-0 LayerNorm rstd is
 bit-exact, LayerNorm output is 99.9986% elementwise exact, and teacher-forced
 block-0 cosine improves to 0.999999933. Its full block-26 cosine is
-0.999687034, slightly below the eight-warp default's 0.999691509, so it remains
+0.999687034 with the earlier attention scale, slightly below that run's
+eight-warp result of 0.999691509, so it remains
 a diagnostic rather than the generation default. With the same FlashAttention path,
 the all-NVRTC run improves final block cosine from 0.999461003 to 0.999620834
 but still fails the gate. A greedy per-block oracle over both implementations
@@ -1303,6 +1306,22 @@ values differ by one representable step (maximum absolute error 0.0009765625).
 Official FlashAttention `--use_fast_math`, fused softmax FMA, and CUDA 12.9
 build variants do not improve that result; the default unfused CUDA 13.1 build
 has the fewest mismatches.
+Forced PyTorch backend replay confirms that default and
+`SDPBackend.FLASH_ATTENTION` are both bit-exact with the captured tensor;
+efficient attention, cuDNN, and math are not.  Profiling identifies the exact
+`Flash_fwd_kernel_traits<96,128,64,4>` specialization, with a 2x1x16 grid,
+128 threads, 49,152 dynamic shared-memory bytes, and the same eight boolean
+template arguments as the native plugin.  A locally extracted NVCC 13.0.88
+toolchain produces the same 56 mismatches as NVCC 12.9 and 13.1.  Rebuilding
+with the upstream PyTorch flags (`--use_fast_math`, normal FMA contraction,
+half/BF16 macro overrides, and extended lambdas) produces 61 mismatches, so
+neither backend dispatch, launch geometry, nor CUDA compiler minor version
+explains the residual difference.  The final cause was the wrapper's
+unqualified host `sqrt` expression and separately compiled kernel arithmetic.
+PyTorch's BF16 output is stable for adjacent scale bits `0x3df15bef` and
+`0x3df15bf0`, while the native specialization requires the upper value to
+reproduce it.  Using that checked constant makes all 294,912 block-0
+attention values bit-identical on matched Q/K/V.
 
 ```sh
 make -C cuda/qimg21 test_cuda_qimg21_vision

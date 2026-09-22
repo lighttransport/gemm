@@ -9,6 +9,7 @@
 #endif
 
 #include <cstring>
+#include <cstdint>
 #include "csrc/flash_attn/src/flash.h"
 #include "csrc/flash_attn/src/kernel_traits.h"
 #include "csrc/flash_attn/src/flash_fwd_kernel.h"
@@ -17,6 +18,16 @@ using q21_text_traits = Flash_fwd_kernel_traits<128, 128, 64, 4, false,
                                                   false, cutlass::bfloat16_t>;
 using q21_vision_traits = Flash_fwd_kernel_traits<96, 128, 64, 4, false,
                                                     false, cutlass::bfloat16_t>;
+
+static float q21_vision_softmax_scale() {
+    /* PyTorch's output is stable for the two adjacent scale values 0x3df15bef
+     * and 0x3df15bf0.  The separately compiled native specialization needs
+     * the upper value to reproduce PyTorch's BF16 output bit-for-bit. */
+    uint32_t bits = 0x3df15bf0u;
+    float scale;
+    std::memcpy(&scale, &bits, sizeof(scale));
+    return scale;
+}
 
 __global__ void q21_text_flash_kernel(const FLASH_NAMESPACE::Flash_fwd_params params) {
     FLASH_NAMESPACE::compute_attn<q21_text_traits, false, true, false, false,
@@ -291,7 +302,7 @@ extern "C" int q21_flash_vision_attention(float *out, const void *qkv,
     p.seqlen_k_rounded = ((tokens + 127) / 128) * 128;
     p.d = head_dim;
     p.d_rounded = 96;
-    p.scale_softmax = static_cast<float>(1.0 / sqrt(static_cast<double>(head_dim)));
+    p.scale_softmax = q21_vision_softmax_scale();
     p.scale_softmax_log2 = p.scale_softmax * static_cast<float>(M_LOG2E);
     p.p_dropout = p.rp_dropout = 1.0f;
     p.p_dropout_in_uint8_t = 255;

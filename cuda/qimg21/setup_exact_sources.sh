@@ -37,6 +37,13 @@ ensure_checkout() {
 ensure_checkout PyTorch https://github.com/pytorch/pytorch.git "$PYTORCH_DIR" "$PYTORCH_REV"
 ensure_checkout FlashAttention https://github.com/Dao-AILab/flash-attention.git "$FLASH_DIR" "$FLASH_REV"
 
+git -C "$PYTORCH_DIR" diff --quiet || die "PyTorch checkout has tracked source modifications"
+# The FlashAttention CUTLASS gitlink is intentionally replaced below.  Verify
+# the attention source independently so that local header edits cannot pass as
+# an exact checkout merely because HEAD still names the pinned commit.
+git -C "$FLASH_DIR" diff --quiet -- csrc/flash_attn ||
+    die "FlashAttention checkout has tracked source modifications"
+
 CUTLASS_DIR="$FLASH_DIR/csrc/cutlass"
 if [[ ! -d "$CUTLASS_DIR/.git" && ! -f "$CUTLASS_DIR/.git" ]]; then
     (( VERIFY_ONLY == 0 )) || die "CUTLASS checkout missing: $CUTLASS_DIR"
@@ -52,6 +59,7 @@ if [[ "$CUTLASS_ACTUAL" != "$CUTLASS_REV" ]]; then
     [[ -z "$(git -C "$CUTLASS_DIR" status --porcelain)" ]] || die "CUTLASS has local changes; refusing checkout"
     git -C "$CUTLASS_DIR" checkout --detach "$CUTLASS_REV"
 fi
+git -C "$CUTLASS_DIR" diff --quiet || die "CUTLASS checkout has tracked source modifications"
 
 echo "exact sources verified:"
 echo "  PyTorch       $PYTORCH_REV"
