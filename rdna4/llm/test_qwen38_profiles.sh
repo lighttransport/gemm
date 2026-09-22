@@ -87,6 +87,10 @@ grep -q 'LLM_QWEN35_IQ4XS_GATEUP_FUSED' "${runner_c}" || {
     echo 'profile test: IQ4_XS gate/up fusion candidate missing' >&2
     exit 1
 }
+grep -q 'LLM_QWEN35_IQ2XXS_GATEUP_FUSED' "${runner_c}" || {
+    echo 'profile test: IQ2_XXS gate/up fusion candidate missing' >&2
+    exit 1
+}
 grep -q 'io_vectors' "${root_dir}/qwen35_nextn.h" || {
     echo 'profile test: fused commit IO coverage guard missing' >&2
     exit 1

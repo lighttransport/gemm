@@ -61,6 +61,13 @@ exact native IQ4_XS Q8_1 staging and row-range fusion to matching FFN gate/up
 matrices. It remains diagnostic until resident logits, hashes, and 64K timing
 show a quality-safe gain.
 
+The dense FFN path also exposes
+`LLM_QWEN35_IQ2XXS_GATEUP_FUSED=1` for matching IQ2_XXS gate/up matrices. It
+uses the existing IQ2_XXS Q/K/V kernel with the V range disabled, sharing the
+native Q8_1 tile and codebook staging while retaining the standalone integer
+dot and reduction order. This remains opt-in pending resident parity and 64K
+throughput validation.
+
 ## 2026-09-22 continuation: opt-in native Q2_K Q/K/V projection fusion
 
 The ordinary one-token attention dispatcher now exposes

@@ -126,6 +126,13 @@ disabled, so both one-token projections share codebook staging and one launch
 while retaining the standalone row arithmetic. This remains opt-in pending
 resident hash, quality, and throughput checks.
 
+Matching IQ2_XXS dense gate/up matrices can similarly opt into
+`LLM_QWEN35_IQ2XXS_GATEUP_FUSED=1`. The existing IQ2_XXS fused kernel covers
+the two output ranges after one native Q8_1 staging launch, with V disabled and
+the standalone integer dot, scale, and reduction order preserved. Production
+dispatch remains unchanged until resident hashes and sustained 64K timing are
+available.
+
 Mixed-IQ attention layers can also opt into
 `LLM_QWEN35_IQ3S_QKV_FUSED=1` when Q, K, and V are all IQ3_S with a common
 input width. The kernel keeps IQ3_S code decoding, scale correction, and warp
