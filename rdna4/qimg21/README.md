@@ -47,3 +47,13 @@ with one denoising step on an RX 9070 XT. This verifies execution, not
 multi-step image quality or CUDA parity. The current matched-input 256x256
 denoiser prediction has cosine similarity about 0.99995 against the saved
 PyTorch reference, below the CUDA runner's 0.99996 regression gate.
+
+On the RX 9070 XT with the installed HIPRTC 9.0 runtime, a matched-input
+256x256 two-step denoiser run takes 6.76 seconds (14,102,172 KiB peak host RSS) and
+is byte-identical to the earlier ROCm implementation. The earlier run took
+30.26 seconds: direct H2D upload from the safetensors mmap eliminates a
+redundant host copy for each BF16 matrix. Set `QIMG21_PROFILE=1` for diagnostic
+per-block upload, compute, and release timing. At 1024x1024, one step takes
+37.74 seconds and its first matched prediction has cosine 0.9999915 and
+relative L2 0.004273 against the saved PyTorch reference. This single-step
+result does not establish full 40-step trajectory or end-to-end quality.

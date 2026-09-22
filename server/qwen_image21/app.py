@@ -128,8 +128,9 @@ class Demo:
         if cfg["quantized"]:
             if not self.quant.is_dir():
                 raise RuntimeError(f"quantized package is unavailable: {self.quant}")
-            command += ["--quantized-transformer", str(self.quant), "--int8-tensor-core",
-                        "--int8-bf16-tail-blocks", "16"]
+            command += ["--quantized-transformer", str(self.quant)]
+            if backend == "cuda":
+                command += ["--int8-tensor-core", "--int8-bf16-tail-blocks", "16"]
         # uv-managed reference environments can expose the host interpreter as
         # sys.executable from a child process; carry the selected interpreter
         # explicitly to the fixture helper so it retains Torch/CUDA imports.

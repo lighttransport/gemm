@@ -32,6 +32,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include "edit_runtime.h"
 #include "mma64_kernels.h"
 #include "norm_vector_kernels.h"
@@ -247,15 +248,27 @@ static CUdeviceptr upload_bf16(const qimg21_shards *s, const char *name) {
     size_t nbytes = safetensors_nbytes(st, idx);
     size_t n = nbytes / (!strcmp(dt, "F32") ? sizeof(float) : sizeof(uint16_t));
     const uint8_t *src = (const uint8_t *)safetensors_data(st, idx);
+    if (!strcmp(dt, "BF16")) {
+        /* Safetensors exposes a stable mmap view. Copy it directly instead
+         * of allocating and touching a second host copy of every matrix. */
+        CUdeviceptr d = checked_cuMemAlloc(nbytes);
+        if (d && cuMemcpyHtoD(d, src, nbytes) != CUDA_SUCCESS) {
+            cuMemFree(d);
+            d = 0;
+        }
+        return d;
+    }
     uint16_t *tmp = (uint16_t *)malloc(n * sizeof(uint16_t));
     if (!tmp) return 0;
-    if (!strcmp(dt, "BF16")) memcpy(tmp, src, n * 2);
-    else if (!strcmp(dt, "F32")) {
+    if (!strcmp(dt, "F32")) {
         const float *f = (const float *)src;
         for (size_t i = 0; i < n; i++) tmp[i] = qimg_f32_to_bf16_rne(f[i]);
     } else { fprintf(stderr, "native: %s dtype %s is not BF16/F32\n", name, dt); free(tmp); return 0; }
     CUdeviceptr d = checked_cuMemAlloc(n * 2);
-    if (d) cuMemcpyHtoD(d, tmp, n * 2);
+    if (d && cuMemcpyHtoD(d, tmp, n * 2) != CUDA_SUCCESS) {
+        cuMemFree(d);
+        d = 0;
+    }
     free(tmp); return d;
 }
 
@@ -538,7 +551,11 @@ static int native_step(cuda_qimg_runner *r, qimg21_kernels *k, const qimg21_shar
        launch_vec(k->round_bf16,r->stream,2*16384,mod)!=CUDA_SUCCESS) goto fail;
     probe(r,"mod",mod,2*16384); dump_stage("mod",mod,2u*16384u,2,16384);
     probe(r,"mod_zero",mod+(size_t)16384*4,16384);
+    int profile = getenv("QIMG21_PROFILE") != NULL;
+    double profile_upload = 0.0, profile_compute = 0.0, profile_release = 0.0;
     for(int bidx=0;bidx<32;bidx++){
+        struct timespec prof_start, prof_uploaded, prof_computed, prof_released;
+        if(profile)clock_gettime(CLOCK_MONOTONIC,&prof_start);
         qimg21_int8_force_bf16 = qimg21_int8_tensor_core &&
                                  bidx >= 32 - qimg21_int8_bf16_tail_blocks;
         if(qimg21_replay_hidden && bidx<qimg21_stage_block)continue;
@@ -558,6 +575,7 @@ static int native_step(cuda_qimg_runner *r, qimg21_kernels *k, const qimg21_shar
         char nm[128];
         snprintf(nm,sizeof(nm),"transformer_blocks.%d.attn.to_q.weight",bidx);CUdeviceptr wq=upload_bf16(s,nm);snprintf(nm,sizeof(nm),"transformer_blocks.%d.attn.to_k.weight",bidx);CUdeviceptr wk=upload_bf16(s,nm);snprintf(nm,sizeof(nm),"transformer_blocks.%d.attn.to_v.weight",bidx);CUdeviceptr wv=upload_bf16(s,nm);snprintf(nm,sizeof(nm),"transformer_blocks.%d.attn.to_out.0.weight",bidx);CUdeviceptr wo=upload_bf16(s,nm);snprintf(nm,sizeof(nm),"transformer_blocks.%d.img_mlp.gate_layer.weight",bidx);CUdeviceptr wg=upload_bf16(s,nm);snprintf(nm,sizeof(nm),"transformer_blocks.%d.img_mlp.proj.weight",bidx);CUdeviceptr wp=upload_bf16(s,nm);snprintf(nm,sizeof(nm),"transformer_blocks.%d.img_mlp.out.weight",bidx);CUdeviceptr wmlpo=upload_bf16(s,nm);snprintf(nm,sizeof(nm),"transformer_blocks.%d.attn.norm_q.weight",bidx);CUdeviceptr wqn=upload_f32(s,nm);snprintf(nm,sizeof(nm),"transformer_blocks.%d.attn.norm_k.weight",bidx);CUdeviceptr wkn=upload_f32(s,nm);
         if(!wq||!wk||!wv||!wo||!wg||!wp||!wmlpo||!wqn||!wkn)goto fail_block;
+        if(profile)clock_gettime(CLOCK_MONOTONIC,&prof_uploaded);
         void *a1[]={&tmp,&hidden,&mod,&N,&D,&prefix,&(int){0}}; cuLaunchKernel(k->mod_ln,N,1,1,k->norm_threads,1,1,256*sizeof(float),r->stream,a1,NULL); cuCtxSynchronize(); if (launch_vec(k->round_bf16,r->stream,N*D,tmp)!=CUDA_SUCCESS) goto fail_block; probe(r,"mod_ln",tmp,N*D); if (qimg21_stage_block < 0 || bidx == qimg21_stage_block) dump_stage("mod_ln",tmp,(size_t)N*D,N,D); if(launch_cast(r,bf,tmp,N*D)!=CUDA_SUCCESS)goto fail_block;
         if(gemm(r,q,wq,bf,N,D,D)!=0||gemm(r,kk,wk,bf,N,D,D)!=0||gemm(r,v,wv,bf,N,D,D)!=0||launch_vec(k->round_bf16,r->stream,N*D,q)!=CUDA_SUCCESS||launch_vec(k->round_bf16,r->stream,N*D,kk)!=CUDA_SUCCESS||launch_vec(k->round_bf16,r->stream,N*D,v)!=CUDA_SUCCESS)goto fail_block;
         probe(r,"q",q,N*D); probe(r,"v",v,N*D); if (qimg21_stage_block < 0 || bidx == qimg21_stage_block) { dump_stage("q",q,(size_t)N*D,N,D); dump_stage("k",kk,(size_t)N*D,N,D); dump_stage("v",v,(size_t)N*D,N,D); }
@@ -624,11 +642,22 @@ static int native_step(cuda_qimg_runner *r, qimg21_kernels *k, const qimg21_shar
          * deterministic on drivers that do not fully order external-stream
          * work behind a cuBLAS call. */
         cuCtxSynchronize();
+        if(profile)clock_gettime(CLOCK_MONOTONIC,&prof_computed);
         probe(r,"block",hidden,N*D); if (qimg21_stage_block < 0 || bidx == qimg21_stage_block) { char label[32]; snprintf(label,sizeof(label),"block_%02d",bidx); dump_stage(label,hidden,(size_t)N*D,N,D); } if(qimg21_stage_all_blocks){char label[48];snprintf(label,sizeof(label),"block_%02d_target",bidx);dump_stage(label,hidden+(size_t)prefix*D*4,(size_t)nout*D,nout,D);} free_d(&wq);free_d(&wk);free_d(&wv);free_d(&wo);free_d(&wg);free_d(&wp);free_d(&wmlpo);free_d(&wqn);free_d(&wkn);
+        if(profile){
+            clock_gettime(CLOCK_MONOTONIC,&prof_released);
+            double up=(prof_uploaded.tv_sec-prof_start.tv_sec)+1e-9*(prof_uploaded.tv_nsec-prof_start.tv_nsec);
+            double run=(prof_computed.tv_sec-prof_uploaded.tv_sec)+1e-9*(prof_computed.tv_nsec-prof_uploaded.tv_nsec);
+            double release=(prof_released.tv_sec-prof_computed.tv_sec)+1e-9*(prof_released.tv_nsec-prof_computed.tv_nsec);
+            profile_upload+=up;profile_compute+=run;profile_release+=release;
+            fprintf(stderr,"qimg21-profile: block=%02d upload=%.4f compute=%.4f release=%.4f\n",bidx,up,run,release);
+        }
         if(qimg21_replay_hidden){result=3;goto fail;} /* Never emit a model prediction from injected state. */
         continue;
 fail_block: free_d(&wq);free_d(&wk);free_d(&wv);free_d(&wo);free_d(&wg);free_d(&wp);free_d(&wmlpo);free_d(&wqn);free_d(&wkn);goto fail;
     }
+    if(profile)fprintf(stderr,"qimg21-profile: totals upload=%.4f compute=%.4f release=%.4f\n",
+                       profile_upload,profile_compute,profile_release);
     qimg21_int8_force_bf16 = 0;
     w_img=upload_bf16(s,"norm_out.linear.weight");w_proj=upload_bf16(s,"proj_out.weight");if(!w_img||!w_proj)goto fail;
     /* Preserve both real and zero timestep rows through final modulation. */

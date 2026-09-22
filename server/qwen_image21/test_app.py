@@ -40,6 +40,30 @@ class QwenImage21RoutingTest(unittest.TestCase):
             self.assertEqual(command[command.index("--native-attention") + 1], "wmma")
             self.assertEqual(command[0], sys.executable)
 
+    def test_rocm_quantized_uses_bf16_wmma_not_cuda_int8(self):
+        with tempfile.TemporaryDirectory(dir=ROOT / "tmp", prefix="qimg21-test-") as td:
+            root = Path(td)
+            (root / "quant").mkdir()
+            demo = self.make_demo(root)
+            cfg = demo._validate({"prompt": "apple", "backend": "rocm", "quantized": True})
+            commands = []
+            with mock.patch.object(demo, "_run", side_effect=lambda command, cwd, log, env=None: commands.append(command)):
+                demo._native(cfg, root / "out")
+            self.assertIn("--quantized-transformer", commands[0])
+            self.assertNotIn("--int8-tensor-core", commands[0])
+
+    def test_cuda_quantized_keeps_int8_tensor_core(self):
+        with tempfile.TemporaryDirectory(dir=ROOT / "tmp", prefix="qimg21-test-") as td:
+            root = Path(td)
+            (root / "quant").mkdir()
+            demo = self.make_demo(root)
+            cfg = demo._validate({"prompt": "apple", "backend": "cuda", "quantized": True})
+            commands = []
+            with mock.patch.object(demo, "_run", side_effect=lambda command, cwd, log, env=None: commands.append(command)):
+                demo._native(cfg, root / "out")
+            self.assertIn("--int8-tensor-core", commands[0])
+            self.assertIn("--int8-bf16-tail-blocks", commands[0])
+
 
 if __name__ == "__main__":
     unittest.main()
