@@ -83,6 +83,10 @@ grep -q 'LLM_QWEN35_DFLASH_EMBED_BROADCAST_KERNEL' "${root_dir}/qwen35_dflash2.h
     echo 'profile test: DFlash mask broadcast candidate missing' >&2
     exit 1
 }
+grep -q 'LLM_QWEN35_IQ4XS_GATEUP_FUSED' "${runner_c}" || {
+    echo 'profile test: IQ4_XS gate/up fusion candidate missing' >&2
+    exit 1
+}
 grep -q 'io_vectors' "${root_dir}/qwen35_nextn.h" || {
     echo 'profile test: fused commit IO coverage guard missing' >&2
     exit 1

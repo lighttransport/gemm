@@ -56,6 +56,11 @@ IQ4_XS Q/K/V rows, with the cached source shape and weight type checked before
 reuse. This is a sidecar-only launch reduction and remains unmeasured on the
 resident device.
 
+An opt-in `LLM_QWEN35_IQ4XS_GATEUP_FUSED=1` target path now applies the same
+exact native IQ4_XS Q8_1 staging and row-range fusion to matching FFN gate/up
+matrices. It remains diagnostic until resident logits, hashes, and 64K timing
+show a quality-safe gain.
+
 ## 2026-09-22 continuation: opt-in native Q2_K Q/K/V projection fusion
 
 The ordinary one-token attention dispatcher now exposes
