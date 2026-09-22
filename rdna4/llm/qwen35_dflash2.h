@@ -63,10 +63,9 @@ typedef struct hllm_qwen35_dflash2 {
     hipEvent_t target_ready;
     hipEvent_t inject_done;
     int inject_pending;
-    /* Private activation scratch for the optional injection stream.  The
-     * target proposal may reuse its normal buffers as soon as target_ready is
-     * recorded; sidecar KV writes remain ordered by inject_done. */
-    void *inject_features, *inject_features_bf16;
+    /* Private activation scratch for the optional injection stream. Captured
+     * feature rows remain read-only until inject_done; x/norm/K/V are private
+     * so the sidecar stream never races target proposal scratch. */
     void *inject_x, *inject_x_bf16, *inject_norm;
     void *inject_k, *inject_v;
     int inject_capacity;
@@ -80,8 +79,6 @@ static int hllm_dflash_overlap_enabled(void) {
 static void hllm_dflash_overlap_workspace_free(hllm_qwen35_dflash2 *d) {
     if (!d) return;
 #define DFLASH_WS_FREE(p) do { if (p) hipFree(p); } while (0)
-    DFLASH_WS_FREE(d->inject_features);
-    DFLASH_WS_FREE(d->inject_features_bf16);
     DFLASH_WS_FREE(d->inject_x); DFLASH_WS_FREE(d->inject_x_bf16);
     DFLASH_WS_FREE(d->inject_norm);
     DFLASH_WS_FREE(d->inject_k); DFLASH_WS_FREE(d->inject_v);
@@ -117,11 +114,7 @@ static int hllm_dflash_overlap_init(hip_llm_runner *r,
         const size_t cap = HLLM_DFLASH_MAX_BLOCK;
         const size_t ne = (size_t)r->n_embd;
         const size_t kd = (size_t)HLLM_DFLASH_KV_HEADS * HLLM_DFLASH_HEAD_DIM;
-        const size_t feature_elems = cap * HLLM_DFLASH_LAYERS * ne;
-        if (hipMalloc(&d->inject_features, feature_elems * sizeof(float)) != hipSuccess ||
-            (d->features_bf16 && hipMalloc(&d->inject_features_bf16,
-                feature_elems * sizeof(uint16_t)) != hipSuccess) ||
-            hipMalloc(&d->inject_x, cap * ne * sizeof(float)) != hipSuccess ||
+        if (hipMalloc(&d->inject_x, cap * ne * sizeof(float)) != hipSuccess ||
             (d->x_bf16 && hipMalloc(&d->inject_x_bf16,
                 cap * ne * sizeof(uint16_t)) != hipSuccess) ||
             hipMalloc(&d->inject_norm, cap * ne * sizeof(float)) != hipSuccess ||
@@ -154,7 +147,6 @@ static void hllm_qwen35_dflash2_free(hip_llm_runner *r) {
     DFLASH_FREE(d->enc_norm); DFLASH_FREE(d->out_norm);
     DFLASH_FREE(d->selector_hidden);
     DFLASH_FREE(d->selector_prev_w); DFLASH_FREE(d->selector_next_w);
-    DFLASH_FREE(d->inject_features); DFLASH_FREE(d->inject_features_bf16);
     DFLASH_FREE(d->inject_x); DFLASH_FREE(d->inject_x_bf16);
     DFLASH_FREE(d->inject_norm); DFLASH_FREE(d->inject_k); DFLASH_FREE(d->inject_v);
     DFLASH_FREE(d->features); DFLASH_FREE(d->features_bf16);
@@ -811,11 +803,7 @@ int hip_llm_qwen35_dflash2_commit(hip_llm_runner *r, int position,
     }
     if (hllm_dflash_overlap_enabled() && hllm_dflash_overlap_init(r, d) == 0) {
         hipStream_t saved_stream = r->stream;
-        size_t feature_bytes = (size_t)processed * HLLM_DFLASH_LAYERS *
-                               (size_t)r->n_embd * sizeof(float);
-        if (processed > d->inject_capacity ||
-            hipMemcpyAsync(d->inject_features, d->features, feature_bytes,
-                           hipMemcpyDeviceToDevice, saved_stream) != hipSuccess)
+        if (processed > d->inject_capacity)
             return -1;
         /* The verifier normally synchronizes before returning, but keep the
          * cross-stream dependency explicit: feature capture is produced on
@@ -826,7 +814,7 @@ int hip_llm_qwen35_dflash2_commit(hip_llm_runner *r, int position,
             return -1;
         r->stream = d->inject_stream;
         int inject_rc = hllm_qwen35_dflash2_inject_impl(r, position, processed,
-            d->inject_features, d->inject_features_bf16,
+            d->features, d->features_bf16,
             d->inject_x, d->inject_x_bf16, d->inject_norm,
             d->inject_k, d->inject_v);
         r->stream = saved_stream;

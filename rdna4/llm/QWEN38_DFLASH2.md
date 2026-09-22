@@ -148,6 +148,11 @@ preserves selector tie breaks and the predecessor chain; the serialized
 32-thread path remains the default pending resident K=4/K=7 hash and draft-time
 A/B measurements.
 
+The opt-in cache-injection overlap path now consumes captured feature rows
+directly after the target-ready event, eliminating a redundant device copy.
+Sidecar `x`/norm/K/V workspaces remain stream-private, and the inject-done
+dependency still orders the next proposal safely.
+
 ## IQ2_XS launch-bounds probe (2026-09-22)
 
 The native one-row IQ2_XS decode kernel is compiled with

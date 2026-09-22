@@ -156,6 +156,11 @@ prepared native Q8_1 activation and otherwise falls back automatically. The
 default path is unchanged until a resident random-64K hash/performance A/B
 proves the launch and temporary traffic savings.
 
+The opt-in sidecar overlap path now reads captured feature rows directly after
+the target-ready event instead of copying them into a second buffer. The
+injection stream retains private `x`/norm/K/V workspaces and its inject-done
+event still gates the next proposal before target scratch can be reused.
+
 ## 2026-09-22 continuation: opt-in parallel DFlash2 selector
 
 The DFlash2 selector now has an opt-in
