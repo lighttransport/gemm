@@ -29,6 +29,7 @@ VLM_BUILD   := $(VLM_DIR)/build
 BUILD       := $(LLM_DIR)build
 Q8V2_KERNEL := $(ROOT)/gemma4-kernels/kernel_q8v2_3x4.S
 Q8B6_KERNEL := $(ROOT)/int8-cmg/micro_kernel_6x4_no_sector.S
+Q8K128_KERNEL := $(ROOT)/dequant-pipe/q8_k128.S
 BF16_PODD_KERNEL := $(ROOT)/gemma4-kernels/sgemm_bf16_2x12.S
 
 # ── Compiler-specific flags ────────────────────────────────────────────
@@ -150,8 +151,9 @@ all: $(BUILD)/llm_runner
 llm_runner: $(BUILD)/llm_runner
 
 qwen38_runner: $(BUILD)/qwen38_runner
-$(BUILD)/qwen38_runner: $(LLM_DIR)qwen38_runner.c $(COMMON)/transformer.h $(COMMON)/gguf_loader.h | $(BUILD)
-	$(CC) $(CFLAGS) $(QWEN_CFLAGS) -o $@ $(LLM_DIR)qwen38_runner.c $(LDFLAGS)
+$(BUILD)/qwen38_runner: $(LLM_DIR)qwen38_runner.c $(COMMON)/transformer.h $(COMMON)/gguf_loader.h $(ROOT)/dequant-pipe/q8_k128.h $(Q8K128_KERNEL) | $(BUILD)
+	$(CC) $(CFLAGS) $(QWEN_CFLAGS) -DTF_LINK_Q8_K128 -o $@ \
+		$(LLM_DIR)qwen38_runner.c $(Q8K128_KERNEL) $(LDFLAGS)
 
 qwen38_kquant_bench: $(BUILD)/bench_qwen38_kquants
 $(BUILD)/bench_qwen38_kquants: $(LLM_DIR)bench_qwen38_kquants.c $(LLM_DIR)kquant_decode_cache.h $(COMMON)/transformer.h $(COMMON)/gguf_loader.h $(COMMON)/ggml_dequant.h | $(BUILD)

@@ -8,8 +8,17 @@ copying the files.
 Build:
 
 ```sh
-make -C a64fx/llm qwen38_runner qwen38_pp_runner CC=fcc OPENMP=1
+mkdir -p tmp/fcc
+TMPDIR="$PWD/tmp/fcc" \
+  make -C a64fx/llm qwen38_runner qwen38_pp_runner CC=fcc OPENMP=1
 ```
+
+When `uname -m` reports `aarch64` on an A64FX host, compile and run the A64FX
+binary natively there. Do not cross-build with the login host's GCC: its SVE
+headers and target runtime may not match. Fujitsu `fcc -Nclang` needs a writable
+temporary directory, so point `TMPDIR` at `tmp/fcc` in this repository rather
+than `/tmp`. The resulting executable should report `ARM aarch64` from `file`
+and can be invoked directly through the launchers below.
 
 Single-node Q4 (anonymous HBM upload, with source-cache eviction):
 
@@ -18,6 +27,70 @@ a64fx/llm/run_qwen38.sh \
   --model ~/models/qwen38/27b/Qwen3.8-27B-UD-Q4_K_XL.gguf \
   --mode single --nodes 1 -- --prompt 'Hello' --max-gen 16 --spec-k 1
 ```
+
+Single-node Q8 llama-bench-style benchmark:
+
+```sh
+MODEL=/home/u14346/models/qwen38/27b/Qwen3.8-27B-Q8_0.gguf
+STAGE=/local/u14346/qwen38
+sh a64fx/llm/stage_gguf_shards.sh "$MODEL" "$STAGE"
+make -C a64fx/llm qwen38_runner CC=fcc OPENMP=1
+
+OMP_NUM_THREADS=48 OMP_PROC_BIND=close OMP_PLACES=cores \
+numactl --interleave=all a64fx/llm/build/qwen38_runner \
+  "$STAGE/Qwen3.8-27B-Q8_0.gguf" --threads 48 --max-seq 1024 \
+  --q8-mode reference --bench --bench-prompt 8,32,128 \
+  --bench-gen 32,128 --bench-warmup 1 --bench-runs 3
+```
+
+`--bench-prompt` and `--bench-gen` accept comma-separated token counts. The
+runner prints llama-bench-style `pp` (prompt/prefill) and `tg` (generation)
+throughput, reuses the resident model between cases, and resets recurrent
+runtime state between repetitions. Use `--bench-csv` for a machine-readable
+header and rows. Benchmark mode currently requires `--spec-k 0` so speculative
+draft work does not mix with the plain prefill/decode rates.
+
+### Four-CMG Q8 decode
+
+Use the dedicated launcher for the packed K-major Q8 path. It stages the GGUF
+under `/local`, allocates one 2 MiB-hugepage arena for the 27.2 GB decode
+weights, binds it across NUMA nodes 4-7, and pins one twelve-core worker group
+to each A64FX CMG:
+
+```sh
+a64fx/llm/run_qwen38_q8_cmg4.sh \
+  /local/u14346/qwen38/Qwen3.8-27B-Q8_0.gguf \
+  --prompt Hello --max-gen 16 --max-seq 128
+
+a64fx/llm/run_qwen38_q8_cmg4.sh \
+  /local/u14346/qwen38/Qwen3.8-27B-Q8_0.gguf \
+  --max-seq 256 --bench --bench-prompt 8 --bench-gen 32 \
+  --bench-warmup 1 --bench-runs 3 --bench-csv
+```
+
+The launcher sets hugepage fallback to zero and the runner checks the resulting
+mapping, so a run fails instead of silently using base pages or one-CMG
+placement. CMG4 mode also rejects GGUF paths outside `/local`: shared-storage
+weights are always staged node-locally before conversion into the resident
+HBM2 arena. The current 64-output by 128-input SVE kernel preserves the Q8_0
+bytes and FP16 scales while changing only FP32 reduction grouping.
+
+CMG4 uses four independent NUMA-aware allocations rather than subranges of one
+recycled heap allocation. Allocation 0/1/2/3 is bound to node 4/5/6/7 and is
+consumed only by worker IDs 0-11/12-23/24-35/36-47, pinned to CPUs
+12-23/24-35/36-47/48-59. Each tensor is split at complete 64-row packed-group
+boundaries; segment starts are 256-byte aligned. `NUMA_REPORT=1` enables the
+runtime tensor-owner check and must report zero errors.
+
+On the development node, the isolated kernel reached 110.8 GB/s on one CMG and
+349.8 GB/s over 48 cores. The first integrated one-token check generated the
+same `,` token as the reference Q8 path. Initial end-to-end decode measured
+0.67 tok/s versus 0.41 tok/s for reference Q8. Fusing the DeltaNet Q/K
+normalization, expansion, and scalar preparation phases removed three pool
+barriers per SSM layer and raised the one-token check to 1.42 tok/s. Profiling
+still attributes most remaining time to DeltaNet/SSM preparation rather than
+weight streaming. Thus the original 20-30 tok/s value remains a bandwidth
+roofline target, not an achieved runner result.
 
 Pipeline parallel Q8 on two nodes or Q8/BF16 on twelve nodes:
 
@@ -72,3 +145,20 @@ Current validation:
   one-token baseline measured 33.177 s prefill and 26.203 s decode. The current
   `transformer_build_panels()` hook is a no-op, so `TF_NO_PANEL=0` is not an
   optimization (the parity trial measured 25.987/26.923 s).
+
+## Module performance measurement
+
+Set `TF_MODULE_PROFILE=1` for a compact bottleneck report from the Qwen runner.
+It enables the existing low-level stage timers during both prompt processing
+and generation, then prints total prefill/decode throughput plus milliseconds
+per token for attention QKV/output, SSM input/prepare/core/output, FFN
+gate/up/down, LM head, and aggregate matrix work:
+
+```sh
+TF_MODULE_PROFILE=1 TF_KV_DTYPE=f16 \
+  a64fx/llm/build/qwen38_runner MODEL.gguf \
+  --prompt 'Return only code.' --max-gen 32 --max-seq 65536
+```
+
+The prefill line is captured before decode counters are reset. Use the same
+prompt, context, thread count, and cache dtype when comparing kernel changes.

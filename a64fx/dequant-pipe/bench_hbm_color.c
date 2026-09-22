@@ -17,6 +17,7 @@ enum { CACHE_LINE = 256, MAX_CORES = 12, MAX_TRIALS = 31 };
 typedef enum { PAGE_THP, PAGE_BASE, PAGE_XOS } page_mode;
 
 extern void hbm_read_256_sve(const uint8_t *, size_t);
+extern void q8_stream_256_sve(const uint8_t *, size_t);
 #define DECLARE_COMPUTE(kind, n) extern void hbm_read_256_##kind##_##n##_sve(const uint8_t *, size_t)
 DECLARE_COMPUTE(sdot, 4); DECLARE_COMPUTE(sdot, 8); DECLARE_COMPUTE(sdot, 12);
 DECLARE_COMPUTE(sdot, 16); DECLARE_COMPUTE(sdot, 24); DECLARE_COMPUTE(sdot, 32);
@@ -167,6 +168,7 @@ static void usage(const char *name)
 static stream_fn select_stream(const char *op, int count)
 {
     if (!strcmp(op, "read") && count == 0) return hbm_read_256_sve;
+    if (!strcmp(op, "q8read") && count == 0) return q8_stream_256_sve;
 #define SELECT(kind, n) if (!strcmp(op, #kind) && count == n) return hbm_read_256_##kind##_##n##_sve
     SELECT(sdot, 4); SELECT(sdot, 8); SELECT(sdot, 12); SELECT(sdot, 16);
     SELECT(sdot, 24); SELECT(sdot, 32); SELECT(fmla, 4); SELECT(fmla, 8);

@@ -124,6 +124,35 @@ nohup a64fx/tools/bash-over-http/watch_local_tunnel.sh \
 
 ## Submit a job
 
+### Submit directly from a Fugaku frontend
+
+When the local shell is already on a Fugaku frontend named `fn01sv0N`, it is
+the corresponding `loginN` frontend.  In that case the bash-over-HTTP bridge
+and SSH forwards are unnecessary: submit the interactive allocation directly
+from the frontend and run the staging/build/benchmark commands in the
+interactive shell.
+
+Confirm the frontend first:
+
+```bash
+hostname -s                         # expected: fn01sv0N
+pjstat                              # optional scheduler check
+```
+
+For a one-node interactive A64FX allocation:
+
+```bash
+pjsub --interact -g hp250467 \
+  -L "freq=2000,eco_state=0,rscgrp=int,node=1,elapse=06:00:00" \
+  --sparam "wait-time=600" --no-check-directory \
+  -x PJM_LLIO_GFSCACHE=/vol0004 --llio localtmp-size=87Gi
+```
+
+The command opens a shell on the allocated compute node.  `/local` is
+allocation-local and should be populated from the shared model filesystem
+inside that shell.  This direct mode is distinct from the persistent
+bash-over-HTTP procedure below and does not require a local tunnel.
+
 The standard one-node, 12-hour remote-development allocation is:
 
 ```bash
