@@ -801,6 +801,8 @@ static void tf_dequant_row(const qtensor *t, int row, float *dst) {
         case GGML_TYPE_F32:    block_size = 1;   type_size = 4;   break;
         case GGML_TYPE_F16:    block_size = 1;   type_size = 2;   break;
         case GGML_TYPE_BF16:   block_size = 1;   type_size = 2;   break;
+        case GGML_TYPE_MXFP4: block_size = 32; type_size = 17; break;
+        case GGML_TYPE_NVFP4: block_size = 64; type_size = 36; break;
         default:
             fprintf(stderr, "tf_dequant_row: unsupported type %u\n", t->type);
             memset(dst, 0, (size_t)n_cols * sizeof(float));
@@ -833,6 +835,8 @@ static int tf_is_supported_weight_type(uint32_t type) {
         case GGML_TYPE_F32:
         case GGML_TYPE_F16:
         case GGML_TYPE_BF16:
+        case GGML_TYPE_MXFP4:
+        case GGML_TYPE_NVFP4:
             return 1;
         default:
             return 0;
@@ -861,6 +865,8 @@ static size_t tf_row_bytes(uint32_t type, int n_cols) {
         case GGML_TYPE_F32:    block_size = 1;   type_size = 4;   break;
         case GGML_TYPE_F16:    block_size = 1;   type_size = 2;   break;
         case GGML_TYPE_BF16:   block_size = 1;   type_size = 2;   break;
+        case GGML_TYPE_MXFP4: block_size = 32; type_size = 17; break;
+        case GGML_TYPE_NVFP4: block_size = 64; type_size = 36; break;
         default: return 0;
     }
     return (size_t)((n_cols + block_size - 1) / block_size) * type_size;
