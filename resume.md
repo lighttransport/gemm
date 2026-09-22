@@ -185,6 +185,11 @@ accumulation still visits all 256 terms in the original order. The selector
 tie break and predecessor chain are unchanged; the serialized 32-thread path
 remains the default pending resident K=4/K=7 hashes and draft-time A/B data.
 
+The parallel selector now decodes the predecessor's 256-rank Q4_K vector only
+in its first candidate group; the other seven groups reuse the same shared
+values. This removes duplicated selector loads without changing candidate
+scores, tie breaks, or the opt-in/default boundary.
+
 The verifier commit boundary also has an opt-in
 `LLM_QWEN35_COMMIT_FUSED_COPY=1` kernel. It retains the existing per-layer
 checkpoint pointer-table copies and folds the accepted hidden/logit device

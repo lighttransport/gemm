@@ -751,6 +751,11 @@ reflects the remaining measured costs.
    cheaper draft-cache storage are the next candidates, provided K=4/K=7
    acceptance and authoritative output remain stable.
 
+   The opt-in eight-group selector now lets group zero populate the shared
+   256-rank predecessor array; the other groups reuse it after the barrier.
+   This removes duplicate Q4_K loads while preserving ordered score arithmetic,
+   tie breaks, and the predecessor chain.
+
    The anchor and fixed mask-token rows now use one scalar IQ1_M mask embedding
    plus device copies for the remaining rows. The pinned greedy K=7 gate is
    exact at 82.65--84.12 tok/s warm (140 drafted/134 accepted, hash

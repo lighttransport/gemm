@@ -218,9 +218,14 @@ void qwen35_dflash2_select_warp(const float *logits,
     if (tid == 0) predecessor = anchor;
     __syncthreads();
     for (int row = 1; row < rows; ++row) {
-        for (int j = lane; j < DFLASH_SELECTOR_RANK; j += 32)
-            predecessor_values[j] = qwen35_dflash2_q4k_value(
-                predecessor_w, predecessor, j);
+        /* Only the first candidate group owns predecessor decoding.  Every
+         * group used to perform the same 256 rank loads into the shared array,
+         * multiplying selector traffic by eight without changing a value. */
+        if (group == 0) {
+            for (int j = lane; j < DFLASH_SELECTOR_RANK; j += 32)
+                predecessor_values[j] = qwen35_dflash2_q4k_value(
+                    predecessor_w, predecessor, j);
+        }
         __syncthreads();
         for (int batch = 0; batch < 2; ++batch) {
             int k = batch * 8 + group;
