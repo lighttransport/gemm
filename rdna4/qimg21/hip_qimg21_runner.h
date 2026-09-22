@@ -61,6 +61,7 @@ typedef struct cuda_qimg_runner {
     CUfunction cast_f32_to_bf16;
     CUfunction bf16_to_f32_add_bias;
     CUfunction gemm_bf16;
+    CUfunction gemm_bf16_f64;
     CUfunction gemm_bf16_wmma;
     CUfunction gemm_int8_s32;
     CUfunction quant_act_perrow_int8;
@@ -94,7 +95,13 @@ static const char *hip_qimg21_common_src =
 "int i=blockIdx.y*blockDim.y+threadIdx.y;if(j>=no||i>=nt)return;float a=0;"
 "for(int k=0;k<ni;k++){unsigned int xb=(unsigned int)x[i*ni+k]<<16;"
 "unsigned int wb=(unsigned int)w[j*ni+k]<<16;float xf,wf;memcpy(&xf,&xb,4);memcpy(&wf,&wb,4);a+=xf*wf;}"
-"y[i*no+j]=a;}\n";
+"y[i*no+j]=a;}\n"
+"extern \"C\" __global__ void q21_gemm_bf16_f64(float* y,const unsigned short* w,"
+"const unsigned short* x,int no,int ni,int nt){int j=blockIdx.x*blockDim.x+threadIdx.x;"
+"int i=blockIdx.y;if(j>=no||i>=nt)return;double a=0;"
+"for(int k=0;k<ni;k++){unsigned int xb=(unsigned int)x[i*ni+k]<<16;"
+"unsigned int wb=(unsigned int)w[j*ni+k]<<16;float xf,wf;memcpy(&xf,&xb,4);memcpy(&wf,&wb,4);"
+"a+=(double)xf*(double)wf;}y[i*no+j]=(float)a;}\n";
 
 static const char *hip_qimg21_wmma_src =
 "#if defined(__gfx1200__) || defined(__gfx1201__)\n"
@@ -156,14 +163,16 @@ static int hip_qimg21_init_kernels(cuda_qimg_runner *r) {
     }
     hipError_t cast_rc = hipModuleGetFunction(&r->cast_f32_to_bf16, module, "q21_cast_f32_bf16");
     hipError_t gemm_rc = hipModuleGetFunction(&r->gemm_bf16, module, "q21_gemm_bf16");
-    if (cast_rc != hipSuccess || gemm_rc != hipSuccess) {
-        const char *cast_es = "?", *gemm_es = "?";
+    hipError_t f64_rc = hipModuleGetFunction(&r->gemm_bf16_f64, module, "q21_gemm_bf16_f64");
+    if (cast_rc != hipSuccess || gemm_rc != hipSuccess || f64_rc != hipSuccess) {
+        const char *cast_es = "?", *gemm_es = "?", *f64_es = "?";
         if (hipGetErrorString) {
             hipGetErrorString(cast_rc, &cast_es);
             hipGetErrorString(gemm_rc, &gemm_es);
+            hipGetErrorString(f64_rc, &f64_es);
         }
-        fprintf(stderr, "qimg21-hip: common functions unavailable: cast=%d (%s) gemm=%d (%s)\n",
-                (int)cast_rc, cast_es, (int)gemm_rc, gemm_es);
+        fprintf(stderr, "qimg21-hip: common functions unavailable: cast=%d (%s) gemm=%d (%s) f64=%d (%s)\n",
+                (int)cast_rc, cast_es, (int)gemm_rc, gemm_es, (int)f64_rc, f64_es);
         hipModuleUnload(module); return -1;
     }
     r->common_module = module;

@@ -124,6 +124,19 @@ cosine from 0.999891917 to 0.999924535; replaying CUDA modulation raised it
 to 0.999950087, still below the gate. Scalar HIP and hipBLAS two-row GEMM
 diagnostics also missed the gate, so they are not production paths.
 
+For a precision probe, `QIMG21_DIAG_TIME2_F64=1` runs the two-row timestep
+projection with FP64 accumulation; `QIMG21_DIAG_MOD_F64=1` does the same for
+the modulation projection. Both are diagnostic only and leave the default
+WMMA path unchanged. On the saved first editing step, the input to timestep
+SiLU is byte-identical between CUDA and HIP, but the pre-round WMMA output
+has a small downward error relative to an FP64 dot product. FP64 timestep
+accumulation reproduces the FP64-rounded BF16 state exactly and improves the
+first prediction cosine from 0.999891917 to 0.999932841. Adding FP64
+modulation instead lowers it to 0.999903025. Neither clears the 0.99996
+editing gate, so broader numeric or attention differences remain. Set
+`QIMG21_STAGE_KEYS=time2_pre_round` to dump the FP32 projection before its
+BF16 rounding for further diagnosis.
+
 The 1024-condition native vision path converts BF16 checkpoint biases to F32
 for its F32 linear epilogue and rounds the patch GEMM output to BF16 before
 adding the bias, matching CUDA's two activation boundaries. On the same

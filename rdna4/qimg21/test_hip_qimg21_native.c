@@ -430,6 +430,19 @@ static int gemm(cuda_qimg_runner *r, CUdeviceptr y, CUdeviceptr w, CUdeviceptr x
     return (int)rc;
 }
 
+/* Diagnostic only: isolate WMMA accumulation error in two-row embeddings. */
+static int gemm_diagnostic_f64(cuda_qimg_runner *r, CUdeviceptr y, CUdeviceptr w,
+                               CUdeviceptr x, int nt, int no, int ni,
+                               const char *flag) {
+    if (!getenv(flag)) return gemm(r, y, w, x, nt, no, ni);
+    void *args[] = {&y, &w, &x, &no, &ni, &nt};
+    CUresult rc = cuLaunchKernel(r->gemm_bf16_f64, (unsigned)((no + 255) / 256),
+                                 (unsigned)nt, 1, 256, 1, 1, 0, r->stream, args, NULL);
+    if (rc == CUDA_SUCCESS) rc = cuCtxSynchronize();
+    if (rc != CUDA_SUCCESS) fprintf(stderr, "native: diagnostic F64 GEMM failed rc=%d\n", rc);
+    return (int)rc;
+}
+
 static int launch_vec(CUfunction f, CUstream st, int n, CUdeviceptr x) {
     void *a[] = { &x, &n };
     CUresult rc = cuLaunchKernel(f, (n + 255) / 256, 1, 1, 256, 1, 1, 0, st, a, NULL);
@@ -556,8 +569,9 @@ static int native_step(cuda_qimg_runner *r, qimg21_kernels *k, const qimg21_shar
        launch_vec(k->round_bf16,r->stream,2*D,temb)!=CUDA_SUCCESS) goto fail;
     dump_stage("time_silu",temb,2u*D,2,D);
     if(launch_cast(r,bf,temb,2*D)!=CUDA_SUCCESS ||
-       gemm(r,temb,w_t2,bf,2,D,D)!=0 ||
-       launch_vec(k->round_bf16,r->stream,2*D,temb)!=CUDA_SUCCESS) goto fail;
+       gemm_diagnostic_f64(r,temb,w_t2,bf,2,D,D,"QIMG21_DIAG_TIME2_F64")!=0) goto fail;
+    dump_stage("time2_pre_round",temb,2u*D,2,D);
+    if(launch_vec(k->round_bf16,r->stream,2*D,temb)!=CUDA_SUCCESS) goto fail;
     dump_stage("time2",temb,2u*D,2,D);
     if(qimg21_replay_time2) {
         npy_f32 replay={0};
@@ -574,7 +588,7 @@ static int native_step(cuda_qimg_runner *r, qimg21_kernels *k, const qimg21_shar
     if(launch_vec(k->silu,r->stream,2*D,tmp2)!=CUDA_SUCCESS ||
        launch_vec(k->round_bf16,r->stream,2*D,tmp2)!=CUDA_SUCCESS ||
        launch_cast(r,bf,tmp2,2*D)!=CUDA_SUCCESS ||
-       gemm(r,mod,w_mod,bf,2,16384,D)!=0 ||
+       gemm_diagnostic_f64(r,mod,w_mod,bf,2,16384,D,"QIMG21_DIAG_MOD_F64")!=0 ||
        launch_vec(k->round_bf16,r->stream,2*16384,mod)!=CUDA_SUCCESS) goto fail;
     probe(r,"mod",mod,2*16384); dump_stage("mod",mod,2u*16384u,2,16384);
     if(qimg21_replay_mod) {
