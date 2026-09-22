@@ -40,8 +40,8 @@ struct q21_ln_stat {
 __device__ q21_ln_stat q21_ln_add(q21_ln_stat a, float value) {
     float delta = value - a.mean;
     float count = a.count + 1.0f;
-    float mean = fmaf(delta, 1.0f / count, a.mean);
-    a.var = fmaf(delta, value - mean, a.var);
+    float mean = a.mean + delta * (1.0f / count);
+    a.var = a.var + delta * (value - mean);
     a.mean = mean;
     a.count = count;
     return a;
@@ -108,12 +108,58 @@ __global__ void q21_vision_layer_norm_kernel(float *out, const float *input,
     }
 }
 
+__global__ void q21_vision_layer_norm_stats_kernel(float *out, const float *input,
+                                                    int width) {
+    int row = blockIdx.x, thread = threadIdx.x, lane = thread & 31, warp = thread >> 5;
+    __shared__ float shared[12];
+    q21_ln_stat stat{0.0f, 0.0f, 0.0f};
+    int vectors = width / 4;
+    for (int vector = thread; vector < vectors; vector += 256) {
+        int column = vector * 4;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) stat = q21_ln_add(stat, input[row * width + column + i]);
+    }
+    for (int offset = 16; offset; offset >>= 1) {
+        q21_ln_stat other{__shfl_down_sync(0xffffffff, stat.mean, offset),
+                          __shfl_down_sync(0xffffffff, stat.var, offset),
+                          __shfl_down_sync(0xffffffff, stat.count, offset)};
+        stat = q21_ln_combine(stat, other);
+    }
+    for (int offset = 4; offset; offset >>= 1) {
+        if (lane == 0 && warp >= offset && warp < 2 * offset) {
+            int index = warp - offset;
+            shared[2 * index] = stat.mean;
+            shared[2 * index + 1] = stat.var;
+            shared[8 + index] = stat.count;
+        }
+        __syncthreads();
+        if (lane == 0 && warp < offset) {
+            q21_ln_stat other{shared[2 * warp], shared[2 * warp + 1], shared[8 + warp]};
+            stat = q21_ln_combine(stat, other);
+        }
+        __syncthreads();
+    }
+    if (thread == 0) {
+        out[2 * row] = stat.mean;
+        out[2 * row + 1] = rsqrtf(stat.var / static_cast<float>(width) + 1.0e-6f);
+    }
+}
+
 extern "C" int q21_flash_vision_layer_norm(float *out, const float *input,
                                              const float *weight, const float *bias,
                                              int rows, int width, cudaStream_t stream) {
     if (!out || !input || !weight || !bias || rows <= 0 || width <= 0 || width % 4)
         return cudaErrorInvalidValue;
     q21_vision_layer_norm_kernel<<<rows, 256, 0, stream>>>(out, input, weight, bias, width);
+    return cudaGetLastError();
+}
+
+extern "C" int q21_flash_vision_layer_norm_stats(float *out, const float *input,
+                                                   int rows, int width,
+                                                   cudaStream_t stream) {
+    if (!out || !input || rows <= 0 || width <= 0 || width % 4)
+        return cudaErrorInvalidValue;
+    q21_vision_layer_norm_stats_kernel<<<rows, 256, 0, stream>>>(out, input, width);
     return cudaGetLastError();
 }
 

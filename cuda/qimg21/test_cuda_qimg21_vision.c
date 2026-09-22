@@ -10,6 +10,8 @@ typedef int (*q21_cutlass_vision_attention_fn)(float *, const void *, int, int, 
 typedef int (*q21_flash_vision_attention_fn)(float *, const void *, int, CUstream);
 typedef int (*q21_flash_vision_layer_norm_fn)(float *, const float *, const float *,
                                               const float *, int, int, CUstream);
+typedef int (*q21_flash_vision_layer_norm_stats_fn)(float *, const float *, int, int,
+                                                    CUstream);
 
 static const char *vision_front_src =
 "extern \"C\" {\n"
@@ -260,6 +262,7 @@ int main(int argc, char **argv) {
     q21_cutlass_vision_attention_fn cutlass_attention = NULL;
     q21_flash_vision_attention_fn flash_attention = NULL;
     q21_flash_vision_layer_norm_fn flash_layer_norm = NULL;
+    q21_flash_vision_layer_norm_stats_fn flash_layer_norm_stats = NULL;
     float *host_pos = NULL, *host_out = NULL;
     int rc = 1, n = h * w, count = n * 1152;
     int vision_compile = -1;
@@ -294,6 +297,8 @@ int main(int argc, char **argv) {
                 dlsym(cutlass_plugin, "q21_flash_vision_attention") : NULL;
             flash_layer_norm = cutlass_plugin ? (q21_flash_vision_layer_norm_fn)
                 dlsym(cutlass_plugin, "q21_flash_vision_layer_norm") : NULL;
+            flash_layer_norm_stats = cutlass_plugin ? (q21_flash_vision_layer_norm_stats_fn)
+                dlsym(cutlass_plugin, "q21_flash_vision_layer_norm_stats") : NULL;
         } else {
             cutlass_attention = cutlass_plugin ? (q21_cutlass_vision_attention_fn)
                 dlsym(cutlass_plugin, "q21_cutlass_vision_attention") : NULL;
@@ -354,6 +359,17 @@ blocks_ready:
         snprintf(name, sizeof(name), "model.visual.blocks.%d.norm1.bias", block);
         CUdeviceptr nb = upload_f32(&shards, name);
         if (!nw || !nb || cuCtxSynchronize()) { free_d(&nw); free_d(&nb); goto done; }
+        if (block == block_index && dump_dir && flash_layer_norm_stats) {
+            CUdeviceptr stats = checked_cuMemAlloc((size_t)n * 2 * sizeof(float));
+            if (!stats || flash_layer_norm_stats((float *)(uintptr_t)stats,
+                                                 (const float *)(uintptr_t)x,
+                                                 n, 1152, r->stream) ||
+                cuStreamSynchronize(r->stream) ||
+                dump_vision(dump_dir, "norm1_stats", stats, (size_t)n * 2, n, 2)) {
+                free_d(&stats); free_d(&nw); free_d(&nb); goto done;
+            }
+            free_d(&stats);
+        }
         void *ln1[] = {&norm, &x, &nw, &nb, &(int){1152}};
         int ln_status = flash_layer_norm
             ? flash_layer_norm((float *)(uintptr_t)norm, (const float *)(uintptr_t)x,
@@ -399,6 +415,17 @@ blocks_ready:
         snprintf(name, sizeof(name), "model.visual.blocks.%d.norm2.bias", block);
         nb = upload_f32(&shards, name);
         if (!nw || !nb || cuCtxSynchronize()) { free_d(&nw); free_d(&nb); goto done; }
+        if (block == block_index && dump_dir && flash_layer_norm_stats) {
+            CUdeviceptr stats = checked_cuMemAlloc((size_t)n * 2 * sizeof(float));
+            if (!stats || flash_layer_norm_stats((float *)(uintptr_t)stats,
+                                                 (const float *)(uintptr_t)x,
+                                                 n, 1152, r->stream) ||
+                cuStreamSynchronize(r->stream) ||
+                dump_vision(dump_dir, "norm2_stats", stats, (size_t)n * 2, n, 2)) {
+                free_d(&stats); free_d(&nw); free_d(&nb); goto done;
+            }
+            free_d(&stats);
+        }
         void *ln2[] = {&norm, &x, &nw, &nb, &(int){1152}};
         ln_status = flash_layer_norm
             ? flash_layer_norm((float *)(uintptr_t)norm, (const float *)(uintptr_t)x,

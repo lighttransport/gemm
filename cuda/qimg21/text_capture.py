@@ -93,6 +93,19 @@ def capture_text_encoder(pipe, folder: Path, stage_layer: int = 0):
                         _save(folder / "vision_block_input.npy", args[0])
                     handles.append(block.register_forward_pre_hook(vision_input_hook))
                 if index == min(stage_layer, len(visual.blocks) - 1):
+                    def save_layer_norm_stats(name, layer_norm):
+                        def hook(module, args):
+                            torch = __import__("torch")
+                            _, mean, rstd = torch.native_layer_norm(
+                                args[0], layer_norm.normalized_shape,
+                                None, None, layer_norm.eps)
+                            _save(folder / f"vision_stage_{name}_mean.npy", mean)
+                            _save(folder / f"vision_stage_{name}_rstd.npy", rstd)
+                        return hook
+                    handles.append(block.norm1.register_forward_pre_hook(
+                        save_layer_norm_stats("norm1", block.norm1)))
+                    handles.append(block.norm2.register_forward_pre_hook(
+                        save_layer_norm_stats("norm2", block.norm2)))
                     for name, child in block.named_modules():
                         if not name:
                             continue

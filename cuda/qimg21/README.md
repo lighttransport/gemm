@@ -1274,6 +1274,18 @@ but still fails the gate. A greedy per-block oracle over both implementations
 first fails at block 5 (0.999954165), showing that LayerNorm-path selection
 alone cannot resolve the recurrent vision error.
 
+`--dump-dir` also records `norm1_stats.npy` and `norm2_stats.npy` as
+`[tokens,2]` mean/rstd pairs when the pinned FlashAttention plugin is active.
+`text_capture.py --dump-text-stages` records the corresponding PyTorch
+`vision_stage_norm{1,2}_{mean,rstd}.npy` arrays. On exact block-0 input, native
+means are bit-identical for 130/256 rows and differ by at most 7.45e-9;
+rstd is identical for 203/256 rows and differs by at most 2.38e-7. These F32
+reduction differences explain the sparse LayerNorm BF16 discrepancies.
+Testing unfused online/combine arithmetic, native BF16 conversion, PyTorch's
+2D launch shape, O2 compilation, and CUDA 12.9 code generation did not improve
+the full recurrence, so the accepted kernel retains the literal pinned
+PyTorch Welford expressions.
+
 ```sh
 make -C cuda/qimg21 test_cuda_qimg21_vision
 cuda/qimg21/test_cuda_qimg21_vision \
