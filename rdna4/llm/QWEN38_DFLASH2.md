@@ -109,6 +109,12 @@ reduction order exact while sharing the Q8_1 activation launch. This remains a
 diagnostic candidate until resident gfx1201 token/logit hashes and sustained
 64K timing show a gain; standalone IQ3_S launches remain the default.
 
+All-IQ4_XS attention layers can opt into
+`LLM_QWEN35_IQ4XS_QKV_FUSED=1`. The candidate keeps the eight virtual warp
+passes, nibble decode, affine correction, and reduction order of standalone
+IQ4_XS while sharing native Q8_1 activation staging. It remains diagnostic
+until resident logits/tokens and sustained 64K timing confirm a gain.
+
 The IQ2_XS target's usual IQ1_S gate/IQ1_M up pair has a corresponding
 `LLM_QWEN35_IQ1_GATEUP_FUSED=1` candidate. It shares the exact Q8_1 activation
 and dispatches both differing IQ1 layouts in one warp-per-row kernel. The

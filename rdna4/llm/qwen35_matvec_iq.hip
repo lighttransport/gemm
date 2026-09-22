@@ -81,6 +81,69 @@ extern "C" __global__ void qwen35_matvec_iq4xs(
     if (lane == 0) out[row] = sum;
 }
 
+/* One-token IQ4_XS Q/K/V fusion.  IQ4_XS uses eight virtual warp passes per
+ * row; keep that accumulation order exactly while joining the three output
+ * ranges behind one native Q8_1 activation launch. */
+extern "C" __global__ void qwen35_matvec_iq4xs_qkv(
+        float *__restrict__ qout, float *__restrict__ kout,
+        float *__restrict__ vout,
+        const unsigned char *__restrict__ qw,
+        const unsigned char *__restrict__ kw,
+        const unsigned char *__restrict__ vw,
+        const signed char *__restrict__ q, const float *__restrict__ scales,
+        int qrows, int krows, int vrows, int cols) {
+    int lane = threadIdx.x & 31;
+    int row = blockIdx.x * 8 + threadIdx.x / 32;
+    int total_rows = qrows + krows + vrows;
+    if (row >= total_rows) return;
+
+    float *out;
+    const unsigned char *weights;
+    int local_row;
+    if (row < qrows) {
+        out = qout;
+        weights = qw;
+        local_row = row;
+    } else if (row < qrows + krows) {
+        out = kout;
+        weights = kw;
+        local_row = row - qrows;
+    } else {
+        out = vout;
+        weights = vw;
+        local_row = row - qrows - krows;
+    }
+
+    int blocks = cols / 256;
+    const unsigned char *w = weights + (size_t)local_row * blocks * 136;
+    float sum = 0.0f;
+#pragma unroll
+    for (int warp = 0; warp < 8; ++warp) {
+        float partial = 0.0f;
+        for (int qb = lane + 32 * warp; qb < blocks * 8; qb += 256) {
+            int ib = qb & 7;
+            const unsigned char *p = w + (qb / 8) * 136;
+            const int *u = (const int *)(q + qb * 32);
+            const unsigned int *v = (const unsigned int *)(p + 8 + ib * 16);
+            int z = 0;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                z = qwen35_dot4(qwen35_iq4_lookup(v[j]), u[j], z);
+                z = qwen35_dot4(qwen35_iq4_lookup(v[j] >> 4), u[j + 4], z);
+            }
+            int ls = ((p[4 + ib / 2] >> (4 * (ib & 1))) & 15) |
+                (((*(const unsigned short *)(p + 2) >> (2 * ib)) & 3) << 4);
+            z *= ls - 32;
+            float d = (float)*(const _Float16 *)p * scales[qb];
+            partial += d * z;
+        }
+        sum += partial;
+    }
+    for (int offset = 16; offset; offset >>= 1)
+        sum += __shfl_xor(sum, offset, 32);
+    if (lane == 0) out[local_row] = sum;
+}
+
 extern "C" __global__ void qwen35_matvec_iq2xxs(
         float *__restrict__ out, const unsigned char *__restrict__ weights,
         const signed char *__restrict__ q, const float *__restrict__ scales,

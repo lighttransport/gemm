@@ -168,6 +168,13 @@ three output ranges. It remains diagnostic until a resident gfx1201 run
 confirms exact logits/tokens and a sustained 64K projection improvement;
 standalone IQ3_S dispatch remains the default.
 
+The same attention dispatch has an opt-in
+`LLM_QWEN35_IQ4XS_QKV_FUSED=1` path for all-IQ4_XS Q/K/V layers with a common
+input width. It preserves IQ4_XS's eight virtual warp passes, nibble lookup,
+affine correction, and reduction order while sharing native Q8_1 activation
+staging. It is diagnostic pending resident logits/tokens and 64K timing; the
+standalone IQ4_XS path remains the default.
+
 ## 2026-09-22 continuation: opt-in DFlash2 Q/K/V projection fusion
 
 DFlash2 proposal rows now have an opt-in `LLM_QWEN35_DFLASH_QKV_FUSED=1` path
