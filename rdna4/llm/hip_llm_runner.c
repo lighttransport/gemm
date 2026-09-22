@@ -3619,6 +3619,49 @@ static const char *hip_kernel_source =
 "        if (lane == 0) out_batch[base + col] = y * scale;\n"
 "    }\n"
 "}\n"
+"/* Fixed d_state=128 verifier probe.  It has the same checkpoint layout and\n"
+" * recurrence order as the generic kernel, but removes the per-row bounds\n"
+" * checks from the four values owned by each lane. */\n"
+"__global__ void deltanet_step_batch_gda_verify_128_f32(\n"
+"    const float *state, float *checkpoints, float *out_batch,\n"
+"    const float *Q_batch, const float *K_batch, const float *V_batch,\n"
+"    const float *alpha_batch, const float *beta_batch,\n"
+"    int dt_rank, int d_state, int v_row_stride, int M) {\n"
+"    (void)d_state;\n"
+"    int h = blockIdx.x, lane = threadIdx.x;\n"
+"    int col = blockIdx.z * blockDim.y + threadIdx.y;\n"
+"    if (h >= dt_rank || col >= 128 || lane >= 32) return;\n"
+"    const float *S = state + (size_t)h * 128 * 128 + (size_t)col * 128;\n"
+"    float s[4];\n"
+"    for (int rr = 0; rr < 4; ++rr) s[rr] = S[rr * 32 + lane];\n"
+"    const float scale = rsqrtf(128.0f);\n"
+"    const size_t per_tok = (size_t)dt_rank * 128;\n"
+"    const size_t per_state = per_tok * 128;\n"
+"    for (int m = 0; m < M; ++m) {\n"
+"        size_t base = (size_t)m * per_tok + (size_t)h * 128;\n"
+"        const float decay = alpha_batch[(size_t)m * dt_rank + h];\n"
+"        float k[4], q[4];\n"
+"        float kv = 0.0f;\n"
+"        for (int rr = 0; rr < 4; ++rr) {\n"
+"            k[rr] = K_batch[base + rr * 32 + lane];\n"
+"            q[rr] = Q_batch[base + rr * 32 + lane];\n"
+"            kv += s[rr] * k[rr];\n"
+"        }\n"
+"        for (int off = 16; off > 0; off >>= 1) kv += __shfl_xor(kv, off);\n"
+"        const float delta = (V_batch[(size_t)m * v_row_stride +\n"
+"                                      (size_t)h * 128 + col] - decay * kv) *\n"
+"                            beta_batch[(size_t)m * dt_rank + h];\n"
+"        float y = 0.0f;\n"
+"        for (int rr = 0; rr < 4; ++rr) {\n"
+"            s[rr] = decay * s[rr] + k[rr] * delta;\n"
+"            y += s[rr] * q[rr];\n"
+"            checkpoints[(size_t)m * per_state +\n"
+"                        ((size_t)h * 128 + col) * 128 + rr * 32 + lane] = s[rr];\n"
+"        }\n"
+"        for (int off = 16; off > 0; off >>= 1) y += __shfl_xor(y, off);\n"
+"        if (lane == 0) out_batch[base + col] = y * scale;\n"
+"    }\n"
+"}\n"
 "/* ---- 25. gated_rmsnorm_silu_f32 ---- */\n"
 "__global__ void gated_rmsnorm_silu_f32(\n"
 "    float *out, const float *z, const float *norm_w,\n"
@@ -13318,6 +13361,7 @@ struct hip_llm_runner {
     hipFunction_t fn_deltanet_step_batch_gda_ref_f32;
     hipFunction_t fn_deltanet_step_batch_gda_ref_128_f32;
     hipFunction_t fn_deltanet_step_batch_gda_verify_f32;
+    hipFunction_t fn_deltanet_step_batch_gda_verify_128_f32;
     hipFunction_t fn_l2_norm_heads_batch_f32;
     hipFunction_t fn_l2_norm_repeat_qk_batch_f32;
     hipFunction_t fn_repeat_tile_batch_f32;
@@ -14454,6 +14498,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(deltanet_step_batch_gda_ref_f32);
     GET_FUNC(deltanet_step_batch_gda_ref_128_f32);
     GET_FUNC(deltanet_step_batch_gda_verify_f32);
+    GET_FUNC(deltanet_step_batch_gda_verify_128_f32);
     GET_FUNC(l2_norm_heads_batch_f32);
     GET_FUNC(l2_norm_repeat_qk_batch_f32);
     GET_FUNC(repeat_tile_batch_f32);
@@ -23715,7 +23760,12 @@ static inline void launch_deltanet_step_batch_verify(hip_llm_runner *r,
     void *args[] = { &state, &checkpoints, &out_batch, &Q_batch, &K_batch,
                      &V_batch, &alpha_batch, &beta_batch, &dt_rank, &d_state,
                      &v_row_stride, &M };
-    LAUNCH(r->fn_deltanet_step_batch_gda_verify_f32, dt_rank, 1,
+    const char *fixed_env = getenv("LLM_QWEN35_DELTANET_VERIFY_FIXED128");
+    hipFunction_t fn = (fixed_env && atoi(fixed_env) != 0 && d_state == 128 &&
+                        r->fn_deltanet_step_batch_gda_verify_128_f32) ?
+        r->fn_deltanet_step_batch_gda_verify_128_f32 :
+        r->fn_deltanet_step_batch_gda_verify_f32;
+    LAUNCH(fn, dt_rank, 1,
            (d_state + 3) / 4, 32, 4, 1, 0, r->stream, args);
 }
 

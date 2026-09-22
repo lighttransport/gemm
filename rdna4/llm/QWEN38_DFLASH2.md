@@ -184,6 +184,14 @@ The verifier commit boundary has an opt-in
 accepted hidden/logit rows in one device launch. It leaves position publication
 and the default reference ordering unchanged pending resident commit/hash A/B.
 
+The hybrid verifier also exposes
+`LLM_QWEN35_DELTANET_VERIFY_FIXED128=1` for Qwen3.8's fixed `d_state=128`
+DeltaNet shape. This probe removes runtime row-count and checkpoint bounds
+checks while preserving the generic recurrence's decay, warp-reduction, update,
+and row-major checkpoint ordering. It has the same launch argument ABI and
+remains opt-in until resident rollback/hash and sustained decode tests show a
+quality-safe gain.
+
 An opt-in `LLM_QWEN35_VERIFY_COMBINE_GROUPED=1` verifier combine kernel now
 handles four adjacent rows per block. It retains the existing split partial
 layout and per-row combine arithmetic, so captured generic decode graphs remain

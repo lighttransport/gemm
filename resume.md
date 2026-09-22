@@ -61,6 +61,14 @@ concurrency, sampled, and multi-turn C++ quality suite passed. On the resident
 gate, repeated cached K=7 windows reported commit times around 0.23--0.57 ms;
 the authoritative token streams and cache restores remained stable.
 
+The hybrid verifier also has an opt-in
+`LLM_QWEN35_DELTANET_VERIFY_FIXED128=1` recurrence kernel for the model's
+fixed `d_state=128` shape. It removes runtime row-count and checkpoint bounds
+checks while retaining the generic kernel's decay, warp-reduction, update, and
+row-major checkpoint order. The argument ABI is unchanged, so captured graph
+selection remains stable; the generic kernel remains the default pending a
+resident rollback/hash and sustained decode comparison.
+
 ## 2026-09-22 continuation: verifier IQ1 Q8₁ activation reuse
 
 The grouped target verifier's IQ1_S gate and IQ1_M up projections consume the
