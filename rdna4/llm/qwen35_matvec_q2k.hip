@@ -130,6 +130,117 @@ extern "C" __global__ void qwen35_matvec_q4k_q81_multi5(
     }
 }
 
+/* DFlash2's Q/K/V projections consume the same activation rows and input
+ * width.  Keep their independent row ranges in one grid so the sidecar pays
+ * one launch after the shared Q8_1 quantization.  Each output warp retains
+ * qwen35_matvec_q4k_q81_multi8's ordered dot, affine correction, and
+ * __shfl_down reduction; only the selected output range changes. */
+template<int MAX_COUNT>
+__device__ __forceinline__ void qwen35_matvec_q4k_q81_qkv_impl(
+        float *qout, float *kout, float *vout,
+        const unsigned char *qw, const unsigned char *kw,
+        const unsigned char *vw, const signed char *q,
+        const float *scales, int qrows, int krows, int vrows,
+        int cols, int count) {
+    int lane = threadIdx.x & 31;
+    int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    int total = qrows + krows + vrows;
+    if (row >= total) return;
+
+    float *out;
+    const unsigned char *weights;
+    int output_rows, local_row;
+    if (row < qrows) {
+        out = qout; weights = qw; output_rows = qrows; local_row = row;
+    } else if (row < qrows + krows) {
+        out = kout; weights = kw; output_rows = krows;
+        local_row = row - qrows;
+    } else {
+        out = vout; weights = vw; output_rows = vrows;
+        local_row = row - qrows - krows;
+    }
+
+    int blocks = cols / 256;
+    const unsigned char *w = weights + (size_t)local_row * blocks * 144;
+    float sum[MAX_COUNT] = {};
+    for (int chunk = lane; chunk < blocks * 4; chunk += 32) {
+        int b = chunk >> 2, c = chunk & 3, is = 2 * c;
+        const unsigned char *p = w + (size_t)b * 144;
+        const unsigned char *sc = p + 4;
+        int sv0, mv0, sv1, mv1;
+        if (is < 4) {
+            sv0 = sc[is] & 63; mv0 = sc[is + 4] & 63;
+        } else {
+            sv0 = (sc[is + 4] & 15) | ((sc[is - 4] >> 6) << 4);
+            mv0 = (sc[is + 4] >> 4) | ((sc[is] >> 6) << 4);
+        }
+        if (is + 1 < 4) {
+            sv1 = sc[is + 1] & 63; mv1 = sc[is + 5] & 63;
+        } else {
+            sv1 = (sc[is + 5] & 15) | ((sc[is - 3] >> 6) << 4);
+            mv1 = (sc[is + 5] >> 4) | ((sc[is + 1] >> 6) << 4);
+        }
+        const unsigned int *qw32 = (const unsigned int *)(p + 16 + c * 32);
+        int dot0[MAX_COUNT] = {}, dot1[MAX_COUNT] = {};
+        int xsum0[MAX_COUNT] = {}, xsum1[MAX_COUNT] = {};
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            unsigned int packed = qw32[j];
+            int lo = (int)(packed & 0x0f0f0f0fu);
+            int hi = (int)((packed >> 4) & 0x0f0f0f0fu);
+#pragma unroll
+            for (int m = 0; m < MAX_COUNT; ++m) if (m < count) {
+                const int *u = (const int *)(q + (size_t)m * cols +
+                                             b * 256 + c * 64);
+                dot0[m] = __builtin_amdgcn_sudot4(true, lo, true, u[j],
+                                                  dot0[m], false);
+                dot1[m] = __builtin_amdgcn_sudot4(true, hi, true, u[j + 8],
+                                                  dot1[m], false);
+                xsum0[m] = __builtin_amdgcn_sudot4(true, 0x01010101, true,
+                                                   u[j], xsum0[m], false);
+                xsum1[m] = __builtin_amdgcn_sudot4(true, 0x01010101, true,
+                                                   u[j + 8], xsum1[m], false);
+            }
+        }
+        float d = (float)*(const _Float16 *)p;
+        float dm = (float)*(const _Float16 *)(p + 2);
+#pragma unroll
+        for (int m = 0; m < MAX_COUNT; ++m) if (m < count) {
+            const float *sx = scales + (size_t)m * (cols / 32) + b * 8 + is;
+            sum[m] += sx[0] * (d * sv0 * dot0[m] - dm * mv0 * xsum0[m]) +
+                      sx[1] * (d * sv1 * dot1[m] - dm * mv1 * xsum1[m]);
+        }
+    }
+#pragma unroll
+    for (int m = 0; m < MAX_COUNT; ++m) if (m < count) {
+        for (int offset = 16; offset; offset >>= 1)
+            sum[m] += __shfl_down(sum[m], offset, 32);
+        if (lane == 0) out[(size_t)m * output_rows + local_row] = sum[m];
+    }
+}
+
+extern "C" __global__ void qwen35_matvec_q4k_q81_qkv(
+        float *qout, float *kout, float *vout,
+        const unsigned char *qw, const unsigned char *kw,
+        const unsigned char *vw, const signed char *q,
+        const float *scales, int qrows, int krows, int vrows,
+        int cols, int count) {
+    qwen35_matvec_q4k_q81_qkv_impl<8>(qout, kout, vout, qw, kw, vw, q,
+                                      scales, qrows, krows, vrows, cols,
+                                      count);
+}
+
+extern "C" __global__ void qwen35_matvec_q4k_q81_qkv5(
+        float *qout, float *kout, float *vout,
+        const unsigned char *qw, const unsigned char *kw,
+        const unsigned char *vw, const signed char *q,
+        const float *scales, int qrows, int krows, int vrows,
+        int cols, int count) {
+    (void)count;
+    qwen35_matvec_q4k_q81_qkv_impl<5>(qout, kout, vout, qw, kw, vw, q,
+                                      scales, qrows, krows, vrows, cols, 5);
+}
+
 extern "C" __global__ void qwen35_argmax_parts(const float *x, int n,
                                                float *scores, int *indices) {
     __shared__ float values[256];

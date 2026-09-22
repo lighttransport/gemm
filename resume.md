@@ -135,6 +135,16 @@ output ranges while retaining the existing per-row dot and reduction order.
 The production path remains on the three-launch dispatch until a resident
 gfx1201 run proves identical 4K/64K hashes and a sustained projection win.
 
+## 2026-09-22 continuation: opt-in DFlash2 Q/K/V projection fusion
+
+DFlash2 proposal rows now have an opt-in `LLM_QWEN35_DFLASH_QKV_FUSED=1` path
+for Q4_K Q/K/V matrices. It quantizes the shared activation tile once and
+selects the three independent output ranges inside one Q4_K grid, preserving
+the existing per-row dot, affine correction, and reduction order. K=4 uses a
+five-row specialization; other proposal widths use the eight-row-capable
+kernel. The default sidecar path remains three launches until a resident
+gfx1201 run confirms identical K=4/K=7 hashes and a sustained draft-time win.
+
 ## 2026-09-22 continuation: IQ2_XXS block-shape probe
 
 I tested 128- and 512-thread blocks for the native one-row IQ2_XXS kernel

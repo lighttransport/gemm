@@ -715,6 +715,13 @@ reflects the remaining measured costs.
    `44915ec1039a64c8`), and seeded sampled K=7 remains exact at 70.47 tok/s
    (140 drafted/115 accepted, hash `630b7cbc72230e0d`). Projection cost remains
    the material sidecar target after eliminating redundant mask embedding work.
+   An opt-in `LLM_QWEN35_DFLASH_QKV_FUSED=1` candidate now combines the
+   three Q4_K Q/K/V output ranges into one grid after their shared Q8_1
+   activation quantization. K=4 uses a compile-time five-row accumulator and
+   wider windows use the eight-row-capable form; both retain the existing
+   per-row dot and reduction order. The serialized three-launch path remains
+   the default until resident K=4/K=7 hash and draft-time measurements prove
+   the launch reduction is beneficial.
 6. **Prompt-cache injection.**  Feature capture now shares the target
    RMSNorm kernel and both 4K and random-64K prefill retain their targets.
    The hipBLASLt bridge now allocates scratch lazily per HIP stream, so a

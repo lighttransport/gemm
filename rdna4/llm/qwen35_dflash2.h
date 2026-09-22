@@ -292,6 +292,46 @@ static void hllm_dflash_project(hip_llm_runner *r, void *dst, void *weight,
     r->q8x2_reuse_valid = r->iq1_q8_valid = r->batch_q8_valid = 0;
 }
 
+/* The five/eight-row DFlash proposal performs Q, K, and V from one input
+ * tile.  This candidate retains qwen35_matvec_q4k_q81_multi{5,8}'s arithmetic
+ * and output layout while selecting all three weight ranges in one launch.
+ * It is intentionally opt-in: resident gfx1201 hash and draft-time A/B data
+ * must prove the launch reduction before changing the serving default. */
+static int hllm_dflash_project_qkv_fused(hip_llm_runner *r,
+        hllm_qwen35_dflash2 *d, void *qout, void *kout, void *vout,
+        void *qw, void *kw, void *vw, int qtype, int ktype, int vtype,
+        void *x, int rows, int qrows, int krows, int vrows, int nc,
+        int stride) {
+    const char *env = getenv("LLM_QWEN35_DFLASH_QKV_FUSED");
+    if (!env || atoi(env) == 0 || !r || !d ||
+        !r->fn_qwen35_matvec_q4k_q81_qkv || !r->fn_qwen35_quantize_q81 ||
+        qtype != GGML_TYPE_Q4_K || ktype != GGML_TYPE_Q4_K ||
+        vtype != GGML_TYPE_Q4_K || rows < 1 || rows > HLLM_DFLASH_MAX_BLOCK ||
+        qrows < 1 || krows < 1 || vrows < 1 || nc <= 0 ||
+        stride != nc || (nc % 256) != 0)
+        return 0;
+    hipFunction_t fn = r->fn_qwen35_matvec_q4k_q81_qkv;
+    if (rows == 5 && r->fn_qwen35_matvec_q4k_q81_qkv5)
+        fn = r->fn_qwen35_matvec_q4k_q81_qkv5;
+    if (d->q81_source != x || d->q81_rows != rows || d->q81_cols != nc) {
+        int total = rows * nc;
+        void *qa[] = { &r->d_act_q8_batch, &r->d_act_scale_batch, &x,
+                       &total };
+        LAUNCH(r->fn_qwen35_quantize_q81, total / 32, 1, 1,
+               32, 1, 1, 0, r->stream, qa);
+        d->q81_source = x;
+        d->q81_rows = rows;
+        d->q81_cols = nc;
+    }
+    int total_rows = qrows + krows + vrows;
+    void *a[] = { &qout, &kout, &vout, &qw, &kw, &vw,
+                  &r->d_act_q8_batch, &r->d_act_scale_batch,
+                  &qrows, &krows, &vrows, &nc, &rows };
+    LAUNCH(fn, (total_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, a);
+    r->q8x2_reuse_valid = r->iq1_q8_valid = r->batch_q8_valid = 0;
+    return 1;
+}
+
 static int hllm_qwen35_dflash2_inject_impl(hip_llm_runner *r, int position,
         int rows, void *features, void *features_bf16, void *x,
         void *x_bf16, void *norm, void *k, void *v) {
@@ -628,9 +668,13 @@ int hip_llm_qwen35_dflash2_propose(hip_llm_runner *r, int32_t anchor,
         hllm_dflash_project(r,d->dynamic,cl->attn_conv_proj,d->norm,rows,
             HLLM_DFLASH_DYNAMIC,ne,ne,cl->attn_conv_proj_type);
         hllm_dflash_conv(r,d,d->conv,d->norm,d->dynamic,cl->attn_conv_base,rows,0);
-        hllm_dflash_project(r,d->q,cl->q,d->conv,rows,qd,ne,ne,cl->q_type);
-        hllm_dflash_project(r,d->k,cl->k,d->conv,rows,kd,ne,ne,cl->k_type);
-        hllm_dflash_project(r,d->v,cl->v,d->conv,rows,kd,ne,ne,cl->v_type);
+        if (!hllm_dflash_project_qkv_fused(r, d, d->q, d->k, d->v,
+                cl->q, cl->k, cl->v, cl->q_type, cl->k_type, cl->v_type,
+                d->conv, rows, qd, kd, kd, ne, ne)) {
+            hllm_dflash_project(r,d->q,cl->q,d->conv,rows,qd,ne,ne,cl->q_type);
+            hllm_dflash_project(r,d->k,cl->k,d->conv,rows,kd,ne,ne,cl->k_type);
+            hllm_dflash_project(r,d->v,cl->v,d->conv,rows,kd,ne,ne,cl->v_type);
+        }
         launch_qknorm_batch(r,d->q,cl->q_norm,HLLM_DFLASH_HEADS,HLLM_DFLASH_HEAD_DIM,rows,qd,r->rms_norm_eps);
         launch_qknorm_batch(r,d->k,cl->k_norm,HLLM_DFLASH_KV_HEADS,HLLM_DFLASH_HEAD_DIM,rows,kd,r->rms_norm_eps);
         launch_rope_mrope_batch(r,d->q,HLLM_DFLASH_HEADS,HLLM_DFLASH_HEAD_DIM,position,
