@@ -1152,6 +1152,34 @@ static inline float tf_q4_k_dot_sve(const block_q4_K *blocks, const float *x, in
     return svaddv_f32(pg, acc);
 }
 
+/* Exact GGUF NVFP4 dot.  Each 64-value block contains four 16-value
+ * sub-blocks, with one UE4M3 scale and eight packed E2M1 pairs per
+ * sub-block.  Decode the nibbles in SVE registers so the fallback never
+ * materializes a full FP32 row. */
+static inline float tf_nvfp4_dot_sve(const block_nvfp4 *blocks, const float *x, int n) {
+    const svbool_t pg = svptrue_b32();
+    const svfloat32_t lut = svld1(pg, ds4f_kvalues_mxfp4_f32);
+    svfloat32_t acc = svdup_f32(0.0f);
+    const int vl = (int)svcntw();
+    for (int ib = 0; ib < n / 64; ib++) {
+        const block_nvfp4 *b = blocks + ib;
+        for (int s = 0; s < 4; s++) {
+            const svfloat32_t scale = svdup_f32(ggml_ue4m3_to_fp32(b->d[s]));
+            const uint8_t *q = b->qs + s * 8;
+            const int base = ib * 64 + s * 16;
+            for (int k = 0; k < 8; k += vl) {
+                svbool_t pt = svwhilelt_b32((uint64_t)k, (uint64_t)8);
+                svuint32_t qv = svld1ub_u32(pt, q + k);
+                svfloat32_t lo = svmul_x(pt, svtbl_f32(lut, svand_n_u32_x(pt, qv, 15)), scale);
+                svfloat32_t hi = svmul_x(pt, svtbl_f32(lut, svlsr_n_u32_x(pt, qv, 4)), scale);
+                acc = svmla_m(pt, acc, lo, svld1(pt, x + base + k));
+                acc = svmla_m(pt, acc, hi, svld1(pt, x + base + 8 + k));
+            }
+        }
+    }
+    return svaddv_f32(pg, acc);
+}
+
 static inline int tf_kq_pair_enabled(void) {
     static int mode = -1;
     if (mode < 0) {
@@ -1753,6 +1781,13 @@ static void *tf_qmatvec_worker(void *arg) {
         }
         for (; i < t->row_end; i++)
             t->dst[i] = tf_q4_k_dot_sve((const block_q4_K *)((const uint8_t *)base + (size_t)i * row_bytes), t->x, n_cols);
+        return NULL;
+    }
+    if (t->mat->type == GGML_TYPE_NVFP4) {
+        size_t row_bytes = (size_t)(n_cols / 64) * sizeof(block_nvfp4);
+        const uint8_t *base = (const uint8_t *)t->mat->data;
+        for (int i = t->row_start; i < t->row_end; i++)
+            t->dst[i] = tf_nvfp4_dot_sve((const block_nvfp4 *)(base + (size_t)i * row_bytes), t->x, n_cols);
         return NULL;
     }
     if (t->mat->type == GGML_TYPE_Q5_K || t->mat->type == GGML_TYPE_Q6_K ||
@@ -3577,6 +3612,10 @@ static void tf_matvec_qtensor_rows(float *dst, const qtensor *mat, const float *
         const block_q4_K *base = (const block_q4_K *)mat->data;
         for (int i = row_start; i < row_end; i++)
             dst[i] = tf_q4_k_dot_sve((const block_q4_K *)((const uint8_t *)base + (size_t)i * rb), x, n_cols);
+    } else if (mat->type == GGML_TYPE_NVFP4) {
+        size_t rb = (size_t)(n_cols / 64) * sizeof(block_nvfp4);
+        for (int i = row_start; i < row_end; i++)
+            dst[i] = tf_nvfp4_dot_sve((const block_nvfp4 *)((const uint8_t *)mat->data + (size_t)i * rb), x, n_cols);
     } else if (mat->type == GGML_TYPE_Q5_K) {
         size_t rb = (size_t)(n_cols / 256) * sizeof(block_q5_K);
         for (int i = row_start; i < row_end; i++) {
@@ -3841,6 +3880,13 @@ static void tf_qmatvec(float *dst, const qtensor *mat, const float *x, int n_row
         }
         for (; i < n_rows; i++)
             dst[i] = tf_q4_k_dot_sve((const block_q4_K *)((const uint8_t *)base + (size_t)i * row_bytes), x, n_cols);
+        return;
+    }
+    if (mat->type == GGML_TYPE_NVFP4) {
+        size_t row_bytes = (size_t)(n_cols / 64) * sizeof(block_nvfp4);
+        const uint8_t *base = (const uint8_t *)mat->data;
+        for (int i = 0; i < n_rows; i++)
+            dst[i] = tf_nvfp4_dot_sve((const block_nvfp4 *)(base + (size_t)i * row_bytes), x, n_cols);
         return;
     }
     if (mat->type == GGML_TYPE_Q5_K || mat->type == GGML_TYPE_Q6_K ||
