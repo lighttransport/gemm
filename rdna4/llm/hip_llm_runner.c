@@ -1053,6 +1053,23 @@ static const char *hip_kernel_source =
 "    q[i]=a==0.0f?0:(signed char)roundf(q8_div_contract(v,d));\n"
 "    if(lane==0)qscale[blockIdx.x]=round_f16_contract(d);\n"
 "}\n"
+"/* Batched DFlash2 variant: preserve the scalar SiLU and Q8_1 contracts\n"
+" * while writing the row-major activation tile used by the next Q4_K matvec.\n"
+" * The flattened block index is also the row-major Q8_1 scale index. */\n"
+"__global__ void silu_mul_q81_batch_f32(float *gate, const float *up,\n"
+"        signed char *q, float *qscale, int n) {\n"
+"    int lane=threadIdx.x, i=blockIdx.x*32+lane;\n"
+"    if(i>=n)return;\n"
+"    float g=gate[i];\n"
+"    g=g/(1.0f+expf(-g));\n"
+"    float v=g*up[i];\n"
+"    gate[i]=v;\n"
+"    float a=fabsf(v);\n"
+"    for(int off=16;off;off>>=1)a=fmaxf(a,__shfl_xor(a,off,32));\n"
+"    float d=q8_div_contract(a,127.0f);\n"
+"    q[i]=a==0.0f?0:(signed char)roundf(q8_div_contract(v,d));\n"
+"    if(lane==0)qscale[blockIdx.x]=round_f16_contract(d);\n"
+"}\n"
 "\n"
 "/* Repack compact GGUF Q8_0 blocks (34 B) into the runner's aligned 36 B\n"
 " * cache representation directly on-device. One warp owns one block. */\n"
@@ -13176,6 +13193,7 @@ struct hip_llm_runner {
     hipFunction_t fn_attn_prefill_scalar_f32;
     hipFunction_t fn_silu_mul_f32;
     hipFunction_t fn_silu_mul_q81_f32;
+    hipFunction_t fn_silu_mul_q81_batch_f32;
     hipFunction_t fn_swiglu_limit_f32;
     hipFunction_t fn_q8_0_compact_to_padded;
     hipFunction_t fn_qwen4_stage_misses;
@@ -14310,6 +14328,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(attn_decode_f32_devp);
     GET_FUNC(silu_mul_f32);
     GET_FUNC(silu_mul_q81_f32);
+    GET_FUNC(silu_mul_q81_batch_f32);
     GET_FUNC(swiglu_limit_f32);
     GET_FUNC(q8_0_compact_to_padded);
     GET_FUNC(qwen4_stage_misses);

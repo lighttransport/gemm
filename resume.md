@@ -708,6 +708,12 @@ standalone Q8_1 dot, split-scale rounding, and warp reduction order.  The
 independent IQ2_XS launches remain the default pending resident 64K hashes and
 timing.
 
+The DFlash2 draft tail also has an opt-in
+`LLM_QWEN35_DFLASH_SILU_Q81_FUSED=1` path for Q4_K down projections.  It keeps
+the exact SiLU and Q8_1 contracts while writing the row-major batch tile that
+the down projection consumes, so the separate SiLU and requantization launches
+can be compared independently.  The serialized SiLU path remains the default.
+
 The DFlash2 mask rows now use a safe default fast path. Every non-anchor
 proposal row has the same mask token, so the runner embeds one anchor and one
 mask row with the exact IQ1_M scalar kernel, then copies the mask row on-device

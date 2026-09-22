@@ -367,6 +367,30 @@ static int hllm_dflash_project_gateup_fused(hip_llm_runner *r,
     return 1;
 }
 
+/* Optional DFlash2 gate/up tail: fuse the exact SiLU multiply with the Q8_1
+ * staging consumed by the following Q4_K down projection.  The F32 result is
+ * still retained in `gate`; only the already-required quantization launch and
+ * readback are folded into the same warp. */
+static int hllm_dflash_silu_q81_fused(hip_llm_runner *r,
+        hllm_qwen35_dflash2 *d, void *gate, void *up,
+        int rows, int n_ff, int down_type) {
+    const char *env = getenv("LLM_QWEN35_DFLASH_SILU_Q81_FUSED");
+    if (!env || atoi(env) == 0 || !r || !d || !gate || !up ||
+        !r->fn_silu_mul_q81_batch_f32 || down_type != GGML_TYPE_Q4_K ||
+        rows < 2 || rows > HLLM_DFLASH_MAX_BLOCK || n_ff <= 0 ||
+        (n_ff % 256) != 0)
+        return 0;
+    int total = rows * n_ff;
+    void *a[] = { &gate, &up, &r->d_act_q8_batch,
+                  &r->d_act_scale_batch, &total };
+    LAUNCH(r->fn_silu_mul_q81_batch_f32, total / 32, 1, 1,
+           32, 1, 1, 0, r->stream, a);
+    d->q81_source = gate;
+    d->q81_rows = rows;
+    d->q81_cols = n_ff;
+    return 1;
+}
+
 static int hllm_qwen35_dflash2_inject_impl(hip_llm_runner *r, int position,
         int rows, void *features, void *features_bf16, void *x,
         void *x_bf16, void *norm, void *k, void *v) {
@@ -780,7 +804,9 @@ int hip_llm_qwen35_dflash2_propose(hip_llm_runner *r, int32_t anchor,
             hllm_dflash_project(r,d->gate,cl->gate,d->conv,rows,r->n_ff,ne,ne,cl->gate_type);
             hllm_dflash_project(r,d->up,cl->up,d->conv,rows,r->n_ff,ne,ne,cl->up_type);
         }
-        launch_silu_mul(r,d->gate,d->up,rows*r->n_ff);
+        if (!hllm_dflash_silu_q81_fused(r, d, d->gate, d->up,
+                rows, r->n_ff, cl->down_type))
+            launch_silu_mul(r,d->gate,d->up,rows*r->n_ff);
         hllm_dflash_project(r,d->proj,cl->down,d->gate,rows,ne,r->n_ff,r->n_ff,cl->down_type);
         hllm_dflash_conv(r,d,d->conv,d->proj,d->dynamic,cl->ffn_conv_base,rows,1);
         launch_add(r,d->x,d->conv,rows*ne);

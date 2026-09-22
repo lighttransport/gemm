@@ -114,6 +114,11 @@ fusions (`LLM_QWEN35_IQ2_QKV_FUSED=1` and
 while preserving each row's Q8_1 arithmetic and reduction order; production
 dispatch remains unchanged until resident hashes and timing are available.
 
+`LLM_QWEN35_DFLASH_SILU_Q81_FUSED=1` is an additional opt-in tail probe for
+Q4_K down projections. It fuses the exact SiLU multiply with row-major Q8_1
+staging and lets the down projection reuse those bytes, while retaining the
+F32 gate result and the serialized path as the default.
+
 ## DFlash2 long-window split retune (2026-09-22)
 
 The sidecar attention launch now uses twelve partitions once its 2,048-token
