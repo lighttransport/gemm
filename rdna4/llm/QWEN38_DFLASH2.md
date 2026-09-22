@@ -1573,6 +1573,9 @@ retain the scalar I/O fallback.
    also retained `7463f176c9b85ba3` but measured 35.54 tok/s decode and
    443.68 tok/s prefill, so it remains diagnostic pending a better projection
    schedule.
+   Native IQ1S and IQ1M DP4A batches likewise retained the exact suffix but
+   measured 35.55/443.93 and 35.55/443.86 tok/s (decode/prefill), respectively;
+   neither improves the production projection schedule.
 
 Each optimization should retain the exact sequence hash and response bytes at
 K=4 and K=7, compile the emitted program, and cover non-coding prompts plus
