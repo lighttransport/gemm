@@ -14,11 +14,12 @@ Disassembly showed four calls to `ldexpf` per four-row FP4 subblock. A bounded
 sample of 24,313,856 UE4M3 scale bytes found 24,305,496 with exponent zero.
 The normal-only bit conversion experiment had missed that dominant case.
 
-`tf_nvfp4_scale_fast` now converts all 256 scale codes without libm: seven
-subnormal constants, a zero/sentinel case, and an IEEE exponent/mantissa
-construction for normal codes. An exhaustive 256-code float-bit comparison
-against the reference conversion passed. The exact four-row full-model
-result rose to 2.838 tok/s over 128 tokens.
+`tf_nvfp4_scale_fast` now converts all 256 scale codes without libm. The
+first implementation used seven subnormal constants and IEEE bit construction
+for normal codes; an exhaustive 256-code float-bit comparison against the
+reference conversion passed. The exact four-row full-model result rose to
+2.838 tok/s over 128 tokens. A later 1 KiB table of those exact values removed
+the remaining scalar branches and bit construction from the decode loop.
 
 The persistent decode path now groups eight rows per call, sharing activation
 loads while keeping each row's original low-nibble/high-nibble FP32 FMA order.
@@ -38,6 +39,7 @@ reusing a scratch address and four sampled values across tokens.
 | Exact four-row reference with fast scales | 2.838 tok/s (45.110 s) | reference | — |
 | Exact eight-row, original FMA order | **3.617 tok/s (35.391 s)** | **128/128** | **0 bitwise** |
 | Exact eight-row, eight-block prefetch | **4.321 tok/s (29.624 s)** | **128/128** | **0 bitwise** |
+| Exact eight-row, prefetch and scale table | **4.464 tok/s (28.674 s)** | **128/128** | **0 bitwise** |
 
 The first two runs used prompt `hi`, `--max-seq 256 --max-gen 128 --spec-k 0`,
 48 threads, `TF_DUMP_TOKENS=1 TF_DPROF=1`, the same staged GGUF, and the
@@ -53,6 +55,10 @@ python3 a64fx/llm/test_qwen38_token_trace.py \
   --tokens 128 --max-logit-error 0
 # PASS: tokens=128/128, selected_logit_max_abs=0, rms=0
 ```
+
+The scale-table run used the same 128-token settings without profiling and
+repeated at 28.676 and 28.674 seconds, both with 128/128 token IDs and zero
+selected-logit error against the exact reference.
 
 The original eight-row stage costs were approximately 123.6 ms/token for FFN
 gate/up, 49.1 for FFN down, 44.2 for SSM input, 15.0 for SSM output, and
