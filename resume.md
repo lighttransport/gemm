@@ -37,6 +37,11 @@ the recurrent state, hidden row, and vocabulary-logits row. This closes a
 large-vocabulary tail omission in the diagnostic path; the serialized commit
 copy and all production defaults are unchanged.
 
+The DFlash2 mask-row broadcast also has an opt-in
+`LLM_QWEN35_DFLASH_EMBED_BROADCAST_KERNEL=1` path. It uses the existing exact
+row-repeat kernel for all repeated mask rows after the anchor and first mask
+row, while the established device-copy loop remains the default.
+
 ## 2026-09-22 continuation: opt-in native Q2_K Q/K/V projection fusion
 
 The ordinary one-token attention dispatcher now exposes

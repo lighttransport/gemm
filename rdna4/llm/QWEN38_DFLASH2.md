@@ -882,6 +882,11 @@ reflects the remaining measured costs.
    `LLM_QWEN35_DFLASH_GATEUP_FUSED=1` similarly reuses that exact kernel for
    the dense Q4_K gate/up pair with no V range. It is a separate opt-in probe;
    the ordinary gate/up/SiLU sequence remains the serving default.
+   `LLM_QWEN35_DFLASH_EMBED_BROADCAST_KERNEL=1` is an additional diagnostic
+   for K=4/K=7 windows: after the exact anchor and first mask embedding, one
+   row-repeat launch fills all remaining mask rows. The established device
+   copy loop remains the default until resident timing and quality checks show
+   a benefit.
    The selector also has an opt-in `LLM_QWEN35_DFLASH_SELECTOR_WARP16=1`
    geometry. It assigns one warp to each of the sixteen candidates in a
    single 512-thread block, removing the two eight-candidate batches while

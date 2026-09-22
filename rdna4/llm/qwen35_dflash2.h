@@ -751,13 +751,25 @@ int hip_llm_qwen35_dflash2_propose(hip_llm_runner *r, int32_t anchor,
         launch_embed_iq1_m(r, d->x, r->d_token_embd, anchor, ne);
         launch_embed_iq1_m(r, (float *)d->x + (size_t)ne,
                            r->d_token_embd, d->mask_token, ne);
-        for (int i = 2; i < rows; ++i) {
-            if (hipMemcpyAsync((float *)d->x + (size_t)i * ne,
-                               (float *)d->x + ne,
-                               (size_t)ne * sizeof(float),
-                               hipMemcpyDeviceToDevice, r->stream) != hipSuccess) {
-                r->qwen4_forward_error = 1;
-                return -1;
+        const char *broadcast_kernel_env =
+            getenv("LLM_QWEN35_DFLASH_EMBED_BROADCAST_KERNEL");
+        if (broadcast_kernel_env && atoi(broadcast_kernel_env) != 0 &&
+            r->fn_hc_repeat_f32) {
+            int repeat_rows = rows - 2;
+            void *dst = (float *)d->x + (size_t)2 * ne;
+            void *src = (float *)d->x + ne;
+            void *a[] = { &dst, &src, &ne, &repeat_rows };
+            LAUNCH(r->fn_hc_repeat_f32, (repeat_rows * ne + 255) / 256,
+                   1, 1, 256, 1, 1, 0, r->stream, a);
+        } else {
+            for (int i = 2; i < rows; ++i) {
+                if (hipMemcpyAsync((float *)d->x + (size_t)i * ne,
+                                   (float *)d->x + ne,
+                                   (size_t)ne * sizeof(float),
+                                   hipMemcpyDeviceToDevice, r->stream) != hipSuccess) {
+                    r->qwen4_forward_error = 1;
+                    return -1;
+                }
             }
         }
     } else if (r->fn_embed_iq1_m_batch) {
