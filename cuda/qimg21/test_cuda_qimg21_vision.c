@@ -3,6 +3,8 @@
 #define main q21_denoise_main
 #include "test_cuda_qimg21_native.c"
 #undef main
+#define STB_IMAGE_IMPLEMENTATION
+#include "../../common/stb_image.h"
 
 typedef int (*q21_cutlass_vision_attention_fn)(float *, const void *, int, int, int, CUstream);
 typedef int (*q21_flash_vision_attention_fn)(float *, const void *, int, CUstream);
@@ -31,6 +33,39 @@ static float bf16_host(uint16_t value) {
     float result;
     memcpy(&result, &bits, sizeof(result));
     return result;
+}
+
+static int load_vision_patches(const char *path, npy_f32 *out, int *grid_h, int *grid_w) {
+    int width = 0, height = 0, channels = 0;
+    unsigned char *pixels = stbi_load(path, &width, &height, &channels, 3);
+    if (!pixels || width < 32 || height < 32 || width % 32 || height % 32) {
+        fprintf(stderr, "vision: input image must be RGB-convertible and divisible by 32\n");
+        stbi_image_free(pixels);
+        return -1;
+    }
+    int gh = height / 16, gw = width / 16, tokens = gh * gw;
+    float *patches = malloc((size_t)tokens * 1536 * sizeof(float));
+    if (!patches) { stbi_image_free(pixels); return -1; }
+    for (int block_y = 0; block_y < gh / 2; block_y++)
+        for (int block_x = 0; block_x < gw / 2; block_x++)
+            for (int merge_y = 0; merge_y < 2; merge_y++)
+                for (int merge_x = 0; merge_x < 2; merge_x++) {
+                    int patch_y = block_y * 2 + merge_y;
+                    int patch_x = block_x * 2 + merge_x;
+                    int token = ((block_y * (gw / 2) + block_x) * 2 + merge_y) * 2 + merge_x;
+                    float *dst = patches + (size_t)token * 1536;
+                    for (int c = 0; c < 3; c++) for (int temporal = 0; temporal < 2; temporal++)
+                        for (int py = 0; py < 16; py++) for (int px = 0; px < 16; px++) {
+                            int source_y = patch_y * 16 + py, source_x = patch_x * 16 + px;
+                            int d = (((c * 2 + temporal) * 16 + py) * 16 + px);
+                            dst[d] = (2.0f / 255.0f) * pixels[(source_y * width + source_x) * 3 + c] - 1.0f;
+                        }
+                }
+    stbi_image_free(pixels);
+    out->data = patches; out->n = (size_t)tokens * 1536; out->ndim = 2;
+    out->shape[0] = (size_t)tokens; out->shape[1] = 1536;
+    *grid_h = gh; *grid_w = gw;
+    return 0;
 }
 
 static CUdeviceptr upload_bf16_raw(const qimg21_shards *shards, const char *name) {
@@ -164,7 +199,7 @@ static int build_position_embedding(const qimg21_shards *shards, int h, int w, f
 }
 
 int main(int argc, char **argv) {
-    const char *model = NULL, *pixels = NULL, *hidden = NULL, *out = NULL;
+    const char *model = NULL, *pixels = NULL, *image = NULL, *hidden = NULL, *out = NULL;
     const char *patch_out = NULL, *dump_dir = NULL, *merged_out = NULL, *deepstack_dir = NULL;
     const char *attention_mode = "flash";
     const char *layer_norm_mode = "nvcc";
@@ -172,6 +207,7 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--model") && i + 1 < argc) model = argv[++i];
         else if (!strcmp(argv[i], "--pixel-values") && i + 1 < argc) pixels = argv[++i];
+        else if (!strcmp(argv[i], "--image") && i + 1 < argc) image = argv[++i];
         else if (!strcmp(argv[i], "--hidden") && i + 1 < argc) hidden = argv[++i];
         else if (!strcmp(argv[i], "--grid-height") && i + 1 < argc) h = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--grid-width") && i + 1 < argc) w = atoi(argv[++i]);
@@ -186,20 +222,22 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--layer-norm") && i + 1 < argc) layer_norm_mode = argv[++i];
         else return 2;
     }
-    if (!model || (!!pixels == !!hidden) || !out || h < 1 || w < 1 || h % 2 || w % 2 ||
+    if (!model || ((!!pixels + !!image + !!hidden) != 1) || !out ||
+        ((!image) && (h < 1 || w < 1)) || h % 2 || w % 2 ||
         h * w > 4096 || max_blocks < 0 || block_index < 0 || block_index > 26 ||
         block_index + max_blocks > 27 ||
         (strcmp(attention_mode, "math") && strcmp(attention_mode, "cutlass") &&
          strcmp(attention_mode, "flash")) ||
         (strcmp(layer_norm_mode, "nvcc") && strcmp(layer_norm_mode, "nvrtc"))) {
-        fprintf(stderr, "usage: %s --model DIR (--pixel-values PATCHES.npy | --hidden BLOCK_INPUT.npy) "
+        fprintf(stderr, "usage: %s --model DIR (--pixel-values PATCHES.npy | --image IMAGE | --hidden BLOCK_INPUT.npy) "
                         "--grid-height H --grid-width W [--block-index N --max-blocks N] "
                         "[--layer-norm nvcc|nvrtc] --out OUTPUT.npy\n", argv[0]);
         return 2;
     }
     npy_f32 input = {0};
-    if (npy_read_f32(pixels ? pixels : hidden, &input) || input.ndim != 2 ||
-        input.shape[0] != (size_t)h * w || input.shape[1] != (size_t)(pixels ? 1536 : 1152)) return 1;
+    if ((image ? load_vision_patches(image, &input, &h, &w) :
+         npy_read_f32(pixels ? pixels : hidden, &input)) || input.ndim != 2 ||
+        input.shape[0] != (size_t)h * w || input.shape[1] != (size_t)((pixels || image) ? 1536 : 1152)) return 1;
     qimg21_shards shards = {{0}, 0};
     char path[2048];
     for (int i = 1; i <= 4; i++) {

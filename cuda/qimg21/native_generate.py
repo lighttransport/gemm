@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Run native Qwen-Image 2.1 denoising with an optional native CUDA VAE.
 
-Text-only generation uses the native tokenizer and CUDA text encoder. Image
-editing retains the Diffusers vision-encoder boundary for now. This driver
+Text-only generation and image-editing conditioning use the native tokenizer,
+CUDA vision encoder, and CUDA text encoder. This driver
 turns the prompt embedding into an F32 fixture, invokes the native
 NVRTC/CUDA transformer for the complete FlowMatch schedule, and only loads the
 Qwen-Image 2.1 VAE after the native subprocess exits.  That process boundary
@@ -171,27 +171,45 @@ def main() -> int:
                 str(prompt_dir / "negative_prompt_embeds.npy"),
             ], cwd=root)
     else:
-        # Image editing still needs the reference multimodal processor and
-        # vision encoder; the language-only encoder above is fully native.
-        text_command = [
-            sys.executable,
-            str(root / "cuda/qimg21/test_cuda_qimg21.py"),
-            "--test-text",
-            "--model",
-            str(model),
-            "--prompt",
-            args.prompt,
-            "--dtype",
-            args.dtype,
-            "--dump-dir",
-            str(prompt_dir),
-            "--out",
-            str(prompt_dir / "text_smoke.png"),
-        ]
+        vision_encoder = root / "cuda/qimg21/test_cuda_qimg21_vision"
+        text_encoder = root / "cuda/qimg21/test_cuda_qimg21_text"
+        if not vision_encoder.exists() or not text_encoder.exists():
+            raise SystemExit("native vision/text executables missing; run `make -C cuda/qimg21 native-text-exact test_cuda_qimg21_vision`")
+        vision_dir = work / "vision"
+        vision_dir.mkdir(parents=True, exist_ok=True)
+        _run([
+            str(vision_encoder), "--model", str(model), "--image", str(condition_dir / "resized.png"),
+            "--max-blocks", "27", "--attention", "flash",
+            "--out", str(vision_dir / "blocks.npy"),
+            "--merged-out", str(vision_dir / "merged.npy"),
+            "--deepstack-dir", str(vision_dir),
+        ], cwd=root)
+        def encode_multimodal_prompt(text, output, prefix):
+            tokens_path = prompt_dir / f"{prefix}tokens.txt"
+            _run([
+                str(text_encoder), "--model", str(model), "--prompt", text,
+                "--vision-merged", str(vision_dir / "merged.npy"),
+                "--vision-deepstack-dir", str(vision_dir),
+                "--image-grid-height", str(condition_hw[0]),
+                "--image-grid-width", str(condition_hw[1]),
+                "--attention", "flash-exact", "--out", str(output),
+                "--dump-tokens", str(tokens_path),
+            ], cwd=root)
+            token_ids = np.loadtxt(tokens_path, dtype=np.int64, ndmin=1)
+            embeddings = np.load(output, mmap_mode="r", allow_pickle=False)
+            token_count = embeddings.shape[-2]
+            retained = token_ids[-token_count:]
+            if retained.shape != (token_count,):
+                raise ValueError("native token and embedding lengths disagree")
+            np.save(prompt_dir / f"{prefix}image_pad_mask.npy",
+                    (retained == 151655)[None, :].astype(np.int64))
+            np.save(prompt_dir / f"{prefix}prompt_mask.npy",
+                    np.ones((1, retained.size), dtype=np.int64))
+
+        encode_multimodal_prompt(args.prompt, prompt_path, "")
         if args.negative_prompt is not None:
-            text_command.extend(["--negative-prompt", args.negative_prompt])
-        text_command.extend(["--image", str(condition_dir / "resized.png")])
-        _run(text_command, cwd=root)
+            encode_multimodal_prompt(args.negative_prompt,
+                                     prompt_dir / "negative_prompt_embeds.npy", "negative_")
     if not prompt_path.exists():
         raise SystemExit(f"text runner did not produce {prompt_path}")
 

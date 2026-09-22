@@ -43,20 +43,22 @@ class EditingInputsTest(unittest.TestCase):
         for call in pipe.encode_prompt.call_args_list:
             self.assertEqual(call.kwargs["image"],[image])
 
-    def fixtures(self, prefix=""):
-        np.save(self.path/f"{prefix}prompt_embeds.npy",np.zeros((1,7,4096),np.float32))
+    def fixtures(self, prefix="", native=False):
+        shape=(7,4096) if native else (1,7,4096)
+        np.save(self.path/f"{prefix}prompt_embeds.npy",np.zeros(shape,np.float32))
         np.save(self.path/f"{prefix}image_pad_mask.npy",np.array([[0,1,1,1,1,0,0]],bool))
         np.save(self.path/f"{prefix}prompt_mask.npy",np.ones((1,7),bool))
 
     def test_layout_native_reader_and_negative_branch(self):
-        for negative in (False,True):
-            self.fixtures("negative_" if negative else "")
-            output=self.path/("negative.txt" if negative else "positive.txt")
-            write_layout(self.path,output,(4,4),(4,4),negative)
-            binary=Path(__file__).with_name("test_joint_layout")
-            result=subprocess.run([str(binary),str(output)],capture_output=True,text=True)
-            self.assertEqual(result.returncode,0,result.stderr)
-            self.assertEqual(result.stdout.splitlines()[0],"35 19 32")
+        for native in (False,True):
+            for negative in (False,True):
+                self.fixtures("negative_" if negative else "", native=native)
+                output=self.path/(f"{'native' if native else 'batched'}-{'negative' if negative else 'positive'}.txt")
+                write_layout(self.path,output,(4,4),(4,4),negative)
+                binary=Path(__file__).with_name("test_joint_layout")
+                result=subprocess.run([str(binary),str(output)],capture_output=True,text=True)
+                self.assertEqual(result.returncode,0,result.stderr)
+                self.assertEqual(result.stdout.splitlines()[0],"35 19 32")
 
     def test_reject_mismatched_or_split_vision_slots(self):
         self.fixtures()

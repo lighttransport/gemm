@@ -1239,11 +1239,15 @@ diff -u tmp/qimg21-token-ref/tokens.txt tmp/qimg21-native-tokens.txt
 ```
 
 The native Qwen3-VL vision front end is available as
-`test_cuda_qimg21_vision`. It consumes the processor's flattened F32 patch
-matrix, performs the BF16 3D patch projection with a custom CUDA epilogue,
+`test_cuda_qimg21_vision`. It consumes either the processor's flattened F32
+patch matrix or an RGB-convertible image whose sides are divisible by 32.
+The `--image` path normalizes pixels to [-1,1] and emits the exact merged-patch
+ordering natively. It then performs the BF16 3D patch projection with a custom CUDA epilogue,
 and interpolates the learned 48x48 position table in native code. Against a
 16x16-patch official capture, patch-projection cosine is 0.9999999952 and the
 first-block input cosine is 0.9999980129, both above the 0.99996 gate.
+For the native 256x256 image path, patch-projection cosine is 0.9999959485 and
+first-block input cosine is 0.9999965657, also above the gate.
 The executable also contains the 27 custom CUDA vision blocks, three
 deep-stack mergers, and the final merger. Its acceptance default is the
 pinned FlashAttention forward specialization selected by PyTorch Flash SDPA
@@ -1257,8 +1261,9 @@ block 0 reaches cosine 0.999999578. Free-running errors still compound: blocks
 at 0.999957891, and block 26 scores 0.999461003. The merger now uses the same
 pinned Welford implementation as the blocks. With the exact PyTorch block-26
 output injected, its local cosine is 0.999990332 and passes the 0.99996 gate;
-the accumulated full-run merger cosine remains 0.999079087, so it is not
-accepted or wired into generation yet. Use `--hidden ... --block-index N
+the accumulated full-run merger cosine remains 0.999079087, so the recurrent
+vision stack is not yet accepted for strict parity. It is wired into the
+experimental editing integration to exercise the complete native path. Use `--hidden ... --block-index N
 --max-blocks 1` for isolated block replay, or `--max-blocks 0 --merged-out ...`
 for merger-only replay, and `--dump-dir DIR` to save every executed block.
 `--layer-norm nvrtc` retains the in-module Welford implementation for
@@ -1302,8 +1307,7 @@ constructs the image-aware ChatML sequence itself from the native tokenizer;
 recomposing rows from the checked exact text-RoPE artifact, without Python or
 runtime trigonometry. For the same editing fixture, all 96 token IDs and the
 entire MRoPE table are bit-exact, and the resulting prompt embedding retains
-cosine 0.9999999999999998, zero MAE, and 100% equality. Wiring image
-patchification and the native vision outputs into `native_generate.py` remains.
+cosine 0.9999999999999998, zero MAE, and 100% equality.
 
 ```sh
 cuda/qimg21/test_cuda_qimg21_text \
@@ -1317,8 +1321,8 @@ cuda/qimg21/test_cuda_qimg21_text \
 Add `--native-vae` to use the native F32 CUDA decoder. It reads the original
 VAE safetensors, applies latent denormalization and the learned post-quant
 convolution, then runs the residual/attention/upsampling graph and clamps the
-RGBA result. Text-only prompt encoding is native; image editing still uses
-the Python multimodal processor/vision encoder boundary. This decoder supports
+RGBA result. Text-only and image-editing prompt conditioning now use the native
+text and vision executables. This decoder supports
 single images; editing parity and peak-memory validation remain work in progress.
 The separate single-frame encoder is described below. Decoder kernels and residual copies share the default CUDA stream
 to avoid races with the shared VAE helpers' synchronous device copies.
@@ -1471,9 +1475,10 @@ used for this memory figure. Artifacts: `tmp/qimg21-encoder-1024/results.json`,
 
 `native_generate.py --image IMAGE --condition-resolution 256 --native-vae`
 now connects native CPU RGBA decoding/Pillow-compatible preprocessing, native F32 VAE encoding and
-normalization, Diffusers vision/text encoding, checked native joint layouts,
-native denoising, and native decoding. Negative prompts get their own layout.
-The text helper wraps the image in the sequence required by `encode_prompt`.
+normalization, native image patchification and vision encoding, native ChatML
+tokenization/MRoPE and text encoding, checked native joint layouts, native
+denoising, and native decoding. Negative prompts get their own native tokens,
+embeddings, masks, and layout.
 Only one condition image is supported; resized sides must be within 32..1024.
 Use a fresh work directory for each editing request.
 
@@ -1486,10 +1491,14 @@ OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=1 tmp/qimg21-ref-venv/bin/python cuda/qim
   --work-dir tmp/qimg21-native-edit-smoke-v2 --out tmp/qimg21-native-edit-smoke-v2.png
 ```
 
-This completed with finite condition tokens, both Euler checkpoints, final
-latents and decoded RGBA pixels. The 128x128 preview depicts a green apple,
-but is only a two-step integration smoke test. Python vision/text remains a
-fallback.
+The original two-step 128x128 smoke test completed with finite condition
+tokens, both Euler checkpoints, final latents and decoded RGBA pixels. A newer
+one-step 256x256 run exercised native VAE encode, all 27 vision blocks, native
+multimodal text, denoising, and native VAE decode and produced finite
+`(82,4096)` prompt embeddings, `(64,4096)` merged vision features, and
+`(256,64)` output latents plus a 256x256 PNG. This is an integration smoke
+test, not an accuracy acceptance result: the recurrent vision error documented
+above remains below the 0.99996 cosine target.
 
 ### Exact BF16 editing parity
 

@@ -36,9 +36,11 @@ def write_layout(prompt_directory, output, condition_hw, target_hw, negative=Fal
     prompt = np.load(directory / f"{prefix}prompt_embeds.npy", allow_pickle=False)
     mask = np.load(directory / f"{prefix}image_pad_mask.npy", allow_pickle=False)
     keys = np.load(directory / f"{prefix}prompt_mask.npy", allow_pickle=False)
-    if prompt.dtype != np.float32 or prompt.ndim != 3 or prompt.shape[0] != 1 or prompt.shape[2] != 4096 or not np.isfinite(prompt).all():
+    if (prompt.dtype != np.float32 or prompt.ndim not in (2, 3) or
+        prompt.shape[-1] != 4096 or (prompt.ndim == 3 and prompt.shape[0] != 1) or
+        not np.isfinite(prompt).all()):
         raise ValueError("editing requires finite batch-one prompt embeddings")
-    nt = prompt.shape[1]
+    nt = prompt.shape[-2]
     if mask.shape != (1, nt) or keys.shape != (1, nt) or not (keys == 1).all() or not np.isin(mask, [0, 1]).all():
         raise ValueError("editing requires an unpadded binary image/text mask")
     ch, cw = condition_hw
