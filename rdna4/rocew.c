@@ -252,8 +252,11 @@ static int loadHIP(void)
         "libamdhip64.so.6",
         "libamdhip64.so.5",
         "/opt/rocm/lib/libamdhip64.so",
+        "/opt/rocm/lib/libamdhip64.so.10",
         "/opt/rocm/lib/libamdhip64.so.6",
         "/opt/rocm/lib/libamdhip64.so.5",
+        "/opt/rocm/core/lib/libamdhip64.so",
+        "/opt/rocm/core/lib/libamdhip64.so.10",
         "/opt/rocm/core-7.14/lib/libamdhip64.so",
         "/opt/rocm/core-7.14/lib/libamdhip64.so.7",
         NULL
@@ -261,6 +264,10 @@ static int loadHIP(void)
 #endif
 
     hip_lib = dynamic_library_open_env("ROCEW_ROCM_LIB", "libamdhip64.so");
+    if (hip_lib == NULL) {
+        const char *path = getenv("ROCEW_HIP_LIB");
+        if (path && *path) hip_lib = dynamic_library_open(path);
+    }
     if (hip_lib == NULL)
         hip_lib = dynamic_library_open_find(hip_paths);
     if (hip_lib == NULL) {
@@ -406,8 +413,11 @@ static int loadHIPRTC(void)
         "libhiprtc.so.6",
         "libhiprtc.so.5",
         "/opt/rocm/lib/libhiprtc.so",
+        "/opt/rocm/lib/libhiprtc.so.10",
         "/opt/rocm/lib/libhiprtc.so.6",
         "/opt/rocm/lib/libhiprtc.so.5",
+        "/opt/rocm/core/lib/libhiprtc.so",
+        "/opt/rocm/core/lib/libhiprtc.so.10",
         "/opt/rocm/core-7.14/lib/libhiprtc.so",
         "/opt/rocm/core-7.14/lib/libhiprtc.so.7",
         NULL
@@ -415,6 +425,10 @@ static int loadHIPRTC(void)
 #endif
 
     hiprtc_lib = dynamic_library_open_env("ROCEW_ROCM_LIB", "libhiprtc.so");
+    if (hiprtc_lib == NULL) {
+        const char *path = getenv("ROCEW_HIPRTC_LIB");
+        if (path && *path) hiprtc_lib = dynamic_library_open(path);
+    }
     if (hiprtc_lib == NULL)
         hiprtc_lib = dynamic_library_open_find(hiprtc_paths);
     if (hiprtc_lib == NULL) {

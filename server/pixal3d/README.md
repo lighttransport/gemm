@@ -13,7 +13,8 @@ sh server/pixal3d/run.sh --backend cuda --bind 127.0.0.1 --port 8765
 ```
 
 Open <http://127.0.0.1:8765/>. Select an image, optionally provide a mask, and
-choose CPU, CUDA, or ROCm. For multiview inference, select **Posed multiview**
+choose CPU, CUDA, or ROCm. The Qwen Image 2.1 tab also selects CUDA or ROCm
+independently of the Pixal3D backend. For multiview inference, select **Posed multiview**
 and choose a folder containing `transforms.json` and its images. The browser
 shows the resolved images in frame order before upload. A separate JSON and
 image picker is available when folder selection is unsupported. GPU runs are
@@ -201,7 +202,8 @@ server/pixal3d/run.sh --backend cuda \
   --qwen-quant-package tmp/qimg21-int8-package
 ```
 
-The Qwen readiness state is reported under `qwen_image21` in `GET /health`.
+The Qwen readiness state is reported under `qwen_image21` in `GET /health`, with
+separate native and reference readiness fields for CUDA and ROCm.
 
 ## Batch JSON API
 

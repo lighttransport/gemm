@@ -1,0 +1,6 @@
+test_hip_qimg21_native
+test_hip_qimg21_text
+test_hip_qimg21_vision
+test_hip_qimg21_vae
+test_hip_qimg21_vae_encode
+test_hip_qimg21_wmma

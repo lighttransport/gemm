@@ -36,5 +36,12 @@ if a.torch_rng:
     np.save(out / "latents.npy", np.ascontiguousarray(latents.float().cpu().numpy()))
 else:
     g = np.random.default_rng(a.seed)
-    np.save(out / "latents.npy", g.standard_normal((a.height_tokens * a.width_tokens, 64), dtype=np.float32))
+    latents = g.standard_normal((a.height_tokens * a.width_tokens, 64), dtype=np.float32)
+    if a.dtype == "bf16":
+        bits = latents.view(np.uint32)
+        bits += np.uint32(0x7fff) + ((bits >> np.uint32(16)) & np.uint32(1))
+        bits &= np.uint32(0xffff0000)
+    else:
+        latents = latents.astype(np.float16).astype(np.float32)
+    np.save(out / "latents.npy", latents)
 print(out)

@@ -1,10 +1,13 @@
 # Qwen Image 2.1 web demo
 
 This is a new standalone demo; it does not reuse the older Qwen Image web
-application. It exposes three run modes:
+application. It exposes three run modes and two accelerator backends:
 
 - `CUDA` runs `cuda/qimg21/native_generate.py` with the native custom CUDA
   runner and native VAE decode.
+- `ROCm` uses the same orchestration and model ABI, with native text, vision,
+  denoiser, and VAE binaries supplied by `rdna4/qimg21/`. PyTorch's ROCm build
+  is needed only for the optional reference path.
 - `PyTorch` runs the pinned Diffusers reference script.
 - `Compare` runs both sequentially under one device lock and renders them
   side-by-side.
@@ -20,6 +23,18 @@ Start it after building the native binaries:
 make -C cuda/qimg21 native
 server/qwen_image21/run.sh --host 127.0.0.1 --port 8091
 ```
+
+Select the RDNA4 path explicitly after building its native binaries:
+
+```sh
+server/qwen_image21/run.sh \
+  --python-rocm tmp/qimg21-rocm-venv/bin/python \
+  --native-rocm rdna4/qimg21/test_hip_qimg21_native
+```
+
+The API accepts `backend=cuda|rocm` and `mode=native|reference|compare`.
+Legacy `mode=cuda` and `mode=rocm` requests remain accepted as native runs.
+`GET /api/health` reports readiness independently for both backends.
 
 Override paths when needed:
 

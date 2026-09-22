@@ -19,6 +19,7 @@ No `hipcc` needed at build time - kernels are compiled at runtime via HIPRTC, lo
 | **LLM** | Qwen3-style transformer (F16/Q8_0/Q2-Q6_K) | ~5500 | GGUF model |
 | **DA3** | Depth Anything 3 (depth + pose + rays + gaussians) | ~2000 | GGUF or safetensors |
 | **PPD** | Pixel-Perfect Depth (DA2 encoder + DiT diffusion) | ~2700 | PyTorch .pth |
+| **Qwen Image 2.1** | 32-block BF16 denoiser with RDNA4 WMMA GEMM | native fixture ABI | Qwen 2.1 safetensors |
 
 ## Requirements
 
@@ -42,6 +43,9 @@ cd da3 && make
 
 # Pixel-Perfect Depth
 cd ppd && make
+
+# Qwen Image 2.1 denoiser
+cd qimg21 && make
 ```
 
 ## Run

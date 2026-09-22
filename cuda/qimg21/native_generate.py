@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Run native Qwen-Image 2.1 denoising with an optional native CUDA VAE.
+"""Run native Qwen-Image 2.1 denoising with an optional native VAE.
 
 Text-only generation and image-editing conditioning use the native tokenizer,
-CUDA vision encoder, and CUDA text encoder. This driver
+native vision encoder, and native text encoder. This driver
 turns the prompt embedding into an F32 fixture, invokes the native
-NVRTC/CUDA transformer for the complete FlowMatch schedule, and only loads the
+runtime transformer for the complete FlowMatch schedule, and only loads the
 Qwen-Image 2.1 VAE after the native subprocess exits.  That process boundary
 lets the transformer release all of its allocations before the decoder claims
 VRAM on a 12–16 GB card.
@@ -29,14 +29,15 @@ def _run(command: list[str], *, cwd: Path) -> None:
     subprocess.run(command, cwd=cwd, check=True)
 
 
-def _decode_vae(model: Path, latent_path: Path, out_path: Path, height: int, width: int, dtype: str) -> None:
+def _decode_vae(model: Path, latent_path: Path, out_path: Path, height: int, width: int,
+                dtype: str, backend: str) -> None:
     """Decode normalized [tokens, 64] latents using AutoencoderKLQwenImage21."""
     import torch
     from diffusers import AutoencoderKLQwenImage21
     from PIL import Image
 
     if not torch.cuda.is_available():
-        raise SystemExit("CUDA is unavailable; the Qwen-Image VAE decode requires NVIDIA CUDA")
+        raise SystemExit(f"{backend.upper()} is unavailable; the Qwen-Image VAE decode requires an accelerator")
     if height % 32 or width % 32:
         raise SystemExit("height and width must be divisible by 32 for Qwen-Image 2.1")
 
@@ -79,6 +80,7 @@ def _decode_vae(model: Path, latent_path: Path, out_path: Path, height: int, wid
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--backend", choices=("cuda", "rocm"), default="cuda")
     ap.add_argument("--model", required=True)
     ap.add_argument("--prompt", default="a red apple on a white table")
     ap.add_argument("--negative-prompt")
@@ -93,8 +95,12 @@ def main() -> int:
     ap.add_argument("--dtype", choices=("bf16", "fp16"), default="bf16")
     ap.add_argument("--work-dir", default="tmp/qimg21-native-generate")
     ap.add_argument("--out", default="tmp/qimg21-native-generate.png")
-    ap.add_argument("--native-bin", default="cuda/qimg21/test_cuda_qimg21_native")
-    ap.add_argument("--native-attention", choices=("math", "reverse64", "mma64", "mma64-flash", "mma64-mixed", "mma64-forward-flash", "mma128-efficient", "cutlass-efficient"), default="math")
+    ap.add_argument("--native-bin", default=None)
+    ap.add_argument("--native-text-bin", default=None)
+    ap.add_argument("--native-vision-bin", default=None)
+    ap.add_argument("--native-vae-bin", default=None)
+    ap.add_argument("--native-vae-encode-bin", default=None)
+    ap.add_argument("--native-attention", choices=("math", "reverse64", "wmma", "mma64", "mma64-flash", "mma64-mixed", "mma64-forward-flash", "mma128-efficient", "cutlass-efficient"), default="math")
     ap.add_argument("--native-normalization", choices=("default", "vector4"), default="default")
     ap.add_argument("--native-rope", choices=("default", "host-table", "host-table-vector4", "host-table-exact"), default="default")
     ap.add_argument("--quantized-transformer", type=Path,
@@ -104,8 +110,12 @@ def main() -> int:
                     help="dynamic W8A8 custom tensor-core execution (requires package)")
     ap.add_argument("--int8-bf16-tail-blocks", type=int, default=0,
                     help="reconstruct this many final transformer blocks to BF16")
-    ap.add_argument("--native-vae", action="store_true", help="Decode with the native F32 CUDA VAE (experimental)")
+    ap.add_argument("--native-vae", action="store_true", help="Decode with the native F32 VAE (experimental)")
     args = ap.parse_args()
+    # The ROCm path has a native decoder and does not require a PyTorch
+    # installation. CUDA keeps its existing reference VAE default.
+    if args.backend == "rocm":
+        args.native_vae = True
     if args.quantized_transformer and args.quantize_on_load:
         ap.error("choose a quantized package or quantize-on-load, not both")
     if args.int8_tensor_core and not args.quantized_transformer:
@@ -121,15 +131,36 @@ def main() -> int:
     out = Path(args.out)
     if not out.is_absolute():
         out = root / out
-    native_bin = Path(args.native_bin)
-    if not native_bin.is_absolute():
-        native_bin = root / native_bin
+    defaults = {
+        "cuda": {
+            "native": "cuda/qimg21/test_cuda_qimg21_native",
+            "text": "cuda/qimg21/test_cuda_qimg21_text",
+            "vision": "cuda/qimg21/test_cuda_qimg21_vision",
+            "vae": "cuda/qimg21/test_cuda_qimg21_vae",
+            "vae_encode": "cuda/qimg21/test_cuda_qimg21_vae_encode",
+        },
+        "rocm": {
+            "native": "rdna4/qimg21/test_hip_qimg21_native",
+            "text": "rdna4/qimg21/test_hip_qimg21_text",
+            "vision": "rdna4/qimg21/test_hip_qimg21_vision",
+            "vae": "rdna4/qimg21/test_hip_qimg21_vae",
+            "vae_encode": "rdna4/qimg21/test_hip_qimg21_vae_encode",
+        },
+    }[args.backend]
+    def resolve_binary(value, key):
+        path = Path(value or defaults[key])
+        return path if path.is_absolute() else root / path
+    native_bin = resolve_binary(args.native_bin, "native")
+    text_bin = resolve_binary(args.native_text_bin, "text")
+    vision_bin = resolve_binary(args.native_vision_bin, "vision")
+    vae_bin = resolve_binary(args.native_vae_bin, "vae")
+    vae_encode_bin = resolve_binary(args.native_vae_encode_bin, "vae_encode")
     if not model.is_dir():
         raise SystemExit(f"model directory does not exist: {model}")
     if not native_bin.exists():
-        raise SystemExit(f"native executable not found: {native_bin}; run `make -C cuda/qimg21 native` first")
-    if args.native_vae and not (root / "cuda/qimg21/test_cuda_qimg21_vae").exists():
-        raise SystemExit("native VAE executable missing; run `make -C cuda/qimg21 native`")
+        raise SystemExit(f"native {args.backend} executable not found: {native_bin}")
+    if args.native_vae and not vae_bin.exists():
+        raise SystemExit(f"native {args.backend} VAE executable missing: {vae_bin}")
     if args.height % 32 or args.width % 32:
         raise SystemExit("height and width must be divisible by 32")
     if args.steps < 1 or args.steps > 100:
@@ -139,9 +170,9 @@ def main() -> int:
     condition_hw = None
     condition_dir = work / "condition"
     if args.image:
-        encoder = root / "cuda/qimg21/test_cuda_qimg21_vae_encode"
+        encoder = vae_encode_bin
         if not encoder.exists():
-            raise SystemExit("native encoder missing; run `make -C cuda/qimg21 native-vae`")
+            raise SystemExit(f"native {args.backend} encoder missing: {encoder}")
         condition_dir.mkdir(parents=True, exist_ok=False)
         _run([str(encoder), "--model", str(model / "vae"),
               "--input-image", str(Path(args.image).resolve()),
@@ -163,29 +194,30 @@ def main() -> int:
 
     prompt_path = prompt_dir / "prompt_embeds.npy"
     if not args.image:
-        text_encoder = root / "cuda/qimg21/test_cuda_qimg21_text"
+        text_encoder = text_bin
         if not text_encoder.exists():
-            raise SystemExit("native text encoder missing; run `make -C cuda/qimg21 native-text-exact`")
+            raise SystemExit(f"native {args.backend} text encoder missing: {text_encoder}")
         _run([
             str(text_encoder), "--model", str(model), "--prompt", args.prompt,
-            "--attention", "flash-exact", "--out", str(prompt_path),
+            "--attention", "flash-exact" if args.backend == "cuda" else "custom",
+            "--out", str(prompt_path),
         ], cwd=root)
         if args.negative_prompt is not None:
             _run([
                 str(text_encoder), "--model", str(model), "--prompt", args.negative_prompt,
-                "--attention", "flash-exact", "--out",
+                "--attention", "flash-exact" if args.backend == "cuda" else "custom", "--out",
                 str(prompt_dir / "negative_prompt_embeds.npy"),
             ], cwd=root)
     else:
-        vision_encoder = root / "cuda/qimg21/test_cuda_qimg21_vision"
-        text_encoder = root / "cuda/qimg21/test_cuda_qimg21_text"
+        vision_encoder = vision_bin
+        text_encoder = text_bin
         if not vision_encoder.exists() or not text_encoder.exists():
-            raise SystemExit("native vision/text executables missing; run `make -C cuda/qimg21 native-text-exact test_cuda_qimg21_vision`")
+            raise SystemExit(f"native {args.backend} vision/text executables missing: {vision_encoder}, {text_encoder}")
         vision_dir = work / "vision"
         vision_dir.mkdir(parents=True, exist_ok=True)
         _run([
             str(vision_encoder), "--model", str(model), "--image", str(condition_dir / "resized.png"),
-            "--max-blocks", "27", "--attention", "flash",
+            "--max-blocks", "27", "--attention", "flash" if args.backend == "cuda" else "math",
             "--out", str(vision_dir / "blocks.npy"),
             "--merged-out", str(vision_dir / "merged.npy"),
             "--deepstack-dir", str(vision_dir),
@@ -198,7 +230,8 @@ def main() -> int:
                 "--vision-deepstack-dir", str(vision_dir),
                 "--image-grid-height", str(condition_hw[0]),
                 "--image-grid-width", str(condition_hw[1]),
-                "--attention", "flash-exact", "--out", str(output),
+                "--attention", "flash-exact" if args.backend == "cuda" else "custom",
+                "--out", str(output),
                 "--dump-tokens", str(tokens_path),
             ], cwd=root)
             token_ids = np.loadtxt(tokens_path, dtype=np.int64, ndmin=1)
@@ -219,7 +252,7 @@ def main() -> int:
     if not prompt_path.exists():
         raise SystemExit(f"text runner did not produce {prompt_path}")
 
-    # The reference text subprocess owns a large CUDA context.  Give the
+    # The reference text subprocess owns a large accelerator context.  Give the
     # driver a moment to retire that context before the native process opens
     # cuBLAS/NVRTC; otherwise some 2-step launches can observe stale device
     # allocations even though the child has exited.
@@ -227,8 +260,7 @@ def main() -> int:
 
     h_tokens, w_tokens = args.height // 16, args.width // 16
     latent_path = work / "latents.npy"
-    _run(
-        [
+    fixture_command = [
             os.environ.get("QIMG21_PYTHON", sys.executable),
             str(root / "cuda/qimg21/make_native_fixture.py"),
             "--prompt-embeds",
@@ -241,12 +273,12 @@ def main() -> int:
             str(args.seed),
             "--dtype",
             args.dtype,
-            "--torch-rng",
             "--out-dir",
             str(work),
-        ],
-        cwd=root,
-    )
+        ]
+    if args.backend == "cuda":
+        fixture_command.append("--torch-rng")
+    _run(fixture_command, cwd=root)
     native_latents = work / "native_latents.npy"
     native_command = [
             str(native_bin),
@@ -299,7 +331,7 @@ def main() -> int:
 
         decoded_path = work / "native_decoded.npy"
         _run([
-            str(root / "cuda/qimg21/test_cuda_qimg21_vae"),
+            str(vae_bin),
             "--model", str(model / "vae"), "--latents", str(native_latents),
             "--height-tokens", str(args.height // 16),
             "--width-tokens", str(args.width // 16), "--out", str(decoded_path),
@@ -311,7 +343,7 @@ def main() -> int:
         out.parent.mkdir(parents=True, exist_ok=True)
         Image.fromarray(pixels.transpose(1, 2, 0)).save(out)
     else:
-        _decode_vae(model, native_latents, out, args.height, args.width, args.dtype)
+        _decode_vae(model, native_latents, out, args.height, args.width, args.dtype, args.backend)
     print(f"native denoise trace: {steps_dir}")
     print(f"fixtures: {work}")
     return 0

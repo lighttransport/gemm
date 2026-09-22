@@ -505,7 +505,11 @@ class PixalServer:
             Path(getattr(args, "qwen_python", ROOT / "tmp/qimg21-ref-venv/bin/python")),
             self.work_dir / "qwen-image21",
             Path(getattr(args, "qwen_native", ROOT / "cuda/qimg21/test_cuda_qimg21_native")),
-            getattr(args, "bind", "127.0.0.1"), getattr(args, "port", 8765))
+            getattr(args, "bind", "127.0.0.1"), getattr(args, "port", 8765),
+            native_rocm=Path(getattr(
+                args, "qwen_native_rocm", ROOT / "rdna4/qimg21/test_hip_qimg21_native")),
+            python_rocm=Path(getattr(
+                args, "qwen_python_rocm", ROOT / "tmp/qimg21-rocm-venv/bin/python")))
 
     @contextmanager
     def execution_lock(self, backend: str, device: int, timeout: float,
@@ -564,7 +568,8 @@ class PixalServer:
                 "default_gpu_execution": self.args.gpu_execution,
                 "default_gpu_kernels": self.args.gpu_kernels,
                 "default_gpu_flow_precision": self.args.gpu_flow_precision,
-                "device_lock": {"cuda": True, "directory": str(self.device_lock_dir)},
+                "device_lock": {"cuda": True, "rocm": True,
+                                 "directory": str(self.device_lock_dir)},
                 "preparation": {"mask_ready": rmbg_ready(self.rembg),
                                 "camera_ready": self.moge.is_file(),
                                 "render_comparison_ready": (
@@ -574,7 +579,17 @@ class PixalServer:
                 "qwen_image21": {
                     "model_ready": self.qwen_image.model.is_dir(),
                     "native_ready": self.qwen_image.native.is_file(),
+                    "native_cuda_ready": all(item.is_file() for item in
+                                              self.qwen_image.native_components("cuda").values()),
+                    "native_rocm_ready": all(item.is_file() for item in
+                                              self.qwen_image.native_components("rocm").values()),
+                    "native_components": {
+                        backend: {name: item.is_file() for name, item in
+                                  self.qwen_image.native_components(backend).items()}
+                        for backend in ("cuda", "rocm")},
                     "reference_ready": self.qwen_image.python.is_file(),
+                    "reference_cuda_ready": self.qwen_image.python.is_file(),
+                    "reference_rocm_ready": self.qwen_image.python_rocm.is_file(),
                     "quantized_available": self.qwen_image.quant.is_dir(),
                 },
                 "limits": {"body_bytes": MAX_BODY_BYTES, "image_bytes": MAX_IMAGE_BYTES,
@@ -582,9 +597,14 @@ class PixalServer:
 
     def qwen_generate(self, request: dict,
                       cancel: threading.Event | None = None, progress=None) -> dict:
-        """Run Qwen Image through the shared CUDA device lock."""
+        """Run Qwen Image through the shared backend/device lock."""
         device = bounded_integer(request.get("device", 0), "device", 0, 255)
-        with self.execution_lock("cuda", device, self.args.timeout, cancel):
+        backend = request.get("backend", "cuda")
+        if request.get("mode") in ("cuda", "rocm"):
+            backend = request["mode"]
+        if backend not in ("cuda", "rocm"):
+            raise ValueError("Qwen backend must be cuda or rocm")
+        with self.execution_lock(backend, device, self.args.timeout, cancel):
             return self.qwen_image.generate(request, progress)
 
     def infer(self, request: dict, cancel: threading.Event | None = None, progress=None) -> dict:
@@ -1740,6 +1760,8 @@ def main() -> None:
     p.add_argument("--qwen-quant-package", default=str(ROOT / "tmp/qimg21-int8-package"))
     p.add_argument("--qwen-python", default=str(ROOT / "tmp/qimg21-ref-venv/bin/python"))
     p.add_argument("--qwen-native", default=str(ROOT / "cuda/qimg21/test_cuda_qimg21_native"))
+    p.add_argument("--qwen-python-rocm", default=str(ROOT / "tmp/qimg21-rocm-venv/bin/python"))
+    p.add_argument("--qwen-native-rocm", default=str(ROOT / "rdna4/qimg21/test_hip_qimg21_native"))
     p.add_argument("--min-free-disk-mib", type=int, default=1024)
     p.add_argument("--job-log-bytes", type=int, default=65536)
     p.add_argument("--shutdown-timeout", type=float, default=30)
