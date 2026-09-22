@@ -206,7 +206,7 @@ int main(int argc, char **argv) {
     const char *patch_out = NULL, *dump_dir = NULL, *merged_out = NULL, *deepstack_dir = NULL;
     const char *attention_mode = "flash";
     const char *flash_plugin_path = "cuda/qimg21/libq21_flash_attention.so";
-    const char *layer_norm_mode = "nvcc";
+    const char *layer_norm_mode = "nvcc-pytorch";
     int h = 0, w = 0, max_blocks = 0, block_index = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--model") && i + 1 < argc) model = argv[++i];

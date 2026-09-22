@@ -1254,29 +1254,29 @@ pinned FlashAttention forward specialization selected by PyTorch Flash SDPA
 for BF16 head dimension 72; `--attention cutlass` and `math` retain diagnostic
 alternatives. Vision linears use BF16-output cuBLAS-LT bias epilogues, including
 the PyTorch-selected algo 21 tile/stage and split-K configurations for the
-256-token block shapes. LayerNorm uses a vector-four, eight-warp
-Welford topology in the pinned NVCC plugin rather than NVRTC. Teacher-forced
-block 0 reaches cosine 0.999999824. Vision RoPE uses a checked CUDA-generated
+256-token block shapes. LayerNorm defaults to the literal vector-four,
+four-warp topology used by pinned ATen. With the exact attention scale,
+teacher-forced block 0 is bit-identical. Vision RoPE uses a checked CUDA-generated
 cosine/sine artifact and separate multiply/add operations matching PyTorch;
 this originally raised the full block-26 cosine from 0.999461003 to
-0.999691509.  After correcting the FlashAttention scale to make the isolated
-operator bit-exact, the full block-26 cosine is 0.999665887832. The recurrent
+0.999691509. Correcting the FlashAttention scale and pairing it with exact
+ATen LayerNorm launch geometry raises full block-26 cosine to 0.999772062868. The recurrent
 result remains below the 0.99996 acceptance target. The merger uses the same
 pinned Welford implementation as the blocks. With the exact PyTorch block-26
 output injected, its local cosine is 0.999990332 and passes the 0.99996 gate;
-the exact-attention accumulated full-run merger cosine is 0.999341086920, so the recurrent
+the accumulated full-run merger cosine is 0.999550591733, so the recurrent
 vision stack is not yet accepted for strict parity. It is wired into the
 experimental editing integration to exercise the complete native path. Use `--hidden ... --block-index N
 --max-blocks 1` for isolated block replay, or `--max-blocks 0 --merged-out ...`
 for merger-only replay, and `--dump-dir DIR` to save every executed block.
 `--layer-norm nvrtc` retains the in-module Welford implementation for
-diagnosis while `nvcc` remains the default. `nvcc-pytorch` selects the literal
-`dim3(32,4)` 128-thread/four-warp launch used by pinned ATen: its block-0 LayerNorm rstd is
+diagnosis while `nvcc` retains the earlier eight-warp implementation.
+`nvcc-pytorch` is the default and selects the literal `dim3(32,4)`
+128-thread/four-warp launch used by pinned ATen: its block-0 LayerNorm rstd is
 bit-exact, LayerNorm output is 99.9986% elementwise exact, and teacher-forced
-block-0 cosine improves to 0.999999933. Its full block-26 cosine is
-0.999687034 with the earlier attention scale, slightly below that run's
-eight-warp result of 0.999691509, so it remains
-a diagnostic rather than the generation default. With the same FlashAttention path,
+block-0 cosine was 0.999999933 with the earlier attention scale and becomes
+bit-exact with the corrected scale. The combined exact path reaches
+0.999967016898 at block 5 and 0.999772062868 at block 26. With the earlier FlashAttention path,
 the all-NVRTC run improves final block cosine from 0.999461003 to 0.999620834
 but still fails the gate. A greedy per-block oracle over both implementations
 first fails at block 5 (0.999954165), showing that LayerNorm-path selection
@@ -1299,10 +1299,11 @@ PyTorch Welford expressions.
 For boundary isolation, `--norm1-override NORM.npy` replaces the first
 executed block's computed normalization output after still running the native
 kernel, and `--flash-plugin PATH` selects an alternate ABI-compatible pinned
-attention build.  Replaying block 0 with the captured PyTorch normalization
-makes all 884,736 QKV values and both rotary Q/K tensors bit-exact.  The first
-remaining difference is then the FlashAttention output: 56 of 294,912 BF16
-values differ by one representable step (maximum absolute error 0.0009765625).
+attention build. Replaying block 0 with the captured PyTorch normalization
+makes all 884,736 QKV values and both rotary Q/K tensors bit-exact. Before the
+scale correction, the first remaining difference was the FlashAttention output:
+56 of 294,912 BF16 values differed by one representable step (maximum absolute
+error 0.0009765625).
 Official FlashAttention `--use_fast_math`, fused softmax FMA, and CUDA 12.9
 build variants do not improve that result; the default unfused CUDA 13.1 build
 has the fewest mismatches.
