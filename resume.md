@@ -204,6 +204,11 @@ per-row split order and arithmetic. The split kernel and captured generic
 decode ABI are unchanged; the reference combine remains the default pending
 resident verifier hashes and timing.
 
+The grouped combine now loads all four metadata rows before one block barrier
+instead of synchronizing after each row. This is an exact barrier-hoist
+micro-optimization: the per-row maximum/scale/reduction order is unchanged,
+and the opt-in/default boundary remains unchanged.
+
 ## 2026-09-22 continuation: IQ2_XXS block-shape probe
 
 I tested 128- and 512-thread blocks for the native one-row IQ2_XXS kernel

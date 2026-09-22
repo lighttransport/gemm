@@ -170,6 +170,8 @@ An opt-in `LLM_QWEN35_VERIFY_COMBINE_GROUPED=1` verifier combine kernel now
 handles four adjacent rows per block. It retains the existing split partial
 layout and per-row combine arithmetic, so captured generic decode graphs remain
 untouched until resident long-context hash and timing A/B validation.
+The kernel hoists its metadata synchronization to one barrier after all four
+rows are loaded; reduction order and output bits remain unchanged.
 
 The opt-in cache-injection overlap path now consumes captured feature rows
 directly after the target-ready event, eliminating a redundant device copy.

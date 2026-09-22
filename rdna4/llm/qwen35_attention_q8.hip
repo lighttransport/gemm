@@ -1084,7 +1084,16 @@ void qwen35_attention_q8_combine_verify4(float *out, const float *parts,
             for (int i = tid; i < splits; i += 256)
                 shared_meta[q][i] = src[i];
         }
-        __syncthreads();
+    }
+    /* All four metadata rows are independent.  A single barrier after the
+     * loads is sufficient; the old per-row barriers serialized the grouped
+     * verifier without protecting any additional data. */
+    __syncthreads();
+    for (int q = 0; q < 4; ++q) {
+        int query = q0 + q;
+        int splits = query < queries ?
+            (forced_splits ? forced_splits :
+             q8_attention_splits(position[query] + 1, heads, nsm, occupancy)) : 0;
         if (splits > 1) {
             const float *src = parts + ((size_t)query * heads + head) * splits * 256;
             float maximum = shared_meta[q][0].x;
@@ -1099,6 +1108,5 @@ void qwen35_attention_q8_combine_verify4(float *out, const float *parts,
             out[((size_t)query * heads + head) * 256 + tid] =
                 numerator / denominator;
         }
-        __syncthreads();
     }
 }
