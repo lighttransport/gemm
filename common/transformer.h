@@ -62,6 +62,8 @@ typedef struct {
     uint32_t kquant_cache_format;
     void    *tp_owned_data; /* owned contiguous TP column repack, if any */
     int      nvfp4_packed; /* K-major eight-row NVFP4 decode layout */
+    int      nvfp4_tiled;  /* size-preserving exact eight-row NVFP4 layout */
+    int      q6_decoded;   /* exact predecoded Q6_K vocabulary head */
 } qtensor;
 
 typedef struct {
@@ -1630,6 +1632,125 @@ static inline void tf_nvfp4_packed_matvec_rows(float *dst, const qtensor *mat,
     }
 }
 
+/* Eight rows share a compact 288-byte tile for every 64 input values.  The
+ * scale codes and nibbles are unchanged; each row keeps its exact FP32 FMA
+ * sequence and final SVE reduction. */
+typedef struct { uint8_t d[8], qs[64]; } tf_nvfp4_tiled_subblock;
+typedef struct { tf_nvfp4_tiled_subblock s[4]; } tf_nvfp4_tiled_block;
+
+static inline void tf_nvfp4_tiled_dot8(float *dst,
+                                       const tf_nvfp4_tiled_block *w,
+                                       const float *x, int nb) {
+    const svbool_t pg = svptrue_b32();
+    const svfloat32_t lut = svld1(pg, ds4f_kvalues_mxfp4_f32);
+    svfloat32_t a0=svdup_f32(0), a1=a0, a2=a0, a3=a0;
+    svfloat32_t a4=a0, a5=a0, a6=a0, a7=a0;
+    for (int ib = 0; ib < nb; ib++) {
+        for (int s = 0; s < 4; s++) {
+            const tf_nvfp4_tiled_subblock *p = &w[ib].s[s];
+            svfloat32_t xv = svld1(pg, x + ib * 64 + s * 16);
+            svfloat32_t xh = svld1(pg, x + ib * 64 + s * 16 + 8);
+#define TF_NVFP4_TILED_ROW(R, A) do { \
+                svbool_t p8=svwhilelt_b32((uint64_t)0,(uint64_t)8); \
+                svuint32_t z=svld1ub_u32(p8,p->qs+(R)*8); \
+                svfloat32_t d=svdup_f32(tf_nvfp4_scale_fast(p->d[R])); \
+                svfloat32_t lo=svtbl_f32(lut,svand_n_u32_x(p8,z,15)); \
+                (A)=svmla_m(p8,(A),svmul_x(p8,lo,d),xv); \
+                svfloat32_t hi=svtbl_f32(lut,svlsr_n_u32_x(p8,z,4)); \
+                (A)=svmla_m(p8,(A),svmul_x(p8,hi,d),xh); \
+            } while (0)
+            TF_NVFP4_TILED_ROW(0,a0); TF_NVFP4_TILED_ROW(1,a1);
+            TF_NVFP4_TILED_ROW(2,a2); TF_NVFP4_TILED_ROW(3,a3);
+            TF_NVFP4_TILED_ROW(4,a4); TF_NVFP4_TILED_ROW(5,a5);
+            TF_NVFP4_TILED_ROW(6,a6); TF_NVFP4_TILED_ROW(7,a7);
+#undef TF_NVFP4_TILED_ROW
+        }
+    }
+    dst[0]=svaddv_f32(pg,a0); dst[1]=svaddv_f32(pg,a1);
+    dst[2]=svaddv_f32(pg,a2); dst[3]=svaddv_f32(pg,a3);
+    dst[4]=svaddv_f32(pg,a4); dst[5]=svaddv_f32(pg,a5);
+    dst[6]=svaddv_f32(pg,a6); dst[7]=svaddv_f32(pg,a7);
+}
+
+static inline void tf_nvfp4_tiled_matvec_rows(float *dst, const qtensor *mat,
+                                               const float *x, int row_start,
+                                               int row_end) {
+    int nb = mat->n_cols / 64;
+    const tf_nvfp4_tiled_block *w = (const tf_nvfp4_tiled_block *)mat->data;
+    for (int i = row_start; i < row_end;) {
+        int tile = i / 8;
+        float values[8];
+        tf_nvfp4_tiled_dot8(values, w + (size_t)tile * nb, x, nb);
+        int end = (tile + 1) * 8;
+        if (end > row_end) end = row_end;
+        for (; i < end; i++) dst[i] = values[i % 8];
+    }
+}
+
+/* Small-N exact verify: decode each compact weight once for up to four
+ * candidate activations, retaining the serial dot's FMA/reduction order. */
+static inline void tf_nvfp4_tiled_gemm_rows(float *y, const qtensor *mat,
+        const float *x, int n, int ys, int xs, int first, int last) {
+    const int nb = mat->n_cols / 64;
+    const tf_nvfp4_tiled_block *base = (const tf_nvfp4_tiled_block *)mat->data;
+    const svbool_t pg = svptrue_b32();
+    const svbool_t p8 = svwhilelt_b32((uint64_t)0, (uint64_t)8);
+    const svfloat32_t lut = svld1(pg, ds4f_kvalues_mxfp4_f32);
+    for (int row = first; row < last; row += 4) {
+        int tile = row / 8, r0 = row % 8;
+        svfloat32_t a00=svdup_f32(0), a01=a00, a02=a00, a03=a00;
+        svfloat32_t a10=a00, a11=a00, a12=a00, a13=a00;
+        svfloat32_t a20=a00, a21=a00, a22=a00, a23=a00;
+        svfloat32_t a30=a00, a31=a00, a32=a00, a33=a00;
+        const tf_nvfp4_tiled_block *w = base + (size_t)tile * nb;
+        for (int ib = 0; ib < nb; ib++) {
+            for (int s = 0; s < 4; s++) {
+                const tf_nvfp4_tiled_subblock *p = &w[ib].s[s];
+#define TF_NVFP4_BATCH_ROW(R, A0, A1, A2, A3) do { \
+                    int rr = r0 + (R); \
+                    svuint32_t z = svld1ub_u32(p8, p->qs + rr * 8); \
+                    svfloat32_t d = svdup_f32(tf_nvfp4_scale_fast(p->d[rr])); \
+                    svfloat32_t lo = svmul_x(p8, \
+                        svtbl_f32(lut, svand_n_u32_x(p8, z, 15)), d); \
+                    svfloat32_t hi = svmul_x(p8, \
+                        svtbl_f32(lut, svlsr_n_u32_x(p8, z, 4)), d); \
+                    const float *x0 = x + ib * 64 + s * 16; \
+                    (A0) = svmla_m(p8, (A0), lo, svld1(p8, x0)); \
+                    (A0) = svmla_m(p8, (A0), hi, svld1(p8, x0 + 8)); \
+                    if (n > 1) { const float *xt = x0 + xs; \
+                        (A1) = svmla_m(p8, (A1), lo, svld1(p8, xt)); \
+                        (A1) = svmla_m(p8, (A1), hi, svld1(p8, xt + 8)); } \
+                    if (n > 2) { const float *xt = x0 + (size_t)2 * xs; \
+                        (A2) = svmla_m(p8, (A2), lo, svld1(p8, xt)); \
+                        (A2) = svmla_m(p8, (A2), hi, svld1(p8, xt + 8)); } \
+                    if (n > 3) { const float *xt = x0 + (size_t)3 * xs; \
+                        (A3) = svmla_m(p8, (A3), lo, svld1(p8, xt)); \
+                        (A3) = svmla_m(p8, (A3), hi, svld1(p8, xt + 8)); } \
+                } while (0)
+                TF_NVFP4_BATCH_ROW(0,a00,a01,a02,a03);
+                TF_NVFP4_BATCH_ROW(1,a10,a11,a12,a13);
+                TF_NVFP4_BATCH_ROW(2,a20,a21,a22,a23);
+                TF_NVFP4_BATCH_ROW(3,a30,a31,a32,a33);
+#undef TF_NVFP4_BATCH_ROW
+            }
+        }
+#define TF_NVFP4_BATCH_STORE(R, A0, A1, A2, A3) do { \
+            int rr = row + (R); \
+            if (rr < last) { \
+                y[rr] = svaddv_f32(pg, A0); \
+                if (n > 1) y[(size_t)ys + rr] = svaddv_f32(pg, A1); \
+                if (n > 2) y[(size_t)2 * ys + rr] = svaddv_f32(pg, A2); \
+                if (n > 3) y[(size_t)3 * ys + rr] = svaddv_f32(pg, A3); \
+            } \
+        } while (0)
+        TF_NVFP4_BATCH_STORE(0,a00,a01,a02,a03);
+        TF_NVFP4_BATCH_STORE(1,a10,a11,a12,a13);
+        TF_NVFP4_BATCH_STORE(2,a20,a21,a22,a23);
+        TF_NVFP4_BATCH_STORE(3,a30,a31,a32,a33);
+#undef TF_NVFP4_BATCH_STORE
+    }
+}
+
 static inline void tf_nvfp4_dot4_sve(float *o0, float *o1, float *o2, float *o3,
                                      const block_nvfp4 *b0, const block_nvfp4 *b1,
                                      const block_nvfp4 *b2, const block_nvfp4 *b3,
@@ -1899,6 +2020,74 @@ static inline void tf_q5_k_dot2_sve(float *out0, float *out1,
     }
     *out0 = svaddv_f32(pg, a0);
     *out1 = svaddv_f32(pg, a1);
+}
+
+typedef struct { int8_t q[256]; float scale[16]; } tf_q6_exact_block;
+
+static inline float tf_q6_exact_dot_sve(const tf_q6_exact_block *blocks,
+                                        const float *x, int n) {
+    const svbool_t pg = svptrue_b32();
+    svfloat32_t acc = svdup_f32(0.0f);
+    for (int ib = 0; ib < n / 256; ib++) {
+        const tf_q6_exact_block *b = &blocks[ib];
+        for (int half = 0; half < 2; half++)
+            for (int part = 0; part < 4; part++)
+                for (int k = 0; k < 32; k += 16) {
+                    int off = half * 128 + part * 32 + k;
+                    int si = half * 8 + part * 2 + k / 16;
+                    svint32_t q = svld1sb_s32(pg, b->q + off);
+                    svfloat32_t w = svmul_n_f32_x(pg,
+                        svcvt_f32_s32_x(pg, q), b->scale[si]);
+                    acc = svmla_m(pg, acc, w,
+                        svld1(pg, x + ib * 256 + off));
+                }
+    }
+    return svaddv_f32(pg, acc);
+}
+
+static inline void tf_q6_exact_matvec_rows(float *dst, const qtensor *mat,
+                                             const float *x, int row_start,
+                                             int row_end) {
+    int nb = mat->n_cols / 256;
+    const tf_q6_exact_block *base = (const tf_q6_exact_block *)mat->data;
+    for (int i = row_start; i < row_end; i++)
+        dst[i] = tf_q6_exact_dot_sve(base + (size_t)i * nb, x, mat->n_cols);
+}
+
+static inline void tf_q6_exact_gemm_rows(float *y, const qtensor *mat,
+        const float *x, int n, int ys, int xs, int first, int last) {
+    const int nb = mat->n_cols / 256;
+    const tf_q6_exact_block *base = (const tf_q6_exact_block *)mat->data;
+    const svbool_t pg = svptrue_b32();
+    for (int row = first; row < last; row++) {
+        svfloat32_t a0 = svdup_f32(0), a1 = a0, a2 = a0, a3 = a0;
+        const tf_q6_exact_block *blocks = base + (size_t)row * nb;
+        for (int ib = 0; ib < nb; ib++) {
+            const tf_q6_exact_block *b = &blocks[ib];
+            for (int half = 0; half < 2; half++)
+                for (int part = 0; part < 4; part++)
+                    for (int k = 0; k < 32; k += 16) {
+                        int off = half * 128 + part * 32 + k;
+                        int si = half * 8 + part * 2 + k / 16;
+                        svint32_t q = svld1sb_s32(pg, b->q + off);
+                        svfloat32_t w = svmul_n_f32_x(pg,
+                            svcvt_f32_s32_x(pg, q), b->scale[si]);
+#define TF_Q6_BATCH_ACC(T, A) do { \
+                            (A) = svmla_m(pg, (A), w, \
+                                svld1(pg, x + (size_t)(T) * xs + ib * 256 + off)); \
+                        } while (0)
+                        TF_Q6_BATCH_ACC(0, a0);
+                        if (n > 1) TF_Q6_BATCH_ACC(1, a1);
+                        if (n > 2) TF_Q6_BATCH_ACC(2, a2);
+                        if (n > 3) TF_Q6_BATCH_ACC(3, a3);
+#undef TF_Q6_BATCH_ACC
+                    }
+        }
+        y[row] = svaddv_f32(pg, a0);
+        if (n > 1) y[(size_t)ys + row] = svaddv_f32(pg, a1);
+        if (n > 2) y[(size_t)2 * ys + row] = svaddv_f32(pg, a2);
+        if (n > 3) y[(size_t)3 * ys + row] = svaddv_f32(pg, a3);
+    }
 }
 
 static inline float tf_q6_k_dot_sve(const block_q6_K *blocks, const float *x, int n) {
@@ -2295,6 +2484,11 @@ static void *tf_qmatvec_worker(void *arg) {
                                          t->row_start, t->row_end);
             return NULL;
         }
+        if (t->mat->nvfp4_tiled) {
+            tf_nvfp4_tiled_matvec_rows(t->dst, t->mat, t->x,
+                                        t->row_start, t->row_end);
+            return NULL;
+        }
         size_t row_bytes = (size_t)(n_cols / 64) * sizeof(block_nvfp4);
         const uint8_t *base = (const uint8_t *)t->mat->data;
         int i = t->row_start;
@@ -2313,6 +2507,11 @@ static void *tf_qmatvec_worker(void *arg) {
     }
     if (t->mat->type == GGML_TYPE_Q5_K || t->mat->type == GGML_TYPE_Q6_K ||
         t->mat->type == GGML_TYPE_IQ4_XS) {
+        if (t->mat->q6_decoded) {
+            tf_q6_exact_matvec_rows(t->dst, t->mat, t->x,
+                                     t->row_start, t->row_end);
+            return NULL;
+        }
         size_t row_bytes = tf_row_bytes(t->mat->type, n_cols);
         int i = t->row_start;
         if (tf_kq_pair_enabled() && t->mat->type == GGML_TYPE_Q5_K) {
@@ -4140,6 +4339,10 @@ static void tf_matvec_qtensor_rows(float *dst, const qtensor *mat, const float *
             tf_nvfp4_packed_matvec_rows(dst, mat, x, row_start, row_end);
             return;
         }
+        if (mat->nvfp4_tiled) {
+            tf_nvfp4_tiled_matvec_rows(dst, mat, x, row_start, row_end);
+            return;
+        }
         size_t rb = (size_t)(n_cols / 64) * sizeof(block_nvfp4);
         const uint8_t *base = (const uint8_t *)mat->data;
         int8_t *xq = NULL; float *xs = NULL;
@@ -4199,6 +4402,10 @@ static void tf_matvec_qtensor_rows(float *dst, const qtensor *mat, const float *
             tf_compact_k_check(mat->type, row, x, n_cols, dst[i]);
         }
     } else if (mat->type == GGML_TYPE_Q6_K) {
+        if (mat->q6_decoded) {
+            tf_q6_exact_matvec_rows(dst, mat, x, row_start, row_end);
+            return;
+        }
         size_t rb = (size_t)(n_cols / 256) * sizeof(block_q6_K);
         for (int i = row_start; i < row_end; i++) {
             const void *row = (const uint8_t *)mat->data + (size_t)i * rb;
@@ -4462,6 +4669,10 @@ static void tf_qmatvec(float *dst, const qtensor *mat, const float *x, int n_row
             tf_nvfp4_packed_matvec_rows(dst, mat, x, 0, n_rows);
             return;
         }
+        if (mat->nvfp4_tiled) {
+            tf_nvfp4_tiled_matvec_rows(dst, mat, x, 0, n_rows);
+            return;
+        }
         size_t row_bytes = (size_t)(n_cols / 64) * sizeof(block_nvfp4);
         const uint8_t *base = (const uint8_t *)mat->data;
         int i = 0;
@@ -4480,6 +4691,10 @@ static void tf_qmatvec(float *dst, const qtensor *mat, const float *x, int n_row
     }
     if (mat->type == GGML_TYPE_Q5_K || mat->type == GGML_TYPE_Q6_K ||
         mat->type == GGML_TYPE_IQ4_XS) {
+        if (mat->q6_decoded) {
+            tf_q6_exact_matvec_rows(dst, mat, x, 0, n_rows);
+            return;
+        }
         size_t row_bytes = tf_row_bytes(mat->type, n_cols);
         int i = 0;
         if (tf_kq_pair_enabled() && mat->type == GGML_TYPE_Q5_K) {
@@ -14771,6 +14986,46 @@ static void tf_gemm_f16_mt_tokenmajor_impl(float *Y_out, const qtensor *mat, con
                                        int n_rows, int N, int out_stride, int X_stride,
                                        int n_threads) {
 #if defined(__ARM_FEATURE_SVE)
+    if ((mat->nvfp4_tiled || mat->q6_decoded) && N >= 1) {
+        int nt = n_threads < 1 ? 1 : n_threads;
+        if (nt > n_rows / 8) nt = n_rows / 8;
+        if (nt < 1) nt = 1;
+#ifdef _OPENMP
+        #pragma omp parallel num_threads(nt)
+        {
+            int tid = omp_get_thread_num(), team = omp_get_num_threads();
+            int first = mat->nvfp4_tiled ?
+                ((n_rows + 7) / 8 * tid / team) * 8 : n_rows * tid / team;
+            int last = mat->nvfp4_tiled ?
+                ((n_rows + 7) / 8 * (tid + 1) / team) * 8 : n_rows * (tid + 1) / team;
+            if (last > n_rows) last = n_rows;
+            for (int t = 0; t < N; t += 4) {
+                int count = N - t < 4 ? N - t : 4;
+                if (mat->nvfp4_tiled)
+                    tf_nvfp4_tiled_gemm_rows(Y_out + (size_t)t * out_stride,
+                        mat, X + (size_t)t * X_stride, count, out_stride,
+                        X_stride, first, last);
+                else
+                    tf_q6_exact_gemm_rows(Y_out + (size_t)t * out_stride,
+                        mat, X + (size_t)t * X_stride, count, out_stride,
+                        X_stride, first, last);
+            }
+        }
+#else
+        for (int t = 0; t < N; t += 4) {
+            int count = N - t < 4 ? N - t : 4;
+            if (mat->nvfp4_tiled)
+                tf_nvfp4_tiled_gemm_rows(Y_out + (size_t)t * out_stride,
+                    mat, X + (size_t)t * X_stride, count, out_stride,
+                    X_stride, 0, n_rows);
+            else
+                tf_q6_exact_gemm_rows(Y_out + (size_t)t * out_stride,
+                    mat, X + (size_t)t * X_stride, count, out_stride,
+                    X_stride, 0, n_rows);
+        }
+#endif
+        return;
+    }
     if (mat->type == GGML_TYPE_IQ3_XXS && N >= 2 && mat->n_cols % 256 == 0) {
         if (tf_iq3_xxs_gemm_tokenmajor(Y_out, mat, X, n_rows, N,
                                       out_stride, X_stride, n_threads)) return;

@@ -144,16 +144,20 @@ GLM5_HDRS   := $(COMMON)/glm5.h $(COMMON)/glm5_impl.h $(COMMON)/glm5_mem.h $(COM
 # ── Targets ────────────────────────────────────────────────────────────
 # ds4f_bake MUST be here: the alias target name matches ds4f_bake.c, so without .PHONY make's
 # built-in "%: %.c" rule fires and re-links the finished binary as if it were an object.
-.PHONY: all clean vlm_objs llm_runner qwen38_runner qwen38_kquant_bench qwen38_kquant_test qwen38_kquant_stage qwen38_kquant_stage_test qwen38_kquant_check qwen38_pp_runner qwen38_prefill_runner qwen38_mixed_runner qwen38_tp_stage pp_runner tp_runner tp_runner_prof ep_runner ds4f_runner ds4f_ep_runner ds4f_decode_bw ds4f_bake m3_ep_runner glm5_ep_runner glm5_ep_runner_fapp glm5_stage glm52_gguf_convert glm5_real_test glm5_fp8_kernel_test
+.PHONY: all clean vlm_objs llm_runner qwen38_runner qwen38_nvfp4_roofline qwen38_kquant_bench qwen38_kquant_test qwen38_kquant_stage qwen38_kquant_stage_test qwen38_kquant_check qwen38_pp_runner qwen38_prefill_runner qwen38_mixed_runner qwen38_tp_stage pp_runner tp_runner tp_runner_prof ep_runner ds4f_runner ds4f_ep_runner ds4f_decode_bw ds4f_bake m3_ep_runner glm5_ep_runner glm5_ep_runner_fapp glm5_stage glm52_gguf_convert glm5_real_test glm5_fp8_kernel_test
 
 all: $(BUILD)/llm_runner
 
 llm_runner: $(BUILD)/llm_runner
 
 qwen38_runner: $(BUILD)/qwen38_runner
-$(BUILD)/qwen38_runner: $(LLM_DIR)qwen38_runner.c $(COMMON)/transformer.h $(COMMON)/gguf_loader.h $(LLM_DIR)kv_f16_sve.h $(LLM_DIR)swiglu_sve.h $(ROOT)/dequant-pipe/q8_k128.h $(Q8K128_KERNEL) | $(BUILD)
+$(BUILD)/qwen38_runner: $(LLM_DIR)qwen38_runner.c $(COMMON)/transformer.h $(COMMON)/gguf_loader.h $(LLM_DIR)qwen38_nvfp4_pack.h $(LLM_DIR)qwen38_q6_head.h $(LLM_DIR)qwen38_spec_verify.h $(LLM_DIR)kv_f16_sve.h $(LLM_DIR)swiglu_sve.h $(ROOT)/dequant-pipe/q8_k128.h $(Q8K128_KERNEL) | $(BUILD)
 	$(CC) $(CFLAGS) $(QWEN_CFLAGS) -DTF_LINK_Q8_K128 -o $@ \
 		$(LLM_DIR)qwen38_runner.c $(Q8K128_KERNEL) $(LDFLAGS)
+
+qwen38_nvfp4_roofline: $(BUILD)/qwen38_nvfp4_roofline
+$(BUILD)/qwen38_nvfp4_roofline: $(LLM_DIR)qwen38_nvfp4_roofline.c $(COMMON)/gguf_loader.h | $(BUILD)
+	$(HOSTCC) -O2 -std=c11 -D_GNU_SOURCE -I$(COMMON) -o $@ $< -lm
 
 .PHONY: test_kv_f16_sve
 test_kv_f16_sve: $(BUILD)/test_kv_f16_sve

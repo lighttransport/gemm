@@ -59,6 +59,37 @@ static int q38_nvfp4_plan(const gguf_context *g, q38_nvfp4_layout **out,
     return 0;
 }
 
+static int q38_nvfp4_plan_tiled(const gguf_context *g,
+                                q38_nvfp4_layout **out, int *out_count) {
+    if (!g || g->n_shards || !g->data) return -1;
+    size_t n = (size_t)g->n_tensors;
+    q38_nvfp4_layout *ds = calloc(n, sizeof(*ds));
+    if (!ds) return -1;
+    int count = 0;
+    _Static_assert(sizeof(tf_nvfp4_tiled_block) ==
+                   8 * sizeof(block_nvfp4), "exact tile must preserve bytes");
+    for (size_t i = 0; i < n; i++) {
+        const gguf_tensor_info *ti = &g->tensors[i];
+        q38_nvfp4_layout *d = &ds[i];
+        d->idx = i;
+        d->old_off = d->new_off = (size_t)ti->offset;
+        d->src_bytes = d->dst_bytes = gguf_tensor_size(g, (int)i);
+        d->cols = ti->dims[0];
+        d->rows = 1;
+        for (uint32_t k = 1; k < ti->n_dims; k++) d->rows *= ti->dims[k];
+        /* Native NextN tensors are a small separate draft path. Keep their
+         * GGUF row layout so their teacher-forced logits stay unchanged. */
+        int nextn_tensor = strstr(ti->name.str, "nextn") != NULL ||
+                           strncmp(ti->name.str, "blk.64.", 7) == 0;
+        d->packed = !nextn_tensor && ti->type == GGML_TYPE_NVFP4 && ti->n_dims >= 2 &&
+                    d->cols % 64 == 0 && d->rows % 8 == 0;
+        count += d->packed;
+    }
+    qsort(ds, n, sizeof(*ds), q38_nvfp4_layout_cmp);
+    *out = ds; *out_count = count;
+    return 0;
+}
+
 /* First-touch final packed locations from their future decode workers. This
  * preserves CMG-local HBM after the serial reverse-order repack. A volatile
  * read/write preserves any small tensors already eagerly loaded by GGUF. */
@@ -100,7 +131,8 @@ static void q38_nvfp4_pack_tile(tf_nvfp4_packed_block *dst,
 }
 
 static int q38_nvfp4_rebind_one(qtensor *t, const q38_nvfp4_layout *ds,
-                                 size_t n, uint8_t *base, size_t old_bytes) {
+                                 size_t n, uint8_t *base, size_t old_bytes,
+                                 int tiled) {
     if (!t || !t->data || (uintptr_t)t->data < (uintptr_t)base ||
         (uintptr_t)t->data >= (uintptr_t)base + old_bytes) return 0;
     size_t off = (size_t)((uint8_t *)t->data - base);
@@ -110,7 +142,8 @@ static int q38_nvfp4_rebind_one(qtensor *t, const q38_nvfp4_layout *ds,
             size_t delta = off - d->old_off;
             if (d->packed && delta) return -1;
             t->data = base + d->new_off + delta;
-            t->nvfp4_packed = d->packed;
+            t->nvfp4_packed = d->packed && !tiled;
+            t->nvfp4_tiled = d->packed && tiled;
             return 0;
         }
     }
@@ -119,7 +152,7 @@ static int q38_nvfp4_rebind_one(qtensor *t, const q38_nvfp4_layout *ds,
 
 static int q38_nvfp4_rebind_layer(transformer_layer *l,
                                    const q38_nvfp4_layout *ds, size_t n,
-                                   uint8_t *base, size_t old_bytes) {
+                                   uint8_t *base, size_t old_bytes, int tiled) {
     /* The leading fields of transformer_layer are consecutive qtensors. */
     _Static_assert(offsetof(transformer_layer, is_ssm) -
                    offsetof(transformer_layer, attn_norm) ==
@@ -127,24 +160,24 @@ static int q38_nvfp4_rebind_layer(transformer_layer *l,
     uint8_t *p = (uint8_t *)&l->attn_norm;
     for (int i = 0; i < 34; i++)
         if (q38_nvfp4_rebind_one((qtensor *)(p + (size_t)i * sizeof(qtensor)),
-                                  ds, n, base, old_bytes)) return -1;
+                                  ds, n, base, old_bytes, tiled)) return -1;
     return 0;
 }
 
 static int q38_nvfp4_rebind_model(transformer_model *m,
                                    const q38_nvfp4_layout *ds, size_t n,
-                                   uint8_t *base, size_t old_bytes) {
+                                   uint8_t *base, size_t old_bytes, int tiled) {
     qtensor *globals[] = {&m->per_layer_token_embd, &m->per_layer_model_proj,
         &m->per_layer_proj_norm, &m->token_embd, &m->output_norm, &m->output,
         &m->nextn.eh_proj, &m->nextn.enorm, &m->nextn.hnorm,
         &m->nextn.shared_head_norm, &m->nextn.embed_tokens,
         &m->nextn.shared_head_head};
     for (size_t i = 0; i < sizeof(globals)/sizeof(globals[0]); i++)
-        if (q38_nvfp4_rebind_one(globals[i], ds, n, base, old_bytes)) return -1;
+        if (q38_nvfp4_rebind_one(globals[i], ds, n, base, old_bytes, tiled)) return -1;
     for (int l = 0; l < m->n_layers; l++)
-        if (q38_nvfp4_rebind_layer(&m->layers[l], ds, n, base, old_bytes)) return -1;
+        if (q38_nvfp4_rebind_layer(&m->layers[l], ds, n, base, old_bytes, tiled)) return -1;
     if (m->nextn.loaded &&
-        q38_nvfp4_rebind_layer(&m->nextn.layer, ds, n, base, old_bytes)) return -1;
+        q38_nvfp4_rebind_layer(&m->nextn.layer, ds, n, base, old_bytes, tiled)) return -1;
     return 0;
 }
 
@@ -178,11 +211,47 @@ static int q38_nvfp4_pack_model(gguf_context *g, transformer_model *m,
         }
     }
     free(scratch);
-    if (q38_nvfp4_rebind_model(m, ds, n, base, old_bytes)) return -1;
+    if (q38_nvfp4_rebind_model(m, ds, n, base, old_bytes, 0)) return -1;
     for (size_t i = 0; i < n; i++)
         g->tensors[ds[i].idx].offset = ds[i].new_off;
     g->data_size = new_bytes;
     return 0;
+}
+
+static int q38_nvfp4_tile_model(gguf_context *g, transformer_model *m,
+                                 const q38_nvfp4_layout *ds, size_t n) {
+    size_t max_tile = 0;
+    for (size_t i = 0; i < n; i++)
+        if (ds[i].packed) {
+            size_t tile = (ds[i].cols / 64) * sizeof(tf_nvfp4_tiled_block);
+            if (tile > max_tile) max_tile = tile;
+        }
+    uint8_t *scratch = malloc(max_tile);
+    if (!scratch) return -1;
+    uint8_t *base = g->data;
+    for (size_t i = 0; i < n; i++) {
+        const q38_nvfp4_layout *d = &ds[i];
+        if (!d->packed) continue;
+        size_t nb = d->cols / 64;
+        size_t tile_bytes = nb * sizeof(tf_nvfp4_tiled_block);
+        uint8_t *tensor = base + d->old_off;
+        for (size_t tile = 0; tile < d->rows / 8; tile++) {
+            const block_nvfp4 *src = (const block_nvfp4 *)(tensor + tile * tile_bytes);
+            tf_nvfp4_tiled_block *dst = (tf_nvfp4_tiled_block *)scratch;
+            for (size_t b = 0; b < nb; b++)
+                for (int s = 0; s < 4; s++) {
+                    tf_nvfp4_tiled_subblock *p = &dst[b].s[s];
+                    for (int r = 0; r < 8; r++) {
+                        const block_nvfp4 *q = src + (size_t)r * nb + b;
+                        p->d[r] = q->d[s];
+                        memcpy(p->qs + r * 8, q->qs + s * 8, 8);
+                    }
+                }
+            memcpy(tensor + tile * tile_bytes, scratch, tile_bytes);
+        }
+    }
+    free(scratch);
+    return q38_nvfp4_rebind_model(m, ds, n, base, g->data_size, 1);
 }
 
 #endif /* __ARM_FEATURE_SVE */

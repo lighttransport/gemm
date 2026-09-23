@@ -8,6 +8,7 @@
 #define TRANSFORMER_IMPLEMENTATION
 #include "transformer.h"
 #include "qwen38_nvfp4_pack.h"
+#include "qwen38_q6_head.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -45,6 +46,8 @@ static int argmax(const float *x, int n) {
     for (int i = 1; i < n; i++) if (x[i] > x[best]) best = i;
     return best;
 }
+
+#include "qwen38_spec_verify.h"
 
 #define QWEN38_BENCH_MAX_CASES 16
 
@@ -202,8 +205,8 @@ static int run_benchmark(transformer_model *m, bpe_vocab *v, int32_t *tok,
 
 static void usage(const char *p) {
     fprintf(stderr, "usage: %s MODEL --prompt TEXT [--max-gen N] [--max-seq N] "
-                    "[--threads N] [--spec-k 0..4] [--mmap] "
-                    "[--fast-swiglu] [--nvfp4-fast] [--nvfp4-packed] [--q8-mode auto|reference|cmg4|cmg4-a15|block64|block64-ffn|block64-exact|row] "
+                    "[--threads N] [--spec-k 0..4] [--spec-verify] [--batch-probe 2..4] [--mmap] "
+                    "[--fast-swiglu] [--nvfp4-fast] [--nvfp4-packed] [--nvfp4-exact-tiled] [--q6-exact-head] [--q8-mode auto|reference|cmg4|cmg4-a15|block64|block64-ffn|block64-exact|row] "
                     "[--bench --bench-prompt N[,N...] --bench-gen N[,N...] "
                     "--bench-runs N --bench-warmup N --bench-csv]\n", p);
 }
@@ -215,6 +218,8 @@ int main(int argc, char **argv) {
     const char *bench_gen_arg = "128";
     int max_gen = 16, max_seq = 512, threads = 48, spec_k = 0, mmap_weights = 0;
     int fast_swiglu = 0, nvfp4_fast = 0, nvfp4_packed = 0;
+    int nvfp4_exact_tiled = 0, q6_exact_head = 0, batch_probe = 0;
+    int spec_verify = 0;
     int bench = 0, bench_runs = 3, bench_warmup = 1, bench_csv = 0;
     int bench_prompt_sizes[QWEN38_BENCH_MAX_CASES];
     int bench_gen_sizes[QWEN38_BENCH_MAX_CASES];
@@ -225,6 +230,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--max-seq") && ++i < argc) max_seq = atoi(argv[i]);
         else if (!strcmp(argv[i], "--threads") && ++i < argc) threads = atoi(argv[i]);
         else if (!strcmp(argv[i], "--spec-k") && ++i < argc) spec_k = atoi(argv[i]);
+        else if (!strcmp(argv[i], "--spec-verify")) spec_verify = 1;
+        else if (!strcmp(argv[i], "--batch-probe") && ++i < argc) batch_probe = atoi(argv[i]);
         else if (!strcmp(argv[i], "--q8-mode") && ++i < argc) q8_mode = argv[i];
         else if (!strcmp(argv[i], "--mmap")) mmap_weights = 1;
         else if (!strcmp(argv[i], "--bench")) bench = 1;
@@ -235,12 +242,17 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--fast-swiglu")) fast_swiglu = 1;
         else if (!strcmp(argv[i], "--nvfp4-fast")) nvfp4_fast = 1;
         else if (!strcmp(argv[i], "--nvfp4-packed")) nvfp4_packed = 1;
+        else if (!strcmp(argv[i], "--nvfp4-exact-tiled")) nvfp4_exact_tiled = 1;
+        else if (!strcmp(argv[i], "--q6-exact-head")) q6_exact_head = 1;
         else if (!strcmp(argv[i], "--bench-csv")) bench_csv = 1;
         else if (argv[i][0] != '-' && !path) path = argv[i];
         else { usage(argv[0]); return 2; }
     }
     if (!path || spec_k < 0 || spec_k > 4 || max_seq < 2 || max_gen < 0 ||
-        threads < 1 || bench_runs < 1 || bench_warmup < 0) {
+        threads < 1 || bench_runs < 1 || bench_warmup < 0 ||
+        (batch_probe && (batch_probe < 2 || batch_probe > 4 || spec_k || bench)) ||
+        (spec_verify && (spec_k < 2 || spec_k > 4 || bench || batch_probe ||
+                         nvfp4_fast || nvfp4_packed || fast_swiglu))) {
         usage(argv[0]); return 2;
     }
 
@@ -266,6 +278,10 @@ int main(int argc, char **argv) {
     }
     if ((!strcmp(q8_mode, "cmg4") || !strcmp(q8_mode, "cmg4-a15")) && threads != 48) {
         fprintf(stderr, "qwen38: --q8-mode cmg4 requires --threads 48\n");
+        return 2;
+    }
+    if (nvfp4_packed && nvfp4_exact_tiled) {
+        fprintf(stderr, "qwen38: choose one NVFP4 layout\n");
         return 2;
     }
     if ((!strcmp(q8_mode, "cmg4") || !strcmp(q8_mode, "cmg4-a15"))) {
@@ -320,9 +336,19 @@ int main(int argc, char **argv) {
         fprintf(stderr, "qwen38: NVFP4 packed first touch %.3fGB (%d tensors)\n",
                 pack_bytes / 1e9, pack_count);
     }
+    if (nvfp4_exact_tiled) {
+        if (mmap_weights || q8_model || m->use_moe || threads != 48 ||
+            !getenv("NUMA_DISTRIBUTE") || g->fd < 0 ||
+            q38_nvfp4_plan_tiled(g, &pack_layout, &pack_count) ||
+            pack_count == 0) {
+            fprintf(stderr, "qwen38: --nvfp4-exact-tiled requires dense, "
+                            "anonymous NVFP4 with 48 NUMA workers\n");
+            return 1;
+        }
+    }
 #else
-    if (nvfp4_packed) {
-        fprintf(stderr, "qwen38: --nvfp4-packed requires A64FX SVE\n");
+    if (nvfp4_packed || nvfp4_exact_tiled) {
+        fprintf(stderr, "qwen38: NVFP4 tiled layouts require A64FX SVE\n");
         return 1;
     }
 #endif
@@ -355,6 +381,28 @@ int main(int argc, char **argv) {
         fprintf(stderr, "qwen38: NVFP4 packed %d tensors %.3fGB in %.3fs\n",
                 pack_count, pack_bytes / 1e9, now_sec() - pack_t0);
         free(pack_layout);
+    }
+    if (nvfp4_exact_tiled) {
+        double pack_t0 = now_sec();
+        if (!m->numa.enabled ||
+            q38_nvfp4_tile_model(g, m, pack_layout, (size_t)g->n_tensors)) {
+            fprintf(stderr, "qwen38: NVFP4 exact in-place tile failed\n");
+            return 1;
+        }
+        fprintf(stderr, "qwen38: NVFP4 exact tiled %d tensors in %.3fs\n",
+                pack_count, now_sec() - pack_t0);
+        free(pack_layout);
+    }
+    if (q6_exact_head && (q8_model || mmap_weights || !m->numa.enabled ||
+                          q38_q6_pack_head(m))) {
+        fprintf(stderr, "qwen38: --q6-exact-head requires anonymous Q6_K "
+                        "output weights and four-CMG residency\n");
+        return 1;
+    }
+#else
+    if (q6_exact_head) {
+        fprintf(stderr, "qwen38: --q6-exact-head requires A64FX SVE\n");
+        return 1;
     }
 #endif
     if (!getenv("TF_NO_PANEL")) transformer_build_panels(m);
@@ -394,7 +442,7 @@ int main(int argc, char **argv) {
     }
 
     int nt = bpe_tokenize(v, prompt, -1, tok, max_seq);
-    if (nt <= 0 || nt + max_gen + spec_k >= max_seq) {
+    if (nt <= 0 || nt + max_gen + spec_k + batch_probe >= max_seq) {
         fprintf(stderr, "qwen38: invalid/too-long prompt (%d tokens; reserve %d drafts)\n",
                 nt, spec_k);
         return 1;
@@ -409,11 +457,19 @@ int main(int argc, char **argv) {
     tf_decode_ffn_gateup_ms = tf_decode_ffn_down_ms = tf_decode_lm_head_ms = 0.0;
     tf_nvfp4_grouped_rows = tf_nvfp4_scalar_rows = 0;
     double prefill_t0 = now_sec();
+    if (batch_probe) fprintf(stderr, "qwen38: batch_probe prompt begin nt=%d\n", nt);
     float *logits = NULL;
     int pos = 0;
     for (; pos < nt; pos++) {
         logits = transformer_forward_logits(m, tok[pos], pos);
-        if (spec_k) transformer_nextn_logits(m, tok[pos], transformer_get_hidden(m), pos);
+        if (spec_verify && pos + 1 < nt) {
+            /* Teacher-force the known next prompt token; the final trunk
+             * hidden must remain intact for the first speculative draft. */
+            transformer_nextn_logits(m, tok[pos + 1],
+                                      transformer_get_hidden(m), pos);
+        } else if (spec_k && !spec_verify) {
+            transformer_nextn_logits(m, tok[pos], transformer_get_hidden(m), pos);
+        }
     }
     double prefill_dt = now_sec() - prefill_t0;
     double pf_matvec = tf_decode_matvec_ms, pf_qkv = tf_decode_attn_qkv_ms;
@@ -423,6 +479,77 @@ int main(int argc, char **argv) {
     double pf_ffn_gateup = tf_decode_ffn_gateup_ms, pf_ffn_down = tf_decode_ffn_down_ms;
     double pf_lm_head = tf_decode_lm_head_ms;
     int32_t cur = transformer_last_argmax(m);
+    if (spec_verify) {
+        if (m->kv_cache_type != 0) {
+            fprintf(stderr, "qwen38: --spec-verify requires TF_KV_DTYPE=f32\n");
+            return 2;
+        }
+        int dump = getenv("TF_DUMP_TOKENS") && atoi(getenv("TF_DUMP_TOKENS")) != 0;
+        int rc = q38_spec_verify(m, v, nt, cur, logits[cur], max_gen, spec_k, dump);
+        free(tok); transformer_free(m); bpe_vocab_free(v); gguf_close(g);
+        return rc;
+    }
+    if (batch_probe) {
+        if (m->kv_cache_type != 0) {
+            fprintf(stderr, "qwen38: --batch-probe requires TF_KV_DTYPE=f32 (batch attention reads F32 KV)\n");
+            return 2;
+        }
+        fprintf(stderr, "qwen38: batch_probe serial begin\n");
+        const int vocab = m->n_vocab;
+        int32_t inputs[4], expected[4];
+        float *serial = malloc((size_t)batch_probe * vocab * sizeof(float));
+        float *batch = malloc((size_t)batch_probe * vocab * sizeof(float));
+        if (!serial || !batch) {
+            fprintf(stderr, "qwen38: batch probe allocation failed\n");
+            return 1;
+        }
+        for (int t = 0; t < batch_probe; t++) {
+            inputs[t] = cur;
+            logits = transformer_forward_logits(m, cur, nt + t);
+            memcpy(serial + (size_t)t * vocab, logits, (size_t)vocab * sizeof(float));
+            expected[t] = transformer_last_argmax(m);
+            cur = expected[t];
+        }
+        fprintf(stderr, "qwen38: batch_probe serial complete; reset\n");
+        transformer_reset_runtime_state(m);
+        for (int t = 0; t < nt; t++)
+            transformer_forward_logits(m, tok[t], t);
+        fprintf(stderr, "qwen38: batch_probe prompt replay complete; batch begin\n");
+        tf_batch_all_logits = batch;
+        transformer_prefill_profile_reset();
+        double bt = now_sec();
+        float *ok = transformer_prefill_gemm(m, inputs, batch_probe, nt);
+        double seconds = now_sec() - bt;
+        transformer_prefill_profile profile;
+        transformer_prefill_profile_get(&profile);
+        fprintf(stderr, "qwen38: batch_probe batch returned %p\n", (void *)ok);
+        tf_batch_all_logits = NULL;
+        int match = 0;
+        float max_diff = 0.0f;
+        for (int t = 0; t < batch_probe && ok; t++) {
+            const float *a = serial + (size_t)t * vocab;
+            const float *b = batch + (size_t)t * vocab;
+            int got = argmax(b, vocab);
+            if (got == expected[t]) match++;
+            for (int j = 0; j < vocab; j++) {
+                float d = fabsf(a[j] - b[j]);
+                if (d > max_diff) max_diff = d;
+            }
+            fprintf(stderr, "qwen38: batch_probe t=%d input=%d serial=%d batch=%d selected_delta=%a\n",
+                    t, inputs[t], expected[t], got, b[expected[t]] - a[expected[t]]);
+        }
+        fprintf(stderr, "qwen38: batch_probe match=%d/%d max_logit_delta=%a batch=%.3fs %.3f tok/s\n",
+                match, batch_probe, max_diff, seconds,
+                seconds > 0.0 ? batch_probe / seconds : 0.0);
+        fprintf(stderr, "qwen38: batch_profile norm=%.1f proj=%.1f ssm_prep=%.1f ssm_scan=%.1f attn_prep=%.1f attn=%.1f out=%.1f ffn_proj=%.1f act=%.1f down=%.1f ms\n",
+                profile.norm_ms, profile.proj_ms, profile.ssm_prepare_ms,
+                profile.ssm_scan_ms, profile.attn_prepare_ms, profile.attn_kernel_ms,
+                profile.out_proj_ms, profile.ffn_proj_ms, profile.ffn_act_ms,
+                profile.ffn_down_ms);
+        free(serial); free(batch); free(tok);
+        transformer_free(m); bpe_vocab_free(v); gguf_close(g);
+        return ok && match == batch_probe ? 0 : 1;
+    }
     int dump_tokens = getenv("TF_DUMP_TOKENS") && atoi(getenv("TF_DUMP_TOKENS")) != 0;
     tf_decode_matvec_ms = 0.0;
     tf_decode_matvec_bytes = 0.0;
