@@ -566,3 +566,22 @@ difference was 0.00910. The compiler emitted SVE spills in the eight-row
 variant. A four-row variant reduced register pressure but reread the compact
 weights and still took about 1.13–1.34 ms. Neither version is suitable for
 the verifier; integer dot product does not help this layout as implemented.
+
+The full 240,000-row, 5120-column three-candidate Q6_K head was also
+benchmarked after precomputing each signed-byte weight times its FP32 scale
+as a resident FP32 value. All 720,000 synthetic outputs matched the existing
+predecoded Q6 head bit for bit, but the enlarged 4.915 GB head stream took
+about **11.1 ms**, versus **8.8 ms** for the 1.536 GB signed-byte/scaled
+stream. Removing the conversion and scale multiplication does not repay the
+extra HBM traffic. Keep the compact exact Q6 head.
+
+A separate packed W4A8 SVE `SDOT` probe shared each FP4 nibble decode across
+three quantized candidate activations. On a 131,072-row, 5120-column
+synthetic matrix it streamed the 0.503 GB predecoded-scale packed layout in
+about **2.8–3.0 ms**, or **169–180 GB/s physical**. The prior one-candidate
+packed probe reached 517 GB/s, so the extra candidate arithmetic almost
+triples time instead of being amortized by shared decoding. Extrapolating
+the measured N=3 rate to the roughly 19.3 GB active packed trunk gives over
+0.10 s per target batch before attention, draft, or head work. This path
+cannot provide a 40 tok/s verifier at its current arithmetic throughput;
+no approximate target kernel was integrated.
