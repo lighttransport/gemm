@@ -340,6 +340,32 @@ cosine 0.99789171. Keeping CUDA text execution but swapping CUDA vision
 features for ROCm vision features yields 0.93445386, locating most of the
 remaining multimodal difference in the vision stack.
 
+For a pinned same-input vision oracle, `pytorch_rocm_vision_reference.py`
+loads only the Qwen3-VL visual weights. It either replays saved
+`pixel_values.npy`/`image_grid_thw.npy` or uses the Qwen Image 2.1 pipeline's
+resize, white alpha composite, prompt template, and processor to prepare an
+image. On the house fixture, generate the PyTorch ROCm stages with:
+
+```
+ref/pixal3d/run.sh rocm rdna4/qimg21/pytorch_rocm_vision_reference.py \
+  --model /mnt/nvme01/models/qimg-21 \
+  --image ref/pixal3d/upstream/assets/images/1_img.png \
+  --out-dir tmp/qimg21-rocm-vision-house-oracle-20260924 \
+  --diffusers-site-packages tmp/qimg21-ref-venv/lib/python3.12/site-packages
+```
+
+The 4096×1536 normalized patch tensor is byte-identical to the native
+`--image` preprocessing of the same resized house (6,291,456 values). Replaying
+those exact patches through native HIP scalar attention yields cosine
+0.999996367 after block 0, 0.999877620 after block 8, 0.996742602 after block
+26, and 0.996581803 after the merger against PyTorch ROCm. First-block norm1
+and QKV cosines are 0.999999999 and 0.999999999; attention projection is
+0.999998301. The PyTorch CUDA versus PyTorch ROCm reference floor on the same
+patch tensor is 0.999994394 after block 0 and 0.996302817 after the merger.
+The pinned reference implementations therefore differ well beyond the
+0.99996 prediction gate at the vision merger. This is stage evidence, not an
+editing prediction pass. The unchanged end-to-end editing gate remains open.
+
 For the same 1024x1024 condition and target dimensions, a two-step standalone
 edit took 62.84 seconds end-to-end on the RX 9070 XT with the corrected
 vision encoder, versus 72.87 seconds on
