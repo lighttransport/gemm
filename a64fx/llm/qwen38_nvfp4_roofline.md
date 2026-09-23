@@ -102,6 +102,26 @@ twice the source storage and still took about 0.64 ms for the FFN gate shape.
 A packed FP32-scale variant took about 0.68 ms. Neither is a useful resident
 format for this 32 GB node. The original compact exact path remains in use.
 
+Further A64FX checks rule out simple placement and dispatch fixes. Copying
+the 50 MB resident FFN gate matrix into a freshly first-touched allocation
+gave 73.8 GB/s versus 73.5 GB/s for the original matrix. Calling the same
+SVE loop directly gave 71.8 GB/s versus 72.2 GB/s through the normal GEMM
+entry point. A separately compiled, fixed-N=3 version matched every one of
+52,224 FFN output floats bitwise but reached only 71.3 GB/s. Explicit
+lookahead prefetch distances of 2–64 compact blocks did not beat the
+unprefetched 74.9 GB/s isolated baseline. LLVM 21 and `-mcpu=a64fx` gave no
+material improvement over the Fujitsu compiler on the exact isolated shape.
+
+On 500 passes of the corrected isolated FFN kernel, `perf stat` counted
+58.1 billion instructions, 36.3 billion retired SVE instructions, 8.36
+billion FP FMA instructions, and 101 million L2 refills; 42.3% of cycles
+were backend-stalled. That is roughly 116 million instructions and 202,000
+L2 refills per 50 MB matrix pass. The L2 refills are consistent with reading
+the whole source matrix each pass, while the low throughput and instruction
+count point to decode/accumulation work as the limiting factor. Reaching the
+40 tok/s end-to-end target will require a substantially different exact
+projection kernel, not a prefetch or NUMA adjustment.
+
 Representative native runs (48 cores, one A64FX node, staged GGUF under
 `/local`, `OMP_PROC_BIND=close`, four-CMG anonymous residency):
 
