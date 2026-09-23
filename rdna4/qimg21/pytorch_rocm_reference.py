@@ -32,9 +32,11 @@ def main():
     ap.add_argument("--out-dir", required=True, type=Path)
     ap.add_argument("--diffusers-site-packages", type=Path,
                     help="use pinned Diffusers from another local environment; ROCm Torch stays loaded")
-    ap.add_argument("--sdpa-backend", choices=("default", "efficient"), default="efficient")
+    ap.add_argument("--sdpa-backend", choices=("default", "efficient", "math"), default="efficient")
     ap.add_argument("--capture-block0", action="store_true",
                     help="dump one step's embedding and block-0 stages for native comparison")
+    ap.add_argument("--capture-block", type=int,
+                    help="dump one step's embedding and stages for block 0..31")
     ap.add_argument("--capture-all-blocks", action="store_true",
                     help="dump one step's output from each transformer block")
     ap.add_argument("--capture-step", type=int, default=0,
@@ -42,6 +44,11 @@ def main():
     ap.add_argument("--free-run", action="store_true",
                     help="feed ROCm-updated target latents into later steps and save trajectory checkpoints")
     args = ap.parse_args()
+    if args.capture_block0 and args.capture_block is not None:
+        ap.error("choose either --capture-block0 or --capture-block")
+    capture_block = 0 if args.capture_block0 else args.capture_block
+    if capture_block is not None and not 0 <= capture_block < 32:
+        ap.error("--capture-block must be in [0, 32)")
     if not torch.cuda.is_available():
         ap.error("PyTorch ROCm GPU access is required")
     if args.diffusers_site_packages:
@@ -61,7 +68,7 @@ def main():
     capture_run = json.loads((capture / "run.json").read_text())
     if args.free_run and capture_run.get("use_true_cfg", False):
         ap.error("--free-run currently requires a capture without true CFG")
-    if (args.capture_block0 or args.capture_all_blocks) and not 0 <= args.capture_step < steps:
+    if (capture_block is not None or args.capture_all_blocks) and not 0 <= args.capture_step < steps:
         ap.error(f"--capture-step must be in [0, {steps})")
     layout = json.loads((capture / "positive_layout.json").read_text())
     shapes = [[tuple(int(x) for x in shape) for shape in image]
@@ -107,8 +114,8 @@ def main():
         for index, block in enumerate(model.transformer_blocks):
             block.register_forward_hook(
                 lambda _module, _inputs, output, index=index: save_block(index, output))
-    if args.capture_block0:
-        stages = out / "block0"
+    if capture_block is not None:
+        stages = out / ("block0" if args.capture_block0 else f"block{capture_block:02d}")
         stages.mkdir()
 
         def save(name, value):
@@ -126,23 +133,24 @@ def main():
         model.time_text_embed.register_forward_hook(output_hook("time2"))
         model.modulation[0].register_forward_hook(output_hook("time2_silu"))
         model.modulation.register_forward_hook(output_hook("mod"))
-        block0 = model.transformer_blocks[0]
-        block0.register_forward_pre_hook(
+        block = model.transformer_blocks[capture_block]
+        block.register_forward_pre_hook(
             lambda _module, inputs, kwargs: save(
-                "hidden0", inputs[0] if inputs else kwargs["hidden_states"]),
+                "hidden0" if args.capture_block0 else f"hidden{capture_block:02d}",
+                inputs[0] if inputs else kwargs["hidden_states"]),
             with_kwargs=True)
-        block0.register_forward_hook(output_hook("block_00"))
-        block0.attn.to_q.register_forward_hook(output_hook("q"))
-        block0.attn.to_k.register_forward_hook(output_hook("k"))
-        block0.attn.to_v.register_forward_hook(output_hook("v"))
-        block0.attn.to_out[0].register_forward_pre_hook(input_hook("attn_raw"))
-        block0.attn.to_out[0].register_forward_hook(output_hook("attn_out"))
-        block0.img_norm2.register_forward_pre_hook(input_hook("post_attn_hidden"))
-        block0.img_mlp.gate_layer.register_forward_hook(output_hook("mlp_gate"))
-        block0.img_mlp.proj.register_forward_hook(output_hook("mlp_proj"))
-        block0.img_mlp.out.register_forward_pre_hook(input_hook("mlp_act"))
-        block0.img_mlp.out.register_forward_hook(output_hook("mlp_out"))
-        original_modulate = block0._modulate
+        block.register_forward_hook(output_hook(f"block_{capture_block:02d}"))
+        block.attn.to_q.register_forward_hook(output_hook("q"))
+        block.attn.to_k.register_forward_hook(output_hook("k"))
+        block.attn.to_v.register_forward_hook(output_hook("v"))
+        block.attn.to_out[0].register_forward_pre_hook(input_hook("attn_raw"))
+        block.attn.to_out[0].register_forward_hook(output_hook("attn_out"))
+        block.img_norm2.register_forward_pre_hook(input_hook("post_attn_hidden"))
+        block.img_mlp.gate_layer.register_forward_hook(output_hook("mlp_gate"))
+        block.img_mlp.proj.register_forward_hook(output_hook("mlp_proj"))
+        block.img_mlp.out.register_forward_pre_hook(input_hook("mlp_act"))
+        block.img_mlp.out.register_forward_hook(output_hook("mlp_out"))
+        original_modulate = block._modulate
         modulation_calls = [0]
 
         def capture_modulate(hidden_states, modulation, target_token_mask):
@@ -152,7 +160,7 @@ def main():
             modulation_calls[0] += 1
             return result
 
-        block0._modulate = capture_modulate
+        block._modulate = capture_modulate
     embeds = torch.from_numpy(prompt).to("cuda", dtype=torch.bfloat16)
     img_mask = torch.from_numpy(image_mask).to("cuda")
     enc_mask = torch.from_numpy(key_mask).to("cuda")
@@ -166,12 +174,14 @@ def main():
         scheduler.set_timesteps(sigmas=np.linspace(1.0, 1.0 / steps, steps),
                                 device="cuda", mu=mu)
     from contextlib import nullcontext
-    context = sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION) if args.sdpa_backend == "efficient" else nullcontext()
+    context = (sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION) if args.sdpa_backend == "efficient"
+               else sdpa_kernel(SDPBackend.MATH) if args.sdpa_backend == "math"
+               else nullcontext())
     with torch.inference_mode(), context:
         running_target = None
         for i in range(steps):
             current_step[0] = i
-            if args.capture_block0:
+            if capture_block is not None:
                 modulation_calls[0] = 0
             source = np.load(capture / f"input_{i:03d}.npy", allow_pickle=False)
             timestep = np.load(capture / f"timestep_{i:03d}.npy", allow_pickle=False)

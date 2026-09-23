@@ -219,6 +219,25 @@ block outputs start at cosine 0.999999816 after block 0, first fall below
 0.99996 after block 9, and end at 0.999939892 after block 31. All 32 values
 are saved in `tmp/qimg21-edit-rocm-block-compare-20260923.json`. This is
 gradual accumulated drift; the trace does not identify a single failed block.
+`pytorch_rocm_reference.py --capture-block 9 --capture-step 1 --free-run`
+also captures the full inputs and intermediate stages of block 9. Its hooked
+predictions and trajectory are byte-identical to the unhooked efficient-SDPA
+oracle. Replaying that exact block input and modulation in native HIP gives
+target-row cosine 0.999999999055 at Q, 0.999999181145 at attention, and
+0.999999245333 at the block output. Replaying PyTorch's attention tensor
+raises the block-output cosine to 0.999999988286; its relative L2 falls from
+0.001228870 to 0.000153064. On identical native Q/K/V, PyTorch ROCm math
+SDPA matches native attention at target cosine 0.999999996245, whereas
+efficient SDPA matches at 0.999999229031. The attention backend is therefore
+a major local source of drift, alongside Q/K/V rounding. However, a full
+two-step PyTorch ROCm **math**-SDPA oracle still yields native prediction
+cosines 0.999947298/0.999878340 and trajectory cosines
+0.999930768/0.999932104, all below the unchanged gate. The math oracle is
+a diagnostic, not a replacement for the pinned efficient-SDPA oracle. Its
+capture, replay, attention probe, and regression results are under
+`tmp/qimg21-edit-rocm-block09-*-20260924/`,
+`tmp/qimg21-edit-reference-rocm-math-20260924/`, and
+`tmp/qimg21-edit-rocm-math-regression-20260924/`.
 On identical native Q/K/V, PyTorch ROCm attention and HIP scalar attention
 reach target cosine 0.999999625. Replaying exact PyTorch ROCm hidden state and
 modulation into native block 0 barely changes its target output cosine
