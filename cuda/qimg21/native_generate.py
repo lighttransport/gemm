@@ -23,6 +23,9 @@ from pathlib import Path
 
 import numpy as np
 
+# Keep this preflight check aligned with QIMG21_EDIT_FUSED_MIN_TOKENS in the HIP runner.
+EDIT_FUSED_MIN_TOKENS = 1024
+
 
 def _run(command: list[str], *, cwd: Path) -> None:
     print("+", " ".join(str(x) for x in command), file=sys.stderr)
@@ -102,7 +105,10 @@ def main() -> int:
     ap.add_argument("--native-vision-bin", default=None)
     ap.add_argument("--native-vae-bin", default=None)
     ap.add_argument("--native-vae-encode-bin", default=None)
-    ap.add_argument("--native-attention", choices=("math", "reverse64", "wmma", "wmma-fused", "edit-size-select", "mma64", "mma64-flash", "mma64-mixed", "mma64-forward-flash", "mma128-efficient", "cutlass-efficient"), default=None)
+    ap.add_argument("--native-attention", choices=(
+        "math", "reverse64", "wmma", "wmma-fused", "edit-size-select",
+        "mma64", "mma64-flash", "mma64-mixed", "mma64-forward-flash",
+        "mma128-efficient", "cutlass-efficient"), default=None)
     ap.add_argument("--native-normalization", choices=("default", "vector4"), default=None)
     ap.add_argument("--native-rope", choices=("default", "host-table", "host-table-vector4", "host-table-exact"), default=None)
     ap.add_argument("--quantized-transformer", type=Path,
@@ -118,8 +124,16 @@ def main() -> int:
     # installation. CUDA keeps its existing reference VAE default.
     if args.backend == "rocm":
         args.native_vae = True
-    rocm_bf16_edit = (args.backend == "rocm" and bool(args.image) and
-                      not (args.quantized_transformer or args.quantize_on_load))
+    if args.height <= 0 or args.width <= 0 or args.height % 32 or args.width % 32:
+        ap.error("height and width must be positive multiples of 32")
+    h_tokens, w_tokens = args.height // 16, args.width // 16
+    target_tokens = h_tokens * w_tokens
+    rocm_bf16_edit = (
+        args.backend == "rocm"
+        and args.dtype == "bf16"
+        and args.image is not None
+        and not (args.quantized_transformer or args.quantize_on_load)
+    )
     if args.native_attention is None:
         if args.backend == "rocm":
             if rocm_bf16_edit:
@@ -132,10 +146,15 @@ def main() -> int:
         args.native_normalization = "vector4" if rocm_bf16_edit else "default"
     if args.native_rope is None:
         args.native_rope = "host-table-exact" if rocm_bf16_edit else "default"
-    if args.native_attention == "edit-size-select" and (args.backend != "rocm" or not args.image):
+    if (args.native_attention == "edit-size-select" and
+            (args.backend != "rocm" or not args.image)):
         ap.error("edit-size-select attention requires ROCm image editing")
-    if args.native_attention == "wmma-fused" or (args.native_attention == "edit-size-select"
-                                                  and args.height * args.width >= 512 * 512):
+    needs_fused_plugin = (
+        args.native_attention == "wmma-fused"
+        or (args.native_attention == "edit-size-select"
+            and target_tokens >= EDIT_FUSED_MIN_TOKENS)
+    )
+    if needs_fused_plugin:
         if args.backend != "rocm":
             ap.error("wmma-fused attention supports ROCm only")
         if not (Path(__file__).resolve().parents[2] / "rdna4/qimg21/libq21_hip_attention.so").is_file():
@@ -185,8 +204,6 @@ def main() -> int:
         raise SystemExit(f"native {args.backend} executable not found: {native_bin}")
     if args.native_vae and not vae_bin.exists():
         raise SystemExit(f"native {args.backend} VAE executable missing: {vae_bin}")
-    if args.height % 32 or args.width % 32:
-        raise SystemExit("height and width must be divisible by 32")
     if args.steps < 1 or args.steps > 100:
         raise SystemExit("steps must be between 1 and 100")
     if args.negative_prompt is not None and args.true_cfg_scale <= 1.0:
@@ -282,7 +299,6 @@ def main() -> int:
     # allocations even though the child has exited.
     time.sleep(2.0)
 
-    h_tokens, w_tokens = args.height // 16, args.width // 16
     latent_path = work / "latents.npy"
     fixture_command = [
             os.environ.get("QIMG21_PYTHON", sys.executable),

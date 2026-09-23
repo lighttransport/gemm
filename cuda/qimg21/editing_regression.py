@@ -35,7 +35,10 @@ def main():
     ap.add_argument("--work-dir", required=True, type=Path)
     ap.add_argument("--native-binary", type=Path,
                     help="native runner to validate (default: CUDA runner beside this script)")
-    ap.add_argument("--native-attention", choices=("math", "reverse64", "mma64", "mma64-flash", "mma64-mixed", "mma64-forward-flash", "mma128-efficient", "cutlass-efficient", "wmma", "wmma-fused", "edit-size-select"), default="math")
+    ap.add_argument("--native-attention", choices=(
+        "math", "reverse64", "mma64", "mma64-flash", "mma64-mixed",
+        "mma64-forward-flash", "mma128-efficient", "cutlass-efficient",
+        "wmma", "wmma-fused", "edit-size-select"), default="math")
     ap.add_argument("--native-normalization", choices=("default", "vector4"), default="default")
     ap.add_argument("--native-rope", choices=("default", "host-table", "host-table-vector4", "host-table-exact"), default="default")
     ap.add_argument("--native-gemm", choices=("wmma", "scalar"), default="wmma")

@@ -38,6 +38,9 @@
 #include "norm_vector_kernels.h"
 #include "rope_table_kernels.h"
 
+/* Also used by native_generate.py to check the fused plugin before launch. */
+#define QIMG21_EDIT_FUSED_MIN_TOKENS 1024
+
 typedef struct {
     st_context *st[4];
     int n;
@@ -794,10 +797,9 @@ int main(int argc, char **argv) {
             else if (!strcmp(mode, "mma64") || !strcmp(mode, "mma64-flash") ||
                      !strcmp(mode, "mma64-mixed") || !strcmp(mode, "mma64-forward-flash") ||
                      !strcmp(mode, "mma128-efficient") || !strcmp(mode, "cutlass-efficient")) {
-                fprintf(stderr, "native: %s is CUDA-only; use math, reverse64, wmma, or wmma-fused on RDNA4\n", mode);
+                fprintf(stderr, "native: %s is CUDA-only; use math, reverse64, wmma, wmma-fused, or edit-size-select on RDNA4\n", mode);
                 return 2;
             }
-            else if (!strcmp(mode, "cutlass-efficient")) {cutlass_plugin_path="cuda/qimg21/libq21_cutlass_attention.so";qimg21_attention_reverse64=0;}
             else { fprintf(stderr, "native: unsupported attention mode\n"); return 2; }
         }
         else if (!strcmp(argv[i], "--gemm") && i + 1 < argc) {
@@ -904,9 +906,10 @@ int main(int argc, char **argv) {
         npy_free(&pe); npy_free(&neg); npy_free(&la); return 1;
     }
     if (qimg21_edit_size_select) {
-        if (ni >= 1024) hip_fused_plugin_path="rdna4/qimg21/libq21_hip_attention.so";
+        int use_fused = ni >= QIMG21_EDIT_FUSED_MIN_TOKENS;
+        if (use_fused) hip_fused_plugin_path="rdna4/qimg21/libq21_hip_attention.so";
         fprintf(stderr,"native: edit-size-select %d target tokens -> %s attention\n",
-                ni, ni >= 1024 ? "fused WMMA" : "scalar");
+                ni, use_fused ? "fused WMMA" : "scalar");
     }
     if (negative_prompt_path && guidance_scale <= 1.0f) { fprintf(stderr,"native: guidance-scale must be > 1 with negative embeds\n"); npy_free(&pe); npy_free(&neg); npy_free(&la); return 1; }
     npy_f32 condition={0};

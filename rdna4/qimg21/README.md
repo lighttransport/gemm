@@ -116,9 +116,9 @@ Artifacts are under `tmp/qimg21-rdna4-fused-1024-40/`.
 
 The public `native_generate.py --backend rocm` path selects fused WMMA
 attention for text-to-image and `edit-size-select` for BF16 editing, with
-vector4 normalization and exact host RoPE as ROCm editing defaults. Quantized
-editing retains the older scalar, normalization, and RoPE defaults unless
-those options are set explicitly. A standalone 1024x1024/40-step generation
+vector4 normalization and exact host RoPE as ROCm editing defaults. FP16 and
+quantized editing retain the older scalar, normalization, and RoPE defaults
+unless those options are set explicitly. A standalone 1024x1024/40-step generation
 with native text encoding, NumPy seed-42 noise, fused denoising, native VAE
 decode, and PNG output completed in
 265.88 seconds (4m26s), peak host RSS 14,103,212 KiB, on the RX 9070 XT.
