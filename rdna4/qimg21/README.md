@@ -459,6 +459,11 @@ pixel difference 0.785/255, and PSNR 47.09 dB; the final latent cosine is
 0.9999025564. The image similarity is a visual/full-path result and does not
 replace the still-failing two-step prediction gate. The CUDA edit artifacts
 use prefix `tmp/qimg21-cuda-bench-edit-r1-20260924`.
+Repeating the CUDA edit with identical settings took 23:42.76; its condition
+latents/moments, vision features, prompt embedding, all 40 saved steps, final
+latents, native VAE tensor, and PNG are byte-identical to the first CUDA run.
+The monitored process peak was again 3,263,168,512 bytes. The second run
+uses prefix `tmp/qimg21-cuda-bench-edit-r2-20260924`.
 
 On a separate identical-tensor one-step native denoiser probe, using the
 ROCm text embedding and initial noise on both backends, native wall times
