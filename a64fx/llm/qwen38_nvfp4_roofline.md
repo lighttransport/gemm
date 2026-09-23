@@ -529,3 +529,27 @@ matrix to 89.129 MB; steady passes were about **0.54–0.55 ms** against
 repeatable. Higher real scale bytes would additionally require an exact
 fallback. The common-scale property therefore did not yield a useful
 resident target kernel in this representation.
+
+More detailed A64FX PMU events on the same 5000-pass exact N=3 gate run
+measured 266.47 billion aggregate cycles, 83.95 billion execution-unit
+completion waits, 81.80 billion floating-point completion waits, and only
+10.52 billion load completion waits (4.77 billion L1-miss and 2.75 billion
+L2-miss waits). This strengthens the conclusion that packed-weight decoding
+and FP32 execution, rather than HBM load latency alone, dominate this
+kernel. A low/high-nibble split-accumulator trial doubled the accumulator
+vector count from 12 to 24; on the 50.135 MB N=3 gate it regressed from
+0.51–0.52 ms to 0.95–1.00 ms. Its changed FP32 summation order also changed
+27,472 of 52,224 outputs, with maximum absolute difference 0.0117188.
+The split-kernel assembly contains SVE vector spill/reload instructions,
+consistent with register pressure causing the regression. It cannot replace
+the exact target kernel.
+
+A paired-scale table experiment precomputed a 16-lane FP32 vector for each
+of the 65,536 possible adjacent UE4M3 scale-byte pairs. This replaced two
+scalar scale-table loads and one SVE select with one 64-byte vector load.
+With synthetic scale frequencies matching the real model's dominant
+`1`/`2`/`3` bytes, all 52,224 N=3 gate outputs matched bit for bit. Yet
+the 50.135 MB matrix took about 0.63–0.78 ms in steady trials against
+about 0.52 ms for the original kernel. The common pair keys stay cache hot,
+but a full-vector scale load is still more costly than the existing scalar
+loads. Do not add this table to the resident model.
