@@ -304,6 +304,22 @@ replays are under `tmp/qimg21-edit-rocm-fused-blocks-20260924/`,
 `tmp/qimg21-edit-rocm-fused-block-compare-20260924.json`,
 `tmp/qimg21-edit-rocm-block14-*-20260924/`, and
 `tmp/qimg21-edit-rocm-hybrid14-regression-20260924/`.
+At that same exact block-9 input, splitting attention by token region shows
+20 text rows, 4,096 condition rows, and 256 target rows. Fused WMMA reaches
+cosine 0.999999928674 on condition rows and 0.999999943431 on target rows,
+but its scalar text correction reaches only 0.999999043855 against PyTorch
+ROCm efficient SDPA. On identical native Q/K/V, PyTorch's efficient text
+attention reaches 0.999999725062; math SDPA matches the scalar correction.
+A diagnostic rounded *unnormalized* text probabilities to BF16 while keeping
+the denominator and value accumulation in F32. This raised exact-input text
+cosine to 0.999999627847 without changing condition or target attention rows.
+In the full seed-43 edit, it raised the second fused prediction from
+0.999807174 to 0.999884830. But on seed 42 it lowered the first prediction
+to 0.999923658 and trajectories to 0.999901678/0.999903322, all below the
+original gate and corresponding reference floors. Rounding normalized
+probabilities to BF16 was worse locally (text cosine 0.999996901). The
+variant remains isolated under `tmp/qimg21_hip_attention_textbf16.hip` and
+`tmp/qimg21_native_textbf16_diag.c`; the production plugin is unchanged.
 On identical native Q/K/V, PyTorch ROCm attention and HIP scalar attention
 reach target cosine 0.999999625. Replaying exact PyTorch ROCm hidden state and
 modulation into native block 0 barely changes its target output cosine
