@@ -92,6 +92,8 @@ def main() -> int:
     ap.add_argument("--width", type=int, default=256)
     ap.add_argument("--steps", type=int, default=2)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--initial-latents", type=Path,
+                    help="reuse the same finite F32 noise tensor across backends")
     ap.add_argument("--dtype", choices=("bf16", "fp16"), default="bf16")
     ap.add_argument("--work-dir", default="tmp/qimg21-native-generate")
     ap.add_argument("--out", default="tmp/qimg21-native-generate.png")
@@ -283,7 +285,9 @@ def main() -> int:
             "--out-dir",
             str(work),
         ]
-    if args.backend == "cuda":
+    if args.initial_latents:
+        fixture_command.extend(("--latents", str(args.initial_latents.resolve())))
+    elif args.backend == "cuda":
         fixture_command.append("--torch-rng")
     _run(fixture_command, cwd=root)
     native_latents = work / "native_latents.npy"

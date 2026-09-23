@@ -1209,6 +1209,10 @@ config, and activation boundaries are rounded to BF16 to match the PyTorch
 reference numerics. `--torch-rng` makes the fixture use the same CUDA RNG and
 packing as the Diffusers pipeline; omit it only for a standalone NumPy smoke
 input. Add `--verbose` for finite-value stage probes.
+For a matched CUDA/ROCm benchmark, pass the same F32 `[height_tokens *
+width_tokens, 64]` noise file to each `native_generate.py` invocation with
+`--initial-latents PATH`. This bypasses the backend-specific random generator;
+the fixture validates shape and finiteness before copying the tensor.
 
 ## Hybrid native image generation
 
