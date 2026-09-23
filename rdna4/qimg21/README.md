@@ -400,3 +400,39 @@ one-step end-to-end run. These are functional and visual checks, not matched
 through BF16 dequantization and WMMA, but its measured 256x256 one-step latency is 23.12
 seconds versus 5.16 seconds for BF16 weights; it is a compatibility path, not
 yet a performance optimization.
+
+## 1024x1024 repeated RDNA4 revalidation (2026-09-24)
+
+Using model `/mnt/nvme01/models/qimg-21`, prompt `a red apple on a white
+table`, BF16, seed 42, 40 steps, native F32 VAE, and `wmma-fused` attention,
+`native_generate.py --backend rocm` completed three text-to-image runs in
+4:23.70, 4:23.66, and 4:23.98, and two house-image edits in 8:40.74 and
+8:39.67. Repeat runs reused the exact F32 initial-noise file through
+`--initial-latents tmp/qimg21-revalidate-t2i-20260924/latents.npy`. All
+repeated PNGs, final latents, and native VAE tensors are byte-identical within
+each mode; all 40 saved steps are finite. Full-run VRAM sampling observed
+3,360,542,720 bytes at peak for text-to-image and 4,566,437,888 bytes for
+editing, including a 59,912,192-byte device baseline. The valid 1024x1024
+outputs and their memory traces use the prefixes
+`tmp/qimg21-rocm-bench-t2i-r3-20260924` and
+`tmp/qimg21-rocm-bench-edit-r2-20260924`. A synchronized one-step profile on
+the same text-to-image inputs
+measured 4.6422 seconds across the 32 block compute sections, 3.0921 seconds
+for block weight uploads, and 0.0146 seconds for release.
+
+On the RTX 5060 Ti, the same model, prompt, BF16 precision, exact initial
+noise, 1024x1024 resolution, 40 steps, and native F32 VAE completed in
+17:43.98 with `cutlass-efficient` attention. The monitor measured
+3,263,168,512 bytes peak for this invocation's CUDA process group; another
+GPU process held about 7.6 GiB throughout, so the wall-time comparison is
+contention affected. Native text embeddings differ across backends (cosine
+0.999032835), despite the identical prompt and noise; this is a matched-input
+throughput run, not an output-parity result. The CUDA PNG and memory trace are
+under `tmp/qimg21-cuda-bench-t2i-r2-20260924*`.
+
+The unchanged two-step same-GPU editing gate still fails. `reverse64`
+attention gave prediction cosines 0.999932210/0.999879014, and fused WMMA
+gave 0.999939325/0.999864240. Plain WMMA gave the same
+0.999974046/0.999876137 as scalar `math` on this fixture: both trajectory
+checkpoints pass, but the second prediction does not. These diagnostics are
+under `tmp/qimg21-edit-rocm-{reverse64,wmma-fused,wmma}-20260924/`.
