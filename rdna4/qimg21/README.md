@@ -430,6 +430,25 @@ contention affected. Native text embeddings differ across backends (cosine
 throughput run, not an output-parity result. The CUDA PNG and memory trace are
 under `tmp/qimg21-cuda-bench-t2i-r2-20260924*`.
 
+The paired house edit on CUDA used the same source PNG (including a
+byte-identical native resized image), exact initial noise, model, prompt,
+BF16 precision, 1024x1024 target, 40 steps, and native F32 VAE. It completed
+in 24:24.27 with 40 finite steps, finite condition/final latents and decoder
+tensor, a valid PNG, and 3,263,168,512 bytes peak CUDA process-group memory.
+Native CUDA and ROCm output PNGs have pixel cosine 0.9999897319, mean absolute
+pixel difference 0.785/255, and PSNR 47.09 dB; the final latent cosine is
+0.9999025564. The image similarity is a visual/full-path result and does not
+replace the still-failing two-step prediction gate. The CUDA edit artifacts
+use prefix `tmp/qimg21-cuda-bench-edit-r1-20260924`.
+
+On a separate identical-tensor one-step native denoiser probe, using the
+ROCm text embedding and initial noise on both backends, native wall times
+were 9.45 seconds (ROCm WMMA fused) and 26.89 seconds (CUDA CUTLASS
+efficient); resulting latent cosine was 0.999981750. These invocation times
+include weight loading and launch setup. The ROCm block compute subtotal
+above is a narrower kernel section; CUDA was still contended by the other
+GPU process.
+
 The unchanged two-step same-GPU editing gate still fails. `reverse64`
 attention gave prediction cosines 0.999932210/0.999879014, and fused WMMA
 gave 0.999939325/0.999864240. Plain WMMA gave the same
