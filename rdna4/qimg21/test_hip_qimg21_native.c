@@ -752,6 +752,7 @@ int main(int argc, char **argv) {
     const char *negative_editing_layout_path = NULL;
     const char *cutlass_plugin_path = NULL;
     const char *hip_fused_plugin_path = NULL;
+    int qimg21_edit_size_select = 0;
     const char *out_path = "native_latents.npy", *dump_dir = NULL, *pred_dir = NULL;
     int ih = 16, iw = 16, steps = 1, verbose = 1;
     float guidance_scale = 1.0f;
@@ -783,9 +784,12 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--attention") && i + 1 < argc) {
             const char *mode = argv[++i];
             qimg21_attention_mma64=0;
+            qimg21_edit_size_select=0;
+            hip_fused_plugin_path=NULL;
             if (!strcmp(mode, "reverse64")) qimg21_attention_reverse64 = 1;
             else if (!strcmp(mode, "wmma")) { qimg21_use_wmma = 1; qimg21_attention_reverse64 = 0; }
             else if (!strcmp(mode, "wmma-fused")) { hip_fused_plugin_path="rdna4/qimg21/libq21_hip_attention.so"; qimg21_attention_reverse64=0; }
+            else if (!strcmp(mode, "edit-size-select")) { qimg21_edit_size_select=1; qimg21_attention_reverse64=0; }
             else if (!strcmp(mode, "math")) qimg21_attention_reverse64 = 0;
             else if (!strcmp(mode, "mma64") || !strcmp(mode, "mma64-flash") ||
                      !strcmp(mode, "mma64-mixed") || !strcmp(mode, "mma64-forward-flash") ||
@@ -836,6 +840,10 @@ int main(int argc, char **argv) {
         (editing_layout_path && (!!negative_prompt_path != !!negative_editing_layout_path)) ||
         (negative_editing_layout_path && !editing_layout_path)) {
         fprintf(stderr,"native: editing requires layout plus condition latents; editing CFG also requires a negative layout and embeds\n");
+        return 2;
+    }
+    if (qimg21_edit_size_select && !editing_layout_path) {
+        fprintf(stderr,"native: edit-size-select requires an editing layout\n");
         return 2;
     }
     if (qimg21_quantize_on_load && qimg21_quantized_transformer) {
@@ -894,6 +902,11 @@ int main(int argc, char **argv) {
        (negative_prompt_path && (nnt<=0 || neg.shape[neg.ndim-1]!=4096))){
         fprintf(stderr,"native: expected embeds [T,4096], optional negative embeds [U,4096], and latents [N,64]\n");
         npy_free(&pe); npy_free(&neg); npy_free(&la); return 1;
+    }
+    if (qimg21_edit_size_select) {
+        if (ni >= 1024) hip_fused_plugin_path="rdna4/qimg21/libq21_hip_attention.so";
+        fprintf(stderr,"native: edit-size-select %d target tokens -> %s attention\n",
+                ni, ni >= 1024 ? "fused WMMA" : "scalar");
     }
     if (negative_prompt_path && guidance_scale <= 1.0f) { fprintf(stderr,"native: guidance-scale must be > 1 with negative embeds\n"); npy_free(&pe); npy_free(&neg); npy_free(&la); return 1; }
     npy_f32 condition={0};

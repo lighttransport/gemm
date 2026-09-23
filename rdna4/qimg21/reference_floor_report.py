@@ -28,6 +28,8 @@ def main():
     parser.add_argument("--rocm-reference", required=True, type=Path)
     parser.add_argument("--native-regression", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path)
+    parser.add_argument("--require-reference-floor", action="store_true",
+                        help="exit nonzero when the approved separate tier fails")
     args = parser.parse_args()
     cuda, cuda_free, rocm, native = (path.resolve() for path in
                                      (args.cuda_reference, args.cuda_free_run,
@@ -101,7 +103,8 @@ def main():
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report, indent=2))
+    return 0 if not args.require_reference_floor or report["reference_floor_tier_pass"] else 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

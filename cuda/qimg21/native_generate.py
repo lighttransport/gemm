@@ -102,9 +102,9 @@ def main() -> int:
     ap.add_argument("--native-vision-bin", default=None)
     ap.add_argument("--native-vae-bin", default=None)
     ap.add_argument("--native-vae-encode-bin", default=None)
-    ap.add_argument("--native-attention", choices=("math", "reverse64", "wmma", "wmma-fused", "mma64", "mma64-flash", "mma64-mixed", "mma64-forward-flash", "mma128-efficient", "cutlass-efficient"), default=None)
-    ap.add_argument("--native-normalization", choices=("default", "vector4"), default="default")
-    ap.add_argument("--native-rope", choices=("default", "host-table", "host-table-vector4", "host-table-exact"), default="default")
+    ap.add_argument("--native-attention", choices=("math", "reverse64", "wmma", "wmma-fused", "edit-size-select", "mma64", "mma64-flash", "mma64-mixed", "mma64-forward-flash", "mma128-efficient", "cutlass-efficient"), default=None)
+    ap.add_argument("--native-normalization", choices=("default", "vector4"), default=None)
+    ap.add_argument("--native-rope", choices=("default", "host-table", "host-table-vector4", "host-table-exact"), default=None)
     ap.add_argument("--quantized-transformer", type=Path,
                     help="Optional experimental row-INT8 transformer package")
     ap.add_argument("--quantize-on-load", choices=("int8-row",))
@@ -118,9 +118,24 @@ def main() -> int:
     # installation. CUDA keeps its existing reference VAE default.
     if args.backend == "rocm":
         args.native_vae = True
+    rocm_bf16_edit = (args.backend == "rocm" and bool(args.image) and
+                      not (args.quantized_transformer or args.quantize_on_load))
     if args.native_attention is None:
-        args.native_attention = "wmma-fused" if args.backend == "rocm" and not args.image else "math"
-    if args.native_attention == "wmma-fused":
+        if args.backend == "rocm":
+            if rocm_bf16_edit:
+                args.native_attention = "edit-size-select"
+            else:
+                args.native_attention = "math" if args.image else "wmma-fused"
+        else:
+            args.native_attention = "math"
+    if args.native_normalization is None:
+        args.native_normalization = "vector4" if rocm_bf16_edit else "default"
+    if args.native_rope is None:
+        args.native_rope = "host-table-exact" if rocm_bf16_edit else "default"
+    if args.native_attention == "edit-size-select" and (args.backend != "rocm" or not args.image):
+        ap.error("edit-size-select attention requires ROCm image editing")
+    if args.native_attention == "wmma-fused" or (args.native_attention == "edit-size-select"
+                                                  and args.height * args.width >= 512 * 512):
         if args.backend != "rocm":
             ap.error("wmma-fused attention supports ROCm only")
         if not (Path(__file__).resolve().parents[2] / "rdna4/qimg21/libq21_hip_attention.so").is_file():

@@ -31,12 +31,19 @@ The RDNA4 runner uses WMMA GEMMs by default when the GPU supports them.
 `--attention wmma-fused` adds the shared Pixal3D/TRELLIS gfx12 WMMA attention
 kernel for image queries and a separate causal text-prefix correction. Editing
 is supported experimentally by processing image groups in reverse order and
-correcting interleaved causal text rows; the editing default remains scalar.
+correcting interleaved causal text rows. The native generator's BF16 ROCm editing
+default is `edit-size-select`: scalar attention below 1,024 target tokens and
+fused WMMA from 1,024 target tokens. The lower-level runner retains its
+explicit `math` default.
 `--attention wmma` and `--attention math` use WMMA GEMMs with scalar attention.
+The editing selection is explicit in the runner and leaves the text-to-image
+attention mode unchanged. It is an empirical policy over the tested 256x256
+and 512x512 edit sizes; the strict 0.99996 gate remains separately reported.
 The legacy `mma64*`, `mma128-efficient`, and `cutlass-efficient` attention
 names are rejected on RDNA4 because they select CUDA-specific kernel source;
-use `math`, `reverse64`, `wmma`, or `wmma-fused` instead. The text and vision
-helpers likewise reject their CUDA-only `cutlass`/`flash` modes.
+use `math`, `reverse64`, `wmma`, `wmma-fused`, or `edit-size-select` for editing
+instead. The text and vision helpers likewise reject their CUDA-only
+`cutlass`/`flash` modes.
 The runner covers the 32-layer
 denoiser ABI, CFG inputs, editing layout inputs, stage dumps, and FlowMatch
 latent updates. Matching native text, vision, VAE decoder, and VAE encoder
@@ -107,17 +114,20 @@ This is faster than the repository's 5060 Ti W8A8 transformer measurement of
 8m12s, though the AMD run uses BF16 weights and a different attention kernel.
 Artifacts are under `tmp/qimg21-rdna4-fused-1024-40/`.
 
-The public `native_generate.py --backend rocm` path now selects fused WMMA
-attention for text-to-image and scalar mask-aware attention for editing. A
-standalone 1024x1024/40-step generation with native text encoding, NumPy
-seed-42 noise, fused denoising, native VAE decode, and PNG output completed in
+The public `native_generate.py --backend rocm` path selects fused WMMA
+attention for text-to-image and `edit-size-select` for BF16 editing, with
+vector4 normalization and exact host RoPE as ROCm editing defaults. Quantized
+editing retains the older scalar, normalization, and RoPE defaults unless
+those options are set explicitly. A standalone 1024x1024/40-step generation
+with native text encoding, NumPy seed-42 noise, fused denoising, native VAE
+decode, and PNG output completed in
 265.88 seconds (4m26s), peak host RSS 14,103,212 KiB, on the RX 9070 XT.
 The resulting image is a coherent red apple on a white table; it is not
 pixel-comparable to CUDA seed 42 because the initial-noise RNG differs.
 Artifacts are under `tmp/qimg21-rdna4-fused-e2e-1024-40/`.
 
-For editing, pass `--native-attention wmma-fused` explicitly to the standalone
-generator. On a two-step 256x256 target with a 1024-condition image, this took
+The standalone generator also accepts `--native-attention wmma-fused`
+explicitly. On a two-step 256x256 target with a 1024-condition image, this took
 16.89 seconds versus 30.47 seconds for scalar ROCm attention. Final latent
 cosine versus a saved CUDA native run was 0.99992565 (scalar ROCm: 0.99990237),
 below the strict 0.99996 gate. A 40-step 256x256 fused edit produced a visually
@@ -223,7 +233,7 @@ CUDA/ROCm trajectory floors by about 0.0000468/0.0000466.
 A user-approved, separately named cross-platform reference-floor tier requires every
 native-versus-PyTorch-ROCm prediction to meet or exceed pinned CUDA-versus-
 ROCm PyTorch on the exact same step input. Each native trajectory checkpoint
-would meet or exceed the CUDA-versus-ROCm free-running checkpoint, with both
+must meet or exceed the CUDA-versus-ROCm free-running checkpoint, with both
 reference runs starting from byte-identical noise and step-0 transformer
 input. A third house edit (`change the sky to sunset orange`, seed 44,
 512x512 target) tests the larger token count. The result is:
@@ -233,6 +243,7 @@ input. A third house edit (`change the sky to sunset orange`, seed 44,
 | Apple edit, seed 42, 256x256 | Pass | Pass | Fail |
 | House edit, seed 43, 256x256 | Pass | Fail, second prediction | Fail |
 | House edit, seed 44, 512x512 | Fail, first prediction and trajectories | Pass | Fail |
+| House edit, seed 45, 512x512 | Pass | Pass | Fail |
 
 For seed 44, scalar native/ROCm predictions are
 0.999881516/0.999844265 against exact-input CUDA/ROCm floors
@@ -240,9 +251,30 @@ For seed 44, scalar native/ROCm predictions are
 0.999837650/0.999836903 fall below full-run reference floors
 0.999859171/0.999858898. Fused WMMA exceeds all four floors on seed 44,
 but its seed-43 second prediction, 0.999807174, falls below the reference
-floor 0.999870206. Thus the approved reference-floor tier is **not met by either tested
-attention path across the three fixtures**. Acceptance remains open, and
-the unchanged 0.99996 regression still fails.
+floor 0.999870206. Neither fixed attention path meets the approved tier
+across the first three fixtures. The explicit `edit-size-select` runner mode
+selects scalar attention below 1,024 target tokens and fused WMMA from
+1,024 tokens. On all four fixtures, its four saved prediction/trajectory
+tensors are byte-identical to the corresponding scalar or fused run, and
+all four provenance-checked reference-floor reports pass with
+`--require-reference-floor`.
+An additional 512x512 house edit with seed 45 gives scalar reference-floor
+margins +0.000015855/+0.000025596 (predictions) and
++0.000020624/+0.000021031 (trajectory). Fused WMMA also passes, with
+margins +0.000007430/+0.000022722 and +0.000009194/+0.000009369.
+The strict 0.99996 gate fails on all four fixtures. The size-selected path
+meets the approved reference-floor tier on the four measured fixtures;
+its minimum margin over a reference floor is +0.000007430 on seed 45's
+first prediction. Generalization to other prompts, seeds, and sizes is not
+yet established. The suite summary is
+`tmp/qimg21-edit-size-select-floor-suite-20260924.json`.
+The public ROCm editing default also completed two matched 1024x1024
+40-step runs with vector4 normalization, exact host RoPE, and fused WMMA
+selected at 4,096 target tokens: 521.21/521.20 seconds and
+4,566,450,176/4,566,413,312 bytes observed device peak. All 55 saved
+`.npy` tensors per run are finite and byte-identical, including the native
+F32 VAE output and 40 checkpoints; the valid RGBA PNGs are byte-identical.
+The artifact prefixes are `tmp/qimg21-rocm-bench-edit-size-select-{r1,r2}-20260924`.
 `reference_floor_report.py` verifies the capture chain, identical starting
 inputs, saved native metrics, and both reference-floor and unchanged strict outcomes.
 Run it for the original fixture with:
@@ -253,13 +285,19 @@ python3 rdna4/qimg21/reference_floor_report.py \
   --cuda-free-run tmp/qimg21-edit-reference-efficient \
   --rocm-reference tmp/qimg21-edit-reference-rocm-free-bundle-20260923 \
   --native-regression tmp/qimg21-edit-rocm-free-regression-20260923 \
-  --out tmp/qimg21-edit-reference-floor-matched-20260924.json
+  --out tmp/qimg21-edit-reference-floor-matched-20260924.json \
+  --require-reference-floor
 ```
+
+The optional `--require-reference-floor` exits nonzero when the separate
+approved tier fails; the existing `editing_regression.py` still evaluates
+0.99996 and reports its own failure independently.
 
 The independent reports are `tmp/qimg21-edit-house-seed43-floor-20260924.json`
 and `tmp/qimg21-edit-house-512-seed44-floor-20260924.json`, with corresponding
-`-fused-floor-` reports. The unchanged strict same-GPU editing gate remains
-open on all three fixtures.
+`-fused-floor-` reports. The seed-45 reports and exact-input captures use
+`tmp/qimg21-edit-house-512-seed45-*`. The unchanged strict same-GPU editing
+gate remains open on all four fixtures.
 
 On the free-running second-step ROCm input, the native and PyTorch ROCm target
 block outputs start at cosine 0.999999816 after block 0, first fall below
