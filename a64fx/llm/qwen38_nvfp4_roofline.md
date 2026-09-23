@@ -238,3 +238,28 @@ would save only about 0.10 s. A 16 KiB exact FP4-value lookup with SVE gathers
 also regressed the isolated 50.135 MB N=3 matrix from 0.499 to 0.854 ms.
 The central requirement is a much higher fraction of the node's FP32
 throughput while decoding compact weights.
+
+The detailed K=3 profile on the 32-token prompt attributes 18.6 ms to
+normalization, 37.0 ms to SSM preparation, 71.1 ms to SSM scans, 7.0 ms to
+attention preparation, 77.2 ms to attention kernels, and 87.7 ms to FFN
+activation across 13 target batches. These stages total about 0.30 s; no
+single nonprojection stage explains the 2.79 s verifier time.
+
+An opt-in `--draft-head-rows 65536` computes only the first 65,536 NextN
+vocabulary logits and marks the rest unavailable to the proposer. The full
+unapproximated target head still verifies every emitted token. On the
+32-token matrix-multiplication prompt, this kept 20/26 draft positions
+accepted and matched all 32 serial target IDs; draft time fell from 421 to
+301 ms and end-to-end decode reached **10.160 tok/s**. Limiting to 32,768
+rows lost a draft acceptance, added a target round, and fell to 9.722 tok/s
+(still 32/32 target IDs). On the independent 64-token `hi` trace, 65,536
+rows retained 35/58 accepted drafts and all 64 exact target IDs, reaching
+8.700 tok/s versus 8.645 with the full draft head. This approximation is
+proposer-only and remains disabled by default because its acceptance depends
+on the prompt's token distribution.
+
+To reproduce the 32-token result, use the export block above and add
+`--draft-head-rows 65536` to its `run_qwen38_nvfp4_cmg4.sh` command. Compare
+the resulting `qwen38: token n=... pos=... id=...` lines against a run with
+`--spec-k 0` and the same prompt, model, `TF_KV_DTYPE=f32`, exact tile, and
+exact Q6 head flags.

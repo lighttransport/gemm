@@ -165,6 +165,13 @@ done:
         fprintf(stderr, "qwen38: spec_profile proj=%.1f out=%.1f ffn_proj=%.1f down=%.1f ms\n",
                 profile.proj_ms, profile.out_proj_ms, profile.ffn_proj_ms,
                 profile.ffn_down_ms);
+        fprintf(stderr, "qwen38: spec_profile_other norm=%.1f ssm_prepare=%.1f "
+                        "ssm_scan=%.1f attn_prepare=%.1f attn_kernel=%.1f "
+                        "ffn_act=%.1f collective=%.1f ms layers=%d calls=%d\n",
+                profile.norm_ms, profile.ssm_prepare_ms, profile.ssm_scan_ms,
+                profile.attn_prepare_ms, profile.attn_kernel_ms,
+                profile.ffn_act_ms, profile.collective_ms,
+                profile.layers, profile.calls);
         fprintf(stderr, "qwen38: spec_stage draft=%.1f verify=%.1f commit=%.1f ms\n",
                 draft_s * 1000.0, verify_s * 1000.0, commit_s * 1000.0);
         fputc('\n', stdout);

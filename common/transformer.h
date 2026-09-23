@@ -17,6 +17,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <float.h>
 #include "gguf_loader.h"
 #include "ggml_dequant.h"
 
@@ -136,6 +137,7 @@ typedef struct {
     qtensor shared_head_head;    /* optional private LM head */
     int layer_index;
     int loaded;
+    int draft_head_rows;         /* optional proposer-only vocabulary prefix */
     float *key_cache;          /* private draft KV [max_seq_len, kv_dim] */
     float *value_cache;
     float *hidden;             /* recurrent draft hidden [n_embd] */
@@ -12846,6 +12848,8 @@ float *transformer_nextn_logits(transformer_model *m, int32_t prev_token,
     const qtensor *head_norm = nn->shared_head_norm.data
         ? &nn->shared_head_norm : &m->output_norm;
     int head_rows = head->n_rows > 0 ? head->n_rows : m->n_vocab;
+    if (nn->draft_head_rows > 0 && nn->draft_head_rows < head_rows)
+        head_rows = nn->draft_head_rows;
     int block_persistent = tf_nextn_ffn_persistent_pool(
         m, L, nn, nff, ne, qkv_persistent, 1, 1, nextn_sharded, head, head_norm,
         head_rows, position, nh, hd, kvd, gqa, qd);
@@ -12917,6 +12921,9 @@ float *transformer_nextn_logits(transformer_model *m, int32_t prev_token,
                 pt_eh - pt0, pt_qkv - pt_eh, pt_attn - pt_qkv,
                 pt_out - pt_attn, pt_ffn - pt_out, end - pt_ffn, end - pt0);
     }
+    if (nn->draft_head_rows > 0 && head_rows < m->n_vocab)
+        for (int i = head_rows; i < m->n_vocab; i++)
+            m->logits[i] = -FLT_MAX;
     return m->logits;
 }
 

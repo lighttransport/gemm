@@ -372,7 +372,7 @@ static int run_benchmark(transformer_model *m, bpe_vocab *v, int32_t *tok,
 
 static void usage(const char *p) {
     fprintf(stderr, "usage: %s MODEL --prompt TEXT [--max-gen N] [--max-seq N] "
-                    "[--threads N] [--spec-k 0..4] [--spec-verify] [--batch-probe 2..4] [--kernel-probe N] [--kernel-probe-check] [--nextn-tile-probe] [--mmap] "
+                    "[--threads N] [--spec-k 0..4] [--spec-verify] [--draft-head-rows N] [--batch-probe 2..4] [--kernel-probe N] [--kernel-probe-check] [--nextn-tile-probe] [--mmap] "
                     "[--fast-swiglu] [--nvfp4-fast] [--nvfp4-packed] [--nvfp4-exact-tiled] [--nextn-exact-tiled] [--q6-exact-head] [--q8-mode auto|reference|cmg4|cmg4-a15|block64|block64-ffn|block64-exact|row] "
                     "[--bench --bench-prompt N[,N...] --bench-gen N[,N...] "
                     "--bench-runs N --bench-warmup N --bench-csv]\n", p);
@@ -387,7 +387,8 @@ int main(int argc, char **argv) {
     int fast_swiglu = 0, nvfp4_fast = 0, nvfp4_packed = 0;
     int nvfp4_exact_tiled = 0, nextn_exact_tiled = 0;
     int q6_exact_head = 0, batch_probe = 0;
-    int spec_verify = 0, kernel_probe = 0, kernel_probe_check = 0;
+    int spec_verify = 0, draft_head_rows = 0;
+    int kernel_probe = 0, kernel_probe_check = 0;
     int nextn_tile_probe = 0;
     int bench = 0, bench_runs = 3, bench_warmup = 1, bench_csv = 0;
     int bench_prompt_sizes[QWEN38_BENCH_MAX_CASES];
@@ -400,6 +401,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--threads") && ++i < argc) threads = atoi(argv[i]);
         else if (!strcmp(argv[i], "--spec-k") && ++i < argc) spec_k = atoi(argv[i]);
         else if (!strcmp(argv[i], "--spec-verify")) spec_verify = 1;
+        else if (!strcmp(argv[i], "--draft-head-rows") && ++i < argc)
+            draft_head_rows = atoi(argv[i]);
         else if (!strcmp(argv[i], "--batch-probe") && ++i < argc) batch_probe = atoi(argv[i]);
         else if (!strcmp(argv[i], "--kernel-probe") && ++i < argc) kernel_probe = atoi(argv[i]);
         else if (!strcmp(argv[i], "--kernel-probe-check")) kernel_probe_check = 1;
@@ -423,7 +426,9 @@ int main(int argc, char **argv) {
     }
     if (!path || spec_k < 0 || spec_k > 4 || max_seq < 2 || max_gen < 0 ||
         threads < 1 || bench_runs < 1 || bench_warmup < 0 ||
-        kernel_probe < 0 || (kernel_probe_check && !kernel_probe) ||
+        kernel_probe < 0 || draft_head_rows < 0 ||
+        (draft_head_rows && !spec_verify) ||
+        (kernel_probe_check && !kernel_probe) ||
         (nextn_exact_tiled && !nvfp4_exact_tiled) ||
         (nextn_tile_probe && (nextn_exact_tiled || !nvfp4_exact_tiled || !q6_exact_head ||
                              !spec_verify || batch_probe || bench || kernel_probe)) ||
@@ -495,6 +500,15 @@ int main(int argc, char **argv) {
     bpe_vocab *v = bpe_vocab_load(g);
     transformer_model *m = transformer_load(g, max_seq);
     if (!v || !m) return 1;
+    if (draft_head_rows > m->n_vocab || (draft_head_rows & 7)) {
+        fprintf(stderr, "qwen38: --draft-head-rows must be <= %d and divisible by 8\n",
+                m->n_vocab);
+        return 2;
+    }
+    m->nextn.draft_head_rows = draft_head_rows;
+    if (draft_head_rows)
+        fprintf(stderr, "qwen38: NextN proposer head limited to %d/%d rows\n",
+                draft_head_rows, m->n_vocab);
     m->decode_swiglu_approx = fast_swiglu;
     transformer_set_nvfp4_fast(nvfp4_fast);
     if (threads > 1) transformer_set_threads(m, threads);
