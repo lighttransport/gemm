@@ -488,3 +488,10 @@ passes were about 0.51–0.54 ms versus about 0.50 ms with the same initializer
 under four-CMG interleave. The FP4 kernel's low FMA issue rate therefore
 cannot be explained by the simple interleaved-versus-local HBM policy in
 this fixed-shape test.
+
+Interleaving the three activation vectors and issuing SVE `ld3w` loads was
+also tested to eliminate the original load-plus-`tbl` activation replication.
+It preserved all 52,224 N=3 gate outputs bit for bit, but expanded the tiny
+activation stream and took about 1.00 ms per 50.135 MB matrix, versus about
+0.52 ms for the current separate loads. The triple load should not replace
+the current kernel.
