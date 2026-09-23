@@ -156,6 +156,21 @@ This trace compares native CUTLASS-efficient CUDA with HIP fused WMMA using
 the identical saved fixture. It identifies accumulated BF16/kernel-order
 sensitivity, not a single bad block or a passing end-to-end edit.
 
+To validate attention against PyTorch ROCm without installing Diffusers into
+the Pixal3D reference environment, use the saved native editing layout:
+
+```sh
+ref/pixal3d/run.sh rocm cuda/qimg21/attention_probe.py \
+  --stage-dir tmp/qimg21-rdna4-edit-efficient-stage0 \
+  --editing-layout tmp/qimg21-edit-efficient-native-exact/fixture-000/layout.txt
+```
+
+On the free-running first-block trace, native HIP versus PyTorch ROCm default
+SDPA has cosine 0.999999990 overall and 0.999999945 on target rows. The same
+probe with CUDA hidden/modulation replay gives 0.999999991 and 0.999999951.
+These are same-Q/K/V local attention checks; they pass the 0.99996 stage gate
+but do not establish end-to-end editing parity.
+
 The 1024-condition native vision path converts BF16 checkpoint biases to F32
 for its F32 linear epilogue and rounds the patch GEMM output to BF16 before
 adding the bias, matching CUDA's two activation boundaries. On the same
