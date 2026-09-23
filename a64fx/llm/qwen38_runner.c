@@ -47,6 +47,47 @@ static int argmax(const float *x, int n) {
     return best;
 }
 
+static int run_kernel_probe(transformer_model *m, int rounds) {
+    if (m->n_layers < 4) return 1;
+    const qtensor *matrices[] = {
+        &m->layers[0].ssm_qkv, &m->layers[0].ssm_out,
+        &m->layers[0].ffn_gate, &m->layers[0].ffn_down,
+        &m->layers[3].attn_q, &m->output
+    };
+    const char *names[] = {
+        "ssm_qkv", "ssm_out", "ffn_gate", "ffn_down", "attn_q", "lm_head"
+    };
+    const int n = 3;
+    for (size_t mi = 0; mi < sizeof(matrices) / sizeof(matrices[0]); mi++) {
+        const qtensor *mat = matrices[mi];
+        if (!mat->data || mat->n_rows <= 0 || mat->n_cols <= 0) return 1;
+        float *x = malloc((size_t)n * mat->n_cols * sizeof(float));
+        float *y = malloc((size_t)n * mat->n_rows * sizeof(float));
+        if (!x || !y) { free(x); free(y); return 1; }
+        for (int i = 0; i < n * mat->n_cols; i++)
+            x[i] = (float)((i * 13) % 67 - 33) * 0.03125f;
+        for (int i = 0; i < 3; i++)
+            tf_gemm_f16_mt_tokenmajor(y, mat, x, mat->n_rows, n,
+                                      mat->n_rows, mat->n_cols, m->n_threads);
+        double begin = now_sec();
+        for (int i = 0; i < rounds; i++)
+            tf_gemm_f16_mt_tokenmajor(y, mat, x, mat->n_rows, n,
+                                      mat->n_rows, mat->n_cols, m->n_threads);
+        double ms = (now_sec() - begin) * 1000.0 / rounds;
+        size_t bytes = mat->nvfp4_tiled
+            ? (size_t)mat->n_rows * (size_t)mat->n_cols / 64 * sizeof(block_nvfp4)
+            : mat->q6_decoded
+                ? (size_t)mat->n_rows * (size_t)mat->n_cols / 256 *
+                  sizeof(tf_q6_exact_block)
+                : (size_t)mat->n_rows * tf_row_bytes(mat->type, mat->n_cols);
+        fprintf(stderr, "qwen38: kernel_probe %s rows=%d cols=%d N=%d bytes=%.3fGB ms=%.3f GBps=%.1f checksum=%a\n",
+                names[mi], mat->n_rows, mat->n_cols, n, bytes / 1e9,
+                ms, bytes / (ms * 1e6), y[mat->n_rows / 2]);
+        free(x); free(y);
+    }
+    return 0;
+}
+
 #include "qwen38_spec_verify.h"
 
 #define QWEN38_BENCH_MAX_CASES 16
@@ -205,7 +246,7 @@ static int run_benchmark(transformer_model *m, bpe_vocab *v, int32_t *tok,
 
 static void usage(const char *p) {
     fprintf(stderr, "usage: %s MODEL --prompt TEXT [--max-gen N] [--max-seq N] "
-                    "[--threads N] [--spec-k 0..4] [--spec-verify] [--batch-probe 2..4] [--mmap] "
+                    "[--threads N] [--spec-k 0..4] [--spec-verify] [--batch-probe 2..4] [--kernel-probe N] [--mmap] "
                     "[--fast-swiglu] [--nvfp4-fast] [--nvfp4-packed] [--nvfp4-exact-tiled] [--q6-exact-head] [--q8-mode auto|reference|cmg4|cmg4-a15|block64|block64-ffn|block64-exact|row] "
                     "[--bench --bench-prompt N[,N...] --bench-gen N[,N...] "
                     "--bench-runs N --bench-warmup N --bench-csv]\n", p);
@@ -219,7 +260,7 @@ int main(int argc, char **argv) {
     int max_gen = 16, max_seq = 512, threads = 48, spec_k = 0, mmap_weights = 0;
     int fast_swiglu = 0, nvfp4_fast = 0, nvfp4_packed = 0;
     int nvfp4_exact_tiled = 0, q6_exact_head = 0, batch_probe = 0;
-    int spec_verify = 0;
+    int spec_verify = 0, kernel_probe = 0;
     int bench = 0, bench_runs = 3, bench_warmup = 1, bench_csv = 0;
     int bench_prompt_sizes[QWEN38_BENCH_MAX_CASES];
     int bench_gen_sizes[QWEN38_BENCH_MAX_CASES];
@@ -232,6 +273,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--spec-k") && ++i < argc) spec_k = atoi(argv[i]);
         else if (!strcmp(argv[i], "--spec-verify")) spec_verify = 1;
         else if (!strcmp(argv[i], "--batch-probe") && ++i < argc) batch_probe = atoi(argv[i]);
+        else if (!strcmp(argv[i], "--kernel-probe") && ++i < argc) kernel_probe = atoi(argv[i]);
         else if (!strcmp(argv[i], "--q8-mode") && ++i < argc) q8_mode = argv[i];
         else if (!strcmp(argv[i], "--mmap")) mmap_weights = 1;
         else if (!strcmp(argv[i], "--bench")) bench = 1;
@@ -250,6 +292,8 @@ int main(int argc, char **argv) {
     }
     if (!path || spec_k < 0 || spec_k > 4 || max_seq < 2 || max_gen < 0 ||
         threads < 1 || bench_runs < 1 || bench_warmup < 0 ||
+        kernel_probe < 0 || (kernel_probe && (bench || batch_probe || spec_k ||
+            !nvfp4_exact_tiled || !q6_exact_head)) ||
         (batch_probe && (batch_probe < 2 || batch_probe > 4 || spec_k || bench)) ||
         (spec_verify && (spec_k < 2 || spec_k > 4 || bench || batch_probe ||
                          nvfp4_fast || nvfp4_packed || fast_swiglu))) {
@@ -409,6 +453,11 @@ int main(int argc, char **argv) {
     fprintf(stderr, "qwen38: load=%.3fs trunk=%d nextn=%d format=%s\n",
             now_sec() - load0, m->n_layers, m->n_nextn_layers,
             mmap_weights ? "mmap" : (q8_resident ? "selective-q8" : "anonymous"));
+    if (kernel_probe) {
+        int rc = run_kernel_probe(m, kernel_probe);
+        transformer_free(m); bpe_vocab_free(v); gguf_close(g);
+        return rc;
+    }
     if (getenv("TF_NULL_GEMM") && atoi(getenv("TF_NULL_GEMM")) == 2) {
         transformer_null_stream_bench(m, 3);
         transformer_free(m);
