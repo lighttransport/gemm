@@ -553,3 +553,16 @@ the 50.135 MB matrix took about 0.63–0.78 ms in steady trials against
 about 0.52 ms for the original kernel. The common pair keys stay cache hot,
 but a full-vector scale load is still more costly than the existing scalar
 loads. Do not add this table to the resident model.
+
+A compact-format, three-candidate SVE `SDOT` prototype was tested on the live
+48-core `51877011` allocation. It kept the 288-byte eight-row block instead
+of expanding resident weights, quantized each candidate activation once per
+16 values, decoded FP4 nibbles with byte `TBL`, and accumulated the three
+integer dot products per row pair. On the synthetic 50.135 MB FFN gate,
+steady passes were about **1.42 ms**, versus **0.52 ms** for the current
+exact FP32 kernel. Relative L2 error against the exact output was 0.0545
+on this cancellation-heavy synthetic activation; maximum absolute output
+difference was 0.00910. The compiler emitted SVE spills in the eight-row
+variant. A four-row variant reduced register pressure but reread the compact
+weights and still took about 1.13–1.34 ms. Neither version is suitable for
+the verifier; integer dot product does not help this layout as implemented.
