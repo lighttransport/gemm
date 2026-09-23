@@ -471,3 +471,6 @@ Default normalization with exact RoPE gave 0.999954939/0.999889537 and
 failed both trajectory checkpoints. Default RoPE with vector4 normalization
 gave 0.999963776/0.999874586 and also failed both trajectory checkpoints.
 Neither variant replaces vector4 plus exact RoPE.
+Combining the diagnostic FP64 timestep and modulation projections gave
+0.999945683/0.999876798 predictions and failed both trajectory checks on
+the same ROCm reference; it is not selected for production.
