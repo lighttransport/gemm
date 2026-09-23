@@ -585,3 +585,24 @@ the measured N=3 rate to the roughly 19.3 GB active packed trunk gives over
 0.10 s per target batch before attention, draft, or head work. This path
 cannot provide a 40 tok/s verifier at its current arithmetic throughput;
 no approximate target kernel was integrated.
+
+The compiled exact N=3 compact loop already schedules twelve independent
+low-nibble FP32 FMAs before the corresponding twelve high-nibble FMAs. An
+A64FX ISA check showed SVE and FP16, but no SVE2 widening FP16 FMA. A
+source-level low/high FMA reorder or FP16-to-FP32 dot instruction therefore
+does not address the measured execution bottleneck on this node.
+
+A model-specific integer-coefficient experiment used the common UE4M3 scale
+bytes `1`–`3`, for which `FP4_code * scale` equals a signed-byte integer
+coefficient times `2^-10`. Three activations were quantized to INT8 and
+their integer SDOT accumulators were scaled only after traversing all K.
+The 50.135 MB gate matrix took about **0.62–0.81 ms**, compared with
+**0.52 ms** for exact FP32. Prepacking the coefficients into a separate
+89.129 MB signed-byte stream removed the FP4/scale decoding and gave
+roughly **0.49–0.54 ms** in steady passes, with occasional nonrepeatable
+0.39–0.40 ms passes. The synthetic gate output had relative L2 difference
+0.01095 and maximum absolute difference 0.00282 against exact FP32, from
+global INT8 activation quantization and changed accumulation order. The
+prototype omits the real model's rare larger scales. Its marginal steady
+gain cannot repay the 1.78× stream size or establish token identity, so it
+was not integrated.
