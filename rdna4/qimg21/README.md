@@ -113,6 +113,29 @@ ROCEW_ROCM_LIB=/opt/rocm/core/lib python3 cuda/qimg21/editing_regression.py \
 For the saved two-step 1024-condition/256-target capture, prediction cosines
 were 0.999891917 and 0.999873082; the trajectory minimum was 0.999863032.
 All are below the 0.99996 gate, so editing parity is not yet established.
+For a same-GPU PyTorch reference, `pytorch_rocm_reference.py` replays the
+saved transformer inputs directly with sequential CPU offload. It uses the
+project's existing ROCm Torch/torchvision and the pinned Diffusers Python
+package files from the CUDA reference environment; it does not load CUDA
+Torch into the ROCm process:
+
+```sh
+ref/pixal3d/run.sh rocm rdna4/qimg21/pytorch_rocm_reference.py \
+  --model /mnt/disk2/models/qimg-21 \
+  --capture-dir tmp/qimg21-edit-reference-efficient \
+  --out-dir tmp/qimg21-edit-reference-rocm-direct \
+  --diffusers-site-packages tmp/qimg21-ref-venv/lib/python3.12/site-packages \
+  --sdpa-backend efficient
+```
+
+On the saved two-step fixture, PyTorch ROCm predictions have cosine
+0.999936229 and 0.999861802 against the PyTorch CUDA capture. Native HIP
+predictions have cosine 0.999939325 and 0.999882018 against PyTorch ROCm.
+Both native comparisons still miss 0.99996. The PyTorch comparison also
+includes framework-version differences (ROCm 2.11 versus CUDA 2.14) and
+does not, by itself, isolate GPU hardware rounding. Diagnostic FP64 timestep
+accumulation reaches 0.999960013 against PyTorch ROCm on step 0 but drops
+to 0.999873083 on step 1; it therefore remains non-production.
 The matched first-step trace has byte-identical BF16 timestep SiLU inputs on
 CUDA and ROCm; the second projection differs in 78 of 8192 BF16 values.
 Those differences propagate into 24 image-row and 233 text-row modulation
