@@ -416,3 +416,37 @@ The Python demo's health endpoint and GPU controls were smoke-tested with
 `--gpu-execution resident --gpu-kernels auto`. Profile data is returned in the
 inference response. The original options/result C ABI layouts remain intact;
 GPU selection uses the separate versioned configuration API.
+
+## RX 9070 XT resident rerun (2026-09-24)
+
+With the same house and four-view example fixtures, seed, mixed flow precision,
+12,288 MiB budget, and resident automatic kernels, rerun:
+
+```sh
+ref/pixal3d/run.sh rocm ref/pixal3d/run_fixture.py --backend rocm \
+  --input ref/pixal3d/upstream/assets/images/1_img.png \
+  --output-dir tmp/pixal3d/revalidate-rocm-house-20260924 --seed 1 \
+  --threads 8 --gpu-execution resident --gpu-kernels auto \
+  --gpu-flow-precision mixed --vram-budget-mib 12288 \
+  --texture-size 1024 --triangle-target 1000000
+ref/pixal3d/run.sh rocm ref/pixal3d/run_fixture.py --backend rocm \
+  --views-dir ref/pixal3d/upstream/assets/mv_images/example \
+  --output-dir tmp/pixal3d/revalidate-rocm-multiview-20260924 --seed 42 \
+  --threads 8 --gpu-execution resident --gpu-kernels auto \
+  --gpu-flow-precision mixed --vram-budget-mib 12288 \
+  --texture-size 4096 --triangle-target 1000000
+```
+
+| Fixture | Runner wall time | Peak reserved device bytes | Triangles | MMA attentions |
+| --- | ---: | ---: | ---: | ---: |
+| House single view | 250.177 s | 7,883,505,744 | 936,320 | 2,280 |
+| Four-view example | 452.329 s | 8,530,360,804 | 968,682 | 2,280 |
+
+Both GLBs pass `ref/pixal3d/validate_glb.py`: no zero-area faces or zero
+normals, valid textures and materials, and the largest welded component owns
+97.43% (house) and 96.28% (four-view) of the faces. The rendered previews under
+each output directory show the expected detailed house and four-sided head.
+Automatic kernels use the gfx12 WMMA attention adapter here; profile counters
+show zero explicit MMA GEMMs because automatic GEMM selection retains the
+vendor BLAS path. The sampler's total-device figures include other processes;
+the table uses the runner's own peak reserved allocation counter.
