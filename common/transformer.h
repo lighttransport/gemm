@@ -15060,10 +15060,23 @@ static int tf_gemm_bf16_smalln_pair(float *Y0, const qtensor *m0,
 
 /* Token-major GEMM: Y[tok * out_stride + row] = dot(W[row,:], X[tok,:])
  * Direct output without transpose. */
+#if defined(TF_HAVE_Q38_NVFP4_N3_GATE) && defined(__ARM_FEATURE_SVE)
+extern int q38_nvfp4_exact_n3_mt(float *y, const void *weights,
+                                 const float *x, int rows, int cols,
+                                 int n_threads);
+#endif
 static void tf_gemm_f16_mt_tokenmajor_impl(float *Y_out, const qtensor *mat, const float *X,
                                        int n_rows, int N, int out_stride, int X_stride,
                                        int n_threads) {
 #if defined(__ARM_FEATURE_SVE)
+#if defined(TF_HAVE_Q38_NVFP4_N3_GATE)
+    if (mat->nvfp4_tiled && N == 3 && out_stride == n_rows &&
+        X_stride == mat->n_cols && svcntw() == 16 &&
+        q38_nvfp4_exact_n3_mt(Y_out, mat->data, X, n_rows,
+                              mat->n_cols, n_threads)) {
+        return;
+    }
+#endif
     if ((mat->nvfp4_tiled || mat->q6_decoded) && N >= 1) {
         int nt = n_threads < 1 ? 1 : n_threads;
         if (nt > n_rows / 8) nt = n_rows / 8;

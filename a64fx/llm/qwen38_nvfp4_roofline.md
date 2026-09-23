@@ -122,6 +122,27 @@ count point to decode/accumulation work as the limiting factor. Reaching the
 40 tok/s end-to-end target will require a substantially different exact
 projection kernel, not a prefetch or NUMA adjustment.
 
+The first effective code-generation change compiles a separate exact N=3
+kernel for each of the model's six active NVFP4 matrix shapes. Those 368
+tensors account for 13.589 GB of active compact weights. Keeping row count,
+column count, and token strides constant in each compiled routine raises
+resident projection throughput from about 69–74 GB/s to 93–100 GB/s. The
+probe's `--kernel-probe-check` option compares every output float against the
+generic exact SVE kernel: all six shapes had zero mismatches, including
+52,224 outputs for the FFN gate matrix. The dispatch applies only to exact
+eight-row tiled weights, N=3, matching strides, and 512-bit SVE; other cases
+continue through the generic kernel.
+
+With the specialized N=3 path, the 64-token `hi` verifier reached **7.802
+tok/s** (35/58 draft positions accepted), versus 6.834 tok/s immediately
+before specialization. The 32-token matrix-multiplication prompt reached
+**8.783 tok/s** (20/26 accepted), versus 7.346 tok/s. Every emitted
+`(position, ID)` matched the corresponding unapproximated serial target trace
+(64/64 and 32/32). These are end-to-end single-request measurements. The
+40 tok/s objective remains open; the exact Q6 head still takes about 8 ms
+per three-token batch, and these verifier runs emit about 2.2–2.5 tokens
+per round.
+
 Representative native runs (48 cores, one A64FX node, staged GGUF under
 `/local`, `OMP_PROC_BIND=close`, four-CMG anonymous residency):
 
@@ -132,5 +153,5 @@ a64fx/llm/run_qwen38_nvfp4_cmg4.sh MODEL --prompt hi --max-seq 256 \
 a64fx/llm/run_qwen38_nvfp4_cmg4.sh MODEL --prompt hi --max-seq 256 \
     --max-gen 64 --spec-k 3 --spec-verify --nvfp4-exact-tiled --q6-exact-head
 a64fx/llm/run_qwen38_nvfp4_cmg4.sh MODEL --max-seq 256 \
-    --nvfp4-exact-tiled --q6-exact-head --kernel-probe 200
+    --nvfp4-exact-tiled --q6-exact-head --kernel-probe 200 --kernel-probe-check
 ```

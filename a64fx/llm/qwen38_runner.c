@@ -47,15 +47,17 @@ static int argmax(const float *x, int n) {
     return best;
 }
 
-static int run_kernel_probe(transformer_model *m, int rounds) {
+static int run_kernel_probe(transformer_model *m, int rounds, int check) {
     if (m->n_layers < 4) return 1;
     const qtensor *matrices[] = {
-        &m->layers[0].ssm_qkv, &m->layers[0].ssm_out,
+        &m->layers[0].ssm_qkv, &m->layers[0].ssm_gate,
+        &m->layers[0].ssm_out,
         &m->layers[0].ffn_gate, &m->layers[0].ffn_down,
         &m->layers[3].attn_q, &m->output
     };
     const char *names[] = {
-        "ssm_qkv", "ssm_out", "ffn_gate", "ffn_down", "attn_q", "lm_head"
+        "ssm_qkv", "ssm_gate", "ssm_out", "ffn_gate", "ffn_down",
+        "attn_q", "lm_head"
     };
     const int n = 3;
     for (size_t mi = 0; mi < sizeof(matrices) / sizeof(matrices[0]); mi++) {
@@ -83,6 +85,34 @@ static int run_kernel_probe(transformer_model *m, int rounds) {
         fprintf(stderr, "qwen38: kernel_probe %s rows=%d cols=%d N=%d bytes=%.3fGB ms=%.3f GBps=%.1f checksum=%a\n",
                 names[mi], mat->n_rows, mat->n_cols, n, bytes / 1e9,
                 ms, bytes / (ms * 1e6), y[mat->n_rows / 2]);
+        if (check && mat->nvfp4_tiled) {
+            size_t outputs = (size_t)n * mat->n_rows;
+            float *reference = malloc(outputs * sizeof(float));
+            if (!reference) { free(x); free(y); return 1; }
+            #ifdef _OPENMP
+            #pragma omp parallel num_threads(m->n_threads)
+            #endif
+            {
+                #ifdef _OPENMP
+                int tid = omp_get_thread_num(), team = omp_get_num_threads();
+                #else
+                int tid = 0, team = 1;
+                #endif
+                int tiles = mat->n_rows / 8;
+                int first = tiles * tid / team * 8;
+                int last = tiles * (tid + 1) / team * 8;
+                tf_nvfp4_tiled_gemm_pair_rows(reference, mat, x, n,
+                                               mat->n_rows, mat->n_cols,
+                                               first, last);
+            }
+            int mismatches = 0;
+            for (size_t j = 0; j < outputs; j++)
+                mismatches += memcmp(&reference[j], &y[j], sizeof(float)) != 0;
+            fprintf(stderr, "qwen38: kernel_probe_check %s mismatches=%d/%zu\n",
+                    names[mi], mismatches, outputs);
+            free(reference);
+            if (mismatches) { free(x); free(y); return 1; }
+        }
         free(x); free(y);
     }
     return 0;
@@ -246,7 +276,7 @@ static int run_benchmark(transformer_model *m, bpe_vocab *v, int32_t *tok,
 
 static void usage(const char *p) {
     fprintf(stderr, "usage: %s MODEL --prompt TEXT [--max-gen N] [--max-seq N] "
-                    "[--threads N] [--spec-k 0..4] [--spec-verify] [--batch-probe 2..4] [--kernel-probe N] [--mmap] "
+                    "[--threads N] [--spec-k 0..4] [--spec-verify] [--batch-probe 2..4] [--kernel-probe N] [--kernel-probe-check] [--mmap] "
                     "[--fast-swiglu] [--nvfp4-fast] [--nvfp4-packed] [--nvfp4-exact-tiled] [--q6-exact-head] [--q8-mode auto|reference|cmg4|cmg4-a15|block64|block64-ffn|block64-exact|row] "
                     "[--bench --bench-prompt N[,N...] --bench-gen N[,N...] "
                     "--bench-runs N --bench-warmup N --bench-csv]\n", p);
@@ -260,7 +290,7 @@ int main(int argc, char **argv) {
     int max_gen = 16, max_seq = 512, threads = 48, spec_k = 0, mmap_weights = 0;
     int fast_swiglu = 0, nvfp4_fast = 0, nvfp4_packed = 0;
     int nvfp4_exact_tiled = 0, q6_exact_head = 0, batch_probe = 0;
-    int spec_verify = 0, kernel_probe = 0;
+    int spec_verify = 0, kernel_probe = 0, kernel_probe_check = 0;
     int bench = 0, bench_runs = 3, bench_warmup = 1, bench_csv = 0;
     int bench_prompt_sizes[QWEN38_BENCH_MAX_CASES];
     int bench_gen_sizes[QWEN38_BENCH_MAX_CASES];
@@ -274,6 +304,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--spec-verify")) spec_verify = 1;
         else if (!strcmp(argv[i], "--batch-probe") && ++i < argc) batch_probe = atoi(argv[i]);
         else if (!strcmp(argv[i], "--kernel-probe") && ++i < argc) kernel_probe = atoi(argv[i]);
+        else if (!strcmp(argv[i], "--kernel-probe-check")) kernel_probe_check = 1;
         else if (!strcmp(argv[i], "--q8-mode") && ++i < argc) q8_mode = argv[i];
         else if (!strcmp(argv[i], "--mmap")) mmap_weights = 1;
         else if (!strcmp(argv[i], "--bench")) bench = 1;
@@ -292,7 +323,8 @@ int main(int argc, char **argv) {
     }
     if (!path || spec_k < 0 || spec_k > 4 || max_seq < 2 || max_gen < 0 ||
         threads < 1 || bench_runs < 1 || bench_warmup < 0 ||
-        kernel_probe < 0 || (kernel_probe && (bench || batch_probe || spec_k ||
+        kernel_probe < 0 || (kernel_probe_check && !kernel_probe) ||
+        (kernel_probe && (bench || batch_probe || spec_k ||
             !nvfp4_exact_tiled || !q6_exact_head)) ||
         (batch_probe && (batch_probe < 2 || batch_probe > 4 || spec_k || bench)) ||
         (spec_verify && (spec_k < 2 || spec_k > 4 || bench || batch_probe ||
@@ -454,7 +486,7 @@ int main(int argc, char **argv) {
             now_sec() - load0, m->n_layers, m->n_nextn_layers,
             mmap_weights ? "mmap" : (q8_resident ? "selective-q8" : "anonymous"));
     if (kernel_probe) {
-        int rc = run_kernel_probe(m, kernel_probe);
+        int rc = run_kernel_probe(m, kernel_probe, kernel_probe_check);
         transformer_free(m); bpe_vocab_free(v); gguf_close(g);
         return rc;
     }

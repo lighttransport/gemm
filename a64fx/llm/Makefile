@@ -151,9 +151,9 @@ all: $(BUILD)/llm_runner
 llm_runner: $(BUILD)/llm_runner
 
 qwen38_runner: $(BUILD)/qwen38_runner
-$(BUILD)/qwen38_runner: $(LLM_DIR)qwen38_runner.c $(COMMON)/transformer.h $(COMMON)/gguf_loader.h $(LLM_DIR)qwen38_nvfp4_pack.h $(LLM_DIR)qwen38_q6_head.h $(LLM_DIR)qwen38_spec_verify.h $(LLM_DIR)kv_f16_sve.h $(LLM_DIR)swiglu_sve.h $(ROOT)/dequant-pipe/q8_k128.h $(Q8K128_KERNEL) | $(BUILD)
-	$(CC) $(CFLAGS) $(QWEN_CFLAGS) -DTF_LINK_Q8_K128 -o $@ \
-		$(LLM_DIR)qwen38_runner.c $(Q8K128_KERNEL) $(LDFLAGS)
+$(BUILD)/qwen38_runner: $(LLM_DIR)qwen38_runner.c $(COMMON)/transformer.h $(COMMON)/gguf_loader.h $(LLM_DIR)qwen38_nvfp4_pack.h $(LLM_DIR)qwen38_q6_head.h $(LLM_DIR)qwen38_spec_verify.h $(LLM_DIR)kv_f16_sve.h $(LLM_DIR)swiglu_sve.h $(ROOT)/dequant-pipe/q8_k128.h $(Q8K128_KERNEL) $(LLM_DIR)qwen38_nvfp4_n3.c | $(BUILD)
+	$(CC) $(CFLAGS) $(QWEN_CFLAGS) -DTF_LINK_Q8_K128 -DTF_HAVE_Q38_NVFP4_N3_GATE -o $@ \
+		$(LLM_DIR)qwen38_runner.c $(Q8K128_KERNEL) $(LLM_DIR)qwen38_nvfp4_n3.c $(LDFLAGS)
 
 qwen38_nvfp4_roofline: $(BUILD)/qwen38_nvfp4_roofline
 $(BUILD)/qwen38_nvfp4_roofline: $(LLM_DIR)qwen38_nvfp4_roofline.c $(COMMON)/gguf_loader.h | $(BUILD)
