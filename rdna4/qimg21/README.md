@@ -360,11 +360,16 @@ those exact patches through native HIP scalar attention yields cosine
 0.999996367 after block 0, 0.999877620 after block 8, 0.996742602 after block
 26, and 0.996581803 after the merger against PyTorch ROCm. First-block norm1
 and QKV cosines are 0.999999999 and 0.999999999; attention projection is
-0.999998301. The PyTorch CUDA versus PyTorch ROCm reference floor on the same
+0.999998301. The attention result before projection is 0.999994906: the first
+measurable block-0 divergence occurs after near-identical QKV, in attention.
+The GELU output is identical wherever its BF16 input is identical. The
+PyTorch CUDA versus PyTorch ROCm reference floor on the same
 patch tensor is 0.999994394 after block 0 and 0.996302817 after the merger.
 The pinned reference implementations therefore differ well beyond the
 0.99996 prediction gate at the vision merger. This is stage evidence, not an
 editing prediction pass. The unchanged end-to-end editing gate remains open.
+The replayed native merged and three deepstack arrays are byte-identical to
+the outputs of the full 1024x1024/40-step house edit rerun.
 
 For the same 1024x1024 condition and target dimensions, a two-step standalone
 edit took 62.84 seconds end-to-end on the RX 9070 XT with the corrected

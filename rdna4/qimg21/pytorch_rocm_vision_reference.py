@@ -117,6 +117,8 @@ def main():
             module.register_forward_hook(
                 lambda _module, _inputs, output, label=label:
                 save(out / f"trace_{label}.npy", output))
+        block.attn.proj.register_forward_pre_hook(
+            lambda _module, inputs: save(out / "trace_attn.npy", inputs[0]))
     for index, merger in enumerate(visual.deepstack_merger_list):
         merger.register_forward_hook(
             lambda _module, _inputs, output, index=index:
