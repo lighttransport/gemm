@@ -161,6 +161,57 @@ alongside the predictions. The default is step 0; `--capture-step 1` selects
 the second editing step. The hooks leave the two predictions byte-identical
 to the run without stage capture. This makes the PyTorch ROCm reference
 directly comparable to `QIMG21_STAGE_BLOCK=0` dumps from the native runner.
+`--capture-all-blocks --capture-step 1` also writes all 32 target block
+outputs under `all_blocks/`. `--free-run` saves a complete regression fixture:
+it uses the pinned Diffusers scheduler to update the ROCm target latent and
+feeds that latent into the next step while retaining the captured condition
+and prompt. The reconstructed model timestep is checked against every
+captured timestep.
+It currently requires a capture without true CFG. For this two-step fixture,
+the same update applied to the saved CUDA predictions reproduced both CUDA
+trajectory checkpoints exactly. The scheduler-backed ROCm capture is
+byte-identical to the earlier BF16 Euler reconstruction on this fixture.
+
+```sh
+ref/pixal3d/run.sh rocm rdna4/qimg21/pytorch_rocm_reference.py \
+  --model /mnt/nvme01/models/qimg-21 \
+  --capture-dir tmp/qimg21-edit-reference-efficient \
+  --out-dir tmp/qimg21-edit-reference-rocm-scheduler-20260923 \
+  --diffusers-site-packages tmp/qimg21-ref-venv/lib/python3.12/site-packages \
+  --sdpa-backend efficient --free-run
+ROCEW_ROCM_LIB=/opt/rocm/core-10.0/lib python3 cuda/qimg21/editing_regression.py \
+  --native-binary rdna4/qimg21/test_hip_qimg21_native \
+  --model /mnt/nvme01/models/qimg-21 \
+  --reference-dir tmp/qimg21-edit-reference-rocm-scheduler-20260923 \
+  --work-dir tmp/qimg21-edit-rocm-scheduler-regression-20260923 \
+  --native-attention math --native-normalization vector4 \
+  --native-rope host-table-exact
+```
+
+The original `tmp/qimg21-edit-reference-rocm-expected/` fixture has ROCm
+predictions but CUDA trajectory files and CUDA `run.json` metadata. Do not use
+its trajectory numbers as a same-GPU ROCm comparison. A fresh independent
+free-running capture is under
+`tmp/qimg21-edit-reference-rocm-free-bundle-20260923/`; its native regression
+is under `tmp/qimg21-edit-rocm-free-regression-20260923/`. Against PyTorch ROCm,
+the native scalar-attention path reaches prediction cosines 0.999974046 and
+0.999876137, and trajectory cosines 0.999964614 and 0.999964570. Thus both
+trajectory checkpoints pass the unchanged 0.99996 gate, while the second
+matched-input prediction still fails. The free-running CUDA/ROCm trajectory
+cosines are 0.999917801 and 0.999917953. With identical captured inputs,
+pinned CUDA PyTorch 2.14 versus ROCm PyTorch 2.11 prediction cosines are
+0.999936229 and 0.999861802; these are a cross-framework reference floor,
+not native acceptance results. A defensible cross-platform criterion would
+retain 0.99996 for native versus same-GPU predictions and trajectory, and
+report CUDA versus ROCm reference drift separately. Do not relax the
+nonquantized gate to the reference floor; the second native prediction still
+needs a fix.
+
+On the free-running second-step ROCm input, the native and PyTorch ROCm target
+block outputs start at cosine 0.999999816 after block 0, first fall below
+0.99996 after block 9, and end at 0.999939892 after block 31. All 32 values
+are saved in `tmp/qimg21-edit-rocm-block-compare-20260923.json`. This is
+gradual accumulated drift; the trace does not identify a single failed block.
 With identical ROCm `hidden0` and `mod` replayed into native HIP, vector4
 `mod_ln` differs in 575 of 17,907,712 BF16 values; the free-running native
 state differs in 5,702. On identical `mod_ln` input, hipBLAS BF16-output QKV
