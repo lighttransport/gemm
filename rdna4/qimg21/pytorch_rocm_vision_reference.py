@@ -6,6 +6,7 @@ tensor captured before the vision encoder, or an image preprocessed with the
 pinned Qwen Image 2.1 pipeline, for comparison with the native encoder.
 """
 import argparse
+from contextlib import nullcontext
 import hashlib
 import json
 from pathlib import Path
@@ -31,6 +32,7 @@ def main():
     parser.add_argument("--prompt", default="a red apple on a white table")
     parser.add_argument("--resolution", type=int, default=1024)
     parser.add_argument("--trace-block", type=int)
+    parser.add_argument("--sdpa-backend", choices=("default", "math"), default="default")
     parser.add_argument("--out-dir", required=True, type=Path)
     parser.add_argument("--diffusers-site-packages", required=True, type=Path)
     args = parser.parse_args()
@@ -124,7 +126,12 @@ def main():
             lambda _module, _inputs, output, index=index:
             save(out / f"deepstack_{index}.npy", output))
     start = time.perf_counter()
-    with torch.inference_mode():
+    if args.sdpa_backend == "math":
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+        attention_context = sdpa_kernel(SDPBackend.MATH)
+    else:
+        attention_context = nullcontext()
+    with torch.inference_mode(), attention_context:
         result = visual(torch.from_numpy(patches).to("cuda", dtype=torch.bfloat16),
                         torch.from_numpy(grid).to("cuda"))
     torch.cuda.synchronize()
@@ -136,6 +143,7 @@ def main():
         "torch": torch.__version__, "device": torch.cuda.get_device_name(0),
         "patches": patches.shape[0], "grid": grid.tolist(),
         "blocks": len(visual.blocks), "elapsed_seconds": time.perf_counter() - start,
+        "sdpa_backend": args.sdpa_backend,
     }
     if args.trace_block is not None:
         record["trace_block"] = args.trace_block

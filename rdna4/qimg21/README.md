@@ -370,6 +370,12 @@ The pinned reference implementations therefore differ well beyond the
 editing prediction pass. The unchanged end-to-end editing gate remains open.
 The replayed native merged and three deepstack arrays are byte-identical to
 the outputs of the full 1024x1024/40-step house edit rerun.
+Forcing PyTorch ROCm's math SDPA on those same patches gives a merger cosine
+of 0.998161784 against its default SDPA result, but native HIP scalar
+attention versus that math oracle is 0.995929653 at the merger. A matched
+attention algorithm alone therefore does not remove the accumulated vision
+drift; the math replay is under
+`tmp/qimg21-rocm-vision-house-math-oracle-20260924/`.
 
 For the same 1024x1024 condition and target dimensions, a two-step standalone
 edit took 62.84 seconds end-to-end on the RX 9070 XT with the corrected
