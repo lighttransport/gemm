@@ -495,3 +495,24 @@ It preserved all 52,224 N=3 gate outputs bit for bit, but expanded the tiny
 activation stream and took about 1.00 ms per 50.135 MB matrix, versus about
 0.52 ms for the current separate loads. The triple load should not replace
 the current kernel.
+
+The Fujitsu 4.12.2 compiler remains faster on the fixed exact N=3 kernel
+than the available LLVM 21 A64FX build: roughly 0.50 versus 0.57 ms for the
+same 50.135 MB matrix and checksum. GCC 8.5 on the node lacks `arm_sve.h`.
+Compiler replacement alone did not expose the missing throughput.
+
+Real UE4M3 scales have a narrow distribution. In `blk.0.ffn_gate.weight`,
+26.1342% of scale bytes are `1`, 66.7564% are `2`, and 6.7341% are `3`;
+99.9999% are below `16`. `blk.32.ffn_gate.weight` is 99.9998% below `16`,
+and `blk.0.ffn_down.weight` is 99.9879% below `16`. For bytes below `16`,
+the exact scale is simply `byte * 2^-10`, but exploiting that in scalar code
+regressed the isolated gate kernel from about 0.498 to 0.765 ms with a
+rare-value fallback, and to about 0.632 ms even without the branch. A
+paired-row branch that reused a precomputed scaled 16-value codebook when
+both rows shared a scale preserved bitwise outputs but settled around
+0.56 ms versus 0.50 ms baseline on a synthetic distribution matching the
+real `1`/`2`/`3` frequencies. The two-register SVE table lookup needed for
+a branchless pair-specific table is not available for this A64FX SVE target.
+The narrow scale distribution therefore remains an opportunity for a more
+substantial encoding/kernel redesign, but these direct substitutions should
+not enter the runner.
