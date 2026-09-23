@@ -188,3 +188,25 @@ a64fx/llm/run_qwen38_nvfp4_cmg4.sh MODEL \
     --max-seq 256 --max-gen 32 --spec-k 3 --spec-verify \
     --nvfp4-exact-tiled --nextn-exact-tiled --q6-exact-head
 ```
+
+With the same exact NextN layout and persistent workers, changing only the
+speculation depth did not help the 32-token prompt. K=2 took 4.243 s (7.541
+tok/s, 18 rounds, 15/18 accepted); K=4 took 4.478 s (7.147 tok/s, 12 rounds,
+22/36 accepted). Both matched all 32 serial target IDs. K=3 remains the
+fastest measured depth at 3.284 s. The extra speculative positions of K=4
+cost more target projection and draft work than its saved round recovers.
+
+An isolated 50.135 MB FFN gate benchmark with fixed dimensions and otherwise
+the same SVE decode measured 0.395 ms for N=1, 0.499 ms for N=3, and 0.637
+ms for N=4 on the 48-core node. Thus even single-candidate compact decode
+is far below a read-only HBM scan; candidate FMAs add cost but are not the
+sole limit. Two exact representation experiments were slower or too small an
+improvement to justify residency: FP16 scales enlarged the stream by 11%
+and took 0.669 ms for N=3; paired-row signed-byte FP4 codes doubled it and
+took 0.458 ms. These are synthetic resident-kernel timings, not end-to-end
+rates or full-logit correctness checks. The latter byte layout would also
+increase the active trunk by 13.589 GB on a 32 GB node.
+Fully unrolling the four 16-value subblocks also regressed the fixed N=3
+50.135 MB kernel from 0.499 to 0.598 ms. Disassembly of the current kernel
+showed no vector accumulator spills in its inner loop, so register-spill
+removal is not an available shortcut to the required throughput.
