@@ -33,6 +33,9 @@ kernel for image queries and a separate causal text-prefix correction. Editing
 is supported experimentally by processing image groups in reverse order and
 correcting interleaved causal text rows; the editing default remains scalar.
 `--attention wmma` and `--attention math` use WMMA GEMMs with scalar attention.
+The legacy `mma64*` and `mma128-efficient` attention names are rejected on
+RDNA4 because they select CUDA-specific kernel source; use `math`, `reverse64`,
+`wmma`, or `wmma-fused` instead.
 The runner covers the 32-layer
 denoiser ABI, CFG inputs, editing layout inputs, stage dumps, and FlowMatch
 latent updates. Matching native text, vision, VAE decoder, and VAE encoder

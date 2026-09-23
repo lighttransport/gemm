@@ -787,11 +787,12 @@ int main(int argc, char **argv) {
             else if (!strcmp(mode, "wmma")) { qimg21_use_wmma = 1; qimg21_attention_reverse64 = 0; }
             else if (!strcmp(mode, "wmma-fused")) { hip_fused_plugin_path="rdna4/qimg21/libq21_hip_attention.so"; qimg21_attention_reverse64=0; }
             else if (!strcmp(mode, "math")) qimg21_attention_reverse64 = 0;
-            else if (!strcmp(mode, "mma64")) {qimg21_attention_mma64=1;qimg21_attention_reverse64=0;}
-            else if (!strcmp(mode, "mma64-flash")) {qimg21_attention_mma64=2;qimg21_attention_reverse64=0;}
-            else if (!strcmp(mode, "mma64-mixed")) {qimg21_attention_mma64=3;qimg21_attention_reverse64=0;}
-            else if (!strcmp(mode, "mma64-forward-flash")) {qimg21_attention_mma64=4;qimg21_attention_reverse64=0;}
-            else if (!strcmp(mode, "mma128-efficient")) {qimg21_attention_mma64=5;qimg21_attention_reverse64=0;}
+            else if (!strcmp(mode, "mma64") || !strcmp(mode, "mma64-flash") ||
+                     !strcmp(mode, "mma64-mixed") || !strcmp(mode, "mma64-forward-flash") ||
+                     !strcmp(mode, "mma128-efficient")) {
+                fprintf(stderr, "native: %s is CUDA-only; use math, reverse64, wmma, or wmma-fused on RDNA4\n", mode);
+                return 2;
+            }
             else if (!strcmp(mode, "cutlass-efficient")) {cutlass_plugin_path="cuda/qimg21/libq21_cutlass_attention.so";qimg21_attention_reverse64=0;}
             else { fprintf(stderr, "native: unsupported attention mode\n"); return 2; }
         }
