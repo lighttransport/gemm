@@ -41,6 +41,29 @@ native VAE path. A separate PyTorch reference mode is available when a ROCm
 PyTorch environment with Qwen Image 2.1 Diffusers support is configured.
 Health reports each native component separately.
 
+Component smoke checks for the ROCm 10 RX 9070 XT are:
+
+```sh
+make -C rdna4/qimg21 all
+ROCEW_ROCM_LIB=/opt/rocm/core-10.0/lib rdna4/qimg21/test_hip_qimg21_wmma
+ROCEW_ROCM_LIB=/opt/rocm/core-10.0/lib rdna4/qimg21/test_hip_qimg21_text \
+  --model /mnt/disk2/models/qimg-21 --prompt 'a red apple' --max-layers 1 --out text.npy
+ROCEW_ROCM_LIB=/opt/rocm/core-10.0/lib rdna4/qimg21/test_hip_qimg21_vision \
+  --model /mnt/disk2/models/qimg-21 --pixel-values PATCHES.npy \
+  --grid-height 64 --grid-width 64 --max-blocks 1 --out vision.npy
+ROCEW_ROCM_LIB=/opt/rocm/core-10.0/lib rdna4/qimg21/test_hip_qimg21_vae \
+  --model /mnt/disk2/models/qimg-21/vae --latents LATENTS.npy \
+  --height-tokens 64 --width-tokens 64 --out image.npy --quiet
+ROCEW_ROCM_LIB=/opt/rocm/core-10.0/lib rdna4/qimg21/test_hip_qimg21_vae_encode \
+  --model /mnt/disk2/models/qimg-21/vae --input-image IMAGE.png \
+  --resolution 256 --out moments.npy --normalized-latents latents.npy
+```
+
+The WMMA test reports `incorrect outputs=0`; the text and vision checks
+produce finite `[tokens,4096]` and `[4096,1152]` outputs, the decoder produces
+finite `[4,1024,1024]` output, and the encoder produces finite `[128,16,16]`
+moments plus `[256,64]` normalized latents.
+
 For standalone generation with only NumPy and Pillow installed, run
 `python3 cuda/qimg21/native_generate.py --backend rocm --model MODEL_ROOT`.
 The ROCm path defaults to native VAE decode and uses a deterministic NumPy
