@@ -268,6 +268,13 @@ GB/s; unrolling two 16-value subblocks kept the checksum but regressed from
 0.500 to 0.707 ms for the 50 MB matrix. The node reported 2.2 GHz during
 these runs. No kernel replacement was made from these experiments.
 
+Two further activation-load experiments also failed to improve the exact
+N=3 compact kernel. An SVE 16-byte load-and-replicate was unsuitable for the
+required eight-float pattern and changed the output checksum. Loading all
+16 activation floats once and selecting the low/high eight-value halves
+preserved the checksum, but slowed the isolated FFN matrix from 0.500 to
+0.676 ms. Neither was applied to the target kernel.
+
 An opt-in `--draft-head-rows 65536` computes only the first 65,536 NextN
 vocabulary logits and marks the rest unavailable to the proposer. The full
 unapproximated target head still verifies every emitted token. On the
