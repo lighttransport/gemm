@@ -148,6 +148,14 @@ output projection and MLP still introduce BF16 differences. These are
 diagnostic injected-state comparisons, not model acceptance; the free-running
 editing predictions above remain below the gate.
 
+The saved first-step, free-running target-hidden trace (`QIMG21_STAGE_ALL_BLOCKS=1`)
+shows gradual amplification rather than one failing layer. CUDA/HIP target
+cosine is 0.999999597 after block 0, first drops below 0.99996 after block 9,
+reaches 0.997721522 at block 29, then recovers to 0.999673598 after block 31.
+This trace compares native CUTLASS-efficient CUDA with HIP fused WMMA using
+the identical saved fixture. It identifies accumulated BF16/kernel-order
+sensitivity, not a single bad block or a passing end-to-end edit.
+
 The 1024-condition native vision path converts BF16 checkpoint biases to F32
 for its F32 linear epilogue and rounds the patch GEMM output to BF16 before
 adding the bias, matching CUDA's two activation boundaries. On the same
