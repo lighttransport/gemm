@@ -156,7 +156,7 @@ ref/pixal3d/run.sh rocm rdna4/qimg21/pytorch_rocm_reference.py \
 ```
 
 Add `--capture-block0` with a fresh `--out-dir` to save the selected step's
-`block0/{time2,time2_silu,mod,hidden0,mod_ln,q,k,v,attn_raw,post_attn_hidden,block_00}.npy`
+`block0/{time2,time2_silu,mod,hidden0,mod_ln,q,k,v,attn_raw,attn_out,post_attn_hidden,mod_ln2,mlp_gate,mlp_proj,mlp_act,mlp_out,block_00}.npy`
 alongside the predictions. The default is step 0; `--capture-step 1` selects
 the second editing step. The hooks leave the two predictions byte-identical
 to the run without stage capture. This makes the PyTorch ROCm reference
@@ -212,6 +212,15 @@ block outputs start at cosine 0.999999816 after block 0, first fall below
 0.99996 after block 9, and end at 0.999939892 after block 31. All 32 values
 are saved in `tmp/qimg21-edit-rocm-block-compare-20260923.json`. This is
 gradual accumulated drift; the trace does not identify a single failed block.
+On identical native Q/K/V, PyTorch ROCm attention and HIP scalar attention
+reach target cosine 0.999999625. Replaying exact PyTorch ROCm hidden state and
+modulation into native block 0 barely changes its target output cosine
+(0.999999812); replaying PyTorch attention as well raises it to 0.999999981.
+After attention replay, target output projection differs in 472 of 1,048,576
+BF16 values, and the MLP output differs in 30,404 values. The detailed
+`--capture-block0` hooks leave both reference predictions and checkpoints
+byte-identical to the uncaptured run. These are guarded local diagnostics;
+injected-state runs do not emit a model prediction.
 With identical ROCm `hidden0` and `mod` replayed into native HIP, vector4
 `mod_ln` differs in 575 of 17,907,712 BF16 values; the free-running native
 state differs in 5,702. On identical `mod_ln` input, hipBLAS BF16-output QKV

@@ -136,14 +136,19 @@ def main():
         block0.attn.to_k.register_forward_hook(output_hook("k"))
         block0.attn.to_v.register_forward_hook(output_hook("v"))
         block0.attn.to_out[0].register_forward_pre_hook(input_hook("attn_raw"))
+        block0.attn.to_out[0].register_forward_hook(output_hook("attn_out"))
         block0.img_norm2.register_forward_pre_hook(input_hook("post_attn_hidden"))
+        block0.img_mlp.gate_layer.register_forward_hook(output_hook("mlp_gate"))
+        block0.img_mlp.proj.register_forward_hook(output_hook("mlp_proj"))
+        block0.img_mlp.out.register_forward_pre_hook(input_hook("mlp_act"))
+        block0.img_mlp.out.register_forward_hook(output_hook("mlp_out"))
         original_modulate = block0._modulate
         modulation_calls = [0]
 
         def capture_modulate(hidden_states, modulation, target_token_mask):
             result = original_modulate(hidden_states, modulation, target_token_mask)
-            if current_step[0] == args.capture_step and modulation_calls[0] == 0:
-                save("mod_ln", result[0])
+            if current_step[0] == args.capture_step and modulation_calls[0] < 2:
+                save("mod_ln" if modulation_calls[0] == 0 else "mod_ln2", result[0])
             modulation_calls[0] += 1
             return result
 
