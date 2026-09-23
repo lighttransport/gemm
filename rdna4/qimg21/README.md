@@ -128,9 +128,10 @@ ref/pixal3d/run.sh rocm rdna4/qimg21/pytorch_rocm_reference.py \
   --sdpa-backend efficient
 ```
 
-Add `--capture-block0` with a fresh `--out-dir` to save first-step
+Add `--capture-block0` with a fresh `--out-dir` to save the selected step's
 `block0/{time2,time2_silu,mod,hidden0,mod_ln,q,k,v,attn_raw,post_attn_hidden,block_00}.npy`
-alongside the predictions. The hooks leave the two predictions byte-identical
+alongside the predictions. The default is step 0; `--capture-step 1` selects
+the second editing step. The hooks leave the two predictions byte-identical
 to the run without stage capture. This makes the PyTorch ROCm reference
 directly comparable to `QIMG21_STAGE_BLOCK=0` dumps from the native runner.
 With identical ROCm `hidden0` and `mod` replayed into native HIP, vector4
@@ -149,6 +150,15 @@ includes framework-version differences (ROCm 2.11 versus CUDA 2.14) and
 does not, by itself, isolate GPU hardware rounding. Diagnostic FP64 timestep
 accumulation reaches 0.999960013 against PyTorch ROCm on step 0 but drops
 to 0.999873083 on step 1; it therefore remains non-production.
+The production scalar editing-attention path has saved-prediction cosine
+0.999930810 and 0.999860295 against CUDA, or 0.999974046 and 0.999884473
+against PyTorch ROCm. Its CUDA trajectory cosines are 0.999909817 and
+0.999910201, so it also misses the gate. A step-1 block-0 capture from the
+same ROCm inputs shows 603 differing BF16 values in the initial 17,907,712
+hidden values, then 5,728 at modulated normalization, 195,397 at Q, and
+3,200,496 after block 0. This is numerical amplification, not a GPU launch
+failure. The reference capture hooks leave both predictions byte-identical
+to the no-capture reference.
 The matched first-step trace has byte-identical BF16 timestep SiLU inputs on
 CUDA and ROCm; the second projection differs in 78 of 8192 BF16 values.
 Those differences propagate into 24 image-row and 233 text-row modulation

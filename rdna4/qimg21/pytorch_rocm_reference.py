@@ -33,7 +33,9 @@ def main():
                     help="use pinned Diffusers from another local environment; ROCm Torch stays loaded")
     ap.add_argument("--sdpa-backend", choices=("default", "efficient"), default="efficient")
     ap.add_argument("--capture-block0", action="store_true",
-                    help="dump first-step embedding and block-0 stages for native comparison")
+                    help="dump one step's embedding and block-0 stages for native comparison")
+    ap.add_argument("--capture-step", type=int, default=0,
+                    help="step to capture with --capture-block0 (default: 0)")
     args = ap.parse_args()
     if not torch.cuda.is_available():
         ap.error("PyTorch ROCm GPU access is required")
@@ -50,6 +52,8 @@ def main():
 
     capture = args.capture_dir.resolve()
     steps = capture_steps(capture)
+    if args.capture_block0 and not 0 <= args.capture_step < steps:
+        ap.error(f"--capture-step must be in [0, {steps})")
     layout = json.loads((capture / "positive_layout.json").read_text())
     shapes = [[tuple(int(x) for x in shape) for shape in image]
               for image in layout["img_shapes"]]
@@ -79,7 +83,7 @@ def main():
         stages.mkdir()
 
         def save(name, value):
-            if current_step[0] == 0:
+            if current_step[0] == args.capture_step:
                 if isinstance(value, tuple):
                     value = value[0]
                 np.save(stages / f"{name}.npy", value.detach().float().cpu().numpy())
@@ -109,7 +113,7 @@ def main():
 
         def capture_modulate(hidden_states, modulation, target_token_mask):
             result = original_modulate(hidden_states, modulation, target_token_mask)
-            if current_step[0] == 0 and modulation_calls[0] == 0:
+            if current_step[0] == args.capture_step and modulation_calls[0] == 0:
                 save("mod_ln", result[0])
             modulation_calls[0] += 1
             return result
@@ -123,6 +127,8 @@ def main():
     with torch.inference_mode(), context:
         for i in range(steps):
             current_step[0] = i
+            if args.capture_block0:
+                modulation_calls[0] = 0
             source = np.load(capture / f"input_{i:03d}.npy", allow_pickle=False)
             timestep = np.load(capture / f"timestep_{i:03d}.npy", allow_pickle=False)
             if (source.dtype != np.float32 or source.ndim != 3 or source.shape[0] != 1 or
