@@ -461,3 +461,30 @@ output projections, 843.9 ms FFN gate/up, and 426.6 ms FFN down. The extra
 ~0.09 s against the best earlier 11.355 tok/s run came from draft time, not
 target projections. This confirms that the exact compact target remains the
 primary throughput gap across two allocations.
+
+Hardware counters for 5000 isolated exact N=3 gate passes on `51877011`
+measured 393.1 billion instructions, 266.6 billion aggregate core cycles,
+111.8 billion backend-stall cycles, 0.95 billion frontend-stall cycles,
+3.46 billion L1D refills, and 1.00 billion L2D refills. The 83.56 billion
+SVE FMA instructions match 24 FMAs per 72-byte eight-row subblock; useful
+FMA issue was only about 0.314 per core-cycle against two per core-cycle
+FP32 peak. The event counts include benchmark setup, but 5000 kernel passes
+dominate the 2.8 s measured process, so they identify backend stalls and
+weight handling as the limiting work. Explicitly prefetching packed weights
+1, 4, 8, or 16 subblocks ahead retained the checksum and ranged from about
+0.497 to 0.505 ms per 50.135 MB pass, indistinguishable from the 0.498 ms
+baseline. It did not reduce the bottleneck.
+
+A lossless 288-byte tile rearrangement placed four 64-byte nibble streams
+before the 32 scale bytes, giving each nibble stream contiguous alignment.
+All 52,224 test outputs matched bit for bit, but the fixed N=3 matrix took
+about 0.731 ms versus 0.495 ms for the interleaved 72-byte subblocks. The
+nearby scale bytes in the current layout are more valuable than nibble-stream
+alignment; retain the interleaved tile.
+
+Changing the isolated weight initialization to row-local first touch and
+running with `numactl --localalloc` did not expose hidden CMG bandwidth:
+passes were about 0.51–0.54 ms versus about 0.50 ms with the same initializer
+under four-CMG interleave. The FP4 kernel's low FMA issue rate therefore
+cannot be explained by the simple interleaved-versus-local HBM policy in
+this fixed-shape test.
