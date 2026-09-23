@@ -320,6 +320,18 @@ original gate and corresponding reference floors. Rounding normalized
 probabilities to BF16 was worse locally (text cosine 0.999996901). The
 variant remains isolated under `tmp/qimg21_hip_attention_textbf16.hip` and
 `tmp/qimg21_native_textbf16_diag.c`; the production plugin is unchanged.
+The pinned PyTorch ROCm 2.11 oracle profiles as
+`aten::_efficient_attention_forward`/`attn_fwd` for all four editing
+segments (8 text, 4,096 condition, 12 text, 256 target rows). On gfx1201,
+`TORCH_ROCM_FA_PREFER_CK=1` reports that CK SDPA is unavailable on this
+architecture and in this PyTorch build; the preferred backend remains
+AOTriton. The two exact block-9 replays have byte-identical BF16 attention
+outputs across all 17,907,712 elements. The preference flag therefore cannot
+provide a second same-GPU attention oracle for this pinned environment.
+The profiler and comparison scripts and outputs are under
+`tmp/qimg21_sdpa_profile.py`, `tmp/qimg21-sdpa-profile-20260924.log`,
+`tmp/qimg21_sdpa_backend_compare.py`, and
+`tmp/qimg21-sdpa-{aotriton,ckpref}-20260924.npy`.
 On identical native Q/K/V, PyTorch ROCm attention and HIP scalar attention
 reach target cosine 0.999999625. Replaying exact PyTorch ROCm hidden state and
 modulation into native block 0 barely changes its target output cosine
