@@ -225,8 +225,24 @@ native-versus-PyTorch-ROCm prediction to meet or exceed pinned CUDA-versus-
 ROCm PyTorch on the exact same step input. Each native trajectory checkpoint
 would meet or exceed the CUDA-versus-ROCm free-running checkpoint, with both
 reference runs starting from byte-identical noise and step-0 transformer
-input. This tier passes both two-step fixtures, with positive margins on all
-eight comparisons. It is a proposal for review, not an acceptance test.
+input. A third house edit (`change the sky to sunset orange`, seed 44,
+512x512 target) tests the larger token count. The result is:
+
+| Fixture | Scalar attention floor tier | Fused WMMA floor tier | Existing 0.99996 gate |
+| --- | --- | --- | --- |
+| Apple edit, seed 42, 256x256 | Pass | Pass | Fail |
+| House edit, seed 43, 256x256 | Pass | Fail, second prediction | Fail |
+| House edit, seed 44, 512x512 | Fail, first prediction and trajectories | Pass | Fail |
+
+For seed 44, scalar native/ROCm predictions are
+0.999881516/0.999844265 against exact-input CUDA/ROCm floors
+0.999897000/0.999832010. Scalar trajectory cosines
+0.999837650/0.999836903 fall below full-run reference floors
+0.999859171/0.999858898. Fused WMMA exceeds all four floors on seed 44,
+but its seed-43 second prediction, 0.999807174, falls below the reference
+floor 0.999870206. Thus the proposed tier is **not met by either tested
+attention path across the three fixtures**. It remains a diagnostic
+criterion, not an accepted or passing replacement for the strict gate.
 `reference_floor_report.py` verifies the capture chain, identical starting
 inputs, saved native metrics, and both proposed and unchanged strict outcomes.
 Run it for the original fixture with:
@@ -240,8 +256,10 @@ python3 rdna4/qimg21/reference_floor_report.py \
   --out tmp/qimg21-edit-reference-floor-matched-20260924.json
 ```
 
-The independent result is in `tmp/qimg21-edit-house-seed43-floor-20260924.json`.
-The unchanged strict same-GPU editing gate remains open on both fixtures.
+The independent reports are `tmp/qimg21-edit-house-seed43-floor-20260924.json`
+and `tmp/qimg21-edit-house-512-seed44-floor-20260924.json`, with corresponding
+`-fused-floor-` reports. The unchanged strict same-GPU editing gate remains
+open on all three fixtures.
 
 On the free-running second-step ROCm input, the native and PyTorch ROCm target
 block outputs start at cosine 0.999999816 after block 0, first fall below
