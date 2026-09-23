@@ -162,6 +162,11 @@ to the no-capture reference.
 PyTorch ROCm's default and forced efficient SDPA produce byte-identical
 predictions on this fixture, so choosing between them does not resolve the
 editing miss.
+The regression harness accepts `--native-gemm scalar` as a diagnostic
+comparison. On the saved ROCm fixture, scalar GEMM produced cosines
+0.999920042 and 0.999871362, versus WMMA's 0.999974046 and 0.999884473;
+its trajectory was 0.999898372/0.999899996. WMMA therefore remains the
+production choice and scalar GEMM is not enabled by default.
 The matched first-step trace has byte-identical BF16 timestep SiLU inputs on
 CUDA and ROCm; the second projection differs in 78 of 8192 BF16 values.
 Those differences propagate into 24 image-row and 233 text-row modulation

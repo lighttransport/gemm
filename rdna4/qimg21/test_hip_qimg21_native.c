@@ -795,6 +795,12 @@ int main(int argc, char **argv) {
             else if (!strcmp(mode, "cutlass-efficient")) {cutlass_plugin_path="cuda/qimg21/libq21_cutlass_attention.so";qimg21_attention_reverse64=0;}
             else { fprintf(stderr, "native: unsupported attention mode\n"); return 2; }
         }
+        else if (!strcmp(argv[i], "--gemm") && i + 1 < argc) {
+            const char *mode = argv[++i];
+            if (!strcmp(mode, "wmma")) qimg21_use_wmma = 1;
+            else if (!strcmp(mode, "scalar")) qimg21_use_wmma = 0;
+            else { fprintf(stderr, "native: unsupported GEMM mode\n"); return 2; }
+        }
         else if (!strcmp(argv[i], "--prompt-embeds") && i + 1 < argc) prompt_path = argv[++i];
         else if (!strcmp(argv[i], "--cutlass-plugin") && i + 1 < argc) cutlass_plugin_path = argv[++i];
         else if (!strcmp(argv[i], "--rope-table-base") && i + 1 < argc) qimg21_rope_base_path = argv[++i];

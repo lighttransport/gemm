@@ -38,6 +38,7 @@ def main():
     ap.add_argument("--native-attention", choices=("math", "reverse64", "mma64", "mma64-flash", "mma64-mixed", "mma64-forward-flash", "mma128-efficient", "cutlass-efficient", "wmma", "wmma-fused"), default="math")
     ap.add_argument("--native-normalization", choices=("default", "vector4"), default="default")
     ap.add_argument("--native-rope", choices=("default", "host-table", "host-table-vector4", "host-table-exact"), default="default")
+    ap.add_argument("--native-gemm", choices=("wmma", "scalar"), default="wmma")
     quant = ap.add_mutually_exclusive_group()
     quant.add_argument("--quantized-transformer", type=Path)
     quant.add_argument("--quantize-on-load", choices=("int8-row",))
@@ -72,14 +73,14 @@ def main():
                "reference": str(ref), "model": str(args.model.resolve()),
                "true_cfg_scale": scale, "predictions": [], "trajectory": [],
                "attention": args.native_attention, "normalization": args.native_normalization,
-               "rope": args.native_rope}
+               "rope": args.native_rope, "gemm": args.native_gemm}
     first_condition = None
     first_fixture = None
 
     def command(fixture, metadata):
         cmd = [str(binary), "--model", str(args.model.resolve()),
                 "--attention", args.native_attention, "--normalization", args.native_normalization,
-                "--rope", args.native_rope,
+                "--rope", args.native_rope, "--gemm", args.native_gemm,
                 "--prompt-embeds", str(fixture / "prompt_embeds.npy"),
                 "--latents", str(fixture / "target_latents.npy"),
                 "--condition-latents", str(fixture / "condition_latents.npy"),
