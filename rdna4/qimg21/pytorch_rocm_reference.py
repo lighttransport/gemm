@@ -32,6 +32,8 @@ def main():
     ap.add_argument("--diffusers-site-packages", type=Path,
                     help="use pinned Diffusers from another local environment; ROCm Torch stays loaded")
     ap.add_argument("--sdpa-backend", choices=("default", "efficient"), default="efficient")
+    ap.add_argument("--capture-block0", action="store_true",
+                    help="dump first-step embedding and block-0 stages for native comparison")
     args = ap.parse_args()
     if not torch.cuda.is_available():
         ap.error("PyTorch ROCm GPU access is required")
@@ -71,6 +73,48 @@ def main():
         local_files_only=True, low_cpu_mem_usage=True)
     model.eval()
     cpu_offload(model, execution_device=torch.device("cuda"))
+    current_step = [-1]
+    if args.capture_block0:
+        stages = out / "block0"
+        stages.mkdir()
+
+        def save(name, value):
+            if current_step[0] == 0:
+                if isinstance(value, tuple):
+                    value = value[0]
+                np.save(stages / f"{name}.npy", value.detach().float().cpu().numpy())
+
+        def output_hook(name):
+            return lambda _module, _inputs, output: save(name, output)
+
+        def input_hook(name):
+            return lambda _module, inputs: save(name, inputs[0])
+
+        model.time_text_embed.register_forward_hook(output_hook("time2"))
+        model.modulation[0].register_forward_hook(output_hook("time2_silu"))
+        model.modulation.register_forward_hook(output_hook("mod"))
+        block0 = model.transformer_blocks[0]
+        block0.register_forward_pre_hook(
+            lambda _module, inputs, kwargs: save(
+                "hidden0", inputs[0] if inputs else kwargs["hidden_states"]),
+            with_kwargs=True)
+        block0.register_forward_hook(output_hook("block_00"))
+        block0.attn.to_q.register_forward_hook(output_hook("q"))
+        block0.attn.to_k.register_forward_hook(output_hook("k"))
+        block0.attn.to_v.register_forward_hook(output_hook("v"))
+        block0.attn.to_out[0].register_forward_pre_hook(input_hook("attn_raw"))
+        block0.img_norm2.register_forward_pre_hook(input_hook("post_attn_hidden"))
+        original_modulate = block0._modulate
+        modulation_calls = [0]
+
+        def capture_modulate(hidden_states, modulation, target_token_mask):
+            result = original_modulate(hidden_states, modulation, target_token_mask)
+            if current_step[0] == 0 and modulation_calls[0] == 0:
+                save("mod_ln", result[0])
+            modulation_calls[0] += 1
+            return result
+
+        block0._modulate = capture_modulate
     embeds = torch.from_numpy(prompt).to("cuda", dtype=torch.bfloat16)
     img_mask = torch.from_numpy(image_mask).to("cuda")
     enc_mask = torch.from_numpy(key_mask).to("cuda")
@@ -78,6 +122,7 @@ def main():
     context = sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION) if args.sdpa_backend == "efficient" else nullcontext()
     with torch.inference_mode(), context:
         for i in range(steps):
+            current_step[0] = i
             source = np.load(capture / f"input_{i:03d}.npy", allow_pickle=False)
             timestep = np.load(capture / f"timestep_{i:03d}.npy", allow_pickle=False)
             if (source.dtype != np.float32 or source.ndim != 3 or source.shape[0] != 1 or

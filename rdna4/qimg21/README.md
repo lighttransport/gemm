@@ -128,6 +128,19 @@ ref/pixal3d/run.sh rocm rdna4/qimg21/pytorch_rocm_reference.py \
   --sdpa-backend efficient
 ```
 
+Add `--capture-block0` with a fresh `--out-dir` to save first-step
+`block0/{time2,time2_silu,mod,hidden0,mod_ln,q,k,v,attn_raw,post_attn_hidden,block_00}.npy`
+alongside the predictions. The hooks leave the two predictions byte-identical
+to the run without stage capture. This makes the PyTorch ROCm reference
+directly comparable to `QIMG21_STAGE_BLOCK=0` dumps from the native runner.
+With identical ROCm `hidden0` and `mod` replayed into native HIP, vector4
+`mod_ln` differs in 575 of 17,907,712 BF16 values; the free-running native
+state differs in 5,702. On identical `mod_ln` input, hipBLAS BF16-output QKV
+matches PyTorch ROCm bit-for-bit, but substituting hipBLAS QKV throughout
+the native model does not pass both editing steps. FP64 normalization also
+improves the first step while worsening the second. Neither experiment is
+selected for production; the remaining divergence is amplified across blocks.
+
 On the saved two-step fixture, PyTorch ROCm predictions have cosine
 0.999936229 and 0.999861802 against the PyTorch CUDA capture. Native HIP
 predictions have cosine 0.999939325 and 0.999882018 against PyTorch ROCm.
