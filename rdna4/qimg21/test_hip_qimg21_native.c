@@ -789,7 +789,7 @@ int main(int argc, char **argv) {
             else if (!strcmp(mode, "math")) qimg21_attention_reverse64 = 0;
             else if (!strcmp(mode, "mma64") || !strcmp(mode, "mma64-flash") ||
                      !strcmp(mode, "mma64-mixed") || !strcmp(mode, "mma64-forward-flash") ||
-                     !strcmp(mode, "mma128-efficient")) {
+                     !strcmp(mode, "mma128-efficient") || !strcmp(mode, "cutlass-efficient")) {
                 fprintf(stderr, "native: %s is CUDA-only; use math, reverse64, wmma, or wmma-fused on RDNA4\n", mode);
                 return 2;
             }

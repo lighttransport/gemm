@@ -248,7 +248,13 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--dump-dir") && i + 1 < argc) dump_dir = argv[++i];
         else if (!strcmp(argv[i], "--merged-out") && i + 1 < argc) merged_out = argv[++i];
         else if (!strcmp(argv[i], "--deepstack-dir") && i + 1 < argc) deepstack_dir = argv[++i];
-        else if (!strcmp(argv[i], "--attention") && i + 1 < argc) attention_mode = argv[++i];
+        else if (!strcmp(argv[i], "--attention") && i + 1 < argc) {
+            attention_mode = argv[++i];
+            if (!strcmp(attention_mode, "cutlass") || !strcmp(attention_mode, "flash")) {
+                fprintf(stderr, "vision: %s attention is CUDA-only; use math on RDNA4\n", attention_mode);
+                return 2;
+            }
+        }
         else if (!strcmp(argv[i], "--flash-plugin") && i + 1 < argc) flash_plugin_path = argv[++i];
         else if (!strcmp(argv[i], "--layer-norm") && i + 1 < argc) layer_norm_mode = argv[++i];
         else if (!strcmp(argv[i], "--norm1-override") && i + 1 < argc) norm1_override = argv[++i];

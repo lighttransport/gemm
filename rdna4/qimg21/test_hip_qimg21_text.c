@@ -81,7 +81,13 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--hidden") && i + 1 < argc) hidden_input = argv[++i];
         else if (!strcmp(argv[i], "--image-grid-height") && i + 1 < argc) image_grid_h = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--image-grid-width") && i + 1 < argc) image_grid_w = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--attention") && i + 1 < argc) attention_mode = argv[++i];
+        else if (!strcmp(argv[i], "--attention") && i + 1 < argc) {
+            attention_mode = argv[++i];
+            if (!strcmp(attention_mode, "cutlass-efficient") || !strcmp(attention_mode, "flash-exact")) {
+                fprintf(stderr, "text: %s attention is CUDA-only; use custom on RDNA4\n", attention_mode);
+                return 2;
+            }
+        }
         else if (!strcmp(argv[i], "--rms") && i + 1 < argc) rms_mode = argv[++i];
         else if (!strcmp(argv[i], "--post-rms") && i + 1 < argc) post_rms_mode = argv[++i];
         else if (!strcmp(argv[i], "--bf16-gemm-output")) text_bf16_gemm_output = 1;
