@@ -59,7 +59,7 @@ static int q38_nvfp4_plan(const gguf_context *g, q38_nvfp4_layout **out,
     return 0;
 }
 
-static int q38_nvfp4_plan_tiled(const gguf_context *g,
+static int q38_nvfp4_plan_tiled(const gguf_context *g, int tile_nextn_ffn,
                                 q38_nvfp4_layout **out, int *out_count) {
     if (!g || g->n_shards || !g->data) return -1;
     size_t n = (size_t)g->n_tensors;
@@ -77,11 +77,16 @@ static int q38_nvfp4_plan_tiled(const gguf_context *g,
         d->cols = ti->dims[0];
         d->rows = 1;
         for (uint32_t k = 1; k < ti->n_dims; k++) d->rows *= ti->dims[k];
-        /* Native NextN tensors are a small separate draft path. Keep their
-         * GGUF row layout so their teacher-forced logits stay unchanged. */
+        /* The NextN FFN can use exact tiles when its fused gate/up worker is
+         * tile-aware. Keep all other draft tensors in their GGUF row layout. */
         int nextn_tensor = strstr(ti->name.str, "nextn") != NULL ||
                            strncmp(ti->name.str, "blk.64.", 7) == 0;
-        d->packed = !nextn_tensor && ti->type == GGML_TYPE_NVFP4 && ti->n_dims >= 2 &&
+        int nextn_ffn = tile_nextn_ffn &&
+            (!strcmp(ti->name.str, "blk.64.ffn_gate.weight") ||
+             !strcmp(ti->name.str, "blk.64.ffn_up.weight") ||
+             !strcmp(ti->name.str, "blk.64.ffn_down.weight"));
+        d->packed = (!nextn_tensor || nextn_ffn) &&
+                    ti->type == GGML_TYPE_NVFP4 && ti->n_dims >= 2 &&
                     d->cols % 64 == 0 && d->rows % 8 == 0;
         count += d->packed;
     }

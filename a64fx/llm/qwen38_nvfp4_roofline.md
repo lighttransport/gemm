@@ -155,3 +155,36 @@ a64fx/llm/run_qwen38_nvfp4_cmg4.sh MODEL --prompt hi --max-seq 256 \
 a64fx/llm/run_qwen38_nvfp4_cmg4.sh MODEL --max-seq 256 \
     --nvfp4-exact-tiled --q6-exact-head --kernel-probe 200 --kernel-probe-check
 ```
+
+The NextN draft FFN's three `blk.64` NVFP4 matrices total 0.150 GB per
+draft call. They previously stayed in GGUF row layout because a full-model
+tile experiment changed the drafts to token zero. A separate probe located
+the defect: the fused gate/up matvec decoded tiled weights as GGUF rows.
+The fused worker now dispatches tile-aware matvecs for both matrices.
+`--nextn-tile-probe` compares the original and tiled NextN path after prompt
+prefill; all three matrix outputs match bitwise, the full logits have a
+maximum 5.01e-6 difference from accumulation order, and the top ID matches.
+
+`--nextn-exact-tiled` tiles only those three draft FFN matrices. On the
+32-token matrix-multiplication prompt, K=3 with this flag reached 9.250
+tok/s, accepted 20/26 drafts, and matched all 32 serial target `(position,
+ID)` pairs. Draft time fell from 878 to 566 ms; target verification remained
+2.79 s. Enabling the existing NextN persistent worker modes cut draft time
+further to 421 ms and raised the same trace to **9.743 tok/s**, again with
+32/32 exact target IDs. These timings include only decode, not model load.
+At 40 tok/s the 32-token trace must finish in 0.8 s, so the current 2.76 s
+target-verification stage alone exceeds the full budget by 3.45x. The exact
+projection kernels, particularly gate/up and down, remain the limiting work.
+The 64-token `hi` trace reached 8.645 tok/s with 35/58 drafts accepted; all
+64 `(position, ID)` pairs matched serial target decode.
+
+```sh
+export TF_NEXTN_FFN_PERSIST=1 TF_NEXTN_BLOCK_PERSIST=1
+export TF_NEXTN_FULL_PERSIST=1 TF_NEXTN_ATTN_BLOCK_PERSIST=1
+export TF_NEXTN_QKV_PERSIST=1 TF_NEXTN_INLINE_ARGMAX=1
+export TF_KV_DTYPE=f32 TF_DUMP_TOKENS=1
+a64fx/llm/run_qwen38_nvfp4_cmg4.sh MODEL \
+    --prompt 'Explain how matrix multiplication works in one paragraph.' \
+    --max-seq 256 --max-gen 32 --spec-k 3 --spec-verify \
+    --nvfp4-exact-tiled --nextn-exact-tiled --q6-exact-head
+```

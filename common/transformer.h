@@ -3868,6 +3868,14 @@ static void *tf_qmatvec_fused2_worker(void *arg) {
                              t->x, n_cols, t->row_start, t->row_end);
         tf_matvec_q4_0_rows(t->dst2, (const uint8_t *)t->mat2->data, row_bytes,
                              t->x, n_cols, t->row_start, t->row_end);
+#if defined(__ARM_FEATURE_SVE)
+    } else if (t->mat1->type == GGML_TYPE_NVFP4 &&
+               t->mat1->nvfp4_tiled && t->mat2->nvfp4_tiled) {
+        tf_nvfp4_tiled_matvec_rows(t->dst1, t->mat1, t->x,
+                                   t->row_start, t->row_end);
+        tf_nvfp4_tiled_matvec_rows(t->dst2, t->mat2, t->x,
+                                   t->row_start, t->row_end);
+#endif
     } else {
         /* Generic path for other quantized weights — AVX2 dot product */
         float *tmp = (float *)malloc(n_cols * sizeof(float));

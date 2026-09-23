@@ -118,6 +118,102 @@ static int run_kernel_probe(transformer_model *m, int rounds, int check) {
     return 0;
 }
 
+static int run_nextn_tile_probe(transformer_model *m, int32_t prev, int position) {
+    if (!m->nextn.loaded || position < 0) return 1;
+    transformer_layer *layer = &m->nextn.layer;
+    qtensor *mats[] = {&layer->ffn_gate, &layer->ffn_up, &layer->ffn_down};
+    qtensor saved[3];
+    void *copies[3] = {NULL, NULL, NULL};
+    int matrix_mismatch = 0;
+    float *seed = malloc((size_t)m->n_embd * sizeof(float));
+    float *reference = malloc((size_t)m->n_vocab * sizeof(float));
+    int rc = 1;
+    if (!seed || !reference) goto done;
+    tf_rmsnorm(seed, transformer_get_hidden(m), &m->output_norm,
+               m->n_embd, m->rms_norm_eps, m->matvec_tmp);
+    float *logits = transformer_nextn_logits(m, prev, seed, position);
+    if (!logits) goto done;
+    memcpy(reference, logits, (size_t)m->n_vocab * sizeof(float));
+    int original_id = argmax(reference, m->n_vocab);
+    for (int mi = 0; mi < 3; mi++) {
+        qtensor *mat = mats[mi];
+        saved[mi] = *mat;
+        if (mat->type != GGML_TYPE_NVFP4 || mat->n_rows % 8 ||
+            mat->n_cols % 64) goto done;
+        int nb = mat->n_cols / 64;
+        size_t tiles = (size_t)mat->n_rows / 8;
+        size_t bytes = tiles * (size_t)nb * sizeof(tf_nvfp4_tiled_block);
+        if (posix_memalign(&copies[mi], 256, bytes)) goto done;
+        const block_nvfp4 *source = mat->data;
+        tf_nvfp4_tiled_block *dest = copies[mi];
+        #ifdef _OPENMP
+        #pragma omp parallel for num_threads(m->n_threads) schedule(static)
+        #endif
+        for (size_t tile = 0; tile < tiles; tile++) {
+            for (int b = 0; b < nb; b++)
+                for (int s = 0; s < 4; s++) {
+                    tf_nvfp4_tiled_subblock *p = &dest[tile * nb + b].s[s];
+                    for (int r = 0; r < 8; r++) {
+                        const block_nvfp4 *q = source + (tile * 8 + r) * nb + b;
+                        p->d[r] = q->d[s];
+                        memcpy(p->qs + r * 8, q->qs + s * 8, 8);
+                    }
+                }
+        }
+        mat->data = copies[mi];
+        mat->nvfp4_tiled = 1;
+        float *input = malloc((size_t)mat->n_cols * sizeof(float));
+        float *a = malloc((size_t)mat->n_rows * sizeof(float));
+        float *b = malloc((size_t)mat->n_rows * sizeof(float));
+        if (!input || !a || !b) {
+            free(input); free(a); free(b); goto done;
+        }
+        for (int i = 0; i < mat->n_cols; i++)
+            input[i] = (float)((i * 13) % 67 - 33) * 0.03125f;
+        tf_matvec_qtensor_rows(a, &saved[mi], input, 0, mat->n_rows);
+        tf_matvec_qtensor_rows(b, mat, input, 0, mat->n_rows);
+        int mismatch = 0, nonfinite = 0, first = -1;
+        for (int i = 0; i < mat->n_rows; i++) {
+            if (memcmp(&a[i], &b[i], sizeof(float))) {
+                mismatch++;
+                if (first < 0) first = i;
+            }
+            uint32_t bits;
+            memcpy(&bits, &b[i], sizeof(bits));
+            nonfinite += (bits & 0x7f800000u) == 0x7f800000u;
+        }
+        fprintf(stderr, "qwen38: nextn_tile_mat %d mismatch=%d/%d nonfinite=%d first=%d ref=%a tiled=%a\n",
+                mi, mismatch, mat->n_rows, nonfinite, first,
+                first < 0 ? 0.0f : a[first], first < 0 ? 0.0f : b[first]);
+        matrix_mismatch += mismatch + nonfinite;
+        free(input); free(a); free(b);
+    }
+    logits = transformer_nextn_logits(m, prev, seed, position);
+    if (!logits) goto done;
+    int tiled_id = argmax(logits, m->n_vocab);
+    int mismatch = 0, nonfinite = 0;
+    float max_delta = 0.0f;
+    for (int i = 0; i < m->n_vocab; i++) {
+        mismatch += memcmp(&reference[i], &logits[i], sizeof(float)) != 0;
+        uint32_t bits;
+        memcpy(&bits, &logits[i], sizeof(bits));
+        nonfinite += (bits & 0x7f800000u) == 0x7f800000u;
+        float delta = fabsf(reference[i] - logits[i]);
+        if (delta > max_delta) max_delta = delta;
+    }
+    fprintf(stderr, "qwen38: nextn_tile_probe original_id=%d tiled_id=%d mismatches=%d/%d nonfinite=%d max_delta=%g first_ref=%a first_tiled=%a\n",
+            original_id, tiled_id, mismatch, m->n_vocab, nonfinite,
+            max_delta, reference[0], logits[0]);
+    rc = matrix_mismatch == 0 && nonfinite == 0 && original_id == tiled_id ? 0 : 1;
+done:
+    for (int mi = 0; mi < 3; mi++) {
+        if (copies[mi]) *mats[mi] = saved[mi];
+        free(copies[mi]);
+    }
+    free(seed); free(reference);
+    return rc;
+}
+
 #include "qwen38_spec_verify.h"
 
 #define QWEN38_BENCH_MAX_CASES 16
@@ -276,8 +372,8 @@ static int run_benchmark(transformer_model *m, bpe_vocab *v, int32_t *tok,
 
 static void usage(const char *p) {
     fprintf(stderr, "usage: %s MODEL --prompt TEXT [--max-gen N] [--max-seq N] "
-                    "[--threads N] [--spec-k 0..4] [--spec-verify] [--batch-probe 2..4] [--kernel-probe N] [--kernel-probe-check] [--mmap] "
-                    "[--fast-swiglu] [--nvfp4-fast] [--nvfp4-packed] [--nvfp4-exact-tiled] [--q6-exact-head] [--q8-mode auto|reference|cmg4|cmg4-a15|block64|block64-ffn|block64-exact|row] "
+                    "[--threads N] [--spec-k 0..4] [--spec-verify] [--batch-probe 2..4] [--kernel-probe N] [--kernel-probe-check] [--nextn-tile-probe] [--mmap] "
+                    "[--fast-swiglu] [--nvfp4-fast] [--nvfp4-packed] [--nvfp4-exact-tiled] [--nextn-exact-tiled] [--q6-exact-head] [--q8-mode auto|reference|cmg4|cmg4-a15|block64|block64-ffn|block64-exact|row] "
                     "[--bench --bench-prompt N[,N...] --bench-gen N[,N...] "
                     "--bench-runs N --bench-warmup N --bench-csv]\n", p);
 }
@@ -289,8 +385,10 @@ int main(int argc, char **argv) {
     const char *bench_gen_arg = "128";
     int max_gen = 16, max_seq = 512, threads = 48, spec_k = 0, mmap_weights = 0;
     int fast_swiglu = 0, nvfp4_fast = 0, nvfp4_packed = 0;
-    int nvfp4_exact_tiled = 0, q6_exact_head = 0, batch_probe = 0;
+    int nvfp4_exact_tiled = 0, nextn_exact_tiled = 0;
+    int q6_exact_head = 0, batch_probe = 0;
     int spec_verify = 0, kernel_probe = 0, kernel_probe_check = 0;
+    int nextn_tile_probe = 0;
     int bench = 0, bench_runs = 3, bench_warmup = 1, bench_csv = 0;
     int bench_prompt_sizes[QWEN38_BENCH_MAX_CASES];
     int bench_gen_sizes[QWEN38_BENCH_MAX_CASES];
@@ -305,6 +403,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--batch-probe") && ++i < argc) batch_probe = atoi(argv[i]);
         else if (!strcmp(argv[i], "--kernel-probe") && ++i < argc) kernel_probe = atoi(argv[i]);
         else if (!strcmp(argv[i], "--kernel-probe-check")) kernel_probe_check = 1;
+        else if (!strcmp(argv[i], "--nextn-tile-probe")) nextn_tile_probe = 1;
         else if (!strcmp(argv[i], "--q8-mode") && ++i < argc) q8_mode = argv[i];
         else if (!strcmp(argv[i], "--mmap")) mmap_weights = 1;
         else if (!strcmp(argv[i], "--bench")) bench = 1;
@@ -316,6 +415,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--nvfp4-fast")) nvfp4_fast = 1;
         else if (!strcmp(argv[i], "--nvfp4-packed")) nvfp4_packed = 1;
         else if (!strcmp(argv[i], "--nvfp4-exact-tiled")) nvfp4_exact_tiled = 1;
+        else if (!strcmp(argv[i], "--nextn-exact-tiled")) nextn_exact_tiled = 1;
         else if (!strcmp(argv[i], "--q6-exact-head")) q6_exact_head = 1;
         else if (!strcmp(argv[i], "--bench-csv")) bench_csv = 1;
         else if (argv[i][0] != '-' && !path) path = argv[i];
@@ -324,6 +424,9 @@ int main(int argc, char **argv) {
     if (!path || spec_k < 0 || spec_k > 4 || max_seq < 2 || max_gen < 0 ||
         threads < 1 || bench_runs < 1 || bench_warmup < 0 ||
         kernel_probe < 0 || (kernel_probe_check && !kernel_probe) ||
+        (nextn_exact_tiled && !nvfp4_exact_tiled) ||
+        (nextn_tile_probe && (nextn_exact_tiled || !nvfp4_exact_tiled || !q6_exact_head ||
+                             !spec_verify || batch_probe || bench || kernel_probe)) ||
         (kernel_probe && (bench || batch_probe || spec_k ||
             !nvfp4_exact_tiled || !q6_exact_head)) ||
         (batch_probe && (batch_probe < 2 || batch_probe > 4 || spec_k || bench)) ||
@@ -415,7 +518,8 @@ int main(int argc, char **argv) {
     if (nvfp4_exact_tiled) {
         if (mmap_weights || q8_model || m->use_moe || threads != 48 ||
             !getenv("NUMA_DISTRIBUTE") || g->fd < 0 ||
-            q38_nvfp4_plan_tiled(g, &pack_layout, &pack_count) ||
+            q38_nvfp4_plan_tiled(g, nextn_exact_tiled,
+                                  &pack_layout, &pack_count) ||
             pack_count == 0) {
             fprintf(stderr, "qwen38: --nvfp4-exact-tiled requires dense, "
                             "anonymous NVFP4 with 48 NUMA workers\n");
@@ -560,6 +664,11 @@ int main(int argc, char **argv) {
     double pf_ffn_gateup = tf_decode_ffn_gateup_ms, pf_ffn_down = tf_decode_ffn_down_ms;
     double pf_lm_head = tf_decode_lm_head_ms;
     int32_t cur = transformer_last_argmax(m);
+    if (nextn_tile_probe) {
+        int rc = run_nextn_tile_probe(m, cur, nt - 1);
+        free(tok); transformer_free(m); bpe_vocab_free(v); gguf_close(g);
+        return rc;
+    }
     if (spec_verify) {
         if (m->kv_cache_type != 0) {
             fprintf(stderr, "qwen38: --spec-verify requires TF_KV_DTYPE=f32\n");

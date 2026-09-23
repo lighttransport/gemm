@@ -15,6 +15,7 @@ static int q38_spec_verify(transformer_model *m, bpe_vocab *v, int pos,
     int *conv_pos = NULL;
     int32_t batch[4], target[4];
     int rc = 1, initialized = 0, generated = 0, rounds = 0, accepted_total = 0;
+    double draft_s = 0.0, verify_s = 0.0, commit_s = 0.0;
     if (k < 2 || k > 4 || m->kv_cache_type != 0 || !m->nextn.loaded)
         return 2;
     if (posix_memalign((void **)&arena, 256, (size_t)k * slot_stride * sizeof(float)))
@@ -56,6 +57,7 @@ static int q38_spec_verify(transformer_model *m, bpe_vocab *v, int pos,
                ne, m->rms_norm_eps, m->matvec_tmp);
     double t0 = now_sec();
     while (generated < max_gen) {
+        double round_t0 = now_sec();
         if (pos + k >= m->max_seq_len) {
             fprintf(stderr, "qwen38: speculative verifier exceeded context\n");
             goto done;
@@ -71,11 +73,13 @@ static int q38_spec_verify(transformer_model *m, bpe_vocab *v, int pos,
             prev = batch[j];
             draft_h = transformer_nextn_hidden(m);
         }
+        double draft_end = now_sec();
         for (int l = 0; l < layers; l++)
             conv_pos[l] = m->conv_state_pos ? m->conv_state_pos[l] : 0;
         tf_batch_all_logits = all_logits;
         tf_batch_hidden_out = &batch_hidden;
         float *ok = transformer_prefill_gemm(m, batch, k, pos);
+        double verify_end = now_sec();
         tf_batch_all_logits = NULL;
         tf_batch_hidden_out = NULL;
         if (!ok || !batch_hidden) {
@@ -128,6 +132,9 @@ static int q38_spec_verify(transformer_model *m, bpe_vocab *v, int pos,
         pos += committed;
         accepted_total += accepted;
         rounds++;
+        draft_s += draft_end - round_t0;
+        verify_s += verify_end - draft_end;
+        commit_s += now_sec() - verify_end;
     }
     rc = 0;
 done:
@@ -158,6 +165,8 @@ done:
         fprintf(stderr, "qwen38: spec_profile proj=%.1f out=%.1f ffn_proj=%.1f down=%.1f ms\n",
                 profile.proj_ms, profile.out_proj_ms, profile.ffn_proj_ms,
                 profile.ffn_down_ms);
+        fprintf(stderr, "qwen38: spec_stage draft=%.1f verify=%.1f commit=%.1f ms\n",
+                draft_s * 1000.0, verify_s * 1000.0, commit_s * 1000.0);
         fputc('\n', stdout);
     }
     free(conv_pos); free(orig_rec); free(orig_conv); free(slots);
