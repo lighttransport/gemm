@@ -516,3 +516,16 @@ a branchless pair-specific table is not available for this A64FX SVE target.
 The narrow scale distribution therefore remains an opportunity for a more
 substantial encoding/kernel redesign, but these direct substitutions should
 not enter the runner.
+
+A fused signed-byte coefficient trial used the common low UE4M3 scales in a
+more direct way. For scale bytes `1`–`4`, the exact product of FP4 code and
+scale is `int8_coefficient * 2^-10`. The 3×5120 FP32 activation input was
+pre-scaled by `2^-10` (exact for the benchmark's normal finite values), so
+the hot N=3 loop needed only signed-byte widening, FP32 conversion, and
+six candidate FMAs per row pair. All 52,224 outputs matched the original
+compact kernel **bit for bit**. However, the sidecar increased the 50.135 MB
+matrix to 89.129 MB; steady passes were about **0.54–0.55 ms** against
+**0.51–0.52 ms** compact. Occasional 0.38 ms sidecar passes were not
+repeatable. Higher real scale bytes would additionally require an exact
+fallback. The common-scale property therefore did not yield a useful
+resident target kernel in this representation.
