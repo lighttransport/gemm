@@ -450,3 +450,30 @@ Automatic kernels use the gfx12 WMMA attention adapter here; profile counters
 show zero explicit MMA GEMMs because automatic GEMM selection retains the
 vendor BLAS path. The sampler's total-device figures include other processes;
 the table uses the runner's own peak reserved allocation counter.
+
+The house fixture was repeated with identical arguments. ROCm observed
+250.177, 231.167, and 262.195 seconds; CUDA observed 446.579 and 468.696
+seconds with a 7,168 MiB budget because an unrelated process held about 7.8
+GiB on the RTX 5060 Ti. All five GLBs pass the validator. ROCm runs one and
+three have byte-identical GLBs (936,320 triangles), while run two is a valid
+but different 996,574-triangle mesh. The two CUDA GLBs are byte-identical
+(937,762 triangles). Repeated ROCm multiview runs were also byte-identical
+(968,682 triangles), at 452.329 and 474.398 seconds.
+
+For a kernel-level comparison, `benchmark_flow_block.py` replayed the same
+real house Shape-1024 noise and conditioning from
+`tmp/pixal3d/resident-runs/rocm-house/dumps`: 10,667 tokens, 30 blocks, mixed
+precision, resident automatic kernels, 7,168 MiB budget, one cold pass and
+three warm repeats. Warm medians were 2.0060 seconds on ROCm and 6.1932
+seconds on CUDA. The output cosine was 0.999999133. Profile counters recorded
+120 MMA attention calls on each backend, with peak reserved device allocations
+of 3,865,546,416 and 3,996,622,512 bytes respectively. The CUDA timing was
+measured while the independent 7.8 GiB GPU process was active.
+
+As a separate BF16 WMMA diagnostic on ROCm, `--gpu-kernels mma
+--gpu-flow-precision bf16` exercised 5,122 explicit MMA GEMMs and 120 MMA
+attentions on the same 30-block input. Its output cosine against BF16
+automatic vendor GEMM was 0.999985775, with a 7.0144-second warm median
+versus 1.9970 seconds for vendor GEMM. The production mixed-precision path
+keeps its surrounding GEMMs in FP32; forcing `mma` there records zero MMA
+GEMMs and does not change its 2.00-second median.
