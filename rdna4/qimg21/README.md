@@ -238,6 +238,25 @@ capture, replay, attention probe, and regression results are under
 `tmp/qimg21-edit-rocm-block09-*-20260924/`,
 `tmp/qimg21-edit-reference-rocm-math-20260924/`, and
 `tmp/qimg21-edit-rocm-math-regression-20260924/`.
+An exact-input fused-WMMA replay at block 9 improves target attention cosine
+against the efficient-SDPA oracle from the scalar path's 0.999999181145 to
+0.999999943431, and block-output cosine from 0.999999245333 to
+0.999999697456. With the full model free-running on the same second-step
+input, fused-WMMA block outputs are closer through block 13 but farther from
+block 14 onward; the final block cosines are 0.999937049 fused versus
+0.999939892 scalar. Replaying the exact PyTorch hidden state at block 14
+again favors fused locally: target attention 0.999999941550 versus
+0.999999238524, and block output 0.999999333924 versus 0.999998586141.
+Thus the free-running reversal reflects accumulated state, not a local
+block-14 fused-kernel regression. A diagnostic run with fused attention in
+blocks 0..13 and scalar thereafter failed both predictions
+(0.999941087/0.999875433) and both trajectories
+(0.999924037/0.999924979). The experimental selector was removed; the
+production paths and strict gate remain unchanged. Matched block traces and
+replays are under `tmp/qimg21-edit-rocm-fused-blocks-20260924/`,
+`tmp/qimg21-edit-rocm-fused-block-compare-20260924.json`,
+`tmp/qimg21-edit-rocm-block14-*-20260924/`, and
+`tmp/qimg21-edit-rocm-hybrid14-regression-20260924/`.
 On identical native Q/K/V, PyTorch ROCm attention and HIP scalar attention
 reach target cosine 0.999999625. Replaying exact PyTorch ROCm hidden state and
 modulation into native block 0 barely changes its target output cosine
