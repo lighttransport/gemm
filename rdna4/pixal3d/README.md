@@ -17,3 +17,15 @@ The workspace budget is enforced inside the backend, including pooled
 resident buffers, so the web server can run the 1024-cascade within the
 configured VRAM limit. The backend is loaded by the Pixal3D server through
 `rdna4/pixal3d/libpixal3d_rocm.so`.
+
+Validate the resident kernels against PyTorch ROCm with:
+
+```sh
+ref/pixal3d/run.sh rocm ref/pixal3d/validate_resident.py --backend rocm
+```
+
+The suite includes a 1,024-token, 12-head BF16 attention case and asserts
+that the WMMA attention counter advances, so a scalar fallback cannot pass
+unnoticed. On the RX 9070 XT this case has cosine 0.999999475 and normalized
+RMSE 0.001025 against PyTorch ROCm. The shared test also passes on the RTX
+5060 Ti CUDA backend.

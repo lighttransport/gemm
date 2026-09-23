@@ -91,6 +91,19 @@ try:
             expected=F.scaled_dot_product_attention(*ts)[0].transpose(0,1)
             op=Op(op=11,precision=prec,n=n,c=128,k=m,heads=2,x=upload(q),w=upload(k),v=upload(v))
             check(f'attention_{prec}_{n}_{m}',run(op,(n,2,128)),expected,prec);free()
+    # Exercise the production-size fused WMMA attention path, not only the
+    # short two-head cases above. This also covers multiple full 128-token tiles.
+    n,heads,hd=1024,12,128
+    q,k,v=[torch.randn(n,heads,hd).bfloat16().float() for _ in range(3)]
+    ts=[z.to('cuda',torch.bfloat16).transpose(0,1)[None] for z in [q,k,v]]
+    expected=F.scaled_dot_product_attention(*ts)[0].transpose(0,1)
+    op=Op(op=11,precision=1,n=n,c=hd,k=n,heads=heads,x=upload(q),w=upload(k),v=upload(v))
+    attention_before=Metrics()
+    assert lib.px_gpu_metrics(d,C.byref(attention_before))==0
+    check(f'attention_1_{n}_{n}_{heads}h',run(op,(n,heads,hd)),expected,1);free()
+    attention_after=Metrics()
+    assert lib.px_gpu_metrics(d,C.byref(attention_after))==0
+    assert attention_after.mma_attentions>attention_before.mma_attentions, 'Full-tile WMMA attention was not used'
     # Cached RoPE phases must preserve the original per-head calculation exactly.
     for prec,dt in [(0,torch.float32),(1,torch.bfloat16),(2,torch.float16)]:
         n,heads,hd=67,2,128

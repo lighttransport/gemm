@@ -159,6 +159,9 @@ hidden values, then 5,728 at modulated normalization, 195,397 at Q, and
 3,200,496 after block 0. This is numerical amplification, not a GPU launch
 failure. The reference capture hooks leave both predictions byte-identical
 to the no-capture reference.
+PyTorch ROCm's default and forced efficient SDPA produce byte-identical
+predictions on this fixture, so choosing between them does not resolve the
+editing miss.
 The matched first-step trace has byte-identical BF16 timestep SiLU inputs on
 CUDA and ROCm; the second projection differs in 78 of 8192 BF16 values.
 Those differences propagate into 24 image-row and 233 text-row modulation
