@@ -199,20 +199,36 @@ the native scalar-attention path reaches prediction cosines 0.999974046 and
 trajectory checkpoints pass the unchanged 0.99996 gate, while the second
 matched-input prediction still fails. The free-running CUDA/ROCm trajectory
 cosines are 0.999917801 and 0.999917953. With identical captured inputs,
-pinned CUDA PyTorch 2.14 versus ROCm PyTorch 2.11 prediction cosines are
-0.999936229 and 0.999861802; these are a cross-framework reference floor,
-not native acceptance results. A defensible cross-platform criterion would
-retain 0.99996 for native versus same-GPU predictions and trajectory, and
+pinned CUDA PyTorch 2.14 versus ROCm PyTorch 2.11 prediction cosines on the
+original fixed inputs are 0.999936229 and 0.999861802. The free-running ROCm
+second-step input differs from that original capture, so the latter cosine
+must not be paired with the native free-running regression. Replaying pinned
+CUDA PyTorch on the *ROCm free-running inputs* instead gives same-input
+reference cosines 0.999936229 and 0.999836624. These are cross-framework
+reference floors, not native acceptance results. A defensible cross-platform
+criterion would retain 0.99996 for native versus same-GPU predictions and trajectory, and
 report CUDA versus ROCm reference drift separately. Do not relax the
 nonquantized gate to the reference floor; the second native prediction still
 needs a fix.
 An optional, separately named cross-platform floor tier would require each
 native-versus-PyTorch-ROCm prediction cosine to be at least the corresponding
-pinned PyTorch-CUDA-versus-PyTorch-ROCm cosine on identical inputs, and both
-native trajectory checkpoints to retain the 0.99996 requirement. The current
+pinned PyTorch-CUDA-versus-PyTorch-ROCm cosine on the same free-running inputs,
+and both native trajectory checkpoints to retain the 0.99996 requirement. The current
 native predictions exceed those reference floors by about 0.0000378 and
-0.0000143, and the trajectories pass. This tier is a proposal for review;
-the unchanged strict same-GPU prediction gate remains open.
+0.0000395, and the trajectories pass. `reference_floor_report.py` validates
+the oracle capture relationship and reports this proposed tier alongside the
+unchanged strict gate; it does not change acceptance tests. Run it with:
+
+```sh
+python3 rdna4/qimg21/reference_floor_report.py \
+  --cuda-reference tmp/qimg21-edit-reference-cuda-on-rocm-inputs-20260924 \
+  --rocm-reference tmp/qimg21-edit-reference-rocm-free-bundle-20260923 \
+  --native-regression tmp/qimg21-edit-rocm-free-regression-20260923 \
+  --out tmp/qimg21-edit-reference-floor-matched-20260924.json
+```
+
+This tier is a proposal for review; the unchanged strict same-GPU prediction
+gate remains open.
 
 On the free-running second-step ROCm input, the native and PyTorch ROCm target
 block outputs start at cosine 0.999999816 after block 0, first fall below
