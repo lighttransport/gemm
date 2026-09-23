@@ -220,7 +220,7 @@ noise are 0.999672487/0.999672307; native exceeds those floors by about
 0.0000468/0.0000488. In the original seed-42 case, native exceeds the
 CUDA/ROCm trajectory floors by about 0.0000468/0.0000466.
 
-A revised, separately named cross-platform floor tier would require every
+A user-approved, separately named cross-platform reference-floor tier requires every
 native-versus-PyTorch-ROCm prediction to meet or exceed pinned CUDA-versus-
 ROCm PyTorch on the exact same step input. Each native trajectory checkpoint
 would meet or exceed the CUDA-versus-ROCm free-running checkpoint, with both
@@ -240,11 +240,11 @@ For seed 44, scalar native/ROCm predictions are
 0.999837650/0.999836903 fall below full-run reference floors
 0.999859171/0.999858898. Fused WMMA exceeds all four floors on seed 44,
 but its seed-43 second prediction, 0.999807174, falls below the reference
-floor 0.999870206. Thus the proposed tier is **not met by either tested
-attention path across the three fixtures**. It remains a diagnostic
-criterion, not an accepted or passing replacement for the strict gate.
+floor 0.999870206. Thus the approved reference-floor tier is **not met by either tested
+attention path across the three fixtures**. Acceptance remains open, and
+the unchanged 0.99996 regression still fails.
 `reference_floor_report.py` verifies the capture chain, identical starting
-inputs, saved native metrics, and both proposed and unchanged strict outcomes.
+inputs, saved native metrics, and both reference-floor and unchanged strict outcomes.
 Run it for the original fixture with:
 
 ```sh

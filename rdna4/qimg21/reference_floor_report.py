@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Report a proposed CUDA/ROCm reference floor without changing editing gates."""
+"""Report the approved CUDA/ROCm reference-floor tier alongside the strict gate."""
 import argparse
 import json
 from pathlib import Path
@@ -75,7 +75,7 @@ def main():
                             "native_rocm_cosine": native_cosine,
                             "margin_above_reference_floor": native_cosine - floor,
                             "strict_pass": native_cosine >= NONQUANTIZED_COSINE_THRESHOLD,
-                            "proposed_floor_pass": native_cosine >= floor})
+                            "reference_floor_pass": native_cosine >= floor})
         name = f"step_{step:03d}.npy"
         checkpoint = compare(rocm / name, native / "trajectory" / name)
         trajectory_floor = compare(rocm / name, cuda_free / name)
@@ -85,9 +85,9 @@ def main():
                            "cuda_rocm_free_run_cosine": trajectory_floor,
                            "margin_above_reference_floor": checkpoint - trajectory_floor,
                            "strict_pass": checkpoint >= NONQUANTIZED_COSINE_THRESHOLD,
-                           "proposed_floor_pass": checkpoint >= trajectory_floor})
+                           "reference_floor_pass": checkpoint >= trajectory_floor})
     report = {
-        "status": "diagnostic proposal; unchanged editing gate remains authoritative",
+        "status": "user-approved separate reference-floor tier; strict editing gate unchanged",
         "strict_threshold": NONQUANTIZED_COSINE_THRESHOLD,
         "cuda_reference": str(cuda), "cuda_free_run": str(cuda_free),
         "rocm_reference": str(rocm),
@@ -95,8 +95,8 @@ def main():
         "cuda_torch": cuda_run["torch"], "rocm_torch": rocm_run["torch"],
         "predictions": predictions, "trajectory": trajectory,
         "strict_existing_gate_pass": all(row["strict_pass"] for row in predictions + trajectory),
-        "proposed_floor_tier_pass": all(row["proposed_floor_pass"]
-                                        for row in predictions + trajectory),
+        "reference_floor_tier_pass": all(row["reference_floor_pass"]
+                                         for row in predictions + trajectory),
     }
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(report, indent=2) + "\n")
