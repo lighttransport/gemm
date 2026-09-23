@@ -206,6 +206,13 @@ retain 0.99996 for native versus same-GPU predictions and trajectory, and
 report CUDA versus ROCm reference drift separately. Do not relax the
 nonquantized gate to the reference floor; the second native prediction still
 needs a fix.
+An optional, separately named cross-platform floor tier would require each
+native-versus-PyTorch-ROCm prediction cosine to be at least the corresponding
+pinned PyTorch-CUDA-versus-PyTorch-ROCm cosine on identical inputs, and both
+native trajectory checkpoints to retain the 0.99996 requirement. The current
+native predictions exceed those reference floors by about 0.0000378 and
+0.0000143, and the trajectories pass. This tier is a proposal for review;
+the unchanged strict same-GPU prediction gate remains open.
 
 On the free-running second-step ROCm input, the native and PyTorch ROCm target
 block outputs start at cosine 0.999999816 after block 0, first fall below
