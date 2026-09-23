@@ -19,6 +19,8 @@ ap.add_argument(
 )
 ap.add_argument("--out-dir", required=True)
 a = ap.parse_args()
+if a.latents and a.torch_rng:
+    ap.error("--latents and --torch-rng are mutually exclusive")
 out = Path(a.out_dir); out.mkdir(parents=True, exist_ok=True)
 np.save(out / "prompt_embeds.npy", np.load(a.prompt_embeds).astype(np.float32, copy=False))
 if a.latents:
