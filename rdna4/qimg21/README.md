@@ -436,3 +436,7 @@ gave 0.999939325/0.999864240. Plain WMMA gave the same
 0.999974046/0.999876137 as scalar `math` on this fixture: both trajectory
 checkpoints pass, but the second prediction does not. These diagnostics are
 under `tmp/qimg21-edit-rocm-{reverse64,wmma-fused,wmma}-20260924/`.
+Default normalization with exact RoPE gave 0.999954939/0.999889537 and
+failed both trajectory checkpoints. Default RoPE with vector4 normalization
+gave 0.999963776/0.999874586 and also failed both trajectory checkpoints.
+Neither variant replaces vector4 plus exact RoPE.
