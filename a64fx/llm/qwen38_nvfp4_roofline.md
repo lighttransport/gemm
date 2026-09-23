@@ -344,3 +344,60 @@ a64fx/llm/build/test_qwen38_kquant_n3
 To reproduce the end-to-end result, use the K=3 command above with
 `--draft-head-rows 65536` and `TF_KV_DTYPE=f32`; run the matching `--spec-k 0`
 serial command and compare every `qwen38: token n=... pos=... id=...` line.
+
+A further exact Q6_K head scheduling check used a 1.536 GB predecoded-block
+synthetic matrix (`K=5120`, 240,000 rows), three FP32 activations, all 48 A64FX
+cores, and bitwise output comparison. The existing independent-row schedule
+took 8.64 ms per pass. Sharing activation loads between two rows took 8.77 ms;
+between four rows took 10.18 ms. Both returned zero bitwise mismatches. The
+four-row variant also regressed on an 8064-row, 51.6 MB matrix (roughly
+0.51 versus 0.31 ms). Interleaving rows therefore does not remedy the Q6
+head's bandwidth gap. A separate exact 8-row/64-column compact-FP4
+block-buffer decode into 2 KiB stack storage kept its checksum but took
+0.741 ms versus 0.500 ms for the current fused path.
+
+An FP4 signed-byte sidecar with FP32 scales was tested on the same 50.135 MB
+fixed N=3 FFN-gate shape. It retained bitwise results, but expanded the
+working matrix to 111.4 MB and took about 0.57–0.72 ms after warmup versus
+0.50–0.52 ms for the current compact format. A prior, more efficient
+paired-row signed-byte layout reached 0.458 ms in isolation, but would add
+13.589 GB to the active trunk; the model's 20.627 GB resident allocation
+already precludes keeping both full forms inside 32 GB HBM. A replacement
+rather than additive packing scheme would be necessary to use that layout
+for the complete target.
+
+For the latest 32-token K=3 run, the six compact N=3 projections account for
+1.824 s of 2.822 s end-to-end (13 target batches, 11.341 tok/s). Replacing
+all six with their optimistic *FP32 peak* floor of 0.279 s, while leaving the
+measured draft, Q4_K/Q6_K projections, head, attention, state, and commit
+stages intact, would still take about 1.277 s, or 25.1 tok/s. The 40 tok/s
+budget is 0.800 s for these 32 tokens. Thus compact-kernel optimization alone
+cannot meet the goal; at least 0.477 s of the remaining stages must also be
+removed even under the unattainable peak-throughput assumption. These floors
+are planning bounds, not predicted achievable rates.
+
+A proposer-only 49,152-row vocabulary cap was also tested on the 32-token
+matrix-multiplication prompt. It retained 20/26 accepted drafts and matched
+all 32 serial target `(position, ID)` pairs, but ran at 10.233 tok/s:
+draft time was 589.0 ms versus 293.0 ms with the 65,536-row cap. A profiled
+repeat took 468.8 ms of draft time, including 143.8 ms for NextN's
+embedding/hidden projection and 325.9 ms for its persistent block. The
+65,536-row profiled repeat took 306.6 ms, split 81.1/232.4 ms across those
+stages, and a normal repeat took 2.818 s end-to-end (11.355 tok/s). Because
+the smaller head also slowed work *before* the head, this is not evidence
+that the extra vocabulary rows improve the head kernel itself. The 65,536-row
+setting remains the best reproduced single-request configuration.
+
+Software-prefetching each predecoded Q6_K row by 2, 4, or 8 blocks did not
+help the full-head exact N=3 kernel. At 240,000 rows, the three distances
+took 9.19, 9.25, and 9.32 ms per pass respectively, against 8.64 ms without
+explicit prefetch; every output remained bitwise identical. The extra
+prefetch instructions should therefore stay out of the production path.
+
+The full 1.536 GB exact Q6_K head benchmark also scaled nearly linearly
+with workers: 36.94 ms at 12, 18.49 ms at 24, 12.34 ms at 36, and 9.27 ms
+at 48 workers in a separate build. This argues against a saturated shared
+HBM link or a simple NUMA placement fix for the current kernel; its per-core
+conversion/FMA work remains the bottleneck. The absolute 48-worker time in
+this build differs slightly from the 8.64 ms comparison build above, so use
+the within-build scaling ratios for that conclusion.
