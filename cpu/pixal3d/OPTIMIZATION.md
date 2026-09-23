@@ -477,3 +477,15 @@ automatic vendor GEMM was 0.999985775, with a 7.0144-second warm median
 versus 1.9970 seconds for vendor GEMM. The production mixed-precision path
 keeps its surrounding GEMMs in FP32; forcing `mma` there records zero MMA
 GEMMs and does not change its 2.00-second median.
+
+The matched CUDA four-view rerun used the same example images, seed 42, mixed
+precision, 4096 texture, and triangle target, with the 7,168 MiB budget
+required by the occupied 5060 Ti. It completed in 1,394.916 seconds through
+the tiled low-memory decoder, with 960,608 triangles, 4,777,099,104 bytes
+peak reserved GPU memory, 12,164,100,096 bytes peak host memory, and 2,280
+MMA attention calls. Its GLB passes the
+validator and its rendered four-view preview is coherent. Earlier saved CUDA
+multiview runs on the resident decoder completed in 512.737 and 490.727
+seconds, so this slow tiled result describes the current memory contention
+and decoder path, not a like-for-like kernel speed change. The current run's
+artifacts are under `tmp/pixal3d/revalidate-cuda-multiview-20260924/`.
