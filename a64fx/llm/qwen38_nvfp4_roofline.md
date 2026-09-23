@@ -210,3 +210,31 @@ Fully unrolling the four 16-value subblocks also regressed the fixed N=3
 50.135 MB kernel from 0.499 to 0.598 ms. Disassembly of the current kernel
 showed no vector accumulator spills in its inner loop, so register-spill
 removal is not an available shortcut to the required throughput.
+
+The three-candidate exact target is also constrained by arithmetic, not only
+HBM. Each compact NVFP4 weight uses 36 bytes per 64 values, and three FP32
+FMA accumulations imply six floating-point operations per weight. At Fugaku
+boost frequency, [RIKEN lists 6.7584 TFLOP/s FP32 peak per node](https://www.r-ccs.riken.jp/en/fugaku/about/).
+Using 830 GB/s STREAM Triad for the memory side gives these *optimistic*
+per-batch floors for the six active specialized shapes:
+
+| Shape group | Compact GB | FP32 GFLOP at N=3 | HBM floor ms | FP32 floor ms |
+| --- | ---: | ---: | ---: | ---: |
+| SSM gate | 0.849 | 9.06 | 1.02 | 1.34 |
+| SSM QKV | 1.416 | 15.10 | 1.71 | 2.23 |
+| SSM output | 1.132 | 12.07 | 1.36 | 1.79 |
+| FFN gate/up | 6.417 | 68.45 | 7.73 | 10.13 |
+| FFN down | 3.209 | 34.23 | 3.87 | 5.06 |
+| Attention Q | 0.566 | 6.04 | 0.68 | 0.89 |
+| **Total** | **13.589** | **144.95** | **16.37** | **21.45** |
+
+The 32-token K=3 trace required 13 target batches, so even peak FP32 would
+spend at least 0.279 s on these projections, before the Q6 head, other
+matrices, draft, attention, state, or launch work. Its measured projection
+profile was 2.372 s, roughly 0.80 TFLOP/s over these six shapes. A separate
+48-worker empty OpenMP region measured 21.1 microseconds; even if every one
+of the roughly 4,800 projection launches cost that much, launch removal
+would save only about 0.10 s. A 16 KiB exact FP4-value lookup with SVE gathers
+also regressed the isolated 50.135 MB N=3 matrix from 0.499 to 0.854 ms.
+The central requirement is a much higher fraction of the node's FP32
+throughput while decoding compact weights.
