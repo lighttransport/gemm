@@ -441,3 +441,23 @@ tensor only 0.515% of paired nibbles were both zero; no entire 64-value
 block was zero, and zero scales occurred in about 0.0006% of scale bytes.
 This rules out a block-skip sparse kernel as a material route to the requested
 throughput on these dense trunk projections.
+
+Loading the eight UE4M3 scale bytes as one 64-bit word and extracting each
+byte in the compact N=3 kernel preserved the checksum but did not improve
+the fixed-shape run: about 0.496 ms versus 0.498 ms baseline. Forcing the
+row-within-tile offset to constant zero also preserved the checksum, but
+regressed to about 0.542 ms on this compiler; adding the packed-scale load
+on top remained at about 0.539 ms. Leave the original scale loads and row
+calculation in place.
+
+The fresh `51877011` run revalidated the current exact target on the staged
+model and 32-token matrix-multiplication prompt. All **32/32**
+`(position, ID)` pairs matched a separate `--spec-k 0` serial run. K=3 with
+the 65,536-row draft head took 2.911 s end-to-end (**10.995 tok/s**), including
+383.3 ms draft, 2426.9 ms target verification, and 85.8 ms commit. It used
+13 rounds and accepted 20/26 proposed positions. The target profile was
+stable relative to the preceding node: 553.0 ms input projections, 162.3 ms
+output projections, 843.9 ms FFN gate/up, and 426.6 ms FFN down. The extra
+~0.09 s against the best earlier 11.355 tok/s run came from draft time, not
+target projections. This confirms that the exact compact target remains the
+primary throughput gap across two allocations.
