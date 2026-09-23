@@ -435,6 +435,12 @@ contention affected. Native text embeddings differ across backends (cosine
 0.999032835), despite the identical prompt and noise; this is a matched-input
 throughput run, not an output-parity result. The CUDA PNG and memory trace are
 under `tmp/qimg21-cuda-bench-t2i-r2-20260924*`.
+The same CUDA command with a new work directory repeated in 18:08.06; the
+prompt embedding, initial/final latents, native VAE output, all 40 saved
+steps, and PNG are byte-identical to the first CUDA run. Its measured process
+peak was again 3,263,168,512 bytes. Across ROCm and CUDA, the matched-input
+text-to-image PNGs have pixel cosine 0.999993255 and PSNR 50.11 dB. The
+second CUDA run uses prefix `tmp/qimg21-cuda-bench-t2i-r3-20260924`.
 
 The paired house edit on CUDA used the same source PNG (including a
 byte-identical native resized image), exact initial noise, model, prompt,
