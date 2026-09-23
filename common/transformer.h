@@ -69,6 +69,7 @@ typedef struct {
 
 typedef struct {
     double norm_ms, proj_ms, ssm_prepare_ms, ssm_scan_ms;
+    double ssm_qkv_gate_ms, ssm_alpha_beta_ms, attn_q_ms, attn_kv_ms;
     double attn_prepare_ms, attn_kernel_ms, out_proj_ms;
     double ffn_proj_ms, ffn_act_ms, ffn_down_ms, collective_ms;
     int layers, calls;
@@ -17468,6 +17469,8 @@ static float *tf_qwen_hybrid_prefill_batch(transformer_model *m,
                                       lq, ne, batch_nt);
             tf_gemm_f16_mt_tokenmajor(gate, &L->ssm_gate, norm, ld, N,
                                       ld, ne, batch_nt);
+            double ab_start = tf_time_ms();
+            pprof->ssm_qkv_gate_ms += ab_start - pt;
             /* Alpha/beta are just 12 rows each. A shared small-N team avoids
              * 96 tiny team launches per verifier round (two in every SSM
              * layer), while the common row primitive preserves exact sums. */
@@ -17491,6 +17494,7 @@ static float *tf_qwen_hybrid_prefill_batch(transformer_model *m,
                                           m->ssm_dt_rank, N, m->ssm_dt_rank,
                                           ne, batch_nt);
             }
+            pprof->ssm_alpha_beta_ms += tf_time_ms() - ab_start;
             pprof->proj_ms += tf_time_ms() - pt;
             /* Prepare convolution/QK/scalars in prompt order, but defer the
              * independent recurrent heads.  proj/attout/up are reused as
@@ -17611,10 +17615,13 @@ static float *tf_qwen_hybrid_prefill_batch(transformer_model *m,
             if (!packed_qkv) {
                 tf_gemm_f16_mt_tokenmajor(proj, &L->attn_q, norm, q2, N,
                                           q2, ne, batch_nt);
+                double kv_start = tf_time_ms();
+                pprof->attn_q_ms += kv_start - pt;
                 tf_gemm_f16_mt_tokenmajor(kv, &L->attn_k, norm, kvdim, N,
                                           kvdim, ne, batch_nt);
                 tf_gemm_f16_mt_tokenmajor(vv, &L->attn_v, norm, kvdim, N,
                                           kvdim, ne, batch_nt);
+                pprof->attn_kv_ms += tf_time_ms() - kv_start;
             }
             pprof->proj_ms += tf_time_ms() - pt;
             /* Prepare Q/K/V and cache rows in prompt order. Compact Q in the

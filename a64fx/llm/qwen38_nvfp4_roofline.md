@@ -245,6 +245,21 @@ attention preparation, 77.2 ms to attention kernels, and 87.7 ms to FFN
 activation across 13 target batches. These stages total about 0.30 s; no
 single nonprojection stage explains the 2.79 s verifier time.
 
+An additional 32-token profile split the 967.6 ms input projections into
+325.8 ms for SSM QKV/gate, 357.6 ms for BF16 SSM alpha/beta, 74.0 ms for
+attention Q, and 210.1 ms for attention K/V. The shape-specific compact
+kernel counters agree with the first and third figures: FFN gate/up spent
+837.8 ms over 1664 calls, FFN down 422.0 ms over 832, SSM QKV 195.6 ms
+over 624, SSM gate 115.8 ms over 624, SSM output 157.6 ms over 832, and
+attention Q 73.3 ms over 208. The 24-row paired alpha/beta path is active:
+turning it off increased its 8-token trace time to 168.0 ms. Capping the
+paired path at 4, 12, or 24 OpenMP workers did not improve the full trace;
+12 workers took 367.8 ms for alpha/beta and 10.112 tok/s, with 32/32 serial
+token IDs. Pairing attention K/V into one team changed its 32-token time
+from 211.7 to 207.0 ms, too small to justify the extra dispatch; it was
+discarded. `OMP_WAIT_POLICY=ACTIVE` made the draft stage 7.57 s and reduced
+end-to-end throughput to 3.07 tok/s, so leave the default wait policy.
+
 An opt-in `--draft-head-rows 65536` computes only the first 65,536 NextN
 vocabulary logits and marks the rest unavailable to the proposer. The full
 unapproximated target head still verifies every emitted token. On the

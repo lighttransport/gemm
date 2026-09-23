@@ -165,6 +165,10 @@ done:
         fprintf(stderr, "qwen38: spec_profile proj=%.1f out=%.1f ffn_proj=%.1f down=%.1f ms\n",
                 profile.proj_ms, profile.out_proj_ms, profile.ffn_proj_ms,
                 profile.ffn_down_ms);
+        fprintf(stderr, "qwen38: spec_profile_proj_detail ssm_qkv_gate=%.1f "
+                        "ssm_alpha_beta=%.1f attn_q=%.1f attn_kv=%.1f ms\n",
+                profile.ssm_qkv_gate_ms, profile.ssm_alpha_beta_ms,
+                profile.attn_q_ms, profile.attn_kv_ms);
         fprintf(stderr, "qwen38: spec_profile_other norm=%.1f ssm_prepare=%.1f "
                         "ssm_scan=%.1f attn_prepare=%.1f attn_kernel=%.1f "
                         "ffn_act=%.1f collective=%.1f ms layers=%d calls=%d\n",

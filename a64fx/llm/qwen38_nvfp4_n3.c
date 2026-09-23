@@ -6,6 +6,29 @@
 #endif
 #include <stdint.h>
 #include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+
+static double q38_n3_profile_ms[7];
+static unsigned long q38_n3_profile_count[7];
+static const char *q38_n3_profile_name[7] = {
+    "unknown", "ffn_gate", "ffn_down", "ssm_qkv",
+    "ssm_gate", "ssm_out", "attn_q"
+};
+static double q38_n3_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000.0 + ts.tv_nsec * 1e-6;
+}
+static void q38_n3_profile_report(void) {
+    for (int i = 1; i <= 6; i++)
+        fprintf(stderr, "qwen38: n3_shape %s calls=%lu total=%.1f avg=%.3f ms\n",
+                q38_n3_profile_name[i], q38_n3_profile_count[i],
+                q38_n3_profile_ms[i],
+                q38_n3_profile_count[i] ?
+                    q38_n3_profile_ms[i] / q38_n3_profile_count[i] : 0.0);
+}
 typedef struct { uint8_t d[8], qs[64]; } q38_n3_subblock;
 typedef struct { q38_n3_subblock s[4]; } q38_n3_block;
 typedef struct { int n_cols; void *data; } q38_n3_matrix;
@@ -142,6 +165,12 @@ Q38_N3_SHAPE(q38_n3_attn_q, 12288, 5120)
 
 int q38_nvfp4_exact_n3_mt(float *y, const void *weights, const float *x,
                             int rows, int cols, int n_threads) {
+    static int profile = -1;
+    if (profile < 0) {
+        const char *env = getenv("Q38_N3_PROFILE");
+        profile = env && atoi(env) != 0;
+        if (profile) atexit(q38_n3_profile_report);
+    }
     int kind = rows == 17408 && cols == 5120 ? 1 :
                rows == 5120 && cols == 17408 ? 2 :
                rows == 10240 && cols == 5120 ? 3 :
@@ -149,6 +178,7 @@ int q38_nvfp4_exact_n3_mt(float *y, const void *weights, const float *x,
                rows == 5120 && cols == 6144 ? 5 :
                rows == 12288 && cols == 5120 ? 6 : 0;
     if (!kind) return 0;
+    double t0 = profile ? q38_n3_now_ms() : 0.0;
 #ifdef _OPENMP
 #pragma omp parallel num_threads(n_threads)
 #endif
@@ -169,6 +199,10 @@ int q38_nvfp4_exact_n3_mt(float *y, const void *weights, const float *x,
             case 5: q38_n3_ssm_out(y, weights, x, first, last); break;
             case 6: q38_n3_attn_q(y, weights, x, first, last); break;
         }
+    }
+    if (profile) {
+        q38_n3_profile_ms[kind] += q38_n3_now_ms() - t0;
+        q38_n3_profile_count[kind]++;
     }
     return 1;
 }
