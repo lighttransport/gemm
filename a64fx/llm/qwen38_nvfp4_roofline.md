@@ -74,6 +74,15 @@ verifier matched all 32 serial output IDs, accepted 20/26 drafts, and reached
 5.491 tok/s versus 5.041 tok/s serial. This demonstrates a small end-to-end
 gain for a multi-token prompt while keeping full target verification.
 
+The next exact kernel packs two output rows into the low and high halves of
+each 512-bit SVE register, using all 16 FP32 lanes. Four row pairs consume one
+eight-row compact tile across up to four candidates. The four-token `hi`
+batch improved from 0.423 to 0.308 s (13.00 verified target tokens/s), with
+the same 4/4 argmax IDs and 1.3e-5 maximum logit delta. End-to-end K=3
+improved from 4.976 to **6.788 tok/s** on `hi` (64/64 IDs identical), and
+from 5.491 to **7.346 tok/s** on the matrix-multiplication prompt (32/32 IDs
+identical). The single-request 40 tok/s target remains open.
+
 Representative native runs (48 cores, one A64FX node, staged GGUF under
 `/local`, `OMP_PROC_BIND=close`, four-CMG anonymous residency):
 

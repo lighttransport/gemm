@@ -1751,6 +1751,84 @@ static inline void tf_nvfp4_tiled_gemm_rows(float *y, const qtensor *mat,
     }
 }
 
+/* Put two tiled rows in the low/high halves of one 512-bit SVE register.
+ * Both rows retain the serial FP32 FMA order over their eight weight lanes. */
+static inline void tf_nvfp4_tiled_gemm_pair_rows(float *y, const qtensor *mat,
+        const float *x, int n, int ys, int xs, int first, int last) {
+    const int nb = mat->n_cols / 64;
+    const tf_nvfp4_tiled_block *base = (const tf_nvfp4_tiled_block *)mat->data;
+    const svbool_t pg = svptrue_b32();
+    const svbool_t p8 = svwhilelt_b32((uint64_t)0, (uint64_t)8);
+    const svuint32_t repeat8 = svand_n_u32_x(pg, svindex_u32(0, 1), 7);
+    const svfloat32_t lut = svld1(pg, ds4f_kvalues_mxfp4_f32);
+    for (int row = first; row < last; row += 8) {
+        const int tile = row / 8, r0 = row % 8;
+        svfloat32_t a00=svdup_f32(0), a01=a00, a02=a00, a03=a00;
+        svfloat32_t a10=a00, a11=a00, a12=a00, a13=a00;
+        svfloat32_t a20=a00, a21=a00, a22=a00, a23=a00;
+        svfloat32_t a30=a00, a31=a00, a32=a00, a33=a00;
+        const tf_nvfp4_tiled_block *w = base + (size_t)tile * nb;
+        for (int ib = 0; ib < nb; ib++)
+            for (int s = 0; s < 4; s++) {
+                const tf_nvfp4_tiled_subblock *p = &w[ib].s[s];
+#define TF_NVFP4_BATCH_PAIR(R,A0,A1,A2,A3) do { \
+                    int rr=r0+2*(R); \
+                    svuint32_t z=svld1ub_u32(pg,p->qs+rr*8); \
+                    svfloat32_t d=svsel_f32(p8, \
+                        svdup_f32(tf_nvfp4_scale_fast(p->d[rr])), \
+                        svdup_f32(tf_nvfp4_scale_fast(p->d[rr+1]))); \
+                    svfloat32_t lo=svmul_x(pg, \
+                        svtbl_f32(lut,svand_n_u32_x(pg,z,15)),d); \
+                    svfloat32_t hi=svmul_x(pg, \
+                        svtbl_f32(lut,svlsr_n_u32_x(pg,z,4)),d); \
+                    const float *x0=x+ib*64+s*16; \
+                    svfloat32_t xl=svtbl_f32(svld1(p8,x0),repeat8); \
+                    svfloat32_t xh=svtbl_f32(svld1(p8,x0+8),repeat8); \
+                    (A0)=svmla_x(pg,(A0),lo,xl); \
+                    (A0)=svmla_x(pg,(A0),hi,xh); \
+                    if(n>1){const float *xt=x0+xs; \
+                        xl=svtbl_f32(svld1(p8,xt),repeat8); \
+                        xh=svtbl_f32(svld1(p8,xt+8),repeat8); \
+                        (A1)=svmla_x(pg,(A1),lo,xl); \
+                        (A1)=svmla_x(pg,(A1),hi,xh);} \
+                    if(n>2){const float *xt=x0+(size_t)2*xs; \
+                        xl=svtbl_f32(svld1(p8,xt),repeat8); \
+                        xh=svtbl_f32(svld1(p8,xt+8),repeat8); \
+                        (A2)=svmla_x(pg,(A2),lo,xl); \
+                        (A2)=svmla_x(pg,(A2),hi,xh);} \
+                    if(n>3){const float *xt=x0+(size_t)3*xs; \
+                        xl=svtbl_f32(svld1(p8,xt),repeat8); \
+                        xh=svtbl_f32(svld1(p8,xt+8),repeat8); \
+                        (A3)=svmla_x(pg,(A3),lo,xl); \
+                        (A3)=svmla_x(pg,(A3),hi,xh);} \
+                }while(0)
+                TF_NVFP4_BATCH_PAIR(0,a00,a01,a02,a03);
+                TF_NVFP4_BATCH_PAIR(1,a10,a11,a12,a13);
+                TF_NVFP4_BATCH_PAIR(2,a20,a21,a22,a23);
+                TF_NVFP4_BATCH_PAIR(3,a30,a31,a32,a33);
+#undef TF_NVFP4_BATCH_PAIR
+            }
+#define TF_NVFP4_BATCH_PAIR_STORE(R,A0,A1,A2,A3) do { \
+            int rr=row+2*(R); \
+            if(rr<last){ \
+                y[rr]=svaddv_f32(p8,A0); \
+                y[rr+1]=svaddv_f32(p8,svext_f32(A0,A0,8)); \
+                if(n>1){y[(size_t)ys+rr]=svaddv_f32(p8,A1); \
+                    y[(size_t)ys+rr+1]=svaddv_f32(p8,svext_f32(A1,A1,8));} \
+                if(n>2){y[(size_t)2*ys+rr]=svaddv_f32(p8,A2); \
+                    y[(size_t)2*ys+rr+1]=svaddv_f32(p8,svext_f32(A2,A2,8));} \
+                if(n>3){y[(size_t)3*ys+rr]=svaddv_f32(p8,A3); \
+                    y[(size_t)3*ys+rr+1]=svaddv_f32(p8,svext_f32(A3,A3,8));} \
+            } \
+        }while(0)
+        TF_NVFP4_BATCH_PAIR_STORE(0,a00,a01,a02,a03);
+        TF_NVFP4_BATCH_PAIR_STORE(1,a10,a11,a12,a13);
+        TF_NVFP4_BATCH_PAIR_STORE(2,a20,a21,a22,a23);
+        TF_NVFP4_BATCH_PAIR_STORE(3,a30,a31,a32,a33);
+#undef TF_NVFP4_BATCH_PAIR_STORE
+    }
+}
+
 static inline void tf_nvfp4_dot4_sve(float *o0, float *o1, float *o2, float *o3,
                                      const block_nvfp4 *b0, const block_nvfp4 *b1,
                                      const block_nvfp4 *b2, const block_nvfp4 *b3,
@@ -15001,10 +15079,17 @@ static void tf_gemm_f16_mt_tokenmajor_impl(float *Y_out, const qtensor *mat, con
             if (last > n_rows) last = n_rows;
             for (int t = 0; t < N; t += 4) {
                 int count = N - t < 4 ? N - t : 4;
-                if (mat->nvfp4_tiled)
-                    tf_nvfp4_tiled_gemm_rows(Y_out + (size_t)t * out_stride,
-                        mat, X + (size_t)t * X_stride, count, out_stride,
-                        X_stride, first, last);
+                if (mat->nvfp4_tiled) {
+                    if (svcntw() == 16)
+                        tf_nvfp4_tiled_gemm_pair_rows(
+                            Y_out + (size_t)t * out_stride, mat,
+                            X + (size_t)t * X_stride, count, out_stride,
+                            X_stride, first, last);
+                    else
+                        tf_nvfp4_tiled_gemm_rows(Y_out + (size_t)t * out_stride,
+                            mat, X + (size_t)t * X_stride, count, out_stride,
+                            X_stride, first, last);
+                }
                 else
                     tf_q6_exact_gemm_rows(Y_out + (size_t)t * out_stride,
                         mat, X + (size_t)t * X_stride, count, out_stride,
@@ -15014,10 +15099,17 @@ static void tf_gemm_f16_mt_tokenmajor_impl(float *Y_out, const qtensor *mat, con
 #else
         for (int t = 0; t < N; t += 4) {
             int count = N - t < 4 ? N - t : 4;
-            if (mat->nvfp4_tiled)
-                tf_nvfp4_tiled_gemm_rows(Y_out + (size_t)t * out_stride,
-                    mat, X + (size_t)t * X_stride, count, out_stride,
-                    X_stride, 0, n_rows);
+            if (mat->nvfp4_tiled) {
+                if (svcntw() == 16)
+                    tf_nvfp4_tiled_gemm_pair_rows(
+                        Y_out + (size_t)t * out_stride, mat,
+                        X + (size_t)t * X_stride, count, out_stride,
+                        X_stride, 0, n_rows);
+                else
+                    tf_nvfp4_tiled_gemm_rows(Y_out + (size_t)t * out_stride,
+                        mat, X + (size_t)t * X_stride, count, out_stride,
+                        X_stride, 0, n_rows);
+            }
             else
                 tf_q6_exact_gemm_rows(Y_out + (size_t)t * out_stride,
                     mat, X + (size_t)t * X_stride, count, out_stride,
