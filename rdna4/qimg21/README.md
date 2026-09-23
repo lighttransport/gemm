@@ -320,6 +320,16 @@ matches PyTorch ROCm bit-for-bit, but substituting hipBLAS QKV throughout
 the native model does not pass both editing steps. FP64 normalization also
 improves the first step while worsening the second. Neither experiment is
 selected for production; the remaining divergence is amplified across blocks.
+An additional diagnostic used hipBLAS BF16-output GEMM for *every* native
+linear. On exact PyTorch ROCm block-9 hidden state and modulation, target Q
+differences fell from 268 to 20 of 1,048,576 BF16 values, and block-output
+cosine improved from 0.999999245333 to 0.999999326636. Yet the full seed-42
+two-step regression worsened: predictions were 0.999956150/0.999873556 and
+trajectories 0.999942145/0.999942659, all below 0.99996. The temporary
+hipBLAS hook was removed and the production binary rebuilt. Its diagnostic
+source and artifacts remain under `tmp/qimg21_hipblas_all_diag.hip`,
+`tmp/qimg21-edit-rocm-block09-hipblas-all-20260924/`, and
+`tmp/qimg21-edit-hipblas-all-seed42-20260924/`.
 
 On the saved two-step fixture, PyTorch ROCm predictions have cosine
 0.999936229 and 0.999861802 against the PyTorch CUDA capture. Native HIP
