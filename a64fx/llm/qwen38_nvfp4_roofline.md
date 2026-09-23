@@ -401,3 +401,43 @@ HBM link or a simple NUMA placement fix for the current kernel; its per-core
 conversion/FMA work remains the bottleneck. The absolute 48-worker time in
 this build differs slightly from the 8.64 ms comparison build above, so use
 the within-build scaling ratios for that conclusion.
+
+A fresh one-node boost-eco allocation (`51877011`, 48 cores) was started
+after `51875770` reached its six-hour limit. The 16,058,504,512-byte model
+was staged with `stage_gguf_shards.sh` using direct I/O in 309 s. Subsequent
+microbenchmarks ran from node-local storage with no model copy in progress.
+
+Preduplicating all three activations into 16-lane vectors removed the SVE
+`tbl` duplication in the exact compact N=3 kernel but increased the
+50.135 MB gate projection from roughly 0.51 to 0.82 ms. Reconstructing
+UE4M3 scales by FP32 bit arithmetic also retained the output checksum but
+increased the same full-scale benchmark from 0.493 to about 0.98 ms.
+`-mcpu=a64fx` and `-funroll-loops` did not improve the existing compiled
+kernel. The generated SVE loop already hoists activation loads across four
+row pairs and issues the six candidate FMAs per pair; the scale loads and
+FP4 table selection remain in its inner loop.
+
+All **4096** combinations of the 256 UE4M3 scale bytes and 16 FP4 codes
+produce FP32 values exactly representable in either FP16 or BF16, including
+the zero encodings. An isolated FP16 sidecar kernel stored those exact values
+as 16-bit weights and matched all 52,224 N=3 gate outputs **bit for bit**
+against compact FP4. The sidecar expanded the 50.135 MB test matrix to
+178.258 MB. Alternating measurement order on an uncontended node gave
+unstable, opposing timing modes: compact commonly took 0.50–0.66 ms and
+FP16 0.37–0.78 ms. There was no repeatable win suitable for the target
+runner. More importantly, expanding all six active specialized shapes would
+stream 48.316 GB per target batch. Across 13 batches, even the optimistic
+830 GB/s HBM floor is **0.757 s** of the 0.800 s 32-token budget, before
+the measured 0.290 s draft, target's other stages, and commit. The full
+FP16 representation also exceeds the node's 32 GB HBM residency. Selective
+materialization might save a little time but cannot be the primary route to
+40 tok/s.
+
+A bounded metadata-offset probe read four real 50.135 MB NVFP4 FFN tensors
+from the staged GGUF without mapping the model. FP4 zero codes accounted for
+6.92% (`blk.0.ffn_gate`), 7.09% (`blk.32.ffn_gate`), 6.99%
+(`blk.0.ffn_down`), and 7.04% (`blk.63.ffn_gate`) of values. In the first
+tensor only 0.515% of paired nibbles were both zero; no entire 64-value
+block was zero, and zero scales occurred in about 0.0006% of scale bytes.
+This rules out a block-skip sparse kernel as a material route to the requested
+throughput on these dense trunk projections.
