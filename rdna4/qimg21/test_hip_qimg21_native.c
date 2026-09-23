@@ -586,8 +586,9 @@ static int native_step(cuda_qimg_runner *r, qimg21_kernels *k, const qimg21_shar
     }
     cuMemcpyDtoD(tmp2,temb,(size_t)2*D*4); cuCtxSynchronize();
     if(launch_vec(k->silu,r->stream,2*D,tmp2)!=CUDA_SUCCESS ||
-       launch_vec(k->round_bf16,r->stream,2*D,tmp2)!=CUDA_SUCCESS ||
-       launch_cast(r,bf,tmp2,2*D)!=CUDA_SUCCESS ||
+       launch_vec(k->round_bf16,r->stream,2*D,tmp2)!=CUDA_SUCCESS) goto fail;
+    dump_stage("time2_silu",tmp2,2u*D,2,D);
+    if(launch_cast(r,bf,tmp2,2*D)!=CUDA_SUCCESS ||
        gemm_diagnostic_f64(r,mod,w_mod,bf,2,16384,D,"QIMG21_DIAG_MOD_F64")!=0 ||
        launch_vec(k->round_bf16,r->stream,2*16384,mod)!=CUDA_SUCCESS) goto fail;
     probe(r,"mod",mod,2*16384); dump_stage("mod",mod,2u*16384u,2,16384);

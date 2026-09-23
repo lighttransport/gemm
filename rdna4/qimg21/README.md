@@ -137,6 +137,15 @@ editing gate, so broader numeric or attention differences remain. Set
 `QIMG21_STAGE_KEYS=time2_pre_round` to dump the FP32 projection before its
 BF16 rounding for further diagnosis.
 
+`QIMG21_STAGE_KEYS=time2_silu` dumps the BF16 SiLU output immediately before
+the modulation GEMM. With CUDA's BF16 `time2.npy` replayed into HIP, all 8192
+SiLU values are byte-identical; modulation still differs in 12 image-row and
+21 text-row values. Thus the remaining matched-input discrepancy at that
+boundary is GEMM accumulation, not SiLU. FP64 modulation with the replayed
+CUDA timestep yields 16/13 differing values and first-prediction cosine
+0.999934041; FP64 modulation alone yields 0.999915156. Both miss the gate,
+and neither is selected by default.
+
 Matched block-0 replay further separates accumulated input drift from local
 kernel error. Injecting the saved CUDA `hidden0.npy` and `mod.npy` with
 `QIMG21_REPLAY_HIDDEN`, `QIMG21_REPLAY_MOD`, and `QIMG21_STAGE_BLOCK=0` into
