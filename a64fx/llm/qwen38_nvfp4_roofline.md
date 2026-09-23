@@ -260,6 +260,14 @@ from 211.7 to 207.0 ms, too small to justify the extra dispatch; it was
 discarded. `OMP_WAIT_POLICY=ACTIVE` made the draft stage 7.57 s and reduced
 end-to-end throughput to 3.07 tok/s, so leave the default wait policy.
 
+The isolated exact N=3 FFN-gate kernel scaled from 17.4 GB/s at 8 workers to
+26.0 at 12, 51.9 at 24, 76.5 at 36, and 100.4 at all 48 workers. This is
+close to linear worker scaling, so reducing the thread count cannot close
+the gap. Adding `restrict` qualifiers kept the same checksum and 100.3
+GB/s; unrolling two 16-value subblocks kept the checksum but regressed from
+0.500 to 0.707 ms for the 50 MB matrix. The node reported 2.2 GHz during
+these runs. No kernel replacement was made from these experiments.
+
 An opt-in `--draft-head-rows 65536` computes only the first 65,536 NextN
 vocabulary logits and marks the rest unavailable to the proposer. The full
 unapproximated target head still verifies every emitted token. On the
