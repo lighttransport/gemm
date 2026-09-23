@@ -246,19 +246,19 @@ activation across 13 target batches. These stages total about 0.30 s; no
 single nonprojection stage explains the 2.79 s verifier time.
 
 An additional 32-token profile split the 967.6 ms input projections into
-325.8 ms for SSM QKV/gate, 357.6 ms for BF16 SSM alpha/beta, 74.0 ms for
+325.8 ms for SSM QKV/gate, 357.6 ms for SSM alpha/beta, 74.0 ms for
 attention Q, and 210.1 ms for attention K/V. The shape-specific compact
 kernel counters agree with the first and third figures: FFN gate/up spent
 837.8 ms over 1664 calls, FFN down 422.0 ms over 832, SSM QKV 195.6 ms
 over 624, SSM gate 115.8 ms over 624, SSM output 157.6 ms over 832, and
-attention Q 73.3 ms over 208. The 24-row paired alpha/beta path is active:
-turning it off increased its 8-token trace time to 168.0 ms. Capping the
-paired path at 4, 12, or 24 OpenMP workers did not improve the full trace;
-12 workers took 367.8 ms for alpha/beta and 10.112 tok/s, with 32/32 serial
-token IDs. Pairing attention K/V into one team changed its 32-token time
-from 211.7 to 207.0 ms, too small to justify the extra dispatch; it was
-discarded. `OMP_WAIT_POLICY=ACTIVE` made the draft stage 7.57 s and reduced
-end-to-end throughput to 3.07 tok/s, so leave the default wait policy.
+attention Q 73.3 ms over 208. Subsequent GGUF metadata inspection showed
+that alpha/beta are **Q4_K with 48 rows each**, attention K is Q4_K, and
+attention V is Q6_K. The existing BF16 alpha/beta pair was therefore never
+selected. Capping that BF16 path at 4, 12, or 24 workers had no useful effect;
+its measured differences were run variation. A BF16 attention K/V pair was
+also inapplicable to these mixed tensor types and was discarded.
+`OMP_WAIT_POLICY=ACTIVE` made the draft stage 7.57 s and reduced end-to-end
+throughput to 3.07 tok/s, so leave the default wait policy.
 
 The isolated exact N=3 FFN-gate kernel scaled from 17.4 GB/s at 8 workers to
 26.0 at 12, 51.9 at 24, 76.5 at 36, and 100.4 at all 48 workers. This is
@@ -286,3 +286,36 @@ To reproduce the 32-token result, use the export block above and add
 the resulting `qwen38: token n=... pos=... id=...` lines against a run with
 `--spec-k 0` and the same prompt, model, `TF_KV_DTYPE=f32`, exact tile, and
 exact Q6 head flags.
+
+The actual Q4_K/Q6_K bottleneck was the generic verifier path's full FP32
+row expansion and separate vector pass for each of three candidates. An exact
+N=3 path now dequantizes one 256-value K block into a 1 KiB stack buffer and
+feeds its values to three independent SVE accumulators in the same order as
+the old per-token dot. The two 48-row SSM Q4_K projections also share one
+OpenMP team. On the 32-token matrix-multiplication prompt, alpha/beta fell
+from 317.6 to **25.0 ms**, attention K/V from 185.4 to **138.4 ms**, and
+verification from 2.715 to **2.420 s**; all **32/32** `(position, ID)` pairs
+matched serial unapproximated target decode. End-to-end was **11.297 tok/s**
+with 20/26 accepted drafts. On the independent 64-token `hi` trace, all
+**64/64** IDs matched, 35/58 drafts were accepted, verification took 5.287 s,
+and end-to-end reached **9.921 tok/s**. These include the optional 65,536-row
+approximate *draft* head; the target projections and head remain exact.
+The 40 tok/s single-request objective remains open.
+
+Rebuilding after removing the superseded full-row N=3 branch gave **11.341
+tok/s** on the 32-token prompt, again with 32/32 serial `(position, ID)`
+matches. For the same compiler flags as the runner, the direct block-buffer
+test compared all 144 outputs for each of Q4_K and Q6_K bit for bit against
+the original full-row dequantization and vector-dot path; both had zero
+mismatches:
+
+```sh
+make -C a64fx/llm qwen38_kquant_n3_test CC=fcc OPENMP=1
+a64fx/llm/build/test_qwen38_kquant_n3
+# type=12 rows=48 outputs=144 bad=0
+# type=14 rows=48 outputs=144 bad=0
+```
+
+To reproduce the end-to-end result, use the K=3 command above with
+`--draft-head-rows 65536` and `TF_KV_DTYPE=f32`; run the matching `--spec-k 0`
+serial command and compare every `qwen38: token n=... pos=... id=...` line.

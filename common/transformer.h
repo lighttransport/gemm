@@ -14301,6 +14301,42 @@ static void *tf_gemm_q8_tm_worker(void *arg) {
 
 static void *tf_gemm_qtensor_tm_worker(void *arg) {
     tf_gemm_qtensor_tm_task *t = (tf_gemm_qtensor_tm_task *)arg;
+#if defined(__ARM_FEATURE_SVE)
+    if (t->N == 3 && t->K % 256 == 0 &&
+        (t->mat->type == GGML_TYPE_Q4_K || t->mat->type == GGML_TYPE_Q6_K)) {
+        float block_buf[256] __attribute__((aligned(64)));
+        const svbool_t pg = svptrue_b32();
+        const int vl = (int)svcntw();
+        const int nb = t->K / 256;
+        const size_t bs = t->mat->type == GGML_TYPE_Q4_K ?
+            sizeof(block_q4_K) : sizeof(block_q6_K);
+        for (int r = t->row_start; r < t->row_end; r++) {
+            const uint8_t *w = (const uint8_t *)t->mat->data +
+                               (size_t)r * nb * bs;
+            svfloat32_t a0 = svdup_f32(0), a1 = a0, a2 = a0;
+            for (int ib = 0; ib < nb; ib++) {
+                if (t->mat->type == GGML_TYPE_Q4_K)
+                    dequantize_row_q4_K(w + (size_t)ib * bs, block_buf, 256);
+                else
+                    dequantize_row_q6_K(w + (size_t)ib * bs, block_buf, 256);
+                int base = ib * 256;
+                for (int k = 0; k < 256; k += vl) {
+                    svfloat32_t v = svld1_f32(pg, block_buf + k);
+                    a0 = svmla_f32_m(pg, a0, v,
+                        svld1_f32(pg, t->X + base + k));
+                    a1 = svmla_f32_m(pg, a1, v,
+                        svld1_f32(pg, t->X + t->X_stride + base + k));
+                    a2 = svmla_f32_m(pg, a2, v,
+                        svld1_f32(pg, t->X + (size_t)2 * t->X_stride + base + k));
+                }
+            }
+            t->Y[r] = svaddv_f32(pg, a0);
+            t->Y[(size_t)t->Y_stride + r] = svaddv_f32(pg, a1);
+            t->Y[(size_t)2 * t->Y_stride + r] = svaddv_f32(pg, a2);
+        }
+        return NULL;
+    }
+#endif
     float *row_buf = (float *)malloc((size_t)t->K * sizeof(float));
     if (!row_buf) return NULL;
     size_t rb = tf_row_bytes(t->mat->type, t->K);
@@ -14355,6 +14391,36 @@ static void *tf_gemm_qtensor_tm_worker(void *arg) {
     }
     free(row_buf);
     return NULL;
+}
+
+static int tf_gemm_qtensor_n3_pair(float *Y0, const qtensor *m0,
+                                  float *Y1, const qtensor *m1,
+                                  const float *X, int rows, int out_stride,
+                                  int X_stride, int n_threads) {
+    if (!m0 || !m1 || m0->type != GGML_TYPE_Q4_K ||
+        m1->type != GGML_TYPE_Q4_K || m0->n_cols != m1->n_cols ||
+        m0->n_cols != X_stride || m0->n_rows != rows ||
+        m1->n_rows != rows || rows <= 0) return 0;
+    int nt = n_threads > 1 ? n_threads : 1;
+    if (nt > rows) nt = rows;
+#ifdef _OPENMP
+    #pragma omp parallel num_threads(nt)
+#endif
+    {
+#ifdef _OPENMP
+        int tid = omp_get_thread_num(), team = omp_get_num_threads();
+#else
+        int tid = 0, team = 1;
+#endif
+        int first = rows * tid / team, last = rows * (tid + 1) / team;
+        tf_gemm_qtensor_tm_task t0 = {Y0, m0, X, first, last, X_stride,
+                                      3, out_stride, X_stride};
+        tf_gemm_qtensor_tm_task t1 = {Y1, m1, X, first, last, X_stride,
+                                      3, out_stride, X_stride};
+        (void)tf_gemm_qtensor_tm_worker(&t0);
+        (void)tf_gemm_qtensor_tm_worker(&t1);
+    }
+    return 1;
 }
 
 static void *tf_gemm_q4_0_tm_worker(void *arg) {
@@ -17471,9 +17537,8 @@ static float *tf_qwen_hybrid_prefill_batch(transformer_model *m,
                                       ld, ne, batch_nt);
             double ab_start = tf_time_ms();
             pprof->ssm_qkv_gate_ms += ab_start - pt;
-            /* Alpha/beta are just 12 rows each. A shared small-N team avoids
-             * 96 tiny team launches per verifier round (two in every SSM
-             * layer), while the common row primitive preserves exact sums. */
+            /* Small alpha/beta matrices can share one team. Keep each row's
+             * dequantization and vector accumulation order unchanged. */
             static int pair_ab = -1;
             if (pair_ab < 0) {
                 const char *e = getenv("TF_SSM_AB_PAIR");
@@ -17486,6 +17551,10 @@ static float *tf_qwen_hybrid_prefill_batch(transformer_model *m,
 #else
             int paired_ab = 0;
 #endif
+            if (!paired_ab && pair_ab && N == 3)
+                paired_ab = tf_gemm_qtensor_n3_pair(
+                    kv, &L->ssm_alpha, vv, &L->ssm_beta, norm,
+                    m->ssm_dt_rank, m->ssm_dt_rank, ne, batch_nt);
             if (!paired_ab) {
                 tf_gemm_f16_mt_tokenmajor(kv, &L->ssm_alpha, norm,
                                           m->ssm_dt_rank, N, m->ssm_dt_rank,
