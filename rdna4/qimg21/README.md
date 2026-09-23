@@ -205,30 +205,43 @@ second-step input differs from that original capture, so the latter cosine
 must not be paired with the native free-running regression. Replaying pinned
 CUDA PyTorch on the *ROCm free-running inputs* instead gives same-input
 reference cosines 0.999936229 and 0.999836624. These are cross-framework
-reference floors, not native acceptance results. A defensible cross-platform
-criterion would retain 0.99996 for native versus same-GPU predictions and trajectory, and
-report CUDA versus ROCm reference drift separately. Do not relax the
-nonquantized gate to the reference floor; the second native prediction still
-needs a fix.
-An optional, separately named cross-platform floor tier would require each
-native-versus-PyTorch-ROCm prediction cosine to be at least the corresponding
-pinned PyTorch-CUDA-versus-PyTorch-ROCm cosine on the same free-running inputs,
-and both native trajectory checkpoints to retain the 0.99996 requirement. The current
-native predictions exceed those reference floors by about 0.0000378 and
-0.0000395, and the trajectories pass. `reference_floor_report.py` validates
-the oracle capture relationship and reports this proposed tier alongside the
-unchanged strict gate; it does not change acceptance tests. Run it with:
+reference floors, not native acceptance results. The unchanged 0.99996
+nonquantized gate still fails on the second native prediction.
+
+An independent house edit (`change the house color to blue`, seed 43, two
+steps, 256x256 target) tests whether this floor generalizes. Its same-input
+CUDA/ROCm prediction cosines are 0.999763470/0.999870206, while native/ROCm
+reaches 0.999798388/0.999910532. Native exceeds the corresponding reference
+floor in both steps, but both predictions fail the fixed 0.99996 gate. Its
+native/ROCm trajectory cosines are 0.999719253/0.999721057, so the earlier
+proposal to retain 0.99996 for trajectories also fails this independent
+fixture. The free-running CUDA/ROCm trajectory cosines from the same initial
+noise are 0.999672487/0.999672307; native exceeds those floors by about
+0.0000468/0.0000488. In the original seed-42 case, native exceeds the
+CUDA/ROCm trajectory floors by about 0.0000468/0.0000466.
+
+A revised, separately named cross-platform floor tier would require every
+native-versus-PyTorch-ROCm prediction to meet or exceed pinned CUDA-versus-
+ROCm PyTorch on the exact same step input. Each native trajectory checkpoint
+would meet or exceed the CUDA-versus-ROCm free-running checkpoint, with both
+reference runs starting from byte-identical noise and step-0 transformer
+input. This tier passes both two-step fixtures, with positive margins on all
+eight comparisons. It is a proposal for review, not an acceptance test.
+`reference_floor_report.py` verifies the capture chain, identical starting
+inputs, saved native metrics, and both proposed and unchanged strict outcomes.
+Run it for the original fixture with:
 
 ```sh
 python3 rdna4/qimg21/reference_floor_report.py \
   --cuda-reference tmp/qimg21-edit-reference-cuda-on-rocm-inputs-20260924 \
+  --cuda-free-run tmp/qimg21-edit-reference-efficient \
   --rocm-reference tmp/qimg21-edit-reference-rocm-free-bundle-20260923 \
   --native-regression tmp/qimg21-edit-rocm-free-regression-20260923 \
   --out tmp/qimg21-edit-reference-floor-matched-20260924.json
 ```
 
-This tier is a proposal for review; the unchanged strict same-GPU prediction
-gate remains open.
+The independent result is in `tmp/qimg21-edit-house-seed43-floor-20260924.json`.
+The unchanged strict same-GPU editing gate remains open on both fixtures.
 
 On the free-running second-step ROCm input, the native and PyTorch ROCm target
 block outputs start at cosine 0.999999816 after block 0, first fall below
