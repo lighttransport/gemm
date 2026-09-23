@@ -24,7 +24,8 @@ No `hipcc` needed at build time - kernels are compiled at runtime via HIPRTC, lo
 ## Requirements
 
 - GCC (build time only - no hipcc/ROCm SDK needed to compile)
-- ROCm 6.x+ runtime: `libamdhip64.so`, `libhiprtc.so` (in `/opt/rocm/lib/`)
+- ROCm 6.x+ runtime: `libamdhip64.so`, `libhiprtc.so` (in `/opt/rocm/lib/`
+  or versioned core prefixes such as `/opt/rocm/core-10.0/lib/`)
 - AMD GPU with RDNA4 architecture (gfx1200 or gfx1201)
 
 ## Build
