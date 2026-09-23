@@ -275,6 +275,17 @@ required eight-float pattern and changed the output checksum. Loading all
 preserved the checksum, but slowed the isolated FFN matrix from 0.500 to
 0.676 ms. Neither was applied to the target kernel.
 
+Sampling 500 passes of the fixed-N=3 50 MB kernel with `perf record -e
+cycles:u -F 999` attributed 95.22% of sampled cycles to the compact decode
+routine and 3.14% to the OpenMP fork barrier. Its disassembly already shares
+activation loads and table selections across the four row pairs; explicitly
+hoisting six activation vectors kept the checksum but took 0.505 ms versus
+0.500 ms. The hot instruction sequence includes UE4M3 scale lookup/broadcast,
+FP4 nibble table selection, FP32 scale multiplication, and three candidate
+FMAs. A separate FP32 scale sidecar preserved the checksum but took 0.655 ms;
+an exact BF16-bit sidecar took 0.715 ms. Extra scale storage and reads did
+not offset the scalar conversion instructions, so neither sidecar was kept.
+
 An opt-in `--draft-head-rows 65536` computes only the first 65,536 NextN
 vocabulary logits and marks the rest unavailable to the proposer. The full
 unapproximated target head still verifies every emitted token. On the
