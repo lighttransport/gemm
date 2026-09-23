@@ -417,10 +417,11 @@ The Python demo's health endpoint and GPU controls were smoke-tested with
 inference response. The original options/result C ABI layouts remain intact;
 GPU selection uses the separate versioned configuration API.
 
-## RX 9070 XT resident rerun (2026-09-24)
+## RX 9070 XT and RTX 5060 Ti resident reruns (2026-09-24)
 
-With the same house and four-view example fixtures, seed, mixed flow precision,
-12,288 MiB budget, and resident automatic kernels, rerun:
+With the same house and four-view example fixtures, seeds, mixed flow
+precision, and resident automatic kernels, rerun with the ROCm 12,288 MiB and
+CUDA 7,168 MiB budgets:
 
 ```sh
 ref/pixal3d/run.sh rocm ref/pixal3d/run_fixture.py --backend rocm \
@@ -434,6 +435,18 @@ ref/pixal3d/run.sh rocm ref/pixal3d/run_fixture.py --backend rocm \
   --output-dir tmp/pixal3d/revalidate-rocm-multiview-20260924 --seed 42 \
   --threads 8 --gpu-execution resident --gpu-kernels auto \
   --gpu-flow-precision mixed --vram-budget-mib 12288 \
+  --texture-size 4096 --triangle-target 1000000
+ref/pixal3d/run.sh cuda ref/pixal3d/run_fixture.py --backend cuda \
+  --input ref/pixal3d/upstream/assets/images/1_img.png \
+  --output-dir tmp/pixal3d/revalidate-cuda-house-20260924 --seed 1 \
+  --threads 8 --gpu-execution resident --gpu-kernels auto \
+  --gpu-flow-precision mixed --vram-budget-mib 7168 \
+  --texture-size 1024 --triangle-target 1000000
+ref/pixal3d/run.sh cuda ref/pixal3d/run_fixture.py --backend cuda \
+  --views-dir ref/pixal3d/upstream/assets/mv_images/example \
+  --output-dir tmp/pixal3d/revalidate-cuda-multiview-20260924 --seed 42 \
+  --threads 8 --gpu-execution resident --gpu-kernels auto \
+  --gpu-flow-precision mixed --vram-budget-mib 7168 \
   --texture-size 4096 --triangle-target 1000000
 ```
 
