@@ -264,6 +264,10 @@ static int loadHIP(void)
     const char* hip_paths[] = { NULL };
 #else
     const char* hip_paths[] = {
+        /* Prefer the installed RDNA4 ROCm 10 runtime over an older system
+         * libamdhip64.so.5 that may be present in the dynamic linker cache. */
+        "/opt/rocm/core-10.0/lib/libamdhip64.so",
+        "/opt/rocm/core-10.0/lib/libamdhip64.so.10",
         "libamdhip64.so",
         "libamdhip64.so.10",
         "libamdhip64.so.9",
@@ -430,6 +434,8 @@ static int loadHIPRTC(void)
     const char* hiprtc_paths[] = { NULL };
 #else
     const char* hiprtc_paths[] = {
+        "/opt/rocm/core-10.0/lib/libhiprtc.so",
+        "/opt/rocm/core-10.0/lib/libhiprtc.so.10",
         "libhiprtc.so",
         "libhiprtc.so.10",
         "libhiprtc.so.9",

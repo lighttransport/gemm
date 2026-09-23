@@ -9,7 +9,7 @@ No `hipcc` needed at build time - kernels are compiled at runtime via HIPRTC, lo
 - **Target**: AMD RDNA4 (gfx1200/gfx1201), 64 CUs, wave size 32
 - **WMMA matrix engine**: BF16/FP16 (`v_wmma_f32_16x16x16_bf16/f16`) and FP8 e4m3 (`v_wmma_f32_16x16x16_fp8_fp8`) on gfx1201. Microbench peaks: BF16 195 TF/s, FP8 351 TF/s (8-wave). Tuned BF16 mm0 sustains 174 TF/s (89% peak); standalone FP8 mm0 via extracted hipBLASLt kernel sustains 218 TF/s.
 - **Runtime compilation**: HIPRTC compiles HIP C kernel strings at program startup
-- **Dynamic loading**: `rocew` (ROCm Extension Wrangler) loads `libamdhip64.so` + `libhiprtc.so` via dlopen
+- **Dynamic loading**: `rocew` (ROCm Extension Wrangler) loads `libamdhip64.so` + `libhiprtc.so` via dlopen. When present, it prefers `/opt/rocm/core-10.0/lib` over an older system `libamdhip64.so.5` in the linker cache.
 
 ## Runners
 
