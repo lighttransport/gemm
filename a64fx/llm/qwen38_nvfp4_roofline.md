@@ -286,6 +286,13 @@ FMAs. A separate FP32 scale sidecar preserved the checksum but took 0.655 ms;
 an exact BF16-bit sidecar took 0.715 ms. Extra scale storage and reads did
 not offset the scalar conversion instructions, so neither sidecar was kept.
 
+Reducing the live accumulators by traversing only two row pairs per pass kept
+the exact checksum but took 0.641 ms: the repeated compact-weight and
+activation reads outweighed the shorter dependency chain. Replacing the two
+scalar scale-table broadcasts with one SVE gather from the same 1 KiB table
+also preserved the checksum but took 0.789 ms. Both compare with the current
+0.500 ms four-pair kernel on the same isolated shape and 48-core node.
+
 An opt-in `--draft-head-rows 65536` computes only the first 65,536 NextN
 vocabulary logits and marks the rest unavailable to the proposer. The full
 unapproximated target head still verifies every emitted token. On the
