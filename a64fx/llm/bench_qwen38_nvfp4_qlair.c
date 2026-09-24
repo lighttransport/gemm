@@ -32,6 +32,9 @@ extern void q38_super_bench_rows_a8(float *, const int8_t *, const int8_t *,
 extern void q38_super_bench_rows_a8_n1(float *, const int8_t *, const int8_t *,
                                         float, const uint32_t *, const float *,
                                         const float *, int, int, int, int);
+extern int q38_nvfp4_packed64_repack(void *, const void *, int);
+extern int q38_nvfp4_packed64_a8_rows(float *, const void *, const int8_t *,
+                                      float, int, int);
 __attribute__((noinline)) void __qlair_sim_start(unsigned long id) {
     (void)id; __asm__ volatile("" ::: "memory");
 }
@@ -127,8 +130,31 @@ static float *activation;
 static int8_t *digits;
 static packed_a8_act *packed_act;
 static float digit_scale[3];
-static int bench_cols, bench_sdot, bench_n1, bench_pack_a8, bench_repack;
+static int bench_cols, bench_sdot, bench_n1, bench_pack_a8, bench_pack64,
+           bench_repack;
 static packed_block repack_source[8 * (17408 / 64)];
+
+static float reference_pack64_row(int row) {
+    static const int8_t code[16] = {
+        0,1,2,3,4,6,8,12,0,-1,-2,-3,-4,-6,-8,-12
+    };
+    int src_row = row % 64;
+    int nb = bench_cols / 64;
+    float expected = 0.0f;
+    for (int tile = 0; tile < bench_cols / 16; tile++) {
+        const packed_subblock *p =
+            &repack_source[(src_row / 8) * nb + tile / 4].s[tile % 4];
+        int sum = 0;
+        for (int v = 0; v < 16; v++) {
+            uint8_t z = p->qs[(src_row % 8) * 8 + v % 8];
+            sum += code[v < 8 ? z & 15 : z >> 4] *
+                   digits[tile * 16 + v];
+        }
+        expected = fmaf((float)sum, p->d[src_row % 8] * digit_scale[0],
+                        expected);
+    }
+    return expected;
+}
 
 /* Validate one row per worker outside the marked region. This catches
  * incomplete simulator execution as well as nibble/order regressions. */
@@ -139,7 +165,9 @@ static int check_first_row(const uint8_t *weights, const float *y,
     };
     for (int c = 0; c < (bench_n1 ? 1 : 3); c++) {
         float expected = 0.0f;
-        if (bench_repack) {
+        if (bench_pack64) {
+            expected = reference_pack64_row(0);
+        } else if (bench_repack) {
             static const int8_t code[16] = {
                 0,1,2,3,4,6,8,12,0,-1,-2,-3,-4,-6,-8,-12
             };
@@ -243,6 +271,15 @@ static int check_repack_all(const float *y, int local_rows) {
     return 1;
 }
 
+static int check_pack64_all(const float *y, int local_rows) {
+    for (int row = 0; row < local_rows; row++) {
+        float expected = reference_pack64_row(row);
+        if (!isfinite(y[row]) || fabsf(y[row] - expected) >
+                0.0005f + 0.0005f * fabsf(expected)) return 0;
+    }
+    return 1;
+}
+
 static pthread_barrier_t start_barrier, end_barrier;
 static uint8_t *segments[4];
 static int bench_rows, bench_cores, bench_passes, bench_warmup;
@@ -261,7 +298,7 @@ static void *run_worker(void *arg) {
     CPU_ZERO(&mask);
     CPU_SET(12 + tid, &mask);
     worker->error = sched_setaffinity(0, sizeof(mask), &mask) != 0;
-    int group_rows = bench_sdot ? 64 : 8;
+    int group_rows = (bench_sdot || bench_pack64) ? 64 : 8;
     int groups = bench_rows / group_rows, nb = bench_cols / 64;
     int cmgs = (bench_cores + 11) / 12, cmg = tid / 12;
     int first = groups * tid / bench_cores;
@@ -269,7 +306,8 @@ static void *run_worker(void *arg) {
     int cmg_first = groups * cmg / cmgs;
     int local_rows = (last - first) * group_rows;
     size_t group_bytes = bench_sdot ? (size_t)bench_cols * 64 :
-                                      (size_t)nb * sizeof(packed_block);
+                         bench_pack64 ? (size_t)bench_cols * 48 :
+                                        (size_t)nb * sizeof(packed_block);
     uint8_t *weights = segments[cmg] + (size_t)(first - cmg_first) * group_bytes;
     size_t bytes = (size_t)(last - first) * group_bytes;
     float *y = NULL;
@@ -291,7 +329,10 @@ static void *run_worker(void *arg) {
     volatile uint8_t stream_sum = 0;
     for (int rep = 0; rep < bench_warmup && !worker->error; rep++) {
         if (bench_compute) {
-            if (bench_pack_a8) {
+            if (bench_pack64) {
+                if (!q38_nvfp4_packed64_a8_rows(y, weights, digits,
+                        digit_scale[0], local_rows, bench_cols)) worker->error = 1;
+            } else if (bench_pack_a8) {
                 if (!q38_nvfp4_packed_a8_rows(y, weights, packed_act,
                         digit_scale[0], local_rows, bench_cols)) worker->error = 1;
             } else if (bench_a8 && bench_n1) {
@@ -330,7 +371,10 @@ static void *run_worker(void *arg) {
     worker->begin = ticks();
     for (int rep = 0; rep < bench_passes && !worker->error; rep++) {
         if (bench_compute) {
-            if (bench_pack_a8) {
+            if (bench_pack64) {
+                if (!q38_nvfp4_packed64_a8_rows(y, weights, digits,
+                        digit_scale[0], local_rows, bench_cols)) worker->error = 1;
+            } else if (bench_pack_a8) {
                 if (!q38_nvfp4_packed_a8_rows(y, weights, packed_act,
                         digit_scale[0], local_rows, bench_cols)) worker->error = 1;
             } else if (bench_a8 && bench_n1) {
@@ -367,6 +411,8 @@ static void *run_worker(void *arg) {
         !check_first_row(weights, y, local_rows)) worker->error = 1;
     if (bench_repack && bench_compute && bench_check_all && !worker->error &&
         !check_repack_all(y, local_rows)) worker->error = 1;
+    if (bench_pack64 && bench_compute && bench_check_all && !worker->error &&
+        !check_pack64_all(y, local_rows)) worker->error = 1;
     if (bench_compute && !worker->error && !isfinite(y[0])) worker->error = 1;
     worker->checksum = bench_compute && !worker->error ? y[0] : (float)stream_sum;
     pthread_barrier_wait(&end_barrier);
@@ -378,6 +424,8 @@ int main(int argc, char **argv) {
     if (argc != 7 || (strcmp(argv[1], "compute") &&
                       strcmp(argv[1], "compute1") &&
                       strcmp(argv[1], "packed8_1") &&
+                      strcmp(argv[1], "packed64_1") &&
+                      strcmp(argv[1], "packed64_stream") &&
                       strcmp(argv[1], "stream") &&
                       strcmp(argv[1], "stream1") &&
                       strcmp(argv[1], "sdot") &&
@@ -391,15 +439,17 @@ int main(int argc, char **argv) {
                       strcmp(argv[1], "repack8_rare_stream") &&
                       strcmp(argv[1], "repack8_groupmeta_stream") &&
                       strcmp(argv[1], "sdot8_stream"))) {
-        fprintf(stderr, "usage: %s compute|compute1|packed8_1|stream|stream1|sdot|sdot_stream|sdot8|sdot8_1|repack8_1|repack8_rare1|repack8_groupmeta1|repack8_stream|repack8_rare_stream|repack8_groupmeta_stream|sdot8_stream ROWS COLS CORES PASSES WARMUP\n", argv[0]);
+        fprintf(stderr, "usage: %s compute|compute1|packed8_1|packed64_1|packed64_stream|stream|stream1|sdot|sdot_stream|sdot8|sdot8_1|repack8_1|repack8_rare1|repack8_groupmeta1|repack8_stream|repack8_rare_stream|repack8_groupmeta_stream|sdot8_stream ROWS COLS CORES PASSES WARMUP\n", argv[0]);
         return 2;
     }
-    bench_compute = !strcmp(argv[1], "compute") || !strcmp(argv[1], "compute1") || !strcmp(argv[1], "packed8_1") || !strcmp(argv[1], "sdot") ||
+    bench_compute = !strcmp(argv[1], "compute") || !strcmp(argv[1], "compute1") || !strcmp(argv[1], "packed8_1") || !strcmp(argv[1], "packed64_1") || !strcmp(argv[1], "sdot") ||
                     !strcmp(argv[1], "sdot8") || !strcmp(argv[1], "sdot8_1") ||
                     !strcmp(argv[1], "repack8_1") ||
                     !strcmp(argv[1], "repack8_rare1") ||
                     !strcmp(argv[1], "repack8_groupmeta1");
     bench_pack_a8 = !strcmp(argv[1], "packed8_1");
+    bench_pack64 = !strcmp(argv[1], "packed64_1") ||
+                   !strcmp(argv[1], "packed64_stream");
     bench_repack = !strcmp(argv[1], "repack8_1") ||
                    !strcmp(argv[1], "repack8_stream") ||
                    !strcmp(argv[1], "repack8_rare1") ||
@@ -413,7 +463,8 @@ int main(int argc, char **argv) {
     bench_groupmeta = !strcmp(argv[1], "repack8_groupmeta1") ||
                       !strcmp(argv[1], "repack8_groupmeta_stream");
     bench_n1 = !strcmp(argv[1], "compute1") || !strcmp(argv[1], "stream1") ||
-               !strcmp(argv[1], "sdot8_1") || bench_pack_a8 || bench_repack;
+               !strcmp(argv[1], "sdot8_1") || bench_pack_a8 ||
+               bench_pack64 || bench_repack;
     bench_a8 = !strcmp(argv[1], "sdot8") || !strcmp(argv[1], "sdot8_1") ||
                bench_repack ||
                !strcmp(argv[1], "sdot8_stream");
@@ -423,7 +474,7 @@ int main(int argc, char **argv) {
     bench_cores = atoi(argv[4]); bench_passes = atoi(argv[5]);
     bench_warmup = atoi(argv[6]);
     bench_check_all = getenv("Q38_QLAIR_CHECK_ALL") != NULL;
-    int group_rows = bench_sdot ? 64 : 8;
+    int group_rows = (bench_sdot || bench_pack64) ? 64 : 8;
     if (bench_rows < group_rows || bench_rows % group_rows || bench_cols < 64 ||
         bench_cols % 64 || (bench_cores != 1 && bench_cores != 12 &&
                               bench_cores != 48) ||
@@ -433,7 +484,8 @@ int main(int argc, char **argv) {
     int groups = bench_rows / group_rows, nb = bench_cols / 64;
     int cmgs = (bench_cores + 11) / 12;
     size_t group_bytes = bench_sdot ? (size_t)bench_cols * 64 :
-                                      (size_t)nb * sizeof(packed_block);
+                         bench_pack64 ? (size_t)bench_cols * 48 :
+                                        (size_t)nb * sizeof(packed_block);
     size_t total_bytes = (size_t)groups * group_bytes;
     for (int cmg = 0; cmg < cmgs; cmg++) {
         size_t cmg_groups = (size_t)(groups * (cmg + 1) / cmgs -
@@ -448,7 +500,14 @@ int main(int argc, char **argv) {
                 return 1;
             }
         }
-        if (bench_repack) {
+        if (bench_pack64) {
+            init_weights(repack_source, (size_t)8 * nb);
+            if (!q38_nvfp4_packed64_repack(segments[cmg], repack_source,
+                                           bench_cols)) return 1;
+            for (size_t group = 1; group < cmg_groups; group++)
+                memcpy(segments[cmg] + group * group_bytes,
+                       segments[cmg], group_bytes);
+        } else if (bench_repack) {
             /* Every synthetic 64-row source group is identical. Convert
              * one, then replicate its derived bytes to keep simulator
              * setup short without changing the timed weight stream. */
@@ -502,17 +561,18 @@ int main(int argc, char **argv) {
                        (size_t)3 * bench_cols * sizeof(float))) return 1;
     for (int i = 0; i < 3 * bench_cols; i++)
         activation[i] = (float)((i * 17) % 101 - 50) * 0.015625f;
-    if (bench_sdot || bench_pack_a8) {
+    if (bench_sdot || bench_pack_a8 || bench_pack64) {
         if (posix_memalign((void **)&digits, 256,
                            (size_t)6 * bench_cols)) return 1;
-        if (bench_a8 || bench_pack_a8) {
+        if (bench_a8 || bench_pack_a8 || bench_pack64) {
             for (int c = 0; c < 3; c++) {
                 float maxabs = 0.0f;
                 for (int k = 0; k < bench_cols; k++) {
                     float a = fabsf(activation[(size_t)c * bench_cols + k]);
                     if (a > maxabs) maxabs = a;
                 }
-                digit_scale[c] = maxabs / (127.0f * (bench_pack_a8 ? 1.0f : 1024.0f));
+                digit_scale[c] = maxabs / (127.0f *
+                    ((bench_pack_a8 || bench_pack64) ? 1.0f : 1024.0f));
                 float inv = maxabs > 0.0f ? 127.0f / maxabs : 0.0f;
                 for (int k = 0; k < bench_cols; k++) {
                     int q = (int)lrintf(activation[(size_t)c * bench_cols + k] * inv);

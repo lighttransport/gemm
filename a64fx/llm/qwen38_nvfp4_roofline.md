@@ -957,3 +957,44 @@ Q38_QLAIR_CHECK_ALL=1 Q38_QLAIR_NO_MBIND=1 \
   qemu-aarch64 -cpu max,sve512=on -L /usr/aarch64-linux-gnu \
   tmp/bench_qwen38_nvfp4_qlair repack8_rare1 6144 5120 12 1 0
 ```
+
+### Compact 64-row FP4 repack experiment
+
+`qwen38_nvfp4_packed64_a8.c` adds a load-time repack that preserves the
+source's 4-bit code and FP32 scale byte count: each 64-row x 16-column
+tile remains 768 bytes (512 packed-code bytes + 256 scale bytes). Two
+four-column groups share the low/high nibbles of each SVE vector. The
+one-token kernel uses SVE table lookup + SDOT, then applies the per-row
+scale to each 16-column partial sum. Its INT8 activation is prepared once
+before the marked region, as in `packed8_1`.
+
+At 6144x5120, the compact weight stream is **23,592,960 bytes**, versus
+31,457,280 bytes for the expanded signed-byte sidecar. The full-shape
+independent source check passes for every row under SVE QEMU. The small
+128x128 all-row check passes in qlair. The initial row-interleaved nibble
+layout reached only **43.6 GB/s** in one full-shape qlair run; pairing
+four-column groups in the low/high nibbles removed SVE zip instructions
+and reached **95.7 GB/s**, while its matched byte scan reached
+**223.6 GB/s**. One alternate SDOT scheduling order reached 92.3 GB/s.
+These are experimental single-run results, not a bandwidth-limited
+compact kernel. Subsequent 12-core qlair attempts sometimes crashed or
+stopped on invalid/unsupported instruction execution even though the same
+binary passed full-shape QEMU; require `correct=1` and a complete 12-thread
+profile before accepting another simulator number. Production load-time
+integration and real-model token identity remain unverified.
+
+Build `qwen38_nvfp4_packed64_a8.c` with Clang `-O3 -march=armv8.2-a+sve`
+and link its object into `bench_qwen38_nvfp4_qlair`. Then run:
+
+```sh
+Q38_QLAIR_CHECK_ALL=1 Q38_QLAIR_NO_MBIND=1 \
+  qemu-aarch64 -cpu max,sve512=on -L /usr/aarch64-linux-gnu \
+  tmp/bench_qwen38_nvfp4_qlair_packed64 packed64_1 6144 5120 12 1 0
+Q=~/work/clair/a64fx/build-inference/qlair
+for mode in packed64_1 packed64_stream; do
+  "$Q" --cores 12 --profile-markers \
+    --profile-report "tmp/q38-fp4-qlair-6144-${mode}.json" \
+    --profile-format json -n 3G tmp/bench_qwen38_nvfp4_qlair_packed64 \
+    -- "$mode" 6144 5120 12 1 1
+done
+```
