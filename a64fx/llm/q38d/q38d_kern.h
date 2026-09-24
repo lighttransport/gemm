@@ -905,19 +905,19 @@ static int q38d_pair_groups = 0;
 static inline void q38d_gemv_any(float *out, const uint8_t *base, int fmt, const q38d_act *a,
                                  int g0, int g1, int rows, int mode) {
     size_t gb = q38d_group_bytes(fmt, a->cols);
-    if (q38d_pair_groups && fmt == Q38D_F4 && a->arith != Q38D_F32 && a->cols % 64 == 0 && a->cols >= 256) {
+    if (q38d_pair_groups && fmt == Q38D_F4 && a->arith != Q38D_F32 && a->cols % 64 == 0 &&
+        a->cols >= 256 && g1 * 8 <= rows && g1 - g0 >= 2) {
+        /* pair group g0+i with g0+half+i: two long sequential streams */
+        int half = (g1 - g0) / 2;
         float tmp[16];
-        for (; g0 + 2 <= g1 && (g0 + 2) * 8 <= rows; g0 += 2) {
-            float *o = out + (size_t)g0 * 8;
-            const uint8_t *w = base + (size_t)g0 * gb;
-            if (!mode) q38d_gemv_dual_f4(o - (size_t)g0 * 8, o - (size_t)g0 * 8 + 8, w - (size_t)g0 * gb,
-                                         w - (size_t)g0 * gb + gb, a, g0, g0 + 1);
-            else {
-                q38d_gemv_dual_f4(tmp - (size_t)g0 * 8, tmp - (size_t)g0 * 8 + 8, w - (size_t)g0 * gb,
-                                  w - (size_t)g0 * gb + gb, a, g0, g0 + 1);
-                for (int r = 0; r < 16; r++) o[r] += tmp[r];
-            }
+        for (int i = 0; i < half; i++) {
+            int ga = g0 + i, gb2 = g0 + half + i;
+            const uint8_t *wa = base + (size_t)ga * gb, *wb = base + (size_t)gb2 * gb;
+            float *oa = mode ? tmp : out + (size_t)ga * 8, *ob = mode ? tmp + 8 : out + (size_t)gb2 * 8;
+            q38d_gemv_dual_f4(oa, ob, wa, wb, a, 0, 1);
+            if (mode) for (int r = 0; r < 8; r++) { out[(size_t)ga * 8 + r] += tmp[r]; out[(size_t)gb2 * 8 + r] += tmp[8 + r]; }
         }
+        g0 += 2 * half;
     }
     for (int g = g0; g < g1; g++) {
         int nr = rows - g * 8 < 8 ? rows - g * 8 : 8;

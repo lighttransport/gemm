@@ -1,375 +1,164 @@
-# Qwen3.8-27B FP4 / true FP6 decode: checkpoint and resume prompt
+# Qwen3.8-27B FP4 / true FP6 decode on one A64FX node: q38d checkpoint
 
-Updated: 2026-09-24 JST, after wrapping up native allocation 51893515.
-This replaces the earlier expanded-FP4 handoff. Root `resume.md` concerns
-unrelated work; use this file for the low-bit decode task.
+Updated: 2026-09-25 JST, interactive allocation 51895461 (host c25-3104b,
+48 cores, 2.0 GHz, `eco_state=0`). Root `resume.md` and the older
+`qwen38-fp4-resume.md` concern other work; this file is current.
 
-## Current result and acceptance boundary
+## Result and acceptance boundary
 
-The compact FP4 path now runs the real model on one 48-core A64FX node.
-The latest measured serial N=1 decode is **8.675 tok/s at 1024 input + 256
-generated tokens**, and **9.693 tok/s at 128 + 256**. These are single trials,
-not stable repeated throughput results. **The FP4 40+ tok/s and true FP6
-30+ tok/s targets have not been reached.** Full-model FP6, held-out quality,
-and unapproximated greedy-reference validation remain open.
+A dedicated decode engine, `a64fx/llm/q38d`, replaces the generic
+`transformer.h` decode path for this model. Serial N=1 greedy decode,
+A16 activations, same repeated sky-blue prompt as the earlier runner:
 
-The user-approved scope is:
-
-- One 48-core A64FX node, including the untimed BF16 oracle. No multi-node
-  reference and no speculative decoding for the throughput gates.
-- FP4 >= 40 tok/s; true FP6 E2M3 >= 30 tok/s. The primary workload is
-  1024 input + 256 generated tokens; sensitivity cases are 128 and 4096.
-- FP6 is quantized from BF16. The older `packed6` expanded-FP4 payload is
-  a separate format and is not a true FP6 result.
-- Held-out perplexity and BF16-logit error must be no worse than existing
-  NVFP4. Optimized execution must match every generated position/token ID
-  from an unapproximated reference for the same weights.
-- Bounded direct-to-CMG loading, a reusable final model image, shared
-  activation preparation, and a one-node layer-streamed BF16 oracle.
-- Simulator acceptance requires matched objects/settings, two native
-  allocations, at least ten samples, CV/drift <= 2%, and < 3% cycle and
-  bandwidth error. Effective source bytes and FAPP physical traffic are
-  separate measurements.
-
-## Implemented checkpoint
-
-All new code lives under `a64fx/llm/`, with opt-in dispatch hooks in
-`common/transformer.h` and CLI integration in `qwen38_runner.c`.
-
-| Component | Files / behavior |
-| --- | --- |
-| Formats and portable reference | `qwen38_lowbit.h`, `.c`: raw NVFP4 repack, BF16-to-FP6 E2M3 conversion, scalar activation preparation and reference math |
-| SVE kernels | `qwen38_lowbit_sve.c`, `qwen38_lowbit_scale.inc`: 512-bit SVE, 8 output rows, code lookup + SDOT, FP32 scale/accumulation; F32 activation dequant/FMA path |
-| Loader and image | `qwen38_lowbit_model.h`, `.c`, `qwen38_lowbit_image.inc`: bounded conversion, CMG-local anonymous storage, descriptor registry, validated cache image |
-| Correctness and measurements | `test_qwen38_lowbit.c`, `test_qwen38_lowbit_model.c`, `bench_qwen38_lowbit.c`, `bench_qwen38_lowbit_prepare.c` |
-| Quality prototype | `qwen38_lowbit_eval.c`, `compare_qwen38_lowbit_quality.py`, `test_qwen38_lowbit_quality.py` |
-
-FP4 stores 512 weights in 288 bytes including UE4M3 scales: **4.5 total
-bits/weight**, with a lossless repack of source NVFP4. True FP6 uses packed
-low-four/high-two-bit planes and E8M0 block-32 scales: 400 bytes per 512
-weights, **6.25 total bits/weight**. E2M3 finite magnitudes span 0.125 to 7.5;
-conversion handles round-to-nearest-even, signed zero, saturation and tails.
-Nonfinite BF16 values are rejected.
-
-A8 activation blocks use symmetric max 127. A16 uses centered radix 256,
-`q = lo + 256 * hi`, max 32639; per-block accumulation stays within INT32.
-The portable double reference and F32 activation path remain available.
-A8/A16 quantization is an approximation: kernel tests do not establish
-full-model greedy equivalence to F32 activations.
-
-SVE activation preparation shares a double reciprocal per 32-element block
-and corrects the residual at half ties. It matches scalar preparation
-byte-for-byte on tested tails, half ties and finite exponent extremes.
-Preparation is shared explicitly across workers with begin/end barriers;
-there is no pointer-address cache heuristic.
-
-The loader uses <= 8 MiB source reads, <= 16 MiB BF16 scratch and four final
-anonymous CMG segments. It pins first touch to CPUs 12/24/36/48, binds nodes
-4..7 and samples placement every 2 MiB. Fugaku needs `mbind` maxnode 64,
-not 8. The runner forces metadata-only source mmap to prevent GGUF from
-materializing a second source copy under NUMA distribution. The current
-reserve is 6 GiB; the measured v4/v5 runner object used the prior 4 GiB
-reserve and had ample observed headroom. Restore pointers/affinity on
-failure; keep the GGUF context alive until the low-bit model is freed.
-
-The v1 cache has canonical metadata, source inventory/file-size/mtime
-identity, per-payload 64-bit checksums, bounded writeback and atomic rename.
-It rejects stale/truncated/corrupt images without silently converting again.
-This detects accidental corruption; source identity is not a cryptographic
-content hash. Raw unsupported weights are loaded once; the Q6_K output
-head remains on the existing path. Auxiliary `nextn.`, `v.`, `mm.`, `mtp.`
-weights stay lazy, but the `blk.64` NextN weights are still loaded/converted.
-
-CLI: `--lowbit fp4|fp6 --lowbit-activation f32|a8|a16` (default F32), with
-optional `--lowbit-image PATH` or `--lowbit-write-image PATH`, mutually
-exclusive. The new runner rejects legacy repacks, speculative/batched
-modes, approximate SiLU and partial-head settings. NUMA mode requires 48
-threads; `--lowbit-no-numa` is for portable validation. KV uses F32.
-
-## Native A64FX results
-
-Allocation **51893515**, host **a25-2201c**, one 48-core node, 2 GHz,
-`eco_state=0`. Fujitsu `fcc -Nclang`, SVE enabled. The job was explicitly
-released on wrap-up; its shell and allocation-local paths cannot be reused.
-
-The same repeated sky-blue seed, 256 generated tokens, one trial and no
-warmup were used for each row:
-
-| Runner | Main change | 128-input tok/s | 1024-input tok/s |
-| --- | --- | ---: | ---: |
-| v3 | Scalar activation preparation; experimental fully unrolled kernel | 3.920 | 3.750 |
-| v4 | SVE preparation with vector FP64 division; LUT kernel | 8.901 | 8.054 |
-| v5 | Shared reciprocal with exact residual correction; LUT kernel | **9.693** | **8.675** |
-
-All **512 generated (position, token ID) pairs and selected logit bits**
-match v3 versus v4 and v3 versus v5. This establishes A8 implementation
-consistency only. No full F32-activation serial replay has been completed.
-An earlier eight-token FP4 A16 smoke run measured 3.364 tok/s; it is not a
-throughput or quality acceptance result. No full-model FP6 rate is available.
-
-Final v5 at 1024 + 256 took 29.511084 s of decode, or 115.278 ms/token:
-
-| Stage | ms/token |
-| --- | ---: |
-| Attention QKV | 5.929 |
-| Attention core | 15.743 |
-| Attention output | 2.098 |
-| SSM input | 11.104 |
-| SSM preparation | 3.290 |
-| SSM core | 2.975 |
-| SSM output | 6.221 |
-| FFN gate/up | 28.153 |
-| FFN down | 13.988 |
-| Q6_K output head | 20.203 |
-
-The CSV `effective_gb_s=0` is a placeholder caused by the runner passing
-zero resident-byte accounting for this path. It is not measured bandwidth;
-fix accounting before using that column.
-
-Activation preparation, 1000 passes on native hardware:
-
-| Input columns | Scalar A8 us | Scalar A16 us | Final SVE A8 us | Final SVE A16 us |
+| Format (bits/weight) | 128+256 tok/s | 1024+256 tok/s (3 trials) | 4096+256 tok/s | Target |
 | --- | ---: | ---: | ---: | ---: |
-| 5120 | 342.709 | 402.656 | 27.192 | 28.012 |
-| 6144 | 411.010 | 482.315 | 32.568 | 33.526 |
-| 17408 | 1164.355 | 1367.871 | 91.886 | 94.586 |
+| FP4 (source NVFP4, 4.5; Q6_K head as exact int8) | 39.20 | **38.88 / 38.81 / 38.83** | 35.70 | 40 |
+| true FP6 E2M3 from BF16 (6.25) | 29.56 | **29.47 / 29.43 / 28.73** | 27.36 | 30 |
 
-Synthetic 17408 x 5120, 48 cores, 500 passes, placement verified:
-FP4 A8 ~394-396 GB/s, A16 ~294.8 GB/s; FP6 A8 ~397.5 GB/s, A16
-~283.8 GB/s. Matched scan controls reach ~844 and ~866-867 GB/s.
-These are source-byte/makespan rates. Worker-only durations are also in
-logs; do not mix boundaries. Pthread startup skew is about 2.65 ms,
-amortized over 500 passes. Full-tile manual unrolling did not improve the
-kernel and is not the selected implementation.
+Previous best (runner, FP4 A8): 8.675 tok/s at 1024+256. **Neither target is
+met**: FP4 is ~0.75 ms/token (~3%) and FP6 ~0.6 ms/token (~2%) short at 1024
+context (128/4096 columns are from the previous build, v37). Prefill (same per-token path) runs at 41.8 tok/s (FP4) and 30.9
+tok/s (FP6) for 1024 tokens.
 
-Original direct conversion planned 18.212 GB of anonymous allocation,
-371 converted matrices, and took 382.029 s. Conversion plus image export
-took 417.267 s; validated image reload took **27.896 s**. The final image
-contains 16,047,620,416 bytes. Padding makes planned anonymous bytes larger
-than touched payload. Do not infer peak resident memory from image size.
+Token identity. Every optimized run is compared position-by-position with an
+F32-activation, exact-weight reference of the same weights
+(`compare_tokens.py`, regex over `n= pos= id=`):
 
-The prior expanded-FP4 study's 852-859 GB/s result remains historical:
-see `a64fx/llm/qwen38_nvfp4_expanded.md`. It uses another representation
-and does not establish true FP6 performance or a real-model token rate.
+- FP4 A16 1024+256: 256/256 IDs equal to the **transformer.h runner's F32
+  run** (independent implementation) in every trial; q38d's own F32 mode
+  also matches the runner 256/256 (max logit diff 0.0025).
+- FP6 A16 1024+256: 256/256 equal to q38d's FP6 F32 reference run.
+- A8 activations fail: the runner's per-32 A8 diverges at n=237, q38d's
+  per-16 A8 at n=4. A16 (centered radix-256 digits) is required.
+- Sensitivity: FP4 128+256 and FP6 128+256 / 4096+256 also match their
+  q38d F32 references 256/256 (max logit diff 0.0013 / 0.0036 / 0.099).
+  FP4 4096+256: 256/256 (max logit diff 0.121).
+- Runs are deterministic: all trials give identical IDs and logits (the
+  sum of squares of K-split boundary rows is kept in the boundary slot and
+  added in a fixed order, not by whichever worker finishes second).
 
-## qlair commit and calibration status
+Held-out quality evaluation (BF16 oracle, perplexity) and the qlair
+simulator calibration from the previous checkpoint were **not** worked on.
 
-Clair checkout: `/home/syoyo/work/clair/a64fx`.
-Committed **`a18ee475` — Fix A64FX compiler emulation and NUMA placement
-queries** (6 files, 352 insertions, 6 deletions). No push was performed.
-The commit includes focused regressions and
-`tools/qlair/a64fx-lowbit-validation.md`.
+## Engine (a64fx/llm/q38d)
 
-Fixed:
+`q38d_engine.c`: 48 persistent workers (CPUs 12..59), weights repacked in
+place from the existing low-bit image (`qwen38_lowbit_model`), per layer:
 
-- Single LDR/STR pre/post-index SP writeback, previously discarded via XZR.
-- NEON FCVTN/N2 and FCVTL/L2 F64/F32 support and aliased operands.
-- NEON LD1/ST1 single-lane B/H/S/D insertion/extraction and post-indexing.
-- SVE WHILE N flag: first predicate element, not last. FCC's
-  `whilelo; b.mi` copy lost the final 32 bytes of a 2080-byte activation.
-- `get_mempolicy(MPOL_F_NODE | MPOL_F_ADDR)` simulated placement queries,
-  with invalid/unmapped-query error handling.
+- SSM layer: in-proj (qkv, z as a dual-matrix pass, alpha, beta) |
+  per-head conv + gated delta rule (state transposed, no reductions) +
+  gated RMSNorm | out-proj into the residual.
+- Attention layer: in-proj (q+gate, k, v) | per-CMG KV head: norm, RoPE,
+  cache, 12-way position split with 4-position x 6-head blocked QK, PV,
+  merge, sigmoid gate | out-proj.
+- FFN: gate+up in one dual-matrix pass (8-row partition; split 16-row
+  activation units quantized by the second finisher) | down-proj K-chunked
+  by 4 with an item-balanced partition (a worker range may end inside a
+  group; the two partial sums meet in a split slot). The 6144-column
+  out-projections stay unchunked (`out_kch=1`; 3 was slower).
+- SSM conv history and conv weights are kept CMG-local per head.
+- Each "|" is a counter barrier (2.5 us). The norm of the residual uses
+  per-worker sums of squares and per-CMG cooperative quantization.
+- Output head: Q6_K expanded exactly to signed bytes ("Q8K", +28% bytes, no
+  decode); argmax per worker, then global. F32 KV cache.
 
-Working-checkout tests passed **537/537**, including pre-existing
-uncommitted tests. Matched FCC driver/kernel replay now gives `correct=1`
-for FP4 A8 and FP6 A16. Existing timing/cache/thread/profiler changes and
-untracked calibration work in Clair were deliberately left uncommitted.
-Do not stage or discard them as part of this task without inspecting them.
+`q38d_kern.h` / `q38d_kern_sve.S`: formats and kernels.
 
-A placement-checked 48-core FP4 A8 simulation, 17408 x 5120, four marked
-passes, reports 4,696,273 maximum worker ticks at 2 GHz, or 85.404 effective
-GB/s. Native ~394 GB/s above uses 500 passes and a makespan boundary. This
-is an unresolved diagnostic discrepancy, not a matched calibration result.
-No timing constants were fitted. An out-of-order simulation was stopped
-at wrap-up and has no usable completed result. The full calibration gate
-remains open.
+- Pair-interleaved 8-row groups: one SDOT result covers two 16-column units
+  (lane 2r+u), so scales need no gather and activations load as 8-byte
+  broadcasts (compact 1 or 2 bytes/column instead of the old 8x copy).
+- UE4M3 scales are re-encoded at repack as E5M3 so that `as_float(u<<20)`
+  is always a normal float. **A64FX pays ~70 cycles per instruction on
+  subnormal FP operands**; this single change took decode from 7.3 to 29.9
+  tok/s.
+- Hand-scheduled, software-pipelined kernels (load / decode / SDOT /
+  combine / convert+FMLA stages across slots). FP4: two pairs per slot
+  (variant 7) and a dual-matrix variant sharing activation broadcasts
+  (variant 8). FP6: 192-byte {codes, high plane} records so the weights are
+  one stream, and a zip-free 6-bit decode. Q8K, Q4_K assembly paths.
+- Exact-weight FP32 path (reference mode) and a double-precision C reference.
 
-## Validation completed and quality prototype limits
+Measured on A64FX (PMU, `pmu_kern.c`, `pmu_stream.c`, `bench_insn.c`):
+TBL/ZIP/UZP/AND-immediate/MOVI are FLA-only (1/cycle); SDOT, shifts, vector
+AND/ORR, FMUL, SCVTF 2/cycle; MOVPRFX before SDOT is free; SDOT/SCVTF/FMLA
+latency ~9, TBL ~6, integer ~4. Scalar integer ops steal FP issue slots.
+FP4 A16 costs ~24 FP ops per 256 weights; the kernels reach ~76% of FP issue
+and are latency-bound (commit waits on FP ops), not load-bound. With 12
+cores streaming: FP4 A16 ~15 GB/s/core (~182 GB/s/CMG); FP6 A16 ~14 GB/s/core
+after the single-stream layout (was 11.6, with 7.7 cycles/pair of L2-miss
+stalls from three separate streams).
 
-- Native SVE numerical/activation tests passed, including half ties,
-  exponent extremes, codes, signs and tail shapes (`test_v5.log`).
-- Final local QEMU SVE tests passed after the last scalar FP6 conversion
-  simplification (per-block power-of-two inverse). That last conversion
-  change has not been benchmarked natively.
-- ASan/UBSan loader/image tests passed for both formats and F32/A8/A16,
-  including stale, truncated, corrupt and partial-failure cases.
-- Quality comparison Python tests: 3 passed. Evaluator cross-compiles.
-- `git diff --check` passed. Existing `gguf_loader.h` compiler warnings
-  remain; do not claim a globally warning-clean build.
+## Where the time goes (FP4 A16, 1024+256, ms/token)
 
-`qwen38_lowbit_eval.c` is an **unvalidated prototype**, not a completed
-BF16 oracle. It streams BF16/raw NVFP4 one layer at a time on one node,
-retains hidden states for a fixed teacher-forced sequence and caps staging
-at 4 GiB with a 6 GiB available-memory guard. Low-bit resident mode also
-supports `--serial` to compare traversal order. It emits bounded logit
-files and JSON NLL/perplexity, relative L2, maximum error, KL, top-1 and
-token-matching diagnostics, tied to token/reference hashes.
+ssm_in 3.91, ssm_core 0.98, ssm_out 1.66, attn_in 1.40, attn_core 0.63,
+attn_out 0.53, ffn_gateup 9.79, ffn_down 5.23, head 1.58 (total 25.7).
+Effective projection bandwidth ~560-850 GB/s. Per-phase overhead is about
+10 us (barrier, norm/quantize, imbalance, stream cold start) x 5 phases x 64
+layers; worker imbalance alone is ~1.4 ms/token (FFN units, 5% granularity
+of the 5120-row out/down matrices; the item-balanced down removed part of
+it). FP6 (34.0 ms, earlier build): ffn_gateup 13.89,
+ffn_down 6.98, ssm_in 5.33, ssm_out 2.39, attn_in 1.77, head 1.47.
 
-It was cross-compiled but **not linked/run on native hardware**. First
-validate layer-major versus serial execution on identical resident FP4/F32
-weights, then validate BF16 staging/mapping on real shards. No held-out
-corpus has been selected or evaluated. The Python comparator requires a
-source-NVFP4/F32 baseline and the same BF16 logit reference; it rejects
-missing/nonfinite/mismatched records and regressions in NLL/L2/max/KL.
-Passing those unit tests does not establish model quality or greedy equality.
-The logit file ABI currently assumes little-endian hosts such as A64FX.
+Tried and rejected (measured): deeper C-intrinsics pipelines (register
+spills/extra scalar ops), four-ahead loads, SDOT chains of four (latency),
+epoch barriers without RMW (4.8 us vs 2.5), producer-side normalization into
+four CMG copies (remote stores), pairing groups of one matrix in the dual
+kernel, larger warm-up prefetch, A64FX hardware barrier (2.2 us, ~0.1
+ms/token; would need dynamic libhwb).
 
-## Reproduction and preserved artifacts
+## Next steps (in order)
 
-Local scratch: `tmp/q38-lowbit-20260924/`.
-Native logs/objects/source archive:
-`tmp/q38-lowbit-20260924/hw-51893515/`.
-Shared remote copy on `fugaku1`:
-`~/work/gemm/qwen38-27b/tmp/q38-lowbit-20260924/hw-51893515/`.
+1. Remove the remaining ~0.7 ms/token: imbalance in ffn_gateup (8-row
+   granularity) and ssm_out, dataflow flags instead of the SSM
+   in-proj->core barrier, cheaper SSM prep (conv/norm), hardware barrier.
+2. Long context: attention core grows to ~2.3 ms at 4096 (K/V prefetch in
+   the in-proj tail); overlap or restructure.
+3. Held-out quality: FP6 vs NVFP4 vs BF16 logits (the old evaluator
+   prototype in `qwen38_lowbit_eval.c` remains unvalidated).
+4. Commit hygiene: dev probes (`bench_*`, `pmu_*`, `q38d_pipe.h`) could move
+   under a tools directory.
 
-The shared directory also contains **`fp4-v1.image`**, preserved with
-bounded 8 MiB writeback before releasing the allocation. Do not download
-this 15 GiB image to the workstation: local free space was only ~15 GB.
-Exclude `fp4-v1.image*` when syncing small logs. Stage it into a new
-allocation's `/local` with bounded reads/writes, fsync and fadvise; source
-identity must still match. Never assume old `/local` data survives.
+## Reproduction
 
-Useful evidence:
-
-- `fp4_a8_bench_v3.log`, `fp4_a8_bench_v4.log`, `fp4_a8_bench_v5.log`.
-- `prepare-v4-trace-check.json`, `prepare-v5-trace-check.json` (local).
-- `prepare_old.log`, `prepare_v4.log`, `prepare_v5.log`, `test_v5.log`.
-- `lut48.log`, `full48.log`, `baseline48.log`, `fp4_a16_smoke3.log`.
-- `native-sources-v5.tgz`, `runner_main_v4.o`, `model_v4.o`, `portable.o`,
-  `lowbit_v4.o`, `lowbit_v5.o`; matched benchmark `bench.o`,
-  `qwen38_lowbit.o`, `lowbit_lut.o`.
-- Local `final-sve-tests.log`, `final-model-tests.log`, qlair regression
-  logs, `bench_lut_sim`, `profile-fp4-48.log` and aggregate JSON.
-
-Raw evidence is untracked scratch; preserve it before any cleanup.
-`native-sources-v5.tgz` records the measured source snapshot; the final
-working tree additionally contains the evaluator prototype and later
-portable-converter/reserve edits. Do not attribute every current source
-line to the measured binary.
-
-Model sources on Fugaku (verify before use):
+Model/image paths (Fugaku):
 
 ```text
-~/models/qwen38/27b/Qwen3.8-27B-NVFP4-Quality-v2.gguf
-~/models/qwen38/27b/bf16/Qwen3.8-27B-BF16-00001-of-00002.gguf
-~/models/qwen38/27b/bf16/Qwen3.8-27B-BF16-00002-of-00002.gguf
+FP4 source: ~/models/qwen38/27b/Qwen3.8-27B-NVFP4-Quality-v2.gguf
+FP4 image : ~/work/gemm/qwen38-27b/tmp/q38-lowbit-20260924/hw-51893515/fp4-v1.image (16.05 GB)
+FP6 source: ~/models/qwen38/27b/bf16/Qwen3.8-27B-BF16-00001-of-00002.gguf (+00002)
+FP6 image : ~/work/gemm/qwen38-27b/tmp/q38-fast-images/fp6-e2m3-skipblk64-v1.image (21.02 GB)
+            written with Q38_LOWBIT_SKIP_PREFIX=blk.64. (must be set to load it)
 ```
 
-Build targets from the remote repo root, with build temporaries in `/local`:
+Stage images into the allocation's `/local` first (`dd bs=8M iflag=direct
+oflag=direct`, ~190 MB/s). Build natively (`make -C a64fx/llm CC=fcc q38d
+q38d_test`) or cross (`clang --target=aarch64-linux-gnu -static -O2
+-march=armv8.2-a+sve -mcpu=a64fx -DPF1_DIST=2048 -DPF2_DIST=32768`, as used
+for the measurements). Runs:
 
 ```sh
-make -C a64fx/llm CC=fcc OPENMP=1 qwen38_lowbit_runner \
-  qwen38_lowbit_sve_test qwen38_lowbit_prepare_bench qwen38_lowbit_eval
+q38d $FP4_GGUF --fmt fp4 --image /local/q38/fp4.image --act a16 \
+     --prompt-tokens 1024 --gen 256        # --act f32 for the reference
+Q38_LOWBIT_SKIP_PREFIX=blk.64. q38d $FP6_GGUF --fmt fp6 \
+     --image /local/q38/fp6.image --act a16 --prompt-tokens 1024 --gen 256
+python3 a64fx/llm/q38d/compare_tokens.py REF.log CAND.log
 ```
 
-The measured runner was built from separate objects (runner O2, kernel
-O3); the Makefile's default O3 runner rebuild must be revalidated before
-comparing timing. Current target names are for resumption, not a claim
-that this exact one-line command produced the archived v5 binary.
+Conversion from BF16 (`--write-image PATH`) takes ~19 min with the parallel
+packer. Tests: `test_q38d_kern` (QEMU or native), `test_qwen38_lowbit_model`
+(ASan/UBSan). Logs of this session: `tmp/q38-fast-final/` (Fugaku shared
+storage) and `tmp/q38-fast/` locally.
 
-Measured command in the now-released allocation:
-
-```sh
-OMP_NUM_THREADS=48 TF_DPROF=1 TF_DUMP_TOKENS=1 \
-./runner_lowbit_v5 \
-  "$HOME/models/qwen38/27b/Qwen3.8-27B-NVFP4-Quality-v2.gguf" \
-  --lowbit fp4 --lowbit-activation a8 \
-  --lowbit-image /local/q38-lowbit-51893515/fp4.image \
-  --prompt 'Explain why the sky is blue.' --max-seq 1344 --threads 48 \
-  --bench --bench-prompt 128,1024 --bench-gen 256 \
-  --bench-runs 1 --bench-warmup 0 --bench-csv
-```
-
-Final local checks (scratch directory must already exist):
-
-```sh
-export TMPDIR="$PWD/tmp/q38-lowbit-20260924"
-clang --target=aarch64-linux-gnu --gcc-toolchain=/usr -fuse-ld=lld \
-  -static -O2 -march=armv8.2-a+sve \
-  a64fx/llm/test_qwen38_lowbit.c a64fx/llm/qwen38_lowbit.c \
-  a64fx/llm/qwen38_lowbit_sve.c -lm -o "$TMPDIR/test_final_sve"
-qemu-aarch64 -cpu max,sve512=on "$TMPDIR/test_final_sve"
-cc -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-  -Wno-unused-function -Icommon -Ia64fx/llm \
-  a64fx/llm/test_qwen38_lowbit_model.c a64fx/llm/qwen38_lowbit_model.c \
-  a64fx/llm/qwen38_lowbit.c -lm -o "$TMPDIR/test_final_model"
-"$TMPDIR/test_final_model"
-python3 -m unittest discover -s a64fx/llm -p test_qwen38_lowbit_quality.py
-```
-
-Clair regression/replay commands are in its committed validation note.
-Read `a64fx/remote-dev-procedure.md` before allocating. Use targeted rsync
-and versioned staging. Never use `/tmp`, hold two full resident models,
-or copy a model into a model-sized dirty page cache. Use `/local` on the
-node and repository `tmp/` locally, bounded I/O and memory monitoring.
-No allocation or simulation from this checkpoint is intended to remain
-running. Preserve unrelated work. No push without a new explicit request.
-
-## Next work, in order
-
-1. Validate the evaluator's layer-major traversal against serial FP4/F32
-   execution on identical fixed tokens, then a bounded native BF16 smoke.
-   Audit tensor mapping and causal recurrent state before trusting metrics.
-2. Choose/record held-out text and tokenization; obtain single-node BF16
-   reference logits, source-NVFP4 baseline, FP4 and true BF16-derived FP6
-   metrics. Check the complete FP6 memory plan before loading it.
-3. Run full unapproximated F32 serial replays for each optimized A8/A16
-   candidate. Compare every generated position and token ID, report the
-   first divergence, and keep this gate separate from held-out quality.
-4. Optimize measured costs: Q6_K output head (~20 ms/token), FFN gate/up
-   (~28), down (~14), SSM projections, then context-dependent attention
-   (~16 at 1024). Kernel source GB/s alone does not imply 40/30 tok/s.
-5. Collect matched-object native/simulator profiles with identical pass
-   counts, timing boundaries and manifests across two allocations, ten
-   samples, then address instruction/scheduling/memory discrepancies.
-   Fit only to measurements; keep FAPP traffic separate from source bytes.
-6. Repeat 1024+256 and 128/4096 sensitivities after correctness gates.
-   Fix resident-byte reporting and consider skipping unused NextN weights.
-   Report actual rates and remaining budget if targets are still unmet.
-
-## Copy-ready resuming prompt
+## Resume prompt
 
 ```text
-Resume the compact FP4 / true FP6 E2M3 Qwen3.8-27B single-stream decode
-work on one 48-core A64FX node. Read AGENTS.md, root decode.md and
-a64fx/remote-dev-procedure.md, then inspect both working trees. Root
-resume.md and the old qwen38-fp4-resume.md are not current for this task.
-
-Goals: plain serial N=1 FP4 >=40 tok/s and true BF16-derived FP6 >=30
-at 1024 input +256 generated tokens, with 128/4096 sensitivity. The
-BF16 oracle must also stay on one node. No speculative rate substitutes.
-Quality must be no worse than source NVFP4 against shared BF16 logits,
-and each optimized path must match every generated position/token ID
-from its unapproximated F32-activation serial reference.
-
-Current native FP4 A8 v5: 8.675 tok/s at 1024+256, 9.693 at 128+256,
-one trial each. All 512 positions/IDs/selected logits match the earlier
-A8 implementation; F32-reference equality is still untested. No full
-FP6 model run or held-out quality result exists. Compact FP4 is 4.5
-bits/weight including scales; true E2M3 FP6 is 6.25. Older expanded
-packed6 FP4 bandwidth results are a different format.
-
-qlair fixes are committed in /home/syoyo/work/clair/a64fx as a18ee475:
-SP writeback, NEON conversions/lane transfers, SVE WHILE flags and
-NUMA placement queries. Working-checkout tests passed 537/537 and
-matched FCC FP4/FP6 numerical replay passes. Pre-existing simulator
-changes remain dirty: preserve them. Timing calibration is incomplete;
-85.4 simulated GB/s versus ~394 native is not a matched comparison.
-Use two allocations, ten samples, CV/drift <=2%, <3% cycles/BW error.
-
-First validate the new qwen38_lowbit_eval prototype (cross-compiled,
-not yet run natively): layer-major versus serial FP4/F32 on fixed
-tokens, then bounded BF16 streaming. Continue quality and complete
-serial greedy gates before treating A8/A16 speed as accepted. Next
-profile/optimize Q6_K head, FFN and attention using measured budgets.
-Do not imply that the 40/30 tok/s targets have already been met.
-
-Allocation 51893515 was released. Evidence and native source/object
-snapshots are under tmp/q38-lowbit-20260924/hw-51893515 locally and
-on Fugaku shared storage. Shared fp4-v1.image is 16,047,620,416 bytes;
-image reload took 27.896 s. Do not download it to the space-limited
-workstation. Stage bounded chunks to a fresh /local allocation and
-verify source identity. Models and exact commands are in decode.md.
-Use /local or repo tmp/, never /tmp. Preserve raw evidence and unrelated
-dirty files. Do not push without explicit per-action authorization.
+Resume single-node A64FX Qwen3.8-27B decode in a64fx/llm/q38d. Read
+decode.md first. Current: FP4 A16 38.8-38.9 tok/s, true FP6 A16 28.7-29.5
+tok/s at 1024+256 (targets 40/30), all generated IDs equal to F32
+exact-weight references. Remaining ~0.6-0.75 ms/token: worker imbalance in
+gate/up and out-proj phases, SSM in-proj->core barrier, SSM prep, attention
+at long context. Images: FP4 fp4-v1.image, FP6 fp6-e2m3-skipblk64-v1.image
+(set Q38_LOWBIT_SKIP_PREFIX=blk.64.). Keep A16 (A8 diverges). Validate every
+change with compare_tokens.py against the F32 runs. Use /local or repo
+tmp/, never /tmp. Do not push without explicit authorization.
 ```

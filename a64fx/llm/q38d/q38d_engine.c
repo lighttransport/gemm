@@ -89,12 +89,16 @@ typedef struct {
     float *xn[NT], *xn_c[NCMG];
     float *ssm_state[NLAYER][NVH];
     float *conv_state[NLAYER];
+    /* per head (worker) CMG-local copies: history [4 slots][q,k,v][128] and
+     * conv weights [4 taps][q,k,v][128] of that head's channels */
+    float *conv_hist[NLAYER][NVH], *conv_wl[NLAYER][NVH];
     float *kc[NATTN][NKV], *vc[NATTN][NKV];
     float *qh[NCMG];        /* [6][256] per CMG */
     float *apart[NCMG];     /* [12][6][2+256] per CMG */
     float best_val[NT];
     int best_idx[NT];
     int next_token;
+    _Atomic int *unit_cnt; /* per 16-row FFN unit, parity counter */
     /* profiling (thread 0) */
     double prof[16];
 } q38d_engine;
@@ -206,6 +210,7 @@ static void *cmg_alloc(size_t bytes, int cmg) {
 /* model loading                                                        */
 
 static gguf_context *G;
+static int out_kch = 1; /* K chunks for the 6144-column residual projections (3 measured slower) */
 static int q6k_expand = 1; /* Q6_K -> exact int8 codes (no decode, +28% bytes) */
 static q38_lowbit_model *LB;
 static q38d_engine E;
@@ -305,40 +310,49 @@ static void repack_worker(int c, int l) {
             }
         }
     }
-    /* K-chunk reorder of this worker's range (after all conversions) */
+    free(tmp);
+}
+
+/* Item partition for K-chunked matrices: (group, chunk) items in group-major
+ * order are split evenly over the CMG's 12 workers; each worker stores its
+ * items chunk-major. A group split between two workers is finished by the
+ * second one. */
+static inline void lane_items(const q38d_mat *m, int c, int l, int *i0, int *i1) {
+    int G8 = (m->first[c + 1] - m->first[c] + 7) / 8, N = G8 * m->kch;
+    *i0 = N * l / PER; *i1 = N * (l + 1) / PER;
+}
+static uint8_t *kchunk_buf[NT][NLAYER * 3 + 4];
+static void kchunk_copy_or_write(int c, int l, int write) {
+    int tid = c * PER + l, slot = 0;
     for (int i = 0; i < ntodo; i++) {
         q38d_mat *m = todo[i].m;
         if (m->kch <= 1) continue;
-        int g0, g1;
-        lane_groups(m, c, l, &g0, &g1);
-        int ng = g1 - g0;
-        if (ng <= 0) continue;
+        int i0, i1;
+        lane_items(m, c, l, &i0, &i1);
+        int gf = i0 / m->kch, gl = (i1 - 1) / m->kch, ng = gl - gf + 1;
         size_t gb = q38d_group_bytes(m->fmt, m->cols);
         int kc = m->cols / m->kch;
-        size_t sb = q38d_group_bytes(m->fmt, kc);
-        size_t np = (size_t)m->cols / 32, npc = (size_t)kc / 32;
-        size_t sco = (size_t)(q38d_scale_stream(m->part[c], m->fmt, m->cols) - m->part[c]);
-        size_t scs = (gb - sco) / np;             /* scale bytes per pair */
-        size_t cpb = sco / np;                    /* code(+high) bytes per pair */
-        uint8_t *range = m->part[c] + (size_t)g0 * gb;
-        uint8_t *buf = malloc((size_t)ng * gb);
-        memcpy(buf, range, (size_t)ng * gb);
-        for (int k = 0; k < m->kch; k++)
-            for (int g = 0; g < ng; g++) {
-                const uint8_t *src = buf + (size_t)g * gb;
-                uint8_t *dst = range + ((size_t)k * ng + g) * sb;
-                if (m->fmt == Q38D_F4) {
-                    memcpy(dst, src + k * npc * 128, npc * 128);
-                    memcpy(dst + npc * 128, src + np * 128 + k * npc * 16, npc * 16);
-                } else if (m->fmt == Q38D_F6) {
-                    memcpy(dst, src + k * npc * 192, npc * 192);
-                    memcpy(dst + npc * 192, src + np * 192 + k * npc * 8, npc * 8);
-                } else { fprintf(stderr, "q38d: K-chunking unsupported for fmt %d\n", m->fmt); exit(1); }
-                (void)scs; (void)cpb;
-            }
-        free(buf);
+        size_t sb = q38d_group_bytes(m->fmt, kc), np = (size_t)m->cols / 32, npc = (size_t)kc / 32;
+        size_t cpp = m->fmt == Q38D_F6 ? 192 : 128, spp = m->fmt == Q38D_F6 ? 8 : 16;
+        if (m->fmt != Q38D_F4 && m->fmt != Q38D_F6) { fprintf(stderr, "q38d: K-chunking unsupported for fmt %d\n", m->fmt); exit(1); }
+        if (!write) {
+            kchunk_buf[tid][slot] = malloc((size_t)ng * gb);
+            memcpy(kchunk_buf[tid][slot], m->part[c] + (size_t)gf * gb, (size_t)ng * gb);
+        } else {
+            uint8_t *buf = kchunk_buf[tid][slot], *dst = m->part[c] + (size_t)i0 * sb;
+            for (int k = 0; k < m->kch; k++)
+                for (int g = gf; g <= gl; g++) {
+                    int it = g * m->kch + k;
+                    if (it < i0 || it >= i1) continue;
+                    const uint8_t *src = buf + (size_t)(g - gf) * gb;
+                    memcpy(dst, src + k * npc * cpp, npc * cpp);
+                    memcpy(dst + npc * cpp, src + np * cpp + k * npc * spp, npc * spp);
+                    dst += sb;
+                }
+            free(buf);
+        }
+        slot++;
     }
-    free(tmp);
 }
 
 static void load_engine(void) {
@@ -360,6 +374,8 @@ static void load_engine(void) {
             describe(&L->beta, need_tensor("blk.%d.ssm_beta.weight", l));
             describe(&L->out, need_tensor("blk.%d.ssm_out.weight", l));
             L->out.unit16 = 1;
+            L->out.kch = out_kch;
+            if (L->out.kch > 1 && L->out.cols % (L->out.kch * 256) == 0) L->out.unit16 = 0; else L->out.kch = 0;
             {
                 float *tmpw = malloc(QKVD * 4 * sizeof(float));
                 load_vec(tmpw, need_tensor("blk.%d.ssm_conv1d.weight", l), QKVD * 4);
@@ -376,6 +392,8 @@ static void load_engine(void) {
             describe(&L->v, need_tensor("blk.%d.attn_v.weight", l));
             describe(&L->o, need_tensor("blk.%d.attn_output.weight", l));
             L->o.unit16 = 1;
+            L->o.kch = out_kch;
+            if (L->o.kch > 1 && L->o.cols % (L->o.kch * 256) == 0) L->o.unit16 = 0; else L->o.kch = 0;
             load_vec(L->q_norm, need_tensor("blk.%d.attn_q_norm.weight", l), HD);
             load_vec(L->k_norm, need_tensor("blk.%d.attn_k_norm.weight", l), HD);
         }
@@ -385,6 +403,7 @@ static void load_engine(void) {
         L->down.unit16 = 1;
         L->down.kch = getenv("Q38D_DOWN_KCH") ? atoi(getenv("Q38D_DOWN_KCH")) : 4;
         if (L->down.kch < 1 || L->down.cols % (L->down.kch * 256)) L->down.kch = 1;
+        if (L->down.kch > 1) L->down.unit16 = 0;
     }
     describe(&E.head, need_tensor("output.weight", 0));
     E.out_norm = vec_ptr(need_tensor("output_norm.weight", 0), EMBD);
@@ -430,11 +449,66 @@ static void mv_chunked(const q38d_mat *m, const q38d_act *a, float *out, int mod
         for (int r = 0; r < 8 && g0 * 8 + g * 8 + r < rows; r++)
             dst[g * 8 + r] = mode ? dst[g * 8 + r] + acc[g][r] : acc[g][r];
 }
+typedef struct { float part[2][8]; float ssq; _Atomic int cnt; char pad[180]; } q38d_split;
+static q38d_split split_slot[NCMG][PER + 1];
+static float mv_ssq[NT];
 static void ssq_publish(int tid, int r0, int r1);
+/* K-chunked residual matvec (mode add into out == E.x) over this worker's
+ * items; publishes the sum of squares of the rows it finalizes. */
+static void mv_items(const q38d_mat *m, const q38d_act *a, float *out, int tid) {
+    int c = tid / PER, l = tid % PER, i0, i1;
+    lane_items(m, c, l, &i0, &i1);
+    float ss = 0;
+    /* boundary slot l is unused when this lane starts on a group edge */
+    if (l > 0 && i0 % m->kch == 0) split_slot[c][l].ssq = 0;
+    if (i1 > i0) {
+        int gf = i0 / m->kch, gl = (i1 - 1) / m->kch, kc = m->cols / m->kch;
+        size_t sb = q38d_group_bytes(m->fmt, kc);
+        const uint8_t *w = m->part[c] + (size_t)i0 * sb;
+        float acc[64][8], part[8];
+        memset(acc, 0, sizeof(float) * 8 * (gl - gf + 1));
+        for (int k = 0; k < m->kch; k++) {
+            size_t p0 = (size_t)k * kc / 32;
+            q38d_act v = *a;
+            v.cols = kc;
+            v.q = a->q + p0 * (a->arith == Q38D_A16 ? 64 : 32);
+            v.sc = a->sc + 2 * p0; v.sum = a->sum + 2 * p0;
+            v.x = a->x ? a->x + k * kc : NULL;
+            for (int g = gf; g <= gl; g++) {
+                int it = g * m->kch + k;
+                if (it < i0 || it >= i1) continue;
+                q38d_gemv_any(part, w, m->fmt, &v, 0, 1, 8, 0);
+                w += sb;
+                for (int r = 0; r < 8; r++) acc[g - gf][r] += part[r];
+            }
+        }
+        for (int g = gf; g <= gl; g++) {
+            float *x = out + m->first[c] + 8 * g;
+            int full = g * m->kch >= i0 && g * m->kch + m->kch - 1 < i1;
+            if (full) {
+                for (int r = 0; r < 8; r++) { x[r] += acc[g - gf][r]; ss += x[r] * x[r]; }
+                continue;
+            }
+            int b = g * m->kch < i0 ? l : l + 1, side = g * m->kch < i0 ? 1 : 0;
+            q38d_split *sp = &split_slot[c][b];
+            memcpy(sp->part[side], acc[g - gf], sizeof(float) * 8);
+            int old = atomic_fetch_add_explicit(&sp->cnt, 1, memory_order_acq_rel);
+            if (old & 1) {
+                /* squares go to the boundary slot, not to whichever worker
+                 * finished second, so the norm's sum order is fixed */
+                float bs = 0;
+                for (int r = 0; r < 8; r++) { x[r] += sp->part[0][r] + sp->part[1][r]; bs += x[r] * x[r]; }
+                sp->ssq = bs;
+            }
+        }
+    }
+    mv_ssq[tid] = ss;
+}
 static void mv(const q38d_mat *m, const q38d_act *a, float *out, int mode, int tid) {
     int c, g0, g1;
     mat_range(m, tid, &c, &g0, &g1);
     uint64_t t0 = tid ? 0 : ticks();
+    if (m->kch > 1 && out == E.x && mode) { mv_items(m, a, out, tid); if (!tid) kprof_kernel += (double)(ticks() - t0); return; }
     if (g0 < g1) {
         if (m->kch > 1) mv_chunked(m, a, out, mode, c, g0, g1);
         else q38d_gemv_any(out + m->first[c], m->part[c], m->fmt, a, g0, g1, m->first[c + 1] - m->first[c], mode);
@@ -614,6 +688,7 @@ static int norm_cmg = 1;
 static double norm_cbar_t;
 static int *norm_csense[NT];
 static float ssq_part[NCMG][64] __attribute__((aligned(256)));
+static int ssq_split_valid; /* last residual update went through mv_items */
 static int ssq_valid; /* partial sums of squares of E.x are current */
 /* After this worker updated residual rows [r0, r1): publish their sum of squares. */
 static void ssq_publish(int tid, int r0, int r1) {
@@ -625,6 +700,7 @@ static void ssq_publish(int tid, int r0, int r1) {
  * apply to their outputs) and publishes the rows' sum of squares. */
 static int prod_norm = 0;
 static int use_dual = 1;
+static int ffn_group_split = 1;
 static int prod_copies = 1; /* 1: one shared act (act_c[0]) read by all CMGs; 4: per-CMG copies */
 static void x_produce(const q38d_mat *m, int tid, const float *w) {
     int c, g0, g1;
@@ -644,6 +720,7 @@ static void x_produce(const q38d_mat *m, int tid, const float *w) {
     }
 }
 static void ssq_publish_rows(const q38d_mat *m, int tid) {
+    if (m->kch > 1) { ssq_part[tid / PER][tid % PER] = mv_ssq[tid]; return; }
     int c, g0, g1;
     mat_range(m, tid, &c, &g0, &g1);
     int r0 = m->first[c] + 8 * g0, r1 = m->first[c] + 8 * g1;
@@ -668,6 +745,8 @@ static const q38d_act *norm_act_impl(int tid, const float *w) {
     if (ssq_valid) {
         ss = 0;
         for (int c = 0; c < NCMG; c++) for (int l = 0; l < PER; l++) ss += ssq_part[c][l];
+        if (ssq_split_valid)
+            for (int c = 0; c < NCMG; c++) for (int b = 1; b < PER; b++) ss += split_slot[c][b].ssq;
     } else ss = sumsq(E.x, EMBD);
     float inv = 1.0f / sqrtf(ss / EMBD + E.eps);
     if (norm_cmg) {
@@ -701,6 +780,26 @@ static const q38d_act *norm_act_impl(int tid, const float *w) {
 /* ------------------------------------------------------------------ */
 /* SSM head                                                             */
 
+static int conv_local = 1;
+static void ssm_prefetch_state(int layer, int h);
+/* part: 0 q, 1 k, 2 v of head h; channels start at ch0 in the qkv vector */
+static void conv_silu_local(int layer, int h, int part, int ch0, int pos, float *out) {
+    float *hs = E.conv_hist[layer][h];
+    const float *w = E.conv_wl[layer][h] + part * 128;
+    const float *in = E.qkv + ch0;
+    const float *h1 = hs + (size_t)((pos + 3) & 3) * 384 + part * 128;
+    const float *h2 = hs + (size_t)((pos + 2) & 3) * 384 + part * 128;
+    const float *h3 = hs + (size_t)((pos + 1) & 3) * 384 + part * 128;
+    const svbool_t pf = svptrue_b32();
+    for (int j = 0; j < 128; j += 16) {
+        svfloat32_t v = svmul_f32_x(pf, svld1_f32(pf, w + j), svld1_f32(pf, h3 + j));
+        v = svmla_f32_x(pf, v, svld1_f32(pf, w + 384 + j), svld1_f32(pf, h2 + j));
+        v = svmla_f32_x(pf, v, svld1_f32(pf, w + 768 + j), svld1_f32(pf, h1 + j));
+        v = svmla_f32_x(pf, v, svld1_f32(pf, w + 1152 + j), svld1_f32(pf, in + j));
+        svst1_f32(pf, out + j, svmul_f32_x(pf, v, q38d_sigmoid_sve(pf, v)));
+    }
+    memcpy(hs + (size_t)(pos & 3) * 384 + part * 128, in, 128 * sizeof(float));
+}
 static void conv_silu(const q38d_layer *L, int layer, int ch0, int pos, int write, float *out) {
     float *cs = E.conv_state[layer];
     const float *in = E.qkv + ch0;
@@ -735,9 +834,16 @@ static void ssm_head(int layer, int h, int pos) {
     const q38d_layer *L = &E.L[layer];
     int g = h % NGROUP;
     float q[128], k[128], v[128], o[128];
-    conv_silu(L, layer, g * DS, pos, h < NGROUP, q);
-    conv_silu(L, layer, NGROUP * DS + g * DS, pos, h < NGROUP, k);
-    conv_silu(L, layer, 2 * NGROUP * DS + h * DS, pos, 1, v);
+    if (ssm_pf == 3) ssm_prefetch_state(layer, h);
+    if (conv_local) {
+        conv_silu_local(layer, h, 0, g * DS, pos, q);
+        conv_silu_local(layer, h, 1, NGROUP * DS + g * DS, pos, k);
+        conv_silu_local(layer, h, 2, 2 * NGROUP * DS + h * DS, pos, v);
+    } else {
+        conv_silu(L, layer, g * DS, pos, h < NGROUP, q);
+        conv_silu(L, layer, NGROUP * DS + g * DS, pos, h < NGROUP, k);
+        conv_silu(L, layer, 2 * NGROUP * DS + h * DS, pos, 1, v);
+    }
     l2norm128(q); l2norm128(k);
     const float qs = 1.0f / sqrtf((float)DS);
     for (int i = 0; i < 128; i++) q[i] *= qs;
@@ -972,6 +1078,12 @@ static inline void pf_l2(const void *p, size_t bytes) {
     for (size_t o = 0; o < bytes; o += 256) __builtin_prefetch((const char *)p + o, 0, 2);
 }
 static void pf_mat(const q38d_mat *m, int tid) {
+    if (m->kch > 1) {
+        int c = tid / PER, i0, i1;
+        lane_items(m, c, tid % PER, &i0, &i1);
+        if (i1 > i0) pf_l2(m->part[c] + (size_t)i0 * q38d_group_bytes(m->fmt, m->cols / m->kch), pf_bytes);
+        return;
+    }
     int c, g0, g1;
     mat_range(m, tid, &c, &g0, &g1);
     if (g0 < g1) pf_l2(m->part[c] + (size_t)g0 * q38d_group_bytes(m->fmt, m->cols), pf_bytes);
@@ -987,10 +1099,10 @@ static void pf_plan(const q38d_plan *P, int tid) {
 static void pf_ffn(const q38d_layer *L, int tid, int which) {
     int c = tid / PER, l = tid % PER;
     int rows = L->gate.first[c + 1] - L->gate.first[c];
-    int units = rows / 16, u0 = units * l / PER;
+    int g0 = rows / 8 * l / PER;
     size_t gb = q38d_group_bytes(L->gate.fmt, L->gate.cols);
-    if (which & 1) pf_l2(L->gate.part[c] + (size_t)2 * u0 * gb, pf_bytes);
-    if (which & 2) pf_l2(L->up.part[c] + (size_t)2 * u0 * gb, pf_bytes);
+    if (which & 1) pf_l2(L->gate.part[c] + (size_t)g0 * gb, pf_bytes);
+    if (which & 2) pf_l2(L->up.part[c] + (size_t)g0 * gb, pf_bytes);
 }
 static int pf_kv;
 static void pf_attn_kv(int tid, int layer);
@@ -1057,6 +1169,7 @@ static void step(int tid, int token, int pos, int want_head, int *gs, int *cs) {
             phase_end(tid, gs, &t, P_SSM_CORE);
             mv(&L->out, &E.act_o, E.x, 1, tid);
             ssq_valid = 1;
+            ssq_split_valid = L->out.kch > 1;
             if (prod_norm) x_produce(&L->out, tid, L->post_norm);
             else ssq_publish_rows(&L->out, tid);
             phase_end(tid, gs, &t, P_SSM_OUT);
@@ -1069,6 +1182,7 @@ static void step(int tid, int token, int pos, int want_head, int *gs, int *cs) {
             phase_end(tid, gs, &t, P_ATT_CORE);
             mv(&L->o, &E.act_o, E.x, 1, tid);
             ssq_valid = 1;
+            ssq_split_valid = L->o.kch > 1;
             if (prod_norm) x_produce(&L->o, tid, L->post_norm);
             else ssq_publish_rows(&L->o, tid);
             phase_end(tid, gs, &t, P_ATT_OUT);
@@ -1078,32 +1192,52 @@ static void step(int tid, int token, int pos, int want_head, int *gs, int *cs) {
         {
             int c = tid / PER, l = tid % PER;
             int rows = L->gate.first[c + 1] - L->gate.first[c];
-            int units = rows / 16, u0 = units * l / PER, u1 = units * (l + 1) / PER;
-            if (u0 < u1) {
+            /* 8-row group partition (+-1 group); a 16-row activation unit
+             * split between two workers is quantized by whichever finishes
+             * second (per-unit counter parity, no reset needed). */
+            int G8 = rows / 8, g0 = G8 * l / PER, g1 = G8 * (l + 1) / PER;
+            if (!ffn_group_split) { int units = rows / 16; g0 = 2 * (units * l / PER); g1 = 2 * (units * (l + 1) / PER); }
+            if (g0 < g1) {
                 int base = L->gate.first[c];
                 if (use_dual && a->arith != Q38D_F32 && L->gate.fmt == L->up.fmt &&
                     (L->gate.fmt == Q38D_F4 || L->gate.fmt == Q38D_F6))
-                    q38d_gemv_dual_fmt(E.h + base, E.qkv + base, L->gate.part[c], L->up.part[c], a, 2 * u0, 2 * u1, L->gate.fmt);
+                    q38d_gemv_dual_fmt(E.h + base, E.qkv + base, L->gate.part[c], L->up.part[c], a, g0, g1, L->gate.fmt);
                 else {
-                    q38d_gemv_any(E.h + base, L->gate.part[c], L->gate.fmt, a, 2 * u0, 2 * u1, rows, 0);
-                    q38d_gemv_any(E.qkv + base, L->up.part[c], L->up.fmt, a, 2 * u0, 2 * u1, rows, 0);
+                    q38d_gemv_any(E.h + base, L->gate.part[c], L->gate.fmt, a, g0, g1, rows, 0);
+                    q38d_gemv_any(E.qkv + base, L->up.part[c], L->up.fmt, a, g0, g1, rows, 0);
                 }
                 if (omul != 1.0f) {
-                    scale_rows(E.h + base + 16 * u0, 16 * (u1 - u0), omul);
-                    scale_rows(E.qkv + base + 16 * u0, 16 * (u1 - u0), omul);
+                    scale_rows(E.h + base + 8 * g0, 8 * (g1 - g0), omul);
+                    scale_rows(E.qkv + base + 8 * g0, 8 * (g1 - g0), omul);
                 }
                 const svbool_t pf = svptrue_b32();
-                for (int r = base + 16 * u0; r < base + 16 * u1; r += 16) {
-                    svfloat32_t gv = svld1_f32(pf, E.h + r);
-                    svfloat32_t hv = svmul_f32_x(pf, svmul_f32_x(pf, gv, q38d_sigmoid_sve(pf, gv)), svld1_f32(pf, E.qkv + r));
-                    svst1_f32(pf, E.h + r, hv);
-                    if (E.arith != Q38D_F32) q38d_prepare_unit(&E.act_h, r / 32, (r / 16) & 1, E.h + r);
+                const svbool_t p8 = svptrue_pat_b32(SV_VL8);
+                for (int g = g0; g < g1; g++) {
+                    int r = base + 8 * g;
+                    svfloat32_t gv = svld1_f32(p8, E.h + r);
+                    svfloat32_t hv = svmul_f32_x(p8, svmul_f32_x(p8, gv, q38d_sigmoid_sve(p8, gv)), svld1_f32(p8, E.qkv + r));
+                    svst1_f32(p8, E.h + r, hv);
+                }
+                (void)pf;
+                if (E.arith != Q38D_F32) {
+                    int u_first = g0 / 2, u_last = (g1 + 1) / 2;
+                    for (int u = u_first; u < u_last; u++) {
+                        int whole = 2 * u >= g0 && 2 * u + 1 < g1;
+                        int r = base + 16 * u;
+                        if (!whole) {
+                            /* shared unit: second finisher quantizes */
+                            int old = atomic_fetch_add_explicit(&E.unit_cnt[r / 16], 1, memory_order_acq_rel);
+                            if (!(old & 1)) continue;
+                        }
+                        q38d_prepare_unit(&E.act_h, r / 32, (r / 16) & 1, E.h + r);
+                    }
                 }
             }
         }
         if (E.arith == Q38D_F32) E.act_h.x = E.h;
         phase_end(tid, gs, &t, P_FFN_UP);
         mv(&L->down, &E.act_h, E.x, 1, tid);
+        ssq_split_valid = L->down.kch > 1;
         if (prod_norm) x_produce(&L->down, tid, layer + 1 < NLAYER ? E.L[layer + 1].attn_norm : E.out_norm);
         else ssq_publish_rows(&L->down, tid);
         phase_end(tid, gs, &t, P_FFN_DOWN);
@@ -1168,6 +1302,14 @@ static void *worker(void *arg) {
         if (E.L[layer].ssm) {
             E.ssm_state[layer][tid] = aligned_alloc(256, DS * DS * sizeof(float));
             memset(E.ssm_state[layer][tid], 0, DS * DS * sizeof(float));
+            E.conv_hist[layer][tid] = aligned_alloc(256, 4 * 384 * sizeof(float));
+            memset(E.conv_hist[layer][tid], 0, 4 * 384 * sizeof(float));
+            float *wl = aligned_alloc(256, 4 * 384 * sizeof(float));
+            int g = tid % NGROUP, ch[3] = {g * DS, NGROUP * DS + g * DS, 2 * NGROUP * DS + tid * DS};
+            for (int kk = 0; kk < 4; kk++)
+                for (int part = 0; part < 3; part++)
+                    memcpy(wl + kk * 384 + part * 128, E.L[layer].conv_w + (size_t)kk * QKVD + ch[part], 128 * sizeof(float));
+            E.conv_wl[layer][tid] = wl;
         }
     int c = tid / PER, l = tid % PER;
     if (l == 0) {
@@ -1191,6 +1333,10 @@ static void *worker(void *arg) {
     norm_csense[tid] = &cs;
     if (getenv("Q38D_NORM_CMG")) norm_cmg = atoi(getenv("Q38D_NORM_CMG"));
     repack_worker(c, l);
+    gbarrier(tid, &gs);
+    kchunk_copy_or_write(c, l, 0);
+    gbarrier(tid, &gs);
+    kchunk_copy_or_write(c, l, 1);
     gbarrier(tid, &gs);
     if (getenv("Q38D_BENCH_BAR")) {
         int n = atoi(getenv("Q38D_BENCH_BAR"));
@@ -1280,6 +1426,7 @@ int main(int argc, char **argv) {
     }
     if (!path || pn < 1 || gn < 1) { usage(argv[0]); return 2; }
     E.fmt = fmt; E.arith = arith; E.max_seq = pn + gn + 1;
+    if (getenv("Q38D_OUT_KCH")) out_kch = atoi(getenv("Q38D_OUT_KCH"));
     if (getenv("Q38D_Q6K_EXPAND")) q6k_expand = atoi(getenv("Q38D_Q6K_EXPAND"));
     if (getenv("Q38D_ASM")) q38d_asm_variant = atoi(getenv("Q38D_ASM"));
     double t_load = now_sec();
@@ -1303,6 +1450,7 @@ int main(int argc, char **argv) {
     E.kb = aligned_alloc(256, NKV * HD * 4); E.vb = aligned_alloc(256, NKV * HD * 4);
     E.o = aligned_alloc(256, DINNER * 4);
     E.h = aligned_alloc(256, NFF * 4);
+    E.unit_cnt = calloc(NFF / 16, sizeof(*E.unit_cnt));
     E.logits = aligned_alloc(256, (size_t)E.n_vocab * 4);
     E.act_o = (q38d_act){DINNER, arith, aligned_alloc(256, q38d_act_qbytes(DINNER, Q38D_A16)),
                          aligned_alloc(256, DINNER / 16 * 4), aligned_alloc(256, DINNER / 16 * 4), E.o};
@@ -1316,6 +1464,9 @@ int main(int argc, char **argv) {
     if (getenv("Q38D_PF_BYTES")) pf_bytes = (size_t)atoi(getenv("Q38D_PF_BYTES"));
     if (getenv("Q38D_PROD_NORM")) prod_norm = atoi(getenv("Q38D_PROD_NORM"));
     if (getenv("Q38D_DUAL")) use_dual = atoi(getenv("Q38D_DUAL"));
+    if (getenv("Q38D_FFN_SPLIT")) ffn_group_split = atoi(getenv("Q38D_FFN_SPLIT"));
+    if (getenv("Q38D_PAIR")) q38d_pair_groups = atoi(getenv("Q38D_PAIR"));
+    if (getenv("Q38D_CONV_LOCAL")) conv_local = atoi(getenv("Q38D_CONV_LOCAL"));
     if (getenv("Q38D_DUAL_COST")) dual_cost = atof(getenv("Q38D_DUAL_COST"));
     if (getenv("Q38D_PF_KV")) pf_kv = atoi(getenv("Q38D_PF_KV"));
     if (getenv("Q38D_EPOCH_BAR")) epoch_bar = atoi(getenv("Q38D_EPOCH_BAR"));
