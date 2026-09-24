@@ -178,6 +178,25 @@ Q38_LAYOUT_CFLAGS := $(filter-out -g -rdynamic -ffp-contract=fast,$(CFLAGS)) -Wa
 
 .PHONY: qwen38_lowbit_test qwen38_lowbit_sve_test qwen38_lowbit_model_test qwen38_lowbit_bench
 .PHONY: qwen38_lowbit_runner
+.PHONY: q38d q38d_test
+# Dedicated Qwen3.8 decode engine (a64fx/llm/q38d): pair-interleaved FP4/FP6
+# kernels, persistent 48-worker decode. Prefetch distances are build knobs.
+Q38D_DIR    := $(LLM_DIR)q38d/
+Q38D_CFLAGS ?= -O2 -march=armv8.2-a+sve -DPF1_DIST=2048 -DPF2_DIST=32768
+ifeq ($(CC),fcc)
+    Q38D_CC_FLAGS := -Nclang $(Q38D_CFLAGS)
+else
+    Q38D_CC_FLAGS := $(Q38D_CFLAGS)
+endif
+q38d: $(BUILD)/q38d
+$(BUILD)/q38d: $(Q38D_DIR)q38d_engine.c $(Q38D_DIR)q38d_kern.h $(Q38D_DIR)q38d_kern_sve.S \
+		$(LLM_DIR)qwen38_lowbit_model.c $(LLM_DIR)qwen38_lowbit.c $(LLM_DIR)qwen38_lowbit_sve.c \
+		$(LLM_DIR)qwen38_lowbit_model.h $(LLM_DIR)qwen38_lowbit_image.inc | $(BUILD)
+	$(CC) $(Q38D_CC_FLAGS) -I$(COMMON) -I$(LLM_DIR) -o $@ $(filter %.c %.S,$^) -lpthread -lm
+q38d_test: $(BUILD)/test_q38d_kern
+$(BUILD)/test_q38d_kern: $(Q38D_DIR)test_q38d_kern.c $(Q38D_DIR)q38d_kern.h $(Q38D_DIR)q38d_kern_sve.S \
+		$(LLM_DIR)qwen38_lowbit.c | $(BUILD)
+	$(CC) $(Q38D_CC_FLAGS) -I$(COMMON) -o $@ $(filter %.c %.S,$^) -lm
 .PHONY: qwen38_lowbit_prepare_bench
 .PHONY: qwen38_lowbit_eval
 qwen38_lowbit_eval: $(BUILD)/qwen38_lowbit_eval

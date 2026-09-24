@@ -117,11 +117,62 @@ static int eligible(const gguf_tensor_info *t, int format) {
 /* Unused auxiliary branches stay lazy; the serial text runner rejects MTP.
  * These GGUF pointers must not be used after their source is closed. */
 static int auxiliary(const char *name) {
+    /* Optional extra prefix (for example "blk.64." for the NextN block) that a
+     * serial decoder never reads. Images record the resulting tensor set, so
+     * loading requires the same setting that wrote the image. */
+    const char *skip = getenv("Q38_LOWBIT_SKIP_PREFIX");
+    if (skip && *skip && !strncmp(name, skip, strlen(skip))) return 1;
     return !strncmp(name, "nextn.", 6) || !strncmp(name, "v.", 2) ||
            !strncmp(name, "mm.", 3) || !strncmp(name, "mtp.", 4);
 }
 
 #include "qwen38_lowbit_image.inc"
+
+/* BF16 -> FP6 conversion of one source window, split into 8-row-aligned
+ * slices converted by up to 12 threads (pinned to the target CMG when numa).
+ * Each slice produces exactly the groups the serial packer would. */
+#include <pthread.h>
+typedef struct {
+    void *out; const uint16_t *in; float *floats; int r0, r1, cols, cpu, ok;
+} fp6_job;
+static void *fp6_worker(void *arg) {
+    fp6_job *j = arg;
+    if (j->cpu >= 0) { cpu_set_t s; CPU_ZERO(&s); CPU_SET(j->cpu, &s); sched_setaffinity(0, sizeof s, &s); }
+    size_t n = (size_t)(j->r1 - j->r0) * j->cols, base = (size_t)j->r0 * j->cols;
+    for (size_t k = 0; k < n; k++) {
+        uint32_t bits = (uint32_t)j->in[base + k] << 16;
+        memcpy(j->floats + base + k, &bits, 4);
+    }
+    size_t gb = q38_lowbit_bytes(Q38_LB_FP6_E2M3, 8, j->cols);
+    j->ok = q38_lowbit_pack_fp6((char *)j->out + (size_t)(j->r0 / 8) * gb,
+                                q38_lowbit_bytes(Q38_LB_FP6_E2M3, j->r1 - j->r0, j->cols),
+                                j->floats + base, j->cols, j->r1 - j->r0, j->cols);
+    return NULL;
+}
+static int pack_fp6_parallel(void *out, size_t bytes, const uint16_t *in, float *floats,
+                             int rows, int cols, int cmg, int numa) {
+    (void)bytes;
+    enum { T = 12 };
+    fp6_job job[T];
+    pthread_t th[T];
+    int groups = (rows + 7) / 8, nt = 0;
+    for (int t = 0; t < T; t++) {
+        int g0 = groups * t / T, g1 = groups * (t + 1) / T;
+        int r0 = g0 * 8, r1 = g1 * 8 < rows ? g1 * 8 : rows;
+        if (r1 <= r0) continue;
+        job[nt] = (fp6_job){out, in, floats, r0, r1, cols, numa ? 12 + cmg * 12 + t : -1, 0};
+        nt++;
+    }
+    int started = 0;
+    for (int t = 1; t < nt; t++)
+        if (!pthread_create(&th[t], NULL, fp6_worker, &job[t])) started |= 1 << t;
+        else fp6_worker(&job[t]);
+    if (nt) fp6_worker(&job[0]);
+    int ok = 1;
+    for (int t = 1; t < nt; t++) if (started & (1 << t)) pthread_join(th[t], NULL);
+    for (int t = 0; t < nt; t++) ok &= job[t].ok;
+    return ok;
+}
 
 static q38_lowbit_model *load_model(gguf_context *g, int format,
     int arithmetic, int numa, size_t reserve_bytes, const char *image_path) {
@@ -215,13 +266,8 @@ static q38_lowbit_model *load_model(gguf_context *g, int format,
                     size_t output_bytes = q38_lowbit_bytes(format, n, mat->cols);
                     if (ok && format == Q38_LB_NVFP4)
                         ok = q38_lowbit_pack_nvfp4(out, output_bytes, input, rb, n, mat->cols);
-                    else if (ok) {
-                        for (size_t j = 0; j < (size_t)n * mat->cols; j++) {
-                            uint32_t bits = (uint32_t)input[j] << 16;
-                            memcpy(floats + j, &bits, 4);
-                        }
-                        ok = q38_lowbit_pack_fp6(out, output_bytes, floats, mat->cols, n, mat->cols);
-                    }
+                    else if (ok)
+                        ok = pack_fp6_parallel(out, output_bytes, input, floats, n, mat->cols, c, numa);
                 }
                 if (ok) ok = verify_part(mat->part[c], bytes, c, numa);
             }
