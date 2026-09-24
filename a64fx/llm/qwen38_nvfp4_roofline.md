@@ -1112,3 +1112,39 @@ check but regressed to 64.7 GB/s. Filling the FP32 lanes by doubling the row
 tile is therefore not enough to remove the compact FP4 decode bottleneck.
 The slower experimental code was removed from `a64fx/llm/`; its build and
 profiles remain under repository `tmp/` for inspection.
+
+### Native A64FX check of compact integer-scale repack
+
+`qwen38_nvfp4_packed8_iscale_a8.c` keeps FP4 codes packed and changes each
+8-row x 64-column tile from 384 bytes to 352 bytes: 256 code bytes, 64
+duplicated INT8 scale-multiplier bytes, and 32 FP32 base-scale bytes. Four
+subblock dot products are accumulated with integer scale multipliers before
+one FP32 conversion per tile. Repack happens before the timed kernel. The
+synthetic fixture's scales are exact integer multiples of the selected base;
+arbitrary real-model scale quantization and token identity are **not yet
+validated**. An all-row 6144 x 5120 check passed under SVE QEMU.
+
+The one-node Fugaku runs used 12 workers pinned to CPUs 12–23 with the weight
+arena bound to HBM node 4, `freq=2000,eco_state=0`, 6144 x 5120, two warmups,
+and 200 timed passes. All three modes returned `correct=1` in both independent
+jobs. `source_gbps` counts logical weight bytes divided by earliest-start to
+latest-finish counter time; `worker_gbps` divides by the slowest worker's
+active duration. Neither is a measured HBM hardware-counter rate.
+
+| Job | Mode | Weight GB/s, makespan | Weight GB/s, worker |
+| --- | --- | ---: | ---: |
+| 51890021 | compact integer scale | 137.954 | 150.898 |
+| 51890021 | original packed-8 | 104.466 | 110.106 |
+| 51890021 | integer-scale byte scan | 211.279 | 239.158 |
+| 51890077 | compact integer scale | 138.035 | 150.961 |
+| 51890077 | original packed-8 | 103.884 | 110.456 |
+| 51890077 | integer-scale byte scan | 211.703 | 239.350 |
+
+The kernel improves full-makespan throughput by about 32% over packed-8 on
+hardware but remains about 65% of its scan control and below the **200+
+GB/s per-CMG** target. The earlier 20-pass job 51889838 had a roughly 2.7 ms
+thread-start span against a 5.6 ms measured interval, so its makespan rates
+were not used as the headline. The 200-pass samples retain a similar start
+span but amortize it over 31–45 ms of kernel work. Job scripts and full logs
+are in repository `tmp/q38-iscale-hw-staged/`; both 200-pass allocations have
+ended. No real 27B model weights were loaded for these synthetic kernel runs.
