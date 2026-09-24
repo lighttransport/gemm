@@ -1690,6 +1690,161 @@ static inline void tf_nvfp4_tiled_matvec_rows(float *dst, const qtensor *mat,
     }
 }
 
+/* Opt-in single-token compact NVFP4 projection. A15 quantization keeps both
+ * signed digits in [-127,127], so each 16-value dot is bounded in INT32.
+ * The original 36-byte blocks stay resident; no expanded weight copy is used. */
+static int tf_nvfp4_compact_a15 = 0;
+static void transformer_set_nvfp4_compact_a15(int enabled) {
+    tf_nvfp4_compact_a15 = enabled != 0;
+}
+typedef struct {
+    int8_t lo0[16], hi0[16], lo1[16], hi1[16];
+    float scale;
+} tf_nvfp4_a15_act;
+
+static inline int tf_nvfp4_a15_quantize(tf_nvfp4_a15_act *out,
+                                        const float *x, int n) {
+    for (int b = 0; b < n / 16; b++) {
+        float mx = 0.0f;
+        for (int j = 0; j < 16; j++) {
+            float a = fabsf(x[b * 16 + j]);
+            if (!isfinite(a)) return -1;
+            if (a > mx) mx = a;
+        }
+        float inv = mx > 0.0f ? 16256.0f / mx : 0.0f;
+        out[b].scale = mx / 16256.0f;
+        for (int j = 0; j < 16; j++) {
+            int q = (int)lrintf(x[b * 16 + j] * inv);
+            if (q > 16256) q = 16256;
+            if (q < -16256) q = -16256;
+            int hi = q / 128, lo = q - hi * 128;
+            int p = j & 7;
+            if (j < 8) {
+                out[b].lo0[p] = out[b].lo0[p + 8] = (int8_t)lo;
+                out[b].hi0[p] = out[b].hi0[p + 8] = (int8_t)hi;
+            } else {
+                out[b].lo1[p] = out[b].lo1[p + 8] = (int8_t)lo;
+                out[b].hi1[p] = out[b].hi1[p + 8] = (int8_t)hi;
+            }
+        }
+    }
+    return 0;
+}
+
+/* Persistent decode revisits the same activation for Q/K/V and gate/up.
+ * Compare all values: a scratch pointer or a few sampled floats cannot prove
+ * that the activation is unchanged across tokens. */
+static inline tf_nvfp4_a15_act *tf_nvfp4_a15_prepare(const float *x, int n) {
+    static _Thread_local tf_nvfp4_a15_act *buf;
+    static _Thread_local float *last_x;
+    static _Thread_local size_t cap, last_cap;
+    static _Thread_local int last_n;
+    size_t need = (size_t)n / 16;
+    if (cap < need) {
+        tf_nvfp4_a15_act *p = realloc(buf, need * sizeof(*p));
+        if (!p) return NULL;
+        buf = p;
+        cap = need;
+    }
+    if (last_n == n && last_x &&
+        memcmp(last_x, x, (size_t)n * sizeof(*x)) == 0) return buf;
+    if (last_cap < (size_t)n) {
+        float *p = realloc(last_x, (size_t)n * sizeof(*p));
+        if (!p) return NULL;
+        last_x = p;
+        last_cap = (size_t)n;
+    }
+    if (tf_nvfp4_a15_quantize(buf, x, n)) return NULL;
+    memcpy(last_x, x, (size_t)n * sizeof(*x));
+    last_n = n;
+    return buf;
+}
+
+static inline svfloat32_t tf_nvfp4_a15_pair(
+        svfloat32_t acc, const tf_nvfp4_tiled_subblock *p,
+        const tf_nvfp4_a15_act *a, int pair, svint8_t lut,
+        svint8_t xl0, svint8_t xh0, svint8_t xl1, svint8_t xh1) {
+    const svbool_t pb = svptrue_b8();
+    const svbool_t p16 = svwhilelt_b8((uint64_t)0, (uint64_t)16);
+    const svbool_t pg = svptrue_b32();
+    const svbool_t p2 = svwhilelt_b32((uint64_t)0, (uint64_t)2);
+    svuint8_t z = svld1_u8(p16, p->qs + pair * 16);
+    svint8_t wl = svtbl_s8(lut, svand_n_u8_x(pb, z, 15));
+    svint8_t wh = svtbl_s8(lut, svlsr_n_u8_x(pb, z, 4));
+    svint32_t low = svadd_s32_x(pg,
+        svdot_s32(svdup_s32(0), wl, xl0),
+        svdot_s32(svdup_s32(0), wh, xl1));
+    svint32_t high = svadd_s32_x(pg,
+        svdot_s32(svdup_s32(0), wl, xh0),
+        svdot_s32(svdup_s32(0), wh, xh1));
+    svint32_t dot = svadd_s32_x(pg, low,
+                                svlsl_n_s32_x(pg, high, 7));
+    float d0 = tf_nvfp4_scale_fast(p->d[2 * pair]) * a->scale;
+    float d1 = tf_nvfp4_scale_fast(p->d[2 * pair + 1]) * a->scale;
+    svfloat32_t scale = svsel_f32(p2, svdup_f32(d0), svdup_f32(d1));
+    return svmla_f32_x(pg, acc, svcvt_f32_s32_x(pg, dot), scale);
+}
+
+static inline void tf_nvfp4_a15_dot8(float out[8],
+                                      const tf_nvfp4_tiled_block *w,
+                                      const tf_nvfp4_a15_act *xq, int nb) {
+    static const int8_t codes[16] =
+        {0,1,2,3,4,6,8,12,0,-1,-2,-3,-4,-6,-8,-12};
+    const svbool_t p16 = svwhilelt_b8((uint64_t)0, (uint64_t)16);
+    const svbool_t p4 = svwhilelt_b32((uint64_t)0, (uint64_t)4);
+    const svint8_t lut = svld1_s8(p16, codes);
+    svfloat32_t acc0 = svdup_f32(0.0f), acc1 = acc0;
+    svfloat32_t acc2 = acc0, acc3 = acc0;
+    for (int ib = 0; ib < nb; ib++) {
+        for (int s = 0; s < 4; s++) {
+            const tf_nvfp4_tiled_subblock *p = &w[ib].s[s];
+            const tf_nvfp4_a15_act *a = &xq[ib * 4 + s];
+            svint8_t xl0 = svld1_s8(p16, a->lo0);
+            svint8_t xh0 = svld1_s8(p16, a->hi0);
+            svint8_t xl1 = svld1_s8(p16, a->lo1);
+            svint8_t xh1 = svld1_s8(p16, a->hi1);
+            acc0 = tf_nvfp4_a15_pair(acc0, p, a, 0, lut,
+                                      xl0, xh0, xl1, xh1);
+            acc1 = tf_nvfp4_a15_pair(acc1, p, a, 1, lut,
+                                      xl0, xh0, xl1, xh1);
+            acc2 = tf_nvfp4_a15_pair(acc2, p, a, 2, lut,
+                                      xl0, xh0, xl1, xh1);
+            acc3 = tf_nvfp4_a15_pair(acc3, p, a, 3, lut,
+                                      xl0, xh0, xl1, xh1);
+        }
+    }
+    float lanes[4];
+#define TF_NVFP4_A15_STORE(PAIR, ACC) do { \
+        svst1_f32(p4, lanes, (ACC)); \
+        out[2 * (PAIR)] = lanes[0] + lanes[1]; \
+        out[2 * (PAIR) + 1] = lanes[2] + lanes[3]; \
+    } while (0)
+    TF_NVFP4_A15_STORE(0, acc0);
+    TF_NVFP4_A15_STORE(1, acc1);
+    TF_NVFP4_A15_STORE(2, acc2);
+    TF_NVFP4_A15_STORE(3, acc3);
+#undef TF_NVFP4_A15_STORE
+}
+
+static inline void tf_nvfp4_a15_matvec_rows(float *dst, const qtensor *mat,
+                                             const float *x, int first, int last) {
+    int nb = mat->n_cols / 64;
+    tf_nvfp4_a15_act *xq = tf_nvfp4_a15_prepare(x, mat->n_cols);
+    if (!xq) {
+        tf_nvfp4_tiled_matvec_rows(dst, mat, x, first, last);
+        return;
+    }
+    const tf_nvfp4_tiled_block *w = (const tf_nvfp4_tiled_block *)mat->data;
+    for (int i = first; i < last;) {
+        int tile = i / 8;
+        float values[8];
+        tf_nvfp4_a15_dot8(values, w + (size_t)tile * nb, xq, nb);
+        int end = (tile + 1) * 8;
+        if (end > last) end = last;
+        for (; i < end; i++) dst[i] = values[i % 8];
+    }
+}
+
 /* Small-N exact verify: decode each compact weight once for up to four
  * candidate activations, retaining the serial dot's FMA/reduction order. */
 static inline void tf_nvfp4_tiled_gemm_rows(float *y, const qtensor *mat,
@@ -2135,6 +2290,10 @@ static inline void tf_q6_exact_matvec_rows(float *dst, const qtensor *mat,
         dst[i] = tf_q6_exact_dot_sve(base + (size_t)i * nb, x, mat->n_cols);
 }
 
+/* Experimental single-request head limit. The caller must mark skipped logits
+ * unavailable after the partial projection. Zero retains the full head. */
+static int tf_target_head_rows = 0;
+
 static inline void tf_q6_exact_gemm_rows(float *y, const qtensor *mat,
         const float *x, int n, int ys, int xs, int first, int last) {
     const int nb = mat->n_cols / 256;
@@ -2560,6 +2719,11 @@ static void *tf_qmatvec_worker(void *arg) {
         return NULL;
     }
     if (t->mat->type == GGML_TYPE_NVFP4) {
+        if (tf_nvfp4_compact_a15 && t->mat->nvfp4_tiled) {
+            tf_nvfp4_a15_matvec_rows(t->dst, t->mat, t->x,
+                                      t->row_start, t->row_end);
+            return NULL;
+        }
         if (t->mat->nvfp4_packed) {
             tf_nvfp4_packed_matvec_rows(t->dst, t->mat, t->x,
                                          t->row_start, t->row_end);
@@ -4424,6 +4588,10 @@ static void tf_matvec_qtensor_rows(float *dst, const qtensor *mat, const float *
         for (int i = row_start; i < row_end; i++)
             dst[i] = tf_q4_k_dot_sve((const block_q4_K *)((const uint8_t *)base + (size_t)i * rb), x, n_cols);
     } else if (mat->type == GGML_TYPE_NVFP4) {
+        if (tf_nvfp4_compact_a15 && mat->nvfp4_tiled) {
+            tf_nvfp4_a15_matvec_rows(dst, mat, x, row_start, row_end);
+            return;
+        }
         if (mat->nvfp4_packed) {
             tf_nvfp4_packed_matvec_rows(dst, mat, x, row_start, row_end);
             return;
@@ -4754,6 +4922,10 @@ static void tf_qmatvec(float *dst, const qtensor *mat, const float *x, int n_row
         return;
     }
     if (mat->type == GGML_TYPE_NVFP4) {
+        if (tf_nvfp4_compact_a15 && mat->nvfp4_tiled) {
+            tf_nvfp4_a15_matvec_rows(dst, mat, x, 0, n_rows);
+            return;
+        }
         if (mat->nvfp4_packed) {
             tf_nvfp4_packed_matvec_rows(dst, mat, x, 0, n_rows);
             return;
@@ -11185,7 +11357,9 @@ float *transformer_forward_logits_pos(transformer_model *model, int32_t token_id
     if (!model->has_lm_head || !hidden) return NULL;
     if (tf_g4p_did_logits) return model->logits;   /* lm_head + softcap already done in the persistent dispatch */
     TF_PROF_BEGIN("lm_head", -1, "matvec", "FP32");
-    tf_qmatvec_pool(model, model->logits, &model->output, hidden, model->n_vocab);
+    int head_rows = tf_target_head_rows ? tf_target_head_rows : model->n_vocab;
+    tf_qmatvec_pool(model, model->logits, &model->output, hidden, head_rows);
+    for (int i = head_rows; i < model->n_vocab; i++) model->logits[i] = -INFINITY;
     TF_PROF_END("lm_head", 2.0 * model->n_vocab * model->n_embd, 0);
     /* Gemma4: final logit soft-capping */
     if (model->is_gemma4 && model->final_logit_softcapping > 0.0f) {
@@ -15147,10 +15321,21 @@ extern int q38_nvfp4_exact_n3_mt(float *y, const void *weights,
                                  const float *x, int rows, int cols,
                                  int n_threads);
 #endif
+#if defined(TF_HAVE_Q38_NVFP4_I16_SUPER) && defined(__ARM_FEATURE_SVE)
+extern int q38_nvfp4_i16_super_mt(float *y, const void *weights,
+                                  const float *x, int rows, int cols,
+                                  int n_threads);
+#endif
 static void tf_gemm_f16_mt_tokenmajor_impl(float *Y_out, const qtensor *mat, const float *X,
                                        int n_rows, int N, int out_stride, int X_stride,
                                        int n_threads) {
 #if defined(__ARM_FEATURE_SVE)
+#if defined(TF_HAVE_Q38_NVFP4_I16_SUPER)
+    if (mat->nvfp4_tiled && N == 3 && out_stride == n_rows &&
+        X_stride == mat->n_cols && svcntw() == 16 &&
+        q38_nvfp4_i16_super_mt(Y_out, mat->data, X, n_rows,
+                                mat->n_cols, n_threads)) return;
+#endif
 #if defined(TF_HAVE_Q38_NVFP4_N3_GATE)
     if (mat->nvfp4_tiled && N == 3 && out_stride == n_rows &&
         X_stride == mat->n_cols && svcntw() == 16 &&

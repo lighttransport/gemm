@@ -30,13 +30,17 @@ def main():
     parser.add_argument("reference")
     parser.add_argument("candidate")
     parser.add_argument("--tokens", type=int, default=32)
-    parser.add_argument("--max-logit-error", type=float, required=True,
-                        help="absolute tolerance; use 0 for repeatability")
+    comparison = parser.add_mutually_exclusive_group(required=True)
+    comparison.add_argument("--max-logit-error", type=float,
+                            help="absolute tolerance; use 0 for repeatability")
+    comparison.add_argument("--ids-only", action="store_true",
+                            help="require every position and token ID; report logit error without gating it")
     parser.add_argument("--benchmark-trials", type=int, default=0,
                         help="compare every recorded benchmark trial, including warmup")
     args = parser.parse_args()
-    if (args.tokens < 1 or args.benchmark_trials < 0 or not math.isfinite(args.max_logit_error)
-            or args.max_logit_error < 0):
+    if (args.tokens < 1 or args.benchmark_trials < 0 or
+            (not args.ids_only and (not math.isfinite(args.max_logit_error)
+                                    or args.max_logit_error < 0))):
         parser.error("tokens must be positive and tolerance finite/nonnegative")
     try:
         ref = read_trace(args.reference, args.tokens)
@@ -70,10 +74,11 @@ def main():
         errors.extend(abs(expected[3] - actual[3]) for expected, actual in zip(ref, got))
     maximum = max(errors)
     rms = math.sqrt(sum(error * error for error in errors) / len(errors))
-    passed = maximum <= args.max_logit_error
+    passed = args.ids_only or maximum <= args.max_logit_error
     print(f"{'PASS' if passed else 'FAIL'}: tokens={args.tokens}/{args.tokens} "
           f"trials={len(candidates)} selected_logit_max_abs={maximum:.9g} rms={rms:.9g} "
-          f"tolerance={args.max_logit_error:.9g}")
+          + ("ids_only=1" if args.ids_only else
+             f"tolerance={args.max_logit_error:.9g}"))
     return 0 if passed else 1
 
 

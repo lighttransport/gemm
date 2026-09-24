@@ -606,3 +606,48 @@ global INT8 activation quantization and changed accumulation order. The
 prototype omits the real model's rare larger scales. Its marginal steady
 gain cannot repay the 1.78× stream size or establish token identity, so it
 was not integrated.
+
+## Follow-up: bounded sidecar and compact single-token prototype (2026-09-24)
+
+The opt-in `--i16-super-gates 32` N=3 verifier sidecar was integrated for
+the first 32 FFN gates. It retains the compact original weights for serial
+replay and NextN, and adds about 2.85 GB of signed-byte sidecars. On the
+32-token matrix-multiplication prompt the observed 2.794 s was 11.453
+emitted tokens/s, versus 10.995 tokens/s in a comparable exact K=3 run;
+gate/up projection time changed from about 843.9 to 820.7 ms. These runs
+do not establish a significant end-to-end speedup because verification
+rounds and draft/attention timing vary. All 32 emitted `(position, ID)`
+pairs matched a full exact serial replay. A separate 64-token `hi` sidecar
+run took 6.380 s (10.031 tokens/s), but has **no fresh exact serial replay**;
+do not use it as an identity-validated result. The sidecar now widens
+`SDOT` accumulators after bounded 256-value K chunks and uses INT64 for the
+zero-point correction. `test_qwen38_nvfp4_i16_super.c` covers adversarial
+full-K overflow and rare UE4M3 scales under AArch64 SVE emulation.
+
+A new opt-in `--nvfp4-compact-a15` single-token prototype keeps the original
+36-byte/64-value compact FP4 weights and quantizes each 16-value activation
+group into two signed-byte digits. It uses SVE `TBL`/`SDOT` for all tiled
+NVFP4 single-token projections, not just FFN gates. It has no second
+resident weight copy. `--a15-probe N` compares six loaded model matrices
+against the exact tiled kernel and reports per-matrix time, source GB/s,
+relative L2 error, maximum absolute error, and nonfinite counts. A separate
+`--target-head-rows N` experiment projects only the first N exact Q6 head
+rows during decode (never prompt prefill) and excludes the remaining logits.
+Both are approximate and restricted to non-speculative 48-thread runs. Use
+`TF_DUMP_TOKENS=1` and `test_qwen38_token_trace.py --ids-only --tokens N`
+against an independent full, unapproximated serial run; the checker requires
+every ordered position and ID plus a completed decode summary.
+
+Local validation only: AArch64/SVE 512-bit QEMU passed 544 A15 synthetic
+outputs against the exact tiled kernel, a partial Q6 head projection test,
+and the sidecar overflow/rare-scale test. The runner passes AArch64 Clang
+SVE/OpenMP syntax checking; `git diff --check` passes. **No real-model A15
+probe, Fugaku throughput, or serial token replay has run for these new
+options.** The prior 14.754 GB/token stream already requires at least
+590 GB/s at 25 ms/token with *zero* compute, draft, attention, or
+synchronization time; the measured exact result remains around 11 tokens/s.
+The 40+ target is therefore unachieved. An isolated Fugaku deployment was
+denied by workspace auto-review as an unauthorized repository export, and
+the available PJM allocation was canceled rather than left queued. Native
+testing needs explicit permission to transfer the reviewed source and a new
+allocation.

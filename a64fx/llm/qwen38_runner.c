@@ -17,6 +17,11 @@
 #include <limits.h>
 #include <math.h>
 
+#if defined(TF_HAVE_Q38_NVFP4_I16_SUPER) && defined(__ARM_FEATURE_SVE)
+extern int q38_nvfp4_i16_super_register(const void *, int, int);
+extern void q38_nvfp4_i16_super_release(void);
+#endif
+
 #ifdef QWEN38_FAPP
 extern void fapp_start(const char *, int, int);
 extern void fapp_stop(const char *, int, int);
@@ -116,6 +121,88 @@ static int run_kernel_probe(transformer_model *m, int rounds, int check) {
         free(x); free(y);
     }
     return 0;
+}
+
+static int run_a15_probe(transformer_model *m, int rounds) {
+#if defined(__ARM_FEATURE_SVE)
+    if (m->n_layers < 4) return 1;
+    const qtensor *mats[] = {
+        &m->layers[0].ssm_qkv, &m->layers[0].ssm_gate,
+        &m->layers[0].ssm_out, &m->layers[0].ffn_gate,
+        &m->layers[0].ffn_down, &m->layers[3].attn_q
+    };
+    const char *names[] = {
+        "ssm_qkv", "ssm_gate", "ssm_out", "ffn_gate", "ffn_down", "attn_q"
+    };
+    for (size_t mi = 0; mi < sizeof(mats) / sizeof(mats[0]); mi++) {
+        const qtensor *mat = mats[mi];
+        if (!mat->nvfp4_tiled || mat->n_rows % 8 || mat->n_cols % 64)
+            return 1;
+        float *x = malloc((size_t)mat->n_cols * sizeof(*x));
+        float *ref = malloc((size_t)mat->n_rows * sizeof(*ref));
+        float *got = malloc((size_t)mat->n_rows * sizeof(*got));
+        if (!x || !ref || !got) {
+            free(x); free(ref); free(got);
+            return 1;
+        }
+        for (int k = 0; k < mat->n_cols; k++)
+            x[k] = (float)((k * 17) % 101 - 50) * 0.03125f;
+        int tiles = mat->n_rows / 8;
+#ifdef _OPENMP
+#pragma omp parallel num_threads(48)
+#endif
+        {
+#ifdef _OPENMP
+            int tid = omp_get_thread_num(), team = omp_get_num_threads();
+#else
+            int tid = 0, team = 1;
+#endif
+            int first = tiles * tid / team * 8;
+            int last = tiles * (tid + 1) / team * 8;
+            tf_nvfp4_tiled_matvec_rows(ref, mat, x, first, last);
+            tf_nvfp4_a15_matvec_rows(got, mat, x, first, last);
+        }
+        double err2 = 0.0, ref2 = 0.0, maxabs = 0.0;
+        int nonfinite = 0;
+        for (int row = 0; row < mat->n_rows; row++) {
+            double e = (double)got[row] - ref[row];
+            if (!isfinite(got[row])) nonfinite++;
+            err2 += e * e;
+            ref2 += (double)ref[row] * ref[row];
+            if (fabs(e) > maxabs) maxabs = fabs(e);
+        }
+        double t0 = now_sec();
+        for (int rep = 0; rep < rounds; rep++) {
+#ifdef _OPENMP
+#pragma omp parallel num_threads(48)
+#endif
+            {
+#ifdef _OPENMP
+                int tid = omp_get_thread_num(), team = omp_get_num_threads();
+#else
+                int tid = 0, team = 1;
+#endif
+                int first = tiles * tid / team * 8;
+                int last = tiles * (tid + 1) / team * 8;
+                tf_nvfp4_a15_matvec_rows(got, mat, x, first, last);
+            }
+        }
+        double ms = (now_sec() - t0) * 1000.0 / rounds;
+        size_t bytes = (size_t)mat->n_rows * mat->n_cols / 64 *
+                       sizeof(block_nvfp4);
+        fprintf(stderr, "qwen38: a15_probe %s rows=%d cols=%d bytes=%.3fGB "
+                        "ms=%.3f GBps=%.1f rel_l2=%.9g max_abs=%.9g nonfinite=%d\n",
+                names[mi], mat->n_rows, mat->n_cols, bytes / 1e9,
+                ms, bytes / (ms * 1e6),
+                sqrt(err2 / (ref2 > 0.0 ? ref2 : 1.0)), maxabs, nonfinite);
+        free(x); free(ref); free(got);
+        if (nonfinite) return 1;
+    }
+    return 0;
+#else
+    (void)m; (void)rounds;
+    return 1;
+#endif
 }
 
 static int run_nextn_tile_probe(transformer_model *m, int32_t prev, int position) {
@@ -372,8 +459,8 @@ static int run_benchmark(transformer_model *m, bpe_vocab *v, int32_t *tok,
 
 static void usage(const char *p) {
     fprintf(stderr, "usage: %s MODEL --prompt TEXT [--max-gen N] [--max-seq N] "
-                    "[--threads N] [--spec-k 0..4] [--spec-verify] [--draft-head-rows N] [--batch-probe 2..4] [--kernel-probe N] [--kernel-probe-check] [--nextn-tile-probe] [--mmap] "
-                    "[--fast-swiglu] [--nvfp4-fast] [--nvfp4-packed] [--nvfp4-exact-tiled] [--nextn-exact-tiled] [--q6-exact-head] [--q8-mode auto|reference|cmg4|cmg4-a15|block64|block64-ffn|block64-exact|row] "
+                    "[--threads N] [--spec-k 0..4] [--spec-verify] [--draft-head-rows N] [--batch-probe 2..4] [--kernel-probe N] [--kernel-probe-check] [--a15-probe N] [--nextn-tile-probe] [--mmap] "
+                    "[--fast-swiglu] [--nvfp4-fast] [--nvfp4-packed] [--nvfp4-exact-tiled] [--nvfp4-compact-a15] [--nextn-exact-tiled] [--q6-exact-head] [--target-head-rows N] [--i16-super-gates N] [--q8-mode auto|reference|cmg4|cmg4-a15|block64|block64-ffn|block64-exact|row] "
                     "[--bench --bench-prompt N[,N...] --bench-gen N[,N...] "
                     "--bench-runs N --bench-warmup N --bench-csv]\n", p);
 }
@@ -385,10 +472,12 @@ int main(int argc, char **argv) {
     const char *bench_gen_arg = "128";
     int max_gen = 16, max_seq = 512, threads = 48, spec_k = 0, mmap_weights = 0;
     int fast_swiglu = 0, nvfp4_fast = 0, nvfp4_packed = 0;
+    int nvfp4_compact_a15 = 0;
     int nvfp4_exact_tiled = 0, nextn_exact_tiled = 0;
     int q6_exact_head = 0, batch_probe = 0;
-    int spec_verify = 0, draft_head_rows = 0;
-    int kernel_probe = 0, kernel_probe_check = 0;
+    int i16_super_gates = 0;
+    int spec_verify = 0, draft_head_rows = 0, target_head_rows = 0;
+    int kernel_probe = 0, kernel_probe_check = 0, a15_probe = 0;
     int nextn_tile_probe = 0;
     int bench = 0, bench_runs = 3, bench_warmup = 1, bench_csv = 0;
     int bench_prompt_sizes[QWEN38_BENCH_MAX_CASES];
@@ -403,8 +492,11 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--spec-verify")) spec_verify = 1;
         else if (!strcmp(argv[i], "--draft-head-rows") && ++i < argc)
             draft_head_rows = atoi(argv[i]);
+        else if (!strcmp(argv[i], "--target-head-rows") && ++i < argc)
+            target_head_rows = atoi(argv[i]);
         else if (!strcmp(argv[i], "--batch-probe") && ++i < argc) batch_probe = atoi(argv[i]);
         else if (!strcmp(argv[i], "--kernel-probe") && ++i < argc) kernel_probe = atoi(argv[i]);
+        else if (!strcmp(argv[i], "--a15-probe") && ++i < argc) a15_probe = atoi(argv[i]);
         else if (!strcmp(argv[i], "--kernel-probe-check")) kernel_probe_check = 1;
         else if (!strcmp(argv[i], "--nextn-tile-probe")) nextn_tile_probe = 1;
         else if (!strcmp(argv[i], "--q8-mode") && ++i < argc) q8_mode = argv[i];
@@ -417,16 +509,29 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--fast-swiglu")) fast_swiglu = 1;
         else if (!strcmp(argv[i], "--nvfp4-fast")) nvfp4_fast = 1;
         else if (!strcmp(argv[i], "--nvfp4-packed")) nvfp4_packed = 1;
+        else if (!strcmp(argv[i], "--nvfp4-compact-a15")) nvfp4_compact_a15 = 1;
         else if (!strcmp(argv[i], "--nvfp4-exact-tiled")) nvfp4_exact_tiled = 1;
         else if (!strcmp(argv[i], "--nextn-exact-tiled")) nextn_exact_tiled = 1;
         else if (!strcmp(argv[i], "--q6-exact-head")) q6_exact_head = 1;
+        else if (!strcmp(argv[i], "--i16-super-gates") && ++i < argc)
+            i16_super_gates = atoi(argv[i]);
         else if (!strcmp(argv[i], "--bench-csv")) bench_csv = 1;
         else if (argv[i][0] != '-' && !path) path = argv[i];
         else { usage(argv[0]); return 2; }
     }
     if (!path || spec_k < 0 || spec_k > 4 || max_seq < 2 || max_gen < 0 ||
         threads < 1 || bench_runs < 1 || bench_warmup < 0 ||
-        kernel_probe < 0 || draft_head_rows < 0 ||
+        kernel_probe < 0 || a15_probe < 0 || draft_head_rows < 0 || target_head_rows < 0 ||
+        i16_super_gates < 0 ||
+        (i16_super_gates && (!nvfp4_exact_tiled || !spec_verify || spec_k != 3)) ||
+        (target_head_rows && (spec_k || spec_verify || !q6_exact_head || bench ||
+                              batch_probe || kernel_probe || a15_probe)) ||
+        (nvfp4_compact_a15 && (!nvfp4_exact_tiled || nvfp4_packed ||
+                                spec_k || spec_verify || bench || batch_probe ||
+                                kernel_probe || a15_probe || threads != 48)) ||
+        (a15_probe && (a15_probe > 200 || spec_k || spec_verify || bench ||
+                       batch_probe || kernel_probe || !nvfp4_exact_tiled ||
+                       threads != 48)) ||
         (draft_head_rows && !spec_verify) ||
         (kernel_probe_check && !kernel_probe) ||
         (nextn_exact_tiled && !nvfp4_exact_tiled) ||
@@ -505,6 +610,14 @@ int main(int argc, char **argv) {
                 m->n_vocab);
         return 2;
     }
+    if (target_head_rows > m->n_vocab || (target_head_rows & 7)) {
+        fprintf(stderr, "qwen38: --target-head-rows must be <= %d and divisible by 8\n",
+                m->n_vocab);
+        return 2;
+    }
+    if (target_head_rows)
+        fprintf(stderr, "qwen38: approximate decode target head limited to %d/%d rows\n",
+                target_head_rows, m->n_vocab);
     m->nextn.draft_head_rows = draft_head_rows;
     if (draft_head_rows)
         fprintf(stderr, "qwen38: NextN proposer head limited to %d/%d rows\n",
@@ -593,6 +706,25 @@ int main(int argc, char **argv) {
                         "output weights and four-CMG residency\n");
         return 1;
     }
+    if (i16_super_gates) {
+#if defined(TF_HAVE_Q38_NVFP4_I16_SUPER)
+        if (atexit(q38_nvfp4_i16_super_release)) return 1;
+        int count = i16_super_gates < m->n_layers ?
+                    i16_super_gates : m->n_layers;
+        for (int l = 0; l < count; l++) {
+            qtensor *gate = &m->layers[l].ffn_gate;
+            if (!gate->nvfp4_tiled ||
+                q38_nvfp4_i16_super_register(gate->data,
+                                              gate->n_rows, gate->n_cols)) {
+                fprintf(stderr, "qwen38: i16 supertile gate pack failed at layer %d\n", l);
+                return 1;
+            }
+        }
+#else
+        fprintf(stderr, "qwen38: i16 supertile requires A64FX SVE\n");
+        return 1;
+#endif
+    }
 #else
     if (q6_exact_head) {
         fprintf(stderr, "qwen38: --q6-exact-head requires A64FX SVE\n");
@@ -605,6 +737,11 @@ int main(int argc, char **argv) {
             mmap_weights ? "mmap" : (q8_resident ? "selective-q8" : "anonymous"));
     if (kernel_probe) {
         int rc = run_kernel_probe(m, kernel_probe, kernel_probe_check);
+        transformer_free(m); bpe_vocab_free(v); gguf_close(g);
+        return rc;
+    }
+    if (a15_probe) {
+        int rc = run_a15_probe(m, a15_probe);
         transformer_free(m); bpe_vocab_free(v); gguf_close(g);
         return rc;
     }
@@ -678,6 +815,11 @@ int main(int argc, char **argv) {
     double pf_ffn_gateup = tf_decode_ffn_gateup_ms, pf_ffn_down = tf_decode_ffn_down_ms;
     double pf_lm_head = tf_decode_lm_head_ms;
     int32_t cur = transformer_last_argmax(m);
+    if (nvfp4_compact_a15) {
+        transformer_set_nvfp4_compact_a15(1);
+        fprintf(stderr, "qwen38: compact NVFP4 A15 decode enabled\n");
+    }
+    tf_target_head_rows = target_head_rows;
     if (nextn_tile_probe) {
         int rc = run_nextn_tile_probe(m, cur, nt - 1);
         free(tok); transformer_free(m); bpe_vocab_free(v); gguf_close(g);
