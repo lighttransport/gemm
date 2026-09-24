@@ -1503,6 +1503,10 @@ static inline void tf_nvfp4_dot8_fast_sve(float *dst, const uint8_t *base, size_
  * to the corresponding 64 FP4 bytes. */
 typedef struct { float d[8]; uint8_t qs[64]; } tf_nvfp4_packed_subblock;
 typedef struct { tf_nvfp4_packed_subblock s[4]; } tf_nvfp4_packed_block;
+static int tf_nvfp4_packed_exact = 0;
+static void transformer_set_nvfp4_packed_exact(int enabled) {
+    tf_nvfp4_packed_exact = enabled != 0;
+}
 typedef struct {
     int8_t lo[64], hi[64];
     float lo_scale[16], hi_scale[16];
@@ -1613,6 +1617,57 @@ static inline void tf_nvfp4_packed_dot8(float *dst,
                                      svadd_f32_x(pg, acc2, acc3));
     svst1(p8, dst, svadd_f32_x(p8, svuzp1_f32(sum, sum),
                                      svuzp2_f32(sum, sum)));
+}
+
+/* Fused exact dequant + GEMV for the load-time expanded layout. The FP32
+ * scales are predecoded but FP4 codes remain compact; each row retains the
+ * tiled kernel's low/high FMA order. */
+static inline void tf_nvfp4_packed_exact_dot8(float *dst,
+                                               const tf_nvfp4_packed_block *w,
+                                               const float *x, int nb) {
+    const svbool_t pg = svptrue_b32();
+    const svfloat32_t lut = svld1(pg, ds4f_kvalues_mxfp4_f32);
+    svfloat32_t a0=svdup_f32(0), a1=a0, a2=a0, a3=a0;
+    svfloat32_t a4=a0, a5=a0, a6=a0, a7=a0;
+    for (int ib = 0; ib < nb; ib++) {
+        for (int s = 0; s < 4; s++) {
+            const tf_nvfp4_packed_subblock *p = &w[ib].s[s];
+            svfloat32_t xv = svld1(pg, x + ib * 64 + s * 16);
+            svfloat32_t xh = svld1(pg, x + ib * 64 + s * 16 + 8);
+#define TF_NVFP4_PACKED_EXACT_ROW(R, A) do { \
+                svbool_t p8=svwhilelt_b32((uint64_t)0,(uint64_t)8); \
+                svuint32_t z=svld1ub_u32(p8,p->qs+(R)*8); \
+                svfloat32_t d=svdup_f32(p->d[R]); \
+                svfloat32_t lo=svtbl_f32(lut,svand_n_u32_x(p8,z,15)); \
+                (A)=svmla_m(p8,(A),svmul_x(p8,lo,d),xv); \
+                svfloat32_t hi=svtbl_f32(lut,svlsr_n_u32_x(p8,z,4)); \
+                (A)=svmla_m(p8,(A),svmul_x(p8,hi,d),xh); \
+            } while (0)
+            TF_NVFP4_PACKED_EXACT_ROW(0,a0); TF_NVFP4_PACKED_EXACT_ROW(1,a1);
+            TF_NVFP4_PACKED_EXACT_ROW(2,a2); TF_NVFP4_PACKED_EXACT_ROW(3,a3);
+            TF_NVFP4_PACKED_EXACT_ROW(4,a4); TF_NVFP4_PACKED_EXACT_ROW(5,a5);
+            TF_NVFP4_PACKED_EXACT_ROW(6,a6); TF_NVFP4_PACKED_EXACT_ROW(7,a7);
+#undef TF_NVFP4_PACKED_EXACT_ROW
+        }
+    }
+    dst[0]=svaddv_f32(pg,a0); dst[1]=svaddv_f32(pg,a1);
+    dst[2]=svaddv_f32(pg,a2); dst[3]=svaddv_f32(pg,a3);
+    dst[4]=svaddv_f32(pg,a4); dst[5]=svaddv_f32(pg,a5);
+    dst[6]=svaddv_f32(pg,a6); dst[7]=svaddv_f32(pg,a7);
+}
+
+static inline void tf_nvfp4_packed_exact_matvec_rows(float *dst,
+        const qtensor *mat, const float *x, int row_start, int row_end) {
+    int nb = mat->n_cols / 64;
+    const tf_nvfp4_packed_block *w = (const tf_nvfp4_packed_block *)mat->data;
+    for (int i = row_start; i < row_end;) {
+        int tile = i / 8;
+        float values[8];
+        tf_nvfp4_packed_exact_dot8(values, w + (size_t)tile * nb, x, nb);
+        int end = (tile + 1) * 8;
+        if (end > row_end) end = row_end;
+        for (; i < end; i++) dst[i] = values[i % 8];
+    }
 }
 
 static inline void tf_nvfp4_packed_matvec_rows(float *dst, const qtensor *mat,
@@ -2722,6 +2777,11 @@ static void *tf_qmatvec_worker(void *arg) {
         if (tf_nvfp4_compact_a15 && t->mat->nvfp4_tiled) {
             tf_nvfp4_a15_matvec_rows(t->dst, t->mat, t->x,
                                       t->row_start, t->row_end);
+            return NULL;
+        }
+        if (t->mat->nvfp4_packed && tf_nvfp4_packed_exact) {
+            tf_nvfp4_packed_exact_matvec_rows(t->dst, t->mat, t->x,
+                                               t->row_start, t->row_end);
             return NULL;
         }
         if (t->mat->nvfp4_packed) {
@@ -4592,6 +4652,10 @@ static void tf_matvec_qtensor_rows(float *dst, const qtensor *mat, const float *
             tf_nvfp4_a15_matvec_rows(dst, mat, x, row_start, row_end);
             return;
         }
+        if (mat->nvfp4_packed && tf_nvfp4_packed_exact) {
+            tf_nvfp4_packed_exact_matvec_rows(dst, mat, x, row_start, row_end);
+            return;
+        }
         if (mat->nvfp4_packed) {
             tf_nvfp4_packed_matvec_rows(dst, mat, x, row_start, row_end);
             return;
@@ -4924,6 +4988,10 @@ static void tf_qmatvec(float *dst, const qtensor *mat, const float *x, int n_row
     if (mat->type == GGML_TYPE_NVFP4) {
         if (tf_nvfp4_compact_a15 && mat->nvfp4_tiled) {
             tf_nvfp4_a15_matvec_rows(dst, mat, x, 0, n_rows);
+            return;
+        }
+        if (mat->nvfp4_packed && tf_nvfp4_packed_exact) {
+            tf_nvfp4_packed_exact_matvec_rows(dst, mat, x, 0, n_rows);
             return;
         }
         if (mat->nvfp4_packed) {
@@ -15320,6 +15388,9 @@ static int tf_gemm_bf16_smalln_pair(float *Y0, const qtensor *m0,
 extern int q38_nvfp4_exact_n3_mt(float *y, const void *weights,
                                  const float *x, int rows, int cols,
                                  int n_threads);
+extern int q38_nvfp4_packed_n3_mt(float *y, const void *weights,
+                                  const float *x, int rows, int cols,
+                                  int n_threads);
 #endif
 #if defined(TF_HAVE_Q38_NVFP4_I16_SUPER) && defined(__ARM_FEATURE_SVE)
 extern int q38_nvfp4_i16_super_mt(float *y, const void *weights,
@@ -15330,6 +15401,12 @@ static void tf_gemm_f16_mt_tokenmajor_impl(float *Y_out, const qtensor *mat, con
                                        int n_rows, int N, int out_stride, int X_stride,
                                        int n_threads) {
 #if defined(__ARM_FEATURE_SVE)
+#if defined(TF_HAVE_Q38_NVFP4_N3_GATE)
+    if (tf_nvfp4_packed_exact && mat->nvfp4_packed && N == 3 &&
+        out_stride == n_rows && X_stride == mat->n_cols &&
+        q38_nvfp4_packed_n3_mt(Y_out, mat->data, X, n_rows,
+                                mat->n_cols, n_threads)) return;
+#endif
 #if defined(TF_HAVE_Q38_NVFP4_I16_SUPER)
     if (mat->nvfp4_tiled && N == 3 && out_stride == n_rows &&
         X_stride == mat->n_cols && svcntw() == 16 &&

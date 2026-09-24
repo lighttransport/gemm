@@ -81,7 +81,10 @@ static int run_kernel_probe(transformer_model *m, int rounds, int check) {
             tf_gemm_f16_mt_tokenmajor(y, mat, x, mat->n_rows, n,
                                       mat->n_rows, mat->n_cols, m->n_threads);
         double ms = (now_sec() - begin) * 1000.0 / rounds;
-        size_t bytes = mat->nvfp4_tiled
+        size_t bytes = mat->nvfp4_packed
+            ? (size_t)mat->n_rows * (size_t)mat->n_cols / 512 *
+              sizeof(tf_nvfp4_packed_block)
+            : mat->nvfp4_tiled
             ? (size_t)mat->n_rows * (size_t)mat->n_cols / 64 * sizeof(block_nvfp4)
             : mat->q6_decoded
                 ? (size_t)mat->n_rows * (size_t)mat->n_cols / 256 *
@@ -90,7 +93,8 @@ static int run_kernel_probe(transformer_model *m, int rounds, int check) {
         fprintf(stderr, "qwen38: kernel_probe %s rows=%d cols=%d N=%d bytes=%.3fGB ms=%.3f GBps=%.1f checksum=%a\n",
                 names[mi], mat->n_rows, mat->n_cols, n, bytes / 1e9,
                 ms, bytes / (ms * 1e6), y[mat->n_rows / 2]);
-        if (check && mat->nvfp4_tiled) {
+        if (check && (mat->nvfp4_tiled ||
+                      (mat->nvfp4_packed && tf_nvfp4_packed_exact))) {
             size_t outputs = (size_t)n * mat->n_rows;
             float *reference = malloc(outputs * sizeof(float));
             if (!reference) { free(x); free(y); return 1; }
@@ -106,9 +110,15 @@ static int run_kernel_probe(transformer_model *m, int rounds, int check) {
                 int tiles = mat->n_rows / 8;
                 int first = tiles * tid / team * 8;
                 int last = tiles * (tid + 1) / team * 8;
-                tf_nvfp4_tiled_gemm_pair_rows(reference, mat, x, n,
-                                               mat->n_rows, mat->n_cols,
-                                               first, last);
+                if (mat->nvfp4_tiled)
+                    tf_nvfp4_tiled_gemm_pair_rows(reference, mat, x, n,
+                                                   mat->n_rows, mat->n_cols,
+                                                   first, last);
+                else
+                    for (int t = 0; t < n; t++)
+                        tf_nvfp4_packed_exact_matvec_rows(
+                            reference + (size_t)t * mat->n_rows, mat,
+                            x + (size_t)t * mat->n_cols, first, last);
             }
             int mismatches = 0;
             for (size_t j = 0; j < outputs; j++)
@@ -460,7 +470,7 @@ static int run_benchmark(transformer_model *m, bpe_vocab *v, int32_t *tok,
 static void usage(const char *p) {
     fprintf(stderr, "usage: %s MODEL --prompt TEXT [--max-gen N] [--max-seq N] "
                     "[--threads N] [--spec-k 0..4] [--spec-verify] [--draft-head-rows N] [--batch-probe 2..4] [--kernel-probe N] [--kernel-probe-check] [--a15-probe N] [--nextn-tile-probe] [--mmap] "
-                    "[--fast-swiglu] [--nvfp4-fast] [--nvfp4-packed] [--nvfp4-exact-tiled] [--nvfp4-compact-a15] [--nextn-exact-tiled] [--q6-exact-head] [--target-head-rows N] [--i16-super-gates N] [--q8-mode auto|reference|cmg4|cmg4-a15|block64|block64-ffn|block64-exact|row] "
+                    "[--fast-swiglu] [--nvfp4-fast] [--nvfp4-packed] [--nvfp4-packed-exact] [--nvfp4-exact-tiled] [--nvfp4-compact-a15] [--nextn-exact-tiled] [--q6-exact-head] [--target-head-rows N] [--i16-super-gates N] [--q8-mode auto|reference|cmg4|cmg4-a15|block64|block64-ffn|block64-exact|row] "
                     "[--bench --bench-prompt N[,N...] --bench-gen N[,N...] "
                     "--bench-runs N --bench-warmup N --bench-csv]\n", p);
 }
@@ -472,6 +482,7 @@ int main(int argc, char **argv) {
     const char *bench_gen_arg = "128";
     int max_gen = 16, max_seq = 512, threads = 48, spec_k = 0, mmap_weights = 0;
     int fast_swiglu = 0, nvfp4_fast = 0, nvfp4_packed = 0;
+    int nvfp4_packed_exact = 0;
     int nvfp4_compact_a15 = 0;
     int nvfp4_exact_tiled = 0, nextn_exact_tiled = 0;
     int q6_exact_head = 0, batch_probe = 0;
@@ -509,6 +520,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--fast-swiglu")) fast_swiglu = 1;
         else if (!strcmp(argv[i], "--nvfp4-fast")) nvfp4_fast = 1;
         else if (!strcmp(argv[i], "--nvfp4-packed")) nvfp4_packed = 1;
+        else if (!strcmp(argv[i], "--nvfp4-packed-exact"))
+            nvfp4_packed = nvfp4_packed_exact = 1;
         else if (!strcmp(argv[i], "--nvfp4-compact-a15")) nvfp4_compact_a15 = 1;
         else if (!strcmp(argv[i], "--nvfp4-exact-tiled")) nvfp4_exact_tiled = 1;
         else if (!strcmp(argv[i], "--nextn-exact-tiled")) nextn_exact_tiled = 1;
@@ -538,10 +551,11 @@ int main(int argc, char **argv) {
         (nextn_tile_probe && (nextn_exact_tiled || !nvfp4_exact_tiled || !q6_exact_head ||
                              !spec_verify || batch_probe || bench || kernel_probe)) ||
         (kernel_probe && (bench || batch_probe || spec_k ||
-            !nvfp4_exact_tiled || !q6_exact_head)) ||
+            (!nvfp4_exact_tiled && !nvfp4_packed_exact) || !q6_exact_head)) ||
         (batch_probe && (batch_probe < 2 || batch_probe > 4 || spec_k || bench)) ||
         (spec_verify && (spec_k < 2 || spec_k > 4 || bench || batch_probe ||
-                         nvfp4_fast || nvfp4_packed || fast_swiglu))) {
+                         nvfp4_fast || (nvfp4_packed && !nvfp4_packed_exact) ||
+                         fast_swiglu))) {
         usage(argv[0]); return 2;
     }
 
@@ -582,6 +596,15 @@ int main(int argc, char **argv) {
         }
         fprintf(stderr, "qwen38: verified node-local GGUF %s; staging into HBM2 next\n",
                 resolved);
+        free(resolved);
+    }
+    if (nvfp4_packed_exact) {
+        char *resolved = realpath(path, NULL);
+        if (!resolved || strncmp(resolved, "/local/", 7) != 0) {
+            fprintf(stderr, "qwen38: --nvfp4-packed-exact requires a model staged under /local\n");
+            free(resolved);
+            return 2;
+        }
         free(resolved);
     }
     double load0 = now_sec();
@@ -630,7 +653,7 @@ int main(int argc, char **argv) {
     size_t pack_bytes = 0;
     int pack_count = 0;
     if (nvfp4_packed) {
-        if (mmap_weights || q8_model || spec_k || m->use_moe ||
+        if (mmap_weights || q8_model || (spec_k && !nvfp4_packed_exact) || m->use_moe ||
             threads != 48 || !getenv("NUMA_DISTRIBUTE") || g->fd < 0 ||
             q38_nvfp4_plan(g, &pack_layout, &pack_bytes, &pack_count) ||
             pack_count == 0) {
@@ -687,7 +710,17 @@ int main(int argc, char **argv) {
         }
         fprintf(stderr, "qwen38: NVFP4 packed %d tensors %.3fGB in %.3fs\n",
                 pack_count, pack_bytes / 1e9, now_sec() - pack_t0);
+        if (nvfp4_packed_exact &&
+            q38_nvfp4_verify_packed_tiles(g, pack_layout,
+                                           (size_t)g->n_tensors)) {
+            fprintf(stderr, "qwen38: packed weights differ from staged GGUF\n");
+            return 1;
+        }
         free(pack_layout);
+    }
+    if (nvfp4_packed_exact) {
+        transformer_set_nvfp4_packed_exact(1);
+        fprintf(stderr, "qwen38: exact fused FP4 dequant enabled for CMG-local packed weights\n");
     }
     if (nvfp4_exact_tiled) {
         double pack_t0 = now_sec();

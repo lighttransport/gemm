@@ -144,7 +144,7 @@ GLM5_HDRS   := $(COMMON)/glm5.h $(COMMON)/glm5_impl.h $(COMMON)/glm5_mem.h $(COM
 # ── Targets ────────────────────────────────────────────────────────────
 # ds4f_bake MUST be here: the alias target name matches ds4f_bake.c, so without .PHONY make's
 # built-in "%: %.c" rule fires and re-links the finished binary as if it were an object.
-.PHONY: all clean vlm_objs llm_runner qwen38_runner qwen38_nvfp4_a15_test qwen38_nvfp4_i16_super_test qwen38_nvfp4_roofline qwen38_kquant_bench qwen38_kquant_test qwen38_kquant_n3_test qwen38_kquant_stage qwen38_kquant_stage_test qwen38_kquant_check qwen38_pp_runner qwen38_prefill_runner qwen38_mixed_runner qwen38_tp_stage pp_runner tp_runner tp_runner_prof ep_runner ds4f_runner ds4f_ep_runner ds4f_decode_bw ds4f_bake m3_ep_runner glm5_ep_runner glm5_ep_runner_fapp glm5_stage glm52_gguf_convert glm5_real_test glm5_fp8_kernel_test
+.PHONY: all clean vlm_objs llm_runner qwen38_runner qwen38_nvfp4_a15_test qwen38_nvfp4_packed_exact_test qwen38_nvfp4_i16_super_test qwen38_nvfp4_roofline qwen38_kquant_bench qwen38_kquant_test qwen38_kquant_n3_test qwen38_kquant_stage qwen38_kquant_stage_test qwen38_kquant_check qwen38_pp_runner qwen38_prefill_runner qwen38_mixed_runner qwen38_tp_stage pp_runner tp_runner tp_runner_prof ep_runner ds4f_runner ds4f_ep_runner ds4f_decode_bw ds4f_bake m3_ep_runner glm5_ep_runner glm5_ep_runner_fapp glm5_stage glm52_gguf_convert glm5_real_test glm5_fp8_kernel_test
 
 all: $(BUILD)/llm_runner
 
@@ -158,6 +158,12 @@ $(BUILD)/qwen38_runner: $(LLM_DIR)qwen38_runner.c $(COMMON)/transformer.h $(COMM
 qwen38_nvfp4_a15_test: $(BUILD)/test_qwen38_nvfp4_a15
 $(BUILD)/test_qwen38_nvfp4_a15: $(LLM_DIR)test_qwen38_nvfp4_a15.c $(COMMON)/transformer.h $(COMMON)/ggml_dequant.h | $(BUILD)
 	$(CC) $(CFLAGS) -O1 -ffunction-sections -fdata-sections -o $@ $< \
+		$(LDFLAGS) -Wl,--gc-sections
+
+qwen38_nvfp4_packed_exact_test: $(BUILD)/test_qwen38_nvfp4_packed_exact
+$(BUILD)/test_qwen38_nvfp4_packed_exact: $(LLM_DIR)test_qwen38_nvfp4_packed_exact.c $(LLM_DIR)qwen38_nvfp4_pack.h $(LLM_DIR)qwen38_nvfp4_n3.c $(COMMON)/transformer.h | $(BUILD)
+	$(CC) $(CFLAGS) -O1 -ffunction-sections -fdata-sections -o $@ \
+		$(LLM_DIR)test_qwen38_nvfp4_packed_exact.c $(LLM_DIR)qwen38_nvfp4_n3.c \
 		$(LDFLAGS) -Wl,--gc-sections
 
 qwen38_nvfp4_i16_super_test: $(BUILD)/test_qwen38_nvfp4_i16_super

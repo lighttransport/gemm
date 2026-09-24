@@ -651,3 +651,50 @@ denied by workspace auto-review as an unauthorized repository export, and
 the available PJM allocation was canceled rather than left queued. Native
 testing needs explicit permission to transfer the reviewed source and a new
 allocation.
+
+## CMG-local packed-scale exact verifier prototype
+
+`--nvfp4-packed-exact` now selects load-time repacking of the staged
+`/local` GGUF into eight-row/64-column tiles with FP32-predecoded UE4M3
+scales and the original packed FP4 nibbles. The tile is 384 bytes versus
+288 bytes compact (1.333x); the existing loader reserves the expanded
+space and the in-place reverse-order pack avoids a second model-sized
+allocation. First touch binds the final pages to the 48 workers' four CMG
+HBM arenas. NextN tensors remain in their original GGUF row layout, so the
+draft does not accidentally use a tiled-weight decoder.
+
+The opt-in exact single-token kernel and K=3 fused verifier multiply FP4
+codes by the predecoded scales inside the SVE loop. The verifier decodes a
+weight once for three candidate activations. Neither path quantizes
+activations. `--kernel-probe N --kernel-probe-check` can time six real
+loaded projection shapes and compare every K=3 output against three exact
+single-token projections. `test_qwen38_nvfp4_packed_exact.c` independently
+packs synthetic GGUF-row blocks and compares 384 outputs bit-for-bit against
+the compact exact tiled kernel under 512-bit SVE QEMU; it also tests that
+the layout planner excludes NextN. At runtime, the loader rereads the first
+and last tile of every packed tensor from the staged `/local` GGUF and
+compares them byte-for-byte against the resident repack. This is a bounded
+source-integrity check, not a full source scan.
+
+Native run sequence, only inside a guarded Fugaku allocation with the model
+staged under `/local`:
+
+```sh
+TF_KV_DTYPE=f32 a64fx/llm/run_qwen38_nvfp4_cmg4.sh "$M" \
+  --prompt hi --max-seq 256 --max-gen 64 --spec-k 0 \
+  --nvfp4-packed-exact --q6-exact-head \
+  --kernel-probe 200 --kernel-probe-check
+TF_KV_DTYPE=f32 TF_DUMP_TOKENS=1 \
+  a64fx/llm/run_qwen38_nvfp4_cmg4.sh "$M" --prompt hi \
+  --max-seq 256 --max-gen 64 --spec-k 3 --spec-verify \
+  --draft-head-rows 65536 --nvfp4-packed-exact --q6-exact-head
+```
+
+Run a separate `--spec-k 0 --nvfp4-exact-tiled --q6-exact-head` serial
+reference with the same model, prompt, KV dtype, and generation settings;
+require all 64 ordered `(position, ID)` pairs with the token-trace checker.
+Repeat on the matrix-multiplication prompt and a third prompt before
+reporting throughput. **No native packed-scale timing or real-model replay
+has been performed yet.** The increased stream might outweigh saved
+scale decoding, and generated code still contains SVE register spills, so
+this prototype is not a claimed bandwidth-saturated kernel.

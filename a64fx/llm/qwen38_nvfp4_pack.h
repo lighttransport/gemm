@@ -32,7 +32,10 @@ static int q38_nvfp4_plan(const gguf_context *g, q38_nvfp4_layout **out,
         d->cols = ti->dims[0];
         d->rows = 1;
         for (uint32_t k = 1; k < ti->n_dims; k++) d->rows *= ti->dims[k];
-        if (ti->type == GGML_TYPE_NVFP4 && ti->n_dims >= 2 &&
+        /* NextN uses row-layout kernels; retain its original GGUF weights. */
+        int nextn_tensor = strstr(ti->name.str, "nextn") != NULL ||
+                           strncmp(ti->name.str, "blk.64.", 7) == 0;
+        if (!nextn_tensor && ti->type == GGML_TYPE_NVFP4 && ti->n_dims >= 2 &&
             d->cols % 64 == 0 && d->rows % 8 == 0) {
             d->packed = 1;
             d->dst_bytes = (d->rows / 8) * (d->cols / 64) *
@@ -220,6 +223,59 @@ static int q38_nvfp4_pack_model(gguf_context *g, transformer_model *m,
     for (size_t i = 0; i < n; i++)
         g->tensors[ds[i].idx].offset = ds[i].new_off;
     g->data_size = new_bytes;
+    return 0;
+}
+
+/* Verify bounded real-model samples against the staged GGUF, without keeping
+ * another resident weight copy. In-place repacking is easiest to audit at
+ * both tensor ends, where layout/offset mistakes are most likely to show. */
+static int q38_nvfp4_verify_packed_tiles(const gguf_context *g,
+        const q38_nvfp4_layout *ds, size_t n) {
+    if (!g || g->fd < 0) return -1;
+    size_t max_src = 0, max_dst = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (!ds[i].packed) continue;
+        size_t nb = ds[i].cols / 64;
+        size_t src = 8 * nb * sizeof(block_nvfp4);
+        size_t dst = nb * sizeof(tf_nvfp4_packed_block);
+        if (src > max_src) max_src = src;
+        if (dst > max_dst) max_dst = dst;
+    }
+    uint8_t *src = malloc(max_src), *want = malloc(max_dst);
+    if (!src || !want) { free(src); free(want); return -1; }
+    int checked = 0;
+    for (size_t i = 0; i < n; i++) {
+        const q38_nvfp4_layout *d = &ds[i];
+        if (!d->packed) continue;
+        size_t nb = d->cols / 64;
+        size_t src_tile = 8 * nb * sizeof(block_nvfp4);
+        size_t dst_tile = nb * sizeof(tf_nvfp4_packed_block);
+        size_t tiles = d->rows / 8;
+        for (int edge = 0; edge < 2; edge++) {
+            size_t tile = edge ? tiles - 1 : 0;
+            off_t offset = (off_t)(g->data_offset + d->old_off + tile * src_tile);
+            size_t read_bytes = 0;
+            while (read_bytes < src_tile) {
+                ssize_t got = pread(g->fd, src + read_bytes,
+                                    src_tile - read_bytes,
+                                    offset + (off_t)read_bytes);
+                if (got <= 0) { free(src); free(want); return -1; }
+                read_bytes += (size_t)got;
+            }
+            q38_nvfp4_pack_tile((tf_nvfp4_packed_block *)want,
+                                 (const block_nvfp4 *)src, nb);
+            if (memcmp(want, g->data + d->new_off + tile * dst_tile,
+                       dst_tile)) {
+                fprintf(stderr, "qwen38: packed tile mismatch tensor=%zu edge=%d\n",
+                        i, edge);
+                free(src); free(want); return -1;
+            }
+            checked++;
+        }
+    }
+    fprintf(stderr, "qwen38: packed source verified %d first/last tiles\n",
+            checked);
+    free(src); free(want);
     return 0;
 }
 
