@@ -923,6 +923,22 @@ in one full-shape run while increasing marked instructions from 1.73M to
 two independent SDOT accumulator banks. Both unrolls passed the small
 all-row qlair correctness gate. The checked-in kernel remains unchanged.
 
+Further four-pass experiments at the same shape confirmed that 200 GB/s is
+within the simulator's run-to-run spread, not yet a stable floor. Compiling
+the fused kernel at `-O2` produced **204.1 and 196.8 GB/s** (`correct=1`);
+the original `-O3` run above was 197.8 GB/s. A diagnostic permutation of
+the twelve workers' contiguous weight shards produced **202.7 and
+199.3 GB/s** with identical arithmetic and bytes, but did not consistently
+remove slow outlier workers, so no placement switch was retained. The
+`-mcpu=a64fx` build was slower than baseline in the small all-row gate.
+Clang lowered `svldnt1_s8` to ordinary `ld1b` at this target, making a
+non-temporal-load variant identical in that gate. A `-ffast-math` variant
+passed the full-shape all-row QEMU check but was slower in the small qlair
+gate and warned that the loader's non-finite input check was undefined;
+it was not retained. These results favor focusing next on the real
+weight-residency and fused-decode path rather than selecting a compiler
+flag from one favorable simulator run.
+
 ```sh
 Q38_QLAIR_CHECK_ALL=1 Q38_QLAIR_NO_MBIND=1 \
   qemu-aarch64 -cpu max,sve512=on -L /usr/aarch64-linux-gnu \
