@@ -983,6 +983,19 @@ binary passed full-shape QEMU; require `correct=1` and a complete 12-thread
 profile before accepting another simulator number. Production load-time
 integration and real-model token identity remain unverified.
 
+The older `packed8_1` path is still the stronger compact FP4 baseline.
+On the same 6144x5120 shape, it delivered 107.6 GB/s in a complete
+12-core qlair run (another control run delivered 96.4 GB/s). Hoisting the
+shared activation scale out of the per-16-column loop and applying it
+once to each output vector reduced marked instructions from 4.44M to
+4.19M, and two complete runs delivered **121.7 and 117.5 GB/s** with
+`correct=1`. The repository's packed-FP4 regression test passed under
+SVE QEMU (`PASS packed_exact`, A8 relative L2 error 0.00384827); the
+full-shape benchmark also passed its independent row check. This remains
+well below the compact stream's 223.6 GB/s scan ceiling. Direct FMLA and
+compiler-wide FP contraction variants passed QEMU but did not finish a
+valid 12-core qlair profile, so neither was retained.
+
 Build `qwen38_nvfp4_packed64_a8.c` with Clang `-O3 -march=armv8.2-a+sve`
 and link its object into `bench_qwen38_nvfp4_qlair`. Then run:
 

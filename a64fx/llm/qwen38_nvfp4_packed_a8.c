@@ -45,9 +45,8 @@ int q38_nvfp4_packed_a8_rows(float *y, const void *weights,
                 svint32_t d0=svdot_s32(svdup_s32(0),lo,xl);
                 svint32_t d1=svdot_s32(svdup_s32(0),hi,xh);
                 svfloat32_t ds=svzip1_f32(svld1(p8,p->d),svld1(p8,p->d));
-                svfloat32_t v=svmul_n_f32_x(pf,
-                    svmul_f32_x(pf,svcvt_f32_s32_x(pf,
-                        svadd_s32_x(pf,d0,d1)),ds),act_scale);
+                svfloat32_t v=svmul_f32_x(pf,svcvt_f32_s32_x(pf,
+                    svadd_s32_x(pf,d0,d1)),ds);
                 switch (s) {
                 case 0: a0=svadd_f32_x(pf,a0,v); break;
                 case 1: a1=svadd_f32_x(pf,a1,v); break;
@@ -57,6 +56,8 @@ int q38_nvfp4_packed_a8_rows(float *y, const void *weights,
             }
         svfloat32_t total=svadd_f32_x(pf,svadd_f32_x(pf,a0,a1),
                                          svadd_f32_x(pf,a2,a3));
+        /* Activation scale is shared by all subblocks in this projection. */
+        total=svmul_n_f32_x(pf,total,act_scale);
         svst1(p8,y+row,svadd_f32_x(p8,svuzp1_f32(total,total),
                                      svuzp2_f32(total,total)));
     }
