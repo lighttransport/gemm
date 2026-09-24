@@ -295,6 +295,34 @@ void q38_super_bench_rows_a8(float *y, const int8_t *coeff,
 #undef Q38_SUPER_A8_STORE
     }
 }
+/* One-token sensitivity floor for the predecoded coefficient sidecar. */
+void q38_super_bench_rows_a8_n1(float *y, const int8_t *coeff,
+                                 const int8_t *digits, float scale,
+                                 int cols, int first, int last) {
+    const svbool_t pb = svptrue_b8(), pf = svptrue_b32();
+    for (int nt = first; nt < last; nt++) {
+        svint32_t a0=svdup_s32(0),a1=a0,a2=a0,a3=a0;
+        const int8_t *wp = coeff + (size_t)nt * cols * 64;
+        for (int k = 0; k < cols; k += 4) {
+            uint32_t q;
+            memcpy(&q, digits + k, 4);
+            svint8_t v = svreinterpret_s8_u32(svdup_n_u32(q));
+            const int8_t *p = wp + (size_t)k * 64;
+            a0 = svdot_s32(a0, svld1_s8(pb, p), v);
+            a1 = svdot_s32(a1, svld1_s8(pb, p + 64), v);
+            a2 = svdot_s32(a2, svld1_s8(pb, p + 128), v);
+            a3 = svdot_s32(a3, svld1_s8(pb, p + 192), v);
+        }
+        svst1_f32(pf, y + nt * 64,
+            svmul_n_f32_x(pf, svcvt_f32_s32_x(pf, a0), scale));
+        svst1_f32(pf, y + nt * 64 + 16,
+            svmul_n_f32_x(pf, svcvt_f32_s32_x(pf, a1), scale));
+        svst1_f32(pf, y + nt * 64 + 32,
+            svmul_n_f32_x(pf, svcvt_f32_s32_x(pf, a2), scale));
+        svst1_f32(pf, y + nt * 64 + 48,
+            svmul_n_f32_x(pf, svcvt_f32_s32_x(pf, a3), scale));
+    }
+}
 #endif
 
 int q38_nvfp4_i16_super_mt(float *y, const void *source, const float *x,

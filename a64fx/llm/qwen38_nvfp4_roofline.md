@@ -767,3 +767,31 @@ for mode in compute stream sdot8 sdot8_stream; do
     -- "$mode" 4096 5120 12 1 0
 done
 ```
+
+## Single-token simulator follow-up (2026-09-24)
+
+An isolated `qwen38_nvfp4_n1.c` candidate uses the same 384-byte packed tile
+and exact FP32 code/scale multiplications for one activation. It is bitwise
+identical to the existing tiled exact projection for all 384 outputs in
+`test_qwen38_nvfp4_packed_exact.c` (eight trials, three activation vectors,
+16 rows). It is **not yet selected by the production runner**. On the same
+4096 x 5120 one-CMG benchmark, `compute1` reached only **35.9 GB/s HBM2**
+(885,169 max marked cycles), versus 218.2 GB/s for `stream1`/`stream` on
+the same packed allocation. Reordering low-nibble FMAs ahead of high-nibble
+FMAs remained bitwise-correct but regressed to 32.3 GB/s, so it was reverted.
+
+As a sensitivity bound, benchmark-only `sdot8_1` uses predecoded signed-byte
+coefficients and one quantized activation. On the real 6144 x 5120 SSM-gate
+shape, balanced across 12 simulated cores, it reached **206.4 GB/s HBM2**
+with a 31,457,280-byte weight stream and sampled scalar-output checks.
+At 4096 x 5120, where 64 row groups split unevenly across 12 workers, it
+reached 189.5 GB/s. This establishes that useful one-token arithmetic can
+exceed 200 GB/s in qlair, but **does not satisfy the FP4 objective**: the
+sidecar is 1.33x larger than packed FP4, activation quantization is lossy,
+rare-scale corrections are omitted, and no real-model token replay exists.
+The remaining problem is an exact or accuracy-validated compact FP4 fused
+dequant/GEMV near that rate with a resident representation fitting 32 GB HBM.
+
+For the N=1 benchmark, add `qwen38_nvfp4_n1.c` to the cross-link command
+above, then run `compute1` versus `stream1` with `4096 5120 12 1 0`.
+`sdot8_1 6144 5120 12 1 0` reproduces the sidecar sensitivity result.

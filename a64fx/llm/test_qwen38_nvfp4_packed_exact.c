@@ -18,6 +18,8 @@
 
 extern int q38_nvfp4_packed_n3_mt(float *, const void *, const float *,
                                    int, int, int);
+extern int q38_nvfp4_packed_n1_rows(float *, const void *, const float *,
+                                    int, int);
 
 int main(void) {
 #if !defined(__ARM_FEATURE_SVE)
@@ -118,6 +120,16 @@ int main(void) {
                 return 1;
             }
         for (int t = 0; t < 3; t++) {
+            if (!q38_nvfp4_packed_n1_rows(got + t * ROWS, packed,
+                                            x + t * COLS, ROWS, COLS)) return 1;
+            for (int i = 0; i < ROWS; i++)
+                if (memcmp(&got[t * ROWS + i], &expected[t * ROWS + i],
+                           sizeof(float))) {
+                    fprintf(stderr, "FAIL candidate packed N1 trial=%d token=%d row=%d ref=%a got=%a\n",
+                            trial, t, i, expected[t * ROWS + i],
+                            got[t * ROWS + i]);
+                    return 1;
+                }
             tf_nvfp4_packed_exact_matvec_rows(got + t * ROWS,
                                                 &pm, x + t * COLS, 0, ROWS);
             for (int i = 0; i < ROWS; i++)

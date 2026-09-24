@@ -15,6 +15,8 @@
 
 extern int q38_nvfp4_packed_n3_mt(float *, const void *, const float *,
                                    int, int, int);
+extern int q38_nvfp4_packed_n1_rows(float *, const void *, const float *,
+                                    int, int);
 extern int q38_super_bench_quantize(int8_t *, int8_t *, float[3],
                                     const float *, int);
 extern void q38_super_bench_rows(float *, const int8_t *, const int32_t *,
@@ -23,6 +25,8 @@ extern void q38_super_bench_rows(float *, const int8_t *, const int32_t *,
                                   int, int, int, int);
 extern void q38_super_bench_rows_a8(float *, const int8_t *, const int8_t *,
                                      const float[3], int, int, int, int);
+extern void q38_super_bench_rows_a8_n1(float *, const int8_t *, const int8_t *,
+                                        float, int, int, int);
 __attribute__((noinline)) void __qlair_sim_start(unsigned long id) {
     (void)id; __asm__ volatile("" ::: "memory");
 }
@@ -64,7 +68,7 @@ static uint8_t stream_weights(const uint8_t *p, size_t bytes) {
 static float *activation;
 static int8_t *digits;
 static float digit_scale[3];
-static int bench_cols, bench_sdot;
+static int bench_cols, bench_sdot, bench_n1;
 
 /* Validate one row per worker outside the marked region. This catches
  * incomplete simulator execution as well as nibble/order regressions. */
@@ -73,7 +77,7 @@ static int check_first_row(const uint8_t *weights, const float *y,
     static const float code[16] = {
         0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12
     };
-    for (int c = 0; c < 3; c++) {
+    for (int c = 0; c < (bench_n1 ? 1 : 3); c++) {
         float expected = 0.0f;
         if (bench_sdot) {
             const int8_t *w = (const int8_t *)weights;
@@ -156,7 +160,10 @@ static void *run_worker(void *arg) {
     volatile uint8_t stream_sum = 0;
     for (int rep = 0; rep < bench_warmup && !worker->error; rep++) {
         if (bench_compute) {
-            if (bench_a8)
+            if (bench_a8 && bench_n1)
+                q38_super_bench_rows_a8_n1(y, (const int8_t *)weights,
+                    digits, digit_scale[0], bench_cols, 0, local_rows / 64);
+            else if (bench_a8)
                 q38_super_bench_rows_a8(y, (const int8_t *)weights, digits,
                     digit_scale, local_rows, bench_cols, 0, local_rows / 64);
             else if (bench_sdot)
@@ -164,7 +171,10 @@ static void *run_worker(void *arg) {
                     rare_offsets, digits, digits + (size_t)3 * bench_cols,
                     digit_scale, activation, local_rows, bench_cols,
                     0, local_rows / 64);
-            else if (!q38_nvfp4_packed_n3_mt(y, weights, activation,
+            else if (bench_n1 ?
+                     !q38_nvfp4_packed_n1_rows(y, weights, activation,
+                                               local_rows, bench_cols) :
+                     !q38_nvfp4_packed_n3_mt(y, weights, activation,
                                               local_rows, bench_cols, 1))
                     worker->error = 1;
         } else stream_sum ^= stream_weights((const uint8_t *)weights, bytes);
@@ -174,7 +184,10 @@ static void *run_worker(void *arg) {
     worker->begin = ticks();
     for (int rep = 0; rep < bench_passes && !worker->error; rep++) {
         if (bench_compute) {
-            if (bench_a8)
+            if (bench_a8 && bench_n1)
+                q38_super_bench_rows_a8_n1(y, (const int8_t *)weights,
+                    digits, digit_scale[0], bench_cols, 0, local_rows / 64);
+            else if (bench_a8)
                 q38_super_bench_rows_a8(y, (const int8_t *)weights, digits,
                     digit_scale, local_rows, bench_cols, 0, local_rows / 64);
             else if (bench_sdot)
@@ -182,7 +195,10 @@ static void *run_worker(void *arg) {
                     rare_offsets, digits, digits + (size_t)3 * bench_cols,
                     digit_scale, activation, local_rows, bench_cols,
                     0, local_rows / 64);
-            else if (!q38_nvfp4_packed_n3_mt(y, weights, activation,
+            else if (bench_n1 ?
+                     !q38_nvfp4_packed_n1_rows(y, weights, activation,
+                                               local_rows, bench_cols) :
+                     !q38_nvfp4_packed_n3_mt(y, weights, activation,
                                               local_rows, bench_cols, 1))
                     worker->error = 1;
         } else stream_sum ^= stream_weights((const uint8_t *)weights, bytes);
@@ -200,17 +216,23 @@ static void *run_worker(void *arg) {
 
 int main(int argc, char **argv) {
     if (argc != 7 || (strcmp(argv[1], "compute") &&
+                      strcmp(argv[1], "compute1") &&
                       strcmp(argv[1], "stream") &&
+                      strcmp(argv[1], "stream1") &&
                       strcmp(argv[1], "sdot") &&
                       strcmp(argv[1], "sdot_stream") &&
                       strcmp(argv[1], "sdot8") &&
+                      strcmp(argv[1], "sdot8_1") &&
                       strcmp(argv[1], "sdot8_stream"))) {
-        fprintf(stderr, "usage: %s compute|stream|sdot|sdot_stream|sdot8|sdot8_stream ROWS COLS CORES PASSES WARMUP\n", argv[0]);
+        fprintf(stderr, "usage: %s compute|compute1|stream|stream1|sdot|sdot_stream|sdot8|sdot8_1|sdot8_stream ROWS COLS CORES PASSES WARMUP\n", argv[0]);
         return 2;
     }
-    bench_compute = !strcmp(argv[1], "compute") || !strcmp(argv[1], "sdot") ||
-                    !strcmp(argv[1], "sdot8");
-    bench_a8 = !strcmp(argv[1], "sdot8") || !strcmp(argv[1], "sdot8_stream");
+    bench_compute = !strcmp(argv[1], "compute") || !strcmp(argv[1], "compute1") || !strcmp(argv[1], "sdot") ||
+                    !strcmp(argv[1], "sdot8") || !strcmp(argv[1], "sdot8_1");
+    bench_n1 = !strcmp(argv[1], "compute1") || !strcmp(argv[1], "stream1") ||
+               !strcmp(argv[1], "sdot8_1");
+    bench_a8 = !strcmp(argv[1], "sdot8") || !strcmp(argv[1], "sdot8_1") ||
+               !strcmp(argv[1], "sdot8_stream");
     bench_sdot = bench_a8 || !strcmp(argv[1], "sdot") ||
                  !strcmp(argv[1], "sdot_stream");
     bench_rows = atoi(argv[2]); bench_cols = atoi(argv[3]);
