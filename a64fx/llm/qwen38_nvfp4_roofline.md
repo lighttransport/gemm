@@ -1055,3 +1055,44 @@ used `packed8soa_1 6144 5120 12 1 0` under SVE QEMU with
 `Q38_QLAIR_CHECK_ALL=1 Q38_QLAIR_NO_MBIND=1`, then `packed8soa_1` and
 `packed8soa_stream` with `6144 5120 12 1 1` under qlair
 `--cores 12 --profile-markers -n 3G`.
+
+### Four-CMG N=1 bandwidth gate
+
+The expanded-byte `repack8_groupmeta1` kernel was tested across all 48 cores,
+with one warmup and one measured pass. Both runs reported `correct=1` and a
+complete 48-thread profile. The matching `repack8_groupmeta_stream` control
+reads the same byte range without dot products or output conversion.
+
+| Rows x columns | Weight bytes | Fused HBM2 GB/s | Scan HBM2 GB/s | Fused / scan |
+| --- | ---: | ---: | ---: | ---: |
+| 17408 x 5120 | 89,128,960 | 702.8 | 897.2 | 78.3% |
+| 15360 x 5120 | 78,643,200 | 715.9 | 899.1 | 79.6% |
+
+The second shape gives every worker exactly five 64-row groups, eliminating
+the 5/6-group scheduling imbalance in the first. Its slowest CMG took
+222,422 simulated cycles for 19.9 MB of HBM reads; the other CMGs took
+201,866–220,125 cycles despite identical per-thread instruction counts.
+The 48-core **200 GB/s per CMG (800 GB/s node) gate is not met**. Its
+12-core, one-CMG ~198–204 GB/s observations do not scale linearly to four
+CMGs. The expanded-byte format is also a sensitivity sidecar, not a compact
+resident-weight solution or a measured real-model decode rate.
+
+A benchmark-only 1 KiB-ahead software prefetch passed the all-row SVE QEMU
+check on 6144 x 5120, but its one-CMG qlair rate was only 115.8 GB/s. It was
+removed. Retain the no-prefetch kernel as the baseline and require a matched
+four-CMG scan and full 48-thread `correct=1` profile for the next candidate.
+
+Reproduce the four-CMG comparison with the cross-built benchmark described
+above:
+
+```sh
+Q=~/work/clair/a64fx/build-inference/qlair
+for rows in 17408 15360; do
+  for mode in repack8_groupmeta1 repack8_groupmeta_stream; do
+    "$Q" --cores 48 --profile-markers \
+      --profile-report "tmp/q38-fp4-qlair-${rows}-c48-${mode}.json" \
+      --profile-format json -n 8G tmp/bench_qwen38_nvfp4_qlair \
+      -- "$mode" "$rows" 5120 48 1 1
+  done
+done
+```
