@@ -20,6 +20,10 @@ extern int q38_nvfp4_packed_n3_mt(float *, const void *, const float *,
                                    int, int, int);
 extern int q38_nvfp4_packed_n1_rows(float *, const void *, const float *,
                                     int, int);
+typedef struct { int8_t lo[64], hi[64]; } q38_a8_test_act;
+extern void q38_nvfp4_packed_a8_prepare(q38_a8_test_act *, const int8_t *, int);
+extern int q38_nvfp4_packed_a8_rows(float *, const void *,
+                                    const q38_a8_test_act *, float, int, int);
 
 int main(void) {
 #if !defined(__ARM_FEATURE_SVE)
@@ -105,6 +109,13 @@ int main(void) {
     pm.n_rows = ROWS; pm.n_cols = COLS;
     pm.nvfp4_packed = 1; pm.data = (uint8_t *)packed;
     float x[3 * COLS], expected[3 * ROWS], got[3 * ROWS];
+    static const float code[16] = {
+        0,1,2,3,4,6,8,12,0,-1,-2,-3,-4,-6,-8,-12
+    };
+    q38_a8_test_act aq[COLS / 16];
+    int8_t xq[COLS];
+    double a8_error2 = 0.0, a8_reference2 = 0.0;
+    float a8_max_abs = 0.0f;
     for (int trial = 0; trial < 8; trial++) {
         for (int i = 0; i < 3 * COLS; i++)
             x[i] = (float)((i * 29 + trial * 17) % 101 - 50) * 0.03125f;
@@ -140,9 +151,47 @@ int main(void) {
                     return 1;
                 }
         }
+        float maxabs = 0.0f;
+        for (int k = 0; k < COLS; k++) {
+            float v = fabsf(x[k]);
+            if (v > maxabs) maxabs = v;
+        }
+        float qscale = maxabs / 127.0f;
+        for (int k = 0; k < COLS; k++)
+            xq[k] = (int8_t)lrintf(x[k] / qscale);
+        q38_nvfp4_packed_a8_prepare(aq, xq, COLS);
+        if (!q38_nvfp4_packed_a8_rows(got, packed, aq,
+                                        qscale, ROWS, COLS)) return 1;
+        for (int row = 0; row < ROWS; row++) {
+            float ref = 0.0f;
+            for (int ib = 0; ib < NB; ib++)
+                for (int s = 0; s < 4; s++) {
+                    const tf_nvfp4_packed_subblock *p =
+                        &packed[(row / 8) * NB + ib].s[s];
+                    int sum = 0;
+                    for (int j = 0; j < 8; j++) {
+                        uint8_t z = p->qs[(row % 8) * 8 + j];
+                        int k = ib * 64 + s * 16 + j;
+                        sum += (int)code[z & 15] * xq[k];
+                        sum += (int)code[z >> 4] * xq[k + 8];
+                    }
+                    ref += (float)sum * p->d[row % 8] * qscale;
+                }
+            if (!isfinite(got[row]) || fabsf(got[row] - ref) >
+                    0.0005f + 0.0005f * fabsf(ref)) {
+                fprintf(stderr, "FAIL packed A8 trial=%d row=%d ref=%a got=%a\n",
+                        trial, row, ref, got[row]);
+                return 1;
+            }
+            float error = got[row] - expected[row];
+            a8_error2 += (double)error * error;
+            a8_reference2 += (double)expected[row] * expected[row];
+            if (fabsf(error) > a8_max_abs) a8_max_abs = fabsf(error);
+        }
     }
-    printf("PASS packed_exact outputs=%d sve_bytes=%zu\n", 8 * 3 * ROWS,
-           (size_t)svcntb());
+    printf("PASS packed_exact outputs=%d sve_bytes=%zu a8_rel_l2=%.6g a8_max_abs=%.6g\n",
+           8 * 3 * ROWS, (size_t)svcntb(),
+           sqrt(a8_error2 / a8_reference2), a8_max_abs);
     return 0;
 #endif
 }

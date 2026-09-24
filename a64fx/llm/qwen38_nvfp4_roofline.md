@@ -795,3 +795,29 @@ dequant/GEMV near that rate with a resident representation fitting 32 GB HBM.
 For the N=1 benchmark, add `qwen38_nvfp4_n1.c` to the cross-link command
 above, then run `compute1` versus `stream1` with `4096 5120 12 1 0`.
 `sdot8_1 6144 5120 12 1 0` reproduces the sidecar sensitivity result.
+
+### Compact W4A8 branch
+
+`qwen38_nvfp4_packed_a8.c` consumes the existing 384-byte packed tile
+directly, with no expanded weight sidecar. It unpacks FP4 nibbles through
+SVE `TBL`, performs two `SDOT`s on one prequantized activation, applies each
+row's predecoded FP32 scale, and accumulates in FP32. The activation is
+globally quantized to INT8, so this is **not** an exact target projection.
+The extended packed test compares every row to an independent scalar
+quantized reference across eight synthetic trials under SVE QEMU.
+Against the exact output on that fixture, its relative L2 error is
+0.00385 (not a real-model quality metric).
+
+On the same 4096 x 5120 qlair one-CMG gate, `packed8_1` reaches
+**114.4 GB/s HBM2** (278,356 max marked cycles, `correct=1`, 12 threads),
+versus 35.9 GB/s for exact N=1 but still well below the 218.2 GB/s matched
+weight scan and the 200+ GB/s objective. It retains the resident FP4 byte
+count. Compiling only this kernel with Clang `-mcpu=a64fx` instead of
+`-march=armv8.2-a+sve` regressed to 20.9 GB/s in qlair; retain the latter
+for this simulator comparison. The 206.4 GB/s result remains specific to
+the larger signed-byte sidecar, and neither approximate branch has a
+real-model token-identity test.
+
+To reproduce `packed8_1`, cross-compile `qwen38_nvfp4_packed_a8.c` with
+`-O3 -march=armv8.2-a+sve`, add its object to the link command above, and
+run `packed8_1 4096 5120 12 1 0` with `--cores 12 --profile-markers`.

@@ -17,6 +17,10 @@ extern int q38_nvfp4_packed_n3_mt(float *, const void *, const float *,
                                    int, int, int);
 extern int q38_nvfp4_packed_n1_rows(float *, const void *, const float *,
                                     int, int);
+typedef struct { int8_t lo[64], hi[64]; } packed_a8_act;
+extern void q38_nvfp4_packed_a8_prepare(packed_a8_act *, const int8_t *, int);
+extern int q38_nvfp4_packed_a8_rows(float *, const void *,
+                                    const packed_a8_act *, float, int, int);
 extern int q38_super_bench_quantize(int8_t *, int8_t *, float[3],
                                     const float *, int);
 extern void q38_super_bench_rows(float *, const int8_t *, const int32_t *,
@@ -67,8 +71,9 @@ static uint8_t stream_weights(const uint8_t *p, size_t bytes) {
 
 static float *activation;
 static int8_t *digits;
+static packed_a8_act *packed_act;
 static float digit_scale[3];
-static int bench_cols, bench_sdot, bench_n1;
+static int bench_cols, bench_sdot, bench_n1, bench_pack_a8;
 
 /* Validate one row per worker outside the marked region. This catches
  * incomplete simulator execution as well as nibble/order regressions. */
@@ -86,6 +91,20 @@ static int check_first_row(const uint8_t *weights, const float *y,
                 sum += (int)w[(size_t)(k & ~3) * 64 + k % 4] *
                        (int)digits[(size_t)c * bench_cols + k];
             expected = (float)sum * digit_scale[c];
+        } else if (bench_pack_a8) {
+            const packed_block *w = (const packed_block *)weights;
+            for (int ib = 0; ib < bench_cols / 64; ib++)
+                for (int s = 0; s < 4; s++) {
+                    const packed_subblock *p = &w[ib].s[s];
+                    int sum = 0;
+                    for (int j = 0; j < 8; j++) {
+                        uint8_t z = p->qs[j];
+                        int k = ib * 64 + s * 16 + j;
+                        sum += (int)code[z & 15] * digits[k];
+                        sum += (int)code[z >> 4] * digits[k + 8];
+                    }
+                    expected += (float)sum * p->d[0] * digit_scale[0];
+                }
         } else {
             const packed_block *w = (const packed_block *)weights;
             for (int ib = 0; ib < bench_cols / 64; ib++)
@@ -160,7 +179,10 @@ static void *run_worker(void *arg) {
     volatile uint8_t stream_sum = 0;
     for (int rep = 0; rep < bench_warmup && !worker->error; rep++) {
         if (bench_compute) {
-            if (bench_a8 && bench_n1)
+            if (bench_pack_a8) {
+                if (!q38_nvfp4_packed_a8_rows(y, weights, packed_act,
+                        digit_scale[0], local_rows, bench_cols)) worker->error = 1;
+            } else if (bench_a8 && bench_n1)
                 q38_super_bench_rows_a8_n1(y, (const int8_t *)weights,
                     digits, digit_scale[0], bench_cols, 0, local_rows / 64);
             else if (bench_a8)
@@ -184,7 +206,10 @@ static void *run_worker(void *arg) {
     worker->begin = ticks();
     for (int rep = 0; rep < bench_passes && !worker->error; rep++) {
         if (bench_compute) {
-            if (bench_a8 && bench_n1)
+            if (bench_pack_a8) {
+                if (!q38_nvfp4_packed_a8_rows(y, weights, packed_act,
+                        digit_scale[0], local_rows, bench_cols)) worker->error = 1;
+            } else if (bench_a8 && bench_n1)
                 q38_super_bench_rows_a8_n1(y, (const int8_t *)weights,
                     digits, digit_scale[0], bench_cols, 0, local_rows / 64);
             else if (bench_a8)
@@ -217,6 +242,7 @@ static void *run_worker(void *arg) {
 int main(int argc, char **argv) {
     if (argc != 7 || (strcmp(argv[1], "compute") &&
                       strcmp(argv[1], "compute1") &&
+                      strcmp(argv[1], "packed8_1") &&
                       strcmp(argv[1], "stream") &&
                       strcmp(argv[1], "stream1") &&
                       strcmp(argv[1], "sdot") &&
@@ -224,13 +250,14 @@ int main(int argc, char **argv) {
                       strcmp(argv[1], "sdot8") &&
                       strcmp(argv[1], "sdot8_1") &&
                       strcmp(argv[1], "sdot8_stream"))) {
-        fprintf(stderr, "usage: %s compute|compute1|stream|stream1|sdot|sdot_stream|sdot8|sdot8_1|sdot8_stream ROWS COLS CORES PASSES WARMUP\n", argv[0]);
+        fprintf(stderr, "usage: %s compute|compute1|packed8_1|stream|stream1|sdot|sdot_stream|sdot8|sdot8_1|sdot8_stream ROWS COLS CORES PASSES WARMUP\n", argv[0]);
         return 2;
     }
-    bench_compute = !strcmp(argv[1], "compute") || !strcmp(argv[1], "compute1") || !strcmp(argv[1], "sdot") ||
+    bench_compute = !strcmp(argv[1], "compute") || !strcmp(argv[1], "compute1") || !strcmp(argv[1], "packed8_1") || !strcmp(argv[1], "sdot") ||
                     !strcmp(argv[1], "sdot8") || !strcmp(argv[1], "sdot8_1");
+    bench_pack_a8 = !strcmp(argv[1], "packed8_1");
     bench_n1 = !strcmp(argv[1], "compute1") || !strcmp(argv[1], "stream1") ||
-               !strcmp(argv[1], "sdot8_1");
+               !strcmp(argv[1], "sdot8_1") || bench_pack_a8;
     bench_a8 = !strcmp(argv[1], "sdot8") || !strcmp(argv[1], "sdot8_1") ||
                !strcmp(argv[1], "sdot8_stream");
     bench_sdot = bench_a8 || !strcmp(argv[1], "sdot") ||
@@ -272,17 +299,17 @@ int main(int argc, char **argv) {
                        (size_t)3 * bench_cols * sizeof(float))) return 1;
     for (int i = 0; i < 3 * bench_cols; i++)
         activation[i] = (float)((i * 17) % 101 - 50) * 0.015625f;
-    if (bench_sdot) {
+    if (bench_sdot || bench_pack_a8) {
         if (posix_memalign((void **)&digits, 256,
                            (size_t)6 * bench_cols)) return 1;
-        if (bench_a8) {
+        if (bench_a8 || bench_pack_a8) {
             for (int c = 0; c < 3; c++) {
                 float maxabs = 0.0f;
                 for (int k = 0; k < bench_cols; k++) {
                     float a = fabsf(activation[(size_t)c * bench_cols + k]);
                     if (a > maxabs) maxabs = a;
                 }
-                digit_scale[c] = maxabs / (127.0f * 1024.0f);
+                digit_scale[c] = maxabs / (127.0f * (bench_pack_a8 ? 1.0f : 1024.0f));
                 float inv = maxabs > 0.0f ? 127.0f / maxabs : 0.0f;
                 for (int k = 0; k < bench_cols; k++) {
                     int q = (int)lrintf(activation[(size_t)c * bench_cols + k] * inv);
@@ -294,6 +321,11 @@ int main(int argc, char **argv) {
         } else if (q38_super_bench_quantize(digits,
                    digits + (size_t)3 * bench_cols, digit_scale,
                    activation, bench_cols)) return 1;
+    }
+    if (bench_pack_a8) {
+        if (posix_memalign((void **)&packed_act, 256,
+                           (size_t)(bench_cols / 16) * sizeof(*packed_act))) return 1;
+        q38_nvfp4_packed_a8_prepare(packed_act, digits, bench_cols);
     }
     pthread_barrier_init(&start_barrier, NULL, (unsigned)bench_cores);
     pthread_barrier_init(&end_barrier, NULL, (unsigned)bench_cores);
@@ -318,7 +350,7 @@ int main(int argc, char **argv) {
            total_bytes * (size_t)bench_passes, (unsigned long long)slow,
            (unsigned long long)(last - first), errors == 0);
     for (int cmg = 0; cmg < cmgs; cmg++) free(segments[cmg]);
-    free(activation); free(digits);
+    free(activation); free(digits); free(packed_act);
     pthread_barrier_destroy(&start_barrier);
     pthread_barrier_destroy(&end_barrier);
     return errors ? 1 : 0;

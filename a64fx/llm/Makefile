@@ -161,9 +161,9 @@ $(BUILD)/test_qwen38_nvfp4_a15: $(LLM_DIR)test_qwen38_nvfp4_a15.c $(COMMON)/tran
 		$(LDFLAGS) -Wl,--gc-sections
 
 qwen38_nvfp4_packed_exact_test: $(BUILD)/test_qwen38_nvfp4_packed_exact
-$(BUILD)/test_qwen38_nvfp4_packed_exact: $(LLM_DIR)test_qwen38_nvfp4_packed_exact.c $(LLM_DIR)qwen38_nvfp4_pack.h $(LLM_DIR)qwen38_nvfp4_n3.c $(LLM_DIR)qwen38_nvfp4_n1.c $(COMMON)/transformer.h | $(BUILD)
+$(BUILD)/test_qwen38_nvfp4_packed_exact: $(LLM_DIR)test_qwen38_nvfp4_packed_exact.c $(LLM_DIR)qwen38_nvfp4_pack.h $(LLM_DIR)qwen38_nvfp4_n3.c $(LLM_DIR)qwen38_nvfp4_n1.c $(LLM_DIR)qwen38_nvfp4_packed_a8.c $(COMMON)/transformer.h | $(BUILD)
 	$(CC) $(CFLAGS) -O1 -ffunction-sections -fdata-sections -o $@ \
-		$(LLM_DIR)test_qwen38_nvfp4_packed_exact.c $(LLM_DIR)qwen38_nvfp4_n3.c $(LLM_DIR)qwen38_nvfp4_n1.c \
+		$(LLM_DIR)test_qwen38_nvfp4_packed_exact.c $(LLM_DIR)qwen38_nvfp4_n3.c $(LLM_DIR)qwen38_nvfp4_n1.c $(LLM_DIR)qwen38_nvfp4_packed_a8.c \
 		$(LDFLAGS) -Wl,--gc-sections
 
 qwen38_nvfp4_i16_super_test: $(BUILD)/test_qwen38_nvfp4_i16_super
