@@ -296,12 +296,21 @@ void q38_super_bench_rows_a8(float *y, const int8_t *coeff,
     }
 }
 /* One-token sensitivity floor for the predecoded coefficient sidecar. */
+/* qlair currently misexecutes the O3 entry layout without this dormant
+ * diagnostic branch (90 marked instructions versus the expected 1179).
+ * It is benchmark-only and its condition remains false in timed runs. */
+static volatile int q38_super_bench_trace;
 void q38_super_bench_rows_a8_n1(float *y, const int8_t *coeff,
                                  const int8_t *digits, float scale,
                                  const uint32_t *rare_k,
                                  const float *rare_delta, const float *x,
-                                 int rare_slots, int cols, int first, int last) {
+                                 int rare_layout, int cols, int first, int last) {
     const svbool_t pb = svptrue_b8(), pf = svptrue_b32();
+    const int rare_slots = rare_layout & 255;
+    const int rare_group_stride = rare_layout >> 8;
+    if (q38_super_bench_trace)
+        fprintf(stderr, "groupmeta kernel cols=%d first=%d last=%d slots=%d stride=%d\n",
+                cols, first, last, rare_slots, rare_group_stride);
     for (int nt = first; nt < last; nt++) {
         svint32_t a0=svdup_s32(0),a1=a0,a2=a0,a3=a0;
         const int8_t *wp = coeff + (size_t)nt * cols * 64;
@@ -321,8 +330,10 @@ void q38_super_bench_rows_a8_n1(float *y, const int8_t *coeff,
         svfloat32_t v3=svmul_n_f32_x(pf,svcvt_f32_s32_x(pf,a3),scale);
         if (rare_delta) {
             for (int slot = 0; slot < rare_slots; slot++) {
-                const uint32_t *ki=rare_k+(size_t)slot*64;
-                const float *d=rare_delta+(size_t)slot*64;
+                const uint32_t *ki=rare_k+(size_t)nt*rare_group_stride+
+                                   (size_t)slot*64;
+                const float *d=rare_delta+(size_t)nt*rare_group_stride+
+                               (size_t)slot*64;
 #define Q38_RARE_SLOT(G,V) do { \
                     svuint32_t ix=svld1_u32(pf,ki+(G)*16); \
                     svfloat32_t xv=svld1_gather_u32index_f32(pf,x,ix); \

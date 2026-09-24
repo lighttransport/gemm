@@ -53,6 +53,9 @@ static float rare_delta[64][16];
 static _Alignas(64) uint32_t rare_slot_k[16][64];
 static _Alignas(64) float rare_slot_delta[16][64];
 static int rare_slots;
+static int bench_groupmeta;
+static _Alignas(64) uint32_t rare_group_k[17408 / 64][2][64];
+static _Alignas(64) float rare_group_delta[17408 / 64][2][64];
 
 static void init_weights(packed_block *w, size_t blocks) {
     for (size_t b = 0; b < blocks; b++)
@@ -200,7 +203,11 @@ static int check_first_row(const uint8_t *weights, const float *y,
         }
         float actual = y[(size_t)c * local_rows];
         if (!isfinite(actual) || fabsf(actual - expected) >
-                0.0005f + 0.0005f * fabsf(expected)) return 0;
+                0.0005f + 0.0005f * fabsf(expected)) {
+            fprintf(stderr, "benchmark check row0 mode_repack=%d groupmeta=%d actual=%a expected=%a\n",
+                    bench_repack, bench_groupmeta, actual, expected);
+            return 0;
+        }
     }
     return 1;
 }
@@ -288,11 +295,15 @@ static void *run_worker(void *arg) {
                 if (!q38_nvfp4_packed_a8_rows(y, weights, packed_act,
                         digit_scale[0], local_rows, bench_cols)) worker->error = 1;
             } else if (bench_a8 && bench_n1) {
+                const uint32_t *rk = bench_groupmeta ?
+                    &rare_group_k[first][0][0] :
+                    (bench_rare ? &rare_slot_k[0][0] : NULL);
+                const float *rd = bench_groupmeta ?
+                    &rare_group_delta[first][0][0] :
+                    (bench_rare ? &rare_slot_delta[0][0] : NULL);
                 q38_super_bench_rows_a8_n1(y, (const int8_t *)weights,
-                    digits, digit_scale[0],
-                    bench_rare ? &rare_slot_k[0][0] : NULL,
-                    bench_rare ? &rare_slot_delta[0][0] : NULL,
-                    activation, rare_slots,
+                    digits, digit_scale[0], rk, rd, activation,
+                    rare_slots | ((bench_groupmeta ? 2 * 64 : 0) << 8),
                     bench_cols, 0, local_rows / 64);
             }
             else if (bench_a8)
@@ -311,6 +322,9 @@ static void *run_worker(void *arg) {
                     worker->error = 1;
         } else stream_sum ^= stream_weights((const uint8_t *)weights, bytes);
     }
+    if (bench_groupmeta && worker->error)
+        fprintf(stderr, "groupmeta setup failed tid=%d rows=%d\n",
+                tid, local_rows);
     pthread_barrier_wait(&start_barrier);
     __qlair_sim_start(0);
     worker->begin = ticks();
@@ -320,11 +334,15 @@ static void *run_worker(void *arg) {
                 if (!q38_nvfp4_packed_a8_rows(y, weights, packed_act,
                         digit_scale[0], local_rows, bench_cols)) worker->error = 1;
             } else if (bench_a8 && bench_n1) {
+                const uint32_t *rk = bench_groupmeta ?
+                    &rare_group_k[first][0][0] :
+                    (bench_rare ? &rare_slot_k[0][0] : NULL);
+                const float *rd = bench_groupmeta ?
+                    &rare_group_delta[first][0][0] :
+                    (bench_rare ? &rare_slot_delta[0][0] : NULL);
                 q38_super_bench_rows_a8_n1(y, (const int8_t *)weights,
-                    digits, digit_scale[0],
-                    bench_rare ? &rare_slot_k[0][0] : NULL,
-                    bench_rare ? &rare_slot_delta[0][0] : NULL,
-                    activation, rare_slots,
+                    digits, digit_scale[0], rk, rd, activation,
+                    rare_slots | ((bench_groupmeta ? 2 * 64 : 0) << 8),
                     bench_cols, 0, local_rows / 64);
             }
             else if (bench_a8)
@@ -368,23 +386,32 @@ int main(int argc, char **argv) {
                       strcmp(argv[1], "sdot8_1") &&
                       strcmp(argv[1], "repack8_1") &&
                       strcmp(argv[1], "repack8_rare1") &&
+                      strcmp(argv[1], "repack8_groupmeta1") &&
                       strcmp(argv[1], "repack8_stream") &&
                       strcmp(argv[1], "repack8_rare_stream") &&
+                      strcmp(argv[1], "repack8_groupmeta_stream") &&
                       strcmp(argv[1], "sdot8_stream"))) {
-        fprintf(stderr, "usage: %s compute|compute1|packed8_1|stream|stream1|sdot|sdot_stream|sdot8|sdot8_1|repack8_1|repack8_rare1|repack8_stream|repack8_rare_stream|sdot8_stream ROWS COLS CORES PASSES WARMUP\n", argv[0]);
+        fprintf(stderr, "usage: %s compute|compute1|packed8_1|stream|stream1|sdot|sdot_stream|sdot8|sdot8_1|repack8_1|repack8_rare1|repack8_groupmeta1|repack8_stream|repack8_rare_stream|repack8_groupmeta_stream|sdot8_stream ROWS COLS CORES PASSES WARMUP\n", argv[0]);
         return 2;
     }
     bench_compute = !strcmp(argv[1], "compute") || !strcmp(argv[1], "compute1") || !strcmp(argv[1], "packed8_1") || !strcmp(argv[1], "sdot") ||
                     !strcmp(argv[1], "sdot8") || !strcmp(argv[1], "sdot8_1") ||
                     !strcmp(argv[1], "repack8_1") ||
-                    !strcmp(argv[1], "repack8_rare1");
+                    !strcmp(argv[1], "repack8_rare1") ||
+                    !strcmp(argv[1], "repack8_groupmeta1");
     bench_pack_a8 = !strcmp(argv[1], "packed8_1");
     bench_repack = !strcmp(argv[1], "repack8_1") ||
                    !strcmp(argv[1], "repack8_stream") ||
                    !strcmp(argv[1], "repack8_rare1") ||
-                   !strcmp(argv[1], "repack8_rare_stream");
+                   !strcmp(argv[1], "repack8_rare_stream") ||
+                   !strcmp(argv[1], "repack8_groupmeta1") ||
+                   !strcmp(argv[1], "repack8_groupmeta_stream");
     bench_rare = !strcmp(argv[1], "repack8_rare1") ||
-                 !strcmp(argv[1], "repack8_rare_stream");
+                 !strcmp(argv[1], "repack8_rare_stream") ||
+                 !strcmp(argv[1], "repack8_groupmeta1") ||
+                 !strcmp(argv[1], "repack8_groupmeta_stream");
+    bench_groupmeta = !strcmp(argv[1], "repack8_groupmeta1") ||
+                      !strcmp(argv[1], "repack8_groupmeta_stream");
     bench_n1 = !strcmp(argv[1], "compute1") || !strcmp(argv[1], "stream1") ||
                !strcmp(argv[1], "sdot8_1") || bench_pack_a8 || bench_repack;
     bench_a8 = !strcmp(argv[1], "sdot8") || !strcmp(argv[1], "sdot8_1") ||
@@ -452,6 +479,20 @@ int main(int argc, char **argv) {
             for (size_t group = 1; group < cmg_groups; group++)
                 memcpy(segments[cmg] + group * group_bytes,
                        segments[cmg], group_bytes);
+            if (bench_groupmeta) {
+                if (rare_slots > 2) {
+                    fprintf(stderr, "group metadata needs %d slots, capacity is 2\n", rare_slots);
+                    return 1;
+                }
+                size_t first_group = (size_t)groups * cmg / cmgs;
+                for (size_t group = 0; group < cmg_groups; group++) {
+                    size_t global_group = first_group + group;
+                    memcpy(rare_group_k[global_group], rare_slot_k,
+                           sizeof(rare_group_k[global_group]));
+                    memcpy(rare_group_delta[global_group], rare_slot_delta,
+                           sizeof(rare_group_delta[global_group]));
+                }
+            }
         } else if (bench_sdot) {
             for (size_t i = 0; i < bytes; i++)
                 segments[cmg][i] = (uint8_t)((int)((i * 37 + cmg * 11) % 241) - 120);

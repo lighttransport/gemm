@@ -880,6 +880,51 @@ exact FP32 logits or generated-token identity. No local NVFP4 27B GGUF or
 load-time replacement of packed weights, 32 GB HBM capacity, real-model
 identity, and native throughput remain open.
 
+### Distinct-address sparse metadata gate
+
+`repack8_groupmeta1` now places each 64-row group's correction indices and
+FP32 deltas at a separate address and advances the metadata pointer alongside
+the K-major coefficient stream. Each group reserves two slots (128 indices
+and 128 deltas, 1 KiB); the repack validates that the rare-scale synthetic
+fixture needs no more than two. At 6144x5120 this is 96 KiB of metadata in
+addition to 30 MiB of signed-byte coefficients. The coefficient and metadata
+*values* are still copied from a single synthetic FP4 source group, not loaded
+from distinct real model weights. The matched `repack8_groupmeta_stream` scans
+the coefficient bytes only, so it is an approximate bandwidth ceiling rather
+than an identical instruction/traffic baseline.
+
+The full-shape all-row independent FP4-source check passes under SVE QEMU
+(`correct=1`). In the 12-core qlair one-CMG run with one warmup, three
+compact-metadata repetitions delivered **182.2, 201.4, and 201.4 GB/s HBM2**
+with `correct=1` and 1,729,044 marked instructions each. The matched
+coefficient scan delivered **226.2 GB/s**; the repeated 201.4 result is 89%
+of that scan. Thus the fused SDOT-plus-sparse-correction path reaches the
+one-CMG bandwidth regime in this simulator, including separate group
+metadata addresses, but the observed variation means 200+ GB/s is not yet
+a guaranteed floor. The previous 16-slot-stride group-metadata run delivered
+192.6 GB/s.
+
+Qlair currently misexecutes the clean O2/O3 kernel entry layout for this
+group-metadata case (only 90–92 marked instructions and `correct=0`). A
+dormant volatile diagnostic branch in the benchmark-only kernel restores
+normal execution (1179 instructions on the 128x128 check); the branch is
+false in the timed runs. This is a simulator/code-layout sensitivity, not a
+native-A64FX validation. Do not accept a qlair bandwidth result without
+checking both `correct=1` and the marked instruction count.
+
+```sh
+Q38_QLAIR_CHECK_ALL=1 Q38_QLAIR_NO_MBIND=1 \
+  qemu-aarch64 -cpu max,sve512=on -L /usr/aarch64-linux-gnu \
+  tmp/bench_qwen38_nvfp4_qlair repack8_groupmeta1 6144 5120 12 1 0
+Q=~/work/clair/a64fx/build-inference/qlair
+for mode in repack8_groupmeta1 repack8_groupmeta_stream; do
+  "$Q" --cores 12 --profile-markers \
+    --profile-report "tmp/q38-fp4-qlair-6144-${mode}.json" \
+    --profile-format json -n 3G tmp/bench_qwen38_nvfp4_qlair \
+    -- "$mode" 6144 5120 12 1 1
+done
+```
+
 ```sh
 Q=~/work/clair/a64fx/build-inference/qlair
 for mode in repack8_1 repack8_stream; do
