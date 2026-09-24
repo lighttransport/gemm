@@ -1027,3 +1027,31 @@ for mode in packed64_1 packed64_stream; do
     -- "$mode" 6144 5120 12 1 1
 done
 ```
+
+### Same-size 8-row SoA repack check
+
+`qwen38_nvfp4_packed8soa_a8.c` tests whether the original 96-byte
+subblocks' interleaved 64 code bytes and 32 FP32 scale bytes limit the
+compact W4A8 kernel. At load time it groups four code vectors (256 bytes)
+ahead of four scale vectors (128 bytes) in each 8-row x 64-column tile;
+the tile remains **384 bytes**. The one-token kernel otherwise keeps the
+same SVE table-lookup, SDOT, and final activation-scale arithmetic as the
+optimized `packed8_1` path. Synthetic tiles are repacked before the marked
+region, and the full 6144x5120 independent-source check passes for every
+row under SVE QEMU.
+
+One complete 12-core qlair run reached **119.9 GB/s HBM2** with
+`correct=1`; the matched SoA byte scan reached **223.5 GB/s**. This is
+within the 117.5–121.7 GB/s range of the existing packed-8 path, so
+separating code and scale storage alone did not address the roughly 2x
+decode-versus-scan gap. Both SoA modes are experimental and do not replace
+the production packed-8 path. The next compact optimization must reduce
+unpack/scale computation or its dependency path, not merely regroup the
+same 384 bytes.
+
+Build `qwen38_nvfp4_packed8soa_a8.c` with Clang
+`-O3 -march=armv8.2-a+sve` and link its object into the benchmark. The gates
+used `packed8soa_1 6144 5120 12 1 0` under SVE QEMU with
+`Q38_QLAIR_CHECK_ALL=1 Q38_QLAIR_NO_MBIND=1`, then `packed8soa_1` and
+`packed8soa_stream` with `6144 5120 12 1 1` under qlair
+`--cores 12 --profile-markers -n 3G`.
