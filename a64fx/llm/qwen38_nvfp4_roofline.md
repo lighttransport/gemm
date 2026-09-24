@@ -1195,3 +1195,17 @@ next compact-kernel optimization should reduce SVE instruction and execution
 pipeline pressure before tuning prefetch or HBM placement. FAPP itself slows
 and skews the threaded timers, so use its event counts for diagnosis and
 uninstrumented runs for throughput claims.
+
+### Expanded execution layouts and verified local HBM
+
+The subsequent [5/6-bit layout study](qwen38_nvfp4_expanded.md) reaches
+219 GB/s logical source throughput and 221 GB/s FAPP HBM reads per CMG for
+a half-predecoded 6-bit payload (480-byte tile including metadata).
+Four-CMG throughput is 852–859 GB/s, 97–99% of matched scans, with 6–9%
+less projection time than the 352-byte compact integer-scale format.
+The study also found that allocation could populate pages on a different
+CMG before the existing `mbind`; pinning initialization before allocation
+and checking physical page placement fixes the launch-dependent scan rate.
+This placement issue is a confounder in the older unverified native/FAPP
+comparisons above. The simulator gate and real-model 40 tok/s goal remain
+unmet; the linked note contains the measured tradeoffs and limitations.

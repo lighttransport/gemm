@@ -44,6 +44,16 @@ extern int q38_nvfp4_packed8soa_a8_rows(float *, const void *,
 extern int q38_nvfp4_packed8_iscale_repack(void *, const void *, int);
 extern int q38_nvfp4_packed8_iscale_a8_rows(float *, const void *,
                                             const packed_a8_act *, float, int, int);
+extern int q38_nvfp4_packed5_repack(void *, const void *, int);
+extern int q38_nvfp4_packed6_repack(void *, const void *, int);
+extern int q38_nvfp4_packed5_a8_rows(float *, const void *,
+                                     const packed_a8_act *, float, int, int);
+extern int q38_nvfp4_packed6_a8_rows(float *, const void *,
+                                     const packed_a8_act *, float, int, int);
+static int (*iscale_repack)(void *, const void *, int);
+static int (*iscale_rows)(float *, const void *, const packed_a8_act *,
+                          float, int, int);
+static size_t iscale_block_bytes;
 __attribute__((noinline)) void __qlair_sim_start(unsigned long id) {
     (void)id; __asm__ volatile("" ::: "memory");
 }
@@ -355,7 +365,7 @@ static void *run_worker(void *arg) {
     int local_rows = (last - first) * group_rows;
     size_t group_bytes = bench_sdot ? (size_t)bench_cols * 64 :
                          bench_pack64 ? (size_t)bench_cols * 48 :
-                         bench_iscale ? (size_t)nb * 352 :
+                         bench_iscale ? (size_t)nb * iscale_block_bytes :
                                         (size_t)nb * sizeof(packed_block);
     uint8_t *weights = segments[cmg] + (size_t)(first - cmg_first) * group_bytes;
     size_t bytes = (size_t)(last - first) * group_bytes;
@@ -379,7 +389,7 @@ static void *run_worker(void *arg) {
     for (int rep = 0; rep < bench_warmup && !worker->error; rep++) {
         if (bench_compute) {
             if (bench_iscale) {
-                if (!q38_nvfp4_packed8_iscale_a8_rows(y, weights, packed_act,
+                if (!iscale_rows(y, weights, packed_act,
                         digit_scale[0], local_rows, bench_cols)) worker->error = 1;
             } else if (bench_pack8soa) {
                 if (!q38_nvfp4_packed8soa_a8_rows(y, weights, packed_act,
@@ -430,7 +440,7 @@ static void *run_worker(void *arg) {
     for (int rep = 0; rep < bench_passes && !worker->error; rep++) {
         if (bench_compute) {
             if (bench_iscale) {
-                if (!q38_nvfp4_packed8_iscale_a8_rows(y, weights, packed_act,
+                if (!iscale_rows(y, weights, packed_act,
                         digit_scale[0], local_rows, bench_cols)) worker->error = 1;
             } else if (bench_pack8soa) {
                 if (!q38_nvfp4_packed8soa_a8_rows(y, weights, packed_act,
@@ -498,6 +508,10 @@ int main(int argc, char **argv) {
                       strcmp(argv[1], "packed8soa_stream") &&
                       strcmp(argv[1], "packed8_iscale1") &&
                       strcmp(argv[1], "packed8_iscale_stream") &&
+                      strcmp(argv[1], "packed5_1") &&
+                      strcmp(argv[1], "packed5_stream") &&
+                      strcmp(argv[1], "packed6_1") &&
+                      strcmp(argv[1], "packed6_stream") &&
                       strcmp(argv[1], "packed64_1") &&
                       strcmp(argv[1], "packed64_stream") &&
                       strcmp(argv[1], "stream") &&
@@ -514,6 +528,7 @@ int main(int argc, char **argv) {
                       strcmp(argv[1], "repack8_groupmeta_stream") &&
                       strcmp(argv[1], "sdot8_stream"))) {
         fprintf(stderr, "usage: %s compute|compute1|packed8_1|packed8soa_1|packed8soa_stream|packed8_iscale1|packed8_iscale_stream|packed64_1|packed64_stream|stream|stream1|sdot|sdot_stream|sdot8|sdot8_1|repack8_1|repack8_rare1|repack8_groupmeta1|repack8_stream|repack8_rare_stream|repack8_groupmeta_stream|sdot8_stream ROWS COLS CORES PASSES WARMUP\n", argv[0]);
+        fprintf(stderr, "expanded modes: packed5_1|packed5_stream|packed6_1|packed6_stream\n");
         return 2;
     }
 #ifdef Q38_FAPP
@@ -529,6 +544,22 @@ int main(int argc, char **argv) {
                      !strcmp(argv[1], "packed8soa_stream");
     bench_iscale = !strcmp(argv[1], "packed8_iscale1") ||
                    !strcmp(argv[1], "packed8_iscale_stream");
+    iscale_repack = q38_nvfp4_packed8_iscale_repack;
+    iscale_rows = q38_nvfp4_packed8_iscale_a8_rows;
+    iscale_block_bytes = 352;
+    if (!strcmp(argv[1], "packed5_1") || !strcmp(argv[1], "packed5_stream")) {
+        bench_iscale = 1;
+        bench_compute = !strcmp(argv[1], "packed5_1");
+        iscale_repack = q38_nvfp4_packed5_repack;
+        iscale_rows = q38_nvfp4_packed5_a8_rows;
+        iscale_block_bytes = 416;
+    } else if (!strcmp(argv[1], "packed6_1") || !strcmp(argv[1], "packed6_stream")) {
+        bench_iscale = 1;
+        bench_compute = !strcmp(argv[1], "packed6_1");
+        iscale_repack = q38_nvfp4_packed6_repack;
+        iscale_rows = q38_nvfp4_packed6_a8_rows;
+        iscale_block_bytes = 480;
+    }
     bench_pack64 = !strcmp(argv[1], "packed64_1") ||
                    !strcmp(argv[1], "packed64_stream");
     bench_repack = !strcmp(argv[1], "repack8_1") ||
@@ -567,7 +598,7 @@ int main(int argc, char **argv) {
     int cmgs = (bench_cores + 11) / 12;
     size_t group_bytes = bench_sdot ? (size_t)bench_cols * 64 :
                          bench_pack64 ? (size_t)bench_cols * 48 :
-                         bench_iscale ? (size_t)nb * 352 :
+                         bench_iscale ? (size_t)nb * iscale_block_bytes :
                                         (size_t)nb * sizeof(packed_block);
     size_t total_bytes = (size_t)groups * group_bytes;
     for (int cmg = 0; cmg < cmgs; cmg++) {
@@ -575,6 +606,17 @@ int main(int argc, char **argv) {
                                      groups * cmg / cmgs);
         size_t bytes = cmg_groups * group_bytes;
         size_t alloc = (bytes + 2097151) & ~(size_t)2097151;
+        /* Fugaku's allocator can populate large pages before mbind below.
+         * Select the owning CMG before allocation as well as first touch. */
+        if (!getenv("Q38_QLAIR_NO_MBIND")) {
+            cpu_set_t init_mask;
+            CPU_ZERO(&init_mask);
+            CPU_SET(12 + cmg * 12, &init_mask);
+            if (sched_setaffinity(0, sizeof(init_mask), &init_mask)) {
+                perror("initialization affinity");
+                return 1;
+            }
+        }
         if (posix_memalign((void **)&segments[cmg], 2097152, alloc)) return 1;
         if (!getenv("Q38_QLAIR_NO_MBIND")) {
             unsigned long nodes = 1UL << (4 + cmg);
@@ -585,8 +627,7 @@ int main(int argc, char **argv) {
         }
         if (bench_iscale) {
             init_weights(repack_source, (size_t)nb);
-            if (!q38_nvfp4_packed8_iscale_repack(segments[cmg],
-                                                  repack_source, nb)) return 1;
+            if (!iscale_repack(segments[cmg], repack_source, nb)) return 1;
             for (size_t group = 1; group < cmg_groups; group++)
                 memcpy(segments[cmg] + group * group_bytes,
                        segments[cmg], group_bytes);
@@ -653,6 +694,20 @@ int main(int argc, char **argv) {
             for (size_t i = 0; i < bytes; i++)
                 segments[cmg][i] = (uint8_t)((int)((i * 37 + cmg * 11) % 241) - 120);
         } else init_weights((packed_block *)segments[cmg], cmg_groups * nb);
+        if (getenv("Q38_QLAIR_DIAG_PLACEMENT")) {
+            fprintf(stderr, "placement cmg=%d init_cpu=%d nodes=", cmg, sched_getcpu());
+            for (size_t off = 0; off < bytes; off += 2097152) {
+                int node = -1;
+                long rc = syscall(SYS_get_mempolicy, &node, NULL, 0UL,
+                                  segments[cmg] + off, 3UL);
+                fprintf(stderr, "%s%d", off ? "," : "", rc ? -1 : node);
+                if (rc || node != 4 + cmg) {
+                    fprintf(stderr, " unexpected HBM placement at offset %zu\n", off);
+                    return 1;
+                }
+            }
+            fputc('\n', stderr);
+        }
     }
     if (posix_memalign((void **)&activation, 256,
                        (size_t)3 * bench_cols * sizeof(float))) return 1;

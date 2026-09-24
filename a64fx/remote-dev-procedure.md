@@ -159,6 +159,13 @@ allocation; `exit` releases it. Check `pjstat` before launching another job so
 an old batch allocation does not run concurrently. For FAPP, collect with
 `fapp` on the compute node and decode with `fapppx` on the frontend.
 
+For CMG bandwidth tests, pin the initializing thread to its target CMG
+**before allocating and touching weights**. A successful `mbind` with no
+migration flag does not prove that already populated pages moved: in job
+51891531 this produced node-5 weights for node-4 workers and halved scan
+bandwidth. The Qwen layout benchmark's `Q38_QLAIR_DIAG_PLACEMENT=1` checks
+physical page nodes and rejects incorrect placement.
+
 ### Batch/persistent bridge for unattended or long runs
 
 Use the bash-over-HTTP batch bridge only when an interactive shell is not

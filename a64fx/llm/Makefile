@@ -171,6 +171,29 @@ $(BUILD)/test_qwen38_nvfp4_i16_super: $(LLM_DIR)test_qwen38_nvfp4_i16_super.c $(
 	$(CC) $(CFLAGS) -o $@ $(LLM_DIR)test_qwen38_nvfp4_i16_super.c \
 		$(LLM_DIR)qwen38_nvfp4_i16_super.c $(LDFLAGS)
 
+# Standalone execution-layout study; keep the setup at O1 and hot kernels at O3.
+Q38_LAYOUT_NAMES := n3 n1 i16_super packed_a8 packed64_a8 packed8soa_a8 packed8_iscale_a8 expanded_a8
+Q38_LAYOUT_OBJS := $(addprefix $(BUILD)/q38_layout_,$(addsuffix .o,$(Q38_LAYOUT_NAMES)))
+Q38_LAYOUT_CFLAGS := $(filter-out -g -rdynamic -ffp-contract=fast,$(CFLAGS)) -Wall -Wextra -Wpedantic
+Q38_LAYOUT_PROFILE_FLAGS :=
+Q38_LAYOUT_PROFILE_LIBS :=
+ifdef Q38_FAPP
+Q38_LAYOUT_PROFILE_FLAGS := -DQ38_FAPP
+Q38_LAYOUT_PROFILE_LIBS := -lfjprofcore
+endif
+.PHONY: qwen38_nvfp4_layout_bench qwen38_nvfp4_expanded_test
+Q38_LAYOUT_BENCH := $(BUILD)/bench_qwen38_nvfp4_qlair$(if $(Q38_FAPP),_fapp)
+qwen38_nvfp4_layout_bench: $(Q38_LAYOUT_BENCH)
+qwen38_nvfp4_expanded_test: $(BUILD)/test_qwen38_nvfp4_expanded_a8
+$(BUILD)/q38_layout_%.o: $(LLM_DIR)qwen38_nvfp4_%.c | $(BUILD)
+	$(CC) $(Q38_LAYOUT_CFLAGS) -O3 -DQ38_SUPER_BENCH -c $< -o $@
+$(BUILD)/q38_layout_bench$(if $(Q38_FAPP),_fapp).o: $(LLM_DIR)bench_qwen38_nvfp4_qlair.c | $(BUILD)
+	$(CC) $(filter-out -D_GNU_SOURCE,$(Q38_LAYOUT_CFLAGS)) -O1 $(Q38_LAYOUT_PROFILE_FLAGS) -c $< -o $@
+$(Q38_LAYOUT_BENCH): $(BUILD)/q38_layout_bench$(if $(Q38_FAPP),_fapp).o $(Q38_LAYOUT_OBJS)
+	$(CC) $(Q38_LAYOUT_CFLAGS) $^ $(LDFLAGS) $(Q38_LAYOUT_PROFILE_LIBS) -o $@
+$(BUILD)/test_qwen38_nvfp4_expanded_a8: $(LLM_DIR)test_qwen38_nvfp4_expanded_a8.c $(BUILD)/q38_layout_expanded_a8.o $(BUILD)/q38_layout_packed_a8.o $(BUILD)/q38_layout_packed8_iscale_a8.o
+	$(CC) $(Q38_LAYOUT_CFLAGS) -O2 $^ $(LDFLAGS) -o $@
+
 qwen38_nvfp4_roofline: $(BUILD)/qwen38_nvfp4_roofline
 $(BUILD)/qwen38_nvfp4_roofline: $(LLM_DIR)qwen38_nvfp4_roofline.c $(COMMON)/gguf_loader.h | $(BUILD)
 	$(HOSTCC) -O2 -std=c11 -D_GNU_SOURCE -I$(COMMON) -o $@ $< -lm
