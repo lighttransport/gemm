@@ -1096,3 +1096,19 @@ for rows in 17408 15360; do
   done
 done
 ```
+
+### Compact 16-row full-lane experiment
+
+A temporary same-byte-count repack grouped two 8-row compact tiles into one
+16-row tile so all 16 FP32 lanes held distinct output rows. It retained the
+384-byte payload per eight rows and 64 columns (768 bytes per new tile). On a
+full 6144 x 5120 independent-source check, every row matched under SVE QEMU.
+The full-size 12-core qlair run crashed, so no full-shape throughput is
+claimed. A smaller 3072 x 5120 run completed with `correct=1` and 70.0 GB/s
+HBM2; the existing packed-8 kernel in the same linked binary and shape reached
+112.9 GB/s.
+Splitting four SDOTs into independent accumulators also passed the all-row
+check but regressed to 64.7 GB/s. Filling the FP32 lanes by doubling the row
+tile is therefore not enough to remove the compact FP4 decode bottleneck.
+The slower experimental code was removed from `a64fx/llm/`; its build and
+profiles remain under repository `tmp/` for inspection.
