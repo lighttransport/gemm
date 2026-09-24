@@ -912,6 +912,17 @@ false in the timed runs. This is a simulator/code-layout sensitivity, not a
 native-A64FX validation. Do not accept a qlair bandwidth result without
 checking both `correct=1` and the marked instruction count.
 
+A sustained four-marked-pass comparison over the same 30 MiB sidecar gave
+**197.8 GB/s** for the fused kernel and **229.5 GB/s** for the matched
+coefficient scan (`correct=1` for both). The kernel therefore uses 86% of
+the scan's bandwidth in this longer run; the earlier 200+ GB/s one-pass
+results should not be interpreted as a sustained minimum. Two experimental
+changes were rejected: a bounded 4 KiB-ahead prefetch reached 191.8 GB/s
+in one full-shape run while increasing marked instructions from 1.73M to
+2.17M; a two-step K-loop unroll reached 126.8 GB/s, or 143.5 GB/s with
+two independent SDOT accumulator banks. Both unrolls passed the small
+all-row qlair correctness gate. The checked-in kernel remains unchanged.
+
 ```sh
 Q38_QLAIR_CHECK_ALL=1 Q38_QLAIR_NO_MBIND=1 \
   qemu-aarch64 -cpu max,sve512=on -L /usr/aarch64-linux-gnu \
@@ -924,6 +935,9 @@ for mode in repack8_groupmeta1 repack8_groupmeta_stream; do
     -- "$mode" 6144 5120 12 1 1
 done
 ```
+
+For the sustained group-metadata comparison, run these two modes with
+`-n 8G` and `6144 5120 12 4 1` after `--`.
 
 ```sh
 Q=~/work/clair/a64fx/build-inference/qlair
