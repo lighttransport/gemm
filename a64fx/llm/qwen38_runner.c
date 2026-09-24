@@ -473,7 +473,18 @@ static void usage(const char *p) {
                     "[--fast-swiglu] [--nvfp4-fast] [--nvfp4-packed] [--nvfp4-packed-exact] [--nvfp4-exact-tiled] [--nvfp4-compact-a15] [--nextn-exact-tiled] [--q6-exact-head] [--target-head-rows N] [--i16-super-gates N] [--q8-mode auto|reference|cmg4|cmg4-a15|block64|block64-ffn|block64-exact|row] "
                     "[--bench --bench-prompt N[,N...] --bench-gen N[,N...] "
                     "--bench-runs N --bench-warmup N --bench-csv]\n", p);
+#ifdef TF_HAVE_Q38_LOWBIT
+    fprintf(stderr, "       [--lowbit fp4|fp6 --lowbit-activation f32|a8|a16] "
+                    "[--lowbit-image PATH | --lowbit-write-image PATH] "
+                    "[--lowbit-no-numa (portable validation only)]\n");
+#endif
 }
+
+#ifdef TF_HAVE_Q38_LOWBIT
+#define Q38_CLOSE_GGUF(g) do { q38_lowbit_model_free(lowbit_model); lowbit_model = NULL; gguf_close(g); } while (0)
+#else
+#define Q38_CLOSE_GGUF(g) gguf_close(g)
+#endif
 
 int main(int argc, char **argv) {
     const char *path = NULL, *prompt = "Hello";
@@ -494,7 +505,38 @@ int main(int argc, char **argv) {
     int bench_prompt_sizes[QWEN38_BENCH_MAX_CASES];
     int bench_gen_sizes[QWEN38_BENCH_MAX_CASES];
     int n_bench_prompt = 0, n_bench_gen = 0;
+#ifdef TF_HAVE_Q38_LOWBIT
+    int lowbit_format = 0, lowbit_arithmetic = 0, lowbit_numa = 1;
+    const char *lowbit_image = NULL, *lowbit_write_image = NULL;
+    q38_lowbit_model *lowbit_model = NULL;
+#endif
     for (int i = 1; i < argc; i++) {
+#ifdef TF_HAVE_Q38_LOWBIT
+        if (!strcmp(argv[i], "--lowbit")) {
+            if (++i >= argc) { usage(argv[0]); return 2; }
+            if (!strcmp(argv[i], "fp4")) lowbit_format = Q38_LB_NVFP4;
+            else if (!strcmp(argv[i], "fp6")) lowbit_format = Q38_LB_FP6_E2M3;
+            else { usage(argv[0]); return 2; }
+            continue;
+        }
+        if (!strcmp(argv[i], "--lowbit-activation")) {
+            if (++i >= argc) { usage(argv[0]); return 2; }
+            if (!strcmp(argv[i], "f32")) lowbit_arithmetic = Q38_LB_F32;
+            else if (!strcmp(argv[i], "a8")) lowbit_arithmetic = Q38_LB_A8;
+            else if (!strcmp(argv[i], "a16")) lowbit_arithmetic = Q38_LB_A16;
+            else { usage(argv[0]); return 2; }
+            continue;
+        }
+        if (!strcmp(argv[i], "--lowbit-no-numa")) { lowbit_numa = 0; continue; }
+        if (!strcmp(argv[i], "--lowbit-image")) {
+            if (++i >= argc) { usage(argv[0]); return 2; }
+            lowbit_image = argv[i]; continue;
+        }
+        if (!strcmp(argv[i], "--lowbit-write-image")) {
+            if (++i >= argc) { usage(argv[0]); return 2; }
+            lowbit_write_image = argv[i]; continue;
+        }
+#endif
         if (!strcmp(argv[i], "--prompt") && ++i < argc) prompt = argv[i];
         else if (!strcmp(argv[i], "--max-gen") && ++i < argc) max_gen = atoi(argv[i]);
         else if (!strcmp(argv[i], "--max-seq") && ++i < argc) max_seq = atoi(argv[i]);
@@ -607,6 +649,34 @@ int main(int argc, char **argv) {
         }
         free(resolved);
     }
+#ifdef TF_HAVE_Q38_LOWBIT
+    if (lowbit_format && (spec_k || spec_verify || batch_probe || kernel_probe ||
+        a15_probe || nextn_tile_probe || nextn_exact_tiled || q6_exact_head ||
+        nvfp4_fast || nvfp4_packed || nvfp4_exact_tiled || nvfp4_compact_a15 ||
+        i16_super_gates || fast_swiglu || target_head_rows || draft_head_rows ||
+        mmap_weights || strcmp(q8_mode, "auto") || (lowbit_numa && threads != 48))) {
+        fprintf(stderr, "qwen38: lowbit requires serial decode, full head, exact SiLU, "
+                        "its own layout and 48 workers for NUMA placement\n");
+        return 2;
+    }
+    if (!lowbit_format && (lowbit_arithmetic || !lowbit_numa || lowbit_image || lowbit_write_image)) {
+        fprintf(stderr, "qwen38: lowbit options require --lowbit\n"); return 2;
+    }
+    if (lowbit_image && lowbit_write_image) {
+        fprintf(stderr, "qwen38: select either image input or image output\n"); return 2;
+    }
+    if (lowbit_format) {
+        setenv("GGUF_LAZY_MMAP", "1", 1);
+        /* NUMA_DISTRIBUTE otherwise makes gguf_open silently materialize any
+         * source shard that fits RAM, before our bounded conversion starts. */
+        setenv("TF_FORCE_MMAP", "1", 1);
+        setenv("TF_KV_DTYPE", "f32", 1);
+        if (lowbit_numa) {
+            setenv("NUMA_DISTRIBUTE", "1", 1);
+            setenv("NUMA_N_CMGS", "4", 1);
+        }
+    }
+#endif
     double load0 = now_sec();
     /* Inspect through a lazy mapping first. Q8 cannot afford a full anonymous
      * GGUF allocation, while smaller formats are reopened through the normal
@@ -619,12 +689,31 @@ int main(int argc, char **argv) {
         if (g->tensors[i].type == GGML_TYPE_Q8_0 && g->tensors[i].n_dims >= 2)
             q8_tensors++;
     int q8_model = q8_tensors > 100;
-    if (!q8_model && !mmap_weights) {
-        gguf_close(g);
+    if (!q8_model && !mmap_weights
+#ifdef TF_HAVE_Q38_LOWBIT
+        && !lowbit_format
+#endif
+       ) {
+        Q38_CLOSE_GGUF(g);
         if (nvfp4_packed) setenv("TF_NVFP4_PACK_SPACE", "1", 1);
         g = gguf_open_multi(path, 0);
         if (!g) return 1;
     }
+#ifdef TF_HAVE_Q38_LOWBIT
+    if (lowbit_format) {
+        lowbit_model = lowbit_image ? q38_lowbit_model_load_image(g, lowbit_format,
+            lowbit_arithmetic, lowbit_numa, (size_t)6 * 1024 * 1024 * 1024, lowbit_image) :
+            q38_lowbit_model_load(g, lowbit_format, lowbit_arithmetic,
+                                 lowbit_numa, (size_t)6 * 1024 * 1024 * 1024);
+        if (!lowbit_model) { Q38_CLOSE_GGUF(g); return 1; }
+        if (lowbit_write_image && !q38_lowbit_model_save_image(lowbit_model, lowbit_write_image)) {
+            Q38_CLOSE_GGUF(g); return 1;
+        }
+        fprintf(stderr, "qwen38: lowbit format=%s activation=%s single-node N=1 KV=F32\n",
+            lowbit_format == Q38_LB_NVFP4 ? "NVFP4" : "FP6_E2M3",
+            lowbit_arithmetic == 8 ? "A8" : lowbit_arithmetic == 16 ? "A16" : "F32_reference");
+    }
+#endif
     bpe_vocab *v = bpe_vocab_load(g);
     transformer_model *m = transformer_load(g, max_seq);
     if (!v || !m) return 1;
@@ -683,6 +772,15 @@ int main(int argc, char **argv) {
     }
 #endif
     size_t q8_resident = 0;
+#ifdef TF_HAVE_Q38_LOWBIT
+    if (lowbit_format) {
+        if (m->use_moe || !m->is_hybrid) {
+            fprintf(stderr, "qwen38: lowbit runner requires dense Qwen hybrid model\n");
+            return 1;
+        }
+        if (lowbit_numa) tf_numa_init(m);
+    } else
+#endif
     if (q8_model && !mmap_weights) {
         if (spec_k) {
             fprintf(stderr, "qwen38: selective Q8 residency currently requires --spec-k 0\n");
@@ -770,19 +868,19 @@ int main(int argc, char **argv) {
             mmap_weights ? "mmap" : (q8_resident ? "selective-q8" : "anonymous"));
     if (kernel_probe) {
         int rc = run_kernel_probe(m, kernel_probe, kernel_probe_check);
-        transformer_free(m); bpe_vocab_free(v); gguf_close(g);
+        transformer_free(m); bpe_vocab_free(v); Q38_CLOSE_GGUF(g);
         return rc;
     }
     if (a15_probe) {
         int rc = run_a15_probe(m, a15_probe);
-        transformer_free(m); bpe_vocab_free(v); gguf_close(g);
+        transformer_free(m); bpe_vocab_free(v); Q38_CLOSE_GGUF(g);
         return rc;
     }
     if (getenv("TF_NULL_GEMM") && atoi(getenv("TF_NULL_GEMM")) == 2) {
         transformer_null_stream_bench(m, 3);
         transformer_free(m);
         bpe_vocab_free(v);
-        gguf_close(g);
+        Q38_CLOSE_GGUF(g);
         return 0;
     }
     if (spec_k && !m->nextn.loaded) {
@@ -795,7 +893,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "qwen38: token buffer allocation failed\n");
         transformer_free(m);
         bpe_vocab_free(v);
-        gguf_close(g);
+        Q38_CLOSE_GGUF(g);
         return 1;
     }
     if (bench) {
@@ -806,7 +904,7 @@ int main(int argc, char **argv) {
         free(tok);
         transformer_free(m);
         bpe_vocab_free(v);
-        gguf_close(g);
+        Q38_CLOSE_GGUF(g);
         return rc;
     }
 
@@ -855,7 +953,7 @@ int main(int argc, char **argv) {
     tf_target_head_rows = target_head_rows;
     if (nextn_tile_probe) {
         int rc = run_nextn_tile_probe(m, cur, nt - 1);
-        free(tok); transformer_free(m); bpe_vocab_free(v); gguf_close(g);
+        free(tok); transformer_free(m); bpe_vocab_free(v); Q38_CLOSE_GGUF(g);
         return rc;
     }
     if (spec_verify) {
@@ -865,7 +963,7 @@ int main(int argc, char **argv) {
         }
         int dump = getenv("TF_DUMP_TOKENS") && atoi(getenv("TF_DUMP_TOKENS")) != 0;
         int rc = q38_spec_verify(m, v, nt, cur, logits[cur], max_gen, spec_k, dump);
-        free(tok); transformer_free(m); bpe_vocab_free(v); gguf_close(g);
+        free(tok); transformer_free(m); bpe_vocab_free(v); Q38_CLOSE_GGUF(g);
         return rc;
     }
     if (batch_probe) {
@@ -926,7 +1024,7 @@ int main(int argc, char **argv) {
                 profile.out_proj_ms, profile.ffn_proj_ms, profile.ffn_act_ms,
                 profile.ffn_down_ms);
         free(serial); free(batch); free(tok);
-        transformer_free(m); bpe_vocab_free(v); gguf_close(g);
+        transformer_free(m); bpe_vocab_free(v); Q38_CLOSE_GGUF(g);
         return ok && match == batch_probe ? 0 : 1;
     }
     int dump_tokens = getenv("TF_DUMP_TOKENS") && atoi(getenv("TF_DUMP_TOKENS")) != 0;
@@ -1023,6 +1121,6 @@ int main(int argc, char **argv) {
     free(tok);
     transformer_free(m);
     bpe_vocab_free(v);
-    gguf_close(g);
+    Q38_CLOSE_GGUF(g);
     return 0;
 }

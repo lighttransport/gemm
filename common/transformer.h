@@ -20,6 +20,9 @@
 #include <float.h>
 #include "gguf_loader.h"
 #include "ggml_dequant.h"
+#ifdef TF_HAVE_Q38_LOWBIT
+#include "../a64fx/llm/qwen38_lowbit_model.h"
+#endif
 
 #define TF_CMG4_LANES 4
 
@@ -65,6 +68,9 @@ typedef struct {
     int      nvfp4_packed; /* K-major eight-row NVFP4 decode layout */
     int      nvfp4_tiled;  /* size-preserving exact eight-row NVFP4 layout */
     int      q6_decoded;   /* exact predecoded Q6_K vocabulary head */
+#ifdef TF_HAVE_Q38_LOWBIT
+    const q38_lowbit_matrix *lowbit;
+#endif
 } qtensor;
 
 typedef struct {
@@ -669,6 +675,15 @@ static qtensor tf_load_tensor(const gguf_context *gguf, const char *name, int re
     uint64_t n_rows = 1;
     for (uint32_t d = 1; d < gguf->tensors[idx].n_dims; d++) n_rows *= gguf->tensors[idx].dims[d];
     t.n_rows = (int)n_rows;
+#ifdef TF_HAVE_Q38_LOWBIT
+    t.lowbit = q38_lowbit_model_tensor(gguf, idx);
+    if (t.lowbit) {
+        /* Keep the original GGML type as metadata. All execution accesses must
+         * go through the descriptor; the four CMG segments are not contiguous. */
+        for (int c = 0; c < 4; c++)
+            if (t.lowbit->part[c]) { t.data = t.lowbit->part[c]; break; }
+    }
+#endif
     return t;
 }
 
@@ -787,6 +802,12 @@ static inline float tf_kv_load_value(const transformer_model *m, int layer, size
  * For a matrix stored as [n_rows, n_cols], row i starts at offset computed
  * from the quantization block size. */
 static void tf_dequant_row(const qtensor *t, int row, float *dst) {
+#ifdef TF_HAVE_Q38_LOWBIT
+    if (t->lowbit) {
+        if (!q38_lowbit_matrix_row(dst, t->lowbit, row)) abort();
+        return;
+    }
+#endif
     /* Compute byte offset for this row */
     int n_cols = t->n_cols;
     int block_size, type_size;
@@ -2558,6 +2579,13 @@ static inline int64_t tf_int8_int16_dot(const int8_t *w, const int16_t *x, int K
 static void *tf_qmatvec_worker(void *arg) {
     tf_matvec_task *t = (tf_matvec_task *)arg;
     int n_cols = t->mat->n_cols;
+#ifdef TF_HAVE_Q38_LOWBIT
+    if (t->mat->lowbit && !tf_g_f64_accum) {
+        if (!q38_lowbit_matrix_rows(t->dst, t->mat->lowbit, t->x,
+                                    t->row_start, t->row_end)) abort();
+        return NULL;
+    }
+#endif
     if (tf_g_f64_accum) {
         /* Reference oracle: dequant each row to F32, dot in double. Uniform across
          * all weight types so the only F32 rounding left is the per-weight dequant. */
@@ -4070,6 +4098,17 @@ static void tf_matvec_f16_rows(float *dst, const uint8_t *base, size_t row_bytes
 static void *tf_qmatvec_fused2_worker(void *arg) {
     tf_matvec_fused2_task *t = (tf_matvec_fused2_task *)arg;
     int n_cols = t->mat1->n_cols;
+#ifdef TF_HAVE_Q38_LOWBIT
+    if (t->mat1->lowbit || t->mat2->lowbit) {
+        float *tmp = malloc((size_t)n_cols * sizeof(float));
+        if (!tmp) abort();
+        tf_matvec_task a = {t->dst1, t->mat1, t->x, t->row_start, t->row_end, tmp};
+        tf_matvec_task b = {t->dst2, t->mat2, t->x, t->row_start, t->row_end, tmp};
+        tf_qmatvec_worker(&a); tf_qmatvec_worker(&b);
+        free(tmp);
+        return NULL;
+    }
+#endif
     if (t->mat1->type == GGML_TYPE_F16) {
         size_t row_bytes = (size_t)n_cols * 2;
         tf_matvec_f16_rows(t->dst1, (const uint8_t *)t->mat1->data, row_bytes,
@@ -4289,7 +4328,13 @@ static void tf_qmatvec_fused2_pool(transformer_model *m, float *dst1, const qten
         tasks[t] = (tf_matvec_fused2_task){dst1, dst2, mat1, mat2, x, offset, offset + count};
         offset += count;
     }
+#ifdef TF_HAVE_Q38_LOWBIT
+    if (!q38_lowbit_matrix_begin(mat1->lowbit, x)) abort();
+#endif
     tf_pool_dispatch(m, tf_qmatvec_fused2_worker, tasks, sizeof(tf_matvec_fused2_task));
+#ifdef TF_HAVE_Q38_LOWBIT
+    q38_lowbit_matrix_end(mat1->lowbit);
+#endif
     if (tf_dprof) { tf_decode_matvec_ms += tf_time_ms() - _t0;
         tf_decode_matvec_bytes += (double)n_rows *
             (double)(tf_row_bytes(mat1->type, mat1->n_cols) +
@@ -4370,7 +4415,13 @@ static void TF_MAYBE_UNUSED tf_qmatvec_fused2_silu_pool(transformer_model *m, fl
         tasks[t] = (tf_fused_ffn_silu_task){dst, gate_mat, up_mat, x, ro, ro + rc};
         ro += rc;
     }
+#ifdef TF_HAVE_Q38_LOWBIT
+    if (!q38_lowbit_matrix_begin(gate_mat->lowbit, x)) abort();
+#endif
     tf_pool_dispatch(m, tf_fused_ffn_silu_worker, tasks, sizeof(tf_fused_ffn_silu_task));
+#ifdef TF_HAVE_Q38_LOWBIT
+    q38_lowbit_matrix_end(gate_mat->lowbit);
+#endif
 }
 
 /* IQ3_XXS decode matvec.  The generic fallback expands every 256-value block
@@ -4607,6 +4658,12 @@ typedef struct {
 static void tf_matvec_qtensor_rows(float *dst, const qtensor *mat, const float *x,
                                     int row_start, int row_end) {
     int n_cols = mat->n_cols;
+#ifdef TF_HAVE_Q38_LOWBIT
+    if (mat->lowbit) {
+        if (!q38_lowbit_matrix_rows(dst, mat->lowbit, x, row_start, row_end)) abort();
+        return;
+    }
+#endif
     if (mat->type == GGML_TYPE_F32) {
         const float *base = mat->data;
         for (int i = row_start; i < row_end; i++) {
@@ -4817,11 +4874,23 @@ static void tf_qmatvec_fused_qkv_pool(transformer_model *m,
         q_off += qc;
         kv_off += kvc;
     }
+#ifdef TF_HAVE_Q38_LOWBIT
+    if (!q38_lowbit_matrix_begin(mat_q->lowbit, m->xb)) abort();
+#endif
     tf_pool_dispatch(m, tf_qmatvec_fused3_worker, tasks, sizeof(tf_matvec_fused3_task));
+#ifdef TF_HAVE_Q38_LOWBIT
+    q38_lowbit_matrix_end(mat_q->lowbit);
+#endif
 }
 
 static void tf_qmatvec(float *dst, const qtensor *mat, const float *x, int n_rows, float *tmp) {
     int n_cols = mat->n_cols;
+#ifdef TF_HAVE_Q38_LOWBIT
+    if (mat->lowbit) {
+        if (!q38_lowbit_matrix_rows(dst, mat->lowbit, x, 0, n_rows)) abort();
+        return;
+    }
+#endif
 #if defined(__ARM_FEATURE_SVE)
 #if defined(TF_LINK_Q8_K128)
     if (mat->q8_k128) {
@@ -5102,7 +5171,13 @@ static void tf_qmatvec_pool(transformer_model *m, float *dst, const qtensor *mat
         tasks[t] = (tf_matvec_task){dst, mat, x, offset, offset + count, m->thread_tmp[t]};
         offset += count;
     }
+#ifdef TF_HAVE_Q38_LOWBIT
+    if (!q38_lowbit_matrix_begin(mat->lowbit, x)) abort();
+#endif
     tf_pool_dispatch(m, tf_qmatvec_worker, tasks, sizeof(tf_matvec_task));
+#ifdef TF_HAVE_Q38_LOWBIT
+    q38_lowbit_matrix_end(mat->lowbit);
+#endif
     if (tf_dprof) { tf_decode_matvec_ms += tf_time_ms() - _t0;
         tf_decode_matvec_bytes += (double)n_rows *
                                   (double)tf_row_bytes(mat->type, mat->n_cols);
@@ -10055,6 +10130,17 @@ static inline void tf_barrier(transformer_model *m, int tid, int *local_sense, i
 static void tf_thread_matvec(float *dst, const qtensor *mat, const float *x,
                               int n_rows, int tid, int nt) {
     (void)x;
+#ifdef TF_HAVE_Q38_LOWBIT
+    if (mat->lowbit) {
+        int groups = (n_rows + 7) / 8;
+        int first = (int)((int64_t)groups * tid / nt) * 8;
+        int last = (int)((int64_t)groups * (tid + 1) / nt) * 8;
+        if (first > n_rows) first = n_rows;
+        if (last > n_rows) last = n_rows;
+        if (!q38_lowbit_matrix_rows(dst, mat->lowbit, x, first, last)) abort();
+        return;
+    }
+#endif
     if (tf_null_gemm_enabled()) {
         tf_null_matvec(dst, mat, n_rows, tid, nt);
         return;
@@ -10601,8 +10687,14 @@ static void *tf_persistent_worker(void *arg) {
                     (m->is_hybrid && layer->is_ssm) ? "ssm" : "attn");
 
         /* Thread 0: RMSNorm (sequential, cheap) */
-        if (tid == 0)
+        if (tid == 0) {
             tf_rmsnorm(m->xb, m->x, &layer->attn_norm, n_embd, m->rms_norm_eps, m->matvec_tmp);
+#ifdef TF_HAVE_Q38_LOWBIT
+            const q38_lowbit_matrix *lb = (m->is_hybrid && layer->is_ssm) ?
+                layer->ssm_qkv.lowbit : layer->attn_q.lowbit;
+            if (!q38_lowbit_matrix_begin(lb, m->xb)) abort();
+#endif
+        }
         tf_spin_barrier(m, &local_sense, nt);  /* B1: xb ready */
 
         if (m->is_hybrid && layer->is_ssm) {
@@ -10625,6 +10717,9 @@ static void *tf_persistent_worker(void *arg) {
             tf_thread_matvec(m->ssm_beta_tmp, &layer->ssm_beta, m->xb,
                              m->ssm_dt_rank, tid, nt);
             tf_spin_barrier(m, &local_sense, nt);
+#ifdef TF_HAVE_Q38_LOWBIT
+            if (tid == 0) q38_lowbit_matrix_end(layer->ssm_qkv.lowbit);
+#endif
             if (tid == 0 && tf_dprof > 0) {
                 tf_decode_ssm_in_ms += tf_time_ms() - ssm_t0;
                 ssm_t0 = tf_time_ms();
@@ -10676,10 +10771,19 @@ static void *tf_persistent_worker(void *arg) {
                 tf_decode_ssm_core_ms += tf_time_ms() - ssm_t0;
                 ssm_t0 = tf_time_ms();
             }
+#ifdef TF_HAVE_Q38_LOWBIT
+            if (layer->ssm_out.lowbit) {
+                if (tid == 0 && !q38_lowbit_matrix_begin(layer->ssm_out.lowbit, m->ffn_buf3)) abort();
+                tf_spin_barrier(m, &local_sense, nt);
+            }
+#endif
             tf_thread_matvec_overlap_reduce(m, m->xb, &layer->ssm_out,
                                             m->ffn_buf3, n_embd, tid, nt,
                                             m->tp_ssm_sharded, &local_sense);
             tf_spin_barrier(m, &local_sense, nt);  /* B2: SSM done */
+#ifdef TF_HAVE_Q38_LOWBIT
+            if (tid == 0) q38_lowbit_matrix_end(layer->ssm_out.lowbit);
+#endif
             if (tid == 0 && !tf_tp_overlap_wanted(m, n_embd, nt, m->tp_ssm_sharded) &&
                 m->tp_ssm_sharded && m->tp_reduce_add_fn)
                 m->tp_reduce_add_fn(m->xb, m->x, n_embd, m->tp_allreduce_ctx);
@@ -10713,6 +10817,9 @@ static void *tf_persistent_worker(void *arg) {
                 }
             }
             tf_spin_barrier(m, &local_sense, nt);  /* B2: Q/K/V ready */
+#ifdef TF_HAVE_Q38_LOWBIT
+            if (tid == 0) q38_lowbit_matrix_end(layer->attn_q.lowbit);
+#endif
             if (tid == 0 && tf_dprof > 0) {
                 double now = tf_time_ms();
                 tf_decode_attn_qkv_ms += now - attn_t0;
@@ -10918,10 +11025,19 @@ static void *tf_persistent_worker(void *arg) {
                 tf_decode_attn_core_ms += now - attn_t0;
                 attn_t0 = now;
             }
+#ifdef TF_HAVE_Q38_LOWBIT
+            if (layer->attn_output.lowbit) {
+                if (tid == 0 && !q38_lowbit_matrix_begin(layer->attn_output.lowbit, m->xb2)) abort();
+                tf_spin_barrier(m, &local_sense, nt);
+            }
+#endif
             tf_thread_matvec_overlap_reduce(m, m->xb, &layer->attn_output,
                                             m->xb2, n_embd, tid, nt,
                                             m->tp_attn_sharded, &local_sense);
             tf_spin_barrier(m, &local_sense, nt);  /* B5: xb ready */
+#ifdef TF_HAVE_Q38_LOWBIT
+            if (tid == 0) q38_lowbit_matrix_end(layer->attn_output.lowbit);
+#endif
             if (tid == 0 && !tf_tp_overlap_wanted(m, n_embd, nt, m->tp_attn_sharded) &&
                 m->tp_attn_sharded && m->tp_reduce_add_fn)
                 m->tp_reduce_add_fn(m->xb, m->x, n_embd, m->tp_allreduce_ctx);
@@ -10945,6 +11061,9 @@ static void *tf_persistent_worker(void *arg) {
             if (!fused_residual)
                 tf_vadd(m->x, m->xb, n_embd);
             tf_rmsnorm(m->xb, m->x, &layer->ffn_norm, n_embd, m->rms_norm_eps, m->matvec_tmp);
+#ifdef TF_HAVE_Q38_LOWBIT
+            if (!q38_lowbit_matrix_begin(layer->ffn_gate.lowbit, m->xb)) abort();
+#endif
         }
         tf_spin_barrier(m, &local_sense, nt);  /* B6: xb ready for FFN (merged) */
 
@@ -10974,6 +11093,16 @@ static void *tf_persistent_worker(void *arg) {
                 int rp = n_ff / nt, re = n_ff % nt;
                 int rs = tid * rp + (tid < re ? tid : re);
                 int rc = rp + (tid < re ? 1 : 0);
+#ifdef TF_HAVE_Q38_LOWBIT
+                if (layer->ffn_gate.lowbit && layer->ffn_up.lowbit) {
+                    int groups = (n_ff + 7) / 8;
+                    rs = (int)((int64_t)groups * tid / nt) * 8;
+                    int end = (int)((int64_t)groups * (tid + 1) / nt) * 8;
+                    if (rs > n_ff) rs = n_ff;
+                    if (end > n_ff) end = n_ff;
+                    rc = end - rs;
+                }
+#endif
                 /* PV producers partition eight-row groups, not individual
                  * rows. Consume the same groups here: there is deliberately
                  * no barrier between the projections and this activation. */
@@ -11009,6 +11138,13 @@ static void *tf_persistent_worker(void *arg) {
                 }
             }
             tf_spin_barrier(m, &local_sense, nt);  /* B7: ffn_buf3 ready for down */
+#ifdef TF_HAVE_Q38_LOWBIT
+            if (tid == 0) q38_lowbit_matrix_end(layer->ffn_gate.lowbit);
+            if (layer->ffn_down.lowbit) {
+                if (tid == 0 && !q38_lowbit_matrix_begin(layer->ffn_down.lowbit, m->ffn_buf3)) abort();
+                tf_spin_barrier(m, &local_sense, nt);
+            }
+#endif
             if (tid == 0 && tf_dprof > 0) {
                 tf_decode_ffn_gateup_ms += tf_time_ms() - ffn_t0;
                 ffn_t0 = tf_time_ms();
@@ -11019,6 +11155,9 @@ static void *tf_persistent_worker(void *arg) {
                                             m->ffn_buf3, n_embd, tid, nt,
                                             m->tp_ffn_sharded, &local_sense);
             tf_spin_barrier(m, &local_sense, nt);  /* B8: xb ready */
+#ifdef TF_HAVE_Q38_LOWBIT
+            if (tid == 0) q38_lowbit_matrix_end(layer->ffn_down.lowbit);
+#endif
             if (tid == 0 && !tf_tp_overlap_wanted(m, n_embd, nt, m->tp_ffn_sharded) &&
                 m->tp_ffn_sharded && m->tp_reduce_add_fn)
                 m->tp_reduce_add_fn(m->xb, m->x, n_embd, m->tp_allreduce_ctx);
@@ -11067,6 +11206,10 @@ static void *tf_persistent_worker(void *arg) {
         if (m->nextn.target_hidden)
             memcpy(m->nextn.target_hidden, m->x, (size_t)n_embd * sizeof(float));
         tf_rmsnorm(m->x, m->x, &m->output_norm, n_embd, m->rms_norm_eps, m->matvec_tmp);
+#ifdef TF_HAVE_Q38_LOWBIT
+        if (tf_g4p_want_logits && m->has_lm_head &&
+            !q38_lowbit_matrix_begin(m->output.lowbit, m->x)) abort();
+#endif
     }
     if (tf_g4p_want_logits && m->has_lm_head) {
         double lm_t0 = (tid == 0 && tf_dprof > 0) ? tf_time_ms() : 0.0;
@@ -11090,6 +11233,9 @@ static void *tf_persistent_worker(void *arg) {
             m->lm_head_best_val[tid] = end > start ? m->logits[best] : -INFINITY;
         }
         tf_spin_barrier(m, &local_sense, nt);
+#ifdef TF_HAVE_Q38_LOWBIT
+        if (tid == 0) q38_lowbit_matrix_end(m->output.lowbit);
+#endif
         if (tid == 0 && m->lm_head_best_idx) {
             int global = m->lm_head_best_idx[0];
             float value = m->lm_head_best_val[0];

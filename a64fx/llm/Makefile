@@ -175,6 +175,38 @@ $(BUILD)/test_qwen38_nvfp4_i16_super: $(LLM_DIR)test_qwen38_nvfp4_i16_super.c $(
 Q38_LAYOUT_NAMES := n3 n1 i16_super packed_a8 packed64_a8 packed8soa_a8 packed8_iscale_a8 expanded_a8
 Q38_LAYOUT_OBJS := $(addprefix $(BUILD)/q38_layout_,$(addsuffix .o,$(Q38_LAYOUT_NAMES)))
 Q38_LAYOUT_CFLAGS := $(filter-out -g -rdynamic -ffp-contract=fast,$(CFLAGS)) -Wall -Wextra -Wpedantic
+
+.PHONY: qwen38_lowbit_test qwen38_lowbit_sve_test qwen38_lowbit_model_test qwen38_lowbit_bench
+.PHONY: qwen38_lowbit_runner
+.PHONY: qwen38_lowbit_prepare_bench
+.PHONY: qwen38_lowbit_eval
+qwen38_lowbit_eval: $(BUILD)/qwen38_lowbit_eval
+$(BUILD)/qwen38_lowbit_eval: $(LLM_DIR)qwen38_lowbit_eval.c $(COMMON)/transformer.h $(LLM_DIR)qwen38_lowbit_model.c $(LLM_DIR)qwen38_lowbit_model.h $(LLM_DIR)qwen38_lowbit_image.inc $(BUILD)/qwen38_lowbit.o $(BUILD)/qwen38_lowbit_sve.o | $(BUILD)
+	$(CC) $(CFLAGS) $(OMP_FLAG) -DTF_HAVE_Q38_LOWBIT -o $@ $(LLM_DIR)qwen38_lowbit_eval.c \
+		$(LLM_DIR)qwen38_lowbit_model.c $(BUILD)/qwen38_lowbit.o $(BUILD)/qwen38_lowbit_sve.o $(LDFLAGS)
+qwen38_lowbit_prepare_bench: $(BUILD)/bench_qwen38_lowbit_prepare
+$(BUILD)/bench_qwen38_lowbit_prepare: $(LLM_DIR)bench_qwen38_lowbit_prepare.c $(BUILD)/qwen38_lowbit.o $(BUILD)/qwen38_lowbit_sve.o | $(BUILD)
+	$(CC) $(Q38_LAYOUT_CFLAGS) -O2 $^ $(LDFLAGS) -o $@
+qwen38_lowbit_runner: $(BUILD)/qwen38_lowbit_runner
+$(BUILD)/qwen38_lowbit_runner: $(LLM_DIR)qwen38_runner.c $(COMMON)/transformer.h $(LLM_DIR)qwen38_lowbit_model.c $(LLM_DIR)qwen38_lowbit_model.h $(LLM_DIR)qwen38_lowbit_image.inc $(BUILD)/qwen38_lowbit.o $(BUILD)/qwen38_lowbit_sve.o | $(BUILD)
+	$(CC) $(CFLAGS) $(OMP_FLAG) -DTF_HAVE_Q38_LOWBIT -o $@ $(LLM_DIR)qwen38_runner.c \
+		$(LLM_DIR)qwen38_lowbit_model.c $(BUILD)/qwen38_lowbit.o $(BUILD)/qwen38_lowbit_sve.o $(LDFLAGS)
+qwen38_lowbit_test: $(BUILD)/test_qwen38_lowbit_host
+qwen38_lowbit_model_test: $(BUILD)/test_qwen38_lowbit_model_host
+$(BUILD)/test_qwen38_lowbit_model_host: $(LLM_DIR)test_qwen38_lowbit_model.c $(LLM_DIR)qwen38_lowbit_model.c $(LLM_DIR)qwen38_lowbit.c $(LLM_DIR)qwen38_lowbit_model.h $(LLM_DIR)qwen38_lowbit_image.inc $(LLM_DIR)qwen38_lowbit.h $(COMMON)/gguf_loader.h | $(BUILD)
+	$(HOSTCC) -O2 -std=c11 -Wall -Wextra -Wpedantic -Wno-unused-function -I$(COMMON) $(filter %.c,$^) -lm -o $@
+qwen38_lowbit_sve_test: $(BUILD)/test_qwen38_lowbit_sve
+qwen38_lowbit_bench: $(BUILD)/bench_qwen38_lowbit$(if $(Q38_FAPP),_fapp)
+$(BUILD)/test_qwen38_lowbit_host: $(LLM_DIR)test_qwen38_lowbit.c $(LLM_DIR)qwen38_lowbit.c $(LLM_DIR)qwen38_lowbit.h | $(BUILD)
+	$(HOSTCC) -O2 -std=c11 -Wall -Wextra -Wpedantic $(filter %.c,$^) -lm -o $@
+$(BUILD)/qwen38_lowbit.o: $(LLM_DIR)qwen38_lowbit.c $(LLM_DIR)qwen38_lowbit.h | $(BUILD)
+	$(CC) $(Q38_LAYOUT_CFLAGS) -O3 -c $< -o $@
+$(BUILD)/qwen38_lowbit_sve.o: $(LLM_DIR)qwen38_lowbit_sve.c $(LLM_DIR)qwen38_lowbit.h $(LLM_DIR)qwen38_lowbit_scale.inc | $(BUILD)
+	$(CC) $(Q38_LAYOUT_CFLAGS) -O3 -c $< -o $@
+$(BUILD)/test_qwen38_lowbit_sve: $(LLM_DIR)test_qwen38_lowbit.c $(BUILD)/qwen38_lowbit.o $(BUILD)/qwen38_lowbit_sve.o | $(BUILD)
+	$(CC) $(Q38_LAYOUT_CFLAGS) -O2 $^ $(LDFLAGS) -o $@
+$(BUILD)/bench_qwen38_lowbit$(if $(Q38_FAPP),_fapp): $(LLM_DIR)bench_qwen38_lowbit.c $(BUILD)/qwen38_lowbit.o $(BUILD)/qwen38_lowbit_sve.o | $(BUILD)
+	$(CC) $(filter-out -D_GNU_SOURCE,$(Q38_LAYOUT_CFLAGS)) -O1 $(if $(Q38_FAPP),-DQ38_FAPP) $^ $(LDFLAGS) $(if $(Q38_FAPP),-lfjprofcore) -o $@
 Q38_LAYOUT_PROFILE_FLAGS :=
 Q38_LAYOUT_PROFILE_LIBS :=
 ifdef Q38_FAPP
