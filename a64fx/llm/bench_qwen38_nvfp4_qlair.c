@@ -12,6 +12,9 @@
 #include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef Q38_FAPP
+#include <fj_tool/fapp.h>
+#endif
 
 extern int q38_nvfp4_packed_n3_mt(float *, const void *, const float *,
                                    int, int, int);
@@ -322,6 +325,9 @@ static pthread_barrier_t start_barrier, end_barrier;
 static uint8_t *segments[4];
 static int bench_rows, bench_cores, bench_passes, bench_warmup;
 static int bench_compute, bench_a8, bench_check_all;
+#ifdef Q38_FAPP
+static const char *bench_region;
+#endif
 typedef struct {
     int tid, error;
     uint64_t begin, end;
@@ -332,6 +338,10 @@ static bench_worker workers[48];
 static void *run_worker(void *arg) {
     bench_worker *worker = arg;
     int tid = worker->tid;
+#ifdef Q38_FAPP
+    char fapp_region[64];
+    snprintf(fapp_region, sizeof(fapp_region), "%s_t%d", bench_region, tid);
+#endif
     cpu_set_t mask;
     CPU_ZERO(&mask);
     CPU_SET(12 + tid, &mask);
@@ -413,6 +423,9 @@ static void *run_worker(void *arg) {
                 tid, local_rows);
     pthread_barrier_wait(&start_barrier);
     __qlair_sim_start(0);
+#ifdef Q38_FAPP
+    fapp_start(fapp_region, 1, 0);
+#endif
     worker->begin = ticks();
     for (int rep = 0; rep < bench_passes && !worker->error; rep++) {
         if (bench_compute) {
@@ -457,6 +470,9 @@ static void *run_worker(void *arg) {
         } else stream_sum ^= stream_weights((const uint8_t *)weights, bytes);
     }
     worker->end = ticks();
+#ifdef Q38_FAPP
+    fapp_stop(fapp_region, 1, 0);
+#endif
     __qlair_sim_end(0);
     if (bench_compute && !worker->error && (bench_a8 || !bench_sdot) &&
         !check_first_row(weights, y, local_rows)) worker->error = 1;
@@ -500,6 +516,9 @@ int main(int argc, char **argv) {
         fprintf(stderr, "usage: %s compute|compute1|packed8_1|packed8soa_1|packed8soa_stream|packed8_iscale1|packed8_iscale_stream|packed64_1|packed64_stream|stream|stream1|sdot|sdot_stream|sdot8|sdot8_1|repack8_1|repack8_rare1|repack8_groupmeta1|repack8_stream|repack8_rare_stream|repack8_groupmeta_stream|sdot8_stream ROWS COLS CORES PASSES WARMUP\n", argv[0]);
         return 2;
     }
+#ifdef Q38_FAPP
+    bench_region = argv[1];
+#endif
     bench_compute = !strcmp(argv[1], "compute") || !strcmp(argv[1], "compute1") || !strcmp(argv[1], "packed8_1") || !strcmp(argv[1], "packed8soa_1") || !strcmp(argv[1], "packed8_iscale1") || !strcmp(argv[1], "packed64_1") || !strcmp(argv[1], "sdot") ||
                     !strcmp(argv[1], "sdot8") || !strcmp(argv[1], "sdot8_1") ||
                     !strcmp(argv[1], "repack8_1") ||

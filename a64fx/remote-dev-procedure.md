@@ -1,8 +1,10 @@
-# Remote A64FX development with bash-over-HTTP
+# Remote A64FX development on Fugaku
 
-This procedure runs a persistent, stateful Bash service inside a Fugaku PJM
-allocation and reaches it from the local workstation through two loopback-only
-SSH forwards.
+Use a direct interactive PJM allocation by default for single-node kernel
+development and profiling; see [Submit a job](#submit-a-job). The optional
+bash-over-HTTP bridge below supports unattended or long-running work. It runs
+a persistent, stateful Bash service inside a PJM batch allocation and reaches
+it from the local workstation through two loopback-only SSH forwards.
 
 ```text
 local client: 127.0.0.1:42386
@@ -22,11 +24,11 @@ forwards. HTTP bearer-token authentication is optional and disabled by default;
 do not change any listener bind address to `0.0.0.0` or expose these ports
 outside the SSH path.
 
-## Prerequisites
+## Prerequisites for the optional bridge
 
 - Local SSH configuration provides `ssh fugaku1` and pins it to
   `login1.fugaku.r-ccs.riken.jp`.
-- The remote checkout is `$HOME/work/gemm/glm53f`.
+- The remote checkout is `$HOME/work/gemm/qwen38-27b`.
 - The compute-node account can SSH back to
   `login1.fugaku.r-ccs.riken.jp`. The job uses `BatchMode=yes` and
   `IdentitiesOnly=yes`.
@@ -56,7 +58,7 @@ example, project-specific connection settings can be kept in:
     "ssh_host": "fugaku1",
     "hostname": "login1.fugaku.r-ccs.riken.jp",
     "port": 32386,
-    "dir": "$HOME/work/gemm/glm53f"
+    "dir": "$HOME/work/gemm/qwen38-27b"
   },
   "server": { "host": "127.0.0.1", "port": 21264 },
   "storage": {
@@ -78,7 +80,7 @@ overwrite unrelated remote artifacts.
 
 ```bash
 REMOTE=fugaku1
-REMOTE_DIR='~/work/gemm/glm53f'
+REMOTE_DIR='~/work/gemm/qwen38-27b'
 rsync -av a64fx/tools/bash-over-http/ \
   "$REMOTE:$REMOTE_DIR/a64fx/tools/bash-over-http/"
 rsync -av a64fx/remote-dev-procedure.md \
@@ -124,13 +126,15 @@ nohup a64fx/tools/bash-over-http/watch_local_tunnel.sh \
 
 ## Submit a job
 
-### Submit directly from a Fugaku frontend
+### Default: interactive A64FX allocation
 
-When the local shell is already on a Fugaku frontend named `fn01sv0N`, it is
-the corresponding `loginN` frontend.  In that case the bash-over-HTTP bridge
-and SSH forwards are unnecessary: submit the interactive allocation directly
-from the frontend and run the staging/build/benchmark commands in the
-interactive shell.
+For single-node development, profiling, and short benchmarks, start with an
+interactive allocation. This uses Fugaku's `int` resource group and gives a
+compute-node shell without deploying the bash-over-HTTP bridge. From a local
+workstation, connect with `ssh -tt fugaku1`; if already on a Fugaku frontend
+named `fn01sv0N`, use that shell directly. The corresponding `loginN` is the
+frontend. An interactive request can still wait when the resource group is
+busy; `--sparam "wait-time=600"` sets the maximum wait for this example.
 
 Confirm the frontend first:
 
@@ -148,12 +152,18 @@ pjsub --interact -g hp250467 \
   -x PJM_LLIO_GFSCACHE=/vol0004 --llio localtmp-size=87Gi
 ```
 
-The command opens a shell on the allocated compute node.  `/local` is
-allocation-local and should be populated from the shared model filesystem
-inside that shell.  This direct mode is distinct from the persistent
-bash-over-HTTP procedure below and does not require a local tunnel.
+The command opens a shell on the allocated compute node. Stage small sources
+or chunked model data into `/local` from the shared filesystem, then compile
+and run inside this shell. Keep the SSH terminal attached while using the
+allocation; `exit` releases it. Check `pjstat` before launching another job so
+an old batch allocation does not run concurrently. For FAPP, collect with
+`fapp` on the compute node and decode with `fapppx` on the frontend.
 
-The standard one-node, 12-hour remote-development allocation is:
+### Batch/persistent bridge for unattended or long runs
+
+Use the bash-over-HTTP batch bridge only when an interactive shell is not
+suitable (for example, unattended runs or multi-node workflows). The standard
+one-node, 12-hour remote-development allocation is:
 
 ```bash
 REMOTE=login1.fugaku.r-ccs.riken.jp \
@@ -215,7 +225,7 @@ The main configurable values are:
 | `FRONTEND_PORT` | recorded `REMOTE_PORT`, normally `32386` | Reverse-forward listener on login1 |
 | `SERVER_HOST` | `127.0.0.1` | Compute-side server bind address |
 | `SERVER_PORT` | `21264` | Compute-side server port |
-| `REMOTE_REPO` | `$HOME/work/gemm/glm53f` | Remote checkout used for submission |
+| `REMOTE_REPO` | `$HOME/work/gemm/qwen38-27b` | Remote checkout used for submission |
 | `MAX_RETRY` | `10` | Consecutive tunnel failures before job exit |
 | `MONITOR_INTERVAL` | `15` | Tunnel check interval in seconds |
 | `KEEPALIVE_SECONDS` | `0` | `0` means run until PJM elapse |
@@ -235,14 +245,16 @@ FRONTEND_PORT=32387 NODES=1 ELAPSE=08:00:00 \
 Use a hostname for `FRONTEND_SSH_TARGET`, not an internal IP address. Keep it a
 single hostname: commas in `pjsub -x` values are interpreted as separators.
 
-## Run an interactive job (maximum six hours)
+## Optional interactive bash-over-HTTP bridge (maximum six hours)
 
 Interactive allocations are limited by Fugaku's `int` resource group to at
 most **06:00:00**. A 12-hour allocation must use the batch launcher instead;
 `run_bash_http_interactive.sh` rejects any larger `ELAPSE` value before it
 contacts `pjsub`.
 
-Use the interactive launcher when the batch `small` queue is delayed. It asks
+For a direct compute-node shell, use the default `pjsub --interact` form above.
+Use this bridge launcher only when a persistent HTTP session is needed and the
+batch `small` queue is delayed. It asks
 the `int` resource group for an immediately usable allocation and waits at most
 600 seconds; it does not leave a queued batch job behind after that wait
 expires.

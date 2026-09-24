@@ -1148,3 +1148,50 @@ were not used as the headline. The 200-pass samples retain a similar start
 span but amortize it over 31–45 ms of kernel work. Job scripts and full logs
 are in repository `tmp/q38-iscale-hw-staged/`; both 200-pass allocations have
 ended. No real 27B model weights were loaded for these synthetic kernel runs.
+
+### Native FAPP bottleneck diagnosis
+
+On interactive Fugaku job **51891094** (`freq=2000,eco_state=0`, one CMG,
+HBM node 4), the Fujitsu FAPP profiler collected all 17 PA event groups for
+the 6144 x 5120 integer-scale kernel, original packed-8 kernel, and matching
+integer-scale byte scan. The benchmark was linked with `-lfjprofcore` and
+`-DQ38_FAPP`; each worker used a distinct region name (`..._t0` through
+`..._t11`). Using the same region name in all pthreads causes FAPP to report
+`multiplex` and nonsensical region counters, so those preliminary profiles
+were discarded. The valid CSVs and run log are under repository
+`tmp/q38-iscale-hw-staged/fapp-51891094-unique/`.
+
+Median per-worker hardware counters below are from separate 100-pass FAPP
+runs. Cycle categories can overlap and must not be summed. They show that
+the packed compute kernel is *not* stalled primarily on HBM access:
+
+| FAPP event | Integer-scale compute | Byte scan |
+| --- | ---: | ---: |
+| CPU cycles (pa6) | 30.79 M | 29.34 M |
+| `LD_COMP_WAIT_L2_MISS` (pa6) | 2.41 M (7.8%) | 15.04 M (51.3%) |
+| `FL_COMP_WAIT` (pa6) | 9.97 M (32.4%) | 3.32 M (11.3%) |
+| `EU_COMP_WAIT` (pa2) | 10.29 M (about 33%) | 3.27 M (about 11%) |
+| Effective instructions (pa1) | 44.68 M | 11.55 M |
+
+For an independent counter check, the same 21.63 MB weight arena was run
+on just CPU 12 for 100 passes, exceeding the 8 MB CMG L2. Its
+`BUS_READ_TOTAL_MEM` count (pa17) was 8.469 M for the integer-scale kernel
+and 8.455 M for the scan, consistent with the 2.163 GB logical stream at
+about 256 bytes per counted memory transaction. The one-core compute took
+167.5 ms (12.9 GB/s logical source rate) versus 67.9 ms (31.8 GB/s) for the
+scan. Compute spent 146 M of 335 M cycles in `FL_COMP_WAIT` and 148 M in
+`EU_COMP_WAIT`, but only 0.61 M in `LD_COMP_WAIT_L2_MISS`. Thus its limiting
+work is FP4 lookup, widening, scaling, and dot-product instruction throughput
+or dependencies, not weight supply from HBM. The pa17 bus event is CMG-wide;
+its per-thread attribution in the 12-worker CSVs is inconsistent, so those
+rows are **not** used to estimate 12-core physical HBM bandwidth.
+
+An uninstrumented same-allocation 200-pass control returned 136.7 GB/s
+logical source rate for integer-scale compute and 211.3 GB/s for scan,
+consistent with the earlier 138/211 GB/s result. The original packed-8
+control varied between allocations (128.3 GB/s here versus 103.9 GB/s in
+job 51890077); comparisons to it should be same-job and repeated. The
+next compact-kernel optimization should reduce SVE instruction and execution
+pipeline pressure before tuning prefetch or HBM placement. FAPP itself slows
+and skews the threaded timers, so use its event counts for diagnosis and
+uninstrumented runs for throughput claims.
