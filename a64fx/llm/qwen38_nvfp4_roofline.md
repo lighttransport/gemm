@@ -698,3 +698,62 @@ reporting throughput. **No native packed-scale timing or real-model replay
 has been performed yet.** The increased stream might outweigh saved
 scale decoding, and generated code still contains SVE register spills, so
 this prototype is not a claimed bandwidth-saturated kernel.
+
+## Local qlair A64FX simulator gate (2026-09-24)
+
+`bench_qwen38_nvfp4_qlair.c` profiles the exact packed N=3 kernel in local
+qlair (`~/work/clair/a64fx/build-inference/qlair`). It uses real FFN
+projection dimensions, synthetic packed NVFP4 bytes, 12 workers in one
+simulated CMG, and a 15.73 MB weight stream (larger than the CMG's 8 MB L2).
+A matched SVE load/XOR scan reads the *same* allocation. Each worker checks
+its first projected row against a scalar reference after the marked region;
+`correct=1` means these samples passed, not whole-model token identity.
+Accept a run only with both `##FP4 ... correct=1` and `Threads: 12`.
+
+| Mode, 4096 x 5120, N=3 | Weight bytes | Max marked cycles | HBM2 GB/s | Share of matched scan |
+| --- | ---: | ---: | ---: | ---: |
+| Exact packed FP4 compute | 15,728,640 | 1,528,770 | 20.9 | 9.6% |
+| Packed-weight scan | 15,728,640 | 144,984 | 218.2 | 100% |
+| A8-activation SDOT sensitivity | 20,971,520 | 412,910 | 102.7 | 46.3% |
+| A8-sidecar scan | 20,971,520 | 190,077 | 221.6 | 100% |
+
+The A8 variant is benchmark-only: it quantizes activations to signed bytes,
+uses a **1.33x larger** coefficient sidecar than packed FP4, omits rare-scale
+corrections, and has no token-identity result. The exact packed path is
+~10.5x slower than its matched scan; even A8 is ~2.2x slower. **The requested
+bandwidth-limited FP4 kernel is not established.** These numbers characterize
+one simulated CMG, not native Fugaku or a 48-core end-to-end decode. Qlair's
+FP4-loop timing has not been calibrated against native hardware, so this is
+a directional gate, not a tok/s prediction. A new kernel needs to approach
+the matched beyond-L2 scan with the same resident representation and pass
+full numerical checks before projecting 40+ tok/s.
+
+Reproduce from the repo root (Clang cross toolchain and qlair already built):
+
+```sh
+mkdir -p tmp
+clang --target=aarch64-linux-gnu --sysroot=/usr/aarch64-linux-gnu \
+  -march=armv8.2-a+sve -std=c11 -O1 -fno-vectorize -fno-slp-vectorize \
+  -Wall -Wextra -Wpedantic -c a64fx/llm/bench_qwen38_nvfp4_qlair.c \
+  -o tmp/bench_qwen38_nvfp4_qlair.o
+clang --target=aarch64-linux-gnu --sysroot=/usr/aarch64-linux-gnu \
+  -march=armv8.2-a+sve -std=c11 -O3 -D_GNU_SOURCE \
+  -c a64fx/llm/qwen38_nvfp4_n3.c -o tmp/qwen38_nvfp4_n3_qlair_seq.o
+clang --target=aarch64-linux-gnu --sysroot=/usr/aarch64-linux-gnu \
+  -march=armv8.2-a+sve -std=c11 -O3 -D_GNU_SOURCE -DQ38_SUPER_BENCH \
+  -Wall -Wextra -Wpedantic -c a64fx/llm/qwen38_nvfp4_i16_super.c \
+  -o tmp/qwen38_nvfp4_i16_super_qlair.o
+clang --target=aarch64-linux-gnu --sysroot=/ --gcc-toolchain=/usr \
+  -B/usr/lib/gcc-cross/aarch64-linux-gnu/13 -fuse-ld=lld -static \
+  tmp/bench_qwen38_nvfp4_qlair.o tmp/qwen38_nvfp4_n3_qlair_seq.o \
+  tmp/qwen38_nvfp4_i16_super_qlair.o \
+  -L/usr/lib/gcc-cross/aarch64-linux-gnu/13 -L/usr/aarch64-linux-gnu/lib \
+  -lm -lpthread -o tmp/bench_qwen38_nvfp4_qlair
+Q=~/work/clair/a64fx/build-inference/qlair
+for mode in compute stream sdot8 sdot8_stream; do
+  "$Q" --cores 12 --profile-markers \
+    --profile-report "tmp/q38-fp4-qlair-4096-c12-${mode}.json" \
+    --profile-format json -n 1G tmp/bench_qwen38_nvfp4_qlair \
+    -- "$mode" 4096 5120 12 1 0
+done
+```

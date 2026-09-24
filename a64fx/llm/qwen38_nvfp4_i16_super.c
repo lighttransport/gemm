@@ -225,6 +225,78 @@ static void q38_super_rows(float *y, const q38_super_matrix *m,
     }
 }
 
+#ifdef Q38_SUPER_BENCH
+/* Isolated qlair kernel path; the benchmark provides already-repacked bytes
+ * and quantized activations so markers contain projection work only. */
+int q38_super_bench_quantize(int8_t *low, int8_t *high, float scale[3],
+                              const float *x, int cols) {
+    return q38_super_quantize(low, high, scale, x, cols);
+}
+void q38_super_bench_rows(float *y, const int8_t *coeff,
+                           const int32_t *weight_sum,
+                           const size_t *rare_offsets,
+                           const int8_t *low, const int8_t *high,
+                           const float scale[3], const float *x,
+                           int rows, int cols, int first, int last) {
+    q38_super_matrix m = {0};
+    m.rows = rows; m.cols = cols;
+    m.coeff = (int8_t *)coeff;
+    m.weight_sum = (int32_t *)weight_sum;
+    m.rare_offsets = (size_t *)rare_offsets;
+    q38_super_rows(y, &m, low, high, scale, x, first, last);
+}
+/* A8 sensitivity: one SDOT per candidate and no INT16 digit recombination.
+ * Full-K lane sums remain below INT32 for |coefficient|<=120, |q|<=127 and
+ * K<=17408. This deliberately excludes rare-scale FP32 corrections. */
+void q38_super_bench_rows_a8(float *y, const int8_t *coeff,
+                              const int8_t *digits, const float scale[3],
+                              int rows, int cols, int first, int last) {
+    const svbool_t pb = svptrue_b8();
+    for (int nt = first; nt < last; nt++) {
+        svint32_t a00=svdup_s32(0),a01=a00,a02=a00;
+        svint32_t a10=a00,a11=a00,a12=a00;
+        svint32_t a20=a00,a21=a00,a22=a00;
+        svint32_t a30=a00,a31=a00,a32=a00;
+        const int8_t *wp = coeff + (size_t)nt * cols * 64;
+        for (int k = 0; k < cols; k += 4) {
+            uint32_t q0,q1,q2;
+            memcpy(&q0,digits+k,4);
+            memcpy(&q1,digits+cols+k,4);
+            memcpy(&q2,digits+2*cols+k,4);
+            svint8_t v0=svreinterpret_s8_u32(svdup_n_u32(q0));
+            svint8_t v1=svreinterpret_s8_u32(svdup_n_u32(q1));
+            svint8_t v2=svreinterpret_s8_u32(svdup_n_u32(q2));
+            const int8_t *p=wp+(size_t)k*64;
+#define Q38_SUPER_A8_GROUP(G,A0,A1,A2) do { \
+                svint8_t z=svld1_s8(pb,p+(G)*64); \
+                (A0)=svdot_s32((A0),z,v0); \
+                (A1)=svdot_s32((A1),z,v1); \
+                (A2)=svdot_s32((A2),z,v2); \
+            } while(0)
+            Q38_SUPER_A8_GROUP(0,a00,a01,a02);
+            Q38_SUPER_A8_GROUP(1,a10,a11,a12);
+            Q38_SUPER_A8_GROUP(2,a20,a21,a22);
+            Q38_SUPER_A8_GROUP(3,a30,a31,a32);
+#undef Q38_SUPER_A8_GROUP
+        }
+        const svbool_t pf = svptrue_b32();
+#define Q38_SUPER_A8_STORE(G,A0,A1,A2) do { \
+            svst1_f32(pf,y+(size_t)0*rows+nt*64+(G)*16, \
+                svmul_n_f32_x(pf,svcvt_f32_s32_x(pf,(A0)),scale[0])); \
+            svst1_f32(pf,y+(size_t)1*rows+nt*64+(G)*16, \
+                svmul_n_f32_x(pf,svcvt_f32_s32_x(pf,(A1)),scale[1])); \
+            svst1_f32(pf,y+(size_t)2*rows+nt*64+(G)*16, \
+                svmul_n_f32_x(pf,svcvt_f32_s32_x(pf,(A2)),scale[2])); \
+        } while(0)
+        Q38_SUPER_A8_STORE(0,a00,a01,a02);
+        Q38_SUPER_A8_STORE(1,a10,a11,a12);
+        Q38_SUPER_A8_STORE(2,a20,a21,a22);
+        Q38_SUPER_A8_STORE(3,a30,a31,a32);
+#undef Q38_SUPER_A8_STORE
+    }
+}
+#endif
+
 int q38_nvfp4_i16_super_mt(float *y, const void *source, const float *x,
                              int rows, int cols, int n_threads) {
     const q38_super_matrix *m = NULL;
