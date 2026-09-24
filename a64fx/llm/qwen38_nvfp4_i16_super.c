@@ -298,7 +298,9 @@ void q38_super_bench_rows_a8(float *y, const int8_t *coeff,
 /* One-token sensitivity floor for the predecoded coefficient sidecar. */
 void q38_super_bench_rows_a8_n1(float *y, const int8_t *coeff,
                                  const int8_t *digits, float scale,
-                                 int cols, int first, int last) {
+                                 const uint32_t *rare_k,
+                                 const float *rare_delta, const float *x,
+                                 int rare_slots, int cols, int first, int last) {
     const svbool_t pb = svptrue_b8(), pf = svptrue_b32();
     for (int nt = first; nt < last; nt++) {
         svint32_t a0=svdup_s32(0),a1=a0,a2=a0,a3=a0;
@@ -313,14 +315,30 @@ void q38_super_bench_rows_a8_n1(float *y, const int8_t *coeff,
             a2 = svdot_s32(a2, svld1_s8(pb, p + 128), v);
             a3 = svdot_s32(a3, svld1_s8(pb, p + 192), v);
         }
-        svst1_f32(pf, y + nt * 64,
-            svmul_n_f32_x(pf, svcvt_f32_s32_x(pf, a0), scale));
-        svst1_f32(pf, y + nt * 64 + 16,
-            svmul_n_f32_x(pf, svcvt_f32_s32_x(pf, a1), scale));
-        svst1_f32(pf, y + nt * 64 + 32,
-            svmul_n_f32_x(pf, svcvt_f32_s32_x(pf, a2), scale));
-        svst1_f32(pf, y + nt * 64 + 48,
-            svmul_n_f32_x(pf, svcvt_f32_s32_x(pf, a3), scale));
+        svfloat32_t v0=svmul_n_f32_x(pf,svcvt_f32_s32_x(pf,a0),scale);
+        svfloat32_t v1=svmul_n_f32_x(pf,svcvt_f32_s32_x(pf,a1),scale);
+        svfloat32_t v2=svmul_n_f32_x(pf,svcvt_f32_s32_x(pf,a2),scale);
+        svfloat32_t v3=svmul_n_f32_x(pf,svcvt_f32_s32_x(pf,a3),scale);
+        if (rare_delta) {
+            for (int slot = 0; slot < rare_slots; slot++) {
+                const uint32_t *ki=rare_k+(size_t)slot*64;
+                const float *d=rare_delta+(size_t)slot*64;
+#define Q38_RARE_SLOT(G,V) do { \
+                    svuint32_t ix=svld1_u32(pf,ki+(G)*16); \
+                    svfloat32_t xv=svld1_gather_u32index_f32(pf,x,ix); \
+                    (V)=svmla_x(pf,(V),svld1(pf,d+(G)*16),xv); \
+                } while (0)
+                Q38_RARE_SLOT(0,v0);
+                Q38_RARE_SLOT(1,v1);
+                Q38_RARE_SLOT(2,v2);
+                Q38_RARE_SLOT(3,v3);
+#undef Q38_RARE_SLOT
+            }
+        }
+        svst1_f32(pf,y+nt*64,v0);
+        svst1_f32(pf,y+nt*64+16,v1);
+        svst1_f32(pf,y+nt*64+32,v2);
+        svst1_f32(pf,y+nt*64+48,v3);
     }
 }
 #endif

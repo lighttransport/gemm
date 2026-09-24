@@ -848,11 +848,37 @@ so the warmup and repetitions are important. The 200+ result is therefore
 established **only for this synthetic, common-scale, A8-activation simulator
 kernel**, not for exact FP4 serial decode or a real model.
 
-The converter currently rejects scales requiring rare-value correction;
-its synthetic source uses only raw scale bytes 1–4. No local NVFP4 27B GGUF
-or `/local` staging directory is available on this machine. Production
-load-time replacement of the packed source, rare-scale correction, 32 GB HBM
-capacity, real-model token identity, and native throughput remain open.
+The plain `repack8_1` fixture uses raw scales 1–4. A second fixture,
+`repack8_rare1`, gives every output row one scale-11 FP4 subblock and inserts
+a zero-scale block. The repacker retains signed-byte coefficients bounded to
+±120 and records only overflowing values as FP32 residuals. The timed SDOT
+kernel gathers each residual's original FP32 activation by K index and
+applies it with SVE FMA **before its one output store**. This corrects the
+overflow contribution without recomputing all 16 values of the rare block.
+The full 6144x5120, 12-worker fixture passes an all-row independent
+FP4-source check under SVE QEMU (`Q38_QLAIR_CHECK_ALL=1`).
+
+| Rare-correction variant, one warmup | HBM2 GB/s, one CMG |
+| --- | ---: |
+| Full 16-value scalar correction | 171.9 |
+| Sparse scalar overflow residuals | 174.9 |
+| Dense 16x64 SVE correction tile | 195.4 |
+| Fused dense tile | 190.0–201.4 (four runs) |
+| Fused sparse SVE gather | **207.2, 207.9, 209.1, 213.5** |
+| Final zero-scale-capable fused gather | **205.4** |
+| Scan of the identical rare-scale repack | 222.3 |
+
+The final simulated kernel is therefore about 92–96% of its matched scan
+and exceeds 200 GB/s in repeated one-CMG runs, *including* sparse rare-scale
+FP32 correction. The gather metadata is generated per 64-row fixture group;
+the synthetic groups are identical and reuse the same small metadata table.
+Real matrices will require distinct per-group metadata and its HBM traffic,
+which this test does not measure. The one-token activation is still globally
+quantized to INT8, so these checks prove the quantized projection math, not
+exact FP32 logits or generated-token identity. No local NVFP4 27B GGUF or
+`/local` staging directory is available on this machine. Production
+load-time replacement of packed weights, 32 GB HBM capacity, real-model
+identity, and native throughput remain open.
 
 ```sh
 Q=~/work/clair/a64fx/build-inference/qlair
@@ -862,4 +888,13 @@ for mode in repack8_1 repack8_stream; do
     --profile-format json -n 3G tmp/bench_qwen38_nvfp4_qlair \
     -- "$mode" 6144 5120 12 1 1
 done
+```
+
+For the rare-scale gate, substitute `repack8_rare1` and
+`repack8_rare_stream` in the loop. The final all-row check was:
+
+```sh
+Q38_QLAIR_CHECK_ALL=1 Q38_QLAIR_NO_MBIND=1 \
+  qemu-aarch64 -cpu max,sve512=on -L /usr/aarch64-linux-gnu \
+  tmp/bench_qwen38_nvfp4_qlair repack8_rare1 6144 5120 12 1 0
 ```

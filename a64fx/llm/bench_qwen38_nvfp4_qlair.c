@@ -30,7 +30,8 @@ extern void q38_super_bench_rows(float *, const int8_t *, const int32_t *,
 extern void q38_super_bench_rows_a8(float *, const int8_t *, const int8_t *,
                                      const float[3], int, int, int, int);
 extern void q38_super_bench_rows_a8_n1(float *, const int8_t *, const int8_t *,
-                                        float, int, int, int);
+                                        float, const uint32_t *, const float *,
+                                        const float *, int, int, int, int);
 __attribute__((noinline)) void __qlair_sim_start(unsigned long id) {
     (void)id; __asm__ volatile("" ::: "memory");
 }
@@ -45,6 +46,13 @@ static uint64_t ticks(void) {
 typedef struct { float d[8]; uint8_t qs[64]; } packed_subblock;
 typedef struct { packed_subblock s[4]; } packed_block;
 _Static_assert(sizeof(packed_block) == 384, "packed tile width");
+static int bench_rare;
+static uint8_t rare_count[64];
+static uint16_t rare_k[64][16];
+static float rare_delta[64][16];
+static _Alignas(64) uint32_t rare_slot_k[16][64];
+static _Alignas(64) float rare_slot_delta[16][64];
+static int rare_slots;
 
 static void init_weights(packed_block *w, size_t blocks) {
     for (size_t b = 0; b < blocks; b++)
@@ -62,7 +70,8 @@ static void init_weights(packed_block *w, size_t blocks) {
 }
 
 /* Convert eight compact FP4 row tiles into the 64-row K-major SDOT layout.
- * This fixture has only UE4M3 scales 1..4, so code*scale fits signed INT8. */
+ * Common scales fit signed INT8. Overflowing coefficients are bounded to
+ * +/-120 and their exact residual is kept for sparse FP32 correction. */
 static int repack_fp4_group(int8_t *dst, const packed_block *src, int cols) {
     static const int8_t code[16] = {
         0,1,2,3,4,6,8,12,0,-1,-2,-3,-4,-6,-8,-12
@@ -78,13 +87,25 @@ static int repack_fp4_group(int8_t *dst, const packed_block *src, int cols) {
                     int v = kk % 16;
                     uint8_t z = p->qs[(row % 8) * 8 + v % 8];
                     int scale = (int)(p->d[row % 8] * 1024.0f);
-                    if (scale < 1 || scale > 10) {
+                    if (scale < 0 || (scale > 10 && !bench_rare)) {
                         fprintf(stderr, "repack fixture: invalid scale row=%d k=%d value=%g raw=%d\n",
                                 row, kk, p->d[row % 8], scale);
                         return 0;
                     }
-                    int value = code[v < 8 ? z & 15 : z >> 4] * scale;
-                    if (value < -127 || value > 127) return 0;
+                    int fp4 = code[v < 8 ? z & 15 : z >> 4];
+                    int value = fp4 * scale;
+                    if (value < -120) value = -120;
+                    if (value > 120) value = 120;
+                    if (bench_rare && value != fp4 * scale) {
+                        if (kk >= 16) return 0;
+                        int n = rare_count[row];
+                        if (n >= 16) return 0;
+                        rare_k[row][n] = (uint16_t)kk;
+                        rare_delta[row][n] =
+                            (float)fp4 * p->d[row % 8] -
+                            (float)value * (1.0f / 1024.0f);
+                        rare_count[row] = (uint8_t)(n + 1);
+                    }
                     dst[(size_t)k * 64 + (size_t)g * 64 + r * 4 + j] =
                         (int8_t)value;
                 }
@@ -120,16 +141,23 @@ static int check_first_row(const uint8_t *weights, const float *y,
                 0,1,2,3,4,6,8,12,0,-1,-2,-3,-4,-6,-8,-12
             };
             int64_t sum = 0;
+            float rare = 0.0f;
             for (int k = 0; k < bench_cols; k++) {
                 const packed_subblock *p =
                     &repack_source[k / 64].s[(k % 64) / 16];
                 int v = k % 16;
                 uint8_t z = p->qs[v % 8];
                 int scale = (int)(p->d[0] * 1024.0f);
-                sum += (int)code[v < 8 ? z & 15 : z >> 4] *
-                       scale * digits[k];
+                int fp4 = code[v < 8 ? z & 15 : z >> 4];
+                int value = fp4 * scale;
+                if (value < -120) value = -120;
+                if (value > 120) value = 120;
+                sum += value * digits[k];
+                rare = fmaf((float)fp4 * p->d[0] -
+                            (float)value * (1.0f / 1024.0f),
+                            activation[k], rare);
             }
-            expected = (float)sum * digit_scale[0];
+            expected = (float)sum * digit_scale[0] + rare;
         } else if (bench_sdot) {
             const int8_t *w = (const int8_t *)weights;
             int64_t sum = 0;
@@ -185,15 +213,23 @@ static int check_repack_all(const float *y, int local_rows) {
     for (int row = 0; row < local_rows; row++) {
         int src_row = row % 64;
         int64_t sum = 0;
+        float rare = 0.0f;
         for (int k = 0; k < bench_cols; k++) {
             const packed_subblock *p =
                 &repack_source[(src_row / 8) * nb + k / 64].s[(k % 64) / 16];
             int v = k % 16;
             uint8_t z = p->qs[(src_row % 8) * 8 + v % 8];
             int scale = (int)(p->d[src_row % 8] * 1024.0f);
-            sum += (int)code[v < 8 ? z & 15 : z >> 4] * scale * digits[k];
+            int fp4 = code[v < 8 ? z & 15 : z >> 4];
+            int value = fp4 * scale;
+            if (value < -120) value = -120;
+            if (value > 120) value = 120;
+            sum += value * digits[k];
+            rare = fmaf((float)fp4 * p->d[src_row % 8] -
+                        (float)value * (1.0f / 1024.0f),
+                        activation[k], rare);
         }
-        float expected = (float)sum * digit_scale[0];
+        float expected = (float)sum * digit_scale[0] + rare;
         if (!isfinite(y[row]) || fabsf(y[row] - expected) >
                 0.0005f + 0.0005f * fabsf(expected)) return 0;
     }
@@ -251,9 +287,14 @@ static void *run_worker(void *arg) {
             if (bench_pack_a8) {
                 if (!q38_nvfp4_packed_a8_rows(y, weights, packed_act,
                         digit_scale[0], local_rows, bench_cols)) worker->error = 1;
-            } else if (bench_a8 && bench_n1)
+            } else if (bench_a8 && bench_n1) {
                 q38_super_bench_rows_a8_n1(y, (const int8_t *)weights,
-                    digits, digit_scale[0], bench_cols, 0, local_rows / 64);
+                    digits, digit_scale[0],
+                    bench_rare ? &rare_slot_k[0][0] : NULL,
+                    bench_rare ? &rare_slot_delta[0][0] : NULL,
+                    activation, rare_slots,
+                    bench_cols, 0, local_rows / 64);
+            }
             else if (bench_a8)
                 q38_super_bench_rows_a8(y, (const int8_t *)weights, digits,
                     digit_scale, local_rows, bench_cols, 0, local_rows / 64);
@@ -278,9 +319,14 @@ static void *run_worker(void *arg) {
             if (bench_pack_a8) {
                 if (!q38_nvfp4_packed_a8_rows(y, weights, packed_act,
                         digit_scale[0], local_rows, bench_cols)) worker->error = 1;
-            } else if (bench_a8 && bench_n1)
+            } else if (bench_a8 && bench_n1) {
                 q38_super_bench_rows_a8_n1(y, (const int8_t *)weights,
-                    digits, digit_scale[0], bench_cols, 0, local_rows / 64);
+                    digits, digit_scale[0],
+                    bench_rare ? &rare_slot_k[0][0] : NULL,
+                    bench_rare ? &rare_slot_delta[0][0] : NULL,
+                    activation, rare_slots,
+                    bench_cols, 0, local_rows / 64);
+            }
             else if (bench_a8)
                 q38_super_bench_rows_a8(y, (const int8_t *)weights, digits,
                     digit_scale, local_rows, bench_cols, 0, local_rows / 64);
@@ -321,17 +367,24 @@ int main(int argc, char **argv) {
                       strcmp(argv[1], "sdot8") &&
                       strcmp(argv[1], "sdot8_1") &&
                       strcmp(argv[1], "repack8_1") &&
+                      strcmp(argv[1], "repack8_rare1") &&
                       strcmp(argv[1], "repack8_stream") &&
+                      strcmp(argv[1], "repack8_rare_stream") &&
                       strcmp(argv[1], "sdot8_stream"))) {
-        fprintf(stderr, "usage: %s compute|compute1|packed8_1|stream|stream1|sdot|sdot_stream|sdot8|sdot8_1|repack8_1|repack8_stream|sdot8_stream ROWS COLS CORES PASSES WARMUP\n", argv[0]);
+        fprintf(stderr, "usage: %s compute|compute1|packed8_1|stream|stream1|sdot|sdot_stream|sdot8|sdot8_1|repack8_1|repack8_rare1|repack8_stream|repack8_rare_stream|sdot8_stream ROWS COLS CORES PASSES WARMUP\n", argv[0]);
         return 2;
     }
     bench_compute = !strcmp(argv[1], "compute") || !strcmp(argv[1], "compute1") || !strcmp(argv[1], "packed8_1") || !strcmp(argv[1], "sdot") ||
                     !strcmp(argv[1], "sdot8") || !strcmp(argv[1], "sdot8_1") ||
-                    !strcmp(argv[1], "repack8_1");
+                    !strcmp(argv[1], "repack8_1") ||
+                    !strcmp(argv[1], "repack8_rare1");
     bench_pack_a8 = !strcmp(argv[1], "packed8_1");
     bench_repack = !strcmp(argv[1], "repack8_1") ||
-                   !strcmp(argv[1], "repack8_stream");
+                   !strcmp(argv[1], "repack8_stream") ||
+                   !strcmp(argv[1], "repack8_rare1") ||
+                   !strcmp(argv[1], "repack8_rare_stream");
+    bench_rare = !strcmp(argv[1], "repack8_rare1") ||
+                 !strcmp(argv[1], "repack8_rare_stream");
     bench_n1 = !strcmp(argv[1], "compute1") || !strcmp(argv[1], "stream1") ||
                !strcmp(argv[1], "sdot8_1") || bench_pack_a8 || bench_repack;
     bench_a8 = !strcmp(argv[1], "sdot8") || !strcmp(argv[1], "sdot8_1") ||
@@ -373,8 +426,29 @@ int main(int argc, char **argv) {
              * one, then replicate its derived bytes to keep simulator
              * setup short without changing the timed weight stream. */
             init_weights(repack_source, (size_t)8 * nb);
+            if (bench_rare) {
+                for (int row = 0; row < 64; row++) {
+                    packed_subblock *p =
+                        &repack_source[(row / 8) * nb].s[0];
+                    p->d[row % 8] = 11.0f / 1024.0f;
+                }
+                if (nb > 1) repack_source[1].s[0].d[0] = 0.0f;
+                memset(rare_count, 0, sizeof(rare_count));
+                memset(rare_slot_k, 0, sizeof(rare_slot_k));
+                memset(rare_slot_delta, 0, sizeof(rare_slot_delta));
+            }
             if (!repack_fp4_group((int8_t *)segments[cmg],
                                   repack_source, bench_cols)) return 1;
+            if (bench_rare) {
+                rare_slots = 0;
+                for (int row = 0; row < 64; row++) {
+                    if (rare_count[row] > rare_slots) rare_slots = rare_count[row];
+                    for (int j = 0; j < rare_count[row]; j++) {
+                        rare_slot_k[j][row] = rare_k[row][j];
+                        rare_slot_delta[j][row] = rare_delta[row][j];
+                    }
+                }
+            }
             for (size_t group = 1; group < cmg_groups; group++)
                 memcpy(segments[cmg] + group * group_bytes,
                        segments[cmg], group_bytes);
