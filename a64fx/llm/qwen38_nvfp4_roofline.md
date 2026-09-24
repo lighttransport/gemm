@@ -728,6 +728,16 @@ a directional gate, not a tok/s prediction. A new kernel needs to approach
 the matched beyond-L2 scan with the same resident representation and pass
 full numerical checks before projecting 40+ tok/s.
 
+There is also a tight arithmetic roofline for exact N=3: each 384-byte packed
+tile contains 512 weights and needs three FP32 FMAs per weight, or 8 FP32
+operations per streamed byte before nibble decoding. One CMG has roughly a
+quarter of the cited 6.7584 TFLOP/s node FP32 peak, so even an ideal FMA-only
+kernel tops out around 211 GB/s of packed source traffic. That is already
+below the 218 GB/s matched scan, with no budget for decode instructions.
+Thus literal scan-rate saturation is not a plausible N=3 design target;
+single-token N=1 has a much lower 2.67 FLOP/byte arithmetic floor and should
+be measured separately if the goal is bandwidth-limited serial decode.
+
 Reproduce from the repo root (Clang cross toolchain and qlair already built):
 
 ```sh
