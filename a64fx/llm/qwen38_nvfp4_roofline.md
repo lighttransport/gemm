@@ -821,3 +821,45 @@ real-model token-identity test.
 To reproduce `packed8_1`, cross-compile `qwen38_nvfp4_packed_a8.c` with
 `-O3 -march=armv8.2-a+sve`, add its object to the link command above, and
 run `packed8_1 4096 5120 12 1 0` with `--cores 12 --profile-markers`.
+
+### FP4-derived signed-byte repack gate
+
+The `repack8_1` simulator mode now creates synthetic 384-byte packed FP4
+tiles, converts their nibble codes and common UE4M3 scales to K-major signed
+coefficients **before** the marked region, and runs the one-token SDOT
+kernel on those derived bytes. Each 64-row fixture group is identical, so
+the converter runs once and its output is copied into the remaining groups;
+this keeps simulator setup bounded without changing the timed stream.
+`repack8_stream` scans the identical allocation and bytes. On a 128x128
+fixture, `Q38_QLAIR_CHECK_ALL=1` validates every output row against an
+independent scalar traversal of the compact FP4 source under both SVE QEMU
+and qlair. The full-size runs check the first row of every worker against
+that source and require `correct=1` plus `Threads: 12`.
+
+For the real 6144x5120 SSM-gate shape, 12 simulated cores, 31,457,280
+repacked bytes (well above one CMG's L2), the four fast-setup cold runs
+reported **202.4, 210.5, 210.0, and 206.5 GB/s HBM2**. A one-pass warmup
+gave **212.4 GB/s** against **225.5 GB/s** for the same-byte matched scan
+(94% of scan). The cold matched scan was 227.5 GB/s. An earlier fixture
+that redundantly performed the full scalar repack for every group reported
+174.7 GB/s despite essentially identical marked instruction and HBM-byte
+counts; setup/cache/simulator state can materially affect one-pass results,
+so the warmup and repetitions are important. The 200+ result is therefore
+established **only for this synthetic, common-scale, A8-activation simulator
+kernel**, not for exact FP4 serial decode or a real model.
+
+The converter currently rejects scales requiring rare-value correction;
+its synthetic source uses only raw scale bytes 1–4. No local NVFP4 27B GGUF
+or `/local` staging directory is available on this machine. Production
+load-time replacement of the packed source, rare-scale correction, 32 GB HBM
+capacity, real-model token identity, and native throughput remain open.
+
+```sh
+Q=~/work/clair/a64fx/build-inference/qlair
+for mode in repack8_1 repack8_stream; do
+  "$Q" --cores 12 --profile-markers \
+    --profile-report "tmp/q38-fp4-qlair-6144-${mode}.json" \
+    --profile-format json -n 3G tmp/bench_qwen38_nvfp4_qlair \
+    -- "$mode" 6144 5120 12 1 1
+done
+```

@@ -61,6 +61,36 @@ static void init_weights(packed_block *w, size_t blocks) {
         }
 }
 
+/* Convert eight compact FP4 row tiles into the 64-row K-major SDOT layout.
+ * This fixture has only UE4M3 scales 1..4, so code*scale fits signed INT8. */
+static int repack_fp4_group(int8_t *dst, const packed_block *src, int cols) {
+    static const int8_t code[16] = {
+        0,1,2,3,4,6,8,12,0,-1,-2,-3,-4,-6,-8,-12
+    };
+    int nb = cols / 64;
+    for (int k = 0; k < cols; k += 4)
+        for (int g = 0; g < 4; g++)
+            for (int r = 0; r < 16; r++)
+                for (int j = 0; j < 4; j++) {
+                    int row = g * 16 + r, kk = k + j;
+                    const packed_subblock *p =
+                        &src[(row / 8) * nb + kk / 64].s[(kk % 64) / 16];
+                    int v = kk % 16;
+                    uint8_t z = p->qs[(row % 8) * 8 + v % 8];
+                    int scale = (int)(p->d[row % 8] * 1024.0f);
+                    if (scale < 1 || scale > 10) {
+                        fprintf(stderr, "repack fixture: invalid scale row=%d k=%d value=%g raw=%d\n",
+                                row, kk, p->d[row % 8], scale);
+                        return 0;
+                    }
+                    int value = code[v < 8 ? z & 15 : z >> 4] * scale;
+                    if (value < -127 || value > 127) return 0;
+                    dst[(size_t)k * 64 + (size_t)g * 64 + r * 4 + j] =
+                        (int8_t)value;
+                }
+    return 1;
+}
+
 static uint8_t stream_weights(const uint8_t *p, size_t bytes) {
     const svbool_t pg = svptrue_b8();
     svuint8_t a = svdup_u8(0);
@@ -73,7 +103,8 @@ static float *activation;
 static int8_t *digits;
 static packed_a8_act *packed_act;
 static float digit_scale[3];
-static int bench_cols, bench_sdot, bench_n1, bench_pack_a8;
+static int bench_cols, bench_sdot, bench_n1, bench_pack_a8, bench_repack;
+static packed_block repack_source[8 * (17408 / 64)];
 
 /* Validate one row per worker outside the marked region. This catches
  * incomplete simulator execution as well as nibble/order regressions. */
@@ -84,7 +115,22 @@ static int check_first_row(const uint8_t *weights, const float *y,
     };
     for (int c = 0; c < (bench_n1 ? 1 : 3); c++) {
         float expected = 0.0f;
-        if (bench_sdot) {
+        if (bench_repack) {
+            static const int8_t code[16] = {
+                0,1,2,3,4,6,8,12,0,-1,-2,-3,-4,-6,-8,-12
+            };
+            int64_t sum = 0;
+            for (int k = 0; k < bench_cols; k++) {
+                const packed_subblock *p =
+                    &repack_source[k / 64].s[(k % 64) / 16];
+                int v = k % 16;
+                uint8_t z = p->qs[v % 8];
+                int scale = (int)(p->d[0] * 1024.0f);
+                sum += (int)code[v < 8 ? z & 15 : z >> 4] *
+                       scale * digits[k];
+            }
+            expected = (float)sum * digit_scale[0];
+        } else if (bench_sdot) {
             const int8_t *w = (const int8_t *)weights;
             int64_t sum = 0;
             for (int k = 0; k < bench_cols; k++)
@@ -131,10 +177,33 @@ static int check_first_row(const uint8_t *weights, const float *y,
     return 1;
 }
 
+static int check_repack_all(const float *y, int local_rows) {
+    static const int8_t code[16] = {
+        0,1,2,3,4,6,8,12,0,-1,-2,-3,-4,-6,-8,-12
+    };
+    int nb = bench_cols / 64;
+    for (int row = 0; row < local_rows; row++) {
+        int src_row = row % 64;
+        int64_t sum = 0;
+        for (int k = 0; k < bench_cols; k++) {
+            const packed_subblock *p =
+                &repack_source[(src_row / 8) * nb + k / 64].s[(k % 64) / 16];
+            int v = k % 16;
+            uint8_t z = p->qs[(src_row % 8) * 8 + v % 8];
+            int scale = (int)(p->d[src_row % 8] * 1024.0f);
+            sum += (int)code[v < 8 ? z & 15 : z >> 4] * scale * digits[k];
+        }
+        float expected = (float)sum * digit_scale[0];
+        if (!isfinite(y[row]) || fabsf(y[row] - expected) >
+                0.0005f + 0.0005f * fabsf(expected)) return 0;
+    }
+    return 1;
+}
+
 static pthread_barrier_t start_barrier, end_barrier;
 static uint8_t *segments[4];
 static int bench_rows, bench_cores, bench_passes, bench_warmup;
-static int bench_compute, bench_a8;
+static int bench_compute, bench_a8, bench_check_all;
 typedef struct {
     int tid, error;
     uint64_t begin, end;
@@ -232,6 +301,8 @@ static void *run_worker(void *arg) {
     __qlair_sim_end(0);
     if (bench_compute && !worker->error && (bench_a8 || !bench_sdot) &&
         !check_first_row(weights, y, local_rows)) worker->error = 1;
+    if (bench_repack && bench_compute && bench_check_all && !worker->error &&
+        !check_repack_all(y, local_rows)) worker->error = 1;
     if (bench_compute && !worker->error && !isfinite(y[0])) worker->error = 1;
     worker->checksum = bench_compute && !worker->error ? y[0] : (float)stream_sum;
     pthread_barrier_wait(&end_barrier);
@@ -249,22 +320,29 @@ int main(int argc, char **argv) {
                       strcmp(argv[1], "sdot_stream") &&
                       strcmp(argv[1], "sdot8") &&
                       strcmp(argv[1], "sdot8_1") &&
+                      strcmp(argv[1], "repack8_1") &&
+                      strcmp(argv[1], "repack8_stream") &&
                       strcmp(argv[1], "sdot8_stream"))) {
-        fprintf(stderr, "usage: %s compute|compute1|packed8_1|stream|stream1|sdot|sdot_stream|sdot8|sdot8_1|sdot8_stream ROWS COLS CORES PASSES WARMUP\n", argv[0]);
+        fprintf(stderr, "usage: %s compute|compute1|packed8_1|stream|stream1|sdot|sdot_stream|sdot8|sdot8_1|repack8_1|repack8_stream|sdot8_stream ROWS COLS CORES PASSES WARMUP\n", argv[0]);
         return 2;
     }
     bench_compute = !strcmp(argv[1], "compute") || !strcmp(argv[1], "compute1") || !strcmp(argv[1], "packed8_1") || !strcmp(argv[1], "sdot") ||
-                    !strcmp(argv[1], "sdot8") || !strcmp(argv[1], "sdot8_1");
+                    !strcmp(argv[1], "sdot8") || !strcmp(argv[1], "sdot8_1") ||
+                    !strcmp(argv[1], "repack8_1");
     bench_pack_a8 = !strcmp(argv[1], "packed8_1");
+    bench_repack = !strcmp(argv[1], "repack8_1") ||
+                   !strcmp(argv[1], "repack8_stream");
     bench_n1 = !strcmp(argv[1], "compute1") || !strcmp(argv[1], "stream1") ||
-               !strcmp(argv[1], "sdot8_1") || bench_pack_a8;
+               !strcmp(argv[1], "sdot8_1") || bench_pack_a8 || bench_repack;
     bench_a8 = !strcmp(argv[1], "sdot8") || !strcmp(argv[1], "sdot8_1") ||
+               bench_repack ||
                !strcmp(argv[1], "sdot8_stream");
     bench_sdot = bench_a8 || !strcmp(argv[1], "sdot") ||
                  !strcmp(argv[1], "sdot_stream");
     bench_rows = atoi(argv[2]); bench_cols = atoi(argv[3]);
     bench_cores = atoi(argv[4]); bench_passes = atoi(argv[5]);
     bench_warmup = atoi(argv[6]);
+    bench_check_all = getenv("Q38_QLAIR_CHECK_ALL") != NULL;
     int group_rows = bench_sdot ? 64 : 8;
     if (bench_rows < group_rows || bench_rows % group_rows || bench_cols < 64 ||
         bench_cols % 64 || (bench_cores != 1 && bench_cores != 12 &&
@@ -290,7 +368,17 @@ int main(int argc, char **argv) {
                 return 1;
             }
         }
-        if (bench_sdot) {
+        if (bench_repack) {
+            /* Every synthetic 64-row source group is identical. Convert
+             * one, then replicate its derived bytes to keep simulator
+             * setup short without changing the timed weight stream. */
+            init_weights(repack_source, (size_t)8 * nb);
+            if (!repack_fp4_group((int8_t *)segments[cmg],
+                                  repack_source, bench_cols)) return 1;
+            for (size_t group = 1; group < cmg_groups; group++)
+                memcpy(segments[cmg] + group * group_bytes,
+                       segments[cmg], group_bytes);
+        } else if (bench_sdot) {
             for (size_t i = 0; i < bytes; i++)
                 segments[cmg][i] = (uint8_t)((int)((i * 37 + cmg * 11) % 241) - 120);
         } else init_weights((packed_block *)segments[cmg], cmg_groups * nb);
