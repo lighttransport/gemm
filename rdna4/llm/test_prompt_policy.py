@@ -6,7 +6,7 @@ import tempfile
 root = Path(__file__).resolve().parents[2]
 source = Path(__file__).with_name("test_hip_llm.c").read_text()
 start = source.index("static int prompt_bos_id(")
-end = source.index("static int run_stdio_server(", start)
+end = source.index("typedef struct {\n    int32_t *tokens;", start)
 program = r'''
 #include <assert.h>
 #include <stdlib.h>

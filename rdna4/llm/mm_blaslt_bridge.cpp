@@ -14,6 +14,10 @@ extern "C" int mm_blaslt_run_bf16(void *, const void *, const void *,
                                   int, int, int, void *) { return -1; }
 extern "C" int mm_blaslt_run_bf16_strided_batch(
     void *, const void *, const void *, int, int, int, int, void *) { return -1; }
+extern "C" int mm_blaslt_run_f32(void *, const void *, const void *,
+                                  int, int, int, void *) { return -1; }
+extern "C" int mm_blaslt_run_f16(void *, const void *, const void *,
+                                  int, int, int, void *) { return -1; }
 
 extern "C" int mm_blaslt_run_bf16_bias(void *, const void *, const void *,
                                        const void *, int, int, int, void *) {
@@ -43,14 +47,27 @@ extern "C" void mm_blaslt_destroy(void) {}
 #else
 
 #include <hip/hip_runtime.h>
+#include <hipblas/hipblas.h>
 #include <hipblaslt/hipblaslt.h>
 #include <hipblaslt/hipblaslt-ext.hpp>
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cstdint>
+#include <mutex>
+#include <memory>
 #include <unordered_map>
+#include <utility>
 #include <vector>
+#include <dlfcn.h>
+
+/* rocew exports HIP entry points as function-pointer variables. A direct HIP
+ * call from this C++ translation unit can bind to that variable as executable
+ * code. Resolve the runtime functions from their library instead. */
+static hipError_t (*bridge_hip_malloc)(void **, size_t) = nullptr;
+static hipError_t (*bridge_hip_free)(void *) = nullptr;
+static const char *(*bridge_hip_error_string)(hipError_t) = nullptr;
 
 #define HBLT_RET(expr)                                                         \
   do {                                                                         \
@@ -67,7 +84,7 @@ extern "C" void mm_blaslt_destroy(void) {}
     hipError_t _err = (expr);                                                  \
     if (_err != hipSuccess) {                                                  \
       std::fprintf(stderr, "[mm_blaslt] HIP error %s:%d: %s\n", __FILE__,      \
-                   __LINE__, hipGetErrorString(_err));                         \
+                   __LINE__, bridge_hip_error_string(_err));                   \
       return -1;                                                               \
     }                                                                          \
   } while (0)
@@ -78,8 +95,14 @@ struct Plan {
   hipblasLtMatmulDesc_t matmul = nullptr;
   hipblasLtMatrixLayout_t a = nullptr, b = nullptr, c = nullptr, d = nullptr;
   hipblasLtMatmulAlgo_t algo{};
-  void *workspace = nullptr;
   size_t workspace_size = 0;
+  /* hipBLASLt workspaces are scratch, not immutable plan state.  Keep one
+   * allocation per stream so a target stream and a sidecar stream can issue
+   * the same shape concurrently without racing the old shape-global buffer. */
+  struct StreamWorkspace {
+    void *ptr = nullptr;
+  };
+  std::unordered_map<uintptr_t, StreamWorkspace> workspaces;
   bool valid = false;
 };
 
@@ -151,18 +174,42 @@ static int g_list_algos = 0;
 
 struct State {
   hipblasLtHandle_t handle = nullptr;
+  hipblasHandle_t hipblas = nullptr;
   hipblasLtMatmulPreference_t pref = nullptr;
-  std::unordered_map<ShapeKey, Plan, ShapeKeyHash> plans;
+  /* Keep Plan addresses stable after insertion.  Callers release the plan
+   * lock before enqueue so a later shape miss must not invalidate an in-flight
+   * descriptor by rehashing this cache. */
+  std::unordered_map<ShapeKey, std::unique_ptr<Plan>, ShapeKeyHash> plans;
   bool initialized = false;
   int verbose = 0;
 };
 
 State g_state;
+/* Plan creation touches the shared hipBLASLt handle and unordered-map cache.
+ * Hold this lock only for initialization/cache insertion; execution remains
+ * unlocked so independent HIP streams can overlap. */
+std::mutex g_plan_mutex;
+/* Target and sidecar streams may request the same plan concurrently.  Keep
+ * only the lazy scratch-map mutation serialized; matmul launches remain on
+ * their caller-owned streams and therefore retain overlap. */
+std::mutex g_workspace_mutex;
+/* hipBLAS (the F16 fallback) stores its stream on the shared handle.  Protect
+ * only stream selection plus enqueue; the lock is released before execution
+ * completes, so independent device work still overlaps. */
+std::mutex g_hipblas_mutex;
+/* Bias/epilogue pointers live in the cached matmul descriptor.  Serialize the
+ * attribute update with its enqueue so concurrent streams cannot submit with
+ * another caller's pointer; the lock is released before device execution. */
+std::mutex g_descriptor_mutex;
 
 void destroy_plan(Plan &p) {
-  if (p.workspace) {
-    (void)hipFree(p.workspace);
-    p.workspace = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(g_workspace_mutex);
+    for (auto &entry : p.workspaces) {
+      if (entry.second.ptr)
+        (void)bridge_hip_free(entry.second.ptr);
+    }
+    p.workspaces.clear();
   }
   if (p.d) hipblasLtMatrixLayoutDestroy(p.d);
   if (p.c) hipblasLtMatrixLayoutDestroy(p.c);
@@ -172,10 +219,37 @@ void destroy_plan(Plan &p) {
   p = Plan{};
 }
 
+/* Initialization can fail after one or more library objects have already
+ * been created.  Keep rollback in one place so optional bridge setup never
+ * leaks a handle and makes a later retry observe stale state. */
+void destroy_handles() {
+  if (g_state.pref) {
+    hipblasLtMatmulPreferenceDestroy(g_state.pref);
+    g_state.pref = nullptr;
+  }
+  if (g_state.handle) {
+    hipblasLtDestroy(g_state.handle);
+    g_state.handle = nullptr;
+  }
+  if (g_state.hipblas) {
+    hipblasDestroy(g_state.hipblas);
+    g_state.hipblas = nullptr;
+  }
+  g_state.initialized = false;
+}
+
 int build_plan(int M, int N, int K, int batch, int flags, Plan &p) {
+  if (M <= 0 || N <= 0 || K <= 0 || batch <= 0) {
+    std::fprintf(stderr,
+                 "[mm_blaslt] rejecting invalid shape M=%d N=%d K=%d batch=%d\n",
+                 M, N, K, batch);
+    return -1;
+  }
   bool with_bias = (flags & 1) != 0;
   bool gelu_bf16d = (flags & 2) != 0;
   bool bias_bf16d = (flags & 4) != 0;
+  bool f32_io = (flags & 8) != 0;
+  bool f16_io = (flags & 16) != 0;
   HBLT_RET(hipblasLtMatmulDescCreate(&p.matmul, HIPBLAS_COMPUTE_32F,
                                      HIP_R_32F));
   hipblasOperation_t trans_a = HIPBLAS_OP_T;
@@ -196,10 +270,11 @@ int build_plan(int M, int N, int K, int batch, int flags, Plan &p) {
   }
 
   hipDataType d_dt = (gelu_bf16d || bias_bf16d) ? HIP_R_16BF : HIP_R_32F;
-  /* W [N,K] BF16 row-major == [K,N] col-major with op=T */
-  HBLT_RET(hipblasLtMatrixLayoutCreate(&p.a, HIP_R_16BF, K, N, K));
-  /* X [M,K] BF16 row-major == [K,M] col-major with op=N */
-  HBLT_RET(hipblasLtMatrixLayoutCreate(&p.b, HIP_R_16BF, K, M, K));
+  hipDataType io_dt = f32_io ? HIP_R_32F : (f16_io ? HIP_R_16F : HIP_R_16BF);
+  /* W [N,K] row-major == [K,N] col-major with op=T */
+  HBLT_RET(hipblasLtMatrixLayoutCreate(&p.a, io_dt, K, N, K));
+  /* X [M,K] row-major == [K,M] col-major with op=N */
+  HBLT_RET(hipblasLtMatrixLayoutCreate(&p.b, io_dt, K, M, K));
   /* Y [M,N] D-type row-major == [N,M] col-major */
   HBLT_RET(hipblasLtMatrixLayoutCreate(&p.c, d_dt, N, M, N));
   HBLT_RET(hipblasLtMatrixLayoutCreate(&p.d, d_dt, N, M, N));
@@ -282,9 +357,6 @@ int build_plan(int M, int N, int K, int batch, int flags, Plan &p) {
 
   p.algo = results[best].algo;
   p.workspace_size = results[best].workspaceSize;
-  if (p.workspace_size > 0) {
-    HIP_RET(hipMalloc(&p.workspace, p.workspace_size));
-  }
   p.valid = true;
   if (g_state.verbose) {
     std::fprintf(stderr,
@@ -295,16 +367,79 @@ int build_plan(int M, int N, int K, int batch, int flags, Plan &p) {
   return 0;
 }
 
+static Plan *get_cached_plan(int M, int N, int K, int batch, int flags) {
+  ShapeKey key{M, N, K, batch, flags};
+  std::lock_guard<std::mutex> lock(g_plan_mutex);
+  auto it = g_state.plans.find(key);
+  if (it != g_state.plans.end()) return it->second.get();
+  auto p = std::make_unique<Plan>();
+  if (build_plan(M, N, K, batch, flags, *p) != 0) {
+    destroy_plan(*p);
+    return nullptr;
+  }
+  auto inserted = g_state.plans.emplace(key, std::move(p));
+  return inserted.first->second.get();
+}
+
+static int plan_workspace(Plan &p, hipStream_t stream, void **workspace) {
+  *workspace = nullptr;
+  if (p.workspace_size == 0) return 0;
+  const uintptr_t key = reinterpret_cast<uintptr_t>(stream);
+  std::lock_guard<std::mutex> lock(g_workspace_mutex);
+  auto it = p.workspaces.find(key);
+  if (it == p.workspaces.end()) {
+    Plan::StreamWorkspace ws;
+    hipError_t err = bridge_hip_malloc(&ws.ptr, p.workspace_size);
+    if (err != hipSuccess) {
+      std::fprintf(stderr, "[mm_blaslt] workspace allocation failed (%zu bytes, stream=%p): %s\n",
+                   p.workspace_size, static_cast<void *>(stream),
+                   bridge_hip_error_string(err));
+      return -1;
+    }
+    it = p.workspaces.emplace(key, ws).first;
+  }
+  *workspace = it->second.ptr;
+  return 0;
+}
+
 }  // namespace
 
 extern "C" int mm_blaslt_init(void) {
+  std::lock_guard<std::mutex> lock(g_plan_mutex);
   if (g_state.initialized) return 0;
-  HBLT_RET(hipblasLtCreate(&g_state.handle));
-  HBLT_RET(hipblasLtMatmulPreferenceCreate(&g_state.pref));
+  static void *runtime = dlopen("libamdhip64.so", RTLD_NOW | RTLD_LOCAL);
+  if (!runtime) {
+    std::fprintf(stderr, "[mm_blaslt] cannot load HIP runtime: %s\n", dlerror());
+    return -1;
+  }
+  bridge_hip_malloc = reinterpret_cast<decltype(bridge_hip_malloc)>(dlsym(runtime, "hipMalloc"));
+  bridge_hip_free = reinterpret_cast<decltype(bridge_hip_free)>(dlsym(runtime, "hipFree"));
+  bridge_hip_error_string = reinterpret_cast<decltype(bridge_hip_error_string)>(dlsym(runtime, "hipGetErrorString"));
+  if (!bridge_hip_malloc || !bridge_hip_free || !bridge_hip_error_string) {
+    std::fprintf(stderr, "[mm_blaslt] HIP allocation entry points unavailable\n");
+    return -1;
+  }
+  auto init_failure = [&](const char *what, hipblasStatus_t status) {
+    std::fprintf(stderr, "[mm_blaslt] %s failed status=%d\n", what,
+                 static_cast<int>(status));
+    destroy_handles();
+    return -1;
+  };
+  hipblasStatus_t status = hipblasCreate(&g_state.hipblas);
+  if (status != HIPBLAS_STATUS_SUCCESS)
+    return init_failure("hipblasCreate", status);
+  status = hipblasLtCreate(&g_state.handle);
+  if (status != HIPBLAS_STATUS_SUCCESS)
+    return init_failure("hipblasLtCreate", status);
+  status = hipblasLtMatmulPreferenceCreate(&g_state.pref);
+  if (status != HIPBLAS_STATUS_SUCCESS)
+    return init_failure("hipblasLtMatmulPreferenceCreate", status);
   uint64_t max_ws = 256ull << 20;
-  HBLT_RET(hipblasLtMatmulPreferenceSetAttribute(
+  status = hipblasLtMatmulPreferenceSetAttribute(
       g_state.pref, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &max_ws,
-      sizeof(max_ws)));
+      sizeof(max_ws));
+  if (status != HIPBLAS_STATUS_SUCCESS)
+    return init_failure("hipblasLtMatmulPreferenceSetAttribute", status);
   if (const char *v = std::getenv("MM_BLASLT_VERBOSE")) {
     g_state.verbose = std::atoi(v);
   }
@@ -337,27 +472,26 @@ extern "C" int mm_blaslt_run_bf16(void *d_y_f32, const void *d_w_bf16,
 extern "C" int mm_blaslt_run_bf16_strided_batch(
     void *d_y_f32, const void *d_w_bf16, const void *d_x_bf16,
     int M, int N, int K, int batch_count, void *stream) {
-  if (batch_count <= 1)
+  if (batch_count <= 0) {
+    std::fprintf(stderr, "[mm_blaslt] rejecting invalid batch count %d\n",
+                 batch_count);
+    return -1;
+  }
+  if (batch_count == 1)
     return mm_blaslt_run_bf16(d_y_f32, d_w_bf16, d_x_bf16, M, N, K, stream);
   if (!g_state.initialized && mm_blaslt_init() != 0) return -1;
-  ShapeKey key{M, N, K, batch_count, 0};
-  auto it = g_state.plans.find(key);
-  if (it == g_state.plans.end()) {
-    Plan p;
-    if (build_plan(M, N, K, batch_count, 0, p) != 0) {
-      destroy_plan(p);
-      return -1;
-    }
-    it = g_state.plans.emplace(key, p).first;
-  }
-  Plan &p = it->second;
+  Plan *cached = get_cached_plan(M, N, K, batch_count, 0);
+  if (!cached) return -1;
+  Plan &p = *cached;
   if (!p.valid) return -1;
+  hipStream_t hip_stream = static_cast<hipStream_t>(stream);
+  void *workspace = nullptr;
+  if (plan_workspace(p, hip_stream, &workspace) != 0) return -1;
   const float alpha = 1.0f, beta = 0.0f;
   HBLT_RET(hipblasLtMatmul(g_state.handle, p.matmul, &alpha,
                            d_w_bf16, p.a, d_x_bf16, p.b, &beta,
                            d_y_f32, p.c, d_y_f32, p.d, &p.algo,
-                           p.workspace, p.workspace_size,
-                           static_cast<hipStream_t>(stream)));
+                           workspace, p.workspace_size, hip_stream));
   return 0;
 }
 
@@ -369,6 +503,42 @@ extern "C" int mm_blaslt_run_bf16_bias(void *d_y_f32, const void *d_w_bf16,
                                           d_bias_f32, M, N, K, stream);
 }
 
+extern "C" int mm_blaslt_run_f32(void *d_y_f32, const void *d_w_f32,
+                                  const void *d_x_f32, int M, int N, int K,
+                                  void *stream) {
+  if (!g_state.initialized && mm_blaslt_init() != 0) return -1;
+  const int flags = 8;
+  Plan *cached = get_cached_plan(M, N, K, 1, flags);
+  if (!cached) return -1;
+  Plan &p = *cached;
+  if (!p.valid) return -1;
+  hipStream_t hip_stream = static_cast<hipStream_t>(stream);
+  void *workspace = nullptr;
+  if (plan_workspace(p, hip_stream, &workspace) != 0) return -1;
+  const float alpha = 1.0f, beta = 0.0f;
+  HBLT_RET(hipblasLtMatmul(g_state.handle, p.matmul, &alpha,
+                           d_w_f32, p.a, d_x_f32, p.b, &beta,
+                           d_y_f32, p.c, d_y_f32, p.d, &p.algo,
+                           workspace, p.workspace_size, hip_stream));
+  return 0;
+}
+
+extern "C" int mm_blaslt_run_f16(void *d_y_f32, const void *d_w_f16,
+                                  const void *d_x_f16, int M, int N, int K,
+                                  void *stream) {
+  const float alpha = 1.0f, beta = 0.0f;
+  if (!g_state.initialized && mm_blaslt_init() != 0) return -1;
+  std::lock_guard<std::mutex> lock(g_hipblas_mutex);
+  HBLT_RET(hipblasSetStream(g_state.hipblas, static_cast<hipStream_t>(stream)));
+  HBLT_RET(hipblasGemmEx(g_state.hipblas, HIPBLAS_OP_T, HIPBLAS_OP_N,
+                         N, M, K, &alpha,
+                         d_w_f16, HIP_R_16F, K,
+                         d_x_f16, HIP_R_16F, K, &beta,
+                         d_y_f32, HIP_R_32F, N,
+                         HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT));
+  return 0;
+}
+
 extern "C" int mm_blaslt_run_bf16_bias_residual(
     void *d_y_f32, const void *d_c_f32, const void *d_w_bf16,
     const void *d_x_bf16, const void *d_bias_f32,
@@ -378,32 +548,30 @@ extern "C" int mm_blaslt_run_bf16_bias_residual(
   }
   bool with_bias = (d_bias_f32 != nullptr);
   int flags = with_bias ? 1 : 0;
-  ShapeKey key{M, N, K, 1, flags};
-  auto it = g_state.plans.find(key);
-  if (it == g_state.plans.end()) {
-    Plan p;
-    if (build_plan(M, N, K, 1, flags, p) != 0) {
-      destroy_plan(p);
-      return -1;
-    }
-    it = g_state.plans.emplace(key, p).first;
-  }
-  Plan &p = it->second;
+  Plan *cached = get_cached_plan(M, N, K, 1, flags);
+  if (!cached) return -1;
+  Plan &p = *cached;
   if (!p.valid) return -1;
-
-  if (with_bias) {
-    HBLT_RET(hipblasLtMatmulDescSetAttribute(
-        p.matmul, HIPBLASLT_MATMUL_DESC_BIAS_POINTER, &d_bias_f32,
-        sizeof(d_bias_f32)));
-  }
+  hipStream_t hip_stream = static_cast<hipStream_t>(stream);
+  void *workspace = nullptr;
+  if (plan_workspace(p, hip_stream, &workspace) != 0) return -1;
 
   const float alpha = 1.0f;
   const float beta = (d_c_f32 != nullptr) ? 1.0f : 0.0f;
   const void *c_ptr = (d_c_f32 != nullptr) ? d_c_f32 : d_y_f32;
-  HBLT_RET(hipblasLtMatmul(g_state.handle, p.matmul, &alpha, d_w_bf16, p.a,
-                           d_x_bf16, p.b, &beta, c_ptr, p.c, d_y_f32, p.d,
-                           &p.algo, p.workspace, p.workspace_size,
-                           static_cast<hipStream_t>(stream)));
+  if (with_bias) {
+    std::lock_guard<std::mutex> lock(g_descriptor_mutex);
+    HBLT_RET(hipblasLtMatmulDescSetAttribute(
+        p.matmul, HIPBLASLT_MATMUL_DESC_BIAS_POINTER, &d_bias_f32,
+        sizeof(d_bias_f32)));
+    HBLT_RET(hipblasLtMatmul(g_state.handle, p.matmul, &alpha, d_w_bf16, p.a,
+                             d_x_bf16, p.b, &beta, c_ptr, p.c, d_y_f32, p.d,
+                             &p.algo, workspace, p.workspace_size, hip_stream));
+  } else {
+    HBLT_RET(hipblasLtMatmul(g_state.handle, p.matmul, &alpha, d_w_bf16, p.a,
+                             d_x_bf16, p.b, &beta, c_ptr, p.c, d_y_f32, p.d,
+                             &p.algo, workspace, p.workspace_size, hip_stream));
+  }
   return 0;
 }
 
@@ -418,29 +586,25 @@ extern "C" int mm_blaslt_run_bf16_bias_bf16d(
     return -1;
   }
   int flags = 1 | 4; /* bias + bf16-D */
-  ShapeKey key{M, N, K, 1, flags};
-  auto it = g_state.plans.find(key);
-  if (it == g_state.plans.end()) {
-    Plan p;
-    if (build_plan(M, N, K, 1, flags, p) != 0) {
-      destroy_plan(p);
-      return -1;
-    }
-    it = g_state.plans.emplace(key, p).first;
-  }
-  Plan &p = it->second;
+  Plan *cached = get_cached_plan(M, N, K, 1, flags);
+  if (!cached) return -1;
+  Plan &p = *cached;
   if (!p.valid) return -1;
-
-  HBLT_RET(hipblasLtMatmulDescSetAttribute(
-      p.matmul, HIPBLASLT_MATMUL_DESC_BIAS_POINTER, &d_bias_f32,
-      sizeof(d_bias_f32)));
+  hipStream_t hip_stream = static_cast<hipStream_t>(stream);
+  void *workspace = nullptr;
+  if (plan_workspace(p, hip_stream, &workspace) != 0) return -1;
 
   const float alpha = 1.0f;
   const float beta = 0.0f;
-  HBLT_RET(hipblasLtMatmul(g_state.handle, p.matmul, &alpha, d_w_bf16, p.a,
-                           d_x_bf16, p.b, &beta, d_y_bf16, p.c, d_y_bf16, p.d,
-                           &p.algo, p.workspace, p.workspace_size,
-                           static_cast<hipStream_t>(stream)));
+  {
+    std::lock_guard<std::mutex> lock(g_descriptor_mutex);
+    HBLT_RET(hipblasLtMatmulDescSetAttribute(
+        p.matmul, HIPBLASLT_MATMUL_DESC_BIAS_POINTER, &d_bias_f32,
+        sizeof(d_bias_f32)));
+    HBLT_RET(hipblasLtMatmul(g_state.handle, p.matmul, &alpha, d_w_bf16, p.a,
+                             d_x_bf16, p.b, &beta, d_y_bf16, p.c, d_y_bf16, p.d,
+                             &p.algo, workspace, p.workspace_size, hip_stream));
+  }
   return 0;
 }
 
@@ -455,46 +619,35 @@ extern "C" int mm_blaslt_run_bf16_bias_gelu_bf16d(
     return -1;
   }
   int flags = 1 | 2; /* bias + gelu+bf16-D */
-  ShapeKey key{M, N, K, 1, flags};
-  auto it = g_state.plans.find(key);
-  if (it == g_state.plans.end()) {
-    Plan p;
-    if (build_plan(M, N, K, 1, flags, p) != 0) {
-      destroy_plan(p);
-      return -1;
-    }
-    it = g_state.plans.emplace(key, p).first;
-  }
-  Plan &p = it->second;
+  Plan *cached = get_cached_plan(M, N, K, 1, flags);
+  if (!cached) return -1;
+  Plan &p = *cached;
   if (!p.valid) return -1;
-
-  HBLT_RET(hipblasLtMatmulDescSetAttribute(
-      p.matmul, HIPBLASLT_MATMUL_DESC_BIAS_POINTER, &d_bias_f32,
-      sizeof(d_bias_f32)));
+  hipStream_t hip_stream = static_cast<hipStream_t>(stream);
+  void *workspace = nullptr;
+  if (plan_workspace(p, hip_stream, &workspace) != 0) return -1;
 
   const float alpha = 1.0f;
   const float beta = 0.0f;
-  HBLT_RET(hipblasLtMatmul(g_state.handle, p.matmul, &alpha, d_w_bf16, p.a,
-                           d_x_bf16, p.b, &beta, d_y_bf16, p.c, d_y_bf16, p.d,
-                           &p.algo, p.workspace, p.workspace_size,
-                           static_cast<hipStream_t>(stream)));
+  {
+    std::lock_guard<std::mutex> lock(g_descriptor_mutex);
+    HBLT_RET(hipblasLtMatmulDescSetAttribute(
+        p.matmul, HIPBLASLT_MATMUL_DESC_BIAS_POINTER, &d_bias_f32,
+        sizeof(d_bias_f32)));
+    HBLT_RET(hipblasLtMatmul(g_state.handle, p.matmul, &alpha, d_w_bf16, p.a,
+                             d_x_bf16, p.b, &beta, d_y_bf16, p.c, d_y_bf16, p.d,
+                             &p.algo, workspace, p.workspace_size, hip_stream));
+  }
   return 0;
 }
 
 extern "C" void mm_blaslt_destroy(void) {
+  std::lock_guard<std::mutex> lock(g_plan_mutex);
   for (auto &kv : g_state.plans) {
-    destroy_plan(kv.second);
+    destroy_plan(*kv.second);
   }
   g_state.plans.clear();
-  if (g_state.pref) {
-    hipblasLtMatmulPreferenceDestroy(g_state.pref);
-    g_state.pref = nullptr;
-  }
-  if (g_state.handle) {
-    hipblasLtDestroy(g_state.handle);
-    g_state.handle = nullptr;
-  }
-  g_state.initialized = false;
+  destroy_handles();
 }
 
 #endif /* MM_BLASLT_DISABLE */

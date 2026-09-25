@@ -1,7 +1,11 @@
 /*
  * mm_blaslt_bridge.h - C-callable multi-shape hipBLASLt BF16 GEMM bridge.
  *
- * Provides a per-(M,N,K) plan cache. All plans use:
+ * Provides a per-(M,N,K) plan cache. Plans are immutable after creation and
+ * allocate scratch lazily per HIP stream, allowing independent target and
+ * sidecar streams to use the same shape concurrently. Cache and workspace
+ * insertion are safe for concurrent host callers; launches remain asynchronous
+ * on their caller-owned streams. All plans use:
  *   X row-major [M,K] BF16, W row-major [N,K] BF16, Y row-major [M,N] F32
  *   computing Y = X * W^T (no bias, no epilogue in v1).
  * hipBLASLt sees this as col-major Y^T[N,M] = W[N,K] * X^T[K,M], so
@@ -35,6 +39,17 @@ int mm_blaslt_run_bf16_strided_batch(void *d_y_f32, const void *d_w_bf16,
                                      const void *d_x_bf16,
                                      int M, int N, int K, int batch_count,
                                      void *stream);
+
+/* F32 input/weight variant used by llama.cpp's batched F32 MMF fallback. */
+int mm_blaslt_run_f32(void *d_y_f32, const void *d_w_f32,
+                      const void *d_x_f32, int M, int N, int K,
+                      void *stream);
+
+/* F16 input/weight variant with F32 accumulation and F32 output, matching
+ * llama.cpp's RDNA4 cuBLAS path for batched F16 projections. */
+int mm_blaslt_run_f16(void *d_y_f32, const void *d_w_f16,
+                      const void *d_x_f16, int M, int N, int K,
+                      void *stream);
 
 /* Same as mm_blaslt_run_bf16 but with fused F32 bias epilogue: Y = X*W^T + bias[N].
  * bias may be NULL — in that case behavior matches mm_blaslt_run_bf16. */

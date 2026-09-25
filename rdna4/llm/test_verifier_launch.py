@@ -1,0 +1,111 @@
+"""Check production verifier launch argument layouts with a recording HIP stub."""
+import os
+from pathlib import Path
+import re
+import subprocess
+import tempfile
+
+root = Path(__file__).resolve().parent
+source = (root / "hip_llm_runner.c").read_text()
+start = source.index("static inline void launch_attn_verify_native_q8(")
+end = source.index("static int launch_attn_prefill_native_q8(", start)
+function = source[start:end]
+fields = sorted(set(re.findall(r"r->(\w+)", function)))
+program = r'''
+#include <cassert>
+#include <cstdlib>
+#include <cstdio>
+#include <cstddef>
+#include <initializer_list>
+using hipFunction_t = int;
+struct hip_llm_runner {
+''' + "\n".join("    int " + name + ";" for name in fields) + r'''
+};
+static hip_llm_runner runner;
+static void *expected_gate, *expected_positions;
+static int expected_queries, expected_width, calls;
+static bool expected_specialized, expected_specialized5, expected_reuse;
+static void record(int fn, int gx, int gy, int, int bx, int, int,
+                   size_t, int, void **args) {
+    if (fn < 100) {
+        assert(fn == (!expected_reuse ? 1 :
+                      expected_queries == 8 && expected_specialized ? 3 :
+                      expected_queries == 5 && expected_specialized5 ? 4 :
+                      expected_queries <= 8 ? 2 : 1));
+        return;
+    }
+    ++calls;
+    assert(gx == runner.n_heads && bx == 256);
+    assert(gy == (expected_queries + expected_width - 1) / expected_width);
+    int i = 3;
+    if (expected_gate) {
+        assert(fn == (expected_reuse ? 100 + expected_width : 301));
+        assert(*static_cast<void **>(args[i++]) == expected_gate);
+    } else assert(fn == (expected_reuse ? 200 + expected_width : 302));
+    assert(*static_cast<void **>(args[i++]) == expected_positions);
+    assert(*static_cast<int *>(args[i++]) == runner.n_heads);
+    assert(*static_cast<int *>(args[i++]) == runner.q8_attention_nsm);
+    assert(*static_cast<int *>(args[i++]) == 11);
+    assert(*static_cast<int *>(args[i++]) == 0);
+    if (expected_reuse) assert(*static_cast<int *>(args[i++]) == expected_queries);
+}
+#define LAUNCH record
+''' + function + r'''
+int main() {
+    unsetenv("LLM_QWEN35_VERIFY_FUSED_SPLIT_COMBINE");
+    runner.n_heads = 24;
+    runner.q8_attention_nsm = 64;
+    runner.q8_attention_max_splits = 128;
+    runner.fn_q8_attention_decode = 1;
+    runner.fn_q8_attention_decode_reuse8 = 2;
+    runner.fn_q8_attention_decode_reuse_fixed8 = 3;
+    runner.fn_q8_attention_decode_reuse_fixed5 = 4;
+    runner.fn_q8_attention_combine_gate = 301;
+    runner.fn_q8_attention_combine = 302;
+    runner.fn_q8_attention_combine_verify4_gate = 104;
+    runner.fn_q8_attention_combine_verify8_gate = 108;
+    runner.fn_q8_attention_combine_verify16_gate = 116;
+    runner.fn_q8_attention_combine_verify4 = 204;
+    runner.fn_q8_attention_combine_verify8 = 208;
+    runner.fn_q8_attention_combine_verify16 = 216;
+    int gate_data, positions;
+    expected_positions = &positions;
+    int cases = 0;
+    for (int mode : {1, 2, 3})
+    for (int queries : {2, 4, 5, 7, 8, 9, 16})
+    for (bool gated : {false, true})
+    for (int specialization : {-1, 0, 1})
+    for (int specialization5 : {-1, 0, 1})
+    for (bool reuse : {false, true}) {
+        expected_specialized5 = specialization5 != 0;
+        if (specialization5 < 0) unsetenv("LLM_QWEN35_VERIFY_ATTN_FIXED5");
+        else setenv("LLM_QWEN35_VERIFY_ATTN_FIXED5", specialization5 ? "1" : "0", 1);
+        expected_reuse = reuse;
+        expected_specialized = specialization != 0;
+        if (specialization < 0) unsetenv("LLM_QWEN35_VERIFY_ATTN_FIXED8");
+        else setenv("LLM_QWEN35_VERIFY_ATTN_FIXED8", specialization ? "1" : "0", 1);
+        char value[] = {char('0' + mode), 0};
+        setenv("LLM_QWEN35_VERIFY_COMBINE_GROUPED", value, 1);
+        expected_gate = gated ? &gate_data : nullptr;
+        expected_queries = queries;
+        expected_width = !reuse ? 1 : queries <= 4 ? 4 : queries <= 8 ?
+            (mode >= 2 ? 8 : 4) : (mode >= 3 ? 16 : mode >= 2 ? 8 : 4);
+        calls = 0;
+        launch_attn_verify_native_q8(&runner, nullptr, nullptr, nullptr,
+            nullptr, nullptr, nullptr, nullptr, nullptr,
+            expected_positions, expected_gate, queries, reuse);
+        assert(calls == 1);
+        ++cases;
+    }
+    std::printf("Verifier grouped launch: %d cases PASS\n", cases);
+}
+'''
+tmp_root = root / "tmp"
+tmp_root.mkdir(exist_ok=True)
+with tempfile.TemporaryDirectory(prefix="verifier-launch-", dir=tmp_root) as directory:
+    path = Path(directory)
+    (path / "test.cpp").write_text(program)
+    subprocess.run(["c++", "-std=c++17", "-O2", "-Wall", "-Wextra", "-Werror",
+                    str(path / "test.cpp"), "-o", str(path / "test")], check=True,
+                   env=os.environ | {"TMPDIR": str(path)})
+    subprocess.run([str(path / "test")], check=True)

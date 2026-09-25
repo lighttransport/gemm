@@ -32,6 +32,7 @@ typedef struct {
 typedef struct {
     int moe_copy_pipeline, moe_copy_stream, moe_copy_ready[128], moe_compute_done[128];
     int decode_mode, n_layers, is_qwen4exp, n_experts, stream;
+    int max_seq_len, qwen35_snapshot_max_tokens;
     hip_layer *layers;
     int qwen4_prefill_copy_stream, qwen4_forward_error;
     qwen4_moe_fence qwen4_prefill_cache_fence[128];

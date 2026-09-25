@@ -3,6 +3,7 @@ set -euo pipefail
 
 root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 flash="${root_dir}/run_qwen38_flash_next_rocm.sh"
+gsq="${root_dir}/run_qwen38_gsq_rocm.sh"
 server="${root_dir}/run_qwen38_codex_server_rocm.sh"
 nextn_forward="${root_dir}/qwen4_nextn_forward.h"
 runner_c="${root_dir}/hip_llm_runner.c"
@@ -13,6 +14,344 @@ expect_contains() {
         printf 'profile test: expected %q in %s\n' "${needle}" "${haystack}" >&2
         return 1
     }
+}
+
+out="$(QWEN38_DRY_RUN=1 QWEN38_VRAM_PROFILE=16g "${gsq}")"
+expect_contains "${out}" 'Qwen3.8-27B-GSQ-RCO-IQ2_XS.gguf'
+expect_contains "${out}" 'selected_context=53248'
+expect_contains "${out}" 'kv_cache=q8q4'
+out="$(QWEN38_DRY_RUN=1 QWEN38_GSQ_KV_CACHE=q8q8 "${gsq}" -s 8192)"
+expect_contains "${out}" 'kv_cache=q8q8'
+expect_contains "${out}" 'selected_context=8192'
+out="$(QWEN38_DRY_RUN=1 QWEN38_GSQ_KV_CACHE=q8q4 "${gsq}" --kv-cache q8q8 -s 8192)"
+expect_contains "${out}" 'kv_cache=q8q8'
+# Numerical-parity policy is model-specific: pure IQ2 and mixed IQ3 enable the
+# validated IQ2_XS Q8_1 adapter, while IQ2_XXS remains direct-F32.
+grep -q 'iq2_xs_q81_default=1' "${gsq}" || {
+    echo 'profile test: pure IQ2 IQ2_XS Q8_1 default missing' >&2
+    exit 1
+}
+grep -q 'iq2_q81_default=0' "${gsq}" || {
+    echo 'profile test: pure IQ2_XXS direct-F32 default missing' >&2
+    exit 1
+}
+grep -q 'iq3_mixed_q81_default=0' "${gsq}" || {
+    echo 'profile test: pure IQ2 IQ1 direct-F32 default missing' >&2
+    exit 1
+}
+grep -q 'LLM_ATTN_DECODE_Q8Q4_VECV="\${LLM_ATTN_DECODE_Q8Q4_VECV:-\${perf_profile}}"' "${gsq}" || {
+    echo 'profile test: vectorized Q4V performance selector missing' >&2
+    exit 1
+}
+grep -q 'LLM_SSM_FUSED="\${LLM_SSM_FUSED:-\${ssm_fused_default}}"' "${gsq}" || {
+    echo 'profile test: model-specific GDN default missing' >&2
+    exit 1
+}
+grep -q 'ssm_fused_default=1' "${gsq}" || {
+    echo 'profile test: IQ3 fused GDN default missing' >&2
+    exit 1
+}
+out="$(QWEN38_DRY_RUN=1 QWEN38_VRAM_PROFILE=16g "${gsq}" -s 262144)"
+expect_contains "${out}" 'safe_context=53248'
+expect_contains "${out}" 'selected_context=53248'
+out="$(QWEN38_DRY_RUN=1 QWEN38_VRAM_PROFILE=16g "${gsq}" -s 66560 --bench-depth 65536)"
+expect_contains "${out}" 'selected_context=66560'
+out="$(QWEN38_DRY_RUN=1 QWEN38_VRAM_PROFILE=16g QWEN38_GSQ_ALLOW_UNSAFE_CONTEXT=1 "${gsq}" -s 262144)"
+expect_contains "${out}" 'selected_context=262144'
+
+grep -q 'One lane per 8-value codebook group' "${runner_c}" || {
+    echo 'profile test: full-wave IQ2_XS decode kernel missing' >&2
+    exit 1
+}
+grep -q 'matvec_q2_K_q81' "${runner_c}" || {
+    echo 'profile test: llama.cpp Q2_K Q8_1 A/B kernel missing' >&2
+    exit 1
+}
+grep -q 'cur_position >= 0 && r->cur_position < 256' "${runner_c}" || {
+    echo 'profile test: short-window Q8 combine elision missing' >&2
+    exit 1
+}
+grep -q 'LLM_QWEN35_DFLASH_INJECT_KV_FUSED' "${root_dir}/qwen35_dflash2.h" || {
+    echo 'profile test: DFlash fused injection candidate missing' >&2
+    exit 1
+}
+grep -q 'if (fused == split)' "${root_dir}/qwen35_dflash2.h" || {
+    echo 'profile test: DFlash overlap must accept fused K/V workspace' >&2
+    exit 1
+}
+grep -q 'hllm_dflash_overlap_abort' "${root_dir}/qwen35_dflash2.h" || {
+    echo 'profile test: DFlash overlap failure path must retire private stream' >&2
+    exit 1
+}
+grep -q 'inject_disabled' "${root_dir}/qwen35_dflash2.h" || {
+    echo 'profile test: DFlash overlap setup failure must fail closed' >&2
+    exit 1
+}
+grep -q '(p) = NULL' "${root_dir}/qwen35_dflash2.h" || {
+    echo 'profile test: DFlash teardown must null freed pointers' >&2
+    exit 1
+}
+grep -q 'overlap_ready' "${root_dir}/qwen35_dflash2.h" || {
+    echo 'profile test: DFlash overlap must fall back when tile capacity is exceeded' >&2
+    exit 1
+}
+grep -q 'd->inject_pending && hllm_dflash_overlap_wait' "${root_dir}/qwen35_dflash2.h" || {
+    echo 'profile test: DFlash commit must retire prior overlap work' >&2
+    exit 1
+}
+grep -q 'hllm_qwen35_dflash2_overlap_wait_reset' "${runner_c}" || {
+    echo 'profile test: reset paths must retire pending DFlash overlap work' >&2
+    exit 1
+}
+grep -q 'hllm_qwen35_dflash2_overlap_pending' "${runner_c}" || {
+    echo 'profile test: reset paths must avoid duplicate overlap fences' >&2
+    exit 1
+}
+grep -q 'hipStreamSynchronize(r->stream)' "${root_dir}/qwen35_dflash2.h" || {
+    echo 'profile test: DFlash reset wait must synchronize before restore' >&2
+    exit 1
+}
+grep -q 'r->d_act_q8_batch' "${root_dir}/qwen35_dflash2.h" || {
+    echo 'profile test: DFlash Q8_1 candidates must guard activation scratch' >&2
+    exit 1
+}
+grep -q 'q81_type' "${root_dir}/qwen35_dflash2.h" || {
+    echo 'profile test: DFlash Q8_1 projection cache type guard missing' >&2
+    exit 1
+}
+grep -q 'LLM_QWEN35_DFLASH_EMBED_BROADCAST_KERNEL' "${root_dir}/qwen35_dflash2.h" || {
+    echo 'profile test: DFlash mask broadcast candidate missing' >&2
+    exit 1
+}
+grep -q 'LLM_QWEN35_DFLASH_QKNORM_ROPE_FUSED' "${runner_c}" || {
+    echo 'profile test: DFlash K-norm/RoPE fusion candidate missing' >&2
+    exit 1
+}
+grep -q 'LLM_QWEN35_DFLASH_QKNORM_ROPE_PAIR_FUSED' "${runner_c}" || {
+    echo 'profile test: DFlash proposal Q/K norm/RoPE fusion candidate missing' >&2
+    exit 1
+}
+grep -q 'LLM_QWEN35_DFLASH_Q4K_FIXED8' "${root_dir}/qwen35_dflash2.h" || {
+    echo 'profile test: fixed-eight DFlash Q4_K candidate missing' >&2
+    exit 1
+}
+grep -q 'qwen35_matvec_q4k_q81_fixed8' "${root_dir}/qwen35_matvec_q2k.hip" || {
+    echo 'profile test: fixed-eight Q4_K device kernel missing' >&2
+    exit 1
+}
+grep -q 'LLM_QWEN35_DFLASH_QKV_FIXED8' "${root_dir}/qwen35_dflash2.h" || {
+    echo 'profile test: fixed-eight DFlash Q/K/V candidate missing' >&2
+    exit 1
+}
+grep -q 'qwen35_matvec_q4k_q81_qkv_fixed8' "${root_dir}/qwen35_matvec_q2k.hip" || {
+    echo 'profile test: fixed-eight Q/K/V device kernel missing' >&2
+    exit 1
+}
+grep -q 'LLM_QWEN35_DFLASH_SELECTOR_FUSED' "${root_dir}/qwen35_dflash2.h" || {
+    echo 'profile test: DFlash selector fusion candidate missing' >&2
+    exit 1
+}
+grep -q 'qwen35_matvec_q4k_q81_qkv_fixed7' "${root_dir}/qwen35_matvec_q2k.hip" || {
+    echo 'profile test: fixed-seven selector Q4_K kernel missing' >&2
+    exit 1
+}
+grep -q 'qwen35_matvec_q4k_q81_qkv_fixed4' "${root_dir}/qwen35_matvec_q2k.hip" || {
+    echo 'profile test: fixed-four selector Q4_K kernel missing' >&2
+    exit 1
+}
+grep -q 'queries <= 4' "${runner_c}" || {
+    echo 'profile test: verifier grouped width must be query-aware' >&2
+    exit 1
+}
+grep -q 'grouped_mode < 0' "${runner_c}" || {
+    echo 'profile test: verifier grouped mode must reject negative values' >&2
+    exit 1
+}
+grep -q 'LLM_QWEN35_Q4K_QKV_FUSED' "${runner_c}" || {
+    echo 'profile test: ordinary Q4_K QKV fusion candidate missing' >&2
+    exit 1
+}
+grep -q 'LLM_QWEN35_IQ_MIXED_QKV_FUSED' "${runner_c}" || {
+    echo 'profile test: mixed-IQ QKV fusion candidate missing' >&2
+    exit 1
+}
+grep -q 'LLM_QWEN35_IQ_MIXED_GATEUP_FUSED' "${runner_c}" || {
+    echo 'profile test: mixed-IQ gate/up fusion candidate missing' >&2
+    exit 1
+}
+grep -q 'LLM_QWEN35_IQ2S_GATEUP_FUSED' "${runner_c}" || {
+    echo 'profile test: IQ2_S gate/up fusion candidate missing' >&2
+    exit 1
+}
+grep -q 'LLM_QWEN35_IQ2S_QKV_FUSED' "${runner_c}" || {
+    echo 'profile test: IQ2_S QKV fusion candidate missing' >&2
+    exit 1
+}
+grep -q 'qwen35_matvec_iq_mixed_qkv' "${root_dir}/qwen35_matvec_iq.hip" || {
+    echo 'profile test: mixed-IQ device kernel missing' >&2
+    exit 1
+}
+grep -q 'need2s' "${root_dir}/qwen35_matvec_iq.hip" || {
+    echo 'profile test: mixed-IQ codebook staging must be format-aware' >&2
+    exit 1
+}
+grep -q 'LLM_QWEN35_IQ_MIXED_THREADS' "${runner_c}" || {
+    echo 'profile test: mixed-IQ thread geometry selector missing' >&2
+    exit 1
+}
+grep -q 'qwen35_native_q81_ready' "${runner_c}" || {
+    echo 'profile test: native Q8_1 readiness guard missing' >&2
+    exit 1
+}
+grep -q 'grid_cache\[2048\]' "${runner_c}" || {
+    echo 'profile test: fused IQ1 gate/up should stage its codebook in LDS' >&2
+    exit 1
+}
+grep -q 'd4_cached' "${runner_c}" || {
+    echo 'profile test: IQ MMQ quantizer option should be cached' >&2
+    exit 1
+}
+grep -q 'static int enabled = -1' "${runner_c}" || {
+    echo 'profile test: IQ shape-thread option should be cached' >&2
+    exit 1
+}
+grep -q '!r->d_act_scale_batch' "${runner_c}" || {
+    echo 'profile test: ordinary Q4_K candidate scratch guard missing' >&2
+    exit 1
+}
+grep -q 'n_cols <= 0' "${runner_c}" || {
+    echo 'profile test: fused one-row projections must reject zero-width shapes' >&2
+    exit 1
+}
+grep -q 'rejecting invalid shape' "${root_dir}/mm_blaslt_bridge.cpp" || {
+    echo 'profile test: hipBLASLt bridge must reject invalid GEMM shapes' >&2
+    exit 1
+}
+grep -q 'batch_count <= 0' "${root_dir}/mm_blaslt_bridge.cpp" || {
+    echo 'profile test: hipBLASLt strided batch must reject non-positive counts' >&2
+    exit 1
+}
+grep -q 'destroy_handles' "${root_dir}/mm_blaslt_bridge.cpp" || {
+    echo 'profile test: hipBLASLt init rollback helper missing' >&2
+    exit 1
+}
+grep -q 'g_workspace_mutex' "${root_dir}/mm_blaslt_bridge.cpp" || {
+    echo 'profile test: per-stream hipBLASLt workspace map must be synchronized' >&2
+    exit 1
+}
+grep -q 'g_plan_mutex' "${root_dir}/mm_blaslt_bridge.cpp" || {
+    echo 'profile test: hipBLASLt plan cache insertion must be synchronized' >&2
+    exit 1
+}
+grep -q 'unique_ptr<Plan>' "${root_dir}/mm_blaslt_bridge.cpp" || {
+    echo 'profile test: hipBLASLt plan entries must remain address-stable' >&2
+    exit 1
+}
+grep -q 'g_hipblas_mutex' "${root_dir}/mm_blaslt_bridge.cpp" || {
+    echo 'profile test: shared hipBLAS stream selection must be synchronized' >&2
+    exit 1
+}
+grep -q 'g_descriptor_mutex' "${root_dir}/mm_blaslt_bridge.cpp" || {
+    echo 'profile test: mutable hipBLASLt descriptor updates must be synchronized' >&2
+    exit 1
+}
+grep -q 'LLM_QWEN35_IQ4XS_GATEUP_FUSED' "${runner_c}" || {
+    echo 'profile test: IQ4_XS gate/up fusion candidate missing' >&2
+    exit 1
+}
+grep -q 'LLM_QWEN35_IQ2XXS_GATEUP_FUSED' "${runner_c}" || {
+    echo 'profile test: IQ2_XXS gate/up fusion candidate missing' >&2
+    exit 1
+}
+grep -q 'LLM_QWEN35_IQ3S_GATEUP_FUSED' "${runner_c}" || {
+    echo 'profile test: IQ3_S gate/up fusion candidate missing' >&2
+    exit 1
+}
+grep -q 'qwen35_attention_q8_combine_verify16' "${runner_c}" || {
+    echo 'profile test: sixteen-row verifier combine candidate missing' >&2
+    exit 1
+}
+grep -q 'LLM_QWEN35_VERIFY_FUSED_SPLIT_COMBINE' "${runner_c}" || {
+    echo 'profile test: verifier fused split/combine selector missing' >&2
+    exit 1
+}
+grep -q 'matvec_f16_llama_pair_batch_f32' "${runner_c}" || {
+    echo 'profile test: batched DeltaNet alpha/beta F16 pair kernel missing' >&2
+    exit 1
+}
+grep -q 'launch_matvec_llama_f16_pair_batch' "${root_dir}/qwen35_nextn.h" || {
+    echo 'profile test: verifier must use the batched DeltaNet F16 pair path' >&2
+    exit 1
+}
+grep -q 'LLM_QWEN35_MTP_F16_PAIR_BATCH' "${root_dir}/qwen35_nextn.h" || {
+    echo 'profile test: batched DeltaNet F16 pair path must remain opt-in' >&2
+    exit 1
+}
+grep -q 'matvec_bf16_llama_pair_batch_f32' "${runner_c}" || {
+    echo 'profile test: batched DeltaNet BF16 pair kernel missing' >&2
+    exit 1
+}
+grep -q 'launch_matvec_llama_bf16_pair_batch' "${root_dir}/qwen35_nextn.h" || {
+    echo 'profile test: verifier must expose the batched DeltaNet BF16 pair path' >&2
+    exit 1
+}
+grep -q 'LLM_QWEN35_MTP_BF16_PAIR_BATCH' "${root_dir}/qwen35_nextn.h" || {
+    echo 'profile test: batched DeltaNet BF16 pair path must remain opt-in' >&2
+    exit 1
+}
+grep -q 'qwen35_attention_q8_decode_verify_fused' "${root_dir}/qwen35_attention_q8.hip" || {
+    echo 'profile test: verifier fused split/combine kernel missing' >&2
+    exit 1
+}
+grep -q 'if (splits == 1)' "${root_dir}/qwen35_attention_q8.hip" || {
+    echo 'profile test: fused verifier short-window direct path missing' >&2
+    exit 1
+}
+grep -q 'io_vectors' "${root_dir}/qwen35_nextn.h" || {
+    echo 'profile test: fused commit IO coverage guard missing' >&2
+    exit 1
+}
+grep -q 'conv_tail' "${runner_c}" || {
+    echo 'profile test: recurrent checkpoint scalar tail guard missing' >&2
+    exit 1
+}
+grep -q 'if(!(conv_stride&3))' "${runner_c}" || {
+    echo 'profile test: recurrent unaligned stride must use scalar copy' >&2
+    exit 1
+}
+grep -q 'state_elements + 3' "${root_dir}/qwen35_nextn.h" || {
+    echo 'profile test: recurrent checkpoint grid must ceil state vectors' >&2
+    exit 1
+}
+grep -q 'm->verify_ssm_layers > 0' "${root_dir}/qwen35_nextn.h" || {
+    echo 'profile test: fused commit copy must retain zero-layer I/O fallback' >&2
+    exit 1
+}
+grep -q 'LLM_QWEN35_DELTANET_VERIFY_FIXED128' "${runner_c}" || {
+    echo 'profile test: fixed d_state=128 verifier recurrence candidate missing' >&2
+    exit 1
+}
+grep -q 'if (!state_vectors)' "${root_dir}/qwen35_nextn.h" || {
+    echo 'profile test: recurrent checkpoint grid must avoid zero launch' >&2
+    exit 1
+}
+# IQ1-only batch/MTP projections must not pay for a discarded Q8x2 tile;
+# mixed SSM roles retain an explicit preserving helper for both contracts.
+grep -q 'launch_quantize_q81_iq1_batch_preserve_q8x2' "${runner_c}" || {
+    echo 'profile test: mixed IQ1/Q8x2 staging helper missing' >&2
+    exit 1
+}
+grep -q 'ensure_batch_q8_scratch' "${runner_c}" || {
+    echo 'profile test: shared batch Q8 capacity guard missing' >&2
+    exit 1
+}
+grep -q 'r->batch_q8_valid = 0;' "${runner_c}" || {
+    echo 'profile test: direct IQ1 staging cache invalidation missing' >&2
+    exit 1
+}
+grep -q 'QWEN38_GSQ_DECODE_TARGET:-30' "${root_dir}/bench_qwen38_gsq_decode.sh" || {
+    echo 'profile test: GSQ 30 tok/s target gate missing' >&2
+    exit 1
 }
 
 # The sidecar checkpoint ring must retain the pre-anchor state at slot zero;

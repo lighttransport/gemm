@@ -1,18 +1,222 @@
 """GPU-independent regression for runner stdout transaction alignment."""
 import base64
+import hashlib
 import io
+import json
 import os
 import queue
 import threading
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from codex_server import Backend, responses_input_messages
+from codex_server import Backend, Handler, responses_input_messages, runner_command
 
 
 class ProtocolTest(unittest.TestCase):
+    def test_http_rejects_malformed_and_duplicate_requests_before_streaming(self):
+        class FakeBackend:
+            def __init__(self):
+                self.cancel_lock = threading.Lock()
+                self.request_cancellations = {}
+                self.active_cancel = None
+                self.active_request_id = None
+                self.last_metrics = {}
+                self.generate_calls = 0
+
+            def register_request(self, request_id, cancellation):
+                return Backend.register_request(self, request_id, cancellation)
+
+            def unregister_request(self, request_id, cancellation):
+                Backend.unregister_request(self, request_id, cancellation)
+
+            def cancel(self, cancellation=None):
+                del cancellation
+                return False
+
+            def cancel_request(self, request_id):
+                del request_id
+                return False
+
+            def generate(self, *args, **kwargs):
+                del args, kwargs
+                self.generate_calls += 1
+                return "ok", 0, 1, 1, "stop"
+
+        backend = FakeBackend()
+        def post(path, body):
+            raw = json.dumps(body).encode()
+            handler = Handler.__new__(Handler)
+            handler.path = path
+            handler.headers = {"Content-Length": str(len(raw))}
+            handler.rfile = io.BytesIO(raw)
+            handler.backend = backend
+            handler.model = "test"
+            handler.max_tokens = 8
+            handler.context = 128
+            handler.coding = False
+            responses = []
+            handler.send_json = lambda status, payload: responses.append(
+                (status, payload, getattr(handler, "_request_id", None)))
+            handler.do_POST()
+            self.assertEqual(len(responses), 1)
+            return responses[0]
+
+        status, payload, _ = post("/v1/chat/completions", {"messages": {}})
+        self.assertEqual(status, 400)
+        self.assertIn("array of objects", payload["error"]["message"])
+        status, payload, _ = post("/v1/cancel", {})
+        self.assertEqual(status, 404)
+        self.assertEqual(payload["status"], "request_not_found")
+
+        owner = threading.Event()
+        self.assertTrue(backend.register_request("duplicate", owner))
+        status, payload, response_id = post("/v1/chat/completions", {
+            "messages": [{"role": "user", "content": "hello"}],
+            "request_id": "duplicate", "stream": True,
+        })
+        self.assertEqual(status, 409)
+        self.assertEqual(response_id, "duplicate")
+        self.assertIn("already active", payload["error"]["message"])
+        self.assertEqual(backend.generate_calls, 0)
+        backend.unregister_request("duplicate", owner)
+
+    def test_request_registration_is_owner_checked(self):
+        backend = Backend.__new__(Backend)
+        backend.cancel_lock = threading.Lock()
+        backend.request_cancellations = {}
+        first = threading.Event()
+        second = threading.Event()
+        self.assertTrue(backend.register_request("same", first))
+        self.assertFalse(backend.register_request("same", second))
+        backend.unregister_request("same", second)
+        self.assertIs(backend.request_cancellations["same"], first)
+        backend.unregister_request("same", first)
+        self.assertNotIn("same", backend.request_cancellations)
+
+    def test_qwen35_runner_command_uses_exact_server_profile(self):
+        args = SimpleNamespace(
+            runner="./test_hip_llm", model="target.gguf", context=65536,
+            moe_cache_mb=0, coding=False, qwen4_coding_profile=False,
+            qwen4_exact=False, qwen4_mtp=None, qwen4_mtp_draft=1,
+            qwen4_mtp_cache_mb=128, qwen4_mtp_verify="scalar",
+            qwen35_server_profile=True,
+        )
+        command = runner_command(args)
+        self.assertIn("--stdio-server", command)
+        self.assertIn("--kv-cache", command)
+        self.assertIn("q8q8", command)
+        self.assertIn("--context-cache-entries", command)
+        self.assertIn("--context-cache-max-mib", command)
+        self.assertEqual(command[-2:], ["--sampling-profile", "llama"])
+
+        args.qwen35_server_profile = False
+        args.qwen35_dflash2 = "draft.gguf"
+        args.qwen35_dflash2_draft = 7
+        dflash_command = runner_command(args)
+        self.assertIn("--qwen35-dflash2", dflash_command)
+        self.assertEqual(dflash_command[-4:], ["--qwen35-dflash2", "draft.gguf",
+                                               "--qwen35-dflash2-draft", "7"])
+
+    def test_qwen35_snapshot_budget_is_forwarded(self):
+        args = SimpleNamespace(
+            runner="./test_hip_llm", model="target.gguf", context=65536,
+            moe_cache_mb=0, coding=False, qwen4_coding_profile=False,
+            qwen4_exact=False, qwen4_mtp=None, qwen4_mtp_draft=1,
+            qwen4_mtp_cache_mb=128, qwen4_mtp_verify="scalar",
+            qwen35_server_profile=False, qwen35_dflash2="draft.gguf",
+            qwen35_dflash2_draft=7, qwen35_snapshot_max_tokens=65536,
+        )
+        command = runner_command(args)
+        self.assertIn("--qwen35-snapshot-max-tokens", command)
+        i = command.index("--qwen35-snapshot-max-tokens")
+        self.assertEqual(command[i + 1], "65536")
+
+    def test_qwen35_profiles_are_mutually_exclusive(self):
+        args = SimpleNamespace(
+            runner="./test_hip_llm", model="target.gguf", context=4096,
+            moe_cache_mb=0, coding=False, qwen4_coding_profile=False,
+            qwen4_exact=False, qwen4_mtp=None, qwen35_server_profile=True,
+            qwen35_dflash2="draft.gguf",
+        )
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            runner_command(args)
+
+    def test_dflash_rejects_qwen4_mtp(self):
+        args = SimpleNamespace(
+            runner="./test_hip_llm", model="target.gguf", context=4096,
+            moe_cache_mb=0, coding=False, qwen4_coding_profile=False,
+            qwen4_exact=False, qwen4_mtp="draft.gguf",
+            qwen35_server_profile=False, qwen35_dflash2="dflash.gguf",
+        )
+        with self.assertRaisesRegex(ValueError, "cannot be combined"):
+            runner_command(args)
+
+    def test_qwen35_mtp_runner_command_is_exact_and_mutually_exclusive(self):
+        args = SimpleNamespace(
+            runner="./test_hip_llm", model="target.gguf", context=4096,
+            moe_cache_mb=0, coding=False, qwen4_coding_profile=False,
+            qwen4_exact=False, qwen4_mtp=None, qwen35_server_profile=False,
+            qwen35_dflash2=None, qwen35_mtp="nextn.gguf",
+            qwen35_mtp_draft=3, qwen35_mtp_window=True,
+        )
+        command = runner_command(args)
+        self.assertEqual(command[-5:], ["--qwen35-mtp", "nextn.gguf",
+                                        "--qwen35-mtp-draft", "3",
+                                        "--qwen35-mtp-window"])
+        args.qwen35_mtp_window = False
+        self.assertEqual(runner_command(args)[-1], "--qwen35-mtp-window")
+        args.qwen35_mtp_draft = 16
+        with self.assertRaisesRegex(ValueError, "must be 1..15"):
+            runner_command(args)
+        args.qwen35_mtp_draft = 3
+        args.qwen35_dflash2 = "dflash.gguf"
+        with self.assertRaisesRegex(ValueError, "cannot be combined"):
+            runner_command(args)
+
+    def test_seed_uses_versioned_reference_sampler_request(self):
+        backend = Backend.__new__(Backend)
+        backend.lock = threading.Lock()
+        backend.cancel_lock = threading.Lock()
+        backend.active_cancel = None
+        backend.ready = True
+        backend.proc = SimpleNamespace(
+            poll=lambda: None, stdin=io.StringIO(),
+            stdout=io.StringIO("OK 0 1 0 stop \n"))
+        backend.generate("test", 4, .6, .95, 0, 1.5, 1.1, .05,
+                         seed=42, frequency=.2, penalty_last_n=32)
+        identity = hashlib.sha256(b"shared").hexdigest()
+        self.assertEqual(backend.proc.stdin.getvalue(),
+                         f"REQ3 {identity} 42 4 0.6 0.95 0 1.5 1.1 0.05 0.2 32 - dGVzdA==\n")
+
+    def test_cache_identity_is_stable_and_namespaced(self):
+        backend = Backend.__new__(Backend)
+        backend.lock = threading.Lock()
+        backend.cancel_lock = threading.Lock()
+        backend.active_cancel = None
+        backend.ready = True
+        backend.proc = SimpleNamespace(
+            poll=lambda: None, stdin=io.StringIO(),
+            stdout=io.StringIO("OK 0 1 0 stop \nOK 0 1 0 stop \n"))
+        backend.generate("test", 0, 0, .95, 20, 0, 1, 0,
+                         cache_key="conversation-a")
+        backend.generate("test", 0, 0, .95, 20, 0, 1, 0,
+                         cache_key="conversation-b")
+        lines = backend.proc.stdin.getvalue().splitlines()
+        self.assertEqual(lines[0].split()[1],
+                         hashlib.sha256(b"conversation-a").hexdigest())
+        self.assertEqual(lines[1].split()[1],
+                         hashlib.sha256(b"conversation-b").hexdigest())
+        self.assertNotEqual(lines[0].split()[1], lines[1].split()[1])
+
+    def test_oversized_runner_request_is_rejected_before_dispatch(self):
+        backend = Backend.__new__(Backend)
+        with self.assertRaisesRegex(ValueError, "runner protocol limit"):
+            backend.generate("x" * (4 * 1024 * 1024), 1, 0, .95, 20,
+                             0, 1, 0)
+
     def test_responses_tool_output_is_preserved(self):
         messages = responses_input_messages([
             {"role": "user", "content": "Call echo."},
@@ -73,6 +277,8 @@ class ProtocolTest(unittest.TestCase):
             "status": "unavailable",
             "runner_alive": False,
             "runner_exit_status": 1,
+            "active_request": None,
+            "queued_requests": 0,
         })
 
     def test_close_reaps_running_runner(self):
@@ -114,25 +320,29 @@ class ProtocolTest(unittest.TestCase):
             stdout=SimpleNamespace(readline=lambda: replies.get(timeout=5)))
         first, second = threading.Event(), threading.Event()
 
-        def generate(event):
+        def generate(event, request_id):
             return backend.generate("test", 4, 1, .95, 40, 0, 1, .01,
-                                    cancellation=event)
+                                    cancellation=event, request_id=request_id)
 
         with patch("codex_server.os.kill") as kill, ThreadPoolExecutor(2) as pool:
-            active = pool.submit(generate, first)
+            active = pool.submit(generate, first, "active")
             self.assertTrue(submitted.wait(2))
-            queued = pool.submit(generate, second)
-            second.set()
-            backend.cancel(second)
+            queued = pool.submit(generate, second, "queued")
+            for _ in range(100):
+                with backend.cancel_lock:
+                    if "queued" in backend.request_cancellations:
+                        break
+                time.sleep(0.005)
+            self.assertTrue(backend.cancel_request("queued"))
             kill.assert_not_called()
             self.assertFalse(first.is_set())
-            backend.cancel(first)
+            self.assertTrue(backend.cancel_request("active"))
             kill.assert_called_once()
             replies.put("OK 0 0 0 cancelled \n")
             self.assertEqual(active.result(timeout=2)[4], "cancelled")
             self.assertEqual(queued.result(timeout=2)[4], "cancelled")
-            self.assertEqual(stdin.getvalue().count("REQ "), 1)
-            backend.cancel(first)
+            self.assertEqual(stdin.getvalue().count("REQ3 "), 1)
+            self.assertFalse(backend.cancel_request("active"))
             self.assertEqual(kill.call_count, 1)
 
     def test_cancelled_during_startup_is_not_dispatched(self):

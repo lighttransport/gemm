@@ -31,6 +31,28 @@ typedef enum {
     HIP_LLM_MOE_GPU_STREAM,
 } hip_llm_moe_mode;
 
+typedef enum {
+    HIP_LLM_KV_AUTO = 0,
+    HIP_LLM_KV_F32,
+    HIP_LLM_KV_F16,
+    /* Explicit llama.cpp-compatible full-attention cache: q8_0 K/q4_0 V. */
+    HIP_LLM_KV_Q8_0_Q4_0,
+    /* Q8_0 for both K and V; supported by Qwen3.5 hybrid attention. */
+    HIP_LLM_KV_Q8_0_Q8_0,
+} hip_llm_kv_cache_type;
+
+typedef enum {
+    HIP_LLM_DECODE_KERNEL_DEFAULT = 0,
+    HIP_LLM_DECODE_KERNEL_NATIVE,
+    HIP_LLM_DECODE_KERNEL_DP4A2,
+    HIP_LLM_DECODE_KERNEL_AUTO,
+} hip_llm_decode_kernel_mode;
+
+typedef enum {
+    HIP_LLM_DECODE_LAYOUT_NATIVE = 0,
+    HIP_LLM_DECODE_LAYOUT_AUTO_REPACK,
+} hip_llm_decode_layout_mode;
+
 typedef struct {
     uint32_t struct_size;
     int max_seq_len;              /* <= 0: model default */
@@ -41,6 +63,28 @@ typedef struct {
     uint64_t gpu_reserve_bytes;   /* 0: default 1 GiB */
     int qwen4_prefill_staging;    /* opt-in two-tier Qwen4 batched prefill */
     uint64_t qwen4_prefill_stage_bytes; /* 0: 512 MiB when staging is enabled */
+    hip_llm_kv_cache_type kv_cache_type;
+    hip_llm_decode_kernel_mode decode_kernel_mode;
+    hip_llm_decode_layout_mode decode_layout_mode;
+    const char *decode_layout_cache_path; /* borrowed for the duration of load */
+    uint64_t decode_layout_budget_bytes;
+    /* Prefill microbatch size. 0 keeps the backend default (512 for Qwen3.5). */
+    int prefill_batch_tokens;
+    /* 0: quality-safe scalar dispatcher; 1: enable Qwen3.5 batched path. */
+    int qwen35_batched_prefill;
+    /* Experimental BF16 projection GEMMs during Qwen3.5 prefill only.
+     * Changes quantized projection arithmetic; decode remains unchanged. */
+    int qwen35_prefill_bf16;
+    /* Opt-in graph-safe Q8/Q8 decode; arithmetic matches uncaptured decode. */
+    int qwen35_decode_graph;
+    /* Diagnostic reference arithmetic profile; whole-model parity is WIP. */
+    int qwen35_reference_math;
+    /* Native Q8/Q8 D=256 decode using the pinned gfx1201 attention order. */
+    int qwen35_native_q8_attention;
+    /* Extend native Q8/Q8 attention to prefill (also enables native decode). */
+    int qwen35_native_q8_prefill;
+    int qwen35_native_q2k; /* precise Q2_K x Q8_1 decode on gfx1201 */
+    int qwen35_native_mmvq; /* also IQ2_XXS/XS/S, IQ3_XXS/S with precise Q8_1 staging */
 } hip_llm_load_options;
 
 typedef struct {
@@ -117,6 +161,38 @@ int hip_llm_qwen4_mtp_configure(hip_llm_runner *r, size_t cache_bytes, int draft
 int hip_llm_qwen4_mtp_set_verify(hip_llm_runner *r, int window);
 /* Borrowed host logits for the current committed target state. */
 float *hip_llm_current_logits(hip_llm_runner *r);
+/* Dense Qwen3.5/3.8 NextN owns its weights and KV. Proposals never advance
+ * target state or sampler RNG; the caller must verify every proposed token.
+ * The draft starts a fresh KV prefix at the first generation position. */
+int hip_llm_qwen35_mtp_load(hip_llm_runner *r, const char *path,
+                           char *error, size_t error_cap);
+int hip_llm_qwen35_mtp_propose(hip_llm_runner *r, int32_t anchor, int position,
+                              int count, int32_t *drafts);
+/* Verify a window, then commit exactly its accepted input prefix before any
+ * new proposal/target forward. Requires Q8/Q8 KV and the native decode graph.
+ * The first window fixes capacity (1..16 rows); later windows may be smaller.
+ * Logits are row-major and borrowed until the next verification call.
+ * Commit accepts 1..rows inputs, including the anchor. On an execution error
+ * reset the target before reuse; partially executed GPU work is not reusable. */
+float *hip_llm_qwen35_mtp_verify(hip_llm_runner *r, const int32_t *tokens,
+                                int rows, int position);
+/* Greedy verifier variant: reduce logits on the GPU and return one token ID
+ * per row.  The target transaction and commit contract are unchanged. */
+int hip_llm_qwen35_mtp_verify_argmax(hip_llm_runner *r, const int32_t *tokens,
+                                    int rows, int position, int32_t *argmax);
+int hip_llm_qwen35_mtp_commit(hip_llm_runner *r, int processed);
+/* Discard only the dense draft transaction/history. Target prompt state and
+ * logits remain live. Call at every independent serving request boundary. */
+void hip_llm_qwen35_mtp_reset(hip_llm_runner *r);
+
+/* Qwen3.8 DFlash2 block-diffusion drafter. Target verification remains exact;
+ * only verified target tokens are committed to the caller. */
+int hip_llm_qwen35_dflash2_load(hip_llm_runner *r, const char *path,
+                               char *error, size_t error_cap);
+int hip_llm_qwen35_dflash2_propose(hip_llm_runner *r, int32_t anchor,
+                                  int position, int count, int32_t *drafts);
+int hip_llm_qwen35_dflash2_commit(hip_llm_runner *r, int position,
+                                 int processed);
 /* Run target forward and return only the greedy token; avoids a full-vocab
  * device-to-host copy during speculative verification. */
 int hip_llm_forward_argmax(hip_llm_runner *r, int32_t token_id, int position);
@@ -234,9 +310,12 @@ void hip_llm_offload(hip_llm_runner *r);
 /* Reset all SSM state (conv + recurrent). Call between conversations for hybrid models. */
 void hip_llm_reset_state(hip_llm_runner *r);
 void hip_llm_set_decode_mode(hip_llm_runner *r, int enabled);
+/* Bound host-side Qwen3.8 Q8 KV snapshots; zero restores the 16K default. */
+void hip_llm_set_qwen35_snapshot_max_tokens(hip_llm_runner *r, int tokens);
 
-/* Save/restore recurrent state at a prompt boundary. KV entries remain in
- * their positional device cache, so this snapshots only hybrid SSM/PLE state.
+/* Save/restore request state at a prompt boundary. Hybrid SSM/PLE state and
+ * DFlash2 sidecar state are always captured; bounded Qwen3.8 Q8 KV rows are
+ * included when available so a cache hit can resume without prompt replay.
  * The opaque snapshot is owned by the caller and may be reused across turns. */
 hip_llm_state_snapshot *hip_llm_snapshot_state(hip_llm_runner *r);
 /* Snapshot only the attention KV slots in [start_pos, start_pos+n_positions).
@@ -245,6 +324,14 @@ hip_llm_state_snapshot *hip_llm_snapshot_state_window(hip_llm_runner *r,
                                                        int start_pos,
                                                        int n_positions);
 int hip_llm_restore_state(hip_llm_runner *r, const hip_llm_state_snapshot *snapshot);
+/* Size of owned host buffers, for bounded multi-context snapshot caches. */
+size_t hip_llm_state_snapshot_bytes(const hip_llm_state_snapshot *snapshot);
+/* True when the snapshot contains every position-dependent cache row needed
+ * to restore it after another conversation has used the runner. */
+int hip_llm_state_snapshot_is_portable(const hip_llm_state_snapshot *snapshot);
+/* Number of prefix tokens represented by the snapshot.  Portable prompt
+ * caches must compare this with their token key before publishing it. */
+int hip_llm_state_snapshot_token_count(const hip_llm_state_snapshot *snapshot);
 void hip_llm_free_state_snapshot(hip_llm_state_snapshot *snapshot);
 
 /* Read last hidden state (d_x) from GPU into dst. n = n_embd. */

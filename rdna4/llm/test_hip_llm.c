@@ -36,6 +36,8 @@
 
 /* HIP LLM runner */
 #include "hip_llm_runner.h"
+#include "reference_sampler.h"
+#include "generation_trace.h"
 
 /* ---- Comparison helpers ---- */
 
@@ -115,6 +117,32 @@ static int sample_top_k_p(const float *logits, int n, int top_k, float top_p,
 }
 
 static int argmax_logits(const float *logits, int n);
+
+/* Vocabulary strings use GPT-2/Qwen's byte-to-Unicode display alphabet.
+ * Decode every piece before it reaches a user-visible stream so spaces,
+ * newlines, arbitrary UTF-8, and byte-fallback tokens are emitted as bytes
+ * rather than tokenizer markers such as U+0120/U+010A (Ġ/Ċ). */
+static void print_decoded_token(FILE *stream, const bpe_vocab *vocab, int token_id) {
+    const char *piece = bpe_token_to_str(vocab, token_id);
+    if (!stream || !piece) return;
+    int decoded_len = 0;
+    char *decoded = bpe_byte_decode(piece, (int)strlen(piece), &decoded_len);
+    if (!decoded) return;
+    if (decoded_len > 0)
+        fwrite(decoded, 1, (size_t)decoded_len, stream);
+    free(decoded);
+}
+
+static int is_generation_stop(const bpe_vocab *vocab, int token_id,
+                              int eos, int eot) {
+    if (token_id == eos || token_id == eot) return 1;
+    /* Some converted vocabularies contain duplicate control-token strings.
+     * Match the piece as well as the metadata ID so benchmark text never
+     * exposes a duplicate ChatML turn terminator. */
+    const char *piece = bpe_token_to_str(vocab, token_id);
+    return piece && (strcmp(piece, "<|im_end|>") == 0 ||
+                     strcmp(piece, "<|endoftext|>") == 0);
+}
 
 /* Coding-only sampler variant. Keep the production sampler above with its
  * small standalone signature because test_sampler.py extracts it directly;
@@ -242,20 +270,174 @@ static int prompt_bos_id(const gguf_context *gguf) {
         (int)gguf->kv[id].value.u32 : -1;
 }
 
+typedef struct {
+    int32_t *tokens;
+    int n_tokens;
+    char *identity;
+    hip_llm_state_snapshot *snapshot;
+    size_t bytes;
+    uint64_t age;
+    int portable;
+} stdio_snapshot_entry;
+
+typedef struct {
+    stdio_snapshot_entry *entries;
+    int capacity;
+    size_t byte_limit;
+    size_t bytes;
+    uint64_t clock;
+} stdio_snapshot_cache;
+
+static void stdio_snapshot_entry_clear(stdio_snapshot_cache *cache, int i) {
+    stdio_snapshot_entry *entry = &cache->entries[i];
+    if (entry->snapshot) {
+        if (cache->bytes >= entry->bytes) cache->bytes -= entry->bytes;
+        else cache->bytes = 0;
+    }
+    free(entry->tokens);
+    free(entry->identity);
+    hip_llm_free_state_snapshot(entry->snapshot);
+    memset(entry, 0, sizeof(*entry));
+}
+
+static int stdio_snapshot_cache_init(stdio_snapshot_cache *cache, int capacity,
+                                     size_t byte_limit) {
+    memset(cache, 0, sizeof(*cache));
+    if (capacity < 0) capacity = 0;
+    cache->capacity = capacity;
+    cache->byte_limit = byte_limit;
+    if (capacity == 0 || byte_limit == 0) return 0;
+    cache->entries = calloc((size_t)capacity, sizeof(*cache->entries));
+    return cache->entries ? 0 : -1;
+}
+
+static void stdio_snapshot_cache_free(stdio_snapshot_cache *cache) {
+    if (!cache) return;
+    for (int i = 0; i < cache->capacity; ++i)
+        stdio_snapshot_entry_clear(cache, i);
+    free(cache->entries);
+    memset(cache, 0, sizeof(*cache));
+}
+
+static void stdio_snapshot_cache_drop_resident(stdio_snapshot_cache *cache) {
+    if (!cache || !cache->entries) return;
+    for (int i = 0; i < cache->capacity; ++i)
+        if (cache->entries[i].snapshot && !cache->entries[i].portable)
+            stdio_snapshot_entry_clear(cache, i);
+}
+
+static int stdio_snapshot_cache_find(const stdio_snapshot_cache *cache,
+                                     const char *identity,
+                                     const int32_t *tokens, int n_tokens,
+                                     int allow_resident) {
+    int best = -1;
+    for (int i = 0; i < cache->capacity; ++i) {
+        const stdio_snapshot_entry *entry = &cache->entries[i];
+        if (!entry->snapshot || entry->n_tokens > n_tokens ||
+            (!entry->portable && !allow_resident) ||
+            strcmp(entry->identity, identity) != 0) continue;
+        if (memcmp(entry->tokens, tokens,
+                   (size_t)entry->n_tokens * sizeof(*tokens)) != 0) continue;
+        if (best < 0 || entry->n_tokens > cache->entries[best].n_tokens)
+            best = i;
+    }
+    return best;
+}
+
+/* Takes ownership of snapshot whether it is retained or rejected. */
+static int stdio_snapshot_cache_publish(stdio_snapshot_cache *cache,
+                                        const char *identity,
+                                        const int32_t *tokens, int n_tokens,
+                                        hip_llm_state_snapshot *snapshot) {
+    if (!snapshot) return 0;
+    size_t state_bytes = hip_llm_state_snapshot_bytes(snapshot);
+    size_t bytes = state_bytes + (size_t)n_tokens * sizeof(*tokens) +
+                   strlen(identity) + 1;
+    int snapshot_tokens = hip_llm_state_snapshot_token_count(snapshot);
+    int portable = hip_llm_state_snapshot_is_portable(snapshot);
+    if (snapshot_tokens != n_tokens || !cache->entries ||
+        n_tokens <= 0 || bytes > cache->byte_limit) {
+        fprintf(stderr,
+                "llm_server: context snapshot rejected tokens=%d state_tokens=%d portable=%d "
+                "bytes=%.1f MiB limit=%.1f MiB\n",
+                n_tokens, snapshot_tokens,
+                hip_llm_state_snapshot_is_portable(snapshot),
+                bytes / (double)(1ULL << 20),
+                cache->byte_limit / (double)(1ULL << 20));
+        hip_llm_free_state_snapshot(snapshot);
+        return 0;
+    }
+    int32_t *token_copy = malloc((size_t)n_tokens * sizeof(*tokens));
+    char *identity_copy = strdup(identity);
+    if (!token_copy || !identity_copy) {
+        free(token_copy); free(identity_copy);
+        hip_llm_free_state_snapshot(snapshot);
+        return -1;
+    }
+    memcpy(token_copy, tokens, (size_t)n_tokens * sizeof(*tokens));
+    int slot = -1;
+    for (int i = 0; i < cache->capacity; ++i) {
+        stdio_snapshot_entry *entry = &cache->entries[i];
+        if (entry->snapshot && entry->n_tokens == n_tokens &&
+            strcmp(entry->identity, identity) == 0 &&
+            memcmp(entry->tokens, tokens,
+                   (size_t)n_tokens * sizeof(*tokens)) == 0) {
+            slot = i;
+            break;
+        }
+        if (!entry->snapshot && slot < 0) slot = i;
+    }
+    size_t replaced = slot >= 0 && cache->entries[slot].snapshot ?
+                      cache->entries[slot].bytes : 0;
+    while (cache->bytes - replaced + bytes > cache->byte_limit || slot < 0) {
+        int oldest = -1;
+        for (int i = 0; i < cache->capacity; ++i)
+            if (i != slot && cache->entries[i].snapshot &&
+                (oldest < 0 || cache->entries[i].age < cache->entries[oldest].age))
+                oldest = i;
+        if (oldest < 0) break;
+        stdio_snapshot_entry_clear(cache, oldest);
+        if (slot < 0) slot = oldest;
+    }
+    replaced = slot >= 0 && cache->entries[slot].snapshot ?
+               cache->entries[slot].bytes : 0;
+    if (slot < 0 || cache->bytes - replaced + bytes > cache->byte_limit) {
+        free(token_copy); free(identity_copy);
+        hip_llm_free_state_snapshot(snapshot);
+        return 0;
+    }
+    stdio_snapshot_entry_clear(cache, slot);
+    cache->entries[slot] = (stdio_snapshot_entry) {
+        .tokens = token_copy, .n_tokens = n_tokens,
+        .identity = identity_copy, .snapshot = snapshot,
+        .bytes = bytes, .age = ++cache->clock,
+        .portable = portable,
+    };
+    cache->bytes += bytes;
+    fprintf(stderr,
+            "llm_server: context snapshot committed slot=%d kind=%s tokens=%d "
+            "bytes=%.1f MiB cache=%.1f MiB\n",
+            slot, portable ? "portable" : "resident", n_tokens,
+            bytes / (double)(1ULL << 20),
+            cache->bytes / (double)(1ULL << 20));
+    return 1;
+}
+
 static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
-                            int n_vocab, int max_seq_len, int bos_id, int mtp_draft) {
+                            int n_vocab, int max_seq_len, int bos_id, int mtp_draft,
+                            int dense_mtp_draft, int dense_mtp_window,
+                            int dflash_draft,
+                            int coding_mode, const hllm_sampler_config *sampling_defaults,
+                            int context_cache_entries, size_t context_cache_bytes) {
     char line[4 * 1024 * 1024];
     int32_t *cache = (int32_t *)malloc((size_t)max_seq_len * sizeof(int32_t));
-    int32_t *prefix_cache = (int32_t *)malloc((size_t)max_seq_len * sizeof(int32_t));
-    int32_t *prompt_cache = (int32_t *)malloc((size_t)max_seq_len * sizeof(int32_t));
     int cache_n = 0;
-    int prefix_cache_n = 0;
-    int prompt_cache_n = 0;
-    hip_llm_state_snapshot *prefix_snapshot = NULL;
-    hip_llm_state_snapshot *prompt_snapshot = NULL;
+    char active_identity[513] = "";
+    stdio_snapshot_cache snapshot_cache;
     unsigned rng = 0x51f15e5du;
-    if (!cache || !prefix_cache || !prompt_cache) {
-        free(cache); free(prefix_cache); free(prompt_cache); return 1;
+    if (!cache || stdio_snapshot_cache_init(&snapshot_cache,
+            context_cache_entries, context_cache_bytes) != 0) {
+        free(cache); return 1;
     }
     signal(SIGUSR1, stdio_cancel_handler);
     fprintf(stderr, "JSONL backend ready (max_seq_len=%d)\n", max_seq_len);
@@ -264,18 +446,69 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
     fflush(stdout);
     while (fgets(line, sizeof(line), stdin)) {
         g_stdio_cancel = 0;
+        size_t line_len = strlen(line);
+        if (line_len == sizeof(line) - 1 && line[line_len - 1] != '\n') {
+            int ch;
+            while ((ch = fgetc(stdin)) != '\n' && ch != EOF) {}
+            puts("ERR request too large");
+            fflush(stdout);
+            continue;
+        }
         int max_tokens = 16, top_k = 20;
         float temperature = 0.2f, top_p = 0.95f, presence = 0.0f;
         float repetition = 1.0f, min_p = 0.0f;
         char *b64 = NULL, *prefix_b64 = NULL;
+        const char *cache_identity = "shared";
+        hllm_sampler_config request_sampling;
+        hllm_sampler_defaults(&request_sampling);
+        if (sampling_defaults) request_sampling = *sampling_defaults;
+        int use_reference = sampling_defaults != NULL;
+        int version3 = !strncmp(line, "REQ3 ", 5);
+        int version2 = !strncmp(line, "REQ2 ", 5);
         static char b64buf[sizeof(line)];
         static char prefix_b64buf[sizeof(line)];
+        static char cache_identity_buf[513];
+        int fields = 0;
+        if (version3) {
+            char seed_text[32], extra, *end = NULL;
+            int n = sscanf(line + 5, "%512s %31s %d %f %f %d %f %f %f %f %d %4194303s %4194303s %c",
+                cache_identity_buf, seed_text, &max_tokens, &temperature, &top_p,
+                &top_k, &presence, &repetition, &min_p,
+                &request_sampling.frequency, &request_sampling.penalty_last_n,
+                prefix_b64buf, b64buf, &extra);
+            if (n != 13 || strlen(cache_identity_buf) > 512) {
+                puts("ERR invalid REQ3"); fflush(stdout); continue;
+            }
+            cache_identity = cache_identity_buf;
+            if (strcmp(seed_text, "-") != 0) {
+                unsigned long seed = strtoul(seed_text, &end, 10);
+                if (seed_text[0] == '-' || !end || *end || seed >= UINT32_MAX) {
+                    puts("ERR invalid REQ3"); fflush(stdout); continue;
+                }
+                request_sampling.seed = seed;
+                use_reference = 1;
+            }
+            fields = 9;
+        } else if (version2) {
+            char seed_text[32], extra, *end = NULL;
+            int n = sscanf(line + 5, "%31s %d %f %f %d %f %f %f %f %d %4194303s %4194303s %c",
+                seed_text, &max_tokens, &temperature, &top_p, &top_k, &presence,
+                &repetition, &min_p, &request_sampling.frequency,
+                &request_sampling.penalty_last_n, prefix_b64buf, b64buf, &extra);
+            unsigned long seed = n > 0 ? strtoul(seed_text, &end, 10) : UINT32_MAX;
+            if (n != 12 || seed_text[0] == '-' || !end || *end || seed >= UINT32_MAX) {
+                puts("ERR invalid REQ2"); fflush(stdout); continue;
+            }
+            request_sampling.seed = seed;
+            fields = 9;
+            use_reference = 1;
+        } else {
         if (strncmp(line, "REQ ", 4) != 0 ||
             sscanf(line + 4, "%d %f %f %d %f ", &max_tokens, &temperature,
                    &top_p, &top_k, &presence) != 5) {
             puts("ERR invalid request"); fflush(stdout); continue;
         }
-        int fields = sscanf(line + 4, "%d %f %f %d %f %f %f %4194303s %4194303s", &max_tokens,
+        fields = sscanf(line + 4, "%d %f %f %d %f %f %f %4194303s %4194303s", &max_tokens,
                             &temperature, &top_p, &top_k, &presence,
                             &repetition, &min_p, prefix_b64buf, b64buf);
         if (fields != 9) {
@@ -292,12 +525,25 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
         if (fields != 9 && fields != 7 && fields != 6) {
             puts("ERR missing prompt"); fflush(stdout); continue;
         }
-        if (max_tokens < 0 || top_k < 1 ||
+        }
+        if (use_reference && (coding_mode || mtp_draft > 0)) {
+            puts("ERR reference sampling incompatible with coding/Qwen4 MTP"); fflush(stdout); continue;
+        }
+        if (max_tokens < 0 || (!use_reference && top_k < 1) ||
             !isfinite(temperature) || temperature < 0.0f ||
             !isfinite(top_p) || top_p < 0.0f || top_p > 1.0f ||
             !isfinite(presence) || !isfinite(repetition) || repetition <= 0.0f ||
             !isfinite(min_p) ||
             min_p < 0.0f || min_p > 1.0f) {
+            puts("ERR invalid sampling"); fflush(stdout); continue;
+        }
+        request_sampling.top_k = top_k;
+        request_sampling.top_p = top_p;
+        request_sampling.min_p = min_p;
+        request_sampling.temperature = temperature;
+        request_sampling.repetition = repetition;
+        request_sampling.presence = presence;
+        if (!isfinite(request_sampling.frequency) || request_sampling.penalty_last_n < 0) {
             puts("ERR invalid sampling"); fflush(stdout); continue;
         }
         prefix_b64 = fields >= 7 ? prefix_b64buf : NULL;
@@ -347,42 +593,72 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
         }
         free(prefix_tokens); free(prefix);
         int common = 0;
-        while (common < cache_n && common < n_tokens && cache[common] == tokens[common]) common++;
-        int prompt_matches_cache = prompt_cache_n > 0 && prompt_cache_n <= n_tokens &&
-                                   prompt_snapshot != NULL;
-        for (int i = 0; prompt_matches_cache && i < prompt_cache_n; ++i)
-            if (prompt_cache[i] != tokens[i]) prompt_matches_cache = 0;
-        int prefix_matches_cache = requested_prefix > 0 && requested_prefix == prefix_cache_n;
-        for (int i = 0; prefix_matches_cache && i < requested_prefix; ++i)
-            if (prefix_cache[i] != tokens[i]) prefix_matches_cache = 0;
-        int restored_prefix = 0;
-        int restored_prompt = 0;
-        if (common != cache_n && prompt_matches_cache &&
-            hip_llm_restore_state(gpu, prompt_snapshot) == 0) {
-            memcpy(cache, prompt_cache, (size_t)prompt_cache_n * sizeof(int32_t));
-            cache_n = prompt_cache_n;
-            common = prompt_cache_n;
-            restored_prompt = 1;
-        } else if (common != cache_n && prefix_matches_cache && prefix_snapshot &&
-            hip_llm_restore_state(gpu, prefix_snapshot) == 0) {
-            memcpy(cache, prefix_cache, (size_t)prefix_cache_n * sizeof(int32_t));
-            cache_n = prefix_cache_n;
-            common = prefix_cache_n;
-            restored_prefix = 1;
+        if (strcmp(active_identity, cache_identity) == 0)
+            while (common < cache_n && common < n_tokens &&
+                   cache[common] == tokens[common]) common++;
+        int have_state = cache_n > 0 && common == cache_n;
+        int prompt_snapshot_present = 0;
+        if (have_state && common == n_tokens) {
+            int exact = stdio_snapshot_cache_find(&snapshot_cache,
+                cache_identity, tokens, n_tokens, 1);
+            if (exact >= 0 && snapshot_cache.entries[exact].n_tokens == n_tokens) {
+                snapshot_cache.entries[exact].age = ++snapshot_cache.clock;
+                prompt_snapshot_present = 1;
+            }
         }
-        if (common != cache_n) {
-            /* Subsequent forwards overwrite positional KV storage. A host
-             * recurrent snapshot cannot restore those overwritten entries. */
-            hip_llm_free_state_snapshot(prefix_snapshot);
-            prefix_snapshot = NULL;
-            prefix_cache_n = 0;
-            hip_llm_free_state_snapshot(prompt_snapshot);
-            prompt_snapshot = NULL;
-            prompt_cache_n = 0;
+        if (!have_state) {
+            int allow_resident = strcmp(active_identity, cache_identity) == 0;
+            int hit = stdio_snapshot_cache_find(&snapshot_cache, cache_identity,
+                                                 tokens, n_tokens,
+                                                 allow_resident);
+            if (hit >= 0 && snapshot_cache.entries[hit].portable)
+                stdio_snapshot_cache_drop_resident(&snapshot_cache);
+            int restore_rc = hit >= 0 ? hip_llm_restore_state(
+                gpu, snapshot_cache.entries[hit].snapshot) : -1;
+            if (hit >= 0 && restore_rc == 0) {
+                stdio_snapshot_entry *entry = &snapshot_cache.entries[hit];
+                memcpy(cache, entry->tokens,
+                       (size_t)entry->n_tokens * sizeof(*cache));
+                cache_n = entry->n_tokens;
+                common = entry->n_tokens;
+                entry->age = ++snapshot_cache.clock;
+                snprintf(active_identity, sizeof(active_identity), "%s",
+                         cache_identity);
+                fprintf(stderr,
+                        "llm_server: context snapshot restored slot=%d tokens=%d\n",
+                        hit, common);
+                prompt_snapshot_present = common == n_tokens;
+                have_state = 1;
+            } else if (hit >= 0) {
+                fprintf(stderr,
+                        "llm_server: context snapshot restore failed slot=%d rc=%d\n",
+                        hit, restore_rc);
+                /* A failed restore may have partially written device state.
+                 * Reset below and evict the unusable snapshot so future
+                 * requests do not loop on the same corrupt entry. */
+                stdio_snapshot_entry_clear(&snapshot_cache, hit);
+            } else {
+                int entries = 0;
+                for (int i = 0; i < snapshot_cache.capacity; ++i)
+                    entries += snapshot_cache.entries[i].snapshot != NULL;
+                fprintf(stderr,
+                        "llm_server: context snapshot miss tokens=%d entries=%d "
+                        "identity=%.8s\n",
+                        n_tokens, entries, cache_identity);
+            }
+        }
+        if (!have_state) {
+            stdio_snapshot_cache_drop_resident(&snapshot_cache);
             hip_llm_reset_state(gpu);
             cache_n = 0;
             common = 0;
+            active_identity[0] = '\0';
         }
+        /* Dense NextN owns request-local draft KV. It does not consume prompt
+         * tokens, so even an append to a live target prefix must begin a new
+         * draft sequence from the completed prompt boundary. */
+        if (dense_mtp_draft > 0)
+            hip_llm_qwen35_mtp_reset(gpu);
         if (n_tokens > max_seq_len) n_tokens = max_seq_len;
         hip_llm_set_qwen4_batch_request_tokens(gpu, n_tokens);
         int batch_size = 128;
@@ -393,7 +669,7 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
         int publish_chunk = publish_chunk_env && atoi(publish_chunk_env) != 0;
         int prompt_added = n_tokens - common;
         int batches = prompt_added > 0 ? (prompt_added + batch_size - 1) / batch_size : 0;
-        if (!restored_prompt && !restored_prefix && requested_prefix > common && requested_prefix < n_tokens) {
+        if (requested_prefix > common && requested_prefix < n_tokens) {
             int a = requested_prefix - common;
             int b = n_tokens - requested_prefix;
             batches = (a + batch_size - 1) / batch_size +
@@ -403,6 +679,8 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
         hip_llm_set_decode_mode(gpu, 0);
         float *logits = prompt_added == 0 && cache_n > 0 ?
                         hip_llm_current_logits(gpu) : NULL;
+        hip_llm_state_snapshot *pending_prefix_snapshot = NULL;
+        hip_llm_state_snapshot *pending_prompt_snapshot = NULL;
         int cancelled = 0;
         int batch_index = 0;
         for (int off = 0; off < prompt_added; ) {
@@ -411,7 +689,7 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
             if (cc > batch_size) cc = batch_size;
             if (publish_chunk)
                 hip_llm_set_qwen4_batch_request_tokens(gpu, cc);
-            if (!restored_prefix && requested_prefix > 0 && common + off < requested_prefix &&
+            if (requested_prefix > 0 && common + off < requested_prefix &&
                 common + off + cc > requested_prefix)
                 cc = requested_prefix - common - off;
             logits = hip_llm_forward_batch_logits(gpu, tokens + common + off, cc,
@@ -426,62 +704,55 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
                     batch_ms > 0.0 ? 1000.0 * (off + cc) / batch_ms : 0.0);
             fflush(stderr);
             if (!logits) break;
-            if (!restored_prefix && requested_prefix > 0 && common + off + cc == requested_prefix) {
-                hip_llm_free_state_snapshot(prefix_snapshot);
-                prefix_snapshot = hip_llm_snapshot_state(gpu);
-                if (prefix_snapshot) {
-                    memcpy(prefix_cache, tokens, (size_t)requested_prefix * sizeof(int32_t));
-                    prefix_cache_n = requested_prefix;
-                } else {
-                    prefix_cache_n = 0;
-                }
-            }
+            if (snapshot_cache.entries && requested_prefix > common &&
+                common + off + cc == requested_prefix)
+                pending_prefix_snapshot = hip_llm_snapshot_state(gpu);
             off += cc;
         }
         double t_prefill1 = get_time_ms();
         if (g_stdio_cancel) cancelled = 1;
         if (cancelled) {
-            hip_llm_free_state_snapshot(prefix_snapshot);
-            prefix_snapshot = NULL;
-            prefix_cache_n = 0;
-            hip_llm_free_state_snapshot(prompt_snapshot);
-            prompt_snapshot = NULL;
-            prompt_cache_n = 0;
+            hip_llm_free_state_snapshot(pending_prefix_snapshot);
+            stdio_snapshot_cache_drop_resident(&snapshot_cache);
             hip_llm_reset_state(gpu);
             cache_n = 0;
+            active_identity[0] = '\0';
             free(tokens);
             puts("OK 0 0 0 cancelled");
             fflush(stdout);
             continue;
         }
         if (!logits && prompt_added > 0) {
-            hip_llm_free_state_snapshot(prefix_snapshot);
-            prefix_snapshot = NULL;
-            prefix_cache_n = 0;
-            hip_llm_free_state_snapshot(prompt_snapshot);
-            prompt_snapshot = NULL;
-            prompt_cache_n = 0;
+            hip_llm_free_state_snapshot(pending_prefix_snapshot);
+            stdio_snapshot_cache_drop_resident(&snapshot_cache);
             hip_llm_reset_state(gpu);
             cache_n = 0;
+            active_identity[0] = '\0';
             free(tokens); puts("ERR prefill"); fflush(stdout); continue;
         }
         /* Save the state at the complete prompt boundary. Generated text is
          * decoded to UTF-8 and may not re-tokenize to the original BPE pieces
          * on the next turn. If that happens, restore this boundary and replay
          * only the appended conversation suffix instead of resetting. */
-        hip_llm_free_state_snapshot(prompt_snapshot);
-        prompt_snapshot = hip_llm_snapshot_state(gpu);
-        if (prompt_snapshot) {
-            memcpy(prompt_cache, tokens, (size_t)n_tokens * sizeof(int32_t));
-            prompt_cache_n = n_tokens;
-        } else {
-            prompt_cache_n = 0;
+        if (snapshot_cache.entries && !prompt_snapshot_present)
+            pending_prompt_snapshot = hip_llm_snapshot_state(gpu);
+        hllm_sampler *sampler = use_reference ? hllm_sampler_create(&request_sampling, n_vocab) : NULL;
+        if (use_reference && !sampler) {
+            hip_llm_free_state_snapshot(pending_prefix_snapshot);
+            hip_llm_free_state_snapshot(pending_prompt_snapshot);
+            stdio_snapshot_cache_drop_resident(&snapshot_cache);
+            hip_llm_reset_state(gpu);
+            cache_n = 0;
+            active_identity[0] = '\0';
+            free(tokens); puts("ERR sampler"); fflush(stdout); continue;
         }
+        for (int i = 0; sampler && i < n_tokens; ++i) hllm_sampler_accept(sampler, tokens[i]);
         unsigned char *seen = (unsigned char *)calloc((size_t)n_vocab, 1);
         for (int i = 0; i < n_tokens; i++) {
             cache[i] = tokens[i];
         }
         cache_n = n_tokens;
+        snprintf(active_identity, sizeof(active_identity), "%s", cache_identity);
         free(tokens);
         if (max_tokens < 0) max_tokens = 0;
         if (max_tokens > max_seq_len - cache_n) max_tokens = max_seq_len - cache_n;
@@ -502,6 +773,18 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
         int mtp_index = 0, mtp_pending = -1, mtp_error = 0;
         int mtp_approx_fallback = 0;
         int mtp_adaptive_fallback = 0;
+        int32_t q35_drafts[16], q35_argmax[16];
+        int q35_count = 0, q35_index = 0, q35_rows = 0;
+        int q35_dflash_fallback = 0;
+        int q35_position = -1;
+        float *q35_logits = NULL;
+        const int q35_is_dflash = dflash_draft > 0;
+        const int q35_draft = q35_is_dflash ? dflash_draft :
+            (dense_mtp_draft > 0 && dense_mtp_window && temperature <= 0.0f ?
+             dense_mtp_draft : 0);
+        int q35_proposed = 0, q35_accepted = 0;
+        double q35_draft_ms = 0.0, q35_verify_ms = 0.0,
+               q35_commit_ms = 0.0;
         int32_t stops[] = { eos, eot, im_end };
         for (int k = 0; logits && k < max_tokens; k++) {
             if (g_stdio_cancel) { cancelled = 1; break; }
@@ -526,10 +809,26 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
                             mtp.accepted, mtp.drafted);
                 }
             }
-            int next = use_mtp ? mtp.tokens[mtp_index++] : (temperature <= 0.0f) ? argmax_logits(logits, n_vocab) :
-                sample_top_k_p(logits, n_vocab, top_k, top_p, temperature, presence,
-                               repetition, min_p, seen, &rng);
-            int is_stop = next == eos || next == eot || next == im_end;
+            int q35_window = q35_draft > 0 && q35_rows > 0;
+            int next = q35_window ?
+                (q35_logits ?
+                    (sampler ? hllm_sampler_sample(sampler,
+                        q35_logits + (size_t)q35_index * n_vocab) :
+                     (temperature <= 0.0f ? argmax_logits(
+                        q35_logits + (size_t)q35_index * n_vocab, n_vocab) :
+                      sample_top_k_p(q35_logits + (size_t)q35_index * n_vocab,
+                        n_vocab, top_k, top_p, temperature, presence,
+                        repetition, min_p, seen, &rng))) :
+                 q35_argmax[q35_index]) :
+                use_mtp ? mtp.tokens[mtp_index++] : sampler ? hllm_sampler_sample(sampler, logits) : (temperature <= 0.0f) ? argmax_logits(logits, n_vocab) :
+                (coding_mode ? sample_top_k_p_coding(logits, n_vocab, top_k, top_p,
+                               temperature, presence, repetition, min_p, seen, &rng, vocab) :
+                 sample_top_k_p(logits, n_vocab, top_k, top_p, temperature, presence,
+                               repetition, min_p, seen, &rng));
+            if (next < 0 || next >= n_vocab) { mtp_error = 1; break; }
+            if (sampler) hllm_sampler_accept(sampler, next);
+            int is_stop = is_generation_stop(vocab, next, eos, eot) ||
+                          next == im_end;
             const char *piece = bpe_token_to_str(vocab, next);
             if (!is_stop && piece && text) {
                 int raw_n = (int)strlen(piece), dec_n = 0;
@@ -558,15 +857,118 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
             generated++;
             if (is_stop) {
                 /* Stop was sampled but never forwarded. Only processed
-                 * tokens belong in the reusable KV/recurrent prefix. */
+                 * tokens belong in the reusable KV/recurrent prefix.  A
+                 * speculative row predicts this stop from an already
+                 * processed input, so publish inputs through that row before
+                 * closing the transaction. */
                 cache_n--;
+                if (q35_window) {
+                    int processed = q35_index + 1;
+                    double tc = get_time_ms();
+                    int commit_rc = q35_is_dflash ?
+                        hip_llm_qwen35_dflash2_commit(gpu, q35_position,
+                                                      processed) :
+                        hip_llm_qwen35_mtp_commit(gpu, processed);
+                    q35_commit_ms += get_time_ms() - tc;
+                    if (commit_rc) {
+                        fprintf(stderr,
+                                "llm_server: Qwen3.8 speculative stop commit failed "
+                                "pos=%d rows=%d\n", q35_position, processed);
+                        fflush(stderr);
+                        mtp_error = 1;
+                    }
+                    q35_rows = q35_index = q35_count = 0;
+                    q35_position = -1;
+                    q35_logits = NULL;
+                }
                 finish_eos = 1;
                 break;
+            }
+            if (q35_window) {
+                int matched = q35_index < q35_count &&
+                              next == q35_drafts[q35_index];
+                q35_index++;
+                if (matched) q35_accepted++;
+                if (!matched || q35_index == q35_rows) {
+                    double tc = get_time_ms();
+                    int commit_rc = q35_is_dflash ?
+                        hip_llm_qwen35_dflash2_commit(gpu, q35_position,
+                                                      q35_index) :
+                        hip_llm_qwen35_mtp_commit(gpu, q35_index);
+                    q35_commit_ms += get_time_ms() - tc;
+                    if (commit_rc) {
+                        fprintf(stderr,
+                                "llm_server: Qwen3.8 speculative commit failed "
+                                "pos=%d rows=%d\n", q35_position, q35_index);
+                        fflush(stderr);
+                        mtp_error = 1; break;
+                    }
+                    q35_rows = q35_index = q35_count = 0;
+                    q35_position = -1;
+                    q35_logits = NULL;
+                }
+            }
+            if (q35_draft > 0 && !q35_dflash_fallback &&
+                (!q35_is_dflash || !coding_mode) &&
+                q35_rows == 0 && k + 1 < max_tokens) {
+                if (q35_is_dflash && cache_n - 1 >= 32768) {
+                    q35_dflash_fallback = 1;
+                    fprintf(stderr,
+                            "llm_server: DFlash2 disabled at position %d; "
+                            "using target decode for long context\n",
+                            cache_n - 1);
+                }
+                if (!q35_dflash_fallback) {
+                    int count = max_tokens - k - 1;
+                    if (count > q35_draft) count = q35_draft;
+                    double td = get_time_ms();
+                    int propose_rc = count > 0 ? (q35_is_dflash ?
+                        hip_llm_qwen35_dflash2_propose(gpu, next, cache_n - 1,
+                                                       count, q35_drafts) :
+                        hip_llm_qwen35_mtp_propose(gpu, next, cache_n - 1,
+                                                   count, q35_drafts)) : 0;
+                    q35_draft_ms += get_time_ms() - td;
+                    if (propose_rc) {
+                        fprintf(stderr,
+                                "llm_server: Qwen3.8 speculative propose failed "
+                                "pos=%d count=%d\n",
+                                cache_n - 1, count);
+                        fflush(stderr);
+                        mtp_error = 1; break;
+                    }
+                    if (count > 0) {
+                        int32_t inputs[16]; inputs[0] = next;
+                        memcpy(inputs + 1, q35_drafts,
+                               (size_t)count * sizeof(int32_t));
+                        double tv = get_time_ms();
+                        if (sampler || temperature > 0.0f)
+                            q35_logits = hip_llm_qwen35_mtp_verify(
+                                gpu, inputs, count + 1, cache_n - 1);
+                        else
+                            q35_logits = NULL;
+                        if (q35_logits == NULL &&
+                            hip_llm_qwen35_mtp_verify_argmax(gpu, inputs, count + 1,
+                                                             cache_n - 1, q35_argmax)) {
+                            fprintf(stderr,
+                                    "llm_server: Qwen3.8 speculative verify failed "
+                                    "pos=%d rows=%d\n",
+                                    cache_n - 1, count + 1);
+                            fflush(stderr);
+                            mtp_error = 1; break;
+                        }
+                        q35_verify_ms += get_time_ms() - tv;
+                        q35_proposed += count;
+                        q35_count = count;
+                        q35_rows = count + 1;
+                        q35_index = 0;
+                        q35_position = cache_n - 1;
+                    }
+                }
             }
             /* If approximate MTP just fell back after a zero-accept batch,
              * replay the emitted anchor through the target so the ordinary
              * decode path resumes with fresh logits and state. */
-            if (!use_mtp || mtp_approx_fallback || mtp_adaptive_fallback)
+            if (!use_mtp && !q35_window && !q35_rows)
                 logits = hip_llm_forward_logits(gpu, next, cache_n - 1);
             double token_now = get_time_ms();
             double token_ms = token_now - t_decode0;
@@ -578,12 +980,37 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
             fflush(stderr);
         }
         if (g_stdio_cancel) cancelled = 1;
+        /* A length limit may cut through an accepted speculative window.
+         * Publish exactly the rows whose tokens were emitted; later verifier
+         * rows remain transaction-local and must not leak into the next turn. */
+        if (!cancelled && !mtp_error && q35_rows > 0 && q35_index > 0) {
+            double tc = get_time_ms();
+            int commit_rc = q35_is_dflash ?
+                hip_llm_qwen35_dflash2_commit(gpu, q35_position, q35_index) :
+                hip_llm_qwen35_mtp_commit(gpu, q35_index);
+            q35_commit_ms += get_time_ms() - tc;
+            if (commit_rc) {
+                fprintf(stderr,
+                        "llm_server: Qwen3.8 speculative length commit failed "
+                        "pos=%d rows=%d\n", q35_position, q35_index);
+                fflush(stderr);
+                mtp_error = 1;
+            }
+            q35_rows = q35_index = q35_count = 0;
+            q35_position = -1;
+            q35_logits = NULL;
+        }
         if (mtp_error) {
-            hip_llm_free_state_snapshot(prefix_snapshot); prefix_snapshot = NULL;
-            prefix_cache_n = cache_n = 0;
+            hip_llm_free_state_snapshot(pending_prefix_snapshot);
+            hip_llm_free_state_snapshot(pending_prompt_snapshot);
+            stdio_snapshot_cache_drop_resident(&snapshot_cache);
+            cache_n = 0;
+            active_identity[0] = '\0';
             hip_llm_reset_state(gpu);
+            hip_llm_set_decode_mode(gpu, 0);
+            hllm_sampler_free(sampler);
             free(text); free(seen);
-            puts("ERR mtp"); fflush(stdout); continue;
+            puts("ERR generation"); fflush(stdout); continue;
         }
         double t_decode1 = get_time_ms();
         hip_llm_set_decode_mode(gpu, 0);
@@ -601,6 +1028,14 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
                 "llm_server: end-to-end=%d prompt-added + %d generated in %.2f ms (%.2f tok/s)\n",
                 prompt_added, generated, end_to_end_ms,
                 end_to_end_ms > 0.0 ? 1000.0 * end_to_end_tokens / end_to_end_ms : 0.0);
+        if (q35_draft > 0) {
+            fprintf(stderr,
+                    "llm_server: %s drafted=%d accepted=%d draft_ms=%.3f "
+                    "verify_ms=%.3f commit_ms=%.3f\n",
+                    q35_is_dflash ? "DFlash2" : "Dense NextN",
+                    q35_proposed, q35_accepted, q35_draft_ms,
+                    q35_verify_ms, q35_commit_ms);
+        }
         {
             hip_llm_moe_stats ms;
             if (hip_llm_get_moe_stats(gpu, &ms) == 0 &&
@@ -633,37 +1068,44 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
          * drop it before the next HTTP request rather than serving from stale
          * target state. */
         if (getenv("LLM_QWEN4_MTP_TRUST_DRAFT")) {
-            hip_llm_free_state_snapshot(prefix_snapshot);
-            prefix_snapshot = NULL;
-            prefix_cache_n = 0;
-            hip_llm_free_state_snapshot(prompt_snapshot);
-            prompt_snapshot = NULL;
-            prompt_cache_n = 0;
+            hip_llm_free_state_snapshot(pending_prefix_snapshot);
+            hip_llm_free_state_snapshot(pending_prompt_snapshot);
+            pending_prefix_snapshot = pending_prompt_snapshot = NULL;
+            stdio_snapshot_cache_drop_resident(&snapshot_cache);
             hip_llm_reset_state(gpu);
             cache_n = 0;
+            active_identity[0] = '\0';
         }
         if (cancelled) {
-            hip_llm_free_state_snapshot(prefix_snapshot);
-            prefix_snapshot = NULL;
-            prefix_cache_n = 0;
-            hip_llm_free_state_snapshot(prompt_snapshot);
-            prompt_snapshot = NULL;
-            prompt_cache_n = 0;
+            hip_llm_free_state_snapshot(pending_prefix_snapshot);
+            hip_llm_free_state_snapshot(pending_prompt_snapshot);
+            pending_prefix_snapshot = pending_prompt_snapshot = NULL;
+            stdio_snapshot_cache_drop_resident(&snapshot_cache);
             hip_llm_reset_state(gpu);
             cache_n = 0;
+            active_identity[0] = '\0';
+        } else if (!getenv("LLM_QWEN4_MTP_TRUST_DRAFT")) {
+            if (pending_prefix_snapshot) {
+                stdio_snapshot_cache_publish(&snapshot_cache, cache_identity,
+                    cache, requested_prefix, pending_prefix_snapshot);
+                pending_prefix_snapshot = NULL;
+            }
+            if (pending_prompt_snapshot) {
+                stdio_snapshot_cache_publish(&snapshot_cache, cache_identity,
+                    cache, n_tokens, pending_prompt_snapshot);
+                pending_prompt_snapshot = NULL;
+            }
         }
         printf("OK %d %d %d %s %s %.3f %.3f\n", cancelled ? 0 : common,
                cancelled ? 0 : n_tokens, generated,
                cancelled ? "cancelled" : (finish_eos ? "stop" : "length"),
                enc ? enc : "", prefill_ms, decode_ms);
         fflush(stdout);
+        hllm_sampler_free(sampler);
         free(enc); free(text); free(seen);
     }
     free(cache);
-    free(prefix_cache);
-    free(prompt_cache);
-    hip_llm_free_state_snapshot(prefix_snapshot);
-    hip_llm_free_state_snapshot(prompt_snapshot);
+    stdio_snapshot_cache_free(&snapshot_cache);
     return 0;
 }
 
@@ -848,6 +1290,30 @@ static int argmax_logits(const float *logits, int n) {
     return best;
 }
 
+static void dump_top_logits(const float *logits, int n) {
+    const char *dump_path = getenv("LLM_DUMP_LOGITS_BIN");
+    if (dump_path) {
+        FILE *f = fopen(dump_path, "wb");
+        if (f) { fwrite(logits, sizeof(float), (size_t)n, f); fclose(f); }
+    }
+    if (!getenv("LLM_DUMP_LOGITS")) return;
+    int ids[20];
+    float vals[20];
+    int count = 0;
+    for (int id = 0; id < n; id++) {
+        float v = logits[id];
+        int p = count < 20 ? count++ : 19;
+        if (count == 20 && v <= vals[19]) continue;
+        while (p > 0 && v > vals[p - 1]) {
+            if (p < 20) { vals[p] = vals[p - 1]; ids[p] = ids[p - 1]; }
+            p--;
+        }
+        vals[p] = v; ids[p] = id;
+    }
+    fprintf(stderr, "top logits:\n");
+    for (int i = 0; i < count; i++) fprintf(stderr, "%d %.9g\n", ids[i], vals[i]);
+}
+
 int main(int argc, char **argv) {
     const char *model_path = NULL;
     const char *prompt = "Hello, how are you?";
@@ -856,17 +1322,39 @@ int main(int argc, char **argv) {
     int max_seq_len = 256;
     int bench_mode = 0;       /* --bench: split prefill/decode tps; skip CPU compare */
     int gpu_only_bench = 0;   /* --gpu-only-bench: also skip CPU model load */
+    int gpu_only = 0;         /* --gpu-only: generate normally without CPU shadow */
     int decode_n = 0;         /* --decode N: greedy-sample N tokens after prefill */
     int prefill_pad = 0;      /* --prefill-len M: pad prompt up to M tokens with last token (for bench) */
     int bench_repeat = 1;     /* --bench-repeat N: rerun the same request N times in-process */
+    int bench_depth = 0;      /* --bench-depth N: random-token prefix before the measured request */
     int compare_paths = 0;    /* --compare-paths: report rel-L2 between batched and per-token logits */
     int coding_mode = 0;      /* Qwen3.8 non-thinking coding sampling profile */
+    int reference_sampling = 0;
+    hllm_sampler_config sampling;
+    hllm_sampler_defaults(&sampling);
+    sampling.temperature = 0.0f;
+    const char *trace_prefix = NULL;
+    int bench_ignore_eos = 0;
     int qwen4_coding_profile = 0;
     int qwen4_batched_prefill = 0;
     int qwen4_prefill_staging = 0;
     int qwen4_prefill_stage_mb = 0;
     int moe_cache_mb = 0;
     int moe_cpu_only = 0;
+    hip_llm_kv_cache_type kv_cache_type = HIP_LLM_KV_AUTO;
+    hip_llm_decode_kernel_mode decode_kernel_mode = HIP_LLM_DECODE_KERNEL_DEFAULT;
+    hip_llm_decode_layout_mode decode_layout_mode = HIP_LLM_DECODE_LAYOUT_NATIVE;
+    const char *decode_layout_cache_path = NULL;
+    int decode_layout_budget_mib = 0;
+    int prefill_batch_tokens = 0;
+    int qwen35_batched_prefill = 0;
+    int qwen35_prefill_bf16 = 0;
+    int qwen35_decode_graph = 0;
+    int qwen35_reference_math = 0;
+    int qwen35_native_q8_attention = 0;
+    int qwen35_native_q8_prefill = 0;
+    int qwen35_native_q2k = 0;
+    int qwen35_native_mmvq = 0;
     int max_layers = 0;
     int verify_hc_batch = 0, verify_ple_split = 0, verify_ssm_projections = 0, verify_moe_native = 0;
     int verify_glm5next_kda = 0;
@@ -877,6 +1365,14 @@ int main(int argc, char **argv) {
     int verify_glm5next_kda_layer = 0;
     int verify_glm5next_dsa_layer = 0;
     const char *inspect_qwen4_nextn = NULL;
+    const char *qwen35_mtp_path = NULL;
+    int qwen35_mtp_draft = 3;
+    int qwen35_mtp_window = 0;
+    const char *qwen35_dflash2_path = NULL;
+    int qwen35_dflash2_draft = 4;
+    int qwen35_snapshot_max_tokens = 0;
+    int context_cache_entries = 4;
+    int context_cache_max_mib = 2048;
     const char *load_qwen4_nextn_fusion = NULL;
     /* Q4_K/Q6_K exact verification is host-synchronization bound; recurrent
      * width-2 drafts minimize rejected-suffix work on the RX 9070 XT. */
@@ -970,16 +1466,49 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--gpu-only-bench") == 0) {
             bench_mode = 1;
             gpu_only_bench = 1;
+        } else if (strcmp(argv[i], "--gpu-only") == 0) {
+            gpu_only = 1;
         } else if (strcmp(argv[i], "--decode") == 0 && i + 1 < argc) {
             decode_n = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--bench-repeat") == 0 && i + 1 < argc) {
             bench_repeat = atoi(argv[++i]);
             if (bench_repeat < 1) bench_repeat = 1;
             if (bench_repeat > 64) bench_repeat = 64;
+        } else if (strcmp(argv[i], "--bench-depth") == 0 && i + 1 < argc) {
+            bench_depth = atoi(argv[++i]);
+            if (bench_depth < 0) { fprintf(stderr, "Invalid benchmark depth\n"); return 2; }
         } else if (strcmp(argv[i], "--prefill-len") == 0 && i + 1 < argc) {
             prefill_pad = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--compare-paths") == 0) {
             compare_paths = 1;
+        } else if (strcmp(argv[i], "--sampling-profile") == 0 && i + 1 < argc) {
+            if (strcmp(argv[++i], "llama")) { fprintf(stderr, "--sampling-profile requires llama\n"); return 2; }
+            reference_sampling = 1;
+        } else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
+            char *end = NULL;
+            unsigned long value = strtoul(argv[++i], &end, 10);
+            if (!*argv[i] || *end || value >= UINT32_MAX) { fprintf(stderr, "Invalid explicit seed\n"); return 2; }
+            sampling.seed = (uint32_t)value; reference_sampling = 1;
+        } else if (strcmp(argv[i], "--temp") == 0 && i + 1 < argc) {
+            sampling.temperature = strtof(argv[++i], NULL); reference_sampling = 1;
+        } else if (strcmp(argv[i], "--top-k") == 0 && i + 1 < argc) {
+            sampling.top_k = atoi(argv[++i]); reference_sampling = 1;
+        } else if (strcmp(argv[i], "--top-p") == 0 && i + 1 < argc) {
+            sampling.top_p = strtof(argv[++i], NULL); reference_sampling = 1;
+        } else if (strcmp(argv[i], "--min-p") == 0 && i + 1 < argc) {
+            sampling.min_p = strtof(argv[++i], NULL); reference_sampling = 1;
+        } else if (strcmp(argv[i], "--repeat-penalty") == 0 && i + 1 < argc) {
+            sampling.repetition = strtof(argv[++i], NULL); reference_sampling = 1;
+        } else if (strcmp(argv[i], "--presence-penalty") == 0 && i + 1 < argc) {
+            sampling.presence = strtof(argv[++i], NULL); reference_sampling = 1;
+        } else if (strcmp(argv[i], "--frequency-penalty") == 0 && i + 1 < argc) {
+            sampling.frequency = strtof(argv[++i], NULL); reference_sampling = 1;
+        } else if (strcmp(argv[i], "--penalty-last-n") == 0 && i + 1 < argc) {
+            sampling.penalty_last_n = atoi(argv[++i]); reference_sampling = 1;
+        } else if (strcmp(argv[i], "--trace-prefix") == 0 && i + 1 < argc) {
+            trace_prefix = argv[++i];
+        } else if (strcmp(argv[i], "--bench-ignore-eos") == 0) {
+            bench_ignore_eos = 1;
         } else if (strcmp(argv[i], "--coding") == 0) {
             coding_mode = 1;
         } else if (strcmp(argv[i], "--qwen4-coding-profile") == 0) {
@@ -995,6 +1524,54 @@ int main(int argc, char **argv) {
             moe_cache_mb = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--moe-cpu") == 0) {
             moe_cpu_only = 1;
+        } else if (strcmp(argv[i], "--kv-cache") == 0 && i + 1 < argc) {
+            const char *mode = argv[++i];
+            if (!strcmp(mode, "auto")) kv_cache_type = HIP_LLM_KV_AUTO;
+            else if (!strcmp(mode, "f32")) kv_cache_type = HIP_LLM_KV_F32;
+            else if (!strcmp(mode, "f16")) kv_cache_type = HIP_LLM_KV_F16;
+            else if (!strcmp(mode, "q8q4")) kv_cache_type = HIP_LLM_KV_Q8_0_Q4_0;
+            else if (!strcmp(mode, "q8q8")) kv_cache_type = HIP_LLM_KV_Q8_0_Q8_0;
+            else { fprintf(stderr, "--kv-cache must be auto, f32, f16, q8q4, or q8q8\n"); return 2; }
+        } else if (strcmp(argv[i], "--ubatch") == 0 && i + 1 < argc) {
+            prefill_batch_tokens = atoi(argv[++i]);
+            if (prefill_batch_tokens < 1 || prefill_batch_tokens > 8192) {
+                fprintf(stderr, "--ubatch must be in 1..8192\n"); return 2;
+            }
+        } else if (strcmp(argv[i], "--qwen35-batched-prefill") == 0) {
+            qwen35_batched_prefill = 1;
+        } else if (strcmp(argv[i], "--qwen35-decode-graph") == 0) {
+            qwen35_decode_graph = 1;
+        } else if (strcmp(argv[i], "--qwen35-reference-math") == 0) {
+            qwen35_reference_math = 1;
+        } else if (strcmp(argv[i], "--qwen35-native-q8-attn") == 0) {
+            qwen35_native_q8_attention = 1;
+        } else if (strcmp(argv[i], "--qwen35-native-q8-prefill") == 0) {
+            qwen35_native_q8_prefill = 1;
+        } else if (strcmp(argv[i], "--qwen35-native-q2k") == 0) {
+            qwen35_native_q2k = 1;
+        } else if (strcmp(argv[i], "--qwen35-native-mmvq") == 0) {
+            qwen35_native_mmvq = 1;
+        } else if (strcmp(argv[i], "--qwen35-prefill-bf16") == 0) {
+            qwen35_batched_prefill = 1;
+            qwen35_prefill_bf16 = 1;
+        } else if (strcmp(argv[i], "--decode-kernels") == 0 && i + 1 < argc) {
+            const char *mode = argv[++i];
+            if (!strcmp(mode, "native")) decode_kernel_mode = HIP_LLM_DECODE_KERNEL_NATIVE;
+            else if (!strcmp(mode, "dp4a2")) decode_kernel_mode = HIP_LLM_DECODE_KERNEL_DP4A2;
+            else if (!strcmp(mode, "auto")) decode_kernel_mode = HIP_LLM_DECODE_KERNEL_AUTO;
+            else { fprintf(stderr, "--decode-kernels must be native, dp4a2, or auto\n"); return 2; }
+        } else if (strcmp(argv[i], "--decode-layout") == 0 && i + 1 < argc) {
+            const char *mode = argv[++i];
+            if (!strcmp(mode, "native")) decode_layout_mode = HIP_LLM_DECODE_LAYOUT_NATIVE;
+            else if (!strcmp(mode, "auto")) decode_layout_mode = HIP_LLM_DECODE_LAYOUT_AUTO_REPACK;
+            else { fprintf(stderr, "--decode-layout must be native or auto\n"); return 2; }
+        } else if (strcmp(argv[i], "--decode-layout-cache") == 0 && i + 1 < argc) {
+            decode_layout_cache_path = argv[++i];
+        } else if (strcmp(argv[i], "--decode-layout-budget-mib") == 0 && i + 1 < argc) {
+            decode_layout_budget_mib = atoi(argv[++i]);
+            if (decode_layout_budget_mib < 0 || decode_layout_budget_mib > 4096) {
+                fprintf(stderr, "--decode-layout-budget-mib must be 0..4096\n"); return 2;
+            }
         } else if (strcmp(argv[i], "--max-layers") == 0 && i + 1 < argc) {
             max_layers = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--verify-ple-split") == 0) {
@@ -1021,6 +1598,28 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--verify-glm5next-dsa-layer") == 0) {
             verify_glm5next_dsa_layer = 1;
             if (i + 1 < argc && argv[i + 1][0] != '-') glm5next_verify_layer = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--qwen35-mtp") == 0 && i + 1 < argc) {
+            qwen35_mtp_path = argv[++i];
+        } else if (strcmp(argv[i], "--qwen35-mtp-draft") == 0 && i + 1 < argc) {
+            qwen35_mtp_draft = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--qwen35-mtp-window") == 0) {
+            qwen35_mtp_window = 1;
+        } else if (strcmp(argv[i], "--qwen35-dflash2") == 0 && i + 1 < argc) {
+            qwen35_dflash2_path = argv[++i];
+        } else if (strcmp(argv[i], "--qwen35-dflash2-draft") == 0 && i + 1 < argc) {
+            qwen35_dflash2_draft = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--qwen35-snapshot-max-tokens") == 0 && i + 1 < argc) {
+            qwen35_snapshot_max_tokens = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--context-cache-entries") == 0 && i + 1 < argc) {
+            context_cache_entries = atoi(argv[++i]);
+            if (context_cache_entries < 0 || context_cache_entries > 64) {
+                fprintf(stderr, "--context-cache-entries must be 0..64\n"); return 1;
+            }
+        } else if (strcmp(argv[i], "--context-cache-max-mib") == 0 && i + 1 < argc) {
+            context_cache_max_mib = atoi(argv[++i]);
+            if (context_cache_max_mib < 0 || context_cache_max_mib > 65536) {
+                fprintf(stderr, "--context-cache-max-mib must be 0..65536\n"); return 1;
+            }
         } else if (strcmp(argv[i], "--inspect-qwen4-nextn") == 0 && i + 1 < argc) {
             inspect_qwen4_nextn = argv[++i];
         } else if (strcmp(argv[i], "--verify-qwen4-nextn") == 0 && i + 1 < argc) {
@@ -1061,8 +1660,26 @@ int main(int argc, char **argv) {
             model_path = argv[i];
         } else {
             fprintf(stderr, "Usage: %s [model.gguf] [-t \"prompt\"] [-n max_tokens] [-s max_seq_len]\n", argv[0]);
-            fprintf(stderr, "       [--bench] [--gpu-only-bench] [--decode N] [--prefill-len M] [--coding]\n");
+            fprintf(stderr, "       [--bench] [--gpu-only-bench] [--gpu-only] [--decode N] [--prefill-len M] [--bench-depth N] [--coding]\n");
             fprintf(stderr, "       [--moe-cache-mb MiB] [--moe-cpu]\n");
+            fprintf(stderr, "       [--kv-cache auto|f32|f16|q8q4|q8q8] [--ubatch N] [--qwen35-batched-prefill]\n");
+            fprintf(stderr, "       [--qwen35-prefill-bf16] (experimental BF16 prefill projections; unchanged decode kernels)\n");
+            fprintf(stderr, "       [--qwen35-decode-graph] [--qwen35-native-q8-attn] (gfx1201 Q8/Q8 decode)\n");
+            fprintf(stderr, "       [--qwen35-native-q8-prefill] (also use native Q8/Q8 for prefill)\n");
+            fprintf(stderr, "       [--qwen35-native-q2k] (native Q2_K x Q8_1 decode on gfx1201)\n");
+            fprintf(stderr, "       [--qwen35-native-mmvq] (native Q2_K, IQ2_XXS/XS/S, IQ3_XXS/S x Q8_1 decode)\n");
+            fprintf(stderr, "       [--qwen35-mtp SIDECAR --qwen35-mtp-draft 1..16] (verified dense NextN, benchmark mode)\n");
+            fprintf(stderr, "       [--qwen35-mtp-window] (exact Q8/Q8 target windows, draft <=15; requires decode graph)\n");
+            fprintf(stderr, "       [--qwen35-dflash2 SIDECAR --qwen35-dflash2-draft 1..7] (exact DFlash2 windows)\n");
+            fprintf(stderr, "       [--qwen35-snapshot-max-tokens N] (bound Qwen3.8 Q8 prompt snapshots)\n");
+            fprintf(stderr, "       [--context-cache-entries N] [--context-cache-max-mib MiB] (bounded prompt snapshots; portable snapshots may cross contexts)\n");
+            fprintf(stderr, "       [--qwen35-reference-math] (diagnostic; incomplete whole-model parity)\n");
+            fprintf(stderr, "       [--sampling-profile llama] [--seed N] [--temp T] [--top-k K] [--top-p P] [--min-p P]\n");
+            fprintf(stderr, "       [--repeat-penalty R] [--presence-penalty P] [--frequency-penalty F] [--penalty-last-n N]\n");
+            fprintf(stderr, "       [--trace-prefix PATH] [--bench-ignore-eos] (synthetic benchmark only)\n");
+            fprintf(stderr, "       [--decode-kernels native|dp4a2|auto]\n");
+            fprintf(stderr, "       [--decode-layout native|auto] [--decode-layout-cache auto|off|PATH]\n");
+            fprintf(stderr, "       [--decode-layout-budget-mib MiB]\n");
             fprintf(stderr, "       [--qwen4-mtp SIDECAR.gguf] [--qwen4-mtp-draft 1..32]\n");
             fprintf(stderr, "       [--qwen4-mtp-cache-mb MiB] [--qwen4-mtp-verify scalar|window]\n");
             fprintf(stderr, "       [--qwen4-mtp-check] [--qwen4-exact]\n");
@@ -1337,17 +1954,24 @@ int main(int argc, char **argv) {
     }
 
     /* Load CPU reference model (may fail for MoE -- run GPU-only in that case) */
-    int gpu_only = 0;
     transformer_model *cpu_model = NULL;
-    if (gpu_only_bench) {
+    if (gpu_only_bench || gpu_only) {
         gpu_only = 1;
-        fprintf(stderr, "\n=== Skipping CPU reference (--gpu-only-bench) ===\n");
+        fprintf(stderr, "\n=== Skipping CPU reference (--%s) ===\n",
+                gpu_only_bench ? "gpu-only-bench" : "gpu-only");
     } else {
         fprintf(stderr, "\n=== Loading CPU reference model ===\n");
         cpu_model = transformer_load(gguf, max_seq_len);
         if (!cpu_model) {
             fprintf(stderr, "CPU model load failed (MoE?), running GPU-only mode\n");
             gpu_only = 1;
+        } else {
+            const char *tf_threads = getenv("TF_THREADS");
+            if (tf_threads && atoi(tf_threads) > 1) {
+                int n = atoi(tf_threads);
+                transformer_set_threads(cpu_model, n);
+                fprintf(stderr, "CPU reference threads: %d (TF_THREADS)\n", n);
+            }
         }
     }
 
@@ -1397,6 +2021,21 @@ int main(int argc, char **argv) {
     if (qwen4_prefill_staging) load_options.qwen4_prefill_staging = 1;
     if (qwen4_prefill_stage_mb > 0)
         load_options.qwen4_prefill_stage_bytes = (uint64_t)qwen4_prefill_stage_mb << 20;
+    load_options.kv_cache_type = kv_cache_type;
+    load_options.prefill_batch_tokens = prefill_batch_tokens;
+    load_options.qwen35_batched_prefill = qwen35_batched_prefill;
+    load_options.qwen35_prefill_bf16 = qwen35_prefill_bf16;
+    load_options.qwen35_decode_graph = qwen35_decode_graph;
+    load_options.qwen35_reference_math = qwen35_reference_math;
+    load_options.qwen35_native_q8_attention = qwen35_native_q8_attention;
+    load_options.qwen35_native_q8_prefill = qwen35_native_q8_prefill;
+    load_options.qwen35_native_q2k = qwen35_native_q2k;
+    load_options.qwen35_native_mmvq = qwen35_native_mmvq;
+    load_options.decode_kernel_mode = decode_kernel_mode;
+    load_options.decode_layout_mode = decode_layout_mode;
+    load_options.decode_layout_cache_path = decode_layout_cache_path;
+    if (decode_layout_budget_mib > 0)
+        load_options.decode_layout_budget_bytes = (uint64_t)decode_layout_budget_mib << 20;
     if (qwen4_batched_prefill) hip_llm_set_qwen4_batched_prefill(gpu, 1);
     if(qwen4_mtp) {
         hip_llm_qwen4_mtp_set_verify(gpu,qwen4_mtp_window);
@@ -1416,6 +2055,39 @@ int main(int argc, char **argv) {
         hip_llm_free(gpu);
         if(cpu_model)transformer_free(cpu_model);
         bpe_vocab_free(vocab);gguf_close_shards(gguf_model);return 1;
+    }
+    if (qwen35_mtp_path) {
+        char error[192] = "invalid benchmark mode or draft width";
+        if ((!bench_mode && !stdio_server) || qwen4_mtp ||
+            qwen35_mtp_draft < 1 || qwen35_mtp_draft > 16 ||
+            (qwen35_mtp_window && qwen35_mtp_draft > 15) ||
+            (stdio_server && (!qwen35_mtp_window || !qwen35_batched_prefill ||
+                              !qwen35_decode_graph ||
+                              kv_cache_type != HIP_LLM_KV_Q8_0_Q8_0)) ||
+            hip_llm_qwen35_mtp_load(gpu, qwen35_mtp_path, error, sizeof(error))) {
+            fprintf(stderr, "Dense NextN load/configuration failed: %s\n", error);
+            hip_llm_free(gpu);
+            if (cpu_model) transformer_free(cpu_model);
+            bpe_vocab_free(vocab); gguf_close_shards(gguf_model); return 1;
+        }
+        fprintf(stderr, "Dense NextN loaded: draft=%d, target verification enabled\n", qwen35_mtp_draft);
+    }
+    if (qwen35_dflash2_path) {
+        char error[192] = "invalid benchmark mode or draft width";
+        if ((!bench_mode && !stdio_server) || qwen4_mtp || qwen35_mtp_path ||
+            qwen35_dflash2_draft < 1 || qwen35_dflash2_draft > 7 ||
+            !qwen35_batched_prefill || !qwen35_decode_graph ||
+            kv_cache_type != HIP_LLM_KV_Q8_0_Q8_0 ||
+            hip_llm_qwen35_dflash2_load(gpu, qwen35_dflash2_path,
+                                        error, sizeof(error))) {
+            fprintf(stderr, "DFlash2 load/configuration failed: %s\n", error);
+            hip_llm_free(gpu);
+            if (cpu_model) transformer_free(cpu_model);
+            bpe_vocab_free(vocab); gguf_close_shards(gguf_model); return 1;
+        }
+        fprintf(stderr, "DFlash2 loaded: draft=%d, exact target windows enabled "
+                        "for greedy and sampled generation\n",
+                        qwen35_dflash2_draft);
     }
     if (load_qwen4_nextn_fusion) {
         gguf_shards *sidecar = gguf_open_shards(load_qwen4_nextn_fusion, 2);
@@ -1491,12 +2163,20 @@ int main(int argc, char **argv) {
     int n_embd = hip_llm_n_embd(gpu);
     int n_vocab = hip_llm_n_vocab(gpu);
     int n_max_seq = hip_llm_max_seq_len(gpu);
+    if (qwen35_snapshot_max_tokens > 0)
+        hip_llm_set_qwen35_snapshot_max_tokens(gpu, qwen35_snapshot_max_tokens);
     int pass = 1;
 
     if (stdio_server) {
         int bos = prompt_bos_id(gguf);
         pass = run_stdio_server(gpu, vocab, n_vocab, n_max_seq, bos,
-                                qwen4_mtp ? qwen4_mtp_draft : 0) == 0;
+                                qwen4_mtp ? qwen4_mtp_draft : 0,
+                                qwen35_mtp_path ? qwen35_mtp_draft : 0,
+                                qwen35_mtp_window,
+                                qwen35_dflash2_path ? qwen35_dflash2_draft : 0,
+                                coding_mode, reference_sampling ? &sampling : NULL,
+                                context_cache_entries,
+                                (size_t)context_cache_max_mib << 20) == 0;
         hip_llm_free(gpu);
         if (cpu_model) transformer_free(cpu_model);
         bpe_vocab_free(vocab);
@@ -1506,7 +2186,27 @@ int main(int argc, char **argv) {
 
     if (bench_mode) {
         unsigned char *seen = NULL;
+        hllm_sampler *sampler = NULL;
+        hllm_generation_trace trace = {0};
+        int32_t *depth_tokens = NULL;
+        hip_llm_state_snapshot *depth_snapshot = NULL;
+        if ((reference_sampling && (coding_mode || qwen4_mtp)) || (trace_prefix && qwen4_mtp)) {
+            fprintf(stderr, "Reference sampler cannot use coding filters or Qwen4 MTP\n");
+            pass = 0; goto bench_done;
+        }
         if (bench_repeat < 1) bench_repeat = 1;
+        {
+            int n_prefill = max_tokens > 0 ? max_tokens : 1;
+            if (bench_depth + n_prefill > n_max_seq) {
+                fprintf(stderr, "Benchmark depth and prompt exceed max_seq_len=%d\n", n_max_seq);
+                pass = 0; goto bench_done;
+            }
+            if (bench_depth + n_prefill + decode_n > n_max_seq) {
+                decode_n = n_max_seq - bench_depth - n_prefill;
+                if (decode_n < 0) decode_n = 0;
+                fprintf(stderr, "Clamped decode to %d (max_seq_len=%d)\n", decode_n, n_max_seq);
+            }
+        }
         /* Optional throwaway prefill + reset before the measured repeats.  Some
          * paths (Qwen4 grouped staging, VRAM-tight profiles) differ on their
          * first invocation only; warming them makes the measured repeats
@@ -1519,25 +2219,89 @@ int main(int argc, char **argv) {
             hip_llm_forward_batch_logits(gpu, tokens, wn, 0);
             hip_llm_reset_state(gpu);
         }
+        if (bench_depth > 0) {
+            const unsigned depth_seed = 1;
+            int depth_chunk = prefill_batch_tokens > 0 ? prefill_batch_tokens : 512;
+            if (depth_chunk > bench_depth) depth_chunk = bench_depth;
+            depth_tokens = (int32_t *)malloc((size_t)bench_depth * sizeof(*depth_tokens));
+            if (!depth_tokens) {
+                fprintf(stderr, "Random depth token allocation failed\n");
+                pass = 0; goto bench_done;
+            }
+            srand(depth_seed);
+            int bos = prompt_bos_id(gguf);
+            for (int i = 0; i < bench_depth; ++i)
+                depth_tokens[i] = i == 0 && bos >= 0 ? bos : rand() % n_vocab;
+            uint64_t depth_hash = 1469598103934665603ULL;
+            for (int i = 0; i < bench_depth; ++i) {
+                depth_hash ^= (uint32_t)depth_tokens[i];
+                depth_hash *= 1099511628211ULL;
+            }
+            hip_llm_reset_state(gpu);
+            hip_llm_set_decode_mode(gpu, 0);
+            hip_llm_set_qwen4_batch_request_tokens(gpu, bench_depth);
+            double depth_start = get_time_ms();
+            for (int off = 0; off < bench_depth; off += depth_chunk) {
+                int count = bench_depth - off;
+                if (count > depth_chunk) count = depth_chunk;
+                if (!hip_llm_forward_batch(gpu, depth_tokens + off, count, off)) {
+                    fprintf(stderr, "Random depth prefill failed at %d/%d\n", off, bench_depth);
+                    pass = 0; goto bench_done;
+                }
+                if ((off + count) % 8192 == 0 || off + count == bench_depth)
+                    fprintf(stderr, "Depth prefill: %d/%d tokens\n", off + count, bench_depth);
+            }
+            depth_snapshot = hip_llm_snapshot_state(gpu);
+            if (!depth_snapshot) {
+                fprintf(stderr, "Failed to snapshot random depth state\n");
+                pass = 0; goto bench_done;
+            }
+            double depth_ms = get_time_ms() - depth_start;
+            fprintf(stderr,
+                "Depth prefill: %d random tokens in %.2f ms -> %.2f tok/s "
+                "(seed=%u hash=%016llx)\n",
+                bench_depth, depth_ms,
+                depth_ms > 0.0 ? 1000.0 * bench_depth / depth_ms : 0.0,
+                depth_seed, (unsigned long long)depth_hash);
+        }
         for (int bench_rep = 0; bench_rep < bench_repeat; bench_rep++) {
         if (bench_repeat > 1)
             fprintf(stderr, "\n=== Bench repeat %d/%d ===\n", bench_rep + 1, bench_repeat);
-        /* Each repeat is an independent request: drop recurrent/KV/PLE state
-         * from the previous one so a hash mismatch is not just carried-over
-         * state.  This makes the in-process repeatability gate equivalent to
-         * two fresh-process runs while loading the model only once. */
-        hip_llm_reset_state(gpu);
+        /* Restore the random depth's recurrent state before every repeat.
+         * Prefix KV rows remain resident and measured rows are overwritten at
+         * identical positions, matching llama-bench's cached-depth restore. */
+        if (depth_snapshot) {
+            if (hip_llm_restore_state(gpu, depth_snapshot)) {
+                fprintf(stderr, "Failed to restore random depth state\n");
+                pass = 0; goto bench_done;
+            }
+        } else {
+            hip_llm_reset_state(gpu);
+        }
         free(seen); seen = NULL;
+        hllm_sampler_free(sampler); sampler = NULL;
+        hllm_trace_close(&trace);
+        if (hllm_trace_open(&trace, trace_prefix, bench_rep)) { pass = 0; goto bench_done; }
+        if (reference_sampling) {
+            sampler = hllm_sampler_create(&sampling, n_vocab);
+            if (!sampler) { fprintf(stderr, "Invalid sampler configuration\n"); pass = 0; goto bench_done; }
+        }
         /* ---- Bench mode: split prefill and decode tokens/sec ---- */
         int n_prefill = max_tokens;
         if (n_prefill < 1) n_prefill = 1;
         if (decode_n < 0) decode_n = 0;
-        if (n_prefill + decode_n > n_max_seq) {
-            decode_n = n_max_seq - n_prefill;
-            if (decode_n < 0) decode_n = 0;
-            fprintf(stderr, "Clamped decode to %d (max_seq_len=%d)\n", decode_n, n_max_seq);
+        if (bench_depth && !bench_mode) {
+            fprintf(stderr, "--bench-depth requires benchmark mode\n"); pass = 0; goto bench_done;
         }
 
+        if (trace_prefix && bench_rep == 0) {
+            char path[4096];
+            int n = snprintf(path, sizeof(path), "%s.prompt.tokens", trace_prefix);
+            FILE *f = n > 0 && n < (int)sizeof(path) ? fopen(path, "wb") : NULL;
+            if (!f) { pass = 0; goto bench_done; }
+            for (int i = 0; i < n_prefill; ++i) fprintf(f, "%d\n", tokens[i]);
+            if (fclose(f)) { pass = 0; goto bench_done; }
+        }
         /* Keep the benchmark harness aligned with the server's Qwen4
          * stateful-batch contract.  The runner uses the published request
          * length to distinguish a single tile (safe to batch) from a
@@ -1546,21 +2310,28 @@ int main(int argc, char **argv) {
          * request and silently measured the scalar path. */
         hip_llm_set_qwen4_batch_request_tokens(gpu, n_prefill);
 
-        fprintf(stderr, "\n=== Bench: prefill=%d tokens, decode=%d tokens, n_embd=%d, n_vocab=%d ===\n",
-                n_prefill, decode_n, n_embd, n_vocab);
+        fprintf(stderr, "\n=== Bench: depth=%d, prefill=%d tokens, decode=%d tokens, n_embd=%d, n_vocab=%d ===\n",
+                bench_depth, n_prefill, decode_n, n_embd, n_vocab);
 
         if (compare_paths && hip_llm_batched_path_available(gpu)) {
             /* Run prefill via per-token path */
             hip_llm_set_batched_path(gpu, 0);
-            float *log_p = hip_llm_forward_batch_logits(gpu, tokens, n_prefill, 0);
+            float *log_p = hip_llm_forward_batch_logits(gpu, tokens, n_prefill, bench_depth);
             if (!log_p) { fprintf(stderr, "compare: per-token path failed\n"); pass = 0; goto bench_done; }
             float *buf_p = (float *)malloc((size_t)n_vocab * sizeof(float));
             memcpy(buf_p, log_p, (size_t)n_vocab * sizeof(float));
 
             /* Run prefill via batched path */
-            hip_llm_reset_state(gpu);
+            if (depth_snapshot) {
+                if (hip_llm_restore_state(gpu, depth_snapshot)) {
+                    fprintf(stderr, "compare: failed to restore depth state\n");
+                    free(buf_p); pass = 0; goto bench_done;
+                }
+            } else {
+                hip_llm_reset_state(gpu);
+            }
             hip_llm_set_batched_path(gpu, 1);
-            float *log_b = hip_llm_forward_batch_logits(gpu, tokens, n_prefill, 0);
+            float *log_b = hip_llm_forward_batch_logits(gpu, tokens, n_prefill, bench_depth);
             if (!log_b) { fprintf(stderr, "compare: batched path failed\n"); free(buf_p); pass = 0; goto bench_done; }
 
             double diff_sq = 0.0, ref_sq = 0.0, batch_sq = 0.0;
@@ -1590,8 +2361,18 @@ int main(int argc, char **argv) {
         const char *warmup_env = getenv("LLM_PREFILL_WARMUP");
         int n_warmup = warmup_env ? atoi(warmup_env) : 0;
         for (int w = 0; w < n_warmup; w++) {
-            float *lg = hip_llm_forward_batch_logits(gpu, tokens, n_prefill, 0);
+            float *lg = hip_llm_forward_batch_logits(gpu, tokens, n_prefill, bench_depth);
             if (!lg) { fprintf(stderr, "GPU prefill warmup %d failed\n", w); pass = 0; goto bench_done; }
+        }
+        if (compare_paths || n_warmup) {
+            if (depth_snapshot) {
+                if (hip_llm_restore_state(gpu, depth_snapshot)) {
+                    fprintf(stderr, "Failed to restore depth state after warmup\n");
+                    pass = 0; goto bench_done;
+                }
+            } else {
+                hip_llm_reset_state(gpu);
+            }
         }
 
         /* Prefill: normally one forward_batch_logits call.  The optional
@@ -1607,7 +2388,7 @@ int main(int argc, char **argv) {
         int stream_chunk = 0;
         const char *stream_chunk_env = getenv("LLM_BENCH_STREAM_CHUNK");
         if (stream_chunk_env) stream_chunk = atoi(stream_chunk_env);
-        if (!stream_chunk_env && n_prefill > 2048) {
+        if (!stream_chunk_env && n_prefill >= 2048) {
             /* Keep direct test_hip_llm invocations on the same bounded
              * large-request path as the serving launcher.  A single 4K+
              * dispatch can exhaust gfx1201 scratch before quality or timing
@@ -1622,7 +2403,8 @@ int main(int argc, char **argv) {
             const char *publish_chunk_env = getenv("LLM_BENCH_STREAM_PUBLISH_CHUNK");
             int publish_chunk = publish_chunk_env && atoi(publish_chunk_env) != 0;
             /* No batch knob means the runner's parity-safe scalar default. */
-            int scalar_stream = !batch_env || atoi(batch_env) == 0;
+            int scalar_stream = (!batch_env || atoi(batch_env) == 0) &&
+                                !qwen35_batched_prefill;
             if (scalar_stream)
                 fprintf(stderr, "Large prefill: scalar streamed forward (dispatcher bypass)\n");
             for (int off = 0; off < n_prefill; off += stream_chunk) {
@@ -1643,26 +2425,43 @@ int main(int argc, char **argv) {
                          * token dominated the supposedly safe path. */
                         int is_last = (off + i + 1 == n_prefill);
                         last_logits = is_last ?
-                            hip_llm_forward_logits(gpu, tokens[off + i], off + i) :
-                            hip_llm_forward(gpu, tokens[off + i], off + i);
+                            hip_llm_forward_logits(gpu, tokens[off + i], bench_depth + off + i) :
+                            hip_llm_forward(gpu, tokens[off + i], bench_depth + off + i);
                         if (!last_logits) break;
                     }
                 } else {
-                    last_logits = hip_llm_forward_batch_logits(gpu, tokens + off, cc, off);
+                    last_logits = hip_llm_forward_batch_logits(gpu, tokens + off, cc, bench_depth + off);
                 }
                 if (!last_logits) break;
             }
         } else {
-            last_logits = hip_llm_forward_batch_logits(gpu, tokens, n_prefill, 0);
+            last_logits = hip_llm_forward_batch_logits(gpu, tokens, n_prefill, bench_depth);
         }
         if (!last_logits) { fprintf(stderr, "GPU forward_batch_logits failed\n"); pass = 0; goto bench_done; }
+        double t_pf1 = get_time_ms();
+        dump_top_logits(last_logits, n_vocab);
+        const char *logits_path = getenv("LLM_LOGITS_PATH");
+        if (logits_path && *logits_path) {
+            FILE *lf = fopen(logits_path, "wb");
+            if (lf) {
+                fwrite(last_logits, sizeof(float), (size_t)n_vocab, lf);
+                fclose(lf);
+                fprintf(stderr, "Wrote logits: %s\n", logits_path);
+            } else {
+                fprintf(stderr, "Cannot write logits: %s\n", logits_path);
+            }
+        }
+        double first_sample_start = get_time_ms();
         seen = coding_mode ? (unsigned char *)calloc((size_t)n_vocab, 1) : NULL;
         unsigned sample_rng = 0x51f15e5du;
-        int next_tok = coding_mode ? sample_top_k_p_coding(last_logits, n_vocab, 20, 0.80f,
+        for (int i = 0; sampler && i < n_prefill; ++i) hllm_sampler_accept(sampler, tokens[i]);
+        int next_tok = sampler ? hllm_sampler_sample(sampler, last_logits) : coding_mode ? sample_top_k_p_coding(last_logits, n_vocab, 20, 0.80f,
                                                     0.70f, 1.50f, 1.0f, 0.0f, seen,
                                                     &sample_rng, vocab)
                                    : argmax_logits(last_logits, n_vocab);
-        double t_pf1 = get_time_ms();
+        double first_sample_ms = get_time_ms() - first_sample_start;
+        int sampler_argmax = sampler && sampling.temperature == 0.0f &&
+            sampling.repetition == 1.0f && sampling.presence == 0.0f && sampling.frequency == 0.0f;
         double prefill_ms = t_pf1 - t_pf0;
         double prefill_tps = (prefill_ms > 0.0) ? (1000.0 * n_prefill / prefill_ms) : 0.0;
         hip_llm_moe_stats prefill_moe = {0};
@@ -1673,7 +2472,7 @@ int main(int argc, char **argv) {
         int decoded = 0;
         int first_decode_tok = next_tok;
         if(qwen4_mtp_check && (!qwen4_mtp || coding_mode ||
-            hip_llm_verify_qwen4_mtp(gpu,next_tok,n_prefill,qwen4_mtp_draft))) {
+            hip_llm_verify_qwen4_mtp(gpu,next_tok,bench_depth+n_prefill,qwen4_mtp_draft))) {
             fprintf(stderr,"Qwen4 MTP transaction check failed\n");pass=0;goto bench_done;
         }
         uint64_t decode_hash = 1469598103934665603ULL;
@@ -1681,7 +2480,38 @@ int main(int argc, char **argv) {
             hip_llm_reset_moe_stats(gpu);
             hip_llm_set_decode_mode(gpu, 1);
             int gen_text = (getenv("LLM_GEN_TEXT") != NULL);
-            if (gen_text) fprintf(stderr, "\n=== Generated text ===\n%s", bpe_token_to_str(vocab, next_tok));
+            int text_finished = 0;
+            const int text_eos = bpe_eos_id(vocab);
+            const int text_eot = bpe_eot_id(vocab);
+            if (qwen35_dflash2_path && (coding_mode ||
+                (sampler && !sampler_argmax)))
+                fprintf(stderr, "DFLASH2 sampled verifier=exact-window\n");
+            if (gen_text) fprintf(stderr, "\n=== Generated text ===\n");
+            const char *finish_reason = "length";
+            int selected = 0;
+            int32_t dense_drafts[16];
+            int dense_count = 0, dense_index = 0, dense_proposed = 0, dense_accepted = 0;
+            int dense_dflash_longctx_notified = 0;
+            double dense_draft_ms = 0, dense_verify_ms = 0, dense_commit_ms = 0;
+            float *dense_logits = NULL;
+            int32_t dense_argmax[16];
+            int dense_window_rows = 0;
+            const int dense_dflash2_configured = qwen35_dflash2_path != NULL;
+            /* The verifier preserves scalar target logits for greedy,
+             * probabilistic, and coding samplers. */
+            const int dense_dflash2 = dense_dflash2_configured;
+            int dense_dflash2_enabled = dense_dflash2;
+            const int dense_path = qwen35_mtp_path != NULL || dense_dflash2;
+            const int dense_window = qwen35_mtp_window || dense_dflash2;
+            const int dense_draft_width = dense_dflash2 ? qwen35_dflash2_draft : qwen35_mtp_draft;
+            const int dense_device_argmax = !coding_mode &&
+                (!sampler || sampler_argmax) && !trace.logits;
+            float *selection_logits = last_logits;
+            int32_t stop_ids[3] = {text_eos, text_eot, -1};
+            for (int id = 0; id < n_vocab; ++id) {
+                const char *piece = bpe_token_to_str(vocab, id);
+                if (piece && !strcmp(piece, "<|im_end|>")) { stop_ids[2] = id; break; }
+            }
             double t_dec0 = get_time_ms();
             int mtp_approx_fallback = 0;
             int mtp_adaptive_fallback = 0;
@@ -1692,15 +2522,27 @@ int main(int argc, char **argv) {
             for (int k = 0; k < decode_n; k++) {
                 if (qwen4_mtp && !coding_mode && !mtp_approx_fallback && !mtp_adaptive_fallback) {
                     hip_llm_qwen4_mtp_result mtp;
-                    if (hip_llm_qwen4_mtp_step(gpu, next_tok, n_prefill+k,
-                            mtp_runtime_draft, decode_n-k, NULL, 0, &mtp)) {
+                    if (hip_llm_qwen4_mtp_step(gpu, next_tok, bench_depth+n_prefill+k,
+                            mtp_runtime_draft, decode_n-k,
+                            bench_ignore_eos ? NULL : stop_ids, bench_ignore_eos ? 0 : 3, &mtp)) {
                         fprintf(stderr, "GPU MTP failed at decode k=%d\n", k); pass=0; break;
                     }
                     for (int i=0;i<mtp.emitted;++i) {
+                        selected++;
+                        int stop = is_generation_stop(vocab, mtp.tokens[i], text_eos, text_eot);
+                        if (stop && !bench_ignore_eos) break;
                         decode_hash ^= (uint32_t)mtp.tokens[i]; decode_hash *= 1099511628211ULL;
-                        if (gen_text) { const char *s=bpe_token_to_str(vocab,mtp.tokens[i]); if(s)fprintf(stderr,"%s",s); }
+                        decoded++;
+                        if (gen_text && !text_finished) {
+                            text_finished = is_generation_stop(
+                                vocab, mtp.tokens[i], text_eos, text_eot);
+                            if (!text_finished)
+                                print_decoded_token(stderr, vocab, mtp.tokens[i]);
+                        }
                     }
-                    decoded += mtp.emitted; k += mtp.emitted-1; next_tok=mtp.pending;
+                    k += mtp.emitted-1; next_tok=mtp.pending;
+                    if (mtp.stopped && !bench_ignore_eos) { finish_reason = "eos"; break; }
+                    if (!mtp.emitted) { pass = 0; finish_reason = "error"; break; }
                     fprintf(stderr,"MTP backend=%s drafted=%d accepted=%d emitted=%d draft_ms=%.3f verify_ms=%.3f\n",
                             getenv("LLM_QWEN4_MTP_TRUST_DRAFT") ? "hip-approx" : "hip",
                             mtp.drafted,mtp.accepted,mtp.emitted,mtp.draft_ms,mtp.verify_ms);
@@ -1729,28 +2571,132 @@ int main(int argc, char **argv) {
                     }
                     continue;
                 }
+                if (next_tok < 0 || next_tok >= n_vocab ||
+                    hllm_trace_token(&trace, next_tok, selection_logits, n_vocab)) {
+                    pass = 0; finish_reason = "error"; break;
+                }
+                selected++;
+                int stop = is_generation_stop(vocab, next_tok, text_eos, text_eot);
+                if (stop && !bench_ignore_eos) { finish_reason = "eos"; break; }
                 decode_hash ^= (uint32_t)next_tok;
                 decode_hash *= 1099511628211ULL;
-                int pos = n_prefill + k;
-                if (!coding_mode) {
-                    int arg = hip_llm_forward_argmax(gpu, next_tok, pos);
-                    if (arg < 0) { fprintf(stderr, "GPU forward_argmax failed at decode k=%d\n", k); pass = 0; break; }
-                    next_tok = arg;
-                } else {
-                    float *lg = hip_llm_forward_logits(gpu, next_tok, pos);
-                    if (!lg) { fprintf(stderr, "GPU forward_logits failed at decode k=%d\n", k); pass = 0; break; }
-                    if (seen && next_tok >= 0 && next_tok < n_vocab) seen[next_tok] = 1;
-                    next_tok = sample_top_k_p_coding(lg, n_vocab, 20, 0.80f,
-                                              0.70f, 1.50f, 1.0f, 0.0f, seen,
-                                              &sample_rng, vocab);
+                if (!text_finished && !stop) {
+                    if (gen_text) print_decoded_token(stderr, vocab, next_tok);
+                    if (trace.bytes) print_decoded_token(trace.bytes, vocab, next_tok);
                 }
+                if (stop) text_finished = 1;
                 decoded++;
-                if (gen_text) { const char *s = bpe_token_to_str(vocab, next_tok); if (s) fprintf(stderr, "%s", s); }
+                if (sampler) hllm_sampler_accept(sampler, next_tok);
+                if (k + 1 == decode_n) break;
+                int pos = bench_depth + n_prefill + k;
+                if (dense_dflash2 && dense_dflash2_enabled && pos >= 32768) {
+                    dense_dflash2_enabled = 0;
+                    if (!dense_dflash_longctx_notified) {
+                        dense_dflash_longctx_notified = 1;
+                        fprintf(stderr,
+                                "DFlash2 disabled at position %d; using "
+                                "target decode for long context\n", pos);
+                    }
+                }
+                if (dense_path && (!dense_dflash2 || dense_dflash2_enabled) &&
+                    (dense_window ? !dense_window_rows : dense_index == dense_count)) {
+                    dense_count = dense_draft_width;
+                    int available = decode_n-k-1-dense_window;
+                    if (dense_count > available) dense_count = available;
+                    dense_index = 0;
+                    double td = get_time_ms();
+                    int propose_rc = 0;
+                    if (dense_count > 0) propose_rc = dense_dflash2 ?
+                        hip_llm_qwen35_dflash2_propose(gpu, next_tok, pos,
+                                                       dense_count, dense_drafts) :
+                        hip_llm_qwen35_mtp_propose(gpu, next_tok, pos,
+                                                   dense_count, dense_drafts);
+                    if (propose_rc) {
+                        pass = 0; finish_reason = "error"; break;
+                    }
+                    dense_draft_ms += get_time_ms()-td;
+                    dense_proposed += dense_count;
+                    if (dense_window && dense_count > 0) {
+                        int32_t inputs[16]; inputs[0] = next_tok;
+                        memcpy(inputs+1, dense_drafts, (size_t)dense_count*sizeof(int32_t));
+                        dense_window_rows = dense_count+1;
+                        double tv = get_time_ms();
+                        int verify_rc = 0;
+                        if (dense_device_argmax)
+                            verify_rc = hip_llm_qwen35_mtp_verify_argmax(gpu, inputs,
+                                dense_window_rows, pos, dense_argmax);
+                        else {
+                            dense_logits = hip_llm_qwen35_mtp_verify(gpu, inputs,
+                                dense_window_rows, pos);
+                            verify_rc = dense_logits ? 0 : -1;
+                        }
+                        dense_verify_ms += get_time_ms()-tv;
+                        if (verify_rc) { pass = 0; finish_reason = "error"; break; }
+                    }
+                }
+                if (dense_window_rows) {
+                    if (dense_device_argmax) next_tok = dense_argmax[dense_index];
+                    else {
+                        selection_logits = dense_logits + (size_t)dense_index*n_vocab;
+                        if (seen) seen[next_tok] = 1;
+                        next_tok = sampler ? hllm_sampler_sample(sampler, selection_logits) : coding_mode ?
+                            sample_top_k_p_coding(selection_logits, n_vocab, 20, 0.80f,
+                                0.70f, 1.50f, 1.0f, 0.0f, seen, &sample_rng, vocab) :
+                            argmax_logits(selection_logits, n_vocab);
+                    }
+                } else if (!coding_mode && (!sampler || sampler_argmax) && !trace.logits) {
+                    next_tok = hip_llm_forward_argmax(gpu, next_tok, pos);
+                    if (next_tok < 0) { pass = 0; finish_reason = "error"; break; }
+                } else {
+                    selection_logits = hip_llm_forward_logits(gpu, next_tok, pos);
+                    if (!selection_logits) { pass = 0; finish_reason = "error"; break; }
+                    if (seen) seen[next_tok] = 1;
+                    next_tok = sampler ? hllm_sampler_sample(sampler, selection_logits) : coding_mode ?
+                        sample_top_k_p_coding(selection_logits, n_vocab, 20, 0.80f,
+                            0.70f, 1.50f, 1.0f, 0.0f, seen, &sample_rng, vocab) :
+                        argmax_logits(selection_logits, n_vocab);
+                }
+                if (dense_window_rows) {
+                    int matched = dense_index < dense_count && next_tok == dense_drafts[dense_index];
+                    dense_index++;
+                    if (matched) dense_accepted++;
+                    if (!matched || dense_index == dense_window_rows) {
+                        double tc = get_time_ms();
+                        int commit_rc = dense_dflash2 ?
+                            hip_llm_qwen35_dflash2_commit(gpu, pos-dense_index+1,
+                                                          dense_index) :
+                            hip_llm_qwen35_mtp_commit(gpu, dense_index);
+                        dense_commit_ms += get_time_ms()-tc;
+                        if (commit_rc) { pass=0; finish_reason="error"; break; }
+                        dense_window_rows = dense_index = dense_count = 0;
+                    }
+                } else if (dense_path && dense_count > 0) {
+                    if (next_tok == dense_drafts[dense_index++]) dense_accepted++;
+                    else dense_count = dense_index = 0;
+                }
+            }
+            if (dense_window_rows && dense_index > 0) {
+                double tc = get_time_ms();
+                int commit_rc = dense_dflash2 ?
+                    hip_llm_qwen35_dflash2_commit(gpu,
+                        bench_depth+n_prefill+decoded-dense_index,dense_index) :
+                    hip_llm_qwen35_mtp_commit(gpu,dense_index);
+                dense_commit_ms += get_time_ms()-tc;
+                if (commit_rc) pass=0;
             }
             if (gen_text) fprintf(stderr, "\n=== end ===\n");
+            if (dense_path)
+                fprintf(stderr, "%s drafted=%d accepted=%d draft_ms=%.3f "
+                        "verify_ms=%.3f commit_ms=%.3f verify=%s\n",
+                        dense_dflash2 ? "DFLASH2" : "DENSE_MTP",
+                        dense_proposed, dense_accepted, dense_draft_ms,
+                        dense_verify_ms, dense_commit_ms,
+                        dense_window ? "window" : "sequential");
             double t_dec1 = get_time_ms();
+            fprintf(stderr, "GENERATION finish=%s selected=%d emitted=%d synthetic=%d\n",
+                    finish_reason, selected, decoded, bench_ignore_eos);
             hip_llm_set_decode_mode(gpu, 0);
-            decode_ms = t_dec1 - t_dec0;
+            decode_ms = t_dec1 - t_dec0 + first_sample_ms;
             decode_tps = (decode_ms > 0.0) ? (1000.0 * decoded / decode_ms) : 0.0;
         }
 
@@ -1872,9 +2818,14 @@ int main(int argc, char **argv) {
                         vs.total_bytes / (double)(1ULL << 20),
                         vs.peak_used_bytes / (double)(1ULL << 20));
         }
+        if (hllm_trace_close(&trace)) pass = 0;
         fprintf(stderr, "Result: %s\n", pass ? "PASS" : "FAIL");
         } /* bench_rep */
 bench_done:
+        hllm_trace_close(&trace);
+        hllm_sampler_free(sampler);
+        hip_llm_free_state_snapshot(depth_snapshot);
+        free(depth_tokens);
         free(seen);
     } else {
         /* ---- Correctness mode: per-token CPU vs GPU compare (legacy) ---- */

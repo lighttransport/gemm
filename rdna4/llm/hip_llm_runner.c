@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <limits.h>
 #include <dlfcn.h>
 #include <time.h>
 #include "qwen4_moe_stage.h"
@@ -62,6 +63,12 @@ static double hllm_monotonic_ms(void) {
 /* hip_runner_common.h: HIP_CHECK, hip_f32_to_f16, hip_upload_raw, hip_compile_kernels */
 #define HIP_RUNNER_COMMON_IMPLEMENTATION
 #include "../hip_runner_common.h"
+#include "qwen35_reference_math.h"
+#include "qwen35_matvec_q2k.inc"
+#include "qwen35_matvec_iq.inc"
+#include "qwen35_attention_q8.inc"
+#include "qwen35_attention_q8_gate.inc"
+#include "qwen35_dflash2.inc"
 
 #ifdef LLM_HIPBLASLT_ENABLED
 #include "mm_blaslt_bridge.h"
@@ -86,11 +93,23 @@ static const char *hip_kernel_source =
 "/* Minimal FP16 support -- no HIP SDK headers needed. */\n"
 "/* We treat FP16 as unsigned short and convert via HIP builtins. */\n"
 "typedef unsigned short half_raw;\n"
+"/* Preserve the quantization boundary under HIPRTC fast-math. */\n"
+"__device__ __forceinline__ float round_f16_contract(float x) {\n"
+"    unsigned int h; float y;\n"
+"    asm volatile(\"v_cvt_f16_f32 %0, %1\" : \"=v\"(h) : \"v\"(x));\n"
+"    asm volatile(\"v_cvt_f32_f16 %0, %1\" : \"=v\"(y) : \"v\"(h));\n"
+"    return y;\n"
+"}\n"
 "\n"
 "__device__ __forceinline__ float half_to_float(half_raw h) {\n"
 "    __half hv;\n"
 "    *((unsigned short*)&hv) = h;\n"
 "    return __half2float(hv);\n"
+"}\n"
+"__device__ __forceinline__ half_raw f32_to_half_raw(float x) {\n"
+"    unsigned int h;\n"
+"    asm volatile(\"v_cvt_f16_f32 %0, %1\" : \"=v\"(h) : \"v\"(x));\n"
+"    return (half_raw)h;\n"
 "}\n"
 "\n"
 "__device__ __forceinline__ unsigned char f32_to_fp8_e4m3_dev(float f) {\n"
@@ -122,6 +141,13 @@ static const char *hip_kernel_source =
 "    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
 "    if (i < n_embd) {\n"
 "        dst[i] = half_to_float(embd_table[(size_t)token_id * n_embd + i]);\n"
+"    }\n"
+"}\n"
+"\n"
+"__global__ void embed_f32(float *dst, const float *embd_table, int token_id, int n_embd) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (i < n_embd) {\n"
+"        dst[i] = embd_table[(size_t)token_id * n_embd + i];\n"
 "    }\n"
 "}\n"
 "\n"
@@ -334,6 +360,82 @@ static const char *hip_kernel_source =
 "        (val[t+s]==val[t] && idx[t+s]<idx[t]))){val[t]=val[t+s];idx[t]=idx[t+s];}__syncthreads();}\n"
 "    if(t==0)out[row]=idx[0];\n"
 "}\n"
+"__global__ void copy_state_rows_f32(float **conv_dst, const float **conv_src,\n"
+"        size_t conv_elements, size_t conv_stride, float **rec_dst,\n"
+"        const float **rec_src, size_t rec_elements, size_t rec_stride,\n"
+"        int row, int layers) {\n"
+"    int layer=blockIdx.y; size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;\n"
+"    if(layer>=layers)return;\n"
+"    size_t nt=(size_t)gridDim.x*blockDim.x;\n"
+"    if(!(conv_stride&3)){\n"
+"        if(i<conv_elements/4)((uint4 *)conv_dst[layer])[i]=\n"
+"            ((const uint4 *)conv_src[layer])[(size_t)row*(conv_stride/4)+i];\n"
+"        size_t conv_tail=(conv_elements/4)*4;\n"
+"        for(size_t j=conv_tail+i;j<conv_elements;j+=nt)\n"
+"            conv_dst[layer][j]=conv_src[layer][(size_t)row*conv_stride+j];\n"
+"    } else for(size_t j=i;j<conv_elements;j+=nt)\n"
+"        conv_dst[layer][j]=conv_src[layer][(size_t)row*conv_stride+j];\n"
+"    if(!(rec_stride&3)){\n"
+"        if(i<rec_elements/4)((uint4 *)rec_dst[layer])[i]=\n"
+"            ((const uint4 *)rec_src[layer])[(size_t)row*(rec_stride/4)+i];\n"
+"        size_t rec_tail=(rec_elements/4)*4;\n"
+"        for(size_t j=rec_tail+i;j<rec_elements;j+=nt)\n"
+"            rec_dst[layer][j]=rec_src[layer][(size_t)row*rec_stride+j];\n"
+"    } else for(size_t j=i;j<rec_elements;j+=nt)\n"
+"        rec_dst[layer][j]=rec_src[layer][(size_t)row*rec_stride+j];\n"
+"}\n"
+"__global__ void copy_state_rows_commit_f32(float **conv_dst,\n"
+"        const float **conv_src, size_t conv_elements, size_t conv_stride,\n"
+"        float **rec_dst, const float **rec_src, size_t rec_elements,\n"
+"        size_t rec_stride, int row, int layers, float *x_dst,\n"
+"        const float *x_src, size_t x_elements, size_t x_stride,\n"
+"        float *logits_dst, const float *logits_src, size_t logits_elements,\n"
+"        size_t logits_stride) {\n"
+"    int layer=blockIdx.y; size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;\n"
+"    if(layer>=layers)return;\n"
+"    size_t nt=(size_t)gridDim.x*blockDim.x;\n"
+"    if(!(conv_stride&3)){\n"
+"        if(i<conv_elements/4)((uint4 *)conv_dst[layer])[i]=\n"
+"            ((const uint4 *)conv_src[layer])[(size_t)row*(conv_stride/4)+i];\n"
+"        size_t conv_tail=(conv_elements/4)*4;\n"
+"        for(size_t j=conv_tail+i;j<conv_elements;j+=nt)\n"
+"            conv_dst[layer][j]=conv_src[layer][(size_t)row*conv_stride+j];\n"
+"    } else for(size_t j=i;j<conv_elements;j+=nt)\n"
+"        conv_dst[layer][j]=conv_src[layer][(size_t)row*conv_stride+j];\n"
+"    if(!(rec_stride&3)){\n"
+"        if(i<rec_elements/4)((uint4 *)rec_dst[layer])[i]=\n"
+"            ((const uint4 *)rec_src[layer])[(size_t)row*(rec_stride/4)+i];\n"
+"        size_t rec_tail=(rec_elements/4)*4;\n"
+"        for(size_t j=rec_tail+i;j<rec_elements;j+=nt)\n"
+"            rec_dst[layer][j]=rec_src[layer][(size_t)row*rec_stride+j];\n"
+"    } else for(size_t j=i;j<rec_elements;j+=nt)\n"
+"        rec_dst[layer][j]=rec_src[layer][(size_t)row*rec_stride+j];\n"
+"    if(layer==0){\n"
+"        if(!(x_stride&3)){\n"
+"            for(size_t j=i;j<x_elements/4;j+=nt)\n"
+"                ((uint4 *)x_dst)[j]=((const uint4 *)x_src)[(size_t)row*(x_stride/4)+j];\n"
+"        } else for(size_t j=i;j<x_elements;j+=nt)\n"
+"            x_dst[j]=x_src[(size_t)row*x_stride+j];\n"
+"        if(!(logits_stride&3)){\n"
+"            for(size_t j=i;j<logits_elements/4;j+=nt)\n"
+"                ((uint4 *)logits_dst)[j]=((const uint4 *)logits_src)[(size_t)row*(logits_stride/4)+j];\n"
+"        } else for(size_t j=i;j<logits_elements;j+=nt)\n"
+"            logits_dst[j]=logits_src[(size_t)row*logits_stride+j];\n"
+"        /* The scalar branch above already covers every element when the\n"
+"         * source stride is unaligned. Only aligned strides need a tail\n"
+"         * after the vector loop; avoid rewriting those bytes twice. */\n"
+"        if(!(x_stride&3)){\n"
+"            size_t x_tail=(x_elements/4)*4;\n"
+"            for(size_t j=x_tail+i;j<x_elements;j+=nt)\n"
+"                x_dst[j]=x_src[(size_t)row*x_stride+j];\n"
+"        }\n"
+"        if(!(logits_stride&3)){\n"
+"            size_t logits_tail=(logits_elements/4)*4;\n"
+"            for(size_t j=logits_tail+i;j<logits_elements;j+=nt)\n"
+"                logits_dst[j]=logits_src[(size_t)row*logits_stride+j];\n"
+"        }\n"
+"    }\n"
+"}\n"
 "__global__ void hc_norm_f32(float *dst, const float *x, const float *w,\n"
 "                            int n_embd, int n_stream, float eps) {\n"
 "    int s = blockIdx.x; if (s >= n_stream) return;\n"
@@ -420,6 +522,207 @@ static const char *hip_kernel_source =
 "        dst[row] = total;\n"
 "    }\n"
 "}\n"
+"/* BF16 weights must remain BF16: llama.cpp's AMD HIP path does not round\n"
+" * these SSM alpha/beta projections to F16 before the dot product. */\n"
+"/* llama.cpp MMVF default-precision contract for F16 weights: convert the\n"
+" * F32 activation in half2 pairs, accumulate in half2, then widen before the\n"
+" * wave reduction.  This remains an explicit numerical A/B kernel. */\n"
+"/* Bit-exact port of llama.cpp ggml-cuda/mmvf.cu mul_mat_vec_f with\n"
+" * type_acc=float (T=half here; the runner stores the BF16 alpha/beta weights\n"
+" * as exactly-representable F16).  f32 FMA over (half,half) pairs, XOR warp\n"
+" * reduction, then the warp-level block fold with zero-filled lanes 8..31. */\n"
+"__global__ void matvec_f16_llama_f32(float *dst, const half_raw *mat, const float *x,\n"
+"                                      int n_rows, int n_cols) {\n"
+"    int row = blockIdx.x; if (row >= n_rows) return;\n"
+"    x += (size_t)blockIdx.y*n_cols; dst += (size_t)blockIdx.y*n_rows;\n"
+"    int tid = threadIdx.x; int ncols2 = n_cols >> 1;\n"
+"    const unsigned int *rp = (const unsigned int *)(mat + (size_t)row * n_cols);\n"
+"    float sumf = 0.0f;\n"
+"    for (int col2 = tid; col2 < ncols2; col2 += blockDim.x) {\n"
+"        unsigned int tmpx = rp[col2];\n"
+"        float2 w = __half22float2(*(const __half2 *)&tmpx);\n"
+"        sumf = fmaf(w.x, x[2 * col2], sumf);\n"
+"        sumf = fmaf(w.y, x[2 * col2 + 1], sumf);\n"
+"    }\n"
+"    for (int off = 16; off > 0; off >>= 1) sumf += __shfl_xor(sumf, off);\n"
+"    __shared__ float buf_iw[32];\n"
+"    if (blockDim.x > 32) {\n"
+"        if (tid < 32) buf_iw[tid] = 0.0f;\n"
+"        __syncthreads();\n"
+"        buf_iw[tid >> 5] = sumf;\n"
+"        __syncthreads();\n"
+"        if (tid < 32) {\n"
+"            sumf = buf_iw[tid];\n"
+"            for (int off = 16; off > 0; off >>= 1) sumf += __shfl_xor(sumf, off);\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    if (tid == 0) dst[row] = sumf;\n"
+"}\n"
+"/* Two independent F16 projections over the same activation.  Flattening the\n"
+" * two row grids into one launch preserves matvec_f16_llama_f32's per-row\n"
+" * arithmetic and reduction order while removing one launch from every SSM\n"
+" * decode layer. */\n"
+"__global__ void matvec_f16_llama_pair_f32(float *dst0, float *dst1,\n"
+"        const half_raw *mat0, const half_raw *mat1, const float *x,\n"
+"        int n_rows, int n_cols) {\n"
+"    int row = blockIdx.x;\n"
+"    float *dst = row < n_rows ? dst0 : dst1;\n"
+"    const half_raw *mat = row < n_rows ? mat0 : mat1;\n"
+"    if (row >= 2 * n_rows) return;\n"
+"    if (row >= n_rows) row -= n_rows;\n"
+"    int tid = threadIdx.x; int ncols2 = n_cols >> 1;\n"
+"    const unsigned int *rp = (const unsigned int *)(mat + (size_t)row * n_cols);\n"
+"    float sumf = 0.0f;\n"
+"    for (int col2 = tid; col2 < ncols2; col2 += blockDim.x) {\n"
+"        unsigned int tmpx = rp[col2];\n"
+"        float2 w = __half22float2(*(const __half2 *)&tmpx);\n"
+"        sumf = fmaf(w.x, x[2 * col2], sumf);\n"
+"        sumf = fmaf(w.y, x[2 * col2 + 1], sumf);\n"
+"    }\n"
+"    for (int off = 16; off > 0; off >>= 1) sumf += __shfl_xor(sumf, off);\n"
+"    __shared__ float buf_iw[32];\n"
+"    if (blockDim.x > 32) {\n"
+"        if (tid < 32) buf_iw[tid] = 0.0f;\n"
+"        __syncthreads();\n"
+"        buf_iw[tid >> 5] = sumf;\n"
+"        __syncthreads();\n"
+"        if (tid < 32) {\n"
+"            sumf = buf_iw[tid];\n"
+"            for (int off = 16; off > 0; off >>= 1) sumf += __shfl_xor(sumf, off);\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    if (tid == 0) dst[row] = sumf;\n"
+"}\n"
+"/* Batched form of the exact F16 pair above.  The two matrices share every\n"
+" * activation row, so flatten their output rows into one grid while keeping\n"
+" * each token/row's half2 FMA and XOR reduction unchanged. */\n"
+"__global__ void matvec_f16_llama_pair_batch_f32(float *dst0, float *dst1,\n"
+"        const half_raw *mat0, const half_raw *mat1, const float *x,\n"
+"        int n_rows, int n_cols, int M) {\n"
+"    int flat = blockIdx.x, token = blockIdx.y;\n"
+"    if (token >= M || flat >= 2 * n_rows) return;\n"
+"    int row = flat < n_rows ? flat : flat - n_rows;\n"
+"    float *dst = (flat < n_rows ? dst0 : dst1) + (size_t)token * n_rows;\n"
+"    const half_raw *mat = (flat < n_rows ? mat0 : mat1);\n"
+"    const float *xp = x + (size_t)token * n_cols;\n"
+"    int tid = threadIdx.x, ncols2 = n_cols >> 1;\n"
+"    const unsigned int *rp = (const unsigned int *)(mat + (size_t)row * n_cols);\n"
+"    float sumf = 0.0f;\n"
+"    for (int col2 = tid; col2 < ncols2; col2 += blockDim.x) {\n"
+"        unsigned int tmpx = rp[col2];\n"
+"        float2 w = __half22float2(*(const __half2 *)&tmpx);\n"
+"        sumf = fmaf(w.x, xp[2 * col2], sumf);\n"
+"        sumf = fmaf(w.y, xp[2 * col2 + 1], sumf);\n"
+"    }\n"
+"    for (int off = 16; off > 0; off >>= 1) sumf += __shfl_xor(sumf, off);\n"
+"    __shared__ float buf_iw[32];\n"
+"    if (blockDim.x > 32) {\n"
+"        if (tid < 32) buf_iw[tid] = 0.0f;\n"
+"        __syncthreads();\n"
+"        buf_iw[tid >> 5] = sumf;\n"
+"        __syncthreads();\n"
+"        if (tid < 32) {\n"
+"            sumf = buf_iw[tid];\n"
+"            for (int off = 16; off > 0; off >>= 1) sumf += __shfl_xor(sumf, off);\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    if (tid == 0) dst[row] = sumf;\n"
+"}\n"
+"/* Bit-exact port of llama.cpp ggml-cuda/mmvf.cu mul_mat_vec_f for\n"
+" * T=nv_bfloat16, type_acc=float on AMD HIP.  Accumulation uses f32 FMA over\n"
+" * (bf16,bf16) pairs, then an XOR warp reduction and the warp-level block fold\n"
+" * (including the zero-filled lanes 8..31).  Launch blockDim must equal the\n"
+" * block_size llama selects for n_cols. */\n"
+"__global__ void matvec_bf16_llama_f32(float *dst, const unsigned short *mat,\n"
+"                                      const float *x, int n_rows, int n_cols) {\n"
+"    int row = blockIdx.x; if (row >= n_rows) return;\n"
+"    x += (size_t)blockIdx.y*n_cols; dst += (size_t)blockIdx.y*n_rows;\n"
+"    int tid = threadIdx.x; int ncols2 = n_cols >> 1;\n"
+"    const int *rp = (const int *)(mat + (size_t)row * n_cols);\n"
+"    float sumf = 0.0f;\n"
+"    for (int col2 = tid; col2 < ncols2; col2 += blockDim.x) {\n"
+"        int tmpx = rp[col2];\n"
+"        unsigned int b0 = (unsigned int)tmpx & 0xffffu;\n"
+"        unsigned int b1 = (unsigned int)tmpx >> 16;\n"
+"        unsigned int f0 = b0 << 16, f1 = b1 << 16;\n"
+"        float w0, w1; __builtin_memcpy(&w0, &f0, sizeof(w0));\n"
+"        __builtin_memcpy(&w1, &f1, sizeof(w1));\n"
+"        sumf = fmaf(w0, x[2 * col2], sumf);\n"
+"        sumf = fmaf(w1, x[2 * col2 + 1], sumf);\n"
+"    }\n"
+"    for (int off = 16; off > 0; off >>= 1) sumf += __shfl_xor(sumf, off);\n"
+"    __shared__ float buf_iw[32];\n"
+"    if (blockDim.x > 32) {\n"
+"        if (tid < 32) buf_iw[tid] = 0.0f;\n"
+"        __syncthreads();\n"
+"        buf_iw[tid >> 5] = sumf;\n"
+"        __syncthreads();\n"
+"        if (tid < 32) {\n"
+"            sumf = buf_iw[tid];\n"
+"            for (int off = 16; off > 0; off >>= 1) sumf += __shfl_xor(sumf, off);\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    if (tid == 0) dst[row] = sumf;\n"
+"}\n"
+"/* Batched pair form of the llama.cpp BF16 MMVF kernel.  Alpha and beta\n"
+" * share the same verifier activation rows; flattening their output rows\n"
+" * removes one launch while retaining the per-row BF16 conversion, FMA, and\n"
+" * XOR reduction order of the standalone kernel. */\n"
+"__global__ void matvec_bf16_llama_pair_batch_f32(float *dst0, float *dst1,\n"
+"        const unsigned short *mat0, const unsigned short *mat1,\n"
+"        const float *x, int n_rows, int n_cols, int M) {\n"
+"    int flat = blockIdx.x, token = blockIdx.y;\n"
+"    if (token >= M || flat >= 2 * n_rows) return;\n"
+"    int row = flat < n_rows ? flat : flat - n_rows;\n"
+"    float *dst = (flat < n_rows ? dst0 : dst1) + (size_t)token * n_rows;\n"
+"    const unsigned short *mat = (flat < n_rows ? mat0 : mat1);\n"
+"    const float *xp = x + (size_t)token * n_cols;\n"
+"    int tid = threadIdx.x, ncols2 = n_cols >> 1;\n"
+"    const int *rp = (const int *)(mat + (size_t)row * n_cols);\n"
+"    float sumf = 0.0f;\n"
+"    for (int col2 = tid; col2 < ncols2; col2 += blockDim.x) {\n"
+"        int tmpx = rp[col2];\n"
+"        unsigned int b0 = (unsigned int)tmpx & 0xffffu;\n"
+"        unsigned int b1 = (unsigned int)tmpx >> 16;\n"
+"        unsigned int f0 = b0 << 16, f1 = b1 << 16;\n"
+"        float w0, w1; __builtin_memcpy(&w0, &f0, sizeof(w0));\n"
+"        __builtin_memcpy(&w1, &f1, sizeof(w1));\n"
+"        sumf = fmaf(w0, xp[2 * col2], sumf);\n"
+"        sumf = fmaf(w1, xp[2 * col2 + 1], sumf);\n"
+"    }\n"
+"    for (int off = 16; off > 0; off >>= 1) sumf += __shfl_xor(sumf, off);\n"
+"    __shared__ float buf_iw[32];\n"
+"    if (blockDim.x > 32) {\n"
+"        if (tid < 32) buf_iw[tid] = 0.0f;\n"
+"        __syncthreads();\n"
+"        buf_iw[tid >> 5] = sumf;\n"
+"        __syncthreads();\n"
+"        if (tid < 32) {\n"
+"            sumf = buf_iw[tid];\n"
+"            for (int off = 16; off > 0; off >>= 1) sumf += __shfl_xor(sumf, off);\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    if (tid == 0) dst[row] = sumf;\n"
+"}\n"
+"__global__ void matvec_bf16_f32(float *dst, const unsigned short *mat,\n"
+"                                const float *x, int n_rows, int n_cols) {\n"
+"    int row = blockIdx.x; if (row >= n_rows) return;\n"
+"    int tid = threadIdx.x; float sum = 0.0f;\n"
+"    const unsigned short *rp = mat + (size_t)row * n_cols;\n"
+"    for (int j = tid; j < n_cols; j += blockDim.x) {\n"
+"        unsigned int bits = (unsigned int)rp[j] << 16; float w;\n"
+"        __builtin_memcpy(&w, &bits, sizeof(w)); sum += w * x[j];\n"
+"    }\n"
+"    for (int o=16; o>0; o>>=1) sum += __shfl_down(sum,o);\n"
+"    __shared__ float ws[8]; int wid=tid/32, lane=tid&31;\n"
+"    if (lane==0) ws[wid]=sum; __syncthreads();\n"
+"    if (tid==0) { float total=0.0f; for(int w=0;w<(blockDim.x+31)/32;w++) total+=ws[w]; dst[row]=total; }\n"
+"}\n"
 "\n"
 "/* ---- 2b. rmsnorm_batch_f32: RMSNorm over n_rows rows, one block per row ---- */\n"
 "__global__ void rmsnorm_batch_f32(float *dst, const float *x, const float *w,\n"
@@ -468,6 +771,151 @@ static const char *hip_kernel_source =
 "    float scale = rsqrtf(sdata[0] / (float)head_dim + eps);\n"
 "    for (int d = tid; d < head_dim; d += NT) v[d] = v[d] * scale * w[d];\n"
 "}\n"
+"__global__ void qknorm_pair_batch_f32(float *q, const float *qw, int q_heads,\n"
+"        float *k, const float *kw, int k_heads, int head_dim,\n"
+"        int q_stride, int k_stride, float eps) {\n"
+"    extern __shared__ float sdata[];\n"
+"    int h=blockIdx.x, row=blockIdx.y, tid=threadIdx.x, NT=blockDim.x;\n"
+"    bool do_q=h<q_heads, do_k=h<k_heads;\n"
+"    float *qv=do_q ? q+(size_t)row*q_stride+(size_t)h*head_dim : (float *)0;\n"
+"    float *kv=do_k ? k+(size_t)row*k_stride+(size_t)h*head_dim : (float *)0;\n"
+"    float sq=0.0f, sk=0.0f;\n"
+"    for(int d=tid;d<head_dim;d+=NT){if(do_q){float x=qv[d];sq+=x*x;}\n"
+"        if(do_k){float x=kv[d];sk+=x*x;}}\n"
+"    sdata[tid]=sq; sdata[NT+tid]=sk; __syncthreads();\n"
+"    for(int s=NT/2;s>0;s>>=1){if(tid<s){sdata[tid]+=sdata[tid+s];\n"
+"        sdata[NT+tid]+=sdata[NT+tid+s];}__syncthreads();}\n"
+"    if(do_q){float z=rsqrtf(sdata[0]/(float)head_dim+eps);\n"
+"        for(int d=tid;d<head_dim;d+=NT)qv[d]=qv[d]*z*qw[d];}\n"
+"    if(do_k){float z=rsqrtf(sdata[NT]/(float)head_dim+eps);\n"
+"        for(int d=tid;d<head_dim;d+=NT)kv[d]=kv[d]*z*kw[d];}\n"
+"}\n"
+"\n"
+"/* Opt-in DFlash2 proposal Q/K norm + M-RoPE fusion.  The normalized values\n"
+" * are committed before the rotation barrier so the reference qknorm-pair\n"
+" * store/read boundary and per-row operation order remain explicit. */\n"
+"__global__ void qknorm_rope_pair_batch_f32(float *q, const float *qw, int q_heads,\n"
+"        float *k, const float *kw, int k_heads, int head_dim,\n"
+"        int q_stride, int k_stride, int position_start, float freq_base,\n"
+"        int sect0, int sect1, int sect2, int sect3, float eps) {\n"
+"    extern __shared__ float sdata[];\n"
+"    int h=blockIdx.x, row=blockIdx.y, tid=threadIdx.x, NT=blockDim.x;\n"
+"    bool do_q=h<q_heads, do_k=h<k_heads;\n"
+"    float *qv=do_q ? q+(size_t)row*q_stride+(size_t)h*head_dim : (float *)0;\n"
+"    float *kv=do_k ? k+(size_t)row*k_stride+(size_t)h*head_dim : (float *)0;\n"
+"    float sq=0.0f, sk=0.0f;\n"
+"    for(int d=tid;d<head_dim;d+=NT){\n"
+"        if(do_q){float x=qv[d];sq+=x*x;}\n"
+"        if(do_k){float x=kv[d];sk+=x*x;}\n"
+"    }\n"
+"    sdata[tid]=sq; sdata[NT+tid]=sk; __syncthreads();\n"
+"    for(int s=NT/2;s>0;s>>=1){\n"
+"        if(tid<s){sdata[tid]+=sdata[tid+s];sdata[NT+tid]+=sdata[NT+tid+s];}\n"
+"        __syncthreads();\n"
+"    }\n"
+"    if(do_q){float z=rsqrtf(sdata[0]/(float)head_dim+eps);\n"
+"        for(int d=tid;d<head_dim;d+=NT)qv[d]=qv[d]*z*qw[d];}\n"
+"    if(do_k){float z=rsqrtf(sdata[NT]/(float)head_dim+eps);\n"
+"        for(int d=tid;d<head_dim;d+=NT)kv[d]=kv[d]*z*kw[d];}\n"
+"    __syncthreads();\n"
+"    int half_dim=sect0+sect1+sect2+sect3;\n"
+"    if(tid>=half_dim) return;\n"
+"    int rope_dim=2*half_dim, pos=position_start+row;\n"
+"    if(tid>=sect0+sect1+sect2) pos=0;\n"
+"    float freq=1.0f/powf(freq_base,(float)(2*tid)/(float)rope_dim);\n"
+"    float theta=(float)pos*freq, ct=cosf(theta), st=sinf(theta);\n"
+"    if(do_q){float v0=qv[tid],v1=qv[tid+half_dim];\n"
+"        qv[tid]=v0*ct-v1*st;qv[tid+half_dim]=v0*st+v1*ct;}\n"
+"    if(do_k){float v0=kv[tid],v1=kv[tid+half_dim];\n"
+"        kv[tid]=v0*ct-v1*st;kv[tid+half_dim]=v0*st+v1*ct;}\n"
+"}\n"
+"\n"
+"/* Decode-only Qwen3.5 attention preparation.  Q heads first split the gated\n"
+" * projection, then Q and K heads independently run the same 256-thread\n"
+" * RMSNorm reduction and M-RoPE arithmetic as the separate kernels. */\n"
+"__device__ __forceinline__ float q8_recip_contract(float b);\n"
+"__device__ __forceinline__ float q8_div_contract(float a, float b);\n"
+"__global__ void deinterleave_qgate_qknorm_mrope_pair_devp(\n"
+"        float *q, float *gate, const float *qfull, float *k, const float *value,\n"
+"        const float *qw, const float *kw, int n_q_heads, int n_kv_heads,\n"
+"        int head_dim, float eps, const int *pos_p, float freq_base,\n"
+"        int sect0, int sect1, int sect2, int sect3, int store_q8q8,\n"
+"        signed char *kc, signed char *vc, half_raw *ks, half_raw *vs) {\n"
+"    extern __shared__ float sdata[];\n"
+"    int bh = blockIdx.x, tid = threadIdx.x, NT = blockDim.x;\n"
+"    bool is_k = bh >= n_q_heads;\n"
+"    int h = is_k ? bh - n_q_heads : bh;\n"
+"    if ((!is_k && h >= n_q_heads) || (is_k && h >= n_kv_heads)) return;\n"
+"    float *v = (is_k ? k : q) + h * head_dim;\n"
+"    const float *w = is_k ? kw : qw;\n"
+"    if (!is_k) {\n"
+"        for (int d = tid; d < head_dim; d += NT) {\n"
+"            size_t src = (size_t)h * 2 * head_dim + d;\n"
+"            v[d] = qfull[src];\n"
+"            gate[(size_t)h * head_dim + d] = qfull[src + head_dim];\n"
+"        }\n"
+"    }\n"
+"    __syncthreads();\n"
+"    float sum = 0.0f;\n"
+"    for (int d = tid; d < head_dim; d += NT) { float x = v[d]; sum += x * x; }\n"
+"    sdata[tid] = sum;\n"
+"    __syncthreads();\n"
+"    for (int s = NT / 2; s > 0; s >>= 1) {\n"
+"        if (tid < s) sdata[tid] += sdata[tid + s];\n"
+"        __syncthreads();\n"
+"    }\n"
+"    float scale = rsqrtf(sdata[0] / (float)head_dim + eps);\n"
+"    for (int d = tid; d < head_dim; d += NT) v[d] = v[d] * scale * w[d];\n"
+"    __syncthreads();\n"
+"    int j = tid;\n"
+"    int half_dim = sect0 + sect1 + sect2 + sect3;\n"
+"    if (j < half_dim) {\n"
+"        int rope_dim = 2 * half_dim;\n"
+"        int pos_v = *pos_p;\n"
+"        int pos;\n"
+"        if (j < sect0) pos = pos_v;\n"
+"        else if (j < sect0 + sect1) pos = pos_v;\n"
+"        else if (j < sect0 + sect1 + sect2) pos = pos_v;\n"
+"        else pos = 0;\n"
+"        float freq = 1.0f / powf(freq_base, (float)(2 * j) / (float)rope_dim);\n"
+"        float theta = (float)pos * freq;\n"
+"        float cos_t = cosf(theta);\n"
+"        float sin_t = sinf(theta);\n"
+"        float v0 = v[j], v1 = v[j + half_dim];\n"
+"        v[j] = v0 * cos_t - v1 * sin_t;\n"
+"        v[j + half_dim] = v0 * sin_t + v1 * cos_t;\n"
+"    }\n"
+"    __syncthreads();\n"
+"    if (is_k && store_q8q8) {\n"
+"        int lane = tid & 31, group = tid >> 5, groups = head_dim / 32;\n"
+"        int kv_dim = n_kv_heads * head_dim, pos = *pos_p;\n"
+"        size_t input = (size_t)h * head_dim + tid;\n"
+"        float xk = tid < head_dim ? k[input] : 0.0f;\n"
+"        float xv = tid < head_dim ? value[input] : 0.0f;\n"
+"        float ak = fabsf(xk), av = fabsf(xv);\n"
+"        for (int z = 16; z; z >>= 1) {\n"
+"            ak = fmaxf(ak, __shfl_xor(ak, z, 32));\n"
+"            av = fmaxf(av, __shfl_xor(av, z, 32));\n"
+"        }\n"
+"        float dk = q8_div_contract(ak, 127.0f);\n"
+"        float dv = q8_div_contract(av, 127.0f);\n"
+"        float ik = dk ? q8_recip_contract(dk) : 0.0f;\n"
+"        float iv = dv ? q8_recip_contract(dv) : 0.0f;\n"
+"        if (tid < head_dim) {\n"
+"            size_t o = (size_t)pos * kv_dim + h * head_dim + tid;\n"
+"            float qk, qv;\n"
+"            asm volatile(\"v_mul_f32 %0, %1, %2\":\"=v\"(qk):\"v\"(xk),\"v\"(ik));\n"
+"            asm volatile(\"v_mul_f32 %0, %1, %2\":\"=v\"(qv):\"v\"(xv),\"v\"(iv));\n"
+"            kc[o] = (signed char)roundf(qk);\n"
+"            vc[o] = (signed char)roundf(qv);\n"
+"            if (lane == 0) {\n"
+"                size_t sg = ((size_t)pos * n_kv_heads + h) * groups + group;\n"
+"                ks[sg] = f32_to_half_raw(round_f16_contract(dk));\n"
+"                vs[sg] = f32_to_half_raw(round_f16_contract(dv));\n"
+"            }\n"
+"        }\n"
+"    }\n"
+"}\n"
 "\n"
 "/* ---- 4b. qknorm_batch_f32: per-row, per-head RMSNorm; grid=(n_heads, M) ---- */\n"
 "__global__ void qknorm_batch_f32(float *vec, const float *w,\n"
@@ -491,6 +939,47 @@ static const char *hip_kernel_source =
 "    }\n"
 "    float scale = rsqrtf(sdata[0] / (float)head_dim + eps);\n"
 "    for (int d = tid; d < head_dim; d += NT) v[d] = v[d] * scale * w[d];\n"
+"}\n"
+"\n"
+"/* Opt-in DFlash2 sidecar K-norm + M-RoPE fusion.  The normalization and\n"
+" * rotation retain the same per-row reduction and scalar operation order as\n"
+" * qknorm_batch_f32 followed by rope_mrope_batch_f32; only the intermediate\n"
+" * global-memory round trip and launch boundary are removed.\n"
+" * Grid: (n_heads, M), block: a power-of-two head dimension. */\n"
+"__global__ void qknorm_rope_mrope_batch_f32(float *vec_batch, const float *w,\n"
+"        int n_heads, int head_dim, int position_start, float freq_base,\n"
+"        int sect0, int sect1, int sect2, int sect3, int row_stride,\n"
+"        float eps) {\n"
+"    extern __shared__ float sdata[];\n"
+"    int h = blockIdx.x, row = blockIdx.y, tid = threadIdx.x;\n"
+"    int NT = blockDim.x;\n"
+"    if (h >= n_heads) return;\n"
+"    float *v = vec_batch + (size_t)row * row_stride + h * head_dim;\n"
+"    float sum = 0.0f;\n"
+"    for (int d = tid; d < head_dim; d += NT) {\n"
+"        float x = v[d]; sum += x * x;\n"
+"    }\n"
+"    sdata[tid] = sum; __syncthreads();\n"
+"    for (int s = NT / 2; s > 0; s >>= 1) {\n"
+"        if (tid < s) sdata[tid] += sdata[tid + s];\n"
+"        __syncthreads();\n"
+"    }\n"
+"    float scale = rsqrtf(sdata[0] / (float)head_dim + eps);\n"
+"    int half_dim = sect0 + sect1 + sect2 + sect3;\n"
+"    if (tid >= half_dim) return;\n"
+"    int rope_dim = 2 * half_dim;\n"
+"    int pos_base = position_start + row, pos;\n"
+"    if (tid < sect0) pos = pos_base;\n"
+"    else if (tid < sect0 + sect1) pos = pos_base;\n"
+"    else if (tid < sect0 + sect1 + sect2) pos = pos_base;\n"
+"    else pos = 0;\n"
+"    float freq = 1.0f / powf(freq_base, (float)(2 * tid) / (float)rope_dim);\n"
+"    float theta = (float)pos * freq;\n"
+"    float ct = cosf(theta), st = sinf(theta);\n"
+"    float v0 = v[tid] * scale * w[tid];\n"
+"    float v1 = v[tid + half_dim] * scale * w[tid + half_dim];\n"
+"    v[tid] = v0 * ct - v1 * st;\n"
+"    v[tid + half_dim] = v0 * st + v1 * ct;\n"
 "}\n"
 "\n"
 "/* ---- 5. rope_neox_f32: NeoX-style RoPE, pairs (j, j+pair_offset) ---- */\n"
@@ -525,6 +1014,8 @@ static const char *hip_kernel_source =
 "/* ---- 5b. rope_mrope_f32: M-RoPE with per-section frequencies ---- */\n"
 "/* Grid: n_heads blocks, blockDim: half_dim threads */\n"
 "/* sections[4] = {temporal, height, width, pad} dimension counts */\n"
+"/* Pair offset is n_rot/2 (sum of sections), not head_dim/2.\n"
+" * Qwen3.5 rotates 64 of 256 head dimensions; leave the tail untouched. */\n"
 "/* For text-only: pos_t = pos_h = pos_w = pos */\n"
 "__global__ void rope_mrope_f32(float *vec, int n_heads, int head_dim,\n"
 "                                int pos_t, int pos_h, int pos_w,\n"
@@ -533,7 +1024,7 @@ static const char *hip_kernel_source =
 "    int h = blockIdx.x;\n"
 "    if (h >= n_heads) return;\n"
 "    int j = threadIdx.x;\n"
-"    int half_dim = head_dim / 2;\n"
+"    int half_dim = sect0 + sect1 + sect2 + sect3;\n"
 "    if (j >= half_dim) return;\n"
 "\n"
 "    /* Determine which section this dimension pair belongs to */\n"
@@ -663,6 +1154,69 @@ static const char *hip_kernel_source =
 "    }\n"
 "}\n"
 "\n"
+"/* Batched form of attn_decode_f32. Each (head,row) block executes the\n"
+" * same reduction/order as the scalar kernel; only the grid adds the query\n"
+" * row dimension. This is the parity path for F32 KV prefill. */\n"
+"__global__ void attn_prefill_scalar_f32(float *out, const float *q,\n"
+"    const float *key_cache, const float *value_cache,\n"
+"    int n_heads, int n_kv_heads, int head_dim, int kv_dim,\n"
+"    int M, int position_start, float scale) {\n"
+"    extern __shared__ float att[];\n"
+"    int h = blockIdx.x, m = blockIdx.y;\n"
+"    if (h >= n_heads || m >= M) return;\n"
+"    int tid = threadIdx.x, nt = blockDim.x;\n"
+"    int kv_h = h / (n_heads / n_kv_heads);\n"
+"    int seq_len = position_start + m + 1;\n"
+"    const float *q_h = q + ((size_t)m * n_heads + h) * head_dim;\n"
+"    for (int t = tid; t < seq_len; t += nt) {\n"
+"        const float *k_t = key_cache + (size_t)t * kv_dim + kv_h * head_dim;\n"
+"        float s = 0.0f;\n"
+"        for (int d = 0; d < head_dim; d++) s += q_h[d] * k_t[d];\n"
+"        att[t] = s * scale;\n"
+"    }\n"
+"    __syncthreads();\n"
+"    float local_max = -1e30f;\n"
+"    for (int t = tid; t < seq_len; t += nt) if (att[t] > local_max) local_max = att[t];\n"
+"    for (int off = 16; off > 0; off >>= 1) {\n"
+"        float v = __shfl_down(local_max, off);\n"
+"        if (v > local_max) local_max = v;\n"
+"    }\n"
+"    __shared__ float warp_max[8];\n"
+"    int wid = tid / 32, lane = tid & 31;\n"
+"    if (lane == 0) warp_max[wid] = local_max;\n"
+"    __syncthreads();\n"
+"    if (tid == 0) {\n"
+"        float v = warp_max[0];\n"
+"        for (int w = 1; w < (nt + 31) / 32; w++) if (warp_max[w] > v) v = warp_max[w];\n"
+"        warp_max[0] = v;\n"
+"    }\n"
+"    __syncthreads();\n"
+"    float max_val = warp_max[0], local_sum = 0.0f;\n"
+"    for (int t = tid; t < seq_len; t += nt) {\n"
+"        float e = expf(att[t] - max_val); att[t] = e; local_sum += e;\n"
+"    }\n"
+"    for (int off = 16; off > 0; off >>= 1) local_sum += __shfl_down(local_sum, off);\n"
+"    __shared__ float warp_sum[8];\n"
+"    if (lane == 0) warp_sum[wid] = local_sum;\n"
+"    __syncthreads();\n"
+"    if (tid == 0) {\n"
+"        float v = 0.0f;\n"
+"        for (int w = 0; w < (nt + 31) / 32; w++) v += warp_sum[w];\n"
+"        warp_sum[0] = v;\n"
+"    }\n"
+"    __syncthreads();\n"
+"    float inv_sum = 1.0f / warp_sum[0];\n"
+"    for (int t = tid; t < seq_len; t += nt) att[t] *= inv_sum;\n"
+"    __syncthreads();\n"
+"    float *out_h = out + ((size_t)m * n_heads + h) * head_dim;\n"
+"    for (int d = tid; d < head_dim; d += nt) {\n"
+"        float sum = 0.0f;\n"
+"        for (int t = 0; t < seq_len; t++)\n"
+"            sum += att[t] * value_cache[(size_t)t * kv_dim + kv_h * head_dim + d];\n"
+"        out_h[d] = sum;\n"
+"    }\n"
+"}\n"
+"\n"
 "/* ---- 8. silu_mul_f32: gate = silu(gate) * up ---- */\n"
 "__global__ void silu_mul_f32(float *gate, const float *up, int n) {\n"
 "    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
@@ -671,6 +1225,39 @@ static const char *hip_kernel_source =
 "        g = g / (1.0f + expf(-g));\n"
 "        gate[i] = g * up[i];\n"
 "    }\n"
+"}\n"
+"/* Decode FFN activation plus exact native Q8_1 staging.  One wave owns one\n"
+" * 32-value block, so this retains the standalone SiLU arithmetic while\n"
+" * replacing the following qwen35_quantize_q81 launch and reread. */\n"
+"__global__ void silu_mul_q81_f32(float *gate, const float *up,\n"
+"        signed char *q, float *qscale, int n) {\n"
+"    int lane=threadIdx.x, i=blockIdx.x*32+lane;\n"
+"    float g=gate[i];\n"
+"    g=g/(1.0f+expf(-g));\n"
+"    float v=g*up[i];\n"
+"    gate[i]=v;\n"
+"    float a=fabsf(v);\n"
+"    for(int off=16;off;off>>=1)a=fmaxf(a,__shfl_xor(a,off,32));\n"
+"    float d=q8_div_contract(a,127.0f);\n"
+"    q[i]=a==0.0f?0:(signed char)roundf(q8_div_contract(v,d));\n"
+"    if(lane==0)qscale[blockIdx.x]=round_f16_contract(d);\n"
+"}\n"
+"/* Batched DFlash2 variant: preserve the scalar SiLU and Q8_1 contracts\n"
+" * while writing the row-major activation tile used by the next Q4_K matvec.\n"
+" * The flattened block index is also the row-major Q8_1 scale index. */\n"
+"__global__ void silu_mul_q81_batch_f32(float *gate, const float *up,\n"
+"        signed char *q, float *qscale, int n) {\n"
+"    int lane=threadIdx.x, i=blockIdx.x*32+lane;\n"
+"    if(i>=n)return;\n"
+"    float g=gate[i];\n"
+"    g=g/(1.0f+expf(-g));\n"
+"    float v=g*up[i];\n"
+"    gate[i]=v;\n"
+"    float a=fabsf(v);\n"
+"    for(int off=16;off;off>>=1)a=fmaxf(a,__shfl_xor(a,off,32));\n"
+"    float d=q8_div_contract(a,127.0f);\n"
+"    q[i]=a==0.0f?0:(signed char)roundf(q8_div_contract(v,d));\n"
+"    if(lane==0)qscale[blockIdx.x]=round_f16_contract(d);\n"
 "}\n"
 "\n"
 "/* Repack compact GGUF Q8_0 blocks (34 B) into the runner's aligned 36 B\n"
@@ -788,15 +1375,28 @@ static const char *hip_kernel_source =
 "__device__ __forceinline__ int dp4a_hw(int a, int b, int c) {\n"
 "    return __builtin_amdgcn_sudot4(true, a, true, b, c, false);\n"
 "}\n"
+"__device__ static const unsigned int signmask4_dev[16] = {\n"
+"    0x00000000u, 0x000000ffu, 0x0000ff00u, 0x0000ffffu,\n"
+"    0x00ff0000u, 0x00ff00ffu, 0x00ffff00u, 0x00ffffffu,\n"
+"    0xff000000u, 0xff0000ffu, 0xff00ff00u, 0xff00ffffu,\n"
+"    0xffff0000u, 0xffff00ffu, 0xffffff00u, 0xffffffffu\n"
+"};\n"
+"typedef unsigned char u8x4 __attribute__((ext_vector_type(4)));\n"
 "/* Build a packed int8x4 from 4 uint8 grid magnitudes, negating byte k when\n"
 "   sign bit (base+k) of sb is set (matches the scalar IQ sign convention). */\n"
 "__device__ __forceinline__ int apply_sign4(unsigned int g, unsigned int sb, int base) {\n"
-"    int r = 0; signed char *o = (signed char *)&r; const unsigned char *gb = (const unsigned char *)&g;\n"
-"    o[0] = (sb & (1u << (base+0))) ? -(int)gb[0] : (int)gb[0];\n"
-"    o[1] = (sb & (1u << (base+1))) ? -(int)gb[1] : (int)gb[1];\n"
-"    o[2] = (sb & (1u << (base+2))) ? -(int)gb[2] : (int)gb[2];\n"
-"    o[3] = (sb & (1u << (base+3))) ? -(int)gb[3] : (int)gb[3];\n"
-"    return r;\n"
+"    unsigned int m = signmask4_dev[(sb >> base) & 15u];\n"
+"    return (int)((g ^ m) + (m & 0x01010101u));\n"
+"}\n"
+"__device__ __forceinline__ int apply_sign4_vec(unsigned int g, unsigned int sb, int base) {\n"
+"    unsigned int m = signmask4_dev[(sb >> base) & 15u];\n"
+"    u8x4 gv = {(unsigned char)g, (unsigned char)(g >> 8),\n"
+"               (unsigned char)(g >> 16), (unsigned char)(g >> 24)};\n"
+"    u8x4 mv = {(unsigned char)m, (unsigned char)(m >> 8),\n"
+"               (unsigned char)(m >> 16), (unsigned char)(m >> 24)};\n"
+"    u8x4 ov = (gv ^ mv) + (mv & (u8x4){1, 1, 1, 1});\n"
+"    return (int)ov[0] | ((int)ov[1] << 8) | ((int)ov[2] << 16) |\n"
+"           ((int)ov[3] << 24);\n"
 "}\n"
 "/* ---- quantize_q8_32: F32 vector -> int8 per-32-block + fp32 scale ---- */\n"
 "/* grid = n/32 blocks, blockDim 32 (one warp per 32-element block).          */\n"
@@ -814,11 +1414,118 @@ static const char *hip_kernel_source =
 "        qs[idx] = (signed char)q;\n"
 "    }\n"
 "}\n"
+"/* Two-term Q8 expansion: x ~= s0*q0 + s1*q1.  Quantizing the residual\n"
+" * cuts activation error to second order while preserving int8 DP4A dots. */\n"
+"__global__ void quantize_q8x2_32(signed char *q0, float *s0, signed char *q1,\n"
+"                                  float *s1, const float *x, int n) {\n"
+"    int g = blockIdx.x, lane = threadIdx.x, idx = g * 32 + lane;\n"
+"    float v = (idx < n) ? x[idx] : 0.0f;\n"
+"    float a = fabsf(v);\n"
+"    for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_down(a, o));\n"
+"    a = __shfl(a, 0);\n"
+"    float d0 = a / 127.0f, inv0 = a > 0.0f ? 127.0f / a : 0.0f;\n"
+"    int z0 = (int)rintf(v * inv0);\n"
+"    z0 = z0 > 127 ? 127 : (z0 < -127 ? -127 : z0);\n"
+"    float r = v - d0 * (float)z0;\n"
+"    float ar = fabsf(r);\n"
+"    for (int o = 16; o > 0; o >>= 1) ar = fmaxf(ar, __shfl_down(ar, o));\n"
+"    ar = __shfl(ar, 0);\n"
+"    float d1 = ar / 127.0f, inv1 = ar > 0.0f ? 127.0f / ar : 0.0f;\n"
+"    int z1 = (int)rintf(r * inv1);\n"
+"    z1 = z1 > 127 ? 127 : (z1 < -127 ? -127 : z1);\n"
+"    if (lane == 0) { s0[g] = d0; s1[g] = d1; }\n"
+"    if (idx < n) { q0[idx] = (signed char)z0; q1[idx] = (signed char)z1; }\n"
+"}\n"
+
+"/* Batched Q8x2 staging for IQ2_XS projections.  One block handles one\n"
+" * 32-value activation group of one token; the layout is token-major. */\n"
+"__global__ void quantize_q8x2_batch_32(signed char *q0, float *s0, signed char *q1,\n"
+"        float *s1, const float *x, int n, int M, int stride) {\n"
+"    int g=blockIdx.x, token=blockIdx.y, lane=threadIdx.x, idx=g*32+lane;\n"
+"    float v=(token<M && idx<n) ? x[(size_t)token*stride+idx] : 0.0f;\n"
+"    float a=fabsf(v);\n"
+"    for(int o=16;o>0;o>>=1) a=fmaxf(a,__shfl_down(a,o));\n"
+"    a=__shfl(a,0); float d0=a/127.0f, inv0=a>0.0f?127.0f/a:0.0f;\n"
+"    /* llama.cpp MMQ uses roundf (half away from zero), not rintf's\n"
+"     * device-rounding-mode dependent tie behavior. */\n"
+"    int z0=(int)roundf(v*inv0); z0=z0>127?127:(z0<-127?-127:z0);\n"
+"    float rr=v-d0*(float)z0, ar=fabsf(rr);\n"
+"    for(int o=16;o>0;o>>=1) ar=fmaxf(ar,__shfl_down(ar,o));\n"
+"    ar=__shfl(ar,0); float d1=ar/127.0f, inv1=ar>0.0f?127.0f/ar:0.0f;\n"
+"    int z1=(int)roundf(rr*inv1); z1=z1>127?127:(z1<-127?-127:z1);\n"
+"    size_t qo=(size_t)token*n+(size_t)g*32, so=(size_t)token*(n/32)+g;\n"
+"    if(lane==0){s0[so]=d0;s1[so]=d1;}\n"
+"    if(token<M && idx<n){q0[qo+lane]=(signed char)z0;q1[qo+lane]=(signed char)z1;}\n"
+"}\n"
+"/* Exact single-term Q8_1 staging used by llama.cpp's MMQ/MVQ path.  The\n"
+" * quantizer computes q with the FP32 scale, then stores ds as FP16; the\n"
+" * explicit half round-trip is important because block_q8_1::ds is half2.\n"
+" * q1/s1 are explicitly zeroed because the native DP4A kernels consume both\n"
+" * terms from the shared scratch contract. */\n"
+"__device__ __forceinline__ void quantize_q8_contract(signed char *q0, float *s0, signed char *q1,\n"
+"        float *s1, const float *x, int n, int M, int stride, int d4) {\n"
+"    int g=blockIdx.x, token=blockIdx.y, lane=threadIdx.x, idx=g*32+lane;\n"
+"    float v=(token<M && idx<n) ? x[(size_t)token*stride+idx] : 0.0f;\n"
+"    float a=fabsf(v);\n"
+"    for(int o=16;o>0;o>>=1) a=fmaxf(a,__shfl_down(a,o));\n"
+"    a=__shfl(a,0); float d=a/127.0f, dh=d4 ? d : round_f16_contract(d);\n"
+"    /* Keep the validated HIP parity form.  Although ggml's source uses\n"
+"     * an explicit reciprocal multiply, the division form is measurably\n"
+"     * closer on gfx1201 for this Qwen3.8 stack. */\n"
+"    int q=(a==0.0f)?0:(int)roundf(v*(d4 ? (127.0f/a) : (1.0f/d)));\n"
+"    q=q>127?127:(q<-127?-127:q);\n"
+"    size_t qo=(size_t)token*n+(size_t)g*32, so=(size_t)token*(n/32)+g;\n"
+"    if(lane==0){s0[so]=dh;s1[so]=0.0f;}\n"
+"    if(token<M && idx<n){q0[qo+lane]=(signed char)q;q1[qo+lane]=0;}\n"
+"}\n"
+"/* IQ1 Q8_1 staging: retain the second half of ds as the FP16 input sum.\n"
+" * Distinct D4/MMVQ wrappers preserve the reference's scale precision. */\n"
+"__global__ void quantize_q81_batch_32_exact(signed char *q0,float *s0,signed char *q1,\n"
+"        float *s1,const float *x,int n,int M,int stride){\n"
+"    quantize_q8_contract(q0,s0,q1,s1,x,n,M,stride,0);\n"
+"}\n"
+"__global__ void quantize_mmq_d4_batch(signed char *q0,float *s0,signed char *q1,\n"
+"        float *s1,const float *x,int n,int M,int stride){\n"
+"    quantize_q8_contract(q0,s0,q1,s1,x,n,M,stride,1);\n"
+"}\n"
+"/* IQ1 correction contract:\n"
+" * IQ1_S/IQ1_M use llama.cpp's affine codebook correction and need the\n"
+" * Q8_1 block sum field. The original-input FP16 sum is retained here as\n"
+" * the validated parity variant. */\n"
+"__global__ void quantize_q81_iq1_batch_32_exact(signed char *q0, float *s0,\n"
+"        float *qsum, const float *x, int n, int M, int stride) {\n"
+"    int g=blockIdx.x, token=blockIdx.y, lane=threadIdx.x, idx=g*32+lane;\n"
+"    float v=(token<M && idx<n) ? x[(size_t)token*stride+idx] : 0.0f;\n"
+"    float a=fabsf(v);\n"
+"    for(int o=16;o>0;o>>=1) a=fmaxf(a,__shfl_down(a,o));\n"
+"    a=__shfl(a,0);\n"
+"    float d=a/127.0f, dh=round_f16_contract(d);\n"
+"    /* Keep the validated HIP parity form.  Although ggml's source uses\n"
+"     * an explicit reciprocal multiply, the division form is measurably\n"
+"     * closer on gfx1201 for this Qwen3.8 stack. */\n"
+"    int q=(a==0.0f)?0:(int)roundf(v/d); q=q>127?127:(q<-127?-127:q);\n"
+"    /* llama.cpp's quantize_q8_1 stores block_q8_1::s as the FP16 sum of the\n"
+"     * original input values, not d*sum(q). The IQ1 affine correction multiplies\n"
+"     * this raw sum by delta, so storing the quantized reconstruction sum biases\n"
+"     * every IQ1_S projection (measured ~0.7% at layer-0 ffn_gate). */\n"
+"    float sumf=v; for(int o=16;o>0;o>>=1) sumf+=__shfl_down(sumf,o);\n"
+"    sumf=__shfl(sumf,0);\n"
+"    size_t qo=(size_t)token*n+(size_t)g*32, so=(size_t)token*(n/32)+g;\n"
+"    if(lane==0){s0[so]=dh;qsum[so]=round_f16_contract(sumf);}\n"
+"    if(token<M && idx<n)q0[qo+lane]=(signed char)q;\n"
+"}\n"
 
 "/* Canonical GGML-compatible Q8_K/Q8_1 activation staging for the exact\n"
 " * Qwen4 routed path.  Q8_K is one 256-value block: fp32 d, 256 int8\n"
 " * values, then 16 int16 sub-block sums (292 bytes).  Q8_1 is one 32-value\n"
 " * block: fp32 d, fp32 sum(d*q), and 32 int8 values (40 bytes). */\n"
+"__device__ __forceinline__ int ggml_nearest_int_q8k(float v) {\n"
+"    /* Match ggml's quantize_row_q8_K_ref rather than inheriting the device\n"
+"     * rounding mode used by rintf. */\n"
+"    float t = v + 12582912.0f;\n"
+"    int bits = __float_as_int(t);\n"
+"    return (bits & 0x007fffff) - 0x00400000;\n"
+"}\n"
 "__global__ void qwen4_quantize_q8k(unsigned char *dst,const float *x,int n){\n"
 "    int b=blockIdx.x,tid=threadIdx.x,lane=tid&31,base=b*256;\n"
 "    if(base>=n)return;\n"
@@ -829,12 +1536,86 @@ static const char *hip_kernel_source =
 "    if(tid<32){a=tid<8?wm[tid]:0.0f;for(int o=16;o>0;o>>=1)a=fmaxf(a,__shfl_down(a,o));if(tid==0){mx=a/127.0f;*(float *)(dst+(size_t)b*292)=mx;}}\n"
 "    __syncthreads();float d=mx;\n"
 "    for(int i=tid;i<256;i+=256){float z=(base+i<n)?x[base+i]:0.0f;\n"
-"        int q=d>0.0f?(int)rintf(z/d):0;q=q>127?127:(q<-127?-127:q);\n"
+"        int q=d>0.0f?ggml_nearest_int_q8k(z/d):0;q=q>127?127:(q<-127?-127:q);\n"
 "        dst[(size_t)b*292+4+i]=(unsigned char)(signed char)q;}\n"
 "    __syncthreads();\n"
 "    for(int s=tid;s<16;s+=256){int sum=0;for(int i=0;i<16;i++){int j=s*16+i;\n"
 "            if(base+j<n)sum+=(signed char)dst[(size_t)b*292+4+j];}\n"
 "        *(short *)(dst+(size_t)b*292+260+s*2)=(short)sum;}\n"
+"}\n"
+"/* llama.cpp-compatible IQ4_XS x Q8_K dot.  This is diagnostic-only: the\n"
+" * production Qwen3.5 path keeps the F32 activation matvec until the full\n"
+" * layer/logit comparison proves that Q8_K reduces accumulated error. */\n"
+"__device__ static const signed char kvalues_iq4nl_q8k_dev[16] = {\n"
+"    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113\n"
+"};\n"
+"__global__ void matvec_iq4_xs_q8k(float *dst, const unsigned char *mat,\n"
+"        const unsigned char *xq, int n_rows, int n_cols){\n"
+"    int warp=threadIdx.x>>5,lane=threadIdx.x&31,row=blockIdx.x*(blockDim.x/32)+warp;\n"
+"    if(row>=n_rows)return; int nb=n_cols/256,G=nb*8;\n"
+"    const unsigned char *rp=mat+(size_t)row*nb*136; float sum=0.0f;\n"
+"    for(int g=lane;g<G;g+=32){int b=g>>3,ib=g&7;\n"
+"        const unsigned char *bp=rp+(size_t)b*136;\n"
+"        float d4d8=half_to_float(*(const half_raw*)bp)*\n"
+"            *(const float *)(xq+(size_t)b*292);\n"
+"        unsigned short sh=*(const unsigned short *)(bp+2);\n"
+"        const unsigned char *sl=bp+4,*qs=bp+8+ib*16;\n"
+"        const signed char *q8=(const signed char *)(xq+(size_t)b*292+4+ib*32);\n"
+"        int ls=((sl[ib/2]>>(4*(ib&1)))&15)|(((sh>>(2*ib))&3)<<4);\n"
+"        int dot=0;\n"
+"        for(int j=0;j<16;j++) dot+=(int)q8[j]*(int)kvalues_iq4nl_q8k_dev[qs[j]&15];\n"
+"        for(int j=0;j<16;j++) dot+=(int)q8[j+16]*(int)kvalues_iq4nl_q8k_dev[qs[j]>>4];\n"
+"        sum=fmaf(d4d8*(float)(ls-32),(float)dot,sum);\n"
+"    }\n"
+"    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o);\n"
+"    if(lane==0)dst[row]=sum;\n"
+"}\n"
+"/* llama.cpp HIP/MMQ-compatible IQ4_XS x Q8_1.  One activation scale is\n"
+" * used for each 32-value group, matching the IQ4_XS MMQ dot grouping. */\n"
+"__global__ void matvec_iq4_xs_q81_batch(float *dst,const unsigned char *mat,\n"
+"        const signed char *q,const float *s,int n_rows,int n_cols,int M){\n"
+"    int warp=threadIdx.x>>5,lane=threadIdx.x&31,row=blockIdx.x*8+warp,token=blockIdx.y;\n"
+"    if(row>=n_rows||token>=M)return; int nb=n_cols/256,G=nb*8;\n"
+"    const unsigned char *rp=mat+(size_t)row*nb*136;\n"
+"    const signed char *tq=q+(size_t)token*n_cols;\n"
+"    const float *ts=s+(size_t)token*(n_cols/32); float sum=0.0f;\n"
+"    for(int g=lane;g<G;g+=32){int b=g>>3,ib=g&7; const unsigned char *bp=rp+b*136;\n"
+"        float d=half_to_float(*(const half_raw*)bp); unsigned short sh=*(const unsigned short*)(bp+2);\n"
+"        const unsigned char *sl=bp+4,*qs=bp+8+ib*16; int ls=((sl[ib/2]>>(4*(ib&1)))&15)|(((sh>>(2*ib))&3)<<4);\n"
+"        const signed char *xv=tq+g*32; int dot=0;\n"
+"        for(int j=0;j<16;j++){dot+=(int)xv[j]*(int)kvalues_iq4nl_q8k_dev[qs[j]&15]; dot+=(int)xv[j+16]*(int)kvalues_iq4nl_q8k_dev[qs[j]>>4];}\n"
+"        sum+=d*(float)(ls-32)*ts[g]*(float)dot; }\n"
+"    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o); if(lane==0)dst[(size_t)token*n_rows+row]=sum;\n"
+"}\n"
+"/* Scalar-row IQ4_XS Q8_1 DP4A port.  The code-word packing follows\n"
+" * llama.cpp's get_int_b4: each word is four contiguous bytes from qs.\n"
+" * This is intentionally an A/B because the existing scalar kernel is the\n"
+" * quality baseline. */\n"
+"__global__ void matvec_iq4_xs_q81_dp4a(float *dst,const unsigned char *mat,\n"
+"        const signed char *q,const float *s,int n_rows,int n_cols){\n"
+"    int warp=threadIdx.x>>5,lane=threadIdx.x&31,row=blockIdx.x*8+warp;\n"
+"    if(row>=n_rows)return; int nb=n_cols/256,G=nb*8;\n"
+"    const unsigned char *rp=mat+(size_t)row*nb*136; const signed char *tq=q;\n"
+"    const float *ts=s; float sum=0.0f;\n"
+"    for(int g=lane;g<G;g+=32){int b=g>>3,ib=g&7; const unsigned char *bp=rp+b*136;\n"
+"        const unsigned char *sl=bp+4,*qs=bp+8+ib*16;\n"
+"        unsigned short sh=*(const unsigned short *)(bp+2);\n"
+"        int ls=((sl[ib/2]>>(4*(ib&1)))&15)|(((sh>>(2*ib))&3)<<4); int z=0;\n"
+"        for(int j=0;j<4;j++){\n"
+"            int w0=(int)(unsigned char)kvalues_iq4nl_q8k_dev[qs[4*j+0]&15] |\n"
+"                   ((int)(unsigned char)kvalues_iq4nl_q8k_dev[qs[4*j+1]&15]<<8) |\n"
+"                   ((int)(unsigned char)kvalues_iq4nl_q8k_dev[qs[4*j+2]&15]<<16) |\n"
+"                   ((int)(unsigned char)kvalues_iq4nl_q8k_dev[qs[4*j+3]&15]<<24);\n"
+"            int w1=(int)(unsigned char)kvalues_iq4nl_q8k_dev[qs[4*j+0]>>4] |\n"
+"                   ((int)(unsigned char)kvalues_iq4nl_q8k_dev[qs[4*j+1]>>4]<<8) |\n"
+"                   ((int)(unsigned char)kvalues_iq4nl_q8k_dev[qs[4*j+2]>>4]<<16) |\n"
+"                   ((int)(unsigned char)kvalues_iq4nl_q8k_dev[qs[4*j+3]>>4]<<24);\n"
+"            const int *u=(const int *)(tq+g*32);\n"
+"            z=dp4a_hw(w0,u[j],z); z=dp4a_hw(w1,u[j+4],z);\n"
+"        }\n"
+"        sum+=half_to_float(*(const half_raw *)bp)*(float)(ls-32)*ts[g]*(float)z;\n"
+"    }\n"
+"    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o); if(lane==0)dst[row]=sum;\n"
 "}\n"
 "__global__ void qwen4_quantize_q81(unsigned char *dst,const float *x,int n){\n"
 "    int b=blockIdx.x,lane=threadIdx.x,base=b*32;\n"
@@ -1776,6 +2557,54 @@ static const char *hip_kernel_source =
 "        sum += __shfl_down(sum, offset);\n"
 "    if (lane == 0) dst[row] = sum;\n"
 "}\n"
+"__global__ void matvec_q2_K_dp4a2(float *dst,const unsigned char *mat,\n"
+"        const signed char *q0,const float *s0,const signed char *q1,const float *s1,\n"
+"        int n_rows,int n_cols){\n"
+"    int lane=threadIdx.x&31,warp=threadIdx.x>>5,row=blockIdx.x*(blockDim.x/32)+warp;\n"
+"    if(row>=n_rows)return;int nb=n_cols/256,G=nb*4;float sum=0.0f;\n"
+"    const unsigned char *rp=mat+(size_t)row*nb*84;\n"
+"    for(int g=lane;g<G;g+=32){int b=g>>2,gi=g&3,n0=gi>>1,half=gi&1;\n"
+"      const unsigned char *bp=rp+b*84,*sc=bp,*qs=bp+16+n0*32+half*16;\n"
+"      float d=half_to_float(*(const half_raw*)(bp+80)),dm=half_to_float(*(const half_raw*)(bp+82));\n"
+"      for(int j=0;j<4;++j){unsigned char sv=sc[n0*8+j*2+half];float dl=d*(float)(sv&15),ml=dm*(float)(sv>>4);\n"
+"        int shift=j*2,qb=b*8+n0*4+j;const signed char *p0=q0+(size_t)qb*32+half*16;\n"
+"        const signed char *p1=q1+(size_t)qb*32+half*16;int z0=0,z1=0,t0=0,t1=0;\n"
+"        for(int t=0;t<4;++t){int k=t*4;int w=((qs[k]>>shift)&3)|(((qs[k+1]>>shift)&3)<<8)|(((qs[k+2]>>shift)&3)<<16)|(((qs[k+3]>>shift)&3)<<24);\n"
+"          z0=dp4a_hw(w,((const int*)p0)[t],z0);z1=dp4a_hw(w,((const int*)p1)[t],z1);}\n"
+"        for(int t=0;t<16;++t){t0+=(int)p0[t];t1+=(int)p1[t];}\n"
+"        sum+=dl*(s0[qb]*(float)z0+s1[qb]*(float)z1)-ml*(s0[qb]*(float)t0+s1[qb]*(float)t1);}}\n"
+"    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o);if(lane==0)dst[row]=sum;\n"
+"}\n"
+"/* Q2_K x Q8_1 A/B path for the runner's contiguous activation layout.\n"
+" * llama.cpp's MMVQ implementation additionally packs the activation tile\n"
+" * for its internal iqs gather; this kernel deliberately does not claim that\n"
+" * permutation and remains diagnostic until that pack stage is ported. */\n"
+"__global__ void matvec_q2_K_q81(float *dst,const unsigned char *mat,\n"
+"        const signed char *q,const float *s,int n_rows,int n_cols){\n"
+"    int lane=threadIdx.x&31,warp=threadIdx.x>>5,row=blockIdx.x*8+warp;\n"
+"    if(row>=n_rows)return; int nb=n_cols/256; float sum=0.0f;\n"
+"    const unsigned char *rp=mat+(size_t)row*nb*84;\n"
+"    int iqs=lane&15;\n"
+"    for(int b=lane>>4;b<nb;b+=2){\n"
+"        const unsigned char *bp=rp+b*84, *sc=bp, *qs=bp+16;\n"
+"        float d=half_to_float(*(const half_raw *)(bp+80));\n"
+"        float dm=half_to_float(*(const half_raw *)(bp+82));\n"
+"        int scale_offset=iqs-(iqs&7)+(iqs&7)/4;\n"
+"        const unsigned char *sck=sc+scale_offset;\n"
+"        int v=((const int *)qs)[iqs];\n"
+"        for(int i=0;i<4;++i){\n"
+"            int vi=(v>>(2*i))&0x03030303;\n"
+"            int qb=b*8+4*(iqs/8)+i, qi=iqs&7;\n"
+"            const int *u=((const int *)q)+(size_t)qb*8+qi;\n"
+"            int z=dp4a_hw(vi,*u,0);\n"
+"            int m=sck[2*i]>>4; m|=m<<8; m|=m<<16;\n"
+"            int zm=dp4a_hw(m,*u,0);\n"
+"            sum+=s[qb]*(d*(float)(sck[2*i]&15)*(float)z-dm*(float)zm);\n"
+"        }\n"
+"    }\n"
+"    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o);\n"
+"    if(lane==0)dst[row]=sum;\n"
+"}\n"
 "/* ---- 15. matvec_q3_K_f32: Q3_K matrix x F32 vector -> F32 ---- */\n"
 "/* Q3_K block: 110 bytes = hmask[32] + qs[64] + scales[12] + d(f16), 256 elements */\n"
 "__global__ void matvec_q3_K_f32(float *dst, const unsigned char *mat, const float *x,\n"
@@ -2026,6 +2855,51 @@ static const char *hip_kernel_source =
 "        sum += __shfl_down(sum, offset);\n"
 "    if (lane == 0) dst[row] = sum;\n"
 "}\n"
+"/* Exact Q4_K batched projection.  Reuse each decoded weight sub-block over\n"
+" * four prompt rows while retaining the scalar g4 arithmetic/reduction. */\n"
+"__global__ void matvec_q4_K_batch_reuse4(float *dst, const unsigned char *mat,\n"
+"        const float *x, int n_rows, int n_cols, int M, int x_stride) {\n"
+"    int warp=threadIdx.x>>5,lane=threadIdx.x&31,row=blockIdx.x*8+warp,token0=blockIdx.y*4;\n"
+"    if(row>=n_rows)return; int nb=n_cols/256,G=nb*4;\n"
+"    const unsigned char *rp=mat+(size_t)row*nb*144; float sum[4]={0,0,0,0};\n"
+"    for(int g=lane;g<G;g+=32){int b=g>>2,c=g&3,is=2*c;\n"
+"        const unsigned char *bp=rp+b*144; float d=half_to_float(*(const half_raw*)bp);\n"
+"        float dm=half_to_float(*(const half_raw*)(bp+2)); const unsigned char *sc=bp+4;\n"
+"        unsigned char sv0,mv0,sv1,mv1;\n"
+"        if(is<4){sv0=sc[is]&63;mv0=sc[is+4]&63;}\n"
+"        else {sv0=(sc[is+4]&15)|((sc[is-4]>>6)<<4);mv0=(sc[is+4]>>4)|((sc[is]>>6)<<4);}\n"
+"        if(is+1<4){sv1=sc[is+1]&63;mv1=sc[is+1+4]&63;}\n"
+"        else {sv1=(sc[is+1+4]&15)|((sc[is+1-4]>>6)<<4);mv1=(sc[is+1+4]>>4)|((sc[is+1]>>6)<<4);}\n"
+"        float d1=d*sv0,m1=dm*mv0,d2=d*sv1,m2=dm*mv1; const unsigned char *q=bp+16+c*32;\n"
+"        for(int t=0;t<4;t++){int token=token0+t;if(token<M){const float *xb=x+(size_t)token*x_stride+b*256+c*64;\n"
+"            float p=0.0f;for(int l=0;l<32;l++)p+=(d1*(q[l]&15)-m1)*xb[l]+(d2*(q[l]>>4)-m2)*xb[l+32];sum[t]+=p;}}\n"
+"    }\n"
+"    for(int t=0;t<4;t++){for(int o=16;o>0;o>>=1)sum[t]+=__shfl_down(sum[t],o);\n"
+"        if(lane==0&&token0+t<M)dst[(size_t)(token0+t)*n_rows+row]=sum[t];}\n"
+"}\n"
+"/* Eight-row DFlash2 specialization.  It retains the scalar g4 operation\n"
+" * order independently for each row and halves Q4_K weight traffic versus\n"
+" * launching the four-row tile twice. */\n"
+"__global__ void matvec_q4_K_batch_reuse8(float *dst, const unsigned char *mat,\n"
+"        const float *x, int n_rows, int n_cols, int M, int x_stride) {\n"
+"    int warp=threadIdx.x>>5,lane=threadIdx.x&31,row=blockIdx.x*8+warp,token0=blockIdx.y*8;\n"
+"    if(row>=n_rows)return; int nb=n_cols/256,G=nb*4;\n"
+"    const unsigned char *rp=mat+(size_t)row*nb*144; float sum[8]={0,0,0,0,0,0,0,0};\n"
+"    for(int g=lane;g<G;g+=32){int b=g>>2,c=g&3,is=2*c;\n"
+"        const unsigned char *bp=rp+b*144; float d=half_to_float(*(const half_raw*)bp);\n"
+"        float dm=half_to_float(*(const half_raw*)(bp+2)); const unsigned char *sc=bp+4;\n"
+"        unsigned char sv0,mv0,sv1,mv1;\n"
+"        if(is<4){sv0=sc[is]&63;mv0=sc[is+4]&63;}\n"
+"        else {sv0=(sc[is+4]&15)|((sc[is-4]>>6)<<4);mv0=(sc[is+4]>>4)|((sc[is]>>6)<<4);}\n"
+"        if(is+1<4){sv1=sc[is+1]&63;mv1=sc[is+1+4]&63;}\n"
+"        else {sv1=(sc[is+1+4]&15)|((sc[is+1-4]>>6)<<4);mv1=(sc[is+1+4]>>4)|((sc[is+1]>>6)<<4);}\n"
+"        float d1=d*sv0,m1=dm*mv0,d2=d*sv1,m2=dm*mv1; const unsigned char *q=bp+16+c*32;\n"
+"        for(int t=0;t<8;t++){int token=token0+t;if(token<M){const float *xb=x+(size_t)token*x_stride+b*256+c*64;\n"
+"            float p=0.0f;for(int l=0;l<32;l++)p+=(d1*(q[l]&15)-m1)*xb[l]+(d2*(q[l]>>4)-m2)*xb[l+32];sum[t]+=p;}}\n"
+"    }\n"
+"    for(int t=0;t<8;t++){for(int o=16;o>0;o>>=1)sum[t]+=__shfl_down(sum[t],o);\n"
+"        if(lane==0&&token0+t<M)dst[(size_t)(token0+t)*n_rows+row]=sum[t];}\n"
+"}\n"
 "\n"
 "/* ---- 17. matvec_q6_K_f32: Q6_K matrix x F32 vector -> F32 ---- */\n"
 "/* Q6_K block: 210 bytes = ql[128] + qh[64] + scales[16] + d(f16), 256 elements */\n"
@@ -2139,6 +3013,23 @@ static const char *hip_kernel_source =
 "        for (int w = 0; w < nw; w++) total += ws6[w];\n"
 "        dst[row] = total;\n"
 "    }\n"
+"}\n"
+"__global__ void matvec_q6_K_batch_reuse8(float *dst, const unsigned char *mat,\n"
+"        const float *x, int M, int n_rows, int n_cols, int x_stride) {\n"
+"    int row=blockIdx.x, token0=blockIdx.y*8; if(row>=n_rows)return;\n"
+"    int tid=threadIdx.x, nb=n_cols/256, G=nb*16;\n"
+"    const unsigned char *rp=mat+(size_t)row*nb*210; float sum[8]={};\n"
+"    for(int g=tid;g<G;g+=blockDim.x){int b=g>>4,rem=g&15;\n"
+"        const unsigned char *bp=rp+b*210;\n"
+"        for(int t=0;t<8;t++){int token=token0+t;if(token<M)\n"
+"            sum[t]+=q6k_dot4(bp,x+(size_t)token*x_stride+b*256,rem>>3,rem&7);}\n"
+"    }\n"
+"    __shared__ float ws[8][2]; int lane=tid&31,wave=tid>>5;\n"
+"    for(int t=0;t<8;t++){for(int o=16;o>0;o>>=1)sum[t]+=__shfl_down(sum[t],o);\n"
+"        if(lane==0)ws[t][wave]=sum[t];}\n"
+"    __syncthreads();\n"
+"    if(tid==0)for(int t=0;t<8&&token0+t<M;t++)\n"
+"        dst[(size_t)(token0+t)*n_rows+row]=ws[t][0]+ws[t][1];\n"
 "}\n"
 "\n"
 "/* ---- 17b. matvec_q5_K_f32: Q5_K matrix x F32 vector -> F32 ---- */\n"
@@ -2436,24 +3327,38 @@ static const char *hip_kernel_source =
 "    }\n"
 "}\n"
 "\n"
-"/* ---- 19b. softplus_mul_batch_f32: same op over M rows of dt_rank ---- */\n"
-"/* bias and a are dt_rank-wide constants; broadcast across the M rows. */\n"
+"/* ---- 19b. softplus_mul_batch_f32: prepare GDA decay over M rows. ---- */\n"
+"/* bias and a are dt_rank-wide constants; broadcast across the M rows.\n"
+" * Batched recurrence used to evaluate expf(alpha) independently for every\n"
+" * state column.  Store the FP32 decay once per token/head here instead. */\n"
 "__global__ void softplus_mul_batch_f32(float *out, const float *in,\n"
 "                                         const float *bias, const float *a,\n"
-"                                         int dt_rank, int M) {\n"
+"                                         int dt_rank, int M, int exponentiate) {\n"
 "    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
 "    int total = M * dt_rank;\n"
 "    if (i >= total) return;\n"
 "    int hi = i % dt_rank;\n"
 "    float x = in[i] + bias[hi];\n"
 "    float sp = (x > 20.0f) ? x : logf(1.0f + expf(x));\n"
-"    out[i] = sp * a[hi];\n"
+"    float alpha = sp * a[hi];\n"
+"    out[i] = exponentiate ? expf(alpha) : alpha;\n"
 "}\n"
 "\n"
 "/* ---- 20. sigmoid_inplace_f32: data[i] = 1/(1+exp(-data[i])) ---- */\n"
 "__global__ void sigmoid_inplace_f32(float *data, int n) {\n"
 "    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
 "    if (i < n) data[i] = 1.0f / (1.0f + expf(-data[i]));\n"
+"}\n"
+"__global__ void ssm_alpha_beta_prepare_batch_f32(float *alpha, float *beta,\n"
+"        const float *bias, const float *a, int dt_rank, int M) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    int total = M * dt_rank;\n"
+"    if (i >= total) return;\n"
+"    int h = i % dt_rank;\n"
+"    float x = alpha[i] + bias[h];\n"
+"    float sp = (x > 20.0f) ? x : logf(1.0f + expf(x));\n"
+"    alpha[i] = expf(sp * a[h]);\n"
+"    beta[i] = 1.0f / (1.0f + expf(-beta[i]));\n"
 "}\n"
 "\n"
 "/* ---- 21. conv1d_depthwise_silu_f32: depthwise causal conv1d + SiLU + state update ---- */\n"
@@ -2508,7 +3413,7 @@ static const char *hip_kernel_source =
 "__global__ void deltanet_step_f32(\n"
 "    float *state, float *out,\n"
 "    const float *Q, const float *K, const float *V,\n"
-"    const float *alpha, const float *beta, int d_state) {\n"
+"    const float *alpha, const float *beta, int d_state, int legacy_order) {\n"
 "    int h = blockIdx.x;\n"
 "    int r = threadIdx.x;\n"
 "    if (r >= d_state) return;\n"
@@ -2518,11 +3423,19 @@ static const char *hip_kernel_source =
 "    float v_r = V[h * d_state + r];\n"
 "    float decay = expf(alpha[h]);\n"
 "    float b = beta[h];\n"
-"    for (int c = 0; c < d_state; c++) S[c] *= decay;\n"
-"    float sk = 0.0f;\n"
-"    for (int c = 0; c < d_state; c++) sk += S[c] * k[c];\n"
-"    float delta = (v_r - sk) * b;\n"
-"    for (int c = 0; c < d_state; c++) S[c] += delta * k[c];\n"
+"    float sk = 0.0f, delta;\n"
+"    if (legacy_order) {\n"
+"        /* The runner stores this recurrent matrix row-major; retain the\n"
+"         * historical order as an explicit numerical A/B. */\n"
+"        for (int c = 0; c < d_state; c++) { S[c] *= decay; sk += S[c] * k[c]; }\n"
+"        delta = (v_r - sk) * b;\n"
+"        for (int c = 0; c < d_state; c++) S[c] += delta * k[c];\n"
+"    } else {\n"
+"        /* Reference scalar order: reduce the old state, then apply decay. */\n"
+"        for (int c = 0; c < d_state; c++) sk += S[c] * k[c];\n"
+"        delta = (v_r - decay * sk) * b;\n"
+"        for (int c = 0; c < d_state; c++) S[c] = decay * S[c] + delta * k[c];\n"
+"    }\n"
 "    float scale = rsqrtf((float)d_state);\n"
 "    float o = 0.0f;\n"
 "    for (int c = 0; c < d_state; c++) o += S[c] * q[c];\n"
@@ -2641,19 +3554,17 @@ static const char *hip_kernel_source =
 "    out[(size_t)h * value_dim + j] = value / denom;\n"
 "}\n"
 "\n"
-"/* ---- 24b. deltanet_step_batch_f32: M sequential steps fused in one kernel ----\n"
-" * Each thread r owns row r of the state matrix; the row is loaded into\n"
-" * registers ONCE at the start, mutated through M token steps, written back\n"
-" * ONCE at the end. Eliminates the M × (state_row R + W) global-memory\n"
-" * traffic of the per-token launch_deltanet_step kernel.\n"
+"/* ---- 24b. deltanet_step_batch_f32: llama.cpp-compatible M-step GDN ----\n"
+" * One physical 32-lane warp owns one state column, four columns per block,\n"
+" * matching ggml-cuda/gated_delta_net.cu's AMD HIP launch and reduction\n"
+" * order. Each lane retains four state rows in registers across M tokens.\n"
 " *\n"
 " * Layout: state is [n_heads, d_state, d_state] F32 persistent across calls.\n"
 " *         Q/K/V_batch are [M, dt_rank, d_state] F32 (heads = dt_rank here).\n"
 " *         alpha/beta_batch are [M, dt_rank] F32.\n"
 " *         out_batch is [M, dt_rank, d_state] F32.\n"
 " *\n"
-" * Requires d_state <= 128 (compile-time max for the per-thread S_row array).\n"
-" * The block dim is d_state; the grid dim is dt_rank. */\n"
+" * Requires d_state <= 128 (the Qwen3.5 model uses 128). */\n"
 "#define DLN_BATCH_MAX_DSTATE 128\n"
 "__global__ void deltanet_step_batch_f32(\n"
 "    float *state, float *out_batch,\n"
@@ -2680,8 +3591,7 @@ static const char *hip_kernel_source =
 "        size_t base    = (size_t)m * per_tok_dt + (size_t)h * d_state;\n"
 "        size_t v_base  = (size_t)m * (size_t)v_row_stride + (size_t)h * d_state;\n"
 "        float v_r   = V_batch[v_base + r];\n"
-"        float decay = parity ? expf(alpha_batch[(size_t)m * dt_rank + h])\n"
-"                             : __expf(alpha_batch[(size_t)m * dt_rank + h]);\n"
+"        float decay = alpha_batch[(size_t)m * dt_rank + h];\n"
 "        float b     = beta_batch[(size_t)m * dt_rank + h];\n"
 "\n"
 "        /* Cooperatively stage k and q into LDS (every thread loads one elt). */\n"
@@ -2699,16 +3609,15 @@ static const char *hip_kernel_source =
 "         * a per-step scalar, so pull it out of the sum and skip touching\n"
 "         * S_row here — saves a full read+write pass. */\n"
 "        if (parity) {\n"
-"            /* Match deltanet_step_f32: decay, then accumulate in c order. */\n"
+"            /* GDA order used by llama.cpp: dot the old state, then apply\n"
+"             * the scalar decay to the reduced dot. */\n"
 "            float sk = 0.0f;\n"
-"            for (int c = 0; c < d_state; ++c) {\n"
-"                S_row[c] *= decay;\n"
+"            for (int c = 0; c < d_state; ++c)\n"
 "                sk += S_row[c] * sK[c];\n"
-"            }\n"
-"            float delta = (v_r - sk) * b;\n"
+"            float delta = (v_r - decay * sk) * b;\n"
 "            float o = 0.0f;\n"
 "            for (int c = 0; c < d_state; ++c) {\n"
-"                S_row[c] += delta * sK[c];\n"
+"                S_row[c] = decay * S_row[c] + delta * sK[c];\n"
 "                o += S_row[c] * sQ[c];\n"
 "            }\n"
 "            out_batch[base + r] = o * scale;\n"
@@ -2723,8 +3632,8 @@ static const char *hip_kernel_source =
 "            sk2 += S_row[c+2] * sK[c+2];\n"
 "            sk3 += S_row[c+3] * sK[c+3];\n"
 "        }\n"
-"        float sk    = ((sk0 + sk1) + (sk2 + sk3)) * decay;\n"
-"        float delta = (v_r - sk) * b;\n"
+"        float sk    = (sk0 + sk1) + (sk2 + sk3);\n"
+"        float delta = (v_r - decay * sk) * b;\n"
 "\n"
 "        /* Pass 2: fuse state update with o-dot.\n"
 "         *   S_row_new[c] = S_row[c] * decay + delta * sK[c]\n"
@@ -2754,7 +3663,194 @@ static const char *hip_kernel_source =
 "    float *S_dst = state + (size_t)h * d_state * d_state + r * d_state;\n"
 "    for (int c = 0; c < d_state; c++) S_dst[c] = S_row[c];\n"
 "}\n"
-"\n"
+"/* llama.cpp HIP layout for Qwen3.5 GDA: one 32-lane warp per state\n"
+" * column. Preserve the reference order: old-state\n"
+" * dot, decay*dot, update, and XOR warp reduction. */\n"
+"__global__ void deltanet_step_batch_gda_ref_f32(\n"
+"    float *state, float *out_batch,\n"
+"    const float *Q_batch, const float *K_batch, const float *V_batch,\n"
+"    const float *alpha_batch, const float *beta_batch,\n"
+"    int dt_rank, int d_state, int v_row_stride, int M, int parity) {\n"
+"    int h = blockIdx.x, lane = threadIdx.x;\n"
+"    int col = blockIdx.z * blockDim.y + threadIdx.y;\n"
+"    if (h >= dt_rank || col >= d_state || lane >= 32) return;\n"
+"    const int rows_per_lane = (d_state + 31) / 32;\n"
+"    float s[DLN_BATCH_MAX_DSTATE / 32 + 1];\n"
+"    float *S = state + (size_t)h * d_state * d_state + (size_t)col * d_state;\n"
+"    for (int rr = 0; rr < rows_per_lane; ++rr) {\n"
+"        int i = rr * 32 + lane;\n"
+"        s[rr] = i < d_state ? S[i] : 0.0f;\n"
+"    }\n"
+"    const float scale = rsqrtf((float)d_state);\n"
+"    const size_t per_tok = (size_t)dt_rank * d_state;\n"
+"    for (int m = 0; m < M; ++m) {\n"
+"        size_t base = (size_t)m * per_tok + (size_t)h * d_state;\n"
+"        const float alpha = alpha_batch[(size_t)m * dt_rank + h];\n"
+"        const float decay = parity ? alpha : expf(alpha);\n"
+"        float k[DLN_BATCH_MAX_DSTATE / 32 + 1];\n"
+"        float q[DLN_BATCH_MAX_DSTATE / 32 + 1];\n"
+"        float kv = 0.0f;\n"
+"        for (int rr = 0; rr < rows_per_lane; ++rr) {\n"
+"            int i = rr * 32 + lane;\n"
+"            k[rr] = i < d_state ? K_batch[base + i] : 0.0f;\n"
+"            q[rr] = i < d_state ? Q_batch[base + i] : 0.0f;\n"
+"            kv += s[rr] * k[rr];\n"
+"        }\n"
+"        for (int off = 16; off > 0; off >>= 1) kv += __shfl_xor(kv, off);\n"
+"        const float delta = (V_batch[(size_t)m * v_row_stride +\n"
+"                                      (size_t)h * d_state + col] - decay * kv) *\n"
+"                            beta_batch[(size_t)m * dt_rank + h];\n"
+"        float y = 0.0f;\n"
+"        for (int rr = 0; rr < rows_per_lane; ++rr) {\n"
+"            s[rr] = decay * s[rr] + k[rr] * delta;\n"
+"            y += s[rr] * q[rr];\n"
+"        }\n"
+"        for (int off = 16; off > 0; off >>= 1) y += __shfl_xor(y, off);\n"
+"        if (lane == 0) out_batch[base + col] = y * scale;\n"
+"    }\n"
+"    for (int rr = 0; rr < rows_per_lane; ++rr) {\n"
+"        int i = rr * 32 + lane;\n"
+"        if (i < d_state) S[i] = s[rr];\n"
+"    }\n"
+"}\n"
+"/* Fixed Qwen3.5 scalar-decode shape.  Spell out the four rows owned by each\n"
+" * lane while retaining the original reference kernel's exp and accumulation\n"
+" * order.  Mode 1 has the original scalar contract (expf); mode 2 consumes\n"
+" * a decay precomputed once per token/head for batched prefill. */\n"
+"__global__ void deltanet_step_batch_gda_ref_128_f32(\n"
+"    float *state, float *out_batch,\n"
+"    const float *Q_batch, const float *K_batch, const float *V_batch,\n"
+"    const float *alpha_batch, const float *beta_batch,\n"
+"    int dt_rank, int d_state, int v_row_stride, int M, int parity) {\n"
+"    (void)d_state;\n"
+"    int h = blockIdx.x, lane = threadIdx.x;\n"
+"    int col = blockIdx.z * blockDim.y + threadIdx.y;\n"
+"    if (h >= dt_rank || col >= 128 || lane >= 32) return;\n"
+"    float *S = state + (size_t)h * 128 * 128 + (size_t)col * 128;\n"
+"    float s[4];\n"
+"    for (int rr = 0; rr < 4; ++rr) s[rr] = S[rr * 32 + lane];\n"
+"    const float scale = rsqrtf(128.0f);\n"
+"    const size_t per_tok = (size_t)dt_rank * 128;\n"
+"    for (int m = 0; m < M; ++m) {\n"
+"        size_t base = (size_t)m * per_tok + (size_t)h * 128;\n"
+"        float k[4], q[4];\n"
+"        float kv = 0.0f;\n"
+"        for (int rr = 0; rr < 4; ++rr) {\n"
+"            k[rr] = K_batch[base + rr * 32 + lane];\n"
+"            q[rr] = Q_batch[base + rr * 32 + lane];\n"
+"            kv += s[rr] * k[rr];\n"
+"        }\n"
+"        for (int off = 16; off > 0; off >>= 1) kv += __shfl_xor(kv, off);\n"
+"        float alpha = alpha_batch[(size_t)m * dt_rank + h];\n"
+"        float decay = parity == 2 ? alpha :\n"
+"                      parity ? expf(alpha) : __expf(alpha);\n"
+"        float delta = (V_batch[(size_t)m * v_row_stride +\n"
+"                               (size_t)h * 128 + col] - decay * kv) *\n"
+"                      beta_batch[(size_t)m * dt_rank + h];\n"
+"        float y = 0.0f;\n"
+"        for (int rr = 0; rr < 4; ++rr) {\n"
+"            s[rr] = decay * s[rr] + k[rr] * delta;\n"
+"            y += s[rr] * q[rr];\n"
+"        }\n"
+"        for (int off = 16; off > 0; off >>= 1) y += __shfl_xor(y, off);\n"
+"        if (lane == 0) out_batch[base + col] = y * scale;\n"
+"    }\n"
+"    for (int rr = 0; rr < 4; ++rr) S[rr * 32 + lane] = s[rr];\n"
+"}\n"
+"/* Exact multi-token verifier recurrence with a rollback checkpoint after\n"
+" * every row.  The canonical state is left untouched; commit copies the\n"
+" * selected checkpoint after target acceptance is known. */\n"
+"__global__ void deltanet_step_batch_gda_verify_f32(\n"
+"    const float *state, float *checkpoints, float *out_batch,\n"
+"    const float *Q_batch, const float *K_batch, const float *V_batch,\n"
+"    const float *alpha_batch, const float *beta_batch,\n"
+"    int dt_rank, int d_state, int v_row_stride, int M) {\n"
+"    int h = blockIdx.x, lane = threadIdx.x;\n"
+"    int col = blockIdx.z * blockDim.y + threadIdx.y;\n"
+"    if (h >= dt_rank || col >= d_state || lane >= 32) return;\n"
+"    const int rows_per_lane = (d_state + 31) / 32;\n"
+"    float s[DLN_BATCH_MAX_DSTATE / 32 + 1];\n"
+"    const float *S = state + (size_t)h * d_state * d_state +\n"
+"                     (size_t)col * d_state;\n"
+"    for (int rr = 0; rr < rows_per_lane; ++rr) {\n"
+"        int i = rr * 32 + lane;\n"
+"        s[rr] = i < d_state ? S[i] : 0.0f;\n"
+"    }\n"
+"    const float scale = rsqrtf((float)d_state);\n"
+"    const size_t per_tok = (size_t)dt_rank * d_state;\n"
+"    const size_t per_state = per_tok * d_state;\n"
+"    for (int m = 0; m < M; ++m) {\n"
+"        size_t base = (size_t)m * per_tok + (size_t)h * d_state;\n"
+"        const float decay = alpha_batch[(size_t)m * dt_rank + h];\n"
+"        float k[DLN_BATCH_MAX_DSTATE / 32 + 1];\n"
+"        float q[DLN_BATCH_MAX_DSTATE / 32 + 1];\n"
+"        float kv = 0.0f;\n"
+"        for (int rr = 0; rr < rows_per_lane; ++rr) {\n"
+"            int i = rr * 32 + lane;\n"
+"            k[rr] = i < d_state ? K_batch[base + i] : 0.0f;\n"
+"            q[rr] = i < d_state ? Q_batch[base + i] : 0.0f;\n"
+"            kv += s[rr] * k[rr];\n"
+"        }\n"
+"        for (int off = 16; off > 0; off >>= 1) kv += __shfl_xor(kv, off);\n"
+"        const float delta = (V_batch[(size_t)m * v_row_stride +\n"
+"                                      (size_t)h * d_state + col] - decay * kv) *\n"
+"                            beta_batch[(size_t)m * dt_rank + h];\n"
+"        float y = 0.0f;\n"
+"        for (int rr = 0; rr < rows_per_lane; ++rr) {\n"
+"            int i = rr * 32 + lane;\n"
+"            s[rr] = decay * s[rr] + k[rr] * delta;\n"
+"            y += s[rr] * q[rr];\n"
+"            if (i < d_state)\n"
+"                checkpoints[(size_t)m * per_state +\n"
+"                            ((size_t)h * d_state + col) * d_state + i] = s[rr];\n"
+"        }\n"
+"        for (int off = 16; off > 0; off >>= 1) y += __shfl_xor(y, off);\n"
+"        if (lane == 0) out_batch[base + col] = y * scale;\n"
+"    }\n"
+"}\n"
+"/* Fixed d_state=128 verifier probe.  It has the same checkpoint layout and\n"
+" * recurrence order as the generic kernel, but removes the per-row bounds\n"
+" * checks from the four values owned by each lane. */\n"
+"__global__ void deltanet_step_batch_gda_verify_128_f32(\n"
+"    const float *state, float *checkpoints, float *out_batch,\n"
+"    const float *Q_batch, const float *K_batch, const float *V_batch,\n"
+"    const float *alpha_batch, const float *beta_batch,\n"
+"    int dt_rank, int d_state, int v_row_stride, int M) {\n"
+"    (void)d_state;\n"
+"    int h = blockIdx.x, lane = threadIdx.x;\n"
+"    int col = blockIdx.z * blockDim.y + threadIdx.y;\n"
+"    if (h >= dt_rank || col >= 128 || lane >= 32) return;\n"
+"    const float *S = state + (size_t)h * 128 * 128 + (size_t)col * 128;\n"
+"    float s[4];\n"
+"    for (int rr = 0; rr < 4; ++rr) s[rr] = S[rr * 32 + lane];\n"
+"    const float scale = rsqrtf(128.0f);\n"
+"    const size_t per_tok = (size_t)dt_rank * 128;\n"
+"    const size_t per_state = per_tok * 128;\n"
+"    for (int m = 0; m < M; ++m) {\n"
+"        size_t base = (size_t)m * per_tok + (size_t)h * 128;\n"
+"        const float decay = alpha_batch[(size_t)m * dt_rank + h];\n"
+"        float k[4], q[4];\n"
+"        float kv = 0.0f;\n"
+"        for (int rr = 0; rr < 4; ++rr) {\n"
+"            k[rr] = K_batch[base + rr * 32 + lane];\n"
+"            q[rr] = Q_batch[base + rr * 32 + lane];\n"
+"            kv += s[rr] * k[rr];\n"
+"        }\n"
+"        for (int off = 16; off > 0; off >>= 1) kv += __shfl_xor(kv, off);\n"
+"        const float delta = (V_batch[(size_t)m * v_row_stride +\n"
+"                                      (size_t)h * 128 + col] - decay * kv) *\n"
+"                            beta_batch[(size_t)m * dt_rank + h];\n"
+"        float y = 0.0f;\n"
+"        for (int rr = 0; rr < 4; ++rr) {\n"
+"            s[rr] = decay * s[rr] + k[rr] * delta;\n"
+"            y += s[rr] * q[rr];\n"
+"            checkpoints[(size_t)m * per_state +\n"
+"                        ((size_t)h * 128 + col) * 128 + rr * 32 + lane] = s[rr];\n"
+"        }\n"
+"        for (int off = 16; off > 0; off >>= 1) y += __shfl_xor(y, off);\n"
+"        if (lane == 0) out_batch[base + col] = y * scale;\n"
+"    }\n"
+"}\n"
 "/* ---- 25. gated_rmsnorm_silu_f32 ---- */\n"
 "__global__ void gated_rmsnorm_silu_f32(\n"
 "    float *out, const float *z, const float *norm_w,\n"
@@ -2783,6 +3879,47 @@ static const char *hip_kernel_source =
 "        if (gate_silu) gate *= zv;\n"
 "        o[i] = normed * gate;\n"
 "    }\n"
+"}\n"
+"/* Qwen3.5 decode specialization: preserve the per-head gated RMSNorm\n"
+" * arithmetic above while staging its 128-wide result as exact Q8_1 for\n"
+" * the following native SSM output projection. Each wave owns one Q8 block. */\n"
+"__global__ void gated_rmsnorm_silu_q81_f32(\n"
+"    float *out, const float *z, const float *norm_w,\n"
+"    signed char *q, float *qscale,\n"
+"    int dt_rank, int d_state, float eps) {\n"
+"    extern __shared__ float sdata[];\n"
+"    int h = blockIdx.x;\n"
+"    if (h >= dt_rank) return;\n"
+"    int tid = threadIdx.x;\n"
+"    float *o = out + h * d_state;\n"
+"    const float *zh = z + h * d_state;\n"
+"    float sum = 0.0f;\n"
+"    for (int i = tid; i < d_state; i += blockDim.x) {\n"
+"        float v = o[i]; sum += v * v;\n"
+"    }\n"
+"    sdata[tid] = sum;\n"
+"    __syncthreads();\n"
+"    for (int s = blockDim.x / 2; s > 0; s >>= 1) {\n"
+"        if (tid < s) sdata[tid] += sdata[tid + s];\n"
+"        __syncthreads();\n"
+"    }\n"
+"    float scale = rsqrtf(sdata[0] / (float)d_state + eps);\n"
+"    for (int i = tid; i < d_state; i += blockDim.x) {\n"
+"        float normed = o[i] * scale * norm_w[i];\n"
+"        float zv = zh[i];\n"
+"        float gate = 1.0f / (1.0f + expf(-zv));\n"
+"        gate *= zv;\n"
+"        o[i] = normed * gate;\n"
+"    }\n"
+"    __syncthreads();\n"
+"    int i = h * d_state + tid;\n"
+"    float v = o[tid];\n"
+"    float a = fabsf(v);\n"
+"    for (int off = 16; off; off >>= 1)\n"
+"        a = fmaxf(a, __shfl_xor(a, off, 32));\n"
+"    float d = q8_div_contract(a, 127.0f);\n"
+"    q[i] = a == 0.0f ? 0 : (signed char)roundf(q8_div_contract(v, d));\n"
+"    if ((tid & 31) == 0) qscale[i >> 5] = round_f16_contract(d);\n"
 "}\n"
 "\n"
 "/* ---- 25c. GLM5Next mHC affine/gates/collapse ---- */\n"
@@ -2840,6 +3977,46 @@ static const char *hip_kernel_source =
 "    }\n"
 "    float inv = rsqrtf(sdata[0] + eps);\n"
 "    for (int i = tid; i < head_dim; i += blockDim.x) v[i] *= inv;\n"
+"}\n"
+"\n"
+"/* Normalize Q/K heads and expand each group head to dt_rank in one launch.\n"
+"   This is algebraically the same as l2_norm_heads_batch_f32 followed by\n"
+"   repeat_tile_batch_f32, but avoids the normalized Q/K round-trip. */\n"
+"__global__ void l2_norm_repeat_qk_batch_f32(\n"
+"    float *q_exp, float *k_exp, float *qk, int n_group, int head_dim,\n"
+"    int dt_rank, int qkv_stride, int exp_stride, int M, float eps) {\n"
+"    int h = blockIdx.x;\n"
+"    int m = blockIdx.y;\n"
+"    if (h >= n_group || m >= M) return;\n"
+"    extern __shared__ float sdata[];\n"
+"    int tid = threadIdx.x;\n"
+"    size_t row = (size_t)m * qkv_stride;\n"
+"    size_t qoff = row + (size_t)h * head_dim;\n"
+"    size_t koff = row + (size_t)(n_group + h) * head_dim;\n"
+"    float sq = 0.0f, sk = 0.0f;\n"
+"    for (int i = tid; i < head_dim; i += blockDim.x) {\n"
+"        float q = qk[qoff + i], k = qk[koff + i];\n"
+"        sq += q * q; sk += k * k;\n"
+"    }\n"
+"    sdata[tid] = sq;\n"
+"    sdata[blockDim.x + tid] = sk;\n"
+"    __syncthreads();\n"
+"    for (int s = blockDim.x / 2; s > 0; s >>= 1) {\n"
+"        if (tid < s) {\n"
+"            sdata[tid] += sdata[tid + s];\n"
+"            sdata[blockDim.x + tid] += sdata[blockDim.x + tid + s];\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    float iq = rsqrtf(sdata[0] + eps);\n"
+"    float ik = rsqrtf(sdata[blockDim.x] + eps);\n"
+"    for (int rep = h; rep < dt_rank; rep += n_group) {\n"
+"        size_t qo = (size_t)m * exp_stride + (size_t)rep * head_dim;\n"
+"        for (int i = tid; i < head_dim; i += blockDim.x) {\n"
+"            q_exp[qo + i] = qk[qoff + i] * iq;\n"
+"            k_exp[qo + i] = qk[koff + i] * ik;\n"
+"        }\n"
+"    }\n"
 "}\n"
 "\n"
 "/* ---- 23b. repeat_tile_batch_f32: broadcast n_group heads to dt_rank, M rows ---- */\n"
@@ -2900,6 +4077,7 @@ static const char *hip_kernel_source =
 "#define CONV1D_BATCH_MAX_K 8\n"
 "__global__ void conv1d_depthwise_silu_batch_f32(\n"
 "    float *conv_out_batch, float *conv_state,\n"
+"    float *checkpoints,\n"
 "    const float *input_batch, const float *weight,\n"
 "    int qkv_dim, int conv_k, int row_stride, int M) {\n"
 "    int j = blockIdx.x * blockDim.x + threadIdx.x;\n"
@@ -2912,21 +4090,149 @@ static const char *hip_kernel_source =
 "    for (int f = 0; f < conv_k - 1; f++) st[f] = conv_state[f * qkv_dim + j];\n"
 "    for (int m = 0; m < M; m++) {\n"
 "        float in_val = input_batch[(size_t)m * row_stride + j];\n"
-"        float sum = w[conv_k - 1] * in_val;\n"
+"        /* Keep the scalar/ggml order: history taps first, then input.\n"
+"         * The alternate order changes SiLU's low bits and compounds in\n"
+"         * the recurrent stack. */\n"
+"        float sum = 0.0f;\n"
 "        for (int f = 0; f < conv_k - 1; f++) sum += w[f] * st[f];\n"
-"        conv_out_batch[(size_t)m * row_stride + j] = sum / (1.0f + __expf(-sum));\n"
+"        sum += w[conv_k - 1] * in_val;\n"
+"        /* Match llama.cpp/ggml_silu accuracy; fast __expf compounds across\n"
+"         * the recurrent stack. */\n"
+"        conv_out_batch[(size_t)m * row_stride + j] = sum / (1.0f + expf(-sum));\n"
 "        /* Shift state: drop oldest, append current input. */\n"
 "        for (int f = 0; f < conv_k - 2; f++) st[f] = st[f + 1];\n"
 "        st[conv_k - 2] = in_val;\n"
+"        if (checkpoints) {\n"
+"            size_t checkpoint = (size_t)m * (conv_k - 1) * qkv_dim;\n"
+"            for (int f = 0; f < conv_k - 1; ++f)\n"
+"                checkpoints[checkpoint + (size_t)f * qkv_dim + j] = st[f];\n"
+"        }\n"
 "    }\n"
 "    /* Store final state back to global. */\n"
-"    for (int f = 0; f < conv_k - 1; f++) conv_state[f * qkv_dim + j] = st[f];\n"
+"    if (!checkpoints)\n"
+"        for (int f = 0; f < conv_k - 1; f++) conv_state[f * qkv_dim + j] = st[f];\n"
+"}\n"
+
+"/* ---- 21c. ssm_prep_batch_f32 -------------------------------------------\n"
+"   Fuse batch conv, Q/K normalization and group-to-rank expansion.  One\n"
+"   block owns one (token, Q/K group); V is emitted into conv_out for the\n"
+"   recurrent update and raw Q/K remain available for diagnostics. */\n"
+"__global__ void ssm_prep_batch_f32(\n"
+"    float *conv_out_batch, float *conv_state,\n"
+"    const float *input_batch, const float *weight,\n"
+"    float *q_exp, float *k_exp,\n"
+"    int qkv_dim, int conv_k, int n_group, int d_state, int dt_rank,\n"
+"    int row_stride, int exp_stride, int M, float eps) {\n"
+"    int g = blockIdx.x, m = blockIdx.y, tid = threadIdx.x;\n"
+"    if (g >= n_group || m >= M) return;\n"
+"    int v_per_group = (qkv_dim - 2 * n_group * d_state) / n_group;\n"
+"    size_t in_row = (size_t)m * row_stride;\n"
+"    size_t out_row = (size_t)m * row_stride;\n"
+"    size_t exp_row = (size_t)m * exp_stride;\n"
+"    extern __shared__ float scratch[];\n"
+"    float *sq = scratch, *sk = scratch + blockDim.x;\n"
+"    float qv = 0.0f, kv = 0.0f;\n"
+"    if (tid < d_state) {\n"
+"        int jq = g * d_state + tid;\n"
+"        int jk = n_group * d_state + g * d_state + tid;\n"
+"        float qs = 0.0f;\n"
+"        float ks = 0.0f;\n"
+"        float qst[CONV1D_BATCH_MAX_K], kst[CONV1D_BATCH_MAX_K];\n"
+"        for (int f = 0; f < conv_k - 1; ++f) {\n"
+"            qst[f] = conv_state[f * qkv_dim + jq];\n"
+"            kst[f] = conv_state[f * qkv_dim + jk];\n"
+"            qs += weight[jq * conv_k + f] * qst[f];\n"
+"            ks += weight[jk * conv_k + f] * kst[f];\n"
+"        }\n"
+"        qs += weight[jq * conv_k + conv_k - 1] * input_batch[in_row + jq];\n"
+"        ks += weight[jk * conv_k + conv_k - 1] * input_batch[in_row + jk];\n"
+"        /* ggml_exp/ggml_silu use accurate exp; the recurrent stack\n"
+"         * amplifies the fast intrinsic's error across layers. */\n"
+"        qv = qs / (1.0f + expf(-qs));\n"
+"        kv = ks / (1.0f + expf(-ks));\n"
+"        conv_out_batch[out_row + jq] = qv;\n"
+"        conv_out_batch[out_row + jk] = kv;\n"
+"        for (int f = 0; f < conv_k - 2; ++f) { qst[f] = qst[f + 1]; kst[f] = kst[f + 1]; }\n"
+"        qst[conv_k - 2] = input_batch[in_row + jq];\n"
+"        kst[conv_k - 2] = input_batch[in_row + jk];\n"
+"        for (int f = 0; f < conv_k - 1; ++f) {\n"
+"            conv_state[f * qkv_dim + jq] = qst[f];\n"
+"            conv_state[f * qkv_dim + jk] = kst[f];\n"
+"        }\n"
+"    }\n"
+"    for (int i = tid; i < v_per_group; i += blockDim.x) {\n"
+"        int j = 2 * n_group * d_state + g * v_per_group + i;\n"
+"        float st[CONV1D_BATCH_MAX_K];\n"
+"        for (int f = 0; f < conv_k - 1; ++f) st[f] = conv_state[f * qkv_dim + j];\n"
+"        float x = input_batch[in_row + j];\n"
+"        float s = 0.0f;\n"
+"        for (int f = 0; f < conv_k - 1; ++f) s += weight[j * conv_k + f] * st[f];\n"
+"        s += weight[j * conv_k + conv_k - 1] * x;\n"
+"        conv_out_batch[out_row + j] = s / (1.0f + expf(-s));\n"
+"        for (int f = 0; f < conv_k - 2; ++f) st[f] = st[f + 1];\n"
+"        st[conv_k - 2] = x;\n"
+"        for (int f = 0; f < conv_k - 1; ++f) conv_state[f * qkv_dim + j] = st[f];\n"
+"    }\n"
+"    sq[tid] = tid < d_state ? qv * qv : 0.0f;\n"
+"    sk[tid] = tid < d_state ? kv * kv : 0.0f;\n"
+"    __syncthreads();\n"
+"    for (int s = blockDim.x / 2; s > 0; s >>= 1) {\n"
+"        if (tid < s) { sq[tid] += sq[tid + s]; sk[tid] += sk[tid + s]; }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    float iq = rsqrtf(sq[0] + eps), ik = rsqrtf(sk[0] + eps);\n"
+"    for (int h = g; h < dt_rank; h += n_group) {\n"
+"        size_t qo = exp_row + (size_t)h * d_state;\n"
+"        for (int i = tid; i < d_state; i += blockDim.x) {\n"
+"            q_exp[qo + i] = conv_out_batch[out_row + g * d_state + i] * iq;\n"
+"            k_exp[qo + i] = conv_out_batch[out_row + n_group * d_state + g * d_state + i] * ik;\n"
+"        }\n"
+"    }\n"
 "}\n"
 "\n"
 "/* ---- 26. sigmoid_mul_f32 ---- */\n"
 "__global__ void sigmoid_mul_f32(float *data, const float *gate, int n) {\n"
 "    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
 "    if (i < n) data[i] *= 1.0f / (1.0f + expf(-gate[i]));\n"
+"}\n"
+"__global__ void sigmoid_mul_q81_f32(float *data, const float *gate,\n"
+"        signed char *q, float *qscale, int n) {\n"
+"    int lane = threadIdx.x, i = blockIdx.x * 32 + lane;\n"
+"    float v = data[i];\n"
+"    v *= 1.0f / (1.0f + expf(-gate[i]));\n"
+"    data[i] = v;\n"
+"    float a = fabsf(v);\n"
+"    for (int off = 16; off; off >>= 1)\n"
+"        a = fmaxf(a, __shfl_xor(a, off, 32));\n"
+"    float d = q8_div_contract(a, 127.0f);\n"
+"    q[i] = a == 0.0f ? 0 : (signed char)roundf(q8_div_contract(v, d));\n"
+"    if (lane == 0) qscale[blockIdx.x] = round_f16_contract(d);\n"
+"}\n"
+
+"__global__ void silu_gate_mul_f32(float *data, const float *gate, int n) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (i < n) {\n"
+"        float z = gate[i];\n"
+"        data[i] *= z / (1.0f + expf(-z));\n"
+"    }\n"
+"}\n"
+
+"__global__ void rmsnorm_heads_inplace_f32(float *data, const float *norm_w,\n"
+"        int n_heads, int head_dim, float eps) {\n"
+"    extern __shared__ float sdata[];\n"
+"    int h = blockIdx.x, tid = threadIdx.x;\n"
+"    if (h >= n_heads) return;\n"
+"    float *v = data + (size_t)h * head_dim;\n"
+"    float sum = 0.0f;\n"
+"    for (int i = tid; i < head_dim; i += blockDim.x) sum += v[i] * v[i];\n"
+"    sdata[tid] = sum;\n"
+"    __syncthreads();\n"
+"    for (int s = blockDim.x / 2; s > 0; s >>= 1) {\n"
+"        if (tid < s) sdata[tid] += sdata[tid + s];\n"
+"        __syncthreads();\n"
+"    }\n"
+"    float scale = rsqrtf(sdata[0] / (float)head_dim + eps);\n"
+"    for (int i = tid; i < head_dim; i += blockDim.x) v[i] *= scale * norm_w[i];\n"
 "}\n"
 "\n"
 "/* ---- 27. deinterleave_qgate_f32 ---- */\n"
@@ -3220,34 +4526,35 @@ static const char *hip_kernel_source =
 "                                     int n_rows, int n_cols) {\n"
 "    int warp_id = threadIdx.x / 32;\n"
 "    int lane = threadIdx.x % 32;\n"
-"    int row = blockIdx.x * 8 + warp_id;\n"
+"    int row = blockIdx.x * (blockDim.x / 32) + warp_id;\n"
 "    if (row >= n_rows) return;\n"
 "    int nb = n_cols / 256;\n"
 "    int row_bytes = nb * 66;\n"
 "    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
+"    int G = nb * 32;\n"
 "    float sum = 0.0f;\n"
-"    for (int b = lane; b < nb; b += 32) {\n"
+"    for (int g = lane; g < G; g += 32) {\n"
+"        int b = g >> 5; int rem = g & 31; int ib32 = rem >> 2; int l = rem & 3;\n"
 "        const unsigned char *bp = row_ptr + b * 66;\n"
 "        float d = half_to_float(*(const half_raw *)bp);\n"
 "        const unsigned short *qs = (const unsigned short *)(bp + 2);\n"
-"        const float *xb = x + b * 256;\n"
-"        float partial = 0.0f;\n"
-"        int yi = 0;\n"
-"        for (int ib32 = 0; ib32 < 8; ib32++) {\n"
-"            unsigned int aux0 = qs[4*ib32] | ((unsigned int)qs[4*ib32+1] << 16);\n"
-"            unsigned int aux1 = qs[4*ib32+2] | ((unsigned int)qs[4*ib32+3] << 16);\n"
-"            float db = d * (0.5f + (float)(aux1 >> 28)) * 0.25f;\n"
-"            const unsigned char *aux8 = (const unsigned char *)&aux0;\n"
-"            for (int l = 0; l < 4; l++) {\n"
-"                const unsigned char *grid = (const unsigned char *)&iq2xxs_grid_dev[aux8[l]];\n"
-"                unsigned char signs = ksigns_iq2xs_dev[(aux1 >> (7*l)) & 127];\n"
-"                for (int j = 0; j < 8; j++) {\n"
-"                    float w = db * (float)grid[j] * ((signs & (1 << j)) ? -1.0f : 1.0f);\n"
-"                    partial += w * xb[yi++];\n"
-"                }\n"
-"            }\n"
-"        }\n"
-"        sum += partial;\n"
+"        unsigned int aux0 = qs[4*ib32] | ((unsigned int)qs[4*ib32+1] << 16);\n"
+"        unsigned int aux1 = qs[4*ib32+2] | ((unsigned int)qs[4*ib32+3] << 16);\n"
+"        float db = d * (0.5f + (float)(aux1 >> 28)) * 0.25f;\n"
+"        unsigned int grid_idx = (aux0 >> (8 * l)) & 255;\n"
+"        const unsigned char *grid = (const unsigned char *)&iq2xxs_grid_dev[grid_idx];\n"
+"        unsigned char signs = ksigns_iq2xs_dev[(aux1 >> (7*l)) & 127];\n"
+"        const float *xb = x + b * 256 + ib32 * 32 + l * 8;\n"
+"        float p0 = 0.0f, p1 = 0.0f, p2 = 0.0f, p3 = 0.0f;\n"
+"        p0 += (float)grid[0] * ((signs &   1) ? -xb[0] : xb[0]);\n"
+"        p1 += (float)grid[1] * ((signs &   2) ? -xb[1] : xb[1]);\n"
+"        p2 += (float)grid[2] * ((signs &   4) ? -xb[2] : xb[2]);\n"
+"        p3 += (float)grid[3] * ((signs &   8) ? -xb[3] : xb[3]);\n"
+"        p0 += (float)grid[4] * ((signs &  16) ? -xb[4] : xb[4]);\n"
+"        p1 += (float)grid[5] * ((signs &  32) ? -xb[5] : xb[5]);\n"
+"        p2 += (float)grid[6] * ((signs &  64) ? -xb[6] : xb[6]);\n"
+"        p3 += (float)grid[7] * ((signs & 128) ? -xb[7] : xb[7]);\n"
+"        sum += db * ((p0 + p1) + (p2 + p3));\n"
 "    }\n"
 "    for (int offset = 16; offset > 0; offset >>= 1)\n"
 "        sum += __shfl_down(sum, offset);\n"
@@ -3830,6 +5137,8 @@ static const char *hip_kernel_source =
 "    0x0f090307, 0x0f090501, 0x0f090b01, 0x0f0b0505, 0x0f0b0905, 0x0f0d0105, 0x0f0d0703, 0x0f0f0101,\n"
 "};\n"
 
+
+
 "__device__ static const unsigned long long iq1s_grid_dev[2048] = {\n"
 "    0xffffffffffffffffULL, 0xffffffffffffff01ULL, 0xffffffffffff0000ULL, 0xffffffffffff01ffULL,\n"
 "    0xffffffffffff0101ULL, 0xffffffffff00ff00ULL, 0xffffffffff000000ULL, 0xffffffffff01ffffULL,\n"
@@ -4345,6 +5654,63 @@ static const char *hip_kernel_source =
 "    0x010101010101ffffULL, 0x010101010101ff01ULL, 0x01010101010101ffULL, 0x0101010101010101ULL,\n"
 "};\n"
 
+"/* ---- 18a. embed_iq1_m: IQ1_M embedding lookup -> F32 ---- */\n"
+"/* Qwen3.8 stores token_embd.weight as IQ1_M.  It must not fall through to\n"
+" * embed_f16, which interprets the 56-byte quant blocks as half values. */\n"
+"__global__ void embed_iq1_m(float *dst, const unsigned char *embd_table,\n"
+"                            int token_id, int n_embd) {\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (i >= n_embd) return;\n"
+"    int nb = n_embd / 256, b = i / 256, e = i % 256;\n"
+"    int ib = (e % 256) / 32, l = (e % 32) / 8, j = e % 8;\n"
+"    const unsigned char *bp = embd_table + (size_t)token_id * nb * 56 + b * 56;\n"
+"    const unsigned char *qs = bp, *qh = bp + 32;\n"
+"    const unsigned short *sc = (const unsigned short *)(bp + 48);\n"
+"    unsigned short su = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0u) |\n"
+"                       ((sc[2] >> 4) & 0x0f00u) | (sc[3] & 0xf000u);\n"
+"    float d = half_to_float(*(const half_raw *)&su);\n"
+"    unsigned short sw = sc[ib / 2];\n"
+"    int shift = 6 * (ib % 2) + (l >= 2 ? 3 : 0);\n"
+"    float dl = d * (float)(2 * ((sw >> shift) & 7) + 1);\n"
+"    unsigned char hv = qh[2 * ib + (l >> 1)];\n"
+"    unsigned short idx = qs[4 * ib + l] |\n"
+"                         ((unsigned short)(hv << ((l & 1) ? 4 : 8)) & 0x700u);\n"
+"    float corr = (hv & ((l & 1) ? 0x80 : 0x08)) ? -0.125f : 0.125f;\n"
+"    const signed char *grid = (const signed char *)&iq1s_grid_dev[idx];\n"
+"    dst[i] = dl * ((float)grid[j] + corr);\n"
+"}\n"
+"__global__ void embed_iq1_m_batch(float *dst, const unsigned char *embd_table,\n"
+"                                  const int *tokens, int n_embd, int rows) {\n"
+"    int row = blockIdx.y;\n"
+"    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (row >= rows || i >= n_embd) return;\n"
+"    int nb = n_embd / 256, b = i / 256, e = i % 256;\n"
+"    int ib = e / 32, l = (e % 32) / 8, j = e % 8;\n"
+"    const unsigned char *bp = embd_table +\n"
+"        ((size_t)tokens[row] * nb + b) * 56;\n"
+"    const unsigned char *qs = bp, *qh = bp + 32;\n"
+"    const unsigned short *sc = (const unsigned short *)(bp + 48);\n"
+"    unsigned short su = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0u) |\n"
+"                       ((sc[2] >> 4) & 0x0f00u) | (sc[3] & 0xf000u);\n"
+"    float d = half_to_float(*(const half_raw *)&su);\n"
+"    unsigned short sw = sc[ib / 2];\n"
+"    int shift = 6 * (ib % 2) + (l >= 2 ? 3 : 0);\n"
+"    float dl = d * (float)(2 * ((sw >> shift) & 7) + 1);\n"
+"    unsigned char hv = qh[2 * ib + (l >> 1)];\n"
+"    unsigned short idx = qs[4 * ib + l] |\n"
+"                         ((unsigned short)(hv << ((l & 1) ? 4 : 8)) & 0x700u);\n"
+"    float corr = (hv & ((l & 1) ? 0x80 : 0x08)) ? -0.125f : 0.125f;\n"
+"    const signed char *grid = (const signed char *)&iq1s_grid_dev[idx];\n"
+"    dst[(size_t)row * n_embd + i] = dl * ((float)grid[j] + corr);\n"
+"}\n"
+
+"/* llama.cpp's CUDA/HIP IQ1_S GPU codebook.  This is intentionally separate\n"
+" * from iq1s_grid_dev above: the latter is the signed CPU dequant table,\n"
+" * whereas MMVQ/MMQ consume the packed GPU representation. */\n"
+"__device__ static const unsigned int iq1s_grid_gpu_dev[2048] = {\n"
+"0x00000000, 0x00000002, 0x00000101, 0x00000200, 0x00000202, 0x00010001, 0x00010101, 0x00020000, 0x00020002, 0x00020200, 0x00020202, 0x01000101, 0x01010001, 0x01010100, 0x01010102, 0x01020101, 0x02000000, 0x02000002, 0x02000200, 0x02000202, 0x02010101, 0x02020000, 0x02020002, 0x02020200, 0x02020202, 0x00000110, 0x00000111, 0x00010011, 0x00010110, 0x00010112, 0x00010211, 0x00010212, 0x00020111, 0x01000011, 0x01000112, 0x01000211, 0x01010012, 0x01010111, 0x01010212, 0x01020011, 0x01020110, 0x01020112, 0x01020210, 0x02000111, 0x02010011, 0x02010110, 0x02010112, 0x02020111, 0x00000020, 0x00000022, 0x00000220, 0x00000222, 0x00010121, 0x00020020, 0x00020022, 0x00020220, 0x00020222, 0x01000121, 0x01010021, 0x01010221, 0x01020120, 0x01020221, 0x02000020, 0x02000022, 0x02000220, 0x02000222, 0x02010021, 0x02010121, 0x02010221, 0x02020020, 0x02020022, 0x02020220, 0x02020222, 0x00011001, 0x00011100, 0x00011102, 0x00021101, 0x01001001, 0x01001201, 0x01011101, 0x01011202, 0x01021100, 0x01021101, 0x02011001, 0x02011201, 0x02021101, 0x00001011, 0x00001110, 0x00001111, 0x00001112, 0x00011111, 0x00011210, 0x00011212, 0x00021211, 0x01001010, 0x01001111, 0x01001212, 0x01011010, 0x01011011, 0x01011110, 0x01011111, 0x01011112, 0x01011211, 0x01021010, 0x01021012, 0x01021111, 0x01021210, 0x01021212, 0x02001011, 0x02011011, 0x02011111, 0x02011210, 0x02011212, 0x02021011, 0x02021110, 0x02021111, 0x02021112, 0x02021211, 0x00011120, 0x00011221, 0x01001021, 0x01001120, 0x01011020, 0x01011022, 0x01011121, 0x01011220, 0x01021020, 0x01021021, 0x01021122, 0x01021221, 0x02001121, 0x02011021, 0x02011120, 0x02011221, 0x00002000, 0x00002002, 0x00002200, 0x00002202, 0x00012101, 0x00022000, 0x00022002, 0x00022200, 0x00022202, 0x01002101, 0x01012001, 0x01012102, 0x01022101, 0x02002000, 0x02002002, 0x02002200, 0x02002202, 0x02012101, 0x02022000, 0x02022002, 0x02022200, 0x02022202, 0x00002111, 0x00012011, 0x00012110, 0x00012211, 0x00022110, 0x00022111, 0x01002011, 0x01012010, 0x01012011, 0x01012111, 0x01022011, 0x01022110, 0x01022211, 0x02012011, 0x02012110, 0x02012112, 0x02012211, 0x02022111, 0x00002020, 0x00002022, 0x00002220, 0x00002222, 0x00012121, 0x00022020, 0x00022022, 0x00022220, 0x00022222, 0x01002121, 0x01012021, 0x01012221, 0x01022021, 0x01022121, 0x02002020, 0x02002022, 0x02002121, 0x02002220, 0x02002222, 0x02012121, 0x02022020, 0x02022022, 0x02022220, 0x02022222, 0x00110000, 0x00110001, 0x00110100, 0x00110201, 0x00120100, 0x00120101, 0x01100001, 0x01100100, 0x01110000, 0x01110101, 0x01110200, 0x01120001, 0x01120100, 0x01120101, 0x01120201, 0x02110001, 0x02110100, 0x02110102, 0x02120001, 0x02120101, 0x00100011, 0x00100110, 0x00100112, 0x00100211, 0x00110010, 0x00110012, 0x00110111, 0x00110210, 0x00120011, 0x00120110, 0x00120211, 0x01100111, 0x01100212, 0x01110010, 0x01110011, 0x01110012, 0x01110110, 0x01110111, 0x01110112, 0x01110211, 0x01120010, 0x01120111, 0x02100110, 0x02110012, 0x02110111, 0x02120011, 0x02120110, 0x00110021, 0x00110120, 0x00110122, 0x00120121, 0x01100020, 0x01100122, 0x01100221, 0x01110022, 0x01110121, 0x01110220, 0x01110222, 0x01120120, 0x01120122, 0x02100121, 0x02110021, 0x02110120, 0x02110122, 0x02120121, 0x00101001, 0x00101102, 0x00101201, 0x00111100, 0x00111101, 0x00111200, 0x00111201, 0x00121001, 0x00121102, 0x01101001, 0x01101101, 0x01101102, 0x01101200, 0x01101202, 0x01111001, 0x01111100, 0x01111101, 0x01111102, 0x01111201, 0x01121002, 0x01121101, 0x01121200, 0x02101100, 0x02101201, 0x02111000, 0x02111100, 0x02111101, 0x02111200, 0x02111201, 0x02111202, 0x02121001, 0x02121100, 0x02121101, 0x02121201, 0x00101012, 0x00101111, 0x00101212, 0x00111011, 0x00111110, 0x00111111, 0x00111112, 0x00111211, 0x00121010, 0x00121012, 0x00121111, 0x00121210, 0x00121212, 0x01101011, 0x01101110, 0x01101111, 0x01101112, 0x01111011, 0x01111012, 0x01111110, 0x01111111, 0x01111112, 0x01111211, 0x01111212, 0x01121011, 0x01121110, 0x01121111, 0x01121112, 0x01121211, 0x02101010, 0x02101012, 0x02101110, 0x02101111, 0x02101210, 0x02101212, 0x02111010, 0x02111011, 0x02111110, 0x02111111, 0x02111112, 0x02111211, 0x02111212, 0x02121010, 0x02121012, 0x02121111, 0x00101021, 0x00101120, 0x00101121, 0x00101122, 0x00111121, 0x00111122, 0x00111220, 0x00111222, 0x00121021, 0x00121122, 0x01101020, 0x01101022, 0x01101120, 0x01101121, 0x01101220, 0x01101222, 0x01111021, 0x01111121, 0x01111122, 0x01111220, 0x01111221, 0x01121021, 0x01121120, 0x01121121, 0x01121220, 0x01121221, 0x01121222, 0x02101122, 0x02101222, 0x02111022, 0x02111121, 0x02121120, 0x02121221, 0x00112001, 0x00112102, 0x00122101, 0x01102001, 0x01102100, 0x01102102, 0x01102201, 0x01112000, 0x01112101, 0x01112200, 0x01112202, 0x01122000, 0x01122001, 0x01122100, 0x01122102, 0x01122201, 0x02102101, 0x02112001, 0x02112100, 0x02122101, 0x00112010, 0x00112012, 0x00112111, 0x00112212, 0x00122011, 0x00122111, 0x01102012, 0x01102110, 0x01102111, 0x01102210, 0x01112011, 0x01112110, 0x01112111, 0x01112112, 0x01112211, 0x01112212, 0x01122010, 0x01122111, 0x01122212, 0x02102211, 0x02112011, 0x02112012, 0x02112111, 0x02112210, 0x02122011, 0x02122112, 0x02122211, 0x00102221, 0x00112122, 0x00122120, 0x00122122, 0x01102120, 0x01102122, 0x01102221, 0x01112020, 0x01112022, 0x01112121, 0x01112220, 0x01122021, 0x01122122, 0x01122221, 0x02102121, 0x02112021, 0x02112122, 0x02112222, 0x00200000, 0x00200002, 0x00200200, 0x00200202, 0x00210101, 0x00220000, 0x00220002, 0x00220101, 0x00220200, 0x00220202, 0x01200101, 0x01210001, 0x01210201, 0x01220001, 0x01220101, 0x02200000, 0x02200002, 0x02200200, 0x02200202, 0x02210101, 0x02220000, 0x02220002, 0x02220101, 0x02220200, 0x02220202, 0x00200111, 0x00210011, 0x00210110, 0x00210211, 0x00220111, 0x01200012, 0x01200110, 0x01200211, 0x01210111, 0x01210210, 0x01210212, 0x01220011, 0x01220110, 0x01220111, 0x01220112, 0x02200111, 0x02210010, 0x02210112, 0x02210211, 0x02220111, 0x00200021, 0x00200220, 0x00200222, 0x00210021, 0x00210121, 0x00220020, 0x00220022, 0x00220220, 0x00220222, 0x01200121, 0x01210021, 0x01210122, 0x01210221, 0x01220121, 0x02200021, 0x02200220, 0x02200222, 0x02210021, 0x02210121, 0x02220020, 0x02220022, 0x02220220, 0x02220222, 0x00201101, 0x00211100, 0x00211102, 0x00211201, 0x00221101, 0x01201100, 0x01201101, 0x01201102, 0x01201201, 0x01211002, 0x01211101, 0x01211200, 0x01211202, 0x01221102, 0x02201101, 0x02211001, 0x02211100, 0x02211201, 0x02221001, 0x02221101, 0x00201211, 0x00211111, 0x00221011, 0x00221211, 0x01201010, 0x01201111, 0x01201210, 0x01211011, 0x01211110, 0x01211111, 0x01211211, 0x01221012, 0x01221111, 0x01221210, 0x02201211, 0x02211010, 0x02211110, 0x02211111, 0x02211210, 0x02211212, 0x02221011, 0x02221110, 0x02221112, 0x02221211, 0x00201121, 0x00211020, 0x00211022, 0x00211221, 0x00221121, 0x01201021, 0x01201221, 0x01211121, 0x01221020, 0x01221021, 0x01221221, 0x02201120, 0x02201122, 0x02211020, 0x02211222, 0x00202000, 0x00202002, 0x00202200, 0x00202202, 0x00212101, 0x00222000, 0x00222002, 0x00222200, 0x00222202, 0x01202101, 0x01212001, 0x01212100, 0x01222101, 0x02202000, 0x02202002, 0x02202200, 0x02202202, 0x02222000, 0x02222002, 0x02222200, 0x02222202, 0x00202211, 0x00212011, 0x00212110, 0x00212211, 0x00222111, 0x01202112, 0x01202211, 0x01212012, 0x01212111, 0x01222011, 0x01222110, 0x01222112, 0x01222211, 0x02202111, 0x02212010, 0x02212112, 0x02212211, 0x02222110, 0x02222111, 0x00202020, 0x00202022, 0x00202220, 0x00202222, 0x00222020, 0x00222022, 0x00222220, 0x00222222, 0x01202121, 0x01212021, 0x01212122, 0x01212221, 0x01222121, 0x02202020, 0x02202022, 0x02202220, 0x02202222, 0x02212121, 0x02222020, 0x02222022, 0x02222220, 0x02222222, 0x10000101, 0x10010001, 0x10010102, 0x10020101, 0x11000201, 0x11010002, 0x11010101, 0x11010200, 0x11010202, 0x11020001, 0x11020100, 0x11020102, 0x12010100, 0x12010201, 0x12020001, 0x12020102, 0x10000010, 0x10000011, 0x10000110, 0x10000112, 0x10000211, 0x10010012, 0x10010111, 0x10010112, 0x10010210, 0x10010212, 0x10020011, 0x10020112, 0x10020211, 0x11000111, 0x11000210, 0x11000212, 0x11010011, 0x11010110, 0x11010111, 0x11010112, 0x11010211, 0x11010212, 0x11020111, 0x11020210, 0x11020212, 0x12000011, 0x12000110, 0x12000112, 0x12010010, 0x12010012, 0x12010111, 0x12020010, 0x12020011, 0x12020012, 0x10000121, 0x10010021, 0x10010120, 0x10010122, 0x10020121, 0x11000021, 0x11010022, 0x11010121, 0x11010222, 0x11020120, 0x11020221, 0x12000221, 0x12010120, 0x12020121, 0x10001001, 0x10011101, 0x10011201, 0x10021201, 0x11001101, 0x11001200, 0x11001202, 0x11011001, 0x11011100, 0x11011101, 0x11011102, 0x11021001, 0x11021002, 0x11021101, 0x11021200, 0x11021202, 0x12001001, 0x12001102, 0x12001201, 0x12011000, 0x12011002, 0x12011101, 0x12021000, 0x12021001, 0x12021201, 0x10001011, 0x10001012, 0x10001111, 0x10001212, 0x10011011, 0x10011110, 0x10011111, 0x10011112, 0x10011211, 0x10021010, 0x10021111, 0x10021212, 0x11001011, 0x11001110, 0x11001111, 0x11001112, 0x11001211, 0x11011010, 0x11011011, 0x11011110, 0x11011111, 0x11011112, 0x11011210, 0x11011211, 0x11021011, 0x11021110, 0x11021111, 0x11021112, 0x11021211, 0x12001012, 0x12001110, 0x12001111, 0x12001210, 0x12011011, 0x12011110, 0x12011111, 0x12011112, 0x12011211, 0x12011212, 0x12021111, 0x12021210, 0x12021212, 0x10001021, 0x10001121, 0x10001221, 0x10011120, 0x10011121, 0x10011220, 0x10011222, 0x10021021, 0x10021120, 0x10021221, 0x11001020, 0x11001022, 0x11001121, 0x11001220, 0x11011020, 0x11011021, 0x11011022, 0x11011121, 0x11011122, 0x11011221, 0x11021022, 0x11021121, 0x11021220, 0x12001021, 0x12001121, 0x12001222, 0x12011120, 0x12011121, 0x12021021, 0x12021120, 0x12021122, 0x10002101, 0x10012001, 0x10012101, 0x10012202, 0x10022101, 0x11002002, 0x11002201, 0x11012000, 0x11012101, 0x11012200, 0x11022001, 0x11022100, 0x11022102, 0x11022201, 0x12002101, 0x12012001, 0x12012100, 0x12012102, 0x12012201, 0x12022101, 0x10002011, 0x10002111, 0x10002112, 0x10002212, 0x10012010, 0x10012110, 0x10012111, 0x10012210, 0x10022011, 0x10022110, 0x10022112, 0x11002010, 0x11002111, 0x11002212, 0x11012011, 0x11012012, 0x11012110, 0x11012111, 0x11012112, 0x11012211, 0x11022010, 0x11022012, 0x11022111, 0x11022112, 0x11022212, 0x12002112, 0x12002211, 0x12012012, 0x12012111, 0x12012112, 0x12012210, 0x12022011, 0x12022110, 0x12022112, 0x12022211, 0x10012122, 0x11002120, 0x11002122, 0x11002221, 0x11012121, 0x11012220, 0x11012222, 0x11022120, 0x11022221, 0x12012120, 0x12022121, 0x10100001, 0x10100100, 0x10100101, 0x10100102, 0x10100201, 0x10110002, 0x10110101, 0x10110202, 0x10120001, 0x10120100, 0x10120201, 0x11100000, 0x11100101, 0x11100200, 0x11110001, 0x11110100, 0x11110101, 0x11110102, 0x11110201, 0x11120101, 0x11120200, 0x12100102, 0x12100201, 0x12110101, 0x12110200, 0x12120000, 0x12120001, 0x12120102, 0x12120201, 0x10100111, 0x10100210, 0x10100211, 0x10100212, 0x10110011, 0x10110110, 0x10110111, 0x10110112, 0x10110210, 0x10110211, 0x10120010, 0x10120111, 0x10120112, 0x10120210, 0x10120212, 0x11100011, 0x11100110, 0x11100111, 0x11100112, 0x11100211, 0x11110010, 0x11110011, 0x11110012, 0x11110110, 0x11110111, 0x11110112, 0x11110210, 0x11110211, 0x11110212, 0x11120011, 0x11120110, 0x11120111, 0x11120112, 0x11120211, 0x12100012, 0x12100111, 0x12110011, 0x12110110, 0x12110111, 0x12110112, 0x12110211, 0x12120010, 0x12120111, 0x12120212, 0x10100021, 0x10100122, 0x10110022, 0x10110121, 0x10110222, 0x10120021, 0x10120120, 0x11100022, 0x11100121, 0x11100222, 0x11110021, 0x11110120, 0x11110121, 0x11110122, 0x11110221, 0x11120022, 0x11120121, 0x12100121, 0x12110020, 0x12110022, 0x12110121, 0x12110221, 0x12110222, 0x12120120, 0x10101100, 0x10101101, 0x10111001, 0x10111100, 0x10111101, 0x10111102, 0x10111200, 0x10111201, 0x10121001, 0x10121101, 0x10121200, 0x10121202, 0x11101001, 0x11101100, 0x11101101, 0x11101102, 0x11101201, 0x11101202, 0x11111000, 0x11111001, 0x11111100, 0x11111101, 0x11111102, 0x11111200, 0x11111201, 0x11111202, 0x11121001, 0x11121002, 0x11121100, 0x11121101, 0x11121102, 0x11121201, 0x12101000, 0x12101200, 0x12101202, 0x12111001, 0x12111100, 0x12111101, 0x12111102, 0x12111201, 0x12121001, 0x12121100, 0x12121101, 0x12121202, 0x10101011, 0x10101012, 0x10101110, 0x10101111, 0x10101112, 0x10101211, 0x10111010, 0x10111011, 0x10111012, 0x10111110, 0x10111111, 0x10111112, 0x10111211, 0x10111212, 0x10121011, 0x10121110, 0x10121111, 0x10121112, 0x10121211, 0x11101010, 0x11101011, 0x11101012, 0x11101110, 0x11101111, 0x11101112, 0x11101210, 0x11101211, 0x11111010, 0x11111011, 0x11111012, 0x11111110, 0x11111111, 0x11111112, 0x11111210, 0x11111211, 0x11111212, 0x11121010, 0x11121011, 0x11121110, 0x11121111, 0x11121112, 0x11121210, 0x11121211, 0x11121212, 0x12101011, 0x12101110, 0x12101111, 0x12101211, 0x12101212, 0x12111010, 0x12111011, 0x12111110, 0x12111111, 0x12111112, 0x12111210, 0x12111211, 0x12121011, 0x12121110, 0x12121111, 0x12121112, 0x12121211, 0x10101020, 0x10101021, 0x10101022, 0x10101120, 0x10101122, 0x10101220, 0x10101221, 0x10111021, 0x10111120, 0x10111121, 0x10111220, 0x10111221, 0x10121020, 0x10121021, 0x10121022, 0x10121120, 0x10121121, 0x10121122, 0x10121220, 0x10121221, 0x11101021, 0x11101121, 0x11101122, 0x11101220, 0x11101221, 0x11101222, 0x11111020, 0x11111021, 0x11111022, 0x11111120, 0x11111121, 0x11111122, 0x11111220, 0x11111221, 0x11111222, 0x11121021, 0x11121120, 0x11121121, 0x11121221, 0x12101022, 0x12101121, 0x12101122, 0x12101220, 0x12101221, 0x12101222, 0x12111021, 0x12111121, 0x12111222, 0x12121022, 0x12121121, 0x12121122, 0x12121220, 0x12121221, 0x10102100, 0x10102101, 0x10102102, 0x10102201, 0x10112000, 0x10112101, 0x10112200, 0x10122001, 0x10122202, 0x11102101, 0x11102200, 0x11102202, 0x11112001, 0x11112100, 0x11112101, 0x11112102, 0x11112200, 0x11112201, 0x11122000, 0x11122002, 0x11122100, 0x11122101, 0x12102002, 0x12102201, 0x12112000, 0x12112002, 0x12112101, 0x12112200, 0x12122001, 0x12122201, 0x10102011, 0x10102012, 0x10102111, 0x10102212, 0x10112011, 0x10112110, 0x10112111, 0x10112112, 0x10112211, 0x10122111, 0x11102011, 0x11102110, 0x11102111, 0x11102112, 0x11102211, 0x11112010, 0x11112011, 0x11112012, 0x11112110, 0x11112111, 0x11112112, 0x11112210, 0x11112211, 0x11112212, 0x11122011, 0x11122110, 0x11122111, 0x11122112, 0x11122211, 0x12102011, 0x12102111, 0x12102211, 0x12112011, 0x12112110, 0x12112111, 0x12112112, 0x12112210, 0x12112211, 0x12122111, 0x10102120, 0x10102220, 0x10112121, 0x10112222, 0x10122020, 0x10122121, 0x10122122, 0x10122221, 0x11102121, 0x11102220, 0x11102221, 0x11112021, 0x11112121, 0x11112122, 0x11112220, 0x11112221, 0x11122022, 0x11122121, 0x11122220, 0x11122222, 0x12102021, 0x12102222, 0x12112022, 0x12112121, 0x12112122, 0x12112220, 0x12112222, 0x12122021, 0x10200101, 0x10210100, 0x10210102, 0x10210201, 0x10220101, 0x11200100, 0x11210000, 0x11210101, 0x11210102, 0x11210200, 0x11210202, 0x11220001, 0x11220100, 0x11220102, 0x11220201, 0x12200001, 0x12210102, 0x12220101, 0x10200011, 0x10200110, 0x10200112, 0x10200211, 0x10210012, 0x10210111, 0x10220011, 0x10220012, 0x10220112, 0x10220211, 0x11200111, 0x11200211, 0x11210011, 0x11210111, 0x11210112, 0x11210211, 0x11220111, 0x11220112, 0x11220212, 0x12200110, 0x12200212, 0x12210012, 0x12210111, 0x12220011, 0x12220112, 0x12220211, 0x10210021, 0x10210122, 0x10210221, 0x11200020, 0x11200021, 0x11200122, 0x11210121, 0x11210122, 0x11210220, 0x11220020, 0x12200121, 0x12210021, 0x12210122, 0x12220121, 0x10211001, 0x10211002, 0x10211101, 0x10211102, 0x10211202, 0x10221001, 0x10221102, 0x10221201, 0x11201000, 0x11201002, 0x11201101, 0x11201200, 0x11201202, 0x11211001, 0x11211100, 0x11211101, 0x11211102, 0x11211201, 0x11211202, 0x11221000, 0x11221002, 0x11221101, 0x12201100, 0x12201101, 0x12201201, 0x12211000, 0x12211002, 0x12211100, 0x12211101, 0x12211102, 0x12211200, 0x12211202, 0x12221001, 0x12221100, 0x12221201, 0x10201111, 0x10201210, 0x10201212, 0x10211011, 0x10211111, 0x10211112, 0x10211211, 0x11201110, 0x11201111, 0x11201112, 0x11201211, 0x11211010, 0x11211011, 0x11211110, 0x11211111, 0x11211112, 0x11211211, 0x11221011, 0x11221110, 0x11221111, 0x11221112, 0x11221211, 0x12201112, 0x12201211, 0x12201212, 0x12211011, 0x12211111, 0x12211112, 0x12211211, 0x12211212, 0x12221012, 0x12221111, 0x12221112, 0x12221210, 0x10201022, 0x10201221, 0x10211121, 0x10221020, 0x10221122, 0x10221220, 0x10221221, 0x11201020, 0x11201121, 0x11201220, 0x11201222, 0x11211021, 0x11211120, 0x11211121, 0x11211122, 0x11211220, 0x11211222, 0x11221020, 0x11221121, 0x11221220, 0x12201020, 0x12201022, 0x12201121, 0x12201222, 0x12211120, 0x12211122, 0x12211220, 0x12211221, 0x12221020, 0x12221120, 0x12221122, 0x12221222, 0x10212102, 0x10212201, 0x10222101, 0x11202001, 0x11212002, 0x11212101, 0x11212202, 0x11222001, 0x11222201, 0x12202101, 0x12212001, 0x12212200, 0x12222102, 0x10202011, 0x10202110, 0x10212010, 0x10212111, 0x10222011, 0x10222110, 0x10222112, 0x10222211, 0x11202010, 0x11202011, 0x11202111, 0x11202112, 0x11202210, 0x11212011, 0x11212110, 0x11212111, 0x11212112, 0x11212211, 0x11222010, 0x11222111, 0x11222212, 0x12202012, 0x12202110, 0x12202212, 0x12212111, 0x12222011, 0x12222110, 0x12222111, 0x12222211, 0x10212021, 0x10212122, 0x10212220, 0x11202021, 0x11202120, 0x11202221, 0x11212020, 0x11212121, 0x11212220, 0x11212222, 0x11222120, 0x11222121, 0x11222221, 0x12202122, 0x12212120, 0x12212220, 0x12212222, 0x12222122, 0x20000000, 0x20000002, 0x20000200, 0x20000202, 0x20020000, 0x20020002, 0x20020200, 0x20020202, 0x21000101, 0x21010000, 0x21010001, 0x21010100, 0x21010102, 0x21010201, 0x21020101, 0x22000000, 0x22000002, 0x22000200, 0x22000202, 0x22010101, 0x22020000, 0x22020002, 0x22020200, 0x22020202, 0x20000111, 0x20010011, 0x20010110, 0x20010112, 0x20010211, 0x20020111, 0x21000011, 0x21000110, 0x21000211, 0x21010010, 0x21010012, 0x21010111, 0x21010112, 0x21010210, 0x21010211, 0x21020110, 0x21020112, 0x21020211, 0x22000111, 0x22000211, 0x22010110, 0x22010112, 0x22010211, 0x22020111, 0x20000020, 0x20000022, 0x20000220, 0x20000222, 0x20010121, 0x20020020, 0x20020022, 0x20020220, 0x20020222, 0x21010021, 0x21010120, 0x21010221, 0x21020121, 0x22000020, 0x22000022, 0x22000220, 0x22000222, 0x22010121, 0x22020020, 0x22020022, 0x22020220, 0x22020222, 0x20011100, 0x20011201, 0x21001001, 0x21001100, 0x21011001, 0x21011101, 0x21011202, 0x21021001, 0x21021100, 0x21021201, 0x22011100, 0x22011201, 0x20001011, 0x20001211, 0x20011012, 0x20011111, 0x20011212, 0x20021112, 0x20021211, 0x21001010, 0x21001011, 0x21001111, 0x21001210, 0x21011011, 0x21011110, 0x21011111, 0x21011112, 0x21011211, 0x21011212, 0x21021111, 0x21021112, 0x21021210, 0x21021212, 0x22001011, 0x22001110, 0x22001112, 0x22001211, 0x22011010, 0x22011012, 0x22011111, 0x22011210, 0x22021112, 0x20011021, 0x20011122, 0x20011221, 0x20021121, 0x21001021, 0x21001120, 0x21001221, 0x21001222, 0x21011020, 0x21011121, 0x21011221, 0x21011222, 0x21021021, 0x21021122, 0x21021222, 0x22001121, 0x22011021, 0x22011222, 0x22021120, 0x20002000, 0x20002002, 0x20002200, 0x20002202, 0x20012101, 0x20022000, 0x20022002, 0x20022200, 0x20022202, 0x21002001, 0x21002101, 0x21012001, 0x21012100, 0x21012201, 0x21022101, 0x21022201, 0x22002000, 0x22002002, 0x22002200, 0x22002202, 0x22012101, 0x22022000, 0x22022002, 0x22022200, 0x22022202, 0x20002111, 0x20002112, 0x20012011, 0x20012110, 0x20012112, 0x20022111, 0x21002011, 0x21002110, 0x21002112, 0x21002211, 0x21012010, 0x21012012, 0x21012111, 0x21012212, 0x21022011, 0x21022110, 0x22002111, 0x22012112, 0x22012211, 0x22022111, 0x20002020, 0x20002022, 0x20002220, 0x20002222, 0x20012121, 0x20022020, 0x20022022, 0x20022220, 0x20022222, 0x21002121, 0x21012021, 0x21012120, 0x21012122, 0x22002020, 0x22002022, 0x22002220, 0x22002222, 0x22012121, 0x22022020, 0x22022022, 0x22022220, 0x22022222, 0x20100101, 0x20110001, 0x20110102, 0x20110200, 0x20110201, 0x20120101, 0x21100001, 0x21100102, 0x21100201, 0x21110101, 0x21110200, 0x21110202, 0x21120201, 0x21120202, 0x22100101, 0x22110001, 0x22110100, 0x22110102, 0x22110201, 0x22120101, 0x20100011, 0x20100110, 0x20100112, 0x20100211, 0x20110010, 0x20110111, 0x20110210, 0x20110212, 0x20120011, 0x20120110, 0x20120112, 0x20120211, 0x21100010, 0x21100111, 0x21110010, 0x21110011, 0x21110110, 0x21110111, 0x21110112, 0x21110211, 0x21120012, 0x21120111, 0x22100110, 0x22100112, 0x22110012, 0x22110111, 0x22110210, 0x22120011, 0x22120110, 0x22120112, 0x22120211, 0x20100121, 0x20110021, 0x20110120, 0x20110221, 0x20120121, 0x21100120, 0x21100122, 0x21100221, 0x21110020, 0x21110022, 0x21110121, 0x21110220, 0x21120122, 0x21120221, 0x22100121, 0x22110120, 0x22110122, 0x22120221, 0x20101001, 0x20101100, 0x20101102, 0x20111000, 0x20111101, 0x20111200, 0x20121102, 0x21101000, 0x21101202, 0x21111001, 0x21111100, 0x21111101, 0x21111102, 0x21111200, 0x21111201, 0x21121000, 0x21121001, 0x21121002, 0x21121101, 0x22101100, 0x22101102, 0x22111002, 0x22111100, 0x22111101, 0x22111200, 0x22121001, 0x22121201, 0x20101010, 0x20101111, 0x20101210, 0x20101212, 0x20111010, 0x20111011, 0x20111110, 0x20111111, 0x20111112, 0x20111211, 0x20121011, 0x20121111, 0x20121211, 0x20121212, 0x21101011, 0x21101110, 0x21101111, 0x21101112, 0x21101211, 0x21111010, 0x21111011, 0x21111012, 0x21111110, 0x21111111, 0x21111112, 0x21111210, 0x21111211, 0x21111212, 0x21121011, 0x21121110, 0x21121111, 0x21121112, 0x21121211, 0x22101011, 0x22101111, 0x22101210, 0x22111011, 0x22111012, 0x22111110, 0x22111111, 0x22111112, 0x22111211, 0x22111212, 0x22121010, 0x22121012, 0x22121111, 0x22121210, 0x22121212, 0x20101021, 0x20101120, 0x20111020, 0x20111121, 0x20111221, 0x20121020, 0x20121122, 0x20121221, 0x21101121, 0x21101220, 0x21101221, 0x21111021, 0x21111022, 0x21111121, 0x21111122, 0x21111221, 0x21121121, 0x21121220, 0x22101022, 0x22101120, 0x22101221, 0x22101222, 0x22111022, 0x22111120, 0x22111121, 0x22121120, 0x22121122, 0x22121221, 0x20102101, 0x20112102, 0x20112201, 0x20122101, 0x21102001, 0x21102102, 0x21112000, 0x21112002, 0x21112101, 0x21112102, 0x21112202, 0x21122100, 0x21122101, 0x22102101, 0x22112001, 0x22112102, 0x22112201, 0x22122101, 0x20102110, 0x20102112, 0x20102211, 0x20112010, 0x20112012, 0x20112111, 0x20112210, 0x20112212, 0x20122010, 0x20122011, 0x20122110, 0x20122112, 0x21102010, 0x21102012, 0x21102111, 0x21102210, 0x21102212, 0x21112011, 0x21112110, 0x21112111, 0x21112112, 0x21112211, 0x21122012, 0x21122111, 0x21122112, 0x21122212, 0x22102011, 0x22102110, 0x22112010, 0x22112012, 0x22112111, 0x22112212, 0x22122011, 0x22122112, 0x20102121, 0x20112121, 0x20122121, 0x21102120, 0x21102122, 0x21102221, 0x21112020, 0x21112121, 0x21112220, 0x21122021, 0x22102121, 0x22112021, 0x22112120, 0x22112121, 0x22112122, 0x20200000, 0x20200002, 0x20200200, 0x20200202, 0x20210101, 0x20220000, 0x20220002, 0x20220200, 0x20220202, 0x21200101, 0x21210001, 0x21210100, 0x21210102, 0x21210201, 0x22200000, 0x22200002, 0x22200200, 0x22200202, 0x22210101, 0x22220000, 0x22220002, 0x22220200, 0x22220202, 0x20200111, 0x20200211, 0x20210011, 0x20210110, 0x20210112, 0x20210211, 0x20210212, 0x21200112, 0x21200211, 0x21210011, 0x21210111, 0x21210210, 0x21210212, 0x21220011, 0x21220110, 0x22200111, 0x22210010, 0x22210012, 0x22210112, 0x22210211, 0x20200022, 0x20200220, 0x20200222, 0x20210020, 0x20210221, 0x20220022, 0x20220220, 0x20220222, 0x21200121, 0x21210021, 0x21210122, 0x21210221, 0x21220121, 0x22200020, 0x22200022, 0x22200220, 0x22200222, 0x22210121, 0x22220020, 0x22220022, 0x22220220, 0x22220222, 0x20211201, 0x20221101, 0x21201001, 0x21201100, 0x21211000, 0x21211100, 0x21211101, 0x21211200, 0x21211202, 0x21221001, 0x21221101, 0x21221102, 0x21221200, 0x21221201, 0x22201101, 0x20201112, 0x20201211, 0x20211010, 0x20211012, 0x20211111, 0x20211210, 0x20221112, 0x20221211, 0x21201012, 0x21201111, 0x21211011, 0x21211110, 0x21211111, 0x21211112, 0x21211211, 0x21221111, 0x21221212, 0x22201011, 0x22201110, 0x22201111, 0x22201112, 0x22201211, 0x22211012, 0x22211111, 0x22211210, 0x20201121, 0x20211021, 0x20211122, 0x20211222, 0x20221021, 0x20221121, 0x21201120, 0x21201122, 0x21201222, 0x21211022, 0x21211121, 0x21211122, 0x21211220, 0x21221020, 0x21221022, 0x22201122, 0x22211020, 0x22211121, 0x22211122, 0x22211221, 0x22221021, 0x22221120, 0x22221122, 0x20202000, 0x20202002, 0x20202200, 0x20202202, 0x20222000, 0x20222002, 0x20222200, 0x20222202, 0x21212001, 0x21212100, 0x21212102, 0x21212201, 0x22202000, 0x22202002, 0x22202200, 0x22202202, 0x22212101, 0x22222000, 0x22222002, 0x22222200, 0x22222202, 0x20202111, 0x20212110, 0x20212211, 0x20222011, 0x20222111, 0x21202011, 0x21212010, 0x21212111, 0x21212212, 0x21222011, 0x21222112, 0x21222211, 0x22212010, 0x22212112, 0x20202020, 0x20202022, 0x20202220, 0x20202222, 0x20222020, 0x20222022, 0x20222220, 0x20222222, 0x21212021, 0x21212120, 0x21212122, 0x22202020, 0x22202022, 0x22202220, 0x22202222, 0x22212121, 0x22222020, 0x22222022, 0x22222220, 0x22222222,\n"
+"};\n"
+"\n"
 "/* ---- Device LUT for IQ4_NL ---- */\n"
 "__device__ static const signed char kvalues_iq4nl_dev[16] = {\n"
 "    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113\n"
@@ -4384,70 +5750,152 @@ static const char *hip_kernel_source =
 "                                    int n_rows, int n_cols) {\n"
 "    int warp_id = threadIdx.x / 32;\n"
 "    int lane = threadIdx.x % 32;\n"
-"    int row = blockIdx.x * 8 + warp_id;\n"
+"    int row = blockIdx.x * (blockDim.x / 32) + warp_id;\n"
 "    if (row >= n_rows) return;\n"
 "    int nb = n_cols / 256;\n"
 "    int row_bytes = nb * 136;\n"
 "    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
 "    float sum = 0.0f;\n"
-"    for (int b = lane; b < nb; b += 32) {\n"
+"    int groups = nb * 8;\n"
+"    for (int g = lane; g < groups; g += 32) {\n"
+"        int b = g >> 3, ib = g & 7;\n"
 "        const unsigned char *bp = row_ptr + b * 136;\n"
 "        float d = half_to_float(*(const half_raw *)bp);\n"
 "        unsigned short scales_h = *(const unsigned short *)(bp + 2);\n"
 "        const unsigned char *scales_l = bp + 4;\n"
-"        const unsigned char *qs = bp + 8;\n"
-"        const float *xb = x + b * 256;\n"
-"        float partial = 0.0f;\n"
-"        for (int ib = 0; ib < 8; ib++) {\n"
-"            int ls = ((scales_l[ib/2] >> 4*(ib%2)) & 0xf) | (((scales_h >> 2*ib) & 3) << 4);\n"
-"            float dl = d * (float)(ls - 32);\n"
-"            for (int j = 0; j < 16; j++) {\n"
-"                float v0 = dl * (float)kvalues_iq4nl_dev[qs[j] & 0xf];\n"
-"                float v1 = dl * (float)kvalues_iq4nl_dev[qs[j] >>  4];\n"
-"                partial += v0 * xb[j] + v1 * xb[j + 16];\n"
-"            }\n"
-"            xb += 32;\n"
-"            qs += 16;\n"
+"        const unsigned char *qs = bp + 8 + ib * 16;\n"
+"        const float *xb = x + b * 256 + ib * 32;\n"
+"        int ls = ((scales_l[ib/2] >> (4*(ib%2))) & 0xf) |\n"
+"                 (((scales_h >> (2*ib)) & 3) << 4);\n"
+"        float dl = d * (float)(ls - 32);\n"
+"        for (int j = 0; j < 16; ++j) {\n"
+"            sum = fmaf(dl * (float)kvalues_iq4nl_dev[qs[j] & 0xf],\n"
+"                       xb[j], sum);\n"
+"            sum = fmaf(dl * (float)kvalues_iq4nl_dev[qs[j] >> 4],\n"
+"                       xb[j + 16], sum);\n"
 "        }\n"
-"        sum += partial;\n"
 "    }\n"
 "    for (int offset = 16; offset > 0; offset >>= 1)\n"
 "        sum += __shfl_down(sum, offset);\n"
 "    if (lane == 0) dst[row] = sum;\n"
 "}\n"
+"__global__ void matvec_iq4_xs_batch_f32(float *dst, const unsigned char *mat,\n"
+"        const float *x, int n_rows, int n_cols, int M, int x_stride) {\n"
+"    int warp=threadIdx.x/32,lane=threadIdx.x&31,row=blockIdx.x*(blockDim.x/32)+warp,token=blockIdx.y;\n"
+"    if(row>=n_rows||token>=M)return; int nb=n_cols/256,G=nb*8;\n"
+"    const unsigned char *rp=mat+(size_t)row*nb*136; const float *xt=x+(size_t)token*x_stride; float sum=0.0f;\n"
+"    for(int g=lane;g<G;g+=32){int b=g>>3,ib=g&7; const unsigned char *bp=rp+b*136;\n"
+"        float d=half_to_float(*(const half_raw*)bp); unsigned short sh=*(const unsigned short*)(bp+2);\n"
+"        const unsigned char *sl=bp+4,*qs=bp+8+ib*16; int ls=((sl[ib/2]>>(4*(ib&1)))&15)|(((sh>>(2*ib))&3)<<4);\n"
+"        float dl=d*(float)(ls-32); const float *xb=xt+b*256+ib*32; float p0=0.0f,p1=0.0f,p2=0.0f,p3=0.0f;\n"
+"        for(int j=0;j<16;j+=4){p0+=(float)kvalues_iq4nl_dev[qs[j]&15]*xb[j]+(float)kvalues_iq4nl_dev[qs[j]>>4]*xb[j+16];\n"
+"            p1+=(float)kvalues_iq4nl_dev[qs[j+1]&15]*xb[j+1]+(float)kvalues_iq4nl_dev[qs[j+1]>>4]*xb[j+17];\n"
+"            p2+=(float)kvalues_iq4nl_dev[qs[j+2]&15]*xb[j+2]+(float)kvalues_iq4nl_dev[qs[j+2]>>4]*xb[j+18];\n"
+"            p3+=(float)kvalues_iq4nl_dev[qs[j+3]&15]*xb[j+3]+(float)kvalues_iq4nl_dev[qs[j+3]>>4]*xb[j+19];}\n"
+"        sum+=dl*((p0+p1)+(p2+p3));}\n"
+"    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o); if(lane==0)dst[(size_t)token*n_rows+row]=sum;\n"
+"}\n"
 
+"__global__ void matvec_iq4_xs_dp4a2_batch(float *dst, const unsigned char *mat,\n"
+"        const signed char *q0, const float *s0, const signed char *q1,\n"
+"        const float *s1, int n_rows, int n_cols, int M) {\n"
+"    int warp=threadIdx.x>>5,lane=threadIdx.x&31,row=blockIdx.x*8+warp,token=blockIdx.y;\n"
+"    if(row>=n_rows||token>=M)return; int nb=n_cols/256,G=nb*8;\n"
+"    const unsigned char *rp=mat+(size_t)row*nb*136;\n"
+"    const signed char *tq0=q0+(size_t)token*n_cols,*tq1=q1+(size_t)token*n_cols;\n"
+"    const float *ts0=s0+(size_t)token*(n_cols/32),*ts1=s1+(size_t)token*(n_cols/32); float sum=0.0f;\n"
+"    for(int g=lane;g<G;g+=32){int b=g>>3,ib=g&7; const unsigned char *bp=rp+b*136;\n"
+"        float d=half_to_float(*(const half_raw*)bp); unsigned short sh=*(const unsigned short*)(bp+2);\n"
+"        const unsigned char *sl=bp+4,*qs=bp+8+ib*16;\n"
+"        int ls=((sl[ib/2]>>(4*(ib&1)))&15)|(((sh>>(2*ib))&3)<<4);\n"
+"        const int *u0=(const int*)(tq0+(size_t)g*32),*u1=(const int*)(tq1+(size_t)g*32); int z0=0,z1=0;\n"
+"        for(int j=0;j<4;j++){\n"
+"            int w0=(int)(unsigned char)kvalues_iq4nl_dev[qs[j]&15]|((int)(unsigned char)kvalues_iq4nl_dev[qs[j+4]&15]<<8)|((int)(unsigned char)kvalues_iq4nl_dev[qs[j+8]&15]<<16)|((int)(unsigned char)kvalues_iq4nl_dev[qs[j+12]&15]<<24);\n"
+"            int w1=(int)(unsigned char)kvalues_iq4nl_dev[qs[j]>>4]|((int)(unsigned char)kvalues_iq4nl_dev[qs[j+4]>>4]<<8)|((int)(unsigned char)kvalues_iq4nl_dev[qs[j+8]>>4]<<16)|((int)(unsigned char)kvalues_iq4nl_dev[qs[j+12]>>4]<<24);\n"
+"            z0=dp4a_hw(w0,u0[j],z0); z0=dp4a_hw(w1,u0[j+4],z0); z1=dp4a_hw(w0,u1[j],z1); z1=dp4a_hw(w1,u1[j+4],z1);\n"
+"        }\n"
+"        sum+=d*(float)(ls-32)*(ts0[g]*(float)z0+ts1[g]*(float)z1);\n"
+"    }\n"
+"    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o); if(lane==0)dst[(size_t)token*n_rows+row]=sum;\n"
+"}\n"
+
+"__global__ void matvec_iq4_xs_dp4a2_batch_reuse4(float *dst, const unsigned char *mat,\n"
+"        const signed char *q0, const float *s0, const signed char *q1,\n"
+"        const float *s1, int n_rows, int n_cols, int M) {\n"
+"    int warp=threadIdx.x>>5,lane=threadIdx.x&31,row=blockIdx.x*8+warp,token0=blockIdx.y*8;\n"
+"    if(row>=n_rows)return; int nb=n_cols/256,G=nb*8;\n"
+"    const unsigned char *rp=mat+(size_t)row*nb*136; float sum[4]={0,0,0,0};\n"
+"    for(int g=lane;g<G;g+=32){int b=g>>3,ib=g&7; const unsigned char *bp=rp+b*136;\n"
+"        float d=half_to_float(*(const half_raw*)bp); unsigned short sh=*(const unsigned short*)(bp+2);\n"
+"        const unsigned char *sl=bp+4,*qs=bp+8+ib*16; int ls=((sl[ib/2]>>(4*(ib&1)))&15)|(((sh>>(2*ib))&3)<<4);\n"
+"        int w0[4],w1[4];\n"
+"        for(int j=0;j<4;j++){w0[j]=(int)(unsigned char)kvalues_iq4nl_dev[qs[j]&15]|((int)(unsigned char)kvalues_iq4nl_dev[qs[j+4]&15]<<8)|((int)(unsigned char)kvalues_iq4nl_dev[qs[j+8]&15]<<16)|((int)(unsigned char)kvalues_iq4nl_dev[qs[j+12]&15]<<24);\n"
+"            w1[j]=(int)(unsigned char)kvalues_iq4nl_dev[qs[j]>>4]|((int)(unsigned char)kvalues_iq4nl_dev[qs[j+4]>>4]<<8)|((int)(unsigned char)kvalues_iq4nl_dev[qs[j+8]>>4]<<16)|((int)(unsigned char)kvalues_iq4nl_dev[qs[j+12]>>4]<<24);}\n"
+"        for(int t=0;t<4;t++){int token=token0+t;if(token<M){const signed char *u0=q0+(size_t)token*n_cols+g*32,*u1=q1+(size_t)token*n_cols+g*32;const float *a0=s0+(size_t)token*(n_cols/32)+g,*a1=s1+(size_t)token*(n_cols/32)+g;int z0=0,z1=0;\n"
+"            for(int j=0;j<4;j++){z0=dp4a_hw(w0[j],((const int*)u0)[j],z0);z0=dp4a_hw(w1[j],((const int*)u0)[j+4],z0);z1=dp4a_hw(w0[j],((const int*)u1)[j],z1);z1=dp4a_hw(w1[j],((const int*)u1)[j+4],z1);}\n"
+"            sum[t]+=d*(float)(ls-32)*(*a0*(float)z0+*a1*(float)z1);}}\n"
+"    }\n"
+"    for(int t=0;t<4;t++){for(int o=16;o>0;o>>=1)sum[t]+=__shfl_down(sum[t],o);if(lane==0&&token0+t<M)dst[(size_t)(token0+t)*n_rows+row]=sum[t];}\n"
+"}\n"
 "/* ---- matvec_iq2_xs_f32: IQ2_XS matrix x F32 vector -> F32 ---- */\n"
+"__global__ void matvec_iq4_xs_batch_reuse4_f32(float *dst, const unsigned char *mat,\n"
+"        const float *x, int n_rows, int n_cols, int M, int x_stride) {\n"
+"    int warp=threadIdx.x>>5,lane=threadIdx.x&31,row=blockIdx.x*8+warp,token0=blockIdx.y*4;\n"
+"    if(row>=n_rows)return; int nb=n_cols/256,G=nb*8; const unsigned char *rp=mat+(size_t)row*nb*136; float sum[4]={0,0,0,0};\n"
+"    for(int g=lane;g<G;g+=32){int b=g>>3,ib=g&7; const unsigned char *bp=rp+b*136; float d=half_to_float(*(const half_raw*)bp);\n"
+"        unsigned short sh=*(const unsigned short*)(bp+2); const unsigned char *sl=bp+4,*qs=bp+8+ib*16; int ls=((sl[ib/2]>>(4*(ib&1)))&15)|(((sh>>(2*ib))&3)<<4); float dl=d*(float)(ls-32);\n"
+"        for(int t=0;t<4;t++){int token=token0+t;if(token<M){const float *xb=x+(size_t)token*x_stride+b*256+ib*32; float blockdot=0;\n"
+"            /* Match llama.cpp's MMQ order: each packed word contributes an\n"
+"             * eight-term FMA chain, the four chains are accumulated, and\n"
+"             * the IQ4_XS scale is applied once per 256-value block. */\n"
+"            for(int l=0;l<4;l++){ unsigned int q=*(const unsigned int *)(qs+l*4); float qsum=0;\n"
+"                qsum=fmaf(xb[4*l+0],(float)kvalues_iq4nl_dev[(q>>0)&15],qsum);\n"
+"                qsum=fmaf(xb[4*l+1],(float)kvalues_iq4nl_dev[(q>>8)&15],qsum);\n"
+"                qsum=fmaf(xb[4*l+2],(float)kvalues_iq4nl_dev[(q>>16)&15],qsum);\n"
+"                qsum=fmaf(xb[4*l+3],(float)kvalues_iq4nl_dev[(q>>24)&15],qsum);\n"
+"                qsum=fmaf(xb[16+4*l+0],(float)kvalues_iq4nl_dev[(q>>4)&15],qsum);\n"
+"                qsum=fmaf(xb[16+4*l+1],(float)kvalues_iq4nl_dev[(q>>12)&15],qsum);\n"
+"                qsum=fmaf(xb[16+4*l+2],(float)kvalues_iq4nl_dev[(q>>20)&15],qsum);\n"
+"                qsum=fmaf(xb[16+4*l+3],(float)kvalues_iq4nl_dev[(q>>28)&15],qsum);\n"
+"                blockdot += qsum; }\n"
+"            sum[t]=fmaf(dl,blockdot,sum[t]);}}\n"
+"    }\n"
+"    for(int t=0;t<4;t++){for(int o=16;o>0;o>>=1)sum[t]+=__shfl_down(sum[t],o);if(lane==0&&token0+t<M)dst[(size_t)(token0+t)*n_rows+row]=sum[t];}\n"
+"}\n"
 "__global__ void matvec_iq2_xs_f32(float *dst, const unsigned char *mat, const float *x,\n"
 "                                    int n_rows, int n_cols) {\n"
 "    int warp_id = threadIdx.x / 32;\n"
 "    int lane = threadIdx.x % 32;\n"
-"    int row = blockIdx.x * 8 + warp_id;\n"
+"    int rows_per_block = blockDim.x / 32;\n"
+"    int row = blockIdx.x * rows_per_block + warp_id;\n"
 "    if (row >= n_rows) return;\n"
 "    int nb = n_cols / 256;\n"
 "    int row_bytes = nb * 74;\n"
 "    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
+"    /* One lane per 8-value codebook group.  The old block-per-lane loop\n"
+"     * activated only nb lanes (20/32 for Qwen3.8's 5120-wide projections)\n"
+"     * and decoded all 32 groups serially in each active lane. */\n"
+"    int groups = nb * 32;\n"
 "    float sum = 0.0f;\n"
-"    for (int b = lane; b < nb; b += 32) {\n"
+"    for (int g = lane; g < groups; g += 32) {\n"
+"        int b = g >> 5;\n"
+"        int rem = g & 31;\n"
+"        int ib32 = rem >> 2;\n"
+"        int l = rem & 3;\n"
 "        const unsigned char *bp = row_ptr + b * 74;\n"
 "        float d = half_to_float(*(const half_raw *)bp);\n"
 "        const unsigned short *qs = (const unsigned short *)(bp + 2);\n"
 "        const unsigned char *scales = bp + 2 + 64;  /* 8 scale bytes at end */\n"
-"        const float *xb = x + b * 256;\n"
+"        const float *xb = x + b * 256 + ib32 * 32 + l * 8;\n"
 "        float partial = 0.0f;\n"
-"        int yi = 0;\n"
-"        for (int ib32 = 0; ib32 < 8; ib32++) {\n"
-"            float db0 = d * (0.5f + (float)(scales[ib32] & 0xf)) * 0.25f;\n"
-"            float db1 = d * (0.5f + (float)(scales[ib32] >>  4)) * 0.25f;\n"
-"            for (int l = 0; l < 4; l++) {\n"
-"                float dl = (l < 2) ? db0 : db1;\n"
-"                unsigned short qval = qs[4*ib32 + l];\n"
-"                const unsigned char *grid = (const unsigned char *)&iq2xs_grid_dev[qval & 511];\n"
-"                unsigned char signs = ksigns_iq2xs_dev[qval >> 9];\n"
-"                for (int j = 0; j < 8; j++) {\n"
-"                    float w = dl * (float)grid[j] * ((signs & (1 << j)) ? -1.0f : 1.0f);\n"
-"                    partial += w * xb[yi++];\n"
-"                }\n"
-"            }\n"
+"        float dl = d * (0.5f + (float)((l < 2) ?\n"
+"            (scales[ib32] & 0xf) : (scales[ib32] >> 4))) * 0.25f;\n"
+"        unsigned short qval = qs[4 * ib32 + l];\n"
+"        const unsigned char *grid = (const unsigned char *)&iq2xs_grid_dev[qval & 511];\n"
+"        unsigned char signs = ksigns_iq2xs_dev[qval >> 9];\n"
+"        for (int j = 0; j < 8; j++) {\n"
+"            float w = dl * (float)grid[j] * ((signs & (1 << j)) ? -1.0f : 1.0f);\n"
+"            partial = fmaf(w, xb[j], partial);\n"
 "        }\n"
 "        sum += partial;\n"
 "    }\n"
@@ -4487,12 +5935,360 @@ static const char *hip_kernel_source =
 "    if (lane == 0) dst[(size_t)slot * n_rows + row] = sum;\n"
 "}\n"
 
+"/* Token-batched IQ2_XS matvec. blockIdx.y selects the input token while each\n"
+" * warp computes one output row. */\n"
+"__global__ void matvec_iq2_xs_batch_f32(float *dst, const unsigned char *mat,\n"
+"        const float *x, int n_rows, int n_cols, int M, int x_stride) {\n"
+"    int warp_id = threadIdx.x / 32, lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * (blockDim.x / 32) + warp_id;\n"
+"    int token = blockIdx.y;\n"
+"    if (row >= n_rows || token >= M) return;\n"
+"    int nb = n_cols / 256;\n"
+"    int groups = nb * 32;\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * nb * 74;\n"
+"    const float *xt = x + (size_t)token * x_stride;\n"
+"    float sum = 0.0f;\n"
+"    for (int g = lane; g < groups; g += 32) {\n"
+"        int b = g >> 5;\n"
+"        int rem = g & 31;\n"
+"        int ib32 = rem >> 2;\n"
+"        int l = rem & 3;\n"
+"        const unsigned char *bp = row_ptr + b * 74;\n"
+"        float d = half_to_float(*(const half_raw *)bp);\n"
+"        const unsigned short *qs = (const unsigned short *)(bp + 2);\n"
+"        const unsigned char *scales = bp + 66;\n"
+"        const float *xb = xt + b * 256 + ib32 * 32 + l * 8;\n"
+"        float dl = d * (0.5f + (float)((l < 2) ?\n"
+"            (scales[ib32] & 0xf) : (scales[ib32] >> 4))) * 0.25f;\n"
+"        unsigned short qval = qs[4 * ib32 + l];\n"
+"        const unsigned char *grid = (const unsigned char *)&iq2xs_grid_dev[qval & 511];\n"
+"        unsigned char signs = ksigns_iq2xs_dev[qval >> 9];\n"
+"        float partial = 0.0f;\n"
+"        for (int j = 0; j < 8; j++) {\n"
+"            float w = dl * (float)grid[j] * ((signs & (1 << j)) ? -1.0f : 1.0f);\n"
+"            partial += w * xb[j];\n"
+"        }\n"
+"        sum += partial;\n"
+"    }\n"
+"    for (int offset = 16; offset > 0; offset >>= 1)\n"
+"        sum += __shfl_down(sum, offset);\n"
+"    if (lane == 0) dst[(size_t)token * n_rows + row] = sum;\n"
+"}\n"
+
+"/* Token-batched IQ2_XXS matvec.  The 66-byte block and auxiliary-bit layout\n"
+" * intentionally mirror matvec_iq2_xxs_f32 above; only the token stride and\n"
+" * output indexing differ. */\n"
+"__global__ void matvec_iq2_xxs_batch_f32(float *dst, const unsigned char *mat,\n"
+"        const float *x, int n_rows, int n_cols, int M, int x_stride) {\n"
+"    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;\n"
+"    int row = blockIdx.x * (blockDim.x / 32) + warp, token = blockIdx.y;\n"
+"    if (row >= n_rows || token >= M) return;\n"
+"    int nb = n_cols / 256, groups = nb * 32;\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * nb * 66;\n"
+"    const float *xt = x + (size_t)token * x_stride;\n"
+"    float sum = 0.0f;\n"
+"    for (int g = lane; g < groups; g += 32) {\n"
+"        int b = g >> 5, rem = g & 31, ib32 = rem >> 2, l = rem & 3;\n"
+"        const unsigned char *bp = row_ptr + b * 66;\n"
+"        float d = half_to_float(*(const half_raw *)bp);\n"
+"        const unsigned short *qs = (const unsigned short *)(bp + 2);\n"
+"        unsigned int aux0 = qs[4 * ib32] | ((unsigned int)qs[4 * ib32 + 1] << 16);\n"
+"        unsigned int aux1 = qs[4 * ib32 + 2] | ((unsigned int)qs[4 * ib32 + 3] << 16);\n"
+"        float db = d * (0.5f + (float)(aux1 >> 28)) * 0.25f;\n"
+"        unsigned int grid_idx = (aux0 >> (8 * l)) & 255;\n"
+"        const unsigned char *grid = (const unsigned char *)&iq2xxs_grid_dev[grid_idx];\n"
+"        unsigned char signs = ksigns_iq2xs_dev[(aux1 >> (7 * l)) & 127];\n"
+"        const float *xb = xt + b * 256 + ib32 * 32 + l * 8;\n"
+"        float p0 = 0.0f, p1 = 0.0f, p2 = 0.0f, p3 = 0.0f;\n"
+"        p0 += (float)grid[0] * ((signs &   1) ? -xb[0] : xb[0]);\n"
+"        p1 += (float)grid[1] * ((signs &   2) ? -xb[1] : xb[1]);\n"
+"        p2 += (float)grid[2] * ((signs &   4) ? -xb[2] : xb[2]);\n"
+"        p3 += (float)grid[3] * ((signs &   8) ? -xb[3] : xb[3]);\n"
+"        p0 += (float)grid[4] * ((signs &  16) ? -xb[4] : xb[4]);\n"
+"        p1 += (float)grid[5] * ((signs &  32) ? -xb[5] : xb[5]);\n"
+"        p2 += (float)grid[6] * ((signs &  64) ? -xb[6] : xb[6]);\n"
+"        p3 += (float)grid[7] * ((signs & 128) ? -xb[7] : xb[7]);\n"
+"        sum += db * ((p0 + p1) + (p2 + p3));\n"
+"    }\n"
+"    for (int off = 16; off > 0; off >>= 1) sum += __shfl_down(sum, off);\n"
+"    if (lane == 0) dst[(size_t)token * n_rows + row] = sum;\n"
+"}\n"
+
+"/* Weight-reuse IQ2_XXS batch kernel: one warp owns one output row and\n"
+" * accumulates four prompt columns while each quantized block is resident in\n"
+" * the warp's registers.  This removes the M-fold weight reload in the basic\n"
+" * token-batched kernel without changing dequantization arithmetic. */\n"
+"__global__ void matvec_iq2_xxs_batch_reuse4_f32(float *dst, const unsigned char *mat,\n"
+"        const float *x, int n_rows, int n_cols, int M, int x_stride) {\n"
+"    int warp=threadIdx.x>>5,lane=threadIdx.x&31,row=blockIdx.x*8+warp;\n"
+"    int token0=blockIdx.y*4; if(row>=n_rows)return; int nb=n_cols/256,G=nb*32;\n"
+"    const unsigned char *rp=mat+(size_t)row*nb*66; float sum[4]={0,0,0,0};\n"
+"    for(int g=lane;g<G;g+=32){int b=g>>5,rem=g&31,ib32=rem>>2,l=rem&3;\n"
+"        const unsigned char *bp=rp+b*66; float d=half_to_float(*(const half_raw*)bp);\n"
+"        const unsigned short *qs=(const unsigned short*)(bp+2);\n"
+"        unsigned int a0=qs[4*ib32]|((unsigned int)qs[4*ib32+1]<<16);\n"
+"        unsigned int a1=qs[4*ib32+2]|((unsigned int)qs[4*ib32+3]<<16);\n"
+"        float db=d*(0.5f+(float)(a1>>28))*0.25f;\n"
+"        const unsigned char *gr=(const unsigned char *)&iq2xxs_grid_dev[(a0>>(8*l))&255];\n"
+"        unsigned char sg=ksigns_iq2xs_dev[(a1>>(7*l))&127];\n"
+"        for(int t=0;t<4;t++){int token=token0+t;if(token<M){const float *xb=x+(size_t)token*x_stride+b*256+ib32*32+l*8;\n"
+"            float p=0; for(int j=0;j<8;j++)p+=(float)gr[j]*((sg&(1<<j))?-xb[j]:xb[j]); sum[t]+=db*p;}}\n"
+"    }\n"
+"    for(int t=0;t<4;t++){for(int o=16;o>0;o>>=1)sum[t]+=__shfl_down(sum[t],o);\n"
+"        if(lane==0&&token0+t<M)dst[(size_t)(token0+t)*n_rows+row]=sum[t];}\n"
+"}\n"
+
+"__global__ void matvec_iq2_xxs_dp4a2_batch(float *dst, const unsigned char *mat,\n"
+"        const signed char *q0, const float *s0, const signed char *q1,\n"
+"        const float *s1, int n_rows, int n_cols, int M) {\n"
+"    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;\n"
+"    int row = blockIdx.x * 8 + warp, token = blockIdx.y;\n"
+"    if (row >= n_rows || token >= M) return;\n"
+"    int nb = n_cols / 256, G = nb * 8;\n"
+"    const unsigned char *rp = mat + (size_t)row * nb * 66;\n"
+"    const signed char *tq0 = q0 + (size_t)token * n_cols, *tq1 = q1 + (size_t)token * n_cols;\n"
+"    const float *ts0 = s0 + (size_t)token * (n_cols / 32), *ts1 = s1 + (size_t)token * (n_cols / 32);\n"
+"    float sum = 0.0f;\n"
+"    for (int qb = lane; qb < G; qb += 32) {\n"
+"        int b = qb >> 3, ib = qb & 7;\n"
+"        const unsigned char *bp = rp + b * 66;\n"
+"        float d = half_to_float(*(const half_raw *)bp);\n"
+"        const unsigned short *qs = (const unsigned short *)(bp + 2);\n"
+"        unsigned int a0 = qs[4 * ib] | ((unsigned int)qs[4 * ib + 1] << 16);\n"
+"        unsigned int a1 = qs[4 * ib + 2] | ((unsigned int)qs[4 * ib + 3] << 16);\n"
+"        const int *u0 = (const int *)(tq0 + qb * 32), *u1 = (const int *)(tq1 + qb * 32);\n"
+"        int z0 = 0, z1 = 0;\n"
+"        for (int l = 0; l < 4; ++l) {\n"
+"            unsigned long long gv = iq2xxs_grid_dev[(a0 >> (8 * l)) & 255];\n"
+"            unsigned char sb = ksigns_iq2xs_dev[(a1 >> (7 * l)) & 127];\n"
+"            int w0 = apply_sign4((unsigned int)gv, sb, 0);\n"
+"            int w1 = apply_sign4((unsigned int)(gv >> 32), sb, 4);\n"
+"            z0 = dp4a_hw(w0, u0[2 * l], z0); z0 = dp4a_hw(w1, u0[2 * l + 1], z0);\n"
+"            z1 = dp4a_hw(w0, u1[2 * l], z1); z1 = dp4a_hw(w1, u1[2 * l + 1], z1);\n"
+"        }\n"
+"        float ad = ts0[qb] * (float)z0 + ts1[qb] * (float)z1;\n"
+"        sum += d * (0.5f + (float)(a1 >> 28)) * 0.25f * ad;\n"
+"    }\n"
+"    for (int off = 16; off > 0; off >>= 1) sum += __shfl_down(sum, off);\n"
+"    if (lane == 0) dst[(size_t)token * n_rows + row] = sum;\n"
+"}\n"
+
+"__global__ void matvec_iq2_xxs_dp4a2_batch_reuse4(float *dst, const unsigned char *mat,\n"
+"        const signed char *q0, const float *s0, const signed char *q1,\n"
+"        const float *s1, int n_rows, int n_cols, int M) {\n"
+"    int warp=threadIdx.x>>5,lane=threadIdx.x&31,row=blockIdx.x*8+warp,token0=blockIdx.y*4;\n"
+"    if(row>=n_rows)return; int nb=n_cols/256,G=nb*8; const unsigned char *rp=mat+(size_t)row*nb*66; float sum[4]={0,0,0,0};\n"
+"    for(int qb=lane;qb<G;qb+=32){int b=qb>>3,ib=qb&7; const unsigned char *bp=rp+b*66;\n"
+"        float d=half_to_float(*(const half_raw*)bp); const unsigned short *qs=(const unsigned short*)(bp+2);\n"
+"        unsigned int a0=qs[4*ib]|((unsigned int)qs[4*ib+1]<<16),a1=qs[4*ib+2]|((unsigned int)qs[4*ib+3]<<16);\n"
+"        for(int t=0;t<4;t++){int token=token0+t;if(token<M){const signed char *tq0=q0+(size_t)token*n_cols,*tq1=q1+(size_t)token*n_cols;\n"
+"            const float *ts0=s0+(size_t)token*(n_cols/32),*ts1=s1+(size_t)token*(n_cols/32); int z0=0,z1=0;\n"
+"            for(int l=0;l<4;l++){unsigned long long gv=iq2xxs_grid_dev[(a0>>(8*l))&255]; unsigned char sg=ksigns_iq2xs_dev[(a1>>(7*l))&127];\n"
+"                int w0=apply_sign4((unsigned int)gv,sg,0),w1=apply_sign4((unsigned int)(gv>>32),sg,4); const int *u0=(const int*)(tq0+qb*32),*u1=(const int*)(tq1+qb*32);\n"
+"                z0=dp4a_hw(w0,u0[2*l],z0);z0=dp4a_hw(w1,u0[2*l+1],z0);z1=dp4a_hw(w0,u1[2*l],z1);z1=dp4a_hw(w1,u1[2*l+1],z1);}\n"
+"            sum[t]+=d*(0.5f+(float)(a1>>28))*0.25f*(ts0[qb]*(float)z0+ts1[qb]*(float)z1);}}\n"
+"    }\n"
+"    for(int t=0;t<4;t++){for(int o=16;o>0;o>>=1)sum[t]+=__shfl_down(sum[t],o);if(lane==0&&token0+t<M)dst[(size_t)(token0+t)*n_rows+row]=sum[t];}\n"
+"}\n"
+
+"/* MMQ-style IQ2_XXS tile: 128 output rows x 128 prompt rows.  The\n"
+" * quantized code tile and Q8 activation tile are loaded once per K=32\n"
+" * step, then reused by every output in the CTA. */\n"
+"__global__ void matmul_iq2_xxs_mmq128(float *Y, const unsigned char *W,\n"
+"        const signed char *q0, const float *s0, const signed char *q1,\n"
+"        const float *s1, int N, int K, int M) {\n"
+"    int tid=threadIdx.x, m0=blockIdx.y*128,n0=blockIdx.x*128,nb=K/256;\n"
+"    __shared__ signed char sw[128*128],sx0[128*128],sx1[128*128];\n"
+"    __shared__ float ws[128*16];\n"
+"    for(int k=0;k<K;k+=128){\n"
+"        for(int it=0;it<64;it++){int e=tid*64+it,r=e>>7,kk=e&127,col=n0+r,kp=k+kk;\n"
+"            sx0[e]=(m0+r<M&&kp<K)?q0[(size_t)(m0+r)*K+kp]:0;\n"
+"            sx1[e]=(m0+r<M&&kp<K)?q1[(size_t)(m0+r)*K+kp]:0;\n"
+"            sw[e]=0; if(col<N&&kp<K){int b=kp>>8,rem=kp&255,ib=rem>>5,l=(rem&31)>>3,j=rem&7;\n"
+"                const unsigned char *bp=W+(size_t)col*nb*66+b*66; const unsigned short *qs=(const unsigned short*)(bp+2);\n"
+"                unsigned int a0=qs[4*ib]|((unsigned int)qs[4*ib+1]<<16),a1=qs[4*ib+2]|((unsigned int)qs[4*ib+3]<<16);\n"
+"                const unsigned char *gr=(const unsigned char *)&iq2xxs_grid_dev[(a0>>(8*l))&255]; unsigned char sg=ksigns_iq2xs_dev[(a1>>(7*l))&127];\n"
+"                unsigned int mag=gr[j]; if(sg&(1<<j))mag=(unsigned int)(-(int)mag)&255u; sw[e]=(signed char)mag;\n"
+"                if((kk&7)==0)ws[r*16+(kk>>3)]=half_to_float(*(const half_raw*)bp)*(0.5f+(float)(a1>>28))*0.25f;}\n"
+"        }\n"
+"        __syncthreads();\n"
+"        for(int out=tid;out<128*128;out+=256){int tm=out>>7,r=out&127;if(m0+tm>=M||n0+r>=N)continue;size_t yi=(size_t)(m0+tm)*N+n0+r;float sum=(k==0)?0.0f:Y[yi];\n"
+"            for(int l=0;l<16;l++){float as0=s0[(size_t)(m0+tm)*(K/32)+k/32+l/4],as1=s1[(size_t)(m0+tm)*(K/32)+k/32+l/4];\n"
+"                int w0=*(const int*)&sw[r*128+l*8],u0=*(const int*)&sx0[tm*128+l*8];\n"
+"                int w1=*(const int*)&sw[r*128+l*8+4],u1=*(const int*)&sx0[tm*128+l*8+4];\n"
+"                int z0=dp4a_hw(w0,u0,0);z0=dp4a_hw(w1,u1,z0);\n"
+"                int v0=*(const int*)&sx1[tm*128+l*8],v1=*(const int*)&sx1[tm*128+l*8+4];\n"
+"                int z1=dp4a_hw(w0,v0,0);z1=dp4a_hw(w1,v1,z1);\n"
+"                sum+=ws[r*16+l]*(as0*(float)z0+as1*(float)z1);}\n"
+"            Y[yi]=sum;}\n"
+"        __syncthreads();\n"
+"    }\n"
+"}\n"
+"/* 64-row MMQ tile: lower LDS footprint improves CTA residency on gfx1201. */\n"
+"__global__ void matmul_iq2_xxs_mmq64(float *Y, const unsigned char *W,\n"
+"        const signed char *q0, const float *s0, const signed char *q1,\n"
+"        const float *s1, int N, int K, int M) {\n"
+"    int tid=threadIdx.x, m0=blockIdx.y*128,n0=blockIdx.x*64,nb=K/256;\n"
+"    __shared__ signed char sw[64*128],sx0[128*128],sx1[128*128]; __shared__ float ws[64];\n"
+"    for(int k=0;k<K;k+=128){\n"
+"        for(int it=0;it<64;it++){int e=tid*64+it,r=e>>7,kk=e&127,col=n0+r,kp=k+kk;\n"
+"            sx0[e]=(m0+r<M&&kp<K)?q0[(size_t)(m0+r)*K+kp]:0; sx1[e]=(m0+r<M&&kp<K)?q1[(size_t)(m0+r)*K+kp]:0;}\n"
+"        for(int it=0;it<32;it++){int e=tid*32+it,r=e>>7,kk=e&127,col=n0+r,kp=k+kk; sw[e]=0;\n"
+"            if(col<N&&kp<K){int b=kp>>8,rem=kp&255,ib=rem>>5,l=(rem&31)>>3,j=rem&7;\n"
+"                const unsigned char *bp=W+(size_t)col*nb*66+b*66; const unsigned short *qs=(const unsigned short*)(bp+2);\n"
+"                unsigned int a0=qs[4*ib]|((unsigned int)qs[4*ib+1]<<16),a1=qs[4*ib+2]|((unsigned int)qs[4*ib+3]<<16);\n"
+"                const unsigned char *gr=(const unsigned char *)&iq2xxs_grid_dev[(a0>>(8*l))&255]; unsigned char sg=ksigns_iq2xs_dev[(a1>>(7*l))&127];\n"
+"                unsigned int mag=gr[j]; if(sg&(1<<j))mag=(unsigned int)(-(int)mag)&255u; sw[e]=(signed char)mag;\n"
+"                if((kk&127)==0)ws[r]=half_to_float(*(const half_raw*)bp)*(0.5f+(float)(a1>>28))*0.25f;}}\n"
+"        __syncthreads();\n"
+"        for(int out=tid;out<128*64;out+=256){int tm=out>>6,r=out&63;if(m0+tm>=M||n0+r>=N)continue;size_t yi=(size_t)(m0+tm)*N+n0+r;float sum=(k==0)?0.0f:Y[yi];\n"
+"            for(int l=0;l<16;l++){int z0=0,z1=0; const int *w=(const int*)&sw[r*128+l*8]; const int *u0=(const int*)&sx0[tm*128+l*8],*u1=(const int*)&sx1[tm*128+l*8];\n"
+"                z0=dp4a_hw(w[0],u0[0],z0); z0=dp4a_hw(w[1],u0[1],z0); z1=dp4a_hw(w[0],u1[0],z1); z1=dp4a_hw(w[1],u1[1],z1);\n"
+"                sum+=ws[r]*(s0[(size_t)(m0+tm)*(K/32)+k/32+l/4]*(float)z0+s1[(size_t)(m0+tm)*(K/32)+k/32+l/4]*(float)z1);}\n"
+"            Y[yi]=sum;}\n"
+"        __syncthreads();\n"
+"    }\n"
+"}\n"
+"/* MMQ-style IQ2_XS tile. IQ2_XS carries one 4-bit scale byte per 32-value\n"
+" * subblock, so the shared scale tile is kept per 8-value dot group. */\n"
+"__global__ void matmul_iq2_xs_mmq128(float *Y, const unsigned char *W,\n"
+"        const signed char *q0, const float *s0, const signed char *q1,\n"
+"        const float *s1, int N, int K, int M) {\n"
+"    int tid=threadIdx.x,m0=blockIdx.y*128,n0=blockIdx.x*128,nb=K/256;\n"
+"    __shared__ signed char sw[128*128],sx0[128*128],sx1[128*128]; __shared__ float ws[128*16];\n"
+"    for(int k=0;k<K;k+=128){\n"
+"        for(int it=0;it<64;it++){int e=tid*64+it,r=e>>7,kk=e&127,kp=k+kk;\n"
+"            sx0[e]=(m0+r<M&&kp<K)?q0[(size_t)(m0+r)*K+kp]:0; sx1[e]=(m0+r<M&&kp<K)?q1[(size_t)(m0+r)*K+kp]:0;}\n"
+"        for(int it=0;it<64;it++){int e=tid*64+it,r=e>>7,kk=e&127,col=n0+r,kp=k+kk; sw[e]=0;\n"
+"            if(col<N&&kp<K){int b=kp>>8,rem=kp&255,ib=rem>>5,l=(rem&31)>>3,j=rem&7; const unsigned char *bp=W+(size_t)col*nb*74+b*74;\n"
+"                const unsigned short *qs=(const unsigned short*)(bp+2); unsigned short qv=qs[4*ib+l];\n"
+"                const unsigned char *gr=(const unsigned char *)&iq2xs_grid_dev[qv&511]; unsigned char sg=ksigns_iq2xs_dev[qv>>9]; unsigned int mag=gr[j];\n"
+"                if(sg&(1<<j))mag=(unsigned int)(-(int)mag)&255u; sw[e]=(signed char)mag;\n"
+"                if((kk&7)==0){unsigned char sc=bp[66+ib]; float d=half_to_float(*(const half_raw*)bp); int ls=(l<2)?(sc&15):(sc>>4); ws[r*16+(kk>>3)]=d*(0.5f+(float)ls)*0.25f;}\n"
+"            }\n"
+"        }\n"
+"        __syncthreads();\n"
+"        for(int out=tid;out<128*128;out+=256){int tm=out>>7,r=out&127;if(m0+tm>=M||n0+r>=N)continue;float sum=0;\n"
+"            for(int l=0;l<16;l++){const int *w=(const int*)&sw[r*128+l*8],*u0=(const int*)&sx0[tm*128+l*8],*u1=(const int*)&sx1[tm*128+l*8];\n"
+"                int z0=dp4a_hw(w[0],u0[0],0);z0=dp4a_hw(w[1],u0[1],z0);int z1=dp4a_hw(w[0],u1[0],0);z1=dp4a_hw(w[1],u1[1],z1);\n"
+"                int ag=k/32+l/4; sum+=ws[r*16+l]*(s0[(size_t)(m0+tm)*(K/32)+ag]*(float)z0+s1[(size_t)(m0+tm)*(K/32)+ag]*(float)z1);}\n"
+"            Y[(size_t)(m0+tm)*N+n0+r]=sum;}\n"
+"        __syncthreads();\n"
+"    }\n"
+"}\n"
+"__global__ void matvec_iq2_xs_batch_tile_f32(float *dst, const unsigned char *mat, const float *x, int n_rows, int n_cols, int M, int x_stride) {\n"
+"    /* One block covers four output rows by two tokens.  The previous version\n"
+"     * loaded the same activation tile once per row and the same IQ2 block\n"
+"     * once per token.  Cooperative staging makes the reuse explicit while\n"
+"     * retaining the scalar IQ2_XS dequantization order for parity. */\n"
+"    __shared__ unsigned char wt[4][74]; __shared__ float xt[2][256];\n"
+"    int tid=threadIdx.x, warp=tid>>5, lane=tid&31;\n"
+"    int row=blockIdx.x*4+(warp>>1), token=blockIdx.y*2+(warp&1);\n"
+"    int active=row<n_rows && token<M, nb=n_cols/256; float sum=0.0f;\n"
+"    for (int b=0; b<nb; ++b) {\n"
+"        /* Warps 0..1 stage the two activation tiles. */\n"
+"        if (warp < 2) {\n"
+"            int i=lane;\n"
+"            while (i < 256) {\n"
+"                int t=warp;\n"
+"                xt[t][i] = (t*2 + blockIdx.y*2 < M) ?\n"
+"                    x[(size_t)(blockIdx.y*2+t)*x_stride + b*256+i] : 0.0f;\n"
+"                i += 32;\n"
+"            }\n"
+"        }\n"
+"        /* Warps 2..5 stage one IQ2 row block each. */\n"
+"        if (warp >= 2 && warp < 6) {\n"
+"            int r=warp-2, i=lane;\n"
+"            const unsigned char *rp = (blockIdx.x*4+r < n_rows) ?\n"
+"                mat + (size_t)(blockIdx.x*4+r)*nb*74 : mat;\n"
+"            while (i < 74) { wt[r][i] = (blockIdx.x*4+r < n_rows) ?\n"
+"                rp[(size_t)b*74+i] : 0; i += 32; }\n"
+"        }\n"
+"        __syncthreads();\n"
+"        if (active) {\n"
+"            const unsigned char *bp=wt[warp>>1];\n"
+"            for (int g=lane; g<32; g+=32) {\n"
+"                int ib=g>>2,l=g&3;\n"
+"                float d=half_to_float(*(const half_raw *)bp);\n"
+"                const unsigned char *sc=bp+66;\n"
+"                const unsigned short *qs=(const unsigned short *)(bp+2);\n"
+"                float dl=d*(0.5f+(float)((l<2)?(sc[ib]&15):(sc[ib]>>4)))*0.25f;\n"
+"                unsigned short qv=qs[4*ib+l];\n"
+"                const unsigned char *grid=(const unsigned char *)&iq2xs_grid_dev[qv&511];\n"
+"                unsigned char signs=ksigns_iq2xs_dev[qv>>9];\n"
+"                for (int j=0;j<8;j++) sum += dl*(float)grid[j]*\n"
+"                    ((signs&(1<<j))?-1.0f:1.0f)*xt[warp&1][ib*32+l*8+j];\n"
+"            }\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    for(int z=16;z;z>>=1) sum+=__shfl_down(sum,z);\n"
+"    if(active&&lane==0) dst[(size_t)token*n_rows+row]=sum;\n"
+"}\n"
+
+"/* Four-token IQ2 tile.  Eight wave32s cover four rows: waves 0..3 stage and\n"
+" * compute one row each, while waves 4..7 stage the four weight rows.  Each\n"
+" * compute wave reuses the decoded weight block for four prompt columns.\n"
+" * This is the closest small tile to llama.cpp's MMQ reuse pattern that fits\n"
+" * the existing native runner's 256-thread launch contract. */\n"
+"__global__ void matvec_iq2_xs_batch_tile4_f32(float *dst, const unsigned char *mat, const float *x, int n_rows, int n_cols, int M, int x_stride) {\n"
+"    __shared__ unsigned char wt[4][74]; __shared__ float xt[4][256];\n"
+"    int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;\n"
+"    int row = blockIdx.x * 4 + (warp & 3);\n"
+"    int token0 = blockIdx.y * 4;\n"
+"    int active_row = row < n_rows, nb = n_cols / 256;\n"
+"    int token_group = warp >> 2;\n"
+"    float sum[2] = { 0.0f, 0.0f };\n"
+"    for (int b = 0; b < nb; ++b) {\n"
+"        if (warp < 4) {\n"
+"            int token = token0 + warp;\n"
+"            for (int i = lane; i < 256; i += 32)\n"
+"                xt[warp][i] = token < M ? x[(size_t)token * x_stride + b * 256 + i] : 0.0f;\n"
+"        }\n"
+"        if (warp >= 4 && warp < 8) {\n"
+"            int r = warp - 4;\n"
+"            const unsigned char *rp = (blockIdx.x * 4 + r < n_rows) ?\n"
+"                mat + (size_t)(blockIdx.x * 4 + r) * nb * 74 : mat;\n"
+"            for (int i = lane; i < 74; i += 32)\n"
+"                wt[r][i] = (blockIdx.x * 4 + r < n_rows) ? rp[(size_t)b * 74 + i] : 0;\n"
+"        }\n"
+"        __syncthreads();\n"
+"        if (active_row) {\n"
+"            const unsigned char *bp = wt[warp & 3];\n"
+"            for (int g = lane; g < 32; g += 32) {\n"
+"                int ib32 = g >> 2, l = g & 3;\n"
+"                float d = half_to_float(*(const half_raw *)bp);\n"
+"                const unsigned char *scales = bp + 66;\n"
+"                float dl = d * (0.5f + (float)((l < 2) ?\n"
+"                    (scales[ib32] & 0xf) : (scales[ib32] >> 4))) * 0.25f;\n"
+"                unsigned short qval = ((const unsigned short *)(bp + 2))[4 * ib32 + l];\n"
+"                const unsigned char *grid = (const unsigned char *)&iq2xs_grid_dev[qval & 511];\n"
+"                unsigned char signs = ksigns_iq2xs_dev[qval >> 9];\n"
+"                for (int t = 0; t < 2; ++t) {\n"
+"                    int token = token0 + token_group * 2 + t;\n"
+"                    if (token < M) {\n"
+"                        const float *xb = xt[token_group * 2 + t] + ib32 * 32 + l * 8;\n"
+"                        for (int j = 0; j < 8; ++j)\n"
+"                            sum[t] += dl * (float)grid[j] * ((signs & (1 << j)) ? -1.0f : 1.0f) * xb[j];\n"
+"                    }\n"
+"                }\n"
+"            }\n"
+"            for (int t = 0; t < 2; ++t) {\n"
+"                for (int off = 16; off > 0; off >>= 1) sum[t] += __shfl_down(sum[t], off);\n"
+"                int token = token0 + token_group * 2 + t;\n"
+"                if (lane == 0 && token < M) dst[(size_t)token * n_rows + row] = sum[t];\n"
+"            }\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"}\n"
+
 "/* ---- matvec_iq3_xxs_f32: IQ3_XXS matrix x F32 vector -> F32 ---- */\n"
 "__global__ void matvec_iq3_xxs_f32(float *dst, const unsigned char *mat, const float *x,\n"
 "                                     int n_rows, int n_cols) {\n"
 "    int warp_id = threadIdx.x / 32;\n"
 "    int lane = threadIdx.x % 32;\n"
-"    int row = blockIdx.x * 8 + warp_id;\n"
+"    int row = blockIdx.x * (blockDim.x / 32) + warp_id;\n"
 "    if (row >= n_rows) return;\n"
 "    int nb = n_cols / 256;\n"
 "    int row_bytes = nb * 98;\n"
@@ -4521,6 +6317,42 @@ static const char *hip_kernel_source =
 "    for (int offset = 16; offset > 0; offset >>= 1)\n"
 "        sum += __shfl_down(sum, offset);\n"
 "    if (lane == 0) dst[row] = sum;\n"
+"}\n"
+
+"/* Reference-order IQ3_XXS matvec.  This intentionally uses one thread per\n"
+" * row and the same block/subblock/lane/element traversal as llama.cpp's\n"
+" * scalar dequant path.  It is a parity probe for reduction-order drift,\n"
+" * not the throughput kernel. */\n"
+"__global__ void matvec_iq3_xxs_scalar_f32(float *dst, const unsigned char *mat,\n"
+"        const float *x, int n_rows, int n_cols) {\n"
+"    int row = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (row >= n_rows) return;\n"
+"    int nb = n_cols / 256;\n"
+"    int row_bytes = nb * 98;\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
+"    float sum = 0.0f;\n"
+"    for (int b = 0; b < nb; ++b) {\n"
+"        const unsigned char *bp = row_ptr + b * 98;\n"
+"        float d = half_to_float(*(const half_raw *)bp);\n"
+"        const unsigned char *qs = bp + 2;\n"
+"        for (int sb = 0; sb < 8; ++sb) {\n"
+"            unsigned int aux = *(const unsigned int *)(bp + 66 + 4*sb);\n"
+"            float db = d * (0.5f + (float)(aux >> 28)) * 0.5f;\n"
+"            for (int l = 0; l < 4; ++l) {\n"
+"                unsigned char sgn = ksigns_iq2xs_dev[(aux >> (7*l)) & 127];\n"
+"                const unsigned char *g1 = (const unsigned char *)&iq3xxs_grid_dev[qs[8*sb+2*l]];\n"
+"                const unsigned char *g2 = (const unsigned char *)&iq3xxs_grid_dev[qs[8*sb+2*l+1]];\n"
+"                const float *xb = x + b * 256 + sb * 32 + l * 8;\n"
+"                for (int j = 0; j < 4; ++j) {\n"
+"                    float w0 = db * (float)g1[j] * ((sgn & (1 << j)) ? -1.0f : 1.0f);\n"
+"                    float w1 = db * (float)g2[j] * ((sgn & (1 << (j+4))) ? -1.0f : 1.0f);\n"
+"                    sum += w0 * xb[j];\n"
+"                    sum += w1 * xb[j+4];\n"
+"                }\n"
+"            }\n"
+"        }\n"
+"    }\n"
+"    dst[row] = sum;\n"
 "}\n"
 
 "/* Pointer-array IQ3_XXS matvec for grouped routed down projections. */\n"
@@ -4620,6 +6452,82 @@ static const char *hip_kernel_source =
 "    if (lane == 0) dst[(size_t)group * n_rows + row] = sum;\n"
 "}\n"
 
+"/* Token-batched IQ3_XXS projection for dense (single-weight) layers.  Keep\n"
+" * the scalar decode identical to matvec_iq3_xxs_f32; this avoids the\n"
+" * temporary BF16 weight materialization used by the generic batch path. */\n"
+"__global__ void matvec_iq3_xxs_batch_f32(float *dst, const unsigned char *mat,\n"
+"        const float *x, int n_rows, int n_cols, int M, int x_stride) {\n"
+"    int warp_id = threadIdx.x / 32, lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * (blockDim.x / 32) + warp_id, token = blockIdx.y;\n"
+"    if (row >= n_rows || token >= M) return;\n"
+"    int nb = n_cols / 256, G = nb * 32;\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * nb * 98;\n"
+"    const float *xt = x + (size_t)token * x_stride;\n"
+"    float sum = 0.0f;\n"
+"    for (int g = lane; g < G; g += 32) {\n"
+"        int b = g >> 5, rem = g & 31, sb = rem >> 2, l = rem & 3;\n"
+"        const unsigned char *bp = row_ptr + b * 98;\n"
+"        float d = half_to_float(*(const half_raw *)bp);\n"
+"        const unsigned char *qs = bp + 2;\n"
+"        unsigned int aux = __builtin_nontemporal_load((const unsigned int *)(bp + 66 + 4*sb));\n"
+"        float db = d * (0.5f + (float)(aux >> 28)) * 0.5f;\n"
+"        unsigned char sgn = ksigns_iq2xs_dev[(aux >> (7*l)) & 127];\n"
+"        const unsigned char *g1 = (const unsigned char *)&iq3xxs_grid_dev[qs[8*sb+2*l]];\n"
+"        const unsigned char *g2 = (const unsigned char *)&iq3xxs_grid_dev[qs[8*sb+2*l+1]];\n"
+"        const float *xb = xt + b * 256 + sb * 32 + l * 8;\n"
+"        for (int j = 0; j < 4; ++j) {\n"
+"            sum += db * (float)g1[j] * ((sgn & (1 << j)) ? -1.0f : 1.0f) * xb[j];\n"
+"            sum += db * (float)g2[j] * ((sgn & (1 << (j+4))) ? -1.0f : 1.0f) * xb[j+4];\n"
+"        }\n"
+"    }\n"
+"    for (int offset = 16; offset > 0; offset >>= 1) sum += __shfl_down(sum, offset);\n"
+"    if (lane == 0) dst[(size_t)token * n_rows + row] = sum;\n"
+"}\n"
+
+"__global__ void matvec_iq3_xxs_batch_reuse4_f32(float *dst, const unsigned char *mat,\n"
+"        const float *x, int n_rows, int n_cols, int M, int x_stride) {\n"
+"    int warp_id = threadIdx.x / 32, lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * (blockDim.x / 32) + warp_id, token0 = blockIdx.y * 4;\n"
+"    if (row >= n_rows) return;\n"
+"    int nb = n_cols / 256, G = nb * 32;\n"
+"    const unsigned char *row_ptr = mat + (size_t)row * nb * 98;\n"
+"    float sum[4] = { 0, 0, 0, 0 };\n"
+"    for (int g = lane; g < G; g += 32) {\n"
+"        int b = g >> 5, rem = g & 31, sb = rem >> 2, l = rem & 3;\n"
+"        const unsigned char *bp = row_ptr + b * 98;\n"
+"        float d = half_to_float(*(const half_raw *)bp);\n"
+"        const unsigned char *qs = bp + 2;\n"
+"        unsigned int aux = __builtin_nontemporal_load((const unsigned int *)(bp + 66 + 4*sb));\n"
+"        float db = d * (0.5f + (float)(aux >> 28)) * 0.5f;\n"
+"        unsigned char sgn = ksigns_iq2xs_dev[(aux >> (7*l)) & 127];\n"
+"        const unsigned char *g1 = (const unsigned char *)&iq3xxs_grid_dev[qs[8*sb+2*l]];\n"
+"        const unsigned char *g2 = (const unsigned char *)&iq3xxs_grid_dev[qs[8*sb+2*l+1]];\n"
+"        for (int t = 0; t < 4; ++t) {\n"
+"            int token = token0 + t;\n"
+"            if (token < M) {\n"
+"                const float *xb = x + (size_t)token * x_stride + b * 256 + sb * 32 + l * 8;\n"
+"                /* Match llama.cpp HIP MMQ's reduction order: form the\n"
+"                 * eight-term dot product with chained FMAs, then apply db\n"
+"                 * with one FMA. */\n"
+"                float qsum = 0.0f;\n"
+"                qsum = fmaf(xb[0], (sgn & 1)   ? -(float)g1[0] : (float)g1[0], qsum);\n"
+"                qsum = fmaf(xb[1], (sgn & 2)   ? -(float)g1[1] : (float)g1[1], qsum);\n"
+"                qsum = fmaf(xb[2], (sgn & 4)   ? -(float)g1[2] : (float)g1[2], qsum);\n"
+"                qsum = fmaf(xb[3], (sgn & 8)   ? -(float)g1[3] : (float)g1[3], qsum);\n"
+"                qsum = fmaf(xb[4], (sgn & 16)  ? -(float)g2[0] : (float)g2[0], qsum);\n"
+"                qsum = fmaf(xb[5], (sgn & 32)  ? -(float)g2[1] : (float)g2[1], qsum);\n"
+"                qsum = fmaf(xb[6], (sgn & 64)  ? -(float)g2[2] : (float)g2[2], qsum);\n"
+"                qsum = fmaf(xb[7], (sgn & 128) ? -(float)g2[3] : (float)g2[3], qsum);\n"
+"                sum[t] = fmaf(db, qsum, sum[t]);\n"
+"            }\n"
+"        }\n"
+"    }\n"
+"    for (int t = 0; t < 4; ++t) {\n"
+"        for (int o = 16; o > 0; o >>= 1) sum[t] += __shfl_down(sum[t], o);\n"
+"        if (lane == 0 && token0 + t < M) dst[(size_t)(token0 + t) * n_rows + row] = sum[t];\n"
+"    }\n"
+"}\n"
+
 "/* ---- matvec_iq2_s_f32: IQ2_S matrix x F32 vector -> F32 ---- */\n"
 "/* Full 32-lane utilization: each lane processes 8-element groups (one (ib32,l)  */\n"
 "/* pair = a single grid entry) striding by 32 over the row's nb*32 groups. Avoids */\n"
@@ -4628,7 +6536,8 @@ static const char *hip_kernel_source =
 "                                   int n_rows, int n_cols) {\n"
 "    int warp_id = threadIdx.x / 32;\n"
 "    int lane = threadIdx.x % 32;\n"
-"    int row = blockIdx.x * 8 + warp_id;\n"
+"    int rows_per_block = blockDim.x / 32;\n"
+"    int row = blockIdx.x * rows_per_block + warp_id;\n"
 "    if (row >= n_rows) return;\n"
 "    int nb = n_cols / 256;\n"
 "    int row_bytes = nb * 82;\n"
@@ -4649,14 +6558,84 @@ static const char *hip_kernel_source =
 "        const unsigned char *grid = (const unsigned char *)&iq2s_grid_dev[grid_idx];\n"
 "        unsigned char s = bp[34 + ib32 * 4 + l];\n"
 "        const float *xb = x + b * 256 + ib32 * 32 + l * 8;\n"
-"        float partial = 0.0f;\n"
-"        for (int j = 0; j < 8; j++)\n"
-"            partial += db * (float)grid[j] * ((s & (1 << j)) ? -1.0f : 1.0f) * xb[j];\n"
-"        sum += partial;\n"
+"        float p0 = (float)grid[0] * ((s &   1) ? -xb[0] : xb[0]);\n"
+"        float p1 = (float)grid[1] * ((s &   2) ? -xb[1] : xb[1]);\n"
+"        float p2 = (float)grid[2] * ((s &   4) ? -xb[2] : xb[2]);\n"
+"        float p3 = (float)grid[3] * ((s &   8) ? -xb[3] : xb[3]);\n"
+"        p0 += (float)grid[4] * ((s &  16) ? -xb[4] : xb[4]);\n"
+"        p1 += (float)grid[5] * ((s &  32) ? -xb[5] : xb[5]);\n"
+"        p2 += (float)grid[6] * ((s &  64) ? -xb[6] : xb[6]);\n"
+"        p3 += (float)grid[7] * ((s & 128) ? -xb[7] : xb[7]);\n"
+"        sum += db * ((p0 + p1) + (p2 + p3));\n"
 "    }\n"
 "    for (int offset = 16; offset > 0; offset >>= 1)\n"
 "        sum += __shfl_down(sum, offset);\n"
 "    if (lane == 0) dst[row] = sum;\n"
+"}\n"
+"__global__ void matvec_iq2_s_batch_f32(float *dst, const unsigned char *mat,\n"
+"        const float *x, int n_rows, int n_cols, int M, int x_stride) {\n"
+"    int warp=threadIdx.x/32,lane=threadIdx.x&31,row=blockIdx.x*(blockDim.x/32)+warp,token=blockIdx.y;\n"
+"    if(row>=n_rows||token>=M)return; int nb=n_cols/256,G=nb*32;\n"
+"    const unsigned char *rp=mat+(size_t)row*nb*82; const float *xt=x+(size_t)token*x_stride; float sum=0.0f;\n"
+"    for(int g=lane;g<G;g+=32){int b=g>>5,gl=g&31,ib=gl>>2,l=gl&3; const unsigned char *bp=rp+b*82;\n"
+"        float d=half_to_float(*(const half_raw*)bp); unsigned char sc=bp[74+ib];\n"
+"        float db=(l<2)?d*(0.5f+(float)(sc&15))*0.25f:d*(0.5f+(float)(sc>>4))*0.25f;\n"
+"        unsigned char qsl=bp[2+ib*4+l],qh=bp[66+ib]; int gi=qsl|((qh<<(8-2*l))&0x300);\n"
+"        const unsigned char *gr=(const unsigned char*)&iq2s_grid_dev[gi]; unsigned char s=bp[34+ib*4+l];\n"
+"        const float *xb=xt+b*256+ib*32+l*8; float p=0.0f;\n"
+"        for(int j=0;j<8;j++)p+=(float)gr[j]*((s&(1<<j))?-xb[j]:xb[j]); sum+=db*p;}\n"
+"    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o); if(lane==0)dst[(size_t)token*n_rows+row]=sum;\n"
+"}\n"
+
+"__global__ void matvec_iq2_s_dp4a2_batch(float *dst, const unsigned char *mat,\n"
+"        const signed char *q0, const float *s0, const signed char *q1,\n"
+"        const float *s1, int n_rows, int n_cols, int M) {\n"
+"    int warp=threadIdx.x>>5,lane=threadIdx.x&31,row=blockIdx.x*8+warp,token=blockIdx.y;\n"
+"    if(row>=n_rows||token>=M)return; int nb=n_cols/256,G=nb*16;\n"
+"    const unsigned char *rp=mat+(size_t)row*nb*82;\n"
+"    const signed char *tq0=q0+(size_t)token*n_cols,*tq1=q1+(size_t)token*n_cols;\n"
+"    const float *ts0=s0+(size_t)token*(n_cols/32),*ts1=s1+(size_t)token*(n_cols/32); float sum=0.0f;\n"
+"    for(int gg=lane;gg<G;gg+=32){int ibg=gg>>1,half=gg&1,b=ibg>>3,ib=ibg&7;\n"
+"        const unsigned char *bp=rp+b*82; float dw=half_to_float(*(const half_raw*)bp);\n"
+"        const unsigned char *qs=bp+2+ib*4,*sg=bp+34+ib*4; unsigned char qh=bp[66+ib],sc=bp[74+ib];\n"
+"        int ls=half?(sc>>4):(sc&15),qb=b*8+ib; const int *u0=(const int*)(tq0+qb*32),*u1=(const int*)(tq1+qb*32);\n"
+"        int z0=0,z1=0; for(int t=0;t<2;t++){int l=half*2+t,idx=qs[l]|((qh<<(8-2*l))&0x300);\n"
+"            const int *gp=(const int*)&iq2s_grid_dev[idx]; int w0=apply_sign4(gp[0],sg[l],0),w1=apply_sign4(gp[1],sg[l],4);\n"
+"            z0=dp4a_hw(w0,u0[l*2],z0); z0=dp4a_hw(w1,u0[l*2+1],z0);\n"
+"            z1=dp4a_hw(w0,u1[l*2],z1); z1=dp4a_hw(w1,u1[l*2+1],z1);}\n"
+"        sum+=dw*0.25f*((float)ls+0.5f)*(ts0[qb]*(float)z0+ts1[qb]*(float)z1);}\n"
+"    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o); if(lane==0)dst[(size_t)token*n_rows+row]=sum;\n"
+"}\n"
+
+"/* IQ2_S four-token reuse variant.  The packed IQ2_S block is decoded once\n"
+" * per lane and reused across four prompt rows; this is exact relative to\n"
+" * matvec_iq2_s_dp4a2_batch and reduces repeated weight traffic at M>=32. */\n"
+"__global__ void matvec_iq2_s_dp4a2_batch_reuse4(float *dst, const unsigned char *mat,\n"
+"        const signed char *q0, const float *s0, const signed char *q1,\n"
+"        const float *s1, int n_rows, int n_cols, int M) {\n"
+"    int warp=threadIdx.x>>5,lane=threadIdx.x&31,row=blockIdx.x*8+warp;\n"
+"    int token0=blockIdx.y*4; if(row>=n_rows)return;\n"
+"    int nb=n_cols/256,G=nb*16; const unsigned char *rp=mat+(size_t)row*nb*82;\n"
+"    float sum[4]={0,0,0,0};\n"
+"    for(int gg=lane;gg<G;gg+=32){\n"
+"        int ibg=gg>>1,half=gg&1,b=ibg>>3,ib=ibg&7;\n"
+"        const unsigned char *bp=rp+b*82; float dw=half_to_float(*(const half_raw*)bp);\n"
+"        const unsigned char *qs=bp+2+ib*4,*sg=bp+34+ib*4;\n"
+"        unsigned char qh=bp[66+ib],sc=bp[74+ib];\n"
+"        int ls=half?(sc>>4):(sc&15),qb=b*8+ib;\n"
+"        for(int t=0;t<4;t++){int token=token0+t;if(token<M){\n"
+"            const int *u0=(const int*)(q0+(size_t)token*n_cols+qb*32);\n"
+"            const int *u1=(const int*)(q1+(size_t)token*n_cols+qb*32);\n"
+"            const float *ts0=s0+(size_t)token*(n_cols/32),*ts1=s1+(size_t)token*(n_cols/32);\n"
+"            int z0=0,z1=0; for(int l=0;l<2;l++){int ll=half*2+l,idx=qs[ll]|((qh<<(8-2*ll))&0x300);\n"
+"                const int *gp=(const int*)&iq2s_grid_dev[idx]; int w0=apply_sign4(gp[0],sg[ll],0),w1=apply_sign4(gp[1],sg[ll],4);\n"
+"                z0=dp4a_hw(w0,u0[ll*2],z0); z0=dp4a_hw(w1,u0[ll*2+1],z0);\n"
+"                z1=dp4a_hw(w0,u1[ll*2],z1); z1=dp4a_hw(w1,u1[ll*2+1],z1);}\n"
+"            sum[t]+=dw*0.25f*((float)ls+0.5f)*(ts0[qb]*(float)z0+ts1[qb]*(float)z1);\n"
+"        }}\n"
+"    }\n"
+"    for(int t=0;t<4;t++){for(int o=16;o>0;o>>=1)sum[t]+=__shfl_down(sum[t],o);\n"
+"        if(lane==0&&token0+t<M)dst[(size_t)(token0+t)*n_rows+row]=sum[t];}\n"
 "}\n"
 
 "/* ---- matvec_iq3_s_f32: IQ3_S matrix x F32 vector -> F32 ---- */\n"
@@ -4666,7 +6645,7 @@ static const char *hip_kernel_source =
 "                                   int n_rows, int n_cols) {\n"
 "    int warp_id = threadIdx.x / 32;\n"
 "    int lane = threadIdx.x % 32;\n"
-"    int row = blockIdx.x * 8 + warp_id;\n"
+"    int row = blockIdx.x * (blockDim.x / 32) + warp_id;\n"
 "    if (row >= n_rows) return;\n"
 "    int nb = n_cols / 256;\n"
 "    int row_bytes = nb * 110;\n"
@@ -4687,15 +6666,81 @@ static const char *hip_kernel_source =
 "        unsigned char s = bp[74 + sb * 4 + l];\n"
 "        const float *xb = x + b * 256 + sb * 32 + l * 8;\n"
 "        float partial = 0.0f;\n"
-"        for (int j = 0; j < 4; j++) {\n"
-"            partial += db * (float)grid1[j] * ((s & (1 << j)) ? -1.0f : 1.0f) * xb[j];\n"
-"            partial += db * (float)grid2[j] * ((s & (1 << (j+4))) ? -1.0f : 1.0f) * xb[j+4];\n"
-"        }\n"
-"        sum += partial;\n"
+"        partial = fmaf(xb[0], (s & 1)   ? -(float)grid1[0] : (float)grid1[0], partial);\n"
+"        partial = fmaf(xb[1], (s & 2)   ? -(float)grid1[1] : (float)grid1[1], partial);\n"
+"        partial = fmaf(xb[2], (s & 4)   ? -(float)grid1[2] : (float)grid1[2], partial);\n"
+"        partial = fmaf(xb[3], (s & 8)   ? -(float)grid1[3] : (float)grid1[3], partial);\n"
+"        partial = fmaf(xb[4], (s & 16)  ? -(float)grid2[0] : (float)grid2[0], partial);\n"
+"        partial = fmaf(xb[5], (s & 32)  ? -(float)grid2[1] : (float)grid2[1], partial);\n"
+"        partial = fmaf(xb[6], (s & 64)  ? -(float)grid2[2] : (float)grid2[2], partial);\n"
+"        partial = fmaf(xb[7], (s & 128) ? -(float)grid2[3] : (float)grid2[3], partial);\n"
+"        sum = fmaf(db, partial, sum);\n"
 "    }\n"
 "    for (int offset = 16; offset > 0; offset >>= 1)\n"
 "        sum += __shfl_down(sum, offset);\n"
 "    if (lane == 0) dst[row] = sum;\n"
+"}\n"
+"/* IQ3_S F32 reference-order variant.  The normal kernel forms an 8-value\n"
+" * dot and scales the partial once.  llama.cpp's dequantized HIP fallback\n"
+" * instead presents each weight value to the GEMM accumulation; keeping the\n"
+" * scale in the FMA operand is useful for isolating that rounding order. */\n"
+"__global__ void matvec_iq3_s_f32_elem(float *dst, const unsigned char *mat,\n"
+"        const float *x, int n_rows, int n_cols) {\n"
+"    int warp_id = threadIdx.x / 32, lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * (blockDim.x / 32) + warp_id;\n"
+"    if (row >= n_rows) return;\n"
+"    int nb = n_cols / 256, G = nb * 32;\n"
+"    const unsigned char *rp = mat + (size_t)row * nb * 110;\n"
+"    float sum = 0.0f;\n"
+"    for (int g = lane; g < G; g += 32) {\n"
+"        int b = g >> 5, g32 = g & 31, sb = g32 >> 2, l = g32 & 3;\n"
+"        const unsigned char *bp = rp + b * 110;\n"
+"        float db = half_to_float(*(const half_raw *)bp) *\n"
+"                   (float)(1 + 2 * ((sb & 1) ? (bp[106 + (sb >> 1)] >> 4) :\n"
+"                                      (bp[106 + (sb >> 1)] & 0xf)));\n"
+"        unsigned char qh = bp[66 + sb];\n"
+"        unsigned char q0 = bp[2 + sb * 8 + 2 * l];\n"
+"        unsigned char q1 = bp[2 + sb * 8 + 2 * l + 1];\n"
+"        const unsigned char *g0 = (const unsigned char *)&iq3s_grid_dev[\n"
+"            q0 | ((qh << (8 - 2 * l)) & 256)];\n"
+"        const unsigned char *g1 = (const unsigned char *)&iq3s_grid_dev[\n"
+"            q1 | ((qh << (7 - 2 * l)) & 256)];\n"
+"        unsigned char s = bp[74 + sb * 4 + l];\n"
+"        const float *xb = x + b * 256 + sb * 32 + l * 8;\n"
+"        for (int j = 0; j < 4; ++j) {\n"
+"            float w = (s & (1u << j)) ? -(float)g0[j] : (float)g0[j];\n"
+"            sum = fmaf(db * w, xb[j], sum);\n"
+"        }\n"
+"        for (int j = 0; j < 4; ++j) {\n"
+"            float w = (s & (1u << (j + 4))) ? -(float)g1[j] : (float)g1[j];\n"
+"            sum = fmaf(db * w, xb[j + 4], sum);\n"
+"        }\n"
+"    }\n"
+"    for (int offset = 16; offset > 0; offset >>= 1)\n"
+"        sum += __shfl_down(sum, offset);\n"
+"    if (lane == 0) dst[row] = sum;\n"
+"}\n"
+"__global__ void matvec_iq3_s_batch_f32(float *dst, const unsigned char *mat,\n"
+"        const float *x, int n_rows, int n_cols, int M, int x_stride) {\n"
+"    int warp=threadIdx.x/32,lane=threadIdx.x&31,row=blockIdx.x*(blockDim.x/32)+warp,token=blockIdx.y;\n"
+"    if(row>=n_rows||token>=M)return; int nb=n_cols/256,G=nb*32;\n"
+"    const unsigned char *rp=mat+(size_t)row*nb*110; const float *xt=x+(size_t)token*x_stride; float sum=0.0f;\n"
+"    for(int g=lane;g<G;g+=32){int b=g>>5,g32=g&31,sb=g32>>2,l=g32&3; const unsigned char *bp=rp+b*110;\n"
+"        float d=half_to_float(*(const half_raw*)bp); unsigned char sc=bp[106+(sb>>1)];\n"
+"        float db=d*(float)(1+2*((sb&1)?(sc>>4):(sc&15))); unsigned char qh=bp[66+sb];\n"
+"        unsigned char q0=bp[2+sb*8+2*l],q1=bp[2+sb*8+2*l+1];\n"
+"        const unsigned char *g1=(const unsigned char*)&iq3s_grid_dev[q0|((qh<<(8-2*l))&256)];\n"
+"        const unsigned char *g2=(const unsigned char*)&iq3s_grid_dev[q1|((qh<<(7-2*l))&256)]; unsigned char s=bp[74+sb*4+l];\n"
+"        const float *xb=xt+b*256+sb*32+l*8; float p=0.0f;\n"
+"        p=fmaf(xb[0],(s&1)?-(float)g1[0]:(float)g1[0],p);\n"
+"        p=fmaf(xb[1],(s&2)?-(float)g1[1]:(float)g1[1],p);\n"
+"        p=fmaf(xb[2],(s&4)?-(float)g1[2]:(float)g1[2],p);\n"
+"        p=fmaf(xb[3],(s&8)?-(float)g1[3]:(float)g1[3],p);\n"
+"        p=fmaf(xb[4],(s&16)?-(float)g2[0]:(float)g2[0],p);\n"
+"        p=fmaf(xb[5],(s&32)?-(float)g2[1]:(float)g2[1],p);\n"
+"        p=fmaf(xb[6],(s&64)?-(float)g2[2]:(float)g2[2],p);\n"
+"        p=fmaf(xb[7],(s&128)?-(float)g2[3]:(float)g2[3],p); sum+=fmaf(db,p,0.0f);}\n"
+"    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o); if(lane==0)dst[(size_t)token*n_rows+row]=sum;\n"
 "}\n"
 
 "/* ======================================================================== */\n"
@@ -4905,9 +6950,9 @@ static const char *hip_kernel_source =
 "#define IQ3S_DP4A_BODY \\\n"
 "    int nb = n_cols / 256; int row_bytes = nb * 110; \\\n"
 "    const unsigned char *row_ptr = mat + (size_t)row * row_bytes; \\\n"
-"    int G = nb * 16; float sum = 0.0f; \\\n"
+"    int G = nb * 8; float sum = 0.0f; \\\n"
 "    for (int gg = lane; gg < G; gg += 32) { \\\n"
-"        int ibg = gg >> 1; int half = gg & 1; int b = ibg >> 3; int ib32 = ibg & 7; \\\n"
+"        int b = gg >> 3; int ib32 = gg & 7; \\\n"
 "        const unsigned char *bp = row_ptr + b * 110; \\\n"
 "        float dw = half_to_float(*(const half_raw *)bp); \\\n"
 "        unsigned char qh = bp[66 + ib32]; \\\n"
@@ -4918,8 +6963,7 @@ static const char *hip_kernel_source =
 "        const int *u = (const int *)(xq + (size_t)(b * 8 + ib32) * 32); \\\n"
 "        float asc = xs[b * 8 + ib32]; \\\n"
 "        int sumi = 0; \\\n"
-"        for (int t = 0; t < 2; t++) { \\\n"
-"            int l0 = half * 4 + t * 2; \\\n"
+"        for (int l0 = 0; l0 < 8; l0 += 2) { \\\n"
 "            unsigned int gx = iq3s_grid_dev[qsb[l0]   | ((qh << (8 - l0)) & 0x100)]; \\\n"
 "            unsigned int gy = iq3s_grid_dev[qsb[l0+1] | ((qh << (7 - l0)) & 0x100)]; \\\n"
 "            unsigned char sb = sgb[l0 >> 1]; \\\n"
@@ -4936,6 +6980,119 @@ static const char *hip_kernel_source =
 "    int warp_id = threadIdx.x / 32; int lane = threadIdx.x % 32;\n"
 "    int row = blockIdx.x * 8 + warp_id; if (row >= n_rows) return;\n"
 "    IQ3S_DP4A_BODY\n"
+"}\n"
+"/* Single-term Q8_1 IQ3_S path matching llama.cpp's vec_dot_iq3_s_q8_1.\n"
+" * The Q8x2 representation is already staged token-major; consume only q0\n"
+" * here, because llama.cpp's Q8_1 MMQ has one 32-value quantizer term. */\n"
+"__global__ void matvec_iq3_s_q81_batch(float *dst, const unsigned char *mat,\n"
+"        const signed char *q, const float *s, int n_rows, int n_cols, int M) {\n"
+"    int warp = threadIdx.x / 32, lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp, token = blockIdx.y;\n"
+"    if (row >= n_rows || token >= M) return;\n"
+"    int nb = n_cols / 256, G = nb * 8;\n"
+"    const unsigned char *rp = mat + (size_t)row * nb * 110;\n"
+"    const signed char *tq = q + (size_t)token * n_cols;\n"
+"    const float *ts = s + (size_t)token * (n_cols / 32);\n"
+"    float sum = 0.0f;\n"
+"    for (int gg = lane; gg < G; gg += 32) {\n"
+"        int b = gg >> 3, ib = gg & 7;\n"
+"        const unsigned char *bp = rp + b * 110;\n"
+"        float dw = half_to_float(*(const half_raw *)bp);\n"
+"        const unsigned char *qs = bp + 2 + ib * 8;\n"
+"        const unsigned char *sg = bp + 74 + ib * 4;\n"
+"        unsigned char qh = bp[66 + ib], sc = bp[106 + (ib >> 1)];\n"
+"        int ls = (ib & 1) ? ((sc >> 4) & 15) : (sc & 15);\n"
+"        int qb = b * 8 + ib;\n"
+"        const int *u = (const int *)(tq + qb * 32);\n"
+"        int sumi = 0;\n"
+"        for (int l = 0; l < 8; l += 2) {\n"
+"            unsigned int gx = iq3s_grid_dev[qs[l] | ((qh << (8-l)) & 0x100)];\n"
+"            unsigned int gy = iq3s_grid_dev[qs[l+1] | ((qh << (7-l)) & 0x100)];\n"
+"            unsigned char sb = sg[l >> 1];\n"
+"            /* Match llama.cpp: l indexes contiguous 4-byte Q8_1 words. */\n"
+"            sumi = dp4a_hw(apply_sign4(gx, sb, 0), u[l], sumi);\n"
+"            sumi = dp4a_hw(apply_sign4(gy, sb, 4), u[l+1], sumi);\n"
+"        }\n"
+"        sum += dw * ts[qb] * (float)(1 + 2 * ls) * (float)sumi;\n"
+"    }\n"
+"    for (int o = 16; o > 0; o >>= 1) sum += __shfl_down(sum, o);\n"
+"    if (lane == 0) dst[(size_t)token * n_rows + row] = sum;\n"
+"}\n"
+"/* Diagnostic MMVQ replay: integer scale, rounded d*sd, then FMA.\n"
+" * Keep the product boundary explicit: HIPRTC fast-math reassociates the\n"
+" * ordinary expression (including __fmul_rn on the tested toolchain).\n"
+" * For IQ3_S, QI=16/VDR=2 maps to the existing stride-32 Q8 groups. */\n"
+"__global__ void matvec_iq3_s_q81_mmvq_batch(float *dst, const unsigned char *mat,\n"
+"        const signed char *q, const float *s, int n_rows, int n_cols, int M) {\n"
+"    int warp = threadIdx.x / 32, lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * 8 + warp, token = blockIdx.y;\n"
+"    if (row >= n_rows || token >= M) return;\n"
+"    int nb = n_cols / 256, G = nb * 8;\n"
+"    const unsigned char *rp = mat + (size_t)row * nb * 110;\n"
+"    const signed char *tq = q + (size_t)token * n_cols;\n"
+"    const float *ts = s + (size_t)token * (n_cols / 32);\n"
+"    float sum = 0.0f;\n"
+"    for (int gg = lane; gg < G; gg += 32) {\n"
+"        int b = gg >> 3, ib = gg & 7;\n"
+"        const unsigned char *bp = rp + b * 110;\n"
+"        float dw = half_to_float(*(const half_raw *)bp);\n"
+"        const unsigned char *qs = bp + 2 + ib * 8;\n"
+"        const unsigned char *sg = bp + 74 + ib * 4;\n"
+"        unsigned char qh = bp[66 + ib], sc = bp[106 + (ib >> 1)];\n"
+"        int ls = (ib & 1) ? ((sc >> 4) & 15) : (sc & 15);\n"
+"        int qb = b * 8 + ib;\n"
+"        const int *u = (const int *)(tq + qb * 32);\n"
+"        int sumi = 0;\n"
+"        for (int l = 0; l < 8; l += 2) {\n"
+"            unsigned int gx = iq3s_grid_dev[qs[l] | ((qh << (8-l)) & 0x100)];\n"
+"            unsigned int gy = iq3s_grid_dev[qs[l+1] | ((qh << (7-l)) & 0x100)];\n"
+"            unsigned char sb = sg[l >> 1];\n"
+"            /* Match llama.cpp: l indexes contiguous 4-byte Q8_1 words. */\n"
+"            sumi = dp4a_hw(apply_sign4(gx, sb, 0), u[l], sumi);\n"
+"            sumi = dp4a_hw(apply_sign4(gy, sb, 4), u[l+1], sumi);\n"
+"        }\n"
+"        float ds; asm volatile(\"v_mul_f32 %0, %1, %2\" : \"=v\"(ds) : \"v\"(dw), \"v\"(ts[qb]));\n"
+"        float scaled = (float)((1 + 2 * ls) * sumi);\n"
+"        asm volatile(\"v_fma_f32 %0, %1, %2, %0\" : \"+v\"(sum) : \"v\"(ds), \"v\"(scaled));\n"
+"    }\n"
+"    for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor(sum, o);\n"
+"    if (lane == 0) dst[(size_t)token * n_rows + row] = sum;\n"
+"}\n"
+"__global__ void matvec_iq3_s_dp4a2(float *dst, const unsigned char *mat,\n"
+"        const signed char *q0, const float *s0, const signed char *q1,\n"
+"        const float *s1, int n_rows, int n_cols) {\n"
+"    int warp = threadIdx.x / 32, lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * (blockDim.x / 32) + warp;\n"
+"    if (row >= n_rows) return;\n"
+"    int nb = n_cols / 256, row_bytes = nb * 110, G = nb * 16;\n"
+"    const unsigned char *rp = mat + (size_t)row * row_bytes;\n"
+"    float sum = 0.0f;\n"
+"    for (int gg = lane; gg < G; gg += 32) {\n"
+"        int ibg = gg >> 1, half = gg & 1, b = ibg >> 3, ib = ibg & 7;\n"
+"        const unsigned char *bp = rp + b * 110;\n"
+"        float dw = half_to_float(*(const half_raw *)bp);\n"
+"        const unsigned char *qs = bp + 2 + ib * 8;\n"
+"        const unsigned char *sg = bp + 74 + ib * 4;\n"
+"        unsigned char qh = bp[66 + ib], sc = bp[106 + (ib >> 1)];\n"
+"        int ls = (ib & 1) ? ((sc >> 4) & 15) : (sc & 15);\n"
+"        int qb = b * 8 + ib;\n"
+"        const int *u0 = (const int *)(q0 + (size_t)qb * 32);\n"
+"        const int *u1 = (const int *)(q1 + (size_t)qb * 32);\n"
+"        int z0 = 0, z1 = 0;\n"
+"        for (int t = 0; t < 2; ++t) {\n"
+"            int l = half * 4 + t * 2;\n"
+"            unsigned int gx = iq3s_grid_dev[qs[l] | ((qh << (8-l)) & 0x100)];\n"
+"            unsigned int gy = iq3s_grid_dev[qs[l+1] | ((qh << (7-l)) & 0x100)];\n"
+"            unsigned char sb = sg[l >> 1];\n"
+"            int w0 = apply_sign4(gx, sb, 0), w1 = apply_sign4(gy, sb, 4);\n"
+"            z0 = dp4a_hw(w0, u0[l], z0); z0 = dp4a_hw(w1, u0[l+1], z0);\n"
+"            z1 = dp4a_hw(w0, u1[l], z1); z1 = dp4a_hw(w1, u1[l+1], z1);\n"
+"        }\n"
+"        float act_dot = s0[qb] * (float)z0 + s1[qb] * (float)z1;\n"
+"        sum += dw * (float)(1 + 2*ls) * act_dot;\n"
+"    }\n"
+"    for (int o = 16; o > 0; o >>= 1) sum += __shfl_down(sum, o);\n"
+"    if (lane == 0) dst[row] = sum;\n"
 "}\n"
 "__global__ void matvec_iq3_s_expert_dp4a(float *dst, const unsigned char *base,\n"
 "                                         const signed char *xq, const float *xs,\n"
@@ -4978,15 +7135,411 @@ static const char *hip_kernel_source =
 "                                  const signed char *xq, const float *xs,\n"
 "                                  int n_rows, int n_cols) {\n"
 "    int warp_id = threadIdx.x / 32; int lane = threadIdx.x % 32;\n"
-"    int row = blockIdx.x * 8 + warp_id; if (row >= n_rows) return;\n"
+"    int row = blockIdx.x * (blockDim.x / 32) + warp_id; if (row >= n_rows) return;\n"
 "    IQ2S_DP4A_BODY\n"
+"}\n"
+"__global__ void matvec_iq2_s_dp4a2(float *dst, const unsigned char *mat,\n"
+"        const signed char *q0, const float *s0, const signed char *q1,\n"
+"        const float *s1, int n_rows, int n_cols) {\n"
+"    int warp = threadIdx.x / 32, lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * (blockDim.x / 32) + warp;\n"
+"    if (row >= n_rows) return;\n"
+"    int nb = n_cols / 256, row_bytes = nb * 82, G = nb * 16;\n"
+"    const unsigned char *rp = mat + (size_t)row * row_bytes;\n"
+"    float sum = 0.0f;\n"
+"    for (int gg = lane; gg < G; gg += 32) {\n"
+"        int ibg = gg >> 1, half = gg & 1, b = ibg >> 3, ib = ibg & 7;\n"
+"        const unsigned char *bp = rp + b * 82;\n"
+"        float dw = half_to_float(*(const half_raw *)bp);\n"
+"        const unsigned char *qs = bp + 2 + ib * 4;\n"
+"        const unsigned char *sg = bp + 34 + ib * 4;\n"
+"        unsigned char qh = bp[66 + ib], sc = bp[74 + ib];\n"
+"        int ls = half ? (sc >> 4) : (sc & 15);\n"
+"        int qb = b * 8 + ib;\n"
+"        const int *u0 = (const int *)(q0 + (size_t)qb * 32);\n"
+"        const int *u1 = (const int *)(q1 + (size_t)qb * 32);\n"
+"        int z0 = 0, z1 = 0;\n"
+"        for (int t = 0; t < 2; ++t) {\n"
+"            int l = half * 2 + t;\n"
+"            int idx = qs[l] | ((qh << (8 - 2*l)) & 0x300);\n"
+"            const int *gp = (const int *)&iq2s_grid_dev[idx];\n"
+"            int w0 = apply_sign4(gp[0], sg[l], 0);\n"
+"            int w1 = apply_sign4(gp[1], sg[l], 4);\n"
+"            z0 = dp4a_hw(w0, u0[l*2], z0); z0 = dp4a_hw(w1, u0[l*2+1], z0);\n"
+"            z1 = dp4a_hw(w0, u1[l*2], z1); z1 = dp4a_hw(w1, u1[l*2+1], z1);\n"
+"        }\n"
+"        float act_dot = s0[qb] * (float)z0 + s1[qb] * (float)z1;\n"
+"        sum += dw * 0.25f * ((float)ls + 0.5f) * act_dot;\n"
+"    }\n"
+"    for (int o = 16; o > 0; o >>= 1) sum += __shfl_down(sum, o);\n"
+"    if (lane == 0) dst[row] = sum;\n"
+"}\n"
+"__global__ void matvec_iq2_xxs_dp4a2(float *dst, const unsigned char *mat,\n"
+"        const signed char *q0, const float *s0, const signed char *q1,\n"
+"        const float *s1, int n_rows, int n_cols) {\n"
+"    int warp = threadIdx.x / 32, lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * (blockDim.x / 32) + warp;\n"
+"    if (row >= n_rows) return;\n"
+"    int nb = n_cols / 256, row_bytes = nb * 66, G = nb * 8;\n"
+"    const unsigned char *rp = mat + (size_t)row * row_bytes;\n"
+"    float sum = 0.0f;\n"
+"    for (int qb = lane; qb < G; qb += 32) {\n"
+"        int b = qb >> 3, ib = qb & 7;\n"
+"        const unsigned char *bp = rp + b * 66;\n"
+"        float d = half_to_float(*(const half_raw *)bp);\n"
+"        const unsigned short *qs = (const unsigned short *)(bp + 2);\n"
+"        unsigned int a0 = qs[4*ib] | ((unsigned int)qs[4*ib+1] << 16);\n"
+"        unsigned int a1 = qs[4*ib+2] | ((unsigned int)qs[4*ib+3] << 16);\n"
+"        const int *u0 = (const int *)(q0 + (size_t)qb * 32);\n"
+"        const int *u1 = (const int *)(q1 + (size_t)qb * 32);\n"
+"        int z0 = 0, z1 = 0;\n"
+"        for (int l = 0; l < 4; ++l) {\n"
+"            unsigned long long gv = iq2xxs_grid_dev[(a0 >> (8*l)) & 255];\n"
+"            unsigned char sb = ksigns_iq2xs_dev[(a1 >> (7*l)) & 127];\n"
+"            int w0 = apply_sign4((unsigned int)gv, sb, 0);\n"
+"            int w1 = apply_sign4((unsigned int)(gv >> 32), sb, 4);\n"
+"            z0 = dp4a_hw(w0, u0[l*2], z0); z0 = dp4a_hw(w1, u0[l*2+1], z0);\n"
+"            z1 = dp4a_hw(w0, u1[l*2], z1); z1 = dp4a_hw(w1, u1[l*2+1], z1);\n"
+"        }\n"
+"        float ad = s0[qb] * (float)z0 + s1[qb] * (float)z1;\n"
+"        sum += d * (0.5f + (float)(a1 >> 28)) * 0.25f * ad;\n"
+"    }\n"
+"    for (int o = 16; o > 0; o >>= 1) sum += __shfl_down(sum, o);\n"
+"    if (lane == 0) dst[row] = sum;\n"
+"}\n"
+"__global__ void matvec_iq3_xxs_dp4a2(float *dst, const unsigned char *mat,\n"
+"        const signed char *q0, const float *s0, const signed char *q1,\n"
+"        const float *s1, int n_rows, int n_cols) {\n"
+"    int warp = threadIdx.x / 32, lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * (blockDim.x / 32) + warp;\n"
+"    if (row >= n_rows) return;\n"
+"    int nb = n_cols / 256, row_bytes = nb * 98, G = nb * 8;\n"
+"    const unsigned char *rp = mat + (size_t)row * row_bytes;\n"
+"    float sum = 0.0f;\n"
+"    for (int qb = lane; qb < G; qb += 32) {\n"
+"        int b = qb >> 3, sb = qb & 7;\n"
+"        const unsigned char *bp = rp + b * 98;\n"
+"        float d = half_to_float(*(const half_raw *)bp);\n"
+"        const unsigned char *qs = bp + 2;\n"
+"        unsigned int aux = __builtin_nontemporal_load((const unsigned int *)(bp + 66 + 4*sb));\n"
+"        const int *u0 = (const int *)(q0 + (size_t)qb * 32);\n"
+"        const int *u1 = (const int *)(q1 + (size_t)qb * 32);\n"
+"        int z0 = 0, z1 = 0;\n"
+"        for (int l = 0; l < 4; ++l) {\n"
+"            unsigned char sg = ksigns_iq2xs_dev[(aux >> (7*l)) & 127];\n"
+"            int w0 = apply_sign4(iq3xxs_grid_dev[qs[8*sb+2*l]], sg, 0);\n"
+"            int w1 = apply_sign4(iq3xxs_grid_dev[qs[8*sb+2*l+1]], sg, 4);\n"
+"            z0 = dp4a_hw(w0, u0[2*l], z0); z0 = dp4a_hw(w1, u0[2*l+1], z0);\n"
+"            z1 = dp4a_hw(w0, u1[2*l], z1); z1 = dp4a_hw(w1, u1[2*l+1], z1);\n"
+"        }\n"
+"        float ad = s0[qb] * (float)z0 + s1[qb] * (float)z1;\n"
+"        sum += d * (0.5f + (float)(aux >> 28)) * 0.5f * ad;\n"
+"    }\n"
+"    for (int o = 16; o > 0; o >>= 1) sum += __shfl_down(sum, o);\n"
+"    if (lane == 0) dst[row] = sum;\n"
+"}\n"
+"__global__ void matvec_iq3_xxs_dp4a2_batch(float *dst, const unsigned char *mat,\n"
+"        const signed char *q0, const float *s0, const signed char *q1,\n"
+"        const float *s1, int n_rows, int n_cols, int M) {\n"
+"    int warp = threadIdx.x / 32, lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * (blockDim.x / 32) + warp, token = blockIdx.y;\n"
+"    if (row >= n_rows || token >= M) return;\n"
+"    int nb = n_cols / 256, G = nb * 8;\n"
+"    const unsigned char *rp = mat + (size_t)row * nb * 98;\n"
+"    const signed char *tq0 = q0 + (size_t)token * n_cols;\n"
+"    const signed char *tq1 = q1 + (size_t)token * n_cols;\n"
+"    const float *ts0 = s0 + (size_t)token * (n_cols / 32);\n"
+"    const float *ts1 = s1 + (size_t)token * (n_cols / 32);\n"
+"    float sum = 0.0f;\n"
+"    for (int qb = lane; qb < G; qb += 32) {\n"
+"        int b = qb >> 3, sb = qb & 7;\n"
+"        const unsigned char *bp = rp + b * 98;\n"
+"        float d = half_to_float(*(const half_raw *)bp);\n"
+"        const unsigned char *qs = bp + 2;\n"
+"        unsigned int aux = __builtin_nontemporal_load((const unsigned int *)(bp + 66 + 4*sb));\n"
+"        const int *u0 = (const int *)(tq0 + (size_t)qb * 32);\n"
+"        const int *u1 = (const int *)(tq1 + (size_t)qb * 32);\n"
+"        int z0 = 0, z1 = 0;\n"
+"        for (int l = 0; l < 4; ++l) {\n"
+"            unsigned char sg = ksigns_iq2xs_dev[(aux >> (7*l)) & 127];\n"
+"            int w0 = apply_sign4(iq3xxs_grid_dev[qs[8*sb+2*l]], sg, 0);\n"
+"            int w1 = apply_sign4(iq3xxs_grid_dev[qs[8*sb+2*l+1]], sg, 4);\n"
+"            z0 = dp4a_hw(w0, u0[2*l], z0); z0 = dp4a_hw(w1, u0[2*l+1], z0);\n"
+"            z1 = dp4a_hw(w0, u1[2*l], z1); z1 = dp4a_hw(w1, u1[2*l+1], z1);\n"
+"        }\n"
+"        float ad = ts0[qb] * (float)z0 + ts1[qb] * (float)z1;\n"
+"        sum += d * (0.5f + (float)(aux >> 28)) * 0.5f * ad;\n"
+"    }\n"
+"    for (int o = 16; o > 0; o >>= 1) sum += __shfl_down(sum, o);\n"
+"    if (lane == 0) dst[(size_t)token * n_rows + row] = sum;\n"
+"}\n"
+"/* Single-term llama.cpp Q8_1 path for IQ2_S. */\n"
+"__global__ void matvec_iq2_s_q81_batch(float *dst, const unsigned char *mat,\n"
+"        const signed char *q, const float *s, int n_rows, int n_cols, int M) {\n"
+"    int warp=threadIdx.x/32,lane=threadIdx.x&31,row=blockIdx.x*8+warp,token=blockIdx.y;\n"
+"    if(row>=n_rows||token>=M)return; int nb=n_cols/256,G=nb*16;\n"
+"    const unsigned char *rp=mat+(size_t)row*nb*82; const signed char *tq=q+(size_t)token*n_cols;\n"
+"    const float *ts=s+(size_t)token*(n_cols/32); float sum=0.0f;\n"
+"    for(int gg=lane;gg<G;gg+=32){\n"
+"        /* Match llama.cpp's IQ2_S Q8_1 reduction: combine the two\n"
+"         * scale-nibble halves in integer space before the /4 truncation.\n"
+"         * Applying each dot as an independent FP32 term changes the\n"
+"         * accumulated Qwen3.5 FFN result. */\n"
+"        int ibg=gg>>1,half=gg&1; if(half) continue;\n"
+"        int b=ibg>>3,ib=ibg&7;\n"
+"        const unsigned char *bp=rp+b*82; float d=half_to_float(*(const half_raw*)bp);\n"
+"        const unsigned char *qs=bp+2+ib*4,*sg=bp+34+ib*4; unsigned char qh=bp[66+ib],sc=bp[74+ib];\n"
+"        const int *u=(const int *)(tq+(size_t)(b*8+ib)*32); int z0=0,z1=0;\n"
+"        for(int ll=0;ll<4;ll++){int idx=qs[ll]|((qh<<(8-2*ll))&0x300);\n"
+"            const int *gp=(const int *)&iq2s_grid_dev[idx];\n"
+"            int w0=apply_sign4(gp[0],sg[ll],0),w1=apply_sign4(gp[1],sg[ll],4);\n"
+"            int z=dp4a_hw(w0,u[ll*2],0); z=dp4a_hw(w1,u[ll*2+1],z);\n"
+"            if(ll<2) z0+=z; else z1+=z;}\n"
+"        int ls0=(int)(sc&15),ls1=(int)(sc>>4);\n"
+"        int sumi=(z0*ls0+z1*ls1+(z0+z1)/2)/4;\n"
+"        sum+=d*ts[b*8+ib]*(float)sumi;\n"
+"    }\n"
+"    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o); if(lane==0)dst[(size_t)token*n_rows+row]=sum;\n"
+"}\n"
+"/* Single-term llama.cpp Q8_1 path for IQ3_XXS. */\n"
+"__device__ __forceinline__ void iq3_xxs_q81_body(float *dst, const unsigned char *mat,\n"
+"        const signed char *q, const float *s, int n_rows, int n_cols, int M, int mmq) {\n"
+"    int warp=threadIdx.x/32,lane=threadIdx.x&31,row=blockIdx.x*8+warp,token=blockIdx.y;\n"
+"    if(row>=n_rows||token>=M)return; int nb=n_cols/256,G=nb*8;\n"
+"    const unsigned char *rp=mat+(size_t)row*nb*98; const signed char *tq=q+(size_t)token*n_cols;\n"
+"    const float *ts=s+(size_t)token*(n_cols/32); float sum=0.0f;\n"
+"    for(int qb=lane;qb<G;qb+=32){int b=qb>>3,sb=qb&7; const unsigned char *bp=rp+b*98;\n"
+"        float d=half_to_float(*(const half_raw*)bp); const unsigned char *qs=bp+2;\n"
+"        unsigned int aux=*(const unsigned int *)(bp+66+4*sb); const int *u=(const int *)(tq+(size_t)qb*32);\n"
+"        /* Match llama.cpp: apply the IQ3 high scale correction to the\n"
+"         * integer dot, including C integer truncation. */\n"
+"        int ls=(int)(aux>>28), zsum=0;\n"
+"        for(int l=0;l<4;l++){unsigned char sg=ksigns_iq2xs_dev[(aux>>(7*l))&127];\n"
+"            int w0=apply_sign4(iq3xxs_grid_dev[qs[8*sb+2*l]],sg,0);\n"
+"            int w1=apply_sign4(iq3xxs_grid_dev[qs[8*sb+2*l+1]],sg,4);\n"
+"            int z=dp4a_hw(w0,u[2*l],0); z=dp4a_hw(w1,u[2*l+1],z);\n"
+"            /* Match llama.cpp: accumulate all 32 values before applying\n"
+"             * its integer scale correction, including C truncation. */\n"
+"            zsum += z;}\n"
+"        if (mmq) {\n"
+"            /* llama.cpp MMQ keeps this scale in FP32 and applies it after\n"
+"             * the complete integer dot; MMVQ truncates the integer result. */\n"
+"            float fs=(ls*d+d*0.5f)*0.5f;\n"
+"            sum+=fs*ts[qb]*(float)zsum;\n"
+"        } else {\n"
+"            int zi=(ls*zsum+zsum/2)/2;\n"
+"            sum+=d*ts[qb]*(float)zi;\n"
+"        }\n"
+"    }\n"
+"    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o); if(lane==0)dst[(size_t)token*n_rows+row]=sum;\n"
+"}\n"
+"__global__ void matvec_iq3_xxs_q81_batch(float *dst,const unsigned char *mat,\n"
+"        const signed char *q,const float *s,int n_rows,int n_cols,int M){\n"
+"    iq3_xxs_q81_body(dst,mat,q,s,n_rows,n_cols,M,0);\n"
+"}\n"
+"__global__ void matvec_iq3_xxs_mmq_scales(float *dst,const unsigned char *mat,\n"
+"        const signed char *q,const float *s,int n_rows,int n_cols,int M){\n"
+"    iq3_xxs_q81_body(dst,mat,q,s,n_rows,n_cols,M,1);\n"
+"}\n"
+"__global__ void matvec_iq3_xxs_dp4a2_batch_reuse4(float *dst, const unsigned char *mat,\n"
+"        const signed char *q0, const float *s0, const signed char *q1,\n"
+"        const float *s1, int n_rows, int n_cols, int M) {\n"
+"    int warp = threadIdx.x / 32, lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * (blockDim.x / 32) + warp, token0 = blockIdx.y * 4;\n"
+"    if (row >= n_rows) return;\n"
+"    int nb = n_cols / 256, G = nb * 8;\n"
+"    const unsigned char *rp = mat + (size_t)row * nb * 98;\n"
+"    float sum[4] = { 0, 0, 0, 0 };\n"
+"    for (int qb = lane; qb < G; qb += 32) {\n"
+"        int b = qb >> 3, sb = qb & 7;\n"
+"        const unsigned char *bp = rp + b * 98;\n"
+"        float d = half_to_float(*(const half_raw *)bp);\n"
+"        const unsigned char *qs = bp + 2;\n"
+"        unsigned int aux = __builtin_nontemporal_load((const unsigned int *)(bp + 66 + 4*sb));\n"
+"        int w0[4], w1[4];\n"
+"        for (int l = 0; l < 4; ++l) {\n"
+"            unsigned char sg = ksigns_iq2xs_dev[(aux >> (7*l)) & 127];\n"
+"            w0[l] = apply_sign4(iq3xxs_grid_dev[qs[8*sb+2*l]], sg, 0);\n"
+"            w1[l] = apply_sign4(iq3xxs_grid_dev[qs[8*sb+2*l+1]], sg, 4);\n"
+"        }\n"
+"        float dw = d * (0.5f + (float)(aux >> 28)) * 0.5f;\n"
+"        for (int t = 0; t < 4; ++t) {\n"
+"            int token = token0 + t;\n"
+"            if (token < M) {\n"
+"                const signed char *tq0 = q0 + (size_t)token * n_cols;\n"
+"                const signed char *tq1 = q1 + (size_t)token * n_cols;\n"
+"                const float *ts0 = s0 + (size_t)token * (n_cols / 32);\n"
+"                const float *ts1 = s1 + (size_t)token * (n_cols / 32);\n"
+"                const int *u0 = (const int *)(tq0 + (size_t)qb * 32);\n"
+"                const int *u1 = (const int *)(tq1 + (size_t)qb * 32);\n"
+"                int z0 = 0, z1 = 0;\n"
+"                for (int l = 0; l < 4; ++l) {\n"
+"                    z0 = dp4a_hw(w0[l], u0[2*l], z0); z0 = dp4a_hw(w1[l], u0[2*l+1], z0);\n"
+"                    z1 = dp4a_hw(w0[l], u1[2*l], z1); z1 = dp4a_hw(w1[l], u1[2*l+1], z1);\n"
+"                }\n"
+"                int scale_i = qb;\n"
+"                sum[t] += dw * (ts0[scale_i] * (float)z0 + ts1[scale_i] * (float)z1);\n"
+"            }\n"
+"        }\n"
+"    }\n"
+"    for (int t = 0; t < 4; ++t) {\n"
+"        for (int o = 16; o > 0; o >>= 1) sum[t] += __shfl_down(sum[t], o);\n"
+"        if (lane == 0 && token0 + t < M) dst[(size_t)(token0 + t) * n_rows + row] = sum[t];\n"
+"    }\n"
+"}\n"
+"__global__ void matvec_iq3_s_dp4a2_batch(float *dst, const unsigned char *mat,\n"
+"        const signed char *q0, const float *s0, const signed char *q1,\n"
+"        const float *s1, int n_rows, int n_cols, int M) {\n"
+"    int warp=threadIdx.x>>5,lane=threadIdx.x&31,row=blockIdx.x*8+warp,token=blockIdx.y;\n"
+"    if(row>=n_rows||token>=M)return; int nb=n_cols/256,G=nb*16; const unsigned char *rp=mat+(size_t)row*nb*110;\n"
+"    const signed char *tq0=q0+(size_t)token*n_cols,*tq1=q1+(size_t)token*n_cols;\n"
+"    const float *ts0=s0+(size_t)token*(n_cols/32),*ts1=s1+(size_t)token*(n_cols/32); float sum=0;\n"
+"    for(int gg=lane;gg<G;gg+=32){int ibg=gg>>1,half=gg&1,b=ibg>>3,ib=ibg&7; const unsigned char *bp=rp+b*110;\n"
+"        float dw=half_to_float(*(const half_raw*)bp); const unsigned char *qs=bp+2+ib*8,*sg=bp+74+ib*4;\n"
+"        unsigned char qh=bp[66+ib],sc=bp[106+(ib>>1)]; int ls=(ib&1)?((sc>>4)&15):(sc&15),qb=b*8+ib;\n"
+"        const int *u0=(const int*)(tq0+(size_t)qb*32),*u1=(const int*)(tq1+(size_t)qb*32); int z0=0,z1=0;\n"
+"        for(int t=0;t<2;t++){int l=half*4+t*2; unsigned int gx=iq3s_grid_dev[qs[l]|((qh<<(8-l))&0x100)],gy=iq3s_grid_dev[qs[l+1]|((qh<<(7-l))&0x100)]; unsigned char sb=sg[l>>1];\n"
+"            int w0=apply_sign4(gx,sb,0),w1=apply_sign4(gy,sb,4); z0=dp4a_hw(w0,u0[l],z0);z0=dp4a_hw(w1,u0[l+1],z0);z1=dp4a_hw(w0,u1[l],z1);z1=dp4a_hw(w1,u1[l+1],z1);}\n"
+"        sum+=dw*(float)(1+2*ls)*(ts0[qb]*(float)z0+ts1[qb]*(float)z1);}\n"
+"    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o); if(lane==0)dst[(size_t)token*n_rows+row]=sum;\n"
+"}\n"
+"__global__ void matvec_iq3_s_dp4a2_batch_reuse4(float *dst, const unsigned char *mat,\n"
+"        const signed char *q0, const float *s0, const signed char *q1,\n"
+"        const float *s1, int n_rows, int n_cols, int M) {\n"
+"    int warp=threadIdx.x>>5,lane=threadIdx.x&31,row=blockIdx.x*8+warp,token0=blockIdx.y*4;\n"
+"    if(row>=n_rows)return; int nb=n_cols/256,G=nb*16;\n"
+"    const unsigned char *rp=mat+(size_t)row*nb*110; float sum[4]={0,0,0,0};\n"
+"    for(int gg=lane;gg<G;gg+=32){int ibg=gg>>1,half=gg&1,b=ibg>>3,ib=ibg&7; const unsigned char *bp=rp+b*110;\n"
+"        float dw=half_to_float(*(const half_raw*)bp); const unsigned char *qs=bp+2+ib*8,*sg=bp+74+ib*4;\n"
+"        unsigned char qh=bp[66+ib],sc=bp[106+(ib>>1)]; int ls=(ib&1)?((sc>>4)&15):(sc&15),qb=b*8+ib;\n"
+"        for(int t=0;t<4;t++){int token=token0+t;if(token<M){const signed char *tq0=q0+(size_t)token*n_cols,*tq1=q1+(size_t)token*n_cols;\n"
+"            const float *ts0=s0+(size_t)token*(n_cols/32),*ts1=s1+(size_t)token*(n_cols/32); int z0=0,z1=0;\n"
+"            for(int u=0;u<2;u++){int l=half*4+u*2; unsigned int gx=iq3s_grid_dev[qs[l]|((qh<<(8-l))&0x100)],gy=iq3s_grid_dev[qs[l+1]|((qh<<(7-l))&0x100)]; unsigned char sb=sg[l>>1];\n"
+"                int w0=apply_sign4(gx,sb,0),w1=apply_sign4(gy,sb,4); const int *u0=(const int*)(tq0+(size_t)qb*32),*u1=(const int*)(tq1+(size_t)qb*32);\n"
+"                z0=dp4a_hw(w0,u0[l],z0);z0=dp4a_hw(w1,u0[l+1],z0);z1=dp4a_hw(w0,u1[l],z1);z1=dp4a_hw(w1,u1[l+1],z1);}\n"
+"            sum[t]+=dw*(float)(1+2*ls)*(ts0[qb]*(float)z0+ts1[qb]*(float)z1);}}\n"
+"    }\n"
+"    for(int t=0;t<4;t++){for(int o=16;o>0;o>>=1)sum[t]+=__shfl_down(sum[t],o);if(lane==0&&token0+t<M)dst[(size_t)(token0+t)*n_rows+row]=sum[t];}\n"
+"}\n"
+"__global__ void matvec_iq2_xs_dp4a2(float *dst, const unsigned char *mat,\n"
+"        const signed char *q0, const float *s0, const signed char *q1,\n"
+"        const float *s1, int n_rows, int n_cols) {\n"
+"    int warp = threadIdx.x / 32, lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * (blockDim.x / 32) + warp;\n"
+"    if (row >= n_rows) return;\n"
+"    int nb = n_cols / 256, row_bytes = nb * 74, G = nb * 8;\n"
+"    const unsigned char *rp = mat + (size_t)row * row_bytes;\n"
+"    float sum = 0.0f;\n"
+"    for (int qb = lane; qb < G; qb += 32) {\n"
+"        int b = qb >> 3, ib = qb & 7;\n"
+"        const unsigned char *bp = rp + b * 74;\n"
+"        float d = half_to_float(*(const half_raw *)bp);\n"
+"        const unsigned short *qs = (const unsigned short *)(bp + 2);\n"
+"        unsigned char sc = bp[66 + ib];\n"
+"        const int *u0 = (const int *)(q0 + (size_t)qb * 32);\n"
+"        const int *u1 = (const int *)(q1 + (size_t)qb * 32);\n"
+"        float block_sum = 0.0f;\n"
+"        for (int l = 0; l < 4; ++l) {\n"
+"            unsigned short qv = qs[4*ib+l];\n"
+"            unsigned long long gv = iq2xs_grid_dev[qv & 511];\n"
+"            unsigned char sb = ksigns_iq2xs_dev[qv >> 9];\n"
+"            int w0 = apply_sign4((unsigned int)gv, sb, 0);\n"
+"            int w1 = apply_sign4((unsigned int)(gv >> 32), sb, 4);\n"
+"            int z0 = dp4a_hw(w0, u0[l*2], 0); z0 = dp4a_hw(w1, u0[l*2+1], z0);\n"
+"            int z1 = dp4a_hw(w0, u1[l*2], 0); z1 = dp4a_hw(w1, u1[l*2+1], z1);\n"
+"            float ls = 0.5f + (float)(l < 2 ? (sc & 15) : (sc >> 4));\n"
+"            block_sum += ls * (s0[qb] * (float)z0 + s1[qb] * (float)z1);\n"
+"        }\n"
+"        sum += d * 0.25f * block_sum;\n"
+"    }\n"
+"    for (int o = 16; o > 0; o >>= 1) sum += __shfl_down(sum, o);\n"
+"    if (lane == 0) dst[row] = sum;\n"
+"}\n"
+"__global__ void matvec_iq2_xs_dp4a2_batch(float *dst, const unsigned char *mat,\n"
+"        const signed char *q0, const float *s0, const signed char *q1,\n"
+"        const float *s1, int n_rows, int n_cols, int M) {\n"
+"    int warp=threadIdx.x/32,lane=threadIdx.x&31,row=blockIdx.x*8+warp,token=blockIdx.y;\n"
+"    if(row>=n_rows || token>=M)return;\n"
+"    int nb=n_cols/256,G=nb*8; const unsigned char *rp=mat+(size_t)row*nb*74;\n"
+"    const signed char *tq0=q0+(size_t)token*n_cols, *tq1=q1+(size_t)token*n_cols;\n"
+"    const float *ts0=s0+(size_t)token*(n_cols/32), *ts1=s1+(size_t)token*(n_cols/32);\n"
+"    float sum=0.0f;\n"
+"    for(int qb=lane;qb<G;qb+=32){int b=qb>>3,ib=qb&7; const unsigned char *bp=rp+b*74;\n"
+"        float d=half_to_float(*(const half_raw*)bp); const unsigned short *qs=(const unsigned short*)(bp+2);\n"
+"        unsigned char sc=bp[66+ib]; const int *u0=(const int*)(tq0+qb*32), *u1=(const int*)(tq1+qb*32); float bs=0.0f;\n"
+"        for(int l=0;l<4;l++){unsigned short qv=qs[4*ib+l]; unsigned long long gv=iq2xs_grid_dev[qv&511];\n"
+"            unsigned char sb=ksigns_iq2xs_dev[qv>>9]; int w0=apply_sign4((unsigned int)gv,sb,0), w1=apply_sign4((unsigned int)(gv>>32),sb,4);\n"
+"            int z0=dp4a_hw(w0,u0[l*2],0); z0=dp4a_hw(w1,u0[l*2+1],z0); int z1=dp4a_hw(w0,u1[l*2],0); z1=dp4a_hw(w1,u1[l*2+1],z1);\n"
+"            float ls=0.5f+(float)(l<2?(sc&15):(sc>>4)); bs+=ls*(ts0[qb]*(float)z0+ts1[qb]*(float)z1);}\n"
+"        sum+=d*0.25f*bs; }\n"
+"    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o); if(lane==0)dst[(size_t)token*n_rows+row]=sum;\n"
+"}\n"
+"/* IQ2_XS MMQ-style reuse: one warp computes four prompt rows for the same\n"
+" * output row, keeping the decoded IQ2 block in registers across tokens. */\n"
+"__global__ void matvec_iq2_xs_dp4a2_batch_reuse4(float *dst, const unsigned char *mat,\n"
+"        const signed char *q0, const float *s0, const signed char *q1,\n"
+"        const float *s1, int n_rows, int n_cols, int M) {\n"
+"    int warp=threadIdx.x>>5,lane=threadIdx.x&31,row=blockIdx.x*8+warp,token0=blockIdx.y*4;\n"
+"    if(row>=n_rows)return; int nb=n_cols/256,G=nb*8; const unsigned char *rp=mat+(size_t)row*nb*74; float sum[4]={0,0,0,0};\n"
+"    for(int qb=lane;qb<G;qb+=32){int b=qb>>3,ib=qb&7; const unsigned char *bp=rp+b*74;\n"
+"        float d=half_to_float(*(const half_raw*)bp); const unsigned short *qs=(const unsigned short*)(bp+2); unsigned char sc=bp[66+ib];\n"
+"        for(int t=0;t<4;t++){int token=token0+t;if(token<M){const int *u0=(const int*)(q0+(size_t)token*n_cols+qb*32),*u1=(const int*)(q1+(size_t)token*n_cols+qb*32);\n"
+"            float bs=0; for(int l=0;l<4;l++){unsigned short qv=qs[4*ib+l]; unsigned long long gv=iq2xs_grid_dev[qv&511]; unsigned char sb=ksigns_iq2xs_dev[qv>>9];\n"
+"                int w0=apply_sign4((unsigned int)gv,sb,0),w1=apply_sign4((unsigned int)(gv>>32),sb,4);\n"
+"                int z0=dp4a_hw(w0,u0[l*2],0);z0=dp4a_hw(w1,u0[l*2+1],z0); int z1=dp4a_hw(w0,u1[l*2],0);z1=dp4a_hw(w1,u1[l*2+1],z1);\n"
+"                float ls=0.5f+(float)(l<2?(sc&15):(sc>>4)); bs+=ls*(s0[(size_t)token*(n_cols/32)+qb]*(float)z0+s1[(size_t)token*(n_cols/32)+qb]*(float)z1);}\n"
+"            sum[t]+=d*0.25f*bs;}}\n"
+"    }\n"
+"    for(int t=0;t<4;t++){for(int o=16;o>0;o>>=1)sum[t]+=__shfl_down(sum[t],o);if(lane==0&&token0+t<M)dst[(size_t)(token0+t)*n_rows+row]=sum[t];}\n"
+"}\n"
+"__global__ void matvec_iq2_xs_dp4a2_batch_tile(float *dst, const unsigned char *mat,\n"
+"        const signed char *q0, const float *s0, const signed char *q1,\n"
+"        const float *s1, int n_rows, int n_cols, int M) {\n"
+"    /* Four rows by two tokens per block.  The IQ2 block and Q8 activation\n"
+"     * tile are staged once and then consumed by the eight row/token warps. */\n"
+"    __shared__ unsigned char wt[4][74];\n"
+"    __shared__ signed char aq0[2][256], aq1[2][256];\n"
+"    __shared__ float as0[2][32], as1[2][32];\n"
+"    int tid=threadIdx.x, warp=tid>>5, lane=tid&31;\n"
+"    int row=blockIdx.x*4+(warp>>1), token=blockIdx.y*2+(warp&1);\n"
+"    int active=row<n_rows && token<M, nb=n_cols/256; float sum=0.0f;\n"
+"    for(int b=0;b<nb;b++){\n"
+"        /* Warps 0..3 stage q0/q1 for the two tokens. */\n"
+"        if(warp<4){int t=warp>>1, which=warp&1, i=lane;\n"
+"            const signed char *src=(which? q1:q0)+(size_t)(blockIdx.y*2+t)*n_cols+b*256;\n"
+"            signed char (*dstq)[256]=which?aq1:aq0;\n"
+"            while(i<256){dstq[t][i]=(blockIdx.y*2+t<M)?src[i]:0;i+=32;}\n"
+"            if(lane<8){const float *ss=(which?s1:s0)+(size_t)(blockIdx.y*2+t)*(n_cols/32)+b*8;\n"
+"                (which?as1:as0)[t][b*8+lane]=((blockIdx.y*2+t<M)?ss[lane]:0.0f);}\n"
+"        }\n"
+"        /* Warps 4..7 stage one IQ2 weight block for each output row. */\n"
+"        if(warp>=4){int r=warp-4,i=lane; const unsigned char *rp=(blockIdx.x*4+r<n_rows)?\n"
+"            mat+(size_t)(blockIdx.x*4+r)*nb*74:mat;\n"
+"            while(i<74){wt[r][i]=(blockIdx.x*4+r<n_rows)?rp[(size_t)b*74+i]:0;i+=32;}\n"
+"        }\n"
+"        __syncthreads();\n"
+"        if(active){const unsigned char *bp=wt[warp>>1]; int t=warp&1;\n"
+"            const signed char *tq0=aq0[t], *tq1=aq1[t]; const float *ts0=as0[t], *ts1=as1[t];\n"
+"            for(int ib=lane;ib<8;ib+=32){const unsigned short *qs=(const unsigned short*)(bp+2);\n"
+"                unsigned char sc=bp[66+ib]; float bs=0.0f;\n"
+"                for(int l=0;l<4;l++){unsigned short qv=qs[4*ib+l]; unsigned long long gv=iq2xs_grid_dev[qv&511];\n"
+"                    unsigned char sb=ksigns_iq2xs_dev[qv>>9]; int w0=apply_sign4((unsigned int)gv,sb,0), w1=apply_sign4((unsigned int)(gv>>32),sb,4);\n"
+"                    int qb=b*8+ib; const int *u0=(const int*)(tq0+ib*32), *u1=(const int*)(tq1+ib*32);\n"
+"                    int z0=dp4a_hw(w0,u0[l*2],0); z0=dp4a_hw(w1,u0[l*2+1],z0); int z1=dp4a_hw(w0,u1[l*2],0); z1=dp4a_hw(w1,u1[l*2+1],z1);\n"
+"                    float ls=0.5f+(float)(l<2?(sc&15):(sc>>4)); bs+=ls*(ts0[qb]*(float)z0+ts1[qb]*(float)z1);}\n"
+"                sum+=half_to_float(*(const half_raw*)bp)*0.25f*bs;\n"
+"            }\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o); if(active&&lane==0)dst[(size_t)token*n_rows+row]=sum;\n"
 "}\n"
 "__global__ void matvec_iq2_s_expert_dp4a(float *dst, const unsigned char *base,\n"
 "                                         const signed char *xq, const float *xs,\n"
 "                                         int n_rows, int n_cols,\n"
 "                                         const int *eidx, int slot, long long stride) {\n"
 "    int warp_id = threadIdx.x / 32; int lane = threadIdx.x % 32;\n"
-"    int row = blockIdx.x * 8 + warp_id; if (row >= n_rows) return;\n"
+"    int row = blockIdx.x * (blockDim.x / 32) + warp_id; if (row >= n_rows) return;\n"
 "    const unsigned char *mat = base + (long long)eidx[slot] * stride;\n"
 "    IQ2S_DP4A_BODY\n"
 "}\n"
@@ -5014,8 +7567,10 @@ static const char *hip_kernel_source =
 "        const float *xb = x + b * 256 + sb * 32 + l * 8; \\\n"
 "        float partial = 0.0f; \\\n"
 "        for (int j = 0; j < 4; j++) { \\\n"
-"            partial += db * (float)grid1[j] * ((s & (1 << j)) ? -1.0f : 1.0f) * xb[j]; \\\n"
-"            partial += db * (float)grid2[j] * ((s & (1 << (j+4))) ? -1.0f : 1.0f) * xb[j+4]; \\\n"
+"            float w0 = db * ((s & (1 << j)) ? -(float)grid1[j] : (float)grid1[j]); \\\n"
+"            float w1 = db * ((s & (1 << (j+4))) ? -(float)grid2[j] : (float)grid2[j]); \\\n"
+"            partial = fmaf(w0, xb[j], partial); \\\n"
+"            partial = fmaf(w1, xb[j+4], partial); \\\n"
 "        } \\\n"
 "        sum += partial; \\\n"
 "    } \\\n"
@@ -5993,28 +8548,42 @@ static const char *hip_kernel_source =
 "    __syncthreads();\n"
 "    for (int g = tid; g < G; g += nthreads) {\n"
 "        int b = g >> 5; int rem = g & 31; int sb = rem >> 2; int l = rem & 3;\n"
-"        int head = b * 8 + sb;\n"
+"        int col0 = b * 256 + sb * 32;\n"
+"        int head = col0 / d_state;\n"
 "        if (head >= dt_rank) continue;\n"
 "        const float *x0 = ssm_out + b * 256 + sb * 32 + l * 8;\n"
 "        float4 xv = *(const float4 *)x0;\n"
-"        atomicAdd(&head_sq[head], xv.x*xv.x + xv.y*xv.y + xv.z*xv.z + xv.w*xv.w);\n"
+"        float4 xv1 = *(const float4 *)(x0 + 4);\n"
+"        atomicAdd(&head_sq[head], xv.x*xv.x + xv.y*xv.y + xv.z*xv.z + xv.w*xv.w\n"
+"              + xv1.x*xv1.x + xv1.y*xv1.y + xv1.z*xv1.z + xv1.w*xv1.w);\n"
 "    }\n"
 "    __syncthreads();\n"
 "    float sum = 0.0f;\n"
 "    for (int g = tid; g < G; g += nthreads) {\n"
 "        int b = g >> 5; int rem = g & 31; int sb = rem >> 2; int l = rem & 3;\n"
-"        int head = b * 8 + sb;\n"
+"        int col0 = b * 256 + sb * 32;\n"
+"        int head = col0 / d_state;\n"
+"        int hpos = col0 % d_state;\n"
 "        if (head >= dt_rank) continue;\n"
 "        float inv_mean = rsqrtf(head_sq[head] * i_d_state + eps);\n"
 "        const float *x0 = ssm_out + b * 256 + sb * 32 + l * 8;\n"
 "        const float *zx0 = z + b * 256 + sb * 32 + l * 8;\n"
 "        float4 xv = *(const float4 *)x0;\n"
+"        float4 xv1 = *(const float4 *)(x0 + 4);\n"
 "        float4 zv = *(const float4 *)zx0;\n"
-"        float nw = norm_w[head];\n"
-"        float nv0 = xv.x * inv_mean * nw;\n"
-"        float nv1 = xv.y * inv_mean * nw;\n"
-"        float nv2 = xv.z * inv_mean * nw;\n"
-"        float nv3 = xv.w * inv_mean * nw;\n"
+"        float4 zv1 = *(const float4 *)(zx0 + 4);\n"
+"        /* ssm_norm is one 128-element vector shared by all recurrent heads;\n"
+"         * index it by the element within the head, not by head number.\n"
+"         */\n"
+"        const float *nw = norm_w + hpos + l * 8;\n"
+"        float nv0 = xv.x * inv_mean * nw[0];\n"
+"        float nv1 = xv.y * inv_mean * nw[1];\n"
+"        float nv2 = xv.z * inv_mean * nw[2];\n"
+"        float nv3 = xv.w * inv_mean * nw[3];\n"
+"        float nv4 = xv1.x * inv_mean * nw[4];\n"
+"        float nv5 = xv1.y * inv_mean * nw[5];\n"
+"        float nv6 = xv1.z * inv_mean * nw[6];\n"
+"        float nv7 = xv1.w * inv_mean * nw[7];\n"
 "        float sg0 = 1.0f / (1.0f + __expf(-zv.x));\n"
 "        float sg1 = 1.0f / (1.0f + __expf(-zv.y));\n"
 "        float sg2 = 1.0f / (1.0f + __expf(-zv.z));\n"
@@ -6031,10 +8600,10 @@ static const char *hip_kernel_source =
 "              + db * (float)g1[1] * ((sgn & 2) ? -nv1 : nv1) * sg1\n"
 "              + db * (float)g1[2] * ((sgn & 4) ? -nv2 : nv2) * sg2\n"
 "              + db * (float)g1[3] * ((sgn & 8) ? -nv3 : nv3) * sg3;\n"
-"        sum += db * (float)g2[0] * ((sgn & 16) ? -(nv0*sg0) : (nv0*sg0))\n"
-"              + db * (float)g2[1] * ((sgn & 32) ? -(nv1*sg1) : (nv1*sg1))\n"
-"              + db * (float)g2[2] * ((sgn & 64) ? -(nv2*sg2) : (nv2*sg2))\n"
-"              + db * (float)g2[3] * ((sgn & 128) ? -(nv3*sg3) : (nv3*sg3));\n"
+"        sum += db * (float)g2[0] * ((sgn & 16) ? -(nv4*zv1.x/(1.0f+__expf(-zv1.x))) : (nv4*zv1.x/(1.0f+__expf(-zv1.x))))\n"
+"              + db * (float)g2[1] * ((sgn & 32) ? -(nv5*zv1.y/(1.0f+__expf(-zv1.y))) : (nv5*zv1.y/(1.0f+__expf(-zv1.y))))\n"
+"              + db * (float)g2[2] * ((sgn & 64) ? -(nv6*zv1.z/(1.0f+__expf(-zv1.z))) : (nv6*zv1.z/(1.0f+__expf(-zv1.z))))\n"
+"              + db * (float)g2[3] * ((sgn & 128) ? -(nv7*zv1.w/(1.0f+__expf(-zv1.w))) : (nv7*zv1.w/(1.0f+__expf(-zv1.w))));\n"
 "    }\n"
 "    for (int o = 16; o > 0; o >>= 1) sum += __shfl_down(sum, o);\n"
 "    __shared__ float wsf[8]; int wid = tid/32, ln = tid%32;\n"
@@ -6096,6 +8665,16 @@ static const char *hip_kernel_source =
 "    for (int st = blockDim.x / 2; st > 0; st >>= 1) { if (tid < st) sd[tid] += sd[tid + st]; __syncthreads(); }\n"
 "    float inv = rsqrtf(sd[0] / n + eps);\n"
 "    for (int i = tid; i < n; i += blockDim.x) xb[i] = x[i] * inv * w[i];\n"
+"}\n"
+"/* Same reduction contract, one independent row per block. */\n"
+"__global__ void res_rmsnorm_batch_f32(float *x, const float *res, float *xb,\n"
+"        const float *w, int n, int rows, float eps) {\n"
+"    extern __shared__ float sd[]; int row=blockIdx.x,tid=threadIdx.x;\n"
+"    if(row>=rows)return; x+=(size_t)row*n;res+=(size_t)row*n;xb+=(size_t)row*n;\n"
+"    float ss=0.0f;for(int i=tid;i<n;i+=blockDim.x){float v=x[i]+res[i];x[i]=v;ss+=v*v;}\n"
+"    sd[tid]=ss;__syncthreads();\n"
+"    for(int st=blockDim.x/2;st>0;st>>=1){if(tid<st)sd[tid]+=sd[tid+st];__syncthreads();}\n"
+"    float inv=rsqrtf(sd[0]/n+eps);for(int i=tid;i<n;i+=blockDim.x)xb[i]=x[i]*inv*w[i];\n"
 "}\n"
 "/* ---- moe_router_fused: per-block expert dot, last block does topK+softmax. */\n"
 "/* grid = ne+1 blocks x 256 thr. Block ne = shared-gate dot + sigmoid. Counter */\n"
@@ -6185,18 +8764,23 @@ static const char *hip_kernel_source =
 "        float4 sv = *(const float4 *)&S[j];\n"
 "        float4 kv = *(const float4 *)&k[j];\n"
 "        float4 qv = *(const float4 *)&q[j];\n"
-"        s_[j+0]=sv.x*decay; s_[j+1]=sv.y*decay; s_[j+2]=sv.z*decay; s_[j+3]=sv.w*decay;\n"
+"        /* Keep old state for the GDA reduction.  Decaying before this dot\n"
+"         * is algebraically equivalent but differs in fp32 rounding from\n"
+"         * llama.cpp's gated_delta_net kernel. */\n"
+"        s_[j+0]=sv.x; s_[j+1]=sv.y; s_[j+2]=sv.z; s_[j+3]=sv.w;\n"
 "        k_[j+0]=kv.x; k_[j+1]=kv.y; k_[j+2]=kv.z; k_[j+3]=kv.w;\n"
 "        q_[j+0]=qv.x; q_[j+1]=qv.y; q_[j+2]=qv.z; q_[j+3]=qv.w;\n"
 "        sk += s_[j]*k_[j] + s_[j+1]*k_[j+1] + s_[j+2]*k_[j+2] + s_[j+3]*k_[j+3];\n"
 "    }\n"
 "    /* reduce sk across the 4 lanes of this row (lanes r*4..r*4+3) */\n"
 "    sk += __shfl_xor(sk, 1); sk += __shfl_xor(sk, 2);\n"
-"    float delta = (v_r - sk) * b;\n"
+"    float delta = (v_r - decay * sk) * b;\n"
 "    float o = 0.0f;\n"
 "    for (int j = 0; j < 32; j += 4) {\n"
-"        s_[j+0] += delta * k_[j+0]; s_[j+1] += delta * k_[j+1];\n"
-"        s_[j+2] += delta * k_[j+2]; s_[j+3] += delta * k_[j+3];\n"
+"        s_[j+0] = decay * s_[j+0] + delta * k_[j+0];\n"
+"        s_[j+1] = decay * s_[j+1] + delta * k_[j+1];\n"
+"        s_[j+2] = decay * s_[j+2] + delta * k_[j+2];\n"
+"        s_[j+3] = decay * s_[j+3] + delta * k_[j+3];\n"
 "        o += s_[j]*q_[j] + s_[j+1]*q_[j+1] + s_[j+2]*q_[j+2] + s_[j+3]*q_[j+3];\n"
 "        float4 sv = { s_[j+0], s_[j+1], s_[j+2], s_[j+3] };\n"
 "        *(float4 *)&S[j] = sv;\n"
@@ -6227,7 +8811,8 @@ static const char *hip_kernel_source =
 "        const float *k = K_batch + (size_t)m * per_tok + h * d_state + c0;\n"
 "        const float *q = Q_batch + (size_t)m * per_tok + h * d_state + c0;\n"
 "        float v_r   = V_batch[(size_t)m * v_row_stride + h * d_state + r];\n"
-"        float decay = __expf(alpha_batch[(size_t)m * dt_rank + h]);\n"
+"        /* The batched alpha-preparation kernel already applied ggml_exp. */\n"
+"        float decay = alpha_batch[(size_t)m * dt_rank + h];\n"
 "        float b     = beta_batch[(size_t)m * dt_rank + h];\n"
 "        float k_[32], q_[32];\n"
 "        float sk = 0.0f;\n"
@@ -6236,14 +8821,14 @@ static const char *hip_kernel_source =
 "            float4 qv = *(const float4 *)&q[j];\n"
 "            k_[j]=kv.x;k_[j+1]=kv.y;k_[j+2]=kv.z;k_[j+3]=kv.w;\n"
 "            q_[j]=qv.x;q_[j+1]=qv.y;q_[j+2]=qv.z;q_[j+3]=qv.w;\n"
-"            s_[j]*=decay;s_[j+1]*=decay;s_[j+2]*=decay;s_[j+3]*=decay;\n"
 "            sk += s_[j]*k_[j]+s_[j+1]*k_[j+1]+s_[j+2]*k_[j+2]+s_[j+3]*k_[j+3];\n"
 "        }\n"
 "        sk += __shfl_xor(sk, 1); sk += __shfl_xor(sk, 2);\n"
-"        float delta = (v_r - sk) * b;\n"
+"        float delta = (v_r - decay * sk) * b;\n"
 "        float o = 0.0f;\n"
 "        for (int j = 0; j < 32; j += 4) {\n"
-"            s_[j]+=delta*k_[j];s_[j+1]+=delta*k_[j+1];s_[j+2]+=delta*k_[j+2];s_[j+3]+=delta*k_[j+3];\n"
+"            s_[j]=decay*s_[j]+delta*k_[j];s_[j+1]=decay*s_[j+1]+delta*k_[j+1];\n"
+"            s_[j+2]=decay*s_[j+2]+delta*k_[j+2];s_[j+3]=decay*s_[j+3]+delta*k_[j+3];\n"
 "            o += s_[j]*q_[j]+s_[j+1]*q_[j+1]+s_[j+2]*q_[j+2]+s_[j+3]*q_[j+3];\n"
 "        }\n"
 "        o += __shfl_xor(o, 1); o += __shfl_xor(o, 2);\n"
@@ -6400,10 +8985,16 @@ static const char *hip_kernel_source =
 "            for (int l = 0; l < 4; l++) {\n"
 "                int grid_idx = qs[l] | (((qh[ib] >> (3*l)) & 7) << 8);\n"
 "                const signed char *grid = (const signed char *)&iq1s_grid_dev[grid_idx];\n"
-"                for (int j = 0; j < 8; j++) {\n"
-"                    float w = dl * ((float)grid[j] + delta);\n"
-"                    partial += w * xb[yi++];\n"
-"                }\n"
+"                /* Match llama.cpp HIP MMQ: form activation/grid products\n"
+"                 * with FMA, horizontally add, then apply dl separately\n"
+"                 * with one outer FMA. */\n"
+"                float sum_v0 = 0.0f, sum_v1 = 0.0f;\n"
+"                for (int j = 0; j < 4; j++)\n"
+"                    sum_v0 = fmaf(xb[yi + j], (float)grid[j] + delta, sum_v0);\n"
+"                for (int j = 4; j < 8; j++)\n"
+"                    sum_v1 = fmaf(xb[yi + j], (float)grid[j] + delta, sum_v1);\n"
+"                partial = fmaf(dl, sum_v0 + sum_v1, partial);\n"
+"                yi += 8;\n"
 "            }\n"
 "            qs += 4;\n"
 "        }\n"
@@ -6423,35 +9014,48 @@ static const char *hip_kernel_source =
 "    }\n"
 "}\n"
 
-"/* Warp-specialized IQ1_S matvec. Two lanes cooperate on each 256-value\n"
-" * block, keeping all 32 lanes useful for the common 4096-wide projections. */\n"
+"__global__ void matvec_iq1_s_batch_f32(float *dst, const unsigned char *mat,\n"
+"        const float *x, int n_rows, int n_cols, int M, int x_stride) {\n"
+"    int warp=threadIdx.x/32,lane=threadIdx.x&31,row=blockIdx.x*(blockDim.x/32)+warp,token=blockIdx.y;\n"
+"    if(row>=n_rows||token>=M)return; int nb=n_cols/256; const unsigned char *rp=mat+(size_t)row*nb*50;\n"
+"    const float *xt=x+(size_t)token*x_stride; float sum=0.0f;\n"
+"    for(int b=lane;b<nb;b+=32){const unsigned char *bp=rp+b*50; float d=half_to_float(*(const half_raw*)bp);\n"
+"        const unsigned char *qs0=bp+2; const unsigned short *qh=(const unsigned short*)(bp+34);\n"
+"        const float *xb=xt+b*256; for(int ib=0;ib<8;ib++){float dl=d*(float)(2*((qh[ib]>>12)&7)+1);\n"
+"            float delta=(qh[ib]&0x8000)?-0.125f:0.125f; const unsigned char *qs=qs0+ib*4;\n"
+"            for(int l=0;l<4;l++){int gi=qs[l]|(((qh[ib]>>(3*l))&7)<<8); const signed char *gr=(const signed char*)&iq1s_grid_dev[gi];\n"
+"                int base=ib*32+l*8; for(int j=0;j<8;j++)sum+=dl*((float)gr[j]+delta)*xb[base+j];}}}\n"
+"    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o); if(lane==0)dst[(size_t)token*n_rows+row]=sum;\n"
+"}\n"
+"/* Warp-specialized IQ1_S matvec. Assign one lane to each 8-value grid\n"
+" * group so metadata decode and the short dot products run in parallel. */\n"
 "__global__ void matvec_iq1_s_warp_f32(float *dst, const unsigned char *mat,\n"
 "                                   const float *x, int n_rows, int n_cols) {\n"
 "    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;\n"
-"    int row = blockIdx.x * 8 + warp;\n"
+"    int row = blockIdx.x * (blockDim.x >> 5) + warp;\n"
 "    if (row >= n_rows) return;\n"
 "    int nb = n_cols / 256, row_bytes = nb * 50;\n"
 "    float sum = 0.0f;\n"
 "    const float delta0 = 0.125f;\n"
-"    for (int b = lane >> 1; b < nb; b += 16) {\n"
+"    int ng = nb * 32;\n"
+"    for (int g = lane; g < ng; g += 32) {\n"
+"        int b = g >> 5, rem = g & 31;\n"
+"        int ib = rem >> 2, l = rem & 3;\n"
 "        const unsigned char *bp = mat + (size_t)row * row_bytes + b * 50;\n"
 "        float d = half_to_float(*(const half_raw *)bp);\n"
 "        const unsigned char *qs0 = bp + 2;\n"
 "        const unsigned short *qh = (const unsigned short *)(bp + 34);\n"
 "        const float *xb = x + b * 256;\n"
-"        int ib0 = (lane & 1) * 4;\n"
-"        for (int ib = ib0; ib < ib0 + 4; ++ib) {\n"
-"            float dl = d * (float)(2 * ((qh[ib] >> 12) & 7) + 1);\n"
-"            float delta = (qh[ib] & 0x8000) ? -delta0 : delta0;\n"
-"            const unsigned char *qs = qs0 + ib * 4;\n"
-"            for (int l = 0; l < 4; ++l) {\n"
-"                int grid_idx = qs[l] | (((qh[ib] >> (3 * l)) & 7) << 8);\n"
-"                const signed char *grid = (const signed char *)&iq1s_grid_dev[grid_idx];\n"
-"                int base = ib * 32 + l * 8;\n"
-"                for (int j = 0; j < 8; ++j)\n"
-"                    sum += dl * ((float)grid[j] + delta) * xb[base + j];\n"
-"            }\n"
-"        }\n"
+"        float dl = d * (float)(2 * ((qh[ib] >> 12) & 7) + 1);\n"
+"        float delta = (qh[ib] & 0x8000) ? -delta0 : delta0;\n"
+"        int grid_idx = qs0[ib * 4 + l] | (((qh[ib] >> (3 * l)) & 7) << 8);\n"
+"        const signed char *grid = (const signed char *)&iq1s_grid_dev[grid_idx];\n"
+"        int base = ib * 32 + l * 8;\n"
+"        /* Preserve the reference dequantize-then-dot order.  The split\n"
+"         * four-term FMAs are faster, but their reassociation is visible\n"
+"         * in the IQ1_S FFN after many layers. */\n"
+"        for (int j = 0; j < 8; ++j)\n"
+"            sum += dl * ((float)grid[j] + delta) * xb[base + j];\n"
 "    }\n"
 "    for (int offset = 16; offset > 0; offset >>= 1)\n"
 "        sum += __shfl_down(sum, offset);\n"
@@ -6546,6 +9150,209 @@ static const char *hip_kernel_source =
 "        sum+=d*xscale[b]*(dot+delta*(float)sumq);}\n"
 "    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o);if(lane==0)dst[row]=sum;\n"
 "}\n"
+"/* Two-term accurate IQ1_S DP4A.  The affine delta is applied to each Q8\n"
+" * term's integer activation sum before the corresponding scale. */\n"
+"__global__ void matvec_iq1_s_dp4a2(float *dst,const unsigned char *mat,\n"
+"        const signed char *q0,const float *s0,const signed char *q1,const float *s1,\n"
+"        int n_rows,int n_cols){\n"
+"    int lane=threadIdx.x&31,warp=threadIdx.x>>5,row=blockIdx.x*(blockDim.x/32)+warp;\n"
+"    if(row>=n_rows)return;int nb=n_cols/256,qblocks=n_cols/32;float sum=0.0f;\n"
+"    const unsigned char *rp=mat+(size_t)row*nb*50;\n"
+"    for(int b=lane;b<qblocks;b+=32){int block=b>>3,ib=b&7;\n"
+"      const unsigned char *bp=rp+block*50;const unsigned short *qh=(const unsigned short*)(bp+34);\n"
+"      const unsigned char *qs=bp+2;float dw=half_to_float(*(const half_raw*)bp)*(float)(2*((qh[ib]>>12)&7)+1);\n"
+"      float delta=(qh[ib]&0x8000)?-0.125f:0.125f;const int *u0=(const int*)(q0+(size_t)b*32);\n"
+"      const int *u1=(const int*)(q1+(size_t)b*32);int z0=0,z1=0,t0=0,t1=0;\n"
+"      for(int l=0;l<4;++l){int gi=qs[ib*4+l]|(((qh[ib]>>(3*l))&7)<<8);\n"
+"        const signed char *g=(const signed char*)&iq1s_grid_dev[gi];\n"
+"        int w0=((int)g[0]&255)|(((int)g[1]&255)<<8)|(((int)g[2]&255)<<16)|(((int)g[3]&255)<<24);\n"
+"        int w1=((int)g[4]&255)|(((int)g[5]&255)<<8)|(((int)g[6]&255)<<16)|(((int)g[7]&255)<<24);\n"
+"        z0=dp4a_hw(w0,u0[l*2],z0);z0=dp4a_hw(w1,u0[l*2+1],z0);\n"
+"        z1=dp4a_hw(w0,u1[l*2],z1);z1=dp4a_hw(w1,u1[l*2+1],z1);\n"
+"        const signed char *p0=(const signed char*)&u0[l*2],*p1=(const signed char*)&u1[l*2];\n"
+"        for(int j=0;j<8;++j){t0+=(int)p0[j];t1+=(int)p1[j];}}\n"
+"      sum+=dw*(s0[b]*((float)z0+delta*(float)t0)+s1[b]*((float)z1+delta*(float)t1));}\n"
+"    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o);if(lane==0)dst[row]=sum;\n"
+"}\n"
+"/* Batched IQ1_S DP4A.  The quantized activation rows are laid out as\n"
+" * [token][K], with one warp computing one (token, output-row) pair. */\n"
+"__global__ void matvec_iq1_s_dp4a2_batch(float *dst,const unsigned char *mat,\n"
+"        const signed char *q0,const float *s0,const signed char *q1,const float *s1,\n"
+"        int n_rows,int n_cols,int M){\n"
+"    int lane=threadIdx.x&31,warp=threadIdx.x>>5,row=blockIdx.x*8+warp,token=blockIdx.y;\n"
+"    if(row>=n_rows||token>=M)return; int nb=n_cols/256,qblocks=n_cols/32; float sum=0.0f;\n"
+"    const unsigned char *rp=mat+(size_t)row*nb*50;\n"
+"    const signed char *x0=q0+(size_t)token*n_cols,*x1=q1+(size_t)token*n_cols;\n"
+"    const float *a0=s0+(size_t)token*qblocks,*a1=s1+(size_t)token*qblocks;\n"
+"    for(int b=lane;b<qblocks;b+=32){int block=b>>3,ib=b&7;\n"
+"        const unsigned char *bp=rp+block*50; const unsigned short *qh=(const unsigned short*)(bp+34);\n"
+"        const unsigned char *qs=bp+2; float dw=half_to_float(*(const half_raw*)bp)*(float)(2*((qh[ib]>>12)&7)+1);\n"
+"        float delta=(qh[ib]&0x8000)?-0.125f:0.125f;\n"
+"        const int *u0=(const int*)(x0+(size_t)b*32),*u1=(const int*)(x1+(size_t)b*32); int z0=0,z1=0,t0=0,t1=0;\n"
+"        for(int l=0;l<4;++l){int gi=qs[ib*4+l]|(((qh[ib]>>(3*l))&7)<<8);\n"
+"            const signed char *g=(const signed char*)&iq1s_grid_dev[gi];\n"
+"            int w0=((int)g[0]&255)|(((int)g[1]&255)<<8)|(((int)g[2]&255)<<16)|(((int)g[3]&255)<<24);\n"
+"            int w1=((int)g[4]&255)|(((int)g[5]&255)<<8)|(((int)g[6]&255)<<16)|(((int)g[7]&255)<<24);\n"
+"            z0=dp4a_hw(w0,u0[l*2],z0); z0=dp4a_hw(w1,u0[l*2+1],z0);\n"
+"            z1=dp4a_hw(w0,u1[l*2],z1); z1=dp4a_hw(w1,u1[l*2+1],z1);\n"
+"            const signed char *p0=(const signed char*)&u0[l*2],*p1=(const signed char*)&u1[l*2];\n"
+"            for(int j=0;j<8;++j){t0+=(int)p0[j];t1+=(int)p1[j];}\n"
+"        }\n"
+"        sum+=dw*(a0[b]*((float)z0+delta*(float)t0)+a1[b]*((float)z1+delta*(float)t1));\n"
+"    }\n"
+"    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o);\n"
+"    if(lane==0)dst[(size_t)token*n_rows+row]=sum;\n"
+"}\n"
+"/* Exact llama.cpp Q8_1 IQ1_S contract using its packed GPU codebook. */\n"
+"__device__ __forceinline__ void iq1_s_q81_body(float *dst,const unsigned char *mat,\n"
+"        const signed char *q,const float *sd,const float *ss,int n_rows,\n"
+"        int n_cols,int M,int mmq_scales){\n"
+"    int lane=threadIdx.x&31,warp=threadIdx.x>>5,row=blockIdx.x*(blockDim.x/32)+warp,token=blockIdx.y;\n"
+"    if(row>=n_rows||token>=M)return; int nb=n_cols/256,G=nb*8; float sum=0.0f;\n"
+"    const unsigned char *rp=mat+(size_t)row*nb*50; const signed char *tq=q+(size_t)token*n_cols;\n"
+"    const float *td=sd+(size_t)token*(n_cols/32),*ts=ss+(size_t)token*(n_cols/32);\n"
+"    for(int qb=lane;qb<G;qb+=32){int b=qb>>3,ib=qb&7; const unsigned char *bp=rp+b*50;\n"
+"        const unsigned short *qh=(const unsigned short*)(bp+34); const unsigned char *qs=bp+2;\n"
+"        float dw=half_to_float(*(const half_raw*)bp)*(float)(2*((qh[ib]>>12)&7)+1);\n"
+"        float delta=(qh[ib]&0x8000)?(-1.0f-0.125f):(-1.0f+0.125f);\n"
+"        const signed char *xp=tq+(size_t)qb*32; int z=0;\n"
+"        for(int l=0;l<4;++l){int gi=qs[ib*4+l]|(((qh[ib]>>(3*l))&7)<<8);\n"
+"            unsigned int grid=iq1s_grid_gpu_dev[gi];\n"
+"            int w0=(int)(grid & 0x0f0f0f0fu);\n"
+"            int w1=(int)((grid >> 4) & 0x0f0f0f0fu);\n"
+"            const int *u=(const int*)(xp+l*8); z=dp4a_hw(w0,u[0],z); z=dp4a_hw(w1,u[1],z);\n"
+"        }\n"
+"        if (mmq_scales) {\n"
+"            /* llama.cpp MMQ loads d1q and d1q*delta into half2. */\n"
+"            float d = round_f16_contract(dw);\n"
+"            float c = round_f16_contract(dw*delta);\n"
+"            sum += d*td[qb]*(float)z + c*ts[qb];\n"
+"        } else sum+=dw*(td[qb]*(float)z+ts[qb]*delta);\n"
+"    }\n"
+"    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o); if(lane==0)dst[(size_t)token*n_rows+row]=sum;\n"
+"}\n"
+"/* Single-term llama.cpp Q8_1 path for IQ2_XXS. */\n"
+"__global__ void matvec_iq1_s_q81_batch(float *dst,const unsigned char *mat,\n"
+"        const signed char *q,const float *sd,const float *ss,int nr,int nc,int M){\n"
+"    iq1_s_q81_body(dst,mat,q,sd,ss,nr,nc,M,0);\n"
+"}\n"
+"/* Exact Q8_1 IQ1_S verification for up to eight rows.  A warp owns one\n"
+" * output row and decodes each weight group once while retaining a distinct\n"
+" * accumulator for every speculative row. */\n"
+"__global__ void matvec_iq1_s_q81_reuse8(float *dst,const unsigned char *mat,\n"
+"        const signed char *q,const float *sd,const float *ss,int nr,int nc,int M){\n"
+"    int lane=threadIdx.x&31,warp=threadIdx.x>>5,row=blockIdx.x*8+warp;\n"
+"    if(row>=nr)return; int nb=nc/256,G=nb*8; float sum[8]={0,0,0,0,0,0,0,0};\n"
+"    const unsigned char *rp=mat+(size_t)row*nb*50; int qblocks=nc/32;\n"
+"    for(int qb=lane;qb<G;qb+=32){int b=qb>>3,ib=qb&7; const unsigned char *bp=rp+b*50;\n"
+"        const unsigned short *qh=(const unsigned short*)(bp+34); const unsigned char *qs=bp+2;\n"
+"        float dw=half_to_float(*(const half_raw*)bp)*(float)(2*((qh[ib]>>12)&7)+1);\n"
+"        float delta=(qh[ib]&0x8000)?(-1.0f-0.125f):(-1.0f+0.125f);\n"
+"        unsigned int grid[4];\n"
+"        for(int l=0;l<4;++l){int gi=qs[ib*4+l]|(((qh[ib]>>(3*l))&7)<<8);grid[l]=iq1s_grid_gpu_dev[gi];}\n"
+"        for(int t=0;t<M;++t){const signed char *xp=q+(size_t)t*nc+(size_t)qb*32; int z=0;\n"
+"            for(int l=0;l<4;++l){int w0=(int)(grid[l]&0x0f0f0f0fu),w1=(int)((grid[l]>>4)&0x0f0f0f0fu);\n"
+"                const int *u=(const int*)(xp+l*8);z=dp4a_hw(w0,u[0],z);z=dp4a_hw(w1,u[1],z);}\n"
+"            sum[t]+=dw*(sd[(size_t)t*qblocks+qb]*(float)z+ss[(size_t)t*qblocks+qb]*delta);}\n"
+"    }\n"
+"    for(int t=0;t<M;++t){for(int o=16;o>0;o>>=1)sum[t]+=__shfl_down(sum[t],o);\n"
+"        if(lane==0)dst[(size_t)t*nr+row]=sum[t];}\n"
+"}\n"
+"__global__ void matvec_iq1_s_mmq_scales(float *dst,const unsigned char *mat,\n"
+"        const signed char *q,const float *sd,const float *ss,int nr,int nc,int M){\n"
+"    iq1_s_q81_body(dst,mat,q,sd,ss,nr,nc,M,1);\n"
+"}\n"
+"__device__ __forceinline__ void iq2_xxs_q81_body(float *dst, const unsigned char *mat,\n"
+"        const signed char *q, const float *s, int n_rows, int n_cols, int M, int mmq) {\n"
+"    int warp=threadIdx.x/32,lane=threadIdx.x&31,row=blockIdx.x*8+warp,token=blockIdx.y;\n"
+"    if(row>=n_rows||token>=M)return; int nb=n_cols/256,G=nb*8;\n"
+"    const unsigned char *rp=mat+(size_t)row*nb*66; const signed char *tq=q+(size_t)token*n_cols;\n"
+"    const float *ts=s+(size_t)token*(n_cols/32); float sum=0.0f;\n"
+"    for(int qb=lane;qb<G;qb+=32){int b=qb>>3,ib=qb&7; const unsigned char *bp=rp+b*66;\n"
+"        float d=half_to_float(*(const half_raw*)bp); const unsigned short *qs=(const unsigned short *)(bp+2);\n"
+"        unsigned int a0=qs[4*ib]|((unsigned int)qs[4*ib+1]<<16);\n"
+"        unsigned int a1=qs[4*ib+2]|((unsigned int)qs[4*ib+3]<<16); const int *u=(const int *)(tq+(size_t)qb*32);\n"
+"        int z=0; for(int l=0;l<4;l++){unsigned long long gv=iq2xxs_grid_dev[(a0>>(8*l))&255];\n"
+"            unsigned char sg=ksigns_iq2xs_dev[(a1>>(7*l))&127];\n"
+"            int w0=apply_sign4((unsigned int)gv,sg,0),w1=apply_sign4((unsigned int)(gv>>32),sg,4);\n"
+"            z=dp4a_hw(w0,u[2*l],z); z=dp4a_hw(w1,u[2*l+1],z);}\n"
+"        int ls=(int)(a1>>27)|1;\n"
+"        /* MMQ scales the integer dot in F32; MMVQ truncates z*ls/8. */\n"
+"        sum+=mmq ? (d*(float)ls*0.125f)*ts[qb]*(float)z : d*ts[qb]*(float)(z*ls/8);\n"
+"    }\n"
+"    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o); if(lane==0)dst[(size_t)token*n_rows+row]=sum;\n"
+"}\n"
+"__global__ void matvec_iq2_xxs_q81_batch(float *dst, const unsigned char *mat,\n"
+"        const signed char *q, const float *s, int nr, int nc, int M) {\n"
+"    iq2_xxs_q81_body(dst,mat,q,s,nr,nc,M,0);\n"
+"}\n"
+"__global__ void matvec_iq2_xxs_mmq_scales(float *dst, const unsigned char *mat,\n"
+"        const signed char *q, const float *s, int nr, int nc, int M) {\n"
+"    iq2_xxs_q81_body(dst,mat,q,s,nr,nc,M,1);\n"
+"}\n"
+"/* Single-term llama.cpp Q8_1 path for IQ2_XS.  IQ2_XS has four 8-value\n"
+" * codebook groups per 32-value block and two packed int8 words per group. */\n"
+"__device__ __forceinline__ void iq2_xs_q81_body(float *dst, const unsigned char *mat,\n"
+"        const signed char *q, const float *s, int n_rows, int n_cols, int M, int mmq) {\n"
+"    int warp=threadIdx.x/32,lane=threadIdx.x&31,row=blockIdx.x*8+warp,token=blockIdx.y;\n"
+"    if(row>=n_rows||token>=M)return; int nb=n_cols/256,G=nb*8;\n"
+"    const unsigned char *rp=mat+(size_t)row*nb*74; const signed char *tq=q+(size_t)token*n_cols;\n"
+"    const float *ts=s+(size_t)token*(n_cols/32); float sum=0.0f;\n"
+"    for(int qb=lane;qb<G;qb+=32){int b=qb>>3,ib=qb&7; const unsigned char *bp=rp+b*74;\n"
+"        float d=half_to_float(*(const half_raw*)bp); const unsigned short *qs=(const unsigned short*)(bp+2);\n"
+"        unsigned char sc=bp[66+ib]; const int *u=(const int*)(tq+(size_t)qb*32);\n"
+"        int z0=0,z1=0;\n"
+"        for(int l=0;l<4;l++){unsigned short qv=qs[4*ib+l]; unsigned long long gv=iq2xs_grid_dev[qv&511];\n"
+"            unsigned char sb=ksigns_iq2xs_dev[qv>>9]; int w0=apply_sign4((unsigned int)gv,sb,0),w1=apply_sign4((unsigned int)(gv>>32),sb,4);\n"
+"            int z=dp4a_hw(w0,u[l*2],0); z=dp4a_hw(w1,u[l*2+1],z);\n"
+"            if(l<2) z0+=z; else z1+=z;}\n"
+"        int ls0=(int)(sc&15),ls1=(int)(sc>>4);\n"
+"        if(mmq) {\n"
+"            float d0=((float)ls0*d+d*0.5f)*0.25f;\n"
+"            float d1=((float)ls1*d+d*0.5f)*0.25f;\n"
+"            sum+=ts[qb]*(d0*(float)z0+d1*(float)z1);\n"
+"        } else {\n"
+"            int sumi=(z0*ls0+z1*ls1+(z0+z1)/2)/4;\n"
+"            sum+=d*ts[qb]*(float)sumi;\n"
+"        }\n"
+"    }\n"
+"    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o); if(lane==0)dst[(size_t)token*n_rows+row]=sum;\n"
+"}\n"
+"__global__ void matvec_iq2_xs_q81_batch(float *dst,const unsigned char *mat,\n"
+"        const signed char *q,const float *s,int nr,int nc,int M){\n"
+"    iq2_xs_q81_body(dst,mat,q,s,nr,nc,M,0);\n"
+"}\n"
+"__global__ void matvec_iq2_xs_mmq_scales(float *dst,const unsigned char *mat,\n"
+"        const signed char *q,const float *s,int nr,int nc,int M){\n"
+"    iq2_xs_q81_body(dst,mat,q,s,nr,nc,M,1);\n"
+"}\n"
+"__global__ void matvec_iq1_s_dp4a2_batch_reuse4(float *dst,const unsigned char *mat,\n"
+"        const signed char *q0,const float *s0,const signed char *q1,const float *s1,\n"
+"        int n_rows,int n_cols,int M){\n"
+"    int lane=threadIdx.x&31,warp=threadIdx.x>>5,row=blockIdx.x*8+warp,token0=blockIdx.y*8;\n"
+"    if(row>=n_rows)return; int nb=n_cols/256,qblocks=n_cols/32; float sum[8]={0,0,0,0,0,0,0,0};\n"
+"    const unsigned char *rp=mat+(size_t)row*nb*50;\n"
+"    for(int b=lane;b<qblocks;b+=32){int block=b>>3,ib=b&7;\n"
+"        const unsigned char *bp=rp+block*50; const unsigned short *qh=(const unsigned short*)(bp+34);\n"
+"        const unsigned char *qs=bp+2; float dw=half_to_float(*(const half_raw*)bp)*(float)(2*((qh[ib]>>12)&7)+1);\n"
+"        float delta=(qh[ib]&0x8000)?-0.125f:0.125f;\n"
+"        for(int t=0;t<8;t++){int token=token0+t;if(token<M){\n"
+"            const signed char *x0=q0+(size_t)token*n_cols+(size_t)b*32,*x1=q1+(size_t)token*n_cols+(size_t)b*32;\n"
+"            const int *u0=(const int*)x0,*u1=(const int*)x1; int z0=0,z1=0,t0=0,t1=0;\n"
+"            for(int l=0;l<4;++l){int gi=qs[ib*4+l]|(((qh[ib]>>(3*l))&7)<<8);\n"
+"                const signed char *g=(const signed char*)&iq1s_grid_dev[gi];\n"
+"                int w0=((int)g[0]&255)|((int)g[1]&255)<<8|((int)g[2]&255)<<16|((int)g[3]&255)<<24;\n"
+"                int w1=((int)g[4]&255)|((int)g[5]&255)<<8|((int)g[6]&255)<<16|((int)g[7]&255)<<24;\n"
+"                z0=dp4a_hw(w0,u0[2*l],z0); z0=dp4a_hw(w1,u0[2*l+1],z0);\n"
+"                z1=dp4a_hw(w0,u1[2*l],z1); z1=dp4a_hw(w1,u1[2*l+1],z1);\n"
+"                const signed char *p0=x0+l*8,*p1=x1+l*8;\n"
+"                for(int j=0;j<8;j++){t0+=(int)p0[j];t1+=(int)p1[j];}\n"
+"            }\n"
+"            sum[t]+=dw*(s0[(size_t)token*qblocks+b]*((float)z0+delta*(float)t0)+s1[(size_t)token*qblocks+b]*((float)z1+delta*(float)t1));\n"
+"        }}\n"
+"    }\n"
+"    for(int t=0;t<8;t++){for(int o=16;o>0;o>>=1)sum[t]+=__shfl_down(sum[t],o);if(lane==0&&token0+t<M)dst[(size_t)(token0+t)*n_rows+row]=sum[t];}\n"
+"}\n"
 "/* Fused IQ1_S gate/up projection and SiLU product for one expert. */\n"
 "__global__ void ffn_gate_up_silu_iq1_s_mw(float *dst,const unsigned char *gate,\n"
 "        const unsigned char *up,const float *x,int rows,int cols){\n"
@@ -6584,18 +9391,20 @@ static const char *hip_kernel_source =
 "}\n"
 
 "/* ---- matvec_iq1_m_f32: IQ1_M matrix x F32 vector -> F32 ---- */\n"
-"__global__ void matvec_iq1_m_f32(float *dst, const unsigned char *mat, const float *x,\n"
-"                                   int n_rows, int n_cols) {\n"
-"    int row = blockIdx.x;\n"
+"__global__ void matvec_iq1_m_f32(float *__restrict__ dst, const unsigned char *__restrict__ mat, const float *__restrict__ x,\n"
+"                                   int n_rows, int n_cols, int f16_operands) {\n"
+"    int warp_id = threadIdx.x / 32;\n"
+"    int lane = threadIdx.x % 32;\n"
+"    int row = blockIdx.x * (blockDim.x / 32) + warp_id;\n"
 "    if (row >= n_rows) return;\n"
-"    int tid = threadIdx.x;\n"
-"    int nthreads = blockDim.x;\n"
 "    int nb = n_cols / 256;\n"
 "    int row_bytes = nb * 56;\n"
 "    const unsigned char *row_ptr = mat + (size_t)row * row_bytes;\n"
 "    float sum = 0.0f;\n"
 "    const float IQ1S_DELTA = 0.125f;\n"
-"    for (int b = tid; b < nb; b += nthreads) {\n"
+"    int G = nb * 32;\n"
+"    for (int g = lane; g < G; g += 32) {\n"
+"        int b = g >> 5; int rem = g & 31; int ib = rem >> 2; int l = rem & 3;\n"
 "        const unsigned char *bp = row_ptr + b * 56;\n"
 "        /* block_iq1_m layout: qs(32) + qh(16) + scales(8) */\n"
 "        const unsigned char *qs = bp;\n"
@@ -6604,46 +9413,274 @@ static const char *hip_kernel_source =
 "        /* Reconstruct f16 scale from 4 stolen nibbles */\n"
 "        unsigned short scale_u16 = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0u) | ((sc[2] >> 4) & 0x0f00u) | (sc[3] & 0xf000u);\n"
 "        float d = half_to_float(*(const half_raw *)&scale_u16);\n"
-"        const float *xb = x + b * 256;\n"
-"        float partial = 0.0f;\n"
-"        int yi = 0;\n"
-"        for (int ib = 0; ib < 8; ib++) {\n"
-"            float dl1 = d * (float)(2*((sc[ib/2] >> (6*(ib%2)+0)) & 0x7) + 1);\n"
-"            float dl2 = d * (float)(2*((sc[ib/2] >> (6*(ib%2)+3)) & 0x7) + 1);\n"
-"            unsigned short idx0 = qs[0] | ((unsigned short)(qh[0] << 8) & 0x700u);\n"
-"            unsigned short idx1 = qs[1] | ((unsigned short)(qh[0] << 4) & 0x700u);\n"
-"            unsigned short idx2 = qs[2] | ((unsigned short)(qh[1] << 8) & 0x700u);\n"
-"            unsigned short idx3 = qs[3] | ((unsigned short)(qh[1] << 4) & 0x700u);\n"
-"            float delta0 = (qh[0] & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;\n"
-"            float delta1 = (qh[0] & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;\n"
-"            float delta2 = (qh[1] & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;\n"
-"            float delta3 = (qh[1] & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;\n"
-"            const signed char *g0 = (const signed char *)&iq1s_grid_dev[idx0];\n"
-"            const signed char *g1 = (const signed char *)&iq1s_grid_dev[idx1];\n"
-"            const signed char *g2 = (const signed char *)&iq1s_grid_dev[idx2];\n"
-"            const signed char *g3 = (const signed char *)&iq1s_grid_dev[idx3];\n"
-"            for (int j = 0; j < 8; j++) partial += dl1 * ((float)g0[j] + delta0) * xb[yi++];\n"
-"            for (int j = 0; j < 8; j++) partial += dl1 * ((float)g1[j] + delta1) * xb[yi++];\n"
-"            for (int j = 0; j < 8; j++) partial += dl2 * ((float)g2[j] + delta2) * xb[yi++];\n"
-"            for (int j = 0; j < 8; j++) partial += dl2 * ((float)g3[j] + delta3) * xb[yi++];\n"
-"            qs += 4; qh += 2;\n"
+"        unsigned short sw = sc[ib/2];\n"
+"        int shift = 6*(ib%2) + (l >= 2 ? 3 : 0);\n"
+"        float dl = d * (float)(2*((sw >> shift) & 0x7) + 1);\n"
+"        unsigned char qhv = qh[2*ib + (l >> 1)];\n"
+"        int qshift = (l & 1) ? 4 : 8;\n"
+"        unsigned short idx = qs[4*ib + l] | ((unsigned short)(qhv << qshift) & 0x700u);\n"
+"        float delta = (qhv & ((l & 1) ? 0x80 : 0x08)) ? -IQ1S_DELTA : IQ1S_DELTA;\n"
+"        const signed char *grid = (const signed char *)&iq1s_grid_dev[idx];\n"
+"        const float *xb = x + b * 256 + ib * 32 + l * 8;\n"
+"        if (f16_operands) {\n"
+"            for (int j = 0; j < 8; ++j) {\n"
+"                float w = round_f16_contract(dl * ((float)grid[j] + delta));\n"
+"                float a = round_f16_contract(xb[j]);\n"
+"                sum = fmaf(w, a, sum);\n"
+"            }\n"
+"            continue;\n"
 "        }\n"
-"        sum += partial;\n"
+"        float dot0 = 0.0f, dot1 = 0.0f;\n"
+"        #pragma unroll\n"
+"        for (int j = 0; j < 4; ++j)\n"
+"            dot0 = fmaf(xb[j], (float)grid[j] + delta, dot0);\n"
+"        #pragma unroll\n"
+"        for (int j = 4; j < 8; ++j)\n"
+"            dot1 = fmaf(xb[j], (float)grid[j] + delta, dot1);\n"
+"        sum = fmaf(dl, dot0 + dot1, sum);\n"
 "    }\n"
 "    for (int offset = 16; offset > 0; offset >>= 1)\n"
 "        sum += __shfl_down(sum, offset);\n"
-"    __shared__ float ws_iq1m[8];\n"
-"    int wid = tid / 32, ln = tid % 32;\n"
-"    if (ln == 0) ws_iq1m[wid] = sum;\n"
-"    __syncthreads();\n"
-"    if (tid == 0) {\n"
-"        float total = 0.0f;\n"
-"        int n_warps = (nthreads + 31) / 32;\n"
-"        for (int w = 0; w < n_warps; w++) total += ws_iq1m[w];\n"
-"        dst[row] = total;\n"
+"    if (lane == 0) dst[row] = sum;\n"
+"}\n"
+"__global__ void matvec_iq1_m_batch_f32(float *dst, const unsigned char *mat,\n"
+"        const float *x, int n_rows, int n_cols, int M, int x_stride) {\n"
+"    int warp=threadIdx.x/32,lane=threadIdx.x&31,row=blockIdx.x*(blockDim.x/32)+warp,token=blockIdx.y;\n"
+"    if(row>=n_rows||token>=M)return; int nb=n_cols/256,G=nb*32; const unsigned char *rp=mat+(size_t)row*nb*56;\n"
+"    const float *xt=x+(size_t)token*x_stride; float sum=0.0f;\n"
+"    for(int g=lane;g<G;g+=32){int b=g>>5,rem=g&31,ib=rem>>2,l=rem&3; const unsigned char *bp=rp+b*56;\n"
+"        const unsigned char *qs=bp,*qh=bp+32; const unsigned short *sc=(const unsigned short*)(bp+48);\n"
+"        unsigned short su=(sc[0]>>12)|((sc[1]>>8)&0x00f0u)|((sc[2]>>4)&0x0f00u)|(sc[3]&0xf000u);\n"
+"        float d=half_to_float(*(const half_raw*)&su); unsigned short sw=sc[ib/2]; int shift=6*(ib%2)+(l>=2?3:0);\n"
+"        float dl=d*(float)(2*((sw>>shift)&7)+1); unsigned char hv=qh[2*ib+(l>>1)]; int qsft=(l&1)?4:8;\n"
+"        unsigned short gi=qs[4*ib+l]|((unsigned short)(hv<<qsft)&0x700u); float delta=(hv&((l&1)?0x80:0x08))?-0.125f:0.125f;\n"
+"        const signed char *gr=(const signed char*)&iq1s_grid_dev[gi]; const float *xb=xt+b*256+ib*32+l*8;\n"
+"        for(int j=0;j<8;j++)sum+=dl*((float)gr[j]+delta)*xb[j];}\n"
+"    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o); if(lane==0)dst[(size_t)token*n_rows+row]=sum;\n"
+"}\n"
+"__global__ void matvec_iq1_m_dp4a2(float *dst,const unsigned char *mat,\n"
+"        const signed char *q0,const float *s0,const signed char *q1,const float *s1,\n"
+"        int n_rows,int n_cols){\n"
+"    int lane=threadIdx.x&31,warp=threadIdx.x>>5,row=blockIdx.x*(blockDim.x/32)+warp;\n"
+"    if(row>=n_rows)return;int nb=n_cols/256,G=nb*32;float sum=0.0f;\n"
+"    const unsigned char *rp=mat+(size_t)row*nb*56;\n"
+"    for(int g=lane;g<G;g+=32){int b=g>>5,rem=g&31,ib=rem>>2,l=rem&3,qb=b*8+ib;\n"
+"      const unsigned char *bp=rp+b*56,*qs=bp,*qh=bp+32;const unsigned short *sc=(const unsigned short*)(bp+48);\n"
+"      unsigned short su=(sc[0]>>12)|((sc[1]>>8)&0x00f0u)|((sc[2]>>4)&0x0f00u)|(sc[3]&0xf000u);\n"
+"      float d=half_to_float(*(const half_raw*)&su);unsigned short sw=sc[ib/2];\n"
+"      int shift=6*(ib%2)+(l>=2?3:0);float dl=d*(float)(2*((sw>>shift)&7)+1);\n"
+"      unsigned char hv=qh[2*ib+(l>>1)];int qshift=(l&1)?4:8;\n"
+"      unsigned short idx=qs[4*ib+l]|((unsigned short)(hv<<qshift)&0x700u);\n"
+"      float delta=(hv&((l&1)?0x80:0x08))?-0.125f:0.125f;\n"
+"      const signed char *grid=(const signed char*)&iq1s_grid_dev[idx];\n"
+"      int w0=((int)grid[0]&255)|(((int)grid[1]&255)<<8)|(((int)grid[2]&255)<<16)|(((int)grid[3]&255)<<24);\n"
+"      int w1=((int)grid[4]&255)|(((int)grid[5]&255)<<8)|(((int)grid[6]&255)<<16)|(((int)grid[7]&255)<<24);\n"
+"      const signed char *p0=q0+(size_t)qb*32+l*8,*p1=q1+(size_t)qb*32+l*8;\n"
+"      const int *u0=(const int*)p0,*u1=(const int*)p1;int z0=dp4a_hw(w1,u0[1],dp4a_hw(w0,u0[0],0));\n"
+"      int z1=dp4a_hw(w1,u1[1],dp4a_hw(w0,u1[0],0)),t0=0,t1=0;\n"
+"      for(int j=0;j<8;++j){t0+=(int)p0[j];t1+=(int)p1[j];}\n"
+"      sum+=dl*(s0[qb]*((float)z0+delta*(float)t0)+s1[qb]*((float)z1+delta*(float)t1));}\n"
+"    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o);if(lane==0)dst[row]=sum;\n"
+"}\n"
+"/* Exact llama.cpp Q8_1 IQ1_M. Each Q8 block covers four 8-value grid\n"
+" * groups; the two IQ1_M scale codes apply to the first and second 16\n"
+" * values respectively. */\n"
+"__global__ void matvec_iq1_m_q81_batch(float *dst,const unsigned char *mat,\n"
+"        const signed char *q,const float *sd,const float *ss,int n_rows,\n"
+"        int n_cols,int M){\n"
+"    int lane=threadIdx.x&31,warp=threadIdx.x>>5,row=blockIdx.x*(blockDim.x/32)+warp,token=blockIdx.y;\n"
+"    if(row>=n_rows||token>=M)return; int nb=n_cols/256,G=nb*32; float sum=0.0f;\n"
+"    const unsigned char *rp=mat+(size_t)row*nb*56; const signed char *tq=q+(size_t)token*n_cols;\n"
+"    const float *td=sd+(size_t)token*(n_cols/32);\n"
+"    for(int g=lane;g<G;g+=32){int b=g>>5,rem=g&31,ib=rem>>2,l=rem&3,qb=b*8+ib;\n"
+"        const unsigned char *bp=rp+b*56,*qs=bp,*qh=bp+32; const unsigned short *sc=(const unsigned short*)(bp+48);\n"
+"        unsigned short su=(sc[0]>>12)|((sc[1]>>8)&0x00f0u)|((sc[2]>>4)&0x0f00u)|(sc[3]&0xf000u);\n"
+"        float base=half_to_float(*(const half_raw*)&su); unsigned short sw=sc[ib/2];\n"
+"        int sh=6*(ib%2); int scode=2*((sw>>(sh+(l>=2?3:0)))&7)+1;\n"
+"        unsigned char hv=qh[2*ib+(l>>1)]; int qshift=(l&1)?4:8;\n"
+"        unsigned short gi=qs[4*ib+l]|((unsigned short)(hv<<qshift)&0x700u);\n"
+"        float delta=(hv&((l&1)?0x80:0x08))?(-1.0f-0.125f):(-1.0f+0.125f);\n"
+"        const signed char *xp=tq+(size_t)qb*32+l*8;\n"
+"        /* IQ1_M uses the same packed GPU codebook as llama.cpp IQ1_S.\n"
+"         * The signed CPU table plus one is not equivalent: its codeword\n"
+"         * ordering differs from iq1s_grid_gpu. */\n"
+"        unsigned int grid=iq1s_grid_gpu_dev[gi];\n"
+"        int w0=(int)(grid & 0x0f0f0f0fu);\n"
+"        int w1=(int)((grid >> 4) & 0x0f0f0f0fu);\n"
+"        const int *u=(const int*)xp; int z=dp4a_hw(w0,u[0],0); z=dp4a_hw(w1,u[1],z);\n"
+"        int qsum=dp4a_hw(0x01010101,u[0],0);qsum=dp4a_hw(0x01010101,u[1],qsum);\n"
+"        sum+=base*(float)scode*td[qb]*((float)z+delta*(float)qsum);\n"
 "    }\n"
+"    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o); if(lane==0)dst[(size_t)token*n_rows+row]=sum;\n"
+"}\n"
+"/* One-token IQ1_S gate + IQ1_M up projections over the shared Q8_1 input.\n"
+" * The two matrices have different block layouts, so each warp keeps an\n"
+" * independent accumulator for each output while retaining the standalone\n"
+" * IQ1 affine/codebook arithmetic and reduction order. */\n"
+"__global__ void ffn_gate_up_iq1s_m_q81(float *gdst,float *udst,\n"
+"        const unsigned char *gmat,const unsigned char *umat,\n"
+"        const signed char *q,const float *sd,const float *ss,\n"
+"        int n_rows,int n_cols){\n"
+"    int lane=threadIdx.x&31,warp=threadIdx.x>>5,row=blockIdx.x*8+warp;\n"
+"    __shared__ unsigned int grid_cache[2048];\n"
+"    for(int i=threadIdx.x;i<2048;i+=blockDim.x)\n"
+"        grid_cache[i]=iq1s_grid_gpu_dev[i];\n"
+"    __syncthreads();\n"
+"    if(row>=n_rows)return;\n"
+"    int nb=n_cols/256,gs=nb*8,gm=nb*32;float gsum=0.0f,usum=0.0f;\n"
+"    const unsigned char *gr=gmat+(size_t)row*nb*50;\n"
+"    for(int qb=lane;qb<gs;qb+=32){int b=qb>>3,ib=qb&7;const unsigned char *bp=gr+b*50;\n"
+"        const unsigned short *qh=(const unsigned short*)(bp+34);const unsigned char *qs=bp+2;\n"
+"        float dw=half_to_float(*(const half_raw*)bp)*(float)(2*((qh[ib]>>12)&7)+1);\n"
+"        float delta=(qh[ib]&0x8000)?(-1.0f-0.125f):(-1.0f+0.125f);\n"
+"        const signed char *xp=q+(size_t)qb*32;int z=0;\n"
+"        for(int l=0;l<4;++l){int gi=qs[ib*4+l]|(((qh[ib]>>(3*l))&7)<<8);unsigned int grid=grid_cache[gi];\n"
+"            int w0=(int)(grid&0x0f0f0f0fu),w1=(int)((grid>>4)&0x0f0f0f0fu);const int *u=(const int*)(xp+l*8);\n"
+"            z=dp4a_hw(w0,u[0],z);z=dp4a_hw(w1,u[1],z);}\n"
+"        gsum+=dw*(sd[qb]*(float)z+ss[qb]*delta);\n"
+"    }\n"
+"    const unsigned char *ur=umat+(size_t)row*nb*56;\n"
+"    for(int g=lane;g<gm;g+=32){int b=g>>5,rem=g&31,ib=rem>>2,l=rem&3,qb=b*8+ib;const unsigned char *bp=ur+b*56;\n"
+"        const unsigned char *qs=bp,*qh=bp+32;const unsigned short *sc=(const unsigned short*)(bp+48);\n"
+"        unsigned short su=(sc[0]>>12)|((sc[1]>>8)&0x00f0u)|((sc[2]>>4)&0x0f00u)|(sc[3]&0xf000u);\n"
+"        float base=half_to_float(*(const half_raw*)&su);unsigned short sw=sc[ib/2];int sh=6*(ib%2);\n"
+"        int scode=2*((sw>>(sh+(l>=2?3:0)))&7)+1;unsigned char hv=qh[2*ib+(l>>1)];int qshift=(l&1)?4:8;\n"
+"        unsigned short gi=qs[4*ib+l]|((unsigned short)(hv<<qshift)&0x700u);\n"
+"        float delta=(hv&((l&1)?0x80:0x08))?(-1.0f-0.125f):(-1.0f+0.125f);unsigned int grid=grid_cache[gi];\n"
+"        int w0=(int)(grid&0x0f0f0f0fu),w1=(int)((grid>>4)&0x0f0f0f0fu);const int *u=(const int*)(q+(size_t)qb*32+l*8);\n"
+"        int z=dp4a_hw(w0,u[0],0);z=dp4a_hw(w1,u[1],z);int qsum=dp4a_hw(0x01010101,u[0],0);qsum=dp4a_hw(0x01010101,u[1],qsum);\n"
+"        usum+=base*(float)scode*sd[qb]*((float)z+delta*(float)qsum);\n"
+"    }\n"
+"    for(int o=16;o>0;o>>=1){gsum+=__shfl_down(gsum,o);usum+=__shfl_down(usum,o);}\n"
+"    if(lane==0){gdst[row]=gsum;udst[row]=usum;}\n"
+"}\n"
+"/* Exact Q8_1 IQ1_M verification with the same per-row accumulation order as\n"
+" * matvec_iq1_m_q81_batch and one shared weight decode for up to eight rows. */\n"
+"__global__ void matvec_iq1_m_q81_reuse8(float *dst,const unsigned char *mat,\n"
+"        const signed char *q,const float *sd,const float *ss,int nr,int nc,int M){\n"
+"    int lane=threadIdx.x&31,warp=threadIdx.x>>5,row=blockIdx.x*8+warp;\n"
+"    if(row>=nr)return; int nb=nc/256,G=nb*32,qblocks=nc/32; float sum[8]={0,0,0,0,0,0,0,0};\n"
+"    const unsigned char *rp=mat+(size_t)row*nb*56;\n"
+"    for(int g=lane;g<G;g+=32){int b=g>>5,rem=g&31,ib=rem>>2,l=rem&3,qb=b*8+ib;\n"
+"        const unsigned char *bp=rp+b*56,*qs=bp,*qh=bp+32;const unsigned short *sc=(const unsigned short*)(bp+48);\n"
+"        unsigned short su=(sc[0]>>12)|((sc[1]>>8)&0x00f0u)|((sc[2]>>4)&0x0f00u)|(sc[3]&0xf000u);\n"
+"        float base=half_to_float(*(const half_raw*)&su);unsigned short sw=sc[ib/2];int sh=6*(ib%2);\n"
+"        int scode=2*((sw>>(sh+(l>=2?3:0)))&7)+1;unsigned char hv=qh[2*ib+(l>>1)];\n"
+"        int qshift=(l&1)?4:8;unsigned short gi=qs[4*ib+l]|((unsigned short)(hv<<qshift)&0x700u);\n"
+"        float delta=(hv&((l&1)?0x80:0x08))?(-1.0f-0.125f):(-1.0f+0.125f);\n"
+"        unsigned int grid=iq1s_grid_gpu_dev[gi];int w0=(int)(grid&0x0f0f0f0fu),w1=(int)((grid>>4)&0x0f0f0f0fu);\n"
+"        for(int t=0;t<M;++t){const signed char *xp=q+(size_t)t*nc+(size_t)qb*32+l*8;const int *u=(const int*)xp;\n"
+"            int z=dp4a_hw(w0,u[0],0);z=dp4a_hw(w1,u[1],z);\n"
+"            int qsum=dp4a_hw(0x01010101,u[0],0);qsum=dp4a_hw(0x01010101,u[1],qsum);\n"
+"            sum[t]+=base*(float)scode*sd[(size_t)t*qblocks+qb]*((float)z+delta*(float)qsum);}\n"
+"    }\n"
+"    for(int t=0;t<M;++t){for(int o=16;o>0;o>>=1)sum[t]+=__shfl_down(sum[t],o);\n"
+"        if(lane==0)dst[(size_t)t*nr+row]=sum[t];}\n"
+"}\n"
+"__global__ void matvec_iq1_m_dp4a2_batch(float *dst,const unsigned char *mat,\n"
+"        const signed char *q0,const float *s0,const signed char *q1,const float *s1,\n"
+"        int n_rows,int n_cols,int M){\n"
+"    int lane=threadIdx.x&31,warp=threadIdx.x>>5,row=blockIdx.x*8+warp,token=blockIdx.y;\n"
+"    if(row>=n_rows||token>=M)return; int nb=n_cols/256,G=nb*32; float sum=0.0f;\n"
+"    const unsigned char *rp=mat+(size_t)row*nb*56;\n"
+"    const signed char *tq0=q0+(size_t)token*n_cols,*tq1=q1+(size_t)token*n_cols;\n"
+"    const float *ts0=s0+(size_t)token*(n_cols/32),*ts1=s1+(size_t)token*(n_cols/32);\n"
+"    for(int g=lane;g<G;g+=32){int b=g>>5,rem=g&31,ib=rem>>2,l=rem&3,qb=b*8+ib;\n"
+"      const unsigned char *bp=rp+b*56,*qs=bp,*qh=bp+32;const unsigned short *sc=(const unsigned short*)(bp+48);\n"
+"      unsigned short su=(sc[0]>>12)|((sc[1]>>8)&0x00f0u)|((sc[2]>>4)&0x0f00u)|(sc[3]&0xf000u);\n"
+"      float d=half_to_float(*(const half_raw*)&su);unsigned short sw=sc[ib/2];\n"
+"      int shift=6*(ib%2)+(l>=2?3:0);float dl=d*(float)(2*((sw>>shift)&7)+1);\n"
+"      unsigned char hv=qh[2*ib+(l>>1)];int qshift=(l&1)?4:8;\n"
+"      unsigned short idx=qs[4*ib+l]|((unsigned short)(hv<<qshift)&0x700u);\n"
+"      float delta=(hv&((l&1)?0x80:0x08))?-0.125f:0.125f;const signed char *grid=(const signed char*)&iq1s_grid_dev[idx];\n"
+"      const signed char *p0=tq0+(size_t)qb*32+l*8,*p1=tq1+(size_t)qb*32+l*8;\n"
+"      int w0=((int)(unsigned char)grid[0])|((int)(unsigned char)grid[1]<<8)|((int)(unsigned char)grid[2]<<16)|((int)(unsigned char)grid[3]<<24);\n"
+"      int w1=((int)(unsigned char)grid[4])|((int)(unsigned char)grid[5]<<8)|((int)(unsigned char)grid[6]<<16)|((int)(unsigned char)grid[7]<<24);\n"
+"      const int *u0=(const int*)p0,*u1=(const int*)p1;\n"
+"      int z0=dp4a_hw(w1,u0[1],dp4a_hw(w0,u0[0],0));\n"
+"      int z1=dp4a_hw(w1,u1[1],dp4a_hw(w0,u1[0],0)),t0=0,t1=0;\n"
+"      for(int j=0;j<8;j++){t0+=(int)p0[j];t1+=(int)p1[j];}\n"
+"      sum+=dl*(ts0[qb]*((float)z0+delta*(float)t0)+ts1[qb]*((float)z1+delta*(float)t1));\n"
+"    }\n"
+"    for(int o=16;o>0;o>>=1)sum+=__shfl_down(sum,o);if(lane==0)dst[(size_t)token*n_rows+row]=sum;\n"
 "}\n"
 
+"__global__ void matvec_iq1_m_dp4a2_batch_reuse4(float *dst,const unsigned char *mat,\n"
+"        const signed char *q0,const float *s0,const signed char *q1,const float *s1,\n"
+"        int n_rows,int n_cols,int M){\n"
+"    int lane=threadIdx.x&31,warp=threadIdx.x>>5,row=blockIdx.x*8+warp,token0=blockIdx.y*4;\n"
+"    if(row>=n_rows)return; int nb=n_cols/256,G=nb*32; float sum[4]={0,0,0,0};\n"
+"    const unsigned char *rp=mat+(size_t)row*nb*56;\n"
+"    for(int g=lane;g<G;g+=32){int b=g>>5,rem=g&31,ib=rem>>2,l=rem&3,qb=b*8+ib;\n"
+"      const unsigned char *bp=rp+b*56,*qs=bp,*qh=bp+32; const unsigned short *sc=(const unsigned short*)(bp+48);\n"
+"      unsigned short su=(sc[0]>>12)|((sc[1]>>8)&0x00f0u)|((sc[2]>>4)&0x0f00u)|(sc[3]&0xf000u);\n"
+"      float d=half_to_float(*(const half_raw*)&su); unsigned short sw=sc[ib/2];\n"
+"      int shift=6*(ib%2)+(l>=2?3:0); float dl=d*(float)(2*((sw>>shift)&7)+1);\n"
+"      unsigned char hv=qh[2*ib+(l>>1)]; int qshift=(l&1)?4:8;\n"
+"      unsigned short idx=qs[4*ib+l]|((unsigned short)(hv<<qshift)&0x700u);\n"
+"      float delta=(hv&((l&1)?0x80:0x08))?-0.125f:0.125f; const signed char *grid=(const signed char*)&iq1s_grid_dev[idx];\n"
+"      int w0=((int)(unsigned char)grid[0])|((int)(unsigned char)grid[1]<<8)|((int)(unsigned char)grid[2]<<16)|((int)(unsigned char)grid[3]<<24);\n"
+"      int w1=((int)(unsigned char)grid[4])|((int)(unsigned char)grid[5]<<8)|((int)(unsigned char)grid[6]<<16)|((int)(unsigned char)grid[7]<<24);\n"
+"      for(int t=0;t<4;t++){int token=token0+t;if(token<M){const signed char *p0=q0+(size_t)token*n_cols+qb*32+l*8,*p1=q1+(size_t)token*n_cols+qb*32+l*8;\n"
+"        const int *u0=(const int*)p0,*u1=(const int*)p1; int z0=dp4a_hw(w1,u0[1],dp4a_hw(w0,u0[0],0));\n"
+"        int z1=dp4a_hw(w1,u1[1],dp4a_hw(w0,u1[0],0)),t0=0,t1=0;\n"
+"        for(int j=0;j<8;j++){t0+=(int)p0[j];t1+=(int)p1[j];}\n"
+"        sum[t]+=dl*(s0[(size_t)token*(n_cols/32)+qb]*((float)z0+delta*(float)t0)+s1[(size_t)token*(n_cols/32)+qb]*((float)z1+delta*(float)t1));}}\n"
+"    }\n"
+"    for(int t=0;t<4;t++){for(int o=16;o>0;o>>=1)sum[t]+=__shfl_down(sum[t],o);if(lane==0&&token0+t<M)dst[(size_t)(token0+t)*n_rows+row]=sum[t];}\n"
+"}\n"
+"/* Single-Q8 IQ1 batch path, matching llama.cpp's MMVQ vec_dot contract.\n"
+" * It is intentionally opt-in: the second residual activation term remains\n"
+" * the exact production path. */\n"
+"__global__ void matvec_iq1_q8_single_batch(float *dst,const unsigned char *mat,\n"
+"        const signed char *q0,const float *s0,int n_rows,int n_cols,int M,int fmt){\n"
+"    int lane=threadIdx.x&31,warp=threadIdx.x>>5,row=blockIdx.x*8+warp;\n"
+"    int token0=blockIdx.y*4;\n"
+"    if(row>=n_rows||token0>=M)return; int nb=n_cols/256,G=n_cols/32;\n"
+"    float sum[4]={0.0f,0.0f,0.0f,0.0f}; int rb=fmt?56:50;\n"
+"    const unsigned char *rp=mat+(size_t)row*nb*rb;\n"
+"    for(int g=lane;g<G;g+=32){\n"
+"        int b=g>>3,ib=g&7; const unsigned char *bp=rp+b*rb;\n"
+"        float d,scale; const unsigned char *qs,*qh; unsigned short gi;\n"
+"        if(fmt){\n"
+"            const unsigned short *sc=(const unsigned short *)(bp+48);\n"
+"            unsigned short sw=sc[ib>>1]; int shift=6*(ib&1)+(ib>=4?3:0);\n"
+"            unsigned short su=(sc[0]>>12)|((sc[1]>>8)&0x00f0u)|\n"
+"                ((sc[2]>>4)&0x0f00u)|(sc[3]&0xf000u);\n"
+"            d=half_to_float(*(const half_raw *)&su); scale=d*(float)(2*((sw>>shift)&7)+1);\n"
+"            qs=bp; qh=bp+32;\n"
+"        } else {\n"
+"            const unsigned short *qh16=(const unsigned short *)(bp+34);\n"
+"            d=half_to_float(*(const half_raw *)bp); scale=d*(float)(2*((qh16[ib]>>12)&7)+1);\n"
+"            qs=bp+2; qh=(const unsigned char *)qh16;\n"
+"        }\n"
+"        for(int l=0;l<4;l++){\n"
+"            float delta; int base=b*256+ib*32+l*8;\n"
+"            if(fmt){ unsigned char hv=qh[2*ib+(l>>1)];\n"
+"                int qshift=(l&1)?4:8; gi=(unsigned short)(qs[4*ib+l]|((hv<<qshift)&0x700u));\n"
+"                delta=(hv&((l&1)?0x80:0x08))?-0.125f:0.125f;\n"
+"            } else { const unsigned short *qh16=(const unsigned short *)qh;\n"
+"                gi=(unsigned short)(qs[ib*4+l]|(((qh16[ib]>>(3*l))&7)<<8));\n"
+"                delta=(qh16[ib]&0x8000)?-0.125f:0.125f; }\n"
+"            const signed char *gr=(const signed char *)&iq1s_grid_dev[gi];\n"
+"            int w0=((int)(unsigned char)gr[0])|((int)(unsigned char)gr[1]<<8)|\n"
+"                ((int)(unsigned char)gr[2]<<16)|((int)(unsigned char)gr[3]<<24);\n"
+"            int w1=((int)(unsigned char)gr[4])|((int)(unsigned char)gr[5]<<8)|\n"
+"                ((int)(unsigned char)gr[6]<<16)|((int)(unsigned char)gr[7]<<24);\n"
+"            for(int t=0;t<4;t++){int token=token0+t;if(token<M){\n"
+"                const signed char *xt=q0+(size_t)token*n_cols;\n"
+"                const float *st=s0+(size_t)token*(n_cols/32);\n"
+"                const int *u=(const int *)(xt+base); int z=dp4a_hw(w0,u[0],0);\n"
+"                z=dp4a_hw(w1,u[1],z); int sy=0;\n"
+"                for(int j=0;j<8;j++)sy+=(int)xt[base+j];\n"
+"                sum[t]+=scale*st[b*8+ib]*((float)z+delta*(float)sy);\n"
+"            }}\n"
+"        }\n"
+"    }\n"
+"    for(int t=0;t<4;t++){for(int o=16;o>0;o>>=1)\n"
+"        sum[t]+=__shfl_down(sum[t],o);\n"
+"        if(lane==0&&token0+t<M)dst[(size_t)(token0+t)*n_rows+row]=sum[t];}\n"
+"}\n"
 "/* ---- matvec_tq1_0_f32: TQ1_0 matrix x F32 vector -> F32 ---- */\n"
 "__global__ void matvec_tq1_0_f32(float *dst, const unsigned char *mat, const float *x,\n"
 "                                   int n_rows, int n_cols) {\n"
@@ -6814,6 +9851,30 @@ static const char *hip_kernel_source =
 "    dst[out_idx] = f32_to_bf16(val);\n"
 "}\n"
 "\n"
+"/* Per-call dequant of IQ1_M (56 B/block) to BF16. */\n"
+"__global__ void dequant_iq1_m_to_bf16(bf16_raw *dst, const unsigned char *mat,\n"
+"                                        int n_rows, int n_cols) {\n"
+"    int row = blockIdx.x, b = blockIdx.y;\n"
+"    int n_blocks_per_row = n_cols / 256;\n"
+"    const unsigned char *bp = mat + (size_t)row * n_blocks_per_row * 56 + b * 56;\n"
+"    const unsigned char *qs = bp, *qh = bp + 32;\n"
+"    const unsigned short *sc = (const unsigned short *)(bp + 48);\n"
+"    int tid = threadIdx.x, ib = tid >> 5, sub = tid & 31;\n"
+"    int l = sub >> 3, j = sub & 7;\n"
+"    unsigned short su = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0u) |\n"
+"                        ((sc[2] >> 4) & 0x0f00u) | (sc[3] & 0xf000u);\n"
+"    float d = half_to_float(*(const half_raw *)&su);\n"
+"    unsigned short sw = sc[ib / 2];\n"
+"    int shift = 6 * (ib % 2) + (l >= 2 ? 3 : 0);\n"
+"    float dl = d * (float)(2 * ((sw >> shift) & 7) + 1);\n"
+"    unsigned char hv = qh[2 * ib + (l >> 1)];\n"
+"    int qshift = (l & 1) ? 4 : 8;\n"
+"    unsigned short idx = qs[4 * ib + l] | ((unsigned short)(hv << qshift) & 0x700u);\n"
+"    float delta = (hv & ((l & 1) ? 0x80 : 0x08)) ? -0.125f : 0.125f;\n"
+"    const signed char *grid = (const signed char *)&iq1s_grid_dev[idx];\n"
+"    float val = dl * ((float)grid[j] + delta);\n"
+"    dst[(size_t)row * n_cols + (size_t)b * 256 + tid] = f32_to_bf16(val);\n"
+"}\n"
 "/* Per-call dequant of TQ1_0 (54 B/block) to BF16. */\n"
 "__global__ void dequant_tq1_0_to_bf16(bf16_raw *dst, const unsigned char *mat,\n"
 "                                        int n_rows, int n_cols) {\n"
@@ -7333,6 +10394,463 @@ static const char *hip_kernel_source =
 "            Y[(size_t)row * N + col] = acc[i];\n"
 "        }\n"
 "    }\n"
+"}\n"
+"/* Fused IQ2_XXS -> BF16 WMMA GEMM.  This follows the 128x128, 256-thread\n"
+" * RDNA4 MMQ tile shape used by llama.cpp, but dequantizes the 128x32 weight\n"
+" * tile directly into LDS instead of materializing a BF16 matrix in VRAM.\n"
+" * The path is opt-in because BF16 accumulation changes the native F32 order. */\n"
+"__global__ void gemm_iq2_xxs_wmma(float *Y, const unsigned char *W, const float *X,\n"
+"        int N, int K, int M) {\n"
+"    int tid=threadIdx.x,wave=tid>>5,lane=tid&31,wM=wave&1,wN=wave>>1;\n"
+"    int half=lane>>4,idx=lane&15,koff=half*8;\n"
+"    int m0=blockIdx.y*128,n0=blockIdx.x*128,nb=K/256;\n"
+"    __shared__ unsigned short smA[128*32],smB[128*32];\n"
+"    float8 z={0,0,0,0,0,0,0,0},c00=z,c01=z,c10=z,c11=z,c20=z,c21=z,c30=z,c31=z;\n"
+"    for(int k=0;k<K;k+=32){\n"
+"        for(int it=0;it<16;it++){int e=tid*16+it,er=e>>5,ek=e&31,row=m0+er,kp=k+ek;\n"
+"            smA[e]=(row<M&&kp<K)?f32_to_bf16(X[(size_t)row*K+kp]):0;\n"
+"            int col=n0+er; unsigned short out=0;\n"
+"            if(col<N&&kp<K){int b=kp>>8,rem=kp&255,ib=rem>>5,l=(rem&31)>>3,j=rem&7;\n"
+"                const unsigned char *bp=W+(size_t)col*nb*66+b*66;\n"
+"                const unsigned short *qs=(const unsigned short*)(bp+2);\n"
+"                unsigned int a0=qs[4*ib]|((unsigned int)qs[4*ib+1]<<16),a1=qs[4*ib+2]|((unsigned int)qs[4*ib+3]<<16);\n"
+"                float d=half_to_float(*(const half_raw*)bp),db=d*(0.5f+(float)(a1>>28))*0.25f;\n"
+"                const unsigned char *gr=(const unsigned char *)&iq2xxs_grid_dev[(a0>>(8*l))&255];\n"
+"                unsigned char sg=ksigns_iq2xs_dev[(a1>>(7*l))&127];\n"
+"                out=f32_to_bf16(db*(float)gr[j]*((sg&(1<<j))?-1.0f:1.0f));}\n"
+"            smB[e]=out;\n"
+"        }\n"
+"        __syncthreads(); int abase=wM*64,bbase=wN*32;\n"
+"        for(int kk0=0;kk0<32;kk0+=16){bf16x8 a0,a1,a2,a3,b0,b1;\n"
+"            for(int i=0;i<8;i++){a0[i]=smA[(abase+idx)*32+kk0+koff+i];a1[i]=smA[(abase+16+idx)*32+kk0+koff+i];\n"
+"                a2[i]=smA[(abase+32+idx)*32+kk0+koff+i];a3[i]=smA[(abase+48+idx)*32+kk0+koff+i];\n"
+"                b0[i]=smB[(bbase+idx)*32+kk0+koff+i];b1[i]=smB[(bbase+16+idx)*32+kk0+koff+i];}\n"
+"            c00=__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a0,b0,c00);c01=__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a0,b1,c01);\n"
+"            c10=__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a1,b0,c10);c11=__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a1,b1,c11);\n"
+"            c20=__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a2,b0,c20);c21=__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a2,b1,c21);\n"
+"            c30=__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a3,b0,c30);c31=__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a3,b1,c31);}\n"
+"        __syncthreads();\n"
+"    }\n"
+"    float8 *acc[8]={&c00,&c01,&c10,&c11,&c20,&c21,&c30,&c31}; int ms[8]={0,0,16,16,32,32,48,48},ns[8]={0,16,0,16,0,16,0,16};\n"
+"    for(int t=0;t<8;t++){int col=n0+ wN*32+ns[t]+idx;if(col>=N)continue;float8 v=*acc[t];\n"
+"        for(int i=0;i<8;i++){int row=m0+wM*64+ms[t]+half*8+i;if(row<M)Y[(size_t)row*N+col]=v[i];}}\n"
+"}\n"
+"/* IQ3_XXS -> Q8 WMMA tile (MMQ-shaped RDNA4 experiment). */\n"
+"__global__ void gemm_iq3_xxs_q8_wmma(float *Y, const unsigned char *W, const signed char *X, const float *S, int N, int K, int M) {\n"
+"    typedef int i32x2 __attribute__((ext_vector_type(2))); typedef int i32x8 __attribute__((ext_vector_type(8)));\n"
+"    int tid=threadIdx.x,wave=tid>>5,lane=tid&31,wM=wave&1,wN=wave>>1,idx=lane&15,half=idx>>3;\n"
+"    int m0=blockIdx.y*128,n0=blockIdx.x*128,nb=K/256;\n"
+"    __shared__ signed char smA[128*32],smB[128*32]; __shared__ float ws[128];\n"
+"    float8 f00={0,0,0,0,0,0,0,0},f01=f00,f10=f00,f11=f00,f20=f00,f21=f00,f30=f00,f31=f00;\n"
+"    for(int k=0;k<K;k+=32){\n"
+"        for(int it=0;it<16;it++){int e=tid*16+it,er=e>>5,ek=e&31,row=m0+er,kp=k+ek;smA[e]=(row<M&&kp<K)?X[(size_t)row*K+kp]:0;}\n"
+"        for(int it=0;it<16;it++){int e=tid*16+it,er=e>>5,ek=e&31,col=n0+er,kp=k+ek;smB[e]=0;if(col<N&&kp<K){int b=kp>>8,rem=kp&255,ib=rem>>5,j=rem&31,l=j>>3,p=j&7;const unsigned char *bp=W+(size_t)col*nb*98+b*98;const unsigned char *qs=bp+2;unsigned int aux=*(const unsigned int*)(bp+66+4*ib);unsigned char sg=ksigns_iq2xs_dev[(aux>>(7*l))&127];const unsigned char *gr=(const unsigned char*)&iq3xxs_grid_dev[qs[8*ib+2*l+(p>=4)]];unsigned int v=gr[p&3];if(sg&(1<<p))v=(unsigned int)(-(int)v)&255u;smB[e]=(signed char)v;if(ek==0)ws[er]=half_to_float(*(const half_raw*)bp)*(0.5f+(float)(aux>>28))*0.5f;}}\n"
+"        __syncthreads();i32x8 c00={0,0,0,0,0,0,0,0},c01=c00,c10=c00,c11=c00,c20=c00,c21=c00,c30=c00,c31=c00;int abase=wM*64,bbase=wN*32;\n"
+"        for(int kk0=0;kk0<32;kk0+=16){i32x2 a0,a1,a2,a3,b0,b1;int aa=(abase+idx)*32+kk0,bb=(bbase+idx)*32+kk0;a0[0]=*(const int*)&smA[aa];a0[1]=*(const int*)&smA[aa+4];a1[0]=*(const int*)&smA[(abase+16+idx)*32+kk0];a1[1]=*(const int*)&smA[(abase+16+idx)*32+kk0+4];a2[0]=*(const int*)&smA[(abase+32+idx)*32+kk0];a2[1]=*(const int*)&smA[(abase+32+idx)*32+kk0+4];a3[0]=*(const int*)&smA[(abase+48+idx)*32+kk0];a3[1]=*(const int*)&smA[(abase+48+idx)*32+kk0+4];b0[0]=*(const int*)&smB[bb];b0[1]=*(const int*)&smB[bb+4];b1[0]=*(const int*)&smB[(bbase+16+idx)*32+kk0];b1[1]=*(const int*)&smB[(bbase+16+idx)*32+kk0+4];c00=__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true,a0,true,b0,c00,false);c01=__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true,a0,true,b1,c01,false);c10=__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true,a1,true,b0,c10,false);c11=__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true,a1,true,b1,c11,false);c20=__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true,a2,true,b0,c20,false);c21=__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true,a2,true,b1,c21,false);c30=__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true,a3,true,b0,c30,false);c31=__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true,a3,true,b1,c31,false);}\n"
+"        i32x8 *cc[8]={&c00,&c01,&c10,&c11,&c20,&c21,&c30,&c31};float8 *ff[8]={&f00,&f01,&f10,&f11,&f20,&f21,&f30,&f31};int ms[8]={0,0,16,16,32,32,48,48},ns[8]={0,16,0,16,0,16,0,16};for(int t=0;t<8;t++){int col=n0+wN*32+ns[t]+idx;if(col>=N)continue;int wi=col-n0;for(int i=0;i<8;i++){int row=m0+wM*64+ms[t]+half*8+i;if(row<M)(*ff[t])[i]+=(float)(*cc[t])[i]*ws[wi]*S[(size_t)row*(K/32)+k/32];}}__syncthreads();\n"
+"    }\n"
+"    float8 *ff[8]={&f00,&f01,&f10,&f11,&f20,&f21,&f30,&f31};int ms[8]={0,0,16,16,32,32,48,48},ns[8]={0,16,0,16,0,16,0,16};for(int t=0;t<8;t++){int col=n0+wN*32+ns[t]+idx;if(col>=N)continue;for(int i=0;i<8;i++){int row=m0+wM*64+ms[t]+half*8+i;if(row<M)Y[(size_t)row*N+col]=(*ff[t])[i];}}\n"
+"}\n"
+"/* IQ3_S -> Q8 WMMA tile.  Weight codebooks are expanded into the same\n"
+" * 32-value LDS tile used by llama.cpp MMQ; one scale is applied per\n"
+" * IQ3_S 32-value sub-block on writeback.  q0 is intentionally the\n"
+" * first Q8 residual term; the exact DP4A path remains the control. */\n"
+"__global__ void gemm_iq3_s_q8_wmma(float *Y, const unsigned char *W,\n"
+"        const signed char *X, const float *S, int N, int K, int M) {\n"
+"    typedef int i32x2 __attribute__((ext_vector_type(2))); typedef int i32x8 __attribute__((ext_vector_type(8)));\n"
+"    int tid=threadIdx.x,wave=tid>>5,lane=tid&31,wM=wave&1,wN=wave>>1,idx=lane&15,half=idx>>3;\n"
+"    int m0=blockIdx.y*128,n0=blockIdx.x*128,nb=K/256;\n"
+"    __shared__ signed char smA[128*32],smB[128*32]; __shared__ float ws[128];\n"
+"    float8 f00={0,0,0,0,0,0,0,0},f01=f00,f10=f00,f11=f00,f20=f00,f21=f00,f30=f00,f31=f00;\n"
+"    for(int k=0;k<K;k+=32){\n"
+"        for(int it=0;it<16;it++){int e=tid*16+it,er=e>>5,ek=e&31,row=m0+er,kp=k+ek; smA[e]=(row<M&&kp<K)?X[(size_t)row*K+kp]:0;}\n"
+"        for(int it=0;it<16;it++){int e=tid*16+it,er=e>>5,ek=e&31,col=n0+er,kp=k+ek; smB[e]=0;\n"
+"            if(col<N&&kp<K){int b=kp>>8,rem=kp&255,ib=rem>>5,j=rem&31,l=j>>3,p=j&7; const unsigned char *bp=W+(size_t)col*nb*110+b*110;\n"
+"                const unsigned char *qs=bp+2+ib*8; unsigned char qh=bp[66+ib],sg=bp[74+ib*4+l];\n"
+"                unsigned int g1=iq3s_grid_dev[qs[2*l]|((qh<<(8-2*l))&0x100)],g2=iq3s_grid_dev[qs[2*l+1]|((qh<<(7-2*l))&0x100)];\n"
+"                unsigned int v=(p<4)?((g1>>(8*p))&255u):((g2>>(8*(p-4)))&255u); int bit=(p<4)?p:p; if(sg&(1<<bit))v=(unsigned int)(-(int)v)&255u; smB[e]=(signed char)v;\n"
+"                if(ek==0){unsigned char sc=bp[106+(ib>>1)];int ls=(ib&1)?((sc>>4)&15):(sc&15);ws[er]=half_to_float(*(const half_raw*)bp)*(float)(1+2*ls);}\n"
+"            }\n"
+"        }\n"
+"        __syncthreads();\n"
+"        i32x8 c00={0,0,0,0,0,0,0,0},c01=c00,c10=c00,c11=c00,c20=c00,c21=c00,c30=c00,c31=c00; int abase=wM*64,bbase=wN*32;\n"
+"        for(int kk0=0;kk0<32;kk0+=16){i32x2 a0,a1,a2,a3,b0,b1;int aa=(abase+idx)*32+kk0,bb=(bbase+idx)*32+kk0;\n"
+"            a0[0]=*(const int*)&smA[aa];a0[1]=*(const int*)&smA[aa+4];a1[0]=*(const int*)&smA[(abase+16+idx)*32+kk0];a1[1]=*(const int*)&smA[(abase+16+idx)*32+kk0+4];\n"
+"            a2[0]=*(const int*)&smA[(abase+32+idx)*32+kk0];a2[1]=*(const int*)&smA[(abase+32+idx)*32+kk0+4];a3[0]=*(const int*)&smA[(abase+48+idx)*32+kk0];a3[1]=*(const int*)&smA[(abase+48+idx)*32+kk0+4];\n"
+"            b0[0]=*(const int*)&smB[bb];b0[1]=*(const int*)&smB[bb+4];b1[0]=*(const int*)&smB[(bbase+16+idx)*32+kk0];b1[1]=*(const int*)&smB[(bbase+16+idx)*32+kk0+4];\n"
+"            c00=__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true,a0,true,b0,c00,false);c01=__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true,a0,true,b1,c01,false);\n"
+"            c10=__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true,a1,true,b0,c10,false);c11=__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true,a1,true,b1,c11,false);\n"
+"            c20=__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true,a2,true,b0,c20,false);c21=__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true,a2,true,b1,c21,false);\n"
+"            c30=__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true,a3,true,b0,c30,false);c31=__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true,a3,true,b1,c31,false);}\n"
+"        i32x8 *cc[8]={&c00,&c01,&c10,&c11,&c20,&c21,&c30,&c31};float8 *ff[8]={&f00,&f01,&f10,&f11,&f20,&f21,&f30,&f31};int ms[8]={0,0,16,16,32,32,48,48},ns[8]={0,16,0,16,0,16,0,16};\n"
+"        for(int t=0;t<8;t++){int col=n0+wN*32+ns[t]+idx;if(col>=N)continue;int wi=col-n0;for(int i=0;i<8;i++){int row=m0+wM*64+ms[t]+half*8+i;if(row<M)(*ff[t])[i]+=(float)(*cc[t])[i]*ws[wi]*S[(size_t)row*(K/32)+k/32];}}\n"
+"        __syncthreads();\n"
+"    }\n"
+"    float8 *ff[8]={&f00,&f01,&f10,&f11,&f20,&f21,&f30,&f31};int ms[8]={0,0,16,16,32,32,48,48},ns[8]={0,16,0,16,0,16,0,16};\n"
+"    for(int t=0;t<8;t++){int col=n0+wN*32+ns[t]+idx;if(col>=N)continue;for(int i=0;i<8;i++){int row=m0+wM*64+ms[t]+half*8+i;if(row<M)Y[(size_t)row*N+col]=(*ff[t])[i];}}\n"
+"}\n"
+"__global__ void gemm_iq3_s_q8_wmma64(float *Y, const unsigned char *W,\n"
+"        const signed char *X, const float *S, const signed char *X1,\n"
+"        const float *S1, int N, int K, int M, int term) {\n"
+"    typedef int i32x2 __attribute__((ext_vector_type(2))); typedef int i32x8 __attribute__((ext_vector_type(8)));\n"
+"    int tid=threadIdx.x,wave=tid>>5,lane=tid&31,wM=wave&1,wN=wave>>1,idx=lane&15,half=idx>>3;\n"
+"    int m0=blockIdx.y*64,n0=blockIdx.x*128,nb=K/256;\n"
+"    __shared__ signed char smA[64*32],smB[128*32]; __shared__ float ws[128];\n"
+"    float8 f00={0,0,0,0,0,0,0,0},f01=f00,f10=f00,f11=f00;\n"
+"    for(int k=0;k<K;k+=32){\n"
+"        for(int it=0;it<8;it++){int e=tid*8+it,er=e>>5,ek=e&31,row=m0+er,kp=k+ek;smA[e]=(row<M&&kp<K)?X[(size_t)row*K+kp]:0;}\n"
+"        for(int it=0;it<16;it++){int e=tid*16+it,er=e>>5,ek=e&31,col=n0+er,kp=k+ek;smB[e]=0;\n"
+"            if(col<N&&kp<K){int b=kp>>8,rem=kp&255,ib=rem>>5,j=rem&31,l=j>>3,p=j&7;const unsigned char *bp=W+(size_t)col*nb*110+b*110;\n"
+"                const unsigned char *qs=bp+2+ib*8;unsigned char qh=bp[66+ib],sg=bp[74+ib*4+l];\n"
+"                unsigned int g1=iq3s_grid_dev[qs[2*l]|((qh<<(8-2*l))&0x100)],g2=iq3s_grid_dev[qs[2*l+1]|((qh<<(7-2*l))&0x100)];\n"
+"                unsigned int v=(p<4)?((g1>>(8*p))&255u):((g2>>(8*(p-4)))&255u);if(sg&(1<<p))v=(unsigned int)(-(int)v)&255u;smB[e]=(signed char)v;\n"
+"                if(ek==0){unsigned char sc=bp[106+(ib>>1)];int ls=(ib&1)?((sc>>4)&15):(sc&15);ws[er]=half_to_float(*(const half_raw*)bp)*(float)(1+2*ls);}\n"
+"            }\n"
+"        }\n"
+"        __syncthreads();\n"
+"        i32x8 c00={0,0,0,0,0,0,0,0},c01=c00,c10=c00,c11=c00;int abase=wM*32,bbase=wN*32;\n"
+"        for(int kk0=0;kk0<32;kk0+=16){i32x2 a0,a1,b0,b1;int aa=(abase+idx)*32+kk0,bb=(bbase+idx)*32+kk0;\n"
+"            a0[0]=*(const int*)&smA[aa];a0[1]=*(const int*)&smA[aa+4];a1[0]=*(const int*)&smA[(abase+16+idx)*32+kk0];a1[1]=*(const int*)&smA[(abase+16+idx)*32+kk0+4];\n"
+"            b0[0]=*(const int*)&smB[bb];b0[1]=*(const int*)&smB[bb+4];b1[0]=*(const int*)&smB[(bbase+16+idx)*32+kk0];b1[1]=*(const int*)&smB[(bbase+16+idx)*32+kk0+4];\n"
+"            c00=__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true,a0,true,b0,c00,false);c01=__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true,a0,true,b1,c01,false);\n"
+"            c10=__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true,a1,true,b0,c10,false);c11=__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true,a1,true,b1,c11,false);}\n"
+"        i32x8 *cc[4]={&c00,&c01,&c10,&c11};float8 *ff[4]={&f00,&f01,&f10,&f11};int ms[4]={0,0,16,16},ns[4]={0,16,0,16};\n"
+"        for(int t=0;t<4;t++){int col=n0+wN*32+ns[t]+idx;if(col>=N)continue;int wi=col-n0;for(int i=0;i<8;i++){int row=m0+wM*32+ms[t]+half*8+i;if(row<M)(*ff[t])[i]+=(float)(*cc[t])[i]*ws[wi]*S[(size_t)row*(K/32)+k/32];}}\n"
+"        __syncthreads();\n"
+"    }\n"
+"    float8 *ff[4]={&f00,&f01,&f10,&f11};int ms[4]={0,0,16,16},ns[4]={0,16,0,16};\n"
+"    for(int t=0;t<4;t++){int col=n0+wN*32+ns[t]+idx;if(col>=N)continue;for(int i=0;i<8;i++){int row=m0+wM*32+ms[t]+half*8+i;if(row<M)Y[(size_t)row*N+col]=(*ff[t])[i];}}\n"
+"}\n"
+"/* Experimental IQ1_M -> Q8 WMMA tile.  IQ1_M has the same 256-value\n"
+ " * block geometry as IQ1_S but stores two 6-bit scale fields per 32-value\n"
+" * group.  This path uses the IQ1_S codebook in WMMA and intentionally\n"
+" * omits the small +/- delta correction; the exact DP4A path remains the\n"
+" * default until output parity is established. */\n"
+"__global__ void gemm_iq1_m_q8_wmma(float *Y, const unsigned char *W,\n"
+"        const signed char *X, const float *S, int N, int K, int M, int fmt) {\n"
+"    typedef int i32x2 __attribute__((ext_vector_type(2)));\n"
+"    typedef int i32x8 __attribute__((ext_vector_type(8)));\n"
+"    int tid=threadIdx.x,wave=tid>>5,lane=tid&31,wM=wave&1,wN=wave>>1;\n"
+"    int idx=lane&15,half=idx>>3,m0=blockIdx.y*128,n0=blockIdx.x*128,nb=K/256;\n"
+"    __shared__ signed char smA[128*128],smB[128*128];\n"
+"    __shared__ float ws[128*4];\n"
+"    float8 f00={0,0,0,0,0,0,0,0},f01=f00,f10=f00,f11=f00,\n"
+"           f20=f00,f21=f00,f30=f00,f31=f00;\n"
+"    for(int k=0;k<K;k+=128){\n"
+"        for(int it=0;it<64;it++){\n"
+"            int e=tid*64+it,er=e>>7,ek=e&127,row=m0+er,kp=k+ek;\n"
+"            smA[e]=(row<M&&kp<K)?X[(size_t)row*K+kp]:0;\n"
+"        }\n"
+"        for(int it=0;it<64;it++){\n"
+"            int e=tid*64+it,er=e>>7,ek=e&127,col=n0+er,kp=k+ek;\n"
+"            smB[e]=0;\n"
+"            if(col<N&&kp<K){\n"
+"                int b=kp>>8,rem=kp&255,ib=rem>>5,j=rem&31,\n"
+"                    l=j>>3,p=j&7;\n"
+"                int rb=fmt?56:50;\n"
+"                const unsigned char *bp=W+(size_t)col*nb*rb+b*rb;\n"
+"                const unsigned char *qs=fmt?bp:bp+2;\n"
+"                const unsigned char *qh=fmt?bp+32:bp+34;\n"
+"                unsigned short gi; float d,scale; unsigned char hv;\n"
+"                if(fmt){\n"
+"                    const unsigned short *sc=(const unsigned short *)(bp+48);\n"
+"                    unsigned short sw=sc[ib>>1];\n"
+"                    int shift=6*(ib&1)+(l>=2?3:0);\n"
+"                    hv=qh[2*ib+(l>>1)];\n"
+"                    int qshift=(l&1)?4:8;\n"
+"                    gi=(unsigned short)(qs[4*ib+l]|\n"
+"                        ((unsigned short)(hv<<qshift)&0x700u));\n"
+"                    unsigned short su=(unsigned short)((sc[0]>>12)|\n"
+"                        ((sc[1]>>8)&0x00f0u)|((sc[2]>>4)&0x0f00u)|\n"
+"                        (sc[3]&0xf000u));\n"
+"                    d=half_to_float(*(const half_raw *)&su);\n"
+"                    scale=d*(float)(2*((sw>>shift)&7)+1);\n"
+"                } else {\n"
+"                    const unsigned short *qh16=(const unsigned short *)qh;\n"
+"                    hv=(unsigned char)(qh16[ib]>>8);\n"
+"                    gi=(unsigned short)(qs[ib*4+l]|\n"
+"                        (((qh16[ib]>>(3*l))&7)<<8));\n"
+"                    d=half_to_float(*(const half_raw *)bp);\n"
+"                    scale=d*(float)(2*((qh16[ib]>>12)&7)+1);\n"
+"                }\n"
+"                unsigned long long grid=iq1s_grid_dev[gi];\n"
+"                /* IQ1_M's table stores two 4-bit values per byte.  The\n"
+"                 * CUDA reference masks/shifts these nibbles into the\n"
+"                 * DP4A operands; loading a whole signed byte here was a\n"
+"                 * wrong codebook mapping for entries containing 0xff. */\n"
+"                smB[e]=(signed char)((grid>>(4*p))&0x0fu);\n"
+"                if((ek&31)==0){\n"
+"                    ws[er*4+(ek>>5)]=scale;\n"
+"                }\n"
+"            }\n"
+"        }\n"
+"        __syncthreads();\n"
+"        i32x8 c00={0,0,0,0,0,0,0,0},c01=c00,c10=c00,c11=c00,\n"
+"              c20=c00,c21=c00,c30=c00,c31=c00;\n"
+"        int abase=wM*64,bbase=wN*32;\n"
+"        for(int z=0;z<4;z++) for(int kk0=0;kk0<32;kk0+=16){\n"
+"            i32x2 a0,a1,a2,a3,b0,b1;\n"
+"            int zoff=z*32,aa=(abase+idx)*128+zoff+kk0,\n"
+"                bb=(bbase+idx)*128+zoff+kk0;\n"
+"            a0[0]=*(const int*)&smA[aa];a0[1]=*(const int*)&smA[aa+4];\n"
+"            a1[0]=*(const int*)&smA[(abase+16+idx)*128+zoff+kk0];\n"
+"            a1[1]=*(const int*)&smA[(abase+16+idx)*128+zoff+kk0+4];\n"
+"            a2[0]=*(const int*)&smA[(abase+32+idx)*128+zoff+kk0];\n"
+"            a2[1]=*(const int*)&smA[(abase+32+idx)*128+zoff+kk0+4];\n"
+"            a3[0]=*(const int*)&smA[(abase+48+idx)*128+zoff+kk0];\n"
+"            a3[1]=*(const int*)&smA[(abase+48+idx)*128+zoff+kk0+4];\n"
+"            b0[0]=*(const int*)&smB[bb];b0[1]=*(const int*)&smB[bb+4];\n"
+"            b1[0]=*(const int*)&smB[(bbase+16+idx)*128+zoff+kk0];\n"
+"            b1[1]=*(const int*)&smB[(bbase+16+idx)*128+zoff+kk0+4];\n"
+"            c00=__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true,a0,true,b0,c00,false);\n"
+"            c01=__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true,a0,true,b1,c01,false);\n"
+"            c10=__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true,a1,true,b0,c10,false);\n"
+"            c11=__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true,a1,true,b1,c11,false);\n"
+"            c20=__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true,a2,true,b0,c20,false);\n"
+"            c21=__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true,a2,true,b1,c21,false);\n"
+"            c30=__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true,a3,true,b0,c30,false);\n"
+"            c31=__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true,a3,true,b1,c31,false);\n"
+"        }\n"
+"        i32x8 *cc[8]={&c00,&c01,&c10,&c11,&c20,&c21,&c30,&c31};\n"
+"        float8 *ff[8]={&f00,&f01,&f10,&f11,&f20,&f21,&f30,&f31};\n"
+"        int ms[8]={0,0,16,16,32,32,48,48},ns[8]={0,16,0,16,0,16,0,16};\n"
+"        for(int t=0;t<8;t++){\n"
+"            int col=n0+wN*32+ns[t]+idx;if(col>=N)continue;\n"
+"            int wi=col-n0;\n"
+"            for(int i=0;i<8;i++){\n"
+"                int row=m0+wM*64+ms[t]+half*8+i;\n"
+"                if(row<M)(*ff[t])[i]+=(float)(*cc[t])[i]*\n"
+"                    ws[wi*4]*S[(size_t)row*(K/32)+k/32];\n"
+"            }\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    float8 *ff[8]={&f00,&f01,&f10,&f11,&f20,&f21,&f30,&f31};\n"
+"    int ms[8]={0,0,16,16,32,32,48,48},ns[8]={0,16,0,16,0,16,0,16};\n"
+"    for(int t=0;t<8;t++){int col=n0+wN*32+ns[t]+idx;if(col>=N)continue;\n"
+"        for(int i=0;i<8;i++){int row=m0+wM*64+ms[t]+half*8+i;\n"
+"            if(row<M)Y[(size_t)row*N+col]=(*ff[t])[i];}}\n"
+"}\n"
+"/* IQ2_XXS -> Q8 int8 WMMA tile. This is the RDNA4 MMQ integer path: the\n"
+" * codebook is expanded into LDS, then the 16x16x16 WMMA instruction does\n"
+" * the dot products. The optional exact mode runs both Q8 residual terms;\n"
+" * the existing DP4A path remains the production accuracy/perf control. */\n"
+"__global__ void gemm_iq2_xxs_q8_wmma(float *Y, const unsigned char *W,\n"
+"        const signed char *X, const float *S, const signed char *X1,\n"
+"        const float *S1, int N, int K, int M, int term) {\n"
+"    typedef int i32x2 __attribute__((ext_vector_type(2))); typedef int i32x8 __attribute__((ext_vector_type(8)));\n"
+"    int tid=threadIdx.x,wave=tid>>5,lane=tid&31,wM=wave&1,wN=wave>>1,idx=lane&15,half=idx>>3;\n"
+"    int m0=blockIdx.y*128,n0=blockIdx.x*128,nb=K/256;\n"
+"    const signed char *Xq=term?X1:X; const float *Sq=term?S1:S;\n"
+"    __shared__ signed char smA[128*32],smB[128*32]; __shared__ float ws[128];\n"
+"    float8 f00={0,0,0,0,0,0,0,0},f01=f00,f10=f00,f11=f00,f20=f00,f21=f00,f30=f00,f31=f00;\n"
+"    for(int k=0;k<K;k+=32){\n"
+"        for(int it=0;it<16;it++){int e=tid*16+it,er=e>>5,ek=e&31,row=m0+er,kp=k+ek; smA[e]=(row<M&&kp<K)?Xq[(size_t)row*K+kp]:0;}\n"
+"        for(int it=0;it<16;it++){int e=tid*16+it,er=e>>5,ek=e&31,col=n0+er,kp=k+ek; smB[e]=0;\n"
+"            if(col<N&&kp<K){int b=kp>>8,rem=kp&255,ib=rem>>5,l=(rem&31)>>3,j=rem&7; const unsigned char *bp=W+(size_t)col*nb*66+b*66;\n"
+"                const unsigned short *qs=(const unsigned short*)(bp+2); unsigned int a0=qs[4*ib]|((unsigned int)qs[4*ib+1]<<16),a1=qs[4*ib+2]|((unsigned int)qs[4*ib+3]<<16);\n"
+"                const unsigned char *gr=(const unsigned char *)&iq2xxs_grid_dev[(a0>>(8*l))&255]; unsigned char sg=ksigns_iq2xs_dev[(a1>>(7*l))&127]; unsigned int v=gr[j];\n"
+"                if(sg&(1<<j))v=(unsigned int)(-(int)v)&255u; smB[e]=(signed char)v; if(ek==0)ws[er]=half_to_float(*(const half_raw*)bp)*(0.5f+(float)(a1>>28))*0.25f;}\n"
+"        }\n"
+"        __syncthreads();\n"
+"        i32x8 c00={0,0,0,0,0,0,0,0},c01=c00,c10=c00,c11=c00,c20=c00,c21=c00,c30=c00,c31=c00;\n"
+"        int abase=wM*64,bbase=wN*32;\n"
+"        for(int kk0=0;kk0<32;kk0+=16){i32x2 a0,a1,a2,a3,b0,b1; int aa=(abase+idx)*32+kk0,bb=(bbase+idx)*32+kk0;\n"
+"            a0[0]=*(const int*)&smA[aa];a0[1]=*(const int*)&smA[aa+4]; a1[0]=*(const int*)&smA[(abase+16+idx)*32+kk0];a1[1]=*(const int*)&smA[(abase+16+idx)*32+kk0+4];\n"
+"            a2[0]=*(const int*)&smA[(abase+32+idx)*32+kk0];a2[1]=*(const int*)&smA[(abase+32+idx)*32+kk0+4]; a3[0]=*(const int*)&smA[(abase+48+idx)*32+kk0];a3[1]=*(const int*)&smA[(abase+48+idx)*32+kk0+4];\n"
+"            b0[0]=*(const int*)&smB[bb];b0[1]=*(const int*)&smB[bb+4]; b1[0]=*(const int*)&smB[(bbase+16+idx)*32+kk0];b1[1]=*(const int*)&smB[(bbase+16+idx)*32+kk0+4];\n"
+"            c00=__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true,a0,true,b0,c00,false);c01=__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true,a0,true,b1,c01,false);\n"
+"            c10=__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true,a1,true,b0,c10,false);c11=__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true,a1,true,b1,c11,false);\n"
+"            c20=__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true,a2,true,b0,c20,false);c21=__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true,a2,true,b1,c21,false);\n"
+"            c30=__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true,a3,true,b0,c30,false);c31=__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true,a3,true,b1,c31,false);}\n"
+"        i32x8 *cc[8]={&c00,&c01,&c10,&c11,&c20,&c21,&c30,&c31}; float8 *ff[8]={&f00,&f01,&f10,&f11,&f20,&f21,&f30,&f31}; int ms[8]={0,0,16,16,32,32,48,48},ns[8]={0,16,0,16,0,16,0,16};\n"
+"        for(int t=0;t<8;t++){int col=n0+wN*32+ns[t]+idx;if(col>=N)continue;int wi=col-n0; for(int i=0;i<8;i++){int row=m0+wM*64+ms[t]+half*8+i;if(row<M)(*ff[t])[i]+=(float)(*cc[t])[i]*ws[wi]*Sq[(size_t)row*(K/32)+k/32];}}\n"
+"        __syncthreads();\n"
+"    }\n"
+"    i32x8 *dummy[1]; (void)dummy; float8 *ff[8]={&f00,&f01,&f10,&f11,&f20,&f21,&f30,&f31}; int ms[8]={0,0,16,16,32,32,48,48},ns[8]={0,16,0,16,0,16,0,16};\n"
+"    for(int t=0;t<8;t++){int col=n0+wN*32+ns[t]+idx;if(col>=N)continue; for(int i=0;i<8;i++){int row=m0+wM*64+ms[t]+half*8+i;if(row<M){size_t yi=(size_t)row*N+col;if(term)Y[yi]+=(*ff[t])[i];else Y[yi]=(*ff[t])[i];}}}\n"
+"}\n"
+"/* Experimental IQ2_XS RDNA4 MMQ tile.  This follows llama.cpp's 32-packed\n"
+" * 84 int shared stride for the IQ2_XS weight row and 36 int stride for\n"
+" * the q8 activation row.  The two q8 activation terms are launched\n"
+" * separately.  Keep behind LLM_QWEN35_IQ2XS_MMQ_WMMA until parity is proven. */\n"
+"__global__ void gemm_iq2_xs_mmq_wmma(float *Y, const unsigned char *W,\n"
+"        const signed char *X, const float *S, const signed char *X1,\n"
+"        const float *S1, int N, int K, int M, int term, int scalar, int fused) {\n"
+"    typedef int i32x2 __attribute__((__vector_size__(2 * sizeof(int))));\n"
+"    typedef int i32x8 __attribute__((__vector_size__(8 * sizeof(int))));\n"
+"    int tid=threadIdx.x,warp=tid>>5,lane=tid&31;\n"
+"    int m0=blockIdx.y*128,n0=blockIdx.x*128,nb=K/256;\n"
+"    int do_fused = fused != 0;\n"
+"    __shared__ int sx[128*84],sy[128*36];\n"
+"    float8 sum[8];\n"
+"    for(int q=0;q<8;q++)sum[q]=(float8){0,0,0,0,0,0,0,0};\n"
+"    float scalar_sum=0.0f;\n"
+"    for(int k=0;k<K;k+=128){\n"
+"        /* Pack q-values at llama.cpp's 8*kqsx + 2*l positions.  A prior\n"
+"         * prototype wrote them densely, which broke MMQ numerical parity. */\n"
+"        for(int e=tid;e<128*8;e+=256){\n"
+"            /* llama.cpp's IQ2_XS loader uses QR2_XS=4: each kqsx owns\n"
+"             * four 8-value codebooks, and each packed uint32 supplies two\n"
+"             * adjacent codebooks. The old port used l>>1/l&1 here, which\n"
+"             * misplaced the second pair in the 84-int row tile. */\n"
+"            int r=e>>3,l=e&7,col=n0+r,kqsx=l>>2,ql=l&3;\n"
+"            int pos=r*84+8*kqsx+2*ql;\n"
+"            for(int j=0;j<4;j++)sx[pos+j]=0;\n"
+"            if(col<N){int rem=k&255,qidx=(rem>>3)+2*l; const unsigned char *bp=W+(size_t)col*nb*74+(k>>8)*74;\n"
+"                const unsigned short *qs=(const unsigned short *)(bp+2);\n"
+"                unsigned int qpair=*(const unsigned int *)(qs+qidx);\n"
+"                for(int j=0;j<2;j++){unsigned short qv=(unsigned short)(qpair>>(16*j));\n"
+"                    unsigned long long gv=iq2xs_grid_dev[qv&511]; unsigned char sg=ksigns_iq2xs_dev[qv>>9];\n"
+"                    sx[pos+2*j]=apply_sign4_vec((unsigned int)gv,sg,0);\n"
+"                    sx[pos+2*j+1]=apply_sign4_vec((unsigned int)(gv>>32),sg,4);}}\n"
+"        }\n"
+"        for(int e=tid;e<128;e+=256){\n"
+"            int r=e,col=n0+r; float *xd=(float *)sx+64+r*84;\n"
+"            for(int z=0;z<8;z++)xd[z]=0.0f;\n"
+"            if(col<N){int rem=k&255; const unsigned char *bp=W+(size_t)col*nb*74+(k>>8)*74;\n"
+"                float d=half_to_float(*(const half_raw *)bp);\n"
+"                for(int z=0;z<8;z++){int qidx=(rem>>3)+(z>>1)*4+(z&1)*2,ib=qidx>>2,l=qidx&3; unsigned char sc=bp[66+ib];\n"
+"                    xd[z]=d*(0.5f+(float)((l<2)?(sc&15):(sc>>4)))*0.25f;}}\n"
+"        }\n"
+"        int passes = do_fused ? 2 : 1;\n"
+"        for(int pass=0; pass<passes; ++pass){\n"
+"            const signed char *Xq=do_fused?(pass?X1:X):(term?X1:X); const float *Sq=do_fused?(pass?S1:S):(term?S1:S);\n"
+"            for(int e=tid;e<128*128;e+=256){int r=e>>7,kk=e&127; signed char *qy=(signed char *)sy;\n"
+"                qy[r*144+16+kk]=(m0+r<M&&k+kk<K)?Xq[(size_t)(m0+r)*K+k+kk]:0;}\n"
+"            for(int r=tid;r<128;r+=256){float *yd=(float *)sy+r*36;\n"
+"                for(int z=0;z<4;z++)yd[z]=(m0+r<M&&k+z*32<K)?Sq[(size_t)(m0+r)*(K/32)+k/32+z]:0.0f;}\n"
+"            __syncthreads();\n"
+"            float *xd=(float *)sx+64; float *yd=(float *)sy;\n"
+"            if(scalar==1 && !do_fused && blockIdx.x==0 && blockIdx.y==0 && tid<256){\n"
+"                int sr=tid>>7, sc=tid&127; const signed char *aq=(const signed char *)sy+sr*144+16;\n"
+"                for(int p=0;p<32;p++){int z=dp4a_hw(sx[sc*84+p],*(const int *)(aq+p*4),0);\n"
+"                    scalar_sum+=xd[sc*84+p/4]*yd[sr*36+p/8]*(float)z;}\n"
+"            }\n"
+"            if(scalar==1 && !do_fused){__syncthreads();continue;}\n"
+"            float8 *acc = sum; int row0=warp*16;\n"
+"            for(int k01=0;k01<32;k01+=4){\n"
+"                i32x2 b0; int jr=row0+(lane&15),ao=2*(lane>>4);\n"
+"                    b0[0]=sy[jr*36+4+k01+ao]; b0[1]=sy[jr*36+4+k01+ao+1];\n"
+"                for(int n=0;n<8;n++){i32x2 a0; int ar=n*16+(lane&15);\n"
+"                    a0[0]=sx[ar*84+k01+ao]; a0[1]=sx[ar*84+k01+ao+1];\n"
+"                    i32x8 c={0,0,0,0,0,0,0,0};\n"
+"                    c=__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true,a0,true,b0,c,false);\n"
+"                    int half=lane>>4,row=row0+(lane&15);\n"
+"                    for(int l=0;l<8;l++){int col=n*16+8*half+l;\n"
+"                        acc[n][l]+=(float)c[l]*xd[col*84+k01/4]*yd[row*36+k01/8];}\n"
+"                }\n"
+"            }\n"
+"            __syncthreads();\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    int half=lane>>4;\n"
+"    if(scalar==1 && !do_fused){if(blockIdx.x==0&&blockIdx.y==0&&tid<256)\n"
+"        {size_t at=(size_t)(m0+(tid>>7))*N+n0+(tid&127);\n"
+"         if(term)Y[at]+=scalar_sum;else Y[at]=scalar_sum;}return;}\n"
+"    for(int n=0;n<8;n++)for(int l=0;l<8;l++){int row=m0+warp*16+(lane&15),col=n0+n*16+8*half+l;\n"
+"        if(row<M&&col<N){size_t at=(size_t)row*N+col;\n"
+"            if(term < 0 || do_fused) Y[at]=sum[n][l];\n"
+"            else if(term)Y[at]+=sum[n][l];else Y[at]=sum[n][l];}}\n"
+"}\n"
+"/* IQ2_S RDNA4 MMQ tile.  The tile/reduction mapping is shared with the\n"
+" * IQ2_XS path, while the loader follows llama.cpp's block_iq2_s layout:\n"
+" * four 2-bit code bytes, four sign bytes, qh, and packed nibbles. */\n"
+"/* IQ2_XXS RDNA4 MMQ tile.  The packed pair stores four code bytes, four\n"
+" * sign indices and one scale per 32-value group. */\n"
+"__global__ void gemm_iq2_xxs_mmq_wmma(float *Y, const unsigned char *W,\n"
+"        const signed char *X, const float *S, const signed char *X1,\n"
+"        const float *S1, int N, int K, int M, int term, int fused) {\n"
+"    typedef int i32x2 __attribute__((__vector_size__(2 * sizeof(int))));\n"
+"    typedef int i32x8 __attribute__((__vector_size__(8 * sizeof(int))));\n"
+"    int tid=threadIdx.x,warp=tid>>5,lane=tid&31;\n"
+"    int m0=blockIdx.y*128,n0=blockIdx.x*128,nb=K/256;\n"
+"    int do_fused=fused!=0;\n"
+"    __shared__ int sx[128*84],sy[128*36]; float8 sum[8];\n"
+"    for(int q=0;q<8;q++)sum[q]=(float8){0,0,0,0,0,0,0,0};\n"
+"    for(int k=0;k<K;k+=128){\n"
+"        for(int e=tid;e<128*16;e+=256){int r=e>>4,l=e&15,col=n0+r,kqsx=l>>2,ql=l&3;\n"
+"            sx[r*84+8*kqsx+2*ql]=0; sx[r*84+8*kqsx+2*ql+1]=0;\n"
+"            if(col<N){int rem=k&255,qidx=(rem>>3)+l,ib=qidx>>2,ll=qidx&3;\n"
+"                const unsigned char *bp=W+(size_t)col*nb*66+(k>>8)*66; const unsigned short *qs=(const unsigned short *)(bp+2);\n"
+"                unsigned int a0=qs[4*ib]|((unsigned int)qs[4*ib+1]<<16),a1=qs[4*ib+2]|((unsigned int)qs[4*ib+3]<<16);\n"
+"                unsigned long long gv=iq2xxs_grid_dev[(a0>>(8*ll))&255]; unsigned char sg=ksigns_iq2xs_dev[(a1>>(7*ll))&127];\n"
+"                sx[r*84+8*kqsx+2*ql]=apply_sign4((unsigned int)gv,sg,0); sx[r*84+8*kqsx+2*ql+1]=apply_sign4((unsigned int)(gv>>32),sg,4);}\n"
+"        }\n"
+"        for(int e=tid;e<128;e+=256){int r=e,col=n0+r; float *xd=(float *)sx+64+r*84; for(int z=0;z<8;z++)xd[z]=0.0f;\n"
+"            if(col<N){int rem=k&255; const unsigned char *bp=W+(size_t)col*nb*66+(k>>8)*66; float d=half_to_float(*(const half_raw *)bp); const unsigned short *qs=(const unsigned short *)(bp+2);\n"
+"                for(int z=0;z<8;z++){int qidx=(rem>>3)+(z>>1)*4+(z&1)*2,ib=qidx>>2; unsigned int a1=qs[4*ib+2]|((unsigned int)qs[4*ib+3]<<16); xd[z]=d*(0.5f+(float)(a1>>28))*0.25f;}}\n"
+"        }\n"
+"        int passes=do_fused?2:1;\n"
+"        for(int pass=0;pass<passes;++pass){\n"
+"            const signed char *Xq=do_fused?(pass?X1:X):(term?X1:X); const float *Sq=do_fused?(pass?S1:S):(term?S1:S);\n"
+"            for(int e=tid;e<128*128;e+=256){int r=e>>7,kk=e&127; ((signed char *)sy)[r*144+16+kk]=(m0+r<M&&k+kk<K)?Xq[(size_t)(m0+r)*K+k+kk]:0;}\n"
+"            for(int r=tid;r<128;r+=256){float *yd=(float *)sy+r*36; for(int z=0;z<4;z++)yd[z]=(m0+r<M&&k+z*32<K)?Sq[(size_t)(m0+r)*(K/32)+k/32+z]:0.0f;}\n"
+"            __syncthreads(); float *xd=(float *)sx+64,*yd=(float *)sy; int row0=warp*16; float8 *acc=sum;\n"
+"            for(int k01=0;k01<32;k01+=4){i32x2 b0; int jr=row0+(lane&15),ao=2*(lane>>4); b0[0]=sy[jr*36+4+k01+ao]; b0[1]=sy[jr*36+4+k01+ao+1];\n"
+"                for(int n=0;n<8;n++){i32x2 a0; int ar=n*16+(lane&15); a0[0]=sx[ar*84+k01+ao]; a0[1]=sx[ar*84+k01+ao+1]; i32x8 c={0,0,0,0,0,0,0,0};\n"
+"                    c=__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true,a0,true,b0,c,false); int half=lane>>4,row=row0+(lane&15);\n"
+"                    for(int l=0;l<8;l++){int col=n*16+8*half+l; acc[n][l]+=(float)c[l]*xd[col*84+k01/4]*yd[row*36+k01/8];}}}\n"
+"            __syncthreads();\n"
+"        }\n"
+"    }\n"
+"    int half=lane>>4; for(int n=0;n<8;n++)for(int l=0;l<8;l++){int row=m0+warp*16+(lane&15),col=n0+n*16+8*half+l; if(row<M&&col<N){size_t at=(size_t)row*N+col; if(do_fused || term<0)Y[at]=sum[n][l]; else if(term)Y[at]+=sum[n][l];else Y[at]=sum[n][l];}}\n"
+"}\n"
+"__global__ void gemm_iq2_s_mmq_wmma(float *Y, const unsigned char *W,\n"
+"        const signed char *X, const float *S, const signed char *X1,\n"
+"        const float *S1, int N, int K, int M, int term, int fused) {\n"
+"    typedef int i32x2 __attribute__((__vector_size__(2 * sizeof(int))));\n"
+"    typedef int i32x8 __attribute__((__vector_size__(8 * sizeof(int))));\n"
+"    int tid=threadIdx.x,warp=tid>>5,lane=tid&31;\n"
+"    int m0=blockIdx.y*128,n0=blockIdx.x*128,nb=K/256;\n"
+"    int do_fused=fused!=0;\n"
+"    __shared__ int sx[128*84],sy[128*36];\n"
+"    float8 sum[8]; for(int q=0;q<8;q++)sum[q]=(float8){0,0,0,0,0,0,0,0};\n"
+"    for(int k=0;k<K;k+=128){\n"
+"        for(int e=tid;e<128*16;e+=256){\n"
+"            int r=e>>4,l=e&15,col=n0+r,kqsx=l>>2,ql=l&3;\n"
+"            sx[r*84+8*kqsx+2*ql]=0; sx[r*84+8*kqsx+2*ql+1]=0;\n"
+"            if(col<N){int rem=k&255,qidx=(rem>>3)+l; const unsigned char *bp=W+(size_t)col*nb*82+(k>>8)*82;\n"
+"                int ib=qidx>>2, ll=qidx&3; const unsigned char *qs=bp+2+ib*4, *sg=bp+34+ib*4;\n"
+"                int qv=qs[ll]|(((int)bp[66+ib]<<(8-2*ll))&0x300);\n"
+"                unsigned long long gv=iq2s_grid_dev[qv];\n"
+"                sx[r*84+8*kqsx+2*ql]=apply_sign4((unsigned int)gv,sg[ll],0);\n"
+"                sx[r*84+8*kqsx+2*ql+1]=apply_sign4((unsigned int)(gv>>32),sg[ll],4);}\n"
+"        }\n"
+"        for(int e=tid;e<128;e+=256){\n"
+"            int r=e,col=n0+r; float *xd=(float *)sx+64+r*84;\n"
+"            for(int z=0;z<8;z++)xd[z]=0.0f;\n"
+"            if(col<N){int rem=k&255; const unsigned char *bp=W+(size_t)col*nb*82+(k>>8)*82;\n"
+"                float d=half_to_float(*(const half_raw *)bp);\n"
+"                for(int z=0;z<8;z++){int qidx=(rem>>3)+(z>>1)*4+(z&1)*2,ib=qidx>>2,ll=qidx&3; unsigned char sc=bp[74+ib];\n"
+"                    xd[z]=d*(0.5f+(float)((ll<2)?(sc&15):(sc>>4)))*0.25f;}}\n"
+"        }\n"
+"        int passes=do_fused?2:1;\n"
+"        for(int pass=0;pass<passes;++pass){\n"
+"            const signed char *Xq=do_fused?(pass?X1:X):(term?X1:X); const float *Sq=do_fused?(pass?S1:S):(term?S1:S);\n"
+"            for(int e=tid;e<128*128;e+=256){int r=e>>7,kk=e&127; signed char *qy=(signed char *)sy;\n"
+"                qy[r*144+16+kk]=(m0+r<M&&k+kk<K)?Xq[(size_t)(m0+r)*K+k+kk]:0;}\n"
+"            for(int r=tid;r<128;r+=256){float *yd=(float *)sy+r*36;\n"
+"                for(int z=0;z<4;z++)yd[z]=(m0+r<M&&k+z*32<K)?Sq[(size_t)(m0+r)*(K/32)+k/32+z]:0.0f;}\n"
+"            __syncthreads();\n"
+"            float *xd=(float *)sx+64; float *yd=(float *)sy; int row0=warp*16;\n"
+"            for(int k01=0;k01<32;k01+=4){\n"
+"                i32x2 b0; int jr=row0+(lane&15),ao=2*(lane>>4);\n"
+"                b0[0]=sy[jr*36+4+k01+ao]; b0[1]=sy[jr*36+4+k01+ao+1];\n"
+"                for(int n=0;n<8;n++){i32x2 a0; int ar=n*16+(lane&15);\n"
+"                    a0[0]=sx[ar*84+k01+ao]; a0[1]=sx[ar*84+k01+ao+1]; i32x8 c={0,0,0,0,0,0,0,0};\n"
+"                    c=__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true,a0,true,b0,c,false);\n"
+"                    int half=lane>>4,row=row0+(lane&15);\n"
+"                    for(int l=0;l<8;l++){int col=n*16+8*half+l; sum[n][l]+=(float)c[l]*xd[col*84+k01/4]*yd[row*36+k01/8];}\n"
+"                }\n"
+"            }\n"
+"            __syncthreads();\n"
+"        }\n"
+"    }\n"
+"    int half=lane>>4;\n"
+"    for(int n=0;n<8;n++)for(int l=0;l<8;l++){int row=m0+warp*16+(lane&15),col=n0+n*16+8*half+l;\n"
+"        if(row<M&&col<N){size_t at=(size_t)row*N+col; if(do_fused)Y[at]=sum[n][l]; else if(term)Y[at]+=sum[n][l];else Y[at]=sum[n][l];}}\n"
 "}\n"
 "/* ---- BF16 GEMM with double-buffered LDS (hides global load behind WMMA).       */\n"
 "__global__ void gemm_bf16_own_db(float *Y, const bf16_raw *W, const bf16_raw *X,\n"
@@ -7942,6 +11460,32 @@ static const char *hip_kernel_source =
 "    }\n"
 "}\n"
 "\n"
+"/* Quantize each Qwen attention head exactly like llama.cpp's Q8_1 query\n"
+" * staging, then materialize the dequantized values for the F16 flash path. */\n"
+"__global__ void quantize_q8_1_f16_heads(half_raw *dst, const float *src, int n_heads, int head_dim, int M, float scale) {\n"
+"    int bh=blockIdx.x,m=bh/n_heads,h=bh%n_heads,tid=threadIdx.x; if(m>=M||h>=n_heads||tid>=head_dim)return;\n"
+"    int lane=tid&31; float x=src[((size_t)m*n_heads+h)*head_dim+tid]*scale; float a=fabsf(x);\n"
+"    for(int s=16;s;s>>=1)a=fmaxf(a,__shfl_down(a,s,32));\n"
+"    __shared__ float ds[8]; if(lane==0)ds[tid>>5]=a/127.0f; __syncthreads();\n"
+"    float d=ds[tid>>5]; int q=d!=0.0f?(int)roundf(x/d):0; if(q<-127)q=-127; if(q>127)q=127;\n"
+"    dst[((size_t)m*n_heads+h)*head_dim+tid]=f32_to_f16_bits((float)q*d);\n"
+"}\n"
+"/* Materialize the integer Q8_1 query required by llama.cpp's fattn-vec\n"
+" * Q8 K/Q4 V kernel.  The scale includes attention's 1/sqrt(D) factor,\n"
+" * matching quantize_q8_1_to_shared(Q * scale) in fattn-common.cuh. */\n"
+"__global__ void quantize_attn_q8_1_batch(signed char *dst, float *scales,\n"
+"    const float *src, int n_heads, int head_dim, int M, float scale) {\n"
+"    int bh=blockIdx.x,m=bh/n_heads,h=bh%n_heads,tid=threadIdx.x;\n"
+"    if(m>=M||h>=n_heads||tid>=head_dim)return;\n"
+"    int lane=tid&31,warp=tid>>5; float x=src[((size_t)m*n_heads+h)*head_dim+tid]*scale;\n"
+"    float a=fabsf(x); for(int s=16;s;s>>=1)a=fmaxf(a,__shfl_down(a,s,32));\n"
+"    __shared__ float ds[8]; if(lane==0)ds[warp]=a/127.0f; __syncthreads();\n"
+"    float d=ds[warp]; int q=d!=0.0f?(int)roundf(x/d):0;\n"
+"    if(q<-127)q=-127; if(q>127)q=127;\n"
+"    dst[((size_t)m*n_heads+h)*head_dim+tid]=(signed char)q;\n"
+"    if(lane==0)scales[((size_t)m*n_heads+h)*(head_dim/32)+warp]=d;\n"
+"}\n"
+"\n"
 "/* Pack KV cache F32 [kv_len, n_kv_heads, head_dim] -> F16 [n_kv_heads, kv_len, head_dim].\n"
 " * Grid: (kv_len, n_kv_heads), block: head_dim (capped at 256). */\n"
 "__global__ void pack_kv_cache_f16(half_raw *dst, const float *src,\n"
@@ -7955,6 +11499,18 @@ static const char *hip_kernel_source =
 "        dst[((size_t)hkv * kv_len + t) * head_dim + d] = f32_to_f16_bits(v);\n"
 "    }\n"
 "}\n"
+"__global__ void pack_kv_q8q4_f16(half_raw *dst, const void *src, const float *scales, int kv_len, int n_kv_heads, int head_dim, int is_v) {\n"
+"    int t=blockIdx.x,h=blockIdx.y,d=threadIdx.x;if(t>=kv_len||h>=n_kv_heads||d>=head_dim)return;int groups=(head_dim+31)/32;float v;if(is_v<=0){int g=d/32;size_t si=((size_t)t*n_kv_heads+h)*groups+g;float s=is_v<0?half_to_float(((const half_raw *)scales)[si]):scales[si];const signed char *p=(const signed char *)src;float q=(float)p[(size_t)t*n_kv_heads*head_dim+h*head_dim+d];if(is_v<0){asm volatile(\"v_mul_f32 %0, %1, %2\":\"=v\"(v):\"v\"(q),\"v\"(s));}else v=q*s;}else{int g=d/32,j=d&31,bi=g*16+(j&15);float s=scales[((size_t)t*n_kv_heads+h)*groups+g];const unsigned char *p=(const unsigned char *)src;unsigned char z=p[(size_t)t*n_kv_heads*(head_dim/2)+h*(head_dim/2)+bi];v=(float)(((j<16)?(z&15):(z>>4))-8)*s;}dst[((size_t)h*kv_len+t)*head_dim+d]=f32_to_f16_bits(v);\n"
+"}\n"
+"__global__ void unpack_kv_q8q4_decode_f16(half_raw *dst, const void *src, const float *scales, int kv_len, int n_kv_heads, int head_dim, int is_v) {\n"
+"    int i=blockIdx.x*blockDim.x+threadIdx.x,total=kv_len*n_kv_heads*head_dim;if(i>=total)return;int t=i/(n_kv_heads*head_dim),z=i%(n_kv_heads*head_dim),h=z/head_dim,d=z%head_dim,groups=(head_dim+31)/32,g=d/32;size_t si=((size_t)t*n_kv_heads+h)*groups+g;float s=is_v<0?half_to_float(((const half_raw *)scales)[si]):scales[si],v;\n"
+"    if(is_v<=0){const signed char *p=(const signed char *)src;float q=(float)p[(size_t)t*n_kv_heads*head_dim+h*head_dim+d];if(is_v<0){asm volatile(\"v_mul_f32 %0, %1, %2\":\"=v\"(v):\"v\"(q),\"v\"(s));}else v=q*s;}else{int j=d&31,bi=g*16+(j&15);const unsigned char *p=(const unsigned char *)src;unsigned char q=p[(size_t)t*n_kv_heads*(head_dim/2)+h*(head_dim/2)+bi];v=(float)(((j<16)?(q&15):(q>>4))-8)*s;}dst[(size_t)t*n_kv_heads*head_dim+h*head_dim+d]=f32_to_f16_bits(v);\n"
+"}\n"
+"__global__ void unpack_kv_q8q4_decode_f16_devp(half_raw *dst, const void *src, const float *scales, const int *position, int n_kv_heads, int head_dim, int is_v) {\n"
+"    int kv_len=*position+1; int i=blockIdx.x*blockDim.x+threadIdx.x,total=kv_len*n_kv_heads*head_dim;if(i>=total)return;int t=i/(n_kv_heads*head_dim),z=i%(n_kv_heads*head_dim),h=z/head_dim,d=z%head_dim,groups=(head_dim+31)/32,g=d/32;size_t si=((size_t)t*n_kv_heads+h)*groups+g;float s=is_v<0?half_to_float(((const half_raw *)scales)[si]):scales[si],v;\n"
+"    if(is_v<=0){const signed char *p=(const signed char *)src;float q=(float)p[(size_t)t*n_kv_heads*head_dim+h*head_dim+d];if(is_v<0){asm volatile(\"v_mul_f32 %0, %1, %2\":\"=v\"(v):\"v\"(q),\"v\"(s));}else v=q*s;}else{int j=d&31,bi=g*16+(j&15);const unsigned char *p=(const unsigned char *)src;unsigned char q=p[(size_t)t*n_kv_heads*(head_dim/2)+h*(head_dim/2)+bi];v=(float)(((j<16)?(q&15):(q>>4))-8)*s;}dst[(size_t)t*n_kv_heads*head_dim+h*head_dim+d]=f32_to_f16_bits(v);\n"
+"}\n"
+
 "\n"
 "/* Batched RoPE NeoX: applies RoPE to M consecutive rows in a [M, n_heads*head_dim]\n"
 " * buffer. Grid: (n_heads, M), block: half_dim. */\n"
@@ -7993,7 +11549,7 @@ static const char *hip_kernel_source =
 "    int row = blockIdx.y;\n"
 "    if (h >= n_heads) return;\n"
 "    int j = threadIdx.x;\n"
-"    int half_dim = head_dim / 2;\n"
+"    int half_dim = sect0 + sect1 + sect2 + sect3;\n"
 "    if (j >= half_dim) return;\n"
 "    int sect_sum = sect0 + sect1 + sect2 + sect3;\n"
 "    int rope_dim = 2 * sect_sum;\n"
@@ -8012,6 +11568,19 @@ static const char *hip_kernel_source =
 "    float v1 = v[j + half_dim];\n"
 "    v[j]            = v0 * cos_t - v1 * sin_t;\n"
 "    v[j + half_dim] = v0 * sin_t + v1 * cos_t;\n"
+"}\n"
+"__global__ void rope_mrope_batch_devpos_f32(float *vec_batch, int n_heads,\n"
+"        int head_dim, const int *positions, float freq_base, int sect0,\n"
+"        int sect1, int sect2, int sect3, int row_stride) {\n"
+"    int h=blockIdx.x,row=blockIdx.y,j=threadIdx.x; if(h>=n_heads)return;\n"
+"    int half_dim=sect0+sect1+sect2+sect3;if(j>=half_dim)return;\n"
+"    int rope_dim=2*half_dim,pos_v=positions[row];\n"
+"    int pos=j<sect0+sect1+sect2?pos_v:0;\n"
+"    float freq=1.0f/powf(freq_base,(float)(2*j)/(float)rope_dim);\n"
+"    float theta=(float)pos*freq,ct=cosf(theta),st=sinf(theta);\n"
+"    float *v=vec_batch+(size_t)row*row_stride+h*head_dim;\n"
+"    float v0=v[j],v1=v[j+half_dim];v[j]=v0*ct-v1*st;\n"
+"    v[j+half_dim]=v0*st+v1*ct;\n"
 "}\n"
 "\n"
 "/* Batched KV cache store: copies M rows from k_batch/v_batch into the cache.\n"
@@ -8622,7 +12191,7 @@ static const char *hip_kernel_source =
 "    int h = blockIdx.x;\n"
 "    if (h >= n_heads) return;\n"
 "    int j = threadIdx.x;\n"
-"    int half_dim = head_dim / 2;\n"
+"    int half_dim = sect0 + sect1 + sect2 + sect3;\n"
 "    if (j >= half_dim) return;\n"
 "    int sect_sum = sect0 + sect1 + sect2 + sect3;\n"
 "    int rope_dim = 2 * sect_sum;\n"
@@ -8943,6 +12512,94 @@ static const char *hip_kernel_source =
 "    int pos=position_start+m; if(lane==0 && group<groups){ks[((size_t)pos*n_kv_heads+h)*groups+group]=fmaxf(ak/(fp8?1.0f:127.0f),1.0e-8f);vs[((size_t)pos*n_kv_heads+h)*groups+group]=fmaxf(av/(fp8?1.0f:127.0f),1.0e-8f);} __syncthreads();\n"
 "    for(int d=tid;d<head_dim;d+=blockDim.x){float sk=ks[((size_t)pos*n_kv_heads+h)*groups+d/32],sv=vs[((size_t)pos*n_kv_heads+h)*groups+d/32];size_t o=(size_t)pos*kv_dim+base+d;kc[o]=qkv_float_to_byte(k[(size_t)m*kv_dim+base+d],sk,fp8);vc[o]=qkv_float_to_byte(v[(size_t)m*kv_dim+base+d],sv,fp8);}\n"
 "}\n"
+"__device__ __forceinline__ signed char q4_quant(float x,float s) {\n"
+"    /* Match ggml quantize_row_q4_0_ref: d is signed (max/-8), and the\n"
+"     * integer conversion is truncation after adding the zero-point. */\n"
+"    int q=(int)(x/s+8.5f); if(q<0)q=0; if(q>15)q=15; return (signed char)(q-8);\n"
+"}\n"
+"/* Q8/Q4 cache quantization follows ggml's block scale contracts. */\n"
+"__global__ void kv_cache_store_q8q4_batch(signed char *kc, unsigned char *vc,\n"
+"    float *ks, float *vs, const float *k, const float *v, int n_kv_heads, int head_dim, int position_start, int M) {\n"
+"    int bh=blockIdx.x,m=bh/n_kv_heads,h=bh%n_kv_heads,tid=threadIdx.x; if(m>=M)return; int groups=(head_dim+31)/32;\n"
+"    int kv_dim=n_kv_heads*head_dim,base=h*head_dim,group=tid>>5,lane=tid&31; float ak=(tid<head_dim)?fabsf(k[(size_t)m*kv_dim+base+tid]):0.0f,av=(tid<head_dim)?v[(size_t)m*kv_dim+base+tid]:0.0f; __shared__ float sk_raw_sh[32],sv_raw_sh[32];\n"
+"    for(int s=16;s;s>>=1){ak=fmaxf(ak,__shfl_down(ak,s,32));}\n"
+"    float av_max=av; for(int s=16;s;s>>=1){float z=__shfl_down(av_max,s,32);if(fabsf(z)>fabsf(av_max))av_max=z;}\n"
+"    int pos=position_start+m; if(lane==0 && group<groups){float sk=fmaxf(ak/127.0f,1.0e-8f),sv=av_max/(-8.0f);if(fabsf(sv)<1.0e-8f)sv=1.0e-8f;sk_raw_sh[group]=sk;sv_raw_sh[group]=sv;ks[((size_t)pos*n_kv_heads+h)*groups+group]=round_f16_contract(sk);vs[((size_t)pos*n_kv_heads+h)*groups+group]=round_f16_contract(sv);} __syncthreads();\n"
+"    /* ggml quantizes from the original FP32 block scale and only then\n"
+"     * stores the FP16 scale. Keep both values here; using the rounded\n"
+"     * scale for the integer decision changes cache codes. */\n"
+"    for(int d=tid;d<head_dim;d+=blockDim.x){float sk=sk_raw_sh[d>>5];int q=(int)roundf(k[(size_t)m*kv_dim+base+d]/sk);q=q<-127?-127:q>127?127:q;size_t ko=(size_t)pos*kv_dim+base+d;kc[ko]=(signed char)q;}\n"
+"    for(int bi=tid;bi<head_dim/2;bi+=blockDim.x){int g=bi/16,j=bi&15,lo=g*32+j,hi=lo+16;float sv=sv_raw_sh[g];int a=(int)(v[(size_t)m*kv_dim+base+lo]/sv+8.5f);if(a<0)a=0;if(a>15)a=15;int b=8;if(hi<head_dim){b=(int)(v[(size_t)m*kv_dim+base+hi]/sv+8.5f);if(b<0)b=0;if(b>15)b=15;}size_t vo=(size_t)pos*(n_kv_heads*(head_dim/2))+h*(head_dim/2)+bi;vc[vo]=(unsigned char)(a|(b<<4));}\n"
+"}\n"
+/* Both Q8_0 caches use the original FP32 scale for codes, FP16 for storage. */
+"/* Match the HIP non-fast-math reciprocal refinement before integer rounding. */\n"
+"__device__ __forceinline__ float q8_recip_contract(float b) {\n"
+"    float r,e,nb=-b;\n"
+"    asm volatile(\"v_rcp_f32 %0, %1\":\"=v\"(r):\"v\"(b));\n"
+"    asm volatile(\"v_fma_f32 %0, %1, %2, 1.0\":\"=v\"(e):\"v\"(nb),\"v\"(r));\n"
+"    asm volatile(\"v_fma_f32 %0, %1, %2, %3\":\"=v\"(r):\"v\"(e),\"v\"(r),\"v\"(r));\n"
+"    asm volatile(\"v_fma_f32 %0, %1, %2, 1.0\":\"=v\"(e):\"v\"(nb),\"v\"(r));\n"
+"    asm volatile(\"v_fma_f32 %0, %1, %2, %3\":\"=v\"(r):\"v\"(e),\"v\"(r),\"v\"(r));\n"
+"    return r;\n"
+"}\n"
+"__device__ __forceinline__ float q8_div_contract(float a, float b) {\n"
+"    float r=q8_recip_contract(b),q,e,nb=-b;\n"
+"    asm volatile(\"v_mul_f32 %0, %1, %2\":\"=v\"(q):\"v\"(a),\"v\"(r));\n"
+"    asm volatile(\"v_fma_f32 %0, %1, %2, %3\":\"=v\"(e):\"v\"(nb),\"v\"(q),\"v\"(a));\n"
+"    asm volatile(\"v_fma_f32 %0, %1, %2, %3\":\"=v\"(q):\"v\"(e),\"v\"(r),\"v\"(q));\n"
+"    return q;\n"
+"}\n"
+"__global__ void kv_cache_store_q8q8_batch(signed char *kc, signed char *vc,\n"
+"    half_raw *ks, half_raw *vs, const float *k, const float *v, int n_kv_heads,\n"
+"    int head_dim, int position_start, int M) {\n"
+"    int m=blockIdx.x/n_kv_heads,h=blockIdx.x%n_kv_heads,tid=threadIdx.x;\n"
+"    int lane=tid&31,group=tid>>5,groups=head_dim/32,kv_dim=n_kv_heads*head_dim;\n"
+"    if(m>=M)return; size_t input=(size_t)m*kv_dim+h*head_dim+tid;\n"
+"    float xk=tid<head_dim?k[input]:0.0f,xv=tid<head_dim?v[input]:0.0f;\n"
+"    float ak=fabsf(xk),av=fabsf(xv);\n"
+"    for(int z=16;z;z>>=1){ak=fmaxf(ak,__shfl_xor(ak,z,32));av=fmaxf(av,__shfl_xor(av,z,32));}\n"
+"    float dk=q8_div_contract(ak,127.0f),dv=q8_div_contract(av,127.0f);\n"
+"    float ik=dk?q8_recip_contract(dk):0.0f,iv=dv?q8_recip_contract(dv):0.0f;\n"
+"    if(tid<head_dim){size_t o=(size_t)(position_start+m)*kv_dim+h*head_dim+tid;\n"
+"        float qk,qv;asm volatile(\"v_mul_f32 %0, %1, %2\":\"=v\"(qk):\"v\"(xk),\"v\"(ik));asm volatile(\"v_mul_f32 %0, %1, %2\":\"=v\"(qv):\"v\"(xv),\"v\"(iv));kc[o]=(signed char)roundf(qk);vc[o]=(signed char)roundf(qv);\n"
+"        if(lane==0){size_t sg=((size_t)(position_start+m)*n_kv_heads+h)*groups+group;\n"
+"            ks[sg]=f32_to_half_raw(round_f16_contract(dk));vs[sg]=f32_to_half_raw(round_f16_contract(dv));}\n"
+"    }\n"
+"}\n"
+"__global__ void kv_cache_store_q8q8_positions(signed char *kc, signed char *vc,\n"
+"    half_raw *ks, half_raw *vs, const float *k, const float *v, int n_kv_heads,\n"
+"    int head_dim, const int *positions, int M) {\n"
+"    int m=blockIdx.x/n_kv_heads,h=blockIdx.x%n_kv_heads,tid=threadIdx.x;\n"
+"    int lane=tid&31,group=tid>>5,groups=head_dim/32,kv_dim=n_kv_heads*head_dim;\n"
+"    if(m>=M)return; size_t input=(size_t)m*kv_dim+h*head_dim+tid;\n"
+"    float xk=tid<head_dim?k[input]:0.0f,xv=tid<head_dim?v[input]:0.0f;\n"
+"    float ak=fabsf(xk),av=fabsf(xv);\n"
+"    for(int z=16;z;z>>=1){ak=fmaxf(ak,__shfl_xor(ak,z,32));av=fmaxf(av,__shfl_xor(av,z,32));}\n"
+"    float dk=q8_div_contract(ak,127.0f),dv=q8_div_contract(av,127.0f);\n"
+"    float ik=dk?q8_recip_contract(dk):0.0f,iv=dv?q8_recip_contract(dv):0.0f;\n"
+"    if(tid<head_dim){int pos=positions[m];size_t o=(size_t)pos*kv_dim+h*head_dim+tid;\n"
+"        float qk,qv;asm volatile(\"v_mul_f32 %0, %1, %2\":\"=v\"(qk):\"v\"(xk),\"v\"(ik));asm volatile(\"v_mul_f32 %0, %1, %2\":\"=v\"(qv):\"v\"(xv),\"v\"(iv));kc[o]=(signed char)roundf(qk);vc[o]=(signed char)roundf(qv);\n"
+"        if(lane==0){size_t sg=((size_t)pos*n_kv_heads+h)*groups+group;\n"
+"            ks[sg]=f32_to_half_raw(round_f16_contract(dk));vs[sg]=f32_to_half_raw(round_f16_contract(dv));}\n"
+"    }\n"
+"}\n"
+"__global__ void kv_cache_store_q8q8_devp(signed char *kc, signed char *vc,\n"
+"    half_raw *ks, half_raw *vs, const float *k, const float *v, int n_kv_heads,\n"
+"    int head_dim, const int *position) {\n"
+"    int position_start=*position, M=1; int m=blockIdx.x/n_kv_heads,h=blockIdx.x%n_kv_heads,tid=threadIdx.x;\n"
+"    int lane=tid&31,group=tid>>5,groups=head_dim/32,kv_dim=n_kv_heads*head_dim;\n"
+"    if(m>=M)return; size_t input=(size_t)m*kv_dim+h*head_dim+tid;\n"
+"    float xk=tid<head_dim?k[input]:0.0f,xv=tid<head_dim?v[input]:0.0f;\n"
+"    float ak=fabsf(xk),av=fabsf(xv);\n"
+"    for(int z=16;z;z>>=1){ak=fmaxf(ak,__shfl_xor(ak,z,32));av=fmaxf(av,__shfl_xor(av,z,32));}\n"
+"    float dk=q8_div_contract(ak,127.0f),dv=q8_div_contract(av,127.0f);\n"
+"    float ik=dk?q8_recip_contract(dk):0.0f,iv=dv?q8_recip_contract(dv):0.0f;\n"
+"    if(tid<head_dim){size_t o=(size_t)(position_start+m)*kv_dim+h*head_dim+tid;\n"
+"        float qk,qv;asm volatile(\"v_mul_f32 %0, %1, %2\":\"=v\"(qk):\"v\"(xk),\"v\"(ik));asm volatile(\"v_mul_f32 %0, %1, %2\":\"=v\"(qv):\"v\"(xv),\"v\"(iv));kc[o]=(signed char)roundf(qk);vc[o]=(signed char)roundf(qv);\n"
+"        if(lane==0){size_t sg=((size_t)(position_start+m)*n_kv_heads+h)*groups+group;\n"
+"            ks[sg]=f32_to_half_raw(round_f16_contract(dk));vs[sg]=f32_to_half_raw(round_f16_contract(dv));}\n"
+"    }\n"
+"}\n"
 /* The max reduction and probability-sum reduction reuse red[]. Every wave
  * must finish reading the maximum before any wave publishes its sum input. */
 "__global__ void attn_decode_flash_f16_devp(float *out, const float *q,\n"
@@ -8952,7 +12609,12 @@ static const char *hip_kernel_source =
 "    extern __shared__ float smem[]; int h=blockIdx.x; if(h>=n_heads)return;\n"
 "    int kv_h=h/(n_heads/n_kv_heads), pos=*pos_p, tid=threadIdx.x, NT=blockDim.x;\n"
 "    float *q_sh=smem,*acc=q_sh+head_dim,*prob=acc+head_dim,*red=prob+NT;\n"
-"    const float *qh=q+h*head_dim; for(int d=tid;d<head_dim;d+=NT){q_sh[d]=qh[d]*scale;acc[d]=0.0f;}\n"
+"    const float *qh=q+h*head_dim; for(int d=tid;d<head_dim;d+=NT){\n"
+"      /* llama.cpp's F16 vector fallback loads Q into half2 registers and\n"
+"       * applies the (power-of-two for head_dim=256) scale there. Round Q\n"
+"       * to F16 before the dot so Q8/Q4-cache fallback uses the same\n"
+"       * operand contract instead of retaining an F32 query. */\n"
+"      q_sh[d]=half_to_float(f32_to_f16_bits(qh[d]*scale)); acc[d]=0.0f; }\n"
 "    __syncthreads(); float mi=-1e30f,li=0.0f;\n"
 "    for(int ts=0;ts<=pos;ts+=NT){ int kp=ts+tid, tn=pos-ts+1; if(tn>NT)tn=NT; float sc=-1e30f;\n"
 "      if(kp<=pos){const half_raw *kr=key_cache+(size_t)kp*kv_dim+kv_h*head_dim;sc=0.0f;\n"
@@ -9033,6 +12695,87 @@ static const char *hip_kernel_source =
 "      if(lane==0)red[warp]=rv;__syncthreads();if(warp==0){rv=tid<8?red[tid]:0.0f;for(int z=16;z;z>>=1)rv+=__shfl_down(rv,z,32);if(tid==0)red[0]=rv;}__syncthreads();\n"
 "      li=li*corr;for(int d=tid;d<head_dim;d+=NT){float a=acc[d]*corr;for(int t=0;t<tn;t++)a+=prob[t]*qkv_byte_to_float(value_cache[(size_t)(ts+t)*kv_dim+kv_h*head_dim+d],value_scale[((size_t)(ts+t)*n_kv_heads+kv_h)*groups+d/32],fp8);acc[d]=a;}li+=red[0];mi=nm;__syncthreads();}\n"
 "    float inv=li>0.0f?1.0f/li:0.0f;for(int d=tid;d<head_dim;d+=NT)out[h*head_dim+d]=acc[d]*inv;\n"
+"}\n"
+"__device__ __forceinline__ float q4_cache_to_float(const unsigned char *vc, size_t i, float s, int d) {\n"
+"    unsigned char p=vc[i]; int q=(d&1)?(p>>4):(p&15); return (float)(q-8)*s;\n"
+"}\n"
+"__global__ void attn_decode_flash_q8q4(float *out, const float *q, const signed char *kc, const unsigned char *vc, const float *ks, const float *vs, int n_heads, int n_kv_heads, int head_dim, int kv_dim, int value_stride, const int *pos_p, float scale) {\n"
+"    extern __shared__ float smem[]; int h=blockIdx.x;if(h>=n_heads)return;int kv_h=h/(n_heads/n_kv_heads),pos=*pos_p,tid=threadIdx.x,NT=blockDim.x,groups=(head_dim+31)/32;float *qv=smem,*acc=qv+head_dim,*pr=acc+head_dim,*red=pr+NT;\n"
+"    for(int d=tid;d<head_dim;d+=NT){qv[d]=q[h*head_dim+d]*scale;acc[d]=0.0f;}__syncthreads();float mi=-1e30f,li=0.0f;\n"
+"    for(int ts=0;ts<=pos;ts+=NT){int kp=ts+tid,tn=pos-ts+1;if(tn>NT)tn=NT;float sc=-1e30f;if(kp<=pos){const signed char *kr=kc+(size_t)kp*kv_dim+kv_h*head_dim;for(int d=0;d<head_dim;d++)sc+=qv[d]*(float)kr[d]*ks[((size_t)kp*n_kv_heads+kv_h)*groups+d/32];}red[tid]=sc;__syncthreads();for(int z=NT/2;z;z>>=1){if(tid<z)red[tid]=fmaxf(red[tid],red[tid+z]);__syncthreads();}float nm=fmaxf(mi,red[0]),corr=mi<-1e29f?0.0f:__expf(mi-nm),pv=kp<=pos?__expf(sc-nm):0.0f;pr[tid]=pv;red[tid]=pv;__syncthreads();for(int z=NT/2;z;z>>=1){if(tid<z)red[tid]+=red[tid+z];__syncthreads();}li=li*corr+red[0];for(int d=tid;d<head_dim;d+=NT){float a=acc[d]*corr;for(int t=0;t<tn;t++){size_t vi=(size_t)(ts+t)*value_stride+kv_h*(head_dim/2)+d/2;a+=pr[t]*q4_cache_to_float(vc,vi,vs[((size_t)(ts+t)*n_kv_heads+kv_h)*groups+d/32],d);}acc[d]=a;}mi=nm;__syncthreads();}\n"
+"    float inv=li>0.0f?1.0f/li:0.0f;for(int d=tid;d<head_dim;d+=NT)out[h*head_dim+d]=acc[d]*inv;\n"
+"}\n"
+"/* Q8K/Q4V decode with warp-local reductions.  The reference kernel performs\n"
+" * two full 256-thread shared-memory reductions per cache tile; this keeps\n"
+" * the same one-key-per-thread mapping but reduces each warp with shuffles. */\n"
+"__global__ void attn_decode_q8q4_warpred(float *out, const float *q, const signed char *kc, const unsigned char *vc, const float *ks, const float *vs, int n_heads, int n_kv_heads, int head_dim, int kv_dim, int value_stride, const int *pos_p, float scale) {\n"
+"    extern __shared__ float smem[];int h=blockIdx.x;if(h>=n_heads)return;int kv_h=h/(n_heads/n_kv_heads),pos=*pos_p,tid=threadIdx.x,NT=blockDim.x,lane=tid&31,warp=tid>>5,groups=(head_dim+31)/32;\n"
+"    float *qv=smem,*acc=qv+head_dim,*pr=acc+head_dim,*red=pr+NT;const float *qh=q+(size_t)h*head_dim;\n"
+"    for(int d=tid;d<head_dim;d+=NT){qv[d]=qh[d]*scale;acc[d]=0.0f;}__syncthreads();float mi=-1e30f,li=0.0f;\n"
+"    for(int ts=0;ts<=pos;ts+=NT){int kp=ts+tid,tn=pos-ts+1;if(tn>NT)tn=NT;float sc=-1e30f;if(kp<=pos){const signed char *kr=kc+(size_t)kp*kv_dim+kv_h*head_dim;for(int d=0;d<head_dim;d++)sc+=qv[d]*(float)kr[d]*ks[((size_t)kp*n_kv_heads+kv_h)*groups+d/32];}\n"
+"      float mx=sc;for(int z=16;z;z>>=1)mx=fmaxf(mx,__shfl_down(mx,z));if(lane==0)red[warp]=mx;__syncthreads();\n"
+"      if(warp==0){mx=tid<NT/32?red[tid]:-1e30f;for(int z=16;z;z>>=1)mx=fmaxf(mx,__shfl_down(mx,z));if(tid==0)red[0]=mx;}__syncthreads();\n"
+"      float nm=red[0],corr=mi<-1e29f?0.0f:__expf(mi-nm),pv=kp<=pos?__expf(sc-nm):0.0f;pr[tid]=pv;float sm=pv;for(int z=16;z;z>>=1)sm+=__shfl_down(sm,z);if(lane==0)red[warp]=sm;__syncthreads();\n"
+"      if(warp==0){sm=tid<NT/32?red[tid]:0.0f;for(int z=16;z;z>>=1)sm+=__shfl_down(sm,z);if(tid==0)red[0]=sm;}__syncthreads();\n"
+"      li=li*corr+red[0];for(int d=tid;d<head_dim;d+=NT){float a=acc[d]*corr;for(int t=0;t<tn;t++){size_t vi=(size_t)(ts+t)*value_stride+kv_h*(head_dim/2)+d/2;a+=pr[t]*q4_cache_to_float(vc,vi,vs[((size_t)(ts+t)*n_kv_heads+kv_h)*groups+d/32],d);}acc[d]=a;}mi=nm;__syncthreads();}\n"
+"    float inv=li>0.0f?1.0f/li:0.0f;for(int d=tid;d<head_dim;d+=NT)out[h*head_dim+d]=acc[d]*inv;\n"
+"}\n"
+"/* Split-KV Q8K/Q4V decode. Each block reduces one sequence segment and\n"
+" * writes (max,sum,value) partials; a second kernel combines the segments.\n"
+" * This exposes long-context parallelism that the one-block-per-head path\n"
+" * cannot use. */\n"
+"__global__ void attn_decode_q8q4_split(float *partial, const float *q, const signed char *kc, const unsigned char *vc, const float *ks, const float *vs, int n_heads, int n_kv_heads, int head_dim, int kv_dim, int value_stride, const int *pos_p, float scale, int splits, int chunk) {\n"
+"    extern __shared__ float smem[];int h=blockIdx.x,sp=blockIdx.y;if(h>=n_heads||sp>=splits)return;int tid=threadIdx.x,NT=blockDim.x,pos=*pos_p,start=sp*chunk,end=start+chunk;if(end>pos+1)end=pos+1;size_t base=((size_t)h*splits+sp)*(head_dim+2);\n"
+"    if(start>pos){if(tid==0){partial[base]=-1e30f;partial[base+1]=0.0f;}return;}\n"
+"    int kv_h=h/(n_heads/n_kv_heads),groups=(head_dim+31)/32;float *qv=smem,*acc=qv+head_dim,*pr=acc+head_dim,*red=pr+NT;const float *qh=q+(size_t)h*head_dim;\n"
+"    for(int d=tid;d<head_dim;d+=NT){qv[d]=qh[d]*scale;acc[d]=0.0f;}__syncthreads();float mi=-1e30f,li=0.0f;\n"
+"    for(int ts=start;ts<end;ts+=NT){int kp=ts+tid,tn=end-ts;if(tn>NT)tn=NT;float sc=-1e30f;if(kp<end){const signed char *kr=kc+(size_t)kp*kv_dim+kv_h*head_dim;for(int d=0;d<head_dim;d++)sc+=qv[d]*(float)kr[d]*ks[((size_t)kp*n_kv_heads+kv_h)*groups+d/32];}\n"
+"      red[tid]=sc;__syncthreads();for(int z=NT/2;z;z>>=1){if(tid<z)red[tid]=fmaxf(red[tid],red[tid+z]);__syncthreads();}float nm=fmaxf(mi,red[0]),corr=mi<-1e29f?0.0f:__expf(mi-nm),pv=kp<end?__expf(sc-nm):0.0f;pr[tid]=pv;red[tid]=pv;__syncthreads();for(int z=NT/2;z;z>>=1){if(tid<z)red[tid]+=red[tid+z];__syncthreads();}\n"
+"      li=li*corr+red[0];for(int d=tid;d<head_dim;d+=NT){float a=acc[d]*corr;for(int t=0;t<tn;t++){size_t vi=(size_t)(ts+t)*value_stride+kv_h*(head_dim/2)+d/2;a+=pr[t]*q4_cache_to_float(vc,vi,vs[((size_t)(ts+t)*n_kv_heads+kv_h)*groups+d/32],d);}acc[d]=a;}mi=nm;__syncthreads();}\n"
+"    partial[base]=mi;partial[base+1]=li;for(int d=tid;d<head_dim;d+=NT)partial[base+2+d]=acc[d];\n"
+"}\n"
+"/* Split-KV attention variant using llama.cpp-style Q8 query quantization and\n"
+" * DP4A for Q8K dot products. Query scales are per 32-element group. */\n"
+"__global__ void attn_decode_q8q4_split_dp4a(float *partial, const signed char *q8, const float *qscale, const signed char *kc, const unsigned char *vc, const float *ks, const float *vs, int n_heads, int n_kv_heads, int head_dim, int kv_dim, int value_stride, const int *pos_p, float scale, int splits, int chunk) {\n"
+"    extern __shared__ float smem[];int h=blockIdx.x,sp=blockIdx.y;if(h>=n_heads||sp>=splits)return;int tid=threadIdx.x,NT=blockDim.x,pos=*pos_p,start=sp*chunk,end=start+chunk;if(end>pos+1)end=pos+1;size_t base=((size_t)h*splits+sp)*(head_dim+2);\n"
+"    if(start>pos){if(tid==0){partial[base]=-1e30f;partial[base+1]=0.0f;}return;}\n"
+"    int kv_h=h/(n_heads/n_kv_heads),groups=(head_dim+31)/32;float *acc=smem,*pr=acc+head_dim,*red=pr+NT;const signed char *qh=q8+(size_t)h*head_dim;const float *qsc=qscale+(size_t)h*groups;\n"
+"    for(int d=tid;d<head_dim;d+=NT)acc[d]=0.0f;__syncthreads();float mi=-1e30f,li=0.0f;\n"
+"    for(int ts=start;ts<end;ts+=NT){int kp=ts+tid,tn=end-ts;if(tn>NT)tn=NT;float sc=-1e30f;if(kp<end){const signed char *kr=kc+(size_t)kp*kv_dim+kv_h*head_dim;float dot=0.0f;for(int g=0;g<groups;g++){const int *qa=(const int *)(qh+g*32);const int *ka=(const int *)(kr+g*32);int z=0;for(int j=0;j<8;j++)z=dp4a_hw(qa[j],ka[j],z);dot+=(float)z*qsc[g]*ks[((size_t)kp*n_kv_heads+kv_h)*groups+g];}sc=dot*scale;}red[tid]=sc;__syncthreads();for(int z=NT/2;z;z>>=1){if(tid<z)red[tid]=fmaxf(red[tid],red[tid+z]);__syncthreads();}float nm=fmaxf(mi,red[0]),corr=mi<-1e29f?0.0f:__expf(mi-nm),pv=kp<end?__expf(sc-nm):0.0f;pr[tid]=pv;red[tid]=pv;__syncthreads();for(int z=NT/2;z;z>>=1){if(tid<z)red[tid]+=red[tid+z];__syncthreads();}li=li*corr+red[0];for(int d=tid;d<head_dim;d+=NT){float a=acc[d]*corr;for(int t=0;t<tn;t++){size_t vi=(size_t)(ts+t)*value_stride+kv_h*(head_dim/2)+d/2;a+=pr[t]*q4_cache_to_float(vc,vi,vs[((size_t)(ts+t)*n_kv_heads+kv_h)*groups+d/32],d);}acc[d]=a;}mi=nm;__syncthreads();}\n"
+"    partial[base]=mi;partial[base+1]=li;for(int d=tid;d<head_dim;d+=NT)partial[base+2+d]=acc[d];\n"
+"}\n"
+"__global__ void attn_decode_q8q4_split_combine(float *out, const float *partial, int n_heads, int head_dim, int splits) {\n"
+"    int h=blockIdx.x,tid=threadIdx.x;if(h>=n_heads)return;extern __shared__ float red[];size_t stride=head_dim+2;float mx=-1e30f;if(tid==0){for(int sp=0;sp<splits;sp++){float v=partial[((size_t)h*splits+sp)*stride];mx=fmaxf(mx,v);}red[0]=mx;}__syncthreads();mx=red[0];\n"
+"    if(tid==0){float den=0.0f;for(int sp=0;sp<splits;sp++){size_t b=((size_t)h*splits+sp)*stride;float m=partial[b];if(m>-1e29f)den+=partial[b+1]*__expf(m-mx);}red[0]=den;}__syncthreads();float den=red[0];for(int d=tid;d<head_dim;d+=blockDim.x){float num=0.0f;for(int sp=0;sp<splits;sp++){size_t b=((size_t)h*splits+sp)*stride;float m=partial[b];if(m>-1e29f)num+=partial[b+2+d]*__expf(m-mx);}out[(size_t)h*head_dim+d]=den>0.0f?num/den:0.0f;}\n"
+"}\n"
+"/* Vector-Q4V split decode, adapted from llama.cpp's fattn-vec layout.\n"
+" * One lane owns two adjacent value channels, so a packed Q4 byte is read\n"
+" * once for both outputs.  QK remains the exact DP4A path; only the V phase\n"
+" * changes its lane mapping.  This is deliberately opt-in pending parity. */\n"
+"__global__ void attn_decode_q8q4_split_dp4a_vecv(float *partial, const signed char *q8, const float *qscale, const signed char *kc, const unsigned char *vc, const float *ks, const float *vs, int n_heads, int n_kv_heads, int head_dim, int kv_dim, int value_stride, const int *pos_p, float scale, int splits, int chunk) {\n"
+"    extern __shared__ float smem[];int h=blockIdx.x,sp=blockIdx.y,tid=threadIdx.x,NT=blockDim.x,pos=*pos_p;\n"
+"    if(h>=n_heads||sp>=splits)return;int start=sp*chunk,end=start+chunk;if(end>pos+1)end=pos+1;\n"
+"    size_t base=((size_t)h*splits+sp)*(head_dim+2);if(start>pos){if(tid==0){partial[base]=-1e30f;partial[base+1]=0.0f;}return;}\n"
+"    int groups=(head_dim+31)/32;float *pr=smem,*red=pr+NT;const signed char *qh=q8+(size_t)h*head_dim;\n"
+"    float mi=-1e30f,li=0.0f,a0=0.0f,a1=0.0f;\n"
+"    for(int ts=start;ts<end;ts+=NT){int kp=ts+tid,tn=end-ts;if(tn>NT)tn=NT;float sc=-1e30f;\n"
+"        if(kp<end){const signed char *kr=kc+(size_t)kp*kv_dim+(h/(n_heads/n_kv_heads))*head_dim;float dot=0.0f;\n"
+"            #pragma unroll\n"
+"            for(int g=0;g<groups;g++){const int *qa=(const int *)(qh+g*32);const int *ka=(const int *)(kr+g*32);int z=0;\n"
+"                #pragma unroll\n"
+"                for(int j=0;j<8;j++)z=dp4a_hw(qa[j],ka[j],z);dot+=(float)z*qscale[(size_t)h*groups+g]*ks[((size_t)kp*n_kv_heads+h/(n_heads/n_kv_heads))*groups+g];}sc=dot*scale;}\n"
+"        red[tid]=sc;__syncthreads();for(int z=NT/2;z;z>>=1){if(tid<z)red[tid]=fmaxf(red[tid],red[tid+z]);__syncthreads();}\n"
+"        float nm=fmaxf(mi,red[0]),corr=mi<-1e29f?0.0f:__expf(mi-nm),pv=kp<end?__expf(sc-nm):0.0f;pr[tid]=pv;red[tid]=pv;__syncthreads();\n"
+"        for(int z=NT/2;z;z>>=1){if(tid<z)red[tid]+=red[tid+z];__syncthreads();}li=li*corr+red[0];\n"
+"        if(tid<head_dim/2){int d=tid*2;float b0=a0*corr,b1=a1*corr;int kv_h=h/(n_heads/n_kv_heads);\n"
+"            #pragma unroll 4\n"
+"            for(int t=0;t<tn;t++){size_t vi=(size_t)(ts+t)*value_stride+kv_h*(head_dim/2)+tid;unsigned char p=vc[vi];\n"
+"                float sv=vs[((size_t)(ts+t)*n_kv_heads+kv_h)*groups+d/32];int q0=(int)(p&15)-8,q1=(int)(p>>4)-8;b0+=pr[t]*((float)q0*sv);b1+=pr[t]*((float)q1*sv);}a0=b0;a1=b1;}\n"
+"        mi=nm;__syncthreads();}\n"
+"    if(tid<head_dim/2){partial[base]=mi;partial[base+1]=li;partial[base+2+tid*2]=a0;partial[base+3+tid*2]=a1;}\n"
+"}\n"
+"__global__ void attn_prefill_flash_q8q4(float *out, const float *q, const signed char *kc, const unsigned char *vc, const float *ks, const float *vs, int n_heads, int n_kv_heads, int head_dim, int kv_dim, int value_stride, int M, int position_start, float scale) {\n"
+"    int h=blockIdx.x,m=blockIdx.y;if(h>=n_heads||m>=M)return;int kv_h=h/(n_heads/n_kv_heads),pos=position_start+m,tid=threadIdx.x,NT=blockDim.x,groups=(head_dim+31)/32;extern __shared__ float smem[];float *qv=smem,*acc=qv+head_dim,*pr=acc+head_dim,*red=pr+NT;const float *qh=q+(size_t)m*n_heads*head_dim+h*head_dim;for(int d=tid;d<head_dim;d+=NT){qv[d]=qh[d]*scale;acc[d]=0.0f;}__syncthreads();float mi=-1e30f,li=0.0f;for(int ts=0;ts<=pos;ts+=NT){int kp=ts+tid,tn=pos-ts+1;if(tn>NT)tn=NT;float sc=-1e30f;if(kp<=pos){const signed char *kr=kc+(size_t)kp*kv_dim+kv_h*head_dim;for(int d=0;d<head_dim;d++)sc+=qv[d]*(float)kr[d]*ks[((size_t)kp*n_kv_heads+kv_h)*groups+d/32];}red[tid]=sc;__syncthreads();for(int z=NT/2;z;z>>=1){if(tid<z)red[tid]=fmaxf(red[tid],red[tid+z]);__syncthreads();}float nm=fmaxf(mi,red[0]),corr=mi<-1e29f?0.0f:__expf(mi-nm),pv=kp<=pos?__expf(sc-nm):0.0f;pr[tid]=pv;red[tid]=pv;__syncthreads();for(int z=NT/2;z;z>>=1){if(tid<z)red[tid]+=red[tid+z];__syncthreads();}li=li*corr+red[0];for(int d=tid;d<head_dim;d+=NT){float a=acc[d]*corr;for(int t=0;t<tn;t++){size_t vi=(size_t)(ts+t)*value_stride+kv_h*(head_dim/2)+d/2;a+=pr[t]*q4_cache_to_float(vc,vi,vs[((size_t)(ts+t)*n_kv_heads+kv_h)*groups+d/32],d);}acc[d]=a;}mi=nm;__syncthreads();}float inv=li>0.0f?1.0f/li:0.0f;for(int d=tid;d<head_dim;d+=NT)out[(size_t)m*n_heads*head_dim+h*head_dim+d]=acc[d]*inv;\n"
 "}\n"
 "/* GQA8 I8 decode: one block handles one query head while eight lanes share\n"
 " * each key dot product.  Qwen4's 12:1 GQA ratio makes the K/V reads the\n"
@@ -9134,14 +12877,120 @@ static const char *hip_kernel_source =
 "    for(int ts=0;ts<=pos;ts+=NT){ int kp=ts+tid, tn=pos-ts+1; if(tn>NT)tn=NT; float sc=-1e30f;\n"
 "      if(kp<=pos){const half_raw *kr=key_cache+(size_t)kp*kv_dim+kv_h*head_dim;sc=0.0f;for(int d=0;d<head_dim;d++)sc+=q_sh[d]*half_to_float(kr[d]);}\n"
 "      red[tid]=sc;__syncthreads();for(int z=NT/2;z;z>>=1){if(tid<z)red[tid]=fmaxf(red[tid],red[tid+z]);__syncthreads();}\n"
-"      float nm=fmaxf(mi,red[0]),corr=mi<-1e29f?0.0f:__expf(mi-nm),pv=kp<=pos?__expf(sc-nm):0.0f;\n"
+"      float nm=fmaxf(mi,red[0]),corr=mi<-1e29f?0.0f:expf(mi-nm),pv=kp<=pos?expf(sc-nm):0.0f;\n"
 "      /* QWEN4_ATTN_MAX_READERS */ __syncthreads();prob[tid]=pv;red[tid]=pv;__syncthreads();for(int z=NT/2;z;z>>=1){if(tid<z)red[tid]+=red[tid+z];__syncthreads();}\n"
 "      li=li*corr+red[0];for(int d=tid;d<head_dim;d+=NT){float a=acc[d]*corr;for(int t=0;t<tn;t++)\n"
 "        a+=prob[t]*half_to_float(value_cache[(size_t)(ts+t)*kv_dim+kv_h*head_dim+d]);acc[d]=a;}\n"
 "      mi=nm;__syncthreads();}\n"
 "    float inv=li>0.0f?1.0f/li:0.0f;for(int d=tid;d<head_dim;d+=NT)out[(size_t)m*q_dim+h*head_dim+d]=acc[d]*inv;\n"
 "}\n"
-"\n"
+"/* llama.cpp fattn-vec-shaped Q8/Q4 fallback.  Eight lanes own one KQ\n"
+" * score, with half2 operands and v_dot2_f32_f16; the V update keeps the\n"
+" * same online-softmax state but uses one output channel per thread.  This\n"
+" * is opt-in while its full-model numerical trace is being compared. */\n"
+"__global__ void attn_prefill_fattn_vec_f16(float *out, const half_raw *q,\n"
+"    const half_raw *key_cache, const half_raw *value_cache,\n"
+"    int n_heads, int n_kv_heads, int head_dim, int kv_len,\n"
+"    int M, int position_start, float scale) {\n"
+"    int h=blockIdx.x,m=blockIdx.y,tid=threadIdx.x,NT=blockDim.x;\n"
+"    if(h>=n_heads||m>=M)return;\n"
+"    int kv_h=h/(n_heads/n_kv_heads),pos=position_start+m,q_dim=n_heads*head_dim;\n"
+"    extern __shared__ float sm[]; float *scores=sm,*prob=scores+32,*state=prob+32;\n"
+"    float acc=0.0f; int d=tid;\n"
+"    const half_raw *qh=q+(size_t)m*q_dim+h*head_dim;\n"
+"    const __half2 *q2=(const __half2 *)qh;\n"
+"    __half2 scale2=__halves2half2(__float2half(scale),__float2half(scale));\n"
+"    float mi=-1.0e30f,li=0.0f;\n"
+"    for(int ts=0;ts<=pos;ts+=32){\n"
+"        int group=tid>>3,lane=tid&7,key=ts+group,tn=pos-ts+1;\n"
+"        if(tn>32)tn=32; float s=group<tn?0.0f:-1.0e30f;\n"
+"        if(group<tn){\n"
+"            const __half2 *k2=(const __half2 *)(key_cache+((size_t)kv_h*kv_len+key)*head_dim);\n"
+"            for(int k0=0;k0<head_dim/2;k0+=8*4) for(int j=0;j<4;j++){\n"
+"                __half2 qv=__hmul2(q2[k0+lane*4+j],scale2);\n"
+"                __half2 kv=k2[k0+lane*4+j];\n"
+"                asm volatile(\"v_dot2_f32_f16 %0, %1, %2, %0\"\n"
+"                    : \"+v\"(s) : \"v\"(kv), \"v\"(qv));\n"
+"            }\n"
+"        }\n"
+"        for(int off=4;off;off>>=1)s+=__shfl_down(s,off,8);\n"
+"        if(lane==0)scores[group]=s;\n"
+"        __syncthreads();\n"
+"        if(tid==0){\n"
+"            float mx=mi; for(int t=0;t<tn;t++)mx=fmaxf(mx,scores[t]);\n"
+"            float corr=mi<-1.0e29f?0.0f:expf(mi-mx),sum=0.0f;\n"
+"            for(int t=0;t<32;t++){float p=t<tn?expf(scores[t]-mx):0.0f;prob[t]=p;sum+=p;}\n"
+"            mi=mx; li=li*corr+sum; state[0]=li; state[1]=corr;\n"
+"        }\n"
+"        __syncthreads();\n"
+"        if(d<head_dim){float a=acc*state[1];\n"
+"            for(int t=0;t<tn;t++){const half_raw *vr=value_cache+((size_t)kv_h*kv_len+ts+t)*head_dim;\n"
+"                a+=prob[t]*half_to_float(vr[d]);}\n"
+"            acc=a;}\n"
+"        __syncthreads();\n"
+"    }\n"
+"    if(d<head_dim){float li_final=state[0];out[(size_t)m*q_dim+h*head_dim+d]=li_final>0.0f?acc/li_final:0.0f;}\n"
+"}\n"
+"/* Direct llama.cpp-style Q8_1-Q8_0/Q4_0 attention.  Unlike the packed-F16\n"
+" * fallback above, this keeps Q8 query integers and performs the KQ dot as\n"
+" * signed integer products times the two FP32 block scales.  It is an A/B\n"
+" * kernel until its V accumulation is matched to llama.cpp's half2 path. */\n"
+"__global__ void attn_prefill_fattn_vec_q8q4(float *out, const signed char *q8,\n"
+"    const float *qscale, const signed char *kc, const unsigned char *vc,\n"
+"    const float *ks, const float *vs, int n_heads, int n_kv_heads,\n"
+"    int head_dim, int kv_dim, int value_stride, int M, int position_start) {\n"
+"    int h=blockIdx.x,m=blockIdx.y,tid=threadIdx.x;\n"
+"    if(h>=n_heads||m>=M)return;\n"
+"    int kv_h=h/(n_heads/n_kv_heads),pos=position_start+m,lane=tid&7,key=tid>>3;\n"
+"    int groups=head_dim/32,q_dim=n_heads*head_dim;\n"
+"    extern __shared__ float sm[]; float *score=sm,*prob=score+16;\n"
+"    float *state=prob+16; float a0=0.0f,a1=0.0f;\n"
+"    const signed char *qh=q8+((size_t)m*n_heads+h)*head_dim;\n"
+"    const float *qds=qscale+((size_t)m*n_heads+h)*groups;\n"
+"    float mi=-1.0e30f,li=0.0f;\n"
+"    for(int ts=0;ts<=pos;ts+=16){\n"
+"        int tn=pos-ts+1; if(tn>16)tn=16; float dot=0.0f;\n"
+"        if(key<tn){\n"
+"            const signed char *kh=kc+(size_t)(ts+key)*kv_dim+kv_h*head_dim;\n"
+"            for(int g=0;g<groups;g++){\n"
+"                const int *qa=(const int *)(qh+g*32+lane*4);\n"
+"                const int *ka=(const int *)(kh+g*32+lane*4);\n"
+"                int z=0; z=dp4a_hw(*qa,*ka,z);\n"
+"                dot+=(float)z*qds[g]*ks[((size_t)(ts+key)*n_kv_heads+kv_h)*groups+g];\n"
+"            }\n"
+"            for(int s=4;s;s>>=1)dot+=__shfl_down(dot,s,8);\n"
+"        }\n"
+"        if(lane==0)score[key]=key<tn?dot:-1.0e30f;\n"
+"        __syncthreads();\n"
+"        if(tid==0){ float mx=mi; for(int t=0;t<tn;t++)mx=fmaxf(mx,score[t]);\n"
+"            float corr=mi<-1.0e29f?0.0f:expf(mi-mx),sum=0.0f;\n"
+"            for(int t=0;t<16;t++){float p=t<tn?expf(score[t]-mx):0.0f;prob[t]=p;sum+=p;}\n"
+"            mi=mx; li=li*corr+sum; state[0]=li; state[1]=corr; }\n"
+"        __syncthreads();\n"
+"        int d0=tid,d1=tid+128;\n"
+"        if(d0<head_dim||d1<head_dim){\n"
+"            float b0=d0<head_dim?half_to_float(f32_to_f16_bits(a0*state[1])):0.0f;\n"
+"            float b1=d1<head_dim?half_to_float(f32_to_f16_bits(a1*state[1])):0.0f;\n"
+"            for(int t=0;t<tn;t++){\n"
+"                const unsigned char *vv=vc+(size_t)(ts+t)*value_stride+kv_h*(head_dim/2);\n"
+"                float p=half_to_float(f32_to_f16_bits(prob[t])),s0=vs[((size_t)(ts+t)*n_kv_heads+kv_h)*groups+d0/32];\n"
+"                if(d0<head_dim){float z=half_to_float(f32_to_f16_bits((float)(((d0&1)?(vv[d0/2]>>4):(vv[d0/2]&15))-8)*s0));\n"
+"                    b0=half_to_float(f32_to_f16_bits(b0+p*z));}\n"
+"                if(d1<head_dim){float s1=vs[((size_t)(ts+t)*n_kv_heads+kv_h)*groups+d1/32];\n"
+"                    float z=half_to_float(f32_to_f16_bits((float)(((d1&1)?(vv[d1/2]>>4):(vv[d1/2]&15))-8)*s1));\n"
+"                    b1=half_to_float(f32_to_f16_bits(b1+p*z));}\n"
+"            }\n"
+"            a0=b0; a1=b1;\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    /* The online-softmax denominator is maintained by tid 0 and mirrored\n"
+"     * through shared state; every value-owning thread must use that shared\n"
+"     * final value rather than its private, untouched li. */\n"
+"    if(tid<head_dim){float inv=state[0]>0.0f?1.0f/state[0]:0.0f;\n"
+"        if(tid<head_dim)out[(size_t)m*q_dim+h*head_dim+tid]=a0*inv;\n"
+"        if(tid+128<head_dim)out[(size_t)m*q_dim+h*head_dim+tid+128]=a1*inv;}\n"
+"}\n"
 "/* Repack batch buffer from compact per-layer stride to padded max stride.\n"
 " * dst [M * dst_stride] = src [M * src_stride], copying n_per_row elements per row. */\n"
 "__global__ void repack_batch_f32(float *dst, const float *src,\n"
@@ -9540,6 +13389,7 @@ struct hip_llm_runner {
     /* Compiled module + kernels */
     hipModule_t module;
     hipFunction_t fn_embed_f16;
+    hipFunction_t fn_embed_f32;
     hipFunction_t fn_embed_f16_devtoken;
     hipFunction_t fn_rmsnorm_f32;
     hipFunction_t fn_hc_norm_f32;
@@ -9549,6 +13399,7 @@ struct hip_llm_runner {
     hipFunction_t fn_qwen4_selected_attn_i8_warp;
     hipFunction_t fn_qwen4_argmax;
     hipFunction_t fn_qwen4_argmax_batch;
+    hipFunction_t fn_copy_state_rows_f32, fn_copy_state_rows_commit_f32;
     hipFunction_t fn_qwen4_qsa_scores;
     hipFunction_t fn_qwen4_qsa_sort_blocks;
     hipFunction_t fn_qwen4_qsa_merge_ids;
@@ -9563,13 +13414,26 @@ struct hip_llm_runner {
     hipFunction_t fn_hc_repeat_batch_f32;
     hipFunction_t fn_rmsnorm_batch_f32;
     hipFunction_t fn_matvec_f16_f32;
+    hipFunction_t fn_matvec_f16_llama_f32;
+    hipFunction_t fn_matvec_f16_llama_pair_f32;
+    hipFunction_t fn_matvec_f16_llama_pair_batch_f32;
+    hipFunction_t fn_matvec_bf16_llama_f32;
+    hipFunction_t fn_matvec_bf16_llama_pair_batch_f32;
+    hipFunction_t fn_matvec_bf16_f32;
     hipFunction_t fn_qknorm_f32;
+    hipFunction_t fn_deinterleave_qgate_qknorm_mrope_pair_devp;
     hipFunction_t fn_qknorm_batch_f32;
+    hipFunction_t fn_qknorm_rope_mrope_batch_f32;
+    hipFunction_t fn_qknorm_pair_batch_f32;
+    hipFunction_t fn_qknorm_rope_pair_batch_f32;
     hipFunction_t fn_rope_neox_f32;
     hipFunction_t fn_rope_mrope_f32;
     hipFunction_t fn_kv_cache_store;
     hipFunction_t fn_attn_decode_f32;
+    hipFunction_t fn_attn_prefill_scalar_f32;
     hipFunction_t fn_silu_mul_f32;
+    hipFunction_t fn_silu_mul_q81_f32;
+    hipFunction_t fn_silu_mul_q81_batch_f32;
     hipFunction_t fn_swiglu_limit_f32;
     hipFunction_t fn_q8_0_compact_to_padded;
     hipFunction_t fn_qwen4_stage_misses;
@@ -9617,6 +13481,9 @@ struct hip_llm_runner {
     hipFunction_t fn_qwen4_gateup_silu_q4k_selected;
     hipFunction_t fn_qwen4_gateup_silu_q4k_selected_2w;
     hipFunction_t fn_qwen4_quantize_q8k;
+    hipFunction_t fn_matvec_iq4_xs_q8k;
+    hipFunction_t fn_matvec_iq4_xs_q81_batch;
+    hipFunction_t fn_matvec_iq4_xs_q81_dp4a;
     hipFunction_t fn_qwen4_quantize_q81;
     hipFunction_t fn_qwen4_gateup_silu_q4k_q8k_selected;
     hipFunction_t fn_qwen4_down_accum_q5_1_q81_selected;
@@ -9648,12 +13515,16 @@ struct hip_llm_runner {
     hipFunction_t fn_embed_q4_0_devtoken;
     hipFunction_t fn_matvec_q2_K_f32;
     hipFunction_t fn_matvec_q2_K_g4_f32;
+    hipFunction_t fn_matvec_q2_K_dp4a2;
+    hipFunction_t fn_matvec_q2_K_q81;
     hipFunction_t fn_matvec_q3_K_f32;
     hipFunction_t fn_matvec_q3_K_g4_f32;
     int q2k_g4, q3k_g4;                     /* LLM_Q2K_G4 / LLM_Q3K_G4 warp-per-row */
     hipFunction_t fn_matvec_q4_K_f32;
     hipFunction_t fn_matvec_q4_K_mw_f32;
     hipFunction_t fn_matvec_q4_K_g4_f32;
+    hipFunction_t fn_matvec_q4_K_batch_reuse4;
+    hipFunction_t fn_matvec_q4_K_batch_reuse8;
     int q4k_g4;                             /* LLM_Q4K_G4: warp-per-row G=nb*4 Q4_K */
     hipFunction_t fn_matvec_q5_K_f32;
     hipFunction_t fn_matvec_q5_K_mw_f32;
@@ -9662,12 +13533,17 @@ struct hip_llm_runner {
     hipFunction_t fn_glm5next_kda_qkv_q5k_batch_f32;
     hipFunction_t fn_glm5next_dsa_qkv_a_q5k_f32;
     hipFunction_t fn_matvec_q6_K_f32;
+    hipFunction_t fn_matvec_q6_K_batch_reuse8;
     hipFunction_t fn_embed_q2_K;
     hipFunction_t fn_embed_q2_K_devtoken;
+    hipFunction_t fn_embed_iq1_m, fn_embed_iq1_m_batch;
     /* SSM kernels */
     hipFunction_t fn_softplus_mul_f32;
     hipFunction_t fn_softplus_mul_batch_f32;
     hipFunction_t fn_sigmoid_inplace_f32;
+    hipFunction_t fn_ssm_alpha_beta_prepare_batch_f32;
+    hipFunction_t fn_silu_gate_mul_f32;
+    hipFunction_t fn_rmsnorm_heads_inplace_f32;
     hipFunction_t fn_conv1d_depthwise_silu_f32;
     hipFunction_t fn_l2_norm_heads_f32;
     hipFunction_t fn_repeat_tile_f32;
@@ -9679,12 +13555,20 @@ struct hip_llm_runner {
     hipFunction_t fn_glm5next_dsa_attend_f32;
     hipFunction_t fn_glm5next_mhc_finish_f32;
     hipFunction_t fn_deltanet_step_batch_f32;
+    hipFunction_t fn_deltanet_step_batch_gda_ref_f32;
+    hipFunction_t fn_deltanet_step_batch_gda_ref_128_f32;
+    hipFunction_t fn_deltanet_step_batch_gda_verify_f32;
+    hipFunction_t fn_deltanet_step_batch_gda_verify_128_f32;
     hipFunction_t fn_l2_norm_heads_batch_f32;
+    hipFunction_t fn_l2_norm_repeat_qk_batch_f32;
     hipFunction_t fn_repeat_tile_batch_f32;
     hipFunction_t fn_gated_rmsnorm_silu_batch_f32;
     hipFunction_t fn_conv1d_depthwise_silu_batch_f32;
+    hipFunction_t fn_ssm_prep_batch_f32;
     hipFunction_t fn_gated_rmsnorm_silu_f32;
+    hipFunction_t fn_gated_rmsnorm_silu_q81_f32;
     hipFunction_t fn_sigmoid_mul_f32;
+    hipFunction_t fn_sigmoid_mul_q81_f32;
     hipFunction_t fn_deinterleave_qgate_f32;
     hipFunction_t fn_deinterleave_qgate_batch_f32;
     /* MoE kernels */
@@ -9693,11 +13577,13 @@ struct hip_llm_runner {
     hipFunction_t fn_matvec_f32_mw_f32;
     hipFunction_t fn_matvec_f32_mw_f32_batch;
     hipFunction_t fn_matvec_f16_f32_batch;
+    hipFunction_t fn_matvec_bf16_f32_batch;
     /* MoE device-side dispatch (sync-free, graph-capturable) */
     hipFunction_t fn_qwen4_fingerprint;
     void *d_qwen4_fingerprints;
     void *d_qwen4_phase_scratch;
     int qwen4_fingerprint_layer;
+    int qwen35_batch_layer;
     int qwen4_fingerprint_active;
     hipFunction_t fn_moe_topk_softmax_gpu;
     hipFunction_t fn_sigmoid_scalar_f32;
@@ -9739,6 +13625,7 @@ struct hip_llm_runner {
     int ssm_out_mw;                             /* LLM_SSM_OUT_MW */
     hipFunction_t fn_moe_route_decode;      /* decode: router+topk+sgate fused */
     hipFunction_t fn_res_rmsnorm_f32;       /* decode: residual + rmsnorm fused */
+    hipFunction_t fn_res_rmsnorm_batch_f32;
     hipFunction_t fn_qwen4_router_batch_native;
     hipFunction_t fn_shexp_gateup_silu_q6k_batch;
     hipFunction_t fn_shexp_down_accum_q6k_batch;
@@ -9754,6 +13641,15 @@ struct hip_llm_runner {
     int ffn_iq3_mw;                         /* LLM_FFN_IQ3_MW: warp-per-row FFN IQ3_XXS */
     int mw_threads;                         /* LLM_MW_THREADS: threads/block for warp-per-row (default 256) */
     hipFunction_t fn_gemm_bf16_own;         /* self-owned BF16 WMMA GEMM */
+    hipFunction_t fn_gemm_iq2_xxs_wmma;
+    hipFunction_t fn_gemm_iq3_s_q8_wmma;
+    hipFunction_t fn_gemm_iq3_xxs_q8_wmma;
+    hipFunction_t fn_gemm_iq3_s_q8_wmma64;
+    hipFunction_t fn_gemm_iq1_m_q8_wmma;
+    hipFunction_t fn_gemm_iq2_xxs_q8_wmma;
+    hipFunction_t fn_gemm_iq2_xxs_mmq_wmma;
+    hipFunction_t fn_gemm_iq2_xs_mmq_wmma;
+    hipFunction_t fn_gemm_iq2_s_mmq_wmma;
     hipFunction_t fn_gemm_bf16_own_db;      /* double-buffered LDS variant */
     int gemm_own;                           /* LLM_GEMM=own -> 1, blaslt -> 0 */
     hipFunction_t fn_dequant_iq2s_all;      /* all-expert dequant (grouped prefill) */
@@ -9782,8 +13678,31 @@ struct hip_llm_runner {
     hipFunction_t fn_matvec_iq4_xs_expert_f32;
     /* DP4A decode path: per-32-block q8 activation + hardware int8 dot */
     hipFunction_t fn_quantize_q8_32;
+    hipFunction_t fn_quantize_q8x2_32;
+    hipFunction_t fn_quantize_q8x2_batch_32;
+    hipFunction_t fn_quantize_q81_batch_32_exact;
+    hipFunction_t fn_quantize_mmq_d4_batch;
+    hipFunction_t fn_quantize_q81_iq1_batch_32_exact;
     hipFunction_t fn_matvec_iq2_s_dp4a;
+    hipFunction_t fn_matvec_iq2_s_dp4a2;
+    hipFunction_t fn_matvec_iq2_s_dp4a2_batch_reuse4;
     hipFunction_t fn_matvec_iq3_s_dp4a;
+    hipFunction_t fn_matvec_iq3_s_q81_batch;
+    hipFunction_t fn_matvec_iq3_s_q81_mmvq_batch;
+    hipFunction_t fn_matvec_iq2_xs_q81_batch;
+    hipFunction_t fn_matvec_iq2_xs_mmq_scales;
+    hipFunction_t fn_matvec_iq2_xxs_q81_batch;
+    hipFunction_t fn_matvec_iq2_xxs_mmq_scales;
+    hipFunction_t fn_matvec_iq3_xxs_q81_batch;
+    hipFunction_t fn_matvec_iq3_xxs_mmq_scales;
+    hipFunction_t fn_matvec_iq2_s_q81_batch;
+    hipFunction_t fn_matvec_iq3_s_dp4a2;
+    hipFunction_t fn_matvec_iq2_xxs_dp4a2;
+    hipFunction_t fn_matvec_iq3_xxs_dp4a2;
+    hipFunction_t fn_matvec_iq2_xs_dp4a2;
+    hipFunction_t fn_matvec_iq2_xs_dp4a2_batch;
+    hipFunction_t fn_matvec_iq2_xs_dp4a2_batch_reuse4;
+    hipFunction_t fn_matvec_iq2_xs_dp4a2_batch_tile;
     hipFunction_t fn_matvec_iq2_s_expert_dp4a;
     hipFunction_t fn_matvec_iq3_s_expert_dp4a;
     /* LDS-cached grid decode path */
@@ -9792,14 +13711,38 @@ struct hip_llm_runner {
     hipFunction_t fn_matvec_iq2_s_lds_f32;
     hipFunction_t fn_matvec_iq2_s_expert_lds_f32;
     int lds_grid;        /* LLM_LDS_GRID: cache iq2s/iq3s grids in shared memory */
-    void *d_act_q8;      /* int8 activation A (d_xb), per-32-block (<= 8192 cols) */
+    void *d_act_q8;      /* int8 activation A, per-32-block (<= 17408 cols) */
     void *d_act_scale;   /* per-32-block fp32 scale A */
     void *d_act_q8_b;    /* int8 activation B (expert d_gate for down-proj) */
     void *d_act_scale_b; /* per-32-block fp32 scale B */
+    void *d_act_q8_batch;
+    void *d_act_scale_batch;
+    void *d_act_q8_batch_b;
+    void *d_act_scale_batch_b;
     void *iq1_q8_source; /* source represented in d_act_q8 for the current callback */
     int   iq1_q8_n;
+    int   iq1_q8_rows;
     int   iq1_q8_valid;
+    void *q8x2_reuse_source;
+    int   q8x2_reuse_n;
+    int   q8x2_reuse_active;
+    int   q8x2_reuse_valid;
+    void *batch_q8_source;
+    int   batch_q8_n, batch_q8_m, batch_q8_stride, batch_q8_valid;
+    int   batch_q8_mode; /* 0=Q8x2, 1=single-term llama.cpp Q8_1 */
+    int   batch_q8_capacity;
     int   decode_dp4a;   /* LLM_DECODE_DP4A (default on) */
+    int   decode_dp4a2;  /* LLM_DECODE_DP4A2: two-term accurate Q8 expansion */
+    hip_llm_kv_cache_type requested_kv_cache_type;
+    hip_llm_kv_cache_type kv_cache_type;
+    hip_llm_decode_kernel_mode requested_decode_kernel_mode;
+    hip_llm_decode_layout_mode requested_decode_layout_mode;
+    const char *requested_decode_layout_cache_path;
+    uint64_t requested_decode_layout_budget_bytes;
+    int requested_prefill_batch_tokens;
+    int requested_qwen35_batched_prefill;
+    int requested_qwen35_prefill_bf16;
+    size_t kv_element_bytes;
     hipFunction_t fn_matvec_iq2_xxs_f32;
     hipFunction_t fn_matvec_iq2_xxs_ptrs_f32;
     hipFunction_t fn_matvec_iq2_xxs_gateup_ptrs_f32;
@@ -9810,17 +13753,55 @@ struct hip_llm_runner {
     hipFunction_t fn_matvec_q5_1_f32;
     hipFunction_t fn_matvec_iq4_nl_f32;
     hipFunction_t fn_matvec_iq4_xs_f32;
+    hipFunction_t fn_matvec_iq4_xs_batch_f32;
+    hipFunction_t fn_matvec_iq4_xs_batch_reuse4_f32;
+    hipFunction_t fn_matvec_iq4_xs_dp4a2_batch;
+    hipFunction_t fn_matvec_iq4_xs_dp4a2_batch_reuse4;
     hipFunction_t fn_matvec_iq2_xs_f32;
     hipFunction_t fn_matvec_iq2_xs_ptrs_f32;
+    hipFunction_t fn_matvec_iq2_xs_batch_f32;
+    hipFunction_t fn_matvec_iq2_xxs_batch_f32;
+    hipFunction_t fn_matvec_iq2_xxs_batch_reuse4_f32;
+    hipFunction_t fn_matvec_iq2_xxs_dp4a2_batch;
+    hipFunction_t fn_matvec_iq2_xxs_dp4a2_batch_reuse4;
+    hipFunction_t fn_matmul_iq2_xxs_mmq128;
+    hipFunction_t fn_matvec_iq2_xs_batch_tile_f32;
+    hipFunction_t fn_matvec_iq2_xs_batch_tile4_f32;
     hipFunction_t fn_matvec_iq3_xxs_f32;
+    hipFunction_t fn_matvec_iq3_xxs_scalar_f32;
     hipFunction_t fn_matvec_iq3_xxs_ptrs_f32;
     hipFunction_t fn_matvec_iq3_xxs_batch_ptrs_f32;
+    hipFunction_t fn_matvec_iq3_xxs_batch_f32;
+    hipFunction_t fn_matvec_iq3_xxs_batch_reuse4_f32;
+    hipFunction_t fn_matvec_iq3_xxs_dp4a2_batch;
+    hipFunction_t fn_matvec_iq3_xxs_dp4a2_batch_reuse4;
     hipFunction_t fn_matvec_iq2_s_f32;
+    hipFunction_t fn_matvec_iq2_s_batch_f32;
+    hipFunction_t fn_matvec_iq2_s_dp4a2_batch;
     hipFunction_t fn_matvec_iq3_s_f32;
+    hipFunction_t fn_matvec_iq3_s_f32_elem;
+    hipFunction_t fn_matvec_iq3_s_batch_f32;
+    hipFunction_t fn_matvec_iq3_s_dp4a2_batch;
+    hipFunction_t fn_matvec_iq3_s_dp4a2_batch_reuse4;
     hipFunction_t fn_matvec_iq1_s_f32;
+    hipFunction_t fn_matvec_iq1_s_batch_f32;
     hipFunction_t fn_matvec_iq1_s_warp_f32;
     hipFunction_t fn_matvec_iq1_s_dp4a;
+    hipFunction_t fn_matvec_iq1_s_dp4a2;
+    hipFunction_t fn_matvec_iq1_s_dp4a2_batch;
+    hipFunction_t fn_matvec_iq1_s_q81_batch;
+    hipFunction_t fn_matvec_iq1_s_q81_reuse8;
+    hipFunction_t fn_matvec_iq1_s_mmq_scales;
+    hipFunction_t fn_matvec_iq1_s_dp4a2_batch_reuse4;
+    hipFunction_t fn_ffn_gate_up_iq1s_m_q81;
     hipFunction_t fn_matvec_iq1_m_f32;
+    hipFunction_t fn_matvec_iq1_m_batch_f32;
+    hipFunction_t fn_matvec_iq1_m_dp4a2_batch;
+    hipFunction_t fn_matvec_iq1_m_q81_batch;
+    hipFunction_t fn_matvec_iq1_m_q81_reuse8;
+    hipFunction_t fn_matvec_iq1_m_dp4a2_batch_reuse4;
+    hipFunction_t fn_matvec_iq1_q8_single_batch;
+    hipFunction_t fn_matvec_iq1_m_dp4a2;
     hipFunction_t fn_matvec_tq1_0_f32;
     hipFunction_t fn_matvec_tq2_0_f32;
 
@@ -9842,14 +13823,21 @@ struct hip_llm_runner {
     hipFunction_t fn_dequant_iq2_s_to_bf16;
     hipFunction_t fn_dequant_iq3_s_to_bf16;
     hipFunction_t fn_dequant_iq1_s_to_bf16;
+    hipFunction_t fn_dequant_iq1_m_to_bf16;
     hipFunction_t fn_dequant_tq1_0_to_bf16;
     hipFunction_t fn_dequant_iq2_xxs_to_bf16;
 
     /* Phase 3 flash-attention helpers */
     hipFunction_t fn_pack_f16_from_f32;
+    hipFunction_t fn_quantize_q8_1_f16_heads;
+    hipFunction_t fn_quantize_attn_q8_1_batch;
     hipFunction_t fn_pack_kv_cache_f16;
+    hipFunction_t fn_pack_kv_q8q4_f16;
+    hipFunction_t fn_unpack_kv_q8q4_decode_f16;
+    hipFunction_t fn_unpack_kv_q8q4_decode_f16_devp;
     hipFunction_t fn_rope_neox_batch_f32;
     hipFunction_t fn_rope_mrope_batch_f32;
+    hipFunction_t fn_rope_mrope_batch_devpos_f32;
     hipFunction_t fn_kv_cache_store_batch;
     hipFunction_t fn_kv_cache_store_batch_strided;
     hipFunction_t fn_flash_attn_wmma_f16_4w_causal;
@@ -9873,6 +13861,7 @@ struct hip_llm_runner {
     int n_ff;
     int n_vocab;
     int max_seq_len;
+    int qwen35_snapshot_max_tokens;
     float rope_freq_base;
     int n_rope_pairs;
     int mrope_sections[4];  /* [temporal, height, width, pad] for M-RoPE */
@@ -10104,6 +14093,7 @@ struct hip_llm_runner {
     int h_moe_eout_cpu_pinned;
     int moe_cpu_prefill;
     int decode_mode;
+    int active_layer; /* layer currently being evaluated; -1 outside a block */
     /* MoE device-side dispatch buffers */
     int  *d_moe_idx;       /* [n_experts_used] selected expert indices */
     float *d_moe_w;        /* [n_experts_used] softmax weights */
@@ -10169,6 +14159,7 @@ struct hip_llm_runner {
     float **d_value_cache_scale;
     int qwen4_kv_i8;  /* opt-in per-token symmetric INT8 KV cache */
     int qwen4_kv_fp8; /* opt-in per-token scaled E4M3 FP8 KV cache */
+    int kv_quantized; /* Q8 K, with Q4 or Q8 V in full-attention layers */
 
     /* Scratch buffers on GPU */
     void *d_x;
@@ -10188,8 +14179,12 @@ struct hip_llm_runner {
     void *d_ssm_Q_exp;
     void *d_ssm_K_exp;
     void *d_ssm_out;
+    void *d_ssm_q8k;       /* diagnostic Q8_K activation for IQ4_XS SSM out */
     void *d_ssm_conv_out;
     void *d_attn_gate;
+    void *d_attn_decode_partial; /* split-KV Q8K/Q4V partials */
+    int   d_attn_decode_partial_splits;
+    int   d_attn_decode_partial_chunk;
 
     /* Deepstack scratch */
     void *d_ds_tmp;
@@ -10276,13 +14271,98 @@ struct hip_llm_runner {
     hipFunction_t fn_attn_decode_f32_devp;
     hipFunction_t fn_kv_cache_store_i8_devp;
     hipFunction_t fn_kv_cache_store_i8_batch;
+    hipFunction_t fn_kv_cache_store_q8q4_batch;
+    hipFunction_t fn_kv_cache_store_q8q8_batch;
+    hipFunction_t fn_kv_cache_store_q8q8_devp;
+    hipFunction_t fn_kv_cache_store_q8q8_positions;
     hipFunction_t fn_attn_decode_flash_i8;
+    hipFunction_t fn_attn_decode_flash_q8q4;
+    hipFunction_t fn_attn_decode_q8q4_warpred;
+    hipFunction_t fn_attn_decode_q8q4_split;
+    hipFunction_t fn_attn_decode_q8q4_split_dp4a;
+    hipFunction_t fn_attn_decode_q8q4_split_dp4a_vecv;
+    hipFunction_t fn_attn_decode_q8q4_split_combine;
+    hipFunction_t fn_attn_prefill_flash_q8q4;
     hipFunction_t fn_attn_prefill_flash_i8_warp;
     hipFunction_t fn_attn_prefill_flash_i8_gqa4_warp;
     hipFunction_t fn_attn_prefill_flash_i8;
+    hipFunction_t fn_attn_prefill_fattn_vec_q8q4;
     int        *d_position;       /* device int, written via hipMemcpyAsync per token */
     hipGraph_t  graph_logits;     /* captured forward+lm_head pipeline */
     hipGraphExec_t graph_exec_logits;
+    hipGraph_t graph_argmax;
+    hipGraphExec_t graph_exec_argmax;
+    int graph_ready_argmax;
+    void *d_argmax;
+    int argmax_valid;
+    int requested_qwen35_decode_graph;
+    hipModule_t reference_math_module;
+    hipFunction_t fn_qwen35_rmsnorm_reference;
+    hipFunction_t fn_qwen35_prefill_rmsnorm_reference;
+    hipFunction_t fn_qwen35_conv_reference, fn_qwen35_silu_gate_reference;
+    int requested_qwen35_native_q8_attention;
+    hipModule_t q8_attention_module;
+    hipModule_t q8_prefill_module;
+    hipModule_t q8_gate_module;
+    hipFunction_t fn_q8_attention_decode, fn_q8_attention_decode_gqa3;
+    hipFunction_t fn_q8_attention_decode_gqa3_reuse;
+    hipFunction_t fn_q8_attention_decode_reuse8;
+    hipFunction_t fn_q8_attention_decode_reuse_fixed8;
+    hipFunction_t fn_q8_attention_decode_reuse_fixed5;
+    hipFunction_t fn_q8_attention_decode_verify_fused;
+    hipFunction_t fn_q8_attention_combine, fn_q8_attention_combine_verify4;
+    hipFunction_t fn_q8_attention_combine_verify8;
+    hipFunction_t fn_q8_attention_combine_verify16;
+    hipFunction_t fn_q8_attention_combine_gate, fn_q8_attention_combine_verify4_gate;
+    hipFunction_t fn_q8_attention_combine_verify8_gate;
+    hipFunction_t fn_q8_attention_combine_verify16_gate;
+    hipFunction_t fn_q8_attention_prefill_wmma;
+    void *d_q8_attention_parts, *d_q8_attention_meta;
+    int q8_attention_max_splits, q8_attention_nsm;
+    int requested_qwen35_native_q8_prefill;
+    void *d_q8_prefill_parts, *d_q8_prefill_meta;
+    size_t q8_prefill_capacity;
+    hipModule_t q2k_module;
+    hipFunction_t fn_qwen35_quantize_q81, fn_qwen35_matvec_q2k;
+    hipFunction_t fn_qwen35_matvec_q2k_qkv;
+    hipFunction_t fn_qwen35_matvec_q4k_q81_multi4;
+    hipFunction_t fn_qwen35_matvec_q4k_q81_multi5;
+    hipFunction_t fn_qwen35_matvec_q4k_q81_multi8;
+    hipFunction_t fn_qwen35_matvec_q4k_q81_fixed8;
+    hipFunction_t fn_qwen35_matvec_q4k_q81_qkv;
+    hipFunction_t fn_qwen35_matvec_q4k_q81_qkv_fixed8;
+    hipFunction_t fn_qwen35_matvec_q4k_q81_qkv_fixed7;
+    hipFunction_t fn_qwen35_matvec_q4k_q81_qkv_fixed4;
+    hipFunction_t fn_qwen35_matvec_q4k_q81_qkv5;
+    hipFunction_t fn_qwen35_matvec_q2k_rows;
+    hipFunction_t fn_qwen35_matvec_q2k_multi4, fn_qwen35_matvec_q2k_multi8;
+    hipFunction_t fn_qwen35_matvec_q2k_fixed8;
+    void *d_native_q81, *d_native_scale, *native_q81_source;
+    int native_q81_valid, native_q81_n;
+    hipFunction_t fn_qwen35_argmax_parts, fn_qwen35_argmax_finish;
+    void *d_native_argmax_scores, *d_native_argmax_indices;
+    hipModule_t iq_module;
+    struct hllm_qwen35_mtp *qwen35_mtp;
+    struct hllm_qwen35_dflash2 *qwen35_dflash2;
+    hipFunction_t fn_qwen35_matvec_iq2xxs, fn_qwen35_matvec_iq2xs;
+    hipFunction_t fn_qwen35_matvec_iq2s, fn_qwen35_matvec_iq3xxs, fn_qwen35_matvec_iq3s;
+    hipFunction_t fn_qwen35_matvec_iq3xxs_qkv;
+    hipFunction_t fn_qwen35_matvec_iq3s_qkv;
+    hipFunction_t fn_qwen35_matvec_iq4xs_qkv;
+    hipFunction_t fn_qwen35_matvec_iq2xxs_qkv;
+    hipFunction_t fn_qwen35_matvec_iq2xs_qkv;
+    hipFunction_t fn_qwen35_matvec_iq_mixed_qkv;
+    hipFunction_t fn_qwen35_matvec_iq2xs_down_residual;
+    hipFunction_t fn_qwen35_matvec_iq4xs, fn_qwen35_matvec_iq4xs_multi8;
+    hipFunction_t fn_qwen35_matvec_iq4xs_5120_multi8;
+    hipFunction_t fn_qwen35_matvec_iq_multi4;
+    hipFunction_t fn_qwen35_matvec_iq2xxs_multi8, fn_qwen35_matvec_iq2xs_multi8;
+    hipFunction_t fn_qwen35_matvec_iq2s_multi8, fn_qwen35_matvec_iq3xxs_multi8;
+    hipFunction_t fn_qwen35_matvec_iq3s_multi8;
+    hipFunction_t fn_qwen35_matvec_iq3s_prefill8;
+    hipFunction_t fn_qwen35_matvec_iq2xxs_fixed8, fn_qwen35_matvec_iq2xs_fixed8;
+    hipFunction_t fn_qwen35_matvec_iq2s_fixed8, fn_qwen35_matvec_iq3xxs_fixed8;
+    hipFunction_t fn_qwen35_matvec_iq3s_fixed8;
     hipGraph_t  graph_hidden;     /* captured forward (no lm_head) pipeline */
     hipGraphExec_t graph_exec_hidden;
     hipGraph_t hc_graph[97];
@@ -10337,6 +14417,7 @@ struct hip_llm_runner {
     hipFunction_t fn_attn_decode_gqa8_i8;
     hipFunction_t fn_kv_cache_store_f16_batch;
     hipFunction_t fn_attn_prefill_flash_f16;
+    hipFunction_t fn_attn_prefill_fattn_vec_f16;
     hipFunction_t fn_flash_attn_wmma_hd512_causal; /* WMMA full-attn (head_dim 512) */
     int           gemma_fa_wmma;                /* use WMMA kernel for full-attn layers */
     int         swa_cache_len;      /* circular SWA cache size = window + chunk */
@@ -10461,6 +14542,7 @@ static int compile_kernels(hip_llm_runner *r) {
     } while(0)
 
     GET_FUNC(embed_f16);
+    GET_FUNC(embed_f32);
     GET_FUNC(rmsnorm_f32);
     GET_FUNC(hc_norm_f32);
     GET_FUNC(qwen4_selected_attn);
@@ -10469,6 +14551,8 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(qwen4_selected_attn_i8_warp);
     GET_FUNC(qwen4_argmax);
     GET_FUNC(qwen4_argmax_batch);
+    GET_FUNC(copy_state_rows_f32);
+    GET_FUNC(copy_state_rows_commit_f32);
     GET_FUNC(qwen4_qsa_scores);
     GET_FUNC(qwen4_qsa_sort_blocks);
     GET_FUNC(qwen4_qsa_merge_ids);
@@ -10483,17 +14567,30 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(hc_repeat_batch_f32);
     GET_FUNC(rmsnorm_batch_f32);
     GET_FUNC(matvec_f16_f32);
+    GET_FUNC(matvec_f16_llama_f32);
+    GET_FUNC(matvec_f16_llama_pair_f32);
+    GET_FUNC(matvec_f16_llama_pair_batch_f32);
+    GET_FUNC(matvec_bf16_llama_f32);
+    GET_FUNC(matvec_bf16_llama_pair_batch_f32);
+    GET_FUNC(matvec_bf16_f32);
     GET_FUNC(qknorm_f32);
+    GET_FUNC(deinterleave_qgate_qknorm_mrope_pair_devp);
     GET_FUNC(qknorm_batch_f32);
+    GET_FUNC(qknorm_rope_mrope_batch_f32);
+    GET_FUNC(qknorm_pair_batch_f32);
+    GET_FUNC(qknorm_rope_pair_batch_f32);
     GET_FUNC(rope_neox_f32);
     GET_FUNC(rope_mrope_f32);
     GET_FUNC(kv_cache_store);
     GET_FUNC(attn_decode_f32);
+    GET_FUNC(attn_prefill_scalar_f32);
     GET_FUNC(rope_neox_f32_devp);
     GET_FUNC(rope_mrope_f32_devp);
     GET_FUNC(kv_cache_store_devp);
     GET_FUNC(attn_decode_f32_devp);
     GET_FUNC(silu_mul_f32);
+    GET_FUNC(silu_mul_q81_f32);
+    GET_FUNC(silu_mul_q81_batch_f32);
     GET_FUNC(swiglu_limit_f32);
     GET_FUNC(q8_0_compact_to_padded);
     GET_FUNC(qwen4_stage_misses);
@@ -10542,6 +14639,9 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(qwen4_gateup_silu_q4k_selected);
     GET_FUNC(qwen4_gateup_silu_q4k_selected_2w);
     GET_FUNC(qwen4_quantize_q8k);
+    GET_FUNC(matvec_iq4_xs_q8k);
+    GET_FUNC(matvec_iq4_xs_q81_batch);
+    GET_FUNC(matvec_iq4_xs_q81_dp4a);
     GET_FUNC(qwen4_quantize_q81);
     GET_FUNC(qwen4_gateup_silu_q4k_q8k_selected);
     GET_FUNC(qwen4_down_accum_q5_1_q81_selected);
@@ -10571,11 +14671,15 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(embed_f16_devtoken);
     GET_FUNC(matvec_q2_K_f32);
     GET_FUNC(matvec_q2_K_g4_f32);
+    GET_FUNC(matvec_q2_K_dp4a2);
+    GET_FUNC(matvec_q2_K_q81);
     GET_FUNC(matvec_q3_K_f32);
     GET_FUNC(matvec_q3_K_g4_f32);
     GET_FUNC(matvec_q4_K_f32);
     GET_FUNC(matvec_q4_K_mw_f32);
     GET_FUNC(matvec_q4_K_g4_f32);
+    GET_FUNC(matvec_q4_K_batch_reuse4);
+    GET_FUNC(matvec_q4_K_batch_reuse8);
     GET_FUNC(matvec_q5_K_f32);
     GET_FUNC(matvec_q5_K_mw_f32);
     GET_FUNC(matvec_q5_K_mw16_f32);
@@ -10583,12 +14687,18 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(glm5next_kda_qkv_q5k_batch_f32);
     GET_FUNC(glm5next_dsa_qkv_a_q5k_f32);
     GET_FUNC(matvec_q6_K_f32);
+    GET_FUNC(matvec_q6_K_batch_reuse8);
     GET_FUNC(embed_q2_K);
     GET_FUNC(embed_q2_K_devtoken);
+    GET_FUNC(embed_iq1_m);
+    GET_FUNC(embed_iq1_m_batch);
     /* SSM kernels */
     GET_FUNC(softplus_mul_f32);
     GET_FUNC(softplus_mul_batch_f32);
     GET_FUNC(sigmoid_inplace_f32);
+    GET_FUNC(ssm_alpha_beta_prepare_batch_f32);
+    GET_FUNC(silu_gate_mul_f32);
+    GET_FUNC(rmsnorm_heads_inplace_f32);
     GET_FUNC(conv1d_depthwise_silu_f32);
     GET_FUNC(l2_norm_heads_f32);
     GET_FUNC(repeat_tile_f32);
@@ -10600,12 +14710,20 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(glm5next_dsa_attend_f32);
     GET_FUNC(glm5next_mhc_finish_f32);
     GET_FUNC(deltanet_step_batch_f32);
+    GET_FUNC(deltanet_step_batch_gda_ref_f32);
+    GET_FUNC(deltanet_step_batch_gda_ref_128_f32);
+    GET_FUNC(deltanet_step_batch_gda_verify_f32);
+    GET_FUNC(deltanet_step_batch_gda_verify_128_f32);
     GET_FUNC(l2_norm_heads_batch_f32);
+    GET_FUNC(l2_norm_repeat_qk_batch_f32);
     GET_FUNC(repeat_tile_batch_f32);
     GET_FUNC(gated_rmsnorm_silu_batch_f32);
     GET_FUNC(conv1d_depthwise_silu_batch_f32);
+    GET_FUNC(ssm_prep_batch_f32);
     GET_FUNC(gated_rmsnorm_silu_f32);
+    GET_FUNC(gated_rmsnorm_silu_q81_f32);
     GET_FUNC(sigmoid_mul_f32);
+    GET_FUNC(sigmoid_mul_q81_f32);
     GET_FUNC(deinterleave_qgate_f32);
     GET_FUNC(deinterleave_qgate_batch_f32);
     /* MoE kernels */
@@ -10614,6 +14732,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(matvec_f32_mw_f32);
     GET_FUNC(matvec_f32_mw_f32_batch);
     GET_FUNC(matvec_f16_f32_batch);
+    GET_FUNC(matvec_bf16_f32_batch);
     /* MoE device-side dispatch */
     GET_FUNC(moe_topk_softmax_gpu);
     GET_FUNC(sigmoid_scalar_f32);
@@ -10652,6 +14771,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(ssm_inv_mean_f32);
     GET_FUNC(moe_route_decode);
     GET_FUNC(res_rmsnorm_f32);
+    GET_FUNC(res_rmsnorm_batch_f32);
     GET_FUNC(qwen4_router_batch_native);
     GET_FUNC(shexp_gateup_silu_q6k_batch);
     GET_FUNC(shexp_down_accum_q6k_batch);
@@ -10662,6 +14782,15 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(deltanet_step_warp_f32);
     GET_FUNC(deltanet_step_batch_warp_f32);
     GET_FUNC(gemm_bf16_own);
+    GET_FUNC(gemm_iq2_xxs_wmma);
+    GET_FUNC(gemm_iq3_s_q8_wmma);
+    GET_FUNC(gemm_iq3_xxs_q8_wmma);
+    GET_FUNC(gemm_iq3_s_q8_wmma64);
+    GET_FUNC(gemm_iq1_m_q8_wmma);
+    GET_FUNC(gemm_iq2_xxs_q8_wmma);
+    GET_FUNC(gemm_iq2_xxs_mmq_wmma);
+    GET_FUNC(gemm_iq2_xs_mmq_wmma);
+    GET_FUNC(gemm_iq2_s_mmq_wmma);
     GET_FUNC(gemm_bf16_own_db);
     GET_FUNC(dequant_iq2s_all);
     GET_FUNC(dequant_iq3s_all);
@@ -10682,8 +14811,51 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(matvec_iq3_xxs_batch_ptrs_f32);
     /* DP4A decode path */
     GET_FUNC(quantize_q8_32);
+    GET_FUNC(quantize_q8x2_32);
+    GET_FUNC(quantize_q8x2_batch_32);
+    GET_FUNC(quantize_q81_batch_32_exact);
+    GET_FUNC(quantize_mmq_d4_batch);
+    GET_FUNC(quantize_q81_iq1_batch_32_exact);
     GET_FUNC(matvec_iq2_s_dp4a);
+    GET_FUNC(matvec_iq2_s_dp4a2);
+    GET_FUNC(matvec_iq2_s_dp4a2_batch_reuse4);
     GET_FUNC(matvec_iq3_s_dp4a);
+    GET_FUNC(matvec_iq3_s_q81_batch);
+    GET_FUNC(matvec_iq3_s_q81_mmvq_batch);
+    /* A/B only: preserve the validated default while porting coupled stages.
+     * The reference variant fixes FP association under HIPRTC fast-math;
+     * test_iq3s_mmvq_replay.py checks it against llama.cpp's actual vecdot. */
+    const char *iq3s_mmvq_ref = getenv("LLM_IQ3S_MMVQ_REF");
+    if (iq3s_mmvq_ref && atoi(iq3s_mmvq_ref) != 0) {
+        hipError_t err = hipModuleGetFunction(&r->fn_matvec_iq3_s_q81_batch,
+                                             r->module, "matvec_iq3_s_q81_mmvq_batch");
+        if (err != hipSuccess) {
+            fprintf(stderr, "hip_llm: IQ3_S MMVQ reference kernel not found\n");
+            return -1;
+        }
+    }
+    GET_FUNC(matvec_iq1_s_q81_batch);
+    GET_FUNC(matvec_iq1_s_q81_reuse8);
+    GET_FUNC(matvec_iq1_s_mmq_scales);
+    GET_FUNC(ffn_gate_up_iq1s_m_q81);
+    GET_FUNC(matvec_iq1_m_q81_batch);
+    GET_FUNC(matvec_iq1_m_q81_reuse8);
+    GET_FUNC(matvec_iq2_xs_q81_batch);
+    GET_FUNC(matvec_iq2_xs_mmq_scales);
+    GET_FUNC(matvec_iq2_xxs_q81_batch);
+    GET_FUNC(matvec_iq2_xxs_mmq_scales);
+    GET_FUNC(matvec_iq3_xxs_q81_batch);
+    GET_FUNC(matvec_iq3_xxs_mmq_scales);
+    GET_FUNC(matvec_iq2_s_q81_batch);
+    GET_FUNC(matvec_iq3_s_dp4a2);
+    GET_FUNC(matvec_iq2_xxs_dp4a2);
+    GET_FUNC(matvec_iq3_xxs_dp4a2);
+    GET_FUNC(matvec_iq3_xxs_dp4a2_batch);
+    GET_FUNC(matvec_iq3_xxs_dp4a2_batch_reuse4);
+    GET_FUNC(matvec_iq2_xs_dp4a2);
+    GET_FUNC(matvec_iq2_xs_dp4a2_batch);
+    GET_FUNC(matvec_iq2_xs_dp4a2_batch_reuse4);
+    GET_FUNC(matvec_iq2_xs_dp4a2_batch_tile);
     GET_FUNC(matvec_iq2_s_expert_dp4a);
     GET_FUNC(matvec_iq3_s_expert_dp4a);
     GET_FUNC(matvec_iq3_s_lds_f32);
@@ -10699,17 +14871,49 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(matvec_q5_1_f32);
     GET_FUNC(matvec_iq4_nl_f32);
     GET_FUNC(matvec_iq4_xs_f32);
+    GET_FUNC(matvec_iq4_xs_batch_f32);
+    GET_FUNC(matvec_iq4_xs_batch_reuse4_f32);
+    GET_FUNC(matvec_iq4_xs_dp4a2_batch);
+    GET_FUNC(matvec_iq4_xs_dp4a2_batch_reuse4);
     GET_FUNC(matvec_iq2_xs_f32);
     GET_FUNC(matvec_iq2_xs_ptrs_f32);
+    GET_FUNC(matvec_iq2_xs_batch_f32);
+    GET_FUNC(matvec_iq2_xxs_batch_f32);
+    GET_FUNC(matvec_iq2_xxs_batch_reuse4_f32);
+    GET_FUNC(matvec_iq2_xxs_dp4a2_batch);
+    GET_FUNC(matvec_iq2_xxs_dp4a2_batch_reuse4);
+    GET_FUNC(matmul_iq2_xxs_mmq128);
+    GET_FUNC(matvec_iq2_xs_batch_tile_f32);
+    GET_FUNC(matvec_iq2_xs_batch_tile4_f32);
     GET_FUNC(matvec_iq3_xxs_f32);
+    GET_FUNC(matvec_iq3_xxs_scalar_f32);
     GET_FUNC(matvec_iq3_xxs_ptrs_f32);
+    GET_FUNC(matvec_iq3_xxs_batch_f32);
+    GET_FUNC(matvec_iq3_xxs_batch_reuse4_f32);
     GET_FUNC(glm5next_moe_weighted_reduce);
     GET_FUNC(matvec_iq2_s_f32);
+    GET_FUNC(matvec_iq2_s_batch_f32);
+    GET_FUNC(matvec_iq2_s_dp4a2_batch);
     GET_FUNC(matvec_iq3_s_f32);
+    GET_FUNC(matvec_iq3_s_f32_elem);
+    GET_FUNC(matvec_iq3_s_batch_f32);
+    GET_FUNC(matvec_iq3_s_dp4a2_batch);
+    GET_FUNC(matvec_iq3_s_dp4a2_batch_reuse4);
     GET_FUNC(matvec_iq1_s_f32);
+    GET_FUNC(matvec_iq1_s_batch_f32);
     GET_FUNC(matvec_iq1_s_warp_f32);
     GET_FUNC(matvec_iq1_s_dp4a);
+    GET_FUNC(matvec_iq1_s_dp4a2);
+    GET_FUNC(matvec_iq1_s_dp4a2_batch);
+    GET_FUNC(matvec_iq1_s_q81_batch);
+    GET_FUNC(matvec_iq1_s_dp4a2_batch_reuse4);
     GET_FUNC(matvec_iq1_m_f32);
+    GET_FUNC(matvec_iq1_m_batch_f32);
+    GET_FUNC(matvec_iq1_m_dp4a2_batch);
+    GET_FUNC(matvec_iq1_m_q81_batch);
+    GET_FUNC(matvec_iq1_m_dp4a2_batch_reuse4);
+    GET_FUNC(matvec_iq1_q8_single_batch);
+    GET_FUNC(matvec_iq1_m_dp4a2);
     GET_FUNC(matvec_tq1_0_f32);
     GET_FUNC(matvec_tq2_0_f32);
     /* Gemma4 kernels */
@@ -10726,6 +14930,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(attn_decode_gqa8_f16);
     GET_FUNC(attn_decode_gqa8_i8);
     GET_FUNC(attn_prefill_flash_f16);
+    GET_FUNC(attn_prefill_fattn_vec_f16);
     /* v2 name forces HIPRTC cache invalidation after the original I8 kernel
      * was observed faulting on gfx1201; the host wrapper/API remains stable. */
     if (hipModuleGetFunction(&r->fn_kv_cache_store_i8_devp, r->module,
@@ -10734,7 +14939,18 @@ static int compile_kernels(hip_llm_runner *r) {
         return -1;
     }
     GET_FUNC(kv_cache_store_i8_batch);
+    GET_FUNC(kv_cache_store_q8q4_batch);
+    GET_FUNC(kv_cache_store_q8q8_batch);
+    GET_FUNC(kv_cache_store_q8q8_devp);
+    GET_FUNC(kv_cache_store_q8q8_positions);
     GET_FUNC(attn_decode_flash_i8);
+    GET_FUNC(attn_decode_flash_q8q4);
+    GET_FUNC(attn_decode_q8q4_warpred);
+    GET_FUNC(attn_decode_q8q4_split);
+    GET_FUNC(attn_decode_q8q4_split_dp4a);
+    GET_FUNC(attn_decode_q8q4_split_dp4a_vecv);
+    GET_FUNC(attn_decode_q8q4_split_combine);
+    GET_FUNC(attn_prefill_flash_q8q4);
     GET_FUNC(attn_prefill_flash_i8_warp);
     GET_FUNC(attn_prefill_flash_i8_gqa4_warp);
     GET_FUNC(attn_prefill_flash_i8);
@@ -10756,17 +14972,25 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(dequant_iq2_s_to_bf16);
     GET_FUNC(dequant_iq3_s_to_bf16);
     GET_FUNC(dequant_iq1_s_to_bf16);
+    GET_FUNC(dequant_iq1_m_to_bf16);
     GET_FUNC(dequant_tq1_0_to_bf16);
     GET_FUNC(dequant_iq2_xxs_to_bf16);
 
     GET_FUNC(pack_f16_from_f32);
+    GET_FUNC(quantize_q8_1_f16_heads);
+    GET_FUNC(quantize_attn_q8_1_batch);
     GET_FUNC(pack_kv_cache_f16);
+    GET_FUNC(pack_kv_q8q4_f16);
+    GET_FUNC(unpack_kv_q8q4_decode_f16);
+    GET_FUNC(unpack_kv_q8q4_decode_f16_devp);
     GET_FUNC(rope_neox_batch_f32);
     GET_FUNC(rope_mrope_batch_f32);
+    GET_FUNC(rope_mrope_batch_devpos_f32);
     GET_FUNC(kv_cache_store_batch);
     GET_FUNC(kv_cache_store_batch_strided);
     GET_FUNC(flash_attn_wmma_f16_4w_causal);
     GET_FUNC(flash_attn_wmma_f16_4w_causal_hd256);
+    GET_FUNC(attn_prefill_fattn_vec_q8q4);
 
     GET_FUNC(matvec_f16_wmma_f32);
 
@@ -10861,13 +15085,16 @@ hip_llm_runner *hip_llm_init(int device_id, int verbose) {
         return NULL;
     }
 
-    /* DP4A decode path (opt-in via LLM_DECODE_DP4A=1). Default OFF: on gfx1201
-     * the IQ2_S/IQ3_S matvecs are grid-lookup-dequant bound, not multiply bound,
-     * so int8 DP4A + q8 activation is ~2% slower than the full-utilization F32
-     * kernels. Kept gated/validated (rel_l2 ~1e-3 vs float ref) for reference and
-     * future tuning (e.g. SIMD sign via __vsub4, LDS-cached grids). */
+    /* DP4A decode path (opt-in via LLM_DECODE_DP4A=1). Default OFF because Q8
+     * activation quantization measures rel_l2 ~1.6e-3 for IQ2_S versus the
+     * strict F32 reference. The packed-sign implementation reaches >90% of
+     * peak bandwidth at the Qwen 17408x5120 projection shape when explicitly
+     * selected for throughput experiments. */
     r->decode_dp4a = 0;
     { const char *e = getenv("LLM_DECODE_DP4A"); if (e) r->decode_dp4a = atoi(e) != 0; }
+    r->decode_dp4a2 = 0;
+    { const char *e = getenv("LLM_DECODE_DP4A2"); if (e) r->decode_dp4a2 = atoi(e) != 0; }
+    if (r->decode_dp4a2) r->decode_dp4a = 1;
     r->lds_grid = 0;
     { const char *e = getenv("LLM_LDS_GRID"); if (e) r->lds_grid = atoi(e) != 0; }
     r->moe_fused_decode = 1;
@@ -10895,13 +15122,21 @@ hip_llm_runner *hip_llm_init(int device_id, int verbose) {
     r->gemm_own = 1;  /* self-owned WMMA GEMM default (faster than blaslt path) */
     { const char *e = getenv("LLM_GEMM"); if (e && strcmp(e, "blaslt") == 0) r->gemm_own = 0; }
     {
-        const size_t QCAP = 8192;
+        const size_t QCAP = 17408;
+        const size_t BMAX = 512;
         if (hipMalloc(&r->d_act_q8,     QCAP)                     != hipSuccess ||
             hipMalloc(&r->d_act_scale,  (QCAP/32) * sizeof(float)) != hipSuccess ||
             hipMalloc(&r->d_act_q8_b,   QCAP)                     != hipSuccess ||
-            hipMalloc(&r->d_act_scale_b,(QCAP/32) * sizeof(float)) != hipSuccess) {
+            hipMalloc(&r->d_act_scale_b,(QCAP/32) * sizeof(float)) != hipSuccess ||
+            hipMalloc(&r->d_act_q8_batch, BMAX * QCAP) != hipSuccess ||
+            hipMalloc(&r->d_act_scale_batch, BMAX * (QCAP/32) * sizeof(float)) != hipSuccess ||
+            hipMalloc(&r->d_act_q8_batch_b, BMAX * QCAP) != hipSuccess ||
+            hipMalloc(&r->d_act_scale_batch_b, BMAX * (QCAP/32) * sizeof(float)) != hipSuccess) {
             fprintf(stderr, "hip_llm: q8 activation scratch alloc failed; DP4A disabled\n");
             r->decode_dp4a = 0;
+            r->decode_dp4a2 = 0;
+        } else {
+            r->batch_q8_capacity = (int)BMAX;
         }
     }
 
@@ -11012,9 +15247,13 @@ static uint16_t hllm_f32_to_f16(float f) {
     if (exp > 15) return sign | 0x7C00;
     if (exp < -14) {
         if (exp < -24) return sign;
+        /* The 24-bit significand shifted by (-1-exp) already yields the
+         * 10-bit F16 subnormal mantissa; shifting again by 13 zeroed every
+         * subnormal weight (all |w| < 2^-14), biasing BF16-derived
+         * projections such as ssm_alpha/ssm_beta. */
         mant |= 0x800000;
         mant >>= (-1 - exp);
-        return sign | (uint16_t)(mant >> 13);
+        return sign | (uint16_t)(mant & 0x3FF);
     }
     return sign | (uint16_t)((exp + 15) << 10) | (uint16_t)(mant >> 13);
 }
@@ -11045,20 +15284,31 @@ static int upload_weight_matrix(void **d_ptr, const qtensor *t, int *out_type) {
          * Set HIP_LLM_LEGACY_CPU_DEQUANT=1 to force the old CPU-dequant path. */
         return upload_kquant_raw(d_ptr, t);
     } else if (t->type == GGML_TYPE_BF16) {
-        *out_type = GGML_TYPE_F16;
+        const char *native_env = getenv("LLM_BF16_NATIVE");
+        if (!native_env || atoi(native_env) == 0) {
+            *out_type = GGML_TYPE_F16;
+            int n_elements = t->n_rows * t->n_cols;
+            float *f32_buf = (float *)malloc((size_t)n_elements * sizeof(float));
+            if (!f32_buf) return -1;
+            dequant_row(GGML_TYPE_BF16, t->data, f32_buf, n_elements);
+            uint16_t *f16_buf = (uint16_t *)malloc((size_t)n_elements * sizeof(uint16_t));
+            if (!f16_buf) { free(f32_buf); return -1; }
+            for (int i = 0; i < n_elements; i++) f16_buf[i] = hllm_f32_to_f16(f32_buf[i]);
+            free(f32_buf);
+            size_t nbytes = (size_t)n_elements * sizeof(uint16_t);
+            hipError_t err = hipMalloc(d_ptr, nbytes);
+            if (err != hipSuccess) { free(f16_buf); return -1; }
+            err = hipMemcpy(*d_ptr, f16_buf, nbytes, hipMemcpyHostToDevice);
+            free(f16_buf);
+            if (err != hipSuccess) { hipFree(*d_ptr); *d_ptr = NULL; return -1; }
+            return 0;
+        }
+        *out_type = GGML_TYPE_BF16;
         int n_elements = t->n_rows * t->n_cols;
-        float *f32_buf = (float *)malloc((size_t)n_elements * sizeof(float));
-        if (!f32_buf) return -1;
-        dequant_row(GGML_TYPE_BF16, t->data, f32_buf, n_elements);
-        uint16_t *f16_buf = (uint16_t *)malloc((size_t)n_elements * sizeof(uint16_t));
-        if (!f16_buf) { free(f32_buf); return -1; }
-        for (int i = 0; i < n_elements; i++) f16_buf[i] = hllm_f32_to_f16(f32_buf[i]);
-        free(f32_buf);
         size_t nbytes = (size_t)n_elements * sizeof(uint16_t);
         hipError_t err = hipMalloc(d_ptr, nbytes);
-        if (err != hipSuccess) { free(f16_buf); return -1; }
-        err = hipMemcpy(*d_ptr, f16_buf, nbytes, hipMemcpyHostToDevice);
-        free(f16_buf);
+        if (err != hipSuccess) return -1;
+        err = hipMemcpy(*d_ptr, t->data, nbytes, hipMemcpyHostToDevice);
         if (err != hipSuccess) { hipFree(*d_ptr); *d_ptr = NULL; return -1; }
         return 0;
     } else {
@@ -12476,6 +16726,9 @@ static int glm5next_moe_gu_pool_get(hip_llm_runner *r, const qtensor *gate,
 static inline void launch_matvec_auto(hip_llm_runner *r, void *dst, void *mat,
                                       void *x, int n_rows, int n_cols,
                                       int weight_type);
+static inline void launch_quantize_q8x2(hip_llm_runner *r, void *x, int n);
+static inline void launch_quantize_q8(hip_llm_runner *r, void *x, int n,
+                                      void *qs, void *scale);
 
 static int glm5next_hip_indexer_step(hip_llm_runner *r,
         const gguf_shards *model, int layer, const glm5next_config *c,
@@ -13272,6 +17525,11 @@ static int hip_llm_load_weights_impl(hip_llm_runner *r, gguf_context *gguf, int 
          * garbles the output (the all-Q4_0 Gemma4 QAT model). matvec_q4_0 handles
          * the tied lm_head at full precision too. */
         if (upload_kquant_raw(&r->d_token_embd, &embd) != 0) return -1;
+    } else if (embd.type == GGML_TYPE_IQ1_M) {
+        /* Keep IQ1_M raw so the dedicated GPU lookup preserves the same
+         * codebook/scale arithmetic as llama.cpp.  The old generic branch
+         * dequantized this table to F16 and then used the F16 lookup path. */
+        if (upload_kquant_raw(&r->d_token_embd, &embd) != 0) return -1;
     } else if (embd.type == GGML_TYPE_Q3_K || embd.type == GGML_TYPE_Q4_K ||
                embd.type == GGML_TYPE_Q5_K || embd.type == GGML_TYPE_Q6_K ||
                embd.type == GGML_TYPE_Q4_1 ||
@@ -13280,9 +17538,19 @@ static int hip_llm_load_weights_impl(hip_llm_runner *r, gguf_context *gguf, int 
                embd.type == GGML_TYPE_IQ2_S   || embd.type == GGML_TYPE_IQ3_XXS ||
                embd.type == GGML_TYPE_IQ3_S   || embd.type == GGML_TYPE_IQ4_NL ||
                embd.type == GGML_TYPE_IQ4_XS  || embd.type == GGML_TYPE_IQ1_S ||
-               embd.type == GGML_TYPE_IQ1_M   || embd.type == GGML_TYPE_TQ1_0 ||
+               embd.type == GGML_TYPE_TQ1_0 ||
                embd.type == GGML_TYPE_TQ2_0) {
-        /* Dequant to F16 for embedding lookup (no dedicated embed kernel for these) */
+        /* Dequant to F16 for embedding lookup (no dedicated embed kernel for these).
+         * An opt-in F32 table avoids the initial F16 rounding when comparing
+         * against llama.cpp's GPU graph. */
+        const char *exact_embed_env = getenv("LLM_EXACT_QUANT_EMBED");
+        if (exact_embed_env && atoi(exact_embed_env) != 0) {
+            int stored_type = GGML_TYPE_F32;
+            if (upload_dequant_f32_matrix(&r->d_token_embd, &embd, &stored_type) != 0)
+                return -1;
+            r->token_embd_type = GGML_TYPE_F32;
+            fprintf(stderr, "hip_llm: exact quant embedding enabled (F32 table)\n");
+        } else {
         int n_elements = embd.n_rows * embd.n_cols;
         float *f32_buf = (float *)malloc((size_t)n_elements * sizeof(float));
         if (!f32_buf) return -1;
@@ -13302,6 +17570,7 @@ static int hip_llm_load_weights_impl(hip_llm_runner *r, gguf_context *gguf, int 
         free(f16_buf);
         if (err != hipSuccess) { hipFree(r->d_token_embd); r->d_token_embd = NULL; return -1; }
         r->token_embd_type = GGML_TYPE_F16;
+        }
     } else {
         if (upload_f16_matrix(&r->d_token_embd, &embd) != 0) return -1;
     }
@@ -13500,7 +17769,29 @@ static int hip_llm_load_weights_impl(hip_llm_runner *r, gguf_context *gguf, int 
 
             snprintf(name, sizeof(name), "blk.%d.ssm_conv1d.weight", l);
             t = hllm_load_tensor(gguf, name, 1);
+            if (l == 0 && getenv("LLM_DEBUG_DUMP_CONV_WEIGHT") && t.data) {
+                const char *path = getenv("LLM_DEBUG_DUMP_CONV_WEIGHT");
+                int count = t.n_rows * t.n_cols;
+                float *host_w = (float *)malloc((size_t)count * sizeof(float));
+                if (host_w) {
+                    dequant_row(t.type, t.data, host_w, count);
+                    FILE *wf = fopen(path, "wb");
+                    if (wf) { fwrite(host_w, sizeof(float), (size_t)count, wf); fclose(wf); }
+                    free(host_w);
+                }
+            }
             if (upload_norm_f32(&cl->ssm_conv1d_w, &t, t.n_rows * t.n_cols) != 0) return -1;
+            if (l == 0 && getenv("LLM_DEBUG_DUMP_CONV_WEIGHT_GPU") && cl->ssm_conv1d_w) {
+                const char *path = getenv("LLM_DEBUG_DUMP_CONV_WEIGHT_GPU");
+                size_t bytes = (size_t)t.n_rows * (size_t)t.n_cols * sizeof(float);
+                float *gpu_w = (float *)malloc(bytes);
+                if (gpu_w && hipMemcpy(gpu_w, cl->ssm_conv1d_w, bytes,
+                                       hipMemcpyDeviceToHost) == hipSuccess) {
+                    FILE *wf = fopen(path, "wb");
+                    if (wf) { fwrite(gpu_w, 1, bytes, wf); fclose(wf); }
+                }
+                free(gpu_w);
+            }
 
             snprintf(name, sizeof(name), "blk.%d.ssm_norm.weight", l);
             t = hllm_load_tensor(gguf, name, 1);
@@ -13730,6 +18021,18 @@ static int hip_llm_load_weights_impl(hip_llm_runner *r, gguf_context *gguf, int 
         }
     }
 
+    if (getenv("LLM_DUMP_LAYER_TYPES")) {
+        for (int l = 0; l < r->n_layers; ++l) {
+            hip_layer *cl = &r->layers[l];
+            fprintf(stderr,
+                    "hip_llm: layer %d attn=%d/%d/%d/%d ssm=%d/%d/%d/%d/%d ffn=%d/%d/%d moe=%d\n",
+                    l, cl->attn_q_type, cl->attn_k_type, cl->attn_v_type,
+                    cl->attn_output_type, cl->ssm_qkv_type, cl->ssm_gate_type,
+                    cl->ssm_alpha_type, cl->ssm_beta_type, cl->ssm_out_type,
+                    cl->ffn_gate_type, cl->ffn_up_type, cl->ffn_down_type, cl->is_moe);
+        }
+    }
+
     return hip_llm_finalize_load(r, max_seq_len);
 }
 
@@ -13765,6 +18068,18 @@ void hip_llm_load_options_default(hip_llm_load_options *options) {
     options->struct_size = sizeof(*options);
     options->moe_mode = HIP_LLM_MOE_AUTO;
     options->gpu_reserve_bytes = 1ull << 30;
+    options->kv_cache_type = HIP_LLM_KV_AUTO;
+    options->decode_kernel_mode = HIP_LLM_DECODE_KERNEL_DEFAULT;
+    options->decode_layout_mode = HIP_LLM_DECODE_LAYOUT_NATIVE;
+    options->prefill_batch_tokens = 0;
+    options->qwen35_batched_prefill = 0;
+    options->qwen35_prefill_bf16 = 0;
+    options->qwen35_decode_graph = 0;
+    options->qwen35_reference_math = 0;
+    options->qwen35_native_q8_attention = 0;
+    options->qwen35_native_q8_prefill = 0;
+    options->qwen35_native_q2k = 0;
+    options->qwen35_native_mmvq = 0;
 }
 
 int hip_llm_load_weights(hip_llm_runner *r, gguf_context *gguf, int max_seq_len) {
@@ -13811,6 +18126,203 @@ int hip_llm_load_weights_sharded(hip_llm_runner *r, gguf_shards *model,
         r->requested_qwen4_prefill_staging = options->qwen4_prefill_staging != 0;
         r->requested_qwen4_prefill_stage_bytes = options->qwen4_prefill_stage_bytes;
     }
+    if (options->struct_size == 0 ||
+        options->struct_size >= offsetof(hip_llm_load_options, decode_layout_budget_bytes) +
+                                sizeof(options->decode_layout_budget_bytes)) {
+        r->requested_kv_cache_type = options->kv_cache_type;
+        r->requested_decode_kernel_mode = options->decode_kernel_mode;
+        r->requested_decode_layout_mode = options->decode_layout_mode;
+        r->requested_decode_layout_cache_path = options->decode_layout_cache_path;
+        r->requested_decode_layout_budget_bytes = options->decode_layout_budget_bytes;
+        if (options->struct_size == 0 ||
+            options->struct_size >= offsetof(hip_llm_load_options, prefill_batch_tokens) +
+                                    sizeof(options->prefill_batch_tokens))
+            r->requested_prefill_batch_tokens = options->prefill_batch_tokens;
+        if (options->struct_size == 0 ||
+            options->struct_size >= offsetof(hip_llm_load_options, qwen35_batched_prefill) +
+                                    sizeof(options->qwen35_batched_prefill))
+            r->requested_qwen35_batched_prefill = options->qwen35_batched_prefill != 0;
+        if (options->struct_size == 0 ||
+            options->struct_size >= offsetof(hip_llm_load_options, qwen35_prefill_bf16) +
+                                    sizeof(options->qwen35_prefill_bf16)) {
+            r->requested_qwen35_prefill_bf16 = options->qwen35_prefill_bf16 != 0;
+            if (r->requested_qwen35_prefill_bf16)
+                r->requested_qwen35_batched_prefill = 1;
+        }
+        if (options->struct_size == 0 ||
+            options->struct_size >= offsetof(hip_llm_load_options, qwen35_decode_graph) +
+                                    sizeof(options->qwen35_decode_graph))
+            r->requested_qwen35_decode_graph = options->qwen35_decode_graph != 0;
+        if (options->struct_size == 0 ||
+            options->struct_size >= offsetof(hip_llm_load_options, qwen35_native_q8_attention) +
+                                    sizeof(options->qwen35_native_q8_attention))
+            r->requested_qwen35_native_q8_attention = options->qwen35_native_q8_attention != 0;
+        if (options->struct_size == 0 ||
+            options->struct_size >= offsetof(hip_llm_load_options, qwen35_native_q8_prefill) +
+                                    sizeof(options->qwen35_native_q8_prefill)) {
+            r->requested_qwen35_native_q8_prefill = options->qwen35_native_q8_prefill != 0;
+            if (r->requested_qwen35_native_q8_prefill) r->requested_qwen35_native_q8_attention = 1;
+        }
+        if ((options->struct_size == 0 ||
+             options->struct_size >= offsetof(hip_llm_load_options, qwen35_reference_math) +
+                                     sizeof(options->qwen35_reference_math)) &&
+            options->qwen35_reference_math) {
+            if (r->requested_qwen35_prefill_bf16) {
+                fprintf(stderr, "hip_llm: reference arithmetic cannot use BF16 projection prefill\n");
+                return -1;
+            }
+            if (hip_compile_kernels_ex(&r->reference_math_module, r->device,
+                    qwen35_reference_math_source, "qwen35_reference.hip", r->verbose,
+                    "qwen35_reference", 1) <= 0 ||
+                hipModuleGetFunction(&r->fn_qwen35_rmsnorm_reference,
+                    r->reference_math_module, "qwen35_rmsnorm_reference") != hipSuccess) return -1;
+            CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_conv_reference,
+                      r->reference_math_module, "qwen35_conv_reference"));
+            CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_silu_gate_reference,
+                      r->reference_math_module, "qwen35_silu_gate_reference"));
+            r->ssm_fused_decode = 0;
+        }
+        /* Diagnostic: isolate prefill normalization without changing scalar
+         * decode arithmetic or disabling the production BF16 projections. */
+        const char *prefill_norm_env = getenv("LLM_QWEN35_PREFILL_REFERENCE_NORM");
+        if (prefill_norm_env && atoi(prefill_norm_env) != 0) {
+            if (!r->reference_math_module &&
+                hip_compile_kernels_ex(&r->reference_math_module, r->device,
+                    qwen35_reference_math_source, "qwen35_reference.hip", r->verbose,
+                    "qwen35_reference", 1) <= 0) return -1;
+            CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_prefill_rmsnorm_reference,
+                      r->reference_math_module, "qwen35_rmsnorm_reference"));
+        }
+        int native_mmvq = (options->struct_size == 0 ||
+            options->struct_size >= offsetof(hip_llm_load_options, qwen35_native_mmvq) +
+                                    sizeof(options->qwen35_native_mmvq)) && options->qwen35_native_mmvq;
+        if (native_mmvq || ((options->struct_size == 0 ||
+             options->struct_size >= offsetof(hip_llm_load_options, qwen35_native_q2k) +
+                                     sizeof(options->qwen35_native_q2k)) &&
+            options->qwen35_native_q2k)) {
+            hipDeviceProp_t props;
+            CHECK_HIP(hipGetDeviceProperties(&props, r->device));
+            if (strncmp(props.gcnArchName, "gfx1201", 7) != 0) {
+                fprintf(stderr, "hip_llm: native Q2_K requires gfx1201\n");
+                hllm_active_shards = NULL;
+                return -1;
+            }
+            if (hip_compile_kernels_ex(&r->q2k_module, r->device,
+                    qwen35_matvec_q2k_source, "qwen35_q2k.hip", r->verbose,
+                    "qwen35_q2k", 1) <= 0) {
+                hllm_active_shards = NULL;
+                return -1;
+            }
+            CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_quantize_q81,
+                      r->q2k_module, "qwen35_quantize_q81"));
+            CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_q2k,
+                      r->q2k_module, "qwen35_matvec_q2k"));
+            CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_q2k_qkv,
+                      r->q2k_module, "qwen35_matvec_q2k_qkv"));
+            CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_q2k_rows,
+                      r->q2k_module, "qwen35_matvec_q2k_rows"));
+            CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_q2k_multi4,
+                      r->q2k_module, "qwen35_matvec_q2k_multi4"));
+            CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_q2k_multi8,
+                      r->q2k_module, "qwen35_matvec_q2k_multi8"));
+            CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_q2k_fixed8,
+                      r->q2k_module, "qwen35_matvec_q2k_fixed8"));
+            CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_q4k_q81_multi5,
+                      r->q2k_module, "qwen35_matvec_q4k_q81_multi5"));
+            CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_q4k_q81_multi4,
+                      r->q2k_module, "qwen35_matvec_q4k_q81_multi4"));
+            CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_q4k_q81_multi8,
+                      r->q2k_module, "qwen35_matvec_q4k_q81_multi8"));
+            CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_q4k_q81_fixed8,
+                      r->q2k_module, "qwen35_matvec_q4k_q81_fixed8"));
+            CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_q4k_q81_qkv,
+                      r->q2k_module, "qwen35_matvec_q4k_q81_qkv"));
+            CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_q4k_q81_qkv_fixed8,
+                      r->q2k_module, "qwen35_matvec_q4k_q81_qkv_fixed8"));
+            CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_q4k_q81_qkv_fixed7,
+                      r->q2k_module, "qwen35_matvec_q4k_q81_qkv_fixed7"));
+            CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_q4k_q81_qkv_fixed4,
+                      r->q2k_module, "qwen35_matvec_q4k_q81_qkv_fixed4"));
+            CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_q4k_q81_qkv5,
+                      r->q2k_module, "qwen35_matvec_q4k_q81_qkv5"));
+            if (!r->d_native_q81) CHECK_HIP(hipMalloc(&r->d_native_q81, 17408));
+            if (!r->d_native_scale) CHECK_HIP(hipMalloc(&r->d_native_scale, 17408/32*sizeof(float)));
+            CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_argmax_parts, r->q2k_module, "qwen35_argmax_parts"));
+            CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_argmax_finish, r->q2k_module, "qwen35_argmax_finish"));
+            if (!r->d_native_argmax_scores) CHECK_HIP(hipMalloc(&r->d_native_argmax_scores, 256*sizeof(float)));
+            if (!r->d_native_argmax_indices) CHECK_HIP(hipMalloc(&r->d_native_argmax_indices, 256*sizeof(int)));
+            if (native_mmvq) {
+                if (hip_compile_kernels_ex(&r->iq_module, r->device,
+                        qwen35_matvec_iq_source, "qwen35_iq.hip", r->verbose,
+                        "qwen35_iq", 1) <= 0) {
+                    hllm_active_shards = NULL;
+                    return -1;
+                }
+                CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq2s,
+                          r->iq_module, "qwen35_matvec_iq2s"));
+                CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq2xxs,
+                          r->iq_module, "qwen35_matvec_iq2xxs"));
+                CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq2xs,
+                          r->iq_module, "qwen35_matvec_iq2xs"));
+                CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq2xs_down_residual,
+                          r->iq_module, "qwen35_matvec_iq2xs_down_residual"));
+                CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq3xxs,
+                          r->iq_module, "qwen35_matvec_iq3xxs"));
+                CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq3xxs_qkv,
+                          r->iq_module, "qwen35_matvec_iq3xxs_qkv"));
+                CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq3s_qkv,
+                          r->iq_module, "qwen35_matvec_iq3s_qkv"));
+                CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq4xs_qkv,
+                          r->iq_module, "qwen35_matvec_iq4xs_qkv"));
+                CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq2xxs_qkv,
+                          r->iq_module, "qwen35_matvec_iq2xxs_qkv"));
+                CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq2xs_qkv,
+                          r->iq_module, "qwen35_matvec_iq2xs_qkv"));
+                CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq_mixed_qkv,
+                          r->iq_module, "qwen35_matvec_iq_mixed_qkv"));
+                CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq3s,
+                          r->iq_module, "qwen35_matvec_iq3s"));
+                CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq4xs,
+                          r->iq_module, "qwen35_matvec_iq4xs"));
+                CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq4xs_multi8,
+                          r->iq_module, "qwen35_matvec_iq4xs_multi8"));
+                CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq4xs_5120_multi8,
+                          r->iq_module, "qwen35_matvec_iq4xs_5120_multi8"));
+                CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq_multi4,
+                          r->iq_module, "qwen35_matvec_iq_multi4"));
+                CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq2xxs_multi8,
+                          r->iq_module, "qwen35_matvec_iq2xxs_multi8"));
+                CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq2xs_multi8,
+                          r->iq_module, "qwen35_matvec_iq2xs_multi8"));
+                CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq2s_multi8,
+                          r->iq_module, "qwen35_matvec_iq2s_multi8"));
+                CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq3xxs_multi8,
+                          r->iq_module, "qwen35_matvec_iq3xxs_multi8"));
+                CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq3s_multi8,
+                          r->iq_module, "qwen35_matvec_iq3s_multi8"));
+                CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq3s_prefill8,
+                          r->iq_module, "qwen35_matvec_iq3s_prefill8"));
+                CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq2xxs_fixed8,
+                          r->iq_module, "qwen35_matvec_iq2xxs_fixed8"));
+                CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq2xs_fixed8,
+                          r->iq_module, "qwen35_matvec_iq2xs_fixed8"));
+                CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq2s_fixed8,
+                          r->iq_module, "qwen35_matvec_iq2s_fixed8"));
+                CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq3xxs_fixed8,
+                          r->iq_module, "qwen35_matvec_iq3xxs_fixed8"));
+                CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq3s_fixed8,
+                          r->iq_module, "qwen35_matvec_iq3s_fixed8"));
+            }
+        }
+        if (options->decode_kernel_mode == HIP_LLM_DECODE_KERNEL_NATIVE) {
+            r->decode_dp4a = 0;
+            r->decode_dp4a2 = 0;
+        } else if (options->decode_kernel_mode == HIP_LLM_DECODE_KERNEL_DP4A2 ||
+                   options->decode_kernel_mode == HIP_LLM_DECODE_KERNEL_AUTO) {
+            r->decode_dp4a = 1;
+            r->decode_dp4a2 = 1;
+        }
+    }
     int rc = hip_llm_load_weights_impl(r, model->metadata, options->max_seq_len);
     hllm_active_shards = NULL;
     return rc;
@@ -13837,13 +18349,136 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
         kv_dim = r->n_kv_heads * r->head_dim_full;
     }
 
-    /* Allocate KV cache */
+    /* Allocate KV cache.  Keep legacy generic models on F32 unless the caller
+     * explicitly selects F16; the tuned Qwen3.5 launcher does so through load
+     * options rather than an environment-only production switch. */
+    r->kv_cache_type = HIP_LLM_KV_F32;
+    r->kv_quantized = r->is_hybrid && !r->is_qwen4exp &&
+                 (r->requested_kv_cache_type == HIP_LLM_KV_Q8_0_Q4_0 ||
+                  r->requested_kv_cache_type == HIP_LLM_KV_Q8_0_Q8_0);
+    if (r->requested_kv_cache_type == HIP_LLM_KV_Q8_0_Q8_0 &&
+        (!r->kv_quantized || r->head_dim <= 0 || r->head_dim > 256 ||
+         r->head_dim % 32 || (getenv("LLM_FA_DISABLE") && atoi(getenv("LLM_FA_DISABLE"))))) {
+        fprintf(stderr, "hip_llm: q8q8 requires hybrid attention, head_dim 32..256 divisible by 32, and attention scratch enabled\n");
+        return -1;
+    }
+    if (r->kv_quantized) r->kv_cache_type = r->requested_kv_cache_type;
+    if (r->requested_qwen35_native_q8_attention) {
+        hipDeviceProp_t props;
+        CHECK_HIP(hipGetDeviceProperties(&props, r->device));
+        if (r->kv_cache_type != HIP_LLM_KV_Q8_0_Q8_0 || r->head_dim != 256 ||
+            strncmp(props.gcnArchName, "gfx1201", 7) || r->is_qwen4exp) {
+            fprintf(stderr, "hip_llm: native Q8 attention requires Qwen3.5 Q8/Q8 D=256 on gfx1201\n");
+            return -1;
+        }
+        if (hip_compile_kernels_ex(&r->q8_attention_module, r->device,
+                qwen35_attention_q8_source, "qwen35_attention_q8.hip", r->verbose,
+                "qwen35_attention_q8", 1) <= 0) return -1;
+        CHECK_HIP(hipModuleGetFunction(&r->fn_q8_attention_decode,
+                  r->q8_attention_module, "qwen35_attention_q8_decode"));
+        CHECK_HIP(hipModuleGetFunction(&r->fn_q8_attention_decode_gqa3,
+                  r->q8_attention_module, "qwen35_attention_q8_decode_gqa3"));
+        CHECK_HIP(hipModuleGetFunction(&r->fn_q8_attention_decode_gqa3_reuse,
+                  r->q8_attention_module,
+                  "qwen35_attention_q8_decode_gqa3_reuse"));
+        CHECK_HIP(hipModuleGetFunction(&r->fn_q8_attention_decode_reuse8,
+                  r->q8_attention_module,
+                  "qwen35_attention_q8_decode_reuse8"));
+        CHECK_HIP(hipModuleGetFunction(&r->fn_q8_attention_decode_reuse_fixed8,
+                  r->q8_attention_module,
+                  "qwen35_attention_q8_decode_reuse_fixed8"));
+        CHECK_HIP(hipModuleGetFunction(&r->fn_q8_attention_decode_reuse_fixed5,
+                  r->q8_attention_module,
+                  "qwen35_attention_q8_decode_reuse_fixed5"));
+        CHECK_HIP(hipModuleGetFunction(&r->fn_q8_attention_decode_verify_fused,
+                  r->q8_attention_module,
+                  "qwen35_attention_q8_decode_verify_fused"));
+        CHECK_HIP(hipModuleGetFunction(&r->fn_q8_attention_combine,
+                  r->q8_attention_module, "qwen35_attention_q8_combine"));
+        CHECK_HIP(hipModuleGetFunction(&r->fn_q8_attention_combine_verify4,
+                  r->q8_attention_module, "qwen35_attention_q8_combine_verify4"));
+        CHECK_HIP(hipModuleGetFunction(&r->fn_q8_attention_combine_verify8,
+                  r->q8_attention_module, "qwen35_attention_q8_combine_verify8"));
+        CHECK_HIP(hipModuleGetFunction(&r->fn_q8_attention_combine_verify16,
+                  r->q8_attention_module, "qwen35_attention_q8_combine_verify16"));
+        if (hip_compile_kernels_ex(&r->q8_gate_module, r->device,
+                qwen35_attention_q8_gate_source, "qwen35_attention_q8_gate.hip",
+                r->verbose, "qwen35_attention_q8_gate", 1) <= 0) return -1;
+        CHECK_HIP(hipModuleGetFunction(&r->fn_q8_attention_combine_gate,
+                  r->q8_gate_module, "qwen35_attention_q8_combine_gate"));
+        CHECK_HIP(hipModuleGetFunction(&r->fn_q8_attention_combine_verify4_gate,
+                  r->q8_gate_module, "qwen35_attention_q8_combine_verify4_gate"));
+        CHECK_HIP(hipModuleGetFunction(&r->fn_q8_attention_combine_verify8_gate,
+                  r->q8_gate_module, "qwen35_attention_q8_combine_verify8_gate"));
+        CHECK_HIP(hipModuleGetFunction(&r->fn_q8_attention_combine_verify16_gate,
+                  r->q8_gate_module, "qwen35_attention_q8_combine_verify16_gate"));
+        if (hip_compile_kernels_ex(&r->q8_prefill_module, r->device,
+                qwen35_attention_q8_source, "qwen35_attention_q8_prefill.hip", r->verbose,
+                "qwen35_attention_q8_prefill", 0) <= 0) return -1;
+        CHECK_HIP(hipModuleGetFunction(&r->fn_q8_attention_prefill_wmma,
+                  r->q8_prefill_module, "qwen35_attention_q8_prefill_wmma"));
+        r->q8_attention_nsm = props.multiProcessorCount;
+        r->q8_attention_max_splits = (max_seq_len + 255) / 256;
+        if (r->q8_attention_max_splits > 128) r->q8_attention_max_splits = 128;
+        size_t parts = (size_t)r->n_heads * r->q8_attention_max_splits;
+        CHECK_HIP(hipMalloc(&r->d_q8_attention_parts, parts * 256 * sizeof(float)));
+        CHECK_HIP(hipMalloc(&r->d_q8_attention_meta, parts * 2 * sizeof(float)));
+    }
+    if (r->is_qwen4exp ||
+        (r->is_hybrid && !r->is_qwen4exp &&
+         r->requested_kv_cache_type == HIP_LLM_KV_F16))
+        r->kv_cache_type = HIP_LLM_KV_F16;
+    r->kv_element_bytes = r->kv_quantized ? sizeof(int8_t) :
+                          r->kv_cache_type == HIP_LLM_KV_F16 ?
+                          sizeof(uint16_t) : sizeof(float);
     if (r->verbose >= 1) {
         size_t free_b = 0, total_b = 0;
         if (hipMemGetInfo(&free_b, &total_b) == hipSuccess)
             fprintf(stderr, "hip_llm: VRAM before KV: %.1f / %.1f MiB free\n",
                     (double)free_b / (1024.0*1024.0),
                     (double)total_b / (1024.0*1024.0));
+    }
+    /* Clamp an oversized Qwen3.5 context after weights are resident,
+     * oversized advertised/requested context after weights are resident,
+     * when the actual remaining VRAM is known.  This is especially important
+     * for the 27B GSQ checkpoint: 32K KV is 4 GiB, but only ~3.8 GiB remains
+     * on a 16-GiB RX 9070 XT before scratch allocation. */
+    if (r->is_hybrid && !r->is_qwen4exp) {
+        size_t free_b = 0, total_b = 0;
+        if (hipMemGetInfo(&free_b, &total_b) == hipSuccess) {
+            int attention_layers = 0;
+            for (int l = 0; l < r->n_layers; ++l)
+                if (!r->layers[l].is_ssm) ++attention_layers;
+            size_t kv_bytes_per_token = (size_t)attention_layers * 2 *
+                r->n_kv_heads * r->head_dim * r->kv_element_bytes;
+            if (r->kv_quantized)
+                kv_bytes_per_token = (size_t)attention_layers * r->n_kv_heads *
+                    (r->head_dim + (r->kv_cache_type == HIP_LLM_KV_Q8_0_Q4_0 ?
+                                     r->head_dim / 2 : r->head_dim)) +
+                    (size_t)attention_layers * 2 * r->n_kv_heads *
+                    ((r->head_dim + 31) / 32) * sizeof(float);
+            /* Shared F16 packing scratch also grows with context unless the
+             * native Q8/Q8 decode and prefill paths never unpack the cache. */
+            if (r->head_dim <= 256 && !(r->requested_qwen35_native_q8_attention &&
+                r->requested_qwen35_native_q8_prefill &&
+                r->requested_kv_cache_type == HIP_LLM_KV_Q8_0_Q8_0))
+                kv_bytes_per_token += (size_t)4 * r->n_kv_heads * r->head_dim;
+            size_t reserve = (size_t)768 << 20;
+            if (kv_bytes_per_token > 0 && free_b > reserve) {
+                size_t fit = (free_b - reserve) / kv_bytes_per_token;
+                fit = (fit / 1024) * 1024;
+                if (fit >= 1024 && fit < (size_t)max_seq_len) {
+                    fprintf(stderr,
+                            "hip_llm: clamping qwen35 context %d -> %zu "
+                            "from free VRAM (KV %.1f MiB, reserve %.0f MiB)\n",
+                            max_seq_len, fit,
+                            (double)(fit * kv_bytes_per_token) / (1024.0 * 1024.0),
+                            (double)reserve / (1024.0 * 1024.0));
+                    max_seq_len = (int)fit;
+                    r->max_seq_len = max_seq_len;
+                }
+            }
+        }
     }
     if (r->is_qwen4exp) {
         const char *kvq = getenv("LLM_QWEN4_KV_QUANT");
@@ -13861,9 +18496,9 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
     }
     r->d_key_cache = (void **)calloc(r->n_layers, sizeof(void *));
     r->d_value_cache = (void **)calloc(r->n_layers, sizeof(void *));
-    r->d_key_cache_scale = r->is_qwen4exp && (r->qwen4_kv_i8 || r->qwen4_kv_fp8) ?
+    r->d_key_cache_scale = (r->is_qwen4exp && (r->qwen4_kv_i8 || r->qwen4_kv_fp8)) || r->kv_quantized ?
         (float **)calloc(r->n_layers, sizeof(float *)) : NULL;
-    r->d_value_cache_scale = r->is_qwen4exp && (r->qwen4_kv_i8 || r->qwen4_kv_fp8) ?
+    r->d_value_cache_scale = (r->is_qwen4exp && (r->qwen4_kv_i8 || r->qwen4_kv_fp8)) || r->kv_quantized ?
         (float **)calloc(r->n_layers, sizeof(float *)) : NULL;
     size_t qwen4_kv_bytes = 0;
     size_t qwen4_kv_f16_bytes = 0;
@@ -13871,6 +18506,7 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
     for (int l = 0; l < r->n_layers; l++) {
         if (r->layers[l].is_ssm) continue;
         size_t kv_cache_size;
+        size_t value_cache_size = 0;
         if (r->is_gemma4) {
             int local_kv = r->layers[l].local_kv_heads;
             int local_hd = r->layers[l].local_head_dim;
@@ -13893,8 +18529,14 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
             }
         } else {
             kv_cache_size = (size_t)max_seq_len * kv_dim *
-                            (r->is_qwen4exp ? ((r->qwen4_kv_i8 || r->qwen4_kv_fp8) ? sizeof(int8_t) : sizeof(uint16_t)) : sizeof(float));
+                            (r->is_qwen4exp ?
+                             ((r->qwen4_kv_i8 || r->qwen4_kv_fp8) ? sizeof(int8_t) : sizeof(uint16_t)) :
+                             r->kv_element_bytes);
+            value_cache_size = r->kv_cache_type == HIP_LLM_KV_Q8_0_Q4_0 ?
+                (size_t)max_seq_len * r->n_kv_heads * (r->head_dim / 2) : kv_cache_size;
         }
+        if (!r->kv_quantized)
+            value_cache_size = kv_cache_size;
         if (r->is_qwen4exp) {
             qwen4_kv_bytes += 2 * kv_cache_size; /* separate K and V */
             qwen4_kv_f16_bytes += (size_t)2 * max_seq_len * kv_dim * sizeof(uint16_t);
@@ -13902,11 +18544,13 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
         }
         CHECK_HIP(hipMalloc(&r->d_key_cache[l], kv_cache_size));
         CHECK_HIP(hipMemset(r->d_key_cache[l], 0, kv_cache_size));
-        CHECK_HIP(hipMalloc(&r->d_value_cache[l], kv_cache_size));
-        CHECK_HIP(hipMemset(r->d_value_cache[l], 0, kv_cache_size));
-        if (r->is_qwen4exp && (r->qwen4_kv_i8 || r->qwen4_kv_fp8)) {
+        CHECK_HIP(hipMalloc(&r->d_value_cache[l], value_cache_size));
+        CHECK_HIP(hipMemset(r->d_value_cache[l], 0, value_cache_size));
+        if ((r->is_qwen4exp && (r->qwen4_kv_i8 || r->qwen4_kv_fp8)) || r->kv_quantized) {
             size_t scale_bytes = (size_t)max_seq_len * r->n_kv_heads *
-                                 ((r->head_dim + 31) / 32) * sizeof(float);
+                                 ((r->head_dim + 31) / 32) *
+                                 (r->kv_cache_type == HIP_LLM_KV_Q8_0_Q8_0 ?
+                                  sizeof(uint16_t) : sizeof(float));
             CHECK_HIP(hipMalloc(&r->d_key_cache_scale[l], scale_bytes));
             CHECK_HIP(hipMalloc(&r->d_value_cache_scale[l], scale_bytes));
             CHECK_HIP(hipMemset(r->d_key_cache_scale[l], 0, scale_bytes));
@@ -13922,7 +18566,10 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
                 f16_gib * 0.5, f16_gib * 0.25);
     }
     if (r->verbose >= 1)
-        fprintf(stderr, "hip_llm: finalize KV complete\n");
+        fprintf(stderr, "hip_llm: finalize KV complete (%s)\n",
+                r->kv_quantized ? (r->kv_cache_type == HIP_LLM_KV_Q8_0_Q8_0 ?
+                    "Q8_0K/Q8_0V" : "Q8_0K/Q4_0V") :
+                (r->kv_cache_type == HIP_LLM_KV_F16 ? "F16" : "F32"));
 
     /* Allocate scratch buffers */
     int max_dim = r->n_embd;
@@ -13940,6 +18587,28 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
     CHECK_HIP(hipMalloc(&r->d_q,   q_dim * sizeof(float)));
     CHECK_HIP(hipMalloc(&r->d_k,   kv_dim * sizeof(float)));
     CHECK_HIP(hipMalloc(&r->d_v,   kv_dim * sizeof(float)));
+    if (r->kv_cache_type == HIP_LLM_KV_Q8_0_Q4_0 && getenv("LLM_ATTN_DECODE_Q8Q4_SPLIT") &&
+        atoi(getenv("LLM_ATTN_DECODE_Q8Q4_SPLIT")) != 0) {
+        int chunk = 2048;
+        const char *chunk_env = getenv("LLM_ATTN_DECODE_Q8Q4_SPLIT_CHUNK");
+        if (chunk_env) {
+            int v = atoi(chunk_env);
+            if (v == 1024 || v == 2048 || v == 4096) chunk = v;
+        }
+        int ns = (max_seq_len + chunk - 1) / chunk;
+        size_t elems = (size_t)r->n_heads * ns * (r->head_dim + 2);
+        if (hipMalloc(&r->d_attn_decode_partial, elems * sizeof(float)) != hipSuccess) {
+            fprintf(stderr, "hip_llm: split Q8Q4 partial allocation failed\n");
+            r->d_attn_decode_partial = NULL;
+        } else {
+            r->d_attn_decode_partial_splits = ns;
+            r->d_attn_decode_partial_chunk = chunk;
+            hipMemset(r->d_attn_decode_partial, 0, elems * sizeof(float));
+            if (r->verbose >= 1)
+                fprintf(stderr, "hip_llm: split Q8Q4 decode enabled (%d x %d-key segments)\n",
+                        ns, chunk);
+        }
+    }
     if (r->is_qwen4exp) {
         size_t hc_elems = (size_t)r->hc_count * r->n_embd;
         CHECK_HIP(hipMalloc(&r->d_hc, hc_elems * sizeof(float)));
@@ -14268,6 +18937,8 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
         CHECK_HIP(hipMalloc(&r->d_ssm_Q_exp,     dt_rank * d_state * sizeof(float)));
         CHECK_HIP(hipMalloc(&r->d_ssm_K_exp,     dt_rank * d_state * sizeof(float)));
         CHECK_HIP(hipMalloc(&r->d_ssm_out,       d_inner * sizeof(float)));
+        CHECK_HIP(hipMalloc(&r->d_ssm_q8k,
+                            (size_t)((d_inner + 255) / 256) * 292));
         CHECK_HIP(hipMalloc(&r->d_ssm_inv_mean,  (dt_rank > 0 ? dt_rank : 256) * sizeof(float)));
         CHECK_HIP(hipMalloc(&r->d_ssm_conv_out,  r->ssm_qkv_dim * sizeof(float)));
         CHECK_HIP(hipMalloc(&r->d_attn_gate,     q_dim * sizeof(float)));
@@ -14293,6 +18964,7 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
     }
 
     /* === Phase 5: device int for position, written via hipMemcpyAsync per token === */
+    CHECK_HIP(hipMalloc(&r->d_argmax, sizeof(int)));
     CHECK_HIP(hipMalloc((void **)&r->d_position, sizeof(int)));
     CHECK_HIP(hipMemset(r->d_position, 0, sizeof(int)));
 
@@ -14317,7 +18989,7 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
          *   hybrid SSM models: 1024 — SSM buffers scale with BMAX × qkv_dim
          *     (160-200 MB each), so default 4096 risks OOM on 27B-class models.
          * LLM_BMAX env still overrides. */
-        int batch_max = r->is_hybrid ? 1024 : 4096;
+        int batch_max = r->is_hybrid ? 512 : 4096;
         /* Qwen4's hybrid/MoE scratch plus a 65K KV cache leaves room for a
          * 512-row tile on a 16GB card.  Larger default tiles OOM before the
          * batched path can be measured. */
@@ -14326,6 +18998,8 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
          * scratch buffers larger than that only wastes VRAM (and risks OOM at the
          * large KV caches needed for long context). */
         if (r->is_gemma4 && r->gemma_prefill_chunk > 0) batch_max = r->gemma_prefill_chunk;
+        if (r->requested_prefill_batch_tokens > 0)
+            batch_max = r->requested_prefill_batch_tokens;
         const char *env_bm = getenv("LLM_BMAX");
         if (env_bm) batch_max = atoi(env_bm);
         /* Grouped exact MTP never submits more than draft+anchor (33) rows.
@@ -14910,7 +19584,10 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
             /* Qwen4 has its own causal attention kernels (including the
              * scaled-I8 path). Avoid reserving an unused max-context K/V
              * packing buffer; at 256K this wastes about 1 GiB on 16-GiB cards. */
-            int fa_eligible = !r->is_qwen4exp && !fa_disable
+            int native_q8_only = r->requested_qwen35_native_q8_attention &&
+                r->requested_qwen35_native_q8_prefill &&
+                r->kv_cache_type == HIP_LLM_KV_Q8_0_Q8_0;
+            int fa_eligible = !r->is_qwen4exp && !fa_disable && !native_q8_only
                 && r->head_dim > 0 && r->head_dim <= 256
                 && r->n_kv_heads > 0
                 && (r->n_heads % r->n_kv_heads) == 0;
@@ -14984,8 +19661,10 @@ static inline int gemm_run_bf16_w(hip_llm_runner *r, void *Y, const void *W,
     if (!r->gemm_own)
         return mm_blaslt_run_bf16(Y, W, X, M, N, K, stream);
     void *args[] = { &Y, &W, &X, &N, &K, &M };
-    hipFunction_t fn = (M >= 128 && K >= 128 && r->fn_gemm_bf16_own_db) ? r->fn_gemm_bf16_own_db
-                                                            : r->fn_gemm_bf16_own;
+    const char *db_env = getenv("LLM_GEMM_OWN_DB");
+    int use_db = !db_env || atoi(db_env) != 0;
+    hipFunction_t fn = (use_db && M >= 128 && K >= 128 && r->fn_gemm_bf16_own_db) ?
+                       r->fn_gemm_bf16_own_db : r->fn_gemm_bf16_own;
     hipError_t err = LAUNCH(fn, (unsigned)((N + 127) / 128),
                             (unsigned)((M + 127) / 128), 1, 256, 1, 1, 0,
                             (hipStream_t)stream, args);
@@ -14994,11 +19673,27 @@ static inline int gemm_run_bf16_w(hip_llm_runner *r, void *Y, const void *W,
                 M, N, K, (int)err);
     return err == hipSuccess ? 0 : -1;
 }
+static inline int gemm_run_f32_w(hip_llm_runner *r, void *Y, const void *W,
+                                 const void *X, int M, int N, int K,
+                                 void *stream) {
+    if (r->gemm_own) return -1;
+    return mm_blaslt_run_f32(Y, W, X, M, N, K, stream);
+}
+static inline int gemm_run_f16_w(void *Y, const void *W, const void *X,
+                                 int M, int N, int K, void *stream) {
+    return mm_blaslt_run_f16(Y, W, X, M, N, K, stream);
+}
 
 static inline void launch_embed(hip_llm_runner *r, void *dst, void *embd_table,
                                 int token_id, int n_embd) {
     void *args[] = { &dst, &embd_table, &token_id, &n_embd };
     LAUNCH(r->fn_embed_f16, (n_embd + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, args);
+}
+
+static inline void launch_embed_f32(hip_llm_runner *r, void *dst, void *embd_table,
+                                    int token_id, int n_embd) {
+    void *args[] = { &dst, &embd_table, &token_id, &n_embd };
+    LAUNCH(r->fn_embed_f32, (n_embd + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, args);
 }
 
 static inline void launch_embed_devtoken(hip_llm_runner *r, void *dst,
@@ -15011,6 +19706,13 @@ static inline void launch_embed_devtoken(hip_llm_runner *r, void *dst,
 
 static inline void launch_rmsnorm(hip_llm_runner *r, void *dst, void *x,
                                    void *w, int n, float eps) {
+    if (r->fn_qwen35_rmsnorm_reference) {
+        int stride = n;
+        void *args[] = { &dst, &x, &w, &n, &stride, &eps };
+        LAUNCH(r->fn_qwen35_rmsnorm_reference, 1, 1, 1,
+               n < 1024 ? 256 : 1024, 1, 1, 0, r->stream, args);
+        return;
+    }
     void *args[] = { &dst, &x, &w, &n, &eps };
     LAUNCH(r->fn_rmsnorm_f32, 1, 1, 1, 256, 1, 1, 256 * sizeof(float), r->stream, args);
 }
@@ -15029,9 +19731,29 @@ static inline void launch_glm5next_mhc_finish(hip_llm_runner *r,
 static inline void launch_rmsnorm_batch(hip_llm_runner *r, void *dst, void *x,
                                           void *w, int n, int n_rows, int row_stride,
                                           float eps) {
+    if (r->fn_qwen35_rmsnorm_reference) {
+        void *args[] = { &dst, &x, &w, &n, &row_stride, &eps };
+        LAUNCH(r->fn_qwen35_rmsnorm_reference, n_rows, 1, 1,
+               n < 1024 ? 256 : 1024, 1, 1, 0, r->stream, args);
+        return;
+    }
     void *args[] = { &dst, &x, &w, &n, &row_stride, &eps };
     LAUNCH(r->fn_rmsnorm_batch_f32, n_rows, 1, 1, 256, 1, 1, 256 * sizeof(float),
            r->stream, args);
+}
+
+/* Prefill-only diagnostic; verifier/draft and scalar decode retain their
+ * existing arithmetic. The reference module is compiled without fast-math. */
+static inline void launch_qwen35_prefill_rmsnorm(hip_llm_runner *r, void *dst,
+        void *x, void *w, int n, int rows, int stride, float eps) {
+    if (r->fn_qwen35_prefill_rmsnorm_reference &&
+        r->is_hybrid && !r->is_qwen4exp) {
+        void *args[] = { &dst, &x, &w, &n, &stride, &eps };
+        LAUNCH(r->fn_qwen35_prefill_rmsnorm_reference, rows, 1, 1,
+               n < 1024 ? 256 : 1024, 1, 1, 0, r->stream, args);
+    } else {
+        launch_rmsnorm_batch(r, dst, x, w, n, rows, stride, eps);
+    }
 }
 
 static inline void launch_matvec(hip_llm_runner *r, void *dst, void *mat,
@@ -15048,6 +19770,75 @@ static inline void launch_matvec(hip_llm_runner *r, void *dst, void *mat,
     void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
     LAUNCH(r->fn_matvec_f16_f32, n_rows, 1, 1, 256, 1, 1, 0, r->stream, args);
 }
+static inline void launch_matvec_llama_f16(hip_llm_runner *r, void *dst, void *mat,
+                                           void *x, int n_rows, int n_cols) {
+    void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
+    LAUNCH(r->fn_matvec_f16_llama_f32, n_rows, 1, 1, 256, 1, 1, 0,
+           r->stream, args);
+}
+static inline void launch_matvec_llama_f16_pair(hip_llm_runner *r,
+        void *dst0, void *dst1, void *mat0, void *mat1, void *x,
+        int n_rows, int n_cols) {
+    void *args[] = { &dst0, &dst1, &mat0, &mat1, &x, &n_rows, &n_cols };
+    LAUNCH(r->fn_matvec_f16_llama_pair_f32, 2 * n_rows, 1, 1,
+           256, 1, 1, 0, r->stream, args);
+}
+static inline void launch_matvec_llama_f16_pair_batch(hip_llm_runner *r,
+        void *dst0, void *dst1, void *mat0, void *mat1, void *x,
+        int n_rows, int n_cols, int rows) {
+    void *args[] = { &dst0, &dst1, &mat0, &mat1, &x,
+                     &n_rows, &n_cols, &rows };
+    LAUNCH(r->fn_matvec_f16_llama_pair_batch_f32, 2 * n_rows, rows, 1,
+           256, 1, 1, 0, r->stream, args);
+}
+static inline void launch_matvec_llama_f16_batch(hip_llm_runner *r, void *dst,
+        void *mat, void *x, int n_rows, int n_cols, int rows) {
+    void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
+    LAUNCH(r->fn_matvec_f16_llama_f32, n_rows, rows, 1, 256, 1, 1, 0,
+           r->stream, args);
+}
+static inline void launch_matvec_bf16(hip_llm_runner *r, void *dst, void *mat,
+                                      void *x, int n_rows, int n_cols) {
+    void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
+    LAUNCH(r->fn_matvec_bf16_f32, n_rows, 1, 1, 256, 1, 1, 0, r->stream, args);
+}
+/* Match ggml-cuda/mmvf.cu's block-size heuristic so the BF16 projection is
+ * bit-identical to llama.cpp's mul_mat_vec_f on gfx1201. */
+static inline void launch_matvec_llama_bf16(hip_llm_runner *r, void *dst, void *mat,
+                                            void *x, int n_rows, int n_cols) {
+    int64_t bs = 32, niter_best = (n_cols + 63) / 64;
+    for (int64_t b = 64; b <= 256; b += 32) {
+        int64_t niter = (n_cols + 2 * b - 1) / (2 * b);
+        if (niter < niter_best) { niter_best = niter; bs = b; }
+    }
+    void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
+    LAUNCH(r->fn_matvec_bf16_llama_f32, n_rows, 1, 1, (unsigned)bs, 1, 1, 0,
+           r->stream, args);
+}
+static inline void launch_matvec_llama_bf16_batch(hip_llm_runner *r, void *dst,
+        void *mat, void *x, int n_rows, int n_cols, int rows) {
+    int64_t bs = 32, niter_best = (n_cols + 63) / 64;
+    for (int64_t b = 64; b <= 256; b += 32) {
+        int64_t niter = (n_cols + 2 * b - 1) / (2 * b);
+        if (niter < niter_best) { niter_best = niter; bs = b; }
+    }
+    void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
+    LAUNCH(r->fn_matvec_bf16_llama_f32, n_rows, rows, 1,
+           (unsigned)bs, 1, 1, 0, r->stream, args);
+}
+static inline void launch_matvec_llama_bf16_pair_batch(hip_llm_runner *r,
+        void *dst0, void *dst1, void *mat0, void *mat1, void *x,
+        int n_rows, int n_cols, int rows) {
+    int64_t bs = 32, niter_best = (n_cols + 63) / 64;
+    for (int64_t b = 64; b <= 256; b += 32) {
+        int64_t niter = (n_cols + 2 * b - 1) / (2 * b);
+        if (niter < niter_best) { niter_best = niter; bs = b; }
+    }
+    void *args[] = { &dst0, &dst1, &mat0, &mat1, &x,
+                     &n_rows, &n_cols, &rows };
+    LAUNCH(r->fn_matvec_bf16_llama_pair_batch_f32, 2 * n_rows, rows, 1,
+           (unsigned)bs, 1, 1, 0, r->stream, args);
+}
 
 static inline void launch_qknorm(hip_llm_runner *r, void *vec, void *w,
                                    int n_heads, int head_dim, float eps) {
@@ -15056,6 +19847,23 @@ static inline void launch_qknorm(hip_llm_runner *r, void *vec, void *w,
     if (bdim > 256) bdim = 256;
     void *args[] = { &vec, &w, &n_heads, &head_dim, &eps };
     LAUNCH(r->fn_qknorm_f32, n_heads, 1, 1, bdim, 1, 1, bdim * sizeof(float), r->stream, args);
+}
+
+static inline void launch_qwen35_decode_qk_prep(hip_llm_runner *r,
+        void *q, void *gate, void *qfull, void *k, void *value,
+        void *qw, void *kw, int n_q_heads, int n_kv_heads, int head_dim,
+        float eps, int store_q8q8, void *kc, void *vc, void *ks, void *vs) {
+    int *pos_p = r->d_position;
+    float freq_base = r->rope_freq_base;
+    int s0 = r->mrope_sections[0], s1 = r->mrope_sections[1];
+    int s2 = r->mrope_sections[2], s3 = r->mrope_sections[3];
+    void *args[] = { &q, &gate, &qfull, &k, &value, &qw, &kw, &n_q_heads,
+                     &n_kv_heads, &head_dim, &eps, &pos_p, &freq_base,
+                     &s0, &s1, &s2, &s3, &store_q8q8,
+                     &kc, &vc, &ks, &vs };
+    LAUNCH(r->fn_deinterleave_qgate_qknorm_mrope_pair_devp,
+           n_q_heads + n_kv_heads, 1, 1, 256, 1, 1,
+           256 * sizeof(float), r->stream, args);
 }
 
 /* Batched QK-norm: grid = (n_heads, n_rows). row_stride = n_heads*head_dim. */
@@ -15068,6 +19876,66 @@ static inline void launch_qknorm_batch(hip_llm_runner *r, void *vec, void *w,
     void *args[] = { &vec, &w, &n_heads, &head_dim, &row_stride, &eps };
     LAUNCH(r->fn_qknorm_batch_f32, n_heads, n_rows, 1, bdim, 1, 1,
            bdim * sizeof(float), r->stream, args);
+}
+
+/* DFlash2 sidecar-only K-norm + M-RoPE candidate.  Keep it opt-in because
+ * resident hash/timing gates must prove that the fused register path matches
+ * the two-launch reference on the target GPU. */
+static inline int launch_qknorm_rope_mrope_batch(hip_llm_runner *r,
+        void *vec, void *w, int n_heads, int head_dim, int position_start,
+        float freq_base, int s0, int s1, int s2, int s3, int row_stride,
+        int n_rows, float eps) {
+    const char *env = getenv("LLM_QWEN35_DFLASH_QKNORM_ROPE_FUSED");
+    int half_dim = s0 + s1 + s2 + s3;
+    if (!env || atoi(env) == 0 || !r ||
+        !r->fn_qknorm_rope_mrope_batch_f32 || half_dim < 1 ||
+        head_dim != 2 * half_dim)
+        return 0;
+    int bdim = 1;
+    while (bdim < head_dim) bdim <<= 1;
+    if (bdim > 256) bdim = 256;
+    void *args[] = { &vec, &w, &n_heads, &head_dim, &position_start,
+                     &freq_base, &s0, &s1, &s2, &s3, &row_stride, &eps };
+    LAUNCH(r->fn_qknorm_rope_mrope_batch_f32, n_heads, n_rows, 1, bdim, 1, 1,
+           bdim * sizeof(float), r->stream, args);
+    return 1;
+}
+
+static inline void launch_qknorm_pair_batch(hip_llm_runner *r, void *q, void *qw,
+    int q_heads, void *k, void *kw, int k_heads, int head_dim,
+    int q_stride, int k_stride, int n_rows, float eps) {
+    int bdim = 1;
+    while (bdim < head_dim) bdim <<= 1;
+    if (bdim > 256) bdim = 256;
+    void *args[] = { &q, &qw, &q_heads, &k, &kw, &k_heads, &head_dim,
+                     &q_stride, &k_stride, &eps };
+    LAUNCH(r->fn_qknorm_pair_batch_f32, q_heads > k_heads ? q_heads : k_heads,
+           n_rows, 1, bdim, 1, 1, 2 * bdim * sizeof(float), r->stream, args);
+}
+
+/* DFlash2 proposal-only Q/K norm + M-RoPE candidate.  The separate pair and
+ * RoPE launches remain the default until resident K=4/K=7 hashes and timing
+ * prove that the launch reduction is quality-safe. */
+static inline int launch_qknorm_rope_pair_batch(hip_llm_runner *r, void *q,
+        void *qw, int q_heads, void *k, void *kw, int k_heads, int head_dim,
+        int q_stride, int k_stride, int position_start, float freq_base,
+        int s0, int s1, int s2, int s3, int n_rows, float eps) {
+    const char *env = getenv("LLM_QWEN35_DFLASH_QKNORM_ROPE_PAIR_FUSED");
+    int half_dim = s0 + s1 + s2 + s3;
+    if (!env || atoi(env) == 0 || !r ||
+        !r->fn_qknorm_rope_pair_batch_f32 || half_dim < 1 ||
+        head_dim != 2 * half_dim)
+        return 0;
+    int bdim = 1;
+    while (bdim < head_dim) bdim <<= 1;
+    if (bdim > 256) bdim = 256;
+    void *args[] = { &q, &qw, &q_heads, &k, &kw, &k_heads, &head_dim,
+                     &q_stride, &k_stride, &position_start, &freq_base,
+                     &s0, &s1, &s2, &s3, &eps };
+    LAUNCH(r->fn_qknorm_rope_pair_batch_f32,
+           q_heads > k_heads ? q_heads : k_heads, n_rows, 1, bdim, 1, 1,
+           2 * bdim * sizeof(float), r->stream, args);
+    return 1;
 }
 
 /* Weightless per-head RMS norm over n_rows (n_rows=1 for decode). Handles head_dim>256. */
@@ -15111,6 +19979,19 @@ static inline void launch_attention(hip_llm_runner *r, void *out, void *q,
     void *args[] = { &out, &q, &key_cache, &value_cache,
                      &n_heads, &n_kv_heads, &head_dim, &kv_dim, &seq_len, &scale };
     LAUNCH(r->fn_attn_decode_f32, n_heads, 1, 1, 256, 1, 1, smem, r->stream, args);
+}
+
+static inline void launch_attention_prefill_scalar(hip_llm_runner *r,
+        void *out, void *q, void *key_cache, void *value_cache,
+        int n_heads, int n_kv_heads, int head_dim, int kv_dim,
+        int M, int position_start, float scale) {
+    int max_seq = position_start + M;
+    size_t smem = (size_t)max_seq * sizeof(float);
+    void *args[] = { &out, &q, &key_cache, &value_cache,
+                     &n_heads, &n_kv_heads, &head_dim, &kv_dim,
+                     &M, &position_start, &scale };
+    LAUNCH(r->fn_attn_prefill_scalar_f32, n_heads, M, 1, 256, 1, 1,
+           smem, r->stream, args);
 }
 
 /* === Phase 5: device-pointer launchers (read position from r->d_position) === */
@@ -15887,8 +20768,158 @@ static inline void launch_matvec_##name(hip_llm_runner *r, void *dst, void *mat,
     LAUNCH(r->fn_field, (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args); \
 }
 
+static inline void launch_quantize_q8x2(hip_llm_runner *r, void *x, int n);
+
+/* The native IQ/Q2 projection entry points are loaded as one module, but keep
+ * the activation quantizer and its two output buffers in the readiness check.
+ * This matters for partial/diagnostic loads: an opt-in fused path must fall
+ * back to the reference dispatcher instead of launching with a null Q8_1
+ * argument after a failed optional allocation. */
+static inline int qwen35_native_q81_ready(const hip_llm_runner *r) {
+    return r && r->fn_qwen35_quantize_q81 && r->d_native_q81 &&
+           r->d_native_scale;
+}
+
+/* A dedicated buffer makes scoped native Q8_1 reuse independent of legacy
+ * IQ/Q8x2 scratch. Callers delimit immutable Q/K/V or gate/up inputs. */
+static inline void launch_native_q81(hip_llm_runner *r, void *x, int n) {
+    if (!qwen35_native_q81_ready(r) || !x || n <= 0 || (n % 32) != 0)
+        return;
+    if (r->q8x2_reuse_active && r->native_q81_valid &&
+        r->native_q81_source == x && r->native_q81_n == n) return;
+    void *a[] = { &r->d_native_q81, &r->d_native_scale, &x, &n };
+    LAUNCH(r->fn_qwen35_quantize_q81, n/32, 1, 1, 32, 1, 1, 0, r->stream, a);
+    r->native_q81_source = x;
+    r->native_q81_n = n;
+    r->native_q81_valid = r->q8x2_reuse_active;
+}
+
+static inline void launch_silu_mul_native_q81(hip_llm_runner *r, void *gate,
+        void *up, int n) {
+    void *a[] = { &gate, &up, &r->d_native_q81, &r->d_native_scale, &n };
+    LAUNCH(r->fn_silu_mul_q81_f32, n / 32, 1, 1, 32, 1, 1,
+           0, r->stream, a);
+    r->native_q81_source = gate;
+    r->native_q81_n = n;
+    r->native_q81_valid = 1;
+}
+
+static inline int qwen35_native_q81_matvec_type(hip_llm_runner *r, int type) {
+    return (type == GGML_TYPE_Q2_K && r->fn_qwen35_matvec_q2k) ||
+           (type == GGML_TYPE_IQ2_XXS && r->fn_qwen35_matvec_iq2xxs) ||
+           (type == GGML_TYPE_IQ2_XS && r->fn_qwen35_matvec_iq2xs) ||
+           (type == GGML_TYPE_IQ2_S && r->fn_qwen35_matvec_iq2s) ||
+           (type == GGML_TYPE_IQ3_XXS && r->fn_qwen35_matvec_iq3xxs) ||
+           (type == GGML_TYPE_IQ3_S && r->fn_qwen35_matvec_iq3s) ||
+           (type == GGML_TYPE_IQ4_XS && r->fn_qwen35_matvec_iq4xs);
+}
+
+/* Format ids consumed by qwen35_matvec_iq_mixed_qkv.  Keep this mapping
+ * explicit so unsupported/malformed row types fall back to the serialized
+ * dispatcher instead of entering the diagnostic kernel. */
+static inline int qwen35_iq_mixed_kind(int type) {
+    switch (type) {
+    case GGML_TYPE_IQ2_XXS: return 0;
+    case GGML_TYPE_IQ2_XS:  return 1;
+    case GGML_TYPE_IQ2_S:   return 2;
+    case GGML_TYPE_IQ3_XXS: return 3;
+    case GGML_TYPE_IQ3_S:   return 4;
+    case GGML_TYPE_IQ4_XS:  return 5;
+    default:                return -1;
+    }
+}
+
+static inline int qwen35_iq_shape_threads_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *env = getenv("LLM_QWEN35_IQ_SHAPE_THREADS");
+        enabled = !env || atoi(env) != 0;
+    }
+    return enabled;
+}
+
+/* The mixed Q/K/V kernel stages its selected codebooks once per block.  A
+ * wider block amortizes that staging on some mixed shapes, but can lose
+ * occupancy on others, so keep the measured 256-thread default and expose a
+ * cached 512-thread A/B choice without rereading the environment per launch. */
+static inline int qwen35_iq_mixed_threads(void) {
+    static int threads = -1;
+    if (threads < 0) {
+        const char *env = getenv("LLM_QWEN35_IQ_MIXED_THREADS");
+        int value = env ? atoi(env) : 256;
+        threads = value == 512 ? 512 : 256;
+    }
+    return threads;
+}
+
+static inline void launch_qwen35_argmax(hip_llm_runner *r, void *x, void *out) {
+    int groups=(r->n_vocab+4095)/4096;
+    if (r->fn_qwen35_argmax_parts && groups <= 256) {
+        void *a[] = { &x, &r->n_vocab, &r->d_native_argmax_scores, &r->d_native_argmax_indices };
+        LAUNCH(r->fn_qwen35_argmax_parts, groups, 1, 1, 256, 1, 1, 0, r->stream, a);
+        void *b[] = { &r->d_native_argmax_scores, &r->d_native_argmax_indices, &groups, &out };
+        LAUNCH(r->fn_qwen35_argmax_finish, 1, 1, 1, 256, 1, 1, 0, r->stream, b);
+    } else {
+        void *a[] = { &x, &r->n_vocab, &out };
+        LAUNCH(r->fn_qwen4_argmax, 1, 1, 1, 256, 1, 1, 0, r->stream, a);
+    }
+}
+
 static inline void launch_matvec_q2_K(hip_llm_runner *r, void *dst, void *mat,
                                       void *x, int n_rows, int n_cols) {
+    if (qwen35_native_q81_ready(r) && r->fn_qwen35_matvec_q2k &&
+        n_cols <= 17408 && n_cols % 256 == 0) {
+        r->q8x2_reuse_valid = 0;
+        r->iq1_q8_valid = 0;
+        launch_native_q81(r, x, n_cols);
+        void *args[] = { &dst, &mat, &r->d_native_q81, &r->d_native_scale,
+                         &n_rows, &n_cols };
+        if (n_cols == 5120 && n_rows >= 5120) {
+            /* Tall FFN gate/up projections are faster with four rows per
+             * block; shorter output/QKV shapes retain eight for occupancy. */
+            int threads = n_rows >= 16000 ? 128 : 256;
+            int rows_per_block = threads / 32;
+            LAUNCH(r->fn_qwen35_matvec_q2k_rows,
+                   (n_rows + rows_per_block - 1) / rows_per_block, 1, 1,
+                   threads, 1, 1, 0, r->stream, args);
+        } else {
+            LAUNCH(r->fn_qwen35_matvec_q2k, n_rows, 1, 1,
+                   256, 1, 1, 0, r->stream, args);
+        }
+        return;
+    }
+    const char *q81_env = getenv("LLM_Q2K_Q81_SCALAR");
+    const char *q81_max_env = getenv("LLM_Q2K_Q81_MAX_LAYER");
+    const char *q81_down_env = getenv("LLM_Q2K_Q81_FFN_DOWN");
+    int q81_max_layer = q81_max_env ? atoi(q81_max_env) : 0x7fffffff;
+    int q81_down = !q81_down_env || atoi(q81_down_env) != 0;
+    int is_down_shape = n_rows < n_cols;
+    if (q81_env && atoi(q81_env) != 0 &&
+        (!is_down_shape || q81_down) && r->active_layer <= q81_max_layer &&
+        n_cols <= 17408 && (n_cols % 256) == 0) {
+        int one = 1, stride = n_cols;
+        void *qa[] = { &r->d_act_q8, &r->d_act_scale, &r->d_act_q8_b,
+                       &r->d_act_scale_b, &x, &n_cols, &one, &stride };
+        LAUNCH(r->fn_quantize_q81_batch_32_exact, (n_cols + 31) / 32, 1, 1,
+               32, 1, 1, 0, r->stream, qa);
+        void *qargs[] = { &dst, &mat, &r->d_act_q8, &r->d_act_scale,
+                          &n_rows, &n_cols };
+        LAUNCH(r->fn_matvec_q2_K_q81, (n_rows + 7) / 8, 1, 1,
+               256, 1, 1, 0, r->stream, qargs);
+        return;
+    }
+    const char *experimental = getenv("LLM_EXPERIMENTAL_Q2K_DP4A2");
+    if (r->decode_dp4a2 && experimental && atoi(experimental) != 0 &&
+        n_cols <= 17408 && (n_cols % 256) == 0) {
+        launch_quantize_q8x2(r, x, n_cols);
+        void *a2[] = { &dst, &mat, &r->d_act_q8, &r->d_act_scale,
+                       &r->d_act_q8_b, &r->d_act_scale_b, &n_rows, &n_cols };
+        int rows_per_block = r->mw_threads / 32;
+        LAUNCH(r->fn_matvec_q2_K_dp4a2,
+               (n_rows + rows_per_block - 1) / rows_per_block, 1, 1,
+               (unsigned)r->mw_threads, 1, 1, 0, r->stream, a2);
+        return;
+    }
     void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
     if (r->q2k_g4)
         LAUNCH(r->fn_matvec_q2_K_g4_f32, (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args);
@@ -15956,7 +20987,59 @@ static inline void launch_matvec_q6_K(hip_llm_runner *r, void *dst, void *mat,
     void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
     LAUNCH(r->fn_matvec_q6_K_f32, n_rows, 1, 1, 64, 1, 1, 0, r->stream, args);
 }
-DEFINE_LAUNCH_MATVEC_MW(iq2_xxs, fn_matvec_iq2_xxs_f32)
+static inline hipFunction_t iq_d4_or_q81_quantizer(hip_llm_runner *r) {
+    static int d4_cached = -1;
+    if (d4_cached < 0) {
+        const char *d4 = getenv("LLM_IQ_MMQ_D4");
+        d4_cached = d4 && atoi(d4) != 0;
+    }
+    r->q8x2_reuse_valid = 0;
+    r->iq1_q8_valid = 0;
+    return d4_cached ? r->fn_quantize_mmq_d4_batch :
+                                r->fn_quantize_q81_batch_32_exact;
+}
+static inline void launch_matvec_iq2_xxs(hip_llm_runner *r, void *dst,
+        void *mat, void *x, int n_rows, int n_cols) {
+    if (qwen35_native_q81_ready(r) && r->fn_qwen35_matvec_iq2xxs &&
+        n_cols <= 17408 && n_cols % 256 == 0) {
+        r->q8x2_reuse_valid = 0;
+        r->iq1_q8_valid = 0;
+        launch_native_q81(r, x, n_cols);
+        void *a[] = { &dst, &mat, &r->d_native_q81, &r->d_native_scale, &n_rows, &n_cols };
+        LAUNCH(r->fn_qwen35_matvec_iq2xxs, (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, a);
+        return;
+    }
+    void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
+    int rows_per_block = r->mw_threads / 32;
+    const char *q81_env = getenv("LLM_IQ2_XXS_Q81_SCALAR");
+    if (q81_env && atoi(q81_env) != 0 && n_cols <= 17408 && (n_cols % 32) == 0) {
+        int one = 1, stride = n_cols;
+        void *qa[] = { &r->d_act_q8, &r->d_act_scale, &r->d_act_q8_b,
+                       &r->d_act_scale_b, &x, &n_cols, &one, &stride };
+        LAUNCH(iq_d4_or_q81_quantizer(r), (n_cols + 31) / 32, 1, 1,
+               32, 1, 1, 0, r->stream, qa);
+        void *qargs[] = { &dst, &mat, &r->d_act_q8, &r->d_act_scale,
+                          &n_rows, &n_cols, &one };
+        const char *d4_env = getenv("LLM_IQ_MMQ_D4");
+        hipFunction_t fn = d4_env && atoi(d4_env) != 0 ?
+            r->fn_matvec_iq2_xxs_mmq_scales : r->fn_matvec_iq2_xxs_q81_batch;
+        LAUNCH(fn, (n_rows + 7) / 8, 1, 1,
+               256, 1, 1, 0, r->stream, qargs);
+        return;
+    }
+    if (r->decode_dp4a2 && (n_cols % 256) == 0 && n_cols <= 17408) {
+        launch_quantize_q8x2(r, x, n_cols);
+        void *a2[] = { &dst, &mat, &r->d_act_q8, &r->d_act_scale,
+                       &r->d_act_q8_b, &r->d_act_scale_b, &n_rows, &n_cols };
+        LAUNCH(r->fn_matvec_iq2_xxs_dp4a2,
+               (n_rows + rows_per_block - 1) / rows_per_block, 1, 1,
+               (unsigned)r->mw_threads, 1, 1, 0, r->stream, a2);
+    } else {
+        LAUNCH(r->fn_matvec_iq2_xxs_f32,
+               (n_rows + rows_per_block - 1) / rows_per_block, 1, 1,
+               (unsigned)r->mw_threads, 1, 1, 0, r->stream, args);
+    }
+}
 static inline void launch_matvec_iq2_xxs_ptrs(hip_llm_runner *r, void *dst,
         void *mats, void *x, int n_rows, int n_cols, int slots) {
     void *args[] = { &dst, &mats, &x, &n_rows, &n_cols };
@@ -15983,15 +21066,1422 @@ DEFINE_LAUNCH_MATVEC(q4_1, fn_matvec_q4_1_f32)
 DEFINE_LAUNCH_MATVEC(q5_0, fn_matvec_q5_0_f32)
 DEFINE_LAUNCH_MATVEC(q5_1, fn_matvec_q5_1_f32)
 DEFINE_LAUNCH_MATVEC_MW(iq4_nl, fn_matvec_iq4_nl_f32)
-DEFINE_LAUNCH_MATVEC_MW(iq4_xs, fn_matvec_iq4_xs_f32)
-DEFINE_LAUNCH_MATVEC_MW(iq2_xs, fn_matvec_iq2_xs_f32)
+static inline void launch_matvec_iq4_xs(hip_llm_runner *r, void *dst,
+        void *mat, void *x, int n_rows, int n_cols) {
+    if (qwen35_native_q81_ready(r) && r->fn_qwen35_matvec_iq4xs &&
+        n_cols <= 17408 && n_cols % 256 == 0) {
+        r->q8x2_reuse_valid = r->iq1_q8_valid = 0;
+        launch_native_q81(r, x, n_cols);
+        void *a[] = { &dst, &mat, &r->d_native_q81, &r->d_native_scale, &n_rows, &n_cols };
+        LAUNCH(r->fn_qwen35_matvec_iq4xs, (n_rows+7)/8, 1, 1, 256, 1, 1, 0, r->stream, a);
+        return;
+    }
+    const char *q81_env = getenv("LLM_IQ4_XS_Q81_SCALAR");
+    const char *q81_max_env = getenv("LLM_IQ4_XS_Q81_MAX_LAYER");
+    int q81_max_layer = q81_max_env ? atoi(q81_max_env) : 0x7fffffff;
+    if (q81_env && atoi(q81_env) != 0 && r->active_layer <= q81_max_layer &&
+        n_cols <= 17408 && (n_cols % 32) == 0) {
+        /* llama.cpp's IQ4_XS MMVQ contract quantizes the activation to
+         * Q8_1 blocks before the integer dot. Use the exact half-rounded
+         * scale/q rule, not the faster two-term staging helper. Keep this
+         * diagnostic route opt-in until the full Qwen3.5 stack passes parity. */
+        int one = 1, stride = n_cols;
+        void *qa[] = { &r->d_act_q8, &r->d_act_scale, &r->d_act_q8_b,
+                       &r->d_act_scale_b, &x, &n_cols, &one, &stride };
+        LAUNCH(iq_d4_or_q81_quantizer(r), (n_cols + 31) / 32, 1, 1,
+               32, 1, 1, 0, r->stream, qa);
+        void *qargs[] = { &dst, &mat, &r->d_act_q8, &r->d_act_scale,
+                          &n_rows, &n_cols, &one };
+        const char *dp4a_env = getenv("LLM_IQ4_XS_Q81_DP4A_SCALAR");
+        if (dp4a_env && atoi(dp4a_env) != 0) {
+            LAUNCH(r->fn_matvec_iq4_xs_q81_dp4a, (n_rows + 7) / 8, 1, 1,
+                   256, 1, 1, 0, r->stream, qargs);
+            return;
+        }
+        LAUNCH(r->fn_matvec_iq4_xs_q81_batch, (n_rows + 7) / 8, 1, 1,
+               256, 1, 1, 0, r->stream, qargs);
+        return;
+    }
+    void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
+    int rows_per_block = r->mw_threads / 32;
+    LAUNCH(r->fn_matvec_iq4_xs_f32,
+           (n_rows + rows_per_block - 1) / rows_per_block, 1, 1,
+           (unsigned)r->mw_threads, 1, 1, 0, r->stream, args);
+}
+static inline void launch_matvec_iq2_xs(hip_llm_runner *r, void *dst,
+        void *mat, void *x, int n_rows, int n_cols) {
+    if (qwen35_native_q81_ready(r) && r->fn_qwen35_matvec_iq2xs &&
+        n_cols <= 17408 && n_cols % 256 == 0) {
+        r->q8x2_reuse_valid = 0;
+        r->iq1_q8_valid = 0;
+        launch_native_q81(r, x, n_cols);
+        void *a[] = { &dst, &mat, &r->d_native_q81, &r->d_native_scale, &n_rows, &n_cols };
+        /* Sixteen waves improve the exact IQ2_XS shapes used by this model,
+         * especially the 10240-row QKV projection, without changing the
+         * one-wave-per-row arithmetic. */
+        int threads = qwen35_iq_shape_threads_enabled() ? 512 : 256;
+        int rows_per_block = threads / 32;
+        LAUNCH(r->fn_qwen35_matvec_iq2xs,
+               (n_rows + rows_per_block - 1) / rows_per_block, 1, 1,
+               threads, 1, 1, 0, r->stream, a);
+        return;
+    }
+    void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
+    int rows_per_block = r->mw_threads / 32;
+    const char *q81_env = getenv("LLM_IQ2_XS_Q81_SCALAR");
+    if (q81_env && atoi(q81_env) != 0 &&
+        n_cols <= 17408 && (n_cols % 32) == 0) {
+        int one = 1, stride = n_cols;
+        void *qa[] = { &r->d_act_q8, &r->d_act_scale, &r->d_act_q8_b,
+                       &r->d_act_scale_b, &x, &n_cols, &one, &stride };
+        LAUNCH(iq_d4_or_q81_quantizer(r), (n_cols + 31) / 32, 1, 1,
+               32, 1, 1, 0, r->stream, qa);
+        void *qargs[] = { &dst, &mat, &r->d_act_q8, &r->d_act_scale,
+                          &n_rows, &n_cols, &one };
+        const char *d4_env = getenv("LLM_IQ_MMQ_D4");
+        hipFunction_t fn = d4_env && atoi(d4_env) != 0 ?
+            r->fn_matvec_iq2_xs_mmq_scales : r->fn_matvec_iq2_xs_q81_batch;
+        LAUNCH(fn, (n_rows + 7) / 8, 1, 1,
+               256, 1, 1, 0, r->stream, qargs);
+        return;
+    }
+    if (r->decode_dp4a2 && (n_cols % 256) == 0 && n_cols <= 17408) {
+        launch_quantize_q8x2(r, x, n_cols);
+        void *a2[] = { &dst, &mat, &r->d_act_q8, &r->d_act_scale,
+                       &r->d_act_q8_b, &r->d_act_scale_b, &n_rows, &n_cols };
+        LAUNCH(r->fn_matvec_iq2_xs_dp4a2,
+               (n_rows + rows_per_block - 1) / rows_per_block, 1, 1,
+               (unsigned)r->mw_threads, 1, 1, 0, r->stream, a2);
+    } else {
+        LAUNCH(r->fn_matvec_iq2_xs_f32,
+               (n_rows + rows_per_block - 1) / rows_per_block, 1, 1,
+               (unsigned)r->mw_threads, 1, 1, 0, r->stream, args);
+    }
+}
+static inline int launch_matvec_iq2xs_down_residual(hip_llm_runner *r,
+        void *residual, void *mat, int n_rows, int n_cols) {
+    const char *env = getenv("LLM_QWEN35_FUSED_DOWN_RESIDUAL");
+    if (!env || atoi(env) == 0 || !r->fn_qwen35_matvec_iq2xs_down_residual ||
+        !r->native_q81_valid || r->native_q81_source != r->d_gate ||
+        r->native_q81_n != n_cols || n_rows < 1 || n_cols <= 0 ||
+        n_cols > 17408 || (n_cols % 256) != 0)
+        return 0;
+    void *a[] = { &residual, &mat, &r->d_native_q81,
+                  &r->d_native_scale, &n_rows, &n_cols };
+    LAUNCH(r->fn_qwen35_matvec_iq2xs_down_residual,
+           (n_rows + 15) / 16, 1, 1, 512, 1, 1, 0, r->stream, a);
+    return 1;
+}
 static inline void launch_matvec_iq2_xs_ptrs(hip_llm_runner *r, void *dst,
         void *mats, void *x, int n_rows, int n_cols, int slots) {
     void *args[] = { &dst, &mats, &x, &n_rows, &n_cols, &slots };
     LAUNCH(r->fn_matvec_iq2_xs_ptrs_f32, (n_rows + 7) / 8, 1, slots,
            256, 1, 1, 0, r->stream, args);
 }
-DEFINE_LAUNCH_MATVEC_MW(iq3_xxs, fn_matvec_iq3_xxs_f32)
+static inline void launch_pack_bf16_from_f32(hip_llm_runner *r, void *dst,
+                                             void *src, int n);
+static inline void launch_quantize_q8x2_batch_cached(hip_llm_runner *r,
+        void *x, int n, int M, int stride);
+static inline void launch_quantize_q81_batch_cached(hip_llm_runner *r,
+        void *x, int n, int M, int stride);
+static inline void launch_quantize_q81_iq1_batch(hip_llm_runner *r,
+        void *x, int n, int M, int stride);
+static inline void launch_quantize_q81_iq1_batch_preserve_q8x2(
+        hip_llm_runner *r, void *x, int n, int M, int stride);
+static inline void launch_matvec_iq_q81_batch(hip_llm_runner *r,
+        hipFunction_t fn, void *dst, void *mat, int n_rows, int n_cols, int M);
+static inline void *get_bf16_weight(hip_llm_runner *r, void *raw_w, void *bf16_w,
+                                    int type, int n_rows, int n_cols);
+static inline void launch_matvec_iq2_xs_batch(hip_llm_runner *r, void *dst,
+        void *mat, void *x, int M, int n_rows, int n_cols, int x_stride) {
+    void *args[] = { &dst, &mat, &x, &n_rows, &n_cols, &M, &x_stride };
+    const char *q81_batch = getenv("LLM_QWEN35_Q81_BATCH");
+    const char *q81_iq2xs = getenv("LLM_QWEN35_IQ2XS_Q81_FFN");
+    if (((q81_batch && atoi(q81_batch) != 0) ||
+         (q81_iq2xs && atoi(q81_iq2xs) != 0)) &&
+        x_stride == n_cols && M > 0 &&
+        M <= r->batch_max && (n_cols % 256) == 0) {
+        launch_quantize_q81_batch_cached(r, x, n_cols, M, x_stride);
+        launch_matvec_iq_q81_batch(r, r->fn_matvec_iq2_xs_q81_batch,
+                                   dst, mat, n_rows, n_cols, M);
+        return;
+    }
+    const char *gemm_env = getenv("LLM_QWEN35_IQ2_BF16_GEMM");
+    if (gemm_env && atoi(gemm_env) != 0 && M >= 32 && M <= r->batch_max &&
+        n_cols <= r->ssm_d_inner && (n_cols % 256) == 0) {
+        void *wb = get_bf16_weight(r, mat, NULL, GGML_TYPE_IQ2_XS,
+                                   n_rows, n_cols);
+        if (wb) {
+            launch_pack_bf16_from_f32(r, r->d_silu_batch_bf16, x, M * n_cols);
+            if (gemm_run_bf16_w(r, dst, wb, r->d_silu_batch_bf16,
+                                M, n_rows, n_cols, r->stream) == 0)
+                return;
+        }
+        /* A staging failure falls through to the exact native path. */
+    }
+    /* The RDNA4 MMQ path is parity-validated against DP4A and is the default
+     * for full-width Qwen3.5 IQ2_XS batches.  Set the variable to 0 for an
+     * exact DP4A A/B control run. */
+    const char *mmq_wmma = getenv("LLM_QWEN35_IQ2XS_MMQ_WMMA");
+    int mmq_wmma_enable = !mmq_wmma || atoi(mmq_wmma) != 0;
+    if (mmq_wmma_enable && x_stride == n_cols && M >= 128 &&
+        n_rows >= 128 && (n_cols % 256) == 0) {
+        launch_quantize_q8x2_batch_cached(r, x, n_cols, M, x_stride);
+        int term0 = 0, term1 = 1, scalar = 0, fused = 0;
+        void *mw[] = { &dst, &mat, &r->d_act_q8_batch, &r->d_act_scale_batch,
+                       &r->d_act_q8_batch_b, &r->d_act_scale_batch_b,
+                       &n_rows, &n_cols, &M, &term0, &scalar, &fused };
+        const char *fused_env = getenv("LLM_QWEN35_IQ2XS_MMQ_FUSED");
+        if (fused_env && atoi(fused_env) != 0) {
+            fused = 1;
+            LAUNCH(r->fn_gemm_iq2_xs_mmq_wmma, (n_rows + 127) / 128,
+                   (M + 127) / 128, 1, 256, 1, 1, 0, r->stream, mw);
+            return;
+        }
+        LAUNCH(r->fn_gemm_iq2_xs_mmq_wmma, (n_rows + 127) / 128,
+               (M + 127) / 128, 1, 256, 1, 1, 0, r->stream, mw);
+        /* llama.cpp's IQ2 MMQ uses one Q8 activation term.  Our exact
+         * expansion has a second residual term; skipping it is substantially
+         * faster but approximate, so keep it opt-in and never silently change
+         * the numerical default. */
+        const char *single_env = getenv("LLM_QWEN35_IQ2_MMQ_SINGLE");
+        if (single_env && atoi(single_env) != 0)
+            return;
+        mw[9] = &term1;
+        LAUNCH(r->fn_gemm_iq2_xs_mmq_wmma, (n_rows + 127) / 128,
+               (M + 127) / 128, 1, 256, 1, 1, 0, r->stream, mw);
+        /* One-shot differential check against the exact DP4A batch kernel.
+         * This is intentionally diagnostic-only: it synchronizes once and
+         * allocates a temporary output, and is never enabled in production. */
+        static int mmq_compare_done = 0;
+        const char *cmp_env = getenv("LLM_QWEN35_IQ2XS_MMQ_COMPARE");
+        if (!mmq_compare_done && cmp_env && atoi(cmp_env) != 0) {
+            mmq_compare_done = 1;
+            void *d_ref = NULL;
+            void *d_scalar = NULL;
+            size_t out_bytes = (size_t)M * (size_t)n_rows * sizeof(float);
+            if (hipMalloc(&d_ref, out_bytes) == hipSuccess &&
+                hipMalloc(&d_scalar, out_bytes) == hipSuccess) {
+                void *scalar_dst = d_scalar;
+                scalar = 1; mw[0] = &scalar_dst; mw[9] = &term0; mw[11] = &fused;
+                LAUNCH(r->fn_gemm_iq2_xs_mmq_wmma,
+                       (n_rows + 127) / 128, (M + 127) / 128,
+                       1, 256, 1, 1, 0, r->stream, mw);
+                mw[9] = &term1;
+                LAUNCH(r->fn_gemm_iq2_xs_mmq_wmma,
+                       (n_rows + 127) / 128, (M + 127) / 128,
+                       1, 256, 1, 1, 0, r->stream, mw);
+                scalar = 0; mw[0] = &dst;
+                void *da[] = { &d_ref, &mat, &r->d_act_q8_batch,
+                               &r->d_act_scale_batch,
+                               &r->d_act_q8_batch_b,
+                               &r->d_act_scale_batch_b,
+                               &n_rows, &n_cols, &M };
+                LAUNCH(r->fn_matvec_iq2_xs_dp4a2_batch,
+                       (n_rows + 7) / 8, M, 1, 256, 1, 1, 0, r->stream, da);
+                if (hipStreamSynchronize(r->stream) == hipSuccess) {
+                    float *h_ref = (float *)malloc(out_bytes);
+                    float *h_mmq = (float *)malloc(out_bytes);
+                    float *h_scalar = (float *)malloc(out_bytes);
+                    if (h_ref && h_mmq &&
+                        h_scalar &&
+                        hipMemcpy(h_ref, d_ref, out_bytes,
+                                  hipMemcpyDeviceToHost) == hipSuccess &&
+                        hipMemcpy(h_mmq, dst, out_bytes,
+                                  hipMemcpyDeviceToHost) == hipSuccess &&
+                        hipMemcpy(h_scalar, d_scalar, out_bytes,
+                                  hipMemcpyDeviceToHost) == hipSuccess) {
+                        double sum2 = 0.0, ref2 = 0.0, max_abs = 0.0;
+                        float max_ref = 0.0f;
+                        size_t max_at = 0;
+                        for (size_t i = 0; i < (size_t)M * (size_t)n_rows; ++i) {
+                            double d = (double)h_mmq[i] - (double)h_ref[i];
+                            double a = fabs(d);
+                            sum2 += d * d; ref2 += (double)h_ref[i] * h_ref[i];
+                            if (a > max_abs) { max_abs = a; max_at = i; }
+                            if (fabsf(h_ref[i]) > max_ref) max_ref = fabsf(h_ref[i]);
+                        }
+                        double scalar_sum2 = 0.0, scalar_ref2 = 0.0;
+                        int scalar_rows = n_rows < 128 ? n_rows : 128;
+                        for (int t = 0; t < 2 && t < M; ++t)
+                            for (int j = 0; j < scalar_rows; ++j) {
+                                size_t at = (size_t)t * (size_t)n_rows + (size_t)j;
+                                double d = (double)h_scalar[at] - (double)h_ref[at];
+                                scalar_sum2 += d*d;
+                                scalar_ref2 += (double)h_ref[at]*h_ref[at];
+                            }
+                        fprintf(stderr, "hip_llm: IQ2_XS MMQ compare n=%d M=%d "
+                                "max_abs=%.8g at=%zu mmq=%.8g ref=%.8g "
+                                "rms_rel=%.8g scalar_rel=%.8g ref_max=%.8g "
+                                "first=[%.6g/%.6g/%.6g %.6g/%.6g/%.6g "
+                                "%.6g/%.6g/%.6g %.6g/%.6g/%.6g]\n",
+                                n_rows, M, max_abs, max_at,
+                                h_mmq[max_at], h_ref[max_at],
+                                sqrt(sum2 / (double)((size_t)M * (size_t)n_rows)) /
+                                    fmax((double)max_ref, 1e-12),
+                                sqrt(scalar_sum2 / (double)(2 * scalar_rows)) /
+                                    sqrt(scalar_ref2 / (double)(2 * scalar_rows)), max_ref,
+                                h_mmq[0], h_ref[0], h_scalar[0],
+                                h_mmq[1], h_ref[1], h_scalar[1],
+                                h_mmq[2], h_ref[2], h_scalar[2],
+                                h_mmq[3], h_ref[3], h_scalar[3]);
+                    }
+                    free(h_ref); free(h_mmq); free(h_scalar);
+                }
+                hipFree(d_ref);
+                hipFree(d_scalar);
+            } else {
+                if (d_ref) hipFree(d_ref);
+                if (d_scalar) hipFree(d_scalar);
+            }
+        }
+        return;
+    }
+    const char *dp_env = getenv("LLM_QWEN35_NATIVE_IQ2_DP4A_BATCH");
+    if (dp_env && atoi(dp_env) != 0 && M > 0 && M <= 512 && n_cols <= 17408 &&
+        (n_cols % 256) == 0) {
+        launch_quantize_q8x2_batch_cached(r, x, n_cols, M, x_stride);
+        void *da[] = { &dst, &mat, &r->d_act_q8_batch, &r->d_act_scale_batch,
+                       &r->d_act_q8_batch_b, &r->d_act_scale_batch_b,
+                       &n_rows, &n_cols, &M };
+        const char *reuse_dp = getenv("LLM_QWEN35_NATIVE_IQ2XS_DP4A_REUSE4");
+        const char *tile_env = getenv("LLM_QWEN35_NATIVE_IQ2_DP4A_TILE");
+        int tile_enable = tile_env && atoi(tile_env) != 0;
+        if (!reuse_dp && !tile_env) tile_enable = 1;
+        if (tile_enable) {
+            LAUNCH(r->fn_matvec_iq2_xs_dp4a2_batch_tile,
+                   (n_rows + 3) / 4, (M + 1) / 2, 1, 256,
+                   1, 1, 0, r->stream, da);
+            return;
+        }
+        /* The reuse-4 reduction is numerically identical for IQ2_XS and is
+         * faster at the ubatch sizes used by Qwen3.8.  Keep an explicit 0
+         * escape hatch for regression comparisons. */
+        if (!reuse_dp || atoi(reuse_dp) != 0) {
+            LAUNCH(r->fn_matvec_iq2_xs_dp4a2_batch_reuse4,
+                   (n_rows + 7) / 8, (M + 3) / 4, 1,
+                   256, 1, 1, 0, r->stream, da);
+            return;
+        }
+        if (tile_env && atoi(tile_env) != 0) {
+            LAUNCH(r->fn_matvec_iq2_xs_dp4a2_batch_tile,
+                   (n_rows + 3) / 4, (M + 1) / 2, 1, 256,
+                   1, 1, 0, r->stream, da);
+            return;
+        }
+        LAUNCH(r->fn_matvec_iq2_xs_dp4a2_batch,
+               (n_rows + 7) / 8, M, 1, 256,
+               1, 1, 0, r->stream, da);
+        return;
+    }
+    const char *tile4_env = getenv("LLM_QWEN35_NATIVE_IQ2_TILE4");
+    if (tile4_env && atoi(tile4_env) != 0) {
+        LAUNCH(r->fn_matvec_iq2_xs_batch_tile4_f32,
+               (n_rows + 3) / 4, (M + 3) / 4, 1, 256,
+               1, 1, 0, r->stream, args);
+        return;
+    }
+    const char *tile_env = getenv("LLM_QWEN35_NATIVE_IQ2_TILE");
+    int tile = tile_env && atoi(tile_env) != 0;
+    hipFunction_t fn = tile ? r->fn_matvec_iq2_xs_batch_tile_f32 :
+                              r->fn_matvec_iq2_xs_batch_f32;
+    LAUNCH(fn, tile ? (n_rows + 3) / 4 : (n_rows + 7) / 8,
+           tile ? (M + 1) / 2 : M, 1,
+           256, 1, 1, 0, r->stream, args);
+}
+static inline void launch_matvec_iq2_xxs_batch(hip_llm_runner *r, void *dst,
+        void *mat, void *x, int M, int n_rows, int n_cols, int x_stride) {
+    void *args[] = { &dst, &mat, &x, &n_rows, &n_cols, &M, &x_stride };
+    const char *q81_batch = getenv("LLM_QWEN35_Q81_BATCH");
+    const char *q81_iq2xxs = getenv("LLM_QWEN35_IQ2XXS_Q81_FFN");
+    if (((q81_batch && atoi(q81_batch) != 0) ||
+         (q81_iq2xxs && atoi(q81_iq2xxs) != 0)) &&
+        x_stride == n_cols && M > 0 &&
+        M <= r->batch_max && (n_cols % 256) == 0) {
+        launch_quantize_q81_batch_cached(r, x, n_cols, M, x_stride);
+        launch_matvec_iq_q81_batch(r, r->fn_matvec_iq2_xxs_q81_batch,
+                                   dst, mat, n_rows, n_cols, M);
+        return;
+    }
+    const char *bf16_env = getenv("LLM_QWEN35_IQ2XXS_BF16_GEMM");
+    const char *max_layer_env = getenv("LLM_QWEN35_IQ2_BF16_MAX_LAYER");
+    int max_layer = (max_layer_env && *max_layer_env) ? atoi(max_layer_env) : INT_MAX;
+    if (bf16_env && atoi(bf16_env) != 0 && M >= 32 && M <= r->batch_max &&
+        n_cols <= r->ssm_d_inner && (n_cols % 256) == 0 &&
+        r->qwen35_batch_layer <= max_layer) {
+        void *wb = get_bf16_weight(r, mat, NULL, GGML_TYPE_IQ2_XXS,
+                                   n_rows, n_cols);
+        if (wb) {
+            launch_pack_bf16_from_f32(r, r->d_silu_batch_bf16, x, M * n_cols);
+            if (gemm_run_bf16_w(r, dst, wb, r->d_silu_batch_bf16,
+                                M, n_rows, n_cols, r->stream) == 0)
+                return;
+        }
+    }
+    const char *mmq_wmma_env = getenv("LLM_QWEN35_IQ2XXS_MMQ_WMMA");
+    if ((!mmq_wmma_env || atoi(mmq_wmma_env) != 0) && x_stride == n_cols && M >= 128 &&
+        n_rows >= 128 && (n_cols % 256) == 0) {
+        launch_quantize_q8x2_batch_cached(r, x, n_cols, M, x_stride);
+        int term0 = 0, term1 = 1, fused = 0;
+        void *wa[] = { &dst, &mat, &r->d_act_q8_batch,
+                       &r->d_act_scale_batch, &r->d_act_q8_batch_b,
+                       &r->d_act_scale_batch_b, &n_rows, &n_cols, &M,
+                       &term0, &fused };
+        const char *fused_env = getenv("LLM_QWEN35_IQ2XXS_MMQ_FUSED");
+        if (fused_env && atoi(fused_env) != 0) {
+            fused = 1;
+            LAUNCH(r->fn_gemm_iq2_xxs_mmq_wmma, (n_rows + 127) / 128,
+                   (M + 127) / 128, 1, 256, 1, 1, 0, r->stream, wa);
+            return;
+        }
+        LAUNCH(r->fn_gemm_iq2_xxs_mmq_wmma, (n_rows + 127) / 128,
+               (M + 127) / 128, 1, 256, 1, 1, 0, r->stream, wa);
+        const char *single_env = getenv("LLM_QWEN35_IQ2_MMQ_SINGLE");
+        if (single_env && atoi(single_env) != 0)
+            return;
+        wa[9] = &term1;
+        LAUNCH(r->fn_gemm_iq2_xxs_mmq_wmma, (n_rows + 127) / 128,
+               (M + 127) / 128, 1, 256, 1, 1, 0, r->stream, wa);
+        static int iq2xxs_mmq_compare_done = 0;
+        const char *cmp_env = getenv("LLM_QWEN35_IQ2XXS_MMQ_COMPARE");
+        if (!iq2xxs_mmq_compare_done && cmp_env && atoi(cmp_env) != 0) {
+            iq2xxs_mmq_compare_done = 1;
+            size_t bytes = (size_t)M * (size_t)n_rows * sizeof(float);
+            void *ref = NULL;
+            if (hipMalloc(&ref, bytes) == hipSuccess) {
+                void *da[] = { &ref, &mat, &r->d_act_q8_batch,
+                               &r->d_act_scale_batch, &r->d_act_q8_batch_b,
+                               &r->d_act_scale_batch_b, &n_rows, &n_cols, &M };
+                LAUNCH(r->fn_matvec_iq2_xxs_dp4a2_batch,
+                       (n_rows + 7) / 8, M, 1, 256, 1, 1, 0, r->stream, da);
+                if (hipStreamSynchronize(r->stream) == hipSuccess) {
+                    float *hm = (float *)malloc(bytes), *hr = (float *)malloc(bytes);
+                    if (hm && hr && hipMemcpy(hm, dst, bytes, hipMemcpyDeviceToHost) == hipSuccess &&
+                        hipMemcpy(hr, ref, bytes, hipMemcpyDeviceToHost) == hipSuccess) {
+                        double e2 = 0.0, r2 = 0.0; float ma = 0.0f;
+                        for (size_t i = 0; i < (size_t)M * (size_t)n_rows; ++i) {
+                            float d = hm[i] - hr[i]; e2 += (double)d*d; r2 += (double)hr[i]*hr[i];
+                            if (fabsf(d) > ma) ma = fabsf(d);
+                        }
+                        fprintf(stderr, "hip_llm: IQ2_XXS MMQ compare M=%d N=%d rel_l2=%.8g max_abs=%.8g first=[%.7g/%.7g %.7g/%.7g]\n",
+                                M, n_rows, sqrt(e2 / fmax(r2, 1e-30)), ma,
+                                hm[0], hr[0], hm[1], hr[1]);
+                    }
+                    free(hm); free(hr);
+                }
+                hipFree(ref);
+            }
+        }
+        return;
+    }
+    const char *q8_wmma = getenv("LLM_QWEN35_IQ2_Q8_WMMA");
+    if (q8_wmma && atoi(q8_wmma) != 0 && x_stride == n_cols && M >= 32 &&
+        (n_cols % 256) == 0) {
+        launch_quantize_q8x2_batch_cached(r, x, n_cols, M, x_stride);
+        const char *exact_env = getenv("LLM_QWEN35_IQ2_Q8_WMMA_EXACT");
+        if (exact_env && atoi(exact_env) != 0) {
+            int term0 = 0, term1 = 1;
+            void *we[] = { &dst, &mat, &r->d_act_q8_batch,
+                           &r->d_act_scale_batch, &r->d_act_q8_batch_b,
+                           &r->d_act_scale_batch_b, &n_rows, &n_cols, &M,
+                           &term0 };
+            LAUNCH(r->fn_gemm_iq2_xxs_q8_wmma, (n_rows + 127) / 128,
+                   (M + 127) / 128, 1, 256, 1, 1, 0, r->stream, we);
+            we[9] = &term1;
+            LAUNCH(r->fn_gemm_iq2_xxs_q8_wmma, (n_rows + 127) / 128,
+                   (M + 127) / 128, 1, 256, 1, 1, 0, r->stream, we);
+            return;
+        }
+        int term = 0;
+        void *wa[] = { &dst, &mat, &r->d_act_q8_batch,
+                       &r->d_act_scale_batch, &r->d_act_q8_batch_b,
+                       &r->d_act_scale_batch_b, &n_rows, &n_cols, &M, &term };
+        LAUNCH(r->fn_gemm_iq2_xxs_q8_wmma, (n_rows + 127) / 128,
+               (M + 127) / 128, 1, 256, 1, 1, 0, r->stream, wa);
+        return;
+    }
+    const char *mmq_env = getenv("LLM_QWEN35_NATIVE_IQ2_MMQ128");
+    if (mmq_env && atoi(mmq_env) != 0 && x_stride == n_cols &&
+        M >= 128 && n_rows >= 1024 && (n_cols % 256) == 0) {
+        launch_quantize_q8x2_batch_cached(r, x, n_cols, M, x_stride);
+        void *ma[] = { &dst, &mat, &r->d_act_q8_batch, &r->d_act_scale_batch,
+                       &r->d_act_q8_batch_b, &r->d_act_scale_batch_b,
+                       &n_rows, &n_cols, &M };
+        LAUNCH(r->fn_matmul_iq2_xxs_mmq128, (n_rows + 127) / 128,
+               (M + 127) / 128, 1, 256, 1, 1, 0, r->stream, ma);
+        return;
+    }
+    const char *wmma_env = getenv("LLM_QWEN35_IQ2_WMMA_FUSED");
+    if (wmma_env && atoi(wmma_env) != 0 && x_stride == n_cols &&
+        M >= 16 && n_rows >= 16 && (n_cols % 32) == 0) {
+        void *wa[] = { &dst, &mat, &x, &n_rows, &n_cols, &M };
+        LAUNCH(r->fn_gemm_iq2_xxs_wmma, (n_rows + 127) / 128,
+               (M + 127) / 128, 1, 256, 1, 1, 0, r->stream, wa);
+        return;
+    }
+    const char *dp_env = getenv("LLM_QWEN35_NATIVE_IQ2_DP4A_BATCH");
+    if (dp_env && atoi(dp_env) != 0 && M > 0 && M <= 512 && (n_cols % 256) == 0) {
+        launch_quantize_q8x2_batch_cached(r, x, n_cols, M, x_stride);
+        void *da[] = { &dst, &mat, &r->d_act_q8_batch, &r->d_act_scale_batch,
+                       &r->d_act_q8_batch_b, &r->d_act_scale_batch_b,
+                       &n_rows, &n_cols, &M };
+        const char *reuse_dp = getenv("LLM_QWEN35_NATIVE_IQ2_DP4A_REUSE4");
+        /* IQ2_XXS reuse4 preserves the baseline reduction order and was
+         * parity-checked on Qwen3.8 IQ2_XS at M=128 and streamed 2K. Keep it
+         * on by default; setting the knob to 0 restores the per-token tile. */
+        if (!reuse_dp || atoi(reuse_dp) != 0) {
+            LAUNCH(r->fn_matvec_iq2_xxs_dp4a2_batch_reuse4,
+                   (n_rows + 7) / 8, (M + 3) / 4, 1,
+                   256, 1, 1, 0, r->stream, da);
+            return;
+        }
+        LAUNCH(r->fn_matvec_iq2_xxs_dp4a2_batch, (n_rows + 7) / 8, M, 1,
+               256, 1, 1, 0, r->stream, da);
+        return;
+    }
+    const char *reuse_env = getenv("LLM_QWEN35_NATIVE_IQ2_REUSE4");
+    if (reuse_env && atoi(reuse_env) != 0 && M > 0 && M <= 512) {
+        LAUNCH(r->fn_matvec_iq2_xxs_batch_reuse4_f32, (n_rows + 7) / 8,
+               (M + 3) / 4, 1, 256, 1, 1, 0, r->stream, args);
+        return;
+    }
+    LAUNCH(r->fn_matvec_iq2_xxs_batch_f32, (n_rows + 7) / 8, M, 1,
+           256, 1, 1, 0, r->stream, args);
+}
+static inline void launch_matvec_iq4_xs_batch(hip_llm_runner *r, void *dst,
+        void *mat, void *x, int M, int n_rows, int n_cols, int x_stride) {
+    void *args[] = { &dst, &mat, &x, &n_rows, &n_cols, &M, &x_stride };
+    const char *q81_batch = getenv("LLM_QWEN35_Q81_BATCH");
+    const char *q81_iq4 = getenv("LLM_QWEN35_IQ4XS_Q81_FFN");
+    if (((q81_batch && atoi(q81_batch) != 0) ||
+         (q81_iq4 && atoi(q81_iq4) != 0)) &&
+        x_stride == n_cols && M > 0 &&
+        M <= r->batch_max && (n_cols % 256) == 0) {
+        launch_quantize_q81_batch_cached(r, x, n_cols, M, x_stride);
+        launch_matvec_iq_q81_batch(r, r->fn_matvec_iq4_xs_q81_batch,
+                                   dst, mat, n_rows, n_cols, M);
+        return;
+    }
+    const char *reuse_env = getenv("LLM_QWEN35_NATIVE_IQ4_REUSE4");
+    if (reuse_env && atoi(reuse_env) != 0 && M > 0 && M <= 512) {
+        LAUNCH(r->fn_matvec_iq4_xs_batch_reuse4_f32, (n_rows + 7) / 8,
+               (M + 3) / 4, 1, 256, 1, 1, 0, r->stream, args);
+        return;
+    }
+    const char *dp_env = getenv("LLM_QWEN35_NATIVE_IQ4_DP4A_BATCH");
+    if (dp_env && atoi(dp_env) != 0 && M > 0 && M <= 512 &&
+        (n_cols % 256) == 0) {
+        launch_quantize_q8x2_batch_cached(r, x, n_cols, M, x_stride);
+        void *da[] = { &dst, &mat, &r->d_act_q8_batch, &r->d_act_scale_batch,
+                       &r->d_act_q8_batch_b, &r->d_act_scale_batch_b,
+                       &n_rows, &n_cols, &M };
+        const char *reuse_env = getenv("LLM_QWEN35_NATIVE_IQ4_DP4A_REUSE4");
+        if (!reuse_env || atoi(reuse_env) != 0) {
+            LAUNCH(r->fn_matvec_iq4_xs_dp4a2_batch_reuse4,
+                   (n_rows + 7) / 8, (M + 3) / 4, 1,
+                   256, 1, 1, 0, r->stream, da);
+            return;
+        }
+        LAUNCH(r->fn_matvec_iq4_xs_dp4a2_batch, (n_rows + 7) / 8, M, 1,
+               256, 1, 1, 0, r->stream, da);
+        return;
+    }
+    LAUNCH(r->fn_matvec_iq4_xs_batch_f32, (n_rows + 7) / 8, M, 1,
+           256, 1, 1, 0, r->stream, args);
+}
+static inline void launch_matvec_iq3_s_batch(hip_llm_runner *r, void *dst,
+        void *mat, void *x, int M, int n_rows, int n_cols, int x_stride) {
+    void *args[] = { &dst, &mat, &x, &n_rows, &n_cols, &M, &x_stride };
+    const char *q81_batch = getenv("LLM_QWEN35_Q81_BATCH");
+    const char *q81_iq3s = getenv("LLM_QWEN35_IQ3S_Q81_FFN");
+    if (((q81_batch && atoi(q81_batch) != 0) ||
+         (q81_iq3s && atoi(q81_iq3s) != 0)) &&
+        x_stride == n_cols && M > 0 &&
+        M <= r->batch_max && (n_cols % 256) == 0) {
+        launch_quantize_q81_batch_cached(r, x, n_cols, M, x_stride);
+        launch_matvec_iq_q81_batch(r, r->fn_matvec_iq3_s_q81_batch,
+                                   dst, mat, n_rows, n_cols, M);
+        return;
+    }
+    const char *wmma_env = getenv("LLM_QWEN35_IQ3_Q8_WMMA");
+    if (wmma_env && atoi(wmma_env) != 0 && x_stride == n_cols && M >= 32 &&
+        (n_cols % 256) == 0) {
+        launch_quantize_q8x2_batch_cached(r, x, n_cols, M, x_stride);
+        void *wa[] = { &dst, &mat, &r->d_act_q8_batch,
+                       &r->d_act_scale_batch, &n_rows, &n_cols, &M };
+        LAUNCH(r->fn_gemm_iq3_s_q8_wmma, (n_rows + 127) / 128,
+               (M + 127) / 128, 1, 256, 1, 1, 0, r->stream, wa);
+        return;
+    }
+    const char *dp_env = getenv("LLM_QWEN35_NATIVE_IQ3_DP4A_BATCH");
+    if (dp_env && atoi(dp_env) != 0 && M > 0 && M <= 512 &&
+        (n_cols % 256) == 0) {
+        launch_quantize_q8x2_batch_cached(r, x, n_cols, M, x_stride);
+        void *da[] = { &dst, &mat, &r->d_act_q8_batch, &r->d_act_scale_batch,
+                       &r->d_act_q8_batch_b, &r->d_act_scale_batch_b,
+                       &n_rows, &n_cols, &M };
+        const char *reuse_env = getenv("LLM_QWEN35_NATIVE_IQ3_DP4A_REUSE4");
+        if (!reuse_env || atoi(reuse_env) != 0) {
+            LAUNCH(r->fn_matvec_iq3_s_dp4a2_batch_reuse4,
+                   (n_rows + 7) / 8, (M + 3) / 4, 1,
+                   256, 1, 1, 0, r->stream, da);
+            return;
+        }
+        LAUNCH(r->fn_matvec_iq3_s_dp4a2_batch, (n_rows + 7) / 8, M, 1,
+               256, 1, 1, 0, r->stream, da);
+        return;
+    }
+    LAUNCH(r->fn_matvec_iq3_s_batch_f32, (n_rows + 7) / 8, M, 1,
+           256, 1, 1, 0, r->stream, args);
+}
+static inline void launch_matvec_iq2_s_batch(hip_llm_runner *r, void *dst,
+        void *mat, void *x, int M, int n_rows, int n_cols, int x_stride) {
+    void *args[] = { &dst, &mat, &x, &n_rows, &n_cols, &M, &x_stride };
+    const char *q81_batch = getenv("LLM_QWEN35_Q81_BATCH");
+    if (q81_batch && atoi(q81_batch) != 0 && x_stride == n_cols && M > 0 &&
+        M <= r->batch_max && (n_cols % 256) == 0) {
+        launch_quantize_q81_batch_cached(r, x, n_cols, M, x_stride);
+        launch_matvec_iq_q81_batch(r, r->fn_matvec_iq2_s_q81_batch,
+                                   dst, mat, n_rows, n_cols, M);
+        return;
+    }
+    const char *bf16_env = getenv("LLM_QWEN35_IQ2S_BF16_GEMM");
+    const char *max_layer_env = getenv("LLM_QWEN35_IQ2_BF16_MAX_LAYER");
+    int max_layer = (max_layer_env && *max_layer_env) ? atoi(max_layer_env) : INT_MAX;
+    if (bf16_env && atoi(bf16_env) != 0 && M >= 32 && M <= r->batch_max &&
+        n_cols <= r->ssm_d_inner && (n_cols % 256) == 0 &&
+        r->qwen35_batch_layer <= max_layer) {
+        void *wb = get_bf16_weight(r, mat, NULL, GGML_TYPE_IQ2_S,
+                                   n_rows, n_cols);
+        if (wb) {
+            launch_pack_bf16_from_f32(r, r->d_silu_batch_bf16, x, M * n_cols);
+            if (gemm_run_bf16_w(r, dst, wb, r->d_silu_batch_bf16,
+                                M, n_rows, n_cols, r->stream) == 0)
+                return;
+        }
+    }
+    const char *mmq_env = getenv("LLM_QWEN35_IQ2S_MMQ_WMMA");
+    if ((!mmq_env || atoi(mmq_env) != 0) && x_stride == n_cols && M >= 128 &&
+        n_rows >= 128 && (n_cols % 256) == 0) {
+        launch_quantize_q8x2_batch_cached(r, x, n_cols, M, x_stride);
+        int term0 = 0, term1 = 1, fused = 0;
+        void *wa[] = { &dst, &mat, &r->d_act_q8_batch,
+                       &r->d_act_scale_batch, &r->d_act_q8_batch_b,
+                       &r->d_act_scale_batch_b, &n_rows, &n_cols, &M,
+                       &term0, &fused };
+        const char *fused_env = getenv("LLM_QWEN35_IQ2S_MMQ_FUSED");
+        if (fused_env && atoi(fused_env) != 0) {
+            fused = 1;
+            LAUNCH(r->fn_gemm_iq2_s_mmq_wmma, (n_rows + 127) / 128,
+                   (M + 127) / 128, 1, 256, 1, 1, 0, r->stream, wa);
+            return;
+        }
+        LAUNCH(r->fn_gemm_iq2_s_mmq_wmma, (n_rows + 127) / 128,
+               (M + 127) / 128, 1, 256, 1, 1, 0, r->stream, wa);
+        const char *single_env = getenv("LLM_QWEN35_IQ2_MMQ_SINGLE");
+        if (single_env && atoi(single_env) != 0)
+            return;
+        wa[9] = &term1;
+        LAUNCH(r->fn_gemm_iq2_s_mmq_wmma, (n_rows + 127) / 128,
+               (M + 127) / 128, 1, 256, 1, 1, 0, r->stream, wa);
+        static int iq2s_mmq_compare_done = 0;
+        const char *cmp_env = getenv("LLM_QWEN35_IQ2S_MMQ_COMPARE");
+        if (!iq2s_mmq_compare_done && cmp_env && atoi(cmp_env) != 0) {
+            iq2s_mmq_compare_done = 1;
+            size_t bytes = (size_t)M * (size_t)n_rows * sizeof(float);
+            void *ref = NULL;
+            if (hipMalloc(&ref, bytes) == hipSuccess) {
+                void *da[] = { &ref, &mat, &r->d_act_q8_batch,
+                               &r->d_act_scale_batch, &r->d_act_q8_batch_b,
+                               &r->d_act_scale_batch_b, &n_rows, &n_cols, &M };
+                LAUNCH(r->fn_matvec_iq2_s_dp4a2_batch,
+                       (n_rows + 7) / 8, M, 1, 256, 1, 1, 0, r->stream, da);
+                if (hipStreamSynchronize(r->stream) == hipSuccess) {
+                    float *hm = (float *)malloc(bytes), *hr = (float *)malloc(bytes);
+                    if (hm && hr && hipMemcpy(hm, dst, bytes, hipMemcpyDeviceToHost) == hipSuccess &&
+                        hipMemcpy(hr, ref, bytes, hipMemcpyDeviceToHost) == hipSuccess) {
+                        double e2 = 0.0, r2 = 0.0; float ma = 0.0f;
+                        for (size_t i = 0; i < (size_t)M * (size_t)n_rows; ++i) {
+                            float d = hm[i] - hr[i]; e2 += (double)d*d; r2 += (double)hr[i]*hr[i];
+                            if (fabsf(d) > ma) ma = fabsf(d);
+                        }
+                        fprintf(stderr, "hip_llm: IQ2_S MMQ compare M=%d N=%d rel_l2=%.8g max_abs=%.8g first=[%.7g/%.7g %.7g/%.7g]\n",
+                                M, n_rows, sqrt(e2 / fmax(r2, 1e-30)), ma,
+                                hm[0], hr[0], hm[1], hr[1]);
+                    }
+                    free(hm); free(hr);
+                }
+                hipFree(ref);
+            }
+        }
+        return;
+    }
+    const char *dp_env = getenv("LLM_QWEN35_NATIVE_IQ2_DP4A_BATCH");
+    if (dp_env && atoi(dp_env) != 0 && M > 0 && M <= 512 && (n_cols % 256) == 0) {
+        launch_quantize_q8x2_batch_cached(r, x, n_cols, M, x_stride);
+        void *da[] = { &dst, &mat, &r->d_act_q8_batch, &r->d_act_scale_batch,
+                       &r->d_act_q8_batch_b, &r->d_act_scale_batch_b,
+                       &n_rows, &n_cols, &M };
+        const char *reuse_env = getenv("LLM_QWEN35_NATIVE_IQ2S_DP4A_REUSE4");
+        if (!reuse_env || atoi(reuse_env) != 0) {
+            LAUNCH(r->fn_matvec_iq2_s_dp4a2_batch_reuse4,
+                   (n_rows + 7) / 8, (M + 3) / 4, 1,
+                   256, 1, 1, 0, r->stream, da);
+            return;
+        }
+        LAUNCH(r->fn_matvec_iq2_s_dp4a2_batch, (n_rows + 7) / 8, M, 1,
+               256, 1, 1, 0, r->stream, da);
+        return;
+    }
+    LAUNCH(r->fn_matvec_iq2_s_batch_f32, (n_rows + 7) / 8, M, 1,
+           256, 1, 1, 0, r->stream, args);
+}
+static inline void launch_matvec_iq1_s_batch(hip_llm_runner *r, void *dst,
+        void *mat, void *x, int M, int n_rows, int n_cols, int x_stride) {
+    void *args[] = { &dst, &mat, &x, &n_rows, &n_cols, &M, &x_stride };
+    const char *q81_env = getenv("LLM_QWEN35_IQ1S_Q81_BATCH");
+    int q81_allowed = 1;
+    const char *q81_max_layer_env = getenv("LLM_QWEN35_FFN_IQ1_Q81_MAX_LAYER");
+    if (q81_max_layer_env && *q81_max_layer_env) {
+        int max_layer = atoi(q81_max_layer_env);
+        q81_allowed = r->active_layer >= 0 && r->active_layer <= max_layer;
+    }
+    if (q81_allowed && q81_env && atoi(q81_env) != 0 && M > 0 && M <= r->batch_max &&
+        x_stride == n_cols && (n_cols % 256) == 0) {
+        /* Use the single-term Q8_1 contract from llama.cpp's IQ1 MMVQ path.
+         * IQ1's affine grid correction needs the quantized block sum; the
+         * generic Q8x2 DP4A path cannot substitute the second scale for it. */
+        launch_quantize_q81_iq1_batch(r, x, n_cols, M, x_stride);
+        void *qa[] = { &dst, &mat, &r->d_act_q8_batch,
+                       &r->d_act_scale_batch, &r->d_act_scale_batch_b,
+                       &n_rows, &n_cols, &M };
+        LAUNCH(r->fn_matvec_iq1_s_q81_batch, (n_rows + 7) / 8, M, 1,
+               256, 1, 1, 0, r->stream, qa);
+        return;
+    }
+    const char *single_env = getenv("LLM_QWEN35_IQ1_Q8_SINGLE");
+    if (single_env && atoi(single_env) != 0 && M > 0 &&
+        M <= 512 && (n_cols % 256) == 0) {
+        launch_quantize_q8x2_batch_cached(r, x, n_cols, M, x_stride);
+        int fmt = 0;
+        void *wa[] = { &dst, &mat, &r->d_act_q8_batch,
+                       &r->d_act_scale_batch, &n_rows, &n_cols, &M, &fmt };
+        LAUNCH(r->fn_matvec_iq1_q8_single_batch, (n_rows + 7) / 8, (M + 3) / 4, 1,
+               256, 1, 1, 0, r->stream, wa);
+        return;
+    }
+    const char *wmma_env = getenv("LLM_QWEN35_IQ1S_Q8_WMMA");
+    if (wmma_env && atoi(wmma_env) != 0 && x_stride == n_cols && M >= 128 &&
+        n_rows >= 128 && (n_cols % 256) == 0) {
+        launch_quantize_q8x2_batch_cached(r, x, n_cols, M, x_stride);
+        int fmt = 0;
+        void *wa[] = { &dst, &mat, &r->d_act_q8_batch,
+                       &r->d_act_scale_batch, &n_rows, &n_cols, &M, &fmt };
+        LAUNCH(r->fn_gemm_iq1_m_q8_wmma, (n_rows + 127) / 128,
+               (M + 127) / 128, 1, 256, 1, 1, 0, r->stream, wa);
+        return;
+    }
+    const char *dp_env = getenv("LLM_QWEN35_NATIVE_IQ1S_DP4A_BATCH");
+    if (dp_env && atoi(dp_env) != 0 && M > 0 && M <= 512 &&
+        x_stride == n_cols && (n_cols % 256) == 0) {
+        launch_quantize_q8x2_batch_cached(r, x, n_cols, M, x_stride);
+        void *da[] = { &dst, &mat, &r->d_act_q8_batch, &r->d_act_scale_batch,
+                       &r->d_act_q8_batch_b, &r->d_act_scale_batch_b,
+                       &n_rows, &n_cols, &M };
+        const char *reuse_env = getenv("LLM_QWEN35_NATIVE_IQ1S_DP4A_REUSE4");
+        if (!reuse_env || atoi(reuse_env) != 0) {
+            LAUNCH(r->fn_matvec_iq1_s_dp4a2_batch_reuse4,
+                   (n_rows + 7) / 8, (M + 7) / 8, 1,
+                   256, 1, 1, 0, r->stream, da);
+        } else {
+            LAUNCH(r->fn_matvec_iq1_s_dp4a2_batch, (n_rows + 7) / 8, M, 1,
+                   256, 1, 1, 0, r->stream, da);
+        }
+        return;
+    }
+    LAUNCH(r->fn_matvec_iq1_s_batch_f32, (n_rows + 7) / 8, M, 1,
+           256, 1, 1, 0, r->stream, args);
+}
+static inline void launch_matvec_iq1_m_batch(hip_llm_runner *r, void *dst,
+        void *mat, void *x, int M, int n_rows, int n_cols, int x_stride) {
+    void *args[] = { &dst, &mat, &x, &n_rows, &n_cols, &M, &x_stride };
+    const char *q81_env = getenv("LLM_QWEN35_IQ1M_Q81_BATCH");
+    int q81_allowed = 1;
+    const char *q81_max_layer_env = getenv("LLM_QWEN35_FFN_IQ1_Q81_MAX_LAYER");
+    if (q81_max_layer_env && *q81_max_layer_env) {
+        int max_layer = atoi(q81_max_layer_env);
+        q81_allowed = r->active_layer >= 0 && r->active_layer <= max_layer;
+    }
+    if (q81_allowed && q81_env && atoi(q81_env) != 0 && M > 0 && M <= r->batch_max &&
+        x_stride == n_cols && (n_cols % 256) == 0) {
+        launch_quantize_q81_iq1_batch(r, x, n_cols, M, x_stride);
+        void *qa[] = { &dst, &mat, &r->d_act_q8_batch,
+                       &r->d_act_scale_batch, &r->d_act_scale_batch_b,
+                       &n_rows, &n_cols, &M };
+        LAUNCH(r->fn_matvec_iq1_m_q81_batch, (n_rows + 7) / 8, M, 1,
+               256, 1, 1, 0, r->stream, qa);
+        return;
+    }
+    const char *single_env = getenv("LLM_QWEN35_IQ1_Q8_SINGLE");
+    if (single_env && atoi(single_env) != 0 && M > 0 &&
+        M <= 512 && (n_cols % 256) == 0) {
+        launch_quantize_q8x2_batch_cached(r, x, n_cols, M, x_stride);
+        int fmt = 1;
+        void *wa[] = { &dst, &mat, &r->d_act_q8_batch,
+                       &r->d_act_scale_batch, &n_rows, &n_cols, &M, &fmt };
+        LAUNCH(r->fn_matvec_iq1_q8_single_batch, (n_rows + 7) / 8, (M + 3) / 4, 1,
+               256, 1, 1, 0, r->stream, wa);
+        return;
+    }
+    const char *wmma_env = getenv("LLM_QWEN35_IQ1M_Q8_WMMA");
+    if (wmma_env && atoi(wmma_env) != 0 && x_stride == n_cols && M >= 128 &&
+        n_rows >= 128 && (n_cols % 256) == 0) {
+        launch_quantize_q8x2_batch_cached(r, x, n_cols, M, x_stride);
+        int fmt = 1;
+        void *wa[] = { &dst, &mat, &r->d_act_q8_batch,
+                       &r->d_act_scale_batch, &n_rows, &n_cols, &M, &fmt };
+        LAUNCH(r->fn_gemm_iq1_m_q8_wmma, (n_rows + 127) / 128,
+               (M + 127) / 128, 1, 256, 1, 1, 0, r->stream, wa);
+        return;
+    }
+    const char *dp_env = getenv("LLM_QWEN35_NATIVE_IQ1M_DP4A_BATCH");
+    if (dp_env && atoi(dp_env) != 0 && M > 0 && M <= 512 &&
+        (n_cols % 256) == 0) {
+        launch_quantize_q8x2_batch_cached(r, x, n_cols, M, x_stride);
+        void *da[] = { &dst, &mat, &r->d_act_q8_batch, &r->d_act_scale_batch,
+                       &r->d_act_q8_batch_b, &r->d_act_scale_batch_b,
+                       &n_rows, &n_cols, &M };
+        const char *reuse_env = getenv("LLM_QWEN35_NATIVE_IQ1M_DP4A_REUSE4");
+        if (!reuse_env || atoi(reuse_env) != 0) {
+            LAUNCH(r->fn_matvec_iq1_m_dp4a2_batch_reuse4,
+                   (n_rows + 7) / 8, (M + 3) / 4, 1,
+                   256, 1, 1, 0, r->stream, da);
+        } else {
+            LAUNCH(r->fn_matvec_iq1_m_dp4a2_batch, (n_rows + 7) / 8, M, 1,
+                   256, 1, 1, 0, r->stream, da);
+        }
+        return;
+    }
+    LAUNCH(r->fn_matvec_iq1_m_batch_f32, (n_rows + 7) / 8, M, 1,
+           256, 1, 1, 0, r->stream, args);
+}
+static inline void launch_matvec_iq3_xxs_batch(hip_llm_runner *r, void *dst,
+        void *mat, void *x, int M, int n_rows, int n_cols, int x_stride);
+static inline int qwen35_native_batch_type(int type) {
+    if (type == GGML_TYPE_IQ3_XXS) {
+        const char *e = getenv("LLM_QWEN35_NATIVE_IQ3XXS_BATCH");
+        return !e || atoi(e) != 0;
+    }
+    if (type == GGML_TYPE_Q4_K) {
+        const char *e = getenv("LLM_QWEN35_NATIVE_Q4K_BATCH");
+        return !e || atoi(e) != 0;
+    }
+    return type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S ||
+           type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_IQ2_S ||
+           type == GGML_TYPE_IQ1_S || type == GGML_TYPE_IQ1_M;
+}
+static inline int qwen35_native_ffn_type(int type) {
+    if (type == GGML_TYPE_IQ2_XXS) {
+        const char *e = getenv("LLM_QWEN35_NATIVE_IQ2XXS_FFN");
+        return e && atoi(e) != 0;
+    }
+    if (type == GGML_TYPE_IQ2_XS) {
+        const char *e = getenv("LLM_QWEN35_NATIVE_IQ2XS_FFN");
+        return e && atoi(e) != 0;
+    }
+    if (type == GGML_TYPE_IQ1_S || type == GGML_TYPE_IQ1_M) {
+        const char *e = getenv("LLM_QWEN35_NATIVE_IQ1_FFN");
+        return e && atoi(e) != 0;
+    }
+    if (type == GGML_TYPE_IQ2_S) {
+        const char *e = getenv("LLM_QWEN35_NATIVE_IQ2S_FFN");
+        return e && atoi(e) != 0;
+    }
+    if (type == GGML_TYPE_IQ3_S) {
+        const char *e = getenv("LLM_QWEN35_NATIVE_IQ3S_FFN");
+        return e && atoi(e) != 0;
+    }
+    if (type == GGML_TYPE_IQ4_XS) {
+        const char *e = getenv("LLM_QWEN35_NATIVE_IQ4XS_FFN");
+        return e && atoi(e) != 0;
+    }
+    return qwen35_native_batch_type(type);
+}
+static inline void launch_matvec_qwen35_native_batch(hip_llm_runner *r,
+        void *dst, void *mat, void *x, int M, int n_rows, int n_cols,
+        int x_stride, int type) {
+    int profile = 0;
+    const char *profile_env = getenv("LLM_QWEN35_PROFILE_BATCH");
+    if (profile_env && atoi(profile_env) != 0) profile = 1;
+    hipEvent_t profile_start = NULL, profile_stop = NULL;
+    if (profile) {
+        hipEventCreate(&profile_start);
+        hipEventCreate(&profile_stop);
+        hipEventRecord(profile_start, r->stream);
+    }
+    const char *q4k_batch_env = getenv("LLM_QWEN35_NATIVE_Q4K_BATCH");
+    if (type == GGML_TYPE_Q4_K && (!q4k_batch_env || atoi(q4k_batch_env) != 0) &&
+        M > 0 && M <= r->batch_max && (n_cols % 256) == 0) {
+        void *args[] = { &dst, &mat, &x, &n_rows, &n_cols, &M, &x_stride };
+        hipFunction_t fn = M > 4 ? r->fn_matvec_q4_K_batch_reuse8 :
+                                   r->fn_matvec_q4_K_batch_reuse4;
+        int tile = M > 4 ? 8 : 4;
+        LAUNCH(fn, (n_rows + 7) / 8, (M + tile - 1) / tile, 1,
+               256, 1, 1, 0, r->stream, args);
+    } else if (type == GGML_TYPE_IQ2_XXS)
+        launch_matvec_iq2_xxs_batch(r, dst, mat, x, M, n_rows, n_cols, x_stride);
+    else if (type == GGML_TYPE_IQ2_XS)
+        launch_matvec_iq2_xs_batch(r, dst, mat, x, M, n_rows, n_cols, x_stride);
+    else if (type == GGML_TYPE_IQ3_XXS)
+        launch_matvec_iq3_xxs_batch(r, dst, mat, x, M, n_rows, n_cols, x_stride);
+    else if (type == GGML_TYPE_IQ3_S)
+        launch_matvec_iq3_s_batch(r, dst, mat, x, M, n_rows, n_cols, x_stride);
+    else if (type == GGML_TYPE_IQ4_XS)
+        launch_matvec_iq4_xs_batch(r, dst, mat, x, M, n_rows, n_cols, x_stride);
+    else if (type == GGML_TYPE_IQ2_S)
+        launch_matvec_iq2_s_batch(r, dst, mat, x, M, n_rows, n_cols, x_stride);
+    else if (type == GGML_TYPE_IQ1_S)
+        launch_matvec_iq1_s_batch(r, dst, mat, x, M, n_rows, n_cols, x_stride);
+    else
+        launch_matvec_iq1_m_batch(r, dst, mat, x, M, n_rows, n_cols, x_stride);
+    if (profile) {
+        hipEventRecord(profile_stop, r->stream);
+        hipEventSynchronize(profile_stop);
+        float ms = 0.0f;
+        hipEventElapsedTime(&ms, profile_start, profile_stop);
+        fprintf(stderr, "hip_llm: batch-profile type=%d M=%d N=%d K=%d ms=%.3f\n",
+                type, M, n_rows, n_cols, ms);
+        hipEventDestroy(profile_start);
+        hipEventDestroy(profile_stop);
+    }
+}
+static inline void launch_matvec_iq3_xxs(hip_llm_runner *r, void *dst,
+        void *mat, void *x, int n_rows, int n_cols) {
+    if (qwen35_native_q81_ready(r) && r->fn_qwen35_matvec_iq3xxs &&
+        n_cols <= 17408 && n_cols % 256 == 0) {
+        r->q8x2_reuse_valid = 0;
+        r->iq1_q8_valid = 0;
+        launch_native_q81(r, x, n_cols);
+        void *a[] = { &dst, &mat, &r->d_native_q81, &r->d_native_scale, &n_rows, &n_cols };
+        /* The native kernel stages its 1 KiB codebook once per block.  Four
+         * waves amortize that load without the occupancy loss seen at 1024. */
+        int threads = 256;
+        int rpb = threads/32;
+        LAUNCH(r->fn_qwen35_matvec_iq3xxs, (n_rows+rpb-1)/rpb, 1, 1, threads, 1, 1, 0, r->stream, a);
+        return;
+    }
+    void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
+    const char *scalar_env = getenv("LLM_IQ3_XXS_SCALAR_REF");
+    if (scalar_env && atoi(scalar_env) != 0) {
+        LAUNCH(r->fn_matvec_iq3_xxs_scalar_f32, (n_rows + 255) / 256, 1, 1,
+               256, 1, 1, 0, r->stream, args);
+        return;
+    }
+    int rows_per_block = r->mw_threads / 32;
+    const char *q81_env = getenv("LLM_IQ3_XXS_Q81_SCALAR");
+    if (q81_env && atoi(q81_env) != 0 && n_cols <= 17408 && (n_cols % 256) == 0) {
+        /* llama.cpp's HIP MMQ contract quantizes the F32 activation to one
+         * Q8_1 term before the IQ3_XXS dot. Reuse the audited batch kernel
+         * with M=1 so scalar decode and batched prefill share arithmetic. */
+        int one = 1, stride = n_cols;
+        launch_quantize_q81_batch_cached(r, x, n_cols, one, stride);
+        void *qargs[] = { &dst, &mat, &r->d_act_q8_batch,
+                          &r->d_act_scale_batch, &n_rows, &n_cols, &one };
+        LAUNCH((getenv("LLM_IQ3_XXS_Q81_MMQ") && atoi(getenv("LLM_IQ3_XXS_Q81_MMQ")) != 0) ?
+               r->fn_matvec_iq3_xxs_mmq_scales : r->fn_matvec_iq3_xxs_q81_batch,
+               (n_rows + 7) / 8, 1, 1,
+               256, 1, 1, 0, r->stream, qargs);
+        static int q81_compare_done;
+        const char *cmp_env = getenv("LLM_IQ3_XXS_Q81_COMPARE");
+        if (!q81_compare_done && cmp_env && atoi(cmp_env) != 0) {
+            q81_compare_done = 1;
+            size_t bytes = (size_t)n_rows * sizeof(float);
+            void *d_ref = NULL;
+            float *h_q81 = NULL, *h_ref = NULL;
+            if (hipMalloc(&d_ref, bytes) == hipSuccess) {
+                void *fargs[] = { &d_ref, &mat, &x, &n_rows, &n_cols };
+                int rows_per_block_ref = r->mw_threads / 32;
+                LAUNCH(r->fn_matvec_iq3_xxs_f32,
+                       (n_rows + rows_per_block_ref - 1) / rows_per_block_ref,
+                       1, 1, (unsigned)r->mw_threads, 1, 1, 0, r->stream, fargs);
+                if (hipStreamSynchronize(r->stream) == hipSuccess) {
+                    h_q81 = (float *)malloc(bytes);
+                    h_ref = (float *)malloc(bytes);
+                    if (h_q81 && h_ref &&
+                        hipMemcpy(h_q81, dst, bytes, hipMemcpyDeviceToHost) == hipSuccess &&
+                        hipMemcpy(h_ref, d_ref, bytes, hipMemcpyDeviceToHost) == hipSuccess) {
+                        double e2 = 0.0, r2 = 0.0, max_abs = 0.0;
+                        for (int i = 0; i < n_rows; ++i) {
+                            double d = (double)h_q81[i] - (double)h_ref[i];
+                            double a = fabs(d);
+                            e2 += d * d; r2 += (double)h_ref[i] * h_ref[i];
+                            if (a > max_abs) max_abs = a;
+                        }
+                        fprintf(stderr, "hip_llm: IQ3 Q8_1 projection A/B N=%d K=%d "
+                                "rel_l2=%.9g max_abs=%.9g\n", n_rows, n_cols,
+                                r2 > 0.0 ? sqrt(e2 / r2) : 0.0, max_abs);
+                    }
+                }
+            }
+            free(h_q81); free(h_ref);
+            if (d_ref) hipFree(d_ref);
+        }
+        return;
+    }
+    const char *experimental = getenv("LLM_EXPERIMENTAL_IQ3XXS_DP4A2");
+    if (r->decode_dp4a2 && experimental && atoi(experimental) != 0 &&
+        n_cols <= 17408 && (n_cols % 256) == 0) {
+        launch_quantize_q8x2(r, x, n_cols);
+        void *a2[] = { &dst, &mat, &r->d_act_q8, &r->d_act_scale,
+                       &r->d_act_q8_b, &r->d_act_scale_b, &n_rows, &n_cols };
+        LAUNCH(r->fn_matvec_iq3_xxs_dp4a2,
+               (n_rows + rows_per_block - 1) / rows_per_block, 1, 1,
+               (unsigned)r->mw_threads, 1, 1, 0, r->stream, a2);
+    } else {
+        LAUNCH(r->fn_matvec_iq3_xxs_f32,
+               (n_rows + rows_per_block - 1) / rows_per_block, 1, 1,
+               (unsigned)r->mw_threads, 1, 1, 0, r->stream, args);
+    }
+}
+
+/* Opt-in native IQ3_XXS Q/K/V fusion for one-token attention.  The fused
+ * kernel preserves the native per-row dot order and uses the same Q8_1
+ * activation buffer as the three independent launches. */
+static inline int launch_qwen35_iq3xxs_qkv_fused(hip_llm_runner *r,
+        void *qout, void *kout, void *vout,
+        void *qw, void *kw, void *vw, void *x,
+        int qrows, int krows, int vrows, int n_cols) {
+    const char *env = getenv("LLM_QWEN35_IQ3_QKV_FUSED");
+    if (!env || atoi(env) == 0 || !qwen35_native_q81_ready(r) ||
+        !r->fn_qwen35_matvec_iq3xxs_qkv ||
+        qrows < 1 || krows < 1 || vrows < 1 || n_cols <= 0 || n_cols > 17408 ||
+        (n_cols % 256) != 0)
+        return 0;
+    launch_native_q81(r, x, n_cols);
+    int total = qrows + krows + vrows;
+    void *a[] = { &qout, &kout, &vout, &qw, &kw, &vw,
+                  &r->d_native_q81, &r->d_native_scale,
+                  &qrows, &krows, &vrows, &n_cols };
+    LAUNCH(r->fn_qwen35_matvec_iq3xxs_qkv, (total + 7) / 8, 1, 1,
+           256, 1, 1, 0, r->stream, a);
+    return 1;
+}
+
+/* Opt-in ordinary-decode Q4_K Q/K/V fusion.  The Q4_K/Q8_1 kernel already
+ * used by DFlash can cover a single row; share its activation quantization and
+ * projection grid while leaving the F32 reference dispatcher as the default. */
+static inline int launch_qwen35_q4k_qkv_fused(hip_llm_runner *r,
+        void *qout, void *kout, void *vout,
+        void *qw, void *kw, void *vw, void *x,
+        int qrows, int krows, int vrows, int n_cols) {
+    const char *env = getenv("LLM_QWEN35_Q4K_QKV_FUSED");
+    if (!env || atoi(env) == 0 || !r ||
+        !r->fn_qwen35_matvec_q4k_q81_qkv ||
+        !r->fn_qwen35_quantize_q81 || !r->d_act_q8_batch ||
+        !r->d_act_scale_batch || qrows < 1 || krows < 1 || vrows < 1 ||
+        n_cols <= 0 || n_cols > 17408 || (n_cols % 256) != 0)
+        return 0;
+    int count = 1, total = qrows + krows + vrows;
+    void *qa[] = { &r->d_act_q8_batch, &r->d_act_scale_batch, &x, &n_cols };
+    LAUNCH(r->fn_qwen35_quantize_q81, n_cols / 32, 1, 1,
+           32, 1, 1, 0, r->stream, qa);
+    void *a[] = { &qout, &kout, &vout, &qw, &kw, &vw,
+                  &r->d_act_q8_batch, &r->d_act_scale_batch,
+                  &qrows, &krows, &vrows, &n_cols, &count };
+    LAUNCH(r->fn_qwen35_matvec_q4k_q81_qkv, (total + 7) / 8, 1, 1,
+           256, 1, 1, 0, r->stream, a);
+    return 1;
+}
+
+/* Opt-in native Q2_K Q/K/V fusion for ordinary one-token attention.  The
+ * Q2_K kernel keeps the standalone eight-virtual-warp arithmetic and only
+ * combines the row ranges after one shared Q8_1 activation quantization. */
+static inline int launch_qwen35_q2k_qkv_fused(hip_llm_runner *r,
+        void *qout, void *kout, void *vout,
+        void *qw, void *kw, void *vw, void *x,
+        int qrows, int krows, int vrows, int n_cols) {
+    const char *env = getenv("LLM_QWEN35_Q2K_QKV_FUSED");
+    if (!env || atoi(env) == 0 || !qwen35_native_q81_ready(r) ||
+        !r->fn_qwen35_matvec_q2k_qkv ||
+        qrows < 1 || krows < 1 || vrows < 1 || n_cols <= 0 || n_cols > 17408 ||
+        (n_cols % 256) != 0)
+        return 0;
+    launch_native_q81(r, x, n_cols);
+    int total = qrows + krows + vrows;
+    int threads = n_cols == 5120 && total >= 16000 ? 128 : 256;
+    int rows_per_block = threads / 32;
+    void *a[] = { &qout, &kout, &vout, &qw, &kw, &vw,
+                  &r->d_native_q81, &r->d_native_scale,
+                  &qrows, &krows, &vrows, &n_cols };
+    LAUNCH(r->fn_qwen35_matvec_q2k_qkv,
+           (total + rows_per_block - 1) / rows_per_block, 1, 1,
+           (unsigned)threads, 1, 1, 0, r->stream, a);
+    return 1;
+}
+
+/* Opt-in native Q2_K gate/up fusion for dense FFN layers. The two matrices
+ * consume the same one-token activation and the Q2_K kernel already supports
+ * a zero V range, so share its exact Q8_1 tile and row arithmetic without
+ * changing the standalone reduction order. */
+static inline int launch_qwen35_q2k_gateup_fused(hip_llm_runner *r,
+        void *gout, void *uout, void *gw, void *uw, void *x,
+        int rows, int n_cols) {
+    const char *env = getenv("LLM_QWEN35_Q2K_GATEUP_FUSED");
+    if (!env || atoi(env) == 0 || !qwen35_native_q81_ready(r) ||
+        !r->fn_qwen35_matvec_q2k_qkv ||
+        rows < 1 || n_cols <= 0 || n_cols > 17408 || (n_cols % 256) != 0)
+        return 0;
+    launch_native_q81(r, x, n_cols);
+    int qrows = rows, krows = rows, vrows = 0;
+    int total = qrows + krows;
+    int threads = n_cols == 5120 && total >= 16000 ? 128 : 256;
+    int rows_per_block = threads / 32;
+    void *vout = NULL, *vw = NULL;
+    void *a[] = { &gout, &uout, &vout, &gw, &uw, &vw,
+                  &r->d_native_q81, &r->d_native_scale,
+                  &qrows, &krows, &vrows, &n_cols };
+    LAUNCH(r->fn_qwen35_matvec_q2k_qkv,
+           (total + rows_per_block - 1) / rows_per_block, 1, 1,
+           (unsigned)threads, 1, 1, 0, r->stream, a);
+    return 1;
+}
+
+/* Opt-in native IQ3_S Q/K/V fusion for mixed-IQ attention.  The fused
+ * kernel preserves the standalone IQ3_S code decode, affine scale, and warp
+ * reduction order while sharing the Q8_1 activation quantization launch. */
+static inline int launch_qwen35_iq3s_qkv_fused(hip_llm_runner *r,
+        void *qout, void *kout, void *vout,
+        void *qw, void *kw, void *vw, void *x,
+        int qrows, int krows, int vrows, int n_cols) {
+    const char *env = getenv("LLM_QWEN35_IQ3S_QKV_FUSED");
+    if (!env || atoi(env) == 0 || !qwen35_native_q81_ready(r) ||
+        !r->fn_qwen35_matvec_iq3s_qkv ||
+        qrows < 1 || krows < 1 || vrows < 1 || n_cols <= 0 || n_cols > 17408 ||
+        (n_cols % 256) != 0)
+        return 0;
+    launch_native_q81(r, x, n_cols);
+    int total = qrows + krows + vrows;
+    void *a[] = { &qout, &kout, &vout, &qw, &kw, &vw,
+                  &r->d_native_q81, &r->d_native_scale,
+                  &qrows, &krows, &vrows, &n_cols };
+    LAUNCH(r->fn_qwen35_matvec_iq3s_qkv, (total + 7) / 8, 1, 1,
+           256, 1, 1, 0, r->stream, a);
+    return 1;
+}
+
+/* Opt-in native IQ4_XS Q/K/V fusion.  The eight virtual warp passes and
+ * per-row reduction remain in the standalone order; only activation staging
+ * and the projection launch are shared. */
+static inline int launch_qwen35_iq4xs_qkv_fused(hip_llm_runner *r,
+        void *qout, void *kout, void *vout,
+        void *qw, void *kw, void *vw, void *x,
+        int qrows, int krows, int vrows, int n_cols) {
+    const char *env = getenv("LLM_QWEN35_IQ4XS_QKV_FUSED");
+    if (!env || atoi(env) == 0 || !qwen35_native_q81_ready(r) ||
+        !r->fn_qwen35_matvec_iq4xs_qkv ||
+        qrows < 1 || krows < 1 || vrows < 1 || n_cols <= 0 || n_cols > 17408 ||
+        (n_cols % 256) != 0)
+        return 0;
+    launch_native_q81(r, x, n_cols);
+    int total = qrows + krows + vrows;
+    void *a[] = { &qout, &kout, &vout, &qw, &kw, &vw,
+                  &r->d_native_q81, &r->d_native_scale,
+                  &qrows, &krows, &vrows, &n_cols };
+    LAUNCH(r->fn_qwen35_matvec_iq4xs_qkv, (total + 7) / 8, 1, 1,
+           256, 1, 1, 0, r->stream, a);
+    return 1;
+}
+
+/* Opt-in native IQ2_XXS Q/K/V fusion. The kernel shares its staged 256-entry
+ * codebook and the prepared Q8_1 activation while retaining each standalone
+ * row's dot, affine scale, and reduction order. */
+static inline int launch_qwen35_iq2xxs_qkv_fused(hip_llm_runner *r,
+        void *qout, void *kout, void *vout,
+        void *qw, void *kw, void *vw, void *x,
+        int qrows, int krows, int vrows, int n_cols) {
+    const char *env = getenv("LLM_QWEN35_IQ2XXS_QKV_FUSED");
+    if (!env || atoi(env) == 0 || !qwen35_native_q81_ready(r) ||
+        !r->fn_qwen35_matvec_iq2xxs_qkv ||
+        qrows < 1 || krows < 1 || vrows < 1 || n_cols <= 0 || n_cols > 17408 ||
+        (n_cols % 256) != 0)
+        return 0;
+    launch_native_q81(r, x, n_cols);
+    int total = qrows + krows + vrows;
+    void *a[] = { &qout, &kout, &vout, &qw, &kw, &vw,
+                  &r->d_native_q81, &r->d_native_scale,
+                  &qrows, &krows, &vrows, &n_cols };
+    LAUNCH(r->fn_qwen35_matvec_iq2xxs_qkv, (total + 7) / 8, 1, 1,
+           256, 1, 1, 0, r->stream, a);
+    return 1;
+}
+
+/* The dense FFN gate and up projections have the same one-token activation
+ * and, on the IQ3_XXS layers used by the long-context target, the same input
+ * width.  Reuse the native Q/K/V kernel with its V range disabled so the
+ * codebook is staged once and the two output ranges are covered by one
+ * launch.  The kernel keeps the standalone per-row dot and reduction order;
+ * this is deliberately opt-in until resident-device hashes and throughput
+ * are measured. */
+static inline int launch_qwen35_iq3xxs_gateup_fused(hip_llm_runner *r,
+        void *gate, void *up, void *gate_w, void *up_w, void *x,
+        int rows, int n_cols) {
+    const char *env = getenv("LLM_QWEN35_IQ3_GATEUP_FUSED");
+    if (!env || atoi(env) == 0 || !qwen35_native_q81_ready(r) ||
+        !r->fn_qwen35_matvec_iq3xxs_qkv ||
+        rows < 1 || n_cols <= 0 || n_cols > 17408 || (n_cols % 256) != 0)
+        return 0;
+    launch_native_q81(r, x, n_cols);
+    int qrows = rows, krows = rows, vrows = 0;
+    void *vout = NULL, *v_w = NULL;
+    void *a[] = { &gate, &up, &vout, &gate_w, &up_w, &v_w,
+                  &r->d_native_q81, &r->d_native_scale,
+                  &qrows, &krows, &vrows, &n_cols };
+    LAUNCH(r->fn_qwen35_matvec_iq3xxs_qkv,
+           (qrows + krows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, a);
+    return 1;
+}
+
+/* The mixed-IQ3_S FFN gate and up matrices share the same one-token input.
+ * Keep the standalone code decode and row reduction exact while combining
+ * their launch and activation staging under an explicit diagnostic switch. */
+static inline int launch_qwen35_iq3s_gateup_fused(hip_llm_runner *r,
+        void *gate, void *up, void *gate_w, void *up_w, void *x,
+        int rows, int n_cols) {
+    const char *env = getenv("LLM_QWEN35_IQ3S_GATEUP_FUSED");
+    if (!env || atoi(env) == 0 || !qwen35_native_q81_ready(r) ||
+        !r->fn_qwen35_matvec_iq3s_qkv ||
+        rows < 1 || n_cols <= 0 || n_cols > 17408 || (n_cols % 256) != 0)
+        return 0;
+    launch_native_q81(r, x, n_cols);
+    int qrows = rows, krows = rows, vrows = 0;
+    void *vout = NULL, *vw = NULL;
+    void *a[] = { &gate, &up, &vout, &gate_w, &up_w, &vw,
+                  &r->d_native_q81, &r->d_native_scale,
+                  &qrows, &krows, &vrows, &n_cols };
+    LAUNCH(r->fn_qwen35_matvec_iq3s_qkv,
+           (qrows + krows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, a);
+    return 1;
+}
+
+/* The IQ4_XS FFN gate and up matrices consume the same one-token activation.
+ * Reuse the native Q8_1 tile and the exact eight-pass row arithmetic of the
+ * Q/K/V kernel; keep this separate and opt-in until resident parity data is
+ * available for mixed IQ4 target layers. */
+static inline int launch_qwen35_iq4xs_gateup_fused(hip_llm_runner *r,
+        void *gate, void *up, void *gate_w, void *up_w, void *x,
+        int rows, int n_cols) {
+    const char *env = getenv("LLM_QWEN35_IQ4XS_GATEUP_FUSED");
+    if (!env || atoi(env) == 0 || !qwen35_native_q81_ready(r) ||
+        !r->fn_qwen35_matvec_iq4xs_qkv ||
+        rows < 1 || n_cols <= 0 || n_cols > 17408 || (n_cols % 256) != 0)
+        return 0;
+    launch_native_q81(r, x, n_cols);
+    int qrows = rows, krows = rows, vrows = 0;
+    void *vout = NULL, *vw = NULL;
+    void *a[] = { &gate, &up, &vout, &gate_w, &up_w, &vw,
+                  &r->d_native_q81, &r->d_native_scale,
+                  &qrows, &krows, &vrows, &n_cols };
+    LAUNCH(r->fn_qwen35_matvec_iq4xs_qkv,
+           (qrows + krows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, a);
+    return 1;
+}
+
+/* The IQ2_XXS FFN gate and up matrices use the same one-token activation.
+ * Reuse the native Q8_1 tile and codebook staging while retaining the
+ * standalone integer dot, scale correction, and warp reduction order. */
+static inline int launch_qwen35_iq2xxs_gateup_fused(hip_llm_runner *r,
+        void *gate, void *up, void *gate_w, void *up_w, void *x,
+        int rows, int n_cols) {
+    const char *env = getenv("LLM_QWEN35_IQ2XXS_GATEUP_FUSED");
+    if (!env || atoi(env) == 0 || !qwen35_native_q81_ready(r) ||
+        !r->fn_qwen35_matvec_iq2xxs_qkv ||
+        rows < 1 || n_cols <= 0 || n_cols > 17408 || (n_cols % 256) != 0)
+        return 0;
+    launch_native_q81(r, x, n_cols);
+    int qrows = rows, krows = rows, vrows = 0;
+    void *vout = NULL, *vw = NULL;
+    void *a[] = { &gate, &up, &vout, &gate_w, &up_w, &vw,
+                  &r->d_native_q81, &r->d_native_scale,
+                  &qrows, &krows, &vrows, &n_cols };
+    LAUNCH(r->fn_qwen35_matvec_iq2xxs_qkv,
+           (qrows + krows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, a);
+    return 1;
+}
+
+/* Opt-in native IQ2_XS Q/K/V fusion.  The shared Q8_1 tile is quantized once;
+ * the device kernel preserves the independent IQ2_XS row arithmetic. */
+static inline int launch_qwen35_iq2xs_qkv_fused(hip_llm_runner *r,
+        void *qout, void *kout, void *vout,
+        void *qw, void *kw, void *vw, void *x,
+        int qrows, int krows, int vrows, int n_cols) {
+    const char *env = getenv("LLM_QWEN35_IQ2_QKV_FUSED");
+    if (!env || atoi(env) == 0 || !qwen35_native_q81_ready(r) ||
+        !r->fn_qwen35_matvec_iq2xs_qkv ||
+        qrows < 1 || krows < 1 || vrows < 1 || n_cols <= 0 || n_cols > 17408 ||
+        (n_cols % 256) != 0)
+        return 0;
+    launch_native_q81(r, x, n_cols);
+    int total = qrows + krows + vrows;
+    int threads = qwen35_iq_shape_threads_enabled() ? 512 : 256;
+    int rows_per_block = threads / 32;
+    void *a[] = { &qout, &kout, &vout, &qw, &kw, &vw,
+                  &r->d_native_q81, &r->d_native_scale,
+                  &qrows, &krows, &vrows, &n_cols };
+    LAUNCH(r->fn_qwen35_matvec_iq2xs_qkv,
+           (total + rows_per_block - 1) / rows_per_block, 1, 1,
+           (unsigned)threads, 1, 1, 0, r->stream, a);
+    return 1;
+}
+
+/* The same kernel can cover an equal-width dense FFN gate/up pair.  V is
+ * disabled by a zero row count, so no null output is dereferenced. */
+static inline int launch_qwen35_iq2xs_gateup_fused(hip_llm_runner *r,
+        void *gate, void *up, void *gate_w, void *up_w, void *x,
+        int rows, int n_cols) {
+    const char *env = getenv("LLM_QWEN35_IQ2_GATEUP_FUSED");
+    if (!env || atoi(env) == 0 || !qwen35_native_q81_ready(r) ||
+        !r->fn_qwen35_matvec_iq2xs_qkv ||
+        rows < 1 || n_cols <= 0 || n_cols > 17408 || (n_cols % 256) != 0)
+        return 0;
+    launch_native_q81(r, x, n_cols);
+    int qrows = rows, krows = rows, vrows = 0;
+    int threads = qwen35_iq_shape_threads_enabled() ? 512 : 256;
+    int rows_per_block = threads / 32;
+    void *vout = NULL, *v_w = NULL;
+    void *a[] = { &gate, &up, &vout, &gate_w, &up_w, &v_w,
+                  &r->d_native_q81, &r->d_native_scale,
+                  &qrows, &krows, &vrows, &n_cols };
+    LAUNCH(r->fn_qwen35_matvec_iq2xs_qkv,
+           (qrows + krows + rows_per_block - 1) / rows_per_block,
+           1, 1, (unsigned)threads, 1, 1, 0, r->stream, a);
+    return 1;
+}
+
+/* Opt-in mixed-IQ ordinary attention fusion.  Q/K/V may use different native
+ * IQ2/IQ3/IQ4 formats, but must share the input width.  The device kernel
+ * stages one Q8_1 activation and all small codebooks per block, then keeps the
+ * exact format-specific row arithmetic. */
+static inline int launch_qwen35_iq_mixed_qkv(hip_llm_runner *r,
+        void *qout, void *kout, void *vout,
+        void *qw, void *kw, void *vw, void *x,
+        int qrows, int krows, int vrows, int n_cols,
+        int qtype, int ktype, int vtype) {
+    const char *env = getenv("LLM_QWEN35_IQ_MIXED_QKV_FUSED");
+    if (!env || atoi(env) == 0 || !qwen35_native_q81_ready(r) ||
+        !r->fn_qwen35_matvec_iq_mixed_qkv || !x ||
+        qrows < 1 || krows < 1 || vrows < 1 || n_cols <= 0 ||
+        n_cols > 17408 || (n_cols % 256) != 0)
+        return 0;
+    int qkind = qwen35_iq_mixed_kind(qtype);
+    int kkind = qwen35_iq_mixed_kind(ktype);
+    int vkind = qwen35_iq_mixed_kind(vtype);
+    if (qkind < 0 || kkind < 0 || vkind < 0)
+        return 0;
+    launch_native_q81(r, x, n_cols);
+    int total = qrows + krows + vrows;
+    void *a[] = { &qout, &kout, &vout, &qw, &kw, &vw,
+                  &r->d_native_q81, &r->d_native_scale,
+                  &qrows, &krows, &vrows, &n_cols,
+                  &qkind, &kkind, &vkind };
+    int threads = qwen35_iq_mixed_threads();
+    int rows_per_block = threads / 32;
+    LAUNCH(r->fn_qwen35_matvec_iq_mixed_qkv,
+           (total + rows_per_block - 1) / rows_per_block, 1, 1,
+           (unsigned)threads, 1, 1, 0, r->stream, a);
+    return 1;
+}
+
+/* Same-format IQ2_S attention still pays three one-row launches because it
+ * has no dedicated Q/K/V entry point. Keep this diagnostic separate from the
+ * heterogeneous switch while sharing the exact IQ2_S branch and Q8_1 tile. */
+static inline int launch_qwen35_iq2s_qkv_fused(hip_llm_runner *r,
+        void *qout, void *kout, void *vout,
+        void *qw, void *kw, void *vw, void *x,
+        int qrows, int krows, int vrows, int n_cols) {
+    const char *env = getenv("LLM_QWEN35_IQ2S_QKV_FUSED");
+    if (!env || atoi(env) == 0 || !qwen35_native_q81_ready(r) ||
+        !r->fn_qwen35_matvec_iq_mixed_qkv || !x || qrows < 1 ||
+        krows < 1 || vrows < 1 || n_cols <= 0 || n_cols > 17408 ||
+        (n_cols % 256) != 0)
+        return 0;
+    launch_native_q81(r, x, n_cols);
+    int qkind = 2, kkind = 2, vkind = 2;
+    int total = qrows + krows + vrows;
+    void *a[] = { &qout, &kout, &vout, &qw, &kw, &vw,
+                  &r->d_native_q81, &r->d_native_scale,
+                  &qrows, &krows, &vrows, &n_cols,
+                  &qkind, &kkind, &vkind };
+    int threads = qwen35_iq_mixed_threads();
+    int rows_per_block = threads / 32;
+    LAUNCH(r->fn_qwen35_matvec_iq_mixed_qkv,
+           (total + rows_per_block - 1) / rows_per_block, 1, 1,
+           (unsigned)threads, 1, 1, 0, r->stream, a);
+    return 1;
+}
+
+/* The same mixed-IQ kernel can cover a heterogeneous dense FFN gate/up pair.
+ * Keep the V range empty so the device path only visits the two requested row
+ * ranges; the null V pointers are therefore never dereferenced.  This joins
+ * the activation quantization and launch for mixed IQ2/IQ3/IQ4 pairs while
+ * retaining each format's exact row arithmetic. */
+static inline int launch_qwen35_iq_mixed_gateup_fused(hip_llm_runner *r,
+        void *gate, void *up, void *gate_w, void *up_w, void *x,
+        int gate_rows, int up_rows, int n_cols,
+        int gate_type, int up_type) {
+    const char *env = getenv("LLM_QWEN35_IQ_MIXED_GATEUP_FUSED");
+    if (!env || atoi(env) == 0 || !qwen35_native_q81_ready(r) ||
+        !r->fn_qwen35_matvec_iq_mixed_qkv || !x || gate_rows < 1 ||
+        up_rows < 1 || n_cols <= 0 || n_cols > 17408 ||
+        (n_cols % 256) != 0 || gate_rows != up_rows ||
+        gate_type == up_type)
+        return 0;
+    int gate_kind = qwen35_iq_mixed_kind(gate_type);
+    int up_kind = qwen35_iq_mixed_kind(up_type);
+    if (gate_kind < 0 || up_kind < 0)
+        return 0;
+    launch_native_q81(r, x, n_cols);
+    int qrows = gate_rows, krows = up_rows, vrows = 0;
+    int vkind = gate_kind;
+    void *vout = NULL, *vw = NULL;
+    void *a[] = { &gate, &up, &vout, &gate_w, &up_w, &vw,
+                  &r->d_native_q81, &r->d_native_scale,
+                  &qrows, &krows, &vrows, &n_cols,
+                  &gate_kind, &up_kind, &vkind };
+    int threads = qwen35_iq_mixed_threads();
+    int rows_per_block = threads / 32;
+    LAUNCH(r->fn_qwen35_matvec_iq_mixed_qkv,
+           (qrows + krows + rows_per_block - 1) / rows_per_block, 1, 1,
+           (unsigned)threads, 1, 1, 0, r->stream, a);
+    return 1;
+}
+
+/* IQ2_S is the one common same-format FFN pair without a dedicated native
+ * gate/up kernel. Reuse the mixed-IQ implementation under its own switch so
+ * the diagnostic can be measured independently from heterogeneous pairs. */
+static inline int launch_qwen35_iq2s_gateup_fused(hip_llm_runner *r,
+        void *gate, void *up, void *gate_w, void *up_w, void *x,
+        int rows, int n_cols) {
+    const char *env = getenv("LLM_QWEN35_IQ2S_GATEUP_FUSED");
+    if (!env || atoi(env) == 0 || !qwen35_native_q81_ready(r) ||
+        !r->fn_qwen35_matvec_iq_mixed_qkv || !x || rows < 1 ||
+        n_cols <= 0 || n_cols > 17408 || (n_cols % 256) != 0)
+        return 0;
+    launch_native_q81(r, x, n_cols);
+    int qrows = rows, krows = rows, vrows = 0;
+    int qkind = 2, kkind = 2, vkind = 2;
+    void *vout = NULL, *vw = NULL;
+    void *a[] = { &gate, &up, &vout, &gate_w, &up_w, &vw,
+                  &r->d_native_q81, &r->d_native_scale,
+                  &qrows, &krows, &vrows, &n_cols,
+                  &qkind, &kkind, &vkind };
+    int threads = qwen35_iq_mixed_threads();
+    int rows_per_block = threads / 32;
+    LAUNCH(r->fn_qwen35_matvec_iq_mixed_qkv,
+           (qrows + krows + rows_per_block - 1) / rows_per_block, 1, 1,
+           (unsigned)threads, 1, 1, 0, r->stream, a);
+    return 1;
+}
+
 static inline void launch_matvec_iq3_xxs_ptrs(hip_llm_runner *r, void *dst,
         void *mats, void *x, int n_rows, int n_cols, int x_stride, int slots) {
     void *args[] = { &dst, &mats, &x, &n_rows, &n_cols, &x_stride };
@@ -16011,47 +22501,587 @@ static inline void launch_matvec_iq3_xxs_batch_ptrs(hip_llm_runner *r,
     LAUNCH(r->fn_matvec_iq3_xxs_batch_ptrs_f32, (n_rows + 7) / 8,
            1, slots * tokens, 256, 1, 1, 0, r->stream, args);
 }
+static inline void launch_matvec_iq3_xxs_batch(hip_llm_runner *r, void *dst,
+        void *mat, void *x, int M, int n_rows, int n_cols, int x_stride) {
+    const char *q81_batch = getenv("LLM_QWEN35_Q81_BATCH");
+    const char *q81_iq3xxs = getenv("LLM_QWEN35_IQ3XXS_Q81_FFN");
+    if (((q81_batch && atoi(q81_batch) != 0) ||
+         (q81_iq3xxs && atoi(q81_iq3xxs) != 0)) &&
+        x_stride == n_cols && M > 0 &&
+        M <= r->batch_max && (n_cols % 256) == 0) {
+        launch_quantize_q81_batch_cached(r, x, n_cols, M, x_stride);
+        launch_matvec_iq_q81_batch(r, (getenv("LLM_IQ3_XXS_Q81_MMQ") && atoi(getenv("LLM_IQ3_XXS_Q81_MMQ")) != 0) ?
+                                      r->fn_matvec_iq3_xxs_mmq_scales : r->fn_matvec_iq3_xxs_q81_batch,
+                                   dst, mat, n_rows, n_cols, M);
+        return;
+    }
+    const char *wmma_env = getenv("LLM_QWEN35_IQ3XXS_Q8_WMMA");
+    if (wmma_env && atoi(wmma_env) != 0 && x_stride == n_cols && M >= 128 &&
+        n_rows >= 128 && (n_cols % 256) == 0) {
+        launch_quantize_q8x2_batch_cached(r, x, n_cols, M, x_stride);
+        void *wa[] = { &dst, &mat, &r->d_act_q8_batch,
+                       &r->d_act_scale_batch, &n_rows, &n_cols, &M };
+        LAUNCH(r->fn_gemm_iq3_xxs_q8_wmma, (n_rows + 127) / 128,
+               (M + 127) / 128, 1, 256, 1, 1, 0, r->stream, wa);
+        return;
+    }
+    const char *dp_env = getenv("LLM_QWEN35_NATIVE_IQ3XXS_DP4A_BATCH");
+    if (dp_env && atoi(dp_env) != 0 && M > 0 && M <= r->batch_max &&
+        (n_cols % 256) == 0) {
+        launch_quantize_q8x2_batch_cached(r, x, n_cols, M, x_stride);
+        void *da[] = { &dst, &mat, &r->d_act_q8_batch, &r->d_act_scale_batch,
+                       &r->d_act_q8_batch_b, &r->d_act_scale_batch_b,
+                       &n_rows, &n_cols, &M };
+        const char *reuse_env = getenv("LLM_QWEN35_NATIVE_IQ3XXS_DP4A_REUSE4");
+        if (!reuse_env || atoi(reuse_env) != 0)
+            LAUNCH(r->fn_matvec_iq3_xxs_dp4a2_batch_reuse4, (n_rows + 7) / 8,
+                   (M + 3) / 4, 1, 256, 1, 1, 0, r->stream, da);
+        else
+            LAUNCH(r->fn_matvec_iq3_xxs_dp4a2_batch, (n_rows + 7) / 8, M, 1,
+                   256, 1, 1, 0, r->stream, da);
+        return;
+    }
+    void *args[] = { &dst, &mat, &x, &n_rows, &n_cols, &M, &x_stride };
+    LAUNCH(r->fn_matvec_iq3_xxs_batch_reuse4_f32, (n_rows + 7) / 8,
+           (M + 3) / 4, 1, 256, 1, 1, 0, r->stream, args);
+}
 /* Quantize a F32 activation vector x[n] -> int8 per-32-block (qs) + fp32 scale. */
 static inline void launch_quantize_q8(hip_llm_runner *r, void *x, int n,
-                                       void *qs, void *scale) {
+                                      void *qs, void *scale) {
     void *args[] = { &qs, &scale, &x, &n };
     LAUNCH(r->fn_quantize_q8_32, (n + 31) / 32, 1, 1, 32, 1, 1, 0, r->stream, args);
+}
+static inline void launch_quantize_q8k(hip_llm_runner *r, void *dst,
+                                       void *x, int n) {
+    void *args[] = { &dst, &x, &n };
+    LAUNCH(r->fn_qwen4_quantize_q8k, (n + 255) / 256, 1, 1,
+           256, 1, 1, 0, r->stream, args);
+}
+static inline void launch_matvec_iq4_xs_q8k(hip_llm_runner *r, void *dst,
+                                             void *mat, void *xq,
+                                             int n_rows, int n_cols) {
+    void *args[] = { &dst, &mat, &xq, &n_rows, &n_cols };
+    LAUNCH(r->fn_matvec_iq4_xs_q8k, (n_rows + 7) / 8, 1, 1,
+           256, 1, 1, 0, r->stream, args);
+}
+static inline void launch_matvec_iq4_xs_q81_batch(hip_llm_runner *r,
+        void *dst, void *mat, void *q, void *s,
+        int n_rows, int n_cols, int M) {
+    void *args[] = { &dst, &mat, &q, &s, &n_rows, &n_cols, &M };
+    LAUNCH(r->fn_matvec_iq4_xs_q81_batch, (n_rows + 7) / 8, M, 1,
+           256, 1, 1, 0, r->stream, args);
+}
+static inline void launch_matvec_iq_q81_batch(hip_llm_runner *r,
+        hipFunction_t fn, void *dst, void *mat, int n_rows, int n_cols, int M) {
+    void *args[] = { &dst, &mat, &r->d_act_q8_batch, &r->d_act_scale_batch,
+                     &n_rows, &n_cols, &M };
+    LAUNCH(fn, (n_rows + 7) / 8, M, 1, 256, 1, 1, 0, r->stream, args);
+}
+static inline void launch_quantize_q8x2(hip_llm_runner *r, void *x, int n) {
+    if (r->q8x2_reuse_active && r->q8x2_reuse_valid &&
+        r->q8x2_reuse_source == x && r->q8x2_reuse_n == n)
+        return;
+    void *args[] = { &r->d_act_q8, &r->d_act_scale, &r->d_act_q8_b,
+                     &r->d_act_scale_b, &x, &n };
+    LAUNCH(r->fn_quantize_q8x2_32, (n + 31) / 32, 1, 1, 32, 1, 1,
+           0, r->stream, args);
+    if (r->q8x2_reuse_active) {
+        r->q8x2_reuse_source = x;
+        r->q8x2_reuse_n = n;
+        r->q8x2_reuse_valid = 1;
+    }
+}
+
+static inline void begin_q8x2_reuse(hip_llm_runner *r) {
+    r->q8x2_reuse_active = 1;
+    r->q8x2_reuse_valid = 0;
+    r->native_q81_valid = 0;
+}
+
+static inline void end_q8x2_reuse(hip_llm_runner *r) {
+    r->q8x2_reuse_active = 0;
+    r->q8x2_reuse_valid = 0;
+    r->native_q81_valid = 0;
+    /* IQ1's exact Q8_1 route uses the same activation scratch, but its
+     * affine block sums are a distinct layout.  Do not let a pointer-stable
+     * d_xb survive into the next layer after the gate/up scope closes. */
+    r->iq1_q8_valid = 0;
+}
+
+/* Enter a one-projection reuse scope after a fused producer has already
+ * refreshed native Q8_1. */
+static inline void begin_native_q81_prepared(hip_llm_runner *r) {
+    r->q8x2_reuse_active = 1;
+    r->q8x2_reuse_valid = 0;
+}
+/* Batched projections commonly share the same activation matrix (Q/K/V and
+ * gate/up). Reuse its Q8x2 representation until the next layer changes the
+ * producer buffer. The key includes the complete batch shape and stride. */
+static inline int ensure_batch_q8_scratch(hip_llm_runner *r, int n, int M) {
+    const size_t QCAP = 17408;
+    if (n > (int)QCAP || M < 1) {
+        fprintf(stderr, "hip_llm: batch Q8 scratch shape unsupported (M=%d K=%d)\n", M, n);
+        r->batch_q8_valid = 0;
+        r->qwen4_forward_error = 1;
+        return 0;
+    }
+    if (M > r->batch_q8_capacity || !r->d_act_q8_batch ||
+        !r->d_act_scale_batch || !r->d_act_q8_batch_b ||
+        !r->d_act_scale_batch_b) {
+        int capacity = r->batch_max > M ? r->batch_max : M;
+        if (capacity < 512) capacity = 512;
+        if (capacity > 8192) capacity = 8192;
+        if (capacity < M ||
+            (r->d_act_q8_batch && hipStreamSynchronize(r->stream) != hipSuccess)) {
+            fprintf(stderr, "hip_llm: cannot grow batch Q8 scratch to M=%d\n", M);
+            r->batch_q8_valid = 0;
+            r->qwen4_forward_error = 1;
+            return 0;
+        }
+        void *q8 = NULL, *sc = NULL, *q8b = NULL, *scb = NULL;
+        if (hipMalloc(&q8, (size_t)capacity * QCAP) != hipSuccess ||
+            hipMalloc(&sc, (size_t)capacity * (QCAP / 32) * sizeof(float)) != hipSuccess ||
+            hipMalloc(&q8b, (size_t)capacity * QCAP) != hipSuccess ||
+            hipMalloc(&scb, (size_t)capacity * (QCAP / 32) * sizeof(float)) != hipSuccess) {
+            if (q8) hipFree(q8); if (sc) hipFree(sc); if (q8b) hipFree(q8b); if (scb) hipFree(scb);
+            fprintf(stderr, "hip_llm: batch Q8 scratch growth failed (capacity=%d)\n", capacity);
+            r->batch_q8_valid = 0;
+            r->qwen4_forward_error = 1;
+            return 0;
+        }
+        if (r->d_act_q8_batch) hipFree(r->d_act_q8_batch);
+        if (r->d_act_scale_batch) hipFree(r->d_act_scale_batch);
+        if (r->d_act_q8_batch_b) hipFree(r->d_act_q8_batch_b);
+        if (r->d_act_scale_batch_b) hipFree(r->d_act_scale_batch_b);
+        r->d_act_q8_batch = q8; r->d_act_scale_batch = sc;
+        r->d_act_q8_batch_b = q8b; r->d_act_scale_batch_b = scb;
+        r->batch_q8_capacity = capacity;
+        r->batch_q8_valid = 0;
+    }
+    return 1;
+}
+
+static inline void launch_quantize_q8x2_batch_cached(hip_llm_runner *r,
+        void *x, int n, int M, int stride) {
+    if (!ensure_batch_q8_scratch(r, n, M)) return;
+    /* This helper owns the two-term Q8x2 layout.  Do not inherit the
+     * producer's previous Q8_1/MMQ mode: those layouts share storage but
+     * have different scale contracts, and the next generic projection must
+     * be able to replace a Q8_1 tile with Q8x2 data. */
+    int q81_mode = 0;
+    if (r->batch_q8_valid && r->batch_q8_mode == q81_mode &&
+        r->batch_q8_source == x &&
+        r->batch_q8_n == n && r->batch_q8_m == M &&
+        r->batch_q8_stride == stride)
+        return;
+    void *args[] = { &r->d_act_q8_batch, &r->d_act_scale_batch,
+                     &r->d_act_q8_batch_b, &r->d_act_scale_batch_b,
+                     &x, &n, &M, &stride };
+    const char *exact_q81 = getenv("LLM_QWEN35_SSM_Q81_EXACT");
+    if (q81_mode || (exact_q81 && atoi(exact_q81) != 0)) {
+        LAUNCH(r->fn_quantize_q81_batch_32_exact, (n + 31) / 32, M, 1,
+               32, 1, 1, 0, r->stream, args);
+    } else {
+        LAUNCH(r->fn_quantize_q8x2_batch_32, (n + 31) / 32, M, 1,
+               32, 1, 1, 0, r->stream, args);
+    }
+    r->batch_q8_mode = q81_mode;
+    r->batch_q8_source = x; r->batch_q8_n = n; r->batch_q8_m = M;
+    r->batch_q8_stride = stride; r->batch_q8_valid = 1;
+}
+static inline void launch_quantize_q81_batch_cached(hip_llm_runner *r,
+        void *x, int n, int M, int stride) {
+    /* Keep Q8_1 staging distinct from the two-term Q8x2 cache.  The old
+     * implementation temporarily changed batch_q8_mode around the generic
+     * helper and then cleared it, leaving the cache metadata inconsistent
+     * with the bytes that were resident.  A following IQ4_XS MMVQ launch
+     * could therefore consume a stale Q8x2 tile as Q8_1 data. */
+    /* M==1 is the scalar decode path.  Its producer buffer is reused in
+     * place for every token, so pointer/shape identity does not imply that
+     * the activation contents are unchanged.  Never reuse that staging tile
+     * without an explicit producer generation. */
+    if (M > 1 && r->batch_q8_valid && r->batch_q8_mode == 1 &&
+        r->batch_q8_source == x && r->batch_q8_n == n &&
+        r->batch_q8_m == M && r->batch_q8_stride == stride)
+        return;
+    void *args[] = { &r->d_act_q8_batch, &r->d_act_scale_batch,
+                     &r->d_act_q8_batch_b, &r->d_act_scale_batch_b,
+                     &x, &n, &M, &stride };
+    LAUNCH(r->fn_quantize_q81_batch_32_exact, (n + 31) / 32, M, 1,
+           32, 1, 1, 0, r->stream, args);
+    r->batch_q8_mode = 1;
+    r->batch_q8_source = x; r->batch_q8_n = n; r->batch_q8_m = M;
+    r->batch_q8_stride = stride; r->batch_q8_valid = M > 1;
+}
+
+/* Long-batch MMQ uses FP32 D4 activation scales. Keep this separate from
+ * the MVQ/Q8_1 cache: the int8 payload is shared, but scale precision is part
+ * of the numerical contract. */
+static inline void launch_quantize_mmq_d4_batch(hip_llm_runner *r,
+        void *x, int n, int M, int stride) {
+    void *args[] = { &r->d_act_q8_batch, &r->d_act_scale_batch,
+                     &r->d_act_q8_batch_b, &r->d_act_scale_batch_b,
+                     &x, &n, &M, &stride };
+    LAUNCH(r->fn_quantize_mmq_d4_batch, (n + 31) / 32, M, 1,
+           32, 1, 1, 0, r->stream, args);
+    r->batch_q8_mode = 2;
+    r->batch_q8_source = x; r->batch_q8_n = n; r->batch_q8_m = M;
+    r->batch_q8_stride = stride; r->batch_q8_valid = 1;
+}
+
+/* llama.cpp's Qwen3.5 gated-attention projections use the Q8_1 activation
+ * contract of its IQ MMVQ kernels. Keep this separate from the SSM controls:
+ * Q/K/V share the same normalized activation rows, so one cached quantization
+ * services all three projections. */
+static inline int launch_qwen35_attn_q81_batch(hip_llm_runner *r, void *dst,
+        void *mat, void *x, int M, int n_rows, int n_cols, int type) {
+    if (M < 1 || M > r->batch_max || (n_cols % 256) != 0) return 0;
+    hipFunction_t fn = NULL;
+    if (type == GGML_TYPE_IQ2_XS) {
+        const char *mmq = getenv("LLM_IQ2_XS_Q81_MMQ");
+        fn = mmq && atoi(mmq) != 0 ? r->fn_matvec_iq2_xs_mmq_scales :
+                                     r->fn_matvec_iq2_xs_q81_batch;
+    }
+    else if (type == GGML_TYPE_IQ2_XXS) fn = r->fn_matvec_iq2_xxs_q81_batch;
+    else if (type == GGML_TYPE_IQ3_XXS) {
+        const char *mmq = getenv("LLM_IQ3_XXS_Q81_MMQ");
+        fn = mmq && atoi(mmq) != 0 ? r->fn_matvec_iq3_xxs_mmq_scales :
+                                     r->fn_matvec_iq3_xxs_q81_batch;
+    }
+    else if (type == GGML_TYPE_IQ4_XS) fn = r->fn_matvec_iq4_xs_q81_batch;
+    else return 0;
+    const char *attn_d4 = getenv("LLM_QWEN35_ATTN_Q81_D4");
+    const char *attn_wmma = getenv("LLM_QWEN35_ATTN_Q81_WMMA");
+    if (attn_d4 && atoi(attn_d4) != 0 &&
+        (type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ2_XXS) &&
+        getenv("LLM_IQ2_XS_Q81_MMQ") &&
+        atoi(getenv("LLM_IQ2_XS_Q81_MMQ")) != 0) {
+        /* llama.cpp selects MMQ_Q8_1_DS_LAYOUT_D4 for IQ2_XS.  Its D4
+         * quantizer keeps the activation scale in FP32; retain this as an
+         * explicit A/B because the legacy half-scale adapter is currently
+         * closer on the full Qwen stack. */
+        launch_quantize_mmq_d4_batch(r, x, n_cols, M, n_cols);
+    } else {
+        launch_quantize_q81_batch_cached(r, x, n_cols, M, n_cols);
+    }
+    if (attn_wmma && atoi(attn_wmma) != 0 && type == GGML_TYPE_IQ2_XXS &&
+        M <= 512 && n_rows >= 4096 &&
+        (n_rows % 128) == 0 && (n_cols % 256) == 0) {
+        int term = 0, fused = 0;
+        void *args[] = { &dst, &mat, &r->d_act_q8_batch,
+                         &r->d_act_scale_batch, &r->d_act_q8_batch_b,
+                         &r->d_act_scale_batch_b, &n_rows, &n_cols, &M,
+                         &term, &fused };
+        if (getenv("LLM_DEBUG_DISPATCH"))
+            fprintf(stderr, "hip_llm: attention IQ2_XXS WMMA A/B layer=%d rows=%d cols=%d M=%d\n",
+                    r->active_layer, n_rows, n_cols, M);
+        LAUNCH(r->fn_gemm_iq2_xxs_mmq_wmma,
+               (n_rows + 127) / 128, (M + 127) / 128, 1,
+               256, 1, 1, 0, r->stream, args);
+        return 1;
+    }
+    const char *attn_mmq = getenv("LLM_IQ2_XS_Q81_MMQ");
+    if (attn_wmma && atoi(attn_wmma) != 0 && type == GGML_TYPE_IQ2_XS &&
+        attn_mmq && atoi(attn_mmq) != 0 && M <= 512 && n_rows >= 4096 &&
+        (n_rows % 128) == 0 && (n_cols % 256) == 0) {
+        if (getenv("LLM_DEBUG_DISPATCH"))
+            fprintf(stderr, "hip_llm: attention WMMA A/B layer=%d rows=%d cols=%d M=%d\n",
+                    r->active_layer, n_rows, n_cols, M);
+        /* Reuse the llama-derived RDNA4 tile for large Q projections.
+         * Q8_1 staging writes the second q8 term as zero. K/V-sized tiles
+         * remain excluded because their current packing regresses parity. */
+        int term = 0, scalar = 0, fused = 0;
+        void *args[] = { &dst, &mat, &r->d_act_q8_batch,
+                         &r->d_act_scale_batch, &r->d_act_q8_batch_b,
+                         &r->d_act_scale_batch_b, &n_rows, &n_cols, &M,
+                         &term, &scalar, &fused };
+        LAUNCH(r->fn_gemm_iq2_xs_mmq_wmma,
+               (n_rows + 127) / 128, (M + 127) / 128, 1,
+               256, 1, 1, 0, r->stream, args);
+        return 1;
+    }
+    launch_matvec_iq_q81_batch(r, fn, dst, mat, n_rows, n_cols, M);
+    return 1;
+}
+static inline void launch_quantize_q81_iq1_batch(hip_llm_runner *r, void *x,
+        int n, int M, int stride) {
+    /* IQ1 consumes q0/s0 plus the original-input block sum in s1.  Do not
+     * launch the two-term Q8x2 producer first: that work is immediately
+     * overwritten and can also leave the shared batch-cache metadata claiming
+     * that q1/s1 still hold a valid Q8x2 tile.  Mixed SSM roles that need both
+     * formats use the explicit preserving helper below. */
+    if (!ensure_batch_q8_scratch(r, n, M)) return;
+    void *args[] = { &r->d_act_q8_batch, &r->d_act_scale_batch,
+                     &r->d_act_scale_batch_b, &x, &n, &M, &stride };
+    LAUNCH(r->fn_quantize_q81_iq1_batch_32_exact, (n + 31) / 32, M, 1,
+           32, 1, 1, 0, r->stream, args);
+    r->batch_q8_valid = 0;
+    r->q8x2_reuse_valid = 0;
+}
+
+/* Seed the common two-term layout for a mixed-format batch.  The IQ1
+ * quantizer intentionally overwrites q0/s0/s1, so the caller must consume its
+ * Q8_1 projections before asking another producer to refresh the scratch. */
+static inline void launch_quantize_q81_iq1_batch_preserve_q8x2(
+        hip_llm_runner *r, void *x, int n, int M, int stride) {
+    launch_quantize_q8x2_batch_cached(r, x, n, M, stride);
+    void *args[] = { &r->d_act_q8_batch, &r->d_act_scale_batch,
+                     &r->d_act_scale_batch_b, &x, &n, &M, &stride };
+    LAUNCH(r->fn_quantize_q81_iq1_batch_32_exact, (n + 31) / 32, M, 1,
+           32, 1, 1, 0, r->stream, args);
+}
+static inline void launch_matvec_iq2_s_dp4a_prequant(hip_llm_runner *r,
+        void *dst, void *mat, void *qs, void *scale, int n_rows, int n_cols) {
+    void *args[] = { &dst, &mat, &qs, &scale, &n_rows, &n_cols };
+    int rows_per_block = r->mw_threads / 32;
+    LAUNCH(r->fn_matvec_iq2_s_dp4a,
+           (n_rows + rows_per_block - 1) / rows_per_block, 1, 1,
+           (unsigned)r->mw_threads, 1, 1, 0, r->stream, args);
 }
 /* IQ2_S / IQ3_S: DP4A path when enabled (quantize x then int8 dot), else the
  * full-utilization F32 fallback. Used by launch_matvec_auto + verify harness. */
 static inline void launch_matvec_iq2_s(hip_llm_runner *r, void *dst, void *mat,
                                        void *x, int n_rows, int n_cols) {
+    if (qwen35_native_q81_ready(r) && r->fn_qwen35_matvec_iq2s &&
+        n_cols <= 17408 && n_cols % 256 == 0) {
+        r->q8x2_reuse_valid = 0;
+        r->iq1_q8_valid = 0;
+        launch_native_q81(r, x, n_cols);
+        void *a[] = { &dst, &mat, &r->d_native_q81, &r->d_native_scale, &n_rows, &n_cols };
+        int threads = qwen35_iq_shape_threads_enabled() && n_rows == 17408 ?
+            512 : 256;
+        int rows_per_block = threads / 32;
+        LAUNCH(r->fn_qwen35_matvec_iq2s,
+               (n_rows + rows_per_block - 1) / rows_per_block, 1, 1,
+               threads, 1, 1, 0, r->stream, a);
+        return;
+    }
     void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
+    const char *q81_env = getenv("LLM_IQ2S_Q81_SCALAR");
+    const char *q81_gate_env = getenv("LLM_IQ2S_Q81_FFN_GATE_ONLY");
+    const char *q81_layer_env = getenv("LLM_IQ2S_Q81_LAYER");
+    int q81_gate_only = q81_gate_env && atoi(q81_gate_env) != 0;
+    int is_ffn_gate_shape = n_rows > n_cols;
+    int q81_layer_ok = !q81_layer_env || atoi(q81_layer_env) == r->active_layer;
+    if (q81_env && atoi(q81_env) != 0 && n_cols <= 17408 &&
+        (n_cols % 256) == 0 && q81_layer_ok &&
+        (!q81_gate_only || is_ffn_gate_shape)) {
+        /* IQ2_S has a llama.cpp-compatible single-term Q8_1 kernel, but the
+         * normal production path historically only exposed its D4/DP4A A/B.
+         * Use the same cached batch staging with M=1 so this contract can be
+         * tested independently of the approximate DP4A route. */
+        launch_quantize_q81_batch_cached(r, x, n_cols, 1, n_cols);
+        launch_matvec_iq_q81_batch(r, r->fn_matvec_iq2_s_q81_batch,
+                                   dst, mat, n_rows, n_cols, 1);
+        return;
+    }
+    const char *d4_env = getenv("LLM_IQ2S_MMQ_D4");
+    if (d4_env && atoi(d4_env) != 0 && n_cols <= 17408 && n_cols % 256 == 0) {
+        int one = 1, stride = n_cols;
+        r->q8x2_reuse_valid = 0;
+        r->iq1_q8_valid = 0;
+        void *qa[] = { &r->d_act_q8, &r->d_act_scale, &r->d_act_q8_b,
+                       &r->d_act_scale_b, &x, &n_cols, &one, &stride };
+        LAUNCH(r->fn_quantize_mmq_d4_batch, n_cols / 32, 1, 1,
+               32, 1, 1, 0, r->stream, qa);
+        launch_matvec_iq2_s_dp4a_prequant(r, dst, mat, r->d_act_q8,
+                                         r->d_act_scale, n_rows, n_cols);
+        return;
+    }
     if (r->lds_grid) {
         LAUNCH(r->fn_matvec_iq2_s_lds_f32, (n_rows + 7) / 8, 1, 1, 256, 1, 1,
                1024 * sizeof(unsigned long long), r->stream, args);
-    } else if (r->decode_dp4a && (n_cols % 256) == 0 && n_cols <= 8192) {
-        launch_quantize_q8(r, x, n_cols, r->d_act_q8, r->d_act_scale);
-        void *a2[] = { &dst, &mat, &r->d_act_q8, &r->d_act_scale, &n_rows, &n_cols };
-        LAUNCH(r->fn_matvec_iq2_s_dp4a, (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, a2);
+    } else if (r->decode_dp4a && (n_cols % 256) == 0 && n_cols <= 17408) {
+        if (r->decode_dp4a2) {
+            launch_quantize_q8x2(r, x, n_cols);
+            void *a2[] = { &dst, &mat, &r->d_act_q8, &r->d_act_scale,
+                           &r->d_act_q8_b, &r->d_act_scale_b,
+                           &n_rows, &n_cols };
+            int rpb = r->mw_threads / 32;
+            LAUNCH(r->fn_matvec_iq2_s_dp4a2, (n_rows + rpb - 1) / rpb,
+                   1, 1, (unsigned)r->mw_threads, 1, 1, 0, r->stream, a2);
+        } else {
+            launch_quantize_q8(r, x, n_cols, r->d_act_q8, r->d_act_scale);
+            launch_matvec_iq2_s_dp4a_prequant(r, dst, mat, r->d_act_q8,
+                                              r->d_act_scale, n_rows, n_cols);
+        }
     } else {
-        LAUNCH(r->fn_matvec_iq2_s_f32, (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args);
+        int rows_per_block = r->mw_threads / 32;
+        LAUNCH(r->fn_matvec_iq2_s_f32,
+               (n_rows + rows_per_block - 1) / rows_per_block, 1, 1,
+               (unsigned)r->mw_threads, 1, 1, 0, r->stream, args);
     }
 }
 static inline void launch_matvec_iq3_s(hip_llm_runner *r, void *dst, void *mat,
                                        void *x, int n_rows, int n_cols) {
+    if (qwen35_native_q81_ready(r) && r->fn_qwen35_matvec_iq3s &&
+        n_cols <= 17408 && n_cols % 256 == 0) {
+        r->q8x2_reuse_valid = 0;
+        r->iq1_q8_valid = 0;
+        launch_native_q81(r, x, n_cols);
+        void *a[] = { &dst, &mat, &r->d_native_q81, &r->d_native_scale, &n_rows, &n_cols };
+        int threads = qwen35_iq_shape_threads_enabled() &&
+            (n_rows == 5120 || n_rows == 17408) ? 128 : 256;
+        int rows_per_block = threads / 32;
+        LAUNCH(r->fn_qwen35_matvec_iq3s,
+               (n_rows + rows_per_block - 1) / rows_per_block, 1, 1,
+               threads, 1, 1, 0, r->stream, a);
+        return;
+    }
     void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
+    /* llama.cpp's scalar IQ3_S MMVQ path consumes the single-term Q8_1
+     * activation contract. Keep it opt-in while comparing accumulated Qwen3.5
+     * SSM drift; the existing F32 dequant path remains the quality default. */
+    const char *q81_env = getenv("LLM_IQ3_S_Q81_SCALAR");
+    if (q81_env && atoi(q81_env) != 0 &&
+        n_cols <= 17408 && (n_cols % 32) == 0) {
+        int one = 1, stride = n_cols;
+        void *qa[] = { &r->d_act_q8, &r->d_act_scale, &r->d_act_q8_b,
+                       &r->d_act_scale_b, &x, &n_cols, &one, &stride };
+        const char *d4_env = getenv("LLM_IQ3S_MMQ_D4");
+        hipFunction_t quantizer = d4_env && atoi(d4_env) != 0 ?
+            r->fn_quantize_mmq_d4_batch : r->fn_quantize_q81_batch_32_exact;
+        r->q8x2_reuse_valid = 0;
+        r->iq1_q8_valid = 0;
+        LAUNCH(quantizer, (n_cols + 31) / 32, 1, 1,
+               32, 1, 1, 0, r->stream, qa);
+        void *qargs[] = { &dst, &mat, &r->d_act_q8, &r->d_act_scale,
+                          &n_rows, &n_cols, &one };
+        LAUNCH(r->fn_matvec_iq3_s_q81_batch, (n_rows + 7) / 8, 1, 1,
+               256, 1, 1, 0, r->stream, qargs);
+        return;
+    }
     if (r->lds_grid) {
         LAUNCH(r->fn_matvec_iq3_s_lds_f32, (n_rows + 7) / 8, 1, 1, 256, 1, 1,
                512 * sizeof(unsigned int), r->stream, args);
-    } else if (r->decode_dp4a && (n_cols % 256) == 0 && n_cols <= 8192) {
-        launch_quantize_q8(r, x, n_cols, r->d_act_q8, r->d_act_scale);
-        void *a2[] = { &dst, &mat, &r->d_act_q8, &r->d_act_scale, &n_rows, &n_cols };
-        LAUNCH(r->fn_matvec_iq3_s_dp4a, (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, a2);
+    } else if (r->decode_dp4a && (n_cols % 256) == 0 && n_cols <= 17408) {
+        if (r->decode_dp4a2) {
+            launch_quantize_q8x2(r, x, n_cols);
+            void *a2[] = { &dst, &mat, &r->d_act_q8, &r->d_act_scale,
+                           &r->d_act_q8_b, &r->d_act_scale_b,
+                           &n_rows, &n_cols };
+            int rpb = r->mw_threads / 32;
+            LAUNCH(r->fn_matvec_iq3_s_dp4a2, (n_rows + rpb - 1) / rpb,
+                   1, 1, (unsigned)r->mw_threads, 1, 1, 0, r->stream, a2);
+        } else {
+            launch_quantize_q8(r, x, n_cols, r->d_act_q8, r->d_act_scale);
+            void *a2[] = { &dst, &mat, &r->d_act_q8, &r->d_act_scale, &n_rows, &n_cols };
+            LAUNCH(r->fn_matvec_iq3_s_dp4a, (n_rows + 7) / 8, 1, 1,
+                   256, 1, 1, 0, r->stream, a2);
+        }
     } else {
-        LAUNCH(r->fn_matvec_iq3_s_f32, (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args);
+        int rows_per_block = r->mw_threads / 32;
+        const char * elem_env = getenv("LLM_IQ3S_F32_ELEM");
+        hipFunction_t f32_fn = elem_env && atoi(elem_env) != 0 ?
+                               r->fn_matvec_iq3_s_f32_elem : r->fn_matvec_iq3_s_f32;
+        LAUNCH(f32_fn,
+               (n_rows + rows_per_block - 1) / rows_per_block, 1, 1,
+               (unsigned)r->mw_threads, 1, 1, 0, r->stream, args);
     }
 }
+/* Scalar adapter for the audited llama.cpp IQ1/Q8_1 batched kernels.
+ * IQ1 needs the FP16 block sum as well as scale for its affine correction.
+ * This scratch write invalidates any cached two-term activation expansion. */
+static inline int launch_iq1_q81_scalar(hip_llm_runner *r, hipFunction_t fn,
+        void *dst, void *mat, void *x, int n_rows, int n_cols, int force) {
+    const char *enabled = getenv("LLM_IQ1_Q81_SCALAR");
+    if (!force && (!enabled || atoi(enabled) == 0)) return 0;
+    if (n_cols > 17408 || n_cols % 256)
+        return 0;
+    int one = 1, stride = n_cols;
+    r->q8x2_reuse_valid = 0;
+    int reuse = r->q8x2_reuse_active && r->iq1_q8_valid &&
+                r->iq1_q8_source == x && r->iq1_q8_n == n_cols;
+    if (!reuse) {
+        void *qa[] = { &r->d_act_q8, &r->d_act_scale, &r->d_act_scale_b,
+                       &x, &n_cols, &one, &stride };
+        LAUNCH(r->fn_quantize_q81_iq1_batch_32_exact, n_cols / 32, 1, 1,
+               32, 1, 1, 0, r->stream, qa);
+        r->iq1_q8_source = x;
+        r->iq1_q8_n = n_cols;
+        r->iq1_q8_valid = r->q8x2_reuse_active;
+    }
+    void *args[] = { &dst, &mat, &r->d_act_q8, &r->d_act_scale,
+                     &r->d_act_scale_b, &n_rows, &n_cols, &one };
+    /* Measured exact geometries on gfx1201. IQ1_S benefits from two waves on
+     * the wide down projection; IQ1_M's heavier codebook decode benefits from
+     * two waves for tall projections and sixteen for the wide down shape. */
+    int iq1_m = fn == r->fn_matvec_iq1_m_q81_batch;
+    int threads = iq1_m ? (n_rows >= n_cols ? 64 : 512) :
+                           (n_rows < n_cols ? 64 : 256);
+    int rows_per_block = threads / 32;
+    LAUNCH(fn, (n_rows + rows_per_block - 1) / rows_per_block, 1, 1,
+           threads, 1, 1, 0, r->stream, args);
+    return 1;
+}
+
+/* Optional dense FFN IQ1_S/IQ1_M gate/up fusion.  Keep the same role-level
+ * Q8_1 gates as launch_matvec_ffn_auto and leave MMQ scale variants on the
+ * standalone path until a resident parity run covers both contracts. */
+static inline int launch_iq1_gateup_q81_fused(hip_llm_runner *r,
+        void *gate, void *up, void *gate_w, void *up_w, void *x,
+        int rows, int n_cols) {
+    const char *fuse = getenv("LLM_QWEN35_IQ1_GATEUP_FUSED");
+    if (!fuse || atoi(fuse) == 0 || !r->fn_ffn_gate_up_iq1s_m_q81 ||
+        rows < 1 || n_cols > 17408 || (n_cols % 256) != 0)
+        return 0;
+    const char *all = getenv("LLM_QWEN35_FFN_IQ1_Q81");
+    const char *ge = getenv("LLM_QWEN35_FFN_GATE_IQ1_Q81");
+    const char *ue = getenv("LLM_QWEN35_FFN_UP_IQ1_Q81");
+    int gate_q81 = ge ? atoi(ge) : (all && atoi(all) != 0);
+    int up_q81 = ue ? atoi(ue) : (all && atoi(all) != 0);
+    const char *gm = getenv("LLM_QWEN35_FFN_GATE_IQ1_MMQ");
+    const char *um = getenv("LLM_QWEN35_FFN_UP_IQ1_MMQ");
+    if (!gate_q81 || !up_q81 || (gm && atoi(gm) != 0) ||
+        (um && atoi(um) != 0))
+        return 0;
+    const char *max_env = getenv("LLM_QWEN35_FFN_IQ1_Q81_MAX_LAYER");
+    if (max_env && *max_env &&
+        (r->active_layer < 0 || r->active_layer > atoi(max_env)))
+        return 0;
+    int one = 1, stride = n_cols;
+    int reuse = r->q8x2_reuse_active && r->iq1_q8_valid &&
+                r->iq1_q8_source == x && r->iq1_q8_n == n_cols;
+    if (!reuse) {
+        void *qa[] = { &r->d_act_q8, &r->d_act_scale, &r->d_act_scale_b,
+                       &x, &n_cols, &one, &stride };
+        LAUNCH(r->fn_quantize_q81_iq1_batch_32_exact, n_cols / 32, 1, 1,
+               32, 1, 1, 0, r->stream, qa);
+        r->iq1_q8_source = x;
+        r->iq1_q8_n = n_cols;
+        r->iq1_q8_valid = r->q8x2_reuse_active;
+    }
+    void *a[] = { &gate, &up, &gate_w, &up_w, &r->d_act_q8,
+                  &r->d_act_scale, &r->d_act_scale_b, &rows, &n_cols };
+    LAUNCH(r->fn_ffn_gate_up_iq1s_m_q81, (rows + 7) / 8, 1, 1,
+           256, 1, 1, 0, r->stream, a);
+    return 1;
+}
+
 static inline void launch_matvec_iq1_s(hip_llm_runner *r, void *dst, void *mat,
                                        void *x, int n_rows, int n_cols) {
+    const char *mmq_env = getenv("LLM_IQ1S_MMQ_SCALES");
+    hipFunction_t q81_fn = mmq_env && atoi(mmq_env) != 0 ?
+        r->fn_matvec_iq1_s_mmq_scales : r->fn_matvec_iq1_s_q81_batch;
+    int q81_allowed = 1;
+    const char *q81_max_layer_env = getenv("LLM_QWEN35_FFN_IQ1_Q81_MAX_LAYER");
+    if (q81_max_layer_env && *q81_max_layer_env) {
+        int max_layer = atoi(q81_max_layer_env);
+        q81_allowed = r->active_layer >= 0 && r->active_layer <= max_layer;
+    }
+    if (q81_allowed && launch_iq1_q81_scalar(r, q81_fn,
+                                             dst, mat, x, n_rows, n_cols, 0)) return;
     void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
     const char *dp_env = getenv("GLM5NEXT_HIP_IQ1_DP4A");
-    if (dp_env && atoi(dp_env) != 0 && n_cols <= 8192 && (n_cols % 256) == 0) {
+    if (r->decode_dp4a2 && n_cols <= 17408 && (n_cols % 256) == 0) {
+        launch_quantize_q8x2(r, x, n_cols);
+        void *a2[] = { &dst, &mat, &r->d_act_q8, &r->d_act_scale,
+                       &r->d_act_q8_b, &r->d_act_scale_b, &n_rows, &n_cols };
+        int rows_per_block = r->mw_threads / 32;
+        LAUNCH(r->fn_matvec_iq1_s_dp4a2,
+               (n_rows + rows_per_block - 1) / rows_per_block, 1, 1,
+               (unsigned)r->mw_threads, 1, 1, 0, r->stream, a2);
+    } else if (dp_env && atoi(dp_env) != 0 && n_cols <= 17408 && (n_cols % 256) == 0) {
         if (!r->iq1_q8_valid || r->iq1_q8_source != x || r->iq1_q8_n != n_cols) {
             launch_quantize_q8(r, x, n_cols, r->d_act_q8, r->d_act_scale);
             r->iq1_q8_source = x;
@@ -16062,14 +23092,46 @@ static inline void launch_matvec_iq1_s(hip_llm_runner *r, void *dst, void *mat,
         LAUNCH(r->fn_matvec_iq1_s_dp4a, (n_rows + 7) / 8, 1, 1,
                256, 1, 1, 0, r->stream, a2);
     } else
-    if (n_cols >= 1024 && (n_cols % 256) == 0)
-        LAUNCH(r->fn_matvec_iq1_s_warp_f32, (n_rows + 7) / 8, 1, 1,
-               256, 1, 1, 0, r->stream, args);
+    if (n_cols >= 1024 && (n_cols % 256) == 0) {
+        int rows_per_block = r->mw_threads / 32;
+        LAUNCH(r->fn_matvec_iq1_s_warp_f32,
+               (n_rows + rows_per_block - 1) / rows_per_block, 1, 1,
+               (unsigned)r->mw_threads, 1, 1, 0, r->stream, args);
+    }
     else
         LAUNCH(r->fn_matvec_iq1_s_f32, n_rows, 1, 1, 256, 1, 1,
                0, r->stream, args);
 }
-DEFINE_LAUNCH_MATVEC(iq1_m, fn_matvec_iq1_m_f32)
+static inline void launch_matvec_iq1_m(hip_llm_runner *r, void *dst,
+        void *mat, void *x, int n_rows, int n_cols) {
+    const char *half_env = getenv("LLM_IQ1M_F16_OPERANDS");
+    int f16_operands = half_env && atoi(half_env) != 0;
+    int q81_allowed = 1;
+    const char *q81_max_layer_env = getenv("LLM_QWEN35_FFN_IQ1_Q81_MAX_LAYER");
+    if (q81_max_layer_env && *q81_max_layer_env) {
+        int max_layer = atoi(q81_max_layer_env);
+        q81_allowed = r->active_layer >= 0 && r->active_layer <= max_layer;
+    }
+    if (!f16_operands && q81_allowed &&
+        launch_iq1_q81_scalar(r, r->fn_matvec_iq1_m_q81_batch,
+                              dst, mat, x, n_rows, n_cols, 0)) return;
+    void *args[] = { &dst, &mat, &x, &n_rows, &n_cols, &f16_operands };
+    int rows_per_block = r->mw_threads / 32;
+    const char *experimental = getenv("LLM_EXPERIMENTAL_IQ1M_DP4A2");
+    if (!f16_operands && r->decode_dp4a2 && experimental && atoi(experimental) != 0 &&
+        n_cols <= 17408 && (n_cols % 256) == 0) {
+        launch_quantize_q8x2(r, x, n_cols);
+        void *a2[] = { &dst, &mat, &r->d_act_q8, &r->d_act_scale,
+                       &r->d_act_q8_b, &r->d_act_scale_b, &n_rows, &n_cols };
+        LAUNCH(r->fn_matvec_iq1_m_dp4a2,
+               (n_rows + rows_per_block - 1) / rows_per_block, 1, 1,
+               (unsigned)r->mw_threads, 1, 1, 0, r->stream, a2);
+    } else {
+        LAUNCH(r->fn_matvec_iq1_m_f32,
+               (n_rows + rows_per_block - 1) / rows_per_block, 1, 1,
+               (unsigned)r->mw_threads, 1, 1, 0, r->stream, args);
+    }
+}
 DEFINE_LAUNCH_MATVEC(tq1_0, fn_matvec_tq1_0_f32)
 DEFINE_LAUNCH_MATVEC(tq2_0, fn_matvec_tq2_0_f32)
 
@@ -16090,10 +23152,25 @@ static inline void launch_embed_q2_K_devtoken(hip_llm_runner *r, void *dst,
            256, 1, 1, 0, r->stream, args);
 }
 
+static inline void launch_embed_iq1_m(hip_llm_runner *r, void *dst,
+                                      void *embd_table, int token_id, int n_embd) {
+    void *args[] = { &dst, &embd_table, &token_id, &n_embd };
+    LAUNCH(r->fn_embed_iq1_m, (n_embd + 255) / 256, 1, 1,
+           256, 1, 1, 0, r->stream, args);
+}
+
+static inline void launch_embed_iq1_m_batch(hip_llm_runner *r, void *dst,
+        void *embd_table, void *tokens, int n_embd, int rows) {
+    void *args[] = { &dst, &embd_table, &tokens, &n_embd, &rows };
+    LAUNCH(r->fn_embed_iq1_m_batch, (n_embd + 255) / 256, rows, 1,
+           256, 1, 1, 0, r->stream, args);
+}
+
 static inline void launch_matvec_auto(hip_llm_runner *r, void *dst, void *mat,
                                        void *x, int n_rows, int n_cols, int weight_type) {
     switch (weight_type) {
         case GGML_TYPE_F32:    launch_matvec_f32(r, dst, mat, x, n_rows, n_cols); break;
+        case GGML_TYPE_BF16:   launch_matvec_bf16(r, dst, mat, x, n_rows, n_cols); break;
         case GGML_TYPE_Q8_0: launch_matvec_q8_f32(r, dst, mat, x, n_rows, n_cols); break;
         case GGML_TYPE_Q2_K: launch_matvec_q2_K(r, dst, mat, x, n_rows, n_cols); break;
         case GGML_TYPE_Q3_K: launch_matvec_q3_K(r, dst, mat, x, n_rows, n_cols); break;
@@ -16119,6 +23196,67 @@ static inline void launch_matvec_auto(hip_llm_runner *r, void *dst, void *mat,
     }
 }
 
+/* Per-role IQ1 parity probe for the Qwen3.5 batched prefill path.  llama.cpp
+ * applies its IQ1 affine Q8_1 correction to the FFN projections as well as
+ * recurrent projections.  Keep the gate/up experiment independent so a
+ * measured FFN improvement cannot silently alter SSM or attention arithmetic.
+ */
+static inline void launch_matvec_ffn_auto(hip_llm_runner *r, void *dst,
+                                           void *mat, void *x, int n_rows,
+                                           int n_cols, int weight_type,
+                                           int ssm_layer) {
+    const char *env = getenv(ssm_layer ? "LLM_QWEN35_SSM_FFN_IQ1_Q81" :
+                             "LLM_QWEN35_FFN_IQ1_Q81");
+    const char *mmq_env = getenv(ssm_layer ? "LLM_QWEN35_SSM_FFN_IQ1_MMQ" :
+                                 "LLM_QWEN35_FFN_IQ1_MMQ");
+    /* Keep gate and up independently selectable while auditing accumulated
+     * Q8_1 error.  The generic knob remains the production default; a role
+     * knob, when present, only overrides its matching IQ1 family. */
+    const char *role_env = NULL;
+    const char *role_mmq_env = NULL;
+    if (ssm_layer && weight_type == GGML_TYPE_IQ1_S) {
+        role_env = getenv("LLM_QWEN35_SSM_GATE_IQ1_Q81");
+        role_mmq_env = getenv("LLM_QWEN35_SSM_GATE_IQ1_MMQ");
+    } else if (ssm_layer && weight_type == GGML_TYPE_IQ1_M) {
+        role_env = getenv("LLM_QWEN35_SSM_UP_IQ1_Q81");
+        role_mmq_env = getenv("LLM_QWEN35_SSM_UP_IQ1_MMQ");
+    } else if (!ssm_layer && weight_type == GGML_TYPE_IQ1_S) {
+        role_env = getenv("LLM_QWEN35_FFN_GATE_IQ1_Q81");
+        role_mmq_env = getenv("LLM_QWEN35_FFN_GATE_IQ1_MMQ");
+    } else if (!ssm_layer && weight_type == GGML_TYPE_IQ1_M) {
+        role_env = getenv("LLM_QWEN35_FFN_UP_IQ1_Q81");
+        role_mmq_env = getenv("LLM_QWEN35_FFN_UP_IQ1_MMQ");
+    }
+    int q81_enabled = role_env ? atoi(role_env) : (env && atoi(env) != 0);
+    int mmq_enabled = role_mmq_env ? atoi(role_mmq_env) : (mmq_env && atoi(mmq_env) != 0);
+    int q81_allowed = 1;
+    if (!ssm_layer) {
+        const char *max_layer_env = getenv("LLM_QWEN35_FFN_IQ1_Q81_MAX_LAYER");
+        if (max_layer_env && *max_layer_env) {
+            int max_layer = atoi(max_layer_env);
+            q81_allowed = r->active_layer >= 0 && r->active_layer <= max_layer;
+        }
+    }
+    if (q81_allowed && q81_enabled && weight_type == GGML_TYPE_IQ1_S) {
+        hipFunction_t fn = mmq_enabled ?
+            r->fn_matvec_iq1_s_mmq_scales : r->fn_matvec_iq1_s_q81_batch;
+        if (launch_iq1_q81_scalar(r, fn,
+                                  dst, mat, x, n_rows, n_cols, 1)) return;
+    } else if (q81_allowed && q81_enabled && weight_type == GGML_TYPE_IQ1_M) {
+        if (launch_iq1_q81_scalar(r, r->fn_matvec_iq1_m_q81_batch,
+                                  dst, mat, x, n_rows, n_cols, 1)) return;
+    }
+    if (!q81_allowed && (weight_type == GGML_TYPE_IQ1_S ||
+                         weight_type == GGML_TYPE_IQ1_M)) {
+        void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
+        hipFunction_t fn = weight_type == GGML_TYPE_IQ1_S ?
+                           r->fn_matvec_iq1_s_f32 : r->fn_matvec_iq1_m_f32;
+        LAUNCH(fn, (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args);
+        return;
+    }
+    launch_matvec_auto(r, dst, mat, x, n_rows, n_cols, weight_type);
+}
+
 /* Quality-first batched fallback for attention projections.  Native quantized
  * matvecs preserve the scalar dequantization order; this is intentionally
  * opt-in because one launch per row trades hipBLASLt throughput for parity. */
@@ -16136,6 +23274,93 @@ static inline int launch_matvec_auto_batch(hip_llm_runner *r, void *dst, void *m
         launch_matvec_auto(r, drow, mat, xrow, n_rows, n_cols, weight_type);
     }
     return 0;
+}
+
+/* Diagnostic bridge for the active Qwen3.8 SSM projection path.  llama.cpp
+ * uses Q8_1 MMQ/MVQ for these IQ weights even when the surrounding graph is
+ * executed one token at a time.  The normal runner keeps the scalar F32
+ * dequant path for quality stability; this gate lets the existing, audited
+ * DP4A kernels cover every eligible IQ input projection without changing
+ * unrelated attention/FFN dispatch. */
+static inline void launch_matvec_ssm_auto(hip_llm_runner *r, void *dst, void *mat,
+                                           void *x, int n_rows, int n_cols, int type,
+                                           int is_qkv) {
+    /* Explicit native MMVQ takes precedence over historical diagnostic gates. */
+    if ((type == GGML_TYPE_IQ2_XXS && r->fn_qwen35_matvec_iq2xxs) ||
+        (type == GGML_TYPE_IQ2_XS && r->fn_qwen35_matvec_iq2xs) ||
+        (type == GGML_TYPE_IQ2_S && r->fn_qwen35_matvec_iq2s) ||
+        (type == GGML_TYPE_IQ3_XXS && r->fn_qwen35_matvec_iq3xxs) ||
+        (type == GGML_TYPE_IQ3_S && r->fn_qwen35_matvec_iq3s) ||
+        (type == GGML_TYPE_IQ4_XS && r->fn_qwen35_matvec_iq4xs)) {
+        launch_matvec_auto(r, dst, mat, x, n_rows, n_cols, type);
+        return;
+    }
+    const char *env = getenv("LLM_QWEN35_SSM_DP4A");
+    const char *q81_env = getenv("LLM_QWEN35_SSM_Q81");
+    const char *type_env = getenv("LLM_QWEN35_SSM_DP4A_TYPE");
+    /* llama.cpp uses its Q8_1 MMVQ kernel independently for the QKV and
+     * gate projections.  Keep the IQ3_S switch independently selectable so
+     * a trace can reproduce the reference's first projection without also
+     * changing every other IQ3_S matrix in the layer. */
+    const char *iq3_q81_env = getenv(is_qkv ? "LLM_QWEN35_SSM_QKV_Q81" :
+                                     "LLM_QWEN35_SSM_GATE_Q81");
+    const char *iq3_gate_max_env = !is_qkv ? getenv("LLM_QWEN35_SSM_GATE_Q81_MAX_LAYER") : NULL;
+    int iq3_gate_allowed = 1;
+    if (iq3_gate_max_env && *iq3_gate_max_env) {
+        int max_layer = atoi(iq3_gate_max_env);
+        iq3_gate_allowed = r->active_layer >= 0 && r->active_layer <= max_layer;
+    }
+    int selected_type = type_env ? atoi(type_env) : -1;
+    if ((r->fn_qwen35_rmsnorm_reference ||
+         (iq3_gate_allowed && iq3_q81_env && atoi(iq3_q81_env) != 0)) && type == GGML_TYPE_IQ3_S &&
+        n_cols <= 17408 && (n_cols % 32) == 0) {
+        int one = 1, stride = n_cols;
+        void *qa[] = { &r->d_act_q8_batch, &r->d_act_scale_batch,
+                       &r->d_act_q8_batch_b, &r->d_act_scale_batch_b,
+                       &x, &n_cols, &one, &stride };
+        r->q8x2_reuse_valid = 0;
+        r->iq1_q8_valid = 0;
+        LAUNCH(r->fn_quantize_q81_batch_32_exact, (n_cols + 31) / 32, 1, 1,
+               32, 1, 1, 0, r->stream, qa);
+        void *a[] = { &dst, &mat, &r->d_act_q8_batch,
+                      &r->d_act_scale_batch, &n_rows, &n_cols, &one };
+        hipFunction_t fn = r->fn_qwen35_rmsnorm_reference ?
+            r->fn_matvec_iq3_s_q81_mmvq_batch : r->fn_matvec_iq3_s_q81_batch;
+        LAUNCH(fn, (n_rows + 7) / 8, 1, 1,
+               256, 1, 1, 0, r->stream, a);
+        return;
+    }
+    if (q81_env && atoi(q81_env) != 0 &&
+        (type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ4_XS) &&
+        n_cols <= 17408 && (n_cols % 256) == 0) {
+        int one = 1;
+        launch_quantize_q81_batch_cached(r, x, n_cols, one, n_cols);
+        void *a[] = { &dst, &mat, &r->d_act_q8_batch,
+                      &r->d_act_scale_batch, &n_rows, &n_cols, &one };
+        hipFunction_t fn = type == GGML_TYPE_IQ4_XS ?
+                           r->fn_matvec_iq4_xs_q81_batch :
+                           (getenv("LLM_IQ3_XXS_Q81_MMQ") && atoi(getenv("LLM_IQ3_XXS_Q81_MMQ")) != 0) ?
+                           r->fn_matvec_iq3_xxs_mmq_scales : r->fn_matvec_iq3_xxs_q81_batch;
+        LAUNCH(fn, (n_rows + 7) / 8, 1, 1,
+               256, 1, 1, 0, r->stream, a);
+        return;
+    }
+    if (env && atoi(env) != 0 && n_cols <= 17408 && (n_cols % 256) == 0 &&
+        (selected_type < 0 || selected_type == type) &&
+        (type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_XS ||
+         type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_XXS ||
+         type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ1_S ||
+         type == GGML_TYPE_IQ1_M)) {
+        int saved_decode = r->decode_dp4a;
+        int saved_decode2 = r->decode_dp4a2;
+        r->decode_dp4a = 1;
+        r->decode_dp4a2 = 1;
+        launch_matvec_auto(r, dst, mat, x, n_rows, n_cols, type);
+        r->decode_dp4a = saved_decode;
+        r->decode_dp4a2 = saved_decode2;
+    } else {
+        launch_matvec_auto(r, dst, mat, x, n_rows, n_cols, type);
+    }
 }
 
 static inline void launch_dense_matvec_auto(hip_llm_runner *r, void *dst, void *mat,
@@ -16182,6 +23407,7 @@ DEFINE_LAUNCH_KQ_DEQUANT(iq2_xs)
 DEFINE_LAUNCH_KQ_DEQUANT(iq2_s)
 DEFINE_LAUNCH_KQ_DEQUANT(iq3_s)
 DEFINE_LAUNCH_KQ_DEQUANT(iq1_s)
+DEFINE_LAUNCH_KQ_DEQUANT(iq1_m)
 DEFINE_LAUNCH_KQ_DEQUANT(tq1_0)
 DEFINE_LAUNCH_KQ_DEQUANT(iq2_xxs)
 #undef DEFINE_LAUNCH_KQ_DEQUANT
@@ -16244,7 +23470,8 @@ static inline int batch_qtype_ok(int type) {
            type == GGML_TYPE_Q6_K    || type == GGML_TYPE_IQ3_XXS ||
            type == GGML_TYPE_IQ4_XS  || type == GGML_TYPE_IQ2_XS  ||
            type == GGML_TYPE_IQ2_S   || type == GGML_TYPE_IQ3_S   ||
-           type == GGML_TYPE_IQ1_S   || type == GGML_TYPE_TQ1_0   ||
+           type == GGML_TYPE_IQ1_S   || type == GGML_TYPE_IQ1_M   ||
+           type == GGML_TYPE_TQ1_0   ||
            type == GGML_TYPE_IQ2_XXS;
 }
  
@@ -16252,26 +23479,40 @@ static inline int batch_qtype_ok(int type) {
  * For MoE layers the dense ffn_* weights are unused (the MoE FFN is batched
  * separately by forward_moe_ffn_batched), so skip those checks. */
 static inline int layer_is_batched_eligible(const hip_layer *cl) {
+    const char *native_env = getenv("LLM_QWEN35_NATIVE_IQ2_BATCH");
+    const int native = native_env && atoi(native_env) != 0;
+    #define LAYER_BATCH_OK(t) (batch_qtype_ok(t) || (native && qwen35_native_batch_type(t)))
     int ffn_ok = cl->is_moe ? 1 :
-        (batch_qtype_ok(cl->ffn_gate_type) && batch_qtype_ok(cl->ffn_up_type) &&
-         batch_qtype_ok(cl->ffn_down_type));
-    return batch_qtype_ok(cl->attn_q_type)      &&
-           batch_qtype_ok(cl->attn_k_type)      &&
-           batch_qtype_ok(cl->attn_v_type)      &&
-           batch_qtype_ok(cl->attn_output_type) && ffn_ok;
+        (LAYER_BATCH_OK(cl->ffn_gate_type) && LAYER_BATCH_OK(cl->ffn_up_type) &&
+         LAYER_BATCH_OK(cl->ffn_down_type));
+    int ok = LAYER_BATCH_OK(cl->attn_q_type)      &&
+             LAYER_BATCH_OK(cl->attn_k_type)      &&
+             LAYER_BATCH_OK(cl->attn_v_type)      &&
+             LAYER_BATCH_OK(cl->attn_output_type) && ffn_ok;
+    #undef LAYER_BATCH_OK
+    return ok;
 }
 
-/* True if every SSM projection weight has a batched path. MoE layers skip the
- * dense ffn_* checks (MoE FFN batched separately). */
+/* True if the state-space projections have a batched path.  The dense FFN is
+ * checked at its own dispatch point: requiring its quantizer here needlessly
+ * sends the entire stateful SSM layer through the per-token fallback when, for
+ * example, only an IQ1_M FFN row kernel is missing. */
 static inline int ssm_layer_is_batched_eligible(const hip_layer *cl) {
-    int ffn_ok = cl->is_moe ? 1 :
-        (batch_qtype_ok(cl->ffn_gate_type) && batch_qtype_ok(cl->ffn_up_type) &&
-         batch_qtype_ok(cl->ffn_down_type));
-    return batch_qtype_ok(cl->ssm_qkv_type)   &&
-           batch_qtype_ok(cl->ssm_gate_type)  &&
-           batch_qtype_ok(cl->ssm_alpha_type) &&
-           batch_qtype_ok(cl->ssm_beta_type)  &&
-           batch_qtype_ok(cl->ssm_out_type)   && ffn_ok;
+    /* Native Qwen3.5 dispatch has exact scalar-dequant batch kernels for the
+     * IQ1/IQ2/IQ3/IQ4 family, including IQ1_M.  Keep the generic path
+     * conservative, but let an explicitly enabled native run use those
+     * kernels for SSM projections even when the generic BF16 staging table
+     * does not yet cover the type. */
+    const char *native_env = getenv("LLM_QWEN35_NATIVE_IQ2_BATCH");
+    const int native = native_env && atoi(native_env) != 0;
+    #define SSM_BATCH_OK(t) (batch_qtype_ok(t) || (native && qwen35_native_batch_type(t)))
+    int ok = SSM_BATCH_OK(cl->ssm_qkv_type)   &&
+             SSM_BATCH_OK(cl->ssm_gate_type)  &&
+             SSM_BATCH_OK(cl->ssm_alpha_type) &&
+             SSM_BATCH_OK(cl->ssm_beta_type)  &&
+             SSM_BATCH_OK(cl->ssm_out_type);
+    #undef SSM_BATCH_OK
+    return ok;
 }
 
 static inline void *get_bf16_weight(hip_llm_runner *r, void *raw_w, void *bf16_w,
@@ -16338,6 +23579,9 @@ static inline void *get_bf16_weight(hip_llm_runner *r, void *raw_w, void *bf16_w
         case GGML_TYPE_IQ1_S:
             if (launch_dequant_iq1_s_to_bf16(r, r->d_wbuf_bf16, raw_w, n_rows, n_cols) != 0) return NULL;
             return r->d_wbuf_bf16;
+        case GGML_TYPE_IQ1_M:
+            if (launch_dequant_iq1_m_to_bf16(r, r->d_wbuf_bf16, raw_w, n_rows, n_cols) != 0) return NULL;
+            return r->d_wbuf_bf16;
         case GGML_TYPE_TQ1_0:
             if (launch_dequant_tq1_0_to_bf16(r, r->d_wbuf_bf16, raw_w, n_rows, n_cols) != 0) return NULL;
             return r->d_wbuf_bf16;
@@ -16363,6 +23607,24 @@ static inline void launch_pack_f16_from_f32(hip_llm_runner *r, void *dst,
            r->stream, args);
 }
 
+static inline void launch_quantize_q8_1_f16_heads(hip_llm_runner *r,
+                                                   void *dst, void *src,
+                                                   int n_heads, int head_dim,
+                                                   int M, float scale) {
+    void *args[] = { &dst, &src, &n_heads, &head_dim, &M, &scale };
+    LAUNCH(r->fn_quantize_q8_1_f16_heads, M * n_heads, 1, 1, head_dim, 1, 1,
+           0, r->stream, args);
+}
+
+static inline void launch_quantize_attn_q8_1_batch(hip_llm_runner *r,
+                                                   void *dst, void *scales,
+                                                   void *src, int n_heads,
+                                                   int head_dim, int M, float scale) {
+    void *args[] = { &dst, &scales, &src, &n_heads, &head_dim, &M, &scale };
+    LAUNCH(r->fn_quantize_attn_q8_1_batch, M * n_heads, 1, 1, head_dim,
+           1, 1, 8 * sizeof(float), r->stream, args);
+}
+
 static inline void launch_pack_kv_cache_f16(hip_llm_runner *r,
                                              void *dst_k, void *dst_v,
                                              void *src_k, void *src_v,
@@ -16378,6 +23640,35 @@ static inline void launch_pack_kv_cache_f16(hip_llm_runner *r,
         LAUNCH(r->fn_pack_kv_cache_f16, kv_len, n_kv_heads, 1, block, 1, 1, 0,
                r->stream, args);
     }
+}
+
+/* Reader selector: 0 is legacy Q8 K, 1 is Q4 V, -1 is protected Q8
+ * multiplication for either cache in Q8/Q8 mode (including signed zero). */
+static inline void launch_pack_kv_q8q4_f16(hip_llm_runner *r,
+    void *dst, void *src, void *scales,
+                                             int kv_len, int n_kv_heads, int head_dim,
+                                             int is_v) {
+    is_v = r->kv_cache_type == HIP_LLM_KV_Q8_0_Q8_0 ? -1 : is_v;
+    void *args[] = { &dst, &src, &scales, &kv_len, &n_kv_heads, &head_dim, &is_v };
+    LAUNCH(r->fn_pack_kv_q8q4_f16, kv_len, n_kv_heads, 1, head_dim, 1, 1,
+           0, r->stream, args);
+}
+
+static inline void launch_unpack_kv_q8q4_decode_f16(hip_llm_runner *r,
+    void *dst, void *src, void *scales, int kv_len, int n_kv_heads,
+    int head_dim, int is_v) {
+    is_v = r->kv_cache_type == HIP_LLM_KV_Q8_0_Q8_0 ? -1 : is_v;
+    void *args[] = { &dst, &src, &scales, &kv_len, &n_kv_heads, &head_dim, &is_v };
+    if (r->requested_qwen35_decode_graph && r->kv_cache_type == HIP_LLM_KV_Q8_0_Q8_0) {
+        void *dynamic[] = { &dst, &src, &scales, &r->d_position, &n_kv_heads, &head_dim, &is_v };
+        int total = r->max_seq_len * n_kv_heads * head_dim;
+        LAUNCH(r->fn_unpack_kv_q8q4_decode_f16_devp, (total + 255) / 256, 1, 1,
+               256, 1, 1, 0, r->stream, dynamic);
+        return;
+    }
+    int total = kv_len * n_kv_heads * head_dim;
+    LAUNCH(r->fn_unpack_kv_q8q4_decode_f16, (total + 255) / 256, 1, 1,
+           256, 1, 1, 0, r->stream, args);
 }
 
 static inline void launch_rope_neox_batch_ff(hip_llm_runner *r, void *vec_batch,
@@ -16548,6 +23839,17 @@ static inline void launch_kv_store_i8_batch(hip_llm_runner *r, void *kc, void *v
     LAUNCH(r->fn_kv_cache_store_i8_batch, M * n_kv_heads, 1, 1, 256, 1, 1, 0, r->stream, args);
 }
 
+static inline void launch_kv_store_q8q4_batch(hip_llm_runner *r, void *kc, void *vc,
+    void *ks, void *vs, void *k, void *v, int n_kv_heads, int head_dim,
+    int position_start, int M) {
+    void *args[] = { &kc, &vc, &ks, &vs, &k, &v, &n_kv_heads, &head_dim,
+                     &position_start, &M };
+    hipFunction_t fn = r->kv_cache_type == HIP_LLM_KV_Q8_0_Q8_0 ?
+        r->fn_kv_cache_store_q8q8_batch : r->fn_kv_cache_store_q8q4_batch;
+    LAUNCH(fn, M * n_kv_heads, 1, 1, 256, 1, 1,
+           0, r->stream, args);
+}
+
 static inline void launch_attn_prefill_flash_f16(hip_llm_runner *r,
     void *out, void *q, void *key_cache, void *value_cache,
     int n_heads, int n_kv_heads, int head_dim, int kv_dim,
@@ -16557,6 +23859,27 @@ static inline void launch_attn_prefill_flash_f16(hip_llm_runner *r,
     size_t smem = ((size_t)(2 * head_dim + 2 * 256)) * sizeof(float);
     LAUNCH(r->fn_attn_prefill_flash_f16, n_heads, M, 1, 256, 1, 1,
            smem, r->stream, args);
+}
+
+static inline void launch_attn_prefill_fattn_vec_f16(hip_llm_runner *r,
+    void *out, void *q_f16, void *key_cache, void *value_cache,
+    int n_heads, int n_kv_heads, int head_dim, int kv_len,
+    int M, int position_start, float scale) {
+    void *args[] = { &out, &q_f16, &key_cache, &value_cache, &n_heads,
+                     &n_kv_heads, &head_dim, &kv_len, &M, &position_start, &scale };
+    LAUNCH(r->fn_attn_prefill_fattn_vec_f16, n_heads, M, 1, 256, 1, 1,
+           (32 + 32 + 2) * sizeof(float), r->stream, args);
+}
+
+static inline void launch_attn_prefill_fattn_vec_q8q4(hip_llm_runner *r,
+    void *out, void *q8, void *qscale, void *key_cache, void *value_cache,
+    void *key_scale, void *value_scale, int n_heads, int n_kv_heads,
+    int head_dim, int kv_dim, int value_stride, int M, int position_start) {
+    void *args[] = { &out, &q8, &qscale, &key_cache, &value_cache,
+        &key_scale, &value_scale, &n_heads, &n_kv_heads, &head_dim, &kv_dim,
+        &value_stride, &M, &position_start };
+    LAUNCH(r->fn_attn_prefill_fattn_vec_q8q4, n_heads, M, 1, 128, 1, 1,
+           34 * sizeof(float), r->stream, args);
 }
 
 static inline void launch_attn_prefill_i8(hip_llm_runner *r,
@@ -16580,6 +23903,189 @@ static inline void launch_attn_prefill_i8(hip_llm_runner *r,
             r->fn_attn_prefill_flash_i8_warp : r->fn_attn_prefill_flash_i8;
         LAUNCH(fn, n_heads, M, 1, 256, 1, 1, smem, r->stream, args);
     }
+}
+
+static inline void launch_attn_decode_native_q8(hip_llm_runner *r, void *out,
+        void *q, void *k, void *v, void *ks, void *vs) {
+    /* Pinned ROCm 10 gfx1201 reference occupancy, measured by the differential
+     * test. Using this port's occupancy would change the split/reduction order. */
+    int occupancy = 11, forced_splits = 0, queries = 1, position_start = -1;
+    int adaptive_long_context = 1;
+    void *a[] = { &out, &r->d_q8_attention_parts, &r->d_q8_attention_meta,
+        &q, &k, &v, &ks, &vs, &r->d_position, &r->n_heads, &r->n_kv_heads,
+        &r->q8_attention_nsm, &occupancy, &forced_splits, &queries,
+        &position_start, &adaptive_long_context };
+    if (r->n_heads == 6 * r->n_kv_heads &&
+        r->fn_q8_attention_decode_gqa3_reuse) {
+        /* The reuse kernel is context-polymorphic when its adaptive guard is
+         * disabled.  Use it for both short and long windows so the paired
+         * gqa3 launch cannot become a no-op at either side of the boundary. */
+        adaptive_long_context = 0;
+        LAUNCH(r->fn_q8_attention_decode_gqa3_reuse,
+               2 * r->n_kv_heads * r->q8_attention_max_splits, 1, 1,
+               32, 4, 1, 0, r->stream, a);
+    } else if (r->n_heads == 6 * r->n_kv_heads &&
+               r->fn_q8_attention_decode_gqa3) {
+        LAUNCH(r->fn_q8_attention_decode_gqa3,
+               2 * r->n_kv_heads * r->q8_attention_max_splits, 1, 1,
+               32, 12, 1, 0, r->stream, a);
+    } else {
+        LAUNCH(r->fn_q8_attention_decode,
+               r->n_heads * r->q8_attention_max_splits, 1, 1,
+               32, 4, 1, 0, r->stream, a);
+    }
+    /* The decode kernel writes final output directly when its adaptive split
+     * count is one; avoid enqueueing the combine no-op while the causal
+     * length is at most one 256-token tile for uncaptured decode. Captured
+     * graphs must retain combine: capture starts at position zero, but replay
+     * reads a changing device position and may require multiple splits. The
+     * combine kernel itself returns immediately when the split count is one. */
+    if (!r->requested_qwen35_decode_graph &&
+        r->cur_position >= 0 && r->cur_position < 256) return;
+    void *b[] = { &out, &r->d_q8_attention_parts, &r->d_q8_attention_meta,
+        &r->d_position, &r->n_heads, &r->q8_attention_nsm, &occupancy, &forced_splits };
+    LAUNCH(r->fn_q8_attention_combine, r->n_heads, 1, 1, 256, 1, 1,
+           (size_t)r->q8_attention_max_splits * 2 * sizeof(float), r->stream, b);
+}
+
+static inline void launch_attn_verify_native_q8(hip_llm_runner *r, void *out,
+        void *parts, void *meta, void *q, void *k, void *v, void *ks,
+        void *vs, void *positions, void *gate, int queries, int group_queries) {
+    /* The verifier owns separate captured graphs for equal and mixed adaptive
+     * split counts.  Equal-count windows share every K/V row; selector
+     * boundaries retain the ordinary per-query grid. */
+    int occupancy = 11, forced_splits = 0;
+    int position_start = -1;
+    int launch_splits = r->q8_attention_max_splits;
+    void *a[] = { &out, &parts, &meta, &q, &k, &v, &ks, &vs, &positions,
+        &r->n_heads, &r->n_kv_heads, &r->q8_attention_nsm, &occupancy,
+        &forced_splits, &queries, &position_start };
+    const char *fused_split_env = getenv("LLM_QWEN35_VERIFY_FUSED_SPLIT_COMBINE");
+    int fused_split = fused_split_env && atoi(fused_split_env) != 0 &&
+        group_queries && queries > 1 && queries <= 16 &&
+        r->fn_q8_attention_decode_verify_fused;
+    if (fused_split) {
+        void *fa[] = { &out, &parts, &meta, &q, &k, &v, &ks, &vs,
+            &gate, &positions, &r->n_heads, &r->n_kv_heads,
+            &r->q8_attention_nsm, &occupancy, &forced_splits, &queries,
+            &position_start };
+        LAUNCH(r->fn_q8_attention_decode_verify_fused, r->n_heads,
+               (queries + 3) / 4, 1, 32, 4, 1, 0, r->stream, fa);
+        return;
+    }
+    if (group_queries && queries > 1 && queries <= 8 &&
+        r->fn_q8_attention_decode_reuse8) {
+        const char *fixed8_env = getenv("LLM_QWEN35_VERIFY_ATTN_FIXED8");
+        hipFunction_t fn = queries == 8 && (!fixed8_env || atoi(fixed8_env) != 0) &&
+            r->fn_q8_attention_decode_reuse_fixed8 ?
+            r->fn_q8_attention_decode_reuse_fixed8 : r->fn_q8_attention_decode_reuse8;
+        const char *fixed5_env = getenv("LLM_QWEN35_VERIFY_ATTN_FIXED5");
+        if (queries == 5 && (!fixed5_env || atoi(fixed5_env) != 0) &&
+            r->fn_q8_attention_decode_reuse_fixed5)
+            fn = r->fn_q8_attention_decode_reuse_fixed5;
+        LAUNCH(fn, 1,
+               launch_splits, r->n_heads,
+               32, 4, 1, 0, r->stream, a);
+    } else {
+        LAUNCH(r->fn_q8_attention_decode, queries,
+               launch_splits, r->n_heads,
+               32, 4, 1, 0, r->stream, a);
+    }
+    const char *group_combine_env = getenv("LLM_QWEN35_VERIFY_COMBINE_GROUPED");
+    int grouped_mode = group_combine_env ? atoi(group_combine_env) : 0;
+    /* Keep malformed diagnostic values on the serialized reference path or
+     * the highest explicitly supported grouped mode. */
+    if (grouped_mode < 0) grouped_mode = 0;
+    if (grouped_mode > 3) grouped_mode = 3;
+    /* Do not pay the 16-row shared tile for a short captured window.  The
+     * narrower kernels retain identical per-row arithmetic and reduce both
+     * shared allocation and idle row loops for the common K=4/K=7 graphs. */
+    int grouped_width = queries <= 4 ? 4 :
+        queries <= 8 ? (grouped_mode >= 2 ? 8 : 4) :
+        (grouped_mode >= 3 ? 16 : grouped_mode >= 2 ? 8 : 4);
+    hipFunction_t grouped_fn = grouped_width == 16 ?
+        (gate ? r->fn_q8_attention_combine_verify16_gate :
+                r->fn_q8_attention_combine_verify16) :
+        grouped_width == 8 ?
+            (gate ? r->fn_q8_attention_combine_verify8_gate :
+                    r->fn_q8_attention_combine_verify8) :
+            (gate ? r->fn_q8_attention_combine_verify4_gate :
+                    r->fn_q8_attention_combine_verify4);
+    int grouped_combine = grouped_mode != 0 && group_queries && queries > 1 &&
+        grouped_fn;
+    if (grouped_combine) {
+        void *ungated[] = { &out, &parts, &meta, &positions, &r->n_heads,
+            &r->q8_attention_nsm, &occupancy, &forced_splits, &queries };
+        void *gated[] = { &out, &parts, &meta, &gate, &positions, &r->n_heads,
+            &r->q8_attention_nsm, &occupancy, &forced_splits, &queries };
+        LAUNCH(grouped_fn, r->n_heads,
+               (queries + grouped_width - 1) / grouped_width, 1,
+               256, 1, 1, 0,
+               r->stream, gate ? gated : ungated);
+    } else if (gate && r->fn_q8_attention_combine_gate) {
+        void *b[] = { &out, &parts, &meta, &gate, &positions, &r->n_heads,
+            &r->q8_attention_nsm, &occupancy, &forced_splits };
+        LAUNCH(r->fn_q8_attention_combine_gate, r->n_heads, queries, 1,
+               256, 1, 1,
+               (size_t)r->q8_attention_max_splits * 2 * sizeof(float),
+               r->stream, b);
+    } else {
+        void *b[] = { &out, &parts, &meta, &positions, &r->n_heads,
+            &r->q8_attention_nsm, &occupancy, &forced_splits };
+        LAUNCH(r->fn_q8_attention_combine, r->n_heads, queries, 1, 256, 1, 1,
+               (size_t)r->q8_attention_max_splits * 2 * sizeof(float), r->stream, b);
+    }
+}
+
+static int launch_attn_prefill_native_q8(hip_llm_runner *r, void *out,
+        void *q, void *k, void *v, void *ks, void *vs, int queries, int position_start) {
+    /* At long context the exact vector kernel re-reads K/V for every query.
+     * Switch only after the ordinary 4K workload to the 128-query WMMA tile,
+     * whose paired waves keep D=256 below the gfx1201 register cliff. */
+    if (r->fn_q8_attention_prefill_wmma && queries >= 64 &&
+        position_start + queries > 4096) {
+        void *wmma[] = { &out, &q, &k, &v, &ks, &vs, &r->n_heads,
+            &r->n_kv_heads, &queries, &position_start };
+        CHECK_HIP(LAUNCH(r->fn_q8_attention_prefill_wmma, r->n_heads,
+            (queries + 127) / 128, 1, 512, 1, 1, 0, r->stream, wmma));
+        return 0;
+    }
+    /* Updated only alongside the two-column pinned reference differential test. */
+    int occupancy = 9;
+    int tiles = (position_start + queries + 255) / 256;
+    int splits = occupancy < tiles ? occupancy : tiles;
+    int tiles_dst = ((queries + 1) / 2) * r->n_heads;
+    int blocks_per_wave = r->q8_attention_nsm * occupancy;
+    int best = 0, waves_best = 0;
+    for (int trial = splits; trial <= tiles; ++trial) {
+        int waves = (tiles_dst * trial + blocks_per_wave - 1) / blocks_per_wave;
+        int efficiency = 100 * tiles_dst * trial / (waves * blocks_per_wave);
+        if (best >= 95 && waves > waves_best) break;
+        if (efficiency > best) { best = efficiency; waves_best = waves; splits = trial; }
+    }
+    size_t count = (size_t)queries * r->n_heads * splits;
+    if (count > r->q8_prefill_capacity) {
+        if (r->d_q8_prefill_parts) {
+            CHECK_HIP(hipFree(r->d_q8_prefill_parts)); r->d_q8_prefill_parts = NULL;
+        }
+        if (r->d_q8_prefill_meta) {
+            CHECK_HIP(hipFree(r->d_q8_prefill_meta)); r->d_q8_prefill_meta = NULL;
+        }
+        r->q8_prefill_capacity = 0;
+        CHECK_HIP(hipMalloc(&r->d_q8_prefill_parts, count * 256 * sizeof(float)));
+        CHECK_HIP(hipMalloc(&r->d_q8_prefill_meta, count * 2 * sizeof(float)));
+        r->q8_prefill_capacity = count;
+    }
+    void *a[] = { &out, &r->d_q8_prefill_parts, &r->d_q8_prefill_meta,
+        &q, &k, &v, &ks, &vs, &r->d_position, &r->n_heads, &r->n_kv_heads,
+        &r->q8_attention_nsm, &occupancy, &splits, &queries, &position_start };
+    CHECK_HIP(LAUNCH(r->fn_q8_attention_decode, queries, splits, r->n_heads, 32, 4, 1, 0, r->stream, a));
+    if (splits == 1) return 0;
+    void *b[] = { &out, &r->d_q8_prefill_parts, &r->d_q8_prefill_meta,
+        &r->d_position, &r->n_heads, &r->q8_attention_nsm, &occupancy, &splits };
+    CHECK_HIP(LAUNCH(r->fn_q8_attention_combine, r->n_heads, queries, 1, 256, 1, 1,
+           (size_t)splits * 2 * sizeof(float), r->stream, b));
+    return 0;
 }
 
 static inline void launch_attn_decode_flash_f16(hip_llm_runner *r,
@@ -16629,6 +24135,93 @@ static inline void launch_attn_decode_i8(hip_llm_runner *r,
     }
 }
 
+static inline void launch_attn_decode_q8q4(hip_llm_runner *r, void *out, void *q,
+    void *kc, void *vc, void *ks, void *vs, int n_heads, int n_kv_heads,
+    int head_dim, int kv_dim, float scale) {
+    int *pos_p = r->d_position;
+    int value_stride = n_kv_heads * (head_dim / 2);
+    void *args[] = { &out, &q, &kc, &vc, &ks, &vs, &n_heads, &n_kv_heads,
+                     &head_dim, &kv_dim, &value_stride, &pos_p, &scale };
+    unsigned threads = 256;
+    const char *threads_env = getenv("LLM_ATTN_DECODE_Q8Q4_THREADS");
+    if (threads_env) {
+        int v = atoi(threads_env);
+        if (v == 128 || v == 256 || v == 512) threads = (unsigned)v;
+    }
+    size_t smem = ((size_t)(2 * head_dim + 2 * threads)) * sizeof(float);
+    const char *warpred = getenv("LLM_ATTN_DECODE_Q8Q4_WARPRED");
+    const char *split = getenv("LLM_ATTN_DECODE_Q8Q4_SPLIT");
+    const char *split_dp4a = getenv("LLM_ATTN_DECODE_Q8Q4_DP4A");
+    if (split && atoi(split) != 0 && r->d_attn_decode_partial &&
+        r->d_attn_decode_partial_splits > 0) {
+        const int chunk = r->d_attn_decode_partial_chunk > 0 ?
+                          r->d_attn_decode_partial_chunk : 2048;
+        /* Keep the launch shape invariant so Phase-5 graph capture remains
+         * valid as position advances. Inactive tail segments self-clear their
+         * partials in the kernel. */
+        int splits = r->d_attn_decode_partial_splits;
+        const char *vecv = getenv("LLM_ATTN_DECODE_Q8Q4_VECV");
+        if (vecv && atoi(vecv) != 0 && r->fn_attn_decode_q8q4_split_dp4a_vecv &&
+            n_heads > 0 && n_kv_heads > 0 && head_dim == 256) {
+            launch_quantize_q8(r, q, n_heads * head_dim,
+                               r->d_act_q8, r->d_act_scale);
+            int vthreads = 128;
+            void *va[] = { &r->d_attn_decode_partial, &r->d_act_q8,
+                           &r->d_act_scale, &kc, &vc, &ks, &vs,
+                           &n_heads, &n_kv_heads, &head_dim, &kv_dim,
+                           &value_stride, &pos_p, &scale, &splits,
+                           (void *)&chunk };
+            LAUNCH(r->fn_attn_decode_q8q4_split_dp4a_vecv, n_heads, splits, 1,
+                   vthreads, 1, 1, (size_t)(2 * vthreads) * sizeof(float),
+                   r->stream, va);
+            void *ca[] = { &out, &r->d_attn_decode_partial, &n_heads, &head_dim, &splits };
+            LAUNCH(r->fn_attn_decode_q8q4_split_combine, n_heads, 1, 1, 256, 1, 1,
+                   sizeof(float), r->stream, ca);
+            return;
+        }
+        if (split_dp4a && atoi(split_dp4a) != 0) {
+            launch_quantize_q8(r, q, n_heads * head_dim,
+                               r->d_act_q8, r->d_act_scale);
+            void *da[] = { &r->d_attn_decode_partial, &r->d_act_q8,
+                           &r->d_act_scale, &kc, &vc, &ks, &vs,
+                           &n_heads, &n_kv_heads, &head_dim, &kv_dim,
+                           &value_stride, &pos_p, &scale, &splits,
+                           (void *)&chunk };
+            LAUNCH(r->fn_attn_decode_q8q4_split_dp4a, n_heads, splits, 1,
+                   256, 1, 1, smem, r->stream, da);
+        } else {
+        void *sa[] = { &r->d_attn_decode_partial, &q, &kc, &vc, &ks, &vs,
+                       &n_heads, &n_kv_heads, &head_dim, &kv_dim, &value_stride,
+                       &pos_p, &scale, &splits, (void *)&chunk };
+        LAUNCH(r->fn_attn_decode_q8q4_split, n_heads, splits, 1, 256, 1, 1,
+               smem, r->stream, sa);
+        }
+        void *ca[] = { &out, &r->d_attn_decode_partial, &n_heads, &head_dim, &splits };
+        LAUNCH(r->fn_attn_decode_q8q4_split_combine, n_heads, 1, 1, 256, 1, 1,
+               sizeof(float), r->stream, ca);
+        return;
+    }
+    if (warpred && atoi(warpred) != 0 && threads == 256 &&
+        r->fn_attn_decode_q8q4_warpred) {
+        LAUNCH(r->fn_attn_decode_q8q4_warpred, n_heads, 1, 1, threads, 1, 1,
+               smem, r->stream, args);
+    } else {
+        LAUNCH(r->fn_attn_decode_flash_q8q4, n_heads, 1, 1, threads, 1, 1,
+               smem, r->stream, args);
+    }
+}
+
+static inline void launch_attn_prefill_q8q4(hip_llm_runner *r, void *out, void *q,
+    void *kc, void *vc, void *ks, void *vs, int n_heads, int n_kv_heads,
+    int head_dim, int kv_dim, int M, int position_start, float scale) {
+    int value_stride = n_kv_heads * (head_dim / 2);
+    void *args[] = { &out, &q, &kc, &vc, &ks, &vs, &n_heads, &n_kv_heads,
+                     &head_dim, &kv_dim, &value_stride, &M, &position_start, &scale };
+    size_t smem = ((size_t)(2 * head_dim + 2 * 256)) * sizeof(float);
+    LAUNCH(r->fn_attn_prefill_flash_q8q4, n_heads, M, 1, 256, 1, 1,
+           smem, r->stream, args);
+}
+
 /* WMMA flash attention for Gemma4 full-attention layers (head_dim 512). Reads the
  * F32 KV cache directly. Grid (n_heads, ceil(M/16)), 1 wave/block, O in LDS. */
 static inline void launch_flash_attn_wmma_hd512(hip_llm_runner *r,
@@ -16656,11 +24249,19 @@ static inline void launch_softplus_mul(hip_llm_runner *r, void *out,
 
 /* Batched softplus_mul: bias/a are dt_rank-wide layer constants, broadcast over M rows. */
 static inline void launch_softplus_mul_batch(hip_llm_runner *r, void *out,
-    void *in, void *bias, void *a, int dt_rank, int M) {
-    void *args[] = { &out, &in, &bias, &a, &dt_rank, &M };
+    void *in, void *bias, void *a, int dt_rank, int M, int exponentiate) {
+    void *args[] = { &out, &in, &bias, &a, &dt_rank, &M, &exponentiate };
     int total = M * dt_rank;
     LAUNCH(r->fn_softplus_mul_batch_f32, (total + 255) / 256, 1, 1, 256, 1, 1, 0,
            r->stream, args);
+}
+
+static inline void launch_ssm_alpha_beta_prepare_batch(hip_llm_runner *r,
+    void *alpha, void *beta, void *bias, void *a, int dt_rank, int M) {
+    void *args[] = { &alpha, &beta, &bias, &a, &dt_rank, &M };
+    int total = M * dt_rank;
+    LAUNCH(r->fn_ssm_alpha_beta_prepare_batch_f32, (total + 255) / 256, 1, 1,
+           256, 1, 1, 0, r->stream, args);
 }
 
 static inline void launch_sigmoid_inplace(hip_llm_runner *r, void *data, int n) {
@@ -16668,14 +24269,43 @@ static inline void launch_sigmoid_inplace(hip_llm_runner *r, void *data, int n) 
     LAUNCH(r->fn_sigmoid_inplace_f32, (n + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, args);
 }
 
+static inline void launch_silu_gate_mul(hip_llm_runner *r, void *data,
+    void *gate, int n) {
+    void *args[] = { &data, &gate, &n };
+    LAUNCH(r->fn_silu_gate_mul_f32, (n + 255) / 256, 1, 1, 256, 1, 1, 0,
+           r->stream, args);
+}
+
+static inline void launch_rmsnorm_heads_inplace(hip_llm_runner *r, void *data,
+    void *norm_w, int n_heads, int head_dim, float eps) {
+    int threads = head_dim <= 128 ? 128 : 256;
+    void *args[] = { &data, &norm_w, &n_heads, &head_dim, &eps };
+    LAUNCH(r->fn_rmsnorm_heads_inplace_f32, n_heads, 1, 1, threads, 1, 1,
+           threads * sizeof(float), r->stream, args);
+}
+
 static inline void launch_conv1d(hip_llm_runner *r, void *conv_out,
     void *conv_state, void *input, void *weight, int qkv_dim, int conv_k) {
     void *args[] = { &conv_out, &conv_state, &input, &weight, &qkv_dim, &conv_k };
-    LAUNCH(r->fn_conv1d_depthwise_silu_f32, (qkv_dim + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, args);
+    hipFunction_t fn = r->fn_qwen35_conv_reference ? r->fn_qwen35_conv_reference : r->fn_conv1d_depthwise_silu_f32;
+    LAUNCH(fn, (qkv_dim + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, args);
 }
 
 static inline void launch_l2_norm_heads(hip_llm_runner *r, void *data,
     int n_heads, int head_dim, float eps) {
+    if (r->fn_qwen35_rmsnorm_reference) {
+        /* build_gdn_l2_norm is RMSNorm(eps/n), then a separate 1/sqrt(n)
+         * scale. Collapsing that to rsqrt(sum+eps) changes rounded results. */
+        void *weight = NULL;
+        float norm_eps = eps / head_dim, scale = 1.0f / sqrtf((float)head_dim);
+        void *a[] = { &data, &data, &weight, &head_dim, &head_dim, &norm_eps };
+        LAUNCH(r->fn_qwen35_rmsnorm_reference, n_heads, 1, 1,
+               head_dim < 1024 ? 256 : 1024, 1, 1, 0, r->stream, a);
+        int n = n_heads * head_dim;
+        void *b[] = { &data, &scale, &n };
+        LAUNCH(r->fn_scale_f32, (n + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, b);
+        return;
+    }
     int threads = (head_dim <= 128) ? 128 : 256;
     void *args[] = { &data, &n_heads, &head_dim, &eps };
     LAUNCH(r->fn_l2_norm_heads_f32, n_heads, 1, 1, threads, 1, 1, threads * sizeof(float), r->stream, args);
@@ -16691,13 +24321,32 @@ static inline void launch_repeat_tile(hip_llm_runner *r, void *dst,
 static inline void launch_deltanet_step(hip_llm_runner *r, void *state,
     void *out, void *Q, void *K, void *V,
     void *alpha, void *beta, int dt_rank, int d_state) {
+    const char *ref_env = getenv("LLM_QWEN35_GDA_REF_SCALAR");
+    if (r->is_hybrid && !r->is_qwen4exp && d_state == 128 &&
+        ref_env && atoi(ref_env) != 0) {
+        /* Reuse the audited reference layout with one token. All scalar
+         * inputs are contiguous; V has a single dt_rank*d_state row. */
+        int stride = dt_rank * d_state, one = 1, parity = 1;
+        void *ref_args[] = { &state, &out, &Q, &K, &V, &alpha, &beta,
+                            &dt_rank, &d_state, &stride, &one, &parity };
+        hipFunction_t ref_fn = r->fn_deltanet_step_batch_gda_ref_128_f32;
+        LAUNCH(ref_fn, dt_rank, 1,
+               (d_state + 3) / 4, 32, 4, 1, 0, r->stream, ref_args);
+        return;
+    }
+    int legacy_order = 0;
+    const char *legacy_env = getenv("LLM_QWEN35_GDA_LEGACY_ORDER");
+    if (legacy_env && atoi(legacy_env) != 0) legacy_order = 1;
     void *args[] = { &state, &out, &Q, &K, &V, &alpha, &beta, &d_state };
+    void *args_legacy[] = { &state, &out, &Q, &K, &V, &alpha, &beta,
+                            &d_state, &legacy_order };
     if (r->ssm_fused_decode && d_state == 128) {
         /* warp-per-row: 8 warps/block, 8 rows/warp -> blocks = heads*rows/64 */
         int blocks = dt_rank * d_state / 64;
         LAUNCH(r->fn_deltanet_step_warp_f32, blocks, 1, 1, 256, 1, 1, 0, r->stream, args);
     } else {
-        LAUNCH(r->fn_deltanet_step_f32, dt_rank, 1, 1, d_state, 1, 1, 0, r->stream, args);
+        LAUNCH(r->fn_deltanet_step_f32, dt_rank, 1, 1, d_state, 1, 1, 0,
+               r->stream, args_legacy);
     }
 }
 
@@ -16753,11 +24402,29 @@ static inline void launch_deltanet_step_batch(hip_llm_runner *r, void *state,
      * parity mode is implemented by the direct kernel; callers selecting
      * LLM_SSM_BATCH_PARITY should also set LLM_SSM_BATCH_WARP=0. */
     const char *batch_warp_env = getenv("LLM_SSM_BATCH_WARP");
-    int use_warp = d_state == 128 && (!batch_warp_env || atoi(batch_warp_env) != 0);
+    /* llama.cpp's Qwen3.5 GDA kernel is the numerical reference: one
+     * 32-lane warp owns a state column and reduces the old-state dot before
+     * applying decay.  The older warp-per-row kernel is faster on some
+     * shapes, but its reassociation changes the recurrent stream enough to
+     * move final logits.  Keep it available as an explicit benchmark opt-in;
+     * production batched execution defaults to the reference order. */
+    int use_warp = d_state == 128 && batch_warp_env && atoi(batch_warp_env) != 0;
     if (use_warp) {
         int blocks = dt_rank * d_state / 64;
         LAUNCH(r->fn_deltanet_step_batch_warp_f32, blocks, 1, 1, 256, 1, 1, 0,
                r->stream, args);
+    } else if (d_state <= 128 && (parity || !use_warp)) {
+        /* Match llama.cpp's GDA kernel: 32-lane warp per column, four
+         * columns per block.  Qwen3.5 uses the scalar-decay GDA form. */
+        int decay_ready = d_state == 128 ? 2 : 1;
+        void *ref_args[] = { &state, &out_batch, &Q_batch, &K_batch, &V_batch,
+            &alpha_batch, &beta_batch, &dt_rank, &d_state, &v_row_stride, &M,
+            &decay_ready };
+        hipFunction_t ref_fn = d_state == 128 ?
+            r->fn_deltanet_step_batch_gda_ref_128_f32 :
+            r->fn_deltanet_step_batch_gda_ref_f32;
+        LAUNCH(ref_fn, dt_rank, 1,
+               (d_state + 3) / 4, 32, 4, 1, 0, r->stream, ref_args);
     } else {
         LAUNCH(r->fn_deltanet_step_batch_f32, dt_rank, 1, 1, d_state, 1, 1, 0,
                r->stream, args);
@@ -16766,10 +24433,29 @@ static inline void launch_deltanet_step_batch(hip_llm_runner *r, void *state,
 
 static inline void launch_gated_rmsnorm_silu(hip_llm_runner *r, void *out,
     void *z, void *norm_w, int dt_rank, int d_state, float eps) {
+    if (r->fn_qwen35_rmsnorm_reference && !r->is_qwen4exp) {
+        launch_rmsnorm_batch(r, out, out, norm_w, d_state, dt_rank, d_state, eps);
+        int n = dt_rank * d_state;
+        void *a[] = { &out, &z, &n };
+        LAUNCH(r->fn_qwen35_silu_gate_reference, (n + 255) / 256, 1, 1,
+               256, 1, 1, 0, r->stream, a);
+        return;
+    }
     int threads = (d_state <= 128) ? 128 : 256;
     int gate_silu = !r->is_qwen4exp;
     void *args[] = { &out, &z, &norm_w, &dt_rank, &d_state, &eps, &gate_silu };
     LAUNCH(r->fn_gated_rmsnorm_silu_f32, dt_rank, 1, 1, threads, 1, 1, threads * sizeof(float), r->stream, args);
+}
+
+static inline void launch_gated_rmsnorm_silu_native_q81(hip_llm_runner *r,
+    void *out, void *z, void *norm_w, int dt_rank, int d_state, float eps) {
+    void *args[] = { &out, &z, &norm_w, &r->d_native_q81,
+                     &r->d_native_scale, &dt_rank, &d_state, &eps };
+    LAUNCH(r->fn_gated_rmsnorm_silu_q81_f32, dt_rank, 1, 1,
+           128, 1, 1, 128 * sizeof(float), r->stream, args);
+    r->native_q81_source = out;
+    r->native_q81_n = dt_rank * d_state;
+    r->native_q81_valid = 1;
 }
 
 /* ---- Batched SSM aux op launchers (one launch over M rows) ---- */
@@ -16780,6 +24466,16 @@ static inline void launch_l2_norm_heads_batch(hip_llm_runner *r, void *data,
     void *args[] = { &data, &n_heads, &head_dim, &row_stride, &M, &eps };
     LAUNCH(r->fn_l2_norm_heads_batch_f32, n_heads, M, 1, threads, 1, 1,
            threads * sizeof(float), r->stream, args);
+}
+
+static inline void launch_l2_norm_repeat_qk_batch(hip_llm_runner *r,
+    void *q_exp, void *k_exp, void *qk, int n_group, int head_dim,
+    int dt_rank, int qkv_stride, int exp_stride, int M, float eps) {
+    int threads = (head_dim <= 128) ? 128 : 256;
+    void *args[] = { &q_exp, &k_exp, &qk, &n_group, &head_dim, &dt_rank,
+                     &qkv_stride, &exp_stride, &M, &eps };
+    LAUNCH(r->fn_l2_norm_repeat_qk_batch_f32, n_group, M, 1, threads, 1, 1,
+           2 * threads * sizeof(float), r->stream, args);
 }
 
 static inline void launch_repeat_tile_batch(hip_llm_runner *r, void *dst, void *src,
@@ -16795,6 +24491,16 @@ static inline void launch_repeat_tile_batch(hip_llm_runner *r, void *dst, void *
 static inline void launch_gated_rmsnorm_silu_batch(hip_llm_runner *r, void *out,
     void *z, void *norm_w, int dt_rank, int d_state, int row_stride, int M,
     float eps) {
+    if (r->fn_qwen35_rmsnorm_reference && !r->is_qwen4exp &&
+        row_stride == dt_rank * d_state) {
+        launch_rmsnorm_batch(r, out, out, norm_w, d_state, M * dt_rank,
+                             d_state, eps);
+        int n = M * dt_rank * d_state;
+        void *a[] = { &out, &z, &n };
+        LAUNCH(r->fn_qwen35_silu_gate_reference, (n + 255) / 256, 1, 1,
+               256, 1, 1, 0, r->stream, a);
+        return;
+    }
     int threads = (d_state <= 128) ? 128 : 256;
     int gate_silu = !r->is_qwen4exp;
     void *args[] = { &out, &z, &norm_w, &dt_rank, &d_state, &row_stride, &M, &eps, &gate_silu };
@@ -16803,17 +24509,56 @@ static inline void launch_gated_rmsnorm_silu_batch(hip_llm_runner *r, void *out,
 }
 
 static inline void launch_conv1d_batch(hip_llm_runner *r, void *conv_out_batch,
-    void *conv_state, void *input_batch, void *weight,
+    void *conv_state, void *checkpoints, void *input_batch, void *weight,
     int qkv_dim, int conv_k, int row_stride, int M) {
-    void *args[] = { &conv_out_batch, &conv_state, &input_batch, &weight,
+    void *args[] = { &conv_out_batch, &conv_state, &checkpoints, &input_batch,
+                     &weight,
                      &qkv_dim, &conv_k, &row_stride, &M };
     LAUNCH(r->fn_conv1d_depthwise_silu_batch_f32, (qkv_dim + 255) / 256, 1, 1,
            256, 1, 1, 0, r->stream, args);
 }
 
+static inline void launch_deltanet_step_batch_verify(hip_llm_runner *r,
+    void *state, void *checkpoints, void *out_batch, void *Q_batch,
+    void *K_batch, void *V_batch, void *alpha_batch, void *beta_batch,
+    int dt_rank, int d_state, int v_row_stride, int M) {
+    void *args[] = { &state, &checkpoints, &out_batch, &Q_batch, &K_batch,
+                     &V_batch, &alpha_batch, &beta_batch, &dt_rank, &d_state,
+                     &v_row_stride, &M };
+    const char *fixed_env = getenv("LLM_QWEN35_DELTANET_VERIFY_FIXED128");
+    hipFunction_t fn = ((!fixed_env || atoi(fixed_env) != 0) && d_state == 128 &&
+                        r->fn_deltanet_step_batch_gda_verify_128_f32) ?
+        r->fn_deltanet_step_batch_gda_verify_128_f32 :
+        r->fn_deltanet_step_batch_gda_verify_f32;
+    LAUNCH(fn, dt_rank, 1,
+           (d_state + 3) / 4, 32, 4, 1, 0, r->stream, args);
+}
+
+static inline void launch_ssm_prep_batch(hip_llm_runner *r, void *conv_out_batch,
+    void *conv_state, void *input_batch, void *weight, void *q_exp, void *k_exp,
+    int qkv_dim, int conv_k, int n_group, int d_state, int dt_rank,
+    int row_stride, int exp_stride, int M, float eps) {
+    void *args[] = { &conv_out_batch, &conv_state, &input_batch, &weight,
+                     &q_exp, &k_exp, &qkv_dim, &conv_k, &n_group, &d_state,
+                     &dt_rank, &row_stride, &exp_stride, &M, &eps };
+    LAUNCH(r->fn_ssm_prep_batch_f32, n_group, M, 1, 256, 1, 1,
+           2 * 256 * sizeof(float), r->stream, args);
+}
+
 static inline void launch_sigmoid_mul(hip_llm_runner *r, void *data, void *gate, int n) {
     void *args[] = { &data, &gate, &n };
     LAUNCH(r->fn_sigmoid_mul_f32, (n + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, args);
+}
+
+static inline void launch_sigmoid_mul_native_q81(hip_llm_runner *r,
+        void *data, void *gate, int n) {
+    void *args[] = { &data, &gate, &r->d_native_q81,
+                     &r->d_native_scale, &n };
+    LAUNCH(r->fn_sigmoid_mul_q81_f32, n / 32, 1, 1, 32, 1, 1,
+           0, r->stream, args);
+    r->native_q81_source = data;
+    r->native_q81_n = n;
+    r->native_q81_valid = 1;
 }
 
 static inline void launch_deinterleave_qgate_batch(hip_llm_runner *r,
@@ -16927,7 +24672,10 @@ static inline void launch_matvec_expert_dp4a(hip_llm_runner *r, void *dst, void 
     void *args[] = { &dst, &base, &qs, &scale, &n_rows, &n_cols, &r->d_moe_idx, &slot, &stride };
     hipFunction_t fn = (type == GGML_TYPE_IQ3_S) ? r->fn_matvec_iq3_s_expert_dp4a
                                                  : r->fn_matvec_iq2_s_expert_dp4a;
-    LAUNCH(fn, (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, args);
+    unsigned threads = type == GGML_TYPE_IQ2_S ? (unsigned)r->mw_threads : 256u;
+    int rows_per_block = (int)threads / 32;
+    LAUNCH(fn, (n_rows + rows_per_block - 1) / rows_per_block, 1, 1,
+           threads, 1, 1, 0, r->stream, args);
 }
 /* Expert-indexed matvec: base resolved on-device from r->d_moe_idx[slot]. */
 static inline void launch_matvec_expert_auto(hip_llm_runner *r, void *dst, void *base,
@@ -17247,6 +24995,10 @@ float *hip_llm_forward(hip_llm_runner *r, int32_t token_id, int position) {
         launch_embed_q4_0(r, r->d_x, r->d_token_embd, token_id, n_embd);
     } else if (r->token_embd_type == GGML_TYPE_Q2_K) {
         launch_embed_q2_K(r, r->d_x, r->d_token_embd, token_id, n_embd);
+    } else if (r->token_embd_type == GGML_TYPE_IQ1_M) {
+        launch_embed_iq1_m(r, r->d_x, r->d_token_embd, token_id, n_embd);
+    } else if (r->token_embd_type == GGML_TYPE_F32) {
+        launch_embed_f32(r, r->d_x, r->d_token_embd, token_id, n_embd);
     } else {
         launch_embed(r, r->d_x, r->d_token_embd, token_id, n_embd);
     }
@@ -17290,7 +25042,21 @@ static float *hip_llm_forward_blocks(hip_llm_runner *r, int position) {
         hipMemcpyAsync(r->h_output, r->d_x, (size_t)r->n_embd * sizeof(float),
                        hipMemcpyDeviceToHost, r->stream);
     }
-    if (hipStreamSynchronize(r->stream) || r->qwen4_forward_error) return NULL;
+    hipError_t sync_err = hipStreamSynchronize(r->stream);
+    if (sync_err != hipSuccess || r->qwen4_forward_error) {
+        const char *dbg = getenv("LLM_DEBUG_SYNC");
+        if (dbg && atoi(dbg) != 0) {
+            const char *sync_text = "unknown";
+            if (hipGetErrorString) hipGetErrorString(sync_err, &sync_text);
+            hipError_t pending = hipGetLastError();
+            const char *pending_text = "unknown";
+            if (hipGetErrorString) hipGetErrorString(pending, &pending_text);
+            fprintf(stderr,
+                    "hip_llm: forward sync failed at position=%d sync=%s pending=%s forward_error=%d\n",
+                    position, sync_text, pending_text, r->qwen4_forward_error);
+        }
+        return NULL;
+    }
     hllm_vram_sample(r);
     return r->h_output;
 }
@@ -18468,8 +26234,22 @@ static uint64_t debug_hash_f32(const float *v, int n) {
     return h;
 }
 
+static inline int debug_attention_layer_selected(int layer) {
+    const char *env = getenv("LLM_DEBUG_ATTN_LAYER");
+    int wanted = env && *env ? atoi(env) : 3;
+    return layer == wanted;
+}
+
 static void debug_f32_state(hip_llm_runner *r, int layer, const char *stage, const void *src, int n) {
-    if (!r->debug_layers) return;
+    /* The diagnostic D2H readback also acted as an implicit device-wide
+     * barrier.  Keep a cheap, host-invisible version available for isolating
+     * stream-ordering bugs in Qwen3.5 without enabling all debug traffic. */
+    if (!r->debug_layers) {
+        const char *sync_env = getenv("LLM_QWEN35_SYNC_STAGES");
+        if (r->is_hybrid && !r->is_qwen4exp && sync_env && atoi(sync_env) != 0)
+            hipDeviceSynchronize();
+        return;
+    }
     float *v = (float *)malloc((size_t)n * sizeof(float));
     if (!v) return;
     hipStreamSynchronize(r->stream);
@@ -18479,7 +26259,323 @@ static void debug_f32_state(hip_llm_runner *r, int layer, const char *stage, con
     fprintf(stderr, "  [L%02d %s] norm=%.6f first=[%.6f, %.6f, %.6f, %.6f] h=%016llx\n",
             layer, stage, sqrt(ss), v[0], v[1], v[2], v[3],
             (unsigned long long)debug_hash_f32(v, n));
+    const char * dump_dir = getenv("LLM_DEBUG_DUMP_DIR");
+    if (dump_dir && debug_attention_layer_selected(layer) &&
+        !strncmp(stage, "attention_replay_", 17)) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/%s.bin", dump_dir, stage);
+        FILE *f = fopen(path, "wb");
+        if (f) { fwrite(v, sizeof(float), (size_t)n, f); fclose(f); }
+    }
+    if (dump_dir && layer >= 0 && layer < 6 && strstr(stage, "ssm_norm")) {
+        char path[512];
+        /* Input RMSNorm and gated output RMSNorm have different shapes and
+         * must not overwrite one another in projection-parity captures. */
+        snprintf(path, sizeof(path), "%s/runner-ssm-%s-%02d.bin", dump_dir,
+                 strstr(stage, "ssm_norm_input") ? "norm-input" : "norm", layer);
+        FILE * f = fopen(path, "wb");
+        if (f) { fwrite(v, sizeof(float), (size_t)n, f); fclose(f); }
+    }
+    if (dump_dir && layer >= 0 && layer < 6 && strstr(stage, "linear_out")) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/runner-linear-out-%02d.bin", dump_dir, layer);
+        FILE * f = fopen(path, "wb");
+        if (f) { fwrite(v, sizeof(float), (size_t)n, f); fclose(f); }
+    }
+    if (dump_dir && layer >= 0 && layer < 6 &&
+        (!strcmp(stage, "Q4 ssm_delta") || !strcmp(stage, "Q4 batch ssm_delta"))) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/runner-gdn-output-%02d.bin", dump_dir, layer);
+        FILE *f = fopen(path, "wb");
+        if (f) { fwrite(v, sizeof(float), (size_t)n, f); fclose(f); }
+    }
+    if (dump_dir && layer >= 0 && layer < 6 &&
+        (!strcmp(stage, "Q4 ssm_z") || !strcmp(stage, "Q4 batch ssm_z"))) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/runner-z-%02d.bin", dump_dir, layer);
+        FILE *f = fopen(path, "wb");
+        if (f) { fwrite(v, sizeof(float), (size_t)n, f); fclose(f); }
+    }
+    if (dump_dir && layer >= 0 && layer < 6 &&
+        !strcmp(stage, "Q4 batch ssm_gate")) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/runner-batch-gate-%02d.bin", dump_dir, layer);
+        FILE *f = fopen(path, "wb");
+        if (f) { fwrite(v, sizeof(float), (size_t)n, f); fclose(f); }
+    }
+    if (dump_dir && debug_attention_layer_selected(layer) && !strcmp(stage, "scalar-attn-q")) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/runner-scalar-attn-q-%02d.bin", dump_dir, layer);
+        FILE * f = fopen(path, "wb");
+        if (f) { fwrite(v, sizeof(float), (size_t)n, f); fclose(f); }
+    }
+    if (dump_dir && debug_attention_layer_selected(layer) && !strcmp(stage, "scalar-attn-k")) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/runner-scalar-attn-k-%02d.bin", dump_dir, layer);
+        FILE * f = fopen(path, "wb");
+        if (f) { fwrite(v, sizeof(float), (size_t)n, f); fclose(f); }
+    }
+    if (dump_dir && debug_attention_layer_selected(layer) && !strcmp(stage, "scalar-attn-v")) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/runner-scalar-attn-v-%02d.bin", dump_dir, layer);
+        FILE * f = fopen(path, "wb");
+        if (f) { fwrite(v, sizeof(float), (size_t)n, f); fclose(f); }
+    }
+    if (dump_dir && debug_attention_layer_selected(layer) && !strcmp(stage, "scalar-attn-pregate")) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/runner-scalar-attn-pregate-%02d.bin", dump_dir, layer);
+        FILE * f = fopen(path, "wb");
+        if (f) { fwrite(v, sizeof(float), (size_t)n, f); fclose(f); }
+    }
+    if (dump_dir && debug_attention_layer_selected(layer) &&
+        !strcmp(stage, "scalar-attn-out")) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/runner-scalar-attn-out-%02d.bin", dump_dir, layer);
+        FILE *f = fopen(path, "wb");
+        if (f) { fwrite(v, sizeof(float), (size_t)n, f); fclose(f); }
+    }
+    if (dump_dir && debug_attention_layer_selected(layer) &&
+        !strcmp(stage, "batch-attn-out")) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/runner-batch-attn-out-%02d.bin", dump_dir, layer);
+        FILE *f = fopen(path, "wb");
+        if (f) { fwrite(v, sizeof(float), (size_t)n, f); fclose(f); }
+    }
+    /* Keep the unnormalized projection rows for a scalar-vs-batched audit.
+     * The batched files contain M rows; consumers must select the matching
+     * row before comparing against the scalar one-token capture. */
+    if (dump_dir && debug_attention_layer_selected(layer) &&
+        (!strcmp(stage, "scalar-attn-qraw") || !strcmp(stage, "scalar-attn-kraw") ||
+         !strcmp(stage, "scalar-attn-vraw") || !strcmp(stage, "batch-attn-qraw") ||
+         !strcmp(stage, "batch-attn-kraw") || !strcmp(stage, "batch-attn-vraw"))) {
+        const char *name = strstr(stage, "qraw") ? "qraw" :
+                           strstr(stage, "kraw") ? "kraw" : "vraw";
+        const char *path_prefix = strstr(stage, "batch-") ? "batch" : "scalar";
+        char path[512];
+        snprintf(path, sizeof(path), "%s/runner-%s-attn-%s-%02d.bin",
+                 dump_dir, path_prefix, name, layer);
+        FILE *f = fopen(path, "wb");
+        if (f) { fwrite(v, sizeof(float), (size_t)n, f); fclose(f); }
+    }
+    if (dump_dir && layer >= 0 && debug_attention_layer_selected(layer) &&
+        strstr(stage, "batch attn_norm")) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/runner-attn-norm-%02d.bin", dump_dir, layer);
+        FILE * f = fopen(path, "wb");
+        if (f) { fwrite(v, sizeof(float), (size_t)n, f); fclose(f); }
+    }
+    if (dump_dir && debug_attention_layer_selected(layer) && !strcmp(stage, "scalar-attn-norm")) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/runner-scalar-attn-norm-%02d.bin", dump_dir, layer);
+        FILE *f = fopen(path, "wb");
+        if (f) { fwrite(v, sizeof(float), (size_t)n, f); fclose(f); }
+    }
+    if (dump_dir && layer >= 0 && layer < 6 && strstr(stage, "batch ssm_qkv")) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/runner-ssm-qkv-%02d.bin", dump_dir, layer);
+        FILE * f = fopen(path, "wb");
+        if (f) { fwrite(v, sizeof(float), (size_t)n, f); fclose(f); }
+    }
+    if (dump_dir && layer >= 0 && layer < 6 && strstr(stage, "ssm_qkv") &&
+        !strstr(stage, "batch")) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/runner-scalar-ssm-qkv-%02d.bin", dump_dir, layer);
+        FILE * f = fopen(path, "wb");
+        if (f) { fwrite(v, sizeof(float), (size_t)n, f); fclose(f); }
+    }
+    if (dump_dir && layer >= 0 && layer < 6 &&
+        (!strcmp(stage, "Q4 gdn_alpha_raw") || !strcmp(stage, "Q4 batch ssm_alpha"))) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/runner-alpha-raw-%02d.bin", dump_dir, layer);
+        FILE * f = fopen(path, "wb");
+        if (f) { fwrite(v, sizeof(float), (size_t)n, f); fclose(f); }
+    }
+    if (dump_dir && layer >= 0 && layer < 6 &&
+        (strstr(stage, "ssm_conv_silu_raw") || !strcmp(stage, "Q4 ssm_conv"))) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/runner-scalar-conv-silu-%02d.bin", dump_dir, layer);
+        FILE * f = fopen(path, "wb");
+        if (f) { fwrite(v, sizeof(float), (size_t)n, f); fclose(f); }
+    }
+    /* Optional token-by-token recurrent trace.  The ordinary diagnostic
+     * filenames intentionally keep only the final token; this sequence form
+     * is for parity audits of the causal convolution/state update. */
+    if (getenv("LLM_DEBUG_DUMP_SEQUENCE") && dump_dir && layer >= 0 && layer < 64 &&
+        (strstr(stage, "ssm_qkv") || strstr(stage, "ssm_conv_silu_raw") ||
+         !strcmp(stage, "Q4 ssm_conv") || !strcmp(stage, "Q4 conv_state"))) {
+        const char * kind = strstr(stage, "ssm_qkv") ? "qkv" :
+                           !strcmp(stage, "Q4 conv_state") ? "conv-state" :
+                           strstr(stage, "ssm_conv_silu_raw") ? "conv-silu-pre-norm" : "conv-silu";
+        char path[512];
+        snprintf(path, sizeof(path), "%s/runner-%s-%02d-%06d.bin", dump_dir,
+                 kind, layer, r->cur_position);
+        FILE * f = fopen(path, "wb");
+        if (f) { fwrite(v, sizeof(float), (size_t)n, f); fclose(f); }
+    }
+    if (dump_dir && layer >= 0 && layer < 6 &&
+        (!strcmp(stage, "Q4 gdn_q_norm") || !strcmp(stage, "Q4 gdn_k_norm") ||
+         !strcmp(stage, "Q4 gdn_alpha") || !strcmp(stage, "Q4 gdn_beta") ||
+         !strcmp(stage, "Q4 gdn_alpha_raw") || !strcmp(stage, "Q4 gdn_beta_raw"))) {
+        const char *kind = strstr(stage, "gdn_q_norm") ? "q-norm" :
+                           strstr(stage, "gdn_k_norm") ? "k-norm" :
+                           strstr(stage, "gdn_alpha") ?
+                               (strstr(stage, "raw") ? "alpha-raw" : "alpha") :
+                               (strstr(stage, "raw") ? "beta-raw" : "beta");
+        char path[512];
+        snprintf(path, sizeof(path), "%s/runner-%s-%02d.bin", dump_dir, kind, layer);
+        FILE *f = fopen(path, "wb");
+        if (f) { fwrite(v, sizeof(float), (size_t)n, f); fclose(f); }
+    }
+    if (dump_dir && layer >= 0 && layer < 2 && strstr(stage, "batch q_norm")) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/runner-q-norm-%02d.bin", dump_dir, layer);
+        FILE * f = fopen(path, "wb");
+        if (f) { fwrite(v, sizeof(float), (size_t)n, f); fclose(f); }
+    }
+    if (dump_dir && layer >= 0 && layer < 2 && strstr(stage, "batch k_norm")) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/runner-k-norm-%02d.bin", dump_dir, layer);
+        FILE * f = fopen(path, "wb");
+        if (f) { fwrite(v, sizeof(float), (size_t)n, f); fclose(f); }
+    }
+    if (dump_dir && layer >= 0 && layer < 2 && strstr(stage, "ssm_conv_silu_raw")) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/runner-conv-raw-%02d.bin", dump_dir, layer);
+        FILE * f = fopen(path, "wb");
+        if (f) { fwrite(v, sizeof(float), (size_t)n, f); fclose(f); }
+    }
+    if (dump_dir && layer >= 0 && layer < 2 && strstr(stage, "batch conv_output_raw")) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/runner-conv-silu-%02d.bin", dump_dir, layer);
+        FILE * f = fopen(path, "wb");
+        if (f) { fwrite(v, sizeof(float), (size_t)n, f); fclose(f); }
+    }
+    if (dump_dir && layer >= 0 && debug_attention_layer_selected(layer) && strstr(stage, "batch ffn_gate")) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/runner-ffn-gate-%02d.bin", dump_dir, layer);
+        FILE * f = fopen(path, "wb");
+        if (f) { fwrite(v, sizeof(float), (size_t)n, f); fclose(f); }
+    }
+    if (dump_dir && layer >= 0 && debug_attention_layer_selected(layer) && strstr(stage, "batch ffn_gate_raw")) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/runner-ffn-gate-raw-%02d.bin", dump_dir, layer);
+        FILE * f = fopen(path, "wb");
+        if (f) { fwrite(v, sizeof(float), (size_t)n, f); fclose(f); }
+    }
+    if (dump_dir && layer >= 0 && debug_attention_layer_selected(layer) && strstr(stage, "batch ffn_up_raw")) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/runner-ffn-up-raw-%02d.bin", dump_dir, layer);
+        FILE * f = fopen(path, "wb");
+        if (f) { fwrite(v, sizeof(float), (size_t)n, f); fclose(f); }
+    }
+    if (dump_dir && layer >= 0 && debug_attention_layer_selected(layer) && strstr(stage, "ffn_gate_raw") &&
+        !strstr(stage, "batch")) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/runner-scalar-ffn-gate-%02d.bin", dump_dir, layer);
+        FILE * f = fopen(path, "wb");
+        if (f) { fwrite(v, sizeof(float), (size_t)n, f); fclose(f); }
+    }
+    if (dump_dir && layer >= 0 && debug_attention_layer_selected(layer) && strstr(stage, "ffn_up_raw") &&
+        !strstr(stage, "batch")) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/runner-scalar-ffn-up-%02d.bin", dump_dir, layer);
+        FILE * f = fopen(path, "wb");
+        if (f) { fwrite(v, sizeof(float), (size_t)n, f); fclose(f); }
+    }
+    if (dump_dir && layer >= 0 && debug_attention_layer_selected(layer) && strstr(stage, "ffn_out") &&
+        !strstr(stage, "batch")) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/runner-scalar-ffn-out-%02d.bin", dump_dir, layer);
+        FILE * f = fopen(path, "wb");
+        if (f) { fwrite(v, sizeof(float), (size_t)n, f); fclose(f); }
+    }
+    if (dump_dir && layer >= 0 && debug_attention_layer_selected(layer) &&
+        (strstr(stage, "batch ffn_norm") || strstr(stage, "scalar ffn_norm_input"))) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/runner-ffn-norm-%02d.bin", dump_dir, layer);
+        FILE * f = fopen(path, "wb");
+        if (f) { fwrite(v, sizeof(float), (size_t)n, f); fclose(f); }
+    }
+    if (dump_dir && layer >= 0 && strstr(stage, "batch layer_out")) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/runner-layer-out-%02d.bin", dump_dir, layer);
+        FILE * f = fopen(path, "wb");
+        if (f) { fwrite(v, sizeof(float), (size_t)n, f); fclose(f); }
+    }
+    if (dump_dir && layer >= 0 && layer < 6 && strstr(stage, "batch attn_residual")) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/runner-attn-residual-%02d.bin", dump_dir, layer);
+        FILE * f = fopen(path, "wb");
+        if (f) { fwrite(v, sizeof(float), (size_t)n, f); fclose(f); }
+    }
+    if (dump_dir && layer >= 0 && layer < 6 && strstr(stage, "batch ssm_residual")) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/runner-l-out-%02d.bin", dump_dir, layer);
+        FILE * f = fopen(path, "wb");
+        if (f) { fwrite(v, sizeof(float), (size_t)n, f); fclose(f); }
+    }
+    if (dump_dir && layer >= 0 && debug_attention_layer_selected(layer) && strstr(stage, "batch ffn_out")) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/runner-ffn-out-%02d.bin", dump_dir, layer);
+        FILE * f = fopen(path, "wb");
+        if (f) { fwrite(v, sizeof(float), (size_t)n, f); fclose(f); }
+    }
+    if (dump_dir && layer == -1 && strstr(stage, "result_norm")) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/runner-result-norm.bin", dump_dir);
+        FILE * f = fopen(path, "wb");
+        if (f) { fwrite(v, sizeof(float), (size_t)n, f); fclose(f); }
+    }
     free(v);
+}
+
+/* Capture one Q8/Q4 KV write for a byte-level comparison with ggml's
+ * quantize_row_q8_0/q4_0 reference.  This is intentionally diagnostic-only:
+ * it synchronizes the stream and copies a single layer to host memory. */
+static void debug_dump_q8q4_kv(hip_llm_runner *r, const char *dir, int layer,
+                               const void *raw_k, const void *raw_v,
+                               const void *cache_k, const void *cache_v,
+                               const void *scale_k, const void *scale_v,
+                               int position_start, int M, int n_kv_heads,
+                               int head_dim) {
+    if (!dir || !*dir || M <= 0 || n_kv_heads <= 0 || head_dim <= 0) return;
+    const int groups = (head_dim + 31) / 32;
+    const size_t raw_n = (size_t) M * n_kv_heads * head_dim;
+    const size_t cache_tokens = (size_t) position_start + M;
+    const size_t cache_n = cache_tokens * n_kv_heads * head_dim;
+    const size_t cache_v_n = cache_tokens * n_kv_heads * (head_dim / 2);
+    const size_t scale_n = cache_tokens * n_kv_heads * groups;
+    float *hk = (float *) malloc(raw_n * sizeof(float));
+    float *hv = (float *) malloc(raw_n * sizeof(float));
+    signed char *qk = (signed char *) malloc(cache_n);
+    unsigned char *qv = (unsigned char *) malloc(cache_v_n);
+    float *sk = (float *) malloc(scale_n * sizeof(float));
+    float *sv = (float *) malloc(scale_n * sizeof(float));
+    if (!hk || !hv || !qk || !qv || !sk || !sv) goto done;
+    hipStreamSynchronize(r->stream);
+    hipMemcpy(hk, raw_k, raw_n * sizeof(float), hipMemcpyDeviceToHost);
+    hipMemcpy(hv, raw_v, raw_n * sizeof(float), hipMemcpyDeviceToHost);
+    hipMemcpy(qk, cache_k, cache_n, hipMemcpyDeviceToHost);
+    hipMemcpy(qv, cache_v, cache_v_n, hipMemcpyDeviceToHost);
+    hipMemcpy(sk, scale_k, scale_n * sizeof(float), hipMemcpyDeviceToHost);
+    hipMemcpy(sv, scale_v, scale_n * sizeof(float), hipMemcpyDeviceToHost);
+    char path[512];
+    snprintf(path, sizeof(path), "%s/raw-k-%02d.bin", dir, layer);
+    FILE *f = fopen(path, "wb"); if (f) { fwrite(hk, sizeof(float), raw_n, f); fclose(f); }
+    snprintf(path, sizeof(path), "%s/raw-v-%02d.bin", dir, layer);
+    f = fopen(path, "wb"); if (f) { fwrite(hv, sizeof(float), raw_n, f); fclose(f); }
+    snprintf(path, sizeof(path), "%s/q8-k-%02d.bin", dir, layer);
+    f = fopen(path, "wb"); if (f) { fwrite(qk, 1, cache_n, f); fclose(f); }
+    snprintf(path, sizeof(path), "%s/q4-v-%02d.bin", dir, layer);
+    f = fopen(path, "wb"); if (f) { fwrite(qv, 1, cache_v_n, f); fclose(f); }
+    snprintf(path, sizeof(path), "%s/q8-scales-%02d.bin", dir, layer);
+    f = fopen(path, "wb"); if (f) { fwrite(sk, sizeof(float), scale_n, f); fclose(f); }
+    snprintf(path, sizeof(path), "%s/q4-scales-%02d.bin", dir, layer);
+    f = fopen(path, "wb"); if (f) { fwrite(sv, sizeof(float), scale_n, f); fclose(f); }
+    fprintf(stderr, "hip_llm: dumped Q8/Q4 KV layer %d (%zu tokens, %d heads, %d dims) to %s\n",
+            layer, cache_tokens, n_kv_heads, head_dim, dir);
+done:
+    free(hk); free(hv); free(qk); free(qv); free(sk); free(sv);
 }
 
 static int forward_hc_mix_batched(hip_llm_runner *r, int M, void *norm_w,
@@ -21374,6 +29470,71 @@ experts_done:
 
 #include "qwen4_qsa_hip.h"
 
+/* Recurrent core shared by scalar decode and exact MTP windows. */
+static void forward_dense_ssm_core(hip_llm_runner *r, hip_layer *cl, int l) {
+    int qkv_dim = r->ssm_qkv_dim, d_state = r->ssm_d_state;
+    int n_group = r->ssm_n_group, dt_rank = r->ssm_dt_rank;
+    int conv_k = r->ssm_conv_kernel;
+    float eps = r->rms_norm_eps;
+    debug_f32_state(r, l, "Q4 ssm_qkv", r->d_ssm_qkv, qkv_dim);
+
+    /* Preparation is independent of the GDN reduction choice. Its
+     * scalar-contract fusion is bitwise tested for the native IQ
+     * decode path; reference RMSNorm uses a different L2 contract. */
+    if ((r->ssm_fused_decode || (r->fn_qwen35_matvec_iq3xxs &&
+         !r->fn_qwen35_rmsnorm_reference)) &&
+        (qkv_dim - 2 * n_group * d_state) % n_group == 0 &&
+        dt_rank % n_group == 0 && d_state <= 256) {
+        /* Fused conv+silu+state, l2norm Q/K, repeat-tile, softplus, sigmoid:
+         * 7 launches -> 1. */
+        void *args[] = { &r->d_ssm_conv_out, &cl->d_conv_state, &r->d_ssm_qkv,
+                         &cl->ssm_conv1d_w, &r->d_ssm_alpha, &r->d_ssm_beta,
+                         &cl->ssm_dt_bias, &cl->ssm_a,
+                         &r->d_ssm_Q_exp, &r->d_ssm_K_exp,
+                         &qkv_dim, &conv_k, &d_state, &n_group, &dt_rank, &eps };
+        LAUNCH(r->fn_ssm_prep_f32, n_group, 1, 1, 256, 1, 1, 0, r->stream, args);
+    } else {
+        debug_f32_state(r, l, "Q4 gdn_alpha_raw", r->d_ssm_alpha, dt_rank);
+        debug_f32_state(r, l, "Q4 gdn_beta_raw", r->d_ssm_beta, dt_rank);
+        launch_softplus_mul(r, r->d_ssm_alpha, r->d_ssm_alpha, cl->ssm_dt_bias, cl->ssm_a, dt_rank);
+        launch_sigmoid_inplace(r, r->d_ssm_beta, dt_rank);
+        debug_f32_state(r, l, "Q4 gdn_alpha", r->d_ssm_alpha, dt_rank);
+        debug_f32_state(r, l, "Q4 gdn_beta", r->d_ssm_beta, dt_rank);
+
+        launch_conv1d(r, r->d_ssm_conv_out, cl->d_conv_state, r->d_ssm_qkv,
+                     cl->ssm_conv1d_w, qkv_dim, conv_k);
+        if (getenv("LLM_DEBUG_DUMP_CONV_STATE") && l == 0)
+            debug_f32_state(r, l, "Q4 conv_state", cl->d_conv_state,
+                            (conv_k - 1) * qkv_dim);
+
+        /* Keep this before Q/K L2 normalization: llama.cpp exposes both
+         * conv_output_raw and conv_output_silu, while the existing trace
+         * below reflects the subsequently normalized Q/K slices. */
+        debug_f32_state(r, l, "Q4 ssm_conv_silu_raw", r->d_ssm_conv_out, qkv_dim);
+
+        launch_l2_norm_heads(r, r->d_ssm_conv_out, n_group, d_state, eps);
+        void *K_raw = (void *)((char *)r->d_ssm_conv_out + (size_t)n_group * d_state * sizeof(float));
+        launch_l2_norm_heads(r, K_raw, n_group, d_state, eps);
+        debug_f32_state(r, l, "Q4 gdn_q_norm", r->d_ssm_conv_out, n_group * d_state);
+        debug_f32_state(r, l, "Q4 gdn_k_norm", K_raw, n_group * d_state);
+
+        launch_repeat_tile(r, r->d_ssm_Q_exp, r->d_ssm_conv_out, dt_rank, d_state, n_group);
+        launch_repeat_tile(r, r->d_ssm_K_exp, K_raw, dt_rank, d_state, n_group);
+    }
+
+    debug_f32_state(r, l, "Q4 ssm_conv", r->d_ssm_conv_out, qkv_dim);
+
+    void *V_ptr = (void *)((char *)r->d_ssm_conv_out + (size_t)2 * n_group * d_state * sizeof(float));
+
+    launch_deltanet_step(r, cl->d_recurrent_state, r->d_ssm_out,
+                        r->d_ssm_Q_exp, r->d_ssm_K_exp, V_ptr,
+                        r->d_ssm_alpha, r->d_ssm_beta, dt_rank, d_state);
+
+    debug_f32_state(r, l, "Q4 ssm_delta", r->d_ssm_out, r->ssm_d_inner);
+    debug_f32_state(r, l, "Q4 ssm_z", r->d_ssm_z, r->ssm_d_inner);
+
+}
+
 static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
         void *key_cache, void *value_cache, int trunk, int attention_only) {
     int n_embd     = r->n_embd;
@@ -21449,7 +29610,13 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
         LAUNCH(r->fn_res_rmsnorm_f32, 1, 1, 1, 256, 1, 1, 256 * sizeof(float), r->stream, a);
         r->moe_add_pending = 0;
     } else {
+        if (r->is_hybrid && cl->is_ssm && r->debug_layers && l < 6)
+            debug_f32_state(r, l, "Q4 ssm_pre_norm", r->d_x, n_embd);
         launch_rmsnorm(r, r->d_xb, r->d_x, cl->attn_norm_w, n_embd, eps);
+        if (r->debug_layers && debug_attention_layer_selected(l) && r->is_hybrid && !cl->is_ssm)
+            debug_f32_state(r, l, "scalar-attn-norm", r->d_xb, n_embd);
+        if (r->is_hybrid && cl->is_ssm && r->debug_layers && l < 6)
+            debug_f32_state(r, l, "Q4 ssm_norm_input", r->d_xb, n_embd);
     }
 
     /* === Gemma4 layer === */
@@ -21529,7 +29696,9 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
         launch_matvec_auto(r, r->d_xb, cl->attn_output_w, r->d_xb2,
                           cl->attn_output_rows, cl->attn_output_cols, cl->attn_output_type);
 
-        /* Post-attention norm */
+        /* Post-attention norm.  Qwen3.5 applies this norm to the attention
+         * branch before adding it to the residual; omitting it causes a large
+         * layer-to-layer drift and changes the first decoded token. */
         if (cl->post_attn_norm_w) {
             launch_rmsnorm(r, r->d_xb, r->d_xb, cl->post_attn_norm_w, n_embd, eps);
         }
@@ -21576,11 +29745,8 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
 
     } else if (r->is_hybrid && cl->is_ssm) {
             /* === SSM (Delta-Net) layer === */
-            int qkv_dim = r->ssm_qkv_dim;
             int d_state = r->ssm_d_state;
-            int n_group = r->ssm_n_group;
             int dt_rank = r->ssm_dt_rank;
-            int conv_k  = r->ssm_conv_kernel;
 
             if (r->ssm_fused_decode &&
                 cl->ssm_qkv_type == GGML_TYPE_Q6_K && cl->ssm_gate_type == GGML_TYPE_Q6_K &&
@@ -21590,7 +29756,7 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
                               &cl->ssm_qkv_w, &cl->ssm_gate_w, &cl->ssm_alpha_w, &cl->ssm_beta_w,
                               &r->d_xb, &qkv_rows, &z_rows, &dt_rank, &n_cols };
                 LAUNCH(r->fn_ssm_matvec4_q6k, qkv_rows + z_rows + 2 * dt_rank, 1, 1, 256, 1, 1, 0, r->stream, a);
-            } else if (r->ssm_fused_decode &&
+            } else if (r->ssm_fused_decode && !r->fn_qwen35_matvec_iq3xxs &&
                 cl->ssm_qkv_type == GGML_TYPE_IQ3_XXS && cl->ssm_gate_type == GGML_TYPE_IQ3_XXS &&
                 cl->ssm_alpha_type == GGML_TYPE_F16 && cl->ssm_beta_type == GGML_TYPE_F16) {
                 int qkv_rows = cl->ssm_qkv_rows, z_rows = cl->ssm_gate_rows, n_cols = cl->ssm_qkv_cols;
@@ -21599,6 +29765,7 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
                               &r->d_xb, &qkv_rows, &z_rows, &dt_rank, &n_cols };
                 LAUNCH(r->fn_ssm_matvec4_iq3xxs, qkv_rows + z_rows + 2 * dt_rank, 1, 1, 256, 1, 1, 0, r->stream, a);
             } else {
+            begin_q8x2_reuse(r);
             if (cl->ssm_qkv_type == GGML_TYPE_Q8_0 &&
                 cl->ssm_gate_type == GGML_TYPE_Q8_0 &&
                 cl->ssm_alpha_type == GGML_TYPE_F32 &&
@@ -21630,60 +29797,57 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
                                     cl->ssm_qkv_rows, cl->ssm_gate_rows,
                                     cl->ssm_qkv_cols, cl->ssm_gate_cols);
             } else {
-                launch_matvec_auto(r, r->d_ssm_qkv, cl->ssm_qkv_w, r->d_xb,
-                                   cl->ssm_qkv_rows, cl->ssm_qkv_cols, cl->ssm_qkv_type);
-                launch_matvec_auto(r, r->d_ssm_z, cl->ssm_gate_w, r->d_xb,
-                                   cl->ssm_gate_rows, cl->ssm_gate_cols, cl->ssm_gate_type);
+                launch_matvec_ssm_auto(r, r->d_ssm_qkv, cl->ssm_qkv_w, r->d_xb,
+                                       cl->ssm_qkv_rows, cl->ssm_qkv_cols,
+                                       cl->ssm_qkv_type, 1);
+                launch_matvec_ssm_auto(r, r->d_ssm_z, cl->ssm_gate_w, r->d_xb,
+                                       cl->ssm_gate_rows, cl->ssm_gate_cols,
+                                       cl->ssm_gate_type, 0);
             }
-            launch_matvec_auto(r, r->d_ssm_alpha, cl->ssm_alpha_w, r->d_xb,
-                               cl->ssm_alpha_rows, cl->ssm_alpha_cols, cl->ssm_alpha_type);
-            launch_matvec_auto(r, r->d_ssm_beta, cl->ssm_beta_w, r->d_xb,
-                               cl->ssm_beta_rows, cl->ssm_beta_cols, cl->ssm_beta_type);
-            }
-
-            debug_f32_state(r, l, "Q4 ssm_qkv", r->d_ssm_qkv, qkv_dim);
-
-            if (r->ssm_fused_decode &&
-                (qkv_dim - 2 * n_group * d_state) % n_group == 0 &&
-                dt_rank % n_group == 0 && d_state <= 256) {
-                /* Fused conv+silu+state, l2norm Q/K, repeat-tile, softplus, sigmoid:
-                 * 7 launches -> 1. */
-                void *args[] = { &r->d_ssm_conv_out, &cl->d_conv_state, &r->d_ssm_qkv,
-                                 &cl->ssm_conv1d_w, &r->d_ssm_alpha, &r->d_ssm_beta,
-                                 &cl->ssm_dt_bias, &cl->ssm_a,
-                                 &r->d_ssm_Q_exp, &r->d_ssm_K_exp,
-                                 &qkv_dim, &conv_k, &d_state, &n_group, &dt_rank, &eps };
-                LAUNCH(r->fn_ssm_prep_f32, n_group, 1, 1, 256, 1, 1, 0, r->stream, args);
+            /* llama.cpp runs the BF16/F16 ssm_alpha and ssm_beta weights through
+             * mul_mat_vec_f, not the generic F32-dequant matvec.  Match its
+             * f32-FMA accumulation and warp-fold order so the decay and update
+             * gate agree with the reference before the recurrent scan. */
+            if (cl->ssm_alpha_type == GGML_TYPE_F16 &&
+                cl->ssm_beta_type == GGML_TYPE_F16 &&
+                cl->ssm_alpha_rows == cl->ssm_beta_rows &&
+                cl->ssm_alpha_cols == cl->ssm_beta_cols) {
+                launch_matvec_llama_f16_pair(r, r->d_ssm_alpha, r->d_ssm_beta,
+                                             cl->ssm_alpha_w, cl->ssm_beta_w,
+                                             r->d_xb, cl->ssm_alpha_rows,
+                                             cl->ssm_alpha_cols);
             } else {
-            launch_softplus_mul(r, r->d_ssm_alpha, r->d_ssm_alpha, cl->ssm_dt_bias, cl->ssm_a, dt_rank);
-            launch_sigmoid_inplace(r, r->d_ssm_beta, dt_rank);
-
-            launch_conv1d(r, r->d_ssm_conv_out, cl->d_conv_state, r->d_ssm_qkv,
-                         cl->ssm_conv1d_w, qkv_dim, conv_k);
-
-            /* Keep this before Q/K L2 normalization: llama.cpp exposes both
-             * conv_output_raw and conv_output_silu, while the existing trace
-             * below reflects the subsequently normalized Q/K slices. */
-            debug_f32_state(r, l, "Q4 ssm_conv_silu_raw", r->d_ssm_conv_out, qkv_dim);
-
-            launch_l2_norm_heads(r, r->d_ssm_conv_out, n_group, d_state, eps);
-            void *K_raw = (void *)((char *)r->d_ssm_conv_out + (size_t)n_group * d_state * sizeof(float));
-            launch_l2_norm_heads(r, K_raw, n_group, d_state, eps);
-
-            launch_repeat_tile(r, r->d_ssm_Q_exp, r->d_ssm_conv_out, dt_rank, d_state, n_group);
-            launch_repeat_tile(r, r->d_ssm_K_exp, K_raw, dt_rank, d_state, n_group);
+                if (cl->ssm_alpha_type == GGML_TYPE_F16) {
+                    launch_matvec_llama_f16(r, r->d_ssm_alpha, cl->ssm_alpha_w,
+                                            r->d_xb, cl->ssm_alpha_rows,
+                                            cl->ssm_alpha_cols);
+                } else if (cl->ssm_alpha_type == GGML_TYPE_BF16) {
+                    launch_matvec_llama_bf16(r, r->d_ssm_alpha, cl->ssm_alpha_w,
+                                             r->d_xb, cl->ssm_alpha_rows,
+                                             cl->ssm_alpha_cols);
+                } else {
+                    launch_matvec_auto(r, r->d_ssm_alpha, cl->ssm_alpha_w, r->d_xb,
+                                       cl->ssm_alpha_rows, cl->ssm_alpha_cols,
+                                       cl->ssm_alpha_type);
+                }
+                if (cl->ssm_beta_type == GGML_TYPE_F16) {
+                    launch_matvec_llama_f16(r, r->d_ssm_beta, cl->ssm_beta_w,
+                                            r->d_xb, cl->ssm_beta_rows,
+                                            cl->ssm_beta_cols);
+                } else if (cl->ssm_beta_type == GGML_TYPE_BF16) {
+                    launch_matvec_llama_bf16(r, r->d_ssm_beta, cl->ssm_beta_w,
+                                             r->d_xb, cl->ssm_beta_rows,
+                                             cl->ssm_beta_cols);
+                } else {
+                    launch_matvec_auto(r, r->d_ssm_beta, cl->ssm_beta_w, r->d_xb,
+                                       cl->ssm_beta_rows, cl->ssm_beta_cols,
+                                       cl->ssm_beta_type);
+                }
+            }
+            end_q8x2_reuse(r);
             }
 
-            debug_f32_state(r, l, "Q4 ssm_conv", r->d_ssm_conv_out, qkv_dim);
-
-            void *V_ptr = (void *)((char *)r->d_ssm_conv_out + (size_t)2 * n_group * d_state * sizeof(float));
-
-            launch_deltanet_step(r, cl->d_recurrent_state, r->d_ssm_out,
-                                r->d_ssm_Q_exp, r->d_ssm_K_exp, V_ptr,
-                                r->d_ssm_alpha, r->d_ssm_beta, dt_rank, d_state);
-
-            debug_f32_state(r, l, "Q4 ssm_delta", r->d_ssm_out, r->ssm_d_inner);
-            debug_f32_state(r, l, "Q4 ssm_z", r->d_ssm_z, r->ssm_d_inner);
+            forward_dense_ssm_core(r, cl, l);
 
              if (r->ssm_fused_decode && cl->ssm_out_type == GGML_TYPE_Q6_K && r->ssm_out_mw) {
                 int nr = cl->ssm_out_rows;
@@ -21700,18 +29864,42 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
                 void *a[] = { &r->d_xb, &cl->ssm_out_w, &r->d_ssm_out, &r->d_ssm_z, &cl->ssm_norm_w,
                               &nr, &nc, &dt_rank, &d_state, &eps };
                 LAUNCH(r->fn_fused_ssm_out_gated_q6k, nr, 1, 1, 256, 1, 1, 0, r->stream, a);
-            } else if (r->ssm_fused_decode && cl->ssm_out_type == GGML_TYPE_IQ3_XXS) {
-                int nr = cl->ssm_out_rows;
-                int nc = cl->ssm_out_cols;
-                void *a[] = { &r->d_xb, &cl->ssm_out_w, &r->d_ssm_out, &r->d_ssm_z, &cl->ssm_norm_w,
-                              &nr, &nc, &dt_rank, &d_state, &eps };
-                LAUNCH(r->fn_fused_ssm_out_gated_iq3xxs, nr, 1, 1, 256, 1, 1, 0, r->stream, a);
             } else {
-                launch_gated_rmsnorm_silu(r, r->d_ssm_out, r->d_ssm_z, cl->ssm_norm_w,
-                                         dt_rank, d_state, eps);
+                /* IQ3_XXS fused output remains diagnostic-only: its layout
+                 * path does not yet match the scalar IQ3 matvec bit-for-bit.
+                 * Keep the reference sequence as the quality-safe default. */
+                const char *separate_norm_env = getenv("LLM_QWEN35_SSM_NORM_SEPARATE");
+                const char *split_norm_q81_env = getenv("LLM_QWEN35_SPLIT_SSM_NORM_Q81");
+                int native_out_q81 = !r->fn_qwen35_rmsnorm_reference &&
+                    d_state == 128 && r->ssm_d_inner <= 17408 &&
+                    (r->ssm_d_inner % 256) == 0 &&
+                    qwen35_native_q81_matvec_type(r, cl->ssm_out_type) &&
+                    (!separate_norm_env || atoi(separate_norm_env) == 0) &&
+                    (!split_norm_q81_env || atoi(split_norm_q81_env) == 0);
+                if (separate_norm_env && atoi(separate_norm_env) != 0) {
+                    /* Match llama.cpp's build_norm_gated graph order:
+                     * RMSNorm(core_out), SiLU(z), then elementwise multiply. */
+                    launch_rmsnorm_heads_inplace(r, r->d_ssm_out,
+                                                 cl->ssm_norm_w, dt_rank,
+                                                 d_state, eps);
+                    launch_silu_gate_mul(r, r->d_ssm_out, r->d_ssm_z,
+                                         dt_rank * d_state);
+                } else if (native_out_q81) {
+                    launch_gated_rmsnorm_silu_native_q81(
+                        r, r->d_ssm_out, r->d_ssm_z, cl->ssm_norm_w,
+                        dt_rank, d_state, eps);
+                    begin_native_q81_prepared(r);
+                } else {
+                    launch_gated_rmsnorm_silu(r, r->d_ssm_out, r->d_ssm_z,
+                                              cl->ssm_norm_w, dt_rank, d_state,
+                                              eps);
+                }
                 debug_f32_state(r, l, "Q4 ssm_norm", r->d_ssm_out, r->ssm_d_inner);
                 launch_matvec_auto(r, r->d_xb, cl->ssm_out_w, r->d_ssm_out,
                                   cl->ssm_out_rows, cl->ssm_out_cols, cl->ssm_out_type);
+                if (native_out_q81) end_q8x2_reuse(r);
+                if (r->debug_layers && l < 6)
+                    debug_f32_state(r, l, "Q4 ssm_linear_out", r->d_xb, n_embd);
             }
 
         } else if (r->is_hybrid) {
@@ -21723,6 +29911,39 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
                                      cl->attn_q_w, cl->attn_k_w, cl->attn_v_w,
                                      r->d_xb, cl->attn_q_rows, cl->attn_k_rows,
                                      cl->attn_v_rows, cl->attn_q_cols);
+            } else if (cl->attn_q_type == GGML_TYPE_IQ2_S &&
+                       cl->attn_k_type == GGML_TYPE_IQ2_S &&
+                       cl->attn_v_type == GGML_TYPE_IQ2_S &&
+                       cl->attn_q_cols == cl->attn_k_cols &&
+                       cl->attn_q_cols == cl->attn_v_cols &&
+                       launch_qwen35_iq2s_qkv_fused(
+                           r, r->d_xb2, r->d_k, r->d_v,
+                           cl->attn_q_w, cl->attn_k_w, cl->attn_v_w,
+                           r->d_xb, cl->attn_q_rows, cl->attn_k_rows,
+                           cl->attn_v_rows, cl->attn_q_cols)) {
+                /* The opt-in same-format IQ2_S candidate owns all projections. */
+            } else if (cl->attn_q_cols == cl->attn_k_cols &&
+                       cl->attn_q_cols == cl->attn_v_cols &&
+                       !(cl->attn_q_type == cl->attn_k_type &&
+                         cl->attn_q_type == cl->attn_v_type) &&
+                       launch_qwen35_iq_mixed_qkv(
+                           r, r->d_xb2, r->d_k, r->d_v,
+                           cl->attn_q_w, cl->attn_k_w, cl->attn_v_w,
+                           r->d_xb, cl->attn_q_rows, cl->attn_k_rows,
+                           cl->attn_v_rows, cl->attn_q_cols,
+                           cl->attn_q_type, cl->attn_k_type, cl->attn_v_type)) {
+                /* The opt-in mixed-IQ candidate owns all three projections. */
+            } else if (cl->attn_q_type == GGML_TYPE_Q2_K &&
+                       cl->attn_k_type == GGML_TYPE_Q2_K &&
+                       cl->attn_v_type == GGML_TYPE_Q2_K &&
+                       cl->attn_q_cols == cl->attn_k_cols &&
+                       cl->attn_q_cols == cl->attn_v_cols &&
+                       launch_qwen35_q2k_qkv_fused(
+                           r, r->d_xb2, r->d_k, r->d_v,
+                           cl->attn_q_w, cl->attn_k_w, cl->attn_v_w,
+                           r->d_xb, cl->attn_q_rows, cl->attn_k_rows,
+                           cl->attn_v_rows, cl->attn_q_cols)) {
+                /* The opt-in native Q2_K candidate owns all projections. */
             } else if (r->ssm_fused_decode &&
                 cl->attn_q_type == GGML_TYPE_Q6_K && cl->attn_k_type == GGML_TYPE_Q6_K &&
                 cl->attn_v_type == GGML_TYPE_Q6_K) {
@@ -21731,7 +29952,7 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
                 void *a[] = { &r->d_xb2, &r->d_k, &r->d_v, &cl->attn_q_w, &cl->attn_k_w, &cl->attn_v_w,
                               &qr, &kr, &vr, &nc, &r->d_xb };
                 LAUNCH(r->fn_matvec_qkv_q6k, qr + kr + vr, 1, 1, 256, 1, 1, 0, r->stream, a);
-            } else if (r->ssm_fused_decode &&
+            } else if (r->ssm_fused_decode && !r->fn_qwen35_matvec_iq3xxs &&
                 cl->attn_q_type == GGML_TYPE_IQ3_XXS && cl->attn_k_type == GGML_TYPE_IQ3_XXS &&
                 cl->attn_v_type == GGML_TYPE_IQ3_XXS) {
                 int qr = cl->attn_q_rows, kr = cl->attn_k_rows, vr = cl->attn_v_rows;
@@ -21739,21 +29960,105 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
                 void *a[] = { &r->d_xb2, &r->d_k, &r->d_v, &cl->attn_q_w, &cl->attn_k_w, &cl->attn_v_w,
                               &qr, &kr, &vr, &nc, &r->d_xb };
                 LAUNCH(r->fn_matvec_qkv_iq3xxs, qr + kr + vr, 1, 1, 256, 1, 1, 0, r->stream, a);
+            } else if (cl->attn_q_type == GGML_TYPE_IQ2_XXS &&
+                       cl->attn_k_type == GGML_TYPE_IQ2_XXS &&
+                       cl->attn_v_type == GGML_TYPE_IQ2_XXS &&
+                       cl->attn_q_cols == cl->attn_k_cols &&
+                       cl->attn_q_cols == cl->attn_v_cols &&
+                       launch_qwen35_iq2xxs_qkv_fused(r, r->d_xb2, r->d_k, r->d_v,
+                           cl->attn_q_w, cl->attn_k_w, cl->attn_v_w, r->d_xb,
+                           cl->attn_q_rows, cl->attn_k_rows, cl->attn_v_rows,
+                           cl->attn_q_cols)) {
+                /* The opt-in native IQ2_XXS candidate owns all projections. */
+            } else if (cl->attn_q_type == GGML_TYPE_IQ2_XS &&
+                       cl->attn_k_type == GGML_TYPE_IQ2_XS &&
+                       cl->attn_v_type == GGML_TYPE_IQ2_XS &&
+                       cl->attn_q_cols == cl->attn_k_cols &&
+                       cl->attn_q_cols == cl->attn_v_cols &&
+                       launch_qwen35_iq2xs_qkv_fused(r, r->d_xb2, r->d_k, r->d_v,
+                           cl->attn_q_w, cl->attn_k_w, cl->attn_v_w, r->d_xb,
+                           cl->attn_q_rows, cl->attn_k_rows, cl->attn_v_rows,
+                           cl->attn_q_cols)) {
+                /* The opt-in native IQ2_XS candidate owns all projections. */
+            } else if (cl->attn_q_type == GGML_TYPE_IQ3_XXS &&
+                       cl->attn_k_type == GGML_TYPE_IQ3_XXS &&
+                       cl->attn_v_type == GGML_TYPE_IQ3_XXS &&
+                       cl->attn_q_cols == cl->attn_k_cols &&
+                       cl->attn_q_cols == cl->attn_v_cols &&
+                       launch_qwen35_iq3xxs_qkv_fused(r, r->d_xb2, r->d_k, r->d_v,
+                           cl->attn_q_w, cl->attn_k_w, cl->attn_v_w, r->d_xb,
+                           cl->attn_q_rows, cl->attn_k_rows, cl->attn_v_rows,
+                           cl->attn_q_cols)) {
+                /* The opt-in native candidate owns all three projections. */
+            } else if (cl->attn_q_type == GGML_TYPE_IQ3_S &&
+                       cl->attn_k_type == GGML_TYPE_IQ3_S &&
+                       cl->attn_v_type == GGML_TYPE_IQ3_S &&
+                       cl->attn_q_cols == cl->attn_k_cols &&
+                       cl->attn_q_cols == cl->attn_v_cols &&
+                       launch_qwen35_iq3s_qkv_fused(r, r->d_xb2, r->d_k, r->d_v,
+                           cl->attn_q_w, cl->attn_k_w, cl->attn_v_w, r->d_xb,
+                           cl->attn_q_rows, cl->attn_k_rows, cl->attn_v_rows,
+                           cl->attn_q_cols)) {
+                /* The opt-in native IQ3_S candidate owns all three projections. */
+            } else if (cl->attn_q_type == GGML_TYPE_IQ4_XS &&
+                       cl->attn_k_type == GGML_TYPE_IQ4_XS &&
+                       cl->attn_v_type == GGML_TYPE_IQ4_XS &&
+                       cl->attn_q_cols == cl->attn_k_cols &&
+                       cl->attn_q_cols == cl->attn_v_cols &&
+                       launch_qwen35_iq4xs_qkv_fused(r, r->d_xb2, r->d_k, r->d_v,
+                           cl->attn_q_w, cl->attn_k_w, cl->attn_v_w, r->d_xb,
+                           cl->attn_q_rows, cl->attn_k_rows, cl->attn_v_rows,
+                           cl->attn_q_cols)) {
+                /* The opt-in native IQ4_XS candidate owns all three projections. */
             } else {
-            launch_matvec_auto(r, r->d_xb2, cl->attn_q_w, r->d_xb,
-                              cl->attn_q_rows, cl->attn_q_cols, cl->attn_q_type);
-            launch_matvec_auto(r, r->d_k, cl->attn_k_w, r->d_xb, cl->attn_k_rows, cl->attn_k_cols, cl->attn_k_type);
-            launch_matvec_auto(r, r->d_v, cl->attn_v_w, r->d_xb, cl->attn_v_rows, cl->attn_v_cols, cl->attn_v_type);
+                begin_q8x2_reuse(r);
+                launch_matvec_auto(r, r->d_xb2, cl->attn_q_w, r->d_xb,
+                                  cl->attn_q_rows, cl->attn_q_cols, cl->attn_q_type);
+                launch_matvec_auto(r, r->d_k, cl->attn_k_w, r->d_xb, cl->attn_k_rows, cl->attn_k_cols, cl->attn_k_type);
+                launch_matvec_auto(r, r->d_v, cl->attn_v_w, r->d_xb, cl->attn_v_rows, cl->attn_v_cols, cl->attn_v_type);
+                end_q8x2_reuse(r);
             }
-            launch_deinterleave_qgate(r, r->d_q, r->d_attn_gate, r->d_xb2, n_heads, head_dim);
+            const char *qk_fused_env = getenv("LLM_QWEN35_QK_FUSED");
+            int qk_fused_requested = qk_fused_env && atoi(qk_fused_env) != 0;
+            int fused_qk_prep = qk_fused_requested && r->use_mrope && cl->has_qk_norm &&
+                cl->attn_q_norm_w && cl->attn_k_norm_w && !r->is_qwen4exp &&
+                r->fn_deinterleave_qgate_qknorm_mrope_pair_devp &&
+                !(r->debug_layers && debug_attention_layer_selected(l));
+            int fused_qk_store = fused_qk_prep && r->kv_quantized &&
+                r->requested_qwen35_decode_graph &&
+                r->kv_cache_type == HIP_LLM_KV_Q8_0_Q8_0;
+            if (fused_qk_prep) {
+                launch_qwen35_decode_qk_prep(r, r->d_q, r->d_attn_gate,
+                        r->d_xb2, r->d_k, r->d_v, cl->attn_q_norm_w,
+                        cl->attn_k_norm_w, n_heads, n_kv_heads, head_dim, eps,
+                        fused_qk_store, key_cache, value_cache,
+                        r->d_key_cache_scale[l], r->d_value_cache_scale[l]);
+            } else {
+                launch_deinterleave_qgate(r, r->d_q, r->d_attn_gate,
+                                          r->d_xb2, n_heads, head_dim);
+            }
 
-            if (cl->has_qk_norm) {
+            if (r->debug_layers && debug_attention_layer_selected(l)) {
+                debug_f32_state(r, l, "scalar-attn-qraw", r->d_q, n_heads * head_dim);
+                debug_f32_state(r, l, "scalar-attn-kraw", r->d_k, kv_dim);
+                debug_f32_state(r, l, "scalar-attn-vraw", r->d_v, kv_dim);
+            }
+
+            if (!fused_qk_prep && cl->has_qk_norm) {
                 if (cl->attn_q_norm_w) launch_qknorm(r, r->d_q, cl->attn_q_norm_w, n_heads, head_dim, eps);
                 if (cl->attn_k_norm_w) launch_qknorm(r, r->d_k, cl->attn_k_norm_w, n_kv_heads, head_dim, eps);
             }
 
-            launch_rope_devp(r, r->d_q, n_heads, head_dim, r->rope_freq_base);
-            launch_rope_devp(r, r->d_k, n_kv_heads, head_dim, r->rope_freq_base);
+            if (!fused_qk_prep) {
+                launch_rope_devp(r, r->d_q, n_heads, head_dim, r->rope_freq_base);
+                launch_rope_devp(r, r->d_k, n_kv_heads, head_dim, r->rope_freq_base);
+            }
+
+            if (r->debug_layers && debug_attention_layer_selected(l)) {
+                debug_f32_state(r, l, "scalar-attn-q", r->d_q, n_heads * head_dim);
+                debug_f32_state(r, l, "scalar-attn-k", r->d_k, kv_dim);
+                debug_f32_state(r, l, "scalar-attn-v", r->d_v, kv_dim);
+            }
 
             if (r->is_qwen4exp && r->debug_layers) {
                 debug_f32_state(r, l, "Q4 q_rope", r->d_q, n_heads * head_dim);
@@ -21801,29 +30106,90 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
                                              n_heads, n_kv_heads, head_dim, kv_dim, scale);
                 }
             } else {
-                launch_kv_store_devp(r, key_cache, value_cache,
-                                     r->d_k, r->d_v, kv_dim, r->max_seq_len);
-                size_t smem_attn = (size_t)r->max_seq_len * sizeof(float);
-                launch_attention_devp(r, r->d_xb2, r->d_q,
-                                       key_cache, value_cache,
-                                       n_heads, n_kv_heads, head_dim, kv_dim, scale, smem_attn);
-            }
+                if (r->kv_quantized) {
+                    if (r->requested_qwen35_decode_graph && r->kv_cache_type == HIP_LLM_KV_Q8_0_Q8_0) {
+                        if (!fused_qk_store) {
+                            void *a[] = { &key_cache, &value_cache, &r->d_key_cache_scale[l],
+                                &r->d_value_cache_scale[l], &r->d_k, &r->d_v, &n_kv_heads,
+                                &head_dim, &r->d_position };
+                            LAUNCH(r->fn_kv_cache_store_q8q8_devp, n_kv_heads, 1, 1,
+                                   256, 1, 1, 0, r->stream, a);
+                        }
+                    } else launch_kv_store_q8q4_batch(r, key_cache, value_cache,
+                                               r->d_key_cache_scale[l], r->d_value_cache_scale[l],
+                                               r->d_k, r->d_v, n_kv_heads, head_dim, r->cur_position, 1);
+                    const char *q8q4_direct = getenv("LLM_ATTN_DECODE_Q8Q4_DIRECT");
+                    if (r->fn_q8_attention_decode) {
+                        launch_attn_decode_native_q8(r, r->d_xb2, r->d_q, key_cache, value_cache,
+                            r->d_key_cache_scale[l], r->d_value_cache_scale[l]);
+                    } else if (r->kv_cache_type == HIP_LLM_KV_Q8_0_Q4_0 && q8q4_direct && atoi(q8q4_direct) != 0) {
+                        launch_attn_decode_q8q4(r, r->d_xb2, r->d_q, key_cache, value_cache,
+                                                r->d_key_cache_scale[l], r->d_value_cache_scale[l],
+                                                n_heads, n_kv_heads, head_dim, kv_dim, scale);
+                    } else {
+                        /* llama.cpp's current HIP build falls back from Q8_0/Q4_0
+                         * FlashAttention to F16 after cache dequantization. Keep
+                         * decode on that same numerical path by unpacking the
+                         * newly written cache into the linear F16 scratch. */
+                        int kv_len = r->cur_position + 1;
+                        launch_unpack_kv_q8q4_decode_f16(r, r->d_kv_pack_K_f16,
+                                                         key_cache, r->d_key_cache_scale[l],
+                                                         kv_len, n_kv_heads, head_dim, 0);
+                        launch_unpack_kv_q8q4_decode_f16(r, r->d_kv_pack_V_f16,
+                                                         value_cache, r->d_value_cache_scale[l],
+                                                         kv_len, n_kv_heads, head_dim, 1);
+                        launch_attn_decode_flash_f16(r, r->d_xb2, r->d_q,
+                                                     r->d_kv_pack_K_f16, r->d_kv_pack_V_f16,
+                                                     n_heads, n_kv_heads, head_dim, kv_dim, scale);
+                    }
+                } else if (r->kv_cache_type == HIP_LLM_KV_F16) {
+                    launch_kv_store_f16_devp(r, key_cache, value_cache,
+                                             r->d_k, r->d_v, kv_dim);
+                    launch_attn_decode_flash_f16(r, r->d_xb2, r->d_q,
+                                                 key_cache, value_cache,
+                                                 n_heads, n_kv_heads, head_dim,
+                                                 kv_dim, scale);
+                } else {
+                    launch_kv_store_devp(r, key_cache, value_cache,
+                                         r->d_k, r->d_v, kv_dim, r->max_seq_len);
+                    size_t smem_attn = (size_t)r->max_seq_len * sizeof(float);
+                    launch_attention_devp(r, r->d_xb2, r->d_q,
+                                           key_cache, value_cache,
+                                           n_heads, n_kv_heads, head_dim, kv_dim,
+                                           scale, smem_attn);
+                }
+        }
 
             int q_dim_local = n_heads * head_dim;
+            if (r->debug_layers && debug_attention_layer_selected(l))
+                debug_f32_state(r, l, "scalar-attn-pregate", r->d_xb2, q_dim_local);
             if (r->ssm_fused_decode && cl->attn_output_type == GGML_TYPE_Q6_K) {
                 int nr = cl->attn_output_rows;
                 int nc = cl->attn_output_cols;
                 void *a[] = { &r->d_xb, &cl->attn_output_w, &r->d_xb2, &r->d_attn_gate, &nr, &nc };
                 LAUNCH(r->fn_matvec_out_gated_q6k, nr, 1, 1, 256, 1, 1, 0, r->stream, a);
-            } else if (r->ssm_fused_decode && cl->attn_output_type == GGML_TYPE_IQ3_XXS) {
+            } else if (r->ssm_fused_decode && !r->fn_qwen35_matvec_iq3xxs && cl->attn_output_type == GGML_TYPE_IQ3_XXS) {
                 int nr = cl->attn_output_rows;
                 int nc = cl->attn_output_cols;
                 void *a[] = { &r->d_xb, &cl->attn_output_w, &r->d_xb2, &r->d_attn_gate, &nr, &nc };
                 LAUNCH(r->fn_matvec_out_gated_iq3xxs, nr, 1, 1, 256, 1, 1, 0, r->stream, a);
             } else {
-                launch_sigmoid_mul(r, r->d_xb2, r->d_attn_gate, q_dim_local);
+                const char *split_gate_q81_env = getenv("LLM_QWEN35_SPLIT_ATTN_GATE_Q81");
+                int native_gate_q81 = q_dim_local <= 17408 &&
+                    (q_dim_local % 256) == 0 &&
+                    qwen35_native_q81_matvec_type(r, cl->attn_output_type) &&
+                    (!split_gate_q81_env || atoi(split_gate_q81_env) == 0);
+                if (native_gate_q81) {
+                    launch_sigmoid_mul_native_q81(
+                        r, r->d_xb2, r->d_attn_gate, q_dim_local);
+                    begin_native_q81_prepared(r);
+                } else {
+                    launch_sigmoid_mul(r, r->d_xb2, r->d_attn_gate,
+                                       q_dim_local);
+                }
                 launch_matvec_auto(r, r->d_xb, cl->attn_output_w, r->d_xb2,
                                   cl->attn_output_rows, cl->attn_output_cols, cl->attn_output_type);
+                if (native_gate_q81) end_q8x2_reuse(r);
             }
 
         } else {
@@ -21835,6 +30201,39 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
                                      cl->attn_q_w, cl->attn_k_w, cl->attn_v_w,
                                      r->d_xb, cl->attn_q_rows, cl->attn_k_rows,
                                      cl->attn_v_rows, cl->attn_q_cols);
+            } else if (cl->attn_q_cols == cl->attn_k_cols &&
+                       cl->attn_q_cols == cl->attn_v_cols &&
+                       !(cl->attn_q_type == cl->attn_k_type &&
+                         cl->attn_q_type == cl->attn_v_type) &&
+                       launch_qwen35_iq_mixed_qkv(
+                           r, r->d_q, r->d_k, r->d_v,
+                           cl->attn_q_w, cl->attn_k_w, cl->attn_v_w,
+                           r->d_xb, cl->attn_q_rows, cl->attn_k_rows,
+                           cl->attn_v_rows, cl->attn_q_cols,
+                           cl->attn_q_type, cl->attn_k_type, cl->attn_v_type)) {
+                /* The opt-in mixed-IQ candidate owns all three projections. */
+            } else if (cl->attn_q_type == GGML_TYPE_Q4_K &&
+                       cl->attn_k_type == GGML_TYPE_Q4_K &&
+                       cl->attn_v_type == GGML_TYPE_Q4_K &&
+                       cl->attn_q_cols == cl->attn_k_cols &&
+                       cl->attn_q_cols == cl->attn_v_cols &&
+                       launch_qwen35_q4k_qkv_fused(
+                           r, r->d_q, r->d_k, r->d_v,
+                           cl->attn_q_w, cl->attn_k_w, cl->attn_v_w,
+                           r->d_xb, cl->attn_q_rows, cl->attn_k_rows,
+                           cl->attn_v_rows, cl->attn_q_cols)) {
+                /* The opt-in Q4_K/Q8_1 candidate owns all projections. */
+            } else if (cl->attn_q_type == GGML_TYPE_Q2_K &&
+                       cl->attn_k_type == GGML_TYPE_Q2_K &&
+                       cl->attn_v_type == GGML_TYPE_Q2_K &&
+                       cl->attn_q_cols == cl->attn_k_cols &&
+                       cl->attn_q_cols == cl->attn_v_cols &&
+                       launch_qwen35_q2k_qkv_fused(
+                           r, r->d_q, r->d_k, r->d_v,
+                           cl->attn_q_w, cl->attn_k_w, cl->attn_v_w,
+                           r->d_xb, cl->attn_q_rows, cl->attn_k_rows,
+                           cl->attn_v_rows, cl->attn_q_cols)) {
+                /* The opt-in native Q2_K candidate owns all projections. */
             } else if (r->ssm_fused_decode &&
                 cl->attn_q_type == GGML_TYPE_Q6_K && cl->attn_k_type == GGML_TYPE_Q6_K &&
                 cl->attn_v_type == GGML_TYPE_Q6_K) {
@@ -21843,7 +30242,7 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
                 void *a[] = { &r->d_q, &r->d_k, &r->d_v, &cl->attn_q_w, &cl->attn_k_w, &cl->attn_v_w,
                               &qr, &kr, &vr, &nc, &r->d_xb };
                 LAUNCH(r->fn_matvec_qkv_q6k, qr + kr + vr, 1, 1, 256, 1, 1, 0, r->stream, a);
-            } else if (r->ssm_fused_decode &&
+            } else if (r->ssm_fused_decode && !r->fn_qwen35_matvec_iq3xxs &&
                 cl->attn_q_type == GGML_TYPE_IQ3_XXS && cl->attn_k_type == GGML_TYPE_IQ3_XXS &&
                 cl->attn_v_type == GGML_TYPE_IQ3_XXS) {
                 int qr = cl->attn_q_rows, kr = cl->attn_k_rows, vr = cl->attn_v_rows;
@@ -21851,10 +30250,62 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
                 void *a[] = { &r->d_q, &r->d_k, &r->d_v, &cl->attn_q_w, &cl->attn_k_w, &cl->attn_v_w,
                               &qr, &kr, &vr, &nc, &r->d_xb };
                 LAUNCH(r->fn_matvec_qkv_iq3xxs, qr + kr + vr, 1, 1, 256, 1, 1, 0, r->stream, a);
+            } else if (cl->attn_q_type == GGML_TYPE_IQ2_XXS &&
+                       cl->attn_k_type == GGML_TYPE_IQ2_XXS &&
+                       cl->attn_v_type == GGML_TYPE_IQ2_XXS &&
+                       cl->attn_q_cols == cl->attn_k_cols &&
+                       cl->attn_q_cols == cl->attn_v_cols &&
+                       launch_qwen35_iq2xxs_qkv_fused(r, r->d_q, r->d_k, r->d_v,
+                           cl->attn_q_w, cl->attn_k_w, cl->attn_v_w, r->d_xb,
+                           cl->attn_q_rows, cl->attn_k_rows, cl->attn_v_rows,
+                           cl->attn_q_cols)) {
+                /* The opt-in native IQ2_XXS candidate owns all projections. */
+            } else if (cl->attn_q_type == GGML_TYPE_IQ2_XS &&
+                       cl->attn_k_type == GGML_TYPE_IQ2_XS &&
+                       cl->attn_v_type == GGML_TYPE_IQ2_XS &&
+                       cl->attn_q_cols == cl->attn_k_cols &&
+                       cl->attn_q_cols == cl->attn_v_cols &&
+                       launch_qwen35_iq2xs_qkv_fused(r, r->d_q, r->d_k, r->d_v,
+                           cl->attn_q_w, cl->attn_k_w, cl->attn_v_w, r->d_xb,
+                           cl->attn_q_rows, cl->attn_k_rows, cl->attn_v_rows,
+                           cl->attn_q_cols)) {
+                /* The opt-in native IQ2_XS candidate owns all projections. */
+            } else if (cl->attn_q_type == GGML_TYPE_IQ3_XXS &&
+                       cl->attn_k_type == GGML_TYPE_IQ3_XXS &&
+                       cl->attn_v_type == GGML_TYPE_IQ3_XXS &&
+                       cl->attn_q_cols == cl->attn_k_cols &&
+                       cl->attn_q_cols == cl->attn_v_cols &&
+                       launch_qwen35_iq3xxs_qkv_fused(r, r->d_q, r->d_k, r->d_v,
+                           cl->attn_q_w, cl->attn_k_w, cl->attn_v_w, r->d_xb,
+                           cl->attn_q_rows, cl->attn_k_rows, cl->attn_v_rows,
+                           cl->attn_q_cols)) {
+                /* The opt-in native candidate owns all three projections. */
+            } else if (cl->attn_q_type == GGML_TYPE_IQ3_S &&
+                       cl->attn_k_type == GGML_TYPE_IQ3_S &&
+                       cl->attn_v_type == GGML_TYPE_IQ3_S &&
+                       cl->attn_q_cols == cl->attn_k_cols &&
+                       cl->attn_q_cols == cl->attn_v_cols &&
+                       launch_qwen35_iq3s_qkv_fused(r, r->d_q, r->d_k, r->d_v,
+                           cl->attn_q_w, cl->attn_k_w, cl->attn_v_w, r->d_xb,
+                           cl->attn_q_rows, cl->attn_k_rows, cl->attn_v_rows,
+                           cl->attn_q_cols)) {
+                /* The opt-in native IQ3_S candidate owns all three projections. */
+            } else if (cl->attn_q_type == GGML_TYPE_IQ4_XS &&
+                       cl->attn_k_type == GGML_TYPE_IQ4_XS &&
+                       cl->attn_v_type == GGML_TYPE_IQ4_XS &&
+                       cl->attn_q_cols == cl->attn_k_cols &&
+                       cl->attn_q_cols == cl->attn_v_cols &&
+                       launch_qwen35_iq4xs_qkv_fused(r, r->d_q, r->d_k, r->d_v,
+                           cl->attn_q_w, cl->attn_k_w, cl->attn_v_w, r->d_xb,
+                           cl->attn_q_rows, cl->attn_k_rows, cl->attn_v_rows,
+                           cl->attn_q_cols)) {
+                /* The opt-in native IQ4_XS candidate owns all three projections. */
             } else {
+                begin_q8x2_reuse(r);
                 launch_matvec_auto(r, r->d_q, cl->attn_q_w, r->d_xb, cl->attn_q_rows, cl->attn_q_cols, cl->attn_q_type);
                 launch_matvec_auto(r, r->d_k, cl->attn_k_w, r->d_xb, cl->attn_k_rows, cl->attn_k_cols, cl->attn_k_type);
                 launch_matvec_auto(r, r->d_v, cl->attn_v_w, r->d_xb, cl->attn_v_rows, cl->attn_v_cols, cl->attn_v_type);
+                end_q8x2_reuse(r);
             }
 
             /* Attention biases (Qwen2.5-VL) */
@@ -21947,8 +30398,18 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
             return;
         }
 
-        /* Residual + FFN RMSNorm fused: x += xb; xb = rmsnorm(x)*w */
-        {
+        if (r->debug_layers && debug_attention_layer_selected(l))
+            debug_f32_state(r, l, "scalar-attn-out", r->d_xb, n_embd);
+
+        /* Residual + FFN RMSNorm fused by default.  The split form is a
+         * parity probe: llama.cpp materializes the residual add before its
+         * RMSNorm, and keeping that boundary separate can expose a reduction
+         * or aliasing difference in the fused kernel. */
+        const char *split_res_norm_env = getenv("LLM_QWEN35_SPLIT_RES_RMSNORM");
+        if (split_res_norm_env && atoi(split_res_norm_env) != 0) {
+            launch_add(r, r->d_x, r->d_xb, n_embd);
+            launch_rmsnorm(r, r->d_xb, r->d_x, cl->ffn_norm_w, n_embd, eps);
+        } else {
             void *a[] = { &r->d_x, &r->d_xb, &r->d_xb, &cl->ffn_norm_w, &n_embd, &eps };
             LAUNCH(r->fn_res_rmsnorm_f32, 1, 1, 1, 256, 1, 1, 256 * sizeof(float), r->stream, a);
         }
@@ -21959,6 +30420,9 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
             goto ffn_done;
         } else {
             /* Dense FFN */
+            if (attention_only) return; /* d_xb is the exact normalized FFN input. */
+            if (r->debug_layers && debug_attention_layer_selected(l))
+                debug_f32_state(r, l, "scalar ffn_norm_input", r->d_xb, n_embd);
             if (cl->ffn_gate_type == GGML_TYPE_Q8_0 &&
                 cl->ffn_up_type == GGML_TYPE_Q8_0 &&
                 cl->ffn_gate_rows == cl->ffn_up_rows &&
@@ -21972,7 +30436,7 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
                 int nc = cl->ffn_gate_cols;
                 void *a[] = { &r->d_gate, &cl->ffn_gate_w, &cl->ffn_up_w, &r->d_xb, &n_ff, &nc };
                 LAUNCH(r->fn_ffn_gate_up_silu_q6k, n_ff, 1, 1, 256, 1, 1, 0, r->stream, a);
-            } else if (r->ssm_fused_decode &&
+            } else if (r->ssm_fused_decode && !r->fn_qwen35_matvec_iq3xxs &&
                 cl->ffn_gate_type == GGML_TYPE_IQ3_XXS && cl->ffn_up_type == GGML_TYPE_IQ3_XXS) {
                 int n_ff = cl->ffn_gate_rows;
                 int nc = cl->ffn_gate_cols;
@@ -21983,18 +30447,134 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
                 } else
                     LAUNCH(r->fn_ffn_gate_up_silu_iq3xxs, n_ff, 1, 1, 256, 1, 1, 0, r->stream, a);
             } else {
-                launch_matvec_auto(r, r->d_gate, cl->ffn_gate_w, r->d_xb,
-                              cl->ffn_gate_rows, cl->ffn_gate_cols, cl->ffn_gate_type);
-                launch_matvec_auto(r, r->d_up, cl->ffn_up_w, r->d_xb,
-                              cl->ffn_up_rows, cl->ffn_up_cols, cl->ffn_up_type);
-                launch_silu_mul(r, r->d_gate, r->d_up, n_ff);
+                int fused_mixed_iq_gateup =
+                    cl->ffn_gate_type != cl->ffn_up_type &&
+                    cl->ffn_gate_rows == cl->ffn_up_rows &&
+                    cl->ffn_gate_cols == cl->ffn_up_cols &&
+                    launch_qwen35_iq_mixed_gateup_fused(
+                        r, r->d_gate, r->d_up, cl->ffn_gate_w,
+                        cl->ffn_up_w, r->d_xb, cl->ffn_gate_rows,
+                        cl->ffn_up_rows, cl->ffn_gate_cols,
+                        cl->ffn_gate_type, cl->ffn_up_type);
+                int fused_iq2s_gateup = !fused_mixed_iq_gateup &&
+                    cl->ffn_gate_type == GGML_TYPE_IQ2_S &&
+                    cl->ffn_up_type == GGML_TYPE_IQ2_S &&
+                    cl->ffn_gate_rows == cl->ffn_up_rows &&
+                    cl->ffn_gate_cols == cl->ffn_up_cols &&
+                    launch_qwen35_iq2s_gateup_fused(
+                        r, r->d_gate, r->d_up, cl->ffn_gate_w,
+                        cl->ffn_up_w, r->d_xb, cl->ffn_gate_rows,
+                        cl->ffn_gate_cols);
+                int fused_q2k_gateup =
+                    cl->ffn_gate_type == GGML_TYPE_Q2_K &&
+                    cl->ffn_up_type == GGML_TYPE_Q2_K &&
+                    cl->ffn_gate_rows == cl->ffn_up_rows &&
+                    cl->ffn_gate_cols == cl->ffn_up_cols &&
+                    launch_qwen35_q2k_gateup_fused(
+                        r, r->d_gate, r->d_up, cl->ffn_gate_w,
+                        cl->ffn_up_w, r->d_xb, cl->ffn_gate_rows,
+                        cl->ffn_gate_cols);
+                int fused_iq2xxs_gateup = !fused_q2k_gateup &&
+                    cl->ffn_gate_type == GGML_TYPE_IQ2_XXS &&
+                    cl->ffn_up_type == GGML_TYPE_IQ2_XXS &&
+                    cl->ffn_gate_rows == cl->ffn_up_rows &&
+                    cl->ffn_gate_cols == cl->ffn_up_cols &&
+                    launch_qwen35_iq2xxs_gateup_fused(
+                        r, r->d_gate, r->d_up, cl->ffn_gate_w,
+                        cl->ffn_up_w, r->d_xb, cl->ffn_gate_rows,
+                        cl->ffn_gate_cols);
+                int fused_iq2_gateup = !fused_q2k_gateup &&
+                    !fused_iq2xxs_gateup &&
+                    cl->ffn_gate_type == GGML_TYPE_IQ2_XS &&
+                    cl->ffn_up_type == GGML_TYPE_IQ2_XS &&
+                    cl->ffn_gate_rows == cl->ffn_up_rows &&
+                    cl->ffn_gate_cols == cl->ffn_up_cols &&
+                    launch_qwen35_iq2xs_gateup_fused(
+                        r, r->d_gate, r->d_up, cl->ffn_gate_w,
+                        cl->ffn_up_w, r->d_xb, cl->ffn_gate_rows,
+                        cl->ffn_gate_cols);
+                int fused_iq3_gateup = !fused_q2k_gateup &&
+                    !fused_iq2xxs_gateup && !fused_iq2_gateup &&
+                    cl->ffn_gate_type == GGML_TYPE_IQ3_XXS &&
+                    cl->ffn_up_type == GGML_TYPE_IQ3_XXS &&
+                    cl->ffn_gate_rows == cl->ffn_up_rows &&
+                    cl->ffn_gate_cols == cl->ffn_up_cols &&
+                    launch_qwen35_iq3xxs_gateup_fused(
+                        r, r->d_gate, r->d_up, cl->ffn_gate_w,
+                        cl->ffn_up_w, r->d_xb, cl->ffn_gate_rows,
+                        cl->ffn_gate_cols);
+                int fused_iq3s_gateup = !fused_q2k_gateup &&
+                    !fused_iq2xxs_gateup && !fused_iq2_gateup &&
+                    !fused_iq3_gateup &&
+                    cl->ffn_gate_type == GGML_TYPE_IQ3_S &&
+                    cl->ffn_up_type == GGML_TYPE_IQ3_S &&
+                    cl->ffn_gate_rows == cl->ffn_up_rows &&
+                    cl->ffn_gate_cols == cl->ffn_up_cols &&
+                    launch_qwen35_iq3s_gateup_fused(
+                        r, r->d_gate, r->d_up, cl->ffn_gate_w,
+                        cl->ffn_up_w, r->d_xb, cl->ffn_gate_rows,
+                        cl->ffn_gate_cols);
+                int fused_iq4_gateup = !fused_q2k_gateup &&
+                    !fused_iq2xxs_gateup && !fused_iq2_gateup &&
+                    !fused_iq3_gateup && !fused_iq3s_gateup &&
+                    cl->ffn_gate_type == GGML_TYPE_IQ4_XS &&
+                    cl->ffn_up_type == GGML_TYPE_IQ4_XS &&
+                    cl->ffn_gate_rows == cl->ffn_up_rows &&
+                    cl->ffn_gate_cols == cl->ffn_up_cols &&
+                    launch_qwen35_iq4xs_gateup_fused(
+                        r, r->d_gate, r->d_up, cl->ffn_gate_w,
+                        cl->ffn_up_w, r->d_xb, cl->ffn_gate_rows,
+                        cl->ffn_gate_cols);
+                int fused_iq1_gateup = !fused_q2k_gateup &&
+                    !fused_iq2xxs_gateup && !fused_iq2_gateup &&
+                    !fused_iq3_gateup && !fused_iq3s_gateup &&
+                    !fused_iq4_gateup &&
+                    cl->ffn_gate_type == GGML_TYPE_IQ1_S &&
+                    cl->ffn_up_type == GGML_TYPE_IQ1_M &&
+                    cl->ffn_gate_rows == cl->ffn_up_rows &&
+                    cl->ffn_gate_cols == cl->ffn_up_cols &&
+                    launch_iq1_gateup_q81_fused(
+                        r, r->d_gate, r->d_up, cl->ffn_gate_w,
+                        cl->ffn_up_w, r->d_xb, cl->ffn_gate_rows,
+                        cl->ffn_gate_cols);
+                if (!fused_q2k_gateup && !fused_iq2xxs_gateup &&
+                    !fused_iq2_gateup &&
+                    !fused_iq3_gateup && !fused_iq3s_gateup &&
+                    !fused_iq4_gateup &&
+                    !fused_iq1_gateup && !fused_mixed_iq_gateup &&
+                    !fused_iq2s_gateup) {
+                    begin_q8x2_reuse(r);
+                    launch_matvec_ffn_auto(r, r->d_gate, cl->ffn_gate_w, r->d_xb,
+                                          cl->ffn_gate_rows, cl->ffn_gate_cols,
+                                          cl->ffn_gate_type, 0);
+                    launch_matvec_ffn_auto(r, r->d_up, cl->ffn_up_w, r->d_xb,
+                                          cl->ffn_up_rows, cl->ffn_up_cols,
+                                          cl->ffn_up_type, 0);
+                    end_q8x2_reuse(r);
+                }
+                if (r->debug_layers && debug_attention_layer_selected(l)) {
+                    debug_f32_state(r, l, "scalar ffn_gate_raw", r->d_gate, n_ff);
+                    debug_f32_state(r, l, "scalar ffn_up_raw", r->d_up, n_ff);
+                }
+                int native_down_q81 = !fused_q2k_gateup &&
+                    n_ff <= 17408 && (n_ff % 256) == 0 &&
+                    qwen35_native_q81_matvec_type(r, cl->ffn_down_type);
+                const char *split_silu_q81 = getenv("LLM_QWEN35_SPLIT_SILU_Q81");
+                if (split_silu_q81 && atoi(split_silu_q81) != 0)
+                    native_down_q81 = 0;
+                if (native_down_q81) {
+                    launch_silu_mul_native_q81(r, r->d_gate, r->d_up, n_ff);
+                    begin_native_q81_prepared(r);
+                } else {
+                    launch_silu_mul(r, r->d_gate, r->d_up, n_ff);
+                }
             }
             if (r->ssm_fused_decode && cl->ffn_down_type == GGML_TYPE_Q6_K) {
                 int nr = cl->ffn_down_rows; /* n_embd */
                 int nc = cl->ffn_down_cols; /* n_ff */
                 void *a[] = { &r->d_x, &cl->ffn_down_w, &r->d_gate, &nr, &nc };
                 LAUNCH(r->fn_matvec_down_residual_q6k, nr, 1, 1, 256, 1, 1, 0, r->stream, a);
-            } else if (r->ssm_fused_decode && cl->ffn_down_type == GGML_TYPE_IQ3_XXS) {
+            } else if (r->ssm_fused_decode && !r->fn_qwen35_matvec_iq3xxs && cl->ffn_down_type == GGML_TYPE_IQ3_XXS) {
                 int nr = cl->ffn_down_rows; /* n_embd */
                 int nc = cl->ffn_down_cols; /* n_ff */
                 void *a[] = { &r->d_x, &cl->ffn_down_w, &r->d_gate, &nr, &nc };
@@ -22004,9 +30584,20 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
                     LAUNCH(r->fn_matvec_down_residual_iq3xxs_splitk, (nr + 7) / 8, (unsigned)r->down_ksplit, 1, 256, 1, 1, 0, r->stream, a);
                 else
                     LAUNCH(r->fn_matvec_down_residual_iq3xxs, nr, 1, 1, 256, 1, 1, 0, r->stream, a);
+            } else if (cl->ffn_down_type == GGML_TYPE_IQ2_XS &&
+                       launch_matvec_iq2xs_down_residual(r, r->d_x,
+                           cl->ffn_down_w, cl->ffn_down_rows,
+                           cl->ffn_down_cols)) {
+                /* The opt-in kernel adds the exact native IQ2_XS sum to the
+                 * live residual and therefore replaces d_xb plus launch_add. */
+                end_q8x2_reuse(r);
             } else {
-                launch_matvec_auto(r, r->d_xb, cl->ffn_down_w, r->d_gate,
-                              cl->ffn_down_rows, cl->ffn_down_cols, cl->ffn_down_type);
+                launch_matvec_ffn_auto(r, r->d_xb, cl->ffn_down_w, r->d_gate,
+                                      cl->ffn_down_rows, cl->ffn_down_cols,
+                                      cl->ffn_down_type, 0);
+                if (r->q8x2_reuse_active) end_q8x2_reuse(r);
+                if (r->debug_layers && debug_attention_layer_selected(l))
+                    debug_f32_state(r, l, "scalar ffn_out", r->d_xb, n_embd);
                 launch_add(r, r->d_x, r->d_xb, n_embd);
             }
         }
@@ -22026,6 +30617,13 @@ ffn_done:
             hipDeviceSynchronize();
             float *full_x = (float *)malloc(n_embd * sizeof(float));
             hipMemcpy(full_x, r->d_x, n_embd * sizeof(float), hipMemcpyDeviceToHost);
+            const char *dump_dir = getenv("LLM_DEBUG_DUMP_DIR");
+            if (dump_dir) {
+                char path[512];
+                snprintf(path, sizeof(path), "%s/runner-layer-out-%02d.bin", dump_dir, l);
+                FILE *f = fopen(path, "wb");
+                if (f) { fwrite(full_x, sizeof(float), (size_t)n_embd, f); fclose(f); }
+            }
             float ss = 0;
             for (int i = 0; i < n_embd; i++) ss += full_x[i] * full_x[i];
             fprintf(stderr, "  [L%02d %s] norm=%.2f first=[%.4f, %.4f, %.4f, %.4f]\n",
@@ -22052,10 +30650,14 @@ static int embed_tokens_batch(hip_llm_runner *r, const int32_t *tokens, int M);
 static int forward_block_batched_dense(hip_llm_runner *r, int M,
                                        int position_start,
                                        const int32_t *token_ids);
+static void hllm_qwen35_dflash2_capture(hip_llm_runner *r, int layer,
+                                        void *hidden, int rows);
 
 /* Per-token forward over all layers + final RMSNorm. */
 #include "qwen4_verify_window.h"
 #include "qwen4_nextn_forward.h"
+#include "qwen35_nextn.h"
+#include "qwen35_dflash2.h"
 #include "qwen4_nextn_ref.h"
 #include "qwen4_qsa_test.h"
 
@@ -22097,8 +30699,37 @@ int hip_llm_verify_qwen4_nextn(hip_llm_runner *r, const gguf_shards *sidecar,
 static void forward_blocks_body(hip_llm_runner *r) {
     int n_run_layers = r->n_layers;
     if (r->max_layers > 0 && r->max_layers < r->n_layers) n_run_layers = r->max_layers;
+    const char *sync_layers_env = getenv("LLM_QWEN35_SYNC_LAYERS");
+    const int sync_layers = r->is_hybrid && !r->is_qwen4exp &&
+                            sync_layers_env && atoi(sync_layers_env) != 0;
+    const char *profile_env = getenv("LLM_QWEN35_PROFILE_DECODE");
+    int profile_decode = profile_env && atoi(profile_env) != 0 &&
+                         r->decode_mode && r->graph_disabled;
     for (int l = 0; l < n_run_layers; l++) {
+        r->active_layer = l;
+        hipEvent_t layer_start = NULL, layer_stop = NULL;
+        if (profile_decode) {
+            hipEventCreate(&layer_start);
+            hipEventCreate(&layer_stop);
+            hipEventRecord(layer_start, r->stream);
+        }
         forward_one_layer(r, l);
+        if (sync_layers) {
+            /* Qwen3.5 mixes HIPRTC kernels with hipBLASLt launches.  Keep an
+             * explicit parity gate for gfx1201 while the fully asynchronous
+             * layer hand-off is being audited; debug captures previously
+             * masked this dependency by synchronizing at every boundary. */
+            hipDeviceSynchronize();
+        }
+        if (profile_decode) {
+            hipEventRecord(layer_stop, r->stream);
+            hipEventSynchronize(layer_stop);
+            float layer_ms = 0.0f;
+            hipEventElapsedTime(&layer_ms, layer_start, layer_stop);
+            fprintf(stderr, "hip_llm: decode-profile layer=%d ms=%.3f\n", l, layer_ms);
+            hipEventDestroy(layer_start);
+            hipEventDestroy(layer_stop);
+        }
         if (r->qwen4_forward_error) return;
         /* Text-encoder hidden snapshots: copy this layer's post-residual hidden
          * state (d_x) into the snapshot buffer. Only active when layers are set
@@ -22129,6 +30760,9 @@ static void hip_llm_phase5_capture(hip_llm_runner *r) {
     const char *env_gd = getenv("LLM_GRAPH_DISABLE");
     const char *env_gv = getenv("LLM_GRAPH_VERBOSE");
     if (env_gd) r->graph_disabled = atoi(env_gd) != 0;
+    /* An explicit runner argument overrides the launcher's legacy IQ3
+     * LLM_GRAPH_DISABLE default. Debug-layer eligibility still applies. */
+    if (r->requested_qwen35_decode_graph) r->graph_disabled = 0;
     if (env_gv) r->graph_verbose  = atoi(env_gv) != 0;
 
     /* DeepStack only fires when r->_ds_embd is set (forward_embd path).
@@ -22146,8 +30780,13 @@ static void hip_llm_phase5_capture(hip_llm_runner *r) {
      * MoE: capturable ONLY when device-side dispatch is active (moe_dev_dispatch_ok),
      * i.e. router top-K + softmax + shared-gate sigmoid run on-device with no host
      * sync. The legacy host-sync MoE path stays gated out. */
+    /* Q8/Q4 Qwen3.5 decode uses a position-dependent unpack into the F16
+     * scratch buffers to match llama.cpp's HIP fallback. Capturing at warm_pos
+     * zero would freeze that unpack length and replay stale attention state. */
     r->graph_eligible =
-        !r->debug_layers && (!r->is_moe || r->moe_dev_dispatch_ok);
+        !r->debug_layers && (!r->kv_quantized ||
+            (r->requested_qwen35_decode_graph && r->kv_cache_type == HIP_LLM_KV_Q8_0_Q8_0)) &&
+        (!r->is_moe || r->moe_dev_dispatch_ok);
 
     if (!r->graph_eligible || r->graph_disabled) {
         if (r->verbose >= 1) {
@@ -22195,6 +30834,21 @@ static void hip_llm_phase5_capture(hip_llm_runner *r) {
         }
     }
 
+    if (r->has_lm_head && r->is_hybrid && !r->is_qwen4exp && r->h_output_pinned) {
+        hipError_t err = hipStreamBeginCapture(r->stream, hipStreamCaptureModeThreadLocal);
+        if (err == hipSuccess) {
+            forward_blocks_body(r);
+            launch_matvec_auto(r, r->d_logits, r->d_output_w, r->d_x,
+                               r->n_vocab, r->n_embd, r->output_w_type);
+            launch_qwen35_argmax(r, r->d_logits, r->d_argmax);
+            hipMemcpyAsync(r->h_output, r->d_argmax, sizeof(int), hipMemcpyDeviceToHost, r->stream);
+            err = hipStreamEndCapture(r->stream, &r->graph_argmax);
+            if (err == hipSuccess && r->graph_argmax &&
+                hipGraphInstantiate(&r->graph_exec_argmax, r->graph_argmax, NULL, NULL, 0) == hipSuccess)
+                r->graph_ready_argmax = 1;
+        }
+    }
+
     /* --- hidden graph: blocks + final norm + D2H of d_x ------------------ */
     {
         hipError_t err = hipStreamBeginCapture(r->stream,
@@ -22223,14 +30877,14 @@ static void hip_llm_phase5_capture(hip_llm_runner *r) {
      * For non-hybrid this is harmless (KV slot 0 gets overwritten on the first
      * real call). For hybrid we must zero the state back out — otherwise the
      * first real decode token sees a primed state from the warm pass. */
-    if (r->is_hybrid && (r->graph_ready_logits || r->graph_ready_hidden)) {
+    if (r->is_hybrid && (r->graph_ready_logits || r->graph_ready_hidden || r->graph_ready_argmax)) {
         hip_llm_reset_state(r);
     }
 
     if (r->verbose >= 1 || r->graph_verbose) {
         fprintf(stderr,
-                "hip_llm: Phase-5 graph capture: logits=%d hidden=%d\n",
-                r->graph_ready_logits, r->graph_ready_hidden);
+                "hip_llm: Phase-5 graph capture: logits=%d hidden=%d argmax=%d\n",
+                r->graph_ready_logits, r->graph_ready_hidden, r->graph_ready_argmax);
     }
 }
 
@@ -22449,6 +31103,10 @@ float *hip_llm_forward_logits(hip_llm_runner *r, int32_t token_id, int position)
         launch_embed_q4_0(r, r->d_x, r->d_token_embd, token_id, n_embd);
     } else if (r->token_embd_type == GGML_TYPE_Q2_K) {
         launch_embed_q2_K(r, r->d_x, r->d_token_embd, token_id, n_embd);
+    } else if (r->token_embd_type == GGML_TYPE_IQ1_M) {
+        launch_embed_iq1_m(r, r->d_x, r->d_token_embd, token_id, n_embd);
+    } else if (r->token_embd_type == GGML_TYPE_F32) {
+        launch_embed_f32(r, r->d_x, r->d_token_embd, token_id, n_embd);
     } else {
         launch_embed(r, r->d_x, r->d_token_embd, token_id, n_embd);
     }
@@ -22474,7 +31132,11 @@ float *hip_llm_forward_logits(hip_llm_runner *r, int32_t token_id, int position)
                    hipMemcpyHostToDevice, r->stream);
     r->cur_position = position;
 
-    if (r->graph_ready_logits) {
+    r->argmax_valid = 0;
+    if (r->qwen4_argmax_only && r->graph_ready_argmax) {
+        hipGraphLaunch(r->graph_exec_argmax, r->stream);
+        r->argmax_valid = 1;
+    } else if (r->graph_ready_logits) {
         hipGraphLaunch(r->graph_exec_logits, r->stream);
     } else {
         forward_blocks_body(r);
@@ -22487,7 +31149,11 @@ float *hip_llm_forward_logits(hip_llm_runner *r, int32_t token_id, int position)
             void *a[] = { &r->d_logits, &n, &cap };
             LAUNCH(r->fn_logit_softcap_f32, (n + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, a);
         }
-        if (r->qwen4_argmax_only && r->is_qwen4exp && r->d_moe_idx) {
+        if (r->qwen4_argmax_only && !r->is_qwen4exp && r->d_argmax) {
+            launch_qwen35_argmax(r, r->d_logits, r->d_argmax);
+            hipMemcpyAsync(r->h_output, r->d_argmax, sizeof(int), hipMemcpyDeviceToHost, r->stream);
+            r->argmax_valid = 1;
+        } else if (r->qwen4_argmax_only && r->is_qwen4exp && r->d_moe_idx) {
             /* Fuse the argmax D2H dependency into the same stream wait used
              * by the target forward.  The old path synchronized here and
              * then launched a second argmax+sync in hip_llm_forward_argmax. */
@@ -22515,6 +31181,27 @@ int hip_llm_forward_argmax(hip_llm_runner *r, int32_t token_id, int position) {
     float *ok = hip_llm_forward_logits(r, token_id, position);
     r->qwen4_argmax_only = saved;
     if (!ok) return -1;
+    if (r->argmax_valid) {
+        int result;
+        memcpy(&result, r->h_output, sizeof(result));
+        return result;
+    }
+    /* qwen4_argmax uses d_moe_idx as its device output scratch.  Qwen3.5
+     * does not allocate that Qwen4-only buffer, so launching the helper here
+     * dereferences a null output pointer.  The public argmax API is used by
+     * Qwen3.5 decode as well; its logits are already synchronized above. */
+    if (!r->is_qwen4exp) {
+        int best = 0;
+        float best_v = r->h_output[0];
+        for (int i = 1; i < r->n_vocab; ++i) {
+            float v = r->h_output[i];
+            if (v > best_v || (v == best_v && i < best)) {
+                best_v = v;
+                best = i;
+            }
+        }
+        return best;
+    }
     return (r->is_qwen4exp && r->d_moe_idx) ?
            r->qwen4_argmax_result : hllm_qwen4_argmax(r);
 }
@@ -22555,6 +31242,64 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
     float scale    = 1.0f / sqrtf((float)head_dim);
     const char *native_batch_env = getenv("LLM_QWEN4_NATIVE_BATCH_QKV");
     int native_batch_qkv = native_batch_env && atoi(native_batch_env) != 0;
+    /* The scalar Qwen3.5 path evaluates IQ* projections directly from the
+     * quantized weights.  Converting those weights to BF16 for a batched GEMM
+     * changes the recurrent input enough to compound across 64 layers.  Keep
+     * the batched state/attention scheduling, but retain exact quantized
+     * projections unless the BF16 experiment is explicitly requested. */
+    const char *qwen35_bf16_env = getenv("LLM_QWEN35_BATCH_BF16_PROJ");
+    const char *qwen35_bf16_ffn_env = getenv("LLM_QWEN35_BF16_FFN_ONLY");
+    int qwen35_bf16_ffn_only = qwen35_bf16_ffn_env && atoi(qwen35_bf16_ffn_env) != 0;
+    int qwen35_bf16_proj = qwen35_bf16_env && atoi(qwen35_bf16_env) != 0 &&
+                           !qwen35_bf16_ffn_only;
+    if (r->requested_qwen35_prefill_bf16) qwen35_bf16_proj = 1;
+    if (r->requested_qwen35_prefill_bf16 && position_start == 0 && r->verbose)
+        fprintf(stderr, "hip_llm: experimental Qwen3.5 BF16 projection prefill; decode dispatch unchanged\n");
+    int qwen35_scalar_proj = r->is_hybrid && !r->is_qwen4exp && !qwen35_bf16_proj;
+    const char *qwen35_native_env = getenv("LLM_QWEN35_NATIVE_IQ2_BATCH");
+    const char *qwen35_native_max_env = getenv("LLM_QWEN35_NATIVE_IQ2_MAX_LAYER");
+    int qwen35_native_max_layer = qwen35_native_max_env && *qwen35_native_max_env
+                                ? atoi(qwen35_native_max_env) : INT_MAX;
+    int qwen35_native_iq2 = qwen35_scalar_proj && qwen35_native_env &&
+                            atoi(qwen35_native_env) != 0;
+    const char *qwen35_native_attn_env = getenv("LLM_QWEN35_NATIVE_ATTN");
+    const char *qwen35_native_ffn_env = getenv("LLM_QWEN35_NATIVE_FFN");
+    int qwen35_native_attn = qwen35_native_iq2 &&
+                             (!qwen35_native_attn_env || atoi(qwen35_native_attn_env) != 0);
+    /* The native batched FFN IQ2 path is still an explicit experiment.  Its
+     * current RDNA4 row/scale contract is not yet equivalent to llama.cpp's
+     * HIP MMQ path; silently selecting it can amplify a layer-0 projection
+     * error by the gated FFN product. */
+    int qwen35_native_ffn = qwen35_native_iq2 && qwen35_native_ffn_env &&
+                            atoi(qwen35_native_ffn_env) != 0;
+    /* Native SSM projection batching is a separate experiment from native
+     * FFN/attention batching. The recurrent update is order-sensitive, so
+     * enabling the IQ batch family must not silently move it off the scalar
+     * reference path. The small alpha/beta shapes are also numerically
+     * sensitive and can trigger a gfx1201 hipBLASLt plan crash. */
+    const char *qwen35_native_ssm_env = getenv("LLM_QWEN35_NATIVE_SSM");
+    int qwen35_native_ssm = qwen35_native_env && atoi(qwen35_native_env) != 0 &&
+                            qwen35_native_ssm_env && atoi(qwen35_native_ssm_env) != 0;
+    const char *qwen35_fast_ssm_env = getenv("LLM_QWEN35_BATCH_SSM_FAST");
+    int qwen35_scalar_ssm = qwen35_scalar_proj || qwen35_native_ssm;
+    int qwen35_fast_ssm = qwen35_scalar_ssm && qwen35_fast_ssm_env &&
+                          atoi(qwen35_fast_ssm_env) != 0;
+    /* llama.cpp quantizes F32 activations to Q8_K for its CPU-compatible
+     * IQ4_XS SSM output path.  Use that path by default for Qwen3.5: on the
+     * RX 9070 XT it improves the layer-0 projection error (0.566% -> 0.156%)
+     * without reducing measured decode throughput.  Set the variable to 0
+     * for the raw-F32 A/B control. */
+    const char *iq4_out_batch_env = getenv("LLM_QWEN35_IQ4_BATCH_SSM_OUT");
+    int qwen35_iq4_batch_out = iq4_out_batch_env && atoi(iq4_out_batch_env) != 0;
+    const char *iq4_q8k_env = getenv("LLM_QWEN35_IQ4_SSM_OUT_Q8K");
+    int qwen35_iq4_q8k_out = r->is_hybrid && !r->is_qwen4exp &&
+                             (!iq4_q8k_env || atoi(iq4_q8k_env) != 0);
+    /* The scalar path reduces each RMSNorm row with the same warp mapping as
+     * decode.  Keep a diagnostic escape hatch for hybrid batched parity: the
+     * phase-2 norm kernel may use a different reduction/order on gfx1201 even
+     * when all quantized projections stay on their scalar kernels. */
+    const char *qwen35_batch_rms_env = getenv("LLM_QWEN35_BATCH_RMSNORM_SCALAR");
+    int qwen35_batch_rms_scalar = qwen35_batch_rms_env && atoi(qwen35_batch_rms_env) != 0;
 
     int n_run_layers = r->n_layers;
     if (r->max_layers > 0 && r->max_layers < r->n_layers) n_run_layers = r->max_layers;
@@ -22569,7 +31314,7 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
     /* One-shot per-runner dispatch summary, gated by LLM_DEBUG_DISPATCH=1.
      * Helpful for diagnosing hybrid / mixed-quant models whose layers fall
      * back to per-row because a weight type lacks a dequant kernel
-     * (e.g. IQ2_S, IQ3_S, IQ4_XS — not yet ported). */
+     * (for example, a future quantization type without a batch kernel). */
     static int s_dump_dispatch_once = -1;
     int dump_dispatch = 0;
     if (s_dump_dispatch_once == -1) {
@@ -22590,8 +31335,45 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
             (size_t)r->n_layers * 5 * sizeof(uint64_t), r->stream) != hipSuccess) return -1;
 
     for (int l = 0; l < n_run_layers; l++) {
+        r->active_layer = l;
         hip_layer *cl = &r->layers[l];
+        int dflash_capture_norm = 0;
+        if (!qwen35_batch_rms_scalar && !r->fn_qwen35_rmsnorm_reference &&
+            !r->fn_qwen35_prefill_rmsnorm_reference)
+            dflash_capture_norm = hllm_qwen35_dflash2_capture_rmsnorm(
+                r, l, r->d_xnorm_batch, r->d_x_batch, cl->attn_norm_w,
+                M, eps);
+        if (!dflash_capture_norm)
+            hllm_qwen35_dflash2_capture(r, l, r->d_x_batch, M);
+        /* Keep recurrent SSM projections scalar unless the explicit BF16
+         * prefill experiment is selected. Recompute these gates for the
+         * interleaved attention and SSM blocks. */
+        qwen35_scalar_proj = r->is_hybrid && !r->is_qwen4exp &&
+                             (!qwen35_bf16_proj ||
+                              (cl->is_ssm && !r->requested_qwen35_prefill_bf16));
+        qwen35_native_iq2 = qwen35_scalar_proj && qwen35_native_env &&
+                            atoi(qwen35_native_env) != 0 &&
+                            l <= qwen35_native_max_layer;
+        qwen35_native_attn = qwen35_native_iq2 &&
+                             (!qwen35_native_attn_env || atoi(qwen35_native_attn_env) != 0);
+        qwen35_native_ffn = qwen35_native_iq2 && qwen35_native_ffn_env &&
+                            atoi(qwen35_native_ffn_env) != 0;
+        qwen35_scalar_ssm = qwen35_scalar_proj || qwen35_native_ssm;
+        qwen35_fast_ssm = qwen35_scalar_ssm && qwen35_fast_ssm_env &&
+                          atoi(qwen35_fast_ssm_env) != 0;
+        qwen35_iq4_batch_out = iq4_out_batch_env && atoi(iq4_out_batch_env) != 0 &&
+                               cl->ssm_out_type == GGML_TYPE_IQ4_XS;
+        qwen35_iq4_q8k_out = (!iq4_q8k_env || atoi(iq4_q8k_env) != 0) &&
+                             cl->ssm_out_type == GGML_TYPE_IQ4_XS &&
+                             !r->requested_qwen35_prefill_bf16;
+        r->batch_q8_valid = 0;
         r->qwen4_fingerprint_layer = l;
+        r->qwen35_batch_layer = l;
+        const char *prefill_profile_env = getenv("LLM_QWEN35_PROFILE_PREFILL");
+        int prefill_profile = r->is_hybrid && !r->is_qwen4exp &&
+            prefill_profile_env && atoi(prefill_profile_env) != 0;
+        if (prefill_profile && hipStreamSynchronize(r->stream) != hipSuccess) return -1;
+        double prefill_layer_start = prefill_profile ? hllm_monotonic_ms() : 0.0;
         if (fingerprint) qwen4_fingerprint(r, 0, r->d_hc_batch,
                                            M * r->hc_count * n_embd);
 
@@ -22633,7 +31415,17 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
         const char *qwen4_batch_ssm_env = getenv("LLM_QWEN4_BATCH_SSM");
         int qwen4_batch_ssm = r->is_qwen4exp && qwen4_batch_ssm_env &&
                               atoi(qwen4_batch_ssm_env) != 0;
+        const char *qwen35_batch_max_env = getenv("LLM_QWEN35_BATCH_MAX_LAYER");
+        int qwen35_batch_max_layer = qwen35_batch_max_env ?
+                                     atoi(qwen35_batch_max_env) : r->n_layers - 1;
+        int qwen35_layer_batch_ok = !r->is_hybrid || r->is_qwen4exp ||
+                                    l <= qwen35_batch_max_layer;
+        const char *qwen35_ssm_env = getenv("LLM_QWEN35_BATCH_SSM");
+        int qwen35_batch_ssm = r->is_qwen4exp || r->requested_qwen35_prefill_bf16 ||
+                               (qwen35_ssm_env && atoi(qwen35_ssm_env) != 0);
         int can_batch_ssm  =  cl->is_ssm &&
+                             qwen35_layer_batch_ok &&
+                             qwen35_batch_ssm &&
                              (!r->is_qwen4exp || qwen4_batch_ssm) &&
                              ssm_layer_is_batched_eligible(cl);
         const char *qwen4_batch_attn_env = getenv("LLM_QWEN4_BATCH_ATTN");
@@ -22654,7 +31446,7 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
          * the historical all-layer default. */
         int batch_attn_max_layer = batch_attn_max_env ? atoi(batch_attn_max_env) :
             (r->is_qwen4exp ? 2 : r->n_layers - 1);
-        int can_batch_attn = qwen4_batch_attn && !cl->is_ssm &&
+        int can_batch_attn = qwen35_layer_batch_ok && qwen4_batch_attn && !cl->is_ssm &&
                              l <= batch_attn_max_layer &&
                              layer_is_batched_eligible(cl);
         /* The grouped verifier defaults to scalar layer bodies because the
@@ -22751,6 +31543,12 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
             r->d_hc = saved_d_hc;
             if (row_failed) return -1;
             if (split_ple_ffn) goto ffn_section;
+            if (prefill_profile) {
+                if (hipStreamSynchronize(r->stream) != hipSuccess) return -1;
+                fprintf(stderr, "hip_llm: prefill-profile layer=%d M=%d path=scalar-%s ms=%.3f\n",
+                        l, M, cl->is_ssm ? "ssm" : "attn",
+                        hllm_monotonic_ms() - prefill_layer_start);
+            }
             continue;
         }
 
@@ -22777,9 +31575,29 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
                                 (const float *)r->d_xnorm_batch, M * n_embd);
             }
         } else {
-            launch_rmsnorm_batch(r, r->d_xnorm_batch, r->d_x_batch,
-                                 cl->attn_norm_w, n_embd, M, n_embd, eps);
+            if (r->debug_layers && l < 6)
+                debug_f32_state(r, l, "Q4 batch ssm_pre_norm",
+                                (const float *)r->d_x_batch + (size_t)(M - 1) * n_embd,
+                                n_embd);
+            if (qwen35_batch_rms_scalar) {
+                for (int m = 0; m < M; ++m)
+                    launch_rmsnorm(r,
+                        (char *)r->d_xnorm_batch + (size_t)m * n_embd * sizeof(float),
+                        (char *)r->d_x_batch + (size_t)m * n_embd * sizeof(float),
+                        cl->attn_norm_w, n_embd, eps);
+            } else if (!dflash_capture_norm) {
+                launch_qwen35_prefill_rmsnorm(r, r->d_xnorm_batch, r->d_x_batch,
+                                     cl->attn_norm_w, n_embd, M, n_embd, eps);
+            }
+            if (r->debug_layers && l < 6)
+                debug_f32_state(r, l, "Q4 batch ssm_norm_input",
+                                (const float *)r->d_xnorm_batch + (size_t)(M - 1) * n_embd,
+                                n_embd);
         }
+            if (r->debug_layers && debug_attention_layer_selected(l))
+                debug_f32_state(r, l, "Q4 batch attn_norm",
+                            (const float *)r->d_xnorm_batch + (size_t)(M - 1) * n_embd,
+                            n_embd);
 
         /* Pack BF16 input (single launch over M*n_embd) */
         launch_pack_bf16_from_f32(r, r->d_xnorm_batch_bf16,
@@ -22808,10 +31626,365 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
                 cl->ssm_gate_type == GGML_TYPE_Q6_K &&
                 cl->ssm_alpha_type == GGML_TYPE_F16 &&
                 cl->ssm_beta_type == GGML_TYPE_F16;
+            int scalar_ssm_proj = qwen35_scalar_ssm;
+            const char *ssm_iq3_mmq_env = getenv("LLM_QWEN35_SSM_IQ3_MMQ");
+            int ssm_iq3_mmq = ssm_iq3_mmq_env && atoi(ssm_iq3_mmq_env) != 0 &&
+                              scalar_ssm_proj && !qwen35_native_ssm &&
+                              M > 0 && M <= r->batch_max &&
+                              cl->ssm_qkv_type == GGML_TYPE_IQ3_S &&
+                              cl->ssm_gate_type == GGML_TYPE_IQ3_S &&
+                              (n_embd % 32) == 0;
+            if (ssm_iq3_mmq)
+                launch_quantize_mmq_d4_batch(r, r->d_xnorm_batch, n_embd, M, n_embd);
+            /* Keep the row-wise quantized SSM projections authoritative for
+             * comparison with llama.cpp's MMVQ path.  The older batched
+             * fallback below otherwise overwrites them with dequantized
+             * BF16 GEMMs, which changes the arithmetic before the recurrent
+             * update. */
+            const char *keep_scalar_env = getenv("LLM_QWEN35_SSM_KEEP_SCALAR");
+            int keep_scalar_ssm = keep_scalar_env && atoi(keep_scalar_env) != 0 &&
+                                  scalar_ssm_proj && !qwen35_native_ssm;
+            /* Diagnostic port of llama.cpp's IQ4_XS MMVQ input contract:
+             * Q8_1, one 32-value block per activation scale.  Keep this
+             * separate from the Q8_K SSM-output route because it changes the
+             * four large IQ4_XS input projections as well. */
+            const char *ssm_in_q81_env = getenv("LLM_QWEN35_SSM_IN_Q81");
+            const char *ssm_gate_q81_env = getenv("LLM_QWEN35_SSM_GATE_Q81");
+            const char *ssm_qkv_q81_env = getenv("LLM_QWEN35_SSM_QKV_Q81");
+            int ssm_q81_all = ssm_in_q81_env && atoi(ssm_in_q81_env) != 0;
+            int ssm_q81_gate = ssm_gate_q81_env && atoi(ssm_gate_q81_env) != 0;
+            /* The scalar SSM dispatcher has independent QKV and gate knobs.
+             * Preserve that contract in the batched path: the production
+             * IQ2 launcher enables QKV Q8_1 through SSM_QKV_Q81 while leaving
+             * the broader SSM_IN_Q81 experiment disabled.  Previously the
+             * batch path tested only SSM_IN_Q81, silently falling back to its
+             * BF16/dequant projection and making scalar and batched runs use
+             * different arithmetic. */
+            int ssm_q81_qkv = ssm_qkv_q81_env && atoi(ssm_qkv_q81_env) != 0;
+            const char *iq1_q81_env = getenv("LLM_QWEN35_SSM_Q81_IQ1");
+            const char *iq1s_q81_env = getenv("LLM_QWEN35_SSM_Q81_IQ1S");
+            const char *iq1m_q81_env = getenv("LLM_QWEN35_SSM_Q81_IQ1M");
+            int use_iq1_s_q81 = (iq1_q81_env && atoi(iq1_q81_env) != 0) ||
+                                (iq1s_q81_env && atoi(iq1s_q81_env) != 0);
+            int use_iq1_m_q81 = (iq1_q81_env && atoi(iq1_q81_env) != 0) ||
+                                (iq1m_q81_env && atoi(iq1m_q81_env) != 0);
+            const char *exact_q81_env = getenv("LLM_QWEN35_SSM_Q81_EXACT");
+            int exact_q81_enabled = exact_q81_env && atoi(exact_q81_env) != 0;
+            int ssm_q81_iq1_type = (use_iq1_s_q81 &&
+                                    (cl->ssm_qkv_type == GGML_TYPE_IQ1_S ||
+                                     cl->ssm_gate_type == GGML_TYPE_IQ1_S)) ||
+                                   (use_iq1_m_q81 &&
+                                    (cl->ssm_qkv_type == GGML_TYPE_IQ1_M ||
+                                     cl->ssm_gate_type == GGML_TYPE_IQ1_M));
+            int use_ssm_in_q81 = (ssm_q81_all || ssm_q81_gate || ssm_q81_qkv) &&
+                                 scalar_ssm_proj && !qwen35_native_ssm &&
+                                 M > 0 && M <= r->batch_max &&
+                                  (cl->ssm_qkv_type == GGML_TYPE_IQ3_S ||
+                                   cl->ssm_gate_type == GGML_TYPE_IQ3_S ||
+                                  (cl->ssm_qkv_type == GGML_TYPE_IQ3_XXS ||
+                                   cl->ssm_gate_type == GGML_TYPE_IQ3_XXS) ||
+                                  (exact_q81_enabled &&
+                                   (cl->ssm_qkv_type == GGML_TYPE_IQ2_XS ||
+                                    cl->ssm_gate_type == GGML_TYPE_IQ2_XS ||
+                                    cl->ssm_qkv_type == GGML_TYPE_IQ2_XXS ||
+                                    cl->ssm_gate_type == GGML_TYPE_IQ2_XXS ||
+                                    ssm_q81_iq1_type)) ||
+                                  cl->ssm_qkv_type == GGML_TYPE_IQ4_XS ||
+                                  cl->ssm_gate_type == GGML_TYPE_IQ4_XS);
+            int qkv_q81 = (ssm_q81_all || ssm_q81_qkv) &&
+                          cl->ssm_qkv_type == GGML_TYPE_IQ3_S;
+            int gate_q81 = (ssm_q81_all || ssm_q81_gate) &&
+                           cl->ssm_gate_type == GGML_TYPE_IQ3_S;
+            int qkv_q81_iq3xxs = (ssm_q81_all || ssm_q81_qkv) &&
+                                 cl->ssm_qkv_type == GGML_TYPE_IQ3_XXS;
+            int gate_q81_iq3xxs = (ssm_q81_all || ssm_q81_gate) &&
+                                  cl->ssm_gate_type == GGML_TYPE_IQ3_XXS;
+            int qkv_q81_iq4xs = (ssm_q81_all || ssm_q81_qkv) &&
+                                cl->ssm_qkv_type == GGML_TYPE_IQ4_XS;
+            int gate_q81_iq4xs = (ssm_q81_all || ssm_q81_gate) &&
+                                 cl->ssm_gate_type == GGML_TYPE_IQ4_XS;
+            int qkv_q81_iq2xs = (ssm_q81_all || ssm_q81_qkv) && exact_q81_enabled &&
+                                cl->ssm_qkv_type == GGML_TYPE_IQ2_XS;
+            int gate_q81_iq2xs = (ssm_q81_all || ssm_q81_gate) && exact_q81_enabled &&
+                                 cl->ssm_gate_type == GGML_TYPE_IQ2_XS;
+            int qkv_q81_iq2xxs = (ssm_q81_all || ssm_q81_qkv) && exact_q81_enabled &&
+                                 cl->ssm_qkv_type == GGML_TYPE_IQ2_XXS;
+            int gate_q81_iq2xxs = (ssm_q81_all || ssm_q81_gate) && exact_q81_enabled &&
+                                  cl->ssm_gate_type == GGML_TYPE_IQ2_XXS;
+            int qkv_q81_iq1s = (ssm_q81_all || ssm_q81_qkv) && exact_q81_enabled &&
+                               use_iq1_s_q81 && cl->ssm_qkv_type == GGML_TYPE_IQ1_S;
+            int gate_q81_iq1s = (ssm_q81_all || ssm_q81_gate) && exact_q81_enabled &&
+                                use_iq1_s_q81 && cl->ssm_gate_type == GGML_TYPE_IQ1_S;
+            int qkv_q81_iq1m = (ssm_q81_all || ssm_q81_qkv) && exact_q81_enabled &&
+                               use_iq1_m_q81 && cl->ssm_qkv_type == GGML_TYPE_IQ1_M;
+            int gate_q81_iq1m = (ssm_q81_all || ssm_q81_gate) && exact_q81_enabled &&
+                                use_iq1_m_q81 && cl->ssm_gate_type == GGML_TYPE_IQ1_M;
+            if (use_ssm_in_q81) {
+                if (qkv_q81_iq1s || gate_q81_iq1s || qkv_q81_iq1m || gate_q81_iq1m) {
+                    /* QKV/gate can be mixed IQ1 and Q8x2.  Keep the old
+                     * two-format staging contract for this dispatcher; the
+                     * IQ1-only projection paths use the cheaper direct helper. */
+                    launch_quantize_q81_iq1_batch_preserve_q8x2(
+                        r, r->d_xnorm_batch, n_embd, M, n_embd);
+                } else {
+                    launch_quantize_q8x2_batch_cached(r, r->d_xnorm_batch,
+                                                      n_embd, M, n_embd);
+                }
+            }
             const char *ssm_native_env = getenv("LLM_QWEN4_BATCH_SSM_NATIVE");
             int ssm_native = ssm_native_env && atoi(ssm_native_env) != 0 &&
                              qwen4_ssm_native_supported(cl);
-            if (ssm_native) {
+            if (scalar_ssm_proj || qwen35_native_ssm) {
+                int native_qkv = qwen35_native_ssm && qwen35_native_batch_type(cl->ssm_qkv_type);
+                int native_gate = qwen35_native_ssm && qwen35_native_batch_type(cl->ssm_gate_type);
+                const char *aux_env = getenv("LLM_QWEN35_NATIVE_IQ2_SSM_AUX");
+                int native_aux = aux_env && atoi(aux_env) != 0;
+                int native_alpha = native_aux && qwen35_native_ssm && qwen35_native_batch_type(cl->ssm_alpha_type);
+                int native_beta = native_aux && qwen35_native_ssm && qwen35_native_batch_type(cl->ssm_beta_type);
+                int batch_alpha = cl->ssm_alpha_type == GGML_TYPE_F16 ||
+                                   cl->ssm_alpha_type == GGML_TYPE_BF16;
+                int batch_beta = cl->ssm_beta_type == GGML_TYPE_F16 ||
+                                  cl->ssm_beta_type == GGML_TYPE_BF16;
+                const char *f16_aux_env = getenv("LLM_QWEN35_SSM_F16_HIPBLAS");
+                int f16_aux_gemm = f16_aux_env && atoi(f16_aux_env) != 0 &&
+                                   cl->ssm_alpha_type == GGML_TYPE_F16 &&
+                                   cl->ssm_beta_type == GGML_TYPE_F16;
+            const char *f32_aux_env = getenv("LLM_QWEN35_SSM_F32_BLASLT");
+                int f32_aux_gemm = f32_aux_env && atoi(f32_aux_env) != 0 &&
+                                   !r->gemm_own &&
+                                   cl->ssm_alpha_type == GGML_TYPE_F32 &&
+                                   cl->ssm_beta_type == GGML_TYPE_F32;
+                const char *ssm_dp4a_env = getenv("LLM_QWEN35_SSM_DP4A_BATCH");
+                int ssm_dp4a_batch = ssm_dp4a_env && atoi(ssm_dp4a_env) != 0 &&
+                                     qwen35_native_batch_type(cl->ssm_qkv_type) &&
+                                     qwen35_native_batch_type(cl->ssm_gate_type);
+                if (f16_aux_gemm) {
+                    launch_pack_f16_from_f32(r, r->d_silu_batch_bf16,
+                                             r->d_xnorm_batch, M * n_embd);
+                    if (gemm_run_f16_w(r->d_ssm_alpha_batch,
+                                       cl->ssm_alpha_w, r->d_silu_batch_bf16,
+                                       M, cl->ssm_alpha_rows, n_embd,
+                                       r->stream) != 0 ||
+                        gemm_run_f16_w(r->d_ssm_beta_batch,
+                                       cl->ssm_beta_w, r->d_silu_batch_bf16,
+                                       M, cl->ssm_beta_rows, n_embd,
+                                       r->stream) != 0) return -1;
+                }
+                if (f32_aux_gemm) {
+                    if (gemm_run_f32_w(r, r->d_ssm_alpha_batch,
+                                       cl->ssm_alpha_w, r->d_xnorm_batch,
+                                       M, cl->ssm_alpha_rows, n_embd,
+                                       r->stream) != 0 ||
+                        gemm_run_f32_w(r, r->d_ssm_beta_batch,
+                                       cl->ssm_beta_w, r->d_xnorm_batch,
+                                       M, cl->ssm_beta_rows, n_embd,
+                                       r->stream) != 0) return -1;
+                }
+                int aux_gemm_done = f16_aux_gemm || f32_aux_gemm;
+                if (f16_aux_gemm && l == 0 && r->verbose >= 1)
+                    fprintf(stderr, "hip_llm: SSM F16 hipBLAS alpha/beta enabled\n");
+                if (f32_aux_gemm && l == 0 && r->verbose >= 1)
+                    fprintf(stderr, "hip_llm: SSM F32 alpha/beta BLASLt A/B enabled\n");
+                if (native_qkv)
+                    launch_matvec_qwen35_native_batch(r, r->d_ssm_qkv_batch, cl->ssm_qkv_w,
+                        r->d_xnorm_batch, M, cl->ssm_qkv_rows, cl->ssm_qkv_cols, n_embd,
+                        cl->ssm_qkv_type);
+                if (native_gate)
+                    launch_matvec_qwen35_native_batch(r, r->d_ssm_z_batch, cl->ssm_gate_w,
+                        r->d_xnorm_batch, M, cl->ssm_gate_rows, cl->ssm_gate_cols, n_embd,
+                        cl->ssm_gate_type);
+                if (native_alpha)
+                    launch_matvec_qwen35_native_batch(r, r->d_ssm_alpha_batch, cl->ssm_alpha_w,
+                        r->d_xnorm_batch, M, cl->ssm_alpha_rows, cl->ssm_alpha_cols, n_embd,
+                        cl->ssm_alpha_type);
+                if (native_beta)
+                    launch_matvec_qwen35_native_batch(r, r->d_ssm_beta_batch, cl->ssm_beta_w,
+                        r->d_xnorm_batch, M, cl->ssm_beta_rows, cl->ssm_beta_cols, n_embd,
+                        cl->ssm_beta_type);
+                if (batch_alpha && !aux_gemm_done) {
+                    void *a[] = { &r->d_ssm_alpha_batch, &cl->ssm_alpha_w,
+                                  &r->d_xnorm_batch, &cl->ssm_alpha_rows,
+                                  &cl->ssm_alpha_cols };
+                    hipFunction_t fn = cl->ssm_alpha_type == GGML_TYPE_BF16 ?
+                                       r->fn_matvec_bf16_f32_batch : r->fn_matvec_f16_f32_batch;
+                    LAUNCH(fn, cl->ssm_alpha_rows, M, 1,
+                           256, 1, 1, 0, r->stream, a);
+                }
+                if (batch_beta && !aux_gemm_done) {
+                    void *a[] = { &r->d_ssm_beta_batch, &cl->ssm_beta_w,
+                                  &r->d_xnorm_batch, &cl->ssm_beta_rows,
+                                  &cl->ssm_beta_cols };
+                    hipFunction_t fn = cl->ssm_beta_type == GGML_TYPE_BF16 ?
+                                       r->fn_matvec_bf16_f32_batch : r->fn_matvec_f16_f32_batch;
+                    LAUNCH(fn, cl->ssm_beta_rows, M, 1,
+                           256, 1, 1, 0, r->stream, a);
+                }
+                for (int m = 0; m < M; ++m) {
+                    float *xrow = (float *)r->d_xnorm_batch + (size_t)m * n_embd;
+                    if (!native_qkv && !ssm_iq3_mmq && !qkv_q81 && !qkv_q81_iq3xxs &&
+                        !qkv_q81_iq4xs &&
+                        !qkv_q81_iq2xs && !qkv_q81_iq2xxs &&
+                        !qkv_q81_iq1s && !qkv_q81_iq1m)
+                        launch_matvec_ssm_auto(r, (float *)r->d_ssm_qkv_batch + (size_t)m * cl->ssm_qkv_rows,
+                                           cl->ssm_qkv_w, xrow, cl->ssm_qkv_rows,
+                                           cl->ssm_qkv_cols, cl->ssm_qkv_type, 1);
+                    if (!native_gate && !ssm_iq3_mmq && !gate_q81 && !gate_q81_iq3xxs &&
+                        !gate_q81_iq4xs &&
+                        !gate_q81_iq2xs && !gate_q81_iq2xxs &&
+                        !gate_q81_iq1s && !gate_q81_iq1m)
+                        launch_matvec_ssm_auto(r, (float *)r->d_ssm_z_batch + (size_t)m * cl->ssm_gate_rows,
+                                           cl->ssm_gate_w, xrow, cl->ssm_gate_rows,
+                                           cl->ssm_gate_cols, cl->ssm_gate_type, 0);
+                    if (!native_alpha && !batch_alpha && !aux_gemm_done)
+                        launch_matvec_auto(r, (float *)r->d_ssm_alpha_batch + (size_t)m * cl->ssm_alpha_rows,
+                                           cl->ssm_alpha_w, xrow, cl->ssm_alpha_rows,
+                                           cl->ssm_alpha_cols, cl->ssm_alpha_type);
+                    if (!native_beta && !batch_beta && !aux_gemm_done)
+                        launch_matvec_auto(r, (float *)r->d_ssm_beta_batch + (size_t)m * cl->ssm_beta_rows,
+                                           cl->ssm_beta_w, xrow, cl->ssm_beta_rows,
+                                           cl->ssm_beta_cols, cl->ssm_beta_type);
+                }
+                if (qkv_q81) {
+                    void *a[] = { &r->d_ssm_qkv_batch, &cl->ssm_qkv_w,
+                                  &r->d_act_q8_batch, &r->d_act_scale_batch,
+                                  &cl->ssm_qkv_rows, &cl->ssm_qkv_cols, &M };
+                    LAUNCH(r->fn_matvec_iq3_s_q81_batch,
+                           (cl->ssm_qkv_rows + 7) / 8, M, 1,
+                           256, 1, 1, 0, r->stream, a);
+                } else if (ssm_iq3_mmq) {
+                    void *a[] = { &r->d_ssm_qkv_batch, &cl->ssm_qkv_w,
+                                  &r->d_act_q8_batch, &r->d_act_scale_batch,
+                                  &cl->ssm_qkv_rows, &cl->ssm_qkv_cols, &M };
+                    LAUNCH(r->fn_matvec_iq3_s_q81_batch,
+                           (cl->ssm_qkv_rows + 7) / 8, M, 1,
+                           256, 1, 1, 0, r->stream, a);
+                    void *g[] = { &r->d_ssm_z_batch, &cl->ssm_gate_w,
+                                  &r->d_act_q8_batch, &r->d_act_scale_batch,
+                                  &cl->ssm_gate_rows, &cl->ssm_gate_cols, &M };
+                    LAUNCH(r->fn_matvec_iq3_s_q81_batch,
+                           (cl->ssm_gate_rows + 7) / 8, M, 1,
+                           256, 1, 1, 0, r->stream, g);
+                } else if (ssm_dp4a_batch) {
+                    launch_matvec_qwen35_native_batch(r, r->d_ssm_qkv_batch,
+                        cl->ssm_qkv_w, r->d_xnorm_batch, M,
+                        cl->ssm_qkv_rows, cl->ssm_qkv_cols, n_embd,
+                        cl->ssm_qkv_type);
+                    launch_matvec_qwen35_native_batch(r, r->d_ssm_z_batch,
+                        cl->ssm_gate_w, r->d_xnorm_batch, M,
+                        cl->ssm_gate_rows, cl->ssm_gate_cols, n_embd,
+                        cl->ssm_gate_type);
+                }
+                if (qkv_q81_iq3xxs) {
+                    void *a[] = { &r->d_ssm_qkv_batch, &cl->ssm_qkv_w,
+                                  &r->d_act_q8_batch, &r->d_act_scale_batch,
+                                  &cl->ssm_qkv_rows, &cl->ssm_qkv_cols, &M };
+                    LAUNCH((getenv("LLM_IQ3_XXS_Q81_MMQ") && atoi(getenv("LLM_IQ3_XXS_Q81_MMQ")) != 0) ?
+                           r->fn_matvec_iq3_xxs_mmq_scales : r->fn_matvec_iq3_xxs_q81_batch,
+                           (cl->ssm_qkv_rows + 7) / 8, M, 1,
+                           256, 1, 1, 0, r->stream, a);
+                }
+                if (qkv_q81_iq4xs) {
+                    void *a[] = { &r->d_ssm_qkv_batch, &cl->ssm_qkv_w,
+                                  &r->d_act_q8_batch, &r->d_act_scale_batch,
+                                  &cl->ssm_qkv_rows, &cl->ssm_qkv_cols, &M };
+                    LAUNCH(r->fn_matvec_iq4_xs_q81_batch,
+                           (cl->ssm_qkv_rows + 7) / 8, M, 1,
+                           256, 1, 1, 0, r->stream, a);
+                }
+                if (qkv_q81_iq2xs) {
+                    void *a[] = { &r->d_ssm_qkv_batch, &cl->ssm_qkv_w,
+                                  &r->d_act_q8_batch, &r->d_act_scale_batch,
+                                  &cl->ssm_qkv_rows, &cl->ssm_qkv_cols, &M };
+                    LAUNCH(r->fn_matvec_iq2_xs_q81_batch,
+                           (cl->ssm_qkv_rows + 7) / 8, M, 1,
+                           256, 1, 1, 0, r->stream, a);
+                }
+                if (qkv_q81_iq2xxs) {
+                    void *a[] = { &r->d_ssm_qkv_batch, &cl->ssm_qkv_w,
+                                  &r->d_act_q8_batch, &r->d_act_scale_batch,
+                                  &cl->ssm_qkv_rows, &cl->ssm_qkv_cols, &M };
+                    LAUNCH(r->fn_matvec_iq2_xxs_q81_batch,
+                           (cl->ssm_qkv_rows + 7) / 8, M, 1,
+                           256, 1, 1, 0, r->stream, a);
+                }
+                if (qkv_q81_iq1s) {
+                    void *a[] = { &r->d_ssm_qkv_batch, &cl->ssm_qkv_w,
+                                  &r->d_act_q8_batch, &r->d_act_scale_batch,
+                                  &r->d_act_scale_batch_b, &cl->ssm_qkv_rows,
+                                  &cl->ssm_qkv_cols, &M };
+                    LAUNCH(r->fn_matvec_iq1_s_q81_batch,
+                           (cl->ssm_qkv_rows + 7) / 8, M, 1,
+                           256, 1, 1, 0, r->stream, a);
+                }
+                if (qkv_q81_iq1m) {
+                    void *a[] = { &r->d_ssm_qkv_batch, &cl->ssm_qkv_w,
+                                  &r->d_act_q8_batch, &r->d_act_scale_batch,
+                                  &r->d_act_scale_batch_b, &cl->ssm_qkv_rows,
+                                  &cl->ssm_qkv_cols, &M };
+                    LAUNCH(r->fn_matvec_iq1_m_q81_batch,
+                           (cl->ssm_qkv_rows + 7) / 8, M, 1,
+                           256, 1, 1, 0, r->stream, a);
+                }
+                if (gate_q81) {
+                    void *a[] = { &r->d_ssm_z_batch, &cl->ssm_gate_w,
+                                  &r->d_act_q8_batch, &r->d_act_scale_batch,
+                                  &cl->ssm_gate_rows, &cl->ssm_gate_cols, &M };
+                    LAUNCH(r->fn_matvec_iq3_s_q81_batch,
+                           (cl->ssm_gate_rows + 7) / 8, M, 1,
+                           256, 1, 1, 0, r->stream, a);
+                }
+                if (gate_q81_iq3xxs) {
+                    void *a[] = { &r->d_ssm_z_batch, &cl->ssm_gate_w,
+                                  &r->d_act_q8_batch, &r->d_act_scale_batch,
+                                  &cl->ssm_gate_rows, &cl->ssm_gate_cols, &M };
+                    LAUNCH((getenv("LLM_IQ3_XXS_Q81_MMQ") && atoi(getenv("LLM_IQ3_XXS_Q81_MMQ")) != 0) ?
+                           r->fn_matvec_iq3_xxs_mmq_scales : r->fn_matvec_iq3_xxs_q81_batch,
+                           (cl->ssm_gate_rows + 7) / 8, M, 1,
+                           256, 1, 1, 0, r->stream, a);
+                }
+                if (gate_q81_iq4xs) {
+                    void *a[] = { &r->d_ssm_z_batch, &cl->ssm_gate_w,
+                                  &r->d_act_q8_batch, &r->d_act_scale_batch,
+                                  &cl->ssm_gate_rows, &cl->ssm_gate_cols, &M };
+                    LAUNCH(r->fn_matvec_iq4_xs_q81_batch,
+                           (cl->ssm_gate_rows + 7) / 8, M, 1,
+                           256, 1, 1, 0, r->stream, a);
+                }
+                if (gate_q81_iq2xs) {
+                    void *a[] = { &r->d_ssm_z_batch, &cl->ssm_gate_w,
+                                  &r->d_act_q8_batch, &r->d_act_scale_batch,
+                                  &cl->ssm_gate_rows, &cl->ssm_gate_cols, &M };
+                    LAUNCH(r->fn_matvec_iq2_xs_q81_batch,
+                           (cl->ssm_gate_rows + 7) / 8, M, 1,
+                           256, 1, 1, 0, r->stream, a);
+                }
+                if (gate_q81_iq2xxs) {
+                    void *a[] = { &r->d_ssm_z_batch, &cl->ssm_gate_w,
+                                  &r->d_act_q8_batch, &r->d_act_scale_batch,
+                                  &cl->ssm_gate_rows, &cl->ssm_gate_cols, &M };
+                    LAUNCH(r->fn_matvec_iq2_xxs_q81_batch,
+                           (cl->ssm_gate_rows + 7) / 8, M, 1,
+                           256, 1, 1, 0, r->stream, a);
+                }
+                if (gate_q81_iq1s) {
+                    void *a[] = { &r->d_ssm_z_batch, &cl->ssm_gate_w,
+                                  &r->d_act_q8_batch, &r->d_act_scale_batch,
+                                  &r->d_act_scale_batch_b, &cl->ssm_gate_rows,
+                                  &cl->ssm_gate_cols, &M };
+                    LAUNCH(r->fn_matvec_iq1_s_q81_batch,
+                           (cl->ssm_gate_rows + 7) / 8, M, 1,
+                           256, 1, 1, 0, r->stream, a);
+                }
+                if (gate_q81_iq1m) {
+                    void *a[] = { &r->d_ssm_z_batch, &cl->ssm_gate_w,
+                                  &r->d_act_q8_batch, &r->d_act_scale_batch,
+                                  &r->d_act_scale_batch_b, &cl->ssm_gate_rows,
+                                  &cl->ssm_gate_cols, &M };
+                    LAUNCH(r->fn_matvec_iq1_m_q81_batch,
+                           (cl->ssm_gate_rows + 7) / 8, M, 1,
+                           256, 1, 1, 0, r->stream, a);
+                }
+            } else if (ssm_native) {
                 if (launch_ssm_matvec4_q8_batch(r,cl,M,r->d_xnorm_batch,
                     r->d_ssm_qkv_batch,r->d_ssm_z_batch,r->d_ssm_alpha_batch,
                     r->d_ssm_beta_batch)) return -1;
@@ -22822,6 +31995,13 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
                     cl->ssm_alpha_w, cl->ssm_beta_w, r->d_xnorm_batch,
                     M, cl->ssm_qkv_rows, cl->ssm_gate_rows, dt_rank,
                     cl->ssm_qkv_cols);
+            } else if (ssm_iq3_mmq) {
+                /* The IQ3_S MMQ projections were produced above with the
+                 * llama.cpp-compatible D4 scale contract. */
+            } else if (keep_scalar_ssm) {
+                /* The row-wise quantized projections above already populated
+                 * qkv/gate.  Alpha/beta were likewise computed above using
+                 * their selected scalar or small-batch path. */
             } else {
             #define SSM_GEMM(dst, w_field, type_field, rows_field, cols_field) do {       \
                 void *_w = get_bf16_weight(r, cl->w_field, cl->w_field##_bf16,            \
@@ -22830,18 +32010,80 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
                 if (gemm_run_bf16_w(r, dst, _w, r->d_xnorm_batch_bf16, M,                 \
                                        cl->rows_field, n_embd, r->stream) != 0) return -1;\
             } while(0)
-            SSM_GEMM(r->d_ssm_qkv_batch,   ssm_qkv_w,   ssm_qkv_type,   ssm_qkv_rows,   ssm_qkv_cols);
-            SSM_GEMM(r->d_ssm_z_batch,     ssm_gate_w,  ssm_gate_type,  ssm_gate_rows,  ssm_gate_cols);
+            /* Diagnostic isolation of the IQ3_S MMQ input contract while
+             * retaining BF16 for the other projection families. */
+            const char *iq3_prefill_env = getenv("LLM_QWEN35_PREFILL_IQ3S_D4");
+            int iq3_prefill_d4 = iq3_prefill_env && atoi(iq3_prefill_env) != 0 &&
+                cl->ssm_qkv_type == GGML_TYPE_IQ3_S &&
+                cl->ssm_gate_type == GGML_TYPE_IQ3_S &&
+                cl->ssm_qkv_cols == n_embd && cl->ssm_gate_cols == n_embd &&
+                n_embd % 256 == 0;
+            if (iq3_prefill_d4) {
+                launch_quantize_mmq_d4_batch(r, r->d_xnorm_batch, n_embd, M, n_embd);
+                int reuse = atoi(iq3_prefill_env) >= 2 &&
+                            r->fn_qwen35_matvec_iq3s_prefill8;
+                hipFunction_t fn = reuse ? r->fn_qwen35_matvec_iq3s_prefill8 :
+                                          r->fn_matvec_iq3_s_q81_batch;
+                int threads = reuse ? 128 : 256;
+                int row_tile = threads / 32;
+                int token_tiles = reuse ? (M + 7) / 8 : M;
+                void *qa[] = { &r->d_ssm_qkv_batch, &cl->ssm_qkv_w,
+                    &r->d_act_q8_batch, &r->d_act_scale_batch,
+                    &cl->ssm_qkv_rows, &cl->ssm_qkv_cols, &M };
+                LAUNCH(fn, (cl->ssm_qkv_rows + row_tile - 1) / row_tile,
+                       token_tiles, 1, threads, 1, 1, 0, r->stream, qa);
+                void *ga[] = { &r->d_ssm_z_batch, &cl->ssm_gate_w,
+                    &r->d_act_q8_batch, &r->d_act_scale_batch,
+                    &cl->ssm_gate_rows, &cl->ssm_gate_cols, &M };
+                LAUNCH(fn, (cl->ssm_gate_rows + row_tile - 1) / row_tile,
+                       token_tiles, 1, threads, 1, 1, 0, r->stream, ga);
+            } else {
+                SSM_GEMM(r->d_ssm_qkv_batch, ssm_qkv_w, ssm_qkv_type, ssm_qkv_rows, ssm_qkv_cols);
+                SSM_GEMM(r->d_ssm_z_batch, ssm_gate_w, ssm_gate_type, ssm_gate_rows, ssm_gate_cols);
+            }
             SSM_GEMM(r->d_ssm_alpha_batch, ssm_alpha_w, ssm_alpha_type, ssm_alpha_rows, ssm_alpha_cols);
             SSM_GEMM(r->d_ssm_beta_batch,  ssm_beta_w,  ssm_beta_type,  ssm_beta_rows,  ssm_beta_cols);
             #undef SSM_GEMM
             }
 
-            /* softplus_mul broadcasts dt_rank-wide bias/a over M rows; sigmoid
-             * is a flat elementwise op so the per-token kernel works as-is. */
+            if (r->debug_layers && l < 6) {
+                debug_f32_state(r, l, "Q4 batch ssm_qkv",
+                                (const float *)r->d_ssm_qkv_batch +
+                                (size_t)(M - 1) * cl->ssm_qkv_rows,
+                                cl->ssm_qkv_rows);
+                debug_f32_state(r, l, "Q4 batch ssm_gate",
+                                (const float *)r->d_ssm_z_batch +
+                                (size_t)(M - 1) * cl->ssm_gate_rows,
+                                cl->ssm_gate_rows);
+                debug_f32_state(r, l, "Q4 batch ssm_alpha",
+                                (const float *)r->d_ssm_alpha_batch +
+                                (size_t)(M - 1) * cl->ssm_alpha_rows,
+                                cl->ssm_alpha_rows);
+                debug_f32_state(r, l, "Q4 batch ssm_beta",
+                                (const float *)r->d_ssm_beta_batch +
+                                (size_t)(M - 1) * cl->ssm_beta_rows,
+                                cl->ssm_beta_rows);
+            }
+
+            /* softplus_mul broadcasts dt_rank-wide bias/a over M rows.  The
+             * fused recurrence consumes exp(alpha); compute that scalar once
+             * per token/head here instead of once per state column. */
+            const char *batch_recur_env = getenv("LLM_SSM_BATCH_RECURRENCE");
+            int use_deltanet_batch = d_state <= 128 && batch_recur_env &&
+                                     atoi(batch_recur_env) != 0;
             launch_softplus_mul_batch(r, r->d_ssm_alpha_batch, r->d_ssm_alpha_batch,
-                                      cl->ssm_dt_bias, cl->ssm_a, dt_rank, M);
+                                      cl->ssm_dt_bias, cl->ssm_a, dt_rank, M,
+                                      use_deltanet_batch);
             launch_sigmoid_inplace(r, r->d_ssm_beta_batch, M * dt_rank);
+
+            if (r->debug_layers && l < 6) {
+                debug_f32_state(r, l, "Q4 batch alpha_softplus",
+                                (const float *)r->d_ssm_alpha_batch +
+                                (size_t)(M - 1) * dt_rank, dt_rank);
+                debug_f32_state(r, l, "Q4 batch beta_sigmoid",
+                                (const float *)r->d_ssm_beta_batch +
+                                (size_t)(M - 1) * dt_rank, dt_rank);
+            }
 
             /* All aux ops now batched over M rows:
              *   conv1d:           one launch, M sequential steps fused
@@ -22853,9 +32095,19 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
              *   gated_rmsnorm:    one launch covering dt_rank × M rows
              * Replaces ~6*M per-row launches per layer with ~6 launches. */
             const char *batch_conv_env = getenv("LLM_SSM_BATCH_CONV");
-            if (batch_conv_env && atoi(batch_conv_env) != 0) {
+            const char *prep_fuse_env = getenv("LLM_SSM_BATCH_PREP_FUSE");
+            int use_prep_fuse = batch_conv_env && atoi(batch_conv_env) != 0 &&
+                                prep_fuse_env && atoi(prep_fuse_env) != 0 &&
+                                qwen35_native_ssm;
+            if (use_prep_fuse) {
+                launch_ssm_prep_batch(r, r->d_ssm_conv_out_batch, cl->d_conv_state,
+                    r->d_ssm_qkv_batch, cl->ssm_conv1d_w,
+                    r->d_ssm_Q_exp_batch, r->d_ssm_K_exp_batch,
+                    qkv_dim, conv_k, n_group, d_state, dt_rank,
+                    qkv_dim, dt_rank * d_state, M, eps);
+            } else if (batch_conv_env && atoi(batch_conv_env) != 0) {
                 launch_conv1d_batch(r, r->d_ssm_conv_out_batch, cl->d_conv_state,
-                                    r->d_ssm_qkv_batch, cl->ssm_conv1d_w,
+                                    NULL, r->d_ssm_qkv_batch, cl->ssm_conv1d_w,
                                     qkv_dim, conv_k, qkv_dim, M);
             } else {
                 /* Scalar conv preserves the exact state/update arithmetic;
@@ -22875,18 +32127,64 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
                 }
             }
 
+            if (r->debug_layers && l < 6) {
+                debug_f32_state(r, l, "Q4 batch conv_output_raw",
+                                (const float *)r->d_ssm_conv_out_batch +
+                                (size_t)(M - 1) * qkv_dim, qkv_dim);
+            }
+
             float *conv_out_base = (float *)r->d_ssm_conv_out_batch;
             float *K_raw_base    = conv_out_base + (size_t)n_group * d_state;
-            launch_l2_norm_heads_batch(r, conv_out_base, n_group, d_state,
-                                       qkv_dim, M, eps);                 /* Q */
-            launch_l2_norm_heads_batch(r, K_raw_base,    n_group, d_state,
-                                       qkv_dim, M, eps);                 /* K */
-            launch_repeat_tile_batch(r, r->d_ssm_Q_exp_batch, conv_out_base,
-                                     dt_rank, d_state, n_group,
-                                     qkv_dim, dt_rank * d_state, M);
-            launch_repeat_tile_batch(r, r->d_ssm_K_exp_batch, K_raw_base,
-                                     dt_rank, d_state, n_group,
-                                     qkv_dim, dt_rank * d_state, M);
+            if (use_prep_fuse) {
+                /* ssm_prep_batch already emitted normalized, expanded Q/K. */
+            } else if (qwen35_scalar_ssm && !qwen35_fast_ssm) {
+                /* Preserve the scalar reduction/order for Qwen3.5.  These
+                 * normalizations feed the recurrent matrix update directly;
+                 * a different parallel reduction is amplified by later
+                 * tokens even when the projections themselves match. */
+                for (int m = 0; m < M; ++m) {
+                    size_t qoff = (size_t)m * qkv_dim;
+                    size_t eoff = (size_t)m * dt_rank * d_state;
+                    launch_l2_norm_heads(r, conv_out_base + qoff,
+                                         n_group, d_state, eps);
+                    launch_l2_norm_heads(r, K_raw_base + qoff,
+                                         n_group, d_state, eps);
+                    launch_repeat_tile(r, (float *)r->d_ssm_Q_exp_batch + eoff,
+                                       conv_out_base + qoff,
+                                       dt_rank, d_state, n_group);
+                    launch_repeat_tile(r, (float *)r->d_ssm_K_exp_batch + eoff,
+                                       K_raw_base + qoff,
+                                       dt_rank, d_state, n_group);
+                }
+            } else if (!getenv("LLM_SSM_BATCH_QK_FUSE") ||
+                       atoi(getenv("LLM_SSM_BATCH_QK_FUSE")) != 0) {
+                launch_l2_norm_repeat_qk_batch(r,
+                    r->d_ssm_Q_exp_batch, r->d_ssm_K_exp_batch,
+                    r->d_ssm_conv_out_batch, n_group, d_state, dt_rank,
+                    qkv_dim, dt_rank * d_state, M, eps);
+            } else {
+                launch_l2_norm_heads_batch(r, conv_out_base, n_group, d_state,
+                                           qkv_dim, M, eps);             /* Q */
+                launch_l2_norm_heads_batch(r, K_raw_base,    n_group, d_state,
+                                           qkv_dim, M, eps);             /* K */
+                launch_repeat_tile_batch(r, r->d_ssm_Q_exp_batch, conv_out_base,
+                                         dt_rank, d_state, n_group,
+                                         qkv_dim, dt_rank * d_state, M);
+                launch_repeat_tile_batch(r, r->d_ssm_K_exp_batch, K_raw_base,
+                                         dt_rank, d_state, n_group,
+                                         qkv_dim, dt_rank * d_state, M);
+            }
+
+            if (r->debug_layers && l < 6) {
+                debug_f32_state(r, l, "Q4 batch q_norm",
+                                (const float *)r->d_ssm_Q_exp_batch +
+                                (size_t)(M - 1) * dt_rank * d_state,
+                                dt_rank * d_state);
+                debug_f32_state(r, l, "Q4 batch k_norm",
+                                (const float *)r->d_ssm_K_exp_batch +
+                                (size_t)(M - 1) * dt_rank * d_state,
+                                dt_rank * d_state);
+            }
 
             /* Phase B: fused multi-token deltanet step. V lives inside conv_out
              * at offset 2*n_group*d_state with stride qkv_dim per row. */
@@ -22898,9 +32196,6 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
              * and __expf/FMA contraction accumulate a measurable logit delta
              * over Qwen4's 36 SSM layers.  Batched projections/conv/norm remain
              * useful without sacrificing the scalar recurrence's parity. */
-            const char *batch_recur_env = getenv("LLM_SSM_BATCH_RECURRENCE");
-            int use_deltanet_batch = d_state <= 128 && batch_recur_env &&
-                                     atoi(batch_recur_env) != 0;
             if (use_deltanet_batch) {
                 launch_deltanet_step_batch(r, cl->d_recurrent_state,
                     r->d_ssm_out_batch,
@@ -22932,17 +32227,105 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
                 }
             }
 
-            /* Batched gated_rmsnorm_silu: one launch over dt_rank × M heads. */
-            launch_gated_rmsnorm_silu_batch(r, r->d_ssm_out_batch, r->d_ssm_z_batch,
-                                            cl->ssm_norm_w, dt_rank, d_state,
-                                            dt_rank * d_state, M, eps);
+            /* Batched gated_rmsnorm_silu: one launch over dt_rank × M heads.
+             * Qwen3.5 uses the scalar reduction for parity for the same reason
+             * as the Q/K head norms above. */
+            if (qwen35_native_ssm && qwen35_native_batch_type(cl->ssm_out_type)) {
+                launch_matvec_qwen35_native_batch(r, r->d_attn_proj_batch, cl->ssm_out_w,
+                    r->d_ssm_out_batch, M, n_embd, d_inner, d_inner, cl->ssm_out_type);
+            } else if (qwen35_scalar_ssm && !qwen35_fast_ssm) {
+                for (int m = 0; m < M; ++m)
+                    launch_gated_rmsnorm_silu(r,
+                        (float *)r->d_ssm_out_batch + (size_t)m * d_inner,
+                        (float *)r->d_ssm_z_batch + (size_t)m * d_inner,
+                        cl->ssm_norm_w, dt_rank, d_state, eps);
+            } else {
+                launch_gated_rmsnorm_silu_batch(r, r->d_ssm_out_batch, r->d_ssm_z_batch,
+                                                cl->ssm_norm_w, dt_rank, d_state,
+                                                dt_rank * d_state, M, eps);
+            }
+            if (r->debug_layers && l < 6)
+                debug_f32_state(r, l, "Q4 batch ssm_norm",
+                                (const float *)r->d_ssm_out_batch +
+                                (size_t)(M - 1) * d_inner, d_inner);
             if (r->is_qwen4exp && r->debug_layers)
                 debug_f32_state(r, l, "Q4 batch ssm_norm",
                                 (const float *)r->d_ssm_out_batch, M * d_inner);
 
             /* ssm_out projection: d_inner -> n_embd, batched. Reuse d_silu_batch_bf16
              * as packing scratch (sized for n_ff >= d_inner). */
-            if (ssm_native) {
+            const char *iq3_xxs_q81_out_env = getenv("LLM_QWEN35_IQ3XXS_SSM_OUT_Q81");
+            int qwen35_iq3_xxs_q81_out = iq3_xxs_q81_out_env &&
+                                         atoi(iq3_xxs_q81_out_env) != 0 &&
+                                         cl->ssm_out_type == GGML_TYPE_IQ3_XXS &&
+                                         d_inner % 256 == 0;
+            if (qwen35_iq3_xxs_q81_out) {
+                /* llama.cpp's IQ3_XXS MMVQ path consumes one Q8_1 block per
+                 * 32 activation values.  The kernel already implements its
+                 * high-scale integer correction; connect it here for a
+                 * direct end-to-end comparison with the ROCm reference. */
+                launch_quantize_q81_batch_cached(r, r->d_ssm_out_batch,
+                                                 d_inner, M, d_inner);
+                launch_matvec_iq_q81_batch(r,
+                    (getenv("LLM_IQ3_XXS_Q81_MMQ") &&
+                     atoi(getenv("LLM_IQ3_XXS_Q81_MMQ")) != 0) ?
+                    r->fn_matvec_iq3_xxs_mmq_scales :
+                    r->fn_matvec_iq3_xxs_q81_batch,
+                    r->d_attn_proj_batch, cl->ssm_out_w,
+                    n_embd, d_inner, M);
+            } else {
+            const char *iq4_q81_env = getenv("LLM_QWEN35_IQ4_SSM_OUT_Q81");
+            int qwen35_iq4_q81_out = iq4_q81_env && atoi(iq4_q81_env) != 0;
+            const char *iq4_q81_max_env = getenv("LLM_QWEN35_IQ4_SSM_OUT_Q81_MAX_LAYER");
+            if (qwen35_iq4_q81_out && iq4_q81_max_env && l > atoi(iq4_q81_max_env))
+                qwen35_iq4_q81_out = 0;
+            const char *iq4_d4_env = getenv("LLM_QWEN35_PREFILL_IQ4XS_D4");
+            int iq4_prefill_d4 = iq4_d4_env && atoi(iq4_d4_env) != 0 &&
+                                 d_inner % 256 == 0;
+            if ((qwen35_iq4_q81_out || iq4_prefill_d4) &&
+                cl->ssm_out_type == GGML_TYPE_IQ4_XS && d_inner % 32 == 0) {
+                /* D4 keeps FP32 activation scales for the prefill MMQ
+                 * diagnostic. The existing Q8_1 route rounds scales through
+                 * half precision for the MMVQ contract. */
+                if (iq4_prefill_d4)
+                    launch_quantize_mmq_d4_batch(r, r->d_ssm_out_batch,
+                                                 d_inner, M, d_inner);
+                else
+                    launch_quantize_q81_batch_cached(r, r->d_ssm_out_batch,
+                                                     d_inner, M, d_inner);
+                launch_matvec_iq4_xs_q81_batch(r, r->d_attn_proj_batch,
+                    cl->ssm_out_w, r->d_act_q8_batch, r->d_act_scale_batch,
+                    n_embd, d_inner, M);
+            } else if (qwen35_iq4_q8k_out && cl->ssm_out_type == GGML_TYPE_IQ4_XS) {
+                if (!r->d_ssm_q8k) return -1;
+                /* Match llama.cpp's CPU IQ4_XS path: quantize each F32
+                 * activation row to one Q8_K block per 256 values, then
+                 * perform the IQ4_XS x Q8_K integer dot.  The scratch is
+                 * stream-ordered and safely reused for the next token. */
+                for (int m = 0; m < M; ++m) {
+                    void *src = (float *)r->d_ssm_out_batch + (size_t)m * d_inner;
+                    void *dst = r->d_ssm_q8k;
+                    launch_quantize_q8k(r, dst, src, d_inner);
+                    launch_matvec_iq4_xs_q8k(r,
+                        (float *)r->d_attn_proj_batch + (size_t)m * n_embd,
+                        cl->ssm_out_w, dst, n_embd, d_inner);
+                }
+            } else if (qwen35_iq4_batch_out) {
+                launch_matvec_qwen35_native_batch(r, r->d_attn_proj_batch,
+                    cl->ssm_out_w, r->d_ssm_out_batch, M, n_embd, d_inner,
+                    d_inner, cl->ssm_out_type);
+            } else if (qwen35_native_ssm && qwen35_native_batch_type(cl->ssm_out_type)) {
+                launch_matvec_qwen35_native_batch(r, r->d_attn_proj_batch,
+                    cl->ssm_out_w, r->d_ssm_out_batch, M, n_embd, d_inner,
+                    d_inner, cl->ssm_out_type);
+            } else if (qwen35_scalar_ssm) {
+                for (int m = 0; m < M; ++m)
+                    launch_matvec_auto(r,
+                        (float *)r->d_attn_proj_batch + (size_t)m * n_embd,
+                        cl->ssm_out_w,
+                        (float *)r->d_ssm_out_batch + (size_t)m * d_inner,
+                        n_embd, d_inner, cl->ssm_out_type);
+            } else if (ssm_native) {
                 if (launch_matmul_q8_batch_f32(r,r->d_attn_proj_batch,cl->ssm_out_w,
                     r->d_ssm_out_batch,M,n_embd,d_inner)) return -1;
             } else {
@@ -22955,7 +32338,11 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
                                        r->d_silu_batch_bf16, M,
                                        n_embd, d_inner, r->stream) != 0) return -1;
             }
-
+            }
+            if (r->debug_layers && l < 6)
+                debug_f32_state(r, l, "Q4 batch ssm_linear_out",
+                                (const float *)r->d_attn_proj_batch + (size_t)(M - 1) * n_embd,
+                                n_embd);
             /* Residual: x_batch += ssm_proj */
             if (r->is_qwen4exp) {
                 const char *hc_scalar_env = getenv("LLM_QWEN4_BATCH_HC_SCALAR");
@@ -22967,6 +32354,15 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
             }
             else launch_add(r, r->d_x_batch, r->d_attn_proj_batch, M * n_embd);
 
+            if (r->debug_layers && l < 6)
+                debug_f32_state(r, l, "Q4 batch attn_residual",
+                                (const float *)r->d_x_batch +
+                                (size_t)(M - 1) * n_embd, n_embd);
+            if (r->debug_layers && l < 6)
+                debug_f32_state(r, l, "Q4 batch ssm_residual",
+                                (const float *)r->d_x_batch +
+                                (size_t)(M - 1) * n_embd, n_embd);
+
             /* Jump past the attn block to the FFN section. */
             goto ffn_section;
         }
@@ -22974,12 +32370,23 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
         /* ---- Q/K/V GEMMs (3 hipBLASLt calls; per-call dequant for K-quant rows).
          * Gated attn: Q projection produces [M, 2*q_dim] into d_qfull_batch,
          * then deinterleave_qgate_batch splits into d_q_batch + d_attn_gate_batch. */
-        const char *scalar_proj_env = getenv("LLM_QWEN4_BATCH_PROJ_SCALAR");
-        int scalar_proj = scalar_proj_env && atoi(scalar_proj_env) != 0;
+    const char *scalar_proj_env = getenv("LLM_QWEN4_BATCH_PROJ_SCALAR");
+    int scalar_proj = (scalar_proj_env && atoi(scalar_proj_env) != 0) ||
+                      qwen35_scalar_proj;
+    const char *attn_q81_env = getenv("LLM_QWEN35_ATTN_Q81_BATCH");
+    int qwen35_attn_q81 = r->is_hybrid && !r->is_qwen4exp &&
+                          attn_q81_env && atoi(attn_q81_env) != 0;
         {
             int q_proj_rows = cl->attn_q_rows;  /* q_dim or 2*q_dim */
             void *q_dst = is_gated_attn ? r->d_qfull_batch : r->d_q_batch;
-            if (scalar_proj) {
+            if (qwen35_attn_q81 && launch_qwen35_attn_q81_batch(r, q_dst,
+                    cl->attn_q_w, r->d_xnorm_batch, M, q_proj_rows, n_embd,
+                    cl->attn_q_type)) {
+                /* llama-compatible Q8_1 IQ projection */
+            } else if (qwen35_native_attn && qwen35_native_batch_type(cl->attn_q_type)) {
+                launch_matvec_qwen35_native_batch(r, q_dst, cl->attn_q_w,
+                    r->d_xnorm_batch, M, q_proj_rows, n_embd, n_embd, cl->attn_q_type);
+            } else if (scalar_proj) {
                 for (int m = 0; m < M; ++m)
                     launch_matvec_auto(r,
                         (char *)q_dst + (size_t)m * q_proj_rows * sizeof(float),
@@ -23017,7 +32424,14 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
         }
 
         {
-            if (scalar_proj) {
+            if (qwen35_attn_q81 && launch_qwen35_attn_q81_batch(r, r->d_k_batch,
+                    cl->attn_k_w, r->d_xnorm_batch, M, l_kvdim, n_embd,
+                    cl->attn_k_type)) {
+                /* llama-compatible Q8_1 IQ projection */
+            } else if (qwen35_native_attn && qwen35_native_batch_type(cl->attn_k_type)) {
+                launch_matvec_qwen35_native_batch(r, r->d_k_batch, cl->attn_k_w,
+                    r->d_xnorm_batch, M, l_kvdim, n_embd, n_embd, cl->attn_k_type);
+            } else if (scalar_proj) {
                 for (int m = 0; m < M; ++m)
                     launch_matvec_auto(r,
                         (char *)r->d_k_batch + (size_t)m * l_kvdim * sizeof(float),
@@ -23046,7 +32460,14 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
             hipMemcpyAsync(r->d_v_batch, r->d_k_batch, (size_t)M * l_kvdim * sizeof(float),
                            hipMemcpyDeviceToDevice, r->stream);
         } else {
-            if (scalar_proj) {
+            if (qwen35_attn_q81 && launch_qwen35_attn_q81_batch(r, r->d_v_batch,
+                    cl->attn_v_w, r->d_xnorm_batch, M, l_kvdim, n_embd,
+                    cl->attn_v_type)) {
+                /* llama-compatible Q8_1 IQ projection */
+            } else if (qwen35_native_attn && qwen35_native_batch_type(cl->attn_v_type)) {
+                launch_matvec_qwen35_native_batch(r, r->d_v_batch, cl->attn_v_w,
+                    r->d_xnorm_batch, M, l_kvdim, n_embd, n_embd, cl->attn_v_type);
+            } else if (scalar_proj) {
                 for (int m = 0; m < M; ++m)
                     launch_matvec_auto(r,
                         (char *)r->d_v_batch + (size_t)m * l_kvdim * sizeof(float),
@@ -23086,6 +32507,14 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
          * local width; for Gemma4 SWA layers (head_dim 256 vs full 512) the global
          * stride is 2x too large and would read stale data from the prior layer. */
         if (cl->has_qk_norm) {
+            if (r->debug_layers && debug_attention_layer_selected(l)) {
+                debug_f32_state(r, l, "batch-attn-qraw", r->d_q_batch,
+                                M * l_qdim);
+                debug_f32_state(r, l, "batch-attn-kraw", r->d_k_batch,
+                                M * l_kvdim);
+                debug_f32_state(r, l, "batch-attn-vraw", r->d_v_batch,
+                                M * l_kvdim);
+            }
             if (cl->attn_q_norm_w)
                 launch_qknorm_batch(r, r->d_q_batch, cl->attn_q_norm_w,
                                     n_heads, l_hd, M, l_qdim, eps);
@@ -23100,15 +32529,28 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
             launch_raw_rmsnorm_heads_batch(r, r->d_v_batch, l_nkv, l_hd, M, l_kvdim, eps);
 
         /* ---- Batched RoPE on Q and K (one launch each, grid=(n_heads, M)) ---- */
+        const char *scalar_rope_env = getenv("LLM_QWEN35_BATCH_ROPE_SCALAR");
+        int scalar_rope = r->is_hybrid && scalar_rope_env && atoi(scalar_rope_env) != 0;
         if (r->use_mrope) {
             int s0 = r->mrope_sections[0], s1 = r->mrope_sections[1];
             int s2 = r->mrope_sections[2], s3 = r->mrope_sections[3];
-            launch_rope_mrope_batch(r, r->d_q_batch, n_heads,    l_hd,
-                                    position_start, r->rope_freq_base,
-                                    s0, s1, s2, s3, l_qdim,  M);
-            launch_rope_mrope_batch(r, r->d_k_batch, l_nkv, l_hd,
-                                    position_start, r->rope_freq_base,
-                                    s0, s1, s2, s3, l_kvdim, M);
+            if (scalar_rope) {
+                for (int m = 0; m < M; ++m) {
+                    launch_rope(r,
+                        (char *)r->d_q_batch + (size_t)m * l_qdim * sizeof(float),
+                        n_heads, l_hd, position_start + m, r->rope_freq_base);
+                    launch_rope(r,
+                        (char *)r->d_k_batch + (size_t)m * l_kvdim * sizeof(float),
+                        l_nkv, l_hd, position_start + m, r->rope_freq_base);
+                }
+            } else {
+                launch_rope_mrope_batch(r, r->d_q_batch, n_heads,    l_hd,
+                                        position_start, r->rope_freq_base,
+                                        s0, s1, s2, s3, l_qdim,  M);
+                launch_rope_mrope_batch(r, r->d_k_batch, l_nkv, l_hd,
+                                        position_start, r->rope_freq_base,
+                                        s0, s1, s2, s3, l_kvdim, M);
+            }
         } else {
             /* Per-layer RoPE base (Gemma4 SWA uses freq_base_swa, full uses freq_base)
              * and n_rope_pairs=0 for Gemma4 so the kernel rotates the full per-layer
@@ -23211,10 +32653,38 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
             launch_kv_store_batch_strided(r, r->d_key_cache[l], r->d_value_cache[l],
                                           r->d_k_batch, r->d_v_batch,
                                           position_start, M, l_kvdim, l_kvdim, pf_cache_len);
+        } else if (r->is_hybrid && r->kv_quantized) {
+            launch_kv_store_q8q4_batch(r, r->d_key_cache[l], r->d_value_cache[l],
+                                       r->d_key_cache_scale[l], r->d_value_cache_scale[l],
+                                       r->d_k_batch, r->d_v_batch, n_kv_heads, head_dim,
+                                       position_start, M);
+            if (l == 3 && r->kv_cache_type == HIP_LLM_KV_Q8_0_Q4_0) {
+                const char *dump_dir = getenv("LLM_DEBUG_DUMP_KV_Q8Q4_DIR");
+                if (dump_dir && *dump_dir)
+                    debug_dump_q8q4_kv(r, dump_dir, l, r->d_k_batch, r->d_v_batch,
+                                       r->d_key_cache[l], r->d_value_cache[l],
+                                       r->d_key_cache_scale[l], r->d_value_cache_scale[l],
+                                       position_start, M, n_kv_heads, head_dim);
+            }
+        } else if (r->is_hybrid && r->kv_cache_type == HIP_LLM_KV_F16) {
+            launch_kv_store_f16_batch(r, r->d_key_cache[l], r->d_value_cache[l],
+                                      r->d_k_batch, r->d_v_batch, kv_dim,
+                                      position_start, M);
         } else {
-            launch_kv_store_batch(r, r->d_key_cache[l], r->d_value_cache[l],
-                                  r->d_k_batch, r->d_v_batch,
-                                  position_start, M, kv_dim);
+            const char *scalar_kv_env = getenv("LLM_QWEN35_BATCH_KV_SCALAR");
+            if (r->is_hybrid && scalar_kv_env && atoi(scalar_kv_env) != 0) {
+                for (int m = 0; m < M; ++m)
+                    launch_kv_store(r, r->d_key_cache[l], r->d_value_cache[l],
+                                    (char *)r->d_k_batch +
+                                        (size_t)m * kv_dim * sizeof(float),
+                                    (char *)r->d_v_batch +
+                                        (size_t)m * kv_dim * sizeof(float),
+                                    position_start + m, kv_dim);
+            } else {
+                launch_kv_store_batch(r, r->d_key_cache[l], r->d_value_cache[l],
+                                      r->d_k_batch, r->d_v_batch,
+                                      position_start, M, kv_dim);
+            }
         }
 
         /* ---- Attention ---- */
@@ -23239,8 +32709,84 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
                                            n_heads, l_nkv, l_hd, l_kvdim,
                                            M, position_start, l_scale, pf_window, pf_cache_len);
             }
-        } else if (r->fa_path_ok) {
+        } else if (r->is_hybrid && r->kv_cache_type == HIP_LLM_KV_F16) {
+            launch_attn_prefill_flash_f16(r, r->d_attn_out_batch, r->d_q_batch,
+                                          r->d_key_cache[l], r->d_value_cache[l],
+                                          n_heads, n_kv_heads, head_dim, kv_dim,
+                                          M, position_start, scale);
+        } else if (r->is_hybrid && r->kv_quantized) {
             int kv_len = position_start + M;
+            const char *direct_q8q4 = getenv("LLM_ATTN_PREFILL_Q8Q4_DIRECT");
+            if (r->requested_qwen35_native_q8_prefill) {
+                if (launch_attn_prefill_native_q8(r, r->d_attn_out_batch, r->d_q_batch,
+                        r->d_key_cache[l], r->d_value_cache[l], r->d_key_cache_scale[l],
+                        r->d_value_cache_scale[l], M, position_start)) return -1;
+            } else if (r->kv_cache_type == HIP_LLM_KV_Q8_0_Q4_0 && direct_q8q4 && atoi(direct_q8q4) != 0) {
+                launch_attn_prefill_q8q4(r, r->d_attn_out_batch, r->d_q_batch,
+                                         r->d_key_cache[l], r->d_value_cache[l],
+                                         r->d_key_cache_scale[l], r->d_value_cache_scale[l],
+                                         n_heads, n_kv_heads, head_dim, kv_dim,
+                                         M, position_start, scale);
+            } else {
+                launch_pack_kv_q8q4_f16(r, r->d_kv_pack_K_f16, r->d_key_cache[l],
+                                        r->d_key_cache_scale[l], kv_len,
+                                        n_kv_heads, head_dim, 0);
+                launch_pack_kv_q8q4_f16(r, r->d_kv_pack_V_f16, r->d_value_cache[l],
+                                        r->d_value_cache_scale[l], kv_len,
+                                        n_kv_heads, head_dim, 1);
+                const char *direct_q81 = getenv("LLM_ATTN_PREFILL_Q8Q4_DIRECT_Q81");
+                if (r->kv_cache_type == HIP_LLM_KV_Q8_0_Q4_0 && direct_q81 && atoi(direct_q81) != 0) {
+                    /* Exact llama.cpp fattn-vec contract: Q is quantized
+                     * per 32 values and the KQ dot consumes Q8 integers
+                     * against the resident Q8 K cache. Reuse the batch Q8
+                     * scratch after projections have completed. */
+                    launch_quantize_attn_q8_1_batch(r, r->d_act_q8_batch,
+                        r->d_act_scale_batch, r->d_q_batch, n_heads, head_dim,
+                        M, scale);
+                    launch_attn_prefill_fattn_vec_q8q4(r, r->d_attn_out_batch,
+                        r->d_act_q8_batch, r->d_act_scale_batch,
+                        r->d_key_cache[l], r->d_value_cache[l],
+                        r->d_key_cache_scale[l], r->d_value_cache_scale[l],
+                        n_heads, n_kv_heads, head_dim, kv_dim,
+                        n_kv_heads * (head_dim / 2), M, position_start);
+                    goto q8q4_attention_done;
+                }
+                const char *q8_query = getenv("LLM_ATTN_PREFILL_Q8Q4_Q8_QUERY");
+                float q_attn_scale = scale;
+                if (q8_query && atoi(q8_query) != 0)
+                    launch_quantize_q8_1_f16_heads(r, r->d_q_batch_f16,
+                                                   r->d_q_batch, n_heads,
+                                                   head_dim, M, scale);
+                else
+                    launch_pack_f16_from_f32(r, r->d_q_batch_f16, r->d_q_batch, M * q_dim);
+                const char *fattn_vec = getenv("LLM_ATTN_PREFILL_Q8Q4_FATTN_VEC");
+                if (fattn_vec && atoi(fattn_vec) != 0) {
+                    launch_attn_prefill_fattn_vec_f16(r, r->d_attn_out_batch,
+                        r->d_q_batch_f16, r->d_kv_pack_K_f16, r->d_kv_pack_V_f16,
+                        n_heads, n_kv_heads, head_dim, kv_len, M, position_start,
+                        (q8_query && atoi(q8_query) != 0) ? 1.0f : q_attn_scale);
+                } else {
+                    launch_flash_attn_causal(r, r->d_attn_out_batch, r->d_q_batch_f16,
+                                             r->d_kv_pack_K_f16, r->d_kv_pack_V_f16,
+                                             M, kv_len, position_start,
+                                             n_heads, n_kv_heads, head_dim,
+                                             (q8_query && atoi(q8_query) != 0) ? 1.0f : q_attn_scale);
+                }
+q8q4_attention_done:;
+            }
+        } else if (r->fa_path_ok && !r->kv_quantized) {
+            int kv_len = position_start + M;
+            const char *scalar_f32_attn_env = getenv("LLM_QWEN35_BATCH_ATTN_SCALAR");
+            if (scalar_f32_attn_env && atoi(scalar_f32_attn_env) != 0) {
+                /* Parity diagnostic: retain batched projections/KV storage,
+                 * but execute the exact scalar F32 arithmetic in one grid.
+                 * Each (head,row) block has the same reduction order as
+                 * attn_decode_f32; this avoids M serialized launches. */
+                launch_attention_prefill_scalar(r, r->d_attn_out_batch,
+                    r->d_q_batch, r->d_key_cache[l], r->d_value_cache[l],
+                    n_heads, n_kv_heads, head_dim, kv_dim,
+                    M, position_start, scale);
+            } else {
             /* Pack K/V cache slice [0..kv_len) into transposed F16 scratch. */
             launch_pack_kv_cache_f16(r,
                                      r->d_kv_pack_K_f16, r->d_kv_pack_V_f16,
@@ -23254,6 +32800,7 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
                                      r->d_kv_pack_K_f16,  r->d_kv_pack_V_f16,
                                      M, kv_len, position_start,
                                      n_heads, n_kv_heads, head_dim, scale);
+            }
         } else {
             for (int m = 0; m < M; m++) {
                 int pos = position_start + m;
@@ -23269,6 +32816,12 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
         /* Gated attn: d_attn_out_batch *= sigmoid(d_attn_gate_batch). The existing
          * sigmoid_mul_f32 kernel is flat-indexed, so a single launch over M*q_dim
          * elements covers the whole batch. */
+        if (r->debug_layers && debug_attention_layer_selected(l)) {
+            debug_f32_state(r, l, "attention_replay_q", r->d_q_batch, M * q_dim);
+            debug_f32_state(r, l, "attention_replay_k", r->d_k_batch, M * kv_dim);
+            debug_f32_state(r, l, "attention_replay_v", r->d_v_batch, M * kv_dim);
+            debug_f32_state(r, l, "attention_replay_pregate", r->d_attn_out_batch, M * q_dim);
+        }
         if (is_gated_attn) {
             launch_sigmoid_mul(r, r->d_attn_out_batch, r->d_attn_gate_batch, M * q_dim);
         }
@@ -23276,7 +32829,12 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
         /* ---- Output projection: [M, q_dim] x W_o^T -> [M, n_embd] ---- */
         int o_rows = r->is_gemma4 ? l_qdim : q_dim;
         const char *scalar_proj_out_env = getenv("LLM_QWEN4_BATCH_PROJ_SCALAR");
-        if (scalar_proj_out_env && atoi(scalar_proj_out_env) != 0) {
+        if (qwen35_native_attn && qwen35_native_batch_type(cl->attn_output_type)) {
+            launch_matvec_qwen35_native_batch(r, r->d_attn_proj_batch,
+                cl->attn_output_w, r->d_attn_out_batch,
+                M, n_embd, o_rows, o_rows, cl->attn_output_type);
+        } else if ((scalar_proj_out_env && atoi(scalar_proj_out_env) != 0) ||
+                   qwen35_scalar_proj) {
             for (int m = 0; m < M; ++m)
                 launch_matvec_auto(r,
                     (char *)r->d_attn_proj_batch + (size_t)m * n_embd * sizeof(float),
@@ -23303,6 +32861,9 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
             debug_f32_state(r, l, "Q4 batch attn_out",
                             (const float *)r->d_attn_proj_batch, M * n_embd);
         }
+        if (r->debug_layers && debug_attention_layer_selected(l))
+            debug_f32_state(r, l, "batch-attn-out", r->d_attn_proj_batch,
+                            M * n_embd);
 
         /* Residual with Gemma4 post-attention norm. llama.cpp applies the norm to the
          * attention output (Wo·attn) and THEN adds the residual: x += post_attn_norm(attn_proj).
@@ -23322,6 +32883,11 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
             launch_add(r, r->d_x_batch, r->d_attn_proj_batch, M * n_embd);
         }
 
+        if (r->debug_layers && debug_attention_layer_selected(l))
+            debug_f32_state(r, l, "Q4 batch attn_residual",
+                            (const float *)r->d_x_batch +
+                            (size_t)(M - 1) * n_embd, n_embd);
+
 ffn_section:
         /* ---- Pre-FFN RMSNorm: one batched launch over M rows ---- */
         if (r->is_qwen4exp) {
@@ -23338,9 +32904,21 @@ ffn_section:
                     cl->hc_ffn_inject_w, cl->hc_ffn_inject_type,
                     r->d_xnorm_batch) != 0) return -1;
         } else {
-            launch_rmsnorm_batch(r, r->d_xnorm_batch, r->d_x_batch,
-                                 cl->ffn_norm_w, n_embd, M, n_embd, eps);
+            if (qwen35_batch_rms_scalar) {
+                for (int m = 0; m < M; ++m)
+                    launch_rmsnorm(r,
+                        (char *)r->d_xnorm_batch + (size_t)m * n_embd * sizeof(float),
+                        (char *)r->d_x_batch + (size_t)m * n_embd * sizeof(float),
+                        cl->ffn_norm_w, n_embd, eps);
+            } else {
+                launch_qwen35_prefill_rmsnorm(r, r->d_xnorm_batch, r->d_x_batch,
+                                     cl->ffn_norm_w, n_embd, M, n_embd, eps);
+            }
         }
+        if (r->debug_layers && debug_attention_layer_selected(l))
+            debug_f32_state(r, l, "Q4 batch ffn_norm",
+                            (const float *)r->d_xnorm_batch + (size_t)(M - 1) * n_embd,
+                            n_embd);
 
         /* ---- MoE FFN: per-row over the batch (Phase 2 increment 1). The router
          * top-K + sparse experts are applied to each of the M normed rows; the
@@ -23392,44 +32970,112 @@ ffn_section:
             continue;
         }
 
-        launch_pack_bf16_from_f32(r, r->d_ffn_norm_batch_bf16,
-                                  r->d_xnorm_batch, M * n_embd);
-
-        /* ---- gate/up GEMMs ---- */
-        {
-            void *gw = get_bf16_weight(r, cl->ffn_gate_w, cl->ffn_gate_w_bf16,
-                                       cl->ffn_gate_type, cl->ffn_gate_rows, cl->ffn_gate_cols);
-            if (!gw) return -1;
-            if (gemm_run_bf16_w(r, r->d_gate_batch, gw,
-                                   r->d_ffn_norm_batch_bf16, M, n_ff, n_embd, r->stream) != 0) return -1;
-        }
-        {
-            void *uw = get_bf16_weight(r, cl->ffn_up_w, cl->ffn_up_w_bf16,
-                                       cl->ffn_up_type, cl->ffn_up_rows, cl->ffn_up_cols);
-            if (!uw) return -1;
-            if (gemm_run_bf16_w(r, r->d_up_batch, uw,
-                                   r->d_ffn_norm_batch_bf16, M, n_ff, n_embd, r->stream) != 0) return -1;
-        }
-
-        /* SiLU(gate) * up — elementwise across [M, n_ff] */
-        if (r->is_gemma4) {
-            int n = M * n_ff;
-            void *a[] = { &r->d_gate_batch, &r->d_up_batch, &n };
-            LAUNCH(r->fn_gelu_mul_f32, (n + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, a);
+        if (qwen35_scalar_proj && !qwen35_bf16_ffn_only) {
+            /* Keep IQ2/IQ3 arithmetic identical to the scalar reference.  A
+             * BF16 weight staging round-trip here is especially damaging for
+             * the gated FFN because its two quantized products are multiplied
+             * elementwise before the down projection. */
+            int native_gate = qwen35_native_ffn && qwen35_native_ffn_type(cl->ffn_gate_type);
+            int native_up = qwen35_native_ffn && qwen35_native_ffn_type(cl->ffn_up_type);
+            int native_down = qwen35_native_ffn && qwen35_native_ffn_type(cl->ffn_down_type);
+            if (native_gate)
+                launch_matvec_qwen35_native_batch(r, r->d_gate_batch, cl->ffn_gate_w,
+                    r->d_xnorm_batch, M, n_ff, n_embd, n_embd, cl->ffn_gate_type);
+            else for (int m = 0; m < M; ++m) {
+                float *xrow = (float *)r->d_xnorm_batch + (size_t)m * n_embd;
+                launch_matvec_ffn_auto(r, (float *)r->d_gate_batch + (size_t)m * n_ff,
+                                       cl->ffn_gate_w, xrow, n_ff, n_embd,
+                                       cl->ffn_gate_type, 0);
+            }
+            if (native_up)
+                launch_matvec_qwen35_native_batch(r, r->d_up_batch, cl->ffn_up_w,
+                    r->d_xnorm_batch, M, n_ff, n_embd, n_embd, cl->ffn_up_type);
+            else for (int m = 0; m < M; ++m) {
+                float *xrow = (float *)r->d_xnorm_batch + (size_t)m * n_embd;
+                launch_matvec_ffn_auto(r, (float *)r->d_up_batch + (size_t)m * n_ff,
+                                       cl->ffn_up_w, xrow, n_ff, n_embd,
+                                       cl->ffn_up_type, 0);
+            }
+            if (r->debug_layers && (debug_attention_layer_selected(l) || getenv("LLM_DEBUG_ALL_FFN")))
+                debug_f32_state(r, l, "Q4 batch ffn_gate_raw",
+                                (const float *)r->d_gate_batch + (size_t)(M - 1) * n_ff,
+                                n_ff);
+            if (r->debug_layers && (debug_attention_layer_selected(l) || getenv("LLM_DEBUG_ALL_FFN")))
+                debug_f32_state(r, l, "Q4 batch ffn_up_raw",
+                                (const float *)r->d_up_batch + (size_t)(M - 1) * n_ff,
+                                n_ff);
+            if (native_gate || native_up)
+                launch_silu_mul(r, r->d_gate_batch, r->d_up_batch, M * n_ff);
+            else
+                for (int m = 0; m < M; ++m)
+                    launch_silu_mul(r, (float *)r->d_gate_batch + (size_t)m * n_ff,
+                                    (float *)r->d_up_batch + (size_t)m * n_ff, n_ff);
+            if (native_down)
+                launch_matvec_qwen35_native_batch(r, r->d_down_batch, cl->ffn_down_w,
+                    r->d_gate_batch, M, n_embd, n_ff, n_ff, cl->ffn_down_type);
+            else for (int m = 0; m < M; ++m) {
+                launch_matvec_auto(r, (float *)r->d_down_batch + (size_t)m * n_embd,
+                                   cl->ffn_down_w,
+                                   (float *)r->d_gate_batch + (size_t)m * n_ff,
+                                   n_embd, n_ff, cl->ffn_down_type);
+            }
+            if (r->debug_layers && (debug_attention_layer_selected(l) || getenv("LLM_DEBUG_ALL_FFN")))
+                debug_f32_state(r, l, "Q4 batch ffn_gate",
+                                (const float *)r->d_gate_batch + (size_t)(M - 1) * n_ff,
+                                n_ff);
         } else {
-            launch_silu_mul(r, r->d_gate_batch, r->d_up_batch, M * n_ff);
+            launch_pack_bf16_from_f32(r, r->d_ffn_norm_batch_bf16,
+                                      r->d_xnorm_batch, M * n_embd);
+
+            /* ---- gate/up GEMMs ---- */
+            {
+                void *gw = get_bf16_weight(r, cl->ffn_gate_w, cl->ffn_gate_w_bf16,
+                                           cl->ffn_gate_type, cl->ffn_gate_rows, cl->ffn_gate_cols);
+                if (!gw) return -1;
+                if (gemm_run_bf16_w(r, r->d_gate_batch, gw,
+                                       r->d_ffn_norm_batch_bf16, M, n_ff, n_embd, r->stream) != 0) return -1;
+            }
+            {
+                void *uw = get_bf16_weight(r, cl->ffn_up_w, cl->ffn_up_w_bf16,
+                                           cl->ffn_up_type, cl->ffn_up_rows, cl->ffn_up_cols);
+                if (!uw) return -1;
+                if (gemm_run_bf16_w(r, r->d_up_batch, uw,
+                                       r->d_ffn_norm_batch_bf16, M, n_ff, n_embd, r->stream) != 0) return -1;
+            }
+            if (r->debug_layers && (debug_attention_layer_selected(l) || getenv("LLM_DEBUG_ALL_FFN")))
+                debug_f32_state(r, l, "Q4 batch ffn_gate_raw",
+                                (const float *)r->d_gate_batch + (size_t)(M - 1) * n_ff,
+                                n_ff);
+
+            /* SiLU(gate) * up — elementwise across [M, n_ff] */
+            if (r->is_gemma4) {
+                int n = M * n_ff;
+                void *a[] = { &r->d_gate_batch, &r->d_up_batch, &n };
+                LAUNCH(r->fn_gelu_mul_f32, (n + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, a);
+            } else {
+                launch_silu_mul(r, r->d_gate_batch, r->d_up_batch, M * n_ff);
+            }
+
+            /* Pack and down projection */
+            launch_pack_bf16_from_f32(r, r->d_silu_batch_bf16,
+                                      r->d_gate_batch, M * n_ff);
+            {
+                void *dw = get_bf16_weight(r, cl->ffn_down_w, cl->ffn_down_w_bf16,
+                                           cl->ffn_down_type, cl->ffn_down_rows, cl->ffn_down_cols);
+                if (!dw) return -1;
+                if (gemm_run_bf16_w(r, r->d_down_batch, dw,
+                                       r->d_silu_batch_bf16, M, n_embd, n_ff, r->stream) != 0) return -1;
+            }
+            if (r->debug_layers && (l < 2 || getenv("LLM_DEBUG_ALL_FFN")))
+                debug_f32_state(r, l, "Q4 batch ffn_gate",
+                                (const float *)r->d_gate_batch + (size_t)(M - 1) * n_ff,
+                                n_ff);
         }
 
-        /* Pack and down projection */
-        launch_pack_bf16_from_f32(r, r->d_silu_batch_bf16,
-                                  r->d_gate_batch, M * n_ff);
-        {
-            void *dw = get_bf16_weight(r, cl->ffn_down_w, cl->ffn_down_w_bf16,
-                                       cl->ffn_down_type, cl->ffn_down_rows, cl->ffn_down_cols);
-            if (!dw) return -1;
-            if (gemm_run_bf16_w(r, r->d_down_batch, dw,
-                                   r->d_silu_batch_bf16, M, n_embd, n_ff, r->stream) != 0) return -1;
-        }
+        if (r->debug_layers && debug_attention_layer_selected(l))
+            debug_f32_state(r, l, "Q4 batch ffn_out",
+                            (const float *)r->d_down_batch +
+                            (size_t)(M - 1) * n_embd, n_embd);
 
         /* Residual + Gemma4 post-FFN norm */
         if (r->is_gemma4 && cl->post_ffw_norm_w) {
@@ -23439,6 +33085,11 @@ ffn_section:
         } else {
             launch_add(r, r->d_x_batch, r->d_down_batch, M * n_embd);
         }
+
+        if (r->debug_layers)
+            debug_f32_state(r, l, "Q4 batch layer_out",
+                            (const float *)r->d_x_batch +
+                            (size_t)(M - 1) * n_embd, n_embd);
 
         /* Gemma4 layer output scale */
         if (r->is_gemma4 && cl->layer_scale_val != 1.0f) {
@@ -23459,6 +33110,12 @@ ffn_section:
                                hipMemcpyHostToDevice, r->stream);
                 launch_add(r, xrow, r->d_ds_tmp, n_embd);
             }
+        }
+        if (prefill_profile) {
+            if (hipStreamSynchronize(r->stream) != hipSuccess) return -1;
+            fprintf(stderr, "hip_llm: prefill-profile layer=%d M=%d path=batch-%s ms=%.3f\n",
+                    l, M, cl->is_ssm ? "ssm" : "attn",
+                    hllm_monotonic_ms() - prefill_layer_start);
         }
     }
 
@@ -23508,12 +33165,19 @@ ffn_section:
         r->d_x = saved_d_x;
         r->d_hc = saved_d_hc;
     } else {
-        launch_rmsnorm_batch(r, r->d_x_batch, r->d_x_batch,
+        launch_qwen35_prefill_rmsnorm(r, r->d_x_batch, r->d_x_batch,
                              r->d_output_norm, n_embd, M, n_embd, eps);
     }
 
+    /* Keep the draft cache aligned with the target prompt.  Feature capture
+     * occurs at layer input above; injection is independent of the target's
+     * final norm and may safely follow the complete target tile. */
+    if (r->qwen35_dflash2 &&
+        hllm_qwen35_dflash2_inject(r, position_start, M) != 0) return -1;
+
     /* Copy last row into r->d_x so callers (and lm_head path) see the result. */
     float *last_row = (float *)r->d_x_batch + (size_t)(M - 1) * n_embd;
+    debug_f32_state(r, -1, "result_norm", last_row, n_embd);
     hipMemcpyAsync(r->d_x, last_row, (size_t)n_embd * sizeof(float),
                    hipMemcpyDeviceToDevice, r->stream);
     /* Qwen4's HC/PLE state is token-persistent as well.  Leaving d_hc at the
@@ -23526,6 +33190,17 @@ ffn_section:
         hipMemcpyAsync(r->d_hc, last_hc, hcd * sizeof(float),
                        hipMemcpyDeviceToDevice, r->stream);
     }
+    /* Batched kernels receive positions as an interval and do not all touch
+     * the scalar runner position.  Publish the last completed row just as the
+     * scalar path does.  Snapshotting used to observe whatever decode or
+     * earlier short request had last written cur_position, producing a
+     * portable-looking snapshot with only that stale number of target KV
+     * rows after a long prefill. */
+    int final_position = position_start + M - 1;
+    r->cur_position = final_position;
+    if (hipMemcpyAsync(r->d_position, &final_position, sizeof(final_position),
+                       hipMemcpyHostToDevice, r->stream) != hipSuccess)
+        return -1;
     if (fingerprint) {
         uint64_t *hashes = calloc((size_t)r->n_layers * 5, sizeof(uint64_t));
         if (!hashes) return -1;
@@ -23547,6 +33222,24 @@ ffn_section:
 }
 
 static int batched_path_eligible(const hip_llm_runner *r, int M) {
+    /* The diagnostic ports currently implement the scalar MMVQ/SSM order. */
+    if (r->fn_qwen35_rmsnorm_reference) return 0;
+    /* Qwen3.5 keeps batching opt-in until the complete hybrid path has passed
+     * a scalar-vs-batched parity check.  The batched implementation now has an
+     * exact-quantized projection mode, but the gate remains conservative while
+     * attention/state numerical validation is still in progress. */
+    if (r->is_hybrid && !r->is_qwen4exp) {
+        const char *e = getenv("LLM_QWEN35_BATCH");
+        if (!r->requested_qwen35_batched_prefill && (!e || atoi(e) == 0)) return 0;
+        /* A layer cap is useful for tracing, but the hybrid batched driver
+         * cannot safely switch between its row-wise fallback and the scalar
+         * top-level driver: recurrent/KV state publication differs at the
+         * wrapper boundary.  Never enter that mixed schedule.  The caller
+         * gets the exact scalar path, which is the only safe prefix/suffix
+         * diagnostic until the hand-off is reworked. */
+        const char *cap = getenv("LLM_QWEN35_BATCH_MAX_LAYER");
+        if (cap && *cap && atoi(cap) < r->n_layers - 1) return 0;
+    }
     /* Exact MTP normally stays on the scalar path.  The grouped verifier
      * explicitly opts into this dispatcher after taking a transaction
      * snapshot; it uses the same exact router/top-k policy but amortizes the
@@ -23578,7 +33271,11 @@ static int batched_path_eligible(const hip_llm_runner *r, int M) {
     if (!r->batch_path_ok && !r->qwen4_grouped_verify) return 0;
     if (r->qwen4_grouped_verify &&
         (!r->d_x_batch || !r->d_qwen4_logits_batch || !r->d_moe_out_batch)) return 0;
-    if (M < r->gemm_m_threshold) return 0;
+    /* DFlash prompt-cache injection consumes hidden taps captured by the
+     * batched Qwen3.5 driver.  A short tail after a cached/random prefix must
+     * use that same driver or the target position advances while the
+     * sidecar's circular KV cache does not. */
+    if (M < r->gemm_m_threshold && !r->qwen35_dflash2) return 0;
     /* Qwen4 carries recurrent/PLE state between chunks.  The single-chunk
      * batched path is parity-checked, but a 2K request split into multiple
      * device batches has not been proven safe on gfx1201 (a failed experiment
@@ -23590,7 +33287,8 @@ static int batched_path_eligible(const hip_llm_runner *r, int M) {
     }
     /* Paths that internally chunk the prefill (Gemma4 and batched-MoE) can accept
      * M > batch_max; only the unchunked dense path is hard-capped at batch_max. */
-    if (M > r->batch_max && !r->is_gemma4 && !r->moe_prefill_batched) return 0;
+    if (M > r->batch_max && !r->is_hybrid &&
+        !r->is_gemma4 && !r->moe_prefill_batched) return 0;
     if (r->_ds_embd != NULL) return 0;  /* DeepStack handled in embed path only */
     return 1;
 }
@@ -23608,6 +33306,7 @@ static int prefill_chunk_size(const hip_llm_runner *r, int n_tokens) {
         if (r->is_qwen4exp && !r->gemm_own) chunk = r->batch_max < 1024 ? r->batch_max : 1024;
         else chunk = r->gemm_own ? r->batch_max : 256;
     }
+    else if (r->is_hybrid)       chunk = r->batch_max;
     else                         chunk = n_tokens;
     { const char *e = getenv("LLM_MOE_CHUNK"); if (e) { int c = atoi(e); if (c >= 1) chunk = c; } }
     { const char *e = getenv("LLM_PREFILL_CHUNK"); if (e) { int c = atoi(e); if (c >= 1) chunk = c; } }
@@ -23634,6 +33333,10 @@ static int embed_tokens_batch(hip_llm_runner *r,
             launch_embed_q4_0(r, row, r->d_token_embd, tid, n_embd);
         } else if (r->token_embd_type == GGML_TYPE_Q2_K) {
             launch_embed_q2_K(r, row, r->d_token_embd, tid, n_embd);
+        } else if (r->token_embd_type == GGML_TYPE_IQ1_M) {
+            launch_embed_iq1_m(r, row, r->d_token_embd, tid, n_embd);
+        } else if (r->token_embd_type == GGML_TYPE_F32) {
+            launch_embed_f32(r, row, r->d_token_embd, tid, n_embd);
         } else {
             launch_embed(r, row, r->d_token_embd, tid, n_embd);
         }
@@ -23727,6 +33430,29 @@ float *hip_llm_forward_batch(hip_llm_runner *r,
                     r->ple_history[1] = tokens[off];
                 }
             }
+            /* Qwen3.8's hybrid path reuses per-layer staging/state buffers on
+             * the next chunk.  A stream dependency is not sufficient for the
+             * hipBLASLt + module-kernel mix on gfx1201: an unbounded internal
+             * loop can leave the driver with a stale mapping and trigger a VM
+             * protection fault once the request crosses the first long-context
+             * tile.  External callers naturally synchronize between requests;
+             * do the same at this internal chunk boundary. */
+            if (off + cc < n_tokens && r->is_hybrid) {
+                hipError_t chunk_err = hipStreamSynchronize(r->stream);
+                if (chunk_err != hipSuccess) {
+                    const char *dbg = getenv("LLM_DEBUG_SYNC");
+                    if (dbg && atoi(dbg) != 0) {
+                        const char *err_text = "unknown";
+                        if (hipGetErrorString) hipGetErrorString(chunk_err, &err_text);
+                        fprintf(stderr,
+                                "hip_llm: prefill chunk sync failed at off=%d size=%d: %s\n",
+                                off, cc, err_text);
+                    }
+                    r->qwen4_forward_error = 1;
+                    r->qwen4_grouped_tokens = NULL;
+                    return NULL;
+                }
+            }
         }
         /* Returning NULL hidden buffer for now — callers needing logits use
          * forward_batch_logits. Most call sites only ask for the next token. */
@@ -23794,6 +33520,26 @@ float *hip_llm_forward_batch_logits(hip_llm_runner *r,
                 } else if (cc == 1) {
                     r->ple_history[0] = r->ple_history[1];
                     r->ple_history[1] = tokens[off];
+                }
+            }
+            /* See the matching hidden-state path above.  The explicit sync is
+             * required for long Qwen3.8 requests on gfx1201; without it the
+             * second internal tile can fault even though each individual tile
+             * is valid and the externally chunked form is stable. */
+            if (off + cc < n_tokens && r->is_hybrid) {
+                hipError_t chunk_err = hipStreamSynchronize(r->stream);
+                if (chunk_err != hipSuccess) {
+                    const char *dbg = getenv("LLM_DEBUG_SYNC");
+                    if (dbg && atoi(dbg) != 0) {
+                        const char *err_text = "unknown";
+                        if (hipGetErrorString) hipGetErrorString(chunk_err, &err_text);
+                        fprintf(stderr,
+                                "hip_llm: logits chunk sync failed at off=%d size=%d: %s\n",
+                                off, cc, err_text);
+                    }
+                    r->qwen4_forward_error = 1;
+                    r->qwen4_grouped_tokens = NULL;
+                    return NULL;
                 }
             }
         }
@@ -24068,6 +33814,8 @@ void hip_llm_offload(hip_llm_runner *r) {
     r->d_moe_gather_w = NULL;
     r->d_moe_assign_pos = NULL;
     hllm_free_qwen4_nextn(r);
+    hllm_qwen35_dflash2_free(r);
+    hllm_free_qwen35_mtp(r);
     /* Phase 2 batched buffers */
     if (r->d_x_batch)             { hipFree(r->d_x_batch);             r->d_x_batch = NULL; }
     if (r->d_xnorm_batch)         { hipFree(r->d_xnorm_batch);         r->d_xnorm_batch = NULL; }
@@ -24160,8 +33908,10 @@ void hip_llm_free(hip_llm_runner *r) {
     if (r->d_ssm_Q_exp)    hipFree(r->d_ssm_Q_exp);
     if (r->d_ssm_K_exp)    hipFree(r->d_ssm_K_exp);
     if (r->d_ssm_out)      hipFree(r->d_ssm_out);
+    if (r->d_ssm_q8k)       hipFree(r->d_ssm_q8k);
     if (r->d_ssm_conv_out) hipFree(r->d_ssm_conv_out);
     if (r->d_attn_gate)    hipFree(r->d_attn_gate);
+    if (r->d_attn_decode_partial) hipFree(r->d_attn_decode_partial);
     if (r->d_ds_tmp)   hipFree(r->d_ds_tmp);
     if (r->d_router_logits) hipFree(r->d_router_logits);
     if (r->d_moe_accum)    hipFree(r->d_moe_accum);
@@ -24254,6 +34004,10 @@ void hip_llm_free(hip_llm_runner *r) {
     if (r->d_q_batch_f16)         hipFree(r->d_q_batch_f16);
     if (r->d_kv_pack_K_f16)       hipFree(r->d_kv_pack_K_f16);
     if (r->d_kv_pack_V_f16)       hipFree(r->d_kv_pack_V_f16);
+    if (r->d_act_q8_batch)        hipFree(r->d_act_q8_batch);
+    if (r->d_act_scale_batch)     hipFree(r->d_act_scale_batch);
+    if (r->d_act_q8_batch_b)      hipFree(r->d_act_q8_batch_b);
+    if (r->d_act_scale_batch_b)   hipFree(r->d_act_scale_batch_b);
 
     if (r->d_key_cache) {
         for (int l = 0; l < r->n_layers; l++) {
@@ -24418,6 +34172,8 @@ void hip_llm_free(hip_llm_runner *r) {
     if (r->d_hc_low)       hipFree(r->d_hc_low);
     if (r->d_hc_inject)    hipFree(r->d_hc_inject);
     hllm_free_qwen4_nextn(r);
+    hllm_qwen35_dflash2_free(r);
+    hllm_free_qwen35_mtp(r);
     if (r->d_ple_conv_state) hipFree(r->d_ple_conv_state);
     if (r->d_ple_emb)      hipFree(r->d_ple_emb);
     if (r->d_ple_value)    hipFree(r->d_ple_value);
@@ -24443,6 +34199,9 @@ void hip_llm_free(hip_llm_runner *r) {
     if (r->qwen4_prefill_copy_stream) hipStreamDestroy(r->qwen4_prefill_copy_stream);
 
     /* === Phase 5: graph + device-int cleanup === */
+    if (r->graph_exec_argmax) hipGraphExecDestroy(r->graph_exec_argmax);
+    if (r->graph_argmax) hipGraphDestroy(r->graph_argmax);
+    if (r->d_argmax) hipFree(r->d_argmax);
     if (r->graph_exec_logits) hipGraphExecDestroy(r->graph_exec_logits);
     if (r->graph_logits)      hipGraphDestroy(r->graph_logits);
     if (r->graph_exec_hidden) hipGraphExecDestroy(r->graph_exec_hidden);
@@ -24458,6 +34217,20 @@ void hip_llm_free(hip_llm_runner *r) {
     }
     if (r->d_position)        hipFree(r->d_position);
 
+    if (r->reference_math_module) hipModuleUnload(r->reference_math_module);
+    if (r->q2k_module) hipModuleUnload(r->q2k_module);
+    if (r->d_native_q81) hipFree(r->d_native_q81);
+    if (r->d_native_scale) hipFree(r->d_native_scale);
+    if (r->d_native_argmax_scores) hipFree(r->d_native_argmax_scores);
+    if (r->d_native_argmax_indices) hipFree(r->d_native_argmax_indices);
+    if (r->iq_module) hipModuleUnload(r->iq_module);
+    if (r->d_q8_attention_parts) hipFree(r->d_q8_attention_parts);
+    if (r->d_q8_attention_meta) hipFree(r->d_q8_attention_meta);
+    if (r->d_q8_prefill_parts) hipFree(r->d_q8_prefill_parts);
+    if (r->d_q8_prefill_meta) hipFree(r->d_q8_prefill_meta);
+    if (r->q8_attention_module) hipModuleUnload(r->q8_attention_module);
+    if (r->q8_prefill_module) hipModuleUnload(r->q8_prefill_module);
+    if (r->q8_gate_module) hipModuleUnload(r->q8_gate_module);
     if (r->module) hipModuleUnload(r->module);
 
 #ifdef LLM_HIPBLASLT_ENABLED
@@ -24886,14 +34659,28 @@ int hip_llm_bench_quant_matvec(
         goto done;
     }
 
+    int prequant = weight_type == GGML_TYPE_IQ2_S && r->decode_dp4a &&
+        getenv("LLM_BENCH_QMV_PREQUANT") &&
+        atoi(getenv("LLM_BENCH_QMV_PREQUANT")) != 0;
+    if (prequant)
+        launch_quantize_q8(r, d_x, n_cols, r->d_act_q8, r->d_act_scale);
+
     for (int i = 0; i < warmup; i++) {
-        launch_matvec_auto(r, d_dst, d_mat, d_x, n_rows, n_cols, weight_type);
+        if (prequant)
+            launch_matvec_iq2_s_dp4a_prequant(r, d_dst, d_mat, r->d_act_q8,
+                                              r->d_act_scale, n_rows, n_cols);
+        else
+            launch_matvec_auto(r, d_dst, d_mat, d_x, n_rows, n_cols, weight_type);
     }
     if (hipStreamSynchronize(r->stream) != hipSuccess) goto done;
 
     if (hipEventRecord(ev_start, r->stream) != hipSuccess) goto done;
     for (int i = 0; i < iters; i++) {
-        launch_matvec_auto(r, d_dst, d_mat, d_x, n_rows, n_cols, weight_type);
+        if (prequant)
+            launch_matvec_iq2_s_dp4a_prequant(r, d_dst, d_mat, r->d_act_q8,
+                                              r->d_act_scale, n_rows, n_cols);
+        else
+            launch_matvec_auto(r, d_dst, d_mat, d_x, n_rows, n_cols, weight_type);
     }
     if (hipEventRecord(ev_stop, r->stream) != hipSuccess) goto done;
     if (hipEventSynchronize(ev_stop) != hipSuccess) goto done;
@@ -24918,8 +34705,21 @@ void hip_llm_reset_state(hip_llm_runner *r) {
     if (!r) return;
 
     if (qwen4_prefill_copies_drain(r)) return;
+    /* Request resets are normally followed by work on r->stream.  Make the
+     * previous request quiescent before clearing persistent hybrid state;
+     * this is important for the batched conv path, which keeps the conv
+     * history live across all rows of a tile. */
+    int overlap_pending = hllm_qwen35_dflash2_overlap_pending(r);
+    if (!overlap_pending && r->stream &&
+        hipStreamSynchronize(r->stream) != hipSuccess) return;
+    if (hllm_qwen35_dflash2_overlap_wait_reset(r)) return;
     r->qwen4_forward_error = 0;
     r->qwen4_nextn_start = -1;
+    if (r->qwen35_mtp) { r->qwen35_mtp->origin = -1; r->qwen35_mtp->verify_rows = 0; }
+    if (r->qwen35_dflash2) {
+        r->qwen35_dflash2->feature_rows = 0;
+        r->qwen35_dflash2->kv_end = 0;
+    }
     r->cur_position = 0;
     if (r->qwen4_exact && r->layers) {
         for (int l=0;l<r->n_layers;++l)
@@ -24994,14 +34794,20 @@ void hip_llm_reset_state(hip_llm_runner *r) {
             if (!cl->is_ssm) continue;
             if (cl->d_conv_state) {
                 size_t conv_bytes = (size_t)(r->ssm_conv_kernel - 1) * r->ssm_qkv_dim * sizeof(float);
-                hipMemset(cl->d_conv_state, 0, conv_bytes);
+                if (hipMemsetAsync(cl->d_conv_state, 0, conv_bytes, r->stream) != hipSuccess)
+                    r->qwen4_forward_error = 1;
             }
             if (cl->d_recurrent_state) {
                 size_t rec_bytes = (size_t)r->ssm_dt_rank * r->ssm_d_state * r->ssm_d_state * sizeof(float);
-                hipMemset(cl->d_recurrent_state, 0, rec_bytes);
+                if (hipMemsetAsync(cl->d_recurrent_state, 0, rec_bytes, r->stream) != hipSuccess)
+                    r->qwen4_forward_error = 1;
             }
         }
     }
+    /* hipMemset/hipMemsetAsync implementations differ in whether the device
+     * write is ordered with a non-default stream.  Fence the reset so the
+     * first batched SSM tile cannot observe a prior request's history. */
+    if (r->stream) hipStreamSynchronize(r->stream);
     if (r->is_gemma4) {
         for (int l = 0; l < r->n_layers; l++) {
             hip_layer *cl = &r->layers[l];
@@ -25034,14 +34840,76 @@ struct hip_llm_state_snapshot {
     size_t *kv_bytes;
     int kv_start;
     int kv_count;
-    float *hc_host, *nextn_hc_host, *logits_host;
-    size_t hc_bytes, logits_bytes;
+    float *hc_host, *nextn_hc_host, *logits_host, *hidden_host;
+    size_t hc_bytes, logits_bytes, hidden_bytes;
     int position, nextn_start;
     void **index_host;
     size_t index_bytes;
     void *nextn_key_host, *nextn_value_host;
     size_t nextn_kv_bytes;
+    void **dflash_key_host, **dflash_value_host;
+    size_t dflash_kv_bytes;
+    int dflash_kv_end;
+    void *dflash_feature_host;
+    size_t dflash_feature_bytes;
+    int dflash_feature_rows;
+    void **qwen35_key_host, **qwen35_value_host;
+    void **qwen35_key_scale_host, **qwen35_value_scale_host;
+    size_t *qwen35_kv_bytes, *qwen35_scale_bytes;
+    int qwen35_kv_count;
+    int portable;
 };
+
+size_t hip_llm_state_snapshot_bytes(const hip_llm_state_snapshot *s) {
+    if (!s) return 0;
+    size_t bytes = sizeof(*s) + s->ple_bytes + s->hc_bytes +
+                   s->logits_bytes + s->hidden_bytes + s->nextn_kv_bytes +
+                   s->dflash_feature_bytes;
+    if (s->conv_host) bytes += (size_t)s->n_layers * sizeof(*s->conv_host);
+    if (s->rec_host) bytes += (size_t)s->n_layers * sizeof(*s->rec_host);
+    if (s->conv_bytes) bytes += (size_t)s->n_layers * sizeof(*s->conv_bytes);
+    if (s->rec_bytes) bytes += (size_t)s->n_layers * sizeof(*s->rec_bytes);
+    if (s->kv_key_host) bytes += (size_t)s->n_layers * sizeof(*s->kv_key_host);
+    if (s->kv_value_host) bytes += (size_t)s->n_layers * sizeof(*s->kv_value_host);
+    if (s->kv_bytes) bytes += (size_t)s->n_layers * sizeof(*s->kv_bytes);
+    if (s->index_host) bytes += (size_t)s->n_layers * sizeof(*s->index_host);
+    if (s->dflash_key_host)
+        bytes += (size_t)HLLM_DFLASH_LAYERS * sizeof(*s->dflash_key_host);
+    if (s->dflash_value_host)
+        bytes += (size_t)HLLM_DFLASH_LAYERS * sizeof(*s->dflash_value_host);
+    if (s->qwen35_key_host)
+        bytes += (size_t)s->n_layers * sizeof(*s->qwen35_key_host);
+    if (s->qwen35_value_host)
+        bytes += (size_t)s->n_layers * sizeof(*s->qwen35_value_host);
+    if (s->qwen35_key_scale_host)
+        bytes += (size_t)s->n_layers * sizeof(*s->qwen35_key_scale_host);
+    if (s->qwen35_value_scale_host)
+        bytes += (size_t)s->n_layers * sizeof(*s->qwen35_value_scale_host);
+    if (s->qwen35_kv_bytes)
+        bytes += (size_t)s->n_layers * sizeof(*s->qwen35_kv_bytes);
+    if (s->qwen35_scale_bytes)
+        bytes += (size_t)s->n_layers * sizeof(*s->qwen35_scale_bytes);
+    for (int l = 0; l < s->n_layers; ++l) {
+        bytes += s->conv_bytes ? s->conv_bytes[l] : 0;
+        bytes += s->rec_bytes ? s->rec_bytes[l] : 0;
+        bytes += s->kv_bytes ? 2 * s->kv_bytes[l] : 0;
+        bytes += s->index_host && s->index_host[l] ? s->index_bytes : 0;
+        bytes += s->qwen35_kv_bytes ? 2 * s->qwen35_kv_bytes[l] : 0;
+        bytes += s->qwen35_scale_bytes ? 2 * s->qwen35_scale_bytes[l] : 0;
+    }
+    if (s->nextn_hc_host) bytes += s->hc_bytes;
+    if (s->dflash_key_host || s->dflash_value_host)
+        bytes += 2 * (size_t)HLLM_DFLASH_LAYERS * s->dflash_kv_bytes;
+    return bytes;
+}
+
+int hip_llm_state_snapshot_is_portable(const hip_llm_state_snapshot *s) {
+    return s && s->portable;
+}
+
+int hip_llm_state_snapshot_token_count(const hip_llm_state_snapshot *s) {
+    return s && s->position >= 0 ? s->position + 1 : 0;
+}
 
 void hip_llm_free_state_snapshot(hip_llm_state_snapshot *s) {
     if (!s) return;
@@ -25053,6 +34921,26 @@ void hip_llm_free_state_snapshot(hip_llm_state_snapshot *s) {
     free(s->rec_host);
     free(s->conv_bytes);
     free(s->rec_bytes);
+    if (s->dflash_key_host || s->dflash_value_host) {
+        for (int l = 0; l < HLLM_DFLASH_LAYERS; ++l) {
+            free(s->dflash_key_host ? s->dflash_key_host[l] : NULL);
+            free(s->dflash_value_host ? s->dflash_value_host[l] : NULL);
+        }
+    }
+    free(s->dflash_key_host);
+    free(s->dflash_value_host);
+    free(s->dflash_feature_host);
+    if (s->qwen35_key_host && s->qwen35_value_host) {
+        for (int l = 0; l < s->n_layers; ++l) {
+            free(s->qwen35_key_host[l]);
+            free(s->qwen35_value_host[l]);
+            free(s->qwen35_key_scale_host ? s->qwen35_key_scale_host[l] : NULL);
+            free(s->qwen35_value_scale_host ? s->qwen35_value_scale_host[l] : NULL);
+        }
+    }
+    free(s->qwen35_key_host); free(s->qwen35_value_host);
+    free(s->qwen35_key_scale_host); free(s->qwen35_value_scale_host);
+    free(s->qwen35_kv_bytes); free(s->qwen35_scale_bytes);
     free(s->ple_host);
     if (s->kv_key_host && s->kv_value_host) {
         for (int l = 0; l < s->n_layers; ++l) {
@@ -25066,6 +34954,7 @@ void hip_llm_free_state_snapshot(hip_llm_state_snapshot *s) {
     if(s->index_host)for(int l=0;l<s->n_layers;++l)free(s->index_host[l]);
     free(s->index_host);free(s->nextn_key_host);free(s->nextn_value_host);
     free(s->hc_host);free(s->nextn_hc_host);free(s->logits_host);
+    free(s->hidden_host);
     free(s);
 }
 
@@ -25131,6 +35020,7 @@ hip_llm_state_snapshot *hip_llm_snapshot_state(hip_llm_runner *r) {
     hip_llm_state_snapshot *s = (hip_llm_state_snapshot *)calloc(1, sizeof(*s));
     if (!s) return NULL;
     s->n_layers = r->n_layers;
+    s->portable = 0;
     s->conv_host = (void **)calloc((size_t)s->n_layers, sizeof(void *));
     s->rec_host = (void **)calloc((size_t)s->n_layers, sizeof(void *));
     s->conv_bytes = (size_t *)calloc((size_t)s->n_layers, sizeof(size_t));
@@ -25145,12 +35035,34 @@ hip_llm_state_snapshot *hip_llm_snapshot_state(hip_llm_runner *r) {
         s->logits_bytes=(size_t)r->n_vocab*sizeof(float);
         s->hc_host=malloc(s->hc_bytes);s->logits_host=malloc(s->logits_bytes);
         if(!s->hc_host || !s->logits_host ||
-           hipMemcpy(s->hc_host,r->d_hc,s->hc_bytes,hipMemcpyDeviceToHost) ||
-           hipMemcpy(s->logits_host,r->d_logits,s->logits_bytes,hipMemcpyDeviceToHost))goto fail;
+           hipMemcpy(s->hc_host,r->d_hc,s->hc_bytes,hipMemcpyDeviceToHost))goto fail;
+        memcpy(s->logits_host, r->h_output, s->logits_bytes);
         if(r->qwen4_nextn_fusion_loaded) {
             s->nextn_hc_host=malloc(s->hc_bytes);
             if(!s->nextn_hc_host || hipMemcpy(s->nextn_hc_host,r->d_qwen4_nextn_hc,s->hc_bytes,hipMemcpyDeviceToHost))goto fail;
         }
+    }
+    /* Non-MoE Qwen3.8 prompt reuse also needs the logits that correspond to
+     * the last prompt row.  Without this small snapshot, a cache hit resumes
+     * from stale logits left by the preceding generated request. */
+    if (!s->logits_host) {
+        s->logits_bytes = (size_t)r->n_vocab * sizeof(float);
+        s->logits_host = malloc(s->logits_bytes);
+        if (!s->logits_host)
+            goto fail;
+        memcpy(s->logits_host, r->h_output, s->logits_bytes);
+    }
+    /* Dense NextN starts each request from the target hidden vector at the
+     * prompt boundary. Portable cache restore must therefore restore d_x as
+     * well as the logits and recurrent/KV state. DFlash owns prompt features
+     * separately and creates only a verifier-workspace shell here. */
+    if (r->qwen35_mtp && r->qwen35_mtp->source) {
+        s->hidden_bytes = (size_t)r->n_embd * sizeof(float);
+        s->hidden_host = malloc(s->hidden_bytes);
+        if (!s->hidden_host || hipMemcpy(s->hidden_host, r->d_x,
+                                         s->hidden_bytes,
+                                         hipMemcpyDeviceToHost) != hipSuccess)
+            goto fail;
     }
     for (int l = 0; l < r->n_layers; ++l) {
         hip_layer *cl = &r->layers[l];
@@ -25182,6 +35094,91 @@ hip_llm_state_snapshot *hip_llm_snapshot_state(hip_llm_runner *r) {
         s->ple_history[0] = r->ple_history[0];
         s->ple_history[1] = r->ple_history[1];
     }
+    if (r->qwen35_dflash2) {
+        hllm_qwen35_dflash2 *d = r->qwen35_dflash2;
+        s->dflash_key_host = calloc(HLLM_DFLASH_LAYERS, sizeof(void *));
+        s->dflash_value_host = calloc(HLLM_DFLASH_LAYERS, sizeof(void *));
+        s->dflash_kv_bytes = (size_t)HLLM_DFLASH_WINDOW *
+            HLLM_DFLASH_KV_HEADS * HLLM_DFLASH_HEAD_DIM * sizeof(float);
+        s->dflash_kv_end = d->kv_end;
+        s->dflash_feature_rows = d->feature_rows;
+        s->dflash_feature_bytes = (size_t)d->feature_rows *
+            HLLM_DFLASH_LAYERS * (size_t)r->n_embd * sizeof(float);
+        if (s->dflash_feature_bytes) {
+            s->dflash_feature_host = malloc(s->dflash_feature_bytes);
+            if (!s->dflash_feature_host || hipMemcpy(s->dflash_feature_host,
+                    d->features, s->dflash_feature_bytes,
+                    hipMemcpyDeviceToHost) != hipSuccess)
+                goto fail;
+        }
+        if (!s->dflash_key_host || !s->dflash_value_host) goto fail;
+        for (int l = 0; l < HLLM_DFLASH_LAYERS; ++l) {
+            s->dflash_key_host[l] = malloc(s->dflash_kv_bytes);
+            s->dflash_value_host[l] = malloc(s->dflash_kv_bytes);
+            if (!s->dflash_key_host[l] || !s->dflash_value_host[l] ||
+                hipMemcpy(s->dflash_key_host[l], d->layers[l].key_cache,
+                          s->dflash_kv_bytes, hipMemcpyDeviceToHost) != hipSuccess ||
+                hipMemcpy(s->dflash_value_host[l], d->layers[l].value_cache,
+                          s->dflash_kv_bytes, hipMemcpyDeviceToHost) != hipSuccess)
+                goto fail;
+        }
+    }
+    /* A Q8 target snapshot must include the target attention rows as well as
+     * the hybrid SSM and DFlash state.  Bound this host-side copy to short
+     * prompts; keep the host copy bounded so long-context serving does not
+     * silently consume multiple gigabytes per cached conversation. */
+    if (r->is_hybrid && !r->is_qwen4exp &&
+        r->kv_cache_type == HIP_LLM_KV_Q8_0_Q8_0 &&
+        s->position >= 0 && s->position + 1 <=
+            (r->qwen35_snapshot_max_tokens > 0 ? r->qwen35_snapshot_max_tokens : 16384)) {
+        s->qwen35_kv_count = s->position + 1;
+        s->qwen35_key_host = calloc((size_t)s->n_layers, sizeof(void *));
+        s->qwen35_value_host = calloc((size_t)s->n_layers, sizeof(void *));
+        s->qwen35_key_scale_host = calloc((size_t)s->n_layers, sizeof(void *));
+        s->qwen35_value_scale_host = calloc((size_t)s->n_layers, sizeof(void *));
+        s->qwen35_kv_bytes = calloc((size_t)s->n_layers, sizeof(size_t));
+        s->qwen35_scale_bytes = calloc((size_t)s->n_layers, sizeof(size_t));
+        if (!s->qwen35_key_host || !s->qwen35_value_host ||
+            !s->qwen35_key_scale_host || !s->qwen35_value_scale_host ||
+            !s->qwen35_kv_bytes || !s->qwen35_scale_bytes) goto fail;
+        int attention_layers = 0;
+        int copied_layers = 0;
+        for (int l = 0; l < s->n_layers; ++l) {
+            hip_layer *cl = &r->layers[l];
+            if (cl->is_ssm) continue;
+            ++attention_layers;
+            if (!r->d_key_cache[l] || !r->d_value_cache[l] ||
+                !r->d_key_cache_scale[l] || !r->d_value_cache_scale[l])
+                continue;
+            size_t row_bytes = (size_t)cl->local_kv_heads * cl->local_head_dim;
+            /* Q8/Q8 scale caches use one FP16 scale per 32 values.  Treating
+             * them as float happened to stay inside an 8K allocation for
+             * tiny snapshots, but crossed it beyond half context and made
+             * long snapshot creation fail. */
+            size_t scale_row = (size_t)cl->local_kv_heads *
+                               (cl->local_head_dim / 32) * sizeof(uint16_t);
+            s->qwen35_kv_bytes[l] = (size_t)s->qwen35_kv_count * row_bytes;
+            s->qwen35_scale_bytes[l] = (size_t)s->qwen35_kv_count * scale_row;
+            s->qwen35_key_host[l] = malloc(s->qwen35_kv_bytes[l]);
+            s->qwen35_value_host[l] = malloc(s->qwen35_kv_bytes[l]);
+            s->qwen35_key_scale_host[l] = malloc(s->qwen35_scale_bytes[l]);
+            s->qwen35_value_scale_host[l] = malloc(s->qwen35_scale_bytes[l]);
+            if (!s->qwen35_key_host[l] || !s->qwen35_value_host[l] ||
+                !s->qwen35_key_scale_host[l] || !s->qwen35_value_scale_host[l] ||
+                hipMemcpy(s->qwen35_key_host[l], r->d_key_cache[l],
+                          s->qwen35_kv_bytes[l], hipMemcpyDeviceToHost) != hipSuccess ||
+                hipMemcpy(s->qwen35_value_host[l], r->d_value_cache[l],
+                          s->qwen35_kv_bytes[l], hipMemcpyDeviceToHost) != hipSuccess ||
+                hipMemcpy(s->qwen35_key_scale_host[l], r->d_key_cache_scale[l],
+                          s->qwen35_scale_bytes[l], hipMemcpyDeviceToHost) != hipSuccess ||
+                hipMemcpy(s->qwen35_value_scale_host[l], r->d_value_cache_scale[l],
+                          s->qwen35_scale_bytes[l], hipMemcpyDeviceToHost) != hipSuccess)
+                goto fail;
+            ++copied_layers;
+        }
+        s->portable = s->qwen35_kv_count == s->position + 1 &&
+                      attention_layers > 0 && copied_layers == attention_layers;
+    }
     return s;
 fail:
     hip_llm_free_state_snapshot(s);
@@ -25194,7 +35191,16 @@ int hip_llm_restore_state(hip_llm_runner *r, const hip_llm_state_snapshot *s) {
     if(hipStreamSynchronize(r->stream))return -1;
     if(s->hc_host && (hipMemcpy(r->d_hc,s->hc_host,s->hc_bytes,hipMemcpyHostToDevice) ||
        hipMemcpy(r->d_logits,s->logits_host,s->logits_bytes,hipMemcpyHostToDevice)))return -1;
+    if(!s->hc_host && s->logits_host && hipMemcpy(r->d_logits, s->logits_host,
+                                                   s->logits_bytes,
+                                                   hipMemcpyHostToDevice)) return -1;
     if(s->logits_host)memcpy(r->h_output,s->logits_host,s->logits_bytes);
+    if (r->qwen35_mtp && r->qwen35_mtp->source) {
+        if (!s->hidden_host || s->hidden_bytes != (size_t)r->n_embd * sizeof(float) ||
+            hipMemcpy(r->d_x, s->hidden_host, s->hidden_bytes,
+                      hipMemcpyHostToDevice) != hipSuccess)
+            return -1;
+    }
     if(s->nextn_hc_host && (!r->d_qwen4_nextn_hc ||
        hipMemcpy(r->d_qwen4_nextn_hc,s->nextn_hc_host,s->hc_bytes,hipMemcpyHostToDevice)))return -1;
     r->cur_position=s->position;r->qwen4_nextn_start=s->nextn_start;
@@ -25237,6 +35243,52 @@ int hip_llm_restore_state(hip_llm_runner *r, const hip_llm_state_snapshot *s) {
         if(!r->qwen4_nextn_fusion_loaded ||
            hipMemcpy((char *)r->d_qwen4_nextn_key_cache+s->kv_start*stride,s->nextn_key_host,s->nextn_kv_bytes,hipMemcpyHostToDevice) ||
            hipMemcpy((char *)r->d_qwen4_nextn_value_cache+s->kv_start*stride,s->nextn_value_host,s->nextn_kv_bytes,hipMemcpyHostToDevice))return -1;
+    }
+    if (s->dflash_key_host) {
+        hllm_qwen35_dflash2 *d = r->qwen35_dflash2;
+        if (!d) return -1;
+        if (s->dflash_feature_host &&
+            (!d->features || hipMemcpy(d->features, s->dflash_feature_host,
+                                        s->dflash_feature_bytes,
+                                        hipMemcpyHostToDevice) != hipSuccess))
+            return -1;
+        for (int l = 0; l < HLLM_DFLASH_LAYERS; ++l) {
+            if (hipMemcpy(d->layers[l].key_cache, s->dflash_key_host[l],
+                          s->dflash_kv_bytes, hipMemcpyHostToDevice) != hipSuccess ||
+                hipMemcpy(d->layers[l].value_cache, s->dflash_value_host[l],
+                          s->dflash_kv_bytes, hipMemcpyHostToDevice) != hipSuccess)
+                return -1;
+        }
+        d->kv_end = s->dflash_kv_end;
+        d->feature_rows = s->dflash_feature_rows;
+    }
+    if (s->qwen35_key_host) {
+        for (int l = 0; l < r->n_layers; ++l) {
+            if (!s->qwen35_key_host[l] || !r->d_key_cache[l]) continue;
+            if (hipMemcpy(r->d_key_cache[l], s->qwen35_key_host[l],
+                          s->qwen35_kv_bytes[l], hipMemcpyHostToDevice) != hipSuccess ||
+                hipMemcpy(r->d_value_cache[l], s->qwen35_value_host[l],
+                          s->qwen35_kv_bytes[l], hipMemcpyHostToDevice) != hipSuccess ||
+                hipMemcpy(r->d_key_cache_scale[l], s->qwen35_key_scale_host[l],
+                          s->qwen35_scale_bytes[l], hipMemcpyHostToDevice) != hipSuccess ||
+                hipMemcpy(r->d_value_cache_scale[l], s->qwen35_value_scale_host[l],
+                          s->qwen35_scale_bytes[l], hipMemcpyHostToDevice) != hipSuccess)
+                return -1;
+        }
+    }
+    /* A snapshot contains persistent request state, not the contents of the
+     * scratch quantization buffers.  Reused device addresses can otherwise
+     * make the next request treat scratch left by the previous repeat as a
+     * valid quantization of its first activation. */
+    r->q8x2_reuse_valid = 0;
+    r->iq1_q8_valid = 0;
+    r->batch_q8_valid = 0;
+    r->qwen4_forward_error = 0;
+    if (r->qwen35_mtp) {
+        hllm_qwen35_mtp *m = r->qwen35_mtp;
+        m->origin = -1;
+        m->verify_rows = 0;
+        m->verify_position = 0;
     }
     return hipDeviceSynchronize() == hipSuccess ? 0 : -1;
 }
@@ -25287,6 +35339,13 @@ void hip_llm_set_decode_mode(hip_llm_runner *r, int enabled) {
         hipStreamSynchronize(r->stream);
     }
     r->decode_mode = enabled != 0;
+}
+
+void hip_llm_set_qwen35_snapshot_max_tokens(hip_llm_runner *r, int tokens) {
+    if (!r) return;
+    if (tokens < 0) tokens = 0;
+    if (tokens > r->max_seq_len) tokens = r->max_seq_len;
+    r->qwen35_snapshot_max_tokens = tokens;
 }
 
 int hip_llm_n_embd(const hip_llm_runner *r) { return r ? r->n_embd : 0; }

@@ -59,7 +59,9 @@ def exercise(args, mode):
         first = post(request)
         text = first["choices"][0]["message"]["content"]
         assert first["usage"]["completion_tokens"] == 16, first
-        assert post(request)["choices"][0]["message"]["content"] == text
+        repeated = post(request)
+        assert repeated["choices"][0]["message"]["content"] == text
+        assert repeated["usage"]["cached_tokens"] > 0, repeated
         # A zero-output request leaves a fully cached prompt: the subsequent
         # request must read its existing logits, not return an empty answer.
         post(dict(request, max_tokens=0))

@@ -9,6 +9,7 @@ ROCM_PATH ?= /opt/rocm
 ROCM_LIB ?= $(dir $(firstword $(wildcard $(ROCM_PATH)/lib/libhipblaslt.so $(ROCM_PATH)/core-*/lib/libhipblaslt.so)))
 CFLAGS = -O3 -Wall -Wextra -D_GNU_SOURCE -I.. -march=native -fopenmp
 LDFLAGS = -ldl -lm -lpthread -fopenmp
+LDFLAGS += -lstdc++
 
 # Sources
 ROCEW_SRC = ../rocew.c
@@ -28,13 +29,29 @@ TARGET = test_hip_llm
 QWEN38_MODEL ?= /mnt/nvme01/models/q38nf/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf
 QSA_MOE_CACHE_MB ?= 128
 
-.PHONY: all clean run api profile-test bench-256k target-gate target-gate-fast target-gate-batch target-gate-4k hipblaslt-status qsa-256k qsa-256k-device qsa-256k-device-warp approx-coherence fp8-test cpu-expert-bench glm5next-contract glm5next-ref glm5next-cpu-kda glm5next-cpu-full glm5next-cpu-runtime glm5next-nextn glm5next-hip-kda help
+.PHONY: all clean run api gsq gsq-target iq2-bw profile-test long-context-gate lifecycle-test qsa-selector-test bench-256k target-gate target-gate-fast target-gate-batch target-gate-4k hipblaslt-status qsa-256k qsa-256k-device qsa-256k-device-warp approx-coherence fp8-test cpu-expert-bench glm5next-contract glm5next-ref glm5next-cpu-kda glm5next-cpu-full glm5next-cpu-runtime glm5next-nextn glm5next-hip-kda half2-test help
 
 all: $(TARGET)
 
+test_fattn_vec_half2: test_fattn_vec_half2.cu
+	$(HIPCC) -O2 --offload-arch=gfx1201 $< -o $@
+
+half2-test: test_fattn_vec_half2
+	env LD_LIBRARY_PATH=$(ROCM_PATH)/core-10.0/lib ./test_fattn_vec_half2
+
+.PHONY: kv-q8q8-test
+kv-q8q8-test:
+	python3 test_kv_q8q8.py --hipcc $(HIPCC) --out tmp/kv-q8q8
+	env LD_LIBRARY_PATH=$(ROCM_LIB) ./tmp/kv-q8q8/test
+
+.PHONY: qwen35-gda-test
+qwen35-gda-test:
+	python3 test_qwen35_gda.py --hipcc $(HIPCC) --out tmp/qwen35-gda
+	env LD_LIBRARY_PATH=$(ROCM_LIB) ./tmp/qwen35-gda/test
+
 ifeq ($(HIPBLASLT),1)
 CFLAGS += -DLLM_HIPBLASLT_ENABLED
-LDFLAGS += -L$(ROCM_LIB) -Wl,-rpath,$(ROCM_LIB) -lhipblaslt -lstdc++
+LDFLAGS += -L$(ROCM_LIB) -Wl,-rpath,$(ROCM_LIB) -lhipblaslt -lhipblas -lstdc++
 BLASLT_OBJ = mm_blaslt_bridge.o
 else
 BLASLT_OBJ =
@@ -62,8 +79,49 @@ cuda_moe_bridge.o: cuda_moe_bridge.cu cuda_moe_bridge.h glm5next_iq1s_grid.h glm
 mm_blaslt_bridge.o: mm_blaslt_bridge.cpp mm_blaslt_bridge.h
 	$(HIPCC) -O3 -fPIE $(BLASLT_BRIDGE_CFLAGS) --offload-arch=gfx1201 -c -o $@ $<
 
-$(TARGET): $(TEST_SRC) $(RUNNER_SRC) $(ROCEW_SRC) hip_llm_runner.h qwen4_moe_stage.h qwen4_ple_split_test.h qwen4_phase_scratch.h qwen4_hc_native_kernels.h qwen4_hc_native_test.h qwen4_ssm_native_kernels.h qwen4_ssm_native_test.h qwen4_moe_native_kernels.h qwen4_moe_native_test.h qwen4_nextn_forward.h qwen4_nextn_ref.h qwen4_qsa_hip.h qwen4_qsa_test.h qwen4_verify_window.h ../../common/qwen4_qsa.h ../hip_runner_common.h ../rocew.h $(BLASLT_OBJ) $(CUDA_MOE_OBJ)
-	$(CC) $(CFLAGS) -o $@ $(TEST_SRC) $(RUNNER_SRC) $(ROCEW_SRC) $(BLASLT_OBJ) $(CUDA_MOE_OBJ) $(LDFLAGS)
+reference_sampler.o: reference_sampler.cpp reference_sampler.h
+	$(CXX) -O3 -std=c++17 -Wall -Wextra -Wpedantic -fno-fast-math -ffp-contract=off -c -o $@ $<
+
+qwen35_attention_q8.inc: qwen35_attention_q8.hip
+	python3 -c 'import json,pathlib; print("static const char qwen35_attention_q8_source[] = " + json.dumps(pathlib.Path("$<").read_text()) + ";")' > $@
+
+qwen35_dflash2.inc: qwen35_dflash2.hip
+	python3 -c 'import json,pathlib; print("static const char qwen35_dflash2_source[] = " + json.dumps(pathlib.Path("$<").read_text()) + ";")' > $@
+
+qwen35_matvec_q2k.inc: qwen35_matvec_q2k.hip
+	python3 -c 'import json,pathlib; print("static const char qwen35_matvec_q2k_source[] = " + json.dumps(pathlib.Path("$<").read_text()) + ";")' > $@
+
+qwen35_matvec_iq.inc: qwen35_matvec_iq.hip embed_hip_source.py qwen35_iq2xxs_grid.inc qwen35_iq2xs_grid.inc ../../common/iq2s_grid.inc ../../common/iq3xxs_grid.inc ../../common/iq3s_grid.inc ../../common/ksigns_iq2xs.inc
+	python3 embed_hip_source.py $< qwen35_matvec_iq_source > $@
+
+# Other test executables include the runner translation unit directly.
+HIPRTC_INCLUDES = qwen35_attention_q8.inc qwen35_attention_q8_gate.inc qwen35_dflash2.inc qwen35_matvec_q2k.inc qwen35_matvec_iq.inc qwen35_reference_math.h qwen35_nextn.h qwen35_dflash2.h
+$(TARGET) tmp/test_hip_qwen4_moe_stage tmp/test_hip_qwen4_moe_stage_large tmp/test_hip_qwen4_attention test_glm5next_nextn: $(HIPRTC_INCLUDES)
+
+LLAMA_REFERENCE ?= ../../tmp/qwen38/reference-build
+.PHONY: reference-attention-test
+reference-attention-test:
+	mkdir -p tmp
+	env TMPDIR=$(abspath tmp) $(HIPCC) -O3 -std=c++17 --offload-arch=gfx1201 -DGGML_USE_HIP \
+	    -I$(LLAMA_REFERENCE)/source/ggml/include -I$(LLAMA_REFERENCE)/source/ggml/src \
+	    -I$(LLAMA_REFERENCE)/source/ggml/src/ggml-cuda test_reference_attention.cpp \
+	    -L$(LLAMA_REFERENCE)/build/bin -Wl,-rpath,$(abspath $(LLAMA_REFERENCE)/build/bin) \
+	    -lggml-base -o tmp/test_reference_attention
+	env LD_LIBRARY_PATH=$(ROCM_LIB) ./tmp/test_reference_attention
+
+.PHONY: reference-sampler-test
+reference-sampler-test: reference_sampler.o
+	mkdir -p tmp
+	$(CXX) -O3 -std=c++17 -Wall -Wextra -Wpedantic -Werror -ffp-contract=off \
+	    -I$(LLAMA_REFERENCE)/source/include -I$(LLAMA_REFERENCE)/source/ggml/include \
+	    test_reference_sampler.cpp reference_sampler.o \
+	    -L$(LLAMA_REFERENCE)/build/bin -Wl,-rpath,$(abspath $(LLAMA_REFERENCE)/build/bin) \
+	    -Wl,-rpath-link,$(ROCM_LIB) -Wl,-rpath,$(ROCM_LIB) \
+	    -lllama -o tmp/test_reference_sampler
+	env LD_LIBRARY_PATH=$(ROCM_LIB) ./tmp/test_reference_sampler
+
+$(TARGET): $(TEST_SRC) $(RUNNER_SRC) $(ROCEW_SRC) hip_llm_runner.h generation_trace.h qwen35_reference_math.h qwen4_moe_stage.h qwen4_ple_split_test.h qwen4_phase_scratch.h qwen4_hc_native_kernels.h qwen4_hc_native_test.h qwen4_ssm_native_kernels.h qwen4_ssm_native_test.h qwen4_moe_native_kernels.h qwen4_moe_native_test.h qwen4_nextn_forward.h qwen4_nextn_ref.h qwen4_qsa_hip.h qwen4_qsa_test.h qwen4_verify_window.h ../../common/qwen4_qsa.h ../hip_runner_common.h ../rocew.h reference_sampler.o $(BLASLT_OBJ) $(CUDA_MOE_OBJ)
+	$(CC) $(CFLAGS) -o $@ $(TEST_SRC) $(RUNNER_SRC) $(ROCEW_SRC) reference_sampler.o $(BLASLT_OBJ) $(CUDA_MOE_OBJ) $(LDFLAGS)
 
 .PHONY: moe-stage-test moe-stage-gpu-test moe-stage-quality
 moe-stage-test:
@@ -105,8 +163,29 @@ run: $(TARGET)
 api: $(TARGET)
 	@echo "Usage: python3 codex_server.py <model.gguf> [--port 8080] [--context 4096]"
 
+gsq: $(TARGET)
+	./run_qwen38_gsq_rocm.sh
+
+gsq-target: $(TARGET)
+	./bench_qwen38_gsq_decode.sh
+
+iq2-bw: $(TARGET)
+	./bench_iq2_matvec_bw.sh
+
 profile-test:
 	./test_qwen38_profiles.sh
+
+long-context-gate: $(TARGET)
+	./test_qwen38_long_context.sh
+
+lifecycle-test:
+	python3 test_dflash_overlap_lifecycle.py
+
+qsa-selector-test:
+	mkdir -p tmp
+	$(CC) -std=c11 -O2 -Wall -Wextra -Wpedantic -Werror \
+	    ../../common/test_qwen4_qsa.c -lm -o tmp/test_qwen4_qsa
+	./tmp/test_qwen4_qsa
 
 approx-coherence: $(TARGET)
 	./test_qwen38_approx_coherence.sh
@@ -188,7 +267,7 @@ bench_cpu_qwen_expert: bench_cpu_qwen_expert.c
 	$(CC) -O3 -Wall -Wextra -march=native -fopenmp -o $@ $< -ldl -lm
 
 clean:
-	rm -f $(TARGET) bench_cpu_qwen_expert test_glm5next_contract test_glm5next_ref test_glm5next_cpu_kda test_glm5next_cpu_full test_glm5next_cpu_runtime test_glm5next_nextn mm_blaslt_bridge.o cuda_moe_bridge.o
+	rm -f $(TARGET) test_fattn_vec_half2 bench_cpu_qwen_expert test_glm5next_contract test_glm5next_ref test_glm5next_cpu_kda test_glm5next_cpu_full test_glm5next_cpu_runtime test_glm5next_nextn mm_blaslt_bridge.o reference_sampler.o cuda_moe_bridge.o qwen35_attention_q8.inc qwen35_dflash2.inc qwen35_matvec_q2k.inc qwen35_matvec_iq.inc
 
 help:
 	@echo "HIP LLM Runner (HIPRTC-based, no hipcc needed)"
