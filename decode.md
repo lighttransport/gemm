@@ -198,6 +198,48 @@ exactness. Findings so far (single core, `bench_multi.c`, generator
   head (vocabulary subset), and (c) batched SSM (chunked delta rule),
   multi-query attention and a 4-token head with little overhead.
 
+### Speculative decoding implementation (FP4, `Q38D_SPEC=k`)
+
+Exact greedy speculative decoding with the NextN drafter:
+
+- Verification pass of T = k + 1 tokens [cur, d1..dk] at positions
+  pos..pos+k: every FP4 projection through the two-group per-token-pointer
+  kernels (`q38d_asmg2p{2,3,4}_f4_a16`), K-quant matrices T single-token
+  passes, down projection K-chunked with multi-token boundary slots,
+  per-CMG cooperative norm for T tokens, SSM cores per token through
+  explicit IO buffers, multi-query attention (`attention_mt`), and a
+  T-token Q8K head (`q38d_asmg2p{2,3,4}_q8k_a16`).
+- Acceptance: the longest draft prefix equal to the pass's argmaxes, plus
+  the pass's own next token. Rollback is free: SSM state of each
+  (layer, head) is a ring of k + 2 buffers (token i reads slot i, writes
+  slot i+1; accepting A tokens advances the ring by A), conv history is an
+  8-slot ring, KV/MTP caches are positional.
+- Drafting: the drafter catches up over the A accepted positions as one
+  A-token pass, then chains k-1 single-token steps; `Q38D_DRAFT_V=131072`
+  drafts from the first 128K vocabulary rows (smaller subsets lose too much
+  acceptance: 32K 2.59, 64K 2.84 tokens/pass).
+
+Results, FP4 A16, 1024+256, node f29-6000c (non-speculative 35.9-36.1
+tok/s on the same node), all 256/256 equal to the F32 reference:
+
+| k | tokens/pass | tok/s | speedup |
+| ---: | ---: | ---: | ---: |
+| 1 | 1.88 | 35.4 (v1) | 0.98x |
+| 2 | 2.56 | 40.5 | 1.12x |
+| 3 | 3.05 | **40.9** | **1.14x** |
+
+k = 3, worker-0 ms per verification pass (75 ms, 3.05 tokens): projections
+54.1, drafting 5.3, cores 4.1, barrier waits 4.6, head 3.3, norms 1.7.
+The projections alone are 17.7 ms per accepted token (vs ~23.6 ms per
+token in single-token decode), so with this kernel the ceiling is ~1.35x
+even without any other overhead; 1.5x needs a verification kernel of
+~10 cycles per pair and token (12 now) plus the overheads roughly halved.
+
+Rejected here: T-scaled in-projection plans (`Q38D_MT_PLANS=1`, larger
+barrier waits), A8 activations for the FFN input or the down input
+(`Q38D_FFN_A8`/`Q38D_DOWN_A8`: first divergence from the F32 reference at
+n = 129, both together at n = 4), so verification must stay A16.
+
 ## Next steps (in order)
 
 1. Remove the remaining ~0.7 ms/token. The in-projection phases are

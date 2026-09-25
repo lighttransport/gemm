@@ -1346,8 +1346,11 @@ static void phase_end_c(int tid, int *cs, uint64_t *t, int phase) {
     prof_mark(tid, t, phase);
 }
 
+/* experiment: A8 activations for the FFN gate/up input / down input */
+static int ffn_a8, down_a8;
 static void layer_body(int tid, int layer, int pos, int *gs, int *cs, uint64_t *tp) {
 #define t (*tp)
+        if (ffn_a8 && E.arith == Q38D_A16) E.act_c[tid / PER].arith = Q38D_A16;
         const q38d_layer *L = &E.L[layer];
         pf_layer[tid] = layer;
         const q38d_act *a;
@@ -1387,6 +1390,7 @@ static void layer_body(int tid, int layer, int pos, int *gs, int *cs, uint64_t *
             else ssq_publish_rows(&L->o, tid);
             phase_end(tid, gs, &t, P_ATT_OUT);
         }
+        if (ffn_a8 && E.arith == Q38D_A16) E.act_c[tid / PER].arith = Q38D_A8;
         if (prod_norm) { int cc = prod_copies > 1 ? tid / PER : 0; a = &E.act_c[cc]; E.act_c[cc].x = E.xn_c[cc]; omul = x_inv(); }
         else { a = norm_act(tid, L->post_norm); omul = 1.0f; }
         {
@@ -1922,6 +1926,86 @@ static int head_multi = 1, mt_plans = 0;
  * 2 cores, 3 head, 4 phase barriers, 5 MTP catch-up + drafts */
 static double sp_t[6];
 #define SP_T(k, ...) do { uint64_t a_ = tid ? 0 : ticks(); __VA_ARGS__; if (!tid) sp_t[k] += (double)(ticks() - a_); } while (0)
+/* Attention for T consecutive query tokens (positions pos0..pos0+T-1) of
+ * one layer: every lane scores its position range for all queries (the K/V
+ * rows come from HBM once, then from L2), and the 6*T (head, token) merges
+ * are spread over the CMG's 12 lanes. */
+static float *qh_mt[NCMG], *apart_mt[NCMG];
+static int attn_multi = 1;
+static void attention_mt(int layer, int tid, int pos0, int T, int *cs) {
+    const q38d_layer *L = &E.L[layer];
+    const int c = tid / PER, l = tid % PER, ai = L->ai;
+    const size_t PS = 2 + HD;   /* partial: max, sum, o[HD] */
+    for (int i = 0; i < T; i++) {
+        if (l < 6) {
+            float *q = qh_mt[c] + ((size_t)i * 6 + l) * HD;
+            memcpy(q, MT.qg[i] + (size_t)(6 * c + l) * 2 * HD, HD * sizeof(float));
+            head_rmsnorm_rope(q, L->q_norm, pos0 + i);
+        } else if (l == 6) {
+            float kv[HD];
+            memcpy(kv, MT.kb[i] + c * HD, sizeof kv);
+            head_rmsnorm_rope(kv, L->k_norm, pos0 + i);
+            memcpy(E.kc[ai][c] + (size_t)(pos0 + i) * HD, kv, sizeof kv);
+            memcpy(E.vc[ai][c] + (size_t)(pos0 + i) * HD, MT.vb[i] + c * HD, HD * sizeof(float));
+        }
+    }
+    cbarrier(tid, cs);
+    const int n = pos0 + T, t0 = (int)((int64_t)n * l / PER), t1 = (int)((int64_t)n * (l + 1) / PER);
+    const float scale = 1.0f / 16.0f;
+    const svbool_t pf = svptrue_b32();
+    const float *K = E.kc[ai][c], *V = E.vc[ai][c];
+    float sc[6 * (t1 - t0 > 0 ? t1 - t0 : 1)];
+    for (int i = 0; i < T; i++) {
+        int b = t1 < pos0 + i + 1 ? t1 : pos0 + i + 1, nt = b - t0;
+        float *part = apart_mt[c] + ((size_t)i * PER + l) * 6 * PS;
+        if (nt <= 0) {
+            for (int hh = 0; hh < 6; hh++) { float *pp = part + hh * PS; pp[0] = -INFINITY; pp[1] = 0; memset(pp + 2, 0, HD * 4); }
+            continue;
+        }
+        attn_scores(qh_mt[c] + (size_t)i * 6 * HD, K, t0, b, sc, nt, scale);
+        for (int hh = 0; hh < 6; hh++) {
+            float *s_h = sc + hh * nt, *pp = part + hh * PS;
+            float m = -INFINITY;
+            for (int j = 0; j < nt; j++) if (s_h[j] > m) m = s_h[j];
+            svfloat32_t lsv = svdup_n_f32(0);
+            for (int j = 0; j < nt; j += 16) {
+                svbool_t pg = svwhilelt_b32(j, nt);
+                svfloat32_t ev = q38d_exp_sve(pg, svsub_n_f32_x(pg, svld1_f32(pg, s_h + j), m));
+                svst1_f32(pg, s_h + j, ev);
+                lsv = svadd_f32_m(pg, lsv, ev);
+            }
+            pp[0] = m; pp[1] = svaddv_f32(pf, lsv);
+            attn_pv(V, t0, b, s_h, pp + 2);
+        }
+    }
+    cbarrier(tid, cs);
+    for (int j = l; j < 6 * T; j += PER) {
+        int i = j / 6, hh = j % 6, hq = 6 * c + hh;
+        float M = -INFINITY;
+        for (int k = 0; k < PER; k++) {
+            float mk = apart_mt[c][((size_t)i * PER + k) * 6 * PS + hh * PS];
+            if (mk > M) M = mk;
+        }
+        float o[HD], den = 0;
+        memset(o, 0, sizeof o);
+        for (int k = 0; k < PER; k++) {
+            const float *pp = apart_mt[c] + ((size_t)i * PER + k) * 6 * PS + hh * PS;
+            if (pp[1] == 0) continue;
+            float w = q38d_expf(pp[0] - M);
+            den += w * pp[1];
+            for (int d = 0; d < HD; d += 16)
+                svst1_f32(pf, o + d, svmla_n_f32_x(pf, svld1_f32(pf, o + d), svld1_f32(pf, pp + 2 + d), w));
+        }
+        const float *gate = MT.qg[i] + (size_t)hq * 2 * HD + HD;
+        float *dst = MT.o[i] + (size_t)hq * HD;
+        float rden = 1.0f / den;
+        for (int d = 0; d < HD; d += 16) {
+            svfloat32_t gv = q38d_sigmoid_sve(pf, svld1_f32(pf, gate + d));
+            svst1_f32(pf, dst + d, svmul_f32_x(pf, svmul_n_f32_x(pf, svld1_f32(pf, o + d), rden), gv));
+        }
+        q38d_prepare_range(&MT.act_o[i], MT.o[i], hq * 8, hq * 8 + 8);
+    }
+}
 /* one layer for T tokens with residuals xs[0..T) */
 static void layer_mt(int tid, int layer, int pos0, int T, float *const *xs, int *gs, int *cs, uint64_t *tp) {
 #define t (*tp)
@@ -1955,7 +2039,8 @@ static void layer_mt(int tid, int layer, int pos0, int T, float *const *xs, int 
             SP_T(1, run_plan_mt(plan_att_mt && mt_plans ? &plan_att_mt[layer] : &plan_att[layer], T, MT.act_c[c], outs, tid));
             if (inproj_cbar && attn_cmg_ok) SP_T(4, phase_end_c(tid, cs, &t, P_ATT_IN));
             else phase_end(tid, gs, &t, P_ATT_IN);
-            SP_T(2, for (int i = 0; i < T; i++) {
+            if (attn_multi) SP_T(2, attention_mt(layer, tid, pos0, T, cs));
+            else SP_T(2, for (int i = 0; i < T; i++) {
                 q38d_io io = {NULL, NULL, NULL, NULL, MT.qg[i], MT.kb[i], MT.vb[i], MT.o[i], &MT.act_o[i], -1};
                 attention_io(layer, tid, pos0 + i, cs, &io);
             });
@@ -2056,6 +2141,10 @@ static void mtp_catchup_mt(int tid, const int *nxt, int pos, int A, int *gs, int
     gbarrier(tid, gs);
 }
 static void mt_alloc(void) {
+    for (int c = 0; c < NCMG; c++) {
+        qh_mt[c] = aligned_alloc(256, (size_t)TMAX * 6 * HD * 4);
+        apart_mt[c] = aligned_alloc(256, (size_t)TMAX * PER * 6 * (2 + HD) * 4);
+    }
     for (int t = 0; t < TMAX; t++) {
         mtp_em[t] = aligned_alloc(256, EMBD * 4);
         mtp_xm[t] = aligned_alloc(256, EMBD * 4);
@@ -2350,6 +2439,9 @@ int main(int argc, char **argv) {
     if (getenv("Q38D_VBENCH")) vbench_T = atoi(getenv("Q38D_VBENCH"));
     if (getenv("Q38D_MTP")) mtp_on = atoi(getenv("Q38D_MTP")) != 0;
     if (getenv("Q38D_SPEC")) spec_k = atoi(getenv("Q38D_SPEC"));
+    if (getenv("Q38D_FFN_A8")) ffn_a8 = atoi(getenv("Q38D_FFN_A8"));
+    if (getenv("Q38D_DOWN_A8")) down_a8 = atoi(getenv("Q38D_DOWN_A8"));
+    if (getenv("Q38D_ATTN_MULTI")) attn_multi = atoi(getenv("Q38D_ATTN_MULTI"));
     if (getenv("Q38D_MT_PLANS")) mt_plans = atoi(getenv("Q38D_MT_PLANS"));
     if (getenv("Q38D_MTP_BATCH")) mtp_batch = atoi(getenv("Q38D_MTP_BATCH"));
     if (getenv("Q38D_DRAFT_V")) draft_v = atoi(getenv("Q38D_DRAFT_V"));
@@ -2387,6 +2479,7 @@ int main(int argc, char **argv) {
                          aligned_alloc(256, DINNER / 16 * 4), aligned_alloc(256, DINNER / 16 * 4), E.o};
     E.act_h = (q38d_act){NFF, arith, aligned_alloc(256, q38d_act_qbytes(NFF, Q38D_A16)),
                          aligned_alloc(256, NFF / 16 * 4), aligned_alloc(256, NFF / 16 * 4), E.h};
+    if (down_a8 && arith == Q38D_A16) E.act_h.arith = Q38D_A8;
     for (int l = 0; l < NLAYER; l++) {
         E.conv_state[l] = calloc((size_t)4 * QKVD, sizeof(float));
         ssm_buf[l] = calloc((size_t)NVH * ssm_ring, sizeof(float *));
