@@ -51,7 +51,7 @@ lib.px_gpu_trim.argtypes=[C.c_void_p]
 class Metrics(C.Structure):
     _fields_=[(name,C.c_uint64) for name in ['uploads','downloads','allocations','gemms','mma_gemms','attentions','mma_attentions']]+[('kernel_ms',C.c_double)]+[(name,C.c_uint64) for name in ['effective_budget_bytes','active_bytes','pooled_bytes','peak_active_bytes','largest_allocation_bytes']]
 lib.px_gpu_metrics.argtypes=[C.c_void_p,C.POINTER(Metrics)]
-assert lib.px_gpu_device_version()==2
+assert lib.px_gpu_device_version()==3
 d=lib.px_gpu_create(0,1024**3)
 assert d
 assert lib.px_gpu_configure(d,['auto','blas','mma'].index(a.kernels),0)==0
@@ -117,6 +117,39 @@ try:
         torch.testing.assert_close(cached,old,rtol=0,atol=0)
         free()
     print('Cached RoPE equivalence PASS',flush=True)
+    # ABI 3 row offsets used by the tiled decoder must reproduce the full
+    # operations exactly.
+    def fetch(b,shape):
+        out=np.empty(shape,np.float32)
+        assert lib.px_gpu_copy(d,b,out.ctypes.data,out.nbytes,1)==0,lib.px_gpu_error(d)
+        return torch.from_numpy(out)
+    for prec,dt in [(0,torch.float32),(2,torch.float16)]:
+        n,ci,co,start,rows=300,64,48,130,100
+        x=torch.randn(n,ci)*.2;w=upload((torch.randn(co,ci)*.2).to(dt));b=upload(torch.randn(co)*.2)
+        full=run(Op(op=0,precision=prec,n=rows,c=co,k=ci,x=upload(x[start:start+rows]),w=w,b=b),(rows,co))
+        shifted=run(Op(op=0,precision=prec,n=rows,c=co,k=ci,heads=start,x=upload(x),w=w,b=b),(rows,co))
+        torch.testing.assert_close(shifted,full,rtol=0,atol=0)
+        free()
+    parents=torch.sort(torch.randint(0,40,(120,),dtype=torch.int32)).values;slots=torch.randint(0,8,(120,),dtype=torch.int32)
+    co=16;x=torch.randn(40,8*co);xp=upload(x);pp=upload(parents);sp=upload(slots)
+    full=run(Op(op=13,n=120,c=co,k=2*co,x=xp,w=pp,b=sp),(120,co))
+    tiled=alloc(120*co*4);child=0
+    for tile in range(0,40,16):
+        end=child
+        while end<120 and parents[end]<tile+16:end+=1
+        if end>child:
+            op=Op(op=13,n=end-child,c=co,k=2*co,heads=child,offset=tile,x=upload(x[tile:tile+16]),w=pp,b=sp,out=tiled)
+            assert lib.px_gpu_execute(d,C.byref(op))==0,lib.px_gpu_error(d)
+        child=end
+    torch.testing.assert_close(fetch(tiled,(120,co)),full,rtol=0,atol=0)
+    free()
+    h=torch.randn(50,24);y=torch.randn(20,24)
+    hb=upload(h);op=Op(op=8,precision=2,n=20,c=24,k=1,heads=17,x=upload(y),w=hb,out=hb)
+    assert lib.px_gpu_execute(d,C.byref(op))==0,lib.px_gpu_error(d)
+    expected=h.clone();expected[17:37]=(h[17:37]+y).half().float()
+    torch.testing.assert_close(fetch(hb,(50,24)),expected,rtol=0,atol=0)
+    free()
+    print('Row-offset LINEAR/C2S/ADD equivalence PASS',flush=True)
     if a.benchmark:
         for n in [1024,4096]:
             q,k,v=[torch.randn(n,12,128).bfloat16().float() for _ in range(3)]
