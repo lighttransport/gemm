@@ -92,16 +92,23 @@ typedef struct {
     /* per head (worker) CMG-local copies: history [4 slots][q,k,v][128] and
      * conv weights [4 taps][q,k,v][128] of that head's channels */
     float *conv_hist[NLAYER][NVH], *conv_wl[NLAYER][NVH];
-    float *kc[NATTN][NKV], *vc[NATTN][NKV];
+    float *kc[NATTN + 1][NKV], *vc[NATTN + 1][NKV]; /* [NATTN]: MTP layer */
     float *qh[NCMG];        /* [6][256] per CMG */
     float *apart[NCMG];     /* [12][6][2+256] per CMG */
     float best_val[NT];
     int best_idx[NT];
     int next_token;
     _Atomic int *unit_cnt; /* per 16-row FFN unit, parity counter */
+    /* NextN/MTP drafter (Q38D_MTP=1, measurement): layer E.L[NLAYER] */
+    q38d_mat eh;
+    const float *enorm, *hnorm, *shnorm;
+    float *mtp_in, *x_mtp, *h_mtp;
+    q38d_act act_mtp;
+    int mtp_draft;
     /* profiling (thread 0) */
     double prof[16];
 } q38d_engine;
+static int mtp_on;
 
 enum { P_EMBED, P_SSM_IN, P_SSM_CORE, P_SSM_OUT, P_ATT_IN, P_ATT_CORE, P_ATT_OUT, P_FFN_UP, P_FFN_DOWN, P_HEAD, P_N };
 static const char *prof_name[P_N] = {"embed", "ssm_in", "ssm_core", "ssm_out", "attn_in", "attn_core",
@@ -438,7 +445,7 @@ static void load_engine(void) {
     E.eps = 1e-6f;
     E.rope_base = 10000000.f;
     for (int j = 0; j < 32; j++) E.inv_freq[j] = 1.0f / powf(E.rope_base, (float)(2 * j) / 64.f);
-    E.L = calloc(NLAYER, sizeof(q38d_layer));
+    E.L = calloc(NLAYER + 1, sizeof(q38d_layer));
     for (int l = 0; l < NLAYER; l++) {
         q38d_layer *L = &E.L[l];
         L->ssm = (l % 4) != 3;
@@ -489,6 +496,33 @@ static void load_engine(void) {
         if (!ssm_perm) fprintf(stderr, "q38d: SSM in-proj layout not permutable, ssm_perm off\n");
         for (int l = 0; ssm_perm && l < NLAYER; l++)
             if (E.L[l].ssm) ssm_permute_layer(&E.L[l], l);
+    }
+    if (mtp_on) {
+        int l = NLAYER;
+        q38d_layer *L = &E.L[l];
+        L->ssm = 0;
+        L->ai = NATTN;
+        L->attn_norm = vec_ptr(need_tensor("blk.%d.attn_norm.weight", l), EMBD);
+        L->post_norm = vec_ptr(need_tensor("blk.%d.post_attention_norm.weight", l), EMBD);
+        describe(&L->q, need_tensor("blk.%d.attn_q.weight", l));
+        describe(&L->k, need_tensor("blk.%d.attn_k.weight", l));
+        describe(&L->v, need_tensor("blk.%d.attn_v.weight", l));
+        describe(&L->o, need_tensor("blk.%d.attn_output.weight", l));
+        L->o.unit16 = 1;
+        L->o.kch = 0;
+        load_vec(L->q_norm, need_tensor("blk.%d.attn_q_norm.weight", l), HD);
+        load_vec(L->k_norm, need_tensor("blk.%d.attn_k_norm.weight", l), HD);
+        describe(&L->gate, need_tensor("blk.%d.ffn_gate.weight", l));
+        describe(&L->up, need_tensor("blk.%d.ffn_up.weight", l));
+        describe(&L->down, need_tensor("blk.%d.ffn_down.weight", l));
+        L->down.unit16 = 1;
+        L->down.kch = 4;
+        if (L->down.cols % (L->down.kch * 256)) L->down.kch = 1;
+        if (L->down.kch > 1) L->down.unit16 = 0;
+        describe(&E.eh, need_tensor("blk.%d.nextn.eh_proj.weight", l));
+        E.enorm = vec_ptr(need_tensor("blk.%d.nextn.enorm.weight", l), EMBD);
+        E.hnorm = vec_ptr(need_tensor("blk.%d.nextn.hnorm.weight", l), EMBD);
+        E.shnorm = vec_ptr(need_tensor("blk.%d.nextn.shared_head_norm.weight", l), EMBD);
     }
     describe(&E.head, need_tensor("output.weight", 0));
     E.out_norm = vec_ptr(need_tensor("output_norm.weight", 0), EMBD);
@@ -1280,13 +1314,8 @@ static void phase_end_c(int tid, int *cs, uint64_t *t, int phase) {
     prof_mark(tid, t, phase);
 }
 
-static void step(int tid, int token, int pos, int want_head, int *gs, int *cs) {
-    uint64_t t = ticks();
-    pf_pos = pos;
-    ssq_valid = 0;
-    embed_token(tid, token);
-    phase_end(tid, gs, &t, P_EMBED);
-    for (int layer = 0; layer < NLAYER; layer++) {
+static void layer_body(int tid, int layer, int pos, int *gs, int *cs, uint64_t *tp) {
+#define t (*tp)
         const q38d_layer *L = &E.L[layer];
         pf_layer[tid] = layer;
         const q38d_act *a;
@@ -1380,12 +1409,16 @@ static void step(int tid, int token, int pos, int want_head, int *gs, int *cs) {
         if (prod_norm) x_produce(&L->down, tid, layer + 1 < NLAYER ? E.L[layer + 1].attn_norm : E.out_norm);
         else ssq_publish_rows(&L->down, tid);
         phase_end(tid, gs, &t, P_FFN_DOWN);
-    }
-    if (!want_head) return;
+    #undef t
+}
+
+/* final norm (weight nw), output head and global argmax -> E.next_token */
+static void head_argmax(int tid, const float *nw, int *gs, uint64_t *tp) {
+#define t (*tp)
     const q38d_act *a;
     float omul = 1.0f;
     if (prod_norm) { int cc = prod_copies > 1 ? tid / PER : 0; a = &E.act_c[cc]; E.act_c[cc].x = E.xn_c[cc]; omul = x_inv(); }
-    else a = norm_act(tid, E.out_norm);
+    else a = norm_act(tid, nw);
     mv(&E.head, a, E.logits, 0, tid);
     if (omul != 1.0f) {
         int c, g0, g1;
@@ -1411,6 +1444,71 @@ static void step(int tid, int token, int pos, int want_head, int *gs, int *cs) {
     }
     prof_mark(tid, &t, P_HEAD);
     gbarrier(tid, gs);
+#undef t
+}
+
+static void step(int tid, int token, int pos, int want_head, int *gs, int *cs) {
+    uint64_t t = ticks();
+    pf_pos = pos;
+    ssq_valid = 0;
+    embed_token(tid, token);
+    phase_end(tid, gs, &t, P_EMBED);
+    for (int layer = 0; layer < NLAYER; layer++) layer_body(tid, layer, pos, gs, cs, &t);
+    if (!want_head) return;
+    head_argmax(tid, E.out_norm, gs, &t);
+}
+
+/* NextN/MTP drafter: from hidden h (main final residual at position pos, or
+ * the drafter's previous output) and the embedding of `token` (= x_{pos+1}),
+ * one attention layer at position pos predicts x_{pos+2} (E.mtp_draft when
+ * want_head). The drafter's output hidden is kept in E.h_mtp for chaining. */
+static void rmsnorm_to(float *dst, const float *x, const float *w) {
+    double ss = 0;
+    for (int i = 0; i < EMBD; i++) ss += (double)x[i] * x[i];
+    float inv = 1.0f / sqrtf((float)(ss / EMBD) + E.eps);
+    for (int i = 0; i < EMBD; i++) dst[i] = x[i] * inv * w[i];
+}
+static void mtp_step(int tid, int token, int pos, const float *hidden, int want_head, int *gs, int *cs) {
+    uint64_t t = ticks();
+    static float *save_x;
+    static int save_next;
+    if (tid == 0) {
+        if (E.embed_q6k) dequant_row(GGML_TYPE_Q6_K, E.embed_q6k + (size_t)token * E.embed_row_bytes, E.x_mtp, EMBD);
+        else q38_lowbit_matrix_row(E.x_mtp, E.embed_lb, token);
+        rmsnorm_to(E.mtp_in, E.x_mtp, E.enorm);
+        rmsnorm_to(E.mtp_in + EMBD, hidden, E.hnorm);
+        q38d_prepare_ref(&E.act_mtp, E.mtp_in);
+        save_x = E.x;
+        save_next = E.next_token;
+    }
+    gbarrier(tid, gs);
+    mv(&E.eh, &E.act_mtp, E.x_mtp, 0, tid);
+    gbarrier(tid, gs);
+    if (tid == 0) E.x = E.x_mtp;
+    ssq_valid = 0;
+    gbarrier(tid, gs);
+    layer_body(tid, NLAYER, pos, gs, cs, &t);
+    if (tid == 0) memcpy(E.h_mtp, E.x_mtp, EMBD * sizeof(float));
+    if (want_head) head_argmax(tid, E.shnorm, gs, &t);
+    gbarrier(tid, gs);
+    if (tid == 0) {
+        E.x = save_x;
+        if (want_head) E.mtp_draft = E.next_token;
+        E.next_token = save_next;
+    }
+    ssq_valid = 0;
+    gbarrier(tid, gs);
+}
+/* drafts[i][k]: depth-k+1 draft for x_{pn-1+i+2+k}, made after x_{pn+i} is known */
+static int (*mtp_chain)[3];
+static void mtp_drafts(int tid, int i, int pos, int *gs, int *cs) {
+    int tok = E.next_token;
+    mtp_step(tid, tok, pos, E.x, 1, gs, cs);
+    int d1 = E.mtp_draft;
+    mtp_step(tid, d1, pos + 1, E.h_mtp, 1, gs, cs);
+    int d2 = E.mtp_draft;
+    mtp_step(tid, d2, pos + 2, E.h_mtp, 1, gs, cs);
+    if (tid == 0) { mtp_chain[i][0] = d1; mtp_chain[i][1] = d2; mtp_chain[i][2] = E.mtp_draft; }
 }
 
 /* ------------------------------------------------------------------ */
@@ -1453,7 +1551,7 @@ static void *worker(void *arg) {
         }
     int c = tid / PER, l = tid % PER;
     if (l == 0) {
-        for (int ai = 0; ai < NATTN; ai++) {
+        for (int ai = 0; ai < NATTN + mtp_on; ai++) {
             E.kc[ai][c] = cmg_alloc((size_t)E.max_seq * HD * 4, c);
             E.vc[ai][c] = cmg_alloc((size_t)E.max_seq * HD * 4, c);
             memset(E.kc[ai][c], 0, (size_t)E.max_seq * HD * 4);
@@ -1518,7 +1616,11 @@ static void *worker(void *arg) {
     double t0 = 0;
     int pn = JOB.n_prompt, gn = JOB.n_gen;
     if (tid == 0) t0 = now_sec();
-    for (int pos = 0; pos < pn; pos++) step(tid, JOB.tok[pos], pos, pos == pn - 1, &gs, &cs);
+    for (int pos = 0; pos < pn; pos++) {
+        step(tid, JOB.tok[pos], pos, pos == pn - 1, &gs, &cs);
+        if (mtp_on && pos + 1 < pn) mtp_step(tid, JOB.tok[pos + 1], pos, E.x, 0, &gs, &cs);
+    }
+    if (mtp_on) mtp_drafts(tid, 0, pn - 1, &gs, &cs);
     if (tid == 0) {
         JOB.t_prefill = now_sec() - t0;
         memset(E.prof, 0, sizeof E.prof);
@@ -1537,6 +1639,28 @@ static void *worker(void *arg) {
         int cur = E.next_token;
         if (tid == 0) { JOB.tok[pn + n] = cur; JOB.trace_logit[n] = E.logits[cur]; }
         step(tid, cur, pn + n, 1, &gs, &cs);
+        if (mtp_on) mtp_drafts(tid, n + 1, pn + n, &gs, &cs);
+    }
+    if (mtp_on && tid == 0) {
+        /* x_{pn+j} = JOB.tok[pn+j], j < gn. Chain i predicts x_{pn+i+1..pn+i+3}. */
+        int hit[3] = {0}, tot[3] = {0};
+        for (int i = 0; i + 1 < gn; i++)
+            for (int k = 0; k < 3 && i + 1 + k < gn; k++) {
+                int ok = 1;
+                for (int j = 0; j <= k; j++) ok &= mtp_chain[i][j] == JOB.tok[pn + i + 1 + j];
+                tot[k]++; hit[k] += ok;
+            }
+        fprintf(stderr, "q38d: MTP prefix acceptance: d1 %d/%d (%.3f), d1..2 %d/%d (%.3f), d1..3 %d/%d (%.3f)\n",
+                hit[0], tot[0], (double)hit[0] / tot[0], hit[1], tot[1], (double)hit[1] / tot[1], hit[2], tot[2], (double)hit[2] / tot[2]);
+        for (int K = 1; K <= 3; K++) {
+            int p = 0, passes = 0;   /* verify pass at chain index p accepts L drafts, advances 1 + L */
+            while (p + 1 < gn) {
+                int L = 0;
+                while (L < K && p + 1 + L < gn && mtp_chain[p][L] == JOB.tok[pn + p + 1 + L]) L++;
+                passes++; p += 1 + L;
+            }
+            fprintf(stderr, "q38d: MTP k=%d drafts: %.3f tokens per verify pass\n", K, (double)(gn - 1) / passes);
+        }
     }
     if (tid == 0) JOB.t_decode = now_sec() - t0;
     return NULL;
@@ -1565,7 +1689,7 @@ int main(int argc, char **argv) {
         else { usage(argv[0]); return 2; }
     }
     if (!path || pn < 1 || gn < 1) { usage(argv[0]); return 2; }
-    E.fmt = fmt; E.arith = arith; E.max_seq = pn + gn + 1;
+    E.fmt = fmt; E.arith = arith; E.max_seq = pn + gn + 4;
     if (getenv("Q38D_OUT_KCH")) out_kch = atoi(getenv("Q38D_OUT_KCH"));
     if (getenv("Q38D_Q6K_EXPAND")) q6k_expand = atoi(getenv("Q38D_Q6K_EXPAND"));
     if (getenv("Q38D_ASM")) q38d_asm_variant = atoi(getenv("Q38D_ASM"));
@@ -1580,10 +1704,11 @@ int main(int argc, char **argv) {
     if (write_image && !q38_lowbit_model_save_image(LB, write_image)) { fprintf(stderr, "q38d: image write failed\n"); return 1; }
     bpe_vocab *vocab = bpe_vocab_load(G);
     if (!vocab) return 1;
+    if (getenv("Q38D_MTP")) mtp_on = atoi(getenv("Q38D_MTP")) != 0;
     if (getenv("Q38D_SSM_PERM")) ssm_perm = atoi(getenv("Q38D_SSM_PERM"));
     if (getenv("Q38D_CONV_LOCAL") && !atoi(getenv("Q38D_CONV_LOCAL"))) ssm_perm = 0;
     load_engine();
-    for (int l = 0; l < NLAYER; l++) {
+    for (int l = 0; l < NLAYER + mtp_on; l++) {
         const q38d_layer *L = &E.L[l];
         if (L->ssm) continue;
         for (int c = 0; c <= 4; c++)
@@ -1608,6 +1733,14 @@ int main(int argc, char **argv) {
     for (int l = 0; l < NLAYER; l++) {
         E.conv_state[l] = calloc((size_t)4 * QKVD, sizeof(float));
     }
+    if (mtp_on) {
+        mtp_chain = calloc((size_t)gn + 2, sizeof(*mtp_chain));
+        E.mtp_in = aligned_alloc(256, 2 * EMBD * 4);
+        E.x_mtp = aligned_alloc(256, EMBD * 4);
+        E.h_mtp = aligned_alloc(256, EMBD * 4);
+        E.act_mtp = (q38d_act){2 * EMBD, arith, aligned_alloc(256, q38d_act_qbytes(2 * EMBD, Q38D_A16)),
+                               aligned_alloc(256, 2 * EMBD / 16 * 4), aligned_alloc(256, 2 * EMBD / 16 * 4), E.mtp_in};
+    }
     if (getenv("Q38D_PLAN")) use_plan = atoi(getenv("Q38D_PLAN"));
     if (getenv("Q38D_SSM_PF")) ssm_pf = atoi(getenv("Q38D_SSM_PF"));
     if (getenv("Q38D_PF_BYTES")) pf_bytes = (size_t)atoi(getenv("Q38D_PF_BYTES"));
@@ -1627,8 +1760,8 @@ int main(int argc, char **argv) {
     if (getenv("Q38D_COST_Q6K")) cost_q6k = atof(getenv("Q38D_COST_Q6K"));
     if (getenv("Q38D_COST_Q8K")) cost_q8k = atof(getenv("Q38D_COST_Q8K"));
     plan_ssm = calloc(NLAYER, sizeof(q38d_plan));
-    plan_att = calloc(NLAYER, sizeof(q38d_plan));
-    for (int l = 0; l < NLAYER; l++) {
+    plan_att = calloc(NLAYER + 1, sizeof(q38d_plan));
+    for (int l = 0; l < NLAYER + mtp_on; l++) {
         q38d_layer *L = &E.L[l];
         if (L->ssm) {
             q38d_plan *P = &plan_ssm[l];

@@ -145,11 +145,17 @@ Target: 1.5-2x tok/s with speculative decoding while keeping A16
 exactness. Findings so far (single core, `bench_multi.c`, generator
 `gen/gen_n4.py` -> `q38d_kern_n4.S`):
 
-- Drafters. Prompt lookup (n-gram, `tmp/q38-fast/ngram_sim.py` over the
-  256 generated IDs) accepts too little: 1.08-1.11 tokens per verify pass
-  for k = 1..8. The NVFP4 GGUF contains the NextN/MTP layer `blk.64`
-  (eh_proj Q4_K 10240->5120, full attention layer, NVFP4 FFN, shared head),
-  so an MTP drafter is available; its acceptance rate is not yet measured.
+- Drafters. Prompt lookup (n-gram, `ngram_sim.py` over the 256 generated
+  IDs) accepts too little: 1.08-1.11 tokens per verify pass for k = 1..8.
+  The NVFP4 GGUF contains the NextN/MTP layer `blk.64` (eh_proj Q4_K
+  10240->5120, full attention layer with its own KV cache, NVFP4 FFN, shared
+  head). `Q38D_MTP=1` runs it as a measurement-only drafter after every
+  token: input [enorm(emb(x_{p+1})); hnorm(h_p)] -> eh_proj -> layer 64 at
+  position p -> shared_head_norm -> head predicts x_{p+2}; chained drafts
+  feed the drafter's own output hidden. FP4 A16, 1024+256 (main tokens
+  still 256/256): depth-1 acceptance 223/255 = 0.875, first two 0.693,
+  first three 0.486; tokens per verify pass 1.875 (k = 1), 2.60 (k = 2),
+  3.07 (k = 3).
 - A64FX throughput model that fits every kernel measured here: about two
   vector-register-writing instructions retire per cycle (loads, SDOT, TBL,
   FP; a fused MOVPRFX is free). KERNEL7 (N = 1) has ~36 writes per pair
@@ -176,10 +182,14 @@ exactness. Findings so far (single core, `bench_multi.c`, generator
   without saving bytes: a 4-token pass costs ~2.6x a 1-token pass in the
   projections (~20 of 25.7 ms), plus per-token SSM/attention cores, norms
   and head. Estimated: ~1.7x at 100% acceptance of 3 drafts; with
-  realistic MTP acceptance (~2.5 tokens per pass for 3 drafts, ~1.85 for
-  1) ~1.0-1.1x. The 1.5-2x target needs a verification kernel near
-  ~6 cycles per pair-token (not reachable with A16 SDOT on A64FX in this
-  layout) or acceptance well above 0.9 per drafted token.
+  the measured MTP acceptance (3.07 tokens per pass for k = 3) and the
+  best measured kernel (12.2 cycles, a 4-token pass ~2.6x a 1-token pass in
+  the projections): ~60 ms per pass + ~6 ms of drafting with the full
+  Q8K head -> ~21.5 ms/token, ~1.2x; ~1.27x with a cheap draft head. A
+  kernel at the model limit (~9.5 cycles) would give ~1.55x. So 1.5x needs
+  (a) the verification kernel within ~5% of the model, (b) a cheap draft
+  head (vocabulary subset), and (c) batched SSM (chunked delta rule),
+  multi-query attention and a 4-token head with little overhead.
 
 ## Next steps (in order)
 
