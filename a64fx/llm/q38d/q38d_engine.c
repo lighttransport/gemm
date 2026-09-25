@@ -2621,6 +2621,20 @@ static void *worker(void *arg) {
         }
         gbarrier(tid, &gs);
     }
+    if (getenv("Q38D_TP_ARBENCH") && tp_n > 1) {
+        /* back-to-back slice collectives (no compute skew): pure latency */
+        int n = atoi(getenv("Q38D_TP_ARBENCH")), sl = EMBD / tp_nsl;
+        gbarrier(tid, &gs);
+        if (tid % PER == 0 && tid / PER < tp_nsl) {
+            int k = tid / PER;
+            for (int i = 0; i < 100; i++) q38d_tp_sum_add_slice(k, E.xpart + k * sl, E.x + k * sl, sl);
+            uint64_t t0 = ticks();
+            for (int i = 0; i < n; i++) q38d_tp_sum_add_slice(k, E.xpart + k * sl, E.x + k * sl, sl);
+            fprintf(stderr, "q38d: TP%d slice %d collective %.2f us\n", tp_n, k, (ticks() - t0) / tick_hz() * 1e6 / n);
+        }
+        gbarrier(tid, &gs);
+        return NULL;
+    }
     if (getenv("Q38D_BENCH_BAR")) {
         int n = atoi(getenv("Q38D_BENCH_BAR"));
         gbarrier(tid, &gs);

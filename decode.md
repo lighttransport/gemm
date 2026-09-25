@@ -176,7 +176,14 @@ tok/s), all 256/256 equal to the F32 reference:
 | --- | ---: | ---: | ---: |
 | TP1 | 35.8 | 27.9 | 1.00x |
 | TP2 | 57.5 | 17.4 | 1.61x |
-| TP4 | 85.2 | 11.7 | 2.38x |
+| TP4 | 85.6 | 11.7 | 2.39x |
+
+Collective latency without compute skew (`Q38D_TP_ARBENCH=N`, back-to-back
+slice collectives): TP4 ~9-10 us per 5 KB slice (two rounds), TP2 ~5 us
+(one round), one 20 KB collective 18.4 us; ~4.5 us fixed per round. In the
+engine skew adds ~3 us. Completion by remote MRQ notice (`Q38D_TP_MRQ=1`,
+default) instead of a STRONG_ORDER trailer Put saves ~0.7 us per TP4
+collective and gives bitwise the same results.
 
 Where TP4 loses against linear (per layer ~180 us): two collectives
 (~13 us each, recursive doubling; a one-round all-to-all was slower),

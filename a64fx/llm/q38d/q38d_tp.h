@@ -177,6 +177,54 @@ static void q38d_ar_put(q38d_ar *a, int peer, utofu_stadd_t src, utofu_stadd_t d
  * visible before earlier payload bytes of the same Put (measured: ranks then
  * sum partly landed payloads; tokens diverged). Payload and trailer travel in
  * separate Puts, the trailer with STRONG_ORDER. */
+/* Completion by remote MRQ notice (no trailer Put): the receiver's notice for
+ * a Put is raised once the whole Put has landed. Notices are tagged with
+ * edata = parity*2 + step; early ones (a faster partner's next step) are
+ * counted until consumed. */
+static int tp_ar_mrq = 1;   /* Q38D_TP_MRQ */
+static int ar_pend[Q38D_TP_NSL][2][2];
+static void q38d_ar_sum_mrq(q38d_ar *a, int k, float *buf) {
+    uint64_t tok = ++a->seq;
+    int gen = (int)(tok & 1), n = a->count;
+    size_t pb = (size_t)n * sizeof(float);
+    void *cb;
+    int rc;
+    for (int st = 0; st < a->nr; st++) {
+        int partner = tp_r ^ (1 << st);
+        char *sb = a->reg + q38d_ar_send_off(a, gen, st);
+        memcpy(sb, buf, pb);
+        for (;;) {
+            rc = utofu_put(a->vcq, a->peer[partner], a->base + q38d_ar_send_off(a, gen, st),
+                           a->pbase[partner] + q38d_ar_recv_off(a, gen, st), pb, (uint64_t)(gen * 2 + st),
+                           UTOFU_ONESIDED_FLAG_TCQ_NOTICE | UTOFU_ONESIDED_FLAG_REMOTE_MRQ_NOTICE, NULL);
+            if (rc != UTOFU_ERR_BUSY) break;
+            utofu_poll_tcq(a->vcq, 0, &cb);
+        }
+        if (rc != UTOFU_SUCCESS) tp_fatal("mrq put", rc);
+        double t0 = 0;
+        unsigned long spins = 0;
+        while (!ar_pend[k][gen][st]) {
+            struct utofu_mrq_notice nt;
+            rc = utofu_poll_mrq(a->vcq, 0, &nt);
+            if (rc == UTOFU_SUCCESS) {
+                if (nt.notice_type == UTOFU_MRQ_TYPE_RMT_PUT) ar_pend[k][(nt.edata >> 1) & 1][nt.edata & 1]++;
+            } else if (rc != UTOFU_ERR_NOT_FOUND) tp_fatal("poll_mrq", rc);
+            else if ((++spins & 0xFFFFF) == 0) {
+                if (!t0) t0 = tp_ar_now();
+                else if (tp_ar_now() - t0 > 60) tp_fatal("mrq collective timeout", st);
+            }
+        }
+        ar_pend[k][gen][st]--;
+        const char *rb = a->reg + q38d_ar_recv_off(a, gen, st);
+        for (size_t o = 0; o < pb; o += 256) __asm__ __volatile__("dc civac, %0" :: "r"(rb + o) : "memory");
+        __asm__ __volatile__("dsb sy" ::: "memory");
+        const float *r = (const float *)rb;
+        const svbool_t pf = svptrue_b32();
+        for (int i = 0; i < n; i += 16) svst1_f32(pf, buf + i, svadd_f32_x(pf, svld1_f32(pf, buf + i), svld1_f32(pf, r + i)));
+        do { rc = utofu_poll_tcq(a->vcq, 0, &cb); } while (rc == UTOFU_ERR_NOT_FOUND);
+        if (rc != UTOFU_SUCCESS) tp_fatal("mrq poll_tcq", rc);
+    }
+}
 static void q38d_ar_sum(q38d_ar *a, float *buf) {
     uint64_t tok = ++a->seq;
     int gen = (int)(tok & 1), n = a->count;
@@ -250,6 +298,7 @@ static void q38d_tp_init(int n, int max_count) {
     utofu_tni_id_t tni = tnis[DEMO_TNI_INDEX];
     if (getenv("Q38D_TP_SLICES")) tp_nsl = atoi(getenv("Q38D_TP_SLICES"));
     if (getenv("Q38D_TP_AR")) tp_ar_mine = atoi(getenv("Q38D_TP_AR"));
+    if (getenv("Q38D_TP_MRQ")) tp_ar_mrq = atoi(getenv("Q38D_TP_MRQ"));
     if (getenv("Q38D_TP_A2A")) tp_a2a = atoi(getenv("Q38D_TP_A2A"));
     if (tp_nsl < 1 || tp_nsl > Q38D_TP_NSL || (size_t)tp_nsl + 1 > ntni) tp_nsl = 1;
     utofu_tni_id_t stni[Q38D_TP_NSL];
@@ -343,6 +392,7 @@ static void q38d_tp_sum_add(float *part, float *residual, int count) {
 /* slice k of the vector (called by the slice's own thread) */
 static void q38d_tp_sum_add_slice(int k, float *part, float *residual, int count) {
     if (tp_ar_mine && tp_a2a && tp_n > 2) q38d_ar_sum_a2a(&tp_ar[k], part);
+    else if (tp_ar_mine && tp_ar_mrq) q38d_ar_sum_mrq(&tp_ar[k], k, part);
     else if (tp_ar_mine) q38d_ar_sum(&tp_ar[k], part);
     else tp_allreduce_sum(&tp_sc[k], part, count);
     const svbool_t pf = svptrue_b32();
