@@ -229,7 +229,20 @@ tok/s on the same node), all 256/256 equal to the F32 reference:
 | 3 | 3.05 | **44.7** | **1.24x** |
 
 (k = 2, 3 with the decode-interleaved kernels and the FP4 drafter below:
-`Q38D_SPEC=3 Q38D_DRAFT_F4=1 Q38D_DRAFT_V=98304`.) On node c25-3104b,
+`Q38D_SPEC=3 Q38D_DRAFT_F4=1 Q38D_DRAFT_V=98304`.)
+
+Sensitivity contexts, k = 3, same node, each compared with its own F32
+reference (all 256/256):
+
+| context | non-speculative | speculative | speedup | tokens/pass |
+| --- | ---: | ---: | ---: | ---: |
+| 128+256 | 36.0 | 45.4 | 1.26x | 3.01 |
+| 1024+256 | ~36 | 44.7 | 1.24x | 3.05 |
+| 4096+256 | 33.0 | **52.6** | **1.59x** | 4.00 |
+
+At 4096 context every draft is accepted (the continuation of the repeated
+prompt is fully predictable), so the pass cost is amortized over 4 tokens;
+at 1024 the chained drafter's depth-2/3 accuracy (0.69/0.49) limits it. On node c25-3104b,
 where non-speculative decode runs at 38.8 tok/s, this corresponds to ~48
 tok/s.
 
