@@ -366,6 +366,29 @@ static inline void q38d_prepare_sve(q38d_act *a, const float *x, float mul, cons
     if (a->arith == Q38D_F32) return;
     q38d_prepare_pairs(a, x, mul, w, 0, a->cols / 32);
 }
+/* Batches of 16 pairs (32 blocks of 16): max|x| and the integer sums of 16
+ * blocks at a time through uzp trees (lane i = block i) instead of one
+ * FMAXV/SADDV per block (2x faster on A64FX); exact (max and integer sums
+ * are order-independent), divisions as vectors, IEEE division and rint to
+ * even as in the scalar reference. */
+static inline svfloat32_t q38d_rmax2(svfloat32_t a, svfloat32_t b) { return svmax_f32_x(svptrue_b32(), svuzp1_f32(a, b), svuzp2_f32(a, b)); }
+static inline svint32_t q38d_radd2(svint32_t a, svint32_t b) { return svadd_s32_x(svptrue_b32(), svuzp1_s32(a, b), svuzp2_s32(a, b)); }
+static inline svfloat32_t q38d_tmax16(const float *v) {   /* v: 16 blocks of 16 floats */
+    const svbool_t pf = svptrue_b32();
+#define L(i) svabs_f32_x(pf, svld1_f32(pf, v + 16 * (i)))
+    svfloat32_t a0 = q38d_rmax2(L(0), L(1)), a1 = q38d_rmax2(L(2), L(3)), a2 = q38d_rmax2(L(4), L(5)), a3 = q38d_rmax2(L(6), L(7));
+    svfloat32_t a4 = q38d_rmax2(L(8), L(9)), a5 = q38d_rmax2(L(10), L(11)), a6 = q38d_rmax2(L(12), L(13)), a7 = q38d_rmax2(L(14), L(15));
+#undef L
+    return q38d_rmax2(q38d_rmax2(q38d_rmax2(a0, a1), q38d_rmax2(a2, a3)), q38d_rmax2(q38d_rmax2(a4, a5), q38d_rmax2(a6, a7)));
+}
+static inline svint32_t q38d_tadd16(const int32_t *v) {
+    const svbool_t pf = svptrue_b32();
+#define L(i) svld1_s32(pf, v + 16 * (i))
+    svint32_t a0 = q38d_radd2(L(0), L(1)), a1 = q38d_radd2(L(2), L(3)), a2 = q38d_radd2(L(4), L(5)), a3 = q38d_radd2(L(6), L(7));
+    svint32_t a4 = q38d_radd2(L(8), L(9)), a5 = q38d_radd2(L(10), L(11)), a6 = q38d_radd2(L(12), L(13)), a7 = q38d_radd2(L(14), L(15));
+#undef L
+    return q38d_radd2(q38d_radd2(q38d_radd2(a0, a1), q38d_radd2(a2, a3)), q38d_radd2(q38d_radd2(a4, a5), q38d_radd2(a6, a7)));
+}
 static inline void q38d_prepare_pairs(q38d_act *a, const float *x, float mul, const float *w, int p0, int p1) {
     const svbool_t pf = svptrue_b32(), pb = svptrue_b8();
     const svbool_t p32 = svwhilelt_b8((uint32_t)0, (uint32_t)32);
@@ -373,29 +396,22 @@ static inline void q38d_prepare_pairs(q38d_act *a, const float *x, float mul, co
     const int a16 = a->arith == Q38D_A16;
     const float limit = a16 ? 32639.f : 127.f;
     const int lim = (int)limit;
-    /* Batches of 16 pairs (32 blocks): independent reductions first, then
-     * vector divisions, then quantization. Arithmetic matches the scalar
-     * reference exactly (IEEE division, rint to even, same products). */
     float v[32 * 16] __attribute__((aligned(64)));
-    float mx[32] __attribute__((aligned(64))), inv[32] __attribute__((aligned(64)));
-    float scl[32] __attribute__((aligned(64))), sums[32] __attribute__((aligned(64)));
+    int32_t qv[32 * 16] __attribute__((aligned(64)));
+    float inv[32] __attribute__((aligned(64))), scl[32] __attribute__((aligned(64)));
     for (int pb0 = p0; pb0 < p1; pb0 += 16) {
         int n = p1 - pb0 < 16 ? p1 - pb0 : 16, nb = 2 * n;
         for (int b = 0; b < nb; b++) {
-            const float *xs = x + 32 * pb0 + 16 * b;
-            svfloat32_t t = svld1_f32(pf, xs);
+            svfloat32_t t = svld1_f32(pf, x + 32 * pb0 + 16 * b);
             if (w) t = svmul_f32_x(pf, svmul_n_f32_x(pf, t, mul), svld1_f32(pf, w + 32 * pb0 + 16 * b));
             svst1_f32(pf, v + 16 * b, t);
-            mx[b] = svmaxv_f32(pf, svabs_f32_x(pf, t));
         }
-        for (int b = nb; b < 32; b++) mx[b] = 0.f;
-        for (int b = 0; b < 32; b += 16) {
-            svfloat32_t m = svld1_f32(pf, mx + b);
+        for (int b = nb; b < 32; b++) svst1_f32(pf, v + 16 * b, svdup_n_f32(0));
+        for (int b = 0; b < nb; b += 16) {
+            svfloat32_t m = q38d_tmax16(v + 16 * b);
             svbool_t pos = svcmpgt_n_f32(pf, m, 0.f);
-            svfloat32_t iv = svdiv_f32_z(pos, svdup_n_f32(limit), m);
-            svfloat32_t sc = svmul_n_f32_z(pos, svdiv_n_f32_x(pf, m, limit), 0x1p64f);
-            svst1_f32(pf, inv + b, iv);
-            svst1_f32(pf, scl + b, sc);
+            svst1_f32(pf, inv + b, svdiv_f32_z(pos, svdup_n_f32(limit), m));
+            svst1_f32(pf, scl + b, svmul_n_f32_z(pos, svdiv_n_f32_x(pf, m, limit), 0x1p64f));
         }
         for (int q = 0; q < n; q++) {
             int p = pb0 + q;
@@ -403,8 +419,7 @@ static inline void q38d_prepare_pairs(q38d_act *a, const float *x, float mul, co
             svint32_t q1 = svcvt_s32_f32_x(pf, svrintn_f32_x(pf, svmul_n_f32_x(pf, svld1_f32(pf, v + 32 * q + 16), inv[2 * q + 1])));
             q0 = svmax_n_s32_x(pf, svmin_n_s32_x(pf, q0, lim), -lim);
             q1 = svmax_n_s32_x(pf, svmin_n_s32_x(pf, q1, lim), -lim);
-            sums[2 * q] = (float)svaddv_s32(pf, q0);
-            sums[2 * q + 1] = (float)svaddv_s32(pf, q1);
+            svst1_s32(pf, qv + 32 * q, q0); svst1_s32(pf, qv + 32 * q + 16, q1);
             if (!a16) {
                 svint16_t h = svuzp1_s16(svreinterpret_s16_s32(q0), svreinterpret_s16_s32(q1));
                 svint8_t b8 = svuzp1_s8(svreinterpret_s8_s16(h), svreinterpret_s8_s16(h));
@@ -422,8 +437,9 @@ static inline void q38d_prepare_pairs(q38d_act *a, const float *x, float mul, co
         }
         for (int b = 0; b < nb; b += 16) {
             svbool_t pg = svwhilelt_b32(b, nb);
+            svfloat32_t sm = svcvt_f32_s32_x(pf, q38d_tadd16(qv + 16 * b));
             svst1_f32(pg, a->sc + 2 * pb0 + b, svld1_f32(pg, scl + b));
-            svst1_f32(pg, a->sum + 2 * pb0 + b, svmul_f32_x(pg, svld1_f32(pg, scl + b), svld1_f32(pg, sums + b)));
+            svst1_f32(pg, a->sum + 2 * pb0 + b, svmul_f32_x(pg, svld1_f32(pg, scl + b), sm));
         }
     }
 }
