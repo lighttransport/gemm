@@ -81,6 +81,14 @@ static int mm_blaslt_run_bf16(void *y, const void *w, const void *x,
                               int M, int N, int K, void *stream) {
     (void)y;(void)w;(void)x;(void)M;(void)N;(void)K;(void)stream; return -1;
 }
+static int mm_blaslt_run_f32(void *y, const void *w, const void *x,
+                             int M, int N, int K, void *stream) {
+    (void)y;(void)w;(void)x;(void)M;(void)N;(void)K;(void)stream; return -1;
+}
+static int mm_blaslt_run_f16(void *y, const void *w, const void *x,
+                             int M, int N, int K, void *stream) {
+    (void)y;(void)w;(void)x;(void)M;(void)N;(void)K;(void)stream; return -1;
+}
 static void mm_blaslt_destroy(void) {}
 #define LLM_HIPBLASLT_ENABLED 1   /* compile the batched path unconditionally */
 #endif
