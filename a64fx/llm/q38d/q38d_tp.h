@@ -173,6 +173,10 @@ static void q38d_ar_put(q38d_ar *a, int peer, utofu_stadd_t src, utofu_stadd_t d
     }
     if (rc != UTOFU_SUCCESS) tp_fatal("slice utofu_put", rc);
 }
+/* A single Put carrying payload + trailer is NOT safe: the trailer can become
+ * visible before earlier payload bytes of the same Put (measured: ranks then
+ * sum partly landed payloads; tokens diverged). Payload and trailer travel in
+ * separate Puts, the trailer with STRONG_ORDER. */
 static void q38d_ar_sum(q38d_ar *a, float *buf) {
     uint64_t tok = ++a->seq;
     int gen = (int)(tok & 1), n = a->count;

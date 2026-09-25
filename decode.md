@@ -139,6 +139,53 @@ not drop, because the lanes that finish early give bandwidth to the others;
 hardware barrier (2.2 us, ~0.1
 ms/token; would need dynamic libhwb).
 
+## Tensor parallelism over 2 and 4 nodes (`Q38D_TP`)
+
+One MPI-free process per node (placed by `mpiexec -n N`; rank from the
+node's uTofu coordinates in `tofu_topo.txt`, written by
+`a64fx/utofu-tests/tofu_topo_helper` in the same allocation). Build natively
+on a compute node: `fcc -Nclang ... -DQ38D_TP ... -ltofucom`.
+
+- Megatron split, cut from the image tile format before repack: SSM key
+  groups (16/tp per rank, CMG-aligned as in the single-node layout) and
+  their value heads for qkv/z/alpha/beta; attention KV heads (4/tp) and
+  their q heads; FFN gate/up rows (17408/tp); vocabulary (248320/tp).
+  Row-parallel: SSM out-proj (the rank's heads' 128-column blocks),
+  attention o, FFN down. 129 collectives per token.
+- Collectives in four slices: lane 0 of CMG k sums slice k (the 1280 rows
+  CMG k produced, so a CMG barrier suffices) over its own VCQ/TNI with
+  recursive doubling; the payload Put is followed by a STRONG_ORDER trailer
+  Put, slots alternate with the collective's parity, and the payload lines
+  are invalidated after the trailer. A single Put carrying payload and
+  trailer is not safe (trailer visible before payload: ranks summed partly
+  landed data and tokens diverged; this also affects the contiguous path of
+  `tp_allreduce.h`). Every rank and every run is bitwise identical
+  (`Q38D_TP_CHECK=1` prints a per-token residual hash).
+- Attention: the rank's KV head runs on the whole CMG group (global
+  barriers inside when the group spans CMGs).
+- Launch hygiene: an 8 s settle before resolving peers (a previous launch's
+  registrations can answer queries with dead addresses), barrier timeouts.
+- `cmg_alloc` keeps a touched 128 KiB tail: kernel prefetches beyond the end
+  of a freshly mapped shard hit never-touched pages, which made the last
+  worker of every shard ~20% slower (TP4 80.9 -> 84.9 tok/s).
+
+FP4 1024+256, 4-node job 51912552 (node e27-5008c runs TP1 at 35.5-35.8
+tok/s), all 256/256 equal to the F32 reference:
+
+| config | tok/s | ms/token | speedup |
+| --- | ---: | ---: | ---: |
+| TP1 | 35.8 | 27.9 | 1.00x |
+| TP2 | 57.5 | 17.4 | 1.61x |
+| TP4 | 85.2 | 11.7 | 2.38x |
+
+Where TP4 loses against linear (per layer ~180 us): two collectives
+(~13 us each, recursive doubling; a one-round all-to-all was slower),
+3-4 global barriers (~3.5 us), two norms, SSM/attention cores that do not
+shrink (12 of 48 workers busy in the SSM core; a key-row split of each
+head over its CMG workers was slower), and smaller per-worker streams.
+Tried without gain: `TP_AR_ROBUST`/poll settings, larger pre-barrier
+prefetch (slower), one-put collective (incorrect).
+
 ## Speculative decoding (FP4): verification-kernel study
 
 Target: 1.5-2x tok/s with speculative decoding while keeping A16
