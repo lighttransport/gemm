@@ -62,6 +62,13 @@ libq21_fast_int8.so: fast_int8_plugin.cu $(PLUGIN_ARCH_STAMP) | verify-exact-sou
 SAGE_SOURCE ?= ../../tmp/sageattention-src
 SAGE_COMMIT := d1a57a546c3d395b1ffcbeecc66d81db76f3b4b5
 
+# Present checkouts are up to date; a missing one explains how to fetch it.
+$(SAGE_SOURCE)/csrc/fused/fused.cu:
+	@echo "SageAttention source not found at $(abspath $(SAGE_SOURCE)). Fetch the pinned commit:" >&2
+	@echo "  git clone https://github.com/thu-ml/SageAttention $(abspath $(SAGE_SOURCE))" >&2
+	@echo "  git -C $(abspath $(SAGE_SOURCE)) checkout $(SAGE_COMMIT)" >&2
+	@exit 1
+
 $(SAGE_SOURCE)/csrc/fused/fused_kernels.cuh: $(SAGE_SOURCE)/csrc/fused/fused.cu
 	@test "$$(git -C $(SAGE_SOURCE) rev-parse HEAD)" = "$(SAGE_COMMIT)" || \
 		{ echo "SageAttention source must be at $(SAGE_COMMIT)"; exit 1; }
