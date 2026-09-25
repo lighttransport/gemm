@@ -11,6 +11,12 @@
  *   cc -O2 -mavx2 -mfma -I../../common -I.. -o test_cuda_qimg test_cuda_qimg.c ../cuew.c -lm -ldl -lpthread
  */
 
+/* transformer.h's NUMA thread binding uses cpu_set_t/CPU_SET from <sched.h>,
+ * which glibc exposes only with _GNU_SOURCE set before the first header. */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
 #endif
@@ -102,13 +108,12 @@ static int test_kernel_split_selector(void) {
     fail |= (qimg_f32_split_apply_tensor_attn_priority("auto", 256, 1) != 0);
     fail |= (qimg_f32_split_apply_tensor_attn_priority("auto", 256, 0) != 256);
     fail |= (qimg_f32_split_apply_tensor_attn_priority("256", 256, 1) != 256);
-    fail |= (qimg_bf16_split_kv_from_env(NULL, 4608) != 0);
-    fail |= (qimg_bf16_split_kv_from_env("0", 4608) != 0);
-    fail |= (qimg_bf16_split_kv_from_env("1", 4608) != 1024);
-    fail |= (qimg_bf16_split_kv_from_env("512", 4608) != 512);
-    fail |= (qimg_bf16_split_kv_from_env("auto", 2048) != 0);
-    fail |= (qimg_bf16_split_kv_from_env("auto", 4608) != 0);
-    fail |= (qimg_bf16_split_kv_from_env("garbage", 4608) != 0);
+    fail |= (qimg_bf16_split_kv_from_env(NULL) != 0);
+    fail |= (qimg_bf16_split_kv_from_env("0") != 0);
+    fail |= (qimg_bf16_split_kv_from_env("1") != 1024);
+    fail |= (qimg_bf16_split_kv_from_env("512") != 512);
+    fail |= (qimg_bf16_split_kv_from_env("auto") != 0);
+    fail |= (qimg_bf16_split_kv_from_env("garbage") != 0);
     if (fail) {
         fprintf(stderr, "FAIL\n");
         return 1;
