@@ -185,6 +185,17 @@ engine skew adds ~3 us. Completion by remote MRQ notice (`Q38D_TP_MRQ=1`,
 default) instead of a STRONG_ORDER trailer Put saves ~0.7 us per TP4
 collective and gives bitwise the same results.
 
+Ceiling of hiding the collectives (`Q38D_TP_NOCOMM=1`: each rank only adds
+its own partial - wrong output, valid timing): TP4 92.0 tok/s (10.9
+ms/token) vs 85.6 with real collectives. Perfect comm/compute overlap is
+therefore worth at most ~7%; near-linear TP4 (~7 ms/token) needs the
+intra-node per-phase costs cut. Per stage, TP4 without comm vs TP1/4
+(ms/token): ssm_in 1.52 vs 1.03, ssm_core 0.81 vs 0.26 (12 of 48 workers
+busy), ssm_out 1.00 vs 0.44, attn_in 0.65 vs 0.37, attn_core 0.65 vs 0.17,
+attn_out 0.33 vs 0.14, gate/up 3.36 vs 2.55, down 2.05 vs 1.45: about
+8-13 us of fixed cost per phase (norm + CMG barrier, global barrier, cold
+stream start, imbalance) that does not shrink with TP.
+
 Where TP4 loses against linear (per layer ~180 us): two collectives
 (~13 us each, recursive doubling; a one-round all-to-all was slower),
 3-4 global barriers (~3.5 us), two norms, SSM/attention cores that do not

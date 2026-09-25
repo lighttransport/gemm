@@ -1650,7 +1650,7 @@ static void phase_end_c(int tid, int *cs, uint64_t *t, int phase) {
  * folds every rank's partial into the residual (the following phase barrier
  * releases the others); norms then take the sum of squares directly. */
 static double tp_comm_t;
-static int tp_check, tp_check_n;
+static int tp_check, tp_check_n, tp_nocomm;
 static int tp_cmg_slices = 1;   /* slice k = the rows of CMG k: CMG barrier suffices */
 static void tp_reduce(int tid, int *gs) {
     if (tp_cmg_slices && tp_nsl == NCMG) cbarrier(tid, norm_csense[tid]);
@@ -1659,7 +1659,8 @@ static void tp_reduce(int tid, int *gs) {
     if (tid % PER == 0 && k < tp_nsl) {
         uint64_t a = tid ? 0 : ticks();
         int n = EMBD / tp_nsl;
-        if (tp_nsl > 1) q38d_tp_sum_add_slice(k, E.xpart + k * n, E.x + k * n, n);
+        if (tp_nocomm) { for (int i = 0; i < n; i++) E.x[k * n + i] += E.xpart[k * n + i]; }   /* timing experiment only */
+        else if (tp_nsl > 1) q38d_tp_sum_add_slice(k, E.xpart + k * n, E.x + k * n, n);
         else q38d_tp_sum_add(E.xpart, E.x, EMBD);
         tp_ssq[k] = sumsq(E.x + k * n, n);
         if (!tid) tp_comm_t += (double)(ticks() - a);
@@ -2835,6 +2836,7 @@ int main(int argc, char **argv) {
     if (getenv("Q38D_DOWN_A8")) down_a8 = atoi(getenv("Q38D_DOWN_A8"));
     if (getenv("Q38D_G2")) g2_variant = atoi(getenv("Q38D_G2"));
     if (getenv("Q38D_FFN_REV")) ffn_rev = atoi(getenv("Q38D_FFN_REV"));
+    if (getenv("Q38D_TP_NOCOMM")) tp_nocomm = atoi(getenv("Q38D_TP_NOCOMM"));
     if (getenv("Q38D_TP_CHECK")) tp_check = atoi(getenv("Q38D_TP_CHECK"));
     if (getenv("Q38D_TP_CMGSL")) tp_cmg_slices = atoi(getenv("Q38D_TP_CMGSL"));
     if (getenv("Q38D_SSM_SPLIT")) ssm_split = atoi(getenv("Q38D_SSM_SPLIT"));
