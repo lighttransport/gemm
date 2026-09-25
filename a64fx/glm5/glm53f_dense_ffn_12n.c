@@ -34,9 +34,11 @@ static void rd(glm53f_st_context*s,const char*n,size_t o,void*p,size_t z,int r){
 static void rd_cols(glm53f_st_context*s,const char*n,uint8_t*p,int rows,int cols,int c0,int cn,int rank){(void)rows;if(glm53f_st_read_columns(s,n,(size_t)cols,(size_t)c0,(size_t)cn,p)){fprintf(stderr,"rank=%d read columns %s failed\n",rank,n);MPI_Abort(MPI_COMM_WORLD,2);}}
 static void rd_scale_cols(glm53f_st_context*s,const char*n,float*p,int rows,int cols,int c0,int cn,int rank){(void)rows;if(glm53f_st_read_columns(s,n,(size_t)cols*sizeof(float),(size_t)c0*sizeof(float),(size_t)cn*sizeof(float),p)){fprintf(stderr,"rank=%d read scale columns %s failed\n",rank,n);MPI_Abort(MPI_COMM_WORLD,2);}}
 static inline float dot(const uint8_t*w,const float*s,const float*x,int n){if(glm53f_dense_scalar_reference)return glm53f_dot_fp8_block128(w,s,x,n);svfloat32_t a=svdup_f32(0);int vl=(int)svcntw();for(int b=0;b<n;b+=B){for(int i=b;i<b+B;i+=vl){svbool_t p=svwhilelt_b32(i,b+B);a=svmla_x(p,a,glm53f_fp8_e4m3_bits(p,w,i),svmul_n_f32_x(p,svld1(p,x+i),s[b/B]));}}return svaddv_f32(svptrue_b32(),a);}
+#ifndef GLM53F_DENSE_NO_MAIN
 static void mv(float*y,const uint8_t*w,const float*s,const float*x,int rows,int cols){int nb=cols/B;
 #pragma omp parallel for schedule(static)
     for(int r=0;r<rows;r++)y[r]=dot(w+(size_t)r*cols,s+(size_t)(r/B)*nb,x,cols);}
+#endif
 struct glm53f_dense_ffn_context_12n{int rank,i0,in,lb,hb;uint8_t*g,*u,*d;float*gs,*us,*ds,*gv,*uv,*act,*part,*bgv,*buv,*bact,*bpart;int q2,gtype,utype,dtype;};
 
 typedef struct { uint64_t offset; int type, rows, columns; } q2_dense_entry;

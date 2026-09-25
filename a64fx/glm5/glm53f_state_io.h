@@ -60,9 +60,17 @@ static inline int glm53f_state_io_floats(glm53f_state_io *io, const void *data,
         size_t n = bytes < sizeof(io->buffer) ? bytes : sizeof(io->buffer);
         if (fread(io->buffer, 1, n, io->file) != n) { io->failed = 1; return -1; }
         for (size_t i = 0; i < n; i += sizeof(float)) {
+            /* isfinite can be optimized away by the runner's fast-math
+             * build. Inspect IEEE-754 exponent bits before doing arithmetic. */
+            uint32_t a_bits, b_bits;
+            memcpy(&a_bits, p + i, sizeof(a_bits));
+            memcpy(&b_bits, io->buffer + i, sizeof(b_bits));
+            if ((a_bits & UINT32_C(0x7f800000)) == UINT32_C(0x7f800000) ||
+                (b_bits & UINT32_C(0x7f800000)) == UINT32_C(0x7f800000)) {
+                io->failed = 1; return -1;
+            }
             float a, b;
             memcpy(&a, p + i, sizeof(a)); memcpy(&b, io->buffer + i, sizeof(b));
-            if (!isfinite(a) || !isfinite(b)) { io->failed = 1; return -1; }
             double d = (double)a - b;
             error += d * d; norm += (double)b * b;
             if (fabs(d) > maximum) maximum = fabs(d);

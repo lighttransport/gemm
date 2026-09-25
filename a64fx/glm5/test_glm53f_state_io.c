@@ -18,9 +18,12 @@ int main(int argc, char **argv) {
     const float near[]={1.0001f,-1,.5f,0};
     const float far[]={2,-1,.5f,0};
     const float nan[]={NAN,-1,.5f,0};
+    const float inf[]={INFINITY,-1,.5f,0};
+    const float ninf[]={-INFINITY,-1,.5f,0};
+    const float *cases[]={ref,near,far,nan,inf,ninf};
     for (int mode=1; mode<=2; ++mode)
-        for (int value=0; value<4; ++value) {
-            const float *data=value==0?ref:value==1?near:value==2?far:nan;
+        for (int value=0; value<6; ++value) {
+            const float *data=cases[value];
             rewind(f); io.offset=io.flushed=0; io.failed=0; io.compare=mode;
             int rc=glm53f_state_io_floats(&io,data,sizeof(ref),"float");
             int expected=value==0 || (mode==2 && value==1);
@@ -31,6 +34,13 @@ int main(int argc, char **argv) {
     failed |= glm53f_state_io_floats(&io,near,sizeof(ref),"near");
     int wrong=38;
     failed |= glm53f_state_io_bytes(&io,&wrong,sizeof(wrong),"wrong_meta") == 0;
+    /* Nonfinite reference values must fail too, even if their bits match. */
+    for (int value=3; value<6; ++value) {
+        rewind(f);
+        failed |= fwrite(cases[value],sizeof(ref),1,f) != 1;
+        rewind(f); io.offset=io.flushed=0; io.failed=0; io.compare=2;
+        failed |= glm53f_state_io_floats(&io,cases[value],sizeof(ref),"bad_reference") == 0;
+    }
     failed |= fclose(f) != 0;
     if (unlink(path)) failed=1;
     printf("STATE_IO typed_float_and_exact_metadata %s\n",failed?"FAIL":"PASS");

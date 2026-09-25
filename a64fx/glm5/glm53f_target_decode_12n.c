@@ -32,25 +32,6 @@ static void *a256(size_t bytes) {
     return posix_memalign(&p, 256, bytes) ? NULL : p;
 }
 
-static void target_memtrace(int rank, const char *phase) {
-    const char *dir = getenv("GLM53F_MEMTRACE_DIR");
-    char path[512], line[256];
-    FILE *in, *out;
-    long rss = -1, avail = -1;
-    if (!dir || !*dir) return;
-    in = fopen("/proc/self/status", "r");
-    while (in && fgets(line, sizeof(line), in))
-        if (sscanf(line, "VmRSS: %ld kB", &rss) == 1) break;
-    if (in) fclose(in);
-    in = fopen("/proc/meminfo", "r");
-    while (in && fgets(line, sizeof(line), in))
-        if (sscanf(line, "MemAvailable: %ld kB", &avail) == 1) break;
-    if (in) fclose(in);
-    snprintf(path, sizeof(path), "%s/rank%02d.mem", dir, rank);
-    out = fopen(path, "a");
-    if (out) { fprintf(out, "%s rss_kb=%ld mem_available_kb=%ld\n", phase, rss, avail); fclose(out); }
-}
-
 static int target_layer_trace(const float *streams, int layer) {
     const char *dir = getenv("GLM53F_LAYER_TRACE_DIR");
     static int traced_steps;
@@ -251,10 +232,8 @@ static glm53f_target_model_12n *target_model_create_with_kda(
             goto fail;
         }
     glm53f_st_close(st);
-    target_memtrace(rank, "layer_stack");
     m->embedding = glm53f_embedding_create_12n(model_dir);
     m->head = glm53f_target_head_create_12n(model_dir);
-    target_memtrace(rank, "embedding_head");
     for (int l = 0; l < LAYERS; ++l) {
         if (l % 4 == 3) m->sparse[l] = glm53f_sparse_create_format_12n(model_dir, l, capacity, latent_bf16);
         else m->kda[l] = glm53f_kda_create_12n(model_dir, l);
@@ -263,9 +242,7 @@ static glm53f_target_model_12n *target_model_create_with_kda(
             goto fail;
         }
     }
-    target_memtrace(rank, "attention");
     if (int8_kda && glm53f_target_model_convert_kda_int8_12n(m)) goto fail;
-    if (int8_kda) target_memtrace(rank, "attention_int8");
     for (int l = 0; l < 3; ++l) {
         m->dense[l] = glm53f_dense_ffn_create_12n(model_dir, l);
         if (!m->dense[l]) {
@@ -273,10 +250,7 @@ static glm53f_target_model_12n *target_model_create_with_kda(
             goto fail;
         }
     }
-    target_memtrace(rank, "dense");
-    target_memtrace(rank, "moe_before");
     m->moe = glm53f_moe_stage_create_12n(routed, shared, model_dir, 3, 42);
-    target_memtrace(rank, "moe_after");
     m->scratch = a256(sizeof(*m->scratch));
     m->streams = a256((size_t)FLAT * sizeof(float));
     m->batch_scratch = a256((size_t)PREFILL_BATCH * sizeof(*m->batch_scratch));
@@ -988,7 +962,6 @@ int main(int argc, char **argv) {
                global_load, cp_hot_prefix);
         fflush(stdout);
     }
-    target_memtrace(rank, "cache_resident");
     {
         long available_kb = target_available_kb(), minimum_kb;
         MPI_Allreduce(&available_kb, &minimum_kb, 1, MPI_LONG, MPI_MIN, MPI_COMM_WORLD);
