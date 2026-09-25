@@ -23,6 +23,9 @@
 #include "../qwen38_lowbit_model.h"
 #include "q38d_kern.h"
 #include "q38d_tp.h"
+#ifdef Q38P_MPI
+#include <mpi.h>
+#endif
 #include <errno.h>
 #include <pthread.h>
 #include <sched.h>
@@ -2967,11 +2970,18 @@ static void *worker(void *arg) {
     double t0 = 0;
     int pn = JOB.n_prompt, gn = JOB.n_gen;
     if (tid == 0) t0 = now_sec();
+#ifdef Q38P_MPI
+    if (pp_on) q38p_pipeline(tid, JOB.tok, pn, &gs);
+    else
+#endif
     if (pf_on) q38p_prefill(tid, JOB.tok, pn, &gs);
     else for (int pos = 0; pos < pn; pos++) {
         step(tid, JOB.tok[pos], pos, pos == pn - 1, &gs, &cs);
         if (mtp_on && pos + 1 < pn) mtp_step(tid, JOB.tok[pos + 1], pos, E.x, 0, &gs, &cs);
     }
+#ifdef Q38P_MPI
+    if (pp_on && (!pp_decode || pp_r != 0)) return NULL;
+#endif
     static float spec_logit0;
     if (tid == 0) spec_logit0 = E.logits[E.next_token];
     if (mtp_on) mtp_drafts(tid, 0, pn - 1, &gs, &cs);
@@ -3102,11 +3112,33 @@ int main(int argc, char **argv) {
         else { usage(argv[0]); return 2; }
     }
     if (!path || pn < 1 || gn < 1) { usage(argv[0]); return 2; }
+#ifndef Q38P_MPI
+    if (getenv("Q38P_PP") && atoi(getenv("Q38P_PP"))) {
+        fprintf(stderr, "q38p: rebuild with -DQ38P_MPI for pipeline mode\n");
+        return 2;
+    }
+#endif
+#ifdef Q38P_MPI
+    if (getenv("Q38P_PP") && atoi(getenv("Q38P_PP"))) {
+        int provided;
+        MPI_Init_thread(&argc, &argv, MPI_THREAD_FUNNELED, &provided);
+        if (provided < MPI_THREAD_FUNNELED) { fprintf(stderr, "q38p: MPI_THREAD_FUNNELED unavailable\n"); return 2; }
+        MPI_Comm_size(MPI_COMM_WORLD, &pp_n);
+        MPI_Comm_rank(MPI_COMM_WORLD, &pp_r);
+        pp_on = 1;
+        pp_prompts = getenv("Q38P_PP_PROMPTS") ? atoi(getenv("Q38P_PP_PROMPTS")) : 1;
+        pp_decode = getenv("Q38P_PP_DECODE") ? atoi(getenv("Q38P_PP_DECODE")) : 0;
+        if (pp_n < 2 || pp_n > 12 || pp_prompts < 1) { fprintf(stderr, "q38p: invalid pipeline nodes/prompts\n"); return 2; }
+        if (fmt != Q38D_F4 || arith != Q38D_A16) { fprintf(stderr, "q38p: pipeline requires --fmt fp4 --act a16\n"); return 2; }
+        pf_on = 1;
+    }
+#endif
     E.fmt = fmt; E.arith = arith; E.max_seq = pn + gn + 8;
     {
         /* tensor parallelism: one process per node, Q38D_TP ranks */
         int tpn = getenv("Q38D_TP") ? atoi(getenv("Q38D_TP")) : 1;
         if (tpn != 1 && tpn != 2 && tpn != 4) { fprintf(stderr, "q38d: Q38D_TP must be 1, 2 or 4\n"); return 2; }
+        if (pp_on && tpn != 1) { fprintf(stderr, "q38p: pipeline and tensor parallel modes cannot be combined\n"); return 2; }
         pin_cpu(12);
         q38d_tp_init(tpn, EMBD);
     }
@@ -3138,6 +3170,9 @@ int main(int argc, char **argv) {
     if (getenv("Q38D_TP_FLAGREL")) tp_flagrel = atoi(getenv("Q38D_TP_FLAGREL"));
     if (getenv("Q38D_TP_PNORM")) tp_pnorm = atoi(getenv("Q38D_TP_PNORM"));
     if (getenv("Q38P")) pf_on = atoi(getenv("Q38P"));
+#ifdef Q38P_MPI
+    if (pp_on) pf_on = 1;
+#endif
     if (getenv("Q38P_CHUNK")) pf_chunk = atoi(getenv("Q38P_CHUNK"));
     if (getenv("Q38P_TEST")) pf_test = atoi(getenv("Q38P_TEST"));
     if (getenv("Q38P_TAIL")) pf_tail_split = atoi(getenv("Q38P_TAIL"));
@@ -3165,6 +3200,12 @@ int main(int argc, char **argv) {
     if (getenv("Q38D_SSM_PERM")) ssm_perm = atoi(getenv("Q38D_SSM_PERM"));
     if (getenv("Q38D_CONV_LOCAL") && !atoi(getenv("Q38D_CONV_LOCAL"))) ssm_perm = 0;
     load_engine();
+#ifdef Q38P_MPI
+    if (pp_on) {
+        pf_stage_bounds(pp_n, pp_r, &pp_u0, &pp_u1);
+        fprintf(stderr, "q38p_pp: rank %d/%d units [%d,%d) prompts=%d\n", pp_r, pp_n, pp_u0, pp_u1, pp_prompts);
+    }
+#endif
     for (int l = 0; l < NLAYER + mtp_on; l++) {
         const q38d_layer *L = &E.L[l];
         if (L->ssm) continue;
@@ -3322,6 +3363,12 @@ int main(int argc, char **argv) {
     for (int i = 1; i < NT; i++) pthread_create(&th[i], NULL, worker, (void *)(intptr_t)i);
     worker((void *)(intptr_t)0);
     for (int i = 1; i < NT; i++) pthread_join(th[i], NULL);
+#ifdef Q38P_MPI
+    if (pp_on) {
+        MPI_Finalize();
+        if (!pp_decode || pp_r != 0 || pp_bad) return pp_bad ? 1 : 0;
+    }
+#endif
     if (tp_r != 0) return 0;
     if (tp_n > 1)
         fprintf(stderr, "q38d: TP%d rank0 collective (worker 0) ms/tok=%.3f over prefill+decode\n", tp_n,
@@ -3329,7 +3376,7 @@ int main(int argc, char **argv) {
     for (int n = 0; n < gn; n++)
         fprintf(stderr, "q38d: token n=%d pos=%d id=%d logit=%a\n", n, pn + n, JOB.tok[pn + n], JOB.trace_logit[n]);
     double hz = tick_hz();
-    if (pf_on) q38p_report(pn, JOB.t_prefill);
+    if (pf_on && !pp_on) q38p_report(pn, JOB.t_prefill);
     fprintf(stderr, "q38d: prefill %d tok %.3f s (%.3f tok/s); decode %d tok %.3f s = %.3f tok/s (%.3f ms/tok)\n",
             pn, JOB.t_prefill, pn / JOB.t_prefill, gn, JOB.t_decode, gn / JOB.t_decode, 1e3 * JOB.t_decode / gn);
     fprintf(stderr, "q38d: stages ms/tok:");

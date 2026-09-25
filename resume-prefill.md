@@ -96,6 +96,16 @@ prefill, up from 0.150 s at 1024 tokens. Logs are preserved in
 `tmp/q38p/job51917132/`. The final compiled source repeated the 1024-token
 gate at 154.5 tok/s and 256/256 agreement.
 
+**Phase 2 pipeline prototype, job 51917132:** `Q38P_MPI` adds balanced
+mixer/FFN stage cuts, MPI residual handoff, repeated independent prompts and
+an optional state gather to rank 0 for full decode validation. The verified
+8-prompt, 1024-token steady rates at chunk 160 are **275.1 tok/s on 2 nodes,
+411.3 on 3, and 544.9 on 4**. The 3-node cuts split layers at units 43 and
+85. All three configurations passed 256/256 decode against F32 after the
+state gather. On 4 nodes, single-prompt latency was 2.55 s and end-to-end
+throughput including fill/drain was 521.7 tok/s. Build/run instructions and
+the chunk sweep are in `a64fx/llm/q38p/README.md`.
+
 ## Remaining items
 
 ### Single node (toward 225 tok/s)
@@ -120,37 +130,21 @@ gate at 154.5 tok/s and 256/256 agreement.
    currently assumes an FP4 model with a Q6_K embedding).
 
 ### Multi-node (Phases 2-4)
-8. Transport:
-   - Generalize `q38d_tp.h` beyond 4 ranks (`Q38D_TP_MAXN 4`, recursive
-     doubling only for n = 2 or 4).
-   - Add a point-to-point Put plus wait API with MRQ notice for the pipeline
-     handoff (`tp_put_wait` and the MRQ code are the starting points;
-     `utofu-tests/pp_handoff_bench.c` measures 3.2 us for a 12 KB hop and
-     6.3 GB/s per link).
-9. Pipeline parallelism:
-   - Cut stages at sub-layer granularity (mixer and FFN units) into S
-     equal-cost stages for S in 1..12. Whole layers would cap 12 stages at
-     89% from imbalance.
-   - Hand off the residual stream (N x 5120 fp32 per chunk) between stages.
-   - Keep several prompts in flight (steady state); report single-prompt
-     latency too.
-10. Weights per stage: the FP4 image for its layers, plus the pre-expanded
-    int16 tiles (48.7 GB over S stages), plus the decode TP4 shard (4 GB).
-    Check that this fits in 28 GB.
-11. Prefill-to-decode handoff:
-    - Send KV (16 layers x L x 1024 x 4 B) and SSM plus conv state
-      (48 x 48 x 64 KB) from the stage nodes to the TP4 decode groups,
-      re-sharded to decode's layout (TP SSM head slots, KV blocks over CMGs).
-    - Run both engines in one process per node, alternating prefill chunks
-      with decode steps.
-12. 12-node jobs:
-    - Run the auto-resubmit wrapper with `NODES=12` and a stage hook with
-      `Q38_NODES=12`. `tmp/q38-fast/stage_hook_4n.sh` now also creates
-      `/local/q38/tmp`, which fcc needs as TMPDIR.
-    - The current wrapper (`tmp/bash-http-auto4`) is 4-node, up to 4 jobs,
-      until 2026-09-26 12:00.
-13. Document the bound, the design and the results in decode.md (or a new
-    prefill.md), and commit each unit.
+8. Run 6- and 12-node allocations. The stage partition code supports these
+   counts, but this allocation had four nodes. Report steady-state throughput
+   and single-prompt latency.
+9. Replace the working MPI handoff with uTofu Put plus MRQ completion.
+   `utofu-tests/pp_handoff_bench.c` measured 3.2 us for a 12 KB hop and
+   6.3 GB/s per link. MPI nonblocking sends without a progress thread were
+   slower here, so the prototype uses blocking sends.
+10. Stage-shard the FP4 image and pre-expand int16 tiles (48.7 GB total),
+    instead of replicating the entire FP4 image on every node. Check that
+    each stage plus its decode TP4 shard fits in about 28 GB HBM2.
+11. Replace the rank-0 single-node decode validation path with handoff to
+    co-resident TP4 decode groups. Re-shard KV, SSM state and conv history,
+    then alternate prefill chunks with decode steps on the same nodes.
+12. Generalize `q38d_tp.h` beyond four ranks for TP collectives if required;
+    the MPI pipeline itself already supports 2–12 stages.
 
 ## How to build and run (1 node)
 
@@ -183,14 +177,15 @@ Environment switches:
 
 > Continue the A64FX Qwen3.8-27B prefill work: read resume-prefill.md and the
 > plan in /home/syoyo/.claude/plans/idempotent-frolicking-bengio.md. The
-> latest verified state is the 2026-09-26 epilogue change (1 node,
-> 154.7 tok/s at chunk 480, 256/256); see the continuation section above.
+> latest verified state includes a 2–4-node MPI pipeline with 256/256
+> decode agreement. At 4 nodes and chunk 160 it sustains 544.9 tok/s across
+> eight prompts; see `a64fx/llm/q38p/README.md`.
 > Continue with the remaining items:
 > - single-node GEMM gap, kernel epilogue, expansion, SSM, attention and
 >   norm costs, toward 225 tok/s (90% of the 250 tok/s/node int16 bound);
-> - then the multi-node pipeline (12/6/4 nodes, steady-state throughput
->   target 2701/1351/900 tok/s) and the prefill-to-decode handoff to TP4
->   groups on the same nodes.
+> - measure the pipeline on 6 and 12 nodes (steady-state targets 1351 and
+>   2701 tok/s), then stage-shard weights and replace MPI handoff with uTofu;
+> - move the validated rank-0 decode handoff to co-resident TP4 groups.
 >
 > Keep every change 256/256 against the F32 reference and commit each unit.
 > Do not use /tmp and do not push.

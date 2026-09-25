@@ -26,8 +26,28 @@
 #define PF_STEPS (PF_KB / 4)
 void q38p_mk_r4t5(const void *W, const void *A, const double *S, double *O, long ngroups, long steps);
 
-static int pf_on, pf_chunk = 240, pf_test;
+static int pf_on, pf_chunk = 240, pf_test, pp_on;
 static int PF_N, PF_NG;   /* tokens per chunk (multiple of PF_T), groups */
+#ifdef Q38P_MPI
+static int pp_n = 1, pp_r, pp_prompts = 1, pp_u0, pp_u1, pp_bad, pp_decode;
+/* A unit is either the mixer or the FFN of a layer. Cuts may fall between
+ * them, which keeps 6- and 12-stage allocations balanced. */
+static void pf_stage_bounds(int n, int rank, int *lo, int *hi) {
+    double prefix[2 * NLAYER + 1] = {0};
+    for (int u = 0; u < 2 * NLAYER; u++)
+        prefix[u + 1] = prefix[u] + ((u & 1) ? 267.4 : (E.L[u / 2].ssm ? 115.8 : 104.9));
+    int cut[13] = {0};
+    for (int s = 1; s < n; s++) {
+        double target = prefix[2 * NLAYER] * s / n;
+        int best = cut[s - 1] + 1;
+        for (int u = best + 1; u <= 2 * NLAYER - (n - s); u++)
+            if (fabs(prefix[u] - target) < fabs(prefix[best] - target)) best = u;
+        cut[s] = best;
+    }
+    cut[n] = 2 * NLAYER;
+    *lo = cut[rank]; *hi = cut[rank + 1];
+}
+#endif
 
 /* per matrix prefill descriptor */
 typedef struct {
@@ -58,6 +78,12 @@ static struct {
     float *sc[NT];            /* per-worker attention scores */
     int ntok, pos0, ng;       /* current chunk; ng = occupied token groups */
 } PB;
+static uint64_t pf_last_hash(void) {
+    const uint8_t *p = (const uint8_t *)(PB.x + (size_t)(PB.ntok - 1) * EMBD);
+    uint64_t h = UINT64_C(1469598103934665603);
+    for (size_t i = 0; i < EMBD * sizeof(float); i++) h = (h ^ p[i]) * UINT64_C(1099511628211);
+    return h;
+}
 static _Atomic int pf_ctr[4];
 static int pf_calls[NT][16];   /* per-worker GEMM call count (identical on every worker) */
 
@@ -403,7 +429,15 @@ static void pf_init(int tid, int *gs) {
                it[n++] = (typeof(it[0])){&P->v, &L->v}; it[n++] = (typeof(it[0])){&P->o, &L->o}; }
         it[n++] = (typeof(it[0])){&P->gate, &L->gate}; it[n++] = (typeof(it[0])){&P->up, &L->up};
         it[n++] = (typeof(it[0])){&P->down, &L->down};
-        for (int i = 0; i < n; i++, item++) if (item % NT == tid) pf_mat_init(it[i].p, it[i].m);
+        for (int i = 0; i < n; i++, item++) {
+#ifdef Q38P_MPI
+            if (pp_on) {
+                int unit = 2 * l + (i >= n - 3);
+                if (unit < pp_u0 || unit >= pp_u1) continue;
+            }
+#endif
+            if (item % NT == tid) pf_mat_init(it[i].p, it[i].m);
+        }
     }
     gbarrier(tid, gs);
 }
@@ -488,118 +522,269 @@ static void pf_residual(int tid, const float *y, int *gs) {
     if (!tid) pf_t[PT_ELT] += ticks() - a;
 }
 
-static void pf_layer_run(int tid, int layer, int *gs) {
+static void pf_layer_run(int tid, int layer, int do_mixer, int do_ffn, int *gs) {
     const q38d_layer *L = &E.L[layer];
     q38p_layer *P = &PL[layer];
     const int N = PB.ntok, pos0 = PB.pos0;
-    pf_norm_quant(tid, L->attn_norm, gs);
-    if (L->ssm) {
-        pf_job j[4] = {{&P->qkv, PB.y0, QKVD}, {&P->z, PB.y1, DINNER}, {&P->alpha, PB.y2, NVH}, {&P->beta, PB.y3, NVH}};
-        pf_gemm_t(tid, j, 4, EMBD, gs);
-        uint64_t a = ticks();
-        int hh = ssm_head_of(tid);
-        if (hh >= 0)
-            for (int t = 0; t < N; t++) {
-                q38d_io io = {PB.y0 + (size_t)t * QKVD, PB.y1 + (size_t)t * DINNER, PB.y2 + (size_t)t * NVH, PB.y3 + (size_t)t * NVH,
-                              NULL, NULL, NULL, PB.o + (size_t)t * DINNER, NULL, -1};
-                ssm_head_io(layer, hh, pos0 + t, &io);
-            }
-        gbarrier(tid, gs);
-        if (!tid) pf_t[PT_SSM] += ticks() - a;
-        pf_quant_rows(tid, PB.o, DINNER, DINNER, gs);
-        pf_job jo = {&P->out, PB.y2, EMBD};
-        pf_gemm_t(tid, &jo, 1, DINNER, gs);
-        pf_residual(tid, PB.y2, gs);
-    } else {
-        pf_job j[3] = {{&P->q, PB.y0, NHEAD * 2 * HD}, {&P->k, PB.y1, NKV * HD}, {&P->v, PB.y2, NKV * HD}};
-        pf_gemm_t(tid, j, 3, EMBD, gs);
-        uint64_t a = ticks();
-        int ai = L->ai;
-        /* q/k norm + RoPE, K/V into the cache (cpk = 1: kcp[..][0] is position-major) */
-        for (int t = tid; t < N; t += NT) {
-            int pos = pos0 + t;
-            for (int hq = 0; hq < NHEAD; hq++) {
-                float *qd = PB.qh + ((size_t)t * NHEAD + hq) * HD;
-                memcpy(qd, PB.y0 + (size_t)t * NHEAD * 2 * HD + (size_t)hq * 2 * HD, HD * 4);
-                head_rmsnorm_rope(qd, L->q_norm, pos);
-            }
-            for (int c = 0; c < NKV; c++) {
-                float kv[HD];
-                memcpy(kv, PB.y1 + (size_t)t * NKV * HD + c * HD, sizeof kv);
-                head_rmsnorm_rope(kv, L->k_norm, pos);
-                memcpy(E.kcp[ai][c][0] + (size_t)pos * HD, kv, sizeof kv);
-                memcpy(E.vcp[ai][c][0] + (size_t)pos * HD, PB.y2 + (size_t)t * NKV * HD + c * HD, HD * 4);
-            }
-        }
-        gbarrier(tid, gs);
-        uint64_t b = ticks();
-        if (!tid) pf_t[PT_ATTPREP] += b - a;
-        /* causal attention: tasks (KV head, token), largest contexts first */
-        int ci = pf_calls[tid][0]++;
-        _Atomic int *ctr = &pf_ctr[ci & 3];
-        if (tid == 0) atomic_store_explicit(&pf_ctr[(ci + 2) & 3], 0, memory_order_relaxed);
-        float *sc = PB.sc[tid], *out = pf_tmp[tid];
-        const svbool_t pf = svptrue_b32();
-        for (;;) {
-            int task = atomic_fetch_add_explicit(ctr, 1, memory_order_relaxed);
-            if (task >= NKV * N) break;
-            int t = N - 1 - task / NKV, c = task % NKV, n = pos0 + t + 1;
-            const float *K = E.kcp[ai][c][0], *V = E.vcp[ai][c][0];
-            attn_scores(PB.qh + ((size_t)t * NHEAD + 6 * c) * HD, K, 0, n, sc, n, 1.0f / 16.0f);
-            float l[6];
-            for (int hh = 0; hh < 6; hh++) {
-                float *s_h = sc + (size_t)hh * n, m = -INFINITY;
-                for (int i = 0; i < n; i++) if (s_h[i] > m) m = s_h[i];
-                svfloat32_t lsv = svdup_n_f32(0);
-                for (int i = 0; i < n; i += 16) {
-                    svbool_t pg = svwhilelt_b32(i, n);
-                    svfloat32_t e = q38d_exp_sve(pg, svsub_n_f32_x(pg, svld1_f32(pg, s_h + i), m));
-                    svst1_f32(pg, s_h + i, e);
-                    lsv = svadd_f32_m(pg, lsv, e);
+    if (do_mixer) {
+        pf_norm_quant(tid, L->attn_norm, gs);
+        if (L->ssm) {
+            pf_job j[4] = {{&P->qkv, PB.y0, QKVD}, {&P->z, PB.y1, DINNER}, {&P->alpha, PB.y2, NVH}, {&P->beta, PB.y3, NVH}};
+            pf_gemm_t(tid, j, 4, EMBD, gs);
+            uint64_t a = ticks();
+            int hh = ssm_head_of(tid);
+            if (hh >= 0)
+                for (int t = 0; t < N; t++) {
+                    q38d_io io = {PB.y0 + (size_t)t * QKVD, PB.y1 + (size_t)t * DINNER, PB.y2 + (size_t)t * NVH, PB.y3 + (size_t)t * NVH,
+                                  NULL, NULL, NULL, PB.o + (size_t)t * DINNER, NULL, -1};
+                    ssm_head_io(layer, hh, pos0 + t, &io);
                 }
-                l[hh] = svaddv_f32(pf, lsv);
+            gbarrier(tid, gs);
+            if (!tid) pf_t[PT_SSM] += ticks() - a;
+            pf_quant_rows(tid, PB.o, DINNER, DINNER, gs);
+            pf_job jo = {&P->out, PB.y2, EMBD};
+            pf_gemm_t(tid, &jo, 1, DINNER, gs);
+            pf_residual(tid, PB.y2, gs);
+        } else {
+            pf_job j[3] = {{&P->q, PB.y0, NHEAD * 2 * HD}, {&P->k, PB.y1, NKV * HD}, {&P->v, PB.y2, NKV * HD}};
+            pf_gemm_t(tid, j, 3, EMBD, gs);
+            uint64_t a = ticks();
+            int ai = L->ai;
+            /* q/k norm + RoPE, K/V into the cache (cpk = 1: kcp[..][0] is position-major) */
+            for (int t = tid; t < N; t += NT) {
+                int pos = pos0 + t;
+                for (int hq = 0; hq < NHEAD; hq++) {
+                    float *qd = PB.qh + ((size_t)t * NHEAD + hq) * HD;
+                    memcpy(qd, PB.y0 + (size_t)t * NHEAD * 2 * HD + (size_t)hq * 2 * HD, HD * 4);
+                    head_rmsnorm_rope(qd, L->q_norm, pos);
+                }
+                for (int c = 0; c < NKV; c++) {
+                    float kv[HD];
+                    memcpy(kv, PB.y1 + (size_t)t * NKV * HD + c * HD, sizeof kv);
+                    head_rmsnorm_rope(kv, L->k_norm, pos);
+                    memcpy(E.kcp[ai][c][0] + (size_t)pos * HD, kv, sizeof kv);
+                    memcpy(E.vcp[ai][c][0] + (size_t)pos * HD, PB.y2 + (size_t)t * NKV * HD + c * HD, HD * 4);
+                }
             }
-            attn_pv6(V, 0, n, sc, n, out, HD);
-            for (int hh = 0; hh < 6; hh++) {
-                int hq = 6 * c + hh;
-                const float *gate = PB.y0 + (size_t)t * NHEAD * 2 * HD + (size_t)hq * 2 * HD + HD;
-                float *dst = PB.o + (size_t)t * NHEAD * HD + (size_t)hq * HD, rl = 1.0f / l[hh];
-                for (int i = 0; i < HD; i += 16)
-                    svst1_f32(pf, dst + i, svmul_f32_x(pf, svmul_n_f32_x(pf, svld1_f32(pf, out + hh * HD + i), rl),
-                                                     q38d_sigmoid_sve(pf, svld1_f32(pf, gate + i))));
+            gbarrier(tid, gs);
+            uint64_t b = ticks();
+            if (!tid) pf_t[PT_ATTPREP] += b - a;
+            /* causal attention: tasks (KV head, token), largest contexts first */
+            int ci = pf_calls[tid][0]++;
+            _Atomic int *ctr = &pf_ctr[ci & 3];
+            if (tid == 0) atomic_store_explicit(&pf_ctr[(ci + 2) & 3], 0, memory_order_relaxed);
+            float *sc = PB.sc[tid], *out = pf_tmp[tid];
+            const svbool_t pf = svptrue_b32();
+            for (;;) {
+                int task = atomic_fetch_add_explicit(ctr, 1, memory_order_relaxed);
+                if (task >= NKV * N) break;
+                int t = N - 1 - task / NKV, c = task % NKV, n = pos0 + t + 1;
+                const float *K = E.kcp[ai][c][0], *V = E.vcp[ai][c][0];
+                attn_scores(PB.qh + ((size_t)t * NHEAD + 6 * c) * HD, K, 0, n, sc, n, 1.0f / 16.0f);
+                float l[6];
+                for (int hh = 0; hh < 6; hh++) {
+                    float *s_h = sc + (size_t)hh * n, m = -INFINITY;
+                    for (int i = 0; i < n; i++) if (s_h[i] > m) m = s_h[i];
+                    svfloat32_t lsv = svdup_n_f32(0);
+                    for (int i = 0; i < n; i += 16) {
+                        svbool_t pg = svwhilelt_b32(i, n);
+                        svfloat32_t e = q38d_exp_sve(pg, svsub_n_f32_x(pg, svld1_f32(pg, s_h + i), m));
+                        svst1_f32(pg, s_h + i, e);
+                        lsv = svadd_f32_m(pg, lsv, e);
+                    }
+                    l[hh] = svaddv_f32(pf, lsv);
+                }
+                attn_pv6(V, 0, n, sc, n, out, HD);
+                for (int hh = 0; hh < 6; hh++) {
+                    int hq = 6 * c + hh;
+                    const float *gate = PB.y0 + (size_t)t * NHEAD * 2 * HD + (size_t)hq * 2 * HD + HD;
+                    float *dst = PB.o + (size_t)t * NHEAD * HD + (size_t)hq * HD, rl = 1.0f / l[hh];
+                    for (int i = 0; i < HD; i += 16)
+                        svst1_f32(pf, dst + i, svmul_f32_x(pf, svmul_n_f32_x(pf, svld1_f32(pf, out + hh * HD + i), rl),
+                                                         q38d_sigmoid_sve(pf, svld1_f32(pf, gate + i))));
+                }
             }
+            gbarrier(tid, gs);
+            if (!tid) pf_t[PT_ATT] += ticks() - b;
+            pf_quant_rows(tid, PB.o, NHEAD * HD, NHEAD * HD, gs);
+            pf_job jo = {&P->o, PB.y2, EMBD};
+            pf_gemm_t(tid, &jo, 1, NHEAD * HD, gs);
+            pf_residual(tid, PB.y2, gs);
         }
-        gbarrier(tid, gs);
-        if (!tid) pf_t[PT_ATT] += ticks() - b;
-        pf_quant_rows(tid, PB.o, NHEAD * HD, NHEAD * HD, gs);
-        pf_job jo = {&P->o, PB.y2, EMBD};
-        pf_gemm_t(tid, &jo, 1, NHEAD * HD, gs);
-        pf_residual(tid, PB.y2, gs);
     }
     /* FFN */
-    pf_norm_quant(tid, L->post_norm, gs);
-    pf_job jf[2] = {{&P->gate, PB.y0, NFF}, {&P->up, PB.y1, NFF}};
-    pf_gemm_t(tid, jf, 2, EMBD, gs);
-    {
-        uint64_t a = ticks();
-        const svbool_t pf = svptrue_b32();
-        for (int t = tid; t < PB.ng * PF_T; t += NT) {
-            if (t >= N) { pf_quant_zero(NFF, t); continue; }
-            float *g = PB.y0 + (size_t)t * NFF;
-            const float *u = PB.y1 + (size_t)t * NFF;
-            for (int i = 0; i < NFF; i += 16) {
-                svfloat32_t gv = svld1_f32(pf, g + i);
-                svst1_f32(pf, g + i, svmul_f32_x(pf, svmul_f32_x(pf, gv, q38d_sigmoid_sve(pf, gv)), svld1_f32(pf, u + i)));
+    if (do_ffn) {
+        pf_norm_quant(tid, L->post_norm, gs);
+        pf_job jf[2] = {{&P->gate, PB.y0, NFF}, {&P->up, PB.y1, NFF}};
+        pf_gemm_t(tid, jf, 2, EMBD, gs);
+        {
+            uint64_t a = ticks();
+            const svbool_t pf = svptrue_b32();
+            for (int t = tid; t < PB.ng * PF_T; t += NT) {
+                if (t >= N) { pf_quant_zero(NFF, t); continue; }
+                float *g = PB.y0 + (size_t)t * NFF;
+                const float *u = PB.y1 + (size_t)t * NFF;
+                for (int i = 0; i < NFF; i += 16) {
+                    svfloat32_t gv = svld1_f32(pf, g + i);
+                    svst1_f32(pf, g + i, svmul_f32_x(pf, svmul_f32_x(pf, gv, q38d_sigmoid_sve(pf, gv)), svld1_f32(pf, u + i)));
+                }
+                pf_quant_row(g, NFF, t);
             }
-            pf_quant_row(g, NFF, t);
+            gbarrier(tid, gs);
+            if (!tid) pf_t[PT_QUANT] += ticks() - a;
+        }
+        pf_job jd = {&P->down, PB.y2, EMBD};
+        pf_gemm_t(tid, &jd, 1, NFF, gs);
+        pf_residual(tid, PB.y2, gs);
+    }
+}
+
+#ifdef Q38P_MPI
+static void pp_transfer_state(float *p, int n, int owner) {
+    if (pp_r == owner) MPI_Send(p, n, MPI_FLOAT, 0, 1, MPI_COMM_WORLD);
+    else if (pp_r == 0) MPI_Recv(p, n, MPI_FLOAT, owner, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+}
+/* Pipeline benchmark and first-token correctness path. Every rank retains
+ * the decode image for now; only the assigned prefill descriptors are built.
+ * MPI calls stay on worker 0, which is the process's main thread. */
+static void q38p_pipeline(int tid, const int *tok, int pn, int *gs) {
+    pf_init(tid, gs);
+    if (tid == 0) { pf_active = 1; MPI_Barrier(MPI_COMM_WORLD); }
+    gbarrier(tid, gs);
+    double t0 = tid == 0 ? MPI_Wtime() : 0, first_done = 0, last_done = 0;
+    double recv_time = 0, send_time = 0, compute_time = 0;
+    int first_token = -1;
+    uint64_t first_hash = 0;
+    for (int prompt = 0; prompt < pp_prompts; prompt++) {
+        /* Stage-local state can be reused as soon as this stage completes its
+         * previous prompt; other stages may still be working on that prompt. */
+        for (int u = pp_u0; u < pp_u1; u++) {
+            if (u & 1) continue;
+            int layer = u / 2;
+            if (!E.L[layer].ssm) continue;
+            int h = ssm_head_of(tid);
+            if (h >= 0) {
+                memset(ssm_st(layer, h, 0), 0, (DS * DS + 2 * DS) * sizeof(float));
+                memset(E.conv_hist[layer][h], 0, 8 * 384 * sizeof(float));
+            }
+            if (tid == 0) memset(E.conv_state[layer], 0, (size_t)4 * QKVD * sizeof(float));
+        }
+        if (tid == 0) pf_active = 1;
+        gbarrier(tid, gs);
+        for (int pos0 = 0; pos0 < pn; pos0 += PF_N) {
+            int ntok = pn - pos0 < PF_N ? pn - pos0 : PF_N;
+            if (tid == 0) {
+                PB.pos0 = pos0; PB.ntok = ntok; PB.ng = (ntok + PF_T - 1) / PF_T;
+                if (pp_r > 0) {
+                    double a = MPI_Wtime();
+                    MPI_Recv(PB.x, ntok * EMBD, MPI_FLOAT, pp_r - 1, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+                    recv_time += MPI_Wtime() - a;
+                }
+            }
+            gbarrier(tid, gs);
+            if (pp_r == 0)
+                for (int t = tid; t < ntok; t += NT)
+                    dequant_row(GGML_TYPE_Q6_K, E.embed_q6k + (size_t)tok[pos0 + t] * E.embed_row_bytes,
+                                PB.x + (size_t)t * EMBD, EMBD);
+            gbarrier(tid, gs);
+            double work_start = tid == 0 ? MPI_Wtime() : 0;
+            for (int u = pp_u0; u < pp_u1;) {
+                int mixer = (u % 2 == 0), ffn = mixer && u + 1 < pp_u1;
+                pf_layer_run(tid, u / 2, mixer, ffn || !mixer, gs);
+                u += mixer && ffn ? 2 : 1;
+            }
+            gbarrier(tid, gs);
+            if (tid == 0) {
+                compute_time += MPI_Wtime() - work_start;
+                if (pp_r + 1 < pp_n) {
+                    double a = MPI_Wtime();
+                    MPI_Send(PB.x, ntok * EMBD, MPI_FLOAT, pp_r + 1, 0, MPI_COMM_WORLD);
+                    send_time += MPI_Wtime() - a;
+                }
+            }
+            gbarrier(tid, gs);
+        }
+        if (pp_r == pp_n - 1) {
+            if (tid == 0) {
+                memcpy(E.x, PB.x + (size_t)(PB.ntok - 1) * EMBD, EMBD * 4);
+                pf_active = 0; ssq_valid = 0; tp_ssq_ok = 0; tp_prod_ok = 0;
+            }
+            gbarrier(tid, gs);
+            uint64_t tt = ticks();
+            head_argmax(tid, E.out_norm, gs, &tt);
+            if (tid == 0) {
+                uint64_t h = pf_last_hash();
+                if (prompt == 0) { first_done = MPI_Wtime(); first_token = E.next_token; first_hash = h; }
+                if (h != first_hash || E.next_token != first_token) {
+                    pp_bad = 1;
+                    fprintf(stderr, "q38p_pp: FATAL prompt=%d residual/token mismatch hash=%016llx token=%d\n",
+                            prompt, (unsigned long long)h, E.next_token);
+                }
+                last_done = MPI_Wtime();
+            }
         }
         gbarrier(tid, gs);
-        if (!tid) pf_t[PT_QUANT] += ticks() - a;
     }
-    pf_job jd = {&P->down, PB.y2, EMBD};
-    pf_gemm_t(tid, &jd, 1, NFF, gs);
-    pf_residual(tid, PB.y2, gs);
+    if (tid == 0) {
+        MPI_Barrier(MPI_COMM_WORLD);
+        double wall = MPI_Wtime() - t0;
+        double metrics[3] = {first_done - t0, last_done - first_done, (double)first_token};
+        MPI_Bcast(metrics, 3, MPI_DOUBLE, pp_n - 1, MPI_COMM_WORLD);
+        MPI_Bcast(&first_hash, 1, MPI_UINT64_T, pp_n - 1, MPI_COMM_WORLD);
+        MPI_Bcast(&pp_bad, 1, MPI_INT, pp_n - 1, MPI_COMM_WORLD);
+        first_token = (int)metrics[2];
+        fprintf(stderr, "q38p_pp: rank=%d/%d units=[%d,%d) prompts=%d tokens=%d wall=%.3f first_token=%d last_residual_hash=%016llx\n",
+                pp_r, pp_n, pp_u0, pp_u1, pp_prompts, pn, wall, (int)metrics[2], (unsigned long long)first_hash);
+        fprintf(stderr, "q38p_pp: rank=%d compute=%.3f recv_wait=%.3f send_wait=%.3f gemm=%.3f norm_quant=%.3f ssm=%.3f attn=%.3f\n",
+                pp_r, compute_time, recv_time, send_time, pf_t[PT_GEMM] / tick_hz(), pf_t[PT_QUANT] / tick_hz(),
+                pf_t[PT_SSM] / tick_hz(), pf_t[PT_ATT] / tick_hz());
+        if (pp_r == 0)
+            fprintf(stderr, "q38p_pp: nodes=%d prompts=%d prompt_tokens=%d end_to_end=%.3f tok/s single_prompt=%.3f s steady=%.3f tok/s\n",
+                    pp_n, pp_prompts, pn, pp_prompts * (double)pn / wall, metrics[0],
+                    pp_prompts > 1 ? (pp_prompts - 1) * (double)pn / metrics[1] : 0.0);
+    }
+    gbarrier(tid, gs);
+    if (pp_decode) {
+        double a = tid == 0 ? MPI_Wtime() : 0;
+        if (tid == 0) {
+            for (int r = 1; r < pp_n; r++) {
+                int u0, u1;
+                pf_stage_bounds(pp_n, r, &u0, &u1);
+                for (int u = u0; u < u1; u++) {
+                    if (u & 1) continue;
+                    int layer = u / 2;
+                    if (E.L[layer].ssm) {
+                        for (int h = 0; h < NVH; h++) {
+                            pp_transfer_state(ssm_st(layer, h, 0), DS * DS + 2 * DS, r);
+                            pp_transfer_state(E.conv_hist[layer][h], 8 * 384, r);
+                        }
+                    } else {
+                        int ai = E.L[layer].ai;
+                        for (int h = 0; h < NKV; h++) {
+                            pp_transfer_state(E.kcp[ai][h][0], pn * HD, r);
+                            pp_transfer_state(E.vcp[ai][h][0], pn * HD, r);
+                        }
+                    }
+                }
+            }
+            if (pp_r == pp_n - 1) MPI_Send(E.x, EMBD, MPI_FLOAT, 0, 2, MPI_COMM_WORLD);
+            if (pp_r == 0) MPI_Recv(E.x, EMBD, MPI_FLOAT, pp_n - 1, 2, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            pf_active = 0; ssq_valid = 0; tp_ssq_ok = 0; tp_prod_ok = 0;
+        }
+        gbarrier(tid, gs);
+        if (pp_r == 0) {
+            uint64_t tt = ticks();
+            head_argmax(tid, E.out_norm, gs, &tt);
+            if (tid == 0) {
+                if (E.next_token != first_token) pp_bad = 1;
+                fprintf(stderr, "q38p_pp: decode handoff %.3f s first_token=%d match=%d\n",
+                        MPI_Wtime() - a, E.next_token, E.next_token == first_token);
+            }
+        }
+        gbarrier(tid, gs);
+    }
 }
+#endif
 
 /* Prefill the whole prompt; afterwards E.next_token holds the first
  * generated token and decode continues at position pn. */
@@ -630,7 +815,7 @@ static void q38p_prefill(int tid, const int *tok, int pn, int *gs) {
             dequant_row(GGML_TYPE_Q6_K, E.embed_q6k + (size_t)tok[pos0 + t] * E.embed_row_bytes, PB.x + (size_t)t * EMBD, EMBD);
         gbarrier(tid, gs);
         if (!tid) pf_t[PT_EMBED] += ticks() - a;
-        for (int layer = 0; layer < NLAYER; layer++) pf_layer_run(tid, layer, gs);
+        for (int layer = 0; layer < NLAYER; layer++) pf_layer_run(tid, layer, 1, 1, gs);
     }
     /* head for the last prompt token through decode's head */
     uint64_t a = ticks();
@@ -639,6 +824,8 @@ static void q38p_prefill(int tid, const int *tok, int pn, int *gs) {
     gbarrier(tid, gs);
     uint64_t tt = ticks();
     head_argmax(tid, E.out_norm, gs, &tt);
+    if (tid == 0)
+        fprintf(stderr, "q38p: last_residual_hash=%016llx\n", (unsigned long long)pf_last_hash());
     if (!tid) pf_t[PT_HEAD] += ticks() - a;
 }
 static void q38p_report(int pn, double sec) {
