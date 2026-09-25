@@ -27,6 +27,8 @@
 #include <math.h>
 #include <immintrin.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 /* x86 has no FPCR; the FP8 "magic" decode's FTZ requirement is handled by not
  * using the magic decode at all on this target (see matvec_fp8e4m3_8row_magic
