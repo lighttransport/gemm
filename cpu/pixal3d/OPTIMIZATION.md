@@ -549,6 +549,19 @@ full crab run's 14.7 s + 14.2 s decoder stages):
 | house, 10,765 tokens | 12288 MiB | new resident | 13.2 s | - | - | identical |
 | house | 2560 MiB | tiled retry | 357.9 s | 610 GB | - | tiled result |
 
+The complete four-view fixture was rerun at 7168 MiB with this decoder and
+the FP32 boundary layers. It used seed 42, mixed precision, 4096 textures and
+a one-million-triangle target (`tmp/pixal3d/mv-7168-20260925`). The resident
+decoders took 9.2 s (shape) and 9.9 s (texture), against 325.5 s and 318.2 s
+on the tiled path. H2D traffic fell from 785 GB to 23 GB, and generation took
+590.9 s instead of 1387.8 s. Peak process device memory was 5.2 GB (NVML),
+and total device use 7.0 GB including the desktop. The mesh has 17,429 shape
+tokens and 967,374 triangles; the boundary-layer change alters the flow
+trajectory, so it is not the earlier 17,387-token mesh. Another project's
+32-way build was saturating the host CPU during postprocessing: UV
+unwrapping took 192.5 s instead of the usual 86 s, so the total overstates
+the uncontended time by about 110 s.
+
 ```sh
 ref/pixal3d/run.sh cuda ref/pixal3d/replay_decoders.py \
   --dump-dir tmp/pixal3d/resident-runs/cuda-crab/dumps \
