@@ -45,7 +45,7 @@ libq21_fast_flash.so: fast_flash_plugin.cu $(PLUGIN_ARCH_STAMP) | verify-exact-s
 		-gencode arch=$(CUDA_COMPUTE),code=$(GPU_ARCH) -I$(FLASH_ATTN_SOURCE) \
 		-I$(FLASH_ATTN_SOURCE)/csrc/cutlass/include -o $@ $<
 
-test_cuda_qimg21_fast: test_cuda_qimg21_fast.c qimg21_fast_kernels.h test_cuda_qimg21_native.c quant_weights.h edit_runtime.h edit_kernels.h mma64_kernels.h norm_vector_kernels.h rope_table_kernels.h joint_layout.h ../../cuda/cuda_runner_common.h ../../cuda/cuew.c ../../cuda/cublasew.c
+test_cuda_qimg21_fast: test_cuda_qimg21_fast.c qimg21_fast_kernels.h qimg21_fast_fp4.h test_cuda_qimg21_native.c quant_weights.h edit_runtime.h edit_kernels.h mma64_kernels.h norm_vector_kernels.h rope_table_kernels.h joint_layout.h ../../cuda/cuda_runner_common.h ../../cuda/cuew.c ../../cuda/cublasew.c
 	$(CC) -O2 -std=c11 -D_GNU_SOURCE -Wall -Wextra -Wno-unused-function -I../../common -I../../cuda -I../qimg \
 		-o $@ test_cuda_qimg21_fast.c ../../cuda/cuew.c ../../cuda/cublasew.c \
 		-ldl -lm -lpthread

@@ -19,6 +19,7 @@
 #include "test_cuda_qimg21_native.c"
 #undef main
 #include "qimg21_fast_kernels.h"
+#include "qimg21_fast_fp4.h"
 #include <fcntl.h>
 #include <time.h>
 #include <unistd.h>
@@ -43,9 +44,16 @@ enum { Q21F_QKV, Q21F_OUT, Q21F_GP, Q21F_MO, Q21F_NQ, Q21F_NK, Q21F_PARTS };
  * F32 row scales, and F32 1/s activation smoothing per input channel. */
 enum { I8_QKV, I8_OUT, I8_GP, I8_MO, I8_S_QKV, I8_S_OUT, I8_S_GP, I8_S_MO, I8_I_QKV, I8_I_OUT, I8_I_GP, I8_I_MO,
        I8_NQ, I8_NK, I8_PARTS };
-enum { Q21F_KIND_BF16, Q21F_KIND_INT8 };
+enum { Q21F_KIND_BF16, Q21F_KIND_INT8, Q21F_KIND_NVFP4 };
+/* NVFP4 SVDQuant blob written by pack_fast.py --kind nvfp4-svd: per group
+ * (0 QKV, 1 out, 2 gate|proj, 3 mlp.out) six parts, then norm_q/norm_k. */
+enum { FP4_CODES, FP4_GS, FP4_WC, FP4_DOWN, FP4_UP, FP4_INV, FP4_PARTS };
+#define FP4_PART(g, j) ((g) * FP4_PARTS + (j))
+#define FP4_NQ 24
+#define FP4_NK 25
+#define Q21F_RANK 128
 typedef struct {
-    size_t offset[16];
+    size_t offset[32];
     size_t bytes;
 } q21f_layout;
 
@@ -63,10 +71,14 @@ typedef struct {
     cublasew_context *blas;
     CUmodule module;
     CUfunction cast_bf16, txt_norm, gelu, silu, mod_prepare, scale_prepare, norm_mod, norm_mod_q8, quant_rows,
-        dequant, qk_norm_rope, swiglu, euler, cfg_combine, checksum, colmax;
+        dequant, qk_norm_rope, fp4_act, w4a4_bf16, swiglu, euler, cfg_combine, checksum, colmax;
     void *plugin;
     q21f_attention_fn attention;
-    q21f_layout layout, i8;
+    q21f_layout layout, i8, fp4;
+    CUmodule fp4_module;
+    /* NVFP4 activation codes [rows][F/8], group scales [rows][F/16], token
+     * scales [rows], and the low-rank down projection [rows][RANK] */
+    CUdeviceptr ac, as, at, lrd;
     q21f_block block[Q21F_BLOCKS];
     /* INT8 activations [rows+16][F], per-row scales, INT32 GEMM scratch */
     CUdeviceptr xq, xs, acc;
@@ -140,6 +152,24 @@ static void q21f_i8_layout_init(q21f_layout *l) {
         l->offset[i] = o;
         o += (sizes[i] + 255) & ~(size_t)255;
     }
+    l->bytes = o;
+}
+
+static void q21f_fp4_layout_init(q21f_layout *l) {
+    size_t D = Q21F_D, F = Q21F_F, o = 0, R = Q21F_RANK;
+    size_t nk[4][2] = {{3 * D, D}, {D, D}, {2 * F, D}, {D, F}};
+    for (int g = 0; g < 4; g++) {
+        size_t n = nk[g][0], k = nk[g][1];
+        size_t sizes[FP4_PARTS] = {n * k / 2, n * k / 16, n * 4, R * k * 2, n * R * 2, k * 4};
+        for (int j = 0; j < FP4_PARTS; j++) {
+            l->offset[FP4_PART(g, j)] = o;
+            o += (sizes[j] + 255) & ~(size_t)255;
+        }
+    }
+    l->offset[FP4_NQ] = o;
+    o += 512;
+    l->offset[FP4_NK] = o;
+    o += 512;
     l->bytes = o;
 }
 
@@ -290,6 +320,26 @@ static int q21f_gemm_i8(q21f_runtime *rt, CUdeviceptr y, int ldy, CUdeviceptr w,
         if (q21f_launch_n(rt, rt->dequant, (size_t)rows * n, a)) return -1;
     }
     return 0;
+}
+
+/* SVDQuant W4A4 linear y[m, n] (stride ldy) from BF16 x[m, k] (stride ldx):
+ * low-rank x @ (down/s)^T @ up^T in BF16 is written to y first, then the NVFP4
+ * GEMM of quant(x/s) and the residual codes adds its scaled accumulator. */
+static int q21f_linear_fp4(q21f_runtime *rt, CUdeviceptr w, int group, CUdeviceptr x, int ldx, CUdeviceptr y,
+                           int ldy, int m, int n, int k) {
+    const q21f_layout *l = &rt->fp4;
+    CUdeviceptr codes = w + l->offset[FP4_PART(group, FP4_CODES)], gs = w + l->offset[FP4_PART(group, FP4_GS)];
+    CUdeviceptr wc = w + l->offset[FP4_PART(group, FP4_WC)], down = w + l->offset[FP4_PART(group, FP4_DOWN)];
+    CUdeviceptr up = w + l->offset[FP4_PART(group, FP4_UP)], inv = w + l->offset[FP4_PART(group, FP4_INV)];
+    if (q21f_gemm(rt, rt->lrd, Q21F_RANK, down, x, ldx, m, Q21F_RANK, k) ||
+        q21f_gemm(rt, y, ldy, up, rt->lrd, Q21F_RANK, m, n, Q21F_RANK))
+        return -1;
+    void *qa[] = {&rt->ac, &rt->as, &rt->at, &x, &ldx, &inv, &k};
+    if (q21f_launch(rt, rt->fp4_act, (unsigned)m, 1, 256, qa)) return -1;
+    int lr = 1;
+    void *ga[] = {&rt->ac, &codes, &rt->as, &gs, &rt->at, &wc, &y, &ldy, &lr, &m, &n, &k};
+    return cuLaunchKernel(rt->w4a4_bf16, (unsigned)((n + 127) / 128), (unsigned)((m + 63) / 64), 1, 256, 1, 1, 0,
+                          rt->compute, ga, NULL) == CUDA_SUCCESS ? 0 : -1;
 }
 
 /* Per-row SmoothQuant INT8 of a BF16 matrix into the shared activation buffer. */
@@ -519,8 +569,8 @@ static int q21f_pass(q21f_runtime *rt, q21f_state *st, q21f_branch *br, int nb, 
     for (int b = 0; b < Q21F_BLOCKS; b++) {
         CUdeviceptr w = q21f_block_begin(rt, b);
         REQ(w, "block %d weights unavailable", b);
-        int i8 = rt->block[b].kind == Q21F_KIND_INT8;
-        const q21f_layout *l = i8 ? &rt->i8 : &rt->layout;
+        int i8 = rt->block[b].kind == Q21F_KIND_INT8, f4 = rt->block[b].kind == Q21F_KIND_NVFP4;
+        const q21f_layout *l = i8 ? &rt->i8 : f4 ? &rt->fp4 : &rt->layout;
         for (int i = 0; i < nb; i++)
             REQ(!q21f_branch_norm(rt, st, &br[i], kind, base[i], N, 0, b ? st->y : 0, 0,
                                   i8 ? w + l->offset[I8_I_QKV] : 0), "norm1");
@@ -531,12 +581,15 @@ static int q21f_pass(q21f_runtime *rt, q21f_state *st, q21f_branch *br, int nb, 
         if (i8)
             REQ(!q21f_gemm_i8(rt, st->qkv, 3 * D, w + l->offset[I8_QKV], w + l->offset[I8_S_QKV], M, 3 * D, D),
                 "QKV W8A8");
+        else if (f4)
+            REQ(!q21f_linear_fp4(rt, w, 0, st->x, D, st->qkv, 3 * D, M, 3 * D, D), "QKV W4A4");
         else {
             q21f_calib(rt, b, 0, st->x, M, D, D);
             REQ(!q21f_gemm_parts(rt, st->qkv, w + l->offset[Q21F_QKV], st->x, M, 3, D, D), "QKV");
         }
         q21f_mark(rt, "qkv", b, st->qkv, (size_t)M * 3 * D * 2);
-        CUdeviceptr nq = w + l->offset[i8 ? I8_NQ : Q21F_NQ], nk = w + l->offset[i8 ? I8_NK : Q21F_NK];
+        CUdeviceptr nq = w + l->offset[i8 ? I8_NQ : f4 ? FP4_NQ : Q21F_NQ];
+        CUdeviceptr nk = w + l->offset[i8 ? I8_NK : f4 ? FP4_NK : Q21F_NK];
         int last_prefix = kind == Q21F_PREFIX && b == Q21F_BLOCKS - 1;
         for (int i = 0; i < nb; i++) {
             q21f_branch *r = &br[i];
@@ -588,6 +641,8 @@ static int q21f_pass(q21f_runtime *rt, q21f_state *st, q21f_branch *br, int nb, 
         if (i8) {
             REQ(!q21f_quant(rt, st->attn, D, D, w + l->offset[I8_I_OUT], M), "out quant");
             REQ(!q21f_gemm_i8(rt, st->y, D, w + l->offset[I8_OUT], w + l->offset[I8_S_OUT], M, D, D), "out W8A8");
+        } else if (f4) {
+            REQ(!q21f_linear_fp4(rt, w, 1, st->attn, D, st->y, D, M, D, D), "out W4A4");
         } else {
             q21f_calib(rt, b, 1, st->attn, M, D, D);
             REQ(!q21f_gemm(rt, st->y, D, w + l->offset[Q21F_OUT], st->attn, D, M, D, D), "out");
@@ -597,7 +652,7 @@ static int q21f_pass(q21f_runtime *rt, q21f_state *st, q21f_branch *br, int nb, 
             REQ(!q21f_branch_norm(rt, st, &br[i], kind, base[i], N, 1, st->y, 0,
                                   i8 ? w + l->offset[I8_I_GP] : 0), "norm2");
         q21f_mark(rt, "x2", b, st->x, (size_t)M * D * 2);
-        if (!i8) q21f_calib(rt, b, 2, st->x, M, D, D);
+        if (!i8 && !f4) q21f_calib(rt, b, 2, st->x, M, D, D);
         if (dump && b == 0) {
             q21f_stage(rt, "attn_out", st->y, M, D, D);
             q21f_stage(rt, "post_attn_hidden", h, M, D, D);
@@ -606,6 +661,7 @@ static int q21f_pass(q21f_runtime *rt, q21f_state *st, q21f_branch *br, int nb, 
         if (i8)
             REQ(!q21f_gemm_i8(rt, st->gp, 2 * F, w + l->offset[I8_GP], w + l->offset[I8_S_GP], M, 2 * F, D),
                 "gate|proj W8A8");
+        else if (f4) REQ(!q21f_linear_fp4(rt, w, 2, st->x, D, st->gp, 2 * F, M, 2 * F, D), "gate|proj W4A4");
         else REQ(!q21f_gemm_parts(rt, st->gp, w + l->offset[Q21F_GP], st->x, M, 2, F, D), "gate|proj");
         q21f_mark(rt, "gp", b, st->gp, (size_t)M * 2 * F * 2);
         { int rows = M, ff = F; void *a[] = {&st->gp, &rows, &ff};
@@ -614,6 +670,8 @@ static int q21f_pass(q21f_runtime *rt, q21f_state *st, q21f_branch *br, int nb, 
             REQ(!q21f_quant(rt, st->gp, 2 * F, F, w + l->offset[I8_I_MO], M), "mlp.out quant");
             REQ(!q21f_gemm_i8(rt, st->y, D, w + l->offset[I8_MO], w + l->offset[I8_S_MO], M, D, F),
                 "mlp.out W8A8");
+        } else if (f4) {
+            REQ(!q21f_linear_fp4(rt, w, 3, st->gp, 2 * F, st->y, D, M, D, F), "mlp.out W4A4");
         } else {
             q21f_calib(rt, b, 3, st->gp, M, F, 2 * F);
             REQ(!q21f_gemm(rt, st->y, D, w + l->offset[Q21F_MO], st->gp, 2 * F, M, D, F), "mlp.out");
@@ -697,7 +755,7 @@ static void q21f_usage(const char *argv0) {
             "  [--editing-layout L.txt --condition-latents C.npy [--negative-editing-layout NL.txt]]\n"
             "  [--vram-budget-mib MIB] [--cfg-batch 0|1] [--fused-gemm 0|1] [--kv-cache on|off]\n"
             "  [--prefix-pass extract|separate] [--plan-only] [--profile]\n"
-            "  [--weights bf16|int8 --quant-package DIR [--bf16-blocks 0,31]]\n"
+            "  [--weights bf16|int8|nvfp4 --quant-package DIR [--bf16-blocks 0,31]]\n"
             "  diagnostics: [--trace] [--verify-slots] [--stage-dir DIR] [--calib-dump FILE.npy]\n"
             "  [--attention cutlass-efficient|flash] [--normalization vector4] [--rope host-table-exact]\n"
             "  [--attention-plugin PATH] [--rope-table-base PATH]\n"
@@ -762,8 +820,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--bf16-blocks") && more) bf16_blocks = argv[++i];
         else if (!strcmp(a, "--weights") && more) {
             const char *m = argv[++i];
-            if (strcmp(m, "bf16") && strcmp(m, "int8")) { q21f_usage(argv[0]); return 2; }
-            int8_weights = !strcmp(m, "int8");
+            if (strcmp(m, "bf16") && strcmp(m, "int8") && strcmp(m, "nvfp4")) { q21f_usage(argv[0]); return 2; }
+            int8_weights = !strcmp(m, "int8") ? 1 : !strcmp(m, "nvfp4") ? 2 : 0;
         }
         else if (!strcmp(a, "--verify-slots")) verify_slots = 1;
         else if (!strcmp(a, "--profile")) profile = 1;
@@ -802,8 +860,8 @@ int main(int argc, char **argv) {
             n += (size_t)snprintf(tail_list + n, sizeof(tail_list) - n, "%s%d", n ? "," : "", b);
         bf16_blocks = tail_list;
     }
-    if (int8_weights != !!package) {
-        fprintf(stderr, "fast: --weights int8 and --quant-package go together\n");
+    if (!!int8_weights != !!package) {
+        fprintf(stderr, "fast: --weights int8|nvfp4 and --quant-package go together\n");
         return 2;
     }
     if (negative_path && guidance <= 1.0f) {
@@ -880,6 +938,11 @@ int main(int argc, char **argv) {
     GETF(mod_prepare, "mod_prepare"); GETF(scale_prepare, "scale_prepare"); GETF(norm_mod, "norm_mod");
     GETF(qk_norm_rope, "qk_norm_rope"); GETF(swiglu, "swiglu");
     GETF(norm_mod_q8, "norm_mod_q8"); GETF(quant_rows, "quant_rows"); GETF(dequant, "dequant");
+    /* Block-scaled FP4 MMA needs the architecture-specific target (sm_120a). */
+    REQ(cu_compile_kernels_ex(&rt.fp4_module, rt.device, q21f_fp4_src, "qimg21_fast_fp4.cu", verbose, "fast-fp4",
+                              CU_COMPILE_ARCH_A) >= 0, "FP4 kernel compile failed");
+    CK(cuModuleGetFunction(&rt.fp4_act, rt.fp4_module, "fp4_act"));
+    CK(cuModuleGetFunction(&rt.w4a4_bf16, rt.fp4_module, "w4a4_bf16"));
     GETF(euler, "euler"); GETF(cfg_combine, "cfg_combine"); GETF(checksum, "checksum"); GETF(colmax, "colmax");
 #undef GETF
     /* cutlass-efficient is PyTorch's memory-efficient kernel (reference
@@ -894,10 +957,12 @@ int main(int argc, char **argv) {
     /* ---- Plan ---- */
     q21f_layout_init(&rt.layout);
     q21f_i8_layout_init(&rt.i8);
+    q21f_fp4_layout_init(&rt.fp4);
     int package_fd = -1;
+    const q21f_layout *qlay = int8_weights == 2 ? &rt.fp4 : &rt.i8;
     for (int b = 0; b < Q21F_BLOCKS; b++) {
-        rt.block[b].kind = int8_weights ? Q21F_KIND_INT8 : Q21F_KIND_BF16;
-        rt.block[b].bytes = int8_weights ? rt.i8.bytes : rt.layout.bytes;
+        rt.block[b].kind = int8_weights == 1 ? Q21F_KIND_INT8 : int8_weights == 2 ? Q21F_KIND_NVFP4 : Q21F_KIND_BF16;
+        rt.block[b].bytes = int8_weights ? qlay->bytes : rt.layout.bytes;
     }
     if (bf16_blocks) {
         /* Sensitive blocks stay BF16, read from the model. */
@@ -919,9 +984,12 @@ int main(int argc, char **argv) {
         if (fp) fclose(fp);
         manifest[got] = 0;
         char expect[64];
-        snprintf(expect, sizeof(expect), "\"blob_bytes\": %zu,", rt.i8.bytes);
-        REQ(strstr(manifest, "\"format\": \"qimg21-fast-int8-smooth-v1\"") && strstr(manifest, expect),
-            "%s is not a qimg21-fast-int8-smooth-v1 package matching this runner", mpath);
+        const char *format = int8_weights == 2 ? "qimg21-fast-nvfp4-svd-v1" : "qimg21-fast-int8-smooth-v1";
+        char want[96];
+        snprintf(want, sizeof(want), "\"format\": \"%s\"", format);
+        snprintf(expect, sizeof(expect), "\"blob_bytes\": %zu,", qlay->bytes);
+        REQ(strstr(manifest, want) && strstr(manifest, expect), "%s is not a %s package matching this runner", mpath,
+            format);
         snprintf(mpath, sizeof(mpath), "%s/blocks.bin", package);
         package_fd = open(mpath, O_RDONLY);
         REQ(package_fd >= 0, "cannot open %s", mpath);
@@ -939,10 +1007,11 @@ int main(int argc, char **argv) {
     plan.fixed = (size_t)(2 * Q21F_D * Q21F_D + Q21F_D * 64 + Q21F_D * 256 + Q21F_D * Q21F_D +
                           4 * Q21F_D * Q21F_D + Q21F_D * Q21F_D + 64 * Q21F_D) * 2 + Q21F_D * 4;
     plan.activations = q21f_state_bytes(st.rows_max, N, nb, nt_max, st.nc);
-    if (int8_weights) {
+    if (int8_weights == 1) {
         rt.acc_bytes = 128 * Q21F_MIB;
         plan.activations += ((size_t)st.rows_max + 16) * (Q21F_F + 4) + rt.acc_bytes;
-    }
+    } else if (int8_weights == 2)
+        plan.activations += (size_t)st.rows_max * (Q21F_F / 2 + Q21F_F / 16 + 4 + Q21F_RANK * 2);
     for (int i = 0; i < nb; i++)
         plan.kv += ((size_t)Q21F_BLOCKS * br[i].prefix + br[i].prefix + N) * Q21F_D * 2 * 2 +
                    (size_t)br[i].prefix * Q21F_D * 2 + (size_t)(br[i].prefix + N) * 128 * 4;
@@ -1019,9 +1088,9 @@ int main(int argc, char **argv) {
             CK(cuMemHostAlloc(&rt.block[b].host, bytes, 0));
             dst = (uint8_t *)rt.block[b].host;
         }
-        if (rt.block[b].kind == Q21F_KIND_INT8) {
-            ssize_t got = pread(package_fd, dst, bytes, (off_t)b * (off_t)rt.i8.bytes);
-            REQ(got == (ssize_t)bytes, "short read of INT8 block %d", b);
+        if (rt.block[b].kind == Q21F_KIND_INT8 || rt.block[b].kind == Q21F_KIND_NVFP4) {
+            ssize_t got = pread(package_fd, dst, bytes, (off_t)b * (off_t)qlay->bytes);
+            REQ(got == (ssize_t)bytes, "short read of quantized block %d", b);
         } else REQ(!q21f_pack_block(&shards, &rt.layout, b, dst), "block %d", b);
         if (rt.block[b].resident) {
             rt.block[b].dev = q21f_alloc(&rt, bytes);
@@ -1030,7 +1099,14 @@ int main(int argc, char **argv) {
         }
     }
     if (package_fd >= 0) { close(package_fd); package_fd = -1; }
-    if (int8_weights) {
+    if (int8_weights == 2) {
+        rt.ac = q21f_alloc(&rt, (size_t)st.rows_max * Q21F_F / 2);
+        rt.as = q21f_alloc(&rt, (size_t)st.rows_max * Q21F_F / 16);
+        rt.at = q21f_alloc(&rt, (size_t)st.rows_max * 4);
+        rt.lrd = q21f_alloc(&rt, (size_t)st.rows_max * Q21F_RANK * 2);
+        REQ(rt.ac && rt.as && rt.at && rt.lrd, "NVFP4 activation buffers");
+    }
+    if (int8_weights == 1) {
         rt.xq = q21f_alloc(&rt, ((size_t)st.rows_max + 16) * Q21F_F);
         rt.xs = q21f_alloc(&rt, ((size_t)st.rows_max + 16) * 4);
         rt.acc = q21f_alloc(&rt, rt.acc_bytes);

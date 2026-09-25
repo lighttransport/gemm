@@ -1997,3 +1997,42 @@ Side-by-side review of the lowest-scoring pair (bakery) shows the same
 composition, style and quality. The differences are small detail placements,
 so the metric mostly measures trajectory divergence. Per step, INT8 took
 0.956 s and 1.017 s against 1.903 s for BF16 with all blocks resident.
+
+### Fast W4A4 (SVDQuant NVFP4)
+
+`--weights nvfp4 --quant-package DIR` runs block linears as SVDQuant W4A4.
+`pack_fast.py --kind nvfp4-svd` writes the package, using the same
+calibration and smoothing as INT8:
+
+- a rank-128 SVD of `W*s` is kept in BF16, with `1/s` folded into the down
+  factor so the runtime feeds it the unsmoothed activation;
+- the residual is rounded to NVFP4: E2M1 codes, one E4M3 scale per 16 inputs,
+  and an F32 row scale that puts the largest group scale at 448. Residual
+  relative error is about 0.094 per group; the package is 4.2 GiB.
+
+The runtime quantizes activations per token with the same two-level scaling
+(`fp4_act`). It writes the low-rank branch to the output with two cuBLAS BF16
+GEMMs, then runs an sm_120a block-scaled FP4 MMA GEMM (`qimg21_fast_fp4.h`,
+main loop from `cuda/fp4_w4a4.h`) whose epilogue applies both scales and adds
+the branch in place.
+
+1024x1024, 40 steps, alpha 0.5, `--attention flash`, 7168 MiB budget: all 32
+blocks resident, 5.4 GB process peak. Against the BF16 PyTorch reference the
+trajectory stays inside the 0.25 MRE gate (max 0.129, min cosine 0.9757).
+Decoded PSNR is 20.7 dB, but the image is a clean apple of the same quality
+with a different pose; W4A4 trajectories diverge more than W8A8, consistent
+with the LPIPS of 0.14 to 0.19 reported for published SVDQuant builds.
+
+It is not fast yet: 2.47 s per step. An nsys profile shows 2.0 s per step in
+the W4A4 GEMM, about 29 TOPS against the 406 TOPS FP4 MMA peak (no
+double-buffering, scalar shared-memory tiles, one sync per 64-wide K step).
+A CUTLASS sm120 block-scaled GEMM is the next step.
+
+The published ModelsLab/Qwen-Image-2.1-W4A4-nvfp4 checkpoint (SHA-256
+`779f7178...242c7a`, in `/mnt/nvme01/models/qimg-21-w4a4-nvfp4`) was also
+examined. Nunchaku's packer unswizzles its FP4 codes (97% sign agreement
+with the weight) and its low-rank factors. Its decomposition does not match
+standard SVDQuant, though: the best-fit residual error stays at 0.24 or more
+for every smoothing variant, and its low-rank term is not the truncated SVD
+of `W`, `W*s` or `W/s`. Its loader repository is not public, so the
+checkpoint is not used.
