@@ -2145,6 +2145,8 @@ Running the pipeline:
   `--quant-package` overrides them.
 - The web demo (`server/qwen_image21`) offers the same presets as a CUDA
   denoiser choice.
+- `--upscale` / `--tile-tokens` raise the output size beyond 1024x1024 at the
+  same VRAM; see the tiling section below.
 
 Measurement setup for the tables below:
 
@@ -2201,3 +2203,163 @@ these stage costs:
   - The default `--conv direct` output stays byte-identical and takes 37.4 s.
   - `native_generate.py` selects `cudnn` with `--runner fast`;
     `--native-vae-conv` overrides it.
+
+## Tiled high-resolution generation
+
+The denoiser already bounds its own memory: `--vram-budget-mib` covers the
+whole process and streams blocks from pinned host memory, so the *denoiser*
+fits any token grid on an 8 GB card. At 2048x2048 (16384 target tokens) the
+`low8` plan is 17 resident and 15 streamed blocks and measures 4.04 s per step
+at a 6,483 MiB peak. The VAE decoder did not: decoding 2048x2048 in one pass
+peaks at **11,762 MiB**, because the decoder holds F32 feature maps at
+1152x1024x1024 and 288x2048x2048 simultaneously.
+
+Two independent mechanisms make the output size independent of VRAM:
+
+- **Latent-space coarse-to-fine (`test_cuda_qimg21_fast`).** A base pass
+  denoises a smaller latent grid, `--refine-from` resamples that base onto the
+  output grid (bilinear, `align_corners=false`, matching
+  `torch.nn.functional.interpolate`), and the output grid is then denoised one
+  `--tile-tokens` square at a time. Each tile is renoised to the sigma
+  `--refine-strength` selects,
+  `x = (1 - sigma) * x0 + sigma * eps`, and the tiles are blended into the
+  assembled grid with a raised-cosine window across their overlap, normalized
+  by the accumulated weight.
+- **Spatially tiled decode (`test_cuda_qimg21_vae --tile`).** Each tile is
+  decoded as a standalone `th x tw` latent image; a pixel is kept only if it is
+  at least `--tile-bleed` latent tokens from the tile boundary, i.e. outside the
+  decoder's boundary-sensitive depth, and the kept interiors are blended with a
+  raised-cosine window. The overlap must be at least `2 * bleed` so the kept
+  intervals of neighbours always meet; `--tile-bleed` larger than half the
+  overlap is rejected rather than leaving gaps.
+
+Everything else is unchanged: the same exact-mode arithmetic, the same prefix
+KV cache, the same presets. `--tile-tokens` needs `--upscale` above 1, because
+tiling refines a base grid and without one there is nothing to refine.
+
+```sh
+# 2048x2048 on an 8 GB card: 1024 base + 9 refine tiles + a tiled decode
+python3 cuda/qimg21/native_generate.py --model /mnt/nvme01/models/qimg-21 \
+  --runner fast --preset low8 --prompt "a lighthouse in a storm, oil painting" \
+  --height 2048 --width 2048 --upscale 2 --tile-tokens 56 --refine-strength 0.4 \
+  --steps 20 --seed 7 --native-vae \
+  --work-dir tmp/qimg21-2048-tiled --out tmp/qimg21-2048-tiled.png
+```
+
+`--height/--width` are the *output* size; `--upscale F` generates the base at
+`1/F` of it (`--base-steps` defaults to `--steps`; a coarse base rarely needs as
+many). `--tile-tokens` defaults to the base grid's shorter side, which is the
+base's native token count. Editing works unchanged: the joint layout's
+target block is the grid the model actually sees, so the refine pass gets a
+layout built for the tile, and because prefix positions do not depend on the
+target grid, one layout serves every tile.
+
+### Equivalences and validation
+
+- A refine with `--tile-tokens` covering the whole grid is **bit-identical** to
+  the untiled restart `--latents GRID.npy --start-step K --refine-seed S` at
+  the same `K` and seed. The tiled path is that restart, once per tile, plus the
+  blend. Both reduce to the ordinary full-schedule run when `--start-step 0`:
+  that path is bit-identical to the pre-tiling binary.
+- `--start-step K` on its own is img2img strength: it resamples `--latents`
+  (either the output grid or a coarse `[base_h, base_w, 64]` grid) and renoises
+  it to `sigmas[K]`. `--refine-from` plus `--tile-tokens` is the same thing
+  with a tile loop, so the two paths cannot drift apart.
+
+Measured on the RTX 5060 Ti, `low8` (`--vram-budget-mib 7168`), 40 steps,
+seed 7, prompt "a red apple on a white table":
+
+Denoiser and decoder peaks are the `nvidia-smi` per-process maxima, sampled
+every 100-200 ms with the sampler running before the process starts.
+
+| Output | Base grid | Refine tiles | Denoiser peak | Denoiser time | Decode peak | Decode time |
+|---|---|---|---:|---:|---:|---:|
+| 1024x1024 | 512, 32x32 tok | 3x3 of 32 | 6,450 MiB | 89 s (9 x 16 steps) | 3,112 MiB | 4.9 s, one pass |
+| 2048x2048 | 1024, 64x64 tok | 3x3 of 56 | 6,886 MiB | 89 s (9 x 16 steps) | **1,862 MiB** | 25.5 s |
+| 2048x2048 | 1024 | 4x4 of 64, `fast12` | 7,499 MiB | 45 s (16 x 8 steps) | 1,862 MiB | 25.5 s |
+| 3072x3072 | 1536, 96x96 tok | 4x4 of 64, `fast12` | 8,204 MiB | 147 s (base 53 s + 16 x 8 steps) | **1,862 MiB** | 65 s (5x5 tiles) |
+
+The tiled refine rows are 40 steps at strength 0.4 for the first two and 20
+steps for the `fast12` rows; the decode tile is 48 tokens with 8 tokens of
+overlap and a bleed of 2 throughout.
+
+Whole-pipeline `native_generate.py` runs, `low8` unless noted, 20 steps:
+
+| Run | Total | Peak | Notes |
+|---|---:|---:|---|
+| 1024x1024 | 55 s | 6,770 MiB | 512 base, 9 refine tiles of 32 |
+| 2048x2048, `--tile-tokens 56` | 111 s | 6,890 MiB | 1024 base, 9 refine tiles, 3x3 decode tiles |
+| 1024x1024 edit, `--tile-tokens 40` | 49 s | 6,912 MiB | 512 condition image, 512 base, 2x2 refine tiles |
+
+For comparison, an **untiled** 2048x2048 run on the same card: the denoiser
+still fits (6,483 MiB, 4.04 s per step) but the decode needs 11,762 MiB, and an
+untiled 3072x3072 decode would need roughly 26 GB. Tiling the decode is what
+makes those sizes reachable at all; tiling the denoiser is what keeps the
+per-step cost and the peak from growing with the output.
+
+A 3072x3072 image is 36,864 target tokens, 4.5x the scheduler's
+`max_seq_length` of 8192, so no single pass could serve it. The 4x4 grid of
+64x64 tiles is 4096 tokens per tile, inside the range the model was trained at,
+which is the reason to tile rather than to push the rope to a new resolution.
+Accuracy against the one-pass decode of the same latents, at 1024x1024:
+
+| Decode tiles | Overlap / bleed | Relative L2 | 8-bit values differing | Max level error |
+|---|---|---:|---:|---:|
+| 48x48 (2x2) | 8 / 2 | 9.0e-4 | 4.7 % | 5 |
+| 40x40 (2x2) | 12 / 4 | 1.5e-3 | 6.7 % | 8 |
+| 32x32 (3x3) | 8 / 2 | 2.8e-3 | 11.0 % | 13 |
+
+The error concentrates on the tile seams and shrinks with tile size, as
+expected: a tile has less context for its mid-block attention and sees
+zero-padding outside its border, which is why the bleed exists. This is the
+same trade diffusers' `enable_tiling` makes.
+
+Refine quality, decoded detail energy (mean |dI/dy| + |dI/dx| of the luma) at
+1024x1024, one seed, identical base and seed:
+
+| Result | Detail |
+|---|---:|
+| Bilinear 2x latent upsample, no refine | 0.0226 |
+| Refine, 1 tile of 64 (the untiled restart) | 0.0346 |
+| Refine, 2x2 tiles of 40 | 0.0293 |
+| Refine, 3x3 tiles of 32 | 0.0277 |
+| 1024x1024 generated directly, 40 steps | 0.0349 |
+
+Against the untiled restart at the same strength and seed, the tiled latents
+reach cosine 0.9949 (2x2 of 40) and 0.9953 (3x3 of 32) with relative L2 0.10:
+each tile is an independent sample, so the fine detail is re-drawn rather than
+carried over, while the composition, palette and lighting survive. Cost grows
+and coherence falls with smaller tiles; that is the dial between VRAM and
+consistency.
+
+Notes and limits:
+
+- The mid-block attention is tile-local, both in the denoiser's refine tiles and
+  in the decode tiles. A tile cannot see content outside itself, so a large
+  object that spans a seam is drawn twice, once per tile, in slightly different
+  detail. Bigger tiles and larger overlaps reduce it.
+- `--refine-strength` is the resolution-fixing dial. Low values keep the
+  resampled (blurry) base; high values re-synthesize. 0.4 to 0.5 works well for
+  a 2x upscale with 20 or 40 steps; below about 0.2 the refine is a no-op and
+  above about 0.6 the base stops constraining the layout.
+- The renoise noise is generated per tile from `--refine-seed` with SplitMix64
+  and Box-Muller, so neighbouring tiles never share a noise pattern and a run is
+  reproducible. The seed is independent of `--seed`, which still controls the
+  base pass and the text encoder.
+- Tiling needs `--runner fast`. The parity harness `test_cuda_qimg21_native`
+  stays the numerical oracle and is unchanged.
+- A tile costs the same attention as any other image of its size, so the total
+  refine work grows with the tile *count*, not the output size squared. 9 tiles
+  of 56x56 is 28,224 token-steps against 268M for one 128x128 attention, which
+  is why 2048x2048 is affordable at all.
+
+### A restart bug this work found
+
+The extract step that fills the prefix K/V cache was gated on the schedule index
+being 0, so a restart (`--start-step K > 0`) and every tile after the first in
+a tiled refine ran their attention against an unwritten cache. The symptom was
+not a crash: images came out washed out with a checkerboard, and the detail
+energy of a "refine" was indistinguishable from a plain bilinear upsample. The
+gate is now "the cache has not been stored yet", which is also what makes the
+cache correctly shared across tiles, since prefix K/V does not depend on the
+tile.

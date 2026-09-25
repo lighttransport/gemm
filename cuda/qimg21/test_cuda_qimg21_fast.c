@@ -785,6 +785,156 @@ fail:
     return -1;
 }
 
+/* ---- Denoising schedule ------------------------------------------------ */
+
+/* Everything one run of steps [s0, s1) needs. The tiled refine path calls
+ * q21f_run_steps once per tile, so the schedule state is passed explicitly
+ * instead of living in main's locals. */
+typedef struct {
+    q21f_state *st;
+    q21f_branch *br;
+    int nb, batch, steps, kv_cache, extract, profile;
+    const char *dump_dir, *pred_dir;
+    float guidance, manual_t;
+    const float *sigmas;
+    uint16_t *pinned_te; /* [steps + 1][512] pinned staging, indexed by step */
+    float *host_out;     /* [target * 64] F32 */
+    uint16_t *host_pred; /* [target * 64] BF16 */
+    CUevent ev0, ev1;
+} q21f_job;
+
+/* Steps [s0, s1) on the sample currently in st->sample. `extracted` tracks
+ * whether the prefix K/V cache has been stored, so a tiled refine fills it on
+ * the first tile only: prefix rows use the zero-timestep modulation and attend
+ * only to earlier prefix tokens, so their K/V do not depend on the tile. */
+static int q21f_run_steps(q21f_runtime *rt, q21f_job *J, int s0, int s1, int *extracted) {
+    q21f_state *st = J->st;
+    q21f_branch *br = J->br;
+    int N = st->target, nb = J->nb;
+    char path[2048];
+    const char *saved_stage = rt->stage_dir;
+    if (J->dump_dir) rt->stage_dir = J->dump_dir;
+    for (int s = s0; s < s1; s++) {
+        float model_t = J->manual_t >= 0.0f
+                            ? J->manual_t
+                            : qimg21_round_bf16_host(qimg21_round_bf16_host(J->sigmas[s] * 1000.0f) / 1000.0f);
+        if (J->profile) CK(cuEventRecord(J->ev0, rt->compute));
+        REQ(!q21f_time(rt, st, model_t, J->pinned_te + (size_t)s * 512), "time embedding");
+        if (!J->kv_cache || (J->extract && !*extracted)) {
+            /* Joint [prefix; target] pass per branch, as the uncached
+             * reference computes every step; with the cache on, this is the
+             * extract step that stores the prefix K/V. It runs on the first
+             * *executed* step, so a restart (--start-step) and the later tiles
+             * of a tiled refine both reuse the one prefix cache. */
+            for (int i = 0; i < nb; i++)
+                REQ(!q21f_pass(rt, st, &br[i], 1, Q21F_JOINT, J->kv_cache, st->pred + (size_t)i * N * 64 * 2),
+                    "joint pass");
+            *extracted = 1;
+        } else if (J->batch == nb) REQ(!q21f_pass(rt, st, br, nb, Q21F_TARGET, 0, st->pred), "decode");
+        else
+            for (int i = 0; i < nb; i++)
+                REQ(!q21f_pass(rt, st, &br[i], 1, Q21F_TARGET, 0, st->pred + (size_t)i * N * 64 * 2), "decode");
+        int n = N * 64, cfg = nb > 1;
+        CUdeviceptr neg = st->pred + (size_t)N * 64 * 2;
+        if (J->pred_dir) {
+            if (cfg) { void *a[] = {&st->pred, &neg, &n, &J->guidance};
+                       REQ(!q21f_launch_n(rt, rt->cfg_combine, (size_t)n, a), "cfg"); }
+            CK(cuMemcpyDtoHAsync(J->host_pred, st->pred, (size_t)n * 2, rt->compute));
+            CK(cuStreamSynchronize(rt->compute));
+            for (int j = 0; j < n; j++) { uint32_t u = (uint32_t)J->host_pred[j] << 16; memcpy(&J->host_out[j], &u, 4); }
+            snprintf(path, sizeof(path), "%s/pred_%03d.npy", J->pred_dir, s);
+            REQ(!npy_write_f32(path, J->host_out, (size_t)n, N, 64), "write %s", path);
+            cfg = 0; /* already combined in place */
+        }
+        float dt = J->sigmas[s + 1] - J->sigmas[s];
+        { void *a[] = {&st->sample, &st->latent, &st->pred, &neg, &n, &J->guidance, &dt, &cfg};
+          REQ(!q21f_launch_n(rt, rt->euler, (size_t)n, a), "euler"); }
+        if (J->profile) {
+            float ms = 0;
+            CK(cuEventRecord(J->ev1, rt->compute));
+            CK(cuEventSynchronize(J->ev1));
+            CK(cuEventElapsedTime(&ms, J->ev0, J->ev1));
+            fprintf(stderr, "fast: step %d/%d sigma=%.7f %.1f ms\n", s + 1, J->steps, J->sigmas[s], ms);
+        } else if (rt->verbose >= 1)
+            fprintf(stderr, "fast: step %d/%d sigma=%.7f\n", s + 1, J->steps, J->sigmas[s]);
+        if (J->dump_dir) {
+            CK(cuMemcpyDtoHAsync(J->host_out, st->sample, (size_t)n * 4, rt->compute));
+            CK(cuStreamSynchronize(rt->compute));
+            snprintf(path, sizeof(path), "%s/step_%03d.npy", J->dump_dir, s);
+            REQ(!npy_write_f32(path, J->host_out, (size_t)n, N, 64), "write %s", path);
+        }
+    }
+    rt->stage_dir = saved_stage;
+    return 0;
+fail:
+    rt->stage_dir = saved_stage;
+    return -1;
+}
+
+/* ---- Tiled (coarse-to-fine) latent assembly ---------------------------- */
+
+/* Bilinear resample of a latent grid, align_corners=false, matching
+ * torch.nn.functional.interpolate: source pixel edges sit at (i + 0.5) * s. */
+static void q21f_resample(const float *src, int sh, int sw, float *dst, int dh, int dw) {
+    for (int y = 0; y < dh; y++) {
+        double fy = ((double)y + 0.5) * sh / dh - 0.5;
+        int y0 = (int)floor(fy);
+        double wy = fy - y0;
+        int y1 = y0 + 1;
+        y0 = y0 < 0 ? 0 : y0 >= sh ? sh - 1 : y0;
+        y1 = y1 < 0 ? 0 : y1 >= sh ? sh - 1 : y1;
+        for (int x = 0; x < dw; x++) {
+            double fx = ((double)x + 0.5) * sw / dw - 0.5;
+            int x0 = (int)floor(fx);
+            double wx = fx - x0;
+            int x1 = x0 + 1;
+            x0 = x0 < 0 ? 0 : x0 >= sw ? sw - 1 : x0;
+            x1 = x1 < 0 ? 0 : x1 >= sw ? sw - 1 : x1;
+            for (int c = 0; c < 64; c++) {
+                double a = src[((size_t)y0 * sw + x0) * 64 + c], b = src[((size_t)y0 * sw + x1) * 64 + c];
+                double d = src[((size_t)y1 * sw + x0) * 64 + c], e = src[((size_t)y1 * sw + x1) * 64 + c];
+                dst[((size_t)y * dw + x) * 64 + c] = (float)((a + (b - a) * wx) + ((d + (e - d) * wx) - (a + (b - a) * wx)) * wy);
+            }
+        }
+    }
+}
+
+/* SplitMix64 -> uniform in (0, 1) -> Box-Muller, so every tile gets its own
+ * reproducible noise from a single seed without a global RNG state. */
+static double q21f_gauss(unsigned long long *state, double *spare) {
+    if (*spare != 0.0) { double v = *spare; *spare = 0.0; return v; }
+    double u[2];
+    for (int i = 0; i < 2; i++) {
+        *state += 0x9e3779b97f4a7c15ULL;
+        unsigned long long z = *state;
+        z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+        z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+        u[i] = ((double)((z ^ (z >> 31)) >> 11) + 0.5) * (1.0 / 9007199254740992.0);
+    }
+    double r = sqrt(-2.0 * log(u[0]));
+    *spare = r * sin(2.0 * M_PI * u[1]);
+    return r * cos(2.0 * M_PI * u[1]);
+}
+
+/* Blend weight of one tile-local row or column. `lo`/`hi` are how many tokens
+ * this tile shares with the previous/next tile, so the raised-cosine ramps land
+ * exactly on the seam: a tile at the grid edge has one neighbour, ramps only on
+ * that side, and therefore covers its outer edge with full weight. */
+static double q21f_tile_window(int i, int size, int lo, int hi) {
+    if (lo > 0 && i < lo) return 0.5 - 0.5 * cos(M_PI * (double)i / lo);
+    if (hi > 0 && i >= size - hi) {
+        int d = size - 1 - i;
+        return 0.5 - 0.5 * cos(M_PI * (double)d / hi);
+    }
+    return 1.0;
+}
+
+/* Origin of tile t along one axis, and how far it overlaps its neighbours. */
+static int q21f_tile_origin(int t, int stride, int total, int size) {
+    int o = t * stride;
+    return o + size > total ? total - size : o;
+}
+
 /* ---- Planning --------------------------------------------------------- */
 
 typedef struct {
@@ -824,11 +974,14 @@ static const q21f_preset q21f_presets[] = {
 
 static void q21f_usage(const char *argv0) {
     fprintf(stderr,
-            "usage: %s --model DIR --prompt-embeds E.npy --latents L.npy [--height-tokens H --width-tokens W]\n"
+            "usage: %s --model DIR --prompt-embeds E.npy [--latents L.npy] [--height-tokens H --width-tokens W]\n"
             "  [--steps N | --timestep T] [--negative-prompt-embeds NEG.npy --guidance-scale S]\n"
             "  [--editing-layout L.txt --condition-latents C.npy [--negative-editing-layout NL.txt]]\n"
             "  [--preset low8|low8-fp4|fast12|accurate] [--vram-budget-mib MIB] [--cfg-batch 0|1] [--fused-gemm 0|1] [--kv-cache on|off]\n"
             "  [--prefix-pass extract|separate] [--plan-only] [--profile]\n"
+            "  restart: --start-step K [--refine-seed N] (img2img strength on a [base_h, base_w, 64] --latents grid)\n"
+            "  tiled coarse-to-fine refine: --refine-from GRID.npy --tile-tokens T [--tile-overlap O]\n"
+            "                               [--refine-strength S] [--refine-seed N]\n"
             "  [--weights bf16|int8|nvfp4 --quant-package DIR [--bf16-blocks 0,31]] [--fp4-gemm cutlass|omma]\n"
             "  [--int8-gemm cutlass|cublas]\n"
             "  diagnostics: [--trace] [--verify-slots] [--stage-dir DIR] [--calib-dump FILE.npy]\n"
@@ -844,12 +997,14 @@ int main(int argc, char **argv) {
     const char *out_path = "native_latents.npy", *dump_dir = NULL, *pred_dir = NULL;
     const char *plugin_path = NULL;
     const char *rope_path = "cuda/qimg21/qwen21_rope_freqs.npy";
-    const char *stage_dir = NULL, *calib_path = NULL, *package = NULL, *bf16_blocks = NULL;
+    const char *stage_dir = NULL, *calib_path = NULL, *package = NULL, *bf16_blocks = NULL, *refine_path = NULL;
     int int8_weights = 0, tail_blocks = 0, fp4_cutlass = 1, i8_cutlass = 1;
     char tail_list[160] = "";
     int ih = 16, iw = 16, steps = 1, verbose = 1, cfg_batch = 1, plan_only = 0, profile = 0, fused_gemm = 1;
     int kv_cache = 1, extract = 1, trace = 0, verify_slots = 0, flash = 0, rt_sage_accum = 1;
-    double budget_mib = 0;
+    int tile_tokens = 0, tile_overlap = 8, start_step = 0;
+    double budget_mib = 0, refine_strength = 0.0;
+    unsigned long long refine_seed = 0;
     float guidance = 1.0f, manual_t = -1.0f;
     const q21f_preset *preset = NULL;
     for (int i = 1; i + 1 < argc; i++)
@@ -910,6 +1065,12 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--trace")) trace = 1;
         else if (!strcmp(a, "--stage-dir") && more) stage_dir = argv[++i];
         else if (!strcmp(a, "--calib-dump") && more) calib_path = argv[++i];
+        else if (!strcmp(a, "--refine-from") && more) refine_path = argv[++i];
+        else if (!strcmp(a, "--tile-tokens") && more) tile_tokens = atoi(argv[++i]);
+        else if (!strcmp(a, "--tile-overlap") && more) tile_overlap = atoi(argv[++i]);
+        else if (!strcmp(a, "--start-step") && more) start_step = atoi(argv[++i]);
+        else if (!strcmp(a, "--refine-strength") && more) refine_strength = atof(argv[++i]);
+        else if (!strcmp(a, "--refine-seed") && more) refine_seed = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(a, "--quant-package") && more) package = argv[++i];
         else if (!strcmp(a, "--fp4-gemm") && more) {
             const char *m = argv[++i];
@@ -951,7 +1112,7 @@ int main(int argc, char **argv) {
             }
         } else { q21f_usage(argv[0]); return 2; }
     }
-    if (!model || !prompt_path || !latent_path || ih < 1 || iw < 1 || ih > 1024 || iw > 1024 ||
+    if (!model || !prompt_path || (!latent_path && !refine_path) || ih < 1 || iw < 1 || ih > 1024 || iw > 1024 ||
         steps < 1 || steps > 100 || (manual_t >= 0.0f && steps != 1) || cfg_batch < 0 || cfg_batch > 1) {
         q21f_usage(argv[0]);
         return 2;
@@ -977,9 +1138,45 @@ int main(int argc, char **argv) {
         fprintf(stderr, "fast: --guidance-scale must be > 1 with negative embeds\n");
         return 2;
     }
+    /* Tiled coarse-to-fine refine: the base latent grid from --refine-from is
+     * resampled onto the --height-tokens/--width-tokens output grid, then
+     * denoised one --tile-tokens square at a time, so device memory and
+     * attention cost follow the tile, not the output. */
+    if (!!refine_path != !!tile_tokens) {
+        fprintf(stderr, "fast: --refine-from and --tile-tokens go together\n");
+        return 2;
+    }
+    if (refine_path && (tile_tokens < 1 || tile_tokens > ih || tile_tokens > iw)) {
+        fprintf(stderr, "fast: --tile-tokens must be in [1, min(height-tokens, width-tokens)] = [%d, %d]\n",
+                tile_tokens, ih < iw ? ih : iw);
+        return 2;
+    }
+    if (tile_overlap < 0) tile_overlap = 0;
+    if (tile_overlap >= tile_tokens) tile_overlap = tile_tokens - 1;
+    if (start_step < 0 || start_step >= steps || (start_step && manual_t >= 0.0f)) {
+        fprintf(stderr, "fast: --start-step must be in [0, steps) and cannot combine with --timestep\n");
+        return 2;
+    }
+    if (refine_path && (refine_strength <= 0.0 || refine_strength > 1.0)) {
+        fprintf(stderr, "fast: a tiled refine needs --refine-strength in (0, 1]\n");
+        return 2;
+    }
 
     int rc = 1, N = ih * iw, nb = negative_path ? 2 : 1;
-    npy_f32 pe = {0}, ne = {0}, la = {0}, cond = {0}, rope = {0};
+    int th = refine_path ? tile_tokens : ih, tw = refine_path ? tile_tokens : iw, T = th * tw;
+    int tstride = tile_tokens - tile_overlap;
+    /* Enough tiles to cover the output grid at `tstride`; the last row/column
+     * of tiles is clamped to the grid edge, so it may overlap more than
+     * tile_overlap and is the only one that can. */
+    int nrows = tile_tokens < ih ? (ih - tile_tokens + tstride - 1) / tstride + 1 : 1;
+    int ncols = tile_tokens < iw ? (iw - tile_tokens + tstride - 1) / tstride + 1 : 1;
+    int refine_start = 0; /* first step of a tiled refine, filled in below */
+    if (refine_path && (long)nrows * ncols > 1024) {
+        fprintf(stderr, "fast: --tile-tokens %d would need %d tiles for a %dx%d grid; "
+                "raise --tile-tokens\n", tile_tokens, nrows * ncols, ih, iw);
+        return 2;
+    }
+    npy_f32 pe = {0}, ne = {0}, la = {0}, cond = {0}, rope = {0}, base_grid = {0};
     q21f_runtime rt;
     q21f_state st;
     q21f_branch br[2];
@@ -988,6 +1185,9 @@ int main(int argc, char **argv) {
     uint16_t *pinned_te = NULL;
     float *host_out = NULL, *sigmas = NULL;
     uint16_t *host_pred = NULL;
+    /* Tiled refine host state: fine0 is the immutable resampled base, fine the
+     * running blend and fine_w its accumulated weight. */
+    float *fine0 = NULL, *fine = NULL, *fine_w = NULL, *tile_in = NULL, *tile_out = NULL;
     memset(&rt, 0, sizeof(rt));
     memset(&st, 0, sizeof(st));
     memset(br, 0, sizeof(br));
@@ -996,7 +1196,8 @@ int main(int argc, char **argv) {
     rt.stage_dir = stage_dir;
     if (stage_dir) mkdir(stage_dir, 0755);
 
-    REQ(!npy_read_f32(prompt_path, &pe) && !npy_read_f32(latent_path, &la), "cannot read inputs");
+    REQ(!npy_read_f32(prompt_path, &pe) && (!latent_path || !npy_read_f32(latent_path, &la)),
+        "cannot read inputs");
     REQ(!negative_path || !npy_read_f32(negative_path, &ne), "cannot read negative embeds");
     REQ(!npy_read_f32(rope_path, &rope) && rope.ndim == 2 && rope.shape[1] == 128,
         "invalid RoPE table %s", rope_path);
@@ -1006,10 +1207,36 @@ int main(int argc, char **argv) {
         br[1].nt = ne.ndim == 3 && ne.shape[0] == 1 ? (int)ne.shape[1] : (ne.ndim == 2 ? (int)ne.shape[0] : 0);
         br[1].prompt = ne.data;
     }
-    int ni = la.ndim == 3 && la.shape[0] == 1 ? (int)la.shape[1] : (la.ndim == 2 ? (int)la.shape[0] : 0);
-    REQ(br[0].nt > 0 && pe.shape[pe.ndim - 1] == Q21F_D && ni == N && la.shape[la.ndim - 1] == 64 &&
+    if (refine_path) {
+        /* The base grid comes from the file: --refine-from is a 3-D
+         * [base_h, base_w, 64] latent, so no separate flag can disagree with
+         * the data. --latents is unused on this path. */
+        REQ(!npy_read_f32(refine_path, &base_grid) && base_grid.ndim == 3 && base_grid.shape[2] == 64 &&
+            base_grid.shape[0] > 0 && base_grid.shape[1] > 0,
+            "--refine-from must be a [base_h, base_w, 64] latent grid");
+        REQ(base_grid.shape[0] <= (size_t)ih && base_grid.shape[1] <= (size_t)iw,
+            "base latent grid %zux%zu does not fit the %dx%d output grid", base_grid.shape[0], base_grid.shape[1],
+            ih, iw);
+        for (size_t i = 0; i < base_grid.n; i++)
+            if (!isfinite(base_grid.data[i])) {
+                fprintf(stderr, "fast: non-finite base latent at %zu\n", i);
+                return 2;
+            }
+        npy_free(&la);
+    } else {
+        int ni = la.ndim == 3 && la.shape[0] == 1 ? (int)la.shape[1] : (la.ndim == 2 ? (int)la.shape[0] : 0);
+        /* --start-step additionally accepts a coarse [bh, bw, 64] grid, which
+         * it resamples onto the output grid before renoising. */
+        int coarse = la.ndim == 3 && la.shape[0] != 1 && la.shape[2] == 64 && la.shape[0] > 0 &&
+                     la.shape[1] > 0 && la.shape[0] <= (size_t)ih && la.shape[1] <= (size_t)iw;
+        REQ(start_step ? (coarse || (ni == N && la.shape[la.ndim - 1] == 64))
+                       : (ni == N && la.shape[la.ndim - 1] == 64),
+            "expected --latents with %d rows of 64 channels for a %dx%d grid, or a "
+            "[base_h, base_w, 64] grid with --start-step", N, ih, iw);
+    }
+    REQ(br[0].nt > 0 && pe.shape[pe.ndim - 1] == Q21F_D &&
         (!negative_path || (br[1].nt > 0 && ne.shape[ne.ndim - 1] == Q21F_D)),
-        "expected embeds [T,4096], optional negative embeds [U,4096], and latents [H*W,64]");
+        "expected embeds [T,4096] and optional negative embeds [U,4096]");
     if (condition_path) {
         REQ(!npy_read_f32(condition_path, &cond), "cannot read condition latents");
         st.nc = cond.ndim == 3 && cond.shape[0] == 1 ? (int)cond.shape[1] : (cond.ndim == 2 ? (int)cond.shape[0] : 0);
@@ -1020,12 +1247,17 @@ int main(int argc, char **argv) {
         const char *path = i ? negative_layout_path : layout_path;
         if (path) {
             int slots, h, w;
-            REQ(!q21_layout_read(path, &br[i].layout, &slots, &h, &w) && slots == br[i].nt && h == ih &&
-                w == iw && br[i].layout.image_tokens == st.nc + N, "invalid editing layout %s", path);
+            /* The layout's target block is the denoised grid: the tile when
+             * refining, the output grid otherwise. */
+            REQ(!q21_layout_read(path, &br[i].layout, &slots, &h, &w) && slots == br[i].nt && h == th &&
+                w == tw && br[i].layout.image_tokens == st.nc + T, "invalid editing layout %s", path);
             br[i].edit = 1;
             br[i].prefix = br[i].layout.prefix;
         } else br[i].prefix = br[i].nt;
     }
+    if (refine_path)
+        for (int i = 0; i < nb; i++)
+            REQ(br[i].prefix > 0, "a tiled refine needs a non-empty text prefix");
 
     /* ---- Device ---- */
     REQ(cuewInit(CUEW_INIT_CUDA | CUEW_INIT_NVRTC) == CUEW_SUCCESS, "cuewInit failed");
@@ -1127,24 +1359,24 @@ int main(int argc, char **argv) {
     int nt_max = br[0].nt > br[1].nt ? br[0].nt : br[1].nt;
     int prefix_max = br[0].prefix > br[1].prefix ? br[0].prefix : br[1].prefix;
     int batch = cfg_batch ? nb : 1;
-    st.target = N;
-    st.rows_max = N * batch;
-    if (st.rows_max < prefix_max + N) st.rows_max = prefix_max + N;
+    st.target = T;
+    st.rows_max = T * batch;
+    if (st.rows_max < prefix_max + T) st.rows_max = prefix_max + T;
     if (st.rows_max < nt_max + st.nc) st.rows_max = nt_max + st.nc;
     q21f_plan plan = {0};
     for (int b = 0; b < Q21F_BLOCKS; b++)
         if (rt.block[b].bytes > plan.block_bytes) plan.block_bytes = rt.block[b].bytes;
     plan.fixed = (size_t)(2 * Q21F_D * Q21F_D + Q21F_D * 64 + Q21F_D * 256 + Q21F_D * Q21F_D +
                           4 * Q21F_D * Q21F_D + Q21F_D * Q21F_D + 64 * Q21F_D) * 2 + Q21F_D * 4;
-    plan.activations = q21f_state_bytes(st.rows_max, N, nb, nt_max, st.nc);
+    plan.activations = q21f_state_bytes(st.rows_max, T, nb, nt_max, st.nc);
     if (int8_weights == 1) {
         rt.acc_bytes = rt.i8_gemm ? 0 : 128 * Q21F_MIB;
         plan.activations += ((size_t)st.rows_max + 16) * (Q21F_F + 4) + rt.acc_bytes;
     } else if (int8_weights == 2)
         plan.activations += (size_t)st.rows_max * (Q21F_F / 2 + Q21F_F / 8 + 4 + Q21F_RANK * 2) + 128 * Q21F_F / 16;
     for (int i = 0; i < nb; i++)
-        plan.kv += ((size_t)Q21F_BLOCKS * br[i].prefix + br[i].prefix + N) * Q21F_D * 2 * 2 +
-                   (size_t)br[i].prefix * Q21F_D * 2 + (size_t)(br[i].prefix + N) * 128 * 4;
+        plan.kv += ((size_t)Q21F_BLOCKS * br[i].prefix + br[i].prefix + T) * Q21F_D * 2 * 2 +
+                   (size_t)br[i].prefix * Q21F_D * 2 + (size_t)(br[i].prefix + T) * 128 * 4;
     size_t free_bytes = 0, total_bytes = 0;
     CK(cuMemGetInfo(&free_bytes, &total_bytes));
     /* The budget covers this process: explicit allocations plus a fixed
@@ -1290,111 +1522,181 @@ int main(int argc, char **argv) {
         SA(cond_bf16, (size_t)(st.nc > 0 ? st.nc : 1) * 64 * 2);
         SA(te, 512 * 2); SA(temb, 2 * D * 2); SA(temb2, 2 * D * 2); SA(tsilu, 2 * D * 2); SA(mod, 8 * D * 2);
         SA(modc, 8 * D * 4); SA(scale, 2 * D * 2); SA(fscale, 2 * D * 4);
-        SA(latent, (size_t)N * 64 * 2); SA(sample, (size_t)N * 64 * 4); SA(pred, (size_t)N * nb * 64 * 2);
+        SA(latent, (size_t)T * 64 * 2); SA(sample, (size_t)T * 64 * 4); SA(pred, (size_t)T * nb * 64 * 2);
 #undef SA
         for (int i = 0; i < nb; i++) {
             size_t P = (size_t)br[i].prefix;
             br[i].cache_k = q21f_alloc(&rt, Q21F_BLOCKS * P * D * 2);
             br[i].cache_v = q21f_alloc(&rt, Q21F_BLOCKS * P * D * 2);
-            br[i].work_k = q21f_alloc(&rt, (P + N) * D * 2);
-            br[i].work_v = q21f_alloc(&rt, (P + N) * D * 2);
+            br[i].work_k = q21f_alloc(&rt, (P + T) * D * 2);
+            br[i].work_v = q21f_alloc(&rt, (P + T) * D * 2);
             br[i].prefix_hidden = q21f_alloc(&rt, P * D * 2);
-            br[i].rope = q21f_alloc(&rt, (P + N) * 128 * 4);
+            br[i].rope = q21f_alloc(&rt, (P + T) * 128 * 4);
             REQ(br[i].cache_k && br[i].cache_v && br[i].work_k && br[i].work_v && br[i].prefix_hidden &&
                 br[i].rope, "branch %d K/V allocation", i);
-            int *pos = q21f_positions(&br[i], ih, iw);
-            REQ(pos && q21f_valid_rope(&rope, pos, (int)P + N), "RoPE positions outside the table");
-            float *table = (float *)malloc((P + N) * 128 * sizeof(float));
+            int *pos = q21f_positions(&br[i], th, tw);
+            REQ(pos && q21f_valid_rope(&rope, pos, (int)P + T), "RoPE positions outside the table");
+            float *table = (float *)malloc((P + T) * 128 * sizeof(float));
             REQ(table, "RoPE table allocation");
-            q21f_rope_rows(table, rope.data, pos, (int)P + N);
+            q21f_rope_rows(table, rope.data, pos, (int)P + T);
             /* Pageable async copies are staged before returning, so the
              * table can be freed right away. */
-            int e = q21f_upload(&rt, br[i].rope, table, (P + N) * 128 * 4, 0);
+            int e = q21f_upload(&rt, br[i].rope, table, (P + T) * 128 * 4, 0);
             free(table);
             free(pos);
             REQ(!e, "RoPE upload");
         }
     }
     CK(cuMemHostAlloc((void **)&pinned_te, (size_t)(steps + 1) * 512 * 2, 0));
-    host_out = (float *)malloc((size_t)N * 64 * sizeof(float));
-    host_pred = (uint16_t *)malloc((size_t)N * nb * 64 * sizeof(uint16_t));
+    host_out = (float *)malloc((size_t)T * 64 * sizeof(float));
+    host_pred = (uint16_t *)malloc((size_t)T * nb * 64 * sizeof(uint16_t));
     sigmas = (float *)malloc((size_t)(steps + 1) * sizeof(float));
-    REQ(host_out && host_pred && sigmas, "host allocation");
+    if (refine_path) {
+        /* The assembled fine grid and its blend weight stay in host memory;
+         * only one tile is ever resident. */
+        fine0 = (float *)malloc((size_t)N * 64 * sizeof(float));
+        fine = (float *)calloc((size_t)N * 64, sizeof(float));
+        fine_w = (float *)calloc((size_t)N, sizeof(float));
+        tile_in = (float *)malloc((size_t)T * 64 * sizeof(float));
+        tile_out = (float *)malloc((size_t)T * 64 * sizeof(float));
+    }
+    REQ(host_out && host_pred && sigmas && (!refine_path || (fine0 && fine && fine_w && tile_in && tile_out)),
+        "host allocation");
     fprintf(stderr, "fast: device allocations %.0f MiB (peak %.0f MiB)\n", rt.allocated / (double)Q21F_MIB,
             rt.peak / (double)Q21F_MIB);
 
     /* ---- Sampling ---- */
+    q21f_job job = {&st, br, nb, batch, steps, kv_cache, extract, profile, dump_dir, pred_dir, guidance,
+                    manual_t, NULL, pinned_te, host_out, host_pred, NULL, NULL};
     if (manual_t >= 0.0f) { sigmas[0] = manual_t; sigmas[1] = 0.0f; }
-    else qimg21_flow_sigmas(steps, N, sigmas);
-    REQ(!q21f_upload(&rt, st.sample, la.data, (size_t)N * 64 * 4, 0), "latent upload");
-    { int n = N * 64; void *a[] = {&st.latent, &st.sample, &n};
-      REQ(!q21f_launch_n(&rt, rt.cast_bf16, (size_t)n, a), "latent cast"); }
+    else qimg21_flow_sigmas(steps, T, sigmas);
+    job.sigmas = sigmas;
     if (dump_dir) mkdir(dump_dir, 0755);
     if (pred_dir) mkdir(pred_dir, 0755);
 
     double prefill_start = q21f_seconds();
     for (int i = 0; i < nb; i++) REQ(!q21f_embed_prefix(&rt, &st, &br[i]), "prefix embedding %d", i);
     if (kv_cache && !extract) {
-        /* The zero-timestep modulation row is step independent. */
+        /* The zero-timestep modulation row is step independent, and so is the
+         * prefix K/V it produces, so this pass is shared by every tile. */
         REQ(!q21f_time(&rt, &st, 0.0f, pinned_te + (size_t)steps * 512), "time embedding");
         for (int i = 0; i < nb; i++)
             REQ(!q21f_pass(&rt, &st, &br[i], 1, Q21F_PREFIX, 1, 0), "prefix pass %d", i);
     }
+    CUevent ev0 = NULL, ev1 = NULL;
+    if (profile) { CK(cuEventCreate(&ev0, 0)); CK(cuEventCreate(&ev1, 0)); job.ev0 = ev0; job.ev1 = ev1; }
     CK(cuStreamSynchronize(rt.compute));
     double prefill_s = q21f_seconds() - prefill_start;
-    CUevent ev0 = NULL, ev1 = NULL;
-    if (profile) { CK(cuEventCreate(&ev0, 0)); CK(cuEventCreate(&ev1, 0)); }
     double loop_start = q21f_seconds();
-    for (int s = 0; s < steps; s++) {
-        float model_t = manual_t >= 0.0f ? manual_t :
-            qimg21_round_bf16_host(qimg21_round_bf16_host(sigmas[s] * 1000.0f) / 1000.0f);
-        if (profile) CK(cuEventRecord(ev0, rt.compute));
-        REQ(!q21f_time(&rt, &st, model_t, pinned_te + (size_t)s * 512), "time embedding");
-        if (!kv_cache || (extract && s == 0)) {
-            /* Joint [prefix; target] pass per branch, as the uncached
-             * reference computes every step; with the cache on, this is the
-             * extract step that stores the prefix K/V. */
-            for (int i = 0; i < nb; i++)
-                REQ(!q21f_pass(&rt, &st, &br[i], 1, Q21F_JOINT, kv_cache, st.pred + (size_t)i * N * 64 * 2),
-                    "joint pass");
-        } else if (batch == nb) REQ(!q21f_pass(&rt, &st, br, nb, Q21F_TARGET, 0, st.pred), "decode");
-        else
-            for (int i = 0; i < nb; i++)
-                REQ(!q21f_pass(&rt, &st, &br[i], 1, Q21F_TARGET, 0, st.pred + (size_t)i * N * 64 * 2), "decode");
-        int n = N * 64, cfg = nb > 1;
-        CUdeviceptr neg = st.pred + (size_t)N * 64 * 2;
-        if (pred_dir) {
-            if (cfg) { void *a[] = {&st.pred, &neg, &n, &guidance};
-                       REQ(!q21f_launch_n(&rt, rt.cfg_combine, (size_t)n, a), "cfg"); }
-            CK(cuMemcpyDtoHAsync(host_pred, st.pred, (size_t)n * 2, rt.compute));
-            CK(cuStreamSynchronize(rt.compute));
-            for (int j = 0; j < n; j++) { uint32_t u = (uint32_t)host_pred[j] << 16; memcpy(&host_out[j], &u, 4); }
-            snprintf(path, sizeof(path), "%s/pred_%03d.npy", pred_dir, s);
-            REQ(!npy_write_f32(path, host_out, (size_t)n, N, 64), "write %s", path);
-            cfg = 0; /* already combined in place */
+    double loop_s = 0.0;
+    if (refine_path) {
+        /* Coarse-to-fine: resample the base latent onto the output grid, then
+         * restart the flow at the sigma --refine-strength selects. Each tile
+         * draws its own noise, so neighbouring tiles do not share a pattern
+         * that the blend could amplify. */
+        int s0 = steps - (int)lround(refine_strength * steps);
+        if (s0 < 1) s0 = 1;
+        if (s0 >= steps) s0 = steps - 1;
+        refine_start = s0;
+        q21f_resample(base_grid.data, (int)base_grid.shape[0], (int)base_grid.shape[1], fine0, ih, iw);
+        fprintf(stderr, "fast: tiled refine %dx%d over a %zux%zu base grid, %dx%d tiles of %dx%d tokens "
+                "(stride %d), %d refine steps from sigma %.5f\n", ih, iw, base_grid.shape[0], base_grid.shape[1],
+                nrows, ncols, th, tw, tstride, steps - s0, sigmas[s0]);
+        int extracted = 0, tile_index = 0;
+        for (int tr = 0; tr < nrows; tr++) {
+            int r0 = q21f_tile_origin(tr, tstride, ih, th);
+            int r_lo = tr > 0 ? q21f_tile_origin(tr - 1, tstride, ih, th) + th - r0 : 0;
+            int r_hi = tr + 1 < nrows ? r0 + th - q21f_tile_origin(tr + 1, tstride, ih, th) : 0;
+            for (int tc = 0; tc < ncols; tc++, tile_index++) {
+                int c0 = q21f_tile_origin(tc, tstride, iw, tw);
+                int c_lo = tc > 0 ? q21f_tile_origin(tc - 1, tstride, iw, tw) + tw - c0 : 0;
+                int c_hi = tc + 1 < ncols ? c0 + tw - q21f_tile_origin(tc + 1, tstride, iw, tw) : 0;
+                double keep = 1.0 - sigmas[s0], noise = sigmas[s0], spare = 0.0;
+                unsigned long long rng = (refine_seed + 0x9e3779b97f4a7c15ULL) * 0xbf58476d1ce4e5b9ULL +
+                                         (unsigned long long)tile_index * 0x94d049bb133111ebULL;
+                for (int y = 0; y < th; y++)
+                    for (int x = 0; x < tw; x++) {
+                        const float *src = fine0 + (((size_t)(r0 + y) * iw) + c0 + x) * 64;
+                        float *dst = tile_in + ((size_t)y * tw + x) * 64;
+                        for (int c = 0; c < 64; c++)
+                            dst[c] = (float)(keep * src[c] + noise * q21f_gauss(&rng, &spare));
+                    }
+                /* wait=1: the tile buffer is reused by the next tile. */
+                REQ(!q21f_upload(&rt, st.sample, tile_in, (size_t)T * 64 * 4, 1), "tile latent upload");
+                { int n = T * 64; void *a[] = {&st.latent, &st.sample, &n};
+                  REQ(!q21f_launch_n(&rt, rt.cast_bf16, (size_t)n, a), "latent cast"); }
+                /* Per-tile dump directories, so a tiled run does not overwrite
+                 * itself once per tile. */
+                if (dump_dir || pred_dir) {
+                    const char *root = dump_dir ? dump_dir : pred_dir;
+                    char tile_dir[2048];
+                    snprintf(tile_dir, sizeof(tile_dir), "%s/tile_%03d", root, tile_index);
+                    REQ(mkdir(tile_dir, 0755) == 0 || errno == EEXIST, "cannot create %s", tile_dir);
+                    job.dump_dir = dump_dir ? tile_dir : NULL;
+                    job.pred_dir = pred_dir ? tile_dir : NULL;
+                }
+                REQ(!q21f_run_steps(&rt, &job, s0, steps, &extracted), "tile %d/%d denoise", tile_index + 1,
+                    nrows * ncols);
+                CK(cuMemcpyDtoHAsync(tile_out, st.sample, (size_t)T * 64 * 4, rt.compute));
+                CK(cuStreamSynchronize(rt.compute));
+                for (int y = 0; y < th; y++) {
+                    double wy = q21f_tile_window(y, th, r_lo, r_hi);
+                    for (int x = 0; x < tw; x++) {
+                        size_t o = ((size_t)(r0 + y) * iw) + c0 + x;
+                        double w = wy * q21f_tile_window(x, tw, c_lo, c_hi);
+                        const float *src = tile_out + ((size_t)y * tw + x) * 64;
+                        float *dst = fine + o * 64;
+                        for (int c = 0; c < 64; c++) dst[c] += (float)(w * src[c]);
+                        fine_w[o] += (float)w;
+                    }
+                }
+                if (rt.verbose >= 1)
+                    fprintf(stderr, "fast: tile %d/%d (row %d col %d) at latent %d,%d\n", tile_index + 1,
+                            nrows * ncols, tr, tc, r0, c0);
+            }
         }
-        float dt = sigmas[s + 1] - sigmas[s];
-        { void *a[] = {&st.sample, &st.latent, &st.pred, &neg, &n, &guidance, &dt, &cfg};
-          REQ(!q21f_launch_n(&rt, rt.euler, (size_t)n, a), "euler"); }
-        if (profile) {
-            float ms = 0;
-            CK(cuEventRecord(ev1, rt.compute));
-            CK(cuEventSynchronize(ev1));
-            CK(cuEventElapsedTime(&ms, ev0, ev1));
-            fprintf(stderr, "fast: step %d/%d sigma=%.7f %.1f ms\n", s + 1, steps, sigmas[s], ms);
-        } else if (verbose >= 1)
-            fprintf(stderr, "fast: step %d/%d sigma=%.7f\n", s + 1, steps, sigmas[s]);
-        if (dump_dir) {
-            CK(cuMemcpyDtoHAsync(host_out, st.sample, (size_t)n * 4, rt.compute));
-            CK(cuStreamSynchronize(rt.compute));
-            snprintf(path, sizeof(path), "%s/step_%03d.npy", dump_dir, s);
-            REQ(!npy_write_f32(path, host_out, (size_t)n, N, 64), "write %s", path);
+        /* Normalize the blend. Interior-facing edges ramp, so a grid-boundary
+         * token is covered by exactly one tile and every weight is positive. */
+        for (size_t i = 0; i < (size_t)N; i++) {
+            if (!(fine_w[i] > 0.0f)) {
+                fprintf(stderr, "fast: the tile grid left latent %zu uncovered\n", i);
+                return 1;
+            }
+            float inv = 1.0f / fine_w[i];
+            for (int c = 0; c < 64; c++) fine[i * 64 + c] *= inv;
         }
+        loop_s = q21f_seconds() - loop_start;
+        REQ(!npy_write_f32(out_path, fine, (size_t)N * 64, N, 64), "write %s", out_path);
+        fprintf(stderr, "fast: wrote %s (%dx%d grid, %d tokens) in %.3f s\n", out_path, ih, iw, N, loop_s);
+    } else {
+        /* A restart resamples --latents (a [base_h, base_w, 64] grid, or the
+         * output grid itself) onto the output grid and renoises it to
+         * sigma[start_step], which is the single-tile case of the tiled
+         * refine: one tile, no blend, the same noise. */
+        const float *x0 = la.data;
+        if (start_step) {
+            if (la.ndim == 3) {
+                q21f_resample(la.data, (int)la.shape[0], (int)la.shape[1], host_out, ih, iw);
+                x0 = host_out;
+            }
+            double keep = 1.0 - sigmas[start_step], noise = sigmas[start_step], spare = 0.0;
+            unsigned long long rng = (refine_seed + 0x9e3779b97f4a7c15ULL) * 0xbf58476d1ce4e5b9ULL;
+            for (size_t i = 0; i < (size_t)T * 64; i++)
+                host_out[i] = (float)(keep * x0[i] + noise * q21f_gauss(&rng, &spare));
+            x0 = host_out;
+            fprintf(stderr, "fast: restart at step %d/%d, sigma %.5f, seed %llu\n", start_step, steps,
+                    sigmas[start_step], refine_seed);
+        }
+        REQ(!q21f_upload(&rt, st.sample, x0, (size_t)T * 64 * 4, 0), "latent upload");
+        { int n = T * 64; void *a[] = {&st.latent, &st.sample, &n};
+          REQ(!q21f_launch_n(&rt, rt.cast_bf16, (size_t)n, a), "latent cast"); }
+        int extracted = 0;
+        REQ(!q21f_run_steps(&rt, &job, start_step, steps, &extracted), "denoise");
+        CK(cuMemcpyDtoHAsync(host_out, st.sample, (size_t)T * 64 * 4, rt.compute));
+        CK(cuStreamSynchronize(rt.compute));
+        loop_s = q21f_seconds() - loop_start;
+        REQ(!npy_write_f32(out_path, host_out, (size_t)T * 64, T, 64), "write %s", out_path);
     }
-    CK(cuMemcpyDtoHAsync(host_out, st.sample, (size_t)N * 64 * 4, rt.compute));
-    CK(cuStreamSynchronize(rt.compute));
-    double loop_s = q21f_seconds() - loop_start;
-    REQ(!npy_write_f32(out_path, host_out, (size_t)N * 64, N, 64), "write %s", out_path);
     if (rt.calib) {
         size_t n = (size_t)Q21F_BLOCKS * 4 * Q21F_F;
         float *h = (float *)malloc(n * 4);
@@ -1436,10 +1738,18 @@ int main(int argc, char **argv) {
     }
     size_t free_after = 0;
     cuMemGetInfo(&free_after, &total_bytes);
-    fprintf(stderr, "fast: prefill %.3f s, %d steps %.3f s (%.3f s/step), device allocations peak %.0f MiB, "
-            "device free %.0f MiB\n", prefill_s, steps, loop_s, loop_s / steps, rt.peak / (double)Q21F_MIB,
+    if (refine_path)
+        fprintf(stderr, "fast: tiled refine holds %.0f MiB of assembled latents in host memory; ",
+                (size_t)N * 64 * 4 / (double)Q21F_MIB);
+    fprintf(stderr, "fast: prefill %.3f s, ", prefill_s);
+    if (refine_path)
+        fprintf(stderr, "%d tiles x %d refine steps %.3f s (%.3f s/step), ", nrows * ncols, steps - refine_start,
+                loop_s, loop_s / ((nrows * ncols) * (steps - refine_start)));
+    else
+        fprintf(stderr, "%d steps %.3f s (%.3f s/step), ", steps, loop_s, loop_s / steps);
+    fprintf(stderr, "device allocations peak %.0f MiB, device free %.0f MiB\n", rt.peak / (double)Q21F_MIB,
             free_after / (double)Q21F_MIB);
-    fprintf(stderr, "fast: wrote %s (%d tokens x 64, %d steps)\n", out_path, N, steps);
+    if (!refine_path) fprintf(stderr, "fast: wrote %s (%d tokens x 64, %d steps)\n", out_path, T, steps);
     rc = 0;
 fail:
     if (rt.compute) cuStreamSynchronize(rt.compute);
@@ -1457,6 +1767,7 @@ fail:
     if (rt.i8_plugin) dlclose(rt.i8_plugin);
     if (rt.sage_plugin) dlclose(rt.sage_plugin);
     free(host_out); free(host_pred); free(sigmas);
-    npy_free(&pe); npy_free(&ne); npy_free(&la); npy_free(&cond); npy_free(&rope);
+    free(fine0); free(fine); free(fine_w); free(tile_in); free(tile_out);
+    npy_free(&pe); npy_free(&ne); npy_free(&la); npy_free(&cond); npy_free(&rope); npy_free(&base_grid);
     return rc;
 }

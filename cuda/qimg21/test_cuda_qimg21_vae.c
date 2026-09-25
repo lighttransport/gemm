@@ -587,8 +587,103 @@ static int qimg21_vae_decode(cuda_qimg_runner *r, const st_context *st,
     }
 }
 
+/* ---- Tiled decode ------------------------------------------------------ */
+
+/* Origin of tile t along one axis; the last tile is clamped to the edge. */
+static int q21_tile_origin(int t, int stride, int total, int size) {
+    int o = t * stride;
+    return o + size > total ? total - size : o;
+}
+
+/* Blend weight of one tile-local row/column. `lo`/`hi` are how many latent
+ * tokens this tile shares with the previous/next tile, so the raised-cosine
+ * ramp lands exactly on the seam. A tile at the image edge has one neighbour,
+ * ramps only on that side and keeps its outer edge at full weight. */
+static double q21_tile_window(int i, int size, int lo, int hi) {
+    if (lo > 0 && i < lo) return 0.5 - 0.5 * cos(M_PI * (double)i / lo);
+    if (hi > 0 && i >= size - hi) {
+        int d = size - 1 - i;
+        return 0.5 - 0.5 * cos(M_PI * (double)d / hi);
+    }
+    return 1.0;
+}
+
+/* Spatially tiled decode. Each tile is decoded as a standalone th x tw latent
+ * image; a pixel is kept only if it is at least `bleed` latent tokens from the
+ * tile boundary, i.e. outside the decoder's boundary-sensitive depth, and the
+ * kept interiors are blended with a raised-cosine window across the overlap.
+ * Since the overlap is at least 2*bleed, the kept intervals of neighbouring
+ * tiles always meet, and the image edge (which has no neighbour) keeps its
+ * full border. The decoder's mid-block attention is tile-local rather than
+ * image-wide, the same trade diffusers' enable_tiling makes; the overlaps are
+ * what hide the seams. Device memory follows the tile, not the output. */
+static int qimg21_vae_decode_tiled(cuda_qimg_runner *r, const st_context *st, const float *latent, int h, int w,
+                                    float *out, int tile, int overlap, int bleed) {
+    int th = tile < h ? tile : h, tw = tile < w ? tile : w;
+    int stride = th - (overlap < th ? overlap : th - 1);
+    int nrows = th < h ? (h - th + stride - 1) / stride + 1 : 1;
+    int ncols = tw < w ? (w - tw + stride - 1) / stride + 1 : 1;
+    int ph = th * 16, pw = tw * 16;
+    float *crop = (float *)malloc((size_t)th * tw * 64 * sizeof(float));
+    float *tile_out = (float *)malloc((size_t)4 * ph * pw * sizeof(float));
+    float *wsum = (float *)calloc((size_t)h * 16 * w * 16, sizeof(float));
+    int rc = 0;
+    if (!crop || !tile_out || !wsum) {
+        fprintf(stderr, "qimg21-vae: tiled decode host allocation failed\n");
+        rc = -1;
+        goto done;
+    }
+    fprintf(stderr, "qimg21-vae: %dx%d latent grid in %dx%d tiles of %dx%d (stride %d, overlap %d, bleed %d)\n", h,
+            w, nrows, ncols, th, tw, stride, overlap, bleed);
+    for (int tr = 0; tr < nrows && !rc; tr++) {
+        int r0 = q21_tile_origin(tr, stride, h, th);
+        int r_lo = tr > 0 ? q21_tile_origin(tr - 1, stride, h, th) + th - r0 : 0;
+        int r_hi = tr + 1 < nrows ? r0 + th - q21_tile_origin(tr + 1, stride, h, th) : 0;
+        for (int tc = 0; tc < ncols && !rc; tc++) {
+            int c0 = q21_tile_origin(tc, stride, w, tw);
+            int c_lo = tc > 0 ? q21_tile_origin(tc - 1, stride, w, tw) + tw - c0 : 0;
+            int c_hi = tc + 1 < ncols ? c0 + tw - q21_tile_origin(tc + 1, stride, w, tw) : 0;
+            for (int y = 0; y < th; y++)
+                memcpy(crop + ((size_t)y * tw) * 64, latent + (((size_t)(r0 + y) * w) + c0) * 64,
+                       (size_t)tw * 64 * sizeof(float));
+            if (qimg21_vae_decode(r, st, crop, th, tw, tile_out)) { rc = -1; break; }
+            int y0 = r_lo ? bleed * 16 : 0, y1 = r_hi ? ph - bleed * 16 : ph;
+            int x0 = c_lo ? bleed * 16 : 0, x1 = c_hi ? pw - bleed * 16 : pw;
+            for (int y = y0; y < y1; y++) {
+                double wy = q21_tile_window(y / 16, th, r_lo, r_hi);
+                for (int x = x0; x < x1; x++) {
+                    double weight = wy * q21_tile_window(x / 16, tw, c_lo, c_hi);
+                    for (int c = 0; c < 4; c++) {
+                        size_t o = ((size_t)c * h * 16 + (r0 * 16 + y)) * w * 16 + c0 * 16 + x;
+                        out[o] += (float)(weight * tile_out[((size_t)c * ph + y) * pw + x]);
+                    }
+                    wsum[(size_t)(r0 * 16 + y) * w * 16 + c0 * 16 + x] += (float)weight;
+                }
+            }
+            fprintf(stderr, "qimg21-vae: tile %d/%d (row %d col %d) at latent %d,%d, keeps %dx%d of %dx%d pixels\n",
+                    tr * ncols + tc + 1, nrows * ncols, tr, tc, r0, c0, (x1 - x0), (y1 - y0), ph, pw);
+        }
+    }
+    size_t total = (size_t)h * 16 * w * 16;
+    for (size_t i = 0; i < total; i++) {
+        if (!(wsum[i] > 0.0f)) {
+            fprintf(stderr, "qimg21-vae: the tile grid left pixel %zu uncovered\n", i);
+            rc = -1;
+            break;
+        }
+        float inv = 1.0f / wsum[i];
+        for (int c = 0; c < 4; c++) out[(size_t)c * h * 16 * w * 16 + i] *= inv;
+    }
+done:
+    free(crop);
+    free(tile_out);
+    free(wsum);
+    return rc;
+}
+
 int main(int argc, char **argv) {
     const char *model=NULL,*latent_path=NULL,*out_path=NULL; int h=0,w=0,verbose=1,conv_cudnn=0;
+    int tile=0,overlap=8,bleed=2;
     for(int i=1;i<argc;i++){
         if(!strcmp(argv[i],"--model")&&i+1<argc)model=argv[++i];
         else if(!strcmp(argv[i],"--latents")&&i+1<argc)latent_path=argv[++i];
@@ -596,14 +691,32 @@ int main(int argc, char **argv) {
         else if(!strcmp(argv[i],"--width-tokens")&&i+1<argc)w=atoi(argv[++i]);
         else if(!strcmp(argv[i],"--out")&&i+1<argc)out_path=argv[++i];
         else if(!strcmp(argv[i],"--quiet"))verbose=0;
+        else if(!strcmp(argv[i],"--tile")&&i+1<argc)tile=atoi(argv[++i]);
+        else if(!strcmp(argv[i],"--tile-overlap")&&i+1<argc)overlap=atoi(argv[++i]);
+        else if(!strcmp(argv[i],"--tile-bleed")&&i+1<argc)bleed=atoi(argv[++i]);
         else if(!strcmp(argv[i],"--conv")&&i+1<argc&&(!strcmp(argv[i+1],"direct")||!strcmp(argv[i+1],"cudnn")))
             conv_cudnn=!strcmp(argv[++i],"cudnn");
-        else {fprintf(stderr,"usage: %s --model VAE_DIR --latents L.npy --height-tokens H --width-tokens W --out OUT.npy [--conv direct|cudnn]\n",argv[0]);return 2;}
+        else {fprintf(stderr,"usage: %s --model VAE_DIR --latents L.npy --height-tokens H --width-tokens W --out OUT.npy [--conv direct|cudnn]\n"
+                            "       [--tile LATENT_TOKENS [--tile-overlap N] [--tile-bleed N]]\n"
+                            "  --tile 0 (default) decodes the whole image in one pass.\n",argv[0]);return 2;}
     }
     if(!model||!latent_path||!out_path||h<=0||w<=0)return 2;
+    if(tile&&(tile<1||tile>h||tile>w)){fprintf(stderr,"qimg21-vae: --tile must be in [1, min(height-tokens, width-tokens)] = [%d, %d]\n",
+        tile,h<w?h:w);return 2;}
+    if(tile){
+        if(overlap<0)overlap=0;
+        if(overlap>=tile)overlap=tile-1;
+        if(bleed<0)bleed=0;
+        if(bleed>overlap/2){
+            fprintf(stderr,"qimg21-vae: --tile-bleed %d must be at most half of --tile-overlap %d, or the tiles leave gaps\n",bleed,overlap);
+            return 2;
+        }
+    }
     /* All shared kernel element indices are signed 32-bit. The largest
-     * stage has 288 channels at the final spatial resolution. */
-    if ((uint64_t)h*w > INT_MAX / (288u*256u)) {
+     * stage has 288 channels at the final spatial resolution. A tiled decode
+     * only ever indexes one tile, so the bound applies to the tile. */
+    int index_h = tile && tile < h ? tile : h, index_w = tile && tile < w ? tile : w;
+    if ((uint64_t)index_h*index_w > INT_MAX / (288u*256u)) {
         fprintf(stderr,"qimg21-vae: dimensions exceed kernel indexing limits\n");
         return 2;
     }
@@ -641,7 +754,11 @@ int main(int argc, char **argv) {
     cuStreamSynchronize(saved_stream);
     r->stream = NULL;
     float *out=(float *)malloc((size_t)4*(h*16)*(w*16)*sizeof(float));
-    int rc=out ? qimg21_vae_decode(r,st,a.data,h,w,out) : -1;
+    int rc=0;
+    if(!out){fprintf(stderr,"qimg21-vae: output allocation failed\n");rc=-1;}
+    else if(tile) memset(out,0,(size_t)4*(h*16)*(w*16)*sizeof(float));
+    if(!rc) rc = tile ? qimg21_vae_decode_tiled(r, st, a.data, h, w, out, tile, overlap, bleed)
+                     : qimg21_vae_decode(r, st, a.data, h, w, out);
     cuStreamSynchronize(r->stream);
     r->stream = saved_stream;
     if(!rc) rc=q21_npy_write_chw(out_path,out,(size_t)4*(h*16)*(w*16),4,h*16,w*16);

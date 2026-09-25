@@ -44,7 +44,7 @@ def _run(command: list[str], *, cwd: Path) -> None:
 
 
 def _decode_vae(model: Path, latent_path: Path, out_path: Path, height: int, width: int,
-                dtype: str, backend: str) -> None:
+                dtype: str, backend: str, tile: bool = False) -> None:
     """Decode normalized [tokens, 64] latents using AutoencoderKLQwenImage21."""
     import torch
     from diffusers import AutoencoderKLQwenImage21
@@ -71,6 +71,10 @@ def _decode_vae(model: Path, latent_path: Path, out_path: Path, height: int, wid
         str(model / "vae"), torch_dtype=torch_dtype, local_files_only=True
     ).to(device="cuda")
     vae.eval()
+    if tile:
+        # The reference decoder tiles spatially for the same reason the native
+        # one does: an untiled 2048x2048 decode does not fit an 8 GB card.
+        vae.enable_tiling()
 
     latents = torch.from_numpy(np_latents.astype(np.float32, copy=False)).to(
         device="cuda", dtype=torch_dtype
@@ -102,8 +106,26 @@ def main() -> int:
     ap.add_argument("--image", help="Experimental single-image editing with native F32 VAE encoding")
     ap.add_argument("--condition-resolution", type=int, default=1024,
                     help="Condition image target-area side length, matching the reference output_resolution")
-    ap.add_argument("--height", type=int, default=256)
-    ap.add_argument("--width", type=int, default=256)
+    ap.add_argument("--height", type=int, default=256, help="output height in pixels")
+    ap.add_argument("--width", type=int, default=256, help="output width in pixels")
+    ap.add_argument("--upscale", type=float, default=1.0,
+                    help="generate a base image this much smaller, then refine it up to "
+                         "--height/--width (2.0 is the usual high-resolution pass)")
+    ap.add_argument("--base-steps", type=int, default=None,
+                    help="steps for the base pass (default: --steps)")
+    ap.add_argument("--tile-tokens", type=int, default=None,
+                    help="refine tile side in latent tokens (default: the base grid's shorter side; "
+                         "needs --upscale above 1)")
+    ap.add_argument("--tile-overlap", type=int, default=8,
+                    help="latent tokens neighbouring refine tiles share")
+    ap.add_argument("--refine-strength", type=float, default=0.5,
+                    help="fraction of the schedule the refine pass re-runs, in (0, 1]")
+    ap.add_argument("--refine-seed", type=int, default=0, help="seed for the refine pass's per-tile noise")
+    ap.add_argument("--vae-tile", type=int, default=None,
+                    help="latent tokens per VAE decode tile (default 48 above 1024 px, else 0 = one pass)")
+    ap.add_argument("--vae-tile-overlap", type=int, default=8)
+    ap.add_argument("--vae-tile-bleed", type=int, default=2,
+                    help="latent tokens discarded at each decode tile edge; must be <= half the overlap")
     ap.add_argument("--steps", type=int, default=2)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--initial-latents", type=Path,
@@ -165,6 +187,48 @@ def main() -> int:
         ap.error("height and width must be positive multiples of 32")
     h_tokens, w_tokens = args.height // 16, args.width // 16
     target_tokens = h_tokens * w_tokens
+    # Coarse-to-fine: a base pass at 1/upscale the output size, then a tiled
+    # refine pass that resamples the base latent and denoises one tile at a
+    # time, so device memory and attention cost follow the tile.
+    tiled = args.upscale > 1.0
+    if tiled and args.runner != "fast":
+        ap.error("tiled generation needs --runner fast; the parity harness has no tile path")
+    if args.upscale <= 0.0:
+        ap.error("--upscale must be positive")
+    if args.tile_tokens is not None and not tiled:
+        ap.error("--tile-tokens needs --upscale above 1: tiling refines a base grid, "
+                 "and without one there is nothing to refine")
+    base_h_tokens = base_w_tokens = None
+    if args.upscale != 1.0:
+        base_h = max(32, int(round(args.height / args.upscale)))
+        base_w = max(32, int(round(args.width / args.upscale)))
+        if base_h % 32 or base_w % 32:
+            ap.error(f"--upscale {args.upscale} leaves a {base_h}x{base_w} base size, not a multiple of 32")
+        base_h_tokens, base_w_tokens = base_h // 16, base_w // 16
+        if base_h_tokens > h_tokens or base_w_tokens > w_tokens:
+            ap.error("--upscale must not enlarge the base grid past the output grid")
+    tile_tokens = args.tile_tokens
+    if tiled:
+        tile_tokens = tile_tokens or min(base_h_tokens, base_w_tokens)
+    if tiled:
+        if not 1 <= tile_tokens <= min(h_tokens, w_tokens):
+            ap.error(f"--tile-tokens must be in [1, {min(h_tokens, w_tokens)}] for a "
+                     f"{args.height}x{args.width} output")
+        if args.tile_overlap < 0 or args.tile_overlap >= tile_tokens:
+            ap.error("--tile-overlap must be in [0, tile-tokens)")
+        if not 0.0 < args.refine_strength <= 1.0:
+            ap.error("--refine-strength must be in (0, 1]")
+        if args.base_steps is not None and args.base_steps < 1:
+            ap.error("--base-steps must be at least 1")
+    if args.vae_tile is None:
+        args.vae_tile = 48 if max(h_tokens, w_tokens) > 64 else 0
+    if args.vae_tile and not 1 <= args.vae_tile <= min(h_tokens, w_tokens):
+        ap.error(f"--vae-tile must be in [1, {min(h_tokens, w_tokens)}] for this output size")
+    if args.vae_tile and args.vae_tile_bleed > args.vae_tile_overlap // 2:
+        ap.error("--vae-tile-bleed must be at most half of --vae-tile-overlap, or the tiles leave gaps")
+    if args.vae_tile:
+        print(f"decoding {args.height}x{args.width} in {args.vae_tile}-token VAE tiles with "
+              f"{args.vae_tile_overlap} tokens of overlap")
     rocm_bf16_edit = (
         args.backend == "rocm"
         and args.dtype == "bf16"
@@ -339,15 +403,21 @@ def main() -> int:
     time.sleep(2.0)
 
     latent_path = work / "latents.npy"
+    native_latents = work / "native_latents.npy"
+    base_latents = work / "base_latents.npy"
+    base_grid = work / "base_latents_grid.npy"
+    # The base pass denoises its own latent grid; the refine pass reuses the
+    # prompt/condition prefix and only needs the resampled base.
+    fixture_h, fixture_w = (base_h_tokens, base_w_tokens) if tiled else (h_tokens, w_tokens)
     fixture_command = [
             os.environ.get("QIMG21_PYTHON", sys.executable),
             str(root / "cuda/qimg21/make_native_fixture.py"),
             "--prompt-embeds",
             str(prompt_path),
             "--height-tokens",
-            str(h_tokens),
+            str(fixture_h),
             "--width-tokens",
-            str(w_tokens),
+            str(fixture_w),
             "--seed",
             str(args.seed),
             "--dtype",
@@ -360,7 +430,6 @@ def main() -> int:
     elif args.backend == "cuda":
         fixture_command.append("--torch-rng")
     _run(fixture_command, cwd=root)
-    native_latents = work / "native_latents.npy"
     if args.runner == "fast":
         # The preset sets budget, weights and attention; explicit flags follow it.
         attention_args = ["--preset", args.preset]
@@ -374,51 +443,65 @@ def main() -> int:
             attention_args += ["--attention", fast_attention]
     else:
         attention_args = ["--attention", args.native_attention]
-    native_command = [
-            str(native_bin), *attention_args,
-            "--model",
-            str(model),
-            "--prompt-embeds",
-            str(prompt_path),
-            "--latents",
-            str(latent_path),
-            "--height-tokens",
-            str(h_tokens),
-            "--width-tokens",
-            str(w_tokens),
-            "--steps",
-            str(args.steps),
-            "--dump-dir",
-            str(steps_dir),
-            "--out",
-            str(native_latents),
-        ]
-    native_command.extend(["--normalization", args.native_normalization, "--rope", args.native_rope])
-    if args.image:
-        from editing_inputs import write_layout
-        layout = condition_dir / "positive_layout.txt"
-        write_layout(prompt_dir, layout, condition_hw, (h_tokens, w_tokens))
-        native_command.extend(["--condition-latents", str(condition_dir / "latents.npy"),
-                               "--editing-layout", str(layout)])
+
+    def denoise_command(gh, gw, steps, out, extra, target_hw=None):
+        """One denoiser invocation. The editing layout's target block is the grid
+        the model actually sees, which is the tile when refining."""
+        command = [str(native_bin), *attention_args,
+                   "--model", str(model),
+                   "--prompt-embeds", str(prompt_path),
+                   "--height-tokens", str(gh), "--width-tokens", str(gw),
+                   "--steps", str(steps), "--out", str(out), *extra]
+        if args.image:
+            from editing_inputs import write_layout
+            suffix = "" if target_hw is None else f"_{target_hw[0]}x{target_hw[1]}"
+            layout = condition_dir / f"positive_layout{suffix}.txt"
+            write_layout(prompt_dir, layout, condition_hw, target_hw or (gh, gw))
+            command.extend(["--condition-latents", str(condition_dir / "latents.npy"),
+                            "--editing-layout", str(layout)])
+            if args.negative_prompt is not None:
+                negative_layout = condition_dir / f"negative_layout{suffix}.txt"
+                write_layout(prompt_dir, negative_layout, condition_hw, target_hw or (gh, gw), negative=True)
+                command.extend(["--negative-editing-layout", str(negative_layout)])
         if args.negative_prompt is not None:
-            negative_layout = condition_dir / "negative_layout.txt"
-            write_layout(prompt_dir, negative_layout, condition_hw, (h_tokens, w_tokens), negative=True)
-            native_command.extend(["--negative-editing-layout", str(negative_layout)])
-    if args.negative_prompt is not None:
-        native_command.extend([
-            "--negative-prompt-embeds",
-            str(prompt_dir / "negative_prompt_embeds.npy"),
-            "--guidance-scale",
-            str(args.true_cfg_scale),
-        ])
-    if args.quantized_transformer:
-        native_command.extend(["--quantized-transformer", str(args.quantized_transformer.resolve())])
-    if args.quantize_on_load:
-        native_command.extend(["--quantize-on-load", args.quantize_on_load])
-    if args.int8_tensor_core:
-        native_command.extend(["--int8-tensor-core", "--int8-bf16-tail-blocks",
-                               str(args.int8_bf16_tail_blocks)])
-    _run(native_command, cwd=root)
+            command.extend(["--negative-prompt-embeds",
+                            str(prompt_dir / "negative_prompt_embeds.npy"),
+                            "--guidance-scale", str(args.true_cfg_scale)])
+        if args.quantized_transformer:
+            command.extend(["--quantized-transformer", str(args.quantized_transformer.resolve())])
+        if args.quantize_on_load:
+            command.extend(["--quantize-on-load", args.quantize_on_load])
+        if args.int8_tensor_core:
+            command.extend(["--int8-tensor-core", "--int8-bf16-tail-blocks",
+                            str(args.int8_bf16_tail_blocks)])
+        return command
+
+    if tiled:
+        base_steps = args.base_steps or args.steps
+        print(f"base pass: {base_h_tokens * 16}x{base_w_tokens * 16} px, {base_steps} steps")
+        _run(denoise_command(base_h_tokens, base_w_tokens, base_steps, base_latents,
+                             ["--latents", str(latent_path), "--normalization", args.native_normalization,
+                              "--rope", args.native_rope, "--dump-dir", str(steps_dir)]), cwd=root)
+        base = np.load(base_latents, allow_pickle=False)
+        if base.shape != (base_h_tokens * base_w_tokens, 64) or not np.isfinite(base).all():
+            raise SystemExit("base pass returned an invalid latent grid")
+        # The refine pass reads the base as a 3-D grid, so the resample target is
+        # unambiguous and no extra flag can disagree with the data.
+        np.save(base_grid, np.ascontiguousarray(base.reshape(base_h_tokens, base_w_tokens, 64)))
+        print(f"refine pass: {args.height}x{args.width} px in {tile_tokens}-token tiles, "
+              f"strength {args.refine_strength}")
+        _run(denoise_command(h_tokens, w_tokens, args.steps, native_latents,
+                             ["--refine-from", str(base_grid), "--tile-tokens", str(tile_tokens),
+                              "--tile-overlap", str(args.tile_overlap),
+                              "--refine-strength", str(args.refine_strength),
+                              "--refine-seed", str(args.refine_seed),
+                              "--normalization", args.native_normalization,
+                              "--rope", args.native_rope,
+                              "--dump-dir", str(steps_dir)], target_hw=(tile_tokens, tile_tokens)), cwd=root)
+    else:
+        _run(denoise_command(h_tokens, w_tokens, args.steps, native_latents,
+                             ["--latents", str(latent_path), "--normalization", args.native_normalization,
+                              "--rope", args.native_rope, "--dump-dir", str(steps_dir)]), cwd=root)
     if args.native_vae:
         from PIL import Image
 
@@ -431,6 +514,8 @@ def main() -> int:
             "--height-tokens", str(args.height // 16),
             "--width-tokens", str(args.width // 16), "--out", str(decoded_path),
             *(["--conv", vae_conv] if vae_conv != "direct" else []),
+            *((["--tile", str(args.vae_tile), "--tile-overlap", str(args.vae_tile_overlap),
+                "--tile-bleed", str(args.vae_tile_bleed)]) if args.vae_tile else []),
         ], cwd=root)
         decoded = np.load(decoded_path)
         if decoded.shape != (4, args.height, args.width) or not np.isfinite(decoded).all():
@@ -439,7 +524,8 @@ def main() -> int:
         out.parent.mkdir(parents=True, exist_ok=True)
         Image.fromarray(pixels.transpose(1, 2, 0)).save(out)
     else:
-        _decode_vae(model, native_latents, out, args.height, args.width, args.dtype, args.backend)
+        _decode_vae(model, native_latents, out, args.height, args.width, args.dtype,
+                     args.backend, tile=bool(args.vae_tile))
     print(f"native denoise trace: {steps_dir}")
     print(f"fixtures: {work}")
     return 0
