@@ -178,11 +178,21 @@ quantization-specific artifact.
 
 Pass `--int8-tensor-core` with an exported row-INT8 package to keep weights as
 INT8 on device, dynamically quantize each BF16 activation row to INT8, execute
-signed `mma.sync.m16n8k32.s32.s8.s8.s32` dot products, and fuse the activation
-and weight row scales into the F32 output epilogue. This is genuine W8A8
-tensor-core execution; it does not reconstruct BF16 weights before GEMM. The
-option is supported by the native executable, `native_generate.py`,
-`regression.py`, and `editing_regression.py`.
+signed `mma.sync.m16n8k32.s32.s8.s8.s32` dot products into an INT32 buffer, and
+apply the activation and weight row scales in a separate
+`dequant_int32_to_bf16` kernel (`cuda/qimg/cuda_qimg_runner.h`). The dequant is
+not fused into the GEMM epilogue. Activations are widened from BF16 to F32
+before quantization, there is no SmoothQuant, and GEMMs with fewer than 16
+tokens or an output width that is not a multiple of 256 (timestep, modulation,
+`proj_out`) use a scalar `dp4a` fallback. This is genuine W8A8 tensor-core
+execution; it does not reconstruct BF16 weights before GEMM. The option is
+supported by the native executable, `native_generate.py`, `regression.py`, and
+`editing_regression.py`.
+
+The harness compiles its NVRTC kernels through `cu_compile_kernels`, which
+passes `--use_fast_math` unless `CUDA_RUNNER_PRECISE_MATH` is set
+(`cuda/cuda_runner_common.h`). Only the vision front end opts out. Parity
+figures in this document were measured with that default.
 
 ```sh
 tmp/qimg21-ref-venv/bin/python cuda/qimg21/regression.py --native \

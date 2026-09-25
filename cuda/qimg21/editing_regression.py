@@ -28,6 +28,11 @@ def guidance_scale(reference):
     return float(scale) if cfg else 1.0
 
 
+def gemm_args(gemm):
+    """Only the HIP runner accepts --gemm; the CUDA runner rejects it."""
+    return ["--gemm", gemm] if gemm else []
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model", required=True, type=Path)
@@ -41,7 +46,8 @@ def main():
         "wmma", "wmma-fused", "edit-size-select"), default="math")
     ap.add_argument("--native-normalization", choices=("default", "vector4"), default="default")
     ap.add_argument("--native-rope", choices=("default", "host-table", "host-table-vector4", "host-table-exact"), default="default")
-    ap.add_argument("--native-gemm", choices=("wmma", "scalar"), default="wmma")
+    ap.add_argument("--native-gemm", choices=("wmma", "scalar"),
+                    help="HIP runner GEMM selection; omitted for runners without --gemm")
     quant = ap.add_mutually_exclusive_group()
     quant.add_argument("--quantized-transformer", type=Path)
     quant.add_argument("--quantize-on-load", choices=("int8-row",))
@@ -83,7 +89,7 @@ def main():
     def command(fixture, metadata):
         cmd = [str(binary), "--model", str(args.model.resolve()),
                 "--attention", args.native_attention, "--normalization", args.native_normalization,
-                "--rope", args.native_rope, "--gemm", args.native_gemm,
+                "--rope", args.native_rope, *gemm_args(args.native_gemm),
                 "--prompt-embeds", str(fixture / "prompt_embeds.npy"),
                 "--latents", str(fixture / "target_latents.npy"),
                 "--condition-latents", str(fixture / "condition_latents.npy"),

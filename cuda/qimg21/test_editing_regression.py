@@ -3,7 +3,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from editing_regression import guidance_scale
+from editing_regression import gemm_args, guidance_scale
 
 
 class EditingRegressionTest(unittest.TestCase):
@@ -24,6 +24,10 @@ class EditingRegressionTest(unittest.TestCase):
                 manifest.write_text(json.dumps({"use_true_cfg": True, "true_cfg_scale": scale}))
                 with self.assertRaises(ValueError):
                     guidance_scale(ref)
+
+    def test_gemm_args_only_when_selected(self):
+        self.assertEqual(gemm_args(None), [])
+        self.assertEqual(gemm_args("scalar"), ["--gemm", "scalar"])
 
 
 if __name__ == "__main__":
