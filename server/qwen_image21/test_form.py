@@ -1,0 +1,120 @@
+"""Browser-logic checks for the Qwen-Image 2.1 demo form.
+
+The page is a single HTML file with an inline script, so these tests extract the
+script and run it under node against a minimal DOM stub. That catches the class
+of bug a Python test cannot see: a mistyped identifier, a size cap computed from
+the wrong branch, a payload that silently drops a setting. The `plan()` helper is
+kept free of DOM access precisely so its rules can be exercised directly.
+"""
+import json
+import re
+import shutil
+import subprocess
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+PAGE = ROOT / "web/qwen_image21.html"
+NODE = shutil.which("node") or shutil.which("nodejs")
+
+STUB = """
+const ids={};
+function mk(id){return {value:'',textContent:'',innerHTML:'',
+  classList:{toggle(){},add(){},remove(){}},
+  addEventListener(){},querySelector(){return mk('x')},querySelectorAll(){return []},
+  options:[],max:0,disabled:false}};
+const document={getElementById:id=>ids[id]||(ids[id]=mk(id)),
+  querySelector:s=>s.includes('mode')?{value:'native'}:mk('s'),
+  querySelectorAll:()=>[{addEventListener(){}}]};
+const fetch=()=>Promise.reject(new Error('offline'));
+"""
+
+
+def script() -> str:
+    return PAGE.read_text(encoding="utf-8").split("<script>")[1].split("</script>")[0]
+
+
+def run(body: str) -> subprocess.CompletedProcess:
+    return subprocess.run([NODE], input=body, text=True, capture_output=True)
+
+
+@unittest.skipUnless(NODE, "node is not installed")
+class QwenImage21FormLogicTest(unittest.TestCase):
+    def test_the_page_script_parses_and_runs(self):
+        result = run(STUB + script())
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_plan_gates_the_tiled_controls_and_the_size_cap(self):
+        body = script()
+        plan = body[body.index("function plan("):body.index("function sync()")]
+        cases = [
+            # name, args, expected
+            ("no preset", ("", "cuda", "native", 2, 1024, 1024),
+             {"fast": False, "tiled": True, "cap": 1024, "ok": False}),
+            ("preset, upscale 1", ("low8", "cuda", "native", 1, 1024, 1024),
+             {"fast": True, "tiled": False, "cap": 2048, "ok": True}),
+            ("preset, upscale 2", ("low8", "cuda", "native", 2, 2048, 2048),
+             {"fast": True, "tiled": True, "cap": 4096, "ok": True}),
+            ("compare mode", ("low8", "cuda", "compare", 2, 2048, 2048),
+             {"fast": False, "tiled": True, "cap": 1024, "ok": False}),
+            ("rocm", ("low8", "rocm", "native", 1, 1024, 1024),
+             {"fast": False, "tiled": False, "cap": 1024, "ok": False}),
+            ("reference mode", ("low8", "cuda", "reference", 1, 1024, 1024),
+             {"fast": False, "tiled": False, "cap": 1024, "ok": False}),
+        ]
+        program = (
+            "const HEALTH={size_limit:{reference:1024,fast:2048,tiled:4096}};\n" + plan +
+            "const cases=" + json.dumps([[c[0], list(c[1]), c[2]] for c in cases]) + ";\n"
+            "let bad=0;\n"
+            "for(const [name,args,want] of cases){\n"
+            "  const got=plan(...args);\n"
+            "  if(JSON.stringify(got)!==JSON.stringify(want)){bad++;console.log('FAIL',name,JSON.stringify(got));}\n"
+            "}\n"
+            # A health payload that has not arrived must not throw or lock the form.
+            "const none=plan('low8','cuda','native',2,4096,4096,null);\n"
+            "if(none.cap!==4096||!none.ok){bad++;console.log('FAIL no-health',JSON.stringify(none));}\n"
+            "process.exit(bad?1:0);\n")
+        result = run(program)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_the_payload_carries_every_tiling_field(self):
+        body = script()
+        for field in ("upscale", "base_steps", "tile_tokens", "tile_overlap",
+                      "refine_strength", "refine_seed", "vae_tile",
+                      "vae_tile_overlap", "vae_tile_bleed"):
+            self.assertIn(field + ":", body, f"{field} is missing from the request payload")
+        # The decode overlap and bleed are only accepted alongside an explicit
+        # decode tile, so the form has to withhold them when the tile is blank.
+        self.assertIn("$('vae_tile').value.trim()?num('vae_tile_overlap'):null", body)
+        self.assertIn("$('vae_tile').value.trim()?num('vae_tile_bleed'):null", body)
+
+    def test_the_form_has_a_control_for_each_setting(self):
+        markup = PAGE.read_text(encoding="utf-8")
+        for control in ("upscale", "refine_strength", "base_steps", "refine_seed",
+                        "tile_tokens", "tile_overlap", "vae_tile",
+                        "vae_tile_overlap", "vae_tile_bleed"):
+            self.assertRegex(markup, rf'id="{control}"', f"no form control named {control}")
+
+    def test_the_run_log_is_rendered_and_escaped(self):
+        body = script()
+        self.assertIn("data.log", body)
+        self.assertIn(".log", PAGE.read_text(encoding="utf-8"))
+        # Runner output goes straight into innerHTML, so it has to be escaped.
+        self.assertIn("data.log.map(l=>l.replace(/[&<>]/g", body)
+        self.assertIn("&amp;", body)
+
+    def test_no_stray_lookalike_identifiers(self):
+        """A mistyped identifier in a minified one-liner fails at runtime, not at
+        parse time, and only on the code path that reads it."""
+        body = script()
+        for name in ("tiled", "upscale", "limits", "preset", "backend"):
+            declared = len(re.findall(rf"\b(?:const|let|var)\s+{name}\b", body))
+            declared += len(re.findall(rf",\s*{name}\s*=", body))
+            self.assertGreaterEqual(declared, 1, f"{name} is used but never declared")
+        # 'tilted' arrived from a bad substitution once and broke the page only
+        # when the tiled path ran.
+        self.assertNotIn("tilted", body)
+
+
+if __name__ == "__main__":
+    unittest.main()

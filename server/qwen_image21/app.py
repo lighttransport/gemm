@@ -32,6 +32,18 @@ DEFAULT_FAST_PACKAGES = {"int8": Path("/mnt/nvme01/models/qimg-21-fast/int8-smoo
 # Fast CUDA denoiser presets (test_cuda_qimg21_fast --preset) and the
 # pack_fast.py weight package each needs.
 FAST_PRESETS = {"low8": "int8", "low8-fp4": "nvfp4", "fast12": "int8", "accurate": None}
+# Output size limits per pixel side. The fast runner bounds its own memory, so
+# the caps are about what the other stages can afford: the parity harness and the
+# PyTorch reference stay at 1024, an untiled fast run goes to 2048 (the VAE
+# decode tiles itself above 1024), and a tiled coarse-to-fine refine reaches 4096.
+SIZE_LIMIT_REFERENCE = 1024
+SIZE_LIMIT_FAST = 2048
+SIZE_LIMIT_TILED = 4096
+# Tiled coarse-to-fine refine, from cuda/qimg21/native_generate.py. A refine
+# tile is composed as its own canvas, so the tile is a quality dial, not only a
+# memory one: the default is the largest that fits the preset's budget, found by
+# the driver. Everything left at None lets the driver choose.
+TILE_DEFAULTS = {"tile_overlap": 8, "vae_tile_overlap": 8, "vae_tile_bleed": 2}
 MAX_BODY = 32 * 1024
 
 
@@ -74,6 +86,20 @@ class Demo:
             "attention": root / ("libq21_cutlass_attention.so" if backend == "cuda" else "libq21_hip_attention.so"),
         }
 
+    @staticmethod
+    def _optional_int(request: dict, key: str, low: int, high: int, what: str):
+        """None passes through so the driver can pick; otherwise bound-checked."""
+        value = request.get(key)
+        if value is None or value == "":
+            return None
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            raise ValueError(f"{key} must be an integer") from None
+        if not low <= value <= high:
+            raise ValueError(f"{key} must be between {low} and {high} ({what})")
+        return value
+
     def _validate(self, request: dict) -> dict:
         if not isinstance(request, dict):
             raise ValueError("request must be a JSON object")
@@ -93,15 +119,6 @@ class Demo:
             raise ValueError("backend must be cuda or rocm")
         if mode not in {"native", "reference", "compare"}:
             raise ValueError("mode must be native, reference, or compare")
-        width = int(request.get("width", 256)); height = int(request.get("height", 256))
-        steps = int(request.get("steps", 2)); seed = int(request.get("seed", 42))
-        if width < 256 or height < 256 or width > 1024 or height > 1024 or width % 32 or height % 32:
-            raise ValueError("width and height must be 256..1024 and divisible by 32")
-        if steps < 1 or steps > 40:
-            raise ValueError("steps must be between 1 and 40")
-        negative = request.get("negative_prompt", "")
-        if not isinstance(negative, str) or len(negative) > 4000:
-            raise ValueError("negative_prompt must be at most 4000 characters")
         quantized = bool(request.get("quantized", False))
         preset = request.get("preset") or None
         if preset is not None:
@@ -111,10 +128,93 @@ class Demo:
                 raise ValueError("fast presets are CUDA only")
             if quantized:
                 raise ValueError("a fast preset selects its own weights; leave quantized off")
+
+        # Tiled coarse-to-fine refine: a base pass at 1/upscale, then a refine
+        # that resamples it onto the requested size and denoises one tile at a
+        # time. It needs the fast runner (the parity harness has no tile path)
+        # and the PyTorch reference cannot do it, so a compare would be a
+        # comparison of two different things.
+        try:
+            upscale = float(request.get("upscale") or 1.0)
+        except (TypeError, ValueError):
+            raise ValueError("upscale must be a number") from None
+        if not 1.0 <= upscale <= 4.0:
+            raise ValueError("upscale must be between 1 (no refine) and 4")
+        tiled = upscale > 1.0
+        if tiled:
+            if backend != "cuda" or preset is None:
+                raise ValueError("a tiled refine needs a CUDA fast preset; pick one under "
+                                 "'CUDA denoiser'")
+            if mode != "native":
+                raise ValueError("a tiled refine has no PyTorch reference to compare against; "
+                                 "use native mode")
+        width = int(request.get("width", 256)); height = int(request.get("height", 256))
+        steps = int(request.get("steps", 2)); seed = int(request.get("seed", 42))
+        if width < 256 or height < 256 or width % 32 or height % 32:
+            raise ValueError("width and height must be at least 256 and divisible by 32")
+        if tiled:
+            for side in (height, width):
+                base = max(32, round(side / upscale))
+                if base % 32:
+                    raise ValueError(f"upscale {upscale} leaves a {base} px base for a {side} px "
+                                     "side, which is not a multiple of 32")
+        fast_native = backend == "cuda" and preset is not None and mode == "native"
+        limit = SIZE_LIMIT_TILED if tiled else SIZE_LIMIT_FAST if fast_native else SIZE_LIMIT_REFERENCE
+        if width > limit or height > limit:
+            what = "a tiled refine" if tiled else "a fast CUDA run" if fast_native else "this run"
+            raise ValueError(f"width and height must be at most {limit} for {what}")
+        if steps < 1 or steps > 40:
+            raise ValueError("steps must be between 1 and 40")
+        negative = request.get("negative_prompt", "")
+        if not isinstance(negative, str) or len(negative) > 4000:
+            raise ValueError("negative_prompt must be at most 4000 characters")
+
+        smallest = min(height // 16, width // 16)
+        tile_tokens = self._optional_int(request, "tile_tokens", 1, smallest,
+                                         "a refine tile covers the whole output grid")
+        tile_overlap = self._optional_int(request, "tile_overlap", 0, 1024, "latent tokens")
+        vae_tile = self._optional_int(request, "vae_tile", 1, smallest, "a decode tile spans the image")
+        vae_tile_overlap = self._optional_int(request, "vae_tile_overlap", 0, 1024, "latent tokens")
+        vae_tile_bleed = self._optional_int(request, "vae_tile_bleed", 0, 1024, "latent tokens")
+        if tile_overlap is None:
+            tile_overlap = TILE_DEFAULTS["tile_overlap"]
+        if tile_tokens is not None and tile_overlap >= tile_tokens:
+            raise ValueError("tile_overlap must be smaller than tile_tokens")
+        # The decode overlap and bleed only mean anything against a decode tile
+        # size; reject them on their own rather than quietly dropping them, since
+        # the driver would pick a different pair.
+        if vae_tile is None and (vae_tile_overlap is not None or vae_tile_bleed is not None):
+            raise ValueError("vae_tile_overlap and vae_tile_bleed need an explicit vae_tile; "
+                             "leave vae_tile empty to let the driver choose all three")
+        if vae_tile is not None:
+            # Each kept pixel must be at least a bleed inside its tile, and a
+            # neighbour's kept interior has to reach it, so the overlap must be
+            # at least twice the bleed or the tiles leave gaps.
+            if vae_tile_overlap is None:
+                vae_tile_overlap = TILE_DEFAULTS["vae_tile_overlap"]
+            if vae_tile_bleed is None:
+                vae_tile_bleed = TILE_DEFAULTS["vae_tile_bleed"]
+            if vae_tile_bleed > vae_tile_overlap // 2:
+                raise ValueError("vae_tile_bleed must be at most half of vae_tile_overlap")
+        try:
+            refine_strength = float(request.get("refine_strength", 0.5))
+        except (TypeError, ValueError):
+            raise ValueError("refine_strength must be a number") from None
+        if not 0.0 < refine_strength <= 1.0:
+            raise ValueError("refine_strength must be greater than 0 and at most 1")
+        base_steps = self._optional_int(request, "base_steps", 1, 100, "steps per pass")
+        refine_seed = self._optional_int(request, "refine_seed", 0, 2 ** 63, "a seed")
+        if refine_seed is None:
+            refine_seed = 0
         return {"prompt": prompt, "negative_prompt": negative.strip(),
                 "mode": mode, "backend": backend,
                 "width": width, "height": height, "steps": steps, "seed": seed,
-                "quantized": quantized, "preset": preset}
+                "quantized": quantized, "preset": preset,
+                "upscale": upscale, "base_steps": base_steps, "tile_tokens": tile_tokens,
+                "tile_overlap": tile_overlap, "refine_strength": refine_strength,
+                "refine_seed": refine_seed, "vae_tile": vae_tile,
+                "vae_tile_overlap": vae_tile_overlap, "vae_tile_bleed": vae_tile_bleed}
+
 
     def _run(self, command: list[str], cwd: Path, log: Path,
              env: dict[str, str] | None = None) -> None:
@@ -125,7 +225,7 @@ class Demo:
             tail = log.read_text(encoding="utf-8", errors="replace")[-4000:]
             raise RuntimeError(f"inference exited with {result.returncode}: {tail}")
 
-    def _native(self, cfg: dict, out: Path) -> Path:
+    def _native(self, cfg: dict, out: Path) -> tuple[Path, Path]:
         backend = cfg["backend"]
         python = self.python if backend == "cuda" else self.python_rocm
         if backend == "rocm" and not python.is_file():
@@ -167,13 +267,47 @@ class Demo:
             command += ["--quantized-transformer", str(self.quant)]
             if backend == "cuda":
                 command += ["--int8-tensor-core", "--int8-bf16-tail-blocks", "16"]
+        # Coarse-to-fine: a base pass at 1/upscale, then a tiled refine up to
+        # the requested size. --tile-tokens and --vae-tile are left off when the
+        # client did not pin them, so the driver picks the largest tile the
+        # preset's budget allows rather than the demo second-guessing it.
+        if cfg["upscale"] > 1.0:
+            command += ["--upscale", str(cfg["upscale"])]
+            if cfg["base_steps"] is not None:
+                command += ["--base-steps", str(cfg["base_steps"])]
+            if cfg["tile_tokens"] is not None:
+                command += ["--tile-tokens", str(cfg["tile_tokens"])]
+            command += ["--tile-overlap", str(cfg["tile_overlap"]),
+                        "--refine-strength", str(cfg["refine_strength"]),
+                        "--refine-seed", str(cfg["refine_seed"])]
+        if cfg["vae_tile"]:
+            command += ["--vae-tile", str(cfg["vae_tile"]),
+                        "--vae-tile-overlap", str(cfg["vae_tile_overlap"]),
+                        "--vae-tile-bleed", str(cfg["vae_tile_bleed"])]
         # uv-managed reference environments can expose the host interpreter as
         # sys.executable from a child process; carry the selected interpreter
         # explicitly to the fixture helper so it retains Torch/CUDA imports.
         env = os.environ.copy()
         env["QIMG21_PYTHON"] = str(python)
-        self._run(command, ROOT, out / f"{backend}.log", env=env)
-        return image
+        log = out / f"{backend}.log"
+        self._run(command, ROOT, log, env=env)
+        return image, log
+
+    @staticmethod
+    def _summary(log: Path) -> list[str]:
+        """The lines a user actually wants from a run: the memory plan, the tile
+        geometry the driver chose, and the per-stage timings. A demo that only
+        shows the picture hides exactly the numbers that explain it."""
+        wanted = ("fast: plan ", "fast: tiled refine ", "fast: prefill ",
+                  "fast: weights ready", "qimg21-vae: ", "base pass:", "refine tile:",
+                  "refine pass:")
+        if not log.is_file():
+            return []
+        try:
+            lines = log.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            return []
+        return [line for line in lines if line.startswith(wanted)][-12:]
 
     def _reference(self, cfg: dict, out: Path) -> Path:
         backend = cfg["backend"]
@@ -204,9 +338,9 @@ class Demo:
             if cfg["mode"] in {"native", "compare"}:
                 backend = cfg["backend"]
                 if progress: progress(f"Qwen {backend.upper()} native", 12)
-                path = self._native(cfg, job)
+                path, log = self._native(cfg, job)
                 if progress: progress(f"Qwen {backend.upper()} native complete", 72 if cfg["mode"] == "compare" else 96)
-                results[backend] = {"image": self._data_url(path)}
+                results[backend] = {"image": self._data_url(path), "log": self._summary(log)}
             if cfg["mode"] in {"reference", "compare"}:
                 if progress: progress(f"Qwen {cfg['backend'].upper()} PyTorch reference", 78)
                 path = self._reference(cfg, job)
@@ -234,6 +368,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {"ok": True, "model": str(demo.model),
                              "quantized_available": demo.quant.is_dir(),
                              "presets": {name: demo.preset_available(name) for name in FAST_PRESETS},
+                             "size_limit": {"reference": SIZE_LIMIT_REFERENCE,
+                                             "fast": SIZE_LIMIT_FAST, "tiled": SIZE_LIMIT_TILED},
                              "native": {backend: all(components[backend].values())
                                         for backend in ("cuda", "rocm")},
                              "native_components": components,
