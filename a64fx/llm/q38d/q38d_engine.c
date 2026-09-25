@@ -22,6 +22,7 @@
 #include "bpe_tokenizer.h"
 #include "../qwen38_lowbit_model.h"
 #include "q38d_kern.h"
+#include "q38d_tp.h"
 #include <errno.h>
 #include <pthread.h>
 #include <sched.h>
@@ -85,6 +86,7 @@ typedef struct {
     size_t embed_row_bytes;
     /* shared runtime state */
     float *x, *qkv, *zb, *ab, *bb, *qg, *kb, *vb, *o, *h, *logits;
+    float *xpart;   /* TP: this rank's partial of a row-parallel projection */
     q38d_act act_o, act_h, act_x[NT], act_c[NCMG];
     float *xn[NT], *xn_c[NCMG];
     float *conv_state[NLAYER];
@@ -433,20 +435,31 @@ static void kchunk_copy_or_write(int c, int l, int write) {
  * rows (qkv per CMG: q[4], k[4], v[12] blocks of 128), which lets the
  * in-proj -> core step use a CMG barrier instead of a global one. */
 static int ssm_perm = 1;
+/* Tensor parallelism: rank tp_r of tp_n owns key groups [tp_r*GR, +GR),
+ * GR = 16/tp_n; CMG c of the rank owns GC = GR/4 of them and their HC = 3*GC
+ * value heads {g, g+16, g+32}; qkv rows per CMG QC = 5*GC*128. tp_n = 1 is
+ * the single-node CMG-aligned layout. */
+static int GR = NGROUP, GC = NGROUP / 4, HC = 3 * NGROUP / 4, QC = QKVD / 4;
+static void tp_dims(void) { GR = NGROUP / tp_n; GC = GR / 4; HC = 3 * GC; QC = 5 * GC * DS; }
 static inline int ssm_head_of(int tid) {
     int c = tid / PER, l = tid % PER;
-    return ssm_perm ? 4 * c + (l & 3) + 16 * (l >> 2) : tid;
+    if (!ssm_perm) return tid;
+    if (l >= HC) return -1;
+    return tp_r * GR + c * GC + l % GC + NGROUP * (l / GC);
 }
-static inline int ssm_slot(int h) { return ((h % NGROUP) / 4) * PER + (h & 3) + 4 * (h / NGROUP); }
-static inline int ssm_qoff(int g) { return ssm_perm ? (QKVD / 4) * (g / 4) + (g % 4) * DS : g * DS; }
-static inline int ssm_koff(int g) { return ssm_perm ? (QKVD / 4) * (g / 4) + 4 * DS + (g % 4) * DS : NGROUP * DS + g * DS; }
+static inline int ssm_slot(int h) { int g = h % NGROUP - tp_r * GR; return (g / GC) * HC + g % GC + GC * (h / NGROUP); }
+static inline int ssm_qoff(int g) { int gl = g - tp_r * GR; return ssm_perm ? QC * (gl / GC) + (gl % GC) * DS : g * DS; }
+static inline int ssm_koff(int g) { int gl = g - tp_r * GR; return ssm_perm ? QC * (gl / GC) + GC * DS + (gl % GC) * DS : NGROUP * DS + g * DS; }
 static inline int ssm_voff(int h) {
     if (!ssm_perm) return 2 * NGROUP * DS + h * DS;
     int sl = ssm_slot(h);
-    return (QKVD / 4) * (sl / PER) + 8 * DS + (sl % PER) * DS;
+    return QC * (sl / HC) + 2 * GC * DS + (sl % HC) * DS;
 }
 static inline int ssm_zoff(int h) { return ssm_perm ? ssm_slot(h) * DS : h * DS; }
 static inline int ssm_abi(int h) { return ssm_perm ? ssm_slot(h) : h; }
+/* index of head h's output in E.o / act_o: original order on one node, rank
+ * slot order under TP (the out-proj columns are gathered to match) */
+static inline int ssm_oidx(int h) { return tp_n > 1 ? ssm_slot(h) : h; }
 /* Move 128-row blocks of a low-bit matrix: new block b takes old block
  * src_blk[b]; blocks are 16 whole groups, so CMG parts stay in place. */
 static void permute_blocks(q38d_mat *m, const int *src_blk, int nblk) {
@@ -474,19 +487,98 @@ static int ssm_perm_ok(const q38d_layer *L) {
     }
     return L->qkv.fmt == Q38D_F4 || L->qkv.fmt == Q38D_F6 ? (L->z.fmt == L->qkv.fmt) : 0;
 }
-static void ssm_permute_layer(q38d_layer *L, int layer) {
-    int bq[QKVD / DS], bz[NVH];
-    for (int c = 0; c < 4; c++)
-        for (int j = 0; j < 20; j++) {
-            int b = 20 * c + j;
-            if (j < 4) bq[b] = 4 * c + j;                               /* q group */
-            else if (j < 8) bq[b] = NGROUP + 4 * c + (j - 4);          /* k group */
-            else bq[b] = 2 * NGROUP + ssm_head_of(c * PER + (j - 8));  /* v head  */
+/* ---- TP sharding (before repack: low-bit groups are still in the image tile
+ * format, 8 rows x 64-column tiles of 288 (FP4) / 400 (FP6) bytes) ---- */
+static int mat_kind(const q38d_mat *m) {
+    for (int i = 0; i < ntodo; i++) if (todo[i].m == m) return todo[i].kind;
+    return -1;
+}
+static const uint8_t *mat_group_src(const q38d_mat *m, int G) {   /* global 8-row group G */
+    int row = 8 * G, c = 0;
+    while (c < 3 && row >= m->first[c + 1]) c++;
+    return m->part[c] + (size_t)((row - m->first[c]) / 8) * q38d_group_bytes(m->fmt, m->cols);
+}
+/* keep rows given as 128-row source blocks (src_blk[b]), nb/4 blocks per CMG */
+static void shard_row_blocks(q38d_mat *m, const int *src_blk, int nb) {
+    if (mat_kind(m) != 0) { fprintf(stderr, "q38d: TP row blocks need a low-bit matrix\n"); exit(1); }
+    size_t gb = q38d_group_bytes(m->fmt, m->cols);
+    uint8_t *np[4];
+    for (int c = 0; c < 4; c++) np[c] = cmg_alloc((size_t)(nb / 4) * 16 * gb, c);
+    for (int b = 0; b < nb; b++)
+        for (int k = 0; k < 16; k++)
+            memcpy(np[b / (nb / 4)] + ((size_t)(b % (nb / 4)) * 16 + k) * gb, mat_group_src(m, src_blk[b] * 16 + k), gb);
+    for (int c = 0; c < 4; c++) m->part[c] = np[c];
+    for (int c = 0; c <= 4; c++) m->first[c] = c * nb / 4 * 128;
+    m->rows = nb * 128;
+}
+/* keep the contiguous rows [row0, row0 + R) */
+static void shard_rows(q38d_mat *m, int idx, int row0, int R) {
+    int kind = mat_kind(m);
+    if (kind == 0) {
+        size_t gb = q38d_group_bytes(m->fmt, m->cols);
+        if (R % 32 || row0 % 8) { fprintf(stderr, "q38d: TP row shard %d+%d not group aligned\n", row0, R); exit(1); }
+        uint8_t *np[4];
+        for (int c = 0; c < 4; c++) {
+            int G = R / 32;
+            np[c] = cmg_alloc((size_t)G * gb, c);
+            for (int g = 0; g < G; g++) memcpy(np[c] + (size_t)g * gb, mat_group_src(m, (row0 + c * R / 4) / 8 + g), gb);
         }
-    for (int t = 0; t < NVH; t++) bz[t] = ssm_head_of(t);
-    permute_blocks(&L->qkv, bq, QKVD / DS);
-    permute_blocks(&L->z, bz, NVH);
-    /* alpha, beta (raw Q4_K/Q6_K rows): 12 rows per CMG in slot order */
+        for (int c = 0; c < 4; c++) m->part[c] = np[c];
+        for (int c = 0; c <= 4; c++) m->first[c] = c * R / 4;
+    } else {
+        const gguf_tensor_info *t = &G->tensors[idx];
+        size_t rb = (size_t)m->cols / 256 * (t->type == GGML_TYPE_Q6_K ? 210 : 144);
+        m->src = (m->src ? m->src : (const uint8_t *)gguf_tensor_data(G, idx)) + (size_t)row0 * rb;
+        int groups = (R + 7) / 8;
+        for (int c = 0; c <= 4; c++) { int r = (int)((int64_t)groups * c / 4) * 8; m->first[c] = r < R ? r : R; }
+        for (int c = 0; c < 4; c++) {
+            int gc = (m->first[c + 1] - m->first[c] + 7) / 8;
+            m->part[c] = gc ? cmg_alloc((size_t)gc * q38d_group_bytes(m->fmt, m->cols), c) : NULL;
+        }
+    }
+    m->rows = R;
+}
+/* keep the columns given as 64-column source tiles (all rows) */
+static void shard_col_tiles(q38d_mat *m, const int *tiles, int nt) {
+    if (mat_kind(m) != 0) { fprintf(stderr, "q38d: TP column shard needs a low-bit matrix\n"); exit(1); }
+    size_t tb = m->fmt == Q38D_F4 ? 288 : 400, gb_new = (size_t)nt * tb;
+    int rows = m->rows, G = rows / 8;
+    uint8_t *np[4];
+    int first[5];
+    for (int c = 0; c <= 4; c++) first[c] = (int)((int64_t)G * c / 4) * 8;
+    for (int c = 0; c < 4; c++) {
+        int gc = (first[c + 1] - first[c]) / 8;
+        np[c] = cmg_alloc((size_t)gc * gb_new, c);
+        for (int g = 0; g < gc; g++) {
+            const uint8_t *src = mat_group_src(m, first[c] / 8 + g);
+            for (int k = 0; k < nt; k++) memcpy(np[c] + (size_t)g * gb_new + (size_t)k * tb, src + (size_t)tiles[k] * tb, tb);
+        }
+    }
+    for (int c = 0; c < 4; c++) m->part[c] = np[c];
+    for (int c = 0; c <= 4; c++) m->first[c] = first[c];
+    m->cols = nt * 64;
+}
+static void shard_cols(q38d_mat *m, int col0, int C) {
+    int nt = C / 64, *tl = malloc(nt * sizeof(int));
+    for (int k = 0; k < nt; k++) tl[k] = col0 / 64 + k;
+    shard_col_tiles(m, tl, nt);
+    free(tl);
+}
+/* SSM layer shard (also the tp_n = 1 CMG-aligned permutation) */
+static void ssm_shard_layer(q38d_layer *L, int layer) {
+    int nbq = 5 * GR, nbz = 3 * GR;
+    int *bq = malloc(nbq * sizeof(int)), *bz = malloc(nbz * sizeof(int));
+    for (int c = 0; c < 4; c++) {
+        for (int j = 0; j < 5 * GC; j++) {
+            int b = 5 * GC * c + j, g = tp_r * GR + c * GC;
+            if (j < GC) bq[b] = g + j;
+            else if (j < 2 * GC) bq[b] = NGROUP + g + (j - GC);
+            else bq[b] = 2 * NGROUP + ssm_head_of(c * PER + (j - 2 * GC));
+        }
+        for (int l = 0; l < HC; l++) bz[c * HC + l] = ssm_head_of(c * PER + l);
+    }
+    if (tp_n == 1) { permute_blocks(&L->qkv, bq, nbq); permute_blocks(&L->z, bz, nbz); }
+    else { shard_row_blocks(&L->qkv, bq, nbq); shard_row_blocks(&L->z, bz, nbz); }
     q38d_mat *ab[2] = {&L->alpha, &L->beta};
     const char *nm[2] = {"blk.%d.ssm_alpha.weight", "blk.%d.ssm_beta.weight"};
     for (int k = 0; k < 2; k++) {
@@ -494,14 +586,43 @@ static void ssm_permute_layer(q38d_layer *L, int layer) {
         int idx = need_tensor(nm[k], layer);
         const gguf_tensor_info *t = &G->tensors[idx];
         size_t rb = (size_t)m->cols / 256 * (t->type == GGML_TYPE_Q6_K ? 210 : 144);
-        uint8_t *buf = malloc((size_t)NVH * rb);
+        int R = 4 * HC;
+        uint8_t *buf = malloc((size_t)R * rb);
         const uint8_t *base = gguf_tensor_data(G, idx);
-        for (int t2 = 0; t2 < NVH; t2++) memcpy(buf + (size_t)t2 * rb, base + (size_t)ssm_head_of(t2) * rb, rb);
-        m->src = buf;
-        for (int c = 0; c <= 4; c++) m->first[c] = c * NVH / 4;
         for (int c = 0; c < 4; c++)
-            m->part[c] = cmg_alloc((size_t)((NVH / 4 + 7) / 8) * q38d_group_bytes(m->fmt, m->cols), c);
+            for (int l = 0; l < HC; l++) memcpy(buf + (size_t)(c * HC + l) * rb, base + (size_t)ssm_head_of(c * PER + l) * rb, rb);
+        m->src = buf;
+        m->rows = R;
+        for (int c = 0; c <= 4; c++) m->first[c] = c * HC;
+        for (int c = 0; c < 4; c++) m->part[c] = cmg_alloc((size_t)((HC + 7) / 8) * q38d_group_bytes(m->fmt, m->cols), c);
     }
+    if (tp_n > 1) {
+        /* out-proj: this rank's heads' 128-column blocks in slot order */
+        int *tl = malloc(8 * HC * sizeof(int)), n = 0;
+        for (int c = 0; c < 4; c++)
+            for (int l = 0; l < HC; l++) { int h = ssm_head_of(c * PER + l); tl[n++] = 2 * h; tl[n++] = 2 * h + 1; }
+        shard_col_tiles(&L->out, tl, n);
+        free(tl);
+    }
+    free(bq); free(bz);
+}
+/* attention and FFN matrices of one layer, head / vocabulary shards */
+static void tp_shard_layer(q38d_layer *L, int l) {
+    if (tp_n == 1) return;
+    if (!L->ssm) {
+        int qr = 2 * NHEAD * HD / tp_n, kr = NKV * HD / tp_n;
+        shard_rows(&L->q, need_tensor("blk.%d.attn_q.weight", l), tp_r * qr, qr);
+        shard_rows(&L->k, need_tensor("blk.%d.attn_k.weight", l), tp_r * kr, kr);
+        shard_rows(&L->v, need_tensor("blk.%d.attn_v.weight", l), tp_r * kr, kr);
+        shard_cols(&L->o, tp_r * (NHEAD * HD / tp_n), NHEAD * HD / tp_n);
+        L->o.kch = 0;
+    }
+    int fr = NFF / tp_n;
+    shard_rows(&L->gate, need_tensor("blk.%d.ffn_gate.weight", l), tp_r * fr, fr);
+    shard_rows(&L->up, need_tensor("blk.%d.ffn_up.weight", l), tp_r * fr, fr);
+    shard_cols(&L->down, tp_r * fr, fr);
+    L->down.kch = 1;
+    L->down.unit16 = 1;
 }
 
 static void load_engine(void) {
@@ -554,13 +675,16 @@ static void load_engine(void) {
         if (L->down.kch < 1 || L->down.cols % (L->down.kch * 256)) L->down.kch = 1;
         if (L->down.kch > 1) L->down.unit16 = 0;
     }
+    tp_dims();
     if (ssm_perm) {
         for (int l = 0; l < NLAYER; l++)
             if (E.L[l].ssm && !ssm_perm_ok(&E.L[l])) { ssm_perm = 0; break; }
         if (!ssm_perm) fprintf(stderr, "q38d: SSM in-proj layout not permutable, ssm_perm off\n");
+        if (!ssm_perm && tp_n > 1) { fprintf(stderr, "q38d: TP needs the CMG-aligned SSM layout\n"); exit(1); }
         for (int l = 0; ssm_perm && l < NLAYER; l++)
-            if (E.L[l].ssm) ssm_permute_layer(&E.L[l], l);
+            if (E.L[l].ssm) ssm_shard_layer(&E.L[l], l);
     }
+    for (int l = 0; l < NLAYER; l++) tp_shard_layer(&E.L[l], l);
     if (mtp_on) {
         int l = NLAYER;
         q38d_layer *L = &E.L[l];
@@ -593,6 +717,10 @@ static void load_engine(void) {
         E.shnorm = vec_ptr(need_tensor("blk.%d.nextn.shared_head_norm.weight", l), EMBD);
     }
     describe(&E.head, need_tensor("output.weight", 0));
+    if (tp_n > 1) {
+        int vr = E.n_vocab / tp_n;
+        shard_rows(&E.head, need_tensor("output.weight", 0), tp_r * vr, vr);
+    }
     if (mtp_on && draft_f4) {
         /* FP4 draft head over the first draft_v vocabulary rows (all if 0) */
         describe_f4 = 1;
@@ -1129,14 +1257,14 @@ static void ssm_finish(const q38d_layer *L, int h, const float *o, const q38d_io
     const svbool_t pf = svptrue_b32();
     float inv = 1.0f / sqrtf(sumsq(o, DS) / DS + E.eps);
     const float *z = io->zb + ssm_zoff(h);
-    float *dst = io->o + (size_t)h * DS;
+    float *dst = io->o + (size_t)ssm_oidx(h) * DS;
     for (int i = 0; i < DS; i += 16) {
         svfloat32_t zv = svld1_f32(pf, z + i);
         svfloat32_t sz = svmul_f32_x(pf, zv, q38d_sigmoid_sve(pf, zv));
         svfloat32_t ov = svmul_f32_x(pf, svmul_n_f32_x(pf, svld1_f32(pf, o + i), inv), svld1_f32(pf, L->ssm_norm + i));
         svst1_f32(pf, dst + i, svmul_f32_x(pf, ov, sz));
     }
-    if (E.arith != Q38D_F32) q38d_prepare_range(io->act_o, io->o, h * 4, h * 4 + 4);
+    if (E.arith != Q38D_F32) q38d_prepare_range(io->act_o, io->o, ssm_oidx(h) * 4, ssm_oidx(h) * 4 + 4);
 }
 static void ssm_prefetch_state(int layer, int h) {
     const char *p = (const char *)ssm_st(layer, h, 0);
@@ -1207,6 +1335,7 @@ static void attention_io(int layer, int tid, int pos, int *csense, const q38d_io
     uint64_t T0 = tid ? 0 : ticks();
     const q38d_layer *L = &E.L[layer];
     int c = tid / PER, l = tid % PER, ai = L->ai;
+    if (c >= NKV / tp_n) return;   /* TP: CMG c runs the rank's local KV head c */
     float *qh = E.qh[c];
     if (l < 6) {
         int hq = 6 * c + l;
@@ -1364,7 +1493,7 @@ static void pf_next(int tid, int layer, int phase) {
     switch (phase) {
     case P_SSM_IN:
         pf_mat(&L->out, tid);
-        if (ssm_cpf) {   /* this head's conv history and weights, read first by the core */
+        if (ssm_cpf && ssm_head_of(tid) >= 0) {   /* this head's conv history and weights, read first by the core */
             int hh = ssm_head_of(tid);
             const char *ph = (const char *)E.conv_hist[layer][hh], *pw = (const char *)E.conv_wl[layer][hh];
             for (int o = 0; o < 8 * 384 * 4; o += 256) __builtin_prefetch(ph + o, 1, 3);
@@ -1389,6 +1518,7 @@ static int pf_kv = 1;
 static void pf_attn_kv(int tid, int layer) {
     const q38d_layer *L = &E.L[layer];
     int c = tid / PER, l = tid % PER, n = pf_pos + 1;
+    if (c >= NKV / tp_n) return;
     int t0 = (int)((int64_t)n * l / PER), t1 = (int)((int64_t)n * (l + 1) / PER);
     if (t1 > t0) {
         pf_l2(E.kc[L->ai][c] + (size_t)t0 * HD, (size_t)(t1 - t0) * HD * 4);
@@ -1417,6 +1547,19 @@ static void phase_end_c(int tid, int *cs, uint64_t *t, int phase) {
     prof_mark(tid, t, phase);
 }
 
+/* TP: all workers have stored their rows of the partial E.xpart; worker 0
+ * folds every rank's partial into the residual (the following phase barrier
+ * releases the others); norms then take the sum of squares directly. */
+static double tp_comm_t;
+static void tp_reduce(int tid, int *gs) {
+    gbarrier(tid, gs);
+    if (tid == 0) {
+        uint64_t a = ticks();
+        q38d_tp_sum_add(E.xpart, E.x, EMBD);
+        tp_comm_t += (double)(ticks() - a);
+    }
+    ssq_valid = 0;
+}
 /* experiment: A8 activations for the FFN gate/up input / down input */
 static int ffn_a8, down_a8;
 static void layer_body(int tid, int layer, int pos, int *gs, int *cs, uint64_t *tp) {
@@ -1430,21 +1573,24 @@ static void layer_body(int tid, int layer, int pos, int *gs, int *cs, uint64_t *
         else a = norm_act(tid, L->attn_norm);
         if (L->ssm) {
             int hh = ssm_head_of(tid);
-            if (ssm_pf == 1) ssm_prefetch_state(layer, hh);
+            if (ssm_pf == 1 && hh >= 0) ssm_prefetch_state(layer, hh);
             if (use_plan) run_plan(&plan_ssm[layer], a, tid, omul);
             else { mv(&L->qkv, a, E.qkv, 0, tid); mv(&L->z, a, E.zb, 0, tid);
                    mv(&L->alpha, a, E.ab, 0, tid); mv(&L->beta, a, E.bb, 0, tid); }
             if (inproj_cbar && ssm_perm && use_plan) phase_end_c(tid, cs, &t, P_SSM_IN);
             else phase_end(tid, gs, &t, P_SSM_IN);
-            if (ssm_pf == 2) ssm_prefetch_state(layer, hh);
-            ssm_head(layer, hh, pos);
+            if (ssm_pf == 2 && hh >= 0) ssm_prefetch_state(layer, hh);
+            if (hh >= 0) ssm_head(layer, hh, pos);
             if (E.arith == Q38D_F32) E.act_o.x = E.o;
             phase_end(tid, gs, &t, P_SSM_CORE);
-            mv(&L->out, &E.act_o, E.x, 1, tid);
-            ssq_valid = 1;
-            ssq_split_valid = L->out.kch > 1;
-            if (prod_norm) x_produce(&L->out, tid, L->post_norm);
-            else ssq_publish_rows(&L->out, tid);
+            if (tp_n > 1) { mv(&L->out, &E.act_o, E.xpart, 0, tid); tp_reduce(tid, gs); }
+            else {
+                mv(&L->out, &E.act_o, E.x, 1, tid);
+                ssq_valid = 1;
+                ssq_split_valid = L->out.kch > 1;
+                if (prod_norm) x_produce(&L->out, tid, L->post_norm);
+                else ssq_publish_rows(&L->out, tid);
+            }
             phase_end(tid, gs, &t, P_SSM_OUT);
         } else {
             if (use_plan) run_plan(&plan_att[layer], a, tid, omul);
@@ -1454,11 +1600,14 @@ static void layer_body(int tid, int layer, int pos, int *gs, int *cs, uint64_t *
             attention(layer, tid, pos, cs);
             if (E.arith == Q38D_F32) E.act_o.x = E.o;
             phase_end(tid, gs, &t, P_ATT_CORE);
-            mv(&L->o, &E.act_o, E.x, 1, tid);
-            ssq_valid = 1;
-            ssq_split_valid = L->o.kch > 1;
-            if (prod_norm) x_produce(&L->o, tid, L->post_norm);
-            else ssq_publish_rows(&L->o, tid);
+            if (tp_n > 1) { mv(&L->o, &E.act_o, E.xpart, 0, tid); tp_reduce(tid, gs); }
+            else {
+                mv(&L->o, &E.act_o, E.x, 1, tid);
+                ssq_valid = 1;
+                ssq_split_valid = L->o.kch > 1;
+                if (prod_norm) x_produce(&L->o, tid, L->post_norm);
+                else ssq_publish_rows(&L->o, tid);
+            }
             phase_end(tid, gs, &t, P_ATT_OUT);
         }
         if (ffn_a8 && E.arith == Q38D_A16) E.act_c[tid / PER].arith = Q38D_A8;
@@ -1511,10 +1660,13 @@ static void layer_body(int tid, int layer, int pos, int *gs, int *cs, uint64_t *
         }
         if (E.arith == Q38D_F32) E.act_h.x = E.h;
         phase_end(tid, gs, &t, P_FFN_UP);
-        mv(&L->down, &E.act_h, E.x, 1, tid);
-        ssq_split_valid = L->down.kch > 1;
-        if (prod_norm) x_produce(&L->down, tid, layer + 1 < NLAYER ? E.L[layer + 1].attn_norm : E.out_norm);
-        else ssq_publish_rows(&L->down, tid);
+        if (tp_n > 1) { mv(&L->down, &E.act_h, E.xpart, 0, tid); tp_reduce(tid, gs); }
+        else {
+            mv(&L->down, &E.act_h, E.x, 1, tid);
+            ssq_split_valid = L->down.kch > 1;
+            if (prod_norm) x_produce(&L->down, tid, layer + 1 < NLAYER ? E.L[layer + 1].attn_norm : E.out_norm);
+            else ssq_publish_rows(&L->down, tid);
+        }
         phase_end(tid, gs, &t, P_FFN_DOWN);
     #undef t
 }
@@ -1549,6 +1701,11 @@ static void head_argmax_m(int tid, const float *nw, const q38d_mat *hm, int *gs,
     if (tid == 0) {
         float best = -INFINITY; int bi = 0;
         for (int i = 0; i < NT; i++) if (E.best_idx[i] >= 0 && E.best_val[i] > best) { best = E.best_val[i]; bi = E.best_idx[i]; }
+        if (tp_n > 1 && hm == &E.head) {
+            int gid = bi + tp_r * (E.n_vocab / tp_n);
+            q38d_tp_argmax(&best, &gid);
+            bi = gid;
+        }
         E.next_token = bi;
     }
     prof_mark(tid, &t, P_HEAD);
@@ -2287,6 +2444,7 @@ static void *worker(void *arg) {
     for (int layer = 0; layer < NLAYER; layer++)
         if (E.L[layer].ssm) {
             int hh = ssm_head_of(tid);
+            if (hh < 0) continue;
             for (int r = 0; r < ssm_ring; r++) {
                 float *b = aligned_alloc(256, (DS * DS + 2 * DS) * sizeof(float));
                 memset(b, 0, (DS * DS + 2 * DS) * sizeof(float));
@@ -2512,6 +2670,13 @@ int main(int argc, char **argv) {
     }
     if (!path || pn < 1 || gn < 1) { usage(argv[0]); return 2; }
     E.fmt = fmt; E.arith = arith; E.max_seq = pn + gn + 8;
+    {
+        /* tensor parallelism: one process per node, Q38D_TP ranks */
+        int tpn = getenv("Q38D_TP") ? atoi(getenv("Q38D_TP")) : 1;
+        if (tpn != 1 && tpn != 2 && tpn != 4) { fprintf(stderr, "q38d: Q38D_TP must be 1, 2 or 4\n"); return 2; }
+        pin_cpu(12);
+        q38d_tp_init(tpn, EMBD);
+    }
     if (getenv("Q38D_OUT_KCH")) out_kch = atoi(getenv("Q38D_OUT_KCH"));
     if (getenv("Q38D_Q6K_EXPAND")) q6k_expand = atoi(getenv("Q38D_Q6K_EXPAND"));
     if (getenv("Q38D_ASM")) q38d_asm_variant = atoi(getenv("Q38D_ASM"));
@@ -2548,6 +2713,7 @@ int main(int argc, char **argv) {
         mtp_on = 1;
         ssm_ring = spec_k + 2;
     }
+    if (tp_n > 1 && (spec_k || mtp_on)) { fprintf(stderr, "q38d: speculative/MTP modes are single-node only\n"); return 2; }
     if (getenv("Q38D_SSM_PERM")) ssm_perm = atoi(getenv("Q38D_SSM_PERM"));
     if (getenv("Q38D_CONV_LOCAL") && !atoi(getenv("Q38D_CONV_LOCAL"))) ssm_perm = 0;
     load_engine();
@@ -2557,7 +2723,8 @@ int main(int argc, char **argv) {
         for (int c = 0; c <= 4; c++)
             if (L->q.first[c] != c * (L->q.rows / 4) || L->k.first[c] != c * HD || L->v.first[c] != c * HD) attn_cmg_ok = 0;
     }
-    if (!attn_cmg_ok) fprintf(stderr, "q38d: attention in-proj not CMG-aligned, global barrier kept\n");
+    if (tp_n > 1) attn_cmg_ok = 0;
+    if (!attn_cmg_ok && tp_n == 1) fprintf(stderr, "q38d: attention in-proj not CMG-aligned, global barrier kept\n");
     /* shared buffers (first touched by main thread; small) */
     E.x = aligned_alloc(256, EMBD * 4);
     E.qkv = aligned_alloc(256, NFF * 4);
@@ -2569,9 +2736,10 @@ int main(int argc, char **argv) {
     E.h = aligned_alloc(256, NFF * 4);
     E.unit_cnt = calloc(NFF / 16, sizeof(*E.unit_cnt));
     E.logits = aligned_alloc(256, (size_t)E.n_vocab * 4);
-    E.act_o = (q38d_act){DINNER, arith, aligned_alloc(256, q38d_act_qbytes(DINNER, Q38D_A16)),
+    E.xpart = aligned_alloc(256, EMBD * 4);
+    E.act_o = (q38d_act){DINNER / tp_n, arith, aligned_alloc(256, q38d_act_qbytes(DINNER, Q38D_A16)),
                          aligned_alloc(256, DINNER / 16 * 4), aligned_alloc(256, DINNER / 16 * 4), E.o};
-    E.act_h = (q38d_act){NFF, arith, aligned_alloc(256, q38d_act_qbytes(NFF, Q38D_A16)),
+    E.act_h = (q38d_act){NFF / tp_n, arith, aligned_alloc(256, q38d_act_qbytes(NFF, Q38D_A16)),
                          aligned_alloc(256, NFF / 16 * 4), aligned_alloc(256, NFF / 16 * 4), E.h};
     if (down_a8 && arith == Q38D_A16) E.act_h.arith = Q38D_A8;
     for (int l = 0; l < NLAYER; l++) {
@@ -2693,6 +2861,10 @@ int main(int argc, char **argv) {
     for (int i = 1; i < NT; i++) pthread_create(&th[i], NULL, worker, (void *)(intptr_t)i);
     worker((void *)(intptr_t)0);
     for (int i = 1; i < NT; i++) pthread_join(th[i], NULL);
+    if (tp_r != 0) return 0;
+    if (tp_n > 1)
+        fprintf(stderr, "q38d: TP%d rank0 collective (worker 0) ms/tok=%.3f over prefill+decode\n", tp_n,
+                tp_comm_t / tick_hz() * 1e3 / (pn + gn));
     for (int n = 0; n < gn; n++)
         fprintf(stderr, "q38d: token n=%d pos=%d id=%d logit=%a\n", n, pn + n, JOB.tok[pn + n], JOB.trace_logit[n]);
     double hz = tick_hz();
