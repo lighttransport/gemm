@@ -7,11 +7,47 @@ import argparse
 from contextlib import nullcontext
 import json
 import os
+import sys
 import time
 from pathlib import Path
 
 import numpy as np
 from PIL import Image
+
+
+def resolve_device(torch, name: str):
+    """Map a requested device onto a real one, refusing what cannot work and
+    saying why. PyTorch exposes ROCm through the `cuda` namespace, so an AMD
+    run and an NVIDIA run share the device string and differ only in the build
+    that is installed -- which is exactly what the request names.
+    """
+    if name == "cpu":
+        return torch.device("cpu")
+    hip = getattr(torch.version, "hip", None)
+    if name == "rocm":
+        if not hip:
+            raise SystemExit("--device rocm needs a ROCm PyTorch build; this interpreter has "
+                             f"torch {torch.__version__} with no HIP runtime")
+        if not torch.cuda.is_available():
+            raise SystemExit("--device rocm needs a visible GPU and none is available")
+        return torch.device("cuda")
+    if hip:
+        raise SystemExit(f"this is a ROCm PyTorch build (HIP {hip}); use --device rocm, "
+                         "not --device cuda")
+    if not torch.cuda.is_available():
+        raise SystemExit("--device cuda needs a visible GPU; use --device cpu to run the "
+                         "reference on the processor")
+    return torch.device("cuda")
+
+
+def device_label(torch, device) -> str:
+    """What actually ran, for the log. `cuda` alone is ambiguous once ROCm is a
+    possibility, and a parity report that cannot say which one it used is not
+    worth much."""
+    if device.type != "cuda":
+        return "cpu"
+    hip = getattr(torch.version, "hip", None)
+    return f"rocm {hip}" if hip else f"cuda {torch.cuda.get_device_name(0)}"
 
 
 def main() -> int:
@@ -26,6 +62,9 @@ def main() -> int:
     ap.add_argument("--steps", type=int, default=1)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--dtype", choices=("bf16", "fp16"), default="bf16")
+    ap.add_argument("--device", choices=("cuda", "rocm", "cpu"), default="cuda",
+                    help="which PyTorch build and device to run on; rocm and cuda need "
+                         "matching PyTorch builds, cpu needs neither")
     ap.add_argument("--sdpa-backend", choices=("default", "efficient"), default="default",
                     help="optionally pin CUDA SDPA for deterministic native parity")
     ap.add_argument(
@@ -50,8 +89,17 @@ def main() -> int:
     import torch
     from diffusers import QwenImage21Pipeline
 
-    if not torch.cuda.is_available():
-        raise SystemExit("reference requires CUDA")
+    device = resolve_device(torch, args.device)
+    on_gpu = device.type == "cuda"
+    label = device_label(torch, device)
+    if args.sdpa_backend == "efficient" and not on_gpu:
+        # The pinned route is the CUDA/HIP flash kernel. Asking for it on the CPU
+        # would either raise deep inside SDPA or quietly pick another kernel, and
+        # the parity fixtures depend on knowing which one ran.
+        print(f"reference: --sdpa-backend efficient has no {label} route; using the default",
+              file=sys.stderr)
+        args.sdpa_backend = "default"
+    print(f"reference: device {label}, dtype {args.dtype}, sdpa {args.sdpa_backend}")
     out = Path(args.dump_dir)
     out.mkdir(parents=True, exist_ok=True)
     image = Image.open(args.image) if args.image else None
@@ -59,7 +107,13 @@ def main() -> int:
     pipe = QwenImage21Pipeline.from_pretrained(
         str(Path(args.model).resolve()), dtype=dtype, local_files_only=True
     )
-    pipe.enable_sequential_cpu_offload(device="cuda")
+    if on_gpu:
+        # The weights are 31 GB and the demo holds a native run in the same
+        # device, so the pipeline is streamed module by module rather than
+        # resident. On the CPU there is nothing to stream away from.
+        pipe.enable_sequential_cpu_offload(device=device)
+    else:
+        pipe.to(device)
     if args.prompt_fixture_dir:
         fixture = args.prompt_fixture_dir
         prompt_array = np.load(fixture / "prompt_embeds.npy", allow_pickle=False)
@@ -73,6 +127,8 @@ def main() -> int:
             raise ValueError("invalid prompt fixture values")
 
         def fixture_encode_prompt(*_args, device=None, num_images_per_prompt=1, **_kwargs):
+            # Falls back to the pipeline's own device, which while offloading is
+            # whichever module is resident, and on the CPU is simply the CPU.
             target = device or pipe._execution_device
             embeddings = torch.from_numpy(prompt_array).to(device=target, dtype=dtype)
             prompt_mask = torch.from_numpy(prompt_mask_array).to(device=target, dtype=torch.bool)
@@ -193,7 +249,9 @@ def main() -> int:
         qmod._qwenimage21_prepare_qkv = capture_prepare_qkv
     if max(args.height, args.width) > 1024:
         pipe.vae.enable_tiling()
-    gen = torch.Generator(device="cuda").manual_seed(args.seed)
+    # The generator has to sit on the same device as the noise it seeds, or
+    # prepare_latents has to copy across a bus and the seed stops being exact.
+    gen = torch.Generator(device=device).manual_seed(args.seed)
     pred_dir = Path(args.dump_pred_dir) if args.dump_pred_dir else None
     if pred_dir:
         pred_dir.mkdir(parents=True, exist_ok=True)
@@ -277,7 +335,7 @@ def main() -> int:
             args.height,
             args.width,
             dtype,
-            torch.device("cuda"),
+            device,
             gen,
             None,
         )
@@ -325,7 +383,10 @@ def main() -> int:
         handle.remove()
     for handle in text_input_handles:
         handle.remove()
-    torch.cuda.synchronize()
+    if on_gpu:
+        # The elapsed time below is only meaningful once the queued work has
+        # actually finished; on the CPU everything already ran in order.
+        torch.cuda.synchronize()
     result.images[0].save(out / "reference.png")
     np.save(out / "reference_rgba.npy", np.asarray(result.images[0].convert("RGBA")))
     (out / "run.json").write_text(json.dumps({
@@ -340,6 +401,8 @@ def main() -> int:
         "seed": args.seed,
         "elapsed_seconds": time.perf_counter() - t0,
         "torch": torch.__version__,
+        "device": label,
+        "device_requested": args.device,
         "sdpa_backend": args.sdpa_backend,
         "use_kv_cache": use_kv_cache,
         "prompt_fixture_dir": str(args.prompt_fixture_dir.resolve()) if args.prompt_fixture_dir else None,
