@@ -499,6 +499,40 @@ peak reserved GPU memory, 12,164,100,096 bytes peak host memory, and 2,280
 MMA attention calls. Its GLB passes the
 validator and its rendered four-view preview is coherent. Earlier saved CUDA
 multiview runs on the resident decoder completed in 512.737 and 490.727
-seconds, so this slow tiled result describes the current memory contention
-and decoder path, not a like-for-like kernel speed change. The current run's
+seconds. The slowdown was not caused by GPU contention: the 16,384-token rule
+added for 8 GB cards sent this 17,387-token fixture to the tiled decoder at
+every budget of 7 GiB or less. That path gathers on the host and re-uploads the
+full F32 convolution weight for every 2048-row tile, which accounts for the
+785 GB of host-to-device traffic and the 325 s and 318 s decoder stages. The
+tiled decoder also rounds some steps on the host, so its output differs from
+the resident decoder (6,335,535 versus 6,335,604 final crab voxels). The run's
 artifacts are under `tmp/pixal3d/revalidate-cuda-multiview-20260924/`.
+
+## Memory-bounded resident decoder
+
+The resident sparse decoder now releases every activation after its last
+consumer, normalizes in place, scatters each 2048-parent conv1 tile straight to
+its children with row-offset C2S, accumulates each conv2 tile into the skip
+buffer, and runs the ConvNeXt MLP in row chunks that are multiples of the
+2048-row GEMM tile. Every GEMM keeps its original shape, so output is
+byte-identical. The 16,384-token rule is gone: the resident decoder always
+runs, and only an allocation beyond the budget or device memory retries on the
+tiled decoder. Decoder replay of saved latents (`replay_decoders.py`, shape
+then guided texture, RTX 5060 Ti; the old resident range includes the original
+full crab run's 14.7 s + 14.2 s decoder stages):
+
+| Input | Budget | Path | Decoders | H2D | Peak active | Output |
+|---|---:|---|---:|---:|---:|---|
+| crab, 17,860 tokens | 12288 MiB | old resident | 28.9-34.4 s | 5.6 GB | 9.23 GiB | reference |
+| crab | 7168 MiB | old tiled | 533.2 s | 939 GB | - | differs |
+| crab | 12288 MiB | new resident | 19.7 s | 3.8 GB | 4.69 GiB | identical |
+| crab | 7168 MiB | new resident | 19.8 s | 3.8 GB | 4.69 GiB | identical |
+| house, 10,765 tokens | 12288 MiB | new resident | 13.2 s | - | - | identical |
+| house | 2560 MiB | tiled retry | 357.9 s | 610 GB | - | tiled result |
+
+```sh
+ref/pixal3d/run.sh cuda ref/pixal3d/replay_decoders.py \
+  --dump-dir tmp/pixal3d/resident-runs/cuda-crab/dumps \
+  --expect-dir tmp/pixal3d/resident-runs/cuda-crab/dumps \
+  --vram-budget-mib 7168 --profile-json tmp/pixal3d/decoder-replay/crab-7168.json
+```

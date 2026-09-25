@@ -3,7 +3,7 @@
 #define PIXAL3D_DEVICE_H
 #include <stddef.h>
 #include <stdint.h>
-#define PX_DEVICE_ABI 2
+#define PX_DEVICE_ABI 3
 enum px_device_op {
     PX_LINEAR,
     PX_NORM,
@@ -31,14 +31,16 @@ enum px_device_op {
 };
 /* Handles refer to plugin-owned Buffer objects, not raw device pointers.
  * Activations are F32; precision selects rounding (0 F32, 1 BF16, 2 F16).
- * LINEAR: n rows, c outputs, k inputs, offset output-row offset; w is packed
- * in the requested precision and b is F32. ATTENTION: n queries, k keys,
+ * LINEAR: n rows, c outputs, k inputs, offset output-row offset, heads
+ * input-row offset; w is packed in the requested precision and b is F32. ATTENTION: n queries, k keys,
  * heads heads, c head width; x/w/v are Q/K/V in token-major layout.
  * PART selects offset of k interleaved channel slices. NORM normalizes c
  * channels; RMS/ROPE use k heads. ROPE extra=1 reads cached F32 phases
  * [tokens,c]; ROPE_PHASE builds these from I32 [tokens,4] coordinates. ROPE2 is in-place (n grid, heads, c width,
  * offset prefix). GATHER uses n output rows, c=27*channels, offset source row,
  * extra selects dense [channels,27] or sparse [27,channels] ordering.
+ * C2S/SKIP write output rows heads..heads+n and subtract offset from parent
+ * indices. ADD with k=1 applies row offset heads to out and w, not x.
  * The remaining operations are internal pointwise/conditioning commands.
  * Coordinate maps are I32 stored in four-byte buffers. */
 struct px_device_command {

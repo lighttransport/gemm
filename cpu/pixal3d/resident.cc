@@ -21,6 +21,15 @@ void Engine::configure(const pixal3d_gpu_options &o) {
     flow_precision_ = o.flow_precision;
     profile_ = o.profile_json ? o.profile_json : "";
 }
+void Engine::plugin_error() const {
+    std::string message = api_.error(gpu_);
+    // Budget refusals and device OOM from gpuMalloc (CUDA/HIP code 2) let
+    // callers retry with a lower-memory path; other failures stay fatal.
+    if (message.find("exceeds memory budget") != std::string::npos ||
+        (message.find("gpuMalloc") != std::string::npos && message.find("failed: 2") != std::string::npos))
+        throw BudgetError(message);
+    throw std::runtime_error(message);
+}
 void Engine::clear_weights() {
     conditioning_cache_.clear();
     weights_.clear();
@@ -75,7 +84,8 @@ Tensor Engine::tensor(size_t count, int precision) {
         cache_bytes_ = 0;
         p = api_.allocate(gpu_, bytes);
     }
-    require(p, api_.error(gpu_));
+    if (!p)
+        plugin_error();
     auto release = api_.release;
     return {std::shared_ptr<void>(p, [release](void *q) { release(q); }), count, precision};
 }
@@ -135,7 +145,10 @@ Tensor Engine::weight(Weights &w, const std::string &name, int precision) {
     }
     return t;
 }
-void Engine::execute(px_device_command op) { require(api_.execute(gpu_, &op) == 0, api_.error(gpu_)); }
+void Engine::execute(px_device_command op) {
+    if (api_.execute(gpu_, &op) != 0)
+        plugin_error();
+}
 Tensor Engine::linear(const Tensor &x, Weights &w, const std::string &name, int precision) {
     auto shape = w.shape(name + ".weight");
     require(shape.size() == 2 && x.size % shape[1] == 0 && x.size / shape[1] <= INT32_MAX,
@@ -204,6 +217,24 @@ Tensor Engine::convolution(const Tensor &x, Weights &w, const std::string &name,
                  bias.get(), nullptr});
     }
     return out;
+}
+void Engine::convolution_tiles(const Tensor &x, Weights &w, const std::string &name, const Tensor &neighbors,
+                               int precision, const std::function<void(const Tensor &, int, int)> &consume) {
+    auto s = w.shape(name + ".weight");
+    require(s.size() == 5 && s[1] == 3 && s[2] == 3 && s[3] == 3, "Expected sparse 3x3x3 resident convolution");
+    int ci = s.back(), co = s[0], n = int(x.size / ci);
+    require(x.size % ci == 0 && neighbors.size == size_t(n) * 27, "Invalid resident convolution geometry");
+    auto wt = weight(w, name + ".weight", precision), bias = weight(w, name + ".bias");
+    auto out = tensor(size_t(std::min(n, 2048)) * co);
+    for (int start = 0; start < n; start += 2048) {
+        int rows = std::min(2048, n - start);
+        auto gather = tensor(size_t(rows) * ci * 27, precision);
+        execute({PX_GATHER, precision, rows, ci * 27, 0, 0, start, 0, 0, gather.get(), x.get(), neighbors.get(),
+                 nullptr, nullptr});
+        execute({PX_LINEAR, precision, rows, co, ci * 27, 0, 0, int(precision != 0), 0, out.get(), gather.get(),
+                 wt.get(), bias.get(), nullptr});
+        consume(out, start, rows);
+    }
 }
 void Engine::begin_profile() {
     timings_.clear();

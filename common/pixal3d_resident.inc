@@ -204,16 +204,17 @@ __global__ void px_gather(void *output, const float *x, const int *map, int star
         static_cast<float *>(output)[i] = value;
 }
 __global__ void px_c2s(float *out, const float *x, const int *parent, const int *slot, int n, int co, int ci,
-                       int skip, int dense) {
+                       int skip, int dense, int row0, int parent0) {
     size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= size_t(n) * co)
         return;
-    int r = i / co, ch = i % co, p = parent[r], s = slot[r];
+    int r = row0 + int(i / co), ch = i % co, p = parent[r] - parent0, s = slot[r];
+    size_t o = size_t(r) * co + ch;
     if (dense) {
-        out[i] = x[size_t(p) * co * 8 + ch * 8 + s];
+        out[o] = x[size_t(p) * co * 8 + ch * 8 + s];
         return;
     }
-    out[i] =
+    out[o] =
         skip ? x[size_t(p) * ci + s * (ci / 8) + ch / (co / (ci / 8))] : x[(size_t(p) * 8 + s) * co + ch];
 }
 __global__ void px_conv2_gather(float *out, const float *x, int rows, int ci, int kernel, int size,
@@ -423,7 +424,7 @@ static void px_resident_linear(Device &d, const px_device_command &op) {
     bool mixed = op.precision == 3;
     bool packed_input = op.extra != 0;
     int lowp = mixed ? 1 : op.precision;
-    px_extent(op.x, size_t(n) * ci, packed_input ? 2 : 4);
+    px_extent(op.x, size_t(n + op.heads) * ci, packed_input ? 2 : 4);
     px_extent(op.w, size_t(co) * ci, op.precision ? 2 : 4);
     px_extent(op.out, size_t(n + op.offset) * co);
     if (op.b)
@@ -435,12 +436,12 @@ static void px_resident_linear(Device &d, const px_device_command &op) {
         packed = std::make_unique<Buffer>(d, size_t(tile) * ci * 2);
     for (int start = 0; start < n; start += tile) {
         int rows = std::min(tile, n - start);
-        float *x = px_float(op.x) + size_t(start) * ci,
+        float *x = px_float(op.x) + size_t(start + op.heads) * ci,
               *out = px_float(op.out) + size_t(start + op.offset) * co;
         if (op.precision) {
             const void *input;
             if (packed_input)
-                input = static_cast<const unsigned short *>(px_buffer(op.x).p) + size_t(start) * ci;
+                input = static_cast<const unsigned short *>(px_buffer(op.x).p) + size_t(start + op.heads) * ci;
             else {
                 cast_bfloat<<<(size_t(rows) * ci + 255) / 256, 256, 0, d.stream>>>(
                     (unsigned short *)packed->p, x, size_t(rows) * ci, lowp);
@@ -558,7 +559,10 @@ extern "C" int px_gpu_execute(void *p, const px_device_command *command) {
             GPU(gpuEventRecord(start, d.stream));
         }
         size_t count = size_t(o.n) * o.c;
-        px_extent(o.out, count, o.op == PX_GATHER && o.precision ? 2 : 4);
+        // Row-offset forms write rows heads..heads+n of their output.
+        bool row_offset = o.op == PX_C2S || o.op == PX_SKIP || (o.op == PX_ADD && o.k);
+        size_t shift = row_offset ? size_t(o.heads) * o.c : 0;
+        px_extent(o.out, count + shift, o.op == PX_GATHER && o.precision ? 2 : 4);
         if (o.op == PX_PART)
             px_extent(o.x, count * o.k);
         else if ((o.op >= PX_NORM && o.op <= PX_RESIDUAL) || o.op == PX_SCALE_ADD || o.op == PX_GROUP_SILU)
@@ -572,7 +576,7 @@ extern "C" int px_gpu_execute(void *p, const px_device_command *command) {
         if (o.op == PX_RMS)
             px_extent(o.w, size_t(o.k) * o.c);
         if (o.op == PX_ADD || o.op == PX_SCALE_ADD || o.op == PX_RESIDUAL) {
-            px_extent(o.w, o.op == PX_ADD && !o.k ? o.c : count);
+            px_extent(o.w, o.op == PX_ADD && !o.k ? o.c : count + shift);
             if (o.b)
                 px_extent(o.b, size_t(o.offset) + o.c);
         }
@@ -618,13 +622,18 @@ extern "C" int px_gpu_execute(void *p, const px_device_command *command) {
                                                                  (const int *)px_buffer(o.w).p, o.offset, o.n,
                                                                  o.c / 27, o.extra, o.precision);
         else if (o.op == PX_C2S || o.op == PX_SKIP)
+        {
+            px_extent(o.w, size_t(o.heads) + o.n);
+            px_extent(o.b, size_t(o.heads) + o.n);
             px_c2s<<<(count + 255) / 256, 256, 0, d.stream>>>(
                 px_float(o.out), px_float(o.x), (const int *)px_buffer(o.w).p, (const int *)px_buffer(o.b).p,
-                o.n, o.c, o.k, o.op == PX_SKIP, o.extra);
+                o.n, o.c, o.k, o.op == PX_SKIP, o.extra, o.heads, o.offset);
+        }
         else if ((o.op >= PX_PART && o.op <= PX_RESIDUAL) || o.op == PX_SCALE_ADD)
-            px_element<<<(count + 255) / 256, 256, 0, d.stream>>>(px_float(o.out), px_float(o.x),
-                                                                  px_float(o.w), px_float(o.b), o.op, count,
-                                                                  o.c, o.precision, o.k, o.offset);
+            px_element<<<(count + 255) / 256, 256, 0, d.stream>>>(px_float(o.out) + shift, px_float(o.x),
+                                                                  px_float(o.w) + (o.w ? shift : 0),
+                                                                  px_float(o.b), o.op, count, o.c, o.precision,
+                                                                  o.k, o.offset);
         else
             throw std::runtime_error("Unsupported resident operation");
         GPU(gpuGetLastError());

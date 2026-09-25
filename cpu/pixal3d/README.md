@@ -158,12 +158,14 @@ native allocator peak remained 6.38 GiB; total device use peaked at 6.60 GiB.
 
 The total-device measurement includes roughly 1 GiB used by the Windows WDDM
 desktop. WSL reports per-process NVML memory as unavailable, so the fixture
-retains total-device and native allocator peaks separately. At an effective
-budget of 7 GiB or less, inputs above 16,384 shape tokens automatically use the
-existing tiled host-offloaded decoder. This preserved the crab run's full
-7,079,106-voxel decodes and FP16 precision while avoiding the resident neighbor
-map overlap that exceeded the card budget. Smaller outputs stay fully resident;
-cards with more than a 7 GiB effective budget retain the resident decoder.
+retains total-device and native allocator peaks separately. The WSL crab run
+above predates the memory-bounded resident decoder: at that time inputs above
+16,384 shape tokens at an effective budget of 7 GiB or less used the tiled
+host-offloaded decoder. The resident decoder now scatters conv1 tiles directly
+to their children, accumulates conv2 tiles into the skip buffer, chunks the
+ConvNeXt MLP, and normalizes in place, so dense shapes stay resident at 7 GiB
+with byte-identical output. The tiled decoder remains only as an automatic
+retry when a resident allocation exceeds the budget or device memory.
 
 The inpainting implementation is pinned to OpenCV 4.12 to match the Python
 reference. It uses its stable priority heap even when the system libraries are

@@ -215,6 +215,45 @@ extern "C" int px_test_decode(int backend, const char *path, float **y, int32_t 
     *rows = out.rows();
     TEST_END
 }
+/* Shape then guided texture decoding, in pipeline order, for decoder replay. */
+extern "C" int px_test_decode_pair(int backend, const char *shape_path, const char *texture_path,
+                                   const float *shape_x, const float *texture_x, const int32_t *coords, int n,
+                                   float **shape_y, float **texture_y, int32_t **out_coords, int *rows) {
+    TEST_BEGIN e.begin_profile();
+    std::vector<px::Subdivision> subs;
+    px::Coords c(coords, coords + size_t(n) * 4);
+    px::Sparse shape_out, texture_out;
+    auto timed = [&](const char *name, auto &&run) {
+        auto start = std::chrono::steady_clock::now();
+        run();
+        e.record(name, std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
+    };
+    {
+        px::Weights w(shape_path);
+        timed("shape.decoder", [&] {
+            shape_out = px::decode_sparse(e, w, {c, px::Vec(shape_x, shape_x + size_t(n) * 32), 32}, false,
+                                          subs, false);
+        });
+    }
+    {
+        px::Weights w(texture_path);
+        timed("texture.decoder", [&] {
+            texture_out = px::decode_sparse(e, w, {c, px::Vec(texture_x, texture_x + size_t(n) * 32), 32},
+                                            false, subs, true);
+        });
+    }
+    px::require(shape_out.coords == texture_out.coords, "Shape and texture coordinates differ");
+    e.write_profile();
+    *rows = shape_out.rows();
+    *shape_y = static_cast<float *>(std::malloc(shape_out.feats.size() * sizeof(float)));
+    *texture_y = static_cast<float *>(std::malloc(texture_out.feats.size() * sizeof(float)));
+    *out_coords = static_cast<int32_t *>(std::malloc(shape_out.coords.size() * sizeof(int32_t)));
+    px::require(*shape_y && *texture_y && *out_coords, "Failed to allocate validation result");
+    std::copy(shape_out.feats.begin(), shape_out.feats.end(), *shape_y);
+    std::copy(texture_out.feats.begin(), texture_out.feats.end(), *texture_y);
+    std::copy(shape_out.coords.begin(), shape_out.coords.end(), *out_coords);
+    TEST_END
+}
 extern "C" int px_test_naf(int backend, const char *path, float *y, float *guide, const float *x, int size,
                            const float *patches, int grid, int target, const float *xy, int n) {
     TEST_BEGIN px::Weights w(path);

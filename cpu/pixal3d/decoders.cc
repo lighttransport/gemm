@@ -87,25 +87,54 @@ static Sparse decode_sparse_gpu(Engine &e, Weights &w, const Sparse &input, bool
     e.inplace(PX_ROUND, h, 1, precision);
     if (!guided)
         subdivisions.clear();
-    auto norm_gpu = [&](const Tensor &x, int c, const std::string &name) {
-        return e.operation(PX_NORM, x, c, precision, e.weight(w, name + ".weight"),
-                           e.weight(w, name + ".bias"), 0, 0, 1e-6f);
+    // px_norm reads each element and writes it from the same thread after the
+    // row reduction, so normalizing in place is exact and saves one activation.
+    auto norm_gpu = [&](Tensor &x, int c, const std::string &name) {
+        e.inplace(PX_NORM, x, c, precision, e.weight(w, name + ".weight"), e.weight(w, name + ".bias"), 0, 0,
+                  1e-6f);
+    };
+    // The neighbor map of `coords`; the previous stage's conv2 map is reused.
+    Tensor nbr;
+    auto ensure_neighbors = [&] {
+        if (!nbr.get()) {
+            auto map = neighbors(coords);
+            nbr = e.upload(map.data(), map.size());
+        }
+    };
+    // ConvNeXt MLP over row chunks. Chunks are multiples of the 2048-row GEMM
+    // tile, so every GEMM and rounding step matches the unchunked sequence;
+    // only the 4x-wide hidden activation shrinks to one chunk.
+    auto mlp = [&](const Tensor &y, int c, const std::string &b) {
+        int n = int(y.size / c), wide = w.shape(b + "mlp.0.weight")[0];
+        int chunk = std::max(2048, int((size_t(128) << 20) / (size_t(wide) * 4) / 2048 * 2048));
+        auto w0 = e.weight(w, b + "mlp.0.weight", precision), b0 = e.weight(w, b + "mlp.0.bias");
+        auto w2 = e.weight(w, b + "mlp.2.weight", precision), b2 = e.weight(w, b + "mlp.2.bias");
+        int most = std::min(n, chunk);
+        auto a = e.tensor(size_t(most) * wide), o = e.tensor(size_t(most) * c);
+        for (int start = 0; start < n; start += chunk) {
+            int rows = std::min(chunk, n - start);
+            e.execute({PX_LINEAR, precision, rows, wide, c, start, 0, 0, 0, a.get(), y.get(), w0.get(), b0.get(),
+                       nullptr});
+            e.execute({PX_SILU, precision, rows * wide, 1, 0, 0, 0, 0, 0, a.get(), a.get(), nullptr, nullptr,
+                       nullptr});
+            e.execute({PX_LINEAR, precision, rows, c, wide, 0, 0, 0, 0, o.get(), a.get(), w2.get(), b2.get(),
+                       nullptr});
+            // h + mlp(y); ADD offsets out and w, and IEEE addition commutes.
+            e.execute({PX_ADD, precision, rows, c, 1, start, 0, 0, 0, h.get(), o.get(), h.get(), nullptr,
+                       nullptr});
+        }
     };
     for (int stage = 0; stage < 5; ++stage) {
         if (stage == 4 && upsample_only)
             return {coords, e.download(h), channels};
-        auto map = neighbors(coords);
-        auto nbr = e.upload(map.data(), map.size());
         std::string prefix = "blocks." + std::to_string(stage) + ".";
         int block = 0;
         while (w.has(prefix + std::to_string(block) + ".conv.weight")) {
+            ensure_neighbors();
             std::string b = prefix + std::to_string(block) + ".";
-            auto x = e.convolution(h, w, b + "conv", nbr, precision);
-            auto y = norm_gpu(x, channels, b + "norm");
-            y = e.linear(y, w, b + "mlp.0", precision);
-            e.inplace(PX_SILU, y, 1, precision);
-            y = e.linear(y, w, b + "mlp.2", precision);
-            e.inplace(PX_ADD, h, channels, precision, y, {}, 1);
+            auto y = e.convolution(h, w, b + "conv", nbr, precision);
+            norm_gpu(y, channels, b + "norm");
+            mlp(y, channels, b);
             ++block;
         }
         if (stage == 4)
@@ -140,48 +169,78 @@ static Sparse decode_sparse_gpu(Engine &e, Weights &w, const Sparse &input, bool
             require(sub.parents[r] >= 0 && size_t(sub.parents[r]) < coords.size() / 4 && sub.slots[r] >= 0 &&
                         sub.slots[r] < 8,
                     "Invalid subdivision guide");
+        for (size_t r = 1; r < sub.parents.size(); ++r)
+            require(sub.parents[r - 1] <= sub.parents[r], "Subdivision parents must be ascending");
         auto parents = e.upload(sub.parents.data(), sub.parents.size()),
              slots = e.upload(sub.slots.data(), sub.slots.size());
-        auto x = norm_gpu(h, ci, b + "norm1");
+        ensure_neighbors();
+        auto x = e.operation(PX_NORM, h, ci, precision, e.weight(w, b + "norm1.weight"),
+                             e.weight(w, b + "norm1.bias"), 0, 0, 1e-6f);
         e.inplace(PX_SILU, x, 1, precision);
-        x = e.convolution(x, w, b + "conv1", nbr, precision);
+        // conv1 has 8x the output channels; scatter each 2048-parent tile to
+        // its children instead of storing the whole conv1 output. Children of
+        // a tile are contiguous because parents are ascending.
         int rows = int(sub.parents.size());
-        auto fine = e.tensor(size_t(rows) * co), skip = e.tensor(size_t(rows) * co);
-        e.execute(
-            {PX_C2S, 0, rows, co, ci, 0, 0, 0, 0, fine.get(), x.get(), parents.get(), slots.get(), nullptr});
+        auto fine = e.tensor(size_t(rows) * co);
+        size_t child = 0;
+        e.convolution_tiles(x, w, b + "conv1", nbr, precision, [&](const Tensor &tile, int start, int count) {
+            size_t end = child;
+            while (end < sub.parents.size() && sub.parents[end] < start + count)
+                ++end;
+            if (end > child)
+                e.execute({PX_C2S, 0, int(end - child), co, ci, int(child), start, 0, 0, fine.get(), tile.get(),
+                           parents.get(), slots.get(), nullptr});
+            child = end;
+        });
+        require(child == sub.parents.size(), "Subdivision parents exceed decoder rows");
+        x = {};
+        nbr = {};
+        auto skip = e.tensor(size_t(rows) * co);
         e.execute(
             {PX_SKIP, 0, rows, co, ci, 0, 0, 0, 0, skip.get(), h.get(), parents.get(), slots.get(), nullptr});
-        x = norm_gpu(fine, co, b + "norm2");
-        e.inplace(PX_SILU, x, 1, precision);
-        map = neighbors(sub.coords);
-        nbr = e.upload(map.data(), map.size());
-        fine = e.convolution(x, w, b + "conv2", nbr, precision);
-        e.inplace(PX_ADD, fine, co, precision, skip, {}, 1);
-        h = std::move(fine);
+        h = {};
+        parents = {};
+        slots = {};
+        norm_gpu(fine, co, b + "norm2");
+        e.inplace(PX_SILU, fine, 1, precision);
         coords = std::move(sub.coords);
+        ensure_neighbors();
+        // conv2 + skip, accumulated into skip one tile at a time.
+        e.convolution_tiles(fine, w, b + "conv2", nbr, precision, [&](const Tensor &tile, int start, int count) {
+            e.execute({PX_ADD, precision, count, co, 1, start, 0, 0, 0, skip.get(), tile.get(), skip.get(),
+                       nullptr, nullptr});
+        });
+        fine = {};
+        h = std::move(skip);
         channels = co;
         std::fprintf(stderr, "Pixal3D resident decoder stage %d: %zu voxels\n", stage, coords.size() / 4);
     }
-    auto x = e.operation(PX_NORM, h, channels, 0, {}, {}, 0, 0, 1e-5f);
-    h = e.linear(x, w, "output_layer");
+    e.inplace(PX_NORM, h, channels, 0, {}, {}, 0, 0, 1e-5f);
+    h = e.linear(h, w, "output_layer");
     return {coords, e.download(h), w.shape("output_layer.weight")[0]};
 }
 Sparse decode_sparse(Engine &e, Weights &w, const Sparse &input, bool upsample_only,
                      std::vector<Subdivision> &subdivisions, bool guided, int precision,
                      std::vector<Sparse> *subdivision_logits) {
-    // Dense foregrounds can expand past seven million decoder voxels. On the
-    // minimum 7 GiB path, the final resident neighbor map and activations then
-    // overlap by more than the device budget. Keep the learned resolution and
-    // precision unchanged, but use the existing tiled host-offloaded decoder
-    // for these high-occupancy cases. Larger budgets retain the faster fully
-    // resident path.
-    constexpr size_t seven_gib = size_t(7) << 30;
-    bool low_memory_fallback = e.resident() && e.resident_budget() <= seven_gib && input.rows() > 16384;
-    if (e.resident() && !low_memory_fallback)
-        return decode_sparse_gpu(e, w, input, upsample_only, subdivisions, guided, precision,
-                                 subdivision_logits);
-    if (low_memory_fallback)
-        std::fprintf(stderr, "Pixal3D decoder: tiled low-memory path for %d input voxels\n", input.rows());
+    // The resident decoder streams its widest activations in tiles and fits
+    // dense four-view shapes in the 7 GiB budget. If an allocation still
+    // exceeds the budget or device memory, release it and rerun on the tiled
+    // host-offloaded decoder, which needs far less device memory but is much
+    // slower and rounds some steps on the host.
+    if (e.resident()) {
+        size_t logits = subdivision_logits ? subdivision_logits->size() : 0;
+        try {
+            return decode_sparse_gpu(e, w, input, upsample_only, subdivisions, guided, precision,
+                                     subdivision_logits);
+        } catch (const BudgetError &error) {
+            std::fprintf(stderr, "Pixal3D decoder: resident path exceeded device memory (%s); "
+                                 "using the tiled low-memory path for %d input voxels\n",
+                         error.what(), input.rows());
+            if (subdivision_logits)
+                subdivision_logits->resize(logits);
+            e.clear_weights();
+        }
+    }
     Sparse h{input.coords, e.linear(input.feats, w, "from_latent"), w.shape("from_latent.weight")[0]};
     round_precision(h.feats, precision);
     if (!guided)

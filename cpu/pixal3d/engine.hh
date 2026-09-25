@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <memory>
 #include <stdexcept>
@@ -39,6 +40,10 @@ void bias_round(float *x, const float *bias, int rows, int columns, int precisio
 void add_residual(Vec &x, const Vec &h, const float *gate, int channels, bool bf);
 void apply_modulation(Vec &x, const Vec &mod, int offset, int channels, bool bf);
 void gelu(Vec &x, bool approximate, int precision = 0);
+/* A resident allocation exceeded the configured budget or device memory. */
+struct BudgetError : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
 struct Weights {
     uint64_t identity;
     st_context *st = nullptr;
@@ -96,6 +101,7 @@ class Engine {
     size_t cache_bytes_ = 0, cache_limit_ = 0, resident_budget_ = 0;
     std::string profile_;
     std::map<std::string, double> timings_;
+    [[noreturn]] void plugin_error() const;
 
   public:
     int threads;
@@ -127,6 +133,11 @@ class Engine {
     Tensor attention(const Tensor &q, const Tensor &k, const Tensor &v, int heads, int hd, int precision);
     Tensor convolution(const Tensor &x, Weights &w, const std::string &name, const Tensor &neighbors,
                        int precision, bool dense = false);
+    /* Sparse convolution in the same 2048-row GEMM tiles as convolution(), but
+     * each tile's rows are handed to consume(tile, start, rows) instead of
+     * being stored, so callers can reduce them without the full output. */
+    void convolution_tiles(const Tensor &x, Weights &w, const std::string &name, const Tensor &neighbors,
+                           int precision, const std::function<void(const Tensor &, int, int)> &consume);
     void record(const std::string &name, double seconds);
     void write_profile();
     void begin_profile();
