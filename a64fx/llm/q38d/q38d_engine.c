@@ -1355,14 +1355,22 @@ static void pf_ffn(const q38d_layer *L, int tid, int which) {
     if (which & 1) pf_l2(L->gate.part[c] + (size_t)g0 * gb, pf_bytes);
     if (which & 2) pf_l2(L->up.part[c] + (size_t)g0 * gb, pf_bytes);
 }
-static int pf_kv;
+static int pf_kv, ssm_cpf = 1;
 static void pf_attn_kv(int tid, int layer);
 /* Prefetch what this worker streams after the barrier that ends `phase`. */
 static void pf_next(int tid, int layer, int phase) {
     if (!pf_bytes) return;
     const q38d_layer *L = &E.L[layer];
     switch (phase) {
-    case P_SSM_IN: pf_mat(&L->out, tid); break;
+    case P_SSM_IN:
+        pf_mat(&L->out, tid);
+        if (ssm_cpf) {   /* this head's conv history and weights, read first by the core */
+            int hh = ssm_head_of(tid);
+            const char *ph = (const char *)E.conv_hist[layer][hh], *pw = (const char *)E.conv_wl[layer][hh];
+            for (int o = 0; o < 8 * 384 * 4; o += 256) __builtin_prefetch(ph + o, 1, 3);
+            for (int o = 0; o < 4 * 384 * 4; o += 256) __builtin_prefetch(pw + o, 0, 3);
+        }
+        break;
     case P_ATT_IN: pf_mat(&L->o, tid); if (pf_kv) pf_attn_kv(tid, layer); break;
     case P_SSM_OUT: case P_ATT_OUT: pf_ffn(L, tid, 3); break;
     case P_FFN_UP: pf_mat(&L->down, tid); break;
@@ -2524,6 +2532,7 @@ int main(int argc, char **argv) {
     if (getenv("Q38D_FFN_A8")) ffn_a8 = atoi(getenv("Q38D_FFN_A8"));
     if (getenv("Q38D_DOWN_A8")) down_a8 = atoi(getenv("Q38D_DOWN_A8"));
     if (getenv("Q38D_G2")) g2_variant = atoi(getenv("Q38D_G2"));
+    if (getenv("Q38D_SSM_CPF")) ssm_cpf = atoi(getenv("Q38D_SSM_CPF"));
     if (getenv("Q38D_NORM_PF")) norm_pf = atoi(getenv("Q38D_NORM_PF"));
     if (getenv("Q38D_ATTN_MULTI")) attn_multi = atoi(getenv("Q38D_ATTN_MULTI"));
     if (getenv("Q38D_MT_PLANS")) mt_plans = atoi(getenv("Q38D_MT_PLANS"));
