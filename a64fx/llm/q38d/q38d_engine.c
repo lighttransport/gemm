@@ -924,6 +924,7 @@ static void build_plan(q38d_plan *P) {
 }
 static void scale_rows(float *p, int n, float f);
 static double dual_cost = 1.6;
+static int plan_lpt = 1;   /* TP SSM in-proj: balance dual/single item counts per lane (TP1 keeps the tuned greedy) */
 /* SSM in-proj with (qkv g, z g) dual items for g < rows(z)/8. */
 static void build_plan_ssm_dual(q38d_plan *P) {
     for (int c = 0; c < NCMG; c++) {
@@ -943,6 +944,25 @@ static void build_plan_ssm_dual(q38d_plan *P) {
         }
         for (int l = 0; l < PER; l++) total += cost[l];
         int nd = Gz < Gq ? Gz : Gq;
+        if (plan_lpt && tp_n > 1) {
+            /* per-lane counts: each dual, then each single item to the
+             * cheapest lane; then contiguous ranges in lane order */
+            int ndl[PER] = {0}, nsl[PER] = {0};
+            for (int it = 0; it < Gq; it++) {
+                double ic = it < nd ? dual_cost * gq : gq;
+                int best = 0;
+                for (int l = 1; l < PER; l++) if (cost[l] < cost[best]) best = l;
+                cost[best] += ic;
+                if (it < nd) ndl[best]++; else nsl[best]++;
+            }
+            int gd = 0, gs1 = nd;
+            for (int l = 0; l < PER; l++) {
+                for (int i = 0; i < ndl[l]; i++) plan_add2(&P->t[c * PER + l], 0, 1, gd++);
+                for (int i = 0; i < nsl[l]; i++) plan_add(&P->t[c * PER + l], 0, gs1++);
+            }
+            for (int g = nd; g < Gz; g++) plan_add(&P->t[c * PER + PER - 1], 1, g);
+            continue;
+        }
         total += nd * dual_cost * gq + (Gq - nd) * gq + 2 * PLAN_STARTUP;
         double target = total / PER;
         int lane = 0, started = 0;
@@ -1805,7 +1825,44 @@ static void phase_end_c(int tid, int *cs, uint64_t *t, int phase) {
 static double tp_comm_t;
 static int tp_check, tp_check_n, tp_nocomm;
 static int tp_cmg_slices = 1;   /* slice k = the rows of CMG k: CMG barrier suffices */
-static void tp_reduce(int tid, int *gs) {
+/* Producer-side norm under TP: the lane that completed slice k quantizes
+ * x*w of that slice (per-16 quantization is invariant to the RMS factor)
+ * into its CMG's act copy and copies it to the other CMGs' copies; the
+ * next phase skips norm_act (its CMG barrier and remote reads of the fresh
+ * slices) and scales its outputs by 1/rms from tp_ssq. */
+static int tp_pnorm = 0, tp_prod_ok;   /* slower: one lane quantizing a slice costs ~12 us */
+static void tp_produce(int k, int n, const float *w) {
+    int r0 = k * n, r1 = r0 + n, own = tp_cmg_slices && tp_nsl == NCMG ? k : 0;
+    const svbool_t pf = svptrue_b32();
+    q38d_act *a = &E.act_c[own];
+    for (int r = r0; r < r1; r += 16) {
+        float v[16] __attribute__((aligned(64)));
+        svst1_f32(pf, v, svmul_f32_x(pf, svld1_f32(pf, E.x + r), svld1_f32(pf, w + r)));
+        if (E.arith == Q38D_F32) { for (int cc = 0; cc < NCMG; cc++) memcpy(E.xn_c[cc] + r, v, sizeof v); }
+        else q38d_prepare_unit(a, r / 32, (r / 16) & 1, v);
+    }
+    if (E.arith == Q38D_F32) return;
+    const size_t qb = a->arith == Q38D_A16 ? 64 : 32;
+    for (int cc = 0; cc < NCMG; cc++) {
+        if (cc == own) continue;
+        q38d_act *b = &E.act_c[cc];
+        memcpy(b->q + (size_t)(r0 / 32) * qb, a->q + (size_t)(r0 / 32) * qb, (size_t)(n / 32) * qb);
+        memcpy(b->sc + r0 / 16, a->sc + r0 / 16, (size_t)(n / 16) * 4);
+        memcpy(b->sum + r0 / 16, a->sum + r0 / 16, (size_t)(n / 16) * 4);
+    }
+}
+/* consumer: this CMG's produced act and the RMS factor */
+static int tp_prod_act(int tid, const q38d_act **a, float *omul) {
+    if (!tp_prod_ok) return 0;
+    int c = tid / PER;
+    E.act_c[c].x = E.xn_c[c];
+    float ss = 0;
+    for (int k = 0; k < tp_nsl; k++) ss += tp_ssq[k];
+    *a = &E.act_c[c];
+    *omul = 1.0f / sqrtf(ss / EMBD + E.eps);
+    return 1;
+}
+static void tp_reduce(int tid, int *gs, const float *w) {
     if (tp_cmg_slices && tp_nsl == NCMG) cbarrier(tid, norm_csense[tid]);
     else gbarrier(tid, gs);
     int k = tid / PER;
@@ -1816,10 +1873,12 @@ static void tp_reduce(int tid, int *gs) {
         else if (tp_nsl > 1) q38d_tp_sum_add_slice(k, E.xpart + k * n, E.x + k * n, n);
         else q38d_tp_sum_add(E.xpart, E.x, EMBD);
         tp_ssq[k] = sumsq(E.x + k * n, n);
+        if (tp_pnorm && w) tp_produce(k, n, w);
         if (!tid) tp_comm_t += (double)(ticks() - a);
     }
     ssq_valid = 0;
     tp_ssq_ok = 1;
+    tp_prod_ok = tp_pnorm && w;
 }
 /* out-projection input: E.act_o, or this CMG's act_oc after its lanes
  * quantized 1/12 of E.o each (CMG barrier) */
@@ -1853,7 +1912,7 @@ static void layer_body(int tid, int layer, int pos, int *gs, int *cs, uint64_t *
         const q38d_act *a;
         float omul = 1.0f;
         if (prod_norm && layer > 0) { int cc = prod_copies > 1 ? tid / PER : 0; a = &E.act_c[cc]; E.act_c[cc].x = E.xn_c[cc]; omul = x_inv(); }
-        else a = norm_act(tid, L->attn_norm);
+        else if (!tp_prod_act(tid, &a, &omul)) a = norm_act(tid, L->attn_norm);
         if (L->ssm) {
             int hh = ssm_head_of(tid);
             if (ssm_pf == 1 && hh >= 0) ssm_prefetch_state(layer, hh);
@@ -1870,7 +1929,7 @@ static void layer_body(int tid, int layer, int pos, int *gs, int *cs, uint64_t *
             if (E.arith == Q38D_F32) E.act_o.x = E.o;
             phase_end(tid, gs, &t, P_SSM_CORE);
             const q38d_act *ao = o_act(tid, cs);
-            if (tp_n > 1) { mv(&L->out, ao, E.xpart, 0, tid); tp_reduce(tid, gs); }
+            if (tp_n > 1) { mv(&L->out, ao, E.xpart, 0, tid); tp_reduce(tid, gs, L->post_norm); }
             else {
                 mv(&L->out, ao, E.x, 1, tid);
                 ssq_valid = 1;
@@ -1888,7 +1947,7 @@ static void layer_body(int tid, int layer, int pos, int *gs, int *cs, uint64_t *
             if (E.arith == Q38D_F32) E.act_o.x = E.o;
             phase_end(tid, gs, &t, P_ATT_CORE);
             const q38d_act *ao = o_act(tid, cs);
-            if (tp_n > 1) { mv(&L->o, ao, E.xpart, 0, tid); tp_reduce(tid, gs); }
+            if (tp_n > 1) { mv(&L->o, ao, E.xpart, 0, tid); tp_reduce(tid, gs, L->post_norm); }
             else {
                 mv(&L->o, ao, E.x, 1, tid);
                 ssq_valid = 1;
@@ -1900,7 +1959,7 @@ static void layer_body(int tid, int layer, int pos, int *gs, int *cs, uint64_t *
         }
         if (ffn_a8 && E.arith == Q38D_A16) E.act_c[tid / PER].arith = Q38D_A8;
         if (prod_norm) { int cc = prod_copies > 1 ? tid / PER : 0; a = &E.act_c[cc]; E.act_c[cc].x = E.xn_c[cc]; omul = x_inv(); }
-        else { a = norm_act(tid, L->post_norm); omul = 1.0f; }
+        else if (!tp_prod_act(tid, &a, &omul)) { a = norm_act(tid, L->post_norm); omul = 1.0f; }
         {
             int c = tid / PER, l = tid % PER;
             int rows = L->gate.first[c + 1] - L->gate.first[c];
@@ -1949,7 +2008,7 @@ static void layer_body(int tid, int layer, int pos, int *gs, int *cs, uint64_t *
         }
         if (E.arith == Q38D_F32) E.act_h.x = E.h;
         phase_end(tid, gs, &t, P_FFN_UP);
-        if (tp_n > 1) { mv(&L->down, &E.act_h, E.xpart, 0, tid); tp_reduce(tid, gs); }
+        if (tp_n > 1) { mv(&L->down, &E.act_h, E.xpart, 0, tid); tp_reduce(tid, gs, layer + 1 < NLAYER ? E.L[layer + 1].attn_norm : E.out_norm); }
         else {
             mv(&L->down, &E.act_h, E.x, 1, tid);
             ssq_split_valid = L->down.kch > 1;
@@ -1968,7 +2027,7 @@ static void head_argmax_m(int tid, const float *nw, const q38d_mat *hm, int *gs,
     const q38d_act *a;
     float omul = 1.0f;
     if (prod_norm) { int cc = prod_copies > 1 ? tid / PER : 0; a = &E.act_c[cc]; E.act_c[cc].x = E.xn_c[cc]; omul = x_inv(); }
-    else a = norm_act(tid, nw);
+    else if (!(hm == &E.head && tp_prod_act(tid, &a, &omul))) a = norm_act(tid, nw);
     mv(&(*hm), a, E.logits, 0, tid);
     if (omul != 1.0f) {
         int c, g0, g1;
@@ -2014,6 +2073,7 @@ static void step(int tid, int token, int pos, int want_head, int *gs, int *cs) {
     pf_pos = pos;
     ssq_valid = 0;
     tp_ssq_ok = 0;
+    tp_prod_ok = 0;
     if (tid == NT - 1) rope_fill(pos);   /* visible to all after the embed barrier */
     embed_token(tid, token);
     phase_end(tid, gs, &t, P_EMBED);
@@ -3024,6 +3084,7 @@ int main(int argc, char **argv) {
     if (getenv("Q38D_TP_NOCOMM")) tp_nocomm = atoi(getenv("Q38D_TP_NOCOMM"));
     if (getenv("Q38D_TP_CHECK")) tp_check = atoi(getenv("Q38D_TP_CHECK"));
     if (getenv("Q38D_TP_CMGSL")) tp_cmg_slices = atoi(getenv("Q38D_TP_CMGSL"));
+    if (getenv("Q38D_TP_PNORM")) tp_pnorm = atoi(getenv("Q38D_TP_PNORM"));
     if (getenv("Q38D_OQ_CMG")) oq_cmg = atoi(getenv("Q38D_OQ_CMG"));
     if (getenv("Q38D_ATT_QPF")) att_qpf = atoi(getenv("Q38D_ATT_QPF"));
     if (getenv("Q38D_ATT_MERGE2")) att_merge2 = atoi(getenv("Q38D_ATT_MERGE2"));
@@ -3121,6 +3182,7 @@ int main(int argc, char **argv) {
     if (getenv("Q38D_SSM_LAZY")) ssm_lazy = atoi(getenv("Q38D_SSM_LAZY"));
     if (getenv("Q38D_INPROJ_CBAR")) inproj_cbar = atoi(getenv("Q38D_INPROJ_CBAR"));
     if (getenv("Q38D_CONV_LOCAL")) conv_local = atoi(getenv("Q38D_CONV_LOCAL"));
+    if (getenv("Q38D_PLAN_LPT")) plan_lpt = atoi(getenv("Q38D_PLAN_LPT"));
     if (getenv("Q38D_DUAL_COST")) dual_cost = atof(getenv("Q38D_DUAL_COST"));
     if (getenv("Q38D_PF_KV")) pf_kv = atoi(getenv("Q38D_PF_KV"));
     if (getenv("Q38D_EPOCH_BAR")) epoch_bar = atoi(getenv("Q38D_EPOCH_BAR"));
