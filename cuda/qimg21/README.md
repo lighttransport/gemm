@@ -1891,6 +1891,11 @@ Validation on the RTX 5060 Ti, against the pinned efficient-SDPA reference:
   partial sums at reduced precision. That lowered the 256x256 edit branch
   prediction from 0.99999997 to 0.9999976 against PyTorch, and CFG-4
   amplified it to 0.99994.
+- `--attention flash` switches to upstream FlashAttention-2
+  (`libq21_fast_flash.so`, pinned source) instead of PyTorch's
+  memory-efficient kernel. It is not bit-identical to the reference. At
+  1024x1024 and 40 steps the trajectory still passes the gate (minimum cosine
+  0.99999087), and attention time per step drops from about 0.65 s to 0.35 s.
 - `--stage-dir DIR` writes the same F32 stage dumps as the harness's
   `QIMG21_STAGE_DIR` (block 0 internals and each block's hidden state), for
   one joint pass.
@@ -1909,6 +1914,19 @@ compute stream. The harness has the same pattern for its prompt, latent and
 weight uploads; its frequent `cuCtxSynchronize` calls happen to serialize
 them before use.
 
-The timings above were measured while an unrelated process used 7.8 GB and
-100% of the GPU: 4.93 s per step at 1024x1024 with 22 streamed blocks. They
-are functional evidence only; uncontended benchmarks are pending.
+Uncontended BF16 timings at 1024x1024, 40 steps, text-to-image. The peak is
+the process's device memory as sampled from `nvidia-smi` (the budget covers
+the whole process):
+
+| Budget | Resident / streamed | Attention | Peak | Per step | 40 steps |
+|---|---|---|---:|---:|---:|
+| none | 32 / 0 | cutlass-efficient | 14,434 MiB | 2.265 s | 90.6 s |
+| 11264 MiB | 21 / 11 | cutlass-efficient | 10,672 MiB | 2.285 s | 91.4 s |
+| 7168 MiB | 12 / 20 | cutlass-efficient | 6,910 MiB | 2.282 s | 91.3 s |
+| 7168 MiB | 12 / 20 | flash | 6,886 MiB | 1.979 s | 79.2 s |
+
+Weight streaming over PCIe 3.0 x8 is fully hidden behind compute at this
+resolution. An nsys profile of the cutlass-efficient runs shows 1.56 s per
+step in cuBLAS BF16 GEMMs (about 37 TFLOPS, the same as PyTorch reaches for
+these shapes) and 0.65 s in attention. The harness takes about 26 s per step
+for the same work. Further speedups need INT8/FP8 or NVFP4 GEMMs.

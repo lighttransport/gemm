@@ -610,7 +610,7 @@ static void q21f_usage(const char *argv0) {
             "  [--vram-budget-mib MIB] [--cfg-batch 0|1] [--fused-gemm 0|1] [--kv-cache on|off]\n"
             "  [--prefix-pass extract|separate] [--plan-only] [--profile]\n"
             "  diagnostics: [--trace] [--verify-slots] [--stage-dir DIR]\n"
-            "  [--attention cutlass-efficient] [--normalization vector4] [--rope host-table-exact]\n"
+            "  [--attention cutlass-efficient|flash] [--normalization vector4] [--rope host-table-exact]\n"
             "  [--attention-plugin PATH] [--rope-table-base PATH]\n"
             "  [--out O.npy] [--dump-dir DIR] [--pred-dir DIR] [--quiet|--verbose]\n", argv0);
 }
@@ -619,11 +619,11 @@ int main(int argc, char **argv) {
     const char *model = NULL, *prompt_path = NULL, *latent_path = NULL, *negative_path = NULL;
     const char *layout_path = NULL, *negative_layout_path = NULL, *condition_path = NULL;
     const char *out_path = "native_latents.npy", *dump_dir = NULL, *pred_dir = NULL;
-    const char *plugin_path = "cuda/qimg21/libq21_fast_attention.so";
+    const char *plugin_path = NULL;
     const char *rope_path = "cuda/qimg21/qwen21_rope_freqs.npy";
     const char *stage_dir = NULL;
     int ih = 16, iw = 16, steps = 1, verbose = 1, cfg_batch = 1, plan_only = 0, profile = 0, fused_gemm = 1;
-    int kv_cache = 1, extract = 1, trace = 0, verify_slots = 0;
+    int kv_cache = 1, extract = 1, trace = 0, verify_slots = 0, flash = 0;
     double budget_mib = 0;
     float guidance = 1.0f, manual_t = -1.0f;
     for (int i = 1; i < argc; i++) {
@@ -667,8 +667,9 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--quiet")) verbose = 0;
         else if (!strcmp(a, "--attention") && more) {
             const char *m = argv[++i];
-            if (strcmp(m, "cutlass-efficient")) {
-                fprintf(stderr, "fast: only --attention cutlass-efficient is implemented (got %s)\n", m);
+            if (!strcmp(m, "flash")) flash = 1;
+            else if (strcmp(m, "cutlass-efficient")) {
+                fprintf(stderr, "fast: --attention must be cutlass-efficient or flash (got %s)\n", m);
                 return 2;
             }
         } else if ((!strcmp(a, "--normalization") || !strcmp(a, "--rope")) && more) {
@@ -765,8 +766,13 @@ int main(int argc, char **argv) {
     GETF(qk_norm_rope, "qk_norm_rope"); GETF(swiglu, "swiglu");
     GETF(euler, "euler"); GETF(cfg_combine, "cfg_combine"); GETF(checksum, "checksum");
 #undef GETF
+    /* cutlass-efficient is PyTorch's memory-efficient kernel (reference
+     * parity); flash is upstream FlashAttention-2 (faster, not bit-exact). */
+    if (!plugin_path)
+        plugin_path = flash ? "cuda/qimg21/libq21_fast_flash.so" : "cuda/qimg21/libq21_fast_attention.so";
     rt.plugin = dlopen(plugin_path, RTLD_NOW | RTLD_LOCAL);
-    REQ(rt.plugin && (rt.attention = (q21f_attention_fn)dlsym(rt.plugin, "q21f_attention")),
+    REQ(rt.plugin && (rt.attention = (q21f_attention_fn)dlsym(rt.plugin, flash ? "q21f_flash_attention"
+                                                                               : "q21f_attention")),
         "cannot load attention plugin %s: %s", plugin_path, dlerror());
 
     /* ---- Plan ---- */
