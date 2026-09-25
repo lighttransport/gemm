@@ -5,6 +5,11 @@
 #ifndef PF2_DIST
 #define PF2_DIST 16384
 #endif
+/* L2 prefetch distance of the multi-token kernels (streaming optimum
+ * is longer than for the single-token kernels) */
+#ifndef PF2N_DIST
+#define PF2N_DIST 65536
+#endif
     .text
     .arch armv8.2-a+sve
 
@@ -24,7 +29,7 @@ q38d_asmnb2_f4_a16:
     dup z29.s, #0
     dup z16.s, #0
     dup z17.s, #0
-    mov x9, #PF2_DIST
+    mov x9, #PF2N_DIST
     prfm pldl1keep, [x0, #PF1_DIST]
     prfm pldl2keep, [x0, x9]
     ld1b {z0.b}, p0/z, [x0]
@@ -351,7 +356,7 @@ q38d_asmnb3_f4_a16:
     dup z20.s, #0
     dup z21.s, #0
     dup z22.s, #0
-    mov x9, #PF2_DIST
+    mov x9, #PF2N_DIST
     prfm pldl1keep, [x0, #PF1_DIST]
     prfm pldl2keep, [x0, x9]
     ld1b {z0.b}, p0/z, [x0]
@@ -792,7 +797,7 @@ q38d_asmnb4_f4_a16:
     dup z25.s, #0
     dup z26.s, #0
     dup z27.s, #0
-    mov x9, #PF2_DIST
+    mov x9, #PF2N_DIST
     prfm pldl1keep, [x0, #PF1_DIST]
     prfm pldl2keep, [x0, x9]
     ld1b {z0.b}, p0/z, [x0]
@@ -1344,7 +1349,7 @@ q38d_asmg2n1_f4_a16:
     dup z29.s, #0
     dup z14.s, #0
     dup z15.s, #0
-    mov x9, #PF2_DIST
+    mov x9, #PF2N_DIST
     add x10, x0, x1
     add x12, x2, x1
     prfm pldl1keep, [x0, #PF1_DIST]
@@ -1516,7 +1521,7 @@ q38d_asmg2n2_f4_a16:
     dup z17.s, #0
     dup z18.s, #0
     dup z19.s, #0
-    mov x9, #PF2_DIST
+    mov x9, #PF2N_DIST
     add x10, x0, x1
     add x12, x2, x1
     prfm pldl1keep, [x0, #PF1_DIST]
@@ -1762,7 +1767,7 @@ q38d_asmg2n3_f4_a16:
     dup z21.s, #0
     dup z22.s, #0
     dup z23.s, #0
-    mov x9, #PF2_DIST
+    mov x9, #PF2N_DIST
     add x10, x0, x1
     add x12, x2, x1
     prfm pldl1keep, [x0, #PF1_DIST]
@@ -2078,7 +2083,7 @@ q38d_asmn4c_f4_a16:
     dup z25.s, #0
     dup z26.s, #0
     dup z27.s, #0
-    mov x9, #PF2_DIST
+    mov x9, #PF2N_DIST
     prfm pldl1keep, [x0, #PF1_DIST]
     prfm pldl2keep, [x0, x9]
     ld1b {z0.b}, p0/z, [x0]
@@ -2795,7 +2800,7 @@ q38d_asmg2c1_f4_a16:
     dup z29.s, #0
     dup z14.s, #0
     dup z15.s, #0
-    mov x9, #PF2_DIST
+    mov x9, #PF2N_DIST
     add x10, x0, x1
     add x12, x2, x1
     prfm pldl1keep, [x0, #PF1_DIST]
@@ -2999,7 +3004,7 @@ q38d_asmg2c2_f4_a16:
     dup z17.s, #0
     dup z18.s, #0
     dup z19.s, #0
-    mov x9, #PF2_DIST
+    mov x9, #PF2N_DIST
     add x10, x0, x1
     add x12, x2, x1
     prfm pldl1keep, [x0, #PF1_DIST]
@@ -3281,7 +3286,7 @@ q38d_asmg2c4_f4_a16:
     dup z25.s, #0
     dup z26.s, #0
     dup z27.s, #0
-    mov x9, #PF2_DIST
+    mov x9, #PF2N_DIST
     add x10, x0, x1
     add x12, x2, x1
     prfm pldl1keep, [x0, #PF1_DIST]
@@ -3707,7 +3712,7 @@ q38d_asmg2s2_f4_a16:
     dup z17.s, #0
     dup z18.s, #0
     dup z19.s, #0
-    mov x9, #PF2_DIST
+    mov x9, #PF2N_DIST
     add x10, x0, x1
     add x12, x2, x1
     prfm pldl1keep, [x0, #PF1_DIST]
@@ -3985,7 +3990,7 @@ q38d_asmg2s4_f4_a16:
     dup z25.s, #0
     dup z26.s, #0
     dup z27.s, #0
-    mov x9, #PF2_DIST
+    mov x9, #PF2N_DIST
     add x10, x0, x1
     add x12, x2, x1
     prfm pldl1keep, [x0, #PF1_DIST]
@@ -4409,7 +4414,7 @@ q38d_asmg2p2_f4_a16:
     dup z17.s, #0
     dup z18.s, #0
     dup z19.s, #0
-    mov x9, #PF2_DIST
+    mov x9, #PF2N_DIST
     add x10, x0, x1
     add x12, x2, x1
     prfm pldl1keep, [x0, #PF1_DIST]
@@ -4699,7 +4704,7 @@ q38d_asmg2p3_f4_a16:
     dup z21.s, #0
     dup z22.s, #0
     dup z23.s, #0
-    mov x9, #PF2_DIST
+    mov x9, #PF2N_DIST
     add x10, x0, x1
     add x12, x2, x1
     prfm pldl1keep, [x0, #PF1_DIST]
@@ -5069,7 +5074,7 @@ q38d_asmg2p4_f4_a16:
     dup z25.s, #0
     dup z26.s, #0
     dup z27.s, #0
-    mov x9, #PF2_DIST
+    mov x9, #PF2N_DIST
     add x10, x0, x1
     add x12, x2, x1
     prfm pldl1keep, [x0, #PF1_DIST]
@@ -5511,7 +5516,7 @@ q38d_asmg2i3_f4_a16:
     dup z21.s, #0
     dup z22.s, #0
     dup z23.s, #0
-    mov x9, #PF2_DIST
+    mov x9, #PF2N_DIST
     add x10, x0, x1
     add x12, x2, x1
     prfm pldl1keep, [x0, #PF1_DIST]
@@ -5881,7 +5886,7 @@ q38d_asmg2i4_f4_a16:
     dup z25.s, #0
     dup z26.s, #0
     dup z27.s, #0
-    mov x9, #PF2_DIST
+    mov x9, #PF2N_DIST
     add x10, x0, x1
     add x12, x2, x1
     prfm pldl1keep, [x0, #PF1_DIST]
@@ -6323,7 +6328,7 @@ q38d_asmg2j3_f4_a16:
     dup z21.s, #0
     dup z22.s, #0
     dup z23.s, #0
-    mov x9, #PF2_DIST
+    mov x9, #PF2N_DIST
     add x10, x0, x1
     add x12, x2, x1
     prfm pldl1keep, [x0, #PF1_DIST]
@@ -6691,7 +6696,7 @@ q38d_asmg2j4_f4_a16:
     dup z25.s, #0
     dup z26.s, #0
     dup z27.s, #0
-    mov x9, #PF2_DIST
+    mov x9, #PF2N_DIST
     add x10, x0, x1
     add x12, x2, x1
     prfm pldl1keep, [x0, #PF1_DIST]
@@ -7126,7 +7131,7 @@ q38d_asmg2p2_q8k_a16:
     dup z17.s, #0
     dup z18.s, #0
     dup z19.s, #0
-    mov x9, #PF2_DIST
+    mov x9, #PF2N_DIST
     add x10, x0, x1
     add x12, x2, x1
     add x17, x7, x1
@@ -8739,7 +8744,7 @@ q38d_asmg2p3_q8k_a16:
     dup z21.s, #0
     dup z22.s, #0
     dup z23.s, #0
-    mov x9, #PF2_DIST
+    mov x9, #PF2N_DIST
     add x10, x0, x1
     add x12, x2, x1
     add x17, x7, x1
@@ -10950,7 +10955,7 @@ q38d_asmg2p4_q8k_a16:
     dup z25.s, #0
     dup z26.s, #0
     dup z27.s, #0
-    mov x9, #PF2_DIST
+    mov x9, #PF2N_DIST
     add x10, x0, x1
     add x12, x2, x1
     add x17, x7, x1
