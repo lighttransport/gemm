@@ -355,6 +355,54 @@ Interactive jobs are limited to six hours; a 12-hour job must use the batch
 launcher. Both launchers pass the selected reverse port to the compute-side
 supervisor.
 
+### Automatic resubmission when an interactive job expires
+
+An interactive allocation ends at its `ELAPSE` limit (observed as
+`PLE 0017 ... (sig=24)` followed by `PJM 0083 ... completed`), and the
+compute node's `/local` is wiped with it. For multi-session work,
+`auto_resubmit_interactive.sh` keeps a bridge available: it runs
+`run_bash_http_interactive.sh` in a loop, waits for the local health check of
+each new allocation, runs an optional ready hook on the new node, and
+requests the next allocation after the previous one ends.
+
+```bash
+REMOTE_REPO='$HOME/work/gemm/qwen38-27b' NODES=1 ELAPSE=06:00:00 WAIT_TIME=600 \
+LOCAL_URL=http://127.0.0.1:42573 \
+READY_HOOK=a64fx/llm/q38d/stage_hook.sh \
+MAX_JOBS=4 UNTIL_EPOCH=$(date -d 'tomorrow 06:00' +%s) \
+LOG_DIR=tmp/bash-http-auto \
+nohup a64fx/tools/bash-over-http/auto_resubmit_interactive.sh \
+  > tmp/bash-http-auto.out 2>&1 &
+```
+
+- All launcher variables (`NODES`, `ELAPSE`, `WAIT_TIME`, `REMOTE_REPO`,
+  `PORT_OFFSET`, `A64FX_MODE`) pass through. `LOCAL_URL` must name the local
+  tunnel end that the client uses; the default is the configured local port
+  (42386) plus `PORT_OFFSET`.
+- `READY_HOOK` is a local file of Bash commands sent through the bridge
+  client after each allocation becomes healthy. Use it to restore
+  node-local state: stage images into `/local` with `dd ... iflag=direct
+  oflag=direct`, copy binaries, and regenerate any reference outputs that
+  lived only in `/local`. Keep anything needed across allocations on shared
+  storage (`tmp/...` in the remote checkout). Hook output goes to
+  `$LOG_DIR/hook.log`.
+- `MAX_JOBS` (default 4) and `UNTIL_EPOCH` bound the total node time. A
+  failed wait for resources backs off from `RESUBMIT_DELAY` (60 s) to 600 s.
+- The current job ID is in `$LOG_DIR/current_jobid`, and the event log is
+  `$LOG_DIR/auto.log`, with one launcher log per allocation.
+- To stop after the current allocation, `touch $LOG_DIR/STOP`. Killing the
+  wrapper does not cancel a running allocation; use `pjdel` for that.
+- The local `ssh -L` tunnel is not recreated by the wrapper. Keep it
+  alive with `open_local_tunnel.sh` or `watch_local_tunnel.sh`. The
+  login-side port is reused by each successive job, and that is safe because
+  only one allocation runs at a time.
+- Work in progress is lost when an allocation ends. Keep individual remote
+  commands shorter than the remaining time, and copy logs to shared storage
+  as part of each command.
+- Do not edit the wrapper while it runs; Bash reads scripts incrementally.
+  Replace it with a new file (write to a new file, then `mv` it into
+  place) if a fix is needed.
+
 ## Stage model data inside the A64FX allocation
 
 Fugaku shared storage is visible from the compute node, so model data does not

@@ -20,9 +20,15 @@ met**: FP4 is ~0.75 ms/token (~3%) and FP6 ~0.6 ms/token (~2%) short at 1024
 context (128/4096 columns are from the previous build, v37). Prefill (same per-token path) runs at 41.8 tok/s (FP4) and 30.9
 tok/s (FP6) for 1024 tokens.
 
+Node variance: the same v41 binary runs at 36.20 tok/s (FP4, 1024+256) on
+node f29-6000c (job 51909571; every phase ~7% slower, global barrier 4.0 us
+vs 2.5 us) against 38.8 on c25-3104b. Compare variants only within one
+allocation.
+
 Token identity. Every optimized run is compared position-by-position with an
 F32-activation, exact-weight reference of the same weights
-(`compare_tokens.py`, regex over `n= pos= id=`):
+(`compare_tokens.py`, regex over `n= pos= id=`). The 1024-context F32
+references are kept on shared storage as `tmp/q38-fast-final/fp{4,6}-f32-1024-ref.log`:
 
 - FP4 A16 1024+256: 256/256 IDs equal to the **transformer.h runner's F32
   run** (independent implementation) in every trial; q38d's own F32 mode
@@ -103,13 +109,22 @@ Tried and rejected (measured): deeper C-intrinsics pipelines (register
 spills/extra scalar ops), four-ahead loads, SDOT chains of four (latency),
 epoch barriers without RMW (4.8 us vs 2.5), producer-side normalization into
 four CMG copies (remote stores), pairing groups of one matrix in the dual
-kernel, larger warm-up prefetch, A64FX hardware barrier (2.2 us, ~0.1
+kernel, larger warm-up prefetch, dynamic tail for FFN gate/up (job
+51909571; the last 24-64 groups per CMG handed out one group at a time from
+a CMG-local counter: balance became near-perfect, max-mean 0.28 -> 0.05 ms,
+but each grab restarts the dual-kernel pipeline and a cold stream, ~3.5 us
+vs ~2.3 us of work, so gate/up got 0.5-1.1 ms/token slower; FFN gate/up
+runs at ~85% of the practical per-CMG stream rate, so its remaining
+imbalance, ~0.3 ms from 45/46 groups and a slower CMG3, is not worth
+chasing), `Q38D_COST_Q8K`/`Q38D_DUAL_COST` retuning (no gain), A64FX
+hardware barrier (2.2 us, ~0.1
 ms/token; would need dynamic libhwb).
 
 ## Next steps (in order)
 
-1. Remove the remaining ~0.7 ms/token: imbalance in ffn_gateup (8-row
-   granularity) and ssm_out, dataflow flags instead of the SSM
+1. Remove the remaining ~0.7 ms/token: ssm_in/attn_in plan imbalance (lanes
+   8-11 finish 10-20 us/layer early; cost-model constants alone did not fix
+   it), dataflow flags instead of the SSM
    in-proj->core barrier, cheaper SSM prep (conv/norm), hardware barrier.
 2. Long context: attention core grows to ~2.3 ms at 4096 (K/V prefetch in
    the in-proj tail); overlap or restructure.
@@ -131,7 +146,10 @@ FP6 image : ~/work/gemm/qwen38-27b/tmp/q38-fast-images/fp6-e2m3-skipblk64-v1.ima
 ```
 
 Stage images into the allocation's `/local` first (`dd bs=8M iflag=direct
-oflag=direct`, ~190 MB/s). Build natively (`make -C a64fx/llm CC=fcc q38d
+oflag=direct`, ~190 MB/s). `a64fx/llm/q38d/stage_hook.sh` does this, copies
+the binary and restores the F32 references; use it as `READY_HOOK` of
+`auto_resubmit_interactive.sh` (see "Automatic resubmission" in
+`a64fx/remote-dev-procedure.md`). Build natively (`make -C a64fx/llm CC=fcc q38d
 q38d_test`) or cross (`clang --target=aarch64-linux-gnu -static -O2
 -march=armv8.2-a+sve -mcpu=a64fx -DPF1_DIST=2048 -DPF2_DIST=32768`, as used
 for the measurements). Runs:
