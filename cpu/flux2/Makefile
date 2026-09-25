@@ -1,5 +1,5 @@
 CC ?= gcc
-CFLAGS = -O2 -mavx2 -mfma -fopenmp -Wall -Wno-unused-function -I../../common
+CFLAGS = -O2 -mavx2 -mfma -fopenmp -Wall -Wno-unused-function -I../../common -D_GNU_SOURCE
 LDFLAGS = -lm -lpthread -fopenmp
 
 MODEL_DIR = /mnt/disk01/models/klein2-4b

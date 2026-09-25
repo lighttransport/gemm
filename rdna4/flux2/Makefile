@@ -4,7 +4,7 @@
 # Only needs gcc/g++ + ROCm runtime libraries (libamdhip64.so, libhiprtc.so) on the system.
 
 CC = gcc
-CFLAGS = -O3 -Wall -Wextra -I.. -march=native
+CFLAGS = -O3 -Wall -Wextra -I.. -march=native -D_GNU_SOURCE
 LDFLAGS = -ldl -lm -lpthread
 
 # Sources

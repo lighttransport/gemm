@@ -54,6 +54,9 @@ ifdef DEBUG
     LDFLAGS += -fsanitize=address -fsanitize=undefined
 endif
 
+# transformer.h's NUMA thread binding uses cpu_set_t/CPU_SET (glibc extension)
+CFLAGS += -D_GNU_SOURCE
+
 HEADERS = $(wildcard $(COMMON)/*.h)
 
 .PHONY: all mpi clean
