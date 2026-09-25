@@ -1930,3 +1930,55 @@ resolution. An nsys profile of the cutlass-efficient runs shows 1.56 s per
 step in cuBLAS BF16 GEMMs (about 37 TFLOPS, the same as PyTorch reaches for
 these shapes) and 0.65 s in attention. The harness takes about 26 s per step
 for the same work. Further speedups need INT8/FP8 or NVFP4 GEMMs.
+
+### Fast W8A8 (SmoothQuant INT8)
+
+`test_cuda_qimg21_fast --weights int8 --quant-package DIR` runs every block
+linear as INT8 x INT8 -> INT32 cuBLAS GEMMs with SmoothQuant.
+`--bf16-blocks LIST` keeps chosen blocks in BF16. The harness flags
+`--quantized-transformer`, `--int8-tensor-core` and `--int8-bf16-tail-blocks`
+are accepted as aliases, so the regression scripts drive it unchanged.
+
+1. **Calibrate.** `--calib-dump FILE.npy` records the per-channel absolute
+   maximum of each block's four linear inputs over a whole run: the QKV
+   input, attention output, gate|proj input and SwiGLU output. The package in
+   use was calibrated on 12 prompts
+   (`/mnt/nvme01/models/qimg-21-fast/calib-prompts/prompts.txt`), BF16, 20
+   steps, at 1024x1024, 768x1344 and 1344x768.
+2. **Pack.** `pack_fast.py --calib ... --alpha A --out-dir DIR` computes
+   `s = amax(X)^A / amax(W)^(1-A)` per input channel for each linear group
+   that shares an input (fused QKV, out, fused gate|proj, mlp.out). It
+   quantizes `W*s` per output row to symmetric INT8 and writes 32 blobs in the
+   runner's device layout (6.5 GiB), so loading is a straight copy.
+3. **Run.** The fused modulated norm writes INT8 rows of `bf16(norm) / s` with
+   a per-token scale. Attention and SwiGLU outputs go through a row
+   quantizer. INT32 accumulators are rescaled to BF16 in row chunks, which
+   bounds the scratch buffer at 128 MiB. Timestep, modulation, `txt_in`,
+   `img_in`, `norm_out` and `proj_out` stay BF16.
+
+Results at 1024x1024, 40 steps, against the pinned BF16 PyTorch reference,
+with `--attention flash` and a 7168 MiB budget (25 resident blocks, 7
+streamed, 6.9 GB process peak):
+
+| Configuration | Per step | Max MRE | Decoded PSNR |
+|---|---:|---:|---:|
+| Harness W8A8 (no smoothing) | 12.3 s | 0.0419 | 37.87 dB |
+| Fast, alpha 0.5 | 0.979 s | 0.0156 | 39.01 dB |
+| Fast, alpha 0.6 | 0.961 s | 0.0205 | 41.09 dB |
+
+The fast runner in BF16 takes 1.98 s per step. A single free-running
+trajectory is a noisy quality measure; see the held-out comparison below.
+
+True-CFG-4 editing (`editing_regression.py`, 256x256 target, 1024 condition
+image), step-1 prediction MRE against PyTorch:
+
+| Alpha | All INT8 | Blocks 0 and 31 in BF16 |
+|---|---:|---:|
+| 0.4 | 0.2475 | 0.2204 |
+| 0.5 | 0.2245 | 0.1942 |
+| 0.6 | 0.2150 | 0.1883 |
+| 0.7 | 0.2124 | 0.1896 |
+
+The complete alpha-0.5 all-INT8 edit regression passes the 0.25 gate:
+predictions 0.148 and 0.224, trajectory 0.160 and 0.158. The harness's
+all-INT8 edit fails at 0.333. Block 0 is the most sensitive single block.

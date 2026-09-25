@@ -19,7 +19,9 @@
 #include "test_cuda_qimg21_native.c"
 #undef main
 #include "qimg21_fast_kernels.h"
+#include <fcntl.h>
 #include <time.h>
+#include <unistd.h>
 
 #define Q21F_D 4096
 #define Q21F_F 12288
@@ -37,13 +39,19 @@ typedef int (*q21f_attention_fn)(void *, const void *, const void *, const void 
 /* Per-block BF16 weight blob: fused QKV [3D,D], out [D,D], fused gate|proj
  * [2F,D], mlp.out [D,F], then F32 norm_q/norm_k [128]. */
 enum { Q21F_QKV, Q21F_OUT, Q21F_GP, Q21F_MO, Q21F_NQ, Q21F_NK, Q21F_PARTS };
+/* SmoothQuant W8A8 blob written by pack_fast.py: per-row INT8 weights, their
+ * F32 row scales, and F32 1/s activation smoothing per input channel. */
+enum { I8_QKV, I8_OUT, I8_GP, I8_MO, I8_S_QKV, I8_S_OUT, I8_S_GP, I8_S_MO, I8_I_QKV, I8_I_OUT, I8_I_GP, I8_I_MO,
+       I8_NQ, I8_NK, I8_PARTS };
+enum { Q21F_KIND_BF16, Q21F_KIND_INT8 };
 typedef struct {
-    size_t offset[Q21F_PARTS];
+    size_t offset[16];
     size_t bytes;
 } q21f_layout;
 
 typedef struct {
-    int resident;
+    int resident, kind;
+    size_t bytes;
     CUdeviceptr dev;
     void *host;
 } q21f_block;
@@ -54,12 +62,15 @@ typedef struct {
     CUstream compute, copy;
     cublasew_context *blas;
     CUmodule module;
-    CUfunction cast_bf16, txt_norm, gelu, silu, mod_prepare, scale_prepare, norm_mod,
-        qk_norm_rope, swiglu, euler, cfg_combine, checksum;
+    CUfunction cast_bf16, txt_norm, gelu, silu, mod_prepare, scale_prepare, norm_mod, norm_mod_q8, quant_rows,
+        dequant, qk_norm_rope, swiglu, euler, cfg_combine, checksum, colmax;
     void *plugin;
     q21f_attention_fn attention;
-    q21f_layout layout;
+    q21f_layout layout, i8;
     q21f_block block[Q21F_BLOCKS];
+    /* INT8 activations [rows+16][F], per-row scales, INT32 GEMM scratch */
+    CUdeviceptr xq, xs, acc;
+    size_t acc_bytes;
     int streamed[Q21F_BLOCKS], n_streamed;
     CUdeviceptr slot[2];
     CUevent loaded[2], freed[2];
@@ -69,6 +80,9 @@ typedef struct {
     size_t allocated, peak, budget;
     int verbose, fused_gemm;
     const char *stage_dir; /* --stage-dir: F32 dumps of a JOINT pass */
+    /* --calib-dump: per-block, per-input channel absmax [32][4][F] F32 for
+     * SmoothQuant: 0 QKV input, 1 out input, 2 gate|proj input, 3 mlp.out input */
+    CUdeviceptr calib;
     /* --verify-slots: device checksum of each streamed slot use */
     CUdeviceptr verify;
     int verify_max;
@@ -112,6 +126,17 @@ static void q21f_layout_init(q21f_layout *l) {
     size_t D = Q21F_D, F = Q21F_F, o = 0;
     size_t sizes[Q21F_PARTS] = {3 * D * D * 2, D * D * 2, 2 * F * D * 2, D * F * 2, 128 * 4, 128 * 4};
     for (int i = 0; i < Q21F_PARTS; i++) {
+        l->offset[i] = o;
+        o += (sizes[i] + 255) & ~(size_t)255;
+    }
+    l->bytes = o;
+}
+
+static void q21f_i8_layout_init(q21f_layout *l) {
+    size_t D = Q21F_D, F = Q21F_F, o = 0;
+    size_t sizes[I8_PARTS] = {3 * D * D, D * D, 2 * F * D, D * F, 3 * D * 4, D * 4, 2 * F * 4, D * 4,
+                              D * 4, D * 4, D * 4, F * 4, 128 * 4, 128 * 4};
+    for (int i = 0; i < I8_PARTS; i++) {
         l->offset[i] = o;
         o += (sizes[i] + 255) & ~(size_t)255;
     }
@@ -201,7 +226,7 @@ static int q21f_queue_copy(q21f_runtime *rt, unsigned long long use) {
     int slot = (int)(use & 1);
     int b = rt->streamed[use % (unsigned)rt->n_streamed];
     if (use >= 2 && cuStreamWaitEvent(rt->copy, rt->freed[slot], 0) != CUDA_SUCCESS) return -1;
-    if (cuMemcpyHtoDAsync(rt->slot[slot], rt->block[b].host, rt->layout.bytes, rt->copy) != CUDA_SUCCESS ||
+    if (cuMemcpyHtoDAsync(rt->slot[slot], rt->block[b].host, rt->block[b].bytes, rt->copy) != CUDA_SUCCESS ||
         cuEventRecord(rt->loaded[slot], rt->copy) != CUDA_SUCCESS)
         return -1;
     return 0;
@@ -217,7 +242,7 @@ static CUdeviceptr q21f_block_begin(q21f_runtime *rt, int b) {
     if (cuStreamWaitEvent(rt->compute, rt->loaded[slot], 0) != CUDA_SUCCESS) return 0;
     if (rt->verify && rt->use < (unsigned long long)rt->verify_max) {
         CUdeviceptr out = rt->verify + rt->use * 8, p = rt->slot[slot];
-        unsigned long long words = rt->layout.bytes / 4;
+        unsigned long long words = rt->block[b].bytes / 4;
         unsigned stride = 4099;
         void *a[] = {&out, &p, &words, &stride};
         if (cuLaunchKernel(rt->checksum, 1, 1, 1, 256, 1, 1, 0, rt->compute, a, NULL) != CUDA_SUCCESS) return 0;
@@ -249,6 +274,30 @@ static int q21f_gemm(q21f_runtime *rt, CUdeviceptr y, int ldy, CUdeviceptr w, CU
     return cublasew_gemm_bf16_bf16_bf16_rowmajor_nt_ld(rt->blas, y, ldy, w, x, ldx, m, n, k);
 }
 
+/* W8A8: INT32 = Xq Wq^T by cuBLAS in row chunks sized to the scratch, then
+ * y = bf16(acc * x_scale[row] * w_scale[col]). Rows are padded to a multiple
+ * of four for IMMA; the INT8 activation buffer has slack rows for that. */
+static int q21f_gemm_i8(q21f_runtime *rt, CUdeviceptr y, int ldy, CUdeviceptr w, CUdeviceptr ws, int m, int n,
+                        int k) {
+    int chunk = (int)(rt->acc_bytes / ((size_t)n * 4)) & ~15;
+    if (chunk < 16) return -1;
+    for (int r0 = 0; r0 < m; r0 += chunk) {
+        int rows = m - r0 < chunk ? m - r0 : chunk, padded = (rows + 3) & ~3;
+        if (cublasew_gemm_int8_s32_rowmajor_nt(rt->blas, rt->acc, w, rt->xq + (size_t)r0 * k, padded, n, k))
+            return -1;
+        CUdeviceptr yy = y + (size_t)r0 * ldy * 2, sx = rt->xs + (size_t)r0 * 4;
+        void *a[] = {&yy, &rt->acc, &sx, &ws, &rows, &n, &ldy};
+        if (q21f_launch_n(rt, rt->dequant, (size_t)rows * n, a)) return -1;
+    }
+    return 0;
+}
+
+/* Per-row SmoothQuant INT8 of a BF16 matrix into the shared activation buffer. */
+static int q21f_quant(q21f_runtime *rt, CUdeviceptr x, int ld, int cols, CUdeviceptr inv_s, int rows) {
+    void *a[] = {&rt->xq, &rt->xs, &x, &inv_s, &cols, &ld};
+    return q21f_launch(rt, rt->quant_rows, (unsigned)rows, 1, 256, a);
+}
+
 /* QKV and gate|proj projections. Fused, one GEMM covers the concatenated
  * weight rows; otherwise each projection runs as the separate [M,n] GEMM the
  * reference framework issues, writing into its column slice. */
@@ -278,6 +327,13 @@ static void q21f_stage(q21f_runtime *rt, const char *name, CUdeviceptr p, int ro
     }
     free(h);
     free(f);
+}
+
+static void q21f_calib(q21f_runtime *rt, int b, int which, CUdeviceptr x, int rows, int cols, int ld) {
+    if (!rt->calib || rows <= 0) return;
+    CUdeviceptr out = rt->calib + ((size_t)b * 4 + which) * Q21F_F * 4;
+    void *a[] = {&out, &x, &rows, &cols, &ld};
+    cuLaunchKernel(rt->colmax, (unsigned)((cols + 255) / 256), 1, 1, 256, 1, 1, 0, rt->compute, a, NULL);
 }
 
 /* Diagnostic: queue a device checksum of a range without synchronizing. */
@@ -417,7 +473,7 @@ static int q21f_rows(const q21f_branch *br, int kind, int N) {
  * target rows row 0. which selects (scale, gate) pair 0 (attention) or 1 (MLP)
  * of the norm and, for the gated residual, the preceding pair. */
 static int q21f_branch_norm(q21f_runtime *rt, q21f_state *st, const q21f_branch *br, int kind, size_t row0,
-                            int N, int pair, CUdeviceptr y, CUdeviceptr final_scale) {
+                            int N, int pair, CUdeviceptr y, CUdeviceptr final_scale, CUdeviceptr inv_s) {
     int D = Q21F_D, P = br->prefix;
     int prefix_rows = kind == Q21F_TARGET ? 0 : P, target_rows = kind == Q21F_PREFIX ? 0 : N;
     int gate_pair = pair ? 0 : 1;
@@ -429,7 +485,13 @@ static int q21f_branch_norm(q21f_runtime *rt, q21f_state *st, const q21f_branch 
                                     : st->modc + (size_t)(mrow * 4 + pair * 2) * D * 4;
         CUdeviceptr g = st->modc + (size_t)(mrow * 4 + gate_pair * 2 + 1) * D * 4;
         CUdeviceptr yy = y ? y + r * D * 2 : 0;
-        if (q21f_norm_mod(rt, st->x + r * D * 2, st->hidden + r * D * 2, yy, g, f, rows)) return -1;
+        if (inv_s) {
+            /* W8A8 consumer: write INT8 rows and per-row scales instead of BF16. */
+            CUdeviceptr q = rt->xq + r * D, qs = rt->xs + r * 4, hh = st->hidden + r * D * 2;
+            float eps = 1e-6f;
+            void *a[] = {&q, &qs, &hh, &yy, &g, &f, &inv_s, &D, &eps};
+            if (q21f_launch(rt, rt->norm_mod_q8, (unsigned)rows, 1, 128, a)) return -1;
+        } else if (q21f_norm_mod(rt, st->x + r * D * 2, st->hidden + r * D * 2, yy, g, f, rows)) return -1;
     }
     return 0;
 }
@@ -457,16 +519,24 @@ static int q21f_pass(q21f_runtime *rt, q21f_state *st, q21f_branch *br, int nb, 
     for (int b = 0; b < Q21F_BLOCKS; b++) {
         CUdeviceptr w = q21f_block_begin(rt, b);
         REQ(w, "block %d weights unavailable", b);
-        const q21f_layout *l = &rt->layout;
+        int i8 = rt->block[b].kind == Q21F_KIND_INT8;
+        const q21f_layout *l = i8 ? &rt->i8 : &rt->layout;
         for (int i = 0; i < nb; i++)
-            REQ(!q21f_branch_norm(rt, st, &br[i], kind, base[i], N, 0, b ? st->y : 0, 0), "norm1");
+            REQ(!q21f_branch_norm(rt, st, &br[i], kind, base[i], N, 0, b ? st->y : 0, 0,
+                                  i8 ? w + l->offset[I8_I_QKV] : 0), "norm1");
         if (dump && b) { char nm[32]; snprintf(nm, sizeof(nm), "block_%02d", b - 1); q21f_stage(rt, nm, h, M, D, D); }
         if (dump && b == 0) q21f_stage(rt, "mod_ln", st->x, M, D, D);
         q21f_mark(rt, "x1", b, st->x, (size_t)M * D * 2);
         q21f_mark(rt, "h", b, h, (size_t)M * D * 2);
-        REQ(!q21f_gemm_parts(rt, st->qkv, w + l->offset[Q21F_QKV], st->x, M, 3, D, D), "QKV");
+        if (i8)
+            REQ(!q21f_gemm_i8(rt, st->qkv, 3 * D, w + l->offset[I8_QKV], w + l->offset[I8_S_QKV], M, 3 * D, D),
+                "QKV W8A8");
+        else {
+            q21f_calib(rt, b, 0, st->x, M, D, D);
+            REQ(!q21f_gemm_parts(rt, st->qkv, w + l->offset[Q21F_QKV], st->x, M, 3, D, D), "QKV");
+        }
         q21f_mark(rt, "qkv", b, st->qkv, (size_t)M * 3 * D * 2);
-        CUdeviceptr nq = w + l->offset[Q21F_NQ], nk = w + l->offset[Q21F_NK];
+        CUdeviceptr nq = w + l->offset[i8 ? I8_NQ : Q21F_NQ], nk = w + l->offset[i8 ? I8_NK : Q21F_NK];
         int last_prefix = kind == Q21F_PREFIX && b == Q21F_BLOCKS - 1;
         for (int i = 0; i < nb; i++) {
             q21f_branch *r = &br[i];
@@ -515,21 +585,39 @@ static int q21f_pass(q21f_runtime *rt, q21f_state *st, q21f_branch *br, int nb, 
         q21f_mark(rt, "q", b, st->q, (size_t)M * D * 2);
         q21f_mark(rt, "k", b, br[0].work_k, (size_t)(br[0].prefix + N) * D * 2);
         q21f_mark(rt, "attn", b, st->attn, (size_t)M * D * 2);
-        REQ(!q21f_gemm(rt, st->y, D, w + l->offset[Q21F_OUT], st->attn, D, M, D, D), "out");
+        if (i8) {
+            REQ(!q21f_quant(rt, st->attn, D, D, w + l->offset[I8_I_OUT], M), "out quant");
+            REQ(!q21f_gemm_i8(rt, st->y, D, w + l->offset[I8_OUT], w + l->offset[I8_S_OUT], M, D, D), "out W8A8");
+        } else {
+            q21f_calib(rt, b, 1, st->attn, M, D, D);
+            REQ(!q21f_gemm(rt, st->y, D, w + l->offset[Q21F_OUT], st->attn, D, M, D, D), "out");
+        }
         q21f_mark(rt, "out", b, st->y, (size_t)M * D * 2);
         for (int i = 0; i < nb; i++)
-            REQ(!q21f_branch_norm(rt, st, &br[i], kind, base[i], N, 1, st->y, 0), "norm2");
+            REQ(!q21f_branch_norm(rt, st, &br[i], kind, base[i], N, 1, st->y, 0,
+                                  i8 ? w + l->offset[I8_I_GP] : 0), "norm2");
         q21f_mark(rt, "x2", b, st->x, (size_t)M * D * 2);
+        if (!i8) q21f_calib(rt, b, 2, st->x, M, D, D);
         if (dump && b == 0) {
             q21f_stage(rt, "attn_out", st->y, M, D, D);
             q21f_stage(rt, "post_attn_hidden", h, M, D, D);
             q21f_stage(rt, "mod_ln2", st->x, M, D, D);
         }
-        REQ(!q21f_gemm_parts(rt, st->gp, w + l->offset[Q21F_GP], st->x, M, 2, F, D), "gate|proj");
+        if (i8)
+            REQ(!q21f_gemm_i8(rt, st->gp, 2 * F, w + l->offset[I8_GP], w + l->offset[I8_S_GP], M, 2 * F, D),
+                "gate|proj W8A8");
+        else REQ(!q21f_gemm_parts(rt, st->gp, w + l->offset[Q21F_GP], st->x, M, 2, F, D), "gate|proj");
         q21f_mark(rt, "gp", b, st->gp, (size_t)M * 2 * F * 2);
         { int rows = M, ff = F; void *a[] = {&st->gp, &rows, &ff};
           REQ(!q21f_launch_n(rt, rt->swiglu, (size_t)M * F, a), "swiglu"); }
-        REQ(!q21f_gemm(rt, st->y, D, w + l->offset[Q21F_MO], st->gp, 2 * F, M, D, F), "mlp.out");
+        if (i8) {
+            REQ(!q21f_quant(rt, st->gp, 2 * F, F, w + l->offset[I8_I_MO], M), "mlp.out quant");
+            REQ(!q21f_gemm_i8(rt, st->y, D, w + l->offset[I8_MO], w + l->offset[I8_S_MO], M, D, F),
+                "mlp.out W8A8");
+        } else {
+            q21f_calib(rt, b, 3, st->gp, M, F, 2 * F);
+            REQ(!q21f_gemm(rt, st->y, D, w + l->offset[Q21F_MO], st->gp, 2 * F, M, D, F), "mlp.out");
+        }
         q21f_mark(rt, "mlp", b, st->y, (size_t)M * D * 2);
         if (dump && b == 0) q21f_stage(rt, "mlp_out", st->y, M, D, D);
         REQ(!q21f_block_end(rt, b), "block end");
@@ -539,7 +627,7 @@ static int q21f_pass(q21f_runtime *rt, q21f_state *st, q21f_branch *br, int nb, 
     for (int i = 0; i < nb; i++) {
         size_t t0 = base[i] + (kind == Q21F_JOINT ? (size_t)br[i].prefix : 0);
         q21f_branch target_only = br[i];
-        REQ(!q21f_branch_norm(rt, st, &target_only, Q21F_TARGET, t0, N, 0, st->y, st->fscale), "final norm");
+        REQ(!q21f_branch_norm(rt, st, &target_only, Q21F_TARGET, t0, N, 0, st->y, st->fscale, 0), "final norm");
         if (dump) {
             q21f_stage(rt, "final_hidden", st->hidden + t0 * D * 2, N, D, D);
             q21f_stage(rt, "final_ln", st->x + t0 * D * 2, N, D, D);
@@ -609,7 +697,8 @@ static void q21f_usage(const char *argv0) {
             "  [--editing-layout L.txt --condition-latents C.npy [--negative-editing-layout NL.txt]]\n"
             "  [--vram-budget-mib MIB] [--cfg-batch 0|1] [--fused-gemm 0|1] [--kv-cache on|off]\n"
             "  [--prefix-pass extract|separate] [--plan-only] [--profile]\n"
-            "  diagnostics: [--trace] [--verify-slots] [--stage-dir DIR]\n"
+            "  [--weights bf16|int8 --quant-package DIR [--bf16-blocks 0,31]]\n"
+            "  diagnostics: [--trace] [--verify-slots] [--stage-dir DIR] [--calib-dump FILE.npy]\n"
             "  [--attention cutlass-efficient|flash] [--normalization vector4] [--rope host-table-exact]\n"
             "  [--attention-plugin PATH] [--rope-table-base PATH]\n"
             "  [--out O.npy] [--dump-dir DIR] [--pred-dir DIR] [--quiet|--verbose]\n", argv0);
@@ -621,7 +710,9 @@ int main(int argc, char **argv) {
     const char *out_path = "native_latents.npy", *dump_dir = NULL, *pred_dir = NULL;
     const char *plugin_path = NULL;
     const char *rope_path = "cuda/qimg21/qwen21_rope_freqs.npy";
-    const char *stage_dir = NULL;
+    const char *stage_dir = NULL, *calib_path = NULL, *package = NULL, *bf16_blocks = NULL;
+    int int8_weights = 0, tail_blocks = 0;
+    char tail_list[160] = "";
     int ih = 16, iw = 16, steps = 1, verbose = 1, cfg_batch = 1, plan_only = 0, profile = 0, fused_gemm = 1;
     int kv_cache = 1, extract = 1, trace = 0, verify_slots = 0, flash = 0;
     double budget_mib = 0;
@@ -661,6 +752,19 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--plan-only")) plan_only = 1;
         else if (!strcmp(a, "--trace")) trace = 1;
         else if (!strcmp(a, "--stage-dir") && more) stage_dir = argv[++i];
+        else if (!strcmp(a, "--calib-dump") && more) calib_path = argv[++i];
+        else if (!strcmp(a, "--quant-package") && more) package = argv[++i];
+        /* Harness aliases so regression.py/editing_regression.py can drive
+         * the fast W8A8 path: the package must be a pack_fast.py package. */
+        else if (!strcmp(a, "--quantized-transformer") && more) package = argv[++i];
+        else if (!strcmp(a, "--int8-tensor-core")) int8_weights = 1;
+        else if (!strcmp(a, "--int8-bf16-tail-blocks") && more) tail_blocks = atoi(argv[++i]);
+        else if (!strcmp(a, "--bf16-blocks") && more) bf16_blocks = argv[++i];
+        else if (!strcmp(a, "--weights") && more) {
+            const char *m = argv[++i];
+            if (strcmp(m, "bf16") && strcmp(m, "int8")) { q21f_usage(argv[0]); return 2; }
+            int8_weights = !strcmp(m, "int8");
+        }
         else if (!strcmp(a, "--verify-slots")) verify_slots = 1;
         else if (!strcmp(a, "--profile")) profile = 1;
         else if (!strcmp(a, "--verbose")) verbose = 2;
@@ -689,6 +793,17 @@ int main(int argc, char **argv) {
     if (!!layout_path != !!condition_path || (negative_layout_path && !layout_path) ||
         (layout_path && negative_path && !negative_layout_path)) {
         fprintf(stderr, "fast: editing requires a layout plus condition latents; editing CFG also needs a negative layout\n");
+        return 2;
+    }
+    if (tail_blocks < 0 || tail_blocks > Q21F_BLOCKS) { q21f_usage(argv[0]); return 2; }
+    if (tail_blocks && !bf16_blocks) {
+        size_t n = 0;
+        for (int b = Q21F_BLOCKS - tail_blocks; b < Q21F_BLOCKS; b++)
+            n += (size_t)snprintf(tail_list + n, sizeof(tail_list) - n, "%s%d", n ? "," : "", b);
+        bf16_blocks = tail_list;
+    }
+    if (int8_weights != !!package) {
+        fprintf(stderr, "fast: --weights int8 and --quant-package go together\n");
         return 2;
     }
     if (negative_path && guidance <= 1.0f) {
@@ -764,7 +879,8 @@ int main(int argc, char **argv) {
     GETF(cast_bf16, "cast_bf16"); GETF(txt_norm, "txt_norm"); GETF(gelu, "gelu_bf16"); GETF(silu, "silu_bf16");
     GETF(mod_prepare, "mod_prepare"); GETF(scale_prepare, "scale_prepare"); GETF(norm_mod, "norm_mod");
     GETF(qk_norm_rope, "qk_norm_rope"); GETF(swiglu, "swiglu");
-    GETF(euler, "euler"); GETF(cfg_combine, "cfg_combine"); GETF(checksum, "checksum");
+    GETF(norm_mod_q8, "norm_mod_q8"); GETF(quant_rows, "quant_rows"); GETF(dequant, "dequant");
+    GETF(euler, "euler"); GETF(cfg_combine, "cfg_combine"); GETF(checksum, "checksum"); GETF(colmax, "colmax");
 #undef GETF
     /* cutlass-efficient is PyTorch's memory-efficient kernel (reference
      * parity); flash is upstream FlashAttention-2 (faster, not bit-exact). */
@@ -777,6 +893,39 @@ int main(int argc, char **argv) {
 
     /* ---- Plan ---- */
     q21f_layout_init(&rt.layout);
+    q21f_i8_layout_init(&rt.i8);
+    int package_fd = -1;
+    for (int b = 0; b < Q21F_BLOCKS; b++) {
+        rt.block[b].kind = int8_weights ? Q21F_KIND_INT8 : Q21F_KIND_BF16;
+        rt.block[b].bytes = int8_weights ? rt.i8.bytes : rt.layout.bytes;
+    }
+    if (bf16_blocks) {
+        /* Sensitive blocks stay BF16, read from the model. */
+        for (const char *c = bf16_blocks; *c;) {
+            char *end;
+            long b = strtol(c, &end, 10);
+            REQ(end != c && b >= 0 && b < Q21F_BLOCKS && (*end == ',' || !*end), "invalid --bf16-blocks %s",
+                bf16_blocks);
+            rt.block[b].kind = Q21F_KIND_BF16;
+            rt.block[b].bytes = rt.layout.bytes;
+            c = *end ? end + 1 : end;
+        }
+    }
+    if (package) {
+        char manifest[1 << 16], mpath[2048];
+        snprintf(mpath, sizeof(mpath), "%s/manifest.json", package);
+        FILE *fp = fopen(mpath, "r");
+        size_t got = fp ? fread(manifest, 1, sizeof(manifest) - 1, fp) : 0;
+        if (fp) fclose(fp);
+        manifest[got] = 0;
+        char expect[64];
+        snprintf(expect, sizeof(expect), "\"blob_bytes\": %zu,", rt.i8.bytes);
+        REQ(strstr(manifest, "\"format\": \"qimg21-fast-int8-smooth-v1\"") && strstr(manifest, expect),
+            "%s is not a qimg21-fast-int8-smooth-v1 package matching this runner", mpath);
+        snprintf(mpath, sizeof(mpath), "%s/blocks.bin", package);
+        package_fd = open(mpath, O_RDONLY);
+        REQ(package_fd >= 0, "cannot open %s", mpath);
+    }
     int nt_max = br[0].nt > br[1].nt ? br[0].nt : br[1].nt;
     int prefix_max = br[0].prefix > br[1].prefix ? br[0].prefix : br[1].prefix;
     int batch = cfg_batch ? nb : 1;
@@ -785,10 +934,15 @@ int main(int argc, char **argv) {
     if (st.rows_max < prefix_max + N) st.rows_max = prefix_max + N;
     if (st.rows_max < nt_max + st.nc) st.rows_max = nt_max + st.nc;
     q21f_plan plan = {0};
-    plan.block_bytes = rt.layout.bytes;
+    for (int b = 0; b < Q21F_BLOCKS; b++)
+        if (rt.block[b].bytes > plan.block_bytes) plan.block_bytes = rt.block[b].bytes;
     plan.fixed = (size_t)(2 * Q21F_D * Q21F_D + Q21F_D * 64 + Q21F_D * 256 + Q21F_D * Q21F_D +
                           4 * Q21F_D * Q21F_D + Q21F_D * Q21F_D + 64 * Q21F_D) * 2 + Q21F_D * 4;
     plan.activations = q21f_state_bytes(st.rows_max, N, nb, nt_max, st.nc);
+    if (int8_weights) {
+        rt.acc_bytes = 128 * Q21F_MIB;
+        plan.activations += ((size_t)st.rows_max + 16) * (Q21F_F + 4) + rt.acc_bytes;
+    }
     for (int i = 0; i < nb; i++)
         plan.kv += ((size_t)Q21F_BLOCKS * br[i].prefix + br[i].prefix + N) * Q21F_D * 2 * 2 +
                    (size_t)br[i].prefix * Q21F_D * 2 + (size_t)(br[i].prefix + N) * 128 * 4;
@@ -802,17 +956,24 @@ int main(int argc, char **argv) {
     if (usable > free_bytes - (free_bytes > 256 * Q21F_MIB ? 256 * Q21F_MIB : 0))
         usable = free_bytes > 256 * Q21F_MIB ? free_bytes - 256 * Q21F_MIB : 0;
     size_t base = plan.fixed + plan.activations + plan.kv;
-    REQ(usable > base + 2 * plan.block_bytes, "budget too small: need at least %.0f MiB for activations, "
-        "K/V and two streaming slots, have %.0f MiB usable", (base + 2 * plan.block_bytes) / (double)Q21F_MIB,
-        usable / (double)Q21F_MIB);
-    if (usable >= base + Q21F_BLOCKS * plan.block_bytes) plan.resident = Q21F_BLOCKS;
-    else {
-        plan.resident = (int)((usable - base - 2 * plan.block_bytes) / plan.block_bytes);
-        if (plan.resident > Q21F_BLOCKS - 3) plan.resident = Q21F_BLOCKS - 3;
-    }
-    plan.streamed = Q21F_BLOCKS - plan.resident;
+    /* Fewest streamed blocks (interleaved) whose resident set, plus two slots
+     * sized for the largest block, fits. */
+    size_t all = 0;
+    for (int b = 0; b < Q21F_BLOCKS; b++) all += rt.block[b].bytes;
+    plan.streamed = -1;
+    if (usable >= base + all) plan.streamed = 0;
+    else
+        for (int S = 3; S <= Q21F_BLOCKS && plan.streamed < 0; S++) {
+            size_t need = base + 2 * plan.block_bytes;
+            for (int b = 0; b < Q21F_BLOCKS; b++)
+                if ((b + 1) * S / Q21F_BLOCKS == b * S / Q21F_BLOCKS) need += rt.block[b].bytes;
+            if (need <= usable) plan.streamed = S;
+        }
+    REQ(plan.streamed >= 0, "budget too small: have %.0f MiB usable for %.0f MiB of activations and K/V",
+        usable / (double)Q21F_MIB, base / (double)Q21F_MIB);
+    plan.resident = Q21F_BLOCKS - plan.streamed;
     rt.budget = usable;
-    fprintf(stderr, "fast: plan %d resident + %d streamed blocks (%.1f MiB each); fixed %.0f, activations %.0f, "
+    fprintf(stderr, "fast: plan %d resident + %d streamed blocks (%.1f MiB max); fixed %.0f, activations %.0f, "
             "K/V %.0f MiB; usable %.0f of %.0f MiB free\n", plan.resident, plan.streamed,
             plan.block_bytes / (double)Q21F_MIB, plan.fixed / (double)Q21F_MIB,
             plan.activations / (double)Q21F_MIB, plan.kv / (double)Q21F_MIB, usable / (double)Q21F_MIB,
@@ -835,7 +996,8 @@ int main(int argc, char **argv) {
         REQ(shards.st[shards.n], "cannot open %s", path);
         shards.n++;
     }
-    CK(cuMemHostAlloc(&staging, rt.layout.bytes, 0));
+    CK(cuMemHostAlloc(&staging, plan.block_bytes > (size_t)4 * Q21F_D * Q21F_D * 2 ? plan.block_bytes
+                                                                                  : (size_t)4 * Q21F_D * Q21F_D * 2, 0));
     rt.txt_norm_w = q21f_upload_tensor(&rt, &shards, "txt_in.text_norm.weight", Q21F_D, 1, staging);
     rt.txt_in = q21f_upload_tensor(&rt, &shards, "txt_in.in_layer.weight", (size_t)Q21F_D * Q21F_D, 0, staging);
     rt.txt_out = q21f_upload_tensor(&rt, &shards, "txt_in.out_layer.weight", (size_t)Q21F_D * Q21F_D, 0, staging);
@@ -851,15 +1013,33 @@ int main(int argc, char **argv) {
     REQ(rt.txt_norm_w && rt.txt_in && rt.txt_out && rt.img_in && rt.t1 && rt.t2 && rt.modulation &&
         rt.norm_out && rt.proj_out, "non-block weights failed to load");
     for (int b = 0; b < Q21F_BLOCKS; b++) {
-        if (rt.block[b].resident) {
-            REQ(!q21f_pack_block(&shards, &rt.layout, b, (uint8_t *)staging), "block %d", b);
-            rt.block[b].dev = q21f_alloc(&rt, rt.layout.bytes);
-            REQ(rt.block[b].dev, "block %d allocation", b);
-            REQ(!q21f_upload(&rt, rt.block[b].dev, staging, rt.layout.bytes, 1), "block %d upload", b);
-        } else {
-            CK(cuMemHostAlloc(&rt.block[b].host, rt.layout.bytes, 0));
-            REQ(!q21f_pack_block(&shards, &rt.layout, b, (uint8_t *)rt.block[b].host), "block %d", b);
+        size_t bytes = rt.block[b].bytes;
+        uint8_t *dst = (uint8_t *)staging;
+        if (!rt.block[b].resident) {
+            CK(cuMemHostAlloc(&rt.block[b].host, bytes, 0));
+            dst = (uint8_t *)rt.block[b].host;
         }
+        if (rt.block[b].kind == Q21F_KIND_INT8) {
+            ssize_t got = pread(package_fd, dst, bytes, (off_t)b * (off_t)rt.i8.bytes);
+            REQ(got == (ssize_t)bytes, "short read of INT8 block %d", b);
+        } else REQ(!q21f_pack_block(&shards, &rt.layout, b, dst), "block %d", b);
+        if (rt.block[b].resident) {
+            rt.block[b].dev = q21f_alloc(&rt, bytes);
+            REQ(rt.block[b].dev, "block %d allocation", b);
+            REQ(!q21f_upload(&rt, rt.block[b].dev, staging, bytes, 1), "block %d upload", b);
+        }
+    }
+    if (package_fd >= 0) { close(package_fd); package_fd = -1; }
+    if (int8_weights) {
+        rt.xq = q21f_alloc(&rt, ((size_t)st.rows_max + 16) * Q21F_F);
+        rt.xs = q21f_alloc(&rt, ((size_t)st.rows_max + 16) * 4);
+        rt.acc = q21f_alloc(&rt, rt.acc_bytes);
+        REQ(rt.xq && rt.xs && rt.acc, "INT8 activation buffers");
+    }
+    if (calib_path) {
+        rt.calib = q21f_alloc(&rt, (size_t)Q21F_BLOCKS * 4 * Q21F_F * 4);
+        REQ(rt.calib, "calibration buffer");
+        CK(cuMemsetD8Async(rt.calib, 0, (size_t)Q21F_BLOCKS * 4 * Q21F_F * 4, rt.compute));
     }
     if (trace) {
         rt.trace_buf = q21f_alloc(&rt, 8192 * 8);
@@ -874,7 +1054,7 @@ int main(int argc, char **argv) {
     }
     if (rt.n_streamed) {
         for (int s = 0; s < 2; s++) {
-            rt.slot[s] = q21f_alloc(&rt, rt.layout.bytes);
+            rt.slot[s] = q21f_alloc(&rt, plan.block_bytes);
             REQ(rt.slot[s], "streaming slot allocation");
             CK(cuEventCreate(&rt.loaded[s], CU_EVENT_DISABLE_TIMING));
             CK(cuEventCreate(&rt.freed[s], CU_EVENT_DISABLE_TIMING));
@@ -1000,6 +1180,16 @@ int main(int argc, char **argv) {
     CK(cuStreamSynchronize(rt.compute));
     double loop_s = q21f_seconds() - loop_start;
     REQ(!npy_write_f32(out_path, host_out, (size_t)N * 64, N, 64), "write %s", out_path);
+    if (rt.calib) {
+        size_t n = (size_t)Q21F_BLOCKS * 4 * Q21F_F;
+        float *h = (float *)malloc(n * 4);
+        REQ(h, "calibration host buffer");
+        CK(cuMemcpyDtoH(h, rt.calib, n * 4));
+        int bad = npy_write_f32(calib_path, h, n, Q21F_BLOCKS * 4, Q21F_F);
+        free(h);
+        REQ(!bad, "write %s", calib_path);
+        fprintf(stderr, "fast: wrote activation calibration %s\n", calib_path);
+    }
     if (rt.trace_buf) {
         unsigned long long *sums = (unsigned long long *)calloc(8192, 8);
         REQ(sums, "trace host buffer");
@@ -1014,7 +1204,7 @@ int main(int argc, char **argv) {
         CK(cuMemcpyDtoH(got, rt.verify, uses * 8));
         for (int k = 0; k < rt.n_streamed; k++) {
             const unsigned *p = (const unsigned *)rt.block[rt.streamed[k]].host;
-            unsigned long long words = rt.layout.bytes / 4, sum = 0;
+            unsigned long long words = rt.block[rt.streamed[k]].bytes / 4, sum = 0;
             for (unsigned t = 0; t < 256; t++)
                 for (unsigned long long i = (unsigned long long)t * 4099; i < words; i += 256ull * 4099) sum += p[i];
             expect[k] = sum;

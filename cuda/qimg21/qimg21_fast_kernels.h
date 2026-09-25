@@ -39,6 +39,34 @@ static const char *q21f_kernel_src =
 " float mu=mean[0],iv=rsqrtf(var[0]/D+eps);bf*o=out+(size_t)t*D;\n"
 " for(int j=i*4;j<D;j+=512)for(int k=0;k<4;k++)o[j+k]=f2b(rb((b2f(row[j+k])-mu)*iv)*f[j+k]);\n"
 "}\n"
+/* norm_mod followed by SmoothQuant W8A8 activation quantization: v =
+ * rb(norm)*f * inv_s (the BF16 activation times 1/s), then per-row symmetric
+ * INT8 with scale amax/127. D must be 4096 (32 values per thread). */
+"__global__ void norm_mod_q8(signed char*q,float*qs,bf*h,const bf*y,const float*g,const float*f,const float*inv_s,int D,float eps){\n"
+" int t=blockIdx.x,i=threadIdx.x,l=i%32,w=i/32;__shared__ float mean[4],var[4],count[4],amx[4];Stat a={0,0,0};\n"
+" bf*row=h+(size_t)t*D;const bf*yr=y?y+(size_t)t*D:0;\n"
+" for(int j=i*4;j<D;j+=512)for(int k=0;k<4;k++){float v=b2f(row[j+k]);if(yr){v=rb(v+rb(g[j+k]*b2f(yr[j+k])));row[j+k]=f2b(v);}float d=v-a.m;float nn=a.n+1.f,nm=fmaf(d,__frcp_rn(nn),a.m);a.v=fmaf(d,v-nm,a.v);a.m=nm;a.n=nn;}\n"
+" for(int s=16;s;s>>=1){Stat b={__shfl_down_sync(0xffffffff,a.m,s),__shfl_down_sync(0xffffffff,a.v,s),__shfl_down_sync(0xffffffff,a.n,s)};a=combine(a,b);}\n"
+" if(l==0){mean[w]=a.m;var[w]=a.v;count[w]=a.n;}__syncthreads();\n"
+" for(int s=2;s;s>>=1){if(l==0&&w<s){Stat b={mean[w+s],var[w+s],count[w+s]};a=combine(a,b);mean[w]=a.m;var[w]=a.v;count[w]=a.n;}__syncthreads();}\n"
+" float mu=mean[0],iv=rsqrtf(var[0]/D+eps),v[32],m=0.f;int n=0;\n"
+" for(int j=i*4;j<D;j+=512)for(int k=0;k<4;k++){float o=rb(rb((b2f(row[j+k])-mu)*iv)*f[j+k])*inv_s[j+k];v[n++]=o;m=fmaxf(m,fabsf(o));}\n"
+" for(int s=16;s;s>>=1)m=fmaxf(m,__shfl_xor_sync(0xffffffff,m,s));if(l==0)amx[w]=m;__syncthreads();\n"
+" m=fmaxf(fmaxf(amx[0],amx[1]),fmaxf(amx[2],amx[3]));float r=m>0.f?127.f/m:0.f;\n"
+" signed char*o=q+(size_t)t*D;n=0;for(int j=i*4;j<D;j+=512)for(int k=0;k<4;k++){int z=__float2int_rn(v[n++]*r);o[j+k]=(signed char)max(-127,min(127,z));}\n"
+" if(i==0)qs[t]=m>0.f?m/127.f:1.f;\n"
+"}\n"
+/* Per-row SmoothQuant INT8 of a BF16 matrix (row stride ld): q = rint(x*inv_s/scale). */
+"__global__ void quant_rows(signed char*q,float*qs,const bf*x,const float*inv_s,int cols,int ld){\n"
+" int t=blockIdx.x,i=threadIdx.x;__shared__ float amx[8];const bf*r=x+(size_t)t*ld;float m=0.f;\n"
+" for(int j=i;j<cols;j+=256)m=fmaxf(m,fabsf(b2f(r[j])*inv_s[j]));\n"
+" for(int s=16;s;s>>=1)m=fmaxf(m,__shfl_xor_sync(0xffffffff,m,s));if(i%32==0)amx[i/32]=m;__syncthreads();\n"
+" m=amx[0];for(int k=1;k<8;k++)m=fmaxf(m,amx[k]);float rr=m>0.f?127.f/m:0.f;signed char*o=q+(size_t)t*cols;\n"
+" for(int j=i;j<cols;j+=256){int z=__float2int_rn(b2f(r[j])*inv_s[j]*rr);o[j]=(signed char)max(-127,min(127,z));}\n"
+" if(i==0)qs[t]=m>0.f?m/127.f:1.f;\n"
+"}\n"
+/* INT32 accumulator -> BF16 with per-row activation and per-column weight scales. */
+"__global__ void dequant(bf*y,const int*acc,const float*xs,const float*ws,int rows,int cols,int ldy){size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;if(i>=(size_t)rows*cols)return;size_t t=i/cols,o=i%cols;y[t*ldy+o]=f2b((float)acc[i]*xs[t]*ws[o]);}\n"
 /* Per-head QK RMSNorm + RoPE from a fused [N,3D] QKV row (harness
  * q21_exact_qk_rope_kernel rounding). Writes Q to q[N,D] and K/V to kv rows
  * starting at kv_row (stride D). table holds F32 cos,sin per token pair. */
@@ -66,6 +94,9 @@ static const char *q21f_kernel_src =
 "__global__ void euler(float*sample,bf*latent,const bf*pred,const bf*neg,int n,float scale,float dt,int cfg){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=n)return;float p=b2f(pred[i]);if(cfg){float u=b2f(neg[i]);p=rb(u+rb(scale*rb(p-u)));}float s=rb(sample[i]+rb(dt*rb(p)));sample[i]=s;latent[i]=f2b(s);}\n"
 /* CFG combine only (single-step prediction dumps). */
 "__global__ void cfg_combine(bf*pred,const bf*neg,int n,float scale){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){float p=b2f(pred[i]),u=b2f(neg[i]);pred[i]=f2b(rb(u+rb(scale*rb(p-u))));}}\n"
+/* Calibration: out[c] = max(out[c], max_r |x[r,c]|) for SmoothQuant; out is
+ * non-negative F32 so its bits order like int32. */
+"__global__ void colmax(float*out,const bf*x,int rows,int cols,int ld){int c=blockIdx.x*blockDim.x+threadIdx.x;if(c>=cols)return;float m=0.f;for(int r=0;r<rows;r++)m=fmaxf(m,fabsf(b2f(x[(size_t)r*ld+c])));atomicMax((int*)&out[c],__float_as_int(m));}\n"
 /* Diagnostic: sampled sum of 32-bit words (every stride-th word). */
 "__global__ void checksum(unsigned long long*out,const unsigned*p,unsigned long long words,unsigned stride){unsigned long long s=0;for(unsigned long long i=(unsigned long long)threadIdx.x*stride;i<words;i+=(unsigned long long)blockDim.x*stride)s+=p[i];atomicAdd(out,s);}\n"
 "}\n";
