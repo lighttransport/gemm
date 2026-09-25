@@ -882,7 +882,7 @@ static const q38d_act *norm_act(int tid, const float *w) {
     if (!tid) kprof_norm += (double)(ticks() - t0);
     return r;
 }
-static int norm_cmg = 1;
+static int norm_cmg = 1, norm_pf = 1;
 static double norm_cbar_t;
 static int *norm_csense[NT];
 static float ssq_part[NCMG][64] __attribute__((aligned(256)));
@@ -952,6 +952,8 @@ static const q38d_act *norm_act_impl(int tid, const float *w) {
         int c = tid / PER, l = tid % PER, np = EMBD / 32;
         int p0 = np * l / PER, p1 = np * (l + 1) / PER;
         q38d_act *a = &E.act_c[c];
+        if (norm_pf)
+            for (int o = 32 * p0 * 4; o < 32 * p1 * 4; o += 256) __builtin_prefetch((const char *)E.x + o, 0, 3);
         if (E.arith == Q38D_F32) {
             float *xn = E.xn_c[c];
             const svbool_t pf = svptrue_b32();
@@ -1841,16 +1843,26 @@ static void run_plan_mt(const q38d_plan *P, int T, const q38d_act *acts, float *
 }
 /* RMSNorm of xs[0..T) with weight w into this CMG's act_c[c][t]: lane l sums
  * and quantizes its 1/12 of the pairs; two CMG barriers. */
+static double nm_t[4];
 static void norm_mt(int tid, float *const *xs, int T, const float *w, int *cs) {
     int c = tid / PER, l = tid % PER, np = EMBD / 32, p0 = np * l / PER, p1 = np * (l + 1) / PER;
+    /* the slices were just written on other CMGs: issue all line fetches first */
+    if (norm_pf)
+        for (int t = 0; t < T; t++)
+            for (int o = 32 * p0 * 4; o < 32 * p1 * 4; o += 256) __builtin_prefetch((const char *)xs[t] + o, 0, 3);
+    uint64_t n0 = tid ? 0 : ticks();
     for (int t = 0; t < T; t++) ssp_part[c][l][t] = sumsq(xs[t] + 32 * p0, 32 * (p1 - p0));
+    uint64_t n1 = tid ? 0 : ticks();
     cbarrier(tid, cs);
+    uint64_t n2 = tid ? 0 : ticks();
     for (int t = 0; t < T; t++) {
         float ss = 0;
         for (int j = 0; j < PER; j++) ss += ssp_part[c][j][t];
         q38d_prepare_pairs(&MT.act_c[c][t], xs[t], 1.0f / sqrtf(ss / EMBD + E.eps), w, p0, p1);
     }
+    uint64_t n3 = tid ? 0 : ticks();
     cbarrier(tid, cs);
+    if (!tid) { nm_t[0] += n1 - n0; nm_t[1] += n2 - n1; nm_t[2] += n3 - n2; nm_t[3] += ticks() - n3; }
 }
 typedef struct { float part[2][TMAX][8]; _Atomic int cnt; char pad[252]; } q38d_split_mt;
 static q38d_split_mt split_mt[NCMG][PER + 1];
@@ -2429,6 +2441,8 @@ static void *worker(void *arg) {
             for (int a = 1; a <= spec_k + 1; a++) fprintf(stderr, " %d:%d", a, hist[a]);
             fprintf(stderr, "\n");
             double hz = tick_hz();
+            fprintf(stderr, "q38d: norm_mt worker0 us/call-set: sum=%.3f cbar1=%.3f quant=%.3f cbar2=%.3f ms/pass\n",
+                    nm_t[0] / hz * 1e3 / passes, nm_t[1] / hz * 1e3 / passes, nm_t[2] / hz * 1e3 / passes, nm_t[3] / hz * 1e3 / passes);
             fprintf(stderr, "q38d: spec worker0 ms/pass: norm=%.2f proj=%.2f cores=%.2f head=%.2f phase_wait=%.2f mtp=%.2f\n",
                     sp_t[0] / hz * 1e3 / passes, sp_t[1] / hz * 1e3 / passes, sp_t[2] / hz * 1e3 / passes,
                     sp_t[3] / hz * 1e3 / passes, sp_t[4] / hz * 1e3 / passes, sp_t[5] / hz * 1e3 / passes);
@@ -2510,6 +2524,7 @@ int main(int argc, char **argv) {
     if (getenv("Q38D_FFN_A8")) ffn_a8 = atoi(getenv("Q38D_FFN_A8"));
     if (getenv("Q38D_DOWN_A8")) down_a8 = atoi(getenv("Q38D_DOWN_A8"));
     if (getenv("Q38D_G2")) g2_variant = atoi(getenv("Q38D_G2"));
+    if (getenv("Q38D_NORM_PF")) norm_pf = atoi(getenv("Q38D_NORM_PF"));
     if (getenv("Q38D_ATTN_MULTI")) attn_multi = atoi(getenv("Q38D_ATTN_MULTI"));
     if (getenv("Q38D_MT_PLANS")) mt_plans = atoi(getenv("Q38D_MT_PLANS"));
     if (getenv("Q38D_MTP_BATCH")) mtp_batch = atoi(getenv("Q38D_MTP_BATCH"));

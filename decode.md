@@ -225,17 +225,31 @@ tok/s on the same node), all 256/256 equal to the F32 reference:
 | k | tokens/pass | tok/s | speedup |
 | ---: | ---: | ---: | ---: |
 | 1 | 1.88 | 35.4 (v1) | 0.98x |
-| 2 | 2.56 | 40.5 | 1.12x |
-| 3 | 3.05 | **40.9** | **1.14x** |
+| 2 | 2.56 | 43.8 | 1.22x |
+| 3 | 3.05 | **44.7** | **1.24x** |
 
-k = 3, worker-0 ms per verification pass (75 ms, 3.05 tokens): projections
-54.1, drafting 5.3, cores 4.1, barrier waits 4.6, head 3.3, norms 1.7.
-The projections alone are 17.7 ms per accepted token (vs ~23.6 ms per
-token in single-token decode), so with this kernel the ceiling is ~1.35x
-even without any other overhead; 1.5x needs a verification kernel of
-~10 cycles per pair and token (12 now) plus the overheads roughly halved.
+(k = 2, 3 with the decode-interleaved kernels and the FP4 drafter below:
+`Q38D_SPEC=3 Q38D_DRAFT_F4=1 Q38D_DRAFT_V=98304`.) On node c25-3104b,
+where non-speculative decode runs at 38.8 tok/s, this corresponds to ~48
+tok/s.
 
-Rejected here: T-scaled in-projection plans (`Q38D_MT_PLANS=1`, larger
+Steps that got here (k = 3, same node): v1 38.1 -> T-token Q8K head 39.7
+-> 128K-row draft head 40.5 -> parallel/batched drafter 40.9 ->
+decode-interleaved kernels g2j (11.05 cycles per pair and token, L2;
+11.9 streaming; g2p 12.0/12.9) 42.6 -> FP4-requantized drafter
+(`Q38D_DRAFT_F4`: eh_proj, attention q/k/v/o and the draft head requantized
+at load to E2M1 with per-16 E5M3 scales) 44.4 -> 96K-row draft head 44.7.
+
+k = 3, worker-0 ms per verification pass (68 ms, 3.05 tokens): projections
+49.7, cores 4.1, barrier waits 4.5, drafting 3.4, head 3.3, norms 1.8
+(quantization 0.94 of it). The projections alone are 16.3 ms per accepted
+token (vs ~23.6 ms per token in single-token decode): with this kernel the
+ceiling is ~1.45x even with every other cost removed. 1.5x would need a
+verification kernel near the throughput model (~9.75 cycles per pair and
+token vs 11.9 streaming) and most of the 18 ms of other per-pass work gone.
+
+Rejected here: software prefetch of the residual slices in the norms (no
+change), T-scaled in-projection plans (`Q38D_MT_PLANS=1`, larger
 barrier waits), A8 activations for the FFN input or the down input
 (`Q38D_FFN_A8`/`Q38D_DOWN_A8`: first divergence from the F32 reference at
 n = 129, both together at n = 4), so verification must stay A16.
