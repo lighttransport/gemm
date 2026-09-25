@@ -94,8 +94,14 @@ typedef struct {
      * conv weights [4 taps][q,k,v][128] of that head's channels */
     float *conv_hist[NLAYER][NVH], *conv_wl[NLAYER][NVH];
     float *kc[NATTN + 1][NKV], *vc[NATTN + 1][NKV]; /* [NATTN]: MTP layer */
+    /* KV head shared by a group of cpk CMGs: position blocks of KVB spread
+     * over the group's CMG memories (part k holds blocks b % cpk == k,
+     * contiguous); kcp[..][0] == kc when cpk == 1 */
+    float *kcp[NATTN + 1][NKV][NCMG], *vcp[NATTN + 1][NKV][NCMG];
     float *qh[NCMG];        /* [6][256] per CMG */
-    float *apart[NCMG];     /* [12][6][2+256] per CMG */
+    float *apart[NKV][NCMG]; /* KV head, part k: [12 lanes][6][2+256] in CMG memory of the part's lanes */
+    float *ahdr[NKV][NCMG];  /* (max, sum) of those partials, [6][12][2] */
+    float *acpart[NKV][NCMG];/* part k's CMG-level merge: [6][max, sum, 256] */
     float best_val[NT];
     int best_idx[NT];
     int next_token;
@@ -1197,6 +1203,8 @@ static void ssm_head_io(int layer, int h, int pos, const q38d_io *io) {
         conv_silu(L, layer, NGROUP * DS + g * DS, pos, h < NGROUP, k);
         conv_silu(L, layer, 2 * NGROUP * DS + h * DS, pos, 1, v);
     }
+    uint64_t Tc = h ? 0 : ticks();
+    if (!h) ssm_t[2] += Tc - T0;   /* conv part of prep (pass2 slot unused when lazy) */
     l2norm128(q); l2norm128(k);
     const float qs = 1.0f / sqrtf((float)DS);
     for (int i = 0; i < 128; i++) q[i] *= qs;
@@ -1384,54 +1392,102 @@ static void head_rmsnorm_rope(float *v, const float *w, int pos) {
 }
 
 /* Scores s[h][t-t0] = scale * q_h . K[t] for 6 heads, four positions per
- * block with 24 register accumulators (each K row read once for all heads). */
+ * block: a 4-head pass (16 accumulators) and a 2-head pass (8), each reduced
+ * by a uzp/add tree (bit-identical to FADDV, far cheaper on A64FX). Wider
+ * register blocks made fcc spill the accumulators inside the loop. */
+static inline svfloat32_t red2(svfloat32_t a, svfloat32_t b) { return svadd_f32_x(svptrue_b32(), svuzp1_f32(a, b), svuzp2_f32(a, b)); }
 #define QK_ACC(h) svfloat32_t a##h##0 = svdup_n_f32(0), a##h##1 = a##h##0, a##h##2 = a##h##0, a##h##3 = a##h##0
 #define QK_FMA(h) do { svfloat32_t qv = svld1_f32(pf, qh + (h) * HD + 16 * j);                       \
     a##h##0 = svmla_f32_x(pf, a##h##0, qv, k0); a##h##1 = svmla_f32_x(pf, a##h##1, qv, k1);          \
     a##h##2 = svmla_f32_x(pf, a##h##2, qv, k2); a##h##3 = svmla_f32_x(pf, a##h##3, qv, k3); } while (0)
-#define QK_OUT(h) do { sc[(h) * nt + i + 0] = svaddv_f32(pf, a##h##0) * scale; sc[(h) * nt + i + 1] = svaddv_f32(pf, a##h##1) * scale; \
-    sc[(h) * nt + i + 2] = svaddv_f32(pf, a##h##2) * scale; sc[(h) * nt + i + 3] = svaddv_f32(pf, a##h##3) * scale; } while (0)
-static void attn_scores(const float *qh, const float *K, int t0, int t1, float *sc, int nt, float scale) {
+#define QK_K() svfloat32_t k0 = svld1_f32(pf, k + 16 * j), k1 = svld1_f32(pf, k + HD + 16 * j), \
+    k2 = svld1_f32(pf, k + 2 * HD + 16 * j), k3 = svld1_f32(pf, k + 3 * HD + 16 * j)
+/* lane 4h+p: head h, position p */
+static inline svfloat32_t qk_4h(const float *qh, const float *k) {
     const svbool_t pf = svptrue_b32();
+    QK_ACC(0); QK_ACC(1); QK_ACC(2); QK_ACC(3);
+#pragma clang loop unroll(disable)
+    for (int j = 0; j < HD / 16; j++) { QK_K(); QK_FMA(0); QK_FMA(1); QK_FMA(2); QK_FMA(3); }
+    return red2(red2(red2(red2(a00, a01), red2(a02, a03)), red2(red2(a10, a11), red2(a12, a13))),
+                red2(red2(red2(a20, a21), red2(a22, a23)), red2(red2(a30, a31), red2(a32, a33))));
+}
+static inline svfloat32_t qk_2h(const float *qh, const float *k) {
+    const svbool_t pf = svptrue_b32();
+    QK_ACC(0); QK_ACC(1);
+#pragma clang loop unroll(disable)
+    for (int j = 0; j < HD / 16; j++) { QK_K(); QK_FMA(0); QK_FMA(1); }
+    svfloat32_t s = red2(red2(red2(a00, a01), red2(a02, a03)), red2(red2(a10, a11), red2(a12, a13)));
+    return red2(s, s);
+}
+static void attn_scores(const float *qh, const float *K, int t0, int t1, float *sc, int nt, float scale) {
+    const svbool_t pf = svptrue_b32(), p4 = svptrue_pat_b32(SV_VL4);
     int i = 0;
     for (; i + 4 <= nt; i += 4) {
         const float *k = K + (size_t)(t0 + i) * HD;
-        QK_ACC(0); QK_ACC(1); QK_ACC(2); QK_ACC(3); QK_ACC(4); QK_ACC(5);
-        for (int j = 0; j < HD / 16; j++) {
-            svfloat32_t k0 = svld1_f32(pf, k + 16 * j), k1 = svld1_f32(pf, k + HD + 16 * j);
-            svfloat32_t k2 = svld1_f32(pf, k + 2 * HD + 16 * j), k3 = svld1_f32(pf, k + 3 * HD + 16 * j);
-            QK_FMA(0); QK_FMA(1); QK_FMA(2); QK_FMA(3); QK_FMA(4); QK_FMA(5);
-        }
-        QK_OUT(0); QK_OUT(1); QK_OUT(2); QK_OUT(3); QK_OUT(4); QK_OUT(5);
+        svfloat32_t r = svmul_n_f32_x(pf, qk_4h(qh, k), scale);
+        svfloat32_t s = svmul_n_f32_x(pf, qk_2h(qh + 4 * HD, k), scale);
+        svst1_f32(p4, sc + i, r);
+        svst1_f32(p4, sc + nt + i, svext_f32(r, r, 4));
+        svst1_f32(p4, sc + 2 * nt + i, svext_f32(r, r, 8));
+        svst1_f32(p4, sc + 3 * nt + i, svext_f32(r, r, 12));
+        svst1_f32(p4, sc + 4 * nt + i, s);
+        svst1_f32(p4, sc + 5 * nt + i, svext_f32(s, s, 4));
     }
     for (; i < nt; i++)
         for (int h = 0; h < 6; h++) sc[h * nt + i] = dot(qh + h * HD, K + (size_t)(t0 + i) * HD, HD) * scale;
 }
-/* o[256] = sum_t p[t-t0] V[t], sixteen register accumulators. */
-#define PV_ACC(j) svfloat32_t o##j = svdup_n_f32(0)
-#define PV_FMA(j) o##j = svmla_f32_x(pf, o##j, svld1_f32(pf, v + 16 * (j)), pv)
-#define PV_ST(j) svst1_f32(pf, out + 16 * (j), o##j)
-static void attn_pv(const float *V, int t0, int t1, const float *p, float *out) {
+/* out_h[256] = sum_t p_h[t-t0] V[t] for 6 heads (p_h = p + h*nt, out_h =
+ * out + h*ostride): passes of 2 heads x 128 dims, 16 accumulators. */
+static void attn_pv6(const float *V, int t0, int t1, const float *p, int nt, float *out, int ostride) {
     const svbool_t pf = svptrue_b32();
-    PV_ACC(0); PV_ACC(1); PV_ACC(2); PV_ACC(3); PV_ACC(4); PV_ACC(5); PV_ACC(6); PV_ACC(7);
-    PV_ACC(8); PV_ACC(9); PV_ACC(10); PV_ACC(11); PV_ACC(12); PV_ACC(13); PV_ACC(14); PV_ACC(15);
-    for (int t = t0; t < t1; t++) {
-        const float *v = V + (size_t)t * HD;
-        svfloat32_t pv = svdup_n_f32(p[t - t0]);
-        PV_FMA(0); PV_FMA(1); PV_FMA(2); PV_FMA(3); PV_FMA(4); PV_FMA(5); PV_FMA(6); PV_FMA(7);
-        PV_FMA(8); PV_FMA(9); PV_FMA(10); PV_FMA(11); PV_FMA(12); PV_FMA(13); PV_FMA(14); PV_FMA(15);
-    }
-    PV_ST(0); PV_ST(1); PV_ST(2); PV_ST(3); PV_ST(4); PV_ST(5); PV_ST(6); PV_ST(7);
-    PV_ST(8); PV_ST(9); PV_ST(10); PV_ST(11); PV_ST(12); PV_ST(13); PV_ST(14); PV_ST(15);
+    for (int hg = 0; hg < 6; hg += 2)
+        for (int d0 = 0; d0 < HD; d0 += 128) {
+            SV8(x); SV8(y);
+#define PZ(j) x##j = svdup_n_f32(0); y##j = x##j
+            SV8_EACH(PZ);
+#undef PZ
+            const float *pa = p + hg * nt - t0, *pb = pa + nt;
+            const float *v = V + (size_t)t0 * HD + d0;
+#pragma clang loop unroll(disable)
+            for (int t = t0; t < t1; t++, v += HD) {
+                svfloat32_t wa = svdup_n_f32(pa[t]), wb = svdup_n_f32(pb[t]);
+#define PF2(j) { svfloat32_t v_ = svld1_f32(pf, v + 16 * j); x##j = svmla_f32_x(pf, x##j, v_, wa); y##j = svmla_f32_x(pf, y##j, v_, wb); }
+                SV8_EACH(PF2);
+#undef PF2
+            }
+            float *oa = out + (size_t)hg * ostride + d0, *ob = oa + ostride;
+#define PST(j) svst1_f32(pf, oa + 16 * j, x##j); svst1_f32(pf, ob + 16 * j, y##j)
+            SV8_EACH(PST);
+#undef PST
+        }
 }
 
 static double att_t[4];
+static double att_lane[NT][4];
+static int att_qpf = 1, att_merge2 = 0;   /* two-level merge: no gain (extra global barrier) */
+/* (max, sum) of lane i's partial of head hh; lanes of one part contiguous */
+#define AHDR(c, i, hh) (E.ahdr[c][(i) / PER] + ((size_t)(hh) * PER + (i) % PER) * 2)   /* per worker: prep+bar1 wait excluded: scores, bar2 wait, merge */
 static void attention_io(int layer, int tid, int pos, int *csense, const q38d_io *io);
 static void attention(int layer, int tid, int pos, int *csense) { attention_io(layer, tid, pos, csense, io_single()); }
 /* The rank's local KV head kv runs on a group of CPK = 4 / (KV heads per
  * rank) CMGs (1 on one node, 2 for TP2, 4 for TP4): lane lw of GW = CPK*12
  * splits the positions; groups wider than a CMG sync with global barriers. */
 static int *gsense_ptr[NT];
+#define KVB 16
+#define APART(c, i) (E.apart[c][(i) / PER] + (size_t)((i) % PER) * 6 * (2 + HD))
+static int kv_cpk(void) { return 4 / (NKV / tp_n); }
+/* position t -> (part, local index) */
+static inline void kv_map(int t, int cpk, int *k, int *u) { int b = t / KVB; *k = b % cpk; *u = (b / cpk) * KVB + t % KVB; }
+/* positions t < n held by part k */
+static inline int kv_count(int n, int cpk, int k) {
+    int nb = n / KVB, r = n % KVB;
+    return (nb / cpk + (k < nb % cpk)) * KVB + (nb % cpk == k ? r : 0);
+}
+/* local range of lane lw (part lw / PER, lane lw % PER) */
+static inline void kv_lane(int n, int cpk, int lw, int *u0, int *u1) {
+    int k = lw / PER, j = lw % PER, nk = kv_count(n, cpk, k);
+    *u0 = (int)((int64_t)nk * j / PER); *u1 = (int)((int64_t)nk * (j + 1) / PER);
+}
 static inline void attn_group(int tid, int *kv, int *lw, int *gw) {
     int cpk = 4 / (NKV / tp_n), c = tid / PER;
     *kv = c / cpk; *lw = (c % cpk) * PER + tid % PER; *gw = cpk * PER;
@@ -1452,26 +1508,32 @@ static void attention_io(int layer, int tid, int pos, int *csense, const q38d_io
         float kv[HD];
         memcpy(kv, io->kb + c * HD, sizeof kv);
         head_rmsnorm_rope(kv, L->k_norm, pos);
-        memcpy(E.kc[ai][c] + (size_t)pos * HD, kv, sizeof kv);
-        memcpy(E.vc[ai][c] + (size_t)pos * HD, io->vb + c * HD, HD * sizeof(float));
+        int pk, pu;
+        kv_map(pos, GW / PER, &pk, &pu);
+        memcpy(E.kcp[ai][c][pk] + (size_t)pu * HD, kv, sizeof kv);
+        memcpy(E.vcp[ai][c][pk] + (size_t)pu * HD, io->vb + c * HD, HD * sizeof(float));
     }
     uint64_t T1 = tid ? 0 : ticks();
     ATT_BAR();
-    uint64_t T2 = tid ? 0 : ticks();
-    int n = pos + 1, t0 = (int)((int64_t)n * l / GW), t1 = (int)((int64_t)n * (l + 1) / GW);
+    uint64_t T2 = ticks();
+    int n = pos + 1, t0, t1;
+    kv_lane(n, GW / PER, l, &t0, &t1);
     const float scale = 1.0f / 16.0f;
     const svbool_t pf = svptrue_b32();
-    float *part = E.apart[c] + (size_t)l * 6 * (2 + HD);
-    const float *K = E.kc[ai][c], *V = E.vc[ai][c];
+    float *part = APART(c, l);
+    const float *K = E.kcp[ai][c][l / PER], *V = E.vcp[ai][c][l / PER];
     int nt = t1 - t0;
     float sc[6 * (nt > 0 ? nt : 1)];
     if (nt <= 0) {
         for (int hh = 0; hh < 6; hh++) {
             float *pp = part + hh * (2 + HD);
             pp[0] = -INFINITY; pp[1] = 0; memset(pp + 2, 0, HD * 4);
+            AHDR(c, l, hh)[0] = -INFINITY; AHDR(c, l, hh)[1] = 0;
         }
     } else {
+        if (att_qpf) for (int o = 0; o < 6 * HD * 4; o += 256) __builtin_prefetch((const char *)qh + o);
         attn_scores(qh, K, t0, t1, sc, nt, scale);
+        att_lane[tid][3] += ticks() - T2;
         for (int hh = 0; hh < 6; hh++) {
             float *s_h = sc + hh * nt, *pp = part + hh * (2 + HD);
             float m = -INFINITY;
@@ -1484,28 +1546,86 @@ static void attention_io(int layer, int tid, int pos, int *csense, const q38d_io
                 lsv = svadd_f32_m(pg, lsv, e);
             }
             pp[0] = m; pp[1] = svaddv_f32(pf, lsv);
-            attn_pv(V, t0, t1, s_h, pp + 2);
+            AHDR(c, l, hh)[0] = m; AHDR(c, l, hh)[1] = pp[1];
         }
+        attn_pv6(V, t0, t1, sc, nt, part + 2, 2 + HD);
     }
-    uint64_t T3 = tid ? 0 : ticks();
-    ATT_BAR();
-    if (!tid) { uint64_t T4 = ticks(); att_t[0] += T1 - T0; att_t[1] += T2 - T1; att_t[2] += T3 - T2; att_t[3] += T4 - T3; }
+    uint64_t T3 = ticks();
+    if (wide && att_merge2) cbarrier(tid, csense);
+    else ATT_BAR();
+    uint64_t T4 = ticks();
+    if (!tid) { att_t[0] += T1 - T0; att_t[1] += T2 - T1; att_t[2] += T3 - T2; att_t[3] += T4 - T3; }
+    att_lane[tid][0] += T3 - T2; att_lane[tid][1] += T4 - T3;
+    if (wide && att_merge2) {
+        /* two-level merge: each CMG part folds its 12 lanes (local lines),
+         * then every task folds the cpk part results */
+        const int k = l / PER, j = l % PER, cpk = GW / PER;
+        float *cp = E.acpart[c][k];
+        for (int task = j; task < 6 * (HD / 32); task += PER) {
+            int hh = task / (HD / 32), ch = task % (HD / 32);
+            const size_t hs = (size_t)hh * (2 + HD);
+            const float *hd = AHDR(c, k * PER, hh);
+            float M = -INFINITY;
+            for (int i = 0; i < PER; i++) if (hd[2 * i] > M) M = hd[2 * i];
+            svfloat32_t o0 = svdup_n_f32(0), o1 = o0;
+            float den = 0;
+            for (int i = 0; i < PER; i++) {
+                if (hd[2 * i + 1] == 0) continue;
+                const float *pp = APART(c, k * PER + i) + hs + 2 + 32 * ch;
+                float w = q38d_expf(hd[2 * i] - M);
+                den += w * hd[2 * i + 1];
+                o0 = svmla_n_f32_x(pf, o0, svld1_f32(pf, pp), w);
+                o1 = svmla_n_f32_x(pf, o1, svld1_f32(pf, pp + 16), w);
+            }
+            svst1_f32(pf, cp + hs + 2 + 32 * ch, o0);
+            svst1_f32(pf, cp + hs + 2 + 32 * ch + 16, o1);
+            if (ch == 0) { cp[hs] = M; cp[hs + 1] = den; }
+        }
+        gbarrier(tid, gsense_ptr[tid]);
+        for (int task = l; task < 6 * (HD / 32); task += GW) {
+            int hh = task / (HD / 32), ch = task % (HD / 32), hq = 6 * c + hh;
+            const size_t hs = (size_t)hh * (2 + HD);
+            float M = -INFINITY;
+            for (int q = 0; q < cpk; q++) if (E.acpart[c][q][hs] > M) M = E.acpart[c][q][hs];
+            svfloat32_t o0 = svdup_n_f32(0), o1 = o0;
+            float den = 0;
+            for (int q = 0; q < cpk; q++) {
+                const float *pp = E.acpart[c][q] + hs;
+                if (pp[1] == 0) continue;
+                float w = q38d_expf(pp[0] - M);
+                den += w * pp[1];
+                o0 = svmla_n_f32_x(pf, o0, svld1_f32(pf, pp + 2 + 32 * ch), w);
+                o1 = svmla_n_f32_x(pf, o1, svld1_f32(pf, pp + 2 + 32 * ch + 16), w);
+            }
+            const float *gate = io->qg + (size_t)hq * 2 * HD + HD + 32 * ch;
+            float *dst = io->o + (size_t)hq * HD + 32 * ch;
+            float rden = 1.0f / den;
+            svst1_f32(pf, dst, svmul_f32_x(pf, svmul_n_f32_x(pf, o0, rden), q38d_sigmoid_sve(pf, svld1_f32(pf, gate))));
+            svst1_f32(pf, dst + 16, svmul_f32_x(pf, svmul_n_f32_x(pf, o1, rden), q38d_sigmoid_sve(pf, svld1_f32(pf, gate + 16))));
+            if (E.arith != Q38D_F32) q38d_prepare_range(io->act_o, io->o, hq * 8 + ch, hq * 8 + ch + 1);
+        }
+        att_lane[tid][2] += ticks() - T4;
+        return;
+    }
     /* merge: 48 tasks (6 heads x 8 chunks of 32 dims) over the group's lanes */
     for (int task = l; task < 6 * (HD / 32); task += GW) {
         int hh = task / (HD / 32), ch = task % (HD / 32), hq = 6 * c + hh;
         const size_t hs = (size_t)hh * (2 + HD);
-        float M = -INFINITY;
+        const float *hdp = AHDR(c, 0, hh);   /* single part (GW == PER) unless merge2 is off */
         for (int i = 0; i < GW; i++) {
-            float mi = E.apart[c][(size_t)i * 6 * (2 + HD) + hs];
-            if (mi > M) M = mi;
+            const char *pc = (const char *)(APART(c, i) + hs + 2 + 32 * ch);
+            __builtin_prefetch(pc); __builtin_prefetch(pc + 124);
         }
+        float M = -INFINITY;
+        for (int i = 0; i < GW; i++) { const float *hd = AHDR(c, i, hh); if (hd[0] > M) M = hd[0]; }
+        (void)hdp;
         svfloat32_t o0 = svdup_n_f32(0), o1 = o0;
         float den = 0;
         for (int i = 0; i < GW; i++) {
-            const float *pp = E.apart[c] + (size_t)i * 6 * (2 + HD) + hs;
-            if (pp[1] == 0) continue;
-            float w = q38d_expf(pp[0] - M);
-            den += w * pp[1];
+            const float *pp = APART(c, i) + hs, *hd = AHDR(c, i, hh);
+            if (hd[1] == 0) continue;
+            float w = q38d_expf(hd[0] - M);
+            den += w * hd[1];
             o0 = svmla_n_f32_x(pf, o0, svld1_f32(pf, pp + 2 + 32 * ch), w);
             o1 = svmla_n_f32_x(pf, o1, svld1_f32(pf, pp + 2 + 32 * ch + 16), w);
         }
@@ -1516,6 +1636,7 @@ static void attention_io(int layer, int tid, int pos, int *csense, const q38d_io
         svst1_f32(pf, dst + 16, svmul_f32_x(pf, svmul_n_f32_x(pf, o1, rden), q38d_sigmoid_sve(pf, svld1_f32(pf, gate + 16))));
         if (E.arith != Q38D_F32) q38d_prepare_range(io->act_o, io->o, hq * 8 + ch, hq * 8 + ch + 1);
     }
+    att_lane[tid][2] += ticks() - T4;
 #undef ATT_BAR
 }
 
@@ -1627,10 +1748,11 @@ static void pf_attn_kv(int tid, int layer) {
     const q38d_layer *L = &E.L[layer];
     int c, l, gw, n = pf_pos + 1;
     attn_group(tid, &c, &l, &gw);
-    int t0 = (int)((int64_t)n * l / gw), t1 = (int)((int64_t)n * (l + 1) / gw);
+    int t0, t1;
+    kv_lane(n, gw / PER, l, &t0, &t1);
     if (t1 > t0) {
-        pf_l2(E.kc[L->ai][c] + (size_t)t0 * HD, (size_t)(t1 - t0) * HD * 4);
-        pf_l2(E.vc[L->ai][c] + (size_t)t0 * HD, (size_t)(t1 - t0) * HD * 4);
+        pf_l2(E.kcp[L->ai][c][l / PER] + (size_t)t0 * HD, (size_t)(t1 - t0) * HD * 4);
+        pf_l2(E.vcp[L->ai][c][l / PER] + (size_t)t0 * HD, (size_t)(t1 - t0) * HD * 4);
     }
 }
 
@@ -2351,8 +2473,8 @@ static void attention_mt(int layer, int tid, int pos0, int T, int *cs) {
                 lsv = svadd_f32_m(pg, lsv, ev);
             }
             pp[0] = m; pp[1] = svaddv_f32(pf, lsv);
-            attn_pv(V, t0, b, s_h, pp + 2);
         }
+        attn_pv6(V, t0, b, sc, nt, part + 2, PS);
     }
     cbarrier(tid, cs);
     for (int j = l; j < 6 * T; j += PER) {
@@ -2592,13 +2714,15 @@ static void *worker(void *arg) {
         }
     int c = tid / PER, l = tid % PER;
     if (l == 0) {
-        int cpk = 4 / (NKV / tp_n);
-        for (int ai = 0; c % cpk == 0 && ai < NATTN + mtp_on; ai++) {
-            int kv = c / cpk;   /* local KV head of the CMG group starting here */
-            E.kc[ai][kv] = cmg_alloc((size_t)E.max_seq * HD * 4, c);
-            E.vc[ai][kv] = cmg_alloc((size_t)E.max_seq * HD * 4, c);
-            memset(E.kc[ai][kv], 0, (size_t)E.max_seq * HD * 4);
-            memset(E.vc[ai][kv], 0, (size_t)E.max_seq * HD * 4);
+        int cpk = kv_cpk();
+        for (int ai = 0; ai < NATTN + mtp_on; ai++) {
+            int kv = c / cpk, k = c % cpk;   /* local KV head of this CMG's group; part k of it */
+            size_t np = ((size_t)E.max_seq / (KVB * cpk) + 1) * KVB;
+            E.kcp[ai][kv][k] = cmg_alloc(np * HD * 4, c);
+            E.vcp[ai][kv][k] = cmg_alloc(np * HD * 4, c);
+            memset(E.kcp[ai][kv][k], 0, np * HD * 4);
+            memset(E.vcp[ai][kv][k], 0, np * HD * 4);
+            if (k == 0) { E.kc[ai][kv] = E.kcp[ai][kv][0]; E.vc[ai][kv] = E.vcp[ai][kv][0]; }
         }
         E.qh[c] = aligned_alloc(256, 6 * HD * 4);
         E.xn_c[c] = aligned_alloc(256, EMBD * sizeof(float));
@@ -2609,7 +2733,9 @@ static void *worker(void *arg) {
         ac->sc = aligned_alloc(256, EMBD / 16 * 4 + 256);
         ac->sum = aligned_alloc(256, EMBD / 16 * 4 + 256);
         memset(ac->q, 0, q38d_act_qbytes(EMBD, Q38D_A16));
-        E.apart[c] = aligned_alloc(256, (size_t)NT * 6 * (2 + HD) * 4);
+        E.apart[c / cpk][c % cpk] = cmg_alloc((size_t)PER * 6 * (2 + HD) * 4, c);
+        E.ahdr[c / cpk][c % cpk] = cmg_alloc((size_t)6 * PER * 2 * 4, c);
+        E.acpart[c / cpk][c % cpk] = cmg_alloc((size_t)6 * (2 + HD) * 4, c);
     }
     norm_csense[tid] = &cs;
     gsense_ptr[tid] = &gs;
@@ -2700,6 +2826,7 @@ static void *worker(void *arg) {
         kprof_kernel = kprof_norm = kprof_wait_acc = 0;
         memset(ssm_t, 0, sizeof ssm_t);
         memset(att_t, 0, sizeof att_t);
+        memset(att_lane, 0, sizeof att_lane);
         norm_cbar_t = 0;
     }
     gbarrier(tid, &gs);
@@ -2849,6 +2976,8 @@ int main(int argc, char **argv) {
     if (getenv("Q38D_TP_NOCOMM")) tp_nocomm = atoi(getenv("Q38D_TP_NOCOMM"));
     if (getenv("Q38D_TP_CHECK")) tp_check = atoi(getenv("Q38D_TP_CHECK"));
     if (getenv("Q38D_TP_CMGSL")) tp_cmg_slices = atoi(getenv("Q38D_TP_CMGSL"));
+    if (getenv("Q38D_ATT_QPF")) att_qpf = atoi(getenv("Q38D_ATT_QPF"));
+    if (getenv("Q38D_ATT_MERGE2")) att_merge2 = atoi(getenv("Q38D_ATT_MERGE2"));
     if (getenv("Q38D_SSM_SPLIT")) ssm_split = atoi(getenv("Q38D_SSM_SPLIT"));
     if (getenv("Q38D_SSM_CPF")) ssm_cpf = atoi(getenv("Q38D_SSM_CPF"));
     if (getenv("Q38D_NORM_PF")) norm_pf = atoi(getenv("Q38D_NORM_PF"));
@@ -3040,6 +3169,14 @@ int main(int argc, char **argv) {
     }
     fprintf(stderr, "q38d: ssm_head worker0 us/layer: prep=%.2f pass1=%.2f pass2=%.2f finish=%.2f\n",
             ssm_t[0] / hz * 1e6 / gn / 48, ssm_t[1] / hz * 1e6 / gn / 48, ssm_t[2] / hz * 1e6 / gn / 48, ssm_t[3] / hz * 1e6 / gn / 48);
+    {
+        double a[4] = {0}, m[4] = {0};
+        for (int i = 0; i < NT; i++) for (int j = 0; j < 4; j++) { a[j] += att_lane[i][j]; if (att_lane[i][j] > m[j]) m[j] = att_lane[i][j]; }
+        fprintf(stderr, "q38d: attention lanes us/layer mean/max: qk=%.2f/%.2f\n", a[3] / NT / hz * 1e6 / gn / 16, m[3] / hz * 1e6 / gn / 16);
+        fprintf(stderr, "q38d: attention lanes us/layer mean/max: scores=%.2f/%.2f bar2=%.2f/%.2f merge=%.2f/%.2f\n",
+                a[0] / NT / hz * 1e6 / gn / 16, m[0] / hz * 1e6 / gn / 16, a[1] / NT / hz * 1e6 / gn / 16, m[1] / hz * 1e6 / gn / 16,
+                a[2] / NT / hz * 1e6 / gn / 16, m[2] / hz * 1e6 / gn / 16);
+    }
     fprintf(stderr, "q38d: norm_act cbarrier part worker0 ms/tok=%.3f\n", norm_cbar_t / hz * 1e3 / gn);
     fprintf(stderr, "q38d: attention worker0 us/layer: prep=%.2f cbar1=%.2f scores+pv=%.2f cbar2=%.2f\n",
             att_t[0] / hz * 1e6 / gn / 16, att_t[1] / hz * 1e6 / gn / 16, att_t[2] / hz * 1e6 / gn / 16, att_t[3] / hz * 1e6 / gn / 16);
