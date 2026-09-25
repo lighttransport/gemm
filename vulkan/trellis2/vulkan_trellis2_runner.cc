@@ -14,9 +14,7 @@
  * Include header-only part for type definitions, provide minimal stub
  * for the implementation (shape decoder uses F32/F16 via safetensors,
  * not GGML quantized types). */
-#include "../../common/ggml_dequant.h"
-/* Stub: shape decoder never calls dequant_row with quantized types */
-int dequant_row(uint32_t /*type*/, const void * /*src*/, float * /*dst*/, int /*n*/) { return 0; }
+#include "../../common/ggml_dequant.h" /* implemented in ggml_dequant_impl.c */
 
 #define SPARSE3D_IMPLEMENTATION
 #include "../../common/sparse3d.h"
@@ -2053,7 +2051,7 @@ int vulkan_trellis2_run_shape_decoder(vulkan_trellis2_runner *r,
                                               cur_N, ch, 1);
 
             /* Run C2S on CPU */
-            sp3d_tensor *t_new = t2sd_c2s_forward(t_cpu, &dec->c2s[stage], 4);
+            sp3d_tensor *t_new = t2sd_c2s_forward(t_cpu, &dec->c2s[stage], NULL, 4); /* unguided shape decode */
             sp3d_free(t_cpu);
 
             int new_N = t_new->N;

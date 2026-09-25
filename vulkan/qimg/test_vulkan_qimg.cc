@@ -12,6 +12,8 @@
  */
 
 #include "../../common/ggml_dequant.h"
+/* The only translation unit in this target that uses the scheduler. */
+#define QIMG_SCHEDULER_IMPLEMENTATION
 #include "../../common/qwen_image_scheduler.h"
 #include "vulkan_qimg_runner.h"
 

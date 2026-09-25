@@ -505,6 +505,7 @@ set(TRELLIS2_VK_TARGET test_vulkan_trellis2)
 add_executable(${TRELLIS2_VK_TARGET}
     trellis2/test_vulkan_trellis2.cc
     trellis2/vulkan_trellis2_runner.cc
+    trellis2/ggml_dequant_impl.c
     ${DEPS_DIR}/vulkan-runner.cc
     ${DEPS_DIR}/vkew.cc
 )
