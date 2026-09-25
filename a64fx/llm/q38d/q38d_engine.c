@@ -1884,6 +1884,28 @@ static void phase_end_tp(int tid, int *gs, uint64_t *t, int phase) {
     busy_start[tid] = t1;
     prof_mark(tid, t, phase);
 }
+/* SSM core end under TP: only the HC head lanes of each CMG work in the
+ * core phase (the others only prefetch), so the out-projection waits for
+ * the head lanes' completion flags instead of a global barrier. */
+static int core_flags = 0;   /* no measurable gain at TP4 (89.5 vs 89.2, noise) */
+static q38d_line core_done[NT];
+static int core_seq[NT][64];
+static void phase_end_core(int tid, int *gs, uint64_t *t, int phase, int producer) {
+    if (!(core_flags && tp_n > 1 && HC < PER && !ssm_split)) { phase_end(tid, gs, t, phase); return; }
+    int e = ++core_seq[tid][0];
+    if (producer) atomic_store_explicit(&core_done[tid].v, e, memory_order_release);
+    pf_next(tid, pf_layer[tid], phase);
+    cur_phase[tid] = phase;
+    uint64_t t0 = ticks();
+    if (busy_on) busy_acc[tid][phase] += (double)(t0 - busy_start[tid]);
+    for (int c = 0; c < NCMG; c++)
+        for (int l = 0; l < HC; l++)
+            while (atomic_load_explicit(&core_done[c * PER + l].v, memory_order_acquire) < e) __asm__ volatile("yield" ::: "memory");
+    uint64_t t1 = ticks();
+    if (!tid) kprof_wait_acc += (double)(t1 - t0);
+    busy_start[tid] = t1;
+    prof_mark(tid, t, phase);
+}
 static void tp_reduce(int tid, int *gs, const float *w) {
     if (tp_cmg_slices && tp_nsl == NCMG) cbarrier(tid, norm_csense[tid]);
     else gbarrier(tid, gs);
@@ -1951,7 +1973,7 @@ static void layer_body(int tid, int layer, int pos, int *gs, int *cs, uint64_t *
                 ssm_head_split(layer, ssm_head_of((tid / PER) * PER + hs), pos, l % W, W, (tid / PER) * PER + hs, tid);
             } else if (hh >= 0) ssm_head(layer, hh, pos);
             if (E.arith == Q38D_F32) E.act_o.x = E.o;
-            phase_end(tid, gs, &t, P_SSM_CORE);
+            phase_end_core(tid, gs, &t, P_SSM_CORE, hh >= 0);
             const q38d_act *ao = o_act(tid, cs);
             if (tp_n > 1) { mv(&L->out, ao, E.xpart, 0, tid); tp_reduce(tid, gs, L->post_norm); }
             else {
@@ -3108,6 +3130,7 @@ int main(int argc, char **argv) {
     if (getenv("Q38D_TP_NOCOMM")) tp_nocomm = atoi(getenv("Q38D_TP_NOCOMM"));
     if (getenv("Q38D_TP_CHECK")) tp_check = atoi(getenv("Q38D_TP_CHECK"));
     if (getenv("Q38D_TP_CMGSL")) tp_cmg_slices = atoi(getenv("Q38D_TP_CMGSL"));
+    if (getenv("Q38D_CORE_FLAGS")) core_flags = atoi(getenv("Q38D_CORE_FLAGS"));
     if (getenv("Q38D_TP_FLAGREL")) tp_flagrel = atoi(getenv("Q38D_TP_FLAGREL"));
     if (getenv("Q38D_TP_PNORM")) tp_pnorm = atoi(getenv("Q38D_TP_PNORM"));
     if (getenv("Q38D_OQ_CMG")) oq_cmg = atoi(getenv("Q38D_OQ_CMG"));

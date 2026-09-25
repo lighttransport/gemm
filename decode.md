@@ -215,6 +215,8 @@ Per-phase cost reductions (same job, commits 95021689..0778e83b). All
 | attention partials and (max, sum) headers in the lanes' own CMG memory, q prefetch | TP4 85.9 -> 87.8 tok/s together with the two rows above |
 | core-output quantization: scales/sums staged per producer CMG, each out-proj worker gathers them (0.5 us); quantizing one SSM head's output took 3.2 us of cross-CMG false sharing on the shared scale lines | TP4 ssm_core 0.75 -> 0.65 ms, attn_core -0.05 ms; 87.5 -> 88.9 tok/s (best run) |
 | TP SSM in-proj plan balanced by per-lane dual/single counts | TP2 ssm_in 2.64 -> 2.36 ms, TP4 1.53 -> 1.49 ms |
+| `q38d_prepare_pairs` with uzp-tree max/sum (exact, 2x faster) | norm compute halves; mostly moves into the norm's CMG-barrier wait |
+| release after sliced collectives by four per-slice completion flags instead of a global barrier (every lane of CMG k passed its CMG barrier before slice k started) | TP4 87.5 -> 89.2-89.6 tok/s |
 
 Negative results kept as options: consumer-side per-CMG quantization
 (`Q38D_OQ_CMG=1`: remote reads of freshly written E.o lines, 3.8 us per
@@ -224,14 +226,20 @@ barrier eats the saving), producer-side norm in the collective lane
 the critical path, TP4 77 tok/s; `prepare_unit` is ~150 ns per 16 values,
 bound by horizontal max/sum reductions). SSM state-row prefetch distance
 and early state prefetch: no effect (the SSM sweep is 3.5 us; prep with
-the depthwise conv 3.2 us and the gated norm dominate the rest).
+the depthwise conv 3.2 us and the gated norm dominate the rest). Also
+without gain: producer flags instead of the global barrier at the SSM core
+end (`Q38D_CORE_FLAGS=1`), the epoch global barrier (`Q38D_EPOCH_BAR=1`,
+TP4 86.1).
 
 After the round (TP1 35.4-35.7 tok/s on this node):
 
 | config | tok/s | speedup |
 | --- | ---: | ---: |
-| TP2 | 58.8-58.9 | 1.65x |
-| TP4 | 86.0-88.9 (typ. 87.4) | 2.45x |
+| TP2 | 59.7 | 1.68x |
+| TP4 | 89.2-89.6 | 2.51x |
+
+(job 51917132, TP1 35.1-35.6 on its node 0; job 51912552 before the flag
+release: TP2 58.8-58.9, TP4 86.0-88.9.)
 
 Run-to-run TP4 spread now comes from the row-parallel phases (collective
 latency). TP4 per token (typical run, ms): ssm_in 1.50, ssm_core 0.66,
