@@ -1982,3 +1982,18 @@ image), step-1 prediction MRE against PyTorch:
 The complete alpha-0.5 all-INT8 edit regression passes the 0.25 gate:
 predictions 0.148 and 0.224, trajectory 0.160 and 0.158. The harness's
 all-INT8 edit fails at 0.333. Block 0 is the most sensitive single block.
+
+Held-out prompts (not in the calibration set), 1024x1024, 20 steps. Decoded
+PSNR is against the same prompt, seed and runner in BF16 (`--attention flash`),
+alpha 0.6 (`/mnt/nvme01/models/qimg-21-fast/eval`):
+
+| Prompt | All INT8 | Blocks 0 and 31 in BF16 |
+|---|---:|---:|
+| lighthouse, storm, oil painting | 34.93 dB | 35.60 dB |
+| golden retriever puppy, sunflowers | 28.37 dB | 31.45 dB |
+| isometric bakery illustration | 26.52 dB | 25.75 dB |
+
+Side-by-side review of the lowest-scoring pair (bakery) shows the same
+composition, style and quality. The differences are small detail placements,
+so the metric mostly measures trajectory divergence. Per step, INT8 took
+0.956 s and 1.017 s against 1.903 s for BF16 with all blocks resident.
