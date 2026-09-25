@@ -1862,6 +1862,28 @@ static int tp_prod_act(int tid, const q38d_act **a, float *omul) {
     *omul = 1.0f / sqrtf(ss / EMBD + E.eps);
     return 1;
 }
+/* Release after a sliced collective: lane 0 of CMG k publishes slice k's
+ * completion; every lane of CMG k passed the CMG barrier before that lane
+ * started, so all four flags imply the whole phase is done (the ordering
+ * of a global barrier, without its arrival tree). */
+static int tp_flagrel = 1;
+static q38d_line tp_done[NCMG];
+static int64_t tp_myseq[NT][32];   /* per-worker count of collectives (own line) */
+static inline int tp_flag_ok(void) { return tp_flagrel && tp_cmg_slices && tp_nsl == NCMG; }
+static void phase_end_tp(int tid, int *gs, uint64_t *t, int phase) {
+    if (!tp_flag_ok()) { phase_end(tid, gs, t, phase); return; }
+    pf_next(tid, pf_layer[tid], phase);
+    cur_phase[tid] = phase;
+    uint64_t t0 = ticks();
+    if (busy_on) busy_acc[tid][phase] += (double)(t0 - busy_start[tid]);
+    int e = (int)tp_myseq[tid][0];
+    for (int k = 0; k < NCMG; k++)
+        while (atomic_load_explicit(&tp_done[k].v, memory_order_acquire) < e) __asm__ volatile("yield" ::: "memory");
+    uint64_t t1 = ticks();
+    if (!tid) kprof_wait_acc += (double)(t1 - t0);
+    busy_start[tid] = t1;
+    prof_mark(tid, t, phase);
+}
 static void tp_reduce(int tid, int *gs, const float *w) {
     if (tp_cmg_slices && tp_nsl == NCMG) cbarrier(tid, norm_csense[tid]);
     else gbarrier(tid, gs);
@@ -1875,7 +1897,9 @@ static void tp_reduce(int tid, int *gs, const float *w) {
         tp_ssq[k] = sumsq(E.x + k * n, n);
         if (tp_pnorm && w) tp_produce(k, n, w);
         if (!tid) tp_comm_t += (double)(ticks() - a);
+        if (tp_flag_ok()) atomic_store_explicit(&tp_done[k].v, (int)tp_myseq[tid][0] + 1, memory_order_release);
     }
+    tp_myseq[tid][0]++;
     ssq_valid = 0;
     tp_ssq_ok = 1;
     tp_prod_ok = tp_pnorm && w;
@@ -1937,7 +1961,7 @@ static void layer_body(int tid, int layer, int pos, int *gs, int *cs, uint64_t *
                 if (prod_norm) x_produce(&L->out, tid, L->post_norm);
                 else ssq_publish_rows(&L->out, tid);
             }
-            phase_end(tid, gs, &t, P_SSM_OUT);
+            if (tp_n > 1) phase_end_tp(tid, gs, &t, P_SSM_OUT); else phase_end(tid, gs, &t, P_SSM_OUT);
         } else {
             if (use_plan) run_plan(&plan_att[layer], a, tid, omul);
             else { mv(&L->q, a, E.qg, 0, tid); mv(&L->k, a, E.kb, 0, tid); mv(&L->v, a, E.vb, 0, tid); }
@@ -1955,7 +1979,7 @@ static void layer_body(int tid, int layer, int pos, int *gs, int *cs, uint64_t *
                 if (prod_norm) x_produce(&L->o, tid, L->post_norm);
                 else ssq_publish_rows(&L->o, tid);
             }
-            phase_end(tid, gs, &t, P_ATT_OUT);
+            if (tp_n > 1) phase_end_tp(tid, gs, &t, P_ATT_OUT); else phase_end(tid, gs, &t, P_ATT_OUT);
         }
         if (ffn_a8 && E.arith == Q38D_A16) E.act_c[tid / PER].arith = Q38D_A8;
         if (prod_norm) { int cc = prod_copies > 1 ? tid / PER : 0; a = &E.act_c[cc]; E.act_c[cc].x = E.xn_c[cc]; omul = x_inv(); }
@@ -2015,7 +2039,7 @@ static void layer_body(int tid, int layer, int pos, int *gs, int *cs, uint64_t *
             if (prod_norm) x_produce(&L->down, tid, layer + 1 < NLAYER ? E.L[layer + 1].attn_norm : E.out_norm);
             else ssq_publish_rows(&L->down, tid);
         }
-        phase_end(tid, gs, &t, P_FFN_DOWN);
+        if (tp_n > 1) phase_end_tp(tid, gs, &t, P_FFN_DOWN); else phase_end(tid, gs, &t, P_FFN_DOWN);
     #undef t
 }
 
@@ -3084,6 +3108,7 @@ int main(int argc, char **argv) {
     if (getenv("Q38D_TP_NOCOMM")) tp_nocomm = atoi(getenv("Q38D_TP_NOCOMM"));
     if (getenv("Q38D_TP_CHECK")) tp_check = atoi(getenv("Q38D_TP_CHECK"));
     if (getenv("Q38D_TP_CMGSL")) tp_cmg_slices = atoi(getenv("Q38D_TP_CMGSL"));
+    if (getenv("Q38D_TP_FLAGREL")) tp_flagrel = atoi(getenv("Q38D_TP_FLAGREL"));
     if (getenv("Q38D_TP_PNORM")) tp_pnorm = atoi(getenv("Q38D_TP_PNORM"));
     if (getenv("Q38D_OQ_CMG")) oq_cmg = atoi(getenv("Q38D_OQ_CMG"));
     if (getenv("Q38D_ATT_QPF")) att_qpf = atoi(getenv("Q38D_ATT_QPF"));
