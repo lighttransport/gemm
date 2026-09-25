@@ -13,13 +13,14 @@ import json
 import mimetypes
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 ROOT = Path(__file__).resolve().parents[2]
 WEB = ROOT / "web"
@@ -45,6 +46,135 @@ SIZE_LIMIT_TILED = 4096
 # the driver. Everything left at None lets the driver choose.
 TILE_DEFAULTS = {"tile_overlap": 8, "vae_tile_overlap": 8, "vae_tile_bleed": 2}
 MAX_BODY = 32 * 1024
+# A job's progress is polled rather than streamed, so a client can attach late
+# or drop off without leaving a thread behind. Steps are returned from a cursor
+# because a long run would otherwise resend its whole history several times a
+# second.
+PROGRESS_TTL = 900.0
+MAX_EVENTS = 4096
+
+# Which pipeline stage a subprocess is, from the driver's "+ <command>" line.
+# The order matters: the text encoder is also invoked for the condition image.
+STAGE_PATTERNS = (
+    ("test_cuda_qimg21_vae_encode", "encode condition image"),
+    ("test_cuda_qimg21_vision", "encode condition image"),
+    ("test_cuda_qimg21_text", "encode prompt"),
+    ("make_native_fixture.py", "sample noise"),
+    ("test_cuda_qimg21_fast", "denoise"),
+    ("test_cuda_qimg21_native", "denoise"),
+    ("test_hip_qimg21_native", "denoise"),
+    ("test_cuda_qimg21_vae", "decode"),
+    ("test_hip_qimg21_vae", "decode"),
+    ("reference.py", "PyTorch reference"),
+)
+
+
+class Progress:
+    """Turns a pipeline log into stage and step events with timings.
+
+    Everything here is a projection of what the runners already print, so the
+    numbers are the runners' own: a step's duration is the denoiser's measured
+    device time, not a difference of poll timestamps. The accumulated figure is
+    the sum of the step times the denoiser reported, which is the number worth
+    showing -- wall clock includes weight streaming and is tracked separately.
+    """
+
+    STEP = re.compile(r"^fast: step (\d+)/(\d+) sigma=([0-9.]+)(?: ([0-9.]+) ms)?$")
+    LAYER = re.compile(r"^text: layer (\d+)/(\d+)\b")
+    TILE = re.compile(r"^fast: tile (\d+)/(\d+)\b")
+    DECODE = re.compile(r"^qimg21-vae: tile (\d+)/(\d+)\b")
+    STAGE_DONE = re.compile(r"^\s+\(([^:]+): ([0-9.]+) s\)\s*$")
+    PLAN = re.compile(r"^fast: plan (.+)$")
+    REFINE = re.compile(r"^fast: tiled refine (.+)$")
+    PASS = re.compile(r"^(base pass|refine pass|refine tile|decoding .+)$")
+
+    def __init__(self, started: float):
+        self.started = started
+        self.stage: str | None = None
+        self.stage_started = started
+        self.accum_ms = 0.0          # measured denoiser step time so far
+        self.stage_steps = 0
+        self.total_steps = 0
+        self.notes: list[str] = []
+        self.done = False
+
+    def feed(self, line: str, now: float) -> dict | None:
+        """One log line in, at most one event out."""
+        line = line.rstrip("\n")
+        if line.startswith("+ "):
+            self.stage = _stage_name(line)
+            self.stage_started = now
+            return {"kind": "stage", "stage": self.stage, "command": line[2:].split(" ")[0].rsplit("/", 1)[-1]}
+        if (match := self.STAGE_DONE.match(line)):
+            return {"kind": "stage_done", "stage": match.group(1),
+                    "seconds": float(match.group(2)), "elapsed_ms": (now - self.started) * 1000.0}
+        if (match := self.STEP.match(line)):
+            index, total, sigma = int(match.group(1)), int(match.group(2)), float(match.group(3))
+            ms = float(match.group(4)) if match.group(4) else None
+            if ms is not None:
+                self.accum_ms += ms
+            self.stage_steps += 1
+            self.total_steps += 1
+            return {"kind": "step", "stage": self.stage, "index": index, "total": total,
+                    "sigma": sigma, "ms": ms, "accum_ms": self.accum_ms,
+                    "elapsed_ms": (now - self.started) * 1000.0}
+        if (match := self.LAYER.match(line)):
+            return {"kind": "layer", "stage": self.stage, "index": int(match.group(1)),
+                    "total": int(match.group(2))}
+        if (match := self.TILE.match(line)):
+            return {"kind": "tile", "stage": self.stage, "index": int(match.group(1)),
+                    "total": int(match.group(2)),
+                    "elapsed_ms": (now - self.started) * 1000.0}
+        if (match := self.DECODE.match(line)):
+            return {"kind": "tile", "stage": "decode", "index": int(match.group(1)),
+                    "total": int(match.group(2)),
+                    "elapsed_ms": (now - self.started) * 1000.0}
+        for pattern, kind in ((self.PLAN, "plan"), (self.REFINE, "plan"), (self.PASS, "plan")):
+            if match := pattern.match(line):
+                if len(self.notes) < 12:
+                    self.notes.append(line)
+                return {"kind": kind, "text": line}
+        return None
+
+    def finish(self) -> None:
+        self.done = True
+
+
+def _stage_name(command_line: str) -> str:
+    for needle, name in STAGE_PATTERNS:
+        if needle in command_line:
+            return name
+    return "pipeline"
+
+
+def _tail(log: Path, progress, stop: threading.Event, interval: float = 0.15) -> None:
+    """Forward newly written log lines until `stop`, never splitting a line."""
+    offset = 0
+    pending = ""
+    while not stop.is_set():
+        try:
+            with log.open("r", encoding="utf-8", errors="replace") as stream:
+                stream.seek(offset)
+                chunk = stream.read()
+                offset = stream.tell()
+        except OSError:
+            chunk = ""
+        if chunk:
+            pending += chunk
+            *lines, pending = pending.split("\n")
+            for line in lines:
+                progress(line)
+        stop.wait(interval)
+    # One last pass so the tail of the log is not dropped.
+    try:
+        with log.open("r", encoding="utf-8", errors="replace") as stream:
+            stream.seek(offset)
+            chunk = stream.read()
+    except OSError:
+        chunk = ""
+    for line in (pending + chunk).split("\n"):
+        if line.strip():
+            progress(line)
 
 
 class Demo:
@@ -68,6 +198,9 @@ class Demo:
                               for kind, path in (fast_packages or DEFAULT_FAST_PACKAGES).items()}
         self.host, self.port = host, port
         self.lock = threading.Lock()
+        # job id -> {"progress": Progress, "events": [...], "started": t}
+        self.jobs: dict[str, dict] = {}
+        self.jobs_lock = threading.Lock()
 
     def preset_available(self, preset: str) -> bool:
         kind = FAST_PRESETS[preset]
@@ -210,6 +343,9 @@ class Demo:
                 "mode": mode, "backend": backend,
                 "width": width, "height": height, "steps": steps, "seed": seed,
                 "quantized": quantized, "preset": preset,
+                # Per-step timings come from the fast runner's own CUDA events,
+                # so this is a hint it can only honour with a preset selected.
+                "profile_steps": bool(request.get("profile_steps")) and preset is not None,
                 "upscale": upscale, "base_steps": base_steps, "tile_tokens": tile_tokens,
                 "tile_overlap": tile_overlap, "refine_strength": refine_strength,
                 "refine_seed": refine_seed, "vae_tile": vae_tile,
@@ -217,15 +353,34 @@ class Demo:
 
 
     def _run(self, command: list[str], cwd: Path, log: Path,
-             env: dict[str, str] | None = None) -> None:
-        with log.open("w", encoding="utf-8") as stream:
-            result = subprocess.run(command, cwd=cwd, stdout=stream, stderr=subprocess.STDOUT,
-                                    timeout=3600, check=False, env=env)
-        if result.returncode:
-            tail = log.read_text(encoding="utf-8", errors="replace")[-4000:]
-            raise RuntimeError(f"inference exited with {result.returncode}: {tail}")
+             env: dict[str, str] | None = None, progress=None) -> None:
+        """Run one child, streaming its output lines to `progress` as it goes.
 
-    def _native(self, cfg: dict, out: Path) -> tuple[Path, Path]:
+        The child already writes everything to `log`, so progress is read back
+        from that file rather than through a pipe: the driver and the denoiser
+        interleave their own stderr with the child's, and a second channel would
+        lose the ordering that makes the log readable. A tail thread advances a
+        byte offset, so a partial line never surfaces twice.
+        """
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with log.open("w", encoding="utf-8") as stream:
+            process = subprocess.Popen(command, cwd=cwd, stdout=stream, stderr=subprocess.STDOUT, env=env)
+            if progress:
+                stop = threading.Event()
+                reader = threading.Thread(target=_tail, args=(log, progress, stop), daemon=True)
+                reader.start()
+                try:
+                    code = process.wait()
+                finally:
+                    stop.set()
+                    reader.join(timeout=5.0)
+            else:
+                code = process.wait()
+        if code:
+            tail = log.read_text(encoding="utf-8", errors="replace")[-4000:]
+            raise RuntimeError(f"inference exited with {code}: {tail}")
+
+    def _native(self, cfg: dict, out: Path, progress=None) -> tuple[Path, Path]:
         backend = cfg["backend"]
         python = self.python if backend == "cuda" else self.python_rocm
         if backend == "rocm" and not python.is_file():
@@ -257,6 +412,8 @@ class Demo:
             command[at:at + 8] = ["--native-bin", str(self.fast), "--runner", "fast", "--preset", preset]
             if kind:
                 command += ["--quant-package", str(self.fast_packages[kind])]
+            if cfg["profile_steps"]:
+                command += ["--profile-steps"]
         if native_vae:
             command.insert(command.index("--native-bin"), "--native-vae")
         if cfg["negative_prompt"]:
@@ -290,7 +447,7 @@ class Demo:
         env = os.environ.copy()
         env["QIMG21_PYTHON"] = str(python)
         log = out / f"{backend}.log"
-        self._run(command, ROOT, log, env=env)
+        self._run(command, ROOT, log, env=env, progress=progress)
         return image, log
 
     @staticmethod
@@ -309,7 +466,7 @@ class Demo:
             return []
         return [line for line in lines if line.startswith(wanted)][-12:]
 
-    def _reference(self, cfg: dict, out: Path) -> Path:
+    def _reference(self, cfg: dict, out: Path, progress=None) -> Path:
         backend = cfg["backend"]
         python = self.python if backend == "cuda" else self.python_rocm
         image = out / "reference" / f"{backend}.png"
@@ -320,7 +477,7 @@ class Demo:
                    "--dump-dir", str(image.parent)]
         if cfg["negative_prompt"]:
             command += ["--negative-prompt", cfg["negative_prompt"], "--true-cfg-scale", "4.0"]
-        self._run(command, ROOT, out / f"reference-{backend}.log")
+        self._run(command, ROOT, out / f"reference-{backend}.log", progress=progress)
         return image
 
     @staticmethod
@@ -328,27 +485,102 @@ class Demo:
         mime = mimetypes.guess_type(path.name)[0] or "image/png"
         return f"data:{mime};base64," + base64.b64encode(path.read_bytes()).decode("ascii")
 
-    def generate(self, request: dict, progress=None) -> dict:
+    def generate(self, request: dict, job_id: str | None = None) -> dict:
         cfg = self._validate(request)
         job = self.work / uuid.uuid4().hex
         job.mkdir(parents=True, exist_ok=False)
         started = time.monotonic()
         results: dict = {"request": cfg, "job": job.name}
-        with self.lock:
-            if cfg["mode"] in {"native", "compare"}:
-                backend = cfg["backend"]
-                if progress: progress(f"Qwen {backend.upper()} native", 12)
-                path, log = self._native(cfg, job)
-                if progress: progress(f"Qwen {backend.upper()} native complete", 72 if cfg["mode"] == "compare" else 96)
-                results[backend] = {"image": self._data_url(path), "log": self._summary(log)}
-            if cfg["mode"] in {"reference", "compare"}:
-                if progress: progress(f"Qwen {cfg['backend'].upper()} PyTorch reference", 78)
-                path = self._reference(cfg, job)
-                if progress: progress("Qwen PyTorch reference complete", 96)
-                results["reference"] = {"image": self._data_url(path)}
+
+        # A client that supplies an id can attach to the run; one that does not
+        # just waits for the response, so progress is strictly additive.
+        if job_id:
+            self._begin(job_id, started)
+        try:
+            with self.lock:
+                if cfg["mode"] in {"native", "compare"}:
+                    backend = cfg["backend"]
+                    self._say(job_id, f"Qwen {backend.upper()} native")
+                    path, log = self._native(cfg, job, self._progress(job_id))
+                    self._say(job_id, f"Qwen {backend.upper()} native complete")
+                    results[backend] = {"image": self._data_url(path), "log": self._summary(log)}
+                if cfg["mode"] in {"reference", "compare"}:
+                    self._say(job_id, "Qwen PyTorch reference")
+                    path = self._reference(cfg, job, self._progress(job_id))
+                    self._say(job_id, "Qwen PyTorch reference complete")
+                    results["reference"] = {"image": self._data_url(path)}
+        finally:
+            self._end(job_id)
         results["elapsed_ms"] = round((time.monotonic() - started) * 1000)
         return results
 
+    # ---- progress registry ----
+
+    def _begin(self, job_id: str, started: float) -> None:
+        with self.jobs_lock:
+            now = time.monotonic()
+            for stale in [key for key, value in self.jobs.items() if now - value["started"] > PROGRESS_TTL]:
+                del self.jobs[stale]
+            self.jobs[job_id] = {"progress": Progress(started), "events": [],
+                                 "base": 0, "started": now}
+
+    def _end(self, job_id: str | None) -> None:
+        if not job_id:
+            return
+        with self.jobs_lock:
+            record = self.jobs.get(job_id)
+            if record:
+                record["progress"].finish()
+
+    def _say(self, job_id: str | None, message: str) -> None:
+        """A message with no log line behind it, for the driver's own phases."""
+        if job_id:
+            self._record(job_id, {"kind": "message", "text": message})
+
+    def _record(self, job_id: str, event: dict) -> None:
+        with self.jobs_lock:
+            record = self.jobs.get(job_id)
+            if not record:
+                return
+            record["events"].append(event)
+            if len(record["events"]) > MAX_EVENTS:
+                # Drop from the front, but count what went: the cursor is
+                # absolute, so a client that has not polled yet still resumes
+                # from the right place instead of re-reading shifted events.
+                drop = len(record["events"]) - MAX_EVENTS
+                del record["events"][:drop]
+                record["base"] += drop
+
+    def _progress(self, job_id: str):
+        """A line sink bound to one job, carrying the wall clock with it."""
+        def sink(line: str) -> None:
+            with self.jobs_lock:
+                record = self.jobs.get(job_id)
+                tracker = record["progress"] if record else None
+            if tracker is None:
+                return
+            event = tracker.feed(line, time.monotonic())
+            if event:
+                self._record(job_id, event)
+        return sink
+
+    def progress_state(self, job_id: str, since: int = 0) -> dict | None:
+        """The events after `since`, plus the totals a client needs to render
+        a header without keeping the whole history."""
+        with self.jobs_lock:
+            record = self.jobs.get(job_id)
+            if not record:
+                return None
+            tracker = record["progress"]
+            # `base` events were trimmed before the client got to them, so a
+            # cursor older than that resumes at the oldest one still held.
+            events = record["events"][max(0, since - record["base"]):]
+            cursor = record["base"] + len(record["events"])
+            snapshot = {"cursor": cursor, "stage": tracker.stage, "done": tracker.done,
+                        "accum_ms": tracker.accum_ms, "total_steps": tracker.total_steps,
+                        "elapsed_ms": (time.monotonic() - record["started"]) * 1000.0,
+                        "notes": list(tracker.notes), "events": events}
+        return snapshot
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "qwen-image21-demo/1.0"
@@ -358,9 +590,30 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status); self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
 
+    def _progress(self, parsed) -> None:
+        """Answer a poll. Bad input is a 400, not a dropped connection: a
+        polling client that gets nothing back cannot tell a typo from a dead
+        server, and would keep retrying a request that can never work."""
+        demo: Demo = self.server.demo  # type: ignore[attr-defined]
+        query = parse_qs(parsed.query)
+        job = (query.get("job") or [""])[0]
+        if not job or len(job) > 64 or not all(c.isalnum() or c in "-_" for c in job):
+            return self._json(400, {"ok": False,
+                                    "error": "job must be 1--64 characters of [A-Za-z0-9_-]"})
+        try:
+            since = int((query.get("since") or ["0"])[0])
+        except ValueError:
+            return self._json(400, {"ok": False, "error": "since must be an integer"})
+        state = demo.progress_state(job, max(0, since))
+        self._json(200 if state else 404,
+                   state if state else {"ok": False, "error": "unknown or expired job"})
+
     def do_GET(self) -> None:
         demo: Demo = self.server.demo  # type: ignore[attr-defined]
-        path = urlparse(self.path).path
+        parsed = urlparse(self.path)
+        path = parsed.path
+        if path == "/api/progress":
+            return self._progress(parsed)
         if path == "/api/health":
             components = {backend: {name: item.is_file()
                                     for name, item in demo.native_components(backend).items()}
@@ -389,7 +642,12 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0"))
             if length <= 0 or length > MAX_BODY: raise ValueError("request body is too large")
             request = json.loads(self.rfile.read(length))
-            result = self.server.demo.generate(request)  # type: ignore[attr-defined]
+            job_id = request.get("job") if isinstance(request, dict) else None
+            if job_id is not None and (not isinstance(job_id, str) or not job_id
+                                       or len(job_id) > 64
+                                       or not all(c.isalnum() or c in "-_" for c in job_id)):
+                raise ValueError("job must be 1--64 characters of [A-Za-z0-9_-]")
+            result = self.server.demo.generate(request, job_id)  # type: ignore[attr-defined]
             self._json(200, {"ok": True, **result})
         except (ValueError, json.JSONDecodeError) as exc:
             self._json(400, {"ok": False, "error": str(exc)})

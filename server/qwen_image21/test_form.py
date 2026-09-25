@@ -85,8 +85,13 @@ class QwenImage21FormLogicTest(unittest.TestCase):
             self.assertIn(field + ":", body, f"{field} is missing from the request payload")
         # The decode overlap and bleed are only accepted alongside an explicit
         # decode tile, so the form has to withhold them when the tile is blank.
-        self.assertIn("$('vae_tile').value.trim()?num('vae_tile_overlap'):null", body)
-        self.assertIn("$('vae_tile').value.trim()?num('vae_tile_bleed'):null", body)
+        for field in ("vae_tile_overlap", "vae_tile_bleed"):
+            self.assertIn(f"$('vae_tile').value.trim() ? num('{field}') : null", body)
+        # Progress is opt-in from the page: it needs a job to attach to and the
+        # runner's per-step timing, which is what --profile-steps asks for.
+        self.assertIn("job, profile_steps: true", body)
+        self.assertIn("startPolling(job, 250)", body)
+        self.assertIn("stopPolling()", body)
 
     def test_the_form_has_a_control_for_each_setting(self):
         markup = PAGE.read_text(encoding="utf-8")
@@ -94,6 +99,39 @@ class QwenImage21FormLogicTest(unittest.TestCase):
                         "tile_tokens", "tile_overlap", "vae_tile",
                         "vae_tile_overlap", "vae_tile_bleed"):
             self.assertRegex(markup, rf'id="{control}"', f"no form control named {control}")
+
+    def test_the_progress_table_renders_a_step_row(self):
+        """One real event must produce a row with the step, its own time and the
+        running total; the display never invents a duration the runner did not
+        report."""
+        body = script()
+        i = body.index("const fmtMs=")
+        j = body.index("// The tiled refine needs")
+        program = (
+            "const $=id=>document.getElementById(id);\n"
+            "const ids={};\n"
+            "function mk(){return {value:'',textContent:'',innerHTML:'',hidden:false,style:{},children:[],"
+            "removeChild(c){const i=this.children.indexOf(c);if(i>=0)this.children.splice(i,1)},"
+            "classList:{toggle(){}},addEventListener(){},querySelector(){return mk()},options:[],"
+            "append(c){this.children.push(c)}}}\n"
+            "const document={getElementById:id=>ids[id]||(ids[id]=mk()),createElement:()=>mk()};\n"
+            + body[i:j] +
+            "applyProgress({stage:'denoise',accum_ms:3293.2,total_steps:3,elapsed_ms:13600,events:[\n"
+            "  {kind:'step',stage:'denoise',index:1,total:8,sigma:0.5358,ms:1781.2,accum_ms:1781.2,elapsed_ms:12000},\n"
+            "  {kind:'step',stage:'denoise',index:2,total:8,sigma:0.4,ms:1500.0,accum_ms:3281.2,elapsed_ms:13500},\n"
+            "  {kind:'step',stage:'denoise',index:3,total:8,sigma:0.3,ms:null,accum_ms:3281.2,elapsed_ms:13600}]});\n"
+            "const rows=document.getElementById('psteps').children;\n"
+            "if(rows.length!==3){console.log('FAIL rows',rows.length);process.exit(1)}\n"
+            "if(!/1\\/8/.test(rows[0].innerHTML)||!/1.78 s/.test(rows[0].innerHTML))"
+            "{console.log('FAIL first row',rows[0].innerHTML);process.exit(1)}\n"
+            # The accumulated column is the sum the denoiser reported, formatted.
+            "if(!/3.28 s/.test(rows[1].innerHTML)){console.log('FAIL cum',rows[1].innerHTML);process.exit(1)}\n"
+            # A step with no measured duration shows a placeholder, never a guess.
+            "if(!/--/.test(rows[2].innerHTML)){console.log('FAIL unmeasured',rows[2].innerHTML);process.exit(1)}\n"
+            "console.log('progress row rendering ok');\n")
+        result = run(program)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("progress row rendering ok", result.stdout)
 
     def test_the_run_log_is_rendered_and_escaped(self):
         body = script()

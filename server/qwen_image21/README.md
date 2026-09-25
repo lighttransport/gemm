@@ -28,6 +28,43 @@ packages default to `/mnt/nvme01/models/qimg-21-fast/`; override them with
 `--int8-package` and `--nvfp4-package`. The API field is `preset`, CUDA only,
 and `GET /api/health` reports which presets are available.
 
+## Live progress
+
+While a run is in flight the page shows the pipeline stage, a progress bar and a
+row per denoising step, and it keeps polling until the run finishes.
+
+The per-step duration is the denoiser's **own measured device time**, not a
+wall-clock delta between polls. The page sets `profile_steps`, the server turns
+that into `native_generate.py --profile-steps`, and the fast runner brackets
+each step with a CUDA event and prints it. The `cum` column is the running sum of
+those same measurements, so it agrees with the runner's own closing line
+(`fast: prefill 0.448 s, 8 steps 20.900 s`). The 250 ms poll interval only
+decides how promptly a step appears; it cannot change the numbers. A step the
+runner did not time shows `--` rather than an estimate.
+
+The same feed carries the memory plan, the prompt-encoding layers, and the
+refine and decode tiles, so a slow stage is attributable to a stage rather than
+just "it is taking a while".
+
+Two endpoints, both optional. A client that does not send `job` behaves exactly
+as before and just waits for `POST /api/generate`:
+
+```sh
+curl -s -X POST -H 'content-type: application/json' \
+  -d '{"job":"demo1","backend":"cuda","mode":"native","prompt":"a red lantern",
+       "width":1024,"height":1024,"steps":8,"seed":7,"preset":"low8",
+       "profile_steps":true}' http://127.0.0.1:8091/api/generate &
+curl -s 'http://127.0.0.1:8091/api/progress?job=demo1&since=0'
+```
+
+`GET /api/progress?job=<id>&since=<cursor>` returns only the events after
+`cursor` and the new `cursor`, so polling is incremental. Records are kept for
+`PROGRESS_TTL` after a run and an unknown `job` is a 404.
+
+`profile_steps` needs a fast CUDA preset: the parity harness has no `--profile`,
+and `native_generate.py` refuses the combination rather than silently reporting
+nothing. It costs a per-step sync, about 1.4% on `low8`.
+
 ## High resolution and tiled refinement
 
 The form has a **High resolution** section that drives the coarse-to-fine path
@@ -91,7 +128,9 @@ server/qwen_image21/run.sh \
   --native-rocm rdna4/qimg21/test_hip_qimg21_native
 ```
 
-The API accepts `backend=cuda|rocm` and `mode=native|reference|compare`, plus
+The API accepts `backend=cuda|rocm` and `mode=native|reference|compare`, an
+optional `job` id to attach to progress, `profile_steps` for per-step timings,
+plus
 the tiling fields above (`upscale`, `base_steps`, `tile_tokens`,
 `tile_overlap`, `refine_strength`, `refine_seed`, `vae_tile`,
 `vae_tile_overlap`, `vae_tile_bleed`). Blank or null means "let the
@@ -108,7 +147,7 @@ server/qwen_image21/run.sh \
 ```
 
 The browser is at `http://127.0.0.1:8091/`; the JSON endpoints are
-`GET /api/health` and `POST /api/generate`.
+`GET /api/health`, `POST /api/generate` and `GET /api/progress`.
 
 Tests:
 
@@ -116,8 +155,9 @@ Tests:
 python3 -m pytest server/qwen_image21 -q
 ```
 
-`test_app.py` covers the routing, the preset selection and the validation of
-every tiling field. `test_form.py` extracts the page's inline script and runs it
+`test_app.py` covers the routing, the preset selection, the validation of
+every tiling field and the progress parser. `test_form.py` extracts the page's inline script and runs it
 under `node` against a DOM stub, so a mistyped identifier or a size cap
 computed from the wrong branch is caught here rather than surfacing as a broken
-page; it skips if `node` is not installed.
+page, including the progress table's row rendering; it skips if `node` is not
+installed.
