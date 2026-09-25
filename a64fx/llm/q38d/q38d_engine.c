@@ -222,12 +222,17 @@ static void pin_cpu(int cpu) {
 }
 
 /* CMG-local anonymous allocation; the caller must first-touch from that CMG. */
+/* A touched 128 KiB tail keeps the kernels' prefetches past the end of a
+ * weight part on mapped pages (a prefetch to a never-touched page costs a
+ * fruitless page walk: the last worker of every part was ~20% slower). */
+#define CMG_ALLOC_TAIL (128u << 10)
 static void *cmg_alloc(size_t bytes, int cmg) {
-    size_t n = (bytes + (2u << 20) - 1) & ~(size_t)((2u << 20) - 1);
+    size_t n = (bytes + CMG_ALLOC_TAIL + (2u << 20) - 1) & ~(size_t)((2u << 20) - 1);
     void *p = mmap(NULL, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (p == MAP_FAILED) { perror("mmap"); exit(1); }
     unsigned long node = 1ul << (4 + cmg);
     if (syscall(SYS_mbind, p, n, 2 /*MPOL_BIND*/, &node, 64ul, 0ul)) perror("mbind");
+    memset((char *)p + bytes, 0, CMG_ALLOC_TAIL);
     return p;
 }
 
@@ -1663,7 +1668,7 @@ static void tp_reduce(int tid, int *gs) {
     tp_ssq_ok = 1;
 }
 /* experiment: A8 activations for the FFN gate/up input / down input */
-static int ffn_a8, down_a8;
+static int ffn_a8, down_a8, ffn_rev;
 static void layer_body(int tid, int layer, int pos, int *gs, int *cs, uint64_t *tp) {
 #define t (*tp)
         if (ffn_a8 && E.arith == Q38D_A16) E.act_c[tid / PER].arith = Q38D_A16;
@@ -1724,7 +1729,8 @@ static void layer_body(int tid, int layer, int pos, int *gs, int *cs, uint64_t *
             /* 8-row group partition (+-1 group); a 16-row activation unit
              * split between two workers is quantized by whichever finishes
              * second (per-unit counter parity, no reset needed). */
-            int G8 = rows / 8, g0 = G8 * l / PER, g1 = G8 * (l + 1) / PER;
+            int lr = ffn_rev ? PER - 1 - l : l;   /* experiment: reversed lane order */
+            int G8 = rows / 8, g0 = G8 * lr / PER, g1 = G8 * (lr + 1) / PER;
             if (!ffn_group_split) { int units = rows / 16; g0 = 2 * (units * l / PER); g1 = 2 * (units * (l + 1) / PER); }
             if (g0 < g1) {
                 int base = L->gate.first[c];
@@ -2814,6 +2820,7 @@ int main(int argc, char **argv) {
     if (getenv("Q38D_FFN_A8")) ffn_a8 = atoi(getenv("Q38D_FFN_A8"));
     if (getenv("Q38D_DOWN_A8")) down_a8 = atoi(getenv("Q38D_DOWN_A8"));
     if (getenv("Q38D_G2")) g2_variant = atoi(getenv("Q38D_G2"));
+    if (getenv("Q38D_FFN_REV")) ffn_rev = atoi(getenv("Q38D_FFN_REV"));
     if (getenv("Q38D_TP_CHECK")) tp_check = atoi(getenv("Q38D_TP_CHECK"));
     if (getenv("Q38D_TP_CMGSL")) tp_cmg_slices = atoi(getenv("Q38D_TP_CMGSL"));
     if (getenv("Q38D_SSM_SPLIT")) ssm_split = atoi(getenv("Q38D_SSM_SPLIT"));

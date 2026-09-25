@@ -107,10 +107,62 @@ typedef struct {
 } q38d_ar;
 static q38d_ar tp_ar[Q38D_TP_NSL];
 static int tp_ar_mine = 1;   /* Q38D_TP_AR=0: use the tp_allreduce.h collective */
-static size_t q38d_ar_send_off(const q38d_ar *a, int gen, int st) { return ((size_t)gen * 2 + st) * a->pay; }
-static size_t q38d_ar_recv_off(const q38d_ar *a, int gen, int st) { return ((size_t)4 + gen * 2 + st) * a->pay; }
-static size_t q38d_ar_trl_off(const q38d_ar *a, int gen, int st) { return (size_t)8 * a->pay + ((size_t)gen * 2 + st) * 256; }
-static size_t q38d_ar_tsrc_off(const q38d_ar *a, int gen, int st) { return (size_t)8 * a->pay + 1024 + ((size_t)gen * 2 + st) * 256; }
+/* 4 slots per parity: RD step st, or all-to-all source rank */
+static size_t q38d_ar_send_off(const q38d_ar *a, int gen, int st) { return ((size_t)gen * 4 + st) * a->pay; }
+static size_t q38d_ar_recv_off(const q38d_ar *a, int gen, int st) { return ((size_t)8 + gen * 4 + st) * a->pay; }
+static size_t q38d_ar_trl_off(const q38d_ar *a, int gen, int st) { return (size_t)16 * a->pay + ((size_t)gen * 4 + st) * 256; }
+static size_t q38d_ar_tsrc_off(const q38d_ar *a, int gen, int st) { return (size_t)16 * a->pay + 2048 + ((size_t)gen * 4 + st) * 256; }
+static int tp_a2a = 0;   /* Q38D_TP_A2A: one-round all-to-all for 4 ranks (slower than RD here) */
+static void q38d_ar_put(q38d_ar *a, int peer, utofu_stadd_t src, utofu_stadd_t dst, size_t len, unsigned long flags);
+/* one round: my partial to every peer's slot [my rank], then fold all
+ * partials in rank order (identical expression on every rank) */
+static void q38d_ar_sum_a2a(q38d_ar *a, float *buf) {
+    uint64_t tok = ++a->seq;
+    int gen = (int)(tok & 1), n = a->count;
+    size_t pb = (size_t)n * sizeof(float);
+    char *sb = a->reg + q38d_ar_send_off(a, gen, 0);
+    memcpy(sb, buf, pb);
+    *(volatile uint64_t *)(a->reg + q38d_ar_tsrc_off(a, gen, 0)) = tok;
+    for (int d = 1; d < tp_n; d++) {
+        int peer = (tp_r + d) % tp_n;
+        q38d_ar_put(a, peer, a->base + q38d_ar_send_off(a, gen, 0), a->pbase[peer] + q38d_ar_recv_off(a, gen, tp_r), pb, 0);
+        q38d_ar_put(a, peer, a->base + q38d_ar_tsrc_off(a, gen, 0), a->pbase[peer] + q38d_ar_trl_off(a, gen, tp_r), 8,
+                    UTOFU_ONESIDED_FLAG_STRONG_ORDER);
+    }
+    const float *src[Q38D_TP_MAXN];
+    for (int r = 0; r < tp_n; r++) {
+        if (r == tp_r) { src[r] = (const float *)sb; continue; }
+        volatile uint64_t *trl = (volatile uint64_t *)(a->reg + q38d_ar_trl_off(a, gen, r));
+        double t0 = 0;
+        unsigned long spins = 0;
+        while (*trl < tok) {
+            tp_ar_flag_inval(trl);
+            if ((++spins & 0xFFFFF) == 0) {
+                if (!t0) t0 = tp_ar_now();
+                else if (tp_ar_now() - t0 > 60) tp_fatal("a2a collective timeout", r);
+            }
+        }
+        const char *rb = a->reg + q38d_ar_recv_off(a, gen, r);
+        for (size_t o = 0; o < pb; o += 256) __asm__ __volatile__("dc civac, %0" :: "r"(rb + o) : "memory");
+        src[r] = (const float *)rb;
+    }
+    __asm__ __volatile__("dsb sy" ::: "memory");
+    const svbool_t pf = svptrue_b32();
+    for (int i = 0; i < n; i += 16) {
+        svfloat32_t acc = svadd_f32_x(pf, svld1_f32(pf, src[0] + i), svld1_f32(pf, src[1] + i));
+        for (int r = 2; r < tp_n; r++) acc = svadd_f32_x(pf, acc, svld1_f32(pf, src[r] + i));
+        svst1_f32(pf, buf + i, acc);
+    }
+    void *cb;
+    int done = 0, rc;
+    while (done < 2 * (tp_n - 1)) {
+        rc = utofu_poll_tcq(a->vcq, 0, &cb);
+        if (rc == UTOFU_SUCCESS) done++;
+        else if (rc != UTOFU_ERR_NOT_FOUND) tp_fatal("a2a poll_tcq", rc);
+    }
+    struct utofu_mrq_notice nt;
+    while (utofu_poll_mrq(a->vcq, 0, &nt) == UTOFU_SUCCESS) {}
+}
 static void q38d_ar_put(q38d_ar *a, int peer, utofu_stadd_t src, utofu_stadd_t dst, size_t len, unsigned long flags) {
     void *cb;
     int rc;
@@ -194,6 +246,7 @@ static void q38d_tp_init(int n, int max_count) {
     utofu_tni_id_t tni = tnis[DEMO_TNI_INDEX];
     if (getenv("Q38D_TP_SLICES")) tp_nsl = atoi(getenv("Q38D_TP_SLICES"));
     if (getenv("Q38D_TP_AR")) tp_ar_mine = atoi(getenv("Q38D_TP_AR"));
+    if (getenv("Q38D_TP_A2A")) tp_a2a = atoi(getenv("Q38D_TP_A2A"));
     if (tp_nsl < 1 || tp_nsl > Q38D_TP_NSL || (size_t)tp_nsl + 1 > ntni) tp_nsl = 1;
     utofu_tni_id_t stni[Q38D_TP_NSL];
     for (int k = 0; k < tp_nsl; k++) stni[k] = tnis[1 + k];
@@ -255,7 +308,7 @@ static void q38d_tp_init(int n, int max_count) {
         a->count = cnt_k;
         a->nr = n == 4 ? 2 : 1;
         a->pay = ((size_t)cnt_k * sizeof(float) + 255) & ~(size_t)255;
-        size_t rbytes = 8 * a->pay + 8 * 256;
+        size_t rbytes = 16 * a->pay + 16 * 256;
         a->reg = tp_map_node(rbytes, k);
         for (size_t o = 0; o < rbytes; o += 256) __asm__ __volatile__("dc civac, %0" :: "r"(a->reg + o) : "memory");
         __asm__ __volatile__("dsb sy" ::: "memory");
@@ -285,7 +338,8 @@ static void q38d_tp_sum_add(float *part, float *residual, int count) {
 }
 /* slice k of the vector (called by the slice's own thread) */
 static void q38d_tp_sum_add_slice(int k, float *part, float *residual, int count) {
-    if (tp_ar_mine) q38d_ar_sum(&tp_ar[k], part);
+    if (tp_ar_mine && tp_a2a && tp_n > 2) q38d_ar_sum_a2a(&tp_ar[k], part);
+    else if (tp_ar_mine) q38d_ar_sum(&tp_ar[k], part);
     else tp_allreduce_sum(&tp_sc[k], part, count);
     const svbool_t pf = svptrue_b32();
     for (int i = 0; i < count; i += 16)
