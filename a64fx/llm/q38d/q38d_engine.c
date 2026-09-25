@@ -88,6 +88,9 @@ typedef struct {
     float *x, *qkv, *zb, *ab, *bb, *qg, *kb, *vb, *o, *h, *logits;
     float *xpart;   /* TP: this rank's partial of a row-parallel projection */
     q38d_act act_o, act_h, act_x[NT], act_c[NCMG];
+    q38d_act act_oc[NCMG];  /* per-CMG quantized copy of E.o (oq_cmg 1) */
+    q38d_act act_ov[NCMG];  /* oq_cmg 2: producer views, q shared, sc/sum in CMG k's staging block */
+    q38d_act act_ot[NT];    /* oq_cmg 2: consumer views, q shared, private gathered sc/sum */
     float *xn[NT], *xn_c[NCMG];
     float *conv_state[NLAYER];
     /* per head (worker) CMG-local copies: history [4 slots][q,k,v][128] and
@@ -1126,9 +1129,24 @@ static const q38d_act *norm_act_impl(int tid, const float *w) {
 /* ------------------------------------------------------------------ */
 /* SSM head                                                             */
 
+/* The core phases' output E.o is quantized by each CMG into its own act_oc
+ * at the start of the out-projection instead of by the producers: producer
+ * lanes of different CMGs shared the scale/sum lines (8 heads per line),
+ * and the SSM heads' quantization took 3.2 us of false sharing at TP4. */
+/* oq_cmg 2: producers quantize their own data as before, but write the
+ * scales/sums of pairs [kQ, (k+1)Q) (all produced by CMG k) into a block
+ * of CMG k; each out-proj worker gathers the 4 blocks into private arrays. */
+static int oq_cmg = 2, oQ;
+static double oq_t[NT][2];
+static void o_prepare(const q38d_io *io, int p0, int p1) {
+    if (E.arith == Q38D_F32) return;
+    if (io->act_o) { q38d_prepare_range(io->act_o, io->o, p0, p1); return; }
+    if (oq_cmg != 2) return;
+    for (int p = p0; p < p1; p++) q38d_prepare_range(&E.act_ov[p / oQ], io->o, p, p + 1);
+}
 static q38d_io io_single_v;
 static const q38d_io *io_single(void) {
-    io_single_v = (q38d_io){E.qkv, E.zb, E.ab, E.bb, E.qg, E.kb, E.vb, E.o, &E.act_o, -1};
+    io_single_v = (q38d_io){E.qkv, E.zb, E.ab, E.bb, E.qg, E.kb, E.vb, E.o, oq_cmg ? NULL : &E.act_o, -1};
     return &io_single_v;
 }
 static int conv_local = 1;
@@ -1181,7 +1199,7 @@ static void l2norm128(float *v) {
  * S k, the rank-1 update and S q are column sweeps without reductions. */
 #define SV8(X) svfloat32_t X##0, X##1, X##2, X##3, X##4, X##5, X##6, X##7
 #define SV8_EACH(M) M(0); M(1); M(2); M(3); M(4); M(5); M(6); M(7)
-static double ssm_t[4];
+static double ssm_t[4], ssm_t2[4];
 static int ssm_pf = 0;
 static int ssm_lazy = 1, ssm_rowpf = 8;
 static void ssm_finish(const q38d_layer *L, int h, const float *o, const q38d_io *io);
@@ -1243,6 +1261,7 @@ static void ssm_head_io(int layer, int h, int pos, const q38d_io *io) {
                 svst1_f32(pf, pdd + 16 * j, d_); svst1_f32(pf, o + 16 * j, svmla_n_f32_x(pf, oa##j, d_, kq)); }
         SV8_EACH(LZ2);
         memcpy(pkd, k, DS * sizeof(float));
+        if (!h) ssm_t2[0] += ticks() - T2l;
         ssm_finish(L, h, o, io);
         if (!h) { uint64_t T4 = ticks(); ssm_t[0] += T1 - T0; ssm_t[1] += T2l - T1; ssm_t[3] += T4 - T2l; }
         return;
@@ -1279,13 +1298,16 @@ static void ssm_finish(const q38d_layer *L, int h, const float *o, const q38d_io
     float inv = 1.0f / sqrtf(sumsq(o, DS) / DS + E.eps);
     const float *z = io->zb + ssm_zoff(h);
     float *dst = io->o + (size_t)ssm_oidx(h) * DS;
+    uint64_t Ta = h ? 0 : ticks();
     for (int i = 0; i < DS; i += 16) {
         svfloat32_t zv = svld1_f32(pf, z + i);
         svfloat32_t sz = svmul_f32_x(pf, zv, q38d_sigmoid_sve(pf, zv));
         svfloat32_t ov = svmul_f32_x(pf, svmul_n_f32_x(pf, svld1_f32(pf, o + i), inv), svld1_f32(pf, L->ssm_norm + i));
         svst1_f32(pf, dst + i, svmul_f32_x(pf, ov, sz));
     }
-    if (E.arith != Q38D_F32) q38d_prepare_range(io->act_o, io->o, ssm_oidx(h) * 4, ssm_oidx(h) * 4 + 4);
+    uint64_t Tb = h ? 0 : ticks();
+    o_prepare(io, ssm_oidx(h) * 4, ssm_oidx(h) * 4 + 4);
+    if (!h) { uint64_t Tc = ticks(); ssm_t2[1] += Tb - Ta; ssm_t2[2] += Tc - Tb; }
 }
 /* TP: head h shared by W workers of its CMG; worker w sweeps the key rows
  * [w*128/W, (w+1)*128/W) of the (lazy) state (whole 512-byte rows, so no
@@ -1360,7 +1382,7 @@ static void ssm_head_split(int layer, int h, int pos, int w, int W, int slot, in
         svfloat32_t ov = svmul_f32_x(pf, svmul_n_f32_x(pf, svld1_f32(pf, o + i), inv), svld1_f32(pf, L->ssm_norm + i));
         svst1_f32(pf, dst + i, svmul_f32_x(pf, ov, sz));
     }
-    if (E.arith != Q38D_F32) q38d_prepare_range(&E.act_o, E.o, oi * 4 + c0 / 32, oi * 4 + (c0 + RS) / 32);
+    o_prepare(io_single(), oi * 4 + c0 / 32, oi * 4 + (c0 + RS) / 32);
 }
 static void ssm_prefetch_state(int layer, int h) {
     const char *p = (const char *)ssm_st(layer, h, 0);
@@ -1602,7 +1624,7 @@ static void attention_io(int layer, int tid, int pos, int *csense, const q38d_io
             float rden = 1.0f / den;
             svst1_f32(pf, dst, svmul_f32_x(pf, svmul_n_f32_x(pf, o0, rden), q38d_sigmoid_sve(pf, svld1_f32(pf, gate))));
             svst1_f32(pf, dst + 16, svmul_f32_x(pf, svmul_n_f32_x(pf, o1, rden), q38d_sigmoid_sve(pf, svld1_f32(pf, gate + 16))));
-            if (E.arith != Q38D_F32) q38d_prepare_range(io->act_o, io->o, hq * 8 + ch, hq * 8 + ch + 1);
+            o_prepare(io, hq * 8 + ch, hq * 8 + ch + 1);
         }
         att_lane[tid][2] += ticks() - T4;
         return;
@@ -1634,7 +1656,7 @@ static void attention_io(int layer, int tid, int pos, int *csense, const q38d_io
         float rden = 1.0f / den;
         svst1_f32(pf, dst, svmul_f32_x(pf, svmul_n_f32_x(pf, o0, rden), q38d_sigmoid_sve(pf, svld1_f32(pf, gate))));
         svst1_f32(pf, dst + 16, svmul_f32_x(pf, svmul_n_f32_x(pf, o1, rden), q38d_sigmoid_sve(pf, svld1_f32(pf, gate + 16))));
-        if (E.arith != Q38D_F32) q38d_prepare_range(io->act_o, io->o, hq * 8 + ch, hq * 8 + ch + 1);
+        o_prepare(io, hq * 8 + ch, hq * 8 + ch + 1);
     }
     att_lane[tid][2] += ticks() - T4;
 #undef ATT_BAR
@@ -1799,6 +1821,28 @@ static void tp_reduce(int tid, int *gs) {
     ssq_valid = 0;
     tp_ssq_ok = 1;
 }
+/* out-projection input: E.act_o, or this CMG's act_oc after its lanes
+ * quantized 1/12 of E.o each (CMG barrier) */
+static const q38d_act *o_act(int tid, int *cs) {
+    if (E.arith == Q38D_F32 || !oq_cmg) return &E.act_o;
+    if (oq_cmg == 2) {
+        q38d_act *a = &E.act_ot[tid];
+        uint64_t t0 = ticks();
+        for (int k = 0; k < NCMG; k++) {
+            memcpy(a->sc + 2 * k * oQ, E.act_ov[k].sc + 2 * k * oQ, 2 * oQ * 4);
+            memcpy(a->sum + 2 * k * oQ, E.act_ov[k].sum + 2 * k * oQ, 2 * oQ * 4);
+        }
+        oq_t[tid][0] += ticks() - t0;
+        return a;
+    }
+    int c = tid / PER, l = tid % PER, np = E.act_o.cols / 32;
+    uint64_t a = ticks();
+    q38d_prepare_range(&E.act_oc[c], E.o, np * l / PER, np * (l + 1) / PER);
+    uint64_t b = ticks();
+    cbarrier(tid, cs);
+    oq_t[tid][0] += b - a; oq_t[tid][1] += ticks() - b;
+    return &E.act_oc[c];
+}
 /* experiment: A8 activations for the FFN gate/up input / down input */
 static int ffn_a8, down_a8, ffn_rev;
 static void layer_body(int tid, int layer, int pos, int *gs, int *cs, uint64_t *tp) {
@@ -1825,9 +1869,10 @@ static void layer_body(int tid, int layer, int pos, int *gs, int *cs, uint64_t *
             } else if (hh >= 0) ssm_head(layer, hh, pos);
             if (E.arith == Q38D_F32) E.act_o.x = E.o;
             phase_end(tid, gs, &t, P_SSM_CORE);
-            if (tp_n > 1) { mv(&L->out, &E.act_o, E.xpart, 0, tid); tp_reduce(tid, gs); }
+            const q38d_act *ao = o_act(tid, cs);
+            if (tp_n > 1) { mv(&L->out, ao, E.xpart, 0, tid); tp_reduce(tid, gs); }
             else {
-                mv(&L->out, &E.act_o, E.x, 1, tid);
+                mv(&L->out, ao, E.x, 1, tid);
                 ssq_valid = 1;
                 ssq_split_valid = L->out.kch > 1;
                 if (prod_norm) x_produce(&L->out, tid, L->post_norm);
@@ -1842,9 +1887,10 @@ static void layer_body(int tid, int layer, int pos, int *gs, int *cs, uint64_t *
             attention(layer, tid, pos, cs);
             if (E.arith == Q38D_F32) E.act_o.x = E.o;
             phase_end(tid, gs, &t, P_ATT_CORE);
-            if (tp_n > 1) { mv(&L->o, &E.act_o, E.xpart, 0, tid); tp_reduce(tid, gs); }
+            const q38d_act *ao = o_act(tid, cs);
+            if (tp_n > 1) { mv(&L->o, ao, E.xpart, 0, tid); tp_reduce(tid, gs); }
             else {
-                mv(&L->o, &E.act_o, E.x, 1, tid);
+                mv(&L->o, ao, E.x, 1, tid);
                 ssq_valid = 1;
                 ssq_split_valid = L->o.kch > 1;
                 if (prod_norm) x_produce(&L->o, tid, L->post_norm);
@@ -2825,6 +2871,8 @@ static void *worker(void *arg) {
         memset(E.prof, 0, sizeof E.prof);
         kprof_kernel = kprof_norm = kprof_wait_acc = 0;
         memset(ssm_t, 0, sizeof ssm_t);
+        memset(ssm_t2, 0, sizeof ssm_t2);
+        memset(oq_t, 0, sizeof oq_t);
         memset(att_t, 0, sizeof att_t);
         memset(att_lane, 0, sizeof att_lane);
         norm_cbar_t = 0;
@@ -2976,6 +3024,7 @@ int main(int argc, char **argv) {
     if (getenv("Q38D_TP_NOCOMM")) tp_nocomm = atoi(getenv("Q38D_TP_NOCOMM"));
     if (getenv("Q38D_TP_CHECK")) tp_check = atoi(getenv("Q38D_TP_CHECK"));
     if (getenv("Q38D_TP_CMGSL")) tp_cmg_slices = atoi(getenv("Q38D_TP_CMGSL"));
+    if (getenv("Q38D_OQ_CMG")) oq_cmg = atoi(getenv("Q38D_OQ_CMG"));
     if (getenv("Q38D_ATT_QPF")) att_qpf = atoi(getenv("Q38D_ATT_QPF"));
     if (getenv("Q38D_ATT_MERGE2")) att_merge2 = atoi(getenv("Q38D_ATT_MERGE2"));
     if (getenv("Q38D_SSM_SPLIT")) ssm_split = atoi(getenv("Q38D_SSM_SPLIT"));
@@ -3021,6 +3070,18 @@ int main(int argc, char **argv) {
     E.xpart = aligned_alloc(256, EMBD * 4);
     E.act_o = (q38d_act){DINNER / tp_n, arith, aligned_alloc(256, q38d_act_qbytes(DINNER, Q38D_A16)),
                          aligned_alloc(256, DINNER / 16 * 4), aligned_alloc(256, DINNER / 16 * 4), E.o};
+    oQ = DINNER / tp_n / 32 / NCMG;
+    for (int c = 0; c < NCMG; c++) {
+        E.act_oc[c] = (q38d_act){DINNER / tp_n, arith, cmg_alloc(q38d_act_qbytes(DINNER, Q38D_A16) + 256, c),
+                                 cmg_alloc(DINNER / 16 * 4 + 256, c), cmg_alloc(DINNER / 16 * 4 + 256, c), E.o};
+        float *blk = cmg_alloc(2 * 2 * oQ * 4 + 512, c);   /* sc block, then sum block on its own lines */
+        size_t sb = ((size_t)2 * oQ + 63) / 64 * 64;
+        E.act_ov[c] = (q38d_act){DINNER / tp_n, arith, E.act_o.q, blk - 2 * c * oQ, blk + sb - 2 * c * oQ, E.o};
+        float *pv = cmg_alloc((size_t)PER * 2 * DINNER / 16 * 4 + 256, c);
+        for (int l = 0; l < PER; l++)
+            E.act_ot[c * PER + l] = (q38d_act){DINNER / tp_n, arith, E.act_o.q, pv + (size_t)l * 2 * DINNER / 16,
+                                               pv + (size_t)l * 2 * DINNER / 16 + DINNER / 16, E.o};
+    }
     E.act_h = (q38d_act){NFF / tp_n, arith, aligned_alloc(256, q38d_act_qbytes(NFF, Q38D_A16)),
                          aligned_alloc(256, NFF / 16 * 4), aligned_alloc(256, NFF / 16 * 4), E.h};
     if (down_a8 && arith == Q38D_A16) E.act_h.arith = Q38D_A8;
@@ -3176,6 +3237,14 @@ int main(int argc, char **argv) {
         fprintf(stderr, "q38d: attention lanes us/layer mean/max: scores=%.2f/%.2f bar2=%.2f/%.2f merge=%.2f/%.2f\n",
                 a[0] / NT / hz * 1e6 / gn / 16, m[0] / hz * 1e6 / gn / 16, a[1] / NT / hz * 1e6 / gn / 16, m[1] / hz * 1e6 / gn / 16,
                 a[2] / NT / hz * 1e6 / gn / 16, m[2] / hz * 1e6 / gn / 16);
+    }
+    fprintf(stderr, "q38d: ssm finish parts us/layer: delta+pk=%.2f gatednorm=%.2f prepare=%.2f\n",
+            ssm_t2[0] / hz * 1e6 / gn / 48, ssm_t2[1] / hz * 1e6 / gn / 48, ssm_t2[2] / hz * 1e6 / gn / 48);
+    {
+        double a[2] = {0}, m[2] = {0};
+        for (int i = 0; i < NT; i++) for (int j = 0; j < 2; j++) { a[j] += oq_t[i][j]; if (oq_t[i][j] > m[j]) m[j] = oq_t[i][j]; }
+        fprintf(stderr, "q38d: o_act us/layer mean/max: quant=%.2f/%.2f cbar=%.2f/%.2f\n", a[0] / NT / hz * 1e6 / gn / 64,
+                m[0] / hz * 1e6 / gn / 64, a[1] / NT / hz * 1e6 / gn / 64, m[1] / hz * 1e6 / gn / 64);
     }
     fprintf(stderr, "q38d: norm_act cbarrier part worker0 ms/tok=%.3f\n", norm_cbar_t / hz * 1e3 / gn);
     fprintf(stderr, "q38d: attention worker0 us/layer: prep=%.2f cbar1=%.2f scores+pv=%.2f cbar2=%.2f\n",
