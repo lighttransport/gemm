@@ -107,7 +107,7 @@ typedef struct {
     /* profiling (thread 0) */
     double prof[16];
 } q38d_engine;
-static int mtp_on, draft_v;
+static int mtp_on, draft_v, draft_f4;
 
 /* Per-call buffers of the SSM and attention cores (single-token path: the
  * E.* buffers; verification pass: token i's buffers). SSM state of
@@ -268,14 +268,16 @@ static const float *vec_ptr(int idx, size_t n) {
 }
 
 /* Matrices are described now and repacked by the worker pool. */
-typedef struct { q38d_mat *m; int idx; int kind; /* 0 lowbit in place, 1 raw Q6_K/Q4_K */ } pending;
+typedef struct { q38d_mat *m; int idx; int kind; /* 0 lowbit in place, 1 raw Q6_K/Q4_K, 2 raw -> FP4 */ } pending;
+static int describe_f4;   /* describe raw K-quant matrices as requantized FP4 (drafter) */
+static int describe_rows; /* > 0: use only the first rows of the tensor */
 static pending *todo;
 static int ntodo;
 
 static void describe(q38d_mat *m, int idx) {
     const gguf_tensor_info *t = &G->tensors[idx];
     const q38_lowbit_matrix *lb = q38_lowbit_model_tensor(G, idx);
-    m->rows = (int)t->dims[1]; m->cols = (int)t->dims[0];
+    m->rows = describe_rows > 0 ? describe_rows : (int)t->dims[1]; m->cols = (int)t->dims[0];
     todo = realloc(todo, (size_t)(ntodo + 1) * sizeof(*todo));
     if (lb) {
         m->fmt = lb->format == Q38_LB_NVFP4 ? Q38D_F4 : Q38D_F6;
@@ -283,7 +285,7 @@ static void describe(q38d_mat *m, int idx) {
         for (int c = 0; c < 4; c++) m->part[c] = lb->part[c];
         todo[ntodo++] = (pending){m, idx, 0};
     } else if (t->type == GGML_TYPE_Q6_K || t->type == GGML_TYPE_Q4_K) {
-        m->fmt = t->type == GGML_TYPE_Q6_K ? (q6k_expand ? Q38D_Q8K : Q38D_Q6K) : Q38D_Q4K;
+        m->fmt = describe_f4 ? Q38D_F4 : t->type == GGML_TYPE_Q6_K ? (q6k_expand ? Q38D_Q8K : Q38D_Q6K) : Q38D_Q4K;
         int groups = (m->rows + 7) / 8;
         for (int c = 0; c <= 4; c++) {
             int r = (int)((int64_t)groups * c / 4) * 8;
@@ -293,12 +295,52 @@ static void describe(q38d_mat *m, int idx) {
             int gcount = (m->first[c + 1] - m->first[c] + 7) / 8;
             m->part[c] = gcount ? cmg_alloc((size_t)gcount * q38d_group_bytes(m->fmt, m->cols), c) : NULL;
         }
-        todo[ntodo++] = (pending){m, idx, 1};
+        todo[ntodo++] = (pending){m, idx, describe_f4 ? 2 : 1};
     } else {
         fprintf(stderr, "q38d: %s: unsupported matrix type %u\n", t->name.str, t->type);
         exit(1);
     }
     if (m->cols % 256) { fprintf(stderr, "q38d: %s cols %d not a multiple of 256\n", t->name.str, m->cols); exit(1); }
+}
+
+/* FP4 requantization of up to eight raw K-quant rows (drafter matrices:
+ * E2M1 codes, per-16 E5M3 scale = smallest code >= amax / 6). The kernel's
+ * weight is e2m1(code) * dec(u), dec(u) = (8 + (u & 7)) * 2^((u >> 3) - 20). */
+static uint8_t e5m3_ceil(float s) {
+    if (!(s > 0)) return 0;
+    int e = ilogbf(s) + 17;                      /* s * 2^(20-e) in [8, 16) */
+    int m = (int)ceilf(ldexpf(s, 20 - e)) - 8;
+    if (m >= 8) { m = 0; e++; }
+    if (e < 0) return 1;
+    if (e > 31) { e = 31; m = 7; }
+    return (uint8_t)(e << 3 | m);
+}
+static float e5m3_dec(uint8_t u) { return u ? ldexpf((float)(8 + (u & 7)), (u >> 3) - 20) : 0.f; }
+static void f4_quant_group(uint8_t *dst, const uint8_t *src, size_t rb, int type, int nr, int cols) {
+    static const float mag[8] = {0, 0.5f, 1, 1.5f, 2, 3, 4, 6};
+    size_t np = (size_t)cols / 32;
+    memset(dst, 0, q38d_group_bytes(Q38D_F4, cols));
+    uint8_t *sc = dst + np * 128;
+    float *row = malloc((size_t)cols * sizeof(float));
+    for (int r = 0; r < nr; r++) {
+        dequant_row(type, src + (size_t)r * rb, row, cols);
+        for (int b = 0; b < cols / 16; b++) {
+            const float *v = row + 16 * b;
+            float amax = 0;
+            for (int j = 0; j < 16; j++) amax = fmaxf(amax, fabsf(v[j]));
+            uint8_t u = e5m3_ceil(amax / 6.0f);
+            float d = e5m3_dec(u), inv = d > 0 ? 1.0f / d : 0.f;
+            for (int j = 0; j < 16; j++) {
+                float x = fabsf(v[j]) * inv;
+                int best = 0;
+                for (int k = 1; k < 8; k++) if (fabsf(mag[k] - x) < fabsf(mag[best] - x)) best = k;
+                unsigned code = (unsigned)best | (v[j] < 0 && best ? 8u : 0u);
+                q38d_put_code(dst, Q38D_F4, cols, r, 16 * b + j, code);
+            }
+            sc[(size_t)(b / 2) * 16 + 2 * r + (b & 1)] = u;
+        }
+    }
+    free(row);
 }
 
 /* Repack CMG c's groups of all pending matrices, lane l of 12. */
@@ -320,6 +362,13 @@ static void repack_worker(int c, int l) {
                 memcpy(tmp, dst, gb);
                 if (m->fmt == Q38D_F4) q38d_repack_f4(dst, tmp, m->cols);
                 else q38d_repack_f6(dst, tmp, m->cols);
+            } else if (todo[i].kind == 2) {
+                const gguf_tensor_info *t = &G->tensors[todo[i].idx];
+                size_t rb = (size_t)m->cols / 256 * (t->type == GGML_TYPE_Q6_K ? 210 : 144);
+                const uint8_t *src = (m->src ? m->src : (const uint8_t *)gguf_tensor_data(G, todo[i].idx)) +
+                                     (size_t)(m->first[c] + g * 8) * rb;
+                int nr = rows - g * 8 < 8 ? rows - g * 8 : 8;
+                f4_quant_group(dst, src, rb, t->type, nr, m->cols);
             } else {
                 const gguf_tensor_info *t = &G->tensors[todo[i].idx];
                 size_t rb = (size_t)m->cols / 256 * (t->type == GGML_TYPE_Q6_K ? 210 : 144);
@@ -519,10 +568,12 @@ static void load_engine(void) {
         L->ai = NATTN;
         L->attn_norm = vec_ptr(need_tensor("blk.%d.attn_norm.weight", l), EMBD);
         L->post_norm = vec_ptr(need_tensor("blk.%d.post_attention_norm.weight", l), EMBD);
+        describe_f4 = draft_f4;
         describe(&L->q, need_tensor("blk.%d.attn_q.weight", l));
         describe(&L->k, need_tensor("blk.%d.attn_k.weight", l));
         describe(&L->v, need_tensor("blk.%d.attn_v.weight", l));
         describe(&L->o, need_tensor("blk.%d.attn_output.weight", l));
+        describe_f4 = 0;
         L->o.unit16 = 1;
         L->o.kch = 0;
         load_vec(L->q_norm, need_tensor("blk.%d.attn_q_norm.weight", l), HD);
@@ -534,12 +585,22 @@ static void load_engine(void) {
         L->down.kch = 4;
         if (L->down.cols % (L->down.kch * 256)) L->down.kch = 1;
         if (L->down.kch > 1) L->down.unit16 = 0;
+        describe_f4 = draft_f4;
         describe(&E.eh, need_tensor("blk.%d.nextn.eh_proj.weight", l));
+        describe_f4 = 0;
         E.enorm = vec_ptr(need_tensor("blk.%d.nextn.enorm.weight", l), EMBD);
         E.hnorm = vec_ptr(need_tensor("blk.%d.nextn.hnorm.weight", l), EMBD);
         E.shnorm = vec_ptr(need_tensor("blk.%d.nextn.shared_head_norm.weight", l), EMBD);
     }
     describe(&E.head, need_tensor("output.weight", 0));
+    if (mtp_on && draft_f4) {
+        /* FP4 draft head over the first draft_v vocabulary rows (all if 0) */
+        describe_f4 = 1;
+        describe_rows = draft_v ? draft_v : E.n_vocab;
+        describe(&E.dhead, need_tensor("output.weight", 0));
+        describe_rows = 0;
+        describe_f4 = 0;
+    }
     E.out_norm = vec_ptr(need_tensor("output_norm.weight", 0), EMBD);
     int ei = need_tensor("token_embd.weight", 0);
     E.embed_lb = q38_lowbit_model_tensor(G, ei);
@@ -1548,7 +1609,7 @@ static void mtp_step(int tid, int token, int pos, const float *hidden, int want_
     gbarrier(tid, gs);
     layer_body(tid, NLAYER, pos, gs, cs, &t);
     if (tid == 0) memcpy(E.h_mtp, E.x_mtp, EMBD * sizeof(float));
-    if (want_head) head_argmax_m(tid, E.shnorm, draft_v ? &E.dhead : &E.head, gs, &t);
+    if (want_head) head_argmax_m(tid, E.shnorm, draft_v || draft_f4 ? &E.dhead : &E.head, gs, &t);
     gbarrier(tid, gs);
     if (tid == 0) {
         E.x = save_x;
@@ -2143,7 +2204,7 @@ static void mtp_catchup_mt(int tid, const int *nxt, int pos, int A, int *gs, int
     if (tid == 0) memcpy(E.h_mtp, mtp_xm[A - 1], EMBD * sizeof(float));
     int id = 0;
     float lg = 0;
-    head_token_m(tid, mtp_xm[A - 1], E.shnorm, draft_v ? &E.dhead : &E.head, gs, cs, &id, &lg);
+    head_token_m(tid, mtp_xm[A - 1], E.shnorm, draft_v || draft_f4 ? &E.dhead : &E.head, gs, cs, &id, &lg);
     if (tid == 0) E.mtp_draft = id;
     gbarrier(tid, gs);
 }
@@ -2247,7 +2308,7 @@ static void *worker(void *arg) {
     gbarrier(tid, &gs);
     kchunk_copy_or_write(c, l, 1);
     gbarrier(tid, &gs);
-    if (mtp_on && draft_v) {
+    if (mtp_on && draft_v && !draft_f4) {
         /* draft head: rows [first'[c], first'[c+1]) copied from the head's groups */
         const q38d_mat *h = &E.head;
         size_t gb = q38d_group_bytes(h->fmt, h->cols);
@@ -2452,6 +2513,7 @@ int main(int argc, char **argv) {
     if (getenv("Q38D_ATTN_MULTI")) attn_multi = atoi(getenv("Q38D_ATTN_MULTI"));
     if (getenv("Q38D_MT_PLANS")) mt_plans = atoi(getenv("Q38D_MT_PLANS"));
     if (getenv("Q38D_MTP_BATCH")) mtp_batch = atoi(getenv("Q38D_MTP_BATCH"));
+    if (getenv("Q38D_DRAFT_F4")) draft_f4 = atoi(getenv("Q38D_DRAFT_F4"));
     if (getenv("Q38D_DRAFT_V")) draft_v = atoi(getenv("Q38D_DRAFT_V"));
     if (getenv("Q38D_HEAD_MULTI")) head_multi = atoi(getenv("Q38D_HEAD_MULTI"));
     if (spec_k) {
@@ -2500,7 +2562,7 @@ int main(int argc, char **argv) {
         E.act_mtp = (q38d_act){2 * EMBD, arith, aligned_alloc(256, q38d_act_qbytes(2 * EMBD, Q38D_A16)),
                                aligned_alloc(256, 2 * EMBD / 16 * 4), aligned_alloc(256, 2 * EMBD / 16 * 4), E.mtp_in};
     }
-    if (mtp_on && draft_v) {
+    if (mtp_on && draft_v && !draft_f4) {
         const q38d_mat *h = &E.head;
         if (draft_v % 32 || draft_v > h->rows) { fprintf(stderr, "q38d: Q38D_DRAFT_V must be a multiple of 32 <= %d\n", h->rows); return 1; }
         E.dhead = *h;
