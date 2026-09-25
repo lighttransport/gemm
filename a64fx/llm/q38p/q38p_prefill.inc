@@ -56,7 +56,7 @@ static struct {
     int16_t *wt[NT];          /* per-worker expanded tile */
     double *acc[NT];          /* per-worker fp64 accumulators [g][R][T][8] */
     float *sc[NT];            /* per-worker attention scores */
-    int ntok, pos0;           /* current chunk */
+    int ntok, pos0, ng;       /* current chunk; ng = occupied token groups */
 } PB;
 static _Atomic int pf_ctr[4];
 static int pf_calls[NT][16];   /* per-worker GEMM call count (identical on every worker) */
@@ -257,15 +257,13 @@ static void pf_quant_row(const float *x, int K, int t) {
         float inv = mx > 0 ? 32767.0f / mx : 0.f;
         PB.as[((size_t)kb * PF_NG + g) * PF_T + tt] = mx > 0 ? (double)mx / 32767.0 : 0.0;
         int16_t *dst = PB.aq + (((size_t)kb * PF_NG + g) * PF_STEPS * PF_T + tt) * 4;
+        int16_t tmp[PF_KB] __attribute__((aligned(64)));
         for (int i = 0; i < PF_KB; i += 16) {
             svint32_t qv = svcvt_s32_f32_x(pf, svrintn_f32_x(pf, svmul_n_f32_x(pf, svld1_f32(pf, xb + i), inv)));
-            int32_t tmp[16] __attribute__((aligned(64)));
-            svst1_s32(pf, tmp, qv);
-            for (int j = 0; j < 16; j += 4) {
-                int16_t *d = dst + (size_t)((i + j) / 4) * PF_T * 4;
-                d[0] = (int16_t)tmp[j]; d[1] = (int16_t)tmp[j + 1]; d[2] = (int16_t)tmp[j + 2]; d[3] = (int16_t)tmp[j + 3];
-            }
+            svst1h_s32(pf, tmp + i, qv);
         }
+        const uint64_t *t64 = (const uint64_t *)tmp;
+        for (int st = 0; st < PF_STEPS; st++) *(uint64_t *)(dst + (size_t)st * PF_T * 4) = t64[st];
     }
 }
 /* padded tokens of the last chunk: zero rows */
@@ -283,9 +281,17 @@ static void pf_quant_zero(int K, int t) {
 
 typedef struct { const q38p_mat *P; float *y; int ystride; } pf_job;
 static double pf_t_expand[NT], pf_t_mk[NT];
+static int pf_tail_split = 1;
+/* Work units: whole tiles in full rounds of NT, then the remaining tiles
+ * split into token-group parts so that every worker gets a similar share. */
 static void pf_gemm(int tid, const pf_job *jobs, int nj, int K, int *gs) {
     int total = 0;
     for (int j = 0; j < nj; j++) total += jobs[j].P->ntile;
+    const int ng = PB.ng;
+    int full = pf_tail_split ? total / NT * NT : total, rem = total - full;
+    int S = rem ? (NT + rem - 1) / rem : 1;
+    if (S > ng) S = ng;
+    int units = full + rem * S;
     int ci = pf_calls[tid][0]++;
     _Atomic int *ctr = &pf_ctr[ci & 3];
     if (tid == 0) atomic_store_explicit(&pf_ctr[(ci + 2) & 3], 0, memory_order_relaxed);   /* last used two calls ago */
@@ -293,37 +299,45 @@ static void pf_gemm(int tid, const pf_job *jobs, int nj, int K, int *gs) {
     double *O = PB.acc[tid];
     int16_t *Wt = PB.wt[tid];
     for (;;) {
-        int it = atomic_fetch_add_explicit(ctr, 1, memory_order_relaxed);
-        if (it >= total) break;
+        int u = atomic_fetch_add_explicit(ctr, 1, memory_order_relaxed);
+        if (u >= units) break;
+        int it, g0 = 0, g1 = ng;
+        if (u < full) it = u;
+        else { int v = u - full, part = v % S; it = full + v / S; g0 = ng * part / S; g1 = ng * (part + 1) / S; }
+        if (g1 <= g0) continue;
         int j = 0;
         while (it >= jobs[j].P->ntile) { it -= jobs[j].P->ntile; j++; }
         const q38p_mat *P = jobs[j].P;
-        memset(O, 0, (size_t)PF_NG * PF_R * PF_T * 8 * sizeof(double));
+        const int gn = g1 - g0;
+        memset(O, 0, (size_t)gn * PF_R * PF_T * 8 * sizeof(double));
         for (int kb = 0; kb < nkb; kb++) {
             uint64_t a = ticks();
             const int16_t *W;
             if (P->pre) W = P->pre + ((size_t)it * nkb + kb) * PF_STEPS * PF_R * 32;
             else { pf_expand(P, it, kb, Wt); W = Wt; }
             uint64_t b = ticks();
-            q38p_mk_r4t5(W, PB.aq + (size_t)kb * PF_NG * PF_STEPS * PF_T * 4, PB.as + (size_t)kb * PF_NG * PF_T, O, PF_NG, PF_STEPS);
+            q38p_mk_r4t5(W, PB.aq + ((size_t)kb * PF_NG + g0) * PF_STEPS * PF_T * 4, PB.as + ((size_t)kb * PF_NG + g0) * PF_T, O, gn, PF_STEPS);
             pf_t_expand[tid] += b - a; pf_t_mk[tid] += ticks() - b;
         }
         /* epilogue: O[g][q][tt][r] * rscale -> Y[g*T+tt][row] */
         const q38d_mat *m = P->m;
         int c = P->tile_c[it], nrows = m->first[c + 1] - m->first[c];
-        for (int g = 0; g < PF_NG; g++)
-            for (int tt = 0; tt < PF_T; tt++) {
-                int tok = g * PF_T + tt;
-                if (tok >= PB.ntok) continue;
-                float *yr = jobs[j].y + (size_t)tok * jobs[j].ystride;
-                for (int q = 0; q < PF_R; q++)
-                    for (int r = 0; r < 8; r++) {
-                        int lr = P->tile_r0[it] + q * 8 + r;
-                        if (lr >= nrows) continue;
-                        int row = m->first[c] + lr;
-                        yr[row] = (float)(O[(((size_t)g * PF_R + q) * PF_T + tt) * 8 + r] * P->rscale[row]);
-                    }
-            }
+        const svbool_t pd = svptrue_b64();
+        for (int q = 0; q < PF_R; q++) {
+            int lr = P->tile_r0[it] + q * 8;
+            if (lr >= nrows) break;
+            int row = m->first[c] + lr, nr = nrows - lr < 8 ? nrows - lr : 8;
+            const svbool_t pr = svwhilelt_b64(0, nr);
+            svfloat64_t rs = svcvt_f64_f32_x(pd, svreinterpret_f32_u64(svld1uw_u64(pr, (const uint32_t *)(P->rscale + row))));
+            for (int g = 0; g < gn; g++)
+                for (int tt = 0; tt < PF_T; tt++) {
+                    int tok = (g0 + g) * PF_T + tt;
+                    if (tok >= PB.ntok) break;
+                    svfloat64_t v = svmul_f64_x(pd, svld1_f64(pd, O + (((size_t)g * PF_R + q) * PF_T + tt) * 8), rs);
+                    svst1w_u64(pr, (uint32_t *)(jobs[j].y + (size_t)tok * jobs[j].ystride + row),
+                               svreinterpret_u64_f32(svcvt_f32_f64_x(pd, v)));
+                }
+        }
     }
     gbarrier(tid, gs);
 }
@@ -420,7 +434,7 @@ static void pf_norm_quant(int tid, const float *w, int *gs) {
     uint64_t a = ticks();
     float *tmp = pf_tmp[tid];
     const svbool_t pf = svptrue_b32();
-    for (int t = tid; t < PF_N; t += NT) {
+    for (int t = tid; t < PB.ng * PF_T; t += NT) {
         if (t >= PB.ntok) { pf_quant_zero(EMBD, t); continue; }
         const float *x = PB.x + (size_t)t * EMBD;
         float inv = 1.0f / sqrtf(sumsq(x, EMBD) / EMBD + E.eps);
@@ -433,7 +447,7 @@ static void pf_norm_quant(int tid, const float *w, int *gs) {
 }
 static void pf_quant_rows(int tid, const float *y, int K, int stride, int *gs) {
     uint64_t a = ticks();
-    for (int t = tid; t < PF_N; t += NT) {
+    for (int t = tid; t < PB.ng * PF_T; t += NT) {
         if (t >= PB.ntok) pf_quant_zero(K, t);
         else pf_quant_row(y + (size_t)t * stride, K, t);
     }
@@ -552,7 +566,7 @@ static void pf_layer_run(int tid, int layer, int *gs) {
     {
         uint64_t a = ticks();
         const svbool_t pf = svptrue_b32();
-        for (int t = tid; t < PF_N; t += NT) {
+        for (int t = tid; t < PB.ng * PF_T; t += NT) {
             if (t >= N) { pf_quant_zero(NFF, t); continue; }
             float *g = PB.y0 + (size_t)t * NFF;
             const float *u = PB.y1 + (size_t)t * NFF;
@@ -583,7 +597,7 @@ static void q38p_prefill(int tid, const int *tok, int pn, int *gs) {
     }
     if (tid == 0) { pf_active = 1; memset(pf_t, 0, sizeof pf_t); }
     for (int pos0 = 0; pos0 < pn; pos0 += PF_N) {
-        if (tid == 0) { PB.pos0 = pos0; PB.ntok = pn - pos0 < PF_N ? pn - pos0 : PF_N; }
+        if (tid == 0) { PB.pos0 = pos0; PB.ntok = pn - pos0 < PF_N ? pn - pos0 : PF_N; PB.ng = (PB.ntok + PF_T - 1) / PF_T; }
         gbarrier(tid, gs);
         uint64_t a = ticks();
         for (int t = tid; t < PB.ntok; t += NT)
@@ -609,5 +623,5 @@ static void q38p_report(int pn, double sec) {
     double e = 0, k = 0;
     for (int i = 0; i < NT; i++) { e += pf_t_expand[i]; k += pf_t_mk[i]; }
     fprintf(stderr, "\nq38p: gemm worker-mean s: expand=%.3f kernel=%.3f; kernel MAC rate %.1f%% of int16 peak\n",
-            e / NT / hz, k / NT / hz, 100.0 * (24.350556e9 * pn) / ((k / NT / hz) * 48 * 2e9 * 64));
+            e / NT / hz, k / NT / hz, 100.0 * (24.350556e9 * ((pn + PF_T - 1) / PF_T * PF_T)) / ((k / NT / hz) * 48 * 2e9 * 64));
 }

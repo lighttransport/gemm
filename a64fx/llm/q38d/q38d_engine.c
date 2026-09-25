@@ -3140,6 +3140,7 @@ int main(int argc, char **argv) {
     if (getenv("Q38P")) pf_on = atoi(getenv("Q38P"));
     if (getenv("Q38P_CHUNK")) pf_chunk = atoi(getenv("Q38P_CHUNK"));
     if (getenv("Q38P_TEST")) pf_test = atoi(getenv("Q38P_TEST"));
+    if (getenv("Q38P_TAIL")) pf_tail_split = atoi(getenv("Q38P_TAIL"));
     if (getenv("Q38D_OQ_CMG")) oq_cmg = atoi(getenv("Q38D_OQ_CMG"));
     if (getenv("Q38D_ATT_QPF")) att_qpf = atoi(getenv("Q38D_ATT_QPF"));
     if (getenv("Q38D_ATT_MERGE2")) att_merge2 = atoi(getenv("Q38D_ATT_MERGE2"));
