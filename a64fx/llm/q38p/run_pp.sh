@@ -10,7 +10,7 @@ prompts=${2:-8}
 tokens=${3:-1024}
 chunk=${4:-160}
 decode=${5:-0}
-if (( nodes < 2 || nodes > 12 || prompts < 1 || tokens < 1 || chunk < 5 )); then
+if (( nodes < 2 || nodes > 128 || prompts < 1 || tokens < 1 || chunk < 5 )); then
     echo "invalid pipeline arguments" >&2
     exit 2
 fi

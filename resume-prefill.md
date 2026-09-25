@@ -7,7 +7,9 @@ Code is in `a64fx/llm/q38p/`: `q38p_prefill.inc` is included into
 
 ## Goal (user decisions)
 
-- An optimized prefill that scales over 1-12 A64FX nodes; focus on 12, 6 and 4 nodes.
+- An optimized prefill that scales over 1-128 A64FX nodes (one rank per
+  mixer/FFN unit); near-term configurations are 6, 8, and 12 nodes, with a
+  24-node run to exercise counts above 12.
 - Prefill and decode time-share the same nodes, e.g. 12-node prefill plus 3 TP4 decode groups.
 - The metric is **steady-state prefill throughput** with several prompts in
   flight; single-prompt latency is reported as well.
@@ -22,7 +24,12 @@ Code is in `a64fx/llm/q38p/`: `q38p_prefill.inc` is included into
 | 1 | 250 | 225 |
 | 4 | 1000 | 900 |
 | 6 | 1501 | 1351 |
+| 8 | 2000 | 1800 |
 | 12 | 3001 | 2701 |
+
+- Practical pipeline target: **150 tok/s per node**. That corresponds to
+  900 tok/s on 6 nodes, 1200 on 8, 1800 on 12, and 3600 on 24. The best
+  measured four-node rate is 544.9 tok/s (136.2 per node), below target.
 
 - A different weight layout from decode is allowed as long as everything
   fits in HBM2 (about 28 GB usable per node).
@@ -162,9 +169,9 @@ the fresh F32 reference 256/256 (maximum logit difference 0.5504).
    currently assumes an FP4 model with a Q6_K embedding).
 
 ### Multi-node (Phases 2-4)
-8. Run 6- and 12-node allocations. The stage partition code supports these
-   counts, but this allocation had four nodes. Report steady-state throughput
-   and single-prompt latency.
+8. The launcher and stage partitioner now accept 2-128 nodes. Run the 6-,
+   8-, and 12-node sweep plus the 24-node validation config; report steady
+   throughput against 150 tok/s/node and single-prompt latency.
 9. Replace the working MPI handoff with uTofu Put plus MRQ completion.
    `utofu-tests/pp_handoff_bench.c` measured 3.2 us for a 12 KB hop and
    6.3 GB/s per link. MPI nonblocking sends without a progress thread were
@@ -176,7 +183,7 @@ the fresh F32 reference 256/256 (maximum logit difference 0.5504).
     co-resident TP4 decode groups. Re-shard KV, SSM state and conv history,
     then alternate prefill chunks with decode steps on the same nodes.
 12. Generalize `q38d_tp.h` beyond four ranks for TP collectives if required;
-    the MPI pipeline itself already supports 2–12 stages.
+    the MPI pipeline now supports up to 128 stages.
 
 ## How to build and run (1 node)
 
@@ -215,8 +222,8 @@ Environment switches:
 > Continue with the remaining items:
 > - single-node GEMM gap, kernel epilogue, expansion, SSM, attention and
 >   norm costs, toward 225 tok/s (90% of the 250 tok/s/node int16 bound);
-> - measure the pipeline on 6 and 12 nodes (steady-state targets 1351 and
->   2701 tok/s), then stage-shard weights and replace MPI handoff with uTofu;
+> - measure the 6-, 8-, 12-, and 24-node configurations (150 tok/s/node
+>   target), then stage-shard weights and replace MPI handoff with uTofu;
 > - move the validated rank-0 decode handoff to co-resident TP4 groups.
 >
 > Keep every change 256/256 against the F32 reference and commit each unit.

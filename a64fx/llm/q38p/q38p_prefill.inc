@@ -29,22 +29,24 @@ void q38p_mk_r4t5(const void *W, const void *A, const double *S, double *O, long
 static int pf_on, pf_chunk = 240, pf_test, pp_on;
 static int PF_N, PF_NG;   /* tokens per chunk (multiple of PF_T), groups */
 #ifdef Q38P_MPI
+#define Q38P_MAX_STAGES (2 * NLAYER)
 static int pp_n = 1, pp_r, pp_prompts = 1, pp_u0, pp_u1, pp_bad, pp_decode;
 /* A unit is either the mixer or the FFN of a layer. Cuts may fall between
- * them, which keeps 6- and 12-stage allocations balanced. */
+ * them, which keeps 6-, 8-, 12-, and larger allocations balanced. */
 static void pf_stage_bounds(int n, int rank, int *lo, int *hi) {
     double prefix[2 * NLAYER + 1] = {0};
     for (int u = 0; u < 2 * NLAYER; u++)
         prefix[u + 1] = prefix[u] + ((u & 1) ? 267.4 : (E.L[u / 2].ssm ? 115.8 : 104.9));
-    int cut[13] = {0};
+    /* One rank per mixer/FFN unit is the architectural limit. */
+    int cut[Q38P_MAX_STAGES + 1] = {0};
     for (int s = 1; s < n; s++) {
         double target = prefix[2 * NLAYER] * s / n;
         int best = cut[s - 1] + 1;
-        for (int u = best + 1; u <= 2 * NLAYER - (n - s); u++)
+        for (int u = best + 1; u <= Q38P_MAX_STAGES - (n - s); u++)
             if (fabs(prefix[u] - target) < fabs(prefix[best] - target)) best = u;
         cut[s] = best;
     }
-    cut[n] = 2 * NLAYER;
+    cut[n] = Q38P_MAX_STAGES;
     *lo = cut[rank]; *hi = cut[rank + 1];
 }
 #endif

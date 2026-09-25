@@ -3128,7 +3128,11 @@ int main(int argc, char **argv) {
         pp_on = 1;
         pp_prompts = getenv("Q38P_PP_PROMPTS") ? atoi(getenv("Q38P_PP_PROMPTS")) : 1;
         pp_decode = getenv("Q38P_PP_DECODE") ? atoi(getenv("Q38P_PP_DECODE")) : 0;
-        if (pp_n < 2 || pp_n > 12 || pp_prompts < 1) { fprintf(stderr, "q38p: invalid pipeline nodes/prompts\n"); return 2; }
+        if (pp_n < 2 || pp_n > Q38P_MAX_STAGES || pp_prompts < 1) {
+            fprintf(stderr, "q38p: pipeline nodes must be 2..%d and prompts must be positive\n",
+                    Q38P_MAX_STAGES);
+            return 2;
+        }
         if (fmt != Q38D_F4 || arith != Q38D_A16) { fprintf(stderr, "q38p: pipeline requires --fmt fp4 --act a16\n"); return 2; }
         pf_on = 1;
     }

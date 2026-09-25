@@ -1,6 +1,7 @@
 # Qwen3.8-27B A64FX prefill pipeline
 
-The MPI pipeline assigns contiguous mixer/FFN units to 2–12 nodes. Each
+The MPI pipeline assigns contiguous mixer/FFN units to 2–128 nodes (one rank
+per mixer/FFN unit, the 128-unit maximum). Each
 process uses 48 A64FX workers and keeps the full FP4 decode image resident;
 only its assigned prefill matrix descriptors are built. A stage sends the
 FP32 residual for each prompt chunk to the next stage. Successive prompts
@@ -30,6 +31,30 @@ gathers the final prompt's KV cache and SSM/conv state to rank 0, then runs
 For another prompt length, set `Q38P_REF` to its F32 reference log. Rank logs
 are written under `tmp/q38p/pp_runs/`.
 
+The standard scale sweep uses 8 independent prompts of 1024 tokens and chunk
+160. The per-node target is 150 tok/s, giving targets of 900, 1200, and 1800
+tok/s for 6, 8, and 12 nodes, and 3600 tok/s for 24 nodes. From an allocation
+of at least 12 nodes, run the 6/8/12 configurations with:
+
+```sh
+bash a64fx/llm/q38p/run_pp.sh 6 8 1024 160 1
+bash a64fx/llm/q38p/run_pp.sh 8 8 1024 160 1
+bash a64fx/llm/q38p/run_pp.sh 12 8 1024 160 1
+```
+
+Ranks above 12 use the same command, up to 128 ranks. For example, a
+24-node allocation runs `bash a64fx/llm/q38p/run_pp.sh 24 8 1024 160 1`.
+An allocation must provide at least as many nodes as the first argument.
+The partitioner keeps at least one mixer/FFN unit per rank and balances the
+estimated MAC cost; throughput above 12 nodes still needs measurement.
+
+Submit the bundled scale jobs from the Fugaku frontend:
+
+```sh
+pjsub --no-check-directory a64fx/llm/q38p/pjsub_pp12_v2.sh  # 6, 8, 12
+pjsub --no-check-directory a64fx/llm/q38p/pjsub_pp24.sh      # 24
+```
+
 The MPI build uses `-O2 -mcpu=a64fx` without `-ffp-contract=fast` to retain
 the established decode correctness. An `-O3 -ffp-contract=fast` build on job
 51917132 diverged from F32 at generated token 5 even on one node; the
@@ -58,6 +83,11 @@ time. State transfer and decode follow those timings when `DECODE=1`.
 | 4 | 200 | 526.8 | 502.4 | 2.70 | residual hash stable |
 | 4 | 160 | **544.9** | **521.7** | **2.55** | **256/256** |
 | 4 | 120 | 535.8 | 515.8 | 2.50 | residual hash stable |
+
+After raising the rank limit, a four-node smoke run at chunk 160 measured
+543.3 tok/s steady (135.8 tok/s/node), 520.1 tok/s end-to-end, and matched
+256/256 decode tokens. Six-, eight-, twelve-, and twenty-four-node rates
+remain unmeasured; the 150 tok/s/node figures are targets.
 
 On four nodes at chunk 480, each stage spent about 12.3 s computing eight
 prompts; upstream stages also spent about 4.7 s in blocking sends. Smaller
