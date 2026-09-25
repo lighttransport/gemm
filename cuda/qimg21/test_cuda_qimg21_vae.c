@@ -15,6 +15,7 @@
 #include "../../common/safetensors.h"
 #include "../qimg/cuda_qimg_runner.h"
 
+#include <dlfcn.h>
 #include <errno.h>
 #include <limits.h>
 #include <math.h>
@@ -327,6 +328,23 @@ static CUdeviceptr q21_conv1(cuda_qimg_runner *r, const st_context *st,
  * receives one latent frame, but the residual decoder still performs the
  * temporal shuffle.  Keeping the first frame is exactly what the pipeline
  * does when it later selects [:, :, 0]. */
+/* Device version of the gather below; compiled on first use. */
+static const char *q21_dup_first_src =
+"extern \"C\" __global__ void q21_dup_first(float *out, const float *in, int out_c, int h, int w,\n"
+"                                           int factor_t, int factor_s, int repeats) {\n"
+"    int oh = h * factor_s, ow = w * factor_s;\n"
+"    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (i >= (size_t)out_c * oh * ow) return;\n"
+"    int ox = (int)(i % ow), oy = (int)((i / ow) % oh), oc = (int)(i / ((size_t)ow * oh));\n"
+"    int sy = oy % factor_s, sx = ox % factor_s, iy = oy / factor_s, ix = ox / factor_s;\n"
+"    size_t rep = ((size_t)oc * factor_t + (size_t)(factor_t - 1)) * factor_s * factor_s +\n"
+"                 (size_t)sy * factor_s + sx;\n"
+"    int ic = (int)(rep / (size_t)repeats);\n"
+"    out[i] = in[(size_t)ic * h * w + (size_t)iy * w + ix];\n"
+"}\n";
+static CUmodule q21_dup_module;
+static CUfunction q21_dup_fn;
+
 static CUdeviceptr q21_dup_first(cuda_qimg_runner *r, CUdeviceptr x,
                                  int in_c, int out_c, int h, int w,
                                  int factor_t, int factor_s) {
@@ -334,6 +352,20 @@ static CUdeviceptr q21_dup_first(cuda_qimg_runner *r, CUdeviceptr x,
     int repeats = out_c * factor / in_c;
     size_t in_n = (size_t)in_c * h * w;
     size_t out_n = (size_t)out_c * (h * factor_s) * (w * factor_s);
+    if (!q21_dup_fn && cu_compile_kernels(&q21_dup_module, r->device, q21_dup_first_src, "qimg21_vae_dup.cu", 0,
+                                          "qimg21_vae_dup") >= 0)
+        cuModuleGetFunction(&q21_dup_fn, q21_dup_module, "q21_dup_first");
+    if (q21_dup_fn) {
+        /* Same gather on the device: avoids a device->host->device round trip
+         * of up to 600 MB per upsampler. */
+        CUdeviceptr out = checked_cuMemAlloc(out_n * sizeof(float));
+        void *a[] = {&out, &x, &out_c, &h, &w, &factor_t, &factor_s, &repeats};
+        if (out && cuLaunchKernel(q21_dup_fn, (unsigned)((out_n + 255) / 256), 1, 1, 256, 1, 1, 0, r->stream, a,
+                                  NULL) == CUDA_SUCCESS)
+            return out;
+        q21_free(&out);
+        return 0;
+    }
     float *hin = (float *)malloc(in_n * sizeof(float));
     float *hout = (float *)malloc(out_n * sizeof(float));
     if (!hin || !hout) { free(hin); free(hout); return 0; }
@@ -556,7 +588,7 @@ static int qimg21_vae_decode(cuda_qimg_runner *r, const st_context *st,
 }
 
 int main(int argc, char **argv) {
-    const char *model=NULL,*latent_path=NULL,*out_path=NULL; int h=0,w=0,verbose=1;
+    const char *model=NULL,*latent_path=NULL,*out_path=NULL; int h=0,w=0,verbose=1,conv_cudnn=0;
     for(int i=1;i<argc;i++){
         if(!strcmp(argv[i],"--model")&&i+1<argc)model=argv[++i];
         else if(!strcmp(argv[i],"--latents")&&i+1<argc)latent_path=argv[++i];
@@ -564,7 +596,9 @@ int main(int argc, char **argv) {
         else if(!strcmp(argv[i],"--width-tokens")&&i+1<argc)w=atoi(argv[++i]);
         else if(!strcmp(argv[i],"--out")&&i+1<argc)out_path=argv[++i];
         else if(!strcmp(argv[i],"--quiet"))verbose=0;
-        else {fprintf(stderr,"usage: %s --model VAE_DIR --latents L.npy --height-tokens H --width-tokens W --out OUT.npy\n",argv[0]);return 2;}
+        else if(!strcmp(argv[i],"--conv")&&i+1<argc&&(!strcmp(argv[i+1],"direct")||!strcmp(argv[i+1],"cudnn")))
+            conv_cudnn=!strcmp(argv[++i],"cudnn");
+        else {fprintf(stderr,"usage: %s --model VAE_DIR --latents L.npy --height-tokens H --width-tokens W --out OUT.npy [--conv direct|cudnn]\n",argv[0]);return 2;}
     }
     if(!model||!latent_path||!out_path||h<=0||w<=0)return 2;
     /* All shared kernel element indices are signed 32-bit. The largest
@@ -589,6 +623,17 @@ int main(int argc, char **argv) {
     st_context *st=safetensors_open(st_path); if(!st){q21_npy_free(&a);return 1;}
     cuda_qimg_runner *r=cuda_qimg_init(0,verbose); if(!r){safetensors_close(st);q21_npy_free(&a);return 1;}
     r->use_fp8_pipe=0; r->use_fp8_pipe_perrow=0; /* retain F32 VAE quality */
+    /* --conv cudnn: F32 cuDNN convolutions (FMA math, no FFT/Winograd) in
+     * place of the direct kernel; much faster, not bit-identical to it. */
+    void *cudnn_plugin=NULL;
+    if(conv_cudnn){
+        cudnn_plugin=dlopen("cuda/qimg21/libq21_cudnn_vae.so",RTLD_NOW|RTLD_LOCAL);
+        qimg_vae_f32_conv2d=cudnn_plugin?(qimg_vae_bf16_conv2d_fn)dlsym(cudnn_plugin,"q21_cudnn_conv2d_f32"):NULL;
+        if(!qimg_vae_f32_conv2d){
+            fprintf(stderr,"qimg21-vae: cannot load cuDNN conv from cuda/qimg21/libq21_cudnn_vae.so: %s\n",dlerror());
+            cuda_qimg_free(r);safetensors_close(st);q21_npy_free(&a);return 1;
+        }
+    }
     /* The shared VAE helpers use synchronous default-stream D2D copies for
      * residuals. Keep their kernels on that same stream: a nonblocking
      * stream otherwise races those copies and intermittently loses residuals. */
@@ -600,5 +645,8 @@ int main(int argc, char **argv) {
     cuStreamSynchronize(r->stream);
     r->stream = saved_stream;
     if(!rc) rc=q21_npy_write_chw(out_path,out,(size_t)4*(h*16)*(w*16),4,h*16,w*16);
-    free(out); cuda_qimg_free(r); safetensors_close(st); q21_npy_free(&a); return rc?1:0;
+    free(out); cuda_qimg_free(r); safetensors_close(st); q21_npy_free(&a);
+    /* The plugin keeps its cuDNN handle; leave it loaded until exit. */
+    (void)cudnn_plugin;
+    return rc?1:0;
 }

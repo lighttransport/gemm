@@ -203,4 +203,83 @@ extern "C" int q21_cudnn_vae_conv2d_ex(float *output, const float *input,
     return q21_cudnn_vae_conv2d_impl(output,input,weight,bias,ci,h,w,co,kh,kw,
                                      stride,pad,oh,ow,stream);
 }
+
+/* F32 convolution for the native VAE decoder (--conv cudnn): F32 data with
+ * FMA math (no TF32), zero padding kh/2, bias added in F32. The handle, the
+ * algorithm per shape and a grow-only workspace are cached across calls;
+ * FFT and Winograd algorithms are excluded to keep direct-sum accuracy. */
+__global__ static void f32_add_bias(float *y, const float *bias, int channels, int spatial) {
+    size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;
+    if(i<(size_t)channels*spatial) y[i]+=bias[i/spatial];
+}
+
+namespace {
+struct f32_algo { int ci,h,w,co,kh,kw; cudnnConvolutionFwdAlgo_t algo; size_t workspace; };
+cudnnHandle_t f32_handle;
+f32_algo f32_algos[64];
+int f32_count;
+void *f32_workspace;
+size_t f32_workspace_bytes;
+}
+
+extern "C" int q21_cudnn_conv2d_f32(float *output, const float *input, const float *weight, const float *bias,
+                                    int ci, int h, int w, int co, int kh, int kw, cudaStream_t stream) {
+    if (!output || !input || !weight || ci <= 0 || h <= 0 || w <= 0 || co <= 0 || kh <= 0 || kw <= 0) return 1;
+    cudnnTensorDescriptor_t xd = nullptr, yd = nullptr;
+    cudnnFilterDescriptor_t wd = nullptr;
+    cudnnConvolutionDescriptor_t cd = nullptr;
+    const f32_algo *found = nullptr;
+    float alpha = 1.0f, beta = 0.0f;
+    int rc = 1;
+    if (!f32_handle) CCHK(cudnnCreate(&f32_handle));
+    CCHK(cudnnSetStream(f32_handle, stream));
+    CCHK(cudnnCreateTensorDescriptor(&xd)); CCHK(cudnnCreateTensorDescriptor(&yd));
+    CCHK(cudnnCreateFilterDescriptor(&wd)); CCHK(cudnnCreateConvolutionDescriptor(&cd));
+    CCHK(cudnnSetTensor4dDescriptor(xd, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 1, ci, h, w));
+    CCHK(cudnnSetTensor4dDescriptor(yd, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 1, co, h, w));
+    CCHK(cudnnSetFilter4dDescriptor(wd, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW, co, ci, kh, kw));
+    CCHK(cudnnSetConvolution2dDescriptor(cd, kh / 2, kw / 2, 1, 1, 1, 1, CUDNN_CROSS_CORRELATION, CUDNN_DATA_FLOAT));
+    CCHK(cudnnSetConvolutionMathType(cd, CUDNN_FMA_MATH));
+    for (int i = 0; i < f32_count; i++) {
+        const f32_algo *a = &f32_algos[i];
+        if (a->ci == ci && a->h == h && a->w == w && a->co == co && a->kh == kh && a->kw == kw) found = a;
+    }
+    if (!found) {
+        cudnnConvolutionFwdAlgoPerf_t perf[CUDNN_CONVOLUTION_FWD_ALGO_COUNT];
+        int returned = 0;
+        CCHK(cudnnGetConvolutionForwardAlgorithm_v7(f32_handle, xd, wd, cd, yd, CUDNN_CONVOLUTION_FWD_ALGO_COUNT,
+                                                     &returned, perf));
+        for (int i = 0; i < returned && !found; i++) {
+            cudnnConvolutionFwdAlgo_t algo = perf[i].algo;
+            if (perf[i].status != CUDNN_STATUS_SUCCESS || perf[i].mathType != CUDNN_FMA_MATH ||
+                algo == CUDNN_CONVOLUTION_FWD_ALGO_FFT || algo == CUDNN_CONVOLUTION_FWD_ALGO_FFT_TILING ||
+                algo == CUDNN_CONVOLUTION_FWD_ALGO_WINOGRAD || algo == CUDNN_CONVOLUTION_FWD_ALGO_WINOGRAD_NONFUSED)
+                continue;
+            size_t bytes = 0;
+            if (cudnnGetConvolutionForwardWorkspaceSize(f32_handle, xd, wd, cd, yd, algo, &bytes) !=
+                CUDNN_STATUS_SUCCESS || f32_count == 64)
+                continue;
+            f32_algos[f32_count] = {ci, h, w, co, kh, kw, algo, bytes};
+            found = &f32_algos[f32_count++];
+        }
+        if (!found) goto done;
+    }
+    if (found->workspace > f32_workspace_bytes) {
+        if (f32_workspace) cudaFree(f32_workspace);
+        f32_workspace = nullptr;
+        f32_workspace_bytes = 0;
+        if (cudaMalloc(&f32_workspace, found->workspace) != cudaSuccess) goto done;
+        f32_workspace_bytes = found->workspace;
+    }
+    CCHK(cudnnConvolutionForward(f32_handle, &alpha, xd, input, wd, weight, cd, found->algo, f32_workspace,
+                                 found->workspace, &beta, yd, output));
+    if (bias) f32_add_bias<<<(unsigned)(((size_t)co * h * w + 255) / 256), 256, 0, stream>>>(output, bias, co, h * w);
+    rc = cudaGetLastError() == cudaSuccess ? 0 : 1;
+done:
+    if (cd) cudnnDestroyConvolutionDescriptor(cd);
+    if (wd) cudnnDestroyFilterDescriptor(wd);
+    if (yd) cudnnDestroyTensorDescriptor(yd);
+    if (xd) cudnnDestroyTensorDescriptor(xd);
+    return rc;
+}
 #undef CCHK

@@ -5918,9 +5918,16 @@ typedef int (*qimg_vae_bf16_conv2d_fn)(float *, const float *, const float *,
                                        const float *, int, int, int, int, int,
                                        int, void *);
 static qimg_vae_bf16_conv2d_fn qimg_vae_bf16_conv2d;
+/* Optional F32 replacement for the direct conv kernel (same zero-padded
+ * contract, F32 in and out), e.g. cuDNN; NULL keeps the built-in kernels. */
+static qimg_vae_bf16_conv2d_fn qimg_vae_f32_conv2d;
 static void vae_op_conv2d(cuda_qimg_runner *r, CUdeviceptr out, CUdeviceptr inp,
                           CUdeviceptr w, CUdeviceptr b,
                           int ci, int h, int w_s, int co, int kh, int kw, int rep_pad) {
+    if (qimg_vae_f32_conv2d && !r->use_bf16_trunc && !rep_pad &&
+        !qimg_vae_f32_conv2d((float *)(uintptr_t)out, (float *)(uintptr_t)inp, (float *)(uintptr_t)w,
+                             (float *)(uintptr_t)b, ci, h, w_s, co, kh, kw, (void *)(uintptr_t)r->stream))
+        return;
     if (r->use_bf16_trunc && !rep_pad && qimg_vae_bf16_conv2d) {
         int failed = qimg_vae_bf16_conv2d((float *)(uintptr_t)out,
                                           (float *)(uintptr_t)inp,

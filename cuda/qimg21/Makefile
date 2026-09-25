@@ -106,7 +106,7 @@ test_cuda_qimg21_native: test_cuda_qimg21_native.c quant_weights.h edit_runtime.
 		-o $@ test_cuda_qimg21_native.c ../../cuda/cuew.c ../../cuda/cublasew.c \
 		-ldl -lm -lpthread
 
-test_cuda_qimg21_vae: test_cuda_qimg21_vae.c ../qimg/cuda_qimg_runner.h ../../cuda/cuew.c ../../cuda/cublasew.c
+test_cuda_qimg21_vae: test_cuda_qimg21_vae.c ../qimg/cuda_qimg_runner.h ../../cuda/cuew.c ../../cuda/cublasew.c libq21_cudnn_vae.so
 	$(CC) -O2 -std=c11 -D_GNU_SOURCE -Wall -Wextra -I../../common -I../../cuda -I../qimg \
 		-o $@ test_cuda_qimg21_vae.c ../../cuda/cuew.c ../../cuda/cublasew.c \
 		-ldl -lm -lpthread
