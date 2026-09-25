@@ -162,6 +162,10 @@ static void g2_asm(int nt, float *out, const uint8_t *g, size_t gb, const int8_t
         for (int r = 0; r < 8; r++) out[8 * k + r] = (acc[16 * k + 2 * r] + acc[16 * k + 2 * r + 1]) * 0x1p45f;
 }
 
+#define G2PDECL(n) void q38d_asmg2p##n##_f4_a16(const uint8_t *, long, const uint8_t *, const int8_t *const *, \
+                                              const float *const *, long, float *, const int8_t *);
+G2PDECL(2) G2PDECL(3) G2PDECL(4)
+
 static float frand(void) { return (float)rand() / (float)RAND_MAX * 2 - 1; }
 
 int main(int argc, char **argv) {
@@ -271,6 +275,33 @@ int main(int argc, char **argv) {
         double s = (double)(ticks() - t0) / hz, pr = (double)(groups / 2 * 2) * np * reps, cyc = s * 2.0e9 / pr;
         printf("g2%s   N=%d: %.2f cycles/pair, %.2f cycles/pair/token, %.1f GB/s weights (check %.3g)\n", g2_kind == 2 ? "s" : g2_kind ? "c" : "n", nt, cyc, cyc / nt, pr * 144 / s / 1e9, mr);
         (void)0;
+    }
+    for (int nt = 2; nt <= 4; nt++) {
+        int np = cols / 32;
+        const int8_t *aqp[4] = {a[0].q, a[1].q, a[2].q, a[3].q};
+        const float *asp[4] = {a[0].sc, a[1].sc, a[2].sc, a[3].sc};
+        void (*f)(const uint8_t *, long, const uint8_t *, const int8_t *const *, const float *const *, long, float *, const int8_t *) =
+            nt == 2 ? q38d_asmg2p2_f4_a16 : nt == 3 ? q38d_asmg2p3_f4_a16 : q38d_asmg2p4_f4_a16;
+        float acc[2 * 4 * 16] __attribute__((aligned(256)));
+        double mr = 0;
+        for (int g = 0; g + 1 < groups && g < 4; g += 2) {
+            f(w + g * gb, (long)gb, w + g * gb + (size_t)np * 128, aqp, asp, np, acc, q38d_lut_f4);
+            for (int gg = 0; gg < 2; gg++)
+                for (int t = 0; t < nt; t++) {
+                    q38d_group_sve(ref, w + (g + gg) * gb, Q38D_F4, Q38D_A16, &a[t], 0, 8);
+                    for (int r = 0; r < 8; r++) {
+                        float v = (acc[16 * (gg * nt + t) + 2 * r] + acc[16 * (gg * nt + t) + 2 * r + 1]) * 0x1p45f;
+                        double e = fabs(v - ref[r]) / (fabs(ref[r]) + 1e-30);
+                        if (e > mr) mr = e;
+                    }
+                }
+        }
+        uint64_t t0 = ticks();
+        for (int r = 0; r < reps; r++)
+            for (int g = 0; g + 1 < groups; g += 2) f(w + g * gb, (long)gb, w + g * gb + (size_t)np * 128, aqp, asp, np, out + 32 * g, q38d_lut_f4);
+        __asm__ volatile("" ::: "memory");
+        double s = (double)(ticks() - t0) / hz, pr = (double)(groups / 2 * 2) * np * reps, cyc = s * 2.0e9 / pr;
+        printf("g2p   N=%d: %.2f cycles/pair, %.2f cycles/pair/token (check %.3g)\n", nt, cyc, cyc / nt, mr);
     }
     /* R16: same bytes, 16-row groups (groups/2 of them), 320 tiles each */
     {

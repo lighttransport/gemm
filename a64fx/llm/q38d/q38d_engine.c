@@ -87,7 +87,6 @@ typedef struct {
     float *x, *qkv, *zb, *ab, *bb, *qg, *kb, *vb, *o, *h, *logits;
     q38d_act act_o, act_h, act_x[NT], act_c[NCMG];
     float *xn[NT], *xn_c[NCMG];
-    float *ssm_state[NLAYER][NVH];
     float *conv_state[NLAYER];
     /* per head (worker) CMG-local copies: history [4 slots][q,k,v][128] and
      * conv weights [4 taps][q,k,v][128] of that head's channels */
@@ -109,6 +108,22 @@ typedef struct {
     double prof[16];
 } q38d_engine;
 static int mtp_on;
+
+/* Per-call buffers of the SSM and attention cores (single-token path: the
+ * E.* buffers; verification pass: token i's buffers). SSM state of
+ * (layer, head) lives in a ring of SSM_RING buffers; the single-token path
+ * updates slot 0 in place, token i of a verification pass reads slot i and
+ * writes slot i+1, and accepting A tokens advances the ring by A. */
+#define TMAX 4
+typedef struct {
+    const float *qkv, *zb, *ab, *bb, *qg, *kb, *vb;
+    float *o;
+    q38d_act *act_o;
+    int slot;            /* SSM: read ring slot `slot`, write `slot + 1` (or in place: -1) */
+} q38d_io;
+static int ssm_ring = 1, ssm_cur;
+static float **ssm_buf[NLAYER];   /* [NVH * ssm_ring] */
+static inline float *ssm_st(int layer, int h, int i) { return ssm_buf[layer][h * ssm_ring + (ssm_cur + i) % ssm_ring]; }
 
 enum { P_EMBED, P_SSM_IN, P_SSM_CORE, P_SSM_OUT, P_ATT_IN, P_ATT_CORE, P_ATT_OUT, P_FFN_UP, P_FFN_DOWN, P_HEAD, P_N };
 static const char *prof_name[P_N] = {"embed", "ssm_in", "ssm_core", "ssm_out", "attn_in", "attn_core",
@@ -899,16 +914,23 @@ static const q38d_act *norm_act_impl(int tid, const float *w) {
 /* ------------------------------------------------------------------ */
 /* SSM head                                                             */
 
+static q38d_io io_single_v;
+static const q38d_io *io_single(void) {
+    io_single_v = (q38d_io){E.qkv, E.zb, E.ab, E.bb, E.qg, E.kb, E.vb, E.o, &E.act_o, -1};
+    return &io_single_v;
+}
 static int conv_local = 1;
 static void ssm_prefetch_state(int layer, int h);
 /* part: 0 q, 1 k, 2 v of head h; channels start at ch0 in the qkv vector */
-static void conv_silu_local(int layer, int h, int part, int ch0, int pos, float *out) {
+/* history ring of 8 positions so that rejected speculative positions never
+ * overwrite the three accepted ones the next token reads */
+static void conv_silu_local(int layer, int h, int part, int ch0, int pos, float *out, const float *qkv) {
     float *hs = E.conv_hist[layer][h];
     const float *w = E.conv_wl[layer][h] + part * 128;
-    const float *in = E.qkv + ch0;
-    const float *h1 = hs + (size_t)((pos + 3) & 3) * 384 + part * 128;
-    const float *h2 = hs + (size_t)((pos + 2) & 3) * 384 + part * 128;
-    const float *h3 = hs + (size_t)((pos + 1) & 3) * 384 + part * 128;
+    const float *in = qkv + ch0;
+    const float *h1 = hs + (size_t)((pos + 7) & 7) * 384 + part * 128;
+    const float *h2 = hs + (size_t)((pos + 6) & 7) * 384 + part * 128;
+    const float *h3 = hs + (size_t)((pos + 5) & 7) * 384 + part * 128;
     const svbool_t pf = svptrue_b32();
     for (int j = 0; j < 128; j += 16) {
         svfloat32_t v = svmul_f32_x(pf, svld1_f32(pf, w + j), svld1_f32(pf, h3 + j));
@@ -917,7 +939,7 @@ static void conv_silu_local(int layer, int h, int part, int ch0, int pos, float 
         v = svmla_f32_x(pf, v, svld1_f32(pf, w + 1152 + j), svld1_f32(pf, in + j));
         svst1_f32(pf, out + j, svmul_f32_x(pf, v, q38d_sigmoid_sve(pf, v)));
     }
-    memcpy(hs + (size_t)(pos & 3) * 384 + part * 128, in, 128 * sizeof(float));
+    memcpy(hs + (size_t)(pos & 7) * 384 + part * 128, in, 128 * sizeof(float));
 }
 static void conv_silu(const q38d_layer *L, int layer, int ch0, int pos, int write, float *out) {
     float *cs = E.conv_state[layer];
@@ -949,17 +971,20 @@ static void l2norm128(float *v) {
 static double ssm_t[4];
 static int ssm_pf = 0;
 static int ssm_lazy = 1, ssm_rowpf = 8;
-static void ssm_finish(const q38d_layer *L, int h, const float *o);
-static void ssm_head(int layer, int h, int pos) {
+static void ssm_finish(const q38d_layer *L, int h, const float *o, const q38d_io *io);
+static void ssm_head_io(int layer, int h, int pos, const q38d_io *io);
+static const q38d_io *io_single(void);
+static void ssm_head(int layer, int h, int pos) { ssm_head_io(layer, h, pos, io_single()); }
+static void ssm_head_io(int layer, int h, int pos, const q38d_io *io) {
     uint64_t T0 = h ? 0 : ticks();
     const q38d_layer *L = &E.L[layer];
     int g = h % NGROUP;
     float q[128], k[128], v[128], o[128];
     if (ssm_pf == 3) ssm_prefetch_state(layer, h);
     if (conv_local) {
-        conv_silu_local(layer, h, 0, ssm_qoff(g), pos, q);
-        conv_silu_local(layer, h, 1, ssm_koff(g), pos, k);
-        conv_silu_local(layer, h, 2, ssm_voff(h), pos, v);
+        conv_silu_local(layer, h, 0, ssm_qoff(g), pos, q, io->qkv);
+        conv_silu_local(layer, h, 1, ssm_koff(g), pos, k, io->qkv);
+        conv_silu_local(layer, h, 2, ssm_voff(h), pos, v, io->qkv);
     } else {
         conv_silu(L, layer, g * DS, pos, h < NGROUP, q);
         conv_silu(L, layer, NGROUP * DS + g * DS, pos, h < NGROUP, k);
@@ -968,11 +993,12 @@ static void ssm_head(int layer, int h, int pos) {
     l2norm128(q); l2norm128(k);
     const float qs = 1.0f / sqrtf((float)DS);
     for (int i = 0; i < 128; i++) q[i] *= qs;
-    float val = E.ab[ssm_abi(h)] + L->dt_bias[h];
+    float val = io->ab[ssm_abi(h)] + L->dt_bias[h];
     float sp = val > 20.0f ? val : logf(1.0f + expf(val));
     float decay = expf(sp * L->ssm_a[h]);
-    float beta = 1.0f / (1.0f + expf(-E.bb[ssm_abi(h)]));
-    float *St = E.ssm_state[layer][h];
+    float beta = 1.0f / (1.0f + expf(-io->bb[ssm_abi(h)]));
+    float *St = ssm_st(layer, h, io->slot < 0 ? 0 : io->slot);
+    float *Sd = io->slot < 0 ? St : ssm_st(layer, h, io->slot + 1);
     const svbool_t pf = svptrue_b32();
     uint64_t T1 = h ? 0 : ticks();
     if (ssm_lazy) {
@@ -981,27 +1007,28 @@ static void ssm_head(int layer, int h, int pos) {
          * S_prev = A + pd pk^T row by row, decay it, and accumulate A k and
          * A q; then o = A q + delta (k . q). */
         float *pk = St + DS * DS, *pd = pk + DS;
+        float *pkd = Sd + DS * DS, *pdd = pkd + DS;
         SV8(sk); SV8(oa); SV8(pv);
 #define LZ0(j) sk##j = svdup_n_f32(0); oa##j = sk##j; pv##j = svld1_f32(pf, pd + 16 * j)
         SV8_EACH(LZ0);
         for (int c = 0; c < DS; c++) {
-            float *row = St + (size_t)c * DS;
+            float *row = St + (size_t)c * DS, *drow = Sd + (size_t)c * DS;
             if (ssm_rowpf && c + ssm_rowpf < DS) {
                 __builtin_prefetch(row + ssm_rowpf * DS, 1, 3);
                 __builtin_prefetch(row + ssm_rowpf * DS + 64, 1, 3);
             }
             svfloat32_t pc = svdup_n_f32(pk[c]), kc = svdup_n_f32(k[c]), qc = svdup_n_f32(q[c]);
 #define LZ1(j) { svfloat32_t s_ = svmul_n_f32_x(pf, svmla_f32_x(pf, svld1_f32(pf, row + 16 * j), pv##j, pc), decay); \
-                svst1_f32(pf, row + 16 * j, s_); sk##j = svmla_f32_x(pf, sk##j, s_, kc); oa##j = svmla_f32_x(pf, oa##j, s_, qc); }
+                svst1_f32(pf, drow + 16 * j, s_); sk##j = svmla_f32_x(pf, sk##j, s_, kc); oa##j = svmla_f32_x(pf, oa##j, s_, qc); }
             SV8_EACH(LZ1);
         }
         uint64_t T2l = h ? 0 : ticks();
         float kq = dot(k, q, DS);
 #define LZ2(j) { svfloat32_t d_ = svmul_n_f32_x(pf, svsub_f32_x(pf, svld1_f32(pf, v + 16 * j), sk##j), beta); \
-                svst1_f32(pf, pd + 16 * j, d_); svst1_f32(pf, o + 16 * j, svmla_n_f32_x(pf, oa##j, d_, kq)); }
+                svst1_f32(pf, pdd + 16 * j, d_); svst1_f32(pf, o + 16 * j, svmla_n_f32_x(pf, oa##j, d_, kq)); }
         SV8_EACH(LZ2);
-        memcpy(pk, k, DS * sizeof(float));
-        ssm_finish(L, h, o);
+        memcpy(pkd, k, DS * sizeof(float));
+        ssm_finish(L, h, o, io);
         if (!h) { uint64_t T4 = ticks(); ssm_t[0] += T1 - T0; ssm_t[1] += T2l - T1; ssm_t[3] += T4 - T2l; }
         return;
     }
@@ -1028,25 +1055,25 @@ static void ssm_head(int layer, int h, int pos) {
 #define OS(j) svst1_f32(pf, o + 16 * j, oo##j)
     SV8_EACH(OS);
     uint64_t T3 = h ? 0 : ticks();
-    ssm_finish(L, h, o);
+    ssm_finish(L, h, o, io);
     if (!h) { uint64_t T4 = ticks(); ssm_t[0] += T1 - T0; ssm_t[1] += T2 - T1; ssm_t[2] += T3 - T2; ssm_t[3] += T4 - T3; }
 }
 /* gated RMSNorm of head h's output into E.o, quantized for the out-proj */
-static void ssm_finish(const q38d_layer *L, int h, const float *o) {
+static void ssm_finish(const q38d_layer *L, int h, const float *o, const q38d_io *io) {
     const svbool_t pf = svptrue_b32();
     float inv = 1.0f / sqrtf(sumsq(o, DS) / DS + E.eps);
-    const float *z = E.zb + ssm_zoff(h);
-    float *dst = E.o + (size_t)h * DS;
+    const float *z = io->zb + ssm_zoff(h);
+    float *dst = io->o + (size_t)h * DS;
     for (int i = 0; i < DS; i += 16) {
         svfloat32_t zv = svld1_f32(pf, z + i);
         svfloat32_t sz = svmul_f32_x(pf, zv, q38d_sigmoid_sve(pf, zv));
         svfloat32_t ov = svmul_f32_x(pf, svmul_n_f32_x(pf, svld1_f32(pf, o + i), inv), svld1_f32(pf, L->ssm_norm + i));
         svst1_f32(pf, dst + i, svmul_f32_x(pf, ov, sz));
     }
-    if (E.arith != Q38D_F32) q38d_prepare_range(&E.act_o, E.o, h * 4, h * 4 + 4);
+    if (E.arith != Q38D_F32) q38d_prepare_range(io->act_o, io->o, h * 4, h * 4 + 4);
 }
 static void ssm_prefetch_state(int layer, int h) {
-    const char *p = (const char *)E.ssm_state[layer][h];
+    const char *p = (const char *)ssm_st(layer, h, 0);
     for (int i = 0; i < DS * DS * 4; i += 256) __builtin_prefetch(p + i, 1, 2);
 }
 
@@ -1108,21 +1135,23 @@ static void attn_pv(const float *V, int t0, int t1, const float *p, float *out) 
 }
 
 static double att_t[4];
-static void attention(int layer, int tid, int pos, int *csense) {
+static void attention_io(int layer, int tid, int pos, int *csense, const q38d_io *io);
+static void attention(int layer, int tid, int pos, int *csense) { attention_io(layer, tid, pos, csense, io_single()); }
+static void attention_io(int layer, int tid, int pos, int *csense, const q38d_io *io) {
     uint64_t T0 = tid ? 0 : ticks();
     const q38d_layer *L = &E.L[layer];
     int c = tid / PER, l = tid % PER, ai = L->ai;
     float *qh = E.qh[c];
     if (l < 6) {
         int hq = 6 * c + l;
-        memcpy(qh + l * HD, E.qg + (size_t)hq * 2 * HD, HD * sizeof(float));
+        memcpy(qh + l * HD, io->qg + (size_t)hq * 2 * HD, HD * sizeof(float));
         head_rmsnorm_rope(qh + l * HD, L->q_norm, pos);
     } else if (l == 6) {
         float kv[HD];
-        memcpy(kv, E.kb + c * HD, sizeof kv);
+        memcpy(kv, io->kb + c * HD, sizeof kv);
         head_rmsnorm_rope(kv, L->k_norm, pos);
         memcpy(E.kc[ai][c] + (size_t)pos * HD, kv, sizeof kv);
-        memcpy(E.vc[ai][c] + (size_t)pos * HD, E.vb + c * HD, HD * sizeof(float));
+        memcpy(E.vc[ai][c] + (size_t)pos * HD, io->vb + c * HD, HD * sizeof(float));
     }
     uint64_t T1 = tid ? 0 : ticks();
     cbarrier(tid, csense);
@@ -1176,14 +1205,14 @@ static void attention(int layer, int tid, int pos, int *csense) {
             for (int j = 0; j < HD; j += 16)
                 svst1_f32(pf, o + j, svmla_n_f32_x(pf, svld1_f32(pf, o + j), svld1_f32(pf, pp + 2 + j), w));
         }
-        const float *gate = E.qg + (size_t)hq * 2 * HD + HD;
-        float *dst = E.o + (size_t)hq * HD;
+        const float *gate = io->qg + (size_t)hq * 2 * HD + HD;
+        float *dst = io->o + (size_t)hq * HD;
         float rden = 1.0f / den;
         for (int j = 0; j < HD; j += 16) {
             svfloat32_t gv = q38d_sigmoid_sve(pf, svld1_f32(pf, gate + j));
             svst1_f32(pf, dst + j, svmul_f32_x(pf, svmul_n_f32_x(pf, svld1_f32(pf, o + j), rden), gv));
         }
-        if (E.arith != Q38D_F32) q38d_prepare_range(&E.act_o, E.o, hq * 8, hq * 8 + 8);
+        if (E.arith != Q38D_F32) q38d_prepare_range(io->act_o, io->o, hq * 8, hq * 8 + 8);
     }
 }
 
@@ -1629,6 +1658,284 @@ static void vbench(int tid, int *gs, int *cs) {
 }
 
 /* ------------------------------------------------------------------ */
+/* speculative decoding: T-token verification pass (Q38D_SPEC=k, T = k + 1) */
+
+static int spec_k;
+typedef struct {
+    float *x[TMAX], *qkv[TMAX], *zb[TMAX], *ab[TMAX], *bb[TMAX], *qg[TMAX], *kb[TMAX], *vb[TMAX], *o[TMAX], *h[TMAX];
+    q38d_act act_o[TMAX], act_h[TMAX];
+    q38d_act act_c[NCMG][TMAX];
+    _Atomic int *unit_cnt[TMAX];
+    int argmax[TMAX];
+    float logit[TMAX];
+} q38d_mtbuf;
+static q38d_mtbuf MT;
+static float ssp_part[NCMG][PER][TMAX] __attribute__((aligned(256)));
+typedef void (*g2p_fn)(const uint8_t *, long, const uint8_t *, const int8_t *const *, const float *const *, long, float *,
+                       const int8_t *);
+void q38d_asmg2p2_f4_a16(const uint8_t *, long, const uint8_t *, const int8_t *const *, const float *const *, long, float *, const int8_t *);
+void q38d_asmg2p3_f4_a16(const uint8_t *, long, const uint8_t *, const int8_t *const *, const float *const *, long, float *, const int8_t *);
+void q38d_asmg2p4_f4_a16(const uint8_t *, long, const uint8_t *, const int8_t *const *, const float *const *, long, float *, const int8_t *);
+static g2p_fn g2p_for(int T) { return T == 2 ? q38d_asmg2p2_f4_a16 : T == 3 ? q38d_asmg2p3_f4_a16 : q38d_asmg2p4_f4_a16; }
+
+static inline void mt_out(float *o, const float *acc, int mode) {
+    for (int r = 0; r < 8; r++) {
+        float v = (acc[2 * r] + acc[2 * r + 1]) * 0x1p45f;
+        o[r] = mode ? o[r] + v : v;
+    }
+}
+/* Groups [g0, g1) of CMG c for T tokens: dual (m2, same group index) or
+ * consecutive group pairs of one matrix. outA/outB[t]: row 0 of the CMG. */
+static void mt_mat(int T, const q38d_mat *m, const q38d_mat *m2, int c, int g0, int g1, const q38d_act *acts,
+                   float *const *outA, float *const *outB, int mode) {
+    if (g0 >= g1) return;
+    if (m->fmt != Q38D_F4 || T < 2 || E.arith != Q38D_A16 || (m2 && m2->fmt != Q38D_F4)) {
+        for (int t = 0; t < T; t++) {
+            q38d_gemv_any(outA[t], m->part[c], m->fmt, &acts[t], g0, g1, m->first[c + 1] - m->first[c], mode);
+            if (m2) q38d_gemv_any(outB[t], m2->part[c], m2->fmt, &acts[t], g0, g1, m2->first[c + 1] - m2->first[c], mode);
+        }
+        return;
+    }
+    const int np = m->cols / 32;
+    const size_t gb = q38d_group_bytes(Q38D_F4, m->cols);
+    const int8_t *aq[TMAX];
+    const float *as[TMAX];
+    for (int t = 0; t < T; t++) { aq[t] = acts[t].q; as[t] = acts[t].sc; }
+    float acc[2 * TMAX * 16] __attribute__((aligned(256)));
+    g2p_fn f = g2p_for(T);
+    for (int g = g0; g < g1;) {
+        const uint8_t *wa = m->part[c] + (size_t)g * gb;
+        int gA = g, gB;
+        float *const *oB;
+        long gs;
+        if (m2) { gs = (long)(m2->part[c] - m->part[c]); gB = g; oB = outB; g += 1; }
+        else if (g + 1 < g1) { gs = (long)gb; gB = g + 1; oB = outA; g += 2; }
+        else { gs = 0; gB = -1; oB = NULL; g += 1; }
+        f(wa, gs, wa + (size_t)np * 128, aq, as, np, acc, q38d_lut_f4);
+        for (int t = 0; t < T; t++) {
+            mt_out(outA[t] + 8 * gA, acc + 16 * t, mode);
+            if (gB >= 0) mt_out(oB[t] + 8 * gB, acc + 16 * (T + t), mode);
+        }
+    }
+}
+static void run_plan_mt(const q38d_plan *P, int T, const q38d_act *acts, float *(*outs)[TMAX], int tid) {
+    int c = tid / PER;
+    const q38d_tplan *tp = &P->t[tid];
+    for (int k = 0; k < tp->nseg; k++) {
+        int mi = tp->s[k].mi, mi2 = tp->s[k].mi2;
+        const q38d_mat *m = P->m[mi], *m2 = mi2 >= 0 ? P->m[mi2] : NULL;
+        float *oa[TMAX], *ob[TMAX];
+        for (int t = 0; t < T; t++) {
+            oa[t] = outs[mi][t] + m->first[c];
+            ob[t] = m2 ? outs[mi2][t] + m2->first[c] : NULL;
+        }
+        mt_mat(T, m, m2, c, tp->s[k].g0, tp->s[k].g1, acts, oa, m2 ? ob : NULL, 0);
+    }
+}
+/* RMSNorm of xs[0..T) with weight w into this CMG's act_c[c][t]: lane l sums
+ * and quantizes its 1/12 of the pairs; two CMG barriers. */
+static void norm_mt(int tid, float *const *xs, int T, const float *w, int *cs) {
+    int c = tid / PER, l = tid % PER, np = EMBD / 32, p0 = np * l / PER, p1 = np * (l + 1) / PER;
+    for (int t = 0; t < T; t++) ssp_part[c][l][t] = sumsq(xs[t] + 32 * p0, 32 * (p1 - p0));
+    cbarrier(tid, cs);
+    for (int t = 0; t < T; t++) {
+        float ss = 0;
+        for (int j = 0; j < PER; j++) ss += ssp_part[c][j][t];
+        q38d_prepare_pairs(&MT.act_c[c][t], xs[t], 1.0f / sqrtf(ss / EMBD + E.eps), w, p0, p1);
+    }
+    cbarrier(tid, cs);
+}
+typedef struct { float part[2][TMAX][8]; _Atomic int cnt; char pad[252]; } q38d_split_mt;
+static q38d_split_mt split_mt[NCMG][PER + 1];
+/* K-chunked residual matvec for T tokens (add into MT.x[t]) */
+static void mv_items_mt(const q38d_mat *m, int T, int tid) {
+    int c = tid / PER, l = tid % PER, i0, i1;
+    lane_items(m, c, l, &i0, &i1);
+    if (i1 <= i0) return;
+    const int gf = i0 / m->kch, gl = (i1 - 1) / m->kch, kc = m->cols / m->kch, npc = kc / 32;
+    const size_t sb = q38d_group_bytes(m->fmt, kc);
+    const uint8_t *w = m->part[c] + (size_t)i0 * sb;
+    float accg[64][TMAX][8];
+    memset(accg, 0, sizeof(float) * TMAX * 8 * (gl - gf + 1));
+    float acc[2 * TMAX * 16] __attribute__((aligned(256)));
+    const int Tk = T < 2 ? 2 : T;   /* one token: two-token kernel on a duplicated pointer */
+    g2p_fn f = g2p_for(Tk);
+    for (int k = 0; k < m->kch; k++) {
+        int ga = -1, n = 0;
+        for (int g = gf; g <= gl; g++) { int it = g * m->kch + k; if (it >= i0 && it < i1) { if (ga < 0) ga = g; n++; } }
+        if (!n) continue;
+        const int8_t *aq[TMAX];
+        const float *as[TMAX];
+        for (int t = 0; t < T; t++) { aq[t] = MT.act_h[t].q + (size_t)k * npc * 64; as[t] = MT.act_h[t].sc + (size_t)k * npc * 2; }
+        if (T < 2) { aq[1] = aq[0]; as[1] = as[0]; }
+        for (int j = 0; j < n;) {
+            int two = j + 1 < n;
+            f(w, two ? (long)sb : 0, w + (size_t)npc * 128, aq, as, npc, acc, q38d_lut_f4);
+            for (int t = 0; t < T; t++)
+                for (int r = 0; r < 8; r++) {
+                    accg[ga + j - gf][t][r] += (acc[16 * t + 2 * r] + acc[16 * t + 2 * r + 1]) * 0x1p45f;
+                    if (two) accg[ga + j + 1 - gf][t][r] += (acc[16 * (Tk + t) + 2 * r] + acc[16 * (Tk + t) + 2 * r + 1]) * 0x1p45f;
+                }
+            w += (size_t)(two ? 2 : 1) * sb;
+            j += two ? 2 : 1;
+        }
+    }
+    for (int g = gf; g <= gl; g++) {
+        int full = g * m->kch >= i0 && g * m->kch + m->kch - 1 < i1;
+        int row = m->first[c] + 8 * g;
+        if (full) {
+            for (int t = 0; t < T; t++) for (int r = 0; r < 8; r++) MT.x[t][row + r] += accg[g - gf][t][r];
+            continue;
+        }
+        int b = g * m->kch < i0 ? l : l + 1, side = g * m->kch < i0 ? 1 : 0;
+        q38d_split_mt *sp = &split_mt[c][b];
+        memcpy(sp->part[side], accg[g - gf], sizeof(float) * TMAX * 8);
+        int old = atomic_fetch_add_explicit(&sp->cnt, 1, memory_order_acq_rel);
+        if (old & 1)
+            for (int t = 0; t < T; t++)
+                for (int r = 0; r < 8; r++) MT.x[t][row + r] += sp->part[0][t][r] + sp->part[1][t][r];
+    }
+}
+static void embed_token_to(int tid, int token, float *dst) {
+    if (E.embed_q6k) {
+        int blocks = EMBD / 256;
+        if (tid < blocks)
+            dequant_row(GGML_TYPE_Q6_K, E.embed_q6k + (size_t)token * E.embed_row_bytes + (size_t)tid * 210, dst + tid * 256, 256);
+    } else if (E.embed_lb->format == Q38_LB_FP6_E2M3) {
+        int k0 = EMBD * tid / NT, k1 = EMBD * (tid + 1) / NT;
+        embed_fp6_cols(dst, E.embed_lb, token, k0, k1);
+    } else if (tid == 0) {
+        q38_lowbit_matrix_row(dst, E.embed_lb, token);
+    }
+}
+/* argmax of the head for residual x -> *id, *logit (all workers) */
+static void head_token(int tid, float *x, int *gs, int *cs, int *id, float *logit) {
+    int c = tid / PER;
+    float *xs[1] = {x};
+    norm_mt(tid, xs, 1, E.out_norm, cs);
+    mv(&E.head, &MT.act_c[c][0], E.logits, 0, tid);
+    {
+        int cc, g0, g1;
+        mat_range(&E.head, tid, &cc, &g0, &g1);
+        int r0 = E.head.first[cc] + 8 * g0, r1 = E.head.first[cc] + 8 * g1;
+        if (r1 > E.head.first[cc + 1]) r1 = E.head.first[cc + 1];
+        float best = -INFINITY; int bi = -1;
+        for (int r = r0; r < r1; r++) if (E.logits[r] > best) { best = E.logits[r]; bi = r; }
+        E.best_val[tid] = best; E.best_idx[tid] = bi;
+    }
+    gbarrier(tid, gs);
+    if (tid == 0) {
+        float best = -INFINITY; int bi = 0;
+        for (int i = 0; i < NT; i++) if (E.best_idx[i] >= 0 && E.best_val[i] > best) { best = E.best_val[i]; bi = E.best_idx[i]; }
+        *id = bi; *logit = best;
+    }
+    gbarrier(tid, gs);
+}
+static void step_mt(int tid, const int *tok, int pos0, int T, int *gs, int *cs) {
+    uint64_t t = ticks();
+    const int c = tid / PER, l = tid % PER;
+    for (int i = 0; i < T; i++) embed_token_to(tid, tok[i], MT.x[i]);
+    phase_end(tid, gs, &t, P_EMBED);
+    for (int layer = 0; layer < NLAYER; layer++) {
+        const q38d_layer *L = &E.L[layer];
+        pf_layer[tid] = layer;
+        norm_mt(tid, MT.x, T, L->attn_norm, cs);
+        if (L->ssm) {
+            float *(outs[4])[TMAX];
+            for (int i = 0; i < T; i++) { outs[0][i] = MT.qkv[i]; outs[1][i] = MT.zb[i]; outs[2][i] = MT.ab[i]; outs[3][i] = MT.bb[i]; }
+            run_plan_mt(&plan_ssm[layer], T, MT.act_c[c], outs, tid);
+            if (inproj_cbar && ssm_perm) phase_end_c(tid, cs, &t, P_SSM_IN);
+            else phase_end(tid, gs, &t, P_SSM_IN);
+            int hh = ssm_head_of(tid);
+            for (int i = 0; i < T; i++) {
+                q38d_io io = {MT.qkv[i], MT.zb[i], MT.ab[i], MT.bb[i], NULL, NULL, NULL, MT.o[i], &MT.act_o[i], i};
+                ssm_head_io(layer, hh, pos0 + i, &io);
+            }
+            phase_end(tid, gs, &t, P_SSM_CORE);
+            {
+                int cc, g0, g1;
+                mat_range(&L->out, tid, &cc, &g0, &g1);
+                float *oa[TMAX];
+                for (int i = 0; i < T; i++) oa[i] = MT.x[i] + L->out.first[c];
+                mt_mat(T, &L->out, NULL, c, g0, g1, MT.act_o, oa, NULL, 1);
+            }
+            phase_end(tid, gs, &t, P_SSM_OUT);
+        } else {
+            float *(outs[3])[TMAX];
+            for (int i = 0; i < T; i++) { outs[0][i] = MT.qg[i]; outs[1][i] = MT.kb[i]; outs[2][i] = MT.vb[i]; }
+            run_plan_mt(&plan_att[layer], T, MT.act_c[c], outs, tid);
+            if (inproj_cbar && attn_cmg_ok) phase_end_c(tid, cs, &t, P_ATT_IN);
+            else phase_end(tid, gs, &t, P_ATT_IN);
+            for (int i = 0; i < T; i++) {
+                q38d_io io = {NULL, NULL, NULL, NULL, MT.qg[i], MT.kb[i], MT.vb[i], MT.o[i], &MT.act_o[i], -1};
+                attention_io(layer, tid, pos0 + i, cs, &io);
+            }
+            phase_end(tid, gs, &t, P_ATT_CORE);
+            {
+                int cc, g0, g1;
+                mat_range(&L->o, tid, &cc, &g0, &g1);
+                float *oa[TMAX];
+                for (int i = 0; i < T; i++) oa[i] = MT.x[i] + L->o.first[c];
+                mt_mat(T, &L->o, NULL, c, g0, g1, MT.act_o, oa, NULL, 1);
+            }
+            phase_end(tid, gs, &t, P_ATT_OUT);
+        }
+        norm_mt(tid, MT.x, T, L->post_norm, cs);
+        {
+            int rows = L->gate.first[c + 1] - L->gate.first[c];
+            int G8 = rows / 8, g0 = G8 * l / PER, g1 = G8 * (l + 1) / PER;
+            int base = L->gate.first[c];
+            float *oa[TMAX], *ob[TMAX];
+            for (int i = 0; i < T; i++) { oa[i] = MT.h[i] + base; ob[i] = MT.qkv[i] + base; }
+            mt_mat(T, &L->gate, &L->up, c, g0, g1, MT.act_c[c], oa, ob, 0);
+            const svbool_t p8 = svptrue_pat_b32(SV_VL8);
+            for (int i = 0; i < T; i++) {
+                for (int g = g0; g < g1; g++) {
+                    int r = base + 8 * g;
+                    svfloat32_t gv = svld1_f32(p8, MT.h[i] + r);
+                    svst1_f32(p8, MT.h[i] + r, svmul_f32_x(p8, svmul_f32_x(p8, gv, q38d_sigmoid_sve(p8, gv)), svld1_f32(p8, MT.qkv[i] + r)));
+                }
+                int u_first = g0 / 2, u_last = (g1 + 1) / 2;
+                for (int u = u_first; u < u_last; u++) {
+                    int whole = 2 * u >= g0 && 2 * u + 1 < g1;
+                    int r = base + 16 * u;
+                    if (!whole) {
+                        int old = atomic_fetch_add_explicit(&MT.unit_cnt[i][r / 16], 1, memory_order_acq_rel);
+                        if (!(old & 1)) continue;
+                    }
+                    q38d_prepare_unit(&MT.act_h[i], r / 32, (r / 16) & 1, MT.h[i] + r);
+                }
+            }
+        }
+        phase_end(tid, gs, &t, P_FFN_UP);
+        mv_items_mt(&L->down, T, tid);
+        phase_end(tid, gs, &t, P_FFN_DOWN);
+    }
+    for (int i = 0; i < T; i++) head_token(tid, MT.x[i], gs, cs, &MT.argmax[i], &MT.logit[i]);
+    prof_mark(tid, &t, P_HEAD);
+}
+static void mt_alloc(void) {
+    for (int t = 0; t < TMAX; t++) {
+        MT.x[t] = aligned_alloc(256, EMBD * 4);
+        MT.qkv[t] = aligned_alloc(256, NFF * 4);
+        MT.zb[t] = aligned_alloc(256, DINNER * 4);
+        MT.ab[t] = aligned_alloc(256, 64 * 4); MT.bb[t] = aligned_alloc(256, 64 * 4);
+        MT.qg[t] = aligned_alloc(256, 2 * NHEAD * HD * 4);
+        MT.kb[t] = aligned_alloc(256, NKV * HD * 4); MT.vb[t] = aligned_alloc(256, NKV * HD * 4);
+        MT.o[t] = aligned_alloc(256, DINNER * 4);
+        MT.h[t] = aligned_alloc(256, NFF * 4);
+        MT.unit_cnt[t] = calloc(NFF / 16, sizeof(*MT.unit_cnt[t]));
+        MT.act_o[t] = (q38d_act){DINNER, E.arith, aligned_alloc(256, q38d_act_qbytes(DINNER, Q38D_A16)),
+                                 aligned_alloc(256, DINNER / 16 * 4), aligned_alloc(256, DINNER / 16 * 4), MT.o[t]};
+        MT.act_h[t] = (q38d_act){NFF, E.arith, aligned_alloc(256, q38d_act_qbytes(NFF, Q38D_A16)),
+                                 aligned_alloc(256, NFF / 16 * 4), aligned_alloc(256, NFF / 16 * 4), MT.h[t]};
+        for (int c = 0; c < NCMG; c++)
+            MT.act_c[c][t] = (q38d_act){EMBD, E.arith, aligned_alloc(256, q38d_act_qbytes(EMBD, Q38D_A16) + 256),
+                                        aligned_alloc(256, EMBD / 16 * 4 + 256), aligned_alloc(256, EMBD / 16 * 4 + 256), NULL};
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* run control                                                          */
 
 typedef struct {
@@ -1655,10 +1962,13 @@ static void *worker(void *arg) {
     for (int layer = 0; layer < NLAYER; layer++)
         if (E.L[layer].ssm) {
             int hh = ssm_head_of(tid);
-            E.ssm_state[layer][hh] = aligned_alloc(256, (DS * DS + 2 * DS) * sizeof(float));
-            memset(E.ssm_state[layer][hh], 0, (DS * DS + 2 * DS) * sizeof(float));
-            E.conv_hist[layer][hh] = aligned_alloc(256, 4 * 384 * sizeof(float));
-            memset(E.conv_hist[layer][hh], 0, 4 * 384 * sizeof(float));
+            for (int r = 0; r < ssm_ring; r++) {
+                float *b = aligned_alloc(256, (DS * DS + 2 * DS) * sizeof(float));
+                memset(b, 0, (DS * DS + 2 * DS) * sizeof(float));
+                ssm_buf[layer][hh * ssm_ring + r] = b;
+            }
+            E.conv_hist[layer][hh] = aligned_alloc(256, 8 * 384 * sizeof(float));
+            memset(E.conv_hist[layer][hh], 0, 8 * 384 * sizeof(float));
             float *wl = aligned_alloc(256, 4 * 384 * sizeof(float));
             int g = hh % NGROUP, ch[3] = {g * DS, NGROUP * DS + g * DS, 2 * NGROUP * DS + hh * DS};
             for (int kk = 0; kk < 4; kk++)
@@ -1737,6 +2047,8 @@ static void *worker(void *arg) {
         step(tid, JOB.tok[pos], pos, pos == pn - 1, &gs, &cs);
         if (mtp_on && pos + 1 < pn) mtp_step(tid, JOB.tok[pos + 1], pos, E.x, 0, &gs, &cs);
     }
+    static float spec_logit0;
+    if (tid == 0) spec_logit0 = E.logits[E.next_token];
     if (mtp_on) mtp_drafts(tid, 0, pn - 1, &gs, &cs);
     if (vbench_T) { vbench(tid, &gs, &cs); return NULL; }
     if (tid == 0) {
@@ -1752,6 +2064,48 @@ static void *worker(void *arg) {
         memset(busy_acc, 0, sizeof busy_acc);
         busy_on = 1;
         t0 = now_sec();
+    }
+    if (spec_k) {
+        /* verify [cur, d1..dk] in one pass; accept the matching draft prefix
+         * plus the pass's own next token; advance the SSM ring; catch the
+         * MTP drafter up over the accepted positions and draft again */
+        int n = 0, pos = pn, cur = E.next_token, passes = 0;
+        static int hist[TMAX + 1];
+        float cur_logit = spec_logit0;
+        int dr[3] = {mtp_chain[0][0], mtp_chain[0][1], mtp_chain[0][2]};
+        while (n < gn) {
+            int T = 1 + spec_k;
+            if (T > gn - n) T = gn - n;
+            int tok[TMAX] = {cur, dr[0], dr[1], dr[2]};
+            step_mt(tid, tok, pos, T, &gs, &cs);
+            int A = 1;
+            while (A < T && MT.argmax[A - 1] == tok[A]) A++;
+            int bonus = MT.argmax[A - 1];
+            if (tid == 0) {
+                for (int i = 0; i < A; i++) { JOB.tok[pn + n + i] = tok[i]; JOB.trace_logit[n + i] = i ? MT.logit[i - 1] : cur_logit; }
+                cur_logit = MT.logit[A - 1];
+                ssm_cur = (ssm_cur + A) % ssm_ring;
+                hist[A]++;
+            }
+            gbarrier(tid, &gs);
+            if (n + A < gn) {
+                for (int i = 0; i < A; i++)
+                    mtp_step(tid, i + 1 < A ? tok[i + 1] : bonus, pos + i, MT.x[i], i == A - 1, &gs, &cs);
+                dr[0] = E.mtp_draft;
+                for (int k = 1; k < spec_k; k++) {
+                    mtp_step(tid, dr[k - 1], pos + A - 1 + k, E.h_mtp, 1, &gs, &cs);
+                    dr[k] = E.mtp_draft;
+                }
+            }
+            n += A; pos += A; cur = bonus; passes++;
+        }
+        if (tid == 0) {
+            JOB.t_decode = now_sec() - t0;
+            fprintf(stderr, "q38d: spec k=%d: %d passes, %.3f tokens/pass, accepted-length histogram:", spec_k, passes, (double)gn / passes);
+            for (int a = 1; a <= spec_k + 1; a++) fprintf(stderr, " %d:%d", a, hist[a]);
+            fprintf(stderr, "\n");
+        }
+        return NULL;
     }
     for (int n = 0; n < gn; n++) {
         int cur = E.next_token;
@@ -1807,7 +2161,7 @@ int main(int argc, char **argv) {
         else { usage(argv[0]); return 2; }
     }
     if (!path || pn < 1 || gn < 1) { usage(argv[0]); return 2; }
-    E.fmt = fmt; E.arith = arith; E.max_seq = pn + gn + 4;
+    E.fmt = fmt; E.arith = arith; E.max_seq = pn + gn + 8;
     if (getenv("Q38D_OUT_KCH")) out_kch = atoi(getenv("Q38D_OUT_KCH"));
     if (getenv("Q38D_Q6K_EXPAND")) q6k_expand = atoi(getenv("Q38D_Q6K_EXPAND"));
     if (getenv("Q38D_ASM")) q38d_asm_variant = atoi(getenv("Q38D_ASM"));
@@ -1824,6 +2178,15 @@ int main(int argc, char **argv) {
     if (!vocab) return 1;
     if (getenv("Q38D_VBENCH")) vbench_T = atoi(getenv("Q38D_VBENCH"));
     if (getenv("Q38D_MTP")) mtp_on = atoi(getenv("Q38D_MTP")) != 0;
+    if (getenv("Q38D_SPEC")) spec_k = atoi(getenv("Q38D_SPEC"));
+    if (spec_k) {
+        if (spec_k < 1 || spec_k > TMAX - 1 || arith != Q38D_A16 || fmt != Q38D_F4) {
+            fprintf(stderr, "q38d: Q38D_SPEC needs 1..%d drafts, --act a16, --fmt fp4\n", TMAX - 1);
+            return 1;
+        }
+        mtp_on = 1;
+        ssm_ring = spec_k + 2;
+    }
     if (getenv("Q38D_SSM_PERM")) ssm_perm = atoi(getenv("Q38D_SSM_PERM"));
     if (getenv("Q38D_CONV_LOCAL") && !atoi(getenv("Q38D_CONV_LOCAL"))) ssm_perm = 0;
     load_engine();
@@ -1851,6 +2214,7 @@ int main(int argc, char **argv) {
                          aligned_alloc(256, NFF / 16 * 4), aligned_alloc(256, NFF / 16 * 4), E.h};
     for (int l = 0; l < NLAYER; l++) {
         E.conv_state[l] = calloc((size_t)4 * QKVD, sizeof(float));
+        ssm_buf[l] = calloc((size_t)NVH * ssm_ring, sizeof(float *));
     }
     if (mtp_on) {
         mtp_chain = calloc((size_t)gn + 2, sizeof(*mtp_chain));
@@ -1859,6 +2223,10 @@ int main(int argc, char **argv) {
         E.h_mtp = aligned_alloc(256, EMBD * 4);
         E.act_mtp = (q38d_act){2 * EMBD, arith, aligned_alloc(256, q38d_act_qbytes(2 * EMBD, Q38D_A16)),
                                aligned_alloc(256, 2 * EMBD / 16 * 4), aligned_alloc(256, 2 * EMBD / 16 * 4), E.mtp_in};
+    }
+    if (spec_k) {
+        if (!ssm_lazy || !conv_local) { fprintf(stderr, "q38d: Q38D_SPEC needs ssm_lazy and conv_local\n"); return 1; }
+        mt_alloc();
     }
     if (getenv("Q38D_PLAN")) use_plan = atoi(getenv("Q38D_PLAN"));
     if (getenv("Q38D_SSM_PF")) ssm_pf = atoi(getenv("Q38D_SSM_PF"));
