@@ -656,15 +656,18 @@ static void mv(const q38d_mat *m, const q38d_act *a, float *out, int mode, int t
 typedef struct { signed char mi, mi2; int g0, g1; } q38d_seg; /* mi2 >= 0: dual with matrix mi2 */
 typedef struct { int nseg; q38d_seg s[6]; } q38d_tplan;
 typedef struct { int nm; const q38d_mat *m[4]; float *out[4]; q38d_tplan t[NT]; } q38d_plan;
-static q38d_plan *plan_ssm, *plan_att;
+static q38d_plan *plan_ssm, *plan_att, *plan_ssm_mt, *plan_att_mt;
 static int use_plan = 1;
 
 /* Estimated cycles of one group (measured A16 cycles per pair, L1). */
 static double cost_q4k = 50, cost_q6k = 70, cost_q8k = 40, cost_f6 = 29;
+/* cost multipliers for the plans of a T-token verification pass: FP4 goes
+ * through the multi-token kernels, K-quant matrices run T single passes */
+static double mt_cost_f4 = 1, mt_cost_kq = 1;
 static double group_cost(const q38d_mat *m) {
     double cpp = m->fmt == Q38D_F4 ? 18.3 : m->fmt == Q38D_F6 ? cost_f6 : m->fmt == Q38D_Q6K ? cost_q6k :
                  m->fmt == Q38D_Q8K ? cost_q8k : cost_q4k;
-    return cpp * (m->cols / 32);
+    return cpp * (m->cols / 32) * (m->fmt == Q38D_F4 ? mt_cost_f4 : mt_cost_kq);
 }
 #define PLAN_STARTUP 1500.0 /* cycles of cold start per segment */
 static void plan_add2(q38d_tplan *tp, int i, int i2, int g) {
@@ -1493,6 +1496,7 @@ static void step(int tid, int token, int pos, int want_head, int *gs, int *cs) {
  * the drafter's previous output) and the embedding of `token` (= x_{pos+1}),
  * one attention layer at position pos predicts x_{pos+2} (E.mtp_draft when
  * want_head). The drafter's output hidden is kept in E.h_mtp for chaining. */
+static void embed_token_to(int tid, int token, float *dst);
 static void rmsnorm_to(float *dst, const float *x, const float *w) {
     double ss = 0;
     for (int i = 0; i < EMBD; i++) ss += (double)x[i] * x[i];
@@ -1503,14 +1507,34 @@ static void mtp_step(int tid, int token, int pos, const float *hidden, int want_
     uint64_t t = ticks();
     static float *save_x;
     static int save_next;
-    if (tid == 0) {
-        if (E.embed_q6k) dequant_row(GGML_TYPE_Q6_K, E.embed_q6k + (size_t)token * E.embed_row_bytes, E.x_mtp, EMBD);
-        else q38_lowbit_matrix_row(E.x_mtp, E.embed_lb, token);
-        rmsnorm_to(E.mtp_in, E.x_mtp, E.enorm);
-        rmsnorm_to(E.mtp_in + EMBD, hidden, E.hnorm);
-        q38d_prepare_ref(&E.act_mtp, E.mtp_in);
-        save_x = E.x;
-        save_next = E.next_token;
+    /* input [enorm(emb(token)); hnorm(hidden)], prepared by all workers:
+     * embedding blocks, then every worker takes both norms' sums of squares
+     * (fixed order) and quantizes its share of the 320 pairs */
+    embed_token_to(tid, token, E.x_mtp);
+    if (tid == 0) { save_x = E.x; save_next = E.next_token; }
+    gbarrier(tid, gs);
+    {
+        float inv_e = 1.0f / sqrtf(sumsq(E.x_mtp, EMBD) / EMBD + E.eps);
+        float inv_h = 1.0f / sqrtf(sumsq(hidden, EMBD) / EMBD + E.eps);
+        int np = EMBD / 32, p0 = 2 * np * tid / NT, p1 = 2 * np * (tid + 1) / NT;
+        if (E.arith == Q38D_F32) {
+            for (int i = 32 * p0; i < 32 * p1; i++)
+                E.mtp_in[i] = i < EMBD ? E.x_mtp[i] * inv_e * E.enorm[i] : hidden[i - EMBD] * inv_h * E.hnorm[i - EMBD];
+        } else {
+            /* pairs [p0, p1) of the 10240-column activation, in two halves */
+            q38d_act *a = &E.act_mtp;
+            if (p0 < np) {
+                q38d_act ae = *a;
+                ae.cols = EMBD;
+                q38d_prepare_pairs(&ae, E.x_mtp, inv_e, E.enorm, p0, p1 < np ? p1 : np);
+            }
+            if (p1 > np) {
+                q38d_act ah = *a;
+                ah.cols = EMBD;
+                ah.q = a->q + (size_t)np * 64; ah.sc = a->sc + 2 * np; ah.sum = a->sum + 2 * np;
+                q38d_prepare_pairs(&ah, hidden, inv_h, E.hnorm, p0 > np ? p0 - np : 0, p1 - np);
+            }
+        }
     }
     gbarrier(tid, gs);
     mv(&E.eh, &E.act_mtp, E.x_mtp, 0, tid);
@@ -1759,7 +1783,7 @@ static void norm_mt(int tid, float *const *xs, int T, const float *w, int *cs) {
 typedef struct { float part[2][TMAX][8]; _Atomic int cnt; char pad[252]; } q38d_split_mt;
 static q38d_split_mt split_mt[NCMG][PER + 1];
 /* K-chunked residual matvec for T tokens (add into MT.x[t]) */
-static void mv_items_mt(const q38d_mat *m, int T, int tid) {
+static void mv_items_mt(const q38d_mat *m, int T, int tid, float *const *xs) {
     int c = tid / PER, l = tid % PER, i0, i1;
     lane_items(m, c, l, &i0, &i1);
     if (i1 <= i0) return;
@@ -1795,7 +1819,7 @@ static void mv_items_mt(const q38d_mat *m, int T, int tid) {
         int full = g * m->kch >= i0 && g * m->kch + m->kch - 1 < i1;
         int row = m->first[c] + 8 * g;
         if (full) {
-            for (int t = 0; t < T; t++) for (int r = 0; r < 8; r++) MT.x[t][row + r] += accg[g - gf][t][r];
+            for (int t = 0; t < T; t++) for (int r = 0; r < 8; r++) xs[t][row + r] += accg[g - gf][t][r];
             continue;
         }
         int b = g * m->kch < i0 ? l : l + 1, side = g * m->kch < i0 ? 1 : 0;
@@ -1804,7 +1828,7 @@ static void mv_items_mt(const q38d_mat *m, int T, int tid) {
         int old = atomic_fetch_add_explicit(&sp->cnt, 1, memory_order_acq_rel);
         if (old & 1)
             for (int t = 0; t < T; t++)
-                for (int r = 0; r < 8; r++) MT.x[t][row + r] += sp->part[0][t][r] + sp->part[1][t][r];
+                for (int r = 0; r < 8; r++) xs[t][row + r] += sp->part[0][t][r] + sp->part[1][t][r];
     }
 }
 static void embed_token_to(int tid, int token, float *dst) {
@@ -1820,16 +1844,16 @@ static void embed_token_to(int tid, int token, float *dst) {
     }
 }
 /* argmax of the head for residual x -> *id, *logit (all workers) */
-static void head_token(int tid, float *x, int *gs, int *cs, int *id, float *logit) {
+static void head_token_m(int tid, float *x, const float *nw, const q38d_mat *hm, int *gs, int *cs, int *id, float *logit) {
     int c = tid / PER;
     float *xs[1] = {x};
-    norm_mt(tid, xs, 1, E.out_norm, cs);
-    mv(&E.head, &MT.act_c[c][0], E.logits, 0, tid);
+    norm_mt(tid, xs, 1, nw, cs);
+    mv(hm, &MT.act_c[c][0], E.logits, 0, tid);
     {
         int cc, g0, g1;
-        mat_range(&E.head, tid, &cc, &g0, &g1);
-        int r0 = E.head.first[cc] + 8 * g0, r1 = E.head.first[cc] + 8 * g1;
-        if (r1 > E.head.first[cc + 1]) r1 = E.head.first[cc + 1];
+        mat_range(hm, tid, &cc, &g0, &g1);
+        int r0 = hm->first[cc] + 8 * g0, r1 = hm->first[cc] + 8 * g1;
+        if (r1 > hm->first[cc + 1]) r1 = hm->first[cc + 1];
         float best = -INFINITY; int bi = -1;
         for (int r = r0; r < r1; r++) if (E.logits[r] > best) { best = E.logits[r]; bi = r; }
         E.best_val[tid] = best; E.best_idx[tid] = bi;
@@ -1841,6 +1865,9 @@ static void head_token(int tid, float *x, int *gs, int *cs, int *id, float *logi
         *id = bi; *logit = best;
     }
     gbarrier(tid, gs);
+}
+static void head_token(int tid, float *x, int *gs, int *cs, int *id, float *logit) {
+    head_token_m(tid, x, E.out_norm, &E.head, gs, cs, id, logit);
 }
 /* output head for T tokens (Q8K multi-token kernel) -> MT.argmax/logit */
 static void head_mt(int tid, int T, int *gs, int *cs) {
@@ -1890,64 +1917,66 @@ static void head_mt(int tid, int T, int *gs, int *cs) {
         }
     gbarrier(tid, gs);
 }
-static int head_multi = 1;
-static void step_mt(int tid, const int *tok, int pos0, int T, int *gs, int *cs) {
-    uint64_t t = ticks();
+static int head_multi = 1, mt_plans = 0;
+/* worker-0 time split of speculative decoding (ticks): 0 norm, 1 proj,
+ * 2 cores, 3 head, 4 phase barriers, 5 MTP catch-up + drafts */
+static double sp_t[6];
+#define SP_T(k, ...) do { uint64_t a_ = tid ? 0 : ticks(); __VA_ARGS__; if (!tid) sp_t[k] += (double)(ticks() - a_); } while (0)
+/* one layer for T tokens with residuals xs[0..T) */
+static void layer_mt(int tid, int layer, int pos0, int T, float *const *xs, int *gs, int *cs, uint64_t *tp) {
+#define t (*tp)
     const int c = tid / PER, l = tid % PER;
-    for (int i = 0; i < T; i++) embed_token_to(tid, tok[i], MT.x[i]);
-    phase_end(tid, gs, &t, P_EMBED);
-    for (int layer = 0; layer < NLAYER; layer++) {
         const q38d_layer *L = &E.L[layer];
         pf_layer[tid] = layer;
-        norm_mt(tid, MT.x, T, L->attn_norm, cs);
+        SP_T(0, norm_mt(tid, xs, T, L->attn_norm, cs));
         if (L->ssm) {
             float *(outs[4])[TMAX];
             for (int i = 0; i < T; i++) { outs[0][i] = MT.qkv[i]; outs[1][i] = MT.zb[i]; outs[2][i] = MT.ab[i]; outs[3][i] = MT.bb[i]; }
-            run_plan_mt(&plan_ssm[layer], T, MT.act_c[c], outs, tid);
-            if (inproj_cbar && ssm_perm) phase_end_c(tid, cs, &t, P_SSM_IN);
+            SP_T(1, run_plan_mt(plan_ssm_mt && mt_plans ? &plan_ssm_mt[layer] : &plan_ssm[layer], T, MT.act_c[c], outs, tid));
+            if (inproj_cbar && ssm_perm) SP_T(4, phase_end_c(tid, cs, &t, P_SSM_IN));
             else phase_end(tid, gs, &t, P_SSM_IN);
             int hh = ssm_head_of(tid);
-            for (int i = 0; i < T; i++) {
+            SP_T(2, for (int i = 0; i < T; i++) {
                 q38d_io io = {MT.qkv[i], MT.zb[i], MT.ab[i], MT.bb[i], NULL, NULL, NULL, MT.o[i], &MT.act_o[i], i};
                 ssm_head_io(layer, hh, pos0 + i, &io);
-            }
-            phase_end(tid, gs, &t, P_SSM_CORE);
+            });
+            SP_T(4, phase_end(tid, gs, &t, P_SSM_CORE));
             {
                 int cc, g0, g1;
                 mat_range(&L->out, tid, &cc, &g0, &g1);
                 float *oa[TMAX];
-                for (int i = 0; i < T; i++) oa[i] = MT.x[i] + L->out.first[c];
-                mt_mat(T, &L->out, NULL, c, g0, g1, MT.act_o, oa, NULL, 1);
+                for (int i = 0; i < T; i++) oa[i] = xs[i] + L->out.first[c];
+                SP_T(1, mt_mat(T, &L->out, NULL, c, g0, g1, MT.act_o, oa, NULL, 1));
             }
-            phase_end(tid, gs, &t, P_SSM_OUT);
+            SP_T(4, phase_end(tid, gs, &t, P_SSM_OUT));
         } else {
             float *(outs[3])[TMAX];
             for (int i = 0; i < T; i++) { outs[0][i] = MT.qg[i]; outs[1][i] = MT.kb[i]; outs[2][i] = MT.vb[i]; }
-            run_plan_mt(&plan_att[layer], T, MT.act_c[c], outs, tid);
-            if (inproj_cbar && attn_cmg_ok) phase_end_c(tid, cs, &t, P_ATT_IN);
+            SP_T(1, run_plan_mt(plan_att_mt && mt_plans ? &plan_att_mt[layer] : &plan_att[layer], T, MT.act_c[c], outs, tid));
+            if (inproj_cbar && attn_cmg_ok) SP_T(4, phase_end_c(tid, cs, &t, P_ATT_IN));
             else phase_end(tid, gs, &t, P_ATT_IN);
-            for (int i = 0; i < T; i++) {
+            SP_T(2, for (int i = 0; i < T; i++) {
                 q38d_io io = {NULL, NULL, NULL, NULL, MT.qg[i], MT.kb[i], MT.vb[i], MT.o[i], &MT.act_o[i], -1};
                 attention_io(layer, tid, pos0 + i, cs, &io);
-            }
-            phase_end(tid, gs, &t, P_ATT_CORE);
+            });
+            SP_T(4, phase_end(tid, gs, &t, P_ATT_CORE));
             {
                 int cc, g0, g1;
                 mat_range(&L->o, tid, &cc, &g0, &g1);
                 float *oa[TMAX];
-                for (int i = 0; i < T; i++) oa[i] = MT.x[i] + L->o.first[c];
-                mt_mat(T, &L->o, NULL, c, g0, g1, MT.act_o, oa, NULL, 1);
+                for (int i = 0; i < T; i++) oa[i] = xs[i] + L->o.first[c];
+                SP_T(1, mt_mat(T, &L->o, NULL, c, g0, g1, MT.act_o, oa, NULL, 1));
             }
-            phase_end(tid, gs, &t, P_ATT_OUT);
+            SP_T(4, phase_end(tid, gs, &t, P_ATT_OUT));
         }
-        norm_mt(tid, MT.x, T, L->post_norm, cs);
+        SP_T(0, norm_mt(tid, xs, T, L->post_norm, cs));
         {
             int rows = L->gate.first[c + 1] - L->gate.first[c];
             int G8 = rows / 8, g0 = G8 * l / PER, g1 = G8 * (l + 1) / PER;
             int base = L->gate.first[c];
             float *oa[TMAX], *ob[TMAX];
             for (int i = 0; i < T; i++) { oa[i] = MT.h[i] + base; ob[i] = MT.qkv[i] + base; }
-            mt_mat(T, &L->gate, &L->up, c, g0, g1, MT.act_c[c], oa, ob, 0);
+            SP_T(1, mt_mat(T, &L->gate, &L->up, c, g0, g1, MT.act_c[c], oa, ob, 0));
             const svbool_t p8 = svptrue_pat_b32(SV_VL8);
             for (int i = 0; i < T; i++) {
                 for (int g = g0; g < g1; g++) {
@@ -1967,15 +1996,72 @@ static void step_mt(int tid, const int *tok, int pos0, int T, int *gs, int *cs) 
                 }
             }
         }
-        phase_end(tid, gs, &t, P_FFN_UP);
-        mv_items_mt(&L->down, T, tid);
-        phase_end(tid, gs, &t, P_FFN_DOWN);
-    }
-    if (head_multi) head_mt(tid, T, gs, cs);
+        SP_T(4, phase_end(tid, gs, &t, P_FFN_UP));
+        SP_T(1, mv_items_mt(&L->down, T, tid, xs));
+        SP_T(4, phase_end(tid, gs, &t, P_FFN_DOWN));
+    #undef t
+}
+static void step_mt(int tid, const int *tok, int pos0, int T, int *gs, int *cs) {
+    uint64_t t = ticks();
+    for (int i = 0; i < T; i++) embed_token_to(tid, tok[i], MT.x[i]);
+    phase_end(tid, gs, &t, P_EMBED);
+    for (int layer = 0; layer < NLAYER; layer++) layer_mt(tid, layer, pos0, T, MT.x, gs, cs, &t);
+    if (head_multi) SP_T(3, head_mt(tid, T, gs, cs));
     else for (int i = 0; i < T; i++) head_token(tid, MT.x[i], gs, cs, &MT.argmax[i], &MT.logit[i]);
     prof_mark(tid, &t, P_HEAD);
 }
+/* NextN drafter over the A positions accepted by a verification pass, as one
+ * A-token pass: inputs (hidden MT.x[i], token nxt[i] = x_{pos+i+1}) at
+ * positions pos+i; the last position's output hidden goes to E.h_mtp and its
+ * draft (x_{pos+A+1}) to E.mtp_draft. */
+static float *mtp_em[TMAX], *mtp_xm[TMAX];
+static q38d_act mtp_act_t[TMAX];
+static int mtp_batch = 1;
+static void mtp_catchup_mt(int tid, const int *nxt, int pos, int A, int *gs, int *cs) {
+    uint64_t t = ticks();
+    for (int i = 0; i < A; i++) embed_token_to(tid, nxt[i], mtp_em[i]);
+    gbarrier(tid, gs);
+    const int np = EMBD / 32, p0 = 2 * np * tid / NT, p1 = 2 * np * (tid + 1) / NT;
+    for (int i = 0; i < A; i++) {
+        float inv_e = 1.0f / sqrtf(sumsq(mtp_em[i], EMBD) / EMBD + E.eps);
+        float inv_h = 1.0f / sqrtf(sumsq(MT.x[i], EMBD) / EMBD + E.eps);
+        q38d_act *a = &mtp_act_t[i];
+        if (p0 < np) {
+            q38d_act ae = *a;
+            ae.cols = EMBD;
+            q38d_prepare_pairs(&ae, mtp_em[i], inv_e, E.enorm, p0, p1 < np ? p1 : np);
+        }
+        if (p1 > np) {
+            q38d_act ah = *a;
+            ah.cols = EMBD;
+            ah.q = a->q + (size_t)np * 64; ah.sc = a->sc + 2 * np; ah.sum = a->sum + 2 * np;
+            q38d_prepare_pairs(&ah, MT.x[i], inv_h, E.hnorm, p0 > np ? p0 - np : 0, p1 - np);
+        }
+    }
+    gbarrier(tid, gs);
+    {
+        int c, g0, g1;
+        mat_range(&E.eh, tid, &c, &g0, &g1);
+        float *oa[TMAX];
+        for (int i = 0; i < A; i++) oa[i] = mtp_xm[i] + E.eh.first[c];
+        mt_mat(A, &E.eh, NULL, c, g0, g1, mtp_act_t, oa, NULL, 0);
+    }
+    gbarrier(tid, gs);
+    layer_mt(tid, NLAYER, pos, A, mtp_xm, gs, cs, &t);
+    if (tid == 0) memcpy(E.h_mtp, mtp_xm[A - 1], EMBD * sizeof(float));
+    int id = 0;
+    float lg = 0;
+    head_token_m(tid, mtp_xm[A - 1], E.shnorm, draft_v ? &E.dhead : &E.head, gs, cs, &id, &lg);
+    if (tid == 0) E.mtp_draft = id;
+    gbarrier(tid, gs);
+}
 static void mt_alloc(void) {
+    for (int t = 0; t < TMAX; t++) {
+        mtp_em[t] = aligned_alloc(256, EMBD * 4);
+        mtp_xm[t] = aligned_alloc(256, EMBD * 4);
+        mtp_act_t[t] = (q38d_act){2 * EMBD, E.arith, aligned_alloc(256, q38d_act_qbytes(2 * EMBD, Q38D_A16)),
+                                  aligned_alloc(256, 2 * EMBD / 16 * 4), aligned_alloc(256, 2 * EMBD / 16 * 4), NULL};
+    }
     for (int t = 0; t < TMAX; t++) {
         mt_logits[t] = aligned_alloc(256, (size_t)E.n_vocab * 4);
         MT.x[t] = aligned_alloc(256, EMBD * 4);
@@ -2162,15 +2248,22 @@ static void *worker(void *arg) {
                 hist[A]++;
             }
             gbarrier(tid, &gs);
+            uint64_t tm0 = tid ? 0 : ticks();
             if (n + A < gn) {
-                for (int i = 0; i < A; i++)
-                    mtp_step(tid, i + 1 < A ? tok[i + 1] : bonus, pos + i, MT.x[i], i == A - 1, &gs, &cs);
+                if (mtp_batch) {
+                    int nxt[TMAX];
+                    for (int i = 0; i < A; i++) nxt[i] = i + 1 < A ? tok[i + 1] : bonus;
+                    mtp_catchup_mt(tid, nxt, pos, A, &gs, &cs);
+                } else
+                    for (int i = 0; i < A; i++)
+                        mtp_step(tid, i + 1 < A ? tok[i + 1] : bonus, pos + i, MT.x[i], i == A - 1, &gs, &cs);
                 dr[0] = E.mtp_draft;
                 for (int k = 1; k < spec_k; k++) {
                     mtp_step(tid, dr[k - 1], pos + A - 1 + k, E.h_mtp, 1, &gs, &cs);
                     dr[k] = E.mtp_draft;
                 }
             }
+            if (!tid) sp_t[5] += (double)(ticks() - tm0);
             n += A; pos += A; cur = bonus; passes++;
         }
         if (tid == 0) {
@@ -2178,6 +2271,10 @@ static void *worker(void *arg) {
             fprintf(stderr, "q38d: spec k=%d: %d passes, %.3f tokens/pass, accepted-length histogram:", spec_k, passes, (double)gn / passes);
             for (int a = 1; a <= spec_k + 1; a++) fprintf(stderr, " %d:%d", a, hist[a]);
             fprintf(stderr, "\n");
+            double hz = tick_hz();
+            fprintf(stderr, "q38d: spec worker0 ms/pass: norm=%.2f proj=%.2f cores=%.2f head=%.2f phase_wait=%.2f mtp=%.2f\n",
+                    sp_t[0] / hz * 1e3 / passes, sp_t[1] / hz * 1e3 / passes, sp_t[2] / hz * 1e3 / passes,
+                    sp_t[3] / hz * 1e3 / passes, sp_t[4] / hz * 1e3 / passes, sp_t[5] / hz * 1e3 / passes);
         }
         return NULL;
     }
@@ -2253,6 +2350,8 @@ int main(int argc, char **argv) {
     if (getenv("Q38D_VBENCH")) vbench_T = atoi(getenv("Q38D_VBENCH"));
     if (getenv("Q38D_MTP")) mtp_on = atoi(getenv("Q38D_MTP")) != 0;
     if (getenv("Q38D_SPEC")) spec_k = atoi(getenv("Q38D_SPEC"));
+    if (getenv("Q38D_MT_PLANS")) mt_plans = atoi(getenv("Q38D_MT_PLANS"));
+    if (getenv("Q38D_MTP_BATCH")) mtp_batch = atoi(getenv("Q38D_MTP_BATCH"));
     if (getenv("Q38D_DRAFT_V")) draft_v = atoi(getenv("Q38D_DRAFT_V"));
     if (getenv("Q38D_HEAD_MULTI")) head_multi = atoi(getenv("Q38D_HEAD_MULTI"));
     if (spec_k) {
@@ -2349,6 +2448,32 @@ int main(int argc, char **argv) {
             P->m[0] = &L->q; P->out[0] = E.qg; P->m[1] = &L->k; P->out[1] = E.kb; P->m[2] = &L->v; P->out[2] = E.vb;
             build_plan(P);
         }
+    }
+    if (spec_k) {
+        /* verification-pass plans: T = spec_k + 1 tokens */
+        int T = spec_k + 1;
+        double sv_dual = dual_cost;
+        mt_cost_f4 = T == 2 ? 1.72 : T == 3 ? 2.0 : 2.3;
+        mt_cost_kq = T;
+        dual_cost = 2.0;
+        if (getenv("Q38D_MT_COST_F4")) mt_cost_f4 = atof(getenv("Q38D_MT_COST_F4"));
+        plan_ssm_mt = calloc(NLAYER + 1, sizeof(q38d_plan));
+        plan_att_mt = calloc(NLAYER + 1, sizeof(q38d_plan));
+        for (int l = 0; l < NLAYER + mtp_on; l++) {
+            q38d_layer *L = &E.L[l];
+            if (L->ssm) {
+                q38d_plan *P = &plan_ssm_mt[l];
+                *P = plan_ssm[l];
+                if (use_dual && L->qkv.fmt == L->z.fmt && L->qkv.fmt == Q38D_F4 && L->qkv.cols == L->z.cols) build_plan_ssm_dual(P);
+                else build_plan(P);
+            } else {
+                q38d_plan *P = &plan_att_mt[l];
+                *P = plan_att[l];
+                build_plan(P);
+            }
+        }
+        mt_cost_f4 = mt_cost_kq = 1;
+        dual_cost = sv_dual;
     }
     if (getenv("Q38D_PLAN_DUMP")) {
         for (int k = 0; k < 2; k++) {
