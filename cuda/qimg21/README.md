@@ -2023,10 +2023,31 @@ Decoded PSNR is 20.7 dB, but the image is a clean apple of the same quality
 with a different pose; W4A4 trajectories diverge more than W8A8, consistent
 with the LPIPS of 0.14 to 0.19 reported for published SVDQuant builds.
 
-It is not fast yet: 2.47 s per step. An nsys profile shows 2.0 s per step in
-the W4A4 GEMM, about 29 TOPS against the 406 TOPS FP4 MMA peak (no
-double-buffering, scalar shared-memory tiles, one sync per 64-wide K step).
-A CUTLASS sm120 block-scaled GEMM is the next step.
+The default `--fp4-gemm cutlass` runs the GEMM with CUTLASS 4.6's sm120
+block-scaled NVFP4 mainloop (`libq21_fast_fp4.so`, the configuration of
+example 79a, pinned CUTLASS source), with `D = alpha*acc + D` in BF16:
+
+- The package uses one F32 weight scale per matrix (`--fp4-scale matrix`,
+  the default), and the activation gets one F32 scale per GEMM. `alpha` is
+  their product, held in a device scalar.
+- Activation and weight group scales use CUTLASS's interleaved layout (a
+  128-row by 4-group atom of 512 bytes). The runner's closed form was
+  checked against CUTLASS's own layout function. Weight scales are
+  converted at load time.
+
+Standalone example 79a measures 250 TFLOPS at 4096x12288x4096, 227 TFLOPS at
+4096x24576x4096 and 115 TFLOPS at 4096x4096x12288 on this card.
+
+| FP4 GEMM | Per step | Max MRE | Min trajectory cosine | Decoded PSNR |
+|---|---:|---:|---:|---:|
+| omma (hand kernel, row scales) | 2.473 s | 0.129 | 0.9757 | 20.7 dB |
+| cutlass (matrix scales) | 0.817 s | 0.104 | 0.9869 | 24.1 dB |
+
+Both are 1024x1024, 40 steps, all blocks resident, with 5.4 GB process peak
+(`--fp4-gemm omma` keeps the hand kernel as a reference). The CUTLASS image
+is again a clean apple close to the reference pose. BF16, INT8 and NVFP4 now
+run at 1.98 s, 0.96 s and 0.82 s per step; attention (about 0.35 s) is the
+largest remaining NVFP4 cost.
 
 The published ModelsLab/Qwen-Image-2.1-W4A4-nvfp4 checkpoint (SHA-256
 `779f7178...242c7a`, in `/mnt/nvme01/models/qimg-21-w4a4-nvfp4`) was also

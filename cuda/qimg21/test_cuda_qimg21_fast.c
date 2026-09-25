@@ -71,7 +71,7 @@ typedef struct {
     cublasew_context *blas;
     CUmodule module;
     CUfunction cast_bf16, txt_norm, gelu, silu, mod_prepare, scale_prepare, norm_mod, norm_mod_q8, quant_rows,
-        dequant, qk_norm_rope, fp4_act, w4a4_bf16, swiglu, euler, cfg_combine, checksum, colmax;
+        dequant, qk_norm_rope, fp4_act, w4a4_bf16, fp4_rowmax, fp4_act_cl, swiglu, euler, cfg_combine, checksum, colmax;
     void *plugin;
     q21f_attention_fn attention;
     q21f_layout layout, i8, fp4;
@@ -79,6 +79,13 @@ typedef struct {
     /* NVFP4 activation codes [rows][F/8], group scales [rows][F/16], token
      * scales [rows], and the low-rank down projection [rows][RANK] */
     CUdeviceptr ac, as, at, lrd;
+    /* CUTLASS block-scaled GEMM (--fp4-gemm cutlass): interleaved activation
+     * scale factors, the activation maximum and the per-GEMM alpha. */
+    void *fp4_plugin;
+    int (*fp4_gemm)(void *, const void *, const void *, const void *, const void *, const float *, int, int, int,
+                    void *);
+    CUdeviceptr sfa, gmax, alpha;
+    size_t sfa_bytes;
     q21f_block block[Q21F_BLOCKS];
     /* INT8 activations [rows+16][F], per-row scales, INT32 GEMM scratch */
     CUdeviceptr xq, xs, acc;
@@ -171,6 +178,25 @@ static void q21f_fp4_layout_init(q21f_layout *l) {
     l->offset[FP4_NK] = o;
     o += 512;
     l->bytes = o;
+}
+
+/* Rewrite each NVFP4 group's plain [n][k/16] E4M3 scales into CUTLASS's
+ * interleaved layout (128-row x 4-group atoms of 512 bytes, K atoms fastest). */
+static int q21f_fp4_cutlass_scales(const q21f_layout *l, uint8_t *blob) {
+    size_t D = Q21F_D, F = Q21F_F;
+    size_t nk[4][2] = {{3 * D, D}, {D, D}, {2 * F, D}, {D, F}};
+    for (int g = 0; g < 4; g++) {
+        size_t n = nk[g][0], kg = nk[g][1] / 16;
+        uint8_t *gs = blob + l->offset[FP4_PART(g, FP4_GS)], *tmp = (uint8_t *)malloc(n * kg);
+        if (!tmp) return -1;
+        for (size_t r = 0; r < n; r++)
+            for (size_t j = 0; j < kg; j++)
+                tmp[((r >> 7) * (kg >> 2) + (j >> 2)) * 512 + (r & 31) * 16 + ((r & 127) >> 5) * 4 + (j & 3)] =
+                    gs[r * kg + j];
+        memcpy(gs, tmp, n * kg);
+        free(tmp);
+    }
+    return 0;
 }
 
 /* Copy one BF16 matrix (or an F32/BF16 vector as F32) into a host blob. */
@@ -334,6 +360,20 @@ static int q21f_linear_fp4(q21f_runtime *rt, CUdeviceptr w, int group, CUdevicep
     if (q21f_gemm(rt, rt->lrd, Q21F_RANK, down, x, ldx, m, Q21F_RANK, k) ||
         q21f_gemm(rt, y, ldy, up, rt->lrd, Q21F_RANK, m, n, Q21F_RANK))
         return -1;
+    if (rt->fp4_gemm) {
+        /* Weight group scales were converted to CUTLASS's layout at load. */
+        size_t sf = (size_t)((m + 127) / 128) * 128 * (k / 16);
+        if (ldy != n || sf > rt->sfa_bytes || cuMemsetD32Async(rt->gmax, 0, 1, rt->compute) ||
+            cuMemsetD8Async(rt->sfa, 0, sf, rt->compute))
+            return -1;
+        void *ra[] = {&rt->gmax, &x, &ldx, &inv, &k};
+        if (q21f_launch(rt, rt->fp4_rowmax, (unsigned)m, 1, 256, ra)) return -1;
+        void *qa[] = {&rt->ac, &rt->sfa, &rt->alpha, &rt->gmax, &wc, &x, &ldx, &inv, &k};
+        if (q21f_launch(rt, rt->fp4_act_cl, (unsigned)m, 1, 256, qa)) return -1;
+        return rt->fp4_gemm((void *)(uintptr_t)y, (const void *)(uintptr_t)rt->ac, (const void *)(uintptr_t)rt->sfa,
+                            (const void *)(uintptr_t)codes, (const void *)(uintptr_t)gs,
+                            (const float *)(uintptr_t)rt->alpha, m, n, k, (void *)rt->compute) ? -1 : 0;
+    }
     void *qa[] = {&rt->ac, &rt->as, &rt->at, &x, &ldx, &inv, &k};
     if (q21f_launch(rt, rt->fp4_act, (unsigned)m, 1, 256, qa)) return -1;
     int lr = 1;
@@ -755,7 +795,7 @@ static void q21f_usage(const char *argv0) {
             "  [--editing-layout L.txt --condition-latents C.npy [--negative-editing-layout NL.txt]]\n"
             "  [--vram-budget-mib MIB] [--cfg-batch 0|1] [--fused-gemm 0|1] [--kv-cache on|off]\n"
             "  [--prefix-pass extract|separate] [--plan-only] [--profile]\n"
-            "  [--weights bf16|int8|nvfp4 --quant-package DIR [--bf16-blocks 0,31]]\n"
+            "  [--weights bf16|int8|nvfp4 --quant-package DIR [--bf16-blocks 0,31]] [--fp4-gemm cutlass|omma]\n"
             "  diagnostics: [--trace] [--verify-slots] [--stage-dir DIR] [--calib-dump FILE.npy]\n"
             "  [--attention cutlass-efficient|flash] [--normalization vector4] [--rope host-table-exact]\n"
             "  [--attention-plugin PATH] [--rope-table-base PATH]\n"
@@ -769,7 +809,7 @@ int main(int argc, char **argv) {
     const char *plugin_path = NULL;
     const char *rope_path = "cuda/qimg21/qwen21_rope_freqs.npy";
     const char *stage_dir = NULL, *calib_path = NULL, *package = NULL, *bf16_blocks = NULL;
-    int int8_weights = 0, tail_blocks = 0;
+    int int8_weights = 0, tail_blocks = 0, fp4_cutlass = 1;
     char tail_list[160] = "";
     int ih = 16, iw = 16, steps = 1, verbose = 1, cfg_batch = 1, plan_only = 0, profile = 0, fused_gemm = 1;
     int kv_cache = 1, extract = 1, trace = 0, verify_slots = 0, flash = 0;
@@ -812,6 +852,11 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--stage-dir") && more) stage_dir = argv[++i];
         else if (!strcmp(a, "--calib-dump") && more) calib_path = argv[++i];
         else if (!strcmp(a, "--quant-package") && more) package = argv[++i];
+        else if (!strcmp(a, "--fp4-gemm") && more) {
+            const char *m = argv[++i];
+            if (strcmp(m, "cutlass") && strcmp(m, "omma")) { q21f_usage(argv[0]); return 2; }
+            fp4_cutlass = !strcmp(m, "cutlass");
+        }
         /* Harness aliases so regression.py/editing_regression.py can drive
          * the fast W8A8 path: the package must be a pack_fast.py package. */
         else if (!strcmp(a, "--quantized-transformer") && more) package = argv[++i];
@@ -943,6 +988,14 @@ int main(int argc, char **argv) {
                               CU_COMPILE_ARCH_A) >= 0, "FP4 kernel compile failed");
     CK(cuModuleGetFunction(&rt.fp4_act, rt.fp4_module, "fp4_act"));
     CK(cuModuleGetFunction(&rt.w4a4_bf16, rt.fp4_module, "w4a4_bf16"));
+    CK(cuModuleGetFunction(&rt.fp4_rowmax, rt.fp4_module, "fp4_rowmax"));
+    CK(cuModuleGetFunction(&rt.fp4_act_cl, rt.fp4_module, "fp4_act_cl"));
+    if (int8_weights == 2 && fp4_cutlass) {
+        rt.fp4_plugin = dlopen("cuda/qimg21/libq21_fast_fp4.so", RTLD_NOW | RTLD_LOCAL);
+        REQ(rt.fp4_plugin, "cannot load CUTLASS FP4 plugin: %s (use --fp4-gemm omma)", dlerror());
+        *(void **)&rt.fp4_gemm = dlsym(rt.fp4_plugin, "q21f_fp4_gemm");
+        REQ(rt.fp4_gemm, "q21f_fp4_gemm missing");
+    }
     GETF(euler, "euler"); GETF(cfg_combine, "cfg_combine"); GETF(checksum, "checksum"); GETF(colmax, "colmax");
 #undef GETF
     /* cutlass-efficient is PyTorch's memory-efficient kernel (reference
@@ -1011,7 +1064,7 @@ int main(int argc, char **argv) {
         rt.acc_bytes = 128 * Q21F_MIB;
         plan.activations += ((size_t)st.rows_max + 16) * (Q21F_F + 4) + rt.acc_bytes;
     } else if (int8_weights == 2)
-        plan.activations += (size_t)st.rows_max * (Q21F_F / 2 + Q21F_F / 16 + 4 + Q21F_RANK * 2);
+        plan.activations += (size_t)st.rows_max * (Q21F_F / 2 + Q21F_F / 8 + 4 + Q21F_RANK * 2) + 128 * Q21F_F / 16;
     for (int i = 0; i < nb; i++)
         plan.kv += ((size_t)Q21F_BLOCKS * br[i].prefix + br[i].prefix + N) * Q21F_D * 2 * 2 +
                    (size_t)br[i].prefix * Q21F_D * 2 + (size_t)(br[i].prefix + N) * 128 * 4;
@@ -1091,6 +1144,8 @@ int main(int argc, char **argv) {
         if (rt.block[b].kind == Q21F_KIND_INT8 || rt.block[b].kind == Q21F_KIND_NVFP4) {
             ssize_t got = pread(package_fd, dst, bytes, (off_t)b * (off_t)qlay->bytes);
             REQ(got == (ssize_t)bytes, "short read of quantized block %d", b);
+            if (rt.block[b].kind == Q21F_KIND_NVFP4 && rt.fp4_gemm)
+                REQ(!q21f_fp4_cutlass_scales(&rt.fp4, dst), "block %d scale layout", b);
         } else REQ(!q21f_pack_block(&shards, &rt.layout, b, dst), "block %d", b);
         if (rt.block[b].resident) {
             rt.block[b].dev = q21f_alloc(&rt, bytes);
@@ -1105,6 +1160,13 @@ int main(int argc, char **argv) {
         rt.at = q21f_alloc(&rt, (size_t)st.rows_max * 4);
         rt.lrd = q21f_alloc(&rt, (size_t)st.rows_max * Q21F_RANK * 2);
         REQ(rt.ac && rt.as && rt.at && rt.lrd, "NVFP4 activation buffers");
+        if (rt.fp4_gemm) {
+            rt.sfa_bytes = (size_t)((st.rows_max + 127) / 128) * 128 * (Q21F_F / 16);
+            rt.sfa = q21f_alloc(&rt, rt.sfa_bytes);
+            rt.gmax = q21f_alloc(&rt, 4);
+            rt.alpha = q21f_alloc(&rt, 4);
+            REQ(rt.sfa && rt.gmax && rt.alpha, "CUTLASS FP4 buffers");
+        }
     }
     if (int8_weights == 1) {
         rt.xq = q21f_alloc(&rt, ((size_t)st.rows_max + 16) * Q21F_F);

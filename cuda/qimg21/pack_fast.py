@@ -50,13 +50,17 @@ def layout_fp4():
     return parts, offset
 
 
-def quantize_nvfp4(r):
+def quantize_nvfp4(r, per_matrix=False):
     """r [n, k] float32 -> (codes u8 [n, k/2] low nibble = even k, group e4m3 bytes [n, k/16],
-    row scale f32 [n], dequantized [n, k])."""
+    row scale f32 [n], dequantized [n, k]). per_matrix uses one F32 scale for all rows so a
+    block-scaled GEMM can apply it as a scalar alpha."""
     n, k = r.shape
     g = r.reshape(n, k // 16, 16)
     amax = g.abs().amax(2)
-    wc = (amax.amax(1) / (6.0 * 448.0)).clamp_min(1e-30)
+    if per_matrix:
+        wc = (amax.max() / (6.0 * 448.0)).clamp_min(1e-30).expand(n).contiguous()
+    else:
+        wc = (amax.amax(1) / (6.0 * 448.0)).clamp_min(1e-30)
     gs = (amax / 6.0 / wc[:, None]).clamp(max=448.0).to(torch.float8_e4m3fn)
     eff = (gs.float() * wc[:, None]).clamp_min(1e-30)
     x = g / eff[:, :, None]
@@ -114,6 +118,8 @@ def main():
     ap.add_argument("--kind", choices=("int8-smooth", "nvfp4-svd"), default="int8-smooth")
     ap.add_argument("--out-dir", type=Path, required=True)
     ap.add_argument("--device", default="cpu")
+    ap.add_argument("--fp4-scale", choices=("row", "matrix"), default="matrix",
+                    help="nvfp4-svd outer weight scale: per output row, or one per matrix (CUTLASS alpha)")
     args = ap.parse_args()
     if not 0.0 <= args.alpha <= 1.0:
         ap.error("--alpha must be in [0, 1]")
@@ -200,7 +206,7 @@ def pack_fp4(args, amax, get):
                 up = (u[:, :RANK] * root).to(torch.bfloat16)
                 down = (root[:, None] * vh[:RANK]).to(torch.bfloat16)
                 residual = smoothed - up.float() @ down.float()
-                codes, gs, wc, deq = quantize_nvfp4(residual)
+                codes, gs, wc, deq = quantize_nvfp4(residual, args.fp4_scale == "matrix")
                 recon = (deq + up.float() @ down.float()) / s[None, :]
                 stats.append({"block": b, "group": name,
                               "weight_rel_l2": float((recon - weight).norm() / weight.norm()),
@@ -219,6 +225,7 @@ def pack_fp4(args, amax, get):
                                                  for s in stats[-4:]), flush=True)
     manifest = {
         "format": FORMAT_FP4, "kind": args.kind, "alpha": args.alpha, "rank": RANK, "blocks": BLOCKS,
+        "fp4_scale": args.fp4_scale,
         "blob_bytes": blob_bytes, "parts": {k: list(v) for k, v in parts.items()},
         "calibration": [{"path": str(p.resolve()),
                          "sha256": hashlib.sha256(p.read_bytes()).hexdigest()} for p in args.calib],

@@ -29,6 +29,23 @@ static const char *q21f_fp4_src =
 "  unsigned char sb=e4m3(ga*(1.f/6.f));float sd=e4m3_dec(sb),inv=sd>0.f?1.f/sd:0.f;gs[(size_t)t*ng+g]=sb;\n"
 "  for(int u=0;u<2;u++){unsigned w=0;for(int e=0;e<8;e++)w|=e2m1(v[u*8+e]*inv)<<(e*4);codes[(size_t)t*(K>>3)+g*2+u]=w;}}\n"
 "}\n"
+/* CUTLASS path, pass 1: gmax = max over rows of |x*inv_s| (gmax zeroed). */
+"__global__ void fp4_rowmax(float*gmax,const bf*x,int ld,const float*inv_s,int K){\n"
+" int t=blockIdx.x,i=threadIdx.x;__shared__ float amx[8];const bf*r=x+(size_t)t*ld;float m=0.f;\n"
+" for(int j=i;j<K;j+=256)m=fmaxf(m,fabsf(b2f(r[j])*inv_s[j]));\n"
+" for(int s=16;s;s>>=1)m=fmaxf(m,__shfl_xor_sync(0xffffffff,m,s));if(i%32==0)amx[i/32]=m;__syncthreads();\n"
+" if(i==0){m=amx[0];for(int k=1;k<8;k++)m=fmaxf(m,amx[k]);atomicMax((int*)gmax,__float_as_int(m));}\n"
+"}\n"
+/* Pass 2: one F32 scale for the whole activation (largest group scale at
+ * 448), E4M3 group scales in CUTLASS's interleaved layout (128-row x 4-group
+ * atoms of 512 bytes), and alpha = activation scale * weight scale. */
+"__global__ void fp4_act_cl(unsigned*codes,unsigned char*sf,float*alpha,const float*gmax,const float*wc,const bf*x,int ld,const float*inv_s,int K){\n"
+" int t=blockIdx.x,i=threadIdx.x;const bf*r=x+(size_t)t*ld;float g0=*gmax;float tsc=g0>0.f?g0/(6.f*448.f):1.f,itsc=1.f/tsc;\n"
+" if(t==0&&i==0)*alpha=tsc*wc[0];int ng=K>>4;size_t atom=((size_t)(t>>7)*(ng>>2))*512+(t&31)*16+((t&127)>>5)*4;\n"
+" for(int g=i;g<ng;g+=256){float v[16],ga=0.f;for(int e=0;e<16;e++){v[e]=b2f(r[g*16+e])*inv_s[g*16+e]*itsc;ga=fmaxf(ga,fabsf(v[e]));}\n"
+"  unsigned char sb=e4m3(ga*(1.f/6.f));float sd=e4m3_dec(sb),inv=sd>0.f?1.f/sd:0.f;sf[atom+(size_t)(g>>2)*512+(g&3)]=sb;\n"
+"  for(int u=0;u<2;u++){unsigned w=0;for(int e=0;e<8;e++)w|=e2m1(v[u*8+e]*inv)<<(e*4);codes[(size_t)t*(K>>3)+g*2+u]=w;}}\n"
+"}\n"
 "#define BM 64\n#define BN 128\n#define BK 64\n#define WN_WARPS 4\n#define MSUB 2\n#define NSUB 4\n"
 /* y[m, n] = bf16(acc * ts[m] * wc[n] + (lr ? y[m, n] : 0)). */
 "__global__ __launch_bounds__(256) void w4a4_bf16(const unsigned*__restrict__ A,const unsigned*__restrict__ B,\n"
