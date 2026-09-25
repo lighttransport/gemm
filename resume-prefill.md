@@ -106,6 +106,38 @@ state gather. On 4 nodes, single-prompt latency was 2.55 s and end-to-end
 throughput including fill/drain was 521.7 tok/s. Build/run instructions and
 the chunk sweep are in `a64fx/llm/q38p/README.md`.
 
+**Single-node 200 tok/s investigation, job 51917132:** A fresh 1024-token
+baseline was 154.6 tok/s (6.624 s); GEMM was 5.668 s, including 4.820 s in
+the int16 kernel, 0.408 s in F4 expansion and 0.314 s in output epilogues.
+The 200 tok/s budget is 5.120 s, so raising the kernel from 84% to 90% of
+peak alone would only save about 0.31 s. The remaining phases also need
+large reductions. The following are exploratory measurements at chunk 480;
+only the alias-safe panel copy was retained:
+
+| Experiment | Prefill tok/s | Decode vs F32 | Finding |
+| --- | ---: | ---: | --- |
+| FP32 output epilogue for F4 | 153.8 | not run | Slower than baseline |
+| Weight prefetch, 1024 B | 154.6 | residual hash unchanged | No full-engine gain |
+| Token-major accumulator layout | 154.7 | residual hash unchanged | No full-engine gain |
+| Precomputed F4 base vectors | 154.2 | 256/256 | Within noise |
+| 1024-column K blocks | 134.1 | 5/256 | Kernel rate fell from 84% to 71% of peak |
+| INT8 rounding of both operands | 153.4 | 0/256 | Insufficient accuracy |
+| INT8 rounding of activations only | 155.0 | 4/256 | Insufficient accuracy |
+| INT8 rounding of F4 weights only | 154.3 | 0/256 | Insufficient accuracy |
+| Power-of-two activation scales | 154.4 | 129/256 | Insufficient accuracy |
+| One activation scale per full K | 154.5 | 256/256 | Accurate, no speed gain alone |
+| Int64 accumulation across K with one scale | 154.0 | 256/256 | GEMM faster, other cost offset it |
+
+An `-O3` build initially appeared to reach 162.1 tok/s but diverged at the
+first generated token. Per-layer hashes located the first difference in the
+activation panel before layer 0 GEMM: an `int16_t` buffer had been read and
+written through `uint64_t` pointers, violating C aliasing rules. Replacing
+those accesses with `memcpy` restored the exact O2 panel and 256/256 decode
+agreement under `-O3`. The corrected `-O3` run was 154.1 tok/s. This was a
+false optimization result caused by missing work, not a usable speedup.
+At 4096 tokens, the corrected `-O3` build reached 142.8 tok/s and matched
+the fresh F32 reference 256/256 (maximum logit difference 0.5504).
+
 ## Remaining items
 
 ### Single node (toward 225 tok/s)
@@ -114,8 +146,8 @@ the chunk sweep are in `a64fx/llm/q38p/README.md`.
 2. Kernel: gain the last points (epilogue cost about 4%).
    - `movprfx` from a zero register instead of `dup` zeroing.
    - Overlap group boundaries.
-   - Try a 1024-column activation block (int64 kept across two tiles by
-     tile-major loop order).
+   - Keep the 512-column activation block: 1024 columns reduced the kernel
+     rate to 71% of peak and failed the 256-token decode gate.
    - Try a per-token scale with outlier columns handled separately.
      This is accuracy-sensitive; check logit diffs.
 3. Tile expansion is 0.41 s (about 8.5% of the kernel). Optimize it, or use

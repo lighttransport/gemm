@@ -35,6 +35,11 @@ the established decode correctness. An `-O3 -ffp-contract=fast` build on job
 51917132 diverged from F32 at generated token 5 even on one node; the
 baseline-precision MPI build matched 256/256 on one through four nodes.
 Its single-node 1024-token prefill rate was 155.2 tok/s at chunk 480.
+An `int16_t` activation panel packing alias violation has since been fixed
+with `memcpy`. With that fix, a single-node `-O3` build without fast math
+passes 256/256 decode but remains near 154 tok/s; the earlier apparent
+162 tok/s `-O3` result came from an incorrect panel. Keep the MPI build at
+its validated `-O2` setting until the pipeline is retested with the fix.
 
 ## Measurements, job 51917132
 

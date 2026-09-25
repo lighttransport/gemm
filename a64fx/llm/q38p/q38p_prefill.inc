@@ -288,8 +288,10 @@ static void pf_quant_row(const float *x, int K, int t) {
             svint32_t qv = svcvt_s32_f32_x(pf, svrintn_f32_x(pf, svmul_n_f32_x(pf, svld1_f32(pf, xb + i), inv)));
             svst1h_s32(pf, tmp + i, qv);
         }
-        const uint64_t *t64 = (const uint64_t *)tmp;
-        for (int st = 0; st < PF_STEPS; st++) *(uint64_t *)(dst + (size_t)st * PF_T * 4) = t64[st];
+        /* Keep the int16 panel's effective type: uint64_t pointer casts let
+         * -O3 discard these stores under strict aliasing. */
+        for (int st = 0; st < PF_STEPS; st++)
+            memcpy(dst + (size_t)st * PF_T * 4, tmp + 4 * st, 4 * sizeof(int16_t));
     }
 }
 /* padded tokens of the last chunk: zero rows */
