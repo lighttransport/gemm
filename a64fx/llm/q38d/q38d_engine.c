@@ -99,7 +99,7 @@ typedef struct {
     int next_token;
     _Atomic int *unit_cnt; /* per 16-row FFN unit, parity counter */
     /* NextN/MTP drafter (Q38D_MTP=1, measurement): layer E.L[NLAYER] */
-    q38d_mat eh;
+    q38d_mat eh, dhead;   /* dhead: first draft_v rows of the head (MTP drafts) */
     const float *enorm, *hnorm, *shnorm;
     float *mtp_in, *x_mtp, *h_mtp;
     q38d_act act_mtp;
@@ -107,7 +107,7 @@ typedef struct {
     /* profiling (thread 0) */
     double prof[16];
 } q38d_engine;
-static int mtp_on;
+static int mtp_on, draft_v;
 
 /* Per-call buffers of the SSM and attention cores (single-token path: the
  * E.* buffers; verification pass: token i's buffers). SSM state of
@@ -1442,25 +1442,27 @@ static void layer_body(int tid, int layer, int pos, int *gs, int *cs, uint64_t *
 }
 
 /* final norm (weight nw), output head and global argmax -> E.next_token */
-static void head_argmax(int tid, const float *nw, int *gs, uint64_t *tp) {
+static void head_argmax_m(int tid, const float *nw, const q38d_mat *hm, int *gs, uint64_t *tp);
+static void head_argmax(int tid, const float *nw, int *gs, uint64_t *tp) { head_argmax_m(tid, nw, &E.head, gs, tp); }
+static void head_argmax_m(int tid, const float *nw, const q38d_mat *hm, int *gs, uint64_t *tp) {
 #define t (*tp)
     const q38d_act *a;
     float omul = 1.0f;
     if (prod_norm) { int cc = prod_copies > 1 ? tid / PER : 0; a = &E.act_c[cc]; E.act_c[cc].x = E.xn_c[cc]; omul = x_inv(); }
     else a = norm_act(tid, nw);
-    mv(&E.head, a, E.logits, 0, tid);
+    mv(&(*hm), a, E.logits, 0, tid);
     if (omul != 1.0f) {
         int c, g0, g1;
-        mat_range(&E.head, tid, &c, &g0, &g1);
-        int r0 = E.head.first[c] + 8 * g0, r1 = E.head.first[c] + 8 * g1;
-        if (r1 > E.head.first[c + 1]) r1 = E.head.first[c + 1];
+        mat_range(&(*hm), tid, &c, &g0, &g1);
+        int r0 = (*hm).first[c] + 8 * g0, r1 = (*hm).first[c] + 8 * g1;
+        if (r1 > (*hm).first[c + 1]) r1 = (*hm).first[c + 1];
         if (r1 > r0) scale_rows(E.logits + r0, r1 - r0, omul);
     }
     {
         int c, g0, g1;
-        mat_range(&E.head, tid, &c, &g0, &g1);
-        int r0 = E.head.first[c] + 8 * g0, r1 = E.head.first[c] + 8 * g1;
-        if (r1 > E.head.first[c + 1]) r1 = E.head.first[c + 1];
+        mat_range(&(*hm), tid, &c, &g0, &g1);
+        int r0 = (*hm).first[c] + 8 * g0, r1 = (*hm).first[c] + 8 * g1;
+        if (r1 > (*hm).first[c + 1]) r1 = (*hm).first[c + 1];
         float best = -INFINITY; int bi = -1;
         for (int r = r0; r < r1; r++) if (E.logits[r] > best) { best = E.logits[r]; bi = r; }
         E.best_val[tid] = best; E.best_idx[tid] = bi;
@@ -1518,7 +1520,7 @@ static void mtp_step(int tid, int token, int pos, const float *hidden, int want_
     gbarrier(tid, gs);
     layer_body(tid, NLAYER, pos, gs, cs, &t);
     if (tid == 0) memcpy(E.h_mtp, E.x_mtp, EMBD * sizeof(float));
-    if (want_head) head_argmax(tid, E.shnorm, gs, &t);
+    if (want_head) head_argmax_m(tid, E.shnorm, draft_v ? &E.dhead : &E.head, gs, &t);
     gbarrier(tid, gs);
     if (tid == 0) {
         E.x = save_x;
@@ -1677,6 +1679,15 @@ void q38d_asmg2p2_f4_a16(const uint8_t *, long, const uint8_t *, const int8_t *c
 void q38d_asmg2p3_f4_a16(const uint8_t *, long, const uint8_t *, const int8_t *const *, const float *const *, long, float *, const int8_t *);
 void q38d_asmg2p4_f4_a16(const uint8_t *, long, const uint8_t *, const int8_t *const *, const float *const *, long, float *, const int8_t *);
 static g2p_fn g2p_for(int T) { return T == 2 ? q38d_asmg2p2_f4_a16 : T == 3 ? q38d_asmg2p3_f4_a16 : q38d_asmg2p4_f4_a16; }
+typedef void (*g2q_fn)(const uint8_t *, long, const uint8_t *, const int8_t *const *, const float *const *, long, float *,
+                       const float *);
+void q38d_asmg2p2_q8k_a16(const uint8_t *, long, const uint8_t *, const int8_t *const *, const float *const *, long, float *, const float *);
+void q38d_asmg2p3_q8k_a16(const uint8_t *, long, const uint8_t *, const int8_t *const *, const float *const *, long, float *, const float *);
+void q38d_asmg2p4_q8k_a16(const uint8_t *, long, const uint8_t *, const int8_t *const *, const float *const *, long, float *, const float *);
+static g2q_fn g2q_for(int T) { return T == 2 ? q38d_asmg2p2_q8k_a16 : T == 3 ? q38d_asmg2p3_q8k_a16 : q38d_asmg2p4_q8k_a16; }
+static float *mt_logits[TMAX];
+static float mt_best_val[NT][TMAX];
+static int mt_best_idx[NT][TMAX];
 
 static inline void mt_out(float *o, const float *acc, int mode) {
     for (int r = 0; r < 8; r++) {
@@ -1831,6 +1842,55 @@ static void head_token(int tid, float *x, int *gs, int *cs, int *id, float *logi
     }
     gbarrier(tid, gs);
 }
+/* output head for T tokens (Q8K multi-token kernel) -> MT.argmax/logit */
+static void head_mt(int tid, int T, int *gs, int *cs) {
+    const q38d_mat *m = &E.head;
+    if (m->fmt != Q38D_Q8K) {
+        for (int i = 0; i < T; i++) head_token(tid, MT.x[i], gs, cs, &MT.argmax[i], &MT.logit[i]);
+        return;
+    }
+    int c, g0, g1;
+    norm_mt(tid, MT.x, T, E.out_norm, cs);
+    mat_range(m, tid, &c, &g0, &g1);
+    const int np = m->cols / 32, Tk = T < 2 ? 2 : T;
+    const size_t gb = q38d_group_bytes(m->fmt, m->cols);
+    const int8_t *aq[TMAX];
+    const float *as[TMAX];
+    for (int t = 0; t < T; t++) { aq[t] = MT.act_c[c][t].q; as[t] = MT.act_c[c][t].sc; }
+    if (T < 2) { aq[1] = aq[0]; as[1] = as[0]; }
+    float acc[2 * TMAX * 16] __attribute__((aligned(256)));
+    g2q_fn f = g2q_for(Tk);
+    const float e = q38d_out_scale(Q38D_Q8K);
+    for (int g = g0; g < g1;) {
+        const uint8_t *w = m->part[c] + (size_t)g * gb;
+        int two = g + 1 < g1;
+        f(w, two ? (long)gb : 0, w + (size_t)np * 256, aq, as, np, acc, (const float *)(w + (size_t)np * 272));
+        for (int t = 0; t < T; t++) {
+            float *o = mt_logits[t] + m->first[c] + 8 * g;
+            for (int r = 0; r < 8; r++) {
+                o[r] = (acc[16 * t + 2 * r] + acc[16 * t + 2 * r + 1]) * e;
+                if (two) o[8 + r] = (acc[16 * (Tk + t) + 2 * r] + acc[16 * (Tk + t) + 2 * r + 1]) * e;
+            }
+        }
+        g += two ? 2 : 1;
+    }
+    int r0 = m->first[c] + 8 * g0, r1 = m->first[c] + 8 * g1;
+    if (r1 > m->first[c + 1]) r1 = m->first[c + 1];
+    for (int t = 0; t < T; t++) {
+        float best = -INFINITY; int bi = -1;
+        for (int r = r0; r < r1; r++) if (mt_logits[t][r] > best) { best = mt_logits[t][r]; bi = r; }
+        mt_best_val[tid][t] = best; mt_best_idx[tid][t] = bi;
+    }
+    gbarrier(tid, gs);
+    if (tid == 0)
+        for (int t = 0; t < T; t++) {
+            float best = -INFINITY; int bi = 0;
+            for (int i = 0; i < NT; i++) if (mt_best_idx[i][t] >= 0 && mt_best_val[i][t] > best) { best = mt_best_val[i][t]; bi = mt_best_idx[i][t]; }
+            MT.argmax[t] = bi; MT.logit[t] = best;
+        }
+    gbarrier(tid, gs);
+}
+static int head_multi = 1;
 static void step_mt(int tid, const int *tok, int pos0, int T, int *gs, int *cs) {
     uint64_t t = ticks();
     const int c = tid / PER, l = tid % PER;
@@ -1911,11 +1971,13 @@ static void step_mt(int tid, const int *tok, int pos0, int T, int *gs, int *cs) 
         mv_items_mt(&L->down, T, tid);
         phase_end(tid, gs, &t, P_FFN_DOWN);
     }
-    for (int i = 0; i < T; i++) head_token(tid, MT.x[i], gs, cs, &MT.argmax[i], &MT.logit[i]);
+    if (head_multi) head_mt(tid, T, gs, cs);
+    else for (int i = 0; i < T; i++) head_token(tid, MT.x[i], gs, cs, &MT.argmax[i], &MT.logit[i]);
     prof_mark(tid, &t, P_HEAD);
 }
 static void mt_alloc(void) {
     for (int t = 0; t < TMAX; t++) {
+        mt_logits[t] = aligned_alloc(256, (size_t)E.n_vocab * 4);
         MT.x[t] = aligned_alloc(256, EMBD * 4);
         MT.qkv[t] = aligned_alloc(256, NFF * 4);
         MT.zb[t] = aligned_alloc(256, DINNER * 4);
@@ -2003,6 +2065,18 @@ static void *worker(void *arg) {
     gbarrier(tid, &gs);
     kchunk_copy_or_write(c, l, 1);
     gbarrier(tid, &gs);
+    if (mtp_on && draft_v) {
+        /* draft head: rows [first'[c], first'[c+1]) copied from the head's groups */
+        const q38d_mat *h = &E.head;
+        size_t gb = q38d_group_bytes(h->fmt, h->cols);
+        int G = (E.dhead.first[c + 1] - E.dhead.first[c]) / 8, a0 = G * l / PER, a1 = G * (l + 1) / PER;
+        for (int g = a0; g < a1; g++) {
+            int row = E.dhead.first[c] + 8 * g, sc = 0;
+            while (sc < 3 && row >= h->first[sc + 1]) sc++;
+            memcpy(E.dhead.part[c] + (size_t)g * gb, h->part[sc] + (size_t)((row - h->first[sc]) / 8) * gb, gb);
+        }
+        gbarrier(tid, &gs);
+    }
     if (getenv("Q38D_BENCH_BAR")) {
         int n = atoi(getenv("Q38D_BENCH_BAR"));
         gbarrier(tid, &gs);
@@ -2179,6 +2253,8 @@ int main(int argc, char **argv) {
     if (getenv("Q38D_VBENCH")) vbench_T = atoi(getenv("Q38D_VBENCH"));
     if (getenv("Q38D_MTP")) mtp_on = atoi(getenv("Q38D_MTP")) != 0;
     if (getenv("Q38D_SPEC")) spec_k = atoi(getenv("Q38D_SPEC"));
+    if (getenv("Q38D_DRAFT_V")) draft_v = atoi(getenv("Q38D_DRAFT_V"));
+    if (getenv("Q38D_HEAD_MULTI")) head_multi = atoi(getenv("Q38D_HEAD_MULTI"));
     if (spec_k) {
         if (spec_k < 1 || spec_k > TMAX - 1 || arith != Q38D_A16 || fmt != Q38D_F4) {
             fprintf(stderr, "q38d: Q38D_SPEC needs 1..%d drafts, --act a16, --fmt fp4\n", TMAX - 1);
@@ -2223,6 +2299,15 @@ int main(int argc, char **argv) {
         E.h_mtp = aligned_alloc(256, EMBD * 4);
         E.act_mtp = (q38d_act){2 * EMBD, arith, aligned_alloc(256, q38d_act_qbytes(2 * EMBD, Q38D_A16)),
                                aligned_alloc(256, 2 * EMBD / 16 * 4), aligned_alloc(256, 2 * EMBD / 16 * 4), E.mtp_in};
+    }
+    if (mtp_on && draft_v) {
+        const q38d_mat *h = &E.head;
+        if (draft_v % 32 || draft_v > h->rows) { fprintf(stderr, "q38d: Q38D_DRAFT_V must be a multiple of 32 <= %d\n", h->rows); return 1; }
+        E.dhead = *h;
+        E.dhead.rows = draft_v;
+        size_t gb = q38d_group_bytes(h->fmt, h->cols);
+        for (int c = 0; c <= 4; c++) E.dhead.first[c] = c * (draft_v / 4);
+        for (int c = 0; c < 4; c++) E.dhead.part[c] = cmg_alloc((size_t)(draft_v / 32) * gb, c);
     }
     if (spec_k) {
         if (!ssm_lazy || !conv_local) { fprintf(stderr, "q38d: Q38D_SPEC needs ssm_lazy and conv_local\n"); return 1; }
