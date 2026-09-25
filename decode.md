@@ -204,6 +204,42 @@ head over its CMG workers was slower), and smaller per-worker streams.
 Tried without gain: `TP_AR_ROBUST`/poll settings, larger pre-barrier
 prefetch (slower), one-put collective (incorrect).
 
+Per-phase cost reductions (same job, commits 95021689..0778e83b). All
+256/256; TP1 bitwise unchanged; TP hashes deterministic across runs:
+
+| change | effect |
+| --- | --- |
+| RoPE table per token, attention merge over all group lanes | TP4 attn_core 0.62 -> 0.59 ms |
+| attention scores: 4+2-head passes, uzp/add tree instead of FADDV (fcc spilled the 24-accumulator block inside the loop); pv: 6 heads in 2-head x 128-dim passes; bit-identical | kernel 2.6x faster in L1; TP1 attn_core 0.85 -> 0.76 ms |
+| KV head shared by a CMG group: 16-position blocks round-robin over the group's CMG memories (all 48 TP4 lanes streamed CMG0's HBM) | TP4 attn_in 0.66 -> 0.54 ms (the KV prefetch no longer competes with CMG0's weights) |
+| attention partials and (max, sum) headers in the lanes' own CMG memory, q prefetch | TP4 85.9 -> 87.8 tok/s together with the two rows above |
+| core-output quantization: scales/sums staged per producer CMG, each out-proj worker gathers them (0.5 us); quantizing one SSM head's output took 3.2 us of cross-CMG false sharing on the shared scale lines | TP4 ssm_core 0.75 -> 0.65 ms, attn_core -0.05 ms; 87.5 -> 88.9 tok/s (best run) |
+| TP SSM in-proj plan balanced by per-lane dual/single counts | TP2 ssm_in 2.64 -> 2.36 ms, TP4 1.53 -> 1.49 ms |
+
+Negative results kept as options: consumer-side per-CMG quantization
+(`Q38D_OQ_CMG=1`: remote reads of freshly written E.o lines, 3.8 us per
+lane), two-level attention merge (`Q38D_ATT_MERGE2=1`: the extra global
+barrier eats the saving), producer-side norm in the collective lane
+(`Q38D_TP_PNORM=1`: one lane quantizing a 1280-value slice costs ~12 us on
+the critical path, TP4 77 tok/s; `prepare_unit` is ~150 ns per 16 values,
+bound by horizontal max/sum reductions). SSM state-row prefetch distance
+and early state prefetch: no effect (the SSM sweep is 3.5 us; prep with
+the depthwise conv 3.2 us and the gated norm dominate the rest).
+
+After the round (TP1 35.4-35.7 tok/s on this node):
+
+| config | tok/s | speedup |
+| --- | ---: | ---: |
+| TP2 | 58.8-58.9 | 1.65x |
+| TP4 | 86.0-88.9 (typ. 87.4) | 2.45x |
+
+Run-to-run TP4 spread now comes from the row-parallel phases (collective
+latency). TP4 per token (typical run, ms): ssm_in 1.50, ssm_core 0.66,
+ssm_out 1.43, attn_in 0.53, attn_core 0.49, attn_out 0.48, gate/up 3.24,
+down 2.64, head 0.48; linear would be ~7.0. The collectives (~10 us x 129)
+are the largest single item left, then per-phase global barriers
+(~3.5 us each, 4-5 per layer).
+
 ## Speculative decoding (FP4): verification-kernel study
 
 Target: 1.5-2x tok/s with speculative decoding while keeping A16
