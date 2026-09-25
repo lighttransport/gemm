@@ -116,15 +116,22 @@ but each grab restarts the dual-kernel pipeline and a cold stream, ~3.5 us
 vs ~2.3 us of work, so gate/up got 0.5-1.1 ms/token slower; FFN gate/up
 runs at ~85% of the practical per-CMG stream rate, so its remaining
 imbalance, ~0.3 ms from 45/46 groups and a slower CMG3, is not worth
-chasing), `Q38D_COST_Q8K`/`Q38D_DUAL_COST` retuning (no gain), A64FX
+chasing), `Q38D_COST_Q8K`/`Q38D_DUAL_COST` retuning (no gain), a min-makespan
+plan partition for ssm_in/attn_in (calibrated costs from per-lane busy
+times: dual 1.88x F4, Q4K 34, Q8K 28 cycles/pair; lanes evened out but mean
+busy rose, ssm_in 3.80 -> 3.86 and attn_in 1.32 -> 1.37 ms, and the max did
+not drop, because the lanes that finish early give bandwidth to the others;
+`Q38D_PLAN_DUMP=1` prints the plans), A64FX
 hardware barrier (2.2 us, ~0.1
 ms/token; would need dynamic libhwb).
 
 ## Next steps (in order)
 
-1. Remove the remaining ~0.7 ms/token: ssm_in/attn_in plan imbalance (lanes
-   8-11 finish 10-20 us/layer early; cost-model constants alone did not fix
-   it), dataflow flags instead of the SSM
+1. Remove the remaining ~0.7 ms/token. The in-projection phases are
+   limited by per-CMG bandwidth, not imbalance (ssm_in ~150 GB/s/CMG,
+   attn_in ~135, ffn_gateup ~171 incl. per-phase overhead); what separates
+   them from gate/up is fixed per-layer cost (norm, barrier, cold stream
+   start). Candidates: dataflow flags instead of the SSM
    in-proj->core barrier, cheaper SSM prep (conv/norm), hardware barrier.
 2. Long context: attention core grows to ~2.3 ms at 4096 (K/V prefetch in
    the in-proj tail); overlap or restructure.

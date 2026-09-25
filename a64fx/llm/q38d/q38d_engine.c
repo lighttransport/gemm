@@ -1493,6 +1493,22 @@ int main(int argc, char **argv) {
             build_plan(P);
         }
     }
+    if (getenv("Q38D_PLAN_DUMP")) {
+        for (int k = 0; k < 2; k++) {
+            int l = 0;
+            while (l < NLAYER && E.L[l].ssm != !k) l++;
+            q38d_plan *P = k ? &plan_att[l] : &plan_ssm[l];
+            for (int i = 0; i < P->nm; i++)
+                fprintf(stderr, "q38d: plan %s m%d fmt=%d rows/cmg=%d cols=%d gcost=%.0f\n", k ? "att" : "ssm", i,
+                        P->m[i]->fmt, P->m[i]->first[1] - P->m[i]->first[0], P->m[i]->cols, group_cost(P->m[i]));
+            for (int t = 0; t < PER; t++) {
+                fprintf(stderr, "q38d: plan %s lane %2d:", k ? "att" : "ssm", t);
+                for (int j = 0; j < P->t[t].nseg; j++)
+                    fprintf(stderr, " m%d%s[%d,%d)", P->t[t].s[j].mi, P->t[t].s[j].mi2 >= 0 ? "+" : "", P->t[t].s[j].g0, P->t[t].s[j].g1);
+                fprintf(stderr, "\n");
+            }
+        }
+    }
     /* prompt */
     int32_t base[4096];
     int bn = bpe_tokenize(vocab, prompt, -1, base, 4096);
