@@ -165,6 +165,12 @@ static void g2_asm(int nt, float *out, const uint8_t *g, size_t gb, const int8_t
 #define G2PDECL(n) void q38d_asmg2p##n##_f4_a16(const uint8_t *, long, const uint8_t *, const int8_t *const *, \
                                               const float *const *, long, float *, const int8_t *);
 G2PDECL(2) G2PDECL(3) G2PDECL(4)
+#define G2IDECL(n) void q38d_asmg2i##n##_f4_a16(const uint8_t *, long, const uint8_t *, const int8_t *const *, \
+                                              const float *const *, long, float *, const int8_t *);
+G2IDECL(3) G2IDECL(4)
+#define G2JDECL(n) void q38d_asmg2j##n##_f4_a16(const uint8_t *, long, const uint8_t *, const int8_t *const *, \
+                                              const float *const *, long, float *, const int8_t *);
+G2JDECL(3) G2JDECL(4)
 
 static float frand(void) { return (float)rand() / (float)RAND_MAX * 2 - 1; }
 
@@ -276,11 +282,14 @@ int main(int argc, char **argv) {
         printf("g2%s   N=%d: %.2f cycles/pair, %.2f cycles/pair/token, %.1f GB/s weights (check %.3g)\n", g2_kind == 2 ? "s" : g2_kind ? "c" : "n", nt, cyc, cyc / nt, pr * 144 / s / 1e9, mr);
         (void)0;
     }
-    for (int nt = 2; nt <= 4; nt++) {
+    for (int vi = 0; vi < 7; vi++) {
+        int nt = vi < 3 ? vi + 2 : vi < 5 ? vi : vi - 2;   /* g2p 2,3,4; g2i 3,4; g2j 3,4 */
         int np = cols / 32;
         const int8_t *aqp[4] = {a[0].q, a[1].q, a[2].q, a[3].q};
         const float *asp[4] = {a[0].sc, a[1].sc, a[2].sc, a[3].sc};
         void (*f)(const uint8_t *, long, const uint8_t *, const int8_t *const *, const float *const *, long, float *, const int8_t *) =
+            vi == 5 ? q38d_asmg2j3_f4_a16 : vi == 6 ? q38d_asmg2j4_f4_a16 :
+            vi == 3 ? q38d_asmg2i3_f4_a16 : vi == 4 ? q38d_asmg2i4_f4_a16 :
             nt == 2 ? q38d_asmg2p2_f4_a16 : nt == 3 ? q38d_asmg2p3_f4_a16 : q38d_asmg2p4_f4_a16;
         float acc[2 * 4 * 16] __attribute__((aligned(256)));
         double mr = 0;
@@ -301,7 +310,7 @@ int main(int argc, char **argv) {
             for (int g = 0; g + 1 < groups; g += 2) f(w + g * gb, (long)gb, w + g * gb + (size_t)np * 128, aqp, asp, np, out + 32 * g, q38d_lut_f4);
         __asm__ volatile("" ::: "memory");
         double s = (double)(ticks() - t0) / hz, pr = (double)(groups / 2 * 2) * np * reps, cyc = s * 2.0e9 / pr;
-        printf("g2p   N=%d: %.2f cycles/pair, %.2f cycles/pair/token (check %.3g)\n", nt, cyc, cyc / nt, mr);
+        printf("%s   N=%d: %.2f cycles/pair, %.2f cycles/pair/token (check %.3g)\n", vi < 3 ? "g2p" : vi < 5 ? "g2i" : "g2j", nt, cyc, cyc / nt, mr);
     }
     /* R16: same bytes, 16-row groups (groups/2 of them), 320 tiles each */
     {

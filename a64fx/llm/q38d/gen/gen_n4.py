@@ -278,7 +278,7 @@ def kernel_g2n4(name, nt=4, share_as=False):
     e(f"    .size {name}, .-{name}\n")
     return "\n".join(L)
 
-def kernel_g2p(name, nt):
+def kernel_g2p(name, nt, inter=False, jmode=False):
     """As kernel_g2n4(share_as=True) but activations are per-token pointers in
     the standard single-token layout:
     void name(const uint8_t *code, long gstride, const uint8_t *scale,
@@ -293,6 +293,7 @@ def kernel_g2p(name, nt):
     acc = {(t, g): 12 + 2 * nt + 2 * t + g for t in range(nt) for g in range(2)}
     AQ = ["x13", "x14", "x15", "x16"][:nt]
     AS = ["x19", "x20", "x21", "x22"][:nt]
+    if jmode: inter = True
     e(f"    .global {name}\n    .type {name}, %function\n    .p2align 6\n{name}:")
     e("    stp d8, d9, [sp, #-96]!\n    stp d10, d11, [sp, #16]\n    stp d12, d13, [sp, #32]\n    stp d14, d15, [sp, #48]")
     e("    stp x19, x20, [sp, #64]\n    stp x21, x22, [sp, #80]")
@@ -323,20 +324,97 @@ def kernel_g2p(name, nt):
                         c = ch[(t, g)]
                         e(f"    lsl z{c}.s, z{c}.s, #8")
         for t in range(nt): e(f"    add {AQ[t]}, {AQ[t]}, #64")
-    def S4():
-        e("    ld1b {z3.s}, p1/z, [x2]\n    ld1b {z2.s}, p1/z, [x12]\n    add x2, x2, #16\n    add x12, x12, #16")
-        e("    lsl z3.s, z3.s, #20\n    lsl z2.s, z2.s, #20")
-        for t in range(nt):
-            e(f"    ld1rd {{z28.d}}, p2/z, [{AS[t]}]\n    add {AS[t]}, {AS[t]}, #8")
-            e("    fmul z0.s, z28.s, z3.s\n    fmul z1.s, z28.s, z2.s")
-            cA, cB = ch[(t, 0)], ch[(t, 1)]
+    def S4pre():
+        wsB = "z0" if inter else "z2"
+        e(f"    ld1b {{z3.s}}, p1/z, [x2]\n    ld1b {{{wsB}.s}}, p1/z, [x12]\n    add x2, x2, #16\n    add x12, x12, #16")
+        e(f"    lsl z3.s, z3.s, #20\n    lsl {wsB}.s, {wsB}.s, #20")
+    def S4tok(t):
+        # z2 is also the broadcast temp of S3: in interleaved mode the scale of
+        # group B lives in z0 (codes are loaded only after S3) and the
+        # products in z1 and z28
+        cA, cB = ch[(t, 0)], ch[(t, 1)]
+        e(f"    ld1rd {{z28.d}}, p2/z, [{AS[t]}]\n    add {AS[t]}, {AS[t]}, #8")
+        if inter:
+            e("    fmul z1.s, z28.s, z3.s\n    fmul z28.s, z28.s, z0.s")
             e(f"    scvtf z{cA}.s, p1/m, z{cA}.s\n    scvtf z{cB}.s, p1/m, z{cB}.s")
-            e(f"    fmla z{acc[(t, 0)]}.s, p1/m, z{cA}.s, z0.s\n    fmla z{acc[(t, 1)]}.s, p1/m, z{cB}.s, z1.s")
+            e(f"    fmla z{acc[(t, 0)]}.s, p1/m, z{cA}.s, z1.s\n    fmla z{acc[(t, 1)]}.s, p1/m, z{cB}.s, z28.s")
+            return
+        e("    fmul z0.s, z28.s, z3.s\n    fmul z1.s, z28.s, z2.s")
+        e(f"    scvtf z{cA}.s, p1/m, z{cA}.s\n    scvtf z{cB}.s, p1/m, z{cB}.s")
+        e(f"    fmla z{acc[(t, 0)]}.s, p1/m, z{cA}.s, z0.s\n    fmla z{acc[(t, 1)]}.s, p1/m, z{cB}.s, z1.s")
+    def S4():
+        S4pre()
+        for t in range(nt): S4tok(t)
+    def S43():
+        # combine of pair p-1 for token t just before S3 overwrites token t's chains
+        S4pre()
+        for half, base in ((0, 32), (1, 0)):
+            for j in range(4):
+                for t in range(nt):
+                    if half == 0 and j == 0: S4tok(t)
+                    e(f"    ld1rd {{z2.d}}, p2/z, [{AQ[t]}, #{base + 8 * j}]")
+                    for g in range(2):
+                        c = ch[(t, g)]
+                        if half == 0 and j == 0: e(f"    movprfx z{c}, z29")
+                        e(f"    sdot z{c}.s, z{dec[g][j]}.b, z2.b")
+            if half == 0:
+                for t in range(nt):
+                    for g in range(2):
+                        c = ch[(t, g)]
+                        e(f"    lsl z{c}.s, z{c}.s, #8")
+        for t in range(nt): e(f"    add {AQ[t]}, {AQ[t]}, #64")
+    def S43j(first):
+        # g2j: S4(p-1) interleaved into S3(p) as in g2i, then the codes of
+        # pair p+1 (A: z0,z1  B: z3,z28) are loaded after the high-digit half
+        # and each weight vector j is decoded right after its last use in the
+        # low-digit half
+        if not first: S4pre()
+        for half, base in ((0, 32), (1, 0)):
+            for j in range(4):
+                for t in range(nt):
+                    if half == 0 and j == 0 and not first: S4tok(t)
+                    e(f"    ld1rd {{z2.d}}, p2/z, [{AQ[t]}, #{base + 8 * j}]")
+                    for g in range(2):
+                        c = ch[(t, g)]
+                        if half == 0 and j == 0: e(f"    movprfx z{c}, z29")
+                        e(f"    sdot z{c}.s, z{dec[g][j]}.b, z2.b")
+                if half == 1:
+                    for g, (cl, ch_) in ((0, ("z0", "z1")), (1, ("z3", "z28"))):
+                        src = cl if j < 2 else ch_
+                        d = dec[g][j]
+                        if j % 2 == 0: e(f"    and z{d}.d, {src}.d, z30.d")
+                        else: e(f"    lsr z{d}.b, {src}.b, #4")
+                        e(f"    tbl z{d}.b, {{z31.b}}, z{d}.b")
+            if half == 0:
+                for t in range(nt):
+                    for g in range(2):
+                        c = ch[(t, g)]
+                        e(f"    lsl z{c}.s, z{c}.s, #8")
+                e("    prfm pldl1keep, [x0, #PF1_DIST]\n    prfm pldl1keep, [x10, #PF1_DIST]")
+                e("    prfm pldl2keep, [x0, x9]\n    prfm pldl2keep, [x10, x9]")
+                e("    ld1b {z0.b}, p0/z, [x0]\n    ld1b {z1.b}, p0/z, [x0, #1, mul vl]\n    add x0, x0, #128")
+                e("    ld1b {z3.b}, p0/z, [x10]\n    ld1b {z28.b}, p0/z, [x10, #1, mul vl]\n    add x10, x10, #128")
+        for t in range(nt): e(f"    add {AQ[t]}, {AQ[t]}, #64")
+    if jmode:
+        S12()
+        S43j(True)
+        e("    subs x5, x5, #1\n    b.eq 2f\n1:")
+        S43j(False)
+        e("    subs x5, x5, #1\n    b.ne 1b\n2:")
+        S4()
+        for g in range(2):
+            for t in range(nt):
+                e(f"    st1w {{z{acc[(t, g)]}.s}}, p1, [x6, #{g * nt + t}, mul vl]")
+        e("    ldp x19, x20, [sp, #64]\n    ldp x21, x22, [sp, #80]")
+        e("    ldp d10, d11, [sp, #16]\n    ldp d12, d13, [sp, #32]\n    ldp d14, d15, [sp, #48]\n    ldp d8, d9, [sp], #96\n    ret")
+        e(f"    .size {name}, .-{name}\n")
+        return "\n".join(L)
     S12()
     e("    sub x5, x5, #1")
     S3(); S12()
     e("    cbz x5, 2f\n1:")
-    S4(); S3()
+    if inter: S43()
+    else: S4(); S3()
     e("    subs x5, x5, #1\n    b.eq 3f")
     S12()
     e("    b 1b\n3:\n2:")
@@ -441,6 +519,10 @@ for nt in (2, 4):
     out.append(kernel_g2n4(f"q38d_asmg2s{nt}_f4_a16", nt, share_as=True))
 for nt in (2, 3, 4):
     out.append(kernel_g2p(f"q38d_asmg2p{nt}_f4_a16", nt))
+for nt in (3, 4):
+    out.append(kernel_g2p(f"q38d_asmg2i{nt}_f4_a16", nt, inter=True))
+for nt in (3, 4):
+    out.append(kernel_g2p(f"q38d_asmg2j{nt}_f4_a16", nt, jmode=True))
 for nt in (2, 3, 4):
     out.append(kernel_q8k_g2p(f"q38d_asmg2p{nt}_q8k_a16", nt))
 out.append('    .section .note.GNU-stack,"",%progbits\n')

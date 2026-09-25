@@ -1706,7 +1706,14 @@ typedef void (*g2p_fn)(const uint8_t *, long, const uint8_t *, const int8_t *con
 void q38d_asmg2p2_f4_a16(const uint8_t *, long, const uint8_t *, const int8_t *const *, const float *const *, long, float *, const int8_t *);
 void q38d_asmg2p3_f4_a16(const uint8_t *, long, const uint8_t *, const int8_t *const *, const float *const *, long, float *, const int8_t *);
 void q38d_asmg2p4_f4_a16(const uint8_t *, long, const uint8_t *, const int8_t *const *, const float *const *, long, float *, const int8_t *);
-static g2p_fn g2p_for(int T) { return T == 2 ? q38d_asmg2p2_f4_a16 : T == 3 ? q38d_asmg2p3_f4_a16 : q38d_asmg2p4_f4_a16; }
+void q38d_asmg2j3_f4_a16(const uint8_t *, long, const uint8_t *, const int8_t *const *, const float *const *, long, float *, const int8_t *);
+void q38d_asmg2j4_f4_a16(const uint8_t *, long, const uint8_t *, const int8_t *const *, const float *const *, long, float *, const int8_t *);
+static int g2_variant = 1;   /* 1: decode-interleaved kernels for T = 3, 4 */
+static g2p_fn g2p_for(int T) {
+    if (g2_variant && T == 3) return q38d_asmg2j3_f4_a16;
+    if (g2_variant && T == 4) return q38d_asmg2j4_f4_a16;
+    return T == 2 ? q38d_asmg2p2_f4_a16 : T == 3 ? q38d_asmg2p3_f4_a16 : q38d_asmg2p4_f4_a16;
+}
 typedef void (*g2q_fn)(const uint8_t *, long, const uint8_t *, const int8_t *const *, const float *const *, long, float *,
                        const float *);
 void q38d_asmg2p2_q8k_a16(const uint8_t *, long, const uint8_t *, const int8_t *const *, const float *const *, long, float *, const float *);
@@ -2441,6 +2448,7 @@ int main(int argc, char **argv) {
     if (getenv("Q38D_SPEC")) spec_k = atoi(getenv("Q38D_SPEC"));
     if (getenv("Q38D_FFN_A8")) ffn_a8 = atoi(getenv("Q38D_FFN_A8"));
     if (getenv("Q38D_DOWN_A8")) down_a8 = atoi(getenv("Q38D_DOWN_A8"));
+    if (getenv("Q38D_G2")) g2_variant = atoi(getenv("Q38D_G2"));
     if (getenv("Q38D_ATTN_MULTI")) attn_multi = atoi(getenv("Q38D_ATTN_MULTI"));
     if (getenv("Q38D_MT_PLANS")) mt_plans = atoi(getenv("Q38D_MT_PLANS"));
     if (getenv("Q38D_MTP_BATCH")) mtp_batch = atoi(getenv("Q38D_MTP_BATCH"));
