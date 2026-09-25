@@ -24,4 +24,6 @@ endif()
 add_executable(test_qwen_image test_qwen_image.c)
 target_include_directories(test_qwen_image PRIVATE ${COMMON})
 target_compile_options(test_qwen_image PRIVATE ${COMMON_FLAGS} ${ARCH_FLAGS})
+# transformer.h's NUMA thread binding uses cpu_set_t/CPU_SET (glibc extension).
+target_compile_definitions(test_qwen_image PRIVATE _GNU_SOURCE)
 target_link_libraries(test_qwen_image PRIVATE m pthread)

@@ -28,10 +28,13 @@ endif()
 add_executable(test_transformer test_transformer.c)
 target_include_directories(test_transformer PRIVATE ${COMMON})
 target_compile_options(test_transformer PRIVATE ${COMMON_FLAGS} ${ARCH_FLAGS})
+# transformer.h's NUMA thread binding uses cpu_set_t/CPU_SET (glibc extension).
+target_compile_definitions(test_transformer PRIVATE _GNU_SOURCE)
 target_link_libraries(test_transformer PRIVATE m pthread)
 
 # --- test_transformer_parallel ---
 add_executable(test_transformer_parallel test_transformer_parallel.c)
 target_include_directories(test_transformer_parallel PRIVATE ${COMMON})
 target_compile_options(test_transformer_parallel PRIVATE ${COMMON_FLAGS} ${ARCH_FLAGS})
+target_compile_definitions(test_transformer_parallel PRIVATE _GNU_SOURCE)
 target_link_libraries(test_transformer_parallel PRIVATE m pthread)

@@ -341,6 +341,10 @@ if(SPIRV_OUTPUTS)
     )
 endif()
 
+# vision_cpu_impl.c compiles transformer.h, whose NUMA thread binding uses
+# cpu_set_t/CPU_SET (glibc extension); C++ sources get _GNU_SOURCE from g++.
+set_source_files_properties(vision_cpu_impl.c PROPERTIES COMPILE_DEFINITIONS _GNU_SOURCE)
+
 # Vision encoder test executable
 set(VISION_TARGET test_vision_encoder)
 

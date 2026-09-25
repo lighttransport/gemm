@@ -24,4 +24,6 @@ endif()
 add_executable(test_flux2 test_flux2.c)
 target_include_directories(test_flux2 PRIVATE ${COMMON})
 target_compile_options(test_flux2 PRIVATE ${COMMON_FLAGS} ${ARCH_FLAGS})
+# transformer.h's NUMA thread binding uses cpu_set_t/CPU_SET (glibc extension).
+target_compile_definitions(test_flux2 PRIVATE _GNU_SOURCE)
 target_link_libraries(test_flux2 PRIVATE m pthread)
