@@ -188,20 +188,121 @@ decode kernel, so routed-expert arithmetic is identical in prefill and
 decode, and each rank's ~2 MB expert part stays L2-resident across its
 tokens.
 
-### Remaining non-native pieces and next steps
+### Next tasks (priority order, after job 51909852)
 
-- **Still converted, not native.** mHC `hc_*_fn` (Q8_0 in the GGUF) is
-  dequantized to BF16 by `glm53f_q2_core_patch`, and llama.cpp also quantizes
-  its 16,384-float input to Q8_0. The MLA `attn_k_b` (Q8_0) is dequantized to
-  BF16 for the query absorption. At position 0 neither matters; at longer
-  contexts both add small differences against llama.cpp.
-- **Batched prefill/MTP paths** still use the GGUF-patched compact weights for
-  KDA and the FP8 shared image. Native per-token paths are used inside the
-  batch for sparse and dense layers, which caps native fast prefill at
-  ~34 tok/s. Batched Q8_0R kernels (tokens x rows) for KDA, sparse, dense and
-  shared would restore the ~150 tok/s class.
-- **Parity beyond position 0** needs a multi-token streamed reference. The
-  probe runs one token per process today.
+1. **Batched native prefill.** Native fast prefill is 34 tok/s, against 55
+   for the hybrid. In `glm53f_sparse_sublayer_batch_12n` and
+   `glm53f_dense_ffn_sublayer_batch_12n`, native sparse and dense layers fall
+   back to one token at a time inside a batch.
+   - Add a tokens-x-rows kernel for repacked Q8_0 (`GLM53F_NATIVE_Q8_0R`):
+     a 4-row x 4-token tile that reuses each weight vector across tokens.
+     Prepare one Q8_0 activation per token, keeping `native_act` per token.
+   - Use it for the sparse q_a/q_b/kv_a/output projections, dense
+     gate/up/down, the KDA batch projections (Q/K/V, f_a/f_b, g_a/g_b, beta,
+     output) and the native shared expert in `moe_prefill_grouped`.
+   - Keep per-token accumulation order equal to the decode kernel, so fast
+     prefill and legacy prefill stay token-identical. The current check
+     already gives 66/256 identical tokens.
+   - Target: at least 150 tok/s prompt ingestion on the 8K coding prompt,
+     with decode unchanged.
+2. **Weight arena for native tensors.** The native loaders make about 450
+   separate `posix_memalign` allocations of 1--3 MB each, including the
+   repacked copies. Earlier work on Laguna S-2.1 fp8 measured a 2x decode
+   gain from handing weights out of a few GB-sized mmap chunks with parallel
+   first touch.
+   - Add a bump arena in `glm53f_iq_bridge.c`, used by `glm53f_native_repack`
+     and the KDA, sparse, dense and shexp loaders.
+   - Measure with a same-allocation A/B of whole binaries only.
+3. **Remaining non-native tensors (llama.cpp contract).**
+   - MLA `attn_k_b` (Q8_0) is dequantized to BF16 for query absorption. Stage
+     it per head, 512 x 256 Q8_0, and absorb with the Q8_0 activation
+     contract.
+   - llama.cpp rounds the absorbed query and the softmax probabilities to F16
+     against its F16 cache. Match that inside `mla_heads_q8_value`.
+   - `hc_*_fn` is Q8_0 in the GGUF, and llama.cpp quantizes the
+     16,384-float mHC input to Q8_0. Production uses BF16 weights and F32
+     input.
+   - None of these matter at position 0; all add small differences at longer
+     contexts.
+4. **Multi-token parity.** The streamed probe processes one token per
+   process. Extend it, or add a small llama.cpp driver, to feed a short
+   prompt (for example 16--64 tokens) and dump per-layer streams at the last
+   position.
+   - Rebuild it only from a llama.cpp tree containing the `ggml-backend.cpp`
+     aliasing fix, which is still uncommitted in `~/work/llama.cpp`.
+   - Compare with `GLM53F_LAYER_TRACE_DIR` from a `--generate` run.
+   - Also re-derive the Q2 full-chain conclusions against the fixed
+     reference.
+5. **Long-context and MTP.**
+   - Measure 16K-context windows with three repeats.
+   - Check the Q4 MTP speculative path (`run_glm53f_q4_mtp_12n.sh`) with
+     `GLM53F_NATIVE` stages exported; its verifier batches run the compact
+     paths.
+   - Run the 8K coding prompt to EOS (or at least 1K tokens) and compile the
+     extracted C++.
+
+### Resuming prompt
+
+Paste this into a new session inside a fresh 12-node interactive allocation:
+
+> Continue GLM-5.3-Flash UD-Q4_K_XL work on 12 A64FX nodes. This host is
+> the allocation's rank-0 node: run MPI jobs directly, with no pjsub, and use
+> the native `mpifcc -Nclang` compiler. Read `a64fx/glm5/GLM53F_Q4_12N.md`
+> first, from "Fully GGUF-backed UD-Q4_K_XL (job 51909852)" through "Next
+> tasks". The branch is `glm53f`, and commit `90420b32` holds the native path.
+>
+> **Current state.**
+>
+> - `bash a64fx/glm5/run_glm53f_q4_12n.sh` defaults to `GLM53F_NATIVE=1`.
+>   Every matrix comes from the GGUF blocks under
+>   `~/models/glm53f-gguf-all/UD-Q4_K_XL/`: routed experts are
+>   Q4_K/Q5_K/Q6_K, and everything else is Q8_0, repacked at load to
+>   `GLM53F_NATIVE_Q8_0R`.
+> - Measured in job 51909852: 24.9 tok/s decode at short context (hybrid 22),
+>   21.4 tok/s at 8K context, native fast prefill 34 tok/s.
+> - Parity against a fixed llama.cpp streamed reference is 0.5--1% relative
+>   L2 through layer 20. At layer 21 a router near-tie swaps one expert.
+>
+> **Reproducing in the new job.**
+>
+> 1. Stage and run with `GLM53F_TARGET_STEPS=128 GLM53F_MIN_TOK_S=20 bash
+>    a64fx/glm5/run_glm53f_q4_12n.sh`. It takes about 30 minutes; the routed
+>    expert stage (15.5 GB per rank) dominates.
+> 2. For A/B runs, reuse the job-51909852 helper scripts in
+>    `tmp/glm53f-q4-51909852/scripts/` after editing their hard-coded job ID
+>    and paths:
+>    - `run_decode.sh TAG native|hybrid TOKEN STEPS [args]`. Pass `-` as
+>      TOKEN when the args start with `--generate PROMPT OUT N`.
+>    - `build.sh`, which writes candidate binaries to **shared** storage.
+>      Other ranks cannot see `/local`.
+>    - `stream_ref.sh TOKEN OUT`, the llama.cpp reference.
+>    - `compare_layers.py` and `router_check.py`.
+> 3. Before measuring, get the hybrid control `GLM53F_NATIVE=0` in the same
+>    allocation. Never compare tok/s across allocations.
+>
+> **Rules and gotchas.**
+>
+> - Do not measure performance while the llama.cpp probe (48 threads) runs
+>   on rank-0's node.
+> - Check `XOS_MMM_L_PAGING_POLICY` inside the job. The preset
+>   `demand:demand:prepage` places heap pages on one CMG.
+> - `--generate` must be argv[4] of `glm53f_target_decode_12n`.
+> - Rank stdout goes only to the `-of-proc` files.
+> - Gate every change on:
+>   - `test_glm53f_kquant`: PASS in both conservative and fast-math builds,
+>     including `repacked_bit_exact`.
+>   - Unchanged token-1234 layer parity (`compare_layers.py` against
+>     `tmp/glm53f-q4-51909852/stream-1234/graph`).
+>   - Coherent 8K coding-prompt output
+>     (`tmp/glm53f-quality-8k/prompt.ids`).
+>   - Same-allocation tok/s against the hybrid control.
+>
+> **Start with next task 1, batched native prefill.** Target at least 150
+> tok/s prompt ingestion with decode unchanged. Fast prefill and legacy
+> prefill should stay token-identical for the native arm.
+>
+> Report measurements with job IDs, update this document, and commit only
+> the glm53f files that are touched.
 
 ## Measurements
 
