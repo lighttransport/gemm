@@ -99,6 +99,7 @@ typedef struct {
     float best_val[NT];
     int best_idx[NT];
     int next_token;
+    float next_logit;   /* logit of next_token (global under TP) */
     _Atomic int *unit_cnt; /* per 16-row FFN unit, parity counter */
     /* NextN/MTP drafter (Q38D_MTP=1, measurement): layer E.L[NLAYER] */
     q38d_mat eh, dhead;   /* dhead: first draft_v rows of the head (MTP drafts) */
@@ -1011,6 +1012,9 @@ static const q38d_act *norm_act(int tid, const float *w) {
     return r;
 }
 static int norm_cmg = 1, norm_pf = 1;
+/* TP: sums of squares of the residual slices published by the collectives */
+static float tp_ssq[4] __attribute__((aligned(256)));
+static int tp_ssq_ok;
 static double norm_cbar_t;
 static int *norm_csense[NT];
 static float ssq_part[NCMG][64] __attribute__((aligned(256)));
@@ -1068,7 +1072,10 @@ static void scale_rows(float *p, int n, float f) {
 }
 static const q38d_act *norm_act_impl(int tid, const float *w) {
     float ss;
-    if (ssq_valid) {
+    if (tp_ssq_ok) {
+        ss = 0;
+        for (int k = 0; k < tp_nsl; k++) ss += tp_ssq[k];
+    } else if (ssq_valid) {
         ss = 0;
         for (int c = 0; c < NCMG; c++) for (int l = 0; l < PER; l++) ss += ssq_part[c][l];
         if (ssq_split_valid)
@@ -1118,7 +1125,8 @@ static void ssm_prefetch_state(int layer, int h);
 /* part: 0 q, 1 k, 2 v of head h; channels start at ch0 in the qkv vector */
 /* history ring of 8 positions so that rejected speculative positions never
  * overwrite the three accepted ones the next token reads */
-static void conv_silu_local(int layer, int h, int part, int ch0, int pos, float *out, const float *qkv) {
+/* wr: update the history (only the leading worker of a split head does) */
+static void conv_silu_local(int layer, int h, int part, int ch0, int pos, float *out, const float *qkv, int wr) {
     float *hs = E.conv_hist[layer][h];
     const float *w = E.conv_wl[layer][h] + part * 128;
     const float *in = qkv + ch0;
@@ -1133,7 +1141,7 @@ static void conv_silu_local(int layer, int h, int part, int ch0, int pos, float 
         v = svmla_f32_x(pf, v, svld1_f32(pf, w + 1152 + j), svld1_f32(pf, in + j));
         svst1_f32(pf, out + j, svmul_f32_x(pf, v, q38d_sigmoid_sve(pf, v)));
     }
-    memcpy(hs + (size_t)(pos & 7) * 384 + part * 128, in, 128 * sizeof(float));
+    if (wr) memcpy(hs + (size_t)(pos & 7) * 384 + part * 128, in, 128 * sizeof(float));
 }
 static void conv_silu(const q38d_layer *L, int layer, int ch0, int pos, int write, float *out) {
     float *cs = E.conv_state[layer];
@@ -1176,9 +1184,9 @@ static void ssm_head_io(int layer, int h, int pos, const q38d_io *io) {
     float q[128], k[128], v[128], o[128];
     if (ssm_pf == 3) ssm_prefetch_state(layer, h);
     if (conv_local) {
-        conv_silu_local(layer, h, 0, ssm_qoff(g), pos, q, io->qkv);
-        conv_silu_local(layer, h, 1, ssm_koff(g), pos, k, io->qkv);
-        conv_silu_local(layer, h, 2, ssm_voff(h), pos, v, io->qkv);
+        conv_silu_local(layer, h, 0, ssm_qoff(g), pos, q, io->qkv, 1);
+        conv_silu_local(layer, h, 1, ssm_koff(g), pos, k, io->qkv, 1);
+        conv_silu_local(layer, h, 2, ssm_voff(h), pos, v, io->qkv, 1);
     } else {
         conv_silu(L, layer, g * DS, pos, h < NGROUP, q);
         conv_silu(L, layer, NGROUP * DS + g * DS, pos, h < NGROUP, k);
@@ -1266,6 +1274,81 @@ static void ssm_finish(const q38d_layer *L, int h, const float *o, const q38d_io
     }
     if (E.arith != Q38D_F32) q38d_prepare_range(io->act_o, io->o, ssm_oidx(h) * 4, ssm_oidx(h) * 4 + 4);
 }
+/* TP: head h shared by W workers of its CMG; worker w sweeps the key rows
+ * [w*128/W, (w+1)*128/W) of the (lazy) state (whole 512-byte rows, so no
+ * line is written by two workers) and publishes its partial S^T k and S^T q.
+ * After one per-head counter sync every worker sums the W partials in a fixed
+ * order, forms the full delta and output (identical on all W), writes its
+ * value-column slice of the pending delta and output, and quantizes those
+ * units. Each worker refreshes the pending k entries of its own rows. */
+typedef struct { _Atomic int v; char pad[252]; } q38d_ctr;
+static q38d_ctr ssm_ctr[NT];
+static float ssm_part[NT][2 * DS] __attribute__((aligned(256)));
+static int ssm_gen[NT];
+static int ssm_split = 0;   /* key-row split of a head over its CMG workers: slower here, off */
+static void ssm_head_split(int layer, int h, int pos, int w, int W, int slot, int tid) {
+    const q38d_layer *L = &E.L[layer];
+    int g = h % NGROUP;
+    float q[DS], k[DS], v[DS];
+    conv_silu_local(layer, h, 0, ssm_qoff(g), pos, q, E.qkv, w == 0);
+    conv_silu_local(layer, h, 1, ssm_koff(g), pos, k, E.qkv, w == 0);
+    conv_silu_local(layer, h, 2, ssm_voff(h), pos, v, E.qkv, w == 0);
+    l2norm128(q); l2norm128(k);
+    const float qs = 1.0f / sqrtf((float)DS);
+    for (int i = 0; i < DS; i++) q[i] *= qs;
+    float val = E.ab[ssm_abi(h)] + L->dt_bias[h];
+    float sp = val > 20.0f ? val : logf(1.0f + expf(val));
+    float decay = expf(sp * L->ssm_a[h]);
+    float beta = 1.0f / (1.0f + expf(-E.bb[ssm_abi(h)]));
+    float *St = ssm_st(layer, h, 0), *pk = St + DS * DS, *pd = pk + DS;
+    const int RS = DS / W, c0 = w * RS;
+    const svbool_t pf = svptrue_b32();
+    SV8(sk); SV8(oa); SV8(pv);
+#define SZ(j) sk##j = svdup_n_f32(0); oa##j = sk##j; pv##j = svld1_f32(pf, pd + 16 * j)
+    SV8_EACH(SZ);
+#undef SZ
+    for (int c = c0; c < c0 + RS; c++) {
+        float *row = St + (size_t)c * DS;
+        svfloat32_t pc = svdup_n_f32(pk[c]), kc = svdup_n_f32(k[c]), qc = svdup_n_f32(q[c]);
+#define SPL(j) { svfloat32_t s_ = svmul_n_f32_x(pf, svmla_f32_x(pf, svld1_f32(pf, row + 16 * j), pv##j, pc), decay); \
+                 svst1_f32(pf, row + 16 * j, s_); sk##j = svmla_f32_x(pf, sk##j, s_, kc); oa##j = svmla_f32_x(pf, oa##j, s_, qc); }
+        SV8_EACH(SPL);
+#undef SPL
+    }
+    float *mp = ssm_part[slot * 0 + (tid)];
+#define SST(j) { svst1_f32(pf, mp + 16 * j, sk##j); svst1_f32(pf, mp + DS + 16 * j, oa##j); }
+    SV8_EACH(SST);
+#undef SST
+    for (int c = c0; c < c0 + RS; c++) pk[c] = k[c];   /* own rows only */
+    int gen = ++ssm_gen[tid];
+    atomic_fetch_add_explicit(&ssm_ctr[slot].v, 1, memory_order_acq_rel);
+    while (atomic_load_explicit(&ssm_ctr[slot].v, memory_order_acquire) < gen * W) __asm__ volatile("yield" ::: "memory");
+    /* fixed-order fold of the W partials (workers tid - w .. tid - w + W - 1) */
+    float o[DS];
+    float kq = dot(k, q, DS);
+    const float *p0 = ssm_part[tid - w];
+    for (int i = 0; i < DS; i += 16) {
+        svfloat32_t s_ = svld1_f32(pf, p0 + i), a_ = svld1_f32(pf, p0 + DS + i);
+        for (int j = 1; j < W; j++) {
+            s_ = svadd_f32_x(pf, s_, svld1_f32(pf, ssm_part[tid - w + j] + i));
+            a_ = svadd_f32_x(pf, a_, svld1_f32(pf, ssm_part[tid - w + j] + DS + i));
+        }
+        svfloat32_t d_ = svmul_n_f32_x(pf, svsub_f32_x(pf, svld1_f32(pf, v + i), s_), beta);
+        if (i >= c0 && i < c0 + RS) svst1_f32(pf, pd + i, d_);   /* own slice of the pending delta */
+        svst1_f32(pf, o + i, svmla_n_f32_x(pf, a_, d_, kq));
+    }
+    float inv = 1.0f / sqrtf(sumsq(o, DS) / DS + E.eps);
+    const float *z = E.zb + ssm_zoff(h);
+    int oi = ssm_oidx(h);
+    float *dst = E.o + (size_t)oi * DS;
+    for (int i = c0; i < c0 + RS; i += 16) {
+        svfloat32_t zv = svld1_f32(pf, z + i);
+        svfloat32_t sz = svmul_f32_x(pf, zv, q38d_sigmoid_sve(pf, zv));
+        svfloat32_t ov = svmul_f32_x(pf, svmul_n_f32_x(pf, svld1_f32(pf, o + i), inv), svld1_f32(pf, L->ssm_norm + i));
+        svst1_f32(pf, dst + i, svmul_f32_x(pf, ov, sz));
+    }
+    if (E.arith != Q38D_F32) q38d_prepare_range(&E.act_o, E.o, oi * 4 + c0 / 32, oi * 4 + (c0 + RS) / 32);
+}
 static void ssm_prefetch_state(int layer, int h) {
     const char *p = (const char *)ssm_st(layer, h, 0);
     for (int i = 0; i < DS * DS * 4; i += 256) __builtin_prefetch(p + i, 1, 2);
@@ -1331,11 +1414,21 @@ static void attn_pv(const float *V, int t0, int t1, const float *p, float *out) 
 static double att_t[4];
 static void attention_io(int layer, int tid, int pos, int *csense, const q38d_io *io);
 static void attention(int layer, int tid, int pos, int *csense) { attention_io(layer, tid, pos, csense, io_single()); }
+/* The rank's local KV head kv runs on a group of CPK = 4 / (KV heads per
+ * rank) CMGs (1 on one node, 2 for TP2, 4 for TP4): lane lw of GW = CPK*12
+ * splits the positions; groups wider than a CMG sync with global barriers. */
+static int *gsense_ptr[NT];
+static inline void attn_group(int tid, int *kv, int *lw, int *gw) {
+    int cpk = 4 / (NKV / tp_n), c = tid / PER;
+    *kv = c / cpk; *lw = (c % cpk) * PER + tid % PER; *gw = cpk * PER;
+}
 static void attention_io(int layer, int tid, int pos, int *csense, const q38d_io *io) {
     uint64_t T0 = tid ? 0 : ticks();
     const q38d_layer *L = &E.L[layer];
-    int c = tid / PER, l = tid % PER, ai = L->ai;
-    if (c >= NKV / tp_n) return;   /* TP: CMG c runs the rank's local KV head c */
+    int ai = L->ai, c, l, GW;
+    attn_group(tid, &c, &l, &GW);   /* c: local KV head, l: lane in its group */
+    const int wide = GW > PER;
+#define ATT_BAR() do { if (wide) gbarrier(tid, gsense_ptr[tid]); else cbarrier(tid, csense); } while (0)
     float *qh = E.qh[c];
     if (l < 6) {
         int hq = 6 * c + l;
@@ -1349,9 +1442,9 @@ static void attention_io(int layer, int tid, int pos, int *csense, const q38d_io
         memcpy(E.vc[ai][c] + (size_t)pos * HD, io->vb + c * HD, HD * sizeof(float));
     }
     uint64_t T1 = tid ? 0 : ticks();
-    cbarrier(tid, csense);
+    ATT_BAR();
     uint64_t T2 = tid ? 0 : ticks();
-    int n = pos + 1, t0 = (int)((int64_t)n * l / PER), t1 = (int)((int64_t)n * (l + 1) / PER);
+    int n = pos + 1, t0 = (int)((int64_t)n * l / GW), t1 = (int)((int64_t)n * (l + 1) / GW);
     const float scale = 1.0f / 16.0f;
     const svbool_t pf = svptrue_b32();
     float *part = E.apart[c] + (size_t)l * 6 * (2 + HD);
@@ -1381,18 +1474,18 @@ static void attention_io(int layer, int tid, int pos, int *csense, const q38d_io
         }
     }
     uint64_t T3 = tid ? 0 : ticks();
-    cbarrier(tid, csense);
+    ATT_BAR();
     if (!tid) { uint64_t T4 = ticks(); att_t[0] += T1 - T0; att_t[1] += T2 - T1; att_t[2] += T3 - T2; att_t[3] += T4 - T3; }
     if (l < 6) {
         int hq = 6 * c + l;
         float M = -INFINITY;
-        for (int i = 0; i < PER; i++) {
+        for (int i = 0; i < GW; i++) {
             float mi = E.apart[c][(size_t)i * 6 * (2 + HD) + l * (2 + HD)];
             if (mi > M) M = mi;
         }
         float o[HD], den = 0;
         memset(o, 0, sizeof o);
-        for (int i = 0; i < PER; i++) {
+        for (int i = 0; i < GW; i++) {
             const float *pp = E.apart[c] + (size_t)i * 6 * (2 + HD) + l * (2 + HD);
             if (pp[1] == 0) continue;
             float w = q38d_expf(pp[0] - M);
@@ -1409,6 +1502,7 @@ static void attention_io(int layer, int tid, int pos, int *csense, const q38d_io
         }
         if (E.arith != Q38D_F32) q38d_prepare_range(io->act_o, io->o, hq * 8, hq * 8 + 8);
     }
+#undef ATT_BAR
 }
 
 /* ------------------------------------------------------------------ */
@@ -1517,9 +1611,9 @@ static int pf_pos;
 static int pf_kv = 1;
 static void pf_attn_kv(int tid, int layer) {
     const q38d_layer *L = &E.L[layer];
-    int c = tid / PER, l = tid % PER, n = pf_pos + 1;
-    if (c >= NKV / tp_n) return;
-    int t0 = (int)((int64_t)n * l / PER), t1 = (int)((int64_t)n * (l + 1) / PER);
+    int c, l, gw, n = pf_pos + 1;
+    attn_group(tid, &c, &l, &gw);
+    int t0 = (int)((int64_t)n * l / gw), t1 = (int)((int64_t)n * (l + 1) / gw);
     if (t1 > t0) {
         pf_l2(E.kc[L->ai][c] + (size_t)t0 * HD, (size_t)(t1 - t0) * HD * 4);
         pf_l2(E.vc[L->ai][c] + (size_t)t0 * HD, (size_t)(t1 - t0) * HD * 4);
@@ -1551,14 +1645,22 @@ static void phase_end_c(int tid, int *cs, uint64_t *t, int phase) {
  * folds every rank's partial into the residual (the following phase barrier
  * releases the others); norms then take the sum of squares directly. */
 static double tp_comm_t;
+static int tp_check, tp_check_n;
+static int tp_cmg_slices = 1;   /* slice k = the rows of CMG k: CMG barrier suffices */
 static void tp_reduce(int tid, int *gs) {
-    gbarrier(tid, gs);
-    if (tid == 0) {
-        uint64_t a = ticks();
-        q38d_tp_sum_add(E.xpart, E.x, EMBD);
-        tp_comm_t += (double)(ticks() - a);
+    if (tp_cmg_slices && tp_nsl == NCMG) cbarrier(tid, norm_csense[tid]);
+    else gbarrier(tid, gs);
+    int k = tid / PER;
+    if (tid % PER == 0 && k < tp_nsl) {
+        uint64_t a = tid ? 0 : ticks();
+        int n = EMBD / tp_nsl;
+        if (tp_nsl > 1) q38d_tp_sum_add_slice(k, E.xpart + k * n, E.x + k * n, n);
+        else q38d_tp_sum_add(E.xpart, E.x, EMBD);
+        tp_ssq[k] = sumsq(E.x + k * n, n);
+        if (!tid) tp_comm_t += (double)(ticks() - a);
     }
     ssq_valid = 0;
+    tp_ssq_ok = 1;
 }
 /* experiment: A8 activations for the FFN gate/up input / down input */
 static int ffn_a8, down_a8;
@@ -1580,7 +1682,10 @@ static void layer_body(int tid, int layer, int pos, int *gs, int *cs, uint64_t *
             if (inproj_cbar && ssm_perm && use_plan) phase_end_c(tid, cs, &t, P_SSM_IN);
             else phase_end(tid, gs, &t, P_SSM_IN);
             if (ssm_pf == 2 && hh >= 0) ssm_prefetch_state(layer, hh);
-            if (hh >= 0) ssm_head(layer, hh, pos);
+            if (tp_n > 1 && ssm_split && PER % HC == 0 && PER / HC > 1) {
+                int W = PER / HC, l = tid % PER, hs = l / W;
+                ssm_head_split(layer, ssm_head_of((tid / PER) * PER + hs), pos, l % W, W, (tid / PER) * PER + hs, tid);
+            } else if (hh >= 0) ssm_head(layer, hh, pos);
             if (E.arith == Q38D_F32) E.act_o.x = E.o;
             phase_end(tid, gs, &t, P_SSM_CORE);
             if (tp_n > 1) { mv(&L->out, &E.act_o, E.xpart, 0, tid); tp_reduce(tid, gs); }
@@ -1701,12 +1806,19 @@ static void head_argmax_m(int tid, const float *nw, const q38d_mat *hm, int *gs,
     if (tid == 0) {
         float best = -INFINITY; int bi = 0;
         for (int i = 0; i < NT; i++) if (E.best_idx[i] >= 0 && E.best_val[i] > best) { best = E.best_val[i]; bi = E.best_idx[i]; }
+        if (tp_check && hm == &E.head) {   /* residual hash per token: equal on every rank and every run */
+            uint64_t hsh = 1469598103934665603ull;
+            const uint32_t *xw = (const uint32_t *)E.x;
+            for (int i = 0; i < EMBD; i++) hsh = (hsh ^ xw[i]) * 1099511628211ull;
+            fprintf(stderr, "q38d: xh rank=%d step=%d %016llx\n", tp_r, tp_check_n++, (unsigned long long)hsh);
+        }
         if (tp_n > 1 && hm == &E.head) {
             int gid = bi + tp_r * (E.n_vocab / tp_n);
             q38d_tp_argmax(&best, &gid);
             bi = gid;
         }
         E.next_token = bi;
+        E.next_logit = best;
     }
     prof_mark(tid, &t, P_HEAD);
     gbarrier(tid, gs);
@@ -1717,6 +1829,7 @@ static void step(int tid, int token, int pos, int want_head, int *gs, int *cs) {
     uint64_t t = ticks();
     pf_pos = pos;
     ssq_valid = 0;
+    tp_ssq_ok = 0;
     embed_token(tid, token);
     phase_end(tid, gs, &t, P_EMBED);
     for (int layer = 0; layer < NLAYER; layer++) layer_body(tid, layer, pos, gs, cs, &t);
@@ -1737,13 +1850,13 @@ static void rmsnorm_to(float *dst, const float *x, const float *w) {
 }
 static void mtp_step(int tid, int token, int pos, const float *hidden, int want_head, int *gs, int *cs) {
     uint64_t t = ticks();
-    static float *save_x;
+    static float *save_x, save_logit;
     static int save_next;
     /* input [enorm(emb(token)); hnorm(hidden)], prepared by all workers:
      * embedding blocks, then every worker takes both norms' sums of squares
      * (fixed order) and quantizes its share of the 320 pairs */
     embed_token_to(tid, token, E.x_mtp);
-    if (tid == 0) { save_x = E.x; save_next = E.next_token; }
+    if (tid == 0) { save_x = E.x; save_next = E.next_token; save_logit = E.next_logit; }
     gbarrier(tid, gs);
     {
         float inv_e = 1.0f / sqrtf(sumsq(E.x_mtp, EMBD) / EMBD + E.eps);
@@ -1782,6 +1895,7 @@ static void mtp_step(int tid, int token, int pos, const float *hidden, int want_
         E.x = save_x;
         if (want_head) E.mtp_draft = E.next_token;
         E.next_token = save_next;
+        E.next_logit = save_logit;
     }
     ssq_valid = 0;
     gbarrier(tid, gs);
@@ -2461,11 +2575,13 @@ static void *worker(void *arg) {
         }
     int c = tid / PER, l = tid % PER;
     if (l == 0) {
-        for (int ai = 0; ai < NATTN + mtp_on; ai++) {
-            E.kc[ai][c] = cmg_alloc((size_t)E.max_seq * HD * 4, c);
-            E.vc[ai][c] = cmg_alloc((size_t)E.max_seq * HD * 4, c);
-            memset(E.kc[ai][c], 0, (size_t)E.max_seq * HD * 4);
-            memset(E.vc[ai][c], 0, (size_t)E.max_seq * HD * 4);
+        int cpk = 4 / (NKV / tp_n);
+        for (int ai = 0; c % cpk == 0 && ai < NATTN + mtp_on; ai++) {
+            int kv = c / cpk;   /* local KV head of the CMG group starting here */
+            E.kc[ai][kv] = cmg_alloc((size_t)E.max_seq * HD * 4, c);
+            E.vc[ai][kv] = cmg_alloc((size_t)E.max_seq * HD * 4, c);
+            memset(E.kc[ai][kv], 0, (size_t)E.max_seq * HD * 4);
+            memset(E.vc[ai][kv], 0, (size_t)E.max_seq * HD * 4);
         }
         E.qh[c] = aligned_alloc(256, 6 * HD * 4);
         E.xn_c[c] = aligned_alloc(256, EMBD * sizeof(float));
@@ -2476,9 +2592,10 @@ static void *worker(void *arg) {
         ac->sc = aligned_alloc(256, EMBD / 16 * 4 + 256);
         ac->sum = aligned_alloc(256, EMBD / 16 * 4 + 256);
         memset(ac->q, 0, q38d_act_qbytes(EMBD, Q38D_A16));
-        E.apart[c] = aligned_alloc(256, (size_t)PER * 6 * (2 + HD) * 4);
+        E.apart[c] = aligned_alloc(256, (size_t)NT * 6 * (2 + HD) * 4);
     }
     norm_csense[tid] = &cs;
+    gsense_ptr[tid] = &gs;
     if (getenv("Q38D_NORM_CMG")) norm_cmg = atoi(getenv("Q38D_NORM_CMG"));
     repack_worker(c, l);
     gbarrier(tid, &gs);
@@ -2617,7 +2734,7 @@ static void *worker(void *arg) {
     }
     for (int n = 0; n < gn; n++) {
         int cur = E.next_token;
-        if (tid == 0) { JOB.tok[pn + n] = cur; JOB.trace_logit[n] = E.logits[cur]; }
+        if (tid == 0) { JOB.tok[pn + n] = cur; JOB.trace_logit[n] = E.next_logit; }
         step(tid, cur, pn + n, 1, &gs, &cs);
         if (mtp_on) mtp_drafts(tid, n + 1, pn + n, &gs, &cs);
     }
@@ -2697,6 +2814,9 @@ int main(int argc, char **argv) {
     if (getenv("Q38D_FFN_A8")) ffn_a8 = atoi(getenv("Q38D_FFN_A8"));
     if (getenv("Q38D_DOWN_A8")) down_a8 = atoi(getenv("Q38D_DOWN_A8"));
     if (getenv("Q38D_G2")) g2_variant = atoi(getenv("Q38D_G2"));
+    if (getenv("Q38D_TP_CHECK")) tp_check = atoi(getenv("Q38D_TP_CHECK"));
+    if (getenv("Q38D_TP_CMGSL")) tp_cmg_slices = atoi(getenv("Q38D_TP_CMGSL"));
+    if (getenv("Q38D_SSM_SPLIT")) ssm_split = atoi(getenv("Q38D_SSM_SPLIT"));
     if (getenv("Q38D_SSM_CPF")) ssm_cpf = atoi(getenv("Q38D_SSM_CPF"));
     if (getenv("Q38D_NORM_PF")) norm_pf = atoi(getenv("Q38D_NORM_PF"));
     if (getenv("Q38D_ATTN_MULTI")) attn_multi = atoi(getenv("Q38D_ATTN_MULTI"));
