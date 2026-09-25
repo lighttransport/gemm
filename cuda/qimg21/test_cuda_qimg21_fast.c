@@ -1163,6 +1163,12 @@ int main(int argc, char **argv) {
     }
 
     int rc = 1, N = ih * iw, nb = negative_path ? 2 : 1;
+    /* Each tile is a self-contained canvas: its rope frame is centred on the
+     * tile, so the model composes a whole subject inside it. That is why more
+     * context does not help here -- giving a tile a halo makes the model draw a
+     * second, smaller subject in the halo, whether the frame is centred on the
+     * window (it composes for the whole padded canvas) or on the kept interior
+     * (the halo still shows canvas the interior never asked for). */
     int th = refine_path ? tile_tokens : ih, tw = refine_path ? tile_tokens : iw, T = th * tw;
     int tstride = tile_tokens - tile_overlap;
     /* Enough tiles to cover the output grid at `tstride`; the last row/column
@@ -1187,7 +1193,7 @@ int main(int argc, char **argv) {
     uint16_t *host_pred = NULL;
     /* Tiled refine host state: fine0 is the immutable resampled base, fine the
      * running blend and fine_w its accumulated weight. */
-    float *fine0 = NULL, *fine = NULL, *fine_w = NULL, *tile_in = NULL, *tile_out = NULL;
+    float *fine0 = NULL, *fine = NULL, *fine_w = NULL, *tile_in = NULL, *tile_out = NULL, *eps_field = NULL;
     memset(&rt, 0, sizeof(rt));
     memset(&st, 0, sizeof(st));
     memset(br, 0, sizeof(br));
@@ -1559,9 +1565,15 @@ int main(int argc, char **argv) {
         fine_w = (float *)calloc((size_t)N, sizeof(float));
         tile_in = (float *)malloc((size_t)T * 64 * sizeof(float));
         tile_out = (float *)malloc((size_t)T * 64 * sizeof(float));
+        /* One noise field for the whole output grid, cropped per tile. Two
+         * tiles that overlap therefore see the *same* noise in the overlap, so
+         * their trajectories agree there and the blend has almost nothing to
+         * reconcile. Independent per-tile noise is the largest avoidable source
+         * of tile-to-tile disagreement. */
+        eps_field = (float *)malloc((size_t)N * 64 * sizeof(float));
     }
-    REQ(host_out && host_pred && sigmas && (!refine_path || (fine0 && fine && fine_w && tile_in && tile_out)),
-        "host allocation");
+    REQ(host_out && host_pred && sigmas &&
+        (!refine_path || (fine0 && fine && fine_w && tile_in && tile_out && eps_field)), "host allocation");
     fprintf(stderr, "fast: device allocations %.0f MiB (peak %.0f MiB)\n", rt.allocated / (double)Q21F_MIB,
             rt.peak / (double)Q21F_MIB);
 
@@ -1599,6 +1611,13 @@ int main(int argc, char **argv) {
         if (s0 >= steps) s0 = steps - 1;
         refine_start = s0;
         q21f_resample(base_grid.data, (int)base_grid.shape[0], (int)base_grid.shape[1], fine0, ih, iw);
+        {
+            /* Seeded exactly as the --start-step path, so a refine whose tile
+             * covers the whole grid stays bit-identical to that restart. */
+            double spare = 0.0;
+            unsigned long long rng = (refine_seed + 0x9e3779b97f4a7c15ULL) * 0xbf58476d1ce4e5b9ULL;
+            for (size_t i = 0; i < (size_t)N * 64; i++) eps_field[i] = (float)q21f_gauss(&rng, &spare);
+        }
         fprintf(stderr, "fast: tiled refine %dx%d over a %zux%zu base grid, %dx%d tiles of %dx%d tokens "
                 "(stride %d), %d refine steps from sigma %.5f\n", ih, iw, base_grid.shape[0], base_grid.shape[1],
                 nrows, ncols, th, tw, tstride, steps - s0, sigmas[s0]);
@@ -1611,15 +1630,14 @@ int main(int argc, char **argv) {
                 int c0 = q21f_tile_origin(tc, tstride, iw, tw);
                 int c_lo = tc > 0 ? q21f_tile_origin(tc - 1, tstride, iw, tw) + tw - c0 : 0;
                 int c_hi = tc + 1 < ncols ? c0 + tw - q21f_tile_origin(tc + 1, tstride, iw, tw) : 0;
-                double keep = 1.0 - sigmas[s0], noise = sigmas[s0], spare = 0.0;
-                unsigned long long rng = (refine_seed + 0x9e3779b97f4a7c15ULL) * 0xbf58476d1ce4e5b9ULL +
-                                         (unsigned long long)tile_index * 0x94d049bb133111ebULL;
+                double keep = 1.0 - sigmas[s0], noise = sigmas[s0];
                 for (int y = 0; y < th; y++)
                     for (int x = 0; x < tw; x++) {
-                        const float *src = fine0 + (((size_t)(r0 + y) * iw) + c0 + x) * 64;
+                        size_t o = ((size_t)(r0 + y) * iw) + c0 + x;
+                        const float *src = fine0 + o * 64;
+                        const float *eps = eps_field + o * 64;
                         float *dst = tile_in + ((size_t)y * tw + x) * 64;
-                        for (int c = 0; c < 64; c++)
-                            dst[c] = (float)(keep * src[c] + noise * q21f_gauss(&rng, &spare));
+                        for (int c = 0; c < 64; c++) dst[c] = (float)(keep * src[c] + noise * eps[c]);
                     }
                 /* wait=1: the tile buffer is reused by the next tile. */
                 REQ(!q21f_upload(&rt, st.sample, tile_in, (size_t)T * 64 * 4, 1), "tile latent upload");
@@ -1681,8 +1699,12 @@ int main(int argc, char **argv) {
             }
             double keep = 1.0 - sigmas[start_step], noise = sigmas[start_step], spare = 0.0;
             unsigned long long rng = (refine_seed + 0x9e3779b97f4a7c15ULL) * 0xbf58476d1ce4e5b9ULL;
-            for (size_t i = 0; i < (size_t)T * 64; i++)
-                host_out[i] = (float)(keep * x0[i] + noise * q21f_gauss(&rng, &spare));
+            for (size_t i = 0; i < (size_t)T * 64; i++) {
+                /* Rounded to F32 first so this path and the tiled path, which
+                 * stores the field as F32, mix identical numbers. */
+                float e = (float)q21f_gauss(&rng, &spare);
+                host_out[i] = (float)(keep * x0[i] + noise * e);
+            }
             x0 = host_out;
             fprintf(stderr, "fast: restart at step %d/%d, sigma %.5f, seed %llu\n", start_step, steps,
                     sigmas[start_step], refine_seed);
@@ -1767,7 +1789,7 @@ fail:
     if (rt.i8_plugin) dlclose(rt.i8_plugin);
     if (rt.sage_plugin) dlclose(rt.sage_plugin);
     free(host_out); free(host_pred); free(sigmas);
-    free(fine0); free(fine); free(fine_w); free(tile_in); free(tile_out);
+    free(fine0); free(fine); free(fine_w); free(tile_in); free(tile_out); free(eps_field);
     npy_free(&pe); npy_free(&ne); npy_free(&la); npy_free(&cond); npy_free(&rope); npy_free(&base_grid);
     return rc;
 }

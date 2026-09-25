@@ -43,6 +43,36 @@ def _run(command: list[str], *, cwd: Path) -> None:
           f"{time.perf_counter() - start:.1f} s)", file=sys.stderr)
 
 
+def _largest_fitting_tile(root, command, limit):
+    """Largest --tile-tokens whose plan still fits the budget.
+
+    The runner refuses a plan it cannot afford and says so, so a --plan-only run
+    is an exact memory query that loads no weights. The command is the real
+    refine invocation, so the probe sees the same editing layout, K/V cache and
+    preset the run will use. Memory is monotone in the tile size, so a binary
+    search finds the largest fit; the maximum is tried first because on most
+    budgets it fits outright and then there is nothing to search.
+    """
+    def fits(tokens):
+        probe = list(command)
+        probe[probe.index("--tile-tokens") + 1] = str(tokens)
+        probe += ["--plan-only", "--quiet"]
+        return subprocess.run(probe, cwd=root, capture_output=True).returncode == 0
+
+    if fits(limit):
+        return limit
+    lo, hi, best = 1, limit - 1, None
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if fits(mid):
+            best, lo = mid, mid + 1
+        else:
+            hi = mid - 1
+    if best is None:
+        raise SystemExit("no refine tile fits the VRAM budget; raise --vram-budget-mib or lower --preset")
+    return best
+
+
 def _decode_vae(model: Path, latent_path: Path, out_path: Path, height: int, width: int,
                 dtype: str, backend: str, tile: bool = False) -> None:
     """Decode normalized [tokens, 64] latents using AutoencoderKLQwenImage21."""
@@ -114,8 +144,9 @@ def main() -> int:
     ap.add_argument("--base-steps", type=int, default=None,
                     help="steps for the base pass (default: --steps)")
     ap.add_argument("--tile-tokens", type=int, default=None,
-                    help="refine tile side in latent tokens (default: the base grid's shorter side; "
-                         "needs --upscale above 1)")
+                    help="refine tile side in latent tokens. The default is the largest tile whose "
+                         "plan still fits --vram-budget-mib, which is also the best quality, since "
+                         "each tile is composed as its own canvas. Needs --upscale above 1.")
     ap.add_argument("--tile-overlap", type=int, default=8,
                     help="latent tokens neighbouring refine tiles share")
     ap.add_argument("--refine-strength", type=float, default=0.5,
@@ -199,6 +230,7 @@ def main() -> int:
         ap.error("--tile-tokens needs --upscale above 1: tiling refines a base grid, "
                  "and without one there is nothing to refine")
     base_h_tokens = base_w_tokens = None
+    tile_tokens = args.tile_tokens
     if args.upscale != 1.0:
         base_h = max(32, int(round(args.height / args.upscale)))
         base_w = max(32, int(round(args.width / args.upscale)))
@@ -207,15 +239,12 @@ def main() -> int:
         base_h_tokens, base_w_tokens = base_h // 16, base_w // 16
         if base_h_tokens > h_tokens or base_w_tokens > w_tokens:
             ap.error("--upscale must not enlarge the base grid past the output grid")
-    tile_tokens = args.tile_tokens
+    if args.tile_tokens is not None and not 1 <= args.tile_tokens <= min(h_tokens, w_tokens):
+        ap.error(f"--tile-tokens must be in [1, {min(h_tokens, w_tokens)}] for a "
+                 f"{args.height}x{args.width} output")
     if tiled:
-        tile_tokens = tile_tokens or min(base_h_tokens, base_w_tokens)
-    if tiled:
-        if not 1 <= tile_tokens <= min(h_tokens, w_tokens):
-            ap.error(f"--tile-tokens must be in [1, {min(h_tokens, w_tokens)}] for a "
-                     f"{args.height}x{args.width} output")
-        if args.tile_overlap < 0 or args.tile_overlap >= tile_tokens:
-            ap.error("--tile-overlap must be in [0, tile-tokens)")
+        if args.tile_overlap < 0:
+            ap.error("--tile-overlap must be >= 0")
         if not 0.0 < args.refine_strength <= 1.0:
             ap.error("--refine-strength must be in (0, 1]")
         if args.base_steps is not None and args.base_steps < 1:
@@ -488,16 +517,30 @@ def main() -> int:
         # The refine pass reads the base as a 3-D grid, so the resample target is
         # unambiguous and no extra flag can disagree with the data.
         np.save(base_grid, np.ascontiguousarray(base.reshape(base_h_tokens, base_w_tokens, 64)))
+
+        # Each tile is composed as its own canvas, so quality falls off with
+        # smaller tiles: more tiles means more independently re-drawn detail.
+        # The default is therefore the largest tile the budget allows, which on
+        # most sizes is the whole grid and means no tiling at all.
+        def refine_command(tokens):
+            return denoise_command(h_tokens, w_tokens, args.steps, native_latents,
+                                   ["--refine-from", str(base_grid), "--tile-tokens", str(tokens),
+                                    "--tile-overlap", str(args.tile_overlap),
+                                    "--refine-strength", str(args.refine_strength),
+                                    "--refine-seed", str(args.refine_seed),
+                                    "--normalization", args.native_normalization,
+                                    "--rope", args.native_rope,
+                                    "--dump-dir", str(steps_dir)],
+                                   target_hw=(tokens, tokens))
+
+        if tile_tokens is None:
+            limit = min(h_tokens, w_tokens)
+            tile_tokens = _largest_fitting_tile(root, refine_command(limit), limit)
+            print(f"refine tile: {tile_tokens} of {limit} latent tokens is the largest that fits "
+                  f"the {args.preset} budget")
         print(f"refine pass: {args.height}x{args.width} px in {tile_tokens}-token tiles, "
               f"strength {args.refine_strength}")
-        _run(denoise_command(h_tokens, w_tokens, args.steps, native_latents,
-                             ["--refine-from", str(base_grid), "--tile-tokens", str(tile_tokens),
-                              "--tile-overlap", str(args.tile_overlap),
-                              "--refine-strength", str(args.refine_strength),
-                              "--refine-seed", str(args.refine_seed),
-                              "--normalization", args.native_normalization,
-                              "--rope", args.native_rope,
-                              "--dump-dir", str(steps_dir)], target_hw=(tile_tokens, tile_tokens)), cwd=root)
+        _run(refine_command(tile_tokens), cwd=root)
     else:
         _run(denoise_command(h_tokens, w_tokens, args.steps, native_latents,
                              ["--latents", str(latent_path), "--normalization", args.native_normalization,

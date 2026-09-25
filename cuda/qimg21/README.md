@@ -2248,11 +2248,20 @@ python3 cuda/qimg21/native_generate.py --model /mnt/nvme01/models/qimg-21 \
 
 `--height/--width` are the *output* size; `--upscale F` generates the base at
 `1/F` of it (`--base-steps` defaults to `--steps`; a coarse base rarely needs as
-many). `--tile-tokens` defaults to the base grid's shorter side, which is the
-base's native token count. Editing works unchanged: the joint layout's
-target block is the grid the model actually sees, so the refine pass gets a
-layout built for the tile, and because prefix positions do not depend on the
-target grid, one layout serves every tile.
+many). Editing works unchanged: the joint layout's target block is the grid the
+model actually sees, so the refine pass gets a layout built for the tile, and
+because prefix positions do not depend on the target grid, one layout serves
+every tile.
+
+`--tile-tokens` defaults to **the largest tile whose plan still fits the VRAM
+budget**, which the driver finds by binary-searching `--plan-only` runs of the
+exact refine command it is about to issue (so the probe sees the same preset,
+editing layout and K/V cache, and loads no weights). Each tile is composed as
+its own canvas, so quality falls off with smaller tiles; on most sizes the
+largest tile that fits is the whole grid, and the default is then no tiling at
+all. Pass `--tile-tokens` to trade quality for time -- the refine's attention
+cost is quadratic in the tile and the tile count grows as the tile shrinks, so
+2048x2048 runs in 111 s as 3x3 tiles of 56 and 138 s as one tile of 128.
 
 ### Equivalences and validation
 
@@ -2287,9 +2296,11 @@ Whole-pipeline `native_generate.py` runs, `low8` unless noted, 20 steps:
 
 | Run | Total | Peak | Notes |
 |---|---:|---:|---|
-| 1024x1024 | 55 s | 6,770 MiB | 512 base, 9 refine tiles of 32 |
+| 1024x1024, `--tile-tokens 56` | 111 s | 6,890 MiB | 1024 base, 9 refine tiles, 3x3 decode tiles |
+| 1024x1024, default | 45 s | 6,770 MiB | 512 base, auto tile 64 = 1 tile, one-pass decode |
 | 2048x2048, `--tile-tokens 56` | 111 s | 6,890 MiB | 1024 base, 9 refine tiles, 3x3 decode tiles |
-| 1024x1024 edit, `--tile-tokens 40` | 49 s | 6,912 MiB | 512 condition image, 512 base, 2x2 refine tiles |
+| 2048x2048, default | 138 s | 7,092 MiB | 1024 base, auto tile 128 = 1 tile, 3x3 decode tiles |
+| 1024x1024 edit, 1024 condition, default | 81 s | 7,044 MiB | 512 base, auto tile 64 = 1 tile; the 2,221 MiB edit K/V cache is what constrains the plan |
 
 For comparison, an **untiled** 2048x2048 run on the same card: the denoiser
 still fits (6,483 MiB, 4.04 s per step) but the decode needs 11,762 MiB, and an
@@ -2314,44 +2325,78 @@ expected: a tile has less context for its mid-block attention and sees
 zero-padding outside its border, which is why the bleed exists. This is the
 same trade diffusers' `enable_tiling` makes.
 
-Refine quality, decoded detail energy (mean |dI/dy| + |dI/dx| of the luma) at
-1024x1024, one seed, identical base and seed:
+### Refine quality
 
-| Result | Detail |
-|---|---:|
-| Bilinear 2x latent upsample, no refine | 0.0226 |
-| Refine, 1 tile of 64 (the untiled restart) | 0.0346 |
-| Refine, 2x2 tiles of 40 | 0.0293 |
-| Refine, 3x3 tiles of 32 | 0.0277 |
-| 1024x1024 generated directly, 40 steps | 0.0349 |
+Two things had to be measured rather than assumed, and both came out
+differently from the obvious guess.
 
-Against the untiled restart at the same strength and seed, the tiled latents
-reach cosine 0.9949 (2x2 of 40) and 0.9953 (3x3 of 32) with relative L2 0.10:
-each tile is an independent sample, so the fine detail is re-drawn rather than
-carried over, while the composition, palette and lighting survive. Cost grows
-and coherence falls with smaller tiles; that is the dial between VRAM and
-consistency.
+**Tiling costs about what resampling the noise costs.** Comparing a tiled refine
+against an untiled restart at the same strength only measures the tiling, but
+against a *different seed* of the same untiled restart measures the noise floor,
+and the two are the same size:
 
-Notes and limits:
+| Comparison, 1024x1024 from a 32x32 base, 20 steps, strength 0.4 | Cosine | Relative L2 |
+|---|---:|---:|
+| two untiled restarts, seeds 11 and 12 | 0.97087 | 0.2412 |
+| 2x2 tiles of 40, against an untiled restart | 0.97064 | 0.2406 |
 
-- The mid-block attention is tile-local, both in the denoiser's refine tiles and
-  in the decode tiles. A tile cannot see content outside itself, so a large
-  object that spans a seam is drawn twice, once per tile, in slightly different
-  detail. Bigger tiles and larger overlaps reduce it.
-- `--refine-strength` is the resolution-fixing dial. Low values keep the
-  resampled (blurry) base; high values re-synthesize. 0.4 to 0.5 works well for
-  a 2x upscale with 20 or 40 steps; below about 0.2 the refine is a no-op and
-  above about 0.6 the base stops constraining the layout.
-- The renoise noise is generated per tile from `--refine-seed` with SplitMix64
-  and Box-Muller, so neighbouring tiles never share a noise pattern and a run is
-  reproducible. The seed is independent of `--seed`, which still controls the
-  base pass and the text encoder.
-- Tiling needs `--runner fast`. The parity harness `test_cuda_qimg21_native`
-  stays the numerical oracle and is unchanged.
-- A tile costs the same attention as any other image of its size, so the total
-  refine work grows with the tile *count*, not the output size squared. 9 tiles
-  of 56x56 is 28,224 token-steps against 268M for one 128x128 attention, which
-  is why 2048x2048 is affordable at all.
+So the latent difference a tiled refine shows against an untiled one is
+indistinguishable from changing `--refine-seed`. The honest statement is that
+tiling re-samples the fine detail rather than losing it; the images below were
+reviewed side by side and the composition, palette and lighting all survive.
+
+**Detail, and the shared noise field.** Decoded detail energy is the mean
+|gradient| of the luma, 1024x1024, one base, one seed, 20 steps, strength 0.4,
+overlap 8. `seam` is the mean gradient in a 48 px band at each tile seam over
+the image average, so 1.0 means the seams are invisible:
+
+| Tiles | Per-tile noise | Shared noise | detail (per-tile) | detail (shared) | seam | cosine vs 1 tile |
+|---:|---|---:|---:|---:|---:|---:|
+| 9 (3x3 of 32) | yes | | 0.0263 | **0.0304** | 0.67 | 0.99934 |
+| 4 (2x2 of 40) | yes | | 0.0276 | **0.0300** | 0.74 | 0.99947 |
+| 4 (2x2 of 48) | | yes | | 0.0297 | 0.89 | 0.99960 |
+| 4 (2x2 of 56) | | yes | | 0.0309 | 0.16 | 0.99985 |
+| 1 (whole grid) | | yes | | 0.0318 | n/a | 1.0 |
+
+The runner draws **one noise field for the whole output grid and crops it per
+tile**, rather than a fresh draw per tile. Two tiles that overlap therefore see
+the *same* noise in the overlap, so their trajectories agree there and the blend
+has almost nothing to reconcile. That is worth 9 to 16 % of the detail energy
+and moves the latent cosine against the untiled result from 0.996 to 0.999. It
+is the one tiling change that measurably pays.
+
+After that, the tile-size penalty is small: 4 to 6 % of detail energy between
+one tile and nine, and the seam ratio never exceeds 0.89, so the seams are
+smoother than the image average rather than brighter. On the full pipeline at
+2048x2048 the single-tile refine also measures 0.1301 against 0.1210 for 3x3
+tiles of 56, and the railing and stair read as one structure instead of being
+re-drawn per tile.
+
+### Two things that did not work
+
+Both were tried because they are the standard answers, and both are recorded so
+they are not retried.
+
+- **A sharper latent resample.** The theory was that a 2x bilinear upsample
+  costs the refine its contrast. It does not: the resampled latent keeps 98.4 %
+  of the base's standard deviation (1.2855 against 1.3062), so there is no
+  contrast to put back. Catmull-Rom (`--latent-resample bicubic`, since
+  removed) preserves the deviation too but overshoots the base range, and the
+  model answers by over-texturing: cosine against the untiled result collapsed
+  to 0.11 and detail energy nearly doubled. A 2x upsample has no content above
+  the base Nyquist, and no filter can invent it.
+- **Overscan, i.e. a padded window per tile.** Denoising a larger window and
+  keeping only its interior should give each tile real generated context
+  instead of only itself. The first version framed the rope on the padded
+  window and the model duly composed a whole second, smaller subject in the
+  halo: the 1024x1024 output showed two apples at a pad of 8 and four at a pad
+  of 12, and the detail metric rose with it, which is why the metric alone was
+  misleading. Re-framing the rope on the kept interior fixed the offset but not
+  the scale, and the halo still showed canvas the interior never asked for.
+  A tile is a self-contained canvas because its rope frame is centred on it,
+  and there is no way to hand it more of the image without also telling it the
+  image is bigger. The feature was removed rather than shipped as a footgun;
+  `--tile-pad` no longer exists.
 
 ### A restart bug this work found
 
