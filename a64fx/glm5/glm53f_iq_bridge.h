@@ -62,6 +62,14 @@ int glm53f_native_matvec_team(const glm53f_native_matrix *m, int count,
                               const void *activation);
 int glm53f_native_matvec_n(const glm53f_native_matrix *m, int count,
                            const float *input);
+/* Token-major inputs/outputs: input stride = columns, each output stride =
+ * its matrix's rows. Each token has a separately prepared activation at
+ * activation + token * activation_stride. The team entry point has an
+ * implicit output barrier and must be called by every enclosing thread. */
+int glm53f_native_matvec_batch_team(const glm53f_native_matrix *m, int count,
+    const void *activation, size_t activation_stride, int tokens);
+int glm53f_native_matvec_batch(const glm53f_native_matrix *m, int count,
+    const float *input, int tokens);
 int glm53f_iq_matvec_2(
     float *output0, const uint8_t *weight0, int weight0_type,
     float *output1, const uint8_t *weight1, int weight1_type,

@@ -10,6 +10,7 @@ enum { TOKENS = 5 };
 int main(int argc, char **argv) {
     int rank, ranks, ok, local_ok = 1;
     int use_int8 = 0;
+    int wide_check = getenv("GLM53F_CHECK_WIDE_PREFILL") != NULL;
     glm53f_prefill_config config = {GLM53F_PREFILL_LEGACY, 32, GLM53F_PREFILL_FAST_DEFAULT, NULL, 0};
     const int input[TOKENS] = {1, 17, 42, 314, 2718};
     int seq[TOKENS], bat[TOKENS], probe_seq, probe_bat;
@@ -34,7 +35,7 @@ int main(int argc, char **argv) {
                 (config.mode == GLM53F_PREFILL_FAST ? 32 : TOKENS) * 4096))
         MPI_Abort(MPI_COMM_WORLD, 2);
     glm53f_target_model_12n *m = glm53f_target_model_create_12n(
-        argv[1], argv[2], argv[3], TOKENS + 1);
+        argv[1], argv[2], argv[3], wide_check ? 33 : TOKENS + 1);
     if (!m || (use_int8 && glm53f_target_model_convert_int8_12n(m)) ||
         glm53f_target_model_configure_prefill_12n(m,&config)) MPI_Abort(MPI_COMM_WORLD,2);
     glm53f_target_snapshot_12n *initial = glm53f_target_snapshot_create_12n(m);
@@ -108,6 +109,35 @@ int main(int argc, char **argv) {
                 fclose(rf);
             }
         }
+    }
+    if (wide_check) {
+        int prompt[32], scalar_token = -1, batch_token = -1;
+        float scalar_logit = 0, batch_logit = 0;
+        local_ok = !glm53f_target_snapshot_restore_12n(m, initial);
+        for (int t = 0; t < 32; ++t) {
+            prompt[t] = input[t % TOKENS];
+            local_ok &= !glm53f_target_model_step_12n(m, prompt[t],
+                &scalar_token, &scalar_logit, NULL);
+        }
+        local_ok &= !glm53f_target_snapshot_save_12n(m, seq_final);
+        local_ok &= !glm53f_target_snapshot_restore_12n(m, initial);
+        local_ok &= !glm53f_target_model_step_batch_12n(m, prompt, 32,
+            NULL, NULL, NULL, NULL);
+        local_ok &= !glm53f_target_model_readout_12n(m, &batch_token, &batch_logit);
+        local_ok &= scalar_token == batch_token &&
+            fabsf(scalar_logit - batch_logit) <= 2e-5f * fmaxf(1.0f, fabsf(scalar_logit));
+        local_ok &= !glm53f_target_model_step_12n(m, 1618, &probe_bat, &probe_bat_logit, NULL);
+        local_ok &= !glm53f_target_snapshot_restore_12n(m, seq_final);
+        local_ok &= !glm53f_target_model_step_12n(m, 1618, &probe_seq, &probe_seq_logit, NULL);
+        local_ok &= probe_seq == probe_bat &&
+            fabsf(probe_seq_logit - probe_bat_logit) <= 2e-5f * fmaxf(1.0f, fabsf(probe_seq_logit));
+        int wide_ok;
+        MPI_Allreduce(&local_ok, &wide_ok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+        ok &= wide_ok;
+        if (!rank) printf("GLM53F_TARGET_PREFILL_CHECK tokens=32 token=%d/%d "
+            "logit=%.9g/%.9g probe=%d/%d probe_logit=%.9g/%.9g %s\n",
+            scalar_token, batch_token, scalar_logit, batch_logit, probe_seq, probe_bat,
+            probe_seq_logit, probe_bat_logit, wide_ok ? "PASS" : "FAIL");
     }
     for (int t = 0; t < TOKENS; t++) glm53f_target_snapshot_free_12n(after[t]);
     glm53f_target_snapshot_free_12n(seq_final);

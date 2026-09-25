@@ -105,6 +105,7 @@ struct glm53f_kda_context_12n {
     int q2_aux,q2_op_cols;
     float *small_g;
     void *act_x,*act_small,*act_out;
+    unsigned char *batch_act;
 };
 
 /* Look up one staged tensor, read it, and repack Q8_0 into the SVE layout.
@@ -388,6 +389,23 @@ static void mv_batch_wide_team(const glm53f_prefill_config *config,
     }
 }
 
+static void native_batch_team(glm53f_kda_context_12n *c,
+        const glm53f_native_matrix *m, int count, const float *x, int tokens) {
+    const int cols = m[0].columns;
+    const size_t stride = glm53f_native_act_bytes(H);
+    int need_q80 = 0, need_q8k = 0;
+    for (int i = 0; i < count; ++i) {
+        if (kda_is_q80(m[i].type)) need_q80 = 1; else need_q8k = 1;
+    }
+#pragma omp for schedule(static)
+    for (int t = 0; t < tokens; ++t)
+        if (glm53f_native_act_prepare(c->batch_act + (size_t)t * stride,
+                x + (size_t)t * cols, cols, need_q8k, need_q80))
+            MPI_Abort(MPI_COMM_WORLD, 2);
+    if (glm53f_native_matvec_batch_team(m, count, c->batch_act, stride, tokens))
+        MPI_Abort(MPI_COMM_WORLD, 2);
+}
+
 int glm53f_kda_sublayer_batch_capture_12n(glm53f_kda_context_12n *c,
         float *out, const float *x, int tokens, void *states, size_t stride) {
     size_t bytes = glm53f_kda_state_bytes_12n(c);
@@ -396,7 +414,13 @@ int glm53f_kda_sublayer_batch_capture_12n(glm53f_kda_context_12n *c,
     if (!c || !out || !x || tokens < 1 || tokens > (wide ? 32 : 5) ||
         (states && stride < bytes))
         return -1;
-    if (c->int8_enabled) {
+    /* Old V2 native stages lack auxiliary projections or use a replicated
+     * output. Keep their scalar native path, including verifier snapshots;
+     * never silently substitute the compact BF16 matrices in a batch. */
+    if (c->int8_enabled || (c->q2_native &&
+            (!c->q2_aux || c->q2_op_cols != c->qd ||
+             !getenv("GLM53F_KDA_BATCH_TEAM") ||
+             !atoi(getenv("GLM53F_KDA_BATCH_TEAM"))))) {
         for (int t = 0; t < tokens; ++t) {
             if (glm53f_kda_sublayer_12n(c, out + (size_t)t * H, x + (size_t)t * H)) return -1;
             if (states && glm53f_kda_save_state_12n(c,
@@ -416,7 +440,11 @@ int glm53f_kda_sublayer_batch_capture_12n(glm53f_kda_context_12n *c,
     }
     weights *w = &c->w;
     int qd = c->qd, hn = c->hn;
-    int column_recurrence = !states && tokens > 5 &&
+    if (c->q2_native && !c->batch_act)
+        c->batch_act = a256((size_t)32 * glm53f_native_act_bytes(H));
+    /* The column-tiled recurrence changes float operation order. Native
+     * batches retain decode's recurrence and exact per-position state. */
+    int column_recurrence = !c->q2_native && !states && tokens > 5 &&
                            (c->prefill.features & GLM53F_PREFILL_RECURRENCE);
     if (column_recurrence && !c->prefill_state) {
         c->prefill_state = a256((size_t)hn * D * D * sizeof(float));
@@ -426,14 +454,29 @@ int glm53f_kda_sublayer_batch_capture_12n(glm53f_kda_context_12n *c,
     double start = MPI_Wtime(), front_end = start;
 #pragma omp parallel shared(front_end)
     {
-        mv_batch_wide_team(&c->prefill, c->bq, w->q, x, tokens, qd, H);
-        mv_batch_wide_team(&c->prefill, c->bk, w->k, x, tokens, qd, H);
-        mv_batch_wide_team(&c->prefill, c->bv, w->v, x, tokens, qd, H);
-        mv_batch_wide_team(&c->prefill, c->bsmall_f, w->fa, x, tokens, D, H);
-        mv_batch_wide_team(&c->prefill, c->bgate_f, w->fb, c->bsmall_f, tokens, qd, D);
-        mv_batch_wide_team(&c->prefill, c->bbeta, w->b, x, tokens, hn, H);
-        mv_batch_wide_team(&c->prefill, c->bsmall_g, w->ga, x, tokens, D, H);
-        mv_batch_wide_team(&c->prefill, c->bgate_g, w->gb, c->bsmall_g, tokens, qd, D);
+        if (c->q2_native) {
+            glm53f_native_matrix mx[6] = {
+                {c->bq,c->q2_q,c->q2_q_type,qd,H},
+                {c->bk,c->q2_k,c->q2_k_type,qd,H},
+                {c->bv,c->q2_v,c->q2_v_type,qd,H},
+                {c->bsmall_f,c->q2_fa,c->q2_fa_type,D,H},
+                {c->bsmall_g,c->q2_ga,c->q2_ga_type,D,H},
+                {c->bbeta,c->q2_b,c->q2_b_type,hn,H}};
+            glm53f_native_matrix mf = {c->bgate_f,c->q2_fb,c->q2_fb_type,qd,D};
+            glm53f_native_matrix mg = {c->bgate_g,c->q2_gb,c->q2_gb_type,qd,D};
+            native_batch_team(c, mx, 6, x, tokens);
+            native_batch_team(c, &mf, 1, c->bsmall_f, tokens);
+            native_batch_team(c, &mg, 1, c->bsmall_g, tokens);
+        } else {
+            mv_batch_wide_team(&c->prefill, c->bq, w->q, x, tokens, qd, H);
+            mv_batch_wide_team(&c->prefill, c->bk, w->k, x, tokens, qd, H);
+            mv_batch_wide_team(&c->prefill, c->bv, w->v, x, tokens, qd, H);
+            mv_batch_wide_team(&c->prefill, c->bsmall_f, w->fa, x, tokens, D, H);
+            mv_batch_wide_team(&c->prefill, c->bgate_f, w->fb, c->bsmall_f, tokens, qd, D);
+            mv_batch_wide_team(&c->prefill, c->bbeta, w->b, x, tokens, hn, H);
+            mv_batch_wide_team(&c->prefill, c->bsmall_g, w->ga, x, tokens, D, H);
+            mv_batch_wide_team(&c->prefill, c->bgate_g, w->gb, c->bsmall_g, tokens, qd, D);
+        }
         int prefill_recurrence = !states && tokens > 5 &&
             getenv("GLM53F_KDA_PREFILL") && atoi(getenv("GLM53F_KDA_PREFILL"));
         if (prefill_recurrence) {
@@ -505,8 +548,13 @@ int glm53f_kda_sublayer_batch_capture_12n(glm53f_kda_context_12n *c,
                     float *k = c->bk + (size_t)t * qd + h * D;
                     float *v = c->bv + (size_t)t * qd + h * D;
                     float *beta = c->bbeta + (size_t)t * hn + h;
-                    glm53f_l2norm(q, D, 1e-6f);
-                    glm53f_l2norm(k, D, 1e-6f);
+                    if (c->q2_native) {
+                        kda_l2norm(q, D, 1e-6f);
+                        kda_l2norm(k, D, 1e-6f);
+                    } else {
+                        glm53f_l2norm(q, D, 1e-6f);
+                        glm53f_l2norm(k, D, 1e-6f);
+                    }
                     glm53f_kda_safe_log_decay(c->decay + h * D,
                         c->bgate_f + (size_t)t * qd + h * D, w->dt + h * D, w->al[h], -5.0f, D);
                     *beta = glm53f_sigmoid(*beta);
@@ -526,8 +574,13 @@ int glm53f_kda_sublayer_batch_capture_12n(glm53f_kda_context_12n *c,
             conv3_team(q, k, v, c->conv, w->qc, w->kc, w->vc, qd);
 #pragma omp for schedule(static)
             for (int h = 0; h < hn; h++) {
-                glm53f_l2norm(q + (size_t)h * D, D, 1e-6f);
-                glm53f_l2norm(k + (size_t)h * D, D, 1e-6f);
+                if (c->q2_native) {
+                    kda_l2norm(q + (size_t)h * D, D, 1e-6f);
+                    kda_l2norm(k + (size_t)h * D, D, 1e-6f);
+                } else {
+                    glm53f_l2norm(q + (size_t)h * D, D, 1e-6f);
+                    glm53f_l2norm(k + (size_t)h * D, D, 1e-6f);
+                }
                 glm53f_kda_safe_log_decay(c->decay + (size_t)h * D,
                     gate + (size_t)h * D, w->dt + (size_t)h * D, w->al[h], -5.0f, D);
                 beta[h] = glm53f_sigmoid(beta[h]);
@@ -555,7 +608,10 @@ int glm53f_kda_sublayer_batch_capture_12n(glm53f_kda_context_12n *c,
         }
 #pragma omp master
         front_end = MPI_Wtime();
-        mv_batch_wide_team(&c->prefill, c->batch_partial, w->op, c->bnormed, tokens, H, qd);
+        if (c->q2_native) {
+            glm53f_native_matrix mo = {c->batch_partial,c->q2_op,c->q2_op_type,H,qd};
+            native_batch_team(c, &mo, 1, c->bnormed, tokens);
+        } else mv_batch_wide_team(&c->prefill, c->batch_partial, w->op, c->bnormed, tokens, H, qd);
     }
     double projection_end = MPI_Wtime();
     c->phase[0] = front_end - start;
@@ -580,7 +636,7 @@ void glm53f_kda_last_detail_12n(const glm53f_kda_context_12n*c,double p[5]){memc
 size_t glm53f_kda_state_bytes_12n(const glm53f_kda_context_12n*c){return c?((size_t)c->hn*D*D+(size_t)3*c->qd*KERNEL)*sizeof(float):0;}
 int glm53f_kda_save_state_12n(const glm53f_kda_context_12n*c,void*dst,size_t bytes){size_t sb=c?(size_t)c->hn*D*D*sizeof(float):0,need=glm53f_kda_state_bytes_12n(c);if(!c||!dst||bytes<need)return-1;memcpy(dst,c->state,sb);memcpy((unsigned char*)dst+sb,c->conv,need-sb);return 0;}
 int glm53f_kda_restore_state_12n(glm53f_kda_context_12n*c,const void*src,size_t bytes){size_t sb=c?(size_t)c->hn*D*D*sizeof(float):0,need=glm53f_kda_state_bytes_12n(c);if(!c||!src||bytes<need)return-1;memcpy(c->state,src,sb);memcpy(c->conv,(const unsigned char*)src+sb,need-sb);return 0;}
-void glm53f_kda_free_12n(glm53f_kda_context_12n*c){if(!c)return;free(c->act_out);free(c->act_small);free(c->act_x);free(c->small_g);free(c->q2_gb);free(c->q2_ga);free(c->q2_b);free(c->q2_fb);free(c->q2_fa);free(c->q2_normed);free(c->q2_op);free(c->q2_v);free(c->q2_k);free(c->q2_q);free(c->prefill_state);free(c->prefill_decay);free(c->prefill_core);for(int m=0;m<4;m++){free(c->int8_weight[m]);free(c->int8_scale[m]);}free(c->bnormed);free(c->bbeta);free(c->bgate_g);free(c->bgate_f);free(c->bsmall_g);free(c->bsmall_f);free(c->bv);free(c->bk);free(c->bq);free(c->batch_partial);free(c->partial);free(c->state);free(c->conv);free(c->work);free(c->normed);free(c->core);free(c->beta);free(c->decay);free(c->gate);free(c->small);free(c->qkv);free(c->w.op);free(c->w.on);free(c->w.ga);free(c->w.fa);free(c->w.gb);free(c->w.b);free(c->w.fb);free(c->w.vc);free(c->w.kc);free(c->w.qc);free(c->w.v);free(c->w.k);free(c->w.q);free(c->w.dt);free(c->w.al);free(c);}
+void glm53f_kda_free_12n(glm53f_kda_context_12n*c){if(!c)return;free(c->batch_act);free(c->act_out);free(c->act_small);free(c->act_x);free(c->small_g);free(c->q2_gb);free(c->q2_ga);free(c->q2_b);free(c->q2_fb);free(c->q2_fa);free(c->q2_normed);free(c->q2_op);free(c->q2_v);free(c->q2_k);free(c->q2_q);free(c->prefill_state);free(c->prefill_decay);free(c->prefill_core);for(int m=0;m<4;m++){free(c->int8_weight[m]);free(c->int8_scale[m]);}free(c->bnormed);free(c->bbeta);free(c->bgate_g);free(c->bgate_f);free(c->bsmall_g);free(c->bsmall_f);free(c->bv);free(c->bk);free(c->bq);free(c->batch_partial);free(c->partial);free(c->state);free(c->conv);free(c->work);free(c->normed);free(c->core);free(c->beta);free(c->decay);free(c->gate);free(c->small);free(c->qkv);free(c->w.op);free(c->w.on);free(c->w.ga);free(c->w.fa);free(c->w.gb);free(c->w.b);free(c->w.fb);free(c->w.vc);free(c->w.kc);free(c->w.qc);free(c->w.v);free(c->w.k);free(c->w.q);free(c->w.dt);free(c->w.al);free(c);}
 
 #ifndef GLM53F_KDA_NO_MAIN
 int main(int argc,char**argv){

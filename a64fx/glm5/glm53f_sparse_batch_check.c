@@ -6,31 +6,35 @@
 #include "glm53f_sparse_12n.h"
 #include "glm53f_collective_12n.h"
 
-enum { HIDDEN = 4096, TOKENS = 4 };
+enum { HIDDEN = 4096 };
 
 int main(int argc, char **argv) {
     int rank, ranks, ok, local_ok = 1;
     int layer = argc > 2 ? atoi(argv[2]) : 3;
     int warm = argc > 3 ? atoi(argv[3]) : 8;
-    float *x = malloc((size_t)(warm + TOKENS) * HIDDEN * sizeof(*x));
-    float *a = malloc((size_t)TOKENS * HIDDEN * sizeof(*a));
-    float *b = malloc((size_t)TOKENS * HIDDEN * sizeof(*b));
+    int tokens = argc > 4 ? atoi(argv[4]) : 4;
+    int prefill = tokens > 5 || getenv("GLM53F_CHECK_SPARSE_PREFILL");
+    if (tokens < 1 || tokens > GLM53F_PREFILL_ATTN_TOKENS || warm < 0 || warm > 1048576)
+        return 2;
+    float *x = malloc((size_t)(warm + tokens) * HIDDEN * sizeof(*x));
+    float *a = malloc((size_t)tokens * HIDDEN * sizeof(*a));
+    float *b = malloc((size_t)tokens * HIDDEN * sizeof(*b));
     MPI_Init(&argc, &argv);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &ranks);
     if (argc < 2 || ranks != 12 || warm < 0 || !x || !a || !b)
         MPI_Abort(MPI_COMM_WORLD, 2);
     if (getenv("GLM53F_UTOFU") && glm53f_collective_init_12n(
-            getenv("TOFU_TOPO_PATH"), 5 * HIDDEN)) MPI_Abort(MPI_COMM_WORLD, 2);
+            getenv("TOFU_TOPO_PATH"), GLM53F_PREFILL_ATTN_TOKENS * HIDDEN)) MPI_Abort(MPI_COMM_WORLD, 2);
     int compare_cp = getenv("GLM53F_SPARSE_COMPARE_CP") != NULL;
     if (compare_cp) setenv("GLM53F_SPARSE_CP", "0", 1);
     glm53f_sparse_context_12n *ca = glm53f_sparse_create_12n(
-        argv[1], layer, warm + TOKENS);
+        argv[1], layer, warm + tokens);
     if (compare_cp) setenv("GLM53F_SPARSE_CP", "1", 1);
     glm53f_sparse_context_12n *cb = glm53f_sparse_create_12n(
-        argv[1], layer, warm + TOKENS);
+        argv[1], layer, warm + tokens);
     if (!ca || !cb) MPI_Abort(MPI_COMM_WORLD, 2);
-    for (int t = 0; t < warm + TOKENS; t++)
+    for (int t = 0; t < warm + tokens; t++)
         for (int i = 0; i < HIDDEN; i++)
             x[(size_t)t * HIDDEN + i] =
                 (float)(((i * 17 + t * 31 + 5) % 251) - 125) / 125.0f;
@@ -42,18 +46,27 @@ int main(int argc, char **argv) {
     }
     MPI_Barrier(MPI_COMM_WORLD);
     double t0 = MPI_Wtime();
-    for (int t = 0; t < TOKENS; t++)
+    for (int t = 0; t < tokens; t++)
         local_ok &= !glm53f_sparse_sublayer_12n(
             ca, a + (size_t)t * HIDDEN,
             x + (size_t)(warm + t) * HIDDEN);
     double seq = MPI_Wtime() - t0;
     MPI_Barrier(MPI_COMM_WORLD);
     t0 = MPI_Wtime();
-    local_ok &= !glm53f_sparse_sublayer_batch_12n(
-        cb, b, x + (size_t)warm * HIDDEN, TOKENS);
+    if (prefill) {
+        glm53f_prefill_config config = {GLM53F_PREFILL_FAST, 16, GLM53F_PREFILL_FAST_DEFAULT, NULL, 0};
+        /* No BF16 GEMM arena is needed for native projection tests. */
+        config.features &= ~GLM53F_PREFILL_GEMM;
+        glm53f_sparse_configure_prefill_12n(cb, &config);
+        glm53f_sparse_prefill_workspace_12n *w = glm53f_sparse_prefill_workspace_create_12n();
+        local_ok &= w && !glm53f_sparse_prefill_12n(cb, w, b,
+            x + (size_t)warm * HIDDEN, tokens);
+        glm53f_sparse_prefill_workspace_free_12n(w);
+    } else local_ok &= !glm53f_sparse_sublayer_batch_12n(
+        cb, b, x + (size_t)warm * HIDDEN, tokens);
     double bat = MPI_Wtime() - t0;
     double d2 = 0.0, r2 = 0.0;
-    for (int i = 0; i < TOKENS * HIDDEN; i++) {
+    for (int i = 0; i < tokens * HIDDEN; i++) {
         double d = (double)a[i] - b[i];
         d2 += d * d;
         r2 += (double)a[i] * a[i];
@@ -63,7 +76,7 @@ int main(int argc, char **argv) {
     double rollback_d2=0.0,rollback_r2=0.0;
     if(warm>=1){local_ok&=!glm53f_sparse_restore_length_12n(ca,warm+1);
         local_ok&=!glm53f_sparse_restore_length_12n(cb,warm+1);
-        for(int t=1;t<TOKENS;t++){local_ok&=!glm53f_sparse_sublayer_12n(ca,a,x+(size_t)(warm+t)*HIDDEN);local_ok&=!glm53f_sparse_sublayer_12n(cb,b,x+(size_t)(warm+t)*HIDDEN);for(int i=0;i<HIDDEN;i++){double d=(double)a[i]-b[i];rollback_d2+=d*d;rollback_r2+=(double)a[i]*a[i];}}}
+        for(int t=1;t<tokens;t++){local_ok&=!glm53f_sparse_sublayer_12n(ca,a,x+(size_t)(warm+t)*HIDDEN);local_ok&=!glm53f_sparse_sublayer_12n(cb,b,x+(size_t)(warm+t)*HIDDEN);for(int i=0;i<HIDDEN;i++){double d=(double)a[i]-b[i];rollback_d2+=d*d;rollback_r2+=(double)a[i]*a[i];}}}
     double rollback_rel=sqrt(rollback_d2/(rollback_r2+1e-30));
     local_ok &= rollback_rel < 3e-6;
     MPI_Allreduce(&local_ok, &ok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
@@ -74,7 +87,7 @@ int main(int argc, char **argv) {
         printf("GLM53F_SPARSE_BATCH mode=%s layer=%d warm=%d tokens=%d rel_l2=%.9g rollback_rel_l2=%.9g "
                "seq_ms=%.3f batch_ms=%.3f speedup=%.3f %s\n",
                compare_cp ? "replicated-vs-cp" : "replicated",
-               layer, warm, TOKENS, rel,rollback_rel,sm * 1e3, bm * 1e3, sm / bm,
+               layer, warm, tokens, rel,rollback_rel,sm * 1e3, bm * 1e3, sm / bm,
                ok ? "PASS" : "FAIL");
     if (!rank) {
         const char *report = getenv("GLM53F_SPARSE_REPORT");
@@ -83,7 +96,7 @@ int main(int argc, char **argv) {
             if (rf) {
                 fprintf(rf, "GLM53F_SPARSE_BATCH mode=%s layer=%d warm=%d tokens=%d rel_l2=%.9g rollback_rel_l2=%.9g seq_ms=%.3f batch_ms=%.3f speedup=%.3f %s\n",
                         compare_cp ? "replicated-vs-cp" : "replicated", layer,
-                        warm, TOKENS, rel, rollback_rel, sm * 1e3, bm * 1e3,
+                        warm, tokens, rel, rollback_rel, sm * 1e3, bm * 1e3,
                         sm / bm, ok ? "PASS" : "FAIL");
                 fclose(rf);
             }

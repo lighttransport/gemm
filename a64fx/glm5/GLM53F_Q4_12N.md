@@ -89,7 +89,9 @@ Kernel and runtime changes:
 - The native shared expert runs gate/up, SwiGLU with the MoE clamp, and down
   from the Q8_0 slice after the routed experts. It is added before the same
   all-reduce.
-- Batched prefill/MTP paths keep the compact (GGUF-patched) weights.
+- At commit `90420b32`, batched KDA/shared-expert paths still kept compact
+  (GGUF-patched) weights. The native batch consistency follow-up below fixes
+  that mismatch with native decode.
 
 Unit test (conservative and fast-math builds):
 
@@ -172,12 +174,14 @@ Prompt: `tmp/glm53f-quality-8k/prompt.ids`. Decode windows are 128 tokens.
 - **Coherence.** All four outputs are coherent and reason correctly about the
   sorting task.
 - **Native: fast vs legacy prefill.** The first 66 generated tokens are
-  identical. Native layers use the same kernels in both modes.
+  identical in this pre-follow-up measurement. KDA and shared-expert
+  batches still substituted compact weights; the follow-up below removes
+  that mismatch.
 - **Hybrid: fast vs legacy prefill.** The outputs differ from the first token
   but remain valid ("Let me carefully design…" instead of "The user wants…").
   Batched FP8/BF16 prefill is a different arithmetic from its per-token path.
 - **Native fast-prefill speed.** Its prompt rate is lower because the native
-  sparse and dense layers still run per token inside a batch.
+  sparse and dense layers still ran per token inside a batch at this point.
 
 **Fast-prefill fix.** Before this job, fast prefill with GGUF routed experts
 crashed with SIGSEGV at the first chunk, including with the pre-edit binary.
@@ -188,23 +192,154 @@ decode kernel, so routed-expert arithmetic is identical in prefill and
 decode, and each rank's ~2 MB expert part stays L2-resident across its
 tokens.
 
-### Next tasks (priority order, after job 51909852)
+### Native batch consistency follow-up (job 51909852)
 
-1. **Batched native prefill.** Native fast prefill is 34 tok/s, against 55
-   for the hybrid. In `glm53f_sparse_sublayer_batch_12n` and
-   `glm53f_dense_ffn_sublayer_batch_12n`, native sparse and dense layers fall
-   back to one token at a time inside a batch.
-   - Add a tokens-x-rows kernel for repacked Q8_0 (`GLM53F_NATIVE_Q8_0R`):
-     a 4-row x 4-token tile that reuses each weight vector across tokens.
-     Prepare one Q8_0 activation per token, keeping `native_act` per token.
-   - Use it for the sparse q_a/q_b/kv_a/output projections, dense
-     gate/up/down, the KDA batch projections (Q/K/V, f_a/f_b, g_a/g_b, beta,
-     output) and the native shared expert in `moe_prefill_grouped`.
-   - Keep per-token accumulation order equal to the decode kernel, so fast
-     prefill and legacy prefill stay token-identical. The current check
-     already gives 66/256 identical tokens.
+The native decode path and its batched paths did not use the same weights.
+The four-position layer-44 callback check on the pre-change binary reports
+`rel_l2=0.00866510901`, with mismatching recurrent snapshots: KDA batching
+still used compact BF16 projections and the older L2-normalization formula.
+Both grouped prefill and the short MoE verifier also used the compact FP8
+shared expert despite a native shared-expert stage being loaded.
+
+The native batch bridge now uses a four-row by four-token Q8_0R SDOT tile.
+It prepares each token's activation independently and keeps the decode
+kernel's per-lane FMA order. Ragged tiles and unrepacked/K-quant matrices
+retain their existing row kernels. Dense FFN, KDA, sparse input/output
+projections and the shared expert use this bridge.
+
+Native KDA batches use the same normalization and recurrent update as
+decode, including every verifier snapshot. Older native stages without the
+auxiliary projections or column-sliced output use scalar native calls.
+Native sparse prefill batches projections but retains the causal selector,
+per-query F16 cache view, and existing attention calculation. Its compact
+indexer keeps F32 activation arithmetic even with the BF16 GEMM recipe
+enabled for other paths.
+
+Validation artifacts are under `tmp/glm53f-native-batch-51909852/`:
+
+- `test_glm53f_kquant` passes in conservative and fast-math builds, including
+  the existing 30 repacked bit-exact cases.
+- `test_glm53f_native_batch` passes 63 shape/batch combinations in both builds:
+  32--4096 columns, 37 rows, batches of 1/2/3/4/5/7/16/31/32, padded prepared
+  activations, mixed Q8_0/Q4_K, and zero inputs. Results are bit-exact against
+  independent calls to the decode entry point.
+- Layer-44 KDA batches of 2/4/5/16/32 positions have zero output difference
+  and bit-exact recurrent snapshots on all ranks. Snapshot-free prefill also
+  has exact final state. The batch-disabled layer-0 fallback passes too.
+- Native dense layers 0--2 pass at four positions (relative L2 below 7e-8
+  with the MPI reduction used by that test).
+- Native sparse layer 3 passes four- and 32-position checks, including a
+  32-position batch starting at 2046 and crossing the sparse-selection
+  boundary: output and rollback differences are zero.
+- The complete five-position native verifier passes its token, logit and
+  post-rollback next-token checks with the fast prefill recipe.
+- The 32-position full-model check also passes: final token/logit
+  `42 / 19.0221443` and the following decode `1 / 12.5834875` are identical
+  to scalar replay from the same initial state.
+- All 45 token-1234 layer traces are byte-for-byte equal to the pre-change
+  native traces. The final token/logit remain `220 / 15.31567`; the stored
+  llama.cpp comparison is unchanged (`parity.txt` in the follow-up folder).
+
+The component binaries use the existing staged images, not a second resident
+copy of the full model. Build with `build_glm53f_integrated_12n.sh`; enable
+`GLM53F_KDA_BATCH_TEAM=1 GLM53F_KDA_WIDE_TILE=1 GLM53F_KDA_PREFILL=1` for
+the KDA callback check. Its optional final positional argument accepts up to
+32 tokens. The sparse batch check accepts `MODEL LAYER WARM TOKENS`; more
+than five tokens exercises the prefill entry point. Both retain their old
+default test sizes. `GLM53F_CHECK_WIDE_PREFILL=1` adds a 32-position prompt
+and subsequent decode check to `glm53f_target_batch_check_12n`.
+
+Standalone kernel commands (run serially, not during MPI timing):
+
+```bash
+for math in conservative fast; do
+    flags=()
+    if [ "$math" = fast ]; then flags=(-ffast-math -fno-math-errno); fi
+    for test in kquant native_batch; do
+        TMPDIR=/local mpifcc -Nclang -O3 -march=armv8.2-a+sve \
+            -ffp-contract=fast -fopenmp -Wall -Wextra "${flags[@]}" \
+            a64fx/glm5/test_glm53f_${test}.c -lm \
+            -o /local/test_glm53f_${test}_${math}
+        OMP_NUM_THREADS=47 /local/test_glm53f_${test}_${math}
+    done
+done
+```
+
+Whole-binary A/B on the same allocation, using the 8,049-token coding prompt,
+256 new tokens, 47 threads, `demand:demand:prepage`, and
+`--prefill-chunk 512 --prefill-mode fast --prefill-features 27
+--prefill-slab 16 --prefill-collective tree-packed --decode-window 128`:
+
+| Binary | Prompt tok/s | Decode tok/s | Minimum MemAvailable |
+| --- | ---: | ---: | ---: |
+| before native batching | 33.733 | 21.407 | 10.253 GiB |
+| native batching | 41.179 | 20.272 | 10.228 GiB |
+| candidate, scalar legacy prefill | 21.035 | 20.588 | 10.371 GiB |
+
+Prompt ingestion improves **22.1%**. The candidate's 256 generated token IDs
+all match the earlier native legacy-prefill output (`long8k-native.ids`);
+they also exactly match a fresh scalar replay with the candidate binary.
+The old fast-prefill output matches only the first 66. The two fast-prefill
+arms therefore decode different sequences, so their decode rates do not
+isolate a kernel regression or speedup. Both outputs are coherent.
+The 150 tok/s prefill target remains unmet.
+
+Exact commands and logs: `benchmark.sh` and `benchmark.log` in the follow-up
+directory; MPI rank output uses `batch-{baseline,candidate}-fast8k.*` under
+`tmp/glm53f-q4-51909852/`. Load time is excluded from prompt/decode rates.
+The baseline and candidate executables are retained separately on shared
+storage so every rank executes the same binary. The tested candidate is
+`tmp/glm53f-native-batch-51909852/candidate/glm53f_target_decode_12n`;
+the existing repo-root module executable was not replaced. The standard
+launcher rebuilds the updated source by default.
+
+Identical-sequence decode controls, run serially on the same allocation:
+
+| Control | Baseline tok/s | Candidate tok/s |
+| --- | ---: | ---: |
+| 128 tokens, first pair | 24.665 | 23.268 |
+| 128 tokens, reverse-order pair | 24.428 | 21.996 |
+| 512 tokens, `GLM53F_PROFILE=1` | 22.858 | 22.491 |
+| 1024 tokens, uninstrumented, candidate first | 23.376 | 22.998 |
+
+Every printed token/logit pair matches in the 512- and 1024-token runs.
+The longer controls both show a **1.6% decode slowdown**, and the short runs
+show a larger gap. Do not claim unchanged decode performance. In the
+512-token profile, baseline/candidate KDA cost is 10.601/11.044 ms per
+position, sparse attention is 8.217/8.369, and MoE is 16.286/16.347.
+The sparse MLA inner phase itself is 1.291/1.291 ms. These timings do not
+establish a cause; further same-allocation controls are needed before any
+decode tuning claim. `decode_controls.sh` records the commands; rank logs
+are `batch-{baseline,candidate}-{profile512,decode1024}.*` in the original
+job folder. Minimum MemAvailable is above 10.58 GiB in these controls.
+
+An additional bounded coding-quality probe used
+`prompts/glm53f_cpp_codegen_task.md` (671 input tokens), the same fast recipe,
+and a 4096-token generation limit. It reached EOS after 1712 generated tokens
+with 51.292 tok/s prompt-only ingestion. This is **not a coding-quality pass**:
+the response included Markdown fences despite the requested source-only
+format. After removing only those fences, the unmodified generated source
+also failed `g++ -std=c++17 -O2 -Wall -Wextra -Werror -pedantic` because `Job`
+is referenced before declaration and outside its nested class scope. The
+CLI correctness harness was therefore not run. Preserve `queue.ids`,
+`queue.cpp`, `queue-build.log`, and `check_queue.py` in the follow-up folder
+as the failed probe. Native batch/scalar parity is established by the tests
+above; a broader semantic or coding-quality improvement is not yet established.
+
+### Next tasks (priority order)
+
+1. **Further native prefill throughput.** The Q8_0R 4-row x 4-token bridge
+   and native dense/KDA/sparse/shared-expert projection batching are now
+   implemented and component-validated (see the follow-up above).
+   - Profile the remaining per-token sparse attention and routed K-quant
+     expert calls before choosing the next batching change.
+   - Preserve decode's activation quantization, accumulation order, causal
+     selector and recurrent snapshots. Run the 32-position full-model check
+     and the sparse check across position 2048 in addition to kernel tests.
    - Target: at least 150 tok/s prompt ingestion on the 8K coding prompt,
      with decode unchanged.
+   - First isolate the measured 1.6% long-control decode slowdown and the
+     larger short-run gap; scalar numerical parity alone is insufficient.
 2. **Weight arena for native tensors.** The native loaders make about 450
    separate `posix_memalign` allocations of 1--3 MB each, including the
    repacked copies. Earlier work on Laguna S-2.1 fp8 measured a 2x decode
@@ -236,8 +371,8 @@ tokens.
 5. **Long-context and MTP.**
    - Measure 16K-context windows with three repeats.
    - Check the Q4 MTP speculative path (`run_glm53f_q4_mtp_12n.sh`) with
-     `GLM53F_NATIVE` stages exported; its verifier batches run the compact
-     paths.
+     `GLM53F_NATIVE` stages exported. The native five-position verifier
+     passes, but the full draft/verify/rollback loop needs an end-to-end run.
    - Run the 8K coding prompt to EOS (or at least 1K tokens) and compile the
      extracted C++.
 
@@ -258,8 +393,10 @@ Paste this into a new session inside a fresh 12-node interactive allocation:
 >   `~/models/glm53f-gguf-all/UD-Q4_K_XL/`: routed experts are
 >   Q4_K/Q5_K/Q6_K, and everything else is Q8_0, repacked at load to
 >   `GLM53F_NATIVE_Q8_0R`.
-> - Measured in job 51909852: 24.9 tok/s decode at short context (hybrid 22),
->   21.4 tok/s at 8K context, native fast prefill 34 tok/s.
+> - Native batch follow-up in job 51909852: 8K prompt ingestion improves
+>   from 33.73 to 41.18 tok/s, with all 256 generated IDs matching scalar
+>   replay. See the follow-up's separate identical-sequence decode controls;
+>   the earlier 24.9 tok/s short-context measurement predates this change.
 > - Parity against a fixed llama.cpp streamed reference is 0.5--1% relative
 >   L2 through layer 20. At layer 21 a router near-tie swaps one expert.
 >
@@ -297,9 +434,10 @@ Paste this into a new session inside a fresh 12-node interactive allocation:
 >     (`tmp/glm53f-quality-8k/prompt.ids`).
 >   - Same-allocation tok/s against the hybrid control.
 >
-> **Start with next task 1, batched native prefill.** Target at least 150
-> tok/s prompt ingestion with decode unchanged. Fast prefill and legacy
-> prefill should stay token-identical for the native arm.
+> **Continue next task 1 from the native batch follow-up.** Native projection
+> batching is implemented; profile remaining sparse attention and routed
+> expert work. Target at least 150 tok/s prompt ingestion with decode
+> unchanged. Check scalar/batched state consistency before timing.
 >
 > Report measurements with job IDs, update this document, and commit only
 > the glm53f files that are touched.

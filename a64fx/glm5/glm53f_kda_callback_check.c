@@ -6,12 +6,12 @@
 #include "glm53f_collective_12n.h"
 #include "glm53f_kda_12n.h"
 
-enum { HIDDEN = 4096, MAX_TOKENS = 5 };
+enum { HIDDEN = 4096, MAX_TOKENS = 32 };
 
 int main(int argc, char **argv) {
     int rank, size, local_ok, ok;
     int layer = argc > 2 ? atoi(argv[2]) : 44;
-    int tokens = argc > 3 ? atoi(argv[3]) : MAX_TOKENS;
+    int tokens = argc > 3 ? atoi(argv[3]) : 5;
     float x[MAX_TOKENS][HIDDEN], a[MAX_TOKENS][HIDDEN], b[MAX_TOKENS][HIDDEN];
     double seq_begin, seq_elapsed, batch_begin, batch_elapsed;
     MPI_Init(&argc, &argv);
@@ -53,6 +53,9 @@ int main(int argc, char **argv) {
     local_ok &= !glm53f_kda_sublayer_batch_capture_12n(
         cb, b[0], x[0], tokens, batch_state, state_bytes);
     batch_elapsed = MPI_Wtime() - batch_begin;
+    double phase[3], detail[5];
+    glm53f_kda_last_phase_12n(cb, phase);
+    glm53f_kda_last_detail_12n(cb, detail);
     double diff2 = 0.0, ref2 = 0.0;
     for (int t = 0; t < tokens; ++t)
         for (int i = 0; i < HIDDEN; ++i) {
@@ -64,15 +67,30 @@ int main(int argc, char **argv) {
     local_ok &= rel_l2 < 2e-6;
     int state_ok = !memcmp(seq_state, batch_state, (size_t)tokens * state_bytes);
     local_ok &= state_ok;
+    /* Prefill omits intermediate snapshots and has a separate chronological
+     * recurrence loop. Check its final state as well as the verifier path. */
+    glm53f_kda_reset_12n(cb);
+    int prefill_ok = !glm53f_kda_sublayer_batch_12n(cb, b[0], x[0], tokens) &&
+        !glm53f_kda_save_state_12n(cb, batch_state, state_bytes) &&
+        !memcmp(seq_state + (size_t)(tokens - 1) * state_bytes, batch_state, state_bytes);
+    double prefill_diff2 = 0, prefill_ref2 = 0;
+    for (int t = 0; t < tokens; ++t)
+        for (int i = 0; i < HIDDEN; ++i) {
+            double d = (double)a[t][i] - b[t][i];
+            prefill_diff2 += d * d;
+            prefill_ref2 += (double)a[t][i] * a[t][i];
+        }
+    double prefill_rel = sqrt(prefill_diff2 / (prefill_ref2 + 1e-30));
+    prefill_ok &= prefill_rel < 2e-6;
+    local_ok &= prefill_ok;
     for (int t = 0; t < tokens; ++t)
         for (int i = 0; i < HIDDEN; ++i)
             local_ok &= isfinite(a[t][i]);
-    int all_state_ok;
+    int all_state_ok, all_prefill_ok;
     MPI_Allreduce(&local_ok, &ok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
     MPI_Allreduce(&state_ok, &all_state_ok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
-    double seq_max, batch_max, phase[3], max_phase[3], detail[5], max_detail[5];
-    glm53f_kda_last_phase_12n(cb, phase);
-    glm53f_kda_last_detail_12n(cb, detail);
+    MPI_Allreduce(&prefill_ok, &all_prefill_ok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+    double seq_max, batch_max, max_phase[3], max_detail[5];
     MPI_Reduce(phase, max_phase, 3, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     MPI_Reduce(detail, max_detail, 5, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     MPI_Reduce(&seq_elapsed, &seq_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
@@ -90,6 +108,9 @@ int main(int argc, char **argv) {
                rel_l2, seq_max * 1e3, batch_max * 1e3, seq_max / batch_max,
                max_phase[0] * 1e3, max_phase[1] * 1e3, max_phase[2] * 1e3,
                ok ? "PASS" : "FAIL");
+        printf("GLM53F_KDA_PREFILL_CHECK tokens=%d rel_l2=%.9g state=%s %s\n",
+               tokens, prefill_rel, all_prefill_ok ? "BIT_EXACT" : "FAIL",
+               all_prefill_ok ? "PASS" : "FAIL");
         const char *report = getenv("GLM53F_KDA_REPORT");
         if (report && *report) {
             FILE *rf = fopen(report, "w");

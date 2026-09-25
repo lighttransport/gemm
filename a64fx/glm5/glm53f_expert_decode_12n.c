@@ -340,6 +340,31 @@ static int nsh_accumulate(glm53f_moe_stage_context_12n *c, int t,
     return bad ? -1 : 0;
 }
 
+/* Up to four positions, using the same native weights and SwiGLU clamp as
+ * decode. Existing batch scratch is sized for 512 intermediate channels. */
+static int nsh_batch(glm53f_moe_stage_context_12n *c, int layer,
+                     const float *x, int tokens) {
+    const int in = c->nsh_in;
+    float *gate = c->batch_up, *up = gate + (size_t)tokens * in;
+    glm53f_native_matrix gu[2] = {
+        {gate,c->nsh_g[layer],c->nsh_gt[layer],in,4096},
+        {up,c->nsh_u[layer],c->nsh_ut[layer],in,4096}};
+    glm53f_native_matrix dn = {
+        c->batch_shared,c->nsh_d[layer],c->nsh_dt[layer],4096,in};
+    if (tokens < 1 || tokens > 4 || in > 512 ||
+        glm53f_native_matvec_batch(gu, 2, x, tokens)) return -1;
+#pragma omp parallel for schedule(static)
+    for (int q = 0; q < tokens * in; ++q) {
+        float g = gate[q], u = up[q];
+        if (g > 10) g = 10;
+        if (g < -100) g = -100;
+        if (u > 10) u = 10;
+        if (u < -10) u = -10;
+        c->batch_activation[q] = (g / (1 + expf(-g))) * u;
+    }
+    return glm53f_native_matvec_batch(&dn, 1, c->batch_activation, tokens);
+}
+
 void glm53f_moe_configure_prefill_12n(glm53f_moe_stage_context_12n *c,
                                      const glm53f_prefill_config *config) {
     if (c && config) c->prefill = *config;
@@ -862,7 +887,9 @@ static int moe_prefill_grouped(glm53f_moe_stage_context_12n *c, float *out,
     for (int base = 0; base < tokens; base += PANEL) {
         int n = tokens - base;
         if (n > PANEL) n = PANEL;
-        glm53f_expert_tokens_bits(&shared, n, x + (size_t)base * H,
+        if (c->nsh_native) {
+            if (nsh_batch(c, table_layer, x + (size_t)base * H, n)) return -1;
+        } else glm53f_expert_tokens_bits(&shared, n, x + (size_t)base * H,
             c->batch_up, c->batch_activation, c->batch_shared);
 #pragma omp parallel for schedule(static)
         for (int q = 0; q < n * H; ++q)
@@ -993,6 +1020,18 @@ int glm53f_moe_stage_sublayer_batch_12n(glm53f_moe_stage_context_12n*c,float*out
         glm53f_router_topk(c->router_logits,c->router_bias+(size_t)li*NEXPERTS,NEXPERTS,8,2.5f,selected,route_weight);
         for(int k=0;k<8;k++){expert_offset*p=&c->table[table_layer*NEXPERTS+selected[k]];if(p->gate_up==UINT64_MAX)continue;parts[t*MAXP+npart]=(glm53f_expert_part){c->blob+p->gate_up,p->gate_up_scale==UINT64_MAX?NULL:(const float*)(c->blob+p->gate_up_scale),c->blob+p->down,p->down_scale==UINT64_MAX?NULL:(const float*)(c->blob+p->down_scale),p->inter,p->gate_type,p->down_type};weights[t*MAXP+npart++]=route_weight[k];}
         counts[t]=npart;
+    }
+    if (c->nsh_native) {
+        for (int t = 0; t < tokens; ++t) {
+            if (!counts[t]) memset(c->batch_local + (size_t)t * H, 0, H * sizeof(float));
+            else glm53f_moe_local_12n(c->batch_local + (size_t)t * H,
+                parts + t * MAXP, weights + t * MAXP, counts[t],
+                x + (size_t)t * H, c->scratch);
+        }
+        if (nsh_batch(c, table_layer, x, tokens)) return -1;
+#pragma omp parallel for schedule(static)
+        for (int q = 0; q < tokens * H; ++q) c->batch_local[q] += c->batch_shared[q];
+        return glm53f_sum_allreduce_12n(c->batch_local, out, tokens * H);
     }
     int has_iq=0;
     for(int t=0;t<tokens&&!has_iq;t++)

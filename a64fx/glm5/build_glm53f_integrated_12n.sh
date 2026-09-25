@@ -107,6 +107,8 @@ TMPDIR="$build_dir" "$cc" "${cflags[@]}" \
     "${ldflags[@]}" -o glm53f_sparse_batch_check
 TMPDIR="$build_dir" "$cc" "${cflags[@]}" test_glm53f_iq_bridge.c \
     "$build_dir/iq_bridge.o" "${ldflags[@]}" -o test_glm53f_iq_bridge
+TMPDIR="$build_dir" "$cc" "${cflags[@]}" test_glm53f_native_batch.c \
+    "${ldflags[@]}" -o test_glm53f_native_batch
 TMPDIR="$build_dir" "$cc" "${cflags[@]}" "${external[@]}" \
     glm53f_sparse_native_stage_probe_12n.c "$build_dir/sparse.o" \
     "$build_dir/iq_bridge.o" "$build_dir/collective.o" \

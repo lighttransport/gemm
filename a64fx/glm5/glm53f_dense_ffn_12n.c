@@ -151,7 +151,18 @@ int glm53f_dense_ffn_sublayer_12n(void*context,float*out,const float*x){glm53f_d
     for(int j=0;j<c->in;j++){float a=c->gv[j]>10?10:c->gv[j],b=c->uv[j]>10?10:c->uv[j]<-10?-10:c->uv[j];c->act[j]=a/(1+expf(-a))*b;}
 #pragma omp parallel for schedule(static)
     for(int r=0;r<H;r++)c->part[r]=dot(c->d+(size_t)r*c->in,c->ds+(size_t)(r/B)*c->lb,c->act,c->in);return glm53f_sum_allreduce_12n(c->part,out,H);}
-int glm53f_dense_ffn_sublayer_batch_12n(glm53f_dense_ffn_context_12n*c,float*out,const float*x,int tokens){if(!c||!out||!x||tokens<1||tokens>4)return-1;if(c->q2){for(int token=0;token<tokens;token++)if(glm53f_dense_ffn_sublayer_12n(c,out+(size_t)token*H,x+(size_t)token*H))return-1;return 0;}glm53f_mv_fp8_block128_bits_batch(c->bgv,c->g,c->gs,x,tokens,c->in,H);glm53f_mv_fp8_block128_bits_batch(c->buv,c->u,c->us,x,tokens,c->in,H);
+int glm53f_dense_ffn_sublayer_batch_12n(glm53f_dense_ffn_context_12n*c,float*out,const float*x,int tokens){if(!c||!out||!x||tokens<1||tokens>4)return-1;
+    if(c->q2){
+        glm53f_native_matrix gu[2] = {
+            {c->bgv,c->g,c->gtype,c->in,H}, {c->buv,c->u,c->utype,c->in,H}};
+        glm53f_native_matrix down = {c->bpart,c->d,c->dtype,H,c->in};
+        if(glm53f_native_matvec_batch(gu,2,x,tokens))return-1;
+#pragma omp parallel for schedule(static)
+        for(int q=0;q<tokens*c->in;q++){float a=c->bgv[q]>10?10:c->bgv[q],b=c->buv[q]>10?10:c->buv[q]<-10?-10:c->buv[q];c->bact[q]=a/(1+expf(-a))*b;}
+        if(glm53f_native_matvec_batch(&down,1,c->bact,tokens))return-1;
+        return glm53f_sum_allreduce_12n(c->bpart,out,tokens*H);
+    }
+    glm53f_mv_fp8_block128_bits_batch(c->bgv,c->g,c->gs,x,tokens,c->in,H);glm53f_mv_fp8_block128_bits_batch(c->buv,c->u,c->us,x,tokens,c->in,H);
 #pragma omp parallel for schedule(static)
     for(int q=0;q<tokens*c->in;q++){float a=c->bgv[q]>10?10:c->bgv[q],b=c->buv[q]>10?10:c->buv[q]<-10?-10:c->buv[q];c->bact[q]=a/(1+expf(-a))*b;}glm53f_mv_fp8_block128_bits_batch(c->bpart,c->d,c->ds,c->bact,tokens,H,c->in);return glm53f_sum_allreduce_12n(c->bpart,out,tokens*H);}
 #ifndef GLM53F_DENSE_NO_MAIN

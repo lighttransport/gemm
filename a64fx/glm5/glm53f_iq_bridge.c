@@ -353,6 +353,45 @@ static inline float native_row(int type, const uint8_t *row,
     return iq_row(type, row, a->q8k, a->columns / 256);
 }
 
+/* Four rows x four tokens. Reuse every weight load across four independent
+ * accumulators without changing the decode kernel's per-lane FMA order. */
+static inline void q8_0r_tile4(float *out, int stride, const uint8_t *w,
+                              size_t rb, const native_act *a[4]) {
+    const int columns = a[0]->columns;
+    const svbool_t p8 = svptrue_b8(), pg = svptrue_b32();
+    const svbool_t lo8 = svptrue_pat_b32(SV_VL8);
+#define Q8R_ACC(R) svfloat32_t a##R##0 = svdup_f32(0), a##R##1 = a##R##0, \
+                              a##R##2 = a##R##0, a##R##3 = a##R##0
+    Q8R_ACC(0); Q8R_ACC(1); Q8R_ACC(2); Q8R_ACC(3);
+#undef Q8R_ACC
+    for (int k = 0; k < columns / 64; ++k) {
+#define Q8R_X(T) const svint8_t x##T = svld1_s8(p8, a[T]->xq + 64 * k); \
+                 const svfloat32_t s##T = svld1_f32(pg, a[T]->xpat + 16 * k)
+        Q8R_X(0); Q8R_X(1); Q8R_X(2); Q8R_X(3);
+#undef Q8R_X
+#define Q8R_FMA(R,T) a##R##T = svmla_f32_m(pg, a##R##T, \
+    svcvt_f32_s32_x(pg, svdot_s32(svdup_s32(0), wv, x##T)), \
+    svmul_f32_x(pg, ws, s##T))
+#define Q8R_ROW(R) do { \
+    const float *d = (const float *)(w + (size_t)(R) * rb + columns); \
+    const svint8_t wv = svld1_s8(p8, (const int8_t *)(w + (size_t)(R) * rb) + 64 * k); \
+    const svfloat32_t ws = svsel_f32(lo8, svdup_f32(d[2*k]), svdup_f32(d[2*k+1])); \
+    Q8R_FMA(R,0); Q8R_FMA(R,1); Q8R_FMA(R,2); Q8R_FMA(R,3); \
+} while (0)
+        Q8R_ROW(0); Q8R_ROW(1); Q8R_ROW(2); Q8R_ROW(3);
+#undef Q8R_ROW
+#undef Q8R_FMA
+    }
+#define Q8R_STORE(R) do { \
+    out[R] = svaddv_f32(pg, a##R##0); \
+    out[(size_t)stride + R] = svaddv_f32(pg, a##R##1); \
+    out[(size_t)2 * stride + R] = svaddv_f32(pg, a##R##2); \
+    out[(size_t)3 * stride + R] = svaddv_f32(pg, a##R##3); \
+} while (0)
+    Q8R_STORE(0); Q8R_STORE(1); Q8R_STORE(2); Q8R_STORE(3);
+#undef Q8R_STORE
+}
+
 static int native_is_q80(int type) {
     return type == GLM53F_GGML_Q8_0 || type == GLM53F_NATIVE_Q8_0R;
 }
@@ -421,6 +460,75 @@ int glm53f_native_matvec_n(const glm53f_native_matrix *m, int count,
     rc |= glm53f_native_matvec_team(m, count, act) != 0;
     free(act);
     return rc ? -1 : 0;
+}
+
+int glm53f_native_matvec_batch_team(const glm53f_native_matrix *m, int count,
+        const void *activation, size_t activation_stride, int tokens) {
+    int total = 0, group[8], start[9];
+    size_t rb[8];
+    if (!m || count < 1 || count > 8 || !activation || tokens < 1 ||
+        activation_stride < glm53f_native_act_bytes(m[0].columns)) return -1;
+    for (int i = 0; i < count; ++i) {
+        rb[i] = glm53f_native_row_size(m[i].type, m[i].columns);
+        if (!m[i].output || !m[i].weight || m[i].rows < 1 || !rb[i]) return -1;
+        for (int t = 0; t < tokens; ++t)
+            if (native_check(m[i].type, m[i].columns,
+                    (const native_act *)((const uint8_t *)activation +
+                                          (size_t)t * activation_stride))) return -1;
+        group[i] = m[i].type == GLM53F_NATIVE_Q8_0R ? 4 : 1;
+        start[i] = total;
+        total += (m[i].rows + group[i] - 1) / group[i];
+    }
+    start[count] = total;
+#pragma omp for collapse(2) schedule(static)
+    for (int q = 0; q < total; ++q)
+        for (int t = 0; t < tokens; t += 4) {
+            int i = 0;
+            while (q >= start[i + 1]) ++i;
+            const int r = (q - start[i]) * group[i];
+            const int nr = m[i].rows - r < group[i] ? m[i].rows - r : group[i];
+            const int nt = tokens - t < 4 ? tokens - t : 4;
+            const uint8_t *row = m[i].weight + (size_t)r * rb[i];
+            float *out = m[i].output + (size_t)t * m[i].rows + r;
+            const native_act *a[4];
+            for (int j = 0; j < nt; ++j)
+                a[j] = (const native_act *)((const uint8_t *)activation +
+                                            (size_t)(t + j) * activation_stride);
+            if (group[i] == 4 && nr == 4 && nt == 4)
+                q8_0r_tile4(out, m[i].rows, row, rb[i], a);
+            else for (int j = 0; j < nt; ++j) {
+                if (group[i] == 4)
+                    q8_0r_rows(out + (size_t)j * m[i].rows, row, rb[i], nr, a[j]);
+                else out[(size_t)j * m[i].rows] = native_row(m[i].type, row, a[j]);
+            }
+        }
+    return 0;
+}
+
+int glm53f_native_matvec_batch(const glm53f_native_matrix *m, int count,
+        const float *input, int tokens) {
+    if (!m || count < 1 || count > 8 || !input || tokens < 1) return -1;
+    int columns = m[0].columns, need_q8k = 0, need_q80 = 0, bad = 0;
+    size_t stride = glm53f_native_act_bytes(columns);
+    if (!stride || (size_t)tokens > SIZE_MAX / stride) return -1;
+    for (int i = 0; i < count; ++i) {
+        if (m[i].columns != columns || !glm53f_native_row_size(m[i].type, columns) ||
+            !glm53f_native_type_supported(m[i].type)) return -1;
+        if (native_is_q80(m[i].type)) need_q80 = 1; else need_q8k = 1;
+    }
+    if (need_q8k && columns % 256) return -1;
+    uint8_t *act = NULL;
+    if (posix_memalign((void **)&act, 256, stride * (size_t)tokens)) return -1;
+#pragma omp parallel reduction(|:bad)
+    {
+#pragma omp for schedule(static)
+        for (int t = 0; t < tokens; ++t)
+            bad |= glm53f_native_act_prepare(act + (size_t)t * stride,
+                input + (size_t)t * columns, columns, need_q8k, need_q80) != 0;
+        bad |= glm53f_native_matvec_batch_team(m, count, act, stride, tokens) != 0;
+    }
+    free(act);
+    return bad ? -1 : 0;
 }
 
 int glm53f_iq_matvec_2(
