@@ -165,6 +165,8 @@ static cublas_lib_t g_cublas_lib;
 static tcublasCreate_v2 p_cublasCreate_v2;
 static tcublasDestroy_v2 p_cublasDestroy_v2;
 static tcublasSetStream_v2 p_cublasSetStream_v2;
+typedef cublasStatus_t (*tcublasSetMathMode)(cublasHandle_t, int);
+static tcublasSetMathMode p_cublasSetMathMode;
 static tcublasSgemm_v2 p_cublasSgemm_v2;
 static tcublasGemmEx p_cublasGemmEx;
 static tcublasGemmStridedBatchedEx p_cublasGemmStridedBatchedEx;
@@ -384,6 +386,7 @@ int cublasewInit(void) {
         return -1;
     }
 
+    cublasew_load_symbol((void **)&p_cublasSetMathMode, "cublasSetMathMode");
     /* Optional: strided batched GEMM for MoE all-expert matmul */
     cublasew_load_symbol((void **)&p_cublasSdgmm, "cublasSdgmm");
     cublasew_load_symbol((void **)&p_cublasGemmStridedBatchedEx, "cublasGemmStridedBatchedEx");
@@ -529,6 +532,12 @@ int cublasewSetStream(cublasew_context *ctx, CUstream stream) {
     if (!ctx || !ctx->handle) return -1;
     ctx->stream = stream;
     return p_cublasSetStream_v2(ctx->handle, stream) == CUBLAS_STATUS_SUCCESS ? 0 : -1;
+}
+
+int cublasew_disallow_reduced_precision_reduction(cublasew_context *ctx) {
+    /* CUBLAS_DEFAULT_MATH | CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION */
+    if (!ctx || !ctx->handle || !p_cublasSetMathMode) return -1;
+    return p_cublasSetMathMode(ctx->handle, 16) == CUBLAS_STATUS_SUCCESS ? 0 : -1;
 }
 
 void cublasew_set_tf32(cublasew_context *ctx, int enable) {

@@ -68,6 +68,7 @@ typedef struct {
     CUdeviceptr txt_norm_w /* F32 */, txt_in, txt_out, img_in, t1, t2, modulation, norm_out, proj_out;
     size_t allocated, peak, budget;
     int verbose, fused_gemm;
+    const char *stage_dir; /* --stage-dir: F32 dumps of a JOINT pass */
     /* --verify-slots: device checksum of each streamed slot use */
     CUdeviceptr verify;
     int verify_max;
@@ -259,6 +260,26 @@ static int q21f_gemm_parts(q21f_runtime *rt, CUdeviceptr y, CUdeviceptr w, CUdev
     return 0;
 }
 
+/* Diagnostic: write a BF16 device matrix as F32 .npy (synchronizes). */
+static void q21f_stage(q21f_runtime *rt, const char *name, CUdeviceptr p, int rows, int cols, int ld) {
+    if (!rt->stage_dir) return;
+    uint16_t *h = (uint16_t *)malloc((size_t)rows * ld * 2);
+    float *f = (float *)malloc((size_t)rows * cols * 4);
+    char path[2048];
+    if (h && f && cuStreamSynchronize(rt->compute) == CUDA_SUCCESS &&
+        cuMemcpyDtoH(h, p, (size_t)rows * ld * 2) == CUDA_SUCCESS) {
+        for (int r = 0; r < rows; r++)
+            for (int c = 0; c < cols; c++) {
+                uint32_t u = (uint32_t)h[(size_t)r * ld + c] << 16;
+                memcpy(&f[(size_t)r * cols + c], &u, 4);
+            }
+        snprintf(path, sizeof(path), "%s/%s.npy", rt->stage_dir, name);
+        npy_write_f32(path, f, (size_t)rows * cols, rows, cols);
+    }
+    free(h);
+    free(f);
+}
+
 /* Diagnostic: queue a device checksum of a range without synchronizing. */
 static void q21f_mark(q21f_runtime *rt, const char *tag, int b, CUdeviceptr p, size_t bytes) {
     if (!rt->trace_buf || rt->trace_n >= 8192) return;
@@ -431,12 +452,16 @@ static int q21f_pass(q21f_runtime *rt, q21f_state *st, q21f_branch *br, int nb, 
         }
         if (kind != Q21F_PREFIX) CK(cuMemcpyDtoDAsync(h + r * D * 2, st->y, (size_t)N * D * 2, rt->compute));
     }
+    int dump = rt->stage_dir && kind == Q21F_JOINT && nb == 1;
+    if (dump) q21f_stage(rt, "hidden0", h, M, D, D);
     for (int b = 0; b < Q21F_BLOCKS; b++) {
         CUdeviceptr w = q21f_block_begin(rt, b);
         REQ(w, "block %d weights unavailable", b);
         const q21f_layout *l = &rt->layout;
         for (int i = 0; i < nb; i++)
             REQ(!q21f_branch_norm(rt, st, &br[i], kind, base[i], N, 0, b ? st->y : 0, 0), "norm1");
+        if (dump && b) { char nm[32]; snprintf(nm, sizeof(nm), "block_%02d", b - 1); q21f_stage(rt, nm, h, M, D, D); }
+        if (dump && b == 0) q21f_stage(rt, "mod_ln", st->x, M, D, D);
         q21f_mark(rt, "x1", b, st->x, (size_t)M * D * 2);
         q21f_mark(rt, "h", b, h, (size_t)M * D * 2);
         REQ(!q21f_gemm_parts(rt, st->qkv, w + l->offset[Q21F_QKV], st->x, M, 3, D, D), "QKV");
@@ -481,6 +506,12 @@ static int q21f_pass(q21f_runtime *rt, q21f_state *st, q21f_branch *br, int nb, 
             }
         }
         if (last_prefix) { REQ(!q21f_block_end(rt, b), "block end"); break; }
+        if (dump && b == 0) {
+            q21f_stage(rt, "v", st->qkv + (size_t)2 * D * 2, M, D, 3 * D);
+            q21f_stage(rt, "rope_q", st->q, M, D, D);
+            q21f_stage(rt, "rope_k", br[0].work_k, M, D, D);
+            q21f_stage(rt, "attn_raw", st->attn, M, D, D);
+        }
         q21f_mark(rt, "q", b, st->q, (size_t)M * D * 2);
         q21f_mark(rt, "k", b, br[0].work_k, (size_t)(br[0].prefix + N) * D * 2);
         q21f_mark(rt, "attn", b, st->attn, (size_t)M * D * 2);
@@ -489,12 +520,18 @@ static int q21f_pass(q21f_runtime *rt, q21f_state *st, q21f_branch *br, int nb, 
         for (int i = 0; i < nb; i++)
             REQ(!q21f_branch_norm(rt, st, &br[i], kind, base[i], N, 1, st->y, 0), "norm2");
         q21f_mark(rt, "x2", b, st->x, (size_t)M * D * 2);
+        if (dump && b == 0) {
+            q21f_stage(rt, "attn_out", st->y, M, D, D);
+            q21f_stage(rt, "post_attn_hidden", h, M, D, D);
+            q21f_stage(rt, "mod_ln2", st->x, M, D, D);
+        }
         REQ(!q21f_gemm_parts(rt, st->gp, w + l->offset[Q21F_GP], st->x, M, 2, F, D), "gate|proj");
         q21f_mark(rt, "gp", b, st->gp, (size_t)M * 2 * F * 2);
         { int rows = M, ff = F; void *a[] = {&st->gp, &rows, &ff};
           REQ(!q21f_launch_n(rt, rt->swiglu, (size_t)M * F, a), "swiglu"); }
         REQ(!q21f_gemm(rt, st->y, D, w + l->offset[Q21F_MO], st->gp, 2 * F, M, D, F), "mlp.out");
         q21f_mark(rt, "mlp", b, st->y, (size_t)M * D * 2);
+        if (dump && b == 0) q21f_stage(rt, "mlp_out", st->y, M, D, D);
         REQ(!q21f_block_end(rt, b), "block end");
     }
     if (kind == Q21F_PREFIX) return 0;
@@ -503,6 +540,11 @@ static int q21f_pass(q21f_runtime *rt, q21f_state *st, q21f_branch *br, int nb, 
         size_t t0 = base[i] + (kind == Q21F_JOINT ? (size_t)br[i].prefix : 0);
         q21f_branch target_only = br[i];
         REQ(!q21f_branch_norm(rt, st, &target_only, Q21F_TARGET, t0, N, 0, st->y, st->fscale), "final norm");
+        if (dump) {
+            q21f_stage(rt, "final_hidden", st->hidden + t0 * D * 2, N, D, D);
+            q21f_stage(rt, "final_ln", st->x + t0 * D * 2, N, D, D);
+            q21f_stage(rt, "block31_mlp_out", st->y + t0 * D * 2, N, D, D);
+        }
         REQ(!q21f_gemm(rt, pred + (size_t)i * N * 64 * 2, 64, rt->proj_out, st->x + t0 * D * 2, D, N, 64, D),
             "proj_out");
     }
@@ -567,7 +609,7 @@ static void q21f_usage(const char *argv0) {
             "  [--editing-layout L.txt --condition-latents C.npy [--negative-editing-layout NL.txt]]\n"
             "  [--vram-budget-mib MIB] [--cfg-batch 0|1] [--fused-gemm 0|1] [--kv-cache on|off]\n"
             "  [--prefix-pass extract|separate] [--plan-only] [--profile]\n"
-            "  diagnostics: [--trace] [--verify-slots]\n"
+            "  diagnostics: [--trace] [--verify-slots] [--stage-dir DIR]\n"
             "  [--attention cutlass-efficient] [--normalization vector4] [--rope host-table-exact]\n"
             "  [--attention-plugin PATH] [--rope-table-base PATH]\n"
             "  [--out O.npy] [--dump-dir DIR] [--pred-dir DIR] [--quiet|--verbose]\n", argv0);
@@ -579,6 +621,7 @@ int main(int argc, char **argv) {
     const char *out_path = "native_latents.npy", *dump_dir = NULL, *pred_dir = NULL;
     const char *plugin_path = "cuda/qimg21/libq21_fast_attention.so";
     const char *rope_path = "cuda/qimg21/qwen21_rope_freqs.npy";
+    const char *stage_dir = NULL;
     int ih = 16, iw = 16, steps = 1, verbose = 1, cfg_batch = 1, plan_only = 0, profile = 0, fused_gemm = 1;
     int kv_cache = 1, extract = 1, trace = 0, verify_slots = 0;
     double budget_mib = 0;
@@ -617,6 +660,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--rope-table-base") && more) rope_path = argv[++i];
         else if (!strcmp(a, "--plan-only")) plan_only = 1;
         else if (!strcmp(a, "--trace")) trace = 1;
+        else if (!strcmp(a, "--stage-dir") && more) stage_dir = argv[++i];
         else if (!strcmp(a, "--verify-slots")) verify_slots = 1;
         else if (!strcmp(a, "--profile")) profile = 1;
         else if (!strcmp(a, "--verbose")) verbose = 2;
@@ -666,6 +710,8 @@ int main(int argc, char **argv) {
     memset(br, 0, sizeof(br));
     rt.verbose = verbose;
     rt.fused_gemm = fused_gemm;
+    rt.stage_dir = stage_dir;
+    if (stage_dir) mkdir(stage_dir, 0755);
 
     REQ(!npy_read_f32(prompt_path, &pe) && !npy_read_f32(latent_path, &la), "cannot read inputs");
     REQ(!negative_path || !npy_read_f32(negative_path, &ne), "cannot read negative embeds");
@@ -707,6 +753,10 @@ int main(int argc, char **argv) {
     CK(cuStreamCreate(&rt.compute, CU_STREAM_NON_BLOCKING));
     CK(cuStreamCreate(&rt.copy, CU_STREAM_NON_BLOCKING));
     REQ(cublasewCreate(&rt.blas, rt.compute) == 0, "cuBLAS unavailable");
+    /* BF16-output GEMMs with split-K (few rows, e.g. proj_out or the two-row
+     * timestep GEMMs) must reduce in FP32, matching FP32 output then one
+     * rounding as the harness and PyTorch reference do. */
+    REQ(cublasew_disallow_reduced_precision_reduction(rt.blas) == 0, "cublasSetMathMode unavailable");
     REQ(cu_compile_kernels_ex(&rt.module, rt.device, q21f_kernel_src, "qimg21_fast.cu", verbose,
                               "fast", 0) >= 0, "kernel compile failed");
 #define GETF(field, name) CK(cuModuleGetFunction(&rt.field, rt.module, name))

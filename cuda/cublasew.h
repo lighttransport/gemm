@@ -31,6 +31,9 @@ int cublasewSetStream(cublasew_context *ctx, CUstream stream);
  * route to the TF32 tensor cores. Default is off (exact SGEMM, no behavior
  * change for existing callers). */
 void cublasew_set_tf32(cublasew_context *ctx, int enable);
+/* Keep split-K and other internal reductions in FP32 when the output type is
+ * 16-bit, so BF16-output GEMMs round only once. Returns -1 if unavailable. */
+int cublasew_disallow_reduced_precision_reduction(cublasew_context *ctx);
 
 /* Row-major Y[m, n_out] = X[m, n_in] * W[n_out, n_in]^T */
 int cublasew_gemm_f32_rowmajor_nt(cublasew_context *ctx,

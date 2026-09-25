@@ -1878,10 +1878,22 @@ Validation on the RTX 5060 Ti, against the pinned efficient-SDPA reference:
   is bit-identical to the harness at every one of the 40 checkpoints. So is
   the decoded image: minimum trajectory cosine 0.999989908 and 58.16 dB RGB
   PSNR against PyTorch, both unchanged from the harness.
-- **256x256, 2 steps, seed 7** (`tmp/qimg21-exact-matrix`): predictions reach
-  cosine 0.999998 and the trajectory 0.999995, against the 0.99996 gate. At
-  this size the harness is bit-identical to PyTorch; the fast runner differs
-  in the last BF16 bits.
+- **256x256, 2 steps, seed 7** (`tmp/qimg21-exact-matrix`): the trajectory is
+  bit-identical to the harness (cosine 0.9999985 against PyTorch).
+- **256x256 true-CFG-4 edit with a 1024 condition image**
+  (`tmp/qimg21-edit-cfg-reference-efficient`, `editing_regression.py`):
+  predictions reach cosine 0.999999849 and 0.99999949, and the trajectory
+  0.9999986 and 0.9999976. These match the harness's documented edit parity,
+  with CFG batched and the prefix KV cache on.
+- The cuBLAS handle sets `CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION`.
+  Without it, BF16-output GEMMs that cuBLAS runs with split-K (few rows, such
+  as `proj_out` over 256 target tokens or the two-row timestep GEMMs) reduced
+  partial sums at reduced precision. That lowered the 256x256 edit branch
+  prediction from 0.99999997 to 0.9999976 against PyTorch, and CFG-4
+  amplified it to 0.99994.
+- `--stage-dir DIR` writes the same F32 stage dumps as the harness's
+  `QIMG21_STAGE_DIR` (block 0 internals and each block's hidden state), for
+  one joint pass.
 - `--verify-slots` checksums every streamed slot use on the device and
   compares it with the pinned host blob at exit.
 - `--trace` records asynchronous per-operation activation checksums.
