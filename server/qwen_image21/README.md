@@ -28,6 +28,44 @@ packages default to `/mnt/nvme01/models/qimg-21-fast/`; override them with
 `--int8-package` and `--nvfp4-package`. The API field is `preset`, CUDA only,
 and `GET /api/health` reports which presets are available.
 
+## The PyTorch reference: CUDA, ROCm or CPU
+
+The reference runs `cuda/qimg21/reference.py`, which takes `--device`:
+
+| `reference_device` | Runs on | Needs |
+|---|---|---|
+| `cuda` | the NVIDIA GPU | a CUDA PyTorch build |
+| `rocm` | the AMD GPU | a ROCm PyTorch build, in its own environment |
+| `cpu` | the processor | any PyTorch build |
+
+`cuda` and `rocm` name a **PyTorch build** as much as a device. PyTorch exposes
+ROCm through the `cuda` namespace, so both requests resolve to the same device
+string and differ only in which build is installed; the driver refuses a
+mismatch with the reason rather than failing on an import or a missing device.
+Each GPU vendor gets its own interpreter, `--python` and `--python-rocm`. The CPU
+route needs no build of its own and defaults to `--python`, since a CUDA build
+runs CPU kernels perfectly well; pass `--python-cpu` to name another.
+
+`reference_device` defaults to the request's `backend`, so existing requests keep
+pointing where they always did. A native-only request does not need a reference
+and is not refused when no PyTorch build is installed at all.
+
+`GET /api/health` reports `reference` (which devices work) and
+`reference_detail` (the torch version, or the reason a device is unavailable).
+The form offers only the devices that work and moves off a selection that turns
+out to be gone.
+
+**A CPU reference is not a parity result.** It runs different kernels on
+different hardware, so a side-by-side against the native runner is a look at
+both pictures. A compare on CPU says so on the result rather than letting the
+pairing imply agreement; `cuda` and `rocm` are the devices a comparison can
+actually mean.
+
+**CPU is slow enough to be a debugging route, not a demo default.** Measured on
+32 cores at 256x256 with one step: the denoise step took 59 s, and the VAE
+decode had not finished after 21 minutes. Budget tens of minutes per image, and
+expect the decode rather than the denoiser to be the long pole.
+
 ## Live progress
 
 While a run is in flight the page shows the pipeline stage, a progress bar and a
@@ -128,9 +166,12 @@ server/qwen_image21/run.sh \
   --native-rocm rdna4/qimg21/test_hip_qimg21_native
 ```
 
-The API accepts `backend=cuda|rocm` and `mode=native|reference|compare`, an
-optional `job` id to attach to progress, `profile_steps` for per-step timings,
-plus
+`--python-cpu` names the interpreter for a CPU reference, if you want one
+separate from `--python`.
+
+The API accepts `backend=cuda|rocm` and `mode=native|reference|compare`,
+`reference_device=cuda|rocm|cpu`, an optional `job` id to attach to progress,
+`profile_steps` for per-step timings, plus
 the tiling fields above (`upscale`, `base_steps`, `tile_tokens`,
 `tile_overlap`, `refine_strength`, `refine_seed`, `vae_tile`,
 `vae_tile_overlap`, `vae_tile_bleed`). Blank or null means "let the
@@ -156,7 +197,8 @@ python3 -m pytest server/qwen_image21 -q
 ```
 
 `test_app.py` covers the routing, the preset selection, the validation of
-every tiling field and the progress parser. `test_form.py` extracts the page's inline script and runs it
+every tiling field, the progress parser, and the reference device routing
+including the build probe that decides which devices a machine can offer. `test_form.py` extracts the page's inline script and runs it
 under `node` against a DOM stub, so a mistyped identifier or a size cap
 computed from the wrong branch is caught here rather than surfacing as a broken
 page, including the progress table's row rendering; it skips if `node` is not

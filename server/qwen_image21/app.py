@@ -40,6 +40,13 @@ FAST_PRESETS = {"low8": "int8", "low8-fp4": "nvfp4", "fast12": "int8", "accurate
 SIZE_LIMIT_REFERENCE = 1024
 SIZE_LIMIT_FAST = 2048
 SIZE_LIMIT_TILED = 4096
+# Where the PyTorch reference may run. `cuda` and `rocm` name a PyTorch build as
+# much as a device: each GPU vendor needs its own Torch, and the CPU route works
+# with either. Only cuda and rocm can be compared against the native runner
+# numerically; a CPU reference runs different kernels on different hardware, so
+# that pairing is about composition rather than agreement.
+REFERENCE_DEVICES = ("cuda", "rocm", "cpu")
+REFERENCE_PARITY_DEVICES = {"cuda", "rocm"}
 # Tiled coarse-to-fine refine, from cuda/qimg21/native_generate.py. A refine
 # tile is composed as its own canvas, so the tile is a quality dial, not only a
 # memory one: the default is the largest that fits the preset's budget, found by
@@ -51,6 +58,8 @@ MAX_BODY = 32 * 1024
 # because a long run would otherwise resend its whole history several times a
 # second.
 PROGRESS_TTL = 900.0
+# A torch import is slow but bounded; a hung interpreter must not hang /api/health.
+PROBE_TIMEOUT = 120.0
 MAX_EVENTS = 4096
 
 # Which pipeline stage a subprocess is, from the driver's "+ <command>" line.
@@ -182,6 +191,7 @@ class Demo:
                  native: Path, host: str, port: int,
                  *, native_rocm: Path | None = None,
                  python_rocm: Path | None = None,
+                 python_cpu: Path | None = None,
                  fast: Path = DEFAULT_FAST,
                  fast_packages: dict[str, Path] | None = None):
         self.model = model.resolve()
@@ -190,6 +200,9 @@ class Demo:
         # to the host interpreter and lose the environment's Torch packages.
         self.python = python.absolute()
         self.python_rocm = (python_rocm or python).absolute()
+        # A CPU reference needs no PyTorch build of its own, but allow one to be
+        # named so a box without a GPU-hosted reference environment still works.
+        self.python_cpu = (python_cpu or python).absolute()
         self.work = work.resolve()
         self.native = native.resolve()
         self.native_rocm = (native_rocm or native).resolve()
@@ -201,11 +214,100 @@ class Demo:
         # job id -> {"progress": Progress, "events": [...], "started": t}
         self.jobs: dict[str, dict] = {}
         self.jobs_lock = threading.Lock()
+        # interpreter path -> probed torch build; see probe_torch()
+        self._probes: dict[str, dict] = {}
 
     def preset_available(self, preset: str) -> bool:
         kind = FAST_PRESETS[preset]
         return self.fast.is_file() and (
             kind is None or (self.fast_packages.get(kind, Path("/nonexistent")) / "manifest.json").is_file())
+
+    def reference_python(self, device: str) -> Path:
+        """Which interpreter runs the PyTorch reference for a device.
+
+        CUDA and ROCm need different PyTorch builds, so each gets its own
+        environment. CPU runs on whichever build is already there: a CUDA build
+        executes CPU kernels perfectly well, and asking for a third environment
+        only adds a way to be wrong.
+        """
+        return {"rocm": self.python_rocm, "cpu": self.python_cpu}.get(device, self.python)
+
+    def probe_torch(self, python: Path) -> dict:
+        """Ask one interpreter what it is, once per process.
+
+        Importing torch costs seconds, and the health endpoint needs the answer
+        on every call, so the result is cached. The cache is keyed by
+        interpreter rather than by device because the CPU and CUDA routes share
+        an interpreter by default and would otherwise import torch twice for the
+        same answer.
+        """
+        cached = self._probes.get(str(python))
+        if cached is not None:
+            return cached
+        result = {"ok": False, "reason": "", "torch": None, "python": str(python)}
+        if not python.is_file():
+            result["reason"] = f"no interpreter at {python}"
+            self._probes[str(python)] = result
+            return result
+        probe = ("import json, torch;"
+                 "print(json.dumps({'torch': torch.__version__,"
+                 "'hip': getattr(torch.version, 'hip', None),"
+                 "'cuda': bool(torch.cuda.is_available())}))")
+        try:
+            done = subprocess.run([str(python), "-c", probe], capture_output=True,
+                                  text=True, timeout=PROBE_TIMEOUT)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            result["reason"] = f"could not probe {python}: {exc}"
+            self._probes[str(python)] = result
+            return result
+        if done.returncode:
+            detail = (done.stderr or "").strip().splitlines()
+            result["reason"] = (f"{python} has no usable torch: "
+                                f"{detail[-1] if detail else 'import failed'}")
+            self._probes[str(python)] = result
+            return result
+        try:
+            build = json.loads(done.stdout.strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            result["reason"] = f"{python} printed no torch version"
+            self._probes[str(python)] = result
+            return result
+        result.update(ok=True, torch=build["torch"], hip=build["hip"], gpu=build["cuda"])
+        self._probes[str(python)] = result
+        return result
+
+    def torch_build(self, device: str) -> dict:
+        """Whether the reference can run on `device` here, and why not if not.
+
+        A CUDA build answers torch.cuda.is_available() == True just like a ROCm
+        one does, so availability is a property of the build and the requested
+        device together, not of the machine alone.
+        """
+        python = self.reference_python(device)
+        build = self.probe_torch(python)
+        result = {"available": False, "reason": "", "torch": build["torch"],
+                  "python": str(python)}
+        if not build["ok"]:
+            result["reason"] = build["reason"]
+        elif device == "cpu":
+            # Any build runs CPU kernels; that is the whole point of the route.
+            result["available"] = True
+        elif bool(build["hip"]) != (device == "rocm"):
+            # A ROCm build reports a HIP version and a CUDA one does not, and
+            # both answer torch.cuda.is_available() the same way, so this is the
+            # only thing that tells the two builds apart.
+            installed = "ROCm" if build["hip"] else "CUDA"
+            wanted = "ROCm" if device == "rocm" else "CUDA"
+            result["reason"] = (f"torch {build['torch']} is a {installed} build; {device} "
+                                f"needs a {wanted} build")
+        elif not build["gpu"]:
+            result["reason"] = f"torch {build['torch']} sees no GPU"
+        else:
+            result["available"] = True
+        return result
+
+    def reference_devices(self) -> dict[str, dict]:
+        return {device: self.torch_build(device) for device in REFERENCE_DEVICES}
 
     def native_components(self, backend: str) -> dict[str, Path]:
         """Return the complete native subprocess set for one backend."""
@@ -252,6 +354,19 @@ class Demo:
             raise ValueError("backend must be cuda or rocm")
         if mode not in {"native", "reference", "compare"}:
             raise ValueError("mode must be native, reference, or compare")
+        # Where the PyTorch reference runs. Defaulting to the native backend
+        # keeps every existing request pointing where it always did: a CUDA
+        # request gets the CUDA reference, an ROCm one the ROCm reference.
+        reference_device = request.get("reference_device") or backend
+        if reference_device not in REFERENCE_DEVICES:
+            raise ValueError("reference_device must be one of " + ", ".join(REFERENCE_DEVICES))
+        if mode in {"reference", "compare"}:
+            # Refuse here with the reason rather than letting the run die on an
+            # import error or a missing GPU several stages later.
+            build = self.torch_build(reference_device)
+            if not build["available"]:
+                raise ValueError(f"the {reference_device} PyTorch reference is unavailable: "
+                                 f"{build['reason']}")
         quantized = bool(request.get("quantized", False))
         preset = request.get("preset") or None
         if preset is not None:
@@ -340,7 +455,7 @@ class Demo:
         if refine_seed is None:
             refine_seed = 0
         return {"prompt": prompt, "negative_prompt": negative.strip(),
-                "mode": mode, "backend": backend,
+                "mode": mode, "backend": backend, "reference_device": reference_device,
                 "width": width, "height": height, "steps": steps, "seed": seed,
                 "quantized": quantized, "preset": preset,
                 # Per-step timings come from the fast runner's own CUDA events,
@@ -467,18 +582,26 @@ class Demo:
         return [line for line in lines if line.startswith(wanted)][-12:]
 
     def _reference(self, cfg: dict, out: Path, progress=None) -> Path:
+        device = cfg["reference_device"]
         backend = cfg["backend"]
-        python = self.python if backend == "cuda" else self.python_rocm
-        image = out / "reference" / f"{backend}.png"
+        python = self.reference_python(device)
+        # The reference is named by the device that produced it: a CUDA and a CPU
+        # picture of the same prompt are different claims, and a compare that
+        # showed one under the other's label would be misleading. One directory
+        # per device, because the driver writes reference.png and run.json by
+        # fixed name and a second run would overwrite the first one's record.
+        dump = out / "reference" / device
         command = [str(python), "cuda/qimg21/reference.py", "--model", str(self.model),
+                   "--device", device,
                    "--prompt", cfg["prompt"], "--height", str(cfg["height"]),
                    "--width", str(cfg["width"]), "--steps", str(cfg["steps"]),
                    "--seed", str(cfg["seed"]), "--dtype", "bf16", "--sdpa-backend", "efficient",
-                   "--dump-dir", str(image.parent)]
+                   "--dump-dir", str(dump)]
         if cfg["negative_prompt"]:
             command += ["--negative-prompt", cfg["negative_prompt"], "--true-cfg-scale", "4.0"]
-        self._run(command, ROOT, out / f"reference-{backend}.log", progress=progress)
-        return image
+        self._run(command, ROOT, out / f"reference-{backend}-{device}.log", progress=progress)
+        # The driver names its own output; do not invent a second name for it.
+        return dump / "reference.png"
 
     @staticmethod
     def _data_url(path: Path) -> str:
@@ -505,10 +628,21 @@ class Demo:
                     self._say(job_id, f"Qwen {backend.upper()} native complete")
                     results[backend] = {"image": self._data_url(path), "log": self._summary(log)}
                 if cfg["mode"] in {"reference", "compare"}:
-                    self._say(job_id, "Qwen PyTorch reference")
+                    device = cfg["reference_device"]
+                    self._say(job_id, f"Qwen PyTorch reference ({device})")
                     path = self._reference(cfg, job, self._progress(job_id))
-                    self._say(job_id, "Qwen PyTorch reference complete")
-                    results["reference"] = {"image": self._data_url(path)}
+                    self._say(job_id, f"Qwen PyTorch reference ({device}) complete")
+                    entry = {"image": self._data_url(path), "device": device,
+                             "torch": self.torch_build(device)["torch"]}
+                    if device not in REFERENCE_PARITY_DEVICES and cfg["mode"] == "compare":
+                        # A CPU reference runs different kernels on different
+                        # hardware, so a side-by-side with the native runner is a
+                        # look at both pictures, not a parity result. Say so on the
+                        # result instead of letting the pairing imply agreement.
+                        entry["note"] = (f"the {device} reference runs different kernels on "
+                                         "different hardware: compare this for composition, "
+                                         "not for numerical agreement")
+                    results["reference"] = entry
         finally:
             self._end(job_id)
         results["elapsed_ms"] = round((time.monotonic() - started) * 1000)
@@ -615,6 +749,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/progress":
             return self._progress(parsed)
         if path == "/api/health":
+            builds = demo.reference_devices()
             components = {backend: {name: item.is_file()
                                     for name, item in demo.native_components(backend).items()}
                           for backend in ("cuda", "rocm")}
@@ -626,8 +761,11 @@ class Handler(BaseHTTPRequestHandler):
                              "native": {backend: all(components[backend].values())
                                         for backend in ("cuda", "rocm")},
                              "native_components": components,
-                             "reference": {"cuda": demo.python.is_file(),
-                                           "rocm": demo.python_rocm.is_file()}})
+                             # Probed once: reference_devices() caches per interpreter,
+                             # but building it twice here would read as two probes.
+                             "reference": {device: build["available"] for device, build
+                                           in builds.items()},
+                             "reference_detail": builds})
             return
         if path in {"/", "/index.html"}:
             data = (WEB / "qwen_image21.html").read_bytes()
@@ -668,6 +806,9 @@ def main() -> int:
                     default=ROOT / "rdna4/qimg21/test_hip_qimg21_native")
     ap.add_argument("--python-rocm", type=Path,
                     default=ROOT / "tmp/qimg21-rocm-venv/bin/python")
+    ap.add_argument("--python-cpu", type=Path, default=None,
+                    help="interpreter for the CPU PyTorch reference; defaults to --python, "
+                         "since a CUDA build also runs CPU kernels")
     ap.add_argument("--fast", type=Path, default=DEFAULT_FAST, help="fast CUDA denoiser for presets")
     ap.add_argument("--int8-package", type=Path, default=DEFAULT_FAST_PACKAGES["int8"],
                     help="pack_fast.py int8-smooth package (low8, fast12)")
@@ -680,7 +821,7 @@ def main() -> int:
     args.work_dir.mkdir(parents=True, exist_ok=True)
     demo = Demo(args.model, args.quant_package, args.python, args.work_dir, args.native,
                 args.host, args.port, native_rocm=args.native_rocm,
-                python_rocm=args.python_rocm, fast=args.fast,
+                python_rocm=args.python_rocm, python_cpu=args.python_cpu, fast=args.fast,
                 fast_packages={"int8": args.int8_package, "nvfp4": args.nvfp4_package})
     server = ThreadingHTTPServer((args.host, args.port), Handler); server.demo = demo  # type: ignore[attr-defined]
     print(f"Qwen Image 2.1 demo: http://{args.host}:{args.port}")

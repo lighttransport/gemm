@@ -138,8 +138,100 @@ class QwenImage21FormLogicTest(unittest.TestCase):
         self.assertIn("data.log", body)
         self.assertIn(".log", PAGE.read_text(encoding="utf-8"))
         # Runner output goes straight into innerHTML, so it has to be escaped.
-        self.assertIn("data.log.map(l=>l.replace(/[&<>]/g", body)
+        self.assertIn("data.log.map(esc)", body)
         self.assertIn("&amp;", body)
+        # The caveat is styled by a rule that has to exist, or a CPU reference
+        # reads as ordinary text.
+        self.assertIn(".meta.warn{", PAGE.read_text(encoding="utf-8"))
+
+    def test_the_escaper_actually_escapes(self):
+        """The escaping is a claim about behaviour, so run it: a note or a log
+        line carrying markup must not become markup."""
+        body = script()
+        i = body.index("const esc=")
+        j = body.index("function render(")
+        program = (
+            "const $=id=>document.getElementById(id);\n"
+            "const ids={};\n"
+            "function mk(){return {value:'',textContent:'',innerHTML:'',hidden:false,style:{},children:[],"
+            "removeChild(c){const i=this.children.indexOf(c);if(i>=0)this.children.splice(i,1)},"
+            "classList:{toggle(){}},addEventListener(){},querySelector(){return mk()},options:[],"
+            "append(c){this.children.push(c)}}\n}\n"
+            "const document={getElementById:id=>ids[id]||(ids[id]=mk()),createElement:()=>mk()};\n"
+            + body[i:j] +
+            "const hostile='<img src=x onerror=alert(1)> & \"quoted\"';\n"
+            "const out=esc(hostile);\n"
+            "if(out.includes('<img')){console.log('FAIL raw tag',out);process.exit(1)}\n"
+            "if(!out.includes('&lt;img')||!out.includes('&amp;')){console.log('FAIL',out);process.exit(1)}\n"
+            "console.log('escape ok');\n")
+        result = run(program)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("escape ok", result.stdout)
+
+    def test_the_form_offers_a_pytorch_device(self):
+        markup = PAGE.read_text(encoding="utf-8")
+        self.assertRegex(markup, r'id="refdevice"')
+        for device in ("cuda", "rocm", "cpu"):
+            self.assertIn(f'<option value="{device}"', markup)
+        body = script()
+        self.assertIn("reference_device: $('refdevice').value", body)
+        # A native run has no reference, so the row stays out of the way.
+        self.assertIn("row.hidden=mode==='native'", body)
+        # An option the health report says is not installed must not be
+        # selectable, or the run comes back as a refusal instead of a picture.
+        self.assertIn("option.disabled=!ok", body)
+
+    def test_the_device_selector_follows_what_is_installed(self):
+        """Only devices with a PyTorch build may be offered, and a selection that
+        turns out to be gone has to move somewhere runnable rather than leaving
+        the form pointed at a request the server will refuse."""
+        body = script()
+        i = body.index("// The reference runs on a PyTorch build per device")
+        j = body.index("for(const id of ['backend'")
+        program = (
+            "const ids={};\n"
+            "const $=id=>document.getElementById(id);\n"
+            "function mk(id){let v=id==='refdevice'?'cuda':'';const o={get value(){return v},"
+            "set value(x){v=x;o.selectedOptions=[o.options.find(y=>y.value===x)]},"
+            "textContent:'',innerHTML:'',hidden:false,style:{},children:[],disabled:false,"
+            "selectedOptions:[],removeChild(){},classList:{toggle(){}},addEventListener(){},"
+            "querySelector(){return mk('x')},options:[{value:'cuda',disabled:false},"
+            "{value:'rocm',disabled:false},{value:'cpu',disabled:false}]};"
+            "o.selectedOptions=[o.options[0]];return o}\n"
+            "const document={getElementById:id=>ids[id]||(ids[id]=mk(id)),createElement:()=>mk('t'),"
+            "querySelector:()=>({value:'reference'}),querySelectorAll:()=>[{addEventListener(){}}]};\n"
+            "const fetch=()=>Promise.reject(new Error('offline'));\n"
+            "const crypto={randomUUID:()=>'x'};const setTimeout=()=>0,clearTimeout=()=>{};\n"
+            "let HEALTH=null;\n"
+            + body[i:j] +
+            "const detail={cuda:{torch:'2.14.0+cu130'},rocm:{torch:null},cpu:{torch:'2.14.0+cu130'}};\n"
+            "HEALTH={reference:{cuda:true,rocm:false,cpu:true},reference_detail:detail};\n"
+            # A native run has no reference, so the row stays out of the way.
+            "syncRefDevice('native');\n"
+            "if(!$('refdevice-row').hidden){console.log('FAIL shown for native');process.exit(1)}\n"
+            "syncRefDevice('reference');\n"
+            "if($('refdevice-row').hidden){console.log('FAIL hidden for reference');process.exit(1)}\n"
+            # The device with no PyTorch build is not selectable.
+            "const byValue=v=>$('refdevice').options.find(o=>o.value===v);\n"
+            "if(!byValue('rocm').disabled){console.log('FAIL rocm selectable');process.exit(1)}\n"
+            "if(!/no PyTorch build/.test(byValue('rocm').textContent))"
+            "{console.log('FAIL no reason',byValue('rocm').textContent);process.exit(1)}\n"
+            "if(byValue('cuda').disabled||byValue('cpu').disabled)"
+            "{console.log('FAIL good device disabled');process.exit(1)}\n"
+            "if(refLabel()!=='PyTorch CUDA'){console.log('FAIL label',refLabel());process.exit(1)}\n"
+            # The CPU hint has to say it is not a parity result.
+            "$('refdevice').value='cpu';syncRefDevice('compare');\n"
+            "if(refLabel()!=='PyTorch CPU'){console.log('FAIL cpu label');process.exit(1)}\n"
+            "if(!/not for numerical agreement/.test($('refdevice-hint').textContent))"
+            "{console.log('FAIL cpu hint',$('refdevice-hint').textContent);process.exit(1)}\n"
+            # A selection that has just become unavailable moves off itself.
+            "$('refdevice').value='rocm';syncRefDevice('compare');\n"
+            "if($('refdevice').selectedOptions[0].disabled)"
+            "{console.log('FAIL stayed on a disabled device');process.exit(1)}\n"
+            "console.log('device selector ok');\n")
+        result = run(program)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("device selector ok", result.stdout)
 
     def test_no_stray_lookalike_identifiers(self):
         """A mistyped identifier in a minified one-liner fails at runtime, not at

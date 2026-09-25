@@ -4,16 +4,34 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from server.qwen_image21.app import MAX_EVENTS, Demo, Progress, ROOT
+from server.qwen_image21.app import MAX_EVENTS, Demo, Progress, REFERENCE_DEVICES, ROOT
 import time
+
+
+def assume_reference(demo: Demo, *devices: str) -> None:
+    """Pretend these reference devices are runnable.
+
+    The demos in these tests use interpreter paths that do not exist, so the
+    availability gate would refuse every reference request. Seeding the probe
+    cache rather than the verdict keeps the real build-matching logic under
+    test: a ROCm request only passes here because the interpreter claims HIP.
+    """
+    for device in devices:
+        python = str(demo.reference_python(device))
+        demo._probes[python] = {"ok": True, "reason": "", "torch": "0.0+test",
+                                "hip": "7.2.0" if device == "rocm" else None,
+                                "gpu": True, "python": python}
 
 
 class QwenImage21RoutingTest(unittest.TestCase):
     def make_demo(self, root: Path) -> Demo:
-        return Demo(root / "model", root / "quant", root / "cuda-python",
+        demo = Demo(root / "model", root / "quant", root / "cuda-python",
                     root / "work", root / "cuda-native", "127.0.0.1", 0,
                     native_rocm=root / "rocm-native",
-                    python_rocm=root / "rocm-python")
+                    python_rocm=root / "rocm-python",
+                    python_cpu=root / "cpu-python")
+        assume_reference(demo, *REFERENCE_DEVICES)
+        return demo
 
     def test_legacy_and_explicit_backend_requests(self):
         with tempfile.TemporaryDirectory(dir=ROOT / "tmp", prefix="qimg21-test-") as td:
@@ -478,6 +496,213 @@ ProgressTestLog = [
     "fast: step 1/2 sigma=1.0000000 100.0 ms",
     "fast: step 2/2 sigma=0.0200000 50.0 ms",
 ]
+
+
+class QwenImage21ReferenceDeviceTest(unittest.TestCase):
+    """The PyTorch reference can run on CUDA, ROCm or CPU. Those are different
+    PyTorch builds, not just different devices, so the routing has to pick the
+    right interpreter and refuse a build that is not installed -- before a run
+    starts, not after it dies on an import error."""
+
+    def make_demo(self, root: Path) -> Demo:
+        demo = Demo(root / "model", root / "quant", root / "cuda-python",
+                    root / "work", root / "cuda-native", "127.0.0.1", 0,
+                    native_rocm=root / "rocm-native",
+                    python_rocm=root / "rocm-python",
+                    python_cpu=root / "cpu-python")
+        return demo
+
+    def test_the_reference_device_defaults_to_the_native_backend(self):
+        """Existing requests must keep pointing where they always did."""
+        with tempfile.TemporaryDirectory(dir=ROOT / "tmp", prefix="qimg21-test-") as td:
+            demo = self.make_demo(Path(td))
+            assume_reference(demo, *REFERENCE_DEVICES)
+            cuda = demo._validate({"prompt": "apple", "backend": "cuda", "mode": "reference"})
+            self.assertEqual(cuda["reference_device"], "cuda")
+            rocm = demo._validate({"prompt": "apple", "backend": "rocm", "mode": "reference"})
+            self.assertEqual(rocm["reference_device"], "rocm")
+            # A native-only request does not need a reference at all, so it is
+            # not refused when no PyTorch build is installed.
+            native = demo._validate({"prompt": "apple", "backend": "rocm", "mode": "native"})
+            self.assertEqual(native["reference_device"], "rocm")
+
+    def test_the_reference_device_is_validated(self):
+        with tempfile.TemporaryDirectory(dir=ROOT / "tmp", prefix="qimg21-test-") as td:
+            demo = self.make_demo(Path(td))
+            assume_reference(demo, *REFERENCE_DEVICES)
+            with self.assertRaises(ValueError) as caught:
+                demo._validate({"prompt": "apple", "mode": "reference", "reference_device": "mps"})
+            self.assertIn("reference_device", str(caught.exception))
+
+    def test_a_missing_build_is_refused_with_the_reason(self):
+        with tempfile.TemporaryDirectory(dir=ROOT / "tmp", prefix="qimg21-test-") as td:
+            demo = self.make_demo(Path(td))
+            # The ROCm interpreter here turns out to hold a CUDA build.
+            demo._probes[str(demo.python_rocm)] = {
+                "ok": True, "reason": "", "torch": "2.14.0+cu130", "hip": None,
+                "gpu": True, "python": str(demo.python_rocm)}
+            with self.assertRaises(ValueError) as caught:
+                demo._validate({"prompt": "apple", "backend": "rocm", "mode": "reference"})
+            message = str(caught.exception)
+            self.assertIn("rocm", message)
+            self.assertIn("CUDA build", message)
+
+    def test_each_device_runs_under_its_own_interpreter(self):
+        with tempfile.TemporaryDirectory(dir=ROOT / "tmp", prefix="qimg21-test-") as td:
+            root = Path(td)
+            demo = self.make_demo(root)
+            self.assertEqual(demo.reference_python("cuda"), root / "cuda-python")
+            self.assertEqual(demo.reference_python("rocm"), root / "rocm-python")
+            self.assertEqual(demo.reference_python("cpu"), root / "cpu-python")
+            # A CPU reference has no build of its own to require, so an unnamed
+            # --python-cpu falls back to the CUDA environment rather than
+            # inventing a third venv that has to be built first.
+            fallback = Demo(root / "m", root / "q", root / "cuda-python", root / "w",
+                            root / "n", "127.0.0.1", 0)
+            self.assertEqual(fallback.reference_python("cpu"), root / "cuda-python")
+            self.assertEqual(fallback.reference_python("rocm"), root / "cuda-python")
+
+    def test_the_reference_command_carries_the_device(self):
+        with tempfile.TemporaryDirectory(dir=ROOT / "tmp", prefix="qimg21-test-") as td:
+            root = Path(td)
+            demo = self.make_demo(root)
+            for device, python in (("cuda", "cuda-python"), ("rocm", "rocm-python"),
+                                   ("cpu", "cpu-python")):
+                assume_reference(demo, device)
+                cfg = demo._validate({"prompt": "apple", "width": 256, "height": 256,
+                                      "steps": 1, "mode": "reference",
+                                      "reference_device": device})
+                commands = []
+                with mock.patch.object(demo, "_run", side_effect=lambda command, cwd, log, env=None, progress=None: commands.append(command)):
+                    demo._reference(cfg, root / "out")
+                command = commands[0]
+                self.assertEqual(command[command.index("--device") + 1], device)
+                self.assertEqual(command[0], str(root / python))
+                # The driver writes reference.png into the dump directory it was
+                # given, so that is the file the server has to go back for.
+                dump = Path(command[command.index("--dump-dir") + 1])
+                self.assertEqual(dump.name, device)
+                self.assertIn("cuda/qimg21/reference.py", command[1])
+
+    def test_the_returned_reference_path_is_the_file_the_driver_wrote(self):
+        """The server used to hand back a name the driver never wrote, which
+        made every reference request fail reading the image."""
+        with tempfile.TemporaryDirectory(dir=ROOT / "tmp", prefix="qimg21-test-") as td:
+            root = Path(td)
+            demo = self.make_demo(root)
+            assume_reference(demo, "cpu")
+            cfg = demo._validate({"prompt": "apple", "width": 256, "height": 256,
+                                  "steps": 1, "mode": "reference", "reference_device": "cpu"})
+
+            def fake_run(command, cwd, log, env=None, progress=None):
+                # Stand in for the driver: write exactly what it writes.
+                dump = Path(command[command.index("--dump-dir") + 1])
+                dump.mkdir(parents=True, exist_ok=True)
+                (dump / "reference.png").write_bytes(b"png")
+
+            with mock.patch.object(demo, "_run", side_effect=fake_run):
+                image = demo._reference(cfg, root / "out")
+            self.assertTrue(image.is_file(), f"{image} was not written by the run")
+            self.assertTrue(demo._data_url(image).startswith("data:image/png;base64,"))
+
+    def test_a_cpu_compare_says_it_is_not_a_parity_result(self):
+        """A CPU reference runs different kernels on different hardware, so a
+        side-by-side is a look at both pictures rather than agreement."""
+        with tempfile.TemporaryDirectory(dir=ROOT / "tmp", prefix="qimg21-test-") as td:
+            root = Path(td)
+            demo = self.make_demo(root)
+            assume_reference(demo, "cpu")
+
+            def fake_run(command, cwd, log, env=None, progress=None):
+                # Stand in for both drivers: the reference writes into its dump
+                # directory, the native one into --out.
+                if "--dump-dir" not in command:
+                    out = Path(command[command.index("--out") + 1])
+                    out.parent.mkdir(parents=True, exist_ok=True)
+                    out.write_bytes(b"png")
+                    return
+                dump = Path(command[command.index("--dump-dir") + 1])
+                dump.mkdir(parents=True, exist_ok=True)
+                (dump / "reference.png").write_bytes(b"png")
+
+            with mock.patch.object(demo, "_run", side_effect=fake_run), \
+                 mock.patch.object(demo, "_summary", return_value=[]):
+                cpu = demo.generate({"prompt": "apple", "width": 256, "height": 256,
+                                     "steps": 1, "mode": "compare", "reference_device": "cpu"})
+            self.assertIn("note", cpu["reference"])
+            self.assertIn("composition", cpu["reference"]["note"])
+            self.assertEqual(cpu["reference"]["device"], "cpu")
+
+            assume_reference(demo, "cuda")
+            with mock.patch.object(demo, "_run", side_effect=fake_run), \
+                 mock.patch.object(demo, "_summary", return_value=[]):
+                cuda = demo.generate({"prompt": "apple", "width": 256, "height": 256,
+                                      "steps": 1, "mode": "compare", "reference_device": "cuda"})
+            self.assertNotIn("note", cuda["reference"])
+            self.assertEqual(cuda["reference"]["device"], "cuda")
+
+    def test_a_build_probe_classifies_what_it_finds(self):
+        """The health endpoint has to tell the form which reference devices are
+        real, and a CUDA build answering a ROCm request is the case that matters:
+        both report torch.cuda.is_available() == True."""
+        def probe(stdout, returncode=0, stderr=""):
+            return mock.Mock(returncode=returncode, stdout=stdout, stderr=stderr)
+        cases = [
+            ("cuda", '{"torch": "2.14.0+cu130", "hip": null, "cuda": true}', True, ""),
+            ("cuda", '{"torch": "2.14.0+cu130", "hip": null, "cuda": false}', False, "sees no GPU"),
+            ("cuda", '{"torch": "2.9.0+rocm", "hip": "7.2.0", "cuda": true}', False, "ROCm build"),
+            ("rocm", '{"torch": "2.9.0+rocm", "hip": "7.2.0", "cuda": true}', True, ""),
+            ("rocm", '{"torch": "2.14.0+cu130", "hip": null, "cuda": true}', False, "CUDA build"),
+            ("rocm", '{"torch": "2.9.0+rocm", "hip": "7.2.0", "cuda": false}', False, "sees no GPU"),
+            # Any build runs on the CPU, so the CPU route only needs an import.
+            ("cpu", '{"torch": "2.14.0+cu130", "hip": null, "cuda": true}', True, ""),
+        ]
+        for device, stdout, available, fragment in cases:
+            with tempfile.TemporaryDirectory(dir=ROOT / "tmp", prefix="qimg21-test-") as td:
+                root = Path(td)
+                for name in ("cuda-python", "rocm-python", "cpu-python"):
+                    (root / name).write_text("")
+                demo = self.make_demo(root)
+                with mock.patch("subprocess.run", return_value=probe(stdout)):
+                    build = demo.torch_build(device)
+                self.assertEqual(build["available"], available,
+                                 f"{device} {stdout} -> {build}")
+                if not available:
+                    self.assertIn(fragment, build["reason"])
+                self.assertEqual(build["torch"], stdout.split('"torch": "')[1].split('"')[0])
+
+    def test_a_missing_interpreter_is_reported_not_probed(self):
+        with tempfile.TemporaryDirectory(dir=ROOT / "tmp", prefix="qimg21-test-") as td:
+            root = Path(td)
+            demo = self.make_demo(root)
+            with mock.patch("subprocess.run") as run:
+                build = demo.torch_build("rocm")
+            run.assert_not_called()
+            self.assertFalse(build["available"])
+            self.assertIn("no interpreter", build["reason"])
+
+    def test_one_interpreter_is_probed_once_for_two_devices(self):
+        """The CPU and CUDA routes share an interpreter by default, so probing
+        per device would import torch twice for the same answer on every health
+        call."""
+        with tempfile.TemporaryDirectory(dir=ROOT / "tmp", prefix="qimg21-test-") as td:
+            root = Path(td)
+            for name in ("cuda-python", "rocm-python", "cpu-python"):
+                (root / name).write_text("")
+            demo = Demo(root / "model", root / "quant", root / "cuda-python",
+                        root / "work", root / "cuda-native", "127.0.0.1", 0,
+                        native_rocm=root / "rocm-native",
+                        python_rocm=root / "rocm-python")
+            self.assertEqual(demo.reference_python("cpu"), demo.reference_python("cuda"))
+            answer = mock.Mock(returncode=0,
+                               stdout='{"torch": "2.14.0+cu130", "hip": null, "cuda": true}',
+                               stderr="")
+            with mock.patch("subprocess.run", return_value=answer) as run:
+                for _ in range(3):
+                    demo.reference_devices()
+            # Three devices, two distinct interpreters, one call each.
+            self.assertEqual(run.call_count, 2)
+
 
 
 if __name__ == "__main__":
