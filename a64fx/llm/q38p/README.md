@@ -8,10 +8,11 @@ FP32 residual for each prompt chunk to the next stage. Successive prompts
 can occupy different stages at the same time. The benchmark repeats the same
 tokenized prompt with fresh KV and SSM state for each prompt.
 
-The stage cuts minimize the difference between cumulative estimated MAC
-counts. A mixer and its FFN can land on different nodes. The 3-node run on
-job 51917132 exercised cuts at units 43 and 85 and produced the same final
-residual hash as the single-node build.
+The stage cuts minimize the difference between cumulative relative unit costs
+calibrated from an 8-prompt, 1024-token, 12-node run. A mixer and its FFN can
+land on different nodes. The 3-node run on job 51917132 exercised cuts at
+units 43 and 85 and produced the same final residual hash as the single-node
+build.
 
 ## Build and run on Fugaku
 
@@ -66,12 +67,12 @@ passes 256/256 decode but remains near 154 tok/s; the earlier apparent
 162 tok/s `-O3` result came from an incorrect panel. Keep the MPI build at
 its validated `-O2` setting until the pipeline is retested with the fix.
 
-## Measurements, job 51917132
+## Measurements
 
-FP4 model, 1024-token prompt, eight repeated independent prompts. `steady`
-is the seven inter-completion intervals at the final stage. `end-to-end`
-includes pipeline fill and drain; `latency` is the first prompt's completion
-time. State transfer and decode follow those timings when `DECODE=1`.
+FP4 model, 1024-token prompt, eight repeated independent prompts. `steady` is
+the seven inter-completion intervals at the final stage. `end-to-end` includes
+pipeline fill and drain; `latency` is the first prompt's completion time.
+State transfer and decode follow those timings when `DECODE=1`.
 
 | Nodes | Chunk | Steady tok/s | End-to-end tok/s | Latency s | Decode vs F32 |
 | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -84,10 +85,27 @@ time. State transfer and decode follow those timings when `DECODE=1`.
 | 4 | 160 | **544.9** | **521.7** | **2.55** | **256/256** |
 | 4 | 120 | 535.8 | 515.8 | 2.50 | residual hash stable |
 
-After raising the rank limit, a four-node smoke run at chunk 160 measured
-543.3 tok/s steady (135.8 tok/s/node), 520.1 tok/s end-to-end, and matched
-256/256 decode tokens. Six-, eight-, twelve-, and twenty-four-node rates
-remain unmeasured; the 150 tok/s/node figures are targets.
+Six-, eight-, and twelve-node results from interactive job 51918651, using
+chunk 160 and the calibrated partition, were:
+
+| Nodes | Steady tok/s | End-to-end tok/s | Steady tok/s/node | First prompt s | Decode vs F32 |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 6 | 802.7 | 743.0 | 133.8 | 2.10 | 256/256 |
+| 8 | 1074.8 | 964.2 | 134.3 | 1.83 | 256/256 |
+| 12 | 1562.8 | 1316.6 | 130.2 | 1.64 | 256/256 |
+
+The target is 150 tok/s/node (900/1200/1800 steady tok/s at 6/8/12 nodes),
+so these measurements are still below target. The initial 12-node partition
+measured 1555.1 steady tok/s; fitting relative FFN, SSM-mixer, and attention-
+mixer costs to per-rank compute times adjusted the cuts and raised the repeat
+to 1562.8 tok/s. This 0.5% gain is small and does not explain the remaining
+gap.
+
+The 12-node chunk sweep (original partition, decode disabled) measured steady
+rates of 1517.8, 1555.1, 1506.5, 1547.6, 1503.5, and 1388.3 tok/s for chunks
+120, 160, 200, 240, 320, and 480. Chunk 160 remains the best setting. A
+four-node smoke run after raising the rank limit measured 543.3 steady
+(135.8 tok/s/node), 520.1 end-to-end, and matched 256/256 decode tokens.
 
 On four nodes at chunk 480, each stage spent about 12.3 s computing eight
 prompts; upstream stages also spent about 4.7 s in blocking sends. Smaller
@@ -98,4 +116,4 @@ single-prompt path and were removed.
 The pipeline currently replicates the full model on each node and gathers
 state to rank 0 for single-node decode. It does not yet use stage-sharded
 weight images, pre-expanded int16 weights, uTofu handoff, or concurrent TP4
-decode groups. Six- and twelve-node throughput remain unmeasured.
+decode groups. Throughput above 12 nodes remains unmeasured.

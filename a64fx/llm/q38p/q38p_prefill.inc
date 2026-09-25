@@ -35,8 +35,11 @@ static int pp_n = 1, pp_r, pp_prompts = 1, pp_u0, pp_u1, pp_bad, pp_decode;
  * them, which keeps 6-, 8-, 12-, and larger allocations balanced. */
 static void pf_stage_bounds(int n, int rank, int *lo, int *hi) {
     double prefix[2 * NLAYER + 1] = {0};
+    /* Relative unit times fitted to the 12-node, 8x1024, chunk-160 run.
+     * FFN units are substantially more expensive than mixer units; attention
+     * mixers are slightly costlier than SSM mixers. */
     for (int u = 0; u < 2 * NLAYER; u++)
-        prefix[u + 1] = prefix[u] + ((u & 1) ? 267.4 : (E.L[u / 2].ssm ? 115.8 : 104.9));
+        prefix[u + 1] = prefix[u] + ((u & 1) ? 566.1 : (E.L[u / 2].ssm ? 294.8 : 326.6));
     /* One rank per mixer/FFN unit is the architectural limit. */
     int cut[Q38P_MAX_STAGES + 1] = {0};
     for (int s = 1; s < n; s++) {

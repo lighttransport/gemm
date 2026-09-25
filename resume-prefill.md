@@ -8,8 +8,8 @@ Code is in `a64fx/llm/q38p/`: `q38p_prefill.inc` is included into
 ## Goal (user decisions)
 
 - An optimized prefill that scales over 1-128 A64FX nodes (one rank per
-  mixer/FFN unit); near-term configurations are 6, 8, and 12 nodes, with a
-  24-node run to exercise counts above 12.
+  mixer/FFN unit); near-term configurations are 6, 8, and 12 nodes. The
+  current allocation and benchmark work stops at 12 nodes.
 - Prefill and decode time-share the same nodes, e.g. 12-node prefill plus 3 TP4 decode groups.
 - The metric is **steady-state prefill throughput** with several prompts in
   flight; single-prompt latency is reported as well.
@@ -28,8 +28,9 @@ Code is in `a64fx/llm/q38p/`: `q38p_prefill.inc` is included into
 | 12 | 3001 | 2701 |
 
 - Practical pipeline target: **150 tok/s per node**. That corresponds to
-  900 tok/s on 6 nodes, 1200 on 8, 1800 on 12, and 3600 on 24. The best
-  measured four-node rate is 544.9 tok/s (136.2 per node), below target.
+  900 tok/s on 6 nodes, 1200 on 8, 1800 on 12, and 3600 on 24. The latest
+  six/eight/twelve-node steady rates are 802.7/1074.8/1562.8 tok/s, or
+  133.8/134.3/130.2 tok/s per node, below target.
 
 - A different weight layout from decode is allowed as long as everything
   fits in HBM2 (about 28 GB usable per node).
@@ -113,6 +114,16 @@ state gather. On 4 nodes, single-prompt latency was 2.55 s and end-to-end
 throughput including fill/drain was 521.7 tok/s. Build/run instructions and
 the chunk sweep are in `a64fx/llm/q38p/README.md`.
 
+**Six/eight/twelve-node validation, interactive job 51918651:** At 8 prompts,
+1024 tokens, and chunk 160, calibrated-partition runs measured 802.7/1074.8/
+1562.8 steady tok/s and 743.0/964.2/1316.6 end-to-end tok/s for 6/8/12 nodes.
+Each decode comparison matched 256/256 tokens. Fitting relative FFN, SSM-mixer,
+and attention-mixer costs to the per-rank times adjusted the stage cuts; the
+12-node steady result improved only 0.5%. A 12-node chunk sweep found chunk
+160 best among 120/160/200/240/320/480. The 150 tok/s/node target remains
+unmet; no 24-node job was submitted. Detailed results are in
+`a64fx/llm/q38p/README.md`.
+
 **Single-node 200 tok/s investigation, job 51917132:** A fresh 1024-token
 baseline was 154.6 tok/s (6.624 s); GEMM was 5.668 s, including 4.820 s in
 the int16 kernel, 0.408 s in F4 expansion and 0.314 s in output epilogues.
@@ -169,9 +180,10 @@ the fresh F32 reference 256/256 (maximum logit difference 0.5504).
    currently assumes an FP4 model with a Q6_K embedding).
 
 ### Multi-node (Phases 2-4)
-8. The launcher and stage partitioner now accept 2-128 nodes. Run the 6-,
-   8-, and 12-node sweep plus the 24-node validation config; report steady
-   throughput against 150 tok/s/node and single-prompt latency.
+8. The launcher and stage partitioner accept 2-128 nodes. The 6/8/12 sweep is
+   complete with correct decode; continue optimizing toward 150 tok/s/node.
+   The 12-node chunk sweep found 160 best, and measured throughput is still
+   16-20 tok/s/node short on steady throughput; end-to-end rates remain lower because they include pipeline fill and drain.
 9. Replace the working MPI handoff with uTofu Put plus MRQ completion.
    `utofu-tests/pp_handoff_bench.c` measured 3.2 us for a 12 KB hop and
    6.3 GB/s per link. MPI nonblocking sends without a progress thread were
@@ -216,14 +228,14 @@ Environment switches:
 
 > Continue the A64FX Qwen3.8-27B prefill work: read resume-prefill.md and the
 > plan in /home/syoyo/.claude/plans/idempotent-frolicking-bengio.md. The
-> latest verified state includes a 2–4-node MPI pipeline with 256/256
-> decode agreement. At 4 nodes and chunk 160 it sustains 544.9 tok/s across
+> latest verified state includes a 6/8/12-node MPI pipeline with 256/256
+> decode agreement. At 12 nodes and chunk 160 it sustains 1562.8 tok/s across
 > eight prompts; see `a64fx/llm/q38p/README.md`.
 > Continue with the remaining items:
 > - single-node GEMM gap, kernel epilogue, expansion, SSM, attention and
 >   norm costs, toward 225 tok/s (90% of the 250 tok/s/node int16 bound);
-> - measure the 6-, 8-, 12-, and 24-node configurations (150 tok/s/node
->   target), then stage-shard weights and replace MPI handoff with uTofu;
+> - reduce the remaining gap to 150 tok/s/node, then stage-shard weights and
+>   replace MPI handoff with uTofu;
 > - move the validated rank-0 decode handoff to co-resident TP4 groups.
 >
 > Keep every change 256/256 against the F32 reference and commit each unit.
