@@ -68,6 +68,7 @@ Code is in `a64fx/llm/q38p/`: `q38p_prefill.inc` is included into
 | v1 | 122.8 | 1200 tokens computed because of chunk padding |
 | v2 | 142.9 | occupied groups only, vector epilogue, chunk 480 |
 | v3 | **150.2** | tail splitting (`Q38P_TAIL=1`) and faster activation packing, commit 41025342 |
+| v4 | **154.7** | token-major GEMM output stores, job 51917132 |
 
 - The max logit diff against F32 is 0.886 (decode path: 0.197). It is
   identical across chunk sizes.
@@ -80,12 +81,26 @@ Code is in `a64fx/llm/q38p/`: `q38p_prefill.inc` is included into
   - The kernel MAC rate is 84.6% of peak.
 - The overall rate is 60% of the bound.
 
+**2026-09-26 continuation, job 51917132:** At chunk 480, the GEMM
+worker-mean profile before the change was expansion 0.407 s, kernel 4.793 s,
+output epilogue 0.467 s, zeroing 0.020 s, dispatch 0.003 s and barrier waits
+0.069 s. Reordering the epilogue to write all 32 adjacent rows of one token
+before moving to the next cut epilogue time to 0.304 s and GEMM wall time
+from 5.795 to 5.668 s. Throughput rose from 151.2 to 154.7 tok/s, with
+256/256 decode agreement and unchanged maximum logit difference (0.8857).
+Chunk 640 tied at 154.8 tok/s; chunk 1025 was slower at 152.3 tok/s, so
+chunk 480 remains the measured setting. At 4096 prompt tokens, the same
+change produced 142.2 tok/s and matched a fresh F32 reference 256/256
+(maximum logit difference 0.5504). Attention took 4.791 s of the 28.809 s
+prefill, up from 0.150 s at 1024 tokens. Logs are preserved in
+`tmp/q38p/job51917132/`. The final compiled source repeated the 1024-token
+gate at 154.5 tok/s and 256/256 agreement.
+
 ## Remaining items
 
 ### Single node (toward 225 tok/s)
-1. Check that the GEMM wall-time gap
-   (gemm minus kernel minus expand, about 0.6 s) is closing, and profile it
-   (memset, epilogue, barrier waits, per-GEMM imbalance).
+1. Continue reducing the GEMM gap. The epilogue is now about 0.30 s;
+   barriers 0.07 s and zeroing 0.02 s. Profile per-GEMM imbalance next.
 2. Kernel: gain the last points (epilogue cost about 4%).
    - `movprfx` from a zero register instead of `dup` zeroing.
    - Overlap group boundaries.
@@ -101,9 +116,8 @@ Code is in `a64fx/llm/q38p/`: `q38p_prefill.inc` is included into
 5. Attention (0.15 s at L=1024, grows with L): block queries so K/V are
    reused from L1/L2 (flash-style, several queries per K block).
 6. norm+quant (0.20 s): fuse with the GEMM epilogue or residual add.
-7. Test L=4096 (reference `/local/q38/ref-f32-4096.log` or equivalent;
-   check the stage hook) and the FP6 image (the path currently assumes an
-   FP4 model with a Q6_K embedding).
+7. L=4096 passed 256/256 on job 51917132. Test the FP6 image (the path
+   currently assumes an FP4 model with a Q6_K embedding).
 
 ### Multi-node (Phases 2-4)
 8. Transport:
@@ -169,7 +183,8 @@ Environment switches:
 
 > Continue the A64FX Qwen3.8-27B prefill work: read resume-prefill.md and the
 > plan in /home/syoyo/.claude/plans/idempotent-frolicking-bengio.md. The
-> latest verified state is commit 41025342 (1 node, 150.2 tok/s, 256/256).
+> latest verified state is the 2026-09-26 epilogue change (1 node,
+> 154.7 tok/s at chunk 480, 256/256); see the continuation section above.
 > Continue with the remaining items:
 > - single-node GEMM gap, kernel epilogue, expansion, SSM, attention and
 >   norm costs, toward 225 tok/s (90% of the 250 tok/s/node int16 bound);

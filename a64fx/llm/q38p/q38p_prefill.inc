@@ -280,7 +280,7 @@ static void pf_quant_zero(int K, int t) {
 /* GEMM: Y[t][row] = sum_k W[row][k] x_t[k] for all matrices in the list  */
 
 typedef struct { const q38p_mat *P; float *y; int ystride; } pf_job;
-static double pf_t_expand[NT], pf_t_mk[NT];
+static double pf_t_expand[NT], pf_t_mk[NT], pf_t_zero[NT], pf_t_epilogue[NT], pf_t_dispatch[NT], pf_t_barrier[NT];
 static int pf_tail_split = 1;
 /* Work units: whole tiles in full rounds of NT, then the remaining tiles
  * split into token-group parts so that every worker gets a similar share. */
@@ -298,6 +298,7 @@ static void pf_gemm(int tid, const pf_job *jobs, int nj, int K, int *gs) {
     int nkb = K / PF_KB;
     double *O = PB.acc[tid];
     int16_t *Wt = PB.wt[tid];
+    uint64_t dispatch_start = ticks();
     for (;;) {
         int u = atomic_fetch_add_explicit(ctr, 1, memory_order_relaxed);
         if (u >= units) break;
@@ -309,7 +310,10 @@ static void pf_gemm(int tid, const pf_job *jobs, int nj, int K, int *gs) {
         while (it >= jobs[j].P->ntile) { it -= jobs[j].P->ntile; j++; }
         const q38p_mat *P = jobs[j].P;
         const int gn = g1 - g0;
+        uint64_t zero_start = ticks();
+        pf_t_dispatch[tid] += zero_start - dispatch_start;
         memset(O, 0, (size_t)gn * PF_R * PF_T * 8 * sizeof(double));
+        pf_t_zero[tid] += ticks() - zero_start;
         for (int kb = 0; kb < nkb; kb++) {
             uint64_t a = ticks();
             const int16_t *W;
@@ -320,26 +324,39 @@ static void pf_gemm(int tid, const pf_job *jobs, int nj, int K, int *gs) {
             pf_t_expand[tid] += b - a; pf_t_mk[tid] += ticks() - b;
         }
         /* epilogue: O[g][q][tt][r] * rscale -> Y[g*T+tt][row] */
+        uint64_t epilogue_start = ticks();
         const q38d_mat *m = P->m;
         int c = P->tile_c[it], nrows = m->first[c + 1] - m->first[c];
         const svbool_t pd = svptrue_b64();
+        int row[PF_R], nr[PF_R], nq = 0;
         for (int q = 0; q < PF_R; q++) {
             int lr = P->tile_r0[it] + q * 8;
             if (lr >= nrows) break;
-            int row = m->first[c] + lr, nr = nrows - lr < 8 ? nrows - lr : 8;
-            const svbool_t pr = svwhilelt_b64(0, nr);
-            svfloat64_t rs = svcvt_f64_f32_x(pd, svreinterpret_f32_u64(svld1uw_u64(pr, (const uint32_t *)(P->rscale + row))));
-            for (int g = 0; g < gn; g++)
-                for (int tt = 0; tt < PF_T; tt++) {
-                    int tok = (g0 + g) * PF_T + tt;
-                    if (tok >= PB.ntok) break;
-                    svfloat64_t v = svmul_f64_x(pd, svld1_f64(pd, O + (((size_t)g * PF_R + q) * PF_T + tt) * 8), rs);
-                    svst1w_u64(pr, (uint32_t *)(jobs[j].y + (size_t)tok * jobs[j].ystride + row),
-                               svreinterpret_u64_f32(svcvt_f32_f64_x(pd, v)));
-                }
+            row[q] = m->first[c] + lr;
+            nr[q] = nrows - lr < 8 ? nrows - lr : 8;
+            nq++;
         }
+        /* Y is token-major: finish adjacent row vectors before moving to
+         * the next token, so their partial cache lines stay resident. */
+        for (int g = 0; g < gn; g++)
+            for (int tt = 0; tt < PF_T; tt++) {
+                int tok = (g0 + g) * PF_T + tt;
+                if (tok >= PB.ntok) break;
+                float *y = jobs[j].y + (size_t)tok * jobs[j].ystride;
+                for (int q = 0; q < nq; q++) {
+                    svbool_t pr = svwhilelt_b64(0, nr[q]);
+                    svfloat64_t rs = svcvt_f64_f32_x(pd, svreinterpret_f32_u64(svld1uw_u64(pr, (const uint32_t *)(P->rscale + row[q]))));
+                    svfloat64_t v = svmul_f64_x(pd, svld1_f64(pd, O + (((size_t)g * PF_R + q) * PF_T + tt) * 8), rs);
+                    svst1w_u64(pr, (uint32_t *)(y + row[q]), svreinterpret_u64_f32(svcvt_f32_f64_x(pd, v)));
+                }
+            }
+        dispatch_start = ticks();
+        pf_t_epilogue[tid] += dispatch_start - epilogue_start;
     }
+    uint64_t barrier_start = ticks();
+    pf_t_dispatch[tid] += barrier_start - dispatch_start;
     gbarrier(tid, gs);
+    pf_t_barrier[tid] += ticks() - barrier_start;
 }
 
 /* ---------------------------------------------------------------- */
@@ -595,7 +612,16 @@ static void q38p_prefill(int tid, const int *tok, int pn, int *gs) {
         if (tid == 0) inited = 1;
         gbarrier(tid, gs);
     }
-    if (tid == 0) { pf_active = 1; memset(pf_t, 0, sizeof pf_t); }
+    if (tid == 0) {
+        pf_active = 1;
+        memset(pf_t, 0, sizeof pf_t);
+        memset(pf_t_expand, 0, sizeof pf_t_expand);
+        memset(pf_t_mk, 0, sizeof pf_t_mk);
+        memset(pf_t_zero, 0, sizeof pf_t_zero);
+        memset(pf_t_epilogue, 0, sizeof pf_t_epilogue);
+        memset(pf_t_dispatch, 0, sizeof pf_t_dispatch);
+        memset(pf_t_barrier, 0, sizeof pf_t_barrier);
+    }
     for (int pos0 = 0; pos0 < pn; pos0 += PF_N) {
         if (tid == 0) { PB.pos0 = pos0; PB.ntok = pn - pos0 < PF_N ? pn - pos0 : PF_N; PB.ng = (PB.ntok + PF_T - 1) / PF_T; }
         gbarrier(tid, gs);
@@ -620,8 +646,12 @@ static void q38p_report(int pn, double sec) {
     for (int i = 0; i < PT_N; i++) tot += pf_t[i];
     fprintf(stderr, "q38p: prefill %d tok in %.3f s = %.1f tok/s (chunk %d); phases s:", pn, sec, pn / sec, PF_N);
     for (int i = 0; i < PT_N; i++) fprintf(stderr, " %s=%.3f", pf_tname[i], pf_t[i] / hz);
-    double e = 0, k = 0;
-    for (int i = 0; i < NT; i++) { e += pf_t_expand[i]; k += pf_t_mk[i]; }
-    fprintf(stderr, "\nq38p: gemm worker-mean s: expand=%.3f kernel=%.3f; kernel MAC rate %.1f%% of int16 peak\n",
-            e / NT / hz, k / NT / hz, 100.0 * (24.350556e9 * ((pn + PF_T - 1) / PF_T * PF_T)) / ((k / NT / hz) * 48 * 2e9 * 64));
+    double e = 0, k = 0, z = 0, ep = 0, d = 0, b = 0;
+    for (int i = 0; i < NT; i++) {
+        e += pf_t_expand[i]; k += pf_t_mk[i]; z += pf_t_zero[i];
+        ep += pf_t_epilogue[i]; d += pf_t_dispatch[i]; b += pf_t_barrier[i];
+    }
+    fprintf(stderr, "\nq38p: gemm worker-mean s: expand=%.3f kernel=%.3f zero=%.3f epilogue=%.3f dispatch=%.3f barrier=%.3f; kernel MAC rate %.1f%% of int16 peak\n",
+            e / NT / hz, k / NT / hz, z / NT / hz, ep / NT / hz, d / NT / hz, b / NT / hz,
+            100.0 * (24.350556e9 * ((pn + PF_T - 1) / PF_T * PF_T)) / ((k / NT / hz) * 48 * 2e9 * 64));
 }
