@@ -1362,12 +1362,21 @@ static void ssm_prefetch_state(int layer, int h) {
 /* ------------------------------------------------------------------ */
 /* attention (CMG c owns KV head c and query heads 6c..6c+5)            */
 
+/* per-token RoPE table (filled before the layers; same cosf/sinf values) */
+static int rope_pos = -1;
+static float rope_c[32], rope_s[32];
+static void rope_fill(int pos) {
+    for (int j = 0; j < 32; j++) { float th = (float)pos * E.inv_freq[j]; rope_c[j] = cosf(th); rope_s[j] = sinf(th); }
+    rope_pos = pos;
+}
 static void head_rmsnorm_rope(float *v, const float *w, int pos) {
     float inv = 1.0f / sqrtf(sumsq(v, HD) / HD + E.eps);
     for (int i = 0; i < HD; i++) v[i] = v[i] * inv * w[i];
+    const int tab = pos == rope_pos;
     for (int j = 0; j < 32; j++) {
-        float th = (float)pos * E.inv_freq[j];
-        float cs = cosf(th), sn = sinf(th);
+        float cs, sn;
+        if (tab) { cs = rope_c[j]; sn = rope_s[j]; }
+        else { float th = (float)pos * E.inv_freq[j]; cs = cosf(th); sn = sinf(th); }
         float a = v[j], b = v[j + 32];
         v[j] = a * cs - b * sn;
         v[j + 32] = a * sn + b * cs;
@@ -1481,31 +1490,31 @@ static void attention_io(int layer, int tid, int pos, int *csense, const q38d_io
     uint64_t T3 = tid ? 0 : ticks();
     ATT_BAR();
     if (!tid) { uint64_t T4 = ticks(); att_t[0] += T1 - T0; att_t[1] += T2 - T1; att_t[2] += T3 - T2; att_t[3] += T4 - T3; }
-    if (l < 6) {
-        int hq = 6 * c + l;
+    /* merge: 48 tasks (6 heads x 8 chunks of 32 dims) over the group's lanes */
+    for (int task = l; task < 6 * (HD / 32); task += GW) {
+        int hh = task / (HD / 32), ch = task % (HD / 32), hq = 6 * c + hh;
+        const size_t hs = (size_t)hh * (2 + HD);
         float M = -INFINITY;
         for (int i = 0; i < GW; i++) {
-            float mi = E.apart[c][(size_t)i * 6 * (2 + HD) + l * (2 + HD)];
+            float mi = E.apart[c][(size_t)i * 6 * (2 + HD) + hs];
             if (mi > M) M = mi;
         }
-        float o[HD], den = 0;
-        memset(o, 0, sizeof o);
+        svfloat32_t o0 = svdup_n_f32(0), o1 = o0;
+        float den = 0;
         for (int i = 0; i < GW; i++) {
-            const float *pp = E.apart[c] + (size_t)i * 6 * (2 + HD) + l * (2 + HD);
+            const float *pp = E.apart[c] + (size_t)i * 6 * (2 + HD) + hs;
             if (pp[1] == 0) continue;
             float w = q38d_expf(pp[0] - M);
             den += w * pp[1];
-            for (int j = 0; j < HD; j += 16)
-                svst1_f32(pf, o + j, svmla_n_f32_x(pf, svld1_f32(pf, o + j), svld1_f32(pf, pp + 2 + j), w));
+            o0 = svmla_n_f32_x(pf, o0, svld1_f32(pf, pp + 2 + 32 * ch), w);
+            o1 = svmla_n_f32_x(pf, o1, svld1_f32(pf, pp + 2 + 32 * ch + 16), w);
         }
-        const float *gate = io->qg + (size_t)hq * 2 * HD + HD;
-        float *dst = io->o + (size_t)hq * HD;
+        const float *gate = io->qg + (size_t)hq * 2 * HD + HD + 32 * ch;
+        float *dst = io->o + (size_t)hq * HD + 32 * ch;
         float rden = 1.0f / den;
-        for (int j = 0; j < HD; j += 16) {
-            svfloat32_t gv = q38d_sigmoid_sve(pf, svld1_f32(pf, gate + j));
-            svst1_f32(pf, dst + j, svmul_f32_x(pf, svmul_n_f32_x(pf, svld1_f32(pf, o + j), rden), gv));
-        }
-        if (E.arith != Q38D_F32) q38d_prepare_range(io->act_o, io->o, hq * 8, hq * 8 + 8);
+        svst1_f32(pf, dst, svmul_f32_x(pf, svmul_n_f32_x(pf, o0, rden), q38d_sigmoid_sve(pf, svld1_f32(pf, gate))));
+        svst1_f32(pf, dst + 16, svmul_f32_x(pf, svmul_n_f32_x(pf, o1, rden), q38d_sigmoid_sve(pf, svld1_f32(pf, gate + 16))));
+        if (E.arith != Q38D_F32) q38d_prepare_range(io->act_o, io->o, hq * 8 + ch, hq * 8 + ch + 1);
     }
 #undef ATT_BAR
 }
@@ -1837,6 +1846,7 @@ static void step(int tid, int token, int pos, int want_head, int *gs, int *cs) {
     pf_pos = pos;
     ssq_valid = 0;
     tp_ssq_ok = 0;
+    if (tid == NT - 1) rope_fill(pos);   /* visible to all after the embed barrier */
     embed_token(tid, token);
     phase_end(tid, gs, &t, P_EMBED);
     for (int layer = 0; layer < NLAYER; layer++) layer_body(tid, layer, pos, gs, cs, &t);
