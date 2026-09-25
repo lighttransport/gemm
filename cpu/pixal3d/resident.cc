@@ -301,8 +301,10 @@ Vec flow_resident(Engine &e, Weights &w, const Vec &input, const Coords &coords,
     e.inplace(PX_SILU, tm, c);
     tm = e.linear(tm, w, "t_embedder.mlp.2");
     e.inplace(PX_SILU, tm, c);
-    auto modulation = e.linear(tm, w, "adaLN_modulation.1", linear_precision);
-    auto hidden = e.linear(e.upload(input), w, "input_layer", linear_precision);
+    // Boundary layers stay FP32 as upstream and the CPU path do; the BF16 mode
+    // then rounds their outputs like upstream's manual_cast.
+    auto modulation = e.linear(tm, w, "adaLN_modulation.1");
+    auto hidden = e.linear(e.upload(input), w, "input_layer");
     for (Tensor *x : {&modulation, &hidden})
         e.inplace(PX_ROUND, *x, 1, bf);
     auto cached = e.condition(w, global_input, projected_input, coords, bf ? 1 : 0);
@@ -349,6 +351,6 @@ Vec flow_resident(Engine &e, Weights &w, const Vec &input, const Coords &coords,
         e.inplace(PX_RESIDUAL, hidden, c, op_precision, h, mod, 0, 5 * c);
     }
     auto h = e.operation(PX_NORM, hidden, c, 0, {}, {}, 0, 0, 1e-5f);
-    return e.download(e.linear(h, w, "out_layer", linear_precision));
+    return e.download(e.linear(h, w, "out_layer"));
 }
 } // namespace px

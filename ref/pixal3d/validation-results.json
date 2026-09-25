@@ -2165,7 +2165,7 @@
         "output_sha256": "b510f666a29deaec140dc30e526e7d3a9c3ed8f0074213c64cc87f9d0e722387",
         "timing_interpretation": "Correctness run under desktop contention; controlled medians in cpu/pixal3d/OPTIMIZATION.md remain the performance reference."
       },
-      "mixed_pytorch_trajectories": {
+      "fp32_pytorch_trajectories": {
         "command_template": [
           "ref/pixal3d/run.sh",
           "cuda",
@@ -2173,7 +2173,9 @@
           "--dump-dir",
           "tmp/pixal3d/resident-runs/cuda-house/dumps",
           "--stage",
-          "STAGE"
+          "STAGE",
+          "--precision",
+          "fp32"
         ],
         "pytorch": "project .venv-cuda, Torch 2.7.1+cu128, model dtype FP32, TF32 disabled",
         "runs": [
@@ -2208,6 +2210,92 @@
             "nrmse": 1.092619912500301e-06,
             "cosine": 0.9999999999994486,
             "max_abs": 2.580881118774414e-05
+          }
+        ],
+        "note": "Recorded before 2026-09-25 as mixed. validate_mixed_trajectory.py passed a zero flow-request flag, which selects the FP32 flow, so these are FP32-mode trajectories."
+      },
+      "mixed_pytorch_trajectories": {
+        "command_template": [
+          "ref/pixal3d/run.sh",
+          "cuda",
+          "ref/pixal3d/validate_mixed_trajectory.py",
+          "--dump-dir",
+          "tmp/pixal3d/resident-runs/cuda-house/dumps",
+          "--stage",
+          "STAGE"
+        ],
+        "pytorch": "project .venv-cuda, Torch 2.7.1+cu128, model dtype FP32, TF32 disabled",
+        "note": "Production mixed mode (BF16 GEMM inputs and attention, FP32 accumulation and pointwise) against the FP32 PyTorch sampler. CFG 7.5 amplifies BF16 differences over twelve steps; FP32 boundary layers (input_layer, adaLN_modulation, out_layer) reduce the drift.",
+        "gate": {
+          "nrmse_max": 0.08,
+          "cosine_min": 0.997
+        },
+        "bf16_boundary_layers": [
+          {
+            "stage": "structure",
+            "tokens": 4096,
+            "steps": 12,
+            "nrmse": 0.10519831600076737,
+            "cosine": 0.9944772421955077,
+            "max_abs": 1.7452603578567505
+          },
+          {
+            "stage": "shape512",
+            "tokens": 2423,
+            "steps": 12,
+            "nrmse": 0.024430830294517807,
+            "cosine": 0.9997015482142082,
+            "max_abs": 0.8380449414253235
+          },
+          {
+            "stage": "shape1024",
+            "tokens": 10765,
+            "steps": 12,
+            "nrmse": 0.05096554533567245,
+            "cosine": 0.9987008075636563,
+            "max_abs": 2.5267984867095947
+          },
+          {
+            "stage": "texture",
+            "tokens": 10765,
+            "steps": 12,
+            "nrmse": 0.012329466305174034,
+            "cosine": 0.9999264089687523,
+            "max_abs": 0.07360339164733887
+          }
+        ],
+        "runs": [
+          {
+            "stage": "structure",
+            "tokens": 4096,
+            "steps": 12,
+            "nrmse": 0.06494330000187282,
+            "cosine": 0.997896442631945,
+            "max_abs": 1.2386523485183716
+          },
+          {
+            "stage": "shape512",
+            "tokens": 2423,
+            "steps": 12,
+            "nrmse": 0.02230148195753234,
+            "cosine": 0.9997512952336169,
+            "max_abs": 0.7455212771892548
+          },
+          {
+            "stage": "shape1024",
+            "tokens": 10765,
+            "steps": 12,
+            "nrmse": 0.047108848564606016,
+            "cosine": 0.99889037949564,
+            "max_abs": 2.080708146095276
+          },
+          {
+            "stage": "texture",
+            "tokens": 10765,
+            "steps": 12,
+            "nrmse": 0.002812903200023882,
+            "cosine": 0.9999963796408006,
+            "max_abs": 0.024972081184387207
           }
         ]
       },

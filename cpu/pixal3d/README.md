@@ -286,11 +286,13 @@ Floating-point reductions differ between BLAS backends. Values close to zero
 can change occupancy/subdivision decisions: seeds do not guarantee bit-identical
 meshes across CPU/CUDA/ROCm. Reference tests separately measure continuous feature
 error and exact coordinate expansion with shared subdivision decisions.
-Isolated checkpoint-stage tests pass their 2% NRMSE bound. The recommended
-mixed mode also passes complete twelve-step comparisons against pinned FP32
-PyTorch for all four stages: NRMSE ranges from `1.09e-6` to `7.11e-5`. Pure
-BF16 accumulated structure/shape trajectories remain diagnostic and can differ
-substantially across PyTorch CUDA/ROCm backends. See the measured comparisons in
+Isolated checkpoint-stage tests pass their 2% NRMSE bound. Complete
+twelve-step trajectories against pinned FP32 PyTorch reach NRMSE `1.09e-6` to
+`7.11e-5` in `fp32` flow mode. The recommended `mixed` mode drifts further
+because CFG amplifies BF16 GEMM differences: `0.0028` (texture) to `0.065`
+(structure), with FP32 boundary layers. Pure BF16 accumulated structure/shape
+trajectories remain diagnostic and can differ substantially across PyTorch
+CUDA/ROCm backends. See the measured comparisons in
 the [reference validation record](../../ref/pixal3d/README.md).
 
 Use `--dump-dir DIR` to save preprocessing, conditioning, noise, every diffusion

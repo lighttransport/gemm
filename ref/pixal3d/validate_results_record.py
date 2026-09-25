@@ -84,11 +84,17 @@ assert optimization["final_budget_matrix"]["outputs_exact"]
 assert optimization["complete_generation_reference"]["outputs_exact"]
 assert len(optimization["rejected_experiments"]) == 3
 assert all(item["decision"] == "removed" for item in optimization["rejected_experiments"])
-trajectories = optimization["mixed_pytorch_trajectories"]["runs"]
-assert {item["stage"] for item in trajectories} == {
-    "structure", "shape512", "shape1024", "texture",
-}
+stages = {"structure", "shape512", "shape1024", "texture"}
+trajectories = optimization["fp32_pytorch_trajectories"]["runs"]
+assert {item["stage"] for item in trajectories} == stages
 assert max(item["nrmse"] for item in trajectories) < .001
+mixed = optimization["mixed_pytorch_trajectories"]
+assert {item["stage"] for item in mixed["runs"]} == stages
+assert max(item["nrmse"] for item in mixed["runs"]) < mixed["gate"]["nrmse_max"]
+assert min(item["cosine"] for item in mixed["runs"]) > mixed["gate"]["cosine_min"]
+for item in mixed["runs"]:
+    before = next(b for b in mixed["bf16_boundary_layers"] if b["stage"] == item["stage"])
+    assert item["nrmse"] < before["nrmse"]
 
 followup = extended["main_release_followup"]
 assert followup["service"]["per_view_masks"]

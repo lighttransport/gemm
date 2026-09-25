@@ -303,17 +303,36 @@ The modes are exposed by the CLI as `--gpu-flow-precision bf16|mixed|fp32`;
 `mixed` is the GPU default and provides the recommended quality/speed tradeoff.
 Reproduce the isolated experiment with
 `validate_flow_precision.py --stage structure --precision bf16|mixed|fp32`. Full
-twelve-step structure sampling from identical native noise and conditioning
-was also compared to the matching FP32 PyTorch sampler on the RTX 5060 Ti.
-All four cascade trajectories pass the `<0.001` NRMSE target without switching
-their BF16 GEMMs or self-attention to FP32:
+twelve-step sampling from identical native noise and conditioning was also
+compared to the matching FP32 PyTorch sampler on the RTX 5060 Ti.
 
-| Stage | Tokens | Mixed NRMSE | Cosine | Max abs |
+Until 2026-09-25 `validate_mixed_trajectory.py` passed a zero flow-request
+flag, which selects the FP32 flow, so the table published here as "mixed"
+measured FP32 mode. Those FP32 numbers are unchanged and remain below the
+`<0.001` target:
+
+| Stage | Tokens | FP32 NRMSE | Cosine | Max abs |
 |---|---:|---:|---:|---:|
 | Structure | 4096 | 0.0000711 | 0.9999999975 | 0.001858 |
 | Shape-512 | 2423 | 0.00000945 | 0.99999999996 | 0.000231 |
 | Shape-1024 | 10765 | 0.0000247 | 0.99999999970 | 0.001926 |
 | Texture | 10765 | 0.00000109 | 0.999999999999 | 0.0000258 |
+
+The validator now runs the configured mode (`--precision mixed|fp32|bf16`,
+default mixed). Mixed mode drifts further over twelve CFG-7.5 steps. Running
+the resident flow's `input_layer`, `adaLN_modulation.1` and `out_layer` in FP32
+(upstream and the CPU path already do; they had been BF16 GEMMs) reduces the
+drift on every stage at negligible cost:
+
+| Stage | Mixed NRMSE, BF16 boundaries | Mixed NRMSE, FP32 boundaries | Cosine |
+|---|---:|---:|---:|
+| Structure | 0.1052 | 0.0649 | 0.99790 |
+| Shape-512 | 0.0244 | 0.0223 | 0.99975 |
+| Shape-1024 | 0.0510 | 0.0471 | 0.99889 |
+| Texture | 0.0123 | 0.0028 | 0.999996 |
+
+The mixed gate is NRMSE `<0.08` and cosine `>0.997`: a regression guard, not a
+parity claim.
 
 Texture includes the saved Shape-1024 latent as its concatenated condition, so
 the check also covers that cross-stage input. Reproduce one stage or iterate all

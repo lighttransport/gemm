@@ -91,7 +91,8 @@ Important measured results:
 - Evaluated packed flow activations and a larger GEMM tile at full-stage and
   complete-generation scale. Both packing variants and the 4096-row schedule
   were removed because they did not improve reserved memory and end-to-end
-  time. Current mixed trajectories remain below `0.001` NRMSE for all stages.
+  time. FP32-mode trajectories remain below `0.001` NRMSE for all stages;
+  mixed-mode trajectories drift `0.0028`-`0.065` (see `OPTIMIZATION.md`).
 - Reconciled performance wording across native, optimization, reference, web,
   and resume documentation; retained timings now identify mode, fixture,
   concurrency and serialization scope.
