@@ -157,6 +157,9 @@ def main() -> int:
     ap.add_argument("--vae-tile-overlap", type=int, default=8)
     ap.add_argument("--vae-tile-bleed", type=int, default=2,
                     help="latent tokens discarded at each decode tile edge; must be <= half the overlap")
+    ap.add_argument("--profile-steps", action="store_true",
+                    help="have the fast denoiser report each step's device time in ms "
+                         "(adds a per-step sync, about 1.4%% on low8)")
     ap.add_argument("--steps", type=int, default=2)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--initial-latents", type=Path,
@@ -226,6 +229,8 @@ def main() -> int:
         ap.error("tiled generation needs --runner fast; the parity harness has no tile path")
     if args.upscale <= 0.0:
         ap.error("--upscale must be positive")
+    if args.profile_steps and args.runner != "fast":
+        ap.error("--profile-steps needs --runner fast; the parity harness has no --profile")
     if args.tile_tokens is not None and not tiled:
         ap.error("--tile-tokens needs --upscale above 1: tiling refines a base grid, "
                  "and without one there is nothing to refine")
@@ -481,6 +486,8 @@ def main() -> int:
                    "--prompt-embeds", str(prompt_path),
                    "--height-tokens", str(gh), "--width-tokens", str(gw),
                    "--steps", str(steps), "--out", str(out), *extra]
+        if args.profile_steps:
+            command.append("--profile")
         if args.image:
             from editing_inputs import write_layout
             suffix = "" if target_hw is None else f"_{target_hw[0]}x{target_hw[1]}"
