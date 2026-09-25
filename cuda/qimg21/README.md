@@ -1823,3 +1823,80 @@ same native 1024x1024 denoiser executable and streamed-weight layout was
 previously sampled at **1,948 MiB**; the shared native F32 decoder peaked at
 **3,112 MiB**, as recorded above. These are observed process peaks, not an
 allocator-enforced cap. Fixtures, decoded images and logs remain ignored.
+
+## Fast denoiser (`test_cuda_qimg21_fast`)
+
+`test_cuda_qimg21_fast` is the production-oriented CUDA denoiser. The parity
+harness `test_cuda_qimg21_native` stays unchanged as the numerical oracle.
+The fast runner reproduces the harness's exact-mode arithmetic (vector4
+Welford normalization, `host-table-exact` RoPE, PyTorch 2.14 memory-efficient
+attention, BF16 rounding boundaries), with these differences:
+
+- Activations are stored as BF16 instead of rounded F32. GEMMs are cuBLAS BF16
+  in and out. QKV and gate|proj each run as one fused GEMM (`--fused-gemm 0`
+  splits them).
+- No synchronization inside a step, and no per-step allocation.
+- Weights are resident within `--vram-budget-mib`. The remaining blocks are
+  packed once into pinned host memory and streamed into two device slots on a
+  copy stream, ordered with events. The budget covers explicit allocations
+  plus a 512 MiB context allowance; `--plan-only` prints the plan.
+- Prefix KV cache: text and condition-image tokens use the zero-timestep
+  modulation and only attend to earlier prefix tokens, so their post-RoPE K/V
+  do not change between steps. Step 0 runs the joint `[prefix; target]`
+  sequence and stores the prefix K/V, as diffusers' extract step does. Later
+  steps run only target rows against `[cached prefix; target]`.
+  - `--kv-cache off` recomputes the joint sequence every step, like the
+    uncached reference.
+  - `--prefix-pass separate` fills the cache with a prefix-only pass instead.
+- Each prefix segment is one attention call from
+  `libq21_fast_attention.so`: bottom-right causal for text runs, unmasked for
+  condition images. The harness issues one query per call for text.
+- True CFG batches both branches into one set of GEMMs (`--cfg-batch 0` runs
+  them one after the other). Attention runs per branch.
+- Kernels are compiled without `--use_fast_math`, through
+  `cu_compile_kernels_ex`.
+
+Build and run from the repository root:
+
+```sh
+make -C cuda/qimg21 fast
+cuda/qimg21/test_cuda_qimg21_fast --model /mnt/nvme01/models/qimg-21 \
+  --prompt-embeds E.npy --latents L.npy --height-tokens 64 --width-tokens 64 \
+  --steps 40 --vram-budget-mib 6000 --out final.npy --profile
+```
+
+The CLI accepts the harness arguments, so `regression.py --native-bin` and
+`editing_regression.py --native-binary` can drive it. It accepts only the
+exact attention, normalization and RoPE modes. `reference.py --kv-cache on`
+dumps predictions from the cached reference path; the default `auto` keeps
+the previous behavior of disabling the cache when predictions are dumped.
+
+Validation on the RTX 5060 Ti, against the pinned efficient-SDPA reference:
+
+- **1024x1024, 40 steps, seed 42** (`tmp/qimg21-exact-1024-40`), 6000 MiB
+  budget with 10 resident and 22 streamed blocks: the free-running trajectory
+  is bit-identical to the harness at every one of the 40 checkpoints. So is
+  the decoded image: minimum trajectory cosine 0.999989908 and 58.16 dB RGB
+  PSNR against PyTorch, both unchanged from the harness.
+- **256x256, 2 steps, seed 7** (`tmp/qimg21-exact-matrix`): predictions reach
+  cosine 0.999998 and the trajectory 0.999995, against the 0.99996 gate. At
+  this size the harness is bit-identical to PyTorch; the fast runner differs
+  in the last BF16 bits.
+- `--verify-slots` checksums every streamed slot use on the device and
+  compares it with the pinned host blob at exit.
+- `--trace` records asynchronous per-operation activation checksums.
+
+Upload ordering matters. A synchronous `cuMemcpyHtoD` runs on the legacy
+stream, which does not order with the non-blocking compute stream. From
+pageable memory it can also return before its DMA lands. In an early build
+the initial latents and RoPE tables were uploaded that way. While another
+process loaded the GPU and PCIe, most single steps produced a different
+wrong prediction (cosine about 0.8), although streamed weights verified
+correctly. All uploads are now stream-ordered with `cuMemcpyHtoDAsync` on the
+compute stream. The harness has the same pattern for its prompt, latent and
+weight uploads; its frequent `cuCtxSynchronize` calls happen to serialize
+them before use.
+
+The timings above were measured while an unrelated process used 7.8 GB and
+100% of the GPU: 4.93 s per step at 1024x1024 with 22 streamed blocks. They
+are functional evidence only; uncontended benchmarks are pending.

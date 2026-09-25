@@ -1354,17 +1354,27 @@ int cublasew_gemm_bf16_bf16_f32_rowmajor_nt(cublasew_context *ctx,
                           CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) == CUBLAS_STATUS_SUCCESS ? 0 : -1;
 }
 
-int cublasew_gemm_bf16_bf16_bf16_rowmajor_nt(cublasew_context *ctx,
-                                           CUdeviceptr d_Y, CUdeviceptr d_W,
-                                           CUdeviceptr d_X, int n_tok, int n_out, int n_in) {
+int cublasew_gemm_bf16_bf16_bf16_rowmajor_nt_ld(cublasew_context *ctx,
+                                                CUdeviceptr d_Y, int ldy,
+                                                CUdeviceptr d_W,
+                                                CUdeviceptr d_X, int ldx,
+                                                int n_tok, int n_out, int n_in) {
     const float alpha = 1.0f, beta = 0.0f;
-    if (!ctx || !ctx->handle || n_tok <= 0 || n_out <= 0 || n_in <= 0) return -1;
+    if (!ctx || !ctx->handle || n_tok <= 0 || n_out <= 0 || n_in <= 0 ||
+        ldx < n_in || ldy < n_out) return -1;
     return p_cublasGemmEx(ctx->handle, CUBLAS_OP_T, CUBLAS_OP_N,
                           n_out, n_tok, n_in, &alpha,
                           (const void *)(uintptr_t)d_W, CUDA_R_16BF, n_in,
-                          (const void *)(uintptr_t)d_X, CUDA_R_16BF, n_in,
-                          &beta, (void *)(uintptr_t)d_Y, CUDA_R_16BF, n_out,
+                          (const void *)(uintptr_t)d_X, CUDA_R_16BF, ldx,
+                          &beta, (void *)(uintptr_t)d_Y, CUDA_R_16BF, ldy,
                           CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP) == CUBLAS_STATUS_SUCCESS ? 0 : -1;
+}
+
+int cublasew_gemm_bf16_bf16_bf16_rowmajor_nt(cublasew_context *ctx,
+                                           CUdeviceptr d_Y, CUdeviceptr d_W,
+                                           CUdeviceptr d_X, int n_tok, int n_out, int n_in) {
+    return cublasew_gemm_bf16_bf16_bf16_rowmajor_nt_ld(ctx, d_Y, n_out, d_W, d_X, n_in,
+                                                       n_tok, n_out, n_in);
 }
 
 /* BF16xBF16->{F32|F16} GEMM with a fused bias (and optional tanh-GELU) epilogue.

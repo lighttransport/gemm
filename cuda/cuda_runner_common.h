@@ -401,19 +401,38 @@ static void cu_write_cache(const char *path, int type, const void *blob,
 
 /* ---- NVRTC kernel compilation ---- */
 
+/* Explicit NVRTC options for runners that must not inherit the fast-math
+ * default: CU_COMPILE_FAST_MATH, CU_COMPILE_NO_FMAD, and CU_COMPILE_ARCH_A
+ * (sm_XXXa, needed for architecture-specific instructions such as sm_120a
+ * block-scaled MMA). */
+enum { CU_COMPILE_FAST_MATH = 1, CU_COMPILE_NO_FMAD = 2, CU_COMPILE_ARCH_A = 4 };
+static int cu_compile_kernels_ex(CUmodule *module, CUdevice device,
+                                 const char *source, const char *prog_name,
+                                 int verbose, const char *prefix, unsigned flags);
+
 static int cu_compile_kernels(CUmodule *module, CUdevice device,
                                const char *source, const char *prog_name,
                                int verbose, const char *prefix) {
+    unsigned flags = (getenv("CUDA_RUNNER_PRECISE_MATH") == NULL ? CU_COMPILE_FAST_MATH : 0u) |
+                     (getenv("CUDA_RUNNER_NO_FMAD") != NULL ? CU_COMPILE_NO_FMAD : 0u);
+    return cu_compile_kernels_ex(module, device, source, prog_name, verbose, prefix, flags);
+}
+
+static int cu_compile_kernels_ex(CUmodule *module, CUdevice device,
+                                 const char *source, const char *prog_name,
+                                 int verbose, const char *prefix, unsigned flags) {
     int major, minor;
     cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device);
     cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device);
     int sm = major * 10 + minor;
 
-    int use_fast_math = (getenv("CUDA_RUNNER_PRECISE_MATH") == NULL);
-    int no_fmad = (getenv("CUDA_RUNNER_NO_FMAD") != NULL);
+    int use_fast_math = (flags & CU_COMPILE_FAST_MATH) != 0;
+    int no_fmad = (flags & CU_COMPILE_NO_FMAD) != 0;
+    int arch_a = (flags & CU_COMPILE_ARCH_A) != 0;
 
 #ifndef _WIN32
-    unsigned flagmask = (use_fast_math ? 1u : 0u) | (no_fmad ? 2u : 0u);
+    /* Bits 0-1 keep the historical cache keys of cu_compile_kernels. */
+    unsigned flagmask = (use_fast_math ? 1u : 0u) | (no_fmad ? 2u : 0u) | (arch_a ? 4u : 0u);
     char cache_path[1024];
     int have_cache = (cu_kernel_cache_path(cache_path, sizeof(cache_path),
                                            source, prog_name, sm, flagmask) == 0);
@@ -435,7 +454,7 @@ static int cu_compile_kernels(CUmodule *module, CUdevice device,
     }
 
     char arch[32];
-    snprintf(arch, sizeof(arch), "--gpu-architecture=sm_%d", sm);
+    snprintf(arch, sizeof(arch), "--gpu-architecture=sm_%d%s", sm, arch_a ? "a" : "");
     const char *opts[3] = { arch, NULL, NULL };
     int nopts = 1;
     if (use_fast_math) {

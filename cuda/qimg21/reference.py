@@ -37,6 +37,8 @@ def main() -> int:
         "--dump-pred-dir",
         help="save each transformer denoiser prediction as pred_NNN.npy",
     )
+    ap.add_argument("--kv-cache", choices=("auto", "on", "off"), default="auto",
+                    help="prefix KV cache; auto disables it when dumping predictions")
     ap.add_argument("--dump-dir", required=True)
     ap.add_argument("--capture-block-dir", help="diagnostic block-0 tensors from the first denoiser call")
     ap.add_argument("--dump-vae-dir", help="save the condition VAE input and posterior moments")
@@ -293,6 +295,7 @@ def main() -> int:
             np.save(out / "prompt_embeds.npy", prompt_embeds.detach().float().cpu().numpy())
         return kwargs
 
+    use_kv_cache = pred_dir is None if args.kv_cache == "auto" else args.kv_cache == "on"
     t0 = time.perf_counter()
     if args.sdpa_backend == "efficient":
         from torch.nn.attention import SDPBackend, sdpa_kernel
@@ -314,7 +317,7 @@ def main() -> int:
             # prefill path.  The cache path is numerically equivalent but uses a
             # different attention execution route, which would measure cache
             # drift instead of kernel parity in the per-step fixtures.
-            use_kv_cache=pred_dir is None,
+            use_kv_cache=use_kv_cache,
             callback_on_step_end=callback,
             callback_on_step_end_tensor_inputs=["latents", "prompt_embeds"],
         )
@@ -338,6 +341,7 @@ def main() -> int:
         "elapsed_seconds": time.perf_counter() - t0,
         "torch": torch.__version__,
         "sdpa_backend": args.sdpa_backend,
+        "use_kv_cache": use_kv_cache,
         "prompt_fixture_dir": str(args.prompt_fixture_dir.resolve()) if args.prompt_fixture_dir else None,
     }, indent=2) + "\n")
     print(f"saved {out / 'reference.png'}")

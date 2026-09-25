@@ -232,6 +232,13 @@ int cublasew_gemm_f16_f16_f32_rowmajor_nn(cublasew_context *ctx,
 int cublasew_gemm_bf16_bf16_bf16_rowmajor_nt(cublasew_context *ctx,
                                            CUdeviceptr d_Y, CUdeviceptr d_W,
                                            CUdeviceptr d_X, int n_tok, int n_out, int n_in);
+/* As above with explicit row strides: Y[n_tok, n_out] (stride ldy) =
+ * X[n_tok, n_in] (stride ldx) * W[n_out, n_in]^T. */
+int cublasew_gemm_bf16_bf16_bf16_rowmajor_nt_ld(cublasew_context *ctx,
+                                                CUdeviceptr d_Y, int ldy,
+                                                CUdeviceptr d_W,
+                                                CUdeviceptr d_X, int ldx,
+                                                int n_tok, int n_out, int n_in);
 
 /* Row-major Y[n_tok, n_out] = X[n_tok, n_in] * W[n_out, n_in]^T + bias, with an
  * optional tanh-GELU on (Y + bias), fused into the cuBLAS-LT epilogue. W and X
