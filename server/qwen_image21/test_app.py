@@ -72,6 +72,42 @@ class QwenImage21RoutingTest(unittest.TestCase):
             self.assertIn("--int8-tensor-core", commands[0])
             self.assertIn("--int8-bf16-tail-blocks", commands[0])
 
+    def test_fast_preset_routes_to_fast_runner(self):
+        with tempfile.TemporaryDirectory(dir=ROOT / "tmp", prefix="qimg21-test-") as td:
+            root = Path(td)
+            package = root / "int8"
+            package.mkdir()
+            (package / "manifest.json").write_text("{}")
+            (root / "fast").write_text("")
+            demo = Demo(root / "model", root / "quant", root / "cuda-python", root / "work",
+                        root / "cuda-native", "127.0.0.1", 0, fast=root / "fast",
+                        fast_packages={"int8": package, "nvfp4": root / "missing"})
+            self.assertTrue(demo.preset_available("low8"))
+            self.assertFalse(demo.preset_available("low8-fp4"))
+            cfg = demo._validate({"prompt": "apple", "backend": "cuda", "preset": "low8"})
+            commands = []
+            with mock.patch.object(demo, "_run", side_effect=lambda command, cwd, log, env=None: commands.append(command)):
+                demo._native(cfg, root / "out")
+            command = commands[0]
+            self.assertEqual(command[command.index("--runner") + 1], "fast")
+            self.assertEqual(command[command.index("--preset") + 1], "low8")
+            self.assertEqual(command[command.index("--native-bin") + 1], str(root / "fast"))
+            self.assertEqual(command[command.index("--quant-package") + 1], str(package))
+            self.assertNotIn("--native-attention", command)
+            self.assertIn("--native-vae", command)
+            with self.assertRaises(RuntimeError):
+                demo._native(demo._validate({"prompt": "apple", "preset": "low8-fp4"}), root / "out2")
+
+    def test_fast_preset_validation(self):
+        with tempfile.TemporaryDirectory(dir=ROOT / "tmp", prefix="qimg21-test-") as td:
+            demo = self.make_demo(Path(td))
+            for request in ({"prompt": "a", "backend": "rocm", "preset": "low8"},
+                            {"prompt": "a", "preset": "low8", "quantized": True},
+                            {"prompt": "a", "preset": "turbo"}):
+                with self.assertRaises(ValueError):
+                    demo._validate(request)
+            self.assertIsNone(demo._validate({"prompt": "a", "preset": ""})["preset"])
+
 
 if __name__ == "__main__":
     unittest.main()

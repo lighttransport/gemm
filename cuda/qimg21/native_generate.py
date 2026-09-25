@@ -26,10 +26,21 @@ import numpy as np
 # Keep this preflight check aligned with QIMG21_EDIT_FUSED_MIN_TOKENS in the HIP runner.
 EDIT_FUSED_MIN_TOKENS = 1024
 
+# test_cuda_qimg21_fast presets (defined in the runner, which prints their
+# expansion) and the weight format each needs from pack_fast.py.
+FAST_PRESET_WEIGHTS = {"low8": "int8", "low8-fp4": "nvfp4", "fast12": "int8", "accurate": None}
+DEFAULT_PACKAGES = {
+    "int8": "/mnt/nvme01/models/qimg-21-fast/int8-smooth-a0.6",
+    "nvfp4": "/mnt/nvme01/models/qimg-21-fast/nvfp4-svd-a0.5-m",
+}
+
 
 def _run(command: list[str], *, cwd: Path) -> None:
     print("+", " ".join(str(x) for x in command), file=sys.stderr)
+    start = time.perf_counter()
     subprocess.run(command, cwd=cwd, check=True)
+    print(f"  ({Path(command[0]).name if 'python' not in Path(command[0]).name else Path(command[1]).name}: "
+          f"{time.perf_counter() - start:.1f} s)", file=sys.stderr)
 
 
 def _decode_vae(model: Path, latent_path: Path, out_path: Path, height: int, width: int,
@@ -108,7 +119,8 @@ def main() -> int:
     ap.add_argument("--native-attention", choices=(
         "math", "reverse64", "wmma", "wmma-fused", "edit-size-select",
         "mma64", "mma64-flash", "mma64-mixed", "mma64-forward-flash",
-        "mma128-efficient", "cutlass-efficient"), default=None)
+        "mma128-efficient", "cutlass-efficient", "flash"), default=None,
+        help="oracle attention; with --runner fast it overrides the preset (cutlass-efficient or flash)")
     ap.add_argument("--native-normalization", choices=("default", "vector4"), default=None)
     ap.add_argument("--native-rope", choices=("default", "host-table", "host-table-vector4", "host-table-exact"), default=None)
     ap.add_argument("--quantized-transformer", type=Path,
@@ -119,7 +131,32 @@ def main() -> int:
     ap.add_argument("--int8-bf16-tail-blocks", type=int, default=0,
                     help="reconstruct this many final transformer blocks to BF16")
     ap.add_argument("--native-vae", action="store_true", help="Decode with the native F32 VAE (experimental)")
+    ap.add_argument("--native-vae-conv", choices=("direct", "cudnn"), default=None,
+                    help="native VAE convolutions: direct F32 kernel (parity) or cuDNN F32 "
+                         "(default: cudnn with --runner fast, direct otherwise)")
+    ap.add_argument("--runner", choices=("oracle", "fast"), default="oracle",
+                    help="denoiser: the parity harness or test_cuda_qimg21_fast (CUDA only)")
+    ap.add_argument("--preset", choices=tuple(FAST_PRESET_WEIGHTS), default="accurate",
+                    help="fast-runner memory/precision preset (low8/low8-fp4: <8 GB, fast12: ~12 GB)")
+    ap.add_argument("--quant-package", type=Path,
+                    help="pack_fast.py package for int8/nvfp4 presets (default: the preset's package)")
     args = ap.parse_args()
+    fast_attention = args.native_attention
+    if args.runner == "fast":
+        if args.backend != "cuda":
+            ap.error("--runner fast is CUDA only")
+        if args.quantized_transformer or args.quantize_on_load or args.int8_tensor_core:
+            ap.error("--runner fast takes --preset/--quant-package instead of harness quantization flags")
+        if fast_attention not in (None, "cutlass-efficient", "flash"):
+            ap.error("--runner fast supports cutlass-efficient or flash attention")
+        if args.native_normalization not in (None, "vector4") or args.native_rope not in (None, "host-table-exact"):
+            ap.error("--runner fast implements vector4 normalization and host-table-exact RoPE only")
+        args.native_attention, args.native_normalization, args.native_rope = (
+            "cutlass-efficient", "vector4", "host-table-exact")
+    elif args.native_attention == "flash":
+        ap.error("flash attention is a --runner fast option")
+    if args.native_vae_conv == "cudnn" and args.backend != "cuda":
+        ap.error("--native-vae-conv cudnn is CUDA only")
     # The ROCm path has a native decoder and does not require a PyTorch
     # installation. CUDA keeps its existing reference VAE default.
     if args.backend == "rocm":
@@ -194,6 +231,8 @@ def main() -> int:
         path = Path(value or defaults[key])
         return path if path.is_absolute() else root / path
     native_bin = resolve_binary(args.native_bin, "native")
+    if args.runner == "fast" and not args.native_bin:
+        native_bin = root / "cuda/qimg21/test_cuda_qimg21_fast"
     text_bin = resolve_binary(args.native_text_bin, "text")
     vision_bin = resolve_binary(args.native_vision_bin, "vision")
     vae_bin = resolve_binary(args.native_vae_bin, "vae")
@@ -322,9 +361,21 @@ def main() -> int:
         fixture_command.append("--torch-rng")
     _run(fixture_command, cwd=root)
     native_latents = work / "native_latents.npy"
+    if args.runner == "fast":
+        # The preset sets budget, weights and attention; explicit flags follow it.
+        attention_args = ["--preset", args.preset]
+        weights = FAST_PRESET_WEIGHTS[args.preset]
+        if weights:
+            package = args.quant_package or Path(DEFAULT_PACKAGES[weights])
+            if not (package / "manifest.json").is_file():
+                raise SystemExit(f"preset {args.preset} needs a pack_fast.py {weights} package: {package}")
+            attention_args += ["--quant-package", str(package.resolve())]
+        if fast_attention:
+            attention_args += ["--attention", fast_attention]
+    else:
+        attention_args = ["--attention", args.native_attention]
     native_command = [
-            str(native_bin),
-            "--attention", args.native_attention,
+            str(native_bin), *attention_args,
             "--model",
             str(model),
             "--prompt-embeds",
@@ -371,12 +422,15 @@ def main() -> int:
     if args.native_vae:
         from PIL import Image
 
+        vae_conv = args.native_vae_conv or ("cudnn" if args.runner == "fast" else "direct")
+
         decoded_path = work / "native_decoded.npy"
         _run([
             str(vae_bin),
             "--model", str(model / "vae"), "--latents", str(native_latents),
             "--height-tokens", str(args.height // 16),
             "--width-tokens", str(args.width // 16), "--out", str(decoded_path),
+            *(["--conv", vae_conv] if vae_conv != "direct" else []),
         ], cwd=root)
         decoded = np.load(decoded_path)
         if decoded.shape != (4, args.height, args.width) or not np.isfinite(decoded).all():

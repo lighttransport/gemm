@@ -36,6 +36,8 @@
 
 typedef int (*q21f_attention_fn)(void *, const void *, const void *, const void *, int, int, int, int, int,
                                  int, int, void *);
+typedef int (*q21f_sage_fn)(void *, const void *, const void *, const void *, int, int, int, int, int, int, int,
+                            int, void *);
 
 /* Per-block BF16 weight blob: fused QKV [3D,D], out [D,D], fused gate|proj
  * [2F,D], mlp.out [D,F], then F32 norm_q/norm_k [128]. */
@@ -74,6 +76,11 @@ typedef struct {
         dequant, qk_norm_rope, fp4_act, w4a4_bf16, fp4_rowmax, fp4_act_cl, swiglu, euler, cfg_combine, checksum, colmax;
     void *plugin;
     q21f_attention_fn attention;
+    /* --attention sage: 8-bit attention for unmasked calls; causal text runs
+     * keep FlashAttention-2 (attention). */
+    void *sage_plugin;
+    q21f_sage_fn sage;
+    int sage_accum;
     q21f_layout layout, i8, fp4;
     CUmodule fp4_module;
     /* NVFP4 activation codes [rows][F/8], group scales [rows][F/16], token
@@ -449,6 +456,9 @@ static void q21f_mark(q21f_runtime *rt, const char *tag, int b, CUdeviceptr p, s
 static int q21f_attend(q21f_runtime *rt, CUdeviceptr out, CUdeviceptr q, CUdeviceptr k, CUdeviceptr v,
                        int nq, int nk, int mask) {
     int D = Q21F_D;
+    if (rt->sage && !mask)
+        return rt->sage((void *)(uintptr_t)out, (const void *)(uintptr_t)q, (const void *)(uintptr_t)k,
+                        (const void *)(uintptr_t)v, nq, nk, Q21F_HEADS, D, D, D, 0, rt->sage_accum, (void *)rt->compute);
     return rt->attention((void *)(uintptr_t)out, (const void *)(uintptr_t)q, (const void *)(uintptr_t)k,
                          (const void *)(uintptr_t)v, nq, nk, Q21F_HEADS, D, D, D, mask, (void *)rt->compute);
 }
@@ -797,17 +807,33 @@ static size_t q21f_state_bytes(int rows, int target, int branches, int nt_max, i
 
 /* ---- CLI -------------------------------------------------------------- */
 
+/* Memory/precision presets, designed at 1024x1024. A preset only sets
+ * defaults: explicit arguments anywhere on the command line override it, and
+ * the expansion is printed. Quantized presets need --quant-package.
+ * low8 and fast12 differ only in budget: fast12 keeps every block and the
+ * edit K/V cache resident, low8 streams what does not fit under 7 GiB. */
+typedef struct {
+    const char *name, *budget, *weights, *attention, *bf16_blocks;
+} q21f_preset;
+static const q21f_preset q21f_presets[] = {
+    {"low8", "7168", "int8", "sage", NULL},
+    {"low8-fp4", "7168", "nvfp4", "sage", NULL},
+    {"fast12", "11264", "int8", "sage", NULL},
+    {"accurate", "11264", "bf16", "cutlass-efficient", NULL},
+};
+
 static void q21f_usage(const char *argv0) {
     fprintf(stderr,
             "usage: %s --model DIR --prompt-embeds E.npy --latents L.npy [--height-tokens H --width-tokens W]\n"
             "  [--steps N | --timestep T] [--negative-prompt-embeds NEG.npy --guidance-scale S]\n"
             "  [--editing-layout L.txt --condition-latents C.npy [--negative-editing-layout NL.txt]]\n"
-            "  [--vram-budget-mib MIB] [--cfg-batch 0|1] [--fused-gemm 0|1] [--kv-cache on|off]\n"
+            "  [--preset low8|low8-fp4|fast12|accurate] [--vram-budget-mib MIB] [--cfg-batch 0|1] [--fused-gemm 0|1] [--kv-cache on|off]\n"
             "  [--prefix-pass extract|separate] [--plan-only] [--profile]\n"
             "  [--weights bf16|int8|nvfp4 --quant-package DIR [--bf16-blocks 0,31]] [--fp4-gemm cutlass|omma]\n"
             "  [--int8-gemm cutlass|cublas]\n"
             "  diagnostics: [--trace] [--verify-slots] [--stage-dir DIR] [--calib-dump FILE.npy]\n"
-            "  [--attention cutlass-efficient|flash] [--normalization vector4] [--rope host-table-exact]\n"
+            "  [--attention cutlass-efficient|flash|sage [--sage-accum fp16|fp32]]\n"
+            "  [--normalization vector4] [--rope host-table-exact]\n"
             "  [--attention-plugin PATH] [--rope-table-base PATH]\n"
             "  [--out O.npy] [--dump-dir DIR] [--pred-dir DIR] [--quiet|--verbose]\n", argv0);
 }
@@ -822,13 +848,31 @@ int main(int argc, char **argv) {
     int int8_weights = 0, tail_blocks = 0, fp4_cutlass = 1, i8_cutlass = 1;
     char tail_list[160] = "";
     int ih = 16, iw = 16, steps = 1, verbose = 1, cfg_batch = 1, plan_only = 0, profile = 0, fused_gemm = 1;
-    int kv_cache = 1, extract = 1, trace = 0, verify_slots = 0, flash = 0;
+    int kv_cache = 1, extract = 1, trace = 0, verify_slots = 0, flash = 0, rt_sage_accum = 1;
     double budget_mib = 0;
     float guidance = 1.0f, manual_t = -1.0f;
+    const q21f_preset *preset = NULL;
+    for (int i = 1; i + 1 < argc; i++)
+        if (!strcmp(argv[i], "--preset")) {
+            preset = NULL;
+            for (size_t p = 0; p < sizeof(q21f_presets) / sizeof(q21f_presets[0]); p++)
+                if (!strcmp(argv[i + 1], q21f_presets[p].name)) preset = &q21f_presets[p];
+            if (!preset) { fprintf(stderr, "fast: unknown preset %s\n", argv[i + 1]); return 2; }
+        }
+    if (preset) {
+        budget_mib = atof(preset->budget);
+        int8_weights = !strcmp(preset->weights, "int8") ? 1 : !strcmp(preset->weights, "nvfp4") ? 2 : 0;
+        flash = !strcmp(preset->attention, "sage") ? 2 : !strcmp(preset->attention, "flash");
+        bf16_blocks = preset->bf16_blocks;
+        fprintf(stderr, "fast: preset %s = --vram-budget-mib %s --weights %s --attention %s%s%s\n", preset->name,
+                preset->budget, preset->weights, preset->attention, bf16_blocks ? " --bf16-blocks " : "",
+                bf16_blocks ? bf16_blocks : "");
+    }
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         int more = i + 1 < argc;
-        if (!strcmp(a, "--model") && more) model = argv[++i];
+        if (!strcmp(a, "--preset") && more) i++;
+        else if (!strcmp(a, "--model") && more) model = argv[++i];
         else if (!strcmp(a, "--prompt-embeds") && more) prompt_path = argv[++i];
         else if (!strcmp(a, "--latents") && more) latent_path = argv[++i];
         else if (!strcmp(a, "--negative-prompt-embeds") && more) negative_path = argv[++i];
@@ -856,6 +900,11 @@ int main(int argc, char **argv) {
             extract = !strcmp(m, "extract");
         }
         else if (!strcmp(a, "--attention-plugin") && more) plugin_path = argv[++i];
+        else if (!strcmp(a, "--sage-accum") && more) {
+            const char *m = argv[++i];
+            if (strcmp(m, "fp32") && strcmp(m, "fp16")) { q21f_usage(argv[0]); return 2; }
+            rt_sage_accum = !strcmp(m, "fp16");
+        }
         else if (!strcmp(a, "--rope-table-base") && more) rope_path = argv[++i];
         else if (!strcmp(a, "--plan-only")) plan_only = 1;
         else if (!strcmp(a, "--trace")) trace = 1;
@@ -888,9 +937,9 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--quiet")) verbose = 0;
         else if (!strcmp(a, "--attention") && more) {
             const char *m = argv[++i];
-            if (!strcmp(m, "flash")) flash = 1;
-            else if (strcmp(m, "cutlass-efficient")) {
-                fprintf(stderr, "fast: --attention must be cutlass-efficient or flash (got %s)\n", m);
+            flash = !strcmp(m, "sage") ? 2 : !strcmp(m, "flash");
+            if (!flash && strcmp(m, "cutlass-efficient")) {
+                fprintf(stderr, "fast: --attention must be cutlass-efficient, flash or sage (got %s)\n", m);
                 return 2;
             }
         } else if ((!strcmp(a, "--normalization") || !strcmp(a, "--rope")) && more) {
@@ -920,7 +969,8 @@ int main(int argc, char **argv) {
         bf16_blocks = tail_list;
     }
     if (!!int8_weights != !!package) {
-        fprintf(stderr, "fast: --weights int8|nvfp4 and --quant-package go together\n");
+        fprintf(stderr, "fast: --weights int8|nvfp4 and --quant-package go together%s\n",
+                preset && int8_weights ? " (the preset quantizes: pass a pack_fast.py package)" : "");
         return 2;
     }
     if (negative_path && guidance <= 1.0f) {
@@ -1026,6 +1076,13 @@ int main(int argc, char **argv) {
     REQ(rt.plugin && (rt.attention = (q21f_attention_fn)dlsym(rt.plugin, flash ? "q21f_flash_attention"
                                                                                : "q21f_attention")),
         "cannot load attention plugin %s: %s", plugin_path, dlerror());
+    if (flash == 2) {
+        /* SageAttention2-style INT8 Q.K / FP8 P.V (not bit-comparable). */
+        rt.sage_plugin = dlopen("cuda/qimg21/libq21_fast_sage.so", RTLD_NOW | RTLD_LOCAL);
+        REQ(rt.sage_plugin && (rt.sage = (q21f_sage_fn)dlsym(rt.sage_plugin, "q21f_sage_attention")),
+            "cannot load cuda/qimg21/libq21_fast_sage.so: %s", dlerror());
+        rt.sage_accum = rt_sage_accum;
+    }
 
     /* ---- Plan ---- */
     q21f_layout_init(&rt.layout);
@@ -1398,6 +1455,7 @@ fail:
     if (rt.plugin) dlclose(rt.plugin);
     if (rt.fp4_plugin) dlclose(rt.fp4_plugin);
     if (rt.i8_plugin) dlclose(rt.i8_plugin);
+    if (rt.sage_plugin) dlclose(rt.sage_plugin);
     free(host_out); free(host_pred); free(sigmas);
     npy_free(&pe); npy_free(&ne); npy_free(&la); npy_free(&cond); npy_free(&rope);
     return rc;

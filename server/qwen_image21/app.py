@@ -26,6 +26,12 @@ WEB = ROOT / "web"
 DEFAULT_MODEL = Path("/mnt/nvme01/models/qimg-21")
 DEFAULT_QUANT = ROOT / "tmp/qimg21-int8-package"
 DEFAULT_PYTHON = ROOT / "tmp/qimg21-ref-venv/bin/python"
+DEFAULT_FAST = ROOT / "cuda/qimg21/test_cuda_qimg21_fast"
+DEFAULT_FAST_PACKAGES = {"int8": Path("/mnt/nvme01/models/qimg-21-fast/int8-smooth-a0.6"),
+                         "nvfp4": Path("/mnt/nvme01/models/qimg-21-fast/nvfp4-svd-a0.5-m")}
+# Fast CUDA denoiser presets (test_cuda_qimg21_fast --preset) and the
+# pack_fast.py weight package each needs.
+FAST_PRESETS = {"low8": "int8", "low8-fp4": "nvfp4", "fast12": "int8", "accurate": None}
 MAX_BODY = 32 * 1024
 
 
@@ -33,7 +39,9 @@ class Demo:
     def __init__(self, model: Path, quant: Path, python: Path, work: Path,
                  native: Path, host: str, port: int,
                  *, native_rocm: Path | None = None,
-                 python_rocm: Path | None = None):
+                 python_rocm: Path | None = None,
+                 fast: Path = DEFAULT_FAST,
+                 fast_packages: dict[str, Path] | None = None):
         self.model = model.resolve()
         self.quant = quant.resolve()
         # Preserve a venv/uv launcher symlink; Path.resolve() would collapse it
@@ -43,8 +51,16 @@ class Demo:
         self.work = work.resolve()
         self.native = native.resolve()
         self.native_rocm = (native_rocm or native).resolve()
+        self.fast = fast.resolve()
+        self.fast_packages = {kind: path.resolve()
+                              for kind, path in (fast_packages or DEFAULT_FAST_PACKAGES).items()}
         self.host, self.port = host, port
         self.lock = threading.Lock()
+
+    def preset_available(self, preset: str) -> bool:
+        kind = FAST_PRESETS[preset]
+        return self.fast.is_file() and (
+            kind is None or (self.fast_packages.get(kind, Path("/nonexistent")) / "manifest.json").is_file())
 
     def native_components(self, backend: str) -> dict[str, Path]:
         """Return the complete native subprocess set for one backend."""
@@ -87,10 +103,18 @@ class Demo:
         if not isinstance(negative, str) or len(negative) > 4000:
             raise ValueError("negative_prompt must be at most 4000 characters")
         quantized = bool(request.get("quantized", False))
+        preset = request.get("preset") or None
+        if preset is not None:
+            if preset not in FAST_PRESETS:
+                raise ValueError("preset must be one of " + ", ".join(FAST_PRESETS))
+            if backend != "cuda":
+                raise ValueError("fast presets are CUDA only")
+            if quantized:
+                raise ValueError("a fast preset selects its own weights; leave quantized off")
         return {"prompt": prompt, "negative_prompt": negative.strip(),
                 "mode": mode, "backend": backend,
                 "width": width, "height": height, "steps": steps, "seed": seed,
-                "quantized": quantized}
+                "quantized": quantized, "preset": preset}
 
     def _run(self, command: list[str], cwd: Path, log: Path,
              env: dict[str, str] | None = None) -> None:
@@ -122,6 +146,17 @@ class Demo:
                    "--native-bin", str(native),
                    "--native-attention", attention, "--native-normalization", "vector4",
                    "--native-rope", "host-table-exact", "--work-dir", str(work), "--out", str(image)]
+        preset = cfg.get("preset")
+        if preset:
+            # The fast runner's preset sets budget, weights and attention.
+            kind = FAST_PRESETS[preset]
+            if not self.preset_available(preset):
+                raise RuntimeError(f"preset {preset} is unavailable: build `make -C cuda/qimg21 fast`"
+                                   + (f" and provide the {kind} package" if kind else ""))
+            at = command.index("--native-bin")
+            command[at:at + 8] = ["--native-bin", str(self.fast), "--runner", "fast", "--preset", preset]
+            if kind:
+                command += ["--quant-package", str(self.fast_packages[kind])]
         if native_vae:
             command.insert(command.index("--native-bin"), "--native-vae")
         if cfg["negative_prompt"]:
@@ -198,6 +233,7 @@ class Handler(BaseHTTPRequestHandler):
                           for backend in ("cuda", "rocm")}
             self._json(200, {"ok": True, "model": str(demo.model),
                              "quantized_available": demo.quant.is_dir(),
+                             "presets": {name: demo.preset_available(name) for name in FAST_PRESETS},
                              "native": {backend: all(components[backend].values())
                                         for backend in ("cuda", "rocm")},
                              "native_components": components,
@@ -238,6 +274,11 @@ def main() -> int:
                     default=ROOT / "rdna4/qimg21/test_hip_qimg21_native")
     ap.add_argument("--python-rocm", type=Path,
                     default=ROOT / "tmp/qimg21-rocm-venv/bin/python")
+    ap.add_argument("--fast", type=Path, default=DEFAULT_FAST, help="fast CUDA denoiser for presets")
+    ap.add_argument("--int8-package", type=Path, default=DEFAULT_FAST_PACKAGES["int8"],
+                    help="pack_fast.py int8-smooth package (low8, fast12)")
+    ap.add_argument("--nvfp4-package", type=Path, default=DEFAULT_FAST_PACKAGES["nvfp4"],
+                    help="pack_fast.py nvfp4-svd package (low8-fp4)")
     ap.add_argument("--work-dir", type=Path, default=ROOT / "tmp/qimg21-web-jobs")
     ap.add_argument("--host", default="127.0.0.1"); ap.add_argument("--port", type=int, default=8091)
     args = ap.parse_args()
@@ -245,7 +286,8 @@ def main() -> int:
     args.work_dir.mkdir(parents=True, exist_ok=True)
     demo = Demo(args.model, args.quant_package, args.python, args.work_dir, args.native,
                 args.host, args.port, native_rocm=args.native_rocm,
-                python_rocm=args.python_rocm)
+                python_rocm=args.python_rocm, fast=args.fast,
+                fast_packages={"int8": args.int8_package, "nvfp4": args.nvfp4_package})
     server = ThreadingHTTPServer((args.host, args.port), Handler); server.demo = demo  # type: ignore[attr-defined]
     print(f"Qwen Image 2.1 demo: http://{args.host}:{args.port}")
     server.serve_forever()

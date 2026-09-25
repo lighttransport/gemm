@@ -1856,9 +1856,13 @@ attention, BF16 rounding boundaries), with these differences:
 - Kernels are compiled without `--use_fast_math`, through
   `cu_compile_kernels_ex`.
 
-Build and run from the repository root:
+Build and run from the repository root. `make fast` also builds the INT8,
+NVFP4 and Sage plugins; the Sage plugin needs a SageAttention checkout at the
+pinned commit:
 
 ```sh
+git clone https://github.com/thu-ml/SageAttention tmp/sageattention-src
+git -C tmp/sageattention-src checkout d1a57a546c3d395b1ffcbeecc66d81db76f3b4b5
 make -C cuda/qimg21 fast
 cuda/qimg21/test_cuda_qimg21_fast --model /mnt/nvme01/models/qimg-21 \
   --prompt-embeds E.npy --latents L.npy --height-tokens 64 --width-tokens 64 \
@@ -1952,9 +1956,18 @@ are accepted as aliases, so the regression scripts drive it unchanged.
    runner's device layout (6.5 GiB), so loading is a straight copy.
 3. **Run.** The fused modulated norm writes INT8 rows of `bf16(norm) / s` with
    a per-token scale. Attention and SwiGLU outputs go through a row
-   quantizer. INT32 accumulators are rescaled to BF16 in row chunks, which
-   bounds the scratch buffer at 128 MiB. Timestep, modulation, `txt_in`,
-   `img_in`, `norm_out` and `proj_out` stay BF16.
+   quantizer. The GEMM (`--int8-gemm cutlass`, the default) is a CUTLASS
+   Sm80 INT8 kernel (`libq21_fast_int8.so`) whose epilogue visitor tree
+   computes `bf16(float(acc) * xs[token] * ws[row])`, in the same operation
+   order as the standalone dequant kernel. `--int8-gemm cublas` runs cuBLAS
+   INT32 GEMMs plus that kernel, in row chunks with a 128 MiB scratch. Both
+   give bit-identical outputs. Timestep, modulation, `txt_in`, `img_in`,
+   `norm_out` and `proj_out` stay BF16.
+
+   On the Qwen block shapes, the CUTLASS kernel (128x256x64 tiles, 3 stages;
+   128x128x64 below 1024 rows) reaches 121 to 145 TOPS. cuBLAS reaches 80 to
+   106 TOPS before its separate dequant pass. A 1024x1024 CFG-4 step drops
+   from 1.965 s to 1.685 s, and the latents stay bit-identical.
 
 Results at 1024x1024, 40 steps, against the pinned BF16 PyTorch reference,
 with `--attention flash` and a 7168 MiB budget (25 resident blocks, 7
@@ -2057,3 +2070,134 @@ standard SVDQuant, though: the best-fit residual error stays at 0.24 or more
 for every smoothing variant, and its low-rank term is not the truncated SVD
 of `W`, `W*s` or `W/s`. Its loader repository is not public, so the
 checkpoint is not used.
+
+### 8-bit attention (`--attention sage`)
+
+`libq21_fast_sage.so` builds SageAttention's sm_89 attention kernel from
+pinned source (thu-ml/SageAttention `d1a57a5`, Apache-2.0, expected at
+`tmp/sageattention-src`) without PyTorch. `sage_shim/` stands in for the two
+PyTorch headers that the kernel headers include, and the Makefile cuts
+`fused.cu` off before its PyTorch bindings. For each unmasked attention call:
+
+- K is smoothed by subtracting its per-channel mean over tokens, which softmax
+  ignores. The mean is a two-pass reduction without atomics, so output is
+  deterministic.
+- Q (per 32-row warp) and K (per 64-row block) are quantized to INT8 per head.
+- V is transposed, padded and quantized to FP8 E4M3 per channel.
+- The kernel runs INT8 Q·Kᵀ and FP8 P·V MMAs.
+  - `--sage-accum fp16` is the default and upstream's choice for sm_120: the
+    P·V instruction accumulator is FP16, with V scaled to 2.25.
+  - `--sage-accum fp32` keeps it in F32.
+
+Causal text-prefix runs still use FlashAttention-2.
+
+On GeForce Blackwell, BF16 MMAs with F32 accumulation run at about a quarter
+of the INT8/FP8 rate, and that limits FlashAttention-2. Measured with 4096
+queries:
+
+| Keys | FlashAttention-2 | Sage |
+|---:|---:|---:|
+| 4,150 | 8.8 ms | 3.3 ms |
+| 8,496 | 18.5 ms | 6.9 ms |
+
+On random inputs, the relative error against F32 attention is about 4e-2
+(FlashAttention-2: 1.8e-3).
+
+End to end at 1024x1024, true CFG 4, 40 steps. PSNR is of the decoded image
+against the `accurate` preset (BF16, bit-identical to the harness):
+
+| Weights | Attention | Per step | PSNR |
+|---|---|---:|---:|
+| BF16 | flash | 4.098 s | 36.02 dB |
+| BF16 | sage, fp32 accumulation | 3.910 s | 33.00 dB |
+| INT8 | flash | 1.685 s | 25.21 dB |
+| INT8 | sage, fp32 accumulation | 1.352 s | 25.33 dB |
+| INT8 | sage, fp16 accumulation | 1.302 s | 26.92 dB |
+
+On its own, 8-bit attention costs about 3 dB. With INT8 weights, the weight
+error dominates and the attention adds no measurable loss, so the quantized
+presets use it.
+
+### Presets and the end-to-end pipeline
+
+`--preset NAME` sets the budget, weight format and attention backend. Any
+explicit argument overrides it, and the runner prints the expansion.
+
+| Preset | Expands to | For |
+|---|---|---|
+| `low8` | `--vram-budget-mib 7168 --weights int8 --attention sage` | 8 GB cards |
+| `low8-fp4` | `--vram-budget-mib 7168 --weights nvfp4 --attention sage` | 4.2 GiB of weights, lower quality |
+| `fast12` | `--vram-budget-mib 11264 --weights int8 --attention sage` | 12 GB cards; all blocks and the edit K/V cache resident |
+| `accurate` | `--vram-budget-mib 11264 --weights bf16 --attention cutlass-efficient` | Bit-identical to the harness |
+
+`low8` and `fast12` produce bit-identical images. `fast12` is faster only when
+`low8` has to stream: with a 1024x1024 condition image, the 4.4 GiB edit K/V
+cache leaves `low8` room for just 2 resident blocks.
+`--bf16-blocks 0,31` improves INT8 edit accuracy (see the W8A8 table above)
+at about 0.1 s per step for each block.
+
+Running the pipeline:
+
+- `native_generate.py --runner fast --preset NAME` runs the whole pipeline
+  with a preset.
+- The INT8 and NVFP4 packages default to
+  `/mnt/nvme01/models/qimg-21-fast/{int8-smooth-a0.6,nvfp4-svd-a0.5-m}`.
+  `--quant-package` overrides them.
+- The web demo (`server/qwen_image21`) offers the same presets as a CUDA
+  denoiser choice.
+
+Measurement setup for the tables below:
+
+- RTX 5060 Ti, `native_generate.py --native-vae`, 1024x1024, 40 steps, true
+  CFG 4 with negative prompt `" "`, seed 42.
+- Editing uses a 1024x1024 condition image.
+- Peak is the denoiser process's device memory, sampled with `nvidia-smi`.
+  The other stages peak at 3.1 GB (VAE decode), 2.3 GB (VAE encode) and
+  0.6 GB (text and vision encoders).
+- PSNR is against the `accurate` preset's image.
+
+Text-to-image:
+
+| Preset | Per step | Peak | Total | PSNR |
+|---|---:|---:|---:|---:|
+| `low8` | 1.48 s | 6,986 MiB | 83 s | 26.3 dB |
+| `low8-fp4` | 1.35 s | 6,078 MiB | 78 s | 23.4 dB |
+| `fast12` | 1.46 s | 8,456 MiB | 81 s | 26.3 dB |
+| `accurate` | 5.70 s | 10,778 MiB | 262 s | reference |
+
+Editing:
+
+| Preset | Per step | Peak | Total | PSNR |
+|---|---:|---:|---:|---:|
+| `low8` | 1.82 s | 6,968 MiB | 107 s | 34.9 dB |
+| `low8-fp4` | 1.70 s | 7,078 MiB | 100 s | 24.1 dB |
+| `fast12` | 1.78 s | 11,168 MiB | 102 s | 34.9 dB |
+| `accurate` | 7.19 s | 10,926 MiB | 333 s | reference |
+
+The `accurate` runs overlapped other GPU jobs on the machine. Uncontended
+repeats took 4.9 s (text-to-image) and 6.3 s (editing) per step.
+
+Stage costs in a `low8` text-to-image run:
+
+- the text encoder, 4.3 s per prompt (twice with CFG);
+- the latent fixture, 2.1 s;
+- denoiser weight loading, about 5 s;
+- VAE decode, 5.2 s.
+
+Editing adds VAE encode (2.1 s) and vision encoding (1.7 s). Two changes cut
+these stage costs:
+
+- **Text encoder.** Linear weights stream through one persistent pinned buffer
+  in 8 MiB chunks instead of a malloc, pageable upload and free per matrix.
+  Time per prompt dropped from 13.6 s to 4.3 s, and embeddings are
+  byte-identical.
+- **VAE decode.** `test_cuda_qimg21_vae --conv cudnn` runs F32 cuDNN
+  convolutions: FMA math, no FFT or Winograd, with the handle and the
+  algorithm per shape cached. The upsampler shortcut gather now runs on the
+  device instead of through a device-host-device round trip.
+  - A 1024x1024 decode takes 4.9 s instead of 43.9 s.
+  - Against the direct kernel, the relative L2 error is 5.7e-7, and 124 of
+    4.2M 8-bit channel values differ by one.
+  - The default `--conv direct` output stays byte-identical and takes 37.4 s.
+  - `native_generate.py` selects `cudnn` with `--runner fast`;
+    `--native-vae-conv` overrides it.
