@@ -1524,4 +1524,160 @@
     KERNEL8F6 q38d_asm8_f6_a8, 0
     KERNEL8F6 q38d_asm8_f6_a16, 1
 
+
+
+/* Four-token F4 A16 (speculative-decoding verification), one pair per slot:
+ * slot s: S4N(s-3) S3N(s-2) S2N(s-1) S1N(s).
+ *
+ * void q38d_asmn4_f4_a16(const uint8_t *code, const uint8_t *unused,
+ *                        const uint8_t *scale, const int8_t *actq,
+ *                        const float *actsc, long np, float *acc64,
+ *                        const int8_t *lut);
+ * Activations interleaved per pair: actq[np][4][64] (per token 32 low then
+ * 32 high digits), actsc[np][4][2]. acc64[4][16]: lane 2r+u per token.
+ * np >= 4.
+ *   codes z0,z1 | decoded z4-z7 (l0 h0 l1 h1)
+ *   SDOT chains (depth 4): token t low digits z(8+2t), high digits z(9+2t)
+ *   accumulators z16-z19 | act temps z20,z21,z24,z25 | S4 temps z22,z23,z26-z28
+ *   x0 code(s), x2 scale(s-3), x3 act(s-2), x4 actsc(s-3), x5 counter */
+.macro S1N
+#if PF1_DIST
+    prfm    pldl1keep, [x0, #PF1_DIST]
+#endif
+#if PF2_DIST
+    prfm    pldl2keep, [x0, x9]
+#endif
+    ld1b    {z0.b}, p0/z, [x0]
+    ld1b    {z1.b}, p0/z, [x0, #1, mul vl]
+    add     x0, x0, #128
+.endm
+.macro S2N
+    and     z4.d, z0.d, M0F.d
+    lsr     z5.b, z0.b, #4
+    and     z6.d, z1.d, M0F.d
+    lsr     z7.b, z1.b, #4
+    tbl     z4.b, {ZL.b}, z4.b
+    tbl     z5.b, {ZL.b}, z5.b
+    tbl     z6.b, {ZL.b}, z6.b
+    tbl     z7.b, {ZL.b}, z7.b
+.endm
+/* weight vector w (act byte offset o within each digit half) for all four
+ * tokens and both digits: token t low at 64t+o, high at 64t+32+o */
+.macro S3STEP w, o, first
+    ld1rd   {z20.d}, p2/z, [x3, #(\o)]
+    ld1rd   {z21.d}, p2/z, [x3, #(\o + 32)]
+    ld1rd   {z24.d}, p2/z, [x3, #(\o + 64)]
+    ld1rd   {z25.d}, p2/z, [x3, #(\o + 96)]
+.if \first
+    movprfx z8, ZERO
+.endif
+    sdot    z8.s, \w\().b, z20.b
+.if \first
+    movprfx z9, ZERO
+.endif
+    sdot    z9.s, \w\().b, z21.b
+.if \first
+    movprfx z10, ZERO
+.endif
+    sdot    z10.s, \w\().b, z24.b
+.if \first
+    movprfx z11, ZERO
+.endif
+    sdot    z11.s, \w\().b, z25.b
+    ld1rd   {z20.d}, p2/z, [x3, #(\o + 128)]
+    ld1rd   {z21.d}, p2/z, [x3, #(\o + 160)]
+    ld1rd   {z24.d}, p2/z, [x3, #(\o + 192)]
+    ld1rd   {z25.d}, p2/z, [x3, #(\o + 224)]
+.if \first
+    movprfx z12, ZERO
+.endif
+    sdot    z12.s, \w\().b, z20.b
+.if \first
+    movprfx z13, ZERO
+.endif
+    sdot    z13.s, \w\().b, z21.b
+.if \first
+    movprfx z14, ZERO
+.endif
+    sdot    z14.s, \w\().b, z24.b
+.if \first
+    movprfx z15, ZERO
+.endif
+    sdot    z15.s, \w\().b, z25.b
+.endm
+.macro S3N
+    S3STEP  z4, 0, 1
+    S3STEP  z5, 8, 0
+    S3STEP  z6, 16, 0
+    S3STEP  z7, 24, 0
+    add     x3, x3, #256
+.endm
+.macro S4TOK lo, hi, acc, tmp, o
+    ld1rd   {\tmp\().d}, p2/z, [x4, #(\o)]
+    lsl     \hi\().s, \hi\().s, #8
+    add     \lo\().s, \lo\().s, \hi\().s
+    fmul    \tmp\().s, \tmp\().s, z22.s
+    scvtf   \lo\().s, p1/m, \lo\().s
+    fmla    \acc\().s, p1/m, \lo\().s, \tmp\().s
+.endm
+.macro S4N
+    ld1b    {z22.s}, p1/z, [x2]
+    add     x2, x2, #16
+    lsl     z22.s, z22.s, #20
+    S4TOK   z8, z9, z16, z23, 0
+    S4TOK   z10, z11, z17, z26, 8
+    S4TOK   z12, z13, z18, z27, 16
+    S4TOK   z14, z15, z19, z28, 24
+    add     x4, x4, #32
+.endm
+    .global q38d_asmn4_f4_a16
+    .type q38d_asmn4_f4_a16, %function
+    .p2align 6
+q38d_asmn4_f4_a16:
+    stp     d8, d9, [sp, #-64]!
+    stp     d10, d11, [sp, #16]
+    stp     d12, d13, [sp, #32]
+    stp     d14, d15, [sp, #48]
+    ptrue   p0.b
+    ptrue   p1.s
+    ptrue   p2.d
+    ld1b    {ZL.b}, p0/z, [x7]
+    dup     M0F.b, #15
+    dup     ZERO.s, #0
+    dup     z16.s, #0
+    dup     z17.s, #0
+    dup     z18.s, #0
+    dup     z19.s, #0
+    mov     x9, #PF2_DIST
+    S1N                                      /* s=0 */
+    S2N                                      /* s=1 */
+    S1N
+    S3N                                      /* s=2 */
+    S2N
+    S1N
+    sub     x5, x5, #3
+1:
+    S4N                                      /* s=3..np-1 */
+    S3N
+    S2N
+    S1N
+    subs    x5, x5, #1
+    b.ne    1b
+    S4N                                      /* s=np */
+    S3N
+    S2N
+    S4N                                      /* s=np+1 */
+    S3N
+    S4N                                      /* s=np+2 */
+    st1w    {z16.s}, p1, [x6]
+    st1w    {z17.s}, p1, [x6, #1, mul vl]
+    st1w    {z18.s}, p1, [x6, #2, mul vl]
+    st1w    {z19.s}, p1, [x6, #3, mul vl]
+    ldp     d10, d11, [sp, #16]
+    ldp     d12, d13, [sp, #32]
+    ldp     d14, d15, [sp, #48]
+    ldp     d8, d9, [sp], #64
+    ret
+    .size q38d_asmn4_f4_a16, .-q38d_asmn4_f4_a16
+
     .section .note.GNU-stack,"",%progbits

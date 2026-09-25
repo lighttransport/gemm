@@ -13,8 +13,8 @@ static int8_t buf[4096] __attribute__((aligned(256)));
                          "dup z30.b, #1\n dup z31.b, #3\n"                           \
                          "1:\n" body "subs %0, %0, #1\n b.ne 1b\n"                   \
                          : "+r"(n) : "r"(buf)                                        \
-                         : "memory", "cc", "z0", "z1", "z2", "z3", "z4", "z5", "z6", "z7", \
-                           "z8", "z9", "z10", "z11", "z12", "z13", "z14", "z15", "z27", "z28", "z29", "z30", "z31", "p0", "p1", "p2"); \
+                         : "memory", "cc", "x9", "z0", "z1", "z2", "z3", "z4", "z5", "z6", "z7", \
+                           "z8", "z9", "z10", "z11", "z12", "z13", "z14", "z15", "z16", "z17", "z18", "z19", "z20", "z27", "z28", "z29", "z30", "z31", "p0", "p1", "p2"); \
         return (double)(ticks() - t0);                                               \
     }
 #define S(x) #x
@@ -46,6 +46,36 @@ static int8_t buf[4096] __attribute__((aligned(256)));
 #define SUNPK(i) "sunpklo z" S(i) ".h, z31.b\n"
 #define UZP(i) "uzp1 z" S(i) ".s, z31.s, z30.s\n"
 #define ADDV(i) "add z" S(i) ".s, z" S(i) ".s, z30.s\n"
+#define SDOTI(i) "sdot z1" S(i) ".s, z30.b, z7.b[1]\n"
+#define LD1RQB(i) "ld1rqb {z" S(i) ".b}, p0/z, [%1, #" S(i) "*16]\n"
+#define LD1RW(i) "ld1rw {z" S(i) ".s}, p2/z, [%1, #" S(i) "*4]\n"
+#define DUPLANE(i) "dup z" S(i) ".s, z31.s[1]\n"
+#define DUPGPR(i) "dup z" S(i) ".s, w9\n"
+#define FMULI(i) "fmul z1" S(i) ".s, z30.s, z7.s[1]\n"
+#define FMLAI(i) "fmla z1" S(i) ".s, z30.s, z7.s[1]\n"
+#define MPSDOTI(i) "movprfx z1" S(i) ", z29\n sdot z1" S(i) ".s, z30.b, z7.b[" S(i) "&3]\n"
+#define SDOTI_U(i) "sdot z1" S(i) ".s, z30.b, z7.b[" S(i) "&3]\n"
+#define LD1RD_T(i) "ld1rd {z20.d}, p1/z, [%1, #" S(i) "*8]\n"
+#define SDOT_T(i) "movprfx z1" S(i) ", z29\n sdot z1" S(i) ".s, z30.b, z20.b\n"
+LOOP(t_mpsdoti, "dup z29.s, #0\n" R8(MPSDOTI))
+LOOP(t_mpsdoti_ldrq, "dup z29.s, #0\n" R8(MPSDOTI) "ld1rqb {z7.b}, p0/z, [%1]\n ld1rqb {z6.b}, p0/z, [%1, #16]\n")
+LOOP(t_sdot_ld1rd_dep, "dup z29.s, #0\n" LD1RD_T(0) SDOT_T(0) LD1RD_T(1) SDOT_T(1) LD1RD_T(2) SDOT_T(2) LD1RD_T(3) SDOT_T(3) LD1RD_T(4) SDOT_T(4) LD1RD_T(5) SDOT_T(5) LD1RD_T(6) SDOT_T(6) LD1RD_T(7) SDOT_T(7))
+#define SDOT_T2(i) "movprfx z1" S(i) ", z29\n sdot z1" S(i) ".s, z30.b, z20.b\n movprfx z" S(i) ", z29\n sdot z" S(i) ".s, z31.b, z20.b\n"
+#define SDOT_T4(i) "movprfx z1" S(i) ", z29\n sdot z1" S(i) ".s, z30.b, z20.b\n movprfx z" S(i) ", z29\n sdot z" S(i) ".s, z31.b, z20.b\n movprfx z1" S(i) ", z29\n sdot z1" S(i) ".s, z28.b, z20.b\n movprfx z" S(i) ", z29\n sdot z" S(i) ".s, z27.b, z20.b\n"
+LOOP(t_ld1rd_2sdot, "dup z29.s, #0\n" LD1RD_T(0) SDOT_T2(0) LD1RD_T(1) SDOT_T2(1) LD1RD_T(2) SDOT_T2(2) LD1RD_T(3) SDOT_T2(3) LD1RD_T(4) SDOT_T2(4) LD1RD_T(5) SDOT_T2(5) LD1RD_T(6) SDOT_T2(6) LD1RD_T(7) SDOT_T2(7))
+LOOP(t_ld1rd_4sdot, "dup z29.s, #0\n" LD1RD_T(0) SDOT_T4(0) LD1RD_T(1) SDOT_T4(1) LD1RD_T(2) SDOT_T4(2) LD1RD_T(3) SDOT_T4(3))
+#define LD1B_T(i) "ld1b {z20.b}, p0/z, [%1, #" S(i) ", mul vl]\n"
+LOOP(t_ld1b_sdot, "dup z29.s, #0\n" LD1B_T(0) SDOT_T(0) LD1B_T(1) SDOT_T(1) LD1B_T(2) SDOT_T(2) LD1B_T(3) SDOT_T(3) LD1B_T(4) SDOT_T(4) LD1B_T(5) SDOT_T(5) LD1B_T(6) SDOT_T(6) LD1B_T(7) SDOT_T(7))
+#define LD1RQ_T(i) "ld1rqb {z20.b}, p0/z, [%1, #" S(i) "*16]\n"
+LOOP(t_ld1rq_sdot, "dup z29.s, #0\n" LD1RQ_T(0) SDOT_T(0) LD1RQ_T(1) SDOT_T(1) LD1RQ_T(2) SDOT_T(2) LD1RQ_T(3) SDOT_T(3) LD1RQ_T(4) SDOT_T(4) LD1RQ_T(5) SDOT_T(5) LD1RQ_T(6) SDOT_T(6) LD1RQ_T(7) SDOT_T(7))
+LOOP(t_sdoti, R8(SDOTI))
+LOOP(t_ld1rqb, R8(LD1RQB))
+LOOP(t_ld1rw, R8(LD1RW))
+LOOP(t_duplane, R8(DUPLANE))
+LOOP(t_dupgpr, "mov w9, #3\n" R8(DUPGPR))
+LOOP(t_fmuli, R8(FMULI))
+LOOP(t_fmlai, R8(FMLAI))
+LOOP(t_sdoti_ld1rqb, R8(SDOTI) R8(LD1RQB))
 LOOP(t_andimm_u, R8(ANDIMM_U))
 LOOP(t_andvec, R8(ANDVEC))
 LOOP(t_scvtf_u, R8(SCVTF_U))
@@ -86,7 +116,12 @@ int main(void) {
         {"add.s", t_add, 8}, {"and.imm(unchained,+movprfx)", t_andimm_u, 8}, {"and.vec", t_andvec, 8},
         {"scvtf(unchained)", t_scvtf_u, 8}, {"fmla(unchained,normal)", t_fmla_u, 8}, {"mov z,z", t_movz, 8},
         {"eor zero", t_eor0, 8}, {"sunpklo", t_sunpk, 8}, {"uzp1", t_uzp, 8}, {"tbl+sdot", t_tbl_sdot, 16}, {"and+tbl", t_and_tbl, 16},
-        {"sdot+ld1rd", t_sdot_ld1rd, 16}};
+        {"sdot+ld1rd", t_sdot_ld1rd, 16}, {"sdot[idx]", t_sdoti, 8}, {"ld1rqb", t_ld1rqb, 8}, {"ld1rw", t_ld1rw, 8},
+        {"dup z.s[1]", t_duplane, 8}, {"dup z,w", t_dupgpr, 8}, {"fmul[idx]", t_fmuli, 8}, {"fmla[idx]", t_fmlai, 8},
+        {"sdot[idx]+ld1rqb", t_sdoti_ld1rqb, 16}, {"movprfx+sdot[idx] unchained", t_mpsdoti, 8},
+        {"8 sdot[idx] + 2 ld1rqb", t_mpsdoti_ldrq, 10}, {"8x(ld1rd->sdot) dep", t_sdot_ld1rd_dep, 16},
+        {"8x(ld1rd->2 sdot)", t_ld1rd_2sdot, 24}, {"4x(ld1rd->4 sdot)", t_ld1rd_4sdot, 20},
+        {"8x(ld1b->sdot)", t_ld1b_sdot, 16}, {"8x(ld1rqb->sdot)", t_ld1rq_sdot, 16}};
     for (unsigned i = 0; i < sizeof(t) / sizeof(t[0]); i++) {
         double tk = t[i].f(n);
         printf("%-14s %.3f cycles/insn (%.2f insn/cycle)\n", t[i].name, tk * cyc / n / t[i].k,

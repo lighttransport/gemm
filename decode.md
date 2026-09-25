@@ -139,6 +139,48 @@ not drop, because the lanes that finish early give bandwidth to the others;
 hardware barrier (2.2 us, ~0.1
 ms/token; would need dynamic libhwb).
 
+## Speculative decoding (FP4): verification-kernel study
+
+Target: 1.5-2x tok/s with speculative decoding while keeping A16
+exactness. Findings so far (single core, `bench_multi.c`, generator
+`gen/gen_n4.py` -> `q38d_kern_n4.S`):
+
+- Drafters. Prompt lookup (n-gram, `tmp/q38-fast/ngram_sim.py` over the
+  256 generated IDs) accepts too little: 1.08-1.11 tokens per verify pass
+  for k = 1..8. The NVFP4 GGUF contains the NextN/MTP layer `blk.64`
+  (eh_proj Q4_K 10240->5120, full attention layer, NVFP4 FFN, shared head),
+  so an MTP drafter is available; its acceptance rate is not yet measured.
+- A64FX throughput model that fits every kernel measured here: about two
+  vector-register-writing instructions retire per cycle (loads, SDOT, TBL,
+  FP; a fused MOVPRFX is free). KERNEL7 (N = 1) has ~36 writes per pair
+  -> 18.5 cycles predicted, 17.7-18.7 measured. Measured instruction
+  mixes: 8 LD1RD + 8 SDOT = 7.2 cycles; indexed SDOT (`sdot z.s, z.b,
+  z.b[i]`) issues at only ~0.9/cycle, so a 16-row layout with LD1RQ +
+  indexed SDOT is slower.
+- Multi-token F4 A16 kernels (cycles per pair per token; N = 1 is 18.7):
+
+  | kernel | N | L2 | HBM stream |
+  | --- | ---: | ---: | ---: |
+  | one group, depth-4 chains (n4a) | 4 | 14.6 | 14.5 |
+  | one group, depth-2 chains (nb4) | 4 | 15.6 | 15.5 |
+  | one group, alternating chain sets (n4c) | 4 | 14.9 | 14.7 |
+  | two groups share each broadcast, depth-9 chains (g2c) | 2 | 17.4 | 19.5 |
+  | same (g2c) | 4 | **12.2** | **13.1** |
+
+  Every activation broadcast (one LD1RD per SDOT in the pair layout) costs
+  as much as the SDOT it feeds, and A16 needs 8 SDOTs per pair and token,
+  so the per-token verification cost cannot fall far below ~9-10 cycles
+  (model for 4 tokens x 2 groups: 9.5).
+- Consequence. The single-token kernels already stream at ~185 GB/s per
+  CMG (the practical HBM rate), so verification pays extra compute
+  without saving bytes: a 4-token pass costs ~2.6x a 1-token pass in the
+  projections (~20 of 25.7 ms), plus per-token SSM/attention cores, norms
+  and head. Estimated: ~1.7x at 100% acceptance of 3 drafts; with
+  realistic MTP acceptance (~2.5 tokens per pass for 3 drafts, ~1.85 for
+  1) ~1.0-1.1x. The 1.5-2x target needs a verification kernel near
+  ~6 cycles per pair-token (not reachable with A16 SDOT on A64FX in this
+  layout) or acceptance well above 0.9 per drafted token.
+
 ## Next steps (in order)
 
 1. Remove the remaining ~0.7 ms/token. The in-projection phases are
