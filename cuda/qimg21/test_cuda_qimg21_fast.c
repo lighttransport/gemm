@@ -90,6 +90,11 @@ typedef struct {
     /* INT8 activations [rows+16][F], per-row scales, INT32 GEMM scratch */
     CUdeviceptr xq, xs, acc;
     size_t acc_bytes;
+    /* CUTLASS INT8 GEMM with the dequant fused into its epilogue
+     * (--int8-gemm cutlass); without it, cuBLAS INT32 GEMMs plus dequant. */
+    void *i8_plugin;
+    int (*i8_gemm)(void *, int, const void *, const float *, const void *, const float *, int, int, int, int,
+                   void *);
     int streamed[Q21F_BLOCKS], n_streamed;
     CUdeviceptr slot[2];
     CUevent loaded[2], freed[2];
@@ -335,6 +340,10 @@ static int q21f_gemm(q21f_runtime *rt, CUdeviceptr y, int ldy, CUdeviceptr w, CU
  * of four for IMMA; the INT8 activation buffer has slack rows for that. */
 static int q21f_gemm_i8(q21f_runtime *rt, CUdeviceptr y, int ldy, CUdeviceptr w, CUdeviceptr ws, int m, int n,
                         int k) {
+    if (rt->i8_gemm)
+        return rt->i8_gemm((void *)(uintptr_t)y, ldy, (const void *)(uintptr_t)rt->xq, (const float *)(uintptr_t)rt->xs,
+                           (const void *)(uintptr_t)w, (const float *)(uintptr_t)ws, m, n, k, -1,
+                           (void *)rt->compute) ? -1 : 0;
     int chunk = (int)(rt->acc_bytes / ((size_t)n * 4)) & ~15;
     if (chunk < 16) return -1;
     for (int r0 = 0; r0 < m; r0 += chunk) {
@@ -796,6 +805,7 @@ static void q21f_usage(const char *argv0) {
             "  [--vram-budget-mib MIB] [--cfg-batch 0|1] [--fused-gemm 0|1] [--kv-cache on|off]\n"
             "  [--prefix-pass extract|separate] [--plan-only] [--profile]\n"
             "  [--weights bf16|int8|nvfp4 --quant-package DIR [--bf16-blocks 0,31]] [--fp4-gemm cutlass|omma]\n"
+            "  [--int8-gemm cutlass|cublas]\n"
             "  diagnostics: [--trace] [--verify-slots] [--stage-dir DIR] [--calib-dump FILE.npy]\n"
             "  [--attention cutlass-efficient|flash] [--normalization vector4] [--rope host-table-exact]\n"
             "  [--attention-plugin PATH] [--rope-table-base PATH]\n"
@@ -809,7 +819,7 @@ int main(int argc, char **argv) {
     const char *plugin_path = NULL;
     const char *rope_path = "cuda/qimg21/qwen21_rope_freqs.npy";
     const char *stage_dir = NULL, *calib_path = NULL, *package = NULL, *bf16_blocks = NULL;
-    int int8_weights = 0, tail_blocks = 0, fp4_cutlass = 1;
+    int int8_weights = 0, tail_blocks = 0, fp4_cutlass = 1, i8_cutlass = 1;
     char tail_list[160] = "";
     int ih = 16, iw = 16, steps = 1, verbose = 1, cfg_batch = 1, plan_only = 0, profile = 0, fused_gemm = 1;
     int kv_cache = 1, extract = 1, trace = 0, verify_slots = 0, flash = 0;
@@ -856,6 +866,10 @@ int main(int argc, char **argv) {
             const char *m = argv[++i];
             if (strcmp(m, "cutlass") && strcmp(m, "omma")) { q21f_usage(argv[0]); return 2; }
             fp4_cutlass = !strcmp(m, "cutlass");
+        } else if (!strcmp(a, "--int8-gemm") && more) {
+            const char *m = argv[++i];
+            if (strcmp(m, "cutlass") && strcmp(m, "cublas")) { q21f_usage(argv[0]); return 2; }
+            i8_cutlass = !strcmp(m, "cutlass");
         }
         /* Harness aliases so regression.py/editing_regression.py can drive
          * the fast W8A8 path: the package must be a pack_fast.py package. */
@@ -996,6 +1010,12 @@ int main(int argc, char **argv) {
         *(void **)&rt.fp4_gemm = dlsym(rt.fp4_plugin, "q21f_fp4_gemm");
         REQ(rt.fp4_gemm, "q21f_fp4_gemm missing");
     }
+    if (int8_weights == 1 && i8_cutlass) {
+        rt.i8_plugin = dlopen("cuda/qimg21/libq21_fast_int8.so", RTLD_NOW | RTLD_LOCAL);
+        REQ(rt.i8_plugin, "cannot load CUTLASS INT8 plugin: %s (use --int8-gemm cublas)", dlerror());
+        *(void **)&rt.i8_gemm = dlsym(rt.i8_plugin, "q21f_i8_gemm");
+        REQ(rt.i8_gemm, "q21f_i8_gemm missing");
+    }
     GETF(euler, "euler"); GETF(cfg_combine, "cfg_combine"); GETF(checksum, "checksum"); GETF(colmax, "colmax");
 #undef GETF
     /* cutlass-efficient is PyTorch's memory-efficient kernel (reference
@@ -1061,7 +1081,7 @@ int main(int argc, char **argv) {
                           4 * Q21F_D * Q21F_D + Q21F_D * Q21F_D + 64 * Q21F_D) * 2 + Q21F_D * 4;
     plan.activations = q21f_state_bytes(st.rows_max, N, nb, nt_max, st.nc);
     if (int8_weights == 1) {
-        rt.acc_bytes = 128 * Q21F_MIB;
+        rt.acc_bytes = rt.i8_gemm ? 0 : 128 * Q21F_MIB;
         plan.activations += ((size_t)st.rows_max + 16) * (Q21F_F + 4) + rt.acc_bytes;
     } else if (int8_weights == 2)
         plan.activations += (size_t)st.rows_max * (Q21F_F / 2 + Q21F_F / 8 + 4 + Q21F_RANK * 2) + 128 * Q21F_F / 16;
@@ -1171,8 +1191,8 @@ int main(int argc, char **argv) {
     if (int8_weights == 1) {
         rt.xq = q21f_alloc(&rt, ((size_t)st.rows_max + 16) * Q21F_F);
         rt.xs = q21f_alloc(&rt, ((size_t)st.rows_max + 16) * 4);
-        rt.acc = q21f_alloc(&rt, rt.acc_bytes);
-        REQ(rt.xq && rt.xs && rt.acc, "INT8 activation buffers");
+        if (rt.acc_bytes) rt.acc = q21f_alloc(&rt, rt.acc_bytes);
+        REQ(rt.xq && rt.xs && (rt.acc || !rt.acc_bytes), "INT8 activation buffers");
     }
     if (calib_path) {
         rt.calib = q21f_alloc(&rt, (size_t)Q21F_BLOCKS * 4 * Q21F_F * 4);
@@ -1376,6 +1396,8 @@ fail:
     if (staging) cuMemFreeHost(staging);
     if (pinned_te) cuMemFreeHost(pinned_te);
     if (rt.plugin) dlclose(rt.plugin);
+    if (rt.fp4_plugin) dlclose(rt.fp4_plugin);
+    if (rt.i8_plugin) dlclose(rt.i8_plugin);
     free(host_out); free(host_pred); free(sigmas);
     npy_free(&pe); npy_free(&ne); npy_free(&la); npy_free(&cond); npy_free(&rope);
     return rc;

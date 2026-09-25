@@ -30,7 +30,7 @@ native-exact: test_cuda_qimg21_native libq21_cutlass_attention.so libq21_flash_a
 
 native-text-exact: test_cuda_qimg21_text libq21_flash_attention.so qwen21_text_rope.npy
 
-fast: test_cuda_qimg21_fast libq21_fast_attention.so libq21_fast_flash.so libq21_fast_fp4.so qwen21_rope_freqs.npy
+fast: test_cuda_qimg21_fast libq21_fast_attention.so libq21_fast_flash.so libq21_fast_fp4.so libq21_fast_int8.so qwen21_rope_freqs.npy
 
 libq21_fast_attention.so: fast_attention_plugin.cu $(PLUGIN_ARCH_STAMP) | verify-exact-sources
 	@test -f $(PYTORCH_SOURCE)/aten/src/ATen/native/transformers/cuda/mem_eff_attention/kernel_forward.h
@@ -50,6 +50,11 @@ libq21_fast_fp4.so: fast_fp4_plugin.cu $(PLUGIN_ARCH_STAMP) | verify-exact-sourc
 	$(CUDA_HOME)/bin/nvcc -O3 -std=c++17 --expt-relaxed-constexpr --shared -Xcompiler=-fPIC \
 		-gencode arch=compute_120a,code=sm_120a -I$(FLASH_ATTN_SOURCE)/csrc/cutlass/include \
 		-I$(FLASH_ATTN_SOURCE)/csrc/cutlass/tools/util/include -o $@ $<
+
+libq21_fast_int8.so: fast_int8_plugin.cu $(PLUGIN_ARCH_STAMP) | verify-exact-sources
+	@test -f $(FLASH_ATTN_SOURCE)/csrc/cutlass/include/cutlass/gemm/kernel/default_gemm_universal_with_visitor.h
+	$(CUDA_HOME)/bin/nvcc -O3 -std=c++17 --expt-relaxed-constexpr --shared -Xcompiler=-fPIC \
+		-gencode arch=$(CUDA_COMPUTE),code=$(GPU_ARCH) -I$(FLASH_ATTN_SOURCE)/csrc/cutlass/include -o $@ $<
 
 test_cuda_qimg21_fast: test_cuda_qimg21_fast.c qimg21_fast_kernels.h qimg21_fast_fp4.h test_cuda_qimg21_native.c quant_weights.h edit_runtime.h edit_kernels.h mma64_kernels.h norm_vector_kernels.h rope_table_kernels.h joint_layout.h ../../cuda/cuda_runner_common.h ../../cuda/cuew.c ../../cuda/cublasew.c
 	$(CC) -O2 -std=c11 -D_GNU_SOURCE -Wall -Wextra -Wno-unused-function -I../../common -I../../cuda -I../qimg \
@@ -192,7 +197,7 @@ regress:
 	$(PYTHON) regression.py --model /mnt/nvme01/models/qimg-21
 
 clean:
-	rm -f test_cuda_qimg21 test_cuda_qimg21_native test_cuda_qimg21_vae test_cuda_qimg21_vae_encode test_cuda_qimg21_text test_cuda_qimg21_vision test_weight_upload test_quant_weights test_joint_layout test_edit_kernels test_scheduler libq21_cutlass_attention.so libq21_flash_attention.so libq21_cudnn_patch.so libq21_cudnn_vae.so libq21_gelu.so test_cuda_qimg21_fast libq21_fast_attention.so libq21_fast_flash.so libq21_fast_fp4.so qwen21_rope_freqs.npy qwen21_text_rope.npy qwen21_vision_rope.npy qwen_image21.png $(PLUGIN_ARCH_STAMP)
+	rm -f test_cuda_qimg21 test_cuda_qimg21_native test_cuda_qimg21_vae test_cuda_qimg21_vae_encode test_cuda_qimg21_text test_cuda_qimg21_vision test_weight_upload test_quant_weights test_joint_layout test_edit_kernels test_scheduler libq21_cutlass_attention.so libq21_flash_attention.so libq21_cudnn_patch.so libq21_cudnn_vae.so libq21_gelu.so test_cuda_qimg21_fast libq21_fast_attention.so libq21_fast_flash.so libq21_fast_fp4.so libq21_fast_int8.so qwen21_rope_freqs.npy qwen21_text_rope.npy qwen21_vision_rope.npy qwen_image21.png $(PLUGIN_ARCH_STAMP)
 
 FORCE:
 .PHONY: FORCE
