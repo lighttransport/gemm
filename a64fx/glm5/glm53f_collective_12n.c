@@ -335,3 +335,10 @@ int glm53f_sum_allreduce_12n(const float *input, float *output, int count) {
         tp_allreduce_sum(&glm53f_comm, output, count);
     return 0;
 }
+
+int glm53f_sum_allreduce_prefill_12n(const float *input, float *output, int count) {
+    if (!input || !output || count < 1 || count > glm53f_collective_capacity_12n()) return -1;
+    if (count > 5 && glm53f_prefill_algorithm)
+        return glm53f_prefill_reduce_gather(input, output, count, glm53f_prefill_algorithm);
+    return glm53f_sum_allreduce_12n(input, output, count);
+}

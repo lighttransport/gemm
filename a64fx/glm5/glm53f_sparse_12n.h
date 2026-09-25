@@ -33,6 +33,14 @@ void glm53f_sparse_reset_12n(glm53f_sparse_context_12n *context);
 void glm53f_sparse_free_12n(glm53f_sparse_context_12n *context);
 int glm53f_sparse_sublayer_12n(
     void *context, float *output, const float *normalized_input);
+/* Validation hook: apply only this rank's output-projection shard to a full
+ * concatenated-head reference and reduce the 4096-wide result. */
+int glm53f_sparse_output_reference_12n(
+    glm53f_sparse_context_12n *context, float *output,
+    const float *attention_heads);
+int glm53f_sparse_value_reference_12n(
+    glm53f_sparse_context_12n *context, float *local_heads,
+    const float *kv_latent);
 /* Append only persistent KV/indexer state; no query or attention output. */
 int glm53f_sparse_cache_append_12n(
     glm53f_sparse_context_12n *context, const float *normalized_input);
@@ -46,7 +54,14 @@ int glm53f_sparse_is_context_parallel_12n(
     const glm53f_sparse_context_12n *context);
 size_t glm53f_sparse_cache_bytes_12n(
     const glm53f_sparse_context_12n *context);
+/* Validate and read the optional rank-local native GGUF sparse image without
+ * loading the safetensors model or allocating a decode cache. */
+int glm53f_sparse_native_stage_probe_12n(int layer);
 /* Commit zero-length cache pages before a capacity check; rejects live state. */
 int glm53f_sparse_touch_cache_12n(glm53f_sparse_context_12n *context);
+/* Keep the first hot_prefix BF16 latent rows on every CP rank. Zero disables
+ * the optimization and preserves the baseline. */
+int glm53f_sparse_set_hot_prefix_12n(glm53f_sparse_context_12n *context,
+                                     int hot_prefix);
 
 #endif

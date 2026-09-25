@@ -7,6 +7,7 @@ int glm53f_collective_is_utofu_12n(void);
 int glm53f_collective_capacity_12n(void);
 int glm53f_collective_prefill_algorithm_12n(int algorithm);
 int glm53f_sum_allreduce_12n(const float *input, float *output, int count);
+int glm53f_sum_allreduce_prefill_12n(const float *input, float *output, int count);
 int glm53f_sum_allreduce_slabs_12n(const float *input, float *output,
                                   int tokens, int width, int slab_tokens);
 

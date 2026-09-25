@@ -8,12 +8,16 @@ bash a64fx/glm5/run_glm53f_q4_12n.sh
 
 The launcher uses `mpifcc -Nclang`, node-local `/local` staging, and the
 allocation's freshly generated uTofu topology. `GLM53F_Q4_MODEL` overrides
-the first GGUF shard (default: `~/models/glm53f-q4/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf`).
+the first GGUF shard (default:
+`~/models/glm53f-gguf-all/UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf`).
 The underlying shared launcher retains historical Q2 labels in its logs.
 
-This is a hybrid: routed experts use the GGUF's Q4_K, Q5_K and Q6_K tensors;
-shared experts and the compact attention/dense core use the existing
-safetensors-derived images. It is not a fully GGUF-backed model.
+By default (`GLM53F_NATIVE=1`, since job 51909852) the model is **fully
+GGUF-backed**. Every matrix runs from the GGUF's own quantized blocks: routed
+experts (Q4_K/Q5_K/Q6_K), dense FFN layers 0--2, all 34 KDA layers, the 11
+sparse MLA layers, and the shared expert (Q8_0). See the next section.
+`GLM53F_NATIVE=0` selects the older hybrid, where the shared expert and the
+compact attention/dense core come from safetensors-derived FP8/BF16 images.
 
 The routed image occupies 15,456,534,528 bytes per rank. Each expert has eight
 256-column parts distributed over 12 ranks, preserving quantization blocks.
@@ -40,6 +44,164 @@ dequantized weights and the same Q8 activation values. Both conservative and
 fast-math builds pass; worst error normalized by the absolute term sum is
 3.05e-8 or less. This checks fused arithmetic, not activation quantization loss
 or whole-model semantic correctness.
+
+## Fully GGUF-backed UD-Q4_K_XL (job 51909852)
+
+In UD-Q4_K_XL, every non-routed weight matrix is **Q8_0**: embeddings, the
+vocabulary head, all attention and KDA projections, dense FFN, shared experts
+and `hc_*_fn`. Only the routed experts are K-quants. The Q2 native stages
+accepted only Q5_K/Q6_K for these tensors, so native Q4 required Q8_0 support
+throughout.
+
+| Component | Stage tool / env | Source blocks | Per-rank layout |
+| --- | --- | --- | --- |
+| routed experts 3--44 | `glm53f_q2_stage` | Q4_K/Q5_K/Q6_K | 8 x 256-col parts, 15.46 GB |
+| dense FFN 0--2 | `glm53f_q2_dense_stage`, `GLM53F_Q2_DENSE_STAGE` | Q8_0 | gate/up rows, down cols (1024), 40 MB |
+| sparse MLA (11 layers) | `glm53f_q2_sparse_stage`, `GLM53F_Q2_SPARSE_STAGE` | Q8_0 | q_a/kv_a replicated, q_b/v_b head rows, output head cols, 190 MB |
+| KDA (34 layers) | `glm53f_q2_kda_stage` (V3), `GLM53F_Q2_KDA_STAGE` | Q8_0 | Q/K/V/f_b/g_b/beta head rows, f_a/g_a replicated, output **head columns**, 423 MB |
+| shared expert 3--44 | `glm53f_q2_shexp_stage`, `GLM53F_Q2_SHEXP_STAGE` | Q8_0 | 64-aligned intermediate slice (128/192), 105 MB |
+| embeddings / head | `glm53f_q2_{embed,head}_stage` | Q8_0 -> F32 rows | unchanged |
+| mHC, norms, conv, indexer, routers | `glm53f_q2_core_patch` on a copy of the compact core | GGUF -> BF16/F32 | unchanged |
+
+Kernel and runtime changes:
+
+- `glm53f_iq_bridge.c` adds `glm53f_native_type_supported()`, which is the
+  routed set plus Q8_0. The routed-expert predicate is unchanged.
+- Activations follow llama.cpp's `vec_dot` contract: Q8_K-style blocks for
+  K/IQ weights, Q8_0 blocks for Q8_0 weights.
+- Q8_0 rows are **repacked at load time** into contiguous int8 values
+  followed by F32 scales. The fp16-to-fp32 conversion is exact. Per lane, the
+  4-row SDOT kernel computes `acc += float(sdot) * (dw * dx)`, which is the
+  block kernel's operation order. It is bit-identical to the GGUF-layout
+  kernel (30/30 shapes) and runs at 135--157 Gweights/s, against 110 for the
+  GGUF layout, with demand paging.
+- `glm53f_native_matvec_team()` is an orphaned-`omp for` variant. In native
+  KDA it fixes a nested-parallel bug: `glm53f_iq_matvec_2` was called inside
+  `omp parallel` + `omp single`, so native Q/K/V ran on one thread. Q/K/V,
+  f_a, g_a and beta now share one work-shared loop.
+- The KDA output is column-sliced for Q8_0. The 640/768-column head slices
+  align with 32-value blocks, so rank-local activation quantization equals
+  llama.cpp's full-vector quantization. The existing sum all-reduce is kept,
+  replacing the replicated-output allgather.
+- The native sparse value path (`mla_heads_q8_value`) was single-threaded over
+  heads and tokens. It is now work-shared in five phases, keeping each output
+  element's accumulation order.
+- The native shared expert runs gate/up, SwiGLU with the MoE clamp, and down
+  from the Q8_0 slice after the routed experts. It is added before the same
+  all-reduce.
+- Batched prefill/MTP paths keep the compact (GGUF-patched) weights.
+
+Unit test (conservative and fast-math builds):
+
+```text
+PASS K-quants cases=300 worst_normalized_error=2.72467e-08
+PASS Q8_0 native cases=42 repacked_bit_exact=30 worst_normalized_error=3.94545e-08 mixed_pair=BIT_EXACT
+```
+
+### Parity against llama.cpp (token 1234, position 0)
+
+The streamed llama.cpp reference had to be fixed first; see the
+"streamed-reference aliasing" note in `GLM53F_VALIDATION.md`. Against the
+fixed reference, the relative L2 of the 16,384-float layer output is:
+
+| Layer | native GGUF | hybrid |
+| ---: | ---: | ---: |
+| 0 | 0.00590 | 0.00972 |
+| 2 | 0.00520 | 0.00690 |
+| 3 (first sparse/MoE) | 0.00856 | 0.00999 |
+| 7 | 0.00809 | 0.00957 |
+| 11 | 0.00990 | 0.01330 |
+| 15 | 0.00808 | 0.00963 |
+| 16 | 0.0231 | 0.0273 |
+| 20 | 0.0303 | 0.0362 |
+| 21 | 0.136 | 0.141 |
+
+Native is closer to llama.cpp than the hybrid at every layer.
+
+- **Layer 0.** Q/K/V, conv, q/k L2-norm, beta, decay, recurrent scan and
+  gated norm all stay within 1.3e-4 to 5.6e-4 relative L2. The input
+  `attn_norm` differs by only 5.4e-6.
+- **Why the floor is ~0.5%.** A tiny upstream float difference flips Q8_0
+  activation-rounding decisions. The expected amplification is
+  `sqrt(noise*127/3)*3/127`, which predicts 3.4e-4 for `q_proj` and 3.7e-3
+  for `kda_out`; the measured values are 4.3e-4 and 4.3e-3. The floor is set
+  by llama's own Q8_0 activation contract, not by a model discrepancy.
+- **Divergence after layer 20.** Layer 16 selects the same top-8 experts as
+  llama.cpp. Layer 21 is a router near-tie: the biased sigmoid scores of the
+  8th and 9th experts differ by only 0.0065. The 3% accumulated input
+  difference swaps expert 177 (llama) for 188 (production). Downstream
+  trajectories then legitimately diverge, including whether the
+  massive-activation dimensions form by layer 25.
+- **Final token.** Both production arms and llama.cpp select token 220.
+
+Scripts, traces and comparison tables are in `tmp/glm53f-q4-51909852/`:
+`scripts/`, `stream-1234/`, `parity-t1234.txt`, and `scripts/router_check.py`.
+
+### Decode throughput (same allocation, alternating A/B, input token 1)
+
+| Run | tokens | tok/s | min MemAvailable |
+| --- | ---: | ---: | ---: |
+| hybrid 1 | 128 | 21.776 | 9.26 GiB |
+| **native 1** | 128 | **24.952** | 8.63 GiB |
+| hybrid 2 | 128 | 22.448 | 9.28 GiB |
+| **native 2** | 128 | **24.808** | 8.65 GiB |
+
+The 16-step hybrid control at the start of the job measured 20.324 tok/s.
+The production launcher was checked end to end:
+`GLM53F_TARGET_STEPS=128 GLM53F_MIN_TOK_S=20 bash a64fx/glm5/run_glm53f_q4_12n.sh`
+ran the repo build, all native stages, the patched core/shared copies and
+decode. It reported `tok_s=23.947 ... PASS` and `SENTINEL glm53f_q2_12n=OK`,
+with 9.35 GiB minimum MemAvailable and the same final token as the candidate
+runs.
+Native GGUF decode is about 12% faster than the hybrid, mainly because the
+34 KDA layers stream Q8_0 (1.125 B/weight repacked) instead of BF16 (2
+B/weight). Both 128-token outputs are coherent English. With this
+one-token prompt, both fall into greedy repetition loops.
+
+### 8K-context generation (8,049-token C++20 coding prompt, 256 new tokens)
+
+Prompt: `tmp/glm53f-quality-8k/prompt.ids`. Decode windows are 128 tokens.
+
+| Arm | prefill mode | prompt tok/s | decode window 1 | decode window 2 | min MemAvailable |
+| --- | --- | ---: | ---: | ---: | ---: |
+| native | legacy (per token) | ~22.0 | 21.422 | 21.172 | 8.20 GiB |
+| hybrid | legacy (per token) | ~19 | 20.108 | 20.082 | 8.85 GiB |
+| native | fast (mask 27, slab 16, tree-packed) | 34.383 | 21.095 | 20.546 | 8.90 GiB |
+| hybrid | fast | 54.610 | 19.106 | 19.393 | 9.56 GiB |
+
+- **Coherence.** All four outputs are coherent and reason correctly about the
+  sorting task.
+- **Native: fast vs legacy prefill.** The first 66 generated tokens are
+  identical. Native layers use the same kernels in both modes.
+- **Hybrid: fast vs legacy prefill.** The outputs differ from the first token
+  but remain valid ("Let me carefully design…" instead of "The user wants…").
+  Batched FP8/BF16 prefill is a different arithmetic from its per-token path.
+- **Native fast-prefill speed.** Its prompt rate is lower because the native
+  sparse and dense layers still run per token inside a batch.
+
+**Fast-prefill fix.** Before this job, fast prefill with GGUF routed experts
+crashed with SIGSEGV at the first chunk, including with the pre-edit binary.
+`moe_prefill_grouped` passed K-quant expert parts to the FP8 panel kernel
+(`glm53f_matvec_fp8_bits_4x4`, reading a NULL scale pointer). K-quant/IQ
+parts now use `glm53f_iq_expert_weighted` per selected token. That is the
+decode kernel, so routed-expert arithmetic is identical in prefill and
+decode, and each rank's ~2 MB expert part stays L2-resident across its
+tokens.
+
+### Remaining non-native pieces and next steps
+
+- **Still converted, not native.** mHC `hc_*_fn` (Q8_0 in the GGUF) is
+  dequantized to BF16 by `glm53f_q2_core_patch`, and llama.cpp also quantizes
+  its 16,384-float input to Q8_0. The MLA `attn_k_b` (Q8_0) is dequantized to
+  BF16 for the query absorption. At position 0 neither matters; at longer
+  contexts both add small differences against llama.cpp.
+- **Batched prefill/MTP paths** still use the GGUF-patched compact weights for
+  KDA and the FP8 shared image. Native per-token paths are used inside the
+  batch for sparse and dense layers, which caps native fast prefill at
+  ~34 tok/s. Batched Q8_0R kernels (tokens x rows) for KDA, sparse, dense and
+  shared would restore the ~150 tok/s class.
+- **Parity beyond position 0** needs a multi-token streamed reference. The
+  probe runs one token per process today.
 
 ## Measurements
 
@@ -72,6 +234,28 @@ BF16 dot-product, and context-partition smoke checks. This demonstrates a
 coherent compilable output with a formatting violation; it is not exhaustive
 verification of all generated numerical primitives or requested bug fixes.
 Raw output, extracted header and harness are in the same shared log directory.
+
+## Direct UD-Q4_K_XL validation (A64FX 12-node job 51843198)
+
+The six-shard model under
+`$HOME/models/glm53f-gguf-all/UD-Q4_K_XL/` was staged with the requested first
+shard override:
+
+```sh
+export GLM53F_Q4_MODEL="$HOME/models/glm53f-gguf-all/UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf"
+export GLM53F_TARGET_STEPS=16 GLM53F_MIN_TOK_S=0
+export GLM53F_Q4_LOG_DIR="$PWD/tmp/glm53f-q4-$PJM_JOBID"
+bash a64fx/glm5/run_glm53f_q4_12n.sh
+```
+
+The outer interactive timeout occurred after routed and embedding staging, so
+the completed artifacts were resumed without restaging. A fresh topology was
+generated for the current allocation before decode. All twelve routed images
+completed at `15,456,534,528` bytes each. The resumed decode completed 16/16
+steps with `GLM53F_TARGET_DECODE_12N ... tok_s=20.760 ... PASS`; rank 0 loaded
+14.395 GiB of routed data and the sampled minimum `MemAvailable` was
+12.504822 GiB. This confirms that the UD-Q4_K_XL routed path fits comfortably
+in the 32-GiB A64FX nodes when staged locally.
 
 ## SVE unpacking follow-up (job 51370956)
 

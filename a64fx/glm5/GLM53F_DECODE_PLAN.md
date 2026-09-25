@@ -26,6 +26,27 @@ roughly 3--4 tok/s. The slowdown is therefore attributable to the sampling
 collective, not the GLM-5.3-Flash model or prefill kernels. No new A64FX run
 is claimed in this section after allocation 51669230 expired.
 
+### Long-context instrumentation and exact communication reductions
+
+The target runner now supports `--decode-window N`, reporting context-aware
+decode windows using the maximum elapsed rank, and `--ignore-eos` for fixed
+length throughput probes. Load time is reported independently. CP runs may
+enable `--cp-hot-prefix 16384`: each rank keeps a separate BF16 copy of the
+first 16K latent rows, avoiding selected-row exchange while decoding within
+that prefix without overwriting the owner-distributed 512K cache. Cold-row
+CP exchange also uses BF16 transport when the latent cache is BF16.
+
+Fast prefill score exchange now packs only active causal pool columns into one
+exact FP32 collective, eliminating rectangular future-context padding while
+retaining the tree-packed reduction and existing numerical path. These
+changes require fresh 8K/16K A64FX measurements; they do not establish a
+throughput claim by themselves.
+
+The matched two-case control is scripted by
+`run_glm53f_long_context_12n.sh MODEL ROUTED_STAGE SHARED_STAGE PROMPT_IDS
+LOG_DIR`. It runs the replicated 16K-capacity FP32 case and the touched 512K
+BF16 CP case with 512-token windows and fixed 8192-token decode trajectories.
+
 ### Unmeasured optimization opportunities
 
 1. Keep greedy/FP32-KV as the quality and speed baseline; benchmark a fresh

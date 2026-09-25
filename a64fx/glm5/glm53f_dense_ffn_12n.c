@@ -17,11 +17,15 @@
 #include "glm53f_expert_kern.h"
 #include "glm53f_dense_ffn_12n.h"
 #include "glm53f_collective_12n.h"
+#include "glm53f_iq_bridge.h"
+#include <errno.h>
+#include <fcntl.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 enum{H=4096,I=12288,B=128};
 static int glm53f_dense_scalar_reference;
@@ -33,14 +37,111 @@ static inline float dot(const uint8_t*w,const float*s,const float*x,int n){if(gl
 static void mv(float*y,const uint8_t*w,const float*s,const float*x,int rows,int cols){int nb=cols/B;
 #pragma omp parallel for schedule(static)
     for(int r=0;r<rows;r++)y[r]=dot(w+(size_t)r*cols,s+(size_t)(r/B)*nb,x,cols);}
-struct glm53f_dense_ffn_context_12n{int rank,i0,in,lb,hb;uint8_t*g,*u,*d;float*gs,*us,*ds,*gv,*uv,*act,*part,*bgv,*buv,*bact,*bpart;};
-glm53f_dense_ffn_context_12n*glm53f_dense_ffn_create_12n(const char*model,int layer){int rank,nr,i0,in;char n[256];glm53f_st_context*st;glm53f_dense_ffn_context_12n*c;MPI_Comm_rank(MPI_COMM_WORLD,&rank);MPI_Comm_size(MPI_COMM_WORLD,&nr);if(nr!=12||layer<0||layer>2||glm53f_block_aligned_slice(I,B,rank,nr,&i0,&in))return NULL;st=glm53f_st_open(model);if(!st)return NULL;c=calloc(1,sizeof(*c));if(!c)MPI_Abort(MPI_COMM_WORLD,2);c->rank=rank;c->i0=i0;c->in=in;c->hb=H/B;c->lb=in/B;
+struct glm53f_dense_ffn_context_12n{int rank,i0,in,lb,hb;uint8_t*g,*u,*d;float*gs,*us,*ds,*gv,*uv,*act,*part,*bgv,*buv,*bact,*bpart;int q2,gtype,utype,dtype;};
+
+typedef struct { uint64_t offset; int type, rows, columns; } q2_dense_entry;
+
+static size_t q2_row_bytes(int type, int columns) {
+    return glm53f_native_type_supported(type) ?
+           glm53f_iq_row_size(type, columns) : 0;
+}
+
+static int q2_find_entry(const char *manifest, const char *name,
+                         q2_dense_entry *entry) {
+    FILE *f = fopen(manifest, "r");
+    char line[1024], type_name[32], got[256];
+    unsigned long long offset;
+    int type, rows, columns;
+    if (!f) return -1;
+    while (fgets(line, sizeof(line), f)) {
+        if (sscanf(line, "%llu %d %31s %d %d %255s", &offset, &type,
+                   type_name, &rows, &columns, got) == 6 &&
+            !strcmp(got, name)) {
+            *entry = (q2_dense_entry){(uint64_t)offset, type, rows, columns};
+            fclose(f);
+            return 0;
+        }
+    }
+    fclose(f);
+    errno = ENOENT;
+    return -1;
+}
+
+static int q2_read_entry(int fd, const q2_dense_entry *entry, uint8_t **data) {
+    size_t row = q2_row_bytes(entry->type, entry->columns);
+    size_t bytes = (size_t)entry->rows * row;
+    if (!row || !bytes || !(*data = a256(bytes))) return -1;
+    unsigned char *p = *data;
+    uint64_t offset = entry->offset;
+    while (bytes) {
+        ssize_t got = pread(fd, p, bytes, (off_t)offset);
+        if (got < 0) { if (errno == EINTR) continue; return -1; }
+        if (!got) { errno = EIO; return -1; }
+        p += got;
+        offset += (uint64_t)got;
+        bytes -= (size_t)got;
+    }
+    return 0;
+}
+
+static int q2_repack(uint8_t **data, int *type, int rows, int columns) {
+    uint8_t *packed = NULL;
+    if (glm53f_native_repack(*type, *data, rows, columns, &packed, type))
+        return -1;
+    if (packed) { free(*data); *data = packed; }
+    return 0;
+}
+
+static int load_q2_dense(glm53f_dense_ffn_context_12n *c,
+                         const char *stage, int layer) {
+    char manifest[4096], blob[4096], name[256];
+    q2_dense_entry gate, up, down;
+    int fd;
+    snprintf(manifest, sizeof(manifest), "%s/rank%02d.manifest", stage, c->rank);
+    snprintf(blob, sizeof(blob), "%s/rank%02d.blob", stage, c->rank);
+    snprintf(name, sizeof(name), "blk.%d.ffn_gate.weight", layer);
+    if (q2_find_entry(manifest, name, &gate)) return -1;
+    snprintf(name, sizeof(name), "blk.%d.ffn_up.weight", layer);
+    if (q2_find_entry(manifest, name, &up)) return -1;
+    snprintf(name, sizeof(name), "blk.%d.ffn_down.weight", layer);
+    if (q2_find_entry(manifest, name, &down)) return -1;
+    if (gate.rows != c->in || gate.columns != H ||
+        up.rows != c->in || up.columns != H ||
+        down.rows != H || down.columns != c->in ||
+        !glm53f_native_type_supported(gate.type) ||
+        !glm53f_native_type_supported(up.type) ||
+        !glm53f_native_type_supported(down.type) ||
+        (fd = open(blob, O_RDONLY)) < 0) return -1;
+    int rc = q2_read_entry(fd, &gate, &c->g) ||
+             q2_read_entry(fd, &up, &c->u) ||
+             q2_read_entry(fd, &down, &c->d);
+    close(fd);
+    if (rc) return -1;
+    c->gtype = gate.type;
+    c->utype = up.type;
+    c->dtype = down.type;
+    /* Q8_0 rows are repacked into the bit-identical SVE layout. */
+    if (q2_repack(&c->g, &c->gtype, gate.rows, gate.columns) ||
+        q2_repack(&c->u, &c->utype, up.rows, up.columns) ||
+        q2_repack(&c->d, &c->dtype, down.rows, down.columns)) return -1;
+    c->q2 = 1;
+    return 0;
+}
+
+glm53f_dense_ffn_context_12n*glm53f_dense_ffn_create_12n(const char*model,int layer){int rank,nr,i0,in;char n[256];glm53f_st_context*st=NULL;glm53f_dense_ffn_context_12n*c;const char*q2_stage=getenv("GLM53F_Q2_DENSE_STAGE");MPI_Comm_rank(MPI_COMM_WORLD,&rank);MPI_Comm_size(MPI_COMM_WORLD,&nr);if(nr!=12||layer<0||layer>2||glm53f_block_aligned_slice(I,B,rank,nr,&i0,&in))return NULL;c=calloc(1,sizeof(*c));if(!c)MPI_Abort(MPI_COMM_WORLD,2);c->rank=rank;c->i0=i0;c->in=in;c->hb=H/B;c->lb=in/B;
+    if(q2_stage&&*q2_stage){if(load_q2_dense(c,q2_stage,layer))goto fail;}else{st=glm53f_st_open(model);if(!st)goto fail;
 #define N(S) snprintf(n,sizeof n,"model.language_model.layers.%d.mlp.%s",layer,S)
     c->g=a256((size_t)in*H);N("gate_proj.weight");rd(st,n,(size_t)i0*H,c->g,(size_t)in*H,rank);c->u=a256((size_t)in*H);N("up_proj.weight");rd(st,n,(size_t)i0*H,c->u,(size_t)in*H,rank);c->gs=a256((size_t)c->lb*c->hb*4);N("gate_proj.weight_scale_inv");rd(st,n,(size_t)(i0/B)*c->hb*4,c->gs,(size_t)c->lb*c->hb*4,rank);c->us=a256((size_t)c->lb*c->hb*4);N("up_proj.weight_scale_inv");rd(st,n,(size_t)(i0/B)*c->hb*4,c->us,(size_t)c->lb*c->hb*4,rank);c->d=a256((size_t)H*in);N("down_proj.weight");rd_cols(st,n,c->d,H,I,i0,in,rank);c->ds=a256((size_t)(H/B)*c->lb*4);N("down_proj.weight_scale_inv");rd_scale_cols(st,n,c->ds,H/B,I/B,i0/B,c->lb,rank);
 #undef N
-    glm53f_st_close(st);c->gv=a256(in*4);c->uv=a256(in*4);c->act=a256(in*4);c->part=a256(H*4);c->bgv=a256((size_t)4*in*4);c->buv=a256((size_t)4*in*4);c->bact=a256((size_t)4*in*4);c->bpart=a256((size_t)4*H*4);return c;}
+    glm53f_st_close(st);st=NULL;}c->gv=a256(in*4);c->uv=a256(in*4);c->act=a256(in*4);c->part=a256(H*4);c->bgv=a256((size_t)4*in*4);c->buv=a256((size_t)4*in*4);c->bact=a256((size_t)4*in*4);c->bpart=a256((size_t)4*H*4);return c;
+fail:if(st)glm53f_st_close(st);glm53f_dense_ffn_free_12n(c);return NULL;}
 void glm53f_dense_ffn_free_12n(glm53f_dense_ffn_context_12n*c){if(!c)return;free(c->bpart);free(c->bact);free(c->buv);free(c->bgv);free(c->part);free(c->act);free(c->uv);free(c->gv);free(c->ds);free(c->d);free(c->us);free(c->gs);free(c->u);free(c->g);free(c);}
 int glm53f_dense_ffn_sublayer_12n(void*context,float*out,const float*x){glm53f_dense_ffn_context_12n*c=context;if(!c)return-1;
+    if(c->q2){if(glm53f_iq_matvec_2(c->gv,c->g,c->gtype,c->uv,c->u,c->utype,c->in,H,x))return-1;
+#pragma omp parallel for schedule(static)
+        for(int j=0;j<c->in;j++){float a=c->gv[j]>10?10:c->gv[j],b=c->uv[j]>10?10:c->uv[j]<-10?-10:c->uv[j];c->act[j]=a/(1+expf(-a))*b;}
+        if(glm53f_iq_matvec(c->part,c->d,c->dtype,H,c->in,c->act))return-1;
+        return glm53f_sum_allreduce_12n(c->part,out,H);}
     /* Gate and up projections have identical shape and input.  Run them in
      * one OpenMP team so the short decode path pays one launch/barrier while
      * retaining the original row order and arithmetic. */
@@ -50,7 +151,7 @@ int glm53f_dense_ffn_sublayer_12n(void*context,float*out,const float*x){glm53f_d
     for(int j=0;j<c->in;j++){float a=c->gv[j]>10?10:c->gv[j],b=c->uv[j]>10?10:c->uv[j]<-10?-10:c->uv[j];c->act[j]=a/(1+expf(-a))*b;}
 #pragma omp parallel for schedule(static)
     for(int r=0;r<H;r++)c->part[r]=dot(c->d+(size_t)r*c->in,c->ds+(size_t)(r/B)*c->lb,c->act,c->in);return glm53f_sum_allreduce_12n(c->part,out,H);}
-int glm53f_dense_ffn_sublayer_batch_12n(glm53f_dense_ffn_context_12n*c,float*out,const float*x,int tokens){if(!c||!out||!x||tokens<1||tokens>4)return-1;glm53f_mv_fp8_block128_bits_batch(c->bgv,c->g,c->gs,x,tokens,c->in,H);glm53f_mv_fp8_block128_bits_batch(c->buv,c->u,c->us,x,tokens,c->in,H);
+int glm53f_dense_ffn_sublayer_batch_12n(glm53f_dense_ffn_context_12n*c,float*out,const float*x,int tokens){if(!c||!out||!x||tokens<1||tokens>4)return-1;if(c->q2){for(int token=0;token<tokens;token++)if(glm53f_dense_ffn_sublayer_12n(c,out+(size_t)token*H,x+(size_t)token*H))return-1;return 0;}glm53f_mv_fp8_block128_bits_batch(c->bgv,c->g,c->gs,x,tokens,c->in,H);glm53f_mv_fp8_block128_bits_batch(c->buv,c->u,c->us,x,tokens,c->in,H);
 #pragma omp parallel for schedule(static)
     for(int q=0;q<tokens*c->in;q++){float a=c->bgv[q]>10?10:c->bgv[q],b=c->buv[q]>10?10:c->buv[q]<-10?-10:c->buv[q];c->bact[q]=a/(1+expf(-a))*b;}glm53f_mv_fp8_block128_bits_batch(c->bpart,c->d,c->ds,c->bact,tokens,H,c->in);return glm53f_sum_allreduce_12n(c->bpart,out,tokens*H);}
 #ifndef GLM53F_DENSE_NO_MAIN

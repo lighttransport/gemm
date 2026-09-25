@@ -819,3 +819,170 @@ activation kernel. The shortest implementation path is therefore to extend
 the rank-local native-GGUF stage used by dense layers to the sparse compact
 projections and attach those staged Q5_K/Q8_0 tensors in the sparse runtime.
 That avoids both the Q5_K-to-FP8 conversion and a second dequantized model copy.
+
+### Native sparse controlled replay (job 51822120)
+
+Job 51822120 validated the resulting native sparse stage from a fresh 12-node
+interactive allocation. All twelve rank-local images passed staging and
+native-load probes. The build and MPI runtime were both pinned to Fujitsu
+TCSDS 1.2.43; `LD_LIBRARY_PATH` must include `$OPAL_PREFIX/lib64`, otherwise
+the inherited environment can load the OSS-CN MPI libraries despite compiling
+with `mpifcc`.
+
+A new controlled 12-rank checker fed the retained llama.cpp layer-3
+`attn_norm` vector directly to the production sparse layer. This removes all
+earlier-layer drift from the comparison:
+
+| Controlled layer-3 boundary | Relative L2 | Maximum absolute error |
+| --- | ---: | ---: |
+| normalized Q-A | 1.32491307e-7 | 7.15255737e-7 |
+| sharded Q-B | 3.61090577e-4 | 0.00263023376 |
+| normalized KV-A | 1.79616619e-4 | 0.000197410583 |
+| DSA output | 0.00740033475 | 0.0134209991 |
+
+The first three native-GGUF projection boundaries pass the selected `1e-3`
+parity gate. The final DSA output does not, so staged numerical parity is not
+complete. A control using the higher-precision FP8 compact fallback was worse
+at all four boundaries (`0.0147061`, `0.00926666`, `0.00389477`, and
+`0.0162617` respectively). The native Q2 path is therefore an improvement and
+should remain enabled for exact-GGUF validation. The next localization point
+is the pre-output attention/value vector: the current dump jumps directly
+from close Q/KV projections to the amplified Q5/Q6 output.
+
+The full token-1234 replay used the final Q8_0 activation arithmetic and
+reported every comparison before returning its aggregate failure. Layer-3
+relative L2 values were `0.0111027` at attention input, `0.00989538` at Q-A,
+`0.00827993` at Q-B, `0.00775978` at KV-A, `0.00959873` at DSA output,
+`0.234513` at cancellation-sensitive mHC post, `0.118155` at FFN input,
+`0.0450075` at routed FFN output, and `0.0627390` at layer output. All values
+were finite. The instrumented run selected token 2 with logit 11.0115051.
+
+Non-instrumented one-step observations from the same staged images were input
+1 to token 5556 at 13.748 tok/s, input 42 to token 154822 at 13.783 tok/s, and
+input 1234 to token 2 at 12.457 tok/s. Their minimum available memory was
+18.238, 18.210, and 18.390 GiB respectively. Logs and source snapshots are in
+`tmp/glm53f-resume-51822120/` and `tmp/glm53f-q2-sublayer-51822120/`.
+
+The same allocation then retained the previously uncollected llama.cpp
+`kqv_out` callback. Replaying retained layer-2 output reproduced the old
+layer-3 attention input and DSA output bit-for-bit. The original native path's
+controlled pre-output heads differed by `0.00635199` relative L2 (FP8 fallback
+`0.00807737`), proving that the residual preceded the output projection.
+
+Adding rank-local GGUF Q8_0 `attn_v_b.weight` rows reduced pre-output error to
+`0.00217697`. Replacing the shared scale converter's mantissa truncation with
+IEEE FP16 round-to-nearest further reduced controlled final DSA error to
+`0.00361088`. An output-only control fed exact llama `kqv_out` through the
+native Q5/Q6 output projection and matched at `1.95090e-7`; an exact-latent
+Q8 value control measured `0.00157805`. The remaining strict-gate failure is
+therefore Q8 value arithmetic plus KV-latent input error, not output-projection
+layout or collective reduction.
+
+The first non-instrumented Q8-value end-to-end run selected token 6746 for
+input 1234, with logit 10.8141556, 12.832 tok/s, and 18.230 GiB minimum
+available memory. This is a material arithmetic change from the earlier token
+2, but still not token-equivalent to llama.cpp's 29656.
+
+The remaining value discrepancy was then resolved as a cache-contract issue.
+On the real latent, the native activation quantizer matched llama.cpp
+byte-for-byte, and native Q8 dot products matched its compiled kernel at
+`1.18222e-7` relative L2. The llama graph's `dsa_kv_latent` callback is F32,
+but attention reads V after the latent has passed through its FP16 KV cache.
+After applying that FP16 cache round-trip to selected rows, controlled
+`kqv_out` became bit-exact and final DSA output reached `1.95090e-7` relative
+L2 (`5.96046e-7` maximum absolute). This passes the selected `1e-3` staged
+parity gate.
+
+The final exact-cache end-to-end input-1234 run still selected token 2, with
+logit 11.4729633, 13.031 tok/s, and 18.188 GiB minimum available memory. Token
+identity remains a full-chain diagnostic: the isolated layer-3 sparse path is
+now cleared, while earlier KDA and accumulated trunk differences remain.
+
+The same job then returned to the first unresolved layer-0 KDA boundary and
+fed llama.cpp's retained `attn_norm` vector into the original GGUF Q/K/V
+blocks.  The A64FX native Q5_K/Q6_K by Q8_K bridge matched llama.cpp at
+`1.16850e-7`, `1.48106e-7`, and `1.67960e-7` relative L2 respectively; all
+maximum absolute differences were at most `4.76837e-7`.  In the same probe,
+BF16-restaged weights remained at `0.00389691`, `0.00384826`, and
+`0.00463610`.  This clears the bridge arithmetic and confirms that KDA must
+retain its native GGUF blocks for exact validation.  The next implementation
+increment is a bounded rank-local KDA stage for layers 0--2 Q/K/V rows and
+output-projection columns, followed by the existing internal KDA boundary
+gate and the token-1234 full-chain diagnostic.
+
+That increment was implemented in job 51822120.  The V2 KDA stage preserves
+rank-owned native Q/K/V rows and replicates each full output matrix because
+the 5/6-head column partition is not uniformly aligned to 256-value GGML
+blocks.  The runtime gathers the normalized 8,192-vector, distributes native
+output rows, and retains the existing all-reduce.  All twelve stage images
+completed at 87,515,136 bytes per node.
+
+In controlled layer-0 replay, Q/K/V remained at `1.16850e-7`, `1.48106e-7`,
+and `1.67960e-7`.  Recurrent scan and gated norm reached `4.54663e-4` and
+`8.23865e-4`; final KDA output reached `0.00415234` relative L2 with
+`9.35061e-5` maximum absolute error.  This is substantially lower than both
+the `0.0353940` hybrid native-QKV/compact-output control and the historical
+`0.0132845` all-compact result.  Normalized K (`0.00264975`) and decay gate
+(`0.00290728`) now identify the next compact auxiliary/convolution boundary.
+
+Full-chain one-step tests preserved token 1 to 5556 and token 42 to 154822.
+Token 1234 moved from 2 to 9406 at logit 11.2475157 and 10.645 tok/s, still
+short of llama.cpp token 29656.  The KDA native stage is therefore validated
+as a material parity improvement, not complete full-chain equivalence.  Its
+current contract is single-token decode; KDA batch/prefill continues to use
+the compact path.
+
+The follow-up KDA control added pre-normalization dumps.  Native Q/K/V
+convolution outputs matched llama at `8.76e-8`, `6.92e-8`, and `1.38e-7`
+relative L2.  llama's `ggml_l2_norm` uses `1 / max(sqrt(sum), eps)`, not
+`1 / sqrt(sum + eps)`; applying that exact contract reduced normalized-Q/K
+errors to `1.05532e-7` and `1.56734e-7`, and KDA output to `0.00411125`.
+The remaining layer-0 gate error is `0.00290728` in the compact auxiliary
+decay projection.  The corrected token-1234 full-chain check selected token 2
+with logit `10.5694981` at `10.465 tok/s`.
+
+### Streamed-reference aliasing at sparse layers (job 51909852)
+
+The streamed llama.cpp reference (`glm53f_stream_graph_probe`) corrupted the
+residual stream at every sparse layer.
+
+**Mechanism.**
+
+- The probe loads the model with `no_alloc`, so the KV cache receives a
+  zero-size dummy buffer.
+- The streamed-validation hack in the fork's `ggml_backend_tensor_alloc`
+  (`~/work/llama.cpp`, commit fbec0ddd8) let the graph allocator bind that
+  cache into the reused compute buffer.
+- The MLA latent row (512 x F16 = 1,024 bytes) then overwrote the first
+  1,024 bytes of the streamed hidden input.
+- After every sparse layer, stream 0 elements [0:256] held the F16 latent
+  bits read as F32.
+
+**Evidence.** On UD-Q4_K_XL, token 1234, layer 3:
+
+- The reference `hc_attn_post` stream 0 has cosine 0.996 with the packed F16
+  `dsa_kv_a_norm` row.
+- Every other 256-element chunk matches production at 0.3--0.9%.
+- Streams 1--3 of the reference are exact linear combinations of the
+  attention output and the incoming streams (residual below 1e-4). Stream 0
+  has a 24% unexplained residual concentrated in [0:256].
+
+**Consequence.** The failure pattern was independent of the weights.
+
+- For both Q2 and Q4 weights, the corrupted reference produced the same
+  errors against production: about 23% at `hc_attn_post-3`, 12% at
+  `ffn_norm-3`, and layer outputs jumping to 23%/86% at layers 7/11.
+- The Q2 conclusions above that cite a "cancellation-sensitive mHC post"
+  (`0.234513`) and the full-chain target token `29656` were therefore
+  measured against a corrupted reference. They should be re-derived.
+
+**Fix.** An uncommitted edit to `ggml/src/ggml-backend.cpp` in
+`~/work/llama.cpp` gives dummy-buffer (size 0) tensors private, zeroed,
+persistent memory instead of a compute-buffer slot. Rebuild the probe from a
+tree containing this fix before generating any new streamed reference.
+
+**Result.** With the fix, native GGUF Q4 production against llama.cpp stays
+flat at 0.5--1.0% relative L2 through layer 15 and 3% at layer 20. Layer 21
+has a router near-tie: the 8th/9th biased score margin is 0.0065, so one of
+eight experts is swapped. Both select final token 220. Full tables are in
+`GLM53F_Q4_12N.md`.

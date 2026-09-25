@@ -96,15 +96,41 @@ TMPDIR="$build_dir" "$cc" "${cflags[@]}" glm53f_prefill_12n.c \
     "${objects[@]}" "$build_dir/target.o" \
     "${ldflags[@]}" -o glm53f_prefill_12n
 TMPDIR="$build_dir" "$cc" "${cflags[@]}" glm53f_kda_callback_check.c \
-    "$build_dir/kda.o" "$build_dir/collective.o" "${ldflags[@]}" -o glm53f_kda_callback_check
+    "$build_dir/kda.o" "$build_dir/iq_bridge.o" "$build_dir/collective.o" \
+    "${ldflags[@]}" -o glm53f_kda_callback_check
+TMPDIR="$build_dir" "$cc" "${cflags[@]}" test_glm53f_kda_reference_12n.c \
+    "$build_dir/kda.o" "$build_dir/iq_bridge.o" "$build_dir/collective.o" \
+    "${ldflags[@]}" -o test_glm53f_kda_reference_12n
 TMPDIR="$build_dir" "$cc" "${cflags[@]}" \
     -DGLM53F_SPARSE_NO_MAIN glm53f_sparse_batch_check.c \
-    glm53f_sparse_layer_12n.c "$build_dir/collective.o" \
+    glm53f_sparse_layer_12n.c "$build_dir/iq_bridge.o" "$build_dir/collective.o" \
     "${ldflags[@]}" -o glm53f_sparse_batch_check
+TMPDIR="$build_dir" "$cc" "${cflags[@]}" test_glm53f_iq_bridge.c \
+    "$build_dir/iq_bridge.o" "${ldflags[@]}" -o test_glm53f_iq_bridge
+TMPDIR="$build_dir" "$cc" "${cflags[@]}" "${external[@]}" \
+    glm53f_sparse_native_stage_probe_12n.c "$build_dir/sparse.o" \
+    "$build_dir/iq_bridge.o" "$build_dir/collective.o" \
+    "${ldflags[@]}" -o glm53f_sparse_native_stage_probe_12n
+TMPDIR="$build_dir" "$cc" "${cflags[@]}" "${external[@]}" \
+    test_glm53f_sparse_reference_12n.c "$build_dir/sparse.o" \
+    "$build_dir/iq_bridge.o" "$build_dir/collective.o" \
+    "${ldflags[@]}" -o test_glm53f_sparse_reference_12n
 TMPDIR="$build_dir" "$cc" "${cflags[@]}" glm53f_q2_stage.c \
     -o glm53f_q2_stage
 TMPDIR="$build_dir" "$cc" "${cflags[@]}" glm53f_q2_embed_stage.c \
     -o glm53f_q2_embed_stage
+TMPDIR="$build_dir" "$cc" "${cflags[@]}" glm53f_q2_dense_stage.c \
+    -o glm53f_q2_dense_stage
+TMPDIR="$build_dir" "$cc" "${cflags[@]}" glm53f_q2_sparse_stage.c \
+    -o glm53f_q2_sparse_stage
+TMPDIR="$build_dir" "$cc" "${cflags[@]}" glm53f_q2_kda_stage.c \
+    -o glm53f_q2_kda_stage
+TMPDIR="$build_dir" "$cc" "${cflags[@]}" glm53f_q2_shexp_stage.c \
+    -o glm53f_q2_shexp_stage
+TMPDIR="$build_dir" "$cc" "${cflags[@]}" glm53f_q2_core_patch.c \
+    -lm -o glm53f_q2_core_patch
+TMPDIR="$build_dir" "$cc" "${cflags[@]}" glm53f_q2_shared_patch.c \
+    -lm -o glm53f_q2_shared_patch
 TMPDIR="$build_dir" "$cc" "${cflags[@]}" \
     '-DGLM53F_Q2_MATRIX_NAME="output.weight"' \
     '-DGLM53F_Q2_STAGE_LABEL="glm53f_q2_head_stage"' \
@@ -112,6 +138,12 @@ TMPDIR="$build_dir" "$cc" "${cflags[@]}" \
     glm53f_q2_embed_stage.c -o glm53f_q2_head_stage
 TMPDIR="$build_dir" "$cc" "${cflags[@]}" glm53f_core_stage.c \
     -o glm53f_core_stage
+TMPDIR="$build_dir" "$cc" "${cflags[@]}" glm53f_q8_stage.c \
+    -o glm53f_q8_stage
+TMPDIR="$build_dir" "$cc" "${cflags[@]}" -c glm53f_q8_resident.c \
+    -o "$build_dir/q8_resident.o"
+TMPDIR="$build_dir" "$cc" "${cflags[@]}" test_glm53f_q8_resident.c \
+    "$build_dir/q8_resident.o" -o test_glm53f_q8_resident
 TMPDIR="$build_dir" "$cc" "${cflags[@]}" glm53f_core_add_routers.c \
     -lm -o glm53f_core_add_routers
 TMPDIR="$build_dir" "$cc" "${cflags[@]}" test_glm53f_int8.c \
@@ -131,7 +163,7 @@ TMPDIR="$build_dir" "$cc" "${cflags[@]}" test_glm53f_state_io.c \
 TMPDIR="$build_dir" "$cc" "${cflags[@]}" test_glm53f_mhc_prefill.c \
     -lm -o test_glm53f_mhc_prefill
 TMPDIR="$build_dir" "$cc" "${cflags[@]}" test_glm53f_sparse_prefill.c \
-    "$build_dir/collective.o" "${ldflags[@]}" -o test_glm53f_sparse_prefill
+    "$build_dir/iq_bridge.o" "$build_dir/collective.o" "${ldflags[@]}" -o test_glm53f_sparse_prefill
 TMPDIR="$build_dir" "$cc" "${cflags[@]}" test_glm53f_collective_payload_12n.c \
     "$build_dir/collective.o" "${ldflags[@]}" -o test_glm53f_collective_payload_12n
 TMPDIR="$build_dir" "$cc" "${cflags[@]}" test_glm53f_index_score.c \
@@ -143,11 +175,11 @@ TMPDIR="$build_dir" "$cc" "${cflags[@]}" test_glm53f_mhc_scalar_real.c \
 TMPDIR="$build_dir" "$cc" "${cflags[@]}" glm53f_mtp_expert_check.c \
     -lm -o glm53f_mtp_expert_check
 TMPDIR="$build_dir" "$cc" "${cflags[@]}" test_glm53f_sparse_math.c \
-    "$build_dir/collective.o" "${ldflags[@]}" -o test_glm53f_sparse_math
+    "$build_dir/iq_bridge.o" "$build_dir/collective.o" "${ldflags[@]}" -o test_glm53f_sparse_math
 TMPDIR="$build_dir" "$cc" "${cflags[@]}" test_glm53f_sparse_cp.c \
-    "$build_dir/collective.o" "${ldflags[@]}" -o test_glm53f_sparse_cp
+    "$build_dir/iq_bridge.o" "$build_dir/collective.o" "${ldflags[@]}" -o test_glm53f_sparse_cp
 TMPDIR="$build_dir" "$cc" "${cflags[@]}" -DGLM53F_SPARSE_NO_MAIN test_glm53f_sparse_prefix.c \
-    glm53f_sparse_layer_12n.c "$build_dir/collective.o" "${ldflags[@]}" -o test_glm53f_sparse_prefix
+    glm53f_sparse_layer_12n.c "$build_dir/iq_bridge.o" "$build_dir/collective.o" "${ldflags[@]}" -o test_glm53f_sparse_prefix
 TMPDIR="$build_dir" "$cc" "${cflags[@]}" test_glm53f_quant_model_12n.c \
     "${objects[@]}" "$build_dir/target.o" "${ldflags[@]}" -o test_glm53f_quant_model_12n
 TMPDIR="$build_dir" "$cc" "${cflags[@]}" glm53f_expert_decode_12n.c \

@@ -1903,14 +1903,9 @@ static inline void gemm_bf16_f32_tokmajor(float *Y, const uint16_t *W, const flo
  * scales, which are always small positive values (absmax/127), so the
  * subnormal/overflow branches below are defensive rather than hot. */
 static inline uint16_t ggml_fp32_to_fp16(float f) {
-    union { float f; uint32_t u; } u; u.f = f;
-    uint32_t bits = u.u;
-    uint32_t sign = (bits >> 16) & 0x8000;
-    int32_t  exp  = (int32_t)((bits >> 23) & 0xff) - 127 + 15;
-    uint32_t mant = (bits >> 13) & 0x3ff;
-    if (exp <= 0)       return (uint16_t)sign;
-    if (exp >= 31)      return (uint16_t)(sign | 0x7c00);
-    return (uint16_t)(sign | ((uint32_t)exp << 10) | mant);
+    union { _Float16 f; uint16_t u; } h;
+    h.f = (_Float16)f;
+    return h.u;
 }
 
 

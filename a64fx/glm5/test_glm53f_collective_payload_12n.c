@@ -42,6 +42,10 @@ int main(int argc, char **argv) {
     MPI_Allreduce(&exact,&all_exact,1,MPI_INT,MPI_MIN,MPI_COMM_WORLD);
     if (!rank) printf("COLLECTIVE_TREE_REFERENCE algorithm=%d exact=%d rel_l2=%.9g\n",algorithm,all_exact,sqrt(err/norm));
     if (algorithm>=3) failed |= !all_exact;
+    if (glm53f_sum_allreduce_prefill_12n(input, output, HIDDEN * TOKENS))
+        MPI_Abort(MPI_COMM_WORLD, 3);
+    for (int i = 0; i < HIDDEN * TOKENS; ++i)
+        failed |= !isfinite(output[i]);
     failed |= glm53f_collective_capacity_12n() != HIDDEN * TOKENS;
     failed |= glm53f_sum_allreduce_12n(input, output, HIDDEN * TOKENS + 1) != -1;
     failed |= glm53f_sum_allreduce_12n(input, output, 0) != -1;

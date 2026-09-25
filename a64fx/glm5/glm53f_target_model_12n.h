@@ -16,6 +16,10 @@ int glm53f_target_model_configure_prefill_12n(glm53f_target_model_12n *model,
 int glm53f_target_model_convert_int8_12n(glm53f_target_model_12n *model);
 int glm53f_target_model_convert_kda_int8_12n(glm53f_target_model_12n *model);
 int glm53f_target_model_touch_cache_12n(glm53f_target_model_12n *model);
+/* Must be called while the model is empty. Storage is separate from the
+ * owner-distributed cache and is safe for 512K-capacity runs. */
+int glm53f_target_model_set_cp_hot_prefix_12n(glm53f_target_model_12n *model,
+                                              int hot_prefix);
 const float *glm53f_target_model_logits_12n(const glm53f_target_model_12n *model,
                                            int *first, int *count);
 /* Evaluate the last completed token without advancing any cache. Invalid

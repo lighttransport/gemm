@@ -16,6 +16,10 @@ int glm53f_iq_type_supported(int type) {
            type == GLM53F_GGML_IQ4_XS;
 }
 
+size_t glm53f_iq_row_size(int type, int columns) {
+    return columns > 0 ? dequant_row_size((uint32_t)type, columns) : 0;
+}
+
 static float q6_k_q8_row(const block_q6_K *w,
                          const glm5_iq_q8_block *x, int blocks) {
     const svbool_t p8 = svptrue_b8(), p32 = svptrue_b32();
@@ -139,6 +143,348 @@ static float iq_row(int type, const uint8_t *row,
     glm5_tensor tensor = {0};
     tensor.type = (glm5_qtype)type;
     return glm5_iq_q8_row(&tensor, row, xq, blocks);
+}
+
+/* llama.cpp's Q8_0 matrix path does not multiply the stored Q8 weights by
+ * the original F32 activation.  It first quantizes each 32-value activation
+ * block to Q8_0 (including the fp16-rounded scale), then performs Q8 x Q8.
+ * Preserve that contract here; the distinction is visible after mHC even
+ * though both variants are close for an isolated projection. */
+static void quantize_q8_0_activation(block_q8_0 *q, const float *x, int n) {
+    const svbool_t pg = svptrue_b32();
+    const int vl = (int)svcntw();
+    for (int b = 0; b < n / 32; ++b) {
+        const float *xb = x + 32 * b;
+        svfloat32_t vmax = svdup_f32(0.0f);
+        for (int j = 0; j < 32; j += vl)
+            vmax = svmax_f32_x(pg, vmax,
+                svabs_f32_x(pg, svld1_f32(pg, xb + j)));
+        const float amax = svmaxv_f32(pg, vmax);
+        const float d = amax / 127.0f;
+        const float id = d != 0.0f ? 1.0f / d : 0.0f;
+        q[b].d = ggml_fp32_to_fp16(d);
+        for (int j = 0; j < 32; j += vl) {
+            svfloat32_t v = svmul_n_f32_x(pg, svld1_f32(pg, xb + j), id);
+            svint32_t iv = svcvt_s32_f32_x(pg, svrintn_f32_x(pg, v));
+            svst1b_s32(pg, q[b].qs + j, iv);
+        }
+    }
+}
+
+static float q8_0_q8_0_row(const block_q8_0 *w,
+                            const block_q8_0 *x, int blocks) {
+    const svbool_t p8 = svptrue_b8();
+    const svbool_t lo32 = svptrue_pat_b8(SV_VL32);
+    const svbool_t hi32 = svnot_b_z(p8, lo32);
+    const svbool_t p32 = svptrue_b32();
+    const svbool_t lo8 = svptrue_pat_b32(SV_VL8);
+    const svbool_t hi8 = svnot_b_z(p32, lo8);
+    svfloat32_t acc = svdup_f32(0.0f);
+    int b = 0;
+    for (; b + 1 < blocks; b += 2) {
+        svint8_t wq = svld1_s8(lo32, w[b].qs);
+        wq = svadd_s8_x(p8, wq, svld1_s8(hi32, w[b].qs + 2));
+        svint8_t xq = svld1_s8(lo32, x[b].qs);
+        xq = svadd_s8_x(p8, xq, svld1_s8(hi32, x[b].qs + 2));
+        const float s0 = ggml_fp16_to_fp32(w[b].d) *
+                         ggml_fp16_to_fp32(x[b].d);
+        const float s1 = ggml_fp16_to_fp32(w[b + 1].d) *
+                         ggml_fp16_to_fp32(x[b + 1].d);
+        const svfloat32_t scale = svdup_f32_m(
+            svdup_f32_z(lo8, s0), hi8, s1);
+        acc = svmla_f32_m(p32, acc,
+            svcvt_f32_s32_x(p32, svdot_s32(svdup_s32(0), wq, xq)), scale);
+    }
+    float sum = svaddv_f32(p32, acc);
+    if (b < blocks) {
+        int dot = 0;
+        for (int j = 0; j < 32; ++j)
+            dot += (int)w[b].qs[j] * (int)x[b].qs[j];
+        sum += (float)dot * ggml_fp16_to_fp32(w[b].d) *
+               ggml_fp16_to_fp32(x[b].d);
+    }
+    return sum;
+}
+
+int glm53f_native_type_supported(int type) {
+    return glm53f_iq_type_supported(type) || type == GLM53F_GGML_Q8_0 ||
+           type == GLM53F_NATIVE_Q8_0R;
+}
+
+/* A prepared activation carries both llama.cpp activation contracts: Q8_K
+ * style 256-value blocks for K/IQ weights and Q8_0 32-value blocks for Q8_0
+ * weights.  Only the formats requested by the caller are populated. */
+typedef struct {
+    int columns, has_q8k, has_q80;
+    glm5_iq_q8_block *q8k;
+    block_q8_0 *q80;
+    int8_t *xq;      /* Q8_0 values, contiguous (repacked-weight path). */
+    float *xpat;     /* per 64 values: 8 lanes of d[2k], 8 lanes of d[2k+1]. */
+} native_act;
+
+static size_t align256(size_t n) { return (n + 255) & ~(size_t)255; }
+
+size_t glm53f_native_act_bytes(int columns) {
+    if (columns < 32 || columns % 32) return 0;
+    return align256(sizeof(native_act)) +
+           align256((size_t)(columns / 256 + 1) * sizeof(glm5_iq_q8_block)) +
+           align256((size_t)(columns / 32) * sizeof(block_q8_0)) +
+           align256((size_t)columns) +
+           align256((size_t)(columns / 64 + 1) * 16 * sizeof(float));
+}
+
+int glm53f_native_act_prepare(void *storage, const float *input, int columns,
+                              int need_q8k, int need_q80) {
+    if (!storage || !input || columns < 32 || columns % 32 ||
+        (need_q8k && columns % 256)) return -1;
+    native_act *a = storage;
+    unsigned char *base = storage;
+    a->columns = columns;
+    a->q8k = (glm5_iq_q8_block *)(base + align256(sizeof(native_act)));
+    a->q80 = (block_q8_0 *)((unsigned char *)a->q8k +
+        align256((size_t)(columns / 256 + 1) * sizeof(glm5_iq_q8_block)));
+    a->xq = (int8_t *)((unsigned char *)a->q80 +
+        align256((size_t)(columns / 32) * sizeof(block_q8_0)));
+    a->xpat = (float *)((unsigned char *)a->xq + align256((size_t)columns));
+    a->has_q8k = a->has_q80 = 0;
+    if (need_q8k) {
+        pthread_once(&glm5_iq_lut_once, glm5_iq_init_luts);
+        glm5_iq_quant_q8(a->q8k, input, columns);
+        a->has_q8k = 1;
+    }
+    if (need_q80) {
+        quantize_q8_0_activation(a->q80, input, columns);
+        for (int b = 0; b < columns / 32; ++b) {
+            memcpy(a->xq + 32 * b, a->q80[b].qs, 32);
+            const float d = ggml_fp16_to_fp32(a->q80[b].d);
+            for (int j = 0; j < 8; ++j)
+                a->xpat[(b >> 1) * 16 + (b & 1) * 8 + j] = d;
+        }
+        a->has_q80 = 1;
+    }
+    return 0;
+}
+
+/* Repacked Q8_0 row: int8 q[columns] followed by float d[columns / 32].
+ * The fp16 -> fp32 scale conversion is exact, so the arithmetic is the same
+ * as the GGUF block layout; only the memory layout is SVE friendly. */
+size_t glm53f_native_row_size(int type, int columns) {
+    if (type == GLM53F_NATIVE_Q8_0R)
+        return columns > 0 && columns % 64 == 0 ?
+               (size_t)columns + (size_t)(columns / 32) * sizeof(float) : 0;
+    return glm53f_iq_row_size(type, columns);
+}
+
+int glm53f_native_repack(int type, const uint8_t *source, int rows,
+                         int columns, uint8_t **output, int *output_type) {
+    if (!source || !output || !output_type || rows < 1) return -1;
+    if (type != GLM53F_GGML_Q8_0 || columns % 64 ||
+        getenv("GLM53F_NATIVE_NO_REPACK")) {
+        *output = NULL;
+        *output_type = type;
+        return 0;
+    }
+    const size_t rb = glm53f_native_row_size(GLM53F_NATIVE_Q8_0R, columns);
+    const size_t sb = (size_t)(columns / 32) * sizeof(block_q8_0);
+    uint8_t *p = NULL;
+    if (posix_memalign((void **)&p, 256, (size_t)rows * rb)) return -1;
+#pragma omp parallel for schedule(static)
+    for (int r = 0; r < rows; ++r) {
+        const block_q8_0 *src = (const block_q8_0 *)(source + (size_t)r * sb);
+        int8_t *q = (int8_t *)(p + (size_t)r * rb);
+        float *d = (float *)(p + (size_t)r * rb + columns);
+        for (int b = 0; b < columns / 32; ++b) {
+            memcpy(q + 32 * b, src[b].qs, 32);
+            d[b] = ggml_fp16_to_fp32(src[b].d);
+        }
+    }
+    *output = p;
+    *output_type = GLM53F_NATIVE_Q8_0R;
+    return 0;
+}
+
+/* Up to four repacked rows share each activation vector.  Per lane this is
+ * acc += float(sdot) * (dw * dx), exactly q8_0_q8_0_row's operation order. */
+static inline void q8_0r_rows(float *out, const uint8_t *w, size_t rb,
+                              int nrows, const native_act *a) {
+    const int columns = a->columns, pairs = columns / 64;
+    const svbool_t p8 = svptrue_b8(), p32 = svptrue_b32();
+    const svbool_t lo8 = svptrue_pat_b32(SV_VL8);
+    const int8_t *q[4];
+    const float *d[4];
+    for (int r = 0; r < 4; ++r) {
+        const int rr = r < nrows ? r : 0;
+        q[r] = (const int8_t *)(w + (size_t)rr * rb);
+        d[r] = (const float *)(w + (size_t)rr * rb + columns);
+    }
+    svfloat32_t acc0 = svdup_f32(0.0f), acc1 = acc0, acc2 = acc0, acc3 = acc0;
+    for (int k = 0; k < pairs; ++k) {
+        const svint8_t xv = svld1_s8(p8, a->xq + 64 * k);
+        const svfloat32_t xs = svld1_f32(p32, a->xpat + 16 * k);
+#define GLM53F_Q8R_ROW(R, ACC) do { \
+        const svint8_t wv = svld1_s8(p8, q[R] + 64 * k); \
+        const svfloat32_t ws = svsel_f32(lo8, svdup_f32(d[R][2 * k]), \
+                                         svdup_f32(d[R][2 * k + 1])); \
+        ACC = svmla_f32_m(p32, ACC, \
+            svcvt_f32_s32_x(p32, svdot_s32(svdup_s32(0), wv, xv)), \
+            svmul_f32_x(p32, ws, xs)); \
+    } while (0)
+        GLM53F_Q8R_ROW(0, acc0);
+        if (nrows > 1) GLM53F_Q8R_ROW(1, acc1);
+        if (nrows > 2) GLM53F_Q8R_ROW(2, acc2);
+        if (nrows > 3) GLM53F_Q8R_ROW(3, acc3);
+#undef GLM53F_Q8R_ROW
+    }
+    out[0] = svaddv_f32(p32, acc0);
+    if (nrows > 1) out[1] = svaddv_f32(p32, acc1);
+    if (nrows > 2) out[2] = svaddv_f32(p32, acc2);
+    if (nrows > 3) out[3] = svaddv_f32(p32, acc3);
+}
+
+static inline float native_row(int type, const uint8_t *row,
+                               const native_act *a) {
+    if (type == GLM53F_NATIVE_Q8_0R) {
+        float y;
+        q8_0r_rows(&y, row, 0, 1, a);
+        return y;
+    }
+    if (type == GLM53F_GGML_Q8_0)
+        return q8_0_q8_0_row((const block_q8_0 *)row, a->q80, a->columns / 32);
+    return iq_row(type, row, a->q8k, a->columns / 256);
+}
+
+static int native_is_q80(int type) {
+    return type == GLM53F_GGML_Q8_0 || type == GLM53F_NATIVE_Q8_0R;
+}
+
+static int native_check(int type, int columns, const native_act *a) {
+    if (!glm53f_native_type_supported(type) || !a || a->columns != columns)
+        return -1;
+    return native_is_q80(type) ? (a->has_q80 ? 0 : -1)
+                               : (a->has_q8k ? 0 : -1);
+}
+
+/* Orphaned work-sharing: call from every thread of an existing team.  The
+ * trailing implicit barrier publishes all outputs to the team. */
+int glm53f_native_matvec_team(const glm53f_native_matrix *m, int count,
+                              const void *activation) {
+    const native_act *a = activation;
+    int total = 0, bad = 0, group[8], start[9];
+    size_t rb[8];
+    if (!m || count < 1 || count > 8) return -1;
+    for (int i = 0; i < count; ++i) {
+        rb[i] = glm53f_native_row_size(m[i].type, m[i].columns);
+        bad |= !m[i].output || !m[i].weight || m[i].rows < 1 || !rb[i] ||
+               native_check(m[i].type, m[i].columns, a);
+        /* Work items are four-row groups for repacked Q8_0, rows otherwise. */
+        group[i] = m[i].type == GLM53F_NATIVE_Q8_0R ? 4 : 1;
+        start[i] = total;
+        total += (m[i].rows + group[i] - 1) / group[i];
+    }
+    start[count] = total;
+    if (bad) return -1;
+#pragma omp for schedule(static)
+    for (int q = 0; q < total; ++q) {
+        int i = 0;
+        while (q >= start[i + 1]) ++i;
+        const int r = (q - start[i]) * group[i];
+        if (group[i] == 4) {
+            const int n = m[i].rows - r < 4 ? m[i].rows - r : 4;
+            q8_0r_rows(m[i].output + r, m[i].weight + (size_t)r * rb[i],
+                       rb[i], n, a);
+        } else {
+            m[i].output[r] = native_row(m[i].type,
+                m[i].weight + (size_t)r * rb[i], a);
+        }
+    }
+    return 0;
+}
+
+int glm53f_native_matvec_n(const glm53f_native_matrix *m, int count,
+                           const float *input) {
+    int need_q8k = 0, need_q80 = 0, columns, rc = 0;
+    if (!m || count < 1 || count > 8 || !input) return -1;
+    columns = m[0].columns;
+    for (int i = 0; i < count; ++i) {
+        if (m[i].columns != columns ||
+            !glm53f_native_type_supported(m[i].type)) return -1;
+        if (native_is_q80(m[i].type)) need_q80 = 1; else need_q8k = 1;
+    }
+    size_t bytes = glm53f_native_act_bytes(columns);
+    void *act = NULL;
+    if (!bytes || posix_memalign(&act, 256, bytes)) return -1;
+    if (glm53f_native_act_prepare(act, input, columns, need_q8k, need_q80)) {
+        free(act);
+        return -1;
+    }
+#pragma omp parallel reduction(|:rc)
+    rc |= glm53f_native_matvec_team(m, count, act) != 0;
+    free(act);
+    return rc ? -1 : 0;
+}
+
+int glm53f_iq_matvec_2(
+        float *output0, const uint8_t *weight0, int weight0_type,
+        float *output1, const uint8_t *weight1, int weight1_type,
+        int rows, int columns, const float *input) {
+    if (native_is_q80(weight0_type) ||
+        (output1 && native_is_q80(weight1_type))) {
+        if (!output0 || !weight0 || (!!output1 != !!weight1)) return -1;
+        glm53f_native_matrix m[2] = {
+            {output0, weight0, weight0_type, rows, columns},
+            {output1, weight1, weight1_type, rows, columns}};
+        return glm53f_native_matvec_n(m, output1 ? 2 : 1, input);
+    }
+    if (!output0 || !weight0 || !input || rows < 1 || columns < 256 ||
+        columns % 256 || !glm53f_iq_type_supported(weight0_type) ||
+        (!!output1 != !!weight1) ||
+        (output1 && !glm53f_iq_type_supported(weight1_type))) return -1;
+    size_t row0 = dequant_row_size((uint32_t)weight0_type, columns);
+    size_t row1 = output1 ? dequant_row_size((uint32_t)weight1_type, columns) : 0;
+    glm5_iq_q8_block *input_q = malloc(
+        (size_t)(columns / 256) * sizeof(*input_q));
+    if (!row0 || (output1 && !row1) || !input_q) {
+        free(input_q);
+        return -1;
+    }
+    pthread_once(&glm5_iq_lut_once, glm5_iq_init_luts);
+    glm5_iq_quant_q8(input_q, input, columns);
+#pragma omp parallel for schedule(static)
+    for (int row = 0; row < rows; ++row) {
+        output0[row] = iq_row(weight0_type, weight0 + (size_t)row * row0,
+                              input_q, columns / 256);
+        if (output1)
+            output1[row] = iq_row(weight1_type,
+                weight1 + (size_t)row * row1, input_q, columns / 256);
+    }
+    free(input_q);
+    return 0;
+}
+
+int glm53f_iq_matvec(
+        float *output, const uint8_t *weight, int weight_type,
+        int rows, int columns, const float *input) {
+    if (weight_type == GLM53F_NATIVE_Q8_0R) {
+        glm53f_native_matrix m = {output, weight, weight_type, rows, columns};
+        return glm53f_native_matvec_n(&m, 1, input);
+    }
+    if (weight_type == GLM53F_GGML_Q8_0) {
+        if (!output || !weight || !input || rows < 1 || columns < 32 ||
+            columns % 32) return -1;
+        const size_t row = (size_t)(columns / 32) * sizeof(block_q8_0);
+        block_q8_0 *input_q = malloc(row);
+        if (!input_q) return -1;
+        quantize_q8_0_activation(input_q, input, columns);
+#pragma omp parallel for schedule(static)
+        for (int r = 0; r < rows; ++r)
+            output[r] = q8_0_q8_0_row(
+                (const block_q8_0 *)(weight + (size_t)r * row),
+                input_q, columns / 32);
+        free(input_q);
+        return 0;
+    }
+    return glm53f_iq_matvec_2(output, weight, weight_type,
+                              NULL, NULL, 0, rows, columns, input);
 }
 
 int glm53f_iq_expert_weighted(

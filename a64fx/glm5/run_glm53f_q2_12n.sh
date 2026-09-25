@@ -33,6 +33,7 @@ run_tag=${GLM53F_Q2_RUN_TAG:-$$}
 export OPAL_PREFIX=${GLM53F_MPI_HOME:-/opt/FJSVxtclanga/tcsds-1.2.43}
 export MPI_HOME=$OPAL_PREFIX
 export PATH="/opt/local/mpiexec:/opt/FJSVxtclanga/tcsds-1.2.43/bin:${PATH}"
+export LD_LIBRARY_PATH="$OPAL_PREFIX/lib64:${LD_LIBRARY_PATH:-}"
 mpiexec_bin=${GLM53F_MPIEXEC:-mpiexec}
 export GLM53F_MPICC=${GLM53F_MPICC:-mpifcc}
 export GLM53F_BUILD_DIR=${GLM53F_BUILD_DIR:-/local/glm53f-q2-build-$job}
@@ -72,15 +73,60 @@ test "$(grep -l 'SENTINEL glm53f_rank_stage=' "$logdir"/shared-stage-$run_tag.*.
 ' sh "$core_source" "$core_stage" "$repo_glm5/glm53f_core_stage"
 test "$(grep -l 'SENTINEL glm53f_rank_stage=' "$logdir"/core-stage-$run_tag.*.* | wc -l)" -eq 12
 
+# GLM53F_NATIVE=1 runs every non-routed matrix from the GGUF's own blocks:
+# dense FFN 0--2, sparse MLA projections, all KDA projections and the shared
+# expert, plus GGUF-patched copies of the compact core/shared images for the
+# remaining small tensors (mHC, norms, conv, indexer, routers).
+if [ "${GLM53F_NATIVE:-0}" = 1 ]; then
+    native_prefix=${GLM53F_NATIVE_PREFIX:-/local/glm53f-native-$job}
+    gcore_stage=${GLM53F_GGUF_CORE_STAGE:-$native_prefix-core}
+    gshared_stage=${GLM53F_GGUF_SHARED_STAGE:-$native_prefix-shared}
+    for kind in dense sparse kda shexp; do
+        echo "staging native GGUF $kind to $native_prefix-$kind"
+        "$mpiexec_bin" -n 12 -of-proc "$logdir/$kind-stage-$run_tag" \
+            ./glm53f_q2_${kind}_stage "$q2" "$native_prefix-$kind"
+        test "$(grep -l "SENTINEL glm53f_q2_${kind}_stage=" "$logdir"/$kind-stage-$run_tag.*.* | wc -l)" -eq 12
+    done
+    echo "patching GGUF copies of the compact core/shared images"
+    "$mpiexec_bin" -n 12 -of-proc "$logdir/gguf-copy-$run_tag" sh -c '
+        rm -rf "$3" "$4" && cp -a "$1" "$3" && cp -a "$2" "$4" && echo GLM53F_GGUF_COPY=OK
+    ' sh "$core_stage" "$shared_stage" "$gcore_stage" "$gshared_stage"
+    test "$(grep -l 'GLM53F_GGUF_COPY=OK' "$logdir"/gguf-copy-$run_tag.*.* | wc -l)" -eq 12
+    rank_exec='r=${PMIX_RANK:-${PJM_MPI_RANK:-${OMPI_COMM_WORLD_RANK:-0}}}; exec "$1" "$2" "$3" "$r" ${4:+"$4"}'
+    "$mpiexec_bin" -n 12 -of-proc "$logdir/core-routers-$run_tag" sh -c "$rank_exec" \
+        sh "$repo_glm5/glm53f_core_add_routers" "$model" "$gcore_stage"
+    test "$(grep -l 'GLM53F_CORE_ROUTERS.*PASS' "$logdir"/core-routers-$run_tag.*.* | wc -l)" -eq 12
+    "$mpiexec_bin" -n 12 -of-proc "$logdir/core-patch-$run_tag" sh -c "$rank_exec" \
+        sh "$repo_glm5/glm53f_q2_core_patch" "$q2" "$gcore_stage" all
+    test "$(grep -l 'SENTINEL glm53f_q2_core_patch=OK' "$logdir"/core-patch-$run_tag.*.* | wc -l)" -eq 12
+    "$mpiexec_bin" -n 12 -of-proc "$logdir/shared-patch-$run_tag" sh -c "$rank_exec" \
+        sh "$repo_glm5/glm53f_q2_shared_patch" "$q2" "$gshared_stage"
+    test "$(grep -l 'SENTINEL glm53f_q2_shared_patch=OK' "$logdir"/shared-patch-$run_tag.*.* | wc -l)" -eq 12
+    core_stage=$gcore_stage
+    shared_stage=$gshared_stage
+    export GLM53F_Q2_DENSE_STAGE=$native_prefix-dense
+    export GLM53F_Q2_SPARSE_STAGE=$native_prefix-sparse
+    export GLM53F_Q2_KDA_STAGE=$native_prefix-kda
+    export GLM53F_Q2_SHEXP_STAGE=$native_prefix-shexp
+    export GLM53F_REPACK_REQUIRE=1
+fi
+
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-47}
 export OMP_DYNAMIC=false OMP_WAIT_POLICY=active
 export OMP_PROC_BIND=close OMP_PLACES=cores FLIB_BARRIER=HARD
 export GLM53F_REPACK_DIR=$core_stage
 export GLM53F_REPACK_REQUIRE=${GLM53F_REPACK_REQUIRE:-0}
 
-"$mpiexec_bin" -n 12 ../utofu-tests/tofu_topo_helper
-test "$(grep -vc '^#' tofu_topo.txt)" -eq 12
-export GLM53F_UTOFU=1 TOFU_TOPO_PATH=$PWD/tofu_topo.txt
+if [ -n "${GLM53F_TOPO_PATH:-}" ]; then
+    topo_path=$GLM53F_TOPO_PATH
+else
+    topo_dir="$logdir/topology-$run_tag"
+    mkdir -p "$topo_dir"
+    (cd "$topo_dir" && "$mpiexec_bin" -n 12 "$repo_glm5/../utofu-tests/tofu_topo_helper")
+    topo_path="$topo_dir/tofu_topo.txt"
+fi
+test "$(grep -vc '^#' "$topo_path")" -eq 12
+export GLM53F_UTOFU=1 TOFU_TOPO_PATH=$topo_path
 
 steps=${GLM53F_TARGET_STEPS:-128}
 input_token=${GLM53F_TARGET_INPUT_TOKEN:-1}

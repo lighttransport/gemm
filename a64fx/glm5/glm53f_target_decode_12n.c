@@ -51,6 +51,61 @@ static void target_memtrace(int rank, const char *phase) {
     if (out) { fprintf(out, "%s rss_kb=%ld mem_available_kb=%ld\n", phase, rss, avail); fclose(out); }
 }
 
+static int target_layer_trace(const float *streams, int layer) {
+    const char *dir = getenv("GLM53F_LAYER_TRACE_DIR");
+    static int traced_steps;
+    int rank;
+    char path[512];
+    FILE *out;
+    if (!dir || !*dir || traced_steps || layer < 0 || layer >= LAYERS) return 0;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    if (rank) return 0;
+    snprintf(path, sizeof(path), "%s/layer-%02d.f32", dir, layer);
+    out = fopen(path, "wb");
+    if (!out) {
+        fprintf(stderr, "GLM53F_LAYER_TRACE_FAIL layer=%d path=%s\n", layer, path);
+        return -1;
+    }
+    size_t wrote = fwrite(streams, sizeof(float), FLAT, out);
+    int close_rc = fclose(out);
+    if (wrote != FLAT || close_rc) {
+        fprintf(stderr, "GLM53F_LAYER_TRACE_FAIL layer=%d path=%s\n", layer, path);
+        return -1;
+    }
+    if (layer + 1 == LAYERS) traced_steps = 1;
+    return 0;
+}
+
+static int target_sublayer_trace(const float *values, size_t count,
+                                 const char *name, int layer) {
+    const char *dir = getenv("GLM53F_SUBLAYER_TRACE_DIR");
+    const char *layer_env = getenv("GLM53F_SUBLAYER_TRACE_LAYER");
+    int trace_layer = layer_env && *layer_env ? atoi(layer_env) : 0;
+    int rank;
+    char path[512];
+    FILE *out;
+    if (!dir || !*dir || layer != trace_layer) return 0;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    if (rank) return 0;
+    snprintf(path, sizeof(path), "%s/%s-%d.f32", dir, name, layer);
+    out = fopen(path, "wb");
+    if (!out) {
+        fprintf(stderr, "GLM53F_SUBLAYER_TRACE_FAIL name=%s layer=%d path=%s\n",
+                name, layer, path);
+        return -1;
+    }
+    size_t wrote = fwrite(values, sizeof(float), count, out);
+    int close_rc = fclose(out);
+    if (wrote != count || close_rc) {
+        fprintf(stderr, "GLM53F_SUBLAYER_TRACE_FAIL name=%s layer=%d path=%s\n",
+                name, layer, path);
+        return -1;
+    }
+    fprintf(stderr, "GLM53F_SUBLAYER_TRACE name=%s layer=%d count=%zu PASS\n",
+            name, layer, count);
+    return 0;
+}
+
 static void *load_exact(glm53f_st_context *st, const char *name, size_t bytes) {
     const st_tensor_info *tensor = glm53f_st_find(st, name, NULL);
     void *p = a256(bytes);
@@ -186,11 +241,12 @@ static glm53f_target_model_12n *target_model_create_with_kda(
     m->mhc_chained = getenv("GLM53F_MHC_CHAINED") && atoi(getenv("GLM53F_MHC_CHAINED"));
     MPI_Comm_size(MPI_COMM_WORLD, &ranks);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    if (ranks != 12) goto fail;
+    if (ranks != 12) { fprintf(stderr, "GLM53F_TARGET_CREATE_FAIL rank=%d phase=ranks value=%d\n", rank, ranks); goto fail; }
     st = glm53f_st_open(model_dir);
-    if (!st) goto fail;
+    if (!st) { fprintf(stderr, "GLM53F_TARGET_CREATE_FAIL rank=%d phase=safetensors\n", rank); goto fail; }
     for (int l = 0; l < LAYERS; ++l)
         if (load_layer(st, l, &m->layer_weight[l])) {
+            fprintf(stderr, "GLM53F_TARGET_CREATE_FAIL rank=%d phase=layer_weight layer=%d\n", rank, l);
             glm53f_st_close(st);
             goto fail;
         }
@@ -202,14 +258,20 @@ static glm53f_target_model_12n *target_model_create_with_kda(
     for (int l = 0; l < LAYERS; ++l) {
         if (l % 4 == 3) m->sparse[l] = glm53f_sparse_create_format_12n(model_dir, l, capacity, latent_bf16);
         else m->kda[l] = glm53f_kda_create_12n(model_dir, l);
-        if (!m->sparse[l] && !m->kda[l]) goto fail;
+        if (!m->sparse[l] && !m->kda[l]) {
+            fprintf(stderr, "GLM53F_TARGET_CREATE_FAIL rank=%d phase=attention layer=%d\n", rank, l);
+            goto fail;
+        }
     }
     target_memtrace(rank, "attention");
     if (int8_kda && glm53f_target_model_convert_kda_int8_12n(m)) goto fail;
     if (int8_kda) target_memtrace(rank, "attention_int8");
     for (int l = 0; l < 3; ++l) {
         m->dense[l] = glm53f_dense_ffn_create_12n(model_dir, l);
-        if (!m->dense[l]) goto fail;
+        if (!m->dense[l]) {
+            fprintf(stderr, "GLM53F_TARGET_CREATE_FAIL rank=%d phase=dense layer=%d\n", rank, l);
+            goto fail;
+        }
     }
     target_memtrace(rank, "dense");
     target_memtrace(rank, "moe_before");
@@ -230,7 +292,13 @@ static glm53f_target_model_12n *target_model_create_with_kda(
     m->batch_state = a256((size_t)VERIFY_BATCH * m->batch_state_stride);
     if (!m->embedding || !m->head || !m->moe || !m->scratch || !m->streams ||
         !m->batch_scratch || !m->batch_streams || !m->batch_normalized ||
-        !m->batch_output || !m->batch_state) goto fail;
+        !m->batch_output || !m->batch_state) {
+        fprintf(stderr, "GLM53F_TARGET_CREATE_FAIL rank=%d phase=workspace embedding=%d head=%d moe=%d scratch=%d streams=%d batch=%d/%d/%d/%d/%d\n",
+                rank, !!m->embedding, !!m->head, !!m->moe, !!m->scratch, !!m->streams,
+                !!m->batch_scratch, !!m->batch_streams, !!m->batch_normalized,
+                !!m->batch_output, !!m->batch_state);
+        goto fail;
+    }
     if(!rank){size_t bytes=0;int cp=0;for(int l=0;l<LAYERS;l++)if(m->sparse[l]){bytes+=glm53f_sparse_cache_bytes_12n(m->sparse[l]);cp+=glm53f_sparse_is_context_parallel_12n(m->sparse[l]);}printf("GLM53F_TARGET_CACHE capacity=%d sparse_layers=11 cp_layers=%d bytes_rank=%zu GiB_rank=%.3f\n",capacity,cp,bytes,bytes/1073741824.0);}
     return m;
 fail:
@@ -265,11 +333,21 @@ int glm53f_target_model_touch_cache_12n(glm53f_target_model_12n *m) {
     return 0;
 }
 
+int glm53f_target_model_set_cp_hot_prefix_12n(glm53f_target_model_12n *m,
+                                              int hot_prefix) {
+    if (!m || hot_prefix < 0) return -1;
+    for (int l = 0; l < LAYERS; ++l)
+        if (m->sparse[l] && glm53f_sparse_set_hot_prefix_12n(m->sparse[l], hot_prefix))
+            return -1;
+    return 0;
+}
+
 int glm53f_target_model_step_12n(glm53f_target_model_12n *m, int token,
         int *next_token, float *next_logit, float *target_hidden) {
     double begin = m && m->profile ? MPI_Wtime() : 0.0;
     if (!m || !next_token || !next_logit ||
         glm53f_embedding_streams_12n(m->embedding, token, m->streams)) return -1;
+    if (target_sublayer_trace(m->streams, FLAT, "hc_init", 0)) return -1;
     if (m->profile) m->scalar_phase[0] += MPI_Wtime() - begin;
     for (int l = 0; l < LAYERS; ++l) {
         const glm53f_target_layer_weights_12n *w = &m->layer_weight[l];
@@ -279,6 +357,8 @@ int glm53f_target_model_step_12n(glm53f_target_model_12n *m, int token,
                                w->input_norm);
             if (m->profile) m->scalar_phase[1] += MPI_Wtime() - begin;
         }
+        if (target_sublayer_trace(m->scratch->mhc.normalized, HIDDEN,
+                                  "attn_norm", l)) return -1;
         begin = m->profile ? MPI_Wtime() : 0.0;
         int rc = m->kda[l] ?
             glm53f_kda_sublayer_12n(m->kda[l], m->scratch->sublayer_output,
@@ -286,6 +366,8 @@ int glm53f_target_model_step_12n(glm53f_target_model_12n *m, int token,
             glm53f_sparse_sublayer_12n(m->sparse[l], m->scratch->sublayer_output,
                                        m->scratch->mhc.normalized);
         if (rc) return -1;
+        if (target_sublayer_trace(m->scratch->sublayer_output, HIDDEN,
+                                  "kda_out", l)) return -1;
         if (m->profile) {
             double elapsed = MPI_Wtime() - begin;
             m->scalar_phase[2] += elapsed;
@@ -303,6 +385,10 @@ int glm53f_target_model_step_12n(glm53f_target_model_12n *m, int token,
                                w->post_attention_norm);
         }
         if (m->profile) m->scalar_phase[1] += MPI_Wtime() - begin;
+        if (target_sublayer_trace(m->streams, FLAT,
+                                  "hc_attn_post", l)) return -1;
+        if (target_sublayer_trace(m->scratch->mhc.normalized, HIDDEN,
+                                  "ffn_norm", l)) return -1;
         begin = m->profile ? MPI_Wtime() : 0.0;
         if (l < 3) {
             rc = glm53f_dense_ffn_sublayer_12n(
@@ -315,6 +401,8 @@ int glm53f_target_model_step_12n(glm53f_target_model_12n *m, int token,
                 m->scratch->mhc.normalized);
         }
         if (rc) return -1;
+        if (target_sublayer_trace(m->scratch->sublayer_output, HIDDEN,
+                                  "ffn_out", l)) return -1;
         if (m->profile) {
             double elapsed = MPI_Wtime() - begin;
             m->scalar_phase[3] += elapsed;
@@ -329,7 +417,9 @@ int glm53f_target_model_step_12n(glm53f_target_model_12n *m, int token,
         } else
             glm53f_mhc_post_sve(m->streams, m->scratch->sublayer_output,
                                 &m->scratch->mhc);
+        if (target_sublayer_trace(m->streams, FLAT, "l_last", l)) return -1;
         if (m->profile) m->scalar_phase[1] += MPI_Wtime() - begin;
+        if (target_layer_trace(m->streams, l)) return -1;
     }
     begin = m->profile ? MPI_Wtime() : 0.0;
     if (target_hidden) {
@@ -553,7 +643,8 @@ int glm53f_target_trace_open_12n(glm53f_target_model_12n *m, const char *prefix,
     io->file = fopen(path, compare ? "rb" : "wbx");
     if (!io->file) { perror(path); free(io); return -1; }
     m->trace = io;
-    const uint64_t header[] = {UINT64_C(0x474c4d3533465452), 1, LAYERS, FLAT};
+    /* Version 2 adds the optional CP hot-prefix state to sparse traces. */
+    const uint64_t header[] = {UINT64_C(0x474c4d3533465452), 2, LAYERS, FLAT};
     return glm53f_state_io_bytes(io, header, sizeof(header), "header");
 }
 
@@ -781,6 +872,7 @@ static int read_token_ids(const char *path, int **ids_out, int *count_out) {
 int main(int argc, char **argv) {
     int rank, ranks, token, steps, generate = 0;
     int requested_capacity = 0, touch_cache = 0, load_only = 0, use_int8 = 0, int8_kda = 0, latent_bf16 = 0;
+    int cp_hot_prefix = 0, decode_window = 64, ignore_eos = 0;
     int prefill_chunk = 1, prefill_chunk_given = 0;
     float temperature = 0.0f, top_p = 1.0f;
     uint64_t sample_state = 88172645463393265ULL;
@@ -792,7 +884,7 @@ int main(int argc, char **argv) {
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &ranks);
     if (argc < 4 || ranks != 12) {
-        if (!rank) fprintf(stderr,"usage: %s MODEL ROUTED_STAGE SHARED_STAGE [token=1] [steps=1] [OPTIONS]\n       %s MODEL ROUTED_STAGE SHARED_STAGE --generate PROMPT_IDS OUTPUT_IDS MAX_NEW [OPTIONS]\noptions: --capacity N --weight-format fp8|int8 --int8-kda --cache-format fp32|bf16 --temperature T --top-p P --seed N --touch-cache --load-only --prefill-chunk N (1..256; up to 512 with --prefill-mode fast, generate only)\n",argv[0],argv[0]);
+        if (!rank) fprintf(stderr,"usage: %s MODEL ROUTED_STAGE SHARED_STAGE [token=1] [steps=1] [OPTIONS]\n       %s MODEL ROUTED_STAGE SHARED_STAGE --generate PROMPT_IDS OUTPUT_IDS MAX_NEW [OPTIONS]\noptions: --capacity N --weight-format fp8|int8 --int8-kda --cache-format fp32|bf16 --temperature T --top-p P --seed N --touch-cache --load-only --prefill-chunk N --decode-window N --cp-hot-prefix N --ignore-eos (generate only)\n",argv[0],argv[0]);
         MPI_Abort(MPI_COMM_WORLD,2);
     }
     generate = argc >= 8 && !strcmp(argv[4], "--generate");
@@ -822,6 +914,20 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--temperature") && i + 1 < argc) temperature = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--top-p") && i + 1 < argc) top_p = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--seed") && i + 1 < argc) sample_state = (uint64_t)strtoull(argv[++i], NULL, 10);
+        else if (!strcmp(argv[i], "--decode-window") && i + 1 < argc) {
+            char *end; long n = strtol(argv[++i], &end, 10);
+            if (!generate || *end || n < 1 || n > MAX_GENERATED_TOKENS) MPI_Abort(MPI_COMM_WORLD, 2);
+            decode_window = (int)n;
+        }
+        else if (!strcmp(argv[i], "--cp-hot-prefix") && i + 1 < argc) {
+            char *end; long n = strtol(argv[++i], &end, 10);
+            if (!generate || *end || n < 0 || n > 16384) MPI_Abort(MPI_COMM_WORLD, 2);
+            cp_hot_prefix = (int)n;
+        }
+        else if (!strcmp(argv[i], "--ignore-eos")) {
+            if (!generate) MPI_Abort(MPI_COMM_WORLD, 2);
+            ignore_eos = 1;
+        }
         else if (!strcmp(argv[i], "--prefill-chunk") && i + 1 < argc) {
             char *end;
             long n = strtol(argv[++i], &end, 10);
@@ -862,8 +968,11 @@ int main(int argc, char **argv) {
     if (generate && capacity < prompt_count + steps) capacity = prompt_count + steps;
     if(capacity<steps)MPI_Abort(MPI_COMM_WORLD,2);
     if(getenv("GLM53F_UTOFU")){const char*topo=getenv("TOFU_TOPO_PATH");if(!topo)topo="../utofu-tests/tofu_topo.txt";if(glm53f_collective_init_12n(topo,(prefill_config.mode == GLM53F_PREFILL_FAST ? 32 : 8)*HIDDEN))MPI_Abort(MPI_COMM_WORLD,2);}
+    double load_begin = MPI_Wtime();
     model=target_model_create_with_kda(argv[1],argv[2],argv[3],capacity,int8_kda,latent_bf16);
     if(!model)MPI_Abort(MPI_COMM_WORLD,2);
+    if (cp_hot_prefix && glm53f_target_model_set_cp_hot_prefix_12n(model, cp_hot_prefix))
+        MPI_Abort(MPI_COMM_WORLD, 2);
     if (use_int8 && glm53f_target_model_convert_int8_12n(model)) MPI_Abort(MPI_COMM_WORLD, 2);
     if (glm53f_target_model_configure_prefill_12n(model, &prefill_config)) MPI_Abort(MPI_COMM_WORLD, 2);
 #if defined(__GLIBC__)
@@ -872,6 +981,13 @@ int main(int argc, char **argv) {
     malloc_trim(0);
 #endif
     if (touch_cache && glm53f_target_model_touch_cache_12n(model)) MPI_Abort(MPI_COMM_WORLD, 2);
+    double local_load = MPI_Wtime() - load_begin, global_load;
+    MPI_Reduce(&local_load, &global_load, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    if (!rank) {
+        printf("GLM53F_TARGET_LOAD seconds=%.6f cp_hot_prefix=%d\n",
+               global_load, cp_hot_prefix);
+        fflush(stdout);
+    }
     target_memtrace(rank, "cache_resident");
     {
         long available_kb = target_available_kb(), minimum_kb;
@@ -890,6 +1006,7 @@ int main(int argc, char **argv) {
     }
     glm53f_target_profile_reset_12n(model);
     MPI_Barrier(MPI_COMM_WORLD);double begin=MPI_Wtime(),prompt_elapsed=0.0,decode_elapsed=0.0,window_begin=begin;
+    int window_tokens = 0;
     int total_steps = generate ? prompt_count + steps - 1 : steps;
     int completed_steps = 0;
     long run_minimum_kb = target_available_kb();
@@ -951,11 +1068,34 @@ int main(int argc, char **argv) {
                 generated_ids[generated] = token;
             }
             generated++;
-            if(!rank&&generated%64==0){double now=MPI_Wtime();printf("GLM53F_TARGET_DECODE_WINDOW end=%d tok_s=%.3f\n",generated,64.0/(now-window_begin));fflush(stdout);window_begin=now;}
+            window_tokens++;
+            if (window_tokens >= decode_window || (ignore_eos && generated == steps)) {
+                double now = MPI_Wtime(), local_window = now - window_begin, global_window;
+                MPI_Reduce(&local_window, &global_window, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+                if (!rank) {
+                    int context_end = prompt_count + generated - 1;
+                    printf("GLM53F_TARGET_DECODE_WINDOW end=%d context_end=%d tokens=%d tok_s=%.3f\n",
+                           generated, context_end, window_tokens, window_tokens / global_window);
+                    fflush(stdout);
+                }
+                window_begin = MPI_Wtime();
+                window_tokens = 0;
+            }
         }
         if (!generate && !rank) printf("GLM53F_TARGET_TOKEN step=%d token=%d logit=%.9g\n",step,token,value);
-        if(generate&&step>=prompt_count-1&&(token==154820||token==154827||token==154829))break;
+        if(generate && !ignore_eos && step>=prompt_count-1 &&
+           (token==154820||token==154827||token==154829)) break;
         if (generate && step + 1 < prompt_count) token = prompt_ids[step + 1];
+    }
+    if (generate && window_tokens > 0) {
+        double local_window = MPI_Wtime() - window_begin, global_window;
+        MPI_Reduce(&local_window, &global_window, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+        if (!rank) {
+            int context_end = prompt_count + generated - 1;
+            printf("GLM53F_TARGET_DECODE_WINDOW end=%d context_end=%d tokens=%d tok_s=%.3f\n",
+                   generated, context_end, window_tokens, window_tokens / global_window);
+            fflush(stdout);
+        }
     }
     double elapsed=MPI_Wtime()-begin,max_elapsed;MPI_Reduce(&elapsed,&max_elapsed,1,MPI_DOUBLE,MPI_MAX,0,MPI_COMM_WORLD);
     double local_phase_seconds[2] = {prompt_elapsed, decode_elapsed}, phase_seconds[2];
