@@ -199,7 +199,7 @@ def kernel_c(name, nt=4):
     e(f"    .size {name}, .-{name}\n")
     return "\n".join(L)
 
-def kernel_g2n4(name, nt=4):
+def kernel_g2n4(name, nt=4, share_as=False):
     """nt tokens x two groups; one depth-9 chain per (token, group): high-digit
     SDOTs (movprfx from zero), LSL 8, low-digit SDOTs on the same register.
     Slot s (program order): S4(s-1) S3(s) S1(s+1) S2(s+1).
@@ -241,6 +241,19 @@ def kernel_g2n4(name, nt=4):
                         e(f"    lsl z{c}.s, z{c}.s, #8")
         e(f"    add x3, x3, #{64 * nt}")
     def S4():
+        if share_as:
+            # weight scales of both groups in z3 / z2 (z2 is free before S3),
+            # one activation-scale load per token, products in z0 / z1
+            e("    ld1b {z3.s}, p1/z, [x2]\n    ld1b {z2.s}, p1/z, [x12]\n    add x2, x2, #16\n    add x12, x12, #16")
+            e("    lsl z3.s, z3.s, #20\n    lsl z2.s, z2.s, #20")
+            for t in range(nt):
+                e(f"    ld1rd {{z28.d}}, p2/z, [x4, #{8 * t}]")
+                e("    fmul z0.s, z28.s, z3.s\n    fmul z1.s, z28.s, z2.s")
+                cA, cB = ch[(t, 0)], ch[(t, 1)]
+                e(f"    scvtf z{cA}.s, p1/m, z{cA}.s\n    scvtf z{cB}.s, p1/m, z{cB}.s")
+                e(f"    fmla z{acc[(t, 0)]}.s, p1/m, z{cA}.s, z0.s\n    fmla z{acc[(t, 1)]}.s, p1/m, z{cB}.s, z1.s")
+            e(f"    add x4, x4, #{8 * nt}")
+            return
         for g, sp in ((0, "x2"), (1, "x12")):
             e(f"    ld1b {{z3.s}}, p1/z, [{sp}]\n    add {sp}, {sp}, #16\n    lsl z3.s, z3.s, #20")
             for t in range(nt):
@@ -275,5 +288,7 @@ for nt in (1, 2, 3):
 out.append(kernel_c("q38d_asmn4c_f4_a16"))
 for nt in (1, 2, 4):
     out.append(kernel_g2n4(f"q38d_asmg2c{nt}_f4_a16", nt))
+for nt in (2, 4):
+    out.append(kernel_g2n4(f"q38d_asmg2s{nt}_f4_a16", nt, share_as=True))
 out.append('    .section .note.GNU-stack,"",%progbits\n')
 open(sys.argv[1], "w").write("\n".join(out))

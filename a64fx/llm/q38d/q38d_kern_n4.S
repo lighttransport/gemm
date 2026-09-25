@@ -3689,4 +3689,700 @@ q38d_asmg2c4_f4_a16:
     ret
     .size q38d_asmg2c4_f4_a16, .-q38d_asmg2c4_f4_a16
 
+    .global q38d_asmg2s2_f4_a16
+    .type q38d_asmg2s2_f4_a16, %function
+    .p2align 6
+q38d_asmg2s2_f4_a16:
+    stp d8, d9, [sp, #-64]!
+    stp d10, d11, [sp, #16]
+    stp d12, d13, [sp, #32]
+    stp d14, d15, [sp, #48]
+    ptrue p0.b
+    ptrue p1.s
+    ptrue p2.d
+    ld1b {z31.b}, p0/z, [x7]
+    dup z30.b, #15
+    dup z29.s, #0
+    dup z16.s, #0
+    dup z17.s, #0
+    dup z18.s, #0
+    dup z19.s, #0
+    mov x9, #PF2_DIST
+    add x10, x0, x1
+    add x12, x2, x1
+    prfm pldl1keep, [x0, #PF1_DIST]
+    prfm pldl2keep, [x0, x9]
+    ld1b {z0.b}, p0/z, [x0]
+    ld1b {z1.b}, p0/z, [x0, #1, mul vl]
+    add x0, x0, #128
+    and z4.d, z0.d, z30.d
+    lsr z5.b, z0.b, #4
+    and z6.d, z1.d, z30.d
+    lsr z7.b, z1.b, #4
+    tbl z4.b, {z31.b}, z4.b
+    tbl z5.b, {z31.b}, z5.b
+    tbl z6.b, {z31.b}, z6.b
+    tbl z7.b, {z31.b}, z7.b
+    prfm pldl1keep, [x10, #PF1_DIST]
+    prfm pldl2keep, [x10, x9]
+    ld1b {z0.b}, p0/z, [x10]
+    ld1b {z1.b}, p0/z, [x10, #1, mul vl]
+    add x10, x10, #128
+    and z8.d, z0.d, z30.d
+    lsr z9.b, z0.b, #4
+    and z10.d, z1.d, z30.d
+    lsr z11.b, z1.b, #4
+    tbl z8.b, {z31.b}, z8.b
+    tbl z9.b, {z31.b}, z9.b
+    tbl z10.b, {z31.b}, z10.b
+    tbl z11.b, {z31.b}, z11.b
+    sub x5, x5, #1
+    ld1rd {z2.d}, p2/z, [x3, #32]
+    movprfx z12, z29
+    sdot z12.s, z4.b, z2.b
+    movprfx z13, z29
+    sdot z13.s, z8.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #96]
+    movprfx z14, z29
+    sdot z14.s, z4.b, z2.b
+    movprfx z15, z29
+    sdot z15.s, z8.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #40]
+    sdot z12.s, z5.b, z2.b
+    sdot z13.s, z9.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #104]
+    sdot z14.s, z5.b, z2.b
+    sdot z15.s, z9.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #48]
+    sdot z12.s, z6.b, z2.b
+    sdot z13.s, z10.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #112]
+    sdot z14.s, z6.b, z2.b
+    sdot z15.s, z10.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #56]
+    sdot z12.s, z7.b, z2.b
+    sdot z13.s, z11.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #120]
+    sdot z14.s, z7.b, z2.b
+    sdot z15.s, z11.b, z2.b
+    lsl z12.s, z12.s, #8
+    lsl z13.s, z13.s, #8
+    lsl z14.s, z14.s, #8
+    lsl z15.s, z15.s, #8
+    ld1rd {z2.d}, p2/z, [x3, #0]
+    sdot z12.s, z4.b, z2.b
+    sdot z13.s, z8.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #64]
+    sdot z14.s, z4.b, z2.b
+    sdot z15.s, z8.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #8]
+    sdot z12.s, z5.b, z2.b
+    sdot z13.s, z9.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #72]
+    sdot z14.s, z5.b, z2.b
+    sdot z15.s, z9.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #16]
+    sdot z12.s, z6.b, z2.b
+    sdot z13.s, z10.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #80]
+    sdot z14.s, z6.b, z2.b
+    sdot z15.s, z10.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #24]
+    sdot z12.s, z7.b, z2.b
+    sdot z13.s, z11.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #88]
+    sdot z14.s, z7.b, z2.b
+    sdot z15.s, z11.b, z2.b
+    add x3, x3, #128
+    prfm pldl1keep, [x0, #PF1_DIST]
+    prfm pldl2keep, [x0, x9]
+    ld1b {z0.b}, p0/z, [x0]
+    ld1b {z1.b}, p0/z, [x0, #1, mul vl]
+    add x0, x0, #128
+    and z4.d, z0.d, z30.d
+    lsr z5.b, z0.b, #4
+    and z6.d, z1.d, z30.d
+    lsr z7.b, z1.b, #4
+    tbl z4.b, {z31.b}, z4.b
+    tbl z5.b, {z31.b}, z5.b
+    tbl z6.b, {z31.b}, z6.b
+    tbl z7.b, {z31.b}, z7.b
+    prfm pldl1keep, [x10, #PF1_DIST]
+    prfm pldl2keep, [x10, x9]
+    ld1b {z0.b}, p0/z, [x10]
+    ld1b {z1.b}, p0/z, [x10, #1, mul vl]
+    add x10, x10, #128
+    and z8.d, z0.d, z30.d
+    lsr z9.b, z0.b, #4
+    and z10.d, z1.d, z30.d
+    lsr z11.b, z1.b, #4
+    tbl z8.b, {z31.b}, z8.b
+    tbl z9.b, {z31.b}, z9.b
+    tbl z10.b, {z31.b}, z10.b
+    tbl z11.b, {z31.b}, z11.b
+    cbz x5, 2f
+1:
+    ld1b {z3.s}, p1/z, [x2]
+    ld1b {z2.s}, p1/z, [x12]
+    add x2, x2, #16
+    add x12, x12, #16
+    lsl z3.s, z3.s, #20
+    lsl z2.s, z2.s, #20
+    ld1rd {z28.d}, p2/z, [x4, #0]
+    fmul z0.s, z28.s, z3.s
+    fmul z1.s, z28.s, z2.s
+    scvtf z12.s, p1/m, z12.s
+    scvtf z13.s, p1/m, z13.s
+    fmla z16.s, p1/m, z12.s, z0.s
+    fmla z17.s, p1/m, z13.s, z1.s
+    ld1rd {z28.d}, p2/z, [x4, #8]
+    fmul z0.s, z28.s, z3.s
+    fmul z1.s, z28.s, z2.s
+    scvtf z14.s, p1/m, z14.s
+    scvtf z15.s, p1/m, z15.s
+    fmla z18.s, p1/m, z14.s, z0.s
+    fmla z19.s, p1/m, z15.s, z1.s
+    add x4, x4, #16
+    ld1rd {z2.d}, p2/z, [x3, #32]
+    movprfx z12, z29
+    sdot z12.s, z4.b, z2.b
+    movprfx z13, z29
+    sdot z13.s, z8.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #96]
+    movprfx z14, z29
+    sdot z14.s, z4.b, z2.b
+    movprfx z15, z29
+    sdot z15.s, z8.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #40]
+    sdot z12.s, z5.b, z2.b
+    sdot z13.s, z9.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #104]
+    sdot z14.s, z5.b, z2.b
+    sdot z15.s, z9.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #48]
+    sdot z12.s, z6.b, z2.b
+    sdot z13.s, z10.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #112]
+    sdot z14.s, z6.b, z2.b
+    sdot z15.s, z10.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #56]
+    sdot z12.s, z7.b, z2.b
+    sdot z13.s, z11.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #120]
+    sdot z14.s, z7.b, z2.b
+    sdot z15.s, z11.b, z2.b
+    lsl z12.s, z12.s, #8
+    lsl z13.s, z13.s, #8
+    lsl z14.s, z14.s, #8
+    lsl z15.s, z15.s, #8
+    ld1rd {z2.d}, p2/z, [x3, #0]
+    sdot z12.s, z4.b, z2.b
+    sdot z13.s, z8.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #64]
+    sdot z14.s, z4.b, z2.b
+    sdot z15.s, z8.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #8]
+    sdot z12.s, z5.b, z2.b
+    sdot z13.s, z9.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #72]
+    sdot z14.s, z5.b, z2.b
+    sdot z15.s, z9.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #16]
+    sdot z12.s, z6.b, z2.b
+    sdot z13.s, z10.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #80]
+    sdot z14.s, z6.b, z2.b
+    sdot z15.s, z10.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #24]
+    sdot z12.s, z7.b, z2.b
+    sdot z13.s, z11.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #88]
+    sdot z14.s, z7.b, z2.b
+    sdot z15.s, z11.b, z2.b
+    add x3, x3, #128
+    subs x5, x5, #1
+    b.eq 3f
+    prfm pldl1keep, [x0, #PF1_DIST]
+    prfm pldl2keep, [x0, x9]
+    ld1b {z0.b}, p0/z, [x0]
+    ld1b {z1.b}, p0/z, [x0, #1, mul vl]
+    add x0, x0, #128
+    and z4.d, z0.d, z30.d
+    lsr z5.b, z0.b, #4
+    and z6.d, z1.d, z30.d
+    lsr z7.b, z1.b, #4
+    tbl z4.b, {z31.b}, z4.b
+    tbl z5.b, {z31.b}, z5.b
+    tbl z6.b, {z31.b}, z6.b
+    tbl z7.b, {z31.b}, z7.b
+    prfm pldl1keep, [x10, #PF1_DIST]
+    prfm pldl2keep, [x10, x9]
+    ld1b {z0.b}, p0/z, [x10]
+    ld1b {z1.b}, p0/z, [x10, #1, mul vl]
+    add x10, x10, #128
+    and z8.d, z0.d, z30.d
+    lsr z9.b, z0.b, #4
+    and z10.d, z1.d, z30.d
+    lsr z11.b, z1.b, #4
+    tbl z8.b, {z31.b}, z8.b
+    tbl z9.b, {z31.b}, z9.b
+    tbl z10.b, {z31.b}, z10.b
+    tbl z11.b, {z31.b}, z11.b
+    b 1b
+3:
+2:
+    ld1b {z3.s}, p1/z, [x2]
+    ld1b {z2.s}, p1/z, [x12]
+    add x2, x2, #16
+    add x12, x12, #16
+    lsl z3.s, z3.s, #20
+    lsl z2.s, z2.s, #20
+    ld1rd {z28.d}, p2/z, [x4, #0]
+    fmul z0.s, z28.s, z3.s
+    fmul z1.s, z28.s, z2.s
+    scvtf z12.s, p1/m, z12.s
+    scvtf z13.s, p1/m, z13.s
+    fmla z16.s, p1/m, z12.s, z0.s
+    fmla z17.s, p1/m, z13.s, z1.s
+    ld1rd {z28.d}, p2/z, [x4, #8]
+    fmul z0.s, z28.s, z3.s
+    fmul z1.s, z28.s, z2.s
+    scvtf z14.s, p1/m, z14.s
+    scvtf z15.s, p1/m, z15.s
+    fmla z18.s, p1/m, z14.s, z0.s
+    fmla z19.s, p1/m, z15.s, z1.s
+    add x4, x4, #16
+    st1w {z16.s}, p1, [x6, #0, mul vl]
+    st1w {z18.s}, p1, [x6, #1, mul vl]
+    st1w {z17.s}, p1, [x6, #2, mul vl]
+    st1w {z19.s}, p1, [x6, #3, mul vl]
+    ldp d10, d11, [sp, #16]
+    ldp d12, d13, [sp, #32]
+    ldp d14, d15, [sp, #48]
+    ldp d8, d9, [sp], #64
+    ret
+    .size q38d_asmg2s2_f4_a16, .-q38d_asmg2s2_f4_a16
+
+    .global q38d_asmg2s4_f4_a16
+    .type q38d_asmg2s4_f4_a16, %function
+    .p2align 6
+q38d_asmg2s4_f4_a16:
+    stp d8, d9, [sp, #-64]!
+    stp d10, d11, [sp, #16]
+    stp d12, d13, [sp, #32]
+    stp d14, d15, [sp, #48]
+    ptrue p0.b
+    ptrue p1.s
+    ptrue p2.d
+    ld1b {z31.b}, p0/z, [x7]
+    dup z30.b, #15
+    dup z29.s, #0
+    dup z20.s, #0
+    dup z21.s, #0
+    dup z22.s, #0
+    dup z23.s, #0
+    dup z24.s, #0
+    dup z25.s, #0
+    dup z26.s, #0
+    dup z27.s, #0
+    mov x9, #PF2_DIST
+    add x10, x0, x1
+    add x12, x2, x1
+    prfm pldl1keep, [x0, #PF1_DIST]
+    prfm pldl2keep, [x0, x9]
+    ld1b {z0.b}, p0/z, [x0]
+    ld1b {z1.b}, p0/z, [x0, #1, mul vl]
+    add x0, x0, #128
+    and z4.d, z0.d, z30.d
+    lsr z5.b, z0.b, #4
+    and z6.d, z1.d, z30.d
+    lsr z7.b, z1.b, #4
+    tbl z4.b, {z31.b}, z4.b
+    tbl z5.b, {z31.b}, z5.b
+    tbl z6.b, {z31.b}, z6.b
+    tbl z7.b, {z31.b}, z7.b
+    prfm pldl1keep, [x10, #PF1_DIST]
+    prfm pldl2keep, [x10, x9]
+    ld1b {z0.b}, p0/z, [x10]
+    ld1b {z1.b}, p0/z, [x10, #1, mul vl]
+    add x10, x10, #128
+    and z8.d, z0.d, z30.d
+    lsr z9.b, z0.b, #4
+    and z10.d, z1.d, z30.d
+    lsr z11.b, z1.b, #4
+    tbl z8.b, {z31.b}, z8.b
+    tbl z9.b, {z31.b}, z9.b
+    tbl z10.b, {z31.b}, z10.b
+    tbl z11.b, {z31.b}, z11.b
+    sub x5, x5, #1
+    ld1rd {z2.d}, p2/z, [x3, #32]
+    movprfx z12, z29
+    sdot z12.s, z4.b, z2.b
+    movprfx z13, z29
+    sdot z13.s, z8.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #96]
+    movprfx z14, z29
+    sdot z14.s, z4.b, z2.b
+    movprfx z15, z29
+    sdot z15.s, z8.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #160]
+    movprfx z16, z29
+    sdot z16.s, z4.b, z2.b
+    movprfx z17, z29
+    sdot z17.s, z8.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #224]
+    movprfx z18, z29
+    sdot z18.s, z4.b, z2.b
+    movprfx z19, z29
+    sdot z19.s, z8.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #40]
+    sdot z12.s, z5.b, z2.b
+    sdot z13.s, z9.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #104]
+    sdot z14.s, z5.b, z2.b
+    sdot z15.s, z9.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #168]
+    sdot z16.s, z5.b, z2.b
+    sdot z17.s, z9.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #232]
+    sdot z18.s, z5.b, z2.b
+    sdot z19.s, z9.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #48]
+    sdot z12.s, z6.b, z2.b
+    sdot z13.s, z10.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #112]
+    sdot z14.s, z6.b, z2.b
+    sdot z15.s, z10.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #176]
+    sdot z16.s, z6.b, z2.b
+    sdot z17.s, z10.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #240]
+    sdot z18.s, z6.b, z2.b
+    sdot z19.s, z10.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #56]
+    sdot z12.s, z7.b, z2.b
+    sdot z13.s, z11.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #120]
+    sdot z14.s, z7.b, z2.b
+    sdot z15.s, z11.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #184]
+    sdot z16.s, z7.b, z2.b
+    sdot z17.s, z11.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #248]
+    sdot z18.s, z7.b, z2.b
+    sdot z19.s, z11.b, z2.b
+    lsl z12.s, z12.s, #8
+    lsl z13.s, z13.s, #8
+    lsl z14.s, z14.s, #8
+    lsl z15.s, z15.s, #8
+    lsl z16.s, z16.s, #8
+    lsl z17.s, z17.s, #8
+    lsl z18.s, z18.s, #8
+    lsl z19.s, z19.s, #8
+    ld1rd {z2.d}, p2/z, [x3, #0]
+    sdot z12.s, z4.b, z2.b
+    sdot z13.s, z8.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #64]
+    sdot z14.s, z4.b, z2.b
+    sdot z15.s, z8.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #128]
+    sdot z16.s, z4.b, z2.b
+    sdot z17.s, z8.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #192]
+    sdot z18.s, z4.b, z2.b
+    sdot z19.s, z8.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #8]
+    sdot z12.s, z5.b, z2.b
+    sdot z13.s, z9.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #72]
+    sdot z14.s, z5.b, z2.b
+    sdot z15.s, z9.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #136]
+    sdot z16.s, z5.b, z2.b
+    sdot z17.s, z9.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #200]
+    sdot z18.s, z5.b, z2.b
+    sdot z19.s, z9.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #16]
+    sdot z12.s, z6.b, z2.b
+    sdot z13.s, z10.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #80]
+    sdot z14.s, z6.b, z2.b
+    sdot z15.s, z10.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #144]
+    sdot z16.s, z6.b, z2.b
+    sdot z17.s, z10.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #208]
+    sdot z18.s, z6.b, z2.b
+    sdot z19.s, z10.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #24]
+    sdot z12.s, z7.b, z2.b
+    sdot z13.s, z11.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #88]
+    sdot z14.s, z7.b, z2.b
+    sdot z15.s, z11.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #152]
+    sdot z16.s, z7.b, z2.b
+    sdot z17.s, z11.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #216]
+    sdot z18.s, z7.b, z2.b
+    sdot z19.s, z11.b, z2.b
+    add x3, x3, #256
+    prfm pldl1keep, [x0, #PF1_DIST]
+    prfm pldl2keep, [x0, x9]
+    ld1b {z0.b}, p0/z, [x0]
+    ld1b {z1.b}, p0/z, [x0, #1, mul vl]
+    add x0, x0, #128
+    and z4.d, z0.d, z30.d
+    lsr z5.b, z0.b, #4
+    and z6.d, z1.d, z30.d
+    lsr z7.b, z1.b, #4
+    tbl z4.b, {z31.b}, z4.b
+    tbl z5.b, {z31.b}, z5.b
+    tbl z6.b, {z31.b}, z6.b
+    tbl z7.b, {z31.b}, z7.b
+    prfm pldl1keep, [x10, #PF1_DIST]
+    prfm pldl2keep, [x10, x9]
+    ld1b {z0.b}, p0/z, [x10]
+    ld1b {z1.b}, p0/z, [x10, #1, mul vl]
+    add x10, x10, #128
+    and z8.d, z0.d, z30.d
+    lsr z9.b, z0.b, #4
+    and z10.d, z1.d, z30.d
+    lsr z11.b, z1.b, #4
+    tbl z8.b, {z31.b}, z8.b
+    tbl z9.b, {z31.b}, z9.b
+    tbl z10.b, {z31.b}, z10.b
+    tbl z11.b, {z31.b}, z11.b
+    cbz x5, 2f
+1:
+    ld1b {z3.s}, p1/z, [x2]
+    ld1b {z2.s}, p1/z, [x12]
+    add x2, x2, #16
+    add x12, x12, #16
+    lsl z3.s, z3.s, #20
+    lsl z2.s, z2.s, #20
+    ld1rd {z28.d}, p2/z, [x4, #0]
+    fmul z0.s, z28.s, z3.s
+    fmul z1.s, z28.s, z2.s
+    scvtf z12.s, p1/m, z12.s
+    scvtf z13.s, p1/m, z13.s
+    fmla z20.s, p1/m, z12.s, z0.s
+    fmla z21.s, p1/m, z13.s, z1.s
+    ld1rd {z28.d}, p2/z, [x4, #8]
+    fmul z0.s, z28.s, z3.s
+    fmul z1.s, z28.s, z2.s
+    scvtf z14.s, p1/m, z14.s
+    scvtf z15.s, p1/m, z15.s
+    fmla z22.s, p1/m, z14.s, z0.s
+    fmla z23.s, p1/m, z15.s, z1.s
+    ld1rd {z28.d}, p2/z, [x4, #16]
+    fmul z0.s, z28.s, z3.s
+    fmul z1.s, z28.s, z2.s
+    scvtf z16.s, p1/m, z16.s
+    scvtf z17.s, p1/m, z17.s
+    fmla z24.s, p1/m, z16.s, z0.s
+    fmla z25.s, p1/m, z17.s, z1.s
+    ld1rd {z28.d}, p2/z, [x4, #24]
+    fmul z0.s, z28.s, z3.s
+    fmul z1.s, z28.s, z2.s
+    scvtf z18.s, p1/m, z18.s
+    scvtf z19.s, p1/m, z19.s
+    fmla z26.s, p1/m, z18.s, z0.s
+    fmla z27.s, p1/m, z19.s, z1.s
+    add x4, x4, #32
+    ld1rd {z2.d}, p2/z, [x3, #32]
+    movprfx z12, z29
+    sdot z12.s, z4.b, z2.b
+    movprfx z13, z29
+    sdot z13.s, z8.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #96]
+    movprfx z14, z29
+    sdot z14.s, z4.b, z2.b
+    movprfx z15, z29
+    sdot z15.s, z8.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #160]
+    movprfx z16, z29
+    sdot z16.s, z4.b, z2.b
+    movprfx z17, z29
+    sdot z17.s, z8.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #224]
+    movprfx z18, z29
+    sdot z18.s, z4.b, z2.b
+    movprfx z19, z29
+    sdot z19.s, z8.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #40]
+    sdot z12.s, z5.b, z2.b
+    sdot z13.s, z9.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #104]
+    sdot z14.s, z5.b, z2.b
+    sdot z15.s, z9.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #168]
+    sdot z16.s, z5.b, z2.b
+    sdot z17.s, z9.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #232]
+    sdot z18.s, z5.b, z2.b
+    sdot z19.s, z9.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #48]
+    sdot z12.s, z6.b, z2.b
+    sdot z13.s, z10.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #112]
+    sdot z14.s, z6.b, z2.b
+    sdot z15.s, z10.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #176]
+    sdot z16.s, z6.b, z2.b
+    sdot z17.s, z10.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #240]
+    sdot z18.s, z6.b, z2.b
+    sdot z19.s, z10.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #56]
+    sdot z12.s, z7.b, z2.b
+    sdot z13.s, z11.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #120]
+    sdot z14.s, z7.b, z2.b
+    sdot z15.s, z11.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #184]
+    sdot z16.s, z7.b, z2.b
+    sdot z17.s, z11.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #248]
+    sdot z18.s, z7.b, z2.b
+    sdot z19.s, z11.b, z2.b
+    lsl z12.s, z12.s, #8
+    lsl z13.s, z13.s, #8
+    lsl z14.s, z14.s, #8
+    lsl z15.s, z15.s, #8
+    lsl z16.s, z16.s, #8
+    lsl z17.s, z17.s, #8
+    lsl z18.s, z18.s, #8
+    lsl z19.s, z19.s, #8
+    ld1rd {z2.d}, p2/z, [x3, #0]
+    sdot z12.s, z4.b, z2.b
+    sdot z13.s, z8.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #64]
+    sdot z14.s, z4.b, z2.b
+    sdot z15.s, z8.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #128]
+    sdot z16.s, z4.b, z2.b
+    sdot z17.s, z8.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #192]
+    sdot z18.s, z4.b, z2.b
+    sdot z19.s, z8.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #8]
+    sdot z12.s, z5.b, z2.b
+    sdot z13.s, z9.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #72]
+    sdot z14.s, z5.b, z2.b
+    sdot z15.s, z9.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #136]
+    sdot z16.s, z5.b, z2.b
+    sdot z17.s, z9.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #200]
+    sdot z18.s, z5.b, z2.b
+    sdot z19.s, z9.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #16]
+    sdot z12.s, z6.b, z2.b
+    sdot z13.s, z10.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #80]
+    sdot z14.s, z6.b, z2.b
+    sdot z15.s, z10.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #144]
+    sdot z16.s, z6.b, z2.b
+    sdot z17.s, z10.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #208]
+    sdot z18.s, z6.b, z2.b
+    sdot z19.s, z10.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #24]
+    sdot z12.s, z7.b, z2.b
+    sdot z13.s, z11.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #88]
+    sdot z14.s, z7.b, z2.b
+    sdot z15.s, z11.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #152]
+    sdot z16.s, z7.b, z2.b
+    sdot z17.s, z11.b, z2.b
+    ld1rd {z2.d}, p2/z, [x3, #216]
+    sdot z18.s, z7.b, z2.b
+    sdot z19.s, z11.b, z2.b
+    add x3, x3, #256
+    subs x5, x5, #1
+    b.eq 3f
+    prfm pldl1keep, [x0, #PF1_DIST]
+    prfm pldl2keep, [x0, x9]
+    ld1b {z0.b}, p0/z, [x0]
+    ld1b {z1.b}, p0/z, [x0, #1, mul vl]
+    add x0, x0, #128
+    and z4.d, z0.d, z30.d
+    lsr z5.b, z0.b, #4
+    and z6.d, z1.d, z30.d
+    lsr z7.b, z1.b, #4
+    tbl z4.b, {z31.b}, z4.b
+    tbl z5.b, {z31.b}, z5.b
+    tbl z6.b, {z31.b}, z6.b
+    tbl z7.b, {z31.b}, z7.b
+    prfm pldl1keep, [x10, #PF1_DIST]
+    prfm pldl2keep, [x10, x9]
+    ld1b {z0.b}, p0/z, [x10]
+    ld1b {z1.b}, p0/z, [x10, #1, mul vl]
+    add x10, x10, #128
+    and z8.d, z0.d, z30.d
+    lsr z9.b, z0.b, #4
+    and z10.d, z1.d, z30.d
+    lsr z11.b, z1.b, #4
+    tbl z8.b, {z31.b}, z8.b
+    tbl z9.b, {z31.b}, z9.b
+    tbl z10.b, {z31.b}, z10.b
+    tbl z11.b, {z31.b}, z11.b
+    b 1b
+3:
+2:
+    ld1b {z3.s}, p1/z, [x2]
+    ld1b {z2.s}, p1/z, [x12]
+    add x2, x2, #16
+    add x12, x12, #16
+    lsl z3.s, z3.s, #20
+    lsl z2.s, z2.s, #20
+    ld1rd {z28.d}, p2/z, [x4, #0]
+    fmul z0.s, z28.s, z3.s
+    fmul z1.s, z28.s, z2.s
+    scvtf z12.s, p1/m, z12.s
+    scvtf z13.s, p1/m, z13.s
+    fmla z20.s, p1/m, z12.s, z0.s
+    fmla z21.s, p1/m, z13.s, z1.s
+    ld1rd {z28.d}, p2/z, [x4, #8]
+    fmul z0.s, z28.s, z3.s
+    fmul z1.s, z28.s, z2.s
+    scvtf z14.s, p1/m, z14.s
+    scvtf z15.s, p1/m, z15.s
+    fmla z22.s, p1/m, z14.s, z0.s
+    fmla z23.s, p1/m, z15.s, z1.s
+    ld1rd {z28.d}, p2/z, [x4, #16]
+    fmul z0.s, z28.s, z3.s
+    fmul z1.s, z28.s, z2.s
+    scvtf z16.s, p1/m, z16.s
+    scvtf z17.s, p1/m, z17.s
+    fmla z24.s, p1/m, z16.s, z0.s
+    fmla z25.s, p1/m, z17.s, z1.s
+    ld1rd {z28.d}, p2/z, [x4, #24]
+    fmul z0.s, z28.s, z3.s
+    fmul z1.s, z28.s, z2.s
+    scvtf z18.s, p1/m, z18.s
+    scvtf z19.s, p1/m, z19.s
+    fmla z26.s, p1/m, z18.s, z0.s
+    fmla z27.s, p1/m, z19.s, z1.s
+    add x4, x4, #32
+    st1w {z20.s}, p1, [x6, #0, mul vl]
+    st1w {z22.s}, p1, [x6, #1, mul vl]
+    st1w {z24.s}, p1, [x6, #2, mul vl]
+    st1w {z26.s}, p1, [x6, #3, mul vl]
+    st1w {z21.s}, p1, [x6, #4, mul vl]
+    st1w {z23.s}, p1, [x6, #5, mul vl]
+    st1w {z25.s}, p1, [x6, #6, mul vl]
+    st1w {z27.s}, p1, [x6, #7, mul vl]
+    ldp d10, d11, [sp, #16]
+    ldp d12, d13, [sp, #32]
+    ldp d14, d15, [sp, #48]
+    ldp d8, d9, [sp], #64
+    ret
+    .size q38d_asmg2s4_f4_a16, .-q38d_asmg2s4_f4_a16
+
     .section .note.GNU-stack,"",%progbits

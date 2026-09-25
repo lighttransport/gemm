@@ -1511,6 +1511,123 @@ static void mtp_drafts(int tid, int i, int pos, int *gs, int *cs) {
     if (tid == 0) { mtp_chain[i][0] = d1; mtp_chain[i][1] = d2; mtp_chain[i][2] = E.mtp_draft; }
 }
 
+/* Projection-only verification benchmark (Q38D_VBENCH=T, T = 1, 2, 4):
+ * every layer's FP4 projections for T tokens with the engine's partitions
+ * and barrier structure; SSM/attention cores are skipped, K-quant matrices
+ * run T single-token passes. Results go to scratch. */
+static int vbench_T;
+void q38d_asmg2s2_f4_a16(const uint8_t *, long, const uint8_t *, const int8_t *, const float *, long, float *, const int8_t *);
+void q38d_asmg2s4_f4_a16(const uint8_t *, long, const uint8_t *, const int8_t *, const float *, long, float *, const int8_t *);
+void q38d_asmn4_f4_a16(const uint8_t *, const uint8_t *, const uint8_t *, const int8_t *, const float *, long, float *, const int8_t *);
+static int8_t *vb_q[NCMG][2];   /* interleaved activations: [0] EMBD/DINNER cols, [1] NFF cols */
+static float *vb_s[NCMG][2];
+static void vb_pair(int T, const uint8_t *wa, const uint8_t *wb, int np, const int8_t *aq, const float *as, float *acc) {
+    if (T == 1) q38d_asm8_f4_a16(wa, wb, wa + (size_t)np * 128, aq, as, np, acc, q38d_lut_f4, wb + (size_t)np * 128);
+    else (T == 4 ? q38d_asmg2s4_f4_a16 : q38d_asmg2s2_f4_a16)(wa, (long)(wb - wa), wa + (size_t)np * 128, aq, as, np, acc, q38d_lut_f4);
+}
+static void vb_one(int T, const uint8_t *w, int np, const int8_t *aq, const float *as, float *acc) {
+    if (T == 4) q38d_asmn4_f4_a16(w, NULL, w + (size_t)np * 128, aq, as, np, acc, q38d_lut_f4);
+    else vb_pair(T, w, w, np, aq, as, acc);
+}
+/* groups [g0, g1) of one matrix (pairs of consecutive groups) or of two
+ * matrices side by side (dual) */
+static void vb_groups(int T, const q38d_mat *m, const q38d_mat *m2, int c, int g0, int g1, int np,
+                      const int8_t *aq, const float *as, float *acc) {
+    size_t gb = q38d_group_bytes(m->fmt, np * 32);
+    if (m2) {
+        for (int g = g0; g < g1; g++) vb_pair(T, m->part[c] + (size_t)g * gb, m2->part[c] + (size_t)g * gb, np, aq, as, acc);
+        return;
+    }
+    int g = g0;
+    for (; g + 1 < g1; g += 2) vb_pair(T, m->part[c] + (size_t)g * gb, m->part[c] + (size_t)(g + 1) * gb, np, aq, as, acc);
+    if (g < g1) vb_one(T, m->part[c] + (size_t)g * gb, np, aq, as, acc);
+}
+static void vb_kquant(int T, const q38d_mat *m, int tid, float *scratch) {
+    int c, g0, g1;
+    mat_range(m, tid, &c, &g0, &g1);
+    const q38d_act *a = &E.act_c[c];
+    for (int t = 0; t < T; t++)
+        if (g0 < g1) q38d_gemv_any(scratch, m->part[c], m->fmt, a, g0, g1, m->first[c + 1] - m->first[c], 0);
+}
+static void vbench(int tid, int *gs, int *cs) {
+    int T = vbench_T, c = tid / PER, l = tid % PER;
+    float acc[2 * 4 * 16] __attribute__((aligned(256)));
+    static float *scratch_all;
+    if (tid == 0) scratch_all = aligned_alloc(256, (size_t)NT * NFF * sizeof(float));
+    if (l == 0) {
+        /* replicate this CMG's quantized x (and h) T times, interleaved per pair */
+        const q38d_act *srcs[2] = {&E.act_c[c], &E.act_h};
+        int cols[2] = {DINNER > EMBD ? DINNER : EMBD, NFF};
+        for (int k = 0; k < 2; k++) {
+            int np = cols[k] / 32, npa = srcs[k]->cols / 32;
+            vb_q[c][k] = aligned_alloc(256, (size_t)np * T * 64);
+            vb_s[c][k] = aligned_alloc(256, (size_t)np * T * 8);
+            for (int p = 0; p < np; p++)
+                for (int t = 0; t < T; t++) {
+                    memcpy(vb_q[c][k] + ((size_t)p * T + t) * 64, srcs[k]->q + (size_t)(p % npa) * 64, 64);
+                    memcpy(vb_s[c][k] + ((size_t)p * T + t) * 2, srcs[k]->sc + (size_t)(p % npa) * 2, 8);
+                }
+        }
+    }
+    gbarrier(tid, gs);
+    float *scratch = scratch_all + (size_t)tid * NFF;
+    int reps = 8;
+    double t0 = now_sec();
+    for (int rep = 0; rep < reps; rep++)
+        for (int layer = 0; layer < NLAYER; layer++) {
+            const q38d_layer *L = &E.L[layer];
+            const int8_t *aq = vb_q[c][0];
+            const float *as = vb_s[c][0];
+            const q38d_tplan *tp = L->ssm ? &plan_ssm[layer].t[tid] : &plan_att[layer].t[tid];
+            const q38d_plan *P = L->ssm ? &plan_ssm[layer] : &plan_att[layer];
+            for (int k = 0; k < tp->nseg; k++) {
+                const q38d_mat *m = P->m[tp->s[k].mi];
+                const q38d_mat *m2 = tp->s[k].mi2 >= 0 ? P->m[tp->s[k].mi2] : NULL;
+                if (m->fmt == Q38D_F4) vb_groups(T, m, m2, c, tp->s[k].g0, tp->s[k].g1, m->cols / 32, aq, as, acc);
+                else for (int t = 0; t < T; t++)
+                    q38d_gemv_any(scratch, m->part[c], m->fmt, &E.act_c[c], tp->s[k].g0, tp->s[k].g1, m->first[c + 1] - m->first[c], 0);
+            }
+            gbarrier(tid, gs);
+            gbarrier(tid, gs);                              /* core phase */
+            const q38d_mat *o = L->ssm ? &L->out : &L->o;
+            { int cc, g0, g1; mat_range(o, tid, &cc, &g0, &g1); if (g0 < g1) vb_groups(T, o, NULL, c, g0, g1, o->cols / 32, aq, as, acc); }
+            gbarrier(tid, gs);
+            {   /* FFN gate/up: 8-row partition, dual */
+                int rows = L->gate.first[c + 1] - L->gate.first[c], G8 = rows / 8;
+                vb_groups(T, &L->gate, &L->up, c, G8 * l / PER, G8 * (l + 1) / PER, L->gate.cols / 32, aq, as, acc);
+            }
+            gbarrier(tid, gs);
+            {   /* down: K-chunked items, chunk-major per worker */
+                const q38d_mat *m = &L->down;
+                int i0, i1;
+                lane_items(m, c, l, &i0, &i1);
+                if (i1 > i0) {
+                    int kc = m->cols / m->kch, npc = kc / 32;
+                    size_t sb = q38d_group_bytes(m->fmt, kc);
+                    const uint8_t *w = m->part[c] + (size_t)i0 * sb;
+                    int gf = i0 / m->kch, gl = (i1 - 1) / m->kch;
+                    for (int kk = 0; kk < m->kch; kk++) {
+                        int n = 0;
+                        for (int g = gf; g <= gl; g++) { int it = g * m->kch + kk; if (it >= i0 && it < i1) n++; }
+                        const int8_t *aqk = vb_q[c][1] + (size_t)kk * npc * T * 64;
+                        const float *ask = vb_s[c][1] + (size_t)kk * npc * T * 2;
+                        int g = 0;
+                        for (; g + 1 < n; g += 2) vb_pair(T, w + (size_t)g * sb, w + (size_t)(g + 1) * sb, npc, aqk, ask, acc);
+                        if (g < n) vb_one(T, w + (size_t)g * sb, npc, aqk, ask, acc);
+                        w += (size_t)n * sb;
+                    }
+                }
+            }
+            gbarrier(tid, gs);
+        }
+    if (tid == 0) {
+        double ms = (now_sec() - t0) * 1e3 / reps;
+        fprintf(stderr, "q38d: vbench T=%d: %.2f ms per pass (projections + 5 barriers/layer), %.2f ms per token\n", T, ms, ms / T);
+    }
+    gbarrier(tid, gs);
+    (void)cs; (void)vb_kquant;
+}
+
 /* ------------------------------------------------------------------ */
 /* run control                                                          */
 
@@ -1621,6 +1738,7 @@ static void *worker(void *arg) {
         if (mtp_on && pos + 1 < pn) mtp_step(tid, JOB.tok[pos + 1], pos, E.x, 0, &gs, &cs);
     }
     if (mtp_on) mtp_drafts(tid, 0, pn - 1, &gs, &cs);
+    if (vbench_T) { vbench(tid, &gs, &cs); return NULL; }
     if (tid == 0) {
         JOB.t_prefill = now_sec() - t0;
         memset(E.prof, 0, sizeof E.prof);
@@ -1704,6 +1822,7 @@ int main(int argc, char **argv) {
     if (write_image && !q38_lowbit_model_save_image(LB, write_image)) { fprintf(stderr, "q38d: image write failed\n"); return 1; }
     bpe_vocab *vocab = bpe_vocab_load(G);
     if (!vocab) return 1;
+    if (getenv("Q38D_VBENCH")) vbench_T = atoi(getenv("Q38D_VBENCH"));
     if (getenv("Q38D_MTP")) mtp_on = atoi(getenv("Q38D_MTP")) != 0;
     if (getenv("Q38D_SSM_PERM")) ssm_perm = atoi(getenv("Q38D_SSM_PERM"));
     if (getenv("Q38D_CONV_LOCAL") && !atoi(getenv("Q38D_CONV_LOCAL"))) ssm_perm = 0;

@@ -177,15 +177,22 @@ exactness. Findings so far (single core, `bench_multi.c`, generator
   as much as the SDOT it feeds, and A16 needs 8 SDOTs per pair and token,
   so the per-token verification cost cannot fall far below ~9-10 cycles
   (model for 4 tokens x 2 groups: 9.5).
+- Full machine (`Q38D_VBENCH=T`: every layer's FP4 projections for T
+  tokens with the engine's partitions and 5 barriers per layer, cores
+  skipped; node f29-6000c): T = 1 23.6 ms per pass, T = 2 40.6 ms
+  (20.3 ms/token), T = 4 54.4 ms (13.6 ms/token, 1.73x less per token).
+  The ratio is better than on one core because T = 1 is bandwidth-bound
+  with 48 cores.
 - Consequence. The single-token kernels already stream at ~185 GB/s per
   CMG (the practical HBM rate), so verification pays extra compute
   without saving bytes: a 4-token pass costs ~2.6x a 1-token pass in the
   projections (~20 of 25.7 ms), plus per-token SSM/attention cores, norms
   and head. Estimated: ~1.7x at 100% acceptance of 3 drafts; with
   the measured MTP acceptance (3.07 tokens per pass for k = 3) and the
-  best measured kernel (12.2 cycles, a 4-token pass ~2.6x a 1-token pass in
-  the projections): ~60 ms per pass + ~6 ms of drafting with the full
-  Q8K head -> ~21.5 ms/token, ~1.2x; ~1.27x with a cheap draft head. A
+  full-machine T = 4 projections (54.4 ms): + ~1 ms chunked SSM core,
+  ~1 ms 4-query attention, ~2 ms norms, ~2.5 ms 4-token head, ~3 ms of
+  drafting with a cheap draft head -> ~64 ms per pass, ~20.8 ms/token vs
+  27.7 on the same node, ~1.33x. A
   kernel at the model limit (~9.5 cycles) would give ~1.55x. So 1.5x needs
   (a) the verification kernel within ~5% of the model, (b) a cheap draft
   head (vocabulary subset), and (c) batched SSM (chunked delta rule),
