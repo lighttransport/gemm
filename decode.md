@@ -63,6 +63,15 @@ place from the existing low-bit image (`qwen38_lowbit_model`), per layer:
   group; the two partial sums meet in a split slot). The 6144-column
   out-projections stay unchunked (`out_kch=1`; 3 was slower).
 - SSM conv history and conv weights are kept CMG-local per head.
+- CMG-aligned in-projection (FP4 image; `ssm_perm`): CMG c owns SSM key
+  groups 4c..4c+3 and their value heads {g, g+16, g+32}; qkv/z row blocks
+  are permuted at load and alpha/beta (raw K-quant) re-gathered, so the
+  in-proj -> SSM core step and the attention in-proj -> core step (already
+  head-aligned) end with a CMG barrier instead of a global one. The FP6
+  image has low-bit alpha/beta and keeps the global barrier.
+- SSM state update in one sweep (`ssm_lazy`): the stored state is the
+  decayed matrix without the last rank-1 update (kept next to it) and
+  o = A q + delta (k . q).
 - Each "|" is a counter barrier (2.5 us). The norm of the residual uses
   per-worker sums of squares and per-CMG cooperative quantization.
 - Output head: Q6_K expanded exactly to signed bytes ("Q8K", +28% bytes, no
@@ -116,7 +125,12 @@ but each grab restarts the dual-kernel pipeline and a cold stream, ~3.5 us
 vs ~2.3 us of work, so gate/up got 0.5-1.1 ms/token slower; FFN gate/up
 runs at ~85% of the practical per-CMG stream rate, so its remaining
 imbalance, ~0.3 ms from 45/46 groups and a slower CMG3, is not worth
-chasing), `Q38D_COST_Q8K`/`Q38D_DUAL_COST` retuning (no gain), a min-makespan
+chasing), `Q38D_COST_Q8K`/`Q38D_DUAL_COST` retuning (no gain), in-proj CMG barriers
+plus the one-sweep SSM update (kept, but only ssm_in -0.13 ms and
+ssm_core -0.05 ms, within the ~0.3 ms run-to-run noise of node f29-6000c),
+SSM state prefetch in the sweep (distances 4-32 rows) or into L2 during
+in-proj (no gain: the state, 37 MB/CMG, is HBM-latency-bound per core),
+`Q38D_PROD_NORM` (now gives wrong tokens with the split-slot down path), a min-makespan
 plan partition for ssm_in/attn_in (calibrated costs from per-lane busy
 times: dual 1.88x F4, Q4K 34, Q8K 28 cycles/pair; lanes evened out but mean
 busy rose, ssm_in 3.80 -> 3.86 and attn_in 1.32 -> 1.37 ms, and the max did

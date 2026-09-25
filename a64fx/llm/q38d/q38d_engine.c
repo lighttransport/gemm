@@ -56,7 +56,7 @@
  * chunk resident in L1 for wide matrices. */
 /* unit16: worker ranges are multiples of two groups (16 rows), so a worker
  * owns whole 16-column activation units of this matrix's output. */
-typedef struct { int rows, cols, fmt, first[5], kch, unit16; uint8_t *part[4]; } q38d_mat;
+typedef struct { int rows, cols, fmt, first[5], kch, unit16; uint8_t *part[4]; const uint8_t *src; } q38d_mat;
 static inline void lane_groups(const q38d_mat *m, int c, int l, int *g0, int *g1) {
     int G8 = (m->first[c + 1] - m->first[c] + 7) / 8;
     if (m->unit16 && !(G8 & 1)) { int U = G8 / 2; *g0 = 2 * (U * l / 12); *g1 = 2 * (U * (l + 1) / 12); }
@@ -301,7 +301,7 @@ static void repack_worker(int c, int l) {
             } else {
                 const gguf_tensor_info *t = &G->tensors[todo[i].idx];
                 size_t rb = (size_t)m->cols / 256 * (t->type == GGML_TYPE_Q6_K ? 210 : 144);
-                const uint8_t *src = (const uint8_t *)gguf_tensor_data(G, todo[i].idx) +
+                const uint8_t *src = (m->src ? m->src : (const uint8_t *)gguf_tensor_data(G, todo[i].idx)) +
                                      (size_t)(m->first[c] + g * 8) * rb;
                 int nr = rows - g * 8 < 8 ? rows - g * 8 : 8;
                 if (m->fmt == Q38D_Q6K) q38d_repack_q6k(dst, src, rb, nr, m->cols);
@@ -355,6 +355,84 @@ static void kchunk_copy_or_write(int c, int l, int write) {
     }
 }
 
+/* CMG-aligned SSM heads (ssm_perm): CMG c owns key groups 4c..4c+3 and the
+ * value heads {g, g+16, g+32} of those groups, lane l running head
+ * 4c + (l & 3) + 16 (l >> 2). The in-projection rows are permuted so that
+ * CMG c's partition holds exactly its heads' q, k, v, z, alpha and beta
+ * rows (qkv per CMG: q[4], k[4], v[12] blocks of 128), which lets the
+ * in-proj -> core step use a CMG barrier instead of a global one. */
+static int ssm_perm = 1;
+static inline int ssm_head_of(int tid) {
+    int c = tid / PER, l = tid % PER;
+    return ssm_perm ? 4 * c + (l & 3) + 16 * (l >> 2) : tid;
+}
+static inline int ssm_slot(int h) { return ((h % NGROUP) / 4) * PER + (h & 3) + 4 * (h / NGROUP); }
+static inline int ssm_qoff(int g) { return ssm_perm ? (QKVD / 4) * (g / 4) + (g % 4) * DS : g * DS; }
+static inline int ssm_koff(int g) { return ssm_perm ? (QKVD / 4) * (g / 4) + 4 * DS + (g % 4) * DS : NGROUP * DS + g * DS; }
+static inline int ssm_voff(int h) {
+    if (!ssm_perm) return 2 * NGROUP * DS + h * DS;
+    int sl = ssm_slot(h);
+    return (QKVD / 4) * (sl / PER) + 8 * DS + (sl % PER) * DS;
+}
+static inline int ssm_zoff(int h) { return ssm_perm ? ssm_slot(h) * DS : h * DS; }
+static inline int ssm_abi(int h) { return ssm_perm ? ssm_slot(h) : h; }
+/* Move 128-row blocks of a low-bit matrix: new block b takes old block
+ * src_blk[b]; blocks are 16 whole groups, so CMG parts stay in place. */
+static void permute_blocks(q38d_mat *m, const int *src_blk, int nblk) {
+    size_t gb = q38d_group_bytes(m->fmt, m->cols), bb = 16 * gb;
+    uint8_t *tmp = malloc((size_t)nblk * bb);
+    for (int b = 0; b < nblk; b++) {
+        int G = b * 16, c = 0;
+        while (G >= m->first[c + 1] / 8) c++;
+        memcpy(tmp + (size_t)b * bb, m->part[c] + (size_t)(G - m->first[c] / 8) * gb, bb);
+    }
+    for (int b = 0; b < nblk; b++) {
+        int G = b * 16, c = 0;
+        while (G >= m->first[c + 1] / 8) c++;
+        memcpy(m->part[c] + (size_t)(G - m->first[c] / 8) * gb, tmp + (size_t)src_blk[b] * bb, bb);
+    }
+    free(tmp);
+}
+static int ssm_perm_ok(const q38d_layer *L) {
+    for (int c = 0; c <= 4; c++)
+        if (L->qkv.first[c] != c * QKVD / 4 || L->z.first[c] != c * DINNER / 4) return 0;
+    /* alpha/beta are re-gathered from raw K-quant rows (12 per CMG) */
+    for (int k = 0; k < 2; k++) {
+        const q38d_mat *m = k ? &L->beta : &L->alpha;
+        if (m->rows != NVH || (m->fmt != Q38D_Q4K && m->fmt != Q38D_Q6K && m->fmt != Q38D_Q8K)) return 0;
+    }
+    return L->qkv.fmt == Q38D_F4 || L->qkv.fmt == Q38D_F6 ? (L->z.fmt == L->qkv.fmt) : 0;
+}
+static void ssm_permute_layer(q38d_layer *L, int layer) {
+    int bq[QKVD / DS], bz[NVH];
+    for (int c = 0; c < 4; c++)
+        for (int j = 0; j < 20; j++) {
+            int b = 20 * c + j;
+            if (j < 4) bq[b] = 4 * c + j;                               /* q group */
+            else if (j < 8) bq[b] = NGROUP + 4 * c + (j - 4);          /* k group */
+            else bq[b] = 2 * NGROUP + ssm_head_of(c * PER + (j - 8));  /* v head  */
+        }
+    for (int t = 0; t < NVH; t++) bz[t] = ssm_head_of(t);
+    permute_blocks(&L->qkv, bq, QKVD / DS);
+    permute_blocks(&L->z, bz, NVH);
+    /* alpha, beta (raw Q4_K/Q6_K rows): 12 rows per CMG in slot order */
+    q38d_mat *ab[2] = {&L->alpha, &L->beta};
+    const char *nm[2] = {"blk.%d.ssm_alpha.weight", "blk.%d.ssm_beta.weight"};
+    for (int k = 0; k < 2; k++) {
+        q38d_mat *m = ab[k];
+        int idx = need_tensor(nm[k], layer);
+        const gguf_tensor_info *t = &G->tensors[idx];
+        size_t rb = (size_t)m->cols / 256 * (t->type == GGML_TYPE_Q6_K ? 210 : 144);
+        uint8_t *buf = malloc((size_t)NVH * rb);
+        const uint8_t *base = gguf_tensor_data(G, idx);
+        for (int t2 = 0; t2 < NVH; t2++) memcpy(buf + (size_t)t2 * rb, base + (size_t)ssm_head_of(t2) * rb, rb);
+        m->src = buf;
+        for (int c = 0; c <= 4; c++) m->first[c] = c * NVH / 4;
+        for (int c = 0; c < 4; c++)
+            m->part[c] = cmg_alloc((size_t)((NVH / 4 + 7) / 8) * q38d_group_bytes(m->fmt, m->cols), c);
+    }
+}
+
 static void load_engine(void) {
     E.n_vocab = (int)G->tensors[need_tensor("output.weight", 0)].dims[1];
     E.eps = 1e-6f;
@@ -404,6 +482,13 @@ static void load_engine(void) {
         L->down.kch = getenv("Q38D_DOWN_KCH") ? atoi(getenv("Q38D_DOWN_KCH")) : 4;
         if (L->down.kch < 1 || L->down.cols % (L->down.kch * 256)) L->down.kch = 1;
         if (L->down.kch > 1) L->down.unit16 = 0;
+    }
+    if (ssm_perm) {
+        for (int l = 0; l < NLAYER; l++)
+            if (E.L[l].ssm && !ssm_perm_ok(&E.L[l])) { ssm_perm = 0; break; }
+        if (!ssm_perm) fprintf(stderr, "q38d: SSM in-proj layout not permutable, ssm_perm off\n");
+        for (int l = 0; ssm_perm && l < NLAYER; l++)
+            if (E.L[l].ssm) ssm_permute_layer(&E.L[l], l);
     }
     describe(&E.head, need_tensor("output.weight", 0));
     E.out_norm = vec_ptr(need_tensor("output_norm.weight", 0), EMBD);
@@ -829,6 +914,8 @@ static void l2norm128(float *v) {
 #define SV8_EACH(M) M(0); M(1); M(2); M(3); M(4); M(5); M(6); M(7)
 static double ssm_t[4];
 static int ssm_pf = 0;
+static int ssm_lazy = 1, ssm_rowpf = 8;
+static void ssm_finish(const q38d_layer *L, int h, const float *o);
 static void ssm_head(int layer, int h, int pos) {
     uint64_t T0 = h ? 0 : ticks();
     const q38d_layer *L = &E.L[layer];
@@ -836,9 +923,9 @@ static void ssm_head(int layer, int h, int pos) {
     float q[128], k[128], v[128], o[128];
     if (ssm_pf == 3) ssm_prefetch_state(layer, h);
     if (conv_local) {
-        conv_silu_local(layer, h, 0, g * DS, pos, q);
-        conv_silu_local(layer, h, 1, NGROUP * DS + g * DS, pos, k);
-        conv_silu_local(layer, h, 2, 2 * NGROUP * DS + h * DS, pos, v);
+        conv_silu_local(layer, h, 0, ssm_qoff(g), pos, q);
+        conv_silu_local(layer, h, 1, ssm_koff(g), pos, k);
+        conv_silu_local(layer, h, 2, ssm_voff(h), pos, v);
     } else {
         conv_silu(L, layer, g * DS, pos, h < NGROUP, q);
         conv_silu(L, layer, NGROUP * DS + g * DS, pos, h < NGROUP, k);
@@ -847,13 +934,43 @@ static void ssm_head(int layer, int h, int pos) {
     l2norm128(q); l2norm128(k);
     const float qs = 1.0f / sqrtf((float)DS);
     for (int i = 0; i < 128; i++) q[i] *= qs;
-    float val = E.ab[h] + L->dt_bias[h];
+    float val = E.ab[ssm_abi(h)] + L->dt_bias[h];
     float sp = val > 20.0f ? val : logf(1.0f + expf(val));
     float decay = expf(sp * L->ssm_a[h]);
-    float beta = 1.0f / (1.0f + expf(-E.bb[h]));
+    float beta = 1.0f / (1.0f + expf(-E.bb[ssm_abi(h)]));
     float *St = E.ssm_state[layer][h];
     const svbool_t pf = svptrue_b32();
     uint64_t T1 = h ? 0 : ticks();
+    if (ssm_lazy) {
+        /* One sweep: the stored state is A = decay S_prev without the last
+         * rank-1 update, kept as (pk, pd) after the matrix. Materialize
+         * S_prev = A + pd pk^T row by row, decay it, and accumulate A k and
+         * A q; then o = A q + delta (k . q). */
+        float *pk = St + DS * DS, *pd = pk + DS;
+        SV8(sk); SV8(oa); SV8(pv);
+#define LZ0(j) sk##j = svdup_n_f32(0); oa##j = sk##j; pv##j = svld1_f32(pf, pd + 16 * j)
+        SV8_EACH(LZ0);
+        for (int c = 0; c < DS; c++) {
+            float *row = St + (size_t)c * DS;
+            if (ssm_rowpf && c + ssm_rowpf < DS) {
+                __builtin_prefetch(row + ssm_rowpf * DS, 1, 3);
+                __builtin_prefetch(row + ssm_rowpf * DS + 64, 1, 3);
+            }
+            svfloat32_t pc = svdup_n_f32(pk[c]), kc = svdup_n_f32(k[c]), qc = svdup_n_f32(q[c]);
+#define LZ1(j) { svfloat32_t s_ = svmul_n_f32_x(pf, svmla_f32_x(pf, svld1_f32(pf, row + 16 * j), pv##j, pc), decay); \
+                svst1_f32(pf, row + 16 * j, s_); sk##j = svmla_f32_x(pf, sk##j, s_, kc); oa##j = svmla_f32_x(pf, oa##j, s_, qc); }
+            SV8_EACH(LZ1);
+        }
+        uint64_t T2l = h ? 0 : ticks();
+        float kq = dot(k, q, DS);
+#define LZ2(j) { svfloat32_t d_ = svmul_n_f32_x(pf, svsub_f32_x(pf, svld1_f32(pf, v + 16 * j), sk##j), beta); \
+                svst1_f32(pf, pd + 16 * j, d_); svst1_f32(pf, o + 16 * j, svmla_n_f32_x(pf, oa##j, d_, kq)); }
+        SV8_EACH(LZ2);
+        memcpy(pk, k, DS * sizeof(float));
+        ssm_finish(L, h, o);
+        if (!h) { uint64_t T4 = ticks(); ssm_t[0] += T1 - T0; ssm_t[1] += T2l - T1; ssm_t[3] += T4 - T2l; }
+        return;
+    }
     SV8(sk); SV8(dl); SV8(oo);
 #define Z0(j) sk##j = svdup_n_f32(0); oo##j = sk##j
     SV8_EACH(Z0);
@@ -877,8 +994,14 @@ static void ssm_head(int layer, int h, int pos) {
 #define OS(j) svst1_f32(pf, o + 16 * j, oo##j)
     SV8_EACH(OS);
     uint64_t T3 = h ? 0 : ticks();
+    ssm_finish(L, h, o);
+    if (!h) { uint64_t T4 = ticks(); ssm_t[0] += T1 - T0; ssm_t[1] += T2 - T1; ssm_t[2] += T3 - T2; ssm_t[3] += T4 - T3; }
+}
+/* gated RMSNorm of head h's output into E.o, quantized for the out-proj */
+static void ssm_finish(const q38d_layer *L, int h, const float *o) {
+    const svbool_t pf = svptrue_b32();
     float inv = 1.0f / sqrtf(sumsq(o, DS) / DS + E.eps);
-    const float *z = E.zb + (size_t)h * DS;
+    const float *z = E.zb + ssm_zoff(h);
     float *dst = E.o + (size_t)h * DS;
     for (int i = 0; i < DS; i += 16) {
         svfloat32_t zv = svld1_f32(pf, z + i);
@@ -887,7 +1010,6 @@ static void ssm_head(int layer, int h, int pos) {
         svst1_f32(pf, dst + i, svmul_f32_x(pf, ov, sz));
     }
     if (E.arith != Q38D_F32) q38d_prepare_range(&E.act_o, E.o, h * 4, h * 4 + 4);
-    if (!h) { uint64_t T4 = ticks(); ssm_t[0] += T1 - T0; ssm_t[1] += T2 - T1; ssm_t[2] += T3 - T2; ssm_t[3] += T4 - T3; }
 }
 static void ssm_prefetch_state(int layer, int h) {
     const char *p = (const char *)E.ssm_state[layer][h];
@@ -1144,6 +1266,20 @@ static void phase_end(int tid, int *gs, uint64_t *t, int phase) {
     prof_mark(tid, t, phase);
 }
 
+/* Phase end with a CMG barrier: the next phase reads only CMG-local data. */
+static int inproj_cbar = 1, attn_cmg_ok = 1;
+static void phase_end_c(int tid, int *cs, uint64_t *t, int phase) {
+    pf_next(tid, pf_layer[tid], phase);
+    cur_phase[tid] = phase;
+    uint64_t t0 = ticks();
+    if (busy_on) busy_acc[tid][phase] += (double)(t0 - busy_start[tid]);
+    cbarrier(tid, cs);
+    uint64_t t1 = ticks();
+    if (!tid) kprof_wait_acc += (double)(t1 - t0);
+    busy_start[tid] = t1;
+    prof_mark(tid, t, phase);
+}
+
 static void step(int tid, int token, int pos, int want_head, int *gs, int *cs) {
     uint64_t t = ticks();
     pf_pos = pos;
@@ -1158,13 +1294,15 @@ static void step(int tid, int token, int pos, int want_head, int *gs, int *cs) {
         if (prod_norm && layer > 0) { int cc = prod_copies > 1 ? tid / PER : 0; a = &E.act_c[cc]; E.act_c[cc].x = E.xn_c[cc]; omul = x_inv(); }
         else a = norm_act(tid, L->attn_norm);
         if (L->ssm) {
-            if (ssm_pf == 1) ssm_prefetch_state(layer, tid);
+            int hh = ssm_head_of(tid);
+            if (ssm_pf == 1) ssm_prefetch_state(layer, hh);
             if (use_plan) run_plan(&plan_ssm[layer], a, tid, omul);
             else { mv(&L->qkv, a, E.qkv, 0, tid); mv(&L->z, a, E.zb, 0, tid);
                    mv(&L->alpha, a, E.ab, 0, tid); mv(&L->beta, a, E.bb, 0, tid); }
-            phase_end(tid, gs, &t, P_SSM_IN);
-            if (ssm_pf == 2) ssm_prefetch_state(layer, tid);
-            ssm_head(layer, tid, pos);
+            if (inproj_cbar && ssm_perm && use_plan) phase_end_c(tid, cs, &t, P_SSM_IN);
+            else phase_end(tid, gs, &t, P_SSM_IN);
+            if (ssm_pf == 2) ssm_prefetch_state(layer, hh);
+            ssm_head(layer, hh, pos);
             if (E.arith == Q38D_F32) E.act_o.x = E.o;
             phase_end(tid, gs, &t, P_SSM_CORE);
             mv(&L->out, &E.act_o, E.x, 1, tid);
@@ -1176,7 +1314,8 @@ static void step(int tid, int token, int pos, int want_head, int *gs, int *cs) {
         } else {
             if (use_plan) run_plan(&plan_att[layer], a, tid, omul);
             else { mv(&L->q, a, E.qg, 0, tid); mv(&L->k, a, E.kb, 0, tid); mv(&L->v, a, E.vb, 0, tid); }
-            phase_end(tid, gs, &t, P_ATT_IN);
+            if (inproj_cbar && attn_cmg_ok && use_plan) phase_end_c(tid, cs, &t, P_ATT_IN);
+            else phase_end(tid, gs, &t, P_ATT_IN);
             attention(layer, tid, pos, cs);
             if (E.arith == Q38D_F32) E.act_o.x = E.o;
             phase_end(tid, gs, &t, P_ATT_CORE);
@@ -1300,16 +1439,17 @@ static void *worker(void *arg) {
     a->sum = aligned_alloc(256, EMBD / 16 * 4 + 256);
     for (int layer = 0; layer < NLAYER; layer++)
         if (E.L[layer].ssm) {
-            E.ssm_state[layer][tid] = aligned_alloc(256, DS * DS * sizeof(float));
-            memset(E.ssm_state[layer][tid], 0, DS * DS * sizeof(float));
-            E.conv_hist[layer][tid] = aligned_alloc(256, 4 * 384 * sizeof(float));
-            memset(E.conv_hist[layer][tid], 0, 4 * 384 * sizeof(float));
+            int hh = ssm_head_of(tid);
+            E.ssm_state[layer][hh] = aligned_alloc(256, (DS * DS + 2 * DS) * sizeof(float));
+            memset(E.ssm_state[layer][hh], 0, (DS * DS + 2 * DS) * sizeof(float));
+            E.conv_hist[layer][hh] = aligned_alloc(256, 4 * 384 * sizeof(float));
+            memset(E.conv_hist[layer][hh], 0, 4 * 384 * sizeof(float));
             float *wl = aligned_alloc(256, 4 * 384 * sizeof(float));
-            int g = tid % NGROUP, ch[3] = {g * DS, NGROUP * DS + g * DS, 2 * NGROUP * DS + tid * DS};
+            int g = hh % NGROUP, ch[3] = {g * DS, NGROUP * DS + g * DS, 2 * NGROUP * DS + hh * DS};
             for (int kk = 0; kk < 4; kk++)
                 for (int part = 0; part < 3; part++)
                     memcpy(wl + kk * 384 + part * 128, E.L[layer].conv_w + (size_t)kk * QKVD + ch[part], 128 * sizeof(float));
-            E.conv_wl[layer][tid] = wl;
+            E.conv_wl[layer][hh] = wl;
         }
     int c = tid / PER, l = tid % PER;
     if (l == 0) {
@@ -1440,7 +1580,16 @@ int main(int argc, char **argv) {
     if (write_image && !q38_lowbit_model_save_image(LB, write_image)) { fprintf(stderr, "q38d: image write failed\n"); return 1; }
     bpe_vocab *vocab = bpe_vocab_load(G);
     if (!vocab) return 1;
+    if (getenv("Q38D_SSM_PERM")) ssm_perm = atoi(getenv("Q38D_SSM_PERM"));
+    if (getenv("Q38D_CONV_LOCAL") && !atoi(getenv("Q38D_CONV_LOCAL"))) ssm_perm = 0;
     load_engine();
+    for (int l = 0; l < NLAYER; l++) {
+        const q38d_layer *L = &E.L[l];
+        if (L->ssm) continue;
+        for (int c = 0; c <= 4; c++)
+            if (L->q.first[c] != c * (L->q.rows / 4) || L->k.first[c] != c * HD || L->v.first[c] != c * HD) attn_cmg_ok = 0;
+    }
+    if (!attn_cmg_ok) fprintf(stderr, "q38d: attention in-proj not CMG-aligned, global barrier kept\n");
     /* shared buffers (first touched by main thread; small) */
     E.x = aligned_alloc(256, EMBD * 4);
     E.qkv = aligned_alloc(256, NFF * 4);
@@ -1466,6 +1615,9 @@ int main(int argc, char **argv) {
     if (getenv("Q38D_DUAL")) use_dual = atoi(getenv("Q38D_DUAL"));
     if (getenv("Q38D_FFN_SPLIT")) ffn_group_split = atoi(getenv("Q38D_FFN_SPLIT"));
     if (getenv("Q38D_PAIR")) q38d_pair_groups = atoi(getenv("Q38D_PAIR"));
+    if (getenv("Q38D_SSM_ROWPF")) ssm_rowpf = atoi(getenv("Q38D_SSM_ROWPF"));
+    if (getenv("Q38D_SSM_LAZY")) ssm_lazy = atoi(getenv("Q38D_SSM_LAZY"));
+    if (getenv("Q38D_INPROJ_CBAR")) inproj_cbar = atoi(getenv("Q38D_INPROJ_CBAR"));
     if (getenv("Q38D_CONV_LOCAL")) conv_local = atoi(getenv("Q38D_CONV_LOCAL"));
     if (getenv("Q38D_DUAL_COST")) dual_cost = atof(getenv("Q38D_DUAL_COST"));
     if (getenv("Q38D_PF_KV")) pf_kv = atoi(getenv("Q38D_PF_KV"));
