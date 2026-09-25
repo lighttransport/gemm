@@ -154,7 +154,7 @@ typedef struct gguf_context_s {
     /* A multi-file context owns one ordinary context per GGUF shard.  The
      * aggregate tensor table below keeps the public API unchanged while
      * gguf_tensor_data() selects the owning shard. */
-    struct gguf_context **parts;
+    struct gguf_context_s **parts; /* gguf_context is a typedef, not a tag */
     uint32_t n_parts;
 } gguf_context;
 
