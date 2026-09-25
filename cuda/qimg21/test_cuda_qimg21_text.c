@@ -13,6 +13,38 @@
 #include "qwen_tokenizer_json.h"
 
 static int text_bf16_gemm_output = 1;
+
+/* Linear weights stream through one persistent pinned buffer and one device
+ * buffer. Each matrix is copied from the mapped checkpoint in 8 MiB chunks,
+ * so a chunk's DMA overlaps the host copy of the next one; the bytes are the
+ * same as a pageable upload. */
+#define TEXT_WEIGHT_BYTES ((size_t)12288 * 4096 * 2)
+static void *text_pinned;
+static CUdeviceptr text_weight;
+static CUstream text_copy;
+
+static CUdeviceptr text_upload(st_context *st, int idx) {
+    size_t bytes = safetensors_nbytes(st, idx);
+    const uint8_t *src = (const uint8_t *)safetensors_data(st, idx);
+    if (bytes > TEXT_WEIGHT_BYTES) return 0;
+    if (!text_pinned && cuMemHostAlloc(&text_pinned, TEXT_WEIGHT_BYTES, 0)) { text_pinned = NULL; return 0; }
+    if (!text_weight && !(text_weight = checked_cuMemAlloc(TEXT_WEIGHT_BYTES))) return 0;
+    if (!text_copy && cuStreamCreate(&text_copy, CU_STREAM_NON_BLOCKING)) { text_copy = NULL; return 0; }
+    const size_t chunk = (size_t)8 << 20;
+    for (size_t off = 0; off < bytes; off += chunk) {
+        size_t len = bytes - off < chunk ? bytes - off : chunk;
+        memcpy((uint8_t *)text_pinned + off, src + off, len);
+        if (cuMemcpyHtoDAsync(text_weight + off, (uint8_t *)text_pinned + off, len, text_copy)) return 0;
+    }
+    return cuStreamSynchronize(text_copy) ? 0 : text_weight;
+}
+
+static void text_upload_free(void) {
+    if (text_copy) cuStreamDestroy(text_copy);
+    if (text_weight) cuMemFree(text_weight);
+    if (text_pinned) cuMemFreeHost(text_pinned);
+    text_copy = NULL; text_weight = 0; text_pinned = NULL;
+}
 typedef int (*q21_cutlass_text_attention_fn)(float *, const void *, const void *,
                                              const void *, int, CUstream);
 
@@ -27,14 +59,14 @@ static int text_linear(cuda_qimg_runner *r, qimg21_kernels *k,
         fprintf(stderr, "text: unsupported/missing matrix %s\n", name);
         return -1;
     }
-    CUdeviceptr w = upload_bf16(s, name);
-    if (!w) return -1;
-    /* The cuBLAS handle owns a separate stream. Pageable host-to-device
-     * copies may return after staging, before the device transfer finishes. */
+    /* The previous GEMM finished before this call (every linear ends with a
+     * context synchronize), so the shared weight buffer is free. */
+    CUdeviceptr w = text_upload(st, idx);
+    if (!w) { fprintf(stderr, "text: upload of %s failed\n", name); return -1; }
     int rc = cuCtxSynchronize();
     if (!rc && text_bf16_gemm_output) {
         CUdeviceptr result = checked_cuMemAlloc((size_t)n * no * 2), bias = 0;
-        if (!result) { free_d(&w); return -1; }
+        if (!result) return -1;
         rc = cublasew_gemm_bf16_bf16_bf16_rowmajor_nt(r->cublaslt_ctx, result, w, in_bf, n, no, ni);
         if (!rc) rc = cuCtxSynchronize();
         void *args[] = {&out, &result, &bias, &no, &n};
@@ -44,7 +76,7 @@ static int text_linear(cuda_qimg_runner *r, qimg21_kernels *k,
         free_d(&result);
     } else if (!rc) rc = gemm(r, out, w, in_bf, n, no, ni);
     if (!rc) rc = launch_vec(k->round_bf16, r->stream, n * no, out);
-    free_d(&w);
+    if (!rc) rc = cuCtxSynchronize();
     return rc;
 }
 
@@ -428,6 +460,7 @@ done:
     free_d(&visual_rows_d);free_d(&visual_embed_d);
     if(module)cuModuleUnload(module);
     if(base_module)cuModuleUnload(base_module);
+    if(r)text_upload_free();
     if(r)cuda_qimg_free(r);
     if(cutlass_plugin)dlclose(cutlass_plugin);
     for(int i=0;i<shards.n;i++)safetensors_close(shards.st[i]);
