@@ -1158,8 +1158,9 @@ static const q38d_act *norm_act_impl(int tid, const float *w) {
  * of CMG k; each out-proj worker gathers the 4 blocks into private arrays. */
 static int oq_cmg = 2, oQ;
 static double oq_t[NT][2];
+static int pf_active;   /* q38p prefill running: its own quantization */
 static void o_prepare(const q38d_io *io, int p0, int p1) {
-    if (E.arith == Q38D_F32) return;
+    if (E.arith == Q38D_F32 || pf_active) return;
     if (io->act_o) { q38d_prepare_range(io->act_o, io->o, p0, p1); return; }
     if (oq_cmg != 2) return;
     for (int p = p0; p < p1; p++) q38d_prepare_range(&E.act_ov[p / oQ], io->o, p, p + 1);
@@ -2834,6 +2835,8 @@ typedef struct {
 static q38d_job JOB;
 static int bench_mv;
 
+#include "../q38p/q38p_prefill.inc"
+
 static void *worker(void *arg) {
     int tid = (int)(intptr_t)arg;
     pin_cpu(12 + tid);
@@ -2964,7 +2967,8 @@ static void *worker(void *arg) {
     double t0 = 0;
     int pn = JOB.n_prompt, gn = JOB.n_gen;
     if (tid == 0) t0 = now_sec();
-    for (int pos = 0; pos < pn; pos++) {
+    if (pf_on) q38p_prefill(tid, JOB.tok, pn, &gs);
+    else for (int pos = 0; pos < pn; pos++) {
         step(tid, JOB.tok[pos], pos, pos == pn - 1, &gs, &cs);
         if (mtp_on && pos + 1 < pn) mtp_step(tid, JOB.tok[pos + 1], pos, E.x, 0, &gs, &cs);
     }
@@ -3133,6 +3137,9 @@ int main(int argc, char **argv) {
     if (getenv("Q38D_CORE_FLAGS")) core_flags = atoi(getenv("Q38D_CORE_FLAGS"));
     if (getenv("Q38D_TP_FLAGREL")) tp_flagrel = atoi(getenv("Q38D_TP_FLAGREL"));
     if (getenv("Q38D_TP_PNORM")) tp_pnorm = atoi(getenv("Q38D_TP_PNORM"));
+    if (getenv("Q38P")) pf_on = atoi(getenv("Q38P"));
+    if (getenv("Q38P_CHUNK")) pf_chunk = atoi(getenv("Q38P_CHUNK"));
+    if (getenv("Q38P_TEST")) pf_test = atoi(getenv("Q38P_TEST"));
     if (getenv("Q38D_OQ_CMG")) oq_cmg = atoi(getenv("Q38D_OQ_CMG"));
     if (getenv("Q38D_ATT_QPF")) att_qpf = atoi(getenv("Q38D_ATT_QPF"));
     if (getenv("Q38D_ATT_MERGE2")) att_merge2 = atoi(getenv("Q38D_ATT_MERGE2"));
@@ -3321,6 +3328,7 @@ int main(int argc, char **argv) {
     for (int n = 0; n < gn; n++)
         fprintf(stderr, "q38d: token n=%d pos=%d id=%d logit=%a\n", n, pn + n, JOB.tok[pn + n], JOB.trace_logit[n]);
     double hz = tick_hz();
+    if (pf_on) q38p_report(pn, JOB.t_prefill);
     fprintf(stderr, "q38d: prefill %d tok %.3f s (%.3f tok/s); decode %d tok %.3f s = %.3f tok/s (%.3f ms/tok)\n",
             pn, JOB.t_prefill, pn / JOB.t_prefill, gn, JOB.t_decode, gn / JOB.t_decode, 1e3 * JOB.t_decode / gn);
     fprintf(stderr, "q38d: stages ms/tok:");
