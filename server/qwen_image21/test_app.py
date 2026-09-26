@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest import mock
 
 from server.qwen_image21.app import (MAX_EVENTS, Demo, Progress, REFERENCE_DEVICES, ROOT,
-                                     compare_runs)
+                                     StepPreviews, compare_runs, denoised_estimate, flow_sigmas)
 import time
 
 
@@ -742,7 +742,7 @@ class QwenImage21CompareTest(unittest.TestCase):
             self.assertIn("compare", result)
             self.assertIn("image", result["cuda"])
 
-    def test_native_and_reference_modes_draw_their_own_noise(self):
+    def test_only_a_compare_hands_the_runner_the_reference_noise(self):
         with tempfile.TemporaryDirectory(dir=ROOT / "tmp", prefix="qimg21-test-") as td:
             root = Path(td)
             demo = QwenImage21RoutingTest.make_demo(None, root)
@@ -752,7 +752,8 @@ class QwenImage21CompareTest(unittest.TestCase):
                 demo._native(cfg, root / "out")
                 demo._reference(demo._validate({"prompt": "apple", "mode": "reference"}), root / "out")
             self.assertNotIn("--initial-latents", commands[0])
-            self.assertNotIn("--dump-initial-latents", commands[1])
+            # The reference always saves its noise: the step-0 preview needs it.
+            self.assertIn("--dump-initial-latents", commands[1])
 
     def test_metrics_name_the_first_stage_that_leaves_the_reference(self):
         import numpy as np
@@ -788,6 +789,67 @@ class QwenImage21CompareTest(unittest.TestCase):
             self.assertEqual(m["first_divergence"], "step 1")
             self.assertEqual(m["image"]["max_abs"], 40.0)
             self.assertGreater(m["image"]["psnr"], 30)
+
+
+class QwenImage21PreviewTest(unittest.TestCase):
+    def test_the_schedule_matches_the_runner(self):
+        # test_cuda_qimg21_fast printed these for a 512x512 (1024-token), 20-step run.
+        sigmas = flow_sigmas(20, 1024)
+        self.assertEqual(len(sigmas), 21)
+        self.assertAlmostEqual(sigmas[0], 1.0, places=6)
+        self.assertAlmostEqual(sigmas[1], 0.9682, places=4)
+        self.assertAlmostEqual(sigmas[12], 0.5013, places=4)
+        self.assertAlmostEqual(sigmas[19], 0.02, places=6)
+        self.assertEqual(sigmas[20], 0.0)
+        self.assertEqual(flow_sigmas(1, 256), [1.0, 0.0])
+
+    def test_the_estimate_recovers_the_clean_latent_of_a_straight_path(self):
+        import numpy as np
+        rng = np.random.default_rng(1)
+        clean, noise = rng.standard_normal((4, 64)), rng.standard_normal((4, 64))
+        at = lambda sigma: (1 - sigma) * clean + sigma * noise
+        estimate = denoised_estimate(at(0.6), at(0.8), 0.8, 0.6)
+        np.testing.assert_allclose(estimate, clean, atol=1e-12)
+        # Without a previous step there is nothing to extrapolate from.
+        np.testing.assert_array_equal(denoised_estimate(at(0.6), None, 0.8, 0.6), at(0.6))
+
+    def test_each_new_step_dump_becomes_one_preview(self):
+        import numpy as np
+        with tempfile.TemporaryDirectory(dir=ROOT / "tmp", prefix="qimg21-test-") as td:
+            root = Path(td)
+            steps = root / "steps"; steps.mkdir()
+            np.save(root / "latents.npy", np.zeros((16 * 16, 64), np.float32))
+            events = []
+            watcher = StepPreviews("native", steps, root / "latents.npy", [(16, 16, 3)], events.append)
+            watcher.sweep()
+            self.assertEqual(events, [])
+            np.save(steps / "step_000.npy", np.ones((1, 256, 64), np.float32))
+            (steps / "step_001.npy").write_bytes(b"\x93NUMPY half written")
+            watcher.sweep()
+            self.assertEqual([e["index"] for e in events], [1])
+            np.save(steps / "step_001.npy", np.ones((256, 64), np.float32))
+            np.save(steps / "block_00.npy", np.ones((3, 64), np.float32))
+            watcher.sweep(); watcher.sweep()
+            self.assertEqual([(e["source"], e["index"], e["total"]) for e in events],
+                             [("native", 1, 3), ("native", 2, 3)])
+            self.assertTrue(events[0]["image"].startswith("data:image/png;base64,"))
+
+    def test_a_tiled_run_previews_its_base_grid(self):
+        import numpy as np
+        with tempfile.TemporaryDirectory(dir=ROOT / "tmp", prefix="qimg21-test-") as td:
+            root = Path(td)
+            demo = QwenImage21RoutingTest.make_demo(None, root)
+            cfg = demo._validate({"prompt": "apple", "width": 512, "height": 512, "steps": 8,
+                                  "preset": "accurate", "upscale": 2, "base_steps": 5})
+            watcher = demo._previews("job", "native", root, root / "none.npy", cfg)
+            self.assertEqual(watcher.grids, [(16, 16, 5), (32, 32, 8)])
+            events = []
+            watcher.emit = events.append
+            np.save(root / "step_000.npy", np.zeros((256, 64), np.float32))
+            watcher.sweep()
+            self.assertEqual((events[0]["index"], events[0]["total"]), (1, 5))
+            # Nobody is watching a run without a job id, so nothing is decoded.
+            self.assertNotIsInstance(demo._previews(None, "native", root, root, cfg), StepPreviews)
 
 
 if __name__ == "__main__":

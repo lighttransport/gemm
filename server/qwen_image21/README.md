@@ -28,6 +28,34 @@ packages default to `/mnt/nvme01/models/qimg-21-fast/`; override them with
 `--int8-package` and `--nvfp4-package`. The API field is `preset`, CUDA only,
 and `GET /api/health` reports which presets are available.
 
+## Step previews
+
+While a run is in flight, each result card shows the picture as it develops.
+Below it is a filmstrip of every step: click a step to hold it, and click it
+again to follow the run. The filmstrip stays under the final picture, with a
+"final" frame to return to.
+
+The runners already dump `step_NNN.npy` after every step for parity work. The
+server watches those files, so the runners need nothing new, and turns each
+one into two things:
+
+- **The picture it is heading for.** Step `i` moves the latent from `sigma_i`
+  to `sigma_i+1` along one velocity, so `x0 = x - sigma_i+1 * dx / dsigma`,
+  using the same FlowMatch schedule the runners use. The raw latent is mostly
+  noise until the last few steps; `x0` shows the composition from early on.
+- **RGB without the VAE.** A fitted affine map reads each token and its eight
+  neighbours and writes an 8x8 RGB patch (`cuda/qimg21/latent_preview.npy`,
+  about 25 dB against the real decode). The previews are soft by design and
+  capped at 384 px a side.
+
+Refit the map on your own runs with
+`python cuda/qimg21/fit_latent_preview.py --jobs tmp/qimg21-web-jobs --out cuda/qimg21/latent_preview.npy`.
+Previews are sent only to a client polling `/api/progress`, as `preview`
+events carrying `source` (`native` or `reference`), `index`, `total`, `sigma`
+and a PNG data URL. The PyTorch reference now always saves its initial noise
+(`--dump-initial-latents`), which the step-0 preview needs; it does not change
+the picture.
+
 ## Compare mode
 
 A compare runs the **reference first**, with `--dump-initial-latents`. The native
@@ -53,7 +81,7 @@ Metrics never block the images. A failure shows up as `compare.error`.
 
 The page adds three views under the two result cards:
 
-- **Overlay**: a swipe split you drag across the picture, a blend with an
+- **Overlay**: a swipe split you drag anywhere across the picture, a blend with an
   opacity slider, and a flicker toggle that swaps the two in place.
 - **Diff**: the per-pixel largest-channel |Δ| with an adjustable gain, a heat or
   gray palette, an optional "only |Δ| > N" mask, and a readout of both RGB

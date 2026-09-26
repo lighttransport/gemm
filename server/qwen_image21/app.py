@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import json
 import mimetypes
 import os
@@ -184,6 +185,153 @@ def _tail(log: Path, progress, stop: threading.Event, interval: float = 0.15) ->
     for line in (pending + chunk).split("\n"):
         if line.strip():
             progress(line)
+
+
+# Per-step previews. Each denoising step's dumped latent becomes a picture
+# without running the VAE: see cuda/qimg21/fit_latent_preview.py.
+PREVIEW_WEIGHTS = ROOT / "cuda/qimg21/latent_preview.npy"
+PREVIEW_MAX_SIDE = 384
+PREVIEW_INTERVAL = 0.3
+
+
+def flow_sigmas(steps: int, tokens: int) -> list[float]:
+    """The FlowMatch schedule the runners use (qimg21_flow_sigmas in
+    test_cuda_qimg21_native.c): steps + 1 sigmas ending at 0."""
+    import math
+    mu = tokens * (0.9 - 0.5) / (8192.0 - 256.0) + 0.5 - (0.9 - 0.5) / (8192.0 - 256.0) * 256.0
+    emu = math.exp(mu)
+    if steps == 1:
+        return [1.0, 0.0]
+    sigmas = [emu / (emu + (1.0 / (1.0 - i / steps) - 1.0)) for i in range(steps)]
+    scale = (1.0 - sigmas[-1]) / (1.0 - 0.02)
+    return [1.0 - (1.0 - sigma) / scale for sigma in sigmas] + [0.0]
+
+
+def denoised_estimate(latent, previous, sigma_from: float, sigma_to: float):
+    """The clean latent a step is heading for. Step i moves x from sigma_from
+    to sigma_to along one velocity v, so v = dx / dsigma and x0 = x - sigma_to v.
+    A preview of x0 shows the picture as it is being decided, where x itself is
+    mostly noise until the last few steps."""
+    if previous is None or sigma_to <= 0.0 or sigma_from == sigma_to:
+        return latent
+    velocity = (latent - previous) / (sigma_to - sigma_from)
+    return latent - sigma_to * velocity
+
+
+_preview_weights = None
+
+
+def preview_image(latents, h_tokens: int, w_tokens: int) -> str | None:
+    """Normalized [tokens, 64] latents -> a PNG data URL, or None when the
+    preview map is not installed."""
+    global _preview_weights
+    import numpy as np
+    from io import BytesIO
+    from PIL import Image
+
+    if _preview_weights is None:
+        if not PREVIEW_WEIGHTS.is_file():
+            return None
+        _preview_weights = np.load(PREVIEW_WEIGHTS).astype(np.float32)
+    weights = _preview_weights
+    patch = int(round((weights.shape[1] // 3) ** 0.5))
+    # The map reads each token's 3x3 neighbourhood (fit_latent_preview.features).
+    grid = np.pad(latents.astype(np.float32).reshape(h_tokens, w_tokens, 64), ((1, 1), (1, 1), (0, 0)),
+                  mode="edge")
+    near = [grid[dy:dy + h_tokens, dx:dx + w_tokens] for dy in range(3) for dx in range(3)]
+    x = np.concatenate(near, axis=2).reshape(h_tokens * w_tokens, 9 * 64)
+    x = np.hstack([x, np.ones((x.shape[0], 1), np.float32)])
+    rgb = (x @ weights).reshape(h_tokens, w_tokens, patch, patch, 3).transpose(0, 2, 1, 3, 4)
+    rgb = np.clip(rgb.reshape(h_tokens * patch, w_tokens * patch, 3) * 127.5 + 127.5, 0, 255)
+    image = Image.fromarray(rgb.astype(np.uint8))
+    if max(image.size) > PREVIEW_MAX_SIDE:
+        image.thumbnail((PREVIEW_MAX_SIDE, PREVIEW_MAX_SIDE), Image.BILINEAR)
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+class StepPreviews:
+    """Watch a run's step dumps and emit one preview event per new step.
+
+    The runners already write step_NNN.npy after every step for parity work,
+    so this reads what is there rather than asking them for anything new. A
+    file caught half-written fails to load and is simply retried next poll.
+    `grids` lists the (h_tokens, w_tokens, steps) a dump may belong to: a tiled
+    run's base pass writes a smaller grid with its own step count.
+    """
+
+    def __init__(self, source: str, step_dir: Path, initial: Path | None,
+                 grids: list[tuple[int, int, int]], emit, interval: float = PREVIEW_INTERVAL):
+        self.source, self.step_dir, self.initial = source, step_dir, initial
+        self.grids, self.emit, self.interval = grids, emit, interval
+        self.seen: set[str] = set()
+        self.latents: dict[int, object] = {}
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self.stop_event.set()
+        self.thread.join(timeout=10.0)
+
+    def _loop(self) -> None:
+        while not self.stop_event.is_set():
+            self.sweep()
+            self.stop_event.wait(self.interval)
+        self.sweep()  # the last step lands just before the runner exits
+
+    def _load(self, path: Path):
+        import numpy as np
+        try:
+            value = np.load(path, allow_pickle=False)
+        except (OSError, ValueError, EOFError):
+            return None
+        if value.size % 64 or not np.isfinite(value).all():
+            return None
+        return value.reshape(-1, 64)
+
+    def sweep(self) -> None:
+        try:
+            names = sorted(path.name for path in self.step_dir.glob("step_*.npy"))
+        except OSError:
+            return
+        for name in names:
+            if name in self.seen:
+                continue
+            try:
+                index = int(name[5:8])
+            except ValueError:
+                self.seen.add(name)
+                continue
+            latent = self._load(self.step_dir / name)
+            if latent is None:
+                return  # still being written; keep order and retry
+            self.seen.add(name)
+            grid = next((g for g in self.grids if g[0] * g[1] == latent.shape[0]), None)
+            if grid is None:
+                continue
+            h, w, steps = grid
+            previous = self.latents.get(index - 1)
+            if index == 0 and self.initial is not None and self.initial.is_file():
+                previous = self._load(self.initial)
+            if previous is not None and previous.shape != latent.shape:
+                previous = None
+            self.latents = {index: latent}
+            sigmas = flow_sigmas(steps, h * w)
+            if index + 1 >= len(sigmas):
+                continue
+            try:
+                image = preview_image(denoised_estimate(latent, previous, sigmas[index], sigmas[index + 1]),
+                                      h, w)
+            except Exception:  # noqa: BLE001 - a preview never breaks a run
+                image = None
+            if image:
+                self.emit({"kind": "preview", "source": self.source, "index": index + 1,
+                           "total": steps, "sigma": sigmas[index + 1], "image": image})
 
 
 # A stage "agrees" with the reference above this cosine. Looser than the
@@ -652,8 +800,7 @@ class Demo:
             return []
         return [line for line in lines if line.startswith(wanted)][-12:]
 
-    def _reference(self, cfg: dict, out: Path, progress=None,
-                   dump_latents: bool = False) -> Path:
+    def _reference(self, cfg: dict, out: Path, progress=None) -> Path:
         device = cfg["reference_device"]
         backend = cfg["backend"]
         python = self.reference_python(device)
@@ -669,8 +816,9 @@ class Demo:
                    "--width", str(cfg["width"]), "--steps", str(cfg["steps"]),
                    "--seed", str(cfg["seed"]), "--dtype", "bf16", "--sdpa-backend", "efficient",
                    "--dump-dir", str(dump)]
-        if dump_latents:
-            command += ["--dump-initial-latents"]
+        # The initial noise is cheap to save and does not change the picture.
+        # A compare starts the runner from it, and the step-0 preview needs it.
+        command += ["--dump-initial-latents"]
         if cfg["negative_prompt"]:
             command += ["--negative-prompt", cfg["negative_prompt"], "--true-cfg-scale", "4.0"]
         self._run(command, ROOT, out / f"reference-{backend}-{device}.log", progress=progress)
@@ -704,8 +852,9 @@ class Demo:
                 if cfg["mode"] in {"reference", "compare"}:
                     device = cfg["reference_device"]
                     self._say(job_id, f"Qwen PyTorch reference ({device})")
-                    ref_path = self._reference(cfg, job, self._progress(job_id),
-                                               dump_latents=compare)
+                    dump = job / "reference" / device
+                    with self._previews(job_id, "reference", dump, dump / "initial_latents.npy", cfg):
+                        ref_path = self._reference(cfg, job, self._progress(job_id))
                     self._say(job_id, f"Qwen PyTorch reference ({device}) complete")
                     entry = {"image": self._data_url(ref_path), "device": device,
                              "torch": self.torch_build(device)["torch"]}
@@ -723,8 +872,10 @@ class Demo:
                     if latents is not None and not latents.is_file():
                         latents = None
                     self._say(job_id, f"Qwen {backend.upper()} native")
-                    native_path, log = self._native(cfg, job, self._progress(job_id),
-                                                    initial_latents=latents)
+                    work = job / f"{backend}-work"
+                    with self._previews(job_id, "native", work / "steps", work / "latents.npy", cfg):
+                        native_path, log = self._native(cfg, job, self._progress(job_id),
+                                                        initial_latents=latents)
                     self._say(job_id, f"Qwen {backend.upper()} native complete")
                     results[backend] = {"image": self._data_url(native_path),
                                         "log": self._summary(log)}
@@ -740,6 +891,20 @@ class Demo:
             self._end(job_id)
         results["elapsed_ms"] = round((time.monotonic() - started) * 1000)
         return results
+
+    def _previews(self, job_id: str | None, source: str, step_dir: Path, initial: Path,
+                  cfg: dict) -> StepPreviews | contextlib.nullcontext:
+        """Previews for one run, only when a client is attached to watch them."""
+        if not job_id:
+            return contextlib.nullcontext()
+        h, w = cfg["height"] // 16, cfg["width"] // 16
+        grids = [(h, w, cfg["steps"])]
+        if cfg.get("upscale", 1.0) > 1.0:
+            base_h = max(32, round(cfg["height"] / cfg["upscale"])) // 16
+            base_w = max(32, round(cfg["width"] / cfg["upscale"])) // 16
+            grids.insert(0, (base_h, base_w, cfg.get("base_steps") or cfg["steps"]))
+        return StepPreviews(source, step_dir, initial, grids,
+                            lambda event: self._record(job_id, event))
 
     # ---- progress registry ----
 
