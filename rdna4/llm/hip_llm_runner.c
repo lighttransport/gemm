@@ -13827,6 +13827,11 @@ struct hip_llm_runner {
     hipFunction_t fn_moe_cache_slots_valid;
     hipFunction_t fn_deltanet_step_warp_f32; /* decode: warp-per-row deltanet */
     int moe_add_pending;                    /* decode: pending x += d_moe_accum fold */
+    /* Decode: layer-end x += pending_res_add folded into the next RMSNorm
+     * (res_rmsnorm_f32 is bitwise add_f32 + rmsnorm_f32).  Only set inside
+     * forward_blocks_body while fold_res_scope is on. */
+    void *pending_res_add;
+    int fold_res_scope;
     hipFunction_t fn_deltanet_step_batch_warp_f32; /* prefill: warp-per-row M-step */
     unsigned int *d_router_counter;
     int ssm_fused_decode;                   /* LLM_SSM_FUSED (default on) */
@@ -29884,6 +29889,11 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
         }
     }
 
+    if (r->pending_res_add && (r->is_qwen4exp || r->moe_add_pending ||
+                               r->fn_qwen35_rmsnorm_reference)) {
+        launch_add(r, r->d_x, r->pending_res_add, n_embd);
+        r->pending_res_add = NULL;
+    }
     /* Qwen4 mixes and normalizes its four residual streams here. */
     if (r->is_qwen4exp) {
         if (trunk && l == 1) qwen4_ple_forward(r, cl);
@@ -29899,6 +29909,13 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
     } else {
         if (r->is_hybrid && cl->is_ssm && r->debug_layers && l < 6)
             debug_f32_state(r, l, "Q4 ssm_pre_norm", r->d_x, n_embd);
+        if (r->pending_res_add) {
+            void *a[] = { &r->d_x, &r->pending_res_add, &r->d_xb,
+                          &cl->attn_norm_w, &n_embd, &eps };
+            LAUNCH(r->fn_res_rmsnorm_f32, 1, 1, 1, 256, 1, 1,
+                   256 * sizeof(float), r->stream, a);
+            r->pending_res_add = NULL;
+        } else
         launch_rmsnorm(r, r->d_xb, r->d_x, cl->attn_norm_w, n_embd, eps);
         if (r->debug_layers && debug_attention_layer_selected(l) && r->is_hybrid && !cl->is_ssm)
             debug_f32_state(r, l, "scalar-attn-norm", r->d_xb, n_embd);
@@ -30885,7 +30902,8 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
                 if (r->q8x2_reuse_active) end_q8x2_reuse(r);
                 if (r->debug_layers && debug_attention_layer_selected(l))
                     debug_f32_state(r, l, "scalar ffn_out", r->d_xb, n_embd);
-                launch_add(r, r->d_x, r->d_xb, n_embd);
+                if (r->fold_res_scope) r->pending_res_add = r->d_xb;
+                else launch_add(r, r->d_x, r->d_xb, n_embd);
             }
         }
 
@@ -30992,6 +31010,13 @@ static void forward_blocks_body(hip_llm_runner *r) {
     const char *profile_env = getenv("LLM_QWEN35_PROFILE_DECODE");
     int profile_decode = profile_env && atoi(profile_env) != 0 &&
                          r->decode_mode && r->graph_disabled;
+    const char *fold_env = getenv("LLM_QWEN35_FOLD_RESIDUAL");
+    r->pending_res_add = NULL;
+    r->fold_res_scope = (!fold_env || atoi(fold_env) != 0) &&
+        !r->is_qwen4exp && !r->is_gemma4 && !r->debug_layers &&
+        !r->fn_qwen35_rmsnorm_reference && !r->_ds_embd &&
+        r->n_hidden_snapshots == 0 && !profile_decode && !sync_layers &&
+        r->fn_res_rmsnorm_f32;
     for (int l = 0; l < n_run_layers; l++) {
         r->active_layer = l;
         hipEvent_t layer_start = NULL, layer_stop = NULL;
@@ -31017,7 +31042,9 @@ static void forward_blocks_body(hip_llm_runner *r) {
             hipEventDestroy(layer_start);
             hipEventDestroy(layer_stop);
         }
-        if (r->qwen4_forward_error) return;
+        if (r->qwen4_forward_error) {
+            r->fold_res_scope = 0; r->pending_res_add = NULL; return;
+        }
         /* Text-encoder hidden snapshots: copy this layer's post-residual hidden
          * state (d_x) into the snapshot buffer. Only active when layers are set
          * (which also disables graph capture so this inline copy runs). */
@@ -31036,8 +31063,20 @@ static void forward_blocks_body(hip_llm_runner *r) {
     } else {
         /* Final RMSNorm */
         if (r->moe_add_pending) { launch_add(r, r->d_x, r->d_moe_accum, r->n_embd); r->moe_add_pending = 0; }
-        launch_rmsnorm(r, r->d_x, r->d_x, r->d_output_norm, r->n_embd, r->rms_norm_eps);
+        if (r->pending_res_add && !r->fn_qwen35_rmsnorm_reference) {
+            int n = r->n_embd; float eps = r->rms_norm_eps;
+            void *a[] = { &r->d_x, &r->pending_res_add, &r->d_x,
+                          &r->d_output_norm, &n, &eps };
+            LAUNCH(r->fn_res_rmsnorm_f32, 1, 1, 1, 256, 1, 1,
+                   256 * sizeof(float), r->stream, a);
+        } else {
+            if (r->pending_res_add)
+                launch_add(r, r->d_x, r->pending_res_add, r->n_embd);
+            launch_rmsnorm(r, r->d_x, r->d_x, r->d_output_norm, r->n_embd, r->rms_norm_eps);
+        }
     }
+    r->pending_res_add = NULL;
+    r->fold_res_scope = 0;
 }
 
 /* === Phase 5 graph capture =============================================== */
