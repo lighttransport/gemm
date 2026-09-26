@@ -185,7 +185,10 @@ class NativeBackend:
         with Image.open(image) as im:
             width, height = im.size
         ratio = width / height
-        resolution = self.condition_resolution
+        # Never upsample: a 512^2 object shown at 1024^2 carries no more detail
+        # but 4x the condition tokens (an edit of a 512^2 object measured
+        # 1-3 s faster at 512, with the same result).
+        resolution = min(self.condition_resolution, max(256, int((width * height) ** 0.5) // 16 * 16))
         while True:
             w = round((resolution * resolution * ratio) ** 0.5 / 32) * 32
             h = round((resolution * resolution / ratio) ** 0.5 / 32) * 32
@@ -354,7 +357,8 @@ class NativeBackend:
         return GenResult(Path(request.out), time.perf_counter() - started, self.name,
                          {"timings": timings, "resident": resident, "mask_shown_as_reference": mask_shown,
                           "preset": self.preset, "attention": self.attention,
-                          "condition_resolution": self.condition_resolution if request.references else None})
+                          "condition_resolution": self.fit_condition_resolution(request.references[0])
+                          if request.references else None})
 
     def _run(self, request: GenRequest, extra: list[str], sockets=(None, None), prompt_batch=()) -> str:
         """Run the driver for a request; its log text, or BackendError."""

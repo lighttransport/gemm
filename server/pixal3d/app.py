@@ -521,12 +521,31 @@ class PixalServer:
             native_options={"binary": self.binary, "model_dir": self.model_dir, "dinov3": self.dinov3,
                             "naf": self.naf},
             reference_options={"model_dir": self.model_dir})
+        self.i23d.image_model_path = self.qwen_image.model
+        # An idle studio must not hold the GPU: release its resident image
+        # model after 10 minutes without a stage.
+        def reap():
+            while True:
+                time.sleep(30)
+                try:
+                    self.i23d.release_if_idle(float(getattr(args, "i23d_idle", 600)))
+                except Exception as exc:  # never let the reaper die
+                    print(f"i23d idle release failed: {exc}", flush=True)
+        threading.Thread(target=reap, name="i23d-idle-release", daemon=True).start()
 
-    def release_gpu(self, keep: str = "") -> None:
+    # The Qwen-Image processes (the Qwen tab's residents and the studio's
+    # image model) always run on CUDA device 0.
+    QWEN_DEVICE = 0
+
+    def release_gpu(self, keep: str = "", device: int = QWEN_DEVICE) -> None:
         """Free device memory held by resident processes another kind of job
         does not use: the Qwen tab's resident denoiser/VAE and PyTorch server,
         and the Text-to-3D studio's resident image model. Pixal3D plans its
-        memory from what is free, so nothing may linger across job kinds."""
+        memory from what is free, so nothing may linger across job kinds.
+        Only a job on the Qwen processes' device (holding its lock) may stop
+        them; a job on another GPU leaves them alone."""
+        if device != self.QWEN_DEVICE:
+            return
         if keep != "qwen-image":
             self.qwen_image.resident.stop()
             self.qwen_image.reference_server.stop()
@@ -536,8 +555,10 @@ class PixalServer:
     def i23d_run(self, request: dict, cancel: threading.Event | None = None, progress=None) -> dict:
         """One Text/Image -> 3D stage under the CUDA device lock."""
         device = bounded_integer(request.get("device", 0), "device", 0, 255)
+        if device != self.QWEN_DEVICE:
+            raise ValueError(f"the Text/Image to 3D studio runs on CUDA device {self.QWEN_DEVICE}")
         with self.execution_lock("cuda", device, self.args.timeout, cancel):
-            self.release_gpu(keep="i23d")
+            self.release_gpu(keep="i23d", device=device)
             try:
                 return self.i23d.run(request, cancel, progress)
             except StudioCancelled as exc:
@@ -638,7 +659,7 @@ class PixalServer:
         if backend not in ("cuda", "rocm"):
             raise ValueError("Qwen backend must be cuda or rocm")
         with self.execution_lock(backend, device, self.args.timeout, cancel):
-            self.release_gpu(keep="qwen-image")
+            self.release_gpu(keep="qwen-image", device=device)
             return self.qwen_image.generate(request, progress)
 
     def infer(self, request: dict, cancel: threading.Event | None = None, progress=None) -> dict:
@@ -683,8 +704,8 @@ class PixalServer:
                 "render comparison is unavailable; run ref/pixal3d/build_preview.sh")
         with self.execution_lock(backend, device, self.args.timeout, cancel) as execution_timeout, \
                 tempfile.TemporaryDirectory(prefix="request-", dir=self.work_dir) as td:
-            if backend != "cpu":
-                self.release_gpu()
+            if backend == "cuda":
+                self.release_gpu(device=device)
             run_dir = Path(td)
             artifact_dir = retained_artifact_dir(request)
             if artifact_dir is not None:
@@ -884,7 +905,8 @@ class PixalServer:
         with self.execution_lock(
                 backend, device, self.args.reference_timeout, cancel) as execution_timeout, \
                 tempfile.TemporaryDirectory(prefix="reference-", dir=self.work_dir) as td:
-            self.release_gpu()
+            if backend == "cuda":
+                self.release_gpu(device=device)
             run_dir = Path(td)
             artifact_dir = retained_artifact_dir(request)
             output_path = ((artifact_dir / ".reference.glb.partial") if artifact_dir
@@ -1826,6 +1848,8 @@ def main() -> None:
     p.add_argument("--job-ttl", type=float, default=86400)
     p.add_argument("--upload-ttl", type=float, default=3600)
     p.add_argument("--device-lock-dir", default=str(ROOT / "tmp/pixal3d/device-locks"))
+    p.add_argument("--i23d-idle", type=float, default=600,
+                   help="seconds before an idle Text/Image to 3D studio releases its resident image model")
     p.add_argument("--qwen-model", default="/mnt/nvme01/models/qimg-21")
     p.add_argument("--qwen-quant-package", default=str(ROOT / "tmp/qimg21-int8-package"))
     p.add_argument("--qwen-python", default=str(ROOT / "tmp/qimg21-ref-venv/bin/python"))

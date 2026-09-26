@@ -27,7 +27,7 @@ import shutil
 import struct
 import subprocess
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from pathlib import Path
 
 from . import imageops
@@ -58,6 +58,8 @@ class ReconSettings:
     resolution: int = 1024              # reference
     low_vram: bool = True               # reference
     timeout: float = 10800.0
+    # A threading.Event: when set, a running Pixal3D process is killed.
+    cancel: object = field(default=None, repr=False, compare=False)
 
     # Measured on the bunny, native CUDA multiview, against standard (233 s):
     # preview 300k triangles 175 s (Chamfer 0.0031), BF16 flow 192 s
@@ -110,15 +112,34 @@ def glb_summary(path: Path) -> dict:
             "bounds": [position.get("min"), position.get("max")]}
 
 
-def _run(cmd: list[str], log: Path, timeout: float) -> str:
+class ReconstructionCancelled(ReconstructionError):
+    pass
+
+
+def _run(cmd: list[str], log: Path, timeout: float, cancel=None) -> str:
+    """Run one step, its output to `log`; `cancel` (an Event) kills it."""
     log.parent.mkdir(parents=True, exist_ok=True)
     with log.open("w") as stream:
         stream.write("+ " + " ".join(cmd) + "\n")
         stream.flush()
+        process = subprocess.Popen(cmd, cwd=ROOT, stdout=stream, stderr=subprocess.STDOUT)
+        deadline = time.monotonic() + timeout
         try:
-            code = subprocess.run(cmd, cwd=ROOT, stdout=stream, stderr=subprocess.STDOUT, timeout=timeout).returncode
-        except subprocess.TimeoutExpired:
-            raise ReconstructionError(f"{Path(cmd[0]).name} exceeded {timeout:g} s; see {log}") from None
+            while process.poll() is None:
+                if cancel is not None and cancel.is_set():
+                    raise ReconstructionCancelled(f"{Path(cmd[0]).name} cancelled")
+                if time.monotonic() > deadline:
+                    raise ReconstructionError(f"{Path(cmd[0]).name} exceeded {timeout:g} s; see {log}")
+                time.sleep(0.2)
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+        code = process.returncode
     text = log.read_text(errors="replace")
     if code:
         raise ReconstructionError(f"{Path(cmd[0]).name} failed ({code}); see {log}:\n{text[-3000:]}")
@@ -263,7 +284,7 @@ class Pixal3DNative:
             raise ReconstructionError(f"native Pixal3D is not ready: missing {', '.join(missing)}")
         profile = work / "profile.json"
         started = time.perf_counter()
-        text = _run(cmd, work / "pixal3d_native.log", self.settings.timeout)
+        text = _run(cmd, work / "pixal3d_native.log", self.settings.timeout, self.settings.cancel)
         stats = {}
         for line in reversed(text.splitlines()):
             try:
@@ -329,7 +350,7 @@ class Pixal3DReference:
         if not ok:
             raise ReconstructionError(f"PyTorch Pixal3D reference is not ready: missing {', '.join(missing)}")
         started = time.perf_counter()
-        _run(cmd, work / "pixal3d_reference.log", self.settings.timeout)
+        _run(cmd, work / "pixal3d_reference.log", self.settings.timeout, self.settings.cancel)
         return {"runner": "reference", "backend": self.backend, "output": str(out),
                 "seconds": round(time.perf_counter() - started, 3), "mesh": glb_summary(out),
                 "log": str(work / "pixal3d_reference.log")}
@@ -386,4 +407,4 @@ def make_reconstructors(which: str, backend: str = "cuda", settings: ReconSettin
 
 
 def settings_dict(settings: ReconSettings) -> dict:
-    return asdict(settings)
+    return {k: v for k, v in asdict(settings).items() if k != "cancel"}

@@ -276,7 +276,22 @@ Other session routes:
 - `POST /v1/i23d/sessions/SID/undo`: refused while a stage is running on
   the session.
 
-Sessions live under `<work-dir>/i23d/` and expire after 24 h.
+Sessions live under `<work-dir>/i23d/` and expire after 24 h without use;
+a session with a stage running never expires.
+
+Robustness:
+- **Cancel** stops a stage: a Pixal3D build's process is killed within a
+  second, and an image step's result is discarded rather than saved under a
+  cancelled job.
+- **Failed views rerun:** a views rerun that fails keeps the previous set.
+- **URLs** carry the file's version, so regenerated views or sheets never
+  show from the browser cache.
+- **Uploads** over 40 megapixels or unreadable are refused, and nothing is
+  left behind.
+- **Idle GPU:** an idle studio releases its resident image model after
+  `--i23d-idle` seconds (600).
+- **Device:** the studio runs on CUDA device 0, where the Qwen processes
+  live. A job on another GPU leaves them alone.
 
 Tests:
 - `tmp/qimg21-ref-venv/bin/python -m unittest server.pixal3d.test_i23d_studio`

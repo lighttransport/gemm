@@ -526,6 +526,9 @@ What made the difference:
   encoders need that device memory. Every init-image request also runs
   one-shot. Later requests for that reference are resident. Use
   `--no-resident` to force one-shot throughout.
+- **Condition resolution.** A reference is never upsampled for the
+  condition: a 512² object is shown at 512² (1,024 tokens), not 1024²
+  (4,096). An edit of a 512² object ran 1–3 s faster with the same result.
 - **Caches.** The condition cache (VAE + vision encodes), the multimodal
   prompt cache and the noise cache are keyed by file content, never by path
   or mtime. They live in `tmp/qimg21-prompt-cache`.

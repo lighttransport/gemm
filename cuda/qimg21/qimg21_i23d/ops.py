@@ -626,6 +626,10 @@ def reconstruct_3d(source, out_dir, reconstructors, *, mode: str = "multiview", 
         if not (source / "transforms.json").is_file():
             raise ValueError(f"{source} has no transforms.json; multiview reconstruction needs a view dataset")
         views, files = recon.stage_views(source, out_dir, max_frames, elevations)
+        if len(files) < 2:
+            raise ValueError(f"multiview reconstruction found only {len(files)} frame(s) in {source} at elevations "
+                             f"{list(elevations) if elevations is not None else 'any'}; pass the elevations the "
+                             "views were made at, or use single view")
         transforms = json.loads((views / "transforms.json").read_text())
         record.update(views_dir=str(views), frames=files, camera_parameters=transforms.get("camera_parameters"))
         for runner in reconstructors:

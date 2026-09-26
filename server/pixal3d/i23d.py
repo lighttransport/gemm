@@ -52,6 +52,7 @@ SIZE = 512
 STAGES = ("text", "upload", "edit", "views", "turnaround", "reconstruct")
 SESSION_ID = re.compile(r"[0-9a-f]{32}")
 SERVED = (".png", ".glb", ".json", ".log")
+MAX_PIXELS = 40_000_000
 
 
 class StudioError(ValueError):
@@ -99,6 +100,8 @@ class Studio:
         self._backend = None
         self.lock = threading.RLock()
         self.busy: set[str] = set()     # sessions with a stage running
+        self.last_used = time.monotonic()
+        self.image_model_path = None     # for health(); the backend factory decides the real one
 
     # ---- image model ------------------------------------------------------
 
@@ -124,6 +127,18 @@ class Studio:
             if self._backend is not None:
                 self._backend.close()
 
+    def release_if_idle(self, idle: float = 600.0) -> bool:
+        """Release the resident image model after `idle` seconds without a
+        stage, so an idle studio doesn't hold GPU memory indefinitely."""
+        with self.lock:
+            if self.busy or self._backend is None or time.monotonic() - self.last_used < idle:
+                return False
+            fast = getattr(self._backend, "_fast", None)
+            if fast is None or not fast.alive():
+                return False
+            self._backend.close()
+            return True
+
     # ---- sessions ---------------------------------------------------------
 
     def _dir(self, sid: str) -> Path:
@@ -148,6 +163,8 @@ class Studio:
     def _expire(self) -> None:
         cutoff = time.time() - self.ttl
         for path in self.root.iterdir():
+            if path.name in self.busy:
+                continue
             try:
                 if SESSION_ID.fullmatch(path.name) and json.loads(
                         (path / "session.json").read_text()).get("updated_at", 0) < cutoff:
@@ -166,18 +183,29 @@ class Studio:
     def public(self, record: dict) -> dict:
         """The session with file references turned into URLs."""
         base = f"/v1/i23d/sessions/{record['id']}/files/"
+        folder = self.root / record["id"]
+
+        def url(relative):
+            # Paths get reused (views regenerated, a turnaround after undo):
+            # the file's mtime in the URL keeps browsers from showing a cached copy.
+            try:
+                version = (folder / relative).stat().st_mtime_ns
+            except OSError:
+                version = 0
+            return f"{base}{relative}?v={version}"
+
         out = json.loads(json.dumps(record))
         for step in out["history"]:
-            step["url"] = base + step["file"]
+            step["url"] = url(step["file"])
             if step.get("raw"):
-                step["raw_url"] = base + step["raw"]
+                step["raw_url"] = url(step["raw"])
         if out.get("views"):
-            out["views"]["urls"] = [base + f for f in out["views"]["files"]]
+            out["views"]["urls"] = [url(f) for f in out["views"]["files"]]
             if out["views"].get("sheet"):
-                out["views"]["sheet_url"] = base + out["views"]["sheet"]
+                out["views"]["sheet_url"] = url(out["views"]["sheet"])
         for model in out["models"]:
             for run in model["runs"]:
-                run["url"] = base + run["file"]
+                run["url"] = url(run["file"])
         out["current"] = out["history"][-1] if out["history"] else None
         return out
 
@@ -207,7 +235,8 @@ class Studio:
         from qimg21_i23d.native import NativeBackend
         native = reconstruct.Pixal3DNative("cuda", **self.native_options).available()
         reference = reconstruct.Pixal3DReference("cuda", **self.reference_options).available()
-        return {"image_model_ready": NativeBackend.available(), "pixal3d_native_ready": native[0],
+        model = self.image_model_path or NativeBackend.__init__.__defaults__[0]
+        return {"image_model_ready": NativeBackend.available(model), "pixal3d_native_ready": native[0],
                 "pixal3d_reference_ready": reference[0], "moge_ready": reconstruct.MOGE.exists(),
                 "image_model_resident": bool(self._backend is not None and
                                              getattr(self._backend, "_fast", None) and
@@ -220,13 +249,31 @@ class Studio:
         if stage not in STAGES:
             raise StudioError(f"stage must be one of {', '.join(STAGES)}")
         sid = request.get("session")
-        with self.lock:
-            record = self._load(sid) if sid else None
         text_turnaround = stage == "turnaround" and request.get("use_reference") is False
-        if record is None:
-            if stage not in ("text", "upload") and not text_turnaround:
-                raise StudioError("this stage needs a session with an object")
-            record = self._load(self.create()["id"])
+        if not sid and stage not in ("text", "upload") and not text_turnaround:
+            raise StudioError("this stage needs a session with an object")
+        if not sid:
+            sid = self.create()["id"]
+        # Load and mark busy in one step: an undo or expiry can't slip between.
+        with self.lock:
+            try:
+                record = self._load(sid)
+            except KeyError:
+                raise StudioError("session not found (it may have expired); start a new one") from None
+            if sid in self.busy:
+                raise StudioError("a stage is already running on this session")
+            self.busy.add(sid)
+            self.last_used = time.monotonic()
+            self._save(record)                  # touch: a running session never expires
+        try:
+            return self._run_stage(stage, record, request, cancel, progress, text_turnaround)
+        finally:
+            with self.lock:
+                self.busy.discard(sid)
+                self.last_used = time.monotonic()
+
+    def _run_stage(self, stage, record, request, cancel, progress, text_turnaround) -> dict:
+        self._cancel = cancel
         if stage in ("edit", "views", "turnaround", "reconstruct") and not record["history"] and not text_turnaround:
             raise StudioError("the session has no object yet; run text or upload first")
 
@@ -237,21 +284,19 @@ class Studio:
                 progress(phase, percent)
 
         started = time.perf_counter()
+        before = len(record["history"])
+        details = getattr(self, "_" + stage)(record, request, report)
+        # A cancel that arrived while the backend was busy: discard the
+        # stage's result rather than save it under a "cancelled" job.
+        if cancel is not None and cancel.is_set():
+            raise StudioCancelled("job cancelled")
+        details["seconds"] = round(time.perf_counter() - started, 3)
+        if len(record["history"]) > before:
+            record["history"][-1]["seconds"] = details["seconds"]
+        if stage in ("views", "turnaround"):
+            record["views"]["seconds"] = details["seconds"]
         with self.lock:
-            self.busy.add(record["id"])
-        try:
-            before = len(record["history"])
-            details = getattr(self, "_" + stage)(record, request, report)
-            details["seconds"] = round(time.perf_counter() - started, 3)
-            if len(record["history"]) > before:
-                record["history"][-1]["seconds"] = details["seconds"]
-            if stage in ("views", "turnaround"):
-                record["views"]["seconds"] = details["seconds"]
-            with self.lock:
-                state = self._save(record)
-        finally:
-            with self.lock:
-                self.busy.discard(record["id"])
+            state = self._save(record)
         return {"kind": "i23d", "stage": stage, "session": record["id"], "details": details, "state": state}
 
     def _next_image(self, record: dict) -> tuple[str, Path]:
@@ -299,15 +344,26 @@ class Studio:
             if not isinstance(source, str) or not source:
                 raise StudioError("upload needs an image")
             photo.write_bytes(base64.b64decode(source.split(",", 1)[-1], validate=True))
-        if photo.stat().st_size > self.image_limit:
-            raise StudioError("image too large")
-        name, path = self._next_image(record)
-        report(f"extracting the object ({method})", 10)
         try:
-            info = ops.preprocess_object(photo, path, self.backend() if method == "qwen" else None, method=method,
-                                         size=(SIZE, SIZE), steps=steps, seed=seed)
-        except imageops.MaskError as exc:
-            raise StudioError(str(exc)) from None
+            if photo.stat().st_size > self.image_limit:
+                raise StudioError("image too large")
+            from PIL import Image, UnidentifiedImageError
+            try:
+                with Image.open(photo) as im:
+                    width, height = im.size
+            except (UnidentifiedImageError, OSError):
+                raise StudioError("the upload is not a readable image") from None
+            if width * height > MAX_PIXELS:
+                raise StudioError(f"the image is {width}x{height}; at most {MAX_PIXELS // 1_000_000} megapixels")
+            name, path = self._next_image(record)
+            report(f"extracting the object ({method})", 10)
+            try:
+                info = ops.preprocess_object(photo, path, self.backend() if method == "qwen" else None,
+                                             method=method, size=(SIZE, SIZE), steps=steps, seed=seed)
+            except imageops.MaskError as exc:
+                raise StudioError(str(exc)) from None
+        finally:
+            photo.unlink(missing_ok=True)
         details = {"method": method, "alignment": info.get("alignment"), "warnings": info.get("warnings")}
         self._push(record, name, "upload", f"photo ({method})", details)
         return details
@@ -340,7 +396,10 @@ class Studio:
         elevation = _float(request, "elevation", 0.0, -60.0, 60.0)
         steps, seed = _int(request, "steps", 16, 1, 50), _int(request, "seed", 0, 0, 2**31 - 1)
         current = record["history"][-1]["file"]
-        root = self.root / record["id"] / "views" / Path(current).stem
+        final = self.root / record["id"] / "views" / Path(current).stem
+        # Built next to the old set and swapped in only on success, so a
+        # failed or cancelled run leaves the recorded views intact.
+        root = final.with_name(final.name + ".new")
         shutil.rmtree(root, ignore_errors=True)
         report("Qwen-Image 2.1: views", 5)
         done = []
@@ -352,6 +411,10 @@ class Studio:
         summary = ops.generate_turntable([self.root / record["id"] / current], root, self.backend(), views=count,
                                          elevation_deg=elevation,
                                          params=ops.ViewParams(steps=steps, seed=seed), on_view=on_view)
+        report("saving the views", 98)
+        shutil.rmtree(final, ignore_errors=True)
+        root.rename(final)
+        root = final
         meta = json.loads((root / "metadata.json").read_text())
         base = root.relative_to(self.root / record["id"]).as_posix()
         record["views"] = {"of": current, "dir": base, "count": count, "elevation": elevation,
@@ -392,6 +455,7 @@ class Studio:
         return {"count": count, "views": [v["view"] for v in summary["views"]]}
 
     def _reconstruct(self, record, request, report):
+        cancel_event = getattr(self, "_cancel", None)
         which = request.get("runner", "native")
         mode = request.get("mode", "single")
         if which not in ("native", "reference", "both"):
@@ -427,7 +491,13 @@ class Studio:
         report(f"Pixal3D {' + '.join(r.name for r in runners)} ({mode})", 8)
         source = (self.root / record["id"] / record["views"]["dir"]) if mode == "multiview" else \
             self.root / record["id"] / current
-        result = ops.reconstruct_3d(source, out, runners, mode=mode, fov_deg=fov)
+        # The session's view set is one ring (any elevation): use all of it.
+        settings.cancel = cancel_event
+        try:
+            result = ops.reconstruct_3d(source, out, runners, mode=mode, fov_deg=fov, elevations=None)
+        except reconstruct.ReconstructionCancelled:
+            shutil.rmtree(out, ignore_errors=True)
+            raise StudioCancelled("job cancelled") from None
         base = out.relative_to(self.root / record["id"]).as_posix()
         model = {"of": current, "mode": mode, "quality": quality, "camera": result.get("camera"),
                  "comparison": result.get("comparison"), "at": time.time(),

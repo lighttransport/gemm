@@ -141,7 +141,7 @@ class StudioTest(unittest.TestCase):
         self.assertEqual((views["kind"], views["azimuths"]), ("turnaround", [0.0, 90.0, 180.0, 270.0]))
         self.assertEqual(views["of"], state["current"]["file"])     # the front panel is the object now
         self.assertEqual(state["current"]["stage"], "turnaround")
-        self.assertTrue(views["sheet_url"].endswith("/sheet.png"))
+        self.assertIn("/sheet.png?v=", views["sheet_url"])      # versioned: a reused path is refetched
         self.run_stage(stage="reconstruct", session=sid, mode="multiview", fov=20)
         self.assertEqual(self.log[-1], ("multiview", "native", 4))
         with self.assertRaises(StudioError):
@@ -157,6 +157,79 @@ class StudioTest(unittest.TestCase):
         self.assertNotIn("reference image", sheet[3])
         with self.assertRaisesRegex(StudioError, "needs a prompt"):
             self.run_stage(stage="turnaround", use_reference=False)
+
+    def test_review_fixes(self):
+        # A missing or expired session is a clear StudioError, not a bare KeyError.
+        with self.assertRaisesRegex(StudioError, "session not found"):
+            self.run_stage(stage="edit", session="0" * 32, instruction="x")
+        sid = self.run_stage(stage="text", prompt="a cup", steps=2)["session"]
+
+        # A cancel that lands while the backend works discards the stage.
+        cancel = threading.Event()
+        original = self.studio._edit
+        def edit_then_cancel(record, request, report):
+            details = original(record, request, report)
+            cancel.set()
+            return details
+        self.studio._edit = edit_then_cancel
+        with self.assertRaises(StudioCancelled):
+            self.studio.run({"stage": "edit", "session": sid, "instruction": "blue", "steps": 2}, cancel)
+        self.studio._edit = original
+        self.assertEqual(len(self.studio.state(sid)["history"]), 1)
+        self.assertFalse(self.studio.busy)
+
+        # A failed views rerun keeps the previous, complete view set.
+        first = self.run_stage(stage="views", session=sid, count=2, steps=2)["state"]["views"]
+        backend = self.studio.backend()
+        broken = backend.generate
+        backend.generate = lambda request: (_ for _ in ()).throw(RuntimeError("out of memory"))
+        with self.assertRaises(RuntimeError):
+            self.run_stage(stage="views", session=sid, count=3, steps=2)
+        backend.generate = broken
+        kept = self.studio.state(sid)["views"]
+        self.assertEqual(kept["count"], 2)
+        for path in kept["files"]:
+            self.assertTrue(self.studio.file(sid, path).is_file())
+        self.assertEqual([u.split("?")[0] for u in kept["urls"]], [u.split("?")[0] for u in first["urls"]])
+
+        # Views at an elevation still feed multiview (all of the ring is used).
+        self.run_stage(stage="views", session=sid, count=4, elevation=20, steps=2)
+        self.run_stage(stage="reconstruct", session=sid, mode="multiview", fov=20)
+        self.assertEqual(self.log[-1][0], "multiview")
+        self.assertGreaterEqual(self.log[-1][2], 4)
+
+        # Uploads: pixel limit and no leftovers.
+        import base64
+        import io
+        from PIL import Image
+        from server.pixal3d import i23d
+        buffer = io.BytesIO()
+        Image.new("RGBA", (64, 64), (200, 0, 0, 255)).save(buffer, "PNG")
+        saved, i23d.MAX_PIXELS = i23d.MAX_PIXELS, 1000
+        try:
+            with self.assertRaisesRegex(StudioError, "megapixels"):
+                self.run_stage(stage="upload", session=sid, image_b64=base64.b64encode(buffer.getvalue()).decode(),
+                               method="alpha")
+        finally:
+            i23d.MAX_PIXELS = saved
+        with self.assertRaisesRegex(StudioError, "not a readable image"):
+            self.run_stage(stage="upload", session=sid, image_b64=base64.b64encode(b"not an image").decode(),
+                           method="alpha")
+        uploads = Path(self.td.name) / sid / "uploads"
+        self.assertEqual(list(uploads.iterdir()) if uploads.exists() else [], [])
+
+        # An idle studio releases its image model; a busy one does not.
+        class Resident:
+            def alive(self):
+                return True
+        self.studio._backend._fast = Resident()
+        self.studio.last_used -= 3600
+        self.studio.busy.add(sid)
+        self.assertFalse(self.studio.release_if_idle(600))
+        self.studio.busy.discard(sid)
+        self.log.clear()
+        self.assertTrue(self.studio.release_if_idle(600))
+        self.assertEqual(self.log, [("close",)])
 
     def test_quality_presets_reach_the_runner(self):
         seen = []

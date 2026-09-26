@@ -738,7 +738,7 @@ class NativeBackendCommandTest(Tmp):
         super().setUp()
         from qimg21_i23d.native import NativeBackend
         self.NativeBackend = NativeBackend
-        self.ref = self.write("ref.png", object_image(256, 256))
+        self.ref = self.write("ref.png", object_image(1024, 1024))
         self.mask = self.write("mask.png", np.full((256, 256), 255, np.uint8), mode="L")
 
     def flag(self, cmd, name):
@@ -817,7 +817,7 @@ class NativeResidentTest(Tmp):
         fake.chmod(0o755)
         self.saved = native.FAST, native.VAE
         native.FAST = native.VAE = fake
-        self.ref = self.write("ref.png", object_image(256, 256))
+        self.ref = self.write("ref.png", object_image(1024, 1024))
 
     def tearDown(self):
         self.native.FAST, self.native.VAE = self.saved
@@ -898,7 +898,11 @@ class NativeResidentTest(Tmp):
         resolution, width, height = backend.condition_size(wide)
         self.assertLessEqual(max(width, height), 1024)
         self.assertLess(resolution, 1024)
-        self.assertEqual(backend.condition_size(self.ref), (1024, 1024, 1024))
+        # A reference is never upsampled: 256^2 stays 256^2; a large one is capped at 1024.
+        small = self.write("small.png", object_image(256, 256))
+        self.assertEqual(backend.condition_size(small), (256, 256, 256))
+        big = self.write("big.png", object_image(1600, 1600))
+        self.assertEqual(backend.condition_size(big), (1024, 1024, 1024))
 
 
 class TorchBackendPlanTest(unittest.TestCase):

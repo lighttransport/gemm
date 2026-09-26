@@ -26,7 +26,8 @@ button{background:var(--accent);border:0;color:#06271f;font-weight:800;cursor:po
 .st-strip{display:flex;gap:8px;overflow-x:auto;margin-top:12px;padding-bottom:4px}.st-strip figure{margin:0;flex:0 0 96px;background:#0a1115;border:1px solid var(--line);border-radius:8px;overflow:hidden}.st-strip figure.now{border-color:var(--accent)}
 .st-strip img{display:block;width:96px;height:96px;object-fit:contain;background:repeating-conic-gradient(#10181d 0 25%,#0c1317 0 50%) 0 0/12px 12px}.st-strip figcaption{font-size:10px;color:var(--muted);padding:4px 5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .studio .models model-viewer{height:440px}.st-sheet{display:block;width:100%;border-radius:8px;background:repeating-conic-gradient(#10181d 0 25%,#0c1317 0 50%) 0 0/12px 12px}.studio [hidden]{display:none!important}.studio .models.one{grid-template-columns:1fr}
-@media(max-width:900px){.studio{grid-template-columns:1fr}}
+.studio>*,.studio .panel,.studio .grid2>*,.studio .grid3>*{min-width:0}.studio select{text-overflow:ellipsis}
+@media(max-width:900px){.studio{grid-template-columns:1fr}}@media(max-width:520px){.app-tabs{gap:6px}.app-tabs button{padding:8px 10px;font-size:12px}.st-actions{grid-template-columns:1fr}.studio .models model-viewer{height:340px}}
 </style>
 </head>
 <body><main>
@@ -183,7 +184,7 @@ function status(text,error){$('st-status').innerHTML='';const s=document.createE
 function progress(p){$('st-bar').style.width=Math.max(0,Math.min(100,p||0))+'%'}
 async function json(url,options){const r=await fetch(url,options),j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error?.message||j.error||j.message||('HTTP '+r.status));return j}
 async function ensureSession(){if(S.sid)return S.sid;const st=await json('/v1/i23d/sessions',{method:'POST'});S.sid=st.id;store.set(S.sid);render(st);return S.sid}
-async function restore(){let sid=null;try{sid=new URLSearchParams(location.search).get('session')}catch(e){}sid=sid||store.get();if(!sid)return;try{const st=await json('/v1/i23d/sessions/'+sid);S.sid=sid;store.set(sid);render(st)}catch(e){store.set(null)}}
+async function restore(){let sid=null;try{sid=new URLSearchParams(location.search).get('session')}catch(e){}sid=sid||store.get();if(!sid)return;try{const st=await json('/v1/i23d/sessions/'+sid);S.sid=sid;store.set(sid);render(st)}catch(e){store.set(null);S.sid=null}}
 async function stage(body){
   await ensureSession();
   const created=await json('/v1/jobs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({kind:'i23d',session:S.sid,...body})});
@@ -200,12 +201,21 @@ async function stage(body){
 async function act(label,fn){
   if(S.busy)return;setBusy(true);progress(1);status(label+'…');
   try{const r=await fn();if(r?.state)render(r.state);status(label+' · done'+(r?.details?.seconds!=null?' in '+r.details.seconds.toFixed(1)+' s':''));progress(100)}
-  catch(e){status(String(e.message||e),true);progress(0);if(S.sid)try{render(await json('/v1/i23d/sessions/'+S.sid))}catch(_){}}
+  catch(e){status(String(e.message||e),true);progress(0);
+    if(/session not found/.test(String(e.message))){S.sid=null;store.set(null)}   // expired: the next step starts a new one
+    else if(S.sid)try{render(await json('/v1/i23d/sessions/'+S.sid))}catch(_){}}
   finally{S.job=null;setBusy(false)}
 }
 function figure(url,caption,now){const f=document.createElement('figure');if(now)f.className='now';const i=document.createElement('img');i.src=url;i.alt=caption;i.loading='lazy';const c=document.createElement('figcaption');c.textContent=caption;c.title=caption;f.append(i,c);return f}
+function clearBox(){S.box=null;$('st-box').hidden=true}
 function render(st){
+  // A box drawn on one object must not be applied to another.
+  if(S.state?.current?.file!==st.current?.file)clearBox();
   S.state=st;const cur=st.current;
+  // A reopened session: show its own prompt and input kind, unless edited here.
+  const described=[...st.history].reverse().find(h=>(h.stage==='text'||(h.stage==='turnaround'&&!/^turnaround \(/.test(h.label)))&&h.label);
+  if(described&&!S.promptTouched)$('st-prompt').value=described.label;
+  if(!S.modeTouched)$('st-mode').value=st.views&&st.views.kind==='turnaround'&&cur&&st.views.of===cur.file?'multiview':'single';
   $('st-empty').hidden=!!cur;$('st-current').hidden=!cur;if(cur)$('st-current').src=cur.url;
   $('st-history').replaceChildren(...st.history.map((h,i)=>figure(h.url,(i+1)+'. '+h.stage+': '+h.label,i===st.history.length-1)));
   $('st-undo').disabled=S.busy||st.history.length<2;
@@ -213,7 +223,7 @@ function render(st){
   if(v)$('st-views-strip').replaceChildren(...v.urls.map((u,i)=>figure(u,Math.round(v.azimuths[i])+'° az · '+v.elevation+'° el')));
   const m=st.models[st.models.length-1];$('st-model-panel').hidden=!m;
   if(m){
-    $('st-models').classList.toggle('one',m.runs.length===1);$('st-models').replaceChildren(...m.runs.map(run=>{const w=document.createElement('div');w.className='model-wrap';const b=document.createElement('b');b.textContent=run.runner==='native'?'Native Pixal3D':'PyTorch reference';const mv=document.createElement('model-viewer');for(const a of ['camera-controls','auto-rotate'])mv.setAttribute(a,'');mv.setAttribute('shadow-intensity','1');mv.setAttribute('interaction-prompt','none');mv.src=run.url;const d=document.createElement('a');d.className='download';d.href=run.url;d.download='object-'+run.runner+'.glb';d.textContent='Download '+run.runner+' GLB';w.append(b,mv,d);return w}));
+    $('st-models').classList.toggle('one',m.runs.length===1);$('st-models').replaceChildren(...m.runs.map(run=>{const w=document.createElement('div');w.className='model-wrap';const b=document.createElement('b');b.textContent=run.runner==='native'?'Native Pixal3D':'PyTorch reference';const mv=document.createElement('model-viewer');for(const a of ['camera-controls','auto-rotate'])mv.setAttribute(a,'');mv.setAttribute('shadow-intensity','1');mv.setAttribute('interaction-prompt','none');mv.setAttribute('camera-orbit','180deg 75deg 105%');mv.src=run.url;const d=document.createElement('a');d.className='download';d.href=run.url;d.download='object-'+run.runner+'.glb';d.textContent='Download '+run.runner+' GLB';w.append(b,mv,d);return w}));
     const lines=['Input: '+(m.mode==='single'?'current object, single view':'object + views, posed')+' ('+m.of+') · quality '+(m.quality||'standard')];
     if(m.camera)lines.push('Camera FOV: '+(m.camera.fov_rad*180/Math.PI).toFixed(1)+'° ('+m.camera.source+')');
     for(const r of m.runs)lines.push(r.runner+': '+r.seconds.toFixed(0)+' s · '+r.mesh.vertices.toLocaleString()+' vertices · '+r.mesh.triangles.toLocaleString()+' triangles');
@@ -246,6 +256,7 @@ $('st-views').onclick=()=>{const turn=$('st-view-kind').value==='turnaround';act
 $('st-view-kind').onchange();
 $('st-build').onclick=()=>act('Building the 3D model',()=>stage(buildBody()));
 $('st-cancel').onclick=async()=>{if(S.job){status('Cancelling…');await fetch('/v1/jobs/'+S.job,{method:'DELETE'})}};
+$('st-prompt').addEventListener('input',()=>{S.promptTouched=true});$('st-mode').addEventListener('change',()=>{S.modeTouched=true});
 $('st-strength').oninput=()=>{$('st-strength-out').textContent=Number($('st-strength').value).toFixed(2)};
 // ---- region box, in pixels of the (square) current object
 const canvas=$('st-canvas'),box=$('st-box');let drag=null;
@@ -253,6 +264,8 @@ $('st-region').onchange=()=>{canvas.classList.toggle('selecting',$('st-region').
 function point(e){const r=canvas.getBoundingClientRect();return[Math.max(0,Math.min(r.width,e.clientX-r.left)),Math.max(0,Math.min(r.height,e.clientY-r.top)),r]}
 canvas.onpointerdown=e=>{if(!$('st-region').checked||!S.state?.current)return;const[x,y]=point(e);drag={x,y};try{canvas.setPointerCapture(e.pointerId)}catch(_){}};
 canvas.onpointermove=e=>{if(!drag)return;const[x,y]=point(e);const l=Math.min(x,drag.x),t=Math.min(y,drag.y),w=Math.abs(x-drag.x),h=Math.abs(y-drag.y);Object.assign(box.style,{left:l+'px',top:t+'px',width:w+'px',height:h+'px'});box.hidden=false};
+canvas.onpointercancel=()=>{drag=null;clearBox()};
+window.addEventListener('resize',()=>{if(S.box)clearBox()});   // the overlay is in CSS pixels
 canvas.onpointerup=e=>{if(!drag)return;const[x,y,r]=point(e);const img=$('st-current'),scale=(img.naturalWidth||512)/r.width;const l=Math.min(x,drag.x),t=Math.min(y,drag.y),w=Math.abs(x-drag.x),h=Math.abs(y-drag.y);drag=null;if(w<6||h<6){S.box=null;box.hidden=true;return}S.box=[l,t,w,h].map(v=>Math.round(v*scale))};
 // ---- readiness
 window.studioOpened=async()=>{if(!S.sid)await restore();try{const h=await json('/health'),r=h.i23d||{};const miss=[];if(!r.image_model_ready)miss.push('Qwen-Image 2.1 native runner');if(!r.pixal3d_native_ready)miss.push('Pixal3D native runner');if(!S.busy&&!S.state?.current)status(miss.length?'Unavailable here: '+miss.join(', '):'Ready · Qwen-Image 2.1 native (CUDA) · Pixal3D native'+(r.pixal3d_reference_ready?' + PyTorch reference':'')+(r.moge_ready?' · MoGe-2 camera':''),miss.length>0)}catch(e){}};
