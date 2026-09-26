@@ -54,6 +54,24 @@ Dead ends (measured, reverted):
 - **Changing attention split geometry**: parity-locked to llama.cpp's
   reduction order.
 
+DFlash2 K=7 follow-up: **100.7 -> ~104.1 tok/s** (same hash, 134/140 accepted).
+- `f14c2a75`: the 17408-column IQ2_S verifier projection ran the one-token kernel
+  with an 8-token grid (weights read 8x, ~265 us). `qwen35_matvec_iq2s_fixed8` is
+  bitwise identical there and 1.74x faster.
+- `2d4048de`: verifier Q8_1 staging reused across same-source projections.
+- The verify window (~64 ms per 8 rows) is dominated by ALU-bound fixed8
+  matvecs. Per window: Q2_K ~9 ms, IQ2_XXS ~6, IQ2_XS ~5, IQ2_S ~5, IQ3 ~6,
+  attention ~4.
+- Draft length is capped at 7 (8 verifier rows). K=5 is much slower (67 tok/s)
+  because the fixed8 kernels need exactly 8 rows.
+- Dead ends (scratch kernels in rdna4/llm/tmp/nq):
+  - **Row-blocked Q2_K fixed8 (R=2/4)**: exact, slower. It is ALU bound at
+    ~7 VALU/weight/token.
+  - **WMMA iu8 for the IQ fixed8 integer dots**: exact (z per 16/32-weight
+    group), but replaying the reference float order needs an LDS transpose.
+    The ~43 KB LDS allows 1 block/CU, and the latency-bound phases lose:
+    IQ2_XXS 101 -> 142 us. A lighter-LDS design would be needed.
+
 Where the ~19.9 ms/token goes:
 - **Matvecs, ~16 ms.**
   - Per-format rates on 17408x5120, rotated over >64 MB so the Infinity
