@@ -14,7 +14,10 @@ work for coding agents:
   from those exact bytes rather than from the parsed tool-call JSON.
 """
 import base64
+import collections
+import hashlib
 import json
+import threading
 
 # Opaque reasoning-item payload: "q38raw1:" + base64(raw assistant text).
 RAW_PREFIX = "q38raw1:"
@@ -117,6 +120,100 @@ def system_frame(messages, registry=None, thinking=False, effort=None):
     if instructions:
         return "<|im_start|>system\n" + instructions + "<|im_end|>\n"
     return ""
+
+
+def _normalized_calls(calls):
+    out = []
+    for call in calls or []:
+        name = call.get("name", "")
+        if call.get("namespace"):
+            name = call["namespace"] + "." + name
+        if call.get("type") == "custom_tool_call":
+            out.append([name, {"input": call.get("input", "")}])
+            continue
+        arguments = call.get("arguments", {})
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments) if arguments else {}
+            except ValueError:
+                pass
+        out.append([name, arguments])
+    return json.dumps(out, sort_keys=True, ensure_ascii=False)
+
+
+class RawTurnCache:
+    """Server-side memory of generated assistant turns.
+
+    Clients do not always return the opaque raw blob: Claude Code drops
+    thinking blocks from earlier turns on the first request of a resumed
+    session, and plain Chat Completions clients never carry it.  Turns are
+    therefore also remembered by the tool-call ids this server issued and by
+    the hash of a text-only answer.  The ids are random and server-issued, so
+    a returned id identifies the generated turn; tool names and the answer
+    text must still match.  Arguments may differ: clients store tool inputs
+    with defaults filled in (Claude Code adds ``replace_all: false``).
+    """
+
+    def __init__(self, capacity=4096):
+        self.capacity = capacity
+        self.entries = collections.OrderedDict()
+        self.lock = threading.Lock()
+
+    @staticmethod
+    def text_key(text):
+        return "text:" + hashlib.sha256(text.strip().encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def call_names(calls):
+        return [name for name, _ in json.loads(_normalized_calls(calls))]
+
+    def remember(self, raw, text, calls, ids):
+        keys = [i for i in ids if i] or ([self.text_key(text)] if text.strip() else [])
+        value = (raw, self.call_names(calls), text.strip())
+        with self.lock:
+            for key in keys:
+                self.entries[key] = value
+                self.entries.move_to_end(key)
+            while len(self.entries) > self.capacity:
+                self.entries.popitem(last=False)
+
+    def resolve(self, messages):
+        """Fill in ``raw`` for assistant turns that lost it."""
+        with self.lock:
+            for m in messages:
+                if m.get("role") != "assistant" or isinstance(m.get("raw"), str):
+                    continue
+                ids = m.get("call_ids") or []
+                key = ids[0] if ids else self.text_key(content_text(m.get("content", "")))
+                entry = self.entries.get(key)
+                if entry is None:
+                    continue
+                raw, names, text = entry
+                if (names == self.call_names(m.get("tool_calls")) and
+                        (text == content_text(m.get("content", "")).strip())):
+                    m["raw"] = raw
+                    self.entries.move_to_end(key)
+        return messages
+
+
+def prefix_boundaries(messages, registry=None, thinking=False, effort=None):
+    """Stable prompt prefixes the runner snapshots and shares across
+    conversations: the whole system turn, and, when tools precede system
+    text, the tools block alone.  Agents embed per-project details (paths,
+    memory directories) in their system text, but the tool schemas, often
+    the larger part, are identical across projects.  The tools boundary
+    ends after "\n\n" before a letter, a clean BPE pre-token split."""
+    frame = system_frame(messages, registry, thinking, effort)
+    out = [frame] if frame else []
+    body = system_text(messages)
+    if registry and body:
+        instructions = REASONING_INSTRUCTIONS[template_effort(effort)] if thinking else ""
+        tools_only = ("<|im_start|>system\n" +
+                      (instructions + "\n\n" if instructions else "") +
+                      tools_block(registry) + "\n\n")
+        if frame.startswith(tools_only) and body[:1].isalpha():
+            out.insert(0, tools_only)
+    return out
 
 
 def render_call(call):
@@ -270,7 +367,9 @@ def responses_input_messages(value):
                 current = assistant_turn()
             current["content"] = content_text(item.get("content", ""))
         elif kind in ("function_call", "custom_tool_call"):
-            assistant_turn()["tool_calls"].append(_call_from_item(item))
+            current = assistant_turn()
+            current["tool_calls"].append(_call_from_item(item))
+            current.setdefault("call_ids", []).append(item.get("call_id"))
         elif kind in ("function_call_output", "custom_tool_call_output"):
             flush()
             messages.append({"role": "tool",
@@ -300,6 +399,8 @@ def chat_input_messages(messages):
         m = dict(m)
         if m.get("role") == "assistant":
             calls = []
+            m["call_ids"] = [c.get("id") for c in m.get("tool_calls") or []
+                             if isinstance(c, dict)]
             for call in m.get("tool_calls") or []:
                 if not isinstance(call, dict):
                     continue

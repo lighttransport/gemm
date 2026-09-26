@@ -24,10 +24,11 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
-from qwen_chat import (chat_input_messages, content_text, encode_raw,
-                       generation_suffix, render_messages,
+from qwen_chat import (RawTurnCache, chat_input_messages, content_text, encode_raw,
+                       generation_suffix, prefix_boundaries, render_messages,
                        responses_input_messages, split_generation, system_frame)
 from qwen_tools import call_events, parse_calls, tool_registry
+import anthropic_api
 
 
 WEB_DIR = Path(__file__).with_name("web")
@@ -398,7 +399,10 @@ class Backend:
                  request_id=None, request_registered=False):
         request_start = time.monotonic()
         cancellation = cancellation if cancellation is not None else threading.Event()
-        prefix_payload = base64.b64encode(prefix.encode("utf-8")).decode("ascii") if prefix else "-"
+        # One stable prefix, or several (each gets a shared runner snapshot).
+        prefixes = [p for p in ([prefix] if isinstance(prefix, str) else prefix or []) if p]
+        prefix_payload = ",".join(base64.b64encode(p.encode("utf-8")).decode("ascii")
+                                  for p in prefixes) or "-"
         payload = base64.b64encode(prompt.encode("utf-8")).decode("ascii")
         cache_identity = hashlib.sha256(str(cache_key).encode("utf-8")).hexdigest()
         seed_field = "-" if seed is None else str(seed)
@@ -564,6 +568,26 @@ class Handler(BaseHTTPRequestHandler):
     context = 4096
     coding = False
     thinking = "auto"
+    raw_turns = RawTurnCache()
+
+    def count_tokens(self):
+        """Estimate /v1/messages/count_tokens from the rendered prompt."""
+        try:
+            n = int(self.headers.get("Content-Length", "0"))
+            if n <= 0 or n > MAX_REQUEST_BYTES:
+                raise ValueError("invalid request body size")
+            req = json.loads(self.rfile.read(n))
+            if not isinstance(req, dict):
+                raise ValueError("request body must be a JSON object")
+        except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+            self.send_json(400, {"type": "error", "error": {
+                "type": "invalid_request_error", "message": str(exc)}})
+            return
+        thinking, effort = self.thinking_mode(req, "/v1/messages")
+        registry = tool_registry(anthropic_api.tool_definitions(req.get("tools")))
+        prompt = chat_prompt(anthropic_api.request_messages(req), registry, thinking, effort)
+        # About 3.5 bytes per token for this tokenizer on code and English.
+        self.send_json(200, {"input_tokens": max(1, round(len(prompt.encode("utf-8")) / 3.5))})
 
     def thinking_mode(self, req, api_path):
         """Return (thinking, effort) for a request.
@@ -572,6 +596,13 @@ class Handler(BaseHTTPRequestHandler):
         (Codex always sends one); Chat Completions think only when asked via
         reasoning_effort or chat_template_kwargs.enable_thinking.
         """
+        if api_path == "/v1/messages":
+            requested, effort = anthropic_api.thinking_request(req)
+            if self.thinking == "off":
+                return False, effort
+            if self.thinking == "on":
+                return True, effort or "medium"
+            return requested, effort
         effort = None
         reasoning = req.get("reasoning")
         if isinstance(reasoning, dict) and isinstance(reasoning.get("effort"), str):
@@ -620,6 +651,12 @@ class Handler(BaseHTTPRequestHandler):
             return False
         except (BrokenPipeError, ConnectionResetError):
             return False
+
+    def do_HEAD(self):
+        # Connectivity probes (Claude Code sends HEAD /api/hello).
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def do_GET(self):
         self._request_id = None
@@ -672,7 +709,8 @@ class Handler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path.rstrip("/") or "/"
         if path.startswith("/v1/"):
             api_path = path
-        elif path in ("/chat/completions", "/completions", "/responses"):
+        elif path in ("/chat/completions", "/completions", "/responses", "/messages",
+                      "/messages/count_tokens"):
             api_path = "/v1" + path
         else:
             api_path = path
@@ -706,7 +744,11 @@ class Handler(BaseHTTPRequestHandler):
                 "request_id": request_id,
             })
             return
-        if api_path not in ("/v1/chat/completions", "/v1/completions", "/v1/responses"):
+        if api_path == "/v1/messages/count_tokens":
+            self.count_tokens()
+            return
+        if api_path not in ("/v1/chat/completions", "/v1/completions", "/v1/responses",
+                            "/v1/messages"):
             self.log_message("404 POST %s", self.path)
             self.send_json(404, {"error": {"message": "not found", "type": "invalid_request_error"}})
             return
@@ -753,6 +795,11 @@ class Handler(BaseHTTPRequestHandler):
                 cache_key = metadata["session_id"]
             elif self.headers.get("X-Prompt-Cache-Key") is not None:
                 cache_key = self.headers.get("X-Prompt-Cache-Key")
+            elif self.headers.get("X-Claude-Code-Session-Id") is not None:
+                cache_key = self.headers.get("X-Claude-Code-Session-Id")
+            elif isinstance(metadata.get("user_id"), str) and metadata["user_id"]:
+                # Claude Code embeds its session id in metadata.user_id.
+                cache_key = metadata["user_id"][:512]
             else:
                 cache_key = "shared"
             if not isinstance(cache_key, str) or not cache_key or len(cache_key) > 512:
@@ -763,6 +810,8 @@ class Handler(BaseHTTPRequestHandler):
                 prompt = req.get("prompt", "")
                 if isinstance(prompt, list): prompt = "".join(map(str, prompt))
                 messages = [{"role": "user", "content": prompt}]
+            elif api_path == "/v1/messages":
+                messages = anthropic_api.request_messages(req)
             elif api_path == "/v1/responses":
                 messages = []
                 if req.get("instructions"): messages.append({"role": "system", "content": req["instructions"]})
@@ -778,7 +827,9 @@ class Handler(BaseHTTPRequestHandler):
                     "message": "messages must be an array of objects",
                     "type": "invalid_request_error"}})
                 return
-            registry = tool_registry(req.get("tools", []))
+            registry = tool_registry(
+                anthropic_api.tool_definitions(req.get("tools"))
+                if api_path == "/v1/messages" else req.get("tools", []))
             thinking, effort = self.thinking_mode(req, api_path)
             try:
                 requested_limit = int(req.get("max_tokens", req.get("max_output_tokens", self.max_tokens)))
@@ -789,11 +840,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(400, {"error": {"message": "max_tokens must be non-negative", "type": "invalid_request_error"}})
                 return
             limit = min(requested_limit, self.max_tokens)
+            self.raw_turns.resolve(messages)
             messages = fit_context(
                 messages, self.context, limit,
                 lambda m: chat_prompt(m, registry, thinking, effort))
             prompt = chat_prompt(messages, registry, thinking, effort)
-            prefix = chat_prefix(messages, registry, thinking, effort)
+            prefix = prefix_boundaries(messages, registry, thinking, effort)
             trace_dir = os.environ.get("QWEN38_TRACE_DIR")
             if trace_dir:
                 # Diagnostic only: raw request plus the exact rendered prompt,
@@ -807,9 +859,8 @@ class Handler(BaseHTTPRequestHandler):
             # an oversized partial line would otherwise desynchronize every
             # later request on the resident runner.
             prompt_bytes = len(prompt.encode("utf-8"))
-            prefix_bytes = len(prefix.encode("utf-8"))
-            encoded_bytes = (4 * ((prompt_bytes + 2) // 3) +
-                             (4 * ((prefix_bytes + 2) // 3) if prefix else 1) +
+            prefix_bytes = sum(4 * ((len(p.encode("utf-8")) + 2) // 3) + 1 for p in prefix)
+            encoded_bytes = (4 * ((prompt_bytes + 2) // 3) + max(prefix_bytes, 1) +
                              2048)
             if encoded_bytes >= MAX_RUNNER_LINE_BYTES:
                 self.send_json(400, {"error": {
@@ -829,11 +880,16 @@ class Handler(BaseHTTPRequestHandler):
             # default makes tool-using agents repeat one failing call.
             if thinking:
                 defaults = (0.6, 0.95, 20, 0.0)
-            elif self.coding or api_path == "/v1/responses":
+            elif self.coding or api_path in ("/v1/responses", "/v1/messages"):
                 defaults = (0.7, 0.80, 20, 1.5)
             else:
                 defaults = (0.2, 0.95, 20, 0.0)
             default_temp, default_top_p, default_top_k, default_presence = defaults
+            if api_path == "/v1/messages" and os.environ.get("QWEN38_HONOR_CLIENT_SAMPLING", "0") == "0":
+                # Anthropic clients send temperature 1 (required there with
+                # extended thinking); Qwen's profiles are the useful values.
+                req = {k: v for k, v in req.items()
+                       if k not in ("temperature", "top_p", "top_k")}
             try:
                 temp = float(req.get("temperature", default_temp))
                 top_p = float(req.get("top_p", default_top_p))
@@ -886,18 +942,27 @@ class Handler(BaseHTTPRequestHandler):
                     stream_base = {"id": stream_response_id, "object": "response",
                                    "created_at": stream_created, "status": "in_progress",
                                    "model": self.model, "output": []}
-                    for sequence_number, event in enumerate(("response.created", "response.in_progress")):
-                        payload = {"type": event, "response": stream_base,
-                                   "sequence_number": sequence_number}
+                    if api_path == "/v1/messages":
+                        stream_response_id = "msg_" + uuid.uuid4().hex[:24]
+                        event, payload = anthropic_api.stream_start(
+                            stream_response_id, self.model, 0, 0)
                         self.wfile.write(("event: " + event + "\ndata: " +
-                                         json.dumps(payload, ensure_ascii=False) + "\n\n").encode())
+                                          json.dumps(payload) + "\n\n").encode())
+                    else:
+                        for sequence_number, event in enumerate(("response.created", "response.in_progress")):
+                            payload = {"type": event, "response": stream_base,
+                                       "sequence_number": sequence_number}
+                            self.wfile.write(("event: " + event + "\ndata: " +
+                                             json.dumps(payload, ensure_ascii=False) + "\n\n").encode())
                     self.wfile.flush()
+                    keepalive_bytes = (b'event: ping\ndata: {"type": "ping"}\n\n'
+                                       if api_path == "/v1/messages" else b": keep-alive\n\n")
 
                     def keepalive():
                         while not stream_keepalive_stop.wait(5.0):
                             try:
                                 with stream_write_lock:
-                                    self.wfile.write(b": keep-alive\n\n")
+                                    self.wfile.write(keepalive_bytes)
                                     self.wfile.flush()
                             except (BrokenPipeError, ConnectionResetError, OSError):
                                 cancelled.set()
@@ -947,6 +1012,27 @@ class Handler(BaseHTTPRequestHandler):
             reasoning_text, answer = split_generation(text, thinking)
             tool_text, calls = parse_calls(answer, registry)
             text = tool_text if calls else answer
+            if api_path == "/v1/messages":
+                content = anthropic_api.response_content(reasoning_text, raw_turn, text, calls)
+                self.raw_turns.remember(raw_turn, text, calls,
+                                        [b["id"] for b in content if b["type"] == "tool_use"])
+                reason = anthropic_api.stop_reason(calls, finish)
+                use = anthropic_api.usage(ptok, cached, ctok)
+                if req.get("stream"):
+                    self.close_connection = True
+                    for event, payload in anthropic_api.stream_events(content, reason, use):
+                        if event == "message_delta":
+                            payload = {**payload, "usage": use}
+                        self.wfile.write(("event: " + event + "\ndata: " +
+                                          json.dumps(payload, ensure_ascii=False) + "\n\n").encode())
+                    self.wfile.flush()
+                else:
+                    self.send_json(200, anthropic_api.message_object(
+                        "msg_" + uuid.uuid4().hex[:24], self.model, content, reason, use))
+                return
+            if api_path != "/v1/messages":
+                self.raw_turns.remember(raw_turn, text, calls,
+                                        [c.get("call_id") for c in calls])
             ident = "chatcmpl-" + uuid.uuid4().hex
             created = int(time.time())
             usage = {"prompt_tokens": ptok, "completion_tokens": ctok, "total_tokens": ptok + ctok, "cached_tokens": cached}

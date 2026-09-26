@@ -1,5 +1,79 @@
 # Qwen3.8 server correctness and performance
 
+## Claude Code CLI support — 2026-09-27
+
+The shim now serves the Anthropic Messages API (`POST /v1/messages`, also
+with `?beta=true`, plus `/v1/messages/count_tokens` and `HEAD` probes). The
+same template renderer and runner caches back it (`anthropic_api.py`). With
+the server from `run_qwen38_27b_codex.sh` running:
+
+```sh
+rdna4/llm/claude/qwen38_claude.sh -p "fix the bug in mathutil.c, compile and run it" \
+    --allowedTools 'Read,Edit,Bash(cc:*),Bash(./mu)' </dev/null
+```
+
+The wrapper runs `claude` with a clean environment and its own config
+directory (`~/.claude-qwen38`). It points every model role at the local
+model and sets `CLAUDE_CODE_MAX_CONTEXT_TOKENS` /
+`CLAUDE_CODE_AUTO_COMPACT_WINDOW` to the server's 64K context (Claude Code
+otherwise assumes 200K) and the output cap to 16K.
+
+### Translation
+
+- System blocks are merged, minus Claude Code's per-version
+  `x-anthropic-billing-header` block.
+- Server-side tools (web search) are not exposed to the model.
+- `tool_result` blocks become grouped `<tool_response>` turns. Mid-conversation
+  `system` messages (Claude Code's `<total_tokens>` budget notes) become user
+  turns.
+- Thinking follows `thinking: {"type": "adaptive"|"enabled"}`, with the
+  effort from `output_config.effort` (or `budget_tokens`).
+- Client `temperature`/`top_p` are ignored in favour of Qwen's profiles;
+  Anthropic clients send 1.0. Set `QWEN38_HONOR_CLIENT_SAMPLING=1` to honor
+  them.
+- Each turn starts with a thinking block whose `signature` carries the raw
+  generated turn. The Messages API requires clients to return thinking
+  blocks unmodified.
+
+### Server-side turn memory
+
+On the first request of a resumed session (`claude -p --resume`), Claude
+Code drops the thinking blocks of earlier turns. It also stores tool inputs
+with defaults filled in (for example `replace_all: false`).
+
+The shim therefore remembers each generated turn, keyed by the tool-call ids
+it issued (random, server-issued) or by the hash of a text-only answer. A
+turn that comes back without its blob replays from that memory when the tool
+names and answer text match. This works for all three APIs.
+
+### Tools-block boundary
+
+Claude Code's system text embeds per-project details, such as a memory
+directory derived from the config dir and cwd. The full system turn is
+therefore only shared between sessions in the same project.
+
+The runner protocol now accepts several comma-separated prefixes, and the
+shim also sends the tools block alone (it precedes the system text in the
+template, ending at a clean `\n\n` + letter split). Each boundary gets a
+shared snapshot.
+
+### Measured
+
+Claude Code 2.1.283 with 20 built-in tools; the cold prompt is 15.7K tokens.
+
+| Run | Turns | Wall | Uncached input | Cache read |
+| --- | ---: | ---: | ---: | ---: |
+| Session 1, fix/compile/run, cold server | 4 | 38.1 s | 15,939 | 47,990 |
+| Session 2, same project (shared system turn) | 4 | 15.7 s | 2,764 | 61,471 |
+| `--resume` session 1 after session 2 | 5 | 11.1 s | 404 | 83,584 |
+
+- The resumed request continued from session 1's saved live state with only
+  the 54-token new message appended.
+- A session in another project restored the 11,871-token tools snapshot and
+  prefilled 3,837 tokens (8.6 s) instead of 15,708 (31 s).
+- Every agent step continued the live state (40–154 appended tokens).
+- The DFlash2 HTTP gate and the Codex flows still pass.
+
 ## Codex integration for Qwen3.8-27B, dense GSQ + DFlash2 — 2026-09-27
 
 Launch with `rdna4/llm/run_qwen38_27b_codex.sh`. It serves the IQ2_XS GSQ
