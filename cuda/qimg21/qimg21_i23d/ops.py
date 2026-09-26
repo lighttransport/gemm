@@ -7,7 +7,10 @@
     generate_view(s)      one or many requested views of a reference object
     generate_multiview    views + metadata.json + transforms.json + validation.json
     generate_turntable    evenly spaced views at one elevation (flat layout)
-    generate_image_to_3d_dataset   the whole chain from one photo
+    generate_image_to_3d_dataset   the whole chain from one photo, optionally
+                          edited, optionally reconstructed with Pixal3D
+    reconstruct_3d        an RGBA object or a view dataset -> GLB (Pixal3D native
+                          runner and/or PyTorch reference)
 
 Every function takes a Backend (backends.select_backend) so the model is
 loaded once and reused across calls; images go to disk as they are produced
@@ -16,6 +19,7 @@ and are never held in memory as a set.
 from __future__ import annotations
 
 import json
+import math
 import tempfile
 import time
 from dataclasses import dataclass, field, asdict
@@ -401,9 +405,26 @@ def generate_image_to_3d_dataset(image, root, backend: Backend, *, azimuth_views
                                  extract: str | None = "qwen", pixels: str = "original", fill: float = 0.85,
                                  cleanup=(), params: ViewParams = ViewParams(), top_bottom: bool = False,
                                  projection: str = "perspective", batch_size: int = 1, extra_references=(),
-                                 model: str = "", on_view=None) -> dict:
+                                 model: str = "", on_view=None, edit: dict | None = None,
+                                 reconstructors=(), recon_mode: str = "single", recon_fov_deg=None,
+                                 recon_elevations=(0.0,), recon_max_frames: int = 16) -> dict:
     """Photo -> object extraction -> RGBA normalization -> optional cleanup ->
-    views -> metadata.json / transforms.json / validation.json."""
+    optional edit -> views -> metadata.json / transforms.json /
+    validation.json -> optional Pixal3D reconstruction (reconstruct_3d).
+
+    edit: edit_object keyword arguments plus "instruction" (e.g. {"instruction":
+    "make the base blue", "rect": (x, y, w, h)}); the edited object is what the
+    views and the reconstruction see. azimuth_views=0 (and no top/bottom)
+    generates no views.
+
+    recon_mode "single" (the default) reconstructs from the prepared object
+    alone; "multiview" poses the generated views with their requested
+    cameras. Measured against Pixal3D on real renders of the same object,
+    single view was clearly better (Chamfer RMS 0.024 vs 0.063): the model
+    keeps a view's outline close to the reference's width, so a deep object's
+    generated side views are too narrow to be used as calibrated cameras. The
+    image backend is closed (resident processes and device memory released)
+    before Pixal3D runs."""
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
     prep_dir = root / "preprocess"
@@ -424,14 +445,94 @@ def generate_image_to_3d_dataset(image, root, backend: Backend, *, azimuth_views
                                                       size=(width, height), steps=params.steps, seed=params.seed,
                                                       keep_background=True)
         prepared = cleaned
+    if edit:
+        options = dict(edit)
+        instruction = options.pop("instruction")
+        edited = prep_dir / "object_edited.png"
+        preprocessing["edit"] = edit_object(prepared, instruction, edited, backend, transparent=True,
+                                            size=(width, height), steps=params.steps, seed=params.seed, **options)
+        prepared = edited
+    if recon_mode not in ("single", "multiview"):
+        raise ValueError("recon_mode must be single or multiview")
+    if azimuth_views < 0:
+        raise ValueError("azimuth_views must be >= 0")
+    if reconstructors and recon_mode == "multiview" and not azimuth_views:
+        raise ValueError("multiview reconstruction needs generated views (azimuth_views > 0)")
     common = {"width": width, "height": height, "projection": projection}
-    specs = viewlib.rings(azimuth_views, list(elevations), **common) if len(elevations) > 1 else \
-        viewlib.ring(azimuth_views, elevations[0], **common)
+    specs = []
+    if azimuth_views:
+        specs = viewlib.rings(azimuth_views, list(elevations), **common) if len(elevations) > 1 else \
+            viewlib.ring(azimuth_views, elevations[0], **common)
     if top_bottom:
         specs += viewlib.top_bottom(**common)
-    layout = "rings" if len(elevations) > 1 or top_bottom else "flat"
-    summary = generate_multiview([prepared, *extra_references], specs, root, backend, params, layout=layout,
-                                 batch_size=batch_size, preprocessing=preprocessing, model=model, on_view=on_view)
+    if specs:
+        layout = "rings" if len(elevations) > 1 or top_bottom else "flat"
+        summary = generate_multiview([prepared, *extra_references], specs, root, backend, params, layout=layout,
+                                     batch_size=batch_size, preprocessing=preprocessing, model=model,
+                                     on_view=on_view)
+    else:
+        summary = {"root": str(root), "views": 0}
+    summary["prepared"] = str(prepared)
     summary["preprocessing"] = preprocessing
+    if reconstructors:
+        backend.close()
+        if recon_mode == "single":
+            summary["reconstruction"] = reconstruct_3d(prepared, root / "reconstruction", reconstructors,
+                                                       mode="single", fov_deg=recon_fov_deg)
+        else:
+            summary["reconstruction"] = reconstruct_3d(root, root / "reconstruction", reconstructors,
+                                                       mode="multiview", elevations=recon_elevations,
+                                                       max_frames=recon_max_frames)
     (root / "pipeline.json").write_text(json.dumps(summary, indent=2, default=str) + "\n")
     return summary
+
+
+def reconstruct_3d(source, out_dir, reconstructors, *, mode: str = "multiview", fov_deg=None,
+                   mesh_scale: float = 1.0, elevations=(0.0,), max_frames: int = 16,
+                   compare: bool = True) -> dict:
+    """Reconstruct a GLB per Pixal3D runner (reconstruct.Pixal3DNative /
+    Pixal3DReference) from:
+    - mode "multiview": a view dataset (transforms.json + RGBA frames); the
+      reference and the generated views at `elevations` (None: all) are
+      staged, at most max_frames (Pixal3D's limit is 16);
+    - mode "single": an RGBA object image; its camera FOV is fov_deg, or
+      estimated with MoGe-2 when None.
+    With two runners the meshes are compared (symmetric Chamfer). Writes
+    out_dir/<runner>.glb and out_dir/reconstruction.json."""
+    from . import reconstruct as recon
+    if not reconstructors:
+        raise ValueError("no reconstructor given")
+    source = Path(source)
+    if not source.exists():
+        raise ValueError(f"{source} does not exist")
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    record = {"mode": mode, "camera_parameters": None, "runs": []}
+    if mode == "multiview":
+        if not (source / "transforms.json").is_file():
+            raise ValueError(f"{source} has no transforms.json; multiview reconstruction needs a view dataset")
+        views, files = recon.stage_views(source, out_dir, max_frames, elevations)
+        transforms = json.loads((views / "transforms.json").read_text())
+        record.update(views_dir=str(views), frames=files, camera_parameters=transforms.get("camera_parameters"))
+        for runner in reconstructors:
+            record["runs"].append(runner.multiview(views, out_dir / f"{runner.name}.glb", out_dir / runner.name))
+    elif mode == "single":
+        if fov_deg is None:
+            camera = recon.estimate_camera(source, out_dir, getattr(reconstructors[0], "backend", "cuda"),
+                                           mesh_scale)
+            fov = float(camera["fov"])
+            record["camera"] = {"fov_rad": fov, "source": camera.get("camera_source", "moge-2")}
+        else:
+            fov = math.radians(float(fov_deg))
+            record["camera"] = {"fov_rad": fov, "source": "given"}
+        record["input"] = str(source)
+        for runner in reconstructors:
+            record["runs"].append(runner.single(source, out_dir / f"{runner.name}.glb", out_dir / runner.name,
+                                                fov_rad=fov, mesh_scale=mesh_scale))
+    else:
+        raise ValueError("mode must be single or multiview")
+    if compare and len(record["runs"]) == 2:
+        record["comparison"] = recon.compare_meshes(record["runs"][0]["output"], record["runs"][1]["output"],
+                                                    out_dir)
+    (out_dir / "reconstruction.json").write_text(json.dumps(record, indent=2, default=str) + "\n")
+    return record

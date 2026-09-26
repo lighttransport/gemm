@@ -373,6 +373,178 @@ class OpsTest(Tmp):
         self.assertEqual(summary["layout"], "rings")
 
 
+def tiny_glb(path, vertices=3, triangles=1):
+    """A GLB with just the JSON chunk the summary reads."""
+    import struct
+    scene = {"meshes": [{"primitives": [{"attributes": {"POSITION": 0}, "indices": 1}]}],
+             "accessors": [{"count": vertices, "min": [-1, -1, -1], "max": [1, 1, 1]}, {"count": 3 * triangles}]}
+    body = json.dumps(scene).encode()
+    body += b" " * (-len(body) % 4)
+    raw = struct.pack("<III", 0x46546C67, 2, 12 + 8 + len(body)) + struct.pack("<II", len(body), 0x4E4F534A) + body
+    Path(path).write_bytes(raw)
+
+
+class FakeRunner:
+    """A Pixal3D runner that records what it was given and writes a GLB."""
+
+    def __init__(self, name, backend, events):
+        self.name, self.backend, self.events = name, backend, events
+
+    def available(self):
+        return True, []
+
+    def single(self, rgba, out, work, *, fov_rad, mesh_scale=1.0):
+        self.events.append(("single", self.name, Path(rgba).name, round(fov_rad, 6)))
+        tiny_glb(out)
+        return {"runner": self.name, "output": str(out), "mode": "single", "fov_rad": fov_rad}
+
+    def multiview(self, views_dir, out, work):
+        transforms = json.loads((Path(views_dir) / "transforms.json").read_text())
+        self.events.append(("multiview", self.name, [f["file_path"] for f in transforms["frames"]]))
+        tiny_glb(out)
+        return {"runner": self.name, "output": str(out), "mode": "multiview"}
+
+
+class ReconstructTest(Tmp):
+    def setUp(self):
+        super().setUp()
+        from qimg21_i23d import reconstruct
+        self.recon = reconstruct
+        self.photo = self.write("photo.png", object_image(320, 240))
+
+    def dataset(self, elevations=(0.0, 20.0), views=4):
+        root = self.dir / "ds"
+        ops.generate_image_to_3d_dataset(self.photo, root, MockBackend(), azimuth_views=views, elevations=elevations,
+                                         width=256, height=256, extract="alpha", params=ops.ViewParams(steps=2))
+        return root
+
+    def test_frame_selection(self):
+        transforms = json.loads((self.dataset() / "transforms.json").read_text())
+        frames = self.recon.select_frames(transforms)
+        # The reference, then the 0-degree ring without its copy of the reference view.
+        self.assertEqual([f["file_path"] for f in frames],
+                         ["reference/ref_00.png", "views/e000/a090.png", "views/e000/a180.png",
+                          "views/e000/a270.png"])
+        self.assertEqual(len(self.recon.select_frames(transforms, elevations=None)), 1 + 3 + 4)
+        self.assertEqual(len(self.recon.select_frames(transforms, max_frames=3, elevations=None)), 3)
+        # Another tool's posed set (no angle fields): every frame is kept.
+        plain = {"frames": [{"file_path": f"v{i}.png", "transform_matrix": []} for i in range(4)]}
+        self.assertEqual([f["file_path"] for f in self.recon.select_frames(plain)],
+                         ["v0.png", "v1.png", "v2.png", "v3.png"])
+
+    def test_staged_views_are_flat_rgba_with_cameras(self):
+        views, sources = self.recon.stage_views(self.dataset(), self.dir / "stage")
+        staged = json.loads((views / "transforms.json").read_text())
+        self.assertEqual([f["file_path"] for f in staged["frames"]], [f"view{i:02d}.png" for i in range(4)])
+        self.assertTrue(all((views / f["file_path"]).is_file() for f in staged["frames"]))
+        self.assertEqual(sources[0], "reference/ref_00.png")
+        self.assertTrue(staged["generated_views"])
+        self.assertIn("not calibration", staged["camera_parameters"])
+        self.assertAlmostEqual(staged["camera_angle_x"], math.radians(20.0))
+
+    def test_commands(self):
+        settings = self.recon.ReconSettings(seed=7, texture_size=1024, triangle_target=200_000, vram_budget_mib=7168)
+        native = self.recon.Pixal3DNative("rocm", settings=settings)
+        cmd = native.single_command(Path("o.png"), Path("o.glb"), 0.5, 2.0, 1.0, Path("p.json"))
+        flag = lambda c, name: c[c.index(name) + 1]
+        self.assertEqual(flag(cmd, "--backend"), "rocm")
+        self.assertEqual(flag(cmd, "--input"), "o.png")
+        self.assertEqual((flag(cmd, "--seed"), flag(cmd, "--texture-size"), flag(cmd, "--vram-budget-mib")),
+                         ("7", "1024", "7168"))
+        self.assertEqual(flag(native.multiview_command(Path("v"), Path("o.glb"), Path("p")), "--views-dir"), "v")
+        cpu = self.recon.Pixal3DNative("cpu").multiview_command(Path("v"), Path("o.glb"), Path("p"))
+        self.assertEqual(flag(cpu, "--gpu-execution"), "legacy")
+        reference = self.recon.Pixal3DReference("cuda")
+        cmd = reference.single_command(Path("o.png"), Path("o.glb"), 0.5)
+        self.assertTrue(cmd[0].endswith("run_reference_cuda310.sh"))
+        self.assertTrue(cmd[2].endswith("run_reference_sv.py"))
+        self.assertIn("--low_vram", cmd)
+        cmd = self.recon.Pixal3DReference("rocm").multiview_command(Path("v"), Path("o.glb"))
+        self.assertTrue(cmd[0].endswith("run.sh") and cmd[1] == "rocm" and cmd[2].endswith("run_reference_mv.py"))
+        with self.assertRaises(ValueError):
+            self.recon.Pixal3DReference("cpu")
+        with self.assertRaises(ValueError):
+            self.recon.ReconSettings(texture_size=333).validate()
+        # prepare_input.py: a unit object fills the frame.
+        self.assertAlmostEqual(self.recon.camera_distance(math.radians(20.0)), 0.5 / math.tan(math.radians(10.0)))
+
+    def test_glb_summary(self):
+        tiny_glb(self.dir / "m.glb", vertices=10, triangles=4)
+        summary = self.recon.glb_summary(self.dir / "m.glb")
+        self.assertEqual((summary["vertices"], summary["triangles"]), (10, 4))
+        (self.dir / "bad.glb").write_bytes(b"nope" * 8)
+        with self.assertRaises(self.recon.ReconstructionError):
+            self.recon.glb_summary(self.dir / "bad.glb")
+
+    def test_pipeline_edits_then_reconstructs_after_releasing_the_image_model(self):
+        events = []
+
+        class Closing(MockBackend):
+            def close(self):
+                events.append(("close",))
+
+            def generate(self, request):
+                events.append(("generate",))
+                return super().generate(request)
+
+        runners = [FakeRunner("native", "cuda", events), FakeRunner("reference", "cuda", events)]
+        root = self.dir / "chain"
+        compared = []
+        original = self.recon.compare_meshes
+        self.recon.compare_meshes = lambda a, b, work, samples=50000: compared.append((a, b)) or {"chamfer": 0}
+        try:
+            summary = ops.generate_image_to_3d_dataset(
+                self.photo, root, Closing(), azimuth_views=4, width=256, height=256, extract="alpha",
+                params=ops.ViewParams(steps=2), edit={"instruction": "paint it blue", "rect": (0, 0, 128, 128)},
+                reconstructors=runners, recon_mode="multiview")
+        finally:
+            self.recon.compare_meshes = original
+        self.assertTrue((root / "preprocess/object_edited.png").is_file())
+        self.assertIn("edit", summary["preprocessing"])
+        # Views are generated from the edited object; the image model is
+        # released before the first reconstruction.
+        first_recon = next(i for i, e in enumerate(events) if e[0] == "multiview")
+        self.assertEqual(events[first_recon - 1], ("close",))
+        self.assertNotIn(("generate",), events[first_recon:])
+        self.assertEqual(events[first_recon][2], [f"view{i:02d}.png" for i in range(4)])
+        self.assertEqual(len(compared), 1)
+        record = json.loads((root / "reconstruction/reconstruction.json").read_text())
+        self.assertEqual([r["runner"] for r in record["runs"]], ["native", "reference"])
+        self.assertIn("comparison", record)
+        self.assertIn("reconstruction", json.loads((root / "pipeline.json").read_text()))
+
+    def test_single_view_mode_uses_the_prepared_object_and_the_given_fov(self):
+        events = []
+        summary = ops.generate_image_to_3d_dataset(
+            self.photo, self.dir / "single", MockBackend(), azimuth_views=0, width=256, height=256, extract="alpha",
+            reconstructors=[FakeRunner("native", "cuda", events)], recon_fov_deg=30.0)
+        self.assertEqual(events, [("single", "native", "object_rgba.png", round(math.radians(30.0), 6))])
+        self.assertEqual(summary["views"], 0)
+        # Views are still generated when asked for; the reconstruction uses the object alone.
+        events.clear()
+        summary = ops.generate_image_to_3d_dataset(
+            self.photo, self.dir / "both", MockBackend(), azimuth_views=4, width=256, height=256, extract="alpha",
+            params=ops.ViewParams(steps=2), reconstructors=[FakeRunner("native", "cuda", events)], recon_fov_deg=30.0)
+        self.assertEqual(summary["views"], 4)
+        self.assertEqual([e[0] for e in events], ["single"])
+        with self.assertRaises(ValueError):
+            ops.generate_image_to_3d_dataset(self.photo, self.dir / "x", MockBackend(), azimuth_views=0, width=256,
+                                             height=256, extract="alpha", recon_mode="multiview",
+                                             reconstructors=[FakeRunner("native", "cuda", events)])
+
+    def test_cli(self):
+        for command in (["reconstruct", "--help"],):
+            with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as done:
+                runner.main(command)
+            self.assertEqual(done.exception.code, 0)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = runner.main(["reconstruct", "--input", str(self.dir / "missing"), "--output", str(self.dir / "o"),
+                                "--reconstruct", "reference", "--pixal3d-backend", "cpu"])
+        self.assertEqual(code, 2)
+        self.assertIn("cuda or rocm", err.getvalue())
+
+
 class ValidationTest(Tmp):
     def test_broken_images_are_reported(self):
         good = object_image(256, 256)

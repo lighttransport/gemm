@@ -177,8 +177,36 @@ def cmd_turntable(args):
                                   model=args.model, on_view=progress)
 
 
+def make_reconstructors(args):
+    from qimg21_i23d import reconstruct
+    settings = reconstruct.ReconSettings(seed=args.recon_seed, texture_size=args.texture_size,
+                                         triangle_target=args.triangle_target, vram_budget_mib=args.vram_budget_mib)
+    runners = reconstruct.make_reconstructors(args.reconstruct, args.pixal3d_backend, settings)
+    for runner in runners:
+        ok, missing = runner.available()
+        if not ok:   # fail before any image work is spent
+            raise backends.BackendError(f"Pixal3D {runner.name} ({runner.backend}) is not ready: "
+                                        f"missing {', '.join(missing)}")
+    return runners
+
+
+def recon_elevations(args):
+    if args.recon_elevations == "all":
+        return None
+    return viewlib.parse_elevations(args.recon_elevations)
+
+
 def cmd_image_to_3d(args):
     extra = list(args.reference or [])
+    runners = make_reconstructors(args)
+    edit = None
+    if args.edit:
+        edit = {"instruction": args.edit, "strength": args.edit_strength, "mask": args.mask,
+                "rect": parse_ints(args.mask_rect, 4, "--mask-rect"),
+                "circle": parse_ints(args.mask_circle, 3, "--mask-circle"), "mask_feather": args.mask_feather,
+                "mask_as_reference": not args.no_mask_reference}
+    elif args.mask or args.mask_rect or args.mask_circle:
+        raise SystemExit("a mask needs --edit")
     backend = make_backend(args, 1 + len(extra))
     elevations = viewlib.parse_elevations(args.elevations) if args.elevations else [args.elevation]
     return ops.generate_image_to_3d_dataset(
@@ -186,7 +214,19 @@ def cmd_image_to_3d(args):
         height=args.height, extract=None if args.keep_background else args.method, pixels=args.pixels,
         fill=args.fill, cleanup=tuple(args.cleanup.split(",")) if args.cleanup else (), params=view_params(args),
         top_bottom=args.top_bottom, projection=args.projection, batch_size=args.batch_size,
-        extra_references=extra, model=args.model, on_view=progress)
+        extra_references=extra, model=args.model, on_view=progress, edit=edit, reconstructors=runners,
+        recon_mode=args.recon_mode, recon_fov_deg=args.recon_fov, recon_elevations=recon_elevations(args),
+        recon_max_frames=args.recon_max_frames)
+
+
+def cmd_reconstruct(args):
+    runners = make_reconstructors(args)
+    if not runners:
+        raise SystemExit("--reconstruct none: nothing to do")
+    source = Path(args.input)
+    mode = args.recon_mode if args.recon_mode_given else ("multiview" if source.is_dir() else "single")
+    return ops.reconstruct_3d(source, args.output, runners, mode=mode, fov_deg=args.recon_fov,
+                              elevations=recon_elevations(args), max_frames=args.recon_max_frames)
 
 
 def cmd_validate(args):
@@ -202,6 +242,28 @@ def cmd_validate(args):
 def progress(record):
     print(f"  view {record['index'] if 'index' in record else ''} {record['file']}: {record['seconds']:.1f} s",
           file=sys.stderr, flush=True)
+
+
+def add_reconstruct_options(parser, default: str):
+    group = parser.add_argument_group("Pixal3D reconstruction")
+    group.add_argument("--reconstruct", default=default, choices=("none", "native", "reference", "both"),
+                       help="native: cpu/pixal3d/pixal3d; reference: the pinned PyTorch pipeline; both: run "
+                            f"both and compare the meshes (default {default})")
+    group.add_argument("--pixal3d-backend", default="cuda", choices=("cuda", "rocm", "cpu"),
+                       help="device for Pixal3D (the reference runs on cuda or rocm)")
+    group.add_argument("--recon-mode", default="single", choices=("single", "multiview"),
+                       help="single (default for image-to-3d; for reconstruct: an image input): the prepared "
+                            "object alone -- measurably better than posing generated views; multiview: the "
+                            "reference plus generated views, posed by their requested cameras")
+    group.add_argument("--recon-fov", type=float,
+                       help="single-view camera FOV in degrees (default: MoGe-2 estimate)")
+    group.add_argument("--recon-elevations", default="0",
+                       help="elevation rings whose views go to Pixal3D, comma-separated, or 'all' (default 0)")
+    group.add_argument("--recon-max-frames", type=int, default=16, help="frames given to Pixal3D (at most 16)")
+    group.add_argument("--recon-seed", type=int, default=42)
+    group.add_argument("--texture-size", type=int, default=4096, choices=(1024, 2048, 4096))
+    group.add_argument("--triangle-target", type=int, default=1_000_000)
+    group.add_argument("--vram-budget-mib", type=int, help="native Pixal3D device-memory budget")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -274,7 +336,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--input", required=True)
     p.add_argument("--reference", action="append", help="extra real reference photos (needs --backend torch)")
     p.add_argument("--output", required=True)
-    p.add_argument("--views", type=int, default=24, help="views per elevation")
+    p.add_argument("--views", type=int, default=24, help="views per elevation (0: none)")
     p.add_argument("--elevation", type=float, default=0.0)
     p.add_argument("--elevations", help="comma-separated elevation rings")
     p.add_argument("--top-bottom", action="store_true")
@@ -284,9 +346,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--pixels", default="original", choices=("original", "generated"))
     p.add_argument("--fill", type=float, default=0.85)
     p.add_argument("--cleanup", help=f"texture cleanup ops before generating views: {', '.join(ops.TEXTURE_OPERATIONS)}")
+    p.add_argument("--edit", help="an object-preserving edit applied to the extracted object before views and "
+                                  "reconstruction (e.g. 'make the base dark blue')")
+    p.add_argument("--edit-strength", type=float, default=1.0, help="1: edit by conditioning; below 1: SDEdit")
+    add_mask_options(p)
     add_view_options(p)
     add_backend_options(p)
+    add_reconstruct_options(p, "none")
     p.set_defaults(run=cmd_image_to_3d)
+
+    p = sub.add_parser("reconstruct", help="an RGBA object or a view dataset -> GLB with Pixal3D")
+    p.add_argument("--input", required=True, help="a dataset directory (multiview) or an RGBA PNG (single)")
+    p.add_argument("--output", required=True, help="output directory (<runner>.glb, reconstruction.json)")
+    add_reconstruct_options(p, "native")
+    p.set_defaults(run=cmd_reconstruct)
 
     p = sub.add_parser("validate", help="re-run the 2D checks on a dataset")
     p.add_argument("dataset")
@@ -296,7 +369,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 # Values that may start with "-" (e.g. --elevations -20,0,20): argparse would
 # read them as options, so they are joined to their flag first.
-SIGNED_VALUES = ("--elevations", "--elevation", "--mask-rect", "--mask-circle")
+SIGNED_VALUES = ("--elevations", "--elevation", "--mask-rect", "--mask-circle", "--recon-elevations")
 
 
 def join_signed_values(argv: list[str]) -> list[str]:
@@ -312,13 +385,18 @@ def join_signed_values(argv: list[str]) -> list[str]:
 
 
 def main(argv=None) -> int:
-    args = build_parser().parse_args(join_signed_values(list(sys.argv[1:] if argv is None else argv)))
+    raw = join_signed_values(list(sys.argv[1:] if argv is None else argv))
+    args = build_parser().parse_args(raw)
+    args.recon_mode_given = any(a == "--recon-mode" or a.startswith("--recon-mode=") for a in raw)
     args.backends = []
     try:
         result = args.run(args)
     except (ValueError, backends.BackendError) as exc:
         print(f"runner: {exc}", file=sys.stderr)
         return 2
+    except RuntimeError as exc:   # reconstruct.ReconstructionError: a runner failed
+        print(f"runner: {exc}", file=sys.stderr)
+        return 1
     finally:
         for backend in args.backends:
             close = getattr(backend, "close", None)

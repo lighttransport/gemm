@@ -9,11 +9,15 @@ TRELLIS.2. It covers:
 - texture cleanup;
 - requested-view, turntable and elevation-ring generation;
 - dataset export with metadata, a NeRF/Blender `transforms.json` and 2D
-  validation.
+  validation;
+- reconstruction to a textured GLB with Pixal3D: the repository's native
+  runner (CUDA, ROCm or CPU) and/or the pinned PyTorch reference (see
+  [Reconstruction with Pixal3D](#reconstruction-with-pixal3d)).
 
-It does **not** reconstruct 3D. Every generated view is a 2D image that the
-model *was asked* to render from some camera; nothing makes the views agree
-with each other geometrically (see [Limitations](#limitations)).
+The package itself trains or runs no 3D network; Pixal3D does the
+reconstruction. Every generated view is a 2D image that the model *was
+asked* to render from some camera; nothing makes the views agree with each
+other geometrically (see [Limitations](#limitations)).
 
 ## Quick start
 
@@ -54,7 +58,8 @@ reference counts).
 | `texture-preprocess` | `--ops neutralize-lighting,reduce-shadows,reduce-specular,remove-reflections,repair-defects,remove-background` with an instruction that forbids beautifying and keeps text/logos. |
 | `multiview` | views of a reference: `--views N [--elevation E]`, or rings `--azimuth-views N --elevations -20,0,20`, `--top-bottom`, extra `--reference` photos (torch backend). |
 | `turntable` | N evenly spaced azimuths at one elevation, flat `images/NNN.png` layout. |
-| `image-to-3d` | the whole chain: extract → normalize → optional `--cleanup` → views → validate → export. `--keep-background` skips extraction for an already clean RGBA. |
+| `image-to-3d` | the whole chain: extract → normalize → optional `--cleanup` → optional `--edit` (with `--mask*`) → views → validate → export → optional `--reconstruct native\|reference\|both`. `--keep-background` skips extraction for an already clean RGBA. |
+| `reconstruct` | a view dataset (multiview) or an RGBA object (single view) → `<runner>.glb` and `reconstruction.json` with Pixal3D. |
 | `validate DIR` | re-run the 2D validation of a dataset and rewrite `validation.json`. |
 
 Shared options: `--backend auto|native|torch|mock`, `--steps` (20),
@@ -219,6 +224,121 @@ These are per-image checks only:
 It also has a dataset summary (foreground fraction min/mean/max). The
 checks are **2D only**: a set can pass while its views disagree in 3D.
 
+## Reconstruction with Pixal3D
+
+```sh
+# Photo -> object -> (edit) -> 4 views -> native Pixal3D multiview -> GLB
+$PY cuda/qimg21/runner.py image-to-3d --input photo.jpg --output tmp/obj \
+  --views 4 --steps 16 --reconstruct native            # [--edit "make the base blue" --mask-rect 0,300,512,212]
+# An existing dataset, both runners, meshes compared
+$PY cuda/qimg21/runner.py reconstruct --input tmp/obj --output tmp/obj/recon-both --reconstruct both
+# One RGBA object, single view (FOV from MoGe-2 unless --recon-fov is given)
+$PY cuda/qimg21/runner.py reconstruct --input obj.png --output tmp/obj1 --recon-mode single
+```
+
+`qimg21_i23d.reconstruct` drives the same runners, with the same flags, as
+the Pixal3D demo server:
+
+| runner | device | command |
+|---|---|---|
+| `native` | `--pixal3d-backend cuda\|rocm\|cpu` | `cpu/pixal3d/pixal3d --backend … --input … --fov --distance --mesh-scale` (single) or `--views-dir` (multiview), resident GPU execution, mixed flow precision |
+| `reference` | cuda (`ref/pixal3d/.venv-reference-cuda310`) or rocm (`.venv-rocm`) | `ref/pixal3d/run_reference_sv.py --image … --fov` or `run_reference_mv.py --views_dir …`, `--low_vram --resolution 1024` |
+
+Multiview input:
+- The dataset's reference (frame 0, which fixes the output orientation)
+  goes to Pixal3D together with the generated views of the
+  `--recon-elevations` rings (default 0).
+- A generated copy of the reference view is dropped, and at most
+  `--recon-max-frames` frames (16, Pixal3D's limit) are used.
+- The frames are staged as `reconstruction/views/viewNN.png` with a flat
+  `transforms.json`. The cameras are the requested ones: FOV 20°, distance
+  3.119, and the same convention as Pixal3D's own posed example.
+- Frames of another tool's `transforms.json` (no angle fields) are all
+  kept.
+
+Single-view input:
+- The prepared object alone.
+- Camera FOV from `--recon-fov`, or estimated by MoGe-2 through
+  `ref/pixal3d/prepare_input.py`, as the server's auto-camera does.
+- Distance is `0.5 / tan(FOV/2)`.
+
+Running it:
+- The image model's resident processes are stopped before Pixal3D runs, so
+  it has the device to itself.
+- `--reconstruct both` also runs `ref/pixal3d/compare_outputs.py`
+  (symmetric Chamfer between the two meshes).
+- `--texture-size`, `--triangle-target`, `--recon-seed` and
+  `--vram-budget-mib` pass through.
+- A runner whose binary, environment or weights are missing is reported
+  before any image work starts.
+
+### Single view vs generated views: measured
+
+Pixal3D's posed example (`ref/pixal3d/upstream/assets/mv_images/example`,
+a cyclops head) has real renders at 0/90/180/270°, which give an oracle.
+All runs used the native runner on CUDA at texture 1024, 1M triangles and
+seed 42:
+- **oracle:** its 4 real views;
+- **single:** our prepared 0° object alone, FOV 20° (its real camera);
+- **generated multiview:** the same object plus our generated 90/180/270°
+  views posed with their requested cameras.
+
+| input | Chamfer RMS vs oracle | mean distance | normal agreement (abs cos) | Pixal3D time |
+|---|---|---|---|---|
+| single view | **0.0235** | 0.017 | 0.839 | 392 s |
+| 0° + generated 90/180/270° | 0.0632 | 0.045 | 0.762 | 381 s |
+
+The generated views make the mesh worse. Their outlines keep roughly the
+reference's width:
+- side views were 0.67–0.68 of the frame wide where the real renders are
+  0.92 (the head is deeper than it is wide), while heights matched;
+- posed as real cameras, they carve the depth to 0.72 instead of 0.99, and
+  the profile comes out flattened;
+- rewording the scale clause ("same camera distance", "reveal the full
+  depth") moved the side width only from 0.67 to 0.71.
+
+So `image-to-3d --reconstruct …` reconstructs from the prepared (optionally
+edited or cleaned) object in single view by default. `--recon-mode
+multiview` stays available for posed real photos, or for experiments once
+view generation keeps real proportions.
+
+### Native runner vs PyTorch reference
+
+`reconstruct --recon-mode single --recon-fov 20 --reconstruct both` on the
+same prepared head: 844 s wall.
+
+| runner | time | vertices / triangles | Chamfer RMS vs oracle |
+|---|---|---|---|
+| native (CUDA) | 398 s | 635,911 / 943,526 | 0.0235 |
+| PyTorch reference (CUDA, `--low_vram`) | 441 s | 663,441 / 970,348 | 0.0326 |
+
+- The two meshes differ from each other by Chamfer RMS 0.0253 (normal
+  agreement 0.863).
+- The native mesh repeated exactly across runs (same vertex and triangle
+  counts).
+- The oracle itself came from the native runner.
+
+### Edit, then reconstruct
+
+```sh
+$PY cuda/qimg21/runner.py image-to-3d \
+  --input ref/pixal3d/upstream/assets/mv_images/example/view00_azim000.png --keep-background \
+  --output tmp/i23d-head-edit --views 0 --steps 16 --seed 7 \
+  --edit "make the skin green and the nose ring silver" --reconstruct native --texture-size 1024
+```
+
+The run took 421 s wall:
+- the edit took 17.8 s and kept the shape;
+- MoGe-2 estimated a 23.4° FOV (the true value is 20°);
+- native Pixal3D took 371 s and produced a green head with a silver ring.
+
+`preprocess/object_edited.png` is the image that was reconstructed.
+`pipeline.json` records the edit, the camera and the mesh.
+
+ROCm (`--pixal3d-backend rocm` for either runner) is wired the way the demo
+server runs it. It is covered by command tests only: this machine has no
+AMD GPU.
+
 ## Performance and memory
 
 Measurements are at 512², 16 steps, `fast12` (INT8 weights + SageAttention),
@@ -315,6 +435,11 @@ took 262 s wall.
   scale, or consistency with the requested camera. `transforms.json` holds
   requested cameras, never calibration, and must not be used as ground
   truth.
+- **Generated views are not calibrated views.** Posed as cameras for
+  Pixal3D multiview, they made the mesh worse than the single input view
+  (see [the measurement](#single-view-vs-generated-views-measured)): the
+  model keeps outlines near the reference's width, so depth is
+  under-estimated.
 - **Approximate viewpoint control.** Front, rear, side profiles, the
   three-quarter views, the 20° ring, the top view and the bottom view
   follow the request. The evidence:
@@ -354,10 +479,12 @@ took 262 s wall.
 - Multi-reference conditioning in the native runner. `joint_layout.h`
   already handles N condition images, but the driver and text-encoder
   layout take one.
-- A geometry-aware stage for real consistency (e.g. camera-conditioned
-  multi-view diffusion, or reprojection checks with a depth model such as
-  MoGe, which is in `ref/pixal3d`). Its output can feed:
-  - Pixal3D posed multiview (`--views-dir`, as smoke-tested here);
+- Views that keep real proportions, which multiview reconstruction needs.
+  Options include camera-conditioned multi-view diffusion, or
+  re-rendering the single-view Pixal3D mesh as the "views" and then
+  refining their texture with Qwen-Image. The latter keeps geometry
+  consistent by construction. Such views can feed:
+  - Pixal3D posed multiview (`--recon-mode multiview`, measured above);
   - Gaussian-splatting or NeRF fitting from `transforms.json`, with the
     cameras refined by SfM or bundle adjustment first, since the requested
     cameras are only an initialization.
