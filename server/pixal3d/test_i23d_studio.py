@@ -46,9 +46,29 @@ class FakeRunner:
 
 
 class Backend(MockBackend):
+    """The mock image model; a wide request (a turnaround sheet) gets one
+    figure per square panel, as the real model draws it."""
+
     def __init__(self, log):
         super().__init__()
         self.log = log
+
+    def generate(self, request):
+        if request.width < 2 * request.height:
+            return super().generate(request)
+        import numpy as np
+        from qimg21_i23d import imageops
+        from qimg21_i23d.backends import GenResult
+        count = request.width // request.height
+        yy, xx = np.mgrid[0:request.height, 0:request.width]
+        sheet = np.zeros((request.height, request.width, 4), np.uint8)
+        for i in range(count):
+            cx, half = (i + 0.5) * request.height, (0.3 if i % 2 == 0 else 0.22) * request.height
+            sheet[((xx - cx) / half) ** 2 + ((yy - request.height / 2) / (0.4 * request.height)) ** 2 <= 1] = \
+                (230, 230, 240, 255)
+        imageops.save_png(sheet, request.out)
+        self.log.append(("sheet", request.width, request.height, request.prompt))
+        return GenResult(Path(request.out), 0.1, "mock", {})
 
     def close(self):
         self.log.append(("close",))
@@ -110,6 +130,22 @@ class StudioTest(unittest.TestCase):
         self.assertIsNone(undone["views"])      # views were of the undone image
         with self.assertRaises(StudioError):
             self.studio.undo(sid)
+
+    def test_turnaround_views_feed_multiview(self):
+        sid = self.run_stage(stage="text", prompt="a cute bunny", steps=2)["session"]
+        state = self.run_stage(stage="turnaround", session=sid, count=4, prompt="a cute bunny", steps=2)["state"]
+        sheet = next(e for e in self.log if e[0] == "sheet")
+        self.assertEqual(sheet[1:3], (2048, 512))
+        self.assertIn("turnaround reference sheet of a cute bunny", sheet[3])
+        views = state["views"]
+        self.assertEqual((views["kind"], views["azimuths"]), ("turnaround", [0.0, 90.0, 180.0, 270.0]))
+        self.assertEqual(views["of"], state["current"]["file"])     # the front panel is the object now
+        self.assertEqual(state["current"]["stage"], "turnaround")
+        self.assertTrue(views["sheet_url"].endswith("/sheet.png"))
+        self.run_stage(stage="reconstruct", session=sid, mode="multiview", fov=20)
+        self.assertEqual(self.log[-1], ("multiview", "native", 4))
+        with self.assertRaises(StudioError):
+            self.run_stage(stage="turnaround", session=sid, count=5)
 
     def test_multiview_needs_views_of_the_current_object(self):
         sid = self.run_stage(stage="text", prompt="a lamp", steps=2)["session"]

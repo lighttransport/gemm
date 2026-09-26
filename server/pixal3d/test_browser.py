@@ -163,6 +163,26 @@ def wait_for(cdp, expression, timeout=10):
     raise AssertionError(f"browser condition timed out: {expression}")
 
 
+class SheetMock(MockBackend):
+    """The mock image model; a wide request (a turnaround sheet) gets one
+    figure per square panel."""
+
+    def generate(self, request):
+        if request.width < 2 * request.height:
+            return super().generate(request)
+        import numpy as np
+        from qimg21_i23d import imageops
+        from qimg21_i23d.backends import GenResult
+        yy, xx = np.mgrid[0:request.height, 0:request.width]
+        sheet = np.zeros((request.height, request.width, 4), np.uint8)
+        for i in range(request.width // request.height):
+            cx, half = (i + 0.5) * request.height, 0.25 * request.height
+            sheet[((xx - cx) / half) ** 2 + ((yy - request.height / 2) / (0.4 * request.height)) ** 2 <= 1] = \
+                (230, 230, 240, 255)
+        imageops.save_png(sheet, request.out)
+        return GenResult(Path(request.out), 0.1, "mock", {})
+
+
 class FakeReconstruction:
     """A Pixal3D runner that writes a minimal GLB (JSON chunk only)."""
 
@@ -209,9 +229,19 @@ def studio_flow(cdp, server, pixal):
     cdp.evaluate("document.getElementById('st-undo').click()")
     wait_for(cdp, f"{count} === 1 && !document.getElementById('st-make').disabled")
     assert cdp.evaluate("document.getElementById('st-undo').disabled")    # nothing left to undo
-    cdp.evaluate("document.getElementById('st-count').value='4';document.getElementById('st-views').click()")
-    wait_for(cdp, "document.querySelectorAll('#st-views-strip figure').length === 4 && "
+    # A separate-view turntable, then a turnaround sheet (the default kind).
+    cdp.evaluate("{const k=document.getElementById('st-view-kind');k.value='views';k.onchange();"
+                 "document.getElementById('st-count').value='3';document.getElementById('st-views').click()}")
+    wait_for(cdp, "document.querySelectorAll('#st-views-strip figure').length === 3 && "
                   "!document.getElementById('st-views').disabled")
+    assert cdp.evaluate("document.getElementById('st-sheet').hidden")
+    cdp.evaluate("{const k=document.getElementById('st-view-kind');k.value='turnaround';k.onchange();"
+                 "document.getElementById('st-views').click()}")
+    wait_for(cdp, "document.querySelectorAll('#st-views-strip figure').length === 4 && "
+                  "!document.getElementById('st-sheet').hidden && !document.getElementById('st-views').disabled")
+    assert cdp.evaluate("document.getElementById('st-mode').value") == "multiview"
+    assert cdp.evaluate(f"{count}") == 2          # the front panel became the current object
+    cdp.evaluate("document.getElementById('st-mode').value='single'")
     cdp.evaluate("document.getElementById('st-runner').value='both';document.getElementById('st-fov').value='20';"
                  "document.getElementById('st-build').click()")
     wait_for(cdp, "!document.getElementById('st-model-panel').hidden && "
@@ -233,7 +263,7 @@ def main():
     scratch.mkdir(parents=True, exist_ok=True)
     pixal.work_dir = scratch
     shutil.rmtree(scratch / "i23d", ignore_errors=True)
-    pixal.i23d = Studio(scratch / "i23d", backend_factory=MockBackend,
+    pixal.i23d = Studio(scratch / "i23d", backend_factory=SheetMock,
                         runner_factory=lambda name, settings: FakeReconstruction(name))
     i23d_reconstruct.compare_meshes = lambda a, b, work, samples=50000: {"symmetric_chamfer_rms": 0.0123}
     server.uploads = app.UploadStore(scratch / "uploads", retained=16)

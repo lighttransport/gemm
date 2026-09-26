@@ -545,6 +545,70 @@ class ReconstructTest(Tmp):
         self.assertIn("cuda or rocm", err.getvalue())
 
 
+def sheet_image(widths, height=400, gap=60, pad=40):
+    """A transparent one-row sheet of ellipses of the given widths."""
+    total = pad * 2 + sum(widths) + gap * (len(widths) - 1)
+    rgba = np.zeros((512, total, 4), np.uint8)
+    yy, xx = np.mgrid[0:512, 0:total]
+    x = pad
+    for w in widths:
+        inside = ((xx - (x + w / 2)) / (w / 2)) ** 2 + ((yy - 256) / (height / 2)) ** 2 <= 1
+        rgba[inside] = (200, 60, 90, 255)
+        x += w + gap
+    return rgba
+
+
+class SheetBackend(MockBackend):
+    """Draws a turnaround sheet: one figure per view, the profile narrower."""
+
+    def generate(self, request):
+        from qimg21_i23d.backends import GenResult
+        count = request.width // request.height
+        widths = [200, 150, 200, 150][:count]
+        sheet = sheet_image(widths)
+        sheet = imageops.resize_rgba(sheet, request.width, request.height)
+        imageops.save_png(sheet, request.out)
+        self.requests = getattr(self, "requests", []) + [request]
+        return GenResult(Path(request.out), 0.1, "mock", {})
+
+
+class TurnaroundTest(Tmp):
+    def test_split_keeps_one_scale_and_ground_line(self):
+        views, boxes = imageops.split_sheet(sheet_image([200, 120, 200, 120]), 4, size=256)
+        self.assertEqual(len(views), 4)
+        widths = [imageops.alpha_bbox(v)[2] - imageops.alpha_bbox(v)[0] for v in views]
+        heights = [imageops.alpha_bbox(v)[3] - imageops.alpha_bbox(v)[1] for v in views]
+        bottoms = [imageops.alpha_bbox(v)[3] for v in views]
+        self.assertAlmostEqual(widths[1] / widths[0], 120 / 200, delta=0.03)   # relative size kept
+        self.assertLessEqual(max(heights) - min(heights), 2)
+        self.assertLessEqual(max(bottoms) - min(bottoms), 2)
+        self.assertAlmostEqual(max(heights) / 256, 0.85, delta=0.02)
+        with self.assertRaisesRegex(imageops.MaskError, "3 separate figures"):
+            imageops.split_sheet(sheet_image([200, 120, 200]), 4)
+
+    def test_turnaround_dataset(self):
+        backend = SheetBackend()
+        root = self.dir / "turn"
+        summary = ops.generate_turnaround(root, backend, prompt="a cute bunny", views=4, size=256, steps=2)
+        request = backend.requests[0]
+        self.assertEqual((request.width, request.height), (1024, 256))
+        self.assertIn("turnaround reference sheet of a cute bunny", request.prompt)
+        self.assertIn("(4) side view with the character facing right", request.prompt)
+        self.assertEqual([v["azimuth_deg"] for v in summary["views"]], [0.0, 90.0, 180.0, 270.0])
+        transforms = json.loads((root / "transforms.json").read_text())
+        self.assertEqual(transforms["frames"][0]["file_path"], "views/view_a000.png")
+        self.assertEqual(summary["validation"]["passed"], 4)
+        from qimg21_i23d import reconstruct
+        frames = reconstruct.select_frames(transforms)
+        self.assertEqual([f["file_path"] for f in frames],
+                         [f"views/view_a{a:03d}.png" for a in (0, 90, 180, 270)])
+        three = ops.generate_turnaround(self.dir / "three", SheetBackend(), reference=self.write("ref.png",
+                                        object_image(256, 256)), views=3, size=256, steps=2)
+        self.assertEqual(len(three["views"]), 3)
+        with self.assertRaises(ValueError):
+            ops.generate_turnaround(self.dir / "x", SheetBackend(), views=4)
+
+
 class ValidationTest(Tmp):
     def test_broken_images_are_reported(self):
         good = object_image(256, 256)

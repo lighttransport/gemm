@@ -400,6 +400,77 @@ def generate_turntable(references, root, backend: Backend, *, views: int = 24, e
     return generate_multiview(references, specs, root, backend, params, layout="flat", **options)
 
 
+TURNAROUND_VIEWS = {
+    4: ((0.0, "front view facing the viewer"), (90.0, "side view with the character facing left"),
+        (180.0, "back view"), (270.0, "side view with the character facing right")),
+    3: ((0.0, "front view facing the viewer"), (90.0, "side view with the character facing left"),
+        (180.0, "back view")),
+}
+TURNAROUND_TEMPLATE = (
+    "Character turnaround reference sheet of {subject}. {count} views of the same character side by side in one "
+    "row, evenly spaced, same size, same height and same ground line, orthographic, no overlap: from left to "
+    "right, {order}. Consistent proportions and details in every view. No text, no labels. {background}")
+
+
+def turnaround_prompt(subject: str, views: int = 4, background: str = "transparent") -> str:
+    order = ", ".join(f"({i + 1}) {words}" for i, (_, words) in enumerate(TURNAROUND_VIEWS[views]))
+    return " ".join(TURNAROUND_TEMPLATE.format(subject=subject, count=views, order=order,
+                                               background=viewlib.BACKGROUND_CLAUSES[background]).split())
+
+
+def generate_turnaround(root, backend: Backend, *, prompt: str | None = None, reference=None, views: int = 4,
+                        size: int = 512, fill: float = 0.85, steps: int = 20, seed: int = 0,
+                        negative_prompt: str | None = None) -> dict:
+    """Consistent posed views of a character from ONE turnaround sheet.
+
+    Views generated one by one (generate_views) drift: each is a separate
+    sample. A turnaround sheet -- front, left profile, back (and right
+    profile) side by side in one image -- is one sample, so the character,
+    its proportions and details agree across views far better. The sheet is
+    drawn at size x (views * size) on a transparent background, from `prompt`
+    (text) and/or a `reference` image of the character, split into views
+    with one shared scale and ground line (imageops.split_sheet) and written
+    as a dataset: views/view_aNNN.png, sheet.png, metadata.json,
+    transforms.json (front view first; cameras requested, not calibrated),
+    validation.json."""
+    if views not in TURNAROUND_VIEWS:
+        raise ValueError(f"views must be one of {sorted(TURNAROUND_VIEWS)}")
+    if not prompt and reference is None:
+        raise ValueError("a turnaround needs a prompt, a reference image, or both")
+    root = Path(root)
+    (root / "views").mkdir(parents=True, exist_ok=True)
+    subject = prompt or "the character in the reference image"
+    if reference is not None:
+        subject += (", exactly as in the reference image: the same identity, shapes, colors, materials and "
+                    "details")
+    text = turnaround_prompt(subject, views)
+    started = time.perf_counter()
+    result = backend.generate(GenRequest(prompt=text, out=root / "sheet.png", width=size * views, height=size,
+                                         steps=steps, seed=seed, references=(Path(reference),) if reference else (),
+                                         negative_prompt=negative_prompt))
+    panels, boxes = imageops.split_sheet(imageops.load_rgba(root / "sheet.png"), views, size=size, fill=fill)
+    frames, files, records = [], [], []
+    for (azimuth, words), panel, box in zip(TURNAROUND_VIEWS[views], panels, boxes):
+        spec = viewlib.ViewSpec(azimuth_deg=azimuth, width=size, height=size, tags={"turnaround": True}).validated()
+        name = f"views/view_a{int(azimuth):03d}.png"
+        imageops.save_png(panel, root / name)
+        frames.append((name, spec))
+        files.append(name)
+        records.append({"file": name, "azimuth_deg": azimuth, "elevation_deg": 0.0, "sheet_box": list(box),
+                        "view": words})
+    writer = DatasetWriter(root, layout="flat")
+    writer.write_transforms(frames)
+    report = validate_dataset(root, files, width=size, height=size, expect_alpha=True)
+    summary = {"root": str(root), "views": records, "prompt": text, "seed": seed, "steps": steps,
+               "reference": str(reference) if reference else None, "sheet": "sheet.png",
+               "seconds": round(time.perf_counter() - started, 3), "backend": result.backend,
+               "validation": report["summary"],
+               "camera_parameters": "requested view metadata, not calibration: panels of one generated "
+                                    "turnaround sheet, framed with one shared scale and ground line"}
+    (root / "metadata.json").write_text(json.dumps(summary, indent=2, default=str) + "\n")
+    return summary
+
+
 def generate_image_to_3d_dataset(image, root, backend: Backend, *, azimuth_views: int = 24,
                                  elevations=(0.0,), width: int = 512, height: int = 512,
                                  extract: str | None = "qwen", pixels: str = "original", fill: float = 0.85,

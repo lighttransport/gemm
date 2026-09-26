@@ -204,23 +204,31 @@ Pixal3D into one guided workflow for a single object:
      blending; outside, pixel paste-back, so the rest of the object is kept
      exactly.
    - A strength below 1 edits by SDEdit from the current pixels.
-3. **Views** (optional). A turntable of the current object, shown as 2D
-   previews.
+3. **Views** (optional). Either:
+   - a **turnaround sheet** (the default): front / left / back (/ right) of
+     the current object as a character, drawn in one image, which keeps it
+     consistent. Its front view becomes the current object, and step 4
+     switches to posed multiview;
+   - a **turntable**: separately generated views, which drift from each
+     other, so they are previews only.
 4. **3D.** Pixal3D builds a textured GLB:
    - runner: native CUDA, the PyTorch reference, or both (the meshes are
      compared by Chamfer);
-   - input: the current object in single view (the default and recommended
-     choice), or the object plus the generated views, posed;
+   - input: the current object in single view, or the object plus its
+     views, posed (use this after a turnaround);
    - camera FOV: from MoGe-2, or given.
 
 "Text → 3D in one go" runs steps 1 and 4 back to back. `?session=<id>` in
 the URL reopens a session, and the last one is remembered in the browser.
 
-Single view is recommended because it measured better. On Pixal3D's posed
-example, the generated-views input scored Chamfer RMS 0.063 against a
-reconstruction from real views, and single view scored 0.024. Generated side
-views keep the reference's outline width, so they under-state depth. See
-`cuda/qimg21/IMAGE_TO_3D.md`.
+Which input to use depends on how the views were made:
+- **Separately generated views:** single view is better. On Pixal3D's posed
+  example, posed turntable views scored Chamfer RMS 0.063 against a
+  reconstruction from real views, and single view scored 0.024.
+- **Turnaround sheet views:** posed multiview gave a clean character (a
+  bunny), while single view left stray floating geometry.
+
+See `cuda/qimg21/IMAGE_TO_3D.md`.
 
 Measured on this RTX 5060 Ti (512², 16 steps, INT8 `fast12`):
 
@@ -254,6 +262,7 @@ The stages and their fields:
 | `upload` | `image_upload` (from `POST /v1/uploads`) or `image_b64`, `method` (`qwen`/`rmbg`/`alpha`) |
 | `edit` | `instruction`, `strength` (0.05–1), `rect` `[x, y, w, h]` in object pixels, `feather` |
 | `views` | `count` (2–24), `elevation` |
+| `turnaround` | `count` (3 or 4), `prompt` (optional character description), `steps`, `seed` |
 | `reconstruct` | `runner` (`native`/`reference`/`both`), `mode` (`single`/`multiview`), `fov` (degrees; omitted means MoGe-2), `texture_size`, `triangle_target`, `seed` |
 
 Other session routes:

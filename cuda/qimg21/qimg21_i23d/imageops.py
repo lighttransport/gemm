@@ -227,3 +227,49 @@ def snap_size(width: int, height: int, area: int | None = None, multiple: int = 
         width, height = w, w / ratio
     return (max(256, int(round(width / multiple)) * multiple),
             max(256, int(round(height / multiple)) * multiple))
+
+
+def split_sheet(rgba: np.ndarray, count: int, *, size: int = 512, fill: float = 0.85, min_gap: int = 8,
+                threshold: int = 16) -> tuple[list[np.ndarray], list[tuple]]:
+    """Split a one-row sheet of `count` views of one object (a turnaround
+    sheet on a transparent background) into square RGBA views.
+
+    Views are the runs of columns holding foreground, gaps narrower than
+    min_gap merged. All views get ONE scale (the largest view's longest side
+    fills `fill` of the canvas) and one ground line, so relative sizes -- a
+    profile being wider or narrower than the front -- survive; each is
+    centred horizontally. Returns the views and their sheet boxes
+    (x0, y0, x1, y1)."""
+    alpha = rgba[..., 3] > threshold
+    columns = np.append(alpha.any(axis=0), False)
+    runs, start = [], None
+    for x, occupied in enumerate(columns):
+        if occupied and start is None:
+            start = x
+        elif not occupied and start is not None:
+            if runs and start - runs[-1][1] < min_gap:
+                runs[-1][1] = x
+            else:
+                runs.append([start, x])
+            start = None
+    width = alpha.shape[1]
+    runs = [r for r in runs if r[1] - r[0] >= max(8, width // (count * 12))]
+    if len(runs) != count:
+        raise MaskError(f"the sheet holds {len(runs)} separate figures, not {count}; regenerate it (another seed) "
+                        "or check that its background is transparent")
+    boxes = []
+    for x0, x1 in runs:
+        ys = np.nonzero(alpha[:, x0:x1].any(axis=1))[0]
+        boxes.append((x0, int(ys.min()), x1, int(ys.max()) + 1))
+    tallest = max(b[3] - b[1] for b in boxes)
+    widest = max(b[2] - b[0] for b in boxes)
+    scale = fill * size / max(tallest, widest)
+    ground = (size + scale * tallest) / 2
+    views = []
+    for x0, y0, x1, y1 in boxes:
+        w, h = max(1, round((x1 - x0) * scale)), max(1, round((y1 - y0) * scale))
+        canvas = np.zeros((size, size, 4), np.uint8)
+        left, top = (size - w) // 2, max(0, round(ground - h))
+        canvas[top:top + h, left:left + w] = resize_rgba(rgba[y0:y1, x0:x1], w, h)[:size - top]
+        views.append(canvas)
+    return views, boxes

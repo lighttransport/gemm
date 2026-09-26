@@ -60,6 +60,7 @@ reference counts).
 | `turntable` | N evenly spaced azimuths at one elevation, flat `images/NNN.png` layout. |
 | `image-to-3d` | the whole chain: extract → normalize → optional `--cleanup` → optional `--edit` (with `--mask*`) → views → validate → export → optional `--reconstruct native\|reference\|both`. `--keep-background` skips extraction for an already clean RGBA. |
 | `reconstruct` | a view dataset (multiview) or an RGBA object (single view) → `<runner>.glb` and `reconstruction.json` with Pixal3D. |
+| `turnaround` | a character's front / left / back (/ right) views from **one turnaround sheet** (`--prompt` and/or `--input` reference) → posed dataset; `--reconstruct native` builds the GLB from those views (multiview). See [Characters](#characters-turnaround-sheets). |
 | `validate DIR` | re-run the 2D validation of a dataset and rewrite `validation.json`. |
 
 Shared options: `--backend auto|native|torch|mock`, `--steps` (20),
@@ -302,6 +303,53 @@ edited or cleaned) object in single view by default. `--recon-mode
 multiview` stays available for posed real photos, or for experiments once
 view generation keeps real proportions.
 
+### Characters: turnaround sheets
+
+Views generated one at a time are separate samples, and they drift. The
+"back" of a character may still show blushing cheeks, and proportions
+change between views. A **turnaround sheet** is one sample, so it is
+consistent: Qwen-Image 2.1 draws front, left profile, back and right
+profile side by side in one transparent `4·512 × 512` image, and
+`imageops.split_sheet` cuts it into posed views.
+- The cut follows the empty columns between the figures.
+- All views share one scale and one ground line, so a profile keeps its
+  true width relative to the front.
+- Each view is centred horizontally.
+
+```sh
+$PY cuda/qimg21/runner.py turnaround --output tmp/bunny --views 4 --steps 20 --seed 12 \
+  --prompt "a cute chibi bunny character: big head, long upright ears, round fluffy body, short arms and \
+legs, soft white fur with pastel pink inner ears, a small pink scarf, big friendly eyes, 3D toy figure style, \
+standing upright in a neutral pose with arms slightly away from the body" --reconstruct native --texture-size 2048
+```
+
+On that bunny, the sheet took 25–48 s per seed and gave four views of the
+same character:
+- the profiles face the correct directions (left profile = 90°);
+- the tail shows on the back and on the sides;
+- the four views are 433–435 px tall.
+
+A separate-view turntable of the same prompt was visibly less consistent
+(a face-like back, a thinner body).
+
+Native Pixal3D multiview from the 4 sheet views took 233 s (654k
+vertices). The mesh is clean: the face, a scarf that wraps around, the
+tail, and ears and profile that match the sheet. Single view from the front
+panel alone took 242 s and had stray floating planes around the model and a
+vaguer back.
+
+So the conclusion depends on how the views were made:
+- generated **one at a time**, views should not be posed (single view is
+  better; see the head above);
+- a **turnaround sheet's** views should, since they are consistent and
+  share one scale.
+
+`turnaround` therefore reconstructs in multiview by default. With
+`--input` the sheet is conditioned on a reference image of the character;
+that path is covered by tests but has not been measured. Generating a
+sheet wider than 1024 px also needed a driver fix: the default VAE decode
+tile is now clamped to the short side.
+
 ### Native runner vs PyTorch reference
 
 `reconstruct --recon-mode single --recon-fov 20 --reconstruct both` on the
@@ -435,11 +483,14 @@ took 262 s wall.
   scale, or consistency with the requested camera. `transforms.json` holds
   requested cameras, never calibration, and must not be used as ground
   truth.
-- **Generated views are not calibrated views.** Posed as cameras for
-  Pixal3D multiview, they made the mesh worse than the single input view
-  (see [the measurement](#single-view-vs-generated-views-measured)): the
-  model keeps outlines near the reference's width, so depth is
-  under-estimated.
+- **Generated views are not calibrated views.**
+  - Views generated one at a time, posed as cameras for Pixal3D multiview,
+    made the mesh worse than the single input view (see [the
+    measurement](#single-view-vs-generated-views-measured)): the model keeps
+    outlines near the reference's width.
+  - A turnaround sheet's views are consistent enough to help for a
+    character. That result is visual, on one character, with no oracle to
+    measure against.
 - **Approximate viewpoint control.** Front, rear, side profiles, the
   three-quarter views, the 20° ring, the top view and the bottom view
   follow the request. The evidence:

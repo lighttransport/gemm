@@ -25,7 +25,7 @@ button{background:var(--accent);border:0;color:#06271f;font-weight:800;cursor:po
 .st-canvas.selecting{cursor:crosshair}.st-progress{height:4px;background:#18232a;border-radius:3px;margin-top:6px;overflow:hidden}#st-bar{height:100%;width:0;background:var(--accent);transition:width .4s}
 .st-strip{display:flex;gap:8px;overflow-x:auto;margin-top:12px;padding-bottom:4px}.st-strip figure{margin:0;flex:0 0 96px;background:#0a1115;border:1px solid var(--line);border-radius:8px;overflow:hidden}.st-strip figure.now{border-color:var(--accent)}
 .st-strip img{display:block;width:96px;height:96px;object-fit:contain;background:repeating-conic-gradient(#10181d 0 25%,#0c1317 0 50%) 0 0/12px 12px}.st-strip figcaption{font-size:10px;color:var(--muted);padding:4px 5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.studio .models model-viewer{height:440px}.studio [hidden]{display:none!important}.studio .models.one{grid-template-columns:1fr}
+.studio .models model-viewer{height:440px}.st-sheet{display:block;width:100%;border-radius:8px;background:repeating-conic-gradient(#10181d 0 25%,#0c1317 0 50%) 0 0/12px 12px}.studio [hidden]{display:none!important}.studio .models.one{grid-template-columns:1fr}
 @media(max-width:900px){.studio{grid-template-columns:1fr}}
 </style>
 </head>
@@ -51,16 +51,19 @@ button{background:var(--accent);border:0;color:#06271f;font-weight:800;cursor:po
 <p class="hint">Strength 1 edits through image conditioning; lower values stay closer to the current pixels. A box is enforced: outside it the object is kept pixel for pixel.</p>
 <div class="actions st-actions"><button type="button" class="run" id="st-apply">Apply edit</button><button type="button" class="ghost" id="st-undo">Undo</button></div></div>
 
-<div class="panel"><h2>3 · Views <span class="opt">optional preview</span></h2>
-<div class="grid2"><div><label for="st-count">Views</label><input id="st-count" type="number" min="2" max="24" value="8"></div><div><label for="st-elev">Elevation °</label><input id="st-elev" type="number" min="-60" max="60" value="0"></div></div>
-<p class="hint">A turntable of the current object from Qwen-Image 2.1. These are 2D previews: their cameras are requested, not calibrated.</p>
+<div class="panel"><h2>3 · Views <span class="opt">optional</span></h2>
+<label for="st-view-kind">Kind</label><select id="st-view-kind"><option value="turnaround">Turnaround sheet: front / left / back / right in one image (characters)</option><option value="views">Turntable: each view generated separately</option></select>
+<div id="st-turn-pane"><div class="grid2"><div><label for="st-turn-count">Views</label><select id="st-turn-count"><option value="4">4: front, left, back, right</option><option value="3">3: front, left, back</option></select></div><div><label for="st-turn-prompt">Character (optional)</label><input id="st-turn-prompt" placeholder="defaults to the reference image"></div></div>
+<p class="hint">One sheet keeps the character, its proportions and details consistent across views; its front view becomes the current object and the views can feed posed multiview reconstruction.</p></div>
+<div id="st-turntable-pane" hidden><div class="grid2"><div><label for="st-count">Views</label><input id="st-count" type="number" min="2" max="24" value="8"></div><div><label for="st-elev">Elevation °</label><input id="st-elev" type="number" min="-60" max="60" value="0"></div></div>
+<p class="hint">Separate samples per view: good previews, but they drift from each other; use single-view reconstruction with them.</p></div>
 <div class="actions st-actions"><button type="button" class="run" id="st-views">Generate views</button></div></div>
 
 <div class="panel"><h2>4 · 3D with Pixal3D</h2>
 <div class="grid2"><div><label for="st-runner">Runner</label><select id="st-runner"><option value="native">Native CUDA runner</option><option value="reference">PyTorch reference</option><option value="both">Both, compared</option></select></div>
-<div><label for="st-mode">Input</label><select id="st-mode"><option value="single">Current object, single view (recommended)</option><option value="multiview">Object + generated views, posed</option></select></div></div>
+<div><label for="st-mode">Input</label><select id="st-mode"><option value="single">Current object, single view (recommended)</option><option value="multiview">Object + views, posed (use with a turnaround)</option></select></div></div>
 <div class="grid3"><div><label for="st-fov">FOV °</label><input id="st-fov" type="number" min="5" max="120" placeholder="auto (MoGe-2)"></div><div><label for="st-texture">Texture</label><select id="st-texture"><option>1024</option><option selected>2048</option><option>4096</option></select></div><div><label for="st-tris">Triangles</label><input id="st-tris" type="number" min="10000" max="5000000" step="10000" value="1000000"></div></div>
-<p class="hint">Single view from the current (possibly edited) object measured clearly better than posing generated views (Chamfer 0.024 vs 0.063 against real views), because generated side views do not keep the object's true depth.</p>
+<p class="hint">Single view is the safe default: separately generated views measured worse than the object alone (Chamfer 0.063 vs 0.024 against real views) because they drift. A turnaround sheet's views are consistent, so they can go to Pixal3D posed.</p>
 <div class="actions st-actions"><button type="button" class="run" id="st-build">Build 3D model</button><button type="button" class="cancel" id="st-cancel" hidden>Cancel</button></div></div>
 </div>
 
@@ -69,7 +72,7 @@ button{background:var(--accent);border:0;color:#06271f;font-weight:800;cursor:po
 <div class="st-canvas" id="st-canvas"><img id="st-current" alt="Current object"><div id="st-box" hidden></div><div id="st-empty">No object yet — generate one from text or a photo.</div></div>
 <div id="st-status" class="status"></div><div class="st-progress"><div id="st-bar"></div></div>
 <div id="st-history" class="st-strip"></div></div>
-<div class="panel" id="st-views-panel" hidden><h2>Views</h2><div id="st-views-strip" class="st-strip"></div></div>
+<div class="panel" id="st-views-panel" hidden><h2 id="st-views-title">Views</h2><img id="st-sheet" class="st-sheet" alt="Turnaround sheet" hidden><div id="st-views-strip" class="st-strip"></div></div>
 <div class="panel" id="st-model-panel" hidden><h2>3D model</h2>
 <div id="st-models" class="models"></div><div id="st-stats" class="stats"></div></div>
 </div>
@@ -205,7 +208,7 @@ function render(st){
   $('st-empty').hidden=!!cur;$('st-current').hidden=!cur;if(cur)$('st-current').src=cur.url;
   $('st-history').replaceChildren(...st.history.map((h,i)=>figure(h.url,(i+1)+'. '+h.stage+': '+h.label,i===st.history.length-1)));
   $('st-undo').disabled=S.busy||st.history.length<2;
-  const v=st.views;$('st-views-panel').hidden=!v;
+  const v=st.views;$('st-views-panel').hidden=!v;$('st-sheet').hidden=!v?.sheet_url;if(v?.sheet_url)$('st-sheet').src=v.sheet_url;$('st-views-title').textContent=v?.kind==='turnaround'?'Turnaround views':'Views';
   if(v)$('st-views-strip').replaceChildren(...v.urls.map((u,i)=>figure(u,Math.round(v.azimuths[i])+'° az · '+v.elevation+'° el')));
   const m=st.models[st.models.length-1];$('st-model-panel').hidden=!m;
   if(m){
@@ -231,7 +234,12 @@ $('st-make').onclick=()=>act(S.source==='text'?'Generating the object':'Extracti
 $('st-oneclick').onclick=()=>act('Text → 3D',async()=>{const r=await makeObject();render(r.state);status('Object ready · building the 3D model…');return stage(buildBody())});
 $('st-apply').onclick=()=>act('Editing',()=>{const instruction=$('st-edit').value.trim();if(!instruction)throw new Error('Write an edit instruction');const body={stage:'edit',instruction,strength:Number($('st-strength').value),...common()};if($('st-region').checked){if(!S.box)throw new Error('Drag a box on the object, or untick "Only inside a box"');body.rect=S.box}return stage(body)});
 $('st-undo').onclick=()=>act('Undo',async()=>({state:await json('/v1/i23d/sessions/'+S.sid+'/undo',{method:'POST'})}));
-$('st-views').onclick=()=>act('Generating views',()=>stage({stage:'views',count:Number($('st-count').value),elevation:Number($('st-elev').value),...common()}));
+$('st-view-kind').onchange=()=>{const t=$('st-view-kind').value==='turnaround';$('st-turn-pane').hidden=!t;$('st-turntable-pane').hidden=t;$('st-views').textContent=t?'Generate turnaround':'Generate views'};
+$('st-views').onclick=()=>{const turn=$('st-view-kind').value==='turnaround';act(turn?'Generating the turnaround':'Generating views',async()=>{
+  if(!turn)return stage({stage:'views',count:Number($('st-count').value),elevation:Number($('st-elev').value),...common()});
+  const r=await stage({stage:'turnaround',count:Number($('st-turn-count').value),prompt:$('st-turn-prompt').value.trim(),...common()});
+  $('st-mode').value='multiview';return r})};
+$('st-view-kind').onchange();
 $('st-build').onclick=()=>act('Building the 3D model',()=>stage(buildBody()));
 $('st-cancel').onclick=async()=>{if(S.job){status('Cancelling…');await fetch('/v1/jobs/'+S.job,{method:'DELETE'})}};
 $('st-strength').oninput=()=>{$('st-strength-out').textContent=Number($('st-strength').value).toFixed(2)};

@@ -517,7 +517,8 @@ def main() -> int:
         if args.base_steps is not None and args.base_steps < 1:
             ap.error("--base-steps must be at least 1")
     if args.vae_tile is None:
-        args.vae_tile = 48 if max(h_tokens, w_tokens) > 64 else 0
+        # Square tiles no larger than the short side (a 2048x512 sheet is 128x32 tokens).
+        args.vae_tile = min(48, h_tokens, w_tokens) if max(h_tokens, w_tokens) > 64 else 0
     if args.vae_tile and not 1 <= args.vae_tile <= min(h_tokens, w_tokens):
         ap.error(f"--vae-tile must be in [1, {min(h_tokens, w_tokens)}] for this output size")
     if args.vae_tile and args.vae_tile_bleed > args.vae_tile_overlap // 2:

@@ -219,6 +219,23 @@ def cmd_image_to_3d(args):
         recon_max_frames=args.recon_max_frames)
 
 
+def cmd_turnaround(args):
+    runners = make_reconstructors(args)
+    if not args.prompt and not args.input:
+        raise SystemExit("give --prompt, --input (a reference image of the character), or both")
+    backend = make_backend(args, 1 if args.input else 0)
+    summary = ops.generate_turnaround(args.output, backend, prompt=args.prompt, reference=args.input,
+                                      views=args.views, size=args.size, steps=args.steps, seed=args.seed)
+    if runners:
+        backend.close()
+        mode = args.recon_mode if args.recon_mode_given else "multiview"
+        source = Path(args.output) if mode == "multiview" else Path(args.output) / summary["views"][0]["file"]
+        summary["reconstruction"] = ops.reconstruct_3d(source, Path(args.output) / "reconstruction", runners,
+                                                       mode=mode, fov_deg=args.recon_fov if mode == "single"
+                                                       else None)
+    return summary
+
+
 def cmd_reconstruct(args):
     runners = make_reconstructors(args)
     if not runners:
@@ -354,6 +371,18 @@ def build_parser() -> argparse.ArgumentParser:
     add_backend_options(p)
     add_reconstruct_options(p, "none")
     p.set_defaults(run=cmd_image_to_3d)
+
+    p = sub.add_parser("turnaround", help="a character's consistent front/side/back views from one "
+                                          "turnaround sheet -> posed dataset (-> GLB)")
+    p.add_argument("--prompt", help="the character, e.g. 'a cute chibi bunny with a pink scarf'")
+    p.add_argument("--input", help="a reference image of the character (with or without --prompt)")
+    p.add_argument("--output", required=True, help="dataset directory")
+    p.add_argument("--views", type=int, default=4, choices=(3, 4),
+                   help="4: front, left, back, right; 3: front, left, back")
+    p.add_argument("--size", type=int, default=512, help="view size in pixels (the sheet is size x views*size)")
+    add_backend_options(p)
+    add_reconstruct_options(p, "none")
+    p.set_defaults(run=cmd_turnaround)
 
     p = sub.add_parser("reconstruct", help="an RGBA object or a view dataset -> GLB with Pixal3D")
     p.add_argument("--input", required=True, help="a dataset directory (multiview) or an RGBA PNG (single)")

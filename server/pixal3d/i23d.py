@@ -19,6 +19,11 @@ never share the GPU with Pixal3D or the Qwen tab):
                  limited to a rectangle (latent blending + pixel paste-back)
     views        a turntable of the current object (2D preview; posed
                  multiview reconstruction input)
+    turnaround   a character turnaround sheet (front / left / back [/ right])
+                 of the current object in ONE image, split into consistently
+                 framed posed views; its front panel becomes the current
+                 object. Far more consistent than separate views, so it is
+                 the view set to use for multiview reconstruction
     reconstruct  Pixal3D native runner and/or PyTorch reference -> GLB; single
                  view from the current object by default (measurably better
                  than posing generated views, see cuda/qimg21/IMAGE_TO_3D.md)
@@ -47,7 +52,7 @@ from qimg21_i23d.backends import GenRequest  # noqa: E402
 SIZE = 512
 OBJECT_CLAUSE = ("A single complete object, centered, fully inside the frame, on its own, with nothing else in "
                  "the scene. Neutral studio lighting.")
-STAGES = ("text", "upload", "edit", "views", "reconstruct")
+STAGES = ("text", "upload", "edit", "views", "turnaround", "reconstruct")
 SESSION_ID = re.compile(r"[0-9a-f]{32}")
 SERVED = (".png", ".glb", ".json", ".log")
 
@@ -169,6 +174,8 @@ class Studio:
                 step["raw_url"] = base + step["raw"]
         if out.get("views"):
             out["views"]["urls"] = [base + f for f in out["views"]["files"]]
+            if out["views"].get("sheet"):
+                out["views"]["sheet_url"] = base + out["views"]["sheet"]
         for model in out["models"]:
             for run in model["runs"]:
                 run["url"] = base + run["file"]
@@ -220,7 +227,7 @@ class Studio:
             if stage not in ("text", "upload"):
                 raise StudioError("this stage needs a session with an object")
             record = self._load(self.create()["id"])
-        if stage in ("edit", "views", "reconstruct") and not record["history"]:
+        if stage in ("edit", "views", "turnaround", "reconstruct") and not record["history"]:
             raise StudioError("the session has no object yet; run text or upload first")
 
         def report(phase, percent):
@@ -238,7 +245,7 @@ class Studio:
             details["seconds"] = round(time.perf_counter() - started, 3)
             if len(record["history"]) > before:
                 record["history"][-1]["seconds"] = details["seconds"]
-            if stage == "views":
+            if stage in ("views", "turnaround"):
                 record["views"]["seconds"] = details["seconds"]
             with self.lock:
                 state = self._save(record)
@@ -358,6 +365,32 @@ class Studio:
                            "validation": summary.get("validation")}
         return {"count": count, "elevation": elevation, "seconds_per_view":
                 round(sum(v["seconds"] for v in meta["views"]) / max(1, len(meta["views"])), 3)}
+
+    def _turnaround(self, record, request, report):
+        count = _int(request, "count", 4, 3, 4)
+        steps, seed = _int(request, "steps", 20, 1, 50), _int(request, "seed", 0, 0, 2**31 - 1)
+        subject = _text(request, "prompt", required=False) or None
+        current = record["history"][-1]
+        root = self.root / record["id"] / "views" / f"turnaround_{len(record['history']):03d}"
+        shutil.rmtree(root, ignore_errors=True)
+        report("Qwen-Image 2.1: turnaround sheet", 10)
+        try:
+            summary = ops.generate_turnaround(root, self.backend(), prompt=subject,
+                                              reference=self.root / record["id"] / current["file"], views=count,
+                                              size=SIZE, steps=steps, seed=seed)
+        except imageops.MaskError as exc:
+            raise StudioError(str(exc)) from None
+        report("framing the views", 90)
+        base = root.relative_to(self.root / record["id"]).as_posix()
+        name, path = self._next_image(record)
+        shutil.copyfile(root / summary["views"][0]["file"], path)
+        self._push(record, name, "turnaround", f"turnaround ({count} views)", {},
+                   raw=f"{base}/sheet.png")
+        record["views"] = {"of": name, "dir": base, "count": count, "elevation": 0.0, "kind": "turnaround",
+                           "files": [f"{base}/{v['file']}" for v in summary["views"]],
+                           "azimuths": [v["azimuth_deg"] for v in summary["views"]],
+                           "sheet": f"{base}/sheet.png", "validation": summary.get("validation")}
+        return {"count": count, "views": [v["view"] for v in summary["views"]]}
 
     def _reconstruct(self, record, request, report):
         which = request.get("runner", "native")
