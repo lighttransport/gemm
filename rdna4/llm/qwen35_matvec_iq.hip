@@ -1073,6 +1073,118 @@ __device__ __forceinline__ void qwen35_matvec_iq_fixed8_compact(
     }
 }
 
+/* Register-blocked eight-row verifier: each warp owns R weight
+ * rows and reuses every activation/scale load across them.  For each row the
+ * lane sub-block order (lane, lane+32, ...), the per-row arithmetic and the
+ * xor reduction are those of qwen35_matvec_iq_fixed8_compact. */
+template<int KIND, int R>
+__device__ __forceinline__ void qwen35_iq_fixed8_decode(const unsigned char *p,
+        int ib, int *av, int *bv, unsigned int &aux) {
+    aux=KIND==0 ? *(const unsigned int *)(p+6+ib*8) :
+        KIND==3 ? *(const unsigned int *)(p+66+ib*4) : 0;
+#pragma unroll
+    for (int j=0; j<4; ++j) {
+        unsigned int lo,hi,signs;
+        if (KIND<=2) {
+            unsigned long long grid;
+            if (KIND==0) {
+                grid=qwen35_iq2xxs_grid[p[2+ib*8+j]];
+                signs=qwen35_parity_signs((aux>>(7*j))&127);
+            } else if (KIND==1) {
+                unsigned int code=((const unsigned short *)(p+2))[ib*4+j];
+                grid=qwen35_iq2xs_grid[code&511];
+                signs=qwen35_parity_signs(code>>9);
+            } else {
+                int index=p[2+ib*4+j] |
+                    ((p[66+ib]<<(8-2*j))&0x300);
+                grid=qwen35_iq2s_grid[index];
+                signs=p[34+ib*4+j];
+            }
+            lo=(unsigned int)grid;
+            hi=(unsigned int)(grid>>32);
+        } else if (KIND==3) {
+            signs=qwen35_parity_signs((aux>>(7*j))&127);
+            lo=qwen35_iq3xxs_grid[p[2+ib*8+2*j]];
+            hi=qwen35_iq3xxs_grid[p[3+ib*8+2*j]];
+        } else {
+            unsigned int qh=p[66+ib];
+            signs=p[74+ib*4+j];
+            lo=qwen35_iq3s_grid[p[2+ib*8+2*j] |
+                ((qh<<(8-2*j))&0x100)];
+            hi=qwen35_iq3s_grid[p[3+ib*8+2*j] |
+                ((qh<<(7-2*j))&0x100)];
+        }
+        av[j]=qwen35_signed_grid(lo,signs,0);
+        bv[j]=qwen35_signed_grid(hi,signs,4);
+    }
+}
+template<int KIND, int R>
+__device__ __forceinline__ void qwen35_matvec_iq_fixed8_rb(
+        float *out, const unsigned char *weights, const signed char *q,
+        const float *scales, int rows, int cols) {
+    int lane=threadIdx.x&31;
+    int row0=(blockIdx.x*(blockDim.x/32)+threadIdx.x/32)*R;
+    if (row0>=rows) return;
+    constexpr int bs=KIND==0 ? 66 : KIND==1 ? 74 : KIND==2 ? 82 :
+                     KIND==3 ? 98 : 110;
+    size_t rstride=(size_t)(cols/256)*bs;
+    const unsigned char *w=weights+(size_t)row0*rstride;
+    int nr=rows-row0<R ? rows-row0 : R;
+    float sum[R][8]={};
+    for (int qb=lane; qb<cols/32; qb+=32) {
+        int ib=qb&7;
+        int av[R][4], bv[R][4]; unsigned int aux[R]; float d16[R];
+        const unsigned char *pr[R];
+#pragma unroll
+        for (int r=0; r<R; ++r) {
+            pr[r]=w+(size_t)(r<nr ? r : 0)*rstride+(qb/8)*bs;
+            qwen35_iq_fixed8_decode<KIND,R>(pr[r],ib,av[r],bv[r],aux[r]);
+            d16[r]=(float)*(const _Float16 *)pr[r];
+        }
+#pragma unroll
+        for (int m=0; m<8; ++m) {
+            const int *u=(const int *)(q+(size_t)m*cols+qb*32);
+            int uu[8];
+#pragma unroll
+            for (int k=0; k<8; ++k) uu[k]=u[k];
+            float scale=scales[(size_t)m*(cols/32)+qb];
+#pragma unroll
+            for (int r=0; r<R; ++r) {
+                const unsigned char *p=pr[r];
+                int z0=0,z1=0;
+#pragma unroll
+                for (int j=0; j<4; ++j) {
+                    if ((KIND==1 || KIND==2) && j>=2) {
+                        z1=qwen35_dot4(av[r][j],uu[2*j],z1);
+                        z1=qwen35_dot4(bv[r][j],uu[2*j+1],z1);
+                    } else {
+                        z0=qwen35_dot4(av[r][j],uu[2*j],z0);
+                        z0=qwen35_dot4(bv[r][j],uu[2*j+1],z0);
+                    }
+                }
+                int z=z0;
+                if (KIND==0) z=z*(int)((aux[r]>>27)|1)/8;
+                else if (KIND==1 || KIND==2) {
+                    int sc=p[(KIND==1?66:74)+ib];
+                    z=(z*(sc&15)+z1*(sc>>4)+(z+z1)/2)/4;
+                } else if (KIND==3) z=((int)(aux[r]>>28)*z+z/2)/2;
+                else z*=1+2*((p[106+ib/2]>>((ib&1)*4))&15);
+                float d=d16[r]*scale;
+                sum[r][m]+=d*z;
+            }
+        }
+    }
+#pragma unroll
+    for (int r=0; r<R; ++r) {
+#pragma unroll
+        for (int m=0; m<8; ++m) {
+            for (int offset=16; offset; offset>>=1)
+                sum[r][m]+=__shfl_xor(sum[r][m],offset,32);
+            if (lane==0 && r<nr) out[(size_t)m*rows+row0+r]=sum[r][m];
+        }
+    }
+}
+
 /* K=7 target verification always evaluates eight rows.  Literal formats and
  * counts let HIPRTC discard unused branches and per-activation bounds. */
 #define QWEN35_IQ_FIXED8(name, kind_value) \
@@ -1083,11 +1195,23 @@ extern "C" __global__ void name( \
     qwen35_matvec_iq_fixed8_compact<kind_value>( \
         out,weights,q,scales,rows,cols); \
 }
-QWEN35_IQ_FIXED8(qwen35_matvec_iq2xxs_fixed8, 0)
-QWEN35_IQ_FIXED8(qwen35_matvec_iq2xs_fixed8, 1)
+/* Rows per warp R: launch with ceil(rows / (8*R)) 256-thread blocks
+ * (hllm_dense_mtp_iq_fixed8_rows).  Measured on gfx1201: IQ2_XXS R=4,
+ * IQ2_XS/IQ3_S R=2; IQ2_S does not benefit. */
+#define QWEN35_IQ_FIXED8_RB(name, kind_value, r_value) \
+extern "C" __global__ void name( \
+        float *out, const unsigned char *weights, const signed char *q, \
+        const float *scales, int rows, int cols, int count) { \
+    (void)count; \
+    qwen35_matvec_iq_fixed8_rb<kind_value, r_value>( \
+        out,weights,q,scales,rows,cols); \
+}
+QWEN35_IQ_FIXED8_RB(qwen35_matvec_iq2xxs_fixed8, 0, 4)
+QWEN35_IQ_FIXED8_RB(qwen35_matvec_iq2xs_fixed8, 1, 2)
 QWEN35_IQ_FIXED8(qwen35_matvec_iq2s_fixed8, 2)
-QWEN35_IQ_FIXED8(qwen35_matvec_iq3s_fixed8, 4)
+QWEN35_IQ_FIXED8_RB(qwen35_matvec_iq3s_fixed8, 4, 2)
 #undef QWEN35_IQ_FIXED8
+#undef QWEN35_IQ_FIXED8_RB
 
 /* IQ3_XXS is faster with the original j-major schedule despite its higher
  * register count, so retain that exact specialization for this format. */
@@ -1154,52 +1278,72 @@ extern "C" __global__ void qwen35_matvec_iq4xs_multi8(
  * virtual reference warps 0..4 can contribute at this width; specializing
  * that bound removes three empty phases while retaining every contributing
  * multiply and addition in the generic kernel's order. */
+/* Register-blocked: a warp owns R output rows and reuses each activation and
+ * scale load across them; per-row virtual-warp order is unchanged. */
 extern "C" __global__ void qwen35_matvec_iq4xs_5120_multi8(
         float *out, const unsigned char *weights, const signed char *q,
         const float *scales, int rows, int cols, int count) {
+    constexpr int R=4;   /* launch ceil(rows/32) 256-thread blocks */
     int lane=threadIdx.x&31;
-    int row=blockIdx.x*(blockDim.x/32)+threadIdx.x/32;
-    if(row>=rows)return;
+    int row0=(blockIdx.x*(blockDim.x/32)+threadIdx.x/32)*R;
+    if(row0>=rows)return;
+    int nr=rows-row0<R ? rows-row0 : R;
     const int blocks=20;
-    const unsigned char *w=weights+(size_t)row*blocks*136;
-    float sum[8]={};
+    const unsigned char *w=weights+(size_t)row0*blocks*136;
+    float sum[R][8]={};
 #pragma unroll
     for(int vw=0;vw<5;++vw){
-        float partial[8]={};
         int qb=lane+32*vw;
         if(qb<blocks*8){
             int ib=qb&7;
-            const unsigned char *p=w+(qb/8)*136;
-            const unsigned int *v=(const unsigned int *)(p+8+ib*16);
-            int z[8]={};
+            int z[R][8]={};
+            int ls[R]; float d16[R]; unsigned int vv[R][4];
+#pragma unroll
+            for(int r=0;r<R;++r){
+                const unsigned char *p=w+(size_t)(r<nr?r:0)*blocks*136+(qb/8)*136;
+                const unsigned int *v=(const unsigned int *)(p+8+ib*16);
+#pragma unroll
+                for(int j=0;j<4;++j)vv[r][j]=v[j];
+                ls[r]=((p[4+ib/2]>>(4*(ib&1)))&15) |
+                      (((*(const unsigned short *)(p+2)>>(2*ib))&3)<<4);
+                d16[r]=(float)*(const _Float16 *)p;
+            }
 #pragma unroll
             for(int j=0;j<4;++j){
-                int lo=qwen35_iq4_lookup(v[j]);
-                int hi=qwen35_iq4_lookup(v[j]>>4);
+                int lo[R],hi[R];
+#pragma unroll
+                for(int r=0;r<R;++r){lo[r]=qwen35_iq4_lookup(vv[r][j]);hi[r]=qwen35_iq4_lookup(vv[r][j]>>4);}
 #pragma unroll
                 for(int m=0;m<8;++m)if(m<count){
                     const int *u=(const int *)(q+(size_t)m*cols+qb*32);
-                    z[m]=qwen35_dot4(lo,u[j],z[m]);
-                    z[m]=qwen35_dot4(hi,u[j+4],z[m]);
+                    int u0=u[j],u1=u[j+4];
+#pragma unroll
+                    for(int r=0;r<R;++r){
+                        z[r][m]=qwen35_dot4(lo[r],u0,z[r][m]);
+                        z[r][m]=qwen35_dot4(hi[r],u1,z[r][m]);
+                    }
                 }
             }
-            int ls=((p[4+ib/2]>>(4*(ib&1)))&15) |
-                   (((*(const unsigned short *)(p+2)>>(2*ib))&3)<<4);
 #pragma unroll
             for(int m=0;m<8;++m)if(m<count){
-                int zz=z[m]*(ls-32);
-                float d=(float)*(const _Float16 *)p *
-                        scales[(size_t)m*(cols/32)+qb];
-                partial[m]+=d*zz;
+                float sc=scales[(size_t)m*(cols/32)+qb];
+#pragma unroll
+                for(int r=0;r<R;++r){
+                    int zz=z[r][m]*(ls[r]-32);
+                    float d=d16[r]*sc;
+                    float partial=0.0f;
+                    partial+=d*zz;
+                    sum[r][m]+=partial;
+                }
             }
         }
-#pragma unroll
-        for(int m=0;m<8;++m)if(m<count)sum[m]+=partial[m];
     }
+#pragma unroll
+    for(int r=0;r<R;++r)
 #pragma unroll
     for(int m=0;m<8;++m)if(m<count){
         for(int offset=16;offset;offset>>=1)
-            sum[m]+=__shfl_xor(sum[m],offset,32);
-        if(lane==0)out[(size_t)m*rows+row]=sum[m];
+            sum[r][m]+=__shfl_xor(sum[r][m],offset,32);
+        if(lane==0&&r<nr)out[(size_t)m*rows+row0+r]=sum[r][m];
     }
 }

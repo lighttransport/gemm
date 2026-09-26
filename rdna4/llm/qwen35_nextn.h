@@ -361,6 +361,15 @@ static hipFunction_t hllm_dense_mtp_iq_fixed8(hip_llm_runner *r, int type) {
     }
 }
 
+/* Weight rows per warp of the fixed8 kernels (qwen35_matvec_iq.hip). */
+static int hllm_dense_mtp_iq_fixed8_rows(int type) {
+    switch (type) {
+        case GGML_TYPE_IQ2_XXS: return 4;
+        case GGML_TYPE_IQ2_XS: case GGML_TYPE_IQ3_S: return 2;
+        default: return 1;
+    }
+}
+
 static void hllm_dense_mtp_res_rmsnorm_batch(hip_llm_runner *r, void *x,
         void *res, void *normalized, void *weight, int width, int rows) {
     float eps = r->rms_norm_eps;
@@ -468,7 +477,8 @@ static void hllm_dense_mtp_projection(hip_llm_runner *r, void *dst, void *w,
             hipFunction_t iq4_fn = nc == 5120 ?
                 r->fn_qwen35_matvec_iq4xs_5120_multi8 :
                 r->fn_qwen35_matvec_iq4xs_multi8;
-            LAUNCH(iq4_fn, (nr+7)/8, 1, 1,
+            int rows_per_block = nc == 5120 ? 32 : 8;   /* 5120 variant: 4 rows/warp */
+            LAUNCH(iq4_fn, (nr+rows_per_block-1)/rows_per_block, 1, 1,
                    256, 1, 1, 0, r->stream, ma);
         } else if (rows <= HLLM_DENSE_MTP_REUSE_ROWS &&
                    type != GGML_TYPE_IQ4_XS &&
@@ -480,12 +490,14 @@ static void hllm_dense_mtp_projection(hip_llm_runner *r, void *dst, void *w,
                 LAUNCH(r->fn_qwen35_matvec_iq_multi4, (nr+3)/4, 1, 1,
                        128, 1, 1, 0, r->stream, ma);
             } else {
-                hipFunction_t multi = rows == HLLM_DENSE_MTP_REUSE_ROWS ?
+                int fixed = rows == HLLM_DENSE_MTP_REUSE_ROWS;
+                hipFunction_t multi = fixed ?
                     hllm_dense_mtp_iq_fixed8(r, type) :
                     hllm_dense_mtp_iq_multi8(r, type);
                 void *ma[] = { &dst, &w, &m->verify_q, &m->verify_scales,
                                &nr, &nc, &rows };
-                LAUNCH(multi, (nr+7)/8, 1, 1, 256, 1, 1, 0,
+                int rows_per_block = 8 * (fixed ? hllm_dense_mtp_iq_fixed8_rows(type) : 1);
+                LAUNCH(multi, (nr+rows_per_block-1)/rows_per_block, 1, 1, 256, 1, 1, 0,
                        r->stream, ma);
             }
         } else LAUNCH(fn, (nr+7)/8, rows, 1, 256, 1, 1, 0, r->stream, a);
