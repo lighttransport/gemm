@@ -707,7 +707,10 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
                     best = i;
             }
             if (best >= 0) {
-                if (strcmp(active_identity, cache_identity) != 0)
+                /* Any live state is about to be replaced.  Clients without a
+                 * session id (pi's llama.cpp provider) share one identity, so
+                 * an identity change is not the only sign of a switch. */
+                if (cache_n > 0 && active_identity[0])
                     stdio_capture_live(gpu, &snapshot_cache, &outgoing,
                                        active_identity, cache, cache_n,
                                        prev_live, prev_live_n);
@@ -844,8 +847,7 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
                 prompt_snapshot_present = 1;
             }
         }
-        if (!have_state && cache_n > 0 && active_identity[0] &&
-            strcmp(active_identity, cache_identity) != 0)
+        if (!have_state && cache_n > 0 && active_identity[0])
             stdio_capture_live(gpu, &snapshot_cache, &outgoing, active_identity,
                                cache, cache_n, prev_live, prev_live_n);
         free(prev_live);
