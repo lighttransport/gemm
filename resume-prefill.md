@@ -1081,3 +1081,33 @@ caller during the PP chunk loop; the current producer uses `FUNNELED` and
 blocking sends/receives. The measured 27.73 s single-prompt wall includes
 about 22.85 s of work on its busiest stage, so communication overlap alone
 cannot meet 150 tok/s/node.
+
+### PP12 locality, partition, and chunk screens (job 51934716)
+
+The fully evaluated 32,768-token C-source prompt was repeated with the exact
+4608 MiB preexpansion and stage-owned pruning above. A profiled chunk-480
+baseline repeated at **27.724591 s = 98.493 tok/s/node**, with residual hash
+`e0e955e58b6353af` and matching TP4 first token. The slowest stage (rank 3)
+spent 22.873 s across its units. Its GEMM worker mean was 14.603 s in the
+INT16 microkernel, 0.460 s in the output epilogue, 0.226 s clearing
+accumulators, 0.013 s expansion, and 0.202 s in barriers. Attention on that
+stage was 5.2 s. Parsing all 128 measured unit times and solving the
+contiguous 12-stage minimax partition gave the **same 22.873 s lower bound**;
+the existing attention cost 1500 already achieves it. Moving stage cuts
+cannot reduce the measured bottleneck at this unit granularity.
+
+| Change from the chunk-480 baseline | Prefill s | Tok/s/node | Result |
+| --- | ---: | ---: | --- |
+| GEMM tiles strictly local to their CMG | 28.785888 | 94.861 | Slower |
+| CMG-local first, then steal queued remote tiles | 28.659186 | 95.281 | Slower |
+| Chunk 510 | 28.510931 | 95.776 | Slower |
+| Chunk 560 | 28.027270 | 97.429 | Slower |
+| Chunk 640 | 28.682547 | 95.203 | Slower |
+| Chunk 800 | 29.984694 | 91.069 | Slower |
+
+The scheduler experiments kept the same final residual hash and matching TP4
+first token; the chunk-800 run also completed 256-token TP4 decode. Both
+scheduler variants were removed from source after the screen. Their losses
+suggest that global tile balancing is more valuable than forcing preexpanded
+weight-panel locality for this shape. Remote logs are under
+`tmp/q38p/{profile-full-chunk480,gemm-cmg-full32k,gemm-cmg-steal-full32k,prune-full-chunk510,prune-full-chunk560,prune-full-chunk640,prune-full-chunk800}-51934716/`.
