@@ -415,6 +415,22 @@ static int stdio_snapshot_cache_publish(stdio_snapshot_cache *cache,
     }
     size_t replaced = slot >= 0 && cache->entries[slot].snapshot ?
                       cache->entries[slot].bytes : 0;
+    /* Stale system prefixes (agents embed dates, git status, cwd) must not
+     * crowd out conversations: keep shared entries to half the slots. */
+    if (strcmp(identity, STDIO_SHARED_PREFIX_IDENTITY) == 0 &&
+        (slot < 0 || !cache->entries[slot].snapshot)) {
+        int shared = 0, oldest = -1;
+        for (int i = 0; i < cache->capacity; ++i) {
+            if (!cache->entries[i].snapshot || !cache->entries[i].shared) continue;
+            shared++;
+            if (oldest < 0 || cache->entries[i].age < cache->entries[oldest].age)
+                oldest = i;
+        }
+        if (oldest >= 0 && shared >= (cache->capacity + 1) / 2) {
+            stdio_snapshot_entry_clear(cache, oldest);
+            if (slot < 0) slot = oldest;
+        }
+    }
     while (cache->bytes - replaced + bytes > cache->byte_limit || slot < 0) {
         /* Evict conversation state before the shared system prefix, which
          * every new conversation restores. */
@@ -485,10 +501,15 @@ static void stdio_capture_live(hip_llm_runner *gpu, const stdio_snapshot_cache *
             return;
     }
     out->snapshot = hip_llm_snapshot_state(gpu);
-    if (!out->snapshot) {
+    /* Above --qwen35-snapshot-max-tokens the runner returns a resident
+     * snapshot (recurrent state only; attention KV stays on the device).
+     * The incoming conversation overwrites that KV, so such a snapshot of
+     * the outgoing state must never be kept. */
+    if (!out->snapshot || !hip_llm_state_snapshot_is_portable(out->snapshot)) {
+        hip_llm_free_state_snapshot(out->snapshot);
+        out->snapshot = NULL;
         fprintf(stderr, "llm_server: live state not saved tokens=%d "
-                "(snapshot unavailable or above --qwen35-snapshot-max-tokens)\n",
-                n_tokens);
+                "(above --qwen35-snapshot-max-tokens)\n", n_tokens);
         return;
     }
     out->tokens = malloc((size_t)n_tokens * sizeof(*tokens));
@@ -513,6 +534,27 @@ static void stdio_publish_outgoing(stdio_snapshot_cache *c, stdio_outgoing *out)
     free(out->tokens);
     free(out->text);
     memset(out, 0, sizeof(*out));
+}
+
+/* Same identity, but is this a different conversation (pi sends no
+ * session id) rather than the same one diverging (a retry or an edited
+ * turn)?  Different conversations part within, or right after, the stable
+ * system prefix; saving the live state is only worth a full KV copy then. */
+enum { STDIO_OTHER_CONVERSATION_SLACK = 256 };
+
+static int stdio_other_conversation_tokens(const int *bounds, int n_bounds) {
+    return (n_bounds ? bounds[n_bounds - 1] : 0) + STDIO_OTHER_CONVERSATION_SLACK;
+}
+
+static int stdio_other_conversation(const unsigned char *prompt, size_t prompt_n,
+                                    const unsigned char *live, size_t live_n,
+                                    const size_t *prefix_lens, int n_prefixes) {
+    size_t common = 0, longest = 0;
+    while (live && common < prompt_n && common < live_n && prompt[common] == live[common])
+        common++;
+    for (int i = 0; i < n_prefixes; ++i)
+        if (prefix_lens[i] > longest) longest = prefix_lens[i];
+    return common <= longest + 4 * STDIO_OTHER_CONVERSATION_SLACK;
 }
 
 static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
@@ -710,7 +752,10 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
                 /* Any live state is about to be replaced.  Clients without a
                  * session id (pi's llama.cpp provider) share one identity, so
                  * an identity change is not the only sign of a switch. */
-                if (cache_n > 0 && active_identity[0])
+                if (cache_n > 0 && active_identity[0] &&
+                    (strcmp(active_identity, cache_identity) != 0 ||
+                     stdio_other_conversation(prompt, prompt_n, prev_live, prev_live_n,
+                                              prefix_lens, n_prefixes)))
                     stdio_capture_live(gpu, &snapshot_cache, &outgoing,
                                        active_identity, cache, cache_n,
                                        prev_live, prev_live_n);
@@ -847,7 +892,9 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
                 prompt_snapshot_present = 1;
             }
         }
-        if (!have_state && cache_n > 0 && active_identity[0])
+        if (!have_state && cache_n > 0 && active_identity[0] &&
+            (strcmp(active_identity, cache_identity) != 0 ||
+             common <= stdio_other_conversation_tokens(prefix_bounds, n_bounds)))
             stdio_capture_live(gpu, &snapshot_cache, &outgoing, active_identity,
                                cache, cache_n, prev_live, prev_live_n);
         free(prev_live);

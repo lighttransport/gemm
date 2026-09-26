@@ -526,6 +526,19 @@ def responses_output(response_id, reasoning, raw_turn, text, calls):
     return items
 
 
+def stream_error_event(api_path, message):
+    """SSE bytes that report a failure after the stream has started."""
+    if api_path == "/v1/messages":
+        payload = {"type": "error", "error": {"type": "api_error", "message": message}}
+        return ("event: error\ndata: " + json.dumps(payload) + "\n\n").encode()
+    if api_path == "/v1/responses":
+        payload = {"type": "response.failed", "response": {
+            "status": "failed", "error": {"code": "server_error", "message": message}}}
+        return ("event: response.failed\ndata: " + json.dumps(payload) + "\n\n").encode()
+    payload = {"error": {"message": message, "type": "server_error"}}
+    return ("data: " + json.dumps(payload) + "\n\ndata: [DONE]\n\n").encode()
+
+
 class Handler(BaseHTTPRequestHandler):
     backend = None
     model = "local"
@@ -546,12 +559,18 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(req, dict):
                 raise ValueError("request body must be a JSON object")
         except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+            self.close_connection = True
             self.send_json(400, {"type": "error", "error": {
                 "type": "invalid_request_error", "message": str(exc)}})
             return
-        thinking, effort = self.thinking_mode(req, "/v1/messages")
-        registry = tool_registry(anthropic_api.tool_definitions(req.get("tools")))
-        prompt = chat_prompt(anthropic_api.request_messages(req), registry, thinking, effort)
+        try:
+            thinking, effort = self.thinking_mode(req, "/v1/messages")
+            registry = tool_registry(anthropic_api.tool_definitions(req.get("tools")))
+            prompt = chat_prompt(anthropic_api.request_messages(req), registry, thinking, effort)
+        except Exception as exc:  # malformed shapes: report, keep serving
+            self.send_json(400, {"type": "error", "error": {
+                "type": "invalid_request_error", "message": str(exc)}})
+            return
         # About 3.5 bytes per token for this tokenizer on code and English.
         self.send_json(200, {"input_tokens": max(1, round(len(prompt.encode("utf-8")) / 3.5))})
 
@@ -620,7 +639,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_HEAD(self):
         # Connectivity probes (Claude Code sends HEAD /api/hello).
-        self.send_response(200)
+        path = urlsplit(self.path).path.rstrip("/") or "/"
+        known = ("/", "/api/hello", "/health", "/v1/health", "/models", "/v1/models", "/v1")
+        self.send_response(200 if path in known else 404)
         self.send_header("Content-Length", "0")
         self.end_headers()
 
@@ -728,8 +749,16 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path in ("/models/load", "/models/unload"):
             # One resident model: loading is a no-op and it stays loaded.
-            n = int(self.headers.get("Content-Length", "0") or 0)
-            if 0 < n <= 4096:
+            try:
+                n = int(self.headers.get("Content-Length", "0") or 0)
+            except ValueError:
+                n = -1
+            if n < 0 or n > 65536:
+                self.close_connection = True
+                self.send_json(400, {"error": {"message": "invalid request body",
+                                                "type": "invalid_request_error"}})
+                return
+            if n:
                 self.rfile.read(n)
             self.send_json(200, {"success": True})
             return
@@ -826,7 +855,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(400, {"error": {"message": "max_tokens must be non-negative", "type": "invalid_request_error"}})
                 return
             limit = min(requested_limit, self.max_tokens)
-            self.raw_turns.resolve(messages)
+            self.raw_turns.resolve(messages, cache_key)
             messages = fit_context(
                 messages, self.context, limit,
                 lambda m: chat_prompt(m, registry, thinking, effort))
@@ -837,7 +866,9 @@ class Handler(BaseHTTPRequestHandler):
                 # Diagnostic only: raw request plus the exact rendered prompt,
                 # for diffing successive agent turns' prefixes.
                 stamp = f"{time.time():.6f}"
-                with open(os.path.join(trace_dir, f"{stamp}.json"), "w", encoding="utf-8") as f:
+                fd = os.open(os.path.join(trace_dir, f"{stamp}.json"),
+                             os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
                     json.dump({"path": api_path, "cache_key": cache_key, "request": req,
                                "prompt": prompt, "prefix": prefix}, f, ensure_ascii=False)
             # The C child reads one complete request into a fixed 4 MiB line.
@@ -905,7 +936,8 @@ class Handler(BaseHTTPRequestHandler):
             stream_keepalive_stop = threading.Event()
             stream_keepalive = None
             stream_write_lock = threading.Lock()
-            stream_response_id = "resp-" + uuid.uuid4().hex if req.get("stream") else None
+            stream_response_id = (("chatcmpl-" if api_path == "/v1/chat/completions" else "resp-")
+                                  + uuid.uuid4().hex) if req.get("stream") else None
             stream_created = int(time.time())
             if not self.backend.register_request(request_id, cancelled):
                 self.send_json(409, {"error": {
@@ -981,6 +1013,7 @@ class Handler(BaseHTTPRequestHandler):
                     stream_keepalive.start()
 
                 splitter = StreamSplitter(thinking)
+                role_sent = [False]
 
                 def stream_token(token):
                     if not req.get("stream"):
@@ -1003,9 +1036,13 @@ class Handler(BaseHTTPRequestHandler):
                         with stream_write_lock:
                             for kind, piece in parts:
                                 field = "reasoning_content" if kind == "reasoning" else "content"
+                                delta = {field: piece}
+                                if not role_sent[0]:
+                                    delta = {"role": "assistant", **delta}
+                                    role_sent[0] = True
                                 obj = {"id": stream_response_id, "object": "chat.completion.chunk",
                                        "created": stream_created, "model": self.model,
-                                       "choices": [{"index": 0, "delta": {field: piece},
+                                       "choices": [{"index": 0, "delta": delta,
                                                     "finish_reason": None}]}
                                 self.wfile.write(("data: " + json.dumps(obj, ensure_ascii=False) +
                                                   "\n\n").encode())
@@ -1047,7 +1084,7 @@ class Handler(BaseHTTPRequestHandler):
                                  answer[answer.find("<tool_call>"):][:400].replace("\n", "\\n") + "\n")
             if api_path == "/v1/messages":
                 content = anthropic_api.response_content(reasoning_text, raw_turn, text, calls)
-                self.raw_turns.remember(raw_turn, text, calls,
+                self.raw_turns.remember(raw_turn, text, calls, scope=cache_key, ids=
                                         [b["id"] for b in content if b["type"] == "tool_use"])
                 reason = anthropic_api.stop_reason(calls, finish)
                 use = anthropic_api.usage(ptok, cached, ctok)
@@ -1061,9 +1098,10 @@ class Handler(BaseHTTPRequestHandler):
                         "msg_" + uuid.uuid4().hex[:24], self.model, content, reason, use))
                 return
             if api_path != "/v1/messages":
-                self.raw_turns.remember(raw_turn, text, calls,
+                self.raw_turns.remember(raw_turn, text, calls, scope=cache_key, ids=
                                         [c.get("call_id") for c in calls])
-            ident = "chatcmpl-" + uuid.uuid4().hex
+            ident = (stream_response_id if req.get("stream") and api_path == "/v1/chat/completions"
+                     else "chatcmpl-" + uuid.uuid4().hex)
             created = int(time.time())
             usage = {"prompt_tokens": ptok, "completion_tokens": ctok, "total_tokens": ptok + ctok,
                      "cached_tokens": cached, "prompt_tokens_details": {"cached_tokens": cached}}
@@ -1152,9 +1190,15 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             self.log_message("500 POST %s: %s", self.path, exc)
             if response_started:
-                # HTTP status and SSE headers are already committed. Appending
-                # a JSON error response would corrupt the event stream.
+                # Headers are committed: report the failure in the stream's own
+                # protocol so agents surface it instead of retrying a silently
+                # truncated response.
                 self.close_connection = True
+                try:
+                    self.wfile.write(stream_error_event(api_path, str(exc)))
+                    self.wfile.flush()
+                except OSError:
+                    pass
                 return
             self.send_json(500, {"error": {"message": str(exc), "type": "server_error"}})
 

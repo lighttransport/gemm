@@ -30,10 +30,13 @@ class PrefixStore:
                 data = json.load(f)
             for key, entry in data.get("prefixes", {}).items():
                 if (isinstance(entry, dict) and isinstance(entry.get("boundaries"), list) and
-                        all(isinstance(b, str) for b in entry["boundaries"])):
+                        entry["boundaries"] and
+                        all(isinstance(b, str) for b in entry["boundaries"]) and
+                        isinstance(entry.get("last"), (int, float)) and
+                        isinstance(entry.get("hits", 0), int)):
                     self.entries[key] = entry
-        except (OSError, ValueError):
-            pass
+        except (OSError, ValueError, AttributeError):
+            self.entries = {}
 
     def record(self, boundaries):
         """Remember one request's prefix boundaries (longest last)."""

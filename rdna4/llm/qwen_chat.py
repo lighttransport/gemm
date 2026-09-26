@@ -154,38 +154,50 @@ class RawTurnCache:
     with defaults filled in (Claude Code adds ``replace_all: false``).
     """
 
-    def __init__(self, capacity=4096):
+    def __init__(self, capacity=4096, max_bytes=128 << 20):
         self.capacity = capacity
+        self.max_bytes = max_bytes
+        self.bytes = 0
         self.entries = collections.OrderedDict()
         self.lock = threading.Lock()
 
     @staticmethod
-    def text_key(text):
-        return "text:" + hashlib.sha256(text.strip().encode("utf-8")).hexdigest()
+    def text_key(text, scope=None):
+        # Text-only turns are matched within one conversation identity: equal
+        # visible answers in other sessions ("Done.") must not import their
+        # reasoning.  Tool-call ids and stream refs are server-issued and
+        # unique, so they need no scope.
+        digest = hashlib.sha256(text.strip().encode("utf-8")).hexdigest()
+        return "text:" + hashlib.sha256(str(scope).encode("utf-8")).hexdigest()[:16] + ":" + digest
+
+    def _store(self, key, value):
+        old = self.entries.pop(key, None)
+        if old is not None:
+            self.bytes -= len(old[0])
+        self.entries[key] = value
+        self.bytes += len(value[0])
+        while self.entries and (len(self.entries) > self.capacity or
+                                self.bytes > self.max_bytes):
+            _, dropped = self.entries.popitem(last=False)
+            self.bytes -= len(dropped[0])
 
     @staticmethod
     def call_names(calls):
         return [name for name, _ in json.loads(_normalized_calls(calls))]
 
-    def remember(self, raw, text, calls, ids):
-        keys = [i for i in ids if i] or ([self.text_key(text)] if text.strip() else [])
+    def remember(self, raw, text, calls, ids=(), scope=None):
+        keys = [i for i in ids if i] or ([self.text_key(text, scope)] if text.strip() else [])
         value = (raw, self.call_names(calls), text.strip())
         with self.lock:
             for key in keys:
-                self.entries[key] = value
-                self.entries.move_to_end(key)
-            while len(self.entries) > self.capacity:
-                self.entries.popitem(last=False)
+                self._store(key, value)
 
     def remember_ref(self, ref, raw):
         """Store a streamed turn under the reference it was sent with."""
         with self.lock:
-            self.entries[ref] = (raw, None, None)
-            self.entries.move_to_end(ref)
-            while len(self.entries) > self.capacity:
-                self.entries.popitem(last=False)
+            self._store(ref, (raw, None, None))
 
-    def resolve(self, messages):
+    def resolve(self, messages, scope=None):
         """Fill in ``raw`` for assistant turns that lost it."""
         with self.lock:
             for m in messages:
@@ -197,7 +209,7 @@ class RawTurnCache:
                     self.entries.move_to_end(ref)
                     continue
                 ids = m.get("call_ids") or []
-                key = ids[0] if ids else self.text_key(content_text(m.get("content", "")))
+                key = ids[0] if ids else self.text_key(content_text(m.get("content", "")), scope)
                 entry = self.entries.get(key)
                 if entry is None:
                     continue
