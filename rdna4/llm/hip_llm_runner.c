@@ -66,6 +66,7 @@ static double hllm_monotonic_ms(void) {
 #include "qwen35_reference_math.h"
 #include "qwen35_matvec_q2k.inc"
 #include "qwen35_matvec_iq.inc"
+#include "qwen35_matvec_multi.inc"
 #include "qwen35_attention_q8.inc"
 #include "qwen35_attention_q8_gate.inc"
 #include "qwen35_dflash2.inc"
@@ -14809,6 +14810,10 @@ struct hip_llm_runner {
     hipFunction_t fn_qwen35_argmax_parts, fn_qwen35_argmax_finish;
     void *d_native_argmax_scores, *d_native_argmax_indices;
     hipModule_t iq_module;
+    /* qwen35_matvec_iq + qwen35_matvec_q2k + qwen35_matvec_multi: one-launch
+     * native projections sharing an activation (pairs and Q/K/V triples). */
+    hipModule_t mv_multi_module;
+    hipFunction_t fn_qwen35_mv_multi, fn_qwen35_mv_pair[8][8];
     struct hllm_qwen35_mtp *qwen35_mtp;
     struct hllm_qwen35_dflash2 *qwen35_dflash2;
     hipFunction_t fn_qwen35_matvec_iq2xxs, fn_qwen35_matvec_iq2xs;
@@ -18757,6 +18762,38 @@ int hip_llm_load_weights_sharded(hip_llm_runner *r, gguf_shards *model,
                           r->iq_module, "qwen35_matvec_iq3s"));
                 CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq4xs,
                           r->iq_module, "qwen35_matvec_iq4xs"));
+                const char *multi_env = getenv("LLM_QWEN35_NATIVE_MULTI");
+                if (r->fn_qwen35_matvec_q2k && (!multi_env || atoi(multi_env) != 0)) {
+                    size_t la = strlen(qwen35_matvec_iq_source);
+                    size_t lb = strlen(qwen35_matvec_q2k_source);
+                    size_t lc = strlen(qwen35_matvec_multi_source);
+                    char *src = (char *)malloc(la + lb + lc + 3);
+                    int ok = 0;
+                    if (src) {
+                        memcpy(src, qwen35_matvec_iq_source, la); src[la] = '\n';
+                        memcpy(src + la + 1, qwen35_matvec_q2k_source, lb);
+                        src[la + 1 + lb] = '\n';
+                        memcpy(src + la + lb + 2, qwen35_matvec_multi_source, lc + 1);
+                        ok = hip_compile_kernels_ex(&r->mv_multi_module, r->device,
+                                src, "qwen35_mv_multi.hip", r->verbose,
+                                "qwen35_mv_multi", 1) > 0;
+                        free(src);
+                    }
+                    if (ok && hipModuleGetFunction(&r->fn_qwen35_mv_multi,
+                            r->mv_multi_module, "qwen35_matvec_native_multi") == hipSuccess) {
+                        for (int ka = 0; ka < 8 && ok; ++ka)
+                            for (int kb = 0; kb < 8 && ok; ++kb) {
+                                char nm[64];
+                                snprintf(nm, sizeof nm, "qwen35_matvec_pair_%d_%d", ka, kb);
+                                ok = hipModuleGetFunction(&r->fn_qwen35_mv_pair[ka][kb],
+                                        r->mv_multi_module, nm) == hipSuccess;
+                            }
+                    } else ok = 0;
+                    if (!ok) {
+                        fprintf(stderr, "hip_llm: native multi-matvec module unavailable\n");
+                        r->fn_qwen35_mv_multi = NULL;
+                    }
+                }
                 CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq4xs_multi8,
                           r->iq_module, "qwen35_matvec_iq4xs_multi8"));
                 CHECK_HIP(hipModuleGetFunction(&r->fn_qwen35_matvec_iq4xs_5120_multi8,
@@ -23749,6 +23786,59 @@ static inline void launch_matvec_auto(hip_llm_runner *r, void *dst, void *mat,
  * recurrent projections.  Keep the gate/up experiment independent so a
  * measured FFN improvement cannot silently alter SSM or attention arithmetic.
  */
+/* Kernel the standalone native path would run for (type, rows, cols), as a
+ * qwen35_matvec_multi segment kind, or -1 when that path is not taken. */
+static inline int qwen35_native_mv_kind(hip_llm_runner *r, int type,
+                                        int rows, int cols) {
+    if (!qwen35_native_q81_ready(r) || cols > 17408 || (cols % 256) != 0 ||
+        rows < 1)
+        return -1;
+    switch (type) {
+    case GGML_TYPE_IQ2_XXS: return r->fn_qwen35_matvec_iq2xxs ? 0 : -1;
+    case GGML_TYPE_IQ2_XS:  return r->fn_qwen35_matvec_iq2xs ? 1 : -1;
+    case GGML_TYPE_IQ2_S:   return r->fn_qwen35_matvec_iq2s ? 2 : -1;
+    case GGML_TYPE_IQ3_XXS: return r->fn_qwen35_matvec_iq3xxs ? 3 : -1;
+    case GGML_TYPE_IQ3_S:   return r->fn_qwen35_matvec_iq3s ? 4 : -1;
+    case GGML_TYPE_IQ4_XS:  return r->fn_qwen35_matvec_iq4xs ? 5 : -1;
+    case GGML_TYPE_Q2_K:
+        if (!r->fn_qwen35_matvec_q2k) return -1;
+        return cols == 5120 && rows >= 5120 ? 6 : 7;
+    default: return -1;
+    }
+}
+
+/* Issue two or three native projections of the same activation as one
+ * launch (bitwise identical rows; see qwen35_matvec_multi.hip).  Returns 0
+ * without launching when any projection would not use its native kernel. */
+static inline int launch_qwen35_native_multi(hip_llm_runner *r, int n,
+        void **outs, void **mats, const int *rows, const int *types,
+        void *x, int cols) {
+    if (!r->fn_qwen35_mv_multi || n < 2 || n > 3) return 0;
+    int kind[3], nb[3];
+    for (int i = 0; i < n; ++i) {
+        kind[i] = qwen35_native_mv_kind(r, types[i], rows[i], cols);
+        if (kind[i] < 0) return 0;
+        nb[i] = kind[i] == 7 ? rows[i] : (rows[i] + 7) / 8;
+    }
+    r->q8x2_reuse_valid = 0;
+    launch_native_q81(r, x, cols);
+    if (n == 2) {
+        void *a[] = { &outs[0], &mats[0], (void *)&rows[0], &nb[0],
+                      &outs[1], &mats[1], (void *)&rows[1],
+                      &r->d_native_q81, &r->d_native_scale, &cols };
+        LAUNCH(r->fn_qwen35_mv_pair[kind[0]][kind[1]], nb[0] + nb[1], 1, 1,
+               256, 1, 1, 0, r->stream, a);
+    } else {
+        void *a[] = { &outs[0], &mats[0], (void *)&rows[0], &kind[0], &nb[0],
+                      &outs[1], &mats[1], (void *)&rows[1], &kind[1], &nb[1],
+                      &outs[2], &mats[2], (void *)&rows[2], &kind[2], &nb[2],
+                      &r->d_native_q81, &r->d_native_scale, &cols };
+        LAUNCH(r->fn_qwen35_mv_multi, nb[0] + nb[1] + nb[2], 1, 1,
+               256, 1, 1, 0, r->stream, a);
+    }
+    return 1;
+}
+
 static inline void launch_matvec_ffn_auto(hip_llm_runner *r, void *dst,
                                            void *mat, void *x, int n_rows,
                                            int n_cols, int weight_type,
@@ -30454,12 +30544,20 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
                                     cl->ssm_qkv_rows, cl->ssm_gate_rows,
                                     cl->ssm_qkv_cols, cl->ssm_gate_cols);
             } else {
+                void *mo[2] = { r->d_ssm_qkv, r->d_ssm_z };
+                void *mw[2] = { cl->ssm_qkv_w, cl->ssm_gate_w };
+                int mr[2] = { cl->ssm_qkv_rows, cl->ssm_gate_rows };
+                int mt[2] = { cl->ssm_qkv_type, cl->ssm_gate_type };
+                if (cl->ssm_qkv_cols != cl->ssm_gate_cols ||
+                    !launch_qwen35_native_multi(r, 2, mo, mw, mr, mt, r->d_xb,
+                                                cl->ssm_qkv_cols)) {
                 launch_matvec_ssm_auto(r, r->d_ssm_qkv, cl->ssm_qkv_w, r->d_xb,
                                        cl->ssm_qkv_rows, cl->ssm_qkv_cols,
                                        cl->ssm_qkv_type, 1);
                 launch_matvec_ssm_auto(r, r->d_ssm_z, cl->ssm_gate_w, r->d_xb,
                                        cl->ssm_gate_rows, cl->ssm_gate_cols,
                                        cl->ssm_gate_type, 0);
+                }
             }
             /* llama.cpp runs the BF16/F16 ssm_alpha and ssm_beta weights through
              * mul_mat_vec_f, not the generic F32-dequant matvec.  Match its
@@ -30678,10 +30776,19 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
                 /* The opt-in native IQ4_XS candidate owns all three projections. */
             } else {
                 begin_q8x2_reuse(r);
+                void *mo[3] = { r->d_xb2, r->d_k, r->d_v };
+                void *mw[3] = { cl->attn_q_w, cl->attn_k_w, cl->attn_v_w };
+                int mr[3] = { cl->attn_q_rows, cl->attn_k_rows, cl->attn_v_rows };
+                int mt[3] = { cl->attn_q_type, cl->attn_k_type, cl->attn_v_type };
+                if (cl->attn_q_cols != cl->attn_k_cols ||
+                    cl->attn_q_cols != cl->attn_v_cols ||
+                    !launch_qwen35_native_multi(r, 3, mo, mw, mr, mt, r->d_xb,
+                                                cl->attn_q_cols)) {
                 launch_matvec_auto(r, r->d_xb2, cl->attn_q_w, r->d_xb,
                                   cl->attn_q_rows, cl->attn_q_cols, cl->attn_q_type);
                 launch_matvec_auto(r, r->d_k, cl->attn_k_w, r->d_xb, cl->attn_k_rows, cl->attn_k_cols, cl->attn_k_type);
                 launch_matvec_auto(r, r->d_v, cl->attn_v_w, r->d_xb, cl->attn_v_rows, cl->attn_v_cols, cl->attn_v_type);
+                }
                 end_q8x2_reuse(r);
             }
             const char *qk_fused_env = getenv("LLM_QWEN35_QK_FUSED");
@@ -31214,12 +31321,20 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
                     !fused_iq1_gateup && !fused_mixed_iq_gateup &&
                     !fused_iq2s_gateup) {
                     begin_q8x2_reuse(r);
+                    void *mo[2] = { r->d_gate, r->d_up };
+                    void *mw[2] = { cl->ffn_gate_w, cl->ffn_up_w };
+                    int mr[2] = { cl->ffn_gate_rows, cl->ffn_up_rows };
+                    int mt[2] = { cl->ffn_gate_type, cl->ffn_up_type };
+                    if (cl->ffn_gate_cols != cl->ffn_up_cols ||
+                        !launch_qwen35_native_multi(r, 2, mo, mw, mr, mt, r->d_xb,
+                                                    cl->ffn_gate_cols)) {
                     launch_matvec_ffn_auto(r, r->d_gate, cl->ffn_gate_w, r->d_xb,
                                           cl->ffn_gate_rows, cl->ffn_gate_cols,
                                           cl->ffn_gate_type, 0);
                     launch_matvec_ffn_auto(r, r->d_up, cl->ffn_up_w, r->d_xb,
                                           cl->ffn_up_rows, cl->ffn_up_cols,
                                           cl->ffn_up_type, 0);
+                    }
                     end_q8x2_reuse(r);
                 }
                 if (r->debug_layers && debug_attention_layer_selected(l)) {
@@ -34907,6 +35022,7 @@ void hip_llm_free(hip_llm_runner *r) {
     if (r->d_native_argmax_scores) hipFree(r->d_native_argmax_scores);
     if (r->d_native_argmax_indices) hipFree(r->d_native_argmax_indices);
     if (r->iq_module) hipModuleUnload(r->iq_module);
+    if (r->mv_multi_module) hipModuleUnload(r->mv_multi_module);
     if (r->d_q8_attention_parts) hipFree(r->d_q8_attention_parts);
     if (r->d_q8_attention_meta) hipFree(r->d_q8_attention_meta);
     if (r->d_q8_prefill_parts) hipFree(r->d_q8_prefill_parts);
