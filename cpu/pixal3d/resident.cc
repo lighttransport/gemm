@@ -131,6 +131,9 @@ Tensor Engine::weight(Weights &w, const std::string &name, int precision) {
     } else if (storage_precision) {
         const float *v = w.get(name);
         std::vector<uint16_t> packed(n);
+        // Element-wise, so parallel is bitwise the same; it also faults the
+        // mmapped checkpoint pages in on all threads at once.
+#pragma omp parallel for schedule(static) if (n >= (size_t(1) << 20))
         for (size_t i = 0; i < n; ++i) {
             if (storage_precision == 1) {
                 float f = bf16(v[i]);

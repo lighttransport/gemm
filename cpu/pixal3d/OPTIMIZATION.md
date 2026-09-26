@@ -568,3 +568,52 @@ ref/pixal3d/run.sh cuda ref/pixal3d/replay_decoders.py \
   --expect-dir tmp/pixal3d/resident-runs/cuda-crab/dumps \
   --vram-budget-mib 7168 --profile-json tmp/pixal3d/decoder-replay/crab-7168.json
 ```
+
+## GPU utilization pass (2026-09-27): overlap, parallel postprocess, loading
+
+Output policy for this pass: deterministic (the same input always gives the
+same GLB) plus the quality gates. Output no longer has to be byte-identical
+to earlier builds. Fixture: `ref/pixal3d/upstream/assets/images/1_img.png`
+(house), single view, FOV 40°, CUDA resident, mixed precision, 2048 texture,
+1M triangles, RTX 5060 Ti. The host was shared, so timings vary by about 10%.
+
+**Where a run went.** Note that `generate` includes the postprocess. The
+baseline was 290 s:
+
+| Part | Seconds |
+|---|---|
+| Diffusion (shape1024 66, texture 40, structure 19, shape512 18) | 143 |
+| Postprocess (unwrap 43, simplify 41, BVH build 23, remesh 10) | 125 |
+| Decoders | 14 |
+| Conditioning | 6 |
+
+Weight loading happens inside the diffusion timings:
+`weights.convert` (serial F32→BF16) took 22.7 s, and `weights.upload` took
+14.6 s. Most of the upload time is actually the stream synchronize waiting
+for earlier compute, because weights upload at first use. A standalone test
+of `px_gpu_copy` measured pageable uploads at 7.0 GB/s. A pinned
+double-buffered staging path measured 6.8 GB/s, so it was not kept.
+
+| Change | generate | Output |
+|---|---|---|
+| Baseline | 290 s | `3e7a2143…` |
+| Geometry postprocess on its own thread during the texture flow and decoder | 235 s | byte-identical |
+| + parallel binned-SAH BVH, closest-point ties broken by lowest face id (build 23.0 → 3.4 s) | 216 s | `ad9845c1…`: geometry identical (Chamfer 0, same triangle count); only tie-broken texels differ |
+| + parallel simplify rounds (bitwise identical; 46.8 → 37.1 s) | 209 s | same hash across three runs |
+| + parallel F32→BF16 weight conversion (22.7 → 3.7 s CPU) | noisy on a shared host | same hash |
+
+What remains:
+- The geometry thread takes 97–115 s, but the texture window it overlaps is
+  about 45 s.
+- xatlas `ComputeCharts` takes 30 s of wall time for about 133 core-seconds
+  of work. That means only about 4.4 cores are busy: the 16.9k charts, which
+  xatlas re-segments with its default options as upstream CuMesh does, are
+  badly load-balanced.
+- Simplify still takes about 28–37 s over 52 rounds:
+  - setup 3–8 s
+  - serial adjacency fill 3.8 s
+  - sort 5 s
+  - costs 7.5 s
+  - serial compaction scans 3 s
+
+  The phase line printed at the end of simplify shows this split.
