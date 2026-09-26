@@ -483,7 +483,8 @@ static void hllm_dense_mtp_projection(hip_llm_runner *r, void *dst, void *w,
                    256, 1, 1, 0, r->stream, ma);
         } else if (rows <= HLLM_DENSE_MTP_REUSE_ROWS &&
                    type != GGML_TYPE_IQ4_XS &&
-                   !(type == GGML_TYPE_IQ2_S && nc > 6144)) {
+                   !(type == GGML_TYPE_IQ2_S && nc > 6144 &&
+                     rows != HLLM_DENSE_MTP_REUSE_ROWS)) {
             int kind = hllm_dense_mtp_iq_kind(type);
             if (rows <= HLLM_DENSE_MTP_SMALL_REUSE_ROWS) {
                 void *ma[] = { &dst, &w, &m->verify_q, &m->verify_scales,
