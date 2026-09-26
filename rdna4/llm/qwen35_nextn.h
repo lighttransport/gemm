@@ -418,7 +418,8 @@ static void hllm_dense_mtp_projection(hip_llm_runner *r, void *dst, void *w,
                    (nr+rows_per_block-1)/rows_per_block, rows, 1,
                    threads, 1, 1, 0, r->stream, a);
         } else {
-            LAUNCH(iq1_fn, (nr+7)/8, 1, 1, 256, 1, 1, 0, r->stream, a);
+            /* reuse8 kernels own four rows per warp */
+            LAUNCH(iq1_fn, (nr+31)/32, 1, 1, 256, 1, 1, 0, r->stream, a);
         }
         r->q8x2_reuse_valid = r->batch_q8_valid = 0;
         return;

@@ -69,7 +69,8 @@ typedef struct {
     int threads;      /* 0: one 256-thread block per row */
     int rows, cols;
     int sig;          /* 0: (y,w,q,s,rows,cols); 1: IQ1 (y,w,q,sd,ss,nr,nc,M=1);
-                       * 2: eight-row verifier (y,w,q[8],s[8],rows,cols,count=8) */
+                       * 2: eight-row verifier (y,w,q[8],s[8],rows,cols,count=8)
+                       * 3: IQ1 eight-row (y,w,q[8],sd[8],ss[8],nr,nc,M=8) */
 } kcase;
 
 /* Launch geometries mirror hip_llm_runner.c (launch_matvec_* native paths). */
@@ -109,6 +110,11 @@ static const kcase cases[] = {
     { "matvec_iq1_m_q81_batch",  2, 56, -2, -1, 64, 6144, 5120, 1 },
     { "matvec_iq1_m_q81_batch",  2, 56, -2, -1, 512, 5120, 6144, 1 },
     /* DFlash2 K=7 eight-row verifier kernels */
+    { "matvec_iq1_s_q81_reuse8", 2, 50, 0, -1, 256, 17408, 5120, 3 },
+    { "matvec_iq1_s_q81_reuse8", 2, 50, 0, -1, 256, 5120, 17408, 3 },
+    { "matvec_iq1_m_q81_reuse8", 2, 56, -2, -1, 256, 17408, 5120, 3 },
+    { "matvec_iq1_m_q81_reuse8", 2, 56, -2, -1, 256, 6144, 5120, 3 },
+    { "matvec_iq1_m_q81_reuse8", 2, 56, -2, -1, 256, 10240, 5120, 3 },
     { "qwen35_matvec_iq2xxs_fixed8", 0, 66, 0, -1, 256, 17408, 5120, 2 },
     { "qwen35_matvec_iq2xxs_fixed8", 0, 66, 0, -1, 256, 5120, 17408, 2 },
     { "qwen35_matvec_iq2xxs_fixed8", 0, 66, 0, -1, 256, 10240, 5120, 2 },
@@ -186,7 +192,7 @@ int main(int argc, char **argv) {
             h = (uint16_t)(0x1800 + (rnd() & 0x3ff));
             if (c->d_off2 >= 0) memcpy(blk + c->d_off2, &h, 2);
         }
-        int nact = c->sig == 2 ? 8 : 1;
+        int nact = c->sig >= 2 ? 8 : 1;
         signed char *hq = malloc((size_t)c->cols * nact);
         float *hs = malloc(sizeof(float) * (c->cols / 32) * nact);
         for (int i = 0; i < c->cols * nact; i++) hq[i] = (signed char)(rnd() % 255 - 127);
@@ -205,10 +211,10 @@ int main(int argc, char **argv) {
         HIP_CHECK(hipMalloc(&dq, (size_t)c->cols * nact));
         HIP_CHECK(hipMalloc(&ds, sizeof(float) * (c->cols / 32) * nact));
         void *ds2;
-        HIP_CHECK(hipMalloc(&ds2, sizeof(float) * (c->cols / 32)));
-        for (int i = 0; i < c->cols / 32; i++) hs[i] = (float)(rnd() % 2000) * 1e-3f - 1.0f;
-        HIP_CHECK(hipMemcpy(ds2, hs, sizeof(float) * (c->cols / 32), hipMemcpyHostToDevice));
-        for (int i = 0; i < c->cols / 32; i++) hs[i] = (float)(rnd() % 1000 + 1) * 1e-4f;
+        HIP_CHECK(hipMalloc(&ds2, sizeof(float) * (c->cols / 32) * nact));
+        for (int i = 0; i < c->cols / 32 * nact; i++) hs[i] = (float)(rnd() % 2000) * 1e-3f - 1.0f;
+        HIP_CHECK(hipMemcpy(ds2, hs, sizeof(float) * (c->cols / 32) * nact, hipMemcpyHostToDevice));
+        for (int i = 0; i < c->cols / 32 * nact; i++) hs[i] = (float)(rnd() % 1000 + 1) * 1e-4f;
         size_t ny = (size_t)c->rows * nact;
         HIP_CHECK(hipMalloc(&dy[0], sizeof(float) * ny));
         HIP_CHECK(hipMalloc(&dy[1], sizeof(float) * ny));
@@ -241,7 +247,8 @@ int main(int argc, char **argv) {
             void *a8[] = { &dy[v], &wcur, &dq, &ds, &ds2, (void *)&c->rows, (void *)&c->cols, &one };
             int eight = 8;
             void *a7[] = { &dy[v], &wcur, &dq, &ds, (void *)&c->rows, (void *)&c->cols, &eight };
-            void **a = c->sig == 1 ? a8 : c->sig == 2 ? a7 : a6;
+            void *a8m[] = { &dy[v], &wcur, &dq, &ds, &ds2, (void *)&c->rows, (void *)&c->cols, &eight };
+            void **a = c->sig == 1 ? a8 : c->sig == 2 ? a7 : c->sig == 3 ? a8m : a6;
             HIP_CHECK(hipMemset(dy[v], 0xff, sizeof(float) * ny));
             for (int i = 0; i < 20; i++) {
                 wcur = dwc[i % ncopy];
