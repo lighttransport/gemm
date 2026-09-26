@@ -21405,8 +21405,8 @@ static inline void launch_matvec_q2_K(hip_llm_runner *r, void *dst, void *mat,
                                       void *x, int n_rows, int n_cols) {
     if (qwen35_native_q81_ready(r) && r->fn_qwen35_matvec_q2k &&
         n_cols <= 17408 && n_cols % 256 == 0) {
+        /* Native Q8_1 lives in d_native_q81; the IQ1 staging stays valid. */
         r->q8x2_reuse_valid = 0;
-        r->iq1_q8_valid = 0;
         launch_native_q81(r, x, n_cols);
         void *args[] = { &dst, &mat, &r->d_native_q81, &r->d_native_scale,
                          &n_rows, &n_cols };
@@ -21538,8 +21538,8 @@ static inline void launch_matvec_iq2_xxs(hip_llm_runner *r, void *dst,
         void *mat, void *x, int n_rows, int n_cols) {
     if (qwen35_native_q81_ready(r) && r->fn_qwen35_matvec_iq2xxs &&
         n_cols <= 17408 && n_cols % 256 == 0) {
+        /* Native Q8_1 lives in d_native_q81; the IQ1 staging stays valid. */
         r->q8x2_reuse_valid = 0;
-        r->iq1_q8_valid = 0;
         launch_native_q81(r, x, n_cols);
         void *a[] = { &dst, &mat, &r->d_native_q81, &r->d_native_scale, &n_rows, &n_cols };
         LAUNCH(r->fn_qwen35_matvec_iq2xxs, (n_rows + 7) / 8, 1, 1, 256, 1, 1, 0, r->stream, a);
@@ -21606,7 +21606,7 @@ static inline void launch_matvec_iq4_xs(hip_llm_runner *r, void *dst,
         void *mat, void *x, int n_rows, int n_cols) {
     if (qwen35_native_q81_ready(r) && r->fn_qwen35_matvec_iq4xs &&
         n_cols <= 17408 && n_cols % 256 == 0) {
-        r->q8x2_reuse_valid = r->iq1_q8_valid = 0;
+        r->q8x2_reuse_valid = 0;
         launch_native_q81(r, x, n_cols);
         void *a[] = { &dst, &mat, &r->d_native_q81, &r->d_native_scale, &n_rows, &n_cols };
         LAUNCH(r->fn_qwen35_matvec_iq4xs, (n_rows+7)/8, 1, 1, 256, 1, 1, 0, r->stream, a);
@@ -21648,8 +21648,8 @@ static inline void launch_matvec_iq2_xs(hip_llm_runner *r, void *dst,
         void *mat, void *x, int n_rows, int n_cols) {
     if (qwen35_native_q81_ready(r) && r->fn_qwen35_matvec_iq2xs &&
         n_cols <= 17408 && n_cols % 256 == 0) {
+        /* Native Q8_1 lives in d_native_q81; the IQ1 staging stays valid. */
         r->q8x2_reuse_valid = 0;
-        r->iq1_q8_valid = 0;
         launch_native_q81(r, x, n_cols);
         void *a[] = { &dst, &mat, &r->d_native_q81, &r->d_native_scale, &n_rows, &n_cols };
         /* Sixteen waves improve the exact IQ2_XS shapes used by this model,
@@ -22495,8 +22495,8 @@ static inline void launch_matvec_iq3_xxs(hip_llm_runner *r, void *dst,
         void *mat, void *x, int n_rows, int n_cols) {
     if (qwen35_native_q81_ready(r) && r->fn_qwen35_matvec_iq3xxs &&
         n_cols <= 17408 && n_cols % 256 == 0) {
+        /* Native Q8_1 lives in d_native_q81; the IQ1 staging stays valid. */
         r->q8x2_reuse_valid = 0;
-        r->iq1_q8_valid = 0;
         launch_native_q81(r, x, n_cols);
         void *a[] = { &dst, &mat, &r->d_native_q81, &r->d_native_scale, &n_rows, &n_cols };
         /* The native kernel stages its 1 KiB codebook once per block.  Four
@@ -23392,8 +23392,8 @@ static inline void launch_matvec_iq2_s(hip_llm_runner *r, void *dst, void *mat,
                                        void *x, int n_rows, int n_cols) {
     if (qwen35_native_q81_ready(r) && r->fn_qwen35_matvec_iq2s &&
         n_cols <= 17408 && n_cols % 256 == 0) {
+        /* Native Q8_1 lives in d_native_q81; the IQ1 staging stays valid. */
         r->q8x2_reuse_valid = 0;
-        r->iq1_q8_valid = 0;
         launch_native_q81(r, x, n_cols);
         void *a[] = { &dst, &mat, &r->d_native_q81, &r->d_native_scale, &n_rows, &n_cols };
         int threads = qwen35_iq_shape_threads_enabled() && n_rows == 17408 ?
@@ -23464,8 +23464,8 @@ static inline void launch_matvec_iq3_s(hip_llm_runner *r, void *dst, void *mat,
                                        void *x, int n_rows, int n_cols) {
     if (qwen35_native_q81_ready(r) && r->fn_qwen35_matvec_iq3s &&
         n_cols <= 17408 && n_cols % 256 == 0) {
+        /* Native Q8_1 lives in d_native_q81; the IQ1 staging stays valid. */
         r->q8x2_reuse_valid = 0;
-        r->iq1_q8_valid = 0;
         launch_native_q81(r, x, n_cols);
         void *a[] = { &dst, &mat, &r->d_native_q81, &r->d_native_scale, &n_rows, &n_cols };
         int threads = qwen35_iq_shape_threads_enabled() &&
