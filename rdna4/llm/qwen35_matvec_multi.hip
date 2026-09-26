@@ -9,7 +9,7 @@
  * QWEN35_MVPAIR/QWEN35_MVTRIPLE line per format combination it loads. */
 
 __device__ __forceinline__ void qwen35_mvseg_iq2xxs(int bx,
-        
+
         float *__restrict__ out, const unsigned char *__restrict__ weights,
         const signed char *__restrict__ q, const float *__restrict__ scales,
         int rows, int cols) {
@@ -55,7 +55,7 @@ __device__ __forceinline__ void qwen35_mvseg_iq2xxs(int bx,
 
 
 __device__ __forceinline__ void qwen35_mvseg_iq2xs(int bx,
-        
+
         float *__restrict__ out, const unsigned char *__restrict__ weights,
         const signed char *__restrict__ q, const float *__restrict__ scales,
         int rows, int cols) {
@@ -99,7 +99,7 @@ __device__ __forceinline__ void qwen35_mvseg_iq2xs(int bx,
 
 
 __device__ __forceinline__ void qwen35_mvseg_iq2s(int bx,
-        
+
         float *__restrict__ out, const unsigned char *__restrict__ weights,
         const signed char *__restrict__ q, const float *__restrict__ scales,
         int rows, int cols) {
@@ -139,7 +139,7 @@ __device__ __forceinline__ void qwen35_mvseg_iq2s(int bx,
 
 
 __device__ __forceinline__ void qwen35_mvseg_iq3xxs(int bx,
-        
+
         float *__restrict__ out, const unsigned char *__restrict__ weights,
         const signed char *__restrict__ q, const float *__restrict__ scales,
         int rows, int cols) {
@@ -181,7 +181,7 @@ __device__ __forceinline__ void qwen35_mvseg_iq3xxs(int bx,
 
 
 __device__ __forceinline__ void qwen35_mvseg_iq3s(int bx,
-        
+
         float *__restrict__ out, const unsigned char *__restrict__ weights,
         const signed char *__restrict__ q, const float *__restrict__ scales,
         int rows, int cols) {
@@ -223,7 +223,7 @@ __device__ __forceinline__ void qwen35_mvseg_iq3s(int bx,
 
 
 __device__ __forceinline__ void qwen35_mvseg_iq4xs(int bx,
-        
+
         float *__restrict__ out, const unsigned char *__restrict__ weights,
         const signed char *__restrict__ q, const float *__restrict__ scales,
         int rows, int cols) {
@@ -266,7 +266,7 @@ __device__ __forceinline__ void qwen35_mvseg_iq4xs(int bx,
 
 
 __device__ __forceinline__ void qwen35_mvseg_q2k_rows(int bx,
-        
+
         float *out, const unsigned char *weights, const signed char *q,
         const float *scales, int rows, int cols) {
     int lane = threadIdx.x & 31;
@@ -310,7 +310,7 @@ __device__ __forceinline__ void qwen35_mvseg_q2k_rows(int bx,
 
 
 __device__ __forceinline__ void qwen35_mvseg_q2k(int bx,
-        
+
         float *out, const unsigned char *weights, const signed char *q,
         const float *scales, int rows, int cols) {
     int row = bx, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;

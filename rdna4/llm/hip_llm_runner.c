@@ -21889,6 +21889,7 @@ static inline void launch_matvec_q2_K(hip_llm_runner *r, void *dst, void *mat,
                        &r->d_act_scale_b, &x, &n_cols, &one, &stride };
         LAUNCH(r->fn_quantize_q81_batch_32_exact, (n_cols + 31) / 32, 1, 1,
                32, 1, 1, 0, r->stream, qa);
+        r->iq1_q8_valid = 0;    /* d_act_q8 now holds this x, not the staging */
         void *qargs[] = { &dst, &mat, &r->d_act_q8, &r->d_act_scale,
                           &n_rows, &n_cols };
         LAUNCH(r->fn_matvec_q2_K_q81, (n_rows + 7) / 8, 1, 1,
@@ -23537,6 +23538,8 @@ static inline void launch_quantize_q8(hip_llm_runner *r, void *x, int n,
                                       void *qs, void *scale) {
     void *args[] = { &qs, &scale, &x, &n };
     LAUNCH(r->fn_quantize_q8_32, (n + 31) / 32, 1, 1, 32, 1, 1, 0, r->stream, args);
+    /* qs may be d_act_q8: an adopted IQ1 Q8_1 staging no longer holds. */
+    r->iq1_q8_valid = 0;
 }
 static inline void launch_quantize_q8k(hip_llm_runner *r, void *dst,
                                        void *x, int n) {
@@ -30589,6 +30592,7 @@ static void forward_dense_ssm_core(hip_llm_runner *r, hip_layer *cl, int l) {
     r->ssm_core_q81_req = 0;
     r->ssm_core_q81_done = 0;
     if (core_req && fold_pair && r->fn_ssm_core_fused_q81_f32 &&
+        r->is_hybrid && !r->is_qwen4exp &&
         r->d_ssm_core_sync && n_group <= 64 && dt_rank % n_group == 0 &&
         !r->debug_layers && d_state == 128 && conv_k == 4 &&
         qkv_dim - 2 * n_group * d_state == dt_rank * d_state &&

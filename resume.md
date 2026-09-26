@@ -64,7 +64,7 @@ DFlash2 K=7 follow-up: **100.7 -> ~104.1 tok/s** (same hash, 134/140 accepted).
   attention ~4.
 - Draft length is capped at 7 (8 verifier rows). K=5 is much slower (67 tok/s)
   because the fixed8 kernels need exactly 8 rows.
-- Dead ends (scratch kernels in rdna4/llm/tmp/nq):
+- Dead ends (scratch kernels were kept locally in the untracked rdna4/llm/tmp/nq):
   - **Row-blocked Q2_K fixed8 (R=2/4)**: exact, slower. It is ALU bound at
     ~7 VALU/weight/token.
   - **WMMA iu8 for the IQ fixed8 integer dots**: exact (z per 16/32-weight
