@@ -631,6 +631,25 @@ class ValidationTest(Tmp):
 
 
 class CliTest(Tmp):
+    def test_text_arguments_from_files(self):
+        long_prompt = "a small brass robot with round glass eyes, " * 200
+        (self.dir / "prompt.txt").write_text(long_prompt + "\n")
+        expanded = runner.read_text_files(["object", "--prompt", "@" + str(self.dir / "prompt.txt"),
+                                           "--negative-prompt=@" + str(self.dir / "prompt.txt"), "--output", "@x"])
+        self.assertEqual(expanded[2], long_prompt.strip())
+        self.assertEqual(expanded[3], "--negative-prompt=" + long_prompt.strip())
+        self.assertEqual(expanded[5], "@x")                   # only text flags read files
+        with self.assertRaisesRegex(SystemExit, "No such file"):
+            runner.read_text_files(["--prompt", "@" + str(self.dir / "missing.txt")])
+        code, out, _ = self.run_cli("object", "--backend", "mock", "--prompt", "@" + str(self.dir / "prompt.txt"),
+                                    "--output", str(self.dir / "robot.png"), "--width", "256", "--height", "256",
+                                    "--size", "256", "--steps", "2")
+        self.assertEqual(code, 0)
+        result = json.loads(out)
+        self.assertTrue(result["prompt"].startswith(long_prompt.strip()))
+        self.assertIn("background is transparent", result["prompt"])
+        self.assertTrue((self.dir / "robot.png").is_file() and (self.dir / "robot_raw.png").is_file())
+
     def run_cli(self, *argv):
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
@@ -638,8 +657,8 @@ class CliTest(Tmp):
         return code, out.getvalue(), err.getvalue()
 
     def test_every_command_has_help(self):
-        for command in ("object-preprocess", "edit", "texture-preprocess", "multiview", "turntable",
-                        "image-to-3d", "validate"):
+        for command in ("object", "object-preprocess", "edit", "texture-preprocess", "multiview", "turntable",
+                        "image-to-3d", "turnaround", "reconstruct", "validate"):
             with self.subTest(command=command):
                 with self.assertRaises(SystemExit) as exit_:
                     self.run_cli(command, "--help")
@@ -807,6 +826,25 @@ class NativeResidentTest(Tmp):
         finally:
             backend.close()
         self.assertFalse(backend._fast.alive() or backend._vae.alive())
+
+    def test_prompt_capacity_grows_with_the_prompt_and_the_limit_is_explained(self):
+        backend = self.native.NativeBackend()
+        counts = {"short": 40, "long": 900, "huge": 4000}
+        backend.prompt_tokens = lambda prompt: counts[prompt]
+        try:
+            capacities = []
+            for prompt in ("short", "long"):
+                backend.resident_sockets(GenRequest(prompt=prompt, out=self.dir / "o.png"))
+                denoiser = next(c for c in reversed(self.calls()) if "--serve-prompt-tokens" in c)
+                capacities.append(int(denoiser[denoiser.index("--serve-prompt-tokens") + 1]))
+            self.assertEqual(capacities, [512, 1024])
+            self.assertEqual(backend._fast.starts, 2)
+            # Text-only 4000 tokens fits; with a 1024-token reference's pads it does not.
+            backend.check_prompt(GenRequest(prompt="huge", out=self.dir / "o.png"))
+            with self.assertRaisesRegex(BackendError, "exceeds the native text encoder"):
+                backend.check_prompt(GenRequest(prompt="huge", out=self.dir / "o.png", references=(self.ref,)))
+        finally:
+            backend.close()
 
     def test_explicit_sockets_and_opt_out_start_nothing(self):
         request = GenRequest(prompt="x", out=self.dir / "o.png")

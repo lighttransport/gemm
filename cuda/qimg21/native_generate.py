@@ -35,12 +35,23 @@ DEFAULT_PACKAGES = {
 }
 
 
+def _shown(command) -> str:
+    """A command line for logs: long arguments (a prompt) are shortened."""
+    parts = []
+    for arg in map(str, command):
+        parts.append(arg if len(arg) <= 160 else f"{arg[:120]!r}...[{len(arg)} chars]")
+    return " ".join(parts)
+
+
 def _run(command: list[str], *, cwd: Path) -> None:
-    print("+", " ".join(str(x) for x in command), file=sys.stderr)
+    print("+", _shown(command), file=sys.stderr)
     start = time.perf_counter()
-    subprocess.run(command, cwd=cwd, check=True)
-    print(f"  ({Path(command[0]).name if 'python' not in Path(command[0]).name else Path(command[1]).name}: "
-          f"{time.perf_counter() - start:.1f} s)", file=sys.stderr)
+    name = Path(command[0]).name if "python" not in Path(command[0]).name else Path(command[1]).name
+    code = subprocess.run(command, cwd=cwd).returncode
+    if code:
+        # Its own messages are already on stderr, just above.
+        raise SystemExit(f"{name} failed (exit status {code})")
+    print(f"  ({name}: {time.perf_counter() - start:.1f} s)", file=sys.stderr)
 
 
 def _run_resident(socket_path: Path, command: list[str]) -> bool:
@@ -63,7 +74,7 @@ def _run_resident(socket_path: Path, command: list[str]) -> bool:
         conn.connect(str(socket_path))
     except OSError:
         return False
-    print("+ resident", " ".join(str(x) for x in command), file=sys.stderr, flush=True)
+    print("+ resident", _shown(command), file=sys.stderr, flush=True)
     status = None
     pending = b""
     with conn:

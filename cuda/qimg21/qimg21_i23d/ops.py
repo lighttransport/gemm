@@ -400,6 +400,34 @@ def generate_turntable(references, root, backend: Backend, *, views: int = 24, e
     return generate_multiview(references, specs, root, backend, params, layout="flat", **options)
 
 
+OBJECT_CLAUSE = ("A single complete object, centered, fully inside the frame, on its own, with nothing else in "
+                 "the scene. Neutral studio lighting.")
+
+
+def generate_object(prompt: str, out, backend: Backend, *, width: int = 1024, height: int = 1024,
+                    size=(512, 512), fill: float = 0.85, transparent: bool = True, steps: int = 20, seed: int = 0,
+                    negative_prompt: str | None = None) -> dict:
+    """Text -> one framed RGBA object (the studio's first step).
+
+    Qwen-Image 2.1 draws the object alone, on a native transparent
+    background by default; the result is framed like preprocess_object
+    (centred, longest side `fill` of a `size` canvas; size None keeps the
+    generated canvas). The unframed image is kept as <out>_raw.png."""
+    if not prompt or not prompt.strip():
+        raise ValueError("an object needs a prompt")
+    out = Path(out)
+    raw = out.with_name(out.stem + "_raw.png")
+    full = " ".join([prompt.strip(), OBJECT_CLAUSE,
+                     viewlib.BACKGROUND_CLAUSES["transparent" if transparent else "white"]])
+    result = backend.generate(GenRequest(prompt=full, out=raw, width=width, height=height, steps=steps, seed=seed,
+                                         negative_prompt=negative_prompt))
+    method = "alpha" if (imageops.load_rgba(raw)[..., 3] < 250).any() else "rmbg"
+    info = preprocess_object(raw, out, backend, method=method, size=size, fill=fill, steps=steps, seed=seed)
+    return {"output": str(out), "raw": str(raw), "prompt": full, "seconds": round(result.seconds, 3),
+            "backend": result.backend, "extraction": info["method"], "transform": info.get("transform"),
+            "timings": result.details.get("timings")}
+
+
 TURNAROUND_VIEWS = {
     4: ((0.0, "front view facing the viewer"), (90.0, "side view with the character facing left"),
         (180.0, "back view"), (270.0, "side view with the character facing right")),

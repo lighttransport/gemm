@@ -46,12 +46,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "cuda/qimg21"))
 
-from qimg21_i23d import imageops, ops, reconstruct, views as viewlib  # noqa: E402
-from qimg21_i23d.backends import GenRequest  # noqa: E402
+from qimg21_i23d import imageops, ops, reconstruct  # noqa: E402
 
 SIZE = 512
-OBJECT_CLAUSE = ("A single complete object, centered, fully inside the frame, on its own, with nothing else in "
-                 "the scene. Neutral studio lighting.")
 STAGES = ("text", "upload", "edit", "views", "turnaround", "reconstruct")
 SESSION_ID = re.compile(r"[0-9a-f]{32}")
 SERVED = (".png", ".glb", ".json", ".log")
@@ -79,7 +76,9 @@ def _float(request, key, default, lo, hi):
     return float(value)
 
 
-def _text(request, key, required=True, limit=2000):
+def _text(request, key, required=True, limit=20000):
+    # Long prompts are fine: the image backend checks them against the text
+    # encoder's token limit and says so. This only bounds the request size.
     value = request.get(key, "")
     if not isinstance(value, str) or (required and not value.strip()) or len(value) > limit:
         raise StudioError(f"{key} must be {'a non-empty ' if required else 'a '}string of at most {limit} characters")
@@ -273,18 +272,13 @@ class Studio:
         if width % 32 or height % 32:
             raise StudioError("width and height must be multiples of 32")
         transparent = request.get("transparent", True) is not False
-        full = " ".join([prompt, OBJECT_CLAUSE, viewlib.BACKGROUND_CLAUSES["transparent" if transparent else "white"]])
         name, path = self._next_image(record)
-        raw = path.with_name(path.stem + "_raw.png")
-        report("Qwen-Image 2.1: text to image", 10)
-        result = self.backend().generate(GenRequest(prompt=full, out=raw, width=width, height=height, steps=steps,
-                                                    seed=seed))
-        report("framing the object", 85)
-        method = "alpha" if (imageops.load_rgba(raw)[..., 3] < 250).any() else "rmbg"
-        info = ops.preprocess_object(raw, path, self.backend(), method=method, size=(SIZE, SIZE),
-                                     steps=steps, seed=seed)
-        details = {"prompt": full, "generation_seconds": round(result.seconds, 3), "extraction": info["method"],
-                   "timings": result.details.get("timings")}
+        report("Qwen-Image 2.1: text to object", 10)
+        info = ops.generate_object(prompt, path, self.backend(), width=width, height=height, size=(SIZE, SIZE),
+                                   transparent=transparent, steps=steps, seed=seed)
+        details = {"prompt": info["prompt"], "generation_seconds": info["seconds"], "extraction": info["extraction"],
+                   "timings": info["timings"]}
+        raw = Path(info["raw"])
         self._push(record, name, "text", prompt, details, raw=raw.relative_to(self.root / record["id"]).as_posix())
         return details
 

@@ -53,6 +53,7 @@ reference counts).
 
 | command | what it does |
 |---|---|
+| `object` | text → one framed RGBA object: Qwen-Image 2.1 draws it alone on a native transparent background (1024² by default); framed like `object-preprocess`, with the unframed image kept as `<output>_raw.png`. |
 | `object-preprocess` (alias `image-to-3d-preprocess`) | photo → RGBA object: `--method qwen` (default; the model's native transparent extraction) or `rmbg` (RMBG-2.0 matting, alpha only) or `alpha` (use the input's alpha). `--pixels original` (default) keeps the source RGB and takes only the alpha, so detail and geometry come from the photo. Then center/scale (`--fill 0.85`, `--pad`, `--crop`, `--size`, `--keep-scale`, `--no-center`). |
 | `edit` | object-preserving image-to-image edit (`--instruction`). `--strength 1` edits through image conditioning; below 1 it is SDEdit from the input. `--mask`/`--mask-rect x,y,w,h`/`--mask-circle cx,cy,r` limit the change (see [Masks](#masks)). |
 | `texture-preprocess` | `--ops neutralize-lighting,reduce-shadows,reduce-specular,remove-reflections,repair-defects,remove-background` with an instruction that forbids beautifying and keeps text/logos. |
@@ -62,6 +63,22 @@ reference counts).
 | `reconstruct` | a view dataset (multiview) or an RGBA object (single view) → `<runner>.glb` and `reconstruction.json` with Pixal3D. |
 | `turnaround` | a character's front / left / back (/ right) views from **one turnaround sheet** (`--prompt` and/or `--input` reference) → posed dataset; `--reconstruct native` builds the GLB from those views (multiview). See [Characters](#characters-turnaround-sheets). |
 | `validate DIR` | re-run the 2D validation of a dataset and rewrite `validation.json`. |
+
+Long prompts:
+- Every text argument (`--prompt`, `--instruction`, `--edit`,
+  `--negative-prompt`) accepts `@FILE` to read the text from a file.
+- The native text encoder takes up to **4096 tokens**, including the chat
+  template and, with an image reference, its image tokens (1024 at the
+  default condition resolution). About 3,000 English words fit without a
+  reference.
+- The backend counts a prompt's tokens with the native tokenizer (~0.15 s,
+  cached). A prompt that doesn't fit is refused before any work, with its
+  token count and the options: shorten it, lower `--condition-resolution`,
+  or use `--backend torch`, which has no limit (the 2.1 pipeline doesn't
+  truncate).
+- The resident denoiser is sized for the prompt: 512 tokens, then 1024,
+  2048 or 4096. Previously every prompt over 512 tokens fell back to a
+  one-shot run: a 669-word prompt took 25 s per image instead of ~7 s.
 
 Shared options: `--backend auto|native|torch|mock`, `--steps` (20),
 `--seed` (0), `--seed-mode shared|per_view`, `--width/--height` (512),
@@ -344,9 +361,44 @@ So the conclusion depends on how the views were made:
 - a **turnaround sheet's** views should, since they are consistent and
   share one scale.
 
-`turnaround` therefore reconstructs in multiview by default. With
-`--input` the sheet is conditioned on a reference image of the character;
-that path is covered by tests but has not been measured. Generating a
+`turnaround` therefore reconstructs in multiview by default.
+
+**From a picture of an existing character** (`--input`), with Pixal3D's
+jester example `21_img.png` as the only input:
+
+```sh
+$PY cuda/qimg21/runner.py turnaround --input ref/pixal3d/upstream/assets/images/21_img.png \
+  --output tmp/jester --views 4 --steps 20 --seed 3
+```
+
+The sheet (31–44 s) kept the identity: the glowing face, the red/blue hat
+with bells, the lantern and the orb. With seed 3 it was also geometrically
+right:
+- the lantern in the character's right hand is on the image left from the
+  front, on the image right from the back, and appears in the right
+  profile;
+- the orb appears in the left profile.
+
+Seed 12 dropped the props from the side and back views, so try a couple of
+seeds.
+
+Reconstruction reversed the bunny's outcome:
+- **Single view** from the front panel (225 s) gave the better model: the
+  reference's colors, a plausible back with no face, and props in place.
+- **Multiview** (234 s) turned the hat magenta and had a few stray quads.
+
+Each panel is centred on its bounding box. For a character with big
+asymmetric parts (lantern, hat tips, orb), that isn't where the turning
+axis is, so the four textures blend slightly off-target (red over blue
+gives magenta). A compact, near-symmetric figure like the bunny doesn't
+show this.
+
+Rule of thumb:
+- a turnaround sheet always gives consistent views, for previews and
+  datasets;
+- reconstruct compact, symmetric characters in multiview, and characters
+  with large asymmetric props in single view;
+- or run both (two ~4-minute runs) and keep the better one. Generating a
 sheet wider than 1024 px also needed a driver fix: the default VAE decode
 tile is now clamped to the short side.
 
@@ -483,6 +535,10 @@ took 262 s wall.
   scale, or consistency with the requested camera. `transforms.json` holds
   requested cameras, never calibration, and must not be used as ground
   truth.
+- **Turnaround panels are centred per view.** Their horizontal registration
+  follows each panel's bounding box, not the character's turning axis,
+  which blurs multiview textures for asymmetric characters (see the
+  jester).
 - **Generated views are not calibrated views.**
   - Views generated one at a time, posed as cameras for Pixal3D multiview,
     made the mesh worse than the single input view (see [the

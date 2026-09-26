@@ -39,6 +39,10 @@ PACKAGES = {"int8": "/mnt/nvme01/models/qimg-21-fast/int8-smooth-a0.6",
 PRESET_WEIGHTS = {"low8": "int8", "low8-fp4": "nvfp4", "fast12": "int8", "accurate": None}
 ATTENTION = {"sage": "sage", "flash": "flash", "exact": "cutlass-efficient"}
 VAE = HERE / "test_cuda_qimg21_vae"
+TEXT = HERE / "test_cuda_qimg21_text"
+# The native text encoder's RoPE table covers 4096 positions; an image
+# reference also spends condition_tokens / 4 of them on image pads.
+MAX_PROMPT_TOKENS = 4096
 RESIDENT_START_TIMEOUT = 600.0
 # The resident VAE decoder holds about 3 GB after its first decode; past 1024^2
 # the decode tiles itself one-shot and the denoiser needs the room.
@@ -135,6 +139,41 @@ class NativeBackend:
         self._vae = _Resident(self._home, "vae", "qimg21-vae: serving")
         self._encoded: set[tuple[str, int]] = set()   # (reference sha256, condition resolution)
         self._prepared: dict[tuple[str, int], list[dict]] = {}   # encode-only timings, reported once
+        self._token_counts: dict[str, int] = {}
+
+    def prompt_tokens(self, prompt: str) -> int:
+        """Token count of a prompt (chat template included), from the native
+        tokenizer itself (CPU only, ~0.15 s, cached). A prompt over the
+        encoder's 4096 tokens raises BackendError with the reason."""
+        if prompt in self._token_counts:
+            return self._token_counts[prompt]
+        if not TEXT.is_file():
+            return max(1, len(prompt.encode()) // 2)      # an upper bound, when the encoder is not built
+        with tempfile.TemporaryDirectory(prefix="qimg21-tokens-", dir=ROOT / "tmp") as td:
+            dump = Path(td) / "tokens.txt"
+            done = subprocess.run([str(TEXT), "--model", str(self.model), "--prompt", prompt, "--dump-tokens",
+                                   str(dump)], cwd=ROOT, capture_output=True, text=True)
+            if done.returncode or not dump.is_file():
+                raise BackendError(f"the prompt could not be tokenized or is longer than {MAX_PROMPT_TOKENS} tokens "
+                                   f"(the native text encoder's limit; {len(prompt.split())} words given). "
+                                   "Shorten it, or use --backend torch")
+            count = len(dump.read_text().split())
+        self._token_counts[prompt] = count
+        return count
+
+    def check_prompt(self, request: GenRequest) -> int:
+        """The prompt capacity (tokens) a request needs; BackendError if it
+        cannot fit the native text encoder."""
+        condition = 0
+        if request.references:
+            _, cw, ch = self.condition_size(request.references[0])
+            condition = (cw // 16) * (ch // 16)
+        needed = max(self.prompt_tokens(p) for p in (request.prompt, request.negative_prompt) if p)
+        if needed + condition // 4 + 8 > MAX_PROMPT_TOKENS:
+            raise BackendError(f"the prompt is {needed} tokens; with the reference image's {condition // 4} image "
+                               f"tokens that exceeds the native text encoder's {MAX_PROMPT_TOKENS}. Shorten it, lower "
+                               "--condition-resolution, or use --backend torch")
+        return needed
 
     def condition_size(self, image) -> tuple[int, int, int]:
         """(resolution, width, height) of a reference's condition image.
@@ -215,12 +254,19 @@ class NativeBackend:
         weights = PRESET_WEIGHTS[self.preset]
         package = PACKAGES[weights] if weights else ""
         attention = ATTENTION.get(self.attention or "", "")
+        # Prompt capacity in powers of two from 512, so a longer prompt
+        # re-sizes the process a few times at most instead of falling back to
+        # a one-shot run for every image.
+        tokens = self.check_prompt(request)
+        capacity = 512
+        while capacity < tokens + 64 and capacity < MAX_PROMPT_TOKENS:
+            capacity *= 2
         key = (FAST.stat().st_mtime_ns, str(self.model), self.preset, package, h, w,
-               bool(request.negative_prompt), attention, condition)
+               bool(request.negative_prompt), attention, condition, capacity)
         command = [str(FAST), "--serve", str(self._fast.socket), "--preset", self.preset, "--model", str(self.model),
                    "--height-tokens", str(h), "--width-tokens", str(w),
                    "--serve-cfg", "1" if request.negative_prompt else "0",
-                   "--serve-condition-tokens", str(condition)]
+                   "--serve-condition-tokens", str(condition), "--serve-prompt-tokens", str(capacity)]
         if attention:
             command += ["--attention", attention]
         if package:
@@ -291,6 +337,7 @@ class NativeBackend:
             raise BackendError("init images and masks need a fast preset (--runner fast)")
         Path(request.out).parent.mkdir(parents=True, exist_ok=True)
         started = time.perf_counter()
+        self.check_prompt(request)
         fast, vae, timings = self.resident_sockets(request)
         text = self._run(request, [], sockets=(fast, vae))
         if not Path(request.out).is_file():

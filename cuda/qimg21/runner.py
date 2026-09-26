@@ -1,16 +1,23 @@
 #!/usr/bin/env python3
-"""Qwen-Image 2.1 runner: Image-to-3D preprocessing commands.
+"""Qwen-Image 2.1 runner: Image-to-3D commands.
 
+    runner.py object              text -> framed RGBA object (transparent background)
     runner.py object-preprocess   photo -> RGBA object (background removal, framing)
     runner.py edit                object-preserving image-to-image edit (optional mask)
     runner.py texture-preprocess  lighting / shadow / specular cleanup for texturing
     runner.py multiview           views of a reference object (rings, top/bottom)
     runner.py turntable           evenly spaced views at one elevation
-    runner.py image-to-3d         the whole chain into a dataset
+    runner.py image-to-3d         the whole chain into a dataset (-> GLB with Pixal3D)
+    runner.py turnaround          a character's front/side/back views from one sheet (-> GLB)
+    runner.py reconstruct         a dataset or an RGBA object -> GLB with Pixal3D
     runner.py validate            re-run the 2D checks on a dataset
 
-Text-to-image generation stays in native_generate.py. Camera values in the
-outputs are requested view metadata, not calibration; see IMAGE_TO_3D.md.
+Text arguments (--prompt, --instruction, --edit, --negative-prompt) accept
+@FILE to read the text from a file, for long prompts. Prompts may be up to
+the native text encoder's 4096 tokens (an image reference uses some of them;
+a too-long prompt is refused with its token count); --backend torch has no
+such limit. Camera values in the outputs are requested view metadata, not
+calibration; see IMAGE_TO_3D.md.
 """
 from __future__ import annotations
 
@@ -115,6 +122,14 @@ def view_params(args) -> ops.ViewParams:
 def view_common(args) -> dict:
     return {"width": args.width, "height": args.height, "projection": args.projection, "fov_deg": args.fov,
             "distance": args.distance}
+
+
+def cmd_object(args):
+    backend = make_backend(args, 0)
+    return ops.generate_object(args.prompt, args.output, backend, width=args.width, height=args.height,
+                               size=None if args.size == 0 else (args.size, args.size), fill=args.fill,
+                               transparent=not args.opaque, steps=args.steps, seed=args.seed,
+                               negative_prompt=args.negative_prompt)
 
 
 def cmd_object_preprocess(args):
@@ -288,6 +303,18 @@ def build_parser() -> argparse.ArgumentParser:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="command", required=True)
 
+    p = sub.add_parser("object", help="text -> one framed RGBA object on a transparent background")
+    p.add_argument("--prompt", required=True, help="the object (or @FILE)")
+    p.add_argument("--output", required=True, help="RGBA PNG (the unframed image is kept as <output>_raw.png)")
+    p.add_argument("--negative-prompt", help="enables true CFG (or @FILE)")
+    p.add_argument("--width", type=int, default=1024, help="generated width (default 1024)")
+    p.add_argument("--height", type=int, default=1024, help="generated height (default 1024)")
+    p.add_argument("--size", type=int, default=512, help="framed square canvas; 0 keeps the generated canvas")
+    p.add_argument("--fill", type=float, default=0.85, help="object's longest side / canvas")
+    p.add_argument("--opaque", action="store_true", help="white background instead of transparency")
+    add_backend_options(p)
+    p.set_defaults(run=cmd_object)
+
     p = sub.add_parser("object-preprocess", aliases=["image-to-3d-preprocess"],
                        help="background removal and framing into an RGBA PNG")
     p.add_argument("--input", required=True)
@@ -401,6 +428,34 @@ def build_parser() -> argparse.ArgumentParser:
 SIGNED_VALUES = ("--elevations", "--elevation", "--mask-rect", "--mask-circle", "--recon-elevations")
 
 
+TEXT_VALUES = ("--prompt", "--instruction", "--edit", "--negative-prompt")
+
+
+def read_text_files(argv: list[str]) -> list[str]:
+    """--prompt @FILE (or --prompt=@FILE): the text of FILE, for prompts too
+    long or too awkward to quote on a command line."""
+    out = []
+    for i, arg in enumerate(argv):
+        flag, eq, value = arg.partition("=")
+        if eq and flag in TEXT_VALUES and value.startswith("@"):
+            out.append(f"{flag}={_read_text(value[1:], flag)}")
+        elif i and argv[i - 1] in TEXT_VALUES and arg.startswith("@"):
+            out.append(_read_text(arg[1:], argv[i - 1]))
+        else:
+            out.append(arg)
+    return out
+
+
+def _read_text(path: str, flag: str) -> str:
+    try:
+        text = Path(path).read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise SystemExit(f"runner: {flag} @{path}: {exc.strerror or exc}")
+    if not text:
+        raise SystemExit(f"runner: {flag} @{path}: the file is empty")
+    return text
+
+
 def join_signed_values(argv: list[str]) -> list[str]:
     out, i = [], 0
     while i < len(argv):
@@ -414,7 +469,7 @@ def join_signed_values(argv: list[str]) -> list[str]:
 
 
 def main(argv=None) -> int:
-    raw = join_signed_values(list(sys.argv[1:] if argv is None else argv))
+    raw = join_signed_values(read_text_files(list(sys.argv[1:] if argv is None else argv)))
     args = build_parser().parse_args(raw)
     args.recon_mode_given = any(a == "--recon-mode" or a.startswith("--recon-mode=") for a in raw)
     args.backends = []

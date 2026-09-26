@@ -480,7 +480,7 @@ int main(int argc, char **argv) {
                 tokenizer_path, prompt, image_grid_h * image_grid_w / 4,
                 ids, 4096, &drop, &image_start) :
             q21_build_prompt_tokens(tokenizer_path, prompt, ids, 4096, &drop);
-        if (n < 0) { fprintf(stderr,"text: native tokenization failed\n"); return 1; }
+        if (n < 0) { fprintf(stderr,"text: native tokenization failed, or the prompt is longer than 4096 tokens (the RoPE table)\n"); return 1; }
         fprintf(stderr,"text: native tokenizer produced %d tokens, drop-prefix=%d\n",n,drop);
     } else {
         char word[64];
