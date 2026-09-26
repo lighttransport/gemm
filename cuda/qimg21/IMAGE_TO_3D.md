@@ -215,14 +215,13 @@ on an RTX 5060 Ti 16 GB, with a 1024-px condition image of the bunny cake.
 | resident denoiser + VAE decoder, prompt cached | **6.9 s** (denoise 5.7 s, decode 0.6 s) |
 | resident, new prompt encoded alone (every view of a new object, before batching) | 12.3–13.7 s (text encoder 3.5–4.7 s) |
 | same, `--condition-resolution 512` | 10.2–10.7 s (denoise 3.6 s) |
-| **new object, view prompts batched** (views 3–8 of 8) | **6.5–6.8 s** |
+| **new object, encode-only prepare + batched prompts** (views 2–8 of 8) | **5.9–6.0 s** |
 
 For a whole new-object turntable (8 views, empty caches), the total went
-from about 115 s to **87 s**:
-- view 1: 35.9 s, one-shot. It runs the VAE and vision encodes, all 8
-  prompts in one 11.9 s text pass, and a denoise that loads the weights.
-- view 2: 11.2 s, which includes starting the resident processes.
-- views 3–8: 6.5 s each.
+from about 115 s to **72.5 s**:
+- prepare, 17.1 s: condition encodes plus all 8 prompts in one text pass;
+- view 1, 12.9 s: includes starting the resident processes;
+- views 2–8: 6.0 s each.
 
 The images are byte-identical to the unbatched run.
 
@@ -235,12 +234,13 @@ What made the difference:
   weight reloading between views. A request of a different shape
   re-sizes them. Both processes exit with the Python process that started
   them, or on `backend.close()`.
-- **One-shot requests.** A backend's first request for each reference
-  (even when its encodes are already in the disk cache), and every
-  init-image request, runs one-shot with the resident processes stopped:
-  its VAE and vision encoders need that device memory. Its encodes are then
-  cached by content, so every later view of that reference is resident.
-  Use `--no-resident` to force one-shot throughout.
+- **One-shot requests.** Without a prepare (a lone `generate_view` or
+  `edit`), a backend's first request for a reference runs one-shot with
+  the resident processes stopped. That happens even when the reference's
+  encodes are already in the disk cache, because its VAE and vision
+  encoders need that device memory. Every init-image request also runs
+  one-shot. Later requests for that reference are resident. Use
+  `--no-resident` to force one-shot throughout.
 - **Caches.** The condition cache (VAE + vision encodes), the multimodal
   prompt cache and the noise cache are keyed by file content, never by path
   or mtime. They live in `tmp/qimg21-prompt-cache`.
@@ -251,12 +251,16 @@ What made the difference:
 - **Device-release wait.** The driver waits for device memory to be
   released only when an encoder subprocess actually ran, which saves 2 s
   per cached view.
-- **Batched view prompts.** `generate_views` hands every request to
-  `backend.prepare()` first. The native backend passes the other view
-  prompts to that reference's first (one-shot) run as
-  `native_generate.py --prompt-batch prompts.json`. The driver encodes the
-  uncached ones with `test_cuda_qimg21_text --prompts-file` in passes of up
-  to 12 prompts, and stores each in the multimodal prompt cache.
+- **Encode-only prepare with batched view prompts.** `generate_views` hands
+  every request to `backend.prepare()` first. For each reference the
+  backend hasn't used yet, the native backend runs the driver once with
+  `--encode-only --prompt-batch prompts.json`, with the resident processes
+  stopped. That run caches the condition image's VAE and vision encodes,
+  and encodes the uncached view prompts with `test_cuda_qimg21_text
+  --prompts-file` in passes of up to 12, storing each in the multimodal
+  prompt cache. Every view, the first included, then goes through the
+  resident processes. The prepare time is reported with the first view's
+  timings (labels starting `prepare:`).
   - In a pass, each 13.9 GB weight stream is used by every prompt: about
     0.75 s per extra prompt instead of 3.5 s.
   - GEMMs, attention and RoPE positions run per prompt, so each prompt's
@@ -308,9 +312,11 @@ took 262 s wall.
 
 ## Future work
 
-- The first view of a new reference still pays for a one-shot denoiser
-  load, and the second for starting the resident processes. The resident
-  denoiser could encode the condition itself instead.
+- All view prompts of one reference share their system and image prefix
+  (~1,030 of ~1,050 rows). Computing that prefix once per batch would cut
+  the prepare text pass by several times. It would, however, change the
+  GEMM row blocking, and so the bits, relative to the PyTorch-parity
+  single-prompt path.
 - Multi-reference conditioning in the native runner. `joint_layout.h`
   already handles N condition images, but the driver and text-encoder
   layout take one.

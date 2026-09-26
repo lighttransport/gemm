@@ -425,6 +425,9 @@ def main() -> int:
                          "still closer to the BF16 reference VAE than it is to itself in F32")
     ap.add_argument("--prompt-cache", type=Path,
                     help="directory of cached text embeddings; a repeated prompt skips the text encoder")
+    ap.add_argument("--encode-only", action="store_true",
+                    help="stop after the condition image and prompt(s) are encoded into --condition-cache "
+                         "and --prompt-cache (with --prompt-batch: all of them); nothing is denoised")
     ap.add_argument("--prompt-batch", type=Path,
                     help="JSON list of further prompts for the same --image: encoded together with this "
                          "run's prompt in one text-encoder pass (each weight streamed once) into "
@@ -808,6 +811,11 @@ def main() -> int:
     # came from the cache.
     if encoded:
         _wait_device_released(args.backend, None if args.image else baseline)
+    if args.encode_only:
+        if not (args.prompt_cache and (not args.image or args.condition_cache)):
+            raise SystemExit("--encode-only needs --prompt-cache (and --condition-cache with --image)")
+        print("encode-only: condition and prompts cached", file=sys.stderr)
+        return 0
 
     latent_path = work / "latents.npy"
     native_latents = work / "native_latents.npy"

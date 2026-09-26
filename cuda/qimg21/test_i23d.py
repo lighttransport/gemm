@@ -453,17 +453,26 @@ class NativeBackendCommandTest(Tmp):
         self.assertEqual(self.flag(cmd, "--negative-prompt"), "blurry")
         self.assertIn("--condition-cache", cmd)
 
-    def test_prepared_prompts_ride_with_the_first_run_of_their_reference(self):
+    def test_prepare_encodes_each_new_reference_once_with_all_its_prompts(self):
         backend = self.NativeBackend()
+        runs = []
+        backend._run = lambda request, extra, sockets=(None, None), prompt_batch=(): (
+            runs.append((request.prompt, extra, list(prompt_batch))) or "timing: text encoder total 1.500 s\n")
         views = [GenRequest(prompt=f"view {i}", out=self.dir / f"{i}.png", references=(self.ref,))
                  for i in range(3)]
-        backend.prepare(views + [GenRequest(prompt="plain", out=self.dir / "p.png")])
-        self.assertTrue(backend.needs_encoder(views[0]))
-        cmd = backend.command(views[1], self.dir)
-        listing = Path(self.flag(cmd, "--prompt-batch"))
-        self.assertEqual(json.loads(listing.read_text()), ["view 0", "view 2"])
-        self.assertNotIn("--prompt-batch", backend.command(GenRequest(prompt="plain", out=self.dir / "p.png"),
-                                                           self.dir))
+        other = self.write("other.png", object_image(200, 100))
+        backend.prepare(views + [views[0], GenRequest(prompt="plain", out=self.dir / "p.png"),
+                                 GenRequest(prompt="o", out=self.dir / "o.png", references=(other,)),
+                                 GenRequest(prompt="e", out=self.dir / "e.png", references=(self.ref,),
+                                            init_image=self.ref, strength=0.5)])
+        self.assertEqual(runs, [("view 0", ["--encode-only"], ["view 1", "view 2"]),
+                                ("o", ["--encode-only"], [])])
+        self.assertFalse(backend.needs_encoder(views[1]))
+        backend.prepare(views)                     # encoded already: nothing runs
+        self.assertEqual(len(runs), 2)
+        cmd = backend.command(views[0], self.dir, prompt_batch=["view 0", "view 1", "view 2"])
+        self.assertEqual(json.loads(Path(self.flag(cmd, "--prompt-batch")).read_text()), ["view 1", "view 2"])
+        self.assertNotIn("--prompt-batch", backend.command(views[0], self.dir))
 
     def test_one_reference_only_and_the_request_is_not_mutated(self):
         request = GenRequest(prompt="x", out=self.dir / "o.png", references=(self.ref, self.ref))

@@ -46,6 +46,10 @@ RESIDENT_VAE_MAX_TOKENS = 64
 TIMING = re.compile(r"^timing: (.+) ([0-9]+(?:\.[0-9]+)?) s(?: \((.*)\))?$")
 
 
+def _timings(text: str) -> list[dict]:
+    return [{"label": m.group(1), "seconds": float(m.group(2))} for m in map(TIMING.match, text.splitlines()) if m]
+
+
 class _Resident:
     """One resident server process, keyed by the setup it was sized for.
 
@@ -123,7 +127,7 @@ class NativeBackend:
         self._fast = _Resident(self._home, "fast", "fast: serving ")
         self._vae = _Resident(self._home, "vae", "qimg21-vae: serving")
         self._encoded: set[tuple[str, int]] = set()   # (reference sha256, condition resolution)
-        self._pending: dict[tuple[str, int], list[str]] = {}   # prompts to encode with a reference's next run
+        self._prepared: dict[tuple[str, int], list[dict]] = {}   # encode-only timings, reported once
 
     def condition_size(self, image) -> tuple[int, int, int]:
         """(resolution, width, height) of a reference's condition image.
@@ -153,24 +157,39 @@ class NativeBackend:
         return sha256_file(request.references[0]), self.fit_condition_resolution(request.references[0])
 
     def needs_encoder(self, request: GenRequest) -> bool:
-        """Whether the driver will run a one-shot encoder: VAE/vision for a
-        new reference or an init image, or a batched text-encoder pass."""
+        """Whether the driver will run a one-shot VAE/vision encoder: for a
+        reference not encoded yet, or an init image."""
         if request.init_image is not None and (request.strength < 1.0 or request.mask is not None):
             return True
         key = self._encode_key(request)
-        return key is not None and (key not in self._encoded or bool(self._pending.get(key)))
+        return key is not None and key not in self._encoded
 
     def prepare(self, requests) -> None:
-        """Note the prompts of requests to come: the next run with their
-        reference encodes all of them in one text-encoder pass (weights
-        streamed once, results bitwise the single-prompt ones) into the
-        prompt cache, so the other runs skip the text encoder."""
+        """Encode what requests to come will need before any of them runs:
+        per reference, one encode-only driver run caches the condition
+        image's VAE/vision encodes and every prompt (one text-encoder pass,
+        weights streamed once, embeddings bitwise the single-prompt ones).
+        The runs themselves then all go to the resident processes."""
+        groups: dict = {}
         for request in requests:
-            key = self._encode_key(request)
-            if key is not None:
-                pending = self._pending.setdefault(key, [])
-                if request.prompt not in pending:
-                    pending.append(request.prompt)
+            request = replace(request, mask_as_reference=False).validate(self.max_references)
+            # Init-image runs encode their image one-shot anyway; a reference
+            # this backend has run with is encoded already.
+            if request.references and request.init_image is None:
+                key = self._encode_key(request)
+                if key not in self._encoded:
+                    groups.setdefault(key, []).append(request)
+        for key, group in groups.items():
+            prompts = list(dict.fromkeys(r.prompt for r in group))
+            self._fast.stop()     # the encoders need the device memory
+            self._vae.stop()
+            started = time.perf_counter()
+            text = self._run(group[0], ["--encode-only"], prompt_batch=prompts[1:])
+            timings = [{"label": "prepare: " + t["label"], "seconds": t["seconds"]} for t in _timings(text)]
+            timings.append({"label": f"prepare: encode {len(prompts)} prompt(s) + condition",
+                            "seconds": round(time.perf_counter() - started, 3)})
+            self._encoded.add(key)
+            self._prepared[key] = timings
 
     def resident_sockets(self, request: GenRequest) -> tuple[str | None, str | None, list[dict]]:
         """(denoiser socket, VAE socket, startup timings) for a request,
@@ -216,9 +235,9 @@ class NativeBackend:
     def available(model=DEFAULT_MODEL) -> bool:
         return FAST.is_file() and Path(model).is_dir()
 
-    def command(self, request: GenRequest, work: Path, sockets=None) -> list[str]:
+    def command(self, request: GenRequest, work: Path, sockets=None, prompt_batch=()) -> list[str]:
         """The native_generate.py invocation for a request. Its only side
-        effect is the prepared prompt list, written into `work`."""
+        effect is the --prompt-batch listing, written into `work`."""
         cmd = [self.python, str(HERE / "native_generate.py"), "--backend", "cuda", "--model", str(self.model),
                "--prompt", request.prompt, "--height", str(request.height), "--width", str(request.width),
                "--steps", str(request.steps), "--seed", str(request.seed), "--dtype", "bf16",
@@ -231,11 +250,11 @@ class NativeBackend:
                 cmd += ["--quant-package", PACKAGES[weights]]
             if self.attention:
                 cmd += ["--native-attention", ATTENTION[self.attention]]
-        batch = self._pending.get(self._encode_key(request)) if request.references else None
-        if batch and [p for p in batch if p != request.prompt]:
+        batch = [p for p in prompt_batch if p != request.prompt]
+        if batch and request.references:
             import json
             listing = work / "prompt_batch.json"
-            listing.write_text(json.dumps([p for p in batch if p != request.prompt]))
+            listing.write_text(json.dumps(batch))
             cmd += ["--prompt-batch", str(listing)]
         if request.references:
             cmd += ["--image", str(Path(request.references[0]).resolve()),
@@ -263,33 +282,38 @@ class NativeBackend:
             raise BackendError("init images and masks need a fast preset (--runner fast)")
         Path(request.out).parent.mkdir(parents=True, exist_ok=True)
         started = time.perf_counter()
-        work = Path(tempfile.mkdtemp(prefix="qimg21-native-", dir=ROOT / "tmp"))
-        log = work / "native.log"
-        env = {**os.environ, "QIMG21_PYTHON": self.python}
-        try:
-            fast, vae, timings = self.resident_sockets(request)
-            with log.open("w") as stream:
-                code = subprocess.run(self.command(request, work, (fast, vae)), cwd=ROOT, stdout=stream,
-                                      stderr=subprocess.STDOUT, env=env).returncode
-            text = log.read_text(errors="replace")
-            if code or not Path(request.out).is_file():
-                raise BackendError(f"native generation failed ({code}): {text[-3000:]}")
-            key = self._encode_key(request)
-            if key is not None:
-                self._encoded.add(key)
-                self._pending.pop(key, None)
-            timings += [{"label": m.group(1), "seconds": float(m.group(2))}
-                        for m in map(TIMING.match, text.splitlines()) if m]
-            resident = {"requests": text.count("+ resident "),
-                        "fallbacks": text.count("resident: run not taken")}
-        finally:
-            if not self.keep_work:
-                import shutil
-                shutil.rmtree(work, ignore_errors=True)
+        fast, vae, timings = self.resident_sockets(request)
+        text = self._run(request, [], sockets=(fast, vae))
+        if not Path(request.out).is_file():
+            raise BackendError(f"native generation wrote no image: {text[-3000:]}")
+        key = self._encode_key(request)
+        if key is not None:
+            self._encoded.add(key)
+            timings = self._prepared.pop(key, []) + timings
+        timings += _timings(text)
+        resident = {"requests": text.count("+ resident "), "fallbacks": text.count("resident: run not taken")}
         return GenResult(Path(request.out), time.perf_counter() - started, self.name,
                          {"timings": timings, "resident": resident, "mask_shown_as_reference": mask_shown,
                           "preset": self.preset, "attention": self.attention,
                           "condition_resolution": self.condition_resolution if request.references else None})
+
+    def _run(self, request: GenRequest, extra: list[str], sockets=(None, None), prompt_batch=()) -> str:
+        """Run the driver for a request; its log text, or BackendError."""
+        work = Path(tempfile.mkdtemp(prefix="qimg21-native-", dir=ROOT / "tmp"))
+        log = work / "native.log"
+        env = {**os.environ, "QIMG21_PYTHON": self.python}
+        try:
+            with log.open("w") as stream:
+                code = subprocess.run(self.command(request, work, sockets, prompt_batch) + extra, cwd=ROOT,
+                                      stdout=stream, stderr=subprocess.STDOUT, env=env).returncode
+            text = log.read_text(errors="replace")
+            if code:
+                raise BackendError(f"native generation failed ({code}): {text[-3000:]}")
+            return text
+        finally:
+            if not self.keep_work:
+                import shutil
+                shutil.rmtree(work, ignore_errors=True)
 
     def close(self) -> None:
         self._fast.stop()
