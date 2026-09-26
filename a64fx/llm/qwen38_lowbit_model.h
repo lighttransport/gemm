@@ -26,6 +26,10 @@ q38_lowbit_model *q38_lowbit_model_load_image(gguf_context *g, int format,
  * prevents a second model-sized dirty page cache from accumulating. */
 int q38_lowbit_model_save_image(const q38_lowbit_model *model, const char *path);
 void q38_lowbit_model_free(q38_lowbit_model *model);
+/* Release source matrix mappings after a consumer has repacked its retained
+ * shards. Raw tensors and matrix descriptors remain available. */
+size_t q38_lowbit_model_prune_matrix_parts(q38_lowbit_model *model,
+                                           const void *const *keep, size_t keep_count);
 const q38_lowbit_matrix *q38_lowbit_model_tensor(const gguf_context *g, int index);
 int q38_lowbit_matrix_row(float *dst, const q38_lowbit_matrix *m, int row);
 int q38_lowbit_matrix_rows(float *dst, const q38_lowbit_matrix *m,

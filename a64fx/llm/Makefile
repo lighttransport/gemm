@@ -178,25 +178,36 @@ Q38_LAYOUT_CFLAGS := $(filter-out -g -rdynamic -ffp-contract=fast,$(CFLAGS)) -Wa
 
 .PHONY: qwen38_lowbit_test qwen38_lowbit_sve_test qwen38_lowbit_model_test qwen38_lowbit_bench
 .PHONY: qwen38_lowbit_runner
-.PHONY: q38d q38d_test
+.PHONY: q38d q38d_test q38d_tp_test
 # Dedicated Qwen3.8 decode engine (a64fx/llm/q38d): pair-interleaved FP4/FP6
 # kernels, persistent 48-worker decode. Prefetch distances are build knobs.
 Q38D_DIR    := $(LLM_DIR)q38d/
 Q38D_CFLAGS ?= -O2 -march=armv8.2-a+sve -DPF1_DIST=2048 -DPF2_DIST=32768
+Q38D_TP ?= 0
 ifeq ($(CC),fcc)
     Q38D_CC_FLAGS := -Nclang $(Q38D_CFLAGS)
 else
     Q38D_CC_FLAGS := $(Q38D_CFLAGS)
 endif
+ifeq ($(Q38D_TP),1)
+    Q38D_CC_FLAGS += -DQ38D_TP
+    Q38D_TP_LIBS := -ltofucom
+endif
 q38d: $(BUILD)/q38d
 $(BUILD)/q38d: $(Q38D_DIR)q38d_engine.c $(Q38D_DIR)q38d_kern.h $(Q38D_DIR)q38d_kern_sve.S \
+		$(Q38D_DIR)q38d_kern_n4.S $(Q38D_DIR)../q38p/q38p_kern.S $(Q38D_DIR)../q38p/q38p_attention.S \
+		$(Q38D_DIR)q38d_tp.h $(Q38D_DIR)q38d_reduce.h $(Q38D_DIR)q38d_attention.h $(Q38D_DIR)q38d_batch.inc $(Q38D_DIR)q38d_kv_i6.h $(Q38D_DIR)q38d_kv_i8.h $(Q38D_DIR)q38d_state.inc $(Q38D_DIR)../q38p/q38p_prefill.inc $(Q38D_DIR)../q38p/q38p_gemm_attention.h $(Q38D_DIR)../q38p/q38p_pv_int16.h $(Q38D_DIR)../q38p/q38p_partition.h \
 		$(LLM_DIR)qwen38_lowbit_model.c $(LLM_DIR)qwen38_lowbit.c $(LLM_DIR)qwen38_lowbit_sve.c \
 		$(LLM_DIR)qwen38_lowbit_model.h $(LLM_DIR)qwen38_lowbit_image.inc | $(BUILD)
-	$(CC) $(Q38D_CC_FLAGS) -I$(COMMON) -I$(LLM_DIR) -o $@ $(filter %.c %.S,$^) -lpthread -lm
+	$(CC) $(Q38D_CC_FLAGS) -I$(COMMON) -I$(LLM_DIR) -o $@ $(filter %.c %.S,$^) -lpthread -lm $(Q38D_TP_LIBS)
 q38d_test: $(BUILD)/test_q38d_kern
 $(BUILD)/test_q38d_kern: $(Q38D_DIR)test_q38d_kern.c $(Q38D_DIR)q38d_kern.h $(Q38D_DIR)q38d_kern_sve.S \
 		$(LLM_DIR)qwen38_lowbit.c | $(BUILD)
 	$(CC) $(Q38D_CC_FLAGS) -I$(COMMON) -o $@ $(filter %.c %.S,$^) -lm
+q38d_tp_test: $(BUILD)/test_q38d_tp_collective
+$(BUILD)/test_q38d_tp_collective: $(Q38D_DIR)test_tp_collective.c $(Q38D_DIR)q38d_tp.h $(Q38D_DIR)q38d_reduce.h $(Q38D_DIR)q38d_attention.h $(Q38D_DIR)q38d_state.inc $(Q38D_DIR)../q38p/q38p_prefill.inc $(Q38D_DIR)../q38p/q38p_gemm_attention.h $(Q38D_DIR)../q38p/q38p_pv_int16.h $(Q38D_DIR)../q38p/q38p_partition.h \
+		$(ROOT)/utofu-tests/tp_allreduce.h $(ROOT)/utofu-tests/tofu_demo.h | $(BUILD)
+	$(CC) $(Q38D_CC_FLAGS) -DQ38D_TP -I$(COMMON) -o $@ $(Q38D_DIR)test_tp_collective.c -ltofucom
 .PHONY: qwen38_lowbit_prepare_bench
 .PHONY: qwen38_lowbit_eval
 qwen38_lowbit_eval: $(BUILD)/qwen38_lowbit_eval

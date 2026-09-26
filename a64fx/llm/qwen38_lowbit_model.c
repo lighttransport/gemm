@@ -347,6 +347,30 @@ void q38_lowbit_model_free(q38_lowbit_model *m) {
     free(m->raw); free(m->raw_bytes); free(m->original); free(m->matrix); free(m->act); free(m);
 }
 
+size_t q38_lowbit_model_prune_matrix_parts(q38_lowbit_model *m,
+                                           const void *const *keep, size_t keep_count) {
+    if (!m) return 0;
+    size_t released = 0;
+    for (size_t i = 0; i < m->gguf->n_tensors; i++) {
+        q38_lowbit_matrix *mat = &m->matrix[i];
+        if (!mat->format) continue;
+        for (int c = 0; c < 4; c++) {
+            void *part = mat->part[c];
+            if (!part) continue;
+            int retained = 0;
+            for (size_t k = 0; k < keep_count; k++)
+                if (part == keep[k]) { retained = 1; break; }
+            if (retained) continue;
+            size_t bytes = round_page(q38_lowbit_bytes(mat->format,
+                mat->first[c + 1] - mat->first[c], mat->cols));
+            if (munmap(part, bytes) != 0) return released;
+            mat->part[c] = NULL;
+            released += bytes;
+        }
+    }
+    return released;
+}
+
 const q38_lowbit_matrix *q38_lowbit_model_tensor(const gguf_context *g, int index) {
     if (index < 0 || (uint64_t)index >= g->n_tensors) return NULL;
     for (q38_lowbit_model *m = models; m; m = m->next)

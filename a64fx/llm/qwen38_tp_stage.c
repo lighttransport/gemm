@@ -21,6 +21,7 @@
 
 #define GGUF_LOADER_IMPLEMENTATION
 #include "../../common/gguf_loader.h"
+#include "../../common/tp_partition.h"
 #include "qwen38_tp_stage.h"
 #define TF_KQUANT_CACHE_LAYOUT_ONLY
 #define TF_KQUANT_CACHE_PACK_ONLY
@@ -51,15 +52,9 @@ static void tp_range(int n, int parts, int rank, int *lo, int *hi) {
     *lo = rank * base + (rank < rem ? rank : rem);
     *hi = *lo + base + (rank < rem);
 }
-/* Keep this in lockstep with transformer_tp_slice_weights().  The runtime
- * rounds the FFN shard width to 256 so the local SVE kernels retain their
- * preferred tile shape; the final rank is clipped to the source width. */
+/* Match transformer_tp_slice_weights(): distribute 256-row SVE tiles evenly. */
 static void tp_chunk_range(int n, int parts, int rank, int *lo, int *hi) {
-    int chunk = ((n + parts - 1) / parts + 255) & ~255;
-    *lo = rank * chunk;
-    *hi = *lo + chunk;
-    if (*lo > n) *lo = n;
-    if (*hi > n) *hi = n;
+    tf_tp_range_aligned(n, parts, rank, 256, lo, hi);
 }
 static uint64_t align_up(uint64_t x, uint64_t a) { return (x + a - 1) & ~(a - 1); }
 

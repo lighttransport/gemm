@@ -11,7 +11,9 @@
 #ifndef Q38D_TP_H
 #define Q38D_TP_H
 
-static int tp_n = 1, tp_r = 0;   /* ranks, my rank */
+static int tp_n = 1, tp_r = 0;   /* ranks, my rank within a TP group */
+static int tp_group = 0;
+#define Q38D_TP_MAXN 12
 
 #ifdef Q38D_TP
 #include <sys/mman.h>
@@ -20,7 +22,6 @@ static int tp_n = 1, tp_r = 0;   /* ranks, my rank */
 #include "../../utofu-tests/tofu_demo.h"
 #include "../../utofu-tests/tp_allreduce.h"
 
-#define Q38D_TP_MAXN 4
 #define Q38D_TP_BAR_STAG DEMO_STAG
 static utofu_vcq_hdl_t tp_vcq;
 static utofu_vcq_id_t tp_peer[Q38D_TP_MAXN];
@@ -271,6 +272,10 @@ static void q38d_tp_init(int n, int max_count) {
     tp_n = n;
     if (n == 1) return;
     if (n > Q38D_TP_MAXN) tp_fatal("too many ranks", n);
+    if (getenv("Q38D_TP_GROUP")) tp_group = atoi(getenv("Q38D_TP_GROUP"));
+    if (tp_group < 0 || tp_group > (Q38D_TP_MAXN - n) / n)
+        tp_fatal("invalid TP group", tp_group);
+    const int first = tp_group * n;
     const char *path = getenv("TOFU_TOPO_PATH") ? getenv("TOFU_TOPO_PATH") : TOPO_PATH;
     FILE *f = fopen(path, "r");
     if (!f) tp_fatal("open topology (run tofu_topo_helper in this allocation)", errno);
@@ -285,13 +290,13 @@ static void q38d_tp_init(int n, int max_count) {
         cnt++;
     }
     fclose(f);
-    if (cnt < n) tp_fatal("topology has fewer ranks than Q38D_TP", cnt);
+    if (cnt < first + n) tp_fatal("topology has fewer ranks than TP group needs", cnt);
     uint8_t mine[TOFU_NCOORDS];
     int rc = utofu_query_my_coords(mine);
     if (rc != UTOFU_SUCCESS) tp_fatal("query coords", rc);
     tp_r = -1;
-    for (int r = 0; r < n; r++) if (!memcmp(mine, topo[r], TOFU_NCOORDS)) tp_r = r;
-    if (tp_r < 0) tp_fatal("node not among the first Q38D_TP topology ranks", -1);
+    for (int r = 0; r < n; r++) if (!memcmp(mine, topo[first + r], TOFU_NCOORDS)) tp_r = r;
+    if (tp_r < 0) tp_fatal("node not in selected TP group", -1);
     utofu_tni_id_t *tnis = NULL;
     size_t ntni = 0;
     if ((rc = utofu_get_onesided_tnis(&tnis, &ntni)) != UTOFU_SUCCESS || !ntni) tp_fatal("onesided TNIs", rc);
@@ -300,6 +305,13 @@ static void q38d_tp_init(int n, int max_count) {
     if (getenv("Q38D_TP_AR")) tp_ar_mine = atoi(getenv("Q38D_TP_AR"));
     if (getenv("Q38D_TP_MRQ")) tp_ar_mrq = atoi(getenv("Q38D_TP_MRQ"));
     if (getenv("Q38D_TP_A2A")) tp_a2a = atoi(getenv("Q38D_TP_A2A"));
+    /* The private MRQ/trailer collectives below were validated only for TP2
+     * and TP4. For every other rank count (including powers of two > 4), use
+     * tp_comm's general non-power-of-two recursive-doubling schedule. */
+    if (n != 2 && n != 4) {
+        tp_ar_mine = 0;
+        tp_a2a = 0;
+    }
     if (tp_nsl < 1 || tp_nsl > Q38D_TP_NSL || (size_t)tp_nsl + 1 > ntni) tp_nsl = 1;
     utofu_tni_id_t stni[Q38D_TP_NSL];
     for (int k = 0; k < tp_nsl; k++) stni[k] = tnis[1 + k];
@@ -319,7 +331,7 @@ static void q38d_tp_init(int n, int max_count) {
     }
     for (int r = 0; r < n; r++) {
         if (r == tp_r) { tp_peer[r] = my; tp_peer_bar[r] = tp_bar_base; continue; }
-        if ((rc = utofu_construct_vcq_id(topo[r], tni, DEMO_CQ_ID, DEMO_CMP_ID, &tp_peer[r])) != UTOFU_SUCCESS)
+        if ((rc = utofu_construct_vcq_id(topo[first + r], tni, DEMO_CQ_ID, DEMO_CMP_ID, &tp_peer[r])) != UTOFU_SUCCESS)
             tp_fatal("construct peer VCQ", rc);
         utofu_set_vcq_id_path(&tp_peer[r], NULL);
         /* the peer may not have registered yet: retry */
@@ -345,7 +357,7 @@ static void q38d_tp_init(int n, int max_count) {
         utofu_vcq_id_t sp[Q38D_TP_MAXN];
         for (int r = 0; r < n; r++) {
             if (r == tp_r) { if ((rc = utofu_query_vcq_id(tp_svcq[k], &sp[r])) != UTOFU_SUCCESS) tp_fatal("query slice VCQ", rc); continue; }
-            if ((rc = utofu_construct_vcq_id(topo[r], stni[k], DEMO_CQ_ID, DEMO_CMP_ID, &sp[r])) != UTOFU_SUCCESS)
+            if ((rc = utofu_construct_vcq_id(topo[first + r], stni[k], DEMO_CQ_ID, DEMO_CMP_ID, &sp[r])) != UTOFU_SUCCESS)
                 tp_fatal("construct slice peer VCQ", rc);
             utofu_set_vcq_id_path(&sp[r], NULL);
         }

@@ -15,4 +15,4 @@ fi
     a64fx/llm/q38d/q38d_engine.c a64fx/llm/qwen38_lowbit_model.c \
     a64fx/llm/qwen38_lowbit.c a64fx/llm/qwen38_lowbit_sve.c \
     a64fx/llm/q38d/q38d_kern_sve.S a64fx/llm/q38d/q38d_kern_n4.S \
-    a64fx/llm/q38p/q38p_kern.S -lpthread -lm -o tmp/q38p/q38p_pp
+    a64fx/llm/q38p/q38p_kern.S a64fx/llm/q38p/q38p_attention.S -lpthread -lm -o tmp/q38p/q38p_pp

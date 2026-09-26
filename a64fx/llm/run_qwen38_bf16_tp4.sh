@@ -1,5 +1,5 @@
 #!/bin/bash
-# Stage and measure Qwen3.8-27B BF16 with TP4/TP6/TP12.
+# Stage and measure Qwen3.8-27B BF16 with supported TP sizes.
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -13,7 +13,7 @@ if [ "$MODE" = mtp-sustained ] || [ "$MODE" = stage-mtp ]; then
     [ "$TP_SIZE" = 4 ] || { echo "$MODE requires TP_SIZE=4" >&2; exit 2; }
     export TP_NEXTN_SHARD=${TP_NEXTN_SHARD:-1}
 fi
-case "$TP_SIZE" in 4|6|12) ;; *) echo "TP_SIZE must be 4, 6, or 12" >&2; exit 2 ;; esac
+case "$TP_SIZE" in 4|6|8|10|12) ;; *) echo "TP_SIZE must be 4, 6, 8, 10, or 12" >&2; exit 2 ;; esac
 NEXTN_SUFFIX=
 if [ "${TP_NEXTN_SHARD:-0}" != 0 ]; then NEXTN_SUFFIX=-nextnshard; fi
 STAGE=${TP_STAGE_DIR:-/local/u14346/qwen38-bf16-tp${TP_SIZE}${NEXTN_SUFFIX}}
@@ -265,5 +265,5 @@ case "$MODE" in
               tp_tokens_rank00.txt tp_null_stream_rank*.txt
         exec mpiexec -np "$TP_SIZE" "${TP_RUNNER_BIN:-./build/tp_runner}" "$MODEL"
         ;;
-    *) echo "usage: TP_SIZE={4|6|12} $0 {plan|stage|stage-mtp|stream|null|check|source-check|bench|mtp-check|mtp-sustained|prefill|handoff|profile}" >&2; exit 2 ;;
+    *) echo "usage: TP_SIZE={4|6|8|10|12} $0 {plan|stage|stage-mtp|stream|null|check|source-check|bench|mtp-check|mtp-sustained|prefill|handoff|profile}" >&2; exit 2 ;;
 esac

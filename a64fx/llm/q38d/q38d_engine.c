@@ -22,7 +22,10 @@
 #include "bpe_tokenizer.h"
 #include "../qwen38_lowbit_model.h"
 #include "q38d_kern.h"
+#include "q38d_kv_i8.h"
+#include "q38d_kv_i6.h"
 #include "q38d_tp.h"
+#include "q38d_reduce.h"
 #ifdef Q38P_MPI
 #include <mpi.h>
 #endif
@@ -80,6 +83,7 @@ typedef struct {
 
 typedef struct {
     int fmt, arith, max_seq, n_vocab;
+    int vocab_first;
     float eps, rope_base, inv_freq[32];
     q38d_layer *L;
     q38d_mat head;
@@ -256,6 +260,13 @@ static int out_kch = 1; /* K chunks for the 6144-column residual projections (3 
 static int q6k_expand = 1; /* Q6_K -> exact int8 codes (no decode, +28% bytes) */
 static q38_lowbit_model *LB;
 static q38d_engine E;
+typedef struct {
+    int8_t *k[NATTN][NKV][NCMG], *v[NATTN][NKV][NCMG];
+    float *ks[NATTN][NKV][NCMG], *vs[NATTN][NKV][NCMG];
+} q38d_i8_heads;
+static q38d_i8_heads KI;
+static int kv_i8_mode, kv_i6_mode, pf_kv_i6_mode, pf_i6_parallel = 1;
+static size_t kv_row_bytes(void) { return kv_i6_mode || pf_kv_i6_mode ? q38d_kv_i6_row_bytes(HD) : HD; }
 
 static int find_tensor(const char *name) {
     for (uint64_t i = 0; i < G->n_tensors; i++)
@@ -458,16 +469,25 @@ static int ssm_perm = 1;
  * value heads {g, g+16, g+32}; qkv rows per CMG QC = 5*GC*128. tp_n = 1 is
  * the single-node CMG-aligned layout. */
 static int GR = NGROUP, GC = NGROUP / 4, HC = 3 * NGROUP / 4, QC = QKVD / 4;
-static void tp_dims(void) { GR = NGROUP / tp_n; GC = GR / 4; HC = 3 * GC; QC = 5 * GC * DS; }
+static int tp_replicate_mixers;
+static void tp_dims(void) {
+    if (tp_replicate_mixers) { GR = NGROUP; GC = NGROUP / 4; HC = 3 * GC; QC = 5 * GC * DS; }
+    else { GR = NGROUP / tp_n; GC = GR / 4; HC = 3 * GC; QC = 5 * GC * DS; }
+}
+static void tp_partition(int units, int rank, int size, int *lo, int *hi) {
+    *lo = (int)((int64_t)units * rank / size);
+    *hi = (int)((int64_t)units * (rank + 1) / size);
+}
 static inline int ssm_head_of(int tid) {
     int c = tid / PER, l = tid % PER;
     if (!ssm_perm) return tid;
     if (l >= HC) return -1;
-    return tp_r * GR + c * GC + l % GC + NGROUP * (l / GC);
+    int rank_group = tp_replicate_mixers ? 0 : tp_r * GR;
+    return rank_group + c * GC + l % GC + NGROUP * (l / GC);
 }
-static inline int ssm_slot(int h) { int g = h % NGROUP - tp_r * GR; return (g / GC) * HC + g % GC + GC * (h / NGROUP); }
-static inline int ssm_qoff(int g) { int gl = g - tp_r * GR; return ssm_perm ? QC * (gl / GC) + (gl % GC) * DS : g * DS; }
-static inline int ssm_koff(int g) { int gl = g - tp_r * GR; return ssm_perm ? QC * (gl / GC) + GC * DS + (gl % GC) * DS : NGROUP * DS + g * DS; }
+static inline int ssm_slot(int h) { int base = tp_replicate_mixers ? 0 : tp_r * GR, g = h % NGROUP - base; return (g / GC) * HC + g % GC + GC * (h / NGROUP); }
+static inline int ssm_qoff(int g) { int base = tp_replicate_mixers ? 0 : tp_r * GR, gl = g - base; return ssm_perm ? QC * (gl / GC) + (gl % GC) * DS : g * DS; }
+static inline int ssm_koff(int g) { int base = tp_replicate_mixers ? 0 : tp_r * GR, gl = g - base; return ssm_perm ? QC * (gl / GC) + GC * DS + (gl % GC) * DS : NGROUP * DS + g * DS; }
 static inline int ssm_voff(int h) {
     if (!ssm_perm) return 2 * NGROUP * DS + h * DS;
     int sl = ssm_slot(h);
@@ -477,7 +497,7 @@ static inline int ssm_zoff(int h) { return ssm_perm ? ssm_slot(h) * DS : h * DS;
 static inline int ssm_abi(int h) { return ssm_perm ? ssm_slot(h) : h; }
 /* index of head h's output in E.o / act_o: original order on one node, rank
  * slot order under TP (the out-proj columns are gathered to match) */
-static inline int ssm_oidx(int h) { return tp_n > 1 ? ssm_slot(h) : h; }
+static inline int ssm_oidx(int h) { return tp_n > 1 && !tp_replicate_mixers ? ssm_slot(h) : h; }
 /* Move 128-row blocks of a low-bit matrix: new block b takes old block
  * src_blk[b]; blocks are 16 whole groups, so CMG parts stay in place. */
 static void permute_blocks(q38d_mat *m, const int *src_blk, int nblk) {
@@ -534,15 +554,18 @@ static void shard_rows(q38d_mat *m, int idx, int row0, int R) {
     int kind = mat_kind(m);
     if (kind == 0) {
         size_t gb = q38d_group_bytes(m->fmt, m->cols);
-        if (R % 32 || row0 % 8) { fprintf(stderr, "q38d: TP row shard %d+%d not group aligned\n", row0, R); exit(1); }
+        if (R % 16 || row0 % 16) { fprintf(stderr, "q38d: TP row shard %d+%d not 16-row aligned\n", row0, R); exit(1); }
         uint8_t *np[4];
+        int units = R / 16;
+        int groups = 2 * units;
         for (int c = 0; c < 4; c++) {
-            int G = R / 32;
-            np[c] = cmg_alloc((size_t)G * gb, c);
-            for (int g = 0; g < G; g++) memcpy(np[c] + (size_t)g * gb, mat_group_src(m, (row0 + c * R / 4) / 8 + g), gb);
+            int g0 = 2 * (units * c / 4), g1 = 2 * (units * (c + 1) / 4);
+            np[c] = cmg_alloc((size_t)(g1 - g0) * gb, c);
+            for (int g = g0; g < g1; g++)
+                memcpy(np[c] + (size_t)(g - g0) * gb, mat_group_src(m, row0 / 8 + g), gb);
         }
         for (int c = 0; c < 4; c++) m->part[c] = np[c];
-        for (int c = 0; c <= 4; c++) m->first[c] = c * R / 4;
+        for (int c = 0; c <= 4; c++) m->first[c] = (int)((int64_t)units * c / 4) * 16;
     } else {
         const gguf_tensor_info *t = &G->tensors[idx];
         size_t rb = (size_t)m->cols / 256 * (t->type == GGML_TYPE_Q6_K ? 210 : 144);
@@ -582,20 +605,30 @@ static void shard_cols(q38d_mat *m, int col0, int C) {
     shard_col_tiles(m, tl, nt);
     free(tl);
 }
+static void shard_cols_tp_tiles(q38d_mat *m, int rank, int size) {
+    int all = m->cols / 64, lo, hi;
+    tp_partition(all, rank, size, &lo, &hi);
+    int *tiles = malloc((size_t)(hi - lo) * sizeof(*tiles));
+    if (!tiles) { fprintf(stderr, "q38d: TP column-tile allocation failed\n"); exit(1); }
+    for (int i = lo; i < hi; i++) tiles[i - lo] = i;
+    shard_col_tiles(m, tiles, hi - lo);
+    free(tiles);
+}
 /* SSM layer shard (also the tp_n = 1 CMG-aligned permutation) */
 static void ssm_shard_layer(q38d_layer *L, int layer) {
     int nbq = 5 * GR, nbz = 3 * GR;
     int *bq = malloc(nbq * sizeof(int)), *bz = malloc(nbz * sizeof(int));
     for (int c = 0; c < 4; c++) {
         for (int j = 0; j < 5 * GC; j++) {
-            int b = 5 * GC * c + j, g = tp_r * GR + c * GC;
+            int b = 5 * GC * c + j;
+            int g = (tp_replicate_mixers ? 0 : tp_r * GR) + c * GC;
             if (j < GC) bq[b] = g + j;
             else if (j < 2 * GC) bq[b] = NGROUP + g + (j - GC);
             else bq[b] = 2 * NGROUP + ssm_head_of(c * PER + (j - 2 * GC));
         }
         for (int l = 0; l < HC; l++) bz[c * HC + l] = ssm_head_of(c * PER + l);
     }
-    if (tp_n == 1) { permute_blocks(&L->qkv, bq, nbq); permute_blocks(&L->z, bz, nbz); }
+    if (tp_n == 1 || tp_replicate_mixers) { permute_blocks(&L->qkv, bq, nbq); permute_blocks(&L->z, bz, nbz); }
     else { shard_row_blocks(&L->qkv, bq, nbq); shard_row_blocks(&L->z, bz, nbz); }
     q38d_mat *ab[2] = {&L->alpha, &L->beta};
     const char *nm[2] = {"blk.%d.ssm_alpha.weight", "blk.%d.ssm_beta.weight"};
@@ -614,7 +647,7 @@ static void ssm_shard_layer(q38d_layer *L, int layer) {
         for (int c = 0; c <= 4; c++) m->first[c] = c * HC;
         for (int c = 0; c < 4; c++) m->part[c] = cmg_alloc((size_t)((HC + 7) / 8) * q38d_group_bytes(m->fmt, m->cols), c);
     }
-    if (tp_n > 1) {
+    if (tp_n > 1 && !tp_replicate_mixers) {
         /* out-proj: this rank's heads' 128-column blocks in slot order */
         int *tl = malloc(8 * HC * sizeof(int)), n = 0;
         for (int c = 0; c < 4; c++)
@@ -627,7 +660,7 @@ static void ssm_shard_layer(q38d_layer *L, int layer) {
 /* attention and FFN matrices of one layer, head / vocabulary shards */
 static void tp_shard_layer(q38d_layer *L, int l) {
     if (tp_n == 1) return;
-    if (!L->ssm) {
+    if (!tp_replicate_mixers && !L->ssm) {
         int qr = 2 * NHEAD * HD / tp_n, kr = NKV * HD / tp_n;
         shard_rows(&L->q, need_tensor("blk.%d.attn_q.weight", l), tp_r * qr, qr);
         shard_rows(&L->k, need_tensor("blk.%d.attn_k.weight", l), tp_r * kr, kr);
@@ -635,10 +668,22 @@ static void tp_shard_layer(q38d_layer *L, int l) {
         shard_cols(&L->o, tp_r * (NHEAD * HD / tp_n), NHEAD * HD / tp_n);
         L->o.kch = 0;
     }
-    int fr = NFF / tp_n;
-    shard_rows(&L->gate, need_tensor("blk.%d.ffn_gate.weight", l), tp_r * fr, fr);
-    shard_rows(&L->up, need_tensor("blk.%d.ffn_up.weight", l), tp_r * fr, fr);
-    shard_cols(&L->down, tp_r * fr, fr);
+    int f0, f1;
+    if (tp_replicate_mixers) {
+        /* Down projection is partitioned in 64-column FP4 tiles; use the
+         * same boundaries for gate/up rows or TP ranks pair different FFN
+         * channels across the two halves of the MLP. */
+        tp_partition(NFF / 64, tp_r, tp_n, &f0, &f1);
+        f0 *= 64; f1 *= 64;
+    } else {
+        f0 = tp_r * (NFF / tp_n);
+        f1 = f0 + NFF / tp_n;
+    }
+    int fr = f1 - f0;
+    shard_rows(&L->gate, need_tensor("blk.%d.ffn_gate.weight", l), f0, fr);
+    shard_rows(&L->up, need_tensor("blk.%d.ffn_up.weight", l), f0, fr);
+    if (tp_replicate_mixers) shard_cols_tp_tiles(&L->down, tp_r, tp_n);
+    else shard_cols(&L->down, f0, fr);
     L->down.kch = 1;
     L->down.unit16 = 1;
 }
@@ -703,6 +748,17 @@ static void load_engine(void) {
             if (E.L[l].ssm) ssm_shard_layer(&E.L[l], l);
     }
     for (int l = 0; l < NLAYER; l++) tp_shard_layer(&E.L[l], l);
+    if (ssm_perm) {
+        for (int l = 0; l < NLAYER; l++) if (E.L[l].ssm) {
+            const q38d_layer *L = &E.L[l];
+            if (L->qkv.rows != 5 * GR * DS || L->z.rows != 3 * GR * DS ||
+                L->alpha.rows != 4 * HC || L->beta.rows != 4 * HC || L->out.cols != 3 * GR * DS) {
+                fprintf(stderr, "q38d: invalid SSM shard layout layer=%d TP%d rank=%d\n", l, tp_n, tp_r);
+                exit(1);
+            }
+        }
+        fprintf(stderr, "q38d: SSM layout validated TP%d rank=%d groups=%d heads=%d\n", tp_n, tp_r, GR, 4 * HC);
+    }
     if (mtp_on) {
         int l = NLAYER;
         q38d_layer *L = &E.L[l];
@@ -736,8 +792,19 @@ static void load_engine(void) {
     }
     describe(&E.head, need_tensor("output.weight", 0));
     if (tp_n > 1) {
-        int vr = E.n_vocab / tp_n;
-        shard_rows(&E.head, need_tensor("output.weight", 0), tp_r * vr, vr);
+        if (tp_replicate_mixers) {
+            int units = (E.n_vocab + 7) / 8, u0, u1;
+            tp_partition(units, tp_r, tp_n, &u0, &u1);
+            E.vocab_first = u0 * 8;
+            int rows = E.n_vocab - E.vocab_first;
+            int vr = (u1 - u0) * 8;
+            if (vr > rows) vr = rows;
+            shard_rows(&E.head, need_tensor("output.weight", 0), E.vocab_first, vr);
+        } else {
+            int vr = E.n_vocab / tp_n;
+            E.vocab_first = tp_r * vr;
+            shard_rows(&E.head, need_tensor("output.weight", 0), E.vocab_first, vr);
+        }
     }
     if (mtp_on && draft_f4) {
         /* FP4 draft head over the first draft_v vocabulary rows (all if 0) */
@@ -1465,10 +1532,12 @@ static inline svfloat32_t qk_2h(const float *qh, const float *k) {
     svfloat32_t s = red2(red2(red2(a00, a01), red2(a02, a03)), red2(red2(a10, a11), red2(a12, a13)));
     return red2(s, s);
 }
+static int att_qk6 = 1;
+void q38p_qk6x4(const float *q, const float *k, float *sc, long stride, float scale);
 static void attn_scores(const float *qh, const float *K, int t0, int t1, float *sc, int nt, float scale) {
     const svbool_t pf = svptrue_b32(), p4 = svptrue_pat_b32(SV_VL4);
     int i = 0;
-    for (; i + 4 <= nt; i += 4) {
+    for (; i + 4 <= t1 - t0; i += 4) {
         const float *k = K + (size_t)(t0 + i) * HD;
         svfloat32_t r = svmul_n_f32_x(pf, qk_4h(qh, k), scale);
         svfloat32_t s = svmul_n_f32_x(pf, qk_2h(qh + 4 * HD, k), scale);
@@ -1479,33 +1548,24 @@ static void attn_scores(const float *qh, const float *K, int t0, int t1, float *
         svst1_f32(p4, sc + 4 * nt + i, s);
         svst1_f32(p4, sc + 5 * nt + i, svext_f32(s, s, 4));
     }
-    for (; i < nt; i++)
+    for (; i < t1 - t0; i++)
+        for (int h = 0; h < 6; h++) sc[h * nt + i] = dot(qh + h * HD, K + (size_t)(t0 + i) * HD, HD) * scale;
+}
+/* Prefill-only six-head tile; decode retains the existing attention path. */
+static void attn_scores_prefill(const float *qh, const float *K, int t0, int t1, float *sc, int nt, float scale) {
+    if (!att_qk6) { attn_scores(qh, K, t0, t1, sc, nt, scale); return; }
+    int i = 0;
+    for (; i + 4 <= t1 - t0; i += 4)
+        q38p_qk6x4(qh, K + (size_t)(t0 + i) * HD, sc + i, nt, scale);
+    for (; i < t1 - t0; i++)
         for (int h = 0; h < 6; h++) sc[h * nt + i] = dot(qh + h * HD, K + (size_t)(t0 + i) * HD, HD) * scale;
 }
 /* out_h[256] = sum_t p_h[t-t0] V[t] for 6 heads (p_h = p + h*nt, out_h =
  * out + h*ostride): passes of 2 heads x 128 dims, 16 accumulators. */
+#include "q38d_attention.h"
+static int att_pv_block = 256;  /* Q38D_ATT_PV_BLOCK=0: original full-range pass */
 static void attn_pv6(const float *V, int t0, int t1, const float *p, int nt, float *out, int ostride) {
-    const svbool_t pf = svptrue_b32();
-    for (int hg = 0; hg < 6; hg += 2)
-        for (int d0 = 0; d0 < HD; d0 += 128) {
-            SV8(x); SV8(y);
-#define PZ(j) x##j = svdup_n_f32(0); y##j = x##j
-            SV8_EACH(PZ);
-#undef PZ
-            const float *pa = p + hg * nt - t0, *pb = pa + nt;
-            const float *v = V + (size_t)t0 * HD + d0;
-#pragma clang loop unroll(disable)
-            for (int t = t0; t < t1; t++, v += HD) {
-                svfloat32_t wa = svdup_n_f32(pa[t]), wb = svdup_n_f32(pb[t]);
-#define PF2(j) { svfloat32_t v_ = svld1_f32(pf, v + 16 * j); x##j = svmla_f32_x(pf, x##j, v_, wa); y##j = svmla_f32_x(pf, y##j, v_, wb); }
-                SV8_EACH(PF2);
-#undef PF2
-            }
-            float *oa = out + (size_t)hg * ostride + d0, *ob = oa + ostride;
-#define PST(j) svst1_f32(pf, oa + 16 * j, x##j); svst1_f32(pf, ob + 16 * j, y##j)
-            SV8_EACH(PST);
-#undef PST
-        }
+    q38d_attn_pv6_blocked(V, t0, t1, p, nt, out, ostride, att_pv_block);
 }
 
 static double att_t[4];
@@ -1521,7 +1581,8 @@ static void attention(int layer, int tid, int pos, int *csense) { attention_io(l
 static int *gsense_ptr[NT];
 #define KVB 16
 #define APART(c, i) (E.apart[c][(i) / PER] + (size_t)((i) % PER) * 6 * (2 + HD))
-static int kv_cpk(void) { return 4 / (NKV / tp_n); }
+static int score_max_vector = 1;  /* Q38D_SCORE_MAX=0: scalar comparison control */
+static int kv_cpk(void) { return tp_replicate_mixers ? 1 : 4 / (NKV / tp_n); }
 /* position t -> (part, local index) */
 static inline void kv_map(int t, int cpk, int *k, int *u) { int b = t / KVB; *k = b % cpk; *u = (b / cpk) * KVB + t % KVB; }
 /* positions t < n held by part k */
@@ -1535,8 +1596,67 @@ static inline void kv_lane(int n, int cpk, int lw, int *u0, int *u1) {
     *u0 = (int)((int64_t)nk * j / PER); *u1 = (int)((int64_t)nk * (j + 1) / PER);
 }
 static inline void attn_group(int tid, int *kv, int *lw, int *gw) {
-    int cpk = 4 / (NKV / tp_n), c = tid / PER;
+    int cpk = kv_cpk(), c = tid / PER;
     *kv = c / cpk; *lw = (c % cpk) * PER + tid % PER; *gw = cpk * PER;
+}
+static void state_fail(const char *what);
+static void attention_scores_i8(const float *qh, const int8_t *k, const float *ks,
+                                int t0, int t1, float *sc, int nt, float scale) {
+    for (int h = 0; h < 6; h++)
+        for (int t = t0; t < t1; t++) {
+            const int8_t *row = k + (size_t)t * HD;
+            const float *q = qh + (size_t)h * HD;
+            float sum = 0.0f;
+            for (int d = 0; d < HD; d++) sum = fmaf(q[d], (float)row[d], sum);
+            sc[(size_t)h * nt + t - t0] = sum * (ks[t] * scale);
+        }
+}
+static void attention_scores_i6(const float *qh, const uint8_t *k, const float *ks,
+                                int t0, int t1, float *sc, int nt, float scale) {
+    const size_t row_bytes = q38d_kv_i6_row_bytes(HD);
+    for (int t = t0; t < t1; t++) {
+        const uint8_t *row = k + (size_t)t * row_bytes;
+        float unpacked[HD];
+        q38d_kv_i6_unpack_f32_256(row, unpacked);
+        for (int h = 0; h < 6; h++) {
+            const float *q = qh + (size_t)h * HD;
+            float sum = dot(q, unpacked, HD);
+            sc[(size_t)h * nt + t - t0] = sum * (ks[t] * scale);
+        }
+    }
+}
+static void attention_pv_i8(const int8_t *v, const float *vs, int t0, int t1,
+                            const float *sc, int nt, float *out, int stride) {
+    for (int h = 0; h < 6; h++) {
+        float *dst = out + (size_t)h * stride;
+        memset(dst, 0, HD * sizeof(float));
+        for (int t = t0; t < t1; t++) {
+            float w = sc[(size_t)h * nt + t - t0] * vs[t];
+            const int8_t *row = v + (size_t)t * HD;
+            for (int d = 0; d < HD; d++) dst[d] = fmaf(w, (float)row[d], dst[d]);
+        }
+    }
+}
+static void attention_pv_i6(const uint8_t *v, const float *vs, int t0, int t1,
+                            const float *sc, int nt, float *out, int stride) {
+    const size_t row_bytes = q38d_kv_i6_row_bytes(HD);
+    for (int h = 0; h < 6; h++) {
+        float *dst = out + (size_t)h * stride;
+        memset(dst, 0, HD * sizeof(float));
+    }
+    const svbool_t pf = svptrue_b32();
+    for (int t = t0; t < t1; t++) {
+        const uint8_t *row = v + (size_t)t * row_bytes;
+        float unpacked[HD];
+        q38d_kv_i6_unpack_f32_256(row, unpacked);
+        for (int h = 0; h < 6; h++) {
+            float *dst = out + (size_t)h * stride;
+            float w = sc[(size_t)h * nt + t - t0] * vs[t];
+            for (int d = 0; d < HD; d += 16)
+                svst1_f32(pf, dst + d, svmla_n_f32_x(pf, svld1_f32(pf, dst + d),
+                                                      svld1_f32(pf, unpacked + d), w));
+        }
+    }
 }
 static void attention_io(int layer, int tid, int pos, int *csense, const q38d_io *io) {
     uint64_t T0 = tid ? 0 : ticks();
@@ -1556,8 +1676,23 @@ static void attention_io(int layer, int tid, int pos, int *csense, const q38d_io
         head_rmsnorm_rope(kv, L->k_norm, pos);
         int pk, pu;
         kv_map(pos, GW / PER, &pk, &pu);
-        memcpy(E.kcp[ai][c][pk] + (size_t)pu * HD, kv, sizeof kv);
-        memcpy(E.vcp[ai][c][pk] + (size_t)pu * HD, io->vb + c * HD, HD * sizeof(float));
+        if (kv_i6_mode) {
+            if (q38d_kv_i6_pack_row(kv, (uint8_t *)KI.k[ai][c][pk] + (size_t)pu * kv_row_bytes(),
+                                     HD, KI.ks[ai][c][pk] + pu) ||
+                q38d_kv_i6_pack_row(io->vb + c * HD,
+                                     (uint8_t *)KI.v[ai][c][pk] + (size_t)pu * kv_row_bytes(),
+                                     HD, KI.vs[ai][c][pk] + pu))
+                state_fail("nonfinite INT6 KV row");
+        } else if (kv_i8_mode) {
+            if (q38d_kv_i8_quantize_row(kv, KI.k[ai][c][pk] + (size_t)pu * HD,
+                                        HD, KI.ks[ai][c][pk] + pu) ||
+                q38d_kv_i8_quantize_row(io->vb + c * HD, KI.v[ai][c][pk] + (size_t)pu * HD,
+                                        HD, KI.vs[ai][c][pk] + pu))
+                state_fail("nonfinite INT8 KV row");
+        } else {
+            memcpy(E.kcp[ai][c][pk] + (size_t)pu * HD, kv, sizeof kv);
+            memcpy(E.vcp[ai][c][pk] + (size_t)pu * HD, io->vb + c * HD, HD * sizeof(float));
+        }
     }
     uint64_t T1 = tid ? 0 : ticks();
     ATT_BAR();
@@ -1578,12 +1713,17 @@ static void attention_io(int layer, int tid, int pos, int *csense, const q38d_io
         }
     } else {
         if (att_qpf) for (int o = 0; o < 6 * HD * 4; o += 256) __builtin_prefetch((const char *)qh + o);
-        attn_scores(qh, K, t0, t1, sc, nt, scale);
+        if (kv_i6_mode)
+            attention_scores_i6(qh, (const uint8_t *)KI.k[ai][c][l / PER],
+                                KI.ks[ai][c][l / PER], t0, t1, sc, nt, scale);
+        else if (kv_i8_mode)
+            attention_scores_i8(qh, KI.k[ai][c][l / PER], KI.ks[ai][c][l / PER],
+                                t0, t1, sc, nt, scale);
+        else attn_scores(qh, K, t0, t1, sc, nt, scale);
         att_lane[tid][3] += ticks() - T2;
         for (int hh = 0; hh < 6; hh++) {
             float *s_h = sc + hh * nt, *pp = part + hh * (2 + HD);
-            float m = -INFINITY;
-            for (int i = 0; i < nt; i++) if (s_h[i] > m) m = s_h[i];
+            float m = q38d_score_max(s_h, nt, score_max_vector);
             svfloat32_t lsv = svdup_n_f32(0);
             for (int i = 0; i < nt; i += 16) {
                 svbool_t pg = svwhilelt_b32(i, nt);
@@ -1594,7 +1734,13 @@ static void attention_io(int layer, int tid, int pos, int *csense, const q38d_io
             pp[0] = m; pp[1] = svaddv_f32(pf, lsv);
             AHDR(c, l, hh)[0] = m; AHDR(c, l, hh)[1] = pp[1];
         }
-        attn_pv6(V, t0, t1, sc, nt, part + 2, 2 + HD);
+        if (kv_i6_mode)
+            attention_pv_i6((const uint8_t *)KI.v[ai][c][l / PER],
+                            KI.vs[ai][c][l / PER], t0, t1, sc, nt, part + 2, 2 + HD);
+        else if (kv_i8_mode)
+            attention_pv_i8(KI.v[ai][c][l / PER], KI.vs[ai][c][l / PER],
+                            t0, t1, sc, nt, part + 2, 2 + HD);
+        else attn_pv6(V, t0, t1, sc, nt, part + 2, 2 + HD);
     }
     uint64_t T3 = ticks();
     if (wide && att_merge2) cbarrier(tid, csense);
@@ -1828,6 +1974,26 @@ static void phase_end_c(int tid, int *cs, uint64_t *t, int phase) {
  * releases the others); norms then take the sum of squares directly. */
 static double tp_comm_t;
 static int tp_check, tp_check_n, tp_nocomm;
+static int tp_trace;
+static const char *tp_trace_dir;
+static int tp_trace_pos = -1;
+static void tp_trace_x(int tid, int layer, int phase) {
+    if (tid != 0) return;
+    if (tp_trace_dir && pf_pos == tp_trace_pos) {
+        char path[4096];
+        snprintf(path, sizeof(path), "%s/tp%d-r%d-l%02d-p%d.bin", tp_trace_dir, tp_n, tp_r, layer, phase);
+        FILE *f = fopen(path, "wb");
+        if (!f || fwrite(E.x, sizeof(float), EMBD, f) != EMBD || fclose(f)) {
+            fprintf(stderr, "q38d: residual trace write failed\n"); exit(1);
+        }
+    }
+    if (!tp_trace) return;
+    uint64_t h = 1469598103934665603ull;
+    const uint32_t *x = (const uint32_t *)E.x;
+    for (int i = 0; i < EMBD; i++) h = (h ^ x[i]) * 1099511628211ull;
+    fprintf(stderr, "q38d: xtrace rank=%d layer=%d phase=%d %016llx\n",
+            tp_r, layer, phase, (unsigned long long)h);
+}
 static int tp_cmg_slices = 1;   /* slice k = the rows of CMG k: CMG barrier suffices */
 /* Producer-side norm under TP: the lane that completed slice k quantizes
  * x*w of that slice (per-16 quantization is invariant to the RMS factor)
@@ -1911,8 +2077,16 @@ static void phase_end_core(int tid, int *gs, uint64_t *t, int phase, int produce
     prof_mark(tid, t, phase);
 }
 static void tp_reduce(int tid, int *gs, const float *w) {
-    if (tp_cmg_slices && tp_nsl == NCMG) cbarrier(tid, norm_csense[tid]);
+    /* Replicated mixers leave the same residual on every rank. Reduce only
+     * the FFN partials, then add the saved residual once. */
+    if (tp_replicate_mixers && tid == 0) memcpy(E.o, E.x, (size_t)EMBD * sizeof(float));
+    if (tp_replicate_mixers) gbarrier(tid, gs);
+    else if (tp_cmg_slices && tp_nsl == NCMG) cbarrier(tid, norm_csense[tid]);
     else gbarrier(tid, gs);
+    if (tp_replicate_mixers) {
+        if (tid == 0) memset(E.x, 0, (size_t)EMBD * sizeof(float));
+        gbarrier(tid, gs);
+    }
     int k = tid / PER;
     if (tid % PER == 0 && k < tp_nsl) {
         uint64_t a = tid ? 0 : ticks();
@@ -1920,6 +2094,11 @@ static void tp_reduce(int tid, int *gs, const float *w) {
         if (tp_nocomm) { for (int i = 0; i < n; i++) E.x[k * n + i] += E.xpart[k * n + i]; }   /* timing experiment only */
         else if (tp_nsl > 1) q38d_tp_sum_add_slice(k, E.xpart + k * n, E.x + k * n, n);
         else q38d_tp_sum_add(E.xpart, E.x, EMBD);
+        if (tp_replicate_mixers) {
+            int r0 = tp_nsl > 1 ? k * n : 0;
+            int nr = tp_nsl > 1 ? n : EMBD;
+            for (int i = 0; i < nr; i++) E.x[r0 + i] += E.o[r0 + i];
+        }
         tp_ssq[k] = sumsq(E.x + k * n, n);
         if (tp_pnorm && w) tp_produce(k, n, w);
         if (!tid) tp_comm_t += (double)(ticks() - a);
@@ -1979,7 +2158,7 @@ static void layer_body(int tid, int layer, int pos, int *gs, int *cs, uint64_t *
             if (E.arith == Q38D_F32) E.act_o.x = E.o;
             phase_end_core(tid, gs, &t, P_SSM_CORE, hh >= 0);
             const q38d_act *ao = o_act(tid, cs);
-            if (tp_n > 1) { mv(&L->out, ao, E.xpart, 0, tid); tp_reduce(tid, gs, L->post_norm); }
+            if (tp_n > 1 && !tp_replicate_mixers) { mv(&L->out, ao, E.xpart, 0, tid); tp_reduce(tid, gs, L->post_norm); }
             else {
                 mv(&L->out, ao, E.x, 1, tid);
                 ssq_valid = 1;
@@ -1987,7 +2166,7 @@ static void layer_body(int tid, int layer, int pos, int *gs, int *cs, uint64_t *
                 if (prod_norm) x_produce(&L->out, tid, L->post_norm);
                 else ssq_publish_rows(&L->out, tid);
             }
-            if (tp_n > 1) phase_end_tp(tid, gs, &t, P_SSM_OUT); else phase_end(tid, gs, &t, P_SSM_OUT);
+            if (tp_n > 1 && !tp_replicate_mixers) phase_end_tp(tid, gs, &t, P_SSM_OUT); else phase_end(tid, gs, &t, P_SSM_OUT);
         } else {
             if (use_plan) run_plan(&plan_att[layer], a, tid, omul);
             else { mv(&L->q, a, E.qg, 0, tid); mv(&L->k, a, E.kb, 0, tid); mv(&L->v, a, E.vb, 0, tid); }
@@ -1997,7 +2176,7 @@ static void layer_body(int tid, int layer, int pos, int *gs, int *cs, uint64_t *
             if (E.arith == Q38D_F32) E.act_o.x = E.o;
             phase_end(tid, gs, &t, P_ATT_CORE);
             const q38d_act *ao = o_act(tid, cs);
-            if (tp_n > 1) { mv(&L->o, ao, E.xpart, 0, tid); tp_reduce(tid, gs, L->post_norm); }
+            if (tp_n > 1 && !tp_replicate_mixers) { mv(&L->o, ao, E.xpart, 0, tid); tp_reduce(tid, gs, L->post_norm); }
             else {
                 mv(&L->o, ao, E.x, 1, tid);
                 ssq_valid = 1;
@@ -2005,8 +2184,9 @@ static void layer_body(int tid, int layer, int pos, int *gs, int *cs, uint64_t *
                 if (prod_norm) x_produce(&L->o, tid, L->post_norm);
                 else ssq_publish_rows(&L->o, tid);
             }
-            if (tp_n > 1) phase_end_tp(tid, gs, &t, P_ATT_OUT); else phase_end(tid, gs, &t, P_ATT_OUT);
+            if (tp_n > 1 && !tp_replicate_mixers) phase_end_tp(tid, gs, &t, P_ATT_OUT); else phase_end(tid, gs, &t, P_ATT_OUT);
         }
+        tp_trace_x(tid, layer, 0);
         if (ffn_a8 && E.arith == Q38D_A16) E.act_c[tid / PER].arith = Q38D_A8;
         if (prod_norm) { int cc = prod_copies > 1 ? tid / PER : 0; a = &E.act_c[cc]; E.act_c[cc].x = E.xn_c[cc]; omul = x_inv(); }
         else if (!tp_prod_act(tid, &a, &omul)) { a = norm_act(tid, L->post_norm); omul = 1.0f; }
@@ -2066,6 +2246,7 @@ static void layer_body(int tid, int layer, int pos, int *gs, int *cs, uint64_t *
             else ssq_publish_rows(&L->down, tid);
         }
         if (tp_n > 1) phase_end_tp(tid, gs, &t, P_FFN_DOWN); else phase_end(tid, gs, &t, P_FFN_DOWN);
+        tp_trace_x(tid, layer, 1);
     #undef t
 }
 
@@ -2106,7 +2287,7 @@ static void head_argmax_m(int tid, const float *nw, const q38d_mat *hm, int *gs,
             fprintf(stderr, "q38d: xh rank=%d step=%d %016llx\n", tp_r, tp_check_n++, (unsigned long long)hsh);
         }
         if (tp_n > 1 && hm == &E.head) {
-            int gid = bi + tp_r * (E.n_vocab / tp_n);
+            int gid = bi + E.vocab_first;
             q38d_tp_argmax(&best, &gid);
             bi = gid;
         }
@@ -2619,8 +2800,7 @@ static void attention_mt(int layer, int tid, int pos0, int T, int *cs) {
         attn_scores(qh_mt[c] + (size_t)i * 6 * HD, K, t0, b, sc, nt, scale);
         for (int hh = 0; hh < 6; hh++) {
             float *s_h = sc + hh * nt, *pp = part + hh * PS;
-            float m = -INFINITY;
-            for (int j = 0; j < nt; j++) if (s_h[j] > m) m = s_h[j];
+            float m = q38d_score_max(s_h, nt, score_max_vector);
             svfloat32_t lsv = svdup_n_f32(0);
             for (int j = 0; j < nt; j += 16) {
                 svbool_t pg = svwhilelt_b32(j, nt);
@@ -2838,7 +3018,9 @@ typedef struct {
 static q38d_job JOB;
 static int bench_mv;
 
+#include "q38d_state.inc"
 #include "../q38p/q38p_prefill.inc"
+#include "q38d_batch.inc"
 
 static void *worker(void *arg) {
     int tid = (int)(intptr_t)arg;
@@ -2874,13 +3056,29 @@ static void *worker(void *arg) {
     if (l == 0) {
         int cpk = kv_cpk();
         for (int ai = 0; ai < NATTN + mtp_on; ai++) {
+#ifdef Q38P_MPI
+            /* A PP rank only evaluates its own attention mixers. Long-context
+             * prefill must not allocate every layer's full FP32 KV on every
+             * node. PP decode still gathers all layers onto rank 0. */
+            int mixer_unit = 2 * (4 * ai + 3);
+            if (pp_on && !pp_decode && (mixer_unit < pp_u0 || mixer_unit >= pp_u1)) continue;
+#endif
             int kv = c / cpk, k = c % cpk;   /* local KV head of this CMG's group; part k of it */
             size_t np = ((size_t)E.max_seq / (KVB * cpk) + 1) * KVB;
-            E.kcp[ai][kv][k] = cmg_alloc(np * HD * 4, c);
-            E.vcp[ai][kv][k] = cmg_alloc(np * HD * 4, c);
-            memset(E.kcp[ai][kv][k], 0, np * HD * 4);
-            memset(E.vcp[ai][kv][k], 0, np * HD * 4);
-            if (k == 0) { E.kc[ai][kv] = E.kcp[ai][kv][0]; E.vc[ai][kv] = E.vcp[ai][kv][0]; }
+            if (kv_i8_mode || kv_i6_mode || pf_kv_i6_mode) {
+                KI.k[ai][kv][k] = cmg_alloc(np * kv_row_bytes(), c);
+                KI.v[ai][kv][k] = cmg_alloc(np * kv_row_bytes(), c);
+                KI.ks[ai][kv][k] = cmg_alloc(np * sizeof(float), c);
+                KI.vs[ai][kv][k] = cmg_alloc(np * sizeof(float), c);
+                if (!KI.k[ai][kv][k] || !KI.v[ai][kv][k] || !KI.ks[ai][kv][k] || !KI.vs[ai][kv][k])
+                    state_fail("INT8 KV allocation");
+            } else {
+                E.kcp[ai][kv][k] = cmg_alloc(np * HD * 4, c);
+                E.vcp[ai][kv][k] = cmg_alloc(np * HD * 4, c);
+                memset(E.kcp[ai][kv][k], 0, np * HD * 4);
+                memset(E.vcp[ai][kv][k], 0, np * HD * 4);
+                if (k == 0) { E.kc[ai][kv] = E.kcp[ai][kv][0]; E.vc[ai][kv] = E.vcp[ai][kv][0]; }
+            }
         }
         E.qh[c] = aligned_alloc(256, 6 * HD * 4);
         E.xn_c[c] = aligned_alloc(256, EMBD * sizeof(float));
@@ -2903,6 +3101,10 @@ static void *worker(void *arg) {
     kchunk_copy_or_write(c, l, 0);
     gbarrier(tid, &gs);
     kchunk_copy_or_write(c, l, 1);
+    gbarrier(tid, &gs);
+    if (tid == 0 && prune_model_parts) context_prune_model();
+    gbarrier(tid, &gs);
+    context_alloc_owned(tid);
     gbarrier(tid, &gs);
     if (mtp_on && draft_v && !draft_f4) {
         /* draft head: rows [first'[c], first'[c+1]) copied from the head's groups */
@@ -2967,9 +3169,38 @@ static void *worker(void *arg) {
         }
         return NULL;
     }
+    if (context_count > 1) {
+        gbarrier(tid, &gs);
+        context_run(tid, &gs, &cs);
+        return NULL;
+    }
     double t0 = 0;
     int pn = JOB.n_prompt, gn = JOB.n_gen;
+    if (state_in) {
+#ifdef Q38D_TP
+        if (tid == 0 && tp_n > 1) tp_barrier();
+#endif
+        gbarrier(tid, &gs);  /* all models/repacked shards ready before import timing */
+    }
     if (tid == 0) t0 = now_sec();
+    if (state_in) {
+        if (tid == 0) state_import();
+        gbarrier(tid, &gs);
+        uint64_t tt = ticks();
+        head_argmax(tid, E.out_norm, &gs, &tt);
+        if (tid == 0 && E.next_token != state_first_token) state_fail("handoff first-token mismatch");
+        /* Optional prompt tail: measure topology-specific recurrent-state
+         * settling separately from both the producer and output generation. */
+        double replay_start = tid == 0 ? now_sec() : 0;
+        for (int pos = state_prompt_tokens(); pos < pn; pos++)
+            step(tid, JOB.tok[pos], pos, pos == pn - 1, &gs, &cs);
+        if (tid == 0) {
+            double ready = now_sec();
+            fprintf(stderr, "q38d_state: TP%d rank=%d import=%.6f s ready=%.6f s first_token=%d prefix_token=%d prefix_match=1 replay_tokens=%d replay=%.6f s\n",
+                    tp_n, tp_r, state_read_sec, ready - t0, E.next_token, state_first_token,
+                    pn - state_prompt_tokens(), ready - replay_start);
+        }
+    } else
 #ifdef Q38P_MPI
     if (pp_on) q38p_pipeline(tid, JOB.tok, pn, &gs);
     else
@@ -2987,9 +3218,10 @@ static void *worker(void *arg) {
     if (mtp_on) mtp_drafts(tid, 0, pn - 1, &gs, &cs);
     if (vbench_T) { vbench(tid, &gs, &cs); return NULL; }
     if (tid == 0) {
-        JOB.t_prefill = now_sec() - t0;
+        JOB.t_prefill = state_in ? 0 : now_sec() - t0;
         memset(E.prof, 0, sizeof E.prof);
         kprof_kernel = kprof_norm = kprof_wait_acc = 0;
+        tp_comm_t = 0;
         memset(ssm_t, 0, sizeof ssm_t);
         memset(ssm_t2, 0, sizeof ssm_t2);
         memset(oq_t, 0, sizeof oq_t);
@@ -3058,11 +3290,23 @@ static void *worker(void *arg) {
         }
         return NULL;
     }
+    double decode_block_start = tid == 0 ? t0 : 0;
+    int decode_block_tokens = 0;
     for (int n = 0; n < gn; n++) {
         int cur = E.next_token;
         if (tid == 0) { JOB.tok[pn + n] = cur; JOB.trace_logit[n] = E.next_logit; }
         step(tid, cur, pn + n, 1, &gs, &cs);
         if (mtp_on) mtp_drafts(tid, n + 1, pn + n, &gs, &cs);
+        if (tid == 0 && tp_r == 0 && gn >= 1024) {
+            decode_block_tokens++;
+            if (decode_block_tokens == 1024 || n + 1 == gn) {
+                double done = now_sec();
+                fprintf(stderr, "q38d_decode: TP%d generated=%d context=%d block_tokens=%d seconds=%.6f tok_s=%.3f\n",
+                        tp_n, n + 1, pn + n + 1, decode_block_tokens, done - decode_block_start,
+                        decode_block_tokens / (done - decode_block_start));
+                decode_block_start = done; decode_block_tokens = 0;
+            }
+        }
     }
     if (mtp_on && tid == 0) {
         /* x_{pn+j} = JOB.tok[pn+j], j < gn. Chain i predicts x_{pn+i+1..pn+i+3}. */
@@ -3091,12 +3335,63 @@ static void *worker(void *arg) {
 
 static void usage(const char *p) {
     fprintf(stderr, "usage: %s MODEL.gguf --fmt fp4|fp6 [--image PATH | --write-image PATH]\n"
-                    "       [--act f32|a8|a16] [--prompt TEXT] [--prompt-tokens N] [--gen N]\n", p);
+                    "       [--act f32|a8|a16] [--prompt TEXT | --prompt-file PATH] [--prompt-tokens N (0=full file)] [--gen N]\n"
+                    "       [--state-out NEW_DIR | --state-in DIR] (requires --image)\n"
+                    "       [--state-out-i6] (quantize PP FP32 KV when writing version-2 state)\n"
+                    "       [--bench-depth N --bench-fill tokens|synthetic-kv --bench-seed N] (PP benchmark only)\n"
+                    "       [--state-prefix-tokens N] (replay the remaining prompt after import)\n"
+                    "       [--contexts N] (2..32 independent FP32 slots, round-robin decode)\n"
+                    "       [--context-prompt-list PATH] (one prompt file path per context; each must have >= prompt-tokens)\n"
+                    "       [--context-state-list PATH] (one version-2 state directory per context)\n"
+                    "       [--prune-model] (release unused TP source matrix mappings after repack)\n"
+                    "       [--prompt-rotate N] (cyclic token rotation for context isolation checks)\n"
+                    "       [--kv-i8] (per-token-scaled INT8 attention cache, regular decode only)\n"
+                    "       [--kv-i6] (per-token-scaled packed INT6 cache, regular decode only)\n"
+                    "       [--prefill-kv-i6] (packed INT6 PP cache; qtile=1, no state export/decode)\n"
+                    "       [--prefill-i6-parallel 0|1] (split deep single-query attention across PP workers)\n"
+                    "       [--warm-kv-depth N] (synthetic compressed cache fill before measured prompt)\n", p);
+}
+
+static void load_context_prompt_list(bpe_vocab *vocab, const char *list_path, int pn) {
+    FILE *list = fopen(list_path, "r");
+    if (!list) state_fail("context prompt list open");
+    context_prompt_tokens = malloc((size_t)context_count * pn * sizeof(int32_t));
+    if (!context_prompt_tokens) state_fail("context prompt token allocation");
+    char path[4096];
+    for (int b = 0; b < context_count; b++) {
+        if (!fgets(path, sizeof(path), list)) state_fail("context prompt list has too few paths");
+        size_t len = strlen(path);
+        if (len && path[len - 1] != '\n' && !feof(list)) state_fail("context prompt path too long");
+        while (len && (path[len - 1] == '\n' || path[len - 1] == '\r')) path[--len] = 0;
+        if (!len) state_fail("empty context prompt path");
+        FILE *f = fopen(path, "rb");
+        if (!f || fseek(f, 0, SEEK_END)) state_fail("context prompt file open/seek");
+        long n = ftell(f);
+        if (n < 1 || n > (16 << 20) || fseek(f, 0, SEEK_SET)) state_fail("context prompt file size (1..16 MiB)");
+        char *data = malloc((size_t)n + 1);
+        int32_t *tokens = malloc(((size_t)n + 1) * sizeof(int32_t));
+        if (!data || !tokens || fread(data, 1, (size_t)n, f) != (size_t)n)
+            state_fail("context prompt file read/allocate");
+        fclose(f);
+        data[n] = 0;
+        int count = bpe_tokenize(vocab, data, -1, tokens, (int)n + 1);
+        if (count < pn) state_fail("context prompt has fewer tokens than --prompt-tokens");
+        memcpy(context_prompt_tokens + (size_t)b * pn, tokens, (size_t)pn * sizeof(int32_t));
+        fprintf(stderr, "q38d_batch: context=%d prompt_file=%s available_tokens=%d used_tokens=%d\n",
+                b, path, count, pn);
+        free(data);
+        free(tokens);
+    }
+    if (fgets(path, sizeof(path), list)) state_fail("context prompt list has too many paths");
+    fclose(list);
 }
 
 int main(int argc, char **argv) {
+    const char *prompt_file = NULL;
+    const char *context_prompt_list = NULL;
+    const char *context_state_list = NULL;
     const char *path = NULL, *image = NULL, *write_image = NULL, *prompt = "Explain why the sky is blue.";
-    int fmt = Q38D_F4, arith = Q38D_A16, pn = 1024, gn = 256;
+    int fmt = Q38D_F4, arith = Q38D_A16, pn = 1024, gn = 256, prompt_rotate = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--fmt") && i + 1 < argc) { i++; fmt = !strcmp(argv[i], "fp6") ? Q38D_F6 : Q38D_F4; }
         else if (!strcmp(argv[i], "--image") && i + 1 < argc) image = argv[++i];
@@ -3105,13 +3400,43 @@ int main(int argc, char **argv) {
             i++; arith = !strcmp(argv[i], "f32") ? Q38D_F32 : !strcmp(argv[i], "a8") ? Q38D_A8 : Q38D_A16;
         }
         else if (!strcmp(argv[i], "--prompt") && i + 1 < argc) prompt = argv[++i];
+        else if (!strcmp(argv[i], "--prompt-file") && i + 1 < argc) prompt_file = argv[++i];
+        else if (!strcmp(argv[i], "--context-prompt-list") && i + 1 < argc) context_prompt_list = argv[++i];
+        else if (!strcmp(argv[i], "--context-state-list") && i + 1 < argc) context_state_list = argv[++i];
+        else if (!strcmp(argv[i], "--state-in") && i + 1 < argc) state_in = argv[++i];
+        else if (!strcmp(argv[i], "--state-prefix-tokens") && i + 1 < argc) state_prefix_tokens = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--state-out") && i + 1 < argc) state_out = argv[++i];
+        else if (!strcmp(argv[i], "--state-out-i6")) state_out_i6 = 1;
         else if (!strcmp(argv[i], "--prompt-tokens") && i + 1 < argc) pn = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--gen") && i + 1 < argc) gn = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--contexts") && i + 1 < argc) context_count = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--prune-model")) prune_model_parts = 1;
+        else if (!strcmp(argv[i], "--prompt-rotate") && i + 1 < argc) prompt_rotate = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--kv-i8")) kv_i8_mode = 1;
+        else if (!strcmp(argv[i], "--kv-i6")) kv_i6_mode = 1;
+        else if (!strcmp(argv[i], "--prefill-kv-i6")) pf_kv_i6_mode = 1;
+        else if (!strcmp(argv[i], "--prefill-i6-parallel") && i + 1 < argc) pf_i6_parallel = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--warm-kv-depth") && i + 1 < argc) warm_kv_depth = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--bench-depth") && i + 1 < argc) {
+            char *end; long v = strtol(argv[++i], &end, 10);
+            if (*end || v < 1 || v > 1048576) { usage(argv[0]); return 2; }
+            pf_bench_depth = (int)v;
+        }
+        else if (!strcmp(argv[i], "--bench-seed") && i + 1 < argc) pf_bench_seed = (unsigned)strtoul(argv[++i], NULL, 10);
+        else if (!strcmp(argv[i], "--bench-fill") && i + 1 < argc) {
+            const char *v = argv[++i];
+            if (strcmp(v, "tokens") && strcmp(v, "synthetic-kv")) { usage(argv[0]); return 2; }
+            pf_bench_synthetic = !strcmp(v, "synthetic-kv");
+        }
         else if (!strcmp(argv[i], "--bench-mv") && i + 1 < argc) bench_mv = atoi(argv[++i]);
         else if (argv[i][0] != '-' && !path) path = argv[i];
         else { usage(argv[0]); return 2; }
     }
-    if (!path || pn < 1 || gn < 1) { usage(argv[0]); return 2; }
+    if (!path || pn < 0 || (pn == 0 && !prompt_file) || gn < 1 ||
+        context_count < 1 || context_count > Q38D_MAX_CONTEXTS || prompt_rotate < 0 || warm_kv_depth < 0 ||
+        warm_kv_depth > 1048576 || pf_i6_parallel < 0 || pf_i6_parallel > 1) { usage(argv[0]); return 2; }
+    if (context_prompt_list && (context_count == 1 || pn == 0 || prompt_file || prompt_rotate))
+        state_fail("--context-prompt-list requires --contexts >=2 and fixed prompt-tokens; no prompt-file/rotate");
 #ifndef Q38P_MPI
     if (getenv("Q38P_PP") && atoi(getenv("Q38P_PP"))) {
         fprintf(stderr, "q38p: rebuild with -DQ38P_MPI for pipeline mode\n");
@@ -3137,11 +3462,34 @@ int main(int argc, char **argv) {
         pf_on = 1;
     }
 #endif
-    E.fmt = fmt; E.arith = arith; E.max_seq = pn + gn + 8;
+    int pf_depth_limit = pf_bench_synthetic ? 1048576 + 8192 : 49152;
+    if (pf_bench_depth < 0 || pf_bench_depth > pf_depth_limit ||
+        (pf_bench_depth && (pn > pf_depth_limit - pf_bench_depth)) ||
+        (pf_bench_depth && (!pp_on || state_in || state_out || prompt_file || pn < 1))) {
+        fprintf(stderr, "q38p: --bench-depth requires pipeline, synthetic prompt, no decode/snapshot; total depth+suffix <=%d\n", pf_depth_limit);
+        return 2;
+    }
+    if ((state_in && state_out) || (state_out && !pp_on) || (state_in && pp_on)) {
+        fprintf(stderr, "q38d: --state-out requires pipeline; --state-in requires decode only\n"); return 2;
+    }
+    if (state_out_i6 && !state_out) state_fail("--state-out-i6 requires --state-out");
+#ifdef Q38P_MPI
+    if (state_out) {
+        if (pp_prompts != 1 || pp_decode) state_fail("export requires one prompt and no pipeline decode");
+        if (pp_r == 0 && mkdir(state_out, 0700)) state_fail("export directory must be new (parent must exist)");
+        MPI_Barrier(MPI_COMM_WORLD);
+    }
+#endif
+#ifdef Q38P_MPI
+    if (pf_bench_depth && pp_decode) state_fail("depth benchmark does not support decode");
+#endif
+    if (pf_bench_depth) pn += pf_bench_depth;
+    E.fmt = fmt; E.arith = arith; E.max_seq = warm_kv_depth + pn + gn + 8;
     {
         /* tensor parallelism: one process per node, Q38D_TP ranks */
         int tpn = getenv("Q38D_TP") ? atoi(getenv("Q38D_TP")) : 1;
-        if (tpn != 1 && tpn != 2 && tpn != 4) { fprintf(stderr, "q38d: Q38D_TP must be 1, 2 or 4\n"); return 2; }
+        if (tpn < 1 || tpn > Q38D_TP_MAXN) { fprintf(stderr, "q38d: Q38D_TP must be 1..%d\n", Q38D_TP_MAXN); return 2; }
+        tp_replicate_mixers = tpn > 1 && tpn != 2 && tpn != 4;
         if (pp_on && tpn != 1) { fprintf(stderr, "q38p: pipeline and tensor parallel modes cannot be combined\n"); return 2; }
         pin_cpu(12);
         q38d_tp_init(tpn, EMBD);
@@ -3160,6 +3508,61 @@ int main(int argc, char **argv) {
     if (write_image && !q38_lowbit_model_save_image(LB, write_image)) { fprintf(stderr, "q38d: image write failed\n"); return 1; }
     bpe_vocab *vocab = bpe_vocab_load(G);
     if (!vocab) return 1;
+    /* File prompts are never repeated; --prompt-tokens selects a prefix. */
+    char *prompt_data = NULL;
+    if (prompt_file) {
+        FILE *f = fopen(prompt_file, "rb");
+        if (!f || fseek(f, 0, SEEK_END)) state_fail("prompt file open/seek");
+        long n = ftell(f);
+        if (n < 1 || n > (16 << 20) || fseek(f, 0, SEEK_SET)) state_fail("prompt file size (1..16 MiB)");
+        prompt_data = malloc((size_t)n + 1);
+        if (!prompt_data || fread(prompt_data, 1, n, f) != (size_t)n) state_fail("prompt file read");
+        prompt_data[n] = 0; fclose(f); prompt = prompt_data;
+    }
+    size_t capacity = strlen(prompt) + 1;
+    int32_t *base = malloc(capacity * sizeof(int32_t));
+    if (!base) state_fail("token allocation");
+    int bn = bpe_tokenize(vocab, prompt, -1, base, (int)capacity);
+    if (prompt_file && pn == 0) pn = bn;
+    if (prompt_file && bn < pn) state_fail("prompt file has fewer tokens than --prompt-tokens");
+    if (bn <= 0) { fprintf(stderr, "q38d: prompt did not tokenize\n"); return 1; }
+    JOB.tok = malloc((size_t)(pn + gn + 1) * sizeof(int32_t));
+    JOB.trace_logit = malloc((size_t)gn * sizeof(float));
+    for (int i = 0; i < pn; i++) JOB.tok[i] = base[i % bn];
+    if (pf_bench_depth) {
+        unsigned r = pf_bench_seed;
+        int nv = (int)G->tensors[need_tensor("output.weight", 0)].dims[1];
+        for (int i = 0; i < pn; i++) { r = r * 1664525u + 1013904223u; JOB.tok[i] = (int)(r % (unsigned)nv); }
+    }
+    if (prompt_rotate && pn > 0) {
+        int offset = prompt_rotate % pn;
+        int32_t *rotated = malloc((size_t)pn * sizeof(int32_t));
+        if (!rotated) state_fail("rotated prompt allocation");
+        for (int i = 0; i < pn; i++) rotated[i] = JOB.tok[(i + offset) % pn];
+        memcpy(JOB.tok, rotated, (size_t)pn * sizeof(int32_t));
+        free(rotated);
+    }
+    JOB.n_prompt = pn; JOB.n_gen = gn;
+    if (context_prompt_list) load_context_prompt_list(vocab, context_prompt_list, pn);
+    if (context_state_list) context_load_state_list(context_state_list);
+    fprintf(stderr, "q38d: prompt_source=%s available_tokens=%d used_tokens=%d repeated=%d\n",
+            pf_bench_depth ? "random-token-benchmark" : prompt_file ? prompt_file : "--prompt",
+            pf_bench_depth ? pn : bn, pn, !pf_bench_depth && !prompt_file && pn > bn);
+    free(base); free(prompt_data);
+    E.max_seq = warm_kv_depth + pn + ((kv_i8_mode || kv_i6_mode) && context_count > 1 && gn < 8192 ? 8192 : gn) + 8;
+    if (context_count > 1) {
+        size_t heads = tp_n == 4 ? 1 : tp_n == 2 ? 2 : 4;
+        size_t bytes_per_token = (size_t)NATTN * heads * 2 *
+                                 ((kv_i8_mode || kv_i6_mode) ? kv_row_bytes() + sizeof(float) : HD * sizeof(float));
+        size_t limit = (size_t)((kv_i8_mode || kv_i6_mode) && prune_model_parts ? 25 : 8) << 30;
+        if ((size_t)E.max_seq > limit / bytes_per_token / (size_t)context_count)
+            state_fail("batched KV exceeds rank memory budget");
+        context_slots = calloc((size_t)context_count, sizeof *context_slots);
+        if (!context_slots) state_fail("context slot allocation");
+    }
+    if (state_prefix_tokens < 0 || state_prefix_tokens > pn || (state_prefix_tokens && !state_in))
+        state_fail("--state-prefix-tokens must describe an imported prefix within the full prompt");
+    if (state_in || state_out || context_state_list) state_identity(image);
     if (getenv("Q38D_VBENCH")) vbench_T = atoi(getenv("Q38D_VBENCH"));
     if (getenv("Q38D_MTP")) mtp_on = atoi(getenv("Q38D_MTP")) != 0;
     if (getenv("Q38D_SPEC")) spec_k = atoi(getenv("Q38D_SPEC"));
@@ -3169,6 +3572,9 @@ int main(int argc, char **argv) {
     if (getenv("Q38D_FFN_REV")) ffn_rev = atoi(getenv("Q38D_FFN_REV"));
     if (getenv("Q38D_TP_NOCOMM")) tp_nocomm = atoi(getenv("Q38D_TP_NOCOMM"));
     if (getenv("Q38D_TP_CHECK")) tp_check = atoi(getenv("Q38D_TP_CHECK"));
+    if (getenv("Q38D_TP_TRACE")) tp_trace = atoi(getenv("Q38D_TP_TRACE"));
+    tp_trace_dir = getenv("Q38D_TRACE_DIR");
+    tp_trace_pos = getenv("Q38D_TRACE_POS") ? atoi(getenv("Q38D_TRACE_POS")) : pn;
     if (getenv("Q38D_TP_CMGSL")) tp_cmg_slices = atoi(getenv("Q38D_TP_CMGSL"));
     if (getenv("Q38D_CORE_FLAGS")) core_flags = atoi(getenv("Q38D_CORE_FLAGS"));
     if (getenv("Q38D_TP_FLAGREL")) tp_flagrel = atoi(getenv("Q38D_TP_FLAGREL"));
@@ -3177,10 +3583,45 @@ int main(int argc, char **argv) {
 #ifdef Q38P_MPI
     if (pp_on) pf_on = 1;
 #endif
+    if (getenv("Q38P_ATTN_CACHE")) pf_attn_cache = atoi(getenv("Q38P_ATTN_CACHE")) != 0;
+    if (getenv("Q38P_ATTN_GEMM")) pf_attn_gemm = atoi(getenv("Q38P_ATTN_GEMM"));
+    if (pf_attn_gemm < 0 || pf_attn_gemm > 1) state_fail("Q38P_ATTN_GEMM must be 0 or 1");
+    if (getenv("Q38P_ATTN_PV_GEMM")) pf_attn_pv_gemm = atoi(getenv("Q38P_ATTN_PV_GEMM"));
+    if (pf_attn_pv_gemm < 0 || pf_attn_pv_gemm > 1) state_fail("Q38P_ATTN_PV_GEMM must be 0 or 1");
+    if (getenv("Q38P_ATTN_PV_INT16")) pf_attn_pv_int16 = atoi(getenv("Q38P_ATTN_PV_INT16"));
+    if (pf_attn_pv_int16 < 0 || pf_attn_pv_int16 > 1) state_fail("Q38P_ATTN_PV_INT16 must be 0 or 1");
+    if (getenv("Q38P_ATTN_PV_RESIDUAL")) pf_attn_pv_residual = atoi(getenv("Q38P_ATTN_PV_RESIDUAL"));
+    if (pf_attn_pv_residual < 0 || pf_attn_pv_residual > 1 ||
+        (pf_attn_pv_residual && !pf_attn_pv_int16)) state_fail("Q38P_ATTN_PV_RESIDUAL requires int16 PV and must be 0 or 1");
+    if (getenv("Q38P_ATTN_PV_P_RESIDUAL")) pf_attn_pv_p_residual = atoi(getenv("Q38P_ATTN_PV_P_RESIDUAL"));
+    if (pf_attn_pv_p_residual < 0 || pf_attn_pv_p_residual > 1 ||
+        (pf_attn_pv_p_residual && !pf_attn_pv_int16))
+        state_fail("Q38P_ATTN_PV_P_RESIDUAL requires int16 PV and must be 0 or 1");
+    if (pf_attn_pv_int16 && pf_attn_pv_gemm) state_fail("select only one PV kernel");
+    if (pf_attn_pv_int16 && pf_on && !pp_on) state_fail("int16 PV requires pipeline prefill");
+    if (getenv("Q38P_ATTN_SCORE_PAD")) pf_attn_score_pad = atoi(getenv("Q38P_ATTN_SCORE_PAD"));
+    if (pf_attn_score_pad < 0 || pf_attn_score_pad > 256 || pf_attn_score_pad % 16)
+        state_fail("Q38P_ATTN_SCORE_PAD must be a multiple of 16 in 0..256");
+    if (getenv("Q38P_ATTN_QK6")) att_qk6 = atoi(getenv("Q38P_ATTN_QK6")) != 0;
+    if (getenv("Q38P_ATTN_PROF")) pf_attn_prof = atoi(getenv("Q38P_ATTN_PROF")) != 0;
+    if (getenv("Q38P_ATTN_KTILE")) pf_attn_ktile = atoi(getenv("Q38P_ATTN_KTILE"));
+    if (pf_attn_ktile < 16 || pf_attn_ktile > 1024 || pf_attn_ktile % 16) state_fail("Q38P_ATTN_KTILE must be a multiple of 16 in 16..1024");
+    if (getenv("Q38P_ATTN_QTILE")) pf_attn_qtile = atoi(getenv("Q38P_ATTN_QTILE"));
+    if (pf_attn_qtile < 1 || pf_attn_qtile > 16) state_fail("Q38P_ATTN_QTILE must be 1..16");
+    if (pp_on && pf_kv_i6_mode &&
+        (pf_attn_cache || pf_attn_pv_int16 || (E.max_seq > 300000 && pf_attn_qtile > 4)))
+        state_fail("packed PP K/V requires key cache and int16 PV off, with query tile <=4 above 300K");
+    if (pf_bench_depth > 49152 &&
+        (!pf_kv_i6_mode || pf_attn_cache || pf_attn_pv_int16 ||
+         (pf_bench_depth > 300000 && pf_attn_qtile > 4)))
+        state_fail("long synthetic PP depth requires --prefill-kv-i6, Q38P_ATTN_CACHE=0, Q38P_ATTN_PV_INT16=0, and query tile <=4 above 300K");
+    if (getenv("Q38P_ATTN_CMG")) pf_attn_cmg = atoi(getenv("Q38P_ATTN_CMG")) != 0;
     if (getenv("Q38P_CHUNK")) pf_chunk = atoi(getenv("Q38P_CHUNK"));
     if (getenv("Q38P_TEST")) pf_test = atoi(getenv("Q38P_TEST"));
     if (getenv("Q38P_TAIL")) pf_tail_split = atoi(getenv("Q38P_TAIL"));
     if (getenv("Q38D_OQ_CMG")) oq_cmg = atoi(getenv("Q38D_OQ_CMG"));
+    if (getenv("Q38D_SCORE_MAX")) score_max_vector = atoi(getenv("Q38D_SCORE_MAX")) != 0;
+    if (getenv("Q38D_ATT_PV_BLOCK")) att_pv_block = atoi(getenv("Q38D_ATT_PV_BLOCK"));
     if (getenv("Q38D_ATT_QPF")) att_qpf = atoi(getenv("Q38D_ATT_QPF"));
     if (getenv("Q38D_ATT_MERGE2")) att_merge2 = atoi(getenv("Q38D_ATT_MERGE2"));
     if (getenv("Q38D_SSM_SPLIT")) ssm_split = atoi(getenv("Q38D_SSM_SPLIT"));
@@ -3200,12 +3641,45 @@ int main(int argc, char **argv) {
         mtp_on = 1;
         ssm_ring = spec_k + 2;
     }
+    if (pf_bench_depth && (spec_k || mtp_on)) state_fail("depth benchmark cannot use MTP/speculation");
     if (tp_n > 1 && (spec_k || mtp_on)) { fprintf(stderr, "q38d: speculative/MTP modes are single-node only\n"); return 2; }
+    if (context_count > 1 && (pp_on || pf_on || state_in || state_out || spec_k || mtp_on))
+        state_fail("--contexts requires regular decode without pipeline, state handoff, or MTP");
+    if (context_state_list && (kv_i8_mode || context_count < 2 || !context_prompt_list ||
+                               warm_kv_depth || state_in || state_out || pp_on || pf_on || spec_k || mtp_on))
+        state_fail("--context-state-list requires regular batched FP32/INT6 decode and matching context prompts");
+    if (kv_i8_mode && kv_i6_mode) state_fail("choose one KV cache format");
+#ifdef Q38P_MPI
+    if (pf_kv_i6_mode && pp_decode) state_fail("--prefill-kv-i6 cannot gather FP32 PP decode state");
+#endif
+    if (pf_kv_i6_mode && (!pp_on || state_in ||
+                          pf_attn_cache || pf_attn_pv_int16 || pf_attn_pv_gemm || pf_attn_score_pad))
+        state_fail("--prefill-kv-i6 requires PP prefill and no packed-key/PV cache");
+    if (pp_on && E.max_seq > 300000 && !pf_kv_i6_mode)
+        state_fail("PP contexts above 300K need --prefill-kv-i6 to fit stage-local HBM");
+    if ((kv_i8_mode && (pp_on || pf_on || state_in || state_out || spec_k || mtp_on)) ||
+        (kv_i6_mode && (pp_on || pf_on || state_out || spec_k || mtp_on)))
+        state_fail("compressed KV mode is incompatible with selected pipeline, handoff, or MTP options");
+    if (warm_kv_depth && (!(kv_i8_mode || kv_i6_mode) || context_count == 1 || !prune_model_parts))
+        state_fail("--warm-kv-depth requires compressed KV, --prune-model, and --contexts N");
     if (getenv("Q38D_SSM_PERM")) ssm_perm = atoi(getenv("Q38D_SSM_PERM"));
     if (getenv("Q38D_CONV_LOCAL") && !atoi(getenv("Q38D_CONV_LOCAL"))) ssm_perm = 0;
+    if (tp_replicate_mixers) {
+        /* Non-TP2/4 sizes use replicated SSM/attention projections and state;
+         * shard the large FFN matrices and vocabulary head. This avoids the
+         * legacy CMG/group and GQA divisibility assumptions while retaining
+         * exact rank-wise reductions for the partitioned FFN. */
+        ssm_split = 0;
+        core_flags = 0;
+    }
+    if (tp_n > 1 && tp_replicate_mixers)
+        fprintf(stderr, "q38d: TP%d using replicated SSM/attention, sharded FFN/head\n", tp_n);
+    if (pf_bench_depth && !ssm_perm) state_fail("depth benchmark requires local convolution layout");
     load_engine();
 #ifdef Q38P_MPI
     if (pp_on) {
+        if (getenv("Q38P_PP_ATTN_COST")) pp_attn_cost = atof(getenv("Q38P_PP_ATTN_COST"));
+        if (!(pp_attn_cost > 0)) state_fail("Q38P_PP_ATTN_COST must be positive");
         pf_stage_bounds(pp_n, pp_r, &pp_u0, &pp_u1);
         fprintf(stderr, "q38p_pp: rank %d/%d units [%d,%d) prompts=%d\n", pp_r, pp_n, pp_u0, pp_u1, pp_prompts);
     }
@@ -3230,21 +3704,23 @@ int main(int argc, char **argv) {
     E.unit_cnt = calloc(NFF / 16, sizeof(*E.unit_cnt));
     E.logits = aligned_alloc(256, (size_t)E.n_vocab * 4);
     E.xpart = aligned_alloc(256, EMBD * 4);
-    E.act_o = (q38d_act){DINNER / tp_n, arith, aligned_alloc(256, q38d_act_qbytes(DINNER, Q38D_A16)),
+    int act_o_cols = tp_replicate_mixers ? DINNER : DINNER / tp_n;
+    int act_h_cols = tp_replicate_mixers ? E.L[0].gate.rows : NFF / tp_n;
+    E.act_o = (q38d_act){act_o_cols, arith, aligned_alloc(256, q38d_act_qbytes(DINNER, Q38D_A16)),
                          aligned_alloc(256, DINNER / 16 * 4), aligned_alloc(256, DINNER / 16 * 4), E.o};
-    oQ = DINNER / tp_n / 32 / NCMG;
+    oQ = act_o_cols / 32 / NCMG;
     for (int c = 0; c < NCMG; c++) {
-        E.act_oc[c] = (q38d_act){DINNER / tp_n, arith, cmg_alloc(q38d_act_qbytes(DINNER, Q38D_A16) + 256, c),
+        E.act_oc[c] = (q38d_act){act_o_cols, arith, cmg_alloc(q38d_act_qbytes(DINNER, Q38D_A16) + 256, c),
                                  cmg_alloc(DINNER / 16 * 4 + 256, c), cmg_alloc(DINNER / 16 * 4 + 256, c), E.o};
         float *blk = cmg_alloc(2 * 2 * oQ * 4 + 512, c);   /* sc block, then sum block on its own lines */
         size_t sb = ((size_t)2 * oQ + 63) / 64 * 64;
-        E.act_ov[c] = (q38d_act){DINNER / tp_n, arith, E.act_o.q, blk - 2 * c * oQ, blk + sb - 2 * c * oQ, E.o};
+        E.act_ov[c] = (q38d_act){act_o_cols, arith, E.act_o.q, blk - 2 * c * oQ, blk + sb - 2 * c * oQ, E.o};
         float *pv = cmg_alloc((size_t)PER * 2 * DINNER / 16 * 4 + 256, c);
         for (int l = 0; l < PER; l++)
-            E.act_ot[c * PER + l] = (q38d_act){DINNER / tp_n, arith, E.act_o.q, pv + (size_t)l * 2 * DINNER / 16,
+            E.act_ot[c * PER + l] = (q38d_act){act_o_cols, arith, E.act_o.q, pv + (size_t)l * 2 * DINNER / 16,
                                                pv + (size_t)l * 2 * DINNER / 16 + DINNER / 16, E.o};
     }
-    E.act_h = (q38d_act){NFF / tp_n, arith, aligned_alloc(256, q38d_act_qbytes(NFF, Q38D_A16)),
+    E.act_h = (q38d_act){act_h_cols, arith, aligned_alloc(256, q38d_act_qbytes(NFF, Q38D_A16)),
                          aligned_alloc(256, NFF / 16 * 4), aligned_alloc(256, NFF / 16 * 4), E.h};
     if (down_a8 && arith == Q38D_A16) E.act_h.arith = Q38D_A8;
     for (int l = 0; l < NLAYER; l++) {
@@ -3283,6 +3759,8 @@ int main(int argc, char **argv) {
     if (getenv("Q38D_SSM_LAZY")) ssm_lazy = atoi(getenv("Q38D_SSM_LAZY"));
     if (getenv("Q38D_INPROJ_CBAR")) inproj_cbar = atoi(getenv("Q38D_INPROJ_CBAR"));
     if (getenv("Q38D_CONV_LOCAL")) conv_local = atoi(getenv("Q38D_CONV_LOCAL"));
+    if (context_count > 1 && (!conv_local || ssm_ring != 1))
+        state_fail("--contexts requires local convolution and one SSM state ring");
     if (getenv("Q38D_PLAN_LPT")) plan_lpt = atoi(getenv("Q38D_PLAN_LPT"));
     if (getenv("Q38D_DUAL_COST")) dual_cost = atof(getenv("Q38D_DUAL_COST"));
     if (getenv("Q38D_PF_KV")) pf_kv = atoi(getenv("Q38D_PF_KV"));
@@ -3352,14 +3830,9 @@ int main(int argc, char **argv) {
             }
         }
     }
-    /* prompt */
-    int32_t base[4096];
-    int bn = bpe_tokenize(vocab, prompt, -1, base, 4096);
-    if (bn <= 0) { fprintf(stderr, "q38d: prompt did not tokenize\n"); return 1; }
-    JOB.tok = malloc((size_t)(pn + gn + 1) * sizeof(int32_t));
-    JOB.trace_logit = malloc((size_t)gn * sizeof(float));
-    for (int i = 0; i < pn; i++) JOB.tok[i] = base[i % bn];
-    JOB.n_prompt = pn; JOB.n_gen = gn;
+    if ((state_in || state_out) && (!conv_local || !ssm_perm || !ssm_lazy || spec_k || mtp_on ||
+            (state_in && tp_n != 1 && tp_n != 2 && tp_n != 4)))
+        state_fail("handoff requires local conv, lazy/permuted SSM, ordinary decode TP1/2/4");
     fprintf(stderr, "q38d: fmt=%s act=%s prompt=%d gen=%d matrices=%d load=%.1fs\n",
             fmt == Q38D_F4 ? "fp4" : "fp6", arith == Q38D_F32 ? "f32" : arith == Q38D_A8 ? "a8" : "a16",
             pn, gn, ntodo, now_sec() - t_load);
@@ -3367,22 +3840,39 @@ int main(int argc, char **argv) {
     for (int i = 1; i < NT; i++) pthread_create(&th[i], NULL, worker, (void *)(intptr_t)i);
     worker((void *)(intptr_t)0);
     for (int i = 1; i < NT; i++) pthread_join(th[i], NULL);
+    if (context_count > 1) return 0;
 #ifdef Q38P_MPI
     if (pp_on) {
         MPI_Finalize();
         if (!pp_decode || pp_r != 0 || pp_bad) return pp_bad ? 1 : 0;
     }
 #endif
+    if (tp_n > 1) {
+        uint64_t stream_hash = UINT64_C(14695981039346656037);
+        for (int n = 0; n < gn; n++) {
+            uint32_t id = (uint32_t)JOB.tok[pn + n];
+            for (int b = 0; b < 4; b++) {
+                stream_hash ^= (uint8_t)(id >> (8 * b));
+                stream_hash *= UINT64_C(1099511628211);
+            }
+        }
+        fprintf(stderr, "q38d: TP%d group=%d rank=%d tokens=%d stream_hash=%016llx\n",
+                tp_n, tp_group, tp_r, gn, (unsigned long long)stream_hash);
+    }
     if (tp_r != 0) return 0;
     if (tp_n > 1)
-        fprintf(stderr, "q38d: TP%d rank0 collective (worker 0) ms/tok=%.3f over prefill+decode\n", tp_n,
-                tp_comm_t / tick_hz() * 1e3 / (pn + gn));
+        fprintf(stderr, "q38d: TP%d rank0 collective (worker 0) ms/tok=%.3f over decode\n", tp_n,
+                tp_comm_t / tick_hz() * 1e3 / gn);
     for (int n = 0; n < gn; n++)
         fprintf(stderr, "q38d: token n=%d pos=%d id=%d logit=%a\n", n, pn + n, JOB.tok[pn + n], JOB.trace_logit[n]);
     double hz = tick_hz();
-    if (pf_on && !pp_on) q38p_report(pn, JOB.t_prefill);
-    fprintf(stderr, "q38d: prefill %d tok %.3f s (%.3f tok/s); decode %d tok %.3f s = %.3f tok/s (%.3f ms/tok)\n",
-            pn, JOB.t_prefill, pn / JOB.t_prefill, gn, JOB.t_decode, gn / JOB.t_decode, 1e3 * JOB.t_decode / gn);
+    if (pf_on && !pp_on && !state_in) q38p_report(pn, JOB.t_prefill);
+    if (state_in)
+        fprintf(stderr, "q38d: imported_prefix=%d replay_prompt=%d; decode %d tok %.3f s = %.3f tok/s (%.3f ms/tok)\n",
+                state_prompt_tokens(), pn - state_prompt_tokens(), gn, JOB.t_decode, gn / JOB.t_decode, 1e3 * JOB.t_decode / gn);
+    else
+        fprintf(stderr, "q38d: prefill %d tok %.3f s (%.3f tok/s); decode %d tok %.3f s = %.3f tok/s (%.3f ms/tok)\n",
+                pn, JOB.t_prefill, pn / JOB.t_prefill, gn, JOB.t_decode, gn / JOB.t_decode, 1e3 * JOB.t_decode / gn);
     fprintf(stderr, "q38d: stages ms/tok:");
     for (int p = 0; p < P_N; p++) fprintf(stderr, " %s=%.3f", prof_name[p], E.prof[p] / hz * 1e3 / gn);
     fprintf(stderr, "\n");

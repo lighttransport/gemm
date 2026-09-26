@@ -19,6 +19,7 @@
 #include <stddef.h>
 #include <float.h>
 #include "gguf_loader.h"
+#include "tp_partition.h"
 #include "ggml_dequant.h"
 #ifdef TF_HAVE_Q38_LOWBIT
 #include "../a64fx/llm/qwen38_lowbit_model.h"
@@ -12349,10 +12350,8 @@ int transformer_tp_slice_weights(transformer_model *m, int rank, int size,
     int kv_rep = okv % size != 0;
     if (kv_rep) { k0 = 0; k1 = okv; }
     else tf_tp_range(okv, size, rank, &k0, &k1);
-    int chunk = ((off + size - 1) / size + 255) & ~255;
-    int f0 = rank * chunk, f1 = f0 + chunk;
-    if (f0 > off) f0 = off;
-    if (f1 > off) f1 = off;
+    int f0, f1;
+    tf_tp_range_aligned(off, size, rank, 256, &f0, &f1);
     if (q1 <= q0 || f1 <= f0) return -1;
     int qstride = m->is_hybrid ? 2 * hd : hd;
     /* Query heads and output-projection columns can remain sharded when the
