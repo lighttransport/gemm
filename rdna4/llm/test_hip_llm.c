@@ -1290,6 +1290,9 @@ static int argmax_logits(const float *logits, int n) {
     return best;
 }
 
+/* LLM_DECODE_LOGITS_HASH=1: route decode through full logits and hash them. */
+static int decode_logits_hash_on;
+static unsigned long long decode_logits_hash = 1469598103934665603ULL;
 static void dump_top_logits(const float *logits, int n) {
     const char *dump_path = getenv("LLM_DUMP_LOGITS_BIN");
     if (dump_path) {
@@ -2512,6 +2515,11 @@ int main(int argc, char **argv) {
                 const char *piece = bpe_token_to_str(vocab, id);
                 if (piece && !strcmp(piece, "<|im_end|>")) { stop_ids[2] = id; break; }
             }
+            {
+                const char *lh = getenv("LLM_DECODE_LOGITS_HASH");
+                decode_logits_hash_on = lh && atoi(lh) != 0;
+                decode_logits_hash = 1469598103934665603ULL;
+            }
             double t_dec0 = get_time_ms();
             int mtp_approx_fallback = 0;
             int mtp_adaptive_fallback = 0;
@@ -2644,12 +2652,21 @@ int main(int argc, char **argv) {
                                 0.70f, 1.50f, 1.0f, 0.0f, seen, &sample_rng, vocab) :
                             argmax_logits(selection_logits, n_vocab);
                     }
-                } else if (!coding_mode && (!sampler || sampler_argmax) && !trace.logits) {
+                } else if (!coding_mode && (!sampler || sampler_argmax) && !trace.logits &&
+                           !decode_logits_hash_on) {
                     next_tok = hip_llm_forward_argmax(gpu, next_tok, pos);
                     if (next_tok < 0) { pass = 0; finish_reason = "error"; break; }
                 } else {
                     selection_logits = hip_llm_forward_logits(gpu, next_tok, pos);
                     if (!selection_logits) { pass = 0; finish_reason = "error"; break; }
+                    if (decode_logits_hash_on) {
+                        /* Bitwise decode parity probe: FNV-1a over every
+                         * step's full logits vector. */
+                        const unsigned char *lb = (const unsigned char *)selection_logits;
+                        for (size_t bi = 0; bi < (size_t)n_vocab * sizeof(float); ++bi)
+                            decode_logits_hash = (decode_logits_hash ^ lb[bi]) *
+                                                 1099511628211ULL;
+                    }
                     if (seen) seen[next_tok] = 1;
                     next_tok = sampler ? hllm_sampler_sample(sampler, selection_logits) : coding_mode ?
                         sample_top_k_p_coding(selection_logits, n_vocab, 20, 0.80f,
@@ -2752,6 +2769,9 @@ int main(int argc, char **argv) {
             fprintf(stderr, "Decode:  %d tokens in %.2f ms  -> %.2f tok/s  (%.3f ms/tok)\n",
                     decoded, decode_ms, decode_tps,
                     decoded > 0 ? decode_ms / decoded : 0.0);
+            if (decode_logits_hash_on)
+                fprintf(stderr, "Decode logits hash=%016llx\n",
+                        (unsigned long long)decode_logits_hash);
             fprintf(stderr, "First decoded token id=%d, last id=%d, sequence hash=%016llx\n",
                     first_decode_tok, next_tok, (unsigned long long)decode_hash);
             double request_ms = prefill_ms + decode_ms;

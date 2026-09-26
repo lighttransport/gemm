@@ -30497,7 +30497,11 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
                 end_q8x2_reuse(r);
             }
             const char *qk_fused_env = getenv("LLM_QWEN35_QK_FUSED");
-            int qk_fused_requested = qk_fused_env && atoi(qk_fused_env) != 0;
+            /* Default on: bitwise identical decode logits to the separate
+             * deinterleave/QK-norm/RoPE/KV-store sequence (4K fixture, all
+             * 154 steps).  The kernel runs one 256-thread block per head. */
+            int qk_fused_requested = (!qk_fused_env || atoi(qk_fused_env) != 0) &&
+                head_dim == 256;
             int fused_qk_prep = qk_fused_requested && r->use_mrope && cl->has_qk_norm &&
                 cl->attn_q_norm_w && cl->attn_k_norm_w && !r->is_qwen4exp &&
                 r->fn_deinterleave_qgate_qknorm_mrope_pair_devp &&
