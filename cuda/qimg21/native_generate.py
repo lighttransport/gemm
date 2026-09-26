@@ -126,6 +126,63 @@ def _decode_vae(model: Path, latent_path: Path, out_path: Path, height: int, wid
     torch.cuda.empty_cache()
 
 
+def _torch_vae(model: Path, dtype: str, tile: bool):
+    import torch
+    from diffusers import AutoencoderKLQwenImage21
+
+    torch_dtype = torch.bfloat16 if dtype == "bf16" else torch.float16
+    vae = AutoencoderKLQwenImage21.from_pretrained(
+        str(model / "vae"), torch_dtype=torch_dtype, local_files_only=True
+    ).to(device="cuda")
+    vae.eval()
+    if tile:
+        vae.enable_tiling()
+    mean = torch.tensor(vae.config.latents_mean, device="cuda", dtype=torch_dtype).view(1, 64, 1, 1, 1)
+    std = torch.tensor(vae.config.latents_std, device="cuda", dtype=torch_dtype).view(1, 64, 1, 1, 1)
+    return vae, mean, std, torch_dtype
+
+
+def _decode_rgba_torch(model: Path, latents: np.ndarray, h_tokens: int, w_tokens: int,
+                       dtype: str, tile: bool) -> np.ndarray:
+    """Normalized [tokens, 64] latents -> RGBA [4, H, W] in [-1, 1]."""
+    import torch
+
+    vae, mean, std, torch_dtype = _torch_vae(model, dtype, tile)
+    x = torch.from_numpy(latents.astype(np.float32, copy=False)).to(device="cuda", dtype=torch_dtype)
+    x = x.reshape(1, h_tokens * w_tokens, 64).transpose(1, 2).reshape(1, 64, 1, h_tokens, w_tokens)
+    with torch.inference_mode():
+        image = vae.decode(x * std + mean, return_dict=False)[0][:, :, 0]
+    out = image[0].float().clamp(-1, 1).cpu().numpy()
+    del vae
+    torch.cuda.empty_cache()
+    return out
+
+
+def _encode_latents_torch(model: Path, rgba: np.ndarray, dtype: str, tile: bool) -> np.ndarray:
+    """RGBA [4, H, W] in [-1, 1] -> normalized [tokens, 64] latents, encoded the
+    way QwenImage21Pipeline._encode_vae_image does (argmax, then normalized)."""
+    import torch
+
+    vae, mean, std, torch_dtype = _torch_vae(model, dtype, tile)
+    x = torch.from_numpy(rgba.astype(np.float32, copy=False)).to(device="cuda", dtype=torch_dtype)
+    with torch.inference_mode():
+        latents = vae.encode(x[None, :, None]).latent_dist.mode()
+        latents = (latents - mean) / std
+    out = latents[0, :, 0].float().reshape(64, -1).T.contiguous().cpu().numpy()
+    del vae
+    torch.cuda.empty_cache()
+    return out
+
+
+def _resize_rgba(rgba: np.ndarray, height: int, width: int) -> np.ndarray:
+    """Bicubic resample of an RGBA [4, h, w] image in [-1, 1] to [4, height, width]."""
+    import torch
+
+    x = torch.from_numpy(rgba.astype(np.float32, copy=False))[None]
+    y = torch.nn.functional.interpolate(x, size=(height, width), mode="bicubic", align_corners=False)
+    return y[0].clamp(-1, 1).numpy()
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--backend", choices=("cuda", "rocm"), default="cuda")
@@ -222,8 +279,9 @@ def main() -> int:
     h_tokens, w_tokens = args.height // 16, args.width // 16
     target_tokens = h_tokens * w_tokens
     # Coarse-to-fine: a base pass at 1/upscale the output size, then a tiled
-    # refine pass that resamples the base latent and denoises one tile at a
-    # time, so device memory and attention cost follow the tile.
+    # refine pass that starts from the base picture upscaled in pixel space and
+    # re-encoded, and denoises one tile at a time, so device memory and
+    # attention cost follow the tile.
     tiled = args.upscale > 1.0
     if tiled and args.runner != "fast":
         ap.error("tiled generation needs --runner fast; the parity harness has no tile path")
@@ -521,9 +579,46 @@ def main() -> int:
         base = np.load(base_latents, allow_pickle=False)
         if base.shape != (base_h_tokens * base_w_tokens, 64) or not np.isfinite(base).all():
             raise SystemExit("base pass returned an invalid latent grid")
-        # The refine pass reads the base as a 3-D grid, so the resample target is
-        # unambiguous and no extra flag can disagree with the data.
-        np.save(base_grid, np.ascontiguousarray(base.reshape(base_h_tokens, base_w_tokens, 64)))
+        # Upscale in pixel space, not latent space. A token of this VAE is a
+        # 16x16 pixel patch, and interpolating between neighbouring tokens does
+        # not interpolate the patches they encode: a bilinear latent upsample
+        # decodes to ghosted, gridded copies of every edge, which the refine
+        # then only partly repairs. Decode the base, resample the picture, and
+        # encode it again, so the refine starts from the base image itself.
+        rgba = None
+        if args.native_vae:
+            base_decoded = work / "base_decoded.npy"
+            base_vae_tile = 48 if max(base_h_tokens, base_w_tokens) > 64 else 0
+            _run([str(vae_bin), "--model", str(model / "vae"), "--latents", str(base_latents),
+                  "--height-tokens", str(base_h_tokens), "--width-tokens", str(base_w_tokens),
+                  "--out", str(base_decoded), "--conv", "cudnn",
+                  *((["--tile", str(base_vae_tile), "--tile-overlap", "8", "--tile-bleed", "2"])
+                    if base_vae_tile else [])], cwd=root)
+            rgba = np.load(base_decoded)
+        else:
+            rgba = _decode_rgba_torch(model, base, base_h_tokens, base_w_tokens, args.dtype,
+                                      max(base_h_tokens, base_w_tokens) > 64)
+        if rgba.shape != (4, base_h_tokens * 16, base_w_tokens * 16) or not np.isfinite(rgba).all():
+            raise SystemExit("base decode returned an invalid RGBA tensor")
+        upscaled = _resize_rgba(rgba, args.height, args.width)
+        # The native encoder takes up to 1024 px a side; larger refines encode
+        # with the reference VAE, tiled.
+        if args.native_vae and vae_encode_bin.exists() and max(args.height, args.width) <= 1024:
+            upscaled_rgba = work / "upscaled_rgba.npy"
+            upscaled_latents = work / "upscaled_latents.npy"
+            np.save(upscaled_rgba, np.ascontiguousarray(upscaled, dtype=np.float32))
+            _run([str(vae_encode_bin), "--model", str(model / "vae"), "--image", str(upscaled_rgba),
+                  "--pipeline-bf16", "--out", str(work / "upscaled_moments.npy"),
+                  "--normalized-latents", str(upscaled_latents)], cwd=root)
+            fine = np.load(upscaled_latents)
+        else:
+            fine = _encode_latents_torch(model, upscaled, args.dtype, max(h_tokens, w_tokens) > 64)
+        if fine.shape != (h_tokens * w_tokens, 64) or not np.isfinite(fine).all():
+            raise SystemExit("upscaled base encode returned an invalid latent grid")
+        # The refine pass reads the start as a 3-D grid, so the target is
+        # unambiguous and no extra flag can disagree with the data. It is
+        # already the output size, so the runner's own resample is the identity.
+        np.save(base_grid, np.ascontiguousarray(fine.reshape(h_tokens, w_tokens, 64)))
 
         # Each tile is composed as its own canvas, so quality falls off with
         # smaller tiles: more tiles means more independently re-drawn detail.

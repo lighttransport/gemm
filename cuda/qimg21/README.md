@@ -2216,11 +2216,14 @@ peaks at **11,762 MiB**, because the decoder holds F32 feature maps at
 
 Two independent mechanisms make the output size independent of VRAM:
 
-- **Latent-space coarse-to-fine (`test_cuda_qimg21_fast`).** A base pass
-  denoises a smaller latent grid, `--refine-from` resamples that base onto the
-  output grid (bilinear, `align_corners=false`, matching
-  `torch.nn.functional.interpolate`), and the output grid is then denoised one
-  `--tile-tokens` square at a time. Each tile is renoised to the sigma
+- **Coarse-to-fine (`test_cuda_qimg21_fast`).** A base pass denoises a smaller
+  latent grid. `native_generate.py` decodes it, upscales the RGBA picture
+  bicubically to the output size, and VAE-encodes it again: the native encoder
+  up to 1024 px a side, the reference VAE (tiled) above that. The result goes to
+  `--refine-from` as an output-sized grid. The runner's own bilinear resample
+  (`align_corners=false`) is then the identity and only matters for a
+  hand-made smaller grid. The output grid is denoised one `--tile-tokens` square
+  at a time. Each tile is renoised to the sigma
   `--refine-strength` selects,
   `x = (1 - sigma) * x0 + sigma * eps`, and the tiles are blended into the
   assembled grid with a raised-cosine window across their overlap, normalized
@@ -2371,6 +2374,16 @@ smoother than the image average rather than brighter. On the full pipeline at
 2048x2048 the single-tile refine also measures 0.1301 against 0.1210 for 3x3
 tiles of 56, and the railing and stair read as one structure instead of being
 re-drawn per tile.
+
+**Upscale the picture, not the latent.** The refine used to start from a
+bilinear 2x upsample of the base *latent*. A token of this VAE is a 16x16 pixel
+patch, and blending neighbouring tokens does not blend the patches they encode.
+Decoded without any denoising, the upsampled latent already shows every edge as
+ghosted, gridded copies. A 0.4-strength refine only partly repairs that, and
+the demo's default upscale of 2 put this "onion-skin" picture in front of every
+fast-preset run. Resampling in pixel space and re-encoding hands the refine the
+base picture itself. The same 512 and 1024 apple come out clean, and so does a
+2048 `low8` refine in 3x3 tiles.
 
 ### Two things that did not work
 
