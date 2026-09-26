@@ -69,16 +69,26 @@ static double hllm_monotonic_ms(void) {
 #include "qwen35_attention_q8.inc"
 #include "qwen35_attention_q8_gate.inc"
 #include "qwen35_dflash2.inc"
+#include "gemm_wmma.inc"
+#include "gemm_wmma_dispatch.h"
 
 #ifdef LLM_HIPBLASLT_ENABLED
 #include "mm_blaslt_bridge.h"
 #else
 /* No-hipBLASLt build: the batched prefill path stays fully functional via the
- * self-owned WMMA GEMM (gemm_bf16_own); these stubs make the blaslt branch
+ * self-owned WMMA GEMM (gemm_wmma.hip); these stubs make the blaslt branch
  * unreachable (init fails -> gemm_own forced on). */
 static int mm_blaslt_init(void) { return -1; }
 static int mm_blaslt_run_bf16(void *y, const void *w, const void *x,
                               int M, int N, int K, void *stream) {
+    (void)y;(void)w;(void)x;(void)M;(void)N;(void)K;(void)stream; return -1;
+}
+static int mm_blaslt_run_f32(void *y, const void *w, const void *x,
+                             int M, int N, int K, void *stream) {
+    (void)y;(void)w;(void)x;(void)M;(void)N;(void)K;(void)stream; return -1;
+}
+static int mm_blaslt_run_f16(void *y, const void *w, const void *x,
+                             int M, int N, int K, void *stream) {
     (void)y;(void)w;(void)x;(void)M;(void)N;(void)K;(void)stream; return -1;
 }
 static void mm_blaslt_destroy(void) {}
@@ -10332,7 +10342,7 @@ static const char *hip_kernel_source =
 "    float8 z = {0,0,0,0,0,0,0,0};\n"
 "    float8 cv00=z,cv01=z,cv10=z,cv11=z,cv20=z,cv21=z,cv30=z,cv31=z;\n"
 "    int interior = (cta_m0 + 128 <= M) && (cta_n0 + 128 <= N) && ((K & 31) == 0);\n"
-"    for (int k = 0; k < K; k += 64) {\n"
+"    for (int k = 0; k < K; k += 32) {\n"
 "        if (interior) {\n"
 "            int er = tid >> 1, ek = (tid & 1) * 16;\n"
 "            bf16x8 *da = (bf16x8 *)&smA[er * 32 + ek];\n"
@@ -10882,7 +10892,7 @@ static const char *hip_kernel_source =
 "            smB[0][e] = (col<N && kp<K) ? W[(size_t)col*K+kp] : 0; }\n"
 "    }\n"
 "    __syncthreads();\n"
-"    for (int k = 0; k < K; k += 32) {\n"
+"    for (int k = 0; k < K; k += 64) {\n"
 "        int nbuf = buf ^ 1;\n"
 "        int a_base = wM*64, b_base = wN*32;\n"
 "        for (int kk0 = 0; kk0 < 32; kk0 += 16) {\n"
@@ -13652,6 +13662,13 @@ struct hip_llm_runner {
     hipFunction_t fn_gemm_iq2_s_mmq_wmma;
     hipFunction_t fn_gemm_bf16_own_db;      /* double-buffered LDS variant */
     int gemm_own;                           /* LLM_GEMM=own -> 1, blaslt -> 0 */
+    gemm_wmma_ctx gemm_wmma;                /* tiled WMMA GEMM (gemm_wmma.hip) */
+    int gemm_wmma_ready;                    /* 0: legacy gemm_bf16_own[_db] */
+    int gemm_fused;                         /* fused dequant GEMM (LLM_GEMM_FUSED) */
+    int gemm_fused_check;                   /* LLM_GEMM_FUSED_CHECK: compare vs dequant */
+    void *d_gemm_check;                     /* check-mode reference output */
+    size_t d_gemm_check_bytes;
+    long gemm_check_calls, gemm_check_bad;
     hipFunction_t fn_dequant_iq2s_all;      /* all-expert dequant (grouped prefill) */
     hipFunction_t fn_dequant_iq3s_all;
     hipFunction_t fn_dequant_iq2_xxs_all;
@@ -19130,21 +19147,11 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
             }
         }
 
-        /* Smart default for large DENSE (non-MoE) models: the FFN GEMMs have big
-         * N (n_ff) and K (n_embd), where hipBLASLt markedly outperforms the
-         * self-owned WMMA GEMM (measured 1.73x prefill on Qwen3.6-27B dense,
-         * n_embd=5120/n_ff=17408). The self-owned GEMM still wins for the 35B
-         * MoE grouped path (which requires gemm_own) and for small dense models
-         * (n_embd<4096, e.g. Qwen3-VL-2B), so restrict the flip accordingly.
-         * An explicit LLM_GEMM=own/blaslt always overrides. */
-        {
-            const char *eg = getenv("LLM_GEMM");
-            int user_forced = (eg && (strcmp(eg, "own") == 0 || strcmp(eg, "blaslt") == 0));
-            if (!user_forced && eligible && !r->is_moe && !r->is_qwen4exp &&
-                (r->n_embd >= 4096 || r->is_gemma4)) {
-                r->gemm_own = 0;  /* prefer hipBLASLt for large dense GEMMs */
-            }
-        }
+        /* The self-owned tiled WMMA GEMM (gemm_wmma.hip) is the default for
+         * every model: on gfx1201 it matches or beats hipBLASLt on the
+         * Qwen3.8-27B prefill shapes (bench_llm_gemm) and avoids hipBLASLt's
+         * gfx1201 workspace crash.  LLM_GEMM=blaslt remains an A/B knob in
+         * HIPBLASLT=1 builds. */
         if (eligible && !r->gemm_own) {
             if (mm_blaslt_init() != 0) {
                 fprintf(stderr,
@@ -19152,9 +19159,31 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
                 r->gemm_own = 1;
             }
         }
+        if (eligible && r->gemm_own && !r->gemm_wmma_ready) {
+            const char *legacy = getenv("LLM_GEMM_OWN_LEGACY");
+            if (!(legacy && atoi(legacy) != 0)) {
+                if (gemm_wmma_init(&r->gemm_wmma, r->device, r->verbose) == 0 &&
+                    gemm_wmma_reserve(&r->gemm_wmma, (size_t)4 << 20,
+                                      r->stream) == 0) {
+                    r->gemm_wmma_ready = 1;
+                    const char *fe = getenv("LLM_GEMM_FUSED");
+                    r->gemm_fused = !(fe && atoi(fe) == 0);
+                    const char *ce = getenv("LLM_GEMM_FUSED_CHECK");
+                    r->gemm_fused_check = ce && atoi(ce) != 0;
+                } else {
+                    fprintf(stderr, "hip_llm: gemm_wmma init failed; "
+                                    "using legacy gemm_bf16_own\n");
+                    gemm_wmma_destroy(&r->gemm_wmma);
+                }
+            }
+        }
         if (r->verbose >= 1 && eligible)
             fprintf(stderr, "hip_llm: prefill GEMM backend = %s\n",
-                    r->gemm_own ? "own (WMMA, no hipBLASLt)" : "hipBLASLt");
+                    !r->gemm_own ? "hipBLASLt" :
+                    r->gemm_wmma_ready ? (r->gemm_fused ?
+                        "own (tiled WMMA gemm_wmma + fused dequant, no hipBLASLt)" :
+                        "own (tiled WMMA gemm_wmma, no hipBLASLt)") :
+                                         "own (legacy WMMA gemm_bf16_own)");
 
         if (eligible) {
             int kv_dim = r->n_kv_heads * r->head_dim;
@@ -19660,6 +19689,8 @@ static inline int gemm_run_bf16_w(hip_llm_runner *r, void *Y, const void *W,
                                   const void *X, int M, int N, int K, void *stream) {
     if (!r->gemm_own)
         return mm_blaslt_run_bf16(Y, W, X, M, N, K, stream);
+    if (r->gemm_wmma_ready && gemm_wmma_supported(W, X, M, N, K))
+        return gemm_wmma_run(&r->gemm_wmma, GEMM_WMMA_BF16, Y, W, X, M, N, K, stream);
     void *args[] = { &Y, &W, &X, &N, &K, &M };
     const char *db_env = getenv("LLM_GEMM_OWN_DB");
     int use_db = !db_env || atoi(db_env) != 0;
@@ -19679,8 +19710,11 @@ static inline int gemm_run_f32_w(hip_llm_runner *r, void *Y, const void *W,
     if (r->gemm_own) return -1;
     return mm_blaslt_run_f32(Y, W, X, M, N, K, stream);
 }
-static inline int gemm_run_f16_w(void *Y, const void *W, const void *X,
-                                 int M, int N, int K, void *stream) {
+static inline int gemm_run_f16_w(hip_llm_runner *r, void *Y, const void *W,
+                                 const void *X, int M, int N, int K,
+                                 void *stream) {
+    if (r->gemm_own && r->gemm_wmma_ready && gemm_wmma_supported(W, X, M, N, K))
+        return gemm_wmma_run(&r->gemm_wmma, GEMM_WMMA_F16, Y, W, X, M, N, K, stream);
     return mm_blaslt_run_f16(Y, W, X, M, N, K, stream);
 }
 
@@ -23589,6 +23623,77 @@ static inline void *get_bf16_weight(hip_llm_runner *r, void *raw_w, void *bf16_w
             fprintf(stderr, "hip_llm: get_bf16_weight: unsupported type %d for %dx%d\n", type, n_rows, n_cols);
             return NULL;  /* not batchable */
     }
+}
+
+/* GGML type -> fused-dequant format of gemm_wmma.hip (-1: not fused). */
+static inline int gemm_wmma_q_fmt(int type) {
+    switch (type) {
+        case GGML_TYPE_IQ2_XXS: return GEMM_WMMA_Q_IQ2_XXS;
+        case GGML_TYPE_IQ2_XS:  return GEMM_WMMA_Q_IQ2_XS;
+        case GGML_TYPE_IQ2_S:   return GEMM_WMMA_Q_IQ2_S;
+        case GGML_TYPE_IQ3_XXS: return GEMM_WMMA_Q_IQ3_XXS;
+        case GGML_TYPE_IQ3_S:   return GEMM_WMMA_Q_IQ3_S;
+        case GGML_TYPE_IQ1_S:   return GEMM_WMMA_Q_IQ1_S;
+        case GGML_TYPE_IQ1_M:   return GEMM_WMMA_Q_IQ1_M;
+        case GGML_TYPE_IQ4_XS:  return GEMM_WMMA_Q_IQ4_XS;
+        case GGML_TYPE_Q2_K:    return GEMM_WMMA_Q_Q2_K;
+        default:                return -1;
+    }
+}
+
+/* Y[M,N] = X[M,K]bf16 x W^T for a projection weight in any storage format.
+ * Quantized weights of a supported format run the fused dequant GEMM, which
+ * decodes tiles in LDS instead of materializing [N,K] BF16 in VRAM; other
+ * formats (or a pre-converted bf16_w) go through get_bf16_weight + GEMM.
+ * LLM_GEMM_FUSED_CHECK=1 also runs the dequant path and compares bitwise. */
+static int gemm_run_weight(hip_llm_runner *r, void *Y, void *raw_w, void *bf16_w,
+                           int type, int n_rows, int n_cols, const void *X,
+                           int M, int N, int K, void *stream) {
+    int fmt = gemm_wmma_q_fmt(type);
+    if (!bf16_w && r->gemm_own && r->gemm_wmma_ready && r->gemm_fused &&
+        fmt >= 0 && N == n_rows && K == n_cols &&
+        gemm_wmma_q_supported(fmt, raw_w, X, M, N, K)) {
+        if (gemm_wmma_run_q(&r->gemm_wmma, fmt, Y, raw_w, X, M, N, K, stream) != 0)
+            return -1;
+        if (!r->gemm_fused_check) return 0;
+        size_t bytes = (size_t)M * N * sizeof(float);
+        if (bytes > r->d_gemm_check_bytes) {
+            if (r->d_gemm_check) hipFree(r->d_gemm_check);
+            r->d_gemm_check = NULL;
+            r->d_gemm_check_bytes = 0;
+            if (hipMalloc(&r->d_gemm_check, bytes) != hipSuccess) return -1;
+            r->d_gemm_check_bytes = bytes;
+        }
+        void *w = get_bf16_weight(r, raw_w, NULL, type, n_rows, n_cols);
+        if (!w || gemm_wmma_run(&r->gemm_wmma, GEMM_WMMA_BF16, r->d_gemm_check, w,
+                                X, M, N, K, stream) != 0) return -1;
+        hipStreamSynchronize((hipStream_t)stream);
+        hipStreamSynchronize(r->stream);
+        float *a = (float *)malloc(bytes), *b = (float *)malloc(bytes);
+        hipMemcpy(a, Y, bytes, hipMemcpyDeviceToHost);
+        hipMemcpy(b, r->d_gemm_check, bytes, hipMemcpyDeviceToHost);
+        size_t n = (size_t)M * N, bad = 0;
+        double maxd = 0;
+        for (size_t i = 0; i < n; i++) {
+            if (memcmp(&a[i], &b[i], 4) != 0) {
+                bad++;
+                double dd = fabs((double)a[i] - (double)b[i]);
+                if (dd > maxd || dd != dd) maxd = dd;
+            }
+        }
+        r->gemm_check_calls++;
+        if (bad) {
+            r->gemm_check_bad++;
+            if (r->gemm_check_bad <= 20)
+                fprintf(stderr, "hip_llm: fused GEMM %s M=%d N=%d K=%d: %zu/%zu outputs differ (max |d|=%g)\n",
+                        gemm_wmma_q_names[fmt], M, N, K, bad, n, maxd);
+        }
+        free(a); free(b);
+        return 0;
+    }
+    void *w = get_bf16_weight(r, raw_w, bf16_w, type, n_rows, n_cols);
+    if (!w) return -1;
+    return gemm_run_bf16_w(r, Y, w, X, M, N, K, stream);
 }
 
 static inline void launch_convert_f16_to_bf16(hip_llm_runner *r, void *dst,
@@ -31761,11 +31866,11 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
                 if (f16_aux_gemm) {
                     launch_pack_f16_from_f32(r, r->d_silu_batch_bf16,
                                              r->d_xnorm_batch, M * n_embd);
-                    if (gemm_run_f16_w(r->d_ssm_alpha_batch,
+                    if (gemm_run_f16_w(r, r->d_ssm_alpha_batch,
                                        cl->ssm_alpha_w, r->d_silu_batch_bf16,
                                        M, cl->ssm_alpha_rows, n_embd,
                                        r->stream) != 0 ||
-                        gemm_run_f16_w(r->d_ssm_beta_batch,
+                        gemm_run_f16_w(r, r->d_ssm_beta_batch,
                                        cl->ssm_beta_w, r->d_silu_batch_bf16,
                                        M, cl->ssm_beta_rows, n_embd,
                                        r->stream) != 0) return -1;
@@ -32004,11 +32109,10 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
                  * their selected scalar or small-batch path. */
             } else {
             #define SSM_GEMM(dst, w_field, type_field, rows_field, cols_field) do {       \
-                void *_w = get_bf16_weight(r, cl->w_field, cl->w_field##_bf16,            \
-                                cl->type_field, cl->rows_field, cl->cols_field);          \
-                if (!_w) return -1;                                                       \
-                if (gemm_run_bf16_w(r, dst, _w, r->d_xnorm_batch_bf16, M,                 \
-                                       cl->rows_field, n_embd, r->stream) != 0) return -1;\
+                if (gemm_run_weight(r, dst, cl->w_field, cl->w_field##_bf16,              \
+                        cl->type_field, cl->rows_field, cl->cols_field,                   \
+                        r->d_xnorm_batch_bf16, M, cl->rows_field, n_embd,                 \
+                        r->stream) != 0) return -1;                                       \
             } while(0)
             /* Diagnostic isolation of the IQ3_S MMQ input contract while
              * retaining BF16 for the other projection families. */
@@ -32331,12 +32435,10 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
             } else {
                 launch_pack_bf16_from_f32(r, r->d_silu_batch_bf16,
                                         r->d_ssm_out_batch, M * d_inner);
-                void *ow = get_bf16_weight(r, cl->ssm_out_w, cl->ssm_out_w_bf16,
-                                cl->ssm_out_type, cl->ssm_out_rows, cl->ssm_out_cols);
-                if (!ow) return -1;
-                if (gemm_run_bf16_w(r, r->d_attn_proj_batch, ow,
-                                       r->d_silu_batch_bf16, M,
-                                       n_embd, d_inner, r->stream) != 0) return -1;
+                if (gemm_run_weight(r, r->d_attn_proj_batch, cl->ssm_out_w,
+                        cl->ssm_out_w_bf16, cl->ssm_out_type, cl->ssm_out_rows,
+                        cl->ssm_out_cols, r->d_silu_batch_bf16, M,
+                        n_embd, d_inner, r->stream) != 0) return -1;
             }
             }
             if (r->debug_layers && l < 6)
@@ -32400,10 +32502,10 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
                                          r->d_xnorm_batch, M, q_proj_rows, n_embd,
                                          cl->attn_q_type) != 0) return -1;
             } else {
-                void *qw = get_bf16_weight(r, cl->attn_q_w, cl->attn_q_w_bf16,
-                                           cl->attn_q_type, cl->attn_q_rows, cl->attn_q_cols);
-                if (!qw || gemm_run_bf16_w(r, q_dst, qw,
-                                   r->d_xnorm_batch_bf16, M, q_proj_rows, n_embd, r->stream) != 0) return -1;
+                if (!cl->attn_q_w && !cl->attn_q_w_bf16) return -1;
+                if (gemm_run_weight(r, q_dst, cl->attn_q_w, cl->attn_q_w_bf16,
+                        cl->attn_q_type, cl->attn_q_rows, cl->attn_q_cols,
+                        r->d_xnorm_batch_bf16, M, q_proj_rows, n_embd, r->stream) != 0) return -1;
             }
             if (is_gated_attn) {
                 launch_deinterleave_qgate_batch(r, r->d_q_batch, r->d_attn_gate_batch,
@@ -32445,10 +32547,10 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
                                          r->d_xnorm_batch, M, l_kvdim, n_embd,
                                          cl->attn_k_type) != 0) return -1;
             } else {
-                void *kw = get_bf16_weight(r, cl->attn_k_w, cl->attn_k_w_bf16,
-                                           cl->attn_k_type, cl->attn_k_rows, cl->attn_k_cols);
-                if (!kw || gemm_run_bf16_w(r, r->d_k_batch, kw,
-                                   r->d_xnorm_batch_bf16, M, l_kvdim, n_embd, r->stream) != 0) return -1;
+                if (!cl->attn_k_w && !cl->attn_k_w_bf16) return -1;
+                if (gemm_run_weight(r, r->d_k_batch, cl->attn_k_w, cl->attn_k_w_bf16,
+                        cl->attn_k_type, cl->attn_k_rows, cl->attn_k_cols,
+                        r->d_xnorm_batch_bf16, M, l_kvdim, n_embd, r->stream) != 0) return -1;
             }
         }
         /* Gemma4 "global"/full-attention layers have no v_proj: V = K (config
@@ -32851,11 +32953,10 @@ q8q4_attention_done:;
             int attn_out_elems = M * o_rows;
             launch_pack_bf16_from_f32(r, r->d_attn_out_batch_bf16,
                                       r->d_attn_out_batch, attn_out_elems);
-            void *ow = get_bf16_weight(r, cl->attn_output_w, cl->attn_output_w_bf16,
-                                       cl->attn_output_type, cl->attn_output_rows, cl->attn_output_cols);
-            if (!ow) return -1;
-            if (gemm_run_bf16_w(r, r->d_attn_proj_batch, ow,
-                                   r->d_attn_out_batch_bf16, M, n_embd, o_rows, r->stream) != 0) return -1;
+            if (gemm_run_weight(r, r->d_attn_proj_batch, cl->attn_output_w,
+                    cl->attn_output_w_bf16, cl->attn_output_type, cl->attn_output_rows,
+                    cl->attn_output_cols, r->d_attn_out_batch_bf16, M, n_embd, o_rows,
+                    r->stream) != 0) return -1;
         }
         if (r->is_qwen4exp && r->debug_layers) {
             debug_f32_state(r, l, "Q4 batch attn_out",
@@ -33029,18 +33130,14 @@ ffn_section:
 
             /* ---- gate/up GEMMs ---- */
             {
-                void *gw = get_bf16_weight(r, cl->ffn_gate_w, cl->ffn_gate_w_bf16,
-                                           cl->ffn_gate_type, cl->ffn_gate_rows, cl->ffn_gate_cols);
-                if (!gw) return -1;
-                if (gemm_run_bf16_w(r, r->d_gate_batch, gw,
-                                       r->d_ffn_norm_batch_bf16, M, n_ff, n_embd, r->stream) != 0) return -1;
+                if (gemm_run_weight(r, r->d_gate_batch, cl->ffn_gate_w, cl->ffn_gate_w_bf16,
+                        cl->ffn_gate_type, cl->ffn_gate_rows, cl->ffn_gate_cols,
+                        r->d_ffn_norm_batch_bf16, M, n_ff, n_embd, r->stream) != 0) return -1;
             }
             {
-                void *uw = get_bf16_weight(r, cl->ffn_up_w, cl->ffn_up_w_bf16,
-                                           cl->ffn_up_type, cl->ffn_up_rows, cl->ffn_up_cols);
-                if (!uw) return -1;
-                if (gemm_run_bf16_w(r, r->d_up_batch, uw,
-                                       r->d_ffn_norm_batch_bf16, M, n_ff, n_embd, r->stream) != 0) return -1;
+                if (gemm_run_weight(r, r->d_up_batch, cl->ffn_up_w, cl->ffn_up_w_bf16,
+                        cl->ffn_up_type, cl->ffn_up_rows, cl->ffn_up_cols,
+                        r->d_ffn_norm_batch_bf16, M, n_ff, n_embd, r->stream) != 0) return -1;
             }
             if (r->debug_layers && (debug_attention_layer_selected(l) || getenv("LLM_DEBUG_ALL_FFN")))
                 debug_f32_state(r, l, "Q4 batch ffn_gate_raw",
@@ -33060,11 +33157,9 @@ ffn_section:
             launch_pack_bf16_from_f32(r, r->d_silu_batch_bf16,
                                       r->d_gate_batch, M * n_ff);
             {
-                void *dw = get_bf16_weight(r, cl->ffn_down_w, cl->ffn_down_w_bf16,
-                                           cl->ffn_down_type, cl->ffn_down_rows, cl->ffn_down_cols);
-                if (!dw) return -1;
-                if (gemm_run_bf16_w(r, r->d_down_batch, dw,
-                                       r->d_silu_batch_bf16, M, n_embd, n_ff, r->stream) != 0) return -1;
+                if (gemm_run_weight(r, r->d_down_batch, cl->ffn_down_w, cl->ffn_down_w_bf16,
+                        cl->ffn_down_type, cl->ffn_down_rows, cl->ffn_down_cols,
+                        r->d_silu_batch_bf16, M, n_embd, n_ff, r->stream) != 0) return -1;
             }
             if (r->debug_layers && (l < 2 || getenv("LLM_DEBUG_ALL_FFN")))
                 debug_f32_state(r, l, "Q4 batch ffn_gate",
@@ -34235,6 +34330,12 @@ void hip_llm_free(hip_llm_runner *r) {
 
 #ifdef LLM_HIPBLASLT_ENABLED
     mm_blaslt_destroy();
+    if (r->gemm_fused_check)
+        fprintf(stderr, "hip_llm: LLM_GEMM_FUSED_CHECK: %ld fused GEMMs checked, %ld differ\n",
+                r->gemm_check_calls, r->gemm_check_bad);
+    if (r->d_gemm_check) hipFree(r->d_gemm_check);
+    gemm_wmma_destroy(&r->gemm_wmma);
+    r->gemm_wmma_ready = 0;
 #endif
 
     if (r->h_output_pinned) hipHostFree(r->h_output);

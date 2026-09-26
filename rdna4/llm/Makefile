@@ -16,9 +16,12 @@ ROCEW_SRC = ../rocew.c
 RUNNER_SRC = hip_llm_runner.c
 TEST_SRC = test_hip_llm.c
 
-# hipBLASLt bridge (optional). Build with `make HIPBLASLT=1` to enable WMMA-class
-# prefill GEMMs via hipBLASLt. Without it, the runner falls back to per-token GEMV.
-HIPBLASLT ?= 1
+# hipBLASLt bridge (optional, off by default). Prefill GEMMs use the self-owned
+# WMMA GEMM in gemm_wmma.hip (with fused dequant for IQ/Q2_K weights), which is
+# faster than hipBLASLt on gfx1201 and needs no hipBLASLt/hipBLAS link.
+# `make HIPBLASLT=1` links the hipBLASLt bridge for A/B runs (LLM_GEMM=blaslt)
+# and for bench_llm_gemm --blaslt.
+HIPBLASLT ?= 0
 CUDA_MOE ?= 0
 HIPBLASLT_HEADERS := $(firstword $(wildcard \
   $(ROCM_PATH)/include/hipblaslt/hipblaslt.h \
@@ -91,11 +94,18 @@ qwen35_dflash2.inc: qwen35_dflash2.hip
 qwen35_matvec_q2k.inc: qwen35_matvec_q2k.hip
 	python3 -c 'import json,pathlib; print("static const char qwen35_matvec_q2k_source[] = " + json.dumps(pathlib.Path("$<").read_text()) + ";")' > $@
 
+gemm_wmma.inc: gemm_wmma.hip embed_hip_source.py iq1s_grid.inc qwen35_iq2xxs_grid.inc qwen35_iq2xs_grid.inc ../../common/iq2s_grid.inc ../../common/iq3xxs_grid.inc ../../common/iq3s_grid.inc ../../common/ksigns_iq2xs.inc
+	python3 embed_hip_source.py $< gemm_wmma_source > $@
+
+# Self-owned WMMA GEMM correctness/throughput bench (vs hipBLASLt when HIPBLASLT=1).
+bench_llm_gemm: bench_llm_gemm.c gemm_wmma.inc gemm_wmma_dispatch.h $(ROCEW_SRC) ../hip_runner_common.h ../rocew.h $(BLASLT_OBJ)
+	$(CC) $(CFLAGS) -o $@ bench_llm_gemm.c $(ROCEW_SRC) $(BLASLT_OBJ) $(LDFLAGS)
+
 qwen35_matvec_iq.inc: qwen35_matvec_iq.hip embed_hip_source.py qwen35_iq2xxs_grid.inc qwen35_iq2xs_grid.inc ../../common/iq2s_grid.inc ../../common/iq3xxs_grid.inc ../../common/iq3s_grid.inc ../../common/ksigns_iq2xs.inc
 	python3 embed_hip_source.py $< qwen35_matvec_iq_source > $@
 
 # Other test executables include the runner translation unit directly.
-HIPRTC_INCLUDES = qwen35_attention_q8.inc qwen35_attention_q8_gate.inc qwen35_dflash2.inc qwen35_matvec_q2k.inc qwen35_matvec_iq.inc qwen35_reference_math.h qwen35_nextn.h qwen35_dflash2.h
+HIPRTC_INCLUDES = gemm_wmma.inc gemm_wmma_dispatch.h qwen35_attention_q8.inc qwen35_attention_q8_gate.inc qwen35_dflash2.inc qwen35_matvec_q2k.inc qwen35_matvec_iq.inc qwen35_reference_math.h qwen35_nextn.h qwen35_dflash2.h
 $(TARGET) tmp/test_hip_qwen4_moe_stage tmp/test_hip_qwen4_moe_stage_large tmp/test_hip_qwen4_attention test_glm5next_nextn: $(HIPRTC_INCLUDES)
 
 LLAMA_REFERENCE ?= ../../tmp/qwen38/reference-build
@@ -213,6 +223,7 @@ target-gate-4k: $(TARGET)
 	QWEN38_TARGET_PROFILE=batch4k ./bench_qwen38_target.sh
 
 hipblaslt-status:
+	@printf 'build: HIPBLASLT=$(HIPBLASLT) (0 = self-owned gemm_wmma only, no hipBLASLt link)\n'
 	@printf 'hipBLASLt headers: %s\n' '$(if $(HIPBLASLT_HEADERS),available,missing)'
 	@printf 'hipBLASLt runtime: %s\n' '$(if $(ROCM_LIB),$(ROCM_LIB)libhipblaslt.so,not-found)'
 	@if [ -z "$(HIPBLASLT_HEADERS)" ]; then echo 'mode: scalar bridge fallback (no acceleration)'; else echo 'mode: accelerated bridge available'; fi
