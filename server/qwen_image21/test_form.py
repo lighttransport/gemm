@@ -133,6 +133,51 @@ class QwenImage21FormLogicTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("progress row rendering ok", result.stdout)
 
+    def test_the_diff_view_measures_the_largest_channel_difference(self):
+        body = script()
+        code = body[body.index("const HEAT="):body.index("function pixelsOf(")]
+        program = code + (
+            "const a=new Uint8ClampedArray([10,10,10,255, 0,0,0,255, 200,0,0,255]);\n"
+            "const b=new Uint8ClampedArray([10,10,10,255, 0,5,0,255, 100,0,0,255]);\n"
+            "let r=diffPixels(a,b,2,'gray',0);\n"
+            "const want=JSON.stringify([0,0,0,255, 10,10,10,255, 200,200,200,255]);\n"
+            "if(JSON.stringify([...r.out])!==want){console.log('FAIL gray',[...r.out]);process.exit(1)}\n"
+            "if(r.max!==100||Math.abs(r.mean-35)>1e-9){console.log('FAIL stats',r.max,r.mean);process.exit(1)}\n"
+            # Only pixels past the threshold are painted; the rest are dimmed.
+            "r=diffPixels(a,b,1,'heat',50);\n"
+            "if(r.over!==1||r.out[8]!==255||r.out[4]!==0){console.log('FAIL threshold',[...r.out]);process.exit(1)}\n"
+            # Agreement is black and the ramp ends bright.
+            "if(JSON.stringify(heat(0))!=='[0,0,4]'||JSON.stringify(heat(1))!=='[252,255,164]'||heat(2)[0]!==252)"
+            "{console.log('FAIL heat');process.exit(1)}\n"
+            "console.log('diff ok');\n")
+        result = run(program)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("diff ok", result.stdout)
+
+    def test_a_compare_draws_the_panel_only_when_both_pictures_exist(self):
+        body = script()
+        self.assertIn("if (d[backend] && d.reference) comparePanel(", body)
+        self.assertIn("d.compare", body)
+
+    def test_a_locked_upscale_box_never_reaches_the_server(self):
+        """The upscale box keeps its value while the tiled controls are locked.
+        Sending it anyway made every compare with a fast preset fail validation,
+        and turned a plain fast run into a tiled refine nobody asked for."""
+        body = script()
+        self.assertIn("upscale: tiledAllowed(mode, backend) ?", body)
+        markup = PAGE.read_text(encoding="utf-8")
+        self.assertIn('<input id="upscale" type="number" value="1"', markup)
+        code = body[body.index("function plan("):body.index("function sync()")]
+        program = (
+            "const HEALTH=null;const vals={preset:'accurate'};const $=id=>({value:vals[id]});\n" + code +
+            body[body.index("function tiledAllowed("):body.index("function num(id)")] +
+            "const bad=[tiledAllowed('compare','cuda'),tiledAllowed('native','rocm'),!tiledAllowed('native','cuda')];\n"
+            "vals.preset='';bad.push(tiledAllowed('native','cuda'));\n"
+            "if(bad.some(Boolean)){console.log('FAIL',JSON.stringify(bad));process.exit(1)}\n"
+            "console.log('upscale gate ok');\n")
+        result = run(program)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_the_run_log_is_rendered_and_escaped(self):
         body = script()
         self.assertIn("data.log", body)

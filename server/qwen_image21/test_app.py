@@ -4,7 +4,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from server.qwen_image21.app import MAX_EVENTS, Demo, Progress, REFERENCE_DEVICES, ROOT
+from server.qwen_image21.app import (MAX_EVENTS, Demo, Progress, REFERENCE_DEVICES, ROOT,
+                                     compare_runs)
 import time
 
 
@@ -703,6 +704,90 @@ class QwenImage21ReferenceDeviceTest(unittest.TestCase):
             # Three devices, two distinct interpreters, one call each.
             self.assertEqual(run.call_count, 2)
 
+
+class QwenImage21CompareTest(unittest.TestCase):
+    def test_a_compare_starts_the_runner_from_the_reference_noise(self):
+        """Seed-derived noise only agrees when both sides draw it the same way;
+        handing the reference's own noise to the runner makes every device pair
+        comparable, so the reference has to run first."""
+        with tempfile.TemporaryDirectory(dir=ROOT / "tmp", prefix="qimg21-test-") as td:
+            root = Path(td)
+            demo = QwenImage21RoutingTest.make_demo(None, root)
+            commands = []
+
+            def fake_run(command, cwd, log, env=None, progress=None):
+                commands.append(command)
+                if "--dump-dir" in command:
+                    dump = Path(command[command.index("--dump-dir") + 1])
+                    dump.mkdir(parents=True, exist_ok=True)
+                    (dump / "reference.png").write_bytes(b"png")
+                    (dump / "initial_latents.npy").write_bytes(b"npy")
+                    return
+                out = Path(command[command.index("--out") + 1])
+                out.parent.mkdir(parents=True, exist_ok=True)
+                out.write_bytes(b"png")
+
+            with mock.patch.object(demo, "_run", side_effect=fake_run), \
+                 mock.patch.object(demo, "_summary", return_value=[]):
+                result = demo.generate({"prompt": "apple", "width": 256, "height": 256,
+                                        "steps": 1, "mode": "compare", "reference_device": "cuda"})
+            reference, native = commands
+            self.assertIn("cuda/qimg21/reference.py", reference[1])
+            self.assertIn("--dump-initial-latents", reference)
+            dump = Path(reference[reference.index("--dump-dir") + 1])
+            self.assertEqual(Path(native[native.index("--initial-latents") + 1]),
+                             dump / "initial_latents.npy")
+            self.assertTrue(result["reference"]["matched_noise"])
+            # Fake fixtures leave nothing to measure; the pictures still come back.
+            self.assertIn("compare", result)
+            self.assertIn("image", result["cuda"])
+
+    def test_native_and_reference_modes_draw_their_own_noise(self):
+        with tempfile.TemporaryDirectory(dir=ROOT / "tmp", prefix="qimg21-test-") as td:
+            root = Path(td)
+            demo = QwenImage21RoutingTest.make_demo(None, root)
+            cfg = demo._validate({"prompt": "apple", "mode": "native"})
+            commands = []
+            with mock.patch.object(demo, "_run", side_effect=lambda c, *a, **k: commands.append(c)):
+                demo._native(cfg, root / "out")
+                demo._reference(demo._validate({"prompt": "apple", "mode": "reference"}), root / "out")
+            self.assertNotIn("--initial-latents", commands[0])
+            self.assertNotIn("--dump-initial-latents", commands[1])
+
+    def test_metrics_name_the_first_stage_that_leaves_the_reference(self):
+        import numpy as np
+        from PIL import Image
+        with tempfile.TemporaryDirectory(dir=ROOT / "tmp", prefix="qimg21-test-") as td:
+            root = Path(td)
+            ref, work = root / "ref", root / "work"
+            (work / "prompt").mkdir(parents=True); (work / "steps").mkdir(); ref.mkdir()
+            rng = np.random.default_rng(0)
+            noise = rng.standard_normal((16, 64)).astype(np.float32)
+            np.save(ref / "initial_latents.npy", noise); np.save(work / "latents.npy", noise)
+            text = rng.standard_normal((1, 8, 32)).astype(np.float32)
+            np.save(ref / "prompt_embeds.npy", text); np.save(work / "prompt" / "prompt_embeds.npy", text[0])
+            good = rng.standard_normal((1, 16, 64)).astype(np.float32)
+            np.save(ref / "step_000.npy", good); np.save(work / "steps" / "step_000.npy", good)
+            np.save(ref / "step_001.npy", good); np.save(work / "steps" / "step_001.npy", -good)
+            # step 2 was dumped by the reference only.
+            np.save(ref / "step_002.npy", good)
+            pixels = rng.integers(0, 256, (32, 32, 3), dtype=np.uint8)
+            pixels[0, 0, 0] = 100
+            np.save(ref / "reference_rgba.npy", np.dstack([pixels, np.full((32, 32), 255, np.uint8)]))
+            shifted = pixels.copy(); shifted[0, 0, 0] = 140
+            Image.fromarray(shifted).save(root / "native.png")
+
+            m = compare_runs(ref, work, root / "native.png")
+            stages = {s["stage"]: s for s in m["stages"]}
+            self.assertAlmostEqual(stages["initial latents"]["cosine"], 1.0)
+            # A squeezed batch axis on one side is the same tensor.
+            self.assertAlmostEqual(stages["text embeddings"]["cosine"], 1.0)
+            self.assertAlmostEqual(stages["step 0"]["cosine"], 1.0)
+            self.assertAlmostEqual(stages["step 1"]["cosine"], -1.0)
+            self.assertTrue(stages["step 2"]["missing"])
+            self.assertEqual(m["first_divergence"], "step 1")
+            self.assertEqual(m["image"]["max_abs"], 40.0)
+            self.assertGreater(m["image"]["psnr"], 30)
 
 
 if __name__ == "__main__":

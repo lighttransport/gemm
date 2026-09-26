@@ -10,7 +10,7 @@ application. It exposes three run modes and two accelerator backends:
   is needed only for the optional reference path.
 - `PyTorch` runs the pinned Diffusers reference script.
 - `Compare` runs both sequentially under one device lock and renders them
-  side-by-side.
+  side-by-side, followed by a comparison panel (see below).
 
 The quantization switch applies the exported row-INT8 package. CUDA enables
 custom INT8 tensor-core GEMMs and the calibrated 16-block BF16 tail; ROCm
@@ -27,6 +27,38 @@ harness). Build them with `make -C cuda/qimg21 fast`. The INT8 and NVFP4
 packages default to `/mnt/nvme01/models/qimg-21-fast/`; override them with
 `--int8-package` and `--nvfp4-package`. The API field is `preset`, CUDA only,
 and `GET /api/health` reports which presets are available.
+
+## Compare mode
+
+A compare runs the **reference first**, with `--dump-initial-latents`. The native
+runner then starts from that file (`native_generate.py --initial-latents`)
+instead of drawing its own noise from the seed. The two pictures then share every
+input on any reference device, and any difference comes from what each
+implementation computes. `reference.matched_noise` in the response says whether
+this worked.
+
+The response also carries `compare`, computed with the same math as
+`cuda/qimg21/compare.py`:
+
+- `stages`: cosine and relative L2 of the native run against the reference for
+  the initial latents, the text embeddings, every denoising step (`step_NNN`),
+  and the decoded image.
+- `image`: PSNR, MAE, RMSE and max |Δ| over the RGB pixels (0-255).
+- `first_divergence`: the first stage whose cosine falls below 0.999, or `null`.
+  This is where to start looking when a picture goes wrong. It is deliberately
+  looser than the BF16 parity gate: it locates a break, it does not certify a
+  kernel.
+
+Metrics never block the images. A failure shows up as `compare.error`.
+
+The page adds three views under the two result cards:
+
+- **Overlay**: a swipe split you drag across the picture, a blend with an
+  opacity slider, and a flicker toggle that swaps the two in place.
+- **Diff**: the per-pixel largest-channel |Δ| with an adjustable gain, a heat or
+  gray palette, an optional "only |Δ| > N" mask, and a readout of both RGB
+  values under the pointer.
+- **Metrics**: the stage table, with the first divergent stage highlighted.
 
 ## The PyTorch reference: CUDA, ROCm or CPU
 
@@ -107,14 +139,14 @@ nothing. It costs a per-step sync, about 1.4% on `low8`.
 
 The form has a **High resolution** section that drives the coarse-to-fine path
 in `cuda/qimg21/native_generate.py`: a base pass at `1/upscale` of the requested
-size, then a refine that resamples the base up and denoises the output grid one
-tile at a time, so a large picture fits the same VRAM. The decoder is tiled
+size, then a refine that upscales the base picture in pixel space, re-encodes
+it, and denoises the output grid one tile at a time, so a large picture fits the same VRAM. The decoder is tiled
 spatially in the same way, so a 2048 or 4096 pixel output decodes in under
 2 GB instead of the 11.8 GB an untiled 2048 decode needs.
 
 | Field | Default | What it does |
 |---|---|---|
-| `upscale` | 2 in the form, 1 off | above 1 turns the two-pass refine on |
+| `upscale` | 1 (off) | above 1 turns the two-pass refine on; the form sends it only while the section is unlocked (CUDA fast preset, native mode) |
 | `base_steps` | same as `steps` | steps for the coarse base pass |
 | `refine_strength` | 0.4 in the form | fraction of the schedule the refine re-runs |
 | `refine_seed` | 0 | seeds the refine's noise, independent of `seed` |

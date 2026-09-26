@@ -186,6 +186,71 @@ def _tail(log: Path, progress, stop: threading.Event, interval: float = 0.15) ->
             progress(line)
 
 
+# A stage "agrees" with the reference above this cosine. Looser than the
+# compare.py BF16 gate on purpose: this marks where a picture starts to go wrong,
+# not whether a kernel change passes parity.
+DIVERGENCE_COSINE = 0.999
+
+
+def _parity_helpers():
+    """cuda/qimg21/compare.py is a script, not a package; load it by path so the
+    demo measures with exactly the math the parity gate uses."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("qimg21_compare", ROOT / "cuda/qimg21/compare.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def compare_runs(ref_dir: Path, native_work: Path, native_image: Path) -> dict:
+    """Numbers for a compare: where along the pipeline the native run leaves the
+    reference. Text embeddings, then every denoising step, then the decoded
+    picture; the first stage below DIVERGENCE_COSINE is the one to look at."""
+    import numpy as np
+    from PIL import Image
+
+    helpers = _parity_helpers()
+    stages: list[dict] = []
+
+    def measure(name: str, reference: Path, candidate: Path) -> None:
+        if not reference.is_file() or not candidate.is_file():
+            stages.append({"stage": name, "missing": True})
+            return
+        try:
+            cosine, rel_l2 = helpers._cosine_error(np.load(reference), np.load(candidate))
+        except ValueError as exc:
+            stages.append({"stage": name, "error": str(exc)})
+            return
+        stages.append({"stage": name, "cosine": cosine, "rel_l2": rel_l2})
+
+    measure("initial latents", ref_dir / "initial_latents.npy", native_work / "latents.npy")
+    measure("text embeddings", ref_dir / "prompt_embeds.npy",
+            native_work / "prompt" / "prompt_embeds.npy")
+    for name in helpers._step_names(ref_dir):
+        measure(f"step {int(name[5:8])}", ref_dir / name, helpers._step_path(native_work, name))
+
+    image: dict = {}
+    ref_rgba = ref_dir / "reference_rgba.npy"
+    if ref_rgba.is_file() and native_image.is_file():
+        ref = np.load(ref_rgba)[..., :3].astype(np.float64)
+        got = np.asarray(Image.open(native_image).convert("RGB")).astype(np.float64)
+        if ref.shape != got.shape:
+            image = {"error": f"shape mismatch: {ref.shape} vs {got.shape}"}
+        else:
+            diff = got - ref
+            rmse = float(np.sqrt(np.mean(diff * diff)))
+            image = {"mae": float(np.mean(np.abs(diff))), "rmse": rmse,
+                     "psnr": 20 * np.log10(255.0 / max(rmse, 1e-12)),
+                     "max_abs": float(np.max(np.abs(diff)))}
+            cosine, rel_l2 = helpers._cosine_error(ref, got)
+            stages.append({"stage": "decoded image", "cosine": cosine, "rel_l2": rel_l2})
+
+    first = next((s["stage"] for s in stages
+                  if "cosine" in s and s["cosine"] < DIVERGENCE_COSINE), None)
+    return {"stages": stages, "image": image, "first_divergence": first,
+            "threshold": DIVERGENCE_COSINE}
+
+
 class Demo:
     def __init__(self, model: Path, quant: Path, python: Path, work: Path,
                  native: Path, host: str, port: int,
@@ -495,7 +560,8 @@ class Demo:
             tail = log.read_text(encoding="utf-8", errors="replace")[-4000:]
             raise RuntimeError(f"inference exited with {code}: {tail}")
 
-    def _native(self, cfg: dict, out: Path, progress=None) -> tuple[Path, Path]:
+    def _native(self, cfg: dict, out: Path, progress=None,
+                initial_latents: Path | None = None) -> tuple[Path, Path]:
         backend = cfg["backend"]
         python = self.python if backend == "cuda" else self.python_rocm
         if backend == "rocm" and not python.is_file():
@@ -531,6 +597,11 @@ class Demo:
                 command += ["--profile-steps"]
         if native_vae:
             command.insert(command.index("--native-bin"), "--native-vae")
+        if initial_latents is not None:
+            # A compare starts the runner from the noise the reference drew, so
+            # the two pictures differ only by what each implementation computes,
+            # not by how each one happens to turn a seed into noise.
+            command += ["--initial-latents", str(initial_latents)]
         if cfg["negative_prompt"]:
             command += ["--negative-prompt", cfg["negative_prompt"], "--true-cfg-scale", "4.0"]
         if cfg["quantized"]:
@@ -581,7 +652,8 @@ class Demo:
             return []
         return [line for line in lines if line.startswith(wanted)][-12:]
 
-    def _reference(self, cfg: dict, out: Path, progress=None) -> Path:
+    def _reference(self, cfg: dict, out: Path, progress=None,
+                   dump_latents: bool = False) -> Path:
         device = cfg["reference_device"]
         backend = cfg["backend"]
         python = self.reference_python(device)
@@ -597,6 +669,8 @@ class Demo:
                    "--width", str(cfg["width"]), "--steps", str(cfg["steps"]),
                    "--seed", str(cfg["seed"]), "--dtype", "bf16", "--sdpa-backend", "efficient",
                    "--dump-dir", str(dump)]
+        if dump_latents:
+            command += ["--dump-initial-latents"]
         if cfg["negative_prompt"]:
             command += ["--negative-prompt", cfg["negative_prompt"], "--true-cfg-scale", "4.0"]
         self._run(command, ROOT, out / f"reference-{backend}-{device}.log", progress=progress)
@@ -621,20 +695,21 @@ class Demo:
             self._begin(job_id, started)
         try:
             with self.lock:
-                if cfg["mode"] in {"native", "compare"}:
-                    backend = cfg["backend"]
-                    self._say(job_id, f"Qwen {backend.upper()} native")
-                    path, log = self._native(cfg, job, self._progress(job_id))
-                    self._say(job_id, f"Qwen {backend.upper()} native complete")
-                    results[backend] = {"image": self._data_url(path), "log": self._summary(log)}
+                compare = cfg["mode"] == "compare"
+                backend = cfg["backend"]
+                ref_path = native_path = None
+                # A compare runs the reference first so the native runner can
+                # start from the very noise the reference drew: on any reference
+                # device, the two pictures then share every input.
                 if cfg["mode"] in {"reference", "compare"}:
                     device = cfg["reference_device"]
                     self._say(job_id, f"Qwen PyTorch reference ({device})")
-                    path = self._reference(cfg, job, self._progress(job_id))
+                    ref_path = self._reference(cfg, job, self._progress(job_id),
+                                               dump_latents=compare)
                     self._say(job_id, f"Qwen PyTorch reference ({device}) complete")
-                    entry = {"image": self._data_url(path), "device": device,
+                    entry = {"image": self._data_url(ref_path), "device": device,
                              "torch": self.torch_build(device)["torch"]}
-                    if device not in REFERENCE_PARITY_DEVICES and cfg["mode"] == "compare":
+                    if device not in REFERENCE_PARITY_DEVICES and compare:
                         # A CPU reference runs different kernels on different
                         # hardware, so a side-by-side with the native runner is a
                         # look at both pictures, not a parity result. Say so on the
@@ -643,6 +718,24 @@ class Demo:
                                          "different hardware: compare this for composition, "
                                          "not for numerical agreement")
                     results["reference"] = entry
+                if cfg["mode"] in {"native", "compare"}:
+                    latents = ref_path.parent / "initial_latents.npy" if compare else None
+                    if latents is not None and not latents.is_file():
+                        latents = None
+                    self._say(job_id, f"Qwen {backend.upper()} native")
+                    native_path, log = self._native(cfg, job, self._progress(job_id),
+                                                    initial_latents=latents)
+                    self._say(job_id, f"Qwen {backend.upper()} native complete")
+                    results[backend] = {"image": self._data_url(native_path),
+                                        "log": self._summary(log)}
+                    if compare:
+                        results["reference"]["matched_noise"] = latents is not None
+                if compare:
+                    try:
+                        results["compare"] = compare_runs(ref_path.parent,
+                                                          job / f"{backend}-work", native_path)
+                    except Exception as exc:  # noqa: BLE001 - metrics never hide the images
+                        results["compare"] = {"error": f"{type(exc).__name__}: {exc}"}
         finally:
             self._end(job_id)
         results["elapsed_ms"] = round((time.monotonic() - started) * 1000)
