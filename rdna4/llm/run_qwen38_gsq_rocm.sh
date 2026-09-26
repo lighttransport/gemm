@@ -19,7 +19,7 @@ runner_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # QWEN38_RUNNER_BIN is useful when the launcher is invoked through a mounted
 # path whose physical /home alias is non-executable under AMD GPU escalation.
 runner_bin="${QWEN38_RUNNER_BIN:-${runner_dir}/test_hip_llm}"
-model="${QWEN38_MODEL:-/mnt/nvme02/models/qwen38/27b/gsq/Qwen3.8-27B-GSQ-RCO-IQ2_XS.gguf}"
+model="${QWEN38_MODEL:-/mnt/disk1/models/qwen38/27b/gsq/Qwen3.8-27B-GSQ-RCO-IQ2_XS.gguf}"
 vram_profile="${QWEN38_VRAM_PROFILE:-16g}"
 safe_context="${QWEN38_GSQ_SAFE_CONTEXT:-53248}"
 allow_unsafe="${QWEN38_GSQ_ALLOW_UNSAFE_CONTEXT:-0}"
@@ -327,6 +327,7 @@ for diag_name in LLM_LOGITS_PATH LLM_GEN_TEXT LLM_DEBUG_LAYERS \
     fi
 done
 exec env QWEN38_MODEL="${model}" \
+    ROCEW_ROCM_LIB="${ROCEW_ROCM_LIB:-/opt/rocm/lib}" \
     LLM_SSM_FUSED="${LLM_SSM_FUSED:-${ssm_fused_default}}" \
     LLM_QWEN35_GDA_REF_SCALAR="${LLM_QWEN35_GDA_REF_SCALAR:-${gdn_ref_default}}" \
     LLM_BMAX="${selected_bmax}" \

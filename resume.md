@@ -1,5 +1,212 @@
 # Qwen3.8 27B HIP runner vs llama.cpp — resume state
 
+## hipBLASLt-free prefill: self-owned WMMA GEMM + fused dequant (2026-09-26, later)
+
+The runner no longer uses or links hipBLASLt. `make -C rdna4/llm` now defaults
+to `HIPBLASLT=0` (no `-lhipblaslt -lhipblas`; `ldd` shows neither). Prefill
+projections run `rdna4/llm/gemm_wmma.hip` through `gemm_wmma_dispatch.h`, and
+quantized weights are decoded inside the GEMM tile loader instead of being
+materialized as BF16 for every 512-token chunk.
+
+Commits `2422e4d8` and `b239cbd6`:
+
+- **Bug fix.** Commit `be2a07f2` (2026-09-03) swapped the K-loop strides of
+  `gemm_bf16_own` (skipped half of K) and `gemm_bf16_own_db` (double-counted).
+  Every `LLM_GEMM=own` / `HIPBLASLT=0` result since then was numerically wrong,
+  including the Qwen4 "batched WMMA → repeated garbage" findings in
+  `QWEN38_PREFILL_TUNING.md`. Re-check those conclusions.
+- **`gemm_wmma.hip`.** Templated tiled WMMA GEMM: register prefetch,
+  double-buffered kslot-major LDS, grid walking M fastest (weight tiles stream
+  once), clamped edges, deterministic split-K.
+- **Fused-dequant variants.** Cover IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S,
+  IQ1_S, IQ1_M, IQ4_XS and Q2_K. Their decoders mirror `dequant_*_to_bf16`.
+  `LLM_GEMM_FUSED_CHECK=1` compares every fused GEMM bitwise with dequant +
+  GEMM: 2936/2936 were identical on the 4K prefill.
+- **Tile rules.** Tuned with `rdna4/llm/bench_llm_gemm`, which compares
+  against hipBLASLt when built `HIPBLASLT=1 --blaslt` and checks fused-variant
+  bit-equality with `--quant <fmt>`. Rules: dense 128x128/4 waves; fused
+  256x128/8 waves for N >= 6144, 128x128/8 waves for N = 5120, 64x64 plus
+  split-K for skinny N.
+- **Knobs.**
+  - `LLM_GEMM_FUSED=0`: dequant + own GEMM.
+  - `LLM_GEMM_OWN_LEGACY=1`: old kernels.
+  - `LLM_GEMM=blaslt`: A/B, only in a `HIPBLASLT=1` build.
+  - `LLM_GEMM_WMMA_{VARIANT,QTILE,SPLITK}`: tuning.
+
+Exact 4K fixture (commands in the next section; `run4k.sh` in
+`tmp/qwen38-212w-handoff/` wraps them). 212 W cap, 4096 prompt tokens,
+Q8/Q8 KV, ubatch 512, warm pass of `--bench-repeat 2`:
+
+| Backend | Warm prefill | Warm decode | Hash |
+| --- | ---: | ---: | --- |
+| hipBLASLt (`HIPBLASLT=1 LLM_GEMM=blaslt`) | 614.7 tok/s | 40.79 | `44915ec1039a64c8` |
+| own GEMM, dequant + GEMM | 641.7-644.7 | 40.6-40.8 | same |
+| own GEMM + fused dequant (`2422e4d8`) | 749.7-753.1 | 40.8 | same |
+| + pipelined/slim decode (`b239cbd6`, default) | **764.7-767.3** | 40.75 | same |
+| DFlash2 K=7, no-hipBLASLt build (`2422e4d8`) | 744.9 | **87.64** | same, 134/140 accepted |
+
+First-pass prefill no longer pays hipBLASLt plan creation: 508.7 before,
+644.7 or more now.
+
+Remaining prefill kernel time at `b239cbd6` (rocprofv3 run before the last
+decode tweak, 6.0 s total): fused GEMMs ~2.9 s. The main remaining costs:
+
+- Exact-vector Q8 attention (`qwen35_attention_q8_decode`, 1.17 s). Kept for
+  llama.cpp parity up to 4K.
+- `deltanet_step_batch_gda_ref` (0.44 s).
+- The llama-compatible IQ2_XXS Q8 MMQ (`gemm_iq2_xxs_mmq_wmma`, 0.35 s,
+  ~6 TF/s, parity path).
+
+A CPU miner (`xmrig`, ~30 cores) ran during all of these measurements. It
+adds launch jitter to short-kernel microbenchmarks; `bench_llm_gemm`
+therefore interleaves candidates over rounds and keeps the minimum.
+
+Untested models: other models that previously auto-selected hipBLASLt
+(dense n_embd >= 4096, gemma4) now also use the own GEMM and were not
+re-validated in this session.
+
+## Current-machine handoff: RX 9070 XT, ROCm 7.14, 212 W (2026-09-26)
+
+This is the latest operational state. Older sections below use model paths and
+ROCm installations from another machine. Read `AGENTS.md` first. Use `/local`
+for scratch if available, otherwise the repository's `tmp/`; do not use the
+system temporary directory. Work from the repository root.
+
+### Setup and local changes
+
+- Branch `main` was at `e45ca254` for these runs. The GPU is an RX 9070 XT
+  (`gfx1201`, 16 GiB). The power cap read from the GPU sysfs `power1_cap` was
+  `212000000` microwatts (212 W); this session did not change it.
+- The target GGUF is
+  `/mnt/disk1/models/qwen38/27b/gsq/Qwen3.8-27B-GSQ-RCO-IQ2_XS.gguf`.
+  The DFlash2 sidecar is
+  `/mnt/disk1/models/qwen38/27b/dflash2/Qwen3.8-27B-DFlash2-Q4_K_M.gguf`.
+  Dense NextN is also present at
+  `/mnt/disk1/models/qwen38/27b/mtp-Qwen3.8-27B-Q4_0.gguf`.
+- `amdrocm-blas-dev7.14`, `amdrocm-runtime-dev7.14`,
+  `amdrocm-hipblas-common-dev7.14`, and `amdrocm-llvm-dev7.14` are installed.
+  `make -C rdna4/llm -j4 HIPBLASLT=1` succeeds. The executable reports
+  `prefill GEMM backend = hipBLASLt` and `Phase-5 graph capture: logits=1
+  hidden=1 argmax=1` with the Q8/Q8 graph configuration below. Existing build
+  warnings remain; the build exited successfully.
+- Two **uncommitted** RDNA4 edits from this session are in the working tree:
+  `run_qwen38_gsq_rocm.sh` defaults to the `/mnt/disk1` IQ2 model and sets
+  `ROCEW_ROCM_LIB` to `/opt/rocm/lib` unless overridden. Without the latter,
+  `rocew` selected the old system `libamdhip64.so.5` and `hipInit` failed with
+  `GPU node has an unrecognized id`. `hip_llm_runner.c` has the missing F32/F16
+  bridge stubs needed for `HIPBLASLT=0` fallback builds. Preserve other
+  pre-existing local changes in `common/`, `cuda/`, and untracked paths.
+
+### Reproduce the exact 4K coding benchmark
+
+`validate_qwen38_reference.py:cpp_prompt()` generates the documented
+4,096-token C++17 merge-intervals prompt. The generated file was tokenized by
+this GGUF as **exactly 4096 tokens**, beginning with token 248045. Generate it
+under a permitted scratch root, then run the ordinary and DFlash2 commands
+sequentially so the GPU is not contended:
+
+```bash
+if [ -d /local ] && [ -w /local ]; then
+  scratch_dir=/local/qwen38-212w-handoff
+else
+  scratch_dir="$PWD/tmp/qwen38-212w-handoff"
+fi
+mkdir -p "$scratch_dir"
+export TMPDIR="$scratch_dir"
+QWEN38_HANDOFF_DIR="$scratch_dir" python3 - <<'PY'
+from pathlib import Path
+import os
+import sys
+sys.path.insert(0, 'rdna4/llm')
+from validate_qwen38_reference import cpp_prompt
+Path(os.environ['QWEN38_HANDOFF_DIR'], 'prompt-4096.txt').write_text(cpp_prompt())
+PY
+make -C rdna4/llm -j4 HIPBLASLT=1
+export QWEN38_MODEL=/mnt/disk1/models/qwen38/27b/gsq/Qwen3.8-27B-GSQ-RCO-IQ2_XS.gguf
+bench_args=(--gpu-only-bench --bench
+  --prompt-file "$scratch_dir/prompt-4096.txt"
+  -n 4096 -s 8192 --ubatch 512 --kv-cache q8q8
+  --qwen35-prefill-bf16 --qwen35-decode-graph
+  --qwen35-native-q8-prefill --qwen35-native-q2k --qwen35-native-mmvq
+  --sampling-profile llama --temp 0 --seed 42
+  --decode 256 --bench-repeat 2)
+bash rdna4/llm/run_qwen38_gsq_rocm.sh "${bench_args[@]}" \
+  > "$scratch_dir/ordinary.log" 2>&1
+bash rdna4/llm/run_qwen38_gsq_rocm.sh "${bench_args[@]}" \
+  --qwen35-dflash2 /mnt/disk1/models/qwen38/27b/dflash2/Qwen3.8-27B-DFlash2-Q4_K_M.gguf \
+  --qwen35-dflash2-draft 7 \
+  > "$scratch_dir/dflash7.log" 2>&1
+```
+
+The `--bench-repeat 2` first pass creates GEMM plans; compare the second,
+warm pass. Both modes stopped at EOS with 154 emitted tokens, reported
+`Result: PASS`, and produced the same sequence hash
+`44915ec1039a64c8`. DFlash2 verified exact target windows and accepted
+134/140 draft tokens on each repeat.
+
+| 212 W mode | First prefill | Warm prefill | First decode | Warm decode |
+| --- | ---: | ---: | ---: | ---: |
+| Ordinary target | 512.25 tok/s | **613.06 tok/s** | 40.77 tok/s | **40.74 tok/s** |
+| DFlash2 K=7 | 508.68 tok/s | **611.13 tok/s** | 86.54 tok/s | **87.48 tok/s** |
+
+This reproduces the documented 600+ tok/s warm prefill and 80+ tok/s
+speculative decode on this fixture. It does **not** reproduce 50+ tok/s
+ordinary decode; the measured result is about 40.7 tok/s. The exact-4K run
+matches the documented sequence hash in `QWEN38_DFLASH2.md`.
+
+The benchmark is workload-sensitive. A padded synthetic 4K prompt reached
+619.96 tok/s warm prefill and 41.44 tok/s ordinary decode, but DFlash2
+accepted only 43/137 drafts and slowed to 36.65 tok/s. A separate valid
+3979-token C coding prompt accepted 61/120 and reached 51.77 tok/s DFlash2
+versus 41.25 tok/s ordinary, with identical output hashes. Do not generalize
+the 87.48 tok/s result without reporting prompt, accepted drafts, context,
+sampling, and output parity.
+
+For comparison, the quality-default Q8 K/Q4 V workload at 53,248 context,
+512 prefill tokens, and 64 generated tokens measured 29.08 tok/s prefill and
+25.96 tok/s decode with the hipBLASLt build at 212 W. It does not enable BF16
+prefill or Q8/Q8 graph decode and is not the same workload as the 4K result.
+Before the HIP development packages were installed, a self-owned WMMA build
+at a measured 304 W cap reached 30.87/27.38 tok/s for that default workload.
+Those measurements differ in cap and backend and are not a controlled A/B.
+
+### Quality and longer-context status
+
+- These September 26 runs checked successful execution and ordinary/DFlash2
+  token-hash equality on the exact 4K greedy fixture. `Result: PASS` is the
+  runner's internal result; this session did **not** rerun the pinned llama.cpp
+  numerical or generated-code quality suite. BF16 projection prefill remains
+  an opt-in, approximate arithmetic choice; see `QWEN38_STATUS.md`.
+- `QWEN38_DFLASH2.md` records an earlier 16,173-token cross-engine audit in
+  which runner and llama.cpp matched only the first 13 generated tokens, and
+  the projection/FFN numerical gap remained open. Do not infer whole-model
+  parity from the same-hash ordinary/DFlash2 result above.
+- `RDNA4_REGRESSION.md` and `test_qwen38_long_context.sh` document 64K
+  performance and serving gates. The older 64K target/DFlash fallback suffix
+  hashes differed across processes. Recheck this with the current binary and
+  the same prompt, KV format, context, and sampling before claiming long
+  context equality or promoting a speed path.
+
+### Resume prompt for the next coding agent
+
+> Continue the RDNA4 Qwen3.8-27B IQ2 runner from this handoff. Read
+> `AGENTS.md`, this section, `rdna4/llm/QWEN38_DFLASH2.md`,
+> `rdna4/llm/QWEN38_STATUS.md`, and `rdna4/llm/RDNA4_REGRESSION.md` first.
+> Preserve the uncommitted user and runner work. Use `/local` if available;
+> otherwise use repository `tmp/` for all scratch and logs. Verify the 212 W
+> power cap, ROCm 7.14 package state, hipBLASLt backend, and exact 4K prompt
+> hash. Reproduce the ordinary and DFlash2 numbers above, then profile the
+> roughly 40.7 tok/s ordinary decode path against the reported 50+ result,
+> identifying workload or configuration differences before changing kernels.
+> Improve performance only with stable output hashes and repeated warm runs.
+> Test speculative acceptance on meaningful prompts, not only synthetic
+> padding. For quality work, run the pinned llama.cpp reference and inspect
+> first divergent tokens, layer outputs, and logits at 4K and longer contexts.
+> Revalidate 16K/64K target/DFlash parity and serving/cancellation behavior
+> before claiming long-context correctness. Report exact commands, power cap,
+> prompt token count, KV type, first/warm throughput, accepted drafts, peak
+> VRAM, hashes, and any numerical or generated-code checks.
+
 ## Long-context, serving-quality, and overlap regression gates (2026-09-22)
 
 Items 7--10 are now represented by reproducible gates. The new
