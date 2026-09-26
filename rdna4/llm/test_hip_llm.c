@@ -653,10 +653,23 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
         size_t prompt_n = 0;
         unsigned char *prompt = b64_decode(b64, &prompt_n);
         if (!prompt) { puts("ERR bad base64"); fflush(stdout); continue; }
-        size_t prefix_n_bytes = 0;
-        unsigned char *prefix = (prefix_b64 && strcmp(prefix_b64, "-") != 0) ?
-            b64_decode(prefix_b64, &prefix_n_bytes) : NULL;
-        if (prefix_b64 && strcmp(prefix_b64, "-") != 0 && !prefix) {
+        /* Up to four stable prefixes ("b64,b64,..."): e.g. the tools block and
+         * the whole system turn.  Each boundary gets a shared snapshot. */
+        enum { MAX_PREFIXES = 4 };
+        unsigned char *prefixes[MAX_PREFIXES] = { NULL };
+        size_t prefix_lens[MAX_PREFIXES] = { 0 };
+        int n_prefixes = 0, bad_prefix = 0;
+        if (prefix_b64 && strcmp(prefix_b64, "-") != 0) {
+            char *save = NULL;
+            for (char *seg = strtok_r(prefix_b64, ",", &save);
+                 seg && n_prefixes < MAX_PREFIXES; seg = strtok_r(NULL, ",", &save)) {
+                prefixes[n_prefixes] = b64_decode(seg, &prefix_lens[n_prefixes]);
+                if (!prefixes[n_prefixes]) { bad_prefix = 1; break; }
+                n_prefixes++;
+            }
+        }
+        if (bad_prefix) {
+            for (int i = 0; i < n_prefixes; ++i) free(prefixes[i]);
             free(prompt); puts("ERR bad prefix base64"); fflush(stdout); continue;
         }
 
@@ -753,11 +766,13 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
         prompt = NULL;
         if (!tokens || n_tokens <= 0) {
             free(prev_live);
-            free(prefix); free(tokens); puts("ERR tokenization"); fflush(stdout); continue;
+            for (int i = 0; i < n_prefixes; ++i) free(prefixes[i]);
+            free(tokens); puts("ERR tokenization"); fflush(stdout); continue;
         }
         if (n_tokens > cap || (bos_id > 0 && tokens[0] != bos_id && n_tokens == cap)) {
             free(prev_live);
-            free(prefix); free(tokens);
+            for (int i = 0; i < n_prefixes; ++i) free(prefixes[i]);
+            free(tokens);
             puts("ERR prompt exceeds context capacity"); fflush(stdout); continue;
         }
         if (bos_id > 0 && n_tokens < cap && (n_tokens == 0 || tokens[0] != bos_id)) {
@@ -765,23 +780,36 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
             tokens[0] = bos_id;
             n_tokens++;
         }
-        int requested_prefix = 0;
-        int32_t *prefix_tokens = prefix ? (int32_t *)malloc((size_t)cap * sizeof(int32_t)) : NULL;
-        if (prefix && prefix_n_bytes > 0 && prefix_tokens) {
-            requested_prefix = bpe_tokenize(vocab, (const char *)prefix,
-                                             (int)prefix_n_bytes, prefix_tokens, cap);
-            if (requested_prefix > cap || requested_prefix < 0)
-                requested_prefix = 0;
-            if (requested_prefix > 0 && bos_id > 0 && requested_prefix < cap && prefix_tokens[0] != bos_id) {
-                memmove(prefix_tokens + 1, prefix_tokens, (size_t)requested_prefix * sizeof(int32_t));
+        /* Validated token-prefix boundaries, ascending; requested_prefix is
+         * the longest (the whole stable system turn). */
+        int prefix_bounds[MAX_PREFIXES], n_bounds = 0;
+        int32_t *prefix_tokens = n_prefixes ? (int32_t *)malloc((size_t)cap * sizeof(int32_t)) : NULL;
+        for (int p = 0; p < n_prefixes && prefix_tokens; ++p) {
+            if (prefix_lens[p] == 0) continue;
+            int bound = bpe_tokenize(vocab, (const char *)prefixes[p],
+                                     (int)prefix_lens[p], prefix_tokens, cap);
+            if (bound > cap || bound < 0) continue;
+            if (bound > 0 && bos_id > 0 && bound < cap && prefix_tokens[0] != bos_id) {
+                memmove(prefix_tokens + 1, prefix_tokens, (size_t)bound * sizeof(int32_t));
                 prefix_tokens[0] = bos_id;
-                requested_prefix++;
+                bound++;
             }
-            for (int i = 0; i < requested_prefix && i < n_tokens; ++i)
-                if (prefix_tokens[i] != tokens[i]) { requested_prefix = 0; break; }
-            if (requested_prefix > n_tokens) requested_prefix = 0;
+            if (bound <= 0 || bound > n_tokens ||
+                memcmp(prefix_tokens, tokens, (size_t)bound * sizeof(int32_t)))
+                continue;       /* not a token prefix of this prompt */
+            int dup = 0, at = n_bounds;
+            for (int i = 0; i < n_bounds; ++i) dup |= prefix_bounds[i] == bound;
+            if (dup) continue;
+            while (at > 0 && prefix_bounds[at - 1] > bound) {
+                prefix_bounds[at] = prefix_bounds[at - 1];
+                at--;
+            }
+            prefix_bounds[at] = bound;
+            n_bounds++;
         }
-        free(prefix_tokens); free(prefix);
+        int requested_prefix = n_bounds ? prefix_bounds[n_bounds - 1] : 0;
+        free(prefix_tokens);
+        for (int i = 0; i < n_prefixes; ++i) free(prefixes[i]);
         int common = 0;
         if (strcmp(active_identity, cache_identity) == 0)
             while (common < cache_n && common < n_tokens &&
@@ -885,18 +913,21 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
         const char *publish_chunk_env = getenv("LLM_QWEN4_PREFILL_COPY_PIPELINE_PUBLISH_CHUNK");
         int publish_chunk = publish_chunk_env && atoi(publish_chunk_env) != 0;
         int prompt_added = n_tokens - common;
-        int batches = prompt_added > 0 ? (prompt_added + batch_size - 1) / batch_size : 0;
-        if (requested_prefix > common && requested_prefix < n_tokens) {
-            int a = requested_prefix - common;
-            int b = n_tokens - requested_prefix;
-            batches = (a + batch_size - 1) / batch_size +
-                      (b + batch_size - 1) / batch_size;
+        int batches = 0;
+        for (int at = common; at < n_tokens; ++batches) {
+            int end = at + batch_size < n_tokens ? at + batch_size : n_tokens;
+            for (int i = 0; i < n_bounds; ++i)
+                if (prefix_bounds[i] > at && prefix_bounds[i] < end) {
+                    end = prefix_bounds[i];
+                    break;
+                }
+            at = end;
         }
         double t_prefill0 = get_time_ms();
         hip_llm_set_decode_mode(gpu, 0);
         float *logits = prompt_added == 0 && cache_n > 0 ?
                         hip_llm_current_logits(gpu) : NULL;
-        hip_llm_state_snapshot *pending_prefix_snapshot = NULL;
+        hip_llm_state_snapshot *pending_prefix_snaps[MAX_PREFIXES] = { NULL };
         hip_llm_state_snapshot *pending_prompt_snapshot = NULL;
         int cancelled = 0;
         int batch_index = 0;
@@ -906,9 +937,12 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
             if (cc > batch_size) cc = batch_size;
             if (publish_chunk)
                 hip_llm_set_qwen4_batch_request_tokens(gpu, cc);
-            if (requested_prefix > 0 && common + off < requested_prefix &&
-                common + off + cc > requested_prefix)
-                cc = requested_prefix - common - off;
+            for (int i = 0; i < n_bounds; ++i)
+                if (common + off < prefix_bounds[i] &&
+                    common + off + cc > prefix_bounds[i]) {
+                    cc = prefix_bounds[i] - common - off;
+                    break;
+                }
             logits = hip_llm_forward_batch_logits(gpu, tokens + common + off, cc,
                                                    common + off);
             double batch_now = get_time_ms();
@@ -921,15 +955,16 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
                     batch_ms > 0.0 ? 1000.0 * (off + cc) / batch_ms : 0.0);
             fflush(stderr);
             if (!logits) break;
-            if (snapshot_cache.entries && requested_prefix > common &&
-                common + off + cc == requested_prefix)
-                pending_prefix_snapshot = hip_llm_snapshot_state(gpu);
+            for (int i = 0; i < n_bounds; ++i)
+                if (snapshot_cache.entries && prefix_bounds[i] > common &&
+                    common + off + cc == prefix_bounds[i])
+                    pending_prefix_snaps[i] = hip_llm_snapshot_state(gpu);
             off += cc;
         }
         double t_prefill1 = get_time_ms();
         if (g_stdio_cancel) cancelled = 1;
         if (cancelled) {
-            hip_llm_free_state_snapshot(pending_prefix_snapshot);
+            for (int i = 0; i < n_bounds; ++i) hip_llm_free_state_snapshot(pending_prefix_snaps[i]);
             stdio_snapshot_cache_drop_resident(&snapshot_cache);
             hip_llm_reset_state(gpu);
             cache_n = 0;
@@ -940,7 +975,7 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
             continue;
         }
         if (!logits && prompt_added > 0) {
-            hip_llm_free_state_snapshot(pending_prefix_snapshot);
+            for (int i = 0; i < n_bounds; ++i) hip_llm_free_state_snapshot(pending_prefix_snaps[i]);
             stdio_snapshot_cache_drop_resident(&snapshot_cache);
             hip_llm_reset_state(gpu);
             cache_n = 0;
@@ -959,7 +994,7 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
             pending_prompt_snapshot = hip_llm_snapshot_state(gpu);
         hllm_sampler *sampler = use_reference ? hllm_sampler_create(&request_sampling, n_vocab) : NULL;
         if (use_reference && !sampler) {
-            hip_llm_free_state_snapshot(pending_prefix_snapshot);
+            for (int i = 0; i < n_bounds; ++i) hip_llm_free_state_snapshot(pending_prefix_snaps[i]);
             hip_llm_free_state_snapshot(pending_prompt_snapshot);
             stdio_snapshot_cache_drop_resident(&snapshot_cache);
             hip_llm_reset_state(gpu);
@@ -1224,7 +1259,7 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
             q35_logits = NULL;
         }
         if (mtp_error) {
-            hip_llm_free_state_snapshot(pending_prefix_snapshot);
+            for (int i = 0; i < n_bounds; ++i) hip_llm_free_state_snapshot(pending_prefix_snaps[i]);
             hip_llm_free_state_snapshot(pending_prompt_snapshot);
             stdio_snapshot_cache_drop_resident(&snapshot_cache);
             cache_n = 0;
@@ -1291,29 +1326,36 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
          * drop it before the next HTTP request rather than serving from stale
          * target state. */
         if (getenv("LLM_QWEN4_MTP_TRUST_DRAFT")) {
-            hip_llm_free_state_snapshot(pending_prefix_snapshot);
+            for (int i = 0; i < n_bounds; ++i) {
+                hip_llm_free_state_snapshot(pending_prefix_snaps[i]);
+                pending_prefix_snaps[i] = NULL;
+            }
             hip_llm_free_state_snapshot(pending_prompt_snapshot);
-            pending_prefix_snapshot = pending_prompt_snapshot = NULL;
+            pending_prompt_snapshot = NULL;
             stdio_snapshot_cache_drop_resident(&snapshot_cache);
             hip_llm_reset_state(gpu);
             cache_n = 0;
             active_identity[0] = '\0';
         }
         if (cancelled) {
-            hip_llm_free_state_snapshot(pending_prefix_snapshot);
+            for (int i = 0; i < n_bounds; ++i) {
+                hip_llm_free_state_snapshot(pending_prefix_snaps[i]);
+                pending_prefix_snaps[i] = NULL;
+            }
             hip_llm_free_state_snapshot(pending_prompt_snapshot);
-            pending_prefix_snapshot = pending_prompt_snapshot = NULL;
+            pending_prompt_snapshot = NULL;
             stdio_snapshot_cache_drop_resident(&snapshot_cache);
             hip_llm_reset_state(gpu);
             cache_n = 0;
             active_identity[0] = '\0';
         } else if (!getenv("LLM_QWEN4_MTP_TRUST_DRAFT")) {
-            if (pending_prefix_snapshot) {
+            for (int i = 0; i < n_bounds; ++i) {
+                if (!pending_prefix_snaps[i]) continue;
                 stdio_snapshot_cache_publish(&snapshot_cache,
                     stdio_shared_prefix_enabled() ? STDIO_SHARED_PREFIX_IDENTITY :
                                                     cache_identity,
-                    cache, requested_prefix, pending_prefix_snapshot, NULL, 0);
-                pending_prefix_snapshot = NULL;
+                    cache, prefix_bounds[i], pending_prefix_snaps[i], NULL, 0);
+                pending_prefix_snaps[i] = NULL;
             }
             if (pending_prompt_snapshot) {
                 stdio_snapshot_cache_publish(&snapshot_cache, cache_identity,
