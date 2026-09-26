@@ -8739,6 +8739,92 @@ static const char *hip_kernel_source =
 "    float inv = rsqrtf(total / n + eps);\n"
 "    for (int i = tid; i < n; i += nt) xb[i] = x[i] * inv * w[i];\n"
 "}\n"
+"/* res_rmsnorm_f32 plus both decode activation quantizations of xb.  Each\n"
+" * (k, warp) register slot is one 32-value block, so the block max/sum are\n"
+" * DPP butterflies (lane 0 of the xor butterfly adds the same pairs as the\n"
+" * shfl_down tree).  The native Q8_1 form repeats qwen35_quantize_q81, which\n"
+" * is compiled without fast-math: its IEEE divisions are spelled out with\n"
+" * the div_scale/div_fmas/div_fixup sequence the precise build emits. */\n"
+"#define RQ_XM(v, k) __int_as_float(__builtin_amdgcn_update_dpp(0, \\\n"
+"    __float_as_int(v), 0x160 + (k), 0xf, 0xf, false))\n"
+"#define RQ_X16(v) __int_as_float(__builtin_amdgcn_permlanex16( \\\n"
+"    __float_as_int(v), __float_as_int(v), 0x76543210, 0xfedcba98, false, false))\n"
+"__device__ __forceinline__ float rq_div_ieee(float n, float d) {\n"
+"    bool f, vcc;\n"
+"    float ds = __builtin_amdgcn_div_scalef(n, d, false, &f);\n"
+"    float ns = __builtin_amdgcn_div_scalef(n, d, true, &vcc);\n"
+"    float r = __builtin_amdgcn_rcpf(ds);\n"
+"    float e = __builtin_fmaf(-ds, r, 1.0f);\n"
+"    r = __builtin_fmaf(e, r, r);\n"
+"    float q = ns * r;\n"
+"    float e2 = __builtin_fmaf(-ds, q, ns);\n"
+"    q = __builtin_fmaf(e2, r, q);\n"
+"    float e3 = __builtin_fmaf(-ds, q, ns);\n"
+"    return __builtin_amdgcn_div_fixupf(\n"
+"        __builtin_amdgcn_div_fmasf(e3, r, q, vcc), d, n);\n"
+"}\n"
+"/* Non-volatile twin of round_f16_contract: free to schedule, still opaque. */\n"
+"__device__ __forceinline__ float rq_f16(float x) {\n"
+"    unsigned int h; float y;\n"
+"    asm(\"v_cvt_f16_f32 %0, %1\" : \"=v\"(h) : \"v\"(x));\n"
+"    asm(\"v_cvt_f32_f16 %0, %1\" : \"=v\"(y) : \"v\"(h));\n"
+"    return y;\n"
+"}\n"
+"/* Fixed geometry: n == RQ_K * blockDim.x (5120 = 20 x 256), so every slot\n"
+" * is live and the unrolled slots interleave without per-slot branches. */\n"
+"#define RQ_K 20\n"
+"__global__ void res_rmsnorm_q81_f32(float *x, const float *res, float *xb,\n"
+"        const float *w, int n, float eps, signed char *nq, float *ns,\n"
+"        signed char *iq, float *is, float *isum) {\n"
+"    extern __shared__ float sd[];\n"
+"    int tid = threadIdx.x, nt = blockDim.x, lane = tid & 31;\n"
+"    float xv[RQ_K], wv[RQ_K];\n"
+"#pragma unroll\n"
+"    for (int k = 0; k < RQ_K; ++k) {\n"
+"        int i = tid + k * nt;\n"
+"        float a = x[i], r = res[i], b = w[i];\n"
+"        xv[k] = a + r;\n"
+"        wv[k] = b;\n"
+"    }\n"
+"    __builtin_amdgcn_sched_barrier(0);\n"
+"    float ss = 0.0f;\n"
+"#pragma unroll\n"
+"    for (int k = 0; k < RQ_K; ++k) ss = __builtin_fmaf(xv[k], xv[k], ss);\n"
+"    float total = rms_tree_sum(ss, sd);\n"
+"    float inv = rsqrtf(total / n + eps);\n"
+"    float o_ns = 0.0f, o_is = 0.0f, o_isum = 0.0f;\n"
+"#pragma unroll\n"
+"    for (int k = 0; k < RQ_K; ++k) {\n"
+"        {\n"
+"            int i = tid + k * nt;\n"
+"            float v = xv[k] * inv * wv[k];\n"
+"            asm(\"\" : \"+v\"(v));\n"
+"            x[i] = xv[k]; xb[i] = v;\n"
+"            float a = fabsf(v);\n"
+"            a = fmaxf(a, RQ_X16(a)); a = fmaxf(a, RQ_XM(a, 8));\n"
+"            a = fmaxf(a, RQ_XM(a, 4)); a = fmaxf(a, RQ_XM(a, 2));\n"
+"            a = fmaxf(a, RQ_XM(a, 1));\n"
+"            float s = v;\n"
+"            s += RQ_X16(s); s += RQ_XM(s, 8); s += RQ_XM(s, 4);\n"
+"            s += RQ_XM(s, 2); s += RQ_XM(s, 1);\n"
+"            float dn = rq_div_ieee(a, 127.0f);\n"
+"            float qn = a == 0.0f ? 0.0f : roundf(rq_div_ieee(v, dn));\n"
+"            float d = a / 127.0f, dh = rq_f16(d);\n"
+"            int q = (a == 0.0f) ? 0 : (int)roundf(v / d);\n"
+"            q = q > 127 ? 127 : (q < -127 ? -127 : q);\n"
+"            nq[i] = (signed char)qn; iq[i] = (signed char)q;\n"
+"            /* Lane k collects slot k's block scalars; one store below. */\n"
+"            float bn = __int_as_float(__builtin_amdgcn_readlane(__float_as_int(rq_f16(dn)), 0));\n"
+"            float bi = __int_as_float(__builtin_amdgcn_readlane(__float_as_int(dh), 0));\n"
+"            float bs = __int_as_float(__builtin_amdgcn_readlane(__float_as_int(rq_f16(s)), 0));\n"
+"            if (lane == k) { o_ns = bn; o_is = bi; o_isum = bs; }\n"
+"        }\n"
+"    }\n"
+"    if (lane < RQ_K) {\n"
+"        int g = lane * (nt / 32) + (tid >> 5);\n"
+"        ns[g] = o_ns; is[g] = o_is; isum[g] = o_isum;\n"
+"    }\n"
+"}\n"
 "/* Same reduction contract, one independent row per block. */\n"
 "__global__ void res_rmsnorm_batch_f32(float *x, const float *res, float *xb,\n"
 "        const float *w, int n, int rows, float eps) {\n"
@@ -13850,6 +13936,10 @@ struct hip_llm_runner {
     int ssm_out_mw;                             /* LLM_SSM_OUT_MW */
     hipFunction_t fn_moe_route_decode;      /* decode: router+topk+sgate fused */
     hipFunction_t fn_res_rmsnorm_f32;       /* decode: residual + rmsnorm fused */
+    hipFunction_t fn_res_rmsnorm_q81_f32;   /* + native and IQ1 Q8_1 of xb */
+    /* Output of the last res_rmsnorm_q81_f32, valid only while no other
+     * kernel has been launched since (hllm_launch_seq unchanged). */
+    void *normq_src; int normq_n; unsigned long long normq_seq;
     hipFunction_t fn_res_rmsnorm_batch_f32;
     hipFunction_t fn_qwen4_router_batch_native;
     hipFunction_t fn_shexp_gateup_silu_q6k_batch;
@@ -15008,6 +15098,9 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(ssm_inv_mean_f32);
     GET_FUNC(moe_route_decode);
     GET_FUNC(res_rmsnorm_f32);
+    if (hipModuleGetFunction(&r->fn_res_rmsnorm_q81_f32, r->module,
+                             "res_rmsnorm_q81_f32") != hipSuccess)
+        r->fn_res_rmsnorm_q81_f32 = NULL;
     GET_FUNC(res_rmsnorm_batch_f32);
     GET_FUNC(qwen4_router_batch_native);
     GET_FUNC(shexp_gateup_silu_q6k_batch);
@@ -19900,8 +19993,12 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
 /* Kernel launch helpers                                                    */
 /* ======================================================================== */
 
+/* Every LAUNCH bumps this, so a producer can prove it was the most recent
+ * kernel on the stream (see res_rmsnorm_q81 and begin_q8x2_reuse). */
+static unsigned long long hllm_launch_seq;
 #define LAUNCH(fn, gx, gy, gz, bx, by, bz, smem, stream, args) \
-    hipModuleLaunchKernel(fn, gx, gy, gz, bx, by, bz, smem, stream, args, NULL)
+    (++hllm_launch_seq, \
+     hipModuleLaunchKernel(fn, gx, gy, gz, bx, by, bz, smem, stream, args, NULL))
 
 /* GEMM router: hipBLASLt or self-owned WMMA GEMM (LLM_GEMM=own / no-blaslt build).
  * Drop-in for mm_blaslt_run_bf16: Y[M,N]f32 = X[M,K]bf16 x W[N,K]^T bf16. */
@@ -21046,6 +21143,40 @@ static inline void launch_native_q81(hip_llm_runner *r, void *x, int n) {
     r->native_q81_source = x;
     r->native_q81_n = n;
     r->native_q81_valid = r->q8x2_reuse_active;
+}
+
+/* Decode residual + RMSNorm.  When the next projection scope can consume
+ * them, the fused variant also writes the native (qwen35_quantize_q81) and
+ * IQ1 (quantize_q81_iq1_batch_32_exact) Q8_1 forms of xb bit-identically,
+ * and begin_q8x2_reuse adopts them if no launch intervened. */
+static inline void launch_res_rmsnorm_decode(hip_llm_runner *r, void *x,
+        void *res, void *xb, void *w, int n, float eps) {
+    static int fuse = -1;
+    if (fuse < 0) {
+        const char *e = getenv("LLM_QWEN35_NORM_Q81");
+        fuse = !e || atoi(e) != 0;
+    }
+    r->normq_src = NULL;
+    if (fuse && r->fn_res_rmsnorm_q81_f32 && n == 20 * 256 &&
+        qwen35_native_q81_ready(r) && r->d_act_q8 && r->d_act_scale &&
+        r->d_act_scale_b) {
+        void *a[] = { &x, &res, &xb, &w, &n, &eps, &r->d_native_q81,
+                      &r->d_native_scale, &r->d_act_q8, &r->d_act_scale,
+                      &r->d_act_scale_b };
+        LAUNCH(r->fn_res_rmsnorm_q81_f32, 1, 1, 1, 256, 1, 1,
+               256 * sizeof(float), r->stream, a);
+        /* The scratch now holds this activation, not any earlier source. */
+        r->native_q81_valid = 0;
+        r->iq1_q8_valid = 0;
+        r->q8x2_reuse_valid = 0;
+        r->normq_src = xb;
+        r->normq_n = n;
+        r->normq_seq = hllm_launch_seq;
+        return;
+    }
+    void *a[] = { &x, &res, &xb, &w, &n, &eps };
+    LAUNCH(r->fn_res_rmsnorm_f32, 1, 1, 1, 256, 1, 1,
+           256 * sizeof(float), r->stream, a);
 }
 
 static inline void launch_silu_mul_native_q81(hip_llm_runner *r, void *gate,
@@ -22839,6 +22970,7 @@ static inline void launch_quantize_q8x2(hip_llm_runner *r, void *x, int n) {
                      &r->d_act_scale_b, &x, &n };
     LAUNCH(r->fn_quantize_q8x2_32, (n + 31) / 32, 1, 1, 32, 1, 1,
            0, r->stream, args);
+    r->iq1_q8_valid = 0;   /* d_act_q8/d_act_scale_b now hold Q8x2 */
     if (r->q8x2_reuse_active) {
         r->q8x2_reuse_source = x;
         r->q8x2_reuse_n = n;
@@ -22850,6 +22982,17 @@ static inline void begin_q8x2_reuse(hip_llm_runner *r) {
     r->q8x2_reuse_active = 1;
     r->q8x2_reuse_valid = 0;
     r->native_q81_valid = 0;
+    /* A res_rmsnorm_q81 launched immediately before this scope already
+     * wrote both Q8_1 forms of its xb output. */
+    if (r->normq_src && r->normq_seq == hllm_launch_seq) {
+        r->native_q81_source = r->normq_src;
+        r->native_q81_n = r->normq_n;
+        r->native_q81_valid = 1;
+        r->iq1_q8_source = r->normq_src;
+        r->iq1_q8_n = r->normq_n;
+        r->iq1_q8_valid = 1;
+    }
+    r->normq_src = NULL;
 }
 
 static inline void end_q8x2_reuse(hip_llm_runner *r) {
@@ -29943,10 +30086,8 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
         if (r->is_hybrid && cl->is_ssm && r->debug_layers && l < 6)
             debug_f32_state(r, l, "Q4 ssm_pre_norm", r->d_x, n_embd);
         if (r->pending_res_add) {
-            void *a[] = { &r->d_x, &r->pending_res_add, &r->d_xb,
-                          &cl->attn_norm_w, &n_embd, &eps };
-            LAUNCH(r->fn_res_rmsnorm_f32, 1, 1, 1, 256, 1, 1,
-                   256 * sizeof(float), r->stream, a);
+            launch_res_rmsnorm_decode(r, r->d_x, r->pending_res_add, r->d_xb,
+                                      cl->attn_norm_w, n_embd, eps);
             r->pending_res_add = NULL;
         } else
         launch_rmsnorm(r, r->d_xb, r->d_x, cl->attn_norm_w, n_embd, eps);
@@ -30747,8 +30888,8 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
             launch_add(r, r->d_x, r->d_xb, n_embd);
             launch_rmsnorm(r, r->d_xb, r->d_x, cl->ffn_norm_w, n_embd, eps);
         } else {
-            void *a[] = { &r->d_x, &r->d_xb, &r->d_xb, &cl->ffn_norm_w, &n_embd, &eps };
-            LAUNCH(r->fn_res_rmsnorm_f32, 1, 1, 1, 256, 1, 1, 256 * sizeof(float), r->stream, a);
+            launch_res_rmsnorm_decode(r, r->d_x, r->d_xb, r->d_xb,
+                                      cl->ffn_norm_w, n_embd, eps);
         }
 
         if (cl->is_moe) {
