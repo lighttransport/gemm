@@ -95,6 +95,25 @@ class ViewSpecTest(unittest.TestCase):
         self.assertIn("rear view", viewlib.view_prompt(viewlib.ViewSpec(180).validated()))
         self.assertIn("orthographic", viewlib.view_prompt(viewlib.ViewSpec(0, projection="orthographic").validated()))
 
+    def test_prompt_spells_out_the_geometry(self):
+        """Where the front points and where the camera is: consistent with the
+        camera matrices (a camera on +X sees the object's left side)."""
+        def text(az, el=0):
+            return viewlib.view_prompt(viewlib.ViewSpec(az, el).validated())
+        self.assertIn("left side in pure profile", text(90))
+        self.assertIn("front points to the left edge", text(90))
+        self.assertIn("front points to the right edge", text(270))
+        self.assertIn("front and its left side are visible", text(45))
+        self.assertIn("back and right side", text(225))
+        self.assertIn("20 degrees above the object", text(0, 20))
+        self.assertIn("directly below the object", text(0, -90))
+        self.assertIn("looking horizontally", text(0, 5))
+        camera = viewlib.camera_position(viewlib.ViewSpec(90).validated())
+        self.assertGreater(camera[0], 0.9 * viewlib.DEFAULT_DISTANCE)
+        # Custom templates need not use the new fields.
+        self.assertEqual(viewlib.view_prompt(viewlib.ViewSpec(90).validated(), template="{view_words}"),
+                         "left side view")
+
     def test_seeds_depend_on_the_view_not_its_position(self):
         a, b = viewlib.ViewSpec(30).validated(), viewlib.ViewSpec(60).validated()
         self.assertEqual(viewlib.derive_seed(7, a), 7)

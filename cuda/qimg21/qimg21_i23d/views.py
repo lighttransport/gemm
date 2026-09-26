@@ -160,6 +160,48 @@ def elevation_words(elevation_deg: float) -> str:
     return "bottom view, camera directly below the object"
 
 
+def facing_words(azimuth_deg: float) -> str:
+    """Where the object's front points in the image, spelled out: the model
+    follows this geometry far better than a view name alone (in a prompt
+    study, side views stayed frontal without it). A camera on +X sees the
+    object's left side in profile, with its front pointing to the image's
+    left edge."""
+    a = azimuth_deg % 360.0
+    if a < 22.5 or a >= 337.5:
+        return "The object's front faces the camera, exactly as in the reference."
+    if 67.5 <= a < 112.5:
+        return ("The camera sees the object's left side in pure profile: the object's front points to the left "
+                "edge of the image and its back to the right edge.")
+    if 157.5 <= a < 202.5:
+        return ("The camera sees the object's back: its front faces directly away from the camera, and what was "
+                "on the left in the reference is now on the right.")
+    if 247.5 <= a < 292.5:
+        return ("The camera sees the object's right side in pure profile: the object's front points to the right "
+                "edge of the image and its back to the left edge.")
+    side, edge = ("left", "left") if a < 180 else ("right", "right")
+    if a < 67.5 or a >= 292.5:
+        return (f"The object is turned about 45 degrees so that both its front and its {side} side are visible: "
+                f"its front points diagonally towards the {edge} edge of the image, no longer at the camera.")
+    return (f"The camera sees the object's back and {side} side at about 45 degrees: its front points diagonally "
+            f"away from the camera towards the {edge} edge of the image.")
+
+
+def height_words(elevation_deg: float) -> str:
+    e = elevation_deg
+    if e >= 75:
+        return "The camera is directly above the object looking straight down: only its top surface is visible."
+    if e >= 10:
+        return (f"The camera is {e:g} degrees above the object looking down at it, so its top surface is visible "
+                "and its sides are foreshortened.")
+    if e <= -75:
+        return ("The camera is directly below the object looking straight up: only its underside and base are "
+                "visible; the top is hidden.")
+    if e <= -10:
+        return (f"The camera is {-e:g} degrees below the object looking up at it, so its underside is visible and "
+                "its top is hidden.")
+    return "The camera is at the object's mid-height, looking horizontally."
+
+
 BACKGROUND_CLAUSES = {
     "transparent": ("This is an RGBA image with transparency. The image has alpha channel and the "
                     "background is transparent."),
@@ -171,7 +213,8 @@ DEFAULT_VIEW_TEMPLATE = (
     "Generate the same object as the reference image. Preserve its identity, geometry, proportions, "
     "materials, colors, surface details, and markings. Change only the camera viewpoint: {view_words}, "
     "{elevation_words}. Camera azimuth: {azimuth:g} degrees from the reference view. Camera elevation: "
-    "{elevation:g} degrees.{roll_clause}{projection_clause} Show the complete object, centered and fully "
+    "{elevation:g} degrees. {facing} {height}{roll_clause}{projection_clause} Show the complete object, "
+    "centered and fully "
     "inside the frame, at the same scale as the reference. Do not introduce new objects. Do not remove "
     "existing parts. Use neutral studio lighting. {background_clause}")
 
@@ -186,6 +229,7 @@ def view_prompt(spec: ViewSpec, *, background: str = "transparent", template: st
                   if spec.projection == "orthographic" else "")
     text = (template or DEFAULT_VIEW_TEMPLATE).format(
         view_words=azimuth_words(spec.azimuth_deg), elevation_words=elevation_words(spec.elevation_deg),
+        facing=facing_words(spec.azimuth_deg), height=height_words(spec.elevation_deg),
         azimuth=round(spec.azimuth_deg, 3), elevation=round(spec.elevation_deg, 3), roll_clause=roll,
         projection_clause=projection, background_clause=BACKGROUND_CLAUSES[background])
     if instruction:

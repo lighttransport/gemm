@@ -118,11 +118,26 @@ is built, and torch otherwise. Both backends implement the same semantics:
 
 - **Prompts.** Each view gets a prompt from a template. The template states
   the requested angles in words, e.g. "front-left three-quarter view",
-  "seen from slightly above", "rear view", "top view". It also carries the
-  identity-preservation clauses and the background clause ("The image has
-  alpha channel and the background is transparent." by default). Use
-  `--template-file` to replace the template, and `--instruction` to append
-  text to it.
+  "seen from slightly above", "rear view", "top view". It also spells out
+  the geometry the camera implies, for example "the object's front points
+  to the left edge of the image" or "the camera is 20 degrees above the
+  object … its top surface is visible". It carries the identity-preservation
+  clauses and the background clause ("The image has alpha channel and the
+  background is transparent." by default). Use `--template-file` to replace
+  the template: its fields are `{view_words}`, `{elevation_words}`,
+  `{facing}`, `{height}`, `{azimuth}`, `{elevation}`, `{roll_clause}`,
+  `{projection_clause}` and `{background_clause}`. Use `--instruction` to
+  append text.
+
+  The geometry sentences came out of a prompt study on the bunny cake, which
+  compared three styles on the hard views:
+  - The template with angles and view names alone left 90°/270° sides
+    frontal, barely changed at 20° elevation, and returned a front view for
+    the bottom.
+  - Adding the geometry sentences gave real profiles, a visible top surface
+    at 20°, and a true underside.
+  - A short "rotate the camera" instruction ignored the angle except for the
+    bottom.
 - **Seeds.** `--seed-mode shared` (the default) gives every view the same
   seed, and so the same initial noise, which helps consistency.
   `per_view` derives a stable seed per camera from
@@ -286,12 +301,15 @@ took 262 s wall.
   scale, or consistency with the requested camera. `transforms.json` holds
   requested cameras, never calibration, and must not be used as ground
   truth.
-- **Weak viewpoint control.** In the bunny-cake run:
-  - front, rear and three-quarter views were plausible;
-  - 90° side views were often three-quarter views;
-  - the 20° elevation ring was barely distinguishable from 0°;
-  - the top view (+90°) worked;
-  - the **bottom view (−90°) came back as a front view**.
+- **Approximate viewpoint control.** With the current template, on the
+  bunny cake:
+  - front, rear, side profiles, the 20° ring, the top view and the bottom
+    view follow the request;
+  - the **45° and 315° three-quarter views stay mostly frontal**.
+
+  Before the geometry sentences, the sides were frontal, the 20° ring looked
+  like 0°, and the bottom view came back as a front view. How closely any
+  view matches its requested camera is unmeasured.
 
   Identity drifts on unseen sides (e.g. a figurine changes species on the
   back). The 2D validator catches none of this.
