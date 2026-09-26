@@ -254,7 +254,7 @@ def mirror_shift(reference: np.ndarray, other: np.ndarray, *, span: int) -> tupl
 
 
 def split_sheet(rgba: np.ndarray, count: int, *, size: int = 512, fill: float = 0.85, min_gap: int = 8,
-                threshold: int = 16, register: tuple = (),
+                threshold: int = 64, register: tuple = (),
                 report: list | None = None) -> tuple[list[np.ndarray], list[tuple]]:
     """Split a one-row sheet of `count` views of one object (a turnaround
     sheet on a transparent background) into square RGBA views.
@@ -270,8 +270,15 @@ def split_sheet(rgba: np.ndarray, count: int, *, size: int = 512, fill: float = 
     one-sided parts. A shift is applied only when it clearly improves the
     overlap; `report` receives one dict per pair. Returns the views and
     their sheet boxes (x0, y0, x1, y1)."""
+    # Faint pixels (a drawn ground shadow, haze) are not the character:
+    # Pixal3D would reconstruct them as a thin plate under its feet.
+    rgba = rgba.copy()
+    rgba[rgba[..., 3] <= threshold] = 0
     alpha = rgba[..., 3] > threshold
-    columns = np.append(alpha.any(axis=0), False)
+    # A column belongs to a figure when it holds a real run of solid pixels:
+    # the faint ground shadow a sheet often draws under all figures (a couple
+    # of rows, low alpha) must not join them into one.
+    columns = np.append(alpha.sum(axis=0) >= max(4, alpha.shape[0] // 100), False)
     runs, start = [], None
     for x, occupied in enumerate(columns):
         if occupied and start is None:

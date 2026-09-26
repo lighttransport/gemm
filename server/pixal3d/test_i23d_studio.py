@@ -147,6 +147,17 @@ class StudioTest(unittest.TestCase):
         with self.assertRaises(StudioError):
             self.run_stage(stage="turnaround", session=sid, count=5)
 
+    def test_character_turnaround_from_text_needs_no_object(self):
+        result = self.run_stage(stage="turnaround", use_reference=False, prompt="a cute robot", count=4, steps=2)
+        state = result["state"]
+        self.assertEqual(len(state["history"]), 1)
+        self.assertEqual(state["current"]["label"], "a cute robot")
+        self.assertEqual(state["views"]["of"], state["current"]["file"])
+        sheet = next(e for e in self.log if e[0] == "sheet")
+        self.assertNotIn("reference image", sheet[3])
+        with self.assertRaisesRegex(StudioError, "needs a prompt"):
+            self.run_stage(stage="turnaround", use_reference=False)
+
     def test_quality_presets_reach_the_runner(self):
         seen = []
         self.studio._runner_factory = lambda name, settings: seen.append(settings) or FakeRunner(name, self.log)

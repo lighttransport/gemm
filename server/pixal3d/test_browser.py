@@ -249,6 +249,13 @@ def studio_flow(cdp, server, pixal):
     assert cdp.evaluate("document.querySelectorAll('#st-models model-viewer').length") == 2
     assert pixal.i23d_requests[-1] == {**pixal.i23d_requests[-1], "stage": "reconstruct", "runner": "both",
                                        "mode": "single", "fov": 20}
+    # A character turnaround straight from text: no reference image is used.
+    before = cdp.evaluate(count)
+    cdp.evaluate("document.getElementById('st-prompt').value='a cute robot';document.getElementById('st-character').click()")
+    wait_for(cdp, f"{count} === {before + 1} && !document.getElementById('st-character').disabled")
+    assert pixal.i23d_requests[-1]["stage"] == "turnaround" and pixal.i23d_requests[-1]["use_reference"] is False
+    assert cdp.evaluate("document.querySelectorAll('#st-views-strip figure').length") == 4
+    assert cdp.evaluate("document.getElementById('st-mode').value") == "multiview"
     print("Text/Image to 3D studio browser test: PASS")
 
 

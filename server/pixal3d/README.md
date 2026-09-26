@@ -218,7 +218,11 @@ Pixal3D into one guided workflow for a single object:
      views, posed (use this after a turnaround);
    - camera FOV: from MoGe-2, or given.
 
-"Text → 3D in one go" runs steps 1 and 4 back to back. `?session=<id>` in
+"Text → 3D in one go" runs steps 1 and 4 back to back. "Character
+turnaround from text" draws a turnaround sheet straight from the prompt,
+with no object needed first; its front view becomes the object.
+"Character → 3D in one go" then builds the model from its posed views. The
+`turnaround` stage takes `use_reference: false` for this. `?session=<id>` in
 the URL reopens a session, and the last one is remembered in the browser.
 
 Which input to use depends on how the views were made:

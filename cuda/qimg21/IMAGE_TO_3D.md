@@ -287,11 +287,15 @@ Running it:
   (symmetric Chamfer between the two meshes).
 - `--quality preview|standard|high` picks the Pixal3D output settings:
 
-  | quality | texture | triangles | flow | bunny multiview |
+  | quality | texture | triangles | flow | bunny multiview (6,781 shape tokens) |
   |---|---|---|---|---|
   | `preview` | 1024 | 300k | BF16 | ~175 s |
   | `standard` (default) | 2048 | 1M | mixed | 233 s |
   | `high` | 4096 | 1M | mixed | — |
+
+  Absolute times scale with the object's complexity. A fox knight with a
+  cape, sword and tail (10,977 shape tokens) took 260 s at `preview`, under
+  CPU load.
 
   On the bunny, the reduced settings changed the shape by Chamfer RMS
   0.0031 (300k triangles) and 0.0037 (BF16 flow) against standard, for an
@@ -424,6 +428,22 @@ Re-reconstructed with registration, the jester's multiview model (254 s)
 lost the magenta and the stray quads. The hat is red/blue striped, the
 lantern keeps its glow, and the back is real; it's now on par with single
 view. `turnaround` reconstructs in multiview by default.
+
+**Splitting robustness.**
+- Sheets often draw a faint ground shadow under all figures (a couple of
+  rows, alpha ≤ 56). A column now counts as a figure only with a real run of
+  solid pixels (≥ 1% of the height above alpha 64), and pixels at or below
+  that alpha are dropped from the views.
+- Before this, a fox-knight sheet split into one "figure", and once split,
+  its shadow became a thin plate under the reconstructed character.
+
+**Character from text in one go** (the studio's "Character → 3D", or
+`turnaround --prompt … --reconstruct native`):
+- a fox-knight sheet in 25 s: four consistent views with armor, cape,
+  sword, shield and tail, mirror IoU 0.915 (front/back) and 0.938
+  (left/right);
+- then a multiview `preview` model with the cape wrapping around, the
+  two-tone tail and the sword, consistent from all sides.
 
 `turnaround --sheet SHEET.png` splits an existing sheet instead of
 generating one. That can be a sheet kept from an earlier run, or a

@@ -222,11 +222,12 @@ class Studio:
         sid = request.get("session")
         with self.lock:
             record = self._load(sid) if sid else None
+        text_turnaround = stage == "turnaround" and request.get("use_reference") is False
         if record is None:
-            if stage not in ("text", "upload"):
+            if stage not in ("text", "upload") and not text_turnaround:
                 raise StudioError("this stage needs a session with an object")
             record = self._load(self.create()["id"])
-        if stage in ("edit", "views", "turnaround", "reconstruct") and not record["history"]:
+        if stage in ("edit", "views", "turnaround", "reconstruct") and not record["history"] and not text_turnaround:
             raise StudioError("the session has no object yet; run text or upload first")
 
         def report(phase, percent):
@@ -364,22 +365,26 @@ class Studio:
         count = _int(request, "count", 4, 3, 4)
         steps, seed = _int(request, "steps", 20, 1, 50), _int(request, "seed", 0, 0, 2**31 - 1)
         subject = _text(request, "prompt", required=False) or None
-        current = record["history"][-1]
+        # use_reference false: a sheet from text alone (a new character); the
+        # default draws the current object as a character.
+        use_reference = request.get("use_reference", True) is not False and bool(record["history"])
+        if not use_reference and not subject:
+            raise StudioError("a turnaround from text needs a prompt")
+        reference = self.root / record["id"] / record["history"][-1]["file"] if use_reference else None
         root = self.root / record["id"] / "views" / f"turnaround_{len(record['history']):03d}"
         shutil.rmtree(root, ignore_errors=True)
         report("Qwen-Image 2.1: turnaround sheet", 10)
         try:
-            summary = ops.generate_turnaround(root, self.backend(), prompt=subject,
-                                              reference=self.root / record["id"] / current["file"], views=count,
-                                              size=SIZE, steps=steps, seed=seed)
+            summary = ops.generate_turnaround(root, self.backend(), prompt=subject, reference=reference,
+                                              views=count, size=SIZE, steps=steps, seed=seed)
         except imageops.MaskError as exc:
             raise StudioError(str(exc)) from None
         report("framing the views", 90)
         base = root.relative_to(self.root / record["id"]).as_posix()
         name, path = self._next_image(record)
         shutil.copyfile(root / summary["views"][0]["file"], path)
-        self._push(record, name, "turnaround", f"turnaround ({count} views)", {},
-                   raw=f"{base}/sheet.png")
+        self._push(record, name, "turnaround", (subject or "") if not use_reference else f"turnaround ({count} views)",
+                   {}, raw=f"{base}/sheet.png")
         record["views"] = {"of": name, "dir": base, "count": count, "elevation": 0.0, "kind": "turnaround",
                            "files": [f"{base}/{v['file']}" for v in summary["views"]],
                            "azimuths": [v["azimuth_deg"] for v in summary["views"]],

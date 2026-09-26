@@ -585,6 +585,14 @@ class TurnaroundTest(Tmp):
         self.assertAlmostEqual(max(heights) / 256, 0.85, delta=0.02)
         with self.assertRaisesRegex(imageops.MaskError, "3 separate figures"):
             imageops.split_sheet(sheet_image([200, 120, 200]), 4)
+        # A faint ground shadow under all figures (2 rows, low alpha) does not join them.
+        shadowed = sheet_image([200, 120, 200, 120])
+        shadowed[470:472, :, :] = (0, 0, 0, 56)
+        clean = imageops.split_sheet(sheet_image([200, 120, 200, 120]), 4, size=256)[0]
+        for shadow_free, reference in zip(imageops.split_sheet(shadowed, 4, size=256)[0], clean):
+            np.testing.assert_array_equal(shadow_free, reference)             # the shadow is dropped
+        shadowed[470:472, 40:120, 3] = 200     # even solid for a short stretch
+        self.assertEqual(len(imageops.split_sheet(shadowed, 4, size=256)[0]), 4)
 
     def test_registration_puts_opposite_views_on_one_axis(self):
         # Front: a body with a prop on one side; back: the body alone (the prop
@@ -843,10 +851,11 @@ class NativeResidentTest(Tmp):
             self.assertEqual([t["label"] for t in timings], ["start resident denoiser"])
             self.assertEqual(backend._fast.starts, 2)
             self.assertEqual(backend._vae.starts, 1)
-            # Past 1024^2 the decode runs one-shot.
-            _, vae, _ = backend.resident_sockets(GenRequest(prompt="y", out=self.dir / "p.png", width=1280,
-                                                            height=1280))
-            self.assertIsNone(vae)
+            # Past 1024 a side the decode runs one-shot, and needs the device:
+            # nothing stays resident for such a request.
+            self.assertEqual(backend.resident_sockets(GenRequest(prompt="y", out=self.dir / "p.png", width=2048,
+                                                                 height=512)), (None, None, []))
+            self.assertFalse(backend._fast.alive() or backend._vae.alive())
             # An init image is encoded every time: the resident processes stop.
             edit = GenRequest(prompt="y", out=self.dir / "p.png", references=(self.ref,), init_image=self.ref,
                               strength=0.5)

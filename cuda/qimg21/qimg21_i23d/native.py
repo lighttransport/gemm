@@ -242,7 +242,10 @@ class NativeBackend:
         starting or re-sizing this backend's resident processes as needed."""
         if self.resident_socket or self.resident_vae_socket or not self.resident or not FAST.is_file():
             return self.resident_socket, self.resident_vae_socket, []
-        if self.needs_encoder(request):
+        if self.needs_encoder(request) or max(request.height, request.width) // 16 > RESIDENT_VAE_MAX_TOKENS:
+            # One-shot encoders, or an output too large for the resident VAE
+            # decoder (a 2048x512 turnaround sheet): its tiled one-shot decode
+            # needs the memory a resident denoiser holds.
             self._fast.stop()
             self._vae.stop()
             return None, None, []

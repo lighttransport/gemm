@@ -42,7 +42,8 @@ button{background:var(--accent);border:0;color:#06271f;font-weight:800;cursor:po
 <div id="st-photo-pane" hidden><label for="st-photo">Photo</label><input id="st-photo" type="file" accept="image/png,image/jpeg,image/webp">
 <label for="st-method">Extraction</label><select id="st-method"><option value="qwen">Qwen-Image 2.1 (keeps the photo's pixels)</option><option value="rmbg">RMBG-2.0 matting</option><option value="alpha">Use the image's alpha</option></select></div>
 <div class="grid2"><div><label for="st-steps">Steps</label><input id="st-steps" type="number" min="1" max="50" value="16"></div><div><label for="st-seed">Seed</label><input id="st-seed" type="number" min="0" value="7"></div></div>
-<div class="actions st-actions"><button type="button" class="run" id="st-make">Generate object</button><button type="button" class="ghost" id="st-oneclick" title="Generate the object, then build the 3D model with the settings in step 4">Text → 3D in one go</button></div></div>
+<div class="actions st-actions"><button type="button" class="run" id="st-make">Generate object</button><button type="button" class="ghost" id="st-oneclick" title="Generate the object, then build the 3D model with the settings in step 4">Text → 3D in one go</button></div>
+<div class="actions st-actions" id="st-char-actions"><button type="button" class="ghost" id="st-character" title="A character turnaround sheet (front, left, back, right) straight from the text; its front view becomes the object and its views feed posed multiview reconstruction">Character turnaround from text</button><button type="button" class="ghost" id="st-character-3d" title="Character turnaround from text, then the 3D model from its posed views">Character → 3D in one go</button></div></div>
 
 <div class="panel"><h2>2 · Edit <span class="opt">optional, repeatable</span></h2>
 <label for="st-edit">Instruction</label><input id="st-edit" placeholder="e.g. make the glaze matte red, keep the eyes">
@@ -176,7 +177,7 @@ $('qwen-run').onclick=async()=>{const button=$('qwen-run'),status=$('qwen-status
 (()=>{
 const S={sid:null,state:null,job:null,busy:false,box:null,source:'text'};
 const store={get(){try{return localStorage.getItem('i23d-session')}catch(e){return null}},set(v){try{v?localStorage.setItem('i23d-session',v):localStorage.removeItem('i23d-session')}catch(e){}}};
-const buttons=['st-make','st-oneclick','st-apply','st-undo','st-views','st-build'];
+const buttons=['st-make','st-oneclick','st-character','st-character-3d','st-apply','st-undo','st-views','st-build'];
 function setBusy(b){S.busy=b;for(const id of buttons)$(id).disabled=b;$('st-undo').disabled=b||!S.state||S.state.history.length<2;$('st-cancel').hidden=!b}
 function status(text,error){$('st-status').innerHTML='';const s=document.createElement('span');if(error)s.className='error';s.textContent=text;$('st-status').append(s)}
 function progress(p){$('st-bar').style.width=Math.max(0,Math.min(100,p||0))+'%'}
@@ -221,7 +222,10 @@ function render(st){
   }
 }
 // ---- source toggle
-function setSource(s){S.source=s;$('st-src-text').classList.toggle('active',s==='text');$('st-src-photo').classList.toggle('active',s==='photo');$('st-text-pane').hidden=s!=='text';$('st-photo-pane').hidden=s!=='photo';$('st-make').textContent=s==='text'?'Generate object':'Extract object';$('st-oneclick').hidden=s!=='text'}
+function setSource(s){S.source=s;$('st-src-text').classList.toggle('active',s==='text');$('st-src-photo').classList.toggle('active',s==='photo');$('st-text-pane').hidden=s!=='text';$('st-photo-pane').hidden=s!=='photo';$('st-make').textContent=s==='text'?'Generate object':'Extract object';$('st-oneclick').hidden=s!=='text';$('st-char-actions').hidden=s!=='text'}
+const characterSheet=()=>stage({stage:'turnaround',use_reference:false,prompt:$('st-prompt').value,count:Number($('st-turn-count').value),...common()});
+$('st-character').onclick=()=>act('Drawing the character turnaround',async()=>{const r=await characterSheet();$('st-mode').value='multiview';return r});
+$('st-character-3d').onclick=()=>act('Character → 3D',async()=>{const r=await characterSheet();render(r.state);$('st-mode').value='multiview';status('Turnaround ready · building the 3D model from its views…');return stage(buildBody())});
 $('st-src-text').onclick=()=>setSource('text');$('st-src-photo').onclick=()=>setSource('photo');
 const common=()=>({steps:Number($('st-steps').value),seed:Number($('st-seed').value)});
 async function makeObject(){
