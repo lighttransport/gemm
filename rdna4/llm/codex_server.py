@@ -24,7 +24,10 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
-from qwen_tools import call_events, parse_calls, tool_instructions, tool_registry
+from qwen_chat import (chat_input_messages, content_text, encode_raw,
+                       generation_suffix, render_messages,
+                       responses_input_messages, split_generation, system_frame)
+from qwen_tools import call_events, parse_calls, tool_registry
 
 
 WEB_DIR = Path(__file__).with_name("web")
@@ -157,112 +160,17 @@ def _handle_sigterm(signum, frame):
     raise KeyboardInterrupt
 
 
-def content_text(content):
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        # Responses API messages use input_text/output_text, while Chat
-        # Completions uses text.  Dropping input_text silently turns a real
-        # user request into an empty message and makes the model answer the
-        # surrounding Codex system prompt instead.
-        return "".join(x.get("text", "") for x in content
-                       if isinstance(x, dict) and
-                       x.get("type") in ("text", "input_text", "output_text", None))
-    return ""
+def chat_prompt(messages, registry=None, thinking=False, effort=None):
+    """Render messages with the checkpoint's chat template (see qwen_chat)."""
+    return render_messages(messages, registry, thinking, effort)
 
 
-def responses_input_messages(value):
-    """Normalize Responses input message objects and direct content items."""
-    if isinstance(value, str):
-        return [{"role": "user", "content": value}]
-    if isinstance(value, dict):
-        return [{"role": value.get("role", "user"),
-                 "content": value.get("content", value.get("text", ""))}]
-    if not isinstance(value, list):
-        return []
-    messages = []
-    direct = []
-    for item in value:
-        if isinstance(item, dict) and item.get("role"):
-            messages.append(item)
-        elif isinstance(item, dict) and item.get("type") == "function_call":
-            # Responses represents the assistant's tool invocation as an
-            # output item rather than a role-bearing message. Keep it when a
-            # client sends the full prior turn back for the tool-result turn;
-            # otherwise the tool output has no causal assistant context.
-            name = item.get("name", "")
-            arguments = item.get("arguments", "{}")
-            try:
-                parsed = json.loads(arguments) if isinstance(arguments, str) else arguments
-            except (TypeError, ValueError):
-                parsed = {"input": str(arguments)}
-            if not isinstance(parsed, dict):
-                parsed = {"input": json.dumps(parsed, ensure_ascii=False)}
-            call = ["<tool_call>", f"<function={name}>"]
-            for key, value in parsed.items():
-                rendered = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
-                call.extend((f"<parameter={key}>", rendered, "</parameter>"))
-            call.extend(("</function>", "</tool_call>"))
-            messages.append({"role": "assistant", "content": "\n".join(call)})
-        elif isinstance(item, dict) and item.get("type") == "function_call_output":
-            # Responses sends tool results as input items rather than chat
-            # messages. Preserve them as a tool turn; dropping them makes a
-            # follow-up generation repeat the same call without its result.
-            output = item.get("output", "")
-            if not isinstance(output, str):
-                output = json.dumps(output, ensure_ascii=False)
-            call_id = item.get("call_id", "")
-            label = f" call_id={call_id}" if call_id else ""
-            messages.append({"role": "tool",
-                             "content": f"<tool_response{label}>\n{output}\n</tool_response>"})
-        elif isinstance(item, dict) and "content" in item:
-            # Be liberal with message-shaped Responses items that omit role;
-            # treating them as user content is safer than silently dropping
-            # the actual request and answering only the system prompt.
-            messages.append({"role": "user", "content": item["content"]})
-        elif isinstance(item, dict) and item.get("type") in ("input_text", "output_text", "text"):
-            direct.append(item)
-    if direct:
-        messages.append({"role": "user", "content": direct})
-    return messages
+def chat_prefix(messages, registry=None, thinking=False, effort=None):
+    """Return the stable leading system frame for prefix KV reuse."""
+    return system_frame(messages, registry, thinking, effort)
 
 
-def chat_prompt(messages):
-    # Match the checkpoint's non-thinking ChatML template, including the
-    # reasoning frame on historical assistant turns. Omitting it changes the
-    # token prefix and discards reusable conversation KV on every follow-up.
-    out = [chat_prefix(messages)]
-    leading = True
-    for m in messages:
-        role = m.get("role", "user")
-        if leading and role in ("system", "developer"):
-            continue
-        leading = False
-        text = content_text(m.get("content", "")).strip()
-        if role == "assistant":
-            text = "<think>\n\n</think>\n\n" + text
-        out.append(f"<|im_start|>{role}\n{text}<|im_end|>\n")
-    # Qwen3.8 Flash Next thinks by default.  Match llama.cpp's explicit
-    # non-thinking mode by placing an empty reasoning block before the final
-    # answer; otherwise <think> content leaks into the Responses text.
-    out.append("<|im_start|>assistant\n<think>\n\n</think>\n\n")
-    return "".join(out)
-
-
-def chat_prefix(messages):
-    """Return the stable leading system/developer frames for prefix KV reuse."""
-    out = []
-    for m in messages:
-        if m.get("role") not in ("system", "developer"):
-            break
-        text = content_text(m.get("content", "")).strip()
-        if text:
-            out.append(text)
-    # Qwen3.8's GGUF template merges consecutive system/developer messages.
-    return "<|im_start|>system\n" + "\n".join(out) + "<|im_end|>\n" if out else ""
-
-
-def fit_context(messages, context_tokens, output_tokens):
+def fit_context(messages, context_tokens, output_tokens, render=None):
     """Keep system/developer instructions and the newest complete user turns.
 
     The tokenizer lives in the GPU child, so this uses a conservative 4-byte
@@ -271,8 +179,9 @@ def fit_context(messages, context_tokens, output_tokens):
     assistant, and tool messages are trimmed as turn groups so a tool result is
     not retained without the request and call that produced it.
     """
+    render = render or chat_prompt
     budget = max(128, context_tokens - output_tokens) * 4
-    if len(chat_prompt(messages)) <= budget:
+    if len(render(messages)) <= budget:
         return messages
     indexed = list(enumerate(messages))
     pinned = [(i, message) for i, message in indexed
@@ -290,7 +199,7 @@ def fit_context(messages, context_tokens, output_tokens):
     for group in reversed(groups):
         trial_items = sorted(kept + group, key=lambda item: item[0])
         trial = [message for _, message in trial_items]
-        if len(chat_prompt(trial)) > budget and len(kept) > len(pinned):
+        if len(render(trial)) > budget and len(kept) > len(pinned):
             break
         kept.extend(group)
     return [message for _, message in sorted(kept, key=lambda item: item[0])]
@@ -587,12 +496,97 @@ class Backend:
         return text, int(cached), int(prompt_tokens), int(completion_tokens), finish
 
 
+def responses_output(response_id, reasoning, raw_turn, text, calls):
+    """Responses output items for one assistant turn.
+
+    The leading reasoning item carries the raw generated turn as opaque
+    encrypted_content.  Clients that keep reasoning items (Codex requests
+    reasoning.encrypted_content with store=false) send it back, so the next
+    prompt reproduces this turn byte for byte and the runner extends its live
+    KV/recurrent state instead of re-prefilling or restoring a snapshot.
+    """
+    items = [{"type": "reasoning", "id": "rs_" + uuid.uuid4().hex,
+              "summary": ([{"type": "summary_text", "text": reasoning}]
+                          if reasoning else []),
+              "encrypted_content": encode_raw(raw_turn)}]
+    if text or not calls:
+        items.append({"type": "message", "id": response_id + "-item",
+                      "role": "assistant", "status": "completed",
+                      "content": [{"type": "output_text", "text": text,
+                                   "annotations": []}]})
+    items.extend(calls)
+    return items
+
+
+def output_item_events(response_id, items):
+    """Buffered Responses stream events for finished output items."""
+    for index, item in enumerate(items):
+        kind = item["type"]
+        if kind in ("function_call", "custom_tool_call"):
+            for event in call_events(response_id, [item]):
+                if event["type"] in ("response.created", "response.in_progress"):
+                    continue
+                yield {**event, "output_index": index}
+            continue
+        if kind == "message":
+            part = item["content"][0]
+            yield {"type": "response.output_item.added", "output_index": index,
+                   "item": {**item, "status": "in_progress", "content": []}}
+            common = {"item_id": item["id"], "output_index": index, "content_index": 0}
+            yield {"type": "response.content_part.added", **common,
+                   "part": {"type": "output_text", "text": "", "annotations": []}}
+            yield {"type": "response.output_text.delta", **common, "delta": part["text"]}
+            yield {"type": "response.output_text.done", **common, "text": part["text"]}
+            yield {"type": "response.content_part.done", **common, "part": part}
+            yield {"type": "response.output_item.done", "output_index": index, "item": item}
+            continue
+        if kind == "reasoning":
+            yield {"type": "response.output_item.added", "output_index": index,
+                   "item": {**item, "summary": []}}
+            for summary_index, summary in enumerate(item["summary"]):
+                common = {"item_id": item["id"], "output_index": index,
+                          "summary_index": summary_index}
+                yield {"type": "response.reasoning_summary_part.added", **common,
+                       "part": {"type": "summary_text", "text": ""}}
+                yield {"type": "response.reasoning_summary_text.delta", **common,
+                       "delta": summary["text"]}
+                yield {"type": "response.reasoning_summary_text.done", **common,
+                       "text": summary["text"]}
+                yield {"type": "response.reasoning_summary_part.done", **common,
+                       "part": summary}
+        yield {"type": "response.output_item.done", "output_index": index, "item": item}
+
+
 class Handler(BaseHTTPRequestHandler):
     backend = None
     model = "local"
     max_tokens = 256
     context = 4096
     coding = False
+    thinking = "auto"
+
+    def thinking_mode(self, req, api_path):
+        """Return (thinking, effort) for a request.
+
+        auto: Responses requests think when they ask for a reasoning effort
+        (Codex always sends one); Chat Completions think only when asked via
+        reasoning_effort or chat_template_kwargs.enable_thinking.
+        """
+        effort = None
+        reasoning = req.get("reasoning")
+        if isinstance(reasoning, dict) and isinstance(reasoning.get("effort"), str):
+            effort = reasoning["effort"]
+        elif isinstance(req.get("reasoning_effort"), str):
+            effort = req["reasoning_effort"]
+        kwargs = req.get("chat_template_kwargs")
+        explicit = kwargs.get("enable_thinking") if isinstance(kwargs, dict) else None
+        if self.thinking == "off":
+            return False, effort
+        if self.thinking == "on":
+            return explicit is not False and effort not in ("none",), effort
+        if isinstance(explicit, bool):
+            return explicit, effort
+        return effort is not None and effort not in ("none", "minimal"), effort
 
     def log_message(self, fmt, *args):
         sys.stderr.write("[api] " + (fmt % args) + "\n")
@@ -776,6 +770,8 @@ class Handler(BaseHTTPRequestHandler):
                 messages.extend(responses_input_messages(inp))
             else:
                 messages = req.get("messages", [])
+                if isinstance(messages, list) and all(isinstance(m, dict) for m in messages):
+                    messages = chat_input_messages(messages)
             if (not isinstance(messages, list) or
                     any(not isinstance(message, dict) for message in messages)):
                 self.send_json(400, {"error": {
@@ -783,8 +779,7 @@ class Handler(BaseHTTPRequestHandler):
                     "type": "invalid_request_error"}})
                 return
             registry = tool_registry(req.get("tools", []))
-            if registry:
-                messages.insert(0, {"role": "system", "content": tool_instructions(registry)})
+            thinking, effort = self.thinking_mode(req, api_path)
             try:
                 requested_limit = int(req.get("max_tokens", req.get("max_output_tokens", self.max_tokens)))
             except (TypeError, ValueError):
@@ -794,9 +789,19 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(400, {"error": {"message": "max_tokens must be non-negative", "type": "invalid_request_error"}})
                 return
             limit = min(requested_limit, self.max_tokens)
-            messages = fit_context(messages, self.context, limit)
-            prompt = chat_prompt(messages)
-            prefix = chat_prefix(messages)
+            messages = fit_context(
+                messages, self.context, limit,
+                lambda m: chat_prompt(m, registry, thinking, effort))
+            prompt = chat_prompt(messages, registry, thinking, effort)
+            prefix = chat_prefix(messages, registry, thinking, effort)
+            trace_dir = os.environ.get("QWEN38_TRACE_DIR")
+            if trace_dir:
+                # Diagnostic only: raw request plus the exact rendered prompt,
+                # for diffing successive agent turns' prefixes.
+                stamp = f"{time.time():.6f}"
+                with open(os.path.join(trace_dir, f"{stamp}.json"), "w", encoding="utf-8") as f:
+                    json.dump({"path": api_path, "cache_key": cache_key, "request": req,
+                               "prompt": prompt, "prefix": prefix}, f, ensure_ascii=False)
             # The C child reads one complete request into a fixed 4 MiB line.
             # Check the actual UTF-8/base64 expansion before streaming headers;
             # an oversized partial line would otherwise desynchronize every
@@ -818,8 +823,17 @@ class Handler(BaseHTTPRequestHandler):
             # MoE decode remains both useful and coherent.
             # The child receives these values through the request protocol;
             # its standalone benchmark sampling defaults do not apply here.
-            default_temp, default_top_p, default_top_k, default_presence = (
-                (0.7, 0.80, 20, 1.5) if self.coding else (0.2, 0.95, 20, 0.0))
+            # Qwen's published profiles: thinking (coding) 0.6/0.95/20, and
+            # non-thinking 0.7/0.8/20 with presence 1.5.  Agent (Responses)
+            # traffic without explicit controls takes them; a near-greedy
+            # default makes tool-using agents repeat one failing call.
+            if thinking:
+                defaults = (0.6, 0.95, 20, 0.0)
+            elif self.coding or api_path == "/v1/responses":
+                defaults = (0.7, 0.80, 20, 1.5)
+            else:
+                defaults = (0.2, 0.95, 20, 0.0)
+            default_temp, default_top_p, default_top_k, default_presence = defaults
             try:
                 temp = float(req.get("temperature", default_temp))
                 top_p = float(req.get("top_p", default_top_p))
@@ -928,9 +942,11 @@ class Handler(BaseHTTPRequestHandler):
                 self.log_message("request cancelled: %s", self.path)
                 self.close_connection = True
                 return
-            tool_text, calls = parse_calls(text, registry)
-            if calls:
-                text = tool_text
+            # The exact bytes of this assistant turn after "<|im_start|>assistant\n".
+            raw_turn = generation_suffix(thinking) + text
+            reasoning_text, answer = split_generation(text, thinking)
+            tool_text, calls = parse_calls(answer, registry)
+            text = tool_text if calls else answer
             ident = "chatcmpl-" + uuid.uuid4().hex
             created = int(time.time())
             usage = {"prompt_tokens": ptok, "completion_tokens": ctok, "total_tokens": ptok + ctok, "cached_tokens": cached}
@@ -943,50 +959,23 @@ class Handler(BaseHTTPRequestHandler):
                 self.close_connection = True
                 if api_path == "/v1/responses":
                     response_id = stream_response_id
-                    if calls:
-                        response_base = {"id": response_id, "object": "response",
-                                         "created_at": created, "status": "in_progress",
-                                         "model": self.model, "output": []}
-                        events = list(call_events(response_id, calls))[2:]
-                        response_done = {**response_base, "status": "completed",
-                                         "output": calls,
-                                         "usage": {"input_tokens": ptok,
-                                                   "output_tokens": ctok,
-                                                   "total_tokens": ptok + ctok,
-                                                   "input_tokens_details": {"cached_tokens": cached}}}
-                        events.append({"type": "response.completed", "response": response_done})
-                        for sequence_number, obj in enumerate(events, 2):
-                            event = obj["type"]
-                            obj = {**obj, "sequence_number": sequence_number}
-                            self.wfile.write(("event: " + event + "\ndata: " +
-                                              json.dumps(obj, ensure_ascii=False) + "\n\n").encode())
-                        self.wfile.flush()
-                        return
-                    item_id = response_id + "-item"
-                    part = {"type": "output_text", "text": text, "annotations": []}
-                    item = {"type": "message", "id": item_id, "role": "assistant", "status": "completed", "content": [part]}
-                    response_base = {"id": response_id, "object": "response", "created_at": created,
-                                     "status": "in_progress", "model": self.model, "output": []}
-                    created_obj = {"type": "response.created", "response": response_base}
-                    in_progress_obj = {"type": "response.in_progress", "response": response_base}
-                    added_obj = {"type": "response.output_item.added", "output_index": 0, "item": {"type": "message", "id": item_id, "role": "assistant", "status": "in_progress", "content": []}}
-                    part_added_obj = {"type": "response.content_part.added", "item_id": item_id, "output_index": 0, "content_index": 0, "part": {"type": "output_text", "text": "", "annotations": []}}
-                    delta_obj = {"type": "response.output_text.delta", "item_id": item_id, "output_index": 0, "content_index": 0, "delta": text}
-                    text_done_obj = {"type": "response.output_text.done", "item_id": item_id, "output_index": 0, "content_index": 0, "text": text}
-                    part_done_obj = {"type": "response.content_part.done", "item_id": item_id, "output_index": 0, "content_index": 0, "part": part}
-                    item_done_obj = {"type": "response.output_item.done", "output_index": 0, "item": item}
-                    response_done = {**response_base, "status": "completed", "output": [item], "usage": {"input_tokens": ptok, "output_tokens": ctok, "total_tokens": ptok + ctok, "input_tokens_details": {"cached_tokens": cached}}}
-                    done_obj = {"type": "response.completed", "response": response_done}
-                    events = (("response.output_item.added", added_obj), ("response.content_part.added", part_added_obj),
-                              ("response.output_text.delta", delta_obj), ("response.output_text.done", text_done_obj),
-                              ("response.content_part.done", part_done_obj), ("response.output_item.done", item_done_obj),
-                              ("response.completed", done_obj))
-                    for sequence_number, (event, obj) in enumerate(events, 2):
+                    output = responses_output(response_id, reasoning_text, raw_turn,
+                                              text, calls)
+                    response_done = {"id": response_id, "object": "response",
+                                     "created_at": created, "status": "completed",
+                                     "model": self.model, "output": output,
+                                     "usage": {"input_tokens": ptok, "output_tokens": ctok,
+                                               "total_tokens": ptok + ctok,
+                                               "input_tokens_details": {"cached_tokens": cached}}}
+                    events = list(output_item_events(response_id, output))
+                    events.append({"type": "response.completed", "response": response_done})
+                    for sequence_number, obj in enumerate(events, 2):
                         # Responses stream consumers use this to order and
                         # validate events.  In particular, Codex silently
                         # discards otherwise well-formed events without it.
                         obj = {**obj, "sequence_number": sequence_number}
-                        self.wfile.write(("event: " + event + "\ndata: " + json.dumps(obj, ensure_ascii=False) + "\n\n").encode())
+                        self.wfile.write(("event: " + obj["type"] + "\ndata: " +
+                                          json.dumps(obj, ensure_ascii=False) + "\n\n").encode())
                 else:
                     if calls:
                         delta = {"role": "assistant", "tool_calls": [
@@ -1009,26 +998,20 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if api_path == "/v1/responses":
                 response_id = "resp-" + uuid.uuid4().hex
-                if calls:
-                    self.send_json(200, {"id": response_id, "object": "response",
-                                         "created_at": created, "model": self.model,
-                                         "output": calls, "status": "completed",
-                                         "usage": {"input_tokens": ptok,
-                                                   "output_tokens": ctok,
-                                                   "total_tokens": ptok + ctok,
-                                                   "input_tokens_details": {"cached_tokens": cached}}})
-                    return
-                item = {"type": "message", "id": response_id + "-item", "role": "assistant",
-                        "status": "completed", "content": [{"type": "output_text", "text": text, "annotations": []}]}
-                self.send_json(200, {"id": response_id, "object": "response", "created_at": created,
-                                     "model": self.model, "output": [item], "output_text": text,
-                                     "status": "completed", "usage": {"input_tokens": ptok,
-                                     "output_tokens": ctok, "total_tokens": ptok + ctok,
-                                     "input_tokens_details": {"cached_tokens": cached}}})
+                output = responses_output(response_id, reasoning_text, raw_turn, text, calls)
+                self.send_json(200, {"id": response_id, "object": "response",
+                                     "created_at": created, "model": self.model,
+                                     "output": output, "output_text": "" if calls else text,
+                                     "status": "completed",
+                                     "usage": {"input_tokens": ptok, "output_tokens": ctok,
+                                               "total_tokens": ptok + ctok,
+                                               "input_tokens_details": {"cached_tokens": cached}}})
             elif api_path == "/v1/completions":
                 self.send_json(200, {"id": ident, "object": "text_completion", "created": created, "model": self.model, "choices": [{"index": 0, "text": text, "finish_reason": finish}], "usage": usage})
             else:
                 message = {"role": "assistant", "content": text}
+                if reasoning_text:
+                    message["reasoning_content"] = reasoning_text
                 if calls:
                     message["content"] = None
                     message["tool_calls"] = [{"id": item["call_id"], "type": item["type"],
@@ -1061,6 +1044,9 @@ def main():
     ap.add_argument("--max-output", type=int, default=256)
     ap.add_argument("--moe-cache-mb", type=int, default=0)
     ap.add_argument("--coding", action="store_true")
+    ap.add_argument("--thinking", choices=("auto", "on", "off"), default="auto",
+                    help="Qwen3.8 reasoning mode: auto follows the request's reasoning "
+                         "effort (Responses) or enable_thinking (Chat Completions)")
     ap.add_argument("--qwen4-coding-profile", action="store_true")
     ap.add_argument("--qwen4-mtp", help="NextN sidecar; accelerate greedy requests only")
     ap.add_argument("--qwen4-exact", action="store_true", help="exact Qwen4 routing/QSA baseline")
@@ -1107,6 +1093,7 @@ def main():
     Handler.max_tokens = args.max_output
     Handler.context = args.context
     Handler.coding = args.coding
+    Handler.thinking = args.thinking
     try:
         server = ThreadingHTTPServer((args.host, args.port), Handler)
     except Exception:

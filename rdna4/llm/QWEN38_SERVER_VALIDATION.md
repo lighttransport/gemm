@@ -1,4 +1,155 @@
-# Qwen3.8 server correctness and performance — 2026-09-05
+# Qwen3.8 server correctness and performance
+
+## Codex integration for Qwen3.8-27B, dense GSQ + DFlash2 — 2026-09-27
+
+Launch with `rdna4/llm/run_qwen38_27b_codex.sh`. It serves the IQ2_XS GSQ
+target plus the DFlash2 sidecar on `127.0.0.1:8090` with a 64K context and
+16K output cap. It also installs a Codex profile
+(`CODEX_HOME=$HOME/.codex-qwen38`) from `rdna4/llm/codex/`:
+
+```sh
+rdna4/llm/run_qwen38_27b_codex.sh &
+CODEX_HOME=$HOME/.codex-qwen38 codex exec --skip-git-repo-check \
+    --sandbox workspace-write "fix the bug in mathutil.c, compile and run it" </dev/null
+```
+
+Close `codex exec`'s stdin (`</dev/null`) in scripts. Otherwise it waits on
+"Reading additional input from stdin".
+
+### Model catalog (`codex/qwen38_model_catalog.json`)
+
+Without a catalog entry, Codex uses fallback metadata and sends no
+`apply_patch` tool. The model then improvised `apply_patch "...\n..."` shell
+strings and looped 170 times on the same parse error.
+
+The catalog entry sets:
+- freeform `apply_patch` (the only type this Codex accepts);
+- a 64K context and a 4K-token tool-output truncation;
+- no skills, plugins, apps or web-search instructions;
+- multi-agent and goals disabled.
+
+- `base_instructions` is our own short agent prompt. It does not copy the
+  hosted models' instruction templates, and it documents the patch format.
+
+The first Codex prompt shrank from 8,804 tokens (fallback metadata) to 6,695
+(with the catalog), then to 2,478 with the short base instructions. A cold
+first request now takes 4.7 s instead of 16.5 s. The tables below were
+measured with the 6.6K-token prompt.
+
+### Template fidelity (`qwen_chat.py`)
+
+Prompts are rendered byte for byte like the GGUF `tokenizer.chat_template`.
+`test_chat_template.py` renders the checked-in `qwen38_chat_template.jinja`
+with jinja2 and compares, including thinking and effort variants. The
+template covers:
+- the official tools block;
+- tool results as a `user` turn of grouped `<tool_response>` blocks (the old
+  shim used an off-template `tool` role with `call_id=`);
+- one assistant turn per model step, with text before its tool calls;
+- `<think>` frames and the reasoning-effort instructions.
+
+### Thinking
+
+`--thinking auto` (default) enables Qwen thinking when a Responses request
+carries `reasoning.effort`, which Codex always sends:
+- `low`, `medium` and `high`/`xhigh` map to the template's effort levels;
+- Chat Completions thinks only with `reasoning_effort` or
+  `chat_template_kwargs.enable_thinking`.
+
+When the request carries no sampling fields, defaults follow Qwen's
+published profiles:
+- thinking: 0.6 / 0.95 / 20;
+- non-thinking Responses: 0.7 / 0.8 / 20 with presence 1.5.
+
+The old 0.2 near-greedy default drove repeated identical tool calls.
+
+### Prefix caching — three layers
+
+1. **Live continuation (runner).** Generated tokens are often not the
+   canonical BPE of their own text. For example, the model emits `Ġ"***`
+   where re-tokenization gives `Ġ"*` + `**`. Before this change, every agent
+   step therefore diverged from the live state, restored a ~0.5 GiB prompt
+   snapshot, and re-published another one.
+   - The runner now remembers the exact bytes behind its live tokens.
+   - A same-identity prompt that byte-extends them at a special-token
+     boundary (`<|`) keeps the live tokens and tokenizes only the appended
+     text.
+   - Per-step snapshots are no longer taken for continuations.
+2. **Exact assistant replay (shim).** Every Responses turn starts with a
+   `reasoning` item whose opaque `encrypted_content` is
+   `q38raw1:` + base64(raw generated turn). Codex requests
+   `reasoning.encrypted_content` with `store=false` and sends the item back,
+   so the turn is re-rendered from its exact bytes, not re-serialized
+   tool-call JSON.
+3. **Snapshots across conversations (runner).**
+   - The system-prefix snapshot is published under a shared namespace, so a
+     new Codex thread restores the ~6.6K-token tools+instructions prefix. It
+     is evicted last, and `LLM_SERVER_SHARED_PREFIX=0` restores per-identity
+     namespacing.
+   - When another identity takes the GPU, the outgoing conversation's live
+     state is snapshotted with its bytes. `codex exec resume` then continues
+     from where the thread stopped (text continuation from the snapshot).
+   - The outgoing state is captured before the restore but published after
+     the incoming conversation's entry was restored and touched, so the save
+     cannot evict what the incoming request needs.
+   - Re-saving an unchanged state is not an LRU touch. The two-entry A/B/A
+     case in `test_qwen35_dflash2_http.py` depends on this ordering.
+
+### Measured on the RX 9070 XT, 212 W cap
+
+Codex 0.157.1, `--sandbox workspace-write`.
+
+| Step | Prompt | Reused | Prefilled | Prefill ms |
+| --- | ---: | ---: | ---: | ---: |
+| New thread, cold server | 6,905 | 0 | 6,905 | 12,948 |
+| Agent steps 2–5 (live continuation) | 7,240–7,658 | all but 37–289 | 37–289 | 152–605 |
+| New thread B (shared system prefix) | 6,911 | 6,583 | 328 | 643 |
+| `codex exec resume` A after B (saved live state) | 7,783 | 7,752 | 31 | 140 |
+
+- The fix/compile/run task finished correctly in 5 requests (`./mu` printed
+  5). Codex reported 29,401 of 36,733 input tokens cached.
+- The resumed and cross-thread tasks also completed correctly.
+- Decode inside Codex ran at 53–94 tok/s with DFlash2. DFlash2 still hands
+  off to target decode beyond 32K positions.
+- A full A / B / `resume A` sequence from a cold server reported these
+  `cached_input_tokens`:
+  - thread A: 59,867 / 67,232 (89%);
+  - thread B: 36,397 / 43,621 (83%);
+  - resume A: 20,604 / 21,028 (98%).
+
+  The only full miss was the very first request.
+
+### DFlash2 serving fix found by this work
+
+The DFlash2 verifier forward is a replayed HIP graph. Its feature-capture
+kernels replay, but their host-side `feature_rows` was set only while
+capturing.
+
+- A prefill whose last batch had one row left `feature_rows = 1`.
+- The next accepted multi-row window was then rejected
+  (`DFlash2 commit rejected ... features=1`), and the request failed with
+  `ERR generation`.
+- Live continuation makes such suffix sizes common. A 129-token Codex step
+  hit it.
+- The fix sets `feature_rows` after every verify-graph launch.
+- `test_qwen35_dflash2_http.py` now includes this one-row-prefill case. It
+  fails without the fix and passes with it.
+- The 4K fixture hashes are unchanged: DFlash2 104.2 tok/s, plain
+  50.2 tok/s.
+
+### Debugging and knobs
+
+Debugging:
+- `QWEN38_TRACE_DIR=<dir>` dumps each request with its rendered prompt.
+- The runner logs `live prefix diverges at N ... live <tokens> | prompt
+  <tokens>` whenever a same-conversation prompt cannot extend the live state.
+
+Runner environment variables:
+- `LLM_SERVER_LIVE_CONTINUATION=0` disables live continuation.
+- `LLM_SERVER_SNAPSHOT_EVERY_PROMPT=1` restores per-request prompt snapshots.
+- `LLM_SERVER_SHARED_PREFIX=0` restores per-identity prefix namespacing.
+
+## Earlier results — 2026-09-05
 
 Hardware: Ryzen Threadripper 1950X (16 cores), RX 9070 XT (gfx1201).
 Model: Qwen3.8-Flash-Next-UD-Q4_K_XL, four GGUF shards.

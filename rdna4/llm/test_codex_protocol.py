@@ -12,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from codex_server import Backend, Handler, responses_input_messages, runner_command
+from codex_server import Backend, Handler, chat_prompt, responses_input_messages, runner_command
 
 
 class ProtocolTest(unittest.TestCase):
@@ -224,8 +224,10 @@ class ProtocolTest(unittest.TestCase):
              "output": {"value": 21}},
         ])
         self.assertEqual(messages[-1]["role"], "tool")
-        self.assertIn("call_id=call_1", messages[-1]["content"])
         self.assertIn('"value": 21', messages[-1]["content"])
+        # The checkpoint template frames tool results as a user turn.
+        self.assertIn('<|im_start|>user\n<tool_response>\n{"value": 21}\n</tool_response><|im_end|>',
+                      chat_prompt(messages))
 
     def test_responses_function_call_is_preserved(self):
         messages = responses_input_messages([
@@ -235,8 +237,9 @@ class ProtocolTest(unittest.TestCase):
             {"type": "function_call_output", "call_id": "call_1", "output": "hello"},
         ])
         self.assertEqual(messages[1]["role"], "assistant")
-        self.assertIn("<function=echo>", messages[1]["content"])
-        self.assertIn("<parameter=text>\nhello", messages[1]["content"])
+        self.assertEqual(messages[1]["tool_calls"][0]["name"], "echo")
+        self.assertIn("<tool_call>\n<function=echo>\n<parameter=text>\nhello\n</parameter>\n"
+                      "</function>\n</tool_call><|im_end|>", chat_prompt(messages))
         self.assertEqual(messages[2]["role"], "tool")
 
     def test_startup_waits_for_runner_ready(self):

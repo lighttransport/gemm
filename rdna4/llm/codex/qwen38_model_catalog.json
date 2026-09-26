@@ -1,0 +1,62 @@
+{
+ "models": [
+  {
+   "slug": "qwen3.8-27b",
+   "display_name": "Qwen3.8-27B (local RDNA4)",
+   "description": "Local Qwen3.8-27B IQ2_XS GSQ served by rdna4/llm/codex_server.py",
+   "default_reasoning_level": "medium",
+   "supported_reasoning_levels": [
+    {
+     "effort": "low",
+     "description": "Brief thinking"
+    },
+    {
+     "effort": "medium",
+     "description": "Default thinking"
+    },
+    {
+     "effort": "high",
+     "description": "Extended thinking (template xhigh)"
+    }
+   ],
+   "shell_type": "unified_exec",
+   "visibility": "list",
+   "supported_in_api": true,
+   "priority": 99,
+   "additional_speed_tiers": [],
+   "service_tiers": [],
+   "available_access_programs": {
+    "cyber": []
+   },
+   "availability_nux": null,
+   "upgrade": null,
+   "include_skills_usage_instructions": false,
+   "include_plugin_usage_instructions": false,
+   "include_apps_usage_instructions": false,
+   "default_reasoning_summary": "none",
+   "support_verbosity": false,
+   "default_verbosity": null,
+   "apply_patch_tool_type": "freeform",
+   "web_search_tool_type": "text",
+   "truncation_policy": {
+    "mode": "tokens",
+    "limit": 4000
+   },
+   "supports_image_detail_original": false,
+   "context_window": 65536,
+   "max_context_window": 65536,
+   "effective_context_window_percent": 90,
+   "experimental_supported_tools": [],
+   "input_modalities": [
+    "text"
+   ],
+   "supports_search_tool": false,
+   "supports_experimental_context": false,
+   "use_responses_lite": false,
+   "supports_reasoning_effort_updates": false,
+   "node_repl_auto_review_required": false,
+   "node_repl_disabled": false,
+   "base_instructions": "You are a coding agent running in the Codex CLI on the user's machine, backed by a local Qwen3.8-27B model. You share a workspace with the user; complete their request end to end.\n\n# Working style\n- Inspect before changing: read the relevant files with shell commands (for example `rg`, `sed -n`, `cat`) before editing.\n- Make focused changes that match the surrounding code. Do not refactor unrelated code.\n- After editing, build and run tests or the program when that is how the change can be verified, and report what you ran and what happened.\n- If a command fails, read its output and change your approach instead of repeating the same command.\n- Stop when the task is done and give a short final answer; do not continue with unrelated work.\n\n# Tools\n- `exec_command` runs a shell command in the workspace and returns its output. Prefer short, non-interactive commands.\n- `apply_patch` edits files. Its input is a patch in this format:\n*** Begin Patch\n*** Update File: path/to/file.c\n@@ optional context line\n unchanged line\n-old line\n+new line\n*** End Patch\n  Use `*** Add File: path` (every line prefixed with `+`) to create a file and `*** Delete File: path` to remove one. Always edit files with `apply_patch`, never by writing patches through the shell.\n\n# Final answer\nSummarize what changed and how it was verified in a few sentences. Reference files by path. Do not paste whole files."
+  }
+ ]
+}
