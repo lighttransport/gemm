@@ -428,6 +428,11 @@ def main() -> int:
     ap.add_argument("--encode-only", action="store_true",
                     help="stop after the condition image and prompt(s) are encoded into --condition-cache "
                          "and --prompt-cache (with --prompt-batch: all of them); nothing is denoised")
+    ap.add_argument("--share-prompt-prefix", action="store_true",
+                    help="with --image: compute the prompts' shared system + image prefix once in the text "
+                         "encoder (test_cuda_qimg21_text --share-prefix). A prompt's embeddings then depend "
+                         "on it alone, whatever it is batched with, but differ from the unsplit (PyTorch-exact) "
+                         "ones by about 1e-4 in cosine; cached separately")
     ap.add_argument("--prompt-batch", type=Path,
                     help="JSON list of further prompts for the same --image: encoded together with this "
                          "run's prompt in one text-encoder pass (each weight streamed once) into "
@@ -435,6 +440,8 @@ def main() -> int:
     ap.add_argument("--quant-package", type=Path,
                     help="pack_fast.py package for int8/nvfp4 presets (default: the preset's package)")
     args = ap.parse_args()
+    if args.share_prompt_prefix and args.backend != "cuda":
+        raise SystemExit("--share-prompt-prefix needs the CUDA text encoder (--backend cuda)")
     fast_attention = args.native_attention
     if args.runner == "fast":
         if args.backend != "cuda":
@@ -700,12 +707,14 @@ def main() -> int:
                     if (vision_dir / name).is_file():
                         shutil.copyfile(vision_dir / name, condition_dir / f"vision_{name}")
                 _store(condition_dir, condition_cached)
+        split = ["--share-prefix"] if args.share_prompt_prefix else []
+
         def multimodal_cache_entry(text):
             key = _file_key(text, condition_dir / "latents.npy", vision_dir / "merged.npy", text_encoder,
-                            model, condition_hw)
+                            model, condition_hw, *split)
             return args.prompt_cache / f"multimodal-{key[:32]}"
 
-        def prefetch_multimodal_prompts(texts, group=12):
+        def prefetch_multimodal_prompts(texts, group=48 if split else 12):
             """Encode the uncached prompts among `texts` in passes of up to
             `group` prompts; each pass streams the text encoder's weights
             once. The embeddings are bitwise the single-prompt ones."""
@@ -730,7 +739,7 @@ def main() -> int:
                     "--image-grid-height", str(condition_hw[0]),
                     "--image-grid-width", str(condition_hw[1]),
                     "--attention", "flash-exact" if args.backend == "cuda" else "custom",
-                    "--out-dir", str(batch_dir / "out"),
+                    "--out-dir", str(batch_dir / "out"), *split,
                 ], cwd=root)
                 for i, text in enumerate(chunk):
                     staged = Path(tempfile.mkdtemp(prefix="multimodal.", dir=prompt_dir))
@@ -768,6 +777,25 @@ def main() -> int:
         def run_multimodal_encoder(text, output, tokens_path):
             nonlocal encoded
             encoded = True
+            if split:
+                # The same split the batched passes use, for one prompt.
+                import shutil
+                import tempfile
+                one = Path(tempfile.mkdtemp(prefix="prompt-one.", dir=prompt_dir))
+                (one / "prompts.bin").write_bytes(text.encode("utf-8") + b"\0")
+                _run([
+                    str(text_encoder), "--model", str(model), "--prompts-file", str(one / "prompts.bin"),
+                    "--vision-merged", str(vision_dir / "merged.npy"),
+                    "--vision-deepstack-dir", str(vision_dir),
+                    "--image-grid-height", str(condition_hw[0]),
+                    "--image-grid-width", str(condition_hw[1]),
+                    "--attention", "flash-exact" if args.backend == "cuda" else "custom",
+                    "--out-dir", str(one / "out"), *split,
+                ], cwd=root)
+                shutil.copyfile(one / "out" / "embeds_000.npy", output)
+                shutil.copyfile(one / "out" / "tokens_000.txt", tokens_path)
+                shutil.rmtree(one, ignore_errors=True)
+                return
             _run([
                 str(text_encoder), "--model", str(model), "--prompt", text,
                 "--vision-merged", str(vision_dir / "merged.npy"),
@@ -791,7 +819,7 @@ def main() -> int:
             np.save(prompt_dir / f"{prefix}prompt_mask.npy",
                     np.ones((1, retained.size), dtype=np.int64))
 
-        if args.prompt_batch and args.prompt_cache:
+        if args.prompt_batch and args.prompt_cache and args.backend == "cuda":   # CUDA text encoder only
             import json
             started = time.perf_counter()
             batch = [args.prompt] + [str(t) for t in json.loads(args.prompt_batch.read_text())]

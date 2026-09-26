@@ -41,6 +41,9 @@ def add_backend_options(parser):
     group.add_argument("--condition-resolution", type=int, default=1024,
                        help="reference images are shown to the model at about this many pixels squared "
                             "(256-1024, default 1024 as the pipeline does); lower is faster")
+    group.add_argument("--exact-prompts", action="store_true",
+                       help="native: encode each image prompt unsplit, bitwise as PyTorch does, instead of "
+                            "sharing the image prefix between prompts (faster; 1 - cos ~ 4e-5)")
     group.add_argument("--no-resident", action="store_true",
                        help="native: run every image one-shot instead of keeping the denoiser and VAE "
                             "decoder loaded between images")
@@ -97,7 +100,7 @@ def parse_ints(text, count, name):
 def make_backend(args, references: int = 1):
     options = {"model": args.model, "preset": args.preset or None, "attention": args.attention,
                "device": args.device, "condition_resolution": args.condition_resolution,
-               "resident": not args.no_resident}
+               "resident": not args.no_resident, "exact_prompts": args.exact_prompts}
     backend = backends.select_backend(args.backend, references=references, **options)
     args.backends.append(backend)   # closed by main(): stops resident processes
     return backend

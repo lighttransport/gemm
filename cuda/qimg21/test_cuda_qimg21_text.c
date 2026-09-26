@@ -20,7 +20,20 @@ static int text_bf16_gemm_output = 1;
  * positions) runs per prompt, so each prompt's embeddings are bitwise the
  * ones a single-prompt run gives. One segment covers all rows otherwise. */
 #define TEXT_MAX_ROWS 32768
-static int text_segments = 1, text_seg_start[256], text_seg_len[256];
+static int text_segments = 1, text_seg_start[257], text_seg_len[257];   /* GEMM pieces */
+
+/* Prompts of one image share their tokens up to the end of the image block
+ * (<|vision_end|>): system prompt, image pads. Causal attention makes those
+ * rows' hidden states independent of the text that follows, so the shared
+ * prefix is stored and computed once (one GEMM piece) and each prompt adds
+ * only its suffix. The split point is fixed by the token structure, never by
+ * which prompts are batched together. Prompt g's logical row t lives at
+ * text_row(g, t). Without sharing text_prefix is 0 and a prompt is its own
+ * piece. */
+static int text_prompts = 1, text_prefix, text_p_len[256], text_p_suf[256];
+static size_t text_row(int g, int t) {
+    return t < text_prefix ? (size_t)t : (size_t)text_p_suf[g] + (size_t)(t - text_prefix);
+}
 
 /* Linear weights stream from the mapped checkpoint, about 14 GB per prompt,
  * while the GEMMs over a few dozen tokens take tens of milliseconds. So the
@@ -324,6 +337,7 @@ int main(int argc, char **argv) {
     const char *vision_merged = NULL, *vision_deepstack_dir = NULL, *rope_table_path = NULL;
     const char *hidden_input = NULL;
     const char *prompt = NULL, *prompts_file = NULL, *out_dir = NULL;
+    int share_prefix = 0;
     const char *attention_mode = "custom";
     const char *rms_mode = "auto";
     const char *post_rms_mode = "auto";
@@ -335,6 +349,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--prompt") && i + 1 < argc) prompt = argv[++i];
         else if (!strcmp(argv[i], "--prompts-file") && i + 1 < argc) prompts_file = argv[++i];
         else if (!strcmp(argv[i], "--out-dir") && i + 1 < argc) out_dir = argv[++i];
+        else if (!strcmp(argv[i], "--share-prefix")) share_prefix = 1;
         else if (!strcmp(argv[i], "--out") && i + 1 < argc) out = argv[++i];
         else if (!strcmp(argv[i], "--dump-tokens") && i + 1 < argc) dump_tokens = argv[++i];
         else if (!strcmp(argv[i], "--dump-rope-table") && i + 1 < argc) dump_rope_table = argv[++i];
@@ -377,7 +392,7 @@ int main(int argc, char **argv) {
         dump_layer < start_layer || dump_layer >= layers) {
         fprintf(stderr, "usage: %s --model DIR (--tokens ids.txt | --prompt TEXT) "
                         "[--out embeds.npy] [--dump-tokens ids.txt] "
-                        "[--prompts-file NUL-separated.txt --out-dir DIR] "
+                        "[--prompts-file NUL-separated.txt --out-dir DIR [--share-prefix]] "
                         "[--vision-merged FILE --vision-deepstack-dir DIR --rope-table FILE] "
                         "[--hidden FILE --start-layer N] "
                         "[--attention custom|cutlass-efficient|flash-exact --drop-prefix N "
@@ -418,7 +433,43 @@ int main(int argc, char **argv) {
         }
         free(text);
         if (!text_segments) { fprintf(stderr, "text: no prompts in %s\n", prompts_file); return 1; }
-        fprintf(stderr, "text: %d prompts, %d rows\n", text_segments, n);
+        text_prompts = text_segments;
+        for (int g = 0; g < text_prompts; g++) { text_p_len[g] = text_seg_len[g]; text_p_suf[g] = text_seg_start[g]; }
+        /* --share-prefix: compute the prefix through the last <|vision_end|>
+         * once (it must be the same in every prompt; flash/CUTLASS attention
+         * only). Every prompt's suffix is then its own GEMM, sized by that
+         * prompt alone, so a prompt's embeddings do not depend on the batch --
+         * but they are not bitwise the unsplit ones (cuBLAS picks its GEMM
+         * algorithm by row count; 1 - cos ~ 4e-5 on view prompts), which is
+         * why it is opt-in. */
+        int shared = -1;
+        for (int t = 0; t < text_p_len[0]; t++) if (ids[t] == 151653) shared = t + 1;
+        if (share_prefix && (!vision_merged || !strcmp(attention_mode, "custom") || shared <= 0)) {
+            fprintf(stderr, "text: --share-prefix needs image prompts and flash-exact/cutlass-efficient attention\n");
+            return 2;
+        }
+        if (share_prefix) {
+            for (int g = 1; g < text_prompts && shared > 0; g++)
+                if (text_p_len[g] <= shared || memcmp(ids + text_p_suf[g], ids, (size_t)shared * sizeof(int)))
+                    shared = -1;
+            if (text_p_len[0] <= shared) shared = -1;
+            if (shared <= 0) { fprintf(stderr, "text: --share-prefix: the prompts' image prefixes differ\n"); return 1; }
+        } else shared = -1;
+        if (shared > 0) {
+            int at = shared;
+            text_seg_start[0] = 0; text_seg_len[0] = shared;
+            for (int g = 0; g < text_prompts; g++) {
+                int tail = text_p_len[g] - shared;
+                memmove(ids + at, ids + text_p_suf[g] + shared, (size_t)tail * sizeof(int));
+                text_p_suf[g] = at;
+                text_seg_start[g + 1] = at; text_seg_len[g + 1] = tail;
+                at += tail;
+            }
+            text_segments = text_prompts + 1;
+            text_prefix = shared;
+            n = at;
+        }
+        fprintf(stderr, "text: %d prompts, %d rows (%d-token prefix shared)\n", text_prompts, n, text_prefix);
         if (mkdir(out_dir, 0755) && errno != EEXIST) { perror("text: out-dir"); return 1; }
     } else if (prompt) {
         char tokenizer_path[2048];
@@ -452,6 +503,7 @@ int main(int argc, char **argv) {
     if (!prompts_file) {
         if (scanned != EOF || n <= drop) return 1;
         text_seg_start[0] = 0; text_seg_len[0] = n; seg_drop[0] = drop; seg_image_start[0] = image_start;
+        text_p_len[0] = n; text_p_suf[0] = 0;
     }
     if (dump_tokens) {
         FILE *fp = fopen(dump_tokens, "w");
@@ -469,6 +521,7 @@ int main(int argc, char **argv) {
     CUmodule module = NULL, base_module = NULL;
     CUdeviceptr x=0, norm=0, bf=0, q=0, key=0, v=0, att=0, tmp=0, gate=0, up=0;
     CUdeviceptr q_bf=0, key_bf=0, v_bf=0, rope_table=0;
+    CUdeviceptr scratch_q=0, scratch_k=0, scratch_v=0, scratch_att=0;
     CUdeviceptr visual_rows_d=0, visual_embed_d=0;
     void *cutlass_plugin = NULL;
     q21_cutlass_text_attention_fn cutlass_attention = NULL;
@@ -494,16 +547,16 @@ int main(int argc, char **argv) {
     int visual_count = 0, visual_per = 0;
     if (!visual_rows) goto done;
     for (int t = 0; t < n; t++) if (ids[t] == 151655) visual_rows[visual_count++] = t;
-    for (int g = 0, first = 0; g < text_segments; g++) {
-        int count = 0;
-        for (int t = 0; t < text_seg_len[g]; t++) count += ids[text_seg_start[g] + t] == 151655;
+    for (int g = 0; g < text_prompts; g++) {
+        int count = 0, first = -1;
+        for (int t = 0; t < text_p_len[g]; t++)
+            if (ids[text_row(g, t)] == 151655) { if (first < 0) first = t; count++; }
         if (g && count != visual_per) {
             fprintf(stderr, "text: prompts disagree on the number of image tokens\n");
             goto done;
         }
         visual_per = count;
-        if (count && seg_image_start[g] < 0) seg_image_start[g] = visual_rows[first] - text_seg_start[g];
-        first += count;
+        if (count && seg_image_start[g] < 0) seg_image_start[g] = first;
     }
     if (visual_count && image_start < 0) image_start = seg_image_start[0];
     if (!hidden_input && (!!vision_merged != (visual_count > 0))) {
@@ -623,11 +676,11 @@ int main(int argc, char **argv) {
         if(!composed){npy_free(&base);goto done;}
         /* Positions restart in every prompt. */
         int hh=image_grid_h/2,ww=image_grid_w/2;
-        for(int g=0;g<text_segments;g++) {
+        for(int g=0;g<text_prompts;g++) {
           int image_start=seg_image_start[g],after=image_start+(hh>ww?hh:ww);
-          for(int t=0;t<text_seg_len[g];t++)for(int j=0;j<128;j++) {
+          for(int t=0;t<text_p_len[g];t++)for(int j=0;j<128;j++) {
             int k=j&63,pos;
-            size_t row=(size_t)text_seg_start[g]+t;
+            size_t row=text_row(g,t);
             if(t<image_start)pos=t;
             else if(t<image_start+visual_per) {
                 int q=t-image_start;
@@ -648,16 +701,16 @@ int main(int argc, char **argv) {
         npy_f32 table={0};
         const char *table_path = rope_table_path ? rope_table_path : "cuda/qimg21/qwen21_text_rope.npy";
         int longest=0;
-        for(int g=0;g<text_segments;g++) if(text_seg_len[g]>longest) longest=text_seg_len[g];
+        for(int g=0;g<text_prompts;g++) if(text_p_len[g]>longest) longest=text_p_len[g];
         if(npy_read_f32(table_path,&table) || table.ndim!=3 ||
            table.shape[0]<(size_t)longest || table.shape[1]!=128 || table.shape[2]!=2) {
             fprintf(stderr,"text: invalid/missing qwen21_text_rope.npy\n"); npy_free(&table); goto done;
         }
         rope_table=checked_cuMemAlloc((size_t)n*128*2*4);
         if(!rope_table) {npy_free(&table);goto done;}
-        for(int g=0;g<text_segments;g++)
-            if(cuMemcpyHtoD(rope_table+(size_t)text_seg_start[g]*128*2*4,table.data,
-                            (size_t)text_seg_len[g]*128*2*4)) {npy_free(&table);goto done;}
+        for(int g=0;g<text_prompts;g++)   /* no shared prefix without an image */
+            if(cuMemcpyHtoD(rope_table+(size_t)text_p_suf[g]*128*2*4,table.data,
+                            (size_t)text_p_len[g]*128*2*4)) {npy_free(&table);goto done;}
         npy_free(&table);
     }
     if (dump_rope_table) {
@@ -671,6 +724,12 @@ int main(int argc, char **argv) {
     }
     if (cutlass_attention) {
         ALLOC(q_bf,n*4096,2); ALLOC(key_bf,n*1024,2); ALLOC(v_bf,n*1024,2);
+    }
+    int longest_prompt = 0;
+    for (int g = 0; g < text_prompts; g++) if (text_p_len[g] > longest_prompt) longest_prompt = text_p_len[g];
+    if (text_prefix) {   /* one prompt's whole sequence, gathered for attention */
+        ALLOC(scratch_q,longest_prompt*4096,2); ALLOC(scratch_k,longest_prompt*1024,2);
+        ALLOC(scratch_v,longest_prompt*1024,2); ALLOC(scratch_att,longest_prompt*4096,4);
     }
     #undef ALLOC
     if(cuMemcpyHtoD(x,host,(size_t)n*4096*4))goto done;
@@ -716,18 +775,37 @@ int main(int argc, char **argv) {
             CHECK(text_cast(r,key_bf,key,n*1024));
             CHECK(text_cast(r,v_bf,v,n*1024));
             CHECK(cuStreamSynchronize(r->stream));
-            for(int g=0;g<text_segments;g++) {
-                size_t o=text_seg_start[g];
-                CHECK(cutlass_attention((float *)(uintptr_t)(att+o*4096*4),
-                                        (const void *)(uintptr_t)(q_bf+o*4096*2),
-                                        (const void *)(uintptr_t)(key_bf+o*1024*2),
-                                        (const void *)(uintptr_t)(v_bf+o*1024*2),text_seg_len[g],r->stream));
+            for(int g=0;g<text_prompts;g++) {
+                size_t o=text_p_suf[g];
+                if(!text_prefix) {
+                    CHECK(cutlass_attention((float *)(uintptr_t)(att+o*4096*4),
+                                            (const void *)(uintptr_t)(q_bf+o*4096*2),
+                                            (const void *)(uintptr_t)(key_bf+o*1024*2),
+                                            (const void *)(uintptr_t)(v_bf+o*1024*2),text_p_len[g],r->stream));
+                    continue;
+                }
+                /* The prompt's full sequence, as a single-prompt run sees it:
+                 * the shared prefix rows, then its own suffix. */
+                size_t P=text_prefix, tail=text_p_len[g]-text_prefix;
+                CHECK(cuMemcpyDtoDAsync(scratch_q,q_bf,P*4096*2,r->stream));
+                CHECK(cuMemcpyDtoDAsync(scratch_q+P*4096*2,q_bf+o*4096*2,tail*4096*2,r->stream));
+                CHECK(cuMemcpyDtoDAsync(scratch_k,key_bf,P*1024*2,r->stream));
+                CHECK(cuMemcpyDtoDAsync(scratch_k+P*1024*2,key_bf+o*1024*2,tail*1024*2,r->stream));
+                CHECK(cuMemcpyDtoDAsync(scratch_v,v_bf,P*1024*2,r->stream));
+                CHECK(cuMemcpyDtoDAsync(scratch_v+P*1024*2,v_bf+o*1024*2,tail*1024*2,r->stream));
+                CHECK(cuStreamSynchronize(r->stream));
+                CHECK(cutlass_attention((float *)(uintptr_t)scratch_att,(const void *)(uintptr_t)scratch_q,
+                                        (const void *)(uintptr_t)scratch_k,(const void *)(uintptr_t)scratch_v,
+                                        text_p_len[g],r->stream));
+                if(!g) CHECK(cuMemcpyDtoDAsync(att,scratch_att,P*4096*4,r->stream));
+                CHECK(cuMemcpyDtoDAsync(att+o*4096*4,scratch_att+P*4096*4,tail*4096*4,r->stream));
+                CHECK(cuStreamSynchronize(r->stream));
             }
         } else {
-            for(int g=0;g<text_segments;g++) {
-                size_t o=text_seg_start[g];
+            for(int g=0;g<text_prompts;g++) {   /* never with a shared prefix */
+                size_t o=text_p_suf[g];
                 CUdeviceptr ag=att+o*4096*4,qg=q+o*4096*4,kg=key+o*1024*4,vg=v+o*1024*4;
-                int len=text_seg_len[g];
+                int len=text_p_len[g];
                 void *aa[]={&ag,&qg,&kg,&vg,&len};
                 CHECK(cuLaunchKernel(attention,32,len,1,32,1,1,0,r->stream,aa,NULL));
             }
@@ -767,7 +845,7 @@ int main(int argc, char **argv) {
                deep.shape[0]!=(size_t)visual_per||deep.shape[1]!=4096){
                 npy_free(&deep);goto done;
             }
-            for(int g=0;g<text_segments;g++)
+            for(int g=0;g<visual_count/visual_per;g++)
                 CHECK(cuMemcpyHtoD(visual_embed_d+(size_t)g*visual_per*4096*4,deep.data,
                                    (size_t)visual_per*4096*4));
             CHECK(cuCtxSynchronize());
@@ -796,17 +874,21 @@ int main(int argc, char **argv) {
     for(size_t i=0;i<(size_t)n*4096;i++)if(!isfinite(host[i]))goto done;
     if (prompts_file) {
         rc = 0;
-        for (int g = 0; g < text_segments && !rc; g++) {
-            int rows = text_seg_len[g] - seg_drop[g];
+        float *rows_out = malloc((size_t)longest_prompt * 4096 * sizeof(float));
+        if (!rows_out) rc = 1;
+        for (int g = 0; g < text_prompts && !rc; g++) {
+            int rows = text_p_len[g] - seg_drop[g];
+            for (int t = 0; t < rows; t++)
+                memcpy(rows_out + (size_t)t * 4096, host + text_row(g, t + seg_drop[g]) * 4096, 4096 * sizeof(float));
             snprintf(path, sizeof(path), "%s/embeds_%03d.npy", out_dir, g);
-            rc = npy_write_f32(path, host + (size_t)(text_seg_start[g] + seg_drop[g]) * 4096,
-                               (size_t)rows * 4096, rows, 4096);
+            rc = npy_write_f32(path, rows_out, (size_t)rows * 4096, rows, 4096);
             snprintf(path, sizeof(path), "%s/tokens_%03d.txt", out_dir, g);
             FILE *fp = rc ? NULL : fopen(path, "w");
             if (!fp) { rc = 1; break; }
-            for (int t = 0; t < text_seg_len[g]; t++) fprintf(fp, "%d\n", ids[text_seg_start[g] + t]);
+            for (int t = 0; t < text_p_len[g]; t++) fprintf(fp, "%d\n", ids[text_row(g, t)]);
             if (fclose(fp)) rc = 1;
         }
+        free(rows_out);
     } else
         rc=npy_write_f32(out,host+(size_t)drop*4096,(size_t)(n-drop)*4096,n-drop,4096);
     TEXT_PHASE("write embeddings");
@@ -823,6 +905,7 @@ done:
     free_d(&x);free_d(&norm);free_d(&bf);free_d(&q);free_d(&key);free_d(&v);
     free_d(&att);free_d(&tmp);free_d(&gate);free_d(&up);
     free_d(&q_bf);free_d(&key_bf);free_d(&v_bf);
+    free_d(&scratch_q);free_d(&scratch_k);free_d(&scratch_v);free_d(&scratch_att);
     free_d(&rope_table);
     free_d(&visual_rows_d);free_d(&visual_embed_d);
     if(module)cuModuleUnload(module);

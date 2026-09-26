@@ -230,15 +230,16 @@ on an RTX 5060 Ti 16 GB, with a 1024-px condition image of the bunny cake.
 | resident denoiser + VAE decoder, prompt cached | **6.9 s** (denoise 5.7 s, decode 0.6 s) |
 | resident, new prompt encoded alone (every view of a new object, before batching) | 12.3–13.7 s (text encoder 3.5–4.7 s) |
 | same, `--condition-resolution 512` | 10.2–10.7 s (denoise 3.6 s) |
-| **new object, encode-only prepare + batched prompts** (views 2–8 of 8) | **5.9–6.0 s** |
+| **new object, encode-only prepare + batched, prefix-shared prompts** (views 2–8 of 8) | **5.7–5.8 s** |
 
 For a whole new-object turntable (8 views, empty caches), the total went
-from about 115 s to **72.5 s**:
-- prepare, 17.1 s: condition encodes plus all 8 prompts in one text pass;
-- view 1, 12.9 s: includes starting the resident processes;
-- views 2–8: 6.0 s each.
+from about 115 s to **64.1 s**:
+- prepare, 10.9 s: condition encodes plus all 8 prompts in one text pass;
+- view 1, 12.5 s: includes starting the resident processes;
+- views 2–8: 5.7 s each.
 
-The images are byte-identical to the unbatched run.
+With `--exact-prompts` it is 68.4 s, and the images are byte-identical to
+encoding each prompt alone.
 
 What made the difference:
 - **Resident processes.** `NativeBackend` starts its own
@@ -272,15 +273,28 @@ What made the difference:
   `--encode-only --prompt-batch prompts.json`, with the resident processes
   stopped. That run caches the condition image's VAE and vision encodes,
   and encodes the uncached view prompts with `test_cuda_qimg21_text
-  --prompts-file` in passes of up to 12, storing each in the multimodal
-  prompt cache. Every view, the first included, then goes through the
+  --prompts-file` in passes of up to 48 prompts (12 with
+  `--exact-prompts`), storing each in the multimodal prompt cache. Every view, the first included, then goes through the
   resident processes. The prepare time is reported with the first view's
   timings (labels starting `prepare:`).
-  - In a pass, each 13.9 GB weight stream is used by every prompt: about
-    0.75 s per extra prompt instead of 3.5 s.
-  - GEMMs, attention and RoPE positions run per prompt, so each prompt's
-    embeddings are bitwise the single-prompt ones (checked on three prompts
-    of different lengths).
+  - In a pass, each 13.9 GB weight stream is used by every prompt.
+  - **Shared prefix (default).** All of a reference's prompts share their
+    system and image tokens, about 1,047 rows, before a ~175-token view
+    text. `--share-prefix` computes that prefix once per pass. Each prompt
+    adds only its suffix, and attention runs per prompt over the prefix
+    plus its suffix.
+    - 8 view prompts: 10.3 s → 4.3 s. The tokenizer is also now parsed
+      once per process.
+    - Each suffix is its own GEMM, sized by that prompt alone. So a
+      prompt's embeddings are the same whether it is encoded alone or in
+      any batch (bitwise, checked), and every multimodal encode of the
+      native backend uses this split.
+    - The cost: cuBLAS picks its GEMM algorithm by row count, so the
+      embeddings are not bitwise the unsplit, PyTorch-exact ones. The
+      difference is 1 − cos ≈ 4e-5, far below the INT8 denoiser's own
+      error, and turntable images move by 26–37 dB PSNR.
+    - `--exact-prompts` restores the unsplit encode, which is still batched
+      and bitwise per prompt. The two modes have separate cache entries.
 
 Memory: in the full chain (18 views plus extraction), device memory
 peaked at 15.8 GB of 16.3 GB (of which ~2.7 GB belonged to other processes)
@@ -301,15 +315,22 @@ took 262 s wall.
   scale, or consistency with the requested camera. `transforms.json` holds
   requested cameras, never calibration, and must not be used as ground
   truth.
-- **Approximate viewpoint control.** With the current template, on the
-  bunny cake:
-  - front, rear, side profiles, the 20° ring, the top view and the bottom
-    view follow the request;
-  - the **45° and 315° three-quarter views stay mostly frontal**.
+- **Approximate viewpoint control.** Front, rear, side profiles, the
+  three-quarter views, the 20° ring, the top view and the bottom view
+  follow the request. The evidence:
+  - **Cyclops head** (Pixal3D's `mv_images/example`, which has real renders
+    at 0/90/180/270°), generated from its 0° render:
+    - every 45° step turned the face the right way;
+    - the silhouette IoU of the generated 90° and 270° views was higher
+      against the matching render than against the mirrored one (90°:
+      0.827 vs 0.735; 270°: 0.796 vs 0.713);
+    - the old template got 90° backwards (0.732 vs 0.829).
+  - **Bunny cake:** the 45° and 315° views look frontal. The body is a
+    cylinder, so only the figurines can show the turn, and a tighter
+    wording did not change them.
 
-  Before the geometry sentences, the sides were frontal, the 20° ring looked
-  like 0°, and the bottom view came back as a front view. How closely any
-  view matches its requested camera is unmeasured.
+  The geometry sentences are what fixed the profiles, the ring and the
+  bottom view. The generated views are still not metrically posed.
 
   Identity drifts on unseen sides (e.g. a figurine changes species on the
   back). The 2D validator catches none of this.
@@ -330,11 +351,6 @@ took 262 s wall.
 
 ## Future work
 
-- All view prompts of one reference share their system and image prefix
-  (~1,030 of ~1,050 rows). Computing that prefix once per batch would cut
-  the prepare text pass by several times. It would, however, change the
-  GEMM row blocking, and so the bits, relative to the PyTorch-parity
-  single-prompt path.
 - Multi-reference conditioning in the native runner. `joint_layout.h`
   already handles N condition images, but the driver and text-encoder
   layout take one.

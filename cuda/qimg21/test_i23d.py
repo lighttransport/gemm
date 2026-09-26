@@ -454,7 +454,8 @@ class NativeBackendCommandTest(Tmp):
 
     def test_text_to_image_stays_plain(self):
         cmd = self.NativeBackend().command(GenRequest(prompt="apple", out=self.dir / "o.png"), self.dir)
-        for flag in ("--image", "--init-image", "--mask", "--strength", "--native-attention"):
+        for flag in ("--image", "--init-image", "--mask", "--strength", "--native-attention",
+                     "--share-prompt-prefix"):
             self.assertNotIn(flag, cmd)
         self.assertEqual(self.flag(cmd, "--preset"), "fast12")
         self.assertIn("--vae-tf32", cmd)
@@ -471,6 +472,9 @@ class NativeBackendCommandTest(Tmp):
         self.assertEqual(self.flag(cmd, "--native-attention"), "cutlass-efficient")
         self.assertEqual(self.flag(cmd, "--negative-prompt"), "blurry")
         self.assertIn("--condition-cache", cmd)
+        self.assertIn("--share-prompt-prefix", cmd)
+        exact = self.NativeBackend(exact_prompts=True).command(request, self.dir)
+        self.assertNotIn("--share-prompt-prefix", exact)
 
     def test_prepare_encodes_each_new_reference_once_with_all_its_prompts(self):
         backend = self.NativeBackend()

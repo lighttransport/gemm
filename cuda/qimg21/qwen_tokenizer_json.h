@@ -67,14 +67,26 @@ fail:
     return NULL;
 }
 
+/* The parsed vocabulary, kept for the process: a batch of prompts would
+ * otherwise re-read tokenizer.json (~0.15 s) for every one. */
+static bpe_vocab *q21_vocab(const char *tokenizer_json) {
+    static bpe_vocab *vocab;
+    static char loaded[2048];
+    if (vocab && !strcmp(loaded, tokenizer_json)) return vocab;
+    if (vocab) bpe_vocab_free(vocab);
+    vocab = q21_bpe_load_json(tokenizer_json);
+    snprintf(loaded, sizeof(loaded), "%s", vocab ? tokenizer_json : "");
+    return vocab;
+}
+
 static int q21_build_prompt_tokens(const char *tokenizer_json, const char *prompt,
                                    int32_t *tokens, int capacity, int *drop_prefix) {
     static const char system[] = "Comprehend and analyze the provided prompt.";
-    bpe_vocab *v = q21_bpe_load_json(tokenizer_json);
+    bpe_vocab *v = q21_vocab(tokenizer_json);
     if (!v) return -1;
     size_t needed = strlen(system) + strlen(prompt) + 160;
     char *text = (char *)malloc(needed);
-    if (!text) { bpe_vocab_free(v); return -1; }
+    if (!text) return -1;
     snprintf(text, needed,
              "<|im_start|>system\n%s<|im_end|>\n"
              "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n",
@@ -83,7 +95,6 @@ static int q21_build_prompt_tokens(const char *tokenizer_json, const char *promp
     snprintf(text, needed, "<|im_start|>system\n%s<|im_end|>\n", system);
     int drop = bpe_tokenize(v, text, -1, NULL, 0);
     free(text);
-    bpe_vocab_free(v);
     if (n < 0 || n > capacity || drop < 0 || drop > n) return -1;
     *drop_prefix = drop;
     return n;
@@ -95,11 +106,11 @@ static int q21_build_multimodal_prompt_tokens(const char *tokenizer_json,
                                                int *drop_prefix, int *image_start) {
     static const char system[] = "Comprehend and analyze the provided prompt.";
     if (image_tokens <= 0 || capacity <= image_tokens + 8) return -1;
-    bpe_vocab *v = q21_bpe_load_json(tokenizer_json);
+    bpe_vocab *v = q21_vocab(tokenizer_json);
     if (!v) return -1;
     size_t needed = strlen(system) + strlen(prompt) + 192;
     char *text = (char *)malloc(needed);
-    if (!text) { bpe_vocab_free(v); return -1; }
+    if (!text) return -1;
     snprintf(text, needed,
              "<|im_start|>system\n%s<|im_end|>\n"
              "<|im_start|>user\n<image1>", system);
@@ -117,12 +128,10 @@ static int q21_build_multimodal_prompt_tokens(const char *tokenizer_json,
     if (suffix < 0 || n + suffix > capacity) goto fail;
     n += suffix;
     free(text);
-    bpe_vocab_free(v);
     *drop_prefix = drop;
     return n;
 fail:
     free(text);
-    bpe_vocab_free(v);
     return -1;
 }
 #endif

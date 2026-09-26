@@ -104,11 +104,12 @@ class NativeBackend:
     name = "native"
     max_references = 1
     OPTIONS = ("model", "preset", "attention", "condition_resolution", "cache_dir", "keep_work",
-               "resident_socket", "resident_vae_socket", "python", "resident")
+               "resident_socket", "resident_vae_socket", "python", "resident", "exact_prompts")
 
     def __init__(self, model=DEFAULT_MODEL, preset: str | None = "fast12", attention: str | None = None,
                  condition_resolution: int = 1024, cache_dir=None, keep_work: bool = False,
-                 resident_socket=None, resident_vae_socket=None, python=None, resident: bool = True):
+                 resident_socket=None, resident_vae_socket=None, python=None, resident: bool = True,
+                 exact_prompts: bool = False):
         if preset is not None and preset not in PRESET_WEIGHTS:
             raise BackendError(f"preset must be one of {', '.join(PRESET_WEIGHTS)}, got {preset!r}")
         if attention is not None and attention not in ATTENTION:
@@ -123,6 +124,12 @@ class NativeBackend:
         self.resident_socket, self.resident_vae_socket = resident_socket, resident_vae_socket
         self.python = str(python or sys.executable)
         self.resident = resident and preset is not None
+        # Image prompts share their system + image prefix, computed once per
+        # text-encoder pass (--share-prompt-prefix): a view prompt's
+        # embeddings then depend on it alone, and a dataset's prompts encode
+        # about 2.4x faster. exact_prompts keeps the unsplit, PyTorch-exact
+        # encode (1 - cos ~ 4e-5 apart).
+        self.exact_prompts = exact_prompts
         self._home = ROOT / "tmp" / f"qimg21-i23d-{os.getpid()}"
         self._fast = _Resident(self._home, "fast", "fast: serving ")
         self._vae = _Resident(self._home, "vae", "qimg21-vae: serving")
@@ -257,6 +264,8 @@ class NativeBackend:
             listing.write_text(json.dumps(batch))
             cmd += ["--prompt-batch", str(listing)]
         if request.references:
+            if not self.exact_prompts:
+                cmd += ["--share-prompt-prefix"]
             cmd += ["--image", str(Path(request.references[0]).resolve()),
                     "--condition-resolution", str(self.fit_condition_resolution(request.references[0])),
                     "--condition-cache", str(self.cache_dir)]
