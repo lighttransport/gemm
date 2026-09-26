@@ -163,6 +163,9 @@ extern "C" __global__ void qwen35_matvec_iq2xxs(
     int blocks = cols / 256;
     const unsigned char *w = weights + (size_t)row * blocks * 66;
     float sum = 0.0f;
+    /* Unrolled so four sub-blocks of loads are in flight (same per-lane
+     * arithmetic order; ~10% on the 17408x5120 decode shape). */
+#pragma unroll 4
     for (int qb = lane; qb < blocks * 8; qb += 32) {
         int b = qb / 8, ib = qb & 7;
         const unsigned char *p = w + b * 66;
