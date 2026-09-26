@@ -45,6 +45,31 @@ __device__ __forceinline__ bf16_raw f32_to_bf16(float f) {
     return (bf16_raw)(rounded >> 16);
 }
 
+/* Decode-path helpers.  bf16_rne_hi(v) holds f32_to_bf16(v) in its high half;
+ * pack2 joins two of those with one v_perm.  flip_if(x, bit) negates x when
+ * bit is 1 (adding 1<<31 flips the sign bit).  (x*g)*(-1) == (-x)*g exactly
+ * under round-to-nearest-even, so moving the sign onto the scale keeps the
+ * decoded BF16 bit-identical to dequant_*_to_bf16. */
+__device__ __forceinline__ unsigned int bf16_rne_hi(float f) {
+    unsigned int u = __float_as_uint(f);
+    return u + ((u >> 16) & 1u) + 0x7FFFu;
+}
+__device__ __forceinline__ unsigned int pack2(unsigned int lo_hi, unsigned int hi_hi) {
+    return __builtin_amdgcn_perm(hi_hi, lo_hi, 0x07060302u);
+}
+__device__ __forceinline__ float flip_if(float x, unsigned int bit) {
+    return __uint_as_float(__float_as_uint(x) + (bit << 31));
+}
+typedef unsigned int u32x4 __attribute__((ext_vector_type(4)));
+__device__ __forceinline__ u16x8 pack8(const float v[8]) {
+    u32x4 w;
+    w[0] = pack2(bf16_rne_hi(v[0]), bf16_rne_hi(v[1]));
+    w[1] = pack2(bf16_rne_hi(v[2]), bf16_rne_hi(v[3]));
+    w[2] = pack2(bf16_rne_hi(v[4]), bf16_rne_hi(v[5]));
+    w[3] = pack2(bf16_rne_hi(v[6]), bf16_rne_hi(v[7]));
+    return __builtin_bit_cast(u16x8, w);
+}
+
 /* ---- llama.cpp IQ tables (ggml authors, MIT; see reference_sampler.cpp) ---- */
 __device__ static const unsigned long long gw_iq2xxs_grid[256] = {
 #include "qwen35_iq2xxs_grid.inc"
@@ -89,15 +114,27 @@ __device__ __forceinline__ unsigned int ld32_a2(const unsigned char *p) {
  * Quantized formats: superblock k/256, sub-block c = (k/32)%8, group of 8
  * g = (k/8)%4 inside the sub-block. */
 struct Raw { unsigned int w[4]; };
+/* Table values fetched by lookup(); split from finish() so the kernel can
+ * issue the (dependent, cached) table loads a pipeline stage early. */
+struct Aux { unsigned int a[3]; };
+#define GW_DECODE_FROM_PARTS                                                   \
+    __device__ static u16x8 decode(const Raw &r, int k) {                      \
+        return finish(r, lookup(r, k), k);                                     \
+    }
+#define GW_NO_LOOKUP                                                           \
+    __device__ static Aux lookup(const Raw &, int) { Aux x; x.a[0] = x.a[1] = x.a[2] = 0; return x; }
 
 struct LdDense {
+    static constexpr bool kDeep = false;
     __device__ static size_t row_bytes(int K) { return (size_t)K * 2; }
     __device__ static Raw load(const unsigned char *row, int k) {
         return __builtin_bit_cast(Raw, *(const u16x8 *)(row + (size_t)k * 2));
     }
-    __device__ static u16x8 decode(const Raw &r, int) {
+    GW_NO_LOOKUP
+    __device__ static u16x8 finish(const Raw &r, const Aux &, int) {
         return __builtin_bit_cast(u16x8, r);
     }
+    GW_DECODE_FROM_PARTS
 };
 
 #define QPOS const int c = (k >> 5) & 7, g = (k >> 3) & 3; (void)c; (void)g
@@ -106,6 +143,7 @@ struct LdDense {
 /* IQ2_XXS, 66 B: d | qs[32] u16.  Sub-block c: aux0 = qs[4c..4c+1] (grid
  * indices), aux1 = qs[4c+2..4c+3] (signs + scale). */
 struct LdIQ2XXS {
+    static constexpr bool kDeep = true;
     __device__ static size_t row_bytes(int K) { return (size_t)(K / 256) * 66; }
     __device__ static Raw load(const unsigned char *row, int k) {
         QPOS; QBP(66);
@@ -116,26 +154,35 @@ struct LdIQ2XXS {
         r.w[2] = ld32_a2(qs + 4);
         return r;
     }
-    __device__ static u16x8 decode(const Raw &r, int k) {
+    __device__ static Aux lookup(const Raw &r, int k) {
+        QPOS;
+        unsigned int idx = (g & 1) ? (r.w[1] >> 8) & 255 : r.w[1] & 255;
+        unsigned long long grid = gw_iq2xxs_grid[idx];
+        Aux x;
+        x.a[0] = (unsigned int)grid; x.a[1] = (unsigned int)(grid >> 32);
+        x.a[2] = gw_ksigns_iq2xs[(r.w[2] >> (7 * g)) & 127];
+        return x;
+    }
+    GW_DECODE_FROM_PARTS
+    __device__ static u16x8 finish(const Raw &r, const Aux &x, int k) {
         QPOS;
         float d = half_to_float((half_raw)r.w[0]);
         unsigned int aux1 = r.w[2];
         float db = d * (0.5f + (float)(aux1 >> 28)) * 0.25f;
-        unsigned int idx = (g & 1) ? (r.w[1] >> 8) & 255 : r.w[1] & 255;
-        unsigned long long grid = gw_iq2xxs_grid[idx];
-        unsigned char signs = gw_ksigns_iq2xs[(aux1 >> (7 * g)) & 127];
-        u16x8 o;
+        unsigned long long grid = (unsigned long long)x.a[0] | ((unsigned long long)x.a[1] << 32);
+        unsigned char signs = (unsigned char)x.a[2];
+        float v[8];
 #pragma unroll
         for (int j = 0; j < 8; j++) {
-            float val = db * (float)(unsigned char)(grid >> (8 * j)) * ((signs & (1 << j)) ? -1.0f : 1.0f);
-            o[j] = f32_to_bf16(val);
+            v[j] = flip_if(db, (signs >> j) & 1u) * (float)(unsigned char)(grid >> (8 * j));
         }
-        return o;
+        return pack8(v);
     }
 };
 
 /* IQ2_XS, 74 B: d | qs[32] u16 (9-bit grid + 7-bit sign) | scales[8]. */
 struct LdIQ2XS {
+    static constexpr bool kDeep = true;
     __device__ static size_t row_bytes(int K) { return (size_t)(K / 256) * 74; }
     __device__ static Raw load(const unsigned char *row, int k) {
         QPOS; QBP(74);
@@ -145,28 +192,36 @@ struct LdIQ2XS {
         r.w[2] = bp[66 + c];
         return r;
     }
-    __device__ static u16x8 decode(const Raw &r, int k) {
+    __device__ static Aux lookup(const Raw &r, int) {
+        unsigned int qval = r.w[1];
+        unsigned long long grid = gw_iq2xs_grid[qval & 511];
+        Aux x;
+        x.a[0] = (unsigned int)grid; x.a[1] = (unsigned int)(grid >> 32);
+        x.a[2] = gw_ksigns_iq2xs[qval >> 9];
+        return x;
+    }
+    GW_DECODE_FROM_PARTS
+    __device__ static u16x8 finish(const Raw &r, const Aux &x, int k) {
         QPOS;
         float d = half_to_float((half_raw)r.w[0]);
         unsigned int sc = r.w[2];
         float dl = (g < 2)
             ? d * (0.5f + (float)(sc & 0xf)) * 0.25f
             : d * (0.5f + (float)(sc >>  4)) * 0.25f;
-        unsigned int qval = r.w[1];
-        unsigned long long grid = gw_iq2xs_grid[qval & 511];
-        unsigned char signs = gw_ksigns_iq2xs[qval >> 9];
-        u16x8 o;
+        unsigned long long grid = (unsigned long long)x.a[0] | ((unsigned long long)x.a[1] << 32);
+        unsigned char signs = (unsigned char)x.a[2];
+        float v[8];
 #pragma unroll
         for (int j = 0; j < 8; j++) {
-            float val = dl * (float)(unsigned char)(grid >> (8 * j)) * ((signs & (1 << j)) ? -1.0f : 1.0f);
-            o[j] = f32_to_bf16(val);
+            v[j] = flip_if(dl, (signs >> j) & 1u) * (float)(unsigned char)(grid >> (8 * j));
         }
-        return o;
+        return pack8(v);
     }
 };
 
 /* IQ2_S, 82 B: d | qs[32] | signs[32] | qh[8] | scales[8]. */
 struct LdIQ2S {
+    static constexpr bool kDeep = true;
     __device__ static size_t row_bytes(int K) { return (size_t)(K / 256) * 82; }
     __device__ static Raw load(const unsigned char *row, int k) {
         QPOS; QBP(82);
@@ -177,29 +232,37 @@ struct LdIQ2S {
         r.w[3] = (unsigned int)bp[66 + c] | ((unsigned int)bp[74 + c] << 8);
         return r;
     }
-    __device__ static u16x8 decode(const Raw &r, int k) {
+    __device__ static Aux lookup(const Raw &r, int k) {
+        QPOS;
+        unsigned char qh = (unsigned char)(r.w[3] & 255);
+        int grid_idx = (int)r.w[1] | ((qh << (8 - 2 * g)) & 0x300);
+        unsigned long long grid = gw_iq2s_grid[grid_idx];
+        Aux x;
+        x.a[0] = (unsigned int)grid; x.a[1] = (unsigned int)(grid >> 32); x.a[2] = 0;
+        return x;
+    }
+    GW_DECODE_FROM_PARTS
+    __device__ static u16x8 finish(const Raw &r, const Aux &x, int k) {
         QPOS;
         float d = half_to_float((half_raw)r.w[0]);
         unsigned int sc = r.w[3] >> 8;
-        unsigned char qh = (unsigned char)(r.w[3] & 255);
         float dl = (g < 2)
             ? d * (0.5f + (float)(sc & 0xf)) * 0.25f
             : d * (0.5f + (float)(sc >>  4)) * 0.25f;
-        int grid_idx = (int)r.w[1] | ((qh << (8 - 2 * g)) & 0x300);
-        unsigned long long grid = gw_iq2s_grid[grid_idx];
+        unsigned long long grid = (unsigned long long)x.a[0] | ((unsigned long long)x.a[1] << 32);
         unsigned char s = (unsigned char)r.w[2];
-        u16x8 o;
+        float v[8];
 #pragma unroll
         for (int j = 0; j < 8; j++) {
-            float val = dl * (float)(unsigned char)(grid >> (8 * j)) * ((s & (1 << j)) ? -1.0f : 1.0f);
-            o[j] = f32_to_bf16(val);
+            v[j] = flip_if(dl, (s >> j) & 1u) * (float)(unsigned char)(grid >> (8 * j));
         }
-        return o;
+        return pack8(v);
     }
 };
 
 /* IQ3_XXS, 98 B: d | qs[64] | scales_and_signs[8] u32. */
 struct LdIQ3XXS {
+    static constexpr bool kDeep = true;
     __device__ static size_t row_bytes(int K) { return (size_t)(K / 256) * 98; }
     __device__ static Raw load(const unsigned char *row, int k) {
         QPOS; QBP(98);
@@ -209,28 +272,37 @@ struct LdIQ3XXS {
         r.w[2] = ld32_a2(bp + 66 + 4 * c);
         return r;
     }
-    __device__ static u16x8 decode(const Raw &r, int k) {
+    __device__ static Aux lookup(const Raw &r, int k) {
+        QPOS;
+        Aux x;
+        x.a[0] = gw_iq3xxs_grid[r.w[1] & 255];
+        x.a[1] = gw_iq3xxs_grid[(r.w[1] >> 8) & 255];
+        x.a[2] = gw_ksigns_iq2xs[(r.w[2] >> (7 * g)) & 127];
+        return x;
+    }
+    GW_DECODE_FROM_PARTS
+    __device__ static u16x8 finish(const Raw &r, const Aux &x, int k) {
         QPOS;
         float d = half_to_float((half_raw)r.w[0]);
         unsigned int aux32 = r.w[2];
         float db = d * (0.5f + (float)(aux32 >> 28)) * 0.5f;
-        unsigned char signs = gw_ksigns_iq2xs[(aux32 >> (7 * g)) & 127];
-        unsigned int g1 = gw_iq3xxs_grid[r.w[1] & 255];
-        unsigned int g2 = gw_iq3xxs_grid[(r.w[1] >> 8) & 255];
-        u16x8 o;
+        unsigned char signs = (unsigned char)x.a[2];
+        unsigned int g1 = x.a[0];
+        unsigned int g2 = x.a[1];
+        float v[8];
 #pragma unroll
         for (int t = 0; t < 8; t++) {
             unsigned int grid = t >= 4 ? g2 : g1;
             int j = t & 3;
-            float val = db * (float)(unsigned char)(grid >> (8 * j)) * ((signs & (1 << t)) ? -1.0f : 1.0f);
-            o[t] = f32_to_bf16(val);
+            v[t] = flip_if(db, (signs >> t) & 1u) * (float)(unsigned char)(grid >> (8 * j));
         }
-        return o;
+        return pack8(v);
     }
 };
 
 /* IQ3_S, 110 B: d | qs[64] | qh[8] | signs[32] | scales[4]. */
 struct LdIQ3S {
+    static constexpr bool kDeep = true;
     __device__ static size_t row_bytes(int K) { return (size_t)(K / 256) * 110; }
     __device__ static Raw load(const unsigned char *row, int k) {
         QPOS; QBP(110);
@@ -241,33 +313,40 @@ struct LdIQ3S {
         r.w[3] = bp[106 + (c >> 1)];
         return r;
     }
-    __device__ static u16x8 decode(const Raw &r, int k) {
+    __device__ static Aux lookup(const Raw &r, int k) {
+        QPOS;
+        int qh = (int)(r.w[2] & 255);
+        int i1 = (int)(r.w[1] & 255) | ((qh << (8 - 2 * g)) & 256);
+        int i2 = (int)((r.w[1] >> 8) & 255) | ((qh << (7 - 2 * g)) & 256);
+        Aux x;
+        x.a[0] = gw_iq3s_grid[i1]; x.a[1] = gw_iq3s_grid[i2]; x.a[2] = 0;
+        return x;
+    }
+    GW_DECODE_FROM_PARTS
+    __device__ static u16x8 finish(const Raw &r, const Aux &x, int k) {
         QPOS;
         float d = half_to_float((half_raw)r.w[0]);
         int scale_b = (int)r.w[3];
         float db = ((c & 1) == 0)
             ? d * (float)(1 + 2 * (scale_b & 0xf))
             : d * (float)(1 + 2 * (scale_b >> 4));
-        int qh = (int)(r.w[2] & 255);
         unsigned char s = (unsigned char)(r.w[2] >> 8);
-        int i1 = (int)(r.w[1] & 255) | ((qh << (8 - 2 * g)) & 256);
-        int i2 = (int)((r.w[1] >> 8) & 255) | ((qh << (7 - 2 * g)) & 256);
-        unsigned int g1 = gw_iq3s_grid[i1];
-        unsigned int g2 = gw_iq3s_grid[i2];
-        u16x8 o;
+        unsigned int g1 = x.a[0];
+        unsigned int g2 = x.a[1];
+        float v[8];
 #pragma unroll
         for (int t = 0; t < 8; t++) {
             unsigned int grid = t >= 4 ? g2 : g1;
             int j4 = t & 3;
-            float val = db * (float)(unsigned char)(grid >> (8 * j4)) * ((s & (1 << t)) ? -1.0f : 1.0f);
-            o[t] = f32_to_bf16(val);
+            v[t] = flip_if(db, (s >> t) & 1u) * (float)(unsigned char)(grid >> (8 * j4));
         }
-        return o;
+        return pack8(v);
     }
 };
 
 /* IQ1_S, 50 B: d | qs[32] | qh[8] u16. */
 struct LdIQ1S {
+    static constexpr bool kDeep = true;
     __device__ static size_t row_bytes(int K) { return (size_t)(K / 256) * 50; }
     __device__ static Raw load(const unsigned char *row, int k) {
         QPOS; QBP(50);
@@ -277,27 +356,35 @@ struct LdIQ1S {
         r.w[2] = ld16(bp + 34 + 2 * c);
         return r;
     }
-    __device__ static u16x8 decode(const Raw &r, int k) {
+    __device__ static Aux lookup(const Raw &r, int k) {
+        QPOS;
+        int grid_idx = (int)r.w[1] | (((r.w[2] >> (3 * g)) & 7) << 8);
+        unsigned long long grid = gw_iq1s_grid[grid_idx];
+        Aux x;
+        x.a[0] = (unsigned int)grid; x.a[1] = (unsigned int)(grid >> 32); x.a[2] = 0;
+        return x;
+    }
+    GW_DECODE_FROM_PARTS
+    __device__ static u16x8 finish(const Raw &r, const Aux &x, int k) {
         QPOS;
         float d = half_to_float((half_raw)r.w[0]);
         const float IQ1S_DELTA = 0.125f;
         unsigned int qh = r.w[2];
         float dl  = d * (float)(2 * ((qh >> 12) & 7) + 1);
         float delta = (qh & 0x8000) ? -IQ1S_DELTA : IQ1S_DELTA;
-        int grid_idx = (int)r.w[1] | (((qh >> (3 * g)) & 7) << 8);
-        unsigned long long grid = gw_iq1s_grid[grid_idx];
-        u16x8 o;
+        unsigned long long grid = (unsigned long long)x.a[0] | ((unsigned long long)x.a[1] << 32);
+        float v[8];
 #pragma unroll
         for (int j = 0; j < 8; j++) {
-            float val = dl * ((float)(signed char)(grid >> (8 * j)) + delta);
-            o[j] = f32_to_bf16(val);
+            v[j] = dl * ((float)(signed char)(grid >> (8 * j)) + delta);
         }
-        return o;
+        return pack8(v);
     }
 };
 
 /* IQ1_M, 56 B: qs[32] | qh[16] | scales[4] u16 (d packed in the top nibbles). */
 struct LdIQ1M {
+    static constexpr bool kDeep = true;
     __device__ static size_t row_bytes(int K) { return (size_t)(K / 256) * 56; }
     __device__ static Raw load(const unsigned char *row, int k) {
         QPOS; QBP(56);
@@ -307,7 +394,18 @@ struct LdIQ1M {
         r.w[2] = (unsigned int)bp[4 * c + g] | ((unsigned int)bp[32 + 2 * c + (g >> 1)] << 8);
         return r;
     }
-    __device__ static u16x8 decode(const Raw &r, int k) {
+    __device__ static Aux lookup(const Raw &r, int k) {
+        QPOS;
+        unsigned char hv = (unsigned char)(r.w[2] >> 8);
+        int qshift = (g & 1) ? 4 : 8;
+        unsigned short idx = (unsigned short)(r.w[2] & 255) | ((unsigned short)(hv << qshift) & 0x700u);
+        unsigned long long grid = gw_iq1s_grid[idx];
+        Aux x;
+        x.a[0] = (unsigned int)grid; x.a[1] = (unsigned int)(grid >> 32); x.a[2] = 0;
+        return x;
+    }
+    GW_DECODE_FROM_PARTS
+    __device__ static u16x8 finish(const Raw &r, const Aux &x, int k) {
         QPOS;
         unsigned short sc0 = (unsigned short)(r.w[0] & 0xffff), sc1 = (unsigned short)(r.w[0] >> 16);
         unsigned short sc2 = (unsigned short)(r.w[1] & 0xffff), sc3 = (unsigned short)(r.w[1] >> 16);
@@ -318,22 +416,20 @@ struct LdIQ1M {
         int shift = 6 * (c % 2) + (g >= 2 ? 3 : 0);
         float dl = d * (float)(2 * ((sw >> shift) & 7) + 1);
         unsigned char hv = (unsigned char)(r.w[2] >> 8);
-        int qshift = (g & 1) ? 4 : 8;
-        unsigned short idx = (unsigned short)(r.w[2] & 255) | ((unsigned short)(hv << qshift) & 0x700u);
         float delta = (hv & ((g & 1) ? 0x80 : 0x08)) ? -0.125f : 0.125f;
-        unsigned long long grid = gw_iq1s_grid[idx];
-        u16x8 o;
+        unsigned long long grid = (unsigned long long)x.a[0] | ((unsigned long long)x.a[1] << 32);
+        float v[8];
 #pragma unroll
         for (int j = 0; j < 8; j++) {
-            float val = dl * ((float)(signed char)(grid >> (8 * j)) + delta);
-            o[j] = f32_to_bf16(val);
+            v[j] = dl * ((float)(signed char)(grid >> (8 * j)) + delta);
         }
-        return o;
+        return pack8(v);
     }
 };
 
 /* IQ4_XS, 136 B: d | scales_h u16 | scales_l[4] | qs[128]. */
 struct LdIQ4XS {
+    static constexpr bool kDeep = true;
     __device__ static size_t row_bytes(int K) { return (size_t)(K / 256) * 136; }
     __device__ static Raw load(const unsigned char *row, int k) {
         QPOS; QBP(136);
@@ -345,7 +441,9 @@ struct LdIQ4XS {
         r.w[3] = ld32(q + 4);
         return r;
     }
-    __device__ static u16x8 decode(const Raw &r, int k) {
+    GW_NO_LOOKUP
+    GW_DECODE_FROM_PARTS
+    __device__ static u16x8 finish(const Raw &r, const Aux &, int k) {
         QPOS;
         float d = half_to_float((half_raw)(r.w[0] & 0xffff));
         unsigned short scales_h = (unsigned short)(r.w[0] >> 16);
@@ -353,20 +451,20 @@ struct LdIQ4XS {
                  (((scales_h >> (2 * c)) & 3) << 4);
         float dl = d * (float)(ls - 32);
         int hi = g >> 1;
-        u16x8 o;
+        float v[8];
 #pragma unroll
         for (int j = 0; j < 8; j++) {
             unsigned int byte = ((j < 4 ? r.w[2] : r.w[3]) >> (8 * (j & 3))) & 255;
             int q = hi ? (int)(byte >> 4) : (int)(byte & 0xf);
-            float val = dl * (float)gw_kvalues_iq4nl[q];
-            o[j] = f32_to_bf16(val);
+            v[j] = dl * (float)gw_kvalues_iq4nl[q];
         }
-        return o;
+        return pack8(v);
     }
 };
 
 /* Q2_K, 84 B: scales[16] | qs[64] | d | dmin.  Sub-block c = n0*4 + j. */
 struct LdQ2K {
+    static constexpr bool kDeep = true;
     __device__ static size_t row_bytes(int K) { return (size_t)(K / 256) * 84; }
     __device__ static Raw load(const unsigned char *row, int k) {
         QPOS; QBP(84);
@@ -379,7 +477,9 @@ struct LdQ2K {
         r.w[3] = ld32(q + 4);
         return r;
     }
-    __device__ static u16x8 decode(const Raw &r, int k) {
+    GW_NO_LOOKUP
+    GW_DECODE_FROM_PARTS
+    __device__ static u16x8 finish(const Raw &r, const Aux &, int k) {
         QPOS;
         float d = half_to_float((half_raw)(r.w[0] & 0xffff));
         float dmin = half_to_float((half_raw)(r.w[0] >> 16));
@@ -387,14 +487,13 @@ struct LdQ2K {
         float dl = d * (float)(sc & 0xF);
         float ml = dmin * (float)(sc >> 4);
         const int shift = (c & 3) * 2;
-        u16x8 o;
+        float v[8];
 #pragma unroll
         for (int j = 0; j < 8; j++) {
             unsigned int qb = ((j < 4 ? r.w[2] : r.w[3]) >> (8 * (j & 3))) & 255;
-            float val = dl * (float)((qb >> shift) & 3) - ml;
-            o[j] = f32_to_bf16(val);
+            v[j] = dl * (float)((qb >> shift) & 3) - ml;
         }
-        return o;
+        return pack8(v);
     }
 };
 
@@ -490,17 +589,36 @@ __device__ __forceinline__ void gemm_wmma_body(
         for (int i = 0; i < AV; i++) smA[sa[i]] = pa[i][0];
 #pragma unroll
         for (int i = 0; i < BV; i++) smB[sb[i]] = LB::decode(LB::load(pb[i], kb[i]), kb[i]);
+        /* Quantized W (kDeep): raw bytes are fetched two K steps ahead and the
+         * grid-table lookups for the next step are issued before the WMMAs, so
+         * neither latency is exposed at the LDS store (all waves of the CTA
+         * reach that point together).  Dense W prefetches one step ahead. */
+        if (LB::kDeep && nk > 1) {
+#pragma unroll
+            for (int i = 0; i < BV; i++) rb[i] = LB::load(pb[i], kb[i] + 32);
+        }
         __syncthreads();
 
         int buf = 0;
         for (int kt = 0; kt < nk; kt++) {
             const int has_next = kt + 1 < nk;
             const int kn = (kt + 1) * 32;
+            Aux ab[BV];
+            Raw rb2[BV];
             if (has_next) {
 #pragma unroll
                 for (int i = 0; i < AV; i++) ra[i] = pa[i][(kt + 1) * 4];
+                if (LB::kDeep) {
 #pragma unroll
-                for (int i = 0; i < BV; i++) rb[i] = LB::load(pb[i], kb[i] + kn);
+                    for (int i = 0; i < BV; i++) ab[i] = LB::lookup(rb[i], kb[i] + kn);
+                    if (kt + 2 < nk) {
+#pragma unroll
+                        for (int i = 0; i < BV; i++) rb2[i] = LB::load(pb[i], kb[i] + kn + 32);
+                    }
+                } else {
+#pragma unroll
+                    for (int i = 0; i < BV; i++) rb[i] = LB::load(pb[i], kb[i] + kn);
+                }
             }
             const u16x8 *cA = smA + buf * 4 * BM;
             const u16x8 *cB = smB + buf * 4 * BN;
@@ -523,8 +641,15 @@ __device__ __forceinline__ void gemm_wmma_body(
                 u16x8 *nB = smB + (buf ^ 1) * 4 * BN;
 #pragma unroll
                 for (int i = 0; i < AV; i++) nA[sa[i]] = ra[i];
+                if (LB::kDeep) {
 #pragma unroll
-                for (int i = 0; i < BV; i++) nB[sb[i]] = LB::decode(rb[i], kb[i] + kn);
+                    for (int i = 0; i < BV; i++) nB[sb[i]] = LB::finish(rb[i], ab[i], kb[i] + kn);
+#pragma unroll
+                    for (int i = 0; i < BV; i++) rb[i] = rb2[i];
+                } else {
+#pragma unroll
+                    for (int i = 0; i < BV; i++) nB[sb[i]] = LB::decode(rb[i], kb[i] + kn);
+                }
                 buf ^= 1;
             }
             __syncthreads();
