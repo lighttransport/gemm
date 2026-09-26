@@ -664,6 +664,41 @@ void qwen35_attention_q8_decode_gqa3_reuse(float *out, float *parts,
     }
     int padded = (length + 255) / 256 * 256;
     for (int base = split * 128; base < padded; base += splits * 128) {
+        /* Issue the chunk's K rows (both pairs) and the first 16 V rows
+         * before any math; rows past the causal end load a clamped valid row
+         * and are masked exactly as before (dot -> -inf, V -> 0). */
+        int key_words[2][32];
+        q8_half key_scales[2][8];
+        #pragma unroll
+        for (int pair = 0; pair < 2; ++pair) {
+            int row = base + warp * 32 + (lane & ~1) + pair;
+            int crow = row < length ? row : length - 1;
+            const int *key = (const int *)(kc + (size_t)crow * stride + kh * 256);
+            const q8_half *key_scale = ks + (size_t)crow * scale_stride + kh * 8;
+            #pragma unroll
+            for (int g = 0; g < 8; ++g) key_scales[pair][g] = key_scale[g];
+            #pragma unroll
+            for (int g = 0; g < 8; ++g)
+                #pragma unroll
+                for (int j = 0; j < 4; ++j)
+                    key_words[pair][4 * g + j] = key[8 * g + 2 * j + lane % 2];
+        }
+        unsigned int value_words[2][16][2];
+        q8_half value_scales[2][16][2];
+        #pragma unroll
+        for (int col = 0; col < 16; ++col) {
+            int row = base + warp * 32 + col;
+            int crow = row < length ? row : length - 1;
+            #pragma unroll
+            for (int tile = 0; tile < 2; ++tile) {
+                int dim = tile * 128 + lane * 4;
+                value_words[0][col][tile] = *(const unsigned int *)(vc +
+                    (size_t)crow * stride + kh * 256 + dim);
+                value_scales[0][col][tile] =
+                    vs[(size_t)crow * scale_stride + kh * 8 + dim / 32];
+            }
+        }
+        __builtin_amdgcn_sched_barrier(0);
         float score[3] = {};
         float next_max[3];
         #pragma unroll
@@ -673,20 +708,16 @@ void qwen35_attention_q8_decode_gqa3_reuse(float *out, float *parts,
             int row = base + warp * 32 + (lane & ~1) + pair;
             float dot[3] = {};
             if (row < length) {
-                const int *key = (const int *)(kc +
-                    (size_t)row * stride + kh * 256);
-                const q8_half *key_scale = ks +
-                    (size_t)row * scale_stride + kh * 8;
                 #pragma unroll
                 for (int g = 0; g < 8; ++g) {
                     float scale[3];
                     #pragma unroll
                     for (int h = 0; h < 3; ++h)
-                        scale[h] = key_scale[g] * qd[h][g];
+                        scale[h] = key_scales[pair][g] * qd[h][g];
                     #pragma unroll
                     for (int j = 0; j < 4; ++j) {
                         int word = 8 * g + 2 * j + lane % 2;
-                        int key_word = key[word];
+                        int key_word = key_words[pair][4 * g + j];
                         #pragma unroll
                         for (int h = 0; h < 3; ++h) {
                             int product = __builtin_amdgcn_sudot4(
@@ -720,6 +751,20 @@ void qwen35_attention_q8_decode_gqa3_reuse(float *out, float *parts,
             for (int i = 0; i < 4; ++i)
                 acc[h][i] = q8_hmul(acc[h][i], rescale_h);
         }
+        /* Second half of the V rows, in flight during the first half's math. */
+        #pragma unroll
+        for (int col = 0; col < 16; ++col) {
+            int row = base + warp * 32 + 16 + col;
+            int crow = row < length ? row : length - 1;
+            #pragma unroll
+            for (int tile = 0; tile < 2; ++tile) {
+                int dim = tile * 128 + lane * 4;
+                value_words[1][col][tile] = *(const unsigned int *)(vc +
+                    (size_t)crow * stride + kh * 256 + dim);
+                value_scales[1][col][tile] =
+                    vs[(size_t)crow * scale_stride + kh * 8 + dim / 32];
+            }
+        }
         __builtin_amdgcn_wave_barrier();
         #pragma unroll
         for (int col = 0; col < 32; ++col) {
@@ -731,14 +776,10 @@ void qwen35_attention_q8_decode_gqa3_reuse(float *out, float *parts,
                     probabilities[h][warp * 32 + col]);
             #pragma unroll
             for (int tile = 0; tile < 2; ++tile) {
-                int dim = tile * 128 + lane * 4;
                 q8_half2 v0 = {}, v1 = {};
                 if (row < length) {
-                    const signed char *value = vc +
-                        (size_t)row * stride + kh * 256 + dim;
-                    unsigned int packed = *(const unsigned int *)value;
-                    q8_half2 d = q8_hsplat(vs[
-                        (size_t)row * scale_stride + kh * 8 + dim / 32]);
+                    unsigned int packed = value_words[col >> 4][col & 15][tile];
+                    q8_half2 d = q8_hsplat(value_scales[col >> 4][col & 15][tile]);
                     v0 = q8_hmul(d, q8_hpair((signed char)packed,
                         (signed char)(packed >> 8)));
                     v1 = q8_hmul(d, q8_hpair((signed char)(packed >> 16),
