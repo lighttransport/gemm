@@ -3347,7 +3347,7 @@ static void usage(const char *p) {
                     "       [--prompt-rotate N] (cyclic token rotation for context isolation checks)\n"
                     "       [--kv-i8] (per-token-scaled INT8 attention cache, regular decode only)\n"
                     "       [--kv-i6] (per-token-scaled packed INT6 cache, regular decode only)\n"
-                    "       [--prefill-kv-i6] (packed INT6 PP cache; qtile=1, no state export/decode)\n"
+                    "       [--prefill-kv-i6] (packed INT6 PP cache for deep PP12 state export)\n"
                     "       [--prefill-i6-parallel 0|1] (split deep single-query attention across PP workers)\n"
                     "       [--warm-kv-depth N] (synthetic compressed cache fill before measured prompt)\n", p);
 }

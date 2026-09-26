@@ -86,7 +86,12 @@ FP32-prefill/INT6-export state on the identical prompt, only the first
 generated ID matched; output index 1 was packed-prefill 333 versus
 FP32-prefill 271. Both decoders used INT6 KV, so the discrepancy is caused
 by compressed KV during prefill. Deep packed PP is a capacity and timing
-prototype pending task-quality evaluation.
+prototype pending task-quality evaluation. An optional INT8 PP cache with
+INT6 state export was screened on the same 1,024-token C-source prompt used
+for the FP32 producer check. It reached 330.49 prefill tok/s total and its
+TP4 continuation matched the FP32 producer for only the first two output
+IDs (index 2: 274 versus 18601). It was slower and did not resolve the
+quality issue, so that experiment was removed from the runner.
 
 State format version 2 stores packed K/V rows and FP32 scales with checksums;
 version 1 FP32 state remains available. A 128-token evaluated PP12 state
@@ -134,6 +139,29 @@ the same output hashes. Distinct prompts retain separate checked imports.
 The same clone path passed an eight-slot INT6 run (64 outputs/slot); its extra
 slots copied in about 0.05 s each after a checked first import.
 
+Eight **distinct**, fully evaluated 32,768-token C-source review prompts
+were also processed with FP32 PP12 and handed to the three TP4 groups. The
+prompts differ in their review focus and share the underlying C source.
+Each PP12 prefill ran at 1,065.05–1,072.53 tok/s total
+(88.75–89.38 tok/s/node), taking 30.55–30.77 s of prefill plus
+5.54–5.96 s for state export. Separate process startup brought each
+prefill launch to 67.20–67.78 s wall time. The three TP4 groups imported
+3/3/2 separate snapshots in 129.38/126.89/80.32 s and decoded 256 tokens
+per context at 60.54/61.44/61.23 aggregate tok/s. The 12-rank checker
+passed; all eight output stream hashes were distinct. This checks distinct
+prompt identities and states at 32K; projection work inside a TP4 group
+still runs one context at a time.
+
+Reusing those eight distinct FP32 states for **8,192 output tokens per
+context** passed the 12-rank checker again, with eight distinct stream
+hashes. The 3/3/2 groups sustained **58.05/58.94/59.19 aggregate tok/s**
+over 423.40/417.00/276.81 s of decode. Their separate state imports took
+131.03/129.87/79.05 s. The busiest group therefore completes its three
+8K outputs in about seven minutes after import; the whole run took
+592.80 s including startup and import. This validates long round-robin
+decode for eight distinct 32K contexts, not task quality or the requested
+deep-context shapes.
+
 The capacity planner (`q38d_capacity.py --json`) uses binary token depths,
 the measured 6.02 GiB TP4 baseline, PP12 stage cuts, output reserve, and
 load/scratch headroom. It now recognizes packed PP12 KV and version-2 handoff
@@ -155,6 +183,23 @@ Q38P_ATTN_QTILE=1 Q38P_ATTN_PV_INT16=0` with
 `HANDOFF_KV_I6=1 HANDOFF_TPS=4` with `run_handoff.sh`.
 `HANDOFF_PREFILL_KV_I6=0` selects FP32 PP with compressed export for shorter
 prompts; the default selects packed PP attention.
+
+`run_multictx_handoff_12n.sh NEW_RUN_DIR PROMPT_LIST PROMPT_TOKENS GEN CHUNK`
+evaluates 6–32 distinct prompt files sequentially on PP12, exports one state
+per prompt, and runs their continuations concurrently in three TP4 groups.
+`PROMPT_LIST` has one path per line. The default retains FP32 K/V for the
+32K coding path; `Q38_MULTI_KV_I6=1` selects packed PP K/V and an INT6
+handoff for depths that exceed FP32 HBM capacity. The runner divides contexts
+as evenly as possible across the groups and checks all 12 rank outputs.
+Sequential PP12 prefill is included in its wall time; this runner does not
+fuse model projections across context slots during decode.
+The six-context packed-KV smoke run (two distinct prompts per TP4 group)
+evaluated 1,024 real tokens per prompt at 569.26–580.34 PP12 tok/s total,
+exported version-2 states in 2.07–2.31 s each, then generated 64 tokens
+per context at 85.31/85.90/86.55 aggregate tok/s by group. All 12 ranks
+passed and all six output hashes differed. This validates the runner's
+packed prefill, state-list import, and grouped decode wiring at short depth;
+it does not resolve packed-prefill quality or throughput at 256K–1M.
 
 Six distinct short C-review prompts were then exported in separate PP12
 version-2 states. Three TP4 groups imported two states each, verified every

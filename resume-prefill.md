@@ -918,4 +918,42 @@ reached about 60 aggregate tok/s per TP4 group. For repeated prompt/state
 slots, a checked first import followed by resident state clones reduced
 three-slot state readiness from 93.39 to 38.78 s, with all eight 256-token
 output sequences matching the single-context FP32 reference. INT6 cloning
-also passed eight slots; each extra state copy took about 0.05 s.
+also passed eight slots; each extra state copy took about 0.05 s. An INT8 PP
+cache with INT6 state export was briefly screened on a 1,024-token C-source
+prompt: 330.49 prefill tok/s total, with only two output IDs matching the
+FP32 producer before divergence. It was slower than FP32 prefill and did not
+solve the quality gate; the experimental code was removed.
+
+Eight distinct 32,768-token C-source review prompts were then evaluated
+sequentially on PP12 with FP32 K/V. Each prefill reached 1,065.05–1,072.53
+aggregate tok/s (88.75–89.38 per node) in 30.55–30.77 s of compute; each
+state export took 5.54–5.96 s. The three TP4 groups imported separate states
+for 3/3/2 contexts and generated 256 outputs/context at
+60.54/61.44/61.23 aggregate tok/s. All 12 ranks passed the grouped checker
+and all eight output hashes differed. Separate state imports took
+129.38/126.89/80.32 s per group, much longer than resident cloning of one
+state. `a64fx/llm/q38d/run_multictx_handoff_12n.sh` now automates distinct
+PP12 exports and grouped decode for 6–32 prompt files; packed INT6 PP/KV is
+opt-in for depths above FP32 capacity. Its decode loop remains round-robin,
+without fused model projections across contexts.
+With `Q38_MULTI_KV_I6=1`, six distinct 1,024-token prompts (two per TP4
+group) passed the full PP12 version-2 export and grouped TP4 import/decode
+check. Packed prefill measured 569.26–580.34 tok/s total; the groups
+generated 64 tokens per context at 85.31/85.90/86.55 aggregate tok/s,
+with six distinct hashes and all 12 ranks passing. This is a short-depth
+wiring check, not a deep-context quality result.
+The same eight distinct FP32 states then generated **8,192 tokens per
+context**. All 12 ranks passed, with eight distinct output hashes; the
+3/3/2 groups delivered 58.05/58.94/59.19 aggregate tok/s over
+423.40/417.00/276.81 s of decode. The busiest group's full run took
+592.80 s including model startup and 131.03 s of separate state imports.
+This validates long grouped decode at 32K, not the 256K–1M real-input
+quality/throughput target.
+
+An isolated A64FX INT6 row-unpack microbenchmark compared the current
+scalar code to a NEON deinterleave plus SVE conversion path. Both produced
+identical 256-value rows; the scalar path reached 11.62 million rows/s and
+the NEON/SVE path 7.37 million rows/s on one worker. The slower candidate
+was not integrated. A second 4,096-entry pair lookup plus SVE conversion
+candidate was also exact but slower: 5.38 versus 11.64 million rows/s.
+Neither unpack variant was integrated into production.
