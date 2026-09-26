@@ -37,6 +37,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from server.qwen_image21.app import Demo as QwenImage21Demo
+from server.pixal3d.i23d import Studio as I23DStudio, StudioCancelled
 
 DEFAULT_MODEL_DIR = Path("/mnt/disk2/models/Pixal3D")
 DEFAULT_DINOV3 = Path("/mnt/disk2/models/dinov3-vitl16/model.safetensors")
@@ -510,6 +511,37 @@ class PixalServer:
                 args, "qwen_native_rocm", ROOT / "rdna4/qimg21/test_hip_qimg21_native")),
             python_rocm=Path(getattr(
                 args, "qwen_python_rocm", ROOT / "tmp/qimg21-rocm-venv/bin/python")))
+        # Text/Image -> 3D: Qwen-Image 2.1 (qimg21_i23d) + Pixal3D, with the
+        # same runner binary and weights as the reconstruction tab.
+        def image_model():
+            from qimg21_i23d.native import NativeBackend
+            return NativeBackend(model=self.qwen_image.model, python=self.qwen_image.python)
+        self.i23d = I23DStudio(
+            self.work_dir / "i23d", backend_factory=image_model,
+            native_options={"binary": self.binary, "model_dir": self.model_dir, "dinov3": self.dinov3,
+                            "naf": self.naf},
+            reference_options={"model_dir": self.model_dir})
+
+    def release_gpu(self, keep: str = "") -> None:
+        """Free device memory held by resident processes another kind of job
+        does not use: the Qwen tab's resident denoiser/VAE and PyTorch server,
+        and the Text-to-3D studio's resident image model. Pixal3D plans its
+        memory from what is free, so nothing may linger across job kinds."""
+        if keep != "qwen-image":
+            self.qwen_image.resident.stop()
+            self.qwen_image.reference_server.stop()
+        if keep != "i23d":
+            self.i23d.release()
+
+    def i23d_run(self, request: dict, cancel: threading.Event | None = None, progress=None) -> dict:
+        """One Text/Image -> 3D stage under the CUDA device lock."""
+        device = bounded_integer(request.get("device", 0), "device", 0, 255)
+        with self.execution_lock("cuda", device, self.args.timeout, cancel):
+            self.release_gpu(keep="i23d")
+            try:
+                return self.i23d.run(request, cancel, progress)
+            except StudioCancelled as exc:
+                raise JobCancelled(str(exc)) from None
 
     @contextmanager
     def execution_lock(self, backend: str, device: int, timeout: float,
@@ -592,6 +624,7 @@ class PixalServer:
                     "reference_rocm_ready": self.qwen_image.python_rocm.is_file(),
                     "quantized_available": self.qwen_image.quant.is_dir(),
                 },
+                "i23d": self.i23d.health(),
                 "limits": {"body_bytes": MAX_BODY_BYTES, "image_bytes": MAX_IMAGE_BYTES,
                            "glb_bytes": MAX_GLB_BYTES, "views": 16}, "backends": out}
 
@@ -605,6 +638,7 @@ class PixalServer:
         if backend not in ("cuda", "rocm"):
             raise ValueError("Qwen backend must be cuda or rocm")
         with self.execution_lock(backend, device, self.args.timeout, cancel):
+            self.release_gpu(keep="qwen-image")
             return self.qwen_image.generate(request, progress)
 
     def infer(self, request: dict, cancel: threading.Event | None = None, progress=None) -> dict:
@@ -649,6 +683,8 @@ class PixalServer:
                 "render comparison is unavailable; run ref/pixal3d/build_preview.sh")
         with self.execution_lock(backend, device, self.args.timeout, cancel) as execution_timeout, \
                 tempfile.TemporaryDirectory(prefix="request-", dir=self.work_dir) as td:
+            if backend != "cpu":
+                self.release_gpu()
             run_dir = Path(td)
             artifact_dir = retained_artifact_dir(request)
             if artifact_dir is not None:
@@ -848,6 +884,7 @@ class PixalServer:
         with self.execution_lock(
                 backend, device, self.args.reference_timeout, cancel) as execution_timeout, \
                 tempfile.TemporaryDirectory(prefix="reference-", dir=self.work_dir) as td:
+            self.release_gpu()
             run_dir = Path(td)
             artifact_dir = retained_artifact_dir(request)
             output_path = ((artifact_dir / ".reference.glb.partial") if artifact_dir
@@ -1047,6 +1084,8 @@ class JobQueue:
     @staticmethod
     def _artifact_paths(directory: Path, result: dict) -> dict[str, Path]:
         stored = {}
+        if result.get("kind") == "i23d":   # files live in the studio session
+            return stored
         # Qwen jobs retain inline image data and intentionally have no GLB;
         # Pixal jobs identify themselves with a backend or native artifact.
         qwen_result = (("request" in result and "job" in result) or
@@ -1264,8 +1303,8 @@ class JobQueue:
 
     def submit(self, request: dict, *, kind: str = "pixal3d",
                batch_id: str | None = None) -> dict:
-        if kind not in ("pixal3d", "qwen-image"):
-            raise ValueError("kind must be pixal3d or qwen-image")
+        if kind not in ("pixal3d", "qwen-image", "i23d"):
+            raise ValueError("kind must be pixal3d, qwen-image or i23d")
         request = dict(request)
         request["_kind"] = kind
         if batch_id is not None:
@@ -1499,6 +1538,12 @@ class JobQueue:
                         self._append_log(job_id, phase)
                         self._update(job_id, phase=phase, progress=percent)
                     result = self.pixal.qwen_generate(request, cancel, qwen_report)
+                elif kind == "i23d":
+                    self._update(job_id, phase=f"Text/Image to 3D: {request.get('stage')}", progress=2)
+                    def i23d_report(phase, percent):
+                        self._append_log(job_id, phase)
+                        self._update(job_id, phase=phase, progress=percent)
+                    result = self.pixal.i23d_run(request, cancel, i23d_report)
                 else:
                     result = self.pixal.infer(request, cancel, report)
                 with self.lock:
@@ -1622,6 +1667,18 @@ class Handler(BaseHTTPRequestHandler):
             data = (ROOT / "web/pixal3d.html").read_bytes()
             self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)
             return
+        if path.startswith("/v1/i23d/sessions/"):
+            sid, _, tail = path[len("/v1/i23d/sessions/"):].partition("/")
+            try:
+                if tail.startswith("files/"):
+                    self.file_response(self.server.pixal.i23d.file(sid, tail[len("files/"):]))
+                elif not tail:
+                    self.json_response(200, self.server.pixal.i23d.state(sid))
+                else:
+                    raise KeyError(tail)
+            except KeyError:
+                self.json_response(404, error_payload("not_found", "session or file not found"))
+            return
         if path.startswith("/v1/jobs/"):
             try:
                 job_id, tail = (path[len("/v1/jobs/"):].split("/", 1) + [""])[:2]
@@ -1671,6 +1728,18 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self.json_response(500, error_payload("internal_error", str(exc)))
             return
+        if path == "/v1/i23d/sessions":
+            self.json_response(201, self.server.pixal.i23d.create())
+            return
+        if path.startswith("/v1/i23d/sessions/") and path.endswith("/undo"):
+            sid = path[len("/v1/i23d/sessions/"):-len("/undo")]
+            try:
+                self.json_response(200, self.server.pixal.i23d.undo(sid))
+            except KeyError:
+                self.json_response(404, error_payload("not_found", "session not found"))
+            except ValueError as exc:
+                self.json_response(409, error_payload("conflict", str(exc)))
+            return
         if path == "/v1/uploads":
             try:
                 if not self.server.jobs.accepting:
@@ -1698,7 +1767,8 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(request, dict):
                 raise ValueError("request body must be a JSON object")
             if path == "/v1/jobs":
-                self.json_response(202, self.server.jobs.submit(request)); return
+                kind = "i23d" if request.get("kind") == "i23d" else "pixal3d"
+                self.json_response(202, self.server.jobs.submit(request, kind=kind)); return
             result = self.server.pixal.infer(request)
             if request.get("reference"):
                 result["reference"] = self.server.pixal.reference(reference_request(request, result))

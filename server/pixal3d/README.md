@@ -12,7 +12,9 @@ From the repository root, prepare an environment once with
 sh server/pixal3d/run.sh --backend cuda --bind 127.0.0.1 --port 8765
 ```
 
-Open <http://127.0.0.1:8765/>. Select an image, optionally provide a mask, and
+Open <http://127.0.0.1:8765/>. The default **Text / Image → 3D** tab (below)
+goes from a prompt or photo through Qwen-Image 2.1 edits to a GLB. In the
+**Pixal3D reconstruction** tab (`/#reconstruct`), select an image, optionally provide a mask, and
 choose CPU, CUDA, or ROCm. The Qwen Image 2.1 tab also selects CUDA or ROCm
 independently of the Pixal3D backend. For multiview inference, select **Posed multiview**
 and choose a folder containing `transforms.json` and its images. The browser
@@ -185,6 +187,89 @@ requests. It runs after native inference and reuses the validated ordered view
 manifest. Automatic and explicit per-view masks are resolved once; the exact
 prepared RGBA files are passed to both native and PyTorch pipelines. Enabling
 the comparison can add several minutes to a request.
+
+## Text / Image → 3D tab (Qwen-Image 2.1 + Pixal3D)
+
+The default tab chains Qwen-Image 2.1 (through `cuda/qimg21/qimg21_i23d`) and
+Pixal3D into one guided workflow for a single object:
+
+1. **Object.** Either:
+   - from text: Qwen-Image 2.1 draws the object with a native transparent
+     background, then it is framed at 512²;
+   - from a photo: the object is extracted with Qwen-Image 2.1 (keeping the
+     photo's pixels), RMBG-2.0, or the image's own alpha.
+2. **Edit** (optional, repeatable, undoable).
+   - An object-preserving instruction such as "make the glaze matte red".
+   - Optionally limited to a box dragged on the object: inside, latent
+     blending; outside, pixel paste-back, so the rest of the object is kept
+     exactly.
+   - A strength below 1 edits by SDEdit from the current pixels.
+3. **Views** (optional). A turntable of the current object, shown as 2D
+   previews.
+4. **3D.** Pixal3D builds a textured GLB:
+   - runner: native CUDA, the PyTorch reference, or both (the meshes are
+     compared by Chamfer);
+   - input: the current object in single view (the default and recommended
+     choice), or the object plus the generated views, posed;
+   - camera FOV: from MoGe-2, or given.
+
+"Text → 3D in one go" runs steps 1 and 4 back to back. `?session=<id>` in
+the URL reopens a session, and the last one is remembered in the browser.
+
+Single view is recommended because it measured better. On Pixal3D's posed
+example, the generated-views input scored Chamfer RMS 0.063 against a
+reconstruction from real views, and single view scored 0.024. Generated side
+views keep the reference's outline width, so they under-state depth. See
+`cuda/qimg21/IMAGE_TO_3D.md`.
+
+Measured on this RTX 5060 Ti (512², 16 steps, INT8 `fast12`):
+
+| step | wall time |
+|---|---|
+| text → framed object | 16.6 s, including starting the resident image model |
+| edit (whole object or boxed) | about 22 s |
+| 8 views | 65 s |
+| Pixal3D native, single view, texture 1024, 1M triangles | about 5–6 min |
+
+The image model stays resident between steps. The server releases it before
+Pixal3D runs, and whenever another tab's job needs the GPU. Likewise, the
+Qwen tab's resident denoiser and PyTorch server are stopped before Pixal3D
+or studio jobs. All GPU jobs share the one worker queue and the CUDA device
+lock.
+
+API: every step is a job on the existing queue.
+
+```sh
+curl -s -X POST localhost:8765/v1/i23d/sessions            # -> {"id": SID, ...}
+curl -s -X POST localhost:8765/v1/jobs -H 'Content-Type: application/json' \
+  -d '{"kind":"i23d","session":"SID","stage":"text","prompt":"a brass desk lamp","steps":16,"seed":3}'
+# poll GET /v1/jobs/JOB, then GET /v1/jobs/JOB/result -> {"state": <session>, "details": ...}
+```
+
+The stages and their fields:
+
+| `stage` | fields |
+|---|---|
+| `text` | `prompt`, `width`, `height` (256–1024, multiples of 32), `steps`, `seed`, `transparent` |
+| `upload` | `image_upload` (from `POST /v1/uploads`) or `image_b64`, `method` (`qwen`/`rmbg`/`alpha`) |
+| `edit` | `instruction`, `strength` (0.05–1), `rect` `[x, y, w, h]` in object pixels, `feather` |
+| `views` | `count` (2–24), `elevation` |
+| `reconstruct` | `runner` (`native`/`reference`/`both`), `mode` (`single`/`multiview`), `fov` (degrees; omitted means MoGe-2), `texture_size`, `triangle_target`, `seed` |
+
+Other session routes:
+- `GET /v1/i23d/sessions/SID`: the history, views and models, with URLs.
+- `GET /v1/i23d/sessions/SID/files/<path>`: images and GLBs of that
+  session only.
+- `POST /v1/i23d/sessions/SID/undo`: refused while a stage is running on
+  the session.
+
+Sessions live under `<work-dir>/i23d/` and expire after 24 h.
+
+Tests:
+- `tmp/qimg21-ref-venv/bin/python -m unittest server.pixal3d.test_i23d_studio`
+  (mock image model, fake Pixal3D);
+- `server/pixal3d/test_browser.py`, whose headless-Chrome flow covers text,
+  a boxed edit, undo, views and a two-runner build.
 
 ## Qwen Image 2.1 tab
 

@@ -18,6 +18,9 @@ from urllib.request import Request, urlopen
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 from server.pixal3d import app
+from server.pixal3d.i23d import Studio
+from qimg21_i23d import reconstruct as i23d_reconstruct
+from qimg21_i23d.backends import MockBackend
 
 
 class FakePixal:
@@ -26,6 +29,12 @@ class FakePixal:
 
     def __init__(self):
         self.requests = []
+        self.i23d = None          # a Studio on the mock image backend, set in main()
+        self.i23d_requests = []
+
+    def i23d_run(self, request, cancel=None, progress=None):
+        self.i23d_requests.append(request)
+        return self.i23d.run(request, cancel, progress)
 
     def health(self):
         ready = {"available": True, "models_ready": True, "multiview_ready": True}
@@ -154,6 +163,65 @@ def wait_for(cdp, expression, timeout=10):
     raise AssertionError(f"browser condition timed out: {expression}")
 
 
+class FakeReconstruction:
+    """A Pixal3D runner that writes a minimal GLB (JSON chunk only)."""
+
+    def __init__(self, name):
+        self.name, self.backend = name, "cuda"
+
+    def available(self):
+        return True, []
+
+    def _glb(self, out):
+        body = json.dumps({"meshes": [{"primitives": [{"attributes": {"POSITION": 0}, "indices": 1}]}],
+                           "accessors": [{"count": 3}, {"count": 3}]}).encode()
+        body += b" " * (-len(body) % 4)
+        Path(out).write_bytes(struct.pack("<III", 0x46546C67, 2, 20 + len(body)) +
+                              struct.pack("<II", len(body), 0x4E4F534A) + body)
+        return {"runner": self.name, "output": str(out), "seconds": 1.0,
+                "mesh": {"vertices": 3, "triangles": 1, "bounds": None}}
+
+    def single(self, rgba, out, work, *, fov_rad, mesh_scale=1.0):
+        return self._glb(out)
+
+    def multiview(self, views_dir, out, work):
+        return self._glb(out)
+
+
+def studio_flow(cdp, server, pixal):
+    """Text -> object -> boxed edit -> undo -> views -> 3D (both runners)."""
+    cdp.call("Page.navigate", {"url": f"http://127.0.0.1:{server.server_port}/"})
+    wait_for(cdp, "document.readyState === 'complete' && !document.getElementById('studio-workspace').hidden")
+    count = "document.querySelectorAll('#st-history figure').length"
+    cdp.evaluate("localStorage.removeItem('i23d-session');document.getElementById('st-prompt').value='a red cup';"
+                 "document.getElementById('st-steps').value='2';document.getElementById('st-make').click()")
+    wait_for(cdp, f"{count} === 1 && !document.getElementById('st-make').disabled")
+    assert cdp.evaluate("document.getElementById('st-current').src.includes('/files/images/000.png')")
+    # Drag a box over the top-left quarter, then edit inside it.
+    cdp.evaluate("""(()=>{const $=id=>document.getElementById(id);$('st-region').click();
+        const c=$('st-canvas'),r=c.getBoundingClientRect();
+        const fire=(type,x,y)=>c.dispatchEvent(new PointerEvent(type,{clientX:r.left+x*r.width,clientY:r.top+y*r.height,pointerId:1,bubbles:true}));
+        fire('pointerdown',0.05,0.05);fire('pointermove',0.5,0.5);fire('pointerup',0.5,0.5);
+        $('st-edit').value='make it blue';$('st-apply').click()})()""")
+    wait_for(cdp, f"{count} === 2 && !document.getElementById('st-apply').disabled")
+    rect = pixal.i23d_requests[-1]["rect"]
+    assert pixal.i23d_requests[-1]["stage"] == "edit" and len(rect) == 4 and 200 < rect[2] < 260, rect
+    cdp.evaluate("document.getElementById('st-undo').click()")
+    wait_for(cdp, f"{count} === 1 && !document.getElementById('st-make').disabled")
+    assert cdp.evaluate("document.getElementById('st-undo').disabled")    # nothing left to undo
+    cdp.evaluate("document.getElementById('st-count').value='4';document.getElementById('st-views').click()")
+    wait_for(cdp, "document.querySelectorAll('#st-views-strip figure').length === 4 && "
+                  "!document.getElementById('st-views').disabled")
+    cdp.evaluate("document.getElementById('st-runner').value='both';document.getElementById('st-fov').value='20';"
+                 "document.getElementById('st-build').click()")
+    wait_for(cdp, "!document.getElementById('st-model-panel').hidden && "
+                  "document.getElementById('st-stats').textContent.includes('Chamfer RMS 0.0123')")
+    assert cdp.evaluate("document.querySelectorAll('#st-models model-viewer').length") == 2
+    assert pixal.i23d_requests[-1] == {**pixal.i23d_requests[-1], "stage": "reconstruct", "runner": "both",
+                                       "mode": "single", "fov": 20}
+    print("Text/Image to 3D studio browser test: PASS")
+
+
 def main():
     chrome = shutil.which("google-chrome") or shutil.which("chromium")
     if not chrome:
@@ -164,6 +232,10 @@ def main():
     scratch = app.ROOT / "tmp/pixal3d/browser-test"
     scratch.mkdir(parents=True, exist_ok=True)
     pixal.work_dir = scratch
+    shutil.rmtree(scratch / "i23d", ignore_errors=True)
+    pixal.i23d = Studio(scratch / "i23d", backend_factory=MockBackend,
+                        runner_factory=lambda name, settings: FakeReconstruction(name))
+    i23d_reconstruct.compare_meshes = lambda a, b, work, samples=50000: {"symmetric_chamfer_rms": 0.0123}
     server.uploads = app.UploadStore(scratch / "uploads", retained=16)
     server.jobs = app.JobQueue(pixal, retained=4, uploads=server.uploads)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -186,8 +258,9 @@ def main():
                     method="PUT"), timeout=5).read())
                 cdp = Cdp(target["webSocketDebuggerUrl"])
                 cdp.call("Runtime.enable")
-                cdp.call("Page.navigate", {"url": f"http://127.0.0.1:{server.server_port}/"})
-                wait_for(cdp, "document.readyState === 'complete'")
+                studio_flow(cdp, server, pixal)
+                cdp.call("Page.navigate", {"url": f"http://127.0.0.1:{server.server_port}/#reconstruct"})
+                wait_for(cdp, "document.readyState === 'complete' && !document.getElementById('pixal-workspace').hidden")
                 wait_for(cdp, "document.getElementById('health').textContent.includes('PyTorch reference')")
 
                 image = scratch / "input.png"
