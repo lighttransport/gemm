@@ -979,7 +979,7 @@ static void q21f_usage(const char *argv0) {
             "  [--editing-layout L.txt --condition-latents C.npy [--negative-editing-layout NL.txt]]\n"
             "  [--preset low8|low8-fp4|fast12|accurate] [--vram-budget-mib MIB] [--cfg-batch 0|1] [--fused-gemm 0|1] [--kv-cache on|off]\n"
             "  [--prefix-pass extract|separate] [--plan-only] [--profile]\n"
-            "  restart: --start-step K [--refine-seed N] (img2img strength on a [base_h, base_w, 64] --latents grid)\n"
+            "  restart: --start-step K [--refine-seed N | --restart-noise E.npy] (img2img strength on a [base_h, base_w, 64] --latents grid)\n"
             "  tiled coarse-to-fine refine: --refine-from GRID.npy --tile-tokens T [--tile-overlap O]\n"
             "                               [--refine-strength S] [--refine-seed N]\n"
             "  [--weights bf16|int8|nvfp4 --quant-package DIR [--bf16-blocks 0,31]] [--fp4-gemm cutlass|omma]\n"
@@ -1005,6 +1005,7 @@ int main(int argc, char **argv) {
     int tile_tokens = 0, tile_overlap = 8, start_step = 0;
     double budget_mib = 0, refine_strength = 0.0;
     unsigned long long refine_seed = 0;
+    const char *restart_noise_path = NULL;
     float guidance = 1.0f, manual_t = -1.0f;
     const q21f_preset *preset = NULL;
     for (int i = 1; i + 1 < argc; i++)
@@ -1071,6 +1072,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--start-step") && more) start_step = atoi(argv[++i]);
         else if (!strcmp(a, "--refine-strength") && more) refine_strength = atof(argv[++i]);
         else if (!strcmp(a, "--refine-seed") && more) refine_seed = strtoull(argv[++i], NULL, 10);
+        else if (!strcmp(a, "--restart-noise") && more) restart_noise_path = argv[++i];
         else if (!strcmp(a, "--quant-package") && more) package = argv[++i];
         else if (!strcmp(a, "--fp4-gemm") && more) {
             const char *m = argv[++i];
@@ -1182,7 +1184,7 @@ int main(int argc, char **argv) {
                 "raise --tile-tokens\n", tile_tokens, nrows * ncols, ih, iw);
         return 2;
     }
-    npy_f32 pe = {0}, ne = {0}, la = {0}, cond = {0}, rope = {0}, base_grid = {0};
+    npy_f32 pe = {0}, ne = {0}, la = {0}, cond = {0}, rope = {0}, base_grid = {0}, restart_noise = {0};
     q21f_runtime rt;
     q21f_state st;
     q21f_branch br[2];
@@ -1266,6 +1268,10 @@ int main(int argc, char **argv) {
             REQ(br[i].prefix > 0, "a tiled refine needs a non-empty text prefix");
 
     /* ---- Device ---- */
+    /* "timing:" lines are one per setup phase, for the demo's breakdown. */
+    double phase_mark = q21f_seconds(), run_start = phase_mark;
+#define Q21F_PHASE(...) do { double now_ = q21f_seconds(); fprintf(stderr, "timing: "); \
+        fprintf(stderr, __VA_ARGS__); fprintf(stderr, " %.3f s\n", now_ - phase_mark); phase_mark = now_; } while (0)
     REQ(cuewInit(CUEW_INIT_CUDA | CUEW_INIT_NVRTC) == CUEW_SUCCESS, "cuewInit failed");
     CK(cuInit(0));
     CK(cuDeviceGet(&rt.device, 0));
@@ -1424,6 +1430,7 @@ int main(int argc, char **argv) {
         if (streamed) rt.streamed[rt.n_streamed++] = b;
     }
 
+    Q21F_PHASE("CUDA init + kernels + memory plan");
     /* ---- Weights ---- */
     double load_start = q21f_seconds();
     char path[2048];
@@ -1518,6 +1525,7 @@ int main(int argc, char **argv) {
     shards.n = 0;
     fprintf(stderr, "fast: weights ready in %.2f s (%.0f MiB device)\n", q21f_seconds() - load_start,
             rt.allocated / (double)Q21F_MIB);
+    Q21F_PHASE("load transformer weights (%.0f MiB)", rt.allocated / (double)Q21F_MIB);
 
     /* ---- State ---- */
     {
@@ -1586,6 +1594,7 @@ int main(int argc, char **argv) {
     if (dump_dir) mkdir(dump_dir, 0755);
     if (pred_dir) mkdir(pred_dir, 0755);
 
+    Q21F_PHASE("activation buffers + inputs");
     double prefill_start = q21f_seconds();
     for (int i = 0; i < nb; i++) REQ(!q21f_embed_prefix(&rt, &st, &br[i]), "prefix embedding %d", i);
     if (kv_cache && !extract) {
@@ -1599,6 +1608,7 @@ int main(int argc, char **argv) {
     if (profile) { CK(cuEventCreate(&ev0, 0)); CK(cuEventCreate(&ev1, 0)); job.ev0 = ev0; job.ev1 = ev1; }
     CK(cuStreamSynchronize(rt.compute));
     double prefill_s = q21f_seconds() - prefill_start;
+    Q21F_PHASE("prompt prefill (text K/V)");
     double loop_start = q21f_seconds();
     double loop_s = 0.0;
     if (refine_path) {
@@ -1692,6 +1702,15 @@ int main(int argc, char **argv) {
          * sigma[start_step], which is the single-tile case of the tiled
          * refine: one tile, no blend, the same noise. */
         const float *x0 = la.data;
+        /* --restart-noise renoises with a given field instead of the RNG. With
+         * the noise the original run started from, a restart from that run's
+         * result lands where the longer schedule's own trajectory would be if
+         * the result were its x0: at step 0 it is exactly a fresh run. */
+        if (restart_noise_path) {
+            REQ(start_step > 0, "--restart-noise needs --start-step");
+            REQ(!npy_read_f32(restart_noise_path, &restart_noise) &&
+                restart_noise.n == (size_t)T * 64, "--restart-noise must hold %d x 64 values", T);
+        }
         if (start_step) {
             if (la.ndim == 3) {
                 q21f_resample(la.data, (int)la.shape[0], (int)la.shape[1], host_out, ih, iw);
@@ -1702,12 +1721,16 @@ int main(int argc, char **argv) {
             for (size_t i = 0; i < (size_t)T * 64; i++) {
                 /* Rounded to F32 first so this path and the tiled path, which
                  * stores the field as F32, mix identical numbers. */
-                float e = (float)q21f_gauss(&rng, &spare);
+                float e = restart_noise.data ? restart_noise.data[i] : (float)q21f_gauss(&rng, &spare);
                 host_out[i] = (float)(keep * x0[i] + noise * e);
             }
             x0 = host_out;
-            fprintf(stderr, "fast: restart at step %d/%d, sigma %.5f, seed %llu\n", start_step, steps,
-                    sigmas[start_step], refine_seed);
+            if (restart_noise.data)
+                fprintf(stderr, "fast: restart at step %d/%d, sigma %.5f, noise %s\n", start_step, steps,
+                        sigmas[start_step], restart_noise_path);
+            else
+                fprintf(stderr, "fast: restart at step %d/%d, sigma %.5f, seed %llu\n", start_step, steps,
+                        sigmas[start_step], refine_seed);
         }
         REQ(!q21f_upload(&rt, st.sample, x0, (size_t)T * 64 * 4, 0), "latent upload");
         { int n = T * 64; void *a[] = {&st.latent, &st.sample, &n};
@@ -1772,6 +1795,10 @@ int main(int argc, char **argv) {
     fprintf(stderr, "device allocations peak %.0f MiB, device free %.0f MiB\n", rt.peak / (double)Q21F_MIB,
             free_after / (double)Q21F_MIB);
     if (!refine_path) fprintf(stderr, "fast: wrote %s (%d tokens x 64, %d steps)\n", out_path, T, steps);
+    phase_mark = loop_start;
+    Q21F_PHASE("denoise %d steps (image generation)", refine_path ? (nrows * ncols) * (steps - refine_start)
+                                                                  : steps - start_step);
+    fprintf(stderr, "timing: denoiser total %.3f s\n", q21f_seconds() - run_start);
     rc = 0;
 fail:
     if (rt.compute) cuStreamSynchronize(rt.compute);
@@ -1791,5 +1818,6 @@ fail:
     free(host_out); free(host_pred); free(sigmas);
     free(fine0); free(fine); free(fine_w); free(tile_in); free(tile_out); free(eps_field);
     npy_free(&pe); npy_free(&ne); npy_free(&la); npy_free(&cond); npy_free(&rope); npy_free(&base_grid);
+    npy_free(&restart_noise);
     return rc;
 }

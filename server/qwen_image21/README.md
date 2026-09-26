@@ -28,7 +28,83 @@ packages default to `/mnt/nvme01/models/qimg-21-fast/`; override them with
 `--int8-package` and `--nvfp4-package`. The API field is `preset`, CUDA only,
 and `GET /api/health` reports which presets are available.
 
-## Step previews
+## Refine with more steps
+
+Preview with a few steps, then refine the picture you like. A native result from
+a CUDA fast preset carries a **Refine with more steps** bar with two settings:
+- a step count;
+- **keep**, the share of the longer schedule taken as already done.
+
+Refining keeps the preview's layout and adds detail. The preview card stays
+beside the result, and a refined result can be refined again.
+
+How it works:
+- A few-step result is a rough draft of what a longer schedule would
+  converge to, so it is re-noised to step `K = keep * steps` of the new
+  schedule, and only steps `K+1..N` run.
+- It is re-noised with the **same noise the preview started from** (the fast
+  runner's `--restart-noise`), not a fresh draw. That is the point the longer
+  run's own trajectory would pass through if the preview were its answer.
+- At keep 0 this is exactly a fresh N-step run from that noise, which can frame
+  the scene differently: a flow schedule's first steps decide the layout.
+  Around 50% keeps the layout and still redraws the detail.
+
+The request fields are:
+
+- `restart_from`: the earlier result's job id, as returned in the response.
+- `restart_keep`: a value from 0 to 0.95.
+
+A refine must be a CUDA fast preset in native mode, untiled, and the same
+size as the earlier run. The server keeps each job's request in
+`request.json` to check that.
+
+The driver flags are `native_generate.py --initial-latents NOISE
+--restart-from LATENTS --restart-step K`.
+
+
+Each card reports its own wall time: in compare mode the runner and the
+reference no longer share one number. Each card shows three figures:
+
+- **total:** the card's own wall time.
+- **image generation:** the denoising loop alone.
+- **everything else:** loading and setup.
+
+A breakdown table under the picture lists every phase, grouped by pipeline
+stage, and the progress panel shows the same phases live as they finish.
+
+Every component prints `timing: <phase> <seconds> s[ (<detail>)]`; the server
+parses those lines, so the numbers are each component's own:
+
+| Component | Phases |
+|---|---|
+| `test_cuda_qimg21_text` | tokenize, CUDA init, kernels, buffers, the 36 layers (with GB streamed, GB/s, and time spent waiting on the upload), write |
+| `test_cuda_qimg21_fast` | CUDA init + kernels + memory plan, transformer weights, buffers, prompt prefill, denoise (image generation) |
+| `test_cuda_qimg21_vae` | CUDA init, decode, write |
+| `reference.py` | torch import, `from_pretrained`, offload setup, prompt encoding, denoise (image generation), VAE decode, the rest of the pipeline, write |
+
+The response carries them per side as `timings` (rows of `stage`, `label`,
+`seconds`, `detail`, and `total` for a stage's wall time), `elapsed_ms` and
+`generation_s`.
+
+**Where the native setup time goes, and what was cut.** The text encoder
+already runs on the GPU. Its cost is streaming about 14 GB of BF16 weights per
+prompt for a few dozen tokens of compute. On this host that is bounded by PCIe
+Gen3 x8 (7.2 GB/s) and page-cache reads (about 8 GB/s), roughly 2 s.
+
+- The weights now stream through a two-slot pinned ring. A loader thread reads
+  ahead with parallel `pread()` while the GEMMs run. The embeddings are
+  bit-identical to before, and skipping the teardown of the checkpoint mapping
+  at exit saves most of a second.
+- A repeated prompt skips the encoder: embeddings are cached in
+  `tmp/qimg21-prompt-cache`, keyed by prompt, checkpoint and encoder build.
+- The initial noise, which costs a torch import to draw, is cached there by seed
+  and grid.
+- A fixed 2 s sleep after the text encoder is now a wait for its device memory
+  to come back, about 30 ms.
+
+A 512², 10-step `fast12` run went from about 16.5 s to 14 s the first time, and
+to 9.7 s with a cached prompt and seed.
+
 
 While a run is in flight, each result card shows the picture as it develops.
 Below it is a filmstrip of every step: click a step to hold it, and click it

@@ -89,7 +89,8 @@ class QwenImage21FormLogicTest(unittest.TestCase):
             self.assertIn(f"$('vae_tile').value.trim() ? num('{field}') : null", body)
         # Progress is opt-in from the page: it needs a job to attach to and the
         # runner's per-step timing, which is what --profile-steps asks for.
-        self.assertIn("job, profile_steps: true", body)
+        self.assertIn("profile_steps: true", body)
+        self.assertIn("const payload = {...base, job};", body)
         self.assertIn("startPolling(job, 250)", body)
         self.assertIn("stopPolling()", body)
 
@@ -177,6 +178,38 @@ class QwenImage21FormLogicTest(unittest.TestCase):
             "console.log('upscale gate ok');\n")
         result = run(program)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_the_timing_table_groups_by_stage_and_marks_generation(self):
+        body = script()
+        code = body[body.index("function headline("):body.index("// ---- step previews")]
+        program = ("const esc=t=>String(t);const fmtMs=ms=>ms+'ms';\n" + code +
+            "const html=timesTable([{stage:'denoise',label:'load weights',seconds:2},"
+            "{stage:'denoise',label:'denoise 10 steps (image generation)',seconds:3},"
+            "{stage:'denoise',label:'stage total',seconds:6,total:true},{stage:'decode',label:'VAE',seconds:1}]);\n"
+            "const ok=(html.match(/class=\"stage\"/g)||[]).length===2&&/class=\"gen\"/.test(html)&&/6000ms/.test(html)"
+            "&&!/>stage total</.test(html)&&timesTable([])==='';\n"
+            "const head=headline(12000,3.3);\n"
+            "if(!ok||!/3300ms/.test(head)||!/8700ms/.test(head)){console.log(html,head);process.exit(1)}\n"
+            "console.log('timing table ok');\n")
+        result = run(program)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_a_refine_restarts_where_the_server_will(self):
+        body = script()
+        code = body[body.index("function refinable("):body.index("function refineBar(")]
+        program = code + (
+            "const cases=[[20,0.5,10],[20,0,0],[20,0.95,19],[4,0.9,3],[10,0.33,3]];\n"
+            "for(const [n,k,want] of cases)if(restartStep(n,k)!==want){console.log('FAIL',n,k,restartStep(n,k));process.exit(1)}\n"
+            "const ok=refinable({backend:'cuda',preset:'fast12',mode:'native',upscale:1})&&"
+            "!refinable({backend:'cuda',preset:'',mode:'native',upscale:1})&&"
+            "!refinable({backend:'cuda',preset:'fast12',mode:'compare',upscale:1})&&"
+            "!refinable({backend:'cuda',preset:'fast12',mode:'native',upscale:2});\n"
+            "if(!ok){console.log('FAIL refinable');process.exit(1)}\n"
+            "console.log('refine ok');\n")
+        result = run(program)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        # The refine reuses the source run's payload, not whatever the form says now.
+        self.assertIn("generate({...base,steps:n,restart_from:sourceJob,restart_keep:rk.value/100},el)", body)
 
     def test_the_run_log_is_rendered_and_escaped(self):
         body = script()

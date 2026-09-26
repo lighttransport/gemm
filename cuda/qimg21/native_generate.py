@@ -43,6 +43,46 @@ def _run(command: list[str], *, cwd: Path) -> None:
           f"{time.perf_counter() - start:.1f} s)", file=sys.stderr)
 
 
+def _device_used_mib(backend: str) -> int | None:
+    """Device memory in use, from nvidia-smi, or None where it cannot be read."""
+    if backend != "cuda":
+        return None
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits",
+                              "--id=0"], capture_output=True, text=True, timeout=5)
+        return int(out.stdout.strip().splitlines()[0]) if out.returncode == 0 else None
+    except (OSError, ValueError, IndexError, subprocess.TimeoutExpired):
+        return None
+
+
+def _wait_device_released(backend: str, baseline: int | None, limit: float = 2.0) -> None:
+    """Wait until a finished child's device memory is back, rather than a flat
+    two seconds. The next process plans its budget from the free memory it
+    sees, so it must not start while the text encoder's context is retiring.
+    Without a reading to compare, fall back to the old fixed wait."""
+    start = time.perf_counter()
+    if baseline is None:
+        time.sleep(limit)
+        return
+    while time.perf_counter() - start < limit:
+        used = _device_used_mib(backend)
+        if used is None or used <= baseline + 128:
+            break
+        time.sleep(0.05)
+    print(f"timing: device memory released {time.perf_counter() - start:.3f} s", file=sys.stderr)
+
+
+def _prompt_cache_key(model: Path, text_bin: Path, backend: str, prompt: str) -> str:
+    """The embedding depends on the prompt, the checkpoint and the encoder
+    build; any of them changing is a different key."""
+    import hashlib
+    import json
+    stat = text_bin.stat()
+    blob = json.dumps({"prompt": prompt, "model": str(model), "backend": backend,
+                       "encoder": [str(text_bin), stat.st_size, stat.st_mtime_ns]}, sort_keys=True)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
 def _largest_fitting_tile(root, command, limit):
     """Largest --tile-tokens whose plan still fits the budget.
 
@@ -251,6 +291,13 @@ def main() -> int:
                     help="denoiser: the parity harness or test_cuda_qimg21_fast (CUDA only)")
     ap.add_argument("--preset", choices=tuple(FAST_PRESET_WEIGHTS), default="accurate",
                     help="fast-runner memory/precision preset (low8/low8-fp4: <8 GB, fast12: ~12 GB)")
+    ap.add_argument("--restart-from", type=Path,
+                    help="refine an earlier result: its final [tokens, 64] latents, renoised to "
+                         "--restart-step of this run's schedule with the --initial-latents noise")
+    ap.add_argument("--restart-step", type=int, default=0,
+                    help="how many of --steps the restart skips; 0 is a fresh run")
+    ap.add_argument("--prompt-cache", type=Path,
+                    help="directory of cached text embeddings; a repeated prompt skips the text encoder")
     ap.add_argument("--quant-package", type=Path,
                     help="pack_fast.py package for int8/nvfp4 presets (default: the preset's package)")
     args = ap.parse_args()
@@ -287,6 +334,13 @@ def main() -> int:
         ap.error("tiled generation needs --runner fast; the parity harness has no tile path")
     if args.upscale <= 0.0:
         ap.error("--upscale must be positive")
+    if args.restart_from is not None:
+        if args.runner != "fast" or args.upscale != 1.0 or args.image:
+            ap.error("--restart-from needs --runner fast, no --upscale and no --image")
+        if args.initial_latents is None:
+            ap.error("--restart-from needs --initial-latents: the noise the earlier run started from")
+        if not 0 <= args.restart_step < args.steps:
+            ap.error("--restart-step must be in [0, --steps)")
     if args.profile_steps and args.runner != "fast":
         ap.error("--profile-steps needs --runner fast; the parity harness has no --profile")
     if args.tile_tokens is not None and not tiled:
@@ -433,17 +487,36 @@ def main() -> int:
         text_encoder = text_bin
         if not text_encoder.exists():
             raise SystemExit(f"native {args.backend} text encoder missing: {text_encoder}")
-        _run([
-            str(text_encoder), "--model", str(model), "--prompt", args.prompt,
-            "--attention", "flash-exact" if args.backend == "cuda" else "custom",
-            "--out", str(prompt_path),
-        ], cwd=root)
+        attention = "flash-exact" if args.backend == "cuda" else "custom"
+        encoded = False
+        baseline = None
+
+        def encode(text: str, output: Path) -> None:
+            nonlocal encoded, baseline
+            cached = None
+            if args.prompt_cache:
+                cached = args.prompt_cache / (_prompt_cache_key(model, text_encoder, args.backend, text) + ".npy")
+                if cached.is_file():
+                    import shutil
+                    shutil.copyfile(cached, output)
+                    print(f"text: prompt embedding cache hit ({cached.name[:12]})", file=sys.stderr)
+                    print("timing: prompt embedding cache hit 0.000 s", file=sys.stderr)
+                    return
+            if baseline is None:
+                baseline = _device_used_mib(args.backend)
+            _run([str(text_encoder), "--model", str(model), "--prompt", text,
+                  "--attention", attention, "--out", str(output)], cwd=root)
+            encoded = True
+            if cached is not None:
+                cached.parent.mkdir(parents=True, exist_ok=True)
+                partial = cached.with_suffix(f".{os.getpid()}.tmp")
+                import shutil
+                shutil.copyfile(output, partial)
+                os.replace(partial, cached)
+
+        encode(args.prompt, prompt_path)
         if args.negative_prompt is not None:
-            _run([
-                str(text_encoder), "--model", str(model), "--prompt", args.negative_prompt,
-                "--attention", "flash-exact" if args.backend == "cuda" else "custom", "--out",
-                str(prompt_dir / "negative_prompt_embeds.npy"),
-            ], cwd=root)
+            encode(args.negative_prompt, prompt_dir / "negative_prompt_embeds.npy")
     else:
         vision_encoder = vision_bin
         text_encoder = text_bin
@@ -488,11 +561,13 @@ def main() -> int:
     if not prompt_path.exists():
         raise SystemExit(f"text runner did not produce {prompt_path}")
 
-    # The reference text subprocess owns a large accelerator context.  Give the
-    # driver a moment to retire that context before the native process opens
-    # cuBLAS/NVRTC; otherwise some 2-step launches can observe stale device
-    # allocations even though the child has exited.
-    time.sleep(2.0)
+    # The text subprocess owns a large accelerator context. Give the driver a
+    # moment to retire it before the native process opens cuBLAS/NVRTC;
+    # otherwise some 2-step launches can observe stale device allocations even
+    # though the child has exited. Nothing to wait for when the embeddings
+    # came from the cache.
+    if args.image or encoded:
+        _wait_device_released(args.backend, None if args.image else baseline)
 
     latent_path = work / "latents.npy"
     native_latents = work / "native_latents.npy"
@@ -517,11 +592,33 @@ def main() -> int:
             "--out-dir",
             str(work),
         ]
+    noise_cache = None
     if args.initial_latents:
         fixture_command.extend(("--latents", str(args.initial_latents.resolve())))
     elif args.backend == "cuda":
-        fixture_command.append("--torch-rng")
+        # Drawing torch's CUDA noise costs a torch import, about two seconds,
+        # for a tensor that depends only on the seed and the grid. Cache it
+        # next to the prompt embeddings, keyed by the interpreter that drew it.
+        if args.prompt_cache:
+            import hashlib
+            import json
+            python = os.environ.get("QIMG21_PYTHON", sys.executable)
+            key = json.dumps({"seed": args.seed, "grid": [fixture_h, fixture_w], "dtype": args.dtype,
+                              "rng": "torch-cuda", "python": python}, sort_keys=True)
+            noise_cache = args.prompt_cache / ("noise-" + hashlib.sha256(key.encode()).hexdigest() + ".npy")
+        if noise_cache is not None and noise_cache.is_file():
+            fixture_command.extend(("--latents", str(noise_cache)))
+            print(f"text: initial noise cache hit ({noise_cache.name[:18]})", file=sys.stderr)
+            noise_cache = None
+        else:
+            fixture_command.append("--torch-rng")
     _run(fixture_command, cwd=root)
+    if noise_cache is not None and latent_path.is_file():
+        import shutil
+        noise_cache.parent.mkdir(parents=True, exist_ok=True)
+        partial = noise_cache.with_suffix(f".{os.getpid()}.tmp")
+        shutil.copyfile(latent_path, partial)
+        os.replace(partial, noise_cache)
     if args.runner == "fast":
         # The preset sets budget, weights and attention; explicit flags follow it.
         attention_args = ["--preset", args.preset]
@@ -643,6 +740,20 @@ def main() -> int:
         print(f"refine pass: {args.height}x{args.width} px in {tile_tokens}-token tiles, "
               f"strength {args.refine_strength}")
         _run(refine_command(tile_tokens), cwd=root)
+    elif args.restart_from is not None and args.restart_step > 0:
+        # Refine an earlier result: renoise it to sigma[K] of this schedule with
+        # the noise that run started from, then run the remaining steps.
+        restart = np.load(args.restart_from, allow_pickle=False)
+        if restart.shape != (h_tokens * w_tokens, 64) or not np.isfinite(restart).all():
+            raise SystemExit(f"--restart-from must be finite [{h_tokens * w_tokens}, 64] latents")
+        print(f"restart: steps {args.restart_step + 1}-{args.steps} of {args.steps} from "
+              f"{args.restart_from.name}", file=sys.stderr)
+        _run(denoise_command(h_tokens, w_tokens, args.steps, native_latents,
+                             ["--latents", str(args.restart_from.resolve()),
+                              "--start-step", str(args.restart_step),
+                              "--restart-noise", str(latent_path),
+                              "--normalization", args.native_normalization,
+                              "--rope", args.native_rope, "--dump-dir", str(steps_dir)]), cwd=root)
     else:
         _run(denoise_command(h_tokens, w_tokens, args.steps, native_latents,
                              ["--latents", str(latent_path), "--normalization", args.native_normalization,

@@ -97,6 +97,8 @@ class Progress:
     PLAN = re.compile(r"^fast: plan (.+)$")
     REFINE = re.compile(r"^fast: tiled refine (.+)$")
     PASS = re.compile(r"^(base pass|refine pass|refine tile|decoding .+)$")
+    # "timing: <phase> <seconds> s[ (<detail>)]", printed by every component.
+    TIMING = re.compile(r"^timing: (.+?) ([0-9]+(?:\.[0-9]+)?) s(?: \((.*)\))?$")
 
     def __init__(self, started: float):
         self.started = started
@@ -115,6 +117,10 @@ class Progress:
             self.stage = _stage_name(line)
             self.stage_started = now
             return {"kind": "stage", "stage": self.stage, "command": line[2:].split(" ")[0].rsplit("/", 1)[-1]}
+        if (match := self.TIMING.match(line)):
+            return {"kind": "timing", "stage": self.stage, "label": match.group(1),
+                    "seconds": float(match.group(2)), "detail": match.group(3),
+                    "elapsed_ms": (now - self.started) * 1000.0}
         if (match := self.STAGE_DONE.match(line)):
             return {"kind": "stage_done", "stage": match.group(1),
                     "seconds": float(match.group(2)), "elapsed_ms": (now - self.started) * 1000.0}
@@ -148,6 +154,38 @@ class Progress:
 
     def finish(self) -> None:
         self.done = True
+
+
+def timing_breakdown(log: Path, default_stage: str) -> list[dict]:
+    """One run's phases, read back from its log: each component's own
+    "timing:" lines, grouped under the pipeline stage that printed them, plus
+    each stage's wall time as the driver measured it."""
+    if not log.is_file():
+        return []
+    tracker = Progress(0.0)
+    tracker.stage = default_stage
+    rows: list[dict] = []
+    try:
+        lines = log.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    for line in lines:
+        event = tracker.feed(line, 0.0)
+        if not event:
+            continue
+        if event["kind"] == "timing":
+            rows.append({"stage": event["stage"] or default_stage, "label": event["label"],
+                         "seconds": event["seconds"], "detail": event["detail"]})
+        elif event["kind"] == "stage_done":
+            rows.append({"stage": tracker.stage or default_stage, "label": "stage total",
+                         "seconds": event["seconds"], "detail": event["stage"], "total": True})
+    return rows
+
+
+def generation_seconds(rows: list[dict]) -> float | None:
+    """Image generation alone: the denoising loop, summed over passes."""
+    spans = [row["seconds"] for row in rows if "(image generation)" in row["label"]]
+    return sum(spans) if spans else None
 
 
 def _stage_name(command_line: str) -> str:
@@ -667,6 +705,33 @@ class Demo:
         refine_seed = self._optional_int(request, "refine_seed", 0, 2 ** 63, "a seed")
         if refine_seed is None:
             refine_seed = 0
+        # Refine an earlier native result with a longer schedule: its final
+        # latents are renoised to step K = keep * steps with the noise that run
+        # started from, and only steps K..N run. keep 0 is a fresh run.
+        restart_from = request.get("restart_from") or None
+        restart_keep = 0.0
+        if restart_from is not None:
+            if not isinstance(restart_from, str) or not re.fullmatch(r"[0-9a-f]{32}", restart_from):
+                raise ValueError("restart_from must be a job id from an earlier result")
+            if backend != "cuda" or preset is None or mode != "native" or upscale > 1.0:
+                raise ValueError("refining with more steps needs a CUDA fast preset in native mode, "
+                                 "without the tiled refine")
+            try:
+                restart_keep = float(request.get("restart_keep", 0.5))
+            except (TypeError, ValueError):
+                raise ValueError("restart_keep must be a number") from None
+            if not 0.0 <= restart_keep <= 0.95:
+                raise ValueError("restart_keep must be between 0 and 0.95")
+            source = self.work / restart_from
+            work = source / "cuda-work"
+            if not (work / "native_latents.npy").is_file() or not (work / "latents.npy").is_file():
+                raise ValueError("that result is gone or was not a native CUDA run; generate it again")
+            try:
+                earlier = json.loads((source / "request.json").read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                earlier = {}
+            if (earlier.get("width"), earlier.get("height")) != (width, height):
+                raise ValueError("refining keeps the picture's size: use the width and height it was made at")
         return {"prompt": prompt, "negative_prompt": negative.strip(),
                 "mode": mode, "backend": backend, "reference_device": reference_device,
                 "width": width, "height": height, "steps": steps, "seed": seed,
@@ -677,7 +742,8 @@ class Demo:
                 "upscale": upscale, "base_steps": base_steps, "tile_tokens": tile_tokens,
                 "tile_overlap": tile_overlap, "refine_strength": refine_strength,
                 "refine_seed": refine_seed, "vae_tile": vae_tile,
-                "vae_tile_overlap": vae_tile_overlap, "vae_tile_bleed": vae_tile_bleed}
+                "vae_tile_overlap": vae_tile_overlap, "vae_tile_bleed": vae_tile_bleed,
+                "restart_from": restart_from, "restart_keep": restart_keep}
 
 
     def _run(self, command: list[str], cwd: Path, log: Path,
@@ -730,6 +796,10 @@ class Demo:
                    "--native-bin", str(native),
                    "--native-attention", attention, "--native-normalization", "vector4",
                    "--native-rope", "host-table-exact", "--work-dir", str(work), "--out", str(image)]
+        # A repeated prompt reuses its text embedding instead of streaming the
+        # 14 GB text encoder again; the key covers the prompt, the checkpoint
+        # and the encoder build.
+        command += ["--prompt-cache", str(self.work.parent / "qimg21-prompt-cache")]
         preset = cfg.get("preset")
         if preset:
             # The fast runner's preset sets budget, weights and attention.
@@ -778,11 +848,22 @@ class Demo:
         # uv-managed reference environments can expose the host interpreter as
         # sys.executable from a child process; carry the selected interpreter
         # explicitly to the fixture helper so it retains Torch/CUDA imports.
+        if cfg.get("restart_from"):
+            source = self.work / cfg["restart_from"] / "cuda-work"
+            command += ["--initial-latents", str(source / "latents.npy"),
+                        "--restart-from", str(source / "native_latents.npy"),
+                        "--restart-step", str(self.restart_step(cfg))]
         env = os.environ.copy()
         env["QIMG21_PYTHON"] = str(python)
         log = out / f"{backend}.log"
         self._run(command, ROOT, log, env=env, progress=progress)
         return image, log
+
+    @staticmethod
+    def restart_step(cfg: dict) -> int:
+        """The step a refine restarts at: `restart_keep` of the schedule is
+        taken as done, so at least one step always runs."""
+        return min(cfg["steps"] - 1, max(0, round(cfg.get("restart_keep", 0.0) * cfg["steps"])))
 
     @staticmethod
     def _summary(log: Path) -> list[str]:
@@ -834,6 +915,9 @@ class Demo:
         cfg = self._validate(request)
         job = self.work / uuid.uuid4().hex
         job.mkdir(parents=True, exist_ok=False)
+        # What was asked for, so a later refine can check it continues the
+        # same picture.
+        (job / "request.json").write_text(json.dumps(cfg), encoding="utf-8")
         started = time.monotonic()
         results: dict = {"request": cfg, "job": job.name}
 
@@ -853,11 +937,17 @@ class Demo:
                     device = cfg["reference_device"]
                     self._say(job_id, f"Qwen PyTorch reference ({device})")
                     dump = job / "reference" / device
+                    side_start = time.monotonic()
                     with self._previews(job_id, "reference", dump, dump / "initial_latents.npy", cfg):
-                        ref_path = self._reference(cfg, job, self._progress(job_id))
+                        ref_path = self._reference(cfg, job, self._progress(job_id, "PyTorch reference"))
+                    ref_ms = round((time.monotonic() - side_start) * 1000)
                     self._say(job_id, f"Qwen PyTorch reference ({device}) complete")
+                    breakdown = timing_breakdown(job / f"reference-{backend}-{device}.log",
+                                                 "PyTorch reference")
                     entry = {"image": self._data_url(ref_path), "device": device,
-                             "torch": self.torch_build(device)["torch"]}
+                             "torch": self.torch_build(device)["torch"],
+                             "elapsed_ms": ref_ms, "timings": breakdown,
+                             "generation_s": generation_seconds(breakdown)}
                     if device not in REFERENCE_PARITY_DEVICES and compare:
                         # A CPU reference runs different kernels on different
                         # hardware, so a side-by-side with the native runner is a
@@ -873,12 +963,21 @@ class Demo:
                         latents = None
                     self._say(job_id, f"Qwen {backend.upper()} native")
                     work = job / f"{backend}-work"
+                    side_start = time.monotonic()
                     with self._previews(job_id, "native", work / "steps", work / "latents.npy", cfg):
-                        native_path, log = self._native(cfg, job, self._progress(job_id),
+                        native_path, log = self._native(cfg, job, self._progress(job_id, "encode prompt"),
                                                         initial_latents=latents)
+                    native_ms = round((time.monotonic() - side_start) * 1000)
                     self._say(job_id, f"Qwen {backend.upper()} native complete")
+                    breakdown = timing_breakdown(log, "encode prompt")
                     results[backend] = {"image": self._data_url(native_path),
-                                        "log": self._summary(log)}
+                                        "log": self._summary(log), "elapsed_ms": native_ms,
+                                        "timings": breakdown,
+                                        "generation_s": generation_seconds(breakdown)}
+                    if cfg.get("restart_from"):
+                        results[backend]["restart"] = {"from": cfg["restart_from"],
+                                                       "step": self.restart_step(cfg),
+                                                       "steps": cfg["steps"]}
                     if compare:
                         results["reference"]["matched_noise"] = latents is not None
                 if compare:
@@ -943,8 +1042,16 @@ class Demo:
                 del record["events"][:drop]
                 record["base"] += drop
 
-    def _progress(self, job_id: str):
-        """A line sink bound to one job, carrying the wall clock with it."""
+    def _progress(self, job_id: str, stage: str | None = None):
+        """A line sink bound to one job, carrying the wall clock with it.
+        `stage` names what runs until the log's first command line does: the
+        driver's prompt cache check, or the whole PyTorch reference."""
+        if stage:
+            with self.jobs_lock:
+                record = self.jobs.get(job_id)
+                if record:
+                    record["progress"].stage = stage
+
         def sink(line: str) -> None:
             with self.jobs_lock:
                 record = self.jobs.get(job_id)

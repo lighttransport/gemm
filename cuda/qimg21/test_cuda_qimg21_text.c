@@ -14,39 +14,187 @@
 
 static int text_bf16_gemm_output = 1;
 
-/* Linear weights stream through one persistent pinned buffer and one device
- * buffer. Each matrix is copied from the mapped checkpoint in 8 MiB chunks,
- * so a chunk's DMA overlaps the host copy of the next one; the bytes are the
- * same as a pageable upload. */
+/* Linear weights stream from the mapped checkpoint, about 14 GB per prompt,
+ * while the GEMMs over a few dozen tokens take tens of milliseconds. So the
+ * upload, not the math, is the encoder's cost, and it is pipelined:
+ *
+ * - A loader thread walks the matrices in the order the layers consume them
+ *   and fills a ring of TEXT_SLOTS pinned + device buffers ahead of the GEMMs.
+ * - Each matrix is read out of the page cache by TEXT_COPY_THREADS threads
+ *   with pread() straight into the pinned slot. Copying from the checkpoint
+ *   mapping instead faults in every page and leaves 14 GB of mappings for the
+ *   kernel to tear down at exit, about a second on its own.
+ * - The DMA of one matrix overlaps the host copy of the next.
+ *
+ * The bytes on the device are exactly the checkpoint's, as before. */
+#include <fcntl.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <time.h>
 #define TEXT_WEIGHT_BYTES ((size_t)12288 * 4096 * 2)
-static void *text_pinned;
-static CUdeviceptr text_weight;
-static CUstream text_copy;
+#define TEXT_SLOTS 2
+#define TEXT_COPY_THREADS 8
 
-static CUdeviceptr text_upload(st_context *st, int idx) {
-    size_t bytes = safetensors_nbytes(st, idx);
-    const uint8_t *src = (const uint8_t *)safetensors_data(st, idx);
-    if (bytes > TEXT_WEIGHT_BYTES) return 0;
-    if (!text_pinned && cuMemHostAlloc(&text_pinned, TEXT_WEIGHT_BYTES, 0)) { text_pinned = NULL; return 0; }
-    if (!text_weight && !(text_weight = checked_cuMemAlloc(TEXT_WEIGHT_BYTES))) return 0;
-    if (!text_copy && cuStreamCreate(&text_copy, CU_STREAM_NON_BLOCKING)) { text_copy = NULL; return 0; }
-    const size_t chunk = (size_t)8 << 20;
-    for (size_t off = 0; off < bytes; off += chunk) {
-        size_t len = bytes - off < chunk ? bytes - off : chunk;
-        memcpy((uint8_t *)text_pinned + off, src + off, len);
-        if (cuMemcpyHtoDAsync(text_weight + off, (uint8_t *)text_pinned + off, len, text_copy)) return 0;
+static double text_seconds(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+
+typedef struct { const uint8_t *src; size_t bytes; int fd; off_t offset; } text_matrix;
+static struct {
+    pthread_t thread; int started;
+    pthread_mutex_t mu; pthread_cond_t cv;
+    text_matrix *jobs; int count;
+    int produced, consumed, failed, stop;
+    void *pinned[TEXT_SLOTS]; CUdeviceptr dev[TEXT_SLOTS]; CUevent ready[TEXT_SLOTS];
+    CUstream copy; CUcontext ctx;
+    size_t bytes_total; double wait_s, read_s;
+} tp = {.mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER};
+
+typedef struct { uint8_t *dst; const uint8_t *src; size_t bytes; int fd; off_t offset; int failed; } text_copy_part;
+static void *text_copy_part_run(void *arg) {
+    text_copy_part *part = arg;
+    if (part->fd < 0) { memcpy(part->dst, part->src, part->bytes); return NULL; }
+    for (size_t done = 0; done < part->bytes;) {
+        ssize_t got = pread(part->fd, part->dst + done, part->bytes - done, part->offset + (off_t)done);
+        if (got <= 0) { part->failed = 1; return NULL; }
+        done += (size_t)got;
     }
-    return cuStreamSynchronize(text_copy) ? 0 : text_weight;
+    return NULL;
+}
+
+static int text_parallel_copy(uint8_t *dst, const text_matrix *m) {
+    const uint8_t *src = m->src;
+    size_t bytes = m->bytes;
+    pthread_t threads[TEXT_COPY_THREADS];
+    text_copy_part parts[TEXT_COPY_THREADS];
+    size_t per = (bytes / TEXT_COPY_THREADS + 4095) & ~(size_t)4095;
+    int spawned = 0;
+    for (int t = 0; t < TEXT_COPY_THREADS; t++) {
+        size_t off = (size_t)t * per;
+        if (off >= bytes) break;
+        parts[t] = (text_copy_part){dst + off, src + off, bytes - off < per ? bytes - off : per,
+                                    m->fd, m->offset + (off_t)off, 0};
+        if (pthread_create(&threads[t], NULL, text_copy_part_run, &parts[t])) {
+            text_copy_part_run(&parts[t]);
+            continue;
+        }
+        spawned |= 1 << t;
+    }
+    int failed = 0;
+    for (int t = 0; t < TEXT_COPY_THREADS; t++) {
+        if (spawned & (1 << t)) pthread_join(threads[t], NULL);
+        if ((size_t)t * per < bytes) failed |= parts[t].failed;
+    }
+    return failed ? -1 : 0;
+}
+
+static void *text_loader(void *arg) {
+    (void)arg;
+    int failed = cuCtxSetCurrent(tp.ctx) != 0;
+    for (int i = 0; i < tp.count && !failed; i++) {
+        int slot = i % TEXT_SLOTS;
+        pthread_mutex_lock(&tp.mu);
+        /* The slot is free once the consumer is done with the matrix that used
+         * it last; its GEMM has completed, so so has that matrix's DMA. */
+        while (!tp.stop && i - tp.consumed >= TEXT_SLOTS) pthread_cond_wait(&tp.cv, &tp.mu);
+        int stop = tp.stop;
+        pthread_mutex_unlock(&tp.mu);
+        if (stop) break;
+        double read_start = text_seconds();
+        failed = text_parallel_copy(tp.pinned[slot], &tp.jobs[i]);
+        tp.read_s += text_seconds() - read_start;
+        failed = failed ||
+                 cuMemcpyHtoDAsync(tp.dev[slot], tp.pinned[slot], tp.jobs[i].bytes, tp.copy) ||
+                 cuEventRecord(tp.ready[slot], tp.copy);
+        pthread_mutex_lock(&tp.mu);
+        if (!failed) tp.produced = i + 1;
+        pthread_cond_broadcast(&tp.cv);
+        pthread_mutex_unlock(&tp.mu);
+    }
+    pthread_mutex_lock(&tp.mu);
+    tp.failed |= failed;
+    pthread_cond_broadcast(&tp.cv);
+    pthread_mutex_unlock(&tp.mu);
+    return NULL;
+}
+
+/* Start streaming `jobs` (owned by the caller until text_upload_free). */
+static int text_loader_start(text_matrix *jobs, int count) {
+    tp.jobs = jobs; tp.count = count;
+    if (cuCtxGetCurrent(&tp.ctx) || cuStreamCreate(&tp.copy, CU_STREAM_NON_BLOCKING)) return -1;
+    for (int s = 0; s < TEXT_SLOTS; s++) {
+        if (cuMemHostAlloc(&tp.pinned[s], TEXT_WEIGHT_BYTES, 0)) { tp.pinned[s] = NULL; return -1; }
+        if (!(tp.dev[s] = checked_cuMemAlloc(TEXT_WEIGHT_BYTES))) return -1;
+        if (cuEventCreate(&tp.ready[s], CU_EVENT_DISABLE_TIMING)) return -1;
+    }
+    for (int i = 0; i < count; i++) tp.bytes_total += jobs[i].bytes;
+    if (pthread_create(&tp.thread, NULL, text_loader, NULL)) return -1;
+    tp.started = 1;
+    return 0;
+}
+
+/* The device copy of matrix `i`, which must be the next one in stream order.
+ * Valid until text_release(i). */
+static CUdeviceptr text_acquire(int i, const uint8_t *src) {
+    if (i >= tp.count || tp.jobs[i].src != src) {
+        fprintf(stderr, "text: weight %d requested out of stream order\n", i);
+        return 0;
+    }
+    double start = text_seconds();
+    pthread_mutex_lock(&tp.mu);
+    while (tp.produced <= i && !tp.failed) pthread_cond_wait(&tp.cv, &tp.mu);
+    int ok = tp.produced > i;
+    pthread_mutex_unlock(&tp.mu);
+    if (!ok || cuEventSynchronize(tp.ready[i % TEXT_SLOTS])) return 0;
+    tp.wait_s += text_seconds() - start;
+    return tp.dev[i % TEXT_SLOTS];
+}
+
+static void text_release(int i) {
+    pthread_mutex_lock(&tp.mu);
+    tp.consumed = i + 1;
+    pthread_cond_broadcast(&tp.cv);
+    pthread_mutex_unlock(&tp.mu);
 }
 
 static void text_upload_free(void) {
-    if (text_copy) cuStreamDestroy(text_copy);
-    if (text_weight) cuMemFree(text_weight);
-    if (text_pinned) cuMemFreeHost(text_pinned);
-    text_copy = NULL; text_weight = 0; text_pinned = NULL;
+    if (tp.started) {
+        pthread_mutex_lock(&tp.mu);
+        tp.stop = 1;
+        pthread_cond_broadcast(&tp.cv);
+        pthread_mutex_unlock(&tp.mu);
+        pthread_join(tp.thread, NULL);
+        tp.started = 0;
+    }
+    if (tp.copy) cuStreamSynchronize(tp.copy);
+    for (int s = 0; s < TEXT_SLOTS; s++) {
+        if (tp.ready[s]) cuEventDestroy(tp.ready[s]);
+        if (tp.dev[s]) cuMemFree(tp.dev[s]);
+        if (tp.pinned[s]) cuMemFreeHost(tp.pinned[s]);
+        tp.ready[s] = NULL; tp.dev[s] = 0; tp.pinned[s] = NULL;
+    }
+    if (tp.copy) cuStreamDestroy(tp.copy);
+    tp.copy = NULL;
 }
+static int text_matrix_index;
+static int text_fds[4] = {-1, -1, -1, -1};
 typedef int (*q21_cutlass_text_attention_fn)(float *, const void *, const void *,
                                              const void *, int, CUstream);
+
+/* Stream-ordered variants of the denoiser's launch helpers, which end in a
+ * context synchronize that would also wait on the weight loader's DMA. */
+static int text_cast(cuda_qimg_runner *r, CUdeviceptr dst, CUdeviceptr src, int n) {
+    void *a[] = {&src, &dst, &n};
+    int rc = (int)cuLaunchKernel(r->cast_f32_to_bf16, (n + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, a, NULL);
+    return rc ? rc : (int)cuStreamSynchronize(r->stream);
+}
+static int text_vec(CUfunction f, CUstream st, int n, CUdeviceptr x) {
+    void *a[] = {&x, &n};
+    int rc = (int)cuLaunchKernel(f, (n + 255) / 256, 1, 1, 256, 1, 1, 0, st, a, NULL);
+    return rc ? rc : (int)cuStreamSynchronize(st);
+}
 
 static int text_linear(cuda_qimg_runner *r, qimg21_kernels *k,
                        const qimg21_shards *s, const char *name,
@@ -59,25 +207,73 @@ static int text_linear(cuda_qimg_runner *r, qimg21_kernels *k,
         fprintf(stderr, "text: unsupported/missing matrix %s\n", name);
         return -1;
     }
-    /* The previous GEMM finished before this call (every linear ends with a
-     * context synchronize), so the shared weight buffer is free. */
-    CUdeviceptr w = text_upload(st, idx);
+    int slot_index = text_matrix_index++;
+    CUdeviceptr w = text_acquire(slot_index, (const uint8_t *)safetensors_data(st, idx));
     if (!w) { fprintf(stderr, "text: upload of %s failed\n", name); return -1; }
-    int rc = cuCtxSynchronize();
-    if (!rc && text_bf16_gemm_output) {
-        CUdeviceptr result = checked_cuMemAlloc((size_t)n * no * 2), bias = 0;
-        if (!result) return -1;
-        rc = cublasew_gemm_bf16_bf16_bf16_rowmajor_nt(r->cublaslt_ctx, result, w, in_bf, n, no, ni);
-        if (!rc) rc = cuCtxSynchronize();
+    /* Stream syncs only: a context synchronize would also wait for the next
+     * matrix's DMA on the loader's stream and serialize the pipeline. The
+     * GEMM result buffer is persistent for the same reason -- cuMemFree may
+     * wait on the whole device. */
+    static CUdeviceptr result;
+    int rc = 0;
+    if (text_bf16_gemm_output) {
+        if (!result && !(result = checked_cuMemAlloc((size_t)4096 * 12288 * 2))) rc = -1;
+        if ((size_t)n * no > (size_t)4096 * 12288) rc = -1;
+        CUdeviceptr bias = 0;
+        if (!rc) rc = cublasew_gemm_bf16_bf16_bf16_rowmajor_nt(r->cublaslt_ctx, result, w, in_bf, n, no, ni);
         void *args[] = {&out, &result, &bias, &no, &n};
         if (!rc) rc = cuLaunchKernel(r->bf16_to_f32_add_bias, (n * no + 255) / 256, 1, 1,
                                      256, 1, 1, 0, r->stream, args, NULL);
-        if (!rc) rc = cuCtxSynchronize();
-        free_d(&result);
-    } else if (!rc) rc = gemm(r, out, w, in_bf, n, no, ni);
-    if (!rc) rc = launch_vec(k->round_bf16, r->stream, n * no, out);
-    if (!rc) rc = cuCtxSynchronize();
+    } else rc = gemm(r, out, w, in_bf, n, no, ni);
+    if (!rc) rc = text_vec(k->round_bf16, r->stream, n * no, out);
+    /* The GEMM is done with the weight, so its slot can be refilled. */
+    text_release(slot_index);
     return rc;
+}
+
+/* Norm weights are tiny (about 1 MB for all layers), so they are converted
+ * and uploaded once, before the layers run, instead of an allocate, copy and
+ * free per call -- a free may wait on the whole device, which would stall
+ * the weight pipeline. text_norm_preload fills this table in call order. */
+typedef struct { const void *src; CUdeviceptr dev; } text_norm_weight;
+static text_norm_weight *text_norms;
+static int text_norm_count;
+static CUdeviceptr text_norm_arena;
+
+static int text_norm_preload(const qimg21_shards *s, int start_layer, int layers) {
+    static const char *order[] = {"input_layernorm.weight", "self_attn.q_norm.weight",
+                                  "self_attn.k_norm.weight", "post_attention_layernorm.weight"};
+    int count = (layers - start_layer) * 4;
+    size_t floats = 0;
+    char name[256];
+    text_norms = calloc((size_t)count, sizeof(*text_norms));
+    if (!text_norms) return -1;
+    for (int pass = 0; pass < 2; pass++) {
+        size_t at = 0;
+        for (int l = start_layer, i = 0; l < layers; l++)
+            for (int j = 0; j < 4; j++, i++) {
+                int idx;
+                snprintf(name, sizeof(name), "model.language_model.layers.%d.%s", l, order[j]);
+                st_context *st = find_tensor(s, name, &idx);
+                if (!st || strcmp(safetensors_dtype(st, idx), "BF16")) return -1;
+                size_t d = safetensors_nbytes(st, idx) / 2;
+                if (pass == 1) {
+                    float *host = malloc(d * sizeof(float));
+                    const uint16_t *bf = (const uint16_t *)safetensors_data(st, idx);
+                    if (!host) return -1;
+                    for (size_t k = 0; k < d; k++) { uint32_t u = (uint32_t)bf[k] << 16; memcpy(&host[k], &u, 4); }
+                    text_norms[i] = (text_norm_weight){safetensors_data(st, idx), text_norm_arena + at * 4};
+                    int rc = cuMemcpyHtoD(text_norms[i].dev, host, d * sizeof(float));
+                    free(host);
+                    if (rc) return -1;
+                }
+                at += (d + 63) & ~(size_t)63;
+            }
+        if (pass == 0 && !(text_norm_arena = checked_cuMemAlloc((floats = at) * sizeof(float)))) return -1;
+    }
+    (void)floats;
+    text_norm_count = count;
+    return 0;
 }
 
 static int text_norm(cuda_qimg_runner *r, CUfunction fn, const qimg21_shards *s,
@@ -87,8 +283,10 @@ static int text_norm(cuda_qimg_runner *r, CUfunction fn, const qimg21_shards *s,
     st_context *st = find_tensor(s, name, &idx);
     if (!st || strcmp(safetensors_dtype(st, idx), "BF16") ||
         safetensors_nbytes(st, idx) != (size_t)d * 2) return -1;
-    CUdeviceptr w = upload_f32(s, name);
-    if (!w) return -1;
+    CUdeviceptr w = 0;
+    for (int i = 0; i < text_norm_count && !w; i++)
+        if (text_norms[i].src == safetensors_data(st, idx)) w = text_norms[i].dev;
+    if (!w) { fprintf(stderr, "text: norm %s was not preloaded\n", name); return -1; }
     void *a[] = {&out, &in, &w, &d, &rows};
     int threads = d == 128 ? 32 : 256;
     int rc = cuCtxSynchronize();
@@ -96,7 +294,6 @@ static int text_norm(cuda_qimg_runner *r, CUfunction fn, const qimg21_shards *s,
         ? cuLaunchKernel(fn, (rows + 15) / 16, 1, 1, 32, 16, 1, 0, r->stream, a, NULL)
         : cuLaunchKernel(fn, rows, 1, 1, threads, 1, 1, 0, r->stream, a, NULL);
     if (!rc) rc = cuStreamSynchronize(r->stream);
-    free_d(&w);
     return rc;
 }
 
@@ -156,6 +353,10 @@ int main(int argc, char **argv) {
                         "--max-layers 36 --dump-layer N]\n", argv[0]); return 2;
     }
     int ids[4096], n = 0, scanned = EOF;
+    double t_start = text_seconds(), t_mark = t_start;
+    /* One "timing:" line per setup phase, for the demo's breakdown. */
+    #define TEXT_PHASE(label) do { double now_ = text_seconds(); \
+        fprintf(stderr, "timing: %s %.3f s\n", label, now_ - t_mark); t_mark = now_; } while (0)
     if (prompt) {
         char tokenizer_path[2048];
         int length = snprintf(tokenizer_path, sizeof(tokenizer_path),
@@ -193,8 +394,10 @@ int main(int argc, char **argv) {
         if (fclose(fp)) { perror("text: close token dump"); return 1; }
     }
     if (!out) return 0;
+    TEXT_PHASE("tokenize");
 
     int rc = 1;
+    text_matrix *jobs = NULL;
     qimg21_shards shards = {{0}, 0};
     cuda_qimg_runner *r = NULL;
     CUmodule module = NULL, base_module = NULL;
@@ -258,8 +461,10 @@ int main(int argc, char **argv) {
         memcpy(host, hidden.data, (size_t)n * 4096 * sizeof(float));
         npy_free(&hidden);
     }
+    TEXT_PHASE("open checkpoint + embed tokens");
     r = cuda_qimg_init(0, 1);
     if (!r) goto done;
+    TEXT_PHASE("CUDA init");
     if (strcmp(attention_mode, "custom")) {
         const char *plugin_path = !strcmp(attention_mode, "flash-exact")
             ? "cuda/qimg21/libq21_flash_attention.so"
@@ -291,6 +496,41 @@ int main(int argc, char **argv) {
         cuModuleGetFunction(&rope_lookup,module,"text_rope_table") ||
         cuModuleGetFunction(&attention,module,"text_attn") ||
         cuModuleGetFunction(&mul_silu,module,"text_mul_silu")) goto done;
+    TEXT_PHASE("load kernels + attention plugin");
+    /* Every linear the layers will ask for, in the order they ask, so the
+     * loader can run ahead of them. */
+    {
+        static const char *order[] = {"self_attn.q_proj.weight", "self_attn.k_proj.weight",
+                                      "self_attn.v_proj.weight", "self_attn.o_proj.weight",
+                                      "mlp.gate_proj.weight", "mlp.up_proj.weight",
+                                      "mlp.down_proj.weight"};
+        int count = (layers - start_layer) * 7, at = 0;
+        for (int i = 0; i < shards.n; i++) {
+            snprintf(path, sizeof(path), "%s/text_encoder/model-%05d-of-00004.safetensors", model, i + 1);
+            text_fds[i] = open(path, O_RDONLY);
+        }
+        jobs = calloc((size_t)count, sizeof(*jobs));
+        if (!jobs) goto done;
+        for (int l = start_layer; l < layers; l++)
+            for (int j = 0; j < 7; j++) {
+                int tensor;
+                snprintf(name, sizeof(name), "model.language_model.layers.%d.%s", l, order[j]);
+                st_context *owner = find_tensor(&shards, name, &tensor);
+                if (!owner || safetensors_nbytes(owner, tensor) > TEXT_WEIGHT_BYTES) {
+                    fprintf(stderr, "text: unsupported/missing matrix %s\n", name);
+                    goto done;
+                }
+                int shard = 0;
+                while (shard < shards.n && shards.st[shard] != owner) shard++;
+                const uint8_t *src = safetensors_data(owner, tensor);
+                /* Fall back to copying from the mapping if the file will not open. */
+                int fd = shard < shards.n ? text_fds[shard] : -1;
+                jobs[at++] = (text_matrix){src, safetensors_nbytes(owner, tensor), fd,
+                                           (off_t)(src - (const uint8_t *)owner->map_base)};
+            }
+        if (text_loader_start(jobs, count)) { fprintf(stderr, "text: weight loader failed to start\n"); goto done; }
+    }
+    if (text_norm_preload(&shards, start_layer, layers)) { fprintf(stderr, "text: norm weights failed to load\n"); goto done; }
     #define ALLOC(p,count,bytes) do { p=checked_cuMemAlloc((size_t)(count)*(bytes)); if(!p)goto done; } while(0)
     ALLOC(x,n*4096,4); ALLOC(norm,n*4096,4); ALLOC(bf,n*12288,2);
     ALLOC(q,n*4096,4); ALLOC(key,n*1024,4); ALLOC(v,n*1024,4);
@@ -353,6 +593,8 @@ int main(int argc, char **argv) {
     }
     if(dump_dir && mkdir(dump_dir,0755) && errno!=EEXIST)goto done;
     #define CHECK(call) do { if((call)!=0)goto done; } while(0)
+    TEXT_PHASE("buffers + RoPE table");
+    double t_layers = text_seconds();
     #define NAME(suffix) snprintf(name,sizeof(name),"model.language_model.layers.%d.%s",l,suffix)
     #define LINEAR(suffix,dst,no,ni) do { NAME(suffix); CHECK(text_linear(r,&base,&shards,name,dst,bf,n,no,ni)); } while(0)
     #define DUMP(label,ptr,width) do { if(dump_dir && l==dump_layer) { CHECK(cuCtxSynchronize()); qimg21_stage_dir=dump_dir; dump_stage("stage_" label,ptr,(size_t)n*(width),n,width); } } while(0)
@@ -367,7 +609,7 @@ int main(int argc, char **argv) {
         NAME("input_layernorm.weight"); CHECK(text_norm(r,input_rms,&shards,name,norm,x,n,4096,
                                                          input_rms == rms_aten));
         DUMP("input_layernorm",norm,4096);
-        CHECK(launch_cast(r,bf,norm,n*4096));
+        CHECK(text_cast(r,bf,norm,n*4096));
         LINEAR("self_attn.q_proj.weight",q,4096,4096);
         LINEAR("self_attn.k_proj.weight",key,1024,4096);
         LINEAR("self_attn.v_proj.weight",v,1024,4096);
@@ -381,9 +623,9 @@ int main(int argc, char **argv) {
         CHECK(cuLaunchKernel(rope_lookup,n,8,1,64,1,1,0,r->stream,ka,NULL));
         DUMP("rope_q",q,4096); DUMP("rope_k",key,1024);
         if (cutlass_attention) {
-            CHECK(launch_cast(r,q_bf,q,n*4096));
-            CHECK(launch_cast(r,key_bf,key,n*1024));
-            CHECK(launch_cast(r,v_bf,v,n*1024));
+            CHECK(text_cast(r,q_bf,q,n*4096));
+            CHECK(text_cast(r,key_bf,key,n*1024));
+            CHECK(text_cast(r,v_bf,v,n*1024));
             CHECK(cuStreamSynchronize(r->stream));
             CHECK(cutlass_attention((float *)(uintptr_t)att,
                                     (const void *)(uintptr_t)q_bf,
@@ -392,10 +634,10 @@ int main(int argc, char **argv) {
         } else {
             void *aa[]={&att,&q,&key,&v,&n};
             CHECK(cuLaunchKernel(attention,32,n,1,32,1,1,0,r->stream,aa,NULL));
-            CHECK(launch_vec(base.round_bf16,r->stream,n*4096,att));
+            CHECK(text_vec(base.round_bf16,r->stream,n*4096,att));
         }
         DUMP("self_attn.o_proj.input",att,4096);
-        CHECK(launch_cast(r,bf,att,n*4096));
+        CHECK(text_cast(r,bf,att,n*4096));
         LINEAR("self_attn.o_proj.weight",tmp,4096,4096);
         DUMP("self_attn.o_proj",tmp,4096);
         int count=n*4096; void *ra[]={&x,&tmp,&count};
@@ -408,13 +650,13 @@ int main(int argc, char **argv) {
         NAME("post_attention_layernorm.weight"); CHECK(text_norm(r,post_rms,&shards,name,norm,x,n,4096,
                                                                   post_rms == rms_aten));
         DUMP("post_attention_layernorm",norm,4096);
-        CHECK(launch_cast(r,bf,norm,n*4096));
+        CHECK(text_cast(r,bf,norm,n*4096));
         LINEAR("mlp.gate_proj.weight",gate,12288,4096);
         LINEAR("mlp.up_proj.weight",up,12288,4096);
         DUMP("mlp.gate_proj",gate,12288); DUMP("mlp.up_proj",up,12288);
         int ffcount=n*12288; void *ma[]={&gate,&gate,&up,&ffcount};
         CHECK(cuLaunchKernel(mul_silu,(ffcount+255)/256,1,1,256,1,1,0,r->stream,ma,NULL));
-        CHECK(launch_cast(r,bf,gate,ffcount));
+        CHECK(text_cast(r,bf,gate,ffcount));
         LINEAR("mlp.down_proj.weight",tmp,4096,12288);
         DUMP("mlp.down_proj",tmp,4096);
         CHECK(cuLaunchKernel(add,(count+255)/256,1,1,256,1,1,0,r->stream,ra,NULL));
@@ -444,9 +686,21 @@ int main(int argc, char **argv) {
         }
     }
     CHECK(cuStreamSynchronize(r->stream));
+    {
+        double seconds = text_seconds() - t_layers;
+        fprintf(stderr, "timing: %d layers %.3f s (%.1f GB of weights streamed at %.1f GB/s, "
+                        "%.3f s waiting on the upload, %.3f s reading the checkpoint)\n", layers - start_layer, seconds,
+                tp.bytes_total / 1e9, tp.bytes_total / 1e9 / (seconds > 0 ? seconds : 1), tp.wait_s, tp.read_s);
+        t_mark = text_seconds();
+    }
     CHECK(cuMemcpyDtoH(host,x,(size_t)n*4096*4));
     for(size_t i=0;i<(size_t)n*4096;i++)if(!isfinite(host[i]))goto done;
     rc=npy_write_f32(out,host+(size_t)drop*4096,(size_t)(n-drop)*4096,n-drop,4096);
+    TEXT_PHASE("write embeddings");
+    fprintf(stderr, "timing: text encoder total %.3f s\n", text_seconds() - t_start);
+    /* Tearing down the context, the pinned ring and 17 GB of mappings costs
+     * about a second and buys nothing: the process ends here either way. */
+    if (!rc && !getenv("QIMG21_TEXT_CLEAN_EXIT")) { fflush(NULL); _exit(0); }
     #undef CHECK
     #undef NAME
     #undef LINEAR
@@ -461,6 +715,10 @@ done:
     if(module)cuModuleUnload(module);
     if(base_module)cuModuleUnload(base_module);
     if(r)text_upload_free();
+    if(text_norm_arena)cuMemFree(text_norm_arena);
+    free(text_norms);
+    free(jobs);
+    for (int i = 0; i < 4; i++) if (text_fds[i] >= 0) close(text_fds[i]);
     if(r)cuda_qimg_free(r);
     if(cutlass_plugin)dlclose(cutlass_plugin);
     for(int i=0;i<shards.n;i++)safetensors_close(shards.st[i]);

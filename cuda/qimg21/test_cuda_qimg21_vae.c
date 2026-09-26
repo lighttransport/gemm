@@ -19,6 +19,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <math.h>
+#include <time.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -722,6 +723,11 @@ int main(int argc, char **argv) {
     }
     q21_vae_dump_dir = getenv("QIMG21_VAE_DUMP_DIR");
     if(q21_vae_dump_dir) mkdir(q21_vae_dump_dir,0755);
+    /* One "timing:" line per phase, for the demo's breakdown. */
+    struct timespec ts_; clock_gettime(CLOCK_MONOTONIC,&ts_);
+    double run_start=ts_.tv_sec+ts_.tv_nsec*1e-9, mark=run_start;
+#define Q21V_PHASE(label) do { struct timespec t_; clock_gettime(CLOCK_MONOTONIC,&t_); \
+        double now_=t_.tv_sec+t_.tv_nsec*1e-9; fprintf(stderr,"timing: %s %.3f s\n",label,now_-mark); mark=now_; } while(0)
     q21_npy a; if(q21_npy_read_f32(latent_path,&a)!=0)return 1;
     size_t need=(size_t)h*w*64;
     if(a.n!=need || a.ndim!=2 || a.shape[0]!=(size_t)h*w || a.shape[1]!=64){
@@ -732,6 +738,7 @@ int main(int argc, char **argv) {
         fprintf(stderr,"qimg21-vae: non-finite input latent\n");
         q21_npy_free(&a);return 1;
     }
+    Q21V_PHASE("read latents");
     char st_path[1024]; snprintf(st_path,sizeof(st_path),"%s/diffusion_pytorch_model.safetensors",model);
     st_context *st=safetensors_open(st_path); if(!st){q21_npy_free(&a);return 1;}
     cuda_qimg_runner *r=cuda_qimg_init(0,verbose); if(!r){safetensors_close(st);q21_npy_free(&a);return 1;}
@@ -750,6 +757,7 @@ int main(int argc, char **argv) {
     /* The shared VAE helpers use synchronous default-stream D2D copies for
      * residuals. Keep their kernels on that same stream: a nonblocking
      * stream otherwise races those copies and intermittently loses residuals. */
+    Q21V_PHASE("CUDA init + kernels");
     CUstream saved_stream = r->stream;
     cuStreamSynchronize(saved_stream);
     r->stream = NULL;
@@ -761,7 +769,10 @@ int main(int argc, char **argv) {
                      : qimg21_vae_decode(r, st, a.data, h, w, out);
     cuStreamSynchronize(r->stream);
     r->stream = saved_stream;
+    Q21V_PHASE("VAE decode (weights + convolutions)");
     if(!rc) rc=q21_npy_write_chw(out_path,out,(size_t)4*(h*16)*(w*16),4,h*16,w*16);
+    Q21V_PHASE("write pixels");
+    fprintf(stderr,"timing: VAE total %.3f s\n",mark-run_start);
     free(out); cuda_qimg_free(r); safetensors_close(st); q21_npy_free(&a);
     /* The plugin keeps its cuDNN handle; leave it loaded until exit. */
     (void)cudnn_plugin;

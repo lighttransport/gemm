@@ -50,7 +50,20 @@ def device_label(torch, device) -> str:
     return f"rocm {hip}" if hip else f"cuda {torch.cuda.get_device_name(0)}"
 
 
+_phase_mark = [time.perf_counter()]
+
+
+def phase(label: str, seconds: float | None = None) -> None:
+    """One "timing:" line per phase, for the demo's breakdown. With no
+    `seconds`, the phase is the time since the previous one."""
+    now = time.perf_counter()
+    print(f"timing: {label} {now - _phase_mark[0] if seconds is None else seconds:.3f} s",
+          file=sys.stderr, flush=True)
+    _phase_mark[0] = now
+
+
 def main() -> int:
+    run_start = time.perf_counter()
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     ap.add_argument("--prompt", default="a red apple on a white table")
@@ -86,8 +99,10 @@ def main() -> int:
                     help="use captured pre-final-RMSNorm prompt embeddings and image-pad mask")
     args = ap.parse_args()
 
+    _phase_mark[0] = time.perf_counter()
     import torch
     from diffusers import QwenImage21Pipeline
+    phase("import torch + diffusers")
 
     device = resolve_device(torch, args.device)
     on_gpu = device.type == "cuda"
@@ -104,9 +119,11 @@ def main() -> int:
     out.mkdir(parents=True, exist_ok=True)
     image = Image.open(args.image) if args.image else None
     dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
+    _phase_mark[0] = time.perf_counter()
     pipe = QwenImage21Pipeline.from_pretrained(
         str(Path(args.model).resolve()), dtype=dtype, local_files_only=True
     )
+    phase("load pipeline weights (from_pretrained)")
     if on_gpu:
         # The weights are 31 GB and the demo holds a native run in the same
         # device, so the pipeline is streamed module by module rather than
@@ -114,6 +131,7 @@ def main() -> int:
         pipe.enable_sequential_cpu_offload(device=device)
     else:
         pipe.to(device)
+    phase("move to device / CPU offload setup")
     if args.prompt_fixture_dir:
         fixture = args.prompt_fixture_dir
         prompt_array = np.load(fixture / "prompt_embeds.npy", allow_pickle=False)
@@ -344,7 +362,36 @@ def main() -> int:
             np.ascontiguousarray(initial_latents[0].detach().float().cpu().numpy()),
         )
 
+    # Where the pipeline's time goes. The denoise span runs from the first
+    # transformer call to the last step callback; prompt encoding and the VAE
+    # decode are timed by wrapping them. A device sync bounds each span, so a
+    # queued kernel is not counted in the next phase.
+    spans = {"encode": 0.0, "decode": 0.0, "first_step": None, "last_step": None}
+
+    def synced():
+        if on_gpu:
+            torch.cuda.synchronize()
+        return time.perf_counter()
+
+    def timed(key, fn):
+        def wrapper(*a, **k):
+            start = synced()
+            try:
+                return fn(*a, **k)
+            finally:
+                spans[key] += synced() - start
+        return wrapper
+
+    pipe.encode_prompt = timed("encode", pipe.encode_prompt)
+    pipe.vae.decode = timed("decode", pipe.vae.decode)
+
+    def first_transformer_call(_module, _inputs):
+        if spans["first_step"] is None:
+            spans["first_step"] = synced()
+    timing_handle = pipe.transformer.register_forward_pre_hook(first_transformer_call)
+
     def callback(_pipe, step, _timestep, kwargs):
+        spans["last_step"] = synced()
         value = kwargs.get("latents")
         if value is not None:
             np.save(out / f"step_{step:03d}.npy", value.detach().float().cpu().numpy())
@@ -379,6 +426,15 @@ def main() -> int:
             callback_on_step_end=callback,
             callback_on_step_end_tensor_inputs=["latents", "prompt_embeds"],
         )
+    timing_handle.remove()
+    pipeline_s = time.perf_counter() - t0
+    denoise_s = (spans["last_step"] - spans["first_step"]
+                 if spans["first_step"] is not None and spans["last_step"] is not None else 0.0)
+    phase("prompt encoding (text encoder)", spans["encode"])
+    phase(f"denoise {args.steps} steps (image generation)", denoise_s)
+    phase("VAE decode", spans["decode"])
+    phase("pipeline other (latent prep, scheduler, postprocess)",
+          max(0.0, pipeline_s - spans["encode"] - denoise_s - spans["decode"]))
     for handle in vae_handles:
         handle.remove()
     for handle in text_input_handles:
@@ -407,6 +463,8 @@ def main() -> int:
         "use_kv_cache": use_kv_cache,
         "prompt_fixture_dir": str(args.prompt_fixture_dir.resolve()) if args.prompt_fixture_dir else None,
     }, indent=2) + "\n")
+    phase("write image + fixtures")
+    print(f"timing: reference total {time.perf_counter() - run_start:.3f} s", file=sys.stderr)
     print(f"saved {out / 'reference.png'}")
     return 0
 

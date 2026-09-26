@@ -5,7 +5,8 @@ from pathlib import Path
 from unittest import mock
 
 from server.qwen_image21.app import (MAX_EVENTS, Demo, Progress, REFERENCE_DEVICES, ROOT,
-                                     StepPreviews, compare_runs, denoised_estimate, flow_sigmas)
+                                     StepPreviews, compare_runs, denoised_estimate, flow_sigmas,
+                                     generation_seconds, timing_breakdown)
 import time
 
 
@@ -850,6 +851,93 @@ class QwenImage21PreviewTest(unittest.TestCase):
             self.assertEqual((events[0]["index"], events[0]["total"]), (1, 5))
             # Nobody is watching a run without a job id, so nothing is decoded.
             self.assertNotIsInstance(demo._previews(None, "native", root, root, cfg), StepPreviews)
+
+
+class QwenImage21TimingTest(unittest.TestCase):
+    LOG = """text: prompt embedding cache hit (abc)
+timing: prompt embedding cache hit 0.000 s
++ /x/cuda/qimg21/test_cuda_qimg21_fast --preset fast12
+timing: CUDA init + kernels + memory plan 0.238 s
+timing: load transformer weights (6936 MiB) 2.630 s
+timing: denoise 10 steps (image generation) 3.234 s
+  (test_cuda_qimg21_fast: 6.6 s)
++ /x/cuda/qimg21/test_cuda_qimg21_text --prompt p
+timing: 36 layers 3.447 s (13.9 GB of weights streamed at 4.0 GB/s, 2.842 s waiting on the upload)
+"""
+
+    def test_a_timing_line_becomes_an_event_under_its_stage(self):
+        tracker = Progress(0.0)
+        tracker.feed("+ /x/test_cuda_qimg21_text --prompt p", 0.0)
+        event = tracker.feed("timing: 36 layers 3.447 s (13.9 GB streamed)", 1.0)
+        self.assertEqual((event["kind"], event["stage"], event["label"], event["seconds"], event["detail"]),
+                         ("timing", "encode prompt", "36 layers", 3.447, "13.9 GB streamed"))
+        self.assertIsNone(tracker.feed("timing: nonsense", 1.0))
+
+    def test_the_breakdown_groups_phases_and_finds_the_generation_time(self):
+        with tempfile.TemporaryDirectory(dir=ROOT / "tmp", prefix="qimg21-test-") as td:
+            log = Path(td) / "cuda.log"
+            log.write_text(self.LOG)
+            rows = timing_breakdown(log, "encode prompt")
+        self.assertEqual([(r["stage"], r["label"]) for r in rows], [
+            ("encode prompt", "prompt embedding cache hit"),
+            ("denoise", "CUDA init + kernels + memory plan"),
+            ("denoise", "load transformer weights (6936 MiB)"),
+            ("denoise", "denoise 10 steps (image generation)"),
+            ("denoise", "stage total"),
+            ("encode prompt", "36 layers")])
+        self.assertTrue(rows[4]["total"])
+        self.assertAlmostEqual(generation_seconds(rows), 3.234)
+        self.assertIsNone(generation_seconds(rows[:1]))
+        self.assertEqual(timing_breakdown(Path(td) / "missing.log", "x"), [])
+
+
+class QwenImage21RestartTest(unittest.TestCase):
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory(dir=ROOT / "tmp", prefix="qimg21-test-")
+        self.root = Path(self.td.name)
+        self.demo = QwenImage21RoutingTest.make_demo(None, self.root)
+        self.source = "a" * 32
+        work = self.root / "work" / self.source / "cuda-work"
+        work.mkdir(parents=True)
+        (work / "native_latents.npy").write_bytes(b"x")
+        (work / "latents.npy").write_bytes(b"x")
+        (work.parent / "request.json").write_text('{"width": 512, "height": 512}')
+
+    def tearDown(self):
+        self.td.cleanup()
+
+    def request(self, **extra):
+        base = {"prompt": "apple", "backend": "cuda", "mode": "native", "preset": "fast12",
+                "width": 512, "height": 512, "steps": 20, "restart_from": self.source}
+        base.update(extra)
+        return base
+
+    def test_a_refine_continues_the_earlier_run_from_its_noise(self):
+        cfg = self.demo._validate(self.request(restart_keep=0.5))
+        self.assertEqual(self.demo.restart_step(cfg), 10)
+        commands = []
+        with mock.patch.object(self.demo, "_run", side_effect=lambda c, *a, **k: commands.append(c)), \
+             mock.patch.object(self.demo, "preset_available", return_value=True):
+            self.demo._native(cfg, self.root / "out")
+        command = commands[0]
+        work = self.root / "work" / self.source / "cuda-work"
+        self.assertEqual(command[command.index("--initial-latents") + 1], str(work / "latents.npy"))
+        self.assertEqual(command[command.index("--restart-from") + 1], str(work / "native_latents.npy"))
+        self.assertEqual(command[command.index("--restart-step") + 1], "10")
+        # At least one step always runs, whatever keep says.
+        self.assertEqual(self.demo.restart_step(self.demo._validate(self.request(steps=4, restart_keep=0.95))), 3)
+
+    def test_a_refine_is_refused_when_it_cannot_continue_the_picture(self):
+        bad = [({"restart_from": "../etc"}, "job id"),
+               ({"preset": ""}, "fast preset"),
+               ({"mode": "compare"}, "fast preset"),
+               ({"restart_keep": 0.99}, "between 0 and 0.95"),
+               ({"width": 768}, "size"),
+               ({"restart_from": "b" * 32}, "gone")]
+        for extra, reason in bad:
+            with self.subTest(extra=extra):
+                with self.assertRaisesRegex(ValueError, reason):
+                    self.demo._validate(self.request(**extra))
 
 
 if __name__ == "__main__":
