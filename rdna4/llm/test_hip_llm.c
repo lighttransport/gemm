@@ -278,7 +278,27 @@ typedef struct {
     size_t bytes;
     uint64_t age;
     int portable;
+    int shared;                 /* system-prefix state usable by any identity */
+    unsigned char *text;        /* exact UTF-8 bytes behind tokens, if known */
+    size_t text_n;
 } stdio_snapshot_entry;
+
+/* Identity of system-prefix snapshots shared across conversations.  The
+ * content key is still the exact token prefix; only the namespace is shared. */
+#define STDIO_SHARED_PREFIX_IDENTITY "*shared-prefix*"
+
+static int stdio_shared_prefix_enabled(void) {
+    const char *e = getenv("LLM_SERVER_SHARED_PREFIX");
+    return !e || atoi(e) != 0;
+}
+
+/* Does prompt p extend base at a special-token boundary ("<|...")?  Then the
+ * appended bytes tokenize identically on their own. */
+static int stdio_text_extends(const unsigned char *p, size_t pn,
+                              const unsigned char *base, size_t bn) {
+    return base && bn > 0 && pn >= bn && memcmp(p, base, bn) == 0 &&
+           (pn == bn || (pn - bn >= 2 && memcmp(p + bn, "<|", 2) == 0));
+}
 
 typedef struct {
     stdio_snapshot_entry *entries;
@@ -296,6 +316,7 @@ static void stdio_snapshot_entry_clear(stdio_snapshot_cache *cache, int i) {
     }
     free(entry->tokens);
     free(entry->identity);
+    free(entry->text);
     hip_llm_free_state_snapshot(entry->snapshot);
     memset(entry, 0, sizeof(*entry));
 }
@@ -334,8 +355,10 @@ static int stdio_snapshot_cache_find(const stdio_snapshot_cache *cache,
     for (int i = 0; i < cache->capacity; ++i) {
         const stdio_snapshot_entry *entry = &cache->entries[i];
         if (!entry->snapshot || entry->n_tokens > n_tokens ||
-            (!entry->portable && !allow_resident) ||
-            strcmp(entry->identity, identity) != 0) continue;
+            (!entry->portable && !allow_resident)) continue;
+        if (strcmp(entry->identity, identity) != 0 &&
+            !(entry->shared && entry->portable && stdio_shared_prefix_enabled()))
+            continue;
         if (memcmp(entry->tokens, tokens,
                    (size_t)entry->n_tokens * sizeof(*tokens)) != 0) continue;
         if (best < 0 || entry->n_tokens > cache->entries[best].n_tokens)
@@ -348,11 +371,12 @@ static int stdio_snapshot_cache_find(const stdio_snapshot_cache *cache,
 static int stdio_snapshot_cache_publish(stdio_snapshot_cache *cache,
                                         const char *identity,
                                         const int32_t *tokens, int n_tokens,
-                                        hip_llm_state_snapshot *snapshot) {
+                                        hip_llm_state_snapshot *snapshot,
+                                        const unsigned char *text, size_t text_n) {
     if (!snapshot) return 0;
     size_t state_bytes = hip_llm_state_snapshot_bytes(snapshot);
     size_t bytes = state_bytes + (size_t)n_tokens * sizeof(*tokens) +
-                   strlen(identity) + 1;
+                   strlen(identity) + 1 + (text ? text_n : 0);
     int snapshot_tokens = hip_llm_state_snapshot_token_count(snapshot);
     int portable = hip_llm_state_snapshot_is_portable(snapshot);
     if (snapshot_tokens != n_tokens || !cache->entries ||
@@ -369,8 +393,10 @@ static int stdio_snapshot_cache_publish(stdio_snapshot_cache *cache,
     }
     int32_t *token_copy = malloc((size_t)n_tokens * sizeof(*tokens));
     char *identity_copy = strdup(identity);
-    if (!token_copy || !identity_copy) {
-        free(token_copy); free(identity_copy);
+    unsigned char *text_copy = text && text_n ? malloc(text_n) : NULL;
+    if (text_copy) memcpy(text_copy, text, text_n);
+    if (!token_copy || !identity_copy || (text && text_n && !text_copy)) {
+        free(token_copy); free(identity_copy); free(text_copy);
         hip_llm_free_state_snapshot(snapshot);
         return -1;
     }
@@ -390,11 +416,15 @@ static int stdio_snapshot_cache_publish(stdio_snapshot_cache *cache,
     size_t replaced = slot >= 0 && cache->entries[slot].snapshot ?
                       cache->entries[slot].bytes : 0;
     while (cache->bytes - replaced + bytes > cache->byte_limit || slot < 0) {
+        /* Evict conversation state before the shared system prefix, which
+         * every new conversation restores. */
         int oldest = -1;
-        for (int i = 0; i < cache->capacity; ++i)
-            if (i != slot && cache->entries[i].snapshot &&
-                (oldest < 0 || cache->entries[i].age < cache->entries[oldest].age))
-                oldest = i;
+        for (int pass = 0; pass < 2 && oldest < 0; ++pass)
+            for (int i = 0; i < cache->capacity; ++i)
+                if (i != slot && cache->entries[i].snapshot &&
+                    (pass || !cache->entries[i].shared) &&
+                    (oldest < 0 || cache->entries[i].age < cache->entries[oldest].age))
+                    oldest = i;
         if (oldest < 0) break;
         stdio_snapshot_entry_clear(cache, oldest);
         if (slot < 0) slot = oldest;
@@ -402,7 +432,7 @@ static int stdio_snapshot_cache_publish(stdio_snapshot_cache *cache,
     replaced = slot >= 0 && cache->entries[slot].snapshot ?
                cache->entries[slot].bytes : 0;
     if (slot < 0 || cache->bytes - replaced + bytes > cache->byte_limit) {
-        free(token_copy); free(identity_copy);
+        free(token_copy); free(identity_copy); free(text_copy);
         hip_llm_free_state_snapshot(snapshot);
         return 0;
     }
@@ -412,15 +442,77 @@ static int stdio_snapshot_cache_publish(stdio_snapshot_cache *cache,
         .identity = identity_copy, .snapshot = snapshot,
         .bytes = bytes, .age = ++cache->clock,
         .portable = portable,
+        .shared = strcmp(identity, STDIO_SHARED_PREFIX_IDENTITY) == 0,
+        .text = text_copy, .text_n = text_copy ? text_n : 0,
     };
     cache->bytes += bytes;
     fprintf(stderr,
-            "llm_server: context snapshot committed slot=%d kind=%s tokens=%d "
+            "llm_server: context snapshot committed slot=%d kind=%s%s tokens=%d "
             "bytes=%.1f MiB cache=%.1f MiB\n",
-            slot, portable ? "portable" : "resident", n_tokens,
+            slot, portable ? "portable" : "resident",
+            cache->entries[slot].shared ? "+shared" : "", n_tokens,
             bytes / (double)(1ULL << 20),
             cache->bytes / (double)(1ULL << 20));
     return 1;
+}
+
+/* The live state of a conversation that is about to lose the device (another
+ * identity is taking over), captured before any restore/reset and published
+ * only after the incoming conversation's entry was restored and touched, so
+ * saving it can never evict the state the incoming request needs. */
+typedef struct {
+    hip_llm_state_snapshot *snapshot;
+    char identity[513];
+    int32_t *tokens;
+    int n_tokens;
+    unsigned char *text;
+    size_t text_n;
+} stdio_outgoing;
+
+static void stdio_capture_live(hip_llm_runner *gpu, const stdio_snapshot_cache *c,
+                               stdio_outgoing *out, const char *identity,
+                               const int32_t *tokens, int n_tokens,
+                               const unsigned char *text, size_t text_n) {
+    memset(out, 0, sizeof(*out));
+    if (!c->entries || n_tokens <= 0 || !identity[0] || !text || !text_n)
+        return;
+    for (int i = 0; i < c->capacity; ++i) {
+        const stdio_snapshot_entry *e = &c->entries[i];
+        /* Already saved (unchanged since): not a reuse, so no LRU touch. */
+        if (e->snapshot && e->n_tokens == n_tokens &&
+            strcmp(e->identity, identity) == 0 &&
+            !memcmp(e->tokens, tokens, (size_t)n_tokens * sizeof(*tokens)))
+            return;
+    }
+    out->snapshot = hip_llm_snapshot_state(gpu);
+    if (!out->snapshot) {
+        fprintf(stderr, "llm_server: live state not saved tokens=%d "
+                "(snapshot unavailable or above --qwen35-snapshot-max-tokens)\n",
+                n_tokens);
+        return;
+    }
+    out->tokens = malloc((size_t)n_tokens * sizeof(*tokens));
+    out->text = malloc(text_n);
+    if (!out->tokens || !out->text) {
+        hip_llm_free_state_snapshot(out->snapshot);
+        free(out->tokens); free(out->text);
+        memset(out, 0, sizeof(*out));
+        return;
+    }
+    memcpy(out->tokens, tokens, (size_t)n_tokens * sizeof(*tokens));
+    memcpy(out->text, text, text_n);
+    out->n_tokens = n_tokens;
+    out->text_n = text_n;
+    snprintf(out->identity, sizeof(out->identity), "%s", identity);
+}
+
+static void stdio_publish_outgoing(stdio_snapshot_cache *c, stdio_outgoing *out) {
+    if (out->snapshot)
+        stdio_snapshot_cache_publish(c, out->identity, out->tokens, out->n_tokens,
+                                     out->snapshot, out->text, out->text_n);
+    free(out->tokens);
+    free(out->text);
+    memset(out, 0, sizeof(*out));
 }
 
 static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
@@ -433,6 +525,16 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
     int32_t *cache = (int32_t *)malloc((size_t)max_seq_len * sizeof(int32_t));
     int cache_n = 0;
     char active_identity[513] = "";
+    /* UTF-8 bytes that cache[0..cache_n) decode to (prompt + generated), when
+     * known exactly.  A follow-up prompt that extends these bytes keeps the
+     * live tokens: generated tokens need not be the canonical BPE of their
+     * own text, and a hybrid recurrent state cannot be rewound to the point
+     * where a full re-tokenization would diverge. */
+    unsigned char *live_bytes = NULL;
+    size_t live_bytes_n = 0;
+    int live_continuations = 0;
+    unsigned char *request_bytes = NULL;   /* this request's prompt bytes */
+    size_t request_bytes_n = 0;
     stdio_snapshot_cache snapshot_cache;
     unsigned rng = 0x51f15e5du;
     if (!cache || stdio_snapshot_cache_init(&snapshot_cache,
@@ -560,13 +662,101 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
 
         int cap = max_seq_len > 0 ? max_seq_len : 512;
         int32_t *tokens = (int32_t *)malloc((size_t)cap * sizeof(int32_t));
-        int n_tokens = tokens ? bpe_tokenize(vocab, (const char *)prompt,
-                                              (int)prompt_n, tokens, cap) : -1;
-        free(prompt);
+        int n_tokens = -1;
+        const char *cont_env = getenv("LLM_SERVER_LIVE_CONTINUATION");
+        int cont_ok = !cont_env || atoi(cont_env) != 0;
+        /* The previous request's exact bytes stay owned here until the state
+         * decisions below; live_bytes is rebuilt only after a clean request. */
+        unsigned char *prev_live = live_bytes;
+        size_t prev_live_n = live_bytes_n;
+        live_bytes = NULL;
+        live_bytes_n = 0;
+        stdio_outgoing outgoing;
+        memset(&outgoing, 0, sizeof(outgoing));
+        int text_base = 0;          /* tokens kept verbatim (live/snapshot) */
+        size_t text_off = 0;        /* prompt bytes those tokens cover */
+        int live_continued = 0;
+        if (tokens && cont_ok && cache_n > 0 &&
+            strcmp(active_identity, cache_identity) == 0 &&
+            stdio_text_extends(prompt, prompt_n, prev_live, prev_live_n)) {
+            text_base = cache_n;
+            text_off = prev_live_n;
+            live_continued = 1;
+        } else if (tokens && cont_ok && snapshot_cache.entries) {
+            int best = -1;
+            for (int i = 0; i < snapshot_cache.capacity; ++i) {
+                stdio_snapshot_entry *e = &snapshot_cache.entries[i];
+                if (!e->snapshot || !e->text || !e->portable ||
+                    strcmp(e->identity, cache_identity) != 0 ||
+                    !stdio_text_extends(prompt, prompt_n, e->text, e->text_n))
+                    continue;
+                if (best < 0 || e->text_n > snapshot_cache.entries[best].text_n)
+                    best = i;
+            }
+            if (best >= 0) {
+                if (strcmp(active_identity, cache_identity) != 0)
+                    stdio_capture_live(gpu, &snapshot_cache, &outgoing,
+                                       active_identity, cache, cache_n,
+                                       prev_live, prev_live_n);
+                stdio_snapshot_cache_drop_resident(&snapshot_cache);
+                stdio_snapshot_entry *e = &snapshot_cache.entries[best];
+                int rc = hip_llm_restore_state(gpu, e->snapshot);
+                if (rc == 0) {
+                    memcpy(cache, e->tokens, (size_t)e->n_tokens * sizeof(*cache));
+                    cache_n = e->n_tokens;
+                    e->age = ++snapshot_cache.clock;
+                    snprintf(active_identity, sizeof(active_identity), "%s",
+                             cache_identity);
+                    text_base = cache_n;
+                    text_off = e->text_n;
+                    fprintf(stderr,
+                            "llm_server: context snapshot restored slot=%d tokens=%d "
+                            "(text continuation)\n", best, cache_n);
+                    stdio_publish_outgoing(&snapshot_cache, &outgoing);
+                } else {
+                    fprintf(stderr,
+                            "llm_server: context snapshot restore failed slot=%d rc=%d\n",
+                            best, rc);
+                    stdio_snapshot_entry_clear(&snapshot_cache, best);
+                    hip_llm_reset_state(gpu);
+                    cache_n = 0;
+                    active_identity[0] = '\0';
+                    stdio_publish_outgoing(&snapshot_cache, &outgoing);
+                }
+            }
+        }
+        if (text_base > 0) {
+            /* The appended text starts at a special token, so tokenizing it
+             * alone yields the same pieces as inside the full prompt. */
+            memcpy(tokens, cache, (size_t)text_base * sizeof(int32_t));
+            int extra = prompt_n == text_off ? 0 :
+                bpe_tokenize(vocab, (const char *)prompt + text_off,
+                             (int)(prompt_n - text_off),
+                             tokens + text_base, cap - text_base);
+            if (extra >= 0 && text_base + extra <= cap) {
+                n_tokens = text_base + extra;
+                if (live_continued) live_continuations++;
+                fprintf(stderr, "llm_server: %s continuation #%d kept=%d appended=%d\n",
+                        live_continued ? "live" : "snapshot", live_continuations,
+                        text_base, extra);
+            } else {
+                text_base = 0;
+                live_continued = 0;
+            }
+        }
+        if (tokens && n_tokens < 0)
+            n_tokens = bpe_tokenize(vocab, (const char *)prompt,
+                                    (int)prompt_n, tokens, cap);
+        free(request_bytes);
+        request_bytes = prompt;
+        request_bytes_n = prompt_n;
+        prompt = NULL;
         if (!tokens || n_tokens <= 0) {
+            free(prev_live);
             free(prefix); free(tokens); puts("ERR tokenization"); fflush(stdout); continue;
         }
         if (n_tokens > cap || (bos_id > 0 && tokens[0] != bos_id && n_tokens == cap)) {
+            free(prev_live);
             free(prefix); free(tokens);
             puts("ERR prompt exceeds context capacity"); fflush(stdout); continue;
         }
@@ -597,6 +787,26 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
             while (common < cache_n && common < n_tokens &&
                    cache[common] == tokens[common]) common++;
         int have_state = cache_n > 0 && common == cache_n;
+        if (!have_state && cache_n > 0 && common > 0) {
+            /* Same conversation, but the live state cannot be extended: show
+             * where the client's re-rendered history left the tokens that were
+             * actually processed (typically a generated turn that does not
+             * re-tokenize identically). */
+            char live[160] = "", sent[160] = "";
+            for (int j = common; j < cache_n && j < common + 6; ++j) {
+                const char *pc = bpe_token_to_str(vocab, cache[j]);
+                size_t o = strlen(live);
+                snprintf(live + o, sizeof(live) - o, "%d[%s] ", cache[j], pc ? pc : "?");
+            }
+            for (int j = common; j < n_tokens && j < common + 6; ++j) {
+                const char *pc = bpe_token_to_str(vocab, tokens[j]);
+                size_t o = strlen(sent);
+                snprintf(sent + o, sizeof(sent) - o, "%d[%s] ", tokens[j], pc ? pc : "?");
+            }
+            fprintf(stderr,
+                    "llm_server: live prefix diverges at %d of %d (prompt %d): "
+                    "live %s| prompt %s\n", common, cache_n, n_tokens, live, sent);
+        }
         int prompt_snapshot_present = 0;
         if (have_state && common == n_tokens) {
             int exact = stdio_snapshot_cache_find(&snapshot_cache,
@@ -606,6 +816,12 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
                 prompt_snapshot_present = 1;
             }
         }
+        if (!have_state && cache_n > 0 && active_identity[0] &&
+            strcmp(active_identity, cache_identity) != 0)
+            stdio_capture_live(gpu, &snapshot_cache, &outgoing, active_identity,
+                               cache, cache_n, prev_live, prev_live_n);
+        free(prev_live);
+        prev_live = NULL;
         if (!have_state) {
             int allow_resident = strcmp(active_identity, cache_identity) == 0;
             int hit = stdio_snapshot_cache_find(&snapshot_cache, cache_identity,
@@ -654,6 +870,7 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
             common = 0;
             active_identity[0] = '\0';
         }
+        stdio_publish_outgoing(&snapshot_cache, &outgoing);
         /* Dense NextN owns request-local draft KV. It does not consume prompt
          * tokens, so even an append to a live target prefix must begin a new
          * draft sequence from the completed prompt boundary. */
@@ -734,7 +951,11 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
          * decoded to UTF-8 and may not re-tokenize to the original BPE pieces
          * on the next turn. If that happens, restore this boundary and replay
          * only the appended conversation suffix instead of resetting. */
-        if (snapshot_cache.entries && !prompt_snapshot_present)
+        /* A continuation (live or text-restored) needs no boundary copy: the
+         * live state is saved when another conversation takes over. */
+        const char *every_env = getenv("LLM_SERVER_SNAPSHOT_EVERY_PROMPT");
+        if (snapshot_cache.entries && !prompt_snapshot_present &&
+            (text_base == 0 || (every_env && atoi(every_env) != 0)))
             pending_prompt_snapshot = hip_llm_snapshot_state(gpu);
         hllm_sampler *sampler = use_reference ? hllm_sampler_create(&request_sampling, n_vocab) : NULL;
         if (use_reference && !sampler) {
@@ -758,7 +979,7 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
         if (max_tokens > max_seq_len - cache_n) max_tokens = max_seq_len - cache_n;
         size_t text_cap = (size_t)max_tokens * 16 + 1, text_n = 0;
         char *text = (char *)calloc(text_cap ? text_cap : 1, 1);
-        int generated = 0, finish_eos = 0;
+        int generated = 0, finish_eos = 0, live_text_bad = 0;
         int eos = bpe_eos_id(vocab), eot = bpe_eot_id(vocab), im_end = -1;
         /* Qwen ChatML terminates an assistant turn with this control token;
          * GGUF's eot_token_id is a different token for this checkpoint. */
@@ -830,9 +1051,11 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
             int is_stop = is_generation_stop(vocab, next, eos, eot) ||
                           next == im_end;
             const char *piece = bpe_token_to_str(vocab, next);
+            if (!is_stop && (!piece || !text)) live_text_bad = 1;
             if (!is_stop && piece && text) {
                 int raw_n = (int)strlen(piece), dec_n = 0;
                 char *decoded = bpe_byte_decode(piece, raw_n, &dec_n);
+                if (!decoded) live_text_bad = 1;
                 if (decoded) {
                     if (text_n + (size_t)dec_n + 1 > text_cap) {
                         text_cap = (text_n + (size_t)dec_n + 1) * 2;
@@ -1086,14 +1309,29 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
             active_identity[0] = '\0';
         } else if (!getenv("LLM_QWEN4_MTP_TRUST_DRAFT")) {
             if (pending_prefix_snapshot) {
-                stdio_snapshot_cache_publish(&snapshot_cache, cache_identity,
-                    cache, requested_prefix, pending_prefix_snapshot);
+                stdio_snapshot_cache_publish(&snapshot_cache,
+                    stdio_shared_prefix_enabled() ? STDIO_SHARED_PREFIX_IDENTITY :
+                                                    cache_identity,
+                    cache, requested_prefix, pending_prefix_snapshot, NULL, 0);
                 pending_prefix_snapshot = NULL;
             }
             if (pending_prompt_snapshot) {
                 stdio_snapshot_cache_publish(&snapshot_cache, cache_identity,
-                    cache, n_tokens, pending_prompt_snapshot);
+                    cache, n_tokens, pending_prompt_snapshot,
+                    request_bytes, request_bytes_n);
                 pending_prompt_snapshot = NULL;
+            }
+            /* Remember the exact bytes behind cache[0..cache_n): prompt plus
+             * every forwarded generated token (a sampled stop is not). */
+            if (!live_text_bad && request_bytes && text &&
+                cache_n == n_tokens + generated - finish_eos &&
+                strcmp(active_identity, cache_identity) == 0) {
+                live_bytes = (unsigned char *)malloc(request_bytes_n + text_n + 1);
+                if (live_bytes) {
+                    memcpy(live_bytes, request_bytes, request_bytes_n);
+                    memcpy(live_bytes + request_bytes_n, text, text_n);
+                    live_bytes_n = request_bytes_n + text_n;
+                }
             }
         }
         printf("OK %d %d %d %s %s %.3f %.3f\n", cancelled ? 0 : common,
@@ -1105,6 +1343,8 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
         free(enc); free(text); free(seen);
     }
     free(cache);
+    free(live_bytes);
+    free(request_bytes);
     stdio_snapshot_cache_free(&snapshot_cache);
     return 0;
 }
