@@ -1,6 +1,7 @@
 /* CuMesh normal-cone chart merging, followed by the shared native xatlas. */
 #include "mesh.hh"
 #include "../../common/xatlas.h"
+#include <chrono>
 #include <numeric>
 #include <parallel/algorithm>
 namespace px {
@@ -46,6 +47,10 @@ void clean_for_uv(Mesh &mesh) {
     mesh.f.swap(faces);
 }
 void unwrap(const Mesh &m, Vec &vertices, std::vector<int32_t> &faces, Vec &uv, std::vector<int32_t> &vmap) {
+    using clock = std::chrono::steady_clock;
+    auto seconds = [](clock::time_point a, clock::time_point b) { return std::chrono::duration<double>(b - a).count(); };
+    auto t_start = clock::now();
+    int rounds = 0;
     int nf = int(m.numF()), nc = nf;
     std::vector<V3> normals(nf);
     Vec areas(nf);
@@ -142,6 +147,7 @@ void unwrap(const Mesh &m, Vec &vertices, std::vector<int32_t> &faces, Vec &uv, 
                 map[ce[i].b] = ce[i].a;
                 ++count;
             }
+        ++rounds;
         if (!count)
             break;
         std::vector<int> compact(nc, -1);
@@ -153,7 +159,7 @@ void unwrap(const Mesh &m, Vec &vertices, std::vector<int32_t> &faces, Vec &uv, 
             c = compact[map[c]];
         nc = next;
     }
-    std::fprintf(stderr, "Pixal3D UV: %d normal-cone charts\n", nc);
+    auto t_merged = clock::now();
     std::vector<std::vector<int>> chart_faces(nc);
     std::vector<size_t> chart_sizes(nc);
     for (int f = 0; f < nf; ++f)
@@ -194,7 +200,17 @@ void unwrap(const Mesh &m, Vec &vertices, std::vector<int32_t> &faces, Vec &uv, 
                 "Cannot add UV chart");
     }
     xatlas::AddMeshJoin(atlas.get());
-    xatlas::Generate(atlas.get());
+    auto t_added = clock::now();
+    // xatlas::Generate is exactly these two calls; split for the timings.
+    xatlas::ComputeCharts(atlas.get());
+    auto t_charts = clock::now();
+    xatlas::PackCharts(atlas.get());
+    auto t_packed = clock::now();
+    std::fprintf(stderr,
+                 "Pixal3D UV: %d normal-cone charts (merge %d rounds %.2f s, add %.2f s, xatlas charts %.2f s, "
+                 "pack %.2f s)\n",
+                 nc, rounds, seconds(t_start, t_merged), seconds(t_merged, t_added), seconds(t_added, t_charts),
+                 seconds(t_charts, t_packed));
     require(atlas->width && atlas->height, "UV atlas is empty");
     require(atlas->meshCount == uint32_t(nc), "UV chart count changed unexpectedly");
     for (int c = 0; c < nc; ++c) {

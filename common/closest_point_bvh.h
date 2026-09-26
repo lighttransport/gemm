@@ -129,11 +129,18 @@ class ClosestPointBVH {
 public:
   ClosestPointBVH() = default;
 
-  // Build SBVH from raw vertices/faces.
+  // Build from raw vertices/faces.
   // vertices: [num_v, 3] float32 row-major
   // faces:    [num_f, 3] int32 row-major
+  //
+  // The default builder is lightrt's parallel binned-SAH BVH (about 7x faster
+  // to build than the serial SBVH on an 8.8M-triangle FDG mesh); `spatial`
+  // selects the SBVH. Either way query() returns the same answer: the
+  // closest face, exact distance ties going to the lowest face id, so the
+  // result does not depend on the tree (or on the order a parallel build
+  // allocated its nodes in).
   bool build(const float* vertices, uint32_t num_v,
-             const int32_t* faces, uint32_t num_f) {
+             const int32_t* faces, uint32_t num_f, bool spatial = false) {
     std::vector<lightrt::Triangle> triangles;
     triangles.reserve(num_f);
     for (uint32_t f = 0; f < num_f; ++f) {
@@ -149,69 +156,33 @@ public:
           lightrt::Vec3(p1[0], p1[1], p1[2]),
           lightrt::Vec3(p2[0], p2[1], p2[2]));
     }
-    lightrt::SBVHBuildConfig cfg;
-    return sbvh_.build(std::move(triangles), cfg);
+    spatial_ = spatial;
+    if (spatial) {
+      lightrt::SBVHBuildConfig cfg;
+      return sbvh_.build(std::move(triangles), cfg);
+    }
+    std::vector<lightrt::AABB> boxes(triangles.size());
+    for (size_t i = 0; i < triangles.size(); ++i) {
+      const auto& t = triangles[i];
+      lightrt::AABB box;
+      box.expand(t.v0);
+      box.expand(t.v1);
+      box.expand(t.v2);
+      boxes[i] = box;
+    }
+    triangles_ = std::move(triangles);
+    return bvh_.build(boxes, lightrt::BVHBuildConfig::quality());
   }
 
   // Single-point closest-point query.
   ClosestPointHit query(const lightrt::Vec3& p) const noexcept {
-    ClosestPointHit best{};
-    best.face_id = UINT32_MAX;
-    best.distance = std::numeric_limits<float>::infinity();
-    float best_dist_sq = std::numeric_limits<float>::infinity();
-
-    const auto& nodes = sbvh_.getNodes();
-    const auto& refs  = sbvh_.getReferences();
-    const auto& triangles = sbvh_.getTriangles();
-    if (nodes.empty()) return best;
-
-    // Iterative DFS with a small fixed stack.
-    constexpr uint32_t kStackSize = 256;
-    uint32_t stack[kStackSize];
-    int32_t  sp = 0;
-    stack[sp++] = 0;
-
-    while (sp > 0) {
-      uint32_t idx = stack[--sp];
-      const lightrt::BVHNode& node = nodes[idx];
-      // Node-AABB lower bound.
-      if (aabb_dist_sq(node.bounds, p) >= best_dist_sq) continue;
-
-      if (node.isLeaf()) {
-        for (uint32_t i = 0; i < node.prim_count; ++i) {
-          const auto& ref = refs[node.prim_offset + i];
-          uint32_t pid = ref.prim_id;
-          const lightrt::Triangle& tri = triangles[pid];
-          lightrt::Vec3 c;
-          float w0, w1, w2;
-          closest_point_on_triangle(p, tri.v0, tri.v1, tri.v2, c, w0, w1, w2);
-          lightrt::Vec3 diff = c - p;
-          float dsq = diff.dot(diff);
-          if (dsq < best_dist_sq) {
-            best_dist_sq = dsq;
-            best.face_id = pid;
-            best.closest[0] = c.x; best.closest[1] = c.y; best.closest[2] = c.z;
-            best.uvw[0] = w0; best.uvw[1] = w1; best.uvw[2] = w2;
-          }
-        }
-      } else {
-        // Visit closer child first for better pruning.
-        uint32_t l = node.left_child;
-        uint32_t r = node.right_child;
-        float dl = aabb_dist_sq(nodes[l].bounds, p);
-        float dr = aabb_dist_sq(nodes[r].bounds, p);
-        if (dl < dr) {
-          if (dr < best_dist_sq && sp < (int32_t)kStackSize) stack[sp++] = r;
-          if (dl < best_dist_sq && sp < (int32_t)kStackSize) stack[sp++] = l;
-        } else {
-          if (dl < best_dist_sq && sp < (int32_t)kStackSize) stack[sp++] = l;
-          if (dr < best_dist_sq && sp < (int32_t)kStackSize) stack[sp++] = r;
-        }
-      }
+    if (spatial_) {
+      const auto& refs = sbvh_.getReferences();
+      return traverse(p, sbvh_.getNodes(), sbvh_.getTriangles(),
+                      [&](uint32_t i) { return refs[i].prim_id; });
     }
-
-    best.distance = std::sqrt(best_dist_sq);
-    return best;
+    const auto& ids = bvh_.getPrimitiveIndices();
+    return traverse(p, bvh_.getNodes(), triangles_, [&](uint32_t i) { return ids[i]; });
   }
 
   // Batch query. points/out_* are flat row-major float arrays (out_face_id is
@@ -244,10 +215,74 @@ public:
     }
   }
 
-  uint32_t numTriangles() const noexcept { return sbvh_.getNumPrimitives(); }
+  uint32_t numTriangles() const noexcept {
+    return spatial_ ? sbvh_.getNumPrimitives() : static_cast<uint32_t>(triangles_.size());
+  }
 
 private:
+  template <class PrimId>
+  static ClosestPointHit traverse(const lightrt::Vec3& p, const std::vector<lightrt::BVHNode>& nodes,
+                                  const std::vector<lightrt::Triangle>& triangles,
+                                  PrimId prim_id) noexcept {
+    ClosestPointHit best{};
+    best.face_id = UINT32_MAX;
+    best.distance = std::numeric_limits<float>::infinity();
+    float best_dist_sq = std::numeric_limits<float>::infinity();
+    if (nodes.empty()) return best;
+
+    // Iterative DFS with a small fixed stack. A node is skipped only when it
+    // is strictly farther than the best: at an exact tie it may still hold a
+    // lower face id, which wins.
+    constexpr uint32_t kStackSize = 256;
+    uint32_t stack[kStackSize];
+    int32_t  sp = 0;
+    stack[sp++] = 0;
+
+    while (sp > 0) {
+      uint32_t idx = stack[--sp];
+      const lightrt::BVHNode& node = nodes[idx];
+      if (aabb_dist_sq(node.bounds, p) > best_dist_sq) continue;
+
+      if (node.isLeaf()) {
+        for (uint32_t i = 0; i < node.prim_count; ++i) {
+          uint32_t pid = prim_id(node.prim_offset + i);
+          const lightrt::Triangle& tri = triangles[pid];
+          lightrt::Vec3 c;
+          float w0, w1, w2;
+          closest_point_on_triangle(p, tri.v0, tri.v1, tri.v2, c, w0, w1, w2);
+          lightrt::Vec3 diff = c - p;
+          float dsq = diff.dot(diff);
+          if (dsq < best_dist_sq || (dsq == best_dist_sq && pid < best.face_id)) {
+            best_dist_sq = dsq;
+            best.face_id = pid;
+            best.closest[0] = c.x; best.closest[1] = c.y; best.closest[2] = c.z;
+            best.uvw[0] = w0; best.uvw[1] = w1; best.uvw[2] = w2;
+          }
+        }
+      } else {
+        // Visit closer child first for better pruning.
+        uint32_t l = node.left_child;
+        uint32_t r = node.right_child;
+        float dl = aabb_dist_sq(nodes[l].bounds, p);
+        float dr = aabb_dist_sq(nodes[r].bounds, p);
+        if (dl < dr) {
+          if (dr <= best_dist_sq && sp < (int32_t)kStackSize) stack[sp++] = r;
+          if (dl <= best_dist_sq && sp < (int32_t)kStackSize) stack[sp++] = l;
+        } else {
+          if (dl <= best_dist_sq && sp < (int32_t)kStackSize) stack[sp++] = l;
+          if (dr <= best_dist_sq && sp < (int32_t)kStackSize) stack[sp++] = r;
+        }
+      }
+    }
+
+    best.distance = std::sqrt(best_dist_sq);
+    return best;
+  }
+
+  bool spatial_ = false;
   lightrt::SBVH sbvh_;
+  lightrt::BVH bvh_;
+  std::vector<lightrt::Triangle> triangles_;
 };
 
 }  // namespace trellis2

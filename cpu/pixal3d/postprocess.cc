@@ -147,23 +147,30 @@ static void dump_mesh(const pixal3d_options &options, const char *name, const Me
     auto path = std::string(options.dump_dir) + "/" + name + ".safetensors";
     require(stw_save(writer.get(), path.c_str()) == 0, "Cannot save mesh dump: " + path);
 }
-void postprocess(const Sparse &shape, const Sparse &texture, const pixal3d_options &options,
-                 pixal3d_result &result, Engine *profile) {
+struct GeometryStage {
+    trellis2::ClosestPointBVH bvh; // over the FDG mesh, for the bake
+    Vec vertices, uv, normals;
+    std::vector<int32_t> faces, vmap;
+    std::vector<std::pair<std::string, double>> timings;
+};
+
+void add_timing(GeometryStage &geometry, const std::string &name, double seconds) {
+    geometry.timings.push_back({name, seconds});
+}
+
+std::shared_ptr<GeometryStage> postprocess_geometry(const Sparse &shape, const pixal3d_options &options) {
+    auto stage = std::make_shared<GeometryStage>();
     auto phase = std::chrono::steady_clock::now();
     auto record = [&](const char *name, std::chrono::steady_clock::time_point begin) {
-        if (profile)
-            profile->record(std::string("postprocess.") + name,
-                            std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count());
+        stage->timings.push_back({std::string("postprocess.") + name,
+                                  std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count()});
     };
     auto mark = [&](const char *name) {
         auto now = std::chrono::steady_clock::now();
-        if (profile)
-            profile->record(std::string("postprocess.") + name,
-                            std::chrono::duration<double>(now - phase).count());
+        stage->timings.push_back({std::string("postprocess.") + name, std::chrono::duration<double>(now - phase).count()});
         phase = now;
     };
-    require(shape.channels == 7 && texture.channels == 6 && shape.coords == texture.coords,
-            "Invalid shape/texture decoder outputs");
+    require(shape.channels == 7, "Invalid shape decoder output");
     Vec decoded = shape.feats;
     for (int i = 0; i < shape.rows(); ++i) {
         for (int c = 0; c < 3; ++c)
@@ -184,7 +191,7 @@ void postprocess(const Sparse &shape, const Sparse &texture, const pixal3d_optio
     dump_mesh(options, "mesh_fdg", original);
     std::fprintf(stderr, "Pixal3D FDG: %u vertices, %u faces\n", original.numV(), original.numF());
     detail = std::chrono::steady_clock::now();
-    trellis2::ClosestPointBVH bvh;
+    auto &bvh = stage->bvh;
     require(bvh.build(original.v.data(), original.numV(), original.f.data(), original.numF()),
             "Cannot build original mesh BVH");
     record("original_bvh", detail);
@@ -196,8 +203,8 @@ void postprocess(const Sparse &shape, const Sparse &texture, const pixal3d_optio
     clean_for_uv(mesh);
     mark("simplify");
     dump_mesh(options, "mesh_simplified", mesh);
-    Vec vertices, uv, normals;
-    std::vector<int32_t> faces, vmap;
+    auto &vertices = stage->vertices, &uv = stage->uv, &normals = stage->normals;
+    auto &faces = stage->faces, &vmap = stage->vmap;
     detail = std::chrono::steady_clock::now();
     unwrap(mesh, vertices, faces, uv, vmap);
     record("unwrap", detail);
@@ -209,6 +216,32 @@ void postprocess(const Sparse &shape, const Sparse &texture, const pixal3d_optio
         std::copy_n(original_normals.data() + size_t(vmap[i]) * 3, 3, normals.data() + i * 3);
     record("normals", detail);
     mark("unwrap_normals");
+    return stage;
+}
+
+void postprocess_texture(GeometryStage &geometry, const Sparse &shape, const Sparse &texture,
+                         const pixal3d_options &options, pixal3d_result &result, Engine *profile) {
+    if (profile)
+        for (auto &[name, seconds] : geometry.timings)
+            profile->record(name, seconds);
+    auto phase = std::chrono::steady_clock::now();
+    auto record = [&](const char *name, std::chrono::steady_clock::time_point begin) {
+        if (profile)
+            profile->record(std::string("postprocess.") + name,
+                            std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count());
+    };
+    auto mark = [&](const char *name) {
+        auto now = std::chrono::steady_clock::now();
+        if (profile)
+            profile->record(std::string("postprocess.") + name,
+                            std::chrono::duration<double>(now - phase).count());
+        phase = now;
+    };
+    require(texture.channels == 6 && shape.coords == texture.coords, "Invalid shape/texture decoder outputs");
+    auto &bvh = geometry.bvh;
+    auto &vertices = geometry.vertices, &uv = geometry.uv, &normals = geometry.normals;
+    auto &faces = geometry.faces;
+    auto detail = std::chrono::steady_clock::now();
     int size = options.texture_size;
     size_t pixels = size_t(size) * size;
     std::vector<int> raster(pixels, -1);
@@ -330,5 +363,11 @@ void postprocess(const Sparse &shape, const Sparse &texture, const pixal3d_optio
     result.triangle_count = int(faces.size() / 3);
     result.texture_size = size;
     record("result_pack", detail);
+}
+
+void postprocess(const Sparse &shape, const Sparse &texture, const pixal3d_options &options,
+                 pixal3d_result &result, Engine *profile) {
+    auto geometry = postprocess_geometry(shape, options);
+    postprocess_texture(*geometry, shape, texture, options, result, profile);
 }
 } // namespace px

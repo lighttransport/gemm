@@ -1,5 +1,6 @@
 /* Resident neural operations; no CUDA/HIP headers in the host library. */
 #include "engine.hh"
+#include <chrono>
 #include <fstream>
 #include <iomanip>
 
@@ -118,9 +119,15 @@ Tensor Engine::weight(Weights &w, const std::string &name, int precision) {
     int index = safetensors_find(w.st, name.c_str());
     const char *dtype = safetensors_dtype(w.st, index);
     Tensor t;
+    // Profile: loading (including the first touch of mmapped checkpoint pages)
+    // and uploading are timed separately from the stage's compute.
+    using clock = std::chrono::steady_clock;
+    auto since = [](clock::time_point t0) { return std::chrono::duration<double>(clock::now() - t0).count(); };
+    auto t0 = clock::now();
     if (storage_precision && !std::strcmp(dtype, storage_precision == 1 ? "BF16" : "F16")) {
         require(safetensors_nbytes(w.st, index) == n * 2, "Invalid packed weight size: " + name);
         t = upload(safetensors_data(w.st, index), n, storage_precision);
+        record("weights.upload", since(t0));
     } else if (storage_precision) {
         const float *v = w.get(name);
         std::vector<uint16_t> packed(n);
@@ -135,9 +142,17 @@ Tensor Engine::weight(Weights &w, const std::string &name, int precision) {
                 std::memcpy(&packed[i], &h, 2);
             }
         }
+        record("weights.convert", since(t0));
+        auto t1 = clock::now();
         t = upload(packed.data(), n, storage_precision);
-    } else
-        t = upload(w.get(name), n);
+        record("weights.upload", since(t1));
+    } else {
+        const float *v = w.get(name);
+        record("weights.convert", since(t0));
+        auto t1 = clock::now();
+        t = upload(v, n);
+        record("weights.upload", since(t1));
+    }
     size_t bytes = n * (storage_precision ? 2 : 4);
     if (cache_bytes_ + bytes <= cache_limit_) {
         weights_[key] = t;

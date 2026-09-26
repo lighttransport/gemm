@@ -3,6 +3,8 @@
 #include <array>
 #include <chrono>
 #include <filesystem>
+#include <future>
+#include <omp.h>
 #include <fstream>
 #include <sys/resource.h>
 
@@ -345,15 +347,13 @@ struct Pipeline {
             auto cond = stage_conditioning(image1024, high, 64, 512, camera, "shape1024");
             shape = sample("shape_slat_flow_model_1024", "shape_slat_sampler", high, cond, "shape1024");
         }
-        Sparse texture;
-        {
-            auto cond = stage_conditioning(image1024, high, 64, 1024, camera, "texture");
-            texture = sample("tex_slat_flow_model_1024", "tex_slat_sampler", high, cond, "texture", &shape);
-        }
+        // The texture flow is guided by the shape latent as sampled; the shape
+        // decoder takes it denormalized. Decode the shape first so its CPU
+        // postprocess (the geometry half) overlaps the texture flow and
+        // decoder on the GPU.
+        Sparse shape_latent = shape;
         normalize(shape, config.at("shape_slat_normalization"), false);
-        normalize(texture, config.at("tex_slat_normalization"), false);
         dump(dumps, "shape_denormalized", shape.feats, 32, shape.coords);
-        dump(dumps, "texture_denormalized", texture.feats, 32, texture.coords);
         std::vector<Subdivision> subs;
         Sparse shape_out, texture_out;
         {
@@ -364,6 +364,25 @@ struct Pipeline {
                 "shape1024.decoder",
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - decoder_start).count());
         }
+        dump(dumps, "shape_decoded", shape_out.feats, 7, shape_out.coords);
+        // Its own OpenMP team, two cores short of the pipeline's, leaving room
+        // for the thread driving the GPU.
+        int geometry_threads = std::max(1, options.threads > 2 ? options.threads - 2 : 1);
+        auto geometry_started = std::chrono::steady_clock::now();
+        auto geometry = std::async(std::launch::async, [&, geometry_threads] {
+            omp_set_num_threads(geometry_threads);
+            auto stage = postprocess_geometry(shape_out, options);
+            add_timing(*stage, "postprocess.geometry_thread",
+                       std::chrono::duration<double>(std::chrono::steady_clock::now() - geometry_started).count());
+            return stage;
+        });
+        Sparse texture;
+        {
+            auto cond = stage_conditioning(image1024, high, 64, 1024, camera, "texture");
+            texture = sample("tex_slat_flow_model_1024", "tex_slat_sampler", high, cond, "texture", &shape_latent);
+        }
+        normalize(texture, config.at("tex_slat_normalization"), false);
+        dump(dumps, "texture_denormalized", texture.feats, 32, texture.coords);
         {
             Weights weights(model_path("tex_slat_decoder"));
             auto decoder_start = std::chrono::steady_clock::now();
@@ -375,12 +394,16 @@ struct Pipeline {
         require(shape_out.coords == texture_out.coords, "Shape and texture coordinates differ");
         for (float &v : texture_out.feats)
             v = std::clamp(v * .5f + .5f, 0.f, 1.f);
-        dump(dumps, "shape_decoded", shape_out.feats, 7, shape_out.coords);
         dump(dumps, "texture_decoded", texture_out.feats, 6, texture_out.coords);
         result.stats.shape_tokens = shape.rows();
         engine.clear_weights();
+        // "postprocess" is the part the pipeline waits for: the rest of the
+        // geometry thread plus the texture half.
         auto post_started = std::chrono::steady_clock::now();
-        postprocess(shape_out, texture_out, options, result, &engine);
+        auto stage = geometry.get();
+        engine.record("postprocess.geometry_wait",
+                      std::chrono::duration<double>(std::chrono::steady_clock::now() - post_started).count());
+        postprocess_texture(*stage, shape_out, texture_out, options, result, &engine);
         engine.record("postprocess",
                       std::chrono::duration<double>(std::chrono::steady_clock::now() - post_started).count());
     }

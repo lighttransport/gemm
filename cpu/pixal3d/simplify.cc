@@ -1,5 +1,6 @@
 /* CPU port of CuMesh's parallel midpoint QEM collapse scheduling. */
 #include "mesh.hh"
+#include <chrono>
 #include <numeric>
 #include <parallel/algorithm>
 namespace px {
@@ -14,55 +15,84 @@ static uint64_t edge(int a, int b) {
 }
 void simplify(Mesh &m, int target) {
     float threshold = 1e-8f;
-    int stalled = 0;
+    int stalled = 0, rounds = 0;
+    // Per-phase totals, printed once: where the rounds spend their time.
+    using clock = std::chrono::steady_clock;
+    double spent[8] = {};
+    auto tick = clock::now();
+    auto lap = [&](int phase) {
+        auto now = clock::now();
+        spent[phase] += std::chrono::duration<double>(now - tick).count();
+        tick = now;
+    };
+    auto input_faces = m.numF();
     while (m.numF() > uint32_t(target)) {
+        ++rounds;
+        tick = clock::now();
         int nv = int(m.numV()), nf = int(m.numF());
         // Compact adjacency avoids millions of small allocations each round.
         // Filling it in face order preserves the former traversal order.
+        // Every step below is parallel yet bitwise identical to the serial
+        // form: integer counts commute; each vertex's quadric is summed over
+        // its faces in face order (the CSR list is filled in face order),
+        // exactly the order of the former single face loop.
         std::vector<int> offsets(size_t(nv) + 1), adjacent(size_t(nf) * 3);
-        std::vector<uint64_t> edges;
-        edges.reserve(m.f.size());
-        std::vector<std::array<float, 10>> qem(nv);
+        std::vector<uint64_t> edges(size_t(nf) * 3);
+        std::vector<std::array<float, 4>> planes(nf);
+#pragma omp parallel for schedule(static)
         for (int f = 0; f < nf; ++f) {
             int a = m.f[3 * f], b = m.f[3 * f + 1], c = m.f[3 * f + 2];
-            ++offsets[size_t(a) + 1];
-            ++offsets[size_t(b) + 1];
-            ++offsets[size_t(c) + 1];
-            edges.push_back(edge(a, b));
-            edges.push_back(edge(b, c));
-            edges.push_back(edge(c, a));
+            __atomic_fetch_add(&offsets[size_t(a) + 1], 1, __ATOMIC_RELAXED);
+            __atomic_fetch_add(&offsets[size_t(b) + 1], 1, __ATOMIC_RELAXED);
+            __atomic_fetch_add(&offsets[size_t(c) + 1], 1, __ATOMIC_RELAXED);
+            edges[3 * size_t(f)] = edge(a, b);
+            edges[3 * size_t(f) + 1] = edge(b, c);
+            edges[3 * size_t(f) + 2] = edge(c, a);
             V3 n = (vertex(m, b) - vertex(m, a)).cross(vertex(m, c) - vertex(m, a));
             float len = std::sqrt(n.dot(n));
             if (len > 1e-12f)
                 n = n * (1 / len);
             else
                 n = V3(0, 0, 0);
-            float p[4] = {n.x, n.y, n.z, -n.dot(vertex(m, a))};
-            for (int id : {a, b, c}) {
+            planes[f] = {n.x, n.y, n.z, -n.dot(vertex(m, a))};
+        }
+        lap(0);
+        std::partial_sum(offsets.begin(), offsets.end(), offsets.begin());
+        {
+            std::vector<int> cursor(offsets.begin(), offsets.end() - 1);
+            for (int f = 0; f < nf; ++f)
+                for (int j = 0; j < 3; ++j)
+                    adjacent[cursor[m.f[3 * f + j]]++] = f;
+        }
+        lap(1);
+        std::vector<std::array<float, 10>> qem(nv);
+#pragma omp parallel for schedule(static)
+        for (int v = 0; v < nv; ++v)
+            for (int position = offsets[v]; position < offsets[v + 1]; ++position) {
+                const float *p = planes[adjacent[position]].data();
                 int k = 0;
                 for (int i = 0; i < 4; ++i)
                     for (int j = i; j < 4; ++j)
-                        qem[id][k++] += p[i] * p[j];
+                        qem[v][k++] += p[i] * p[j];
             }
-        }
-        std::partial_sum(offsets.begin(), offsets.end(), offsets.begin());
-        std::vector<int> cursor(offsets.begin(), offsets.end() - 1);
-        for (int f = 0; f < nf; ++f)
-            for (int j = 0; j < 3; ++j)
-                adjacent[cursor[m.f[3 * f + j]]++] = f;
+        planes.clear();
+        planes.shrink_to_fit();
+        lap(2);
         __gnu_parallel::sort(edges.begin(), edges.end());
         std::vector<uint8_t> boundary(nv);
-        for (size_t i = 0; i < edges.size();) {
-            size_t j = i + 1;
-            while (j < edges.size() && edges[j] == edges[i])
-                ++j;
-            if (j == i + 1) {
-                boundary[int(edges[i] >> 32)] = 1;
-                boundary[uint32_t(edges[i])] = 1;
+        size_t ne = edges.size();
+#pragma omp parallel for schedule(static)
+        for (size_t i = 0; i < ne; ++i) {
+            // A boundary edge appears once: it starts a run of length one.
+            bool first = i == 0 || edges[i - 1] != edges[i];
+            bool last = i + 1 == ne || edges[i + 1] != edges[i];
+            if (first && last) {
+                __atomic_store_n(&boundary[int(edges[i] >> 32)], uint8_t(1), __ATOMIC_RELAXED);
+                __atomic_store_n(&boundary[uint32_t(edges[i])], uint8_t(1), __ATOMIC_RELAXED);
             }
-            i = j;
         }
         edges.erase(std::unique(edges.begin(), edges.end()), edges.end());
+        lap(3);
         std::vector<float> costs(edges.size());
 #pragma omp parallel for schedule(static)
         for (size_t i = 0; i < edges.size(); ++i) {
@@ -109,6 +139,7 @@ void simplify(Mesh &m, int target) {
             costs[i] = valid ? cost + .01f * length + .001f * (triangles ? skinny / triangles : 0) * length
                              : INFINITY;
         }
+        lap(4);
         auto packed = [&](size_t i) {
             uint32_t u;
             std::memcpy(&u, &costs[i], 4);
@@ -130,10 +161,15 @@ void simplify(Mesh &m, int target) {
             for (int position = offsets[b]; position < offsets[b + 1]; ++position)
                 atomic_min(&best[adjacent[position]], p);
         }
+        lap(5);
         std::vector<int> mapping(nv);
         std::iota(mapping.begin(), mapping.end(), 0);
         std::vector<uint8_t> keep(nf, 1);
         int collapsed = 0;
+        // Winners are disjoint: a winning edge is the best of every face
+        // around both endpoints, so two winners share no face and no vertex.
+        // Applying them in parallel writes disjoint entries.
+#pragma omp parallel for schedule(static) reduction(+ : collapsed)
         for (size_t i = 0; i < edges.size(); ++i) {
             if (costs[i] > threshold)
                 continue;
@@ -165,24 +201,42 @@ void simplify(Mesh &m, int target) {
                     keep[f] = 0;
             }
         }
+        lap(6);
+        // Compaction by prefix sums, in the original order.
         Mesh next;
         std::vector<int> compact(nv, -1);
-        for (int i = 0; i < nv; ++i)
-            if (mapping[i] == i) {
-                compact[i] = int(next.numV());
-                next.v.insert(next.v.end(), m.v.begin() + 3 * i, m.v.begin() + 3 * i + 3);
-            }
-        for (int f = 0; f < nf; ++f)
-            if (keep[f])
-                for (int j = 0; j < 3; ++j)
-                    next.f.push_back(compact[mapping[m.f[3 * f + j]]]);
+        {
+            std::vector<int> vpos(size_t(nv) + 1, 0), fpos(size_t(nf) + 1, 0);
+            for (int i = 0; i < nv; ++i)
+                vpos[i + 1] = vpos[i] + (mapping[i] == i);
+            for (int f = 0; f < nf; ++f)
+                fpos[f + 1] = fpos[f] + keep[f];
+            next.v.resize(size_t(vpos[nv]) * 3);
+            next.f.resize(size_t(fpos[nf]) * 3);
+#pragma omp parallel for schedule(static)
+            for (int i = 0; i < nv; ++i)
+                if (mapping[i] == i) {
+                    compact[i] = vpos[i];
+                    std::copy_n(m.v.begin() + 3 * size_t(i), 3, next.v.begin() + 3 * size_t(vpos[i]));
+                }
+#pragma omp parallel for schedule(static)
+            for (int f = 0; f < nf; ++f)
+                if (keep[f])
+                    for (int j = 0; j < 3; ++j)
+                        next.f[3 * size_t(fpos[f]) + j] = compact[mapping[m.f[3 * f + j]]];
+        }
+        lap(7);
         float removed = float(nf - next.numF()) / nf;
         m = std::move(next);
         if (removed < .01f)
             threshold *= 10;
         stalled = collapsed ? 0 : stalled + 1;
         require(stalled < 20, "Mesh cannot be simplified to requested target");
-        std::fprintf(stderr, "Pixal3D simplify: %u faces\n", m.numF());
     }
+    std::fprintf(stderr,
+                 "Pixal3D simplify: %u -> %u faces in %d rounds (setup %.2f, adjacency %.2f, qem %.2f, sort+boundary "
+                 "%.2f, costs %.2f, select %.2f, collapse %.2f, compact %.2f s)\n",
+                 input_faces, m.numF(), rounds, spent[0], spent[1], spent[2], spent[3], spent[4], spent[5], spent[6],
+                 spent[7]);
 }
 } // namespace px

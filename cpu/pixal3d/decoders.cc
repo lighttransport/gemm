@@ -1,4 +1,5 @@
 #include "engine.hh"
+#include <chrono>
 #include <cstdio>
 #include <unordered_map>
 
@@ -97,8 +98,11 @@ static Sparse decode_sparse_gpu(Engine &e, Weights &w, const Sparse &input, bool
     Tensor nbr;
     auto ensure_neighbors = [&] {
         if (!nbr.get()) {
+            auto t0 = std::chrono::steady_clock::now();
             auto map = neighbors(coords);
             nbr = e.upload(map.data(), map.size());
+            e.record("decoder.neighbors",
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
         }
     };
     // ConvNeXt MLP over row chunks. Chunks are multiples of the 2048-row GEMM
@@ -144,7 +148,10 @@ static Sparse decode_sparse_gpu(Engine &e, Weights &w, const Sparse &input, bool
         require(ci % 8 == 0 && co % (ci / 8) == 0, "Invalid resident subdivision ratio");
         Subdivision sub;
         if (!guided || subdivision_logits) {
+            auto t0 = std::chrono::steady_clock::now();
             auto logits = e.download(e.linear(h, w, b + "to_subdiv", precision));
+            e.record("decoder.subdiv_download",
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
             if (subdivision_logits)
                 subdivision_logits->push_back({coords, logits, 8});
             if (!guided) {
