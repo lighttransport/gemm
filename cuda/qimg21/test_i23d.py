@@ -308,6 +308,29 @@ class OpsTest(Tmp):
             self.assertEqual((self.dir / f"one/images/{i:03d}.png").read_bytes(),
                              (self.dir / f"many/images/{i:03d}.png").read_bytes())
 
+    def test_prepare_sees_every_view_before_any_runs(self):
+        events = []
+
+        class Recording(MockBackend):
+            def prepare(self, requests):
+                events.append(("prepare", [r.prompt for r in requests]))
+
+            def generate(self, request):
+                events.append(("generate", request.prompt))
+                return super().generate(request)
+
+        ref = self.write("ref.png", object_image(128, 128))
+        specs = viewlib.turntable(3, width=256, height=256)
+        outs = [self.dir / f"v{i}.png" for i in range(3)]
+        records = list(ops.generate_views([ref], specs, outs, Recording(), ops.ViewParams(steps=2)))
+        self.assertEqual(events[0], ("prepare", [r["prompt"] for r in records]))
+        self.assertEqual([e[0] for e in events[1:]], ["generate"] * 3)
+        plain = list(ops.generate_views([ref], specs, [self.dir / f"w{i}.png" for i in range(3)], MockBackend(),
+                                        ops.ViewParams(steps=2)))
+        for a, b in zip(records, plain):
+            self.assertEqual((a["prompt"], a["seed"]), (b["prompt"], b["seed"]))
+            self.assertEqual(Path(a["file"]).read_bytes(), Path(b["file"]).read_bytes())
+
     def test_a_long_turntable_does_not_accumulate_memory(self):
         backend = MockBackend()
         gc.collect()
@@ -395,6 +418,174 @@ class CliTest(Tmp):
                                     str(self.dir / "o.png"), "--method", "alpha", "--size", "256")
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(out)["output_size"], [256, 256])
+
+
+class NativeBackendCommandTest(Tmp):
+    """The native_generate.py command a request becomes (no GPU needed)."""
+
+    def setUp(self):
+        super().setUp()
+        from qimg21_i23d.native import NativeBackend
+        self.NativeBackend = NativeBackend
+        self.ref = self.write("ref.png", object_image(256, 256))
+        self.mask = self.write("mask.png", np.full((256, 256), 255, np.uint8), mode="L")
+
+    def flag(self, cmd, name):
+        return cmd[cmd.index(name) + 1] if name in cmd else None
+
+    def test_text_to_image_stays_plain(self):
+        cmd = self.NativeBackend().command(GenRequest(prompt="apple", out=self.dir / "o.png"), self.dir)
+        for flag in ("--image", "--init-image", "--mask", "--strength", "--native-attention"):
+            self.assertNotIn(flag, cmd)
+        self.assertEqual(self.flag(cmd, "--preset"), "fast12")
+        self.assertIn("--vae-tf32", cmd)
+
+    def test_edit_flags(self):
+        backend = self.NativeBackend(attention="exact", condition_resolution=512)
+        request = GenRequest(prompt="fix", out=self.dir / "o.png", references=(self.ref,), init_image=self.ref,
+                             strength=0.6, mask=self.mask, negative_prompt="blurry")
+        cmd = backend.command(request, self.dir)
+        self.assertEqual(self.flag(cmd, "--image"), str(self.ref.resolve()))
+        self.assertEqual(self.flag(cmd, "--condition-resolution"), "512")
+        self.assertEqual(self.flag(cmd, "--strength"), "0.6")
+        self.assertEqual(self.flag(cmd, "--mask"), str(self.mask.resolve()))
+        self.assertEqual(self.flag(cmd, "--native-attention"), "cutlass-efficient")
+        self.assertEqual(self.flag(cmd, "--negative-prompt"), "blurry")
+        self.assertIn("--condition-cache", cmd)
+
+    def test_prepared_prompts_ride_with_the_first_run_of_their_reference(self):
+        backend = self.NativeBackend()
+        views = [GenRequest(prompt=f"view {i}", out=self.dir / f"{i}.png", references=(self.ref,))
+                 for i in range(3)]
+        backend.prepare(views + [GenRequest(prompt="plain", out=self.dir / "p.png")])
+        self.assertTrue(backend.needs_encoder(views[0]))
+        cmd = backend.command(views[1], self.dir)
+        listing = Path(self.flag(cmd, "--prompt-batch"))
+        self.assertEqual(json.loads(listing.read_text()), ["view 0", "view 2"])
+        self.assertNotIn("--prompt-batch", backend.command(GenRequest(prompt="plain", out=self.dir / "p.png"),
+                                                           self.dir))
+
+    def test_one_reference_only_and_the_request_is_not_mutated(self):
+        request = GenRequest(prompt="x", out=self.dir / "o.png", references=(self.ref, self.ref))
+        with self.assertRaisesRegex(BackendError, "at most 1"):
+            self.NativeBackend().generate(request)
+        masked = GenRequest(prompt="x", out=self.dir / "o.png", references=(self.ref,), init_image=self.ref,
+                            mask=self.mask)
+        with self.assertRaises(BackendError):
+            self.NativeBackend(preset=None).generate(masked)
+        self.assertTrue(masked.mask_as_reference)
+        with self.assertRaisesRegex(BackendError, "preset"):
+            self.NativeBackend(preset="turbo")
+
+
+class NativeResidentTest(Tmp):
+    """NativeBackend's own resident processes, with stand-in executables."""
+
+    def setUp(self):
+        super().setUp()
+        from qimg21_i23d import native
+        self.native = native
+        fake = self.dir / "fake_server"
+        # Records its arguments, announces itself as both servers do, and
+        # stays up until terminated.
+        fake.write_text('#!/bin/sh\necho "$@" >> "$(dirname "$0")/calls.txt"\n'
+                        'echo "fast: serving fake"\necho "qimg21-vae: serving fake"\nexec sleep 60\n')
+        fake.chmod(0o755)
+        self.saved = native.FAST, native.VAE
+        native.FAST = native.VAE = fake
+        self.ref = self.write("ref.png", object_image(256, 256))
+
+    def tearDown(self):
+        self.native.FAST, self.native.VAE = self.saved
+        super().tearDown()
+
+    def calls(self):
+        return [line.split() for line in (self.dir / "calls.txt").read_text().splitlines()]
+
+    def test_sized_for_the_request_reused_and_resized(self):
+        backend = self.native.NativeBackend(condition_resolution=512)
+        try:
+            request = GenRequest(prompt="x", out=self.dir / "o.png", references=(self.ref,))
+            # A reference not encoded yet: its encoders run one-shot, with the
+            # device to themselves.
+            self.assertTrue(backend.needs_encoder(request))
+            self.assertEqual(backend.resident_sockets(request), (None, None, []))
+            self.assertFalse((self.dir / "calls.txt").exists())
+            backend._encoded.add(backend._encode_key(request))
+            fast, vae, timings = backend.resident_sockets(request)
+            self.assertTrue(fast and vae)
+            self.assertEqual([t["label"] for t in timings], ["start resident denoiser", "start resident VAE decoder"])
+            denoiser = next(c for c in self.calls() if "--serve-condition-tokens" in c)
+            self.assertEqual(denoiser[denoiser.index("--serve-condition-tokens") + 1], str(32 * 32))
+            self.assertEqual(denoiser[denoiser.index("--serve-cfg") + 1], "0")
+            # Same setup: nothing restarts.
+            self.assertEqual(backend.resident_sockets(GenRequest(prompt="y", out=self.dir / "p.png",
+                                                                 references=(self.ref,)))[2], [])
+            # CFG doubles the batch: a new denoiser, the VAE decoder stays.
+            _, _, timings = backend.resident_sockets(GenRequest(prompt="y", out=self.dir / "p.png",
+                                                                references=(self.ref,), negative_prompt="n"))
+            self.assertEqual([t["label"] for t in timings], ["start resident denoiser"])
+            self.assertEqual(backend._fast.starts, 2)
+            self.assertEqual(backend._vae.starts, 1)
+            # Past 1024^2 the decode runs one-shot.
+            _, vae, _ = backend.resident_sockets(GenRequest(prompt="y", out=self.dir / "p.png", width=1280,
+                                                            height=1280))
+            self.assertIsNone(vae)
+            # An init image is encoded every time: the resident processes stop.
+            edit = GenRequest(prompt="y", out=self.dir / "p.png", references=(self.ref,), init_image=self.ref,
+                              strength=0.5)
+            self.assertEqual(backend.resident_sockets(edit), (None, None, []))
+            self.assertFalse(backend._fast.alive() or backend._vae.alive())
+        finally:
+            backend.close()
+        self.assertFalse(backend._fast.alive() or backend._vae.alive())
+
+    def test_explicit_sockets_and_opt_out_start_nothing(self):
+        request = GenRequest(prompt="x", out=self.dir / "o.png")
+        given = self.native.NativeBackend(resident_socket="a.sock", resident_vae_socket="b.sock")
+        self.assertEqual(given.resident_sockets(request), ("a.sock", "b.sock", []))
+        self.assertEqual(self.native.NativeBackend(resident=False).resident_sockets(request), (None, None, []))
+        self.assertEqual(self.native.NativeBackend(preset=None).resident_sockets(request), (None, None, []))
+        self.assertFalse((self.dir / "calls.txt").exists())
+
+    def test_condition_size_respects_the_encoder_limit(self):
+        wide = self.write("wide.png", object_image(512, 2048))
+        backend = self.native.NativeBackend()
+        resolution, width, height = backend.condition_size(wide)
+        self.assertLessEqual(max(width, height), 1024)
+        self.assertLess(resolution, 1024)
+        self.assertEqual(backend.condition_size(self.ref), (1024, 1024, 1024))
+
+
+class TorchBackendPlanTest(unittest.TestCase):
+    """The PyTorch backend's schedule and memory planning (CPU only)."""
+
+    SCHEDULER = Path("/mnt/nvme01/models/qimg-21/scheduler")
+
+    @unittest.skipUnless(SCHEDULER.is_dir(), "model scheduler config not available")
+    def test_the_schedule_matches_native_and_truncates_to_its_tail(self):
+        from diffusers import FlowMatchEulerDiscreteScheduler
+        from qimg21_i23d.torch_backend import schedule
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("qimg21_app", ROOT / "server/qwen_image21/app.py")
+        app = importlib.util.module_from_spec(spec); spec.loader.exec_module(app)
+        scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(str(self.SCHEDULER))
+        inputs, full, mu = schedule(scheduler, 20, 1024)
+        np.testing.assert_allclose(full, app.flow_sigmas(20, 1024), atol=1e-6)
+        scheduler.set_timesteps(sigmas=inputs[8:], mu=mu)
+        np.testing.assert_array_equal([float(s) for s in scheduler.sigmas], full[8:])
+
+    def test_the_reserve_grows_with_the_sequence(self):
+        from qimg21_i23d.torch_backend import TorchBackend
+        backend = TorchBackend()
+        base = dict(prompt="x", out=Path("o.png"))
+        plain = backend.reserve_for(GenRequest(**base))
+        one = backend.reserve_for(GenRequest(**base, references=("a",)))
+        two = backend.reserve_for(GenRequest(**base, references=("a", "b")))
+        cfg = backend.reserve_for(GenRequest(**base, references=("a", "b"), negative_prompt="n"))
+        self.assertLess(plain, one)
+        self.assertLess(one, two)
+        self.assertLess(two, cfg)
 
 
 if __name__ == "__main__":

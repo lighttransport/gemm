@@ -222,6 +222,15 @@ void *f32_workspace;
 size_t f32_workspace_bytes;
 }
 
+/* QIMG21_VAE_TF32=1 lets the F32 convolutions use TF32 tensor cores: inputs
+ * rounded to 10 mantissa bits, F32 accumulation. The PyTorch pipeline decodes
+ * in BF16 (7 bits), so this stays closer to it than it is to itself in F32. */
+static int f32_tf32(void) {
+    static int mode = -1;
+    if (mode < 0) { const char *e = getenv("QIMG21_VAE_TF32"); mode = e && atoi(e) ? 1 : 0; }
+    return mode;
+}
+
 extern "C" int q21_cudnn_conv2d_f32(float *output, const float *input, const float *weight, const float *bias,
                                     int ci, int h, int w, int co, int kh, int kw, cudaStream_t stream) {
     if (!output || !input || !weight || ci <= 0 || h <= 0 || w <= 0 || co <= 0 || kh <= 0 || kw <= 0) return 1;
@@ -239,7 +248,7 @@ extern "C" int q21_cudnn_conv2d_f32(float *output, const float *input, const flo
     CCHK(cudnnSetTensor4dDescriptor(yd, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 1, co, h, w));
     CCHK(cudnnSetFilter4dDescriptor(wd, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW, co, ci, kh, kw));
     CCHK(cudnnSetConvolution2dDescriptor(cd, kh / 2, kw / 2, 1, 1, 1, 1, CUDNN_CROSS_CORRELATION, CUDNN_DATA_FLOAT));
-    CCHK(cudnnSetConvolutionMathType(cd, CUDNN_FMA_MATH));
+    CCHK(cudnnSetConvolutionMathType(cd, f32_tf32() ? CUDNN_TENSOR_OP_MATH : CUDNN_FMA_MATH));
     for (int i = 0; i < f32_count; i++) {
         const f32_algo *a = &f32_algos[i];
         if (a->ci == ci && a->h == h && a->w == w && a->co == co && a->kh == kh && a->kw == kw) found = a;
@@ -251,7 +260,8 @@ extern "C" int q21_cudnn_conv2d_f32(float *output, const float *input, const flo
                                                      &returned, perf));
         for (int i = 0; i < returned && !found; i++) {
             cudnnConvolutionFwdAlgo_t algo = perf[i].algo;
-            if (perf[i].status != CUDNN_STATUS_SUCCESS || perf[i].mathType != CUDNN_FMA_MATH ||
+            if (perf[i].status != CUDNN_STATUS_SUCCESS ||
+                (!f32_tf32() && perf[i].mathType != CUDNN_FMA_MATH) ||
                 algo == CUDNN_CONVOLUTION_FWD_ALGO_FFT || algo == CUDNN_CONVOLUTION_FWD_ALGO_FFT_TILING ||
                 algo == CUDNN_CONVOLUTION_FWD_ALGO_WINOGRAD || algo == CUDNN_CONVOLUTION_FWD_ALGO_WINOGRAD_NONFUSED)
                 continue;

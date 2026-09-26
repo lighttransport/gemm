@@ -43,6 +43,112 @@ def _run(command: list[str], *, cwd: Path) -> None:
           f"{time.perf_counter() - start:.1f} s)", file=sys.stderr)
 
 
+def _run_resident(socket_path: Path, command: list[str]) -> bool:
+    """Send one denoiser run to a resident test_cuda_qimg21_fast --serve.
+
+    The resident process already holds the transformer, so this skips the
+    weight load. Its output streams back while it runs and is copied to stderr
+    as a one-shot run's would be, with the same "+ command" and stage-time
+    lines, so the log reads the same. Returns False when no resident process
+    can take the run -- none listening, a different setup, or it went away
+    mid-run -- and the caller runs one-shot instead.
+    """
+    import socket as socketlib
+    args = [str(arg) for arg in command[1:]]
+    if any("\t" in arg or "\n" in arg for arg in args):
+        return False
+    start = time.perf_counter()
+    try:
+        conn = socketlib.socket(socketlib.AF_UNIX, socketlib.SOCK_STREAM)
+        conn.connect(str(socket_path))
+    except OSError:
+        return False
+    print("+ resident", " ".join(str(x) for x in command), file=sys.stderr, flush=True)
+    status = None
+    pending = b""
+    with conn:
+        conn.sendall(("\t".join(args) + "\n").encode("utf-8"))
+        while True:
+            try:
+                chunk = conn.recv(65536)
+            except OSError:
+                chunk = b""
+            if not chunk:
+                break
+            pending += chunk
+            *lines, pending = pending.split(b"\n")
+            for raw in lines:
+                line = raw.decode("utf-8", errors="replace")
+                if line.startswith("fast-serve: status "):
+                    status = int(line.split()[2])
+                print(line, file=sys.stderr, flush=True)
+    if pending:
+        print(pending.decode("utf-8", errors="replace"), file=sys.stderr, flush=True)
+    if status != 0:
+        print(f"resident: run not taken (status {status}); running one-shot", file=sys.stderr, flush=True)
+        return False
+    print(f"  ({Path(command[0]).name}: {time.perf_counter() - start:.1f} s)", file=sys.stderr, flush=True)
+    return True
+
+
+def _file_key(*parts) -> str:
+    """A cache key over files (by content, not path or mtime) and plain values."""
+    import hashlib
+    digest = hashlib.sha256()
+    for part in parts:
+        if isinstance(part, Path) and part.is_file():
+            with open(part, "rb") as stream:
+                for chunk in iter(lambda: stream.read(1 << 20), b""):
+                    digest.update(chunk)
+            # Content only: a copied or re-encoded file with the same bytes is
+            # the same input.
+            digest.update(b"|file|")
+        else:
+            digest.update(f"|{part}|".encode())
+    return digest.hexdigest()
+
+
+def _copy_into(source: Path, target: Path) -> None:
+    import shutil
+    target.mkdir(parents=True, exist_ok=True)
+    for item in source.iterdir():
+        if item.is_file():
+            shutil.copyfile(item, target / item.name)
+
+
+def _store(source: Path, cache: Path, names=None) -> None:
+    """Copy `source`'s files into `cache` atomically (a rename of a filled
+    temporary directory), so a reader never sees a half-written entry."""
+    import shutil
+    import tempfile
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=cache.name + ".", dir=cache.parent))
+    for item in source.iterdir():
+        if item.is_file() and (names is None or item.name in names or any(item.name.startswith(n) for n in names)):
+            shutil.copyfile(item, staging / item.name)
+    try:
+        staging.rename(cache)
+    except OSError:
+        shutil.rmtree(staging, ignore_errors=True)  # another run stored it first
+
+
+def _encode_image_latents(encoder: Path, model: Path, rgba, width: int, height: int, work: Path,
+                          name: str, root: Path) -> Path:
+    """Normalized [tokens, 64] latents of an RGBA image at the output size,
+    through the same BF16 pipeline encode the condition image uses."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from qimg21_i23d import imageops
+    if max(width, height) > 1024:
+        raise SystemExit("an init image or mask needs an output of at most 1024 px a side (the native encoder's limit)")
+    resized = imageops.resize_rgba(rgba, width, height) if rgba.shape[:2] != (height, width) else rgba
+    chw = (resized.astype(np.float32) / 127.5 - 1.0).transpose(2, 0, 1)
+    tensor, latents = work / f"{name}_rgba.npy", work / f"{name}_latents.npy"
+    np.save(tensor, np.ascontiguousarray(chw))
+    _run([str(encoder), "--model", str(model / "vae"), "--image", str(tensor), "--pipeline-bf16",
+          "--out", str(work / f"{name}_moments.npy"), "--normalized-latents", str(latents)], cwd=root)
+    return latents
+
+
 def _device_used_mib(backend: str) -> int | None:
     """Device memory in use, from nvidia-smi, or None where it cannot be read."""
     if backend != "cuda":
@@ -296,8 +402,33 @@ def main() -> int:
                          "--restart-step of this run's schedule with the --initial-latents noise")
     ap.add_argument("--restart-step", type=int, default=0,
                     help="how many of --steps the restart skips; 0 is a fresh run")
+    ap.add_argument("--init-image", type=Path,
+                    help="SDEdit: start from this image, encoded at the output size, instead of pure noise "
+                         "(with --strength; --runner fast)")
+    ap.add_argument("--strength", type=float, default=1.0,
+                    help="with --init-image: the share of the schedule that runs, in (0, 1]; the flow restarts "
+                         "at step round((1 - strength) * steps)")
+    ap.add_argument("--mask", type=Path,
+                    help="edit only where this mask is white (255): outside it the latents follow the init "
+                         "image (or --image) at every step, and its pixels are pasted back after decoding")
+    ap.add_argument("--mask-feather", type=int, default=0, help="Gaussian feather of --mask in pixels")
+    ap.add_argument("--condition-cache", type=Path,
+                    help="cache the condition image's VAE and vision encodes here, keyed by the image content")
+    ap.add_argument("--resident-socket", type=Path,
+                    help="send the denoise to a resident test_cuda_qimg21_fast --serve on this socket, "
+                         "falling back to a one-shot run when it cannot take it")
+    ap.add_argument("--resident-vae-socket", type=Path,
+                    help="send the decode to a resident test_cuda_qimg21_vae --serve on this socket, "
+                         "falling back to a one-shot decode when it cannot take it")
+    ap.add_argument("--vae-tf32", action="store_true",
+                    help="let the cuDNN VAE convolutions use TF32 tensor cores (F32 accumulation); "
+                         "still closer to the BF16 reference VAE than it is to itself in F32")
     ap.add_argument("--prompt-cache", type=Path,
                     help="directory of cached text embeddings; a repeated prompt skips the text encoder")
+    ap.add_argument("--prompt-batch", type=Path,
+                    help="JSON list of further prompts for the same --image: encoded together with this "
+                         "run's prompt in one text-encoder pass (each weight streamed once) into "
+                         "--prompt-cache, so later runs with them hit the cache")
     ap.add_argument("--quant-package", type=Path,
                     help="pack_fast.py package for int8/nvfp4 presets (default: the preset's package)")
     args = ap.parse_args()
@@ -307,8 +438,8 @@ def main() -> int:
             ap.error("--runner fast is CUDA only")
         if args.quantized_transformer or args.quantize_on_load or args.int8_tensor_core:
             ap.error("--runner fast takes --preset/--quant-package instead of harness quantization flags")
-        if fast_attention not in (None, "cutlass-efficient", "flash"):
-            ap.error("--runner fast supports cutlass-efficient or flash attention")
+        if fast_attention not in (None, "cutlass-efficient", "flash", "sage"):
+            ap.error("--runner fast supports cutlass-efficient, flash or sage attention")
         if args.native_normalization not in (None, "vector4") or args.native_rope not in (None, "host-table-exact"):
             ap.error("--runner fast implements vector4 normalization and host-table-exact RoPE only")
         args.native_attention, args.native_normalization, args.native_rope = (
@@ -334,9 +465,18 @@ def main() -> int:
         ap.error("tiled generation needs --runner fast; the parity harness has no tile path")
     if args.upscale <= 0.0:
         ap.error("--upscale must be positive")
+    if args.init_image is not None or args.mask is not None or args.strength != 1.0:
+        if args.runner != "fast" or args.upscale != 1.0 or args.restart_from is not None:
+            ap.error("--init-image/--strength/--mask need --runner fast, no --upscale and no --restart-from")
+        if not 0.0 < args.strength <= 1.0:
+            ap.error("--strength must be in (0, 1]")
+        if args.strength < 1.0 and args.init_image is None:
+            ap.error("--strength below 1 needs --init-image")
+        if args.mask is not None and args.init_image is None and args.image is None:
+            ap.error("--mask needs --init-image or --image: the pixels to keep outside it")
     if args.restart_from is not None:
-        if args.runner != "fast" or args.upscale != 1.0 or args.image:
-            ap.error("--restart-from needs --runner fast, no --upscale and no --image")
+        if args.runner != "fast" or args.upscale != 1.0:
+            ap.error("--restart-from needs --runner fast and no --upscale")
         if args.initial_latents is None:
             ap.error("--restart-from needs --initial-latents: the noise the earlier run started from")
         if not 0 <= args.restart_step < args.steps:
@@ -459,11 +599,31 @@ def main() -> int:
         raise SystemExit("--true-cfg-scale must be > 1 when --negative-prompt is used")
     condition_hw = None
     condition_dir = work / "condition"
+    vision_dir = work / "vision"
+    condition_cached = None
     if args.image:
         encoder = vae_encode_bin
         if not encoder.exists():
             raise SystemExit(f"native {args.backend} encoder missing: {encoder}")
         condition_dir.mkdir(parents=True, exist_ok=False)
+        if args.condition_cache:
+            key = _file_key(Path(args.image).resolve(), args.condition_resolution, model, encoder, vision_bin)
+            condition_cached = args.condition_cache / f"condition-{key[:32]}"
+    encoded = False     # whether an encoder subprocess ran (and its context must retire)
+    if args.image and condition_cached is not None and (condition_cached / "latents.npy").is_file():
+        # Same image, resolution and binaries: the VAE and vision encodes are
+        # a function of those alone.
+        _copy_into(condition_cached, condition_dir)
+        vision_dir.mkdir(parents=True, exist_ok=True)
+        for name in ("merged.npy", "deepstack_0.npy", "deepstack_1.npy", "deepstack_2.npy"):
+            import shutil
+            shutil.copyfile(condition_dir / f"vision_{name}", vision_dir / name)
+        print(f"condition: cache hit ({condition_cached.name})", file=sys.stderr)
+        print("timing: condition image cache hit 0.000 s", file=sys.stderr)
+        image_tensor = np.load(condition_dir / "image.npy", mmap_mode="r")
+        condition_hw = image_tensor.shape[1] // 16, image_tensor.shape[2] // 16
+    elif args.image:
+        encoded = True
         _run([str(encoder), "--model", str(model / "vae"),
               "--input-image", str(Path(args.image).resolve()),
               "--resolution", str(args.condition_resolution),
@@ -488,7 +648,6 @@ def main() -> int:
         if not text_encoder.exists():
             raise SystemExit(f"native {args.backend} text encoder missing: {text_encoder}")
         attention = "flash-exact" if args.backend == "cuda" else "custom"
-        encoded = False
         baseline = None
 
         def encode(text: str, output: Path) -> None:
@@ -522,17 +681,90 @@ def main() -> int:
         text_encoder = text_bin
         if not vision_encoder.exists() or not text_encoder.exists():
             raise SystemExit(f"native {args.backend} vision/text executables missing: {vision_encoder}, {text_encoder}")
-        vision_dir = work / "vision"
         vision_dir.mkdir(parents=True, exist_ok=True)
-        _run([
-            str(vision_encoder), "--model", str(model), "--image", str(condition_dir / "resized.png"),
-            "--max-blocks", "27", "--attention", "flash" if args.backend == "cuda" else "math",
-            "--out", str(vision_dir / "blocks.npy"),
-            "--merged-out", str(vision_dir / "merged.npy"),
-            "--deepstack-dir", str(vision_dir),
-        ], cwd=root)
+        if not (vision_dir / "merged.npy").is_file():
+            encoded = True
+            _run([
+                str(vision_encoder), "--model", str(model), "--image", str(condition_dir / "resized.png"),
+                "--max-blocks", "27", "--attention", "flash" if args.backend == "cuda" else "math",
+                "--out", str(vision_dir / "blocks.npy"),
+                "--merged-out", str(vision_dir / "merged.npy"),
+                "--deepstack-dir", str(vision_dir),
+            ], cwd=root)
+            if condition_cached is not None:
+                import shutil
+                for name in ("merged.npy", "deepstack_0.npy", "deepstack_1.npy", "deepstack_2.npy"):
+                    if (vision_dir / name).is_file():
+                        shutil.copyfile(vision_dir / name, condition_dir / f"vision_{name}")
+                _store(condition_dir, condition_cached)
+        def multimodal_cache_entry(text):
+            key = _file_key(text, condition_dir / "latents.npy", vision_dir / "merged.npy", text_encoder,
+                            model, condition_hw)
+            return args.prompt_cache / f"multimodal-{key[:32]}"
+
+        def prefetch_multimodal_prompts(texts, group=12):
+            """Encode the uncached prompts among `texts` in passes of up to
+            `group` prompts; each pass streams the text encoder's weights
+            once. The embeddings are bitwise the single-prompt ones."""
+            nonlocal encoded
+            import shutil
+            import tempfile
+            pending = []
+            for text in texts:
+                if text not in pending and not (multimodal_cache_entry(text) / "embeds.npy").is_file():
+                    pending.append(text)
+            if len(pending) < 2:
+                return
+            for at in range(0, len(pending), group):
+                chunk = pending[at:at + group]
+                batch_dir = Path(tempfile.mkdtemp(prefix="prompt-batch.", dir=prompt_dir))
+                (batch_dir / "prompts.bin").write_bytes(b"".join(t.encode("utf-8") + b"\0" for t in chunk))
+                encoded = True
+                _run([
+                    str(text_encoder), "--model", str(model), "--prompts-file", str(batch_dir / "prompts.bin"),
+                    "--vision-merged", str(vision_dir / "merged.npy"),
+                    "--vision-deepstack-dir", str(vision_dir),
+                    "--image-grid-height", str(condition_hw[0]),
+                    "--image-grid-width", str(condition_hw[1]),
+                    "--attention", "flash-exact" if args.backend == "cuda" else "custom",
+                    "--out-dir", str(batch_dir / "out"),
+                ], cwd=root)
+                for i, text in enumerate(chunk):
+                    staged = Path(tempfile.mkdtemp(prefix="multimodal.", dir=prompt_dir))
+                    shutil.copyfile(batch_dir / "out" / f"embeds_{i:03d}.npy", staged / "embeds.npy")
+                    shutil.copyfile(batch_dir / "out" / f"tokens_{i:03d}.txt", staged / "tokens.txt")
+                    _store(staged, multimodal_cache_entry(text))
+                    shutil.rmtree(staged, ignore_errors=True)
+                shutil.rmtree(batch_dir, ignore_errors=True)
+            print(f"text: encoded {len(pending)} prompts in {(len(pending) + group - 1) // group} pass(es)",
+                  file=sys.stderr)
+
         def encode_multimodal_prompt(text, output, prefix):
             tokens_path = prompt_dir / f"{prefix}tokens.txt"
+            cached = None
+            if args.prompt_cache:
+                cached = multimodal_cache_entry(text)
+            if cached is not None and (cached / "embeds.npy").is_file():
+                import shutil
+                shutil.copyfile(cached / "embeds.npy", output)
+                shutil.copyfile(cached / "tokens.txt", tokens_path)
+                print(f"text: multimodal prompt cache hit ({cached.name})", file=sys.stderr)
+                print("timing: prompt embedding cache hit 0.000 s", file=sys.stderr)
+            else:
+                run_multimodal_encoder(text, output, tokens_path)
+                if cached is not None:
+                    import shutil
+                    import tempfile
+                    staged = Path(tempfile.mkdtemp(prefix="multimodal.", dir=prompt_dir))
+                    shutil.copyfile(output, staged / "embeds.npy")
+                    shutil.copyfile(tokens_path, staged / "tokens.txt")
+                    _store(staged, cached)
+                    shutil.rmtree(staged, ignore_errors=True)
+            write_multimodal_masks(output, tokens_path, prefix)
+
+        def run_multimodal_encoder(text, output, tokens_path):
+            nonlocal encoded
+            encoded = True
             _run([
                 str(text_encoder), "--model", str(model), "--prompt", text,
                 "--vision-merged", str(vision_dir / "merged.npy"),
@@ -543,6 +775,8 @@ def main() -> int:
                 "--out", str(output),
                 "--dump-tokens", str(tokens_path),
             ], cwd=root)
+
+        def write_multimodal_masks(output, tokens_path, prefix):
             token_ids = np.loadtxt(tokens_path, dtype=np.int64, ndmin=1)
             embeddings = np.load(output, mmap_mode="r", allow_pickle=False)
             token_count = embeddings.shape[-2]
@@ -554,6 +788,12 @@ def main() -> int:
             np.save(prompt_dir / f"{prefix}prompt_mask.npy",
                     np.ones((1, retained.size), dtype=np.int64))
 
+        if args.prompt_batch and args.prompt_cache:
+            import json
+            started = time.perf_counter()
+            batch = [args.prompt] + [str(t) for t in json.loads(args.prompt_batch.read_text())]
+            prefetch_multimodal_prompts(batch)
+            print(f"timing: batched prompt encoding {time.perf_counter() - started:.3f} s", file=sys.stderr)
         encode_multimodal_prompt(args.prompt, prompt_path, "")
         if args.negative_prompt is not None:
             encode_multimodal_prompt(args.negative_prompt,
@@ -566,7 +806,7 @@ def main() -> int:
     # otherwise some 2-step launches can observe stale device allocations even
     # though the child has exited. Nothing to wait for when the embeddings
     # came from the cache.
-    if args.image or encoded:
+    if encoded:
         _wait_device_released(args.backend, None if args.image else baseline)
 
     latent_path = work / "latents.npy"
@@ -667,6 +907,36 @@ def main() -> int:
                             str(args.int8_bf16_tail_blocks)])
         return command
 
+    # SDEdit / masked edit: the init image (or, for a mask alone, the condition
+    # image) encoded at the output size. The flow restarts at step K with the
+    # seed's own noise; a mask keeps the sample on that source outside it.
+    edit_start = None
+    edit_source = args.init_image or (Path(args.image) if args.mask is not None else None)
+    edit_pixels = edit_mask = None
+    if edit_source is not None and (args.strength < 1.0 or args.mask is not None):
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from qimg21_i23d import imageops
+        edit_pixels = imageops.load_rgba(edit_source)
+        if edit_pixels.shape[:2] != (args.height, args.width):
+            edit_pixels = imageops.resize_rgba(edit_pixels, args.width, args.height)
+        source_latents = _encode_image_latents(vae_encode_bin, model, edit_pixels, args.width, args.height,
+                                               work, "source", root)
+        start_step = min(args.steps - 1, max(0, round((1.0 - args.strength) * args.steps)))
+        blend = None
+        if args.mask is not None:
+            edit_mask = imageops.make_mask((args.width, args.height), image=args.mask, resize=True,
+                                           feather=args.mask_feather)
+            blend = work / "blend_mask.npy"
+            np.save(blend, imageops.latent_mask(edit_mask, h_tokens, w_tokens, dilate=1))
+        edit_start = (source_latents, start_step, blend)
+
+    def denoise(command):
+        """A resident denoiser when one is listening and can take the run;
+        otherwise the one-shot runner, exactly as before."""
+        if args.resident_socket and args.runner == "fast" and _run_resident(args.resident_socket, command):
+            return
+        _run(command, cwd=root)
+
     if tiled:
         base_steps = args.base_steps or args.steps
         print(f"base pass: {base_h_tokens * 16}x{base_w_tokens * 16} px, {base_steps} steps")
@@ -688,7 +958,7 @@ def main() -> int:
             base_vae_tile = 48 if max(base_h_tokens, base_w_tokens) > 64 else 0
             _run([str(vae_bin), "--model", str(model / "vae"), "--latents", str(base_latents),
                   "--height-tokens", str(base_h_tokens), "--width-tokens", str(base_w_tokens),
-                  "--out", str(base_decoded), "--conv", "cudnn",
+                  "--out", str(base_decoded), "--conv", "cudnn", *(["--tf32"] if args.vae_tf32 else []),
                   *((["--tile", str(base_vae_tile), "--tile-overlap", "8", "--tile-bleed", "2"])
                     if base_vae_tile else [])], cwd=root)
             rgba = np.load(base_decoded)
@@ -740,6 +1010,20 @@ def main() -> int:
         print(f"refine pass: {args.height}x{args.width} px in {tile_tokens}-token tiles, "
               f"strength {args.refine_strength}")
         _run(refine_command(tile_tokens), cwd=root)
+    elif edit_start is not None:
+        source_latents, start_step, blend = edit_start
+        if start_step:
+            print(f"init image: steps {start_step + 1}-{args.steps} of {args.steps} (strength "
+                  f"{args.strength:g})", file=sys.stderr)
+        extra = ["--latents", str(source_latents if start_step else latent_path),
+                 "--restart-noise", str(latent_path),
+                 "--normalization", args.native_normalization, "--rope", args.native_rope,
+                 "--dump-dir", str(steps_dir)]
+        if start_step:
+            extra += ["--start-step", str(start_step)]
+        if blend is not None:
+            extra += ["--blend-mask", str(blend), "--blend-source", str(source_latents)]
+        denoise(denoise_command(h_tokens, w_tokens, args.steps, native_latents, extra))
     elif args.restart_from is not None and args.restart_step > 0:
         # Refine an earlier result: renoise it to sigma[K] of this schedule with
         # the noise that run started from, then run the remaining steps.
@@ -748,31 +1032,34 @@ def main() -> int:
             raise SystemExit(f"--restart-from must be finite [{h_tokens * w_tokens}, 64] latents")
         print(f"restart: steps {args.restart_step + 1}-{args.steps} of {args.steps} from "
               f"{args.restart_from.name}", file=sys.stderr)
-        _run(denoise_command(h_tokens, w_tokens, args.steps, native_latents,
-                             ["--latents", str(args.restart_from.resolve()),
-                              "--start-step", str(args.restart_step),
-                              "--restart-noise", str(latent_path),
-                              "--normalization", args.native_normalization,
-                              "--rope", args.native_rope, "--dump-dir", str(steps_dir)]), cwd=root)
+        denoise(denoise_command(h_tokens, w_tokens, args.steps, native_latents,
+                                ["--latents", str(args.restart_from.resolve()),
+                                 "--start-step", str(args.restart_step),
+                                 "--restart-noise", str(latent_path),
+                                 "--normalization", args.native_normalization,
+                                 "--rope", args.native_rope, "--dump-dir", str(steps_dir)]))
     else:
-        _run(denoise_command(h_tokens, w_tokens, args.steps, native_latents,
-                             ["--latents", str(latent_path), "--normalization", args.native_normalization,
-                              "--rope", args.native_rope, "--dump-dir", str(steps_dir)]), cwd=root)
+        denoise(denoise_command(h_tokens, w_tokens, args.steps, native_latents,
+                                ["--latents", str(latent_path), "--normalization", args.native_normalization,
+                                 "--rope", args.native_rope, "--dump-dir", str(steps_dir)]))
     if args.native_vae:
         from PIL import Image
 
         vae_conv = args.native_vae_conv or ("cudnn" if args.runner == "fast" else "direct")
 
         decoded_path = work / "native_decoded.npy"
-        _run([
+        decode_command = [
             str(vae_bin),
             "--model", str(model / "vae"), "--latents", str(native_latents),
             "--height-tokens", str(args.height // 16),
             "--width-tokens", str(args.width // 16), "--out", str(decoded_path),
             *(["--conv", vae_conv] if vae_conv != "direct" else []),
+            *(["--tf32"] if args.vae_tf32 and vae_conv == "cudnn" else []),
             *((["--tile", str(args.vae_tile), "--tile-overlap", str(args.vae_tile_overlap),
                 "--tile-bleed", str(args.vae_tile_bleed)]) if args.vae_tile else []),
-        ], cwd=root)
+        ]
+        if not (args.resident_vae_socket and _run_resident(args.resident_vae_socket, decode_command)):
+            _run(decode_command, cwd=root)
         decoded = np.load(decoded_path)
         if decoded.shape != (4, args.height, args.width) or not np.isfinite(decoded).all():
             raise SystemExit("native VAE returned an invalid RGBA tensor")
@@ -782,6 +1069,11 @@ def main() -> int:
     else:
         _decode_vae(model, native_latents, out, args.height, args.width, args.dtype,
                      args.backend, tile=bool(args.vae_tile))
+    if edit_mask is not None:
+        # Outside the mask the original pixels come back exactly.
+        from qimg21_i23d import imageops
+        imageops.save_png(imageops.paste_outside(edit_pixels, imageops.load_rgba(out), edit_mask), out)
+        print("mask: pasted the original pixels back outside the edited region", file=sys.stderr)
     print(f"native denoise trace: {steps_dir}")
     print(f"fixtures: {work}")
     return 0

@@ -14,6 +14,14 @@
 
 static int text_bf16_gemm_output = 1;
 
+/* --prompts-file encodes several prompts in one pass: their rows are
+ * concatenated, every streamed weight is used by each prompt in turn, and
+ * everything that mixes rows (the GEMM's algorithm choice, attention, RoPE
+ * positions) runs per prompt, so each prompt's embeddings are bitwise the
+ * ones a single-prompt run gives. One segment covers all rows otherwise. */
+#define TEXT_MAX_ROWS 32768
+static int text_segments = 1, text_seg_start[256], text_seg_len[256];
+
 /* Linear weights stream from the mapped checkpoint, about 14 GB per prompt,
  * while the GEMMs over a few dozen tokens take tens of milliseconds. So the
  * upload, not the math, is the encoder's cost, and it is pipelined:
@@ -215,16 +223,29 @@ static int text_linear(cuda_qimg_runner *r, qimg21_kernels *k,
      * GEMM result buffer is persistent for the same reason -- cuMemFree may
      * wait on the whole device. */
     static CUdeviceptr result;
+    static size_t result_rows;
     int rc = 0;
     if (text_bf16_gemm_output) {
-        if (!result && !(result = checked_cuMemAlloc((size_t)4096 * 12288 * 2))) rc = -1;
-        if ((size_t)n * no > (size_t)4096 * 12288) rc = -1;
+        /* Sized once, for the widest output, before the pipeline is busy. */
+        size_t rows = n > 4096 ? (size_t)n : 4096;
+        if (!result && (result = checked_cuMemAlloc(rows * 12288 * 2))) result_rows = rows;
+        if (!result || (size_t)n > result_rows) rc = -1;
         CUdeviceptr bias = 0;
-        if (!rc) rc = cublasew_gemm_bf16_bf16_bf16_rowmajor_nt(r->cublaslt_ctx, result, w, in_bf, n, no, ni);
+        for (int g = 0; g < text_segments && !rc; g++) {
+            int rows_g = text_segments > 1 ? text_seg_len[g] : n;
+            size_t at = text_segments > 1 ? (size_t)text_seg_start[g] : 0;
+            rc = cublasew_gemm_bf16_bf16_bf16_rowmajor_nt(r->cublaslt_ctx, result + at * no * 2, w,
+                                                          in_bf + at * ni * 2, rows_g, no, ni);
+        }
         void *args[] = {&out, &result, &bias, &no, &n};
         if (!rc) rc = cuLaunchKernel(r->bf16_to_f32_add_bias, (n * no + 255) / 256, 1, 1,
                                      256, 1, 1, 0, r->stream, args, NULL);
-    } else rc = gemm(r, out, w, in_bf, n, no, ni);
+    } else
+        for (int g = 0; g < text_segments && !rc; g++) {
+            int rows_g = text_segments > 1 ? text_seg_len[g] : n;
+            size_t at = text_segments > 1 ? (size_t)text_seg_start[g] : 0;
+            rc = gemm(r, out + at * no * 4, w, in_bf + at * ni * 2, rows_g, no, ni);
+        }
     if (!rc) rc = text_vec(k->round_bf16, r->stream, n * no, out);
     /* The GEMM is done with the weight, so its slot can be refilled. */
     text_release(slot_index);
@@ -302,7 +323,7 @@ int main(int argc, char **argv) {
     const char *dump_tokens = NULL, *dump_rope_table = NULL;
     const char *vision_merged = NULL, *vision_deepstack_dir = NULL, *rope_table_path = NULL;
     const char *hidden_input = NULL;
-    const char *prompt = NULL;
+    const char *prompt = NULL, *prompts_file = NULL, *out_dir = NULL;
     const char *attention_mode = "custom";
     const char *rms_mode = "auto";
     const char *post_rms_mode = "auto";
@@ -312,6 +333,8 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i], "--model") && i + 1 < argc) model = argv[++i];
         else if (!strcmp(argv[i], "--tokens") && i + 1 < argc) tokens = argv[++i];
         else if (!strcmp(argv[i], "--prompt") && i + 1 < argc) prompt = argv[++i];
+        else if (!strcmp(argv[i], "--prompts-file") && i + 1 < argc) prompts_file = argv[++i];
+        else if (!strcmp(argv[i], "--out-dir") && i + 1 < argc) out_dir = argv[++i];
         else if (!strcmp(argv[i], "--out") && i + 1 < argc) out = argv[++i];
         else if (!strcmp(argv[i], "--dump-tokens") && i + 1 < argc) dump_tokens = argv[++i];
         else if (!strcmp(argv[i], "--dump-rope-table") && i + 1 < argc) dump_rope_table = argv[++i];
@@ -333,7 +356,14 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--dump-layer") && i + 1 < argc) dump_layer = atoi(argv[++i]);
         else { fprintf(stderr, "text: unknown/incomplete option %s\n", argv[i]); return 2; }
     }
-    if (!model || (!!tokens == !!prompt) || (!out && !dump_tokens) ||
+    if (prompts_file && (prompt || tokens || !out_dir || out || dump_tokens || dump_dir || dump_rope_table ||
+                         hidden_input || rope_table_path || start_layer)) {
+        fprintf(stderr, "text: --prompts-file takes --out-dir and none of --prompt/--tokens/--out/--dump-*/"
+                        "--hidden/--rope-table/--start-layer\n");
+        return 2;
+    }
+    if (prompts_file) prompt = "";   /* the checks below see one prompt source */
+    if (!model || (!!tokens == !!prompt) || (!out && !dump_tokens && !out_dir) ||
         (vision_deepstack_dir && !vision_merged) ||
         (strcmp(attention_mode, "custom") && strcmp(attention_mode, "cutlass-efficient") &&
          strcmp(attention_mode, "flash-exact")) ||
@@ -347,17 +377,50 @@ int main(int argc, char **argv) {
         dump_layer < start_layer || dump_layer >= layers) {
         fprintf(stderr, "usage: %s --model DIR (--tokens ids.txt | --prompt TEXT) "
                         "[--out embeds.npy] [--dump-tokens ids.txt] "
+                        "[--prompts-file NUL-separated.txt --out-dir DIR] "
                         "[--vision-merged FILE --vision-deepstack-dir DIR --rope-table FILE] "
                         "[--hidden FILE --start-layer N] "
                         "[--attention custom|cutlass-efficient|flash-exact --drop-prefix N "
                         "--max-layers 36 --dump-layer N]\n", argv[0]); return 2;
     }
-    int ids[4096], n = 0, scanned = EOF;
+    int *ids = malloc(TEXT_MAX_ROWS * sizeof(int)), n = 0, scanned = EOF;
+    int seg_drop[256], seg_image_start[256];
+    if (!ids) return 1;
     double t_start = text_seconds(), t_mark = t_start;
     /* One "timing:" line per setup phase, for the demo's breakdown. */
     #define TEXT_PHASE(label) do { double now_ = text_seconds(); \
         fprintf(stderr, "timing: %s %.3f s\n", label, now_ - t_mark); t_mark = now_; } while (0)
-    if (prompt) {
+    if (prompts_file) {
+        char tokenizer_path[2048];
+        snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/processor/tokenizer.json", model);
+        FILE *fp = fopen(prompts_file, "rb");
+        if (!fp) { perror("text: open prompts file"); return 1; }
+        size_t cap = 1 << 16, len = 0, got;
+        char *text = malloc(cap + 1);
+        while (text && (got = fread(text + len, 1, cap - len, fp)) > 0)
+            if ((len += got) == cap) text = realloc(text, (cap *= 2) + 1);
+        fclose(fp);
+        if (!text) return 1;
+        text[len] = 0;
+        text_segments = 0;
+        for (size_t at = 0; at < len; at += strlen(text + at) + 1) {
+            if (!text[at]) continue;
+            if (text_segments == 256) { fprintf(stderr, "text: more than 256 prompts\n"); return 1; }
+            int g = text_segments, d = 0, first = -1;
+            int m = vision_merged ? q21_build_multimodal_prompt_tokens(
+                        tokenizer_path, text + at, image_grid_h * image_grid_w / 4, ids + n,
+                        TEXT_MAX_ROWS - n, &d, &first) :
+                    q21_build_prompt_tokens(tokenizer_path, text + at, ids + n, TEXT_MAX_ROWS - n, &d);
+            if (m <= d) { fprintf(stderr, "text: tokenization of prompt %d failed (or over %d rows)\n",
+                                  g, TEXT_MAX_ROWS); return 1; }
+            text_seg_start[g] = n; text_seg_len[g] = m; seg_drop[g] = d; seg_image_start[g] = first;
+            n += m; text_segments++;
+        }
+        free(text);
+        if (!text_segments) { fprintf(stderr, "text: no prompts in %s\n", prompts_file); return 1; }
+        fprintf(stderr, "text: %d prompts, %d rows\n", text_segments, n);
+        if (mkdir(out_dir, 0755) && errno != EEXIST) { perror("text: out-dir"); return 1; }
+    } else if (prompt) {
         char tokenizer_path[2048];
         int length = snprintf(tokenizer_path, sizeof(tokenizer_path),
                               "%s/processor/tokenizer.json", model);
@@ -386,17 +449,20 @@ int main(int argc, char **argv) {
         }
         fclose(fp);
     }
-    if (scanned != EOF || n <= drop) return 1;
+    if (!prompts_file) {
+        if (scanned != EOF || n <= drop) return 1;
+        text_seg_start[0] = 0; text_seg_len[0] = n; seg_drop[0] = drop; seg_image_start[0] = image_start;
+    }
     if (dump_tokens) {
         FILE *fp = fopen(dump_tokens, "w");
         if (!fp) { perror("text: open token dump"); return 1; }
         for (int i = 0; i < n; i++) fprintf(fp, "%d\n", ids[i]);
         if (fclose(fp)) { perror("text: close token dump"); return 1; }
     }
-    if (!out) return 0;
+    if (!out && !out_dir) return 0;
     TEXT_PHASE("tokenize");
 
-    int rc = 1;
+    int rc = 1, *visual_rows = NULL;
     text_matrix *jobs = NULL;
     qimg21_shards shards = {{0}, 0};
     cuda_qimg_runner *r = NULL;
@@ -424,29 +490,42 @@ int main(int argc, char **argv) {
         uint32_t bits = (uint32_t)embedding[(size_t)ids[t]*4096+j] << 16;
         memcpy(host+(size_t)t*4096+j, &bits, 4);
     }
-    int visual_rows[4096], visual_count = 0;
+    visual_rows = malloc((size_t)n * sizeof(int));
+    int visual_count = 0, visual_per = 0;
+    if (!visual_rows) goto done;
     for (int t = 0; t < n; t++) if (ids[t] == 151655) visual_rows[visual_count++] = t;
-    if (visual_count && image_start < 0) image_start = visual_rows[0];
+    for (int g = 0, first = 0; g < text_segments; g++) {
+        int count = 0;
+        for (int t = 0; t < text_seg_len[g]; t++) count += ids[text_seg_start[g] + t] == 151655;
+        if (g && count != visual_per) {
+            fprintf(stderr, "text: prompts disagree on the number of image tokens\n");
+            goto done;
+        }
+        visual_per = count;
+        if (count && seg_image_start[g] < 0) seg_image_start[g] = visual_rows[first] - text_seg_start[g];
+        first += count;
+    }
+    if (visual_count && image_start < 0) image_start = seg_image_start[0];
     if (!hidden_input && (!!vision_merged != (visual_count > 0))) {
         fprintf(stderr, "text: image-pad tokens and --vision-merged must be supplied together\n");
         goto done;
     }
     if (visual_count && (!rope_table_path) &&
         (image_grid_h < 2 || image_grid_w < 2 || image_grid_h % 2 || image_grid_w % 2 ||
-         image_grid_h / 2 * (image_grid_w / 2) != visual_count)) {
+         image_grid_h / 2 * (image_grid_w / 2) != visual_per)) {
         fprintf(stderr, "text: native multimodal MRoPE requires matching even image grid dimensions\n");
         goto done;
     }
     if (vision_merged) {
         npy_f32 merged = {0};
         if (npy_read_f32(vision_merged, &merged) || merged.ndim != 2 ||
-            merged.shape[0] != (size_t)visual_count || merged.shape[1] != 4096) {
+            merged.shape[0] != (size_t)visual_per || merged.shape[1] != 4096) {
             fprintf(stderr, "text: invalid merged vision embedding\n");
             npy_free(&merged); goto done;
         }
         for (int i = 0; i < visual_count; i++)
             memcpy(host + (size_t)visual_rows[i] * 4096,
-                   merged.data + (size_t)i * 4096, 4096 * sizeof(float));
+                   merged.data + (size_t)(i % visual_per) * 4096, 4096 * sizeof(float));
         npy_free(&merged);
     }
     if (hidden_input) {
@@ -542,18 +621,23 @@ int main(int argc, char **argv) {
            base.shape[1]!=128||base.shape[2]!=2) {npy_free(&base);goto done;}
         composed=malloc((size_t)n*128*2*4);
         if(!composed){npy_free(&base);goto done;}
-        int hh=image_grid_h/2,ww=image_grid_w/2,after=image_start+(hh>ww?hh:ww);
-        for(int t=0;t<n;t++)for(int j=0;j<128;j++) {
+        /* Positions restart in every prompt. */
+        int hh=image_grid_h/2,ww=image_grid_w/2;
+        for(int g=0;g<text_segments;g++) {
+          int image_start=seg_image_start[g],after=image_start+(hh>ww?hh:ww);
+          for(int t=0;t<text_seg_len[g];t++)for(int j=0;j<128;j++) {
             int k=j&63,pos;
+            size_t row=(size_t)text_seg_start[g]+t;
             if(t<image_start)pos=t;
-            else if(t<image_start+visual_count) {
+            else if(t<image_start+visual_per) {
                 int q=t-image_start;
                 pos=k<60&&k%3==1?image_start+q/ww:
                     k<60&&k%3==2?image_start+q%ww:image_start;
-            } else pos=after+t-image_start-visual_count;
+            } else pos=after+t-image_start-visual_per;
             if(pos<0||pos>=(int)base.shape[0]){free(composed);npy_free(&base);goto done;}
-            composed[((size_t)t*128+j)*2]=base.data[((size_t)pos*128+j)*2];
-            composed[((size_t)t*128+j)*2+1]=base.data[((size_t)pos*128+j)*2+1];
+            composed[(row*128+j)*2]=base.data[((size_t)pos*128+j)*2];
+            composed[(row*128+j)*2+1]=base.data[((size_t)pos*128+j)*2+1];
+          }
         }
         rope_table=checked_cuMemAlloc((size_t)n*128*2*4);
         if(!rope_table||cuMemcpyHtoD(rope_table,composed,(size_t)n*128*2*4)) {
@@ -563,12 +647,17 @@ int main(int argc, char **argv) {
     } else {
         npy_f32 table={0};
         const char *table_path = rope_table_path ? rope_table_path : "cuda/qimg21/qwen21_text_rope.npy";
+        int longest=0;
+        for(int g=0;g<text_segments;g++) if(text_seg_len[g]>longest) longest=text_seg_len[g];
         if(npy_read_f32(table_path,&table) || table.ndim!=3 ||
-           table.shape[0]<(size_t)n || table.shape[1]!=128 || table.shape[2]!=2) {
+           table.shape[0]<(size_t)longest || table.shape[1]!=128 || table.shape[2]!=2) {
             fprintf(stderr,"text: invalid/missing qwen21_text_rope.npy\n"); npy_free(&table); goto done;
         }
         rope_table=checked_cuMemAlloc((size_t)n*128*2*4);
-        if(!rope_table || cuMemcpyHtoD(rope_table,table.data,(size_t)n*128*2*4)) {npy_free(&table);goto done;}
+        if(!rope_table) {npy_free(&table);goto done;}
+        for(int g=0;g<text_segments;g++)
+            if(cuMemcpyHtoD(rope_table+(size_t)text_seg_start[g]*128*2*4,table.data,
+                            (size_t)text_seg_len[g]*128*2*4)) {npy_free(&table);goto done;}
         npy_free(&table);
     }
     if (dump_rope_table) {
@@ -627,13 +716,21 @@ int main(int argc, char **argv) {
             CHECK(text_cast(r,key_bf,key,n*1024));
             CHECK(text_cast(r,v_bf,v,n*1024));
             CHECK(cuStreamSynchronize(r->stream));
-            CHECK(cutlass_attention((float *)(uintptr_t)att,
-                                    (const void *)(uintptr_t)q_bf,
-                                    (const void *)(uintptr_t)key_bf,
-                                    (const void *)(uintptr_t)v_bf,n,r->stream));
+            for(int g=0;g<text_segments;g++) {
+                size_t o=text_seg_start[g];
+                CHECK(cutlass_attention((float *)(uintptr_t)(att+o*4096*4),
+                                        (const void *)(uintptr_t)(q_bf+o*4096*2),
+                                        (const void *)(uintptr_t)(key_bf+o*1024*2),
+                                        (const void *)(uintptr_t)(v_bf+o*1024*2),text_seg_len[g],r->stream));
+            }
         } else {
-            void *aa[]={&att,&q,&key,&v,&n};
-            CHECK(cuLaunchKernel(attention,32,n,1,32,1,1,0,r->stream,aa,NULL));
+            for(int g=0;g<text_segments;g++) {
+                size_t o=text_seg_start[g];
+                CUdeviceptr ag=att+o*4096*4,qg=q+o*4096*4,kg=key+o*1024*4,vg=v+o*1024*4;
+                int len=text_seg_len[g];
+                void *aa[]={&ag,&qg,&kg,&vg,&len};
+                CHECK(cuLaunchKernel(attention,32,len,1,32,1,1,0,r->stream,aa,NULL));
+            }
             CHECK(text_vec(base.round_bf16,r->stream,n*4096,att));
         }
         DUMP("self_attn.o_proj.input",att,4096);
@@ -667,10 +764,12 @@ int main(int argc, char **argv) {
                 snprintf(path,sizeof(path),"%s/vision_deepstack_%d.npy",vision_deepstack_dir,l);
             }
             if(npy_read_f32(path,&deep)||deep.ndim!=2||
-               deep.shape[0]!=(size_t)visual_count||deep.shape[1]!=4096){
+               deep.shape[0]!=(size_t)visual_per||deep.shape[1]!=4096){
                 npy_free(&deep);goto done;
             }
-            CHECK(cuMemcpyHtoD(visual_embed_d,deep.data,(size_t)visual_count*4096*4));
+            for(int g=0;g<text_segments;g++)
+                CHECK(cuMemcpyHtoD(visual_embed_d+(size_t)g*visual_per*4096*4,deep.data,
+                                   (size_t)visual_per*4096*4));
             CHECK(cuCtxSynchronize());
             npy_free(&deep);
             int visual_values=visual_count*4096;
@@ -695,7 +794,21 @@ int main(int argc, char **argv) {
     }
     CHECK(cuMemcpyDtoH(host,x,(size_t)n*4096*4));
     for(size_t i=0;i<(size_t)n*4096;i++)if(!isfinite(host[i]))goto done;
-    rc=npy_write_f32(out,host+(size_t)drop*4096,(size_t)(n-drop)*4096,n-drop,4096);
+    if (prompts_file) {
+        rc = 0;
+        for (int g = 0; g < text_segments && !rc; g++) {
+            int rows = text_seg_len[g] - seg_drop[g];
+            snprintf(path, sizeof(path), "%s/embeds_%03d.npy", out_dir, g);
+            rc = npy_write_f32(path, host + (size_t)(text_seg_start[g] + seg_drop[g]) * 4096,
+                               (size_t)rows * 4096, rows, 4096);
+            snprintf(path, sizeof(path), "%s/tokens_%03d.txt", out_dir, g);
+            FILE *fp = rc ? NULL : fopen(path, "w");
+            if (!fp) { rc = 1; break; }
+            for (int t = 0; t < text_seg_len[g]; t++) fprintf(fp, "%d\n", ids[text_seg_start[g] + t]);
+            if (fclose(fp)) rc = 1;
+        }
+    } else
+        rc=npy_write_f32(out,host+(size_t)drop*4096,(size_t)(n-drop)*4096,n-drop,4096);
     TEXT_PHASE("write embeddings");
     fprintf(stderr, "timing: text encoder total %.3f s\n", text_seconds() - t_start);
     /* Tearing down the context, the pinned ring and 17 GB of mappings costs
@@ -723,5 +836,7 @@ done:
     if(cutlass_plugin)dlclose(cutlass_plugin);
     for(int i=0;i<shards.n;i++)safetensors_close(shards.st[i]);
     free(host);
+    free(visual_rows);
+    free(ids);
     return rc;
 }

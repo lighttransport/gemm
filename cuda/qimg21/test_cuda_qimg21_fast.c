@@ -21,6 +21,10 @@
 #include "qimg21_fast_kernels.h"
 #include "qimg21_fast_fp4.h"
 #include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -73,7 +77,7 @@ typedef struct {
     cublasew_context *blas;
     CUmodule module;
     CUfunction cast_bf16, txt_norm, gelu, silu, mod_prepare, scale_prepare, norm_mod, norm_mod_q8, quant_rows,
-        dequant, qk_norm_rope, fp4_act, w4a4_bf16, fp4_rowmax, fp4_act_cl, swiglu, euler, cfg_combine, checksum, colmax;
+        dequant, qk_norm_rope, fp4_act, w4a4_bf16, fp4_rowmax, fp4_act_cl, swiglu, euler, cfg_combine, checksum, colmax, mask_blend;
     void *plugin;
     q21f_attention_fn attention;
     /* --attention sage: 8-bit attention for unmasked calls; causal text runs
@@ -801,6 +805,9 @@ typedef struct {
     float *host_out;     /* [target * 64] F32 */
     uint16_t *host_pred; /* [target * 64] BF16 */
     CUevent ev0, ev1;
+    /* Masked editing (--blend-mask): per-token weights [target], the source
+     * latents and the noise [target * 64]; 0 when unused. */
+    CUdeviceptr blend_mask, blend_src, blend_noise;
 } q21f_job;
 
 /* Steps [s0, s1) on the sample currently in st->sample. `extracted` tracks
@@ -813,7 +820,10 @@ static int q21f_run_steps(q21f_runtime *rt, q21f_job *J, int s0, int s1, int *ex
     int N = st->target, nb = J->nb;
     char path[2048];
     const char *saved_stage = rt->stage_dir;
-    if (J->dump_dir) rt->stage_dir = J->dump_dir;
+    /* Stage dumps stay opt-in (--stage-dir); a dump dir only redirects them
+     * (per tile). Step previews alone must not write every block's hidden
+     * state, which costs seconds per joint pass. */
+    if (J->dump_dir && rt->stage_dir) rt->stage_dir = J->dump_dir;
     for (int s = s0; s < s1; s++) {
         float model_t = J->manual_t >= 0.0f
                             ? J->manual_t
@@ -849,6 +859,11 @@ static int q21f_run_steps(q21f_runtime *rt, q21f_job *J, int s0, int s1, int *ex
         float dt = J->sigmas[s + 1] - J->sigmas[s];
         { void *a[] = {&st->sample, &st->latent, &st->pred, &neg, &n, &J->guidance, &dt, &cfg};
           REQ(!q21f_launch_n(rt, rt->euler, (size_t)n, a), "euler"); }
+        if (J->blend_mask) {
+            float sigma = J->sigmas[s + 1];
+            void *a[] = {&st->sample, &st->latent, &J->blend_mask, &J->blend_src, &J->blend_noise, &n, &sigma};
+            REQ(!q21f_launch_n(rt, rt->mask_blend, (size_t)n, a), "mask blend");
+        }
         if (J->profile) {
             float ms = 0;
             CK(cuEventRecord(J->ev1, rt->compute));
@@ -972,6 +987,49 @@ static const q21f_preset q21f_presets[] = {
     {"accurate", "11264", "bf16", "cutlass-efficient", NULL},
 };
 
+/* ---- Resident mode (--serve SOCKET) ----
+ * Loading the transformer is most of a short run's cost, so the demo keeps one
+ * process resident per setup (model, weights, grid, CFG) and sends it runs over
+ * a Unix socket. A request is one line: the usual per-run flags, tab
+ * separated. While it runs, stderr is the connection, so the client sees the
+ * same step and timing lines a one-shot run prints. The last line is
+ * "fast-serve: status N": 0 done, 2 bad request, 3 not this process's setup
+ * (the caller runs one-shot instead). A failure inside the run exits the
+ * process; the client sees the connection close without a status. */
+static int q21f_serve_listen(const char *path) {
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    if (strlen(path) >= sizeof(addr.sun_path)) return -1;
+    strcpy(addr.sun_path, path);
+    unlink(path);
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) || listen(fd, 4)) { close(fd); return -1; }
+    return fd;
+}
+
+/* One request line into `buf`, split on tabs into `argv`. */
+static int q21f_serve_read(int fd, char *buf, size_t cap, char **argv, int max_args) {
+    size_t n = 0;
+    while (n + 1 < cap) {
+        ssize_t got = read(fd, buf + n, 1);
+        if (got <= 0) return -1;
+        if (buf[n] == '\n') break;
+        n++;
+    }
+    buf[n] = 0;
+    int argc = 0;
+    for (char *p = buf; *p && argc < max_args;) {
+        argv[argc++] = p;
+        char *tab = strchr(p, '\t');
+        if (!tab) break;
+        *tab = 0;
+        p = tab + 1;
+    }
+    return argc;
+}
+
 static void q21f_usage(const char *argv0) {
     fprintf(stderr,
             "usage: %s --model DIR --prompt-embeds E.npy [--latents L.npy] [--height-tokens H --width-tokens W]\n"
@@ -980,6 +1038,8 @@ static void q21f_usage(const char *argv0) {
             "  [--preset low8|low8-fp4|fast12|accurate] [--vram-budget-mib MIB] [--cfg-batch 0|1] [--fused-gemm 0|1] [--kv-cache on|off]\n"
             "  [--prefix-pass extract|separate] [--plan-only] [--profile]\n"
             "  restart: --start-step K [--refine-seed N | --restart-noise E.npy] (img2img strength on a [base_h, base_w, 64] --latents grid)\n"
+            "  masked edit: --blend-mask M.npy --blend-source S.npy --restart-noise E.npy (outside the mask the\n"
+            "               sample follows S renoised with E at every step)\n"
             "  tiled coarse-to-fine refine: --refine-from GRID.npy --tile-tokens T [--tile-overlap O]\n"
             "                               [--refine-strength S] [--refine-seed N]\n"
             "  [--weights bf16|int8|nvfp4 --quant-package DIR [--bf16-blocks 0,31]] [--fp4-gemm cutlass|omma]\n"
@@ -988,7 +1048,10 @@ static void q21f_usage(const char *argv0) {
             "  [--attention cutlass-efficient|flash|sage [--sage-accum fp16|fp32]]\n"
             "  [--normalization vector4] [--rope host-table-exact]\n"
             "  [--attention-plugin PATH] [--rope-table-base PATH]\n"
-            "  [--out O.npy] [--dump-dir DIR] [--pred-dir DIR] [--quiet|--verbose]\n", argv0);
+            "  [--out O.npy] [--dump-dir DIR] [--pred-dir DIR] [--quiet|--verbose]\n"
+            "  resident: --serve SOCKET --height-tokens H --width-tokens W [--serve-cfg 0|1]\n"
+            "            [--serve-prompt-tokens N] [--serve-condition-tokens C] (then one run per connection;\n"
+            "            C > 0 also serves image-conditioned edits with up to C condition tokens)\n", argv0);
 }
 
 int main(int argc, char **argv) {
@@ -1006,6 +1069,9 @@ int main(int argc, char **argv) {
     double budget_mib = 0, refine_strength = 0.0;
     unsigned long long refine_seed = 0;
     const char *restart_noise_path = NULL;
+    const char *blend_mask_path = NULL, *blend_source_path = NULL;
+    const char *serve_path = NULL;
+    int serve_cfg = 0, serve_prompt_tokens = 512, serve_condition_tokens = 0;
     float guidance = 1.0f, manual_t = -1.0f;
     const q21f_preset *preset = NULL;
     for (int i = 1; i + 1 < argc; i++)
@@ -1073,6 +1139,12 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--refine-strength") && more) refine_strength = atof(argv[++i]);
         else if (!strcmp(a, "--refine-seed") && more) refine_seed = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(a, "--restart-noise") && more) restart_noise_path = argv[++i];
+        else if (!strcmp(a, "--blend-mask") && more) blend_mask_path = argv[++i];
+        else if (!strcmp(a, "--blend-source") && more) blend_source_path = argv[++i];
+        else if (!strcmp(a, "--serve") && more) serve_path = argv[++i];
+        else if (!strcmp(a, "--serve-cfg") && more) serve_cfg = atoi(argv[++i]) != 0;
+        else if (!strcmp(a, "--serve-prompt-tokens") && more) serve_prompt_tokens = atoi(argv[++i]);
+        else if (!strcmp(a, "--serve-condition-tokens") && more) serve_condition_tokens = atoi(argv[++i]);
         else if (!strcmp(a, "--quant-package") && more) package = argv[++i];
         else if (!strcmp(a, "--fp4-gemm") && more) {
             const char *m = argv[++i];
@@ -1114,7 +1186,15 @@ int main(int argc, char **argv) {
             }
         } else { q21f_usage(argv[0]); return 2; }
     }
-    if (!model || !prompt_path || (!latent_path && !refine_path) || ih < 1 || iw < 1 || ih > 1024 || iw > 1024 ||
+    if (serve_path && (prompt_path || latent_path || refine_path || layout_path || condition_path || calib_path ||
+                       trace || verify_slots || plan_only || stage_dir || pred_dir || manual_t >= 0.0f ||
+                       serve_prompt_tokens < 1 || serve_prompt_tokens > 4096 || serve_condition_tokens < 0 ||
+                       serve_condition_tokens > 16384)) {
+        fprintf(stderr, "fast: --serve takes the setup only; runs arrive over the socket\n");
+        return 2;
+    }
+    if (!model || (!serve_path && (!prompt_path || (!latent_path && !refine_path))) || ih < 1 || iw < 1 ||
+        ih > 1024 || iw > 1024 ||
         steps < 1 || steps > 100 || (manual_t >= 0.0f && steps != 1) || cfg_batch < 0 || cfg_batch > 1) {
         q21f_usage(argv[0]);
         return 2;
@@ -1159,12 +1239,16 @@ int main(int argc, char **argv) {
         fprintf(stderr, "fast: --start-step must be in [0, steps) and cannot combine with --timestep\n");
         return 2;
     }
+    if (blend_mask_path && refine_path) {
+        fprintf(stderr, "fast: --blend-mask is a one-shot, untiled option\n");
+        return 2;
+    }
     if (refine_path && (refine_strength <= 0.0 || refine_strength > 1.0)) {
         fprintf(stderr, "fast: a tiled refine needs --refine-strength in (0, 1]\n");
         return 2;
     }
 
-    int rc = 1, N = ih * iw, nb = negative_path ? 2 : 1;
+    int rc = 1, N = ih * iw, nb = serve_path ? (serve_cfg ? 2 : 1) : negative_path ? 2 : 1;
     /* Each tile is a self-contained canvas: its rope frame is centred on the
      * tile, so the model composes a whole subject inside it. That is why more
      * context does not help here -- giving a tile a halo makes the model draw a
@@ -1204,11 +1288,23 @@ int main(int argc, char **argv) {
     rt.stage_dir = stage_dir;
     if (stage_dir) mkdir(stage_dir, 0755);
 
+    REQ(!npy_read_f32(rope_path, &rope) && rope.ndim == 2 && rope.shape[1] == 128,
+        "invalid RoPE table %s", rope_path);
+    if (serve_path) {
+        /* Size everything for the longest prompt a request may bring; each
+         * run then uses the prefix its own prompt needs. */
+        /* An edit's text stream also carries one image-pad slot per 4
+         * condition tokens; its prefix is the text plus the condition tokens. */
+        for (int i = 0; i < nb; i++) {
+            br[i].nt = serve_prompt_tokens + serve_condition_tokens / 4;
+            br[i].prefix = serve_prompt_tokens + serve_condition_tokens;
+        }
+        st.nc = serve_condition_tokens;
+        goto inputs_done;
+    }
     REQ(!npy_read_f32(prompt_path, &pe) && (!latent_path || !npy_read_f32(latent_path, &la)),
         "cannot read inputs");
     REQ(!negative_path || !npy_read_f32(negative_path, &ne), "cannot read negative embeds");
-    REQ(!npy_read_f32(rope_path, &rope) && rope.ndim == 2 && rope.shape[1] == 128,
-        "invalid RoPE table %s", rope_path);
     br[0].nt = pe.ndim == 3 && pe.shape[0] == 1 ? (int)pe.shape[1] : (pe.ndim == 2 ? (int)pe.shape[0] : 0);
     br[0].prompt = pe.data;
     if (negative_path) {
@@ -1266,6 +1362,7 @@ int main(int argc, char **argv) {
     if (refine_path)
         for (int i = 0; i < nb; i++)
             REQ(br[i].prefix > 0, "a tiled refine needs a non-empty text prefix");
+inputs_done:;
 
     /* ---- Device ---- */
     /* "timing:" lines are one per setup phase, for the demo's breakdown. */
@@ -1310,7 +1407,7 @@ int main(int argc, char **argv) {
         *(void **)&rt.i8_gemm = dlsym(rt.i8_plugin, "q21f_i8_gemm");
         REQ(rt.i8_gemm, "q21f_i8_gemm missing");
     }
-    GETF(euler, "euler"); GETF(cfg_combine, "cfg_combine"); GETF(checksum, "checksum"); GETF(colmax, "colmax");
+    GETF(euler, "euler"); GETF(mask_blend, "mask_blend"); GETF(cfg_combine, "cfg_combine"); GETF(checksum, "checksum"); GETF(colmax, "colmax");
 #undef GETF
     /* cutlass-efficient is PyTorch's memory-efficient kernel (reference
      * parity); flash is upstream FlashAttention-2 (faster, not bit-exact). */
@@ -1548,6 +1645,7 @@ int main(int argc, char **argv) {
             br[i].rope = q21f_alloc(&rt, (P + T) * 128 * 4);
             REQ(br[i].cache_k && br[i].cache_v && br[i].work_k && br[i].work_v && br[i].prefix_hidden &&
                 br[i].rope, "branch %d K/V allocation", i);
+            if (serve_path) continue; /* each run uploads the rows its prompt needs */
             int *pos = q21f_positions(&br[i], th, tw);
             REQ(pos && q21f_valid_rope(&rope, pos, (int)P + T), "RoPE positions outside the table");
             float *table = (float *)malloc((P + T) * 128 * sizeof(float));
@@ -1561,10 +1659,12 @@ int main(int argc, char **argv) {
             REQ(!e, "RoPE upload");
         }
     }
-    CK(cuMemHostAlloc((void **)&pinned_te, (size_t)(steps + 1) * 512 * 2, 0));
+    /* A resident process serves any step count up to the CLI's limit. */
+    int steps_cap = serve_path ? 100 : steps;
+    CK(cuMemHostAlloc((void **)&pinned_te, (size_t)(steps_cap + 1) * 512 * 2, 0));
     host_out = (float *)malloc((size_t)T * 64 * sizeof(float));
     host_pred = (uint16_t *)malloc((size_t)T * nb * 64 * sizeof(uint16_t));
-    sigmas = (float *)malloc((size_t)(steps + 1) * sizeof(float));
+    sigmas = (float *)malloc((size_t)(steps_cap + 1) * sizeof(float));
     if (refine_path) {
         /* The assembled fine grid and its blend weight stay in host memory;
          * only one tile is ever resident. */
@@ -1585,9 +1685,170 @@ int main(int argc, char **argv) {
     fprintf(stderr, "fast: device allocations %.0f MiB (peak %.0f MiB)\n", rt.allocated / (double)Q21F_MIB,
             rt.peak / (double)Q21F_MIB);
 
+    /* ---- Resident: wait for the next run ---- */
+    int serve_fd = -1, client = -1, saved_stderr = -1;
+    CUdeviceptr blend_buffers[3] = {0, 0, 0};
+    /* A resident process must not outlive whoever started it: it holds several
+     * GB of VRAM nothing else would give back. PR_SET_PDEATHSIG is no use here:
+     * it fires when the parent *thread* exits, and the demo starts this from a
+     * short-lived request thread. So the accept loop watches the parent pid. */
+    pid_t serve_parent = getppid();
+    char request[65536], *req_argv[256];
+    char serve_model[2048] = "", serve_package[2048] = "";
+    int serve_flash = flash;
+    if (serve_path) {
+        snprintf(serve_model, sizeof(serve_model), "%s", model);
+        snprintf(serve_package, sizeof(serve_package), "%s", package ? package : "");
+        signal(SIGPIPE, SIG_IGN);
+        serve_fd = q21f_serve_listen(serve_path);
+        REQ(serve_fd >= 0, "cannot listen on %s", serve_path);
+        saved_stderr = dup(2);
+        fprintf(stderr, "fast: serving %dx%d%s on %s (prompt capacity %d tokens)\n", ih, iw,
+                nb == 2 ? " with CFG" : "", serve_path, serve_prompt_tokens);
+    }
+serve_next:;
+    if (serve_path) {
+        if (client >= 0) {
+            fflush(stderr);
+            dup2(saved_stderr, 2);
+            close(client);
+            client = -1;
+        }
+        npy_free(&pe); npy_free(&ne); npy_free(&la); npy_free(&restart_noise); npy_free(&cond);
+        for (int i = 0; i < 2; i++) { q21_layout_free(&br[i].layout); br[i].edit = 0; }
+        st.nc = 0; st.condition = NULL;
+        for (;;) {
+            struct pollfd pfd = {serve_fd, POLLIN, 0};
+            if (getppid() != serve_parent) {
+                fprintf(stderr, "fast: parent exited; resident process stopping\n");
+                rc = 0;
+                goto fail;
+            }
+            if (poll(&pfd, 1, 1000) > 0) break;
+        }
+        client = accept(serve_fd, NULL, NULL);
+        if (client < 0) goto serve_next;
+        int req_argc = q21f_serve_read(client, request, sizeof(request), req_argv, 256);
+        if (req_argc < 0) goto serve_next;
+        dup2(client, 2);
+        /* Per-run settings start from their defaults every time. */
+        prompt_path = latent_path = negative_path = restart_noise_path = NULL;
+        condition_path = layout_path = negative_layout_path = NULL;
+        blend_mask_path = blend_source_path = NULL;
+        out_path = "native_latents.npy"; dump_dir = NULL;
+        steps = 1; start_step = 0; refine_seed = 0; guidance = 1.0f; profile = 0;
+        int status = 0, seen_model = 0, seen_preset = 0, seen_package = 0;
+        for (int i = 0; i < req_argc && !status; i++) {
+            const char *a = req_argv[i];
+            const char *v = i + 1 < req_argc ? req_argv[i + 1] : NULL;
+            if (!strcmp(a, "--prompt-embeds") && v) prompt_path = req_argv[++i];
+            else if (!strcmp(a, "--negative-prompt-embeds") && v) negative_path = req_argv[++i];
+            else if (!strcmp(a, "--guidance-scale") && v) guidance = (float)atof(req_argv[++i]);
+            else if (!strcmp(a, "--latents") && v) latent_path = req_argv[++i];
+            else if (!strcmp(a, "--steps") && v) steps = atoi(req_argv[++i]);
+            else if (!strcmp(a, "--start-step") && v) start_step = atoi(req_argv[++i]);
+            else if (!strcmp(a, "--restart-noise") && v) restart_noise_path = req_argv[++i];
+            else if (!strcmp(a, "--refine-seed") && v) refine_seed = strtoull(req_argv[++i], NULL, 10);
+            else if (!strcmp(a, "--out") && v) out_path = req_argv[++i];
+            else if (!strcmp(a, "--dump-dir") && v) dump_dir = req_argv[++i];
+            else if (!strcmp(a, "--profile")) profile = 1;
+            else if (!strcmp(a, "--condition-latents") && v) condition_path = req_argv[++i];
+            else if (!strcmp(a, "--editing-layout") && v) layout_path = req_argv[++i];
+            else if (!strcmp(a, "--negative-editing-layout") && v) negative_layout_path = req_argv[++i];
+            else if (!strcmp(a, "--blend-mask") && v) blend_mask_path = req_argv[++i];
+            else if (!strcmp(a, "--blend-source") && v) blend_source_path = req_argv[++i];
+            /* The setup this process was loaded with must be the one asked for. */
+            else if (!strcmp(a, "--model") && v) { seen_model = 1; status = strcmp(req_argv[++i], serve_model) ? 3 : 0; }
+            else if (!strcmp(a, "--quant-package") && v) {
+                seen_package = 1; status = strcmp(req_argv[++i], serve_package) ? 3 : 0;
+            } else if (!strcmp(a, "--preset") && v) {
+                seen_preset = 1; status = !preset || strcmp(req_argv[++i], preset->name) ? 3 : 0;
+            }
+            else if (!strcmp(a, "--height-tokens") && v) status = atoi(req_argv[++i]) != ih ? 3 : 0;
+            else if (!strcmp(a, "--width-tokens") && v) status = atoi(req_argv[++i]) != iw ? 3 : 0;
+            else if (!strcmp(a, "--attention") && v) {
+                const char *m = req_argv[++i];
+                status = (!strcmp(m, "sage") ? 2 : !strcmp(m, "flash")) != serve_flash ? 3 : 0;
+            } else if ((!strcmp(a, "--normalization") || !strcmp(a, "--rope")) && v) i++;
+            else status = 3; /* tiling, editing, diagnostics: a one-shot run's job */
+        }
+        /* A request must name the setup it expects, not inherit this one. */
+        if (!status && (!seen_model || seen_preset != !!preset || seen_package != !!serve_package[0])) status = 3;
+        if (!status && (!!negative_path != (nb == 2))) status = 3;
+        if (!status && (condition_path || layout_path) && !serve_condition_tokens) status = 3; /* not sized for edits */
+        if (!status && (!prompt_path || !latent_path || steps < 1 || steps > steps_cap || start_step < 0 ||
+                        start_step >= steps || (negative_path && guidance <= 1.0f) ||
+                        (!!layout_path != !!condition_path) || (negative_layout_path && !layout_path) ||
+                        (layout_path && negative_path && !negative_layout_path) ||
+                        (blend_mask_path && (!blend_source_path || !restart_noise_path)) ||
+                        (restart_noise_path && !start_step && !blend_mask_path)))
+            status = 2;
+        if (!status && (npy_read_f32(prompt_path, &pe) || npy_read_f32(latent_path, &la) ||
+                        (negative_path && npy_read_f32(negative_path, &ne))))
+            status = 2;
+        if (!status) {
+            br[0].prompt = pe.data;
+            br[0].nt = pe.ndim == 3 && pe.shape[0] == 1 ? (int)pe.shape[1] : (pe.ndim == 2 ? (int)pe.shape[0] : 0);
+            if (nb == 2) {
+                br[1].prompt = ne.data;
+                br[1].nt = ne.ndim == 3 && ne.shape[0] == 1 ? (int)ne.shape[1] : (ne.ndim == 2 ? (int)ne.shape[0] : 0);
+            }
+            for (int i = 0; i < nb && !status; i++) {
+                if (br[i].nt > serve_prompt_tokens + serve_condition_tokens / 4)
+                    status = 3; /* longer than this process was sized for */
+                else if (br[i].nt < 1) status = 2;
+                br[i].prefix = br[i].nt;
+            }
+            if (!status && condition_path) {
+                if (npy_read_f32(condition_path, &cond)) status = 2;
+                else {
+                    st.nc = cond.ndim == 3 && cond.shape[0] == 1 ? (int)cond.shape[1]
+                                                                  : (cond.ndim == 2 ? (int)cond.shape[0] : 0);
+                    if (st.nc < 1 || cond.shape[cond.ndim - 1] != 64) status = 2;
+                    else if (st.nc > serve_condition_tokens) status = 3; /* larger than this process was sized for */
+                    st.condition = cond.data;
+                }
+            }
+            for (int i = 0; i < nb && !status; i++) {
+                const char *path = i ? negative_layout_path : layout_path;
+                if (!path) continue;
+                int slots, h, w;
+                if (q21_layout_read(path, &br[i].layout, &slots, &h, &w) || slots != br[i].nt || h != th ||
+                    w != tw || br[i].layout.image_tokens != st.nc + T)
+                    status = 2;
+                else if (br[i].layout.prefix > serve_prompt_tokens + serve_condition_tokens) status = 3;
+                else { br[i].edit = 1; br[i].prefix = br[i].layout.prefix; }
+            }
+            int ni = la.ndim == 3 && la.shape[0] == 1 ? (int)la.shape[1] : (la.ndim == 2 ? (int)la.shape[0] : 0);
+            if (!status && !(ni == N && la.shape[la.ndim - 1] == 64)) status = 2;
+            if (!status && ((pe.shape[pe.ndim - 1] != Q21F_D) || (nb == 2 && ne.shape[ne.ndim - 1] != Q21F_D)))
+                status = 2;
+        }
+        if (status) {
+            fprintf(stderr, "fast-serve: status %d (%s)\n", status,
+                    status == 3 ? "not this resident process's setup" : "bad request");
+            goto serve_next;
+        }
+        run_start = phase_mark = q21f_seconds();
+        fprintf(stderr, "timing: reuse resident transformer weights (%.0f MiB) 0.000 s\n",
+                rt.allocated / (double)Q21F_MIB);
+        for (int i = 0; i < nb; i++) {
+            size_t P = (size_t)br[i].prefix;
+            int *pos = q21f_positions(&br[i], th, tw);
+            REQ(pos && q21f_valid_rope(&rope, pos, (int)P + T), "RoPE positions outside the table");
+            float *table = (float *)malloc((P + T) * 128 * sizeof(float));
+            REQ(table, "RoPE table allocation");
+            q21f_rope_rows(table, rope.data, pos, (int)P + T);
+            int e = q21f_upload(&rt, br[i].rope, table, (P + T) * 128 * 4, 1);
+            free(table);
+            free(pos);
+            REQ(!e, "RoPE upload");
+        }
+    }
+
     /* ---- Sampling ---- */
     q21f_job job = {&st, br, nb, batch, steps, kv_cache, extract, profile, dump_dir, pred_dir, guidance,
-                    manual_t, NULL, pinned_te, host_out, host_pred, NULL, NULL};
+                    manual_t, NULL, pinned_te, host_out, host_pred, NULL, NULL, 0, 0, 0};
     if (manual_t >= 0.0f) { sigmas[0] = manual_t; sigmas[1] = 0.0f; }
     else qimg21_flow_sigmas(steps, T, sigmas);
     job.sigmas = sigmas;
@@ -1707,9 +1968,32 @@ int main(int argc, char **argv) {
          * result lands where the longer schedule's own trajectory would be if
          * the result were its x0: at step 0 it is exactly a fresh run. */
         if (restart_noise_path) {
-            REQ(start_step > 0, "--restart-noise needs --start-step");
+            REQ(start_step > 0 || blend_mask_path, "--restart-noise needs --start-step or --blend-mask");
             REQ(!npy_read_f32(restart_noise_path, &restart_noise) &&
                 restart_noise.n == (size_t)T * 64, "--restart-noise must hold %d x 64 values", T);
+        }
+        if (blend_mask_path) {
+            npy_f32 bmask = {0}, bsrc = {0};
+            REQ(restart_noise.data, "--blend-mask needs --restart-noise (the noise the source is renoised with)");
+            REQ(blend_source_path && !npy_read_f32(blend_source_path, &bsrc) && bsrc.n == (size_t)T * 64,
+                "--blend-mask needs --blend-source with %d x 64 values", T);
+            REQ(!npy_read_f32(blend_mask_path, &bmask) && bmask.n == (size_t)T, "--blend-mask must hold %d weights", T);
+            for (size_t i = 0; i < bmask.n; i++)
+                REQ(isfinite(bmask.data[i]) && bmask.data[i] >= 0.0f && bmask.data[i] <= 1.0f,
+                    "--blend-mask weights must be in [0, 1]");
+            /* Allocated once and reused: a resident process serves many edits. */
+            if (!blend_buffers[0]) {
+                blend_buffers[0] = q21f_alloc(&rt, (size_t)T * 4);
+                blend_buffers[1] = q21f_alloc(&rt, (size_t)T * 64 * 4);
+                blend_buffers[2] = q21f_alloc(&rt, (size_t)T * 64 * 4);
+            }
+            job.blend_mask = blend_buffers[0]; job.blend_src = blend_buffers[1]; job.blend_noise = blend_buffers[2];
+            REQ(job.blend_mask && job.blend_src && job.blend_noise, "blend buffers");
+            REQ(!q21f_upload(&rt, job.blend_mask, bmask.data, (size_t)T * 4, 1) &&
+                !q21f_upload(&rt, job.blend_src, bsrc.data, (size_t)T * 64 * 4, 1) &&
+                !q21f_upload(&rt, job.blend_noise, restart_noise.data, (size_t)T * 64 * 4, 1), "blend upload");
+            npy_free(&bmask); npy_free(&bsrc);
+            fprintf(stderr, "fast: masked edit from %s\n", blend_mask_path);
         }
         if (start_step) {
             if (la.ndim == 3) {
@@ -1799,6 +2083,12 @@ int main(int argc, char **argv) {
     Q21F_PHASE("denoise %d steps (image generation)", refine_path ? (nrows * ncols) * (steps - refine_start)
                                                                   : steps - start_step);
     fprintf(stderr, "timing: denoiser total %.3f s\n", q21f_seconds() - run_start);
+    if (serve_path) {
+        if (ev0) cuEventDestroy(ev0);
+        if (ev1) cuEventDestroy(ev1);
+        fprintf(stderr, "fast-serve: status 0\n");
+        goto serve_next;
+    }
     rc = 0;
 fail:
     if (rt.compute) cuStreamSynchronize(rt.compute);

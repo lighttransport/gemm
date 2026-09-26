@@ -50,6 +50,132 @@ def device_label(torch, device) -> str:
     return f"rocm {hip}" if hip else f"cuda {torch.cuda.get_device_name(0)}"
 
 
+class BlockRing:
+    """--offload resident for the transformer: the first N blocks live on the
+    device and the rest stream through two device slots, one block ahead of
+    compute, as the native runner's plan does.
+
+    Every block's weights are kept in pinned host memory. unpark() puts the
+    first N on the device -- N chosen from the memory free at that moment --
+    and park() gives the device back, so a resident reference server can hold
+    its weights in host RAM between runs and still leave the GPU to others.
+
+    The blocks share one shape, so two sets of device tensors serve every
+    streamed block: before block j runs, its weights are already in its slot
+    (copied on a side stream) and its parameters point there; it then starts
+    the copy of the next streamed block into the other slot, once the compute
+    that last used that slot has finished. Events order both directions, so no
+    block ever reads a slot mid-copy. (diffusers' own group offloading with
+    some groups pinned resident races exactly there.)"""
+
+    def __init__(self, torch, transformer, device, reserve_mib: int):
+        self.torch, self.device, self.reserve = torch, device, reserve_mib * 2**20
+        self.blocks = list(transformer.transformer_blocks)
+        self.others = [child for name, child in transformer.named_children() if name != "transformer_blocks"]
+        shapes = [tuple(p.shape) for p in self.blocks[0].parameters()]
+        if any([tuple(p.shape) for p in b.parameters()] != shapes for b in self.blocks):
+            raise SystemExit("reference: --offload resident needs identically shaped transformer blocks")
+        self.host = [[p.data.pin_memory() for p in b.parameters()] for b in self.blocks]
+        for block, tensors in zip(self.blocks, self.host):
+            for param, tensor in zip(block.parameters(), tensors):
+                param.data = tensor
+        self.block_bytes = sum(t.numel() * t.element_size() for t in self.host[0])
+        self.resident = len(self.blocks)
+        self.slots = None
+        for j, block in enumerate(self.blocks):
+            block.register_forward_pre_hook(lambda _m, _a, j=j: self.before(j))
+            block.register_forward_hook(lambda _m, _a, _o, j=j: self.after(j))
+        transformer.register_forward_pre_hook(lambda _m, _a: self.fetch(self.resident))
+
+    def unpark(self) -> int:
+        torch = self.torch
+        for module in self.others:
+            module.to(self.device)
+        free, _ = torch.cuda.mem_get_info(self.device)
+        room = free - self.reserve - 2 * self.block_bytes  # the two slots
+        self.resident = max(0, min(len(self.blocks), int(room // self.block_bytes)))
+        for block, tensors in zip(self.blocks[:self.resident], self.host):
+            for param, tensor in zip(block.parameters(), tensors):
+                param.data = tensor.to(self.device, non_blocking=True)
+        if self.resident < len(self.blocks):
+            self.slots = [[torch.empty_like(t, device=self.device) for t in self.host[0]] for _ in range(2)]
+            self.copy_stream = torch.cuda.Stream(self.device)
+            self.copied = [torch.cuda.Event() for _ in range(2)]
+            self.released = [torch.cuda.Event() for _ in range(2)]
+            for event in self.released:
+                event.record()
+        torch.cuda.synchronize(self.device)
+        return self.resident
+
+    def park(self) -> None:
+        for block, tensors in zip(self.blocks, self.host):
+            for param, tensor in zip(block.parameters(), tensors):
+                param.data = tensor
+        for module in self.others:
+            module.to("cpu")
+        self.slots = None
+        self.torch.cuda.synchronize(self.device)
+        self.torch.cuda.empty_cache()
+
+    def fetch(self, j: int) -> None:
+        if j >= len(self.blocks) or self.slots is None:
+            return
+        slot = (j - self.resident) % 2
+        with self.torch.cuda.stream(self.copy_stream):
+            self.copy_stream.wait_event(self.released[slot])
+            for dst, src in zip(self.slots[slot], self.host[j]):
+                dst.copy_(src, non_blocking=True)
+            self.copied[slot].record(self.copy_stream)
+
+    def before(self, j: int) -> None:
+        if j < self.resident:
+            return
+        slot = (j - self.resident) % 2
+        self.torch.cuda.current_stream().wait_event(self.copied[slot])
+        for param, tensor in zip(self.blocks[j].parameters(), self.slots[slot]):
+            param.data = tensor
+        self.fetch(j + 1)
+
+    def after(self, j: int) -> None:
+        if j >= self.resident:
+            self.released[(j - self.resident) % 2].record()
+
+
+def place_on_device(torch, pipe, device, mode: str, reserve_mib: int):
+    """--offload group|resident. Weights stream with diffusers' group
+    offloading on a side CUDA stream, so each block's copy overlaps the block
+    before it. In resident mode the VAE, the transformer's non-block layers and
+    its first N blocks live on the device, N being as many as fit next to
+    `reserve_mib`; the text encoder (about 15 GB in BF16) never fits on a 16 GB
+    card and is streamed in both modes."""
+    from diffusers.hooks import apply_group_offloading
+
+    def stream(module, level="block_level"):
+        apply_group_offloading(module, onload_device=device, offload_device=torch.device("cpu"),
+                               offload_type=level, num_blocks_per_group=1 if level == "block_level" else None,
+                               use_stream=True, record_stream=True)
+
+    # Block level only splits a module's direct ModuleList children, and the
+    # text encoder's layers are nested (model.language_model.layers): block
+    # level would onload all 15 GB as one group. Leaf level streams each layer.
+    stream(pipe.text_encoder, "leaf_level")
+    pipe.vae.to(device)
+    transformer = pipe.transformer
+    blocks = transformer.transformer_blocks
+    resident, ring = 0, None
+    if mode == "group":
+        stream(transformer)
+    else:
+        ring = BlockRing(torch, transformer, device, reserve_mib)
+        resident = ring.unpark()
+    print(f"reference: offload {mode}: {resident} of {len(blocks)} transformer blocks resident, "
+          f"the rest and the text encoder streamed", file=sys.stderr)
+    # Mixed placement leaves the pipeline unable to infer where to run; say so.
+    pipe.__class__ = type(pipe.__class__.__name__, (pipe.__class__,),
+                          {"_execution_device": property(lambda _self: device)})
+    return ring
+
+
 _phase_mark = [time.perf_counter()]
 
 
@@ -62,8 +188,7 @@ def phase(label: str, seconds: float | None = None) -> None:
     _phase_mark[0] = now
 
 
-def main() -> int:
-    run_start = time.perf_counter()
+def make_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     ap.add_argument("--prompt", default="a red apple on a white table")
@@ -78,6 +203,15 @@ def main() -> int:
     ap.add_argument("--device", choices=("cuda", "rocm", "cpu"), default="cuda",
                     help="which PyTorch build and device to run on; rocm and cuda need "
                          "matching PyTorch builds, cpu needs neither")
+    ap.add_argument("--offload", choices=("sequential", "group", "resident"), default="sequential",
+                    help="GPU weight placement. sequential: every submodule copied at each use "
+                         "(least memory, slowest). group: block by block with the next block "
+                         "prefetched on a side stream. resident: the VAE and as many transformer "
+                         "blocks as fit stay on the device and only the rest stream, as the native "
+                         "runner's memory plan does. All three compute the same numbers.")
+    ap.add_argument("--resident-reserve-mib", type=int, default=2560,
+                    help="device memory --offload resident leaves free for activations and the "
+                         "streamed text encoder")
     ap.add_argument("--sdpa-backend", choices=("default", "efficient"), default="default",
                     help="optionally pin CUDA SDPA for deterministic native parity")
     ap.add_argument(
@@ -97,6 +231,21 @@ def main() -> int:
     ap.add_argument("--dump-text-inputs-dir", help="save token IDs and masks passed to the text encoder")
     ap.add_argument("--prompt-fixture-dir", type=Path,
                     help="use captured pre-final-RMSNorm prompt embeddings and image-pad mask")
+    ap.add_argument("--serve", type=Path,
+                    help="stay loaded and serve runs on this Unix socket (--offload resident only); "
+                         "--dump-dir is then per request")
+    return ap
+
+
+def main() -> int:
+    run_start = time.perf_counter()
+    ap = make_parser()
+    if "--serve" in sys.argv:
+        # --dump-dir comes with each request, not with the server.
+        for action in ap._actions:
+            if action.dest == "dump_dir":
+                action.required = False
+        return serve(ap, ap.parse_args())
     args = ap.parse_args()
 
     _phase_mark[0] = time.perf_counter()
@@ -124,11 +273,13 @@ def main() -> int:
         str(Path(args.model).resolve()), dtype=dtype, local_files_only=True
     )
     phase("load pipeline weights (from_pretrained)")
-    if on_gpu:
+    if on_gpu and args.offload == "sequential":
         # The weights are 31 GB and the demo holds a native run in the same
         # device, so the pipeline is streamed module by module rather than
         # resident. On the CPU there is nothing to stream away from.
         pipe.enable_sequential_cpu_offload(device=device)
+    elif on_gpu:
+        place_on_device(torch, pipe, device, args.offload, args.resident_reserve_mib)
     else:
         pipe.to(device)
     phase("move to device / CPU offload setup")
@@ -460,6 +611,7 @@ def main() -> int:
         "device": label,
         "device_requested": args.device,
         "sdpa_backend": args.sdpa_backend,
+        "offload": args.offload if on_gpu else None,
         "use_kv_cache": use_kv_cache,
         "prompt_fixture_dir": str(args.prompt_fixture_dir.resolve()) if args.prompt_fixture_dir else None,
     }, indent=2) + "\n")
@@ -467,6 +619,180 @@ def main() -> int:
     print(f"timing: reference total {time.perf_counter() - run_start:.3f} s", file=sys.stderr)
     print(f"saved {out / 'reference.png'}")
     return 0
+
+# Options a served run supports; anything else is a one-shot run's job.
+SERVE_UNSUPPORTED = ("image", "dump_pred_dir", "capture_block_dir", "dump_vae_dir", "dump_text_inputs_dir",
+                     "prompt_fixture_dir")
+# Must match what the server was started with.
+SERVE_SETUP = ("model", "device", "dtype", "offload")
+
+
+def serve(ap: argparse.ArgumentParser, setup) -> int:
+    """Stay loaded; one run per connection on a Unix socket.
+
+    Same protocol as the native runners: a request is one line of this
+    script's usual flags, tab separated; stdout and stderr stream back while it
+    runs; the last line is "fast-serve: status N" (0 done, 1 failed, 2 bad
+    request, 3 not this server's setup). Weights stay in pinned host memory;
+    each run puts the resident blocks and the VAE on the device and takes them
+    off again afterwards, so the GPU is free between runs."""
+    import io
+    import os
+    import socket as socketlib
+    import traceback
+    import torch
+    from diffusers import QwenImage21Pipeline
+
+    if setup.offload != "resident" or setup.device == "cpu":
+        ap.error("--serve needs --offload resident on a GPU")
+    _phase_mark[0] = time.perf_counter()
+    device = resolve_device(torch, setup.device)
+    dtype = torch.bfloat16 if setup.dtype == "bf16" else torch.float16
+    pipe = QwenImage21Pipeline.from_pretrained(str(Path(setup.model).resolve()), dtype=dtype, local_files_only=True)
+    ring = place_on_device(torch, pipe, device, "resident", setup.resident_reserve_mib)
+    ring.park()
+    pipe.vae.to("cpu")
+    spans = {"encode": 0.0, "decode": 0.0, "first_step": None, "last_step": None}
+
+    def synced():
+        torch.cuda.synchronize()
+        return time.perf_counter()
+
+    def timed(key, fn):
+        def wrapper(*a, **k):
+            start = synced()
+            try:
+                return fn(*a, **k)
+            finally:
+                spans[key] += synced() - start
+        return wrapper
+
+    pipe.encode_prompt = timed("encode", pipe.encode_prompt)
+    pipe.vae.decode = timed("decode", pipe.vae.decode)
+
+    def first_call(_module, _inputs):
+        if spans["first_step"] is None:
+            spans["first_step"] = synced()
+    pipe.transformer.register_forward_pre_hook(first_call)
+
+    listener = socketlib.socket(socketlib.AF_UNIX, socketlib.SOCK_STREAM)
+    setup.serve.unlink(missing_ok=True)
+    listener.bind(str(setup.serve))
+    listener.listen(4)
+    listener.settimeout(1.0)
+    parent = os.getppid()
+    print(f"reference: serving on {setup.serve} ({time.perf_counter() - _phase_mark[0]:.1f} s to load)",
+          file=sys.stderr, flush=True)
+    while True:
+        if os.getppid() != parent:
+            return 0
+        try:
+            conn, _ = listener.accept()
+        except socketlib.timeout:
+            continue
+        conn.settimeout(None)
+        stream = conn.makefile("rw", encoding="utf-8", errors="replace", newline="\n", buffering=1)
+        saved = sys.stdout, sys.stderr
+        status = 0
+        try:
+            line = stream.readline().rstrip("\n")
+            sys.stdout = sys.stderr = stream
+            try:
+                args = ap.parse_args(line.split("\t"))
+            except SystemExit:
+                status = 2
+            if not status and (any(getattr(args, k) for k in SERVE_UNSUPPORTED) or args.serve or
+                               any(getattr(args, k) != getattr(setup, k) for k in SERVE_SETUP) or
+                               not args.dump_dir):
+                status = 3
+            if not status:
+                try:
+                    run_served(torch, pipe, ring, device, dtype, args, spans)
+                except Exception:  # noqa: BLE001 - report it and stay up
+                    traceback.print_exc()
+                    status = 1
+                finally:
+                    ring.park()
+                    pipe.vae.to("cpu")
+                    torch.cuda.empty_cache()
+            print(f"fast-serve: status {status}", flush=True)
+        except (OSError, ValueError):
+            pass
+        finally:
+            sys.stdout, sys.stderr = saved
+            try:
+                stream.close()
+                conn.close()
+            except OSError:
+                pass
+
+
+def run_served(torch, pipe, ring, device, dtype, args, spans) -> None:
+    """One text-to-image run on the loaded pipeline: the demo's options only."""
+    run_start = time.perf_counter()
+    _phase_mark[0] = run_start
+    print("timing: reuse loaded PyTorch pipeline 0.000 s", file=sys.stderr)
+    resident = ring.unpark()
+    pipe.vae.to(device)
+    phase(f"onload {resident} resident transformer blocks + VAE")
+    for key in spans:
+        spans[key] = 0.0 if key in ("encode", "decode") else None
+    out = Path(args.dump_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    if max(args.height, args.width) > 1024:
+        pipe.vae.enable_tiling()
+    else:
+        pipe.vae.disable_tiling()
+    gen = torch.Generator(device=device).manual_seed(args.seed)
+    initial_latents, _ = pipe.prepare_latents(None, 1, pipe.transformer.config.in_channels, args.height,
+                                              args.width, dtype, device, gen, None)
+    np.save(out / "initial_latents.npy", np.ascontiguousarray(initial_latents[0].detach().float().cpu().numpy()))
+
+    def callback(_pipe, step, _timestep, kwargs):
+        torch.cuda.synchronize()
+        spans["last_step"] = time.perf_counter()
+        value = kwargs.get("latents")
+        if value is not None:
+            np.save(out / f"step_{step:03d}.npy", value.detach().float().cpu().numpy())
+        prompt_embeds = kwargs.get("prompt_embeds")
+        if prompt_embeds is not None and step == 0:
+            np.save(out / "prompt_embeds.npy", prompt_embeds.detach().float().cpu().numpy())
+        return kwargs
+
+    if args.sdpa_backend == "efficient":
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+        backend_context = sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION)
+    else:
+        backend_context = nullcontext()
+    t0 = time.perf_counter()
+    use_kv_cache = args.kv_cache != "off"
+    with backend_context:
+        result = pipe(prompt=args.prompt, negative_prompt=args.negative_prompt,
+                      true_cfg_scale=args.true_cfg_scale, height=args.height, width=args.width,
+                      num_inference_steps=args.steps, latents=initial_latents, use_kv_cache=use_kv_cache,
+                      callback_on_step_end=callback,
+                      callback_on_step_end_tensor_inputs=["latents", "prompt_embeds"])
+    pipeline_s = time.perf_counter() - t0
+    denoise_s = (spans["last_step"] - spans["first_step"]
+                 if spans["first_step"] is not None and spans["last_step"] is not None else 0.0)
+    phase("prompt encoding (text encoder)", spans["encode"])
+    phase(f"denoise {args.steps} steps (image generation)", denoise_s)
+    phase("VAE decode", spans["decode"])
+    phase("pipeline other (latent prep, scheduler, postprocess)",
+          max(0.0, pipeline_s - spans["encode"] - denoise_s - spans["decode"]))
+    result.images[0].save(out / "reference.png")
+    np.save(out / "reference_rgba.npy", np.asarray(result.images[0].convert("RGBA")))
+    (out / "run.json").write_text(json.dumps({
+        "model": str(Path(args.model).resolve()), "prompt": args.prompt,
+        "negative_prompt": args.negative_prompt, "true_cfg_scale": args.true_cfg_scale,
+        "height": args.height, "width": args.width, "steps": args.steps, "seed": args.seed,
+        "elapsed_seconds": pipeline_s, "torch": torch.__version__, "device": device_label(torch, device),
+        "device_requested": args.device, "sdpa_backend": args.sdpa_backend, "use_kv_cache": use_kv_cache,
+        "offload": "resident", "resident_blocks": resident, "served": True,
+    }, indent=2) + "\n")
+    phase("write image + fixtures")
+    print(f"timing: reference total {time.perf_counter() - run_start:.3f} s", file=sys.stderr)
+    print(f"saved {out / 'reference.png'}")
 
 
 if __name__ == "__main__":

@@ -62,6 +62,129 @@ The driver flags are `native_generate.py --initial-latents NOISE
 --restart-from LATENTS --restart-step K`.
 
 
+## Resident denoiser
+
+Loading the transformer (about 7 GB for `fast12`, 2.6 s) was most of a short
+run's setup, and a refine or a new seed at the same size does not need it
+again. So the server keeps one `test_cuda_qimg21_fast --serve` process loaded
+between runs.
+
+**Starting it.** The first eligible run starts the process. Eligible means
+native mode, a CUDA fast preset, and no tiled refine. The load shows in that
+run's breakdown under *load resident denoiser*.
+
+**Reusing it.** Later runs with the same setup send their denoise to it over a
+Unix socket, and the breakdown reads *reuse resident transformer weights 0 s*.
+The setup is binary, model, preset and package, output size, and whether a
+negative prompt doubles the batch; steps, seed, prompt and refines may vary.
+Prompts are served up to 512 tokens.
+
+**Stopping it.**
+- A run with a different setup replaces the process.
+- Any other kind of run (compare, the PyTorch reference, a tiled refine, the
+  parity harness, ROCm) stops it first, so its VRAM is free.
+- It stops after 15 minutes idle.
+- It stops when the server exits. The process also watches its parent's pid,
+  because the kernel's parent-death signal fires when the parent *thread*
+  exits, and the demo starts it from a request thread.
+
+`GET /api/health` reports `resident`.
+
+The VAE decoder rides along: a `test_cuda_qimg21_vae --serve` process with the
+same lifetime, for outputs up to 1024². It keeps its roughly 1 GB of F32
+weights on the device, so a decode drops from 2.4 s to 0.55 s. Fast-preset
+runs also decode with TF32 cuDNN convolutions (`--vae-tf32`). That is 22%
+faster, and the image still measures 52.7 dB against the BF16 reference VAE,
+as the F32 decode does.
+
+Output from the resident processes is bit-identical to one-shot runs with the
+same inputs. At 512² with `fast12`:
+
+| Run | One-shot | Resident denoiser | Denoiser and VAE |
+|---|---|---|---|
+| 20-step refine | 10.0 s | 6.1 s | 5.1 s |
+| New 6-step seed | about 9.4 s | 5.7 s | 4.1 s |
+
+**Protocol.** One connection carries one run:
+- **Request:** a single line of the usual per-run flags, tab separated.
+- **While it runs:** stderr is the connection, so step, timing and preview
+  output flows as in a one-shot run.
+- **Last line:** `fast-serve: status N`. 0 is done, 2 is a bad request, and 3
+  means the run is not this process's setup; the driver then runs one-shot.
+  The driver also runs one-shot when the process goes away mid-run.
+
+The driver flag is `native_generate.py --resident-socket PATH`.
+
+## Agreement with PyTorch
+
+A denoising trajectory amplifies tiny arithmetic differences step by step, so
+the reference's own spread sets the bar. The same PyTorch run with a different
+SDPA backend (memory-efficient against the default) ends at cosine **0.99939**
+at step 19 (512², 20 steps), and its image differs by 34.3 dB.
+
+`cuda/qimg21/trajectory_sweep.py` runs the fast runner from each reference's
+own noise and reports that step-19 distance. Mean 1 - cosine over three
+prompts and seeds, with denoise time at 512² x 20 steps:
+
+| Weights | Attention | 1 - cos | Denoise |
+|---|---|---:|---:|
+| BF16 (`accurate`) | exact | 4.0e-4 | 15.1 s |
+| BF16 (`accurate`) | flash | 3.6e-4 | 14.0 s |
+| INT8 (`fast12`) | sage (default) | 1.3e-3 | 5.0 s |
+| INT8 (`fast12`) | flash | 1.4e-3 | 5.1 s |
+| INT8 (`fast12`) | exact | 7.8e-4 | 5.8 s |
+| NVFP4 (`low8-fp4`) | sage | 6.3e-3 | 4.7 s |
+| PyTorch vs PyTorch | efficient vs default | about 6e-4 | |
+
+What the sweep shows:
+- **BF16 is already below the noise floor**, so a closer cosine there is not
+  measurable. The per-stage metrics say the same: the text embeddings and the
+  VAE are not where it diverges. Decoding the reference's own final latents
+  with the native VAE gives 52.7 dB, and running the denoiser from the
+  reference's exact embeddings leaves the drift unchanged.
+- **For INT8, the attention kernel is the lever.** Exact attention moves every
+  case closer, reaching the floor, for 17% more time. The form's **Attention**
+  select offers it for fast presets (API field `attention`: `exact`, `flash`
+  or `sage`).
+- **Keeping sensitive blocks in BF16 did not help** FP4 or INT8 consistently.
+- **The int8-smooth-a0.5 package** measured closer than a0.6 on all three
+  cases. The runner README records a0.6 winning other comparisons, so the
+  default stands.
+
+## PyTorch reference: fair timing
+
+On a 16 GB card neither the 14 GB BF16 transformer nor the 15 GB text encoder
+fits whole, and the original reference streamed every module at every use
+(`enable_sequential_cpu_offload`). That measured the PCIe link, not PyTorch.
+`reference.py --offload` now offers three placements, all computing the same
+numbers:
+
+| `--offload` | Transformer | 512², 20 steps: denoise |
+|---|---|---:|
+| `sequential` | every module copied at each use | about 57 s |
+| `group` | block by block, next block prefetched on a side stream | 45.3 s |
+| `resident` | as many blocks on the device as fit (17 to 20 of 32); the rest stream through two prefetched slots | 22 to 24 s |
+
+The native `accurate` preset, BF16 with the same kind of plan, denoises the same
+run in about 16 s.
+
+**Serving.** For CUDA the demo keeps a PyTorch server loaded
+(`reference.py --serve --offload resident`, about 45 s once):
+- Its weights live in pinned host memory.
+- Each run puts the resident blocks and the VAE on the device (1.5 s) and
+  takes them off afterwards. Between runs it holds only its CUDA context
+  (about 1 GB), so the native runners keep the GPU.
+- A served run is byte-identical to the one-shot `sequential` run.
+
+The form's **PyTorch weights** select (API `reference_offload`) switches back
+to the original one-shot sequential run.
+
+`resident` places blocks with its own two-slot ring, not diffusers' group
+offloading. Pinning some groups resident inside group offloading races with
+its stream prefetch and gives wrong numbers from the second step on.
+
+## Timing breakdown
+
 Each card reports its own wall time: in compare mode the runner and the
 reference no longer share one number. Each card shows three figures:
 
@@ -105,6 +228,8 @@ Gen3 x8 (7.2 GB/s) and page-cache reads (about 8 GB/s), roughly 2 s.
 A 512², 10-step `fast12` run went from about 16.5 s to 14 s the first time, and
 to 9.7 s with a cached prompt and seed.
 
+
+## Step previews
 
 While a run is in flight, each result card shows the picture as it develops.
 Below it is a filmstrip of every step: click a step to hold it, and click it

@@ -1,10 +1,12 @@
 import tempfile
+import threading
 import sys
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from server.qwen_image21.app import (MAX_EVENTS, Demo, Progress, REFERENCE_DEVICES, ROOT,
+from server.qwen_image21.app import (MAX_EVENTS, Demo, Progress, REFERENCE_DEVICES, ROOT, ResidentDenoiser,
+                                     ResidentReference, send_resident,
                                      StepPreviews, compare_runs, denoised_estimate, flow_sigmas,
                                      generation_seconds, timing_breakdown)
 import time
@@ -938,6 +940,131 @@ class QwenImage21RestartTest(unittest.TestCase):
             with self.subTest(extra=extra):
                 with self.assertRaisesRegex(ValueError, reason):
                     self.demo._validate(self.request(**extra))
+
+
+class QwenImage21ResidentTest(unittest.TestCase):
+    """The resident denoiser's lifecycle, with a stand-in for the binary that
+    announces it is serving and then waits to be stopped."""
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory(dir=ROOT / "tmp", prefix="qimg21-test-")
+        root = Path(self.td.name)
+        (root / "model").mkdir()
+        fake = root / "fast"
+        fake.write_text("#!/bin/sh\necho 'timing: load transformer weights (1 MiB) 0.100 s' >&2\n"
+                        "echo \"fast: serving $*\" >&2\nexec sleep 60\n")
+        fake.chmod(0o755)
+        self.demo = Demo(root / "model", root / "quant", root / "py", root / "work", root / "native",
+                         "127.0.0.1", 0, fast=fake, fast_packages={"int8": root, "nvfp4": root})
+        self.addCleanup(self.demo.resident.stop)
+
+    def tearDown(self):
+        self.td.cleanup()
+
+    def cfg(self, **extra):
+        request = {"prompt": "apple", "backend": "cuda", "mode": "native", "preset": "accurate",
+                   "width": 512, "height": 512, "steps": 4}
+        request.update(extra)
+        return self.demo._validate(request)
+
+    def test_only_untiled_native_fast_runs_are_served(self):
+        self.assertIsNotNone(ResidentDenoiser.key_for(self.demo, self.cfg()))
+        with mock.patch.object(self.demo, "torch_build", return_value={"available": True, "torch": "x"}):
+            for extra in ({"preset": ""}, {"mode": "compare"},
+                          {"upscale": 2, "width": 1024, "height": 1024}):
+                with self.subTest(extra=extra):
+                    self.assertIsNone(ResidentDenoiser.key_for(self.demo, self.cfg(**extra)))
+
+    def test_a_process_is_reused_for_the_same_setup_and_replaced_for_another(self):
+        seen = []
+        log = Path(self.td.name) / "start.log"
+        first = self.demo.resident.ensure(self.demo, self.cfg(), seen.append, log)
+        self.assertIsNotNone(first)
+        process = self.demo.resident.process
+        self.assertTrue(any("load transformer weights" in line for line in seen))
+        self.assertIn("(fast: ", log.read_text())
+        # Another seed or step count is the same setup: no restart.
+        self.assertEqual(self.demo.resident.ensure(self.demo, self.cfg(steps=20, seed=7)), first)
+        self.assertIs(self.demo.resident.process, process)
+        # Another size is not.
+        self.demo.resident.ensure(self.demo, self.cfg(width=768))
+        self.assertIsNot(self.demo.resident.process, process)
+        self.assertIsNotNone(process.poll())
+        self.assertEqual(self.demo.resident.state()["width"], 768)
+        # A run it cannot serve stops it, freeing the device.
+        self.assertIsNone(self.demo.resident.ensure(self.demo, self.cfg(preset="")))
+        self.assertFalse(self.demo.resident.state()["running"])
+
+    def test_an_idle_process_is_reaped(self):
+        self.demo.resident.ensure(self.demo, self.cfg())
+        self.assertFalse(self.demo.resident.reap_if_idle(idle=60))
+        self.assertTrue(self.demo.resident.reap_if_idle(idle=0))
+        self.assertFalse(self.demo.resident.state()["running"])
+
+    def test_a_process_that_never_serves_is_given_up(self):
+        broken = Path(self.td.name) / "broken"
+        broken.write_text("#!/bin/sh\necho 'fast: cannot listen' >&2\nexit 1\n")
+        broken.chmod(0o755)
+        self.demo.fast = broken
+        self.assertIsNone(self.demo.resident.ensure(self.demo, self.cfg()))
+        self.assertFalse(self.demo.resident.state()["running"])
+
+
+class QwenImage21ServingTest(unittest.TestCase):
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory(dir=ROOT / "tmp", prefix="qimg21-test-")
+        self.root = Path(self.td.name)
+        self.demo = QwenImage21RoutingTest.make_demo(None, self.root)
+
+    def tearDown(self):
+        self.td.cleanup()
+
+    def test_attention_is_a_fast_preset_choice_that_reaches_the_driver(self):
+        cfg = self.demo._validate({"prompt": "apple", "backend": "cuda", "mode": "native",
+                                   "preset": "fast12", "attention": "exact"})
+        commands = []
+        with mock.patch.object(self.demo, "_run", side_effect=lambda c, *a, **k: commands.append(c)), \
+             mock.patch.object(self.demo, "preset_available", return_value=True):
+            self.demo._native(cfg, self.root / "out")
+        command = commands[0]
+        self.assertEqual(command[len(command) - 1 - command[::-1].index("--native-attention") + 1],
+                         "cutlass-efficient")
+        self.assertIn("--vae-tf32", command)
+        for bad in ({"attention": "exact"}, {"preset": "fast12", "attention": "turbo"}):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                self.demo._validate({"prompt": "apple", "backend": "cuda", **bad})
+
+    def test_the_reference_offload_is_validated_and_defaults_to_resident(self):
+        cfg = self.demo._validate({"prompt": "apple", "mode": "reference", "reference_device": "cuda"})
+        self.assertEqual(cfg["reference_offload"], "resident")
+        with self.assertRaises(ValueError):
+            self.demo._validate({"prompt": "apple", "reference_offload": "gpu-everything"})
+
+    def test_a_resident_reference_needs_an_interpreter_and_a_model(self):
+        server = ResidentReference(self.root / "resident")
+        self.assertIsNone(server.ensure(self.root / "no-python", self.root))
+        self.assertFalse(server.state()["running"])
+
+    def test_the_client_streams_the_reply_and_reads_the_status(self):
+        import socket as socketlib
+        path = self.root / "s.sock"
+        listener = socketlib.socket(socketlib.AF_UNIX, socketlib.SOCK_STREAM)
+        listener.bind(str(path)); listener.listen(1)
+        received = []
+
+        def serve():
+            conn, _ = listener.accept()
+            with conn:
+                received.append(conn.makefile().readline())
+                conn.sendall(b"timing: denoise 2 steps (image generation) 0.500 s\nfast-serve: status 0\n")
+        thread = threading.Thread(target=serve); thread.start()
+        events = []
+        log = self.root / "run.log"
+        self.assertEqual(send_resident(path, ["--steps", "2"], log, events.append), 0)
+        thread.join(); listener.close()
+        self.assertEqual(received, ["--steps\t2\n"])
+        self.assertIn("image generation", log.read_text())
+        self.assertIsNone(send_resident(self.root / "absent.sock", ["x"], log))
 
 
 if __name__ == "__main__":

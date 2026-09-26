@@ -15,6 +15,7 @@ import mimetypes
 import os
 from pathlib import Path
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -34,6 +35,8 @@ DEFAULT_FAST_PACKAGES = {"int8": Path("/mnt/nvme01/models/qimg-21-fast/int8-smoo
 # Fast CUDA denoiser presets (test_cuda_qimg21_fast --preset) and the
 # pack_fast.py weight package each needs.
 FAST_PRESETS = {"low8": "int8", "low8-fp4": "nvfp4", "fast12": "int8", "accurate": None}
+# The demo's names for the fast runner's attention kernels.
+FAST_ATTENTION = {"sage": "sage", "flash": "flash", "exact": "cutlass-efficient"}
 # Output size limits per pixel side. The fast runner bounds its own memory, so
 # the caps are about what the other stages can afford: the parity harness and the
 # PyTorch reference stay at 1024, an untiled fast run goes to 2048 (the VAE
@@ -66,6 +69,9 @@ MAX_EVENTS = 4096
 # Which pipeline stage a subprocess is, from the driver's "+ <command>" line.
 # The order matters: the text encoder is also invoked for the condition image.
 STAGE_PATTERNS = (
+    ("test_cuda_qimg21_fast --serve", "load resident denoiser"),
+    ("test_cuda_qimg21_vae --serve", "load resident VAE"),
+    ("reference.py --serve", "load resident PyTorch reference"),
     ("test_cuda_qimg21_vae_encode", "encode condition image"),
     ("test_cuda_qimg21_vision", "encode condition image"),
     ("test_cuda_qimg21_text", "encode prompt"),
@@ -437,6 +443,312 @@ def compare_runs(ref_dir: Path, native_work: Path, native_image: Path) -> dict:
             "threshold": DIVERGENCE_COSINE}
 
 
+# A resident denoiser that has sat unused this long gives its VRAM back.
+RESIDENT_IDLE = 900.0
+RESIDENT_START_TIMEOUT = 300.0
+
+
+def _end_process(process: subprocess.Popen | None) -> None:
+    if process is not None and process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+
+
+def spawn_resident(command: list[str], log: Path, ready: str, sink, lines: list[str],
+                   timeout: float = RESIDENT_START_TIMEOUT) -> subprocess.Popen | None:
+    """Start one resident process and follow its log until it prints a line
+    starting with `ready` or exits. Its output goes to `sink` and `lines` as it
+    arrives, so the run that pays for the start shows where the time went."""
+    stream = log.open("w", encoding="utf-8")
+    try:
+        process = subprocess.Popen(command, cwd=ROOT, stdout=stream, stderr=subprocess.STDOUT)
+    finally:
+        stream.close()
+    lines.append("+ " + " ".join(command))
+    if sink:
+        sink(lines[-1])
+    offset, started, is_ready = 0, time.monotonic(), False
+    while time.monotonic() - started < timeout:
+        try:
+            with log.open("r", encoding="utf-8", errors="replace") as handle:
+                handle.seek(offset)
+                chunk = handle.read()
+                offset = handle.tell()
+        except OSError:
+            chunk = ""
+        for line in chunk.splitlines():
+            lines.append(line)
+            if sink:
+                sink(line)
+            is_ready = is_ready or line.startswith(ready)
+        if is_ready or process.poll() is not None:
+            break
+        time.sleep(0.1)
+    program = command[1] if Path(command[0]).name.startswith("python") else command[0]
+    lines.append(f"  ({Path(program).name}: "
+                 f"{time.monotonic() - started:.1f} s)")
+    if sink:
+        sink(lines[-1])
+    if not is_ready:
+        _end_process(process)
+        return None
+    return process
+
+
+def send_resident(socket_path: Path, args: list[str], log: Path, progress=None) -> int | None:
+    """One run on a resident server (the socket protocol the runners share):
+    the reply streams into `log` -- and through it to `progress` -- as a
+    one-shot run's output would. Returns the status, or None when the server
+    could not be reached or went away mid-run."""
+    import socket as socketlib
+    if any("\t" in arg or "\n" in arg for arg in args):
+        return None
+    try:
+        conn = socketlib.socket(socketlib.AF_UNIX, socketlib.SOCK_STREAM)
+        conn.connect(str(socket_path))
+    except OSError:
+        return None
+    status = None
+    log.parent.mkdir(parents=True, exist_ok=True)
+    stop = threading.Event()
+    with log.open("w", encoding="utf-8") as stream, conn:
+        reader = None
+        if progress:
+            reader = threading.Thread(target=_tail, args=(log, progress, stop), daemon=True)
+            reader.start()
+        try:
+            conn.sendall(("\t".join(args) + "\n").encode("utf-8"))
+            pending = b""
+            while True:
+                chunk = conn.recv(65536)
+                if not chunk:
+                    break
+                pending += chunk
+                *lines, pending = pending.split(b"\n")
+                for raw in lines:
+                    line = raw.decode("utf-8", errors="replace")
+                    if line.startswith("fast-serve: status "):
+                        status = int(line.split()[2])
+                    stream.write(line + "\n")
+                stream.flush()
+        except OSError:
+            status = None
+        finally:
+            stop.set()
+            if reader:
+                reader.join(timeout=5.0)
+    return status
+
+
+class ResidentReference:
+    """A PyTorch reference kept loaded (reference.py --serve, --offload
+    resident). Its weights live in pinned host memory; each run puts the
+    resident transformer blocks and the VAE on the device and takes them off
+    again, so between runs it holds only its CUDA context (about 1 GB) and the
+    native runners keep the GPU. Loading takes about 40 s, once."""
+
+    def __init__(self, directory: Path):
+        self.directory = directory
+        self.process: subprocess.Popen | None = None
+        self.key: tuple | None = None
+        self.socket: Path | None = None
+        self.last_used = 0.0
+        self.lock = threading.Lock()
+
+    def alive(self) -> bool:
+        return self.process is not None and self.process.poll() is None
+
+    def stop(self) -> None:
+        with self.lock:
+            _end_process(self.process)
+            self.process, self.key = None, None
+            if self.socket is not None:
+                self.socket.unlink(missing_ok=True)
+
+    def ensure(self, python: Path, model: Path, sink=None, start_log: Path | None = None) -> Path | None:
+        key = (str(python), str(model))
+        if not Path(python).exists() or not Path(model).is_dir():
+            return None
+        with self.lock:
+            if self.alive() and self.key == key:
+                self.last_used = time.monotonic()
+                return self.socket
+            _end_process(self.process)
+            self.directory.mkdir(parents=True, exist_ok=True)
+            self.socket = self.directory / "reference.sock"
+            command = [str(python), "cuda/qimg21/reference.py", "--serve", str(self.socket), "--model", str(model),
+                       "--device", "cuda", "--dtype", "bf16", "--offload", "resident"]
+            lines: list[str] = []
+            self.process = spawn_resident(command, self.directory / "reference.log", "reference: serving on",
+                                          sink, lines)
+            if start_log is not None:
+                start_log.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            if self.process is None:
+                self.key = None
+                return None
+            self.key = key
+            self.last_used = time.monotonic()
+            return self.socket
+
+    def reap_if_idle(self, idle: float = RESIDENT_IDLE) -> bool:
+        with self.lock:
+            if self.alive() and time.monotonic() - self.last_used > idle:
+                _end_process(self.process)
+                self.process, self.key = None, None
+                return True
+        return False
+
+    def state(self) -> dict:
+        with self.lock:
+            return {"running": self.alive(), "idle_s": round(time.monotonic() - self.last_used, 1)
+                    if self.alive() else None}
+
+
+class ResidentDenoiser:
+    """At most one test_cuda_qimg21_fast --serve, kept loaded between runs.
+
+    Loading the transformer is most of a short run's setup, and a refine or a
+    new seed at the same size does not need it again. The process is keyed by
+    everything its memory plan depends on -- binary, model, preset and package,
+    grid, and whether CFG doubles the batch -- and replaced when a run needs a
+    different one. It holds several GB, so any other kind of run (the PyTorch
+    reference, a tiled refine, the parity harness) stops it first.
+    """
+
+    # The resident VAE decoder holds about 3 GB after its first decode; past
+    # 1024^2 the denoiser needs that room, and the decode tiles itself anyway.
+    VAE_MAX_TOKENS = 64
+
+    def __init__(self, directory: Path):
+        self.directory = directory
+        self.process: subprocess.Popen | None = None
+        self.key: tuple | None = None
+        self.socket: Path | None = None
+        # The VAE decoder rides along with the denoiser: same lifetime, own socket.
+        self.vae_process: subprocess.Popen | None = None
+        self.vae_socket_path: Path | None = None
+        self.last_used = 0.0
+        self.lock = threading.Lock()
+
+    @staticmethod
+    def key_for(demo: "Demo", cfg: dict) -> tuple | None:
+        """The setup a run needs, or None when a resident process cannot serve it."""
+        preset = cfg.get("preset")
+        if (cfg["backend"] != "cuda" or not preset or cfg["mode"] != "native" or cfg["upscale"] > 1.0
+                or cfg["quantized"] or not demo.model.is_dir() or not demo.preset_available(preset)):
+            return None
+        kind = FAST_PRESETS[preset]
+        package = str(demo.fast_packages[kind]) if kind else ""
+        return (str(demo.fast), demo.fast.stat().st_mtime_ns, str(demo.model), preset, package,
+                cfg["height"] // 16, cfg["width"] // 16, bool(cfg["negative_prompt"]),
+                FAST_ATTENTION.get(cfg.get("attention") or "", ""))
+
+    def alive(self) -> bool:
+        return self.process is not None and self.process.poll() is None
+
+    def vae_alive(self) -> bool:
+        return self.vae_process is not None and self.vae_process.poll() is None
+
+    def stop(self) -> None:
+        with self.lock:
+            self._stop()
+
+    _end = staticmethod(_end_process)
+
+    def _stop(self) -> None:
+        self._end(self.process)
+        self._end(self.vae_process)
+        self.process = self.vae_process = None
+        for path in (self.socket, self.vae_socket_path):
+            if path is not None:
+                path.unlink(missing_ok=True)
+        self.key = None
+
+    def _spawn(self, command: list[str], log: Path, ready: str, sink, lines: list[str]):
+        return spawn_resident(command, log, ready, sink, lines)
+
+    def vae_socket(self, demo: "Demo", cfg: dict, sink=None, start_log: Path | None = None) -> Path | None:
+        """The resident VAE decoder's socket, starting it next to a running
+        resident denoiser if needed. None means decode one-shot."""
+        with self.lock:
+            if not self.alive() or self.key is None:
+                return None
+            if max(cfg["height"], cfg["width"]) // 16 > self.VAE_MAX_TOKENS:
+                return None
+            if self.vae_process is not None and self.vae_process.poll() is None:
+                return self.vae_socket_path
+            binary = ROOT / "cuda/qimg21/test_cuda_qimg21_vae"
+            if not binary.is_file():
+                return None
+            self.vae_socket_path = self.directory / "vae.sock"
+            lines: list[str] = []
+            command = [str(binary), "--serve", str(self.vae_socket_path), "--model", str(demo.model / "vae"),
+                       "--conv", "cudnn", "--tf32"]
+            self.vae_process = self._spawn(command, self.directory / "resident-vae.log",
+                                           "qimg21-vae: serving", sink, lines)
+            if start_log is not None:
+                with start_log.open("a", encoding="utf-8") as handle:
+                    handle.write("\n".join(lines) + "\n")
+            return self.vae_socket_path if self.vae_process is not None else None
+
+    def ensure(self, demo: "Demo", cfg: dict, sink=None, start_log: Path | None = None) -> Path | None:
+        """The socket of a resident process for this run, starting one if
+        needed. Startup output goes to `sink` and `start_log`, so the run that
+        paid for the load still shows where the time went. None means run
+        one-shot."""
+        key = self.key_for(demo, cfg)
+        with self.lock:
+            if key is None:
+                self._stop()
+                return None
+            if self.alive() and self.key == key:
+                self.last_used = time.monotonic()
+                return self.socket
+            self._stop()
+            self.directory.mkdir(parents=True, exist_ok=True)
+            self.socket = self.directory / "fast.sock"
+            _, _, model, preset, package, h, w, cfg_batch, attention = key
+            command = [str(demo.fast), "--serve", str(self.socket), "--preset", preset, "--model", model,
+                       "--height-tokens", str(h), "--width-tokens", str(w),
+                       "--serve-cfg", "1" if cfg_batch else "0"]
+            if attention:
+                command += ["--attention", attention]
+            if package:
+                command += ["--quant-package", package]
+            lines: list[str] = []
+            self.process = self._spawn(command, self.directory / "resident.log", "fast: serving ", sink, lines)
+            if start_log is not None:
+                start_log.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            if self.process is None:
+                self._stop()
+                return None
+            self.key = key
+            self.last_used = time.monotonic()
+            return self.socket
+
+    def reap_if_idle(self, idle: float = RESIDENT_IDLE) -> bool:
+        with self.lock:
+            if self.alive() and time.monotonic() - self.last_used > idle:
+                self._stop()
+                return True
+            if self.process is not None and not self.alive():
+                self._stop()
+        return False
+
+    def state(self) -> dict:
+        with self.lock:
+            if not self.alive() or self.key is None:
+                return {"running": False}
+            _, _, _, preset, _, h, w, cfg_batch, attention = self.key
+            return {"running": True, "preset": preset, "attention": attention or "preset default",
+                    "width": w * 16, "height": h * 16, "cfg": cfg_batch,
+                    "vae": self.vae_alive(), "idle_s": round(time.monotonic() - self.last_used, 1)}
+
+
 class Demo:
     def __init__(self, model: Path, quant: Path, python: Path, work: Path,
                  native: Path, host: str, port: int,
@@ -467,6 +779,8 @@ class Demo:
         self.jobs_lock = threading.Lock()
         # interpreter path -> probed torch build; see probe_torch()
         self._probes: dict[str, dict] = {}
+        self.resident = ResidentDenoiser(self.work.parent / "qimg21-resident")
+        self.reference_server = ResidentReference(self.work.parent / "qimg21-resident")
 
     def preset_available(self, preset: str) -> bool:
         kind = FAST_PRESETS[preset]
@@ -708,6 +1022,23 @@ class Demo:
         # Refine an earlier native result with a longer schedule: its final
         # latents are renoised to step K = keep * steps with the noise that run
         # started from, and only steps K..N run. keep 0 is a fresh run.
+        # How the CUDA PyTorch reference holds its weights: a loaded server with
+        # as many transformer blocks on the device as fit (fast, the fair
+        # comparison), or the original one-shot run that streams every module
+        # at each use (least device memory).
+        # Attention kernel for a fast preset. Its default (Sage: INT8 Q.K, FP8
+        # P.V for low8/fast12/low8-fp4) is the fastest; "exact" is PyTorch's
+        # memory-efficient kernel, which halves INT8's distance to the
+        # reference trajectory for about 17% more denoise time.
+        attention = request.get("attention") or None
+        if attention is not None:
+            if attention not in FAST_ATTENTION:
+                raise ValueError("attention must be one of " + ", ".join(FAST_ATTENTION))
+            if preset is None:
+                raise ValueError("attention is a fast-preset option")
+        reference_offload = request.get("reference_offload") or "resident"
+        if reference_offload not in {"resident", "sequential"}:
+            raise ValueError("reference_offload must be resident or sequential")
         restart_from = request.get("restart_from") or None
         restart_keep = 0.0
         if restart_from is not None:
@@ -743,7 +1074,8 @@ class Demo:
                 "tile_overlap": tile_overlap, "refine_strength": refine_strength,
                 "refine_seed": refine_seed, "vae_tile": vae_tile,
                 "vae_tile_overlap": vae_tile_overlap, "vae_tile_bleed": vae_tile_bleed,
-                "restart_from": restart_from, "restart_keep": restart_keep}
+                "restart_from": restart_from, "restart_keep": restart_keep,
+                "reference_offload": reference_offload, "attention": attention}
 
 
     def _run(self, command: list[str], cwd: Path, log: Path,
@@ -809,6 +1141,8 @@ class Demo:
                                    + (f" and provide the {kind} package" if kind else ""))
             at = command.index("--native-bin")
             command[at:at + 8] = ["--native-bin", str(self.fast), "--runner", "fast", "--preset", preset]
+            if cfg.get("attention"):
+                command += ["--native-attention", FAST_ATTENTION[cfg["attention"]]]
             if kind:
                 command += ["--quant-package", str(self.fast_packages[kind])]
             if cfg["profile_steps"]:
@@ -848,6 +1182,16 @@ class Demo:
         # uv-managed reference environments can expose the host interpreter as
         # sys.executable from a child process; carry the selected interpreter
         # explicitly to the fixture helper so it retains Torch/CUDA imports.
+        socket_path = self.resident.ensure(self, cfg, progress, out / "resident-start.log")
+        if socket_path is not None:
+            command += ["--resident-socket", str(socket_path)]
+            vae_socket = self.resident.vae_socket(self, cfg, progress, out / "resident-start.log")
+            if vae_socket is not None:
+                command += ["--resident-vae-socket", str(vae_socket)]
+        if preset:
+            # TF32 VAE convolutions: 22% faster, and the decoded image stays
+            # at 52.7 dB against the BF16 reference VAE, as in F32.
+            command += ["--vae-tf32"]
         if cfg.get("restart_from"):
             source = self.work / cfg["restart_from"] / "cuda-work"
             command += ["--initial-latents", str(source / "latents.npy"),
@@ -902,7 +1246,18 @@ class Demo:
         command += ["--dump-initial-latents"]
         if cfg["negative_prompt"]:
             command += ["--negative-prompt", cfg["negative_prompt"], "--true-cfg-scale", "4.0"]
-        self._run(command, ROOT, out / f"reference-{backend}-{device}.log", progress=progress)
+        log = out / f"reference-{backend}-{device}.log"
+        if device == "cuda" and cfg.get("reference_offload", "resident") == "resident":
+            socket_path = self.reference_server.ensure(python, self.model, progress, out / "reference-start.log")
+            if socket_path is not None:
+                status = send_resident(socket_path, command[2:] + ["--offload", "resident"], log, progress)
+                if status == 0:
+                    return dump / "reference.png"
+        else:
+            # The one-shot run streams its own weights; the server's idle
+            # context is the only thing to give back.
+            self.reference_server.stop()
+        self._run(command, ROOT, log, progress=progress)
         # The driver names its own output; do not invent a second name for it.
         return dump / "reference.png"
 
@@ -927,6 +1282,9 @@ class Demo:
             self._begin(job_id, started)
         try:
             with self.lock:
+                if ResidentDenoiser.key_for(self, cfg) is None:
+                    # Everything else needs the VRAM a resident denoiser holds.
+                    self.resident.stop()
                 compare = cfg["mode"] == "compare"
                 backend = cfg["backend"]
                 ref_path = native_path = None
@@ -942,8 +1300,9 @@ class Demo:
                         ref_path = self._reference(cfg, job, self._progress(job_id, "PyTorch reference"))
                     ref_ms = round((time.monotonic() - side_start) * 1000)
                     self._say(job_id, f"Qwen PyTorch reference ({device}) complete")
-                    breakdown = timing_breakdown(job / f"reference-{backend}-{device}.log",
-                                                 "PyTorch reference")
+                    breakdown = (timing_breakdown(job / "reference-start.log", "load resident PyTorch reference")
+                                 + timing_breakdown(job / f"reference-{backend}-{device}.log",
+                                                    "PyTorch reference"))
                     entry = {"image": self._data_url(ref_path), "device": device,
                              "torch": self.torch_build(device)["torch"],
                              "elapsed_ms": ref_ms, "timings": breakdown,
@@ -969,7 +1328,8 @@ class Demo:
                                                         initial_latents=latents)
                     native_ms = round((time.monotonic() - side_start) * 1000)
                     self._say(job_id, f"Qwen {backend.upper()} native complete")
-                    breakdown = timing_breakdown(log, "encode prompt")
+                    breakdown = (timing_breakdown(job / "resident-start.log", "load resident denoiser")
+                                 + timing_breakdown(log, "encode prompt"))
                     results[backend] = {"image": self._data_url(native_path),
                                         "log": self._summary(log), "elapsed_ms": native_ms,
                                         "timings": breakdown,
@@ -1130,7 +1490,9 @@ class Handler(BaseHTTPRequestHandler):
                              # but building it twice here would read as two probes.
                              "reference": {device: build["available"] for device, build
                                            in builds.items()},
-                             "reference_detail": builds})
+                             "reference_detail": builds,
+                             "resident": demo.resident.state(),
+                             "reference_server": demo.reference_server.state()})
             return
         if path in {"/", "/index.html"}:
             data = (WEB / "qwen_image21.html").read_bytes()
@@ -1190,7 +1552,29 @@ def main() -> int:
                 fast_packages={"int8": args.int8_package, "nvfp4": args.nvfp4_package})
     server = ThreadingHTTPServer((args.host, args.port), Handler); server.demo = demo  # type: ignore[attr-defined]
     print(f"Qwen Image 2.1 demo: http://{args.host}:{args.port}")
-    server.serve_forever()
+
+    def reap() -> None:
+        # Never while a run holds the device: the run is what keeps it warm.
+        while True:
+            time.sleep(30)
+            if demo.lock.acquire(blocking=False):
+                try:
+                    if demo.resident.reap_if_idle():
+                        print("resident denoiser idle; stopped to free VRAM", flush=True)
+                    if demo.reference_server.reap_if_idle():
+                        print("resident PyTorch reference idle; stopped", flush=True)
+                finally:
+                    demo.lock.release()
+    threading.Thread(target=reap, daemon=True).start()
+    # A plain kill must still stop the resident denoiser (the finally below).
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        demo.resident.stop()
+        demo.reference_server.stop()
     return 0
 
 

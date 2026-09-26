@@ -92,6 +92,10 @@ static const char *q21f_kernel_src =
  * harness host code. pred/neg are BF16 [n], sample F32 [n]; latent receives
  * the BF16 copy used as the next img_in input. */
 "__global__ void euler(float*sample,bf*latent,const bf*pred,const bf*neg,int n,float scale,float dt,int cfg){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=n)return;float p=b2f(pred[i]);if(cfg){float u=b2f(neg[i]);p=rb(u+rb(scale*rb(p-u)));}float s=rb(sample[i]+rb(dt*rb(p)));sample[i]=s;latent[i]=f2b(s);}\n"
+/* Masked editing: outside the mask (weight 0 per latent token) the sample is
+ * reset to the source renoised to this sigma with the run's own noise, so only
+ * the masked region is generated. */
+"__global__ void mask_blend(float*sample,bf*latent,const float*mask,const float*src,const float*noise,int n,float sigma){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=n)return;float m=mask[i/64];float keep=(1.f-sigma)*src[i]+sigma*noise[i];float s=m*sample[i]+(1.f-m)*keep;sample[i]=s;latent[i]=f2b(s);}\n"
 /* CFG combine only (single-step prediction dumps). */
 "__global__ void cfg_combine(bf*pred,const bf*neg,int n,float scale){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){float p=b2f(pred[i]),u=b2f(neg[i]);pred[i]=f2b(rb(u+rb(scale*rb(p-u))));}}\n"
 /* Calibration: out[c] = max(out[c], max_r |x[r,c]|) for SmoothQuant; out is

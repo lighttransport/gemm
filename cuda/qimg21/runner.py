@@ -38,6 +38,12 @@ def add_backend_options(parser):
     group.add_argument("--attention", default=None, choices=(None, "sage", "flash", "exact"),
                        help="native attention kernel; exact is closest to PyTorch")
     group.add_argument("--device", default="cuda", help="torch backend device")
+    group.add_argument("--condition-resolution", type=int, default=1024,
+                       help="reference images are shown to the model at about this many pixels squared "
+                            "(256-1024, default 1024 as the pipeline does); lower is faster")
+    group.add_argument("--no-resident", action="store_true",
+                       help="native: run every image one-shot instead of keeping the denoiser and VAE "
+                            "decoder loaded between images")
     group.add_argument("--steps", type=int, default=20, help="denoising steps (default 20)")
     group.add_argument("--seed", type=int, default=0, help="base seed (default 0); every output is reproducible "
                                                             "from it")
@@ -90,8 +96,11 @@ def parse_ints(text, count, name):
 
 def make_backend(args, references: int = 1):
     options = {"model": args.model, "preset": args.preset or None, "attention": args.attention,
-               "device": args.device}
-    return backends.select_backend(args.backend, references=references, **options)
+               "device": args.device, "condition_resolution": args.condition_resolution,
+               "resident": not args.no_resident}
+    backend = backends.select_backend(args.backend, references=references, **options)
+    args.backends.append(backend)   # closed by main(): stops resident processes
+    return backend
 
 
 def view_params(args) -> ops.ViewParams:
@@ -301,11 +310,17 @@ def join_signed_values(argv: list[str]) -> list[str]:
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(join_signed_values(list(sys.argv[1:] if argv is None else argv)))
+    args.backends = []
     try:
         result = args.run(args)
     except (ValueError, backends.BackendError) as exc:
         print(f"runner: {exc}", file=sys.stderr)
         return 2
+    finally:
+        for backend in args.backends:
+            close = getattr(backend, "close", None)
+            if close:
+                close()
     print(json.dumps(result, indent=2, default=str))
     return 0
 

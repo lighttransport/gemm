@@ -76,6 +76,13 @@ class ViewParams:
         return asdict(self)
 
 
+def _scratch() -> Path:
+    """Scratch space inside the repository (AGENTS.md: tmp/, not /tmp)."""
+    path = REPO_ROOT / "tmp"
+    path.mkdir(exist_ok=True)
+    return path
+
+
 def _output_size(width: int, height: int, max_side: int = 1024) -> tuple:
     """The source aspect ratio at no more than 1024^2, multiples of 32."""
     area = min(width * height, max_side * max_side)
@@ -115,7 +122,7 @@ def preprocess_object(image, out, backend: Backend | None = None, *, method: str
     source = imageops.load_rgba(image)
     info = {"method": method, "pixels": pixels, "source_size": [source.shape[1], source.shape[0]],
             "warnings": []}
-    with tempfile.TemporaryDirectory(prefix="qimg21-i23d-") as td:
+    with tempfile.TemporaryDirectory(prefix="qimg21-i23d-", dir=_scratch()) as td:
         work = Path(td)
         if method == "alpha":
             if source[..., 3].min() == 255:
@@ -195,7 +202,7 @@ def edit_object(image, instruction: str, out, backend: Backend, *, strength: flo
         prompt += " " + PRESERVE_CLAUSE
     if transparent:
         prompt += " " + viewlib.BACKGROUND_CLAUSES["transparent"]
-    with tempfile.TemporaryDirectory(prefix="qimg21-i23d-") as td:
+    with tempfile.TemporaryDirectory(prefix="qimg21-i23d-", dir=_scratch()) as td:
         work = Path(td)
         resized = source if source.shape[:2] == (height, width) else imageops.resize_rgba(source, width, height)
         source_file = _as_rgba_file(resized, work, "source")
@@ -256,23 +263,36 @@ def texture_preprocess(image, out, backend: Backend, *, operations=DEFAULT_TEXTU
 
 # ---- views ---------------------------------------------------------------
 
+def _view_request(refs: tuple, spec: viewlib.ViewSpec, out, params: ViewParams):
+    spec = spec.validated()
+    seed = viewlib.derive_seed(params.seed, spec, params.seed_mode)
+    prompt = viewlib.view_prompt(spec, background=params.background, template=params.template,
+                                 instruction=params.instruction)
+    request = GenRequest(prompt=prompt, out=Path(out), width=spec.width, height=spec.height, steps=params.steps,
+                         seed=seed, references=refs, negative_prompt=params.negative_prompt,
+                         true_cfg_scale=params.true_cfg_scale, tags={"view": spec.to_dict()})
+    return request, spec
+
+
+def _view_record(request: GenRequest, spec: viewlib.ViewSpec, result) -> dict:
+    return {"file": str(request.out), "seed": request.seed, "prompt": request.prompt,
+            "seconds": round(result.seconds, 3), "backend": result.backend, "spec": spec.to_dict(),
+            "details": result.details}
+
+
+def _references(references) -> tuple:
+    refs = tuple(Path(r) for r in references)
+    if not refs:
+        raise ValueError("a view needs at least one reference image")
+    return refs
+
+
 def generate_view(references, spec: viewlib.ViewSpec, out, backend: Backend,
                   params: ViewParams = ViewParams()) -> dict:
     """One requested view of the reference object. Reproducible from the
     references, params.seed/seed_mode, the spec and the generation params."""
-    spec = spec.validated()
-    refs = tuple(Path(r) for r in references)
-    if not refs:
-        raise ValueError("a view needs at least one reference image")
-    seed = viewlib.derive_seed(params.seed, spec, params.seed_mode)
-    prompt = viewlib.view_prompt(spec, background=params.background, template=params.template,
-                                 instruction=params.instruction)
-    result = backend.generate(GenRequest(prompt=prompt, out=Path(out), width=spec.width, height=spec.height,
-                                         steps=params.steps, seed=seed, references=refs,
-                                         negative_prompt=params.negative_prompt,
-                                         true_cfg_scale=params.true_cfg_scale, tags={"view": spec.to_dict()}))
-    return {"file": str(out), "seed": seed, "prompt": prompt, "seconds": round(result.seconds, 3),
-            "backend": result.backend, "spec": spec.to_dict(), "details": result.details}
+    request, spec = _view_request(_references(references), spec, out, params)
+    return _view_record(request, spec, backend.generate(request))
 
 
 def generate_views(references, specs, outs, backend: Backend, params: ViewParams = ViewParams(), *,
@@ -280,40 +300,33 @@ def generate_views(references, specs, outs, backend: Backend, params: ViewParams
     """Views in the given order, written as they finish. batch_size groups
     requests for backends that can batch (TorchBackend); it never changes a
     view's prompt, seed or conditioning, only how many run together. Yields one
-    record per view; nothing is kept in memory."""
+    record per view; nothing is kept in memory.
+
+    A backend with prepare() sees every request first (NativeBackend encodes
+    all the view prompts in one text-encoder pass); that changes when work
+    happens, never a view's result."""
     specs, outs = list(specs), list(outs)
     if len(specs) != len(outs):
         raise ValueError("one output path per view")
     if batch_size < 1:
         raise ValueError(f"batch_size must be at least 1, got {batch_size}")
+    refs = _references(references)
+    planned = [_view_request(refs, spec, out, params) for spec, out in zip(specs, outs)]
+    prepare = getattr(backend, "prepare", None)
+    if prepare:
+        prepare([request for request, _ in planned])
     batcher = getattr(backend, "generate_batch", None)
-    for start in range(0, len(specs), batch_size):
-        chunk = list(zip(specs[start:start + batch_size], outs[start:start + batch_size]))
+    for start in range(0, len(planned), batch_size):
+        chunk = planned[start:start + batch_size]
         if batcher and len(chunk) > 1:
-            refs = tuple(Path(r) for r in references)
-            requests, meta = [], []
-            for spec, out in chunk:
-                spec = spec.validated()
-                seed = viewlib.derive_seed(params.seed, spec, params.seed_mode)
-                prompt = viewlib.view_prompt(spec, background=params.background, template=params.template,
-                                             instruction=params.instruction)
-                requests.append(GenRequest(prompt=prompt, out=Path(out), width=spec.width, height=spec.height,
-                                           steps=params.steps, seed=seed, references=refs,
-                                           negative_prompt=params.negative_prompt,
-                                           true_cfg_scale=params.true_cfg_scale))
-                meta.append((spec, seed, prompt, out))
-            for (spec, seed, prompt, out), result in zip(meta, batcher(requests)):
-                record = {"file": str(out), "seed": seed, "prompt": prompt, "seconds": round(result.seconds, 3),
-                          "backend": result.backend, "spec": spec.to_dict(), "details": result.details}
-                if on_view:
-                    on_view(record)
-                yield record
+            results = batcher([request for request, _ in chunk])
         else:
-            for spec, out in chunk:
-                record = generate_view(references, spec, out, backend, params)
-                if on_view:
-                    on_view(record)
-                yield record
+            results = (backend.generate(request) for request, _ in chunk)   # lazily, one at a time
+        for (request, spec), result in zip(chunk, results):
+            record = _view_record(request, spec, result)
+            if on_view:
+                on_view(record)
+            yield record
 
 
 def generate_multiview(references, specs, root, backend: Backend, params: ViewParams = ViewParams(), *,
@@ -356,7 +369,8 @@ def generate_multiview(references, specs, root, backend: Backend, params: ViewPa
               "elevation_deg": r["spec"]["elevation_deg"], "roll_deg": r["spec"]["roll_deg"],
               "distance": r["spec"]["distance"], "fov_deg": r["spec"]["fov_deg"],
               "projection": r["spec"]["projection"], "width": r["spec"]["width"], "height": r["spec"]["height"],
-              "seed": r["seed"], "prompt": r["prompt"], "seconds": r["seconds"], "backend": r["backend"]}
+              "seed": r["seed"], "prompt": r["prompt"], "seconds": r["seconds"], "backend": r["backend"],
+              "timings": (r.get("details") or {}).get("timings")}
              for r in records]
     backend_name = records[0]["backend"] if records else getattr(backend, "name", "?")
     writer.write_metadata(model=model, backend=backend_name, seed=params.seed, seed_mode=params.seed_mode,

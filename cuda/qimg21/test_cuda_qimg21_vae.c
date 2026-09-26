@@ -20,6 +20,11 @@
 #include <limits.h>
 #include <math.h>
 #include <time.h>
+#include <unistd.h>
+#include <sys/un.h>
+#include <sys/socket.h>
+#include <signal.h>
+#include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -184,9 +189,54 @@ static float q21_round_bf16(float value) {
     return value;
 }
 
+/* Device weight cache. A one-shot decode uses each weight once, so by
+ * default weights are uploaded per use and freed. A tiled decode reuses every
+ * weight per tile, and a resident decoder (--serve) per request; with the
+ * cache on, each is converted and uploaded once (about 1 GB in F32) and
+ * q21_free leaves cached pointers alone. */
+typedef struct { char name[192]; CUdeviceptr d; int co, ci, kh, kw; } q21_cached_weight;
+static int q21_weight_cache_on;
+static q21_cached_weight *q21_weight_cache;
+static int q21_weight_cache_n, q21_weight_cache_cap;
+
+static CUdeviceptr q21_upload_uncached(const st_context *st, const char *name,
+                                       int *co, int *ci, int *kh, int *kw);
+
 /* Upload a qimg-21 F32/BF16 tensor and return its 4-D conv shape. */
 static CUdeviceptr q21_upload(const st_context *st, const char *name,
                               int *co, int *ci, int *kh, int *kw) {
+    if (!q21_weight_cache_on) return q21_upload_uncached(st, name, co, ci, kh, kw);
+    for (int i = 0; i < q21_weight_cache_n; i++) {
+        q21_cached_weight *e = &q21_weight_cache[i];
+        if (strcmp(e->name, name)) continue;
+        if (co) *co = e->co;
+        if (ci) *ci = e->ci;
+        if (kh) *kh = e->kh;
+        if (kw) *kw = e->kw;
+        return e->d;
+    }
+    int c0, c1, k0, k1;
+    CUdeviceptr d = q21_upload_uncached(st, name, &c0, &c1, &k0, &k1);
+    if (!d || strlen(name) >= sizeof(q21_weight_cache[0].name)) return d;
+    if (q21_weight_cache_n == q21_weight_cache_cap) {
+        int cap = q21_weight_cache_cap ? 2 * q21_weight_cache_cap : 256;
+        q21_cached_weight *grown = realloc(q21_weight_cache, (size_t)cap * sizeof(*grown));
+        if (!grown) return d;
+        q21_weight_cache = grown;
+        q21_weight_cache_cap = cap;
+    }
+    q21_cached_weight *e = &q21_weight_cache[q21_weight_cache_n++];
+    snprintf(e->name, sizeof(e->name), "%s", name);
+    e->d = d; e->co = c0; e->ci = c1; e->kh = k0; e->kw = k1;
+    if (co) *co = c0;
+    if (ci) *ci = c1;
+    if (kh) *kh = k0;
+    if (kw) *kw = k1;
+    return d;
+}
+
+static CUdeviceptr q21_upload_uncached(const st_context *st, const char *name,
+                                       int *co, int *ci, int *kh, int *kw) {
     int idx = safetensors_find(st, name);
     if (idx < 0) {
         fprintf(stderr, "qimg21-vae: missing tensor %s\n", name);
@@ -222,6 +272,9 @@ static CUdeviceptr q21_upload(const st_context *st, const char *name,
 }
 
 static void q21_free(CUdeviceptr *p) {
+    if (*p && q21_weight_cache_on)
+        for (int i = 0; i < q21_weight_cache_n; i++)
+            if (q21_weight_cache[i].d == *p) { *p = 0; return; }
     if (*p) cuMemFree(*p);
     *p = 0;
 }
@@ -682,34 +735,31 @@ done:
     return rc;
 }
 
-int main(int argc, char **argv) {
-    const char *model=NULL,*latent_path=NULL,*out_path=NULL; int h=0,w=0,verbose=1,conv_cudnn=0;
-    int tile=0,overlap=8,bleed=2;
-    for(int i=1;i<argc;i++){
-        if(!strcmp(argv[i],"--model")&&i+1<argc)model=argv[++i];
-        else if(!strcmp(argv[i],"--latents")&&i+1<argc)latent_path=argv[++i];
-        else if(!strcmp(argv[i],"--height-tokens")&&i+1<argc)h=atoi(argv[++i]);
-        else if(!strcmp(argv[i],"--width-tokens")&&i+1<argc)w=atoi(argv[++i]);
-        else if(!strcmp(argv[i],"--out")&&i+1<argc)out_path=argv[++i];
-        else if(!strcmp(argv[i],"--quiet"))verbose=0;
-        else if(!strcmp(argv[i],"--tile")&&i+1<argc)tile=atoi(argv[++i]);
-        else if(!strcmp(argv[i],"--tile-overlap")&&i+1<argc)overlap=atoi(argv[++i]);
-        else if(!strcmp(argv[i],"--tile-bleed")&&i+1<argc)bleed=atoi(argv[++i]);
-        else if(!strcmp(argv[i],"--conv")&&i+1<argc&&(!strcmp(argv[i+1],"direct")||!strcmp(argv[i+1],"cudnn")))
-            conv_cudnn=!strcmp(argv[++i],"cudnn");
-        else {fprintf(stderr,"usage: %s --model VAE_DIR --latents L.npy --height-tokens H --width-tokens W --out OUT.npy [--conv direct|cudnn]\n"
-                            "       [--tile LATENT_TOKENS [--tile-overlap N] [--tile-bleed N]]\n"
-                            "  --tile 0 (default) decodes the whole image in one pass.\n",argv[0]);return 2;}
+static double q21v_now(void) {
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec + t.tv_nsec * 1e-9;
+}
+
+/* One "timing:" line per phase, for the demo's breakdown. */
+#define Q21V_PHASE(label) do { double now_ = q21v_now(); \
+        fprintf(stderr, "timing: %s %.3f s\n", label, now_ - *mark); *mark = now_; } while (0)
+
+/* Decode one latent grid to OUT.npy. 0 done, 2 bad input, 1 failure. */
+static int q21v_decode_one(cuda_qimg_runner *r, st_context *st, const char *latent_path, int h, int w,
+                           const char *out_path, int tile, int overlap, int bleed, double *mark) {
+    if (!latent_path || !out_path || h <= 0 || w <= 0) return 2;
+    if (tile && (tile < 1 || tile > h || tile > w)) {
+        fprintf(stderr, "qimg21-vae: --tile must be in [1, min(height-tokens, width-tokens)] = [%d, %d]\n",
+                tile, h < w ? h : w);
+        return 2;
     }
-    if(!model||!latent_path||!out_path||h<=0||w<=0)return 2;
-    if(tile&&(tile<1||tile>h||tile>w)){fprintf(stderr,"qimg21-vae: --tile must be in [1, min(height-tokens, width-tokens)] = [%d, %d]\n",
-        tile,h<w?h:w);return 2;}
-    if(tile){
-        if(overlap<0)overlap=0;
-        if(overlap>=tile)overlap=tile-1;
-        if(bleed<0)bleed=0;
-        if(bleed>overlap/2){
-            fprintf(stderr,"qimg21-vae: --tile-bleed %d must be at most half of --tile-overlap %d, or the tiles leave gaps\n",bleed,overlap);
+    if (tile) {
+        if (overlap < 0) overlap = 0;
+        if (overlap >= tile) overlap = tile - 1;
+        if (bleed < 0) bleed = 0;
+        if (bleed > overlap / 2) {
+            fprintf(stderr, "qimg21-vae: --tile-bleed %d must be at most half of --tile-overlap %d, or the tiles "
+                            "leave gaps\n", bleed, overlap);
             return 2;
         }
     }
@@ -717,64 +767,222 @@ int main(int argc, char **argv) {
      * stage has 288 channels at the final spatial resolution. A tiled decode
      * only ever indexes one tile, so the bound applies to the tile. */
     int index_h = tile && tile < h ? tile : h, index_w = tile && tile < w ? tile : w;
-    if ((uint64_t)index_h*index_w > INT_MAX / (288u*256u)) {
-        fprintf(stderr,"qimg21-vae: dimensions exceed kernel indexing limits\n");
+    if ((uint64_t)index_h * index_w > INT_MAX / (288u * 256u)) {
+        fprintf(stderr, "qimg21-vae: dimensions exceed kernel indexing limits\n");
         return 2;
     }
-    q21_vae_dump_dir = getenv("QIMG21_VAE_DUMP_DIR");
-    if(q21_vae_dump_dir) mkdir(q21_vae_dump_dir,0755);
-    /* One "timing:" line per phase, for the demo's breakdown. */
-    struct timespec ts_; clock_gettime(CLOCK_MONOTONIC,&ts_);
-    double run_start=ts_.tv_sec+ts_.tv_nsec*1e-9, mark=run_start;
-#define Q21V_PHASE(label) do { struct timespec t_; clock_gettime(CLOCK_MONOTONIC,&t_); \
-        double now_=t_.tv_sec+t_.tv_nsec*1e-9; fprintf(stderr,"timing: %s %.3f s\n",label,now_-mark); mark=now_; } while(0)
-    q21_npy a; if(q21_npy_read_f32(latent_path,&a)!=0)return 1;
-    size_t need=(size_t)h*w*64;
-    if(a.n!=need || a.ndim!=2 || a.shape[0]!=(size_t)h*w || a.shape[1]!=64){
-        fprintf(stderr,"qimg21-vae: expected latent shape [%d,64]\n",h*w);
-        q21_npy_free(&a);return 1;
+    q21_npy a;
+    if (q21_npy_read_f32(latent_path, &a) != 0) return 2;
+    size_t need = (size_t)h * w * 64;
+    if (a.n != need || a.ndim != 2 || a.shape[0] != (size_t)h * w || a.shape[1] != 64) {
+        fprintf(stderr, "qimg21-vae: expected latent shape [%d,64]\n", h * w);
+        q21_npy_free(&a); return 2;
     }
-    for(size_t i=0;i<a.n;i++) if(!isfinite(a.data[i])) {
-        fprintf(stderr,"qimg21-vae: non-finite input latent\n");
-        q21_npy_free(&a);return 1;
+    for (size_t i = 0; i < a.n; i++) if (!isfinite(a.data[i])) {
+        fprintf(stderr, "qimg21-vae: non-finite input latent\n");
+        q21_npy_free(&a); return 2;
     }
     Q21V_PHASE("read latents");
-    char st_path[1024]; snprintf(st_path,sizeof(st_path),"%s/diffusion_pytorch_model.safetensors",model);
-    st_context *st=safetensors_open(st_path); if(!st){q21_npy_free(&a);return 1;}
-    cuda_qimg_runner *r=cuda_qimg_init(0,verbose); if(!r){safetensors_close(st);q21_npy_free(&a);return 1;}
-    r->use_fp8_pipe=0; r->use_fp8_pipe_perrow=0; /* retain F32 VAE quality */
-    /* --conv cudnn: F32 cuDNN convolutions (FMA math, no FFT/Winograd) in
-     * place of the direct kernel; much faster, not bit-identical to it. */
-    void *cudnn_plugin=NULL;
-    if(conv_cudnn){
-        cudnn_plugin=dlopen("cuda/qimg21/libq21_cudnn_vae.so",RTLD_NOW|RTLD_LOCAL);
-        qimg_vae_f32_conv2d=cudnn_plugin?(qimg_vae_bf16_conv2d_fn)dlsym(cudnn_plugin,"q21_cudnn_conv2d_f32"):NULL;
-        if(!qimg_vae_f32_conv2d){
-            fprintf(stderr,"qimg21-vae: cannot load cuDNN conv from cuda/qimg21/libq21_cudnn_vae.so: %s\n",dlerror());
-            cuda_qimg_free(r);safetensors_close(st);q21_npy_free(&a);return 1;
-        }
-    }
+    float *out = (float *)malloc((size_t)4 * (h * 16) * (w * 16) * sizeof(float));
+    int rc = 0;
+    if (!out) { fprintf(stderr, "qimg21-vae: output allocation failed\n"); rc = -1; }
+    else if (tile) memset(out, 0, (size_t)4 * (h * 16) * (w * 16) * sizeof(float));
     /* The shared VAE helpers use synchronous default-stream D2D copies for
      * residuals. Keep their kernels on that same stream: a nonblocking
      * stream otherwise races those copies and intermittently loses residuals. */
-    Q21V_PHASE("CUDA init + kernels");
     CUstream saved_stream = r->stream;
     cuStreamSynchronize(saved_stream);
     r->stream = NULL;
-    float *out=(float *)malloc((size_t)4*(h*16)*(w*16)*sizeof(float));
-    int rc=0;
-    if(!out){fprintf(stderr,"qimg21-vae: output allocation failed\n");rc=-1;}
-    else if(tile) memset(out,0,(size_t)4*(h*16)*(w*16)*sizeof(float));
-    if(!rc) rc = tile ? qimg21_vae_decode_tiled(r, st, a.data, h, w, out, tile, overlap, bleed)
-                     : qimg21_vae_decode(r, st, a.data, h, w, out);
+    int cached = q21_weight_cache_n;
+    if (!rc) rc = tile ? qimg21_vae_decode_tiled(r, st, a.data, h, w, out, tile, overlap, bleed)
+                       : qimg21_vae_decode(r, st, a.data, h, w, out);
     cuStreamSynchronize(r->stream);
     r->stream = saved_stream;
-    Q21V_PHASE("VAE decode (weights + convolutions)");
-    if(!rc) rc=q21_npy_write_chw(out_path,out,(size_t)4*(h*16)*(w*16),4,h*16,w*16);
+    if (q21_weight_cache_on && cached)
+        Q21V_PHASE("VAE decode (convolutions; weights already on device)");
+    else
+        Q21V_PHASE("VAE decode (weights + convolutions)");
+    if (!rc) rc = q21_npy_write_chw(out_path, out, (size_t)4 * (h * 16) * (w * 16), 4, h * 16, w * 16);
     Q21V_PHASE("write pixels");
-    fprintf(stderr,"timing: VAE total %.3f s\n",mark-run_start);
-    free(out); cuda_qimg_free(r); safetensors_close(st); q21_npy_free(&a);
-    /* The plugin keeps its cuDNN handle; leave it loaded until exit. */
-    (void)cudnn_plugin;
-    return rc?1:0;
+    free(out); q21_npy_free(&a);
+    return rc ? 1 : 0;
+}
+
+/* ---- Resident mode (--serve SOCKET) ----
+ * As test_cuda_qimg21_fast --serve: one run per connection, one tab-separated
+ * line of per-run flags in, stderr streamed back, "fast-serve: status N" last
+ * (0 done, 2 bad request, 3 not this process's setup). Weights stay cached on
+ * the device between runs. */
+static int q21v_listen(const char *path) {
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    if (strlen(path) >= sizeof(addr.sun_path)) return -1;
+    strcpy(addr.sun_path, path);
+    unlink(path);
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) || listen(fd, 4)) { close(fd); return -1; }
+    return fd;
+}
+
+static int q21v_read_request(int fd, char *buf, size_t cap, char **argv, int max_args) {
+    size_t n = 0;
+    while (n + 1 < cap) {
+        ssize_t got = read(fd, buf + n, 1);
+        if (got <= 0) return -1;
+        if (buf[n] == '\n') break;
+        n++;
+    }
+    buf[n] = 0;
+    int argc = 0;
+    for (char *p = buf; *p && argc < max_args;) {
+        argv[argc++] = p;
+        char *tab = strchr(p, '\t');
+        if (!tab) break;
+        *tab = 0;
+        p = tab + 1;
+    }
+    return argc;
+}
+
+int main(int argc, char **argv) {
+    const char *model = NULL, *latent_path = NULL, *out_path = NULL, *serve_path = NULL;
+    int h = 0, w = 0, verbose = 1, conv_cudnn = 0, pipeline_bf16 = 0, tf32 = 0;
+    int tile = 0, overlap = 8, bleed = 2;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--model") && i + 1 < argc) model = argv[++i];
+        else if (!strcmp(argv[i], "--latents") && i + 1 < argc) latent_path = argv[++i];
+        else if (!strcmp(argv[i], "--height-tokens") && i + 1 < argc) h = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--width-tokens") && i + 1 < argc) w = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--out") && i + 1 < argc) out_path = argv[++i];
+        else if (!strcmp(argv[i], "--quiet")) verbose = 0;
+        else if (!strcmp(argv[i], "--pipeline-bf16")) pipeline_bf16 = 1;
+        else if (!strcmp(argv[i], "--tf32")) tf32 = 1;
+        else if (!strcmp(argv[i], "--serve") && i + 1 < argc) serve_path = argv[++i];
+        else if (!strcmp(argv[i], "--tile") && i + 1 < argc) tile = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--tile-overlap") && i + 1 < argc) overlap = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--tile-bleed") && i + 1 < argc) bleed = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--conv") && i + 1 < argc && (!strcmp(argv[i + 1], "direct") || !strcmp(argv[i + 1], "cudnn")))
+            conv_cudnn = !strcmp(argv[++i], "cudnn");
+        else {
+            fprintf(stderr, "usage: %s --model VAE_DIR --latents L.npy --height-tokens H --width-tokens W --out OUT.npy [--conv direct|cudnn]\n"
+                            "       [--tile LATENT_TOKENS [--tile-overlap N] [--tile-bleed N]] [--pipeline-bf16] [--tf32]\n"
+                            "       resident: --serve SOCKET --model VAE_DIR [--conv cudnn] [--tf32] (runs arrive over the socket)\n"
+                            "  --pipeline-bf16 decodes as the BF16 PyTorch pipeline does: BF16 cuDNN convolutions,\n"
+                            "  CUTLASS attention, and activations rounded to BF16 between ops.\n"
+                            "  --tf32 lets --conv cudnn use TF32 tensor cores (F32 accumulation).\n"
+                            "  --tile 0 (default) decodes the whole image in one pass.\n", argv[0]);
+            return 2;
+        }
+    }
+    if (!model || (!serve_path && (!latent_path || !out_path || h <= 0 || w <= 0))) return 2;
+    if (tf32) setenv("QIMG21_VAE_TF32", "1", 1);
+    /* A tiled decode reuses every weight per tile, a resident one per run. */
+    q21_weight_cache_on = serve_path || tile;
+    q21_vae_dump_dir = getenv("QIMG21_VAE_DUMP_DIR");
+    if (q21_vae_dump_dir) mkdir(q21_vae_dump_dir, 0755);
+    double run_start = q21v_now(), mark_value = run_start, *mark = &mark_value;
+    char st_path[1024]; snprintf(st_path, sizeof(st_path), "%s/diffusion_pytorch_model.safetensors", model);
+    st_context *st = safetensors_open(st_path); if (!st) return 1;
+    cuda_qimg_runner *r = cuda_qimg_init(0, verbose); if (!r) { safetensors_close(st); return 1; }
+    r->use_fp8_pipe = 0; r->use_fp8_pipe_perrow = 0; /* retain F32 VAE quality */
+    if (pipeline_bf16) {
+        /* The reference pipeline runs the VAE in BF16. */
+        q21_vae_bf16_mode = 1;
+        r->use_bf16_trunc = 1;
+        void *bf16_plugin = dlopen("cuda/qimg21/libq21_cudnn_vae.so", RTLD_NOW | RTLD_LOCAL);
+        qimg_vae_bf16_conv2d = bf16_plugin ? (qimg_vae_bf16_conv2d_fn)dlsym(bf16_plugin, "q21_cudnn_vae_conv2d") : NULL;
+        void *attention_plugin = dlopen("cuda/qimg21/libq21_cutlass_attention.so", RTLD_NOW | RTLD_LOCAL);
+        q21_cutlass_vae_attention = attention_plugin ? (q21_cutlass_vae_attention_fn)
+            dlsym(attention_plugin, "q21_cutlass_vae_attention") : NULL;
+        if (!qimg_vae_bf16_conv2d || !q21_cutlass_vae_attention) {
+            fprintf(stderr, "qimg21-vae: --pipeline-bf16 needs libq21_cudnn_vae.so and libq21_cutlass_attention.so: %s\n", dlerror());
+            cuda_qimg_free(r); safetensors_close(st); return 1;
+        }
+    }
+    /* --conv cudnn: F32 cuDNN convolutions (FMA math unless --tf32, no
+     * FFT/Winograd) in place of the direct kernel; much faster, not
+     * bit-identical to it. The plugin keeps its cuDNN handle until exit. */
+    if (conv_cudnn) {
+        void *cudnn_plugin = dlopen("cuda/qimg21/libq21_cudnn_vae.so", RTLD_NOW | RTLD_LOCAL);
+        qimg_vae_f32_conv2d = cudnn_plugin ? (qimg_vae_bf16_conv2d_fn)dlsym(cudnn_plugin, "q21_cudnn_conv2d_f32") : NULL;
+        if (!qimg_vae_f32_conv2d) {
+            fprintf(stderr, "qimg21-vae: cannot load cuDNN conv from cuda/qimg21/libq21_cudnn_vae.so: %s\n", dlerror());
+            cuda_qimg_free(r); safetensors_close(st); return 1;
+        }
+    }
+    Q21V_PHASE("CUDA init + kernels");
+    if (!serve_path) {
+        int rc = q21v_decode_one(r, st, latent_path, h, w, out_path, tile, overlap, bleed, mark);
+        fprintf(stderr, "timing: VAE total %.3f s\n", *mark - run_start);
+        cuda_qimg_free(r); safetensors_close(st);
+        return rc ? 1 : 0;
+    }
+
+    int serve_fd = q21v_listen(serve_path);
+    if (serve_fd < 0) { fprintf(stderr, "qimg21-vae: cannot listen on %s\n", serve_path); return 1; }
+    signal(SIGPIPE, SIG_IGN);
+    /* Watch the parent pid, as test_cuda_qimg21_fast --serve does: the demo
+     * starts this from a short-lived thread, which PR_SET_PDEATHSIG would track. */
+    pid_t parent = getppid();
+    int saved_stderr = dup(2);
+    fprintf(stderr, "qimg21-vae: serving on %s\n", serve_path);
+    char request[65536], *req_argv[64];
+    for (;;) {
+        for (;;) {
+            struct pollfd pfd = {serve_fd, POLLIN, 0};
+            if (getppid() != parent) {
+                fprintf(stderr, "qimg21-vae: parent exited; resident decoder stopping\n");
+                return 0;
+            }
+            if (poll(&pfd, 1, 1000) > 0) break;
+        }
+        int client = accept(serve_fd, NULL, NULL);
+        if (client < 0) continue;
+        int req_argc = q21v_read_request(client, request, sizeof(request), req_argv, 64);
+        if (req_argc < 0) { close(client); continue; }
+        dup2(client, 2);
+        const char *lp = NULL, *op = NULL;
+        int rh = 0, rw = 0, rtile = 0, roverlap = 8, rbleed = 2, status = 0;
+        /* The numerics this process was started with must be the ones asked
+         * for, including flags a request leaves out. */
+        int req_cudnn = 0, req_tf32 = 0, req_bf16 = 0;
+        for (int i = 0; i < req_argc && !status; i++) {
+            const char *a = req_argv[i];
+            int more = i + 1 < req_argc;
+            if (!strcmp(a, "--latents") && more) lp = req_argv[++i];
+            else if (!strcmp(a, "--out") && more) op = req_argv[++i];
+            else if (!strcmp(a, "--height-tokens") && more) rh = atoi(req_argv[++i]);
+            else if (!strcmp(a, "--width-tokens") && more) rw = atoi(req_argv[++i]);
+            else if (!strcmp(a, "--tile") && more) rtile = atoi(req_argv[++i]);
+            else if (!strcmp(a, "--tile-overlap") && more) roverlap = atoi(req_argv[++i]);
+            else if (!strcmp(a, "--tile-bleed") && more) rbleed = atoi(req_argv[++i]);
+            else if (!strcmp(a, "--quiet")) continue;
+            else if (!strcmp(a, "--model") && more) status = strcmp(req_argv[++i], model) ? 3 : 0;
+            else if (!strcmp(a, "--conv") && more) req_cudnn = !strcmp(req_argv[++i], "cudnn");
+            else if (!strcmp(a, "--tf32")) req_tf32 = 1;
+            else if (!strcmp(a, "--pipeline-bf16")) req_bf16 = 1;
+            else status = 3;
+        }
+        if (!status && (req_cudnn != conv_cudnn || req_tf32 != tf32 || req_bf16 != pipeline_bf16)) status = 3;
+        if (!status) {
+            double run = q21v_now();
+            *mark = run;
+            fprintf(stderr, "timing: reuse resident VAE decoder 0.000 s\n");
+            status = q21v_decode_one(r, st, lp, rh, rw, op, rtile, roverlap, rbleed, mark);
+            if (status == 1) {
+                /* A device failure leaves nothing to trust; let the caller
+                 * see the connection close and run one-shot. */
+                fflush(stderr);
+                return 1;
+            }
+            if (!status) fprintf(stderr, "timing: VAE total %.3f s\n", *mark - run);
+        }
+        fprintf(stderr, "fast-serve: status %d%s\n", status,
+                status == 3 ? " (not this resident process's setup)" : status == 2 ? " (bad request)" : "");
+        fflush(stderr);
+        dup2(saved_stderr, 2);
+        close(client);
+    }
 }

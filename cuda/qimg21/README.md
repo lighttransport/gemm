@@ -5,6 +5,10 @@ snapshot. The runner uses the official Diffusers CUDA implementation with
 sequential CPU offload, which fits the 16 GB RTX 5060 Ti. A native C/NVRTC
 transformer path is included for kernel bring-up and direct PyTorch comparison.
 
+For Image-to-3D preprocessing (object extraction, object-preserving and
+masked edits, multi-view/turntable datasets with `transforms.json` and
+validation), see [IMAGE_TO_3D.md](IMAGE_TO_3D.md) and `runner.py --help`.
+
 The model is never copied. Pass the existing snapshot directly:
 
 ```sh
@@ -2421,3 +2425,27 @@ energy of a "refine" was indistinguishable from a plain bilinear upsample. The
 gate is now "the cache has not been stored yet", which is also what makes the
 cache correctly shared across tiles, since prefix K/V does not depend on the
 tile.
+
+## Resident servers, VAE TF32, and the trajectory sweep
+
+- **`test_cuda_qimg21_fast --serve SOCKET`** loads once for one setup:
+  - The setup is the grid, CFG (`--serve-cfg`) and a prompt capacity
+    (`--serve-prompt-tokens`, default 512).
+  - Runs then arrive one per connection as a tab-separated line of the usual
+    flags; stderr streams back, and the last line is `fast-serve: status N`.
+  - It is bit-identical to a one-shot run.
+- **`test_cuda_qimg21_vae --serve SOCKET`** does the same for the decoder:
+  - A device weight cache keeps the decoder's weights uploaded; the cache is
+    also on for any tiled one-shot decode.
+  - At 512² the decode takes 0.55 s against 2.4 s one-shot.
+- **`--tf32`** lets `--conv cudnn` use TF32 tensor cores. It is 22% faster, at
+  52.66 against 52.67 dB versus the BF16 reference VAE.
+- **`--pipeline-bf16`** on the decoder is not a speed path: cuDNN rejects BF16
+  configurations for several decoder shapes, which then fall back to the direct
+  kernel.
+- **`reference.py --offload sequential|group|resident`** and **`--serve`**:
+  see `server/qwen_image21/README.md`, "PyTorch reference: fair timing".
+- **`trajectory_sweep.py`** runs fast-runner settings against PyTorch
+  trajectories from matched noise; see "Agreement with PyTorch" in the same
+  README.
+
