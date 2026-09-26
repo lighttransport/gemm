@@ -14982,6 +14982,9 @@ struct hip_llm_runner {
     hipFunction_t fn_q8_attention_combine_verify8;
     hipFunction_t fn_q8_attention_combine_verify16;
     hipFunction_t fn_q8_attention_combine_gate, fn_q8_attention_combine_verify4_gate;
+    hipFunction_t fn_q8_attention_combine_gate_q81;
+    void *attn_gate_q81;        /* decode: gate for a fused combine+gate+Q8_1 */
+    int attn_gate_q81_done;
     hipFunction_t fn_q8_attention_combine_verify8_gate;
     hipFunction_t fn_q8_attention_combine_verify16_gate;
     hipFunction_t fn_q8_attention_prefill_wmma;
@@ -19095,6 +19098,9 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
                 r->verbose, "qwen35_attention_q8_gate", 1) <= 0) return -1;
         CHECK_HIP(hipModuleGetFunction(&r->fn_q8_attention_combine_gate,
                   r->q8_gate_module, "qwen35_attention_q8_combine_gate"));
+        if (hipModuleGetFunction(&r->fn_q8_attention_combine_gate_q81,
+                r->q8_gate_module, "qwen35_attention_q8_combine_gate_q81") != hipSuccess)
+            r->fn_q8_attention_combine_gate_q81 = NULL;
         CHECK_HIP(hipModuleGetFunction(&r->fn_q8_attention_combine_verify4_gate,
                   r->q8_gate_module, "qwen35_attention_q8_combine_verify4_gate"));
         CHECK_HIP(hipModuleGetFunction(&r->fn_q8_attention_combine_verify8_gate,
@@ -25004,6 +25010,20 @@ static inline void launch_attn_decode_native_q8(hip_llm_runner *r, void *out,
      * graphs must retain combine: capture starts at position zero, but replay
      * reads a changing device position and may require multiple splits. The
      * combine kernel itself returns immediately when the split count is one. */
+    void *gate = r->attn_gate_q81;
+    r->attn_gate_q81 = NULL;
+    r->attn_gate_q81_done = 0;
+    if (gate && r->fn_q8_attention_combine_gate_q81) {
+        /* Combine (also for one split), sigmoid gate and the native Q8_1
+         * staging of the output projection in one launch. */
+        void *g[] = { &out, &r->d_q8_attention_parts, &r->d_q8_attention_meta,
+            &gate, &r->d_position, &r->n_heads, &r->q8_attention_nsm,
+            &occupancy, &forced_splits, &r->d_native_q81, &r->d_native_scale };
+        LAUNCH(r->fn_q8_attention_combine_gate_q81, r->n_heads, 1, 1, 256, 1, 1,
+               (size_t)r->q8_attention_max_splits * 2 * sizeof(float), r->stream, g);
+        r->attn_gate_q81_done = 1;
+        return;
+    }
     if (!r->requested_qwen35_decode_graph &&
         r->cur_position >= 0 && r->cur_position < 256) return;
     void *b[] = { &out, &r->d_q8_attention_parts, &r->d_q8_attention_meta,
@@ -31345,6 +31365,16 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
                                                r->d_k, r->d_v, n_kv_heads, head_dim, r->cur_position, 1);
                     const char *q8q4_direct = getenv("LLM_ATTN_DECODE_Q8Q4_DIRECT");
                     if (r->fn_q8_attention_decode) {
+                        const char *gf = getenv("LLM_QWEN35_ATTN_GATE_Q81_FOLD");
+                        const char *sg = getenv("LLM_QWEN35_SPLIT_ATTN_GATE_Q81");
+                        int ot = cl->attn_output_type;
+                        if ((!gf || atoi(gf) != 0) && (!sg || atoi(sg) == 0) &&
+                            !r->debug_layers && head_dim == 256 &&
+                            n_heads * head_dim <= 17408 &&
+                            !(r->ssm_fused_decode && (ot == GGML_TYPE_Q6_K ||
+                              (!r->fn_qwen35_matvec_iq3xxs && ot == GGML_TYPE_IQ3_XXS))) &&
+                            qwen35_native_q81_matvec_type(r, ot))
+                            r->attn_gate_q81 = r->d_attn_gate;
                         launch_attn_decode_native_q8(r, r->d_xb2, r->d_q, key_cache, value_cache,
                             r->d_key_cache_scale[l], r->d_value_cache_scale[l]);
                     } else if (r->kv_cache_type == HIP_LLM_KV_Q8_0_Q4_0 && q8q4_direct && atoi(q8q4_direct) != 0) {
@@ -31404,7 +31434,13 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
                     (q_dim_local % 256) == 0 &&
                     qwen35_native_q81_matvec_type(r, cl->attn_output_type) &&
                     (!split_gate_q81_env || atoi(split_gate_q81_env) == 0);
-                if (native_gate_q81) {
+                if (native_gate_q81 && r->attn_gate_q81_done) {
+                    r->attn_gate_q81_done = 0;
+                    r->native_q81_source = r->d_xb2;
+                    r->native_q81_n = q_dim_local;
+                    r->native_q81_valid = 1;
+                    begin_native_q81_prepared(r);
+                } else if (native_gate_q81) {
                     launch_sigmoid_mul_native_q81(
                         r, r->d_xb2, r->d_attn_gate, q_dim_local);
                     begin_native_q81_prepared(r);
