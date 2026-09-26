@@ -24,7 +24,8 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
-from qwen_chat import (RawTurnCache, chat_input_messages, content_text, encode_raw,
+from qwen_chat import (RawTurnCache, StreamSplitter, chat_input_messages, content_text,
+                       encode_raw,
                        generation_suffix, prefix_boundaries, render_messages,
                        responses_input_messages, split_generation, system_frame)
 from qwen_tools import call_events, parse_calls, tool_registry
@@ -257,7 +258,8 @@ class Backend:
         self.request_cancellations = {}
         self.metrics_local = threading.local()
         self.ready = False
-        self.model = args.model.rsplit("/", 1)[-1]
+        self.model = (getattr(args, "served_model_name", None) or
+                      args.model.rsplit("/", 1)[-1])
         try:
             ready_timeout = float(os.environ.get("QWEN38_READY_TIMEOUT", "300"))
             if not math.isfinite(ready_timeout) or ready_timeout <= 0:
@@ -676,7 +678,20 @@ class Handler(BaseHTTPRequestHandler):
             })
         elif path in ("/v1/models", "/models"):
             now = int(time.time())
-            self.send_json(200, {"object": "list", "data": [{"id": self.model, "object": "model", "created": now, "owned_by": "local"}]})
+            # llama.cpp router shape (status/meta) so router clients such as
+            # pi's llama.cpp extension accept this single resident model.
+            self.send_json(200, {"object": "list", "data": [{
+                "id": self.model, "object": "model", "created": now, "owned_by": "local",
+                "status": {"value": "loaded"}, "source": "resident",
+                "meta": {"n_ctx": self.context, "n_ctx_train": self.context},
+                "architecture": {"input_modalities": ["text"]}}]})
+        elif path in ("/props", "/v1/props"):
+            template = Path(__file__).with_name("qwen38_chat_template.jinja")
+            self.send_json(200, {
+                "models_autoload": False,
+                "chat_template": template.read_text() if template.exists() else "",
+                "default_generation_settings": {"n_ctx": self.context},
+                "model_path": self.model})
         else:
             self.log_message("404 GET %s", self.path)
             self.send_json(404, {"error": {"message": "not found", "type": "invalid_request_error"}})
@@ -746,6 +761,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         if api_path == "/v1/messages/count_tokens":
             self.count_tokens()
+            return
+        if path in ("/models/load", "/models/unload"):
+            # One resident model: loading is a no-op and it stays loaded.
+            n = int(self.headers.get("Content-Length", "0") or 0)
+            if 0 < n <= 4096:
+                self.rfile.read(n)
+            self.send_json(200, {"success": True})
             return
         if api_path not in ("/v1/chat/completions", "/v1/completions", "/v1/responses",
                             "/v1/messages"):
@@ -972,16 +994,24 @@ class Handler(BaseHTTPRequestHandler):
                     stream_keepalive = threading.Thread(target=keepalive, daemon=True)
                     stream_keepalive.start()
 
+                splitter = StreamSplitter(thinking)
+
                 def stream_token(token):
                     if not req.get("stream") or api_path != "/v1/chat/completions":
                         return
-                    obj = {"id": stream_response_id, "object": "chat.completion.chunk",
-                           "created": stream_created, "model": self.model,
-                           "choices": [{"index": 0, "delta": {"content": token},
-                                        "finish_reason": None}]}
+                    parts = splitter.feed(token)
+                    if not parts:
+                        return
                     try:
                         with stream_write_lock:
-                            self.wfile.write(("data: " + json.dumps(obj, ensure_ascii=False) + "\n\n").encode())
+                            for kind, piece in parts:
+                                field = "reasoning_content" if kind == "reasoning" else "content"
+                                obj = {"id": stream_response_id, "object": "chat.completion.chunk",
+                                       "created": stream_created, "model": self.model,
+                                       "choices": [{"index": 0, "delta": {field: piece},
+                                                    "finish_reason": None}]}
+                                self.wfile.write(("data: " + json.dumps(obj, ensure_ascii=False) +
+                                                  "\n\n").encode())
                             self.wfile.flush()
                     except (BrokenPipeError, ConnectionResetError, OSError):
                         cancelled.set()
@@ -1035,7 +1065,8 @@ class Handler(BaseHTTPRequestHandler):
                                         [c.get("call_id") for c in calls])
             ident = "chatcmpl-" + uuid.uuid4().hex
             created = int(time.time())
-            usage = {"prompt_tokens": ptok, "completion_tokens": ctok, "total_tokens": ptok + ctok, "cached_tokens": cached}
+            usage = {"prompt_tokens": ptok, "completion_tokens": ctok, "total_tokens": ptok + ctok,
+                     "cached_tokens": cached, "prompt_tokens_details": {"cached_tokens": cached}}
             performance = getattr(self.backend, "last_metrics", {})
             if req.get("stream"):
                 # The stream headers and keepalive comments were sent before
@@ -1078,8 +1109,23 @@ class Handler(BaseHTTPRequestHandler):
                     elif text and api_path != "/v1/chat/completions":
                         obj = {"id": ident, "object": "chat.completion.chunk", "created": created, "model": self.model, "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}]}
                         self.wfile.write(("data: " + json.dumps(obj, ensure_ascii=False) + "\n\n").encode())
-                    obj = {"id": ident, "object": "chat.completion.chunk", "created": created, "model": self.model, "choices": [{"index": 0, "delta": {}, "finish_reason": finish}], "performance": performance}
-                    self.wfile.write(("data: " + json.dumps(obj) + "\n\ndata: [DONE]\n\n").encode())
+                    elif text.startswith(splitter.content) and len(text) > len(splitter.content):
+                        # Held-back answer text that turned out not to be a call.
+                        obj = {"id": ident, "object": "chat.completion.chunk", "created": created,
+                               "model": self.model, "choices": [{"index": 0, "delta": {
+                                   "content": text[len(splitter.content):]}, "finish_reason": None}]}
+                        self.wfile.write(("data: " + json.dumps(obj, ensure_ascii=False) + "\n\n").encode())
+                    obj = {"id": ident, "object": "chat.completion.chunk", "created": created, "model": self.model, "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls" if calls else finish}], "performance": performance}
+                    self.wfile.write(("data: " + json.dumps(obj) + "\n\n").encode())
+                    options = req.get("stream_options")
+                    if isinstance(options, dict) and options.get("include_usage"):
+                        obj = {"id": ident, "object": "chat.completion.chunk", "created": created,
+                               "model": self.model, "choices": [],
+                               "usage": {"prompt_tokens": ptok, "completion_tokens": ctok,
+                                         "total_tokens": ptok + ctok,
+                                         "prompt_tokens_details": {"cached_tokens": cached}}}
+                        self.wfile.write(("data: " + json.dumps(obj) + "\n\n").encode())
+                    self.wfile.write(b"data: [DONE]\n\n")
                 self.wfile.flush()
                 return
             if api_path == "/v1/responses":
@@ -1130,6 +1176,9 @@ def main():
     ap.add_argument("--max-output", type=int, default=256)
     ap.add_argument("--moe-cache-mb", type=int, default=0)
     ap.add_argument("--coding", action="store_true")
+    ap.add_argument("--served-model-name", default=None,
+                    help="model id reported by /v1/models and responses "
+                         "(default: the GGUF file name)")
     ap.add_argument("--thinking", choices=("auto", "on", "off"), default="auto",
                     help="Qwen3.8 reasoning mode: auto follows the request's reasoning "
                          "effort (Responses) or enable_thinking (Chat Completions)")

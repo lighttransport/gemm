@@ -1,5 +1,72 @@
 # Qwen3.8 server correctness and performance
 
+## pi coding agent via its llama.cpp extension — 2026-09-27
+
+pi's built-in llama.cpp extension (pi 0.87.1) talks to a llama.cpp router
+server. The shim now answers the router endpoints it uses:
+- `GET /models` entries carry `status.value = "loaded"`, `meta.n_ctx`, and
+  the input modalities.
+- `GET /props` returns `models_autoload: false` and the GGUF chat template.
+  The template contains `enable_thinking`, which makes pi mark the model as
+  reasoning and send `chat_template_kwargs.enable_thinking`.
+- `POST /models/load` and `/models/unload` are no-ops: one model is
+  resident.
+- `--served-model-name` (the launcher uses `qwen3.8-27b`) replaces the GGUF
+  file name as the model id.
+
+Setup:
+
+```sh
+rdna4/llm/run_qwen38_27b_codex.sh &
+rdna4/llm/pi/qwen38_pi_setup.sh     # credential + catalog in ~/.pi-qwen38
+PI_CODING_AGENT_DIR=~/.pi-qwen38 pi --provider llama.cpp --model qwen3.8-27b
+```
+
+In an existing pi setup, `/login llama.cpp` with URL `http://127.0.0.1:8090`
+followed by `/model` is equivalent. Two catalog quirks:
+- pi refreshes extension catalogs from the network only in interactive and
+  RPC modes; `pi -p` and `pi update --models` use the stored catalog. The
+  helper therefore runs one short RPC session.
+- pi sends no session id or cache key to llama.cpp, so all pi sessions share
+  one cache identity.
+
+### Chat Completions streaming
+
+Streaming now splits the generation:
+- Reasoning before `</think>` streams as `reasoning_content`.
+- Answer text streams as `content`, held back from the first possible
+  `<tool_call>`. Tool calls follow as `tool_calls` deltas with
+  `finish_reason: "tool_calls"`.
+- A usage chunk with `prompt_tokens_details.cached_tokens` follows when
+  `stream_options.include_usage` is set.
+
+Previously the raw XML and `<think>` text streamed as content.
+
+pi replays tool calls with the server-issued ids. The raw-turn memory
+therefore restores their exact bytes (see the Claude Code section).
+
+### Caching changes found with pi
+
+- **Save on any discard (runner).** Because pi's sessions share one
+  identity, the runner now captures the live state whenever it is about to
+  be replaced, not only on an identity change. A → B → A with pi restored
+  A's saved 5,341-token state and appended 28 tokens.
+- **All-but-last-paragraph boundary (shim).** pi ends its system prompt with
+  the project context and then a `<cwd>` paragraph. The shim now also sends
+  "all but the last paragraph" as a prefix boundary. A session in another
+  directory of the same repo restored 4,408 tokens and prefilled 46, instead
+  of 3,496 from the 960-token tools snapshot.
+
+### Measured
+
+pi's cold prompt is 4.5K tokens (read/bash/edit/write tools plus
+AGENTS.md/CLAUDE.md context).
+- The fix/compile/run task took 14.9 s over 4 requests. Every step after
+  the first continued the live state (17–65 tokens appended).
+- Thinking blocks and tool calls arrived as structured pi content.
+- The DFlash2 HTTP gate passes. Codex and Claude Code still work against
+  the same server.
+
 ## Claude Code CLI support — 2026-09-27
 
 The shim now serves the Anthropic Messages API (`POST /v1/messages`, also

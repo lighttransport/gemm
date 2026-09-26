@@ -206,13 +206,22 @@ def prefix_boundaries(messages, registry=None, thinking=False, effort=None):
     frame = system_frame(messages, registry, thinking, effort)
     out = [frame] if frame else []
     body = system_text(messages)
-    if registry and body:
-        instructions = REASONING_INSTRUCTIONS[template_effort(effort)] if thinking else ""
-        tools_only = ("<|im_start|>system\n" +
-                      (instructions + "\n\n" if instructions else "") +
-                      tools_block(registry) + "\n\n")
-        if frame.startswith(tools_only) and body[:1].isalpha():
-            out.insert(0, tools_only)
+    if not body:
+        return out
+    instructions = REASONING_INSTRUCTIONS[template_effort(effort)] if thinking else ""
+    head = "<|im_start|>system\n" + (instructions + "\n\n" if instructions else "")
+    if registry:
+        head += tools_block(registry) + "\n\n"
+        if frame.startswith(head) and body[:1].isalpha():
+            out.insert(0, head)
+    # Agents append per-directory context last (pi: "<cwd>...</cwd>"), so
+    # all but the final paragraph is shared by sessions in the same project.
+    # The runner drops a candidate that is not a clean token prefix.
+    cut = body.rfind("\n\n")
+    if cut > 0 and len(body) - cut < len(body) // 4:
+        candidate = head + body[:cut + 2]
+        if frame.startswith(candidate) and candidate not in out:
+            out.insert(len(out) - 1, candidate)
     return out
 
 
@@ -292,6 +301,71 @@ def split_generation(text, thinking):
     if end < 0:
         return text.strip(), ""
     return text[:end].strip(), text[end + len("</think>"):].lstrip("\n")
+
+
+class StreamSplitter:
+    """Split streamed generation into reasoning and answer deltas.
+
+    Text before ``</think>`` is reasoning (when thinking).  Answer text is
+    streamed until a ``<tool_call>`` may begin; from there it is held back,
+    since tool calls are delivered as structured deltas after parsing.
+    Partial tag prefixes are held until they resolve.
+    """
+
+    THINK_END = "</think>"
+    CALL = "<tool_call>"
+
+    def __init__(self, thinking):
+        self.reasoning = thinking
+        self.pending = ""
+        self.after_think = False
+        self.in_call = False
+        self.content = ""          # answer text already emitted
+
+    @staticmethod
+    def _hold(text, tag):
+        """Length of a trailing prefix of ``tag`` in ``text``."""
+        for n in range(min(len(tag) - 1, len(text)), 0, -1):
+            if text.endswith(tag[:n]):
+                return n
+        return 0
+
+    def feed(self, piece):
+        out = []
+        self.pending += piece
+        if self.reasoning:
+            end = self.pending.find(self.THINK_END)
+            if end < 0:
+                keep = self._hold(self.pending, self.THINK_END)
+                emit = self.pending[:len(self.pending) - keep]
+                self.pending = self.pending[len(emit):]
+                if emit:
+                    out.append(("reasoning", emit))
+                return out
+            if end:
+                out.append(("reasoning", self.pending[:end]))
+            self.pending = self.pending[end + len(self.THINK_END):]
+            self.reasoning = False
+            self.after_think = True
+        if self.after_think:
+            self.pending = self.pending.lstrip("\n")
+            if not self.pending:
+                return out
+            self.after_think = False
+        if self.in_call:
+            return out
+        start = self.pending.find(self.CALL)
+        if start >= 0:
+            emit, self.in_call = self.pending[:start], True
+            self.pending = self.pending[start:]
+        else:
+            keep = self._hold(self.pending, self.CALL)
+            emit = self.pending[:len(self.pending) - keep]
+            self.pending = self.pending[len(emit):]
+        if emit:
+            self.content += emit
+            out.append(("content", emit))
+        return out
 
 
 def _call_from_item(item):

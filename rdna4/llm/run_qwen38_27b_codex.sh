@@ -50,6 +50,7 @@ cd "${runner_dir}"
 exec python3 codex_server.py "${model}" --runner "${runner_dir}/test_hip_llm" \
     --host "${host}" --port "${port}" --context "${context}" \
     --max-output "${max_output}" --thinking "${thinking}" \
+    --served-model-name "${QWEN38_SERVED_MODEL:-qwen3.8-27b}" \
     --qwen35-dflash2 "${dflash}" \
     --context-cache-entries "${cache_entries}" \
     --context-cache-max-mib "${cache_mib}" \
