@@ -99,6 +99,8 @@ def request_messages(req):
                     if raw is not None:
                         turn["raw"] = raw
                     else:
+                        if str(block.get("signature", "")).startswith("q38ref1:"):
+                            turn["raw_ref"] = block["signature"]
                         turn["reasoning_content"] = block.get("thinking", "")
                 elif kind == "text":
                     turn["content"] += block.get("text", "")
@@ -174,38 +176,3 @@ def message_object(message_id, model, content, reason, use):
 def stream_start(message_id, model, prompt_tokens, cached):
     return ("message_start", {"type": "message_start", "message": message_object(
         message_id, model, [], None, usage(prompt_tokens, cached, 0))})
-
-
-def stream_events(content, reason, use):
-    """The buffered remainder of a streamed message, in protocol order."""
-    for index, block in enumerate(content):
-        kind = block["type"]
-        if kind == "thinking":
-            yield ("content_block_start", {"type": "content_block_start", "index": index,
-                                           "content_block": {"type": "thinking",
-                                                             "thinking": "", "signature": ""}})
-            if block["thinking"]:
-                yield ("content_block_delta", {"type": "content_block_delta", "index": index,
-                                               "delta": {"type": "thinking_delta",
-                                                         "thinking": block["thinking"]}})
-            yield ("content_block_delta", {"type": "content_block_delta", "index": index,
-                                           "delta": {"type": "signature_delta",
-                                                     "signature": block["signature"]}})
-        elif kind == "text":
-            yield ("content_block_start", {"type": "content_block_start", "index": index,
-                                           "content_block": {"type": "text", "text": ""}})
-            yield ("content_block_delta", {"type": "content_block_delta", "index": index,
-                                           "delta": {"type": "text_delta",
-                                                     "text": block["text"]}})
-        else:
-            yield ("content_block_start", {"type": "content_block_start", "index": index,
-                                           "content_block": {**block, "input": {}}})
-            yield ("content_block_delta", {"type": "content_block_delta", "index": index,
-                                           "delta": {"type": "input_json_delta",
-                                                     "partial_json": json.dumps(
-                                                         block["input"], ensure_ascii=False)}})
-        yield ("content_block_stop", {"type": "content_block_stop", "index": index})
-    yield ("message_delta", {"type": "message_delta",
-                             "delta": {"stop_reason": reason, "stop_sequence": None},
-                             "usage": {"output_tokens": use["output_tokens"]}})
-    yield ("message_stop", {"type": "message_stop"})

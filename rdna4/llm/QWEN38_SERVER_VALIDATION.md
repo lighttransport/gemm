@@ -1,5 +1,53 @@
 # Qwen3.8 server correctness and performance
 
+## Live streaming and restart warm-up — 2026-09-27
+
+### Live Responses and Messages streams (`live_stream.py`)
+
+Codex and Claude Code now receive reasoning and answer text while the model
+generates. Previously every event was buffered until the turn finished.
+
+- **Codex (Responses).** The reasoning item's summary deltas stream first.
+  The item then closes, and the message's `output_text` deltas follow. Tool
+  calls and `response.completed` come at the end.
+- **Claude Code (Messages).** A thinking block streams `thinking_delta`s and
+  closes when the answer starts. Text deltas follow, and tool-use blocks come
+  at the end.
+
+The replay blob has to be sent before the reasoning item or thinking block
+closes, which is before the raw turn is known. Streams therefore carry a
+reference, `q38ref1:<id>`, that the server's raw-turn memory resolves; the
+raw bytes are stored under the id when generation finishes. Non-streaming
+responses keep the inline `q38raw1:` blob.
+
+Measured on a Claude Code fix/compile/run task:
+- 106 thinking deltas and 54 text deltas reached the client during
+  generation.
+- The follow-up `--resume` took 3 turns and 6.1 s, with 158 uncached input
+  tokens.
+
+The Codex fix and resume completed with only live continuations (no
+divergences).
+
+### System-prefix warm-up across restarts (`prefix_store.py`)
+
+Shared prefix snapshots live in host memory, so a restart used to cost every
+agent a full system-prompt prefill on its first request (Claude Code 15.7K
+tokens, about 31 s).
+
+With `--prefix-store FILE`, the shim records the prefix boundaries of
+successful requests. The launcher uses
+`~/.cache/qwen38-server/prefixes.json`; the file contains the system prompts
+and is written 0600. On startup, a background thread replays the
+`--prefix-warmup` (default 4) most recent entries as zero-output requests.
+The runner does not add a duplicate prompt snapshot when a prompt is exactly
+a shared prefix. The launcher now keeps 16 snapshot entries.
+
+After a restart, the three stored prefixes re-prefilled in the background:
+pi 4,430 tokens in 9.2 s, Codex 2,321 in 5.0 s, Claude Code 13,185 in 26.5 s.
+The first Claude Code request then restored 13,185 tokens and finished in
+9.3 s, instead of about 38 s cold.
+
 ## pi coding agent via its llama.cpp extension — 2026-09-27
 
 pi's built-in llama.cpp extension (pi 0.87.1) talks to a llama.cpp router

@@ -99,18 +99,52 @@ class MessagesTranslationTest(unittest.TestCase):
         self.assertEqual(anthropic_api.thinking_request(
             {"thinking": {"type": "enabled", "budget_tokens": 31999}}), (True, "xhigh"))
 
-    def test_stream_event_order(self):
-        content = anthropic_api.response_content("r", "<think>\nr</think>\n\nok", "ok", [])
-        use = anthropic_api.usage(100, 90, 5)
-        self.assertEqual(use["input_tokens"], 10)
-        events = [e for e, _ in anthropic_api.stream_events(content, "end_turn", use)]
-        self.assertEqual(events, ["content_block_start", "content_block_delta",
-                                  "content_block_delta", "content_block_stop",
-                                  "content_block_start", "content_block_delta",
-                                  "content_block_stop", "message_delta", "message_stop"])
-        payloads = [p for _, p in anthropic_api.stream_events(content, "end_turn", use)]
-        self.assertEqual(payloads[2]["delta"]["type"], "signature_delta")
-        json.dumps(payloads)
+    def test_live_stream_event_order_and_ref_replay(self):
+        from live_stream import MessagesLive, new_ref
+        from qwen_chat import RawTurnCache, StreamSplitter
+        events, ref, cache = [], new_ref(), RawTurnCache()
+        live = MessagesLive(lambda e, p: events.append((e, p)), ref)
+        splitter = StreamSplitter(True)
+        generated = "Plan.\n</think>\n\nDone.<tool_call>\n<function=Bash>\n<parameter=command>\nls\n</parameter>\n</function>\n</tool_call>"
+        for piece in (generated[:3], generated[3:20], generated[20:]):
+            live.feed(splitter.feed(piece))
+        reasoning, answer = split_generation(generated, True)
+        text, calls = parse_calls(answer, self.registry)
+        content = anthropic_api.response_content(reasoning, "<think>\n" + generated, text, calls)
+        tools = [b for b in content if b["type"] == "tool_use"]
+        cache.remember_ref(ref, "<think>\n" + generated)
+        live.finish(text, tools, "tool_use", anthropic_api.usage(10, 5, 3))
+        names = [e for e, _ in events]
+        self.assertEqual(names[0], "content_block_start")
+        signature = [p for e, p in events if p.get("delta", {}).get("type") == "signature_delta"]
+        self.assertEqual(signature[0]["delta"]["signature"], ref)
+        self.assertEqual(names[-2:], ["message_delta", "message_stop"])
+        self.assertIn("thinking_delta", [p.get("delta", {}).get("type") for _, p in events])
+        # The client returns the streamed blocks; the reference replays the bytes.
+        messages = anthropic_api.request_messages({"messages": [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "Plan.", "signature": ref},
+                {"type": "text", "text": "Done."}] + tools}]})
+        cache.resolve(messages)
+        self.assertEqual(messages[1]["raw"], "<think>\n" + generated)
+
+    def test_responses_live_stream(self):
+        from live_stream import ResponsesLive, new_ref
+        from qwen_chat import RawTurnCache, StreamSplitter, responses_input_messages
+        events, ref, cache = [], new_ref(), RawTurnCache()
+        live = ResponsesLive(events.append, "resp-1", ref)
+        splitter = StreamSplitter(True)
+        live.feed(splitter.feed("Think.\n</think>\n\nHello"))
+        output = live.finish("Hello", [])
+        cache.remember_ref(ref, "<think>\nThink.\n</think>\n\nHello")
+        kinds = [e["type"] for e in events]
+        self.assertLess(kinds.index("response.reasoning_summary_text.delta"),
+                        kinds.index("response.output_text.delta"))
+        self.assertEqual(output[0]["encrypted_content"], ref)
+        messages = responses_input_messages(output)
+        cache.resolve(messages)
+        self.assertEqual(messages[0]["raw"], "<think>\nThink.\n</think>\n\nHello")
 
 
 if __name__ == "__main__":

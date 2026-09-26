@@ -177,11 +177,24 @@ class RawTurnCache:
             while len(self.entries) > self.capacity:
                 self.entries.popitem(last=False)
 
+    def remember_ref(self, ref, raw):
+        """Store a streamed turn under the reference it was sent with."""
+        with self.lock:
+            self.entries[ref] = (raw, None, None)
+            self.entries.move_to_end(ref)
+            while len(self.entries) > self.capacity:
+                self.entries.popitem(last=False)
+
     def resolve(self, messages):
         """Fill in ``raw`` for assistant turns that lost it."""
         with self.lock:
             for m in messages:
                 if m.get("role") != "assistant" or isinstance(m.get("raw"), str):
+                    continue
+                ref = m.get("raw_ref")
+                if ref and ref in self.entries:
+                    m["raw"] = self.entries[ref][0]
+                    self.entries.move_to_end(ref)
                     continue
                 ids = m.get("call_ids") or []
                 key = ids[0] if ids else self.text_key(content_text(m.get("content", "")))
@@ -430,6 +443,10 @@ def responses_input_messages(value):
             raw = decode_raw(item.get("encrypted_content"))
             if raw is not None:
                 current["raw"] = raw
+            elif str(item.get("encrypted_content", "")).startswith("q38ref1:"):
+                current["raw_ref"] = item["encrypted_content"]
+                current["reasoning_content"] = "\n".join(
+                    x.get("text", "") for x in item.get("summary") or [] if isinstance(x, dict))
             else:
                 summary = item.get("summary") or item.get("content") or []
                 current["reasoning_content"] = "\n".join(

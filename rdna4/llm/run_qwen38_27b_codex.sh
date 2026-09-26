@@ -21,7 +21,7 @@ thinking="${QWEN38_THINKING:-auto}"
 # Host-side conversation snapshots: the shared system prefix plus the live
 # state of conversations that lost the GPU to another one.  A 64K-token
 # snapshot is about 2.3 GiB.
-cache_entries="${QWEN38_CONTEXT_CACHE_ENTRIES:-8}"
+cache_entries="${QWEN38_CONTEXT_CACHE_ENTRIES:-16}"
 cache_mib="${QWEN38_CONTEXT_CACHE_MIB:-12288}"
 snapshot_tokens="${QWEN38_SNAPSHOT_MAX_TOKENS:-${context}}"
 codex_home="${QWEN38_CODEX_HOME:-${HOME}/.codex-qwen38}"
@@ -51,6 +51,7 @@ exec python3 codex_server.py "${model}" --runner "${runner_dir}/test_hip_llm" \
     --host "${host}" --port "${port}" --context "${context}" \
     --max-output "${max_output}" --thinking "${thinking}" \
     --served-model-name "${QWEN38_SERVED_MODEL:-qwen3.8-27b}" \
+    --prefix-store "${QWEN38_PREFIX_STORE:-${HOME}/.cache/qwen38-server/prefixes.json}" \
     --qwen35-dflash2 "${dflash}" \
     --context-cache-entries "${cache_entries}" \
     --context-cache-max-mib "${cache_mib}" \

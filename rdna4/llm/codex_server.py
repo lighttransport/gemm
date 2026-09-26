@@ -30,6 +30,8 @@ from qwen_chat import (RawTurnCache, StreamSplitter, chat_input_messages, conten
                        responses_input_messages, split_generation, system_frame)
 from qwen_tools import call_events, parse_calls, tool_registry
 import anthropic_api
+from live_stream import MessagesLive, ResponsesLive, new_ref
+from prefix_store import PrefixStore
 
 
 WEB_DIR = Path(__file__).with_name("web")
@@ -524,45 +526,6 @@ def responses_output(response_id, reasoning, raw_turn, text, calls):
     return items
 
 
-def output_item_events(response_id, items):
-    """Buffered Responses stream events for finished output items."""
-    for index, item in enumerate(items):
-        kind = item["type"]
-        if kind in ("function_call", "custom_tool_call"):
-            for event in call_events(response_id, [item]):
-                if event["type"] in ("response.created", "response.in_progress"):
-                    continue
-                yield {**event, "output_index": index}
-            continue
-        if kind == "message":
-            part = item["content"][0]
-            yield {"type": "response.output_item.added", "output_index": index,
-                   "item": {**item, "status": "in_progress", "content": []}}
-            common = {"item_id": item["id"], "output_index": index, "content_index": 0}
-            yield {"type": "response.content_part.added", **common,
-                   "part": {"type": "output_text", "text": "", "annotations": []}}
-            yield {"type": "response.output_text.delta", **common, "delta": part["text"]}
-            yield {"type": "response.output_text.done", **common, "text": part["text"]}
-            yield {"type": "response.content_part.done", **common, "part": part}
-            yield {"type": "response.output_item.done", "output_index": index, "item": item}
-            continue
-        if kind == "reasoning":
-            yield {"type": "response.output_item.added", "output_index": index,
-                   "item": {**item, "summary": []}}
-            for summary_index, summary in enumerate(item["summary"]):
-                common = {"item_id": item["id"], "output_index": index,
-                          "summary_index": summary_index}
-                yield {"type": "response.reasoning_summary_part.added", **common,
-                       "part": {"type": "summary_text", "text": ""}}
-                yield {"type": "response.reasoning_summary_text.delta", **common,
-                       "delta": summary["text"]}
-                yield {"type": "response.reasoning_summary_text.done", **common,
-                       "text": summary["text"]}
-                yield {"type": "response.reasoning_summary_part.done", **common,
-                       "part": summary}
-        yield {"type": "response.output_item.done", "output_index": index, "item": item}
-
-
 class Handler(BaseHTTPRequestHandler):
     backend = None
     model = "local"
@@ -571,6 +534,7 @@ class Handler(BaseHTTPRequestHandler):
     coding = False
     thinking = "auto"
     raw_turns = RawTurnCache()
+    prefix_store = None
 
     def count_tokens(self):
         """Estimate /v1/messages/count_tokens from the rendered prompt."""
@@ -949,6 +913,21 @@ class Handler(BaseHTTPRequestHandler):
                     "type": "invalid_request_error"}})
                 return
             watcher = None
+            live = None
+            live_ref = None
+            sequence = [2]
+
+            def sse(event, payload):
+                with stream_write_lock:
+                    self.wfile.write(("event: " + event + "\ndata: " +
+                                      json.dumps(payload, ensure_ascii=False) + "\n\n").encode())
+                    self.wfile.flush()
+
+            def sse_responses(obj):
+                obj = {**obj, "sequence_number": sequence[0]}
+                sequence[0] += 1
+                sse(obj["type"], obj)
+
             try:
                 if req.get("stream"):
                     # Send headers only after reserving the ID. A duplicate
@@ -977,6 +956,13 @@ class Handler(BaseHTTPRequestHandler):
                             self.wfile.write(("event: " + event + "\ndata: " +
                                              json.dumps(payload, ensure_ascii=False) + "\n\n").encode())
                     self.wfile.flush()
+                    # Reasoning and answer text stream while the model runs.
+                    if api_path == "/v1/messages":
+                        live_ref = new_ref()
+                        live = MessagesLive(sse, live_ref)
+                    elif api_path == "/v1/responses":
+                        live_ref = new_ref()
+                        live = ResponsesLive(sse_responses, stream_response_id, live_ref)
                     keepalive_bytes = (b'event: ping\ndata: {"type": "ping"}\n\n'
                                        if api_path == "/v1/messages" else b": keep-alive\n\n")
 
@@ -997,7 +983,18 @@ class Handler(BaseHTTPRequestHandler):
                 splitter = StreamSplitter(thinking)
 
                 def stream_token(token):
-                    if not req.get("stream") or api_path != "/v1/chat/completions":
+                    if not req.get("stream"):
+                        return
+                    if live is not None:
+                        parts = splitter.feed(token)
+                        if parts:
+                            try:
+                                live.feed(parts)
+                            except (BrokenPipeError, ConnectionResetError, OSError):
+                                cancelled.set()
+                                self.backend.cancel(cancelled)
+                        return
+                    if api_path != "/v1/chat/completions":
                         return
                     parts = splitter.feed(token)
                     if not parts:
@@ -1037,6 +1034,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.log_message("request cancelled: %s", self.path)
                 self.close_connection = True
                 return
+            if self.prefix_store is not None:
+                self.prefix_store.record(prefix)
             # The exact bytes of this assistant turn after "<|im_start|>assistant\n".
             raw_turn = generation_suffix(thinking) + text
             reasoning_text, answer = split_generation(text, thinking)
@@ -1050,12 +1049,9 @@ class Handler(BaseHTTPRequestHandler):
                 use = anthropic_api.usage(ptok, cached, ctok)
                 if req.get("stream"):
                     self.close_connection = True
-                    for event, payload in anthropic_api.stream_events(content, reason, use):
-                        if event == "message_delta":
-                            payload = {**payload, "usage": use}
-                        self.wfile.write(("event: " + event + "\ndata: " +
-                                          json.dumps(payload, ensure_ascii=False) + "\n\n").encode())
-                    self.wfile.flush()
+                    self.raw_turns.remember_ref(live_ref, raw_turn)
+                    live.finish(text, [b for b in content if b["type"] == "tool_use"],
+                                reason, use)
                 else:
                     self.send_json(200, anthropic_api.message_object(
                         "msg_" + uuid.uuid4().hex[:24], self.model, content, reason, use))
@@ -1076,23 +1072,16 @@ class Handler(BaseHTTPRequestHandler):
                 self.close_connection = True
                 if api_path == "/v1/responses":
                     response_id = stream_response_id
-                    output = responses_output(response_id, reasoning_text, raw_turn,
-                                              text, calls)
+                    self.raw_turns.remember_ref(live_ref, raw_turn)
+                    output = live.finish(text, calls)
                     response_done = {"id": response_id, "object": "response",
                                      "created_at": created, "status": "completed",
                                      "model": self.model, "output": output,
                                      "usage": {"input_tokens": ptok, "output_tokens": ctok,
                                                "total_tokens": ptok + ctok,
                                                "input_tokens_details": {"cached_tokens": cached}}}
-                    events = list(output_item_events(response_id, output))
-                    events.append({"type": "response.completed", "response": response_done})
-                    for sequence_number, obj in enumerate(events, 2):
-                        # Responses stream consumers use this to order and
-                        # validate events.  In particular, Codex silently
-                        # discards otherwise well-formed events without it.
-                        obj = {**obj, "sequence_number": sequence_number}
-                        self.wfile.write(("event: " + obj["type"] + "\ndata: " +
-                                          json.dumps(obj, ensure_ascii=False) + "\n\n").encode())
+                    # Codex discards Responses events without sequence_number.
+                    sse_responses({"type": "response.completed", "response": response_done})
                 else:
                     if calls:
                         delta = {"role": "assistant", "tool_calls": [
@@ -1176,6 +1165,11 @@ def main():
     ap.add_argument("--max-output", type=int, default=256)
     ap.add_argument("--moe-cache-mb", type=int, default=0)
     ap.add_argument("--coding", action="store_true")
+    ap.add_argument("--prefix-store", default="",
+                    help="JSON file remembering agents' system prefixes across restarts "
+                         "(contains system prompts; written 0600); empty disables")
+    ap.add_argument("--prefix-warmup", type=int, default=4,
+                    help="stored prefixes to re-prefill at startup (0 disables)")
     ap.add_argument("--served-model-name", default=None,
                     help="model id reported by /v1/models and responses "
                          "(default: the GGUF file name)")
@@ -1238,6 +1232,25 @@ def main():
         raise
     signal.signal(signal.SIGTERM, _handle_sigterm)
     print(f"OpenAI-compatible API: http://{args.host}:{args.port}/v1", flush=True)
+    if args.prefix_store:
+        Handler.prefix_store = PrefixStore(args.prefix_store)
+        stored = Handler.prefix_store.warmup_list()[:max(0, args.prefix_warmup)]
+        if stored:
+            def warmup():
+                # Queued like ordinary requests: an agent request that
+                # arrives meanwhile waits only for the item in progress.
+                for boundaries in stored:
+                    start = time.monotonic()
+                    try:
+                        _, cached, tokens, _, _ = Handler.backend.generate(
+                            boundaries[-1], 0, 0.0, 0.95, 20, 0.0, 1.0, 0.0,
+                            prefix=boundaries, cache_key="prefix-warmup")
+                        sys.stderr.write(f"[warmup] prefix {tokens} tokens "
+                                         f"({tokens - cached} prefilled) in "
+                                         f"{time.monotonic() - start:.1f}s\n")
+                    except Exception as exc:  # warm-up is best effort
+                        sys.stderr.write(f"[warmup] failed: {exc}\n")
+            threading.Thread(target=warmup, daemon=True).start()
     try: server.serve_forever()
     except KeyboardInterrupt: pass
     finally:

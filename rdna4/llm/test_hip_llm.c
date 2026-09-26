@@ -991,7 +991,10 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
         /* A continuation (live or text-restored) needs no boundary copy: the
          * live state is saved when another conversation takes over. */
         const char *every_env = getenv("LLM_SERVER_SNAPSHOT_EVERY_PROMPT");
+        /* A prompt that is exactly a shared prefix (a cache warm-up) is
+         * already covered by that shared snapshot. */
         if (snapshot_cache.entries && !prompt_snapshot_present &&
+            !(n_bounds > 0 && prefix_bounds[n_bounds - 1] == n_tokens) &&
             (text_base == 0 || (every_env && atoi(every_env) != 0)))
             pending_prompt_snapshot = hip_llm_snapshot_state(gpu);
         hllm_sampler *sampler = use_reference ? hllm_sampler_create(&request_sampling, n_vocab) : NULL;
