@@ -1,5 +1,74 @@
 # Qwen3.8 27B HIP runner vs llama.cpp — resume state
 
+## Ordinary decode 50 tok/s, DFlash2 100 tok/s (2026-09-26, decode push)
+
+The exact 4K fixture (`tmp/qwen38-212w-handoff/run4k.sh`, 212 W, Q8/Q8 KV,
+154 decode tokens) now decodes at **~50.2 tok/s** ordinary (was 45.5) and
+**~100.7 tok/s** DFlash2 K=7. The sequence hash `44915ec1039a64c8` is
+unchanged. Every step also kept the stronger per-step check
+`LLM_DECODE_LOGITS_HASH=1` → `Decode logits hash=7580569c2ad13f74`, which
+FNV-hashes each decode step's full logits.
+
+| Commit | Change | Decode tok/s |
+|---|---|---|
+| `cecc9722` | residual RMSNorm quantizes native + IQ1 Q8_1 in the same launch | 45.8 |
+| `e367d140` | fused Q/K prep on by default (D=256); logits-hash probe | 46.3 |
+| `e1deaad5` | F16 alpha/beta pair matvec folded into `ssm_prep` | 46.7 |
+| `0e0cdee9` | 1024-thread `res_rmsnorm_q81_f32` | 47.1 |
+| `cdc10a05` | IQ1 Q8_1 staging stays valid across native matvecs | 47.2 |
+| `8079ee63`, `bfb0e3b2` | same-activation projections (SSM qkv+z, attn q/k/v, FFN gate+up), IQ1 included, run as one pair/triple launch; generated per format combination (`qwen35_matvec_multi.hip`) | 48.5 |
+| `50e72edb` | `ssm_core_fused_q81_f32`: prep + alpha/beta + GDA step + gated norm/Q8_1, one block per value head | 49.2 |
+| `adbf1a9e` | attention combine + sigmoid gate + Q8_1 in one launch | 49.35 |
+| `5a2e1c10` | Q2_K warp-per-row matvec prefetches the row (cols 5120), ~14% faster kernel | **50.2** |
+
+How the merges stay bitwise exact:
+- The merged kernels copy the standalone bodies verbatim, so every row is
+  identical to a separate launch.
+- Fast-math main-module code copied into the precise modules (SiLU, sigmoid,
+  Q8_1 divides, f16 scale round trip) is written as the same ISA sequence in
+  inline asm.
+- In the fast-math module, `asm volatile("" : "+v"(x))` pins the multiply
+  order where the compiler reassociated (the gated-norm product).
+
+Knobs, each default on; set to 0 to opt out:
+- `LLM_QWEN35_NATIVE_MULTI`
+- `LLM_QWEN35_SSM_CORE_FUSED`
+- `LLM_QWEN35_ATTN_GATE_Q81_FOLD`
+- `LLM_QWEN35_NORM_Q81`
+- `LLM_QWEN35_SSM_PAIR_FOLD`
+- `LLM_QWEN35_QK_FUSED`
+
+`LLM_QWEN35_SSM_CORE_CHECK=1` (with `LLM_GRAPH_DISABLE=1`, no
+`--qwen35-decode-graph`) diffs every fused SSM output against the 3-launch
+path.
+
+Dead ends (measured, reverted):
+- **SiLU·up + Q8_1 folded into the FFN gate+up kernel** (last block of each
+  32-row group finishes the group): 4352 blocks each paying a fence plus an
+  atomic cost more than the saved launch. Seq_cst fence: 46.5 tok/s;
+  release-only: 48.5 vs 48.9.
+- **Deltanet + gated-norm fold via last-block atomics**: slower.
+- **Prefetch variants of the IQ2_XXS and IQ2_S matvecs**: no gain or slower.
+  These kernels are ALU/codebook bound, not latency bound. Only Q2_K rows
+  (8 serialized virtual-warp passes) was latency bound.
+- **Changing attention split geometry**: parity-locked to llama.cpp's
+  reduction order.
+
+Where the ~19.9 ms/token goes:
+- **Matvecs, ~16 ms.**
+  - Per-format rates on 17408x5120, rotated over >64 MB so the Infinity
+    Cache can't serve them: IQ4_XS ~595 GB/s (bandwidth bound); IQ3 ~560;
+    IQ2_S ~520; IQ2_XS ~485; IQ2_XXS ~465; Q2_K rows ~550 after prefetch;
+    IQ1 ~400.
+  - The low-bit formats are ALU bound: cheaper codebook/sign decode is the
+    remaining matvec lever.
+- **About 560 kernels/token × ~2.35 µs graph-node cost.**
+- **Largest remaining small kernels:**
+  - 127 × `res_rmsnorm_q81_f32` (~4.5 µs each; multi-block races on the
+    in-place residual).
+  - 58 × `silu_mul_q81_f32`.
+  - 16 × gqa3 attention (~32 µs, parity-locked).
+
 ## hipBLASLt-free prefill: self-owned WMMA GEMM + fused dequant (2026-09-26, later)
 
 The runner no longer uses or links hipBLASLt. `make -C rdna4/llm` now defaults
