@@ -31918,6 +31918,7 @@ static int embed_tokens_batch(hip_llm_runner *r, const int32_t *tokens, int M);
 static int forward_block_batched_dense(hip_llm_runner *r, int M,
                                        int position_start,
                                        const int32_t *token_ids);
+static void hllm_qwen35_dflash2_set_feature_rows(hip_llm_runner *r, int rows);
 static void hllm_qwen35_dflash2_capture(hip_llm_runner *r, int layer,
                                         void *hidden, int rows);
 

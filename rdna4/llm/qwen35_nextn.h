@@ -877,6 +877,11 @@ static float *hllm_qwen35_mtp_verify_impl(hip_llm_runner *r,
     if (hipMemcpyAsync(m->verify_positions, positions, (size_t)rows*sizeof(int),
                        hipMemcpyHostToDevice, r->stream) ||
         hipGraphLaunch(*selected_execution, r->stream)) return NULL;
+    /* The graph replays the DFlash2 feature capture kernels, but their
+     * host-side row count was only recorded while capturing.  A one-row
+     * prefill batch in between would otherwise leave it at 1 and reject
+     * the commit of a multi-row accepted window. */
+    hllm_qwen35_dflash2_set_feature_rows(r, rows);
     if (argmax) {
         void *a[] = { &m->verify_logits, &r->n_vocab, &rows, &m->verify_argmax };
         LAUNCH(r->fn_qwen4_argmax_batch, rows, 1, 1, 256, 1, 1, 0, r->stream, a);

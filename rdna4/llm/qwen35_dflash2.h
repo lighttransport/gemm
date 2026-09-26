@@ -287,6 +287,10 @@ static void hllm_qwen35_dflash2_capture(hip_llm_runner *r, int layer,
     d->feature_rows = rows;
 }
 
+static void hllm_qwen35_dflash2_set_feature_rows(hip_llm_runner *r, int rows) {
+    if (r && r->qwen35_dflash2) r->qwen35_dflash2->feature_rows = rows;
+}
+
 static int hllm_qwen35_dflash2_capture_rmsnorm(hip_llm_runner *r, int layer,
         void *norm, void *hidden, void *weight, int rows, float eps) {
     hllm_qwen35_dflash2 *d = r ? r->qwen35_dflash2 : NULL;
