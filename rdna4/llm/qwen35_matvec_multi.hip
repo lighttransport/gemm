@@ -272,6 +272,7 @@ __device__ __forceinline__ void qwen35_mvseg_q2k_rows(int bx,
     int lane = threadIdx.x & 31;
     int row = bx * (blockDim.x / 32) + threadIdx.x / 32;
     if (row >= rows) return;
+    if (cols == 5120) { qwen35_q2k_rows20(row, lane, out, weights, q, scales); return; }
     int blocks = cols / 256, iqs = lane & 15;
     const unsigned char *w = weights + (size_t)row * blocks * 84;
     float parts[8] = {};
