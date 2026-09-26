@@ -998,6 +998,13 @@ so the extra scheduling option was removed. Exact prefill remains below the
 150 tok/s/node target; the stage's projection GEMM and attention are the
 largest measured costs.
 
+One more exact attention screen used `Q38P_ATTN_PV_GEMM=1` and
+`Q38P_ATTN_SCORE_PAD=64` with the selected preexpansion/cuts/chunk. It
+retained the same residual hash and 256/256 TP4 IDs with zero reported logit
+difference, but slowed prefill to 1128.362 tok/s total (94.030/node).
+On a two-attention stage, PV worker time rose from about 4.94 to 5.42 s.
+Keep the default FP32 PV kernel.
+
 Reproduce on a staged 12-node allocation:
 
 ```sh
