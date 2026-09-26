@@ -116,9 +116,17 @@ single-prompt path and were removed.
 
 The pipeline currently replicates the full model on each node. The original
 runner gathers state to rank 0 for single-node decode; the handoff runner below
-exports a canonical snapshot for TP2/TP4 decode. It does not yet use stage-sharded
-weight images, pre-expanded int16 weights, uTofu handoff, or concurrent TP4
-decode groups. Throughput above 12 nodes remains unmeasured.
+exports a canonical snapshot for TP2/TP4 decode. Stage-sharded weight images,
+uTofu handoff, and concurrent TP4 decode groups remain future work.
+Throughput above 12 nodes remains unmeasured.
+
+For long FP4 prompts, `Q38P_PREEXPAND_F4_MIB=2048` stores selected stage-owned
+F4 matrices as exact INT16 GEMM panels in HBM, removing repeated expansion
+on every prompt chunk. The budget is per rank, defaults to zero, and is capped
+at 2048 MiB because larger unrestricted sets triggered HBM NUMA out-of-memory
+kills in 12-node experiments. `Q38P_PP_ATTN_COST=1500` selects measured
+32K-context stage cuts. These settings are specific to the 27B NVFP4 image
+and 32K input; profile other models and lengths before adopting them.
 
 ## Experimental 12-node prefill → TP4/TP2 decode
 

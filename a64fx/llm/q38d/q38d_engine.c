@@ -3617,6 +3617,9 @@ int main(int argc, char **argv) {
         state_fail("long synthetic PP depth requires --prefill-kv-i6, Q38P_ATTN_CACHE=0, Q38P_ATTN_PV_INT16=0, and query tile <=4 above 300K");
     if (getenv("Q38P_ATTN_CMG")) pf_attn_cmg = atoi(getenv("Q38P_ATTN_CMG")) != 0;
     if (getenv("Q38P_CHUNK")) pf_chunk = atoi(getenv("Q38P_CHUNK"));
+    if (getenv("Q38P_PREEXPAND_F4_MIB")) pf_preexpand_f4_mib = atoi(getenv("Q38P_PREEXPAND_F4_MIB"));
+    if (pf_preexpand_f4_mib < 0 || pf_preexpand_f4_mib > 2048)
+        state_fail("Q38P_PREEXPAND_F4_MIB must be 0..2048");
     if (getenv("Q38P_TEST")) pf_test = atoi(getenv("Q38P_TEST"));
     if (getenv("Q38P_TAIL")) pf_tail_split = atoi(getenv("Q38P_TAIL"));
     if (getenv("Q38D_OQ_CMG")) oq_cmg = atoi(getenv("Q38D_OQ_CMG"));

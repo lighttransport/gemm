@@ -957,3 +957,56 @@ the NEON/SVE path 7.37 million rows/s on one worker. The slower candidate
 was not integrated. A second 4,096-entry pair lookup plus SVE conversion
 candidate was also exact but slower: 5.38 versus 11.64 million rows/s.
 Neither unpack variant was integrated into production.
+
+### Exact FP4 preexpansion on 12-node job 51934716
+
+The 32,768-token C-source review prompt was **fully evaluated**, one request
+through PP12, with Qwen3.8-27B NVFP4 and FP32 KV. The producer's prefill
+timer excludes model loading, state export, TP4 import, and decode. A new
+`Q38P_PREEXPAND_F4_MIB` option expands selected stage-owned FP4 weight
+matrices once into the same exact INT16 panels used by the existing GEMM. It
+defaults to zero and is limited to 2048 MiB per rank. The expanded panels are
+first-touched by workers on their owning CMG.
+
+| Configuration | Chunk | Prefill s | Total tok/s | Tok/s/node |
+| --- | ---: | ---: | ---: | ---: |
+| No preexpansion, original cuts | 160 | 31.354952 | 1045.066 | 87.089 |
+| No preexpansion, original cuts | 480 | 29.753986 | 1101.298 | 91.775 |
+| Full 3.5–4.0 GiB preexpansion, original cuts | 160 | 28.792208 | 1138.086 | 94.840 |
+| 2048 MiB cap, attention cost 2000 | 160 | 29.073732 | 1127.065 | 93.922 |
+| 2048 MiB cap, attention cost 1500 | 160 | 28.476962 | 1150.685 | 95.890 |
+| 2048 MiB cap, attention cost 1500 | 320 | 28.206088 | 1161.735 | 96.811 |
+| **2048 MiB cap, attention cost 1500** | **480** | **28.084219** | **1166.776** | **97.231** |
+
+The selected 480-token configuration is 5.94% faster than the same-chunk
+control. Its final residual hash (`e0e955e58b6353af`) and all 256 TP4
+continuation IDs and reported logits match the non-preexpanded control exactly.
+State export took 5.382 s, TP4 import 7.812 s, and 256-token generation
+ran at 60.481 tok/s; these are separate from prefill throughput.
+The 2 GiB cap preexpanded about 1.97–1.99 GiB and 15–17 FP4 matrices per
+rank. An unrestricted 3.5–4.0 GiB variant completed once at chunk 160, but
+subsequent runs at chunks 160 and 480 triggered real per-node OOM kills on
+different ranks, despite total RSS around 18 GiB. The A64FX HBM NUMA-domain
+limit makes that configuration unsafe. The 2 GiB cap completed the measured
+160, 320, and 480 runs.
+
+The profile at 480 has a 23.283 s busiest stage (16.025 s GEMM, 5.154 s
+attention), with 28.084 s total pipeline latency. Refitting the attention
+partition cost from 2000 to 1500 reduced long-stage imbalance. An experimental
+160-token first chunk followed by 480-token chunks gave 97.137 tok/s/node,
+so the extra scheduling option was removed. Exact prefill remains below the
+150 tok/s/node target; the stage's projection GEMM and attention are the
+largest measured costs.
+
+Reproduce on a staged 12-node allocation:
+
+```sh
+bash a64fx/llm/q38p/build_pp.sh
+Q38P_PP_ATTN_COST=1500 Q38P_PREEXPAND_F4_MIB=2048 \
+  HANDOFF_KV_I6=0 HANDOFF_TPS=4 \
+  bash a64fx/llm/q38p/run_handoff.sh tmp/q38p/new-preexpand32k \
+  32768 256 480 tmp/q38d-context-prompts/review_q38d_32768.txt
+```
+
+Run directories and per-rank profiles from job 51934716 are under remote
+`tmp/q38p/preexpand-*51934716/`. Use fresh output directories when rerunning.

@@ -6,8 +6,8 @@
  *  - Weights: every NVFP4 row of this model spans <= 6 binades of per-16
  *    scales, so a row is exactly int16 (|w| <= 12*15*2^6) times 2^(b_row-21).
  *    32-row x 512-column tiles are expanded from the decode F4 groups on the
- *    fly into an L1 buffer (no second weight copy). The few Q4_K/Q8_K
- *    matrices (ssm alpha/beta, attention k/v) are converted once to int16
+ *    fly into an L1 buffer, or preexpanded within an explicit HBM budget.
+ *    The few Q4_K/Q8_K matrices (ssm alpha/beta, attention k/v) convert once to int16
  *    tiles with a per-row scale (rounded, <= 2^-16 of the row maximum).
  *  - Activations: int16 per (token, 512-column block).
  * Microkernel q38p_mk_r4t5 (gen_pf.py): 32 rows x 5 tokens, weight tile
@@ -29,6 +29,7 @@ void q38p_mk_r4t5(const void *W, const void *A, const double *S, double *O, long
 static int pf_bench_depth, pf_bench_synthetic;
 static unsigned pf_bench_seed = 1;
 static int pf_on, pf_chunk = 240, pf_test, pp_on;
+static int pf_preexpand_f4_mib; /* stage-local F4 -> exact INT16 panels, bounded HBM budget */
 static int pf_attn_cmg = 1;  /* Q38P_ATTN_CMG=0: global query work queue */
 static int pf_attn_cache = 1;
 static int pf_attn_prof;
@@ -66,7 +67,7 @@ typedef struct {
     int *tile_c, *tile_r0;            /* CMG part and first local row of each tile */
     float *rscale;                    /* per global row */
     int8_t *rbase;                    /* F4: per global row base exponent */
-    int16_t *pre;                     /* non-F4: pre-expanded tiles [tile][kb][PF_STEPS][PF_R][32] */
+    int16_t *pre;                     /* pre-expanded tiles [tile][kb][PF_STEPS][PF_R][32] */
     const uint8_t **sub[NCMG];        /* F4: (group, K chunk) -> sub-group [g * kch + k] */
 } q38p_mat;
 
@@ -439,6 +440,8 @@ static void pf_gemm(int tid, const pf_job *jobs, int nj, int K, int *gs) {
 /* init                                                               */
 
 static float *pf_tmp[NT];     /* per-worker row scratch (NFF floats) */
+static q38p_mat *pf_preexpand_list[NLAYER * 12];
+static int pf_preexpand_count;
 static double pf_t[16];       /* thread-0 phase times */
 enum { PT_EMBED, PT_QUANT, PT_GEMM, PT_SSM, PT_ATTPREP, PT_ATT, PT_ELT, PT_HEAD, PT_N };
 static const char *pf_tname[PT_N] = {"embed", "norm+quant", "gemm", "ssm_core", "attn_prep", "attn", "eltwise", "head"};
@@ -532,6 +535,47 @@ static void pf_init(int tid, int *gs) {
         }
     }
     gbarrier(tid, gs);
+    if (pf_preexpand_f4_mib) {
+        uint64_t start = tid == 0 ? ticks() : 0;
+        if (tid == 0) {
+            size_t bytes = 0;
+            size_t limit = (size_t)pf_preexpand_f4_mib << 20;
+            for (int l = 0; l < NLAYER; l++) {
+                q38p_layer *P = &PL[l];
+                q38p_mat *m[] = {&P->qkv, &P->z, &P->alpha, &P->beta, &P->out,
+                                 &P->q, &P->k, &P->v, &P->o, &P->gate, &P->up, &P->down};
+                for (size_t i = 0; i < sizeof(m) / sizeof(m[0]); i++) {
+                    q38p_mat *p = m[i];
+                    if (!p->m || p->m->fmt != Q38D_F4) continue;
+                    size_t n = (size_t)p->ntile * (p->cols / PF_KB) * PF_STEPS * PF_R * 32 * sizeof(int16_t);
+                    if (n > limit - bytes) continue;
+                    bytes += n;
+                    p->pre = aligned_alloc(256, n);
+                    if (!p->pre) state_fail("PP preexpanded F4 allocation");
+                    pf_preexpand_list[pf_preexpand_count++] = p;
+                }
+            }
+            fprintf(stderr, "q38p_preexpand: matrices=%d bytes=%.3f GiB budget=%d MiB\n",
+                    pf_preexpand_count, (double)bytes / (double)(1ull << 30), pf_preexpand_f4_mib);
+        }
+        gbarrier(tid, gs);
+        int c = tid / PER, lane = tid % PER;
+        for (int i = 0; i < pf_preexpand_count; i++) {
+            q38p_mat *P = pf_preexpand_list[i];
+            int nkb = P->cols / PF_KB, local_tile = 0;
+            for (int t = 0; t < P->ntile; t++) {
+                if (P->tile_c[t] != c) continue;
+                if (local_tile++ % PER != lane) continue;
+                for (int kb = 0; kb < nkb; kb++)
+                    pf_expand(P, t, kb,
+                              P->pre + ((size_t)t * nkb + kb) * PF_STEPS * PF_R * 32);
+            }
+        }
+        gbarrier(tid, gs);
+        if (tid == 0)
+            fprintf(stderr, "q38p_preexpand: ready_s=%.3f\n",
+                    (double)(ticks() - start) / tick_hz());
+    }
 }
 
 /* exactness self-test of the tile expansion (Q38P_TEST=1) */
