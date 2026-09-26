@@ -9133,6 +9133,124 @@ static const char *hip_kernel_source =
 "        }\n"
 "    }\n"
 "}\n"
+"/* ssm_prep_f32 (register path) and matvec_f16_llama_pair_f32 in one launch.\n"
+" * Blocks [0, n_group) run the conv/L2-norm prep; each block after that owns\n"
+" * one F16 alpha/beta row with the pair kernel's exact FMA and reduction\n"
+" * order, then applies the softplus/sigmoid that block 0 of ssm_prep applied\n"
+" * to the stored value.  Nothing in the prep reads alpha/beta. */\n"
+"__global__ void ssm_prep_pair_f32(float *conv_out, float *conv_state,\n"
+"        const float *qkv_in, const float *conv_w,\n"
+"        float *alpha, float *beta, const float *dt_bias, const float *a_arr,\n"
+"        float *Q_exp, float *K_exp,\n"
+"        int qkv_dim, int conv_k, int d_state, int n_group, int dt_rank, float eps,\n"
+"        const half_raw *mat0, const half_raw *mat1, const float *x, int n_cols) {\n"
+"    int g = blockIdx.x; int tid = threadIdx.x;\n"
+"    if (g >= n_group) {\n"
+"        int row = g - n_group;\n"
+"        if (row >= 2 * dt_rank) return;\n"
+"        bool is_beta = row >= dt_rank;\n"
+"        const half_raw *mat = is_beta ? mat1 : mat0;\n"
+"        if (is_beta) row -= dt_rank;\n"
+"        int ncols2 = n_cols >> 1;\n"
+"        const unsigned int *rp = (const unsigned int *)(mat + (size_t)row * n_cols);\n"
+"        float sumf = 0.0f;\n"
+"        for (int col2 = tid; col2 < ncols2; col2 += blockDim.x) {\n"
+"            unsigned int tmpx = rp[col2];\n"
+"            float2 w = __half22float2(*(const __half2 *)&tmpx);\n"
+"            sumf = fmaf(w.x, x[2 * col2], sumf);\n"
+"            sumf = fmaf(w.y, x[2 * col2 + 1], sumf);\n"
+"        }\n"
+"        for (int off = 16; off > 0; off >>= 1) sumf += __shfl_xor(sumf, off);\n"
+"        __shared__ float buf_iw[32];\n"
+"        if (blockDim.x > 32) {\n"
+"            if (tid < 32) buf_iw[tid] = 0.0f;\n"
+"            __syncthreads();\n"
+"            buf_iw[tid >> 5] = sumf;\n"
+"            __syncthreads();\n"
+"            if (tid < 32) {\n"
+"                sumf = buf_iw[tid];\n"
+"                for (int off = 16; off > 0; off >>= 1) sumf += __shfl_xor(sumf, off);\n"
+"            }\n"
+"            __syncthreads();\n"
+"        }\n"
+"        if (tid == 0) {\n"
+"            if (!is_beta) {\n"
+"                float xx = sumf + dt_bias[row];\n"
+"                float sp = (xx > 20.0f) ? xx : logf(1.0f + expf(xx));\n"
+"                alpha[row] = sp * a_arr[row];\n"
+"            } else {\n"
+"                beta[row] = 1.0f / (1.0f + expf(-sumf));\n"
+"            }\n"
+"        }\n"
+"        return;\n"
+"    }\n"
+"    int v_per_blk = (qkv_dim - 2 * n_group * d_state) / n_group;\n"
+"    __shared__ float sq[256], sk[256];\n"
+"    int nch = 2 * d_state + v_per_blk;\n"
+"    float cw[3][4], cs[3][3], ci[3], cv[3];\n"
+"    int jj[3];\n"
+"#pragma unroll\n"
+"    for (int c = 0; c < 3; ++c) {\n"
+"        int t = tid + c * 256;\n"
+"        int j;\n"
+"        if (t < d_state) j = g * d_state + t;\n"
+"        else if (t < 2 * d_state) j = n_group * d_state + g * d_state + (t - d_state);\n"
+"        else j = 2 * n_group * d_state + g * v_per_blk + (t - 2 * d_state);\n"
+"        if (t >= nch) j = 0;\n"
+"        jj[c] = j;\n"
+"#pragma unroll\n"
+"        for (int f = 0; f < 4; ++f) cw[c][f] = conv_w[j * 4 + f];\n"
+"#pragma unroll\n"
+"        for (int f = 0; f < 3; ++f) cs[c][f] = conv_state[f * qkv_dim + j];\n"
+"        ci[c] = qkv_in[j];\n"
+"    }\n"
+"    __builtin_amdgcn_sched_barrier(0);\n"
+"#pragma unroll\n"
+"    for (int c = 0; c < 3; ++c) {\n"
+"        float sum = 0.0f;\n"
+"#pragma unroll\n"
+"        for (int f = 0; f < 3; f++) sum += cw[c][f] * cs[c][f];\n"
+"        sum += cw[c][3] * ci[c];\n"
+"        cv[c] = sum / (1.0f + expf(-sum));\n"
+"    }\n"
+"#pragma unroll\n"
+"    for (int c = 0; c < 3; ++c) {\n"
+"        int t = tid + c * 256, j = jj[c];\n"
+"        if (t >= nch) continue;\n"
+"        if (t >= 2 * d_state) conv_out[j] = cv[c];\n"
+"        conv_state[0 * qkv_dim + j] = cs[c][1];\n"
+"        conv_state[1 * qkv_dim + j] = cs[c][2];\n"
+"        conv_state[2 * qkv_dim + j] = ci[c];\n"
+"    }\n"
+"    float v0 = cv[0];\n"
+"    sq[tid] = tid < d_state ? v0 * v0 : 0.0f;\n"
+"    if (tid >= d_state) sk[tid] = 0.0f;\n"
+"    if (tid >= d_state && tid < 2 * d_state) sk[tid - d_state] = v0 * v0;\n"
+"    __syncthreads();\n"
+"    for (int s = 128; s >= 32; s >>= 1) {\n"
+"        if (tid < s) { sq[tid] += sq[tid + s]; sk[tid] += sk[tid + s]; }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    if (tid < 32) {\n"
+"        float a = sq[tid], b = sk[tid];\n"
+"        for (int s = 16; s > 0; s >>= 1) {\n"
+"            a += __shfl_down(a, s, 32); b += __shfl_down(b, s, 32);\n"
+"        }\n"
+"        if (tid == 0) { sq[0] = a; sk[0] = b; }\n"
+"    }\n"
+"    __syncthreads();\n"
+"    float iq = rsqrtf(sq[0] + eps), ik = rsqrtf(sk[0] + eps);\n"
+"    if (tid < d_state) {\n"
+"        float v = v0 * iq;\n"
+"        conv_out[g * d_state + tid] = v;\n"
+"        for (int h = g; h < dt_rank; h += n_group) Q_exp[h * d_state + tid] = v;\n"
+"    } else if (tid < 2 * d_state) {\n"
+"        int i = tid - d_state;\n"
+"        float v = v0 * ik;\n"
+"        conv_out[n_group * d_state + g * d_state + i] = v;\n"
+"        for (int h = g; h < dt_rank; h += n_group) K_exp[h * d_state + i] = v;\n"
+"    }\n"
+"}\n"
 "/* ---- Fused shared-expert decode (Q6_K): gate+up+silu, then down+scale-add. ---- */\n"
 "__global__ void shexp_gateup_silu_q6k(float *out, const unsigned char *gw,\n"
 "        const unsigned char *uw, const float *x, int eff, int n_cols) {\n"
@@ -13912,6 +14030,9 @@ struct hip_llm_runner {
     hipFunction_t fn_shexp_gateup_silu_q8;
     hipFunction_t fn_shexp_down_accum_q8;
     hipFunction_t fn_ssm_prep_f32;          /* decode: fused SSM aux chain */
+    hipFunction_t fn_ssm_prep_pair_f32;     /* + the F16 alpha/beta pair */
+    /* F16 alpha/beta pair deferred into the next ssm_prep launch. */
+    void *ssm_pair_w0, *ssm_pair_w1, *ssm_pair_x; int ssm_pair_rows, ssm_pair_cols;
     hipFunction_t fn_ssm_matvec4_q6k;       /* decode: fused 4 SSM input matvecs */
     hipFunction_t fn_ssm_matvec4_q6k_batch; /* prefill: exact per-token rows */
     hipFunction_t fn_matvec_qkv_q6k;        /* decode: fused attn q/k/v matvecs */
@@ -15098,6 +15219,9 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(ssm_inv_mean_f32);
     GET_FUNC(moe_route_decode);
     GET_FUNC(res_rmsnorm_f32);
+    if (hipModuleGetFunction(&r->fn_ssm_prep_pair_f32, r->module,
+                             "ssm_prep_pair_f32") != hipSuccess)
+        r->fn_ssm_prep_pair_f32 = NULL;
     if (hipModuleGetFunction(&r->fn_res_rmsnorm_q81_f32, r->module,
                              "res_rmsnorm_q81_f32") != hipSuccess)
         r->fn_res_rmsnorm_q81_f32 = NULL;
@@ -20126,6 +20250,14 @@ static inline void launch_matvec_llama_f16(hip_llm_runner *r, void *dst, void *m
     void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
     LAUNCH(r->fn_matvec_f16_llama_f32, n_rows, 1, 1, 256, 1, 1, 0,
            r->stream, args);
+}
+static inline int qwen35_ssm_pair_fold_enabled(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("LLM_QWEN35_SSM_PAIR_FOLD");
+        on = !e || atoi(e) != 0;
+    }
+    return on;
 }
 static inline void launch_matvec_llama_f16_pair(hip_llm_runner *r,
         void *dst0, void *dst1, void *mat0, void *mat1, void *x,
@@ -29944,6 +30076,27 @@ static void forward_dense_ssm_core(hip_llm_runner *r, hip_layer *cl, int l) {
     int n_group = r->ssm_n_group, dt_rank = r->ssm_dt_rank;
     int conv_k = r->ssm_conv_kernel;
     float eps = r->rms_norm_eps;
+    /* A deferred alpha/beta pair folds into the prep launch only on the
+     * register-path geometry; otherwise it runs here, before anything
+     * reads alpha/beta. */
+    int fold_pair = r->ssm_pair_w0 != NULL;
+    if (fold_pair) {
+        int v_per_blk = n_group ? (qkv_dim - 2 * n_group * d_state) / n_group : 0;
+        int foldable = conv_k == 4 && d_state <= 128 &&
+            2 * d_state + v_per_blk <= 3 * 256 &&
+            (r->ssm_fused_decode || (r->fn_qwen35_matvec_iq3xxs &&
+             !r->fn_qwen35_rmsnorm_reference)) &&
+            (qkv_dim - 2 * n_group * d_state) % n_group == 0 &&
+            dt_rank % n_group == 0;
+        if (!foldable) {
+            launch_matvec_llama_f16_pair(r, r->d_ssm_alpha, r->d_ssm_beta,
+                                         r->ssm_pair_w0, r->ssm_pair_w1,
+                                         r->ssm_pair_x, r->ssm_pair_rows,
+                                         r->ssm_pair_cols);
+            r->ssm_pair_w0 = NULL;
+            fold_pair = 0;
+        }
+    }
     debug_f32_state(r, l, "Q4 ssm_qkv", r->d_ssm_qkv, qkv_dim);
 
     /* Preparation is independent of the GDN reduction choice. Its
@@ -29959,7 +30112,14 @@ static void forward_dense_ssm_core(hip_llm_runner *r, hip_layer *cl, int l) {
                          &cl->ssm_conv1d_w, &r->d_ssm_alpha, &r->d_ssm_beta,
                          &cl->ssm_dt_bias, &cl->ssm_a,
                          &r->d_ssm_Q_exp, &r->d_ssm_K_exp,
-                         &qkv_dim, &conv_k, &d_state, &n_group, &dt_rank, &eps };
+                         &qkv_dim, &conv_k, &d_state, &n_group, &dt_rank, &eps,
+                         &r->ssm_pair_w0, &r->ssm_pair_w1, &r->ssm_pair_x,
+                         &r->ssm_pair_cols };
+        if (fold_pair) {
+            LAUNCH(r->fn_ssm_prep_pair_f32, n_group + 2 * dt_rank, 1, 1,
+                   256, 1, 1, 0, r->stream, args);
+            r->ssm_pair_w0 = NULL;
+        } else
         LAUNCH(r->fn_ssm_prep_f32, n_group, 1, 1, 256, 1, 1, 0, r->stream, args);
     } else {
         debug_f32_state(r, l, "Q4 gdn_alpha_raw", r->d_ssm_alpha, dt_rank);
@@ -30290,6 +30450,15 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
                 cl->ssm_beta_type == GGML_TYPE_F16 &&
                 cl->ssm_alpha_rows == cl->ssm_beta_rows &&
                 cl->ssm_alpha_cols == cl->ssm_beta_cols) {
+                if (r->fn_ssm_prep_pair_f32 && qwen35_ssm_pair_fold_enabled() &&
+                    cl->ssm_alpha_rows == r->ssm_dt_rank) {
+                    /* Folded into forward_dense_ssm_core's ssm_prep launch. */
+                    r->ssm_pair_w0 = cl->ssm_alpha_w;
+                    r->ssm_pair_w1 = cl->ssm_beta_w;
+                    r->ssm_pair_x = r->d_xb;
+                    r->ssm_pair_rows = cl->ssm_alpha_rows;
+                    r->ssm_pair_cols = cl->ssm_alpha_cols;
+                } else
                 launch_matvec_llama_f16_pair(r, r->d_ssm_alpha, r->d_ssm_beta,
                                              cl->ssm_alpha_w, cl->ssm_beta_w,
                                              r->d_xb, cl->ssm_alpha_rows,
@@ -31190,6 +31359,7 @@ static void forward_blocks_body(hip_llm_runner *r) {
                          r->decode_mode && r->graph_disabled;
     const char *fold_env = getenv("LLM_QWEN35_FOLD_RESIDUAL");
     r->pending_res_add = NULL;
+    r->ssm_pair_w0 = NULL;
     r->fold_res_scope = (!fold_env || atoi(fold_env) != 0) &&
         !r->is_qwen4exp && !r->is_gemma4 && !r->debug_layers &&
         !r->fn_qwen35_rmsnorm_reference && !r->_ds_embd &&
