@@ -1041,6 +1041,10 @@ class Handler(BaseHTTPRequestHandler):
             reasoning_text, answer = split_generation(text, thinking)
             tool_text, calls = parse_calls(answer, registry)
             text = tool_text if calls else answer
+            if not calls and "<tool_call>" in answer:
+                # The client receives this as plain text; make it visible.
+                sys.stderr.write("[tool-call] unparsed: " +
+                                 answer[answer.find("<tool_call>"):][:400].replace("\n", "\\n") + "\n")
             if api_path == "/v1/messages":
                 content = anthropic_api.response_content(reasoning_text, raw_turn, text, calls)
                 self.raw_turns.remember(raw_turn, text, calls,

@@ -48,6 +48,22 @@ pi 4,430 tokens in 9.2 s, Codex 2,321 in 5.0 s, Claude Code 13,185 in 26.5 s.
 The first Claude Code request then restored 13,185 tokens and finished in
 9.3 s, instead of about 38 s cold.
 
+### Three-agent task check
+
+Task: write a test for a stack library, add a `make test` Makefile target
+(`-fsanitize=address`), and fix the library. It has two planted bugs:
+`realloc` without `sizeof(int)`, and `pop` reading one past the top.
+
+| Agent | Result | Wall | Notes |
+| --- | --- | ---: | --- |
+| Claude Code | both bugs fixed, `make test` passes | 69 s | 9 turns, 117K cached / 6.4K uncached input |
+| Codex | both fixed, passes | 252 s | Codex's workspace-write sandbox blocks `ptrace`, so LeakSanitizer fails; the model diagnosed it and set `ASAN_OPTIONS=detect_leaks=0` |
+| pi | both fixed (`data[--s->size]`), passes | 252 s | |
+
+The shim now logs `[tool-call] unparsed: ...` when the model writes
+`<tool_call>` but no call parses; the client then receives plain text. No
+such case occurred in these runs.
+
 ## pi coding agent via its llama.cpp extension — 2026-09-27
 
 pi's built-in llama.cpp extension (pi 0.87.1) talks to a llama.cpp router
