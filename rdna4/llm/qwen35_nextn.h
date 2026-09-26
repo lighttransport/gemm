@@ -53,6 +53,8 @@ typedef struct hllm_qwen35_mtp {
     void *verify_x, *verify_logits, *verify_positions, *verify_argmax;
     void *verify_norm, *verify_gate, *verify_up;
     void *verify_q, *verify_scales;
+    /* verify_q holds Q8_1 of vq_src while hllm_launch_seq == vq_seq. */
+    void *vq_src; int vq_nc, vq_rows; unsigned long long vq_seq;
     void *verify_ssm_qkv, *verify_ssm_z, *verify_ssm_alpha, *verify_ssm_beta, *verify_ssm_out;
     void *verify_attn_parts, *verify_attn_meta;
     void *verify_conv[128], *verify_rec[128];
@@ -443,9 +445,18 @@ static void hllm_dense_mtp_projection(hip_llm_runner *r, void *dst, void *w,
          * projections.  Always restage it: pointer identity does not imply
          * that an earlier graph node's contents survive later scratch writes. */
         int total = rows*nc;
-        void *qa[] = { &m->verify_q, &m->verify_scales, &x, &total };
-        LAUNCH(r->fn_qwen35_quantize_q81, total/32, 1, 1, 32, 1, 1, 0,
-               r->stream, qa);
+        /* ...but a projection issued immediately after another one of the
+         * same source (SSM qkv+z, attention q/k/v, FFN gate+up) may reuse
+         * it: nothing else was launched in between. */
+        const char *vq_env = getenv("LLM_QWEN35_VERIFY_Q81_REUSE");
+        int vq_reuse = (!vq_env || atoi(vq_env) != 0) &&
+            m->vq_src == x && m->vq_nc == nc && m->vq_rows == rows &&
+            m->vq_seq == hllm_launch_seq;
+        if (!vq_reuse) {
+            void *qa[] = { &m->verify_q, &m->verify_scales, &x, &total };
+            LAUNCH(r->fn_qwen35_quantize_q81, total/32, 1, 1, 32, 1, 1, 0,
+                   r->stream, qa);
+        }
         void *a[] = { &dst, &w, &m->verify_q, &m->verify_scales, &nr, &nc };
         if (type == GGML_TYPE_Q2_K) {
             if (rows == HLLM_DENSE_MTP_REUSE_ROWS) {
@@ -503,6 +514,10 @@ static void hllm_dense_mtp_projection(hip_llm_runner *r, void *dst, void *w,
                        r->stream, ma);
             }
         } else LAUNCH(fn, (nr+7)/8, rows, 1, 256, 1, 1, 0, r->stream, a);
+        m->vq_src = x; m->vq_nc = nc; m->vq_rows = rows;
+        m->vq_seq = hllm_launch_seq;
+        r->q8x2_reuse_valid = r->iq1_q8_valid = r->batch_q8_valid = 0;
+        return;
     } else {
         for (int i = 0; i < rows; ++i)
             launch_matvec_ffn_auto(r, (float *)dst+(size_t)i*nr, w,
