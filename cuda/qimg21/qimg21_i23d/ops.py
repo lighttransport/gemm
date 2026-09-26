@@ -448,7 +448,7 @@ def turnaround_prompt(subject: str, views: int = 4, background: str = "transpare
 
 def generate_turnaround(root, backend: Backend, *, prompt: str | None = None, reference=None, views: int = 4,
                         size: int = 512, fill: float = 0.85, steps: int = 20, seed: int = 0,
-                        negative_prompt: str | None = None) -> dict:
+                        negative_prompt: str | None = None, sheet=None) -> dict:
     """Consistent posed views of a character from ONE turnaround sheet.
 
     Views generated one by one (generate_views) drift: each is a separate
@@ -460,11 +460,15 @@ def generate_turnaround(root, backend: Backend, *, prompt: str | None = None, re
     with one shared scale and ground line (imageops.split_sheet) and written
     as a dataset: views/view_aNNN.png, sheet.png, metadata.json,
     transforms.json (front view first; cameras requested, not calibrated),
-    validation.json."""
+    validation.json.
+
+    sheet: an existing turnaround sheet (RGBA, one row, views in the order
+    above -- e.g. drawn by hand or kept from an earlier run) to split instead
+    of generating one."""
     if views not in TURNAROUND_VIEWS:
         raise ValueError(f"views must be one of {sorted(TURNAROUND_VIEWS)}")
-    if not prompt and reference is None:
-        raise ValueError("a turnaround needs a prompt, a reference image, or both")
+    if not prompt and reference is None and sheet is None:
+        raise ValueError("a turnaround needs a prompt, a reference image, or an existing sheet")
     root = Path(root)
     (root / "views").mkdir(parents=True, exist_ok=True)
     subject = prompt or "the character in the reference image"
@@ -473,10 +477,21 @@ def generate_turnaround(root, backend: Backend, *, prompt: str | None = None, re
                     "details")
     text = turnaround_prompt(subject, views)
     started = time.perf_counter()
-    result = backend.generate(GenRequest(prompt=text, out=root / "sheet.png", width=size * views, height=size,
-                                         steps=steps, seed=seed, references=(Path(reference),) if reference else (),
-                                         negative_prompt=negative_prompt))
-    panels, boxes = imageops.split_sheet(imageops.load_rgba(root / "sheet.png"), views, size=size, fill=fill)
+    if sheet is not None:
+        imageops.save_png(imageops.load_rgba(sheet), root / "sheet.png")
+        text, backend_name = None, "given sheet"
+    else:
+        result = backend.generate(GenRequest(prompt=text, out=root / "sheet.png", width=size * views, height=size,
+                                             steps=steps, seed=seed,
+                                             references=(Path(reference),) if reference else (),
+                                             negative_prompt=negative_prompt))
+        backend_name = result.backend
+    # Front/back (and left/right profile) are 180 degrees apart: register
+    # each opposite view on its partner's mirror image.
+    registration: list = []
+    panels, boxes = imageops.split_sheet(imageops.load_rgba(root / "sheet.png"), views, size=size, fill=fill,
+                                         register=((0, 2), (1, 3)) if views == 4 else ((0, 2),),
+                                         report=registration)
     frames, files, records = [], [], []
     for (azimuth, words), panel, box in zip(TURNAROUND_VIEWS[views], panels, boxes):
         spec = viewlib.ViewSpec(azimuth_deg=azimuth, width=size, height=size, tags={"turnaround": True}).validated()
@@ -491,8 +506,8 @@ def generate_turnaround(root, backend: Backend, *, prompt: str | None = None, re
     report = validate_dataset(root, files, width=size, height=size, expect_alpha=True)
     summary = {"root": str(root), "views": records, "prompt": text, "seed": seed, "steps": steps,
                "reference": str(reference) if reference else None, "sheet": "sheet.png",
-               "seconds": round(time.perf_counter() - started, 3), "backend": result.backend,
-               "validation": report["summary"],
+               "seconds": round(time.perf_counter() - started, 3), "backend": backend_name,
+               "validation": report["summary"], "registration": registration,
                "camera_parameters": "requested view metadata, not calibration: panels of one generated "
                                     "turnaround sheet, framed with one shared scale and ground line"}
     (root / "metadata.json").write_text(json.dumps(summary, indent=2, default=str) + "\n")

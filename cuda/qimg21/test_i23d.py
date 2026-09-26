@@ -586,6 +586,35 @@ class TurnaroundTest(Tmp):
         with self.assertRaisesRegex(imageops.MaskError, "3 separate figures"):
             imageops.split_sheet(sheet_image([200, 120, 200]), 4)
 
+    def test_registration_puts_opposite_views_on_one_axis(self):
+        # Front: a body with a prop on one side; back: the body alone (the prop
+        # hidden), like the jester's lantern. Centring each bbox shifts the
+        # back's body by half the prop; mirror registration undoes that.
+        h, w = 512, 1400
+        yy, xx = np.mgrid[0:h, 0:w]
+        sheet = np.zeros((h, w, 4), np.uint8)
+        def body(cx):
+            return ((xx - cx) / 90.0) ** 2 + ((yy - 256) / 200.0) ** 2 <= 1
+        sheet[body(250)] = (200, 60, 90, 255)
+        sheet[(xx >= 340) & (xx < 420) & (yy > 200) & (yy < 300)] = (40, 40, 200, 255)   # the prop
+        sheet[body(800)] = (200, 60, 90, 255)
+        report = []
+        plain, _ = imageops.split_sheet(sheet, 2, size=512)
+        views, _ = imageops.split_sheet(sheet, 2, size=512, register=((0, 1),), report=report)
+
+        def body_centre(view):
+            row = view[256, :, 3] > 127            # through the body and the prop
+            red = row & (view[256, :, 2] < 150)
+            xs = np.nonzero(red)[0]
+            return (xs.min() + xs.max()) / 2
+
+        # The back is mirrored: its body centre should mirror the front's about the canvas centre.
+        front = body_centre(views[0])
+        self.assertGreater(abs(body_centre(plain[1]) - (511 - front)), 10)     # misregistered when centred
+        self.assertLessEqual(abs(body_centre(views[1]) - (511 - front)), 2)    # registered
+        self.assertGreater(report[0]["mirror_iou"], report[0]["mirror_iou_centred"])
+        self.assertNotEqual(report[0]["shift_px"], 0)
+
     def test_turnaround_dataset(self):
         backend = SheetBackend()
         root = self.dir / "turn"

@@ -194,8 +194,9 @@ def cmd_turntable(args):
 
 def make_reconstructors(args):
     from qimg21_i23d import reconstruct
-    settings = reconstruct.ReconSettings(seed=args.recon_seed, texture_size=args.texture_size,
-                                         triangle_target=args.triangle_target, vram_budget_mib=args.vram_budget_mib)
+    settings = reconstruct.ReconSettings.preset(
+        args.quality, seed=args.recon_seed, texture_size=args.texture_size, triangle_target=args.triangle_target,
+        vram_budget_mib=args.vram_budget_mib, flow_precision=args.flow_precision, gpu_kernels=args.gpu_kernels)
     runners = reconstruct.make_reconstructors(args.reconstruct, args.pixal3d_backend, settings)
     for runner in runners:
         ok, missing = runner.available()
@@ -236,11 +237,12 @@ def cmd_image_to_3d(args):
 
 def cmd_turnaround(args):
     runners = make_reconstructors(args)
-    if not args.prompt and not args.input:
-        raise SystemExit("give --prompt, --input (a reference image of the character), or both")
-    backend = make_backend(args, 1 if args.input else 0)
+    if not args.prompt and not args.input and not args.sheet:
+        raise SystemExit("give --prompt, --input (a reference image of the character), or --sheet")
+    backend = backends.MockBackend() if args.sheet else make_backend(args, 1 if args.input else 0)
     summary = ops.generate_turnaround(args.output, backend, prompt=args.prompt, reference=args.input,
-                                      views=args.views, size=args.size, steps=args.steps, seed=args.seed)
+                                      views=args.views, size=args.size, steps=args.steps, seed=args.seed,
+                                      sheet=args.sheet)
     if runners:
         backend.close()
         mode = args.recon_mode if args.recon_mode_given else "multiview"
@@ -293,9 +295,16 @@ def add_reconstruct_options(parser, default: str):
                        help="elevation rings whose views go to Pixal3D, comma-separated, or 'all' (default 0)")
     group.add_argument("--recon-max-frames", type=int, default=16, help="frames given to Pixal3D (at most 16)")
     group.add_argument("--recon-seed", type=int, default=42)
-    group.add_argument("--texture-size", type=int, default=4096, choices=(1024, 2048, 4096))
-    group.add_argument("--triangle-target", type=int, default=1_000_000)
+    group.add_argument("--quality", default="standard", choices=("preview", "standard", "high"),
+                       help="preview: 1024 texture, 300k triangles, BF16 flow (~25%% faster, same shape); "
+                            "standard: 2048, 1M; high: 4096, 1M. The flags below override it")
+    group.add_argument("--texture-size", type=int, choices=(1024, 2048, 4096))
+    group.add_argument("--triangle-target", type=int)
     group.add_argument("--vram-budget-mib", type=int, help="native Pixal3D device-memory budget")
+    group.add_argument("--flow-precision", choices=("mixed", "bf16", "fp32"),
+                       help="native Pixal3D flow-transformer precision")
+    group.add_argument("--gpu-kernels", default="auto", choices=("auto", "blas", "mma"),
+                       help="native Pixal3D GEMM kernels (default auto)")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -404,6 +413,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--prompt", help="the character, e.g. 'a cute chibi bunny with a pink scarf'")
     p.add_argument("--input", help="a reference image of the character (with or without --prompt)")
     p.add_argument("--output", required=True, help="dataset directory")
+    p.add_argument("--sheet", help="split this existing turnaround sheet (RGBA, one row, in the view order below) "
+                                   "instead of generating one")
     p.add_argument("--views", type=int, default=4, choices=(3, 4),
                    help="4: front, left, back, right; 3: front, left, back")
     p.add_argument("--size", type=int, default=512, help="view size in pixels (the sheet is size x views*size)")

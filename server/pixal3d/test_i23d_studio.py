@@ -147,6 +147,18 @@ class StudioTest(unittest.TestCase):
         with self.assertRaises(StudioError):
             self.run_stage(stage="turnaround", session=sid, count=5)
 
+    def test_quality_presets_reach_the_runner(self):
+        seen = []
+        self.studio._runner_factory = lambda name, settings: seen.append(settings) or FakeRunner(name, self.log)
+        sid = self.run_stage(stage="text", prompt="a cup", steps=2)["session"]
+        self.run_stage(stage="reconstruct", session=sid, quality="preview", fov=20)
+        self.run_stage(stage="reconstruct", session=sid, quality="high", triangle_target=500000, fov=20)
+        self.assertEqual([(s.texture_size, s.triangle_target, s.flow_precision) for s in seen],
+                         [(1024, 300000, "bf16"), (4096, 500000, "mixed")])
+        self.assertEqual(self.studio.state(sid)["models"][-1]["quality"], "high")
+        with self.assertRaises(StudioError):
+            self.run_stage(stage="reconstruct", session=sid, quality="ultra")
+
     def test_multiview_needs_views_of_the_current_object(self):
         sid = self.run_stage(stage="text", prompt="a lamp", steps=2)["session"]
         self.run_stage(stage="views", session=sid, count=2, steps=2)

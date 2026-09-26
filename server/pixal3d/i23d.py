@@ -399,12 +399,13 @@ class Studio:
         fov = request.get("fov")
         if fov is not None:
             fov = _float(request, "fov", 20.0, 5.0, 120.0)
-        settings = reconstruct.ReconSettings(
-            seed=_int(request, "seed", 42, 0, 2**32 - 1),
-            texture_size=_int(request, "texture_size", 2048, 1024, 4096),
-            triangle_target=_int(request, "triangle_target", 1_000_000, 10_000, 5_000_000))
+        quality = request.get("quality", "standard")
         try:
-            settings.validate()
+            settings = reconstruct.ReconSettings.preset(
+                quality, seed=_int(request, "seed", 42, 0, 2**32 - 1),
+                texture_size=_int(request, "texture_size", None, 1024, 4096) if "texture_size" in request else None,
+                triangle_target=_int(request, "triangle_target", None, 10_000, 5_000_000)
+                if "triangle_target" in request else None)
         except ValueError as exc:
             raise StudioError(str(exc)) from None
         runners = [self._runner_factory(name, settings) for name in ("native", "reference")
@@ -423,7 +424,7 @@ class Studio:
             self.root / record["id"] / current
         result = ops.reconstruct_3d(source, out, runners, mode=mode, fov_deg=fov)
         base = out.relative_to(self.root / record["id"]).as_posix()
-        model = {"of": current, "mode": mode, "camera": result.get("camera"),
+        model = {"of": current, "mode": mode, "quality": quality, "camera": result.get("camera"),
                  "comparison": result.get("comparison"), "at": time.time(),
                  "runs": [{"runner": r["runner"], "file": f"{base}/{Path(r['output']).name}",
                            "seconds": r["seconds"], "mesh": r["mesh"]} for r in result["runs"]]}

@@ -285,8 +285,23 @@ Running it:
   it has the device to itself.
 - `--reconstruct both` also runs `ref/pixal3d/compare_outputs.py`
   (symmetric Chamfer between the two meshes).
-- `--texture-size`, `--triangle-target`, `--recon-seed` and
-  `--vram-budget-mib` pass through.
+- `--quality preview|standard|high` picks the Pixal3D output settings:
+
+  | quality | texture | triangles | flow | bunny multiview |
+  |---|---|---|---|---|
+  | `preview` | 1024 | 300k | BF16 | ~175 s |
+  | `standard` (default) | 2048 | 1M | mixed | 233 s |
+  | `high` | 4096 | 1M | mixed | — |
+
+  On the bunny, the reduced settings changed the shape by Chamfer RMS
+  0.0031 (300k triangles) and 0.0037 (BF16 flow) against standard, for an
+  object about 0.9 units tall. Most of Pixal3D's time is diffusion
+  (~90–120 s) plus CPU post-processing (~50–80 s: simplification, BVH
+  builds and UV unwrapping, which the triangle count drives). BF16 flow
+  saved only ~5 s of diffusion.
+- `--texture-size`, `--triangle-target`, `--flow-precision`,
+  `--gpu-kernels`, `--recon-seed` and `--vram-budget-mib` override the
+  preset.
 - A runner whose binary, environment or weights are missing is reported
   before any image work starts.
 
@@ -382,23 +397,37 @@ right:
 Seed 12 dropped the props from the side and back views, so try a couple of
 seeds.
 
-Reconstruction reversed the bunny's outcome:
-- **Single view** from the front panel (225 s) gave the better model: the
-  reference's colors, a plausible back with no face, and props in place.
-- **Multiview** (234 s) turned the hat magenta and had a few stray quads.
+**Registration.** At first, multiview reconstruction lost to single view
+here:
+- single view from the front panel (225 s) gave the reference's colors and a
+  plausible back;
+- multiview (234 s) turned the hat magenta and had stray quads.
 
-Each panel is centred on its bounding box. For a character with big
-asymmetric parts (lantern, hat tips, orb), that isn't where the turning
-axis is, so the four textures blend slightly off-target (red over blue
-gives magenta). A compact, near-symmetric figure like the bunny doesn't
-show this.
+The cause was registration. Each panel was centred on its own bounding box,
+and for a character with big one-sided parts that isn't the turning axis.
+The back view (which hides the lantern) sat 19 px off, so the four textures
+blended off-target (red over blue gives magenta).
 
-Rule of thumb:
-- a turnaround sheet always gives consistent views, for previews and
-  datasets;
-- reconstruct compact, symmetric characters in multiview, and characters
-  with large asymmetric props in single view;
-- or run both (two ~4-minute runs) and keep the better one. Generating a
+Opposite views are mirror images of each other in an orthographic
+turnaround. `split_sheet(register=…)` therefore shifts the back until its
+mirror best overlaps the front, and the right profile likewise against the
+left (`imageops.mirror_shift`, within ±15% of the width, and only when the
+overlap clearly improves). The shifts and IoUs are recorded in
+`metadata.json` as `registration`:
+
+| character | back vs front | right vs left |
+|---|---|---|
+| jester | shifted 19 px, mirror IoU 0.459 → 0.526 | shifted 7 px, 0.703 → 0.768 |
+| bunny | 0 px (0.935) | 0 px (0.899) |
+
+Re-reconstructed with registration, the jester's multiview model (254 s)
+lost the magenta and the stray quads. The hat is red/blue striped, the
+lantern keeps its glow, and the back is real; it's now on par with single
+view. `turnaround` reconstructs in multiview by default.
+
+`turnaround --sheet SHEET.png` splits an existing sheet instead of
+generating one. That can be a sheet kept from an earlier run, or a
+hand-drawn turnaround in the same view order. Generating a
 sheet wider than 1024 px also needed a driver fix: the default VAE decode
 tile is now clamped to the short side.
 
@@ -535,10 +564,11 @@ took 262 s wall.
   scale, or consistency with the requested camera. `transforms.json` holds
   requested cameras, never calibration, and must not be used as ground
   truth.
-- **Turnaround panels are centred per view.** Their horizontal registration
-  follows each panel's bounding box, not the character's turning axis,
-  which blurs multiview textures for asymmetric characters (see the
-  jester).
+- **Turnaround registration is silhouette-based.** Opposite views are
+  aligned by mirror overlap, which assumes near-orthographic panels and
+  similar silhouettes. When the model draws the back quite differently from
+  the front (the jester's mirror IoU is 0.53), registration can only
+  partly fix it.
 - **Generated views are not calibrated views.**
   - Views generated one at a time, posed as cameras for Pixal3D multiview,
     made the mesh worse than the single input view (see [the

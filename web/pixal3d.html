@@ -62,7 +62,7 @@ button{background:var(--accent);border:0;color:#06271f;font-weight:800;cursor:po
 <div class="panel"><h2>4 · 3D with Pixal3D</h2>
 <div class="grid2"><div><label for="st-runner">Runner</label><select id="st-runner"><option value="native">Native CUDA runner</option><option value="reference">PyTorch reference</option><option value="both">Both, compared</option></select></div>
 <div><label for="st-mode">Input</label><select id="st-mode"><option value="single">Current object, single view (recommended)</option><option value="multiview">Object + views, posed (use with a turnaround)</option></select></div></div>
-<div class="grid3"><div><label for="st-fov">FOV °</label><input id="st-fov" type="number" min="5" max="120" placeholder="auto (MoGe-2)"></div><div><label for="st-texture">Texture</label><select id="st-texture"><option>1024</option><option selected>2048</option><option>4096</option></select></div><div><label for="st-tris">Triangles</label><input id="st-tris" type="number" min="10000" max="5000000" step="10000" value="1000000"></div></div>
+<div class="grid3"><div><label for="st-fov">FOV °</label><input id="st-fov" type="number" min="5" max="120" placeholder="auto (MoGe-2)"></div><div><label for="st-quality">Quality</label><select id="st-quality" title="preview: 1024 texture, 300k triangles, BF16 flow (~25% faster, same shape); standard: 2048, 1M; high: 4096, 1M"><option value="preview">Preview (faster)</option><option value="standard" selected>Standard</option><option value="high">High (4K texture)</option></select></div><div><label for="st-tris">Triangles</label><input id="st-tris" type="number" min="10000" max="5000000" step="10000" placeholder="preset"></div></div>
 <p class="hint">Single view is the safe default: separately generated views measured worse than the object alone (Chamfer 0.063 vs 0.024 against real views) because they drift. A turnaround sheet's views are consistent, so they can go to Pixal3D posed.</p>
 <div class="actions st-actions"><button type="button" class="run" id="st-build">Build 3D model</button><button type="button" class="cancel" id="st-cancel" hidden>Cancel</button></div></div>
 </div>
@@ -213,7 +213,7 @@ function render(st){
   const m=st.models[st.models.length-1];$('st-model-panel').hidden=!m;
   if(m){
     $('st-models').classList.toggle('one',m.runs.length===1);$('st-models').replaceChildren(...m.runs.map(run=>{const w=document.createElement('div');w.className='model-wrap';const b=document.createElement('b');b.textContent=run.runner==='native'?'Native Pixal3D':'PyTorch reference';const mv=document.createElement('model-viewer');for(const a of ['camera-controls','auto-rotate'])mv.setAttribute(a,'');mv.setAttribute('shadow-intensity','1');mv.setAttribute('interaction-prompt','none');mv.src=run.url;const d=document.createElement('a');d.className='download';d.href=run.url;d.download='object-'+run.runner+'.glb';d.textContent='Download '+run.runner+' GLB';w.append(b,mv,d);return w}));
-    const lines=['Input: '+(m.mode==='single'?'current object, single view':'object + generated views')+' ('+m.of+')'];
+    const lines=['Input: '+(m.mode==='single'?'current object, single view':'object + views, posed')+' ('+m.of+') · quality '+(m.quality||'standard')];
     if(m.camera)lines.push('Camera FOV: '+(m.camera.fov_rad*180/Math.PI).toFixed(1)+'° ('+m.camera.source+')');
     for(const r of m.runs)lines.push(r.runner+': '+r.seconds.toFixed(0)+' s · '+r.mesh.vertices.toLocaleString()+' vertices · '+r.mesh.triangles.toLocaleString()+' triangles');
     if(m.comparison)lines.push('Native vs reference: symmetric Chamfer RMS '+m.comparison.symmetric_chamfer_rms.toFixed(4));
@@ -229,7 +229,7 @@ async function makeObject(){
   const file=$('st-photo').files[0];if(!file)throw new Error('Choose a photo first');
   return stage({stage:'upload',image_upload:await uploadFile(file),method:$('st-method').value,...common()});
 }
-function buildBody(){const body={stage:'reconstruct',runner:$('st-runner').value,mode:$('st-mode').value,texture_size:Number($('st-texture').value),triangle_target:Number($('st-tris').value)};if($('st-fov').value)body.fov=Number($('st-fov').value);return body}
+function buildBody(){const body={stage:'reconstruct',runner:$('st-runner').value,mode:$('st-mode').value,quality:$('st-quality').value};if($('st-tris').value)body.triangle_target=Number($('st-tris').value);if($('st-fov').value)body.fov=Number($('st-fov').value);return body}
 $('st-make').onclick=()=>act(S.source==='text'?'Generating the object':'Extracting the object',makeObject);
 $('st-oneclick').onclick=()=>act('Text → 3D',async()=>{const r=await makeObject();render(r.state);status('Object ready · building the 3D model…');return stage(buildBody())});
 $('st-apply').onclick=()=>act('Editing',()=>{const instruction=$('st-edit').value.trim();if(!instruction)throw new Error('Write an edit instruction');const body={stage:'edit',instruction,strength:Number($('st-strength').value),...common()};if($('st-region').checked){if(!S.box)throw new Error('Drag a box on the object, or untick "Only inside a box"');body.rect=S.box}return stage(body)});

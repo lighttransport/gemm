@@ -263,7 +263,7 @@ The stages and their fields:
 | `edit` | `instruction`, `strength` (0.05–1), `rect` `[x, y, w, h]` in object pixels, `feather` |
 | `views` | `count` (2–24), `elevation` |
 | `turnaround` | `count` (3 or 4), `prompt` (optional character description), `steps`, `seed` |
-| `reconstruct` | `runner` (`native`/`reference`/`both`), `mode` (`single`/`multiview`), `fov` (degrees; omitted means MoGe-2), `texture_size`, `triangle_target`, `seed` |
+| `reconstruct` | `runner` (`native`/`reference`/`both`), `mode` (`single`/`multiview`), `quality` (`preview`/`standard`/`high`), `fov` (degrees; omitted means MoGe-2), `texture_size`, `triangle_target` (override the preset), `seed` |
 
 Other session routes:
 - `GET /v1/i23d/sessions/SID`: the history, views and models, with URLs.

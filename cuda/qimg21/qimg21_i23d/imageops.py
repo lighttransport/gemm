@@ -229,8 +229,33 @@ def snap_size(width: int, height: int, area: int | None = None, multiple: int = 
             max(256, int(round(height / multiple)) * multiple))
 
 
+def mirror_shift(reference: np.ndarray, other: np.ndarray, *, span: int) -> tuple[int, float, float]:
+    """The horizontal shift of `other` (an opposite view's alpha mask) whose
+    mirror image best overlaps `reference`: (shift, IoU there, IoU at 0).
+
+    In an orthographic view pair 180 degrees apart (front/back, left/right
+    profile) each silhouette is the other's mirror image, so the best shift
+    puts both views on one turning axis."""
+    mirrored = other[:, ::-1]
+    width = reference.shape[1]
+
+    def iou(shift):
+        moved = np.zeros_like(mirrored)
+        if shift >= 0:
+            moved[:, shift:] = mirrored[:, :width - shift]
+        else:
+            moved[:, :shift] = mirrored[:, -shift:]
+        return (reference & moved).sum() / max(1, (reference | moved).sum())
+
+    scores = {shift: iou(shift) for shift in range(-span, span + 1)}
+    best = max(scores, key=lambda k: (scores[k], -abs(k)))
+    # The mask was mirrored: moving the mirror by +s moves the view by -s.
+    return -best, scores[best], scores[0]
+
+
 def split_sheet(rgba: np.ndarray, count: int, *, size: int = 512, fill: float = 0.85, min_gap: int = 8,
-                threshold: int = 16) -> tuple[list[np.ndarray], list[tuple]]:
+                threshold: int = 16, register: tuple = (),
+                report: list | None = None) -> tuple[list[np.ndarray], list[tuple]]:
     """Split a one-row sheet of `count` views of one object (a turnaround
     sheet on a transparent background) into square RGBA views.
 
@@ -238,8 +263,13 @@ def split_sheet(rgba: np.ndarray, count: int, *, size: int = 512, fill: float = 
     min_gap merged. All views get ONE scale (the largest view's longest side
     fills `fill` of the canvas) and one ground line, so relative sizes -- a
     profile being wider or narrower than the front -- survive; each is
-    centred horizontally. Returns the views and their sheet boxes
-    (x0, y0, x1, y1)."""
+    centred horizontally. `register` lists (reference, opposite) view index
+    pairs 180 degrees apart: the opposite view is then shifted so its mirror
+    image best overlaps the reference (mirror_shift), which puts both on one
+    turning axis -- bounding-box centring alone misplaces a view with large
+    one-sided parts. A shift is applied only when it clearly improves the
+    overlap; `report` receives one dict per pair. Returns the views and
+    their sheet boxes (x0, y0, x1, y1)."""
     alpha = rgba[..., 3] > threshold
     columns = np.append(alpha.any(axis=0), False)
     runs, start = [], None
@@ -272,4 +302,19 @@ def split_sheet(rgba: np.ndarray, count: int, *, size: int = 512, fill: float = 
         left, top = (size - w) // 2, max(0, round(ground - h))
         canvas[top:top + h, left:left + w] = resize_rgba(rgba[y0:y1, x0:x1], w, h)[:size - top]
         views.append(canvas)
+    for reference, opposite in register:
+        shift, after, before = mirror_shift(views[reference][..., 3] > 127, views[opposite][..., 3] > 127,
+                                            span=max(1, size * 15 // 100))
+        applied = shift if after > before + 0.01 else 0
+        if applied:
+            moved = np.zeros_like(views[opposite])
+            if applied > 0:
+                moved[:, applied:] = views[opposite][:, :size - applied]
+            else:
+                moved[:, :applied] = views[opposite][:, -applied:]
+            views[opposite] = moved
+        if report is not None:
+            report.append({"reference": reference, "view": opposite, "shift_px": applied,
+                           "mirror_iou": round(float(after if applied else before), 4),
+                           "mirror_iou_centred": round(float(before), 4)})
     return views, boxes
