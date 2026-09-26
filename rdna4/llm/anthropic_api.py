@@ -29,7 +29,7 @@ def thinking_request(req):
         return True, config["effort"]
     budget = thinking.get("budget_tokens")
     effort = "xhigh"
-    if isinstance(budget, int):
+    if isinstance(budget, (int, float)) and not isinstance(budget, bool):
         for limit, name in EFFORT_BY_BUDGET:
             if budget <= limit:
                 effort = name
@@ -86,7 +86,9 @@ def request_messages(req):
         if not isinstance(message, dict):
             continue
         role = message.get("role")
-        content = message.get("content", "")
+        content = message.get("content")
+        if content is None:
+            content = ""
         if role == "assistant":
             turn = {"role": "assistant", "content": "", "tool_calls": []}
             blocks = content if isinstance(content, list) else [{"type": "text", "text": content}]
@@ -103,7 +105,7 @@ def request_messages(req):
                             turn["raw_ref"] = block["signature"]
                         turn["reasoning_content"] = block.get("thinking", "")
                 elif kind == "text":
-                    turn["content"] += block.get("text", "")
+                    turn["content"] += block.get("text") or ""
                 elif kind == "tool_use":
                     turn.setdefault("call_ids", []).append(block.get("id"))
                     turn["tool_calls"].append({"name": block.get("name", ""),

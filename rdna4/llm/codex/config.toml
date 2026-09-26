@@ -1,7 +1,8 @@
 # Codex profile for the local Qwen3.8-27B server (rdna4/llm/codex_server.py).
 # Use:  CODEX_HOME=<dir containing this file> codex exec ...
 # model_catalog_json must be an absolute path; run_qwen38_27b_codex.sh
-# rewrites it when it installs this profile.
+# points it at a copy in the profile directory whose context window it
+# rewrites on every start to match the server's --context.
 model = "qwen3.8-27b"
 model_provider = "local-qwen"
 model_reasoning_effort = "medium"

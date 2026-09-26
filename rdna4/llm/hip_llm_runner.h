@@ -181,6 +181,11 @@ float *hip_llm_qwen35_mtp_verify(hip_llm_runner *r, const int32_t *tokens,
 int hip_llm_qwen35_mtp_verify_argmax(hip_llm_runner *r, const int32_t *tokens,
                                     int rows, int position, int32_t *argmax);
 int hip_llm_qwen35_mtp_commit(hip_llm_runner *r, int processed);
+/* Allocate the verification workspace for `rows` rows now (about 1.2 GiB
+ * for eight rows of the 27B model) instead of on the first verify.  Returns
+ * nonzero when it does not fit; the caller should then decode without the
+ * draft model. */
+int hip_llm_qwen35_mtp_verify_reserve(hip_llm_runner *r, int rows);
 /* Discard only the dense draft transaction/history. Target prompt state and
  * logits remain live. Call at every independent serving request boundary. */
 void hip_llm_qwen35_mtp_reset(hip_llm_runner *r);

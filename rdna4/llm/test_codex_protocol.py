@@ -251,6 +251,15 @@ class ProtocolTest(unittest.TestCase):
             backend._wait_ready()
         self.assertTrue(backend.ready)
 
+    def test_startup_reads_the_allocated_context(self):
+        backend = Backend.__new__(Backend)
+        backend.ready = False
+        backend.proc = SimpleNamespace(stdout=io.StringIO("READY max_seq_len=190464\n"),
+                                       poll=lambda: None)
+        backend._wait_ready()
+        self.assertTrue(backend.ready)
+        self.assertEqual(backend.max_seq_len, 190464)
+
     def test_startup_reports_runner_failure(self):
         backend = Backend.__new__(Backend)
         backend.ready = False

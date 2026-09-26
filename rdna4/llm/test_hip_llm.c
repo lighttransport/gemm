@@ -584,9 +584,26 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
         free(cache); return 1;
     }
     signal(SIGUSR1, stdio_cancel_handler);
+    /* Speculative decoding needs a verification workspace next to the KV
+     * cache.  Reserve it before the first request: when it no longer fits
+     * (a large context took the VRAM) serve with plain decode rather than
+     * failing every generation on the first verify. */
+    int spec_draft = dflash_draft > 0 ? dflash_draft :
+                     dense_mtp_window ? dense_mtp_draft : 0;
+    if (spec_draft > 0 && hip_llm_qwen35_mtp_verify_reserve(gpu, spec_draft + 1)) {
+        fprintf(stderr, "llm_server: WARNING: the %d-row speculative verify workspace "
+                "does not fit next to the %d-token context; serving without the "
+                "draft model (lower the context to use it)\n",
+                spec_draft + 1, max_seq_len);
+        dflash_draft = 0;
+        dense_mtp_draft = 0;
+    }
     fprintf(stderr, "JSONL backend ready (max_seq_len=%d)\n", max_seq_len);
     fflush(stderr);
-    puts("READY");
+    /* The context actually allocated can be smaller than requested (the
+     * qwen35 path clamps it to free VRAM); report it so the HTTP shim
+     * advertises and budgets against the real window. */
+    printf("READY max_seq_len=%d\n", max_seq_len);
     fflush(stdout);
     while (fgets(line, sizeof(line), stdin)) {
         g_stdio_cancel = 0;

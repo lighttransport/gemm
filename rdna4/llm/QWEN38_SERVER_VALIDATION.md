@@ -1,5 +1,154 @@
 # Qwen3.8 server correctness and performance
 
+## Agent code review, long context and review fixes — 2026-09-27
+
+### Long context: 1M is out of reach, the card's own limit is stable
+
+A 1M-token context is not reachable with this model on this card. The GGUF's
+native `qwen35.context_length` is 262,144, and the Q8 KV cache alone for 1M
+tokens would be about 35 GB against 16 GB of VRAM.
+
+The runner clamps the requested context to free VRAM:
+
+| Server | Requested | Allocated |
+| --- | ---: | ---: |
+| `--qwen35-server-profile` (no DFlash2) | 262,144 | 190,464 |
+| launcher with DFlash2 | 114,688 | 114,688 |
+| launcher with DFlash2 | 131,072 | 131,072, DFlash2 off (see below) |
+
+DFlash2 needs an 8-row verify workspace of about 1.2 GiB: recurrent-state
+checkpoints for every SSM layer. It was allocated on the first speculative
+verify, after the KV cache had taken the VRAM. At 131,072 that allocation
+failed, and **every request returned `ERR generation`**: the first Claude
+Code request here (`speculative verify failed pos=17069 rows=8`), and even a
+one-line prompt. The runner now reserves the workspace
+(`hip_llm_qwen35_mtp_verify_reserve`) before it reports READY. If the
+reserve fails, it logs a warning and serves with plain decode. 114,688 is the
+largest tested context that keeps DFlash2.
+
+Needle test (`tmp/longctx/needle.py`) on the no-DFlash2 server:
+- The prompt is repository sources with three codewords planted at 10%, 50% and 90%.
+- Each run asks for all three codewords, then a follow-up question in the same conversation.
+- Each run then asks a short unrelated conversation (B), and returns to the long one (A).
+
+| Prompt tokens | Share of window | Prefill | Needles | Follow-up | A after B | Snapshot |
+| ---: | ---: | ---: | --- | ---: | ---: | ---: |
+| 145,839 | 77% | 646 s | 3/3 | 1.5 s | 3.3 s | 5.0 GB |
+| 188,756 | 99% | 999 s | 3/3 | 2.2 s | 3.1 s | 6.4 GB |
+
+- The follow-up extends the live state. After B, A resumes from its host
+  snapshot rather than being prefilled again.
+- Decode at 188K is about 31 tok/s.
+- Larger prompts are rejected before prefill with a context-length error
+  (below).
+
+Fixes found by this test:
+- **The shim advertised the requested window, not the allocated one.** The
+  runner now prints `READY max_seq_len=N`. The shim adopts N for
+  `/props` and `/models` `n_ctx`, for history trimming (`fit_context`) and
+  for error messages. A bare `READY` from an older runner is still accepted.
+- **Overflow was a 500 `server_error`.** It is now 400 with `code:
+  context_length_exceeded` on OpenAI routes. On `/v1/messages` it is
+  `invalid_request_error` "prompt is too long: it exceeds the N-token
+  context window". Streams report the same codes. These are the errors on
+  which Codex and Claude Code compact their history.
+- **`fit_context` used 4 characters per token.** Source code and Markdown
+  measure 2.7–2.8 with this vocabulary, so a trimmed history could still
+  overflow. It now uses 3.
+- `claude/qwen38_claude.sh` sizes Claude Code's window from the server's
+  `/props` unless `QWEN38_CONTEXT` is set.
+
+### Three agents reviewing this repository concurrently
+
+Codex, Claude Code and pi each reviewed one shim module read-only, in a
+detached worktree. All three ran at the same time against one launcher
+server (64K, DFlash2). Prompt:
+
+> Review FILE for real bugs … report at most 5 concrete findings with a
+> line number and a one-sentence failure scenario.
+
+Prefix caching across the three interleaved conversations:
+- Every Codex and pi request extended its previous prompt byte for byte.
+- Of 46 requests, all but the compaction restarts were served from a live
+  continuation or a text-continuation snapshot restore.
+- Most requests added 0.1–3K uncached tokens.
+
+Codex (`anthropic_api.py`, 57 min, 22 turns):
+
+| # | Finding | Verdict |
+| --- | --- | --- |
+| 1 | `input_tokens` should include cache reads | wrong: Anthropic's `input_tokens` excludes `cache_read_input_tokens` |
+| 2 | assistant `content: null` raises `TypeError` → 500 | **real, fixed** |
+| 3 | user `content: null` turn silently dropped | fixed (kept as an empty turn) |
+| 4 | float `budget_tokens` ignored | fixed |
+| 5 | `response_content` non-string arguments | latent, no caller passes one |
+
+pi (`qwen_tools.py`, 25.5 min, 11 turns):
+
+| # | Finding | Verdict |
+| --- | --- | --- |
+| 1 | fence-parity check miscounts "``" | wrong: it counts triple backticks |
+| 2 | JSON-parsed values not type-checked | by design; the client validates tool input |
+| 3 | non-dict property schema raises → 500 | **real, fixed** |
+| 4 | `render_call` raises on non-JSON strings | real, and the function was dead code: removed |
+| 5 | `call_events` assumes `item["type"]` | latent |
+
+Related to pi's #2/#3, `parse_calls` now decodes each parameter by its
+schema. A property without a `type` (`enum`, `anyOf`, Claude Code's
+`Workflow.args`) keeps the raw text when it is not JSON. Previously the whole
+call became plain text. A `["string", "null"]` type keeps strings raw.
+
+Claude Code (`live_stream.py`) failed at 64K: "Autocompact is thrashing: the
+context refilled to the limit within 3 turns of the previous compact, 3
+times in a row". Claude Code compacts at about the window minus its output
+reserve and a 13K buffer. That is about 36K tokens at 64K with a 16K output
+cap, and its system prompt alone is 14K, so reading `codex_server.py`
+(about 20K tokens) is enough to thrash. The compaction requests themselves
+were cheap: the summary request reused 99% of the prompt from its snapshot,
+and each restart reused the 14.2K-token system prefix.
+
+Rerun on the new launcher default (114,688 tokens, DFlash2 kept), Claude
+Code alone:
+- It finished in 27.5 min with no compaction thrash; the prompt grew to 70K
+  tokens.
+- The answer was unusable for a different reason. The model was still
+  thinking while it worked through a `StreamSplitter` test string containing
+  `</think>`, and it emitted that as the real special token (id 248069
+  appears 29 times in the generation). The shim splits reasoning from the
+  answer at the first `</think>`, the same rule vLLM's and llama.cpp's Qwen
+  reasoning parsers use. The rest of the deliberation therefore became the
+  visible answer.
+- A quoted tag and a structural one are identical at both the text and the
+  token level. This is a limit of the model's chat format when it reviews
+  code that handles its own tags, not a shim bug.
+
+Two further bugs surfaced before any review started:
+- **`QWEN38_TRACE_DIR` pointing at a missing directory failed every request
+  with a 500.** Codex showed this as "high demand". Trace writing now creates
+  the directory, uses collision-free names, and never fails a request.
+- **`~/.pi-qwen38/auth.json` was `{}`,** so pi reported `Unknown provider
+  "llama.cpp"`. Running `pi/qwen38_pi_setup.sh` fixes it; the setup step is
+  required.
+
+### DFlash2 in agent traffic
+
+During the agent reviews DFlash2 barely helped: 38.7 tok/s overall.
+- 34% of drafts were accepted under the agents' sampling temperatures.
+- The runner turns DFlash2 off past position 32,768, where agent
+  conversations quickly arrive (11 of 48 requests).
+
+Controlled A/B on a 9,885-token code prompt, 700 tokens, thinking off:
+
+| Sampling | Decode | Acceptance |
+| --- | ---: | ---: |
+| greedy | 57.5 tok/s | 49% |
+| temperature 0.6 | 43–56 tok/s | 34–49% |
+
+At this context an 8-row verify costs about 67 ms, about 2.7 single-token
+decodes. That verify cost, not the shim, limits speculative gains in agent
+workloads; the 4K benchmark's 100+ tok/s does not carry over to 10–35K
+agent contexts.
+
 ## Live streaming and restart warm-up — 2026-09-27
 
 ### Live Responses and Messages streams (`live_stream.py`)
@@ -146,8 +295,8 @@ rdna4/llm/claude/qwen38_claude.sh -p "fix the bug in mathutil.c, compile and run
 The wrapper runs `claude` with a clean environment and its own config
 directory (`~/.claude-qwen38`). It points every model role at the local
 model and sets `CLAUDE_CODE_MAX_CONTEXT_TOKENS` /
-`CLAUDE_CODE_AUTO_COMPACT_WINDOW` to the server's 64K context (Claude Code
-otherwise assumes 200K) and the output cap to 16K.
+`CLAUDE_CODE_AUTO_COMPACT_WINDOW` to the server's context, read from
+`/props` (Claude Code otherwise assumes 200K), and the output cap to 16K.
 
 ### Translation
 

@@ -698,6 +698,77 @@ static void hllm_dense_mtp_attention(hip_llm_runner *r, hip_layer *cl,
         r->d_attn_proj_batch, m->verify_norm, cl->ffn_norm_w, ne, rows);
 }
 
+/* Allocate the fixed-width verification workspace (per-row recurrent state
+ * checkpoints for every SSM layer, logits and scratch).  It is about 1.2 GiB
+ * for eight rows of the 27B model, so a server calls this before accepting
+ * requests: allocating it lazily on the first verify fails when the KV cache
+ * has already taken the remaining VRAM. */
+static int hllm_qwen35_mtp_verify_alloc(hip_llm_runner *r, hllm_qwen35_mtp *m,
+                                        int capacity) {
+    size_t conv = (size_t)(r->ssm_conv_kernel-1)*r->ssm_qkv_dim*sizeof(float);
+    size_t rec = (size_t)r->ssm_dt_rank*r->ssm_d_state*r->ssm_d_state*sizeof(float);
+    /* Fixed capacity keeps captured graph pointers stable.  A loaded
+     * draft backend uses one fixed verification width for its lifetime. */
+    m->verify_capacity = -1;
+#define VERIFY_ALLOC_FAIL() do { \
+        hipStreamSynchronize(r->stream); \
+        hllm_qwen35_mtp_verify_workspace_free(m); \
+        return -1; \
+    } while (0)
+    if (hipMalloc(&m->verify_x, (size_t)capacity*r->n_embd*sizeof(float)) ||
+        hipMalloc(&m->verify_norm, (size_t)capacity*r->n_embd*sizeof(float)) ||
+        hipMalloc(&m->verify_gate, (size_t)capacity*r->n_ff*sizeof(float)) ||
+        hipMalloc(&m->verify_up, (size_t)capacity*r->n_ff*sizeof(float)) ||
+        hipMalloc(&m->verify_q, (size_t)capacity*r->n_ff) ||
+        hipMalloc(&m->verify_scales, (size_t)capacity*r->n_ff/32*sizeof(float)) ||
+        hipMalloc(&m->verify_ssm_qkv, (size_t)capacity*r->ssm_qkv_dim*sizeof(float)) ||
+        hipMalloc(&m->verify_ssm_z, (size_t)capacity*r->ssm_d_inner*sizeof(float)) ||
+        hipMalloc(&m->verify_ssm_out, (size_t)capacity*r->ssm_d_inner*sizeof(float)) ||
+        hipMalloc(&m->verify_ssm_alpha, (size_t)capacity*r->ssm_dt_rank*sizeof(float)) ||
+        hipMalloc(&m->verify_ssm_beta, (size_t)capacity*r->ssm_dt_rank*sizeof(float)) ||
+        hipMalloc(&m->verify_attn_parts, (size_t)capacity*r->n_heads*
+            r->q8_attention_max_splits*r->head_dim*sizeof(float)) ||
+        hipMalloc(&m->verify_attn_meta, (size_t)capacity*r->n_heads*
+            r->q8_attention_max_splits*2*sizeof(float)) ||
+        hipMalloc(&m->verify_logits, (size_t)capacity*r->n_vocab*sizeof(float)) ||
+        hipMalloc(&m->verify_positions, (size_t)capacity*sizeof(int)) ||
+        hipMalloc(&m->verify_argmax, (size_t)capacity*sizeof(int32_t)))
+        VERIFY_ALLOC_FAIL();
+    m->host_logits = malloc((size_t)capacity*r->n_vocab*sizeof(float));
+    if (!m->host_logits) VERIFY_ALLOC_FAIL();
+    void *conv_dst[128], *conv_src[128], *rec_dst[128], *rec_src[128];
+    int ssm_layers = 0;
+    for (int l = 0; l < r->n_layers; ++l) if (r->layers[l].is_ssm) {
+        if (hipMalloc(&m->verify_conv[l], (size_t)capacity*conv) ||
+            hipMalloc(&m->verify_rec[l], (size_t)capacity*rec))
+            VERIFY_ALLOC_FAIL();
+        conv_dst[ssm_layers] = r->layers[l].d_conv_state;
+        conv_src[ssm_layers] = m->verify_conv[l];
+        rec_dst[ssm_layers] = r->layers[l].d_recurrent_state;
+        rec_src[ssm_layers] = m->verify_rec[l];
+        ++ssm_layers;
+    }
+    size_t ptr_bytes = (size_t)ssm_layers*sizeof(void *);
+    if (hipMalloc(&m->verify_conv_dst_ptrs, ptr_bytes) ||
+        hipMalloc(&m->verify_conv_src_ptrs, ptr_bytes) ||
+        hipMalloc(&m->verify_rec_dst_ptrs, ptr_bytes) ||
+        hipMalloc(&m->verify_rec_src_ptrs, ptr_bytes) ||
+        hipMemcpyAsync(m->verify_conv_dst_ptrs, conv_dst, ptr_bytes,
+                       hipMemcpyHostToDevice, r->stream) ||
+        hipMemcpyAsync(m->verify_conv_src_ptrs, conv_src, ptr_bytes,
+                       hipMemcpyHostToDevice, r->stream) ||
+        hipMemcpyAsync(m->verify_rec_dst_ptrs, rec_dst, ptr_bytes,
+                       hipMemcpyHostToDevice, r->stream) ||
+        hipMemcpyAsync(m->verify_rec_src_ptrs, rec_src, ptr_bytes,
+                       hipMemcpyHostToDevice, r->stream))
+        VERIFY_ALLOC_FAIL();
+    m->verify_ssm_layers = ssm_layers;
+    m->verify_capacity = capacity;
+#undef VERIFY_ALLOC_FAIL
+    hllm_vram_sample(r);
+    return 0;
+}
+
 /* Capture a layer-major window with the target's exact arithmetic contract.
  * Grouped kernels share weights without changing each row's accumulation
  * order. Recurrent state is checkpointed after every row, and positions stay
@@ -714,68 +785,8 @@ static float *hllm_qwen35_mtp_verify_impl(hip_llm_runner *r,
     for (int i = 0; i < rows; ++i) if (tokens[i] < 0 || tokens[i] >= r->n_vocab) return NULL;
     size_t conv = (size_t)(r->ssm_conv_kernel-1)*r->ssm_qkv_dim*sizeof(float);
     size_t rec = (size_t)r->ssm_dt_rank*r->ssm_d_state*r->ssm_d_state*sizeof(float);
-    if (!m->verify_capacity) {
-        /* Fixed capacity keeps captured graph pointers stable.  A loaded
-         * draft backend uses one fixed verification width for its lifetime. */
-        int capacity = rows;
-        m->verify_capacity = -1;
-#define VERIFY_ALLOC_FAIL() do { \
-            hipStreamSynchronize(r->stream); \
-            hllm_qwen35_mtp_verify_workspace_free(m); \
-            return NULL; \
-        } while (0)
-        if (hipMalloc(&m->verify_x, (size_t)capacity*r->n_embd*sizeof(float)) ||
-            hipMalloc(&m->verify_norm, (size_t)capacity*r->n_embd*sizeof(float)) ||
-            hipMalloc(&m->verify_gate, (size_t)capacity*r->n_ff*sizeof(float)) ||
-            hipMalloc(&m->verify_up, (size_t)capacity*r->n_ff*sizeof(float)) ||
-            hipMalloc(&m->verify_q, (size_t)capacity*r->n_ff) ||
-            hipMalloc(&m->verify_scales, (size_t)capacity*r->n_ff/32*sizeof(float)) ||
-            hipMalloc(&m->verify_ssm_qkv, (size_t)capacity*r->ssm_qkv_dim*sizeof(float)) ||
-            hipMalloc(&m->verify_ssm_z, (size_t)capacity*r->ssm_d_inner*sizeof(float)) ||
-            hipMalloc(&m->verify_ssm_out, (size_t)capacity*r->ssm_d_inner*sizeof(float)) ||
-            hipMalloc(&m->verify_ssm_alpha, (size_t)capacity*r->ssm_dt_rank*sizeof(float)) ||
-            hipMalloc(&m->verify_ssm_beta, (size_t)capacity*r->ssm_dt_rank*sizeof(float)) ||
-            hipMalloc(&m->verify_attn_parts, (size_t)capacity*r->n_heads*
-                r->q8_attention_max_splits*r->head_dim*sizeof(float)) ||
-            hipMalloc(&m->verify_attn_meta, (size_t)capacity*r->n_heads*
-                r->q8_attention_max_splits*2*sizeof(float)) ||
-            hipMalloc(&m->verify_logits, (size_t)capacity*r->n_vocab*sizeof(float)) ||
-            hipMalloc(&m->verify_positions, (size_t)capacity*sizeof(int)) ||
-            hipMalloc(&m->verify_argmax, (size_t)capacity*sizeof(int32_t)))
-            VERIFY_ALLOC_FAIL();
-        m->host_logits = malloc((size_t)capacity*r->n_vocab*sizeof(float));
-        if (!m->host_logits) VERIFY_ALLOC_FAIL();
-        void *conv_dst[128], *conv_src[128], *rec_dst[128], *rec_src[128];
-        int ssm_layers = 0;
-        for (int l = 0; l < r->n_layers; ++l) if (r->layers[l].is_ssm) {
-            if (hipMalloc(&m->verify_conv[l], (size_t)capacity*conv) ||
-                hipMalloc(&m->verify_rec[l], (size_t)capacity*rec))
-                VERIFY_ALLOC_FAIL();
-            conv_dst[ssm_layers] = r->layers[l].d_conv_state;
-            conv_src[ssm_layers] = m->verify_conv[l];
-            rec_dst[ssm_layers] = r->layers[l].d_recurrent_state;
-            rec_src[ssm_layers] = m->verify_rec[l];
-            ++ssm_layers;
-        }
-        size_t ptr_bytes = (size_t)ssm_layers*sizeof(void *);
-        if (hipMalloc(&m->verify_conv_dst_ptrs, ptr_bytes) ||
-            hipMalloc(&m->verify_conv_src_ptrs, ptr_bytes) ||
-            hipMalloc(&m->verify_rec_dst_ptrs, ptr_bytes) ||
-            hipMalloc(&m->verify_rec_src_ptrs, ptr_bytes) ||
-            hipMemcpyAsync(m->verify_conv_dst_ptrs, conv_dst, ptr_bytes,
-                           hipMemcpyHostToDevice, r->stream) ||
-            hipMemcpyAsync(m->verify_conv_src_ptrs, conv_src, ptr_bytes,
-                           hipMemcpyHostToDevice, r->stream) ||
-            hipMemcpyAsync(m->verify_rec_dst_ptrs, rec_dst, ptr_bytes,
-                           hipMemcpyHostToDevice, r->stream) ||
-            hipMemcpyAsync(m->verify_rec_src_ptrs, rec_src, ptr_bytes,
-                           hipMemcpyHostToDevice, r->stream))
-            VERIFY_ALLOC_FAIL();
-        m->verify_ssm_layers = ssm_layers;
-        m->verify_capacity = capacity;
-#undef VERIFY_ALLOC_FAIL
-        hllm_vram_sample(r);
-    }
+    if (!m->verify_capacity &&
+        hllm_qwen35_mtp_verify_alloc(r, m, rows)) return NULL;
     if (rows > m->verify_capacity) return NULL;
     int reuse_attention = rows > 1 && rows <= HLLM_DENSE_MTP_REUSE_ROWS &&
                           r->fn_q8_attention_decode_reuse8;
@@ -899,6 +910,13 @@ static float *hllm_qwen35_mtp_verify_impl(hip_llm_runner *r,
 float *hip_llm_qwen35_mtp_verify(hip_llm_runner *r, const int32_t *tokens,
                                 int rows, int position) {
     return hllm_qwen35_mtp_verify_impl(r, tokens, rows, position, NULL);
+}
+
+int hip_llm_qwen35_mtp_verify_reserve(hip_llm_runner *r, int rows) {
+    hllm_qwen35_mtp *m = r ? r->qwen35_mtp : NULL;
+    if (!m || rows < 1 || rows > HLLM_DENSE_MTP_MAX_ROWS) return -1;
+    if (m->verify_capacity) return m->verify_capacity >= rows ? 0 : -1;
+    return hllm_qwen35_mtp_verify_alloc(r, m, rows);
 }
 
 int hip_llm_qwen35_mtp_verify_argmax(hip_llm_runner *r, const int32_t *tokens,

@@ -13,6 +13,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import select
 import signal
 import socket
@@ -184,7 +185,9 @@ def fit_context(messages, context_tokens, output_tokens, render=None):
     not retained without the request and call that produced it.
     """
     render = render or chat_prompt
-    budget = max(128, context_tokens - output_tokens) * 4
+    # Source code tokenizes at about 2.7 characters per token with this
+    # vocabulary; 3 keeps the trimmed prompt inside the runner's window.
+    budget = max(128, context_tokens - output_tokens) * 3
     if len(render(messages)) <= budget:
         return messages
     indexed = list(enumerate(messages))
@@ -260,6 +263,7 @@ class Backend:
         self.request_cancellations = {}
         self.metrics_local = threading.local()
         self.ready = False
+        self.max_seq_len = None
         self.model = (getattr(args, "served_model_name", None) or
                       args.model.rsplit("/", 1)[-1])
         try:
@@ -337,7 +341,13 @@ class Backend:
                 raise RuntimeError(
                     "runner exited before READY" +
                     (f" (status {status})" if status is not None else ""))
-            if raw.rstrip("\r\n") == "READY":
+            line = raw.rstrip("\r\n")
+            if line == "READY" or line.startswith("READY "):
+                # "READY max_seq_len=N" reports the context the runner
+                # allocated, which free VRAM may have clamped.
+                match = re.search(r"max_seq_len=(\d+)", line)
+                if match:
+                    self.max_seq_len = int(match.group(1))
                 self.ready = True
             else:
                 sys.stderr.write("[runner diagnostic] " + raw)
@@ -526,16 +536,24 @@ def responses_output(response_id, reasoning, raw_turn, text, calls):
     return items
 
 
-def stream_error_event(api_path, message):
-    """SSE bytes that report a failure after the stream has started."""
+def stream_error_event(api_path, message, overflow=False):
+    """SSE bytes that report a failure after the stream has started.
+
+    A context overflow uses the codes agents act on (Codex compacts on
+    context_length_exceeded, Claude Code on "prompt is too long")."""
     if api_path == "/v1/messages":
-        payload = {"type": "error", "error": {"type": "api_error", "message": message}}
+        payload = {"type": "error", "error": {
+            "type": "invalid_request_error" if overflow else "api_error", "message": message}}
         return ("event: error\ndata: " + json.dumps(payload) + "\n\n").encode()
     if api_path == "/v1/responses":
         payload = {"type": "response.failed", "response": {
-            "status": "failed", "error": {"code": "server_error", "message": message}}}
+            "status": "failed", "error": {
+                "code": "context_length_exceeded" if overflow else "server_error",
+                "message": message}}}
         return ("event: response.failed\ndata: " + json.dumps(payload) + "\n\n").encode()
-    payload = {"error": {"message": message, "type": "server_error"}}
+    payload = {"error": {"message": message,
+                         "type": "invalid_request_error" if overflow else "server_error",
+                         **({"code": "context_length_exceeded"} if overflow else {})}}
     return ("data: " + json.dumps(payload) + "\n\ndata: [DONE]\n\n").encode()
 
 
@@ -864,13 +882,18 @@ class Handler(BaseHTTPRequestHandler):
             trace_dir = os.environ.get("QWEN38_TRACE_DIR")
             if trace_dir:
                 # Diagnostic only: raw request plus the exact rendered prompt,
-                # for diffing successive agent turns' prefixes.
-                stamp = f"{time.time():.6f}"
-                fd = os.open(os.path.join(trace_dir, f"{stamp}.json"),
-                             os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    json.dump({"path": api_path, "cache_key": cache_key, "request": req,
-                               "prompt": prompt, "prefix": prefix}, f, ensure_ascii=False)
+                # for diffing successive agent turns' prefixes.  A trace that
+                # cannot be written must never fail the request itself.
+                stamp = f"{time.time():.6f}-{uuid.uuid4().hex[:8]}"
+                try:
+                    os.makedirs(trace_dir, mode=0o700, exist_ok=True)
+                    fd = os.open(os.path.join(trace_dir, f"{stamp}.json"),
+                                 os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                    with os.fdopen(fd, "w", encoding="utf-8") as f:
+                        json.dump({"path": api_path, "cache_key": cache_key, "request": req,
+                                   "prompt": prompt, "prefix": prefix}, f, ensure_ascii=False)
+                except OSError as exc:
+                    self.log_message("trace not written: %s", exc)
             # The C child reads one complete request into a fixed 4 MiB line.
             # Check the actual UTF-8/base64 expansion before streaming headers;
             # an oversized partial line would otherwise desynchronize every
@@ -1188,19 +1211,31 @@ class Handler(BaseHTTPRequestHandler):
             # socket left to report an error on.
             return
         except Exception as exc:
-            self.log_message("500 POST %s: %s", self.path, exc)
+            self.log_message("error POST %s: %s", self.path, exc)
+            overflow = "exceeds context capacity" in str(exc)
+            message = (f"prompt is too long: it exceeds the {self.context}-token context window"
+                       if overflow else str(exc))
             if response_started:
                 # Headers are committed: report the failure in the stream's own
                 # protocol so agents surface it instead of retrying a silently
                 # truncated response.
                 self.close_connection = True
                 try:
-                    self.wfile.write(stream_error_event(api_path, str(exc)))
+                    self.wfile.write(stream_error_event(api_path, message, overflow))
                     self.wfile.flush()
                 except OSError:
                     pass
                 return
-            self.send_json(500, {"error": {"message": str(exc), "type": "server_error"}})
+            # Agents compact their history on these context-overflow errors.
+            if api_path == "/v1/messages":
+                self.send_json(400 if overflow else 500, {"type": "error", "error": {
+                    "type": "invalid_request_error" if overflow else "api_error",
+                    "message": message}})
+            else:
+                self.send_json(400 if overflow else 500, {"error": {
+                    "message": message,
+                    "type": "invalid_request_error" if overflow else "server_error",
+                    "code": "context_length_exceeded" if overflow else None}})
 
 
 def main():
@@ -1268,7 +1303,12 @@ def main():
     Handler.backend = Backend(args)
     Handler.model = Handler.backend.model
     Handler.max_tokens = args.max_output
-    Handler.context = args.context
+    # Advertise and budget against the window the runner really allocated.
+    Handler.context = min(args.context, getattr(Handler.backend, "max_seq_len", None) or
+                          args.context)
+    if Handler.context < args.context:
+        print(f"context clamped by the runner: {args.context} -> {Handler.context} tokens",
+              flush=True)
     Handler.coding = args.coding
     Handler.thinking = args.thinking
     try:

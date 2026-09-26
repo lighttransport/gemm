@@ -1,4 +1,5 @@
 """Regression tests for Qwen XML tool-call translation."""
+import json
 import unittest
 
 from qwen_tools import parse_calls, tool_registry
@@ -79,6 +80,34 @@ class QwenToolsTest(unittest.TestCase):
         self.assertEqual(text, "")
         self.assertEqual(calls[0]["type"], "custom_tool_call")
         self.assertEqual(calls[0]["input"], "printf GPU_CODEX_OK")
+
+    def test_parameter_values_follow_the_property_schema(self):
+        registry = tool_registry([{"type": "function", "function": {
+            "name": "run", "parameters": {"type": "object", "properties": {
+                "args": {"description": "any JSON value, no type"},
+                "mode": {"enum": ["fast", "full"]},
+                "label": {"type": ["string", "null"]},
+                "count": {"type": "integer"}}}}}])
+
+        def call(params):
+            return parse_calls("<tool_call>\n<function=run>\n" + "".join(
+                f"<parameter={k}>\n{v}\n</parameter>\n" for k, v in params.items())
+                + "</function>\n</tool_call>", registry)[1]
+
+        calls = call({"args": "plain words", "mode": "fast", "label": "123"})
+        self.assertEqual(json.loads(calls[0]["arguments"]),
+                         {"args": "plain words", "mode": "fast", "label": "123"})
+        calls = call({"args": '{"a": 1}', "label": "null", "count": "3"})
+        self.assertEqual(json.loads(calls[0]["arguments"]),
+                         {"args": {"a": 1}, "label": None, "count": 3})
+        self.assertEqual(call({"count": "three"}), [])
+
+    def test_malformed_schema_is_not_a_crash(self):
+        registry = tool_registry([{"type": "function", "function": {
+            "name": "odd", "parameters": {"properties": {"x": "string"}, "required": "x"}}}])
+        text, calls = parse_calls("<tool_call>\n<function=odd>\n<parameter=x>\nhi\n"
+                                  "</parameter>\n</function>\n</tool_call>", registry)
+        self.assertEqual(json.loads(calls[0]["arguments"]), {"x": "hi"})
 
 
 if __name__ == "__main__":

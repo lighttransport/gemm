@@ -146,6 +146,17 @@ class MessagesTranslationTest(unittest.TestCase):
         cache.resolve(messages)
         self.assertEqual(messages[0]["raw"], "<think>\nThink.\n</think>\n\nHello")
 
+    def test_null_content_and_float_budget(self):
+        # Review regressions: null content was a 500, a float budget
+        # ignored the budget-to-effort table.
+        messages = anthropic_api.request_messages({"messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": None},
+            {"role": "user", "content": None}]})
+        self.assertEqual([m["role"] for m in messages], ["user", "assistant", "user"])
+        self.assertEqual(anthropic_api.thinking_request(
+            {"thinking": {"type": "enabled", "budget_tokens": 10000.0}}), (True, "medium"))
+
 
 if __name__ == "__main__":
     unittest.main()

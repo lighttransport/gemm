@@ -12,7 +12,13 @@ set -euo pipefail
 port="${QWEN38_API_PORT:-8090}"
 host="${QWEN38_API_HOST:-127.0.0.1}"
 config="${QWEN38_CLAUDE_CONFIG_DIR:-${HOME}/.claude-qwen38}"
-context="${QWEN38_CONTEXT:-65536}"
+# Size Claude Code's window from the running server (/props reports the
+# context the runner actually allocated, after any VRAM clamp) unless
+# QWEN38_CONTEXT overrides it; a window larger than the server's would
+# postpone compaction until requests start failing.
+context="${QWEN38_CONTEXT:-$(curl -fsS --max-time 5 "http://${host}:${port}/props" 2>/dev/null |
+    python3 -c 'import json,sys; print(json.load(sys.stdin)["default_generation_settings"]["n_ctx"])' \
+    2>/dev/null || echo 65536)}"
 max_output="${QWEN38_MAX_OUTPUT:-16384}"
 model="${QWEN38_CLAUDE_MODEL:-qwen3.8-27b}"
 mkdir -p "${config}"
