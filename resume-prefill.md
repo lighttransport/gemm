@@ -1017,3 +1017,67 @@ Q38P_PP_ATTN_COST=1500 Q38P_PREEXPAND_F4_MIB=2048 \
 
 Run directories and per-rank profiles from job 51934716 are under remote
 `tmp/q38p/preexpand-*51934716/`. Use fresh output directories when rerunning.
+
+### PP12 stage-owned matrix pruning
+
+The full model load gives every producer rank FP4 matrices for all 64 layers.
+`Q38P_PRUNE_MODEL=1` now releases converted matrix mappings outside the
+rank's assigned mixer/FFN units after all repacking and K-chunk copies finish.
+Rank 0 retains the embedding; the last rank retains the output head. This is
+opt-in and restricted to PP producer mode, so TP decode and PP gather/decode
+continue to retain their full weights. At 12 nodes, the short 1024-token
+handoff released **12.5–13.0 GiB per rank** and passed TP4 state import and
+64-token generation (first-token match). The image/model loading phase still
+loads all weights before pruning, so the peak startup RSS does not fall.
+
+Pruning gave enough HBM for **all** stage-owned F4 panels to be preexpanded,
+about 2.99–4.45 GiB per rank. The same evaluated 32,768-token C-source prompt
+at chunk 480 and attention partition cost 1500 then took **27.708363 s =
+1182.603 tok/s total = 98.550 tok/s/node**. This is 1.36% above the
+2 GiB capped configuration and 7.38% above its same-chunk control. State
+export took 5.258 s; TP4 import took 7.766 s and 256-token generation ran
+at 60.428 tok/s. The final residual hash remained
+`e0e955e58b6353af`, and all 256 TP4 IDs and reported logits matched the
+2 GiB capped run exactly. The largest stage spent 22.852 s computing,
+including 15.553 s GEMM and 5.160 s attention. This remains below the
+150 tok/s/node target.
+
+The validated run used an 8192 MiB allowance, but actually allocated at most
+4.45 GiB. The final option is constrained to **4608 MiB** with pruning and
+requires the released source mappings to cover that budget. Reproduce the
+same panel set with:
+
+```sh
+Q38P_PRUNE_MODEL=1 Q38P_PREEXPAND_F4_MIB=4608 \
+  Q38P_PP_ATTN_COST=1500 HANDOFF_KV_I6=0 HANDOFF_TPS=4 \
+  bash a64fx/llm/q38p/run_handoff.sh tmp/q38p/new-pruned-full32k \
+  32768 256 480 tmp/q38d-context-prompts/review_q38d_32768.txt
+```
+
+The final 4608 MiB build repeated at 27.731956 s, 1181.597 total tok/s,
+**98.466 tok/s/node**, with the same residual hash and 256/256 TP4 IDs and
+logits (zero reported difference). Remote logs:
+`tmp/q38p/prune-smoke-51934716/`,
+`tmp/q38p/prune-full-preexpand32k-51934716/`, and
+`tmp/q38p/prune-full-final4608-51934716/`.
+
+Both final and 2 GiB capped FP32 states from the same 32,768-token prompt
+then generated **8,192 TP4 tokens** with the rebuilt decoder. All 8192 IDs
+and reported logits matched exactly (zero reported logit difference). The
+pruned state generated at 57.900 tok/s; the capped reference at 58.020
+tok/s, with independent state-import times excluded. Logs:
+`tmp/q38p/prune-full-final4608-long-51934716/` and
+`tmp/q38p/preexpand-cap2g-long-51934716/`.
+
+An exact two-query/two-head FP32 PV prototype in
+`tmp/q38p/pv_pair_probe.c` was bit-identical across 1–32767-key cases, but
+slower on one A64FX worker at 32767 keys: 12.12–12.52 ms versus 7.48–7.50 ms
+for the existing PV kernel. It was not integrated.
+
+A two-rank MPI thread-level probe on the same allocation requested
+`MPI_THREAD_MULTIPLE` (3) and received `MPI_THREAD_SERIALIZED` (2) on both
+ranks. A future communication progress thread would need to be the sole MPI
+caller during the PP chunk loop; the current producer uses `FUNNELED` and
+blocking sends/receives. The measured 27.73 s single-prompt wall includes
+about 22.85 s of work on its busiest stage, so communication overlap alone
+cannot meet 150 tok/s/node.

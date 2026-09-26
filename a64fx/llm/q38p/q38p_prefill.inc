@@ -30,6 +30,7 @@ static int pf_bench_depth, pf_bench_synthetic;
 static unsigned pf_bench_seed = 1;
 static int pf_on, pf_chunk = 240, pf_test, pp_on;
 static int pf_preexpand_f4_mib; /* stage-local F4 -> exact INT16 panels, bounded HBM budget */
+static int pf_prune_model; /* PP-only: release converted weights outside this stage */
 static int pf_attn_cmg = 1;  /* Q38P_ATTN_CMG=0: global query work queue */
 static int pf_attn_cache = 1;
 static int pf_attn_prof;
@@ -75,6 +76,43 @@ typedef struct {
     q38p_mat qkv, z, alpha, beta, out, q, k, v, o, gate, up, down;
 } q38p_layer;
 static q38p_layer *PL;
+
+#ifdef Q38P_MPI
+static void pf_keep_mat(const q38d_mat *m, const void **keep, size_t *count) {
+    for (int c = 0; c < NCMG; c++)
+        if (m->part[c]) keep[(*count)++] = m->part[c];
+}
+
+/* Repacking and K-chunk copies must finish before dropping source mappings.
+ * The PP producer never evaluates a unit outside [pp_u0, pp_u1). */
+static void pf_prune_unused_model(void) {
+    const void *keep[(NLAYER + 1) * 12 * NCMG + 8];
+    size_t count = 0;
+    for (int l = 0; l < NLAYER; l++) {
+        const q38d_layer *p = &E.L[l];
+        if (2 * l >= pp_u0 && 2 * l < pp_u1) {
+            const q38d_mat *m[] = {&p->qkv, &p->z, &p->alpha, &p->beta, &p->out,
+                                   &p->q, &p->k, &p->v, &p->o};
+            for (size_t j = 0; j < sizeof(m) / sizeof(m[0]); j++)
+                pf_keep_mat(m[j], keep, &count);
+        }
+        if (2 * l + 1 >= pp_u0 && 2 * l + 1 < pp_u1) {
+            pf_keep_mat(&p->gate, keep, &count);
+            pf_keep_mat(&p->up, keep, &count);
+            pf_keep_mat(&p->down, keep, &count);
+        }
+    }
+    if (pp_r == pp_n - 1) pf_keep_mat(&E.head, keep, &count);
+    if (pp_r == 0 && E.embed_lb)
+        for (int c = 0; c < NCMG; c++)
+            if (E.embed_lb->part[c]) keep[count++] = E.embed_lb->part[c];
+    size_t released = q38_lowbit_model_prune_matrix_parts(LB, keep, count);
+    fprintf(stderr, "q38p_prune: rank=%d kept_parts=%zu released=%.3f GiB\n",
+            pp_r, count, (double)released / (double)(1ull << 30));
+    if (pf_preexpand_f4_mib && released < ((size_t)pf_preexpand_f4_mib << 20))
+        state_fail("PP model pruning freed less than the F4 preexpansion budget");
+}
+#endif
 
 /* chunk buffers */
 static struct {

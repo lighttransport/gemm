@@ -122,11 +122,17 @@ Throughput above 12 nodes remains unmeasured.
 
 For long FP4 prompts, `Q38P_PREEXPAND_F4_MIB=2048` stores selected stage-owned
 F4 matrices as exact INT16 GEMM panels in HBM, removing repeated expansion
-on every prompt chunk. The budget is per rank, defaults to zero, and is capped
-at 2048 MiB because larger unrestricted sets triggered HBM NUMA out-of-memory
-kills in 12-node experiments. `Q38P_PP_ATTN_COST=1500` selects measured
-32K-context stage cuts. These settings are specific to the 27B NVFP4 image
-and 32K input; profile other models and lengths before adopting them.
+on every prompt chunk. The budget is per rank and defaults to zero. Without
+pruning it is capped at 2048 MiB: larger sets triggered HBM NUMA out-of-memory
+kills in 12-node experiments. `Q38P_PRUNE_MODEL=1` releases converted FP4
+matrices outside each PP rank's assigned units after repacking, retaining the
+embedding on rank 0 and output head on the last rank. It applies only to PP
+producers, and raises the allowed preexpansion budget to 4608 MiB. On the
+27B model it released 12.5–13.0 GiB per rank; full preexpansion then reached
+98.55 tok/s/node at 32K with exact 8192-token TP4 continuation. The producer still
+loads the full model before pruning. `Q38P_PP_ATTN_COST=1500` selects the
+measured 32K stage cuts. Profile other models and lengths before adopting
+these settings.
 
 ## Experimental 12-node prefill → TP4/TP2 decode
 
