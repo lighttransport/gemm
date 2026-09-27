@@ -333,6 +333,10 @@ void hip_llm_set_qwen35_snapshot_max_tokens(hip_llm_runner *r, int tokens);
  * included when available so a cache hit can resume without prompt replay.
  * The opaque snapshot is owned by the caller and may be reused across turns. */
 hip_llm_state_snapshot *hip_llm_snapshot_state(hip_llm_runner *r);
+/* Recurrent, logits and draft state without the attention KV rows.  Valid
+ * to restore only while the KV rows up to its position are still in VRAM
+ * (for example to roll back a cancelled decode to its prompt boundary). */
+hip_llm_state_snapshot *hip_llm_snapshot_state_resident(hip_llm_runner *r);
 /* Snapshot only the attention KV slots in [start_pos, start_pos+n_positions).
  * This bounded transaction is intended for speculative draft verification. */
 hip_llm_state_snapshot *hip_llm_snapshot_state_window(hip_llm_runner *r,

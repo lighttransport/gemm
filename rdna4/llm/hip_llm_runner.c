@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/mman.h>
+#include <pthread.h>
 #include <string.h>
 #include <math.h>
 #include <limits.h>
@@ -14530,6 +14531,7 @@ struct hip_llm_runner {
     int n_vocab;
     int max_seq_len;
     int qwen35_snapshot_max_tokens;
+    int snapshot_skip_kv;               /* resident snapshot: leave KV rows in VRAM */
     float rope_freq_base;
     int n_rope_pairs;
     int mrope_sections[4];  /* [temporal, height, width, pad] for M-RoPE */
@@ -36142,6 +36144,7 @@ void hip_llm_reset_state(hip_llm_runner *r) {
 
 struct hip_llm_state_snapshot {
     int n_layers;
+    int in_arena;               /* buffers live in the pinned checkpoint arena */
     void **conv_host;
     void **rec_host;
     size_t *conv_bytes;
@@ -36225,11 +36228,42 @@ int hip_llm_state_snapshot_token_count(const hip_llm_state_snapshot *s) {
     return s && s->position >= 0 ? s->position + 1 : 0;
 }
 
+static void hllm_snapshot_release(void *p);
+static char *g_ckpt_arena;
+static size_t g_ckpt_cap, g_ckpt_used, g_ckpt_need;
+static int g_ckpt_filling, g_ckpt_busy;
+
+hip_llm_state_snapshot *hip_llm_snapshot_state_resident(hip_llm_runner *r) {
+    if (!r) return NULL;
+    int use_arena = !g_ckpt_busy;
+    if (use_arena && g_ckpt_need > g_ckpt_cap) {
+        /* Size the arena from the previous checkpoint (the first one used
+         * ordinary buffers and only measured). */
+        if (g_ckpt_arena) hipHostFree(g_ckpt_arena);
+        g_ckpt_arena = NULL;
+        g_ckpt_cap = 0;
+        size_t cap = g_ckpt_need + ((size_t)8 << 20);
+        if (hipHostMalloc((void **)&g_ckpt_arena, cap, 0) == hipSuccess) g_ckpt_cap = cap;
+        else g_ckpt_arena = NULL;
+    }
+    if (use_arena) { g_ckpt_filling = 1; g_ckpt_used = 0; g_ckpt_need = 0; }
+    r->snapshot_skip_kv = 1;
+    hip_llm_state_snapshot *s = hip_llm_snapshot_state(r);
+    r->snapshot_skip_kv = 0;
+    g_ckpt_filling = 0;
+    if (s && use_arena && g_ckpt_used > 0) {
+        s->in_arena = 1;
+        g_ckpt_busy = 1;
+    }
+    return s;
+}
+
 void hip_llm_free_state_snapshot(hip_llm_state_snapshot *s) {
     if (!s) return;
+    if (s->in_arena) g_ckpt_busy = 0;
     for (int l = 0; l < s->n_layers; ++l) {
-        free(s->conv_host ? s->conv_host[l] : NULL);
-        free(s->rec_host ? s->rec_host[l] : NULL);
+        hllm_snapshot_release(s->conv_host ? s->conv_host[l] : NULL);
+        hllm_snapshot_release(s->rec_host ? s->rec_host[l] : NULL);
     }
     free(s->conv_host);
     free(s->rec_host);
@@ -36237,25 +36271,25 @@ void hip_llm_free_state_snapshot(hip_llm_state_snapshot *s) {
     free(s->rec_bytes);
     if (s->dflash_key_host || s->dflash_value_host) {
         for (int l = 0; l < HLLM_DFLASH_LAYERS; ++l) {
-            free(s->dflash_key_host ? s->dflash_key_host[l] : NULL);
-            free(s->dflash_value_host ? s->dflash_value_host[l] : NULL);
+            hllm_snapshot_release(s->dflash_key_host ? s->dflash_key_host[l] : NULL);
+            hllm_snapshot_release(s->dflash_value_host ? s->dflash_value_host[l] : NULL);
         }
     }
     free(s->dflash_key_host);
     free(s->dflash_value_host);
-    free(s->dflash_feature_host);
+    hllm_snapshot_release(s->dflash_feature_host);
     if (s->qwen35_key_host && s->qwen35_value_host) {
         for (int l = 0; l < s->n_layers; ++l) {
-            free(s->qwen35_key_host[l]);
-            free(s->qwen35_value_host[l]);
-            free(s->qwen35_key_scale_host ? s->qwen35_key_scale_host[l] : NULL);
-            free(s->qwen35_value_scale_host ? s->qwen35_value_scale_host[l] : NULL);
+            hllm_snapshot_release(s->qwen35_key_host[l]);
+            hllm_snapshot_release(s->qwen35_value_host[l]);
+            hllm_snapshot_release(s->qwen35_key_scale_host ? s->qwen35_key_scale_host[l] : NULL);
+            hllm_snapshot_release(s->qwen35_value_scale_host ? s->qwen35_value_scale_host[l] : NULL);
         }
     }
     free(s->qwen35_key_host); free(s->qwen35_value_host);
     free(s->qwen35_key_scale_host); free(s->qwen35_value_scale_host);
     free(s->qwen35_kv_bytes); free(s->qwen35_scale_bytes);
-    free(s->ple_host);
+    hllm_snapshot_release(s->ple_host);
     if (s->kv_key_host && s->kv_value_host) {
         for (int l = 0; l < s->n_layers; ++l) {
             free(s->kv_key_host[l]);
@@ -36267,8 +36301,8 @@ void hip_llm_free_state_snapshot(hip_llm_state_snapshot *s) {
     free(s->kv_bytes);
     if(s->index_host)for(int l=0;l<s->n_layers;++l)free(s->index_host[l]);
     free(s->index_host);free(s->nextn_key_host);free(s->nextn_value_host);
-    free(s->hc_host);free(s->nextn_hc_host);free(s->logits_host);
-    free(s->hidden_host);
+    hllm_snapshot_release(s->hc_host);hllm_snapshot_release(s->nextn_hc_host);hllm_snapshot_release(s->logits_host);
+    hllm_snapshot_release(s->hidden_host);
     free(s);
 }
 
@@ -36331,36 +36365,133 @@ hip_llm_state_snapshot *hip_llm_snapshot_state_window(hip_llm_runner *r,
 
 /* Snapshot buffers are written once, right after allocation, so first-touch
  * page faults bound capture speed (~1.5 GB/s on 4 KiB pages).  Large ones
- * are 2 MiB aligned and advised onto transparent huge pages (~2x faster).
- * They are released with free() like any other snapshot buffer. */
+ * are 2 MiB aligned on transparent huge pages, and freed ones are kept in
+ * a small pool (LLM_SNAPSHOT_POOL_MIB, default 1024) and reused: a server
+ * captures similar sizes turn after turn, and reused pages cost nothing.
+ * Every snapshot buffer is released through hllm_snapshot_release. */
+#define HLLM_POOL_SLOTS 1024
+typedef struct { void *p; size_t size; int in_use; } hllm_pool_block;
+static hllm_pool_block g_snapshot_pool[HLLM_POOL_SLOTS];
+static int g_snapshot_pool_n;
+static size_t g_snapshot_pool_idle;
+static unsigned long g_snapshot_pool_hits, g_snapshot_pool_misses;
+static pthread_mutex_t g_snapshot_pool_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static size_t hllm_snapshot_pool_cap(void) {
+    static long cap = -1;
+    if (cap < 0) {
+        const char *env = getenv("LLM_SNAPSHOT_POOL_MIB");
+        cap = env && *env ? atol(env) : 1024;
+        if (cap < 0) cap = 0;
+    }
+    return (size_t)cap << 20;
+}
+
+/* The per-turn rollback checkpoint (hip_llm_snapshot_state_resident) is a
+ * single live object of nearly constant size.  It is bump-allocated from one
+ * persistent pinned arena, sized from the previous checkpoint, so the GPU
+ * copies straight into it: no staging copy, no page faults. */
+
+static int hllm_in_arena(const void *p) {
+    return g_ckpt_arena && (const char *)p >= g_ckpt_arena &&
+           (const char *)p < g_ckpt_arena + g_ckpt_cap;
+}
+
 static void *hllm_snapshot_alloc(size_t bytes) {
     const size_t huge = (size_t)2 << 20;
+    if (g_ckpt_filling) {
+        size_t need = (bytes + 255) & ~(size_t)255;
+        g_ckpt_need += need;
+        if (g_ckpt_arena && g_ckpt_used + need <= g_ckpt_cap) {
+            void *p = g_ckpt_arena + g_ckpt_used;
+            g_ckpt_used += need;
+            return p;
+        }
+    }
     if (bytes < huge) return malloc(bytes);
+    pthread_mutex_lock(&g_snapshot_pool_mu);
+    int best = -1;
+    for (int i = 0; i < g_snapshot_pool_n; ++i) {
+        hllm_pool_block *b = &g_snapshot_pool[i];
+        if (!b->in_use && b->size >= bytes && b->size <= bytes + bytes / 4 + huge &&
+            (best < 0 || b->size < g_snapshot_pool[best].size)) best = i;
+    }
+    if (best >= 0) {
+        g_snapshot_pool_hits++;
+        g_snapshot_pool[best].in_use = 1;
+        g_snapshot_pool_idle -= g_snapshot_pool[best].size;
+        void *p = g_snapshot_pool[best].p;
+        pthread_mutex_unlock(&g_snapshot_pool_mu);
+        return p;
+    }
+    g_snapshot_pool_misses++;
+    pthread_mutex_unlock(&g_snapshot_pool_mu);
     void *p = NULL;
     if (posix_memalign(&p, huge, bytes) != 0) return NULL;
 #ifdef MADV_HUGEPAGE
     madvise(p, bytes, MADV_HUGEPAGE);
 #endif
+    pthread_mutex_lock(&g_snapshot_pool_mu);
+    if (g_snapshot_pool_n < HLLM_POOL_SLOTS)
+        g_snapshot_pool[g_snapshot_pool_n++] = (hllm_pool_block){ p, bytes, 1 };
+    pthread_mutex_unlock(&g_snapshot_pool_mu);
     return p;
+}
+
+/* free() for snapshot buffers: pooled blocks go back to the pool while it
+ * stays under its cap; anything else (malloc'd) is freed. */
+static void hllm_snapshot_release(void *p) {
+    if (!p || hllm_in_arena(p)) return;
+    pthread_mutex_lock(&g_snapshot_pool_mu);
+    int found = 0;
+    for (int i = 0; i < g_snapshot_pool_n; ++i) {
+        if (g_snapshot_pool[i].p != p) continue;
+        g_snapshot_pool[i].in_use = 0;
+        g_snapshot_pool_idle += g_snapshot_pool[i].size;
+        found = 1;
+        break;
+    }
+    /* Over the cap, drop the largest idle blocks first: long-context KV
+     * copies are rarely the same size twice, while the per-turn recurrent
+     * state blocks are reused every turn. */
+    while (g_snapshot_pool_idle > hllm_snapshot_pool_cap()) {
+        int big = -1;
+        for (int i = 0; i < g_snapshot_pool_n; ++i)
+            if (!g_snapshot_pool[i].in_use &&
+                (big < 0 || g_snapshot_pool[i].size > g_snapshot_pool[big].size)) big = i;
+        if (big < 0) break;
+        g_snapshot_pool_idle -= g_snapshot_pool[big].size;
+        free(g_snapshot_pool[big].p);
+        g_snapshot_pool[big] = g_snapshot_pool[--g_snapshot_pool_n];
+    }
+    pthread_mutex_unlock(&g_snapshot_pool_mu);
+    if (!found) free(p);
 }
 
 /* Device-to-host copy for state snapshots.  hipMemcpy into pageable
  * memory runs at ~1.3 GB/s on this host; staging through two pinned 32 MiB
  * buffers and memcpy'ing into the caller's pages reaches ~14 GB/s. */
 #define HLLM_SNAP_STAGE_BYTES ((size_t)32 << 20)
-static int hllm_snapshot_d2h(hip_llm_runner *r, void *dst, const void *src, size_t bytes) {
-    if (bytes < ((size_t)1 << 20) || r->snap_stage_state < 0)
-        return hipMemcpy(dst, src, bytes, hipMemcpyDeviceToHost) != hipSuccess;
+static int hllm_snapshot_stage_init(hip_llm_runner *r) {
     if (r->snap_stage_state == 0) {
         r->snap_stage_state = -1;
         for (int i = 0; i < 2; ++i)
             if (hipHostMalloc(&r->snap_stage[i], HLLM_SNAP_STAGE_BYTES, 0) != hipSuccess ||
                 hipEventCreate(&r->snap_stage_ready[i]) != hipSuccess)
-                return hipMemcpy(dst, src, bytes, hipMemcpyDeviceToHost) != hipSuccess;
+                return -1;
         r->snap_stage_state = 1;
         fprintf(stderr, "hip_llm: snapshot staging via 2 x %zu MiB pinned buffers\n",
                 HLLM_SNAP_STAGE_BYTES >> 20);
     }
+    return r->snap_stage_state > 0 ? 0 : -1;
+}
+
+static int hllm_snapshot_d2h(hip_llm_runner *r, void *dst, const void *src, size_t bytes) {
+    if (hllm_in_arena(dst))
+        return hipMemcpyAsync(dst, src, bytes, hipMemcpyDeviceToHost, r->stream) != hipSuccess ||
+               hipStreamSynchronize(r->stream) != hipSuccess;
+    if (bytes < ((size_t)1 << 20) || hllm_snapshot_stage_init(r))
+        return hipMemcpy(dst, src, bytes, hipMemcpyDeviceToHost) != hipSuccess;
     size_t chunks = (bytes + HLLM_SNAP_STAGE_BYTES - 1) / HLLM_SNAP_STAGE_BYTES;
     for (size_t i = 0; i <= chunks; ++i) {
         if (i < chunks) {           /* queue chunk i while chunk i-1 drains */
@@ -36378,6 +36509,67 @@ static int hllm_snapshot_d2h(hip_llm_runner *r, void *dst, const void *src, size
         }
     }
     return 0;
+}
+
+/* Many small device-to-host copies (per-layer recurrent state) each paid a
+ * synchronous round trip.  A batch queues them into one pinned staging
+ * buffer and synchronizes once per HLLM_SNAP_STAGE_BYTES. */
+typedef struct { void *dst; size_t off, len; } hllm_d2h_item;
+typedef struct {
+    hip_llm_runner *r;
+    size_t used;
+    int n, fail, direct;
+    double wait_ms, copy_ms;
+    hllm_d2h_item items[160];
+} hllm_d2h_batch;
+
+static void hllm_d2h_batch_flush(hllm_d2h_batch *b) {
+    hip_llm_runner *r = b->r;
+    if (b->direct && !b->fail) {
+        double t0 = hllm_monotonic_ms();
+        if (hipStreamSynchronize(r->stream) != hipSuccess) b->fail = 1;
+        b->wait_ms += hllm_monotonic_ms() - t0;
+        b->direct = 0;
+    }
+    if (!b->n || b->fail) { b->n = 0; b->used = 0; return; }
+    double t0 = hllm_monotonic_ms();
+    if (hipEventRecord(r->snap_stage_ready[0], r->stream) != hipSuccess ||
+        hipEventSynchronize(r->snap_stage_ready[0]) != hipSuccess) {
+        b->fail = 1;
+    } else {
+        double t1 = hllm_monotonic_ms();
+        for (int i = 0; i < b->n; ++i)
+            memcpy(b->items[i].dst, (char *)r->snap_stage[0] + b->items[i].off, b->items[i].len);
+        b->wait_ms += t1 - t0;
+        b->copy_ms += hllm_monotonic_ms() - t1;
+    }
+    b->n = 0;
+    b->used = 0;
+}
+
+static void hllm_d2h_batch_add(hllm_d2h_batch *b, void *dst, const void *src, size_t len) {
+    hip_llm_runner *r = b->r;
+    if (b->fail || !dst || !len) { if (!dst) b->fail = 1; return; }
+    if (hllm_in_arena(dst)) {       /* pinned destination: copy directly */
+        if (hipMemcpyAsync(dst, src, len, hipMemcpyDeviceToHost, r->stream) != hipSuccess)
+            b->fail = 1;
+        b->direct = 1;
+        return;
+    }
+    if (hllm_snapshot_stage_init(r) || len > HLLM_SNAP_STAGE_BYTES / 2) {
+        hllm_d2h_batch_flush(b);
+        if (hllm_snapshot_d2h(r, dst, src, len)) b->fail = 1;
+        return;
+    }
+    if (b->used + len > HLLM_SNAP_STAGE_BYTES || b->n == (int)(sizeof(b->items) / sizeof(b->items[0])))
+        hllm_d2h_batch_flush(b);
+    if (hipMemcpyAsync((char *)r->snap_stage[0] + b->used, src, len,
+                       hipMemcpyDeviceToHost, r->stream) != hipSuccess) {
+        b->fail = 1;
+        return;
+    }
+    b->items[b->n++] = (hllm_d2h_item){ dst, b->used, len };
+    b->used += (len + 255) & ~(size_t)255;
 }
 
 hip_llm_state_snapshot *hip_llm_snapshot_state(hip_llm_runner *r) {
@@ -36431,6 +36623,7 @@ hip_llm_state_snapshot *hip_llm_snapshot_state(hip_llm_runner *r) {
                                          hipMemcpyDeviceToHost) != hipSuccess)
             goto fail;
     }
+    hllm_d2h_batch batch = { .r = r };
     for (int l = 0; l < r->n_layers; ++l) {
         hip_layer *cl = &r->layers[l];
         if (!cl->is_ssm) continue;
@@ -36438,18 +36631,20 @@ hip_llm_state_snapshot *hip_llm_snapshot_state(hip_llm_runner *r) {
             s->conv_bytes[l] = (size_t)(r->ssm_conv_kernel - 1) *
                                r->ssm_qkv_dim * sizeof(float);
             s->conv_host[l] = hllm_snapshot_alloc(s->conv_bytes[l]);
-            if (!s->conv_host[l] || hipMemcpy(s->conv_host[l], cl->d_conv_state,
-                                              s->conv_bytes[l], hipMemcpyDeviceToHost) != hipSuccess)
-                goto fail;
+            hllm_d2h_batch_add(&batch, s->conv_host[l], cl->d_conv_state, s->conv_bytes[l]);
         }
         if (cl->d_recurrent_state) {
             s->rec_bytes[l] = (size_t)r->ssm_dt_rank * r->ssm_d_state *
                               r->ssm_d_state * sizeof(float);
             s->rec_host[l] = hllm_snapshot_alloc(s->rec_bytes[l]);
-            if (!s->rec_host[l] || hllm_snapshot_d2h(r, s->rec_host[l], cl->d_recurrent_state, s->rec_bytes[l]))
-                goto fail;
+            hllm_d2h_batch_add(&batch, s->rec_host[l], cl->d_recurrent_state, s->rec_bytes[l]);
         }
     }
+    hllm_d2h_batch_flush(&batch);
+    if (batch.fail) goto fail;
+    if (getenv("LLM_SNAPSHOT_PROFILE"))
+        fprintf(stderr, "hip_llm: snapshot state copies wait=%.1f memcpy=%.1f ms\n",
+                batch.wait_ms, batch.copy_ms);
     if (r->d_ple_conv_state && r->ple_n_heads > 0) {
         size_t hist = (size_t)(r->ple_conv_kernel - 1) * r->ple_ngram;
         s->ple_bytes = hist * (size_t)r->hc_count * r->n_embd * sizeof(float);
@@ -36490,7 +36685,7 @@ hip_llm_state_snapshot *hip_llm_snapshot_state(hip_llm_runner *r) {
      * the hybrid SSM and DFlash state.  Bound this host-side copy to short
      * prompts; keep the host copy bounded so long-context serving does not
      * silently consume multiple gigabytes per cached conversation. */
-    if (r->is_hybrid && !r->is_qwen4exp &&
+    if (r->is_hybrid && !r->is_qwen4exp && !r->snapshot_skip_kv &&
         r->kv_cache_type == HIP_LLM_KV_Q8_0_Q8_0 &&
         s->position >= 0 && s->position + 1 <=
             (r->qwen35_snapshot_max_tokens > 0 ? r->qwen35_snapshot_max_tokens : 16384)) {
@@ -36541,8 +36736,10 @@ hip_llm_state_snapshot *hip_llm_snapshot_state(hip_llm_runner *r) {
                       attention_layers > 0 && copied_layers == attention_layers;
     }
     if (getenv("LLM_SNAPSHOT_PROFILE"))
-        fprintf(stderr, "hip_llm: snapshot profile sync=%.1f state=%.1f rest=%.1f ms\n",
-                t_synced - t_start, t_ssm - t_synced, hllm_monotonic_ms() - t_ssm);
+        fprintf(stderr, "hip_llm: snapshot profile sync=%.1f state=%.1f rest=%.1f ms "
+                "pool hits=%lu misses=%lu idle=%.0f MiB\n",
+                t_synced - t_start, t_ssm - t_synced, hllm_monotonic_ms() - t_ssm,
+                g_snapshot_pool_hits, g_snapshot_pool_misses, g_snapshot_pool_idle / 1048576.0);
     if (hip_llm_state_snapshot_bytes(s) >= ((size_t)256 << 20))
         fprintf(stderr, "hip_llm: snapshot capture %.1f MiB in %.1f ms\n",
                 hip_llm_state_snapshot_bytes(s) / 1048576.0,

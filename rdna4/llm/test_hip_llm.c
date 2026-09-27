@@ -601,6 +601,48 @@ static int stdio_snapshot_cache_publish_spare(stdio_snapshot_cache *cache,
     return rc;
 }
 
+/* LLM_SERVER_CANCEL_ROLLBACK=0 disables the per-turn rollback checkpoint. */
+static int stdio_cancel_rollback_enabled(void) {
+    static int value = -1;
+    if (value < 0) {
+        const char *env = getenv("LLM_SERVER_CANCEL_ROLLBACK");
+        value = env && *env ? atoi(env) != 0 : 1;
+    }
+    return value;
+}
+
+#define LOOP_TAIL 32
+/* Occurrences of the last `tail` tokens of t[0..n) within t (non-overlapping). */
+static int stdio_tail_repeats(const int32_t *t, int n, int tail) {
+    if (n < 3 * tail) return 0;
+    const int32_t *end = t + n - tail;
+    int count = 0;
+    for (int i = 0; i + tail <= n; ++i)
+        if (t[i] == end[0] && memcmp(t + i, end, (size_t)tail * sizeof(*t)) == 0) {
+            count++;
+            i += tail - 1;
+        }
+    return count;
+}
+
+static int stdio_token_id(const bpe_vocab *vocab, int n_vocab, const char *piece) {
+    for (int i = n_vocab - 1; i >= 0; --i) {       /* control tokens sit at the end */
+        const char *s = bpe_token_to_str(vocab, i);
+        if (s && strcmp(s, piece) == 0) return i;
+    }
+    return -1;
+}
+
+/* LLM_SERVER_LOOP_GUARD=0 disables the reasoning-loop guard. */
+static int stdio_loop_guard_enabled(void) {
+    static int value = -1;
+    if (value < 0) {
+        const char *env = getenv("LLM_SERVER_LOOP_GUARD");
+        value = env && *env ? atoi(env) != 0 : 1;
+    }
+    return value;
+}
+
 /* DFlash2 hands decoding back to the target at this position: at 64K its
  * acceptance fell to 37% and speculation ran slower than the target alone.
  * LLM_QWEN35_DFLASH2_MAX_POS overrides it (0 disables DFlash2). */
@@ -1180,6 +1222,21 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
         free(tokens);
         if (max_tokens < 0) max_tokens = 0;
         if (max_tokens > max_seq_len - cache_n) max_tokens = max_seq_len - cache_n;
+        /* Continuation turns keep no prompt snapshot.  A resident checkpoint
+         * (recurrent, logits and draft state; the KV rows stay in VRAM and
+         * decoding only appends) lets a cancelled request roll the live
+         * state back to its prompt instead of resetting it, so an agent's
+         * retry after an interrupt needs no prefill at all. */
+        hip_llm_state_snapshot *boundary_snapshot = NULL;
+        if (snapshot_cache.entries && !pending_prompt_snapshot && max_tokens > 0 &&
+            stdio_cancel_rollback_enabled()) {
+            double tb = get_time_ms();
+            boundary_snapshot = hip_llm_snapshot_state_resident(gpu);
+            if (boundary_snapshot)
+                fprintf(stderr, "llm_server: rollback checkpoint %.1f MiB in %.1f ms\n",
+                        hip_llm_state_snapshot_bytes(boundary_snapshot) / 1048576.0,
+                        get_time_ms() - tb);
+        }
         size_t text_cap = (size_t)max_tokens * 16 + 1, text_n = 0;
         char *text = (char *)calloc(text_cap ? text_cap : 1, 1);
         int generated = 0, finish_eos = 0, live_text_bad = 0;
@@ -1223,6 +1280,19 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
         double q35_draft_ms = 0.0, q35_verify_ms = 0.0,
                q35_commit_ms = 0.0;
         int32_t stops[] = { eos, eot, im_end };
+        /* Reasoning-loop guard.  The 2-bit model occasionally repeats one
+         * paragraph of its thinking until the output cap (observed twice in
+         * ~400 agent requests, each burning ~6 minutes).  While the prompt
+         * opened a <think> block and it is not closed yet: when the last
+         * LOOP_TAIL tokens already occurred twice before, raise the
+         * presence penalty to Qwen's recommended 1.5; if it loops again at
+         * least 256 tokens later, close the thinking so the answer starts. */
+        int think_close = stdio_token_id(vocab, n_vocab, "</think>");
+        int think_open = stdio_token_id(vocab, n_vocab, "<think>");
+        int loop_guard = 0, loop_trips = 0, loop_last_trip = 0, loop_force_close = 0;
+        for (int i = n_tokens - 1; think_open >= 0 && think_close >= 0 && i >= 0 &&
+                                   i >= n_tokens - 4; --i)
+            if (cache[i] == think_open) loop_guard = stdio_loop_guard_enabled();
         for (int k = 0; logits && k < max_tokens; k++) {
             if (g_stdio_cancel) { cancelled = 1; break; }
             int use_mtp = mtp_draft > 0 && temperature <= 0.0f &&
@@ -1263,6 +1333,13 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
                  sample_top_k_p(logits, n_vocab, top_k, top_p, temperature, presence,
                                repetition, min_p, seen, &rng));
             if (next < 0 || next >= n_vocab) { mtp_error = 1; break; }
+            if (loop_guard && loop_force_close) {
+                next = think_close;
+                loop_force_close = 0;
+                fprintf(stderr, "llm_server: reasoning loop persisted; closed the "
+                        "thinking at token %d\n", generated);
+            }
+            if (loop_guard && next == think_close) loop_guard = 0;
             if (sampler) hllm_sampler_accept(sampler, next);
             int is_stop = is_generation_stop(vocab, next, eos, eot) ||
                           next == im_end;
@@ -1294,6 +1371,18 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
             if (cache_n < max_seq_len) cache[cache_n++] = next;
             if (seen && next >= 0 && next < n_vocab) seen[next] = 1;
             generated++;
+            if (loop_guard && generated % 16 == 0 &&
+                stdio_tail_repeats(cache + n_tokens, cache_n - n_tokens, LOOP_TAIL) >= 3) {
+                if (loop_trips == 0) {
+                    if (presence < 1.5f) presence = 1.5f;
+                    fprintf(stderr, "llm_server: reasoning loop at token %d; presence "
+                            "penalty raised to %.1f\n", generated, presence);
+                    loop_trips = 1;
+                    loop_last_trip = generated;
+                } else if (generated - loop_last_trip >= 256) {
+                    loop_force_close = 1;
+                }
+            }
             if (is_stop) {
                 /* Stop was sampled but never forwarded. Only processed
                  * tokens belong in the reusable KV/recurrent prefix.  A
@@ -1500,6 +1589,7 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
             hip_llm_set_decode_mode(gpu, 0);
             hllm_sampler_free(sampler);
             free(text); free(seen);
+            hip_llm_free_state_snapshot(boundary_snapshot);
             puts("ERR generation"); fflush(stdout); continue;
         }
         double t_decode1 = get_time_ms();
@@ -1595,9 +1685,19 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
                 request_bytes, request_bytes_n);
             pending_prompt_snapshot = NULL;
             stdio_snapshot_cache_drop_resident(&snapshot_cache);
-            hip_llm_reset_state(gpu);
-            cache_n = 0;
-            active_identity[0] = '\0';
+            if (boundary_snapshot && request_bytes &&
+                hip_llm_restore_state(gpu, boundary_snapshot) == 0 &&
+                (live_bytes = (unsigned char *)malloc(request_bytes_n + 1)) != NULL) {
+                memcpy(live_bytes, request_bytes, request_bytes_n);
+                live_bytes_n = request_bytes_n;
+                cache_n = n_tokens;
+                fprintf(stderr, "llm_server: cancelled; live state rolled back to the "
+                        "%d-token prompt\n", n_tokens);
+            } else {
+                hip_llm_reset_state(gpu);
+                cache_n = 0;
+                active_identity[0] = '\0';
+            }
         } else if (!getenv("LLM_QWEN4_MTP_TRUST_DRAFT")) {
             for (int i = 0; i < n_bounds; ++i) {
                 if (!pending_prefix_snaps[i]) continue;
@@ -1632,6 +1732,7 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
                enc ? enc : "", prefill_ms, decode_ms);
         fflush(stdout);
         hllm_sampler_free(sampler);
+        hip_llm_free_state_snapshot(boundary_snapshot);
         free(enc); free(text); free(seen);
     }
     free(cache);

@@ -1,5 +1,74 @@
 # Qwen3.8 server correctness and performance
 
+## Interrupted follow-up turns, reasoning loops, snapshot buffers — 2026-09-27
+
+### Rolling back a cancelled continuation
+
+A cancelled request reset the runner. The first turn of a conversation kept
+its prompt snapshot, but an interrupted follow-up turn (a live continuation,
+which takes no prompt snapshot) left the retry nothing better than the last
+saved snapshot or shared prefix.
+
+Every continuation turn now takes a **resident checkpoint** after prefill:
+the recurrent, logits and DFlash2 state, without the attention KV rows
+(`hip_llm_snapshot_state_resident`). Decoding only appends KV rows, so on a
+cancel the runner restores the checkpoint and keeps the live state at the
+prompt boundary instead of resetting. The agent's retry is then a live
+continuation with nothing to prefill.
+- Measured on an 8,590-token follow-up interrupted at its first token: the
+  retry reused all 8,590 tokens in 1.4 s.
+- Its greedy text equals the uninterrupted follow-up byte for byte.
+- A clean re-prefill of the same messages differs late, as any live
+  continuation does.
+
+The checkpoint is 233 MiB. It lives in one persistent pinned arena, sized
+from the previous checkpoint, so the GPU copies straight into it: **18 ms
+per turn** after the first, against 130 ms with ordinary buffers.
+`LLM_SERVER_CANCEL_ROLLBACK=0` turns it off.
+
+A different next message after an interrupt still restores from saved
+snapshots, because the old prompt's assistant header is not a prefix of the
+new prompt.
+
+### Reasoning-loop guard
+
+In about 400 agent requests, two turns looped on one paragraph of their
+thinking until the 16,384-token output cap:
+- a Claude Code review turn;
+- a Codex turn that repeated "Scenario: realloc to 8 succeeded…" four times
+  and never found the missing `sizeof(int)`, so the task failed.
+
+Each wasted about 6 minutes of GPU time.
+
+The runner now watches thinking-mode generations until `</think>`. Every 16
+tokens it checks whether the last 32 tokens have already occurred twice in
+this response.
+1. On the first hit, it raises the presence penalty to 1.5, the value
+   Qwen recommends against endless repetition in quantized models.
+2. If the loop continues at least 256 tokens later, it closes the thinking
+   (emits `</think>`) so the model moves on to its answer.
+
+Induced test (the model was told to recite a line 80 times in its
+reasoning): the guard tripped at token 1456 and closed the thinking at 1776.
+Normal thinking at 3K–23K contexts never triggered it. Code and answers
+after `</think>` are never touched. `LLM_SERVER_LOOP_GUARD=0` turns it off.
+
+### Snapshot buffers
+
+- Freed snapshot buffers of 2 MiB or more are pooled and reused, best fit,
+  up to `LLM_SNAPSHOT_POOL_MIB` (default 1024). Over the cap, the largest
+  idle blocks are dropped first.
+- Per-layer recurrent-state copies are batched through the pinned staging
+  buffer with one synchronization per 32 MiB, instead of a synchronous
+  round trip each.
+
+`LLM_SNAPSHOT_PROFILE=1` now splits a capture into device wait and host
+copy. On this machine the host copy into fresh pages runs at about 2 GB/s:
+xmrig saturates DRAM, and non-coherent pinned staging did not change it.
+Full KV captures therefore stay about as fast as with huge pages alone.
+Pinning the whole 12 GiB snapshot cache instead is not worth the locked
+memory.
+
 ## Hardening for agent traffic: crashes, interrupts, protocol — 2026-09-27
 
 ### Runner crashes
