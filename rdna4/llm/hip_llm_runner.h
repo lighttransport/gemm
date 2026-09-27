@@ -186,6 +186,10 @@ int hip_llm_qwen35_mtp_commit(hip_llm_runner *r, int processed);
  * nonzero when it does not fit; the caller should then decode without the
  * draft model. */
 int hip_llm_qwen35_mtp_verify_reserve(hip_llm_runner *r, int rows);
+/* Allocate the worst-case Q8 prefill attention scratch now (about 200 MiB
+ * for 512-row batches) so a server's first long prompt cannot fail on it
+ * after the KV cache and optional workspaces have taken the VRAM. */
+int hip_llm_reserve_prefill_scratch(hip_llm_runner *r);
 /* Discard only the dense draft transaction/history. Target prompt state and
  * logits remain live. Call at every independent serving request boundary. */
 void hip_llm_qwen35_mtp_reset(hip_llm_runner *r);
@@ -194,6 +198,9 @@ void hip_llm_qwen35_mtp_reset(hip_llm_runner *r);
  * only verified target tokens are committed to the caller. */
 int hip_llm_qwen35_dflash2_load(hip_llm_runner *r, const char *path,
                                char *error, size_t error_cap);
+/* True when the draft's context ends at `position`, so a proposal there is
+ * valid.  Plain target decoding does not extend it; the next prefill does. */
+int hip_llm_qwen35_dflash2_synced(hip_llm_runner *r, int position);
 int hip_llm_qwen35_dflash2_propose(hip_llm_runner *r, int32_t anchor,
                                   int position, int count, int32_t *drafts);
 int hip_llm_qwen35_dflash2_commit(hip_llm_runner *r, int position,

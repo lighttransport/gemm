@@ -557,6 +557,46 @@ static int stdio_other_conversation(const unsigned char *prompt, size_t prompt_n
     return common <= longest + 4 * STDIO_OTHER_CONVERSATION_SLACK;
 }
 
+/* DFlash2 hands decoding back to the target at this position: at 64K its
+ * acceptance fell to 37% and speculation ran slower than the target alone.
+ * LLM_QWEN35_DFLASH2_MAX_POS overrides it (0 disables DFlash2). */
+static int dflash2_max_position(void) {
+    static int value = -1;
+    if (value < 0) {
+        const char *env = getenv("LLM_QWEN35_DFLASH2_MAX_POS");
+        value = env && *env ? atoi(env) : 32768;
+        if (value < 0) value = 0;
+    }
+    return value;
+}
+
+/* Plain-decode wall time per token, a moving average over requests that
+ * handed off to the decode graph.  LLM_QWEN35_DFLASH2_PLAIN_MS seeds it
+ * (default 21 ms, the RX 9070 XT GSQ profile at a few K tokens). */
+static double g_dflash2_plain_ms = 0.0;
+static double dflash2_plain_ms_per_token(void) {
+    if (g_dflash2_plain_ms <= 0.0) {
+        const char *env = getenv("LLM_QWEN35_DFLASH2_PLAIN_MS");
+        g_dflash2_plain_ms = env && *env && atof(env) > 0.0 ? atof(env) : 21.0;
+    }
+    return g_dflash2_plain_ms;
+}
+static void dflash2_observe_plain(double ms) {
+    if (ms > 0.0 && ms < 1000.0)
+        g_dflash2_plain_ms = 0.7 * dflash2_plain_ms_per_token() + 0.3 * ms;
+}
+
+#define DFLASH2_MIN_STEPS 16
+/* LLM_QWEN35_DFLASH2_ADAPTIVE=0 restores unconditional speculation. */
+static int dflash2_adaptive(void) {
+    static int value = -1;
+    if (value < 0) {
+        const char *env = getenv("LLM_QWEN35_DFLASH2_ADAPTIVE");
+        value = env && *env ? atoi(env) != 0 : 1;
+    }
+    return value;
+}
+
 static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
                             int n_vocab, int max_seq_len, int bos_id, int mtp_draft,
                             int dense_mtp_draft, int dense_mtp_window,
@@ -588,6 +628,11 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
      * cache.  Reserve it before the first request: when it no longer fits
      * (a large context took the VRAM) serve with plain decode rather than
      * failing every generation on the first verify. */
+    if (hip_llm_reserve_prefill_scratch(gpu)) {
+        fprintf(stderr, "llm_server: the prefill scratch does not fit next to the "
+                "%d-token context; lower the context\n", max_seq_len);
+        free(cache); return 1;
+    }
     int spec_draft = dflash_draft > 0 ? dflash_draft :
                      dense_mtp_window ? dense_mtp_draft : 0;
     if (spec_draft > 0 && hip_llm_qwen35_mtp_verify_reserve(gpu, spec_draft + 1)) {
@@ -1108,6 +1153,19 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
             (dense_mtp_draft > 0 && dense_mtp_window && temperature <= 0.0f ?
              dense_mtp_draft : 0);
         int q35_proposed = 0, q35_accepted = 0;
+        /* Adaptive DFlash2: judge speculation by its cumulative rate since
+         * the start of the request.  After DFLASH2_MIN_STEPS steps, a request
+         * whose speculative rate stays below 90% of plain decoding (long
+         * thinking prose with ~30% acceptance) hands the rest of its tokens
+         * to the target's decode graph; code and tool calls, where the gain
+         * comes in bursts of fully accepted windows, keep speculating.  The
+         * hand-off is one-way: plain tokens do not feed the draft's context,
+         * and the next prompt's prefill re-syncs it. */
+        const int q35_adaptive = q35_is_dflash && dflash2_adaptive();
+        double q35_spec_start = 0.0;
+        int q35_spec_generated = 0, q35_spec_steps = 0, q35_handed_off = 0;
+        double q35_plain_ms = 0.0, q35_last_tick = 0.0;
+        int q35_plain_tokens = 0;
         double q35_draft_ms = 0.0, q35_verify_ms = 0.0,
                q35_commit_ms = 0.0;
         int32_t stops[] = { eos, eot, im_end };
@@ -1238,14 +1296,37 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
             if (q35_draft > 0 && !q35_dflash_fallback &&
                 (!q35_is_dflash || !coding_mode) &&
                 q35_rows == 0 && k + 1 < max_tokens) {
-                if (q35_is_dflash && cache_n - 1 >= 32768) {
+                if (q35_is_dflash && cache_n - 1 >= dflash2_max_position()) {
                     q35_dflash_fallback = 1;
                     fprintf(stderr,
                             "llm_server: DFlash2 disabled at position %d; "
                             "using target decode for long context\n",
                             cache_n - 1);
                 }
-                if (!q35_dflash_fallback) {
+                int speculate = !q35_dflash_fallback;
+                if (speculate && q35_adaptive) {
+                    double now = get_time_ms();
+                    if (q35_spec_steps == 0) {
+                        q35_spec_start = now;
+                        q35_spec_generated = generated;
+                    } else if (q35_spec_steps >= DFLASH2_MIN_STEPS && now > q35_spec_start &&
+                               (generated - q35_spec_generated) / (now - q35_spec_start) *
+                               dflash2_plain_ms_per_token() < 0.9) {
+                        fprintf(stderr, "llm_server: DFlash2 hand-off at position %d after "
+                                "%d steps: %.1f < plain %.1f tok/s\n", cache_n - 1,
+                                q35_spec_steps,
+                                1000.0 * (generated - q35_spec_generated) / (now - q35_spec_start),
+                                1000.0 / dflash2_plain_ms_per_token());
+                        q35_dflash_fallback = q35_handed_off = 1;
+                        speculate = 0;
+                    }
+                    if (speculate) q35_spec_steps++;
+                }
+                if (speculate && q35_is_dflash && !hip_llm_qwen35_dflash2_synced(gpu, cache_n - 1)) {
+                    q35_dflash_fallback = 1;
+                    speculate = 0;
+                }
+                if (speculate) {
                     int count = max_tokens - k - 1;
                     if (count > q35_draft) count = q35_draft;
                     double td = get_time_ms();
@@ -1295,9 +1376,21 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
             /* If approximate MTP just fell back after a zero-accept batch,
              * replay the emitted anchor through the target so the ordinary
              * decode path resumes with fresh logits and state. */
-            if (!use_mtp && !q35_window && !q35_rows)
+            /* q35_window describes the window this token came from; when
+             * that window just committed and no new one was proposed (the
+             * DFlash2 hand-off), the target must forward `next` here or the
+             * following token is sampled from stale logits. */
+            int plain_step = !use_mtp && !q35_rows;
+            if (plain_step)
                 logits = hip_llm_forward_logits(gpu, next, cache_n - 1);
             double token_now = get_time_ms();
+            if (plain_step && q35_last_tick > 0.0) {
+                /* Wall time per plain token, sampling included, so it
+                 * compares with the speculative steps' wall rate. */
+                q35_plain_ms += token_now - q35_last_tick;
+                q35_plain_tokens++;
+            }
+            q35_last_tick = token_now;
             double token_ms = token_now - t_decode0;
             fprintf(stderr,
                     "llm_server: decode token=%d id=%d elapsed=%.2f ms "
@@ -1311,15 +1404,20 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
          * Publish exactly the rows whose tokens were emitted; later verifier
          * rows remain transaction-local and must not leak into the next turn. */
         if (!cancelled && !mtp_error && q35_rows > 0 && q35_index > 0) {
+            /* The last emitted token matched a draft (a mismatch commits in
+             * the loop), so it is the input of row q35_index.  Include that
+             * row: the live state must cover cache[0..cache_n), every emitted
+             * token, as after plain decode and the stop commit. */
+            int processed = q35_index < q35_rows ? q35_index + 1 : q35_index;
             double tc = get_time_ms();
             int commit_rc = q35_is_dflash ?
-                hip_llm_qwen35_dflash2_commit(gpu, q35_position, q35_index) :
-                hip_llm_qwen35_mtp_commit(gpu, q35_index);
+                hip_llm_qwen35_dflash2_commit(gpu, q35_position, processed) :
+                hip_llm_qwen35_mtp_commit(gpu, processed);
             q35_commit_ms += get_time_ms() - tc;
             if (commit_rc) {
                 fprintf(stderr,
                         "llm_server: Qwen3.8 speculative length commit failed "
-                        "pos=%d rows=%d\n", q35_position, q35_index);
+                        "pos=%d rows=%d\n", q35_position, processed);
                 fflush(stderr);
                 mtp_error = 1;
             }
@@ -1362,6 +1460,13 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
                     q35_is_dflash ? "DFlash2" : "Dense NextN",
                     q35_proposed, q35_accepted, q35_draft_ms,
                     q35_verify_ms, q35_commit_ms);
+            if (q35_adaptive && q35_plain_tokens >= 16)
+                dflash2_observe_plain(q35_plain_ms / q35_plain_tokens);
+            if (q35_adaptive)
+                fprintf(stderr, "llm_server: DFlash2 adaptive spec_steps=%d "
+                        "handed_off=%d plain_tokens=%d plain=%.1f tok/s\n",
+                        q35_spec_steps, q35_handed_off, q35_plain_tokens,
+                        1000.0 / dflash2_plain_ms_per_token());
         }
         {
             hip_llm_moe_stats ms;
@@ -2948,7 +3053,7 @@ int main(int argc, char **argv) {
                 if (sampler) hllm_sampler_accept(sampler, next_tok);
                 if (k + 1 == decode_n) break;
                 int pos = bench_depth + n_prefill + k;
-                if (dense_dflash2 && dense_dflash2_enabled && pos >= 32768) {
+                if (dense_dflash2 && dense_dflash2_enabled && pos >= dflash2_max_position()) {
                     dense_dflash2_enabled = 0;
                     if (!dense_dflash_longctx_notified) {
                         dense_dflash_longctx_notified = 1;

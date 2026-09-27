@@ -15,10 +15,11 @@ model="${QWEN38_MODEL:-/mnt/disk1/models/qwen38/27b/gsq/Qwen3.8-27B-GSQ-RCO-IQ2_
 dflash="${QWEN38_DFLASH2:-/mnt/disk1/models/qwen38/27b/dflash2/Qwen3.8-27B-DFlash2-Q4_K_M.gguf}"
 port="${QWEN38_API_PORT:-8090}"
 host="${QWEN38_API_HOST:-127.0.0.1}"
-# 112K is the largest context that still leaves VRAM for DFlash2's verify
-# workspace on a 16 GB card (the runner serves without DFlash2 above it).
-# Claude Code needs well over 64K: it compacts ~30K tokens below the window.
-context="${QWEN38_CONTEXT:-114688}"
+# 96K is the largest context that leaves VRAM for the GSQ profile's decode
+# layout, the prefill scratch and DFlash2's verify workspace on a 16 GB card
+# (above it the runner serves without DFlash2).  Claude Code needs well over
+# 64K: it compacts ~30K tokens below the window.
+context="${QWEN38_CONTEXT:-98304}"
 max_output="${QWEN38_MAX_OUTPUT:-16384}"
 thinking="${QWEN38_THINKING:-auto}"
 # Host-side conversation snapshots: the shared system prefix plus the live
@@ -35,6 +36,9 @@ for f in "${model}" "${dflash}"; do
         exit 1
     fi
 done
+# The GSQ profile wrapper selects the tuned kernels (see the script);
+# QWEN38_RUNNER=path/to/test_hip_llm runs the binary with its defaults.
+runner="${QWEN38_RUNNER:-${runner_dir}/qwen38_gsq_stdio_runner.sh}"
 if [[ ! -x "${runner_dir}/test_hip_llm" ]]; then
     echo "build the runner first: make -C ${runner_dir}" >&2
     exit 1
@@ -62,7 +66,7 @@ fi
 
 export ROCEW_ROCM_LIB="${ROCEW_ROCM_LIB:-/opt/rocm/lib}"
 cd "${runner_dir}"
-exec python3 codex_server.py "${model}" --runner "${runner_dir}/test_hip_llm" \
+exec python3 codex_server.py "${model}" --runner "${runner}" \
     --host "${host}" --port "${port}" --context "${context}" \
     --max-output "${max_output}" --thinking "${thinking}" \
     --served-model-name "${QWEN38_SERVED_MODEL:-qwen3.8-27b}" \

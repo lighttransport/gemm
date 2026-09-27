@@ -1,5 +1,134 @@
 # Qwen3.8 server correctness and performance
 
+## Faster agent traffic: kernel profile, adaptive DFlash2, two decode fixes — 2026-09-27
+
+Where the time went in the agent runs below: decode was 83% of GPU time, at
+37–39 tok/s. The 4K benchmark decodes at 50 tok/s.
+
+### The HTTP server never used the tuned kernels
+
+`run_qwen38_gsq_rocm.sh`, which produced every published benchmark number,
+sets about 25 kernel-selection variables:
+- `--decode-kernels/--decode-layout auto` with a 1.8 GiB decode layout,
+- `--qwen35-batched-prefill --ubatch 512` (the server prefilled 128 rows at
+  a time),
+- the Q8_1 matvec selections.
+
+`codex_server.py` started `test_hip_llm` directly and got none of them. The
+launcher now runs the runner through `qwen38_gsq_stdio_runner.sh`, which
+applies the profile (`QWEN38_RUNNER` overrides it). Same prompts, same
+server:
+
+| | Before | Profile |
+| --- | ---: | ---: |
+| Prefill, 16K prompt | 525 tok/s | 771 tok/s |
+| Prefill, 40K prompt | 424 tok/s | 634 tok/s |
+| Plain decode, 40K | 38.6 tok/s | 43.1 tok/s |
+| DFlash2 decode, 16K (greedy) | 48.0 tok/s | 53.6 tok/s |
+
+The decode layout costs VRAM, so the default context drops from 112K to
+**96K**, the largest that keeps the prefill scratch and the DFlash2 verify
+workspace. A needle test at 87,595 tokens passes (3/3). Prefill runs at
+402 tok/s, against 261 tok/s at 100K without the profile, and 492 MiB stays
+free at peak.
+
+The runner now also reserves the worst-case Q8 prefill attention scratch
+before READY (`hip_llm_reserve_prefill_scratch`, about 200 MiB for 512-row
+batches). It used to be allocated on the first prefill, and with the
+profile at 112K that allocation failed with `ERR prefill` after the KV cache
+and DFlash2 had taken the VRAM.
+
+### Adaptive DFlash2
+
+Thinking-mode agent turns, server-default sampling, 1024 tokens (tok/s):
+
+| Prompt | Always speculate | Plain | Adaptive |
+| ---: | ---: | ---: | ---: |
+| 3K | 39.6 (28% accepted) | 48.7 | 48.9 |
+| 12K | 37.2 | 46.9 | 47.4 |
+| 23K | 31.0 | 45.2 | 46.0 |
+
+A speculative step, meaning a draft plus an 8-row verify, costs 75–88 ms. At
+about 21 ms per plain token it pays off only above roughly 37% acceptance.
+Thinking prose stays below that. Code and tool calls are well above it.
+
+Stack-library agent task (Claude Code, Codex, pi; all passing an independent
+ASan check). Aggregate server-side rates:
+
+| Configuration | Decode | Prefill | Accepted |
+| --- | ---: | ---: | ---: |
+| Old: no profile, always speculate | 49.8 | 462 | 45% |
+| Profile, always speculate | 52.6 | 634 | 47% |
+| Profile, adaptive (default) | 50.1 | 651 | 49% |
+
+The adaptive run had a different mix of turns: 68% of its tokens were in
+turns that handed off. Split per request:
+- turns that kept speculating: 60.3 tok/s at 56% acceptance;
+- turns that handed off: 46.5 tok/s, plain speed. Always speculating would
+  have run them at about 40 tok/s, given their 28% acceptance.
+
+Policy:
+- Each request speculates first.
+- After 16 steps, if its **cumulative** rate is below 90% of plain decoding,
+  the rest of the request goes to the decode graph.
+- Plain speed is a moving average of measured plain tokens, seeded at 21 ms
+  (`LLM_QWEN35_DFLASH2_PLAIN_MS`).
+
+The hand-off is one-way:
+- Plain tokens do not produce the draft's features, and the next prompt's
+  prefill re-syncs them.
+- Resuming by decoding one-row verify steps was tried: it runs at 22 tok/s.
+- Resuming with the skipped window zeroed was also tried: the probes kept
+  losing.
+
+Knobs:
+- `LLM_QWEN35_DFLASH2_ADAPTIVE=0` restores unconditional speculation.
+- `LLM_QWEN35_DFLASH2_MAX_POS` (default 32768) keeps the old position cut-off.
+
+### Two decode bugs behind the hand-off
+
+Both are in the stdio server loop (`test_hip_llm.c`). The benchmark loop was
+not affected.
+
+1. **Stale logits after a speculative-to-plain switch.** The loop skipped
+   the target forward of the token that came from the just-committed window,
+   because `q35_window` still described that window. The next token was
+   then sampled from the prompt's logits. Greedy code output stopped after
+   18 tokens (`def tool_registry(to` then `` ``` ``). The old 32K cut-off
+   takes the same path (reproduced by forcing it at position 9900), so every
+   DFlash2 generation that crossed position 32,768 got one token sampled
+   from stale logits there.
+2. **Live state one token short after a length cut inside a window.** The
+   final commit published `q35_index` rows. The last emitted token is the
+   input of row `q35_index`, so the live state missed it. Live continuation
+   then extended a state that did not contain the reply's last token. The
+   commit now includes that row, matching plain decode and the stop commit.
+
+Check (`tmp/gsqprof/cut_continue.py`): cut a DFlash2 reply at 3, 5, 6, 7, 9
+or 13 tokens, continue the conversation, and compare with a fresh prefill of
+the same messages. All match.
+- A 22-token cut differs late at a near-tie. It differs identically with
+  always-on speculation, so the verifier's state, not the hand-off, is not
+  bit-identical to a batch prefill.
+- The reference 4K benchmark keeps hash `44915ec1039a64c8`: ordinary
+  50.2 tok/s, DFlash2 103.6 tok/s.
+- The DFlash2 HTTP gate passes (4/4).
+
+### Conversation switches
+
+Capturing a live state before another conversation takes the GPU ran at
+about 1.1 GB/s: 3.1 GB in 2.5 s at 87K tokens.
+
+The limit is first-touch page faults on the fresh host buffers (about
+1.5 GB/s on 4 KiB pages), not PCIe. Snapshot buffers are now 2 MiB aligned
+with `MADV_HUGEPAGE`, and large device-to-host copies go through a pinned
+double buffer: 770 MiB now takes 414–458 ms instead of 700 ms. Restore
+already ran at about 10 GB/s.
+
+Captures and restores of 256 MiB or more are logged with their time.
+`LLM_SNAPSHOT_PROFILE=1` splits a capture into stages. Reusing freed
+snapshot buffers would avoid the faults altogether and is the next lever.
+
 ## Agent code review, long context and review fixes — 2026-09-27
 
 ### Long context: 1M is out of reach, the card's own limit is stable

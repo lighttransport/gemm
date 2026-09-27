@@ -868,6 +868,11 @@ static void hllm_dflash_conv(hip_llm_runner *r, hllm_qwen35_dflash2 *d,
     d->q81_source=NULL;
 }
 
+int hip_llm_qwen35_dflash2_synced(hip_llm_runner *r, int position) {
+    hllm_qwen35_dflash2 *d = r ? r->qwen35_dflash2 : NULL;
+    return d && d->kv_end == position;
+}
+
 int hip_llm_qwen35_dflash2_propose(hip_llm_runner *r, int32_t anchor,
         int position, int count, int32_t *drafts) {
     hllm_qwen35_dflash2 *d = r ? r->qwen35_dflash2 : NULL;
