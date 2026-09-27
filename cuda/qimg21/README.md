@@ -2448,4 +2448,3 @@ tile.
 - **`trajectory_sweep.py`** runs fast-runner settings against PyTorch
   trajectories from matched noise; see "Agreement with PyTorch" in the same
   README.
-
