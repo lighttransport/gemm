@@ -3,7 +3,14 @@
 
 #ifdef PX_HIP
 #include "../tmp/pixal3d/wmma_attention.inc"
+// RDNA runs wave32; the warp kernels below reduce over 32 lanes.
+#define PX_SHFL_XOR(v, s) __shfl_xor(v, s)
+#define PX_SHFL_DOWN(v, s) __shfl_down(v, s)
+#define PX_SHFL(v, l) __shfl(v, l)
 #else
+#define PX_SHFL_XOR(v, s) __shfl_xor_sync(0xffffffffu, v, s)
+#define PX_SHFL_DOWN(v, s) __shfl_down_sync(0xffffffffu, v, s)
+#define PX_SHFL(v, l) __shfl_sync(0xffffffffu, v, l)
 #include "../tmp/pixal3d/fa2.inc"
 __global__ void px_attention_layout(unsigned short *packed, float *plain, int n, int heads, int precision,
                                     int unpack) {
@@ -17,6 +24,18 @@ __global__ void px_attention_layout(unsigned short *packed, float *plain, int n,
                                   : __half2float(__ushort_as_half(packed[i]));
     else
         packed[i] = px_pack(plain[j], precision);
+}
+// FA2's [heads, n, 128] output straight to a packed BF16 [n, heads*128]
+// GEMM input: the value px_attention_layout unpacks, rounded as cast_bfloat.
+__global__ void px_attention_unpack_bf16(unsigned short *plain, const unsigned short *packed, int n, int heads,
+                                         int precision) {
+    size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= size_t(n) * heads * 128)
+        return;
+    int d = i % 128, row = i / 128 % n, head = i / (128 * n);
+    float value = precision == 1 ? __uint_as_float(unsigned(packed[i]) << 16)
+                                 : __half2float(__ushort_as_half(packed[i]));
+    plain[(size_t(row) * heads + head) * 128 + d] = __float_as_uint(round_bfloat(value)) >> 16;
 }
 #endif
 static Buffer &px_buffer(void *p) {
@@ -55,10 +74,11 @@ __global__ void px_element(float *out, const float *x, const float *w, const flo
     }
     out[i] = round_precision(value, precision);
 }
+__device__ unsigned short px_bf16_bits(float value) { return __float_as_uint(round_bfloat(value)) >> 16; }
 // px_element with one block per row and threads striding over the channels:
 // the same per-element arithmetic without a 64-bit modulo per element.
 __global__ void px_element_rows(float *out, const float *x, const float *w, const float *b, int op, int c,
-                                int precision, int k, int offset) {
+                                int precision, int k, int offset, unsigned short *packed) {
     size_t row = blockIdx.x;
     for (int ch = threadIdx.x; ch < c; ch += blockDim.x) {
         size_t i = row * c + ch;
@@ -80,7 +100,11 @@ __global__ void px_element_rows(float *out, const float *x, const float *w, cons
             float shift = w[offset + ch], scale = round_precision(1 + w[offset + c + ch], precision);
             value = round_precision(round_precision(value, precision) * scale, precision) + shift;
         }
-        out[i] = round_precision(value, precision);
+        value = round_precision(value, precision);
+        if (packed)
+            packed[i] = px_bf16_bits(value);
+        else
+            out[i] = value;
     }
 }
 __global__ void px_norm(float *out, const float *x, const float *w, const float *b, int c, float eps,
@@ -129,7 +153,7 @@ __global__ void px_norm(float *out, const float *x, const float *w, const float 
 // per-head RMS norms (rows of 128 values, heads x tokens rows) left half of
 // px_norm's threads idle and spent most of its time in barriers.
 __global__ void px_norm_warp(float *out, const float *x, const float *w, const float *b, int c, float eps,
-                             int precision, int rms, int heads, int rows) {
+                             int precision, int rms, int heads, int rows, unsigned short *packed) {
     int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x % 32;
     if (row >= rows)
         return;
@@ -138,7 +162,7 @@ __global__ void px_norm_warp(float *out, const float *x, const float *w, const f
     for (int j = lane; j < c; j += 32)
         sum += rms ? double(in[j]) * in[j] : in[j];
     for (int s = 16; s; s /= 2)
-        sum += __shfl_xor_sync(0xffffffffu, sum, s);
+        sum += PX_SHFL_XOR(sum, s);
     double mean = rms ? 0 : sum / c, variance = sum;
     if (!rms) {
         variance = 0;
@@ -147,7 +171,7 @@ __global__ void px_norm_warp(float *out, const float *x, const float *w, const f
             variance += v * v;
         }
         for (int s = 16; s; s /= 2)
-            variance += __shfl_xor_sync(0xffffffffu, variance, s);
+            variance += PX_SHFL_XOR(variance, s);
     }
     float inv =
         rms ? sqrtf(float(c)) / fmaxf(sqrtf(float(variance)), 1e-12f) : 1 / sqrtf(float(variance / c) + eps);
@@ -155,7 +179,11 @@ __global__ void px_norm_warp(float *out, const float *x, const float *w, const f
         float value = in[j];
         value = rms ? value * (inv * w[(row % heads) * c + j])
                     : (value - float(mean)) * inv * (w ? w[j] : 1) + (b ? b[j] : 0);
-        out[size_t(row) * c + j] = round_precision(value, precision);
+        value = round_precision(value, precision);
+        if (packed)
+            packed[size_t(row) * c + j] = px_bf16_bits(value);
+        else
+            out[size_t(row) * c + j] = value;
     }
 }
 __device__ void px_phase(const int *coords, int f, int nf, float &co, float &si) {
@@ -256,7 +284,7 @@ __global__ void px_cross5(float *out, const float *q, const float *k, const floa
 // then (i, i+32), then shuffles down 16..1 -- the same pairings, so the same
 // sums, without a 256-thread block and ten barriers per key.
 __global__ void px_cross5_warp(float *out, const float *q, const float *k, const float *v, int n, int heads,
-                               int precision) {
+                               int precision, unsigned short *packed) {
     int item = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x % 32;
     if (item >= n * heads)
         return;
@@ -273,8 +301,8 @@ __global__ void px_cross5_warp(float *out, const float *q, const float *k, const
         float a1 = __fadd_rn(__fmul_rn(x[1], kr[lane + 32]), __fmul_rn(x[3], kr[lane + 96]));
         float t = __fadd_rn(a0, a1);
         for (int s = 16; s; s /= 2)
-            t = __fadd_rn(t, __shfl_down_sync(0xffffffffu, t, s));
-        scores[key] = __shfl_sync(0xffffffffu, t, 0) / sqrtf(128.f);
+            t = __fadd_rn(t, PX_SHFL_DOWN(t, s));
+        scores[key] = PX_SHFL(t, 0) / sqrtf(128.f);
     }
     float max = scores[0], sum = 0;
     for (int j = 1; j < 5; ++j)
@@ -285,13 +313,17 @@ __global__ void px_cross5_warp(float *out, const float *q, const float *k, const
     }
     for (int j = 0; j < 5; ++j)
         scores[j] /= sum;
-    float *orow = out + size_t(row) * c + head * 128;
+    size_t base = size_t(row) * c + head * 128;
     for (int part = 0; part < 4; ++part) {
         int d = lane + 32 * part;
         float value = 0;
         for (int j = 0; j < 5; ++j)
             value += scores[j] * v[j * c + head * 128 + d];
-        orow[d] = round_precision(value, precision);
+        value = round_precision(value, precision);
+        if (packed)
+            packed[base + d] = px_bf16_bits(value);
+        else
+            out[base + d] = value;
     }
 }
 __global__ void px_gather(void *output, const float *x, const int *map, int start, int rows, int ci,
@@ -524,6 +556,61 @@ extern "C" int px_gpu_metrics(void *p, px_device_metrics *out) {
     }
     return 0;
 }
+#ifndef PX_HIP
+// D[co x rows] = W^T X + bias in one cuBLASLt call (column-major view, as the
+// cublasGemmEx call below): the bias is added in the epilogue in FP32 --
+// what finish_gemm does in mixed mode -- instead of a separate pass. False
+// when cuBLASLt offers no plan; the caller then takes the GemmEx path.
+static bool px_lt_linear(Device &d, float *out, const void *w, const void *x, const float *bias, int rows,
+                         int co, int ci) {
+    if (d.lt_failed)
+        return false;
+    if (!d.lt) {
+        if (cublasLtCreate(&d.lt) != CUBLAS_STATUS_SUCCESS || gpuMalloc(&d.lt_workspace, Device::kLtWorkspace)) {
+            (void)gpuGetLastError();
+            d.lt_failed = true;
+            return false;
+        }
+    }
+    auto &plan = d.lt_plans[{rows, co, ci}];
+    if (!plan.desc) {
+        cublasOperation_t ta = CUBLAS_OP_T, tb = CUBLAS_OP_N;
+        cublasLtEpilogue_t epilogue = CUBLASLT_EPILOGUE_BIAS;
+        cudaDataType_t bias_type = CUDA_R_32F;
+        cublasLtMatmulPreference_t pref{};
+        cublasLtMatmulHeuristicResult_t result{};
+        int found = 0;
+        size_t ws = Device::kLtWorkspace;
+        plan.ok = cublasLtMatmulDescCreate(&plan.desc, CUBLAS_COMPUTE_32F, CUDA_R_32F) == 0 &&
+                  cublasLtMatmulDescSetAttribute(plan.desc, CUBLASLT_MATMUL_DESC_TRANSA, &ta, sizeof(ta)) == 0 &&
+                  cublasLtMatmulDescSetAttribute(plan.desc, CUBLASLT_MATMUL_DESC_TRANSB, &tb, sizeof(tb)) == 0 &&
+                  cublasLtMatmulDescSetAttribute(plan.desc, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogue,
+                                                 sizeof(epilogue)) == 0 &&
+                  cublasLtMatmulDescSetAttribute(plan.desc, CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, &bias_type,
+                                                 sizeof(bias_type)) == 0 &&
+                  cublasLtMatrixLayoutCreate(&plan.a, CUDA_R_16BF, ci, co, ci) == 0 &&
+                  cublasLtMatrixLayoutCreate(&plan.b, CUDA_R_16BF, ci, rows, ci) == 0 &&
+                  cublasLtMatrixLayoutCreate(&plan.c, CUDA_R_32F, co, rows, co) == 0 &&
+                  cublasLtMatmulPreferenceCreate(&pref) == 0 &&
+                  cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws,
+                                                       sizeof(ws)) == 0 &&
+                  cublasLtMatmulAlgoGetHeuristic(d.lt, plan.desc, plan.a, plan.b, plan.c, plan.c, pref, 1,
+                                                 &result, &found) == 0 &&
+                  found > 0;
+        if (pref)
+            (void)cublasLtMatmulPreferenceDestroy(pref);
+        if (plan.ok)
+            plan.algo = result.algo;
+    }
+    if (!plan.ok)
+        return false;
+    if (cublasLtMatmulDescSetAttribute(plan.desc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias)) != 0)
+        return false;
+    float one = 1, zero = 0;
+    return cublasLtMatmul(d.lt, plan.desc, &one, w, plan.a, x, plan.b, &zero, out, plan.c, out, plan.c,
+                          &plan.algo, d.lt_workspace, Device::kLtWorkspace, d.stream) == CUBLAS_STATUS_SUCCESS;
+}
+#endif
 static void px_resident_linear(Device &d, const px_device_command &op) {
     int n = op.n, co = op.c, ci = op.k;
     bool mixed = op.precision == 3;
@@ -558,6 +645,13 @@ static void px_resident_linear(Device &d, const px_device_command &op) {
                     co, ci, lowp);
                 d.metrics.mma_gemms++;
             } else {
+#ifndef PX_HIP
+                if (mixed && op.b && lowp == 1 &&
+                    px_lt_linear(d, out, px_buffer(op.w).p, input, px_float(op.b), rows, co, ci)) {
+                    d.metrics.gemms++;
+                    continue; // bias added in the epilogue
+                }
+#endif
                 auto type = lowp == 1 ? BF16_TYPE : F16_TYPE;
                 GPU(blasGemmEx(d.blas, OP_T, OP_N, co, rows, ci, &one, px_buffer(op.w).p, type, ci, input,
                                type, ci, &zero, out, F32_TYPE, co, COMPUTE_F32, ALGO_DEFAULT));
@@ -574,14 +668,55 @@ static void px_resident_linear(Device &d, const px_device_command &op) {
 }
 static void px_resident_attention(Device &d, const px_device_command &op) {
     int n = op.n, m = op.k, heads = op.heads, hd = op.c, c = heads * hd;
+    bool pack = op.extra & PX_PACK_OUT;
     px_extent(op.x, size_t(n) * c);
     px_extent(op.w, size_t(m) * c);
     px_extent(op.v, size_t(m) * c);
-    px_extent(op.out, size_t(n) * c);
+    px_extent(op.out, size_t(n) * c, pack ? 2 : 4);
     d.metrics.attentions++;
+    unsigned short *packed_out = pack ? (unsigned short *)px_buffer(op.out).p : nullptr;
     if (m == 5 && hd == 128) {
         px_cross5_warp<<<(size_t(n) * heads + 7) / 8, 256, 0, d.stream>>>(
-            px_float(op.out), px_float(op.x), px_float(op.w), px_float(op.v), n, heads, op.precision);
+            pack ? nullptr : px_float(op.out), px_float(op.x), px_float(op.w), px_float(op.v), n, heads,
+            op.precision, packed_out);
+        return;
+    }
+    if (pack) {
+        // Other paths compute F32 as before, then cast into the packed output.
+        Buffer plain(d, size_t(n) * c * 4);
+#ifndef PX_HIP
+        if (op.precision && hd == 128 && n == m && d.kernels != 1 && d.mma_supported) {
+            size_t count = size_t(n) * c;
+            Buffer q(d, count * 2), k(d, count * 2), v(d, count * 2), out(d, count * 2);
+            px_attention_layout<<<(count + 255) / 256, 256, 0, d.stream>>>((unsigned short *)q.p,
+                                                                           px_float(op.x), n, heads,
+                                                                           op.precision, 0);
+            px_attention_layout<<<(count + 255) / 256, 256, 0, d.stream>>>((unsigned short *)k.p,
+                                                                           px_float(op.w), n, heads,
+                                                                           op.precision, 0);
+            px_attention_layout<<<(count + 255) / 256, 256, 0, d.stream>>>((unsigned short *)v.p,
+                                                                           px_float(op.v), n, heads,
+                                                                           op.precision, 0);
+            if (op.precision == 1)
+                px_fa2_bf16::px_fa2_bf16<<<dim3((n + 63) / 64, heads), 128, 34816, d.stream>>>(
+                    (unsigned short *)out.p, (unsigned short *)q.p, (unsigned short *)k.p,
+                    (unsigned short *)v.p, n, 128, 1 / sqrtf(128.f));
+            else
+                px_fa2_fp16::px_fa2_fp16<<<dim3((n + 63) / 64, heads), 128, 34816, d.stream>>>(
+                    (unsigned short *)out.p, (unsigned short *)q.p, (unsigned short *)k.p,
+                    (unsigned short *)v.p, n, 128, 1 / sqrtf(128.f));
+            px_attention_unpack_bf16<<<(count + 255) / 256, 256, 0, d.stream>>>(
+                packed_out, (unsigned short *)out.p, n, heads, op.precision);
+            d.metrics.mma_attentions++;
+            return;
+        }
+#endif
+        px_device_command plain_op = op;
+        plain_op.extra &= ~PX_PACK_OUT;
+        plain_op.out = &plain;
+        d.metrics.attentions--; // counted by the call below
+        px_resident_attention(d, plain_op);
+        cast_bfloat<<<(size_t(n) * c + 255) / 256, 256, 0, d.stream>>>(packed_out, plain.f(), size_t(n) * c, 1);
         return;
     }
     if (m == 5 && hd <= 256) {
@@ -675,7 +810,11 @@ extern "C" int px_gpu_execute(void *p, const px_device_command *command) {
         // Row-offset forms write rows heads..heads+n of their output.
         bool row_offset = o.op == PX_C2S || o.op == PX_SKIP || (o.op == PX_ADD && o.k);
         size_t shift = row_offset ? size_t(o.heads) * o.c : 0;
-        px_extent(o.out, count + shift, o.op == PX_GATHER && o.precision ? 2 : 4);
+        bool pack = (o.extra & PX_PACK_OUT) &&
+                    (o.op == PX_NORM || o.op == PX_RMS || o.op == PX_MODULATE || o.op == PX_GELU);
+        if (o.op != PX_ATTENTION)
+            px_extent(o.out, count + shift, (o.op == PX_GATHER && o.precision) || pack ? 2 : 4);
+        unsigned short *packed_out = pack ? (unsigned short *)px_buffer(o.out).p : nullptr;
         if (o.op == PX_PART)
             px_extent(o.x, count * o.k);
         else if ((o.op >= PX_NORM && o.op <= PX_RESIDUAL) || o.op == PX_SCALE_ADD || o.op == PX_GROUP_SILU)
@@ -702,9 +841,10 @@ extern "C" int px_gpu_execute(void *p, const px_device_command *command) {
         else if (o.op == PX_ATTENTION)
             px_resident_attention(d, o);
         else if (o.op == PX_NORM || o.op == PX_RMS)
-            px_norm_warp<<<(o.n + 7) / 8, 256, 0, d.stream>>>(px_float(o.out), px_float(o.x), px_float(o.w),
-                                                               px_float(o.b), o.c, o.epsilon, o.precision,
-                                                               o.op == PX_RMS, o.k, o.n);
+            px_norm_warp<<<(o.n + 7) / 8, 256, 0, d.stream>>>(pack ? nullptr : px_float(o.out), px_float(o.x),
+                                                               px_float(o.w), px_float(o.b), o.c, o.epsilon,
+                                                               o.precision, o.op == PX_RMS, o.k, o.n,
+                                                               packed_out);
         else if (o.op == PX_ROPE)
             px_rope<<<(count / 2 + 255) / 256, 256, 0, d.stream>>>(px_float(o.out), px_float(o.x),
                                                                    (const int *)px_buffer(o.w).p, count, o.c,
@@ -746,8 +886,10 @@ extern "C" int px_gpu_execute(void *p, const px_device_command *command) {
         else if (((o.op >= PX_PART && o.op <= PX_RESIDUAL) || o.op == PX_SCALE_ADD) && o.c >= 128 &&
                  count % o.c == 0 && count / o.c <= size_t(INT32_MAX))
             px_element_rows<<<unsigned(count / o.c), 256, 0, d.stream>>>(
-                px_float(o.out) + shift, px_float(o.x), px_float(o.w) + (o.w ? shift : 0), px_float(o.b), o.op,
-                o.c, o.precision, o.k, o.offset);
+                pack ? nullptr : px_float(o.out) + shift, px_float(o.x), px_float(o.w) + (o.w ? shift : 0),
+                px_float(o.b), o.op, o.c, o.precision, o.k, o.offset, packed_out);
+        else if (pack)
+            throw std::runtime_error("Packed output needs rows of at least 128 channels");
         else if ((o.op >= PX_PART && o.op <= PX_RESIDUAL) || o.op == PX_SCALE_ADD)
             px_element<<<(count + 255) / 256, 256, 0, d.stream>>>(px_float(o.out) + shift, px_float(o.x),
                                                                   px_float(o.w) + (o.w ? shift : 0),

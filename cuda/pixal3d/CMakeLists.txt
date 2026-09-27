@@ -33,4 +33,4 @@ if(MSVC)
     target_compile_options(pixal3d_cuda PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
 endif()
-target_link_libraries(pixal3d_cuda PRIVATE CUDA::cublas CUDA::cudart)
+target_link_libraries(pixal3d_cuda PRIVATE CUDA::cublas CUDA::cublasLt CUDA::cudart)

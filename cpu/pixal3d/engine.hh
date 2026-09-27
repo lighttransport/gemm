@@ -135,7 +135,8 @@ class Engine {
                      const Tensor &b = {}, int k = 0, int offset = 0, float epsilon = 0, int extra = 0);
     void inplace(int op, Tensor &x, int c, int precision = 0, const Tensor &w = {}, const Tensor &b = {},
                  int k = 0, int offset = 0, float epsilon = 0, int extra = 0);
-    Tensor attention(const Tensor &q, const Tensor &k, const Tensor &v, int heads, int hd, int precision);
+    Tensor attention(const Tensor &q, const Tensor &k, const Tensor &v, int heads, int hd, int precision,
+                     bool pack_output = false);
     Tensor convolution(const Tensor &x, Weights &w, const std::string &name, const Tensor &neighbors,
                        int precision, bool dense = false);
     /* Sparse convolution in the same 2048-row GEMM tiles as convolution(), but

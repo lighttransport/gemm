@@ -56,6 +56,9 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cublas_v2.h>
+#include <cublasLt.h>
+#include <map>
+#include <tuple>
 #define gpuMalloc cudaMalloc
 #define gpuFree cudaFree
 #define gpuMemcpyAsync cudaMemcpyAsync
@@ -109,8 +112,37 @@ struct Device {
     bool mma_supported = false;
     std::vector<std::pair<void *, size_t>> pool;
     px_device_metrics metrics{};
+#ifndef PX_HIP
+    // cuBLASLt GEMMs with a fused bias epilogue (mixed precision). One plan per
+    // shape, from the fixed top heuristic -- never timed, so the same kernel
+    // is chosen on every run.
+    struct LtPlan {
+        cublasLtMatmulDesc_t desc{};
+        cublasLtMatrixLayout_t a{}, b{}, c{};
+        cublasLtMatmulAlgo_t algo{};
+        bool ok = false;
+    };
+    cublasLtHandle_t lt{};
+    void *lt_workspace = nullptr;
+    static constexpr size_t kLtWorkspace = size_t(32) << 20;
+    bool lt_failed = false;
+    std::map<std::tuple<int, int, int>, LtPlan> lt_plans;
+#endif
     ~Device() {
         (void)gpuSetDevice(ordinal);
+#ifndef PX_HIP
+        for (auto &item : lt_plans) {
+            auto &plan = item.second;
+            if (plan.desc) (void)cublasLtMatmulDescDestroy(plan.desc);
+            if (plan.a) (void)cublasLtMatrixLayoutDestroy(plan.a);
+            if (plan.b) (void)cublasLtMatrixLayoutDestroy(plan.b);
+            if (plan.c) (void)cublasLtMatrixLayoutDestroy(plan.c);
+        }
+        if (lt_workspace)
+            (void)gpuFree(lt_workspace);
+        if (lt)
+            (void)cublasLtDestroy(lt);
+#endif
         if (stream)
             (void)gpuStreamSynchronize(stream);
         for (auto b : pool)

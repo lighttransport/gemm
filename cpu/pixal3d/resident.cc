@@ -188,6 +188,7 @@ Tensor Engine::linear(const Tensor &x, Weights &w, const std::string &name, int 
     op.x = x.get();
     op.w = weight_tensor.get();
     op.b = bias.get();
+    op.extra = x.precision ? 1 : 0; // a packed BF16 input skips the cast
     execute(op);
     return y;
 }
@@ -197,7 +198,7 @@ Tensor Engine::operation(int op, const Tensor &x, int c, int precision, const Te
     if (op == PX_PART)
         require(k > 0 && x.size / c % k == 0 && offset >= 0 && offset < k, "Invalid resident slice");
     size_t size = op == PX_PART ? x.size / size_t(k) : x.size;
-    auto y = tensor(size);
+    auto y = tensor(size, extra & PX_PACK_OUT ? 1 : 0);
     px_device_command command{op,    precision, int(size / c), c,       k,       0,       offset,
                               extra, epsilon,   y.get(),       x.get(), w.get(), b.get(), nullptr};
     execute(command);
@@ -210,15 +211,15 @@ void Engine::inplace(int op, Tensor &x, int c, int precision, const Tensor &w, c
              b.get(), nullptr});
 }
 Tensor Engine::attention(const Tensor &q, const Tensor &k, const Tensor &v, int heads, int hd,
-                         int precision) {
-    auto y = tensor(q.size);
+                         int precision, bool pack_output) {
+    auto y = tensor(q.size, pack_output ? 1 : 0);
     require(heads > 0 && hd > 0 && int64_t(heads) * hd <= INT32_MAX, "Invalid attention head size");
     int c = heads * hd;
     require(q.size % c == 0 && k.size % c == 0 && k.size == v.size && q.size / c <= INT32_MAX &&
                 k.size / c <= INT32_MAX,
             "Invalid attention tensors");
-    execute({PX_ATTENTION, precision, int(q.size / c), hd, int(k.size / c), heads, 0, 0, 0, y.get(), q.get(),
-             k.get(), nullptr, v.get()});
+    execute({PX_ATTENTION, precision, int(q.size / c), hd, int(k.size / c), heads, 0,
+             pack_output ? PX_PACK_OUT : 0, 0, y.get(), q.get(), k.get(), nullptr, v.get()});
     return y;
 }
 void Engine::record(const std::string &name, double seconds) { timings_[name] += seconds; }
@@ -314,6 +315,9 @@ Vec flow_resident(Engine &e, Weights &w, const Vec &input, const Coords &coords,
                 blocks > 0 && blocks <= 30,
             "Invalid resident flow geometry");
     int hd = c / heads;
+    // GEMM inputs are produced as packed BF16 when the GEMMs take BF16
+    // inputs anyway (mixed, BF16): the same bits the cast would give.
+    int pack = linear_precision == 1 || linear_precision == 3 ? PX_PACK_OUT : 0;
     Vec time(256);
     for (int j = 0; j < 128; ++j) {
         float phase = t * 1000.f * std::exp(-std::log(10000.f) * j / 128.f);
@@ -336,7 +340,7 @@ Vec flow_resident(Engine &e, Weights &w, const Vec &input, const Coords &coords,
         std::string b = "blocks." + std::to_string(i) + ".", ca = b + "cross_attn.cross_attn_block.";
         auto mod = e.operation(PX_ADD, modulation, 6 * c, op_precision, e.weight(w, b + "modulation"));
         auto h = e.operation(PX_NORM, hidden, c, 0, {}, {}, 0, 0, 1e-6f);
-        e.inplace(PX_MODULATE, h, c, op_precision, mod);
+        h = e.operation(PX_MODULATE, h, c, op_precision, mod, {}, 0, 0, 0, pack);
         auto qkv = e.linear(h, w, b + "self_attn.to_qkv", linear_precision);
         auto q = e.operation(PX_PART, qkv, c, 0, {}, {}, 3, 0);
         auto k = e.operation(PX_PART, qkv, c, 0, {}, {}, 3, 1);
@@ -346,11 +350,11 @@ Vec flow_resident(Engine &e, Weights &w, const Vec &input, const Coords &coords,
         e.inplace(PX_RMS, k, hd, op_precision, e.weight(w, b + "self_attn.k_rms_norm.gamma"), {}, heads);
         e.inplace(PX_ROPE, q, hd, op_precision, phases, {}, heads, 0, 0, 1);
         e.inplace(PX_ROPE, k, hd, op_precision, phases, {}, heads, 0, 0, 1);
-        h = e.attention(q, k, v, heads, hd, attention_precision);
+        h = e.attention(q, k, v, heads, hd, attention_precision, pack);
         h = e.linear(h, w, b + "self_attn.to_out", linear_precision);
         e.inplace(PX_RESIDUAL, hidden, c, op_precision, h, mod, 0, 2 * c);
         h = e.operation(PX_NORM, hidden, c, bf, e.weight(w, b + "norm2.weight"),
-                        e.weight(w, b + "norm2.bias"), 0, 0, 1e-6f);
+                        e.weight(w, b + "norm2.bias"), 0, 0, 1e-6f, pack);
         q = e.linear(h, w, ca + "to_q", linear_precision);
         if (!cached->keys[i].get()) {
             auto kv = e.linear(global, w, ca + "to_kv", linear_precision);
@@ -361,7 +365,7 @@ Vec flow_resident(Engine &e, Weights &w, const Vec &input, const Coords &coords,
         k = cached->keys[i];
         v = cached->values[i];
         e.inplace(PX_RMS, q, hd, op_precision, e.weight(w, ca + "q_rms_norm.gamma"), {}, heads);
-        h = e.attention(q, k, v, heads, hd, attention_precision);
+        h = e.attention(q, k, v, heads, hd, attention_precision, pack);
         h = e.linear(h, w, ca + "to_out", linear_precision);
         // Exact shortcuts: a zero input projects to the bias row (0 * W = 0,
         // + bias), added by the broadcast form of the same PX_ADD; otherwise
@@ -381,9 +385,12 @@ Vec flow_resident(Engine &e, Weights &w, const Vec &input, const Coords &coords,
         }
         e.inplace(PX_RESIDUAL, hidden, c, op_precision, h);
         h = e.operation(PX_NORM, hidden, c, 0, {}, {}, 0, 0, 1e-6f);
-        e.inplace(PX_MODULATE, h, c, op_precision, mod, {}, 0, 3 * c);
+        h = e.operation(PX_MODULATE, h, c, op_precision, mod, {}, 0, 3 * c, 0, pack);
         h = e.linear(h, w, b + "mlp.mlp.0", linear_precision);
-        e.inplace(PX_GELU, h, 1, op_precision, {}, {}, 1);
+        if (pack) // GELU writes the packed input of mlp.2, a row of the MLP width at a time
+            h = e.operation(PX_GELU, h, int(h.size / (hidden.size / c)), op_precision, {}, {}, 1, 0, 0, pack);
+        else
+            e.inplace(PX_GELU, h, 1, op_precision, {}, {}, 1);
         h = e.linear(h, w, b + "mlp.mlp.2", linear_precision);
         e.inplace(PX_RESIDUAL, hidden, c, op_precision, h, mod, 0, 5 * c);
     }

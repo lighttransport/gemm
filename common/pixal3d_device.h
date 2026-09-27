@@ -3,7 +3,7 @@
 #define PIXAL3D_DEVICE_H
 #include <stddef.h>
 #include <stdint.h>
-#define PX_DEVICE_ABI 3
+#define PX_DEVICE_ABI 4
 enum px_device_op {
     PX_LINEAR,
     PX_NORM,
@@ -43,6 +43,10 @@ enum px_device_op {
  * indices. ADD with k=1 applies row offset heads to out and w, not x.
  * The remaining operations are internal pointwise/conditioning commands.
  * Coordinate maps are I32 stored in four-byte buffers. */
+/* Flag in px_device_command.extra for PX_NORM, PX_MODULATE, PX_GELU and
+ * PX_ATTENTION: write the output as packed BF16 (the input of the next
+ * GEMM), exactly the bits cast_bfloat would give, instead of F32. */
+#define PX_PACK_OUT 0x100
 struct px_device_command {
     int op, precision, n, c, k, heads, offset, extra;
     float epsilon;
