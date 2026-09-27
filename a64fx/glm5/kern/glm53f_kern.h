@@ -118,6 +118,27 @@ void gk_pack_q6_kp16(uint8_t *dst, const uint8_t *rows, size_t row_bytes,
 void gk_q6_kp16_v1(const gk_mv *m, int r0, int r1);
 void gk_q6_kp16_v1pf(const gk_mv *m, int r0, int r1);
 
+/* Prefill GEMM on 16-row panels with scale block sb (glm53f_kern_gemm.c).
+ * Y[t][r] = sum_k X[t][k] W[r][k] for r in [r0, r1) (multiples of 64) and
+ * tokens [t0, t1) in steps of 6. */
+size_t gk_panel_bytes_gemm(int sb, int columns);
+void gk_pack_panel16(int sb, uint8_t *dst, const int8_t *q, const float *scale,
+                     int nrows, int columns);
+void gk_gemm_panel16(int sb, const uint8_t *w, int K, int r0, int r1, int t0, int t1,
+                     const int8_t *x, size_t ldx, const float *xs, size_t ldxs,
+                     float *y, size_t ldy);
+void gk_gemm_panel16_asm(int sb, const uint8_t *w, int K, int r0, int r1, int t0, int t1,
+                         const int8_t *x, size_t ldx, const float *xs, size_t ldxs,
+                         float *y, size_t ldy);
+/* Fully packed prefill GEMM: 64-row super-panels + 6-token packed activations. */
+size_t gk_panel64_bytes(int sb, int columns);
+extern int gk_gemm_kchunk;
+void gk_pack_panel64(int sb, uint8_t *dst, const int8_t *q, const float *scale, int nrows, int columns);
+void gk_pack_act6(int sb, int8_t *xp, float *xsp, const int8_t *x, size_t ldx,
+                  const float *xs, size_t ldxs, int K);
+void gk_gemm_panel64(int sb, const uint8_t *w, int K, int r0, int r1, int t0, int t1,
+                     const int8_t *xp, const float *xsp, float *y, size_t ldy);
+
 #ifdef __cplusplus
 }
 #endif
