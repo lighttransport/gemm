@@ -686,6 +686,17 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(200, {"input_tokens": max(1, round(len(prompt.encode("utf-8")) / 3.5))})
 
     def thinking_mode(self, req, api_path):
+        """(thinking, effort), with --default-reasoning-effort filling in an
+        effort the client did not name.  The template otherwise renders its
+        xhigh instruction: pi's llama.cpp provider sends none and thought
+        ~7x longer per turn than Codex at medium on the same task."""
+        thinking, effort = self._thinking_mode(req, api_path)
+        default = getattr(self, "default_effort", None)
+        if thinking and effort is None and default:
+            effort = default
+        return thinking, effort
+
+    def _thinking_mode(self, req, api_path):
         """Return (thinking, effort) for a request.
 
         auto: Responses requests think when they ask for a reasoning effort
@@ -1197,6 +1208,9 @@ class Handler(BaseHTTPRequestHandler):
             reasoning_text, answer = split_generation(text, thinking)
             tool_text, calls = parse_calls(answer, registry)
             text = tool_text if calls else answer
+            sys.stderr.write(f"[turn] {api_path} finish={finish} completion={ctok} "
+                             f"reasoning_chars={len(reasoning_text)} answer_chars={len(answer)} "
+                             f"calls={len(calls)}\n")
             if not calls and "<tool_call>" in answer:
                 # The client receives this as plain text; make it visible.
                 sys.stderr.write("[tool-call] unparsed: " +
@@ -1347,6 +1361,10 @@ def main():
     ap.add_argument("--prefix-store", default="",
                     help="JSON file remembering agents' system prefixes across restarts "
                          "(contains system prompts; written 0600); empty disables")
+    ap.add_argument("--default-reasoning-effort", choices=("low", "medium", "high", "xhigh"),
+                    default=None,
+                    help="reasoning effort for thinking requests that name none "
+                         "(default: the chat template's xhigh)")
     ap.add_argument("--prefix-warmup", type=int, default=4,
                     help="stored prefixes to re-prefill at startup (0 disables)")
     ap.add_argument("--served-model-name", default=None,
@@ -1406,6 +1424,7 @@ def main():
         print(f"context clamped by the runner: {args.context} -> {Handler.context} tokens",
               flush=True)
     Handler.coding = args.coding
+    Handler.default_effort = args.default_reasoning_effort
     Handler.thinking = args.thinking
     try:
         server = ThreadingHTTPServer((args.host, args.port), Handler)

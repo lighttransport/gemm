@@ -355,6 +355,19 @@ class ProtocolTest(unittest.TestCase):
                 backend.generate("boom", 4, 0.0, 1.0, 1, 0.0, 1.0, 0.0)
             self.assertEqual(len(spawned), before)
 
+    def test_default_reasoning_effort_fills_only_unnamed_efforts(self):
+        handler = Handler.__new__(Handler)
+        handler.thinking = "auto"
+        handler.default_effort = "medium"
+        on = {"chat_template_kwargs": {"enable_thinking": True}}
+        self.assertEqual(handler.thinking_mode(on, "/v1/chat/completions"), (True, "medium"))
+        self.assertEqual(handler.thinking_mode({**on, "reasoning_effort": "high"},
+                                               "/v1/chat/completions"), (True, "high"))
+        self.assertEqual(handler.thinking_mode({}, "/v1/chat/completions"), (False, None))
+        self.assertEqual(handler.thinking_mode(
+            {"thinking": {"type": "adaptive"}, "output_config": {"effort": "high"}},
+            "/v1/messages"), (True, "high"))
+
     def test_startup_reads_the_allocated_context(self):
         backend = Backend.__new__(Backend)
         backend.ready = False

@@ -70,6 +70,7 @@ exec python3 codex_server.py "${model}" --runner "${runner}" \
     --host "${host}" --port "${port}" --context "${context}" \
     --max-output "${max_output}" --thinking "${thinking}" \
     --served-model-name "${QWEN38_SERVED_MODEL:-qwen3.8-27b}" \
+    --default-reasoning-effort "${QWEN38_DEFAULT_EFFORT:-medium}" \
     --prefix-store "${QWEN38_PREFIX_STORE:-${HOME}/.cache/qwen38-server/prefixes.json}" \
     --qwen35-dflash2 "${dflash}" \
     --context-cache-entries "${cache_entries}" \

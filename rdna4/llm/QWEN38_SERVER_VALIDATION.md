@@ -1,5 +1,50 @@
 # Qwen3.8 server correctness and performance
 
+## Reasoning effort defaults for agents — 2026-09-27
+
+Where agent time goes, measured on a three-agent run of the stack task:
+- The GPU was busy for almost the whole session: 324 s decode and 30 s
+  prefill out of a 364 s wall.
+- 68% of the generated text was thinking.
+
+The Qwen template has three effort levels: low, medium and xhigh ("think
+carefully"). Requests with no effort get xhigh. By agent:
+- Codex sends `medium` and thought 339 characters per turn.
+- Claude Code sends `high`, which maps to xhigh, and thought 863.
+- pi's llama.cpp provider sends no effort, so it got xhigh, and thought
+  2,406 characters per turn (990 tokens per turn against Codex's 299).
+
+A/B on two fixtures (the stack library, and a ring buffer plus string helper
+with two subtle bugs), each checked by an independent ASan oracle:
+
+| Agent, effort | Runs | Passed | Wall, total | Decode tokens |
+| --- | ---: | ---: | ---: | ---: |
+| pi, xhigh (template default) | 6 | 6 | 1,990 s | 77,935 |
+| pi, **medium** | 6 | 6 | 920 s | 36,027 |
+| Claude Code, xhigh | 4 | 4 | 1,205 s | 48,781 |
+| Claude Code, **medium** | 4 | 4 | 859 s | 36,714 |
+
+Every run passed at both levels, and each configuration had one long
+outlier. Medium used 25–54% fewer tokens.
+
+The defaults are now:
+- `codex_server.py --default-reasoning-effort` fills in an effort only for
+  thinking requests that name none. The launcher passes `medium`;
+  `QWEN38_DEFAULT_EFFORT` overrides it.
+- `claude/qwen38_claude.sh` sets `CLAUDE_CODE_EFFORT_LEVEL=medium`;
+  `QWEN38_CLAUDE_EFFORT` overrides it. A captured request confirms Claude
+  Code then sends `output_config.effort: "medium"`.
+- An effort the client names explicitly is always honored.
+
+The shim now logs one `[turn]` line per request with the reasoning and
+answer sizes and the number of tool calls.
+
+The reasoning-loop guard tripped once in these runs (pi, token 3,344). The
+turn then finished normally with a tool call.
+
+Host-side sampling costs 0.35 ms per token (measured). A GPU top-k would save
+about 2% of decode, so it was not pursued.
+
 ## Interrupted follow-up turns, reasoning loops, snapshot buffers — 2026-09-27
 
 ### Rolling back a cancelled continuation

@@ -20,6 +20,11 @@ context="${QWEN38_CONTEXT:-$(curl -fsS --max-time 5 "http://${host}:${port}/prop
     python3 -c 'import json,sys; print(json.load(sys.stdin)["default_generation_settings"]["n_ctx"])' \
     2>/dev/null || echo 65536)}"
 max_output="${QWEN38_MAX_OUTPUT:-16384}"
+# Claude Code asks for "high" effort, which the Qwen template renders as its
+# xhigh instruction.  On agent tasks medium passed as often at about half
+# the decoded tokens (QWEN38_SERVER_VALIDATION.md); QWEN38_CLAUDE_EFFORT
+# overrides it (low, medium, high, xhigh).
+effort="${QWEN38_CLAUDE_EFFORT:-medium}"
 model="${QWEN38_CLAUDE_MODEL:-qwen3.8-27b}"
 mkdir -p "${config}"
 exec env -i HOME="${HOME}" PATH="${PATH}" TERM="${TERM:-xterm-256color}" \
@@ -33,6 +38,7 @@ exec env -i HOME="${HOME}" PATH="${PATH}" TERM="${TERM:-xterm-256color}" \
     CLAUDE_CODE_MAX_CONTEXT_TOKENS="${context}" \
     CLAUDE_CODE_AUTO_COMPACT_WINDOW="${context}" \
     CLAUDE_CODE_MAX_OUTPUT_TOKENS="${max_output}" \
+    CLAUDE_CODE_EFFORT_LEVEL="${effort}" \
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_TELEMETRY=1 \
     DISABLE_AUTOUPDATER=1 \
     claude "$@"
