@@ -88,6 +88,7 @@ void gk_q8_0r16_v3pf(const gk_mv *m, int r0, int r1, int pf_bytes);
 void gk_q8_0r16_v3pf4k(const gk_mv *m, int r0, int r1);
 void gk_q8_0r16_v3pf16k(const gk_mv *m, int r0, int r1);
 void gk_q8_0r16_v3pf64k(const gk_mv *m, int r0, int r1);
+void gk_q8_0r16_v4pf(const gk_mv *m, int r0, int r1);
 
 /* v1: lossless 16-row Q4_K panel repack (glm53f_kern_q4k16.c).  Row-size
  * accounting is per panel/16: 152 bytes per 256 columns. */
@@ -96,6 +97,8 @@ void gk_pack_q4_kp16(uint8_t *dst, const uint8_t *rows, size_t row_bytes,
                      int nrows, int columns);
 void gk_q4_kp16_v1(const gk_mv *m, int r0, int r1);
 void gk_q4_kp16_v1pf(const gk_mv *m, int r0, int r1);
+void gk_q4_kp16_v2pf(const gk_mv *m, int r0, int r1);
+void gk_q4_kp16_v3pf(const gk_mv *m, int r0, int r1);
 
 /* v1: lossless 16-row Q5_K panel repack (glm53f_kern_q5k16.c), 184 bytes
  * per 256 columns per row; same activation contract as Q4_KP16. */
@@ -105,6 +108,7 @@ void gk_pack_q5_kp16(uint8_t *dst, const uint8_t *rows, size_t row_bytes,
 void gk_q5_kp16_v1(const gk_mv *m, int r0, int r1);
 void gk_q5_kp16_v1pf(const gk_mv *m, int r0, int r1);
 void gk_q5_kp16_v2pf(const gk_mv *m, int r0, int r1);
+void gk_q5_kp16_v3pf(const gk_mv *m, int r0, int r1);
 
 /* v1: lossless 16-row Q6_K panel repack (glm53f_kern_q6k16.c), 212 bytes
  * per 256 columns per row. */

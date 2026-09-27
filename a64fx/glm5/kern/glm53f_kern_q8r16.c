@@ -215,3 +215,60 @@ void gk_q8_0r16_v3pf(const gk_mv *m, int r0, int r1, int pf) {
 void gk_q8_0r16_v3pf4k(const gk_mv *m, int r0, int r1) { gk_q8_0r16_v3pf(m, r0, r1, 4096); }
 void gk_q8_0r16_v3pf16k(const gk_mv *m, int r0, int r1) { gk_q8_0r16_v3pf(m, r0, r1, 16384); }
 void gk_q8_0r16_v3pf64k(const gk_mv *m, int r0, int r1) { gk_q8_0r16_v3pf(m, r0, r1, 65536); }
+
+/* v4: v3pf16k with two 16-row panels per iteration sharing the LD1RW
+ * activation broadcasts and loop work (the panel kernels are bound by how
+ * much work fits in the ROB; see gk_q4_kp16_v3pf). */
+#define Q8R16_PAIR_HALF(IA, IB, WA, WB, X) do {                                   \
+    const svint8_t x0 = gk_bcast4((X)), x1 = gk_bcast4((X) + 4);                  \
+    const svint8_t x2 = gk_bcast4((X) + 8), x3 = gk_bcast4((X) + 12);             \
+    IA = svdot_s32(svdup_s32(0), svld1_s8(p8, (WA)), x0);                         \
+    IB = svdot_s32(svdup_s32(0), svld1_s8(p8, (WB)), x0);                         \
+    IA = svdot_s32(IA, svld1_s8(p8, (WA) + 64), x1);                              \
+    IB = svdot_s32(IB, svld1_s8(p8, (WB) + 64), x1);                              \
+    IA = svdot_s32(IA, svld1_s8(p8, (WA) + 128), x2);                             \
+    IB = svdot_s32(IB, svld1_s8(p8, (WB) + 128), x2);                             \
+    IA = svdot_s32(IA, svld1_s8(p8, (WA) + 192), x3);                             \
+    IB = svdot_s32(IB, svld1_s8(p8, (WB) + 192), x3);                             \
+} while (0)
+
+void gk_q8_0r16_v4pf(const gk_mv *m, int r0, int r1) {
+    const int nb = m->columns / 32;
+    const size_t pb = gk_panel_bytes_q8_0r16(m->columns);
+    const svbool_t p8 = svptrue_b8(), p32 = svptrue_b32();
+    const int8_t *xq = m->a->xq;
+    const float *xd = m->a->xd;
+    int r = r0;
+    for (; r + 16 < r1; r += 32) {
+        const int8_t *wa = (const int8_t *)(m->w + (size_t)(r / 16) * pb);
+        const int8_t *wb = wa + pb;
+        svfloat32_t fa = svdup_f32(0.0f), fb = fa;
+#pragma clang loop unroll(disable)
+        for (int b = 0; b < nb; b += 2, wa += 2 * 576, wb += 2 * 576) {
+            __builtin_prefetch(wa + 16384, 0, 2); __builtin_prefetch(wa + 16384 + 256, 0, 2);
+            __builtin_prefetch(wa + 16384 + 512, 0, 2); __builtin_prefetch(wa + 16384 + 768, 0, 2);
+            __builtin_prefetch(wa + 16384 + 1024, 0, 2);
+            __builtin_prefetch(wb + 16384, 0, 2); __builtin_prefetch(wb + 16384 + 256, 0, 2);
+            __builtin_prefetch(wb + 16384 + 512, 0, 2); __builtin_prefetch(wb + 16384 + 768, 0, 2);
+            __builtin_prefetch(wb + 16384 + 1024, 0, 2);
+            const int8_t *x = xq + 32 * b;
+            svint32_t a0, b0, a1, b1, c0, d0, c1, d1;
+            Q8R16_PAIR_HALF(a0, c0, wa, wb, x);
+            Q8R16_PAIR_HALF(b0, d0, wa + 256, wb + 256, x + 16);
+            Q8R16_PAIR_HALF(a1, c1, wa + 576, wb + 576, x + 32);
+            Q8R16_PAIR_HALF(b1, d1, wa + 576 + 256, wb + 576 + 256, x + 48);
+            const float s0 = xd[b], s1 = xd[b + 1];
+            fa = svmla_f32_x(p32, fa, svcvt_f32_s32_x(p32, svadd_s32_x(p32, a0, b0)),
+                             svmul_n_f32_x(p32, svld1_f32(p32, (const float *)(wa + 512)), s0));
+            fb = svmla_f32_x(p32, fb, svcvt_f32_s32_x(p32, svadd_s32_x(p32, c0, d0)),
+                             svmul_n_f32_x(p32, svld1_f32(p32, (const float *)(wb + 512)), s0));
+            fa = svmla_f32_x(p32, fa, svcvt_f32_s32_x(p32, svadd_s32_x(p32, a1, b1)),
+                             svmul_n_f32_x(p32, svld1_f32(p32, (const float *)(wa + 576 + 512)), s1));
+            fb = svmla_f32_x(p32, fb, svcvt_f32_s32_x(p32, svadd_s32_x(p32, c1, d1)),
+                             svmul_n_f32_x(p32, svld1_f32(p32, (const float *)(wb + 576 + 512)), s1));
+        }
+        svst1_f32(p32, m->y + r, fa);
+        svst1_f32(svwhilelt_b32(r + 16, r1), m->y + r + 16, fb);
+    }
+    if (r < r1) gk_q8_0r16_v3pf(m, r, r1, 16384);
+}

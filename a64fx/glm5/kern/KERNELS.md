@@ -135,3 +135,19 @@ Reaching the node roof needs about 9.4 B/cycle per core.
 1. **K-quant panels.** All three are done (Q4/Q5/Q6_KP16). Q5 is still FP-op bound at 57% of the CMG roof. Options: 2 panels per iteration to share LD1RW broadcasts; drop the `svdup_s32(0)` MOVIs by chaining the first SDOT; or a lossy INT8-128 path behind the quality gate.
 2. **Persistent layer chain.** Prefetch the next matrix during the current one to remove the 48-thread ramp.
 3. **Rewire the production path.** Have `glm53f_iq_bridge.c` call these cores, repack Q8_0R to Q8_0R16 at load, and convert the head from F32 to Q8_0R16 losslessly.
+
+## Two-panel variants and layer chains (2026-09-28)
+
+**Two-panel kernels.** These process 32 rows per iteration and share the LD1RW activation broadcasts:
+- `gk_q8_0r16_v4pf`: 31.2 B/cycle from L1 (v3: 24.4).
+- `gk_q4_kp16_v3pf`: 15.4 B/cycle (v1: 12.3).
+- `gk_q5_kp16_v3pf`: no gain; it is FP-op bound.
+
+**Per-rank decode GEMV chain for one token** (clair `sim-accuracy/glm53f/chain.c`). The chain runs all 270 dependent GEMVs of the 12-node layout with production OpenMP hardware barriers. It excludes allreduce, attention cores, the KDA recurrence and mHC. At 48 threads:
+
+| Kernel set | ms per token | % of node read roof |
+|---|---:|---:|
+| Production kernels | 8.68 | 21.7% |
+| Panel kernels + 16 KiB next-stage prefetch | 2.92 | 59.3% |
+
+That is 2.97× faster. The two-panel kernels do not improve the chain: it is bound by per-stage start-up (about 10 µs stages, 1.4 µs barrier). Use 64 KiB pages or per-thread 2 MiB-aligned slices: XOS large pages shared across CMGs cost 1.8×.
