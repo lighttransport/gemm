@@ -210,6 +210,14 @@ __global__ void finish_gemm(float *y, const float *bias, size_t n, int c, int bf
         y[i] = round_precision(v, bf);
     }
 }
+__global__ void finish_gemm_rows(float *y, const float *bias, int c, int bf) {
+    size_t row = blockIdx.x;
+    for (int ch = threadIdx.x; ch < c; ch += blockDim.x) {
+        size_t i = row * c + ch;
+        float v = y[i] + (bias ? round_precision(bias[ch], bf) : 0);
+        y[i] = round_precision(v, bf);
+    }
+}
 __global__ void softmax_rows(float *s, int rows, int cols) {
     int row = blockIdx.x;
     if (row >= rows)

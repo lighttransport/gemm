@@ -1,5 +1,6 @@
 /* Resident neural operations; no CUDA/HIP headers in the host library. */
 #include "engine.hh"
+#include <algorithm>
 #include <chrono>
 #include <fstream>
 #include <iomanip>
@@ -65,7 +66,11 @@ std::shared_ptr<DeviceConditioning> Engine::condition(Weights &w, const Vec &glo
     cached->projected = upload(projected);
     cached->positions = upload(coords.data(), coords.size());
     int heads = w.shape("blocks.0.self_attn.q_rms_norm.gamma")[0];
-    int hd = w.shape("input_layer.weight")[0] / heads;
+    int c = w.shape("input_layer.weight")[0], hd = c / heads;
+    cached->zero_projected = std::all_of(projected.begin(), projected.end(), [](float v) { return v == 0; });
+    // Up to a quarter of the budget for the per-block projections (about
+    // 1.9 GiB at shape1024's ~10.7k tokens and 12 GiB).
+    cached->cache_projections = coords.size() / 4 * size_t(c) * 4 * 30 <= resident_budget_ / 4;
     cached->rope_phases = tensor(coords.size() / 4 * hd);
     execute({PX_ROPE_PHASE, 0, int(coords.size() / 4), hd, 0, 0, 0, 0, 0, cached->rope_phases.get(), nullptr,
              cached->positions.get(), nullptr, nullptr});
@@ -358,8 +363,22 @@ Vec flow_resident(Engine &e, Weights &w, const Vec &input, const Coords &coords,
         e.inplace(PX_RMS, q, hd, op_precision, e.weight(w, ca + "q_rms_norm.gamma"), {}, heads);
         h = e.attention(q, k, v, heads, hd, attention_precision);
         h = e.linear(h, w, ca + "to_out", linear_precision);
-        auto projection = e.linear(projected, w, b + "cross_attn.proj_linear", linear_precision);
-        e.inplace(PX_ADD, h, c, op_precision, projection, {}, 1);
+        // Exact shortcuts: a zero input projects to the bias row (0 * W = 0,
+        // + bias), added by the broadcast form of the same PX_ADD; otherwise
+        // the per-block projection is reused across steps when cached.
+        // BF16 mode rounds GEMM outputs, so it keeps the computed path.
+        if (cached->zero_projected && linear_precision != 1) {
+            if (w.has(b + "cross_attn.proj_linear.bias"))
+                e.inplace(PX_ADD, h, c, op_precision, e.weight(w, b + "cross_attn.proj_linear.bias"), {}, 0);
+        } else {
+            Tensor projection = cached->projections[i];
+            if (!projection.get()) {
+                projection = e.linear(projected, w, b + "cross_attn.proj_linear", linear_precision);
+                if (cached->cache_projections)
+                    cached->projections[i] = projection;
+            }
+            e.inplace(PX_ADD, h, c, op_precision, projection, {}, 1);
+        }
         e.inplace(PX_RESIDUAL, hidden, c, op_precision, h);
         h = e.operation(PX_NORM, hidden, c, 0, {}, {}, 0, 0, 1e-6f);
         e.inplace(PX_MODULATE, h, c, op_precision, mod, {}, 0, 3 * c);

@@ -55,6 +55,34 @@ __global__ void px_element(float *out, const float *x, const float *w, const flo
     }
     out[i] = round_precision(value, precision);
 }
+// px_element with one block per row and threads striding over the channels:
+// the same per-element arithmetic without a 64-bit modulo per element.
+__global__ void px_element_rows(float *out, const float *x, const float *w, const float *b, int op, int c,
+                                int precision, int k, int offset) {
+    size_t row = blockIdx.x;
+    for (int ch = threadIdx.x; ch < c; ch += blockDim.x) {
+        size_t i = row * c + ch;
+        float value = x[i];
+        if (op == PX_PART)
+            value = x[(row * k + offset) * c + ch];
+        else if (op == PX_GELU)
+            value = k ? .5f * value * (1 + tanhf(.7978845608028654f * (value + .044715f * value * value * value)))
+                      : .5f * value * (1 + erff(value * .7071067811865475f));
+        else if (op == PX_SILU)
+            value = value / (1 + expf(-value));
+        else if (op == PX_ADD)
+            value += w[k ? i : ch];
+        else if (op == PX_RESIDUAL)
+            value += round_precision(w[i] * (b ? b[offset + ch] : 1), precision);
+        else if (op == PX_SCALE_ADD)
+            value += w[i] * b[ch];
+        else if (op == PX_MODULATE) {
+            float shift = w[offset + ch], scale = round_precision(1 + w[offset + c + ch], precision);
+            value = round_precision(round_precision(value, precision) * scale, precision) + shift;
+        }
+        out[i] = round_precision(value, precision);
+    }
+}
 __global__ void px_norm(float *out, const float *x, const float *w, const float *b, int c, float eps,
                         int precision, int rms, int heads) {
     int row = blockIdx.x;
@@ -91,6 +119,40 @@ __global__ void px_norm(float *out, const float *x, const float *w, const float 
         rms ? sqrtf(float(c)) / fmaxf(sqrtf(float(variance)), 1e-12f) : 1 / sqrtf(float(variance / c) + eps);
     for (int j = threadIdx.x; j < c; j += 256) {
         float value = x[size_t(row) * c + j];
+        value = rms ? value * (inv * w[(row % heads) * c + j])
+                    : (value - float(mean)) * inv * (w ? w[j] : 1) + (b ? b[j] : 0);
+        out[size_t(row) * c + j] = round_precision(value, precision);
+    }
+}
+// One warp per row: the same double accumulation as px_norm, reduced with warp
+// shuffles instead of a 256-thread block, shared memory and barriers. The
+// per-head RMS norms (rows of 128 values, heads x tokens rows) left half of
+// px_norm's threads idle and spent most of its time in barriers.
+__global__ void px_norm_warp(float *out, const float *x, const float *w, const float *b, int c, float eps,
+                             int precision, int rms, int heads, int rows) {
+    int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x % 32;
+    if (row >= rows)
+        return;
+    const float *in = x + size_t(row) * c;
+    double sum = 0;
+    for (int j = lane; j < c; j += 32)
+        sum += rms ? double(in[j]) * in[j] : in[j];
+    for (int s = 16; s; s /= 2)
+        sum += __shfl_xor_sync(0xffffffffu, sum, s);
+    double mean = rms ? 0 : sum / c, variance = sum;
+    if (!rms) {
+        variance = 0;
+        for (int j = lane; j < c; j += 32) {
+            double v = in[j] - mean;
+            variance += v * v;
+        }
+        for (int s = 16; s; s /= 2)
+            variance += __shfl_xor_sync(0xffffffffu, variance, s);
+    }
+    float inv =
+        rms ? sqrtf(float(c)) / fmaxf(sqrtf(float(variance)), 1e-12f) : 1 / sqrtf(float(variance / c) + eps);
+    for (int j = lane; j < c; j += 32) {
+        float value = in[j];
         value = rms ? value * (inv * w[(row % heads) * c + j])
                     : (value - float(mean)) * inv * (w ? w[j] : 1) + (b ? b[j] : 0);
         out[size_t(row) * c + j] = round_precision(value, precision);
@@ -187,6 +249,49 @@ __global__ void px_cross5(float *out, const float *q, const float *k, const floa
         for (int j = 0; j < 5; ++j)
             value += scores[j] * v[j * c + head * hd + d];
         out[size_t(row) * c + head * hd + d] = round_precision(value, precision);
+    }
+}
+// px_cross5 for hd == 128, one warp per (token, head). Each lane holds dims
+// l, l+32, l+64, l+96 and reproduces px_cross5's tree exactly: (i, i+64),
+// then (i, i+32), then shuffles down 16..1 -- the same pairings, so the same
+// sums, without a 256-thread block and ten barriers per key.
+__global__ void px_cross5_warp(float *out, const float *q, const float *k, const float *v, int n, int heads,
+                               int precision) {
+    int item = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x % 32;
+    if (item >= n * heads)
+        return;
+    int row = item / heads, head = item % heads, c = heads * 128;
+    const float *qr = q + size_t(row) * c + head * 128;
+    float x[4];
+    for (int j = 0; j < 4; ++j)
+        x[j] = qr[lane + 32 * j];
+    float scores[5];
+    for (int key = 0; key < 5; ++key) {
+        const float *kr = k + key * c + head * 128;
+        // Products rounded as separate floats, as px_cross5 stores them.
+        float a0 = __fadd_rn(__fmul_rn(x[0], kr[lane]), __fmul_rn(x[2], kr[lane + 64]));
+        float a1 = __fadd_rn(__fmul_rn(x[1], kr[lane + 32]), __fmul_rn(x[3], kr[lane + 96]));
+        float t = __fadd_rn(a0, a1);
+        for (int s = 16; s; s /= 2)
+            t = __fadd_rn(t, __shfl_down_sync(0xffffffffu, t, s));
+        scores[key] = __shfl_sync(0xffffffffu, t, 0) / sqrtf(128.f);
+    }
+    float max = scores[0], sum = 0;
+    for (int j = 1; j < 5; ++j)
+        max = fmaxf(max, scores[j]);
+    for (int j = 0; j < 5; ++j) {
+        scores[j] = expf(scores[j] - max);
+        sum += scores[j];
+    }
+    for (int j = 0; j < 5; ++j)
+        scores[j] /= sum;
+    float *orow = out + size_t(row) * c + head * 128;
+    for (int part = 0; part < 4; ++part) {
+        int d = lane + 32 * part;
+        float value = 0;
+        for (int j = 0; j < 5; ++j)
+            value += scores[j] * v[j * c + head * 128 + d];
+        orow[d] = round_precision(value, precision);
     }
 }
 __global__ void px_gather(void *output, const float *x, const int *map, int start, int rows, int ci,
@@ -459,8 +564,11 @@ static void px_resident_linear(Device &d, const px_device_command &op) {
             }
         } else
             GPU(blasSgemm(d.blas, OP_T, OP_N, co, rows, ci, &one, px_float(op.w), ci, x, ci, &zero, out, co));
-        finish_gemm<<<(size_t(rows) * co + 255) / 256, 256, 0, d.stream>>>(
-            out, px_float(op.b), size_t(rows) * co, co, mixed ? 0 : op.precision);
+        if (co >= 128)
+            finish_gemm_rows<<<rows, 256, 0, d.stream>>>(out, px_float(op.b), co, mixed ? 0 : op.precision);
+        else
+            finish_gemm<<<(size_t(rows) * co + 255) / 256, 256, 0, d.stream>>>(
+                out, px_float(op.b), size_t(rows) * co, co, mixed ? 0 : op.precision);
         d.metrics.gemms++;
     }
 }
@@ -471,6 +579,11 @@ static void px_resident_attention(Device &d, const px_device_command &op) {
     px_extent(op.v, size_t(m) * c);
     px_extent(op.out, size_t(n) * c);
     d.metrics.attentions++;
+    if (m == 5 && hd == 128) {
+        px_cross5_warp<<<(size_t(n) * heads + 7) / 8, 256, 0, d.stream>>>(
+            px_float(op.out), px_float(op.x), px_float(op.w), px_float(op.v), n, heads, op.precision);
+        return;
+    }
     if (m == 5 && hd <= 256) {
         px_cross5<<<dim3(n, heads), 256, 0, d.stream>>>(px_float(op.out), px_float(op.x), px_float(op.w),
                                                         px_float(op.v), n, heads, hd, op.precision);
@@ -589,8 +702,9 @@ extern "C" int px_gpu_execute(void *p, const px_device_command *command) {
         else if (o.op == PX_ATTENTION)
             px_resident_attention(d, o);
         else if (o.op == PX_NORM || o.op == PX_RMS)
-            px_norm<<<o.n, 256, 0, d.stream>>>(px_float(o.out), px_float(o.x), px_float(o.w), px_float(o.b),
-                                               o.c, o.epsilon, o.precision, o.op == PX_RMS, o.k);
+            px_norm_warp<<<(o.n + 7) / 8, 256, 0, d.stream>>>(px_float(o.out), px_float(o.x), px_float(o.w),
+                                                               px_float(o.b), o.c, o.epsilon, o.precision,
+                                                               o.op == PX_RMS, o.k, o.n);
         else if (o.op == PX_ROPE)
             px_rope<<<(count / 2 + 255) / 256, 256, 0, d.stream>>>(px_float(o.out), px_float(o.x),
                                                                    (const int *)px_buffer(o.w).p, count, o.c,
@@ -629,6 +743,11 @@ extern "C" int px_gpu_execute(void *p, const px_device_command *command) {
                 px_float(o.out), px_float(o.x), (const int *)px_buffer(o.w).p, (const int *)px_buffer(o.b).p,
                 o.n, o.c, o.k, o.op == PX_SKIP, o.extra, o.heads, o.offset);
         }
+        else if (((o.op >= PX_PART && o.op <= PX_RESIDUAL) || o.op == PX_SCALE_ADD) && o.c >= 128 &&
+                 count % o.c == 0 && count / o.c <= size_t(INT32_MAX))
+            px_element_rows<<<unsigned(count / o.c), 256, 0, d.stream>>>(
+                px_float(o.out) + shift, px_float(o.x), px_float(o.w) + (o.w ? shift : 0), px_float(o.b), o.op,
+                o.c, o.precision, o.k, o.offset);
         else if ((o.op >= PX_PART && o.op <= PX_RESIDUAL) || o.op == PX_SCALE_ADD)
             px_element<<<(count + 255) / 256, 256, 0, d.stream>>>(px_float(o.out) + shift, px_float(o.x),
                                                                   px_float(o.w) + (o.w ? shift : 0),

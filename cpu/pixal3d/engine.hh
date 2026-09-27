@@ -88,6 +88,11 @@ struct DeviceConditioning {
     Coords coords;
     Tensor global, projected, positions, rope_phases;
     Tensor keys[30], values[30];
+    // proj_linear(projected) per block: step-invariant within a stage, so it
+    // is computed once when the budget allows (cache_projections). Negative
+    // guidance projects all zeros: the result is exactly the bias row.
+    Tensor projections[30];
+    bool zero_projected = false, cache_projections = false;
 };
 class Engine {
     void *library_ = nullptr, *gpu_ = nullptr;
