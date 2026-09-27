@@ -1216,6 +1216,204 @@ static inline float tf_iq4_xs_dot_sve(const block_iq4_xs *blocks, const float *x
     return svaddv_f32(pg,svadd_f32_x(pg,svadd_f32_x(pg,a0,a1),svadd_f32_x(pg,a2,a3)));
 }
 
+/* A8 companion for the compact Q5_K/IQ4_XS decode kernels.  Each 256-value
+ * activation block has one scale, shared by its eight 32-value groups.  The
+ * weight stream remains in its original GGUF layout. */
+typedef struct {
+    int8_t q[256];
+    float d[8];
+    int32_t sum[8];
+} tf_kquant_a8_block;
+
+static inline void tf_kquant_quant_a8(tf_kquant_a8_block *out,
+                                      const float *x, int n) {
+    const svbool_t pg = svptrue_b32();
+    for (int b = 0; b < n / 256; b++) {
+        svfloat32_t vmax = svdup_f32(0.0f);
+        for (int k = 0; k < 256; k += 16)
+            vmax = svmax_f32_x(pg, vmax,
+                svabs_f32_x(pg, svld1_f32(pg, x + b * 256 + k)));
+        float amax = svmaxv_f32(pg, vmax);
+        float d = amax > 0.0f ? amax / 127.0f : 0.0f;
+        float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
+        for (int g = 0; g < 8; g++) {
+            const float *src = x + b * 256 + g * 32;
+            out[b].d[g] = d;
+            int32_t sum = 0;
+            for (int k = 0; k < 32; k += 16) {
+                svint32_t v = svcvt_s32_f32_x(pg, svrintn_f32_x(pg,
+                    svmul_n_f32_x(pg, svld1_f32(pg, src + k), inv)));
+                v = svmin_n_s32_x(pg, svmax_n_s32_x(pg, v, -127), 127);
+                svst1b_s32(pg, out[b].q + g * 32 + k, v);
+                sum += svaddv_s32(pg, v);
+            }
+            out[b].sum[g] = sum;
+        }
+    }
+}
+
+static inline float tf_q5_k_a8_dot_sve(const block_q5_K *w,
+                                       const tf_kquant_a8_block *x, int nb) {
+    const svbool_t p8 = svptrue_b8(), p32 = svwhilelt_b8(0, 32);
+    const svbool_t p32lane = svptrue_b32(), first8 = svwhilelt_b32(0, 8);
+    svfloat32_t acc = svdup_f32(0.0f);
+    float corr = 0.0f;
+    for (int b = 0; b < nb; b++) {
+        const float d = ggml_fp16_to_fp32(w[b].d);
+        const float dm = ggml_fp16_to_fp32(w[b].dmin);
+        svint32_t iacc = svdup_s32(0);
+        for (int g = 0, is = 0; g < 4; g++, is += 2) {
+            uint8_t sc0, m0, sc1, m1;
+            get_scale_min_k4(is, w[b].scales, &sc0, &m0);
+            get_scale_min_k4(is + 1, w[b].scales, &sc1, &m1);
+            svuint8_t packed = svld1_u8(p32, w[b].qs + g * 32);
+            svuint8_t lo = svand_n_u8_x(p8, packed, 15);
+            svuint8_t hi = svlsr_n_u8_x(p8, packed, 4);
+            svuint8_t high = svld1_u8(p32, w[b].qh);
+            svuint8_t hb0 = svand_n_u8_x(p8, svlsr_n_u8_x(p8, high, 2 * g), 1);
+            svuint8_t hb1 = svand_n_u8_x(p8, svlsr_n_u8_x(p8, high, 2 * g + 1), 1);
+            svint8_t q = svreinterpret_s8_u8(svorr_u8_x(p8,
+                svsplice_u8(p32, lo, hi),
+                svlsl_n_u8_x(p8, svsplice_u8(p32, hb0, hb1), 4)));
+            svint32_t dot = svdot_s32(svdup_s32(0), q,
+                svld1_s8(p8, x[b].q + g * 64));
+            svint32_t sc = svsel_s32(first8, svdup_s32(sc0), svdup_s32(sc1));
+            iacc = svmla_s32_x(p32lane, iacc, dot, sc);
+            corr -= dm * x[b].d[0] *
+                    ((float)m0 * x[b].sum[2 * g] + (float)m1 * x[b].sum[2 * g + 1]);
+        }
+        acc = svmla_n_f32_x(p32lane, acc, svcvt_f32_s32_x(p32lane, iacc),
+                            d * x[b].d[0]);
+    }
+    return svaddv_f32(p32lane, acc) + corr;
+}
+
+static inline void tf_q5_k_a8_dot4_sve(float out[4], const block_q5_K *w0,
+                                       const block_q5_K *w1, const block_q5_K *w2,
+                                       const block_q5_K *w3,
+                                       const tf_kquant_a8_block *x, int nb) {
+    const svbool_t p8 = svptrue_b8(), p32b = svwhilelt_b8(0, 32);
+    const svbool_t pg = svptrue_b32(), first8 = svwhilelt_b32(0, 8);
+    svfloat32_t a0 = svdup_f32(0), a1 = a0, a2 = a0, a3 = a0;
+    float c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+    for (int b = 0; b < nb; b++) {
+        svint32_t i0 = svdup_s32(0), i1 = i0, i2 = i0, i3 = i0;
+#define TF_Q5_A8_ROW(W, IA, CORR) do { \
+    const block_q5_K *wb = &(W)[b]; \
+    uint8_t sc0, mn0, sc1, mn1; \
+    get_scale_min_k4(2*g, wb->scales, &sc0, &mn0); \
+    get_scale_min_k4(2*g+1, wb->scales, &sc1, &mn1); \
+    svuint8_t packed=svld1_u8(p32b,wb->qs+g*32); \
+    svuint8_t high=svld1_u8(p32b,wb->qh); \
+    svuint8_t lo=svand_n_u8_x(p8,packed,15), hi=svlsr_n_u8_x(p8,packed,4); \
+    svuint8_t hb0=svand_n_u8_x(p8,svlsr_n_u8_x(p8,high,2*g),1); \
+    svuint8_t hb1=svand_n_u8_x(p8,svlsr_n_u8_x(p8,high,2*g+1),1); \
+    svint8_t q=svreinterpret_s8_u8(svorr_u8_x(p8,svsplice_u8(p32b,lo,hi), \
+        svlsl_n_u8_x(p8,svsplice_u8(p32b,hb0,hb1),4))); \
+    svint32_t dot=svdot_s32(svdup_s32(0),q,svld1_s8(p8,x[b].q+g*64)); \
+    (IA)=svmla_s32_x(pg,(IA),dot,svsel_s32(first8,svdup_s32(sc0),svdup_s32(sc1))); \
+    (CORR)-=ggml_fp16_to_fp32(wb->dmin)*x[b].d[0]* \
+        ((float)mn0*x[b].sum[2*g]+(float)mn1*x[b].sum[2*g+1]); \
+} while (0)
+        for (int g = 0; g < 4; g++) {
+            TF_Q5_A8_ROW(w0, i0, c0);
+            TF_Q5_A8_ROW(w1, i1, c1);
+            TF_Q5_A8_ROW(w2, i2, c2);
+            TF_Q5_A8_ROW(w3, i3, c3);
+        }
+#undef TF_Q5_A8_ROW
+        a0 = svmla_n_f32_x(pg, a0, svcvt_f32_s32_x(pg, i0),
+                            ggml_fp16_to_fp32(w0[b].d) * x[b].d[0]);
+        a1 = svmla_n_f32_x(pg, a1, svcvt_f32_s32_x(pg, i1),
+                            ggml_fp16_to_fp32(w1[b].d) * x[b].d[0]);
+        a2 = svmla_n_f32_x(pg, a2, svcvt_f32_s32_x(pg, i2),
+                            ggml_fp16_to_fp32(w2[b].d) * x[b].d[0]);
+        a3 = svmla_n_f32_x(pg, a3, svcvt_f32_s32_x(pg, i3),
+                            ggml_fp16_to_fp32(w3[b].d) * x[b].d[0]);
+    }
+    out[0] = svaddv_f32(pg, a0) + c0; out[1] = svaddv_f32(pg, a1) + c1;
+    out[2] = svaddv_f32(pg, a2) + c2; out[3] = svaddv_f32(pg, a3) + c3;
+}
+
+static inline float tf_iq4_xs_a8_dot_sve(const block_iq4_xs *w,
+                                         const tf_kquant_a8_block *x, int nb) {
+    const svbool_t p8 = svptrue_b8(), p32 = svptrue_b32();
+    const svbool_t p16 = svwhilelt_b8(0, 16), p32b = svwhilelt_b8(0, 32);
+    const svbool_t first8 = svwhilelt_b32(0, 8);
+    static const uint8_t idx_a_data[64] = {
+         0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,15,
+        255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
+        16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,
+        255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255
+    };
+    static const uint8_t idx_b_data[64] = {
+        255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
+         0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,15,
+        255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
+        16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+    };
+    const svuint8_t idx_a = svld1_u8(p8, idx_a_data);
+    const svuint8_t idx_b = svld1_u8(p8, idx_b_data);
+    const svint8_t palette = svld1_s8(p16, kvalues_iq4nl);
+    svfloat32_t acc = svdup_f32(0.0f);
+    for (int b = 0; b < nb; b++) {
+        const float d = ggml_fp16_to_fp32(w[b].d);
+        svint32_t iacc = svdup_s32(0);
+        uint16_t high = w[b].scales_h;
+        for (int g = 0; g < 4; g++) {
+            svuint8_t packed = svld1_u8(p32b, w[b].qs + g * 32);
+            svint8_t lo = svtbl_s8(palette, svand_n_u8_x(p8, packed, 15));
+            svint8_t hi = svtbl_s8(palette, svlsr_n_u8_x(p8, packed, 4));
+            svint8_t q = svorr_s8_x(p8, svtbl_s8(lo, idx_a), svtbl_s8(hi, idx_b));
+            svint32_t dot = svdot_s32(svdup_s32(0), q,
+                svld1_s8(p8, x[b].q + g * 64));
+            int s0 = (int)((w[b].scales_l[g] & 15) | (((high >> (4 * g)) & 3) << 4)) - 32;
+            int s1 = (int)((w[b].scales_l[g] >> 4) | (((high >> (4 * g + 2)) & 3) << 4)) - 32;
+            svint32_t sc = svsel_s32(first8, svdup_s32(s0), svdup_s32(s1));
+            iacc = svmla_s32_x(p32, iacc, dot, sc);
+        }
+        acc = svmla_n_f32_x(p32, acc, svcvt_f32_s32_x(p32, iacc), d * x[b].d[0]);
+    }
+    return svaddv_f32(p32, acc);
+}
+
+static inline int tf_kquant_a8_enabled(void) {
+    static int initialized, enabled;
+    if (!initialized) {
+        const char *v = getenv("TF_KQUANT_A8");
+        enabled = v && atoi(v) != 0;
+        initialized = 1;
+    }
+    return enabled;
+}
+
+static inline int tf_kquant_a8_rows(float *dst, const qtensor *mat,
+                                    const float *x, int start, int end) {
+    if (!tf_kquant_a8_enabled() || mat->n_cols % 256 != 0 ||
+        (mat->type != GGML_TYPE_Q5_K && mat->type != GGML_TYPE_IQ4_XS))
+        return 0;
+    const int nb = mat->n_cols / 256;
+    tf_kquant_a8_block *qx = (tf_kquant_a8_block *)alloca((size_t)nb * sizeof(*qx));
+    tf_kquant_quant_a8(qx, x, mat->n_cols);
+    size_t rb = tf_row_bytes(mat->type, mat->n_cols);
+    int r = start;
+    if (mat->type == GGML_TYPE_Q5_K) {
+        for (; r + 3 < end; r += 4) {
+            const uint8_t *row = (const uint8_t *)mat->data + (size_t)r * rb;
+            tf_q5_k_a8_dot4_sve(dst + r, (const block_q5_K *)row,
+                (const block_q5_K *)(row + rb), (const block_q5_K *)(row + 2 * rb),
+                (const block_q5_K *)(row + 3 * rb), qx, nb);
+        }
+    }
+    for (; r < end; r++) {
+        const uint8_t *row = (const uint8_t *)mat->data + (size_t)r * rb;
+        dst[r] = mat->type == GGML_TYPE_Q5_K ?
+            tf_q5_k_a8_dot_sve((const block_q5_K *)row, qx, nb) :
+            tf_iq4_xs_a8_dot_sve((const block_iq4_xs *)row, qx, nb);
+    }
+    return 1;
+}
+
 #include "../a64fx/llm/mixed_iq_decode.h"
 #include "../a64fx/llm/iq4_decode_cache.h"
 #if defined(__ARM_FEATURE_SVE)
@@ -1356,9 +1554,6 @@ static void *tf_qmatvec_worker(void *arg) {
         return NULL;
     }
 #if defined(__ARM_FEATURE_SVE)
-    if (tf_kquant_cache_rows(t->dst, t->mat, t->x,
-                             t->row_start, t->row_end))
-        return NULL;
     if (t->mat->q8_block64) {
         int nb = n_cols / 64;
         int8_t *xq = (int8_t *)t->tmp;
@@ -1465,6 +1660,11 @@ static void *tf_qmatvec_worker(void *arg) {
         return NULL;
     }
 #if defined(__ARM_FEATURE_SVE)
+    if (tf_kquant_cache_rows(t->dst, t->mat, t->x,
+                             t->row_start, t->row_end))
+        return NULL;
+    if (tf_kquant_a8_rows(t->dst, t->mat, t->x, t->row_start, t->row_end))
+        return NULL;
     if (t->mat->iq4_cache) {
         tf_iq4_cache_view_rows(t->dst,t->mat->iq4_cache,t->x,t->row_start,t->row_end);
         return NULL;
@@ -3276,6 +3476,8 @@ static void tf_matvec_qtensor_rows(float *dst, const qtensor *mat, const float *
 #if defined(__ARM_FEATURE_SVE)
     } else if (tf_kquant_cache_rows(dst, mat, x, row_start, row_end)) {
         return;
+    } else if (tf_kquant_a8_rows(dst, mat, x, row_start, row_end)) {
+        return;
     } else if (mat->iq4_cache) {
         tf_iq4_cache_view_rows(dst,mat->iq4_cache,x,row_start,row_end);
     } else if (mat->mixed_iq_cache) {
@@ -3485,6 +3687,8 @@ static void tf_qmatvec(float *dst, const qtensor *mat, const float *x, int n_row
     }
 #if defined(__ARM_FEATURE_SVE)
     if (tf_kquant_cache_rows(dst, mat, x, 0, n_rows))
+        return;
+    if (tf_kquant_a8_rows(dst, mat, x, 0, n_rows))
         return;
     if (mat->iq4_cache) {
         tf_iq4_cache_view_rows(dst,mat->iq4_cache,x,0,n_rows);
