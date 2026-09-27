@@ -2,7 +2,8 @@
 
 This procedure runs a persistent, stateful Bash service inside a Fugaku PJM
 allocation and reaches it from the local workstation through two loopback-only
-SSH forwards.
+SSH forwards. On the Fugaku frontend, login N is named `fn01sv0N` (for
+example, login1 is `fn01sv01`); use that frontend hostname directly.
 
 ```text
 local client: 127.0.0.1:42386
@@ -24,8 +25,10 @@ outside the SSH path.
 
 ## Prerequisites
 
-- Local SSH configuration provides `ssh fugaku1` and pins it to
-  `login1.fugaku.r-ccs.riken.jp`.
+- When running on a Fugaku frontend, use the current frontend directly:
+  `hostname` should report `fn01sv0N`, and `pjsub` should be invoked locally.
+  The older `fugaku1`/`login1.fugaku.r-ccs.riken.jp` SSH-forward setup is for
+  an external workstation and is not required on the frontend.
 - The remote checkout is `$HOME/work/gemm/glm53f`.
 - The compute-node account can SSH back to
   `login1.fugaku.r-ccs.riken.jp`. The job uses `BatchMode=yes` and
@@ -123,6 +126,36 @@ nohup a64fx/tools/bash-over-http/watch_local_tunnel.sh \
 ```
 
 ## Submit a job
+
+When already on a Fugaku frontend, submit directly; do not SSH through the
+external `fugaku1` alias. The following is the canonical one-node, six-hour
+interactive allocation:
+
+```bash
+hostname                         # fn01sv0N; N identifies the login frontend
+pjsub --interact -g hp250467 \
+  -L 'freq=2000,eco_state=0,rscgrp=int,node=1,elapse=06:00:00' \
+  --mpi 'proc=12' \
+  --sparam 'wait-time=600' --no-check-directory \
+  -x PJM_LLIO_GFSCACHE=/vol0004 --llio localtmp-size=87Gi \
+  < a64fx/tools/bash-over-http/pjsub_bash_http.sh
+```
+
+The `--mpi 'proc=12'` option is required for one-node GLM5.3F component tests
+that launch twelve ranks. For a one-process diagnostic use `proc=1`. The
+direct command leaves the terminal attached to the persistent compute-side
+HTTP shell. Run it from the repository root and keep the terminal or tmux
+session alive for the allocation. Set `A64FX_MODE=boost-eco` and change the
+frequency/ecostate values only when that mode is intentionally requested.
+
+On the current frontend image, the reverse-SSH HTTP bridge may not be able to
+reach `fn01sv0N` from the compute node, and the non-login direct environment
+may expose a stale `mpiexec` wrapper. For direct component workloads, submit a
+script through `pjsub --interact` and verify `PJM_MPI_PROC=12`; use the
+frontend-native MPI wrapper/runtime selected by the allocation image.
+
+The external-workstation wrapper remains documented below for users who need
+the SSH-forwarded bridge.
 
 The standard one-node, 12-hour remote-development allocation is:
 
