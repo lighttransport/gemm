@@ -1,0 +1,130 @@
+{
+  "cases": [
+    {
+      "id": "full-r1",
+      "variant": "full",
+      "ring": 1,
+      "calls": 2048,
+      "passes": 1
+    },
+    {
+      "id": "full-r128",
+      "variant": "full",
+      "ring": 128,
+      "calls": 2048,
+      "passes": 1
+    },
+    {
+      "id": "full-r2048",
+      "variant": "full",
+      "ring": 2048,
+      "calls": 2048,
+      "passes": 1
+    },
+    {
+      "id": "loads-r1",
+      "variant": "loads",
+      "ring": 1,
+      "calls": 2048,
+      "passes": 1
+    },
+    {
+      "id": "loads-r128",
+      "variant": "loads",
+      "ring": 128,
+      "calls": 2048,
+      "passes": 1
+    },
+    {
+      "id": "loads-r2048",
+      "variant": "loads",
+      "ring": 2048,
+      "calls": 2048,
+      "passes": 1
+    },
+    {
+      "id": "dequant-r1",
+      "variant": "dequant",
+      "ring": 1,
+      "calls": 2048,
+      "passes": 1
+    },
+    {
+      "id": "dequant-r128",
+      "variant": "dequant",
+      "ring": 128,
+      "calls": 2048,
+      "passes": 1
+    },
+    {
+      "id": "dequant-r2048",
+      "variant": "dequant",
+      "ring": 2048,
+      "calls": 2048,
+      "passes": 1
+    },
+    {
+      "id": "flat-r1",
+      "variant": "flat",
+      "ring": 1,
+      "calls": 2048,
+      "passes": 1
+    },
+    {
+      "id": "flat-r128",
+      "variant": "flat",
+      "ring": 128,
+      "calls": 2048,
+      "passes": 1
+    },
+    {
+      "id": "flat-r2048",
+      "variant": "flat",
+      "ring": 2048,
+      "calls": 2048,
+      "passes": 1
+    },
+    {
+      "id": "flat_loads-r1",
+      "variant": "flat_loads",
+      "ring": 1,
+      "calls": 2048,
+      "passes": 1
+    },
+    {
+      "id": "flat_loads-r128",
+      "variant": "flat_loads",
+      "ring": 128,
+      "calls": 2048,
+      "passes": 1
+    },
+    {
+      "id": "flat_loads-r2048",
+      "variant": "flat_loads",
+      "ring": 2048,
+      "calls": 2048,
+      "passes": 1
+    },
+    {
+      "id": "flat_dequant-r1",
+      "variant": "flat_dequant",
+      "ring": 1,
+      "calls": 2048,
+      "passes": 1
+    },
+    {
+      "id": "flat_dequant-r128",
+      "variant": "flat_dequant",
+      "ring": 128,
+      "calls": 2048,
+      "passes": 1
+    },
+    {
+      "id": "flat_dequant-r2048",
+      "variant": "flat_dequant",
+      "ring": 2048,
+      "calls": 2048,
+      "passes": 1
+    }
+  ]
+}
