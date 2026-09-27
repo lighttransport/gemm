@@ -717,3 +717,1046 @@ gk_gemm_tile6x4p_asm:
     ldp d8, d9, [sp], #64
     ret
     .size gk_gemm_tile6x4p_asm, .-gk_gemm_tile6x4p_asm
+
+/* gk_gemm_tile6x4pp_asm: 64-row x 6-token prefill GEMM tile on fully packed
+ * operands (one stream each, like a64fx/int8-cmg's 94% 6x4 kernel):
+ *   w:  64-row super-panel, per scale block of sb columns:
+ *       (sb/4) k-groups x 4 vectors x 64 B, then 64 f32 row scales (256 B)
+ *   xp: packed activations, per k-group 6 tokens x 4 bytes (24 B)
+ *   xsp: packed token scales, per block 6 f32
+ * Registers as in gk_gemm_tile6x4_asm.  The k loop is unrolled 4x.
+ *
+ *   void gk_gemm_tile6x4pp_asm(const int8_t *w, long nblocks, long kgroups4,
+ *                             const int8_t *xp, const float *xsp,
+ *                             float *y, size_t ldy_bytes);
+ * y must be zeroed by the caller.
+ * pp variant: L1 prefetch of the weight stream (1 KiB ahead) and the packed
+ * activation stream (192 B ahead) in every k iteration. */
+    .text
+    .globl gk_gemm_tile6x4pp_asm
+    .type gk_gemm_tile6x4pp_asm, %function
+    .p2align 6
+gk_gemm_tile6x4pp_asm:
+    stp d8, d9, [sp, #-64]!
+    stp d10, d11, [sp, #16]
+    stp d12, d13, [sp, #32]
+    stp d14, d15, [sp, #48]
+    ptrue p0.b
+.Lqblock:
+    dup z0.s, #0
+    dup z1.s, #0
+    dup z2.s, #0
+    dup z3.s, #0
+    dup z4.s, #0
+    dup z5.s, #0
+    dup z6.s, #0
+    dup z7.s, #0
+    dup z8.s, #0
+    dup z9.s, #0
+    dup z10.s, #0
+    dup z11.s, #0
+    dup z12.s, #0
+    dup z13.s, #0
+    dup z14.s, #0
+    dup z15.s, #0
+    dup z16.s, #0
+    dup z17.s, #0
+    dup z18.s, #0
+    dup z19.s, #0
+    dup z20.s, #0
+    dup z21.s, #0
+    dup z22.s, #0
+    dup z23.s, #0
+    mov x8, x2
+.Lqk:
+    prfm pldl1keep, [x0, #1024]
+    prfm pldl1keep, [x0, #1280]
+    prfm pldl1keep, [x3, #192]
+    ld1b {z24.b}, p0/z, [x0, #0, mul vl]
+    ld1b {z25.b}, p0/z, [x0, #1, mul vl]
+    ld1b {z26.b}, p0/z, [x0, #2, mul vl]
+    ld1b {z27.b}, p0/z, [x0, #3, mul vl]
+    ld1rw {z28.s}, p0/z, [x3, #0]
+    sdot z0.s, z24.b, z28.b
+    sdot z1.s, z25.b, z28.b
+    sdot z2.s, z26.b, z28.b
+    sdot z3.s, z27.b, z28.b
+    ld1rw {z29.s}, p0/z, [x3, #4]
+    sdot z4.s, z24.b, z29.b
+    sdot z5.s, z25.b, z29.b
+    sdot z6.s, z26.b, z29.b
+    sdot z7.s, z27.b, z29.b
+    ld1rw {z30.s}, p0/z, [x3, #8]
+    sdot z8.s, z24.b, z30.b
+    sdot z9.s, z25.b, z30.b
+    sdot z10.s, z26.b, z30.b
+    sdot z11.s, z27.b, z30.b
+    ld1rw {z31.s}, p0/z, [x3, #12]
+    sdot z12.s, z24.b, z31.b
+    sdot z13.s, z25.b, z31.b
+    sdot z14.s, z26.b, z31.b
+    sdot z15.s, z27.b, z31.b
+    ld1rw {z28.s}, p0/z, [x3, #16]
+    sdot z16.s, z24.b, z28.b
+    sdot z17.s, z25.b, z28.b
+    sdot z18.s, z26.b, z28.b
+    sdot z19.s, z27.b, z28.b
+    ld1rw {z29.s}, p0/z, [x3, #20]
+    sdot z20.s, z24.b, z29.b
+    sdot z21.s, z25.b, z29.b
+    sdot z22.s, z26.b, z29.b
+    sdot z23.s, z27.b, z29.b
+    ld1b {z24.b}, p0/z, [x0, #4, mul vl]
+    ld1b {z25.b}, p0/z, [x0, #5, mul vl]
+    ld1b {z26.b}, p0/z, [x0, #6, mul vl]
+    ld1b {z27.b}, p0/z, [x0, #7, mul vl]
+    ld1rw {z28.s}, p0/z, [x3, #24]
+    sdot z0.s, z24.b, z28.b
+    sdot z1.s, z25.b, z28.b
+    sdot z2.s, z26.b, z28.b
+    sdot z3.s, z27.b, z28.b
+    ld1rw {z29.s}, p0/z, [x3, #28]
+    sdot z4.s, z24.b, z29.b
+    sdot z5.s, z25.b, z29.b
+    sdot z6.s, z26.b, z29.b
+    sdot z7.s, z27.b, z29.b
+    ld1rw {z30.s}, p0/z, [x3, #32]
+    sdot z8.s, z24.b, z30.b
+    sdot z9.s, z25.b, z30.b
+    sdot z10.s, z26.b, z30.b
+    sdot z11.s, z27.b, z30.b
+    ld1rw {z31.s}, p0/z, [x3, #36]
+    sdot z12.s, z24.b, z31.b
+    sdot z13.s, z25.b, z31.b
+    sdot z14.s, z26.b, z31.b
+    sdot z15.s, z27.b, z31.b
+    ld1rw {z28.s}, p0/z, [x3, #40]
+    sdot z16.s, z24.b, z28.b
+    sdot z17.s, z25.b, z28.b
+    sdot z18.s, z26.b, z28.b
+    sdot z19.s, z27.b, z28.b
+    ld1rw {z29.s}, p0/z, [x3, #44]
+    sdot z20.s, z24.b, z29.b
+    sdot z21.s, z25.b, z29.b
+    sdot z22.s, z26.b, z29.b
+    sdot z23.s, z27.b, z29.b
+    add x0, x0, #512
+    ld1b {z24.b}, p0/z, [x0, #0, mul vl]
+    ld1b {z25.b}, p0/z, [x0, #1, mul vl]
+    ld1b {z26.b}, p0/z, [x0, #2, mul vl]
+    ld1b {z27.b}, p0/z, [x0, #3, mul vl]
+    ld1rw {z28.s}, p0/z, [x3, #48]
+    sdot z0.s, z24.b, z28.b
+    sdot z1.s, z25.b, z28.b
+    sdot z2.s, z26.b, z28.b
+    sdot z3.s, z27.b, z28.b
+    ld1rw {z29.s}, p0/z, [x3, #52]
+    sdot z4.s, z24.b, z29.b
+    sdot z5.s, z25.b, z29.b
+    sdot z6.s, z26.b, z29.b
+    sdot z7.s, z27.b, z29.b
+    ld1rw {z30.s}, p0/z, [x3, #56]
+    sdot z8.s, z24.b, z30.b
+    sdot z9.s, z25.b, z30.b
+    sdot z10.s, z26.b, z30.b
+    sdot z11.s, z27.b, z30.b
+    ld1rw {z31.s}, p0/z, [x3, #60]
+    sdot z12.s, z24.b, z31.b
+    sdot z13.s, z25.b, z31.b
+    sdot z14.s, z26.b, z31.b
+    sdot z15.s, z27.b, z31.b
+    ld1rw {z28.s}, p0/z, [x3, #64]
+    sdot z16.s, z24.b, z28.b
+    sdot z17.s, z25.b, z28.b
+    sdot z18.s, z26.b, z28.b
+    sdot z19.s, z27.b, z28.b
+    ld1rw {z29.s}, p0/z, [x3, #68]
+    sdot z20.s, z24.b, z29.b
+    sdot z21.s, z25.b, z29.b
+    sdot z22.s, z26.b, z29.b
+    sdot z23.s, z27.b, z29.b
+    ld1b {z24.b}, p0/z, [x0, #4, mul vl]
+    ld1b {z25.b}, p0/z, [x0, #5, mul vl]
+    ld1b {z26.b}, p0/z, [x0, #6, mul vl]
+    ld1b {z27.b}, p0/z, [x0, #7, mul vl]
+    ld1rw {z28.s}, p0/z, [x3, #72]
+    sdot z0.s, z24.b, z28.b
+    sdot z1.s, z25.b, z28.b
+    sdot z2.s, z26.b, z28.b
+    sdot z3.s, z27.b, z28.b
+    ld1rw {z29.s}, p0/z, [x3, #76]
+    sdot z4.s, z24.b, z29.b
+    sdot z5.s, z25.b, z29.b
+    sdot z6.s, z26.b, z29.b
+    sdot z7.s, z27.b, z29.b
+    ld1rw {z30.s}, p0/z, [x3, #80]
+    sdot z8.s, z24.b, z30.b
+    sdot z9.s, z25.b, z30.b
+    sdot z10.s, z26.b, z30.b
+    sdot z11.s, z27.b, z30.b
+    ld1rw {z31.s}, p0/z, [x3, #84]
+    sdot z12.s, z24.b, z31.b
+    sdot z13.s, z25.b, z31.b
+    sdot z14.s, z26.b, z31.b
+    sdot z15.s, z27.b, z31.b
+    ld1rw {z28.s}, p0/z, [x3, #88]
+    sdot z16.s, z24.b, z28.b
+    sdot z17.s, z25.b, z28.b
+    sdot z18.s, z26.b, z28.b
+    sdot z19.s, z27.b, z28.b
+    ld1rw {z29.s}, p0/z, [x3, #92]
+    sdot z20.s, z24.b, z29.b
+    sdot z21.s, z25.b, z29.b
+    sdot z22.s, z26.b, z29.b
+    sdot z23.s, z27.b, z29.b
+    add x0, x0, #512
+    add x3, x3, #96
+    subs x8, x8, #1
+    b.ne .Lqk
+    ld1w {z24.s}, p0/z, [x0, #0, mul vl]
+    ld1w {z25.s}, p0/z, [x0, #1, mul vl]
+    ld1w {z26.s}, p0/z, [x0, #2, mul vl]
+    ld1w {z27.s}, p0/z, [x0, #3, mul vl]
+    add x0, x0, #256
+    mov x9, x5
+    ld1rw {z28.s}, p0/z, [x4, #0]
+    scvtf z0.s, p0/m, z0.s
+    fmul z29.s, z24.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #0, mul vl]
+    fmla z30.s, p0/m, z0.s, z29.s
+    st1w {z30.s}, p0, [x9, #0, mul vl]
+    scvtf z1.s, p0/m, z1.s
+    fmul z29.s, z25.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #1, mul vl]
+    fmla z30.s, p0/m, z1.s, z29.s
+    st1w {z30.s}, p0, [x9, #1, mul vl]
+    scvtf z2.s, p0/m, z2.s
+    fmul z29.s, z26.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #2, mul vl]
+    fmla z30.s, p0/m, z2.s, z29.s
+    st1w {z30.s}, p0, [x9, #2, mul vl]
+    scvtf z3.s, p0/m, z3.s
+    fmul z29.s, z27.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #3, mul vl]
+    fmla z30.s, p0/m, z3.s, z29.s
+    st1w {z30.s}, p0, [x9, #3, mul vl]
+    add x9, x9, x6
+    ld1rw {z28.s}, p0/z, [x4, #4]
+    scvtf z4.s, p0/m, z4.s
+    fmul z29.s, z24.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #0, mul vl]
+    fmla z30.s, p0/m, z4.s, z29.s
+    st1w {z30.s}, p0, [x9, #0, mul vl]
+    scvtf z5.s, p0/m, z5.s
+    fmul z29.s, z25.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #1, mul vl]
+    fmla z30.s, p0/m, z5.s, z29.s
+    st1w {z30.s}, p0, [x9, #1, mul vl]
+    scvtf z6.s, p0/m, z6.s
+    fmul z29.s, z26.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #2, mul vl]
+    fmla z30.s, p0/m, z6.s, z29.s
+    st1w {z30.s}, p0, [x9, #2, mul vl]
+    scvtf z7.s, p0/m, z7.s
+    fmul z29.s, z27.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #3, mul vl]
+    fmla z30.s, p0/m, z7.s, z29.s
+    st1w {z30.s}, p0, [x9, #3, mul vl]
+    add x9, x9, x6
+    ld1rw {z28.s}, p0/z, [x4, #8]
+    scvtf z8.s, p0/m, z8.s
+    fmul z29.s, z24.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #0, mul vl]
+    fmla z30.s, p0/m, z8.s, z29.s
+    st1w {z30.s}, p0, [x9, #0, mul vl]
+    scvtf z9.s, p0/m, z9.s
+    fmul z29.s, z25.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #1, mul vl]
+    fmla z30.s, p0/m, z9.s, z29.s
+    st1w {z30.s}, p0, [x9, #1, mul vl]
+    scvtf z10.s, p0/m, z10.s
+    fmul z29.s, z26.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #2, mul vl]
+    fmla z30.s, p0/m, z10.s, z29.s
+    st1w {z30.s}, p0, [x9, #2, mul vl]
+    scvtf z11.s, p0/m, z11.s
+    fmul z29.s, z27.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #3, mul vl]
+    fmla z30.s, p0/m, z11.s, z29.s
+    st1w {z30.s}, p0, [x9, #3, mul vl]
+    add x9, x9, x6
+    ld1rw {z28.s}, p0/z, [x4, #12]
+    scvtf z12.s, p0/m, z12.s
+    fmul z29.s, z24.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #0, mul vl]
+    fmla z30.s, p0/m, z12.s, z29.s
+    st1w {z30.s}, p0, [x9, #0, mul vl]
+    scvtf z13.s, p0/m, z13.s
+    fmul z29.s, z25.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #1, mul vl]
+    fmla z30.s, p0/m, z13.s, z29.s
+    st1w {z30.s}, p0, [x9, #1, mul vl]
+    scvtf z14.s, p0/m, z14.s
+    fmul z29.s, z26.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #2, mul vl]
+    fmla z30.s, p0/m, z14.s, z29.s
+    st1w {z30.s}, p0, [x9, #2, mul vl]
+    scvtf z15.s, p0/m, z15.s
+    fmul z29.s, z27.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #3, mul vl]
+    fmla z30.s, p0/m, z15.s, z29.s
+    st1w {z30.s}, p0, [x9, #3, mul vl]
+    add x9, x9, x6
+    ld1rw {z28.s}, p0/z, [x4, #16]
+    scvtf z16.s, p0/m, z16.s
+    fmul z29.s, z24.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #0, mul vl]
+    fmla z30.s, p0/m, z16.s, z29.s
+    st1w {z30.s}, p0, [x9, #0, mul vl]
+    scvtf z17.s, p0/m, z17.s
+    fmul z29.s, z25.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #1, mul vl]
+    fmla z30.s, p0/m, z17.s, z29.s
+    st1w {z30.s}, p0, [x9, #1, mul vl]
+    scvtf z18.s, p0/m, z18.s
+    fmul z29.s, z26.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #2, mul vl]
+    fmla z30.s, p0/m, z18.s, z29.s
+    st1w {z30.s}, p0, [x9, #2, mul vl]
+    scvtf z19.s, p0/m, z19.s
+    fmul z29.s, z27.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #3, mul vl]
+    fmla z30.s, p0/m, z19.s, z29.s
+    st1w {z30.s}, p0, [x9, #3, mul vl]
+    add x9, x9, x6
+    ld1rw {z28.s}, p0/z, [x4, #20]
+    scvtf z20.s, p0/m, z20.s
+    fmul z29.s, z24.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #0, mul vl]
+    fmla z30.s, p0/m, z20.s, z29.s
+    st1w {z30.s}, p0, [x9, #0, mul vl]
+    scvtf z21.s, p0/m, z21.s
+    fmul z29.s, z25.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #1, mul vl]
+    fmla z30.s, p0/m, z21.s, z29.s
+    st1w {z30.s}, p0, [x9, #1, mul vl]
+    scvtf z22.s, p0/m, z22.s
+    fmul z29.s, z26.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #2, mul vl]
+    fmla z30.s, p0/m, z22.s, z29.s
+    st1w {z30.s}, p0, [x9, #2, mul vl]
+    scvtf z23.s, p0/m, z23.s
+    fmul z29.s, z27.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #3, mul vl]
+    fmla z30.s, p0/m, z23.s, z29.s
+    st1w {z30.s}, p0, [x9, #3, mul vl]
+    add x9, x9, x6
+    add x4, x4, #24
+    subs x1, x1, #1
+    b.ne .Lqblock
+    ldp d14, d15, [sp, #48]
+    ldp d12, d13, [sp, #32]
+    ldp d10, d11, [sp, #16]
+    ldp d8, d9, [sp], #64
+    ret
+    .size gk_gemm_tile6x4pp_asm, .-gk_gemm_tile6x4pp_asm
+
+/* gk_gemm_tile6x4p2_asm: 64-row x 6-token prefill GEMM tile on fully packed
+ * operands (one stream each, like a64fx/int8-cmg's 94% 6x4 kernel):
+ *   w:  64-row super-panel, per scale block of sb columns:
+ *       (sb/4) k-groups x 4 vectors x 64 B, then 64 f32 row scales (256 B)
+ *   xp: packed activations, per k-group 6 tokens x 4 bytes (24 B)
+ *   xsp: packed token scales, per block 6 f32
+ * Registers as in gk_gemm_tile6x4_asm.  The k loop is unrolled 4x.
+ *
+ *   void gk_gemm_tile6x4p2_asm(const int8_t *w, long nblocks, long kgroups4,
+ *                             const int8_t *xp, const float *xsp,
+ *                             float *y, size_t ldy_bytes);
+ * y must be zeroed by the caller.
+ * p2 variant: pp plus L2 prefetch of the weight stream 16 KiB ahead.
+ * pp variant: L1 prefetch of the weight stream (1 KiB ahead) and the packed
+ * activation stream (192 B ahead) in every k iteration. */
+    .text
+    .globl gk_gemm_tile6x4p2_asm
+    .type gk_gemm_tile6x4p2_asm, %function
+    .p2align 6
+gk_gemm_tile6x4p2_asm:
+    stp d8, d9, [sp, #-64]!
+    stp d10, d11, [sp, #16]
+    stp d12, d13, [sp, #32]
+    stp d14, d15, [sp, #48]
+    ptrue p0.b
+.Lrblock:
+    dup z0.s, #0
+    dup z1.s, #0
+    dup z2.s, #0
+    dup z3.s, #0
+    dup z4.s, #0
+    dup z5.s, #0
+    dup z6.s, #0
+    dup z7.s, #0
+    dup z8.s, #0
+    dup z9.s, #0
+    dup z10.s, #0
+    dup z11.s, #0
+    dup z12.s, #0
+    dup z13.s, #0
+    dup z14.s, #0
+    dup z15.s, #0
+    dup z16.s, #0
+    dup z17.s, #0
+    dup z18.s, #0
+    dup z19.s, #0
+    dup z20.s, #0
+    dup z21.s, #0
+    dup z22.s, #0
+    dup z23.s, #0
+    mov x8, x2
+.Lrk:
+    prfm pldl1keep, [x0, #1024]
+    prfm pldl1keep, [x0, #1280]
+    prfm pldl1keep, [x3, #192]
+    prfm pldl2keep, [x0, #16384]
+    prfm pldl2keep, [x0, #16640]
+    prfm pldl2keep, [x0, #16896]
+    prfm pldl2keep, [x0, #17152]
+    ld1b {z24.b}, p0/z, [x0, #0, mul vl]
+    ld1b {z25.b}, p0/z, [x0, #1, mul vl]
+    ld1b {z26.b}, p0/z, [x0, #2, mul vl]
+    ld1b {z27.b}, p0/z, [x0, #3, mul vl]
+    ld1rw {z28.s}, p0/z, [x3, #0]
+    sdot z0.s, z24.b, z28.b
+    sdot z1.s, z25.b, z28.b
+    sdot z2.s, z26.b, z28.b
+    sdot z3.s, z27.b, z28.b
+    ld1rw {z29.s}, p0/z, [x3, #4]
+    sdot z4.s, z24.b, z29.b
+    sdot z5.s, z25.b, z29.b
+    sdot z6.s, z26.b, z29.b
+    sdot z7.s, z27.b, z29.b
+    ld1rw {z30.s}, p0/z, [x3, #8]
+    sdot z8.s, z24.b, z30.b
+    sdot z9.s, z25.b, z30.b
+    sdot z10.s, z26.b, z30.b
+    sdot z11.s, z27.b, z30.b
+    ld1rw {z31.s}, p0/z, [x3, #12]
+    sdot z12.s, z24.b, z31.b
+    sdot z13.s, z25.b, z31.b
+    sdot z14.s, z26.b, z31.b
+    sdot z15.s, z27.b, z31.b
+    ld1rw {z28.s}, p0/z, [x3, #16]
+    sdot z16.s, z24.b, z28.b
+    sdot z17.s, z25.b, z28.b
+    sdot z18.s, z26.b, z28.b
+    sdot z19.s, z27.b, z28.b
+    ld1rw {z29.s}, p0/z, [x3, #20]
+    sdot z20.s, z24.b, z29.b
+    sdot z21.s, z25.b, z29.b
+    sdot z22.s, z26.b, z29.b
+    sdot z23.s, z27.b, z29.b
+    ld1b {z24.b}, p0/z, [x0, #4, mul vl]
+    ld1b {z25.b}, p0/z, [x0, #5, mul vl]
+    ld1b {z26.b}, p0/z, [x0, #6, mul vl]
+    ld1b {z27.b}, p0/z, [x0, #7, mul vl]
+    ld1rw {z28.s}, p0/z, [x3, #24]
+    sdot z0.s, z24.b, z28.b
+    sdot z1.s, z25.b, z28.b
+    sdot z2.s, z26.b, z28.b
+    sdot z3.s, z27.b, z28.b
+    ld1rw {z29.s}, p0/z, [x3, #28]
+    sdot z4.s, z24.b, z29.b
+    sdot z5.s, z25.b, z29.b
+    sdot z6.s, z26.b, z29.b
+    sdot z7.s, z27.b, z29.b
+    ld1rw {z30.s}, p0/z, [x3, #32]
+    sdot z8.s, z24.b, z30.b
+    sdot z9.s, z25.b, z30.b
+    sdot z10.s, z26.b, z30.b
+    sdot z11.s, z27.b, z30.b
+    ld1rw {z31.s}, p0/z, [x3, #36]
+    sdot z12.s, z24.b, z31.b
+    sdot z13.s, z25.b, z31.b
+    sdot z14.s, z26.b, z31.b
+    sdot z15.s, z27.b, z31.b
+    ld1rw {z28.s}, p0/z, [x3, #40]
+    sdot z16.s, z24.b, z28.b
+    sdot z17.s, z25.b, z28.b
+    sdot z18.s, z26.b, z28.b
+    sdot z19.s, z27.b, z28.b
+    ld1rw {z29.s}, p0/z, [x3, #44]
+    sdot z20.s, z24.b, z29.b
+    sdot z21.s, z25.b, z29.b
+    sdot z22.s, z26.b, z29.b
+    sdot z23.s, z27.b, z29.b
+    add x0, x0, #512
+    ld1b {z24.b}, p0/z, [x0, #0, mul vl]
+    ld1b {z25.b}, p0/z, [x0, #1, mul vl]
+    ld1b {z26.b}, p0/z, [x0, #2, mul vl]
+    ld1b {z27.b}, p0/z, [x0, #3, mul vl]
+    ld1rw {z28.s}, p0/z, [x3, #48]
+    sdot z0.s, z24.b, z28.b
+    sdot z1.s, z25.b, z28.b
+    sdot z2.s, z26.b, z28.b
+    sdot z3.s, z27.b, z28.b
+    ld1rw {z29.s}, p0/z, [x3, #52]
+    sdot z4.s, z24.b, z29.b
+    sdot z5.s, z25.b, z29.b
+    sdot z6.s, z26.b, z29.b
+    sdot z7.s, z27.b, z29.b
+    ld1rw {z30.s}, p0/z, [x3, #56]
+    sdot z8.s, z24.b, z30.b
+    sdot z9.s, z25.b, z30.b
+    sdot z10.s, z26.b, z30.b
+    sdot z11.s, z27.b, z30.b
+    ld1rw {z31.s}, p0/z, [x3, #60]
+    sdot z12.s, z24.b, z31.b
+    sdot z13.s, z25.b, z31.b
+    sdot z14.s, z26.b, z31.b
+    sdot z15.s, z27.b, z31.b
+    ld1rw {z28.s}, p0/z, [x3, #64]
+    sdot z16.s, z24.b, z28.b
+    sdot z17.s, z25.b, z28.b
+    sdot z18.s, z26.b, z28.b
+    sdot z19.s, z27.b, z28.b
+    ld1rw {z29.s}, p0/z, [x3, #68]
+    sdot z20.s, z24.b, z29.b
+    sdot z21.s, z25.b, z29.b
+    sdot z22.s, z26.b, z29.b
+    sdot z23.s, z27.b, z29.b
+    ld1b {z24.b}, p0/z, [x0, #4, mul vl]
+    ld1b {z25.b}, p0/z, [x0, #5, mul vl]
+    ld1b {z26.b}, p0/z, [x0, #6, mul vl]
+    ld1b {z27.b}, p0/z, [x0, #7, mul vl]
+    ld1rw {z28.s}, p0/z, [x3, #72]
+    sdot z0.s, z24.b, z28.b
+    sdot z1.s, z25.b, z28.b
+    sdot z2.s, z26.b, z28.b
+    sdot z3.s, z27.b, z28.b
+    ld1rw {z29.s}, p0/z, [x3, #76]
+    sdot z4.s, z24.b, z29.b
+    sdot z5.s, z25.b, z29.b
+    sdot z6.s, z26.b, z29.b
+    sdot z7.s, z27.b, z29.b
+    ld1rw {z30.s}, p0/z, [x3, #80]
+    sdot z8.s, z24.b, z30.b
+    sdot z9.s, z25.b, z30.b
+    sdot z10.s, z26.b, z30.b
+    sdot z11.s, z27.b, z30.b
+    ld1rw {z31.s}, p0/z, [x3, #84]
+    sdot z12.s, z24.b, z31.b
+    sdot z13.s, z25.b, z31.b
+    sdot z14.s, z26.b, z31.b
+    sdot z15.s, z27.b, z31.b
+    ld1rw {z28.s}, p0/z, [x3, #88]
+    sdot z16.s, z24.b, z28.b
+    sdot z17.s, z25.b, z28.b
+    sdot z18.s, z26.b, z28.b
+    sdot z19.s, z27.b, z28.b
+    ld1rw {z29.s}, p0/z, [x3, #92]
+    sdot z20.s, z24.b, z29.b
+    sdot z21.s, z25.b, z29.b
+    sdot z22.s, z26.b, z29.b
+    sdot z23.s, z27.b, z29.b
+    add x0, x0, #512
+    add x3, x3, #96
+    subs x8, x8, #1
+    b.ne .Lrk
+    ld1w {z24.s}, p0/z, [x0, #0, mul vl]
+    ld1w {z25.s}, p0/z, [x0, #1, mul vl]
+    ld1w {z26.s}, p0/z, [x0, #2, mul vl]
+    ld1w {z27.s}, p0/z, [x0, #3, mul vl]
+    add x0, x0, #256
+    mov x9, x5
+    ld1rw {z28.s}, p0/z, [x4, #0]
+    scvtf z0.s, p0/m, z0.s
+    fmul z29.s, z24.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #0, mul vl]
+    fmla z30.s, p0/m, z0.s, z29.s
+    st1w {z30.s}, p0, [x9, #0, mul vl]
+    scvtf z1.s, p0/m, z1.s
+    fmul z29.s, z25.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #1, mul vl]
+    fmla z30.s, p0/m, z1.s, z29.s
+    st1w {z30.s}, p0, [x9, #1, mul vl]
+    scvtf z2.s, p0/m, z2.s
+    fmul z29.s, z26.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #2, mul vl]
+    fmla z30.s, p0/m, z2.s, z29.s
+    st1w {z30.s}, p0, [x9, #2, mul vl]
+    scvtf z3.s, p0/m, z3.s
+    fmul z29.s, z27.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #3, mul vl]
+    fmla z30.s, p0/m, z3.s, z29.s
+    st1w {z30.s}, p0, [x9, #3, mul vl]
+    add x9, x9, x6
+    ld1rw {z28.s}, p0/z, [x4, #4]
+    scvtf z4.s, p0/m, z4.s
+    fmul z29.s, z24.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #0, mul vl]
+    fmla z30.s, p0/m, z4.s, z29.s
+    st1w {z30.s}, p0, [x9, #0, mul vl]
+    scvtf z5.s, p0/m, z5.s
+    fmul z29.s, z25.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #1, mul vl]
+    fmla z30.s, p0/m, z5.s, z29.s
+    st1w {z30.s}, p0, [x9, #1, mul vl]
+    scvtf z6.s, p0/m, z6.s
+    fmul z29.s, z26.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #2, mul vl]
+    fmla z30.s, p0/m, z6.s, z29.s
+    st1w {z30.s}, p0, [x9, #2, mul vl]
+    scvtf z7.s, p0/m, z7.s
+    fmul z29.s, z27.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #3, mul vl]
+    fmla z30.s, p0/m, z7.s, z29.s
+    st1w {z30.s}, p0, [x9, #3, mul vl]
+    add x9, x9, x6
+    ld1rw {z28.s}, p0/z, [x4, #8]
+    scvtf z8.s, p0/m, z8.s
+    fmul z29.s, z24.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #0, mul vl]
+    fmla z30.s, p0/m, z8.s, z29.s
+    st1w {z30.s}, p0, [x9, #0, mul vl]
+    scvtf z9.s, p0/m, z9.s
+    fmul z29.s, z25.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #1, mul vl]
+    fmla z30.s, p0/m, z9.s, z29.s
+    st1w {z30.s}, p0, [x9, #1, mul vl]
+    scvtf z10.s, p0/m, z10.s
+    fmul z29.s, z26.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #2, mul vl]
+    fmla z30.s, p0/m, z10.s, z29.s
+    st1w {z30.s}, p0, [x9, #2, mul vl]
+    scvtf z11.s, p0/m, z11.s
+    fmul z29.s, z27.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #3, mul vl]
+    fmla z30.s, p0/m, z11.s, z29.s
+    st1w {z30.s}, p0, [x9, #3, mul vl]
+    add x9, x9, x6
+    ld1rw {z28.s}, p0/z, [x4, #12]
+    scvtf z12.s, p0/m, z12.s
+    fmul z29.s, z24.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #0, mul vl]
+    fmla z30.s, p0/m, z12.s, z29.s
+    st1w {z30.s}, p0, [x9, #0, mul vl]
+    scvtf z13.s, p0/m, z13.s
+    fmul z29.s, z25.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #1, mul vl]
+    fmla z30.s, p0/m, z13.s, z29.s
+    st1w {z30.s}, p0, [x9, #1, mul vl]
+    scvtf z14.s, p0/m, z14.s
+    fmul z29.s, z26.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #2, mul vl]
+    fmla z30.s, p0/m, z14.s, z29.s
+    st1w {z30.s}, p0, [x9, #2, mul vl]
+    scvtf z15.s, p0/m, z15.s
+    fmul z29.s, z27.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #3, mul vl]
+    fmla z30.s, p0/m, z15.s, z29.s
+    st1w {z30.s}, p0, [x9, #3, mul vl]
+    add x9, x9, x6
+    ld1rw {z28.s}, p0/z, [x4, #16]
+    scvtf z16.s, p0/m, z16.s
+    fmul z29.s, z24.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #0, mul vl]
+    fmla z30.s, p0/m, z16.s, z29.s
+    st1w {z30.s}, p0, [x9, #0, mul vl]
+    scvtf z17.s, p0/m, z17.s
+    fmul z29.s, z25.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #1, mul vl]
+    fmla z30.s, p0/m, z17.s, z29.s
+    st1w {z30.s}, p0, [x9, #1, mul vl]
+    scvtf z18.s, p0/m, z18.s
+    fmul z29.s, z26.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #2, mul vl]
+    fmla z30.s, p0/m, z18.s, z29.s
+    st1w {z30.s}, p0, [x9, #2, mul vl]
+    scvtf z19.s, p0/m, z19.s
+    fmul z29.s, z27.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #3, mul vl]
+    fmla z30.s, p0/m, z19.s, z29.s
+    st1w {z30.s}, p0, [x9, #3, mul vl]
+    add x9, x9, x6
+    ld1rw {z28.s}, p0/z, [x4, #20]
+    scvtf z20.s, p0/m, z20.s
+    fmul z29.s, z24.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #0, mul vl]
+    fmla z30.s, p0/m, z20.s, z29.s
+    st1w {z30.s}, p0, [x9, #0, mul vl]
+    scvtf z21.s, p0/m, z21.s
+    fmul z29.s, z25.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #1, mul vl]
+    fmla z30.s, p0/m, z21.s, z29.s
+    st1w {z30.s}, p0, [x9, #1, mul vl]
+    scvtf z22.s, p0/m, z22.s
+    fmul z29.s, z26.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #2, mul vl]
+    fmla z30.s, p0/m, z22.s, z29.s
+    st1w {z30.s}, p0, [x9, #2, mul vl]
+    scvtf z23.s, p0/m, z23.s
+    fmul z29.s, z27.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #3, mul vl]
+    fmla z30.s, p0/m, z23.s, z29.s
+    st1w {z30.s}, p0, [x9, #3, mul vl]
+    add x9, x9, x6
+    add x4, x4, #24
+    subs x1, x1, #1
+    b.ne .Lrblock
+    ldp d14, d15, [sp, #48]
+    ldp d12, d13, [sp, #32]
+    ldp d10, d11, [sp, #16]
+    ldp d8, d9, [sp], #64
+    ret
+    .size gk_gemm_tile6x4p2_asm, .-gk_gemm_tile6x4p2_asm
+
+/* gk_gemm_tile6x4p3_asm: 64-row x 6-token prefill GEMM tile on fully packed
+ * operands (one stream each, like a64fx/int8-cmg's 94% 6x4 kernel):
+ *   w:  64-row super-panel, per scale block of sb columns:
+ *       (sb/4) k-groups x 4 vectors x 64 B, then 64 f32 row scales (256 B)
+ *   xp: packed activations, per k-group 6 tokens x 4 bytes (24 B)
+ *   xsp: packed token scales, per block 6 f32
+ * Registers as in gk_gemm_tile6x4_asm.  The k loop is unrolled 4x.
+ *
+ *   void gk_gemm_tile6x4p3_asm(const int8_t *w, long nblocks, long kgroups4,
+ *                             const int8_t *xp, const float *xsp,
+ *                             float *y, size_t ldy_bytes);
+ * y must be zeroed by the caller.
+ * p3 variant: p2 with L1 distances doubled (weights 2 KiB, 4 lines;
+ * activations 384 B).
+ * p2 variant: pp plus L2 prefetch of the weight stream 16 KiB ahead.
+ * pp variant: L1 prefetch of the weight stream (1 KiB ahead) and the packed
+ * activation stream (192 B ahead) in every k iteration. */
+    .text
+    .globl gk_gemm_tile6x4p3_asm
+    .type gk_gemm_tile6x4p3_asm, %function
+    .p2align 6
+gk_gemm_tile6x4p3_asm:
+    stp d8, d9, [sp, #-64]!
+    stp d10, d11, [sp, #16]
+    stp d12, d13, [sp, #32]
+    stp d14, d15, [sp, #48]
+    ptrue p0.b
+.Lsblock:
+    dup z0.s, #0
+    dup z1.s, #0
+    dup z2.s, #0
+    dup z3.s, #0
+    dup z4.s, #0
+    dup z5.s, #0
+    dup z6.s, #0
+    dup z7.s, #0
+    dup z8.s, #0
+    dup z9.s, #0
+    dup z10.s, #0
+    dup z11.s, #0
+    dup z12.s, #0
+    dup z13.s, #0
+    dup z14.s, #0
+    dup z15.s, #0
+    dup z16.s, #0
+    dup z17.s, #0
+    dup z18.s, #0
+    dup z19.s, #0
+    dup z20.s, #0
+    dup z21.s, #0
+    dup z22.s, #0
+    dup z23.s, #0
+    mov x8, x2
+.Lsk:
+    prfm pldl1keep, [x0, #2048]
+    prfm pldl1keep, [x0, #2304]
+    prfm pldl1keep, [x0, #2560]
+    prfm pldl1keep, [x0, #2816]
+    prfm pldl1keep, [x3, #384]
+    prfm pldl2keep, [x0, #16384]
+    prfm pldl2keep, [x0, #16640]
+    prfm pldl2keep, [x0, #16896]
+    prfm pldl2keep, [x0, #17152]
+    ld1b {z24.b}, p0/z, [x0, #0, mul vl]
+    ld1b {z25.b}, p0/z, [x0, #1, mul vl]
+    ld1b {z26.b}, p0/z, [x0, #2, mul vl]
+    ld1b {z27.b}, p0/z, [x0, #3, mul vl]
+    ld1rw {z28.s}, p0/z, [x3, #0]
+    sdot z0.s, z24.b, z28.b
+    sdot z1.s, z25.b, z28.b
+    sdot z2.s, z26.b, z28.b
+    sdot z3.s, z27.b, z28.b
+    ld1rw {z29.s}, p0/z, [x3, #4]
+    sdot z4.s, z24.b, z29.b
+    sdot z5.s, z25.b, z29.b
+    sdot z6.s, z26.b, z29.b
+    sdot z7.s, z27.b, z29.b
+    ld1rw {z30.s}, p0/z, [x3, #8]
+    sdot z8.s, z24.b, z30.b
+    sdot z9.s, z25.b, z30.b
+    sdot z10.s, z26.b, z30.b
+    sdot z11.s, z27.b, z30.b
+    ld1rw {z31.s}, p0/z, [x3, #12]
+    sdot z12.s, z24.b, z31.b
+    sdot z13.s, z25.b, z31.b
+    sdot z14.s, z26.b, z31.b
+    sdot z15.s, z27.b, z31.b
+    ld1rw {z28.s}, p0/z, [x3, #16]
+    sdot z16.s, z24.b, z28.b
+    sdot z17.s, z25.b, z28.b
+    sdot z18.s, z26.b, z28.b
+    sdot z19.s, z27.b, z28.b
+    ld1rw {z29.s}, p0/z, [x3, #20]
+    sdot z20.s, z24.b, z29.b
+    sdot z21.s, z25.b, z29.b
+    sdot z22.s, z26.b, z29.b
+    sdot z23.s, z27.b, z29.b
+    ld1b {z24.b}, p0/z, [x0, #4, mul vl]
+    ld1b {z25.b}, p0/z, [x0, #5, mul vl]
+    ld1b {z26.b}, p0/z, [x0, #6, mul vl]
+    ld1b {z27.b}, p0/z, [x0, #7, mul vl]
+    ld1rw {z28.s}, p0/z, [x3, #24]
+    sdot z0.s, z24.b, z28.b
+    sdot z1.s, z25.b, z28.b
+    sdot z2.s, z26.b, z28.b
+    sdot z3.s, z27.b, z28.b
+    ld1rw {z29.s}, p0/z, [x3, #28]
+    sdot z4.s, z24.b, z29.b
+    sdot z5.s, z25.b, z29.b
+    sdot z6.s, z26.b, z29.b
+    sdot z7.s, z27.b, z29.b
+    ld1rw {z30.s}, p0/z, [x3, #32]
+    sdot z8.s, z24.b, z30.b
+    sdot z9.s, z25.b, z30.b
+    sdot z10.s, z26.b, z30.b
+    sdot z11.s, z27.b, z30.b
+    ld1rw {z31.s}, p0/z, [x3, #36]
+    sdot z12.s, z24.b, z31.b
+    sdot z13.s, z25.b, z31.b
+    sdot z14.s, z26.b, z31.b
+    sdot z15.s, z27.b, z31.b
+    ld1rw {z28.s}, p0/z, [x3, #40]
+    sdot z16.s, z24.b, z28.b
+    sdot z17.s, z25.b, z28.b
+    sdot z18.s, z26.b, z28.b
+    sdot z19.s, z27.b, z28.b
+    ld1rw {z29.s}, p0/z, [x3, #44]
+    sdot z20.s, z24.b, z29.b
+    sdot z21.s, z25.b, z29.b
+    sdot z22.s, z26.b, z29.b
+    sdot z23.s, z27.b, z29.b
+    add x0, x0, #512
+    ld1b {z24.b}, p0/z, [x0, #0, mul vl]
+    ld1b {z25.b}, p0/z, [x0, #1, mul vl]
+    ld1b {z26.b}, p0/z, [x0, #2, mul vl]
+    ld1b {z27.b}, p0/z, [x0, #3, mul vl]
+    ld1rw {z28.s}, p0/z, [x3, #48]
+    sdot z0.s, z24.b, z28.b
+    sdot z1.s, z25.b, z28.b
+    sdot z2.s, z26.b, z28.b
+    sdot z3.s, z27.b, z28.b
+    ld1rw {z29.s}, p0/z, [x3, #52]
+    sdot z4.s, z24.b, z29.b
+    sdot z5.s, z25.b, z29.b
+    sdot z6.s, z26.b, z29.b
+    sdot z7.s, z27.b, z29.b
+    ld1rw {z30.s}, p0/z, [x3, #56]
+    sdot z8.s, z24.b, z30.b
+    sdot z9.s, z25.b, z30.b
+    sdot z10.s, z26.b, z30.b
+    sdot z11.s, z27.b, z30.b
+    ld1rw {z31.s}, p0/z, [x3, #60]
+    sdot z12.s, z24.b, z31.b
+    sdot z13.s, z25.b, z31.b
+    sdot z14.s, z26.b, z31.b
+    sdot z15.s, z27.b, z31.b
+    ld1rw {z28.s}, p0/z, [x3, #64]
+    sdot z16.s, z24.b, z28.b
+    sdot z17.s, z25.b, z28.b
+    sdot z18.s, z26.b, z28.b
+    sdot z19.s, z27.b, z28.b
+    ld1rw {z29.s}, p0/z, [x3, #68]
+    sdot z20.s, z24.b, z29.b
+    sdot z21.s, z25.b, z29.b
+    sdot z22.s, z26.b, z29.b
+    sdot z23.s, z27.b, z29.b
+    ld1b {z24.b}, p0/z, [x0, #4, mul vl]
+    ld1b {z25.b}, p0/z, [x0, #5, mul vl]
+    ld1b {z26.b}, p0/z, [x0, #6, mul vl]
+    ld1b {z27.b}, p0/z, [x0, #7, mul vl]
+    ld1rw {z28.s}, p0/z, [x3, #72]
+    sdot z0.s, z24.b, z28.b
+    sdot z1.s, z25.b, z28.b
+    sdot z2.s, z26.b, z28.b
+    sdot z3.s, z27.b, z28.b
+    ld1rw {z29.s}, p0/z, [x3, #76]
+    sdot z4.s, z24.b, z29.b
+    sdot z5.s, z25.b, z29.b
+    sdot z6.s, z26.b, z29.b
+    sdot z7.s, z27.b, z29.b
+    ld1rw {z30.s}, p0/z, [x3, #80]
+    sdot z8.s, z24.b, z30.b
+    sdot z9.s, z25.b, z30.b
+    sdot z10.s, z26.b, z30.b
+    sdot z11.s, z27.b, z30.b
+    ld1rw {z31.s}, p0/z, [x3, #84]
+    sdot z12.s, z24.b, z31.b
+    sdot z13.s, z25.b, z31.b
+    sdot z14.s, z26.b, z31.b
+    sdot z15.s, z27.b, z31.b
+    ld1rw {z28.s}, p0/z, [x3, #88]
+    sdot z16.s, z24.b, z28.b
+    sdot z17.s, z25.b, z28.b
+    sdot z18.s, z26.b, z28.b
+    sdot z19.s, z27.b, z28.b
+    ld1rw {z29.s}, p0/z, [x3, #92]
+    sdot z20.s, z24.b, z29.b
+    sdot z21.s, z25.b, z29.b
+    sdot z22.s, z26.b, z29.b
+    sdot z23.s, z27.b, z29.b
+    add x0, x0, #512
+    add x3, x3, #96
+    subs x8, x8, #1
+    b.ne .Lsk
+    ld1w {z24.s}, p0/z, [x0, #0, mul vl]
+    ld1w {z25.s}, p0/z, [x0, #1, mul vl]
+    ld1w {z26.s}, p0/z, [x0, #2, mul vl]
+    ld1w {z27.s}, p0/z, [x0, #3, mul vl]
+    add x0, x0, #256
+    mov x9, x5
+    ld1rw {z28.s}, p0/z, [x4, #0]
+    scvtf z0.s, p0/m, z0.s
+    fmul z29.s, z24.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #0, mul vl]
+    fmla z30.s, p0/m, z0.s, z29.s
+    st1w {z30.s}, p0, [x9, #0, mul vl]
+    scvtf z1.s, p0/m, z1.s
+    fmul z29.s, z25.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #1, mul vl]
+    fmla z30.s, p0/m, z1.s, z29.s
+    st1w {z30.s}, p0, [x9, #1, mul vl]
+    scvtf z2.s, p0/m, z2.s
+    fmul z29.s, z26.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #2, mul vl]
+    fmla z30.s, p0/m, z2.s, z29.s
+    st1w {z30.s}, p0, [x9, #2, mul vl]
+    scvtf z3.s, p0/m, z3.s
+    fmul z29.s, z27.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #3, mul vl]
+    fmla z30.s, p0/m, z3.s, z29.s
+    st1w {z30.s}, p0, [x9, #3, mul vl]
+    add x9, x9, x6
+    ld1rw {z28.s}, p0/z, [x4, #4]
+    scvtf z4.s, p0/m, z4.s
+    fmul z29.s, z24.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #0, mul vl]
+    fmla z30.s, p0/m, z4.s, z29.s
+    st1w {z30.s}, p0, [x9, #0, mul vl]
+    scvtf z5.s, p0/m, z5.s
+    fmul z29.s, z25.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #1, mul vl]
+    fmla z30.s, p0/m, z5.s, z29.s
+    st1w {z30.s}, p0, [x9, #1, mul vl]
+    scvtf z6.s, p0/m, z6.s
+    fmul z29.s, z26.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #2, mul vl]
+    fmla z30.s, p0/m, z6.s, z29.s
+    st1w {z30.s}, p0, [x9, #2, mul vl]
+    scvtf z7.s, p0/m, z7.s
+    fmul z29.s, z27.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #3, mul vl]
+    fmla z30.s, p0/m, z7.s, z29.s
+    st1w {z30.s}, p0, [x9, #3, mul vl]
+    add x9, x9, x6
+    ld1rw {z28.s}, p0/z, [x4, #8]
+    scvtf z8.s, p0/m, z8.s
+    fmul z29.s, z24.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #0, mul vl]
+    fmla z30.s, p0/m, z8.s, z29.s
+    st1w {z30.s}, p0, [x9, #0, mul vl]
+    scvtf z9.s, p0/m, z9.s
+    fmul z29.s, z25.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #1, mul vl]
+    fmla z30.s, p0/m, z9.s, z29.s
+    st1w {z30.s}, p0, [x9, #1, mul vl]
+    scvtf z10.s, p0/m, z10.s
+    fmul z29.s, z26.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #2, mul vl]
+    fmla z30.s, p0/m, z10.s, z29.s
+    st1w {z30.s}, p0, [x9, #2, mul vl]
+    scvtf z11.s, p0/m, z11.s
+    fmul z29.s, z27.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #3, mul vl]
+    fmla z30.s, p0/m, z11.s, z29.s
+    st1w {z30.s}, p0, [x9, #3, mul vl]
+    add x9, x9, x6
+    ld1rw {z28.s}, p0/z, [x4, #12]
+    scvtf z12.s, p0/m, z12.s
+    fmul z29.s, z24.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #0, mul vl]
+    fmla z30.s, p0/m, z12.s, z29.s
+    st1w {z30.s}, p0, [x9, #0, mul vl]
+    scvtf z13.s, p0/m, z13.s
+    fmul z29.s, z25.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #1, mul vl]
+    fmla z30.s, p0/m, z13.s, z29.s
+    st1w {z30.s}, p0, [x9, #1, mul vl]
+    scvtf z14.s, p0/m, z14.s
+    fmul z29.s, z26.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #2, mul vl]
+    fmla z30.s, p0/m, z14.s, z29.s
+    st1w {z30.s}, p0, [x9, #2, mul vl]
+    scvtf z15.s, p0/m, z15.s
+    fmul z29.s, z27.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #3, mul vl]
+    fmla z30.s, p0/m, z15.s, z29.s
+    st1w {z30.s}, p0, [x9, #3, mul vl]
+    add x9, x9, x6
+    ld1rw {z28.s}, p0/z, [x4, #16]
+    scvtf z16.s, p0/m, z16.s
+    fmul z29.s, z24.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #0, mul vl]
+    fmla z30.s, p0/m, z16.s, z29.s
+    st1w {z30.s}, p0, [x9, #0, mul vl]
+    scvtf z17.s, p0/m, z17.s
+    fmul z29.s, z25.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #1, mul vl]
+    fmla z30.s, p0/m, z17.s, z29.s
+    st1w {z30.s}, p0, [x9, #1, mul vl]
+    scvtf z18.s, p0/m, z18.s
+    fmul z29.s, z26.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #2, mul vl]
+    fmla z30.s, p0/m, z18.s, z29.s
+    st1w {z30.s}, p0, [x9, #2, mul vl]
+    scvtf z19.s, p0/m, z19.s
+    fmul z29.s, z27.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #3, mul vl]
+    fmla z30.s, p0/m, z19.s, z29.s
+    st1w {z30.s}, p0, [x9, #3, mul vl]
+    add x9, x9, x6
+    ld1rw {z28.s}, p0/z, [x4, #20]
+    scvtf z20.s, p0/m, z20.s
+    fmul z29.s, z24.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #0, mul vl]
+    fmla z30.s, p0/m, z20.s, z29.s
+    st1w {z30.s}, p0, [x9, #0, mul vl]
+    scvtf z21.s, p0/m, z21.s
+    fmul z29.s, z25.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #1, mul vl]
+    fmla z30.s, p0/m, z21.s, z29.s
+    st1w {z30.s}, p0, [x9, #1, mul vl]
+    scvtf z22.s, p0/m, z22.s
+    fmul z29.s, z26.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #2, mul vl]
+    fmla z30.s, p0/m, z22.s, z29.s
+    st1w {z30.s}, p0, [x9, #2, mul vl]
+    scvtf z23.s, p0/m, z23.s
+    fmul z29.s, z27.s, z28.s
+    ld1w {z30.s}, p0/z, [x9, #3, mul vl]
+    fmla z30.s, p0/m, z23.s, z29.s
+    st1w {z30.s}, p0, [x9, #3, mul vl]
+    add x9, x9, x6
+    add x4, x4, #24
+    subs x1, x1, #1
+    b.ne .Lsblock
+    ldp d14, d15, [sp, #48]
+    ldp d12, d13, [sp, #32]
+    ldp d10, d11, [sp, #16]
+    ldp d8, d9, [sp], #64
+    ret
+    .size gk_gemm_tile6x4p3_asm, .-gk_gemm_tile6x4p3_asm

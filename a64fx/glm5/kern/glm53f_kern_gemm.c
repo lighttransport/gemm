@@ -145,6 +145,15 @@ void gk_gemm_panel16(int sb, const uint8_t *w, int K, int r0, int r1, int t0, in
 /* ---- fully packed variant (glm53f_kern_gemm_asm.S gk_gemm_tile6x4p_asm) ---- */
 void gk_gemm_tile6x4p_asm(const int8_t *w, long nblocks, long kgroups4, const int8_t *xp,
                           const float *xsp, float *y, size_t ldy_bytes);
+void gk_gemm_tile6x4pp_asm(const int8_t *w, long nblocks, long kgroups4, const int8_t *xp,
+                           const float *xsp, float *y, size_t ldy_bytes);
+void gk_gemm_tile6x4p2_asm(const int8_t *w, long nblocks, long kgroups4, const int8_t *xp,
+                           const float *xsp, float *y, size_t ldy_bytes);
+void gk_gemm_tile6x4p3_asm(const int8_t *w, long nblocks, long kgroups4, const int8_t *xp,
+                           const float *xsp, float *y, size_t ldy_bytes);
+/* 1: L1-prefetching micro-kernel; 2: plus L2 weight prefetch 16 KiB ahead;
+ * 3: as 2 with doubled L1 prefetch distances. */
+int gk_gemm_l1pf = 0;
 
 size_t gk_panel64_bytes(int sb, int columns) { return (size_t)(columns / sb) * (64 * (size_t)sb + 256); }
 
@@ -195,7 +204,8 @@ void gk_gemm_panel64(int sb, const uint8_t *w, int K, int r0, int r1, int t0, in
         for (int k0 = 0; k0 < K; k0 += kc) {
             const int kn = K - k0 < kc ? K - k0 : kc;
             for (int t = t0; t + 6 <= t1; t += 6)
-                gk_gemm_tile6x4p_asm((const int8_t *)(wr + (size_t)(k0 / sb) * blk), kn / sb, sb / 16,
+                (gk_gemm_l1pf == 3 ? gk_gemm_tile6x4p3_asm : gk_gemm_l1pf == 2 ? gk_gemm_tile6x4p2_asm : gk_gemm_l1pf ? gk_gemm_tile6x4pp_asm : gk_gemm_tile6x4p_asm)(
+                                     (const int8_t *)(wr + (size_t)(k0 / sb) * blk), kn / sb, sb / 16,
                                      xp + (size_t)(t / 6) * 6 * K + (size_t)(k0 / 4) * 24,
                                      xsp + (size_t)(t / 6) * 6 * (K / sb) + (size_t)(k0 / sb) * 6,
                                      y + (size_t)t * ldy + r, ldy * 4);
