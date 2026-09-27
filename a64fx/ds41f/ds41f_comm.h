@@ -3,6 +3,8 @@
 #include <stddef.h>
 int ds41f_comm_init(int *argc,char ***argv,int *rank,int *ranks);
 void ds41f_comm_sum(float *values,size_t count);
+void ds41f_comm_sum_bf16(float *values,size_t count);
+void ds41f_comm_reduce_owner(float *values,size_t count,int owner);
 void ds41f_comm_ready(void);
 /* Select identically on every rank, before issuing broadcasts. */
 void ds41f_comm_use_mpi_broadcast(int enabled);
@@ -12,10 +14,18 @@ void ds41f_comm_bytes(void *values,size_t bytes,int owner);
  * with nonzero low bits instead of silently quantizing a residual. */
 void ds41f_comm_bf16_broadcast(float *values,size_t count,size_t tail,int owner);
 void ds41f_comm_bf16_handoff(float *values,size_t count,size_t tail,int owner,int next);
-/* Token-major strided rows, batch 1..6. The BF16 prefix and FP32 tail keep
+/* Token-major strided rows, batch 1..16. The BF16 prefix and FP32 tail keep
  * the same representation and signed-zero rule as the single-row forms. */
 void ds41f_comm_bf16_broadcast_batch(float *values,size_t stride,size_t count,size_t tail,size_t batch,int owner);
 void ds41f_comm_bf16_handoff_batch(float *values,size_t stride,size_t count,size_t tail,size_t batch,int owner,int next);
+void ds41f_comm_tp_bf16_broadcast_batch(float *values,size_t stride,size_t count,size_t tail,size_t batch,int owner);
+void ds41f_comm_tp_reduce_owner(float *values,size_t count,int owner);
+typedef struct {void *request;void *wire;float *values;size_t stride,count,tail,batch;int receive,raw;} ds41f_comm_handoff_request;
+void ds41f_comm_handoff_start(ds41f_comm_handoff_request *request,float *values,size_t stride,
+                              size_t count,size_t tail,size_t batch,int owner,int next,int slot);
+void ds41f_comm_handoff_wait(ds41f_comm_handoff_request *request);
+void ds41f_comm_handoff_bytes_start(ds41f_comm_handoff_request *request,void *values,size_t bytes,
+                                    int owner,int next,int slot);
 void ds41f_comm_tp_gather_batch(float *out,size_t out_stride,float *part,size_t part_stride,size_t count,size_t batch,int owner,int all);
 
 void ds41f_comm_abort(const char *message,int error);
@@ -40,5 +50,10 @@ void ds41f_comm_shared_gather_aligned(float *out,const float *part,size_t count,
                                       int owner,size_t global_count,size_t alignment);
 void ds41f_comm_shared_reduce_scatter(float *out,const float *in,size_t global_count);
 void ds41f_comm_shared_reduce_scatter_aligned(float *out,const float *in,
-                                              size_t global_count,size_t alignment);
+                                               size_t global_count,size_t alignment);
+void ds41f_comm_shared_allreduce(float *values,size_t count);
+void ds41f_comm_shared_reduce_owner(float *out,const float *in,size_t count,int owner);
+/* Gather eight equal BF16 preparation shards on ranks 0..7, then publish the
+ * reconstructed vector to all twelve ranks. */
+void ds41f_comm_attention_gather_qkv(float *qr,float *kv,float *qr_part,float *kv_part);
 #endif

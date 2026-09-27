@@ -107,6 +107,8 @@ static int tp_shared(const char *name)
 {return strstr(name,".ffn.shared_experts.")!=NULL;}
 static int tp_attention(const char *name)
 {return strstr(name,".attn.wq_b.")||strstr(name,".attn.wo_a.")||strstr(name,".attn.wo_b.");}
+static int tp_attention_prepare(const char *name)
+{return strstr(name,".attn.wq_a.")||strstr(name,".attn.wkv.");}
 static int tp_sharded(const char *name)
 {return tp_vocab(name)||!strcmp(name,"mtp.0.main_proj.weight")||!strcmp(name,"mtp.0.main_proj.scale")||strstr(name,".attn.wq_b.")||strstr(name,".attn.wo_a.")||
     strstr(name,".attn.wo_b.")||tp_shared(name);}
@@ -156,14 +158,23 @@ int ds41f_weights_check_shared_tp(ds41f_weights *s,const char *stage,int tp,int 
     FILE *f=fopen(path,"r");if(!f)return errno;
     int version,stored_tp,stored_rank,ranks;char extra;int rc=0;
     if(!fgets(line,sizeof line,f)||sscanf(line,"DS41FSH %d %d %d %d %c",&version,&stored_tp,&stored_rank,&ranks,&extra)!=4||
-       version!=1||stored_tp!=tp||stored_rank!=rank||ranks!=12)rc=EINVAL;
+       (version!=1&&version!=2)||stored_tp!=tp||stored_rank!=rank||ranks!=12)rc=EINVAL;
     unsigned char *seen=calloc(s->count,1);if(!seen){fclose(f);return ENOMEM;}
     while(!rc&&fgets(line,sizeof line,f)){
         char name[192];size_t rows,cols,first,local;
-        if(sscanf(line,"%191s %zu %zu %zu %zu %c",name,&rows,&cols,&first,&local,&extra)!=5){rc=EINVAL;break;}
+        char axis='R';int fields=sscanf(line,"%191s %zu %zu %c %zu %zu %c",name,&rows,&cols,&axis,&first,&local,&extra);
+        int column=fields==6&&axis=='C';
+        if(!column&&sscanf(line,"%191s %zu %zu %zu %zu %c",name,&rows,&cols,&first,&local,&extra)!=5){rc=EINVAL;break;}
         const ds41f_weight *found=ds41f_weight_find(s,name);
-        if(!found||!tp_shared(name)||found->rows!=local||found->cols!=cols||first>rows||local>rows-first){rc=EINVAL;break;}
+        if(!found||!tp_shared(name)||(column?(found->rows!=rows||found->cols!=local):
+           (found->rows!=local||found->cols!=cols))||(!column&&(first>rows||local>rows-first))){rc=EINVAL;break;}
         size_t index=(size_t)(found-s->items);if(seen[index]){rc=EINVAL;break;}seen[index]=1;
+        if(column){
+            if(version!=2||!strstr(name,".ffn.shared_experts.w2.")||first>cols||local>cols-first){rc=EINVAL;break;}
+            size_t expected_first=cols*(size_t)rank/12,expected_end=cols*(size_t)(rank+1)/12;
+            if(first!=expected_first||local!=expected_end-expected_first){rc=EINVAL;break;}
+            continue;
+        }
         int local_rank=rank%tp;size_t alignment=(!strcmp(found->dtype,"F8_E4M3")&&
             strstr(name,".ffn.shared_experts.")&&strstr(name,".weight"))?32:1;
         if(rows%alignment){rc=EINVAL;break;}
@@ -185,7 +196,10 @@ int ds41f_weights_check_shared_tp(ds41f_weights *s,const char *stage,int tp,int 
         if(len+7>=sizeof scale_name){rc=ENAMETOOLONG;break;}
         memcpy(scale_name,w->name,len);memcpy(scale_name+len,".scale",7);
         const ds41f_weight *scale=ds41f_weight_find(s,scale_name);
-        if(!scale||strcmp(scale->dtype,"F8_E8M0")||
+        if(!scale||strcmp(scale->dtype,"F8_E8M0")){rc=EINVAL;break;}
+        if(version==2&&strstr(w->name,".ffn.shared_experts.w2.")){
+            if(scale->rows!=(w->rows+31)/32||scale->cols!=(w->cols+31)/32){rc=EINVAL;break;}
+        }else if(
            scale->global_rows!=(w->global_rows+31)/32||
            scale->row_start!=w->row_start/32||scale->rows!=(w->rows+31)/32){rc=EINVAL;break;}}
     free(seen);fclose(f);return rc;
@@ -198,16 +212,27 @@ int ds41f_weights_check_attention_tp(ds41f_weights *s,const char *stage,int rank
     FILE *f=fopen(path,"r");if(!f)return errno;
     int version,stored_tp,stored_rank,ranks;char extra;int rc=0;
     if(!fgets(line,sizeof line,f)||sscanf(line,"DS41FA %d %d %d %d %c",
-       &version,&stored_tp,&stored_rank,&ranks,&extra)!=4||version!=1||stored_tp!=8||
+       &version,&stored_tp,&stored_rank,&ranks,&extra)!=4||(version<1||version>3)||stored_tp!=8||
        stored_rank!=rank||ranks!=12){rc=EINVAL;}
     unsigned char *seen=calloc(s->count,1);if(!seen){fclose(f);return ENOMEM;}
     while(!rc&&fgets(line,sizeof line,f)){
         char name[192];size_t rows,cols,first,local;
-        if(sscanf(line,"%191s %zu %zu %zu %zu %c",name,&rows,&cols,&first,&local,&extra)!=5){rc=EINVAL;break;}
+        char axis='R';int fields=sscanf(line,"%191s %zu %zu %c %zu %zu %c",name,&rows,&cols,&axis,&first,&local,&extra);
+        int column=fields==6&&axis=='C';
+        if(!column&&sscanf(line,"%191s %zu %zu %zu %zu %c",name,&rows,&cols,&first,&local,&extra)!=5){rc=EINVAL;break;}
         const ds41f_weight *found=ds41f_weight_find(s,name);
-        if(!found||!tp_attention(name)||found->rows!=local||found->cols!=cols||
-           first>rows||local>rows-first){rc=EINVAL;break;}
-        int head_shard=strstr(name,".attn.wq_b.")||strstr(name,".attn.wo_a.");
+        int preparation=version==2&&tp_attention_prepare(name);
+        if(!found||(!tp_attention(name)&&!preparation)||
+           (column?(found->rows!=rows||found->cols!=local):(found->rows!=local||found->cols!=cols))||
+           (!column&&(first>rows||local>rows-first))){rc=EINVAL;break;}
+        if(column){
+            if(version!=3||!strstr(name,".attn.wo_b.")||rank>=8||first>cols||local>cols-first){rc=EINVAL;break;}
+            size_t expected_first=cols*(size_t)rank/8,expected_end=cols*(size_t)(rank+1)/8;
+            if(first!=expected_first||local!=expected_end-expected_first){rc=EINVAL;break;}
+            size_t index=(size_t)(found-s->items);if(seen[index]){rc=EINVAL;break;}seen[index]=1;
+            continue;
+        }
+        int head_shard=strstr(name,".attn.wq_b.")||strstr(name,".attn.wo_a.")||preparation;
         int degree=head_shard?8:12;if(head_shard&&rank>=8){rc=EINVAL;break;}
         size_t name_len=strlen(name);
         int weight_suffix=name_len>=7&&!strcmp(name+name_len-7,".weight");
@@ -224,19 +249,44 @@ int ds41f_weights_check_attention_tp(ds41f_weights *s,const char *stage,int rank
     /* The manifest lists only the rows used by this rank.  Q/WO-A are
      * present on ranks 0..7; every rank carries a WO-B output shard. */
     if(!rc)for(size_t i=0;i<s->count;++i){const ds41f_weight *w=&s->items[i];
-        if(!tp_attention(w->name))continue;
-        int want=!((strstr(w->name,".attn.wq_b.")||strstr(w->name,".attn.wo_a."))&&rank>=8);
+        if(!tp_attention(w->name)&&!(version==2&&tp_attention_prepare(w->name)))continue;
+        int want=!((strstr(w->name,".attn.wq_b.")||strstr(w->name,".attn.wo_a.")||
+                    (version==3&&strstr(w->name,".attn.wo_b."))||
+                    (version==2&&tp_attention_prepare(w->name)))&&rank>=8);
         if((int)seen[i]!=want){rc=EINVAL;break;}}
     /* Each FP8 scale row corresponds to a 32-row output group. */
     if(!rc)for(size_t i=0;i<s->count;++i){const ds41f_weight *w=&s->items[i];
         size_t len=strlen(w->name);
-        if(!tp_attention(w->name)||strcmp(w->dtype,"F8_E4M3")||len<7||strcmp(w->name+len-7,".weight"))continue;
+        if((!tp_attention(w->name)&&!(version==2&&tp_attention_prepare(w->name)))||
+           strcmp(w->dtype,"F8_E4M3")||len<7||strcmp(w->name+len-7,".weight"))continue;
         char scale_name[192];if(len>=sizeof scale_name){rc=ENAMETOOLONG;break;}
         memcpy(scale_name,w->name,len-7);memcpy(scale_name+len-7,".scale",7);
         const ds41f_weight *scale=ds41f_weight_find(s,scale_name);
-        if(!scale||strcmp(scale->dtype,"F8_E8M0")||scale->global_rows!=(w->global_rows+31)/32||
-           scale->row_start!=w->row_start/32||scale->rows!=(w->rows+31)/32){rc=EINVAL;break;}}
+        if(!scale||strcmp(scale->dtype,"F8_E8M0")){rc=EINVAL;break;}
+        if(version==3&&strstr(w->name,".attn.wo_b.")){
+            if(scale->rows!=(w->rows+31)/32||scale->cols!=(w->cols+31)/32){rc=EINVAL;break;}
+        }else if(scale->global_rows!=(w->global_rows+31)/32||scale->row_start!=w->row_start/32||
+                 scale->rows!=(w->rows+31)/32){rc=EINVAL;break;}}
     free(seen);fclose(f);return rc;
+}
+int ds41f_weights_check_attention_prepare_tp8(ds41f_weights *s,const char *stage,int rank)
+{
+    if(!s||!stage||rank<0||rank>=12)return EINVAL;
+    char path[4096],line[512],extra;int n=snprintf(path,sizeof path,"%s/weights.attention.tp",stage);
+    if(n<0||(size_t)n>=sizeof path)return ENAMETOOLONG;
+    FILE *f=fopen(path,"r");if(!f)return errno;
+    int version,tp,stored_rank,ranks;
+    int rc=!fgets(line,sizeof line,f)||sscanf(line,"DS41FA %d %d %d %d %c",
+        &version,&tp,&stored_rank,&ranks,&extra)!=4||version!=2||tp!=8||stored_rank!=rank||ranks!=12;
+    fclose(f);if(rc)return EINVAL;
+    if(rank==0)for(int layer=0;layer<40;++layer){char name[192];
+        snprintf(name,sizeof name,"layers.%d.attn.q_norm.weight",layer);
+        const ds41f_weight *q=ds41f_weight_find(s,name);
+        snprintf(name,sizeof name,"layers.%d.attn.kv_norm.weight",layer);
+        const ds41f_weight *kv=ds41f_weight_find(s,name);
+        if(!q||!kv||strcmp(q->dtype,"BF16")||strcmp(kv->dtype,"BF16")||
+           q->rows!=1||q->cols!=1280||kv->rows!=1||kv->cols!=512)return EINVAL;}
+    return 0;
 }
 int ds41f_weights_requantize_fp8(ds41f_weights *s,size_t block,size_t limit,int projections_only)
 {

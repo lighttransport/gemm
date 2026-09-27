@@ -2,11 +2,321 @@
 
 See the [current results](#current-results-2026-09-13), the original
 [20/30/40 tokens/s implementation plan](#203040-tokenss-implementation-plan),
+the [100+ tokens/s prefill plan](#100-tokenss-prefill-plan-2026-09-14),
 and [remaining work](#future-work-after-the-continuation).
 The earlier pause was superseded by the requests to pursue INT8 SDOT decode
 and implement the plan. Dated sections preserve the experiment history;
 their allocation status and unfinished-task notes describe that point in time.
 The current results and remaining-work list supersede those older notes.
+
+## 200+ tokens/s three-stage prefill plan, 2026-09-15
+
+The next prefill target is **200+ input tokens/s** for the fixed 1105-token
+replay on twelve normal-mode A64FX nodes. Timing excludes resident loading but
+includes embedding, Engram reads and transfers, causal state updates,
+pipeline fill/drain and the final vocabulary head. The accepted batch-64
+control remains 33.45--33.56 input tokens/s. Its approximately 12.0 ms/token
+world FFN publication and 5.2 ms/token shared/reduction span already exceed
+the complete 5 ms/token target, so the new path changes the distribution
+rather than adding another serial collective optimization.
+
+Use three pipeline stages with four ranks each: ranks 0--3 own layers 0--12,
+ranks 4--7 own layers 13--26, and ranks 8--11 own layers 27--39. Attention and
+the shared expert remain TP4 inside a stage; routed experts use
+`expert_id % 4`, and the local owner is `4*stage + (layer & 3)`. Only the
+BF16 residual plus bounded causal metadata crosses the two stage boundaries.
+The projected largest rank holds 26,155,609,824 bytes of resident weights,
+close to the validated 26.08 GB maximum and compatible with the existing
+2 GiB `MemAvailable` floor. The legacy layout and accepted 24 tok/s decode
+command remain separate controls; the pipeline layout must hand off correct
+state to decode, but its decode speed does not gate the prefill result.
+
+Implementation order and gates:
+
+1. Add a versioned pipeline manifest and bounded staging pass. It records the
+   stage/layer ranges, TP4 tensor ranges, local expert ownership, source header
+   hashes and expected resident bytes. Reject incomplete or mismatched roots.
+2. Split MPI into the three stage communicators and remove world collectives
+   from the prompt layer loop. Use double-buffered nonblocking handoffs from
+   rank 0 to rank 5 after layer 12 and rank 6 to rank 11 after layer 26.
+   Carry at most 512 selected row IDs and 2048 candidate block IDs per token,
+   plus source-1/source-3 compressed publications where required.
+3. Replace per-token Engram synchronization with a bounded four-tile feeder.
+   Four local I/O workers sort and deduplicate owned reads; only the main
+   thread issues MPI under `MPI_THREAD_FUNNELED`. Target owners are ranks 1
+   and 6 for layers 1 and 14.
+4. Start with 36-token prompt tiles. Integrate the BF16 2x12 kernel as a wide
+   dense path and compare it per production shape with the retained six-token
+   INT8 SDOT path. Keep one resident weight representation per tensor. Batch
+   projection, gate, Engram projection, mHC/norm/pointwise and sparse
+   attention work; preserve causal preparation and every BF16 boundary.
+5. Column-shard WO-B and shared W2 inside TP4. Reduce each rank's routed and
+   shared contribution together once per layer. Keep exact softmax; the
+   previously rejected approximate exp2 modes stay disabled.
+
+The slowest stage must average at most 4.4 ms/input token, with engineering
+budgets of 1.6 ms for attention plus mHC, 2.0 ms for routed/shared FFN,
+0.45 ms for all communication and 0.15 ms exposed Engram wait. Admission
+requires all 1105 retained next-token IDs, route IDs, selected IDs and
+structural state counts to match; captured tensors and logits require cosine
+at least 0.999 and relative RMS at most 1%. The performance claim requires
+three runs individually at or above 200 input tokens/s (at most 5.525 seconds
+per replay), full-tile p95 and stage-balance reporting, and at least 2 GiB
+`MemAvailable` throughout on every rank.
+
+Earlier work in commits `2b5bd3d3` and `f02af899` added stage-local BF16
+broadcast, owner reduction, and two-slot nonblocking residual handoff
+primitives. The versioned Python stager described in that work is absent from
+this checkout, so pipeline roots cannot yet be prepared here. The existing
+verifier still uses the legacy all-layer loop. The A64FX MPI build and
+transport tests remain to be run in a compute allocation.
+
+The scheduler contract is now isolated in `ds41f_pipeline.[ch]`. It validates
+the stage descriptor, exposes the layer-owner and boundary mapping, and bounds
+the selected-row, candidate-block, and compressed-publication fields carried
+between stages. `test_pipeline` exercises those rules on the host; it does not
+claim that the legacy verifier can execute a staged root yet.
+
+`ds41f_pipeline_runtime.[ch]` now provides the wavefront driver for the future
+model callback: it runs the `tiles+2` fill/drain waves, maps wave `W` to tile
+`W-stage`, and alternates two handoff slots. The host test covers all three
+stages, partial final tiles, and slot ordering. The callback remains separate
+from the verifier until its layer-local state and stage collectives are
+converted together.
+
+The runtime now preposts the next stage-boundary receive immediately after a
+tile callback, while retaining the two-slot wait-before-reuse rule. This
+removes a receive-control bubble from the steady-state wavefront; the host
+transport test checks that tile 1 is posted before tile 0's stage work drains.
+The runtime also rejects tile sizes above the fixed 64-token envelope before
+invoking a callback.
+
+The verifier layer body is now exposed internally as
+`forward_batch_range(..., first_layer, last_layer, include_head)`. The legacy
+`forward_batch()` wrapper still executes layers 0--39 with the vocabulary head;
+the staged callback can reuse the same implementation for one contiguous stage
+and defer the head to the final stage.
+
+`verify_begin_stage()` now initializes a tile from a received 20,484-float
+residual packet, snapshots the stage attention state, and records the tile's
+positions without re-embedding tokens or rereading Engram. The eventual
+callback will call this for stages 1 and 2 after validating their metadata;
+stage 0 continues to use the existing token/Engram initializer.
+
+The staged callback now accepts one compact metadata wire per tile, validates
+its header against the scheduled tile, and installs it before the stage-local
+snapshot. Residual and metadata arrays are independently strided so they can
+use separate double buffers while retaining identical tile sequencing.
+
+`ds41f_attention_receive_pipeline_metadata()` now validates a compact wire
+and installs selected rows, candidate blocks, and the compressed publication
+into a stage-local attention state. It rejects oversized or mismatched tile
+headers before modifying state; the wavefront callback still needs to supply
+the layer and residual handoff sequencing.
+
+The boundary transport now also has a raw-byte asynchronous path sized for one
+`ds41f_pipeline_wire`. The model callback can post residual and causal metadata
+with matching slots, then validate the received header before installing rows
+or candidate blocks. The existing BF16 path remains unchanged for legacy
+decode and verifier runs.
+
+The stage wire now has a fixed-capacity envelope sized for 64 tokens. Each
+slot carries the 20,480-element BF16 residual prefix, four FP32 tail values,
+and one complete causal metadata record; unused slots are zero-filled and
+never read from the caller. `test_pipeline` covers a partial two-token tile,
+exact-BF16 rejection, metadata round-trip, and the fixed-size canary. The
+remaining integration step is a scheduler transport adapter that owns two
+envelope buffers per boundary and posts one MPI request per slot; the staged
+verifier must not be enabled until that adapter and per-token publication
+state are validated on twelve ranks.
+The packer avoids clearing valid slots before overwriting them, reducing
+memory traffic on full tiles while retaining zero-fill for the partial tail.
+The scheduler also rejects tile-count arithmetic that could overflow before
+computing token positions.
+
+`ds41f_pipeline_transport.[ch]` now supplies the MPI adapter for this
+contract. It owns two send and two receive envelope buffers, maps the fixed
+boundary pairs `(0,5)` and `(6,11)`, and performs pack/send plus receive/unpack
+through the scheduler callbacks. It requires identical tile and token strides
+for both directions and rejects records that cannot fit the 64-token wire.
+The A64FX MPI build and a twelve-rank delayed-receiver test are still required
+before enabling staged verifier execution.
+
+Before staging a checkpoint, restore or implement the bounded audit stager.
+It must report all twelve footprints, each stage maximum, the global maximum
+rank, and the expected `(0,5)` and `(6,11)` boundary pairs without copying
+weights. Do not enable the staged path until that audit and the twelve-rank
+transport test pass.
+
+After this target, retain as future work a unified pipeline layout that also
+repeats the accepted 24 tok/s decode result, long-prompt and actual-1M
+execution, KV checkpoint/restore, multi-request scheduling and server
+integration. None of those expands the 1K single-request prefill acceptance
+scope.
+
+## 100+ tokens/s prefill plan, 2026-09-14
+
+The accepted decode stopping point is the speed-first configuration at
+**40.722 ms/token, 24.557 tokens/s** around 1K history. Decode optimization is
+paused. Prefill now targets **100+ input tokens/s** on the same 12 A64FX nodes,
+excluding resident weight loading and including all causal KV/Engram state
+updates. The fixed 1105-token replay remains the primary workload.
+
+The current prompt loop calls the batch-one `forward()` for every input, so it
+cannot reach the target through decode tuning alone. The existing causal
+verifier provides the starting implementation: it evaluates up to six token
+positions together, preserves each position's causal attention view, batches
+INT8 expert GEMVs, and has batched BF16 transport. First measure batch sizes
+1--6 on a standard TP4 layout and compare every predicted token plus final
+state against sequential replay. At batch six, 100 tokens/s requires at most
+**60 ms per six-token tile** or **10 ms/input token**.
+
+Implementation gates:
+
+1. Promote bounded replay batching into an explicit `--prefill-batch` runner
+   path. It must process only prompt tokens in tiles, commit the final causal
+   state, then hand the last prediction and state to ordinary decode. Remove
+   verifier-only allocations and checks from the production path only after
+   the trace/state gate passes.
+2. Profile prefill as begin/pre, causal attention, gate, input broadcast,
+   routed experts, shared/reduction, post/handoff and head. Use one head pass
+   at the prompt boundary; intermediate prompt logits are unnecessary.
+3. Increase tiles beyond six once the bounded path is stable. Batch projection
+   and expert kernels must reuse each weight panel across tokens. Causal sparse
+   attention retains per-position masks and KV publication order. Target
+   16-token tiles first, then 32 if HBM scratch remains below the 2 GiB floor.
+4. Combine communication across the tile: one token-major owner broadcast and
+   one reduction per layer/tile. Keep explicit runner arguments; do not select
+   production prefill behavior through environment variables.
+5. Admission requires exact prompt predictions and final state versus the
+   retained sequential path, three timing repeats, >=100 input tokens/s mean,
+   and reported p95 tile latency and minimum `MemAvailable`. Approximate INT8,
+   expert SDOT, mHC and BF16 reduction results remain labeled speed-first.
+
+The first standard-TP4 measurement used the existing six-position causal
+verifier over all 1105 inputs. It took **37.666 seconds, 29.34 input tokens/s**.
+The maximum-rank average per six-input tile was 25.9 ms begin/state setup,
+8.8 ms pre, 51.6 ms attention, 1.6 ms gate, 82.9 ms input broadcast, 13.6 ms
+routed experts, 37.2 ms shared/reduction, 1.9 ms post/handoff and 3.2 ms head.
+Thus communication alone is about 120 ms of a 227 ms tile, while the target
+allows 60 ms. The intermediate next-token trace matched 1065/1105 positions;
+the first difference was at position 32, so final-state equivalence remains a
+required gate rather than an assumption based on the final token.
+
+An explicit `--prefill-batch` path now enables batched expert and transport
+operators and computes the vocabulary head only at the prompt boundary. Its
+first batch-six run preserved the expected final next token 19 and reduced
+nonfinal-tile head time to approximately 0.007 ms, but total time was
+**39.130 seconds, 28.24 input tokens/s**. This confirms that head work is not
+the limiting component. The implementation accepts up to 16-position causal
+tiles; INT8 and MXFP4 operators remain internally tiled by six so their proven
+microkernels and accumulation order are retained while communication is
+amortized across the larger outer tile.
+
+The validated 16-position run completed in **36.544 seconds, 30.24 input
+tokens/s**, retained final token 19, and used about 160 MiB of causal-window
+scratch per rank. Replacing the routed-expert allreduce with a prompt-only
+`MPI_Reduce` to the layer owner reduced the run to **36.095 seconds, 30.61
+input tokens/s**. The rooted reduction changes FP32 summation order (rank-0
+state hash `b233094c50f0ea24` versus `2f53e57c85fb69bf`) and is therefore a
+speed-first result. Its small 1.2% gain confirms that the next material change
+must reduce bytes, especially the full-world FFN input broadcast. Send each
+token row only to ranks owning one of its six selected experts, retain route
+order at the owner, and measure this sparse exchange before increasing the
+outer tile again.
+
+A first blocking route-aware prototype published only the route metadata and
+sent each BF16 input row to ranks owning a selected routed expert. It regressed
+to **36.872 seconds, 29.97 input tokens/s**. It also omitted some ranks in the
+owner's TP4 shared-expert group, which independently need the input. The
+prototype was removed. Revisit sparse input exchange only with shared-group
+recipients included and nonblocking sends/receives overlapped with owner-side
+shared projection; the serialized point-to-point schedule is not competitive.
+
+A second experiment replaced the large MPI broadcast with the existing uTofu
+recursive-doubling sum in BF16, while retaining a separate exact FP32 metadata
+broadcast. A dedicated 12-rank test passed at batches 1, 6 and 16 across the
+32K-element transport chunk boundary. On job 51628518 the same-job MPI baseline
+was **36.473 seconds, 30.30 input tokens/s**, while uTofu took **37.469 seconds,
+29.49 input tokens/s**. Both produced final token 19 and rank-0 state hash
+`b233094c50f0ea24`; uTofu increased the representative batch-16 broadcast
+phase from about 190 ms to 217 ms. The option and test extension were removed.
+Collective substitution cannot close the remaining 3.3x gap. The next design
+step is pipeline-parallel prompt flow across layer-owner groups, so different
+groups process different prompt tiles concurrently and dense state moves by
+point-to-point handoff rather than a world collective at every layer.
+
+The causal-window snapshot was then reduced without changing model arithmetic.
+The old verifier copied all `40*128*512` ring values for every token, consuming
+160 MiB at batch 16. A tile can overwrite at most 16 old ring rows per layer;
+the attention reader now keeps those rows in a 32 KiB overlay and substitutes
+one only when a future tile position reused a slot needed by an earlier query.
+Two batch-16 runs took **35.634 and 35.712 seconds**, or **31.01 and 30.94 input
+tokens/s**, versus the same-job 36.473-second/30.30-token/s baseline. Both
+retained final token 19 and exact rank-0 state hash `b233094c50f0ea24`.
+
+Attention subphase timing on the overlay path attributed 78.3 ms per full
+tile to preparation/context communication, 28.9 ms to sparse attend, and 27.0
+ms to WQ-B, WO-A, TP gather, and WO-B/output gather combined. The TP4 path had
+issued one approximately 9.5 KiB context broadcast per token and layer. It now
+prepares the 16 contexts causally on the owner, broadcasts the contiguous
+context batch once, and applies it in order on peer ranks. The validated run
+took **34.758 seconds, 31.79 input tokens/s**, retained token 19 and state hash
+`b233094c50f0ea24`, and reduced preparation to 75.3 ms. Eight source/index
+layers still synchronize publication, selection, or candidate state per token;
+batching those state messages is the next bounded attention optimization.
+
+A trial batched those eight all-rank metadata synchronizations into one context
+publication per layer. After correcting an initial collective-scope deadlock,
+it completed in **34.617 seconds, 31.92 input tokens/s** and reduced maximum-rank
+preparation to 73.1 ms per full tile. The final token remained 19, but rank 0's
+state hash changed to `81e422b983b7c28b`; the exact reference is
+`b233094c50f0ea24`. The 0.4% throughput gain does not justify carrying a
+different sparse-attention state, so the synchronization rewrite was removed.
+Evidence is in `tmp/ds41f/job51628518/prefill-syncbatch-b16-v2`.
+
+With full-window snapshots gone, the outer prompt tile now accepts 32
+positions. Projection and expert kernels remain internally tiled by six;
+BF16 input/handoff and TP gather transports retain bounded 16-position wire
+buffers and split larger calls, while the smaller context messages span the
+full outer tile. The journal and causal overlay bounds were raised to match.
+Three complete runs took **33.837, 33.858 and 33.700 seconds**, or **32.66,
+32.64 and 32.79 input tokens/s**. All retained token 19 and exact rank-0 state hash
+`b233094c50f0ea24`; rank 0 kept about 4.7 GB `MemAvailable`. Evidence is in
+`tmp/ds41f/job51628518/prefill-mpi-b32-v4` through `prefill-mpi-b32-v6`.
+The per-run p95 full-tile latencies were 1.043, 1.063 and 1.036 seconds.
+
+The largest tile that keeps the raw context message below the one-megabyte
+transport cap is 64. The same bounded wire operators split large BF16 and TP
+payloads into 16-position calls. Three exact runs took **33.350, 33.544 and
+33.449 seconds**, or **33.13, 32.94 and 33.03 input tokens/s**. Each retained
+token 19 and state hash `b233094c50f0ea24`; p95 full-tile latency was
+2.050--2.097 seconds. The 33.03 tokens/s mean is only 1.0% above batch 32,
+showing that larger serial tiles are near their useful limit. Further progress
+toward 100 tokens/s requires concurrent pipeline flow across layer-owner
+groups. Evidence is in `tmp/ds41f/job51628518/prefill-mpi-b64-v1` through
+`prefill-mpi-b64-v3`.
+
+A tile-level sparse FFN input experiment broadcast route metadata once and
+posted one aggregated BF16 message to each selected expert rank plus every
+member of the owner's shared-TP4 group. Its dedicated 12-rank communication
+test passed, and the full replay retained token 19 and exact state hash
+`b233094c50f0ea24`. It nevertheless regressed to **33.748 seconds, 32.74 input
+tokens/s**. Maximum-rank input publication rose from 12.143 to 12.487 ms/token;
+attention and reduction skew rose as well. The point-to-point packing and
+rendezvous cost exceeds the bytes saved, so the option and transport were
+removed. Evidence is in
+`tmp/ds41f/job51646185/prefill-sparse-b64-v1`.
+
+Open MPI's ring scatter/allgather broadcast (algorithm 9) improves the large
+batch-64 BF16 publications without changing their representation. Two diagnostic runs and one explicit-argument validation took **32.929,
+32.997 and 33.034 seconds**, or **33.56, 33.49 and 33.45 input tokens/s**.
+All retained token 19 and state hash `b233094c50f0ea24`.
+The retained `--mpi-broadcast-algorithm 9` runner argument selects the MPI
+algorithm before `MPI_Init`; production tuning does not depend on an
+environment variable. Evidence is in
+`tmp/ds41f/job51646185/prefill-bcast9-b64-v1`, `prefill-bcast9-b64-v2`
+and `prefill-bcastarg9-b64-v1`.
 
 ## Current results, 2026-09-13
 
@@ -133,6 +443,109 @@ the production guard therefore keeps SDOT separate from persistent tiled-FP32
 attention. The next 30+ work item is an online prepacked QK/softmax/PV loop
 using the integer `sdot` and `exp2` kernels, followed by owner-free shared
 reduction and projection overlap. Thirty and forty tokens/s remain unachieved.
+
+### Owner-free shared reduction continuation, allocation 51607843
+
+The next 30+ step replaces the hierarchical shared-output
+reduce-scatter/BF16-gather pair with one TP12 `MPI_Allreduce`. Each rank adds
+its routed-expert result and its unique shared-W2 output-row shard before the
+collective, so every rank receives the complete FFN result and the layer owner
+can continue without a second gather. `--shared-reduce allreduce` selects this
+mode; `full` and `hierarchical` remain as controls. TP12 attention also skips
+the legacy publication and selected-ID broadcasts because its all-rank context
+has already installed that state. The layer-20 candidate-block broadcast is
+still required.
+
+On normal-mode allocation **51607843**, the fixed replay returned `next=19`
+at position 1104. The 128 steady-state positions 1105--1232 measured
+**42.952 ms/token**, **23.282 tokens/s**, p95 **44.179 ms**, and minimum final
+`MemAvailable` **4,998,299,648 B**. This improves the preceding hierarchical
+result of 44.904 ms/token and 22.269 tokens/s, but does not meet 30 tokens/s.
+The 32-token owner-path profile reports shared reduction **7.000 ms**, down
+from about 9.96 ms in the preceding profile, and attention synchronization
+**0.045 ms**, down from 0.585 ms. Attention remains **19.814 ms**. Its newly
+split communication spans are context **2.707 ms**, projected-head allgather
+**4.158 ms**, and output gather **3.029 ms**; shared-hidden allgather is
+**1.067 ms**. Evidence is in
+`tmp/ds41f/job51607843/allreduce-mpi-128-v1`.
+
+Two transport experiments were rejected. The registered uTofu allreduce was
+initially launched through the wrong LLVM-21 MPI wrapper and is not a valid
+performance result; the retained runner uses LLVM 23 in the same shell as
+`mpiexec`. An eight-producer `MPI_Allgatherv` removed the four zero projected
+head tiles but slowed the sustained run to **45.262 ms/token**, **22.094
+tokens/s**, p95 **47.098 ms**. Its lower payload does not repay the
+variable-count collective overhead, so the fixed TP12 allgather remains.
+Evidence is in `tmp/ds41f/job51607843/prefix8-128-v1`.
+
+The invalid uTofu result was subsequently replaced by a correct LLVM-23 run,
+and two more transport branches were closed. A bit-exact BF16 attention wire
+reduced the per-layer context payload from about 9.6 to 6.0 KiB, but scalar
+packing and the smaller-message `MPI_Bcast` path reduced sustained speed to
+**43.924 ms/token**, **22.766 tokens/s**, p95 **45.192 ms**. All 129 replayed
+`(input,next)` transitions matched the retained baseline. A contemporaneous
+raw-context run using the registered uTofu recursive-doubling sum for the
+5,120-float combined routed/shared output measured **43.171 ms/token**,
+**23.163 tokens/s**, p95 **44.594 ms**, also with an exact 129-transition
+trace. It did not improve on the retained MPI result of 23.282 tokens/s. Both
+code paths were removed. Evidence is in
+`tmp/ds41f/job51607843/contextbf16-128-v2` and
+`tmp/ds41f/job51607843/utofu-raw-128-v1`.
+
+The bounded profiles immediately after an unrelated long MPI workload had
+substantially more collective skew than the earlier clean profile (for
+example, raw-context communication was 12.772 ms versus 2.707 ms), so their
+nested communication spans are not suitable for estimating absolute savings.
+The 128-token wall times and exact token traces remain the admission evidence;
+the compact-wire run was also slower than the raw-wire run under the same
+post-workload conditions.
+
+The next 30+ implementation must remove at least **9.619 ms** from the new
+42.952 ms baseline. The measured path is to distribute attention preparation
+(WQ-A, WKV and index query/score ownership) instead of only WQ-B/WO, and to
+replace the two attention gathers with fixed-count topology-aware collectives
+or direct owner delivery. A payload-only `Allgatherv` change is insufficient.
+The admission gates remain <=12 ms total attention and <=33.333 ms/token,
+with the same 1105-token replay and full token-trace comparison.
+
+The next implementation task is therefore a staged TP12 attention-preparation
+layout. Shard WQ-A and WKV output rows across all ranks, replicate only their
+small norm and rotary metadata, and assign index-query/score tiles to ranks
+that already own the corresponding attention head groups. Quantize the layer
+input once, broadcast that compact activation before preparation, then merge
+the WQ-A/WKV shards with fixed-count collectives. Measure WQ-A, WKV, index and
+context synchronization separately; retain the layout only if total attention
+falls below 15 ms before pursuing the 12 ms admission gate. Per-rank staged
+bytes, HBM headroom, the position-1104 `next=19` check, and the complete
+positions-1104--1232 token trace are mandatory validation outputs.
+
+Implementation is now gated as `--attention-prepare-tp8` in both `stage_tp.py`
+and the runner. WQ-A is split into 160 rows/rank and WKV into 64 rows/rank on
+ranks 0--7, with their FP8 scale rows split at the same 32-row boundaries.
+Only rank 0 stages the complete 1280/512-element Q/KV norm vectors. At decode,
+the layer owner publishes the exact-BF16 normalized input, the eight ranks
+compute both local projections, and one packed BF16 attention-communicator
+allgather plus world broadcast reconstructs both vectors. Rank 0 performs the
+original norms, KV RoPE and activation quantization, then publishes the 1792
+normalized Q/KV elements in one BF16 broadcast. The layer owner retains source
+compression and index selection, publishes only selection/publication
+metadata, and execution rejoins the retained TP12 WQ-B/sparse/WO path.
+
+The old staging format remains version 1 and is unchanged unless the new flag
+is passed; preparation staging writes `DS41FA` version 2 and the runner rejects
+version 1 when the new execution flag is selected. The rank-layout tests cover
+complete, nonoverlapping WQ-A/WKV rows and matching scale geometry. The full
+runner cross-compiles with LLVM 23 on the Fugaku login frontend. Remote
+correctness and performance validation are pending a 12-node allocation; use
+the existing 1105-token replay and first compare the entire token trace before
+using its timing.
+
+An actual 48-shard model inventory dry run passes on all twelve layouts. The
+largest resident plan is rank 0 at **26,218,924,192 bytes**, only 9,313,024
+bytes above its retained TP12 layout; ranks 8--11 become smaller because they
+no longer own complete per-layer WQ-A/WKV matrices. The largest bounded copy
+is 801,205,632 bytes on rank 2. This stays within the prior HBM admission
+envelope and makes restaging practical within a short validation allocation.
 
 ## Proposed path to 30+ and 40+ tokens/s
 
@@ -2115,6 +2528,133 @@ dense layers round-robin (`layer % 12`), with embeddings/head separately
 accounted. Broadcast owner-produced activations for EP and combine routed
 outputs using uTofu. The runner now shares packed KV/index source rows and
 selection state using that transport.
+
+### Six-hour continuation, allocation 51619965
+
+The 12-node normal-mode interactive job **51619965** was launched with a
+six-hour wall limit. A same-allocation rerun of the retained TP12 configuration
+measured **43.416 ms/token**, **23.033 tokens/s**, p95 **44.767 ms** over
+positions 1105--1232. This is the comparison point for the following trials.
+
+Distributed TP8 preparation is runtime-correct but rejected for performance.
+Its position-1104 result was `next=19`, and all 129 transitions matched the
+retained trace. It measured **48.208 ms/token**, **20.743 tokens/s**, p95
+**49.918 ms**. The profile attributes **23.950 ms** to attention and **17.486
+ms** to preparation/context communication. The extra collectives cost more
+than the distributed WQ-A/WKV work saves. The separately gated implementation
+is retained for future fusion work; it is not a selected runtime setting.
+
+Two 5,120-element output-reduction transport probes were also rejected. MPI
+sum measured 45.104 ms for the two-transition smoke and registered-uTofu sum
+44.480 ms, versus 43.585 ms for the contemporary control. Both produced the
+exact `19, 369` token pair. Their temporary code was removed.
+
+The retained `--attention-output-columns` experiment instead changes the WO-B
+layout. Ranks 0--7 each stage all 5,120 output rows for their contiguous 1,024
+input columns (and the corresponding 160x32 FP8 scale panel). Each rank applies
+WO-B directly to its local eight-head projection; one 5,120-float allreduce
+replaces both the 12x1,024 projected-vector allgather and row-output gather.
+The stager copies bounded row segments and records column ranges in version-3
+attention manifests. It adds about 70 MiB to the largest rank and stays within
+the 32 GiB HBM admission limit.
+
+The fixed 1105-token replay returned `19, 369`, and the 129-token trace matched
+the retained baseline at every transition. The bounded profile at positions
+1105--1136 measured **42.914 ms/token**, **23.302 tokens/s**, p95 **47.131
+ms**; the same window in the contemporary baseline measured **44.515
+ms/token**, **22.464 tokens/s**. Attention
+fell to **17.397 ms** and WO-B itself cost **1.338 ms**. End-to-end improvement
+in the matched profile window is **1.601 ms/token**, so this topology is a
+valid building block but does not meet 30 tokens/s. Evidence is in
+`tmp/ds41f/job51619965/column-128-v1`.
+
+The next 30+ work must remove another **9.581 ms/token**. Prioritize the shared
+expert/routed-result collective (currently about 10.13 ms including rank skew)
+and fuse attention preparation communication with the retained column-WO-B
+topology. Do not add another standalone preparation collective. A viable
+composition should compute owner QA/KV while head ranks begin WQ-B work, carry
+normalized Q/KV in an existing layer handoff, and overlap the final attention
+reduction with owner-side mHC work where dependencies permit. Admit each step
+only with the 1105-token replay, complete 129-transition comparison, and a
+same-allocation 128-token timing run. The 30+ gate remains <=33.333 ms/token;
+40+ still requires <=25 ms/token and likely column-sharded shared W2 plus a
+combined routed/shared reduction.
+
+The next shared-output iteration column-shards shared-expert W2 as well.
+Every rank keeps its 192-element W1/W3 hidden shard and owns all 5,120 W2
+output rows for those input columns. This preserves the per-rank W2 weight
+count while removing the 2,304-element hidden allgather. Version-2 shared
+manifests record the W2 weight and scale column ranges, and
+`--shared-output-columns` requires the existing TP12 allreduce path.
+
+This composition passed the full 129-transition comparison. Its bounded
+profile measured **41.741 ms/token**, **23.957 tokens/s**, p95 **45.056 ms**.
+The shared-overlap span fell from 4.286 to **2.706 ms**; attention remained
+17.514 ms. A rooted reduction for the combined routed/shared FFN output was
+also exact and reduced its nested collective span, but total latency regressed
+to **43.019 ms/token**, **23.246 tokens/s**, so that FFN transport branch was
+removed.
+
+Only the layer owner consumes column-sharded WO-B output, so the attention
+collective now uses `MPI_Reduce` to that owner instead of distributing the
+5,120-float result to every rank. The complete 129-token trace remains exact.
+The matched profile improves again to **41.573 ms/token**, **24.054 tokens/s**,
+p95 **45.770 ms**, with attention at **17.344 ms**. Relative to the
+same-allocation 44.515 ms profile, the accepted WO-B/shared-W2 column layouts
+and rooted attention result remove **2.942 ms/token**. Evidence is in
+`tmp/ds41f/job51619965/shared-column-128-v1` and
+`tmp/ds41f/job51619965/shared-column-rooted-128-v1`.
+
+Reducing column-WO-B across only the eight producing head ranks was exact but
+did not improve the result. Layers owned by ranks 8--11 require a second
+20 KiB transfer from rank 0; the measured profile was **41.580 ms/token**,
+**24.050 tokens/s**, p95 **45.930 ms**, effectively tied with and slightly
+slower than the simpler 12-rank rooted reduction. That code was removed.
+Evidence is in `tmp/ds41f/job51619965/attention8reduce-128-v1`.
+
+An isolated 5,120-float MPI allreduce benchmark also rules out collective
+algorithm selection as a material 30+ step. Across 1,000 calls, Open MPI's
+default, nonoverlapping, recursive-doubling, ring and Rabenseifner algorithms
+measured 51.913, 51.839, 52.110, 52.514 and 51.273 microseconds/call. The best
+spread is only about 0.026 ms/token across 40 layers without application rank
+skew. No MPI algorithm override is retained.
+
+The explicit `--shared-reduce utofu-bf16` mode applies the existing SVE-packed
+BF16 recursive-doubling sum only to the combined routed/shared FFN output.
+Other collectives retain their selected representations. It rounds after each
+tree exchange and is therefore part of the approximate speed-first track.
+Nevertheless, all 129 replay transitions matched the retained token trace.
+The bounded profile measured **40.927 ms/token**, **24.434 tokens/s**, p95
+**44.437 ms**. Expert-sum rendezvous fell from 3.326 to **1.949 ms**, and its
+complete span from 10.434 to **9.168 ms**. Evidence is in
+`tmp/ds41f/job51619965/shared-bf16-128-v1`.
+
+Applying BF16 uTofu transport to column-WO-B at the same time was rejected.
+Although its 129-token trace also matched, it measured **41.426 ms/token**,
+**24.139 tokens/s**, p95 **46.486 ms**, with isolated samples as high as
+54.233 ms. Sharing the uTofu reduction resource between both per-layer
+collectives introduces variance and loses the FFN-only gain. The attention
+option was removed; rooted MPI reduction remains selected for WO-B.
+
+Approximate mHC mode 3 splits each of the 24 matrix rows into two 10,240-term
+halves, filling all 48 persistent workers before a pairwise FP32 sum. Native
+and A64FX bounded tests cover all four mHC modes and keep the split result
+within the existing FP32 tolerance. The full-history smoke returned `19, 369`,
+and all 129 generated IDs matched the retained trace. Combined with shared
+BF16 uTofu reduction, its profile measured **40.722 ms/token**, **24.557
+tokens/s**, p95 **44.085 ms**. Attention/FFN mHC mix spans fell from
+1.173/1.117 to **1.086/1.019 ms**. This mode changes dot-product association
+and remains an explicit speed-first approximation. Evidence is in
+`tmp/ds41f/job51619965/mhc-split-128-v1`.
+
+Reaching 30 tokens/s now requires another **8.240 ms/token**. The dominant
+serialized spans are attention (17.34 ms), routed plus shared expert work
+(9.68 ms), and the per-layer result rendezvous. The next implementation should
+reduce the number of collectives rather than substitute transports: carry the
+next layer's attention context in the residual handoff where possible, and
+partition routed W2 columns so active expert ranks contribute directly to the
+same output reduction without a second hidden publication. Preserve the
+current column layouts as the comparison point.
 
 `stage_backbone.py` stages source bytes unchanged to
 `/local/$USER/ds41f-51562789/rank<R>` on the corresponding node. Engram rows

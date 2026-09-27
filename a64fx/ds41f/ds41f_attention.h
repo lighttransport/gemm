@@ -1,6 +1,7 @@
 #ifndef DS41F_ATTENTION_H
 #define DS41F_ATTENTION_H
 #include "ds41f_weights.h"
+#include "ds41f_pipeline.h"
 #include <stdint.h>
 typedef struct {
     size_t capacity;
@@ -28,6 +29,13 @@ typedef struct {
 } ds41f_attention_context;
 int ds41f_attention_prepare(ds41f_attention *state,const ds41f_weights *weights,
                             int layer,size_t position,const float *x,ds41f_attention_context *context);
+int ds41f_attention_prepare_shards(const ds41f_weights *weights,int layer,const float *x,
+                                   float *qr_part,float *kv_part);
+int ds41f_attention_normalize_qkv(ds41f_attention *state,const ds41f_weights *weights,
+                                  int layer,size_t position,float *qr,float *kv);
+int ds41f_attention_prepare_metadata(ds41f_attention *state,const ds41f_weights *weights,
+                                     int layer,size_t position,const float *x,
+                                     ds41f_attention_context *context);
 int ds41f_attention_apply(ds41f_attention *state,int layer,size_t position,
                           const ds41f_attention_context *context);
 int ds41f_attention_project(ds41f_attention *state,const ds41f_weights *weights,
@@ -35,6 +43,10 @@ int ds41f_attention_project(ds41f_attention *state,const ds41f_weights *weights,
                             size_t first_head,size_t heads,float *projected);
 int ds41f_attention_attend(ds41f_attention *state,const ds41f_weights *weights,int layer,
                            size_t position,float *q,size_t first_head,size_t heads,float *attended);
+int ds41f_attention_attend_causal_tile(ds41f_attention *state,const ds41f_weights *weights,
+                           int layer,size_t position,float *q,size_t first_head,size_t heads,
+                           float *attended,size_t tile_start,size_t tile_count,
+                           const float *overwritten_rows);
 int ds41f_attention_grouped_output(const ds41f_weights *weights,int layer,float *out,
                                    const float *x,size_t groups);
 int ds41f_attention_output(const ds41f_weights *weights,int layer,const float *projected,float *out);
@@ -51,4 +63,8 @@ int ds41f_attention_step(ds41f_attention *state,const ds41f_weights *weights,
  * layer. Owner has already written it before evaluating sparse attention. */
 int ds41f_attention_receive(ds41f_attention *state,int layer,size_t position,
                             const uint8_t publication[356]);
+int ds41f_attention_receive_pipeline_metadata(ds41f_attention *state,
+                                              const ds41f_pipeline_wire *wire,
+                                              size_t bytes, uint32_t tile,
+                                              uint32_t position, uint32_t count);
 #endif

@@ -20,6 +20,7 @@ int ds41f_linear_int8_cached(const ds41f_weights *store,const ds41f_weight *weig
 int ds41f_weights_check_tp(ds41f_weights *store,const char *stage,int tp,int rank);
 int ds41f_weights_check_shared_tp(ds41f_weights *store,const char *stage,int tp,int rank);
 int ds41f_weights_check_attention_tp(ds41f_weights *store,const char *stage,int rank);
+int ds41f_weights_check_attention_prepare_tp8(ds41f_weights *store,const char *stage,int rank);
 int ds41f_weights_requantize_fp8(ds41f_weights *store,size_t block,size_t limit,int projections_only);
 void ds41f_weights_free(ds41f_weights *store);
 const ds41f_weight *ds41f_weight_find(const ds41f_weights *store,const char *name);

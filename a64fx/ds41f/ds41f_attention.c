@@ -277,6 +277,36 @@ int ds41f_attention_prepare(ds41f_attention *s,const ds41f_weights *w,int layer,
     memcpy(context->publication,s->publication,356);
     return 0;
 }
+int ds41f_attention_prepare_shards(const ds41f_weights *w,int layer,const float *x,
+                                   float *qr_part,float *kv_part)
+{
+    if(!w||!x||!qr_part||!kv_part||layer<0||layer>=40)return EINVAL;
+    double pt=P_BEGIN();CHECK(linear(w,layer,"wq_a",qr_part,x,0));P_END(ATTN_QA,pt);
+    pt=P_BEGIN();CHECK(linear(w,layer,"wkv",kv_part,x,0));P_END(ATTN_KV,pt);
+    return 0;
+}
+int ds41f_attention_normalize_qkv(ds41f_attention *s,const ds41f_weights *w,int layer,size_t pos,
+                                  float *qr,float *kv)
+{
+    if(!s||!w||!qr||!kv||layer<0||layer>=40||pos>=s->capacity)return EINVAL;
+    double pt=P_BEGIN();CHECK(norm(w,layer,"q_norm",qr,qr));P_END(ATTN_QA,pt);
+    pt=P_BEGIN();CHECK(norm(w,layer,"kv_norm",kv,kv));
+    rope(kv,1,512,layer,pos,0);CHECK(ds41f_act_quant(kv,kv,512));P_END(ATTN_KV,pt);
+    memcpy(s->window+((size_t)layer*128+pos%128)*512,kv,512*sizeof(float));
+    return 0;
+}
+int ds41f_attention_prepare_metadata(ds41f_attention *s,const ds41f_weights *w,int layer,size_t pos,
+                                     const float *x,ds41f_attention_context *context)
+{
+    if(!s||!w||!x||!context||layer<0||layer>=40||pos>=s->capacity)return EINVAL;
+    memcpy(s->window+((size_t)layer*128+pos%128)*512,context->kv,512*sizeof(float));
+    double pt=P_BEGIN();if(is_source(layer))CHECK(update_source(s,w,layer,pos,x));P_END(ATTN_COMPRESS,pt);
+    pt=P_BEGIN();if(is_index(layer))CHECK(select_positions(s,w,layer,pos,x,context->qr));P_END(ATTN_INDEX,pt);
+    context->selected_count=s->selected_count;
+    memcpy(context->selected,s->selected,s->selected_count*sizeof(int));
+    memcpy(context->publication,s->publication,356);
+    return 0;
+}
 int ds41f_attention_apply(ds41f_attention *s,int layer,size_t pos,const ds41f_attention_context *context)
 {
     if(!s||!context||layer<0||layer>=40||pos>=s->capacity||context->selected_count>512)return EINVAL;
@@ -285,6 +315,22 @@ int ds41f_attention_apply(ds41f_attention *s,int layer,size_t pos,const ds41f_at
     memcpy(s->selected,context->selected,s->selected_count*sizeof(int));
     memcpy(s->publication,context->publication,356);
     return ds41f_attention_receive(s,layer,pos,context->publication);
+}
+int ds41f_attention_receive_pipeline_metadata(ds41f_attention *s,
+                                               const ds41f_pipeline_wire *wire,
+                                               size_t bytes, uint32_t tile,
+                                               uint32_t position, uint32_t count)
+{
+    if(!s||!wire||ds41f_pipeline_wire_check(wire,bytes,tile,position,count))return EINVAL;
+    s->selected_count=wire->header.selected_count;
+    for(size_t i=0;i<s->selected_count;++i)s->selected[i]=(int)wire->selected[i];
+    size_t candidate_bytes=(s->capacity+7)/8;memset(s->candidate_blocks,0,candidate_bytes);
+    for(size_t i=0;i<wire->header.candidate_count;++i)
+        if(wire->candidates[i]<candidate_bytes)s->candidate_blocks[wire->candidates[i]]=1;
+    memcpy(s->publication,wire->publication,wire->header.publication_bytes);
+    if(wire->header.publication_bytes<sizeof s->publication)
+        memset(s->publication+wire->header.publication_bytes,0,sizeof s->publication-wire->header.publication_bytes);
+    return 0;
 }
 typedef struct {
     float * rows;
@@ -321,11 +367,13 @@ static void attention_project_team_work(void *context,size_t first,size_t last)
         ids[raw_count+i]=(int)(raw_count+i);
     }
 }
-int ds41f_attention_attend(ds41f_attention *s,const ds41f_weights *w,int layer,size_t pos,
-                           float *q,size_t first_head,size_t heads,float *attended)
+static int attention_attend_impl(ds41f_attention *s,const ds41f_weights *w,int layer,size_t pos,
+                           float *q,size_t first_head,size_t heads,float *attended,
+                           size_t tile_start,size_t tile_count,const float *overwritten)
 {
     if(!s||!w||!q||!attended||!s->rows||layer<0||layer>=40||pos>=s->capacity||
-       !heads||heads%8||first_head+heads>64)return EINVAL;
+       !heads||heads%8||first_head+heads>64||tile_count>64||
+       (tile_count&&(!overwritten||pos<tile_start||pos>=tile_start+tile_count)))return EINVAL;
     double pt=P_BEGIN();rope(q,heads,512,layer,pos,0);P_END(ATTN_Q_ROPE,pt);pt=P_BEGIN();
     float *window=s->window+(size_t)layer*128*512;
     size_t raw_count=pos<128?pos+1:128,extra=layer<2?0:s->selected_count;
@@ -333,7 +381,10 @@ int ds41f_attention_attend(ds41f_attention *s,const ds41f_weights *w,int layer,s
     float *rows=s->rows;
     int ids[128+512];
     for(size_t i=0;i<raw_count;++i){size_t token=pos+1-raw_count+i;
-        memcpy(rows+i*512,window+(token%128)*512,512*sizeof(float));ids[i]=(int)i;}
+        const float *row=window+(token%128)*512;
+        if(tile_count&&token+128>pos&&token+128>=tile_start&&token+128<tile_start+tile_count)
+            row=overwritten+(token+128-tile_start)*512;
+        memcpy(rows+i*512,row,512*sizeof(float));ids[i]=(int)i;}
     if(ds41f_team_active()){
         attention_project_team_job job={rows, s, layer, raw_count, ids};
         (void)ds41f_team_for(extra,attention_project_team_work,&job);
@@ -355,6 +406,13 @@ int ds41f_attention_attend(ds41f_attention *s,const ds41f_weights *w,int layer,s
     ds41f_round_bf16(attended,heads*512);rope(attended,heads,512,layer,pos,1);
     P_END(ATTN_INVERSE_ROPE,pt);return 0;
 }
+int ds41f_attention_attend(ds41f_attention *s,const ds41f_weights *w,int layer,size_t pos,
+                           float *q,size_t first_head,size_t heads,float *attended)
+{return attention_attend_impl(s,w,layer,pos,q,first_head,heads,attended,0,0,NULL);}
+int ds41f_attention_attend_causal_tile(ds41f_attention *s,const ds41f_weights *w,int layer,size_t pos,
+                           float *q,size_t first_head,size_t heads,float *attended,
+                           size_t tile_start,size_t tile_count,const float *overwritten)
+{return attention_attend_impl(s,w,layer,pos,q,first_head,heads,attended,tile_start,tile_count,overwritten);}
 int ds41f_attention_project(ds41f_attention *s,const ds41f_weights *w,int layer,size_t pos,
                             const float *qr,size_t first_head,size_t heads,float *projected)
 {
