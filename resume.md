@@ -1,119 +1,123 @@
-# DS4F resume handoff
+# Resume: GLM-5.3-Flash A64FX kernel efficiency + QLAIR accuracy (updated 2026-09-28 02:40)
 
-Worktree: `/mnt/nvme02/work/gemm/ds4f`
+## Goal
+Run GLM-5.3-Flash (GLM53F) efficiently on A64FX. Targets:
+- bandwidth-bound kernels: ≥95% of the measured read roof;
+- compute-bound kernels: ≥90% of int8/FP peak;
+- QLAIR A64FX simulator: <3% cycle error, so kernels can be optimized without hardware.
 
-## Objective
+Work on a 2-node PJM allocation: `hwrun.sh` runs on the quiet second node; builds and QLAIR run on the Claude node.
 
-Serving target on CPU + Radeon 9070 XT, exact/mHC/tier-B2 quality path:
+## Where things are
+- **gemm worktree `a64fx/glm5/kern/`:** kernel cores and `KERNELS.md` (inventory with per-rank shapes, plus all results).
 
-- preserve output quality first (mHC exact quality gate, see below);
-- single-stream decode around 18 tok/s;
-- prefill around 100-200 tok/s for 1K+ input;
-- prefix/system/tool-token caching for coding-agent requests;
-- harden long-context and multi-context operation.
+  | File | Contents |
+  |---|---|
+  | `glm53f_kern_v0.c` | production loops |
+  | `glm53f_kern_q8r16.c` | Q8_0R16 v1–v4 |
+  | `glm53f_kern_q4k16.c` | Q4_KP16 v1–v3 |
+  | `glm53f_kern_q5k16.c` | Q5_KP16 v1–v3 |
+  | `glm53f_kern_q6k16.c` | Q6_KP16 |
+  | `glm53f_kern_gemm.c`, `glm53f_kern_gemm_asm.S` | prefill GEMM |
 
-Do not redefine success around the current benchmark numbers. Do not push to any remote without explicit user permission.
+- **clair `~/work/clair/a64fx/a64fx/llm-guided-opt/sim-accuracy/glm53f/`:** measurement framework; `STATUS.md` holds every table.
 
-## Current status (2026-08-12)
+  | File | Purpose |
+  |---|---|
+  | `bench.c` | L0/L1 kernels, load probes |
+  | `chain.c` | L2 per-rank decode layer chains; `out/chain-omp` is the fcc OpenMP build with production barriers |
+  | `gemm.c` | prefill GEMM |
+  | `lprobe.c` | L1 load/SDOT probes |
+  | `hwrun.sh`, `run_*.sh` | runners |
+  | `report.py`, `chain_report.py`, `gemm_report.py`, `compare.py` | reports and native-vs-sim comparison |
+  | `measurements/hw-20260927{,b}/` | raw logs and hashes |
 
-**Prefill: ~17.5 tok/s at 1024 tokens** (up from a ~11-15 tok/s baseline this session via a real bug fix). **Decode: ~5.2-5.5 tok/s** (up from ~5.1 baseline). Both still well short of the 100-200 / 18 tok/s targets. Quality gate holds at 8/9 argmax match throughout (one expected W4A8 approximation mismatch at token index 2 — not a regression, do not chase 9/9).
+- **QLAIR:** `~/work/clair/a64fx/build-inference/qlair` (clang 21, `-DCMAKE_DISABLE_PRECOMPILE_HEADERS=ON`). Run as `qlair --profile --profile-markers --a64fx-backend event --cores N -n 4e10 ELF -- args`.
 
-This session made two genuine, verified, quality-neutral fixes plus a large validated-but-not-yet-beneficial GPU attention kernel:
+## Current state (all committed)
 
-1. **`DS4F_ATTN_GEMM` platform-default bug (commit `b804fecd`)** — the "fast" 8-head-blocked attention kernel was SVE-only-optimized; on this x86 host it silently fell back to unvectorized scalar code (`common/ds4f_kernels_x86.h`) while bypassing its own genuinely-AVX2-vectorized simpler path. Fixed the default to be platform-conditional. **+~32-34% on the attn phase, prefill baseline 11-15 -> 17.5 tok/s.** This was the single biggest win this session.
-2. **`DS4F_MV_FUSE` default bug (commit `9907c69c`)** — batches independent matvec dispatches into one thread-pool barrier instead of one-per-matvec; was off by default despite the code's own comment quantifying the gap as decode-specific. Bit-exact. **+~6% decode.**
-3. **Tier-B2-aware GPU attention kernel (commits `5e648d50`, `1dbf751d`)** — built and validated *correct* (mHC quality gate bit-identical, unit-tested including a ring-buffer wraparound edge case found and fixed along the way), but measured **slower** (attn phase ~3x slower, prefill -6%, decode -15%) because it dispatches one GPU round-trip per single sequential position, and that per-call latency exceeds the CPU AVX2 path it replaces. Left in the tree as **opt-in, off by default** (`DS4F_ATTN_HYBRID_GPU=0`) — inert, zero risk, but a real foundation for a future batched-attention rewrite.
-4. **Adaptive hot-expert cache (commit `a6ecc5ea`)** — periodic batched re-admission of GPU-resident experts based on a live decode-time routing window. Built, safe, real effect (shifts load from CPU to GPU), but **net-zero throughput** (refresh's own upload cost offsets the CPU time saved). Left in as **opt-in, off by default** (`DS4F_ADAPTIVE_CACHE_PERIOD=0`).
+**Decode, per-rank token GEMV chain** (270 dependent GEMVs, 48 threads, 12-node shapes):
 
-Everything is committed. Working tree is clean except two untracked runtime log files (`a64fx/llm/ds4f_frontend.log`, `a64fx/llm/ds4f_runner.log` — do not commit these). No server or benchmark process is currently running.
+| Configuration | ms/token | % of node roof |
+|---|---:|---:|
+| v0 production kernels | 8.68 | 22% |
+| Panel kernels + OMP hardware barrier + 16 KiB next-stage prefetch | 2.92 | 59% |
+| Panel kernels + split-phase flag barrier + 16 KiB split prefetch (`chain p16 ... flag16`) | **2.75** | **63%** |
 
-## Why the targets aren't reached (the real bottleneck, confirmed with hard numbers)
+- **Per-kernel, 12 threads:** Q8_0R16 89%, Q4_KP16 84%, Q6_KP16 79%, Q5_KP16 57% (FP-op bound). Head as Q8_0R16: 92% at 48 threads.
+- **Synchronization is a major term.** The atomic spin barrier costs 7.4 µs; the Fujitsu hardware barrier (FLIB_BARRIER=HARD) 1.4 µs; the flag barrier 1.3 µs.
+- **XOS 2 MiB pages cost 1.8×** on per-thread slices (`XOS_MMM_L_HPAGE_TYPE=none` for chain-omp).
 
-- **Prefill's `experts` phase (routed-FFN) is data-volume-bound, not a staging inefficiency.** A single 256-token prefill call transfers ~64GB across ~28,824 individual H2D copies at ~4.17 GB/s, on a confirmed-full-speed PCIe Gen5 x16 link. Two different host-memory staging strategies (full-span `hipHostRegister`, persistent pinned staging buffers) were tried and both failed to help — the bottleneck is genuine per-request data volume (near-full per-layer expert-weight coverage from diverse per-token routing), not the transfer mechanism. Not fixable without either violating the accuracy requirement (approximating routing) or reducing repeat uploads via genuine cross-request/cross-call expert-identity caching (see the adaptive-cache result above, which already tried this for decode and found it net-neutral).
-- **Attention (both prefill and decode) is legitimately compute-bound**, using an already-optimized, now-correctly-vectorized SVE/AVX2 kernel, with a properly bounded (not O(K^2)) sliding window. The only remaining lever is GPU offload, which now exists (Step 3 above) but is slower in its current single-position dispatch form.
-- **The one architectural path to a real win for both targets**: restructure tier-B2's compressor to allow **batching multiple sequential positions into one GPU attention kernel call**, instead of the current one-position-at-a-time dispatch. This requires touching `ds4f_tb2_prepare`'s sequential per-position ring-buffer dependency (each position's compression state depends on the previous position's update) — a materially larger, not-yet-scoped restructuring project. This is the concrete next step, explicitly deferred by user decision twice this session (once for prefill, once for decode) rather than rushed under time pressure.
-- **Alternative architectural path**: cross-request batching (keep the GPU busy with one request's routed-FFN upload while another request's CPU attention runs) — not explored this session, would need serving-scheduler-level changes, not kernel changes.
+**Prefill GEMM** (64×6 tile, scale blocks 32/128/256):
 
-## TODO / next steps, in priority order
+| Configuration | sb 32 | sb 128 | sb 256 |
+|---|---:|---:|---:|
+| One core, L1 | 48% | 71% | 77% |
+| 48 threads, K=4096 × 48 tokens | 35% | 48% | 52% |
 
-1. **Scope and implement tier-B2 compressor restructuring for batched GPU attention.** This is the one remaining lever with real expected payoff for both prefill and decode. Needs its own dedicated session with proper validation runway (unit tests + the mHC exact quality gate at every step, exactly as done for the single-position kernel this session) — do not rush this under time pressure. Once positions can be batched, re-enable and re-benchmark the `DS4F_ATTN_HYBRID_GPU` path built this session (already correct, just needs a batched caller).
-2. If pursuing the routed-FFN data-volume problem further: investigate genuine cross-request expert-identity caching (distinct from the adaptive intra-request cache already tried and found net-neutral) or reducing bytes moved via a different serving pattern.
-3. Re-run 8192-token prefill scaling once the above changes land (last full run was interrupted mid-execution by the harness, not a crash — 256/1024-token results are the reliable current baseline).
-4. Prefix/system/tool-token caching for coding-agent requests, and long-context/multi-context hardening — not investigated this session at all; still open from the original objective.
+- The reference pure-int8 6×4 loop reaches 89%. ≥90% needs per-channel/per-token scaling (lossy) and is still capped near 89%.
+- The multi-core drop (63% → 52%) is unexplained. It is not weight residency, K chunking or bandwidth.
 
-## Resuming prompt
+**QLAIR** (commits `da50dea8`, `fc4c9efd`, `ffe531b3`):
+- **Fixed:** indexed SVE ops, LD1RQ imm, event SVE pipes.
+- **Accuracy is still not <3% for GLM53F kernels.**
 
-> Continue DS4F serving optimization on CPU + Radeon 9070 XT. Current state: prefill ~17.5 tok/s @ 1024 tokens, decode ~5.2-5.5 tok/s, both short of the 100-200 / 18 tok/s targets, quality gate holding at 8/9 (expected). This session fixed two real platform-default bugs (`DS4F_ATTN_GEMM`, `DS4F_MV_FUSE` — see resume.md) and built a validated-correct-but-not-yet-fast GPU tier-B2 attention kernel (opt-in, `DS4F_ATTN_HYBRID_GPU`). The confirmed next step is restructuring the tier-B2 compressor (`ds4f_tb2_prepare`) to allow batching multiple sequential positions into one GPU attention call — the current per-position dispatch has too much fixed GPU round-trip latency to win over the CPU path. Read resume.md in full before starting. Validate every change against the mHC exact quality gate (`hetero/ds4f/build/test_ds4f_real_tokens --config /tmp/ds4f_quality_exact.json --stage-dir /tmp/ds4f_nocopy_stage --prompt-ids /tmp/ds4f_quality_ids.txt --max-tokens 9`, expect 8/9) and check for orphan processes / VRAM leaks (`rocm-smi --showmeminfo vram`) before and after every risky test. Do not rush unvalidated numeric kernel changes — this session's pattern of incremental build-then-validate-then-commit worked well; keep using it.
+  | Case | Event backend error |
+  |---|---:|
+  | L0 v0 kernels | −5 to −24% |
+  | Panel kernels | −28 to −50% |
+  | GEMM tile | −15 to −21% |
+  | Load+SDOT probes | −4 to −5% |
+  | Dependent base-register ADD loops | −8% |
 
-## Authoritative model and staging
+  f32 streaming passes (+2.1%).
+- **Native laws established:**
+  - L1 loads issue 2 per cycle.
+  - A dependent base-register ADD costs about 1 cycle per 8-load block. The cost shrinks with more independent loads before the next load (see STATUS matched-density table).
+  - Loads and SDOTs co-issue at about 2.8 Z-writing instructions per cycle, commit-limited. See the commit histograms in STATUS.
 
-```text
-GGUF: /mnt/nvme02/models/ds4f-0731/DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf
-Stage: /tmp/ds4f_nocopy_stage
-Tokenizer: /mnt/nvme02/models/ds4f-0731/tokenizer.json
-Quality prompt IDs: /tmp/ds4f_quality_ids.txt
-Quality config: /tmp/ds4f_quality_exact.json
-```
+## QLAIR event-backend fixes this session (clair commits 33fef290, 91d4f159, 2f25f07e, + station parity)
 
-## Quality gate (run after every change touching numerics)
+All are event-only, backed by native probes (`lprobe.c`), and recorded with data in STATUS.md:
+1. **SDOT/UDOT (incl. indexed), indexed FMLA/FMLS, integer MLA/MLS/MAD/MSB now read Zda.** Loop-carried SDOT chains had no dependence at all (native 40.8 vs event 14.5 cycles/block).
+2. **AdvSIMD MOVI's phantom rn/rm (z0) source is dropped.** The decoder zero-initializes rn/rm.
+3. **FLA-only forms per the Fujitsu table and 8-stream probes:** AND/ORR/EOR #imm, DUP/CPY scalar and imm, FDUP/FCPY/DUPM, SPLICE, TBL, ZIP/UZP/TRN, UNPK, DUP-indexed, INDEX. SEL (vectors) is FL*.
+4. **Phantom rm=z0 source is dropped for SVE forms without Zm** (immediate/unary/extend/UNPK/REV/SPLICE...).
+5. **RS0/RS1 parity uses each op's ordinal among same-class ops in its decode group** (`station_class_parity`). Raw slot parity put all loads of alternating ld/sdot on EAGA: native 5.34 vs event 6.34.
 
-```sh
-hetero/ds4f/build/test_ds4f_real_tokens \
-  --config /tmp/ds4f_quality_exact.json \
-  --stage-dir /tmp/ds4f_nocopy_stage \
-  --prompt-ids /tmp/ds4f_quality_ids.txt --max-tokens 9
-```
+**GLM53F L1 kernel gate** (same ELF, 30 native samples): mean |error| 5.9–6.8%; 3–5 of 10 within 3%, depending on which masking errors the fixes removed. See `compare-acc*.json`.
 
-Expect 8/9 argmax match (one W4A8 approximation mismatch at token index 2 is the known-expected baseline — not a regression). Never claim 9/9.
+- **Q8_0R-family kernels match:** v0 +1.0%, Q8_0R16 v3 −0.6%, v4pf −0.2%.
+- **K-quant kernels are all simulated too fast (−4 to −17%).** The best-isolated remaining term is SDOT consuming freshly loaded registers: native 6.17 vs 5.32 cycles/block at lag 0, 4.92 vs 4.67 at lag 1. Natively, cycles = 4 + STALL_BACKEND (0x24). QLAIR does not emulate events 0x23/0x24.
 
-## Build
+## Production integration plan (not started; needs the real model on 12 nodes)
 
-```sh
-make -C hetero/ds4f -j4
-sh a64fx/llm/build_ds4f_serve.sh
-```
+- **Where Q8_0R is used:**
+  - `glm53f_iq_bridge.c` (`glm53f_native_repack`, `_matvec_team`, `_matvec_batch_team`);
+  - direct Q8_0R checks in `glm53f_kda_layer_12n.c:150`, `glm53f_sparse_layer_12n.c:443` (v_b attention weights read row-wise; do NOT repack those), `glm53f_expert_decode_12n.c:302`, and `glm53f_dense_ffn_12n.c`.
+- **Plan:**
+  1. Add the `GLM53F_NATIVE_Q8_0R16` type.
+  2. Repack only matrices consumed solely through `native_matvec_*`.
+  3. Add a per-block activation scale `xd` to `native_act`.
+  4. Dispatch 16-row groups to `gk_q8_0r16_v3pf` (`#include "kern/glm53f_kern_q8r16.c"`).
+  5. Keep row slicing aligned to 16.
+  6. Same for the routed experts: Q4_KP16/Q5_KP16/Q6_KP16 inside `glm53f_iq_expert_weighted`.
+- **Barriers:** production already uses `FLIB_BARRIER=HARD`. The flag barrier with split-phase prefetch helped the chain a further 6%.
+- **Pages:** check weight page placement (2 MiB XOS pages shared across CMG slices cost 1.8× in the chain).
 
-Pre-existing warning noise, no errors expected.
+## Next steps (priority)
+1. **Simulator.**
+   - Explain the lag-0 load→SDOT backend stall (STALL_BACKEND 1.60 vs 0.92 cycles/block); it probably comes from load-waiting FP ops filling the RSE. Emulate PMU 0x23/0x24 in QLAIR.
+   - Then the dependent base-ADD rule (matched density table).
+   - Re-check the K-quant L0 cases, the GEMM tile, and the qwen38 nine-case event gate.
+2. **Decode.** Integrate panel kernels, repack at load and use flag or hardware barriers into the production runner (`glm53f_iq_bridge.c`, `glm53f_target_decode_12n.c`). Validate on 12 nodes: `build_glm53f_integrated_12n.sh check` bit-identical, then a tok/s A/B. Check production weight page placement: the 2 MiB page effect.
+3. **Prefill.** Explain the multi-core GEMM drop (per-core PMU at 12 threads). Consider W8A8 per-channel behind the quality gate.
+4. Re-run the qwen38 nine-case event gate; its static cross ELF is off-node.
 
-## Benchmark (standalone — do not run concurrently with a live server; it loads its own full model and the two will contend for CPU/memory)
-
-```sh
-timeout 180s env DS4F_STAGE_DIR=/tmp/ds4f_nocopy_stage \
- DS4F_TOKENIZER=/mnt/nvme02/models/ds4f-0731/tokenizer.json \
- DS4F_SERVE_USE_HIP=1 DS4F_HIP_DEVICE=0 LLM_THREADS=16 DS4F_CMGS=4 DS4F_PROF=1 \
- python3 a64fx/llm/ds4f_serve_bench.py \
- --stage-dir /tmp/ds4f_nocopy_stage \
- --tokenizer /mnt/nvme02/models/ds4f-0731/tokenizer.json \
- --prompt-tokens 1024 --warm-decode 4 --decode-tokens 32 \
- --threads 16 --cmgs 4 --hip-device 0 --hip-mxfp4-wmma 1 \
- --hip-routed-ffn 1 --hip-expert-stream 1 --hip-expert-cache-mb 0
-```
-
-Model load takes ~60-70s (156GB staged model) — don't mistake load time for inference throughput. `--hip-expert-cache-mb -1` (or `auto` via the server) enables the static post-prefill hot-expert cache; `DS4F_ADAPTIVE_CACHE_PERIOD=64` additionally enables the (currently net-neutral) periodic adaptive refresh; `DS4F_ATTN_HYBRID_GPU=1` enables the (currently slower) GPU tier-B2 attention path. All default off/safe.
-
-## Server restart command (only when needed)
-
-```sh
-env DS4F_STAGE_DIR=/tmp/ds4f_nocopy_stage \
- DS4F_SERVE_BASE=/tmp/ds4f_cdx \
- DS4F_TOKENIZER=/mnt/nvme02/models/ds4f-0731/tokenizer.json \
- DS4F_SERVE_USE_HIP=1 DS4F_HIP_DEVICE=0 LLM_THREADS=16 DS4F_CMGS=4 \
- ./a64fx/llm/run_ds4f_single_serve.sh \
- --context-memory-ttl-sec 600 --context-disk-ttl-sec 86400 \
- --context-memory-mb 512 --context-disk-mb 8192 \
- --prefill-quantum-tokens 32 --single-prefill-quantum-tokens 2048 \
- --agent-cache-max-tokens 14336 --runner-timeout-sec 3600 \
- --decode-quantum-tokens 4 --scheduler-quantum-ms 250 \
- --hip-mxfp4-wmma 1 --hip-expert-stream 1 --hip-routed-ffn 1 \
- --hip-expert-cache-mb auto --hip-expert-cache-reserve-mb 1536 \
- --hip-expert-cache-stats 1 --default-temperature 0.0 --default-top-p 1.0
-```
-
-Verify with:
-
-```sh
-curl -s --max-time 5 http://127.0.0.1:8080/health
-curl -s --max-time 5 http://127.0.0.1:8080/v1/progress
-```
-
-Check for orphan processes (`ps aux | grep ds4f`) before restarting.
+## Gotchas
+- **XOS paging:** export `XOS_MMM_L_PAGING_POLICY=demand:demand:demand` (`hwexec.sh` does).
+- **No cross-thread atomics under QLAIR.** Harnesses skip spin barriers when CNTFRQ == 2e9.
+- **Import allowlist:** keep `make check-imports` clean (`allowlist.txt`).
+- **The clang driver is slow here** (about 2 minutes per link). Don't wrap `make` in a short `timeout`: a killed make leaves stale binaries.
+- **Z-register spills** (`objdump | grep 'str z'`): use asm for 24-accumulator tiles.
+- **Freeze ELFs per campaign** (`out/*-cN`), so native and sim runs use the same hash.
