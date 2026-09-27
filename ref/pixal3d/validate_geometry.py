@@ -117,24 +117,27 @@ for scale in [.01,1.]:
     surface_score('fill_holes_'+str(scale),filled,filled_ref,1024)
 # The plugin's GPU remesh must reproduce the CPU remesh exactly.
 plugin_path=ROOT.parent.parent/'cuda/pixal3d/libpixal3d_cuda.so'
-gpu_remesh=getattr(C.CDLL(str(plugin_path)),'px_gpu_remesh',None) if plugin_path.exists() else None
+plugin=C.CDLL(str(plugin_path)) if plugin_path.exists() else None
+gpu_remesh=getattr(plugin,'px_gpu_remesh',None)
+gpu_simplify=getattr(plugin,'px_gpu_simplify',None)
 class RemeshRequest(C.Structure):
     _fields_=[('vertices',C.c_void_p),('faces',C.c_void_p),('num_vertices',C.c_int),('num_faces',C.c_int),
               ('resolution',C.c_int),('device',C.c_int),('gpu',C.c_void_p)]
 class RemeshResult(C.Structure):
     _fields_=[('vertices',C.POINTER(C.c_float)),('faces',C.POINTER(C.c_int32)),('num_vertices',C.c_int),
               ('num_faces',C.c_int),('error',C.c_char*256)]
-def check_gpu_remesh(v,f,resolution,native):
-    if gpu_remesh is None:
+def check_gpu_remesh(v,f,resolution,native,function=None,name='gpu_remesh_'):
+    function=function or gpu_remesh
+    if function is None:
         return
     v,f=np.ascontiguousarray(v,np.float32),np.ascontiguousarray(f,np.int32)
     request=RemeshRequest(v.ctypes.data,f.ctypes.data,len(v),len(f),resolution,0,None);result=RemeshResult()
-    assert gpu_remesh(C.byref(request),C.byref(result))==0,result.error.decode()
+    assert function(C.byref(request),C.byref(result))==0,result.error.decode()
     gv=np.ctypeslib.as_array(result.vertices,shape=(result.num_vertices,3)).copy()
     gf=np.ctypeslib.as_array(result.faces,shape=(result.num_faces,3)).copy()
     C.CDLL(None).free(C.cast(result.vertices,C.c_void_p));C.CDLL(None).free(C.cast(result.faces,C.c_void_p))
-    assert np.array_equal(gv,native[0]) and np.array_equal(gf,native[1]),'GPU remesh differs from the CPU'
-    print(json.dumps(dict(test='gpu_remesh_'+str(resolution),faces=len(gf),identical=True)),flush=True)
+    assert np.array_equal(gv,native[0]) and np.array_equal(gf,native[1]),name+'differs from the CPU'
+    print(json.dumps(dict(test=name+str(resolution),faces=len(gf),identical=True)),flush=True)
 for resolution in [64,128]:
     native=native_mesh(v,f,resolution)
     check_gpu_remesh(v,f,resolution,native)
@@ -144,6 +147,9 @@ for resolution in [64,128]:
     surface_score('remesh_'+str(resolution),native,reference,resolution)
     target=len(native[1])//2
     simplified=native_mesh(*native,target=target)
+    # Same request layout: the resolution slot carries the face target.
+    if gpu_simplify is not None:
+        check_gpu_remesh(*native,target,simplified,gpu_simplify,'gpu_simplify_')
     upstream=cumesh.CuMesh();upstream.init(torch.tensor(native[0],device='cuda'),torch.tensor(native[1],device='cuda'))
     upstream.simplify(target)
     reference=tuple(t.cpu().numpy() for t in upstream.read())

@@ -369,10 +369,10 @@ struct Pipeline {
         // for the thread driving the GPU.
         int geometry_threads = std::max(1, options.threads > 2 ? options.threads - 2 : 1);
         auto geometry_started = std::chrono::steady_clock::now();
-        auto gpu_remesh = engine.gpu_remesh();
-        auto geometry = std::async(std::launch::async, [&, geometry_threads, gpu_remesh] {
+        auto gpu_geometry = engine.gpu_geometry();
+        auto geometry = std::async(std::launch::async, [&, geometry_threads, gpu_geometry] {
             omp_set_num_threads(geometry_threads);
-            auto stage = postprocess_geometry(shape_out, options, gpu_remesh);
+            auto stage = postprocess_geometry(shape_out, options, gpu_geometry);
             add_timing(*stage, "postprocess.geometry_thread",
                        std::chrono::duration<double>(std::chrono::steady_clock::now() - geometry_started).count());
             return stage;

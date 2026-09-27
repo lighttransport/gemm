@@ -26,7 +26,7 @@ struct Error : std::runtime_error {
 struct Arena {
     cudaStream_t stream{};
     Device *engine = nullptr;
-    size_t limit = 0, used = 0, peak = 0;
+    size_t limit = 0, used = 0, peak = 0, freed = 0;
     std::unordered_map<void *, size_t> live;
     void lend(size_t bytes) {
         if (!engine) {
@@ -51,7 +51,14 @@ struct Arena {
     }
     template <class T> T *alloc(size_t count) {
         size_t bytes = std::max<size_t>(count * sizeof(T), 16);
-        lend(bytes);
+        try {
+            lend(bytes);
+        } catch (const Error &) {
+            if (!freed)
+                throw;
+            sync(); // settle released memory, then ask once more
+            lend(bytes);
+        }
         void *p = nullptr;
         cudaError_t status = cudaMallocAsync(&p, bytes, stream);
         if (status != cudaSuccess) {
@@ -63,7 +70,8 @@ struct Arena {
         peak = std::max(peak, used);
         return static_cast<T *>(p);
     }
-    // Memory returns to the ledger once the stream has actually freed it.
+    // Memory returns to the ledger at the next stream sync, once the stream
+    // has actually freed it.
     void release(void *p) {
         auto it = live.find(p);
         if (it == live.end())
@@ -71,14 +79,25 @@ struct Arena {
         size_t bytes = it->second;
         live.erase(it);
         (void)cudaFreeAsync(p, stream);
-        (void)cudaStreamSynchronize(stream);
         used -= bytes;
-        give_back(bytes);
+        freed += bytes;
+    }
+    void sync() {
+        RM_CHECK(cudaStreamSynchronize(stream));
+        give_back(freed);
+        freed = 0;
+    }
+    // Highest priority: these small kernels run beside the flow's large ones
+    // and would otherwise wait behind them for free SMs.
+    void open_stream() {
+        int least = 0, greatest = 0;
+        RM_CHECK(cudaDeviceGetStreamPriorityRange(&least, &greatest));
+        RM_CHECK(cudaStreamCreateWithPriority(&stream, cudaStreamNonBlocking, greatest));
     }
     template <class T> T scalar(const T *p) {
         T value{};
         RM_CHECK(cudaMemcpyAsync(&value, p, sizeof(T), cudaMemcpyDeviceToHost, stream));
-        RM_CHECK(cudaStreamSynchronize(stream));
+        sync();
         return value;
     }
     ~Arena() {
@@ -88,7 +107,7 @@ struct Arena {
             (void)cudaStreamSynchronize(stream);
             (void)cudaStreamDestroy(stream);
         }
-        give_back(used);
+        give_back(used + freed);
     }
 };
 
@@ -560,7 +579,7 @@ inline void run(const px_remesh_request &r, px_remesh_result &result) {
     Arena arena;
     arena.engine = static_cast<Device *>(r.gpu);
     RM_CHECK(cudaSetDevice(arena.engine ? arena.engine->ordinal : r.device));
-    RM_CHECK(cudaStreamCreateWithFlags(&arena.stream, cudaStreamNonBlocking));
+    arena.open_stream();
     if (!arena.engine) {
         size_t free = 0, total = 0;
         RM_CHECK(cudaMemGetInfo(&free, &total));

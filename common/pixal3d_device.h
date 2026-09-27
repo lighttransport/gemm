@@ -76,4 +76,13 @@ struct px_remesh_result {
     int num_vertices, num_faces;
     char error[256];
 };
+/* Optional CUDA entry px_gpu_simplify: px::simplify (QEM collapse rounds
+ * down to `target` faces) on the GPU, giving the same mesh; memory, gpu and
+ * failure behave as for px_gpu_remesh, and the result uses the same struct. */
+struct px_simplify_request {
+    const float *vertices;
+    const int32_t *faces;
+    int num_vertices, num_faces, target, device;
+    void *gpu;
+};
 #endif

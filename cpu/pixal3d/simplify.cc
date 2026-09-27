@@ -239,4 +239,18 @@ void simplify(Mesh &m, int target) {
                  input_faces, m.numF(), rounds, spent[0], spent[1], spent[2], spent[3], spent[4], spent[5], spent[6],
                  spent[7]);
 }
+bool simplify_gpu(const GpuGeometry &gpu, Mesh &mesh, int target) {
+    if (!gpu.simplify || mesh.numF() <= uint32_t(target))
+        return false;
+    px_simplify_request request{mesh.v.data(), mesh.f.data(), int(mesh.numV()), int(mesh.numF()), target, 0, gpu.gpu};
+    px_remesh_result result{};
+    if (gpu.simplify(&request, &result) != 0) {
+        std::fprintf(stderr, "Pixal3D simplify: GPU path unavailable (%s); using the CPU\n", result.error);
+        return false;
+    }
+    mesh.set(result.vertices, result.num_vertices, result.faces, result.num_faces);
+    std::free(result.vertices);
+    std::free(result.faces);
+    return true;
+}
 } // namespace px

@@ -76,11 +76,13 @@ struct GpuApi {
     size_t (*peak)(void *) = nullptr;
     const char *(*error)(void *) = nullptr;
     int (*remesh)(const px_remesh_request *, px_remesh_result *) = nullptr;
+    int (*simplify)(const px_simplify_request *, px_remesh_result *) = nullptr;
 };
-/* The plugin's GPU remesh and the engine whose budget it borrows from; fn is
- * null when there is none, and the CPU remesh runs instead. */
-struct GpuRemesh {
-    int (*fn)(const px_remesh_request *, px_remesh_result *) = nullptr;
+/* The plugin's GPU geometry steps and the engine whose budget they borrow
+ * from; a null step runs on the CPU instead. */
+struct GpuGeometry {
+    int (*remesh)(const px_remesh_request *, px_remesh_result *) = nullptr;
+    int (*simplify)(const px_simplify_request *, px_remesh_result *) = nullptr;
     void *gpu = nullptr;
 };
 struct Tensor {
@@ -121,7 +123,7 @@ class Engine {
     ~Engine();
     void configure(const pixal3d_gpu_options &options);
     bool resident() const { return resident_; }
-    GpuRemesh gpu_remesh() const { return {api_.remesh, api_.remesh ? gpu_ : nullptr}; }
+    GpuGeometry gpu_geometry() const { return {api_.remesh, api_.simplify, gpu_}; }
     size_t resident_budget() const { return resident_budget_; }
     pixal3d_flow_precision flow_mode(bool requested) const {
         if (!requested || flow_precision_ == PIXAL3D_FLOW_FP32)

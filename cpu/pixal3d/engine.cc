@@ -121,6 +121,7 @@ Engine::Engine(const pixal3d_options &o) : threads(o.threads) {
             PX_SYM(trim, "px_gpu_trim");
         }
         api_.remesh = reinterpret_cast<decltype(api_.remesh)>(dlsym(library_, "px_gpu_remesh"));
+        api_.simplify = reinterpret_cast<decltype(api_.simplify)>(dlsym(library_, "px_gpu_simplify"));
         gpu_ = api_.create(o.device, o.vram_budget_mib * 1024 * 1024);
         require(gpu_, "GPU initialization failed; verify device access and memory budget");
         if (api_.metrics) {

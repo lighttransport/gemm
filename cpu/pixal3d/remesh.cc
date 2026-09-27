@@ -169,13 +169,13 @@ Mesh remesh(const Mesh &, const trellis2::ClosestPointBVH &bvh, int resolution) 
                  t_levels, t_corners, unique.size(), t_udf, since(t1), since(t0));
     return result;
 }
-bool remesh_gpu(const GpuRemesh &gpu, const Mesh &source, int resolution, Mesh &out) {
-    if (!gpu.fn)
+bool remesh_gpu(const GpuGeometry &gpu, const Mesh &source, int resolution, Mesh &out) {
+    if (!gpu.remesh)
         return false;
     px_remesh_request request{source.v.data(), source.f.data(), int(source.numV()), int(source.numF()),
                               resolution,      0,               gpu.gpu};
     px_remesh_result result{};
-    if (gpu.fn(&request, &result) != 0) {
+    if (gpu.remesh(&request, &result) != 0) {
         std::fprintf(stderr, "Pixal3D remesh: GPU path unavailable (%s); using the CPU\n", result.error);
         return false;
     }

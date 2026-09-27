@@ -706,3 +706,41 @@ thread 99.7 → 85.9 s. The GLB hash is unchanged (`ad9845c1…`). The geometry
 thread still outlasts the texture window (`geometry_wait` 47 s), because of
 unwrap (41 s) and simplify (39 s).
 
+
+### GPU simplify
+
+`px_gpu_simplify` (`cuda/pixal3d/simplify.inc`) ports the parallel CPU
+rounds of `simplify.cc` one kernel per step. The GPU versions:
+- **Adjacency (CSR):** a stable CUB radix sort of face corners by vertex,
+  so each list stays in face order.
+- **Quadrics:** summed per vertex over its faces, in face order.
+- **Edges:** sorted, then boundary-marked and made unique with
+  `DeviceSelect::Unique`.
+- **Selection:** the packed cost+index `atomicMin` per face, which does
+  not depend on order.
+- **Collapses:** disjoint collapses, then scan compaction.
+
+Every float expression keeps the CPU's order (with `std::max` and
+`std::clamp` semantics spelled out), so the mesh is bit-identical.
+`validate_geometry.py` asserts this at 64 and 128. On the house mesh
+(13.5M → 992k faces, 52 rounds) it takes 1.5 s standalone, against 38.4 s
+on the CPU; the peak is 1.4 GiB, borrowed from the engine ledger like the
+remesh.
+
+Both geometry kernels share the GPU with the texture flow. Two changes kept
+their many small kernels from queuing behind the flow's GEMMs:
+- the geometry stream uses the highest stream priority;
+- released memory goes back to the ledger at the next sync the step already
+  makes, not through a sync per release.
+
+| House fixture | simplify in the pipeline | geometry thread | generate |
+|---|---|---|---|
+| CPU simplify | 39.1 s | 85.9 s | 178 s |
+| GPU simplify | 9.4 s | 58.6 s | 153 s |
+| + high-priority stream | 4.8 s | 52.7 s | 148 s |
+| + no sync per release | 2.0 s | 50.1 s | 144 s |
+
+The GLB hash is unchanged (`ad9845c1…`), and the peak engine reservation
+stays at 5.9 GiB. The geometry thread now outlasts the texture window by only
+8.5 s (`geometry_wait`). Unwrap (42 s, xatlas) takes most of the geometry
+thread.

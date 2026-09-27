@@ -161,7 +161,7 @@ void add_timing(GeometryStage &geometry, const std::string &name, double seconds
 }
 
 std::shared_ptr<GeometryStage> postprocess_geometry(const Sparse &shape, const pixal3d_options &options,
-                                                    const GpuRemesh &gpu) {
+                                                    const GpuGeometry &gpu) {
     auto stage = std::make_shared<GeometryStage>();
     auto phase = std::chrono::steady_clock::now();
     auto record = [&](const char *name, std::chrono::steady_clock::time_point begin) {
@@ -213,7 +213,8 @@ std::shared_ptr<GeometryStage> postprocess_geometry(const Sparse &shape, const p
         mesh = remesh(original, bvh);
     mark("remesh");
     dump_mesh(options, "mesh_remeshed", mesh);
-    simplify(mesh, options.decimation_target);
+    if (!simplify_gpu(gpu, mesh, options.decimation_target))
+        simplify(mesh, options.decimation_target);
     clean_for_uv(mesh);
     mark("simplify");
     dump_mesh(options, "mesh_simplified", mesh);

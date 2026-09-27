@@ -27,7 +27,7 @@ void postprocess(const Sparse &shape, const Sparse &texture, const pixal3d_optio
 struct GeometryStage;
 void add_timing(GeometryStage &geometry, const std::string &name, double seconds);
 std::shared_ptr<GeometryStage> postprocess_geometry(const Sparse &shape, const pixal3d_options &options,
-                                                    const GpuRemesh &gpu = {});
+                                                    const GpuGeometry &gpu = {});
 void postprocess_texture(GeometryStage &geometry, const Sparse &shape, const Sparse &texture,
                          const pixal3d_options &options, pixal3d_result &result, Engine *profile = nullptr);
 } // namespace px
