@@ -62,6 +62,8 @@ Each core computes output rows `[r0, r1)` of one GEMV. Cores contain no OpenMP a
 | `gk_q8_0r16_v2` | same | As v1, with two 4-deep SDOT chains per block |
 | `gk_q8_0r16_v3` | same | Plain SDOT against LD1RW broadcast. Indexed SDOT is 2 uops on A64FX. |
 | `gk_q8_0r16_v3pf{4k,16k,64k}` | same | v3 plus L2 software prefetch of the weight stream, 4/16/64 KiB ahead |
+| `gk_q4_kp16_v1` | `glm53f_kern_q4k16.c` | Lossless 16-row Q4_K panel repack (152 B per 256 columns per row, +5.6% bytes; scales unpacked to bytes, `d`/`dmin` as f32). The nibbles are laid out so one AND or LSR yields each row-lane SDOT operand. Scale and min sums are exact in int32; per-32 activation sums are precomputed. |
+| `gk_q4_kp16_v1pf` | same | v1 plus L2 software prefetch 16 KiB ahead |
 
 ## Measured efficiency: HBM-streaming, per-rank shapes (job 51943789)
 
@@ -77,6 +79,17 @@ Each core computes output rows `[r0, r1)` of one GEMV. Cores contain no OpenMP a
 | Head 12907×4096, F32 v0 → Q8_0R16 | 48 | 652 (72%) | 770 (85%) | 4.2× in time |
 
 ¹ The 48-thread KDA region lasts only about 16 µs, and its CV is 15–18%. Stream start-up and ramp dominate at that size. Closing the gap needs cross-kernel prefetch in a persistent layer chain; a single kernel cannot do it.
+
+Routed-expert gate/up, Q4_K, 8 parts (4096×4096). GB/s counts the bytes actually streamed; the panel format is +5.6%.
+
+| Thr | v0 cycles | v1pf cycles | v1pf GB/s (% roof) | Speed-up |
+|---:|---:|---:|---:|---:|
+| 1 | 4.80 M | 0.94 M | 21.2 (58%) | 5.1× |
+| 12 | 422 k | 106 k | 188 (84%) | 4.0× |
+| 48 | 121 k | 35.8 k | 557 (62%)¹ | 3.4× |
+| 48, decode-average 5.33 parts (2736 rows) | 83.7 k | 28.5 k | 467 | 2.9× |
+
+Q4_KP16 v1 from L1 runs at 11.7 B/cycle, 5.5× v0. A fully unrolled first version spilled Z registers, about 80 STR/LDR Z per super-block, and reached only 6.1 B/cycle.
 
 Production v0 kernels at 48 threads:
 
@@ -101,6 +114,6 @@ Reaching the node roof needs about 9.4 B/cycle per core.
 
 ## Next
 
-1. **K-quant panels.** Lossless repacks of Q4_K/Q5_K/Q6_K with row-lane layout and pre-expanded sub-block scales. Today these are 5–9× below the roof.
+1. **K-quant panels.** Q4_K is done (Q4_KP16). Q5_K/Q6_K, the routed down projection, are still 8–9× below the roof in v0. Apply the same row-lane layout with the high-bit plane merged.
 2. **Persistent layer chain.** Prefetch the next matrix during the current one to remove the 48-thread ramp.
 3. **Rewire the production path.** Have `glm53f_iq_bridge.c` call these cores, repack Q8_0R to Q8_0R16 at load, and convert the head from F32 to Q8_0R16 losslessly.
