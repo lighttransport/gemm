@@ -617,3 +617,37 @@ What remains:
   - serial compaction scans 3 s
 
   The phase line printed at the end of simplify shows this split.
+
+### Flow kernels (Phase 3)
+
+Measured with nsys on one shape1024 30-block pass (1 cold + 3 warm
+forwards, ~10.7k tokens, mixed precision); the output was bitwise
+identical at every step.
+
+| Step | Kernel time |
+|---|---|
+| Baseline | 11.75 s |
+| Warp-per-row norms (1.85 → 0.64 s) | 10.72 s |
+| + cross-projection cache and exact zero-guidance shortcut | 10.76 s (540 fewer GEMM calls; the GEMMs are small, so the total barely moved) |
+| + warp cross-attention over 5 keys (0.61 → 0.04 s) | 10.26 s |
+| + row-shaped element and GEMM epilogue kernels (no 64-bit modulo) | 9.83 s |
+
+End to end on the house fixture: diffusion 143 → 114 s, and the run
+209 → 198 s, with the same GLB hash as before this step.
+
+**Headroom.** The big kernels are near what this GPU does:
+
+| Kernel | Ours | PyTorch reference |
+|---|---|---|
+| cuBLAS BF16 GEMM, same shapes (M = 10752) | ~30 TFLOPS | 31–32 TFLOPS |
+| Flash attention, 12 × 128 heads, N = 10752 | ~25 TFLOPS | 28.4 TFLOPS |
+
+GEMMs and FA2 are now 71% of flow kernel time, and what remains is small:
+- the F32→BF16 cast before each GEMM and the bias epilogue after it
+  (~0.9 s of 9.8, fusible with cuBLASLt epilogues or with producers
+  that write BF16);
+- the FA2 pack/unpack passes (0.17 s);
+- up to ~12% in the attention kernel itself.
+
+Whole-matrix GEMM tiles and a 64 MiB cuBLAS workspace left cuBLAS on its
+64×64 kernel with the same speed.
