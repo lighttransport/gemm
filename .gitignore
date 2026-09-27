@@ -120,6 +120,19 @@ zen2/bench_*
 
 # Fugaku job scheduler logs
 *.err
+/output.*/
+/a64fx/ds41f/output.*/
+/a64fx/ds41f/tmp/
+/a64fx/tools/bash-over-http/job-logs/
+/a64fx/llm/tp_run_*.txt
+
+# A64FX local benchmark and test executables
+/a64fx/dequant-pipe/.exec_bridge_probe
+/a64fx/dequant-pipe/bench_*
+!/a64fx/dequant-pipe/bench_*.c
+/a64fx/dequant-pipe/test_e4_pack
+/a64fx/ds41f/test_pipeline*
+!/a64fx/ds41f/test_pipeline*.c
 
 # Build artifact binaries — sparse3d
 cpu/*/test_*
