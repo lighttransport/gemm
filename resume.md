@@ -1,4 +1,4 @@
-# Resume: GLM-5.3-Flash A64FX kernel efficiency + QLAIR accuracy (updated 2026-09-28 02:40)
+# Resume: GLM-5.3-Flash A64FX kernel efficiency + QLAIR accuracy (updated 2026-09-28 04:10)
 
 ## Goal
 Run GLM-5.3-Flash (GLM53F) efficiently on A64FX. Targets:
@@ -90,6 +90,38 @@ All are event-only, backed by native probes (`lprobe.c`), and recorded with data
 - **Q8_0R-family kernels match:** v0 +1.0%, Q8_0R16 v3 −0.6%, v4pf −0.2%.
 - **K-quant kernels are all simulated too fast (−4 to −17%).** The best-isolated remaining term is SDOT consuming freshly loaded registers: native 6.17 vs 5.32 cycles/block at lag 0, 4.92 vs 4.67 at lag 1. Natively, cycles = 4 + STALL_BACKEND (0x24). QLAIR does not emulate events 0x23/0x24.
 
+## Session 2026-09-28 02:40–04:10 (clair commits 3650b130, 71401b32, c786a15c, d8852aec)
+
+All the new simulator switches are diagnostic and default off, so default QLAIR behaviour is unchanged. Regressions pass: test-qlair 610/610, event CTests 2/2. Full tables are in `glm53f/STATUS.md`, in the last three sections.
+
+**1. RSE release at completion** (`QLAIR_SIM_EVENT_RSE_RELEASE_COMPLETE=1`)
+- The GEMM tile goes from −8% to −2.8%.
+- The ld8sd16 probe overshoots (+5.8%), and the gate is unchanged.
+- Not promoted.
+
+**2. The "lag-0 stall" is FP rename exhaustion** (`QLAIR_SIM_EVENT_FP_RENAMES=N`)
+- Every ld+SDOT probe moves monotonically with the pool size; loads-only and ld+ADD probes do not move.
+- At N=88 the probes fall within ±1%.
+- Q8_0R16 overshoots (+4%).
+
+**3. Native window-size probes** (`glm53f/wprobe/`: two pointer-chase misses N fillers apart)
+- Knees: ROB 128, GPR 64, FP renames 96. These are exactly the model's counts, so do not shrink the pool.
+- LD1B fillers knee at 38/39. That is 40 fetch ports, and a completed younger load's port waits for the older miss. This is the existing diagnostic `QLAIR_SIM_EVENT_ORDERED_FETCH_RELEASE=1`, not the default.
+- An FMUL-chain head blocker with LD1B fillers knees near 90, so ports are **not** held to commit.
+- Ordered release is neutral on L1-resident cases. It should matter for HBM streaming and is the promotion candidate.
+
+**4. Rename-lifetime switch** (`QLAIR_SIM_EVENT_FP_HOLD_LOAD=D`, `QLAIR_SIM_EVENT_FP_HOLD_FL=D`; FP renames held D cycles past commit)
+- LOAD=4 makes every ld+SDOT probe exact (noadd sd8/12/16 and lag0/lag1 all 0.0%).
+- It keeps the Q8_0R family in gate (−0.1/+2.3/+1.1).
+- Kernel gate: 3/10, mean 6.9% → 6.6%.
+- This is the best single rule so far. It is not yet backed by a direct native lifetime probe.
+
+**5. Residuals that no rename or port rule moves**
+- q4k_v0 −15%, q5k_v0 −11%, q6kp16_v1pf −15%, f32_v0 −4.3%: a separate missing cost, probably the unpack ops.
+- GEMM sb32 −11 to −15%.
+- Sim random-miss latency is about 455 cycles/iter vs native 290 (16 MiB chains).
+- `wp fm` runs +17 cycles/iter slow in the sim (161 vs 144), while a minimal FMUL-chain + LD1B loop matches.
+
 ## Production integration plan (not started; needs the real model on 12 nodes)
 
 - **Where Q8_0R is used:**
@@ -107,9 +139,12 @@ All are event-only, backed by native probes (`lprobe.c`), and recorded with data
 
 ## Next steps (priority)
 1. **Simulator.**
-   - Explain the lag-0 load→SDOT backend stall (STALL_BACKEND 1.60 vs 0.92 cycles/block); it probably comes from load-waiting FP ops filling the RSE. Emulate PMU 0x23/0x24 in QLAIR.
-   - Then the dependent base-ADD rule (matched density table).
-   - Re-check the K-quant L0 cases, the GEMM tile, and the qwen38 nine-case event gate.
+   - Write a direct native probe for load-result rename lifetime. Use a throughput loop in which renames bind, and compare LD1B→consumer against FADD→consumer. If it confirms about 4 cycles, promote `FP_HOLD_LOAD=4` together with `ORDERED_FETCH_RELEASE`.
+   - Validate on the 1-core HBM streaming cases (`cases-sim.txt` L1 section; re-measure native with the frozen ELF).
+   - Then the K-quant unpack-op residual: q4k_v0/q5k_v0 insensitive to every switch.
+   - Then the dependent base-ADD rule (ld8u6 −7.6%).
+   - Then the sim random-miss latency (wprobe 455 vs 290).
+   - The acceptance set is `/local`-independent: `measurements/hw-20260927b/eval_probes.sh` plus the kernel gate (`run_sim.sh out/bench-c13 <cases-acc2 with S=3> event ...`, then `compare.py --native measurements/hw-20260927b/acc2-native.log`).
 2. **Decode.** Integrate panel kernels, repack at load and use flag or hardware barriers into the production runner (`glm53f_iq_bridge.c`, `glm53f_target_decode_12n.c`). Validate on 12 nodes: `build_glm53f_integrated_12n.sh check` bit-identical, then a tok/s A/B. Check production weight page placement: the 2 MiB page effect.
 3. **Prefill.** Explain the multi-core GEMM drop (per-core PMU at 12 threads). Consider W8A8 per-channel behind the quality gate.
 4. Re-run the qwen38 nine-case event gate; its static cross ELF is off-node.
