@@ -46,7 +46,8 @@ typedef struct {
     const int8_t *xq;        /* Q8_0 values, contiguous (Q8_0R weights) */
     const float *xpat;       /* per 64 values: 8 lanes d[2k], 8 lanes d[2k+1] */
     const float *xd;         /* per 32-value block: Q8_0 scale as f32 */
-    const int32_t *q8k_bsum32; /* per 32-value block: sum of q8k[].q (Q4_KP16) */
+    const int32_t *q8k_bsum32; /* per 32-value block: sum of q8k[].q (Q4/Q5_KP16) */
+    const int32_t *q8k_bsum16; /* per 16-value block: sum of q8k[].q (Q6_KP16) */
     const float *xf;         /* F32 activation (head) */
 } gk_act;
 
@@ -95,6 +96,23 @@ void gk_pack_q4_kp16(uint8_t *dst, const uint8_t *rows, size_t row_bytes,
                      int nrows, int columns);
 void gk_q4_kp16_v1(const gk_mv *m, int r0, int r1);
 void gk_q4_kp16_v1pf(const gk_mv *m, int r0, int r1);
+
+/* v1: lossless 16-row Q5_K panel repack (glm53f_kern_q5k16.c), 184 bytes
+ * per 256 columns per row; same activation contract as Q4_KP16. */
+size_t gk_row_bytes_q5_kp16(int columns);
+void gk_pack_q5_kp16(uint8_t *dst, const uint8_t *rows, size_t row_bytes,
+                     int nrows, int columns);
+void gk_q5_kp16_v1(const gk_mv *m, int r0, int r1);
+void gk_q5_kp16_v1pf(const gk_mv *m, int r0, int r1);
+void gk_q5_kp16_v2pf(const gk_mv *m, int r0, int r1);
+
+/* v1: lossless 16-row Q6_K panel repack (glm53f_kern_q6k16.c), 212 bytes
+ * per 256 columns per row. */
+size_t gk_row_bytes_q6_kp16(int columns);
+void gk_pack_q6_kp16(uint8_t *dst, const uint8_t *rows, size_t row_bytes,
+                     int nrows, int columns);
+void gk_q6_kp16_v1(const gk_mv *m, int r0, int r1);
+void gk_q6_kp16_v1pf(const gk_mv *m, int r0, int r1);
 
 #ifdef __cplusplus
 }

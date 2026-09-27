@@ -64,6 +64,9 @@ Each core computes output rows `[r0, r1)` of one GEMV. Cores contain no OpenMP a
 | `gk_q8_0r16_v3pf{4k,16k,64k}` | same | v3 plus L2 software prefetch of the weight stream, 4/16/64 KiB ahead |
 | `gk_q4_kp16_v1` | `glm53f_kern_q4k16.c` | Lossless 16-row Q4_K panel repack (152 B per 256 columns per row, +5.6% bytes; scales unpacked to bytes, `d`/`dmin` as f32). The nibbles are laid out so one AND or LSR yields each row-lane SDOT operand. Scale and min sums are exact in int32; per-32 activation sums are precomputed. |
 | `gk_q4_kp16_v1pf` | same | v1 plus L2 software prefetch 16 KiB ahead |
+| `gk_q5_kp16_v1`, `_v1pf` | `glm53f_kern_q5k16.c` | Lossless 16-row Q5_K panels: 184 B per 256 columns per row (+4.5%). The Q4_KP16 nibble plane is kept, plus one 64 B high-bit plane per sub-block (bit t of byte r·4+i is the fifth bit of k-group t). The high part is a separate SDOT on `(plane >> t) & 1`, scaled by 16 in int32. |
+| `gk_q5_kp16_v2pf` | same | 8 two-deep SDOT chains instead of 4. Slower: 7.5 vs 8.5 B/cycle from L1, so Q5 is bound by FP-op count, not latency. |
+| `gk_q6_kp16_v1`, `_v1pf` | `glm53f_kern_q6k16.c` | Lossless 16-row Q6_K panels: 212 B per 256 columns per row (+1%). Per 16-weight sub-block: 2 nibble vectors, one 2-bit high plane, 16 int8 scales; f32 `d` per row. The −32 offset is an exact int32 term using per-16 activation sums. |
 
 ## Measured efficiency: HBM-streaming, per-rank shapes (job 51943789)
 
@@ -91,6 +94,21 @@ Routed-expert gate/up, Q4_K, 8 parts (4096×4096). GB/s counts the bytes actuall
 
 Q4_KP16 v1 from L1 runs at 11.7 B/cycle, 5.5× v0. A fully unrolled first version spilled Z registers, about 80 STR/LDR Z per super-block, and reached only 6.1 B/cycle.
 
+Routed-expert down projection, 8 parts (32768×256, K=256). v1 means v1pf unless noted.
+
+| Kernel | Thr | v0 cycles | v1 cycles | v1 % roof | Speed-up |
+|---|---:|---:|---:|---:|---:|
+| Q5_K → Q5_KP16 | 1 | 5.31 M | 0.94 M | 35% | 5.7× |
+| Q5_K → Q5_KP16 | 12 | 450 k | 94 k | 57% | 4.8× |
+| Q5_K → Q5_KP16 | 48 | 121 k | 31 k | 43% | 3.9× |
+| Q6_K → Q6_KP16 | 1 | 5.48 M | 0.82 M | 47% | 6.7× |
+| Q6_K → Q6_KP16 | 12 | 464 k | 78 k | 79% | 5.9× |
+| Q6_K → Q6_KP16 | 48 | 125 k | 29 k | 53% | 4.3× |
+
+From L1:
+- Q5_KP16 runs at 8.5 B/cycle and Q6_KP16 at 8.7, against 1.1 and 1.3 for v0.
+- Q5 remains bound by FP-op count, at about 49 ops per 16-row × 32-weight sub-block. It is below the 9.4 B/cycle per core needed to saturate a CMG.
+
 Production v0 kernels at 48 threads:
 
 | Kernel | GB/s | % of roof |
@@ -114,6 +132,6 @@ Reaching the node roof needs about 9.4 B/cycle per core.
 
 ## Next
 
-1. **K-quant panels.** Q4_K is done (Q4_KP16). Q5_K/Q6_K, the routed down projection, are still 8–9× below the roof in v0. Apply the same row-lane layout with the high-bit plane merged.
+1. **K-quant panels.** All three are done (Q4/Q5/Q6_KP16). Q5 is still FP-op bound at 57% of the CMG roof. Options: 2 panels per iteration to share LD1RW broadcasts; drop the `svdup_s32(0)` MOVIs by chaining the first SDOT; or a lossy INT8-128 path behind the quality gate.
 2. **Persistent layer chain.** Prefetch the next matrix during the current one to remove the 48-thread ramp.
 3. **Rewire the production path.** Have `glm53f_iq_bridge.c` call these cores, repack Q8_0R to Q8_0R16 at load, and convert the head from F32 to Q8_0R16 losslessly.
