@@ -13,7 +13,8 @@ void simplify(Mesh &mesh, int target);
 void fill_holes(Mesh &mesh);
 void vertex_normals(const Mesh &mesh, Vec &normals);
 void clean_for_uv(Mesh &mesh);
-void unwrap(const Mesh &mesh, Vec &vertices, std::vector<int32_t> &faces, Vec &uv, std::vector<int32_t> &map);
+void unwrap(const Mesh &mesh, Vec &vertices, std::vector<int32_t> &faces, Vec &uv, std::vector<int32_t> &map,
+            const GpuGeometry &gpu = {});
 void inpaint(std::vector<uint8_t> &image, int channels, const std::vector<uint8_t> &mask, int size,
              int radius);
 } // namespace px

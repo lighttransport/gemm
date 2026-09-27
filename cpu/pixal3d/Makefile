@@ -36,7 +36,7 @@ geometry.o: geometry.c ../../common/trellis2_fdg_mesh.h | $(TMPDIR)
 lightrt.o: ../../common/lightrt.cc ../../common/lightrt.hh
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 xatlas.o: ../../common/xatlas.cc ../../common/xatlas.h
-	$(CXX) $(CXXFLAGS) -Wno-type-limits -c $< -o $@
+	$(CXX) $(CXXFLAGS) -DNDEBUG -Wno-type-limits -c $< -o $@
 $(TMPDIR):
 	mkdir -p $@
 -include $(OBJECTS:.o=.d) main.d validation.d test_pixal3d.d

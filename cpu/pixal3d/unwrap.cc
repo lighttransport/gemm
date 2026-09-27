@@ -15,6 +15,11 @@ struct Adjacency {
     int a, b;
     float length;
 };
+// Largest merged chart. xatlas re-segments each chart with a greedy grow that
+// re-projects and re-checks the whole chart per face, quadratic in its size:
+// two ~22k-face charts took 22 s of a 22 s xatlas pass on the house fixture.
+// Capping them changes only a handful of charts (see OPTIMIZATION.md).
+constexpr int kMaxChartFaces = 8192;
 // Match CuMesh.uv_unwrap's cleanup, including its AND threshold rule.
 void clean_for_uv(Mesh &mesh) {
     std::vector<int32_t> faces;
@@ -46,7 +51,40 @@ void clean_for_uv(Mesh &mesh) {
     mesh.v.swap(vertices);
     mesh.f.swap(faces);
 }
-void unwrap(const Mesh &m, Vec &vertices, std::vector<int32_t> &faces, Vec &uv, std::vector<int32_t> &vmap) {
+// The normal-cone merge through the plugin; same charts as the loop below.
+static bool merge_charts_gpu(const GpuGeometry &gpu, const std::vector<V3> &normals, const Vec &areas,
+                             const std::vector<Adjacency> &adjacency, std::vector<int> &charts, int &nc,
+                             int &rounds) {
+    if (!gpu.merge_charts)
+        return false;
+    int nf = int(normals.size()), na = int(adjacency.size());
+    Vec packed(size_t(nf) * 3), lengths(na);
+    std::vector<int32_t> pairs(size_t(na) * 2);
+    for (int f = 0; f < nf; ++f) {
+        packed[3 * size_t(f)] = normals[f].x;
+        packed[3 * size_t(f) + 1] = normals[f].y;
+        packed[3 * size_t(f) + 2] = normals[f].z;
+    }
+    for (int i = 0; i < na; ++i) {
+        pairs[2 * size_t(i)] = adjacency[i].a;
+        pairs[2 * size_t(i) + 1] = adjacency[i].b;
+        lengths[i] = adjacency[i].length;
+    }
+    px_chart_request request{packed.data(), areas.data(), pairs.data(), lengths.data(), nf, na, kMaxChartFaces, 0,
+                             gpu.gpu};
+    px_chart_result result{};
+    if (gpu.merge_charts(&request, &result) != 0) {
+        std::fprintf(stderr, "Pixal3D UV: GPU chart merge unavailable (%s); using the CPU\n", result.error);
+        return false;
+    }
+    std::copy(result.charts, result.charts + nf, charts.begin());
+    std::free(result.charts);
+    nc = result.num_charts;
+    rounds = result.rounds;
+    return true;
+}
+void unwrap(const Mesh &m, Vec &vertices, std::vector<int32_t> &faces, Vec &uv, std::vector<int32_t> &vmap,
+            const GpuGeometry &gpu) {
     using clock = std::chrono::steady_clock;
     auto seconds = [](clock::time_point a, clock::time_point b) { return std::chrono::duration<double>(b - a).count(); };
     auto t_start = clock::now();
@@ -87,9 +125,13 @@ void unwrap(const Mesh &m, Vec &vertices, std::vector<int32_t> &faces, Vec &uv, 
     edges.shrink_to_fit();
     std::vector<int> charts(nf);
     std::iota(charts.begin(), charts.end(), 0);
-    for (;;) {
+    bool merged_on_gpu = merge_charts_gpu(gpu, normals, areas, adjacency, charts, nc, rounds);
+    while (!merged_on_gpu) {
         std::vector<V3> axes(nc, V3(0, 0, 0));
         Vec area(nc), angle(nc), perimeter(nc);
+        std::vector<int> sizes(nc);
+        for (int f = 0; f < nf; ++f)
+            ++sizes[charts[f]];
         for (int f = 0; f < nf; ++f) {
             axes[charts[f]] = axes[charts[f]] + normals[f];
             area[charts[f]] += areas[f];
@@ -134,7 +176,9 @@ void unwrap(const Mesh &m, Vec &vertices, std::vector<int32_t> &faces, Vec &uv, 
             float low = std::min(-angle[e.a], axis_angle - angle[e.b]),
                   high = std::max(angle[e.a], axis_angle + angle[e.b]);
             float ar = area[e.a] + area[e.b], per = perimeter[e.a] + perimeter[e.b] - 2 * e.length;
-            cost[i] = (high - low) * .5f + .1f * ar + .0001f * per * per / std::max(ar, 1e-20f);
+            cost[i] = sizes[e.a] + sizes[e.b] > kMaxChartFaces
+                          ? INFINITY
+                          : (high - low) * .5f + .1f * ar + .0001f * per * per / std::max(ar, 1e-20f);
             for (int c : {e.a, e.b})
                 if (best[c] < 0 || cost[i] < cost[best[c]])
                     best[c] = int(i);

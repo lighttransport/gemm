@@ -221,7 +221,7 @@ std::shared_ptr<GeometryStage> postprocess_geometry(const Sparse &shape, const p
     auto &vertices = stage->vertices, &uv = stage->uv, &normals = stage->normals;
     auto &faces = stage->faces, &vmap = stage->vmap;
     detail = std::chrono::steady_clock::now();
-    unwrap(mesh, vertices, faces, uv, vmap);
+    unwrap(mesh, vertices, faces, uv, vmap, gpu);
     record("unwrap", detail);
     detail = std::chrono::steady_clock::now();
     Vec original_normals;

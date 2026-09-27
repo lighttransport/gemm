@@ -85,4 +85,22 @@ struct px_simplify_request {
     int num_vertices, num_faces, target, device;
     void *gpu;
 };
+/* Optional CUDA entry px_gpu_merge_charts: the normal-cone chart merge of
+ * px::unwrap on the GPU. Inputs are the per-face unit normals and areas and
+ * the manifold face adjacencies (face pairs with shared-edge lengths) in the
+ * CPU's order; `charts` (malloc'd) gets each face's chart. Pairs whose
+ * merged chart would exceed max_chart_faces never merge. Memory, gpu and
+ * failure behave as for px_gpu_remesh. */
+struct px_chart_request {
+    const float *normals, *areas;
+    const int32_t *adjacent_faces; /* two faces per adjacency */
+    const float *adjacent_lengths;
+    int num_faces, num_adjacent, max_chart_faces, device;
+    void *gpu;
+};
+struct px_chart_result {
+    int32_t *charts;
+    int num_charts, rounds;
+    char error[256];
+};
 #endif

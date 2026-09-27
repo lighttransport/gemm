@@ -744,3 +744,60 @@ The GLB hash is unchanged (`ad9845c1…`), and the peak engine reservation
 stays at 5.9 GiB. The geometry thread now outlasts the texture window by only
 8.5 s (`geometry_wait`). Unwrap (42 s, xatlas) takes most of the geometry
 thread.
+
+### UV unwrap
+
+Profile of the house mesh (992k faces), standalone, 14 threads: 41.6 s in
+all. The normal-cone merge took 6.8 s (173 serial rounds), adding the
+meshes 1.4 s, xatlas `ComputeCharts` 29.2 s and packing 3.9 s.
+
+- **xatlas without debug asserts.** The CPU build has no `NDEBUG`, so
+  xatlas compiled with `XA_DEBUG=1`: bounds-checked, out-of-line array
+  access. Its `XA_DEBUG` blocks are asserts only, and building `xatlas.o`
+  with `-DNDEBUG` gives the same output. ComputeCharts went 29.2 → 22.3 s.
+- **GPU chart merge** (`px_gpu_merge_charts`, `cuda/pixal3d/charts.inc`).
+  Each round is kernels over stable radix groupings, so every float sum
+  keeps the CPU order:
+  - chart axis and area over faces in face order;
+  - chart-pair lengths in adjacency order;
+  - perimeters in pair order;
+  - the CPU's first-best pair per chart, as a packed `atomicMin`.
+
+  `std::acos` is glibc 2.39's fdlibm `acosf`, which is not correctly
+  rounded: a double-precision acos differs on 0.25% of inputs. The GPU
+  therefore uses a port of glibc's algorithm, checked equal on all 2.13
+  billion floats in [-1, 1]. On that glibc, the charts are bit-identical to
+  the CPU merge (unwrap hash unchanged). The merge went 6.8 → 1.0 s
+  standalone; it takes about 8 s inside the pipeline, where it shares the
+  GPU with the texture flow and is hidden.
+- **Chart-size cap (output change).** xatlas re-segments each input chart
+  with a greedy grow. Each added face refits the basis, re-projects the
+  whole chart and re-checks its boundary for self-intersections, so the
+  cost is quadratic in chart size. Two ~22k-face normal-cone charts took
+  22 s each, the whole xatlas wall time; the other 16.9k charts would have
+  finished in about 12 s across 14 threads. There is no exact speedup, so
+  the merge now never builds a chart above 8192 faces: such pairs get
+  cost +inf, the same on the CPU and the GPU.
+
+  | Cap | Charts | Output vertices | xatlas charts |
+  |---|---|---|---|
+  | none | 16853 | 840465 | 22.3 s |
+  | 8192 (kept) | 16861 | 835736 | 3.9 s |
+  | 4096 | 16865 | 835557 | 3.8 s |
+  | 2048 | 16911 | 833014 | 3.3 s |
+
+  Quality against the uncapped output:
+  - the surface is identical triangle for triangle;
+  - the four renders give 39.5–45.2 dB PSNR and silhouette IoU 1.0;
+  - `validate_glb.py` passes.
+
+  (`compare_outputs.py` reports a 0.003 Chamfer between identical surfaces.
+  That comes from its point sampling on differently split vertex arrays.)
+
+| House fixture | unwrap | geometry thread | geometry_wait | generate |
+|---|---|---|---|---|
+| Before | 42.5 s | 50.1 s | 8.5 s | 143.6 s |
+| NDEBUG xatlas + GPU merge + 8192 cap | 18.3 s | 25.6 s | 0.0 s | 132.7 s |
+
+The geometry thread is now fully hidden behind the texture stage. The GLB
+changed (`1f7d678d…`) only in its UV layout and baked texture.
