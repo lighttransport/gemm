@@ -550,7 +550,7 @@ extern "C" int px_gpu_metrics(void *p, px_device_metrics *out) {
         out->largest_allocation_bytes = d.largest_allocation;
     } else {
         d.metrics = {};
-        d.peak = d.live;
+        d.peak = d.live.load();
         d.peak_active = d.active;
         d.largest_allocation = 0;
     }

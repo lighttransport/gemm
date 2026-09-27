@@ -3,6 +3,8 @@
 #include "mesh.hh"
 #include <array>
 #include <filesystem>
+#include <future>
+#include <omp.h>
 #include <opencv2/photo.hpp>
 #include <parallel/algorithm>
 #include <unordered_map>
@@ -158,7 +160,8 @@ void add_timing(GeometryStage &geometry, const std::string &name, double seconds
     geometry.timings.push_back({name, seconds});
 }
 
-std::shared_ptr<GeometryStage> postprocess_geometry(const Sparse &shape, const pixal3d_options &options) {
+std::shared_ptr<GeometryStage> postprocess_geometry(const Sparse &shape, const pixal3d_options &options,
+                                                    const GpuRemesh &gpu) {
     auto stage = std::make_shared<GeometryStage>();
     auto phase = std::chrono::steady_clock::now();
     auto record = [&](const char *name, std::chrono::steady_clock::time_point begin) {
@@ -192,11 +195,22 @@ std::shared_ptr<GeometryStage> postprocess_geometry(const Sparse &shape, const p
     std::fprintf(stderr, "Pixal3D FDG: %u vertices, %u faces\n", original.numV(), original.numF());
     detail = std::chrono::steady_clock::now();
     auto &bvh = stage->bvh;
-    require(bvh.build(original.v.data(), original.numV(), original.f.data(), original.numF()),
-            "Cannot build original mesh BVH");
+    // The bake needs the CPU BVH either way; build it while the GPU remeshes.
+    int threads = omp_get_max_threads();
+    auto built = std::async(std::launch::async, [&] {
+        omp_set_num_threads(threads);
+        return bvh.build(original.v.data(), original.numV(), original.f.data(), original.numF());
+    });
+    Mesh mesh;
+    auto remesh_start = std::chrono::steady_clock::now();
+    bool remeshed = remesh_gpu(gpu, original, 1024, mesh);
+    if (remeshed)
+        record("remesh_gpu", remesh_start);
+    require(built.get(), "Cannot build original mesh BVH");
     record("original_bvh", detail);
     mark("holes_bvh");
-    Mesh mesh = remesh(original, bvh);
+    if (!remeshed)
+        mesh = remesh(original, bvh);
     mark("remesh");
     dump_mesh(options, "mesh_remeshed", mesh);
     simplify(mesh, options.decimation_target);

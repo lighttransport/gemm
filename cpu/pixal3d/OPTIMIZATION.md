@@ -631,6 +631,8 @@ identical at every step.
 | + cross-projection cache and exact zero-guidance shortcut | 10.76 s (540 fewer GEMM calls; the GEMMs are small, so the total barely moved) |
 | + warp cross-attention over 5 keys (0.61 → 0.04 s) | 10.26 s |
 | + row-shaped element and GEMM epilogue kernels (no 64-bit modulo) | 9.83 s |
+| + norm, modulate, GELU and attention write the packed BF16 GEMM input (`PX_PACK_OUT`) | 9.74 s |
+| + bias added in a cuBLASLt `BIAS` epilogue for mixed-precision linears (drops `finish_gemm_rows`) | 9.33 s |
 
 End to end on the house fixture: diffusion 143 → 114 s, and the run
 209 → 198 s, with the same GLB hash as before this step.
@@ -651,3 +653,56 @@ GEMMs and FA2 are now 71% of flow kernel time, and what remains is small:
 
 Whole-matrix GEMM tiles and a 64 MiB cuBLAS workspace left cuBLAS on its
 64×64 kernel with the same speed.
+
+The cast and bias items above are now fused (3e4ffe15). The cuBLASLt plan
+per shape comes from its fixed top heuristic, never from timing, so every
+run picks the same kernel.
+
+### GPU remesh (Phase 5)
+
+`px_gpu_remesh` (`cuda/pixal3d/remesh.inc`) runs `px::remesh` on the GPU on
+the geometry thread, concurrently with the texture flow.
+- **BVH:** an LBVH built from Morton+face-id keys sorted by CUB radix sort,
+  a Karras build, and a spin-free bottom-up refit. Internal nodes are 32 B
+  and each leaf is one triangle.
+- **Levels:** the narrow-band candidates at each level are kept as sorted
+  hierarchical keys, in the CPU's seed and child order, and compacted with
+  scans.
+- **Corner UDFs:** computed per voxel. There is no deduplication table: more
+  queries, but less memory.
+- **Faces:** neighbour voxels are found by binary search on the sorted keys,
+  and faces are emitted in the CPU's voxel/axis order.
+
+The distance and contouring code follows the CPU's float expression order,
+built with `--fmad=false`. Remesh output uses only the minimum distance,
+which is independent of the tree. The mesh is therefore bit-identical to the
+CPU remesh; `validate_geometry.py` asserts this at 64 and 128.
+
+**Memory.** The remesh borrows from the engine's budget ledger. The ledger's
+`live + lent <= budget` is admitted under a mutex. If the loan is refused,
+the remesh falls back to the CPU and never waits. If the engine is refused
+only because of the loan, it waits for the loan to return, which takes under
+a second. The house run therefore stays inside 12 GiB, even though about
+3 GB of this GPU is held by other processes.
+
+Measured on the house FDG mesh (8.4M faces, output 13.5M faces):
+
+| | Time | Notes |
+|---|---|---|
+| CPU remesh, 16 threads | 10.6 s | levels 3.5, corners hash 2.75, UDF 1.8, contour 2.6 |
+| GPU remesh | 0.7 s | BVH 0.05–0.2, levels 0.16, UDF 0.32, contour 0.17; peak 849 MiB |
+
+A deduplicated corner hash table made the UDF 0.14 s, but the peak rose to
+1.35 GiB. Four-triangle leaves were 5× slower, because fixed-size groups
+straddle Morton jumps and give loose boxes.
+
+The CPU closest-point BVH is still needed by the bake. It is now built
+(3.7 s) while the GPU remeshes, so remesh leaves the geometry thread's
+critical path: `postprocess.remesh` went from 11.9 to 0.0 s, and
+`remesh_gpu` takes 1.0 s inside `holes_bvh`.
+
+End to end on the house fixture: `generate` 198 → 178 s, and the geometry
+thread 99.7 → 85.9 s. The GLB hash is unchanged (`ad9845c1…`). The geometry
+thread still outlasts the texture window (`geometry_wait` 47 s), because of
+unwrap (41 s) and simplify (39 s).
+

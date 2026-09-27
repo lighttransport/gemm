@@ -1,6 +1,7 @@
 /* CPU port of CuMesh's narrow-band UDF/simple dual contouring algorithm.
  * Uses the shared native closest-point BVH. See ref/pixal3d sources manifest. */
 #include "mesh.hh"
+#include <chrono>
 #include <unordered_map>
 
 namespace px {
@@ -16,6 +17,9 @@ Mesh remesh(const Mesh &, const trellis2::ClosestPointBVH &bvh, int resolution) 
             "Remesh resolution must be power of two >=32");
     // Pixal3D's explicit AABB is [-.5,.5]^3, not the mesh's tight bounds.
     float scale = float(resolution + 3) / resolution, eps = scale / resolution;
+    using clock = std::chrono::steady_clock;
+    auto since = [](clock::time_point t) { return std::chrono::duration<double>(clock::now() - t).count(); };
+    auto t0 = clock::now();
     std::vector<Coord> coords;
     coords.reserve(32768);
     for (int x = 0; x < 32; ++x)
@@ -47,6 +51,8 @@ Mesh remesh(const Mesh &, const trellis2::ClosestPointBVH &bvh, int resolution) 
         if (level == resolution)
             break;
     }
+    double t_levels = since(t0);
+    auto t1 = clock::now();
     std::unordered_map<uint64_t, int> corners;
     corners.reserve(coords.size() * 4);
     std::vector<Coord> unique;
@@ -56,6 +62,8 @@ Mesh remesh(const Mesh &, const trellis2::ClosestPointBVH &bvh, int resolution) 
             if (corners.emplace(pack(q), int(unique.size())).second)
                 unique.push_back(q);
         }
+    double t_corners = since(t1);
+    t1 = clock::now();
     Vec udf(unique.size());
 #pragma omp parallel for schedule(dynamic, 256)
     for (size_t i = 0; i < unique.size(); ++i) {
@@ -66,6 +74,8 @@ Mesh remesh(const Mesh &, const trellis2::ClosestPointBVH &bvh, int resolution) 
                      .distance -
                  eps;
     }
+    double t_udf = since(t1);
+    t1 = clock::now();
     Vec dual(coords.size() * 3);
     std::vector<int> intersected(coords.size() * 3);
 #pragma omp parallel for schedule(static)
@@ -154,6 +164,24 @@ Mesh remesh(const Mesh &, const trellis2::ClosestPointBVH &bvh, int resolution) 
         i = map[i];
     result.v.swap(vertices);
     require(result.numF() > 0, "Remesh produced no faces");
+    std::fprintf(stderr,
+                 "Pixal3D remesh: levels %.2fs, corners %.2fs (%zu), udf %.2fs, contour %.2fs, total %.2fs\n",
+                 t_levels, t_corners, unique.size(), t_udf, since(t1), since(t0));
     return result;
+}
+bool remesh_gpu(const GpuRemesh &gpu, const Mesh &source, int resolution, Mesh &out) {
+    if (!gpu.fn)
+        return false;
+    px_remesh_request request{source.v.data(), source.f.data(), int(source.numV()), int(source.numF()),
+                              resolution,      0,               gpu.gpu};
+    px_remesh_result result{};
+    if (gpu.fn(&request, &result) != 0) {
+        std::fprintf(stderr, "Pixal3D remesh: GPU path unavailable (%s); using the CPU\n", result.error);
+        return false;
+    }
+    out.set(result.vertices, result.num_vertices, result.faces, result.num_faces);
+    std::free(result.vertices);
+    std::free(result.faces);
+    return true;
 }
 } // namespace px

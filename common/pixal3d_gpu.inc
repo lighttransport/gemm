@@ -3,7 +3,10 @@
  * device buffers. SPDX-License-Identifier: MIT */
 #include "pixal3d_device.h"
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <condition_variable>
+#include <mutex>
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -104,8 +107,14 @@ struct Device {
     blasHandle blas{};
     gpuStream stream{};
     int ordinal = 0;
-    size_t budget = 0, live = 0, peak = 0, active = 0, peak_active = 0, pool_bytes = 0, pool_limit = 0,
+    size_t budget = 0, peak = 0, active = 0, peak_active = 0, pool_bytes = 0, pool_limit = 0,
            largest_allocation = 0;
+    // The budget ledger: `live` is the engine's allocations (pool included),
+    // `lent` the share a concurrent plugin job (the GPU remesh) holds. Growth
+    // on either side is admitted under `ledger`, so live + lent <= budget.
+    std::atomic<size_t> live{0}, lent{0};
+    std::mutex ledger;
+    std::condition_variable returned;
     std::string error;
     bool pool_enabled = false, profile = false;
     int kernels = 0;
@@ -183,7 +192,7 @@ struct Buffer {
                 d.peak_active = std::max(d.peak_active, d.active);
                 return;
             }
-            while (n > d.budget - d.live && !d.pool.empty()) {
+            while (n > d.budget - std::min(d.budget, d.live + d.lent) && !d.pool.empty()) {
                 auto b = d.pool.back();
                 d.pool.pop_back();
                 GPU(gpuFree(b.first));
@@ -191,13 +200,26 @@ struct Buffer {
                 d.pool_bytes -= b.second;
             }
         }
-        if (n > d.budget - d.live)
-            throw std::runtime_error("Pixal3D GPU workspace exceeds memory budget");
-        GPU(gpuMalloc(&p, n));
+        {
+            // Memory lent to the remesh comes back within about a second:
+            // wait for it instead of failing.
+            std::unique_lock<std::mutex> lock(d.ledger);
+            while (n > d.budget - std::min(d.budget, d.live + d.lent)) {
+                if (!d.lent)
+                    throw std::runtime_error("Pixal3D GPU workspace exceeds memory budget");
+                d.returned.wait(lock);
+            }
+            d.live += n;
+        }
+        try {
+            GPU(gpuMalloc(&p, n));
+        } catch (...) {
+            d.live -= n;
+            throw;
+        }
         d.metrics.allocations++;
-        d.live += n;
         d.active += n;
-        d.peak = std::max(d.peak, d.live);
+        d.peak = std::max<size_t>(d.peak, d.live);
         d.peak_active = std::max(d.peak_active, d.active);
         d.largest_allocation = std::max(d.largest_allocation, n);
     }

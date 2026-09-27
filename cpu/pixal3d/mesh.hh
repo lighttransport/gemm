@@ -5,6 +5,8 @@
 namespace px {
 using Mesh = trellis2::Mesh;
 Mesh remesh(const Mesh &source, const trellis2::ClosestPointBVH &bvh, int resolution = 1024);
+// The same remesh through the plugin; false (after a note) to use the CPU.
+bool remesh_gpu(const GpuRemesh &gpu, const Mesh &source, int resolution, Mesh &out);
 void simplify(Mesh &mesh, int target);
 void fill_holes(Mesh &mesh);
 void vertex_normals(const Mesh &mesh, Vec &normals);

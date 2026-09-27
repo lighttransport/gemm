@@ -8,7 +8,7 @@ endif
 export TMPDIR := $(abspath ../../tmp/pixal3d)
 ARCH_CHECK_OBJECTS := $(addprefix $(TMPDIR)/pixal3d-gpu-,$(addsuffix .o,$(SUPPORTED_GPU_ARCHS)))
 all: libpixal3d_cuda.so
-libpixal3d_cuda.so: gpu.cu $(TMPDIR)/fa2.inc $(TMPDIR)/pixal3d-gpu-arch ../../common/pixal3d_gpu.inc ../../common/pixal3d_resident.inc ../../common/pixal3d_mma.inc ../../common/pixal3d_device.h | $(TMPDIR)
+libpixal3d_cuda.so: gpu.cu remesh.inc $(TMPDIR)/fa2.inc $(TMPDIR)/pixal3d-gpu-arch ../../common/pixal3d_gpu.inc ../../common/pixal3d_resident.inc ../../common/pixal3d_mma.inc ../../common/pixal3d_device.h | $(TMPDIR)
 	$(NVCC) -std=c++17 -O3 --fmad=false -arch=$(GPU_ARCH) -Xcompiler=-fPIC -shared $< -lcublas -lcublasLt -Xlinker -rpath -Xlinker $(CUDA_PATH)/lib64 -o $@.new
 	mv $@.new $@
 $(TMPDIR)/pixal3d-gpu-%.o: gpu.cu $(TMPDIR)/fa2.inc ../../common/pixal3d_gpu.inc ../../common/pixal3d_resident.inc ../../common/pixal3d_mma.inc ../../common/pixal3d_device.h | $(TMPDIR)

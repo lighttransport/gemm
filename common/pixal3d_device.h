@@ -57,4 +57,23 @@ struct px_device_metrics {
     double kernel_ms;
     uint64_t effective_budget_bytes, active_bytes, pooled_bytes, peak_active_bytes, largest_allocation_bytes;
 };
+/* Optional CUDA entry px_gpu_remesh: px::remesh (narrow-band UDF + dual
+ * contouring) on the GPU, giving the same mesh. It runs on its own stream,
+ * concurrently with the resident engine `gpu` (from px_gpu_create), and
+ * borrows from that engine's memory budget; the engine waits for the loan
+ * rather than fail. With gpu null it uses `device` and any free memory.
+ * Output arrays are malloc'd; on failure (including no budget left) it
+ * returns -1 with error set and the caller remeshes on the CPU. */
+struct px_remesh_request {
+    const float *vertices;
+    const int32_t *faces;
+    int num_vertices, num_faces, resolution, device;
+    void *gpu;
+};
+struct px_remesh_result {
+    float *vertices;
+    int32_t *faces;
+    int num_vertices, num_faces;
+    char error[256];
+};
 #endif

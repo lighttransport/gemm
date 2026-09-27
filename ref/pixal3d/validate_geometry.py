@@ -115,8 +115,29 @@ for scale in [.01,1.]:
     filled_ref=tuple(t.cpu().numpy() for t in upstream.read())
     assert tuple(map(len,filled))==tuple(map(len,filled_ref))
     surface_score('fill_holes_'+str(scale),filled,filled_ref,1024)
+# The plugin's GPU remesh must reproduce the CPU remesh exactly.
+plugin_path=ROOT.parent.parent/'cuda/pixal3d/libpixal3d_cuda.so'
+gpu_remesh=getattr(C.CDLL(str(plugin_path)),'px_gpu_remesh',None) if plugin_path.exists() else None
+class RemeshRequest(C.Structure):
+    _fields_=[('vertices',C.c_void_p),('faces',C.c_void_p),('num_vertices',C.c_int),('num_faces',C.c_int),
+              ('resolution',C.c_int),('device',C.c_int),('gpu',C.c_void_p)]
+class RemeshResult(C.Structure):
+    _fields_=[('vertices',C.POINTER(C.c_float)),('faces',C.POINTER(C.c_int32)),('num_vertices',C.c_int),
+              ('num_faces',C.c_int),('error',C.c_char*256)]
+def check_gpu_remesh(v,f,resolution,native):
+    if gpu_remesh is None:
+        return
+    v,f=np.ascontiguousarray(v,np.float32),np.ascontiguousarray(f,np.int32)
+    request=RemeshRequest(v.ctypes.data,f.ctypes.data,len(v),len(f),resolution,0,None);result=RemeshResult()
+    assert gpu_remesh(C.byref(request),C.byref(result))==0,result.error.decode()
+    gv=np.ctypeslib.as_array(result.vertices,shape=(result.num_vertices,3)).copy()
+    gf=np.ctypeslib.as_array(result.faces,shape=(result.num_faces,3)).copy()
+    C.CDLL(None).free(C.cast(result.vertices,C.c_void_p));C.CDLL(None).free(C.cast(result.faces,C.c_void_p))
+    assert np.array_equal(gv,native[0]) and np.array_equal(gf,native[1]),'GPU remesh differs from the CPU'
+    print(json.dumps(dict(test='gpu_remesh_'+str(resolution),faces=len(gf),identical=True)),flush=True)
 for resolution in [64,128]:
     native=native_mesh(v,f,resolution)
+    check_gpu_remesh(v,f,resolution,native)
     rv,rf=cumesh.remeshing.remesh_narrow_band_dc(torch.tensor(v,device='cuda'),torch.tensor(f,device='cuda'),
         torch.zeros(3,device='cuda'),(resolution+3)/resolution,resolution)
     reference=(rv.cpu().numpy(),rf.cpu().numpy())
