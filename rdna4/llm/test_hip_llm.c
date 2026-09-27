@@ -557,6 +557,50 @@ static int stdio_other_conversation(const unsigned char *prompt, size_t prompt_n
     return common <= longest + 4 * STDIO_OTHER_CONVERSATION_SLACK;
 }
 
+/* Publish a snapshot only if it fits without evicting anything, as the
+ * first candidate for later eviction.  Used for state kept from cancelled
+ * requests: useful to the retry that usually follows an interrupt, but not
+ * worth displacing a conversation that is still in progress. */
+static int stdio_snapshot_cache_publish_spare(stdio_snapshot_cache *cache,
+                                              const char *identity,
+                                              const int32_t *tokens, int n_tokens,
+                                              hip_llm_state_snapshot *snapshot,
+                                              const unsigned char *text, size_t text_n) {
+    if (!snapshot) return 0;
+    int is_shared = strcmp(identity, STDIO_SHARED_PREFIX_IDENTITY) == 0;
+    int free_slot = 0, same = -1, shared = 0;
+    for (int i = 0; cache->entries && i < cache->capacity; ++i) {
+        stdio_snapshot_entry *e = &cache->entries[i];
+        if (!e->snapshot) { free_slot = 1; continue; }
+        shared += e->shared;
+        if (e->n_tokens == n_tokens && strcmp(e->identity, identity) == 0 &&
+            memcmp(e->tokens, tokens, (size_t)n_tokens * sizeof(*tokens)) == 0)
+            same = i;
+    }
+    if (same >= 0) {                 /* already cached: keep the existing one */
+        hip_llm_free_state_snapshot(snapshot);
+        return 0;
+    }
+    size_t bytes = hip_llm_state_snapshot_bytes(snapshot) +
+                   (size_t)n_tokens * sizeof(*tokens) + strlen(identity) + 1 +
+                   (text ? text_n : 0);
+    if (!hip_llm_state_snapshot_is_portable(snapshot) || !free_slot ||
+        cache->bytes + bytes > cache->byte_limit ||
+        (is_shared && shared >= (cache->capacity + 1) / 2)) {
+        hip_llm_free_state_snapshot(snapshot);
+        return 0;
+    }
+    int rc = stdio_snapshot_cache_publish(cache, identity, tokens, n_tokens,
+                                          snapshot, text, text_n);
+    for (int i = 0; cache->entries && i < cache->capacity; ++i) {
+        stdio_snapshot_entry *e = &cache->entries[i];
+        if (e->snapshot && e->n_tokens == n_tokens && strcmp(e->identity, identity) == 0 &&
+            memcmp(e->tokens, tokens, (size_t)n_tokens * sizeof(*tokens)) == 0)
+            e->age = 0;
+    }
+    return rc;
+}
+
 /* DFlash2 hands decoding back to the target at this position: at 64K its
  * acceptance fell to 37% and speculation ran slower than the target alone.
  * LLM_QWEN35_DFLASH2_MAX_POS overrides it (0 disables DFlash2). */
@@ -1075,7 +1119,17 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
         double t_prefill1 = get_time_ms();
         if (g_stdio_cancel) cancelled = 1;
         if (cancelled) {
-            for (int i = 0; i < n_bounds; ++i) hip_llm_free_state_snapshot(pending_prefix_snaps[i]);
+            /* Shared prefixes completed before the cancel are exact state
+             * at their boundaries; keep them so the retry that usually
+             * follows an agent's interrupt does not prefill them again. */
+            for (int i = 0; i < n_bounds; ++i) {
+                if (!pending_prefix_snaps[i]) continue;
+                stdio_snapshot_cache_publish_spare(&snapshot_cache,
+                    stdio_shared_prefix_enabled() ? STDIO_SHARED_PREFIX_IDENTITY :
+                                                    cache_identity,
+                    tokens, prefix_bounds[i], pending_prefix_snaps[i], NULL, 0);
+                pending_prefix_snaps[i] = NULL;
+            }
             stdio_snapshot_cache_drop_resident(&snapshot_cache);
             hip_llm_reset_state(gpu);
             cache_n = 0;
@@ -1381,10 +1435,16 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
              * DFlash2 hand-off), the target must forward `next` here or the
              * following token is sampled from stale logits. */
             int plain_step = !use_mtp && !q35_rows;
-            if (plain_step)
+            if (plain_step) {
                 logits = hip_llm_forward_logits(gpu, next, cache_n - 1);
+                /* `next` is already in cache[]; ending the loop quietly
+                 * would publish a live state one token short. */
+                if (!logits) { mtp_error = 1; break; }
+            }
             double token_now = get_time_ms();
-            if (plain_step && q35_last_tick > 0.0) {
+            /* Sample plain speed only where speculation competes with it. */
+            if (plain_step && q35_handed_off && q35_last_tick > 0.0 &&
+                cache_n - 1 < dflash2_max_position()) {
                 /* Wall time per plain token, sampling included, so it
                  * compares with the speculative steps' wall rate. */
                 q35_plain_ms += token_now - q35_last_tick;
@@ -1425,6 +1485,11 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
             q35_position = -1;
             q35_logits = NULL;
         }
+        /* After a hand-off the draft never saw the plain-decoded positions;
+         * blank them so the next turn's draft does not attend stale rows. */
+        if (!cancelled && !mtp_error && q35_is_dflash && q35_dflash_fallback &&
+            hip_llm_qwen35_dflash2_clear_gap(gpu, cache_n))
+            fprintf(stderr, "llm_server: DFlash2 gap clear failed at %d\n", cache_n);
         if (mtp_error) {
             for (int i = 0; i < n_bounds; ++i) hip_llm_free_state_snapshot(pending_prefix_snaps[i]);
             hip_llm_free_state_snapshot(pending_prompt_snapshot);
@@ -1512,11 +1577,22 @@ static int run_stdio_server(hip_llm_runner *gpu, bpe_vocab *vocab,
             active_identity[0] = '\0';
         }
         if (cancelled) {
+            /* The live state may sit inside an uncommitted speculative
+             * window, so it is dropped; the boundary snapshots were taken
+             * before decoding and remain exact.  Publishing them lets the
+             * agent's retry or next message restore the prompt instead of
+             * prefilling the whole conversation again. */
             for (int i = 0; i < n_bounds; ++i) {
-                hip_llm_free_state_snapshot(pending_prefix_snaps[i]);
+                if (!pending_prefix_snaps[i]) continue;
+                stdio_snapshot_cache_publish_spare(&snapshot_cache,
+                    stdio_shared_prefix_enabled() ? STDIO_SHARED_PREFIX_IDENTITY :
+                                                    cache_identity,
+                    cache, prefix_bounds[i], pending_prefix_snaps[i], NULL, 0);
                 pending_prefix_snaps[i] = NULL;
             }
-            hip_llm_free_state_snapshot(pending_prompt_snapshot);
+            stdio_snapshot_cache_publish_spare(&snapshot_cache, cache_identity,
+                cache, n_tokens, pending_prompt_snapshot,
+                request_bytes, request_bytes_n);
             pending_prompt_snapshot = NULL;
             stdio_snapshot_cache_drop_resident(&snapshot_cache);
             hip_llm_reset_state(gpu);

@@ -25150,7 +25150,7 @@ static int hllm_q8_prefill_scratch(hip_llm_runner *r, size_t count) {
 
 int hip_llm_reserve_prefill_scratch(hip_llm_runner *r) {
     if (!r || !r->weights_loaded) return -1;
-    if (!r->fn_q8_attention_prefill_wmma && !r->requested_qwen35_native_q8_prefill) return 0;
+    if (!r->requested_qwen35_native_q8_prefill) return 0;
     int rows = r->batch_max > 0 ? r->batch_max : 1;
     if (rows > 4096) rows = 4096;
     return hllm_q8_prefill_scratch(r,
@@ -35230,7 +35230,7 @@ void hip_llm_free(hip_llm_runner *r) {
     if (r->d_router_counter) hipFree(r->d_router_counter);
     for (int i = 0; i < 2; ++i) {
         if (r->snap_stage[i]) hipHostFree(r->snap_stage[i]);
-        if (r->snap_stage_state > 0 && r->snap_stage_ready[i]) hipEventDestroy(r->snap_stage_ready[i]);
+        if (r->snap_stage_ready[i]) hipEventDestroy(r->snap_stage_ready[i]);
     }
     if (r->h_router_logits_pinned) hipHostFree(r->h_router_logits);
     else free(r->h_router_logits);

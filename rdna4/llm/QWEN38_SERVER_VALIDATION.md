@@ -1,5 +1,78 @@
 # Qwen3.8 server correctness and performance
 
+## Hardening for agent traffic: crashes, interrupts, protocol — 2026-09-27
+
+### Runner crashes
+
+A runner that died (GPU fault, OOM kill) used to leave the server returning
+"runner exited" until someone restarted it by hand.
+
+The next request now restarts it and waits for READY:
+- It retries once after 15 s if the first start raced the dead process's
+  VRAM release.
+- The context the new runner reports updates `/props`, trimming and error
+  messages before that request continues.
+- Stored system prefixes are warmed again in the background.
+
+Limits:
+- At most `QWEN38_MAX_RESTARTS` (default 3) restarts within 10 min; after
+  that the runner stays down and `/health` reports it.
+- A request whose runner dies before any token reached the client runs
+  again once on the restarted runner. Afterwards the client, which already
+  has partial output, gets the error.
+- A request that has killed the runner twice is refused without another
+  restart. Agents resend a failed request verbatim, and one such request
+  could otherwise use up the restart budget for everyone.
+
+Soak test, measured: Claude Code, Codex and pi fixed the stack library
+concurrently while the runner was killed with `kill -9` 120 s in. The next
+request restarted it. One in-flight Claude Code request that had already
+streamed text failed; Claude Code retried it. All three finished and passed
+an independent ASan oracle (429 s, 515 s, 472 s).
+
+### Interrupts
+
+On a cancel (client disconnect, an agent's Esc) the runner reset its state
+and discarded the snapshots it had just built. The retry that usually
+follows re-prefilled the whole prompt.
+
+Now the snapshots taken at complete boundaries (shared prefixes, the prompt
+boundary) are kept before the reset, with three conditions:
+- portable ones only;
+- only when they fit without evicting another entry;
+- marked first to evict.
+
+The first version published them like any other snapshot. In the DFlash2
+gate's two-entry cache, the cancelled request's snapshot evicted the
+conversation still in progress, and the A/B/A restore returned 0 cached
+tokens. A 15,316-token
+request interrupted at its first token, or mid-prefill, is retried with all
+15,316 tokens cached in 1.6 s. The prefill alone had taken 18 s.
+
+The live state itself is still dropped, since it may sit inside an
+uncommitted speculative window.
+
+### Protocol
+
+Chat Completions streams began with Responses-API events
+(`event: response.created`, `response.in_progress`). The OpenAI SDKs pass
+`response.*` events to chat clients as chunks without `choices`. Those
+events are now sent on `/v1/responses` only.
+
+### Review findings fixed (independent review of this and the previous commit)
+
+- After a DFlash2 hand-off, the draft's 2048-slot context ring kept stale
+  rows for the plain-decoded positions, and the next turn's prefill did not
+  rewrite them. They are now zeroed when the request ends.
+- The plain-decode rate that the hand-off compares against also counted
+  tokens past the 32K cut-off. It now samples only handed-off tokens below
+  it.
+- The prefill-scratch reservation was also made when native Q8 prefill was
+  off.
+- Staging events leaked if pinned-buffer setup failed partway.
+- A failed plain forward ended generation silently with a live state one
+  token short. It is now an error that resets the state.
+
 ## Faster agent traffic: kernel profile, adaptive DFlash2, two decode fixes — 2026-09-27
 
 Where the time went in the agent runs below: decode was 83% of GPU time, at

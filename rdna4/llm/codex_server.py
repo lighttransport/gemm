@@ -254,6 +254,9 @@ class Backend:
                             stderr=None, text=True, bufsize=1, env=runner_env)
         if os.name == "posix":
             popen_kwargs["start_new_session"] = True
+        self._spawn_args = (cmd, popen_kwargs)
+        self.restart_times = []
+        self.on_restart = None
         self.proc = subprocess.Popen(cmd, **popen_kwargs)
         self.lock = threading.Lock()
         self.request_gate = FairRequestGate()
@@ -295,6 +298,46 @@ class Backend:
         gate = getattr(self, "request_gate", None)
         if gate is not None:
             gate.close()
+        self._stop_proc()
+
+    def _restart_locked(self):
+        """Replace a runner that died (GPU fault, OOM kill) before a request.
+
+        Called with self.lock held.  At most QWEN38_MAX_RESTARTS (default 3)
+        restarts within ten minutes: a runner that keeps dying is left down
+        and /health reports it, rather than crash-looping on a bad GPU."""
+        status = self.proc.poll()
+        now = time.monotonic()
+        limit = int(os.environ.get("QWEN38_MAX_RESTARTS", "3"))
+        self.restart_times = [t for t in self.restart_times if now - t < 600.0]
+        if getattr(self, "_spawn_args", None) is None or len(self.restart_times) >= limit:
+            raise RuntimeError("runner exited")
+        self.restart_times.append(now)
+        sys.stderr.write(f"[runner] exited with status {status}; restarting "
+                         f"({len(self.restart_times)}/{limit} in 10 min)\n")
+        self._stop_proc()
+        cmd, popen_kwargs = self._spawn_args
+        # The dead process's VRAM is released asynchronously by the driver;
+        # a load that races it fails, so allow one delayed retry.
+        for attempt in range(2):
+            time.sleep(3.0 if attempt == 0 else 15.0)
+            self.ready = False
+            self.proc = subprocess.Popen(cmd, **popen_kwargs)
+            try:
+                self._wait_ready(float(os.environ.get("QWEN38_READY_TIMEOUT", "300")))
+                break
+            except RuntimeError as exc:
+                sys.stderr.write(f"[runner] restart attempt {attempt + 1} failed: {exc}\n")
+                self._stop_proc()
+        else:
+            raise RuntimeError("runner exited and could not be restarted")
+        sys.stderr.write("[runner] restarted\n")
+        if self.on_restart is not None:
+            # Runs before the request that triggered the restart continues;
+            # hooks start their own threads for slow work (prefix warm-up).
+            self.on_restart()
+
+    def _stop_proc(self):
         if self.proc.poll() is None:
             if os.name == "posix" and hasattr(self.proc, "pid"):
                 try:
@@ -314,6 +357,12 @@ class Backend:
             else:
                 self.proc.kill()
             self.proc.wait()
+        for pipe in (getattr(self.proc, "stdin", None), getattr(self.proc, "stdout", None)):
+            try:
+                if pipe is not None:
+                    pipe.close()
+            except (OSError, ValueError):
+                pass
 
     def _wait_ready(self, timeout=None):
         """Wait until the resident runner has loaded the model."""
@@ -407,6 +456,39 @@ class Backend:
             self.metrics_local = threading.local()
         self.metrics_local.value = value
 
+    def _transact(self, line, on_token):
+        """Send one request line and read until its OK/ERR result."""
+        # HIP libraries may print diagnostics on stdout. Consume those
+        # within the transaction: returning early leaves its OK queued
+        # and makes the next HTTP request receive the previous answer.
+        self.proc.stdin.write(line)
+        self.proc.stdin.flush()
+        while True:
+            raw = self.proc.stdout.readline()
+            if not raw:
+                raise RuntimeError("runner closed its response pipe")
+            result = raw.rstrip("\r\n")
+            if result.startswith("TOK "):
+                if on_token is not None:
+                    try:
+                        on_token(base64.b64decode(result[4:]).decode("utf-8", "replace"))
+                    except (ValueError, UnicodeError):
+                        sys.stderr.write("[runner diagnostic] malformed token frame\n")
+                continue
+            if result.startswith(("OK ", "ERR ")):
+                return result
+            sys.stderr.write("[runner diagnostic] " + result + "\n")
+
+    def _reap_if_dead(self):
+        """True when the runner process has exited (waits briefly for it)."""
+        try:
+            self.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            return False
+        except (AttributeError, TypeError):
+            return self.proc.poll() is not None
+        return True
+
     def generate(self, prompt, max_tokens, temperature, top_p, top_k, presence, repetition, min_p,
                  prefix="", cancellation=None, on_token=None, seed=None,
                  frequency=0.0, penalty_last_n=64, cache_key="shared",
@@ -442,45 +524,56 @@ class Backend:
             if ticket is None:
                 return "", 0, 0, 0, "cancelled"
             with self.lock:
-                if self.proc.poll() is not None:
-                    raise RuntimeError("runner exited")
-                # The constructor normally consumes READY; retain this check for
-                # tests and callers that construct Backend without __init__.
-                self._wait_ready()
-                with self.cancel_lock:
+                streamed = False
+
+                def forward_token(piece):
+                    nonlocal streamed
+                    streamed = True
+                    on_token(piece)
+
+                line_hash = hashlib.sha256(line.encode("utf-8")).hexdigest()
+                crashed = getattr(self, "crash_requests", None)
+                if crashed is None:
+                    crashed = self.crash_requests = {}
+                if crashed.get(line_hash, 0) >= 2:
+                    # Agents resend a failed request verbatim; one that has
+                    # killed the runner twice would otherwise use up the
+                    # restart budget and take the server down for everyone.
+                    raise RuntimeError("this request crashed the runner twice; not retrying")
+                for attempt in range(2):
                     if cancellation.is_set():
                         return "", 0, 0, 0, "cancelled"
-                    self.active_cancel = cancellation
-                    self.active_request_id = request_id
-                # Preserve the final empty field: an immediate EOS is a valid
-                # completion and the runner's OK line intentionally ends with an
-                # empty base64 payload in that case.
-                # HIP libraries may print diagnostics on stdout. Consume those
-                # within the transaction: returning early leaves its OK queued
-                # and makes the next HTTP request receive the previous answer.
-                try:
-                    self.proc.stdin.write(line)
-                    self.proc.stdin.flush()
-                    while True:
-                        raw = self.proc.stdout.readline()
-                        if not raw:
-                            raise RuntimeError("runner closed its response pipe")
-                        result = raw.rstrip("\r\n")
-                        if result.startswith("TOK "):
-                            if on_token is not None:
-                                try:
-                                    on_token(base64.b64decode(result[4:]).decode("utf-8", "replace"))
-                                except (ValueError, UnicodeError):
-                                    sys.stderr.write("[runner diagnostic] malformed token frame\n")
-                            continue
-                        if result.startswith(("OK ", "ERR ")):
-                            break
-                        sys.stderr.write("[runner diagnostic] " + result + "\n")
-                finally:
-                    # Clear ownership before another request can take self.lock.
+                    if self.proc.poll() is not None:
+                        self._restart_locked()
+                    # The constructor normally consumes READY; retain this check for
+                    # tests and callers that construct Backend without __init__.
+                    self._wait_ready()
                     with self.cancel_lock:
-                        self.active_cancel = None
-                        self.active_request_id = None
+                        if cancellation.is_set():
+                            return "", 0, 0, 0, "cancelled"
+                        self.active_cancel = cancellation
+                        self.active_request_id = request_id
+                    try:
+                        result = self._transact(line, forward_token if on_token else None)
+                        break
+                    except (OSError, RuntimeError) as exc:
+                        # The runner died under this request.  Before any
+                        # token reached the client the request can simply
+                        # run again on a restarted runner; afterwards the
+                        # client has partial output and gets the error.
+                        died = self._reap_if_dead()
+                        if died:
+                            crashed[line_hash] = crashed.get(line_hash, 0) + 1
+                            if len(crashed) > 64:
+                                crashed.pop(next(iter(crashed)))
+                        if attempt or streamed or not died:
+                            raise
+                        sys.stderr.write(f"[runner] died during a request ({exc}); retrying\n")
+                    finally:
+                        # Clear ownership before another request can take self.lock.
+                        with self.cancel_lock:
+                            self.active_cancel = None
+                            self.active_request_id = None
         finally:
             self.request_gate.release(ticket)
             if not request_registered:
@@ -1004,7 +1097,10 @@ class Handler(BaseHTTPRequestHandler):
                             stream_response_id, self.model, 0, 0)
                         self.wfile.write(("event: " + event + "\ndata: " +
                                           json.dumps(payload) + "\n\n").encode())
-                    else:
+                    elif api_path == "/v1/responses":
+                        # Chat Completions streams carry only chunks: the
+                        # OpenAI SDKs hand `response.*` events to chat
+                        # clients as chunks without `choices`.
                         for sequence_number, event in enumerate(("response.created", "response.in_progress")):
                             payload = {"type": event, "response": stream_base,
                                        "sequence_number": sequence_number}
@@ -1320,25 +1416,37 @@ def main():
         raise
     signal.signal(signal.SIGTERM, _handle_sigterm)
     print(f"OpenAI-compatible API: http://{args.host}:{args.port}/v1", flush=True)
+    def update_context():
+        # A runner restarted while the old one's VRAM was still being
+        # released may have clamped to a smaller context.
+        allocated = getattr(Handler.backend, "max_seq_len", None) or args.context
+        if min(args.context, allocated) != Handler.context:
+            sys.stderr.write(f"[runner] context now {min(args.context, allocated)} tokens "
+                             f"(was {Handler.context})\n")
+            Handler.context = min(args.context, allocated)
+
+    Handler.backend.on_restart = update_context
     if args.prefix_store:
         Handler.prefix_store = PrefixStore(args.prefix_store)
-        stored = Handler.prefix_store.warmup_list()[:max(0, args.prefix_warmup)]
-        if stored:
-            def warmup():
-                # Queued like ordinary requests: an agent request that
-                # arrives meanwhile waits only for the item in progress.
-                for boundaries in stored:
-                    start = time.monotonic()
-                    try:
-                        _, cached, tokens, _, _ = Handler.backend.generate(
-                            boundaries[-1], 0, 0.0, 0.95, 20, 0.0, 1.0, 0.0,
-                            prefix=boundaries, cache_key="prefix-warmup")
-                        sys.stderr.write(f"[warmup] prefix {tokens} tokens "
-                                         f"({tokens - cached} prefilled) in "
-                                         f"{time.monotonic() - start:.1f}s\n")
-                    except Exception as exc:  # warm-up is best effort
-                        sys.stderr.write(f"[warmup] failed: {exc}\n")
-            threading.Thread(target=warmup, daemon=True).start()
+
+        def warmup():
+            # Queued like ordinary requests: an agent request that arrives
+            # meanwhile waits only for the item in progress.
+            for boundaries in Handler.prefix_store.warmup_list()[:max(0, args.prefix_warmup)]:
+                start = time.monotonic()
+                try:
+                    _, cached, tokens, _, _ = Handler.backend.generate(
+                        boundaries[-1], 0, 0.0, 0.95, 20, 0.0, 1.0, 0.0,
+                        prefix=boundaries, cache_key="prefix-warmup")
+                    sys.stderr.write(f"[warmup] prefix {tokens} tokens "
+                                     f"({tokens - cached} prefilled) in "
+                                     f"{time.monotonic() - start:.1f}s\n")
+                except Exception as exc:  # warm-up is best effort
+                    sys.stderr.write(f"[warmup] failed: {exc}\n")
+        # A restarted runner has lost its shared prefixes as well.
+        Handler.backend.on_restart = lambda: (
+            update_context(), threading.Thread(target=warmup, daemon=True).start())
+        threading.Thread(target=warmup, daemon=True).start()
     try: server.serve_forever()
     except KeyboardInterrupt: pass
     finally:

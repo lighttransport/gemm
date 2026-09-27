@@ -251,6 +251,110 @@ class ProtocolTest(unittest.TestCase):
             backend._wait_ready()
         self.assertTrue(backend.ready)
 
+    def test_dead_runner_is_restarted_before_the_next_request(self):
+        answer = base64.b64encode(b"hi").decode()
+
+        class FakeProc:
+            def __init__(self, out, status=None):
+                self.stdin, self.stdout, self.status = io.StringIO(), io.StringIO(out), status
+                self.pid = 0
+            def poll(self):
+                return self.status
+            def wait(self, timeout=None):
+                return self.status
+
+        backend = Backend.__new__(Backend)
+        backend.ready = True
+        backend.lock = threading.Lock()
+        backend.cancel_lock = threading.Lock()
+        backend.proc = FakeProc("", status=-9)
+        backend._spawn_args = (["runner"], {})
+        backend.restart_times = []
+        restarted = threading.Event()
+        backend.on_restart = restarted.set
+        spawned = FakeProc(f"READY max_seq_len=4096\nOK 0 5 1 stop {answer} 1 1\n")
+        with patch("codex_server.subprocess.Popen", return_value=spawned), \
+             patch("codex_server.time.sleep"), patch("codex_server.os.killpg"), \
+             patch("codex_server.sys.stderr"):
+            text = backend.generate("prompt", 4, 0.0, 1.0, 1, 0.0, 1.0, 0.0)[0]
+        self.assertEqual(text, "hi")
+        self.assertIs(backend.proc, spawned)
+        self.assertTrue(restarted.is_set())
+        # A runner that keeps dying is left down instead of crash-looping.
+        backend.restart_times = [time.monotonic()] * 3
+        backend.proc = FakeProc("", status=-9)
+        with patch("codex_server.os.killpg"), self.assertRaisesRegex(RuntimeError, "runner exited"):
+            backend.generate("prompt", 4, 0.0, 1.0, 1, 0.0, 1.0, 0.0)
+
+    def test_request_is_retried_when_the_runner_dies_before_output(self):
+        answer = base64.b64encode(b"again").decode()
+
+        class FakeProc:
+            def __init__(self, out, status=None):
+                self.stdin, self.stdout, self.status = io.StringIO(), io.StringIO(out), status
+                self.pid = 0
+            def poll(self):
+                return self.status
+            def wait(self, timeout=None):
+                return self.status
+
+        backend = Backend.__new__(Backend)
+        backend.ready = True
+        backend.lock = threading.Lock()
+        backend.cancel_lock = threading.Lock()
+        backend.proc = FakeProc("", status=None)      # alive, then its pipe closes
+        backend._spawn_args = (["runner"], {})
+        backend.restart_times = []
+        backend.on_restart = None
+
+        def dies():
+            backend.proc.status = -11
+            return ""
+        backend.proc.stdout.readline = dies
+        spawned = FakeProc(f"READY\nOK 0 5 1 stop {answer} 1 1\n")
+        with patch("codex_server.subprocess.Popen", return_value=spawned), \
+             patch("codex_server.time.sleep"), patch("codex_server.os.killpg"), \
+             patch("codex_server.sys.stderr"):
+            text = backend.generate("prompt", 4, 0.0, 1.0, 1, 0.0, 1.0, 0.0)[0]
+        self.assertEqual(text, "again")
+
+    def test_a_request_that_keeps_crashing_the_runner_is_refused(self):
+        class DyingProc:
+            def __init__(self, *args, **kwargs):
+                self.stdin, self.stdout, self.status, self.pid = io.StringIO(), io.StringIO("READY\n"), None, 0
+            def poll(self):
+                return self.status
+            def wait(self, timeout=None):
+                return self.status
+
+        backend = Backend.__new__(Backend)
+        backend.ready = True
+        backend.lock = threading.Lock()
+        backend.cancel_lock = threading.Lock()
+        backend.proc = DyingProc()
+        backend._spawn_args = (["runner"], {})
+        backend.restart_times = []
+        backend.on_restart = None
+        spawned = []
+
+        def spawn(*args, **kwargs):
+            proc = DyingProc()
+            proc.stdout.readline = lambda p=proc: ("READY\n" if not backend.ready else
+                                                   (setattr(p, "status", -11) or ""))
+            spawned.append(proc)
+            return proc
+        backend.proc.stdout.readline = lambda: (setattr(backend.proc, "status", -11) or "")
+        with patch("codex_server.subprocess.Popen", side_effect=spawn), \
+             patch("codex_server.time.sleep"), patch("codex_server.os.killpg"), \
+             patch("codex_server.sys.stderr"), patch.dict(os.environ, {"QWEN38_MAX_RESTARTS": "9"}):
+            for _ in range(2):
+                with self.assertRaises(RuntimeError):
+                    backend.generate("boom", 4, 0.0, 1.0, 1, 0.0, 1.0, 0.0)
+            before = len(spawned)
+            with self.assertRaisesRegex(RuntimeError, "crashed the runner twice"):
+                backend.generate("boom", 4, 0.0, 1.0, 1, 0.0, 1.0, 0.0)
+            self.assertEqual(len(spawned), before)
+
     def test_startup_reads_the_allocated_context(self):
         backend = Backend.__new__(Backend)
         backend.ready = False

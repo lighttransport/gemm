@@ -873,6 +873,31 @@ int hip_llm_qwen35_dflash2_synced(hip_llm_runner *r, int position) {
     return d && d->kv_end == position;
 }
 
+int hip_llm_qwen35_dflash2_clear_gap(hip_llm_runner *r, int position) {
+    hllm_qwen35_dflash2 *d = r ? r->qwen35_dflash2 : NULL;
+    if (!d || position < d->kv_end) return -1;
+    if (d->inject_pending && hllm_dflash_overlap_wait(r, d)) return -1;
+    /* Positions the target decoded without the draft would otherwise keep
+     * stale ring rows from older positions.  Zero keys score uniformly and
+     * zero values add nothing; only the last window is ever read. */
+    int start = d->kv_end > position - HLLM_DFLASH_WINDOW ?
+                d->kv_end : position - HLLM_DFLASH_WINDOW;
+    size_t row = (size_t)HLLM_DFLASH_KV_HEADS * HLLM_DFLASH_HEAD_DIM * sizeof(float);
+    for (int p = start; p < position; ) {
+        int slot = p % HLLM_DFLASH_WINDOW;
+        int n = HLLM_DFLASH_WINDOW - slot;
+        if (n > position - p) n = position - p;
+        for (int l = 0; l < HLLM_DFLASH_LAYERS; ++l)
+            if (hipMemsetAsync((char *)d->layers[l].key_cache + (size_t)slot * row, 0,
+                               (size_t)n * row, r->stream) != hipSuccess ||
+                hipMemsetAsync((char *)d->layers[l].value_cache + (size_t)slot * row, 0,
+                               (size_t)n * row, r->stream) != hipSuccess) return -1;
+        p += n;
+    }
+    d->kv_end = position;
+    return 0;
+}
+
 int hip_llm_qwen35_dflash2_propose(hip_llm_runner *r, int32_t anchor,
         int position, int count, int32_t *drafts) {
     hllm_qwen35_dflash2 *d = r ? r->qwen35_dflash2 : NULL;

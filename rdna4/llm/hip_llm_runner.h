@@ -201,6 +201,9 @@ int hip_llm_qwen35_dflash2_load(hip_llm_runner *r, const char *path,
 /* True when the draft's context ends at `position`, so a proposal there is
  * valid.  Plain target decoding does not extend it; the next prefill does. */
 int hip_llm_qwen35_dflash2_synced(hip_llm_runner *r, int position);
+/* After the target decoded [draft end, position) alone, blank those rows
+ * of the draft's context window and mark it current at `position`. */
+int hip_llm_qwen35_dflash2_clear_gap(hip_llm_runner *r, int position);
 int hip_llm_qwen35_dflash2_propose(hip_llm_runner *r, int32_t anchor,
                                   int position, int count, int32_t *drafts);
 int hip_llm_qwen35_dflash2_commit(hip_llm_runner *r, int position,
