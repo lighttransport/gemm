@@ -128,6 +128,13 @@ tok/s** with the same 32-token hash `b9f867f533408c06`. An independent
 11-token prompt with 16 forced decode tokens also matched its baseline hash
 `fab0d2285407b753` and measured 7.49/7.61 versus 6.86/7.29 tok/s.
 
+With the vectorized F16 path, `LLM_QWEN4_EXACT_GPU_TOPK=1` and
+`LLM_QWEN4_EXACT_PRE_GRAPHS=1` raised the same 1K run to **7.81 prefill /
+6.97 decode tok/s**, retaining its hash; 47 prefix graphs captured. A
+nonblocking Q2 cache-promotion experiment kept the 32-token hash but did not
+improve the short run and lowered cache hits, so the required promotion wait
+remains in place.
+
 Combining exact GPU router top-k, 47 captured prefix graphs, and WMMA decode
 also preserved the 1K sequence hash. That run measured **7.29 prefill tok/s**
 and **6.47 decode tok/s**. The gain is small enough to leave these diagnostic
