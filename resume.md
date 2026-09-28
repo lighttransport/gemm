@@ -1,4 +1,4 @@
-# Resume: GLM-5.3-Flash A64FX kernel efficiency + QLAIR accuracy (updated 2026-09-28 13:31)
+# Resume: GLM-5.3-Flash A64FX kernel efficiency + QLAIR accuracy (updated 2026-09-28 21:30)
 
 ## Goal
 Run GLM-5.3-Flash (GLM53F) efficiently on A64FX. Targets:
@@ -215,6 +215,30 @@ All the new simulator switches are diagnostic and default off, so default QLAIR 
   about 52k; pipe completion counts are unchanged. This supports data wait,
   not extra L1 pipe work, as the source of the HBM increment.
 
+## Session 2026-09-28 18:00–21:30 (job 51969492, 4 nodes: rank 1 = quiet HW node via `hwrun.sh`, ranks 2–3 free)
+
+Picked up the uncommitted work of a previous 4-node session. The whole Q5 variant set, the atomics rewrite and the `pfimm16k` kernel are committed.
+
+**Bugs fixed (both silently broke native-vs-sim comparisons):**
+- **QLAIR decoded PRFUM as LDUR x<prfop>** (clair 3ff111d4). `prfum pldl2keep` loaded into x2, so `gk_q8_0r16_v3pf*` failed verify under QLAIR only. It is now a hint, with a unit test. No gate or HBM case used PRFUM.
+- **`qsys()` lacked SVE clobbers** (clair 2d11a55c). Linux zeroes P and truncates Z on `svc`, so a predicate live across the PMU ioctl made native SVE loads all-false. `bench.c` roofs are unaffected (checked).
+
+**Other session work, recovered and committed:**
+- Q5_KP16 v4pf (fifth bit merged: +2–3%) and Q5_KB16 (byte-expanded: 1.6× on 1 core, −15% at 48T because bandwidth-bound). Keep the compact format.
+- QLAIR atomics as locked read-modify-writes. The exact count holds under functional and legacy modes (`probes/atomic_spin.c`); the event backend still rejects atomics. This is also an open N0.5 item of the Nagare plan.
+
+**HBM/L2 stream calibration probe `sprobe/`** (clair STATUS "HBM/L2 stream calibration"):
+- Native direct streams are demand-driven: about 10.5 L1 misses in flight, 156-cycle sequential vs 255-cycle random latency, and no hardware prefetch.
+- The event backend is prefetch-driven and 40–47% fast on HBM streams.
+- HBM latency 238 fixes random misses (−1.4%). No distance/latency pair fixes streams.
+- Handed off to the **Nagare** engine effort (`a64fx-new-sim-plan.md`, another session). Don't keep fitting event-backend HBM knobs.
+- Also found: store→load forwarding costs about 19 cycles natively (sim matches), and sim scalar random-load MLP looks too high.
+
+**Prefill GEMM (native):**
+- **Pad the output row stride** (`gemm.c P`): 48T sb256 58.9 → **64.1%** (15.7 TOPS), sb128 58.8%, sb32 41.5%. With ldy = 3072, output tiles fold onto 4 L1 sets. Integration rule: keep `(ldy*4/256) % 64` away from multiples of 16.
+- **CMG-token mode** (`gemm.c t`) runs per-rank shapes (2304 × 4096) at 60.4%.
+- **The 504-token chunk stays at ~50% in every variant tried** (token blocks, K chunks). Output tiles cycle through L2: L1-miss latency 37 → 88.
+
 ## Production integration plan (not started; needs the real model on 12 nodes)
 
 - **Where Q8_0R is used:**
@@ -232,19 +256,20 @@ All the new simulator switches are diagnostic and default off, so default QLAIR 
 
 ## Next steps (priority)
 1. **Simulator.**
-   - Isolate demand versus prefetched HBM-line latency and memory-level parallelism. The matched 64-row ROT=1 versus ROT=32 control now pins the incremental HBM underprediction at 33,985 cycles, close to the 34,762-cycle L2-miss-wait difference; use this pair and the row sweep as gates. The diagnostic L2 prefetch distance 20 → 4 only moved the 16-row simulation by +9.4% and stays off.
-   - Design a load-result rename lifetime probe without the 144-cycle FMUL head masking release delay or FADD/LD pipe-use differences. Keep `FP_HOLD_LOAD=4` diagnostic until it is supported directly.
-   - Then the K-quant unpack-op residual: q4k_v0/q5k_v0 insensitive to every switch.
-   - Then the dependent base-ADD rule (ld8u6 −7.6%).
-   - Then the sim random-miss latency (wprobe 455 vs 290).
-   - The acceptance set is `/local`-independent: `measurements/hw-20260927b/eval_probes.sh` plus the kernel gate (`run_sim.sh out/bench-c13 <cases-acc2 with S=3> event ...`, then `compare.py --native measurements/hw-20260927b/acc2-native.log`).
+   - Memory model: the Nagare engine owns it now. Feed it `sprobe` cells0 (native direct streams, random, L2) plus the PMU groups. The event backend's candidate `HBM_LATENCY=238` is physically backed but not promoted.
+   - Event core: scalar random-load MLP (LCG `ldr` loop: 11 sim vs 29 native cycles/iter; `/local/stf3.*` repro described in STATUS). Then the K-quant unpack residual and the ld8u6 base-ADD rule.
+   - Keep `FP_HOLD_LOAD=4` diagnostic until a direct lifetime probe supports it.
+   - Acceptance: `measurements/hw-20260927b/eval_probes.sh`, the kernel gate (`compare.py`), and `sprobe/cellcmp.py`.
 2. **Decode.** Integrate panel kernels, repack at load and use flag or hardware barriers into the production runner (`glm53f_iq_bridge.c`, `glm53f_target_decode_12n.c`). Validate on 12 nodes: `build_glm53f_integrated_12n.sh check` bit-identical, then a tok/s A/B. Check production weight page placement: the 2 MiB page effect.
-3. **Prefill.** Explain the multi-core GEMM drop (per-core PMU at 12 threads). Consider W8A8 per-channel behind the quality gate.
+3. **Prefill.** Fix the 504-token loop nest: keep a token block's output tiles in L1 without re-streaming weights from HBM (per-CMG token blocks sized so the CMG weight replica stays L2-resident, or packed f32 scratch). Test the L2-capacity hypothesis first: weights plus the 2 MiB of activations compete in the 8 MiB L2. Integrate with the padded output stride. W8A8 per-channel remains a gated lossy option.
 4. Re-run the qwen38 nine-case event gate; its static cross ELF is off-node.
 
 ## Gotchas
 - **XOS paging:** export `XOS_MMM_L_PAGING_POLICY=demand:demand:demand` (`hwexec.sh` does).
-- **No cross-thread atomics under QLAIR.** Harnesses skip spin barriers when CNTFRQ == 2e9.
+- **Atomics under QLAIR:** they work in functional and legacy modes since d00b417c, but the event backend rejects them. Harnesses still skip spin barriers when CNTFRQ == 2e9.
+- **SVE and syscalls:** any inline `svc` must clobber z0–z31/p0–p15 (`qsys.h`), or native SVE state is silently lost.
+- **Run each sim ELF once with verify=1** (`run_sim.sh` now fails on a bad verify). The PRFUM bug hid behind verify=0.
+- **zsh:** `set -- $c` does not word-split. Use `${=c}` or bash scripts.
 - **Import allowlist:** keep `make check-imports` clean (`allowlist.txt`).
 - **The clang driver is slow here** (about 2 minutes per link). Don't wrap `make` in a short `timeout`: a killed make leaves stale binaries.
 - **Z-register spills** (`objdump | grep 'str z'`): use asm for 24-accumulator tiles.
