@@ -134,6 +134,7 @@ Speed on an RTX 5060 Ti (16 GB, sm_120), with the GPU shared with another busy p
 
 ```
 hf download Qwen/Qwen3-TTS-12Hz-1.7B-Base --local-dir /mnt/nvme01/models/speech/Qwen3-TTS-12Hz-1.7B-Base
+hf download Qwen/Qwen3-TTS-12Hz-0.6B-Base --local-dir /mnt/nvme01/models/speech/Qwen3-TTS-12Hz-0.6B-Base
 speech/build/qwen3_tts_cuda --backend cuda --model <Base dir> --ref-wav ref.wav \
     --ref-text "参照音声の書き起こし" --text "合成したい文" --out out.wav      # in-context (ICL)
 speech/build/qwen3_tts_cuda ... --ref-wav ref.wav --xvec-only ...                  # speaker embedding only
@@ -175,9 +176,19 @@ The reference wav can be at any sample rate; it is resampled to 24 kHz. Both mod
 | Output | Speaker similarity to the reference | Kana CER |
 |---|---|---|
 | another recording of the same JSUT speaker (ceiling) | 0.744 | — |
-| **clone, ICL** | **0.634** | 0.4% |
-| clone, x-vector only | 0.575 | 1.3% |
+| **clone, ICL, 1.7B** | **0.634** | 0.4% |
+| clone, x-vector only, 1.7B | 0.575 | 1.3% |
+| **clone, ICL, 0.6B** | **0.654** | 2.6% |
+| clone, x-vector only, 0.6B | 0.605 | 2.5% |
 | CustomVoice Ono_Anna (a different speaker) | 0.239 | 3.6% |
+
+**0.6B Base.** Both sizes use the same code. For 0.6B, the hidden size, the 1024-d speaker embedding and the absence of a projection from the talker to the code predictor are all read from the checkpoint. On the same checks the 0.6B model gives:
+- identical greedy codes on the CUDA and CPU backends in ICL mode (39 frames), and on CUDA in x-vector mode (24 frames);
+- identical reference codes;
+- speaker-embedding cos 1.0;
+- waveform SNR 100.5 dB (ICL, CUDA), 99.7 dB (ICL, CPU) and 112.1 dB (x-vector).
+
+Its talker RTF on CUDA is about 0.2.
 
 `speech/build/tts_ja_cuda --text "…" --out out.wav --aux aux.json` runs the whole pipeline: text → Qwen3-TTS (CUDA) → ja_align (CPU) → wav plus `aux.json`.
 
