@@ -20,7 +20,7 @@ SOURCES = ("ryzen/vhuman_deformer.c", "ryzen/lightrig_mlp2.c", "ryzen/gemm_avx2.
 
 
 def write_package(path, rig_def: dict, rest: np.ndarray, shapes: dict, joints: np.ndarray, weights: np.ndarray,
-                  ml=None) -> dict:
+                  ml=None, contacts_viz: dict | None = None) -> dict:
     R = rigdef.Rig(rig_def)
     C, I, J = len(R.controls), len(R.inputs), R.J
     jm = np.zeros((J * 6, I), np.float32)
@@ -47,6 +47,9 @@ def write_package(path, rig_def: dict, rest: np.ndarray, shapes: dict, joints: n
                   "output.mean", "output.scale"):
             t[f"ml.{k}"] = ml.m[k]
     t["morph"] = np.stack(morph).astype(np.float32)
+    if contacts_viz:
+        from . import contacts
+        t.update(contacts.tensors(contacts_viz, rest))
     meta = {"format": "vhuman-rig-deformer", "version": "1", "controls": json.dumps(R.controls),
             "morphs": json.dumps(names + (ml.target_names() if ml is not None else [])),
             "units": "metres; head frame +Y up, face +Z"}
@@ -78,6 +81,8 @@ class Native:
         fp = ctypes.POINTER(ctypes.c_float)
         L.vh_deformer_eval.argtypes = [ctypes.c_void_p, fp, ctypes.c_int, fp]
         L.vh_deformer_weights.argtypes = [ctypes.c_void_p, fp, fp]
+        L.vh_deformer_set_contact_iterations.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        L.vh_deformer_has_contacts.argtypes = [ctypes.c_void_p]
         L.vh_deformer_batch_scratch.restype = ctypes.c_size_t
         L.vh_deformer_batch_scratch.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
         L.vh_deformer_eval_batch.argtypes = [ctypes.c_void_p, fp, ctypes.c_size_t, ctypes.c_int, fp, fp]
@@ -85,12 +90,16 @@ class Native:
         if not self.h:
             raise ValueError(f"cannot load {package}")
         self.C = L.vh_deformer_controls(self.h)
+        self.has_contacts = bool(L.vh_deformer_has_contacts(self.h))
         self.V = L.vh_deformer_vertices(self.h)
         self.M = L.vh_deformer_morphs(self.h)
 
     @staticmethod
     def _p(a):
         return a.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+
+    def set_contact_iterations(self, n: int):
+        self.lib.vh_deformer_set_contact_iterations(self.h, int(n))
 
     def eval(self, controls: np.ndarray, use_ml: bool = True) -> np.ndarray:
         x = np.ascontiguousarray(controls, np.float32)

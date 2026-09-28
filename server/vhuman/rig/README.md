@@ -76,11 +76,13 @@ viewer and native C:
    without, single-threaded. Parity with numpy
    is ≈1e-7 m (`test_rig`, via ctypes).
 4. **GPU runtimes**: `cuda/vhuman/` (cuew + NVRTC) and `vulkan/vhuman/`
-   (vkew + glslc SPIR-V). The host prepares the rig state, and one kernel or
-   shader blends morphs (register-tiled over 8 frames) and skins. Both
-   equal the CPU result (`test_rig`). On an RTX 5060 Ti, 1024-frame batches
-   take 2–6 µs/frame (CUDA kernel) and 8–12 µs/frame (Vulkan
-   submit-to-completion).
+   (vkew + glslc SPIR-V). The host prepares the rig state (the MLP batched as
+   two `sgemm_avx2` calls). One kernel or shader blends morphs
+   (register-tiled over 8 frames) and skins, and a second one projects the
+   contacts. Both equal the CPU result (`test_rig`). Idle RTX 5060 Ti,
+   1024-frame batches, 149 morphs: CUDA 2.2 µs/frame deform, 6.7 µs/frame
+   with exact contacts; Vulkan 2.9 and 7.8 µs/frame (submit to completion).
+   Host preparation takes 4.5 µs/frame.
 
 Contacts (ground truth, the viewer's heat map and `viz.json`): lid vertices vs
 the eyeballs, lip/vestibule vertices vs sphere sets (per-tooth spheres on the
@@ -110,6 +112,30 @@ network still adds a few crossings, about 0.4 vertices per sample and
 mostly shallow. For example, tongueOut with the jaw at 0.6 goes from 59
 tongue + 19 teeth contacts to 0 + 2, but leaves 48 lip-pair vertices up to
 0.5 mm.
+
+### Exact contacts (post-skinning projection)
+
+`contacts.py` defines a projection that runs after skinning in every runtime:
+numpy, C (`vh_deformer_eval`, on by default, `vh_deformer_set_contact_iterations`),
+CUDA and Vulkan (a second kernel/shader, one workgroup per frame), and the
+web viewer ("exact contacts"). Per frame, up to 4 iterations, each ending the
+loop early if it moves nothing:
+1. lid vertices go outside their eyeball;
+2. upper/lower lip pairs separate along the head/jaw up axis;
+3. lip/vestibule vertices go outside tooth and tongue spheres (per vertex,
+   repeated passes: overlapping spheres push into each other).
+
+The displacement is then smoothed over the contact vertices' mesh graph (2
+Jacobi steps) so neighbours follow, and the projection runs once more. The
+thresholds are the training contacts' (rest-relative), shipped in the package
+(`contact.*`) and `viz.json`. On 200 random poses: 703 eye, 720 sphere and 65
+lip penetrations → 0, 0, 0. C equals numpy within 1e-5 m (float32), and
+CUDA/Vulkan equal C within 2e-8 m.
+
+The viewer evaluates the ~1.1k contact vertices on the CPU (three.js
+`getVertexPosition`), projects them, maps each correction back before skinning
+(inverse blended rotation) and feeds it through a `contactOffset` attribute
+that the materials add right after the morph targets (~15 ms per update in JS).
 
 ## Inspection (web viewer)
 
@@ -184,8 +210,9 @@ Names are our own; the 51 expression controls are the LightRig canonical
 - vchar shows joint-driven controls only through animations (the ROM).
 - The ML deformer corrects sub-millimetre contacts and soft-tissue
   shearing; it cannot add expression detail the procedural shapes lack.
-  Tongue contacts are about halved on unseen controls (the solver removes all
-  of them), and the network's own correction adds a few shallow lip crossings.
-  A post-skinning contact projection would make both exact, but it is not
-  possible in the web viewer's GPU skinning. The native runtime covers the welded head; teeth, tongue and eyes are
+  The ML deformer alone halves tongue contacts on unseen controls and adds a
+  few shallow lip crossings; the post-skinning projection makes all modelled
+  contacts exact. Contacts are only the modelled ones (eyeballs, tooth and
+  tongue spheres, lip pairs); sphere proxies are coarser than the teeth and
+  tongue meshes. USD/vchar playback has no projection (it evaluates UsdSkel). The native runtime covers the welded head; teeth, tongue and eyes are
   rigid or simply skinned in the exports.

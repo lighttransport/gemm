@@ -101,10 +101,15 @@ def write(asset, out_path) -> dict:
         tnames = []
         if part.shapes:
             prim["targets"] = []
+            # glTF: every target of a primitive has the same attributes; targets
+            # without normal deltas get an empty (all-zero) sparse NORMAL
+            with_normals = any(dn is not None for _, _, dn in part.shapes.values())
             for name, (idx, d, dn) in part.shapes.items():
                 t = {"POSITION": b.sparse_vec3(len(part.positions), idx, d)}
                 if dn is not None:
                     t["NORMAL"] = b.sparse_vec3(len(part.positions), idx, dn)
+                elif with_normals:
+                    t["NORMAL"] = b.sparse_vec3(len(part.positions), np.zeros(0, np.int64), np.zeros((0, 3)))
                 prim["targets"].append(t)
                 tnames.append(name)
         mesh = {"name": part.name, "primitives": [prim]}

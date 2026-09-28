@@ -105,6 +105,7 @@ a.dl{color:var(--accent);margin-right:12px;font-size:13px;display:inline-block}
       <label><input type="checkbox" id="wire"> wireframe</label>
       <label><input type="checkbox" id="bones"> skeleton</label>
       <label title="learned corrective deformer (contacts with eyeballs, teeth and lips; soft-tissue relaxation)"><input type="checkbox" id="ml" checked> ML deformer</label>
+      <label title="post-skinning contact projection: lids outside the eyeballs, lips outside teeth and tongue, upper lip above the lower (exact)"><input type="checkbox" id="exact" checked> exact contacts</label>
       <label title="random blinks"><input type="checkbox" id="auto-blink" checked> auto blink</label>
       <label title="eyes (and a little of the head) follow the pointer over the viewer"><input type="checkbox" id="look-at"> look at pointer</label>
       <label>exposure <input type="range" id="exposure" min="0.3" max="2.5" step="0.05" value="1" style="width:100px"></label>
@@ -376,6 +377,7 @@ function applyRig() {
     for (const [name, i] of Object.entries(dict)) mesh.morphTargetInfluences[i] = ev.weights[name] || 0;
   }
   dirty = true;
+  if (state.exact) projectContacts();
   if (typeof updateHeat === 'function' && $('viz').value !== 'shaded') updateHeat(false);
   if (typeof updateJointMarkers === 'function' && $('joints').checked) { state.model.updateMatrixWorld(true); updateJointMarkers(); }
 }
@@ -399,7 +401,10 @@ function setHeatMaterials(on) {
         const n = m.geometry.attributes.position.count;
         m.geometry.setAttribute('color', new THREE.BufferAttribute(new Float32Array(n * 3).fill(0.55), 3));
       }
-      if (!m.userData.heatMat) m.userData.heatMat = new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide });
+      if (!m.userData.heatMat) {
+        m.userData.heatMat = new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide });
+        if (m.geometry.attributes.contactOffset) patchMaterial(m.userData.heatMat);
+      }
       m.material = m.userData.heatMat;
       m.material.wireframe = $('wire').checked;
     } else if (viz.originals.has(m)) {
@@ -469,6 +474,7 @@ function contactDepths(ct) {   // per welded vertex, penetration depth (mm) for 
     const vm = state.vizData.parts[name].vmap, p = deformedPositions(m);
     for (let i = 0; i < vm.length; i++) for (let c = 0; c < 3; c++) pos[3 * vm[i] + c] = p[3 * i + c];
   }
+  if (state.exact) for (const [w, d] of state.exact.delta) for (let c = 0; c < 3; c++) pos[3 * w + c] += d[c];   // + the projection
   const counts = {};
   const P = (w) => [pos[3 * w] * 1000, pos[3 * w + 1] * 1000, pos[3 * w + 2] * 1000];
   for (const e of ct.eyes) {
@@ -598,6 +604,137 @@ $('viz-joint').addEventListener('change', () => updateHeat(true));
 $('viz-range').addEventListener('input', () => updateHeat(true));
 $('joints').addEventListener('change', () => { updateJointMarkers(); dirty = true; });
 controls.addEventListener('change', updateJointMarkers);
+
+// ---- exact contacts: post-skinning projection (server/vhuman/rig/contacts.py) ------------------
+// The projection runs on the CPU for the contact vertices; its posed correction
+// goes back before skinning (inverse blended rotation) into a contactOffset
+// vertex attribute that the materials add right after the morph targets.
+const CONTACT_ITERS = 4, SPHERE_PASSES = 8, SMOOTH_STEPS = 2;
+function patchMaterial(m) {
+  if (m.userData.contactPatched) return;
+  m.userData.contactPatched = true;
+  m.onBeforeCompile = (sh) => {
+    sh.vertexShader = sh.vertexShader.replace('#include <common>', '#include <common>\nattribute vec3 contactOffset;')
+      .replace('#include <morphtarget_vertex>', '#include <morphtarget_vertex>\ntransformed += contactOffset;');
+  };
+  m.customProgramCacheKey = () => 'contactOffset';
+  m.needsUpdate = true;
+}
+function setupContactOffsets() {
+  const V = state.vizData;
+  state.exact = null;
+  if (!V?.contacts) return;
+  const ct = prepareContacts();
+  const parts = [];
+  for (const [name, m] of Object.entries(ct.parts)) {
+    const vm = V.parts[name].vmap, n = vm.length;
+    m.geometry.setAttribute('contactOffset', new THREE.BufferAttribute(new Float32Array(n * 3), 3));
+    for (const mat of [].concat(m.material)) patchMaterial(mat);
+    parts.push({ mesh: m, vm });
+  }
+  // contact vertices (welded) and, per welded vertex, one unwelded representative + all duplicates
+  const need = new Set([...V.contacts.lip_ids, ...V.contacts.pairs_upper, ...V.contacts.pairs_lower, ...V.contacts.eye.flatMap((e) => e.ids)]);
+  const rep = new Map(), dup = new Map();
+  for (const p of parts) p.vm.forEach((w, i) => {
+    if (!need.has(w)) return;
+    if (!rep.has(w)) rep.set(w, [p, i]);
+    if (!dup.has(w)) dup.set(w, []);
+    dup.get(w).push([p, i]);
+  });
+  state.exact = { ct, parts, ids: [...need], rep, dup, delta: new Map() };
+}
+function projectContacts() {
+  const E = state.exact;
+  if (!E) return;
+  const on = $('exact').checked;
+  for (const p of E.parts) p.mesh.geometry.attributes.contactOffset.array.fill(0);
+  E.delta = new Map();
+  if (on) {
+    state.model.updateMatrixWorld(true);
+    state.skeleton.update();
+    const C = state.vizData.contacts, ct = E.ct, mm = 1000;
+    const x = new Map();                            // welded id -> posed position (mm)
+    for (const w of E.ids) { const [p, i] = E.rep.get(w); p.mesh.getVertexPosition(i, _v); x.set(w, [_v.x * mm, _v.y * mm, _v.z * mm]); }
+    const x0 = new Map([...x].map(([k, v]) => [k, v.slice()]));
+    const push = (q, c, thr) => {
+      const vx = q[0] - c[0], vy = q[1] - c[1], vz = q[2] - c[2], d = Math.hypot(vx, vy, vz);
+      if (d < thr) { const k = thr / Math.max(d, 1e-9); q[0] = c[0] + vx * k; q[1] = c[1] + vy * k; q[2] = c[2] + vz * k; return true; }
+      return false;
+    };
+    const eyeC = ct.eyes.map((e) => { const c = new THREE.Vector3(...e.center).applyMatrix4(skinMatrix(e.joint)).multiplyScalar(mm); return [c.x, c.y, c.z]; });
+    const sc = [];
+    for (const S of ct.spheres) S.centers.forEach((c0, t) => {
+      const M = new THREE.Matrix4().set(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+      for (let k = 0; k < 2; k++) { const w = S.weights[t][k]; if (!w) continue; const El = skinMatrix(S.joints[t][k]).elements; for (let e = 0; e < 16; e++) M.elements[e] += w * El[e]; }
+      const c = new THREE.Vector3(...c0).applyMatrix4(M).multiplyScalar(mm);
+      sc.push({ c: [c.x, c.y, c.z], S, t });
+    });
+    const up = new THREE.Vector3().setFromMatrixColumn(skinMatrix(C.head), 1).add(new THREE.Vector3().setFromMatrixColumn(skinMatrix(C.jaw), 1)).normalize();
+    const solve = () => {
+      for (let it = 0; it < CONTACT_ITERS; it++) {
+        let any = false;
+        ct.eyes.forEach((e, k) => e.ids.forEach((w, i) => { any = push(x.get(w), eyeC[k], e.thr[i]) || any; }));
+        C.pairs_upper.forEach((u, i) => {
+          const a = x.get(u), b = x.get(C.pairs_lower[i]);
+          const sep = (a[0] - b[0]) * up.x + (a[1] - b[1]) * up.y + (a[2] - b[2]) * up.z;
+          let dl = ct.sep0[i] - sep;
+          if (dl > 0) { dl *= 0.5; any = true; a[0] += dl * up.x; a[1] += dl * up.y; a[2] += dl * up.z; b[0] -= dl * up.x; b[1] -= dl * up.y; b[2] -= dl * up.z; }
+        });
+        C.lip_ids.forEach((w, l) => {
+          const q = x.get(w);
+          for (let pass = 0; pass < SPHERE_PASSES; pass++) {
+            let moved = false;
+            for (const { c, S, t } of sc) moved = push(q, c, S.thr[l * S.centers.length + t]) || moved;
+            any = any || moved;
+            if (!moved) break;
+          }
+        });
+        if (!any) break;
+      }
+    };
+    solve();
+    if (C.verts) {       // smooth the displacement over the contact graph, then project again (exact)
+      const d = C.verts.map(() => [0, 0, 0]);
+      for (let step = 0; step < SMOOTH_STEPS; step++) {
+        C.verts.forEach((w, i) => { const q = x.get(w), q0 = x0.get(w); d[i] = [q[0] - q0[0], q[1] - q0[1], q[2] - q0[2]]; });
+        C.verts.forEach((w, i) => {
+          const b = C.nbr_ptr[i], e = C.nbr_ptr[i + 1], q = x.get(w), q0 = x0.get(w);
+          for (let a = 0; a < 3; a++) {
+            let m = 0;
+            for (let k = b; k < e; k++) m += d[C.nbr_idx[k]][a];
+            const mean = e > b ? m / (e - b) : d[i][a];
+            q[a] = q0[a] + 0.5 * (d[i][a] + mean);
+          }
+        });
+      }
+      solve();
+    }
+    // posed correction -> pre-skinning offset: solve (sum_k w_k R_k) d = delta
+    const A = new THREE.Matrix3(), R = new THREE.Matrix3(), inv = new THREE.Matrix3(), dv = new THREE.Vector3();
+    for (const w of E.ids) {
+      const q = x.get(w), q0 = x0.get(w);
+      const dx = (q[0] - q0[0]) / mm, dy = (q[1] - q0[1]) / mm, dz = (q[2] - q0[2]) / mm;
+      if (!dx && !dy && !dz) continue;
+      E.delta.set(w, [dx, dy, dz]);
+      const [p, i] = E.rep.get(w);
+      const si = p.mesh.geometry.attributes.skinIndex, sw = p.mesh.geometry.attributes.skinWeight;
+      A.set(0, 0, 0, 0, 0, 0, 0, 0, 0);
+      for (let k = 0; k < 4; k++) {
+        const wt = sw.getComponent(i, k);
+        if (!wt) continue;
+        R.setFromMatrix4(skinMatrix(si.getComponent(i, k)));
+        for (let e = 0; e < 9; e++) A.elements[e] += wt * R.elements[e];
+      }
+      inv.copy(A).invert();
+      dv.set(dx, dy, dz).applyMatrix3(inv);
+      for (const [pp, ii] of E.dup.get(w)) pp.mesh.geometry.attributes.contactOffset.setXYZ(ii, dv.x, dv.y, dv.z);
+    }
+  }
+  for (const p of E.parts) p.mesh.geometry.attributes.contactOffset.needsUpdate = true;
+  dirty = true;
+}
+$('exact').addEventListener('change', () => { projectContacts(); updateHeat(true); });
+Object.assign(state, { applyRig: () => applyRig(), projectContacts, updateHeat });     // for tests and debugging
 
 // ---- animation ------------------------------------------------------------------------------
 let tween = null;
@@ -753,6 +890,8 @@ async function loadRig(h) {
   buildControls(def);
   applyRig();
   $('empty').hidden = true;
+  setupContactOffsets();
+  applyRig();
   updateHeat(true);
   $('vlabel').textContent = `rig.glb · ${def.controls.length} controls · ${def.blendshapes.length} shapes · ${def.joints.length} joints`;
   setView('front');

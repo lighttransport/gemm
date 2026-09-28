@@ -183,6 +183,8 @@ class RigEndToEndTests(unittest.TestCase):
         self.assertIn("JOINTS_0", prim["attributes"])
         self.assertEqual(len(prim["targets"]), len(skin["extras"]["targetNames"]))
         self.assertIn("eyeBlinkLeft", skin["extras"]["targetNames"])
+        # glTF: all targets of a primitive carry the same attributes
+        self.assertEqual(len({tuple(sorted(t)) for t in prim["targets"]}), 1)
         w = g.accessor(prim["attributes"]["WEIGHTS_0"])
         np.testing.assert_allclose(w.sum(1), 1.0, atol=1e-5)
 
@@ -202,6 +204,7 @@ class RigEndToEndTests(unittest.TestCase):
         from .rig import native, safetensors as st
         lib = native.build_library(Path(self.tmp.name) / "native")
         N = native.Native(lib, self.rig_dir / "rig_deformer.safetensors")
+        N.set_contact_iterations(0)                     # the rig alone; the projection is tested below
         try:
             rig = json.loads((self.rig_dir / "rig.json").read_text())
             r = rigdef.Rig(rig, folder=self.rig_dir)
@@ -220,6 +223,34 @@ class RigEndToEndTests(unittest.TestCase):
                 np.testing.assert_allclose(N.eval(x), ref, atol=2e-6)
             B = N.eval_batch(X)
             np.testing.assert_allclose(B[2], N.eval(X[2]), atol=2e-6)
+        finally:
+            N.close()
+
+    @unittest.skipIf(shutil.which("gcc") is None, "no gcc")
+    def test_contact_projection(self):
+        """Exact contacts: C equals the numpy reference; nothing penetrates after it."""
+        from .rig import contacts, native, safetensors as st
+        lib = native.build_library(Path(self.tmp.name) / "native_ct")
+        N = native.Native(lib, self.rig_dir / "rig_deformer.safetensors")
+        try:
+            self.assertTrue(N.has_contacts)
+            rig = rigdef.Rig(json.loads((self.rig_dir / "rig.json").read_text()), folder=self.rig_dir)
+            t, _ = st.load(self.rig_dir / "rig_deformer.safetensors")
+            rng = np.random.default_rng(3)
+            X = np.zeros((12, N.C), np.float32)
+            X[:, :51] = (rng.random((12, 51)) < 0.2) * rng.random((12, 51))
+            X[::2, rig.cidx["jawOpen"]] = 0.7
+            X[::3, rig.cidx["tongueOut"]] = 1.0
+            for x in X:
+                N.set_contact_iterations(0)
+                raw = N.eval(x)
+                N.set_contact_iterations(contacts.ITERATIONS)
+                got = N.eval(x)
+                skin = rig.evaluate(x)["skin"]
+                np.testing.assert_allclose(got, contacts.project(raw, skin, t), atol=1e-4)
+                self.assertEqual(contacts.depths(got, skin, t), {"eye": 0, "spheres": 0, "lips": 0})
+                untouched = np.setdiff1d(np.arange(N.V), t["contact.verts"])
+                np.testing.assert_array_equal(got[untouched], raw[untouched])
         finally:
             N.close()
 
@@ -265,6 +296,7 @@ class RigEndToEndTests(unittest.TestCase):
         self.assertEqual(set(viz["parts"]), {"head_skin", "head_mouth"})
         c = viz["contacts"]
         self.assertEqual(set(c["spheres"]), {"teeth", "tongue"})
+        self.assertEqual(len(c["nbr_ptr"]), len(c["verts"]) + 1)
         self.assertEqual(len(c["eye"]), 2)
         self.assertEqual(len(c["pairs_upper"]), len(c["pairs_lower"]))
         vmax = max(max(p["vmap"]) for p in viz["parts"].values())
