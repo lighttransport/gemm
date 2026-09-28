@@ -135,6 +135,13 @@ nonblocking Q2 cache-promotion experiment kept the 32-token hash but did not
 improve the short run and lowered cache hits, so the required promotion wait
 remains in place.
 
+The fastest parity-checked profile combines the opt-in 1K batch prefill with
+the default vectorized F16 kernel and both exact options above. It measured
+**10.27 prefill / 7.07 decode tok/s** for 1,024 prompt and 32 decode tokens,
+with the same `b9f867f533408c06` hash and 14.65 GiB peak VRAM use. The GPU
+still reported 96 MHz memory clock in manual mode. This is the current
+throughput result, well below the 1,200/60 tok/s target.
+
 Combining exact GPU router top-k, 47 captured prefix graphs, and WMMA decode
 also preserved the 1K sequence hash. That run measured **7.29 prefill tok/s**
 and **6.47 decode tok/s**. The gain is small enough to leave these diagnostic
