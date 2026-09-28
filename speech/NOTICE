@@ -1,0 +1,38 @@
+speech/ — Qwen3-TTS runner and ja_align Japanese CTC aligner
+Copyright 2026 - Present, Light Transport Entertainment Inc.
+All code in this directory is original work licensed under the MIT License
+(see ../LICENSE). No weights or data are distributed here.
+
+Upstream work consulted and followed (all Apache-2.0 or MIT):
+
+* Qwen3-TTS (qwen-tts Python package, Qwen3-TTS-12Hz model and tokenizer
+  configs/weights) — Apache-2.0, Alibaba Qwen team.
+  https://github.com/QwenLM/Qwen3-TTS
+  qwen3_tts/qtts_talker.h, qtts_codec.h follow
+  qwen_tts/core/models/modeling_qwen3_tts.py and
+  qwen_tts/core/tokenizer_12hz/modeling_qwen3_tts_tokenizer_v2.py.
+* Hugging Face transformers (Wav2Vec2 modeling, Qwen2 tokenizer behaviour) — Apache-2.0.
+  ja_align/w2v2.h follows Wav2Vec2FeatureEncoder / Wav2Vec2EncoderStableLayerNorm.
+* hiragana-asr (DualCTCModel, kana/phoneme vocabularies) and the
+  sakasegawa/japanese-wav2vec2-large-hiragana-ctc checkpoint — Apache-2.0.
+  https://github.com/nyosegawa/hiragana-asr
+  Base model reazon-research/japanese-wav2vec2-large — Apache-2.0.
+  Training data ReazonSpeech is CDLA-Sharing-1.0; CDLA places no restriction
+  on model outputs. We ship conversion scripts only.
+* ctc-segmentation (Kürzinger et al., 2020) — Apache-2.0.
+* Repository components reused (MIT unless noted): common/safetensors.h,
+  common/bpe_tokenizer.h + common/unicode_data_tables.inc (derived from
+  llama.cpp, MIT; Unicode data under the Unicode license), common/gguf_loader.h,
+  common/npy_io.h, common/philox_rng.h, cuda/cuew.{c,h} (Apache-2.0, from Blender),
+  cuda/cuda_runner_common.h.
+
+Clean-room components (implemented from papers / specifications only; the
+corresponding permissive-but-non-Apache/MIT tools are used solely as
+black-box validation oracles, their source was not consulted):
+
+* CTC Viterbi forced alignment (Graves et al., 2006 trellis) — validated against
+  torchaudio.functional.forced_align (BSD-2) as an oracle.
+* YIN F0 estimation (de Cheveigné & Kawahara, 2002).
+* Windowed-sinc resampler, RIFF/WAVE I/O, FFT.
+* Japanese kana -> phoneme and phoneme -> viseme tables, written from Japanese
+  phonology (label strings follow the Apache-2.0 model vocabulary).
