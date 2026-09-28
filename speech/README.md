@@ -100,3 +100,55 @@ speech/build/test_codec <model>/speech_tokenizer tmp/speech/codec_rand/codes.npy
 | codec only (random codes) | SNR 106.8 dB |
 
 CPU speed on a Threadripper 1950X with 16 threads: talker RTF 3.1, codec RTF 0.6. The CPU path is a reference path; the CUDA backend is the one meant for fast generation.
+
+## ja_align — Japanese CTC aligner and speech features for facial animation
+
+```
+speech/build/ja_align --model ja_align.safetensors --wav speech.wav \
+    [--kana "こんにちわ、きょーわ…"] [--phonemes "k o N n i ch i w a"] [--fps 30] \
+    [--out aux.json] [--posteriors post.npy] [--dump-dir dir]
+```
+
+- **Model.** [`sakasegawa/japanese-wav2vec2-large-hiragana-ctc`](https://huggingface.co/sakasegawa/japanese-wav2vec2-large-hiragana-ctc), Apache-2.0.
+  - A wav2vec2-large encoder pretrained on 35k hours of ReazonSpeech.
+  - It has two CTC heads: a 42-phoneme InterCTC head at layer 12 (OpenJTalk-style symbols) and a kana CTC head at layer 24.
+  - It runs at 20 ms frames.
+  - `ja_align/convert_ckpt.py` turns the `.pt` checkpoint into safetensors and folds in the positional-conv weight norm.
+- **Self-contained.** `ja_align/` has no dependencies outside itself: its own safetensors reader, GEMM, WAV I/O and DSP. It is plain C99 plus optional OpenMP and AVX2, with a scalar fallback.
+- **Alignment modes.**
+  - **Free** (the default): greedy CTC spans for phonemes and kana. This is the mode for TTS output, whose content is already known and clean.
+  - **Forced**: when a reading is given, the phonemes and kana are aligned to it with Viterbi, and a CTC-segmentation confidence score is computed.
+  - The reading has to be a *pronunciation* kana string (は→わ, long vowels as ー or a repeated vowel). Kanji-to-reading conversion is deliberately left out of the C module.
+- **Outputs** (`aux.json`, `"format": "ja_align.v1"`):
+  - `phones` and `kana`: CTC spans `{s, start, end, conf}` in seconds. Phones also carry a `viseme`.
+  - `intervals`: contiguous phone intervals running from one onset to the next.
+    - A phone holds while the energy stays above the loudest frame − 35 dB.
+    - A quiet gap of 120 ms or more becomes `sil`.
+    - `cl` (a geminate) takes the viseme of the following consonant.
+  - `visemes`: `fps`, and `frames[n][15]` weights over `sil PP FF TH DD kk CH SS nn RR aa E ih oh ou`.
+    - The weights are built from the intervals with ±35 ms linear co-articulation ramps and normalized to sum to 1.
+    - Devoiced vowels (uppercase `U` / `I`) are weighted at half strength.
+  - `prosody`: at a 10 ms hop, `rms_db` (dBFS, 25 ms window), `f0_hz` (YIN, 60–600 Hz, 0 when unvoiced) and `aperiodicity` (the minimum of the YIN CMNDF).
+  - `--posteriors`: 50 Hz phoneme posteriors `[T, 43]`, as `.npy`. These are useful for soft, learned lip-sync models.
+
+### Validation
+
+These use fixtures in `tmp/speech/`. The test audio is Qwen3-TTS output from the C runner.
+
+```
+python speech/ref/align_reference.py --wav x.wav --dump-dir ref --phonemes "…" --kana "…"   # HF + torchaudio + ctc-segmentation
+speech/build/test_w2v2 ja_align.safetensors ref/input.npy c && python speech/ref/compare.py --reference-dir ref --runner-dir c
+speech/build/test_ja_ctc ref
+make -C speech test
+```
+
+| Check | Result |
+|---|---|
+| encoder stages vs HF `Wav2Vec2Model`, same 16 kHz input | cos 1.0; log-posterior max abs 4e-5 |
+| forced alignment vs `torchaudio.functional.forced_align` (black-box oracle), phoneme + kana | **0 / 383 frames differ** |
+| CTC-segmentation vs the `ctc-segmentation` package (the method ESPnet uses) | timings exact; `char_probs` exact; confidence identical to 1e-6 |
+| Viterbi vs brute-force enumeration (200 random problems) | optimal in every case |
+| end to end with our resampler vs a torchaudio-resampled reference | posterior cos 0.99997, argmax agreement 99.2% |
+| resampler 24→16 kHz / YIN / RMS | 80 dB tone SNR, −64 dB stopband / 0.8% F0 error / 0.15 dB |
+
+Speed: CPU RTF ≈ 0.2 (7.7 s of audio in 1.6 s on 16 threads, Threadripper 1950X).

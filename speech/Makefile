@@ -13,7 +13,7 @@ JA      := ja_align
 QT_HDRS := $(QT)/qtts_ops.h $(QT)/qtts_codec.h $(QT)/qtts_talker.h $(QT)/qtts_tokenizer.h $(QT)/wav_io.h
 JA_HDRS := $(wildcard $(JA)/*.h)
 
-all: $(BUILD)/qwen3_tts $(BUILD)/test_codec $(BUILD)/test_tokenizer
+all: $(BUILD)/qwen3_tts $(BUILD)/test_codec $(BUILD)/test_tokenizer $(BUILD)/ja_align $(BUILD)/test_w2v2
 
 $(BUILD):
 	mkdir -p $(BUILD)
@@ -32,6 +32,9 @@ $(BUILD)/ja_align: $(JA)/ja_align_main.c $(JA_HDRS) | $(BUILD)
 	$(CC) $(CFLAGS) -I$(JA) -o $@ $< -lm
 
 $(BUILD)/test_ja_ctc: tests/test_ja_ctc.c $(JA_HDRS) | $(BUILD)
+	$(CC) $(CFLAGS) -I$(JA) -o $@ $< -lm
+
+$(BUILD)/test_w2v2: tests/test_w2v2.c $(JA_HDRS) | $(BUILD)
 	$(CC) $(CFLAGS) -I$(JA) -o $@ $< -lm
 
 $(BUILD)/test_ja_dsp: tests/test_ja_dsp.c $(JA_HDRS) | $(BUILD)
