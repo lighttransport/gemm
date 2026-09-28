@@ -141,6 +141,8 @@ tok/s** with the same 32-token hash `b9f867f533408c06`. An independent
 With the vectorized F16 path, `LLM_QWEN4_EXACT_GPU_TOPK=1` and
 `LLM_QWEN4_EXACT_PRE_GRAPHS=1` raised the same 1K run to **7.81 prefill /
 6.97 decode tok/s**, retaining its hash; 47 prefix graphs captured. A
+separate 11-token coding prompt with 16 forced decode tokens also retained
+its baseline hash `fab0d2285407b753` with both options enabled. A
 nonblocking Q2 cache-promotion experiment kept the 32-token hash but did not
 improve the short run and lowered cache hits, so the required promotion wait
 remains in place.
