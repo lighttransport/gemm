@@ -22,8 +22,9 @@ Pixal3D demo server.
     GET  /vhuman_eye_shader.js      the analytic eye shader, shared by both pages
     GET  /v1/heads, /v1/heads/<id>/<file>           Qwen portrait -> Pixal3D head -> fitted eyes
     GET  /rig                       the facial rig page (web/vhuman_rig.html)
-    GET  /v1/heads/<id>/rig/<file>  rig.glb, rig.json, rig.usda, rig_usd.zip, preview.png, textures/*.png
-    POST /v1/jobs                   {kind: plates|baseline|head|head_skin|expressions|rig, ...} -> {id}
+    GET  /v1/heads/<id>/rig/<file>  rig outputs
+    GET  /v1/heads/<id>/rig/takes, /v1/heads/<id>/rig/takes/<take>/<file>
+    POST /v1/jobs                   {kind: plates|baseline|head|head_skin|expressions|rig|rig_speech, ...} -> {id}
     GET  /v1/jobs, /v1/jobs/<id>    POST /v1/jobs/<id>/cancel
 """
 from __future__ import annotations
@@ -32,6 +33,7 @@ import argparse
 import json
 import mimetypes
 import os
+import re
 import threading
 import time
 import traceback
@@ -169,8 +171,9 @@ class App:
         self.service = EyeService(Path(args.work))
         from . import qwen, baseline
         from .head import pipeline as head_pipeline
-        from .rig import exprdata, job as rig_job
+        from .rig import exprdata, job as rig_job, speech as rig_speech
         self.rig_job = rig_job
+        self.rig_speech = rig_speech
         self.gpu = gpu
         self.qwen_opts = {"python": args.qwen_python, "mock": args.mock}
         self.jobs = Jobs(Path(args.work) / "jobs", {
@@ -184,6 +187,10 @@ class App:
                                                                               python=args.qwen_python, mock=args.mock),
             "rig": lambda req, prog, cancel: rig_job.rig_job(self.service, req, prog, cancel,
                                                              python=getattr(args, "rig_python", None), mock=args.mock),
+            "rig_speech": lambda req, prog, cancel: rig_speech.speech_job(
+                self.service, req, prog, cancel, model=getattr(args, "tts_model", None) or rig_speech.DEFAULT_MODEL,
+                aligner=getattr(args, "aligner", None) or rig_speech.DEFAULT_ALIGNER,
+                backend=getattr(args, "tts_backend", "auto")),
         })
 
     def health(self) -> dict:
@@ -191,6 +198,10 @@ class App:
         return {"ok": True, "gpu": self.gpu.gpu_status(), "qwen": qwen.availability(**self.qwen_opts),
                 "pixal3d": baseline.availability(mock=self.args.mock), "plates": len(self.service.list_plates()),
                 "rig": self.rig_job.availability(getattr(self.args, "rig_python", None)),
+                "rig_speech": self.rig_speech.availability(
+                    getattr(self.args, "tts_model", None) or self.rig_speech.DEFAULT_MODEL,
+                    getattr(self.args, "aligner", None) or self.rig_speech.DEFAULT_ALIGNER,
+                    getattr(self.args, "tts_backend", "auto")),
                 "algo_version": P.ALGO_VERSION}
 
 
@@ -226,7 +237,23 @@ def make_handler(app: App, quiet: bool = False):
             headers = {"Cache-Control": "public, max-age=31536000, immutable" if immutable else "no-cache"}
             if path.suffix in (".glb", ".zip"):
                 headers["Content-Disposition"] = f'attachment; filename="{path.name}"'
-            self._send(200, path.read_bytes(), ctype, headers)
+            data = path.read_bytes()
+            if path.suffix == ".wav":
+                ctype = "audio/wav"
+                headers["Accept-Ranges"] = "bytes"
+                request_range = self.headers.get("Range")
+                if request_range:
+                    match = re.fullmatch(r"bytes=(\d+)-(\d*)", request_range)
+                    if not match:
+                        return self._send(416, b"", ctype, {"Content-Range": f"bytes */{len(data)}"})
+                    start = int(match.group(1))
+                    end = int(match.group(2)) if match.group(2) else len(data) - 1
+                    if start >= len(data) or end < start:
+                        return self._send(416, b"", ctype, {"Content-Range": f"bytes */{len(data)}"})
+                    end = min(end, len(data) - 1)
+                    headers["Content-Range"] = f"bytes {start}-{end}/{len(data)}"
+                    return self._send(206, data[start:end + 1], ctype, headers)
+            self._send(200, data, ctype, headers)
 
         def _body(self) -> dict:
             length = int(self.headers.get("Content-Length") or 0)
@@ -269,6 +296,14 @@ def make_handler(app: App, quiet: bool = False):
                                       {"Cache-Control": "no-cache"})
                 if path == "/v1/heads":
                     return self._json(200, {"heads": app.service.list_heads()})
+                if path.startswith("/v1/heads/") and "/rig/takes" in path:
+                    hid, _, tail = path[len("/v1/heads/"):].partition("/rig/takes")
+                    if tail == "":
+                        return self._json(200, {"takes": app.service.list_takes(hid)})
+                    parts = tail.lstrip("/").split("/")
+                    if len(parts) == 2 and tail.startswith("/"):
+                        return self._file(app.service.take_file(hid, parts[0], parts[1]))
+                    return self._error(404, "no such file")
                 if path.startswith("/v1/heads/") and "/rig/" in path:
                     hid, _, name = path[len("/v1/heads/"):].partition("/rig/")
                     return self._file(app.service.rig_file(hid, name))
@@ -353,6 +388,9 @@ def main(argv=None) -> int:
     default_rig = ROOT / "tmp/vhuman-rig-venv/bin/python"
     ap.add_argument("--rig-python", default=str(default_rig) if default_rig.exists() else None,
                     help="interpreter for the facial rig builder (numpy, scipy, torch)")
+    ap.add_argument("--tts-model", default=None, help="Qwen3-TTS model directory for rig_speech jobs")
+    ap.add_argument("--aligner", default=None, help="ja_align.safetensors for rig_speech jobs")
+    ap.add_argument("--tts-backend", choices=("auto", "cpu", "cuda"), default="auto")
     args = ap.parse_args(argv)
     app = App(args)
     server = ThreadingHTTPServer((args.host, args.port), make_handler(app))

@@ -26,7 +26,7 @@ header .health{margin-left:auto;color:var(--muted);font:12px ui-monospace,monosp
 .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px;margin-bottom:14px}
 .card h2{margin:0 0 10px;font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);font-weight:600}
 label{display:block;color:var(--muted);font-size:12px;margin:8px 0 4px}
-input,select{width:100%;background:#0f1318;color:var(--text);border:1px solid var(--line);border-radius:8px;padding:6px 8px;font:inherit}
+input,select,textarea{width:100%;background:#0f1318;color:var(--text);border:1px solid var(--line);border-radius:8px;padding:6px 8px;font:inherit}
 button{background:#1d242c;color:var(--text);border:1px solid var(--line);border-radius:8px;padding:6px 10px;font:inherit;cursor:pointer}
 button:hover{border-color:var(--accent)}
 button.on{border-color:var(--accent);color:var(--accent)}
@@ -139,6 +139,28 @@ a.dl{color:var(--accent);margin-right:12px;font-size:13px;display:inline-block}
         <span class="msg" id="anim-msg"></span>
       </div>
     </div>
+    <div class="card">
+      <h2>Speech take</h2>
+      <label>Japanese text <textarea id="speech-text" rows="3" maxlength="1000" placeholder="今日はいい天気ですね。"></textarea></label>
+      <div class="tools">
+        <label>speaker <input id="speech-speaker" value="Ono_Anna" style="width:150px"></label>
+        <label>seed <input id="speech-seed" type="number" min="0" step="1" value="7" style="width:75px"></label>
+        <label>emotion <select id="speech-emotion" style="width:115px"><option>neutral</option><option>joy</option><option>sadness</option><option>anger</option><option>disgust</option><option>surprise</option></select></label>
+        <button id="add-emotion" title="Add an emotion key at the audio playhead, or at 0 for a new take">add key</button>
+        <button id="clear-emotions">clear keys</button>
+      </div>
+      <div id="emotion-keys" class="msg"></div>
+      <div class="tools">
+        <label>speech strength <input id="speech-strength" type="range" min="0" max="1" step="0.05" value="1" style="width:95px"></label>
+        <label>emotion strength <input id="emotion-strength" type="range" min="0" max="1" step="0.05" value="0.6" style="width:95px"></label>
+        <button id="speech-generate" disabled>generate take</button>
+        <button id="speech-rebuild" disabled title="Rebuild animation from the selected take without regenerating speech">rebuild animation</button>
+      </div>
+      <label>saved takes <select id="speech-takes"><option value="">none</option></select></label>
+      <audio id="speech-audio" controls preload="metadata" style="width:100%;margin-top:8px"></audio>
+      <div id="speech-downloads"></div>
+      <div id="speech-msg" class="msg"></div>
+    </div>
   </main>
   <aside class="right">
     <div class="card">
@@ -158,7 +180,8 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 
 const $ = (id) => document.getElementById(id);
-const state = { heads: [], current: null, rig: null, model: null, values: {}, anim: null, job: null };
+const state = { heads: [], current: null, rig: null, model: null, values: {}, anim: null, job: null,
+                speechAvailable: false };
 window.__rigState = state;
 async function api(path, body) {
   const opts = body === undefined ? {} : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) };
@@ -789,8 +812,9 @@ function tweenTo(target, seconds) {
   const keys = new Set([...Object.keys(from), ...Object.keys(target)]);
   tween = { from, target, keys, t0: performance.now(), dur: seconds * 1000 };
 }
-function stopAnim() { state.anim = null; $('anim-msg').textContent = ''; }
+function stopAnim() { state.anim = null; state.takeActive = false; $('speech-audio').pause(); $('anim-msg').textContent = ''; }
 function playFrames(frames, label) {       // frames: [{t (s), v: {...}}]
+  stopAnim();
   state.anim = { frames, t0: performance.now(), label };
 }
 function sampleFrames(frames, t) {
@@ -802,6 +826,128 @@ function sampleFrames(frames, t) {
   for (const k of new Set([...Object.keys(a.v), ...Object.keys(b.v)])) v[k] = (a.v[k] || 0) * (1 - f) + (b.v[k] || 0) * f;
   return v;
 }
+const speechAudio = $('speech-audio');
+let emotionKeys = [], speechLoadGen = 0;
+function renderEmotionKeys() {
+  const box = $('emotion-keys');
+  box.replaceChildren();
+  if (!emotionKeys.length) { box.textContent = 'No emotion keys · neutral'; return; }
+  for (const key of emotionKeys) {
+    const row = document.createElement('div');
+    row.textContent = `${key.t.toFixed(2)}s · ${Object.keys(key.weights).join(', ') || 'neutral'} `;
+    const remove = document.createElement('button');
+    remove.textContent = '×';
+    remove.title = 'remove key';
+    remove.addEventListener('click', () => { emotionKeys = emotionKeys.filter((k) => k !== key); renderEmotionKeys(); });
+    row.appendChild(remove);
+    box.appendChild(row);
+  }
+}
+function updateTakeFrame() {
+  if (!state.takeActive || !state.takeFrames?.length || !state.rig) return;
+  state.values = sampleFrames(state.takeFrames, speechAudio.currentTime) || {};
+  applyRig();
+  syncSliders();
+  $('anim-msg').textContent = `${state.take?.id || 'take'} · ${speechAudio.currentTime.toFixed(2)}s`;
+}
+speechAudio.addEventListener('play', () => { if (state.takeFrames?.length) { state.anim = null; state.takeActive = true; } });
+for (const event of ['timeupdate', 'seeked', 'ended']) speechAudio.addEventListener(event, updateTakeFrame);
+async function loadTake(take) {
+  const gen = ++speechLoadGen;
+  const animation = await api(take.urls.animation);
+  if (gen !== speechLoadGen || animation.format !== 'vhuman.performance.v1') return;
+  stopAnim();
+  state.take = take;
+  state.takeFrames = animation.frames;
+  state.takeActive = true;
+  speechAudio.src = take.urls.audio;
+  speechAudio.load();
+  emotionKeys = (animation.emotion_keyframes || []).map((k) => ({ t: +k.t, weights: { ...k.weights } }));
+  $('speech-strength').value = animation.speech_strength;
+  $('emotion-strength').value = animation.emotion_strength;
+  $('speech-rebuild').disabled = false;
+  $('speech-msg').textContent = take.rig_stale ? 'Rig changed since export; rebuild this animation for the current rig.' : '';
+  renderEmotionKeys();
+  const links = $('speech-downloads');
+  links.replaceChildren();
+  for (const [label, key] of [['WAV', 'audio'], ['controls JSON', 'animation'], ['LightRig track', 'lightrig'], ['USD animation', 'usd']]) {
+    const a = document.createElement('a');
+    a.className = 'dl'; a.textContent = label; a.href = take.urls[key]; a.download = '';
+    links.appendChild(a);
+  }
+  updateTakeFrame();
+}
+async function loadTakes(headId, selectId) {
+  const gen = ++speechLoadGen;
+  const data = await api(`/v1/heads/${headId}/rig/takes`);
+  if (gen !== speechLoadGen || state.current?.id !== headId) return;
+  const select = $('speech-takes');
+  select.replaceChildren();
+  for (const take of data.takes) {
+    const option = document.createElement('option');
+    option.value = take.id;
+    option.textContent = `${take.id} · ${take.text || take.source} · ${take.duration.toFixed(2)}s`;
+    select.appendChild(option);
+  }
+  state.takes = data.takes;
+  if (data.takes.length) {
+    select.value = selectId || data.takes[0].id;
+    await loadTake(data.takes.find((t) => t.id === select.value) || data.takes[0]);
+  } else {
+    stopAnim(); state.take = null; state.takeFrames = null; speechAudio.removeAttribute('src'); speechAudio.load();
+    $('speech-rebuild').disabled = true;
+    $('speech-downloads').replaceChildren();
+  }
+}
+$('speech-takes').addEventListener('change', () => {
+  const take = state.takes?.find((t) => t.id === $('speech-takes').value);
+  if (take) loadTake(take).catch((e) => { $('speech-msg').textContent = String(e); });
+});
+$('add-emotion').addEventListener('click', () => {
+  const t = state.take ? speechAudio.currentTime : 0;
+  const name = $('speech-emotion').value;
+  emotionKeys = emotionKeys.filter((k) => Math.abs(k.t - t) > 0.001);
+  emotionKeys.push({ t: +t.toFixed(3), weights: name === 'neutral' ? {} : { [name]: 1 } });
+  emotionKeys.sort((a, b) => a.t - b.t);
+  renderEmotionKeys();
+});
+$('clear-emotions').addEventListener('click', () => { emotionKeys = []; renderEmotionKeys(); });
+async function runSpeechJob(rebuild) {
+  if (!state.current?.rig || state.speechJob) return;
+  const headId = state.current.id;
+  const body = { kind: 'rig_speech', head_id: headId, emotion_keyframes: emotionKeys,
+                 speech_strength: +$('speech-strength').value, emotion_strength: +$('emotion-strength').value };
+  if (rebuild) {
+    if (!state.take) return;
+    body.source_take = state.take.id;
+  } else {
+    body.text = $('speech-text').value.trim();
+    body.speaker = $('speech-speaker').value.trim() || 'Ono_Anna';
+    body.seed = +$('speech-seed').value;
+    if (!body.text) { $('speech-msg').textContent = 'Enter Japanese text first'; return; }
+  }
+  $('speech-generate').disabled = $('speech-rebuild').disabled = true;
+  try {
+    const job = await api('/v1/jobs', body);
+    state.speechJob = job.id;
+    for (;;) {
+      await new Promise((r) => setTimeout(r, 1000));
+      const j = await api(`/v1/jobs/${job.id}`);
+      $('speech-msg').textContent = j.message;
+      if (j.state === 'done') { state.speechJob = null; await loadTakes(headId, j.result.id); break; }
+      if (j.state === 'failed' || j.state === 'cancelled') throw new Error(j.error || j.state);
+    }
+  } catch (e) {
+    state.speechJob = null;
+    $('speech-msg').textContent = String(e.message || e);
+  } finally {
+    $('speech-generate').disabled = !state.speechAvailable;
+    $('speech-rebuild').disabled = !state.take;
+  }
+}
+$('speech-generate').addEventListener('click', () => runSpeechJob(false));
+$('speech-rebuild').addEventListener('click', () => runSpeechJob(true));
+renderEmotionKeys();
 $('rom').addEventListener('click', () => {
   if (!state.rig) return;
   const frames = [{ t: 0, v: {} }];
@@ -867,6 +1013,7 @@ function tick(now) {
     }
     changed = true;
   }
+  if (state.takeActive && !speechAudio.paused) updateTakeFrame();
   if ($('auto-blink').checked) {
     if (now > nextBlink) { blinkT0 = now; nextBlink = now + 2200 + Math.random() * 3500; }
     const bt = (now - blinkT0) / 1000;
@@ -1004,14 +1151,16 @@ function renderHeads() {
   }
 }
 async function select(h) {
+  if (state.current?.id !== h.id) { ++speechLoadGen; stopAnim(); state.take = null; state.takeFrames = null; }
   state.current = h;
   renderHeads();
   showFacts(h);
   $('build').disabled = !!state.job;
   $('build').textContent = h.rig ? 'Rebuild rig for selected head' : 'Build rig for selected head';
   if (h.rig) {
-    try { await loadRig(h); } catch (e) { $('msg').textContent = String(e); $('msg').className = 'msg bad'; }
+    try { await loadRig(h); await loadTakes(h.id); } catch (e) { $('msg').textContent = String(e); $('msg').className = 'msg bad'; }
   } else {
+    $('speech-takes').replaceChildren();
     $('empty').hidden = false;
     $('empty').textContent = 'no rig yet: build one (≈ 1–2 min, GPU optional)';
   }
@@ -1051,6 +1200,12 @@ $('build').addEventListener('click', async () => {
 });
 api('/health').then((h) => {
   $('health').textContent = h.rig?.available ? `rig builder: ${h.rig.python}` : `rig builder unavailable: ${h.rig?.reason || '?'}`;
+  state.speechAvailable = !!h.rig_speech?.available;
+  $('speech-generate').disabled = !state.speechAvailable;
+  if (!h.rig_speech?.available) {
+    $('speech-generate').disabled = true;
+    $('speech-msg').textContent = 'Speech runner or model missing; see speech/README.md';
+  }
 }).catch(() => { $('health').textContent = 'server unreachable'; });
 resize();
 refresh().catch((e) => { $('msg').textContent = String(e); });

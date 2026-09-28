@@ -268,6 +268,19 @@ def cmd_rig_track(args) -> dict:
                            rig_layer=str(rig_json.parent / "rig.usda"))
 
 
+def cmd_rig_speech(args) -> dict:
+    from .rig import speech
+    svc = EyeService(Path(args.work))
+    emotions = json.loads(Path(args.emotions[1:]).read_text() if args.emotions.startswith("@") else args.emotions)
+    req = {"head_id": args.head, "text": args.text, "wav": args.wav, "source_take": args.source_take,
+           "speaker": args.speaker, "instruct": args.instruct, "kana": args.kana, "seed": args.seed,
+           "ref_wav": args.ref_wav, "ref_text": args.ref_text, "xvec_only": args.xvec_only,
+           "emotion_keyframes": emotions, "speech_strength": args.speech_strength,
+           "emotion_strength": args.emotion_strength}
+    return speech.speech_job(svc, req, _progress, threading.Event(), model=args.tts_model or speech.DEFAULT_MODEL,
+                             aligner=args.aligner or speech.DEFAULT_ALIGNER, backend=args.backend, allow_wav=True)
+
+
 def cmd_bench(args) -> dict:
     """Timing targets (cold caches): procedural textures and renders."""
     out = {}
@@ -385,6 +398,26 @@ def main(argv=None) -> int:
     sp.add_argument("--out", required=True)
     sp.add_argument("--fps", type=float, default=30.0)
     sp.set_defaults(fn=cmd_rig_track)
+    sp = sub.add_parser("rig-speech", help="Japanese text or WAV -> synchronized facial take")
+    sp.add_argument("--head", required=True)
+    source = sp.add_mutually_exclusive_group(required=True)
+    source.add_argument("--text")
+    source.add_argument("--wav")
+    source.add_argument("--source-take", help="reuse a completed take's audio and alignment")
+    sp.add_argument("--speaker", default="Ono_Anna")
+    sp.add_argument("--instruct", default="")
+    sp.add_argument("--kana")
+    sp.add_argument("--seed", type=int, default=7)
+    sp.add_argument("--ref-wav")
+    sp.add_argument("--ref-text")
+    sp.add_argument("--xvec-only", action="store_true")
+    sp.add_argument("--tts-model")
+    sp.add_argument("--aligner")
+    sp.add_argument("--backend", choices=("auto", "cpu", "cuda"), default="auto")
+    sp.add_argument("--speech-strength", type=float, default=1.0)
+    sp.add_argument("--emotion-strength", type=float, default=.6)
+    sp.add_argument("--emotions", default="[]", help="emotion keyframes JSON or @file.json")
+    sp.set_defaults(fn=cmd_rig_speech)
     sub.add_parser("replate", help="re-extract the plate library from its source images").set_defaults(fn=cmd_replate)
     sub.add_parser("bench", help="timing targets").set_defaults(fn=cmd_bench)
     args = ap.parse_args(argv)

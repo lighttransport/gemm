@@ -229,6 +229,52 @@ Names are our own; the 51 expression controls are the LightRig canonical
   ROM animation and `rig.json`.
 - LightRig: `lightrig inspect rig.usda`.
 
+## Speech takes
+
+`rig-speech` joins the existing Japanese Qwen3-TTS + `ja_align` pipeline to
+the facial rig. Build the CPU runner with `make -C speech build/tts_ja` (or
+`make -C speech cuda` for CUDA), then use a fitted, rigged head:
+
+```sh
+python3 -m server.vhuman.cli --work tmp/vhuman-independent rig-speech \
+  --head <id> --text 'こんにちは。' --speaker Ono_Anna --backend auto
+python3 -m server.vhuman.cli --work tmp/vhuman-independent rig-speech \
+  --head <id> --wav input.wav --backend cpu
+```
+
+For a Base model, use `--tts-model <Base dir> --ref-wav reference.wav`
+and optionally `--ref-text` or `--xvec-only`. `--source-take <take id>`
+rebuilds animation from a completed take's audio and alignment, without
+repeating TTS or CTC. `--emotions @keys.json` accepts an array such as
+`[{"t":0,"weights":{"joy":1}},{"t":1.5,"weights":{"sadness":1}}]`;
+keyframe times must increase and stay within the audio. Strength defaults
+are 1.0 for speech and 0.6 for emotion; the take seed defaults to 7. A TTS
+result with no aligned phonemes fails instead of saving a silent animation.
+The web `/rig` panel creates and
+rebuilds takes with the same job queue. The server accepts text and existing
+take IDs; filesystem WAV paths and reference voice files are CLI-only.
+
+The converter samples `ja_align.v1`'s 15 visemes at its 30 fps frame times,
+uses the rig's existing vowel and closed-lip poses, applies a three-frame
+symmetric filter, and emits a neutral final frame. Speech drives the jaw,
+lips and tongue; manual emotion drives upper-face controls and restrained
+mouth-corner motion. Playback samples the same controls against the WAV
+element's current time, including after seeking. Server `/health` reports
+speech runner/model availability.
+
+Each `<head>/rig/takes/<id>/` contains `audio.wav`, `align.json`,
+`animation.json` (`vhuman.performance.v1`: fps, duration, control names, and
+`[{t,v}]` frames), `lightrig.txt`, `animation.usda` (a sublayer of the head's
+`rig.usda`), and `manifest.json`. The take listing and guarded file URLs are
+under `/v1/heads/<id>/rig/takes`. Manifests record the rig hash; the viewer
+warns when a rebuilt rig makes an older animation stale.
+
+`speech.build_frames` has an optional timestamped emotion-provider callback.
+The NVIDIA Audio2Emotion-v2.2 model is not loaded or downloaded here: its
+[license](https://huggingface.co/nvidia/Audio2Emotion-v2.2/blob/main/LICENSE)
+restricts it to use in connection with the NVIDIA Audio2Face project.
+This callback is the boundary for a future licensed SDK bridge.
+
 ## Provenance and licensing
 
 - MetaHuman DNA Calibration (proprietary licence restricted to Unreal Engine

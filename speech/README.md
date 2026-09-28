@@ -192,6 +192,10 @@ Its talker RTF on CUDA is about 0.2.
 
 `speech/build/tts_ja_cuda --text "…" --out out.wav --aux aux.json` runs the whole pipeline: text → Qwen3-TTS (CUDA) → ja_align (CPU) → wav plus `aux.json`.
 
+The virtual-human rig consumes this output through `python3 -m server.vhuman.cli rig-speech`;
+see `server/vhuman/rig/README.md` for synchronized preview and
+USD/LightRig exports. Existing WAV files can enter through the same command.
+
 ## ja_align — Japanese CTC aligner and speech features for facial animation
 
 ```

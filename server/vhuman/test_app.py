@@ -13,6 +13,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+import wave
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
@@ -79,6 +80,39 @@ class ServerTest(unittest.TestCase):
         job = self.wait_job(json.loads(body)["id"])
         self.assertEqual(job["state"], "failed")
 
+    def test_speech_take_job_and_routes(self):
+        from .test_rig import _toy_rig
+        from .test_speech import _aux
+        head_id = "speecht1"
+        rig = self.work / "heads" / head_id / "rig"
+        source = rig / "takes" / ("a" * 12)
+        source.mkdir(parents=True, exist_ok=True)
+        (rig / "rig.json").write_text(json.dumps(_toy_rig()))
+        (rig / "rig.usda").write_text("#usda 1.0\n")
+        (source / "manifest.json").write_text(json.dumps({"id": source.name, "head_id": head_id, "duration": .5}))
+        (source / "align.json").write_text(json.dumps(_aux()))
+        with wave.open(str(source / "audio.wav"), "wb") as wav:
+            wav.setnchannels(1); wav.setsampwidth(2); wav.setframerate(24000)
+            wav.writeframes(bytes(24000))
+        status, _, raw = self.post("/v1/jobs", {"kind": "rig_speech", "head_id": head_id,
+                                                   "source_take": source.name})
+        self.assertEqual(status, 202)
+        job = self.wait_job(json.loads(raw)["id"])
+        self.assertEqual(job["state"], "done", job.get("error"))
+        take = job["result"]
+        listing = json.loads(self.get(f"/v1/heads/{head_id}/rig/takes")[2])["takes"]
+        self.assertTrue(any(t["id"] == take["id"] for t in listing))
+        self.assertEqual(self.status_of(take["urls"]["audio"]), 200)
+        self.assertEqual(self.status_of(take["urls"]["animation"]), 200)
+        request = urllib.request.Request(self.base + take["urls"]["audio"], headers={"Range": "bytes=0-9"})
+        with urllib.request.urlopen(request) as response:
+            self.assertEqual(response.status, 206)
+            self.assertEqual(response.read(), (source / "audio.wav").read_bytes()[:10])
+        self.assertEqual(self.status_of(f"/v1/heads/{head_id}/rig/takes/{take['id']}/../rig.json"), 404)
+        raw = self.post("/v1/jobs", {"kind": "rig_speech", "head_id": head_id,
+                                     "wav": str(source / "audio.wav")})[2]
+        self.assertEqual(self.wait_job(json.loads(raw)["id"])["state"], "failed")
+
     def test_page_health_schema(self):
         status, ctype, body = self.get("/")
         self.assertEqual(status, 200)
@@ -90,6 +124,7 @@ class ServerTest(unittest.TestCase):
         health = json.loads(self.get("/health")[2])
         self.assertTrue(health["ok"])
         self.assertTrue(health["qwen"]["available"])
+        self.assertIn("rig_speech", health)
         schema = json.loads(self.get("/v1/eye/schema")[2])
         self.assertEqual(len(schema["presets"]), 12)
 

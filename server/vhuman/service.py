@@ -7,6 +7,7 @@ is a directory lookup and every URL is immutable.
 from __future__ import annotations
 
 import io
+import hashlib
 import json
 import shutil
 import threading
@@ -265,6 +266,44 @@ class EyeService:
         if not path.is_file():
             raise ServiceError("no such file")
         return path
+
+    def take_file(self, hid: str, take_id: str, name: str) -> Path:
+        """Only public, fixed-name artifacts from a completed speech take."""
+        from .rig.speech import TAKE_FILES
+        if not isinstance(take_id, str) or len(take_id) != 12 or any(c not in "0123456789abcdef" for c in take_id):
+            raise ServiceError("no such take")
+        if name not in TAKE_FILES:
+            raise ServiceError("no such file")
+        base = self.rig_file(hid, "rig.json").parent / "takes" / take_id
+        if not (base / "manifest.json").is_file():
+            raise ServiceError("no such take")
+        path = base / name
+        if not path.is_file():
+            raise ServiceError("no such file")
+        return path
+
+    def take_summary(self, hid: str, take_id: str) -> dict:
+        manifest = json.loads(self.take_file(hid, take_id, "manifest.json").read_text())
+        current_rig = hashlib.sha256(self.rig_file(hid, "rig.json").read_bytes()).hexdigest()[:16]
+        manifest["rig_stale"] = bool(manifest.get("rig_sha256") and manifest["rig_sha256"] != current_rig)
+        base = f"/v1/heads/{hid}/rig/takes/{take_id}/"
+        manifest["urls"] = {key: base + name for key, name in {
+            "manifest": "manifest.json", "audio": "audio.wav", "align": "align.json",
+            "animation": "animation.json", "usd": "animation.usda", "lightrig": "lightrig.txt",
+        }.items() if (self.work / "heads" / hid / "rig" / "takes" / take_id / name).is_file()}
+        return manifest
+
+    def list_takes(self, hid: str) -> list[dict]:
+        root = self.rig_file(hid, "rig.json").parent / "takes"
+        if not root.is_dir():
+            return []
+        out = []
+        for path in sorted(root.glob("*/manifest.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+            try:
+                out.append(self.take_summary(hid, path.parent.name))
+            except (ValueError, ServiceError):
+                continue
+        return out
 
     def head_file(self, hid: str, name: str = "") -> Path:
         from .head.pipeline import FILES
