@@ -1,4 +1,4 @@
-# Resume: GLM-5.3-Flash A64FX kernel efficiency + QLAIR accuracy (updated 2026-09-28 11:27)
+# Resume: GLM-5.3-Flash A64FX kernel efficiency + QLAIR accuracy (updated 2026-09-28 13:20)
 
 ## Goal
 Run GLM-5.3-Flash (GLM53F) efficiently on A64FX. Targets:
@@ -189,6 +189,25 @@ All the new simulator switches are diagnostic and default off, so default QLAIR 
   node completed. Clair `STATUS.md` records the native command and
   `measurements/hw-20260927b/` has the measurement logs.
 
+## Session 2026-09-28 13:03–13:20 (clair commit 84e710d3; allocation ends 14:00 JST)
+
+- Same frozen Q8_0R 64×4096 kernel, only rotating weight copies changed:
+  ROT=1 (0.29 MiB, L2) is 37,050 native hardware cycles with zero L2-miss
+  wait; ROT=32 (9 MiB, HBM) is 89,269 cycles with 52,675 L2-miss-wait
+  cycles. CV is 0.34% / 1.75%; both verified correct. The event backend is
+  33,024 / 51,258 cycles with 0 / 17,913 modeled L2-miss wait.
+- The incremental HBM cost is 52,219 native versus 18,234 event cycles: a
+  **33,985-cycle missing cost**. The native-versus-event miss-wait difference
+  is 34,762 cycles. The L2-resident error is only 4,026 cycles. This narrows
+  the Q8 gap to miss service or miss overlap, with a smaller base kernel error.
+- ROT=16 (4.5 MiB) had a noisy 30-sample median because only one copy is
+  warmed before timing. A 100-sample follow-up still shows some late-sample
+  L2-miss wait; disabling huge pages moves it only modestly. Do not use
+  ROT=16 as a clean L2 control. ROT=1 and ROT=32 are stable controls.
+- The ROT=16 simulator replay is still running; the ROT=1 replay has passed
+  correctness and completed. Native logs, simulator profile, and replay
+  commands are in Clair `STATUS.md` and `measurements/hw-20260927b/`.
+
 ## Production integration plan (not started; needs the real model on 12 nodes)
 
 - **Where Q8_0R is used:**
@@ -206,7 +225,7 @@ All the new simulator switches are diagnostic and default off, so default QLAIR 
 
 ## Next steps (priority)
 1. **Simulator.**
-   - Isolate demand versus prefetched HBM-line latency and memory-level parallelism. Q8 HBM has a −43.8% event error at 64 rows with 1.8% native CV; its modeled L2-miss wait is 17,913 versus 51,610 native PMU cycles. Use the frozen `bench-c13` and the new row-sweep logs in `measurements/hw-20260927b/` as the gate. The diagnostic L2 prefetch distance 20 → 4 only moved the 16-row simulation by +9.4% and stays off.
+   - Isolate demand versus prefetched HBM-line latency and memory-level parallelism. The matched 64-row ROT=1 versus ROT=32 control now pins the incremental HBM underprediction at 33,985 cycles, close to the 34,762-cycle L2-miss-wait difference; use this pair and the row sweep as gates. The diagnostic L2 prefetch distance 20 → 4 only moved the 16-row simulation by +9.4% and stays off.
    - Design a load-result rename lifetime probe without the 144-cycle FMUL head masking release delay or FADD/LD pipe-use differences. Keep `FP_HOLD_LOAD=4` diagnostic until it is supported directly.
    - Then the K-quant unpack-op residual: q4k_v0/q5k_v0 insensitive to every switch.
    - Then the dependent base-ADD rule (ld8u6 −7.6%).
