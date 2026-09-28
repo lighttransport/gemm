@@ -100,3 +100,21 @@ the verified exact output. Forcing all layers into the existing batched path
 changed the sequence and did not improve prefill speed, so it remains a
 diagnostic only. The GPU was on a 304 W power cap and manual performance
 level for both measurements.
+
+## MTP and exact-path follow-up
+
+The `shared-Q8_0` NextN sidecar from
+[unsloth/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/blob/main/MTP/README.md)
+passed the runner's Qwen4 NextN schema inspection and loaded beside this Q2_0
+trunk. Exact scalar MTP with a three-token draft preserved the 1K prompt's
+sequence hash, accepting most drafts, but measured **5.89 decode tok/s** and
+**6.78 prefill tok/s**. Its verifier still executes target tokens sequentially.
+The experimental grouped verifier preserved the sequence on a 32-token prompt
+but decoded only **3.90 tok/s**. Neither is a faster default for this model.
+
+Combining exact GPU router top-k, 47 captured prefix graphs, and WMMA decode
+also preserved the 1K sequence hash. That run measured **7.29 prefill tok/s**
+and **6.47 decode tok/s**. The gain is small enough to leave these diagnostic
+switches explicit. Logs are `tmp/qwen38_q2_mtp1024_32.log`,
+`tmp/qwen38_q2_mtp_window32_8.log`, and
+`tmp/qwen38_q2_1k_exact_tuned_combo.log`.
