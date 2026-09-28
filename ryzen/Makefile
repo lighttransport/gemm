@@ -52,7 +52,9 @@ BENCH_GEMM = bench_gemm
 BENCH_FLASH = bench_flash_attn
 BENCH_NN = bench_nn_ops
 
-.PHONY: all clean gemm flash nn run help disasm
+BENCH_VHUMAN = bench_vhuman_deformer
+
+.PHONY: all clean gemm flash nn run help disasm vhuman
 
 all: $(BENCH_GEMM) $(BENCH_FLASH) $(BENCH_NN)
 
@@ -85,6 +87,21 @@ bench_nn_ops.o: bench_nn_ops.c $(NN_HEADERS)
 
 nn_ops_avx2.o: nn_ops_avx2.c $(NN_HEADERS)
 	$(CC) $(CFLAGS) -c -o $@ $<
+
+# Virtual-human face deformer (server/vhuman/rig): rig package -> vertices
+$(BENCH_VHUMAN): bench_vhuman_deformer.o vhuman_deformer.o lightrig_mlp2.o gemm_avx2.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+bench_vhuman_deformer.o: bench_vhuman_deformer.c vhuman_deformer.h
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+vhuman_deformer.o: vhuman_deformer.c vhuman_deformer.h $(GEMM_HEADERS) lightrig_mlp2.h
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+lightrig_mlp2.o: lightrig_mlp2.c lightrig_mlp2.h
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+vhuman: $(BENCH_VHUMAN)
 
 # Run targets
 gemm: $(BENCH_GEMM)
@@ -125,7 +142,7 @@ nn-asm: $(BENCH_NN)
 		sed -n '/^[0-9a-f]* <rmsnorm_f32_avx2>:/,/^[0-9a-f]* </p' | head -200
 
 clean:
-	rm -f *.o $(BENCH_GEMM) $(BENCH_FLASH) $(BENCH_NN) *.asm
+	rm -f *.o $(BENCH_GEMM) $(BENCH_FLASH) $(BENCH_NN) $(BENCH_VHUMAN) *.asm
 
 help:
 	@echo "AMD Zen2 Benchmark Makefile"
@@ -135,6 +152,7 @@ help:
 	@echo "  gemm           - Build and run GEMM benchmark"
 	@echo "  flash          - Build and run Flash Attention benchmark"
 	@echo "  nn             - Build and run NN Ops (RMSNorm, LayerNorm, FFN)"
+	@echo "  vhuman         - Build the face deformer benchmark (bench_vhuman_deformer PKG)"
 	@echo "  run            - Same as 'gemm'"
 	@echo "  run-<N>        - GEMM with NxNxN matrix (e.g., make run-1024)"
 	@echo "  disasm         - Generate disassembly for all"
