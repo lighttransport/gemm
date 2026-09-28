@@ -48,7 +48,7 @@ int hip_llm_qwen4_exact_enable(hip_llm_runner *r) {
     }
     r->qwen4_exact=1;
     r->qwen4_coding_profile=0;
-    hip_llm_set_batched_path(r,0);
+    if (!r->qwen4_batched_prefill) hip_llm_set_batched_path(r,0);
     return 0;
 fail:
     hllm_qwen4_qsa_free(r);

@@ -10745,6 +10745,16 @@ static const char *hip_kernel_source =
 "    size_t out_idx = (size_t)row * n_cols + (size_t)b * 256 + tid;\n"
 "    dst[out_idx] = f32_to_bf16(val);\n"
 "}\n"
+"/* Per-call Q2_0 dequant for the opt-in batched MoE path. */\n"
+"__global__ void dequant_q2_0_to_bf16(bf16_raw *dst, const unsigned char *mat,\n"
+"                                       int n_rows, int n_cols) {\n"
+"    int row=blockIdx.x,b=blockIdx.y,c=threadIdx.x;\n"
+"    if(row>=n_rows||c>=64)return;\n"
+"    const unsigned char *bp=mat+((size_t)row*(n_cols/64)+b)*18;\n"
+"    float d=half_to_float(*(const half_raw *)bp);\n"
+"    int q=(bp[2+c/4]>>(2*(c&3)))&3;\n"
+"    dst[(size_t)row*n_cols+b*64+c]=f32_to_bf16((float)(q-1)*d);\n"
+"}\n"
 "/* Per-call dequant of Q2_K (84 B/block) to BF16. One thread per output column;  */\n"
 "/* column order matches matvec_q2_K_f32's xb traversal. Layout: scales[16] +     */\n"
 "/* qs[64] + d(f16)@80 + dmin(f16)@82. */\n"
@@ -14552,6 +14562,7 @@ struct hip_llm_runner {
     hipFunction_t fn_dequant_q4_0_to_bf16;
     hipFunction_t fn_dequant_q5_1_to_bf16;
     hipFunction_t fn_dequant_q2_K_to_bf16;
+    hipFunction_t fn_dequant_q2_0_to_bf16;
     hipFunction_t fn_dequant_q3_K_to_bf16;
     hipFunction_t fn_dequant_q4_K_to_bf16;
     hipFunction_t fn_dequant_q5_K_to_bf16;
@@ -15735,6 +15746,7 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(dequant_q4_0_to_bf16);
     GET_FUNC(dequant_q5_1_to_bf16);
     GET_FUNC(dequant_q2_K_to_bf16);
+    GET_FUNC(dequant_q2_0_to_bf16);
     GET_FUNC(dequant_q3_K_to_bf16);
     GET_FUNC(dequant_q4_K_to_bf16);
     GET_FUNC(dequant_q5_K_to_bf16);
@@ -24656,6 +24668,13 @@ static inline int launch_dequant_q5_1_to_bf16(hip_llm_runner *r, void *dst,
     return e == hipSuccess ? 0 : -1;
 }
 
+static inline int launch_dequant_q2_0_to_bf16(hip_llm_runner *r, void *dst,
+        void *src, int n_rows, int n_cols) {
+    void *args[] = { &dst, &src, &n_rows, &n_cols };
+    return LAUNCH(r->fn_dequant_q2_0_to_bf16, n_rows, n_cols / 64, 1,
+                  64, 1, 1, 0, r->stream, args) == hipSuccess ? 0 : -1;
+}
+
 /* Return a BF16 weight pointer suitable for mm_blaslt_run_bf16, doing per-call
  * dequant into r->d_wbuf_bf16 if the weight is not F16-pre-converted.
  * NOTE: returns r->d_wbuf_bf16 for non-F16 paths; the caller must consume the
@@ -24750,6 +24769,10 @@ static inline void *get_bf16_weight(hip_llm_runner *r, void *raw_w, void *bf16_w
             return r->d_wbuf_bf16;
         case GGML_TYPE_Q2_K:
             launch_dequant_q2_K_to_bf16(r, r->d_wbuf_bf16, raw_w, n_rows, n_cols);
+            return r->d_wbuf_bf16;
+        case GGML_TYPE_Q2_0:
+            if (launch_dequant_q2_0_to_bf16(r, r->d_wbuf_bf16,
+                                            raw_w, n_rows, n_cols) != 0) return NULL;
             return r->d_wbuf_bf16;
         case GGML_TYPE_Q3_K:
             launch_dequant_q3_K_to_bf16(r, r->d_wbuf_bf16, raw_w, n_rows, n_cols);
@@ -34936,7 +34959,10 @@ static int batched_path_eligible(const hip_llm_runner *r, int M) {
      * explicitly opts into this dispatcher after taking a transaction
      * snapshot; it uses the same exact router/top-k policy but amortizes the
      * recurrent target layers across the draft window. */
-    if (r->qwen4_exact && !r->qwen4_grouped_verify) return 0;
+    /* An explicit prefill request may use the batched trunk while decode
+     * remains exact. The ordinary exact profile keeps scalar prefill. */
+    if (r->qwen4_exact && !r->qwen4_grouped_verify &&
+        !r->qwen4_batched_prefill) return 0;
     /* The Qwen4 batched prefill switch is an explicit correctness boundary.
      * load_weights_sharded() clears moe_prefill_batched when
      * LLM_QWEN4_BATCH=0, but the generic dispatcher used to ignore that field

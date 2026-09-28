@@ -79,3 +79,24 @@ next layer, and an MTP draft model for speculative decode. Its reported Q2_0
 84 tok/s with MTP enabled. This repository has only the two base model GGUF
 shards and no matching Flash-Next MTP weights. The 60 decode / 1,200 prefill
 targets are not met by this implementation.
+
+An explicit single-tile batched profile is available with a build that enables
+the batch dispatcher:
+
+```sh
+make -C rdna4/llm TARGET=tmp/test_hip_llm_batch HIPBLASLT=1 \
+  ROCM_LIB=/opt/rocm/lib tmp/test_hip_llm_batch
+QWEN38_Q2_RUNNER=rdna4/llm/tmp/test_hip_llm_batch LLM_BMAX=1024 \
+  rdna4/llm/run_qwen38_flash_next_q2_rocm.sh --bench \
+  --prompt-file tmp/qwen38_1k_prompt.txt --prefill-len 1024 -n 1024 \
+  --decode 32 -s 1152 --qwen4-batched-prefill
+```
+
+The opt-in batch path reached **8.97 prefill tok/s** and **6.35 decode
+tok/s** on the same 1K prompt, with the scalar sequence hash
+`b9f867f533408c06`. Peak VRAM use was 14.65 GiB. The gain is limited because
+SSM layers and most attention layers still execute row by row to preserve
+the verified exact output. Forcing all layers into the existing batched path
+changed the sequence and did not improve prefill speed, so it remains a
+diagnostic only. The GPU was on a 304 W power cap and manual performance
+level for both measurements.
