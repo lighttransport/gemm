@@ -21,7 +21,9 @@ Pixal3D demo server.
     GET  /head                      the head page (web/vhuman_head.html)
     GET  /vhuman_eye_shader.js      the analytic eye shader, shared by both pages
     GET  /v1/heads, /v1/heads/<id>/<file>           Qwen portrait -> Pixal3D head -> fitted eyes
-    POST /v1/jobs                   {kind: plates|baseline|head|head_skin, ...} -> {id}
+    GET  /rig                       the facial rig page (web/vhuman_rig.html)
+    GET  /v1/heads/<id>/rig/<file>  rig.glb, rig.json, rig.usda, rig_usd.zip, preview.png, textures/*.png
+    POST /v1/jobs                   {kind: plates|baseline|head|head_skin|rig, ...} -> {id}
     GET  /v1/jobs, /v1/jobs/<id>    POST /v1/jobs/<id>/cancel
 """
 from __future__ import annotations
@@ -44,6 +46,7 @@ from .service import ROOT, WORK, EyeService, ServiceError
 
 PAGE = ROOT / "web" / "vhuman_eye.html"
 HEAD_PAGE = ROOT / "web" / "vhuman_head.html"
+RIG_PAGE = ROOT / "web" / "vhuman_rig.html"
 EYE_SHADER = ROOT / "web" / "vhuman_eye_shader.js"      # shared by both pages
 MAX_BODY = 1 << 20
 MAX_JOBS_QUEUED = 8
@@ -166,6 +169,8 @@ class App:
         self.service = EyeService(Path(args.work))
         from . import qwen, baseline
         from .head import pipeline as head_pipeline
+        from .rig import job as rig_job
+        self.rig_job = rig_job
         self.gpu = gpu
         self.qwen_opts = {"python": args.qwen_python, "mock": args.mock}
         self.jobs = Jobs(Path(args.work) / "jobs", {
@@ -175,12 +180,15 @@ class App:
             "head": lambda req, prog, cancel: head_pipeline.head_job(self.service, req, prog, cancel,
                                                                      python=args.qwen_python, mock=args.mock),
             "head_skin": lambda req, prog, cancel: head_pipeline.skin_job(self.service, req, prog, cancel),
+            "rig": lambda req, prog, cancel: rig_job.rig_job(self.service, req, prog, cancel,
+                                                             python=getattr(args, "rig_python", None), mock=args.mock),
         })
 
     def health(self) -> dict:
         from . import baseline, qwen
         return {"ok": True, "gpu": self.gpu.gpu_status(), "qwen": qwen.availability(**self.qwen_opts),
                 "pixal3d": baseline.availability(mock=self.args.mock), "plates": len(self.service.list_plates()),
+                "rig": self.rig_job.availability(getattr(self.args, "rig_python", None)),
                 "algo_version": P.ALGO_VERSION}
 
 
@@ -254,8 +262,14 @@ def make_handler(app: App, quiet: bool = False):
                 if path in ("/head", "/vhuman_head"):
                     return self._send(200, HEAD_PAGE.read_bytes(), "text/html; charset=utf-8",
                                       {"Cache-Control": "no-cache"})
+                if path in ("/rig", "/vhuman_rig"):
+                    return self._send(200, RIG_PAGE.read_bytes(), "text/html; charset=utf-8",
+                                      {"Cache-Control": "no-cache"})
                 if path == "/v1/heads":
                     return self._json(200, {"heads": app.service.list_heads()})
+                if path.startswith("/v1/heads/") and "/rig/" in path:
+                    hid, _, name = path[len("/v1/heads/"):].partition("/rig/")
+                    return self._file(app.service.rig_file(hid, name))
                 if path.startswith("/v1/heads/"):
                     return self._file(app.service.head_file(*path[len("/v1/heads/"):].split("/", 1)))
                 if path == "/health":
@@ -334,6 +348,9 @@ def main(argv=None) -> int:
     ap.add_argument("--qwen-python", default=str(default_py) if default_py.exists() else None,
                     help="interpreter for cuda/qimg21/native_generate.py (needs torch)")
     ap.add_argument("--mock", action="store_true", help="mock Qwen and Pixal3D (no GPU)")
+    default_rig = ROOT / "tmp/vhuman-rig-venv/bin/python"
+    ap.add_argument("--rig-python", default=str(default_rig) if default_rig.exists() else None,
+                    help="interpreter for the facial rig builder (numpy, scipy, torch)")
     args = ap.parse_args(argv)
     app = App(args)
     server = ThreadingHTTPServer((args.host, args.port), make_handler(app))

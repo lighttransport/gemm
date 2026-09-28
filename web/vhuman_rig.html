@@ -1,0 +1,553 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Virtual Human Rig</title>
+<link rel="icon" href="data:,">
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.163.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.163.0/examples/jsm/"
+  }
+}
+</script>
+<style>
+:root{--bg:#0d1014;--panel:#151a20;--line:#252d36;--text:#e3e8ee;--muted:#8b97a5;--accent:#6fc2a8;--warn:#e7a15b;--bad:#e07474}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+header{display:flex;flex-wrap:wrap;gap:6px 16px;align-items:baseline;padding:14px 20px;border-bottom:1px solid var(--line)}
+header h1{margin:0;font-size:19px;font-weight:600}
+header .sub{color:var(--muted);font-size:13px}
+header a{color:var(--accent);text-decoration:none;font-size:13px}
+header .health{margin-left:auto;color:var(--muted);font:12px ui-monospace,monospace}
+.layout{display:grid;grid-template-columns:300px 1fr 330px;gap:16px;padding:16px 20px;max-width:1700px;margin:0 auto}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px;margin-bottom:14px}
+.card h2{margin:0 0 10px;font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);font-weight:600}
+label{display:block;color:var(--muted);font-size:12px;margin:8px 0 4px}
+input,select{width:100%;background:#0f1318;color:var(--text);border:1px solid var(--line);border-radius:8px;padding:6px 8px;font:inherit}
+button{background:#1d242c;color:var(--text);border:1px solid var(--line);border-radius:8px;padding:6px 10px;font:inherit;cursor:pointer}
+button:hover{border-color:var(--accent)}
+button.on{border-color:var(--accent);color:var(--accent)}
+button.primary{background:var(--accent);color:#0c1512;border-color:var(--accent);font-weight:600;width:100%;margin-top:10px}
+button:disabled{opacity:.5;cursor:default}
+.progress{height:6px;background:#0f1318;border-radius:4px;overflow:hidden;margin-top:10px}
+.progress>div{height:100%;background:var(--accent);width:0;transition:width .3s}
+.msg{color:var(--muted);font-size:12px;margin-top:6px;min-height:1.2em}
+.msg.bad{color:var(--bad)}
+.heads{display:flex;flex-direction:column;gap:8px;max-height:420px;overflow-y:auto;overflow-x:hidden}
+.head>div{min-width:0}
+.head{display:grid;grid-template-columns:48px 1fr;gap:10px;align-items:center;padding:6px;border:1px solid var(--line);border-radius:10px;cursor:pointer;background:#11161b}
+.head.sel{border-color:var(--accent)}
+.head img{width:48px;height:48px;object-fit:cover;border-radius:8px;background:#222}
+.head b{display:block;font-weight:500;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.head span{color:var(--muted);font-size:11px}
+.head .tag{color:var(--accent)}
+.viewer{position:relative;background:radial-gradient(ellipse at 50% 35%,#27313b,#0d1115 75%);border:1px solid var(--line);border-radius:12px;height:680px;overflow:hidden}
+.viewer canvas{display:block;width:100%;height:100%}
+.viewer .label{position:absolute;left:12px;top:10px;font-size:12px;color:var(--muted);background:#0008;padding:3px 8px;border-radius:6px}
+.viewer .empty[hidden]{display:none}
+.viewer .empty{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:var(--muted);text-align:center;padding:20px}
+.tools{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0;align-items:center}
+.tools label{display:flex;gap:6px;align-items:center;margin:0;color:var(--text);font-size:13px}
+.tools input[type=checkbox]{width:auto}
+.presets{display:flex;flex-wrap:wrap;gap:6px}
+.presets button{font-size:12px;padding:4px 8px}
+.controls{max-height:980px;overflow:auto;padding-right:4px}
+details.group{border-top:1px solid var(--line);padding:6px 0}
+details.group summary{cursor:pointer;color:var(--muted);font-size:12px;letter-spacing:.06em;text-transform:uppercase}
+.ctl{display:grid;grid-template-columns:1fr 110px 36px;gap:6px;align-items:center;font-size:12px;margin:3px 0}
+.ctl span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ctl input{padding:0;height:16px}
+.ctl output{color:var(--muted);font:11px ui-monospace,monospace;text-align:right}
+table{width:100%;border-collapse:collapse;font-size:12px}
+td{padding:3px 6px;border-bottom:1px solid var(--line)}
+td:first-child{color:var(--muted);width:46%}
+a.dl{color:var(--accent);margin-right:12px;font-size:13px;display:inline-block}
+.preview img{width:100%;border-radius:8px;background:#1b2027;display:block;margin-top:6px}
+@media(max-width:1200px){.layout{grid-template-columns:280px 1fr}.right{grid-column:1 / -1}}
+@media(max-width:800px){.layout{grid-template-columns:1fr}.viewer{height:460px}}
+</style>
+</head>
+<body>
+<header>
+  <h1>Virtual Human Rig</h1>
+  <span class="sub">template fit · skeleton (jaw, eyes, teeth, tongue) · 52 expression shapes · linear rig</span>
+  <a href="/head">heads →</a>
+  <span class="health" id="health">…</span>
+</header>
+<div class="layout">
+  <aside>
+    <div class="card">
+      <h2>Heads</h2>
+      <div class="heads" id="heads"><span class="msg">no fitted heads yet — generate one on the heads page</span></div>
+      <label for="res">Skin atlas</label>
+      <select id="res"><option value="1024">1024 (fast)</option><option value="2048" selected>2048</option><option value="4096">4096</option></select>
+      <button class="primary" id="build" disabled>Build rig for selected head</button>
+      <div class="progress"><div id="bar"></div></div>
+      <div class="msg" id="msg"></div>
+    </div>
+    <div class="card">
+      <h2>Rig</h2>
+      <table id="facts"></table>
+      <div style="margin-top:8px" id="downloads"></div>
+      <div class="preview"><img id="preview-img" alt="pose sheet" hidden></div>
+    </div>
+  </aside>
+  <main>
+    <div class="viewer" id="viewer"><span class="label" id="vlabel">rig.glb</span><div class="empty" id="empty">pick a head with a rig, or build one</div></div>
+    <div class="tools">
+      <button data-view="front">front</button><button data-view="three">¾</button><button data-view="profile">profile</button><button data-view="mouth">mouth</button><button data-view="eyes">eyes</button>
+      <label><input type="checkbox" id="wire"> wireframe</label>
+      <label><input type="checkbox" id="bones"> skeleton</label>
+      <label title="random blinks"><input type="checkbox" id="auto-blink" checked> auto blink</label>
+      <label title="eyes (and a little of the head) follow the pointer over the viewer"><input type="checkbox" id="look-at"> look at pointer</label>
+      <label>exposure <input type="range" id="exposure" min="0.3" max="2.5" step="0.05" value="1" style="width:100px"></label>
+    </div>
+    <div class="card">
+      <h2>Animation</h2>
+      <div class="tools">
+        <button id="rom">range of motion ▶</button>
+        <button id="talk">talk loop ▶</button>
+        <label title="LightRig face track: a timestamp and the 52 lr.face.v1 controls per line">LightRig track <input type="file" id="track" accept=".txt" style="width:200px"></label>
+        <button id="stop">■ stop</button>
+        <span class="msg" id="anim-msg"></span>
+      </div>
+    </div>
+  </main>
+  <aside class="right">
+    <div class="card">
+      <h2>Presets</h2>
+      <div class="presets" id="presets"></div>
+    </div>
+    <div class="card">
+      <h2>Controls <button id="reset" style="float:right;font-size:11px;padding:2px 8px">reset</button></h2>
+      <div class="controls" id="controls"><span class="msg">load a rig</span></div>
+    </div>
+  </aside>
+</div>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+
+const $ = (id) => document.getElementById(id);
+const state = { heads: [], current: null, rig: null, model: null, values: {}, anim: null, job: null };
+window.__rigState = state;
+async function api(path, body) {
+  const opts = body === undefined ? {} : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) };
+  const r = await fetch(path, opts);
+  const data = await r.json();
+  if (!r.ok) throw new Error(data.error || r.statusText);
+  return data;
+}
+
+// ---- the linear rig (same equations as server/vhuman/rig/rigdef.py) --------------------
+const ATTRS = ['tx', 'ty', 'tz', 'rx', 'ry', 'rz'];
+class LinearRig {
+  constructor(def) {
+    this.def = def;
+    this.controls = def.controls.map((c) => c.name);
+    this.cidx = Object.fromEntries(this.controls.map((n, i) => [n, i]));
+    this.inputs = this.controls.concat(def.correctives.map((c) => c.name));
+    this.iidx = Object.fromEntries(this.inputs.map((n, i) => [n, i]));
+    this.joints = def.joints;
+    this.jidx = Object.fromEntries(this.joints.map((j, i) => [j.name, i]));
+    this.M = def.joint_matrix.map((e) => [this.jidx[e.joint] * 6 + ATTRS.indexOf(e.attr), this.iidx[e.input], e.value]);
+    this.shapes = def.blendshapes.map((b) => [b.name, this.iidx[b.input]]);
+  }
+  evaluate(values) {
+    const x = this.def.controls.map((c) => Math.min(c.max, Math.max(c.min, values[c.name] || 0)));
+    const clamp01 = (v) => Math.min(1, Math.max(0, v));
+    const inp = x.concat(this.def.correctives.map((c) => Math.min(1, c.inputs.reduce((p, n) => p * clamp01(x[this.cidx[n]]), c.weight ?? 1))));
+    const delta = new Float64Array(this.joints.length * 6);
+    for (const [row, col, v] of this.M) delta[row] += v * inp[col];
+    const weights = {};
+    for (const [name, src] of this.shapes) weights[name] = inp[src];
+    return { delta, weights };
+  }
+}
+const _m4 = new THREE.Matrix4(), _r = new THREE.Matrix4(), _e = new THREE.Matrix4();
+function restMatrix3(j) {       // row-major nested -> Matrix4
+  const R = j.rest_rotation;
+  return new THREE.Matrix4().set(R[0][0], R[0][1], R[0][2], 0, R[1][0], R[1][1], R[1][2], 0, R[2][0], R[2][1], R[2][2], 0, 0, 0, 0, 1);
+}
+function eulerZYX(rx, ry, rz) {   // Rz @ Ry @ Rx (radians)
+  const cx = Math.cos(rx), sx = Math.sin(rx), cy = Math.cos(ry), sy = Math.sin(ry), cz = Math.cos(rz), sz = Math.sin(rz);
+  const Rx = new THREE.Matrix4().set(1, 0, 0, 0, 0, cx, -sx, 0, 0, sx, cx, 0, 0, 0, 0, 1);
+  const Ry = new THREE.Matrix4().set(cy, 0, sy, 0, 0, 1, 0, 0, -sy, 0, cy, 0, 0, 0, 0, 1);
+  const Rz = new THREE.Matrix4().set(cz, -sz, 0, 0, sz, cz, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1);
+  return Rz.multiply(Ry).multiply(Rx);
+}
+
+// ---- viewer -------------------------------------------------------------------------
+const viewer = $('viewer');
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, preserveDrawingBuffer: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+renderer.toneMapping = THREE.NeutralToneMapping;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+viewer.prepend(renderer.domElement);
+const scene = new THREE.Scene();
+const pmrem = new THREE.PMREMGenerator(renderer);
+scene.environment = pmrem.fromScene(new RoomEnvironment(renderer), 0.03).texture;
+const key = new THREE.DirectionalLight(0xffffff, 1.4);
+key.position.set(0.8, 1.2, 2.0);
+scene.add(key);
+const camera = new THREE.PerspectiveCamera(22, 1, 0.005, 20);
+const controls = new OrbitControls(camera, renderer.domElement);
+let dirty = true;
+controls.addEventListener('change', () => { dirty = true; });
+let skelHelper = null;
+function resize() {
+  const w = viewer.clientWidth, h = viewer.clientHeight;
+  renderer.setSize(w, h, false);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+  dirty = true;
+}
+window.addEventListener('resize', resize);
+const views = { front: [0, 0, 1], three: [0.62, 0.05, 0.78], profile: [1, 0.02, 0] };
+function setView(name) {
+  // the head frame: +Y up, the face looks along +Z, metres, origin between the eyeballs
+  if (name === 'mouth') { controls.target.set(0, -0.072, 0.03); camera.position.set(0.05, -0.06, 0.25); }
+  else if (name === 'eyes') { controls.target.set(0, 0.0, 0.01); camera.position.set(0.02, 0.01, 0.23); }
+  else {
+    controls.target.set(0, -0.03, 0);
+    camera.position.set(...views[name].map((v) => v * 0.75)).add(controls.target);
+  }
+  controls.update();
+  dirty = true;
+}
+document.querySelectorAll('[data-view]').forEach((b) => b.addEventListener('click', () => setView(b.dataset.view)));
+$('exposure').addEventListener('input', () => { renderer.toneMappingExposure = +$('exposure').value; dirty = true; });
+$('wire').addEventListener('change', () => {
+  state.model?.traverse((o) => { if (o.isMesh) for (const m of [].concat(o.material)) m.wireframe = $('wire').checked; });
+  dirty = true;
+});
+$('bones').addEventListener('change', () => { if (skelHelper) skelHelper.visible = $('bones').checked; dirty = true; });
+
+// ---- controls UI ----------------------------------------------------------------------
+const GROUP_ORDER = ['brow', 'eyes', 'gaze', 'cheek', 'nose', 'mouth', 'jaw', 'tongue', 'head', 'other'];
+function buildControls(def) {
+  const box = $('controls');
+  box.innerHTML = '';
+  const groups = {};
+  for (const c of def.controls) (groups[c.group] ||= []).push(c);
+  for (const g of GROUP_ORDER.filter((g) => groups[g])) {
+    const d = document.createElement('details');
+    d.className = 'group';
+    d.open = ['mouth', 'jaw', 'eyes', 'brow'].includes(g);
+    d.innerHTML = `<summary>${g} (${groups[g].length})</summary>`;
+    for (const c of groups[g]) {
+      const row = document.createElement('div');
+      row.className = 'ctl';
+      row.innerHTML = `<span title="${c.name}">${c.name}</span><input type="range" min="${c.min}" max="${c.max}" step="0.01" value="0" data-ctl="${c.name}"><output>0.00</output>`;
+      const input = row.querySelector('input'), out = row.querySelector('output');
+      input.addEventListener('input', () => { stopAnim(); state.values[c.name] = +input.value; out.value = (+input.value).toFixed(2); applyRig(); });
+      d.appendChild(row);
+    }
+    box.appendChild(d);
+  }
+}
+function syncSliders() {
+  document.querySelectorAll('[data-ctl]').forEach((el) => {
+    const v = state.values[el.dataset.ctl] || 0;
+    el.value = v;
+    el.nextElementSibling.value = v.toFixed(2);
+  });
+}
+const PRESETS = {
+  neutral: {},
+  smile: { mouthSmileLeft: 1, mouthSmileRight: 1, cheekSquintLeft: 0.5, cheekSquintRight: 0.5, eyeSquintLeft: 0.25, eyeSquintRight: 0.25 },
+  'open smile': { mouthSmileLeft: 1, mouthSmileRight: 1, jawOpen: 0.35, cheekSquintLeft: 0.5, cheekSquintRight: 0.5, mouthUpperUpLeft: 0.3, mouthUpperUpRight: 0.3 },
+  surprise: { browInnerUp: 1, browOuterUpLeft: 0.8, browOuterUpRight: 0.8, eyeWideLeft: 0.9, eyeWideRight: 0.9, jawOpen: 0.4, mouthFunnel: 0.2 },
+  anger: { browDownLeft: 1, browDownRight: 1, eyeSquintLeft: 0.5, eyeSquintRight: 0.5, noseSneerLeft: 0.5, noseSneerRight: 0.5, mouthPressLeft: 0.6, mouthPressRight: 0.6 },
+  sad: { browInnerUp: 0.8, mouthFrownLeft: 0.9, mouthFrownRight: 0.9, mouthShrugLower: 0.4, eyeLookDownLeft: 0.2, eyeLookDownRight: 0.2 },
+  disgust: { noseSneerLeft: 1, noseSneerRight: 1, mouthUpperUpLeft: 0.7, mouthUpperUpRight: 0.7, browDownLeft: 0.4, browDownRight: 0.4, eyeSquintLeft: 0.3, eyeSquintRight: 0.3 },
+  wink: { eyeBlinkLeft: 1, mouthSmileLeft: 0.6, cheekSquintLeft: 0.6 },
+  pucker: { mouthPucker: 1, mouthFunnel: 0.2 },
+  'tongue out': { jawOpen: 0.6, tongueOut: 1 },
+  A: { jawOpen: 0.55, mouthStretchLeft: 0.15, mouthStretchRight: 0.15 },
+  E: { jawOpen: 0.25, mouthStretchLeft: 0.5, mouthStretchRight: 0.5, mouthSmileLeft: 0.2, mouthSmileRight: 0.2 },
+  I: { jawOpen: 0.12, mouthSmileLeft: 0.45, mouthSmileRight: 0.45, mouthStretchLeft: 0.3, mouthStretchRight: 0.3 },
+  O: { jawOpen: 0.45, mouthFunnel: 0.7, mouthPucker: 0.3 },
+  U: { jawOpen: 0.12, mouthPucker: 0.9, mouthFunnel: 0.35 },
+  M: { mouthPressLeft: 0.6, mouthPressRight: 0.6, mouthRollLower: 0.3, mouthRollUpper: 0.2 },
+};
+for (const [name, v] of Object.entries(PRESETS)) {
+  const b = document.createElement('button');
+  b.textContent = name;
+  b.addEventListener('click', () => { stopAnim(); tweenTo(v, 0.25); });
+  $('presets').appendChild(b);
+}
+$('reset').addEventListener('click', () => { stopAnim(); tweenTo({}, 0.2); });
+
+// ---- apply ---------------------------------------------------------------------------------
+let blink = 0, gaze = { x: 0, y: 0 }, pointer = null;
+function effectiveValues() {
+  const v = Object.assign({}, state.values);
+  if ($('auto-blink').checked && blink > 0) {
+    v.eyeBlinkLeft = Math.max(v.eyeBlinkLeft || 0, blink);
+    v.eyeBlinkRight = Math.max(v.eyeBlinkRight || 0, blink);
+  }
+  if ($('look-at').checked) {
+    const gx = gaze.x, gy = gaze.y;
+    v.eyeLookOutLeft = Math.max(0, gx); v.eyeLookInRight = Math.max(0, gx);
+    v.eyeLookInLeft = Math.max(0, -gx); v.eyeLookOutRight = Math.max(0, -gx);
+    v.eyeLookUpLeft = v.eyeLookUpRight = Math.max(0, gy);
+    v.eyeLookDownLeft = v.eyeLookDownRight = Math.max(0, -gy);
+    v.headYaw = (v.headYaw || 0) + 0.25 * gx;
+    v.headPitch = (v.headPitch || 0) + 0.2 * gy;
+  }
+  return v;
+}
+function applyRig() {
+  if (!state.rig || !state.model) return;
+  const ev = state.rig.evaluate(effectiveValues());
+  for (let j = 0; j < state.rig.joints.length; j++) {
+    const J = state.rig.joints[j], bone = state.bones[J.name];
+    if (!bone) continue;
+    const d = ev.delta.subarray(j * 6, j * 6 + 6);
+    bone.position.set(J.rest_translation[0] + d[0], J.rest_translation[1] + d[1], J.rest_translation[2] + d[2]);
+    _m4.copy(state.restR[j]).multiply(eulerZYX(d[3], d[4], d[5]));
+    bone.quaternion.setFromRotationMatrix(_m4);
+  }
+  for (const mesh of state.morphMeshes) {
+    const dict = mesh.morphTargetDictionary;
+    for (const [name, i] of Object.entries(dict)) mesh.morphTargetInfluences[i] = ev.weights[name] || 0;
+  }
+  dirty = true;
+}
+
+// ---- animation ------------------------------------------------------------------------------
+let tween = null;
+function tweenTo(target, seconds) {
+  const from = Object.assign({}, state.values);
+  const keys = new Set([...Object.keys(from), ...Object.keys(target)]);
+  tween = { from, target, keys, t0: performance.now(), dur: seconds * 1000 };
+}
+function stopAnim() { state.anim = null; $('anim-msg').textContent = ''; }
+function playFrames(frames, label) {       // frames: [{t (s), v: {...}}]
+  state.anim = { frames, t0: performance.now(), label };
+}
+function sampleFrames(frames, t) {
+  if (t >= frames[frames.length - 1].t) return null;
+  let i = 0;
+  while (i < frames.length - 2 && frames[i + 1].t < t) i++;
+  const a = frames[i], b = frames[i + 1], f = Math.min(1, Math.max(0, (t - a.t) / Math.max(1e-6, b.t - a.t)));
+  const v = {};
+  for (const k of new Set([...Object.keys(a.v), ...Object.keys(b.v)])) v[k] = (a.v[k] || 0) * (1 - f) + (b.v[k] || 0) * f;
+  return v;
+}
+$('rom').addEventListener('click', () => {
+  if (!state.rig) return;
+  const frames = [{ t: 0, v: {} }];
+  let t = 0;
+  for (const c of state.rig.def.controls) {
+    if (c.min < 0) frames.push({ t: t + 0.25, v: { [c.name]: 1 } }, { t: t + 0.6, v: { [c.name]: -1 } }, { t: t + 0.8, v: {} });
+    else frames.push({ t: t + 0.3, v: { [c.name]: 1 } }, { t: t + 0.6, v: {} });
+    frames[frames.length - 2].label = c.name;
+    t = frames[frames.length - 1].t;
+  }
+  playFrames(frames, 'range of motion');
+});
+$('talk').addEventListener('click', () => {
+  const seq = ['A', 'M', 'E', 'O', 'I', 'U', 'A', 'M', 'O', 'E'];
+  const frames = [{ t: 0, v: {} }];
+  seq.forEach((p, i) => frames.push({ t: 0.18 * (i + 1), v: PRESETS[p], label: p }));
+  frames.push({ t: 0.18 * (seq.length + 1), v: {} });
+  const loop = [];
+  for (let r = 0; r < 4; r++) for (const f of frames) loop.push({ t: f.t + r * 0.18 * (seq.length + 1), v: f.v, label: f.label });
+  playFrames(loop, 'talk loop');
+});
+$('stop').addEventListener('click', stopAnim);
+$('track').addEventListener('change', async () => {
+  const f = $('track').files[0];
+  if (!f) return;
+  const LR = ['browDownLeft', 'browDownRight', 'browInnerUp', 'browOuterUpLeft', 'browOuterUpRight', 'cheekPuff', 'cheekSquintLeft', 'cheekSquintRight', 'eyeBlinkLeft', 'eyeBlinkRight', 'eyeLookDownLeft', 'eyeLookDownRight', 'eyeLookInLeft', 'eyeLookInRight', 'eyeLookOutLeft', 'eyeLookOutRight', 'eyeLookUpLeft', 'eyeLookUpRight', 'eyeSquintLeft', 'eyeSquintRight', 'eyeWideLeft', 'eyeWideRight', 'jawForward', 'jawLeft', 'jawOpen', 'jawRight', 'mouthClose', 'mouthDimpleLeft', 'mouthDimpleRight', 'mouthFrownLeft', 'mouthFrownRight', 'mouthFunnel', 'mouthLeft', 'mouthLowerDownLeft', 'mouthLowerDownRight', 'mouthPressLeft', 'mouthPressRight', 'mouthPucker', 'mouthRight', 'mouthRollLower', 'mouthRollUpper', 'mouthShrugLower', 'mouthShrugUpper', 'mouthSmileLeft', 'mouthSmileRight', 'mouthStretchLeft', 'mouthStretchRight', 'mouthUpperUpLeft', 'mouthUpperUpRight', 'noseSneerLeft', 'noseSneerRight'];
+  const frames = [];
+  for (const line of (await f.text()).split('\n')) {
+    const p = line.trim().split(/\s+/).map(Number);
+    if (p.length !== 53 && p.length !== 55) continue;
+    const v = {};
+    LR.forEach((n, i) => { v[n] = p[2 + i]; });     // p[1] is _neutral
+    frames.push({ t: p[0], v });
+  }
+  if (frames.length < 2) { $('anim-msg').textContent = 'no frames (53 or 55 numbers per line)'; return; }
+  const t0 = frames[0].t;
+  frames.forEach((fr) => { fr.t -= t0; });
+  playFrames(frames, `${f.name}: ${frames.length} frames`);
+});
+let nextBlink = performance.now() + 2500, blinkT0 = 0;
+renderer.domElement.addEventListener('pointermove', (e) => {
+  const r = renderer.domElement.getBoundingClientRect();
+  pointer = { x: ((e.clientX - r.left) / r.width) * 2 - 1, y: -(((e.clientY - r.top) / r.height) * 2 - 1) };
+});
+renderer.domElement.addEventListener('pointerleave', () => { pointer = null; });
+function tick(now) {
+  requestAnimationFrame(tick);
+  let changed = false;
+  if (tween) {
+    const f = Math.min(1, (now - tween.t0) / tween.dur), s = f * f * (3 - 2 * f);
+    for (const k of tween.keys) state.values[k] = (tween.from[k] || 0) * (1 - s) + (tween.target[k] || 0) * s;
+    if (f >= 1) { tween = null; syncSliders(); }
+    changed = true;
+  }
+  if (state.anim) {
+    const t = (now - state.anim.t0) / 1000;
+    const v = sampleFrames(state.anim.frames, t);
+    if (!v) stopAnim();
+    else {
+      state.values = v;
+      const cur = state.anim.frames.filter((fr) => fr.t <= t && fr.label).pop();
+      $('anim-msg').textContent = `${state.anim.label}${cur ? ' · ' + cur.label : ''}`;
+    }
+    changed = true;
+  }
+  if ($('auto-blink').checked) {
+    if (now > nextBlink) { blinkT0 = now; nextBlink = now + 2200 + Math.random() * 3500; }
+    const bt = (now - blinkT0) / 1000;
+    const b = bt < 0.08 ? bt / 0.08 : bt < 0.2 ? 1 - (bt - 0.08) / 0.12 : 0;
+    if (b !== blink) { blink = b; changed = true; }
+  }
+  if ($('look-at').checked) {
+    const tgt = pointer ? { x: Math.max(-1, Math.min(1, pointer.x * 1.6)), y: Math.max(-1, Math.min(1, pointer.y * 1.6)) } : { x: 0, y: 0 };
+    const nx = gaze.x + (tgt.x - gaze.x) * 0.15, ny = gaze.y + (tgt.y - gaze.y) * 0.15;
+    if (Math.abs(nx - gaze.x) + Math.abs(ny - gaze.y) > 1e-4) { gaze = { x: nx, y: ny }; changed = true; }
+  }
+  if (changed) { applyRig(); if (tween || state.anim) syncSliders(); }
+  if (dirty) { renderer.render(scene, camera); dirty = false; }
+}
+requestAnimationFrame(tick);
+
+// ---- loading ------------------------------------------------------------------------------
+const loader = new GLTFLoader();
+let loadGen = 0;
+async function loadRig(h) {
+  const gen = ++loadGen;
+  $('empty').hidden = false;
+  $('empty').textContent = 'loading rig…';
+  const base = `/v1/heads/${h.id}/rig/`;
+  const [def, gltf] = await Promise.all([api(base + 'rig.json'), loader.loadAsync(base + 'rig.glb')]);
+  if (gen !== loadGen) return;
+  if (state.model) { scene.remove(state.model); state.model.traverse((o) => { o.geometry?.dispose(); }); }
+  if (skelHelper) { scene.remove(skelHelper); skelHelper = null; }
+  state.model = gltf.scene;
+  state.bones = {};
+  state.morphMeshes = [];
+  gltf.scene.traverse((o) => {
+    if (o.isBone) state.bones[o.name] = o;
+    if (o.isMesh) {
+      o.frustumCulled = false;
+      if (o.morphTargetDictionary && Object.keys(o.morphTargetDictionary).length) state.morphMeshes.push(o);
+      for (const m of [].concat(o.material)) {
+        if (/mouth/.test(m.name)) m.side = THREE.DoubleSide;
+        if (/eyeshell/.test(o.name)) m.depthWrite = false;
+      }
+    }
+  });
+  scene.add(gltf.scene);
+  skelHelper = new THREE.SkeletonHelper(gltf.scene);
+  skelHelper.visible = $('bones').checked;
+  scene.add(skelHelper);
+  state.rig = new LinearRig(def);
+  state.restR = def.joints.map(restMatrix3);
+  state.values = {};
+  buildControls(def);
+  applyRig();
+  $('empty').hidden = true;
+  $('vlabel').textContent = `rig.glb · ${def.controls.length} controls · ${def.blendshapes.length} shapes · ${def.joints.length} joints`;
+  setView('front');
+}
+function showFacts(h) {
+  const r = h.rig;
+  const rows = [];
+  if (r) {
+    const rep = r.report || {};
+    rows.push(['template vertices', rep.template?.vertices], ['fit mean / p95 (mm)', rep.register ? `${rep.register.final_mean_dist_mm} / ${rep.register.final_p95_dist_mm}` : ''],
+      ['texture transfer mean (mm)', rep.bake?.mean_transfer_mm], ['shapes / controls', `${rep.shapes} / ${rep.controls}`],
+      ['joints', (rep.joints || []).join(', ')], ['build (s)', rep.seconds]);
+  } else rows.push(['rig', 'not built']);
+  $('facts').innerHTML = rows.map(([k, v]) => `<tr><td>${k}</td><td>${v ?? ''}</td></tr>`).join('');
+  const dl = $('downloads');
+  dl.innerHTML = '';
+  if (r) {
+    for (const [label, key] of [['rig.glb', 'glb'], ['USD package (.zip)', 'usd_zip'], ['rig.usda', 'usda'], ['rig.json', 'json']]) {
+      if (!r.urls[key]) continue;
+      const a = document.createElement('a');
+      a.className = 'dl'; a.href = r.urls[key]; a.textContent = label; a.download = '';
+      dl.appendChild(a);
+    }
+    $('preview-img').src = r.urls.preview || '';
+    $('preview-img').hidden = !r.urls.preview;
+  } else $('preview-img').hidden = true;
+}
+function renderHeads() {
+  const box = $('heads');
+  if (!state.heads.length) { box.innerHTML = '<span class="msg">no fitted heads yet — generate one on the heads page</span>'; return; }
+  box.innerHTML = '';
+  for (const h of state.heads) {
+    const el = document.createElement('div');
+    el.className = 'head' + (state.current?.id === h.id ? ' sel' : '');
+    el.innerHTML = `<img src="${h.urls.portrait || ''}" alt=""><div><b></b><span>${h.id} · ${h.rig ? '<span class="tag">rigged</span>' : 'no rig'}</span></div>`;
+    el.querySelector('b').textContent = h.subject || '(head)';
+    el.addEventListener('click', () => select(h));
+    box.appendChild(el);
+  }
+}
+async function select(h) {
+  state.current = h;
+  renderHeads();
+  showFacts(h);
+  $('build').disabled = !!state.job;
+  $('build').textContent = h.rig ? 'Rebuild rig for selected head' : 'Build rig for selected head';
+  if (h.rig) {
+    try { await loadRig(h); } catch (e) { $('msg').textContent = String(e); $('msg').className = 'msg bad'; }
+  } else {
+    $('empty').hidden = false;
+    $('empty').textContent = 'no rig yet: build one (≈ 1–2 min, GPU optional)';
+  }
+}
+async function refresh(selectId) {
+  const data = await api('/v1/heads');
+  state.heads = data.heads;
+  renderHeads();
+  const want = selectId || state.current?.id || new URLSearchParams(location.search).get('head');
+  const h = state.heads.find((x) => x.id === want) || state.heads.find((x) => x.rig);
+  if (h && (!state.current || state.current.id !== h.id || selectId)) await select(h);
+}
+$('build').addEventListener('click', async () => {
+  if (!state.current) return;
+  $('build').disabled = true;
+  $('msg').className = 'msg';
+  try {
+    const job = await api('/v1/jobs', { kind: 'rig', head_id: state.current.id, res: +$('res').value });
+    state.job = job.id;
+    const id = state.current.id;
+    for (;;) {
+      await new Promise((r) => setTimeout(r, 1000));
+      const j = await api(`/v1/jobs/${job.id}`);
+      $('bar').style.width = `${Math.round(j.progress * 100)}%`;
+      $('msg').textContent = j.message;
+      if (j.state === 'done') break;
+      if (j.state === 'failed' || j.state === 'cancelled') throw new Error(j.error || j.state);
+    }
+    state.job = null;
+    await refresh(id);
+  } catch (e) {
+    state.job = null;
+    $('msg').textContent = String(e.message || e);
+    $('msg').className = 'msg bad';
+  }
+  $('build').disabled = false;
+});
+api('/health').then((h) => {
+  $('health').textContent = h.rig?.available ? `rig builder: ${h.rig.python}` : `rig builder unavailable: ${h.rig?.reason || '?'}`;
+}).catch(() => { $('health').textContent = 'server unreachable'; });
+resize();
+refresh().catch((e) => { $('msg').textContent = String(e); });
+</script>
+</body>
+</html>

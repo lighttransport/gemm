@@ -229,8 +229,41 @@ class EyeService:
                         "urls": {n.split(".")[0]: base + n for n in ("portrait.png", "landmarks.png", "pixal3d.glb",
                                                                     "head_eyes.glb", "fit.json", "skin_basecolor.png", "skin_normal.png",
                                                                     "skin_orm.png", "skin_mask.png", "skin.json")
-                                 if (meta.parent / n).is_file()}})
+                                 if (meta.parent / n).is_file()},
+                        "rig": self._rig_summary(meta.parent, base)})
         return out
+
+    @staticmethod
+    def _rig_summary(folder: Path, base: str) -> dict | None:
+        rep = folder / "rig" / "rig_report.json"
+        if not rep.is_file():
+            return None
+        try:
+            report = json.loads(rep.read_text())
+        except ValueError:
+            return None
+        keys = {"glb": "rig.glb", "json": "rig.json", "usda": "rig.usda", "usd_zip": "rig_usd.zip",
+                "preview": "preview.png", "report": "rig_report.json"}
+        urls = {k: f"{base}rig/{n}" for k, n in keys.items() if (folder / "rig" / n).is_file()}
+        brief = {k: report.get(k) for k in ("version", "template", "register", "bake", "shapes", "controls",
+                                             "joints", "seconds")}
+        return {"urls": urls, "report": brief}
+
+    def rig_file(self, hid: str, name: str) -> Path:
+        """A rig output: the fixed names of rig/job.py or textures/<name>.png."""
+        from .rig.job import RIG_FILES
+        if not (isinstance(hid, str) and hid.isalnum() and len(hid) <= 32):
+            raise ServiceError("no such file")
+        ok = name in RIG_FILES or (name.startswith("textures/") and name.count("/") == 1
+                                   and name.endswith(".png") and all(c.isalnum() or c in "_-."
+                                                                     for c in name[len("textures/"):])
+                                   and ".." not in name)
+        if not ok:
+            raise ServiceError("no such file")
+        path = self.work / "heads" / hid / "rig" / name
+        if not path.is_file():
+            raise ServiceError("no such file")
+        return path
 
     def head_file(self, hid: str, name: str = "") -> Path:
         from .head.pipeline import FILES

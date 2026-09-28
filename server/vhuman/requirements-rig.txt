@@ -1,0 +1,6 @@
+# Facial rig builder (server/vhuman/rig): registration and shape smoothing use
+# PyTorch (CUDA optional); scipy for the k-d trees and the spherical hull.
+numpy
+pillow
+scipy
+torch

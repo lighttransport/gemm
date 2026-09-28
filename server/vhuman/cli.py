@@ -9,6 +9,8 @@
     python3 -m server.vhuman.cli replate
     python3 -m server.vhuman.cli head --subject "a 30-year-old woman with short dark hair" [--quality standard]
     python3 -m server.vhuman.cli head-fit --portrait P.png --glb pixal3d.glb
+    python3 -m server.vhuman.cli rig --head ID [--res 2048]      (template fit, skeleton, shapes, GLB + USD)
+    python3 -m server.vhuman.cli rig-track --head ID --track T.txt --out anim.usda   (LightRig track -> UsdSkel)
     python3 -m server.vhuman.cli baseline --source analytic|qwen [--quality preview]
     python3 -m server.vhuman.cli bench
 
@@ -247,6 +249,25 @@ def cmd_baseline(args) -> dict:
 
 
 
+def cmd_rig(args) -> dict:
+    """The rig job without the server: a subprocess in the rig interpreter."""
+    from .rig import job as rig_job
+    svc = EyeService(Path(args.work))
+    return rig_job.rig_job(svc, {"head_id": args.head, "res": args.res, "iters": args.iters}, _progress,
+                           threading.Event(), python=args.rig_python)
+
+
+def cmd_rig_track(args) -> dict:
+    """Evaluate a LightRig face track on a built rig -> a UsdSkel animation layer."""
+    from .rig import rigdef, usd
+    svc = EyeService(Path(args.work))
+    rig_json = svc.rig_file(args.head, "rig.json")
+    rig = rigdef.Rig(json.loads(rig_json.read_text()))
+    times, frames = rigdef.read_track(args.track)
+    return usd.write_track(rig, times, frames, Path(args.out), fps=args.fps,
+                           rig_layer=str(rig_json.parent / "rig.usda"))
+
+
 def cmd_bench(args) -> dict:
     """Timing targets (cold caches): procedural textures and renders."""
     out = {}
@@ -275,6 +296,8 @@ def main(argv=None) -> int:
     ap.add_argument("--work", default=str(WORK))
     ap.add_argument("--qwen-python", default=str(DEFAULT_QWEN_PY) if DEFAULT_QWEN_PY.exists() else None)
     ap.add_argument("--mock", action="store_true", help="mock Qwen and Pixal3D (no GPU)")
+    default_rig = ROOT / "tmp/vhuman-rig-venv/bin/python"
+    ap.add_argument("--rig-python", default=str(default_rig) if default_rig.exists() else None)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def with_params(sp):
@@ -351,6 +374,17 @@ def main(argv=None) -> int:
     sp.add_argument("--qwen-preset", choices=("fast12", "low8"), default="fast12")
     sp.add_argument("--skin", help="Skin controls as JSON or @file.json")
     sp.set_defaults(fn=cmd_head_fit)
+    sp = sub.add_parser("rig", help="facial rig of a fitted head (needs --rig-python: numpy, scipy, torch)")
+    sp.add_argument("--head", required=True)
+    sp.add_argument("--res", type=int, choices=(1024, 2048, 4096), default=2048)
+    sp.add_argument("--iters", type=int, default=600)
+    sp.set_defaults(fn=cmd_rig)
+    sp = sub.add_parser("rig-track", help="LightRig face track (timestamp + 52 controls per line) -> USD animation")
+    sp.add_argument("--head", required=True)
+    sp.add_argument("--track", required=True)
+    sp.add_argument("--out", required=True)
+    sp.add_argument("--fps", type=float, default=30.0)
+    sp.set_defaults(fn=cmd_rig_track)
     sub.add_parser("replate", help="re-extract the plate library from its source images").set_defaults(fn=cmd_replate)
     sub.add_parser("bench", help="timing targets").set_defaults(fn=cmd_bench)
     args = ap.parse_args(argv)

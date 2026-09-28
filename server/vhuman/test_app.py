@@ -67,6 +67,18 @@ class ServerTest(unittest.TestCase):
             time.sleep(0.2)
         self.fail("job did not finish")
 
+    def test_rig_page_and_routes(self):
+        status, ctype, body = self.get("/rig")
+        self.assertEqual(status, 200)
+        self.assertIn(b"class LinearRig", body)
+        self.assertIn("rig", json.loads(self.get("/health")[2]))
+        for bad in ("/v1/heads/abc/rig/rig.glb", "/v1/heads/abc/rig/../fit.json", "/v1/heads/abc/rig/fit_cache.pkl"):
+            self.assertEqual(self.status_of(bad), 404)
+        status, _, body = self.post("/v1/jobs", {"kind": "rig", "head_id": "missing"})
+        self.assertEqual(status, 202)
+        job = self.wait_job(json.loads(body)["id"])
+        self.assertEqual(job["state"], "failed")
+
     def test_page_health_schema(self):
         status, ctype, body = self.get("/")
         self.assertEqual(status, 200)
