@@ -151,3 +151,31 @@ Reaching the node roof needs about 9.4 B/cycle per core.
 | Panel kernels + 16 KiB next-stage prefetch | 2.92 | 59.3% |
 
 That is 2.97× faster. The two-panel kernels do not improve the chain: it is bound by per-stage start-up (about 10 µs stages, 1.4 µs barrier). Use 64 KiB pages or per-thread 2 MiB-aligned slices: XOS large pages shared across CMGs cost 1.8×.
+
+## Q5 variants and prefill GEMM partitioning (2026-09-28 evening)
+
+**Q5_K down projection** (native, `--verify` bad=0, cycles):
+
+| Case | Q5_KP16 v1pf | Q5_KP16 v4pf (fifth bit merged, half the SDOTs) | Q5_KB16 (byte-expanded, +52% bytes) |
+|---|---:|---:|---:|
+| 1T L1-resident | 404 | 394 | 290 |
+| 48T, 8 parts | 21253 | 20891 | 24384 |
+
+Decode is bandwidth-bound at 47 threads, so keep the compact panel. v4pf is a small win everywhere.
+
+**Prefill GEMM `gk_gemm_panel64` at 47–48 threads**, K = 4096, % of the int8 SDOT peak (clair `gemm.c`, `measurements/hw-20260928-4n/gemm8`–`gemm12`):
+
+| Shape | Mode | sb256 | sb128 | sb32 |
+|---|---|---:|---:|---:|
+| 3072 rows, 48 tokens | row split, output stride = rows | 58.9 | 53.5 | 38.5 |
+| 3072 rows, 48 tokens | row split, **output stride padded by 64 floats** | **64.1** | **58.8** | **41.5** |
+| 2304 rows (KDA qkv per rank), 192 tokens | CMG-token | 60.4 | – | – |
+| 2304 rows, 504 tokens | CMG-token | 50.6 | 45.5 | 32.0 |
+
+Modes and findings:
+- **CMG-token mode** splits tokens across CMGs and 64-row panels across a CMG's cores, with one weight replica per CMG. It runs real per-rank shapes (rows only need to be a multiple of 64) as efficiently as row mode.
+- **Integration rule: pad the output row stride.** Keep `(ldy * 4 / 256) % 64` away from multiples of 16. With ldy = 3072, a 6-token output tile folds onto 4 of the 64 L1 sets.
+- **At 504 tokens the output tiles are a capacity problem** (126 KiB of live tiles per panel cycle through L2 once per K chunk), and the loop nest loses about 14 points against 48 tokens. Things that do not fix it:
+  - Token blocking (`gk_gemm_tblock`) is worse (41%), because each block re-streams the weight panel. Default 0 = unblocked.
+  - K chunks of 256, 1024, 2048 and 4096 are worse than 512.
+- **Next:** a loop nest that keeps a token block's output tiles in L1 without re-streaming weights from HBM. For example, per-CMG token blocks sized so that the CMG's weight replica stays L2-resident across the blocks, or f32 partial sums in a packed scratch.

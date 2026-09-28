@@ -216,6 +216,57 @@ void gk_q8_0r16_v3pf4k(const gk_mv *m, int r0, int r1) { gk_q8_0r16_v3pf(m, r0, 
 void gk_q8_0r16_v3pf16k(const gk_mv *m, int r0, int r1) { gk_q8_0r16_v3pf(m, r0, r1, 16384); }
 void gk_q8_0r16_v3pf64k(const gk_mv *m, int r0, int r1) { gk_q8_0r16_v3pf(m, r0, r1, 65536); }
 
+/* Fixed-offset form of the same 16 KiB prefetch pattern. It lets the
+ * compiler use PRFM unsigned immediates instead of updating a pointer for
+ * each hint. Keep it separate for native and simulator A/B checks. */
+#define Q8R16_PF_IMM(W) do {                                                     \
+    const int8_t *pfw = (W) + 16384;                                             \
+    __builtin_prefetch(pfw + 0, 0, 2);                                           \
+    __builtin_prefetch(pfw + 256, 0, 2);                                         \
+    __builtin_prefetch(pfw + 512, 0, 2);                                         \
+    __builtin_prefetch(pfw + 768, 0, 2);                                         \
+    __builtin_prefetch(pfw + 1024, 0, 2);                                        \
+    __builtin_prefetch(pfw + 1280, 0, 2);                                        \
+    __builtin_prefetch(pfw + 1536, 0, 2);                                        \
+    __builtin_prefetch(pfw + 1792, 0, 2);                                        \
+    __builtin_prefetch(pfw + 2048, 0, 2);                                        \
+} while (0)
+
+void gk_q8_0r16_v3pfimm16k(const gk_mv *m, int r0, int r1) {
+    const int nb = m->columns / 32;
+    const size_t pb = gk_panel_bytes_q8_0r16(m->columns);
+    const svbool_t p8 = svptrue_b8(), p32 = svptrue_b32();
+    const int8_t *xq = m->a->xq;
+    const float *xd = m->a->xd;
+    for (int r = r0; r < r1; r += 16) {
+        const int8_t *w = (const int8_t *)(m->w + (size_t)(r / 16) * pb);
+        svfloat32_t f0 = svdup_f32(0.0f), f1 = f0;
+        for (int b = 0; b < nb; b += 4, w += 4 * 576) {
+            Q8R16_PF_IMM(w);
+            const int8_t *x = xq + 32 * b;
+            const svfloat32_t xs = svld1rq_f32(p32, xd + b);
+            svint32_t a0, b0, a1, b1, a2, b2, a3, b3;
+            Q8R16_HALF3(a0, w, x);
+            Q8R16_HALF3(b0, w + 256, x + 16);
+            Q8R16_HALF3(a1, w + 576, x + 32);
+            Q8R16_HALF3(b1, w + 576 + 256, x + 48);
+            Q8R16_HALF3(a2, w + 1152, x + 64);
+            Q8R16_HALF3(b2, w + 1152 + 256, x + 80);
+            Q8R16_HALF3(a3, w + 1728, x + 96);
+            Q8R16_HALF3(b3, w + 1728 + 256, x + 112);
+            f0 = svmla_f32_x(p32, f0, svcvt_f32_s32_x(p32, svadd_s32_x(p32, a0, b0)),
+                svmul_lane_f32(svld1_f32(p32, (const float *)(w + 512)), xs, 0));
+            f1 = svmla_f32_x(p32, f1, svcvt_f32_s32_x(p32, svadd_s32_x(p32, a1, b1)),
+                svmul_lane_f32(svld1_f32(p32, (const float *)(w + 576 + 512)), xs, 1));
+            f0 = svmla_f32_x(p32, f0, svcvt_f32_s32_x(p32, svadd_s32_x(p32, a2, b2)),
+                svmul_lane_f32(svld1_f32(p32, (const float *)(w + 1152 + 512)), xs, 2));
+            f1 = svmla_f32_x(p32, f1, svcvt_f32_s32_x(p32, svadd_s32_x(p32, a3, b3)),
+                svmul_lane_f32(svld1_f32(p32, (const float *)(w + 1728 + 512)), xs, 3));
+        }
+        svst1_f32(svwhilelt_b32(r, r1), m->y + r, svadd_f32_x(p32, f0, f1));
+    }
+}
+
 /* v4: v3pf16k with two 16-row panels per iteration sharing the LD1RW
  * activation broadcasts and loop work (the panel kernels are bound by how
  * much work fits in the ROB; see gk_q4_kp16_v3pf). */

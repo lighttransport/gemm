@@ -189,26 +189,36 @@ void gk_pack_act6(int sb, int8_t *xp, float *xsp, const int8_t *x, size_t ldx,
  * group (K bytes x 6 and K/sb x 6 floats per group). */
 /* K chunk (columns) of gk_gemm_panel64; a multiple of the scale block. */
 int gk_gemm_kchunk = 512;
+/* Token block of gk_gemm_panel64 (tokens, multiple of 6; 0 = no blocking). */
+int gk_gemm_tblock = 0;
 
 void gk_gemm_panel64(int sb, const uint8_t *w, int K, int r0, int r1, int t0, int t1,
                      const int8_t *xp, const float *xsp, float *y, size_t ldy) {
     /* K is processed in chunks of up to 512 columns so a 64-row weight chunk
      * (32-64 KiB) stays in L1 while every 6-token tile reuses it; the f32
-     * output tile accumulates across chunks. */
+     * output tile accumulates across chunks.  gk_gemm_tblock optionally
+     * blocks tokens so a block's output tiles (1.5 KiB per 6 tokens) stay in
+     * L1; measured at 504 tokens x 47-48 threads it LOSES (50% -> 41% of int8
+     * peak): each block re-streams the weight panel, which costs more than
+     * spilling the output tiles.  Default 0 = unblocked. */
     const size_t pb = gk_panel64_bytes(sb, K), blk = 64 * (size_t)sb + 256;
     const int kc = gk_gemm_kchunk > sb ? gk_gemm_kchunk / sb * sb : sb;
+    const int tb = gk_gemm_tblock >= 6 ? gk_gemm_tblock / 6 * 6 : t1 - t0;
     for (int r = r0; r < r1; r += 64) {
         const uint8_t *wr = w + (size_t)(r / 64) * pb;
-        for (int t = t0; t + 6 <= t1; t += 6)
-            for (int u = 0; u < 6; ++u) __builtin_memset(y + (size_t)(t + u) * ldy + r, 0, 64 * 4);
-        for (int k0 = 0; k0 < K; k0 += kc) {
-            const int kn = K - k0 < kc ? K - k0 : kc;
-            for (int t = t0; t + 6 <= t1; t += 6)
-                (gk_gemm_l1pf == 3 ? gk_gemm_tile6x4p3_asm : gk_gemm_l1pf == 2 ? gk_gemm_tile6x4p2_asm : gk_gemm_l1pf ? gk_gemm_tile6x4pp_asm : gk_gemm_tile6x4p_asm)(
-                                     (const int8_t *)(wr + (size_t)(k0 / sb) * blk), kn / sb, sb / 16,
-                                     xp + (size_t)(t / 6) * 6 * K + (size_t)(k0 / 4) * 24,
-                                     xsp + (size_t)(t / 6) * 6 * (K / sb) + (size_t)(k0 / sb) * 6,
-                                     y + (size_t)t * ldy + r, ldy * 4);
+        for (int b0 = t0; b0 < t1; b0 += tb) {
+            const int b1 = t1 - b0 < tb ? t1 : b0 + tb;
+            for (int t = b0; t + 6 <= b1; t += 6)
+                for (int u = 0; u < 6; ++u) __builtin_memset(y + (size_t)(t + u) * ldy + r, 0, 64 * 4);
+            for (int k0 = 0; k0 < K; k0 += kc) {
+                const int kn = K - k0 < kc ? K - k0 : kc;
+                for (int t = b0; t + 6 <= b1; t += 6)
+                    (gk_gemm_l1pf == 3 ? gk_gemm_tile6x4p3_asm : gk_gemm_l1pf == 2 ? gk_gemm_tile6x4p2_asm : gk_gemm_l1pf ? gk_gemm_tile6x4pp_asm : gk_gemm_tile6x4p_asm)(
+                                         (const int8_t *)(wr + (size_t)(k0 / sb) * blk), kn / sb, sb / 16,
+                                         xp + (size_t)(t / 6) * 6 * K + (size_t)(k0 / 4) * 24,
+                                         xsp + (size_t)(t / 6) * 6 * (K / sb) + (size_t)(k0 / sb) * 6,
+                                         y + (size_t)t * ldy + r, ldy * 4);
+            }
         }
     }
 }
