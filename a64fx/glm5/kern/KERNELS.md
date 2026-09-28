@@ -178,4 +178,11 @@ Modes and findings:
 - **At 504 tokens the output tiles are a capacity problem** (126 KiB of live tiles per panel cycle through L2 once per K chunk), and the loop nest loses about 14 points against 48 tokens. Things that do not fix it:
   - Token blocking (`gk_gemm_tblock`) is worse (41%), because each block re-streams the weight panel. Default 0 = unblocked.
   - K chunks of 256, 1024, 2048 and 4096 are worse than 512.
-- **Next:** a loop nest that keeps a token block's output tiles in L1 without re-streaming weights from HBM. For example, per-CMG token blocks sized so that the CMG's weight replica stays L2-resident across the blocks, or f32 partial sums in a packed scratch.
+- **Balance the per-thread work, not the per-CMG work, at 47 threads.** The 11-thread CMG owns ⌈36/11⌉ = 4 panels per thread instead of 3. Giving each CMG a token share proportional to 1/⌈panels/threads⌉ takes 2304 × 504 tokens from 50.2 to **55.5%** (48 threads: 59.1%), and 192 tokens from 49.1 to 57.3%.
+- **Measured and left off (default-off knobs):**
+  - token blocks (`gk_gemm_tblock`);
+  - output-tile prefetch (`gk_gemm_ypf`): +3 points at 504 tokens, −4 at 48;
+  - next-chunk L2 prefetch (`gk_gemm_chunkpf`);
+  - a 2D row × token CMG split.
+
+  An L2-hot 768-row replica reaches 66%.
