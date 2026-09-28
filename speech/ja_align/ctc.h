@@ -45,7 +45,8 @@ int ctc_segmentation(const float *logp, int T, int V, const int *tgt, int L,
 
 #endif /* JA_CTC_H */
 
-#ifdef JA_CTC_IMPLEMENTATION
+#if defined(JA_CTC_IMPLEMENTATION) && !defined(JA_CTC_IMPL_DONE)
+#define JA_CTC_IMPL_DONE
 
 #include <math.h>
 #include <stdlib.h>

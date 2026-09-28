@@ -21,7 +21,8 @@ void   ja_yin(const float *x, int n, int sr, int win, int hop, float fmin, float
 
 #endif /* JA_DSP_H */
 
-#ifdef JA_DSP_IMPLEMENTATION
+#if defined(JA_DSP_IMPLEMENTATION) && !defined(JA_DSP_IMPL_DONE)
+#define JA_DSP_IMPL_DONE
 
 #include <math.h>
 #include <stdlib.h>

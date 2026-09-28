@@ -184,6 +184,27 @@ make -C speech test
 
 Speed: CPU RTF ≈ 0.2 (7.7 s of audio in 1.6 s on 16 threads, Threadripper 1950X).
 
+### CUDA encoder
+
+```
+make -C speech cuda
+speech/build/ja_align_cuda --cuda --model ja_align.safetensors --wav x.wav --out aux.json
+```
+
+- `ja_align/ja_cuda.h` keeps the module self-contained. It `dlopen`s `libcuda.so.1` and `libnvrtc.so` and declares only the ~25 driver/NVRTC entry points it uses, so it needs no CUDA headers and links only `-ldl`.
+- The kernels are:
+  - a tiled SGEMM whose A operand has a row stride, so strided convolutions run as a plain GEMM;
+  - the grouped positional conv, as a gathered GEMM with one grid z-slice per group;
+  - the CNN front end (conv0 plus per-channel GroupNorm + GELU);
+  - LayerNorm, and bidirectional multi-head attention (online softmax, 4 warps per query).
+- It plugs into `ja_align_run_ex` through a `ja_encoder_fn` hook. CTC decoding, prosody and visemes stay on the CPU.
+- `tts_ja_cuda` uses it automatically with `--backend cuda`.
+
+| Check | Result |
+|---|---|
+| every encoder stage and both heads' log-posteriors vs the CPU encoder (7.7 s utterance) | cos 1.0, log-posterior max abs 5e-5; decoded phonemes and kana identical |
+| speed, 7.7 s of audio (RTX 5060 Ti vs 16 CPU threads) | 0.26 s vs 1.97 s (RTF 0.034 vs 0.26) |
+
 **Edge padding.** wav2vec2 CTC misses speech that begins right at the start of the buffer, and TTS output starts speaking almost immediately. `ja_align` therefore pads 0.5 s of silence on both sides (`ja_align_opts.pad`) and drops the padded frames afterwards. `align_reference.py --pad 0.5` does the same, so end-to-end comparisons stay like-for-like.
 
 ## Intelligibility eval (Qwen3-TTS, Japanese)
@@ -201,4 +222,37 @@ python speech/ref/asr_eval.py --out-dir tmp/speech/eval1 --seeds 1 2
 | raw wav | 16.5% (12/40 above 20%) | 17.8% (17/40 above 20%) |
 | wav padded with 0.5 s silence | **4.5%** (median 3.7%) | **4.5%** (median 3.6%) |
 
-The C runner is exactly as intelligible as the reference implementation. The remaining errors are mostly small-kana and long-vowel confusions (ひい for ひー, じぎょー for じゅぎょー), which the model card lists as its known weak spots.
+The C runner is exactly as intelligible as the reference implementation.
+
+## Pitch-accent check
+
+```
+python speech/ref/accent_eval.py --eval-dir tmp/speech/eval1 --jsut jsut_ver1.1 --jsut-n 100 \
+    --ja-align speech/build/ja_align_cuda --extra-args=--cuda
+```
+
+**Method**
+1. pyopenjtalk full-context labels (used only as an evaluation oracle) give each utterance's accent phrases, with mora count *n* and accent type *k*.
+2. `ja_align` force-aligns the labelled phonemes.
+3. Each mora gets the median YIN F0 of its vowel, in semitones.
+
+**What is scored, per accent phrase**
+- **Accented phrases** (1 ≤ *k* < *n*): the largest F0 drop must fall right after the nucleus. One mora of lag is allowed, because the fall is realized late. The drop must be at least 1 semitone.
+- **Unaccented phrases**: no drop of 1.5 semitones or more inside the phrase.
+- **Chance**: the same F0 scored against accent types shuffled among phrases of the same length.
+
+**Human reference.** The same pipeline was run on 99 JSUT recordings of read speech by a native speaker. They are used only as test data and are not redistributed.
+
+| Speech | Nucleus placement | Chance | Above chance | Unaccented phrases flat |
+|---|---|---|---|---|
+| JSUT (human, 99 utterances) | 61.6% | 41.1% | +20.5 | 76.0% |
+| Qwen3-TTS, C/CUDA runner (40) | 46.3% | 29.6% | +16.7 | 94.4% |
+| Qwen3-TTS, PyTorch qwen_tts (40) | 39.6% | 25.7% | +13.9 | 95.8% |
+
+**Findings**
+- The metric is noisy even for human speech. Human speech is only 20 points above chance, and the likely causes are OpenJTalk accent-prediction errors and phrase-boundary and F0 noise.
+- Measured against that ceiling, Qwen3-TTS (Ono_Anna) realizes about 70–80% of the accent-nucleus signal a human reader shows.
+- Qwen3-TTS keeps unaccented phrases flatter than the human reader does, which suggests a compressed pitch range.
+- The difference between the C runner and PyTorch is sampling variance: both run the same model, and greedy codes are identical.
+- The phrase-initial rise was also measured. It is at chance even for the human reader, so it is left out as uninformative.
+- One mispronounced accent seen by inspection: 二時間 rises where the dictionary puts a fall after じ. The remaining errors are mostly small-kana and long-vowel confusions (ひい for ひー, じぎょー for じゅぎょー), which the model card lists as its known weak spots.

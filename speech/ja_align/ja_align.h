@@ -68,12 +68,17 @@ typedef struct {
 
 void ja_align_opts_default(ja_align_opts *o);
 int  ja_align_run(w2v2_model *m, const float *wav, int n, int sr, const ja_align_opts *o, ja_align_result *r);
+/* same with a pluggable encoder (e.g. the CUDA encoder in ja_cuda.h); wav16k is mono 16 kHz */
+typedef int (*ja_encoder_fn)(void *ctx, const float *wav16k, int n, w2v2_output *out, const char *dump_dir);
+int  ja_align_run_ex(ja_encoder_fn enc, void *enc_ctx, const float *wav, int n, int sr,
+                     const ja_align_opts *o, ja_align_result *r);
 int  ja_align_write_json(const ja_align_result *r, const char *path);
 void ja_align_result_free(ja_align_result *r);
 
 #endif /* JA_ALIGN_H */
 
-#ifdef JA_ALIGN_IMPLEMENTATION
+#if defined(JA_ALIGN_IMPLEMENTATION) && !defined(JA_ALIGN_IMPL_DONE)
+#define JA_ALIGN_IMPL_DONE
 
 #include <math.h>
 #include <stdio.h>
@@ -194,7 +199,16 @@ static void ja__unit_from_seg(ja_unit *u, const ctc_seg *s, const char *const *n
     u->viseme = names == ja_phoneme_names ? ja_phoneme_viseme(u->sym) : 0;
 }
 
+static int ja__cpu_encoder(void *ctx, const float *wav16k, int n, w2v2_output *out, const char *dump) {
+    return w2v2_run((w2v2_model *)ctx, wav16k, n, out, dump);
+}
+
 int ja_align_run(w2v2_model *m, const float *wav, int n, int sr, const ja_align_opts *o, ja_align_result *r) {
+    return ja_align_run_ex(ja__cpu_encoder, m, wav, n, sr, o, r);
+}
+
+int ja_align_run_ex(ja_encoder_fn enc, void *enc_ctx, const float *wav, int n, int sr,
+                    const ja_align_opts *o, ja_align_result *r) {
     memset(r, 0, sizeof(*r));
     int n16 = 0;
     float *x = ja_resample(wav, n, sr, 16000, &n16);
@@ -213,7 +227,7 @@ int ja_align_run(w2v2_model *m, const float *wav, int n, int sr, const ja_align_
     int pf = (int)lroundf(o->pad / (float)JA_FRAME), ps = pf * 320;
     float *xp = (float *)calloc((size_t)n16 + 2 * (size_t)ps, sizeof(float));
     memcpy(xp + ps, x, sizeof(float) * (size_t)n16);
-    int rc_run = w2v2_run(m, xp, n16 + 2 * ps, &out, o->dump_dir);
+    int rc_run = enc(enc_ctx, xp, n16 + 2 * ps, &out, o->dump_dir);
     free(xp);
     free(x);
     if (rc_run) return -1;

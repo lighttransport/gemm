@@ -44,7 +44,11 @@ test: $(BUILD)/test_ja_ctc $(BUILD)/test_ja_dsp
 	$(BUILD)/test_ja_ctc
 	$(BUILD)/test_ja_dsp
 
-cuda: $(BUILD)/qwen3_tts_cuda $(BUILD)/tts_ja_cuda
+cuda: $(BUILD)/qwen3_tts_cuda $(BUILD)/tts_ja_cuda $(BUILD)/ja_align_cuda
+
+# CUDA aligner: still self-contained (libcuda / libnvrtc are dlopen'ed), only -ldl
+$(BUILD)/ja_align_cuda: $(JA)/ja_align_main.c $(JA_HDRS) | $(BUILD)
+	$(CC) $(CFLAGS) -DJA_WITH_CUDA -I$(JA) -o $@ $< -ldl -lm
 
 $(BUILD)/qwen3_tts_cuda: $(QT)/qwen3_tts_main.c $(QT)/qtts_cuda.h $(QT)/qtts_cuda_kernels.h $(QT_HDRS) | $(BUILD)
 	$(CC) $(CFLAGS) -DQTTS_WITH_CUDA -I$(COMMON) -I$(CUDADIR) -I$(QT) -o $@ $(QT)/qwen3_tts_main.c \

@@ -4,11 +4,18 @@
  * ja_align: Japanese speech -> timed phonemes / kana, viseme curves, prosody (JSON).
  *
  *   ja_align --model ja_align.safetensors --wav in.wav [--kana "きょうは…"] [--phonemes "ky o o w a"]
- *            [--fps 30] [--out aux.json] [--posteriors post.npy] [--dump-dir dir]
+ *            [--fps 30] [--out aux.json] [--posteriors post.npy] [--dump-dir dir] [--cuda [--device N]]
  */
 #define JA_ALIGN_IMPLEMENTATION
 #include "ja_align.h"
 #include "ja_wav.h"
+#ifdef JA_WITH_CUDA
+#define JA_CUDA_IMPLEMENTATION
+#include "ja_cuda.h"
+static int cuda_encoder(void *ctx, const float *wav, int n, w2v2_output *out, const char *dump) {
+    return w2v2_cuda_run((w2v2_cuda *)ctx, wav, n, out, dump);
+}
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,6 +31,7 @@ static double now_s(void) {
 
 int main(int argc, char **argv) {
     const char *model = NULL, *wav = NULL, *out = "aux.json", *post = NULL;
+    int use_cuda = 0, device = 0;
     ja_align_opts o;
     ja_align_opts_default(&o);
     for (int i = 1; i < argc; i++) {
@@ -36,6 +44,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--out") && v) { out = v; i++; }
         else if (!strcmp(a, "--posteriors") && v) { post = v; i++; }
         else if (!strcmp(a, "--dump-dir") && v) { o.dump_dir = v; i++; }
+        else if (!strcmp(a, "--cuda")) use_cuda = 1;
+        else if (!strcmp(a, "--device") && v) { device = atoi(v); i++; }
         else { fprintf(stderr, "unknown or incomplete option %s\n", a); return 1; }
     }
     if (!model || !wav) {
@@ -47,11 +57,29 @@ int main(int argc, char **argv) {
     float *x = wav_read(wav, &n, &sr);
     if (!x) { fprintf(stderr, "cannot read %s\n", wav); return 1; }
     double t0 = now_s();
-    w2v2_model *m = w2v2_load(model);
-    if (!m) return 1;
-    double t1 = now_s();
+    w2v2_model *m = NULL;
     ja_align_result r;
-    if (ja_align_run(m, x, n, sr, &o, &r)) { fprintf(stderr, "alignment failed\n"); return 1; }
+    int rc;
+    double t1;
+    if (use_cuda) {
+#ifdef JA_WITH_CUDA
+        w2v2_cuda *g = w2v2_cuda_create(model, device, 1);
+        if (!g) return 1;
+        t1 = now_s();
+        rc = ja_align_run_ex(cuda_encoder, g, x, n, sr, &o, &r);
+        w2v2_cuda_free(g);
+#else
+        (void)device;
+        fprintf(stderr, "built without CUDA (make -C speech cuda)\n");
+        return 1;
+#endif
+    } else {
+        m = w2v2_load(model);
+        if (!m) return 1;
+        t1 = now_s();
+        rc = ja_align_run(m, x, n, sr, &o, &r);
+    }
+    if (rc) { fprintf(stderr, "alignment failed\n"); return 1; }
     double t2 = now_s();
     ja_align_write_json(&r, out);
     if (post) { int dims[2] = { r.T, r.n_phon_cls }; ja_npy_save_f32(post, r.phon_post, 2, dims); }

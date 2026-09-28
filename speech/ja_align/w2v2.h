@@ -37,7 +37,8 @@ void        w2v2_output_free(w2v2_output *o);
 
 #endif /* JA_W2V2_H */
 
-#ifdef JA_W2V2_IMPLEMENTATION
+#if defined(JA_W2V2_IMPLEMENTATION) && !defined(JA_W2V2_IMPL_DONE)
+#define JA_W2V2_IMPL_DONE
 
 #include <math.h>
 #include <stdio.h>

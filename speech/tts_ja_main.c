@@ -30,6 +30,13 @@
 #endif
 #define JA_ALIGN_IMPLEMENTATION
 #include "ja_align.h"
+#ifdef QTTS_WITH_CUDA
+#define JA_CUDA_IMPLEMENTATION
+#include "ja_cuda.h"
+static int cuda_encoder(void *ctx, const float *wav, int n, w2v2_output *out, const char *dump) {
+    return w2v2_cuda_run((w2v2_cuda *)ctx, wav, n, out, dump);
+}
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -89,8 +96,9 @@ int main(int argc, char **argv) {
     char tokdir[1024];
     snprintf(tokdir, sizeof(tokdir), "%s/speech_tokenizer", model);
     qtts_codec *codec = qtts_codec_load(tokdir);
-    w2v2_model *w2v = w2v2_load(aligner);
-    if (!m || !codec || !w2v) return 1;
+    /* CPU encoder weights are only needed when the aligner runs on the CPU */
+    w2v2_model *w2v = use_cuda ? NULL : w2v2_load(aligner);
+    if (!m || !codec || (!use_cuda && !w2v)) return 1;
     const qtts_backend *be = NULL;
 #ifdef QTTS_WITH_CUDA
     qtts_cuda *gpu = NULL;
@@ -116,11 +124,23 @@ int main(int argc, char **argv) {
     double t2 = now_s();
     wav_write_pcm16(out_wav, wav, n, 24000);
     ja_align_result r;
-    if (ja_align_run(w2v, wav, n, 24000, &ao, &r)) { fprintf(stderr, "alignment failed\n"); return 1; }
+    int arc;
+    double t_al0 = now_s();
+#ifdef QTTS_WITH_CUDA
+    if (use_cuda) {  /* created after TTS so each runtime keeps its own current context */
+        w2v2_cuda *wg = w2v2_cuda_create(aligner, 0, 0);
+        if (!wg) return 1;
+        t_al0 = now_s();
+        arc = ja_align_run_ex(cuda_encoder, wg, wav, n, 24000, &ao, &r);
+        w2v2_cuda_free(wg);
+    } else
+#endif
+    arc = ja_align_run(w2v, wav, n, 24000, &ao, &r);
+    if (arc) { fprintf(stderr, "alignment failed\n"); return 1; }
     ja_align_write_json(&r, aux);
     double t3 = now_s();
     fprintf(stderr, "load %.1fs | tts %.2fs for %.2fs audio (RTF %.2f) | align %.2fs | %s + %s\n",
-            t1 - t0, t2 - t1, n / 24000.0, (t2 - t1) / (n / 24000.0), t3 - t2, out_wav, aux);
+            t1 - t0, t2 - t1, n / 24000.0, (t2 - t1) / (n / 24000.0), t3 - t_al0, out_wav, aux);
     printf("%s\n%s\n", r.kana_text, r.phoneme_text);
     ja_align_result_free(&r);
     free(wav); free(ids); free(inst);
