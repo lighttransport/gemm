@@ -120,6 +120,14 @@ decode tok/s for eight decode tokens. The PLE table is not the current
 throughput limiter. During the run, ROCm reported manual performance mode and
 memory clock level 0 (96 MHz), even while GPU memory activity was 69%.
 
+The Qwen SSD profile now uses the existing vectorized F16 matvec kernel for
+its F16 projections. `LLM_QWEN4_F16_LLAMA=0` restores the original kernel;
+an explicit `LLM_DECODE_WMMA=1` also retains its own path. On the 1K prompt,
+this raised scalar throughput from 7.12/6.28 to **7.53 prefill / 6.85 decode
+tok/s** with the same 32-token hash `b9f867f533408c06`. An independent
+11-token prompt with 16 forced decode tokens also matched its baseline hash
+`fab0d2285407b753` and measured 7.49/7.61 versus 6.86/7.29 tok/s.
+
 Combining exact GPU router top-k, 47 captured prefix graphs, and WMMA decode
 also preserved the 1K sequence hash. That run measured **7.29 prefill tok/s**
 and **6.47 decode tok/s**. The gain is small enough to leave these diagnostic

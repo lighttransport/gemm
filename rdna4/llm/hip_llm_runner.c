@@ -20884,6 +20884,15 @@ static inline void launch_qwen35_prefill_rmsnorm(hip_llm_runner *r, void *dst,
 
 static inline void launch_matvec(hip_llm_runner *r, void *dst, void *mat,
                                   void *x, int n_rows, int n_cols) {
+    const char *qwen4_llama = r->is_qwen4exp ? getenv("LLM_QWEN4_F16_LLAMA") : NULL;
+    int use_llama = r->is_qwen4exp && r->qwen4_ple_ssd && !r->decode_wmma;
+    if (qwen4_llama) use_llama = atoi(qwen4_llama) != 0;
+    if (use_llama) {
+        void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
+        LAUNCH(r->fn_matvec_f16_llama_f32, n_rows, 1, 1, 256, 1, 1, 0,
+               r->stream, args);
+        return;
+    }
     /* Phase 4: WMMA path needs n_rows multiple of 16 and n_cols >= 16. */
     if (r->decode_wmma && (n_rows & 15) == 0 && n_cols >= 16) {
         void *args[] = { &dst, &mat, &x, &n_rows, &n_cols };
