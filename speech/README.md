@@ -101,6 +101,37 @@ speech/build/test_codec <model>/speech_tokenizer tmp/speech/codec_rand/codes.npy
 
 CPU speed on a Threadripper 1950X with 16 threads: talker RTF 3.1, codec RTF 0.6. The CPU path is a reference path; the CUDA backend is the one meant for fast generation.
 
+### CUDA backend
+
+```
+make -C speech cuda
+speech/build/qwen3_tts_cuda --backend cuda --text "…" --out out.wav
+speech/build/qwen3_tts_cuda --backend cuda --codes-in codes.npy --out out.wav   # decode only
+```
+
+`qwen3_tts/qtts_cuda.h` and `qtts_cuda_kernels.h` use the driver API with NVRTC, loaded through `cuda/cuew`. Nothing links against the CUDA toolkit, and every kernel is our own; there is no cuBLAS.
+
+- **Talker and code predictor.**
+  - BF16 weights stay resident on the GPU. Q/K/V and gate/up are each fused into a single matrix.
+  - Decode (M ≤ 4) uses a warp-per-row BF16 GEMV with 16-byte loads. Prefill uses a 64×64 tiled GEMM.
+  - Each head gets RMSNorm and RoPE in one fused kernel.
+  - Attention is warp-split with an online softmax.
+  - The KV cache is F32 and lives on the device.
+- **Sampling stays on the host** and uses the same sampler code and Philox stream as the CPU backend. Only the logits come back over PCIe: 16 × ≤12 KB per frame.
+- **Codec decoder.** All convolutions are an implicit-GEMM kernel with a causal gather. Transposed convolutions are a GEMM followed by overlap-add. SnakeBeta, ConvNeXt, LayerNorm and the sliding-window attention (reusing the LM kernels) are elementwise or small kernels. Weights are F32.
+- Kernels are compiled without fast-math so results track the CPU reference.
+
+| Check (same text as above) | Result |
+|---|---|
+| greedy codes vs PyTorch, 79 × 16 | **identical** |
+| talker logits / hidden | max abs 4.2e-5 / 4.8e-5 |
+| codec stages / waveform vs PyTorch | cos 1.0 / **SNR 109 dB** |
+| sampled run, seed 7, CUDA vs CPU runner | **identical codes** (96 frames) |
+
+Speed on an RTX 5060 Ti (16 GB, sm_120), with the GPU shared with another busy process: talker RTF 0.24–0.28, codec RTF 0.01–0.09, end to end ≈ 0.26–0.31.
+
+`speech/build/tts_ja_cuda --text "…" --out out.wav --aux aux.json` runs the whole pipeline: text → Qwen3-TTS (CUDA) → ja_align (CPU) → wav plus `aux.json`.
+
 ## ja_align — Japanese CTC aligner and speech features for facial animation
 
 ```
@@ -152,3 +183,22 @@ make -C speech test
 | resampler 24→16 kHz / YIN / RMS | 80 dB tone SNR, −64 dB stopband / 0.8% F0 error / 0.15 dB |
 
 Speed: CPU RTF ≈ 0.2 (7.7 s of audio in 1.6 s on 16 threads, Threadripper 1950X).
+
+**Edge padding.** wav2vec2 CTC misses speech that begins right at the start of the buffer, and TTS output starts speaking almost immediately. `ja_align` therefore pads 0.5 s of silence on both sides (`ja_align_opts.pad`) and drops the padded frames afterwards. `align_reference.py --pad 0.5` does the same, so end-to-end comparisons stay like-for-like.
+
+## Intelligibility eval (Qwen3-TTS, Japanese)
+
+```
+python speech/ref/asr_eval.py --out-dir tmp/speech/eval1 --seeds 1 2
+```
+
+- **Test set:** 20 everyday sentences (`tests/ja_sentences.txt`) × 2 seeds, speaker Ono_Anna, default sampling.
+- **Systems compared:** our C/CUDA runner vs the official `qwen_tts` package (BF16, CUDA).
+- **Scoring:** both are transcribed by the hiragana-ctc model and scored with kana CER against pyopenjtalk pronunciation readings. pyopenjtalk is used only as an evaluation oracle.
+
+| Recognizer input | C/CUDA runner | PyTorch qwen_tts |
+|---|---|---|
+| raw wav | 16.5% (12/40 above 20%) | 17.8% (17/40 above 20%) |
+| wav padded with 0.5 s silence | **4.5%** (median 3.7%) | **4.5%** (median 3.6%) |
+
+The C runner is exactly as intelligible as the reference implementation. The remaining errors are mostly small-kana and long-vowel confusions (ひい for ひー, じぎょー for じゅぎょー), which the model card lists as its known weak spots.

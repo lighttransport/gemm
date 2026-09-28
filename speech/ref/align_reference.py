@@ -65,6 +65,8 @@ def main() -> None:
     ap.add_argument("--dump-dir", required=True)
     ap.add_argument("--phonemes", default="", help="space-separated phoneme targets for forced alignment")
     ap.add_argument("--kana", default="", help="kana string (no spaces needed) for forced alignment")
+    ap.add_argument("--pad", type=float, default=0.0,
+                    help="seconds of silence on both sides (ja_align default 0.5); padded frames are dropped")
     args = ap.parse_args()
     from transformers import Wav2Vec2Config, Wav2Vec2Model
 
@@ -84,6 +86,10 @@ def main() -> None:
     inter = int(ck.get("inter_ctc_layer", 12))
 
     x = load_audio(args.wav)
+    n_orig = x.shape[0]
+    pf = int(round(args.pad / 0.02))
+    if pf:
+        x = np.concatenate([np.zeros(pf * 320, np.float32), x, np.zeros(pf * 320, np.float32)])
     xn = (x - x.mean()) / np.sqrt(x.var() + 1e-7)  # Wav2Vec2FeatureExtractor do_normalize
     xn = xn.astype(np.float32)
     out = Path(args.dump_dir)
@@ -99,6 +105,9 @@ def main() -> None:
         final = r.last_hidden_state[0]
         ph = torch.log_softmax(heads["phoneme_head"](hs[inter][0]), -1)
         ka = torch.log_softmax(heads["kana_head"](final), -1)
+        if pf:
+            keep = min(int(np.ceil(n_orig / 16000 / 0.02)), ph.shape[0] - pf)
+            ph, ka = ph[pf:pf + keep], ka[pf:pf + keep]
     np.save(out / "input.npy", xn)
     np.save(out / "w2v_feat.npy", feats["feat"].astype(np.float32))
     np.save(out / "w2v_h0.npy", hs[0][0].numpy())

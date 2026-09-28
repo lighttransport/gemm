@@ -72,7 +72,8 @@ int   qt_npy_save_i32(const char *path, const int32_t *d, int ndim, const int *d
 #endif
 
 /* ======================================================================== */
-#ifdef QTTS_OPS_IMPLEMENTATION
+#if defined(QTTS_OPS_IMPLEMENTATION) && !defined(QTTS_OPS_IMPL_DONE)
+#define QTTS_OPS_IMPL_DONE
 
 #include <immintrin.h>
 #include <math.h>

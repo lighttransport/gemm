@@ -29,6 +29,8 @@ void        qtts_codec_free(qtts_codec *c);
 int         qtts_codec_num_quantizers(const qtts_codec *c);
 int         qtts_codec_upsample(const qtts_codec *c);     /* samples per frame (1920) */
 int         qtts_codec_sample_rate(const qtts_codec *c);  /* 24000 */
+/* RVQ dequantization: codes [T][nq] -> x [T][codebook_dim] */
+void        qtts_codec_rvq(const qtts_codec *c, const int32_t *codes, int T, float *x);
 
 /* codes: [T][nq] int32. Returns malloc'd wav of T*upsample samples in *n_out.
  * If dump_dir is non-NULL, intermediate stages of the first chunk are saved as .npy
@@ -39,7 +41,8 @@ float      *qtts_codec_decode(qtts_codec *c, const int32_t *codes, int T, int *n
 #endif /* QTTS_CODEC_H */
 
 /* ======================================================================== */
-#ifdef QTTS_CODEC_IMPLEMENTATION
+#if defined(QTTS_CODEC_IMPLEMENTATION) && !defined(QTTS_CODEC_IMPL_DONE)
+#define QTTS_CODEC_IMPL_DONE
 
 #include <math.h>
 #include <stdio.h>
@@ -536,10 +539,9 @@ static float *qc__convnext(const qc_upblock *U, float *x, int T, int d) {
     return x;
 }
 
-/* Decode one chunk (no chunking logic). Returns wav of T*upsample samples. */
-static float *qc__decode_chunk(const qtts_codec *c, const int32_t *codes, int T, const char *dump) {
+void qtts_codec_rvq(const qtts_codec *c, const int32_t *codes, int T, float *x) {
     int vqd = c->cb_dim / 2, D = c->cb_dim;
-    /* RVQ: sum within each group in 256-d, then 1x1 projections to 512 */
+    /* sum within each group (semantic / acoustic) in 256-d, then the 1x1 output projections */
     float *sf = (float *)calloc((size_t)T * vqd, sizeof(float));
     float *sr = (float *)calloc((size_t)T * vqd, sizeof(float));
     for (int t = 0; t < T; t++)
@@ -550,7 +552,6 @@ static float *qc__decode_chunk(const qtts_codec *c, const int32_t *codes, int T,
             float *dst = (q == 0 ? sf : sr) + (size_t)t * vqd;
             for (int i = 0; i < vqd; i++) dst[i] += e[i];
         }
-    float *x = (float *)malloc(sizeof(float) * (size_t)T * D);
     for (int t = 0; t < T; t++)
         for (int o = 0; o < D; o++) {
             float s = 0.0f;
@@ -560,6 +561,13 @@ static float *qc__decode_chunk(const qtts_codec *c, const int32_t *codes, int T,
             x[(size_t)t * D + o] = s;
         }
     free(sf); free(sr);
+}
+
+/* Decode one chunk (no chunking logic). Returns wav of T*upsample samples. */
+static float *qc__decode_chunk(const qtts_codec *c, const int32_t *codes, int T, const char *dump) {
+    int D = c->cb_dim;
+    float *x = (float *)malloc(sizeof(float) * (size_t)T * D);
+    qtts_codec_rvq(c, codes, T, x);
     qc__dump(dump, "codec_rvq", x, T, D);
 
     float *h = qc__conv(&c->pre_conv, x, T);

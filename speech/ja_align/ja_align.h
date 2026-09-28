@@ -35,6 +35,8 @@ typedef struct {
     float ramp;            /* co-articulation ramp half-width in seconds (default 0.035) */
     float sil_gap;         /* minimum low-energy gap turned into silence (default 0.12 s) */
     float sil_db;          /* silence threshold relative to the loudest frame (default -35 dB) */
+    float pad;             /* seconds of silence added on both sides before the encoder (default 0.5);
+                            * wav2vec2 CTC misses speech that starts right at the buffer edge */
     const char *dump_dir;  /* optional .npy dumps of encoder stages / posteriors */
 } ja_align_opts;
 
@@ -86,6 +88,7 @@ void ja_align_opts_default(ja_align_opts *o) {
     o->ramp = 0.035f;
     o->sil_gap = 0.12f;
     o->sil_db = -35.0f;
+    o->pad = 0.5f;
 }
 
 static int ja__parse_phonemes(const char *s, int *ids, int cap) {
@@ -206,8 +209,22 @@ int ja_align_run(w2v2_model *m, const float *wav, int n, int sr, const ja_align_
     ja_yin(x, n16, 16000, 640, 160, 60.0f, 600.0f, 0.15f, r->f0, r->aper, r->n_prosody);
 
     w2v2_output out;
-    if (w2v2_run(m, x, n16, &out, o->dump_dir)) { free(x); return -1; }
+    /* pad whole 20 ms frames of silence on both sides, run, then drop the padded frames */
+    int pf = (int)lroundf(o->pad / (float)JA_FRAME), ps = pf * 320;
+    float *xp = (float *)calloc((size_t)n16 + 2 * (size_t)ps, sizeof(float));
+    memcpy(xp + ps, x, sizeof(float) * (size_t)n16);
+    int rc_run = w2v2_run(m, xp, n16 + 2 * ps, &out, o->dump_dir);
+    free(xp);
     free(x);
+    if (rc_run) return -1;
+    if (pf > 0) {
+        int keep = (int)ceil(r->duration / JA_FRAME);
+        if (keep > out.T - pf) keep = out.T - pf;
+        if (keep < 1) keep = 1;
+        memmove(out.phon_logp, out.phon_logp + (size_t)pf * out.n_phon, sizeof(float) * (size_t)keep * out.n_phon);
+        memmove(out.kana_logp, out.kana_logp + (size_t)pf * out.n_kana, sizeof(float) * (size_t)keep * out.n_kana);
+        out.T = keep;
+    }
     r->T = out.T;
     r->n_phon_cls = out.n_phon;
     r->phon_post = (float *)malloc(sizeof(float) * (size_t)out.T * out.n_phon);

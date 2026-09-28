@@ -49,6 +49,20 @@ typedef struct {
     int n_steps;
 } qtts_gen_result;
 
+/* Compute backend for the generation loop. Prompt construction, sampling and the
+ * frame loop are shared; a backend only runs the networks.
+ *   talker : run the talker on x[M][H] at positions pos0.., write the final (normed)
+ *            hidden of the last row to last[H] and keep it for head/predict
+ *   head   : codebook-0 logits [codec_vocab] from the kept hidden
+ *   predict: given codes[0], fill codes[1..G-1]; sample(ud, logits, n) picks each code */
+typedef int (*qtts_sample_fn)(void *ud, float *logits, int n);
+typedef struct {
+    void *ctx;
+    int (*talker)(void *ctx, const float *x, int M, int pos0, float *last);
+    int (*head)(void *ctx, float *logits);
+    int (*predict)(void *ctx, int32_t *codes, qtts_sample_fn sample, void *ud);
+} qtts_backend;
+
 qtts_model *qtts_model_load(const char *model_dir, int max_ctx);
 void        qtts_model_free(qtts_model *m);
 void        qtts_gen_params_default(qtts_gen_params *p);
@@ -58,16 +72,19 @@ int         qtts_model_codec_vocab(const qtts_model *m);
  * text_ids: tokenized "<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n".
  * instruct_ids: tokenized "<|im_start|>user\n{instruct}<|im_end|>\n" or NULL.
  * capture: store prefill/step fixtures in the result. Returns 0 on success. */
-int  qtts_generate(qtts_model *m, const int32_t *text_ids, int n_text, const int32_t *instruct_ids,
-                   int n_instruct, const char *speaker, const char *language,
+int  qtts_generate(qtts_model *m, const qtts_backend *be, const int32_t *text_ids, int n_text,
+                   const int32_t *instruct_ids, int n_instruct, const char *speaker, const char *language,
                    const qtts_gen_params *gp, int capture, qtts_gen_result *out,
                    void (*on_frame)(void *user, const int32_t *codes16, int frame), void *user);
+/* host-side helpers shared with other backends */
+void qtts_codec_embed_sum(const qtts_model *m, const int32_t *codes, float *x);  /* x[H] = sum of 16 rows */
 void qtts_gen_result_free(qtts_gen_result *r);
 
 #endif /* QTTS_TALKER_H */
 
 /* ======================================================================== */
-#ifdef QTTS_TALKER_IMPLEMENTATION
+#if defined(QTTS_TALKER_IMPLEMENTATION) && !defined(QTTS_TALKER_IMPL_DONE)
+#define QTTS_TALKER_IMPL_DONE
 
 #include <ctype.h>
 #include <math.h>
@@ -420,16 +437,37 @@ static int qtl__sample(float *logits, int n, int greedy, float temp, int top_k, 
     return pick;
 }
 
+/* ---- CPU backend ---- */
+
+typedef struct { qtts_model *m; float *last; } qtl_cpu_ctx;
+
+static int qtl__cpu_talker(void *ctx, const float *x, int M, int pos0, float *last) {
+    qtl_cpu_ctx *c = (qtl_cpu_ctx *)ctx;
+    int H = c->m->talker.hidden;
+    float *hid = (float *)malloc(sizeof(float) * (size_t)M * H);
+    qtl__forward(&c->m->talker, x, M, pos0, hid);
+    memcpy(c->last, hid + (size_t)(M - 1) * H, sizeof(float) * H);
+    if (last) memcpy(last, c->last, sizeof(float) * H);
+    free(hid);
+    return 0;
+}
+
+static int qtl__cpu_head(void *ctx, float *logits) {
+    qtl_cpu_ctx *c = (qtl_cpu_ctx *)ctx;
+    qt_gemv_bf16(1, c->last, c->m->codec_head, c->m->codec_vocab, c->m->talker.hidden, logits);
+    return 0;
+}
+
 /* code predictor for one frame: fills codes[1..G-1] given talker hidden and code0 */
-static void qtl__predict_frame(qtts_model *m, const float *talker_hidden, int32_t *codes,
-                               const qtts_gen_params *gp, philox_rng_state *rng) {
+static int qtl__cpu_predict(void *ctx, int32_t *codes, qtts_sample_fn sample, void *ud) {
+    qtl_cpu_ctx *c = (qtl_cpu_ctx *)ctx;
+    qtts_model *m = c->m;
     int H = m->talker.hidden, CH = m->cp.hidden, V = m->cp_vocab;
     float in2[2 * 4096], proj[2 * 4096], hid[2 * 4096];
     float *logits = (float *)malloc(sizeof(float) * (size_t)V);
-    memcpy(in2, talker_hidden, sizeof(float) * H);
+    memcpy(in2, c->last, sizeof(float) * H);
     memset(in2 + H, 0, sizeof(float) * H);
     qtl__row_add(in2 + H, m->codec_emb, codes[0], H);
-    int greedy = gp->greedy;
     for (int g = 0; g < m->num_groups - 1; g++) {
         int M = g == 0 ? 2 : 1, pos0 = g == 0 ? 0 : g + 1;
         const float *src = g == 0 ? in2 : in2 + H;
@@ -445,14 +483,28 @@ static void qtl__predict_frame(qtts_model *m, const float *talker_hidden, int32_
         }
         qtl__forward(&m->cp, proj, M, pos0, hid);
         qt_gemv_bf16(1, hid + (size_t)(M - 1) * CH, m->cp_head[g], V, CH, logits);
-        codes[g + 1] = qtl__sample(logits, V, greedy, gp->sub_temperature, gp->sub_top_k, gp->sub_top_p, rng);
+        codes[g + 1] = sample(ud, logits, V);
     }
     free(logits);
+    return 0;
 }
 
-int qtts_generate(qtts_model *m, const int32_t *ids, int n_ids, const int32_t *inst, int n_inst,
-                  const char *speaker, const char *language, const qtts_gen_params *gp, int capture,
-                  qtts_gen_result *out,
+void qtts_codec_embed_sum(const qtts_model *m, const int32_t *codes, float *x) {
+    int H = m->talker.hidden;
+    memset(x, 0, sizeof(float) * H);
+    qtl__row_add(x, m->codec_emb, codes[0], H);
+    for (int g = 1; g < m->num_groups; g++) qtl__row_add(x, m->cp_emb[g - 1], codes[g], H);
+}
+
+typedef struct { const qtts_gen_params *gp; philox_rng_state *rng; } qtl_sub_sampler;
+static int qtl__sub_sample(void *ud, float *logits, int n) {
+    qtl_sub_sampler *s = (qtl_sub_sampler *)ud;
+    return qtl__sample(logits, n, s->gp->greedy, s->gp->sub_temperature, s->gp->sub_top_k, s->gp->sub_top_p, s->rng);
+}
+
+int qtts_generate(qtts_model *m, const qtts_backend *be_in, const int32_t *ids, int n_ids,
+                  const int32_t *inst, int n_inst, const char *speaker, const char *language,
+                  const qtts_gen_params *gp, int capture, qtts_gen_result *out,
                   void (*on_frame)(void *user, const int32_t *codes16, int frame), void *user) {
     int H = m->talker.hidden, V = m->codec_vocab, G = m->num_groups;
     memset(out, 0, sizeof(*out));
@@ -540,16 +592,18 @@ int qtts_generate(qtts_model *m, const int32_t *ids, int n_ids, const int32_t *i
     philox_rng_state rng;
     philox_rng_init(&rng, gp->seed, 0);
 
-    float *hid = (float *)malloc(sizeof(float) * (size_t)L * H);
+    qtl_cpu_ctx cpu = { m, (float *)malloc(sizeof(float) * H) };
+    qtts_backend cpu_be = { &cpu, qtl__cpu_talker, qtl__cpu_head, qtl__cpu_predict };
+    const qtts_backend *be = be_in ? be_in : &cpu_be;
+    qtl_sub_sampler sub = { gp, &rng };
     float *logits = (float *)malloc(sizeof(float) * (size_t)V);
     float *x = (float *)malloc(sizeof(float) * H);
-    unsigned char *seen = (unsigned char *)calloc((size_t)V, 1);
-    qtl__forward(&m->talker, pre, L, 0, hid);
     float *last = (float *)malloc(sizeof(float) * H);
-    memcpy(last, hid + (size_t)(L - 1) * H, sizeof(float) * H);
+    unsigned char *seen = (unsigned char *)calloc((size_t)V, 1);
+    int rc = be->talker(be->ctx, pre, L, 0, last);
     int pos = L, step = 0, frames = 0;
-    for (;;) {
-        qt_gemv_bf16(1, last, m->codec_head, V, H, logits);
+    while (rc == 0) {
+        if ((rc = be->head(be->ctx, logits))) break;
         if (capture) {
             memcpy(out->step_logits + (size_t)step * V, logits, sizeof(float) * V);
             memcpy(out->step_hidden + (size_t)step * H, last, sizeof(float) * H);
@@ -569,23 +623,21 @@ int qtts_generate(qtts_model *m, const int32_t *ids, int n_ids, const int32_t *i
         seen[c0] = 1;
         int32_t *codes = out->codes + (size_t)frames * G;
         codes[0] = c0;
-        qtl__predict_frame(m, last, codes, gp, &rng);
+        if ((rc = be->predict(be->ctx, codes, qtl__sub_sample, &sub))) break;
         if (on_frame) on_frame(user, codes, frames);
         /* next talker input: sum of all codebook embeddings + trailing text */
-        memset(x, 0, sizeof(float) * H);
-        qtl__row_add(x, m->codec_emb, codes[0], H);
-        for (int g = 1; g < G; g++) qtl__row_add(x, m->cp_emb[g - 1], codes[g], H);
+        qtts_codec_embed_sum(m, codes, x);
         const float *tt = frames < n_trailing ? trailing + (size_t)frames * H : e_pad;
         for (int j = 0; j < H; j++) x[j] += tt[j];
         frames++;
-        qtl__forward(&m->talker, x, 1, pos, last);
+        rc = be->talker(be->ctx, x, 1, pos, last);
         pos++;
     }
     out->n_frames = frames;
     out->n_steps = step;
     if (!capture) free(pre);
-    free(sp); free(trailing); free(hid); free(logits); free(x); free(seen); free(last);
-    return 0;
+    free(sp); free(trailing); free(logits); free(x); free(seen); free(last); free(cpu.last);
+    return rc;
 }
 
 void qtts_gen_result_free(qtts_gen_result *r) {

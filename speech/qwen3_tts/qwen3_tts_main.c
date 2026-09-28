@@ -6,6 +6,7 @@
  *   qwen3_tts --model <dir> --text "..." [--speaker Ono_Anna] [--language Japanese]
  *             [--instruct "..."] [--greedy] [--seed N] [--max-frames N] [--streaming]
  *             [--out out.wav] [--dump-dir dir] [--ids input_ids.npy] [--codes-out codes.npy]
+ *             [--backend cpu|cuda] [--device N] [--codes-in codes.npy (decode only)]
  */
 #define SAFETENSORS_IMPLEMENTATION
 #define GGUF_LOADER_IMPLEMENTATION
@@ -22,6 +23,10 @@
 #include "qtts_talker.h"
 #include "qtts_tokenizer.h"
 #include "wav_io.h"
+#ifdef QTTS_WITH_CUDA
+#define QTTS_CUDA_IMPLEMENTATION
+#include "qtts_cuda.h"
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -65,7 +70,8 @@ int main(int argc, char **argv) {
     const char *instruct = "", *out_wav = "out.wav", *dump = NULL, *ids_npy = NULL, *codes_out = NULL;
     qtts_gen_params gp;
     qtts_gen_params_default(&gp);
-    int verbose = 1;
+    int verbose = 1, use_cuda = 0, device = 0;
+    const char *codes_in = NULL;
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         const char *v = i + 1 < argc ? argv[i + 1] : NULL;
@@ -82,11 +88,15 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--max-frames") && v) { gp.max_frames = atoi(v); i++; }
         else if (!strcmp(a, "--temperature") && v) { gp.temperature = gp.sub_temperature = (float)atof(v); i++; }
         else if (!strcmp(a, "--top-k") && v) { gp.top_k = gp.sub_top_k = atoi(v); i++; }
+        else if (!strcmp(a, "--backend") && v) { use_cuda = !strcmp(v, "cuda"); i++; }
+        else if (!strcmp(a, "--device") && v) { device = atoi(v); i++; }
+        else if (!strcmp(a, "--codes-in") && v) { codes_in = v; i++; }
         else if (!strcmp(a, "--greedy")) gp.greedy = 1;
         else if (!strcmp(a, "--streaming")) gp.streaming = 1;
         else if (!strcmp(a, "--quiet")) verbose = 0;
         else { fprintf(stderr, "unknown or incomplete option %s\n", a); return 1; }
     }
+    if (dump) mkdir(dump, 0755);
     double t0 = now_s();
     bpe_vocab *vocab = qtts_tokenizer_load(model);
     if (!vocab) return 1;
@@ -102,20 +112,46 @@ int main(int argc, char **argv) {
     }
     if (*instruct) inst = tokenize(vocab, "<|im_start|>user\n%s<|im_end|>\n", instruct, &n_inst);
 
-    qtts_model *m = qtts_model_load(model, 4096);
+    qtts_model *m = qtts_model_load(model, 2400);
     char tokdir[1024];
     snprintf(tokdir, sizeof(tokdir), "%s/speech_tokenizer", model);
     qtts_codec *codec = qtts_codec_load(tokdir);
     if (!m || !codec) return 1;
+    const qtts_backend *be = NULL;
+#ifdef QTTS_WITH_CUDA
+    qtts_cuda *gpu = NULL;
+    qtts_backend gbe;
+    if (use_cuda) {
+        gpu = qtts_cuda_create(m, codec, device, verbose);
+        if (!gpu) { fprintf(stderr, "CUDA backend unavailable\n"); return 1; }
+        gbe = qtts_cuda_backend(gpu);
+        be = &gbe;
+    }
+#else
+    (void)device;
+    if (use_cuda) { fprintf(stderr, "built without CUDA (make cuda)\n"); return 1; }
+#endif
     double t1 = now_s();
-    if (verbose) fprintf(stderr, "loaded in %.2fs; %d text ids\n", t1 - t0, n_ids);
+    if (verbose) fprintf(stderr, "loaded in %.2fs; %d text ids; backend %s\n", t1 - t0, n_ids, use_cuda ? "cuda" : "cpu");
 
     qtts_gen_result res;
-    if (qtts_generate(m, ids, n_ids, inst, n_inst, speaker, language, &gp, dump != NULL, &res,
-                      on_frame, &verbose)) return 1;
+    memset(&res, 0, sizeof(res));
+    if (codes_in) {  /* decode-only: codes from an .npy */
+        int nd = 0, dims[8], f32 = 0;
+        res.codes = (int32_t *)npy_load(codes_in, &nd, dims, &f32);
+        if (!res.codes || nd != 2) { fprintf(stderr, "bad --codes-in\n"); return 1; }
+        res.n_frames = dims[0];
+    } else if (qtts_generate(m, be, ids, n_ids, inst, n_inst, speaker, language, &gp, dump != NULL, &res,
+                             on_frame, &verbose)) return 1;
     double t2 = now_s();
     int n = 0;
-    float *wav = qtts_codec_decode(codec, res.codes, res.n_frames, &n, dump);
+    float *wav;
+#ifdef QTTS_WITH_CUDA
+    if (use_cuda) wav = qtts_cuda_decode(gpu, res.codes, res.n_frames, &n, dump);
+    else
+#endif
+    wav = qtts_codec_decode(codec, res.codes, res.n_frames, &n, dump);
+    if (!wav) { fprintf(stderr, "decode failed\n"); return 1; }
     double t3 = now_s();
     wav_write_pcm16(out_wav, wav, n, qtts_codec_sample_rate(codec));
     double dur = n / (double)qtts_codec_sample_rate(codec);
@@ -127,9 +163,11 @@ int main(int argc, char **argv) {
         snprintf(p, sizeof(p), "%s/input_ids.npy", dump);
         qt_npy_save_i32(p, ids, 1, &n_ids);
         int H = qtts_model_hidden(m), V = qtts_model_codec_vocab(m);
-        save_npy_f32(dump, "prefill_embeds", res.prefill_embeds, res.prefill_len, H);
-        save_npy_f32(dump, "step_logits", res.step_logits, res.n_steps, V);
-        save_npy_f32(dump, "talker_hidden", res.step_hidden, res.n_steps, H);
+        if (res.prefill_embeds) {
+            save_npy_f32(dump, "prefill_embeds", res.prefill_embeds, res.prefill_len, H);
+            save_npy_f32(dump, "step_logits", res.step_logits, res.n_steps, V);
+            save_npy_f32(dump, "talker_hidden", res.step_hidden, res.n_steps, H);
+        }
         snprintf(p, sizeof(p), "%s/codes.npy", dump);
         int cd[2] = { res.n_frames, 16 };
         qt_npy_save_i32(p, res.codes, 2, cd);
@@ -139,6 +177,9 @@ int main(int argc, char **argv) {
     if (codes_out) { int cd[2] = { res.n_frames, 16 }; qt_npy_save_i32(codes_out, res.codes, 2, cd); }
     free(wav); free(ids); free(inst);
     qtts_gen_result_free(&res);
+#ifdef QTTS_WITH_CUDA
+    qtts_cuda_free(gpu);
+#endif
     qtts_codec_free(codec);
     qtts_model_free(m);
     bpe_vocab_free(vocab);

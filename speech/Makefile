@@ -44,11 +44,17 @@ test: $(BUILD)/test_ja_ctc $(BUILD)/test_ja_dsp
 	$(BUILD)/test_ja_ctc
 	$(BUILD)/test_ja_dsp
 
-cuda: $(BUILD)/qwen3_tts_cuda
+cuda: $(BUILD)/qwen3_tts_cuda $(BUILD)/tts_ja_cuda
 
-$(BUILD)/qwen3_tts_cuda: $(QT)/qwen3_tts_cuda_main.c $(QT)/qtts_cuda.c $(QT)/qtts_cuda.h $(QT_HDRS) | $(BUILD)
-	$(CC) $(CFLAGS) -I$(COMMON) -I$(CUDADIR) -I$(QT) -o $@ $(QT)/qwen3_tts_cuda_main.c $(QT)/qtts_cuda.c \
+$(BUILD)/qwen3_tts_cuda: $(QT)/qwen3_tts_main.c $(QT)/qtts_cuda.h $(QT)/qtts_cuda_kernels.h $(QT_HDRS) | $(BUILD)
+	$(CC) $(CFLAGS) -DQTTS_WITH_CUDA -I$(COMMON) -I$(CUDADIR) -I$(QT) -o $@ $(QT)/qwen3_tts_main.c \
 	    $(CUDADIR)/cuew.c -ldl -lm -lpthread
+
+$(BUILD)/tts_ja: tts_ja_main.c $(QT_HDRS) $(JA_HDRS) | $(BUILD)
+	$(CC) $(CFLAGS) -I$(COMMON) -I$(QT) -I$(JA) -o $@ $< -lm
+
+$(BUILD)/tts_ja_cuda: tts_ja_main.c $(QT)/qtts_cuda.h $(QT)/qtts_cuda_kernels.h $(QT_HDRS) $(JA_HDRS) | $(BUILD)
+	$(CC) $(CFLAGS) -DQTTS_WITH_CUDA -I$(COMMON) -I$(CUDADIR) -I$(QT) -I$(JA) -o $@ $< $(CUDADIR)/cuew.c -ldl -lm -lpthread
 
 clean:
 	rm -rf $(BUILD)
