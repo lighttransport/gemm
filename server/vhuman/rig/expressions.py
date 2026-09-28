@@ -203,7 +203,40 @@ def build(F: Fields, skel: dict, skin_w: tuple) -> dict:
     for k in list(S):
         S[k] = np.asarray(S[k], np.float64)
         S[k][~np.isfinite(S[k])] = 0.0
-    return smooth_shapes(F, S)
+    S = smooth_shapes(F, S)
+    return {k: (v if k == "mouthClose" else keep_lips_apart(F, v)) for k, v in S.items()}
+
+
+LIP_PAIR_RINGS = (1, 0, -1, -2)
+
+
+def keep_lips_apart(F: Fields, d: np.ndarray) -> np.ndarray:
+    """No shape may push one lip through the other. Per upper/lower sample
+    pair (rings 1..-2), the vertical closing a shape causes is limited to the
+    pair's rest gap (zero where the lips touch at rest). The excess is split
+    between the two lips and faded onto rings 2 and 3 of the same columns.
+    Pairs that touch at rest then stay apart under any sum of shapes; pairs
+    with a rest gap can still be closed by combinations (closing the mouth is
+    the job of the jaw-scaled mouthClose)."""
+    tm = F.tmpl
+    H, N = T.MOUTH_HALF, T.MOUTH_N
+    out = d.copy()
+    for k in LIP_PAIR_RINGS:
+        ring = tm.ring_ids("mouth", k)
+        j = np.arange(1, H)
+        up, lo = ring[j], ring[N - j]
+        gap = np.maximum(F.pos[up, 1] - F.pos[lo, 1], 0.0)
+        excess = np.maximum(-(out[up, 1] - out[lo, 1]) - gap, 0.0)
+        if not excess.any():
+            continue
+        out[up, 1] += 0.5 * excess
+        out[lo, 1] -= 0.5 * excess
+        if k == 1:                          # fade outwards over the next loops
+            for kk, f in ((2, 0.6), (3, 0.25)):
+                r = tm.ring_ids("mouth", kk)
+                out[r[j], 1] += f * 0.5 * excess
+                out[r[N - j], 1] -= f * 0.5 * excess
+    return out
 
 
 def _normals(F: Fields):

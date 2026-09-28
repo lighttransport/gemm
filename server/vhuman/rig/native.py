@@ -155,3 +155,45 @@ class NativeGPU(Native):
             self.lib.vh_gpu_free(self.g)
             self.g = None
         super().close()
+
+
+def build_vk_library(out_dir: Path) -> Path:
+    """libvhuman_deformer_vk.so via vulkan/vhuman/Makefile (glslc + g++; Vulkan loaded at run time)."""
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    src = ROOT / "vulkan" / "vhuman"
+    subprocess.run(["make", "-C", str(src), "libvhuman_deformer_vk.so"], check=True, capture_output=True, text=True)
+    lib = out_dir / "libvhuman_deformer_vk.so"
+    lib.write_bytes((src / "libvhuman_deformer_vk.so").read_bytes())
+    return lib
+
+
+class NativeVK(Native):
+    """The Vulkan compute backend (vulkan/vhuman): same package, batched evaluation."""
+
+    def __init__(self, lib_path, package, device: int = 0):
+        super().__init__(lib_path, package)
+        L = self.lib
+        L.vh_vk_create.restype = ctypes.c_void_p
+        L.vh_vk_create.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+        L.vh_vk_free.argtypes = [ctypes.c_void_p]
+        L.vh_vk_eval_batch.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_size_t, ctypes.c_int,
+                                       ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_double)]
+        self.g = L.vh_vk_create(self.h, device, 0)
+        if not self.g:
+            super().close()
+            raise RuntimeError("no Vulkan device")
+
+    def eval_gpu(self, controls: np.ndarray, use_ml: bool = True) -> tuple[np.ndarray, list]:
+        x = np.ascontiguousarray(controls, np.float32)
+        out = np.zeros((len(x), self.V, 3), np.float32)
+        ms = (ctypes.c_double * 4)()
+        if self.lib.vh_vk_eval_batch(self.g, self._p(x), len(x), int(use_ml), self._p(out), ms):
+            raise RuntimeError("Vulkan deformer dispatch failed")
+        return out, list(ms)
+
+    def close(self):
+        if getattr(self, "g", None):
+            self.lib.vh_vk_free(self.g)
+            self.g = None
+        super().close()

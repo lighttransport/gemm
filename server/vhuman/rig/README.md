@@ -75,19 +75,41 @@ viewer and native C:
    1.15 ms/frame with the ML correctives (0.51 ms batched) and 0.18 ms
    without, single-threaded. Parity with numpy
    is ≈1e-7 m (`test_rig`, via ctypes).
-4. **GPU runtime**: `cuda/vhuman/` (cuew + NVRTC): the host prepares the rig
-   state, and one fused kernel blends morphs (register-tiled over 8 frames)
-   and skins. It runs at ~2.3 µs/frame for 1024-frame batches on an RTX 5060
-   Ti and equals the CPU result.
+4. **GPU runtimes**: `cuda/vhuman/` (cuew + NVRTC) and `vulkan/vhuman/`
+   (vkew + glslc SPIR-V). The host prepares the rig state, and one kernel or
+   shader blends morphs (register-tiled over 8 frames) and skins. Both
+   equal the CPU result (`test_rig`). On an RTX 5060 Ti, 1024-frame batches
+   take 2–6 µs/frame (CUDA kernel) and 8–12 µs/frame (Vulkan
+   submit-to-completion).
 
 Contacts (ground truth, the viewer's heat map and `viz.json`): lid vertices vs
 the eyeballs, lip/vestibule vertices vs sphere sets (per-tooth spheres on the
 teeth joints; three spheres per tongue cross-section on the blended tongue
-joints), and upper vs lower lip pairs on rings 1..-2. The sampler includes
-tongue controls with an open jaw. Reference man, held-out contact vertices
-for linear vs linear + ML: eye 16930→1906, teeth 2328→717, lips 6060→2872,
-tongue 289→278. The solver removes tongue contacts, but the network does
-not yet generalise them.
+joints), and upper vs lower lip pairs on rings 1..-2.
+
+Rig-level contact fixes (before any learning):
+- **mouthClose** is driven by the corrective mouthClose × jawOpen: it
+  closes an open mouth and does nothing to a closed one.
+- **tongueOut** reaches the incisors on its own. It protrudes past the lips
+  only through tongueOut × jawOpen.
+- **Lip shapes**: every shape (except mouthClose) keeps each upper/lower lip
+  pair from closing past its rest gap (zero where the lips touch). The excess
+  is split between the lips and faded outwards. For pairs that touch at rest,
+  no sum of shapes can cross them. Pairs with a rest gap (the outer ring) can
+  still be closed by combinations (e.g. press + roll), which the ML
+  correction mostly removes. Linear-rig lip crossings on held-out controls
+  dropped from 6060 to 64 vertices.
+
+Learning: 4096 samples (30% tongue scenarios with an open jaw), region-split
+PCA (48 mouth + 48 rest components), and an MLP on the rig's full input vector
+(controls + corrective products). Tongue-contact samples weigh 4x, with
+AdamW. A posed-space lip penalty keeps the predicted correction from crossing
+the lips. Reference man, held-out contact vertices, linear vs linear + ML:
+eye 17429→1887, teeth 4846→576, tongue 1306→601. For lips, 64→231: the
+network still adds a few crossings, about 0.4 vertices per sample and
+mostly shallow. For example, tongueOut with the jaw at 0.6 goes from 59
+tongue + 19 teeth contacts to 0 + 2, but leaves 48 lip-pair vertices up to
+0.5 mm.
 
 ## Inspection (web viewer)
 
@@ -162,7 +184,8 @@ Names are our own; the 51 expression controls are the LightRig canonical
 - vchar shows joint-driven controls only through animations (the ROM).
 - The ML deformer corrects sub-millimetre contacts and soft-tissue
   shearing; it cannot add expression detail the procedural shapes lack.
-  Lip-lip contacts are only about halved, and tongue contacts are solved but
-  not learned. Some lip crossings come from the rig itself (e.g. mouthClose
-  without jawOpen). The native runtime covers the welded head; teeth, tongue and eyes are
+  Tongue contacts are about halved on unseen controls (the solver removes all
+  of them), and the network's own correction adds a few shallow lip crossings.
+  A post-skinning contact projection would make both exact, but it is not
+  possible in the web viewer's GPU skinning. The native runtime covers the welded head; teeth, tongue and eyes are
   rigid or simply skinned in the exports.

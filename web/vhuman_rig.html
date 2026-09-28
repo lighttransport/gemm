@@ -187,7 +187,7 @@ class LinearRig {
     for (const [row, col, v] of this.M) delta[row] += v * inp[col];
     const weights = {};
     for (const [name, src] of this.shapes) weights[name] = inp[src];
-    if (this.ml && this.mlOn) Object.assign(weights, this.ml.weights(Object.fromEntries(this.controls.map((n, i) => [n, x[i]]))));
+    if (this.ml && this.mlOn) Object.assign(weights, this.ml.weights(Object.fromEntries(this.inputs.map((n, i) => [n, inp[i]]))));
     return { delta, weights };
   }
 }
@@ -209,7 +209,7 @@ class MLDeformer {        // c = fc2(relu(fc1((x - mean) * scale))) * out.scale 
     this.t = t; this.def = def;
     [this.H, this.I] = t['fc1.weight'].shape; this.K = t['fc2.weight'].shape[0];
     this.h = new Float32Array(this.H); this.x = new Float32Array(this.I);
-    this.lo = def.inputs.map((n) => def.ranges[n][0]); this.hi = def.inputs.map((n) => def.ranges[n][1]);
+    this.lo = def.inputs.map((n) => (def.ranges[n] || [0, 1])[0]); this.hi = def.inputs.map((n) => (def.ranges[n] || [0, 1])[1]);
   }
   weights(values) {
     const t = this.t, x = this.x, h = this.h, out = { ml_mean: 1 };

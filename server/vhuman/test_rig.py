@@ -242,6 +242,24 @@ class RigEndToEndTests(unittest.TestCase):
         finally:
             G.close()
 
+    @unittest.skipIf(shutil.which("glslc") is None or shutil.which("g++") is None, "no glslc/g++")
+    def test_vulkan_deformer_parity(self):
+        from .rig import native
+        try:
+            lib = native.build_vk_library(Path(self.tmp.name) / "vk")
+            G = native.NativeVK(lib, self.rig_dir / "rig_deformer.safetensors")
+        except (RuntimeError, OSError, subprocess.CalledProcessError) as exc:
+            self.skipTest(f"Vulkan unavailable: {exc}")
+        try:
+            rng = np.random.default_rng(2)
+            X = np.zeros((13, G.C), np.float32)
+            X[:, :51] = (rng.random((13, 51)) < 0.15) * rng.random((13, 51))
+            out, _ = G.eval_gpu(X)
+            for f in (0, 8, 12):
+                np.testing.assert_allclose(out[f], G.eval(X[f]), atol=2e-6)
+        finally:
+            G.close()
+
     def test_viz_export(self):
         viz = json.loads((self.rig_dir / "viz.json").read_text())
         self.assertEqual(set(viz["parts"]), {"head_skin", "head_mouth"})

@@ -14,7 +14,7 @@
 
 struct vh_deformer {
     st_context *st;
-    size_t C, P, I, J, B, M, V, K, H, corr_k;
+    size_t C, P, I, J, B, M, V, K, H, corr_k, ml_in;
     const float *range;        /* C x 2 */
     const int32_t *corr_in;    /* P x corr_k (-1 padded) */
     const float *corr_w;       /* P */
@@ -71,6 +71,8 @@ vh_deformer *vh_deformer_load(const char *path) {
     d->w1 = tensor(s, "ml.fc1.weight", "F32", 2, sh);
     if (d->w1) {
         d->H = sh[0];
+        d->ml_in = sh[1];                            /* controls, or controls + correctives */
+        ok = ok && d->ml_in <= d->I;
         d->b1 = tensor(s, "ml.fc1.bias", "F32", 1, sh);
         d->w2 = tensor(s, "ml.fc2.weight", "F32", 2, sh); d->K = sh[0];
         d->b2 = tensor(s, "ml.fc2.bias", "F32", 1, sh);
@@ -83,7 +85,7 @@ vh_deformer *vh_deformer_load(const char *path) {
     } else {
         ok = ok && d->M == d->B;
     }
-    if (!ok || d->J > 64 || d->C > 512) { vh_deformer_free(d); return NULL; }
+    if (!ok || d->J > 64 || d->I > 512) { vh_deformer_free(d); return NULL; }
     d->inp = malloc(sizeof(float) * d->I);
     d->delta = malloc(sizeof(float) * d->J * ATTR);
     d->skin = malloc(sizeof(float) * d->J * 16);
@@ -172,8 +174,8 @@ static void weights(vh_deformer *d, int use_ml, float *w) {
         return;
     }
     float x[512];
-    for (size_t c = 0; c < d->C && c < 512; ++c) x[c] = (d->inp[c] - d->imean[c]) * d->iscale[c];
-    lt_mlp2_f32(x, d->w1, d->b1, d->w2, d->b2, d->hid, d->coef, d->C, d->H, d->K);
+    for (size_t c = 0; c < d->ml_in && c < 512; ++c) x[c] = (d->inp[c] - d->imean[c]) * d->iscale[c];
+    lt_mlp2_f32(x, d->w1, d->b1, d->w2, d->b2, d->hid, d->coef, d->ml_in, d->H, d->K);
     w[d->B] = 1.f;                                   /* ml_mean */
     for (size_t k = 0; k < d->K; ++k)                /* c_k / output.scale_k */
         w[d->B + 1 + k] = (d->coef[k] * d->oscale[k] + d->omean[k]) / d->oscale[k];

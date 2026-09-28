@@ -45,7 +45,7 @@ def _mirror(name: str) -> str:
     return name
 
 
-def sample_controls(names: list[str], n: int, seed: int = 0) -> np.ndarray:
+def sample_controls(names: list[str], n: int, seed: int = 0, tongue_share: float = 0.18) -> np.ndarray:
     """Sparse, plausible combinations: a few expressions at a time, often
     symmetric, with many jaw-open + lip combinations (where contact matters)."""
     rng = np.random.default_rng(seed)
@@ -57,6 +57,13 @@ def sample_controls(names: list[str], n: int, seed: int = 0) -> np.ndarray:
     X = np.zeros((n, len(names)), np.float32)
     for s in range(n):
         r = rng.random()
+        if r > 1.0 - tongue_share and tongue:                       # tongue scenarios: rare in use, but all contact
+            X[s, idx["jawOpen"]] = float(rng.uniform(0.15, 1.0))
+            for k in rng.choice(tongue, size=min(len(tongue), 1 + rng.poisson(0.8)), replace=False):
+                X[s, idx[k]] = float(rng.uniform(0.3, 1.0))
+            for k in rng.choice(lips, size=rng.poisson(0.8), replace=False):
+                X[s, idx[k]] = float(rng.uniform(0.2, 1.0))
+            continue
         picks = list(rng.choice(pool, size=1 + rng.poisson(2.5), replace=False))
         if r < 0.35:
             picks += ["jawOpen"] + list(rng.choice(lips, size=1 + rng.poisson(1.2), replace=False))
@@ -89,6 +96,14 @@ def tooth_spheres(part, joint_index: int, block: int) -> tuple[np.ndarray, np.nd
         c.append(cen)
         r.append(0.8 * float(np.median(d)))
     return np.asarray(c), np.asarray(r)
+
+
+def region_mask(tmpl: T.Template, rest: np.ndarray, reach_m: float = 0.022) -> np.ndarray:
+    """Vertices of the mouth region: the mouth group and skin within reach of
+    the lip seam (ring 0)."""
+    seam = rest[tmpl.ring_ids("mouth", 0)]
+    d = np.min(np.linalg.norm(rest[:, None] - seam[None], axis=-1), 1)
+    return (tmpl.group == 2) | (d < reach_m)
 
 
 def tongue_spheres(part, nu: int = 28, nv: int = 20):
@@ -326,47 +341,69 @@ class MLP2(torch.nn.Module):
         return self.fc2(torch.relu(self.fc1(x)))
 
 
-def train(tr: TorchRig, tmpl: T.Template, contacts: Contacts, out_dir: Path, samples: int = 2048,
-          k: int = 64, hidden: int = 256, batch: int = 128, iters: int = 100, epochs: int = 2500, seed: int = 0,
-          log=print, progress=None, w_contact: float = 1500.0) -> dict:
+def train(tr: TorchRig, tmpl: T.Template, contacts: Contacts, out_dir: Path, samples: int = 4096,
+          k: int = 48, k_mouth: int = 48, hidden: int = 256, batch: int = 128, iters: int = 100, epochs: int = 2500, seed: int = 0,
+          log=print, progress=None, w_contact: float = 1500.0, tongue_weight: float = 4.0,
+          tongue_share: float = 0.3, weight_decay: float = 1e-3, solve_cache=None, lip_weight: float = 10.0) -> dict:
     t0 = time.perf_counter()
     dev = tr.rest.device
     torch.manual_seed(seed)
-    X = sample_controls(tr.controls, samples, seed)
-    solver = Solver(tr, tmpl, contacts, iters=iters, w_contact=w_contact)
-    res, before, after = [], [], []
-    for s in range(0, samples, batch):
-        c = torch.tensor(X[s:s + batch], device=dev)
-        o = solver.solve(c)
-        res.append(o["residual_mm"].cpu())
-        before.append({k2: v.cpu() for k2, v in o["before"].items()})
-        after.append({k2: v.cpu() for k2, v in o["after"].items()})
-        if progress and (s // batch) % 8 == 0:
-            progress(s / samples, f"deformer ground truth {s}/{samples}")
+    X = sample_controls(tr.controls, samples, seed, tongue_share=tongue_share)
+    cache = Path(solve_cache) if solve_cache else None
+    if cache is not None and cache.exists():                # experiments: reuse a solve
+        blob = torch.load(cache, weights_only=False)
+        X, res, before, after = blob["X"], blob["res"], blob["before"], blob["after"]
+    else:
+        solver = Solver(tr, tmpl, contacts, iters=iters, w_contact=w_contact)
+        res, before, after = [], [], []
+        for s in range(0, samples, batch):
+            c = torch.tensor(X[s:s + batch], device=dev)
+            o = solver.solve(c)
+            res.append(o["residual_mm"].cpu())
+            before.append({k2: v.cpu() for k2, v in o["before"].items()})
+            after.append({k2: v.cpu() for k2, v in o["after"].items()})
+            if progress and (s // batch) % 8 == 0:
+                progress(s / samples, f"deformer ground truth {s}/{samples}")
+        if cache is not None:
+            torch.save({"X": X, "res": res, "before": before, "after": after}, cache)
     Rm = torch.cat(res)                                                   # (N, V, 3) mm
     N, V = Rm.shape[:2]
     t_solve = time.perf_counter() - t0
     agg = lambda lst, key: int(sum(int(d[key].sum()) for d in lst))       # noqa: E731
     contact = {key: {"linear": agg(before, key), "solved": agg(after, key)} for key in before[0]}
-    # PCA of the residuals
+    # PCA of the residuals, per region: the mouth (lips, vestibule, bag and
+    # their surroundings: teeth/tongue contacts) and the rest (mostly lids).
+    # Disjoint supports keep the stacked basis orthonormal, and the rare mouth
+    # corrections get their own capacity instead of a global tail.
     Y = Rm.reshape(N, -1).to(dev)
     mean = Y.mean(0)
-    U, Sv, Vh = torch.linalg.svd(Y - mean, full_matrices=False)
-    k = min(k, Vh.shape[0])
-    basis = Vh[:k]                                                         # (K, 3V)
+    mouth_v = torch.tensor(region_mask(tmpl, tr.rest.cpu().numpy()), device=dev)
+    masks = [mouth_v.repeat_interleave(3), ~mouth_v.repeat_interleave(3)]
+    ks = [k_mouth, k]
+    bases, explained = [], []
+    for m, kk in zip(masks, ks):
+        Z = (Y - mean) * m
+        U, Sv, Vh = torch.linalg.svd(Z, full_matrices=False)
+        kk = min(kk, Vh.shape[0])
+        bases.append(Vh[:kk] * m)
+        var = Sv ** 2
+        explained.append(float(var[:kk].sum() / var.sum()) if var.sum() > 0 else 1.0)
+    basis = torch.cat(bases)                                                 # (K, 3V)
+    k = basis.shape[0]
     coeff = (Y - mean) @ basis.T
-    var = (Sv ** 2)
-    explained = float(var[:k].sum() / var.sum()) if var.sum() > 0 else 1.0
     # MLP: controls -> coefficients (normalised both ways), vertex-space loss
-    Xt = torch.tensor(X, device=dev)
+    # network inputs: the rig's input vector (controls and their corrective
+    # products, e.g. tongueOut x jawOpen, which contacts depend on)
+    with torch.no_grad():
+        Xt = tr.input_vector(torch.tensor(X, device=dev))
     xm, xs = Xt.mean(0), Xt.std(0)
     xs = torch.where(xs > 1e-6, 1.0 / xs, torch.ones_like(xs))
     cm, cs = coeff.mean(0), coeff.std(0).clamp(min=1e-6)
     perm = torch.randperm(N, device=dev)
     n_val = max(1, N // 8)
     va, trn = perm[:n_val], perm[n_val:]
-    net = MLP2(X.shape[1], hidden, k).to(dev)
-    opt = torch.optim.Adam(net.parameters(), lr=3e-3, weight_decay=1e-6)
+    net = MLP2(Xt.shape[1], hidden, k).to(dev)
+    opt = torch.optim.AdamW(net.parameters(), lr=3e-3, weight_decay=weight_decay)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, epochs)
     xin = (Xt - xm) * xs
     target = (coeff - cm) / cs
@@ -377,10 +414,41 @@ def train(tr: TorchRig, tmpl: T.Template, contacts: Contacts, out_dir: Path, sam
             r = pred @ basis + mean
             return (r - Y[idx]).reshape(len(idx), V, 3).norm(dim=-1)
 
+    # lips must not cross through the correction either: per upper/lower pair,
+    # the posed separation (linear rig + the predicted pre-skinning offset,
+    # carried by each vertex's blended skinning) stays >= min(rest gap, 0)
+    pu, pl = contacts.pair_u, contacts.pair_l
+    sep_lin, Au, Al = [], [], []
+    with torch.no_grad():
+        for i in range(0, N, 128):
+            o = tr(torch.tensor(X[i:i + 128], device=dev))
+            up = o["skin"][:, contacts.head, :3, 1] + o["skin"][:, contacts.jaw, :3, 1]
+            up = up / up.norm(dim=-1, keepdim=True)                          # (b, 3)
+            x = o["pos"] * 1000
+            sep_lin.append(((x[:, pu] - x[:, pl]) * up[:, None]).sum(-1))
+            Au.append((up[:, None, None, :] @ o["blend"][:, pu])[..., 0, :])  # (b, P, 3): up^T A_u
+            Al.append((up[:, None, None, :] @ o["blend"][:, pl])[..., 0, :])
+    sep_lin, Au, Al = torch.cat(sep_lin), torch.cat(Au), torch.cat(Al)
+    sep_floor = contacts.sep0[None]
+    Bu = basis.reshape(k, V, 3)[:, pu]                                      # (K, P, 3)
+    Bl = basis.reshape(k, V, 3)[:, pl]
+    mu, ml_ = mean.reshape(V, 3)[pu], mean.reshape(V, 3)[pl]
+
+    def lip_penalty(pred_norm, idx):
+        c = pred_norm * cs + cm                                              # (n, K) mm
+        du = torch.einsum("nk,kpc->npc", c, Bu) + mu
+        dl = torch.einsum("nk,kpc->npc", c, Bl) + ml_
+        sep = sep_lin[idx] + (Au[idx] * du).sum(-1) - (Al[idx] * dl).sum(-1)
+        return (torch.relu(sep_floor - sep) ** 2).mean()
+
+    # rare contact classes (the tongue) weigh more: they are all residual, and few
+    rare = torch.cat([d["tongue"] for d in before]).to(dev) if "tongue" in before[0] else torch.zeros(N, device=dev)
+    sw = (1.0 + tongue_weight * (rare > 0).float())[:, None]
     for ep in range(epochs):
         opt.zero_grad()
         pred = net(xin[trn])
-        loss = (((pred - target[trn]) * (cs / cs.max())) ** 2).mean()
+        loss = ((((pred - target[trn]) * (cs / cs.max())) ** 2) * sw[trn]).mean()
+        loss = loss + lip_weight * lip_penalty(pred, trn) / float(cs.max()) ** 2
         loss.backward()
         opt.step()
         sched.step()
@@ -388,32 +456,45 @@ def train(tr: TorchRig, tmpl: T.Template, contacts: Contacts, out_dir: Path, sam
             log(f"deformer mlp epoch {ep}: loss {loss.item():.5f}, val mean err {vert_err(va).mean().item():.4f} mm")
     ev = vert_err(va)
     mag = Y[va].reshape(len(va), V, 3).norm(dim=-1)
-    # the runtime question: contacts on held-out controls, linear rig vs linear + ML correctives
-    with torch.no_grad():
-        pre = ((net(xin[va]) * cs + cm) @ basis + mean).reshape(len(va), V, 3) / 1000
-        cv = torch.tensor(X, device=dev)[va]
-        lin = tr(cv)
-        ml = tr(cv, pre=pre)
-        _, c_lin = contacts.energy(lin["pos"] * 1000, lin["skin"])
-        _, c_ml = contacts.energy(ml["pos"] * 1000, ml["skin"])
-    held_out = {key: {"linear": int(c_lin[key].sum()), "ml": int(c_ml[key].sum())} for key in c_lin}
+    # the runtime question: contacts on held-out (and as many training)
+    # controls, linear rig vs linear + ML correctives (chunked: the rig's
+    # per-vertex matrices are large)
+    def contact_counts(ids):
+        tot_l, tot_m = {}, {}
+        for i in range(0, len(ids), 128):
+            b = ids[i:i + 128]
+            with torch.no_grad():
+                pre = ((net(xin[b]) * cs + cm) @ basis + mean).reshape(len(b), V, 3) / 1000
+                cv = torch.tensor(X, device=dev)[b]
+                lin = tr(cv)
+                _, cl = contacts.energy(lin["pos"] * 1000, lin["skin"])
+                ml = tr(cv, pre=pre)
+                _, cm_ = contacts.energy(ml["pos"] * 1000, ml["skin"])
+            for key in cl:
+                tot_l[key] = tot_l.get(key, 0) + int(cl[key].sum())
+                tot_m[key] = tot_m.get(key, 0) + int(cm_[key].sum())
+        return {key: {"linear": tot_l[key], "ml": tot_m[key]} for key in tot_l}
+
+    held_out = contact_counts(va)
+    train_contacts = contact_counts(trn[:len(va)])
     # export: LightRig .lrm (output.* denormalises straight to PCA coefficients in metres)
     out_dir = Path(out_dir)
     lrm = {"fc1.weight": net.fc1.weight.detach().cpu().numpy(), "fc1.bias": net.fc1.bias.detach().cpu().numpy(),
            "fc2.weight": net.fc2.weight.detach().cpu().numpy(), "fc2.bias": net.fc2.bias.detach().cpu().numpy(),
            "input.mean": xm.cpu().numpy(), "input.scale": xs.cpu().numpy(),
            "output.mean": (cm / 1000).cpu().numpy(), "output.scale": (cs / 1000).cpu().numpy()}
-    meta = {"format": "vhuman-ml-deformer", "version": "1", "inputs": json.dumps(tr.controls),
+    meta = {"format": "vhuman-ml-deformer", "version": "2", "inputs": json.dumps(tr.inputs),
             "outputs": "pca coefficients (metres) of pre-skinning corrective offsets",
             "kind": "face-corrective"}
     st.save(out_dir / "deformer.lrm", lrm, meta)
     st.save(out_dir / "deformer_basis.safetensors",
             {"basis": basis.reshape(k, V, 3).cpu().numpy(), "mean": (mean / 1000).reshape(V, 3).cpu().numpy()},
             {"vertices": V, "components": k, "units": "basis is unit-norm; offsets = mean + sum_k c_k basis_k"})
-    stats = {"samples": N, "components": k, "hidden": hidden, "explained_variance": round(explained, 4),
+    stats = {"samples": N, "components": k, "hidden": hidden,
+             "explained_variance": {"mouth": round(explained[0], 4), "rest": round(explained[1], 4)},
              "residual_mean_mm": round(float(mag.mean()), 4), "residual_p99_mm": round(float(mag.quantile(0.99)), 4),
              "val_error_mean_mm": round(float(ev.mean()), 4), "val_error_p99_mm": round(float(ev.quantile(0.99)), 4),
-             "contact_vertices": contact, "held_out_contacts": held_out, "solve_seconds": round(t_solve, 1),
+             "contact_vertices": contact, "held_out_contacts": held_out, "train_contacts": train_contacts, "solve_seconds": round(t_solve, 1),
              "seconds": round(time.perf_counter() - t0, 1)}
     (out_dir / "deformer.json").write_text(json.dumps(stats, indent=1))
     return stats

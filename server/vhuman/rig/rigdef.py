@@ -77,7 +77,9 @@ def joint_matrix_entries(scale: float) -> list[tuple]:
         ("eyeLookInLeft", "eye_L", "ry", deg(-28.0)), ("eyeLookInRight", "eye_R", "ry", deg(28.0)),
         ("eyeLookOutLeft", "eye_L", "ry", deg(32.0)), ("eyeLookOutRight", "eye_R", "ry", deg(-32.0)),
         # tongue chain
-        ("tongueOut", "tongue_01", "tz", 24.0 * mm), ("tongueOut", "tongue_01", "ty", 3.0 * mm),
+        # the tongue reaches the incisors on its own; past the lips only as far as the jaw is open
+        ("tongueOut", "tongue_01", "tz", 5.0 * mm), ("corr_tongueOut_jawOpen", "tongue_01", "tz", 19.0 * mm),
+        ("corr_tongueOut_jawOpen", "tongue_01", "ty", 3.0 * mm),
         ("tongueOut", "tongue_02", "rx", deg(-6.0)), ("tongueOut", "tongue_03", "rx", deg(-4.0)),
         ("tongueUp", "tongue_02", "rx", deg(-14.0)), ("tongueUp", "tongue_03", "rx", deg(-18.0)),
         ("tongueUp", "tongue_04", "rx", deg(-18.0)),
@@ -103,7 +105,12 @@ CORRECTIVES = (
     # smiling with an open jaw: corners stay up with the cheeks
     ("corr_jawOpen_smile_L", ("jawOpen", "mouthSmileLeft"), 1.0),
     ("corr_jawOpen_smile_R", ("jawOpen", "mouthSmileRight"), 1.0),
+    # mouthClose closes an open mouth: its shape is scaled by the jaw's opening
+    ("corr_mouthClose_jawOpen", ("mouthClose", "jawOpen"), 1.0),
+    ("corr_tongueOut_jawOpen", ("tongueOut", "jawOpen"), 1.0),
 )
+# blendshapes driven by a corrective instead of the control of the same name
+SHAPE_INPUT = {"mouthClose": "corr_mouthClose_jawOpen"}
 
 
 def euler_matrix(rx, ry, rz) -> np.ndarray:
@@ -181,8 +188,7 @@ class Rig:
             world[j] = local[j] if p < 0 else world[p] @ local[j]
         weights = inp[self.shape_src]
         if self.ml is not None:
-            x = inp[:len(self.controls)]
-            weights = np.concatenate([weights, self.ml.target_weights(dict(zip(self.controls, x)))])
+            weights = np.concatenate([weights, self.ml.target_weights(dict(zip(self.inputs, inp)))])
         return {"inputs": inp, "joint_delta": delta, "local": local, "world": world,
                 "skin": world @ self.inv_bind, "weights": weights}
 

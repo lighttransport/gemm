@@ -134,7 +134,9 @@ def write(asset, out: Path, subj=None) -> dict:
     rig = rigdef.Rig(asset.rig, ml=asset.info.get("ml"))
     skel = asset.skeleton
     joints = [SK.usd_path(j["name"]) for j in skel["joints"]]
-    blend_only = sorted(set(rig.shape_names) & set(rig.controls)
+    # vchar maps a control straight to a same-named blendshape: only shapes driven by their own control
+    own = {b["name"] for b in asset.rig["blendshapes"] if b["input"] == b["name"]}
+    blend_only = sorted(set(rig.shape_names) & set(rig.controls) & own
                         - {e["input"] for e in asset.rig["joint_matrix"]})
     frames = rom_frames(rig)
     end = frames[-1][0]

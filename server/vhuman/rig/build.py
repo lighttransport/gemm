@@ -63,7 +63,7 @@ def rig_definition(skel: dict, shape_names: list[str]) -> dict:
     cnames = {c["name"] for c in controls}
     corr = [{"name": n, "inputs": list(i), "weight": w} for n, i, w in rigdef.CORRECTIVES]
     inputs = cnames | {c["name"] for c in corr}
-    blend = [{"name": n, "input": n} for n in shape_names if n in inputs]
+    blend = [{"name": n, "input": rigdef.SHAPE_INPUT.get(n, n)} for n in shape_names if n in inputs]
     jm = [{"input": i, "joint": j, "attr": a, "value": v} for i, j, a, v in rigdef.joint_matrix_entries(skel["scale"])]
     return {"format": "vhuman-rig", "version": VERSION, "namespace": "lr.face.v1",
             "controls": controls, "correctives": corr, "joints": skel["joints"], "joint_matrix": jm,
@@ -106,7 +106,7 @@ STAGES = {"features": .04, "register": .08, "fit_cache": .2, "skeleton_weights":
 
 def assemble(folder, out_dir=None, res: int = 2048, iters: int = 600, log=print, cache_dir=None,
              reuse_fit: bool = False, preview: bool = True, keep_asset: bool = False, progress=None,
-             deformer_samples: int = 3072) -> dict:
+             deformer_samples: int = 4096) -> dict:
     t0 = time.perf_counter()
     folder = Path(folder)
     out = Path(out_dir) if out_dir else folder / "rig"
@@ -386,7 +386,7 @@ def main(argv=None):
     ap.add_argument("--no-preview", action="store_true")
     ap.add_argument("--keep-asset", action="store_true", help="also pickle the assembled asset (debugging)")
     ap.add_argument("--progress", action="store_true", help="print '@progress <fraction> <message>' lines")
-    ap.add_argument("--deformer-samples", type=int, default=3072,
+    ap.add_argument("--deformer-samples", type=int, default=4096,
                     help="ground-truth samples for the ML corrective deformer (0: no deformer)")
     a = ap.parse_args(argv)
     prog = None
