@@ -1,4 +1,4 @@
-# Resume: GLM-5.3-Flash A64FX kernel efficiency + QLAIR accuracy (updated 2026-09-28 13:20)
+# Resume: GLM-5.3-Flash A64FX kernel efficiency + QLAIR accuracy (updated 2026-09-28 13:28)
 
 ## Goal
 Run GLM-5.3-Flash (GLM53F) efficiently on A64FX. Targets:
@@ -189,7 +189,7 @@ All the new simulator switches are diagnostic and default off, so default QLAIR 
   node completed. Clair `STATUS.md` records the native command and
   `measurements/hw-20260927b/` has the measurement logs.
 
-## Session 2026-09-28 13:03–13:20 (clair commit 84e710d3; allocation ends 14:00 JST)
+## Session 2026-09-28 13:03–13:28 (clair commits 84e710d3, 4e42a286; allocation ends 14:00 JST)
 
 - Same frozen Q8_0R 64×4096 kernel, only rotating weight copies changed:
   ROT=1 (0.29 MiB, L2) is 37,050 native hardware cycles with zero L2-miss
@@ -204,9 +204,12 @@ All the new simulator switches are diagnostic and default off, so default QLAIR 
   warmed before timing. A 100-sample follow-up still shows some late-sample
   L2-miss wait; disabling huge pages moves it only modestly. Do not use
   ROT=16 as a clean L2 control. ROT=1 and ROT=32 are stable controls.
-- The ROT=16 simulator replay is still running; the ROT=1 replay has passed
-  correctness and completed. Native logs, simulator profile, and replay
-  commands are in Clair `STATUS.md` and `measurements/hw-20260927b/`.
+- The ROT=16 simulator replay completed and verified correct. It sees zero
+  HBM reads and zero modeled L2-miss wait at 33,019 cycles, while native
+  late samples take 43,888 cycles with 6,961 L2-miss-wait cycles and 9.75%
+  CV. This is a separate cache-residency mismatch, but too noisy for timing
+  calibration. Native logs, simulator profiles, and replay commands are in
+  Clair `STATUS.md` and `measurements/hw-20260927b/`.
 
 ## Production integration plan (not started; needs the real model on 12 nodes)
 
