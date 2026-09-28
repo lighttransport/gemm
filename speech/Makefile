@@ -10,7 +10,7 @@ CUDADIR := ../cuda
 QT      := qwen3_tts
 JA      := ja_align
 
-QT_HDRS := $(QT)/qtts_ops.h $(QT)/qtts_codec.h $(QT)/qtts_talker.h $(QT)/qtts_tokenizer.h $(QT)/wav_io.h
+QT_HDRS := $(QT)/qtts_clone.h $(QT)/qtts_spk.h $(QT)/qtts_codec_enc.h $(QT)/qtts_ops.h $(QT)/qtts_codec.h $(QT)/qtts_talker.h $(QT)/qtts_tokenizer.h $(QT)/wav_io.h
 JA_HDRS := $(wildcard $(JA)/*.h)
 
 all: $(BUILD)/qwen3_tts $(BUILD)/test_codec $(BUILD)/test_tokenizer $(BUILD)/ja_align $(BUILD)/test_w2v2

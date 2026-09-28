@@ -7,6 +7,9 @@
  *             [--instruct "..."] [--greedy] [--seed N] [--max-frames N] [--streaming]
  *             [--out out.wav] [--dump-dir dir] [--ids input_ids.npy] [--codes-out codes.npy]
  *             [--backend cpu|cuda] [--device N] [--codes-in codes.npy (decode only)]
+ *   voice clone (Base model): --ref-wav ref.wav [--ref-text "transcript"] [--xvec-only]
+ *             with --ref-text: in-context cloning (reference codes + transcript in the prompt);
+ *             without it (or --xvec-only): speaker-embedding-only cloning.
  */
 #define SAFETENSORS_IMPLEMENTATION
 #define GGUF_LOADER_IMPLEMENTATION
@@ -14,6 +17,8 @@
 #define QTTS_OPS_IMPLEMENTATION
 #define QTTS_CODEC_IMPLEMENTATION
 #define QTTS_TALKER_IMPLEMENTATION
+#define QTTS_SPK_IMPLEMENTATION
+#define QTTS_CODEC_ENC_IMPLEMENTATION
 #include "safetensors.h"
 #include "gguf_loader.h"
 #include "bpe_tokenizer.h"
@@ -21,8 +26,11 @@
 #include "qtts_ops.h"
 #include "qtts_codec.h"
 #include "qtts_talker.h"
+#include "qtts_spk.h"
+#include "qtts_codec_enc.h"
 #include "qtts_tokenizer.h"
 #include "wav_io.h"
+#include "qtts_clone.h"
 #ifdef QTTS_WITH_CUDA
 #define QTTS_CUDA_IMPLEMENTATION
 #include "qtts_cuda.h"
@@ -71,7 +79,8 @@ int main(int argc, char **argv) {
     qtts_gen_params gp;
     qtts_gen_params_default(&gp);
     int verbose = 1, use_cuda = 0, device = 0;
-    const char *codes_in = NULL;
+    const char *codes_in = NULL, *ref_wav = NULL, *ref_text = NULL;
+    int xvec_only = 0, streaming_set = 0;
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         const char *v = i + 1 < argc ? argv[i + 1] : NULL;
@@ -92,7 +101,11 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--device") && v) { device = atoi(v); i++; }
         else if (!strcmp(a, "--codes-in") && v) { codes_in = v; i++; }
         else if (!strcmp(a, "--greedy")) gp.greedy = 1;
-        else if (!strcmp(a, "--streaming")) gp.streaming = 1;
+        else if (!strcmp(a, "--streaming")) { gp.streaming = 1; streaming_set = 1; }
+        else if (!strcmp(a, "--non-streaming")) { gp.streaming = 0; streaming_set = 1; }
+        else if (!strcmp(a, "--ref-wav") && v) { ref_wav = v; i++; }
+        else if (!strcmp(a, "--ref-text") && v) { ref_text = v; i++; }
+        else if (!strcmp(a, "--xvec-only")) xvec_only = 1;
         else if (!strcmp(a, "--quiet")) verbose = 0;
         else { fprintf(stderr, "unknown or incomplete option %s\n", a); return 1; }
     }
@@ -117,6 +130,16 @@ int main(int argc, char **argv) {
     snprintf(tokdir, sizeof(tokdir), "%s/speech_tokenizer", model);
     qtts_codec *codec = qtts_codec_load(tokdir);
     if (!m || !codec) return 1;
+
+    /* voice clone: speaker embedding (+ reference codes and transcript for ICL) */
+    qtts_clone_state cs;
+    memset(&cs, 0, sizeof(cs));
+    if (ref_wav) {
+        if (qtts_clone_prepare(&cs, model, vocab, ref_wav, ref_text, xvec_only, dump)) return 1;
+        gp.clone = &cs.vc;
+        if (!streaming_set) gp.streaming = 1;   /* generate_voice_clone defaults to the streaming text feed */
+        speaker = "";
+    }
     const qtts_backend *be = NULL;
 #ifdef QTTS_WITH_CUDA
     qtts_cuda *gpu = NULL;
@@ -146,11 +169,16 @@ int main(int argc, char **argv) {
     double t2 = now_s();
     int n = 0;
     float *wav;
+    /* ICL: decode [reference codes + generated codes], then cut the reference part */
+    int dec_T = 0;
+    int32_t *dec_codes = qtts_clone_codes(&cs, res.codes, res.n_frames, &dec_T);
 #ifdef QTTS_WITH_CUDA
-    if (use_cuda) wav = qtts_cuda_decode(gpu, res.codes, res.n_frames, &n, dump);
+    if (use_cuda) wav = qtts_cuda_decode(gpu, dec_codes, dec_T, &n, dump);
     else
 #endif
-    wav = qtts_codec_decode(codec, res.codes, res.n_frames, &n, dump);
+    wav = qtts_codec_decode(codec, dec_codes, dec_T, &n, dump);
+    n = qtts_clone_trim(&cs, wav, n, dec_T);
+    if (dec_codes != res.codes) free(dec_codes);
     if (!wav) { fprintf(stderr, "decode failed\n"); return 1; }
     double t3 = now_s();
     wav_write_pcm16(out_wav, wav, n, qtts_codec_sample_rate(codec));
@@ -175,7 +203,7 @@ int main(int argc, char **argv) {
         qt_npy_save_f32(p, wav, 1, &n);
     }
     if (codes_out) { int cd[2] = { res.n_frames, 16 }; qt_npy_save_i32(codes_out, res.codes, 2, cd); }
-    free(wav); free(ids); free(inst);
+    free(wav); free(ids); free(inst); qtts_clone_free(&cs);
     qtts_gen_result_free(&res);
 #ifdef QTTS_WITH_CUDA
     qtts_cuda_free(gpu);

@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 static void wav__u32(FILE *f, uint32_t v) { uint8_t b[4] = { (uint8_t)v, (uint8_t)(v >> 8), (uint8_t)(v >> 16), (uint8_t)(v >> 24) }; fwrite(b, 1, 4, f); }
 static void wav__u16(FILE *f, uint16_t v) { uint8_t b[2] = { (uint8_t)v, (uint8_t)(v >> 8) }; fwrite(b, 1, 2, f); }
@@ -86,6 +87,31 @@ static inline float *wav_read(const char *path, int *n_out, int *sr_out) {
     *n_out = n;
     if (sr_out) *sr_out = sr;
     return x;
+}
+
+/* Band-limited resampling by Blackman-windowed sinc interpolation (cutoff 0.95 x min Nyquist). */
+static inline float *wav_resample(const float *x, int n, int sr_in, int sr_out, int *n_out) {
+    long long no = ((long long)n * sr_out + sr_in - 1) / sr_in;
+    float *y = (float *)malloc(sizeof(float) * (size_t)(no > 0 ? no : 1));
+    if (sr_in == sr_out) { memcpy(y, x, sizeof(float) * (size_t)n); *n_out = n; return y; }
+    double ratio = (double)sr_out / sr_in, fc = 0.95 * 0.5 * (ratio < 1.0 ? ratio : 1.0);
+    const double PI = 3.14159265358979323846;
+    double width = 32 / (2.0 * fc);
+    #pragma omp parallel for schedule(static)
+    for (long long i = 0; i < no; i++) {
+        double t = i / ratio, acc = 0.0, ws = 0.0;
+        for (long long j = (long long)ceil(t - width); j <= (long long)floor(t + width); j++) {
+            double d = t - j, a = 2.0 * fc * d;
+            double sn = fabs(a) < 1e-12 ? 1.0 : sin(PI * a) / (PI * a);
+            double u = (d + width) / (2.0 * width);
+            double k = 2.0 * fc * sn * (0.42 - 0.5 * cos(2 * PI * u) + 0.08 * cos(4 * PI * u));
+            ws += k;
+            if (j >= 0 && j < n) acc += k * x[j];
+        }
+        y[i] = (float)(ws > 0 ? acc / ws : 0.0);
+    }
+    *n_out = (int)no;
+    return y;
 }
 
 #endif /* QTTS_WAV_IO_H */

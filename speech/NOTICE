@@ -20,6 +20,13 @@ Upstream work consulted and followed (all Apache-2.0 or MIT):
   Training data ReazonSpeech is CDLA-Sharing-1.0; CDLA places no restriction
   on model outputs. We ship conversion scripts only.
 * ctc-segmentation (Kürzinger et al., 2020) — Apache-2.0.
+* Hugging Face transformers Mimi (MimiModel encoder path) — Apache-2.0;
+  qwen3_tts/qtts_codec_enc.h follows it. qwen3_tts/qtts_spk.h follows the
+  ECAPA-TDNN Qwen3TTSSpeakerEncoder in qwen_tts (Apache-2.0).
+
+Evaluation-only tools and data (never linked or redistributed): pyopenjtalk
+(accent/reading oracle), SpeechBrain spkrec-ecapa-voxceleb (Apache-2.0, speaker
+similarity), JSUT corpus (human baseline / reference voices; research terms).
 * Repository components reused (MIT unless noted): common/safetensors.h,
   common/bpe_tokenizer.h + common/unicode_data_tables.inc (derived from
   llama.cpp, MIT; Unicode data under the Unicode license), common/gguf_loader.h,
@@ -33,6 +40,9 @@ black-box validation oracles, their source was not consulted):
 * CTC Viterbi forced alignment (Graves et al., 2006 trellis) — validated against
   torchaudio.functional.forced_align (BSD-2) as an oracle.
 * YIN F0 estimation (de Cheveigné & Kawahara, 2002).
+* Speaker-encoder log-mel front end (radix-2 FFT, periodic Hann, reflect padding,
+  Slaney-scale mel filterbank with Slaney normalization) — torch.stft and
+  librosa.filters.mel (ISC) used only as numeric oracles.
 * Windowed-sinc resampler, RIFF/WAVE I/O, FFT.
 * Japanese kana -> phoneme and phoneme -> viseme tables, written from Japanese
   phonology (label strings follow the Apache-2.0 model vocabulary).

@@ -26,6 +26,17 @@
 
 typedef struct qtts_model qtts_model;
 
+/* Voice cloning (Base model). spk_emb alone = x-vector mode; with ref_ids + ref_codes = ICL
+ * (in-context) mode: the reference transcript and its codec frames are placed in the prompt and
+ * generation continues the reference speech. */
+typedef struct {
+    const float *spk_emb;          /* [hidden] speaker embedding (qtts_spk_embed), required */
+    const int32_t *ref_ids;        /* tokenized "<|im_start|>assistant\n{ref}<|im_end|>\n" (ICL) */
+    int n_ref_ids;
+    const int32_t *ref_codes;      /* [n_ref][16] reference codes (qtts_cenc_encode) (ICL) */
+    int n_ref;
+} qtts_voice_clone;
+
 typedef struct {
     int greedy;               /* 1: argmax (validation), 0: sample */
     float temperature, top_p; /* talker */
@@ -36,6 +47,7 @@ typedef struct {
     int max_frames;
     uint64_t seed;
     int streaming;            /* 0: non-streaming text feed (CustomVoice default) */
+    const qtts_voice_clone *clone; /* NULL unless cloning a voice with the Base model */
 } qtts_gen_params;
 
 typedef struct {
@@ -534,12 +546,17 @@ int qtts_generate(qtts_model *m, const qtts_backend *be_in, const int32_t *ids, 
     int cpre[8], nc = 0;
     if (lang_id < 0) { cpre[nc++] = m->nothink; cpre[nc++] = m->think_bos; cpre[nc++] = m->think_eos; }
     else { cpre[nc++] = m->think; cpre[nc++] = m->think_bos; cpre[nc++] = lang_id; cpre[nc++] = m->think_eos; }
-    if (spk_id >= 0) cpre[nc++] = spk_id;
+    const qtts_voice_clone *vc = gp->clone;
+    int spk_row = -1;                   /* position of the speaker row in the codec prefix */
+    if (vc && vc->spk_emb) spk_row = nc++;
+    else if (spk_id >= 0) cpre[nc++] = spk_id;
     cpre[nc++] = m->codec_pad;
     cpre[nc++] = m->codec_bos;
+    int icl = vc && vc->ref_codes && vc->n_ref > 0 && vc->ref_ids && vc->n_ref_ids > 5;
 
     int n_text = n_ids - 3 - 5;         /* ids[3:-5] */
-    int cap = n_inst + 3 + nc + n_text + 4;
+    int n_rtext = icl ? vc->n_ref_ids - 3 - 2 : 0;   /* ref_ids[3:-2] */
+    int cap = n_inst + 3 + nc + n_text + 4 + (icl ? n_rtext + vc->n_ref + 4 : 0);
     float *pre = (float *)calloc((size_t)cap * H, sizeof(float));
     int L = 0;
     if (inst && n_inst > 0) { qtl__text_embed(m, inst, n_inst, pre); L += n_inst; }
@@ -549,16 +566,55 @@ int qtts_generate(qtts_model *m, const qtts_backend *be_in, const int32_t *ids, 
     float *sp = (float *)malloc(sizeof(float) * 3 * H);
     qtl__text_embed(m, special, 3, sp);
     const float *e_bos = sp, *e_eos = sp + H, *e_pad = sp + 2 * H;
-    /* tts_pad x (nc-2) + tts_bos, each + codec_emb(cpre[0..nc-2]) */
+    /* tts_pad x (nc-2) + tts_bos, each + codec prefix row 0..nc-2 (speaker row = x-vector) */
     for (int i = 0; i < nc - 1; i++) {
         float *r = pre + (size_t)L * H;
         memcpy(r, i < nc - 2 ? e_pad : e_bos, sizeof(float) * H);
-        qtl__row_add(r, m->codec_emb, cpre[i], H);
+        if (i == spk_row) for (int j = 0; j < H; j++) r[j] += vc->spk_emb[j];
+        else qtl__row_add(r, m->codec_emb, cpre[i], H);
         L++;
     }
     float *trailing = NULL;
     int n_trailing = 0;
-    if (!gp->streaming) {
+    if (icl) {
+        /* text track: (ref text + target text) + tts_eos; codec track: codec_bos + sum of ref codes */
+        int Lt = n_rtext + n_text + 1, Lc = 1 + vc->n_ref;
+        float *te = (float *)malloc(sizeof(float) * (size_t)Lt * H);
+        int32_t *cat_ids = (int32_t *)malloc(sizeof(int32_t) * (size_t)(Lt > 1 ? Lt - 1 : 1));
+        memcpy(cat_ids, vc->ref_ids + 3, sizeof(int32_t) * (size_t)n_rtext);
+        memcpy(cat_ids + n_rtext, ids + 3, sizeof(int32_t) * (size_t)n_text);
+        qtl__text_embed(m, cat_ids, Lt - 1, te);
+        memcpy(te + (size_t)(Lt - 1) * H, e_eos, sizeof(float) * H);
+        free(cat_ids);
+        float *ce = (float *)calloc((size_t)Lc * H, sizeof(float));
+        qtl__row_add(ce, m->codec_emb, m->codec_bos, H);
+        for (int f = 0; f < vc->n_ref; f++) qtts_codec_embed_sum(m, vc->ref_codes + (size_t)f * m->num_groups, ce + (size_t)(1 + f) * H);
+        if (!gp->streaming) {
+            for (int i = 0; i < Lt; i++) {
+                float *r = pre + (size_t)L++ * H;
+                memcpy(r, te + (size_t)i * H, sizeof(float) * H);
+                qtl__row_add(r, m->codec_emb, m->codec_pad, H);
+            }
+            for (int i = 0; i < Lc; i++) {
+                float *r = pre + (size_t)L++ * H;
+                for (int j = 0; j < H; j++) r[j] = ce[(size_t)i * H + j] + e_pad[j];
+            }
+            n_trailing = 1;
+            trailing = (float *)malloc(sizeof(float) * H);
+            memcpy(trailing, e_pad, sizeof(float) * H);
+        } else {
+            for (int i = 0; i < Lc; i++) {
+                const float *t = i < Lt ? te + (size_t)i * H : e_pad;
+                float *r = pre + (size_t)L++ * H;
+                for (int j = 0; j < H; j++) r[j] = t[j] + ce[(size_t)i * H + j];
+            }
+            n_trailing = Lt > Lc ? Lt - Lc : 1;
+            trailing = (float *)malloc(sizeof(float) * (size_t)n_trailing * H);
+            if (Lt > Lc) memcpy(trailing, te + (size_t)Lc * H, sizeof(float) * (size_t)n_trailing * H);
+            else memcpy(trailing, e_pad, sizeof(float) * H);
+        }
+        free(te); free(ce);
+    } else if (!gp->streaming) {
         /* text tokens + tts_eos, each + codec_pad; then tts_pad + codec_bos */
         qtl__text_embed(m, ids + 3, n_text, pre + (size_t)L * H);
         memcpy(pre + (size_t)(L + n_text) * H, e_eos, sizeof(float) * H);

@@ -6,6 +6,7 @@
  *   tts_ja --model <qwen3-tts dir> --aligner ja_align.safetensors --text "..." [--speaker Ono_Anna]
  *          [--instruct "..."] [--kana "pronunciation reading"] [--seed N] [--backend cpu|cuda]
  *          [--fps 30] [--out out.wav] [--aux aux.json]
+ *          voice clone (--model <Base dir>): --ref-wav ref.wav [--ref-text "transcript"] [--xvec-only]
  *
  * Without --kana the aligner runs alignment-free on the synthesized audio (the content is known
  * to be clean speech); with --kana it force-aligns the given reading.
@@ -16,6 +17,8 @@
 #define QTTS_OPS_IMPLEMENTATION
 #define QTTS_CODEC_IMPLEMENTATION
 #define QTTS_TALKER_IMPLEMENTATION
+#define QTTS_SPK_IMPLEMENTATION
+#define QTTS_CODEC_ENC_IMPLEMENTATION
 #include "safetensors.h"
 #include "gguf_loader.h"
 #include "bpe_tokenizer.h"
@@ -23,7 +26,10 @@
 #include "qtts_codec.h"
 #include "qtts_talker.h"
 #include "qtts_tokenizer.h"
+#include "qtts_spk.h"
+#include "qtts_codec_enc.h"
 #include "wav_io.h"
+#include "qtts_clone.h"
 #ifdef QTTS_WITH_CUDA
 #define QTTS_CUDA_IMPLEMENTATION
 #include "qtts_cuda.h"
@@ -64,7 +70,8 @@ int main(int argc, char **argv) {
     const char *model = "/mnt/nvme01/models/speech/Qwen3-TTS-12Hz-1.7B-CustomVoice";
     const char *aligner = "/mnt/nvme01/models/speech/japanese-wav2vec2-large-hiragana-ctc/ja_align.safetensors";
     const char *text = NULL, *speaker = "Ono_Anna", *instruct = "", *out_wav = "out.wav", *aux = "aux.json";
-    int use_cuda = 0;
+    int use_cuda = 0, xvec_only = 0;
+    const char *ref_wav = NULL, *ref_text = NULL;
     qtts_gen_params gp;
     qtts_gen_params_default(&gp);
     ja_align_opts ao;
@@ -83,6 +90,9 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--out") && v) { out_wav = v; i++; }
         else if (!strcmp(a, "--aux") && v) { aux = v; i++; }
         else if (!strcmp(a, "--backend") && v) { use_cuda = !strcmp(v, "cuda"); i++; }
+        else if (!strcmp(a, "--ref-wav") && v) { ref_wav = v; i++; }
+        else if (!strcmp(a, "--ref-text") && v) { ref_text = v; i++; }
+        else if (!strcmp(a, "--xvec-only")) xvec_only = 1;
         else { fprintf(stderr, "unknown or incomplete option %s\n", a); return 1; }
     }
     if (!text) { fprintf(stderr, "usage: %s --text \"日本語のテキスト\" [options]\n", argv[0]); return 1; }
@@ -99,6 +109,14 @@ int main(int argc, char **argv) {
     /* CPU encoder weights are only needed when the aligner runs on the CPU */
     w2v2_model *w2v = use_cuda ? NULL : w2v2_load(aligner);
     if (!m || !codec || (!use_cuda && !w2v)) return 1;
+    qtts_clone_state cs;
+    memset(&cs, 0, sizeof(cs));
+    if (ref_wav) {
+        if (qtts_clone_prepare(&cs, model, vocab, ref_wav, ref_text, xvec_only, NULL)) return 1;
+        gp.clone = &cs.vc;
+        gp.streaming = 1;
+        speaker = "";
+    }
     const qtts_backend *be = NULL;
 #ifdef QTTS_WITH_CUDA
     qtts_cuda *gpu = NULL;
@@ -114,13 +132,16 @@ int main(int argc, char **argv) {
     double t1 = now_s();
     qtts_gen_result res;
     if (qtts_generate(m, be, ids, n_ids, inst, n_inst, speaker, "Japanese", &gp, 0, &res, NULL, NULL)) return 1;
-    int n = 0;
+    int n = 0, dec_T = 0;
     float *wav;
+    int32_t *dec_codes = qtts_clone_codes(&cs, res.codes, res.n_frames, &dec_T);
 #ifdef QTTS_WITH_CUDA
-    if (use_cuda) wav = qtts_cuda_decode(gpu, res.codes, res.n_frames, &n, NULL);
+    if (use_cuda) wav = qtts_cuda_decode(gpu, dec_codes, dec_T, &n, NULL);
     else
 #endif
-    wav = qtts_codec_decode(codec, res.codes, res.n_frames, &n, NULL);
+    wav = qtts_codec_decode(codec, dec_codes, dec_T, &n, NULL);
+    n = qtts_clone_trim(&cs, wav, n, dec_T);
+    if (dec_codes != res.codes) free(dec_codes);
     double t2 = now_s();
     wav_write_pcm16(out_wav, wav, n, 24000);
     ja_align_result r;
@@ -145,6 +166,7 @@ int main(int argc, char **argv) {
     ja_align_result_free(&r);
     free(wav); free(ids); free(inst);
     qtts_gen_result_free(&res);
+    qtts_clone_free(&cs);
 #ifdef QTTS_WITH_CUDA
     qtts_cuda_free(gpu);
 #endif

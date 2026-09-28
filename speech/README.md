@@ -130,6 +130,55 @@ speech/build/qwen3_tts_cuda --backend cuda --codes-in codes.npy --out out.wav   
 
 Speed on an RTX 5060 Ti (16 GB, sm_120), with the GPU shared with another busy process: talker RTF 0.24–0.28, codec RTF 0.01–0.09, end to end ≈ 0.26–0.31.
 
+### Voice cloning (Base model)
+
+```
+hf download Qwen/Qwen3-TTS-12Hz-1.7B-Base --local-dir /mnt/nvme01/models/speech/Qwen3-TTS-12Hz-1.7B-Base
+speech/build/qwen3_tts_cuda --backend cuda --model <Base dir> --ref-wav ref.wav \
+    --ref-text "参照音声の書き起こし" --text "合成したい文" --out out.wav      # in-context (ICL)
+speech/build/qwen3_tts_cuda ... --ref-wav ref.wav --xvec-only ...                  # speaker embedding only
+```
+
+The reference wav can be at any sample rate; it is resampled to 24 kHz. Both modes run on the CPU backend too, and `tts_ja` accepts the same options. New components, all running once per reference clip on the CPU:
+
+- **`qtts_spk.h`: speaker encoder.**
+  - It computes a log-mel spectrogram with an FFT, a Slaney mel filterbank and reflect padding, all written from the definitions. torch.stft and librosa served only as numeric oracles.
+  - An ECAPA-TDNN then produces a 2048-d x-vector: TDNN, 3 SE-Res2Net blocks, attentive statistics pooling.
+  - This follows `Qwen3TTSSpeakerEncoder` (Apache-2.0).
+- **`qtts_codec_enc.h`: tokenizer encoder.** It encodes the reference audio into 12.5 Hz codes and follows the Apache-2.0 HF `MimiModel.encode` path. It consists of:
+  - a causal SEANet encoder with strides 4/5/6/8;
+  - an 8-layer causal transformer;
+  - a stride-2 downsample with replicate padding;
+  - split-RVQ nearest-centroid encoding (1 semantic + 15 acoustic codebooks).
+- **Prompt construction (`qtts_talker.h`, `qtts_voice_clone`).**
+  - The x-vector takes the speaker slot of the codec prefix.
+  - ICL adds `(reference text + target text) + tts_eos` on the text track and `codec_bos + summed reference codes` on the codec track. It has streaming and non-streaming layouts, following `generate_icl_prompt`.
+  - Output is decoded as `[reference codes + generated codes]` and the reference part is cut (`qtts_clone.h`).
+  - Voice cloning defaults to the streaming text feed, as `generate_voice_clone` does.
+
+**Validation.** The reference clip is JSUT BASIC5000_0002 resampled to 24 kHz, and decoding is greedy. The comparison is `speech/ref/qtts_clone_reference.py` vs `qwen3_tts_cuda --dump-dir`.
+
+| Check | ICL, streaming | ICL, non-streaming | x-vector only |
+|---|---|---|---|
+| log-mel vs torch.stft + librosa | max abs 1.8e-4 | same | same |
+| speaker embedding | cos 1.0 (max abs 1.9e-6) | same | same |
+| encoder stages (SEANet / transformer / downsample) | cos 1.0 | same | — |
+| reference codes, 62 × 16 | **identical** | **identical** | — |
+| prompt embeddings | max abs 9.5e-7 | 9.5e-7 | 9.5e-7 |
+| generated greedy codes | **identical** (39) | **identical** (24) | **identical** (24) |
+| waveform | SNR 114.3 dB | 113.3 dB | 113.7 dB |
+
+**Quality** (`speech/ref/clone_eval.py`, 10 sentences, sampling).
+- Speaker similarity is the cosine of SpeechBrain ECAPA-VoxCeleb embeddings between the reference clip and the output. SpeechBrain is Apache-2.0 and used only as an evaluation oracle.
+- CER uses the hiragana CTC model as in the intelligibility eval.
+
+| Output | Speaker similarity to the reference | Kana CER |
+|---|---|---|
+| another recording of the same JSUT speaker (ceiling) | 0.744 | — |
+| **clone, ICL** | **0.634** | 0.4% |
+| clone, x-vector only | 0.575 | 1.3% |
+| CustomVoice Ono_Anna (a different speaker) | 0.239 | 3.6% |
+
 `speech/build/tts_ja_cuda --text "…" --out out.wav --aux aux.json` runs the whole pipeline: text → Qwen3-TTS (CUDA) → ja_align (CPU) → wav plus `aux.json`.
 
 ## ja_align — Japanese CTC aligner and speech features for facial animation
