@@ -27677,11 +27677,25 @@ static int qwen4_ple_gather(hip_llm_runner *r, int32_t token_id) {
                         r->h_ple_emb + (size_t)h * r->ple_dim, r->ple_dim);
         }
     }
+    const char *profile_env = getenv("LLM_QWEN4_PLE_PROFILE");
+    int profile = profile_env && atoi(profile_env) != 0;
+    double start_ms = profile ? hllm_monotonic_ms() : 0.0;
     /* The previous token may still be reading this host buffer via DMA. */
     if (r->ple_disk && hipStreamSynchronize(r->stream) != hipSuccess) return -1;
+    double sync_ms = profile ? hllm_monotonic_ms() - start_ms : 0.0;
     if (r->ple_disk && qwen4_ple_disk_gather(r->ple_disk, disk_rows, r->h_ple_emb)) {
         fprintf(stderr, "hip_llm: PLE SSD row read failed\n");
         return -1;
+    }
+    if (profile) {
+        static unsigned calls;
+        static double total_sync_ms, total_read_ms;
+        ++calls;
+        total_sync_ms += sync_ms;
+        total_read_ms += hllm_monotonic_ms() - start_ms - sync_ms;
+        if (calls % 128 == 0)
+            fprintf(stderr, "hip_llm: PLE profile calls=%u sync_ms=%.1f read_ms=%.1f\n",
+                    calls, total_sync_ms, total_read_ms);
     }
     return hipMemcpyAsync(r->d_ple_emb, r->h_ple_emb,
                           (size_t)r->ple_n_heads * r->ple_dim * sizeof(float),

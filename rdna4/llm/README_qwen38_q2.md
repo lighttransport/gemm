@@ -112,6 +112,14 @@ sequence hash, accepting most drafts, but measured **5.89 decode tok/s** and
 The experimental grouped verifier preserved the sequence on a 32-token prompt
 but decoded only **3.90 tok/s**. Neither is a faster default for this model.
 
+`LLM_QWEN4_PLE_PROFILE=1` reports the cumulative SSD gather and stream-wait
+time every 128 PLE calls. On a 1,024-token scalar prefill, the 16-worker SSD
+gather took 610 ms and its preceding stream wait took 293 ms, together only
+0.65% of the 139.07 s prefill. That run reached 7.36 prefill tok/s and 7.33
+decode tok/s for eight decode tokens. The PLE table is not the current
+throughput limiter. During the run, ROCm reported manual performance mode and
+memory clock level 0 (96 MHz), even while GPU memory activity was 69%.
+
 Combining exact GPU router top-k, 47 captured prefix graphs, and WMMA decode
 also preserved the 1K sequence hash. That run measured **7.29 prefill tok/s**
 and **6.47 decode tok/s**. The gain is small enough to leave these diagnostic
