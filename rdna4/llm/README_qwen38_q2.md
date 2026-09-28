@@ -148,6 +148,14 @@ tok/s, and 32 threads fell to 2.00/2.05 tok/s while preserving the output
 hash. The 32-thread run spent 11.76 s in CPU expert work during 15.96 s of
 prefill, showing severe oversubscription.
 
+`rocprofv3 --kernel-trace --stats` on the vectorized F16 32+8 run recorded
+73,695 GPU dispatches and 3.91 s of kernel time during a 5.56 s measured
+request. F16 matvec was largest (11,817 calls, 1.24 s), followed by Q3_K
+matvec (0.49 s), IQ4_XS matvec (0.45 s), and F32 matvec (0.34 s). A
+128-thread F16 launch retained the hash but was slower than 256 threads.
+The trace and PLE profile point to the scalar GPU projection chain and its
+memory traffic as the remaining bottleneck under the observed clock setting.
+
 Combining exact GPU router top-k, 47 captured prefix graphs, and WMMA decode
 also preserved the 1K sequence hash. That run measured **7.29 prefill tok/s**
 and **6.47 decode tok/s**. The gain is small enough to leave these diagnostic
