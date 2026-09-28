@@ -263,6 +263,9 @@ public:
   
   // Insert a compute→compute pipeline barrier (SHADER_WRITE→SHADER_READ|WRITE)
   void computeBarrier();
+  // Insert a compute→transfer barrier (SHADER_WRITE→TRANSFER_READ), e.g. before
+  // recordCopyBuffer of a shader's output into a staging buffer
+  void computeToTransferBarrier();
 
   // Synchronization
   bool waitForCompletion();

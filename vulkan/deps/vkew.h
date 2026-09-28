@@ -965,9 +965,15 @@ typedef struct VkMemoryBarrier {
 // Access flags
 #define VK_ACCESS_SHADER_READ_BIT  0x00000020
 #define VK_ACCESS_SHADER_WRITE_BIT 0x00000040
+#ifndef VK_ACCESS_TRANSFER_READ_BIT
+#define VK_ACCESS_TRANSFER_READ_BIT 0x00000800
+#endif
 
 // Pipeline stage flags
 #define VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT 0x00000800
+#ifndef VK_PIPELINE_STAGE_TRANSFER_BIT
+#define VK_PIPELINE_STAGE_TRANSFER_BIT 0x00001000
+#endif
 
 typedef struct VkSubmitInfo {
     VkStructureType sType;

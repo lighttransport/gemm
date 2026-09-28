@@ -1,0 +1,62 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+// Virtual-human face deformer: blend morphs (register-tiled over FT frames)
+// then 4-influence linear blend skinning. Same math as the CPU/CUDA backends.
+layout(local_size_x = 128) in;
+#define FT 8
+#define MAX_M 256
+#define MAX_J 64
+layout(std430, binding = 0) readonly buffer Rest { float rest[]; };
+layout(std430, binding = 1) readonly buffer Morph { float morph[]; };
+layout(std430, binding = 2) readonly buffer SJ { int sj[]; };
+layout(std430, binding = 3) readonly buffer SW { float sw[]; };
+layout(std430, binding = 4) readonly buffer W { float weights[]; };
+layout(std430, binding = 5) readonly buffer Skin { float skin[]; };
+layout(std430, binding = 6) writeonly buffer Out { float outp[]; };
+layout(push_constant) uniform PC { int V; int M; int J; int frames; } pc;
+shared float s_w[FT * MAX_M];
+shared float s_sk[FT * MAX_J * 12];
+
+void main() {
+  int f0 = int(gl_WorkGroupID.y) * FT;
+  int nf = min(FT, pc.frames - f0);
+  int M = pc.M, J = pc.J, V = pc.V;
+  for (int i = int(gl_LocalInvocationID.x); i < FT * M; i += 128) {
+    int f = i / M;
+    s_w[i] = f < nf ? weights[(f0 + f) * M + i % M] : 0.0;
+  }
+  for (int i = int(gl_LocalInvocationID.x); i < FT * J * 12; i += 128) {
+    int f = i / (J * 12);
+    s_sk[i] = f < nf ? skin[(f0 + f) * J * 12 + i % (J * 12)] : 0.0;
+  }
+  barrier();
+  int v = int(gl_GlobalInvocationID.x);
+  if (v >= V) return;
+  float px0 = rest[3 * v], py0 = rest[3 * v + 1], pz0 = rest[3 * v + 2];
+  float px[FT], py[FT], pz[FT];
+  [[unroll]] for (int f = 0; f < FT; ++f) { px[f] = px0; py[f] = py0; pz[f] = pz0; }
+  int stride = V * 3;
+  for (int m = 0; m < M; ++m) {
+    int o = m * stride + 3 * v;
+    float dx = morph[o], dy = morph[o + 1], dz = morph[o + 2];
+    [[unroll]] for (int f = 0; f < FT; ++f) {
+      float w = s_w[f * M + m];
+      px[f] = fma(w, dx, px[f]); py[f] = fma(w, dy, py[f]); pz[f] = fma(w, dz, pz[f]);
+    }
+  }
+  ivec4 j = ivec4(sj[4 * v], sj[4 * v + 1], sj[4 * v + 2], sj[4 * v + 3]);
+  vec4 w = vec4(sw[4 * v], sw[4 * v + 1], sw[4 * v + 2], sw[4 * v + 3]);
+  [[unroll]] for (int f = 0; f < FT; ++f) {
+    if (f >= nf) break;
+    float mm[12];
+    [[unroll]] for (int e = 0; e < 12; ++e) mm[e] = 0.0;
+    [[unroll]] for (int k = 0; k < 4; ++k) {
+      int base = (f * J + j[k]) * 12;
+      [[unroll]] for (int e = 0; e < 12; ++e) mm[e] += w[k] * s_sk[base + e];
+    }
+    int o = ((f0 + f) * V + v) * 3;
+    outp[o] = mm[0] * px[f] + mm[1] * py[f] + mm[2] * pz[f] + mm[3];
+    outp[o + 1] = mm[4] * px[f] + mm[5] * py[f] + mm[6] * pz[f] + mm[7];
+    outp[o + 2] = mm[8] * px[f] + mm[9] * py[f] + mm[10] * pz[f] + mm[11];
+  }
+}

@@ -641,6 +641,17 @@ void VulkanComputeRunner::computeBarrier() {
         0, 1, &barrier, 0, nullptr, 0, nullptr);
 }
 
+void VulkanComputeRunner::computeToTransferBarrier() {
+    VkMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    vkCmdPipelineBarrier(commandBuffer_,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 1, &barrier, 0, nullptr, 0, nullptr);
+}
+
 bool VulkanComputeRunner::endRecordingAndSubmit() {
     if (vkEndCommandBuffer(commandBuffer_) != VK_SUCCESS) {
         setError("Failed to end command buffer recording");
