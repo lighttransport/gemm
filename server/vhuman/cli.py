@@ -262,7 +262,7 @@ def cmd_rig_track(args) -> dict:
     from .rig import rigdef, usd
     svc = EyeService(Path(args.work))
     rig_json = svc.rig_file(args.head, "rig.json")
-    rig = rigdef.Rig(json.loads(rig_json.read_text()))
+    rig = rigdef.Rig(json.loads(rig_json.read_text()), folder=rig_json.parent)
     times, frames = rigdef.read_track(args.track)
     return usd.write_track(rig, times, frames, Path(args.out), fps=args.fps,
                            rig_layer=str(rig_json.parent / "rig.usda"))

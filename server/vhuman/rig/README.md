@@ -37,8 +37,43 @@ Outputs go to `<head>/rig/`: `rig.glb` (web viewer), `rig.usda` + `textures/`
 | Shapes | `expressions.py` | 51 `lr.face.v1` expression shapes + 4 correctives. Lids rotate about the eyeball centre (blink closes each upper sample onto its lower partner); `mouthClose` is solved against the jaw skinning; light PyTorch sparse-Laplacian smoothing. |
 | Mouth | `mouthparts.py` | 28 teeth on a smooth dental arch (overbite/overjet), swept gums, lofted tongue skinned to the tongue chain. |
 | Carried meshes | `attach.py` | Eyeballs from `head_eyes.glb` (rigid on the eye joints); tearlines, caruncles and eyeshells follow the lids through a surface wrap. |
-| Rig | `rigdef.py` | Controls → correctives → sparse joint-delta matrix + blendshape weights → LBS. Identical code in `web/vhuman_rig.html`. |
+| Rig | `rigdef.py` | Controls → correctives → sparse joint-delta matrix + blendshape weights (+ ML corrective weights) → LBS. Identical code in `web/vhuman_rig.html`. |
+| Deformer | `torchrig.py`, `mldeformer.py`, `mlruntime.py`, `native.py` | Batched PyTorch rig, contact/ARAP ground truth, PCA + MLP2 training, numpy runtime, native package + ctypes. |
 | Export | `gltf.py`, `usd.py` | glTF: one skin, sparse morph targets (POSITION + NORMAL), `extras.targetNames`. USD: SkelRoot/Skeleton/BlendShape, vchar control metadata, a range-of-motion `SkelAnimation`. |
+
+## Deformer
+
+Two layers, both evaluated identically in numpy (`rigdef.Rig`), the web
+viewer and native C:
+
+1. **Linear rig** (below): blendshapes, correctives and LBS.
+2. **ML corrective deformer** (`mldeformer.py`, trained per head during the
+   build; `--deformer-samples 0` skips it). A PyTorch ground-truth solve
+   relaxes the linear result for ~2k sampled control combinations:
+   anchoring to the rig, ARAP soft tissue against the rest shape (rotations
+   by a batched polar Newton iteration), and contacts. Lids stay outside
+   the rotating eyeballs, lips/vestibule outside per-tooth spheres on the
+   teeth joints, and the upper lip above the lower one. All thresholds are
+   relative to the rest pose, so the neutral face is unchanged. Residuals
+   are mapped before skinning, compressed by PCA (48 components) and
+   learned by a two-layer ReLU MLP (controls → coefficients). Outputs:
+   - `deformer.lrm`: LightRig `.lrm` safetensors, the same format as
+     `ryzen/lightrig_lrm_runner.c`.
+   - `deformer_basis.safetensors`: the PCA basis.
+   - morph targets `ml_mean`, `ml_00…` in rig.glb and rig.usda, with weights
+     from the MLP (`rig.json` `ml_deformer`).
+   - `deformer.json`: statistics, including contacts on held-out controls for
+     the linear rig and for linear + ML (reference man: eye 11403→2132,
+     teeth 1782→756, lips 3607→1723 contact vertices).
+3. **Native runtime**: `ryzen/vhuman_deformer.{h,c}` loads
+   `rig_deformer.safetensors` (written by `native.py`: the welded head,
+   all morphs, skin, the rig as dense tensors, the MLP). It evaluates one
+   frame (sparse AXPY over active morphs, `lt_mlp2_f32` for the MLP) or a
+   batch (`sgemm_avx2` over all morphs), then LBS. `make -C ryzen vhuman &&
+   ryzen/bench_vhuman_deformer <head>/rig/rig_deformer.safetensors`.
+   The reference head (12.6k vertices, 101 morphs) takes 0.55 ms/frame with
+   the ML correctives and 0.17 ms without, single-threaded. Parity with numpy
+   is ≈1e-7 m (`test_rig`, via ctypes).
 
 ## Rig evaluation (`rig.json`)
 
@@ -99,3 +134,8 @@ Names are our own; the 51 expression controls are the LightRig canonical
 - Mouth detection falls back to proportions when the lips are not found
   (reported as `features.mouth.fallback`).
 - vchar shows joint-driven controls only through animations (the ROM).
+- The ML deformer corrects sub-millimetre contacts and soft-tissue
+  shearing; it cannot add expression detail the procedural shapes lack.
+  Lip-lip contacts are only halved, and the tongue is not part of the contact
+  model. The native runtime covers the welded head; teeth, tongue and eyes are
+  rigid or simply skinned in the exports.

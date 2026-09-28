@@ -246,7 +246,7 @@ class EyeService:
                 "preview": "preview.png", "report": "rig_report.json"}
         urls = {k: f"{base}rig/{n}" for k, n in keys.items() if (folder / "rig" / n).is_file()}
         brief = {k: report.get(k) for k in ("version", "template", "register", "bake", "shapes", "controls",
-                                             "joints", "seconds")}
+                                             "joints", "seconds", "deformer")}
         return {"urls": urls, "report": brief}
 
     def rig_file(self, hid: str, name: str) -> Path:

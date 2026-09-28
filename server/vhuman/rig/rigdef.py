@@ -115,10 +115,16 @@ def euler_matrix(rx, ry, rz) -> np.ndarray:
 
 
 class Rig:
-    """Evaluate a rig definition (rig.json's "rig" section)."""
+    """Evaluate a rig definition (rig.json). With `ml` (an mldeformer.MLDeformer,
+    or `folder` holding deformer.lrm), the ML corrective targets named in
+    d["ml_deformer"] get their weights from the network."""
 
-    def __init__(self, d: dict):
+    def __init__(self, d: dict, ml=None, folder=None):
         self.d = d
+        if ml is None and folder is not None and d.get("ml_deformer"):
+            from .mlruntime import MLDeformer
+            ml = MLDeformer(folder)
+        self.ml = ml if d.get("ml_deformer") else None
         self.controls = [c["name"] for c in d["controls"]]
         self.cidx = {n: i for i, n in enumerate(self.controls)}
         self.lo = np.array([c["min"] for c in d["controls"]])
@@ -140,6 +146,8 @@ class Rig:
         self.inv_bind = np.linalg.inv(self.bind)
         self.shape_names = [b["name"] for b in d["blendshapes"]]
         self.shape_src = np.array([self.iidx[b["input"]] for b in d["blendshapes"]], np.int64)
+        self.ml_targets = list(d["ml_deformer"]["targets"]) if self.ml is not None else []
+        self.shape_names = self.shape_names + self.ml_targets
         self.J = J
 
     def input_vector(self, controls) -> np.ndarray:
@@ -171,8 +179,12 @@ class Rig:
             local[j, :3, 3] = self.rest_t[j] + delta[j, :3]
             p = self.parent[j]
             world[j] = local[j] if p < 0 else world[p] @ local[j]
+        weights = inp[self.shape_src]
+        if self.ml is not None:
+            x = inp[:len(self.controls)]
+            weights = np.concatenate([weights, self.ml.target_weights(dict(zip(self.controls, x)))])
         return {"inputs": inp, "joint_delta": delta, "local": local, "world": world,
-                "skin": world @ self.inv_bind, "weights": inp[self.shape_src]}
+                "skin": world @ self.inv_bind, "weights": weights}
 
 
 def deform(rest: np.ndarray, joints: np.ndarray, weights: np.ndarray, skin_mats: np.ndarray,

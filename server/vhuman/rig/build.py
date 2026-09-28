@@ -83,12 +83,29 @@ def _shape_normals(pos, tris, shapes: dict, vmap: np.ndarray):
     return out
 
 
-STAGES = {"features": .05, "register": .12, "fit_cache": .4, "skeleton_weights": .42, "shapes": .45, "bake": .5,
-          "assemble": .72, "gltf": .76, "usd": .8, "preview": .86}
+def train_deformer(tmpl, pos, shapes, Jn, W, skel, feat, out, samples, log=print, progress=None):
+    """The ML corrective deformer (mldeformer.py) on the welded template."""
+    import torch
+    from . import mldeformer, torchrig
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    rig0 = rig_definition(skel, sorted(shapes))
+    tr = torchrig.TorchRig(rig0, pos, shapes, Jn, W, device=dev)
+    names = [j["name"] for j in skel["joints"]]
+    jidx = {n: i for i, n in enumerate(names)}
+    teeth = [(mouthparts.teeth(skel, up, skel["scale"], jidx)[0], "teeth_upper" if up else "teeth_lower")
+             for up in (True, False)]
+    contacts = mldeformer.Contacts(tmpl, feat, skel, teeth, dev, pos)
+    stats = mldeformer.train(tr, tmpl, contacts, out, samples=samples, log=log, progress=progress)
+    return mldeformer.MLDeformer(out), stats
+
+
+STAGES = {"features": .04, "register": .08, "fit_cache": .2, "skeleton_weights": .22, "shapes": .24,
+          "deformer": .25, "bake": .5, "assemble": .72, "gltf": .76, "usd": .8, "preview": .86}
 
 
 def assemble(folder, out_dir=None, res: int = 2048, iters: int = 600, log=print, cache_dir=None,
-             reuse_fit: bool = False, preview: bool = True, keep_asset: bool = False, progress=None) -> dict:
+             reuse_fit: bool = False, preview: bool = True, keep_asset: bool = False, progress=None,
+             deformer_samples: int = 2048) -> dict:
     t0 = time.perf_counter()
     folder = Path(folder)
     out = Path(out_dir) if out_dir else folder / "rig"
@@ -99,11 +116,13 @@ def assemble(folder, out_dir=None, res: int = 2048, iters: int = 600, log=print,
         timings[key] = round(time.perf_counter() - t, 2)
         if progress:
             nxt = {"features": "register", "fit_cache": "skeleton_weights", "register": "skeleton_weights",
-                   "skeleton_weights": "shapes", "shapes": "bake", "bake": "assemble", "assemble": "gltf",
+                   "skeleton_weights": "shapes", "shapes": "deformer" if deformer_samples else "bake",
+                   "deformer": "bake", "bake": "assemble", "assemble": "gltf",
                    "gltf": "usd", "usd": "preview", "preview": None}.get(key)
             if nxt:
                 progress(STAGES[nxt], {"register": "fitting the template (PyTorch)", "skeleton_weights": "skeleton and weights",
-                                       "shapes": "expression shapes", "bake": "transferring the skin maps",
+                                       "shapes": "expression shapes", "deformer": "ML deformer: ground truth",
+                                       "bake": "transferring the skin maps",
                                        "assemble": "assembling meshes", "gltf": "writing rig.glb",
                                        "usd": "writing rig.usda", "preview": "rendering the pose sheet"}[nxt])
         return time.perf_counter()
@@ -132,6 +151,13 @@ def assemble(folder, out_dir=None, res: int = 2048, iters: int = 600, log=print,
     t = lap("skeleton_weights", t)
     shapes = expressions.build(F, skel, (Jn, W))
     t = lap("shapes", t)
+    ml, ml_stats = None, None
+    if deformer_samples:
+        ml, ml_stats = train_deformer(tmpl, pos, shapes, Jn, W, skel, feat, out, deformer_samples, log=log,
+                                      progress=(lambda f, m: progress(STAGES["deformer"] + 0.2 * f, m))
+                                      if progress else None)
+        shapes = dict(shapes, **ml.target_deltas())
+        t = lap("deformer", t)
     parts_t = meshes.unweld(tmpl, pos)
     lining_rgb = tuple(subj.fit.get("fit", {}).get("lining", {}).get("srgb", (150, 100, 85)))
     baked = bake.bake(tmpl, parts_t[0], pos, subj, out, res=res, lining_srgb=lining_rgb, log=log)
@@ -140,13 +166,14 @@ def assemble(folder, out_dir=None, res: int = 2048, iters: int = 600, log=print,
     parts: list[ExportPart] = []
     for p in parts_t:
         tris_w = p.vmap[p.tris]
-        dn = _shape_normals(pos, tris_w, shapes, p.vmap)
+        dn = _shape_normals(pos, tris_w, {k: v for k, v in shapes.items() if not k.startswith("ml_")}, p.vmap)
         sh = {}
         for name, d in shapes.items():
             dv = d[p.vmap]
             idx = np.flatnonzero(np.linalg.norm(dv, axis=1) > 2e-6)
             if len(idx):
-                sh[name] = (idx, dv[idx], dn[name][idx])
+                # ML components are sub-millimetre: their normal deltas are not worth the bytes
+                sh[name] = (idx, dv[idx], None if name.startswith("ml_") else dn[name][idx])
         parts.append(ExportPart(f"head_{p.name}", p.material, pos[p.vmap], p.normals, p.uv, p.tangents, p.tris,
                                 Jn[p.vmap], W[p.vmap], sh))
     for pm in (*mouthparts.teeth(skel, True, skel["scale"], jidx), *mouthparts.teeth(skel, False, skel["scale"], jidx),
@@ -215,12 +242,19 @@ def assemble(folder, out_dir=None, res: int = 2048, iters: int = 600, log=print,
         "baseColorFactor": [0.68, 0.28, 0.29, 1.0], "metallicFactor": 0.0, "roughnessFactor": 0.45}}}
     shape_names = sorted({n for p in parts for n in p.shapes})
     rig = rig_definition(skel, shape_names)
-    asset = RigAsset(skel, parts, materials, rig, {})
+    if ml is not None:
+        rig["ml_deformer"] = {"model": "deformer.lrm", "basis": "deformer_basis.safetensors",
+                              "targets": ml.target_names(), "inputs": ml.inputs,
+                              "evaluation": "c = MLP2((x - input.mean) * input.scale) * output.scale + output.mean;"
+                                            " weight(ml_mean) = 1, weight(ml_k) = c_k / output.scale_k"}
+    asset = RigAsset(skel, parts, materials, rig, {"ml": ml})
     t = lap("assemble", t)
     if keep_asset:
         import pickle
         (out / "asset.pkl").write_bytes(pickle.dumps(asset))
     (out / "rig.json").write_text(json.dumps(rig, indent=1))
+    from . import native
+    native_stats = native.write_package(out / "rig_deformer.safetensors", rig, pos, shapes, Jn, W, ml)
     glb_stats = gltf.write(asset, out / "rig.glb")
     t = lap("gltf", t)
     usd_stats = usd.write(asset, out, subj)
@@ -230,7 +264,8 @@ def assemble(folder, out_dir=None, res: int = 2048, iters: int = 600, log=print,
     t = lap("preview", t)
     report = {"version": VERSION, "head": folder.name, "template": tmpl.info, "features": feat.info,
               "register": fit["stats"], "skin": skin_info, "bake": baked["stats"], "gltf": glb_stats,
-              "usd": usd_stats, "shapes": len(shape_names), "controls": len(rig["controls"]),
+              "usd": usd_stats, "shapes": len(rig["blendshapes"]), "controls": len(rig["controls"]),
+              "deformer": ml_stats, "native_package": native_stats,
               "joints": names, "timings": timings, "seconds": round(time.perf_counter() - t0, 2),
               "preview": prev}
     (out / "rig_report.json").write_text(json.dumps(report, indent=1, default=float))
@@ -249,7 +284,7 @@ POSES = [("neutral", {}), ("smile", {"mouthSmileLeft": 1, "mouthSmileRight": 1, 
 
 
 def pose_parts(asset: RigAsset, controls: dict) -> list[tuple]:
-    R = rigdef.Rig(asset.rig)
+    R = rigdef.Rig(asset.rig, ml=asset.info.get("ml"))
     ev = R.evaluate(controls)
     wts = dict(zip(R.shape_names, ev["weights"]))
     out = []
@@ -308,7 +343,7 @@ def preview_sheet(asset: RigAsset, path: Path, size: int = 300) -> list[str]:
     flat = {"teeth": (0.93, 0.9, 0.82), "gums": (0.75, 0.35, 0.35), "tongue": (0.7, 0.3, 0.3),
             "mouth": (0.42, 0.12, 0.12)}
     proxies = _eye_proxies(asset)
-    R = rigdef.Rig(asset.rig)
+    R = rigdef.Rig(asset.rig, ml=asset.info.get("ml"))
     tiles = []
     for label, ctrl in POSES:
         scene = []
@@ -346,6 +381,8 @@ def main(argv=None):
     ap.add_argument("--no-preview", action="store_true")
     ap.add_argument("--keep-asset", action="store_true", help="also pickle the assembled asset (debugging)")
     ap.add_argument("--progress", action="store_true", help="print '@progress <fraction> <message>' lines")
+    ap.add_argument("--deformer-samples", type=int, default=2048,
+                    help="ground-truth samples for the ML corrective deformer (0: no deformer)")
     a = ap.parse_args(argv)
     prog = None
     if a.progress:
@@ -354,6 +391,7 @@ def main(argv=None):
         prog(0.01, "facial features")
     rep = assemble(a.head, a.out, a.res, a.iters, cache_dir=a.cache, reuse_fit=a.reuse_fit,
                    preview=not a.no_preview, keep_asset=a.keep_asset, progress=prog,
+                   deformer_samples=a.deformer_samples,
                    log=(lambda m: print(m, flush=True)))
     print(json.dumps({k: rep[k] for k in ("seconds", "timings", "shapes", "controls", "register", "bake")},
                      default=float))

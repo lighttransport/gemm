@@ -101,6 +101,7 @@ a.dl{color:var(--accent);margin-right:12px;font-size:13px;display:inline-block}
       <button data-view="front">front</button><button data-view="three">¾</button><button data-view="profile">profile</button><button data-view="mouth">mouth</button><button data-view="eyes">eyes</button>
       <label><input type="checkbox" id="wire"> wireframe</label>
       <label><input type="checkbox" id="bones"> skeleton</label>
+      <label title="learned corrective deformer (contacts with eyeballs, teeth and lips; soft-tissue relaxation)"><input type="checkbox" id="ml" checked> ML deformer</label>
       <label title="random blinks"><input type="checkbox" id="auto-blink" checked> auto blink</label>
       <label title="eyes (and a little of the head) follow the pointer over the viewer"><input type="checkbox" id="look-at"> look at pointer</label>
       <label>exposure <input type="range" id="exposure" min="0.3" max="2.5" step="0.05" value="1" style="width:100px"></label>
@@ -166,9 +167,44 @@ class LinearRig {
     for (const [row, col, v] of this.M) delta[row] += v * inp[col];
     const weights = {};
     for (const [name, src] of this.shapes) weights[name] = inp[src];
+    if (this.ml && this.mlOn) Object.assign(weights, this.ml.weights(Object.fromEntries(this.controls.map((n, i) => [n, x[i]]))));
     return { delta, weights };
   }
 }
+// ---- the ML corrective deformer (server/vhuman/rig/mldeformer.py) --------------------------
+async function loadSafetensors(url) {
+  const buf = await (await fetch(url)).arrayBuffer();
+  const n = Number(new DataView(buf).getBigUint64(0, true));
+  const header = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 8, n)));
+  const out = {};
+  for (const [k, h] of Object.entries(header)) {
+    if (k === '__metadata__') continue;
+    const [a, b] = h.data_offsets;
+    out[k] = { shape: h.shape, data: new Float32Array(buf.slice(8 + n + a, 8 + n + b)) };
+  }
+  return out;
+}
+class MLDeformer {        // c = fc2(relu(fc1((x - mean) * scale))) * out.scale + out.mean; weight_k = c_k / out.scale_k
+  constructor(t, def) {
+    this.t = t; this.def = def;
+    [this.H, this.I] = t['fc1.weight'].shape; this.K = t['fc2.weight'].shape[0];
+    this.h = new Float32Array(this.H); this.x = new Float32Array(this.I);
+    this.lo = def.inputs.map((n) => def.ranges[n][0]); this.hi = def.inputs.map((n) => def.ranges[n][1]);
+  }
+  weights(values) {
+    const t = this.t, x = this.x, h = this.h, out = { ml_mean: 1 };
+    this.def.inputs.forEach((n, i) => { x[i] = (Math.max(this.lo[i], Math.min(this.hi[i], values[n] || 0)) - t['input.mean'].data[i]) * t['input.scale'].data[i]; });
+    const W1 = t['fc1.weight'].data, b1 = t['fc1.bias'].data, W2 = t['fc2.weight'].data, b2 = t['fc2.bias'].data;
+    for (let j = 0; j < this.H; j++) { let s = b1[j]; for (let i = 0; i < this.I; i++) s += W1[j * this.I + i] * x[i]; h[j] = s > 0 ? s : 0; }
+    const om = t['output.mean'].data, os = t['output.scale'].data;
+    for (let k = 0; k < this.K; k++) {
+      let s = b2[k]; for (let j = 0; j < this.H; j++) s += W2[k * this.H + j] * h[j];
+      out[this.def.targets[k + 1]] = (s * os[k] + om[k]) / os[k];
+    }
+    return out;
+  }
+}
+
 const _m4 = new THREE.Matrix4(), _r = new THREE.Matrix4(), _e = new THREE.Matrix4();
 function restMatrix3(j) {       // row-major nested -> Matrix4
   const R = j.rest_rotation;
@@ -226,6 +262,7 @@ $('wire').addEventListener('change', () => {
   state.model?.traverse((o) => { if (o.isMesh) for (const m of [].concat(o.material)) m.wireframe = $('wire').checked; });
   dirty = true;
 });
+$('ml').addEventListener('change', () => { if (state.rig) { state.rig.mlOn = $('ml').checked; applyRig(); } });
 $('bones').addEventListener('change', () => { if (skelHelper) skelHelper.visible = $('bones').checked; dirty = true; });
 
 // ---- controls UI ----------------------------------------------------------------------
@@ -453,6 +490,13 @@ async function loadRig(h) {
   skelHelper.visible = $('bones').checked;
   scene.add(skelHelper);
   state.rig = new LinearRig(def);
+  if (def.ml_deformer) {
+    const t = await loadSafetensors(base + def.ml_deformer.model);
+    const ranges = Object.fromEntries(def.controls.map((c) => [c.name, [c.min, c.max]]));
+    state.rig.ml = new MLDeformer(t, Object.assign({ ranges }, def.ml_deformer));
+  }
+  state.rig.mlOn = $('ml').checked;
+  $('ml').disabled = !def.ml_deformer;
   state.restR = def.joints.map(restMatrix3);
   state.values = {};
   buildControls(def);
@@ -469,6 +513,12 @@ function showFacts(h) {
     rows.push(['template vertices', rep.template?.vertices], ['fit mean / p95 (mm)', rep.register ? `${rep.register.final_mean_dist_mm} / ${rep.register.final_p95_dist_mm}` : ''],
       ['texture transfer mean (mm)', rep.bake?.mean_transfer_mm], ['shapes / controls', `${rep.shapes} / ${rep.controls}`],
       ['joints', (rep.joints || []).join(', ')], ['build (s)', rep.seconds]);
+    const d = rep.deformer;
+    if (d) {
+      const pct = (k) => d.held_out_contacts?.[k] ? `${d.held_out_contacts[k].linear}→${d.held_out_contacts[k].ml}` : '';
+      rows.push(['ML deformer', `${d.samples} samples · ${d.components} comps · val ${d.val_error_mean_mm} mm`],
+        ['held-out contacts (eye / teeth / lips)', `${pct('eye')} / ${pct('teeth')} / ${pct('lips')}`]);
+    }
   } else rows.push(['rig', 'not built']);
   $('facts').innerHTML = rows.map(([k, v]) => `<tr><td>${k}</td><td>${v ?? ''}</td></tr>`).join('');
   const dl = $('downloads');

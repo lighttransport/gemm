@@ -41,14 +41,15 @@ def main(argv=None) -> int:
     pipeline.mock_head_glb(head / "pixal3d.glb", portrait, 20.0)
     fit.fit_head(portrait, head / "pixal3d.glb", head, fov_deg=20.0, res=256)
     rep = build.assemble(head, head / "rig", res=512, iters=60, cache_dir=out / "cache", preview=False,
-                         log=lambda m: None)
+                         log=lambda m: None, deformer_samples=192)
     tm = template.get(out / "cache")
     rig = json.loads((head / "rig" / "rig.json").read_text())
     summary = {"template": template_invariants(tm), "report": {k: rep[k] for k in ("shapes", "controls", "joints")},
                "fallback_mouth": rep["features"]["mouth"]["fallback"],
                "files": sorted(p.name for p in (head / "rig").iterdir()),
                "rig_controls": len(rig["controls"]), "blendshapes": [b["name"] for b in rig["blendshapes"]],
-               "register": rep["register"], "gltf": rep["gltf"], "usd": rep["usd"]}
+               "register": rep["register"], "gltf": rep["gltf"], "usd": rep["usd"], "deformer": rep["deformer"],
+               "ml_targets": len(rig.get("ml_deformer", {}).get("targets", []))}
     print(json.dumps(summary, default=float))
     return 0
 

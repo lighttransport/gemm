@@ -131,7 +131,7 @@ def write(asset, out: Path, subj=None) -> dict:
     out = Path(out)
     tex_dir = out / "textures"
     tex_dir.mkdir(exist_ok=True)
-    rig = rigdef.Rig(asset.rig)
+    rig = rigdef.Rig(asset.rig, ml=asset.info.get("ml"))
     skel = asset.skeleton
     joints = [SK.usd_path(j["name"]) for j in skel["joints"]]
     blend_only = sorted(set(rig.shape_names) & set(rig.controls)
@@ -233,8 +233,9 @@ def package(out: Path) -> str:
     partial = out / "rig_usd.zip.partial"
     with zipfile.ZipFile(partial, "w", zipfile.ZIP_DEFLATED) as f:
         f.write(out / "rig.usda", "rig.usda")
-        if (out / "rig.json").exists():
-            f.write(out / "rig.json", "rig.json")
+        for extra in ("rig.json", "deformer.lrm", "deformer_basis.safetensors", "deformer.json"):
+            if (out / extra).exists():
+                f.write(out / extra, extra)
         for t in sorted((out / "textures").glob("*.png")):
             f.write(t, f"textures/{t.name}")
     partial.replace(z)

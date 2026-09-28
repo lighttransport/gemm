@@ -4,6 +4,7 @@ tmp/vhuman-rig-venv or VHUMAN_RIG_PYTHON is unavailable)."""
 import json
 import math
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -100,6 +101,20 @@ class ChartTests(unittest.TestCase):
         self.assertGreater(ring[T.MOUTH_HALF, 0], seam[-1, 0])
 
 
+class SafetensorsTests(unittest.TestCase):
+    def test_round_trip(self):
+        from .rig import safetensors as st
+        with tempfile.TemporaryDirectory() as d:
+            t = {"a": np.arange(6, dtype=np.float32).reshape(2, 3), "b": np.array([1, -2], np.int32)}
+            st.save(Path(d) / "x.safetensors", t, {"k": "v"})
+            back, meta = st.load(Path(d) / "x.safetensors")
+            np.testing.assert_array_equal(back["a"], t["a"])
+            np.testing.assert_array_equal(back["b"], t["b"])
+            self.assertEqual(meta, {"k": "v"})
+            raw = (Path(d) / "x.safetensors").read_bytes()
+            self.assertEqual((8 + int.from_bytes(raw[:8], "little")) % 8, 0)     # aligned tensor data
+
+
 class RigFileTests(unittest.TestCase):
     def test_rig_file_guard(self):
         from .service import EyeService, ServiceError
@@ -150,7 +165,8 @@ class RigEndToEndTests(unittest.TestCase):
         self.assertEqual(t["boundary_edges"], t["expected_boundary"])   # lid linings + the neck cut
 
     def test_outputs(self):
-        for name in ("rig.glb", "rig.json", "rig.usda", "rig_usd.zip", "rig_report.json", "rig_basecolor.png"):
+        for name in ("rig.glb", "rig.json", "rig.usda", "rig_usd.zip", "rig_report.json", "rig_basecolor.png",
+                     "deformer.lrm", "deformer_basis.safetensors", "rig_deformer.safetensors"):
             self.assertIn(name, self.summary["files"])
         self.assertEqual(self.summary["report"]["controls"], len(rigdef.CONTROLS))
         self.assertGreaterEqual(self.summary["report"]["shapes"], 50)
@@ -169,6 +185,43 @@ class RigEndToEndTests(unittest.TestCase):
         self.assertIn("eyeBlinkLeft", skin["extras"]["targetNames"])
         w = g.accessor(prim["attributes"]["WEIGHTS_0"])
         np.testing.assert_allclose(w.sum(1), 1.0, atol=1e-5)
+
+    def test_ml_deformer(self):
+        d = self.summary["deformer"]
+        self.assertEqual(self.summary["ml_targets"], d["components"] + 1)
+        self.assertLess(d["val_error_mean_mm"], d["residual_mean_mm"] + 1e-6)
+        rig = json.loads((self.rig_dir / "rig.json").read_text())
+        r = rigdef.Rig(rig, folder=self.rig_dir)                  # numpy runtime, no torch
+        ev = r.evaluate({"jawOpen": 1.0, "mouthSmileLeft": 1.0})
+        w = dict(zip(r.shape_names, ev["weights"]))
+        self.assertEqual(w["ml_mean"], 1.0)
+        self.assertTrue(all(np.isfinite(v) for v in w.values()))
+
+    @unittest.skipIf(shutil.which("gcc") is None, "no gcc")
+    def test_native_deformer_parity(self):
+        from .rig import native, safetensors as st
+        lib = native.build_library(Path(self.tmp.name) / "native")
+        N = native.Native(lib, self.rig_dir / "rig_deformer.safetensors")
+        try:
+            rig = json.loads((self.rig_dir / "rig.json").read_text())
+            r = rigdef.Rig(rig, folder=self.rig_dir)
+            pk, meta = st.load(self.rig_dir / "rig_deformer.safetensors")
+            names = json.loads(meta["morphs"])
+            rng = np.random.default_rng(0)
+            X = np.zeros((6, N.C), np.float32)
+            X[:, :51] = (rng.random((6, 51)) < 0.15) * rng.random((6, 51))
+            X[:, r.cidx["headYaw"]] = rng.uniform(-1, 1, 6)
+            for x in X:
+                ev = r.evaluate(x)
+                w = dict(zip(r.shape_names, ev["weights"]))
+                p = pk["rest"] + np.tensordot(np.array([w.get(n, 0.0) for n in names]), pk["morph"], 1)
+                ref = rigdef.deform(p.astype(np.float64), pk["skin.joints"].astype(int),
+                                    pk["skin.weights"].astype(np.float64), ev["skin"])
+                np.testing.assert_allclose(N.eval(x), ref, atol=2e-6)
+            B = N.eval_batch(X)
+            np.testing.assert_allclose(B[2], N.eval(X[2]), atol=2e-6)
+        finally:
+            N.close()
 
     def test_usd_layer(self):
         text = (self.rig_dir / "rig.usda").read_text()
