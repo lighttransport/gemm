@@ -129,6 +129,9 @@ LD_LIBRARY_PATH=/opt/rocm/lib rdna4/llm/tmp/bench_hip_mem_bw
 Four consecutive runs measured 40.77–40.88 GiB/s. After changing the
 manual memory level, rerun this probe and the 1K model command with the same
 model and context settings to quantify the hardware effect.
+On this card, `sudo rocm-smi --setmclk 5` selects the highest listed memory
+level while keeping performance mode manual. The benchmark launcher does not
+change GPU clock settings.
 
 The Qwen SSD profile now uses the existing vectorized F16 matvec kernel for
 its F16 projections. `LLM_QWEN4_F16_LLAMA=0` restores the original kernel;
