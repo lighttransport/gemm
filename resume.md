@@ -1,4 +1,4 @@
-# Resume: GLM-5.3-Flash A64FX kernel efficiency + QLAIR accuracy (updated 2026-09-28 04:10)
+# Resume: GLM-5.3-Flash A64FX kernel efficiency + QLAIR accuracy (updated 2026-09-28 09:20)
 
 ## Goal
 Run GLM-5.3-Flash (GLM53F) efficiently on A64FX. Targets:
@@ -122,6 +122,32 @@ All the new simulator switches are diagnostic and default off, so default QLAIR 
 - Sim random-miss latency is about 455 cycles/iter vs native 290 (16 MiB chains).
 - `wp fm` runs +17 cycles/iter slow in the sim (161 vs 144), while a minimal FMUL-chain + LD1B loop matches.
 
+## Session 2026-09-28 08:13–09:20 (clair commit af095eba)
+
+- A matched FMUL-head window probe with LD1B versus FADD fillers has the same
+  native 88→92 knee and 144→159 cycles/iteration. It confirms rename capacity
+  but cannot resolve a four-cycle post-commit hold: the 144-cycle head hides
+  that delay. `FP_HOLD_LOAD=4` remains diagnostic and default off.
+- Remeasured all five full-size one-core HBM native cases with frozen
+  `bench-c13`; correctness passed and CV is at most 0.24%. Exact cycles and
+  raw logs are in the new `STATUS.md` section and `measurements/hw-20260927b/`.
+- A smaller same-ELF simulator campaign finished with three samples per case.
+  Q8 and F32 rotate more than 8 MiB of weights, while Q4 is an L2 control:
+
+  | Case | Native cycles | Event cycles | Error |
+  |---|---:|---:|---:|
+  | Q8 256×4096 HBM | 348,340 | 203,998 | −41.4% |
+  | F32 128×4096 HBM | 299,340 | 282,835 | −5.5% |
+  | Q4 256×4096 L2 | 297,670 | 246,217 | −17.3% |
+
+- `QLAIR_SIM_EVENT_ORDERED_FETCH_RELEASE=1` changes none of those cycles.
+  It remains diagnostic and default off. The Q8 HBM error is a separate large
+  memory-model gap: native compulsory read rate is 3.4 B/cycle versus 5.8
+  B/cycle implied by the simulator. The Q4 L2 residual is separate.
+- The full-size simulator replay was stopped after more than twenty minutes
+  without its first two cases finishing; the compact campaign supplied the
+  paired comparison instead. No simulator default or production kernel changed.
+
 ## Production integration plan (not started; needs the real model on 12 nodes)
 
 - **Where Q8_0R is used:**
@@ -139,8 +165,8 @@ All the new simulator switches are diagnostic and default off, so default QLAIR 
 
 ## Next steps (priority)
 1. **Simulator.**
-   - Write a direct native probe for load-result rename lifetime. Use a throughput loop in which renames bind, and compare LD1B→consumer against FADD→consumer. If it confirms about 4 cycles, promote `FP_HOLD_LOAD=4` together with `ORDERED_FETCH_RELEASE`.
-   - Validate on the 1-core HBM streaming cases (`cases-sim.txt` L1 section; re-measure native with the frozen ELF).
+   - Probe sequential SVE HBM loads to separate latency, memory-level parallelism and per-core bandwidth; the compact Q8 HBM error is −41.4% and ordered fetch release does not move it. Use the frozen `bench-c13` and native logs in `measurements/hw-20260927b/` as the gate.
+   - Design a load-result rename lifetime probe without the 144-cycle FMUL head masking release delay or FADD/LD pipe-use differences. Keep `FP_HOLD_LOAD=4` diagnostic until it is supported directly.
    - Then the K-quant unpack-op residual: q4k_v0/q5k_v0 insensitive to every switch.
    - Then the dependent base-ADD rule (ld8u6 −7.6%).
    - Then the sim random-miss latency (wprobe 455 vs 290).
