@@ -14,6 +14,15 @@ from ..rig.common import normalize, vertex_normals
 from .assemble import FLIP_PIXAL, _project
 
 
+def _fit_extents(source: np.ndarray, target: np.ndarray):
+    """Scale and centre a garment by robust bounds, independent of mesh density."""
+    src_lo, src_hi = np.percentile(source, [5, 95], axis=0)
+    target_lo, target_hi = np.percentile(target, [5, 95], axis=0)
+    scale = float(np.median((target_hi - target_lo)[:2] /
+                            np.maximum((src_hi - src_lo)[:2], 1e-6)))
+    return scale, (src_lo + src_hi) * .5, (target_lo + target_hi) * .5
+
+
 def _source_parts(glb_path: Path):
     glb = GLB.load(glb_path)
     for mesh in glb.doc["meshes"]:
@@ -78,13 +87,12 @@ def import_garments(out: Path, vertices: np.ndarray, faces: np.ndarray,
             if not source:
                 raise ValueError("Pixal3D garment has no textured mesh")
             src_points = np.concatenate([s[0] for s in source])
-            ss = np.percentile(src_points, 95, axis=0) - np.percentile(src_points, 5, axis=0)
-            ts = np.percentile(target, 95, axis=0) - np.percentile(target, 5, axis=0)
-            scale = float(np.median(ts[:2] / np.maximum(ss[:2], 1e-6)))
+            scale, src_center, target_center = _fit_extents(src_points, target)
             if not .01 < scale < 10:
                 raise ValueError("garment reconstruction scale is invalid")
-            src_center = np.median(src_points, axis=0)
-            target_center = np.median(target, axis=0)
+            # Mesh vertex density differs from MHR's. Align the extent centres
+            # rather than medians: a garment with many waistband vertices must
+            # not slide below the feet when its sparse lower leg is fitted.
             candidates = []
             for si, (p, n, uv, tri, mat, images) in enumerate(source):
                 placed = (p - src_center) * scale + target_center
@@ -94,8 +102,11 @@ def import_garments(out: Path, vertices: np.ndarray, faces: np.ndarray,
                 surface = vertices[near]
                 normal = body_normals[near]
                 signed = np.einsum("ij,ij->i", placed - surface, normal)
-                deep = signed < -.01
-                placed[deep] += (-signed[deep] + .005)[:, None] * normal[deep]
+                # Leave clearance from the animated body. Allowing vertices
+                # just inside or exactly on its surface produced large dark
+                # z-fighting patches on the real Pixal3D trousers.
+                close = signed < .012
+                placed[close] += (.012 - signed[close])[:, None] * normal[close]
                 if n is None:
                     n = vertex_normals(placed, tri)
                 name_i = f"garment_{name}_{si}"

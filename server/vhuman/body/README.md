@@ -51,9 +51,14 @@ python3 -m server.vhuman.cli body --head HEAD_ID --quality standard \
   --outfit "blue shirt, dark trousers and shoes" --garments shirt,pants,shoes
 ```
 
+`--qwen-preset auto` is the default: it selects `low8` when less than 15,000 MiB
+of GPU memory is free, or `fast12` otherwise. The CLI, job request and rig page
+also accept an explicit `low8` or `fast12` choice.
+
 The server accepts `POST /v1/jobs` with `{"kind":"body","head_id":"..."}`
-and optional `outfit`, `quality`, `seed`, `steps`, and `garments` fields. The
-rig page has the same controls and can preview body poses with facial speech.
+and optional `outfit`, `quality`, `seed`, `steps`, `qwen_preset`, and `garments`
+fields. The rig page has the same controls and can preview body poses with
+facial speech.
 The local checkpoint directory defaults to `/mnt/nvme01/models/sam3d-body`;
 override it with `--sam3d-body-model` on the CLI or server. The model files
 remain outside the repository and are not copied into avatar exports.

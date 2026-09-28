@@ -8,6 +8,7 @@ import numpy as np
 from ..eye.glb import GLB
 from ..rig.gltf import RigGLB
 from .assemble import _joint_entry, _similarity
+from .garments import _fit_extents
 
 
 class BodyGeometryTest(unittest.TestCase):
@@ -44,6 +45,18 @@ class BodyGeometryTest(unittest.TestCase):
         dense = reader.accessor(acc)
         np.testing.assert_allclose(dense[ids], values)
         self.assertEqual(int(np.count_nonzero(dense)), 5)
+
+    def test_garment_fit_is_not_biased_by_waist_vertex_density(self):
+        y = np.linspace(-.5, .5, 200)
+        source = np.column_stack([np.linspace(-.3, .3, 200), y, np.zeros(200)])
+        source = np.concatenate([source, np.tile([0., .35, 0.], (100, 1))])
+        target = np.column_stack([np.linspace(-.3, .3, 200), y + .7, np.zeros(200)])
+        scale, src_center, target_center = _fit_extents(source, target)
+        fitted = (source - src_center) * scale + target_center
+        median_fit = (source - np.median(source, axis=0)) * scale + np.median(target, axis=0)
+        target_top = np.percentile(target[:, 1], 95)
+        self.assertLess(abs(np.percentile(fitted[:, 1], 95) - target_top),
+                        abs(np.percentile(median_fit[:, 1], 95) - target_top))
 
 
 if __name__ == "__main__":

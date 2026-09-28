@@ -275,8 +275,13 @@ def _face_parts(face_dir: Path, alignment: np.ndarray, joints_offset: int,
                 band = pos[:, 1] < neck_y + .045
                 if band.any():
                     _, near = tree.query(pos[band], workers=-1)
-                    blend = np.clip((pos[band, 1] - neck_y) / .045, 0, 1)[:, None]
+                    blend = np.clip((pos[band, 1] - (neck_y + .01)) / .035, 0, 1)[:, None]
                     pos[band] = neck[near] * (1 - blend) + pos[band] * blend
+                # The face template has a wide lower collar. Faces touching
+                # that collar stretch into visible shoulder spikes after the
+                # head is registered to a different body. Keep the narrow
+                # neck section, which still overlaps MHR at the cut.
+                triangles = triangles[np.min(pos[triangles, 1], axis=1) >= neck_y + .02]
             shapes = {}
             for name, target in zip(mesh.get("extras", {}).get("targetNames", []), prim.get("targets", [])):
                 ids, delta = g.sparse_accessor(target["POSITION"])

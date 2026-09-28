@@ -105,6 +105,8 @@ a.dl{color:var(--accent);margin-right:12px;font-size:13px;display:inline-block}
       <input id="body-garments" value="shirt,pants,shoes">
       <label for="body-quality">Quality</label>
       <select id="body-quality"><option value="preview">preview</option><option value="standard" selected>standard</option><option value="high">high</option></select>
+      <label for="body-qwen-preset">Qwen GPU memory</label>
+      <select id="body-qwen-preset"><option value="auto" selected>automatic</option><option value="low8">low memory</option><option value="fast12">fast</option></select>
       <button class="primary" id="build-body" disabled>Create body for selected rig</button>
       <div class="msg" id="body-msg"></div>
       <div id="body-pose" hidden>
@@ -203,7 +205,8 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 
 const $ = (id) => document.getElementById(id);
-const state = { heads: [], current: null, rig: null, model: null, values: {}, anim: null, job: null, avatarMode: false,
+const state = { heads: [], current: null, rig: null, model: null, values: {}, anim: null, job: null,
+                avatarMode: new URLSearchParams(location.search).get('body') === '1',
                 bodyPose: {},
                 speechAvailable: false, emotionAvailable: false, bodyAvailable: false };
 window.__rigState = state;
@@ -1235,6 +1238,7 @@ async function select(h) {
   $('build-body').disabled = !!state.job || !h.rig || !state.bodyAvailable;
   $('avatar-mode').disabled = !h.body;
   if (!h.body) { state.avatarMode = false; $('avatar-mode').checked = false; }
+  else $('avatar-mode').checked = state.avatarMode;
   $('build').textContent = h.rig ? 'Rebuild rig for selected head' : 'Build rig for selected head';
   if (h.rig) {
     const params = new URLSearchParams(location.search);
@@ -1302,6 +1306,7 @@ $('build-body').addEventListener('click', async () => {
   try {
     const job = await api('/v1/jobs', { kind: 'body', head_id: id,
       outfit: $('body-outfit').value.trim(), quality: $('body-quality').value,
+      qwen_preset: $('body-qwen-preset').value,
       garments: $('body-garments').value.split(',').map((s) => s.trim()).filter(Boolean) });
     state.job = job.id;
     for (;;) {

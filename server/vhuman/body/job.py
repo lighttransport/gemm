@@ -26,11 +26,22 @@ FILES = ("body_image.png", "body_image_raw.png", "body_mhr.glb", "body_mhr.glb.j
          "pixal3d_full.glb", "body_basecolor.png", "avatar.glb", "avatar.usda", "avatar_usd.zip",
          "avatar.json", "body_report.json", "garments.json", "deformer.lrm",
          "wm_smile.png", "wm_brow_up.png", "wm_brow_down.png", "wm_mouth.png")
-PROMPT = ("Full-length photorealistic studio photograph of the same person as the reference portrait, "
-          "head to toe in frame, standing upright in a relaxed symmetrical A-pose, arms angled outward and "
+PROMPT = ("Full-length photorealistic studio photograph of the same person's facial identity as the reference "
+          "portrait. Use the portrait for face identity only, not for its crop or clothing. Dress the person in "
+          "{outfit}; every named garment is worn and clearly visible. Head to toe in frame, standing upright "
+          "in a relaxed symmetrical A-pose, arms angled outward and "
           "separated from the torso, straight legs slightly apart, both hands and shoes fully visible. "
           "Front view, level camera, plain transparent background, even diffuse lighting, sharp details. "
-          "Outfit: {outfit}. One person only, no props, no crop, no text.")
+          "One person only, no props, no crop, no text.")
+BODY_FAST12_MIN_FREE_MIB = 15000
+
+
+def _qwen_preset(requested: str, status: dict | None) -> str:
+    if requested not in ("auto", "fast12", "low8"):
+        raise ValueError("qwen_preset must be auto, fast12 or low8")
+    if requested != "auto":
+        return requested
+    return "fast12" if status and status["free_mib"] >= BODY_FAST12_MIN_FREE_MIB else "low8"
 
 
 def availability(model_dir=MODEL_DIR, rig_python=None, mock=False) -> dict:
@@ -130,12 +141,12 @@ def _generate_image(head: Path, out: Path, outfit: str, seed: int, attempts: int
     if mock:
         _mock_image(image, seed)
         return {"prompt": PROMPT.format(outfit=outfit), "seed": seed, "bbox": _image_gate(image),
-                "backend": "mock"}
+                "backend": "mock", "preset": preset}
     qwen._import_qimg21()
     from qimg21_i23d import backends, ops, imageops
     prompt = PROMPT.format(outfit=outfit)
     errors = []
-    with gpu.device_session(8192 if preset == "low8" else gpu.QWEN_MIN_FREE_MIB, cancel):
+    with gpu.device_session(8192 if preset == "low8" else BODY_FAST12_MIN_FREE_MIB, cancel):
         backend = qwen.make_backend(python, False, preset=preset)
         try:
             for attempt in range(attempts):
@@ -155,7 +166,8 @@ def _generate_image(head: Path, out: Path, outfit: str, seed: int, attempts: int
                                           size=None, fill=None, center=False)
                     bbox = _image_gate(image)
                     return {"prompt": prompt, "seed": s, "bbox": bbox,
-                            "backend": backend.name, "extraction": method, "attempts": errors}
+                            "backend": backend.name, "preset": preset,
+                            "extraction": method, "attempts": errors}
                 except (ValueError, RuntimeError) as exc:
                     errors.append({"seed": s, "error": str(exc)})
         finally:
@@ -218,7 +230,8 @@ def _garments(out: Path, names: list[str], mock: bool, cancel, progress) -> list
                 raise ValueError("segmentation skipped in mock mode")
             if not SAM3_MODEL.is_file() or not (CLIP_BPE / "vocab.json").is_file():
                 raise ValueError("optional SAM 3 garment segmentation weights or tokenizer missing")
-            progress(.51 + .07 * i / max(len(names), 1), f"segmenting {name}")
+            slot_start = .51 + .24 * i / len(names)
+            progress(slot_start, f"segmenting {name}")
             mask_npy = out / f"garment_{slug}_masks.npy"
             cmd = [str(_binary("sam3", use_cuda, cancel)), str(SAM3_MODEL), str(out / "body_image.png"),
                    "--phrase", name, "-o", str(mask_npy),
@@ -245,7 +258,7 @@ def _garments(out: Path, names: list[str], mock: bool, cancel, progress) -> list
             crop_path = out / f"garment_{slug}_input.png"
             Image.fromarray(crop).save(crop_path)
             glb = f"garment_{slug}.glb"
-            progress(.57 + .16 * i / max(len(names), 1), f"Pixal3D {name}")
+            progress(slot_start + .08 / len(names), f"Pixal3D {name}")
             _pixal(out, crop_path, glb, "preview", False, cancel)
             record.update(status="reconstructed", mask=png, glb=glb, pixels=int(mask.sum()))
         except gpu.Cancelled:
@@ -282,6 +295,7 @@ def body_job(service, request: dict, progress, cancel, *, python=None, rig_pytho
     seed = int(request.get("seed", 11))
     steps = int(request.get("steps", 24))
     attempts = max(1, min(3, int(request.get("attempts", 3))))
+    qwen_preset = _qwen_preset(request.get("qwen_preset", "auto"), gpu.gpu_status())
     names = request.get("garments", ["shirt", "pants", "shoes"])
     if not isinstance(names, list) or len(names) > 5 or any(not isinstance(n, str) or not n.strip() for n in names):
         raise ValueError("garments must be a list of at most five phrases")
@@ -290,7 +304,7 @@ def body_job(service, request: dict, progress, cancel, *, python=None, rig_pytho
     try:
         started = time.perf_counter()
         generated = _generate_image(head, out, outfit, seed, attempts, steps, python,
-                                    request.get("qwen_preset", "fast12"), mock, progress, cancel)
+                                    qwen_preset, mock, progress, cancel)
         progress(.12, "SAM 3D Body mesh and pose")
         sam = _sam_body(out, generated["bbox"], model_dir, mock, cancel)
         progress(.37, "Pixal3D whole-body appearance")

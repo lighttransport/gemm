@@ -262,6 +262,7 @@ def cmd_body(args) -> dict:
     svc = EyeService(Path(args.work))
     return body_job.body_job(svc, {"head_id": args.head, "outfit": args.outfit, "seed": args.seed,
                               "quality": args.quality, "steps": args.steps,
+                              "qwen_preset": args.qwen_preset,
                               "garments": [x.strip() for x in args.garments.split(",") if x.strip()]},
                              _progress, threading.Event(), python=args.qwen_python,
                              rig_python=args.rig_python, model_dir=args.sam3d_body_model, mock=args.mock)
@@ -412,6 +413,8 @@ def main(argv=None) -> int:
     sp.add_argument("--seed", type=int, default=11)
     sp.add_argument("--quality", choices=("preview", "standard", "high"), default="standard")
     sp.add_argument("--steps", type=int, default=24)
+    sp.add_argument("--qwen-preset", choices=("auto", "fast12", "low8"), default="auto",
+                    help="select Qwen memory preset automatically from free GPU memory")
     sp.add_argument("--garments", default="shirt,pants,shoes", help="comma-separated SAM 3 garment prompts")
     sp.set_defaults(fn=cmd_body)
     sp = sub.add_parser("rig-track", help="LightRig face track (timestamp + 52 controls per line) -> USD animation")
