@@ -1,0 +1,421 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Virtual Human Head</title>
+<link rel="icon" href="data:,">
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.163.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.163.0/examples/jsm/"
+  }
+}
+</script>
+<style>
+:root{--bg:#0d1014;--panel:#151a20;--line:#252d36;--text:#e3e8ee;--muted:#8b97a5;--accent:#6fc2a8;--warn:#e7a15b;--bad:#e07474}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+header{display:flex;flex-wrap:wrap;gap:6px 16px;align-items:baseline;padding:14px 20px;border-bottom:1px solid var(--line)}
+header h1{margin:0;font-size:19px;font-weight:600}
+header .sub{color:var(--muted);font-size:13px}
+header a{color:var(--accent);text-decoration:none;font-size:13px}
+header .health{margin-left:auto;color:var(--muted);font:12px ui-monospace,monospace}
+.layout{display:grid;grid-template-columns:340px 1fr;gap:16px;padding:16px 20px;max-width:1500px;margin:0 auto}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px;margin-bottom:14px}
+.card h2{margin:0 0 10px;font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);font-weight:600}
+label{display:block;color:var(--muted);font-size:12px;margin:8px 0 4px}
+textarea,input,select{width:100%;background:#0f1318;color:var(--text);border:1px solid var(--line);border-radius:8px;padding:8px;font:inherit}
+textarea{min-height:74px;resize:vertical}
+.row{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}
+button{background:#1d242c;color:var(--text);border:1px solid var(--line);border-radius:8px;padding:8px 12px;font:inherit;cursor:pointer}
+button:hover{border-color:var(--accent)}
+button.primary{background:var(--accent);color:#0c1512;border-color:var(--accent);font-weight:600;width:100%;margin-top:12px}
+button:disabled{opacity:.5;cursor:default}
+.progress{height:6px;background:#0f1318;border-radius:4px;overflow:hidden;margin-top:10px}
+.progress>div{height:100%;background:var(--accent);width:0;transition:width .3s}
+.msg{color:var(--muted);font-size:12px;margin-top:6px;min-height:1.2em}
+.msg.bad{color:var(--bad)}
+.heads{display:flex;flex-direction:column;gap:8px;max-height:460px;overflow:auto}
+.head{display:grid;grid-template-columns:56px 1fr;gap:10px;align-items:center;padding:6px;border:1px solid var(--line);border-radius:10px;cursor:pointer;background:#11161b}
+.head.sel{border-color:var(--accent)}
+.head img{width:56px;height:56px;object-fit:cover;border-radius:8px;background:#222}
+.head b{display:block;font-weight:500;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.head span{color:var(--muted);font-size:11px}
+.viewer{position:relative;background:radial-gradient(ellipse at 50% 35%,#27313b,#0d1115 75%);border:1px solid var(--line);border-radius:12px;height:620px;overflow:hidden}
+.viewer canvas{display:block;width:100%;height:100%}
+.viewer .label{position:absolute;left:12px;top:10px;font-size:12px;color:var(--muted);background:#0008;padding:3px 8px;border-radius:6px}
+.viewer .empty{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:var(--muted)}
+.tools{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0}
+.tools label{display:flex;gap:6px;align-items:center;margin:0;color:var(--text);font-size:13px}
+.tools input[type=checkbox]{width:auto}
+.images{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.images figure{margin:0}
+.images img{width:100%;border-radius:10px;background:#1b2027;display:block}
+.images figcaption{color:var(--muted);font-size:12px;margin-top:4px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+td{padding:4px 6px;border-bottom:1px solid var(--line)}
+td:first-child{color:var(--muted);width:44%}
+a.dl{color:var(--accent);margin-right:14px;font-size:13px}
+@media(max-width:900px){.layout{grid-template-columns:1fr}.viewer{height:440px}}
+@media(max-width:520px){.images{grid-template-columns:1fr}.row{grid-template-columns:1fr 1fr}}
+</style>
+</head>
+<body>
+<header>
+  <h1>Virtual Human Head</h1>
+  <span class="sub">Qwen-Image 2.1 portrait → Pixal3D head → fitted analytic eyes</span>
+  <a href="/">eye editor →</a>
+  <span class="health" id="health">…</span>
+</header>
+<div class="layout">
+  <aside>
+    <div class="card">
+      <h2>Generate</h2>
+      <label for="subject">Person</label>
+      <textarea id="subject">a 30-year-old woman with light olive skin, short dark brown hair tied back, hazel eyes</textarea>
+      <div class="row">
+        <div><label for="seed">Seed</label><input id="seed" type="number" min="0" value="11"></div>
+        <div><label for="quality">Quality</label><select id="quality"><option>preview</option><option selected>standard</option><option>high</option></select></div>
+        <div><label for="fov">FOV °</label><input id="fov" type="number" min="8" max="60" value="20"></div>
+      </div>
+      <label for="qwen-preset">Qwen memory</label><select id="qwen-preset"><option value="fast12">Fast · 12 GiB free</option><option value="low8">Streaming · 8 GiB free</option></select>
+      <label for="iris-source">Iris detail</label>
+      <select id="iris-source"><option value="portrait">Generate for this portrait</option><option value="library">Match existing library</option></select>
+      <details style="margin-top:12px"><summary>Skin textures</summary>
+        <label><input type="checkbox" id="skin-enabled" checked> Generate skin maps</label>
+        <div class="row">
+          <div><label for="skin-tone-u">Cool → warm</label><input id="skin-tone-u" type="number" min="0" max="1" step=".05" value=".5"></div>
+          <div><label for="skin-tone-v">Light → dark</label><input id="skin-tone-v" type="number" min="0" max="1" step=".05" value=".5"></div>
+          <div><label for="skin-tone-strength">Tone mix</label><input id="skin-tone-strength" type="number" min="0" max="1" step=".05" value="0"></div>
+        </div>
+        <p class="msg">Tone mix 0 preserves the portrait’s skin color.</p>
+        <label for="skin-delight">Reduce portrait lighting</label><input id="skin-delight" type="number" min="0" max="1" step=".1" value="0">
+        <p class="msg">0 keeps the source lighting. Higher values reduce estimated directional shading on facial skin.</p>
+        <div class="row">
+          <div><label for="skin-roughness">Roughness ×</label><input id="skin-roughness" type="number" min=".2" max="2" step=".05" value="1"></div>
+          <div><label for="skin-pores">Pore detail</label><input id="skin-pores" type="number" min="0" max="1" step=".05" value=".45"></div>
+          <div><label for="skin-freckles">Freckle density</label><input id="skin-freckles" type="number" min="0" max="1" step=".05" value="0"></div>
+        </div>
+        <div class="row">
+          <div><label for="skin-freckle-strength">Freckle strength</label><input id="skin-freckle-strength" type="number" min="0" max="1" step=".05" value=".45"></div>
+          <div><label for="skin-freckle-saturation">Freckle saturation</label><input id="skin-freckle-saturation" type="number" min="0" max="1" step=".05" value=".5"></div>
+          <div><label for="skin-freckle-tone">Freckle tone</label><input id="skin-freckle-tone" type="number" min="-1" max="1" step=".05" value="0"></div>
+        </div>
+        <label for="skin-freckle-mask">Freckle placement</label><select id="skin-freckle-mask"><option value="cheeks_nose">Cheeks and nose</option><option value="cheeks">Cheeks</option><option value="full_face">Full face</option></select>
+        <button id="apply-skin" disabled>Apply skin to selected head (CPU)</button>
+        <label for="skin-region">Regional accent</label><select id="skin-region"></select>
+        <div class="row">
+          <div><label for="skin-redness">Redness</label><input id="skin-redness" type="number" min="-1" max="1" step=".05" value="0"></div>
+          <div><label for="skin-saturation">Saturation</label><input id="skin-saturation" type="number" min="-1" max="1" step=".05" value="0"></div>
+          <div><label for="skin-lightness">Lightness</label><input id="skin-lightness" type="number" min="-1" max="1" step=".05" value="0"></div>
+        </div>
+      </details>
+      <button class="primary" id="go">Generate head (≈ 4–5 min)</button>
+      <div class="progress"><div id="bar"></div></div>
+      <div class="msg" id="msg"></div>
+    </div>
+    <div class="card">
+      <h2>Heads</h2>
+      <div class="heads" id="heads"><span class="msg">none yet</span></div>
+    </div>
+  </aside>
+  <main>
+    <div class="viewer" id="viewer"><span class="label" id="vlabel">GLB · head + eyes</span><div class="empty" id="empty">pick or generate a head</div></div>
+    <div class="tools">
+      <button data-view="front">front</button><button data-view="three">¾</button><button data-view="profile">profile</button><button data-view="eyes">eyes close-up</button>
+      <label><input type="checkbox" id="show-head" checked> head</label>
+      <label><input type="checkbox" id="show-eyes" checked> eyes</label>
+      <label title="the eye page's ray-traced refractive shader, or the GLB's portable eye meshes"><input type="checkbox" id="analytic" checked> analytic eyes</label>
+      <label title="light everything with the eye shader's studio (else a generic room)"><input type="checkbox" id="studio" checked> studio light</label>
+      <label title="Preview the exported lid shadow at full strength (1) or reduce it; downloaded GLBs are unchanged">lid shadow (preview) <input type="range" id="lid-shadow" min="0" max="1" step="0.05" value="1" style="width:100px"> <output id="lid-shadow-value" for="lid-shadow">1.00</output></label>
+      <label>exposure <input type="range" id="exposure" min="0.3" max="2.5" step="0.05" value="1" style="width:110px"></label>
+    </div>
+    <div class="card">
+      <h2>Fit</h2>
+      <div class="images">
+        <figure><img id="portrait" alt="Qwen portrait"><figcaption>Qwen-Image 2.1 portrait (the Pixal3D input)</figcaption></figure>
+        <figure><img id="landmarks" alt="Detected eyes"><figcaption>detected irises, pupils, eye openings and corners</figcaption></figure>
+      </div>
+      <table id="facts"></table><div id="skin-downloads" style="margin-top:10px"></div>
+      <div style="margin-top:10px"><a class="dl" id="dl-glb" download>head + eyes GLB</a><a class="dl" id="dl-pixal" download>Pixal3D GLB</a><a class="dl" id="dl-fit" download>fit.json</a></div>
+    </div>
+  </main>
+</div>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import * as Eye from '/vhuman_eye_shader.js';
+
+const $ = (id) => document.getElementById(id);
+const state = { heads: [], current: null, job: null, model: null };
+window.__headState = state;
+
+async function api(path, body) {
+  const opts = body === undefined ? {} : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) };
+  const r = await fetch(path, opts);
+  const data = await r.json();
+  if (!r.ok) throw new Error(data.error || r.statusText);
+  return data;
+}
+
+// ---- viewer
+const viewer = $('viewer');
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+renderer.toneMapping = THREE.NeutralToneMapping;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+viewer.prepend(renderer.domElement);
+const scene = new THREE.Scene();
+const pmrem = new THREE.PMREMGenerator(renderer);
+const roomEnv = pmrem.fromScene(new RoomEnvironment(renderer), 0.03).texture;
+const key = new THREE.DirectionalLight(0xffffff, 1.2);
+key.position.set(-1.2, 1.4, -2.0);
+scene.add(key);
+// The eye shader's studio (softboxes + sky, optics.uniforms), turned to face
+// the head (it looks along -Z); as an environment it lights the head too.
+const studio = Eye.makeStudioUniforms();
+let studioEnv = null, geometry = null;
+function buildStudioEnv(g) {
+  Eye.applyStudio(studio, g, Math.PI);
+  const envScene = new THREE.Scene();
+  const bg = new THREE.Mesh(new THREE.SphereGeometry(10, 64, 32), Eye.makeBackgroundMaterial(studio, { raw: true }));
+  envScene.add(bg);
+  if (studioEnv) studioEnv.dispose();
+  studioEnv = pmrem.fromScene(envScene, 0.0).texture;
+  bg.geometry.dispose(); bg.material.dispose();
+}
+function applyLighting() {
+  const useStudio = $('studio').checked && studioEnv;
+  scene.environment = useStudio ? studioEnv : roomEnv;
+  key.visible = !useStudio;
+  render();
+}
+const camera = new THREE.PerspectiveCamera(22, 1, 0.005, 20);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.addEventListener('change', render);
+Object.assign(state, { render: () => render(), camera, controls });   // for tests and debugging
+let eyeCenter = new THREE.Vector3(), headCenter = new THREE.Vector3(), headSize = 1;
+function resize() {
+  const w = viewer.clientWidth, h = viewer.clientHeight;
+  renderer.setSize(w, h, false);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+  render();
+}
+function render() { renderer.render(scene, camera); }
+window.addEventListener('resize', resize);
+
+function setView(name) {
+  // The face looks along -Z (Pixal3D's GLB frame).
+  const d = headSize * 3.4;
+  const dirs = { front: [0, 0, -1], three: [-0.6, 0.05, -0.8], profile: [-1, 0, -0.02] };
+  if (name === 'eyes') {
+    controls.target.copy(eyeCenter);
+    camera.position.copy(eyeCenter).add(new THREE.Vector3(-0.08, 0.02, -1).normalize().multiplyScalar(headSize * 0.8));
+  } else {
+    controls.target.copy(headCenter);
+    camera.position.copy(headCenter).add(new THREE.Vector3(...dirs[name]).normalize().multiplyScalar(d));
+  }
+  controls.update();
+  render();
+}
+document.querySelectorAll('[data-view]').forEach((b) => b.addEventListener('click', () => setView(b.dataset.view)));
+$('exposure').addEventListener('input', () => {
+  renderer.toneMappingExposure = +$('exposure').value;
+  studio.uExposure.value = +$('exposure').value;      // the eye shader tone-maps itself (the same Neutral curve)
+  render();
+});
+for (const id of ['show-head', 'show-eyes', 'analytic']) $(id).addEventListener('change', applyVisibility);
+$('studio').addEventListener('change', applyLighting);
+const shellMaterials = new WeakMap();
+function applyLidShadow() {
+  const strength = +$('lid-shadow').value;
+  $('lid-shadow-value').value = strength.toFixed(2);
+  state.model?.traverse((o) => {
+    if (!o.isMesh || !/^eye_(left|right)_eyeshell$/.test(o.name)) return;
+    for (const mat of (Array.isArray(o.material) ? o.material : [o.material])) {
+      if (!shellMaterials.has(mat)) shellMaterials.set(mat, { opacity: mat.opacity, depthWrite: mat.depthWrite });
+      const base = shellMaterials.get(mat);
+      mat.opacity = base.opacity * strength;
+      // A fully transparent shell must not occlude other translucent layers.
+      mat.depthWrite = strength > 0 && base.depthWrite;
+    }
+  });
+  render();
+}
+$('lid-shadow').addEventListener('input', applyLidShadow);
+function applyVisibility() {
+  if (!state.model) return;
+  state.model.traverse((o) => {
+    if (!o.isMesh) return;
+    const isEye = /eye_/.test(o.name) || /eye_/.test(o.parent?.name || '');
+    let on = isEye ? $('show-eyes').checked : $('show-head').checked;
+    // analytic: the shader proxies replace the GLB's eyeball and iris meshes (the eyeshells stay)
+    const analytic = $('analytic').checked && state.eyesAnalytic;
+    if (/^eye_(left|right)_(shell|iris)$/.test(o.name)) on = on && !analytic;
+    if (o.userData.analyticEye) on = on && analytic;
+    o.visible = on;
+  });
+  $('vlabel').textContent = $('analytic').checked && state.eyesAnalytic
+    ? 'GLB head · analytic eye shader (ray-traced refraction)' : 'GLB · head + portable eyes (KHR transmission cornea)';
+  render();
+}
+
+const loader = new GLTFLoader();
+let headLoadGeneration = 0;
+async function loadHead(h) {
+  const generation = ++headLoadGeneration;
+  window.__headReady = false;
+  state.current = h;
+  $('apply-skin').disabled = false;
+  document.querySelectorAll('.head').forEach((el) => el.classList.toggle('sel', el.dataset.id === h.id));
+  $('empty').textContent = 'loading…';
+  $('empty').style.display = 'flex';
+  $('portrait').src = h.urls.portrait || '';
+  $('landmarks').src = h.urls.landmarks || '';
+  $('dl-glb').href = h.urls.head_eyes || '#';
+  $('dl-pixal').href = h.urls.pixal3d || '#';
+  $('dl-fit').href = h.urls.fit || '#';
+  $('skin-downloads').replaceChildren(...['skin_basecolor', 'skin_normal', 'skin_orm', 'skin_mask', 'skin'].filter(n => h.urls[n]).map(n => {
+    const a = document.createElement('a'); a.className = 'dl'; a.href = h.urls[n]; a.download = ''; a.textContent = n.replaceAll('_', ' '); return a;
+  }));
+  const f = h.fit || {};
+  const rows = [
+    ['person', h.subject || '—'], ['seed / quality', `${h.seed ?? '—'} / ${h.quality || '—'}`],
+    ['scale (mesh units per m)', f.units_per_m?.toFixed(3)], ['head+bust height', f.head_height_m ? (f.head_height_m * 100).toFixed(1) + ' cm' : '—'],
+    ['IPD vs iris-width scale', f.k_ipd ? `${f.k_ipd.toFixed(3)} vs ${f.k_iris.toFixed(3)}` : '—'],
+    ['skin textures', h.skin ? `${h.skin.resolution.join(' × ')} · ${h.skin.seconds.toFixed(1)} s` : 'source texture'],
+    ['iris plate', h.plate || 'procedural'], ['iris source', h.iris?.source || 'library'], ['total time', h.seconds ? h.seconds.toFixed(1) + ' s' : '—'],
+  ];
+  $('facts').replaceChildren(...rows.map(([k, v]) => { const tr = document.createElement('tr'); tr.innerHTML = '<td></td><td></td>'; tr.children[0].textContent = k; tr.children[1].textContent = v ?? '—'; return tr; }));
+  if (state.model) { scene.remove(state.model); state.model = null; }
+  if (!h.urls.head_eyes) { $('empty').textContent = 'no GLB'; return; }
+  const gltf = await loader.loadAsync(h.urls.head_eyes);
+  if (generation !== headLoadGeneration) return;
+  state.model = gltf.scene;
+  scene.add(state.model);
+  const box = new THREE.Box3().setFromObject(state.model);
+  box.getCenter(headCenter);
+  headSize = box.getSize(new THREE.Vector3()).length() * 0.5;
+  const eyes = [];
+  state.model.traverse((o) => { if (/^eye_(left|right)$/.test(o.name)) eyes.push(o.getWorldPosition(new THREE.Vector3())); });
+  if (eyes.length) eyeCenter = eyes.reduce((a, b) => a.add(b), new THREE.Vector3()).multiplyScalar(1 / eyes.length);
+  state.eyesAnalytic = false;
+  try { await addAnalyticEyes(h, state.model); } catch (e) { console.error('analytic eyes:', e); }
+  if (generation !== headLoadGeneration) return;
+  $('empty').style.display = 'none';
+  applyLidShadow();
+  applyVisibility();
+  setView('front');
+  window.__headReady = true;
+}
+
+// The analytic eyes: per eye, the fit's parameters (its side) and iris plate
+// -> /v1/eye/textures -> a shader proxy under the GLB's eye node.
+async function addAnalyticEyes(h, model) {
+  if (!h.urls.fit) return;
+  const rec = await fetch(h.urls.fit).then((r) => r.json());
+  if (state.model !== model) return;
+  const detail = rec.plate ? { source: 'plate', id: rec.plate } : { source: 'procedural' };
+  const made = [];
+  for (const side of ['right', 'left']) {
+    const node = model.getObjectByName(`eye_${side}`);
+    if (!node || !rec.eye_params) continue;
+    const params = JSON.parse(JSON.stringify(rec.eye_params));
+    params.optics.side = side;
+    const resp = await api('/v1/eye/textures', { params, res: 1024, detail });
+    const g = resp.uniforms;
+    if (!geometry) { geometry = g; buildStudioEnv(g); applyLighting(); }
+    const mat = Eye.makeEyeMaterial(studio);
+    Eye.applyEyeGeometry(mat, g);
+    Eye.applyEyeParams(mat, params, g);
+    Eye.bindEyeTextures(mat, await Eye.loadEyeTextures(resp, { anisotropy: renderer.capabilities.getMaxAnisotropy() }));
+    const proxy = Eye.makeEyeProxy(mat, g, { followNode: true });
+    proxy.name = `eye_${side}_analytic`;
+    proxy.userData.analyticEye = true;
+    made.push([node, proxy]);
+  }
+  if (state.model !== model) return;               // another head was picked meanwhile
+  for (const [node, proxy] of made) node.add(proxy);
+  state.eyesAnalytic = made.length > 0;
+}
+
+// ---- heads list and jobs
+async function refreshHeads(selectId) {
+  const { heads } = await api('/v1/heads');
+  state.heads = heads;
+  const box = $('heads');
+  if (!heads.length) { box.innerHTML = '<span class="msg">none yet</span>'; return; }
+  box.replaceChildren(...heads.map((h) => {
+    const el = document.createElement('div');
+    el.className = 'head';
+    el.dataset.id = h.id;
+    const img = document.createElement('img'); img.src = h.urls.portrait || ''; img.alt = '';
+    const txt = document.createElement('div');
+    const b = document.createElement('b'); b.textContent = h.subject || h.id;
+    const s = document.createElement('span'); s.textContent = `${h.id} · ${h.quality || ''}${h.seconds ? ' · ' + Math.round(h.seconds) + ' s' : ''}`;
+    txt.append(b, s);
+    el.append(img, txt);
+    el.addEventListener('click', () => loadHead(h));
+    return el;
+  }));
+  const pick = heads.find((h) => h.id === selectId) || (!state.current && heads[0]);
+  if (pick) loadHead(pick);
+}
+
+const skinRegions = Object.fromEntries(['scalp', 'forehead', 'nose', 'under_eye', 'cheeks', 'lips', 'chin', 'ears'].map(r => [r, {redness: 0, saturation: 0, lightness: 0}]));
+$('skin-region').replaceChildren(...Object.keys(skinRegions).map(r => { const o = document.createElement('option'); o.value = r; o.textContent = r.replace('_', ' '); return o; }));
+$('skin-region').value = 'cheeks';
+$('skin-region').addEventListener('change', () => { for (const k of ['redness', 'saturation', 'lightness']) $('skin-' + k).value = skinRegions[$('skin-region').value][k]; });
+for (const k of ['redness', 'saturation', 'lightness']) $('skin-' + k).addEventListener('input', () => { skinRegions[$('skin-region').value][k] = +$('skin-' + k).value; });
+function skinParams() {
+  return {enabled: $('skin-enabled').checked, tone_u: +$('skin-tone-u').value, tone_v: +$('skin-tone-v').value,
+    tone_strength: +$('skin-tone-strength').value, delight_strength: +$('skin-delight').value,
+    roughness: +$('skin-roughness').value, pore_strength: +$('skin-pores').value,
+    seed: +$('seed').value, freckles: {density: +$('skin-freckles').value, strength: +$('skin-freckle-strength').value,
+      saturation: +$('skin-freckle-saturation').value, tone_shift: +$('skin-freckle-tone').value, mask: $('skin-freckle-mask').value}, regions: skinRegions};
+}
+$('apply-skin').addEventListener('click', async () => {
+  if (!state.current) return;
+  $('apply-skin').disabled = true; $('go').disabled = true; $('msg').className = 'msg';
+  try {
+    const job = await api('/v1/jobs', {kind: 'head_skin', head_id: state.current.id, skin: skinParams()});
+    state.job = job.id; poll(job.id);
+  } catch (e) { $('msg').className = 'msg bad'; $('msg').textContent = e.message; $('apply-skin').disabled = false; $('go').disabled = false; }
+});
+$('go').addEventListener('click', async () => {
+  $('go').disabled = true; $('apply-skin').disabled = true;
+  $('msg').className = 'msg';
+  try {
+    const job = await api('/v1/jobs', { kind: 'head', subject: $('subject').value, seed: +$('seed').value,
+                                        quality: $('quality').value, fov: +$('fov').value, iris_source: $('iris-source').value, qwen_preset: $('qwen-preset').value, skin: skinParams() });
+    state.job = job.id;
+    poll(job.id);
+  } catch (e) { $('msg').className = 'msg bad'; $('msg').textContent = e.message; $('go').disabled = false; $('apply-skin').disabled = !state.current; }
+});
+async function poll(id) {
+  const j = await api(`/v1/jobs/${id}`);
+  $('bar').style.width = `${Math.round((j.progress || 0) * 100)}%`;
+  $('msg').textContent = j.state === 'failed' ? j.error : `${j.state} · ${j.message || ''}`;
+  if (j.state === 'failed') $('msg').className = 'msg bad';
+  if (['done', 'failed', 'cancelled'].includes(j.state)) {
+    $('go').disabled = false; $('apply-skin').disabled = !state.current;
+    if (j.state === 'done') refreshHeads(j.result.id);
+    return;
+  }
+  setTimeout(() => poll(id), 1500);
+}
+
+api('/health').then((h) => {
+  const g = h.gpu ? `${h.gpu.name} · ${h.gpu.free_mib} MiB free` : 'no GPU';
+  $('health').textContent = `${g} · Qwen ${h.qwen.available ? 'ready' : 'n/a'} · Pixal3D ${h.pixal3d.available ? 'ready' : 'n/a'}`;
+}).catch(() => {});
+resize();
+refreshHeads();
+</script>
+</body>
+</html>

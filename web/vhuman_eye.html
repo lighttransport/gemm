@@ -1,0 +1,757 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Virtual Human Eye</title>
+<link rel="icon" href="data:,">
+<script type="importmap">
+{
+  "imports": {
+    "three":         "https://unpkg.com/three@0.163.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.163.0/examples/jsm/"
+  }
+}
+</script>
+<style>
+:root{
+  --bg:#0d1014;--panel:#141920;--panel2:#1a2029;--line:#262e39;--text:#e4e8ee;--muted:#8b95a3;
+  --accent:#5fb3a1;--accent2:#d9a35c;--danger:#d0655f;--radius:10px;
+}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}
+header{display:flex;flex-wrap:wrap;align-items:baseline;gap:6px 18px;padding:14px 18px;border-bottom:1px solid var(--line)}
+header h1{margin:0;font-size:18px;font-weight:650;letter-spacing:.2px}
+header .sub{color:var(--muted);font-size:12.5px}
+#health{margin-left:auto;color:var(--muted);font:12px ui-monospace,SFMono-Regular,Menlo,monospace}
+.layout{display:grid;grid-template-columns:380px minmax(0,1fr);gap:16px;padding:16px;max-width:1500px;margin:0 auto}
+aside{display:flex;flex-direction:column;gap:12px;min-width:0}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:12px 14px}
+.card h2{margin:0 0 8px;font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:var(--muted)}
+details.group{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:0 14px}
+details.group>summary{cursor:pointer;list-style:none;padding:11px 0;font-weight:650;display:flex;align-items:center;gap:8px}
+details.group>summary::-webkit-details-marker{display:none}
+details.group>summary::before{content:"\25B8";color:var(--muted);font-size:11px;transition:transform .15s}
+details.group[open]>summary::before{transform:rotate(90deg)}
+details.group>summary .tag{margin-left:auto;font-size:10.5px;font-weight:600;color:var(--muted);border:1px solid var(--line);border-radius:999px;padding:1px 7px}
+details.group .fields{padding-bottom:10px}
+.field{display:grid;grid-template-columns:1fr auto;align-items:center;gap:2px 8px;margin:7px 0}
+.field label{font-size:12.5px;color:#c9d0da;display:flex;align-items:center;gap:6px}
+.field label .ue{font-size:10px;color:#687382;font-family:ui-monospace,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:150px}
+.field .val{font:11.5px ui-monospace,monospace;color:var(--muted);text-align:right;min-width:52px}
+.field input[type=range]{grid-column:1/-1;width:100%}
+.field.struct label::after{content:"rebuild";font-size:9.5px;color:var(--accent2);border:1px solid #4d3d25;border-radius:4px;padding:0 4px}
+input[type=range]{accent-color:var(--accent);height:18px;margin:0}
+select,input[type=number],input[type=text]{background:var(--panel2);color:var(--text);border:1px solid var(--line);border-radius:7px;padding:5px 8px;font:inherit;font-size:13px}
+input[type=color]{width:44px;height:24px;border:1px solid var(--line);border-radius:6px;background:var(--panel2);padding:1px}
+button{background:var(--panel2);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:7px 11px;font:inherit;font-size:13px;cursor:pointer}
+button:hover{border-color:#3a4552}
+button.primary{background:var(--accent);border-color:var(--accent);color:#08140f;font-weight:650}
+button.danger{border-color:#5a2b29;color:#f0a19c}
+button:disabled{opacity:.5;cursor:default}
+.presets{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}
+.preset{display:flex;align-items:center;gap:7px;padding:6px 7px;font-size:12px;text-align:left}
+.preset.active{border-color:var(--accent)}
+.swatch{width:22px;height:22px;border-radius:50%;flex:none;border:1px solid #0006;position:relative;overflow:hidden}
+.swatch::after{content:"";position:absolute;inset:6px;border-radius:50%;background:#050505}
+.row{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:6px 0}
+.row label{font-size:12.5px;color:#c9d0da}
+.row .grow{flex:1}
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.seg button{border:0;border-radius:0;background:transparent;padding:6px 11px}
+.seg button.on{background:var(--panel2);color:var(--accent)}
+.plates{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-top:6px}
+.plates button{padding:3px;border-radius:8px;display:flex;flex-direction:column;gap:3px;align-items:center;font-size:10.5px;color:var(--muted)}
+.plates img{width:100%;aspect-ratio:1;object-fit:cover;border-radius:6px;background:#000}
+.plates button.on{border-color:var(--accent)}
+.empty{color:var(--muted);font-size:12px}
+.progress{height:6px;background:var(--panel2);border-radius:4px;overflow:hidden;margin-top:6px}
+.progress>div{height:100%;width:0;background:var(--accent);transition:width .3s}
+.jobmsg{font:11.5px ui-monospace,monospace;color:var(--muted);margin-top:4px;white-space:pre-wrap}
+.jobmsg.err{color:#f0a19c}
+.viewer{display:flex;flex-direction:column;gap:10px;min-width:0}
+.tabs{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.stage{display:grid;grid-template-columns:minmax(0,1fr);gap:12px}
+.stage.split{grid-template-columns:1fr 1fr}
+.pane{position:relative;background:radial-gradient(120% 90% at 50% 35%,#27303b 0%,#12161c 70%);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;aspect-ratio:1;width:100%;max-width:calc(100vh - 170px);margin:0 auto}
+.pane[hidden]{display:none}
+.pane canvas,.pane img{display:block;width:100%;height:100%;object-fit:contain}
+.pane .label{position:absolute;left:10px;top:8px;font-size:11px;color:var(--muted);background:#0009;padding:2px 7px;border-radius:5px}
+.pane .spinner{position:absolute;inset:0;display:none;align-items:center;justify-content:center;color:var(--muted);background:#0005;font-size:13px}
+.pane.busy .spinner{display:flex}
+#status{font:12px ui-monospace,monospace;color:var(--muted);min-height:18px;white-space:pre-wrap}
+#status .warn{color:var(--accent2)}
+.downloads{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.downloads a{color:var(--accent);font-size:12.5px}
+#compare-out{font:12px ui-monospace,monospace;color:var(--muted)}
+#diff{max-width:160px;border-radius:6px;border:1px solid var(--line);display:none}
+@media (max-width:850px){
+  .layout{grid-template-columns:1fr;padding:10px}
+  .viewer{order:-1}
+  .stage.split{grid-template-columns:1fr}
+  .pane{max-width:none}
+  .presets{grid-template-columns:repeat(2,1fr)}
+  #health{margin-left:0;width:100%}
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>Virtual Human Eye</h1>
+  <span class="sub">Independent eye controls · procedural iris/sclera · Qwen-Image 2.1 iris plates · analytic refraction</span>
+  <span id="health">…</span>
+</header>
+<div class="layout">
+  <aside>
+    <div class="card">
+      <h2>Presets</h2>
+      <div id="presets" class="presets"></div>
+    </div>
+    <div class="card">
+      <h2>Iris detail source</h2>
+      <div class="seg" id="detail-seg">
+        <button data-detail="procedural" class="on">Procedural</button>
+        <button data-detail="plate">Qwen plate</button>
+      </div>
+      <div id="plate-box" hidden>
+        <div id="plates" class="plates"></div>
+        <div class="row" style="margin-top:10px">
+          <input id="plate-color" type="text" aria-label="Plate colour description" class="grow" placeholder="colour, e.g. hazel with a golden ring" value="">
+        </div>
+        <div class="row">
+          <label>Count <input id="plate-count" type="number" min="1" max="8" value="4" style="width:56px"></label>
+          <label>Seed <input id="plate-seed" type="number" min="0" value="1" style="width:80px"></label>
+          <button id="plate-go" class="primary">Generate plates</button>
+          <button id="plate-cancel" class="danger" hidden>Cancel</button>
+        </div>
+        <div class="progress" id="plate-progress" hidden><div></div></div>
+        <div class="jobmsg" id="plate-msg"></div>
+      </div>
+    </div>
+    <div class="card">
+      <h2>View</h2>
+      <div class="row"><label>Texture resolution</label>
+        <select id="res" aria-label="Texture resolution"><option>512</option><option selected>1024</option><option>2048</option></select>
+        <label style="margin-left:auto"><input type="checkbox" id="studio-bg"> Studio background</label>
+      </div>
+      <div class="field"><label>Gaze yaw</label><span class="val" id="yaw-v">0°</span><input type="range" id="yaw" aria-label="Gaze yaw" min="-40" max="40" step="0.5" value="0"></div>
+      <div class="field"><label>Gaze pitch</label><span class="val" id="pitch-v">0°</span><input type="range" id="pitch" aria-label="Gaze pitch" min="-30" max="30" step="0.5" value="0"></div>
+      <div class="field"><label>Exposure</label><span class="val" id="exposure-v">1.00</span><input type="range" id="exposure" aria-label="Exposure" min="0.25" max="3" step="0.01" value="1"></div>
+      <div class="row"><button id="reset-view">Reset view</button><label><input type="checkbox" id="ortho"> Match CPU camera (orthographic)</label></div>
+    </div>
+    <div id="groups"></div>
+  </aside>
+  <section class="viewer">
+    <div class="tabs">
+      <div class="seg" id="view-seg">
+        <button data-view="shader" class="on">Eye shader</button>
+        <button data-view="glb">Portable GLB</button>
+        <button data-view="cpu">CPU reference</button>
+      </div>
+      <span id="compare-out"></span>
+    </div>
+    <div class="stage" id="stage">
+      <div class="pane" id="gl-pane"><span class="label" id="gl-label">WebGL · analytic eye shader</span><div class="spinner" id="gl-spin">working…</div></div>
+      <div class="pane" id="cpu-pane" hidden><span class="label">CPU ray tracer (render.py)</span><img id="cpu-img" alt="CPU reference render"><div class="spinner">rendering on the CPU…</div></div>
+    </div>
+    <div class="row"><canvas id="diff" width="128" height="128" title="|WebGL - CPU| x8"></canvas></div>
+    <div id="status"></div>
+    <div class="downloads">
+      <button id="dl-glb">Download GLB</button>
+      <button id="dl-textures">Textures (zip)</button>
+      <button id="dl-params">Params JSON</button>
+      <span id="dl-links"></span>
+    </div>
+  </section>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import * as Eye from '/vhuman_eye_shader.js';
+
+const $ = (id) => document.getElementById(id);
+const state = window.__eyeState = {
+  schema: null, params: null, detail: { source: 'procedural' }, res: 1024, preset: null,
+  texKey: null, timings: null, textureRequests: 0, textureSeconds: null, view: 'shader',
+  geometry: null, ready: false, lastCompare: null, errors: [],
+};
+window.__eyeReady = false;
+const deep = (o) => JSON.parse(JSON.stringify(o));
+
+// ---------------------------------------------------------------- API
+async function api(path, body) {
+  const opts = body === undefined ? {} : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) };
+  const r = await fetch(path, opts);
+  const ct = r.headers.get('content-type') || '';
+  const data = ct.includes('json') ? await r.json() : await r.blob();
+  if (!r.ok) throw new Error((data && data.error) || `${r.status} ${r.statusText}`);
+  return data;
+}
+function status(msg, warn) {
+  const el = $('status');
+  el.textContent = '';
+  const s = document.createElement('span');
+  if (warn) s.className = 'warn';
+  s.textContent = msg;
+  el.append(s);
+}
+
+// ---------------------------------------------------------------- colour helpers
+const lin2srgb = (c) => c <= 0.0031308 ? 12.92 * c : 1.055 * Math.pow(c, 1 / 2.4) - 0.055;
+const srgb2lin = (c) => c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+const toHex = (rgb) => '#' + rgb.map((c) => Math.round(Math.min(1, Math.max(0, lin2srgb(c))) * 255).toString(16).padStart(2, '0')).join('');
+const fromHex = (hex) => [1, 3, 5].map((i) => srgb2lin(parseInt(hex.slice(i, i + 2), 16) / 255));
+
+// ---------------------------------------------------------------- GLSL: web/vhuman_eye_shader.js
+// ---------------------------------------------------------------- three.js scene
+const pane = $('gl-pane');
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, preserveDrawingBuffer: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+renderer.toneMapping = THREE.NoToneMapping;
+renderer.outputColorSpace = THREE.SRGBColorSpace;   // only the GLB view's standard materials use it
+renderer.setClearColor(0x000000, 0);
+pane.prepend(renderer.domElement);
+const maxAniso = renderer.capabilities.getMaxAnisotropy();
+
+const persp = new THREE.PerspectiveCamera(20, 1, 0.002, 30);
+const HALF = 0.0145;                                   // render.Camera.half_width
+const ortho = new THREE.OrthographicCamera(-HALF, HALF, HALF, -HALF, 0.001, 30);
+ortho.position.set(0, 0, 0.05);
+ortho.lookAt(0, 0, 0);
+const controls = new OrbitControls(persp, renderer.domElement);
+controls.enableDamping = false;
+controls.minDistance = 0.03;
+controls.maxDistance = 0.6;
+function resetView() {
+  persp.position.set(0, 0, HALF / Math.tan(THREE.MathUtils.degToRad(10)) * 1.12);
+  controls.target.set(0, 0, 0);
+  controls.update();
+  requestRender();
+}
+controls.addEventListener('change', () => requestRender());
+
+const shaderScene = new THREE.Scene();
+const glbScene = new THREE.Scene();
+const pmrem = new THREE.PMREMGenerator(renderer);
+glbScene.environment = pmrem.fromScene(new RoomEnvironment(renderer), 0.02).texture;
+
+const common = Eye.makeStudioUniforms();
+const bgMaterial = Eye.makeBackgroundMaterial(common);
+const bgMesh = new THREE.Mesh(new THREE.SphereGeometry(10, 32, 16), bgMaterial);
+bgMesh.renderOrder = -1;
+bgMesh.frustumCulled = false;
+bgMesh.visible = false;
+shaderScene.add(bgMesh);
+let eyeMesh = null, eyeMaterial = null;
+const eyeToWorld = new THREE.Matrix4();          // the gaze (applyView); the eye sits at the origin
+
+// Server geometry/optics numbers (optics.uniforms) -> uniforms.
+function applyGeometry(g) {
+  state.geometry = g;
+  if (eyeMesh) {
+    shaderScene.remove(eyeMesh);
+    eyeMesh.geometry.dispose();
+    eyeMaterial.dispose();
+  }
+  eyeMaterial = Eye.makeEyeMaterial(common);
+  eyeMesh = Eye.makeEyeProxy(eyeMaterial, g);
+  shaderScene.add(eyeMesh);
+  setEyeFrame();
+  Eye.applyEyeGeometry(eyeMaterial, g);
+  Eye.applyStudio(common, g);
+}
+function setEyeFrame() {
+  if (!eyeMaterial) return;
+  eyeMaterial.uniforms.uWorldFromEye.value.copy(eyeToWorld);
+  eyeMaterial.uniforms.uEyeFromWorld.value.copy(eyeToWorld).invert();
+}
+
+// Live parameters -> uniforms (no network).
+function applyParams() {
+  if (!eyeMaterial || !state.geometry) return;
+  const { pupilRatio: pr, pupilScale: sc } = Eye.applyEyeParams(eyeMaterial, state.params, state.geometry);
+  const stretch = Math.max(sc, 1 / sc);
+  state.dilationWarning = stretch > 1.6 ? `pupil ratio ${pr.toFixed(2)}: the iris texture stretches ${stretch.toFixed(2)}x` : null;
+  requestRender();
+}
+
+// render.gaze_matrix: eye-to-world R = Ry(yaw) Rx(pitch)
+function applyView() {
+  const yaw = THREE.MathUtils.degToRad(+$('yaw').value), pitch = THREE.MathUtils.degToRad(+$('pitch').value);
+  const cy = Math.cos(yaw), sy = Math.sin(yaw), cx = Math.cos(pitch), sx = Math.sin(pitch);
+  const ry = new THREE.Matrix3().set(cy, 0, sy, 0, 1, 0, -sy, 0, cy);
+  const rx = new THREE.Matrix3().set(1, 0, 0, 0, cx, sx, 0, -sx, cx);
+  const r = new THREE.Matrix3().multiplyMatrices(ry, rx);
+  eyeToWorld.setFromMatrix3(r);
+  setEyeFrame();
+  common.uExposure.value = +$('exposure').value;
+  const cpu = state.view === 'cpu';
+  bgMesh.visible = $('studio-bg').checked || cpu;
+  $('yaw-v').textContent = `${(+$('yaw').value).toFixed(1)}°`;
+  $('pitch-v').textContent = `${(+$('pitch').value).toFixed(1)}°`;
+  $('exposure-v').textContent = (+$('exposure').value).toFixed(2);
+  if (glbRoot) glbRoot.quaternion.setFromRotationMatrix(new THREE.Matrix4().setFromMatrix3(r));
+  requestRender();
+}
+
+function activeCamera() { return ($('ortho').checked || state.view === 'cpu') ? ortho : persp; }
+
+let pending = false, firstFrameWaiters = [];
+function requestRender() {
+  if (pending) return;
+  pending = true;
+  requestAnimationFrame(renderNow);
+}
+function renderNow() {
+  pending = false;
+  const w = pane.clientWidth, h = pane.clientHeight;
+  const size = renderer.getSize(new THREE.Vector2());
+  if (size.x !== w || size.y !== h) renderer.setSize(w, h, false);
+  const cam = activeCamera();
+  if (cam === persp) { persp.aspect = w / h; persp.updateProjectionMatrix(); }
+  else {
+    const a = w / h;
+    ortho.left = -HALF * Math.max(a, 1); ortho.right = HALF * Math.max(a, 1);
+    ortho.top = HALF / Math.min(a, 1); ortho.bottom = -HALF / Math.min(a, 1);
+    ortho.updateProjectionMatrix();
+  }
+  controls.enabled = cam === persp;
+  common.uOrtho.value = cam === ortho ? 1 : 0;
+  cam.getWorldDirection(common.uCamDir.value);
+  renderer.render(state.view === 'glb' ? glbScene : shaderScene, cam);
+  const waiters = firstFrameWaiters; firstFrameWaiters = [];
+  waiters.forEach((f) => f());
+}
+new ResizeObserver(() => requestRender()).observe(pane);
+
+// ---------------------------------------------------------------- textures
+let texSeq = 0, texTimer = null;
+function scheduleTextures(delay = 250) {
+  clearTimeout(texTimer);
+  texTimer = setTimeout(loadTextures, delay);
+}
+async function loadTextures() {
+  const seq = ++texSeq;
+  $('gl-pane').classList.add('busy');
+  const started = performance.now();
+  try {
+    state.textureRequests++;
+    const resp = await api('/v1/eye/textures', { params: state.params, res: state.res, detail: state.detail });
+    if (seq !== texSeq) return;
+    applyGeometry(resp.uniforms);
+    const tex = await Eye.loadEyeTextures(resp, { anisotropy: maxAniso });
+    if (seq !== texSeq) { tex.dispose(); return; }
+    Eye.bindEyeTextures(eyeMaterial, tex);
+    state.texKey = resp.key;
+    state.timings = resp.timings;
+    state.textureSeconds = resp.seconds;
+    state.chartBitmap = tex.chart.image;
+    applyParams();
+    renderPresets();
+    const total = ((performance.now() - started) / 1000).toFixed(2);
+    status(`textures ${resp.key} · ${resp.res}² · server ${resp.seconds}s (iris ${resp.timings.iris_s}s, sclera ${resp.timings.sclera_s}s) · round trip ${total}s`
+           + (resp.detail.source === 'plate' ? ` · plate ${resp.detail.id}` : ''));
+    await new Promise((r) => { firstFrameWaiters.push(r); requestRender(); });
+    if (!state.ready) { state.ready = true; window.__eyeReady = true; }
+  } catch (e) {
+    console.error('textures:', e);
+    status(`texture request failed: ${e.message}`, true);
+  } finally {
+    if (seq === texSeq) $('gl-pane').classList.remove('busy');
+  }
+}
+
+// ---------------------------------------------------------------- controls
+const GROUP_TITLES = { iris: 'Iris', structure: 'Iris structure', pupil: 'Pupil', cornea: 'Cornea', sclera: 'Sclera', optics: 'Optics' };
+const GROUP_TAGS = { structure: 'rebuild', optics: 'metres / optics' };
+const structural = (f) => !f.live || (f.group === 'optics' && f.key === 'side');   // optics.side reseeds the veins
+const inputs = {};
+
+function fmt(f, v) {
+  if (f.kind === 'int') return String(v);
+  const span = Math.abs(f.hi - f.lo);
+  return (+v).toFixed(span < 0.02 ? 5 : span < 0.2 ? 4 : 3);
+}
+function buildControls() {
+  const host = $('groups');
+  host.textContent = '';
+  for (const group of state.schema.groups) {
+    const det = document.createElement('details');
+    det.className = 'group';
+    det.open = group === 'iris' || group === 'pupil';
+    const sum = document.createElement('summary');
+    sum.innerHTML = `<span></span><span class="tag"></span>`;
+    sum.children[0].textContent = GROUP_TITLES[group] || group;
+    sum.children[1].textContent = GROUP_TAGS[group] || '';
+    det.append(sum);
+    const box = document.createElement('div');
+    box.className = 'fields';
+    for (const f of state.schema.fields.filter((x) => x.group === group)) box.append(fieldControl(f));
+    det.append(box);
+    host.append(det);
+  }
+}
+function fieldControl(f) {
+  const wrap = document.createElement('div');
+  wrap.className = 'field' + (structural(f) ? ' struct' : '');
+  const label = document.createElement('label');
+  label.textContent = f.label;
+  label.title = f.help || '';
+  const val = document.createElement('span');
+  val.className = 'val';
+  wrap.append(label, val);
+  const id = `f-${f.group}-${f.key}`;
+  let input;
+  if (f.kind === 'float') {
+    input = document.createElement('input');
+    input.type = 'range'; input.min = f.lo; input.max = f.hi; input.step = (f.hi - f.lo) / 1000;
+    input.addEventListener('input', () => { val.textContent = fmt(f, input.value); setParam(f, +input.value); });
+  } else if (f.kind === 'int') {
+    input = document.createElement('input');
+    input.type = 'number'; input.min = f.lo; input.max = f.hi; input.step = 1; input.style.width = '96px';
+    input.addEventListener('change', () => setParam(f, Math.max(f.lo, Math.min(f.hi, Math.round(+input.value || 0)))));
+    const dice = document.createElement('button');
+    dice.textContent = '⟳'; dice.title = 'random seed'; dice.type = 'button';
+    dice.addEventListener('click', () => { input.value = Math.floor(Math.random() * 100000); input.dispatchEvent(new Event('change')); });
+    val.replaceWith(dice);
+  } else if (f.kind === 'enum') {
+    input = document.createElement('select');
+    for (const c of f.choices) { const o = document.createElement('option'); o.value = o.textContent = c; input.append(o); }
+    input.addEventListener('change', () => setParam(f, input.value));
+    val.remove();
+  } else if (f.kind === 'bool') {
+    input = document.createElement('input');
+    input.type = 'checkbox';
+    input.addEventListener('change', () => setParam(f, input.checked));
+    val.remove();
+  } else if (f.kind === 'color') {
+    input = document.createElement('input');
+    input.type = 'color';
+    input.addEventListener('input', () => setParam(f, fromHex(input.value)));
+    val.remove();
+  }
+  input.id = id;
+  input.setAttribute('aria-label', f.label);
+  label.htmlFor = id;
+  wrap.append(input);
+  inputs[`${f.group}.${f.key}`] = { f, input, val };
+  return wrap;
+}
+function syncControls() {
+  for (const { f, input, val } of Object.values(inputs)) {
+    const v = state.params[f.group][f.key];
+    if (f.kind === 'bool') input.checked = v;
+    else if (f.kind === 'color') input.value = toHex(v);
+    else input.value = v;
+    if (val && val.isConnected) val.textContent = fmt(f, v);
+  }
+}
+function setParam(f, value) {
+  state.params[f.group][f.key] = value;
+  state.preset = null;
+  document.querySelectorAll('.preset.active').forEach((b) => b.classList.remove('active'));
+  if (structural(f)) scheduleTextures();
+  else applyParams();
+}
+function applyPreset(name) {
+  const before = JSON.stringify(structKey(state.params));
+  state.params = deep(state.schema.presets[name]);
+  state.preset = name;
+  syncControls();
+  document.querySelectorAll('.preset').forEach((b) => b.classList.toggle('active', b.dataset.name === name));
+  if (JSON.stringify(structKey(state.params)) !== before) scheduleTextures(0);
+  else applyParams();
+}
+function structKey(p) {
+  const out = {};
+  for (const f of state.schema.fields) if (structural(f)) out[`${f.group}.${f.key}`] = p[f.group][f.key];
+  return out;
+}
+
+// Preset swatches: primary / secondary colours from the chart texture.
+let chartCtx = null;
+function chartRGB(u, v) {
+  if (!state.chartBitmap) return [128, 128, 128];
+  if (!chartCtx) {
+    const c = document.createElement('canvas');
+    c.width = c.height = state.chartBitmap.width;
+    chartCtx = c.getContext('2d', { willReadFrequently: true });
+    chartCtx.drawImage(state.chartBitmap, 0, 0);
+  }
+  const s = state.chartBitmap.width - 1;
+  const d = chartCtx.getImageData(Math.round(s * u), Math.round(s * v), 1, 1).data;
+  return [d[0], d[1], d[2]];
+}
+function renderPresets() {
+  const host = $('presets');
+  if (host.childElementCount && !state.chartBitmap) return;
+  host.textContent = '';
+  for (const [name, p] of Object.entries(state.schema.presets)) {
+    const b = document.createElement('button');
+    b.className = 'preset' + (state.preset === name ? ' active' : '');
+    b.dataset.name = name;
+    const sw = document.createElement('span');
+    sw.className = 'swatch';
+    const a = chartRGB(p.iris.secondary_color_u, p.iris.secondary_color_v), c = chartRGB(p.iris.primary_color_u, p.iris.primary_color_v);
+    sw.style.background = `radial-gradient(circle, rgb(${a}) 0 45%, rgb(${c}) 60% 100%)`;
+    const t = document.createElement('span');
+    t.textContent = name.replace(/_/g, ' ');
+    b.append(sw, t);
+    b.addEventListener('click', () => applyPreset(name));
+    host.append(b);
+  }
+}
+
+// ---------------------------------------------------------------- detail source / plates
+async function refreshPlates() {
+  let plates = [];
+  try { plates = (await api('/v1/plates')).plates; } catch (e) { console.error(e); }
+  state.plates = plates;
+  const host = $('plates');
+  host.textContent = '';
+  if (!plates.length) {
+    const p = document.createElement('div');
+    p.className = 'empty'; p.style.gridColumn = '1/-1';
+    p.textContent = 'No iris plates yet. Generate some with Qwen-Image 2.1 below.';
+    host.append(p);
+    return;
+  }
+  for (const pl of plates) {
+    const b = document.createElement('button');
+    b.className = state.detail.source === 'plate' && state.detail.id === pl.id ? 'on' : '';
+    const img = document.createElement('img');
+    img.src = pl.thumb_url; img.alt = pl.id; img.loading = 'lazy';
+    const cap = document.createElement('span');
+    const q = pl.quality && typeof pl.quality === 'object' ? pl.quality.score : pl.quality;
+    cap.textContent = typeof q === 'number' ? `q ${q.toFixed(2)}` : pl.seed != null ? `seed ${pl.seed}` : pl.id.slice(0, 6);
+    b.title = pl.prompt || pl.id;
+    b.append(img, cap);
+    b.addEventListener('click', () => { state.detail = { source: 'plate', id: pl.id }; refreshPlates(); scheduleTextures(0); });
+    host.append(b);
+  }
+}
+document.querySelectorAll('#detail-seg button').forEach((b) => b.addEventListener('click', () => {
+  document.querySelectorAll('#detail-seg button').forEach((x) => x.classList.toggle('on', x === b));
+  $('plate-box').hidden = b.dataset.detail !== 'plate';
+  if (b.dataset.detail === 'procedural') {
+    if (state.detail.source !== 'procedural') { state.detail = { source: 'procedural' }; scheduleTextures(0); }
+  } else {
+    refreshPlates();
+    if (state.plates && state.plates.length && state.detail.source !== 'plate') {
+      state.detail = { source: 'plate', id: state.plates[0].id }; refreshPlates(); scheduleTextures(0);
+    }
+  }
+}));
+let jobId = null;
+$('plate-go').addEventListener('click', async () => {
+  const body = { kind: 'plates', count: Math.max(1, Math.min(8, +$('plate-count').value || 1)),
+                 seed: Math.max(0, +$('plate-seed').value || 0), color: $('plate-color').value.trim() };
+  $('plate-msg').className = 'jobmsg';
+  $('plate-msg').textContent = 'submitting…';
+  try {
+    const job = await api('/v1/jobs', body);
+    jobId = job.id;
+    $('plate-go').disabled = true; $('plate-cancel').hidden = false; $('plate-progress').hidden = false;
+    pollJob();
+  } catch (e) {
+    $('plate-msg').className = 'jobmsg err';
+    $('plate-msg').textContent = e.message;
+  }
+});
+$('plate-cancel').addEventListener('click', async () => { if (jobId) { try { await api(`/v1/jobs/${jobId}/cancel`, {}); } catch (e) { console.error(e); } } });
+async function pollJob() {
+  if (!jobId) return;
+  let job;
+  try { job = await api(`/v1/jobs/${jobId}`); } catch (e) { setTimeout(pollJob, 1500); return; }
+  $('plate-progress').firstElementChild.style.width = `${Math.round((job.progress || 0) * 100)}%`;
+  const tail = (job.log || []).slice(-3).join('\n');
+  $('plate-msg').textContent = `${job.state}: ${job.message || ''}${job.error ? '\n' + job.error : ''}${tail ? '\n' + tail : ''}`;
+  if (['done', 'failed', 'cancelled'].includes(job.state)) {
+    $('plate-msg').className = 'jobmsg' + (job.state === 'failed' ? ' err' : '');
+    $('plate-go').disabled = false; $('plate-cancel').hidden = true;
+    jobId = null;
+    refreshPlates();
+    refreshHealth();
+    return;
+  }
+  setTimeout(pollJob, 1000);
+}
+
+// ---------------------------------------------------------------- views
+let glbRoot = null, glbKey = null;
+const gltfLoader = new GLTFLoader();
+async function showGlb() {
+  const key = JSON.stringify([state.params, state.res, state.detail]);
+  if (glbKey === key && glbRoot) { requestRender(); return; }
+  $('gl-pane').classList.add('busy');
+  try {
+    const t0 = performance.now();
+    const resp = await api('/v1/eye/export', { params: state.params, res: state.res, formats: ['glb'], detail: state.detail });
+    const gltf = await gltfLoader.loadAsync(resp.urls.glb);
+    if (glbRoot) { glbScene.remove(glbRoot); glbRoot.traverse((o) => { if (o.material) o.material.dispose(); if (o.geometry) o.geometry.dispose(); }); }
+    glbRoot = gltf.scene;
+    glbScene.add(glbRoot);
+    glbKey = key;
+    applyView();
+    status(`portable GLB · export ${resp.seconds}s · total ${((performance.now() - t0) / 1000).toFixed(2)}s · ${resp.urls.glb}`);
+    setLinks({ GLB: resp.urls.glb });
+  } catch (e) {
+    console.error('glb:', e);
+    status(`GLB export failed: ${e.message}`, true);
+  } finally { $('gl-pane').classList.remove('busy'); }
+}
+function setView(v) {
+  state.view = v;
+  document.querySelectorAll('#view-seg button').forEach((b) => b.classList.toggle('on', b.dataset.view === v));
+  $('cpu-pane').hidden = v !== 'cpu';
+  $('stage').classList.toggle('split', v === 'cpu');
+  $('diff').style.display = v === 'cpu' ? 'block' : 'none';
+  $('gl-label').textContent = v === 'glb' ? 'WebGL · portable GLB (MeshPhysicalMaterial, KHR transmission/ior/volume)'
+    : v === 'cpu' ? 'WebGL · analytic eye shader (CPU camera)' : 'WebGL · analytic eye shader';
+  applyView();
+  if (v === 'glb') showGlb();
+  if (v === 'cpu') compareWithCpu();
+}
+document.querySelectorAll('#view-seg button').forEach((b) => b.addEventListener('click', () => setView(b.dataset.view)));
+
+// CPU reference: render.py through the server, and the WebGL shader under the
+// same orthographic camera (2x supersampled) for a numeric comparison.
+async function compareWithCpu() {
+  const size = 384;
+  const cpuPane = $('cpu-pane');
+  cpuPane.classList.add('busy');
+  $('compare-out').textContent = 'rendering the CPU reference…';
+  try {
+    const blob = await api('/v1/eye/render', { params: state.params, size, yaw: +$('yaw').value, pitch: +$('pitch').value,
+                                                 fov: 0, spp: 4, detail: state.detail });
+    $('cpu-img').src = URL.createObjectURL(blob);
+    const bmp = await createImageBitmap(blob, { colorSpaceConversion: 'none', premultiplyAlpha: 'none' });
+    const c2 = document.createElement('canvas'); c2.width = c2.height = size;
+    const x2 = c2.getContext('2d', { willReadFrequently: true }); x2.drawImage(bmp, 0, 0);
+    const cpu = x2.getImageData(0, 0, size, size).data;
+    const gpu = readShaderPixels(size);
+    let sum = 0, cnt = 0, sumI = 0, cntI = 0, maxd = 0;
+    const g = state.geometry;
+    const rIris = (g.limbusRadius * state.params.cornea.size / g.corneaSizeRef) / HALF * size / 2;
+    const diff = $('diff').getContext('2d');
+    const img = diff.createImageData(size, size);
+    for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) {
+      const k = (y * size + x) * 4;
+      let d = 0;
+      for (let c = 0; c < 3; c++) d += Math.abs(cpu[k + c] - gpu[k + c]);
+      d /= 3;
+      sum += d; cnt++;
+      maxd = Math.max(maxd, d);
+      const rr = Math.hypot(x + 0.5 - size / 2, y + 0.5 - size / 2);
+      if (rr < 0.9 * rIris) { sumI += d; cntI++; }
+      img.data[k] = img.data[k + 1] = img.data[k + 2] = Math.min(255, d * 8); img.data[k + 3] = 255;
+    }
+    $('diff').width = $('diff').height = size;
+    diff.putImageData(img, 0, 0);
+    state.lastCompare = { mean: sum / cnt, iris_mean: cntI ? sumI / cntI : null, max: maxd, size };
+    $('compare-out').textContent = `|WebGL − CPU| mean ${state.lastCompare.mean.toFixed(2)}/255 · iris ${state.lastCompare.iris_mean?.toFixed(2)}/255 · max ${maxd.toFixed(0)}`;
+  } catch (e) {
+    console.error('cpu compare:', e);
+    $('compare-out').textContent = `CPU reference failed: ${e.message}`;
+  } finally { cpuPane.classList.remove('busy'); requestRender(); }
+}
+function readShaderPixels(size) {
+  const ss = 2, n = size * ss;
+  const rt = new THREE.WebGLRenderTarget(n, n, { type: THREE.UnsignedByteType });
+  const cam = new THREE.OrthographicCamera(-HALF, HALF, HALF, -HALF, 0.001, 30);
+  cam.position.set(0, 0, 0.05); cam.lookAt(0, 0, 0); cam.updateMatrixWorld();
+  const saved = { ortho: common.uOrtho.value, bg: bgMesh.visible };
+  common.uOrtho.value = 1; bgMesh.visible = true;
+  cam.getWorldDirection(common.uCamDir.value);
+  renderer.setRenderTarget(rt);
+  renderer.render(shaderScene, cam);
+  const buf = new Uint8Array(n * n * 4);
+  renderer.readRenderTargetPixels(rt, 0, 0, n, n, buf);
+  renderer.setRenderTarget(null);
+  rt.dispose();
+  common.uOrtho.value = saved.ortho; bgMesh.visible = saved.bg;
+  const out = new Uint8ClampedArray(size * size * 4);
+  for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) {
+    for (let c = 0; c < 4; c++) {
+      let s = 0;
+      for (let j = 0; j < ss; j++) for (let i = 0; i < ss; i++) {
+        const sy = n - 1 - (y * ss + j);                  // GL rows are bottom-up
+        s += buf[(sy * n + x * ss + i) * 4 + c];
+      }
+      out[(y * size + x) * 4 + c] = s / (ss * ss);
+    }
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------- downloads / health
+function setLinks(links) {
+  const host = $('dl-links');
+  host.textContent = '';
+  for (const [name, href] of Object.entries(links)) {
+    const a = document.createElement('a');
+    a.href = href; a.textContent = name; a.download = ''; a.style.marginRight = '10px';
+    host.append(a);
+  }
+}
+async function exportAndDownload(formats, key, button) {
+  button.disabled = true;
+  const label = button.textContent;
+  button.textContent = 'exporting…';
+  try {
+    const resp = await api('/v1/eye/export', { params: state.params, res: state.res, formats, detail: state.detail });
+    state.lastExport = resp;
+    setLinks(Object.fromEntries(Object.entries(resp.urls).map(([k, v]) => [k === 'glb' ? 'eye.glb' : k === 'textures_zip' ? 'eye_textures.zip' : 'params.json', v])));
+    const a = document.createElement('a');
+    a.href = resp.urls[key]; a.download = ''; document.body.append(a); a.click(); a.remove();
+    status(`export ${resp.key} · ${resp.seconds}s`);
+  } catch (e) {
+    status(`export failed: ${e.message}`, true);
+  } finally { button.disabled = false; button.textContent = label; }
+}
+$('dl-glb').addEventListener('click', (e) => exportAndDownload(['glb'], 'glb', e.currentTarget));
+$('dl-textures').addEventListener('click', (e) => exportAndDownload(['textures'], 'textures_zip', e.currentTarget));
+$('dl-params').addEventListener('click', () => {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([JSON.stringify(state.params, null, 1)], { type: 'application/json' }));
+  a.download = `eye_${state.preset || 'custom'}.json`;
+  a.click();
+});
+async function refreshHealth() {
+  try {
+    const h = await api('/health');
+    const gpu = h.gpu ? `${h.gpu.name} · ${h.gpu.free_mib} MiB free` : 'no GPU';
+    const av = (x) => x && x.available ? 'ready' : `off${x && x.reason ? ' (' + x.reason + ')' : ''}`;
+    $('health').textContent = `${gpu} · Qwen ${av(h.qwen)} · Pixal3D ${av(h.pixal3d)} · ${h.plates} plates`;
+  } catch (e) { $('health').textContent = 'server unreachable'; }
+}
+
+// ---------------------------------------------------------------- init
+for (const id of ['yaw', 'pitch', 'exposure']) $(id).addEventListener('input', applyView);
+for (const id of ['studio-bg', 'ortho']) $(id).addEventListener('change', applyView);
+$('res').addEventListener('change', () => { state.res = +$('res').value; scheduleTextures(0); });
+$('reset-view').addEventListener('click', () => { $('yaw').value = 0; $('pitch').value = 0; applyView(); resetView(); });
+window.addEventListener('error', (e) => state.errors.push(String(e.message)));
+
+async function init() {
+  refreshHealth();
+  setInterval(refreshHealth, 15000);
+  state.schema = await api('/v1/eye/schema');
+  const names = Object.keys(state.schema.presets);
+  state.preset = names.includes('hazel') ? 'hazel' : names[0];
+  state.params = deep(state.schema.presets[state.preset]);
+  buildControls();
+  syncControls();
+  renderPresets();
+  resetView();
+  applyView();
+  await loadTextures();
+  refreshPlates();
+}
+init().catch((e) => { console.error('init:', e); status(`init failed: ${e.message}`, true); });
+</script>
+</body>
+</html>

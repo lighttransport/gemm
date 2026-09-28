@@ -144,6 +144,21 @@
     </ul>
   </section>
 
+  <section>
+    <h2>Virtual human — eyes</h2>
+    <div class="task">procedural + Qwen-Image 2.1 iris → analytic 3D eye</div>
+    <ul>
+      <li>
+        <a href="http://localhost:8790/">Virtual Human Eye <span class="pill">single</span><span class="port">:8790</span></a>
+        <div class="desc">Independent eye controls (iris / pupil / cornea / sclera), procedural numpy textures, Qwen-Image 2.1 iris plates, a ray-traced refractive WebGL eye shader, and GLB / neutral texture export. Start with <code>sh server/vhuman/run.sh</code>; see <code>server/vhuman/README.md</code>.</div>
+      </li>
+      <li>
+        <a href="http://localhost:8790/head">Virtual Human Head <span class="pill">single</span><span class="port">:8790</span></a>
+        <div class="desc">Text → Qwen-Image 2.1 portrait → Pixal3D head → analytic eyes fitted into the eye sockets (same server).</div>
+      </li>
+    </ul>
+  </section>
+
   <footer>
     Each compare page lives on its own port (python reference sidecar).
     Single-backend pages are served straight from the C server at <code>/</code>.
