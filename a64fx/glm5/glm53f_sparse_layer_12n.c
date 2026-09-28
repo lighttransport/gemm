@@ -98,7 +98,8 @@ struct glm53f_sparse_context_12n {
 
 static int sparse_native_load_one(const char *blob, const char *manifest,
         const char *wanted, int expected_type, int expected_rows,
-        int expected_cols, uint8_t **output, int *loaded_type) {
+        int expected_cols, uint8_t **output, int *loaded_type,
+        int allow_panel) {
     FILE *m = fopen(manifest, "r");
     char line[512], type_name[32], name[256];
     uint64_t offset;
@@ -153,7 +154,10 @@ static int sparse_native_load_one(const char *blob, const char *manifest,
     /* Q8_0 rows are repacked into the bit-identical SVE layout. */
     uint8_t *packed = NULL;
     int packed_type = (int)type;
-    if (glm53f_native_repack((int)type, p, rows, cols, &packed, &packed_type)) {
+    int repack_error = allow_panel ?
+        glm53f_native_repack((int)type, p, rows, cols, &packed, &packed_type) :
+        glm53f_native_repack_rowwise((int)type, p, rows, cols, &packed, &packed_type);
+    if (repack_error) {
         free(p);
         return -1;
     }
@@ -171,12 +175,14 @@ static int sparse_native_load(glm53f_sparse_context_12n *c) {
     snprintf(manifest, sizeof(manifest), "%s/rank%02d.manifest", stage, c->rank);
 #define LOAD(S, T, R, C, P, TP) do { \
     snprintf(name, sizeof(name), "blk.%d." S, c->layer); \
-    if (sparse_native_load_one(blob, manifest, name, T, R, C, &c->P, TP)) return -1; \
+    if (sparse_native_load_one(blob, manifest, name, T, R, C, &c->P, TP, 1)) return -1; \
 } while (0)
     LOAD("attn_q_a.weight", -1, QA, H, q2_qa, &c->q2_qa_type);
     LOAD("attn_q_b.weight", GLM53F_GGML_Q8_0, c->qd, QA, q2_qb, &c->q2_qb_type);
     LOAD("attn_kv_a_mqa.weight", GLM53F_GGML_Q8_0, LAT, H, q2_kva, &c->q2_kva_type);
-    LOAD("attn_v_b.weight", GLM53F_GGML_Q8_0, c->hn * VD, LAT, q2_vb, &c->q2_vb_type);
+    snprintf(name, sizeof(name), "blk.%d.attn_v_b.weight", c->layer);
+    if (sparse_native_load_one(blob, manifest, name, GLM53F_GGML_Q8_0,
+            c->hn * VD, LAT, &c->q2_vb, &c->q2_vb_type, 0)) return -1;
     LOAD("attn_output.weight", -1, H, c->hn * VD, q2_op, &c->q2_op_type);
 #undef LOAD
     c->q2_native = 1;

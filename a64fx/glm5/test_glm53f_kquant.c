@@ -162,11 +162,12 @@ static int test_q8_0_native(unsigned *rng) {
     printf("PASS Q8_0 native cases=%d repacked_bit_exact=%d worst_normalized_error=%g mixed_pair=BIT_EXACT\n",
            cases, repacked, worst);
     if (getenv("GLM53F_KQUANT_BENCH")) {
-        enum { BR = 8192, BC = 4096, REPS = 20 };
+        enum { BR = 8192, BC = 4096, REPS = 200 };
         size_t rb = dequant_row_size(GLM53F_GGML_Q8_0, BC);
         unsigned char *matrix = malloc((size_t)BR * rb);
         float *out = malloc(BR * sizeof(float));
-        if (!matrix || !out) return 1;
+        float *reference = malloc(BR * sizeof(float));
+        if (!matrix || !out || !reference) return 1;
 #pragma omp parallel for schedule(static)
         for (int r = 0; r < BR; ++r) memcpy(matrix + (size_t)r * rb, w, rb);
         glm53f_native_matrix bm = {out, matrix, GLM53F_GGML_Q8_0, BR, BC};
@@ -181,18 +182,30 @@ static int test_q8_0_native(unsigned *rng) {
         int rtype = 0;
         if (glm53f_native_repack(GLM53F_GGML_Q8_0, matrix, BR, BC, &rp, &rtype) || !rp)
             return 1;
-        float check = out[BR - 1];
+        memcpy(reference, out, BR * sizeof(float));
         glm53f_native_matrix rm = {out, rp, rtype, BR, BC};
         size_t rrb = glm53f_native_row_size(rtype, BC);
         start = omp_get_wtime();
         for (int rep = 0; rep < REPS; ++rep)
             if (glm53f_native_matvec_n(&rm, 1, x)) return 1;
         seconds = omp_get_wtime() - start;
-        printf("BENCH type=Q8_0R Gweights_s=%.3f GB_s=%.3f check=%.9g same=%d\n",
+        double worst_error = 0.0;
+        for (int r = 0; r < BR; ++r) {
+            double error = fabs((double)out[r] - reference[r]) /
+                           (1.0 + fabs((double)reference[r]));
+            if (!isfinite(out[r]) || error > 2e-5) {
+                fprintf(stderr, "FAIL q8 bench panel row=%d error=%g\n", r, error);
+                return 1;
+            }
+            if (error > worst_error) worst_error = error;
+        }
+        printf("BENCH type=%s Gweights_s=%.3f GB_s=%.3f check=%.9g worst_normalized_error=%.9g\n",
+               rtype == GLM53F_NATIVE_Q8_0R16 ? "Q8_0R16" : "Q8_0R",
                (double)BR * BC * REPS / seconds / 1e9,
                (double)BR * rrb * REPS / seconds / 1e9, out[BR - 1],
-               out[BR - 1] == check);
+               worst_error);
         free(rp);
+        free(reference);
         free(out);
         free(matrix);
     }
@@ -201,11 +214,82 @@ static int test_q8_0_native(unsigned *rng) {
     return 0;
 }
 
+static int test_q8_0_panel(unsigned *rng) {
+    enum { ROWS = 32, COLUMNS = 128, TOKENS = 5 };
+    block_q8_0 w[ROWS * COLUMNS / 32];
+    float x[TOKENS * COLUMNS], baseline[TOKENS * ROWS], panel_y[TOKENS * ROWS];
+    for (size_t i = 0; i < sizeof(w) / sizeof(w[0]); ++i) {
+        *rng = *rng * 1664525u + 1013904223u;
+        w[i].d = ggml_fp32_to_fp16(0.001f * (1 + (*rng >> 28)));
+        for (int j = 0; j < 32; ++j) {
+            *rng = *rng * 1664525u + 1013904223u;
+            w[i].qs[j] = (int8_t)((int)(*rng >> 24) - 127);
+        }
+    }
+    for (int i = 0; i < TOKENS * COLUMNS; ++i) {
+        *rng = *rng * 1664525u + 1013904223u;
+        x[i] = ((int)(*rng >> 16) - 32768) / 4096.0f;
+    }
+    glm53f_native_matrix base = {baseline, (const uint8_t *)w,
+                                  GLM53F_GGML_Q8_0, ROWS, COLUMNS};
+    if (glm53f_native_matvec_batch(&base, 1, x, TOKENS)) return 1;
+    const char *prior_panel = getenv("GLM53F_NATIVE_Q8_PANEL");
+    char *saved_panel = prior_panel ? strdup(prior_panel) : NULL;
+    if (prior_panel && !saved_panel) return 1;
+    if (setenv("GLM53F_NATIVE_Q8_PANEL", "1", 1)) return 1;
+    uint8_t *packed = NULL;
+    int type = 0;
+    int rc = glm53f_native_repack(GLM53F_GGML_Q8_0, (const uint8_t *)w,
+                                  ROWS, COLUMNS, &packed, &type);
+    uint8_t *rowwise = NULL;
+    int row_type = 0;
+    int row_rc = glm53f_native_repack_rowwise(GLM53F_GGML_Q8_0,
+        (const uint8_t *)w, ROWS, COLUMNS, &rowwise, &row_type);
+    if (saved_panel) {
+        setenv("GLM53F_NATIVE_Q8_PANEL", saved_panel, 1);
+        free(saved_panel);
+    } else unsetenv("GLM53F_NATIVE_Q8_PANEL");
+    if (rc || !packed || type != GLM53F_NATIVE_Q8_0R16 ||
+        row_rc || !rowwise || row_type != GLM53F_NATIVE_Q8_0R) return 1;
+    glm53f_native_matrix rm = {panel_y, rowwise, row_type, ROWS, COLUMNS};
+    if (glm53f_native_matvec_batch(&rm, 1, x, TOKENS)) return 1;
+    for (int i = 0; i < TOKENS * ROWS; ++i)
+        if (panel_y[i] != baseline[i]) return 1;
+    free(rowwise);
+    glm53f_native_matrix pm = {panel_y, packed, type, ROWS, COLUMNS};
+    if (glm53f_native_matvec_batch(&pm, 1, x, TOKENS)) return 1;
+    double worst = 0;
+    for (int i = 0; i < TOKENS * ROWS; ++i) {
+        double err = fabs((double)panel_y[i] - baseline[i]) /
+                     (1.0 + fabs((double)baseline[i]));
+        if (!isfinite(panel_y[i]) || err > 2e-5) {
+            fprintf(stderr, "FAIL q8 panel index=%d baseline=%g panel=%g error=%g\n",
+                    i, baseline[i], panel_y[i], err);
+            free(packed);
+            return 1;
+        }
+        if (err > worst) worst = err;
+    }
+    for (int t = 0; t < TOKENS; ++t) {
+        pm.output = panel_y + (size_t)t * ROWS;
+        if (glm53f_native_matvec_n(&pm, 1, x + (size_t)t * COLUMNS)) return 1;
+    }
+    for (int i = 0; i < TOKENS * ROWS; ++i)
+        if (!isfinite(panel_y[i]) ||
+            fabs((double)panel_y[i] - baseline[i]) /
+                (1.0 + fabs((double)baseline[i])) > 2e-5) return 1;
+    free(packed);
+    printf("PASS Q8_0R16 panel rows=%d tokens=%d worst_normalized_error=%g\n",
+           ROWS, TOKENS, worst);
+    return 0;
+}
+
 int main(void) {
     unsigned char weights[16 * sizeof(block_q6_K)];
     float input[4096], decoded[4096];
     glm5_iq_q8_block xq[16];
     unsigned rng = 7;
+    if (test_q8_0_panel(&rng)) return 1;
     double worst = 0.0;
     for (int type = GLM53F_GGML_Q4_K; type <= GLM53F_GGML_Q6_K; ++type) {
         for (int trial = 0; trial < 100; ++trial) {

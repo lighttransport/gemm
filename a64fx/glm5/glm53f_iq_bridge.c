@@ -7,6 +7,7 @@
 #define GLM5_IMPL
 #include "../../common/glm5.h"
 #include "glm53f_iq_bridge.h"
+#include "kern/glm53f_kern.h"
 
 int glm53f_iq_type_supported(int type) {
     return type == GLM53F_GGML_Q4_K || type == GLM53F_GGML_Q5_K ||
@@ -208,7 +209,7 @@ static float q8_0_q8_0_row(const block_q8_0 *w,
 
 int glm53f_native_type_supported(int type) {
     return glm53f_iq_type_supported(type) || type == GLM53F_GGML_Q8_0 ||
-           type == GLM53F_NATIVE_Q8_0R;
+           type == GLM53F_NATIVE_Q8_0R || type == GLM53F_NATIVE_Q8_0R16;
 }
 
 /* A prepared activation carries both llama.cpp activation contracts: Q8_K
@@ -220,6 +221,7 @@ typedef struct {
     block_q8_0 *q80;
     int8_t *xq;      /* Q8_0 values, contiguous (repacked-weight path). */
     float *xpat;     /* per 64 values: 8 lanes of d[2k], 8 lanes of d[2k+1]. */
+    float *xd;       /* per 32 values: Q8_0 scale (16-row panel path). */
 } native_act;
 
 static size_t align256(size_t n) { return (n + 255) & ~(size_t)255; }
@@ -230,7 +232,8 @@ size_t glm53f_native_act_bytes(int columns) {
            align256((size_t)(columns / 256 + 1) * sizeof(glm5_iq_q8_block)) +
            align256((size_t)(columns / 32) * sizeof(block_q8_0)) +
            align256((size_t)columns) +
-           align256((size_t)(columns / 64 + 1) * 16 * sizeof(float));
+           align256((size_t)(columns / 64 + 1) * 16 * sizeof(float)) +
+           align256((size_t)(columns / 32) * sizeof(float));
 }
 
 int glm53f_native_act_prepare(void *storage, const float *input, int columns,
@@ -246,6 +249,8 @@ int glm53f_native_act_prepare(void *storage, const float *input, int columns,
     a->xq = (int8_t *)((unsigned char *)a->q80 +
         align256((size_t)(columns / 32) * sizeof(block_q8_0)));
     a->xpat = (float *)((unsigned char *)a->xq + align256((size_t)columns));
+    a->xd = (float *)((unsigned char *)a->xpat +
+        align256((size_t)(columns / 64 + 1) * 16 * sizeof(float)));
     a->has_q8k = a->has_q80 = 0;
     if (need_q8k) {
         pthread_once(&glm5_iq_lut_once, glm5_iq_init_luts);
@@ -257,6 +262,7 @@ int glm53f_native_act_prepare(void *storage, const float *input, int columns,
         for (int b = 0; b < columns / 32; ++b) {
             memcpy(a->xq + 32 * b, a->q80[b].qs, 32);
             const float d = ggml_fp16_to_fp32(a->q80[b].d);
+            a->xd[b] = d;
             for (int j = 0; j < 8; ++j)
                 a->xpat[(b >> 1) * 16 + (b & 1) * 8 + j] = d;
         }
@@ -269,19 +275,49 @@ int glm53f_native_act_prepare(void *storage, const float *input, int columns,
  * The fp16 -> fp32 scale conversion is exact, so the arithmetic is the same
  * as the GGUF block layout; only the memory layout is SVE friendly. */
 size_t glm53f_native_row_size(int type, int columns) {
+    if (type == GLM53F_NATIVE_Q8_0R16)
+        return columns > 0 && columns % 128 == 0 ?
+               gk_panel_bytes_q8_0r16(columns) / 16 : 0;
     if (type == GLM53F_NATIVE_Q8_0R)
         return columns > 0 && columns % 64 == 0 ?
                (size_t)columns + (size_t)(columns / 32) * sizeof(float) : 0;
     return glm53f_iq_row_size(type, columns);
 }
 
-int glm53f_native_repack(int type, const uint8_t *source, int rows,
-                         int columns, uint8_t **output, int *output_type) {
+static int native_repack_impl(int type, const uint8_t *source, int rows,
+                              int columns, uint8_t **output, int *output_type,
+                              int allow_panel) {
     if (!source || !output || !output_type || rows < 1) return -1;
     if (type != GLM53F_GGML_Q8_0 || columns % 64 ||
         getenv("GLM53F_NATIVE_NO_REPACK")) {
         *output = NULL;
         *output_type = type;
+        return 0;
+    }
+    const char *panel = getenv("GLM53F_NATIVE_Q8_PANEL");
+    if (allow_panel && panel && strcmp(panel, "1") == 0 && columns % 128 == 0 &&
+        rows % 16 == 0) {
+        const size_t pb = gk_panel_bytes_q8_0r16(columns);
+        const size_t sb = (size_t)(columns / 32) * sizeof(block_q8_0);
+        uint8_t *p = NULL;
+        if (posix_memalign((void **)&p, 256, (size_t)(rows / 16) * pb)) return -1;
+#pragma omp parallel for schedule(static)
+        for (int panel_index = 0; panel_index < rows / 16; ++panel_index) {
+            uint8_t *dst = p + (size_t)panel_index * pb;
+            const uint8_t *src = source + (size_t)panel_index * 16 * sb;
+            for (int b = 0; b < columns / 32; ++b) {
+                uint8_t *blk = dst + (size_t)b * 576;
+                float *dw = (float *)(blk + 512);
+                for (int r = 0; r < 16; ++r) {
+                    const block_q8_0 *w = (const block_q8_0 *)(src + (size_t)r * sb);
+                    dw[r] = ggml_fp16_to_fp32(w[b].d);
+                    for (int j = 0; j < 8; ++j)
+                        memcpy(blk + j * 64 + r * 4, w[b].qs + j * 4, 4);
+                }
+            }
+        }
+        *output = p;
+        *output_type = GLM53F_NATIVE_Q8_0R16;
         return 0;
     }
     const size_t rb = glm53f_native_row_size(GLM53F_NATIVE_Q8_0R, columns);
@@ -301,6 +337,16 @@ int glm53f_native_repack(int type, const uint8_t *source, int rows,
     *output = p;
     *output_type = GLM53F_NATIVE_Q8_0R;
     return 0;
+}
+
+int glm53f_native_repack(int type, const uint8_t *source, int rows,
+                         int columns, uint8_t **output, int *output_type) {
+    return native_repack_impl(type, source, rows, columns, output, output_type, 1);
+}
+
+int glm53f_native_repack_rowwise(int type, const uint8_t *source, int rows,
+                                 int columns, uint8_t **output, int *output_type) {
+    return native_repack_impl(type, source, rows, columns, output, output_type, 0);
 }
 
 /* Up to four repacked rows share each activation vector.  Per lane this is
@@ -353,6 +399,16 @@ static inline float native_row(int type, const uint8_t *row,
     return iq_row(type, row, a->q8k, a->columns / 256);
 }
 
+static inline void q8_0r16_rows(float *out, const uint8_t *weight,
+                               int rows, int columns, int r,
+                               const native_act *a) {
+    const gk_act ga = {.columns = columns, .xq = a->xq, .xd = a->xd};
+    const gk_mv gm = {.w = weight,
+                      .row_bytes = glm53f_native_row_size(GLM53F_NATIVE_Q8_0R16, columns),
+                      .rows = rows, .columns = columns, .a = &ga, .y = out};
+    gk_q8_0r16_v3pf16k(&gm, r, r + 16);
+}
+
 /* Four rows x four tokens. Reuse every weight load across four independent
  * accumulators without changing the decode kernel's per-lane FMA order. */
 static inline void q8_0r_tile4(float *out, int stride, const uint8_t *w,
@@ -393,7 +449,8 @@ static inline void q8_0r_tile4(float *out, int stride, const uint8_t *w,
 }
 
 static int native_is_q80(int type) {
-    return type == GLM53F_GGML_Q8_0 || type == GLM53F_NATIVE_Q8_0R;
+    return type == GLM53F_GGML_Q8_0 || type == GLM53F_NATIVE_Q8_0R ||
+           type == GLM53F_NATIVE_Q8_0R16;
 }
 
 static int native_check(int type, int columns, const native_act *a) {
@@ -416,7 +473,9 @@ int glm53f_native_matvec_team(const glm53f_native_matrix *m, int count,
         bad |= !m[i].output || !m[i].weight || m[i].rows < 1 || !rb[i] ||
                native_check(m[i].type, m[i].columns, a);
         /* Work items are four-row groups for repacked Q8_0, rows otherwise. */
-        group[i] = m[i].type == GLM53F_NATIVE_Q8_0R ? 4 : 1;
+        group[i] = m[i].type == GLM53F_NATIVE_Q8_0R16 ? 16 :
+                   m[i].type == GLM53F_NATIVE_Q8_0R ? 4 : 1;
+        bad |= group[i] == 16 && m[i].rows % 16 != 0;
         start[i] = total;
         total += (m[i].rows + group[i] - 1) / group[i];
     }
@@ -427,7 +486,10 @@ int glm53f_native_matvec_team(const glm53f_native_matrix *m, int count,
         int i = 0;
         while (q >= start[i + 1]) ++i;
         const int r = (q - start[i]) * group[i];
-        if (group[i] == 4) {
+        if (group[i] == 16) {
+            q8_0r16_rows(m[i].output, m[i].weight, m[i].rows,
+                          m[i].columns, r, a);
+        } else if (group[i] == 4) {
             const int n = m[i].rows - r < 4 ? m[i].rows - r : 4;
             q8_0r_rows(m[i].output + r, m[i].weight + (size_t)r * rb[i],
                        rb[i], n, a);
@@ -475,7 +537,9 @@ int glm53f_native_matvec_batch_team(const glm53f_native_matrix *m, int count,
             if (native_check(m[i].type, m[i].columns,
                     (const native_act *)((const uint8_t *)activation +
                                           (size_t)t * activation_stride))) return -1;
-        group[i] = m[i].type == GLM53F_NATIVE_Q8_0R ? 4 : 1;
+        group[i] = m[i].type == GLM53F_NATIVE_Q8_0R16 ? 16 :
+                   m[i].type == GLM53F_NATIVE_Q8_0R ? 4 : 1;
+        if (group[i] == 16 && m[i].rows % 16 != 0) return -1;
         start[i] = total;
         total += (m[i].rows + group[i] - 1) / group[i];
     }
@@ -494,7 +558,11 @@ int glm53f_native_matvec_batch_team(const glm53f_native_matrix *m, int count,
             for (int j = 0; j < nt; ++j)
                 a[j] = (const native_act *)((const uint8_t *)activation +
                                             (size_t)(t + j) * activation_stride);
-            if (group[i] == 4 && nr == 4 && nt == 4)
+            if (group[i] == 16) {
+                for (int j = 0; j < nt; ++j)
+                    q8_0r16_rows(m[i].output + (size_t)(t + j) * m[i].rows,
+                        m[i].weight, m[i].rows, m[i].columns, r, a[j]);
+            } else if (group[i] == 4 && nr == 4 && nt == 4)
                 q8_0r_tile4(out, m[i].rows, row, rb[i], a);
             else for (int j = 0; j < nt; ++j) {
                 if (group[i] == 4)

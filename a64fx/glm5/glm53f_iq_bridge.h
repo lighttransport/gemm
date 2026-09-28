@@ -15,7 +15,8 @@ enum {
     GLM53F_GGML_IQ3_XXS = 18,
     GLM53F_GGML_IQ4_XS = 23,
     /* Runtime-only layout of GGUF Q8_0 rows (see glm53f_native_repack). */
-    GLM53F_NATIVE_Q8_0R = 1008
+    GLM53F_NATIVE_Q8_0R = 1008,
+    GLM53F_NATIVE_Q8_0R16 = 1009
 };
 
 typedef struct {
@@ -52,6 +53,9 @@ size_t glm53f_native_row_size(int type, int columns);
  * GLM53F_NATIVE_NO_REPACK=1: *output = NULL and *output_type = type. */
 int glm53f_native_repack(int type, const uint8_t *source, int rows,
                          int columns, uint8_t **output, int *output_type);
+/* Keep head-local row indexing for matrices such as attn_v_b.weight. */
+int glm53f_native_repack_rowwise(int type, const uint8_t *source, int rows,
+                                 int columns, uint8_t **output, int *output_type);
 size_t glm53f_native_act_bytes(int columns);
 int glm53f_native_act_prepare(void *storage, const float *input, int columns,
                               int need_q8k, int need_q80);

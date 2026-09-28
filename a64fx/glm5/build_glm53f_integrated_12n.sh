@@ -46,13 +46,14 @@ obj sparse glm53f_sparse_layer_12n.c "${external[@]}" -DGLM53F_SPARSE_NO_MAIN
 obj dense glm53f_dense_ffn_12n.c "${external[@]}" -DGLM53F_DENSE_NO_MAIN
 obj moe glm53f_expert_decode_12n.c "${external[@]}" -DGLM53F_EXPERT_NO_MAIN
 obj iq_bridge glm53f_iq_bridge.c
+obj q8_panel kern/glm53f_kern_q8r16.c
 obj head glm53f_target_head_12n.c "${external[@]}" -DGLM53F_TARGET_HEAD_NO_MAIN
 obj embedding glm53f_embedding_12n.c "${external[@]}"
-objects=()
+objects=("$build_dir/q8_panel.o")
 for name in collective kda sparse dense moe iq_bridge head embedding; do
     objects+=("$build_dir/$name.o")
 done
-kernels=("$build_dir/iq_bridge.o" "$build_dir/collective.o")
+kernels=("$build_dir/iq_bridge.o" "$build_dir/q8_panel.o" "$build_dir/collective.o")
 bin glm53f_target_decode_12n glm53f_target_decode_12n.c "${objects[@]}"
 for name in q2_stage q2_embed_stage q2_dense_stage q2_sparse_stage q2_kda_stage \
             q2_shexp_stage q2_core_patch q2_shared_patch core_stage core_add_routers; do
@@ -68,7 +69,7 @@ if [ "$bin_dir" = . ]; then bin ../utofu-tests/tofu_topo_helper ../utofu-tests/t
 if [ "$mode" != runtime ]; then
     obj target glm53f_target_decode_12n.c -DGLM53F_TARGET_MODEL_NO_MAIN
     for name in kquant native_batch prefill_config state_io; do
-        bin "test_glm53f_$name" "test_glm53f_$name.c"
+        bin "test_glm53f_$name" "test_glm53f_$name.c" "$build_dir/q8_panel.o"
     done
     bin glm53f_kda_callback_check glm53f_kda_callback_check.c "$build_dir/kda.o" "${kernels[@]}"
     bin glm53f_dense_batch_check glm53f_dense_batch_check.c "$build_dir/dense.o" "$build_dir/kda.o" "${kernels[@]}"
@@ -83,7 +84,7 @@ if [ "$mode" = all ]; then
     bin test_glm53f_mtp_cache_12n test_glm53f_mtp_cache_12n.c "${objects[@]}" "$build_dir/mtp.o"
     bin glm53f_prefill_12n glm53f_prefill_12n.c "${objects[@]}" "$build_dir/target.o"
     bin test_glm53f_kda_reference_12n test_glm53f_kda_reference_12n.c "$build_dir/kda.o" "${kernels[@]}"
-    bin test_glm53f_iq_bridge test_glm53f_iq_bridge.c "$build_dir/iq_bridge.o"
+    bin test_glm53f_iq_bridge test_glm53f_iq_bridge.c "$build_dir/iq_bridge.o" "$build_dir/q8_panel.o"
     for name in glm53f_sparse_native_stage_probe_12n test_glm53f_sparse_reference_12n; do
         bin "$name" "$name.c" "$build_dir/sparse.o" "${kernels[@]}"
     done

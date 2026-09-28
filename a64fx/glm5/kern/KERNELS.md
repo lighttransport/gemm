@@ -186,3 +186,27 @@ Modes and findings:
   - a 2D row × token CMG split.
 
   An L2-hot 768-row replica reaches 66%.
+
+## Production Q8 panel trial (2026-09-29, job 51977508)
+
+`glm53f_iq_bridge.c` can now repack eligible native Q8_0 matrices directly
+into Q8_0R16 panels at load and dispatch `gk_q8_0r16_v3pf16k` for decode.
+Set `GLM53F_NATIVE_Q8_PANEL=1` before loading the model. Matrices must have
+columns divisible by 128 and rows divisible by 16; other Q8 matrices retain
+the Q8_0R path. The option remains off by default because the panel changes
+FP32 accumulation order and a 12-node model A/B has not run.
+
+The focused test covers 32 rows, 128 columns and five tokens in both batch
+and one-token modes (worst normalized error `1.73e-6`). The 8192×4096
+microbenchmark checks every row against the GGUF Q8 reference (worst
+normalized error `2.78e-7`). Its 200-repeat data on the active build node:
+
+| Threads / paging | Q8_0R Gweights/s | Q8_0R16 Gweights/s |
+| --- | ---: | ---: |
+| 1 / inherited | 6.09 | 28.77 |
+| 47 / inherited XOS pages | 65.21 | 68.08 |
+| 47 / `XOS_MMM_L_HPAGE_TYPE=none`, demand paging | 161.02 | 300.16 |
+
+The 47-thread page setting dominates this isolated microbenchmark. These
+figures include neither layer barriers nor the full 12-node decode; use the
+production runner to decide whether to enable the panel by default.

@@ -299,7 +299,8 @@ static int nsh_load(glm53f_moe_stage_context_12n *c, const char *stage) {
 }
 
 static int nsh_is_q80(int type) {
-    return type == GLM53F_GGML_Q8_0 || type == GLM53F_NATIVE_Q8_0R;
+    return type == GLM53F_GGML_Q8_0 || type == GLM53F_NATIVE_Q8_0R ||
+           type == GLM53F_NATIVE_Q8_0R16;
 }
 
 /* output += shared_expert(x) for this rank's intermediate slice.  One team:

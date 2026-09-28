@@ -147,7 +147,7 @@ static int kda_native_load(glm53f_kda_context_12n*c){
     c->act_x=a256(ab);c->act_small=a256(ab);c->act_out=a256(ab);c->small_g=a256(D*sizeof(float));
     c->q2_native=1;return 0;}
 
-static int kda_is_q80(int type){return type==GLM53F_GGML_Q8_0||type==GLM53F_NATIVE_Q8_0R;}
+static int kda_is_q80(int type){return type==GLM53F_GGML_Q8_0||type==GLM53F_NATIVE_Q8_0R||type==GLM53F_NATIVE_Q8_0R16;}
 
 void glm53f_kda_configure_prefill_12n(glm53f_kda_context_12n *c,
                                      const glm53f_prefill_config *config) {

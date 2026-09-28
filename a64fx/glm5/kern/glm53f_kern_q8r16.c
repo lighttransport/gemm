@@ -16,7 +16,8 @@
 #include <arm_sve.h>
 
 size_t gk_panel_bytes_q8_0r16(int columns) {
-    return (size_t)16 * gk_row_bytes_q8_0r(columns);
+    return columns > 0 && columns % 32 == 0 ?
+           (size_t)(columns / 32) * 576 : 0;
 }
 
 void gk_pack_q8_0r16(uint8_t *dst, const uint8_t *rows, size_t row_bytes,

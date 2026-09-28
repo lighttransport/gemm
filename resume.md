@@ -239,20 +239,32 @@ Picked up the uncommitted work of a previous 4-node session. The whole Q5 varian
 - **CMG-token mode** (`gemm.c t`) runs per-rank shapes (2304 × 4096) at 60.4%.
 - **The 504-token chunk:** at 48 threads, 2304 rows reach 59%. At production's **47 threads** the 11-core CMG straggles, and balancing each CMG's token share by its busiest core's panel count takes 50.2 → **55.5%** (192 tokens: 49.1 → 57.3%). Token blocks, K chunks, a 2D row/token split, output-tile prefetch and next-chunk prefetch do not help much (kept as default-off knobs). A 768-row replica that is L2-hot reaches 66%.
 
-## Production integration plan (not started; needs the real model on 12 nodes)
+## Production integration plan (Q8 trial started; needs the real model on 12 nodes)
 
 - **Where Q8_0R is used:**
   - `glm53f_iq_bridge.c` (`glm53f_native_repack`, `_matvec_team`, `_matvec_batch_team`);
   - direct Q8_0R checks in `glm53f_kda_layer_12n.c:150`, `glm53f_sparse_layer_12n.c:443` (v_b attention weights read row-wise; do NOT repack those), `glm53f_expert_decode_12n.c:302`, and `glm53f_dense_ffn_12n.c`.
 - **Plan:**
-  1. Add the `GLM53F_NATIVE_Q8_0R16` type.
-  2. Repack only matrices consumed solely through `native_matvec_*`.
-  3. Add a per-block activation scale `xd` to `native_act`.
-  4. Dispatch 16-row groups to `gk_q8_0r16_v3pf` (`#include "kern/glm53f_kern_q8r16.c"`).
-  5. Keep row slicing aligned to 16.
-  6. Same for the routed experts: Q4_KP16/Q5_KP16/Q6_KP16 inside `glm53f_iq_expert_weighted`.
+  1. Q8 trial: `GLM53F_NATIVE_Q8_0R16` is now an opt-in runtime type;
+     eligible Q8 matrices are packed directly from GGUF at load, `xd` is
+     prepared once, and 16-row decode groups call `gk_q8_0r16_v3pf16k`.
+     One-token and batch correctness plus a matrix microbenchmark pass.
+  2. Run a 12-node real-model token and tok/s A/B before enabling the panel
+     by default. Check the production page placement at the same time.
+  3. Keep row-wise attention V weights in their original layout.
+  4. Integrate the routed-expert Q4_KP16/Q5_KP16/Q6_KP16 paths in `glm53f_iq_expert_weighted`.
 - **Barriers:** production already uses `FLIB_BARRIER=HARD`. The flag barrier with split-phase prefetch helped the chain a further 6%.
 - **Pages:** check weight page placement (2 MiB XOS pages shared across CMG slices cost 1.8× in the chain).
+
+## 2026-09-29 continuation
+
+Q8_0R16 production decode is opt-in via `GLM53F_NATIVE_Q8_PANEL=1`. The
+8192×4096 one-node microbenchmark at 47 threads measured 68.08 vs 65.21
+Gweights/s with inherited XOS pages, and 300.16 vs 161.02 with 2 MiB pages
+disabled. The focused numerical checks pass, but this is not a 12-node model
+result. See `kern/KERNELS.md`. Clair gained `glm53f/sprobe/random_line.c`, a
+same-ELF scalar/SVE random-line control; its 4/16 MiB native/event comparison
+is in `glm53f/STATUS.md`. The event HBM path remains uncalibrated.
 
 ## Next steps (priority)
 1. **Simulator.**
@@ -260,7 +272,11 @@ Picked up the uncommitted work of a previous 4-node session. The whole Q5 varian
    - Event core: scalar random-load MLP (LCG `ldr` loop: 11 sim vs 29 native cycles/iter; `/local/stf3.*` repro described in STATUS). Then the K-quant unpack residual and the ld8u6 base-ADD rule.
    - Keep `FP_HOLD_LOAD=4` diagnostic until a direct lifetime probe supports it.
    - Acceptance: `measurements/hw-20260927b/eval_probes.sh`, the kernel gate (`compare.py`), and `sprobe/cellcmp.py`.
-2. **Decode.** Integrate panel kernels, repack at load and use flag or hardware barriers into the production runner (`glm53f_iq_bridge.c`, `glm53f_target_decode_12n.c`). Validate on 12 nodes: `build_glm53f_integrated_12n.sh check` bit-identical, then a tok/s A/B. Check production weight page placement: the 2 MiB page effect.
+2. **Decode.** Validate the opt-in Q8 panel path on 12 nodes with a real
+   model token and tok/s A/B. Expect close numerical agreement rather than
+   bit identity because the panel accumulates FP32 blocks in a new order.
+   Then integrate K-quant panels and evaluate flag or hardware barriers in
+   `glm53f_target_decode_12n.c`. Check production weight page placement.
 3. **Prefill.** Integrate `gk_gemm_panel64` into the production prefill with these rules:
    - pad the output row stride (`P`);
    - split tokens across CMGs and panels within a CMG (`t`), with each CMG's token share balanced by its busiest thread (47 threads);
