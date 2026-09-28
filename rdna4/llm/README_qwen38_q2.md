@@ -80,13 +80,12 @@ next layer, and an MTP draft model for speculative decode. Its reported Q2_0
 shards and no matching Flash-Next MTP weights. The 60 decode / 1,200 prefill
 targets are not met by this implementation.
 
-An explicit single-tile batched profile is available with a build that enables
-the batch dispatcher:
+An explicit single-tile batched profile is available with the standard
+`test_hip_llm` build:
 
 ```sh
-make -C rdna4/llm TARGET=tmp/test_hip_llm_batch HIPBLASLT=1 \
-  ROCM_LIB=/opt/rocm/lib tmp/test_hip_llm_batch
-QWEN38_Q2_RUNNER=rdna4/llm/tmp/test_hip_llm_batch LLM_BMAX=1024 \
+make -C rdna4/llm test_hip_llm
+LLM_BMAX=1024 \
   rdna4/llm/run_qwen38_flash_next_q2_rocm.sh --bench \
   --prompt-file tmp/qwen38_1k_prompt.txt --prefill-len 1024 -n 1024 \
   --decode 32 -s 1152 --qwen4-batched-prefill
@@ -152,6 +151,16 @@ the default vectorized F16 kernel and both exact options above. It measured
 with the same `b9f867f533408c06` hash and 14.65 GiB peak VRAM use. The GPU
 still reported 96 MHz memory clock in manual mode. This is the current
 throughput result, well below the 1,200/60 tok/s target.
+The standard build also passed the same combined profile at 10.38/7.03
+tok/s and the identical hash, so a separate HIPBLASLt build is unnecessary.
+
+```sh
+LLM_BMAX=1024 LLM_QWEN4_EXACT_GPU_TOPK=1 \
+  LLM_QWEN4_EXACT_PRE_GRAPHS=1 \
+  rdna4/llm/run_qwen38_flash_next_q2_rocm.sh --bench \
+  --prompt-file tmp/qwen38_1k_prompt.txt --prefill-len 1024 -n 1024 \
+  --decode 32 -s 1152 --qwen4-batched-prefill
+```
 
 Keep the launcher's default `OMP_NUM_THREADS=16` on the Ryzen 9 3950X.
 At 32 prompt + 8 decode tokens, an eight-thread control measured 7.39/8.20
