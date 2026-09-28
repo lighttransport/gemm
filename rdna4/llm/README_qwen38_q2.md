@@ -142,6 +142,12 @@ with the same `b9f867f533408c06` hash and 14.65 GiB peak VRAM use. The GPU
 still reported 96 MHz memory clock in manual mode. This is the current
 throughput result, well below the 1,200/60 tok/s target.
 
+Keep the launcher's default `OMP_NUM_THREADS=16` on the Ryzen 9 3950X.
+At 32 prompt + 8 decode tokens, an eight-thread control measured 7.39/8.20
+tok/s, and 32 threads fell to 2.00/2.05 tok/s while preserving the output
+hash. The 32-thread run spent 11.76 s in CPU expert work during 15.96 s of
+prefill, showing severe oversubscription.
+
 Combining exact GPU router top-k, 47 captured prefix graphs, and WMMA decode
 also preserved the 1K sequence hash. That run measured **7.29 prefill tok/s**
 and **6.47 decode tok/s**. The gain is small enough to leave these diagnostic
