@@ -156,8 +156,15 @@ target; the procedural shape of the expression's controls is corrected by a
 pre-skinning delta (PyTorch, through the portrait camera) with a Laplacian
 smoothness term, a weak view-axis term and the lip margins excluded. The
 correction is split over the expression's primary controls by their
-procedural magnitude and side. `rig_report.json` → `expressions` has the
-reprojection error before/after per expression (typically 4-18 px → < 1 px).
+procedural magnitude and side. Folds are repaired after the fit: around skin
+triangles that flip or collapse relative to the procedural pose, the
+correction fades out (smooth falloff) until none remain. Joint-driven
+expressions (jaw open) are first matched in intensity; the image usually
+shows a partial opening (≈0.25 of `jawOpen`), and flow across the opening
+mouth is unreliable, so the correction is applied only at intensity ≥ 0.75.
+`rig_report.json` → `expressions` has, per expression, the reprojection
+error before/after (typically 2-7 px → < 1 px), the intensity, whether it
+was applied, and the folds before/after repair.
 
 **Wrinkle maps** (`wrinkles.py`): each expression portrait is warped back onto
 the neutral one along a smoothed flow; the band-passed log-luminance change
@@ -241,9 +248,10 @@ Names are our own; the 51 expression controls are the LightRig canonical
 ## Limitations
 
 - Expression shapes are procedural fields scaled to the subject; with
-  expression portraits, the 12 imaged expressions are corrected from 2D flow
-  of generated (not captured) images: depth along the view axis and the lip
-  margins stay procedural, and the other controls stay procedural.
+  expression portraits, 11 imaged expressions are corrected from 2D flow
+  of generated (not captured) images (jaw open only when the image opens it
+  fully): depth along the view axis, the lip margins and the other controls
+  stay procedural.
 - Wrinkle maps are shading-derived normal detail from one view (front-facing
   skin only); nostril rims and lids may show small artefacts.
 - Ears and nostrils are smoothed by the template fit (their detail survives

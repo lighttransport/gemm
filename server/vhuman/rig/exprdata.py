@@ -197,6 +197,14 @@ def rigid_drift(px0: np.ndarray, target: np.ndarray, stable: np.ndarray):
     return lambda p: s * p @ R.T + t
 
 
+FOLD_AREA = 0.1          # fold: projected area below this share of the procedural pose's
+FOLD_ROUNDS = 8
+FOLD_SPREAD = 6          # rings of falloff around a fold
+DEBUG = False
+MIN_INTENSITY = 0.75
+INTENSITIES = (0.25, 0.35, 0.45, 0.55, 0.65, 0.75, 0.85, 1.0)   # joint-driven expressions
+
+
 def fit(tmpl, pos, subj, feat, shapes: dict, rig_def: dict, skel: dict, joints, weights, folder: Path,
         iters: int = 500, log=print, smooth: float = 40.0) -> tuple[dict, dict]:
     """Refine `shapes` from the expression portraits in folder. Returns the new
@@ -205,6 +213,7 @@ def fit(tmpl, pos, subj, feat, shapes: dict, rig_def: dict, skel: dict, joints, 
     import torch
     from ..head.camera import PixalCamera
     from .common import edges, vertex_normals
+    from . import template as T
     from .torchrig import TorchRig
     manifest = json.loads((folder / "manifest.json").read_text())
     dev = "cuda" if torch.cuda.is_available() else "cpu"
@@ -227,6 +236,9 @@ def fit(tmpl, pos, subj, feat, shapes: dict, rig_def: dict, skel: dict, joints, 
         nbrs[a].append(b)
         nbrs[b].append(a)
     new = {k: v.copy() for k, v in shapes.items()}
+    adj = torch.sparse_coo_tensor(torch.tensor(np.concatenate([E, E[:, ::-1]]).T.copy(), device=dev),
+                                  torch.ones(2 * len(E), device=dev), (V, V)).coalesce()
+    deg = torch.sparse.sum(adj, 1).to_dense().clamp(min=1)
     report = {}
     side_left = np.clip(0.5 + pos[:, 0] / 0.012, 0, 1)
     for name, spec in manifest["expressions"].items():
@@ -253,7 +265,9 @@ def fit(tmpl, pos, subj, feat, shapes: dict, rig_def: dict, skel: dict, joints, 
             for i in np.flatnonzero(region):
                 grow[nbrs[i]] = True
             region = grow
-        region &= np.isin(tmpl.kind, [0, 1, 2, 3])
+        # the lid linings and the mouth bag have no data but must follow the skin
+        # (smoothness carries them); else a moved lip corner uncovers the bag
+        region &= tmpl.kind != T.KIND["cap"]
         tr = TorchRig(rig_def, pos, shapes, joints, weights, device=dev)
         x = torch.zeros(1, len(tr.controls), device=dev)
         for c, w in controls.items():
@@ -269,12 +283,34 @@ def fit(tmpl, pos, subj, feat, shapes: dict, rig_def: dict, skel: dict, joints, 
         reg = torch.tensor(region, device=dev)[:, None]
         delta = torch.zeros(V, 3, device=dev, requires_grad=True)
         opt = torch.optim.Adam([delta], lr=2e-4)
+        # folds: skin triangles whose area projected on the procedural pose's
+        # normal falls below FOLD_AREA of the procedural area (flipped or crushed)
+        ftri = torch.tensor(tmpl.tris[skin_t][region[tmpl.tris[skin_t]].any(1)], device=dev)
+
+        def tri_a(p):                    # area vectors (2 x area along the normal)
+            return torch.cross(p[ftri[:, 1]] - p[ftri[:, 0]], p[ftri[:, 2]] - p[ftri[:, 0]], dim=-1)
+        # joint-driven expressions: the image may show a smaller or larger joint
+        # motion than the control at 1; find that intensity first (grid), fit the
+        # remaining correction there and scale it back to the control's range
+        intensity = 1.0
+        if joint_driven:
+            with torch.no_grad():
+                errs = {k: float(((proj(tr(x * k)["pos"][0]) - tgt).norm(dim=-1) * cw).sum() / cw.sum().clamp(min=1))
+                        for k in INTENSITIES}
+            intensity = min(errs, key=errs.get)
+            x = x * intensity
         with torch.no_grad():
-            px_proc = proj(tr(x)["pos"][0])
+            p_proc = tr(x)["pos"][0]
+            px_proc = proj(p_proc)
             err0 = float(((px_proc - tgt).norm(dim=-1) * cw).sum() / cw.sum().clamp(min=1))
+            a_proc = tri_a(p_proc)
+            s_proc = a_proc.norm(dim=-1)
+            n_proc = a_proc / s_proc[:, None].clamp(min=1e-12)
+            ok_t = s_proc > 0.05 * s_proc.median()          # degenerate triangles: not judged
         for it in range(iters):
             d = delta * reg
-            px = proj(tr(x, pre=d[None])["pos"][0])
+            p = tr(x, pre=d[None])["pos"][0]
+            px = proj(p)
             e_px = (((px - tgt) ** 2).sum(-1) * cw).sum() / cw.sum().clamp(min=1)
             lap = d[ei] - d[ej]
             e_s = (lap ** 2).sum(-1).mean() * 1e6 * smooth
@@ -285,8 +321,28 @@ def fit(tmpl, pos, subj, feat, shapes: dict, rig_def: dict, skel: dict, joints, 
             loss.backward()
             opt.step()
         with torch.no_grad():
-            d = (delta * reg).cpu().numpy().astype(np.float64)
-            px_fit = proj(tr(x, pre=(delta * reg)[None])["pos"][0])
+            # fold repair: shrink the correction around folded triangles (grown
+            # 2 rings, halved per round) until no new folds remain
+            dd = delta * reg
+            atten = torch.ones(V, device=dev)
+            folds0 = None
+            for r in range(FOLD_ROUNDS + 1):
+                p = tr(x, pre=(dd * atten[:, None])[None])["pos"][0]
+                bad = ok_t & ((tri_a(p) * n_proc).sum(-1) < FOLD_AREA * s_proc)
+                folds0 = int(bad.sum()) if folds0 is None else folds0
+                if DEBUG:
+                    print(name, "fold round", r, int(bad.sum()))
+                if not bad.any() or r == FOLD_ROUNDS:
+                    break
+                m = torch.zeros(V, device=dev)
+                m[ftri[bad].flatten()] = 1.0
+                for _ in range(FOLD_SPREAD):             # smooth falloff: no step for new folds
+                    m = torch.maximum(m, (adj @ m[:, None])[:, 0] / deg)
+                m = torch.clamp(m, 0, 1)
+                atten = atten * (1 - (0.5 if r < FOLD_ROUNDS - 1 else 1.0) * m)   # last round: remove
+            folds1 = int(bad.sum())
+            d = (dd * atten[:, None]).cpu().numpy().astype(np.float64)
+            px_fit = proj(tr(x, pre=(dd * atten[:, None])[None])["pos"][0])
             err1 = float(((px_fit - tgt).norm(dim=-1) * cw).sum() / cw.sum().clamp(min=1))
         # split the correction over the controls (their procedural share; sides for L/R)
         shares = {}
@@ -296,11 +352,16 @@ def fit(tmpl, pos, subj, feat, shapes: dict, rig_def: dict, skel: dict, joints, 
             side = side_left if c.endswith("Left") else (1 - side_left) if c.endswith("Right") else np.ones(V)
             shares[c] = w * (np.linalg.norm(shapes[c], axis=1) + 1e-5 * side)
         tot = sum(shares.values()) if shares else None
+        # a partial joint motion says little about the control's full range (the
+        # correction would be extrapolated); open-mouth flow is unreliable anyway
+        skipped = joint_driven and intensity < MIN_INTENSITY
+        if skipped:
+            tot = None
         if tot is not None:
             for c, s in shares.items():
-                new[c] = new[c] + d * (s / np.maximum(tot, 1e-12))[:, None] / controls[c]
-        report[name] = {"controls": controls, "px_error_procedural": round(err0, 3), "px_error_fitted": round(err1, 3),
-                        "vertices": int(region.sum()), "confident": int((c_v * region > 0.5).sum()),
+                new[c] = new[c] + d * (s / np.maximum(tot, 1e-12))[:, None] / (controls[c] * intensity)
+        report[name] = {"controls": controls, "intensity": intensity, "applied": not skipped, "px_error_procedural": round(err0, 3), "px_error_fitted": round(err1, 3),
+                        "folds_repaired": [folds0, folds1], "vertices": int(region.sum()), "confident": int((c_v * region > 0.5).sum()),
                         "max_correction_mm": round(float(np.linalg.norm(d, axis=1).max() * 1000), 2),
                         "seconds": round(time.perf_counter() - t0, 1)}
         if log:
