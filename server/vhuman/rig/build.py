@@ -104,9 +104,113 @@ STAGES = {"features": .04, "register": .08, "fit_cache": .2, "skeleton_weights":
           "deformer": .25, "bake": .5, "assemble": .72, "gltf": .76, "usd": .8, "preview": .86}
 
 
+def head_parts(parts_t, pos, shapes, Jn, W) -> list[ExportPart]:
+    """Skin and mouth-interior export parts of a (LOD) template with its shapes."""
+    out = []
+    for p in parts_t:
+        tris_w = p.vmap[p.tris]
+        dn = _shape_normals(pos, tris_w, {k: v for k, v in shapes.items() if not k.startswith("ml_")}, p.vmap)
+        sh = {}
+        for name, d in shapes.items():
+            dv = d[p.vmap]
+            idx = np.flatnonzero(np.linalg.norm(dv, axis=1) > 2e-6)
+            if len(idx):
+                # ML components are sub-millimetre: their normal deltas are not worth the bytes
+                sh[name] = (idx, dv[idx], None if name.startswith("ml_") else dn[name][idx])
+        out.append(ExportPart(f"head_{p.name}", p.material, pos[p.vmap], p.normals, p.uv, p.tangents, p.tris,
+                              Jn[p.vmap], W[p.vmap], sh))
+    return out
+
+
+def carried_materials(carried, subj) -> dict:
+    materials = {}
+    for c in carried:
+        imgs = {}
+
+        def grab(o):
+            if isinstance(o, dict):
+                for k2, v in o.items():
+                    if k2.endswith("Texture") and isinstance(v, dict) and "index" in v:
+                        src = subj.glb.doc["textures"][v["index"]]["source"]
+                        view = subj.glb.doc["bufferViews"][subj.glb.doc["images"][src]["bufferView"]]
+                        st = view.get("byteOffset", 0)
+                        imgs[v["index"]] = bytes(subj.glb.bin[st:st + view["byteLength"]])
+                    else:
+                        grab(v)
+            elif isinstance(o, list):
+                for x in o:
+                    grab(x)
+        grab(c.material)
+        materials[f"carried_{c.name}"] = {"gltf": c.material, "images": imgs}
+    return materials
+
+
+def carried_parts(carried, pos, skin_tris, Jn, W, shapes, jidx) -> list[ExportPart]:
+    """Eyeballs rigid on the eye joints; eye-edge meshes wrap-bound to the skin."""
+    out = []
+    for c in carried:
+        n = len(c.positions)
+        sh = {}
+        if c.joint:
+            J = np.zeros((n, 4), np.int64)
+            J[:, 0] = jidx[c.joint]
+            Wc = np.zeros((n, 4))
+            Wc[:, 0] = 1
+        else:
+            tb, bb, dist = attach.bind_wrap(c.positions, pos, skin_tris)
+            J, Wc, dd = attach.wrap_data((tb, bb), skin_tris, Jn, W, shapes)
+            for name, d in dd.items():
+                idx = np.flatnonzero(np.linalg.norm(d, axis=1) > 2e-6)
+                if len(idx):
+                    sh[name] = (idx, d[idx], None)
+        tan = compute_tangents(c.positions, c.normals, c.uv, c.tris).astype(np.float64) \
+            if "normalTexture" in c.material else None
+        out.append(ExportPart(c.name, f"carried_{c.name}", c.positions, c.normals, c.uv, tan, c.tris, J, Wc, sh))
+    return out
+
+
+def export_lods(levels, tmpl, pos, shapes, Jn, W, contacts_viz, mouth_parts, carried, jidx, asset, out, subj,
+                cache_dir, log=print) -> dict:
+    """LOD k assets from LOD0's rig data (lod.py): rig_lod<k>.glb, rig_lod<k>.usda,
+    rig_deformer_lod<k>.safetensors, viz_lod<k>.json (rig.json is shared)."""
+    from . import lod, native
+    from .contacts import graph
+    report = {}
+    for lv in levels:
+        t0 = time.perf_counter()
+        tl = lod.get(lv, cache_dir)
+        idx, w = lod.mapping(tmpl, tl, lv)
+        tl = lod.snap_uvs(tmpl, tl, idx, w)
+        pos_l = lod.apply(idx, w, pos)
+        W_l = lod.apply(idx, w, W)
+        W_l /= np.maximum(W_l.sum(1, keepdims=True), 1e-12)
+        Jn_l = Jn[idx[:, 0]]
+        shapes_l = {k: lod.apply(idx, w, d) for k, d in shapes.items()}
+        parts_t = meshes.unweld(tl, pos_l)
+        parts = head_parts(parts_t, pos_l, shapes_l, Jn_l, W_l) + list(mouth_parts)
+        parts += carried_parts(carried, pos_l, tl.tris[tl.tri_mat == 0], Jn_l, W_l, shapes_l, jidx)
+        a = RigAsset(asset.skeleton, parts, asset.materials, asset.rig, asset.info)
+        cv = lod.contacts_viz(contacts_viz, idx, w, tl.tris) if contacts_viz else None
+        viz = {"parts": {f"head_{p.name}": {"vmap": p.vmap.tolist()} for p in parts_t}, "contacts": cv,
+               "welded_vertices": int(len(pos_l)), "lod": lv}
+        (out / f"viz_lod{lv}.json").write_text(json.dumps(viz, separators=(",", ":"),
+                                                          default=lambda o: o.tolist() if hasattr(o, "tolist") else str(o)))
+        pk = native.write_package(out / f"rig_deformer_lod{lv}.safetensors", asset.rig, pos_l, shapes_l, Jn_l, W_l,
+                                  asset.info.get("ml"), contacts_viz=cv)
+        g = gltf.write(a, out / f"rig_lod{lv}.glb")
+        u = usd.write(a, out, subj, name=f"rig_lod{lv}.usda")
+        report[lv] = {"vertices": int(tl.n), "triangles": int(len(tl.tris)), "glb_bytes": g["bytes"],
+                      "usd_bytes": u["bytes"], "package_bytes": pk["bytes"],
+                      "seconds": round(time.perf_counter() - t0, 1)}
+        if log:
+            log(f"LOD{lv}: {report[lv]}")
+    del graph
+    return report
+
+
 def assemble(folder, out_dir=None, res: int = 2048, iters: int = 600, log=print, cache_dir=None,
              reuse_fit: bool = False, preview: bool = True, keep_asset: bool = False, progress=None,
-             deformer_samples: int = 4096) -> dict:
+             deformer_samples: int = 4096, lods=(1, 2)) -> dict:
     t0 = time.perf_counter()
     folder = Path(folder)
     out = Path(out_dir) if out_dir else folder / "rig"
@@ -151,6 +255,12 @@ def assemble(folder, out_dir=None, res: int = 2048, iters: int = 600, log=print,
     Jn, W, skin_info = skinning.weights(tmpl, pos, F, skel)
     t = lap("skeleton_weights", t)
     shapes = expressions.build(F, skel, (Jn, W))
+    expr_dir = out / "expressions"
+    expr_report = None
+    if (expr_dir / "manifest.json").exists():             # the subject's own expressions (exprdata.py)
+        from . import exprdata
+        shapes, expr_report = exprdata.fit(tmpl, pos, subj, feat, shapes, rig_definition(skel, sorted(shapes)),
+                                           skel, Jn, W, expr_dir, log=log)
     t = lap("shapes", t)
     ml, ml_stats, contacts_viz = None, None, None
     if deformer_samples:
@@ -162,68 +272,27 @@ def assemble(folder, out_dir=None, res: int = 2048, iters: int = 600, log=print,
     parts_t = meshes.unweld(tmpl, pos)
     lining_rgb = tuple(subj.fit.get("fit", {}).get("lining", {}).get("srgb", (150, 100, 85)))
     baked = bake.bake(tmpl, parts_t[0], pos, subj, out, res=res, lining_srgb=lining_rgb, log=log)
+    wrinkle_maps = None
+    if (expr_dir / "manifest.json").exists():
+        from . import wrinkles
+        brow_y = float(np.mean([b[:, 1].mean() for b in feat.brows]))
+        wrinkle_maps = wrinkles.bake(tmpl, parts_t[0], pos, subj, expr_dir, out, res=min(res, 2048), log=log,
+                                     brow_y=brow_y)
     t = lap("bake", t)
     # ---- parts ---------------------------------------------------------------------------
-    parts: list[ExportPart] = []
-    for p in parts_t:
-        tris_w = p.vmap[p.tris]
-        dn = _shape_normals(pos, tris_w, {k: v for k, v in shapes.items() if not k.startswith("ml_")}, p.vmap)
-        sh = {}
-        for name, d in shapes.items():
-            dv = d[p.vmap]
-            idx = np.flatnonzero(np.linalg.norm(dv, axis=1) > 2e-6)
-            if len(idx):
-                # ML components are sub-millimetre: their normal deltas are not worth the bytes
-                sh[name] = (idx, dv[idx], None if name.startswith("ml_") else dn[name][idx])
-        parts.append(ExportPart(f"head_{p.name}", p.material, pos[p.vmap], p.normals, p.uv, p.tangents, p.tris,
-                                Jn[p.vmap], W[p.vmap], sh))
+    parts: list[ExportPart] = head_parts(parts_t, pos, shapes, Jn, W)
+    mouth_parts = []
     for pm in (*mouthparts.teeth(skel, True, skel["scale"], jidx), *mouthparts.teeth(skel, False, skel["scale"], jidx),
                mouthparts.tongue(skel, skel["scale"], jidx)):
         nrm = vertex_normals(pm.positions, pm.tris)
         uv = np.zeros((len(pm.positions), 2))
-        parts.append(ExportPart(pm.name, pm.material, pm.positions, nrm, uv, None, pm.tris, pm.joints, pm.weights))
+        mouth_parts.append(ExportPart(pm.name, pm.material, pm.positions, nrm, uv, None, pm.tris, pm.joints,
+                                      pm.weights))
+    parts += mouth_parts
     # carried eye meshes
     carried = attach.collect(subj.glb, subj.frame)
-    skin_tris = tmpl.tris[tmpl.tri_mat == 0]
-    materials = {}
-    for c in carried:
-        key = f"carried_{c.name}"
-        imgs = {}
-
-        def grab(o):
-            if isinstance(o, dict):
-                for k2, v in o.items():
-                    if k2.endswith("Texture") and isinstance(v, dict) and "index" in v:
-                        src = subj.glb.doc["textures"][v["index"]]["source"]
-                        view = subj.glb.doc["bufferViews"][subj.glb.doc["images"][src]["bufferView"]]
-                        st = view.get("byteOffset", 0)
-                        imgs[v["index"]] = bytes(subj.glb.bin[st:st + view["byteLength"]])
-                    else:
-                        grab(v)
-            elif isinstance(o, list):
-                for x in o:
-                    grab(x)
-        grab(c.material)
-        materials[key] = {"gltf": c.material, "images": imgs}
-        n = len(c.positions)
-        if c.joint:
-            J = np.zeros((n, 4), np.int64)
-            J[:, 0] = jidx[c.joint]
-            Wc = np.zeros((n, 4))
-            Wc[:, 0] = 1
-            sh = {}
-        else:
-            tb, bb, dist = attach.bind_wrap(c.positions, pos, skin_tris)
-            Jv, Wc, dd = attach.wrap_data((tb, bb), skin_tris, Jn, W, shapes)
-            J = Jv
-            sh = {}
-            for name, d in dd.items():
-                idx = np.flatnonzero(np.linalg.norm(d, axis=1) > 2e-6)
-                if len(idx):
-                    sh[name] = (idx, d[idx], None)
-        tan = compute_tangents(c.positions, c.normals, c.uv, c.tris).astype(np.float64) \
-            if "normalTexture" in c.material else None
-        parts.append(ExportPart(c.name, key, c.positions, c.normals, c.uv, tan, c.tris, J, Wc, sh))
+    materials = carried_materials(carried, subj)
+    parts += carried_parts(carried, pos, tmpl.tris[tmpl.tri_mat == 0], Jn, W, shapes, jidx)
     # ---- materials ------------------------------------------------------------------------
     rd = {k: Path(v).read_bytes() for k, v in baked["files"].items()}
     materials["skin"] = {"gltf": {"name": "skin", "pbrMetallicRoughness": {
@@ -243,6 +312,8 @@ def assemble(folder, out_dir=None, res: int = 2048, iters: int = 600, log=print,
         "baseColorFactor": [0.68, 0.28, 0.29, 1.0], "metallicFactor": 0.0, "roughnessFactor": 0.45}}}
     shape_names = sorted({n for p in parts for n in p.shapes})
     rig = rig_definition(skel, shape_names)
+    if wrinkle_maps:
+        rig["wrinkles"] = wrinkle_maps
     if ml is not None:
         rig["ml_deformer"] = {"model": "deformer.lrm", "basis": "deformer_basis.safetensors",
                               "targets": ml.target_names(), "inputs": ml.inputs,
@@ -267,6 +338,8 @@ def assemble(folder, out_dir=None, res: int = 2048, iters: int = 600, log=print,
     glb_stats = gltf.write(asset, out / "rig.glb")
     t = lap("gltf", t)
     usd_stats = usd.write(asset, out, subj)
+    lod_report = export_lods(lods, tmpl, pos, shapes, Jn, W, contacts_viz, mouth_parts, carried, jidx, asset, out,
+                             subj, cache_dir, log=log) if lods else {}
     usd_stats["zip"] = usd.package(out)
     t = lap("usd", t)
     prev = preview_sheet(asset, out / "preview.png") if preview else []
@@ -274,7 +347,8 @@ def assemble(folder, out_dir=None, res: int = 2048, iters: int = 600, log=print,
     report = {"version": VERSION, "head": folder.name, "template": tmpl.info, "features": feat.info,
               "register": fit["stats"], "skin": skin_info, "bake": baked["stats"], "gltf": glb_stats,
               "usd": usd_stats, "shapes": len(rig["blendshapes"]), "controls": len(rig["controls"]),
-              "deformer": ml_stats, "native_package": native_stats,
+              "deformer": ml_stats, "native_package": native_stats, "expressions": expr_report,
+              "wrinkles": [m["name"] for m in (wrinkle_maps or {}).get("maps", [])], "lods": lod_report,
               "joints": names, "timings": timings, "seconds": round(time.perf_counter() - t0, 2),
               "preview": prev}
     (out / "rig_report.json").write_text(json.dumps(report, indent=1, default=float))
@@ -390,6 +464,7 @@ def main(argv=None):
     ap.add_argument("--no-preview", action="store_true")
     ap.add_argument("--keep-asset", action="store_true", help="also pickle the assembled asset (debugging)")
     ap.add_argument("--progress", action="store_true", help="print '@progress <fraction> <message>' lines")
+    ap.add_argument("--lods", default="1,2", help="LOD levels to export besides LOD0 (comma list, '' for none)")
     ap.add_argument("--deformer-samples", type=int, default=4096,
                     help="ground-truth samples for the ML corrective deformer (0: no deformer)")
     a = ap.parse_args(argv)
@@ -401,6 +476,7 @@ def main(argv=None):
     rep = assemble(a.head, a.out, a.res, a.iters, cache_dir=a.cache, reuse_fit=a.reuse_fit,
                    preview=not a.no_preview, keep_asset=a.keep_asset, progress=prog,
                    deformer_samples=a.deformer_samples,
+                   lods=tuple(int(x) for x in a.lods.split(",") if x.strip()),
                    log=(lambda m: print(m, flush=True)))
     print(json.dumps({k: rep[k] for k in ("seconds", "timings", "shapes", "controls", "register", "bake")},
                      default=float))

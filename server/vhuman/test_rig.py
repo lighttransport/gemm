@@ -302,6 +302,33 @@ class RigEndToEndTests(unittest.TestCase):
         vmax = max(max(p["vmap"]) for p in viz["parts"].values())
         self.assertLess(vmax, viz["welded_vertices"])
 
+    def test_expressions_and_wrinkles(self):
+        ex = self.summary["expressions"]
+        self.assertEqual(set(ex), {"smile", "brows_up"})
+        for rec in ex.values():
+            self.assertLessEqual(rec["px_error_fitted"], rec["px_error_procedural"] + 1e-6)
+        self.assertEqual(sorted(self.summary["wrinkles"]), ["brow_up", "smile"])
+        rig = json.loads((self.rig_dir / "rig.json").read_text())
+        maps = {m["name"]: m for m in rig["wrinkles"]["maps"]}
+        self.assertIn("mouthSmileLeft", maps["smile"]["drivers"])
+        from PIL import Image
+        img = np.asarray(Image.open(self.rig_dir / maps["brow_up"]["file"]))
+        self.assertEqual(img.shape[2], 3)
+        self.assertLess(abs(float(np.median(img[..., 0])) - 128), 2)       # mostly flat
+
+    def test_lods(self):
+        self.assertEqual(sorted(int(k) for k in self.summary["lods"]), [1, 2])
+        prev = self.summary["template"]["vertices"]
+        for lv in ("1", "2"):
+            inv = self.summary["lod_templates"][lv]
+            self.assertEqual(inv["nonmanifold_edges"], 0)
+            self.assertEqual(inv["boundary_edges"], inv["expected_boundary"])
+            self.assertTrue(inv["exact_ring_mapping"])
+            self.assertLess(inv["vertices"], prev)
+            prev = inv["vertices"]
+            for f in (f"rig_lod{lv}.glb", f"rig_lod{lv}.usda", f"rig_deformer_lod{lv}.safetensors", f"viz_lod{lv}.json"):
+                self.assertIn(f, self.summary["files"])
+
     def test_usd_layer(self):
         text = (self.rig_dir / "rig.usda").read_text()
         self.assertTrue(text.startswith("#usda 1.0"))

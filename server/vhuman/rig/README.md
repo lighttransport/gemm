@@ -137,6 +137,46 @@ The viewer evaluates the ~1.1k contact vertices on the CPU (three.js
 (inverse blended rotation) and feeds it through a `contactOffset` attribute
 that the materials add right after the morph targets (~15 ms per update in JS).
 
+## Subject expressions, wrinkle maps, LODs
+
+**Expression portraits** (`exprdata.py`, job kind `expressions`): Qwen-Image
+2.1 edits the neutral portrait into 12 expressions (smile, brows up/down,
+sneer, squint, frown, pucker, funnel, stretch, press, cheek puff, jaw open;
+`preset` `low8` by default) under `<head>/rig/expressions/` with a
+`manifest.json`. Run it before the rig job:
+
+```sh
+curl -XPOST localhost:8790/v1/jobs -d '{"kind":"expressions","head_id":"<id>"}'
+```
+
+When `expressions/manifest.json` exists, the rig build fits **data-driven
+shapes**: dense optical flow (OpenCV DIS, rigid drift removed with a
+similarity fit) between the neutral and expression portraits is the 2D
+target; the procedural shape of the expression's controls is corrected by a
+pre-skinning delta (PyTorch, through the portrait camera) with a Laplacian
+smoothness term, a weak view-axis term and the lip margins excluded. The
+correction is split over the expression's primary controls by their
+procedural magnitude and side. `rig_report.json` → `expressions` has the
+reprojection error before/after per expression (typically 4-18 px → < 1 px).
+
+**Wrinkle maps** (`wrinkles.py`): each expression portrait is warped back onto
+the neutral one along a smoothed flow; the band-passed log-luminance change
+(capped against the fine-flow warp, so moving features do not leave edges)
+is read as a height field, and its slope is baked into the skin atlas in
+tangent space. Groups `brow_up`, `brow_down`, `smile`, `mouth` → `wm_<group>.png`
+(RG = 0.5 + 0.5 slope, flat 128). `rig.json` → `wrinkles` lists the maps
+with driver controls; the viewer adds them to the normal map per face side
+("wrinkles" toggle).
+
+**LODs** (`lod.py`): LOD1 (≈3.7k) and LOD2 (≈1.4k vertices, vs ≈13k) templates are built
+from coarser layouts (ring subsets, divisor sample counts, wider spacing);
+ring vertices map exactly onto LOD0 vertices, free vertices by barycentrics
+in LOD0's chart, so skin weights, shapes, ML targets and contact sets
+transfer and every LOD shares `rig.json` and the texture atlas. Outputs
+`rig_lod{1,2}.glb/.usda`, `rig_deformer_lod{1,2}.safetensors`,
+`viz_lod{1,2}.json`; the viewer's LOD selector switches meshes (`--lods` in
+`build.py`; head only, no body).
+
 ## Inspection (web viewer)
 
 `/rig` → Inspect:
@@ -195,12 +235,17 @@ Names are our own; the 51 expression controls are the LightRig canonical
 - LightRig and LightUSD (Apache-2.0) are external tools, cloned by
   `external.sh` into `third_party/` (ignored by Git), never vendored.
 - Generated assets inherit the terms of their inputs (Qwen-Image output,
-  Pixal3D reconstruction); they stay in the local work directory.
+  Pixal3D reconstruction, Qwen-Image expression edits); they stay in the
+  local work directory.
 
 ## Limitations
 
-- Expression shapes are procedural fields scaled to the subject, not solved
-  from captured performances; wrinkles and wrinkle maps are not modelled.
+- Expression shapes are procedural fields scaled to the subject; with
+  expression portraits, the 12 imaged expressions are corrected from 2D flow
+  of generated (not captured) images: depth along the view axis and the lip
+  margins stay procedural, and the other controls stay procedural.
+- Wrinkle maps are shading-derived normal detail from one view (front-facing
+  skin only); nostril rims and lids may show small artefacts.
 - Ears and nostrils are smoothed by the template fit (their detail survives
   in the baked normal map only). The template has no separate eyelashes.
 - The mouth interior, teeth and tongue are generic; nothing is inferred from

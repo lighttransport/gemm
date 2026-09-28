@@ -105,6 +105,8 @@ a.dl{color:var(--accent);margin-right:12px;font-size:13px;display:inline-block}
       <label><input type="checkbox" id="wire"> wireframe</label>
       <label><input type="checkbox" id="bones"> skeleton</label>
       <label title="learned corrective deformer (contacts with eyeballs, teeth and lips; soft-tissue relaxation)"><input type="checkbox" id="ml" checked> ML deformer</label>
+      <label title="expression wrinkle maps (from the subject's expression portraits) blended into the skin normals"><input type="checkbox" id="wrinkles" checked> wrinkles</label>
+      <label title="level of detail: LOD0 12.6k, LOD1 ~3.7k, LOD2 ~1.4k head vertices; all driven by the same rig">LOD <select id="lod" style="width:auto"><option value="0">0</option><option value="1">1</option><option value="2">2</option></select></label>
       <label title="post-skinning contact projection: lids outside the eyeballs, lips outside teeth and tongue, upper lip above the lower (exact)"><input type="checkbox" id="exact" checked> exact contacts</label>
       <label title="random blinks"><input type="checkbox" id="auto-blink" checked> auto blink</label>
       <label title="eyes (and a little of the head) follow the pointer over the viewer"><input type="checkbox" id="look-at"> look at pointer</label>
@@ -376,6 +378,7 @@ function applyRig() {
     const dict = mesh.morphTargetDictionary;
     for (const [name, i] of Object.entries(dict)) mesh.morphTargetInfluences[i] = ev.weights[name] || 0;
   }
+  wrinkleWeights(effectiveValues());
   dirty = true;
   if (state.exact) projectContacts();
   if (typeof updateHeat === 'function' && $('viz').value !== 'shaded') updateHeat(false);
@@ -605,6 +608,47 @@ $('viz-range').addEventListener('input', () => updateHeat(true));
 $('joints').addEventListener('change', () => { updateJointMarkers(); dirty = true; });
 controls.addEventListener('change', updateJointMarkers);
 
+// ---- wrinkle maps (server/vhuman/rig/wrinkles.py) ------------------------------------------------
+// Tangent-space slope maps added to the skin's normal map, one per group, each
+// weighted by its driver controls for the texel's side of the face.
+function patchWrinkles(mat, W) {
+  const uni = { wmCenter: { value: W.def.u_center }, wmWidth: { value: W.def.side_width } };
+  W.maps.forEach((m, i) => { uni[`wmTex${i}`] = { value: m.tex }; uni[`wmW${i}`] = { value: new THREE.Vector2() }; });
+  W.uniforms = uni;
+  const prev = mat.onBeforeCompile;
+  mat.onBeforeCompile = (sh, r) => {
+    if (prev) prev(sh, r);
+    Object.assign(sh.uniforms, uni);
+    const decl = W.maps.map((_, i) => `uniform sampler2D wmTex${i}; uniform vec2 wmW${i};`).join('\n');
+    const sum = W.maps.map((_, i) => `s += mix(wmW${i}.y, wmW${i}.x, side) * (texture2D(wmTex${i}, uv).xy * 2.0 - 1.0);`).join('\n');
+    sh.fragmentShader = sh.fragmentShader.replace('#include <common>', `#include <common>
+uniform float wmCenter; uniform float wmWidth;
+${decl}
+vec2 wrinkleSlope(vec2 uv) {
+  float side = smoothstep(wmCenter - wmWidth, wmCenter + wmWidth, uv.x);   // 1: the subject's left
+  vec2 s = vec2(0.0);
+  ${sum}
+  return s;
+}`).replace('mapN.xy *= normalScale;', 'mapN.xy *= normalScale;\n\tmapN.xy += wrinkleSlope(vNormalMapUv);');
+  };
+  const key = mat.customProgramCacheKey ? mat.customProgramCacheKey() : '';
+  mat.customProgramCacheKey = () => key + '|wrinkles' + W.maps.length;
+  mat.needsUpdate = true;
+}
+function wrinkleWeights(values) {
+  const W = state.wrinkles;
+  if (!W || !W.uniforms) return;
+  const on = $('wrinkles').checked;
+  W.maps.forEach((m, i) => {
+    let L = 0, R = 0;
+    for (const [c, f] of Object.entries(m.drivers)) {
+      const v = Math.max(0, values[c] || 0) * f;
+      if (c.endsWith('Left')) L += v; else if (c.endsWith('Right')) R += v; else { L += v; R += v; }
+    }
+    W.uniforms[`wmW${i}`].value.set(on ? Math.min(1, L) : 0, on ? Math.min(1, R) : 0);
+  });
+}
+
 // ---- exact contacts: post-skinning projection (server/vhuman/rig/contacts.py) ------------------
 // The projection runs on the CPU for the contact vertices; its posed correction
 // goes back before skinning (inverse blended rotation) into a contactOffset
@@ -734,6 +778,8 @@ function projectContacts() {
   dirty = true;
 }
 $('exact').addEventListener('change', () => { projectContacts(); updateHeat(true); });
+$('wrinkles').addEventListener('change', () => applyRig());
+$('lod').addEventListener('change', () => { if (state.current?.rig) loadRig(state.current).then(() => applyRig()); });
 Object.assign(state, { applyRig: () => applyRig(), projectContacts, updateHeat });     // for tests and debugging
 
 // ---- animation ------------------------------------------------------------------------------
@@ -846,10 +892,14 @@ async function loadRig(h) {
   $('empty').hidden = false;
   $('empty').textContent = 'loading rig…';
   const base = `/v1/heads/${h.id}/rig/`;
-  const [def, gltf] = await Promise.all([api(base + 'rig.json'), loader.loadAsync(base + 'rig.glb')]);
+  const lod = +$('lod').value, suffix = lod ? `_lod${lod}` : '';
+  const hasLod = !lod || (h.rig?.lods || []).includes(lod);
+  const [def, gltf] = await Promise.all([api(base + 'rig.json'), loader.loadAsync(base + (hasLod ? `rig${suffix}.glb` : 'rig.glb'))]);
   if (gen !== loadGen) return;
   if (state.model) { scene.remove(state.model); state.model.traverse((o) => { o.geometry?.dispose(); }); }
   if (skelHelper) { scene.remove(skelHelper); skelHelper = null; }
+  state.exact = null;                                   // the previous mesh's contact state (other vertex ids)
+  state.wrinkles = null;
   state.model = gltf.scene;
   state.skeleton = null;
   state.bones = {};
@@ -870,7 +920,7 @@ async function loadRig(h) {
   skelHelper.visible = $('bones').checked;
   scene.add(skelHelper);
   gltf.scene.traverse((o) => { if (o.isSkinnedMesh && !state.skeleton) state.skeleton = o.skeleton; });
-  state.vizData = await fetch(base + 'viz.json').then((r) => (r.ok ? r.json() : null)).catch(() => null);
+  state.vizData = await fetch(base + (hasLod && lod ? `viz${suffix}.json` : 'viz.json')).then((r) => (r.ok ? r.json() : null)).catch(() => null);
   viz.ct = null;
   for (const el of viz.labels) el.remove();
   viz.labels = [];
@@ -891,9 +941,24 @@ async function loadRig(h) {
   applyRig();
   $('empty').hidden = true;
   setupContactOffsets();
+  state.wrinkles = null;
+  if (def.wrinkles?.maps?.length) {
+    const tl = new THREE.TextureLoader();
+    const maps = await Promise.all(def.wrinkles.maps.map(async (m) => {
+      const tex = await tl.loadAsync(base + m.file);
+      tex.flipY = false;                                  // glTF UVs (v down)
+      tex.colorSpace = THREE.NoColorSpace;
+      return Object.assign({ tex }, m);
+    }));
+    state.wrinkles = { def: def.wrinkles, maps };
+    gltf.scene.traverse((o) => { if (o.isMesh && o.name === 'head_skin') for (const mat of [].concat(o.material)) patchWrinkles(mat, state.wrinkles); });
+  }
+  $('wrinkles').disabled = !state.wrinkles;
   applyRig();
   updateHeat(true);
-  $('vlabel').textContent = `rig.glb · ${def.controls.length} controls · ${def.blendshapes.length} shapes · ${def.joints.length} joints`;
+  let nv = 0;
+  gltf.scene.traverse((o) => { if (o.isMesh && /^head_/.test(o.name)) nv += o.geometry.attributes.position.count; });
+  $('vlabel').textContent = `rig${hasLod ? suffix : ''}.glb · LOD${hasLod ? lod : 0} · ${nv} head vertices · ${def.controls.length} controls · ${def.blendshapes.length} shapes · ${def.joints.length} joints`;
   setView('front');
 }
 function showFacts(h) {

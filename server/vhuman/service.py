@@ -246,18 +246,19 @@ class EyeService:
                 "preview": "preview.png", "report": "rig_report.json"}
         urls = {k: f"{base}rig/{n}" for k, n in keys.items() if (folder / "rig" / n).is_file()}
         brief = {k: report.get(k) for k in ("version", "template", "register", "bake", "shapes", "controls",
-                                             "joints", "seconds", "deformer")}
-        return {"urls": urls, "report": brief}
+                                             "joints", "seconds", "deformer", "expressions", "wrinkles")}
+        brief["lods"] = sorted(int(k) for k in (report.get("lods") or {}))
+        return {"urls": urls, "report": brief, "lods": brief["lods"]}
 
     def rig_file(self, hid: str, name: str) -> Path:
         """A rig output: the fixed names of rig/job.py or textures/<name>.png."""
         from .rig.job import RIG_FILES
         if not (isinstance(hid, str) and hid.isalnum() and len(hid) <= 32):
             raise ServiceError("no such file")
-        ok = name in RIG_FILES or (name.startswith("textures/") and name.count("/") == 1
-                                   and name.endswith(".png") and all(c.isalnum() or c in "_-."
-                                                                     for c in name[len("textures/"):])
-                                   and ".." not in name)
+        folder, _, base = name.partition("/")
+        ok = name in RIG_FILES or (folder in ("textures", "expressions") and base.endswith(".png")
+                                   and "/" not in base and ".." not in base
+                                   and all(c.isalnum() or c in "_-." for c in base))
         if not ok:
             raise ServiceError("no such file")
         path = self.work / "heads" / hid / "rig" / name

@@ -25,7 +25,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -47,6 +47,34 @@ MOUTH_INNER = 6                 # wet lip, lip/gum fold, 4 cavity rings (then a 
 FACE_SPACING = 1.5              # chart mm (the thinned points end up ~1.4x apart)
 MOUTH_LENS_MM = 4.5             # half-height of the layout's open mouth
 BACK_SPACING = 4.5
+@dataclass(frozen=True)
+class Layout:
+    """Template resolution: ring sample counts, which of the LOD0 ring offsets
+    are kept, and the free points' spacing. LOD k's ring counts divide LOD0's
+    and its rings are a subset of LOD0's, so each LOD ring vertex has an
+    exact LOD0 counterpart (lod.py)."""
+    eye_n: int = 48
+    mouth_half: int = 32
+    neck_n: int = 48
+    eye_rings: tuple = tuple(range(8))
+    mouth_rings: tuple = tuple(range(9))
+    neck_rings: tuple = (0, 1)
+    face_spacing: float = 1.5
+    back_spacing: float = 4.5
+    mouth_lens_mm: float = 4.5            # the layout's open mouth (coarse LODs need a fatter lens)
+    neck_shrink: float = 1.0              # hole test polygon scale for the neck (coarse LODs: < 1)
+
+    @property
+    def mouth_n(self) -> int:
+        return 2 * self.mouth_half
+
+    def ring_mm(self) -> dict:
+        return {"eye": tuple(EYE_RING_MM[i] for i in self.eye_rings),
+                "mouth": tuple(MOUTH_RING_MM[i] for i in self.mouth_rings),
+                "neck": tuple(NECK_RING_MM[i] for i in self.neck_rings)}
+
+
+HOLE_SHRINK = 0.9
 KIND = {"free": 0, "eye": 1, "mouth": 2, "neck": 3, "eye_inner": 4, "mouth_inner": 5, "cap": 6}
 
 
@@ -147,21 +175,23 @@ def _almond(cx, cy, cz, half_w, up, down, medial_sign, n=EYE_N):
     return np.stack([x, y, z], 1)
 
 
-def canonical_features() -> dict:
+def canonical_features(layout: "Layout | None" = None) -> dict:
+    lay = layout or Layout()
     eyes = {}
     for side, sx in (("right", -1.0), ("left", 1.0)):
         # medial is towards the nose: -sx
-        eyes[side] = _almond(sx * 0.0345, 0.0, 0.006, 0.0125, 0.0055, 0.005, -sx)
-    j = np.linspace(-1, 1, MOUTH_HALF + 1)
+        eyes[side] = _almond(sx * 0.0345, 0.0, 0.006, 0.0125, 0.0055, 0.005, -sx, n=lay.eye_n)
+    j = np.linspace(-1, 1, lay.mouth_half + 1)
     seam_x = 0.031 * j
     seam = np.stack([seam_x, -0.0745 + 0.0015 * j ** 2, 0.048 - 0.015 * j ** 2], 1)
     # an open lens in the chart for the layout (the rings need room); subjects close it
     sc = chart_of_points(seam)
     sc[:, 1] = sc[:, 1].mean()           # a straight layout seam (the lips bulge forward)
-    lift = np.stack([0 * j, MOUTH_LENS_MM * np.sin((j + 1) * math.pi / 2) ** 0.7], 1)
+    lift = np.stack([0 * j, lay.mouth_lens_mm * np.sin((j + 1) * math.pi / 2) ** 0.7], 1)
     upper, lower = sc + lift, sc - lift
-    th = np.linspace(-math.pi, math.pi, NECK_N, endpoint=False) + math.pi / NECK_N
-    neck = np.stack([0.058 * np.sin(th), np.full(NECK_N, -0.153), -0.035 + 0.062 * np.cos(th)], 1)
+    nn = lay.neck_n
+    th = np.linspace(-math.pi, math.pi, nn, endpoint=False) + math.pi / nn
+    neck = np.stack([0.058 * np.sin(th), np.full(nn, -0.153), -0.035 + 0.062 * np.cos(th)], 1)
     pts = {"nose_tip": [0, -0.037, 0.073], "subnasale": [0, -0.058, 0.051], "sellion": [0, 0.0, 0.029],
            "glabella": [0, 0.011, 0.028], "pogonion": [0, -0.107, 0.057], "menton": [0, -0.121, 0.052],
            "crown": [0, 0.123, -0.07], "ear_right": [-0.099, -0.002, -0.078], "ear_left": [0.099, -0.002, -0.078]}
@@ -182,15 +212,17 @@ def _ccw(poly):
     return poly if signed_area(poly) > 0 else None
 
 
-def rings_chart(eye_loops: dict, mouth_chart: np.ndarray, neck_loop: np.ndarray, center=CENTER) -> dict:
+def rings_chart(eye_loops: dict, mouth_chart: np.ndarray, neck_loop: np.ndarray, center=CENTER,
+                ring_mm: dict | None = None) -> dict:
     """Chart positions of every ring vertex, from ring-0 loops: eyes and neck
     in 3D (head frame), the mouth already in the chart. Returns
     {name: (K, N, 2)}; outward offsets follow *_RING_MM."""
+    mm = ring_mm or Layout().ring_mm()
     out = {}
     for side, loop in eye_loops.items():
         c = chart_of_points(loop, center)
         sign = 1.0 if signed_area(c) > 0 else -1.0
-        out[f"eye_{side}"] = np.stack([offset_loop(c, d, sign) for d in EYE_RING_MM])
+        out[f"eye_{side}"] = np.stack([offset_loop(c, d, sign) for d in mm["eye"]])
     c = np.asarray(mouth_chart, np.float64)
     area = signed_area(c)
     if abs(area) < 1e-6:
@@ -199,11 +231,11 @@ def rings_chart(eye_loops: dict, mouth_chart: np.ndarray, neck_loop: np.ndarray,
         sign = -1.0
     else:
         sign = 1.0 if area > 0 else -1.0
-    out["mouth"] = np.stack([offset_loop(c, d, sign) for d in MOUTH_RING_MM])
+    out["mouth"] = np.stack([offset_loop(c, d, sign) for d in mm["mouth"]])
     c = chart_of_points(neck_loop, center)
     sign = 1.0 if signed_area(c) > 0 else -1.0
     # the neck's hole is the region inside ring 0: rings grow away from it
-    out["neck"] = np.stack([offset_loop(c, d, sign) for d in NECK_RING_MM])
+    out["neck"] = np.stack([offset_loop(c, d, sign) for d in mm["neck"]])
     return out
 
 
@@ -247,12 +279,12 @@ class Template:
                    rings=rings, info=json.loads(str(z["info"])))
 
 
-def _spacing(chart: np.ndarray) -> np.ndarray:
+def _spacing(chart: np.ndarray, face: float = FACE_SPACING, back: float = BACK_SPACING) -> np.ndarray:
     """Target vertex spacing (chart mm): fine on the face, coarse behind."""
     # face ellipse: from above the brows to under the chin, ear to ear-ish
     cx, cy, ax, ay = 0.0, -30.0, 72.0, 92.0
     q = np.hypot((chart[:, 0] - cx) / ax, (chart[:, 1] - cy) / ay)
-    return FACE_SPACING + (BACK_SPACING - FACE_SPACING) * smoothstep(1.0, 1.5, q)
+    return face + (back - face) * smoothstep(1.0, 1.5, q)
 
 
 def _fibonacci(n: int) -> np.ndarray:
@@ -314,12 +346,13 @@ def _hull_tris(dirs: np.ndarray) -> np.ndarray:
     return t
 
 
-def build(seed: int = 7) -> Template:
+def build(seed: int = 7, layout: Layout | None = None) -> Template:
     from scipy.spatial import cKDTree
+    lay = layout or Layout()
     rng = np.random.default_rng(seed)
-    cf = canonical_features()
+    cf = canonical_features(lay)
     loop = mouth_loop(cf["mouth_chart_upper"], cf["mouth_chart_lower"])
-    rc = rings_chart(cf["eyes"], loop, cf["neck"])
+    rc = rings_chart(cf["eyes"], loop, cf["neck"], ring_mm=lay.ring_mm())
     names = ["eye_right", "eye_left", "mouth", "neck"]
     ring_chart, ring_meta = [], []
     for g, name in enumerate(names):
@@ -334,7 +367,7 @@ def build(seed: int = 7) -> Template:
     # candidates, minus the ring patches (inside each feature's outermost ring)
     cands = _fibonacci(60000)
     cc = to_chart(cands)
-    sp = _spacing(cc)
+    sp = _spacing(cc, lay.face_spacing, lay.back_spacing)
     inside = np.zeros(len(cands), bool)
     for name in names:
         outer = rc[name][-1]
@@ -343,7 +376,7 @@ def build(seed: int = 7) -> Template:
             continue
         inside |= point_in_polygon(cc, outer)
     cands, sp = cands[~inside], sp[~inside]
-    ring_sp = _spacing(ring_chart)
+    ring_sp = _spacing(ring_chart, lay.face_spacing, lay.back_spacing)
     keep = _thin(cands, sp, ring_dirs, ring_sp, rng)
     free = cands[keep]
     dirs = np.concatenate([ring_dirs, free])
@@ -359,7 +392,15 @@ def build(seed: int = 7) -> Template:
         for g, name in enumerate(names):
             ring0 = (meta[:, 1] == g) & (meta[:, 2] == 0)
             bad |= ring0[t].all(1)
-            bad |= ring0[t].any(1) & point_in_polygon(cen, rc[name][0])
+            # (against ring 0 shrunk towards its centre: at a thin lens's tips an
+            # outer triangle's centroid can fall inside the lens itself)
+            poly = rc[name][0]
+            if name == "neck":              # large and convex: any triangle reaching well into it
+                inner = poly.mean(0) + lay.neck_shrink * (poly - poly.mean(0))
+                bad |= ring0[t].any(1) & point_in_polygon(cen, inner)
+            else:
+                inner = poly.mean(0) + HOLE_SHRINK * (poly - poly.mean(0))
+                bad |= (ring0[t].sum(1) >= 2) & point_in_polygon(cen, inner)
         return bad
 
     # relax the free points (a few Laplacian steps on the sphere), then triangulate
@@ -463,7 +504,7 @@ def build(seed: int = 7) -> Template:
     sample = np.concatenate(sample_l).astype(np.int64)
     tris = np.concatenate(new_tris)
     tri_mat = np.concatenate(new_mat)
-    uv, tri_uv = _uv_layout(chart, kind, group, ring, sample, tris, tri_mat)
+    uv, tri_uv = _uv_layout(chart, kind, group, ring, sample, tris, tri_mat, lay.mouth_n)
     t = Template(chart, kind, group, ring, sample, tris, tri_mat, uv, tri_uv, rings,
                  info={"version": VERSION, "seed": seed, "vertices": int(len(kind)), "triangles": int(len(tris)),
                        "skin_triangles": int((tri_mat == 0).sum()), "mouth_triangles": int((tri_mat == 1).sum())})
@@ -475,7 +516,7 @@ UV_FRONT = (0.37, 0.5, 0.36)     # centre u, v, radius
 UV_BACK = (0.86, 0.27, 0.135)
 
 
-def _uv_layout(chart, kind, group, ring, sample, tris, tri_mat):
+def _uv_layout(chart, kind, group, ring, sample, tris, tri_mat, mouth_n: int = MOUTH_N):
     """Face-vertex UVs: skin in two azimuthal charts (front about +Z, back
     about -Z, seam where the angle from +Z passes FRONT_MAX_DEG); the mouth
     interior in its own unit square (u around the ring, v with depth)."""
@@ -494,7 +535,7 @@ def _uv_layout(chart, kind, group, ring, sample, tris, tri_mat):
     tri_front |= inner_skin[tris].any(1)
     # mouth UVs: u = sample / N along the ring, v = depth
     mouth_v = np.clip(-ring / (MOUTH_INNER + 1), 0, 1)
-    uv_m = np.stack([sample / MOUTH_N, 0.05 + 0.9 * mouth_v], 1)
+    uv_m = np.stack([sample / mouth_n, 0.05 + 0.9 * mouth_v], 1)
     cap = kind == KIND["cap"]
     uv_m[cap] = [0.5, 0.95]
     uv = np.concatenate([uv_f, uv_b, uv_m])
@@ -504,7 +545,7 @@ def _uv_layout(chart, kind, group, ring, sample, tris, tri_mat):
     # the mouth ring wraps: the last quad column spans u = (N-1)/N .. 1
     tm = tri_uv[m] - 2 * V
     s = sample[tm]
-    wrap = (s.max(1) - s.min(1)) > MOUTH_N // 2
+    wrap = (s.max(1) - s.min(1)) > mouth_n // 2
     extra = []
     for ti in np.flatnonzero(wrap):
         row = tri_uv[m][ti].copy()

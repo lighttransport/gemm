@@ -1,6 +1,8 @@
 # Facial rig builder (server/vhuman/rig): registration and shape smoothing use
-# PyTorch (CUDA optional); scipy for the k-d trees and the spherical hull.
+# PyTorch (CUDA optional); scipy for the k-d trees and the spherical hull;
+# OpenCV for the expression portraits' optical flow (exprdata.py, wrinkles.py).
 numpy
+opencv-python-headless
 pillow
 scipy
 torch

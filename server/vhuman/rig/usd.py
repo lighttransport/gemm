@@ -127,7 +127,7 @@ def _material_usd(name, spec, tex_dir: Path, rel: str) -> str:
     return "\n".join(lines)
 
 
-def write(asset, out: Path, subj=None) -> dict:
+def write(asset, out: Path, subj=None, name: str = "rig.usda") -> dict:
     out = Path(out)
     tex_dir = out / "textures"
     tex_dir.mkdir(exist_ok=True)
@@ -222,7 +222,7 @@ def write(asset, out: Path, subj=None) -> dict:
         L.append(_material_usd(_ident(key), spec, tex_dir, "textures"))
     L += ["    }", "}", ""]
     text = "\n".join(L)
-    (out / "rig.usda").write_text(text)
+    (out / name).write_text(text)
     stats.update({"bytes": len(text), "rom_frames": len(frames), "rom_end": end, "vchar_controls": len(blend_only)})
     return stats
 
@@ -235,6 +235,8 @@ def package(out: Path) -> str:
     partial = out / "rig_usd.zip.partial"
     with zipfile.ZipFile(partial, "w", zipfile.ZIP_DEFLATED) as f:
         f.write(out / "rig.usda", "rig.usda")
+        for extra in sorted(out.glob("rig_lod*.usda")):
+            f.write(extra, extra.name)
         for extra in ("rig.json", "deformer.lrm", "deformer_basis.safetensors", "deformer.json"):
             if (out / extra).exists():
                 f.write(out / extra, extra)

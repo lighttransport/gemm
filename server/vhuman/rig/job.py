@@ -16,7 +16,10 @@ from ..service import ROOT
 DEFAULT_PYTHON = ROOT / "tmp/vhuman-rig-venv/bin/python"
 RIG_FILES = ("rig.glb", "rig.json", "rig.usda", "rig_usd.zip", "preview.png", "rig_report.json", "features.json",
              "rig_basecolor.png", "rig_normal.png", "rig_orm.png", "rig_mouth.png", "deformer.lrm",
-             "deformer_basis.safetensors", "deformer.json", "rig_deformer.safetensors", "viz.json")
+             "deformer_basis.safetensors", "deformer.json", "rig_deformer.safetensors", "viz.json", "wm_brow_up.png", "wm_brow_down.png",
+             "wm_smile.png", "wm_mouth.png", "expressions/manifest.json", "rig_lod1.glb", "rig_lod2.glb",
+             "rig_lod1.usda", "rig_lod2.usda", "rig_deformer_lod1.safetensors", "rig_deformer_lod2.safetensors",
+             "viz_lod1.json", "viz_lod2.json")
 MIN_FREE_MIB = 1536
 
 

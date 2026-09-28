@@ -42,7 +42,8 @@ def write_package(path, rig_def: dict, rest: np.ndarray, shapes: dict, joints: n
         t["corr.weight"] = np.array([c.get("weight", 1.0) for c in rig_def["correctives"]], np.float32)
     if ml is not None:
         deltas = ml.target_deltas()
-        morph += [deltas[n] for n in ml.target_names()]
+        # the ML targets as given in `shapes` when present (e.g. mapped to a LOD)
+        morph += [shapes[n] if n in shapes else deltas[n] for n in ml.target_names()]
         for k in ("fc1.weight", "fc1.bias", "fc2.weight", "fc2.bias", "input.mean", "input.scale",
                   "output.mean", "output.scale"):
             t[f"ml.{k}"] = ml.m[k]

@@ -23,7 +23,7 @@ Pixal3D demo server.
     GET  /v1/heads, /v1/heads/<id>/<file>           Qwen portrait -> Pixal3D head -> fitted eyes
     GET  /rig                       the facial rig page (web/vhuman_rig.html)
     GET  /v1/heads/<id>/rig/<file>  rig.glb, rig.json, rig.usda, rig_usd.zip, preview.png, textures/*.png
-    POST /v1/jobs                   {kind: plates|baseline|head|head_skin|rig, ...} -> {id}
+    POST /v1/jobs                   {kind: plates|baseline|head|head_skin|expressions|rig, ...} -> {id}
     GET  /v1/jobs, /v1/jobs/<id>    POST /v1/jobs/<id>/cancel
 """
 from __future__ import annotations
@@ -169,7 +169,7 @@ class App:
         self.service = EyeService(Path(args.work))
         from . import qwen, baseline
         from .head import pipeline as head_pipeline
-        from .rig import job as rig_job
+        from .rig import exprdata, job as rig_job
         self.rig_job = rig_job
         self.gpu = gpu
         self.qwen_opts = {"python": args.qwen_python, "mock": args.mock}
@@ -180,6 +180,8 @@ class App:
             "head": lambda req, prog, cancel: head_pipeline.head_job(self.service, req, prog, cancel,
                                                                      python=args.qwen_python, mock=args.mock),
             "head_skin": lambda req, prog, cancel: head_pipeline.skin_job(self.service, req, prog, cancel),
+            "expressions": lambda req, prog, cancel: exprdata.expressions_job(self.service, req, prog, cancel,
+                                                                              python=args.qwen_python, mock=args.mock),
             "rig": lambda req, prog, cancel: rig_job.rig_job(self.service, req, prog, cancel,
                                                              python=getattr(args, "rig_python", None), mock=args.mock),
         })
