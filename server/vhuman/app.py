@@ -23,8 +23,9 @@ Pixal3D demo server.
     GET  /v1/heads, /v1/heads/<id>/<file>           Qwen portrait -> Pixal3D head -> fitted eyes
     GET  /rig                       the facial rig page (web/vhuman_rig.html)
     GET  /v1/heads/<id>/rig/<file>  rig outputs
+    GET  /v1/heads/<id>/body/<file>  combined avatar outputs
     GET  /v1/heads/<id>/rig/takes, /v1/heads/<id>/rig/takes/<take>/<file>
-    POST /v1/jobs                   {kind: plates|baseline|head|head_skin|expressions|rig|rig_speech, ...} -> {id}
+    POST /v1/jobs                   {kind: plates|baseline|head|head_skin|expressions|rig|body|rig_speech, ...} -> {id}
     GET  /v1/jobs, /v1/jobs/<id>    POST /v1/jobs/<id>/cancel
 """
 from __future__ import annotations
@@ -172,9 +173,11 @@ class App:
         from . import qwen, baseline
         from .head import pipeline as head_pipeline
         from .rig import emotion as rig_emotion, exprdata, job as rig_job, speech as rig_speech
+        from .body import job as body_job
         self.rig_job = rig_job
         self.rig_speech = rig_speech
         self.rig_emotion = rig_emotion
+        self.body_job = body_job
         self.gpu = gpu
         self.qwen_opts = {"python": args.qwen_python, "mock": args.mock}
         self.jobs = Jobs(Path(args.work) / "jobs", {
@@ -188,6 +191,9 @@ class App:
                                                                               python=args.qwen_python, mock=args.mock),
             "rig": lambda req, prog, cancel: rig_job.rig_job(self.service, req, prog, cancel,
                                                              python=getattr(args, "rig_python", None), mock=args.mock),
+            "body": lambda req, prog, cancel: body_job.body_job(self.service, req, prog, cancel,
+                        python=args.qwen_python, rig_python=getattr(args, "rig_python", None),
+                        model_dir=getattr(args, "sam3d_body_model", body_job.MODEL_DIR), mock=args.mock),
             "rig_speech": lambda req, prog, cancel: rig_speech.speech_job(
                 self.service, req, prog, cancel, model=getattr(args, "tts_model", None) or rig_speech.DEFAULT_MODEL,
                 aligner=getattr(args, "aligner", None) or rig_speech.DEFAULT_ALIGNER,
@@ -201,6 +207,8 @@ class App:
         return {"ok": True, "gpu": self.gpu.gpu_status(), "qwen": qwen.availability(**self.qwen_opts),
                 "pixal3d": baseline.availability(mock=self.args.mock), "plates": len(self.service.list_plates()),
                 "rig": self.rig_job.availability(getattr(self.args, "rig_python", None)),
+                "body": self.body_job.availability(getattr(self.args, "sam3d_body_model", self.body_job.MODEL_DIR),
+                                                    getattr(self.args, "rig_python", None), self.args.mock),
                 "rig_speech": self.rig_speech.availability(
                     getattr(self.args, "tts_model", None) or self.rig_speech.DEFAULT_MODEL,
                     getattr(self.args, "aligner", None) or self.rig_speech.DEFAULT_ALIGNER,
@@ -313,6 +321,9 @@ def make_handler(app: App, quiet: bool = False):
                 if path.startswith("/v1/heads/") and "/rig/" in path:
                     hid, _, name = path[len("/v1/heads/"):].partition("/rig/")
                     return self._file(app.service.rig_file(hid, name))
+                if path.startswith("/v1/heads/") and "/body/" in path:
+                    hid, _, name = path[len("/v1/heads/"):].partition("/body/")
+                    return self._file(app.service.body_file(hid, name))
                 if path.startswith("/v1/heads/"):
                     return self._file(app.service.head_file(*path[len("/v1/heads/"):].split("/", 1)))
                 if path == "/health":
@@ -394,6 +405,8 @@ def main(argv=None) -> int:
     default_rig = ROOT / "tmp/vhuman-rig-venv/bin/python"
     ap.add_argument("--rig-python", default=str(default_rig) if default_rig.exists() else None,
                     help="interpreter for the facial rig builder (numpy, scipy, torch)")
+    ap.add_argument("--sam3d-body-model", default="/mnt/nvme01/models/sam3d-body",
+                    help="local SAM 3D Body checkpoint directory")
     ap.add_argument("--tts-model", default=None, help="Qwen3-TTS model directory for rig_speech jobs")
     ap.add_argument("--aligner", default=None, help="ja_align.safetensors for rig_speech jobs")
     ap.add_argument("--tts-backend", choices=("auto", "cpu", "cuda"), default="auto")

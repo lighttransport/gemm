@@ -90,6 +90,8 @@ int sam3d_body_get_encoder_tokens(sam3d_body_ctx *ctx, float *out,
 
 /* MHR regression head output — raw parameter vector (npose floats). */
 int sam3d_body_get_mhr_params(sam3d_body_ctx *ctx, float *out, int *out_n);
+int sam3d_body_get_decoded_mhr(sam3d_body_ctx *ctx,
+                               float model_params[204], float shape[45]);
 
 /* Camera translation (3,) and focal length (1,). */
 int sam3d_body_get_cam(sam3d_body_ctx *ctx, float *out_cam_t_xyz,

@@ -85,6 +85,7 @@ struct sam3d_body_ctx {
     /* Stage outputs (all NULL until the corresponding stage lands). */
     f32_2d   encoder_tokens;   /* [n_tokens, dim] */
     float   *mhr_params;       int mhr_params_n;
+    float    decoded_model_params[204], decoded_shape[45];
     float    cam_t[3];
     float    focal_px;
     float   *vertices;         int n_vertices;   /* V×3 */
@@ -569,6 +570,8 @@ int sam3d_body_run_decoder(sam3d_body_ctx *ctx)
     sam3d_body_decoder_full_result r;
     memset(&r, 0, sizeof(r));
     r.pred_vertices = ctx->vertices;
+    r.mhr_model_params = ctx->decoded_model_params;
+    r.shape = ctx->decoded_shape;
 
     rc = sam3d_body_decoder_forward_full(
             ctx->decoder_model,
@@ -675,6 +678,15 @@ int sam3d_body_get_mhr_params(sam3d_body_ctx *ctx, float *out, int *out_n)
         memcpy(out, ctx->mhr_params,
                (size_t)ctx->mhr_params_n * sizeof(float));
     return ctx->mhr_params ? SAM3D_BODY_E_OK : SAM3D_BODY_E_NOT_IMPLEMENTED;
+}
+
+int sam3d_body_get_decoded_mhr(sam3d_body_ctx *ctx,
+                               float model_params[204], float shape[45])
+{
+    if (!ctx || !ctx->mhr_params) return SAM3D_BODY_E_INVAL;
+    if (model_params) memcpy(model_params, ctx->decoded_model_params, sizeof(ctx->decoded_model_params));
+    if (shape) memcpy(shape, ctx->decoded_shape, sizeof(ctx->decoded_shape));
+    return SAM3D_BODY_E_OK;
 }
 
 int sam3d_body_get_cam(sam3d_body_ctx *ctx, float *out_cam_t_xyz,

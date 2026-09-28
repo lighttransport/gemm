@@ -257,6 +257,16 @@ def cmd_rig(args) -> dict:
                            threading.Event(), python=args.rig_python)
 
 
+def cmd_body(args) -> dict:
+    from .body import job as body_job
+    svc = EyeService(Path(args.work))
+    return body_job.body_job(svc, {"head_id": args.head, "outfit": args.outfit, "seed": args.seed,
+                              "quality": args.quality, "steps": args.steps,
+                              "garments": [x.strip() for x in args.garments.split(",") if x.strip()]},
+                             _progress, threading.Event(), python=args.qwen_python,
+                             rig_python=args.rig_python, model_dir=args.sam3d_body_model, mock=args.mock)
+
+
 def cmd_rig_track(args) -> dict:
     """Evaluate a LightRig face track on a built rig -> a UsdSkel animation layer."""
     from .rig import rigdef, usd
@@ -314,6 +324,7 @@ def main(argv=None) -> int:
     ap.add_argument("--mock", action="store_true", help="mock Qwen and Pixal3D (no GPU)")
     default_rig = ROOT / "tmp/vhuman-rig-venv/bin/python"
     ap.add_argument("--rig-python", default=str(default_rig) if default_rig.exists() else None)
+    ap.add_argument("--sam3d-body-model", default="/mnt/nvme01/models/sam3d-body")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def with_params(sp):
@@ -395,6 +406,14 @@ def main(argv=None) -> int:
     sp.add_argument("--res", type=int, choices=(1024, 2048, 4096), default=2048)
     sp.add_argument("--iters", type=int, default=600)
     sp.set_defaults(fn=cmd_rig)
+    sp = sub.add_parser("body", help="Qwen full-body image -> SAM 3D Body -> Pixal3D -> combined avatar")
+    sp.add_argument("--head", required=True, help="existing head with a facial rig")
+    sp.add_argument("--outfit", default="plain fitted shirt, trousers and shoes")
+    sp.add_argument("--seed", type=int, default=11)
+    sp.add_argument("--quality", choices=("preview", "standard", "high"), default="standard")
+    sp.add_argument("--steps", type=int, default=24)
+    sp.add_argument("--garments", default="shirt,pants,shoes", help="comma-separated SAM 3 garment prompts")
+    sp.set_defaults(fn=cmd_body)
     sp = sub.add_parser("rig-track", help="LightRig face track (timestamp + 52 controls per line) -> USD animation")
     sp.add_argument("--head", required=True)
     sp.add_argument("--track", required=True)

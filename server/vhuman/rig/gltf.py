@@ -55,7 +55,9 @@ def write(asset, out_path) -> dict:
     for j in skel["joints"]:
         R = np.asarray(j["rest_rotation"])
         q = quat_from_matrix(R)
-        jnode[j["name"]] = b.node(j["name"], translation=j["rest_translation"], rotation=q.tolist(), root=False)
+        scale = j.get("rest_scale", 1.0)
+        jnode[j["name"]] = b.node(j["name"], translation=j["rest_translation"], rotation=q.tolist(),
+                                  scale=[scale] * 3 if scale != 1.0 else None, root=False)
     for j in skel["joints"]:
         if j["parent"]:
             b.doc["nodes"][jnode[j["parent"]]].setdefault("children", []).append(jnode[j["name"]])
@@ -63,7 +65,8 @@ def write(asset, out_path) -> dict:
     inv = np.stack([np.linalg.inv(np.asarray(j["bind"])).T.reshape(-1) for j in skel["joints"]]).astype("<f4")
     ibm = b.raw_accessor(inv, FLOAT, "MAT4")
     b.doc.setdefault("skins", []).append({"joints": [jnode[n] for n in names], "inverseBindMatrices": ibm,
-                                          "skeleton": jnode[names[0]], "name": "face"})
+                                          "skeleton": jnode[names[0]],
+                                          "name": "avatar" if asset.info.get("rig_name") == "avatar.json" else "face"})
     # textures and materials
     mats = {}
     for key, spec in asset.materials.items():
@@ -122,7 +125,8 @@ def write(asset, out_path) -> dict:
         stats["meshes"].append({"name": part.name, "vertices": int(len(part.positions)),
                                 "triangles": int(len(part.tris)), "targets": len(tnames)})
         stats["morph_targets"] += len(tnames)
-    b.doc["asset"]["extras"] = {"rig": "rig.json", "units": "metres", "frame": "+Y up, face +Z"}
+    b.doc["asset"]["extras"] = {"rig": asset.info.get("rig_name", "rig.json"),
+                                  "units": "metres", "frame": "+Y up, face +Z"}
     size = b.write(out_path)
     stats["bytes"] = size
     return stats

@@ -97,12 +97,32 @@ a.dl{color:var(--accent);margin-right:12px;font-size:13px;display:inline-block}
       <div style="margin-top:8px" id="downloads"></div>
       <div class="preview"><img id="preview-img" alt="pose sheet" hidden></div>
     </div>
+    <div class="card">
+      <h2>Full body avatar</h2>
+      <label for="body-outfit">Outfit</label>
+      <input id="body-outfit" value="plain fitted shirt, trousers and shoes">
+      <label for="body-garments">Separate garment meshes (comma separated)</label>
+      <input id="body-garments" value="shirt,pants,shoes">
+      <label for="body-quality">Quality</label>
+      <select id="body-quality"><option value="preview">preview</option><option value="standard" selected>standard</option><option value="high">high</option></select>
+      <button class="primary" id="build-body" disabled>Create body for selected rig</button>
+      <div class="msg" id="body-msg"></div>
+      <div id="body-pose" hidden>
+        <label>Body pose preview</label>
+        <div class="ctl"><span>left arm</span><input type="range" data-body-pose="mhr_l_uparm" min="-60" max="60" value="0"><output>0°</output></div>
+        <div class="ctl"><span>right arm</span><input type="range" data-body-pose="mhr_r_uparm" min="-60" max="60" value="0"><output>0°</output></div>
+        <div class="ctl"><span>left knee</span><input type="range" data-body-pose="mhr_l_lowleg" min="0" max="70" value="0"><output>0°</output></div>
+        <div class="ctl"><span>right knee</span><input type="range" data-body-pose="mhr_r_lowleg" min="0" max="70" value="0"><output>0°</output></div>
+        <button id="body-pose-reset">reset body pose</button>
+      </div>
+    </div>
   </aside>
   <main>
     <div class="viewer" id="viewer"><span class="label" id="vlabel">rig.glb</span><div class="empty" id="empty">pick a head with a rig, or build one</div></div>
     <div class="tools">
       <button data-view="front">front</button><button data-view="three">¾</button><button data-view="profile">profile</button><button data-view="mouth">mouth</button><button data-view="eyes">eyes</button>
       <label><input type="checkbox" id="wire"> wireframe</label>
+      <label><input type="checkbox" id="avatar-mode" disabled> full body</label>
       <label><input type="checkbox" id="bones"> skeleton</label>
       <label title="learned corrective deformer (contacts with eyeballs, teeth and lips; soft-tissue relaxation)"><input type="checkbox" id="ml" checked> ML deformer</label>
       <label title="expression wrinkle maps (from the subject's expression portraits) blended into the skin normals"><input type="checkbox" id="wrinkles" checked> wrinkles</label>
@@ -183,8 +203,9 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 
 const $ = (id) => document.getElementById(id);
-const state = { heads: [], current: null, rig: null, model: null, values: {}, anim: null, job: null,
-                speechAvailable: false, emotionAvailable: false };
+const state = { heads: [], current: null, rig: null, model: null, values: {}, anim: null, job: null, avatarMode: false,
+                bodyPose: {},
+                speechAvailable: false, emotionAvailable: false, bodyAvailable: false };
 window.__rigState = state;
 async function api(path, body) {
   const opts = body === undefined ? {} : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) };
@@ -295,6 +316,16 @@ function resize() {
 window.addEventListener('resize', resize);
 const views = { front: [0, 0, 1], three: [0.62, 0.05, 0.78], profile: [1, 0.02, 0] };
 function setView(name) {
+  if (state.avatarMode) {
+    if (name === 'mouth' || name === 'eyes') {
+      controls.target.set(0, name === 'eyes' ? 1.58 : 1.51, 0.03);
+      camera.position.copy(controls.target).add(new THREE.Vector3(0.06, 0, 0.35));
+    } else {
+      controls.target.set(0, 0.86, 0);
+      camera.position.set(...views[name].map((v) => v * 5.0)).add(controls.target);
+    }
+    controls.update(); dirty = true; return;
+  }
   // the head frame: +Y up, the face looks along +Z, metres, origin between the eyeballs
   if (name === 'mouth') { controls.target.set(0, -0.072, 0.03); camera.position.set(0.05, -0.06, 0.25); }
   else if (name === 'eyes') { controls.target.set(0, 0.0, 0.01); camera.position.set(0.02, 0.01, 0.23); }
@@ -399,6 +430,14 @@ function applyRig() {
     bone.position.set(J.rest_translation[0] + d[0], J.rest_translation[1] + d[1], J.rest_translation[2] + d[2]);
     _m4.copy(state.restR[j]).multiply(eulerZYX(d[3], d[4], d[5]));
     bone.quaternion.setFromRotationMatrix(_m4);
+  }
+  if (state.avatarMode) {
+    for (const [name, deg] of Object.entries(state.bodyPose)) {
+      const bone = state.bones[name];
+      if (!bone || !deg) continue;
+      const axis = name.includes('lowleg') ? new THREE.Vector3(1, 0, 0) : new THREE.Vector3(0, 0, 1);
+      bone.quaternion.multiply(new THREE.Quaternion().setFromAxisAngle(axis, THREE.MathUtils.degToRad(deg)));
+    }
   }
   for (const mesh of state.morphMeshes) {
     const dict = mesh.morphTargetDictionary;
@@ -1061,10 +1100,12 @@ async function loadRig(h) {
   const gen = ++loadGen;
   $('empty').hidden = false;
   $('empty').textContent = 'loading rig…';
-  const base = `/v1/heads/${h.id}/rig/`;
-  const lod = +$('lod').value, suffix = lod ? `_lod${lod}` : '';
+  const avatar = state.avatarMode && !!h.body;
+  const base = `/v1/heads/${h.id}/${avatar ? 'body' : 'rig'}/`;
+  const lod = avatar ? 0 : +$('lod').value, suffix = lod ? `_lod${lod}` : '';
   const hasLod = !lod || (h.rig?.lods || []).includes(lod);
-  const [def, gltf] = await Promise.all([api(base + 'rig.json'), loader.loadAsync(base + (hasLod ? `rig${suffix}.glb` : 'rig.glb'))]);
+  const [def, gltf] = await Promise.all([api(base + (avatar ? 'avatar.json' : 'rig.json')),
+    loader.loadAsync(base + (avatar ? 'avatar.glb' : hasLod ? `rig${suffix}.glb` : 'rig.glb'))]);
   if (gen !== loadGen) return;
   if (state.model) { scene.remove(state.model); state.model.traverse((o) => { o.geometry?.dispose(); }); }
   if (skelHelper) { scene.remove(skelHelper); skelHelper = null; }
@@ -1090,7 +1131,7 @@ async function loadRig(h) {
   skelHelper.visible = $('bones').checked;
   scene.add(skelHelper);
   gltf.scene.traverse((o) => { if (o.isSkinnedMesh && !state.skeleton) state.skeleton = o.skeleton; });
-  state.vizData = await fetch(base + (hasLod && lod ? `viz${suffix}.json` : 'viz.json')).then((r) => (r.ok ? r.json() : null)).catch(() => null);
+  state.vizData = avatar ? null : await fetch(base + (hasLod && lod ? `viz${suffix}.json` : 'viz.json')).then((r) => (r.ok ? r.json() : null)).catch(() => null);
   viz.ct = null;
   for (const el of viz.labels) el.remove();
   viz.labels = [];
@@ -1110,7 +1151,7 @@ async function loadRig(h) {
   buildControls(def);
   applyRig();
   $('empty').hidden = true;
-  setupContactOffsets();
+  if (!avatar) setupContactOffsets();
   state.wrinkles = null;
   if (def.wrinkles?.maps?.length) {
     const tl = new THREE.TextureLoader();
@@ -1128,8 +1169,10 @@ async function loadRig(h) {
   updateHeat(true);
   let nv = 0;
   gltf.scene.traverse((o) => { if (o.isMesh && /^head_/.test(o.name)) nv += o.geometry.attributes.position.count; });
-  $('vlabel').textContent = `rig${hasLod ? suffix : ''}.glb · LOD${hasLod ? lod : 0} · ${nv} head vertices · ${def.controls.length} controls · ${def.blendshapes.length} shapes · ${def.joints.length} joints`;
+  $('vlabel').textContent = avatar ? `avatar.glb · MHR body + facial rig · ${def.joints.length} joints · ${def.controls.length} facial controls`
+    : `rig${hasLod ? suffix : ''}.glb · LOD${hasLod ? lod : 0} · ${nv} head vertices · ${def.controls.length} controls · ${def.blendshapes.length} shapes · ${def.joints.length} joints`;
   setView('front');
+  $('body-pose').hidden = !avatar;
 }
 function showFacts(h) {
   const r = h.rig;
@@ -1159,6 +1202,16 @@ function showFacts(h) {
     $('preview-img').src = r.urls.preview || '';
     $('preview-img').hidden = !r.urls.preview;
   } else $('preview-img').hidden = true;
+  if (h.body) {
+    const rep = h.body.report || {};
+    rows.push(['body mesh / joints', `${rep.body_vertices || '?'} vertices · ${rep.body_joints || '?'} joints`],
+      ['garments', (rep.garments || []).map((g) => `${g.name}: ${g.status}`).join(', ') || 'body texture']);
+    $('facts').innerHTML = rows.map(([k, v]) => `<tr><td>${k}</td><td>${v ?? ''}</td></tr>`).join('');
+    for (const [label, key] of [['avatar.glb', 'glb'], ['avatar USD package', 'usd_zip'], ['body image', 'image']]) {
+      const a = document.createElement('a'); a.className = 'dl'; a.href = h.body.urls[key];
+      a.textContent = label; a.download = ''; dl.appendChild(a);
+    }
+  }
 }
 function renderHeads() {
   const box = $('heads');
@@ -1179,6 +1232,9 @@ async function select(h) {
   renderHeads();
   showFacts(h);
   $('build').disabled = !!state.job;
+  $('build-body').disabled = !!state.job || !h.rig || !state.bodyAvailable;
+  $('avatar-mode').disabled = !h.body;
+  if (!h.body) { state.avatarMode = false; $('avatar-mode').checked = false; }
   $('build').textContent = h.rig ? 'Rebuild rig for selected head' : 'Build rig for selected head';
   if (h.rig) {
     const params = new URLSearchParams(location.search);
@@ -1223,10 +1279,57 @@ $('build').addEventListener('click', async () => {
   }
   $('build').disabled = false;
 });
+$('avatar-mode').addEventListener('change', async () => {
+  state.avatarMode = $('avatar-mode').checked;
+  $('viz').value = 'shaded';
+  if (state.current?.rig) await loadRig(state.current);
+});
+document.querySelectorAll('[data-body-pose]').forEach((input) => input.addEventListener('input', () => {
+  state.bodyPose[input.dataset.bodyPose] = +input.value;
+  input.nextElementSibling.value = `${input.value}°`;
+  applyRig();
+}));
+$('body-pose-reset').addEventListener('click', () => {
+  state.bodyPose = {};
+  document.querySelectorAll('[data-body-pose]').forEach((input) => { input.value = 0; input.nextElementSibling.value = '0°'; });
+  applyRig();
+});
+$('build-body').addEventListener('click', async () => {
+  if (!state.current?.rig || state.job) return;
+  const id = state.current.id;
+  $('build-body').disabled = true;
+  $('body-msg').className = 'msg';
+  try {
+    const job = await api('/v1/jobs', { kind: 'body', head_id: id,
+      outfit: $('body-outfit').value.trim(), quality: $('body-quality').value,
+      garments: $('body-garments').value.split(',').map((s) => s.trim()).filter(Boolean) });
+    state.job = job.id;
+    for (;;) {
+      await new Promise((r) => setTimeout(r, 1000));
+      const j = await api(`/v1/jobs/${job.id}`);
+      $('bar').style.width = `${Math.round(j.progress * 100)}%`;
+      $('body-msg').textContent = j.message;
+      if (j.state === 'done') break;
+      if (j.state === 'failed' || j.state === 'cancelled') throw new Error(j.error || j.state);
+    }
+    state.job = null;
+    state.avatarMode = true; $('avatar-mode').checked = true;
+    await refresh(id);
+  } catch (e) {
+    state.job = null;
+    $('body-msg').textContent = String(e.message || e);
+    $('body-msg').className = 'msg bad';
+  }
+  $('build-body').disabled = !state.current?.rig || !state.bodyAvailable;
+});
 api('/health').then((h) => {
   $('health').textContent = h.rig?.available ? `rig builder: ${h.rig.python}` : `rig builder unavailable: ${h.rig?.reason || '?'}`;
   state.speechAvailable = !!h.rig_speech?.available;
   state.emotionAvailable = !!h.rig_emotion?.available;
+  state.bodyAvailable = !!h.body?.available;
+  $('build-body').disabled = !!state.job || !state.current?.rig || !state.bodyAvailable;
+  if (!state.bodyAvailable) $('body-msg').textContent = h.body?.reason ||
+    `Body model or rig interpreter missing: ${(h.body?.missing || []).join(', ')}`;
   $('speech-auto-emotion').disabled = !state.emotionAvailable;
   $('speech-auto-emotion').title = state.emotionAvailable ? 'Extract coarse Japanese emotion tags from audio' : 'SenseVoiceSmall model or runtime missing';
   $('speech-generate').disabled = !state.speechAvailable;

@@ -101,10 +101,12 @@ static void write_sidecar_json(cuda_sam3d_body_ctx *ctx,
     float *k3 = nk3 ? (float *)malloc((size_t)nk3 * 3 * sizeof(float)) : NULL;
     float *k2 = nk2 ? (float *)malloc((size_t)nk2 * 2 * sizeof(float)) : NULL;
     float cam_t[3] = {0}, focal_px = 0;
+    float model_params[204], shape[45];
     if (mp) cuda_sam3d_body_get_mhr_params(ctx, mp, &np);
     if (k3) cuda_sam3d_body_get_keypoints_3d(ctx, k3, &nk3);
     if (k2) cuda_sam3d_body_get_keypoints_2d(ctx, k2, &nk2);
     cuda_sam3d_body_get_cam(ctx, cam_t, &focal_px);
+    cuda_sam3d_body_get_decoded_mhr(ctx, model_params, shape);
 
     fprintf(jf, "{\n");
     if (has_bbox) {
@@ -126,6 +128,11 @@ static void write_sidecar_json(cuda_sam3d_body_ctx *ctx,
     fprintf(jf, "  \"mhr_params\": [");
     for (int i = 0; i < np; i++)
         fprintf(jf, "%s%.6g", i ? "," : "", mp[i]);
+    fprintf(jf, "],\n");
+    fprintf(jf, "  \"model_params\": [");
+    for (int i = 0; i < 204; i++) fprintf(jf, "%s%.9g", i ? "," : "", model_params[i]);
+    fprintf(jf, "],\n  \"shape\": [");
+    for (int i = 0; i < 45; i++) fprintf(jf, "%s%.9g", i ? "," : "", shape[i]);
     fprintf(jf, "],\n");
     fprintf(jf, "  \"keypoints_3d\": [");
     for (int i = 0; i < nk3; i++)

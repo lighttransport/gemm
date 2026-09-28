@@ -133,7 +133,13 @@ def write(asset, out: Path, subj=None, name: str = "rig.usda") -> dict:
     tex_dir.mkdir(exist_ok=True)
     rig = rigdef.Rig(asset.rig, ml=asset.info.get("ml"))
     skel = asset.skeleton
-    joints = [SK.usd_path(j["name"]) for j in skel["joints"]]
+    by_name = {j["name"]: j for j in skel["joints"]}
+    def joint_path(name):
+        chain = [name]
+        while by_name[chain[-1]]["parent"] is not None:
+            chain.append(by_name[chain[-1]]["parent"])
+        return "/".join(reversed(chain))
+    joints = [joint_path(j["name"]) for j in skel["joints"]]
     # vchar maps a control straight to a same-named blendshape: only shapes driven by their own control
     own = {b["name"] for b in asset.rig["blendshapes"] if b["input"] == b["name"]}
     blend_only = sorted(set(rig.shape_names) & set(rig.controls) & own
@@ -149,7 +155,8 @@ def write(asset, out: Path, subj=None, name: str = "rig.usda") -> dict:
           f"            string[] controlMappings = {names_arr}",
           "            float2[] controlRanges = [" + ", ".join("(0, 1)" for _ in blend_only) + "]",
           "            float[] controlDefaults = [" + ", ".join("0" for _ in blend_only) + "]",
-          '            string rigDefinition = "rig.json"', '            string controlNamespace = "lr.face.v1"',
+          f'            string rigDefinition = "{asset.info.get("rig_name", "rig.json")}"',
+          '            string controlNamespace = "lr.face.v1"',
           "        }", "    }", ")", "{", "    rel skel:skeleton = </Character/Skeleton>"]
     L += ['    def Skeleton "Skeleton" (', '        prepend apiSchemas = ["SkelBindingAPI"]', "    )", "    {",
           "        uniform token[] joints = [" + ", ".join(f'"{p}"' for p in joints) + "]",
@@ -158,6 +165,7 @@ def write(asset, out: Path, subj=None, name: str = "rig.usda") -> dict:
     for j in skel["joints"]:
         m = np.eye(4)
         m[:3, :3] = np.asarray(j["rest_rotation"])
+        m[:3, :3] *= j.get("rest_scale", 1.0)
         m[:3, 3] = j["rest_translation"]
         rest.append(m)
     L += ["        uniform matrix4d[] restTransforms = [" + ", ".join(_mat(m) for m in rest) + "]",
@@ -171,13 +179,15 @@ def write(asset, out: Path, subj=None, name: str = "rig.usda") -> dict:
         ev = rig.evaluate(ctrl)
         loc = ev["local"]
         tr.append(f"                {time_}: " + _vec(loc[:, :3, 3]))
-        qs = [quat_from_matrix(m[:3, :3]) for m in loc]
+        qs = [quat_from_matrix(m[:3, :3] / skel["joints"][i].get("rest_scale", 1.0))
+              for i, m in enumerate(loc)]
         ro.append(f"                {time_}: [" + ", ".join(f"({_f(q[3])}, {_f(q[0])}, {_f(q[1])}, {_f(q[2])})"
                                                            for q in qs) + "]")
         bw.append(f"                {time_}: " + _floats(ev["weights"]))
     L += ["            float3[] translations.timeSamples = {", ",\n".join(tr), "            }",
           "            quatf[] rotations.timeSamples = {", ",\n".join(ro), "            }",
-          "            half3[] scales = [" + ", ".join("(1, 1, 1)" for _ in joints) + "]",
+          "            half3[] scales = [" + ", ".join("(" + ", ".join([_f(j.get("rest_scale", 1.0))] * 3) + ")"
+                                                for j in skel["joints"]) + "]",
           "            float[] blendShapeWeights.timeSamples = {", ",\n".join(bw), "            }", "        }", "    }"]
     # geometry
     L += ['    def Scope "Geom"', "    {"]

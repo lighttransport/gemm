@@ -397,6 +397,7 @@ struct cuda_sam3d_body_ctx {
     f32_2d   encoder_tokens;
     int      encoder_tokens_dev_valid;
     float   *mhr_params;   int mhr_params_n;
+    float    decoded_model_params[204], decoded_shape[45];
     float    cam_t[3];
     float    focal_px;
     float   *vertices;     int n_vertices;
@@ -3674,6 +3675,8 @@ int cuda_sam3d_body_run_decoder(cuda_sam3d_body_ctx *ctx)
     if (!ctx->mhr_params) { rc_total = -1; goto cleanup; }
     memcpy(ctx->mhr_params, pose519, 519 * sizeof(float));
     ctx->mhr_params_n = 519;
+    memcpy(ctx->decoded_model_params, mp_buf, sizeof(ctx->decoded_model_params));
+    memcpy(ctx->decoded_shape, shape_buf, sizeof(ctx->decoded_shape));
 
     memcpy(ctx->cam_t, pred_cam_t_world, sizeof(ctx->cam_t));
     ctx->focal_px = cam_int[0];
@@ -3851,6 +3854,15 @@ int cuda_sam3d_body_get_mhr_params(cuda_sam3d_body_ctx *ctx, float *out, int *ou
         memcpy(out, ctx->mhr_params, (size_t)ctx->mhr_params_n * sizeof(float));
     return ctx->mhr_params ? CUDA_SAM3D_BODY_E_OK
                            : CUDA_SAM3D_BODY_E_NOT_IMPLEMENTED;
+}
+
+int cuda_sam3d_body_get_decoded_mhr(cuda_sam3d_body_ctx *ctx,
+                                    float model_params[204], float shape[45])
+{
+    if (!ctx || !ctx->mhr_params) return CUDA_SAM3D_BODY_E_INVAL;
+    if (model_params) memcpy(model_params, ctx->decoded_model_params, sizeof(ctx->decoded_model_params));
+    if (shape) memcpy(shape, ctx->decoded_shape, sizeof(ctx->decoded_shape));
+    return CUDA_SAM3D_BODY_E_OK;
 }
 
 int cuda_sam3d_body_get_cam(cuda_sam3d_body_ctx *ctx,

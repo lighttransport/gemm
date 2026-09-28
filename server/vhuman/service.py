@@ -231,7 +231,8 @@ class EyeService:
                                                                     "head_eyes.glb", "fit.json", "skin_basecolor.png", "skin_normal.png",
                                                                     "skin_orm.png", "skin_mask.png", "skin.json")
                                  if (meta.parent / n).is_file()},
-                        "rig": self._rig_summary(meta.parent, base)})
+                        "rig": self._rig_summary(meta.parent, base),
+                        "body": self._body_summary(meta.parent, base)})
         return out
 
     @staticmethod
@@ -263,6 +264,36 @@ class EyeService:
         if not ok:
             raise ServiceError("no such file")
         path = self.work / "heads" / hid / "rig" / name
+        if not path.is_file():
+            raise ServiceError("no such file")
+        return path
+
+    @staticmethod
+    def _body_summary(folder: Path, base: str) -> dict | None:
+        report_path = folder / "body" / "body_report.json"
+        if not report_path.is_file() or not (folder / "body" / "avatar.glb").is_file():
+            return None
+        try:
+            report = json.loads(report_path.read_text())
+        except ValueError:
+            return None
+        keys = {"glb": "avatar.glb", "usda": "avatar.usda", "usd_zip": "avatar_usd.zip",
+                "json": "avatar.json", "image": "body_image.png", "report": "body_report.json"}
+        return {"urls": {k: f"{base}body/{n}" for k, n in keys.items()
+                         if (folder / "body" / n).is_file()},
+                "report": {k: report.get(k) for k in ("body_vertices", "body_triangles", "body_joints",
+                                                       "face_joints", "landmark_error_m", "garments", "total_seconds")}}
+
+    def body_file(self, hid: str, name: str) -> Path:
+        from .body.job import FILES
+        if not (isinstance(hid, str) and hid.isalnum() and len(hid) <= 32):
+            raise ServiceError("no such file")
+        folder, _, base = name.partition("/")
+        allowed = name in FILES or (folder == "textures" and base.endswith(".png") and "/" not in base
+                                    and all(c.isalnum() or c in "_-." for c in base))
+        if not allowed:
+            raise ServiceError("no such file")
+        path = self.work / "heads" / hid / "body" / name
         if not path.is_file():
             raise ServiceError("no such file")
         return path

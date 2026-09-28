@@ -148,6 +148,7 @@ class Rig:
         self.M_vals = np.array([e["value"] for e in ent], np.float64)
         self.rest_t = np.array([j["rest_translation"] for j in self.joints], np.float64)
         self.rest_R = np.array([j["rest_rotation"] for j in self.joints], np.float64)   # (J, 3, 3)
+        self.rest_s = np.array([j.get("rest_scale", 1.0) for j in self.joints], np.float64)
         self.parent = np.array([self.jidx.get(j["parent"], -1) if j["parent"] else -1 for j in self.joints])
         self.bind = np.array([j["bind"] for j in self.joints], np.float64)                 # (J, 4, 4) world
         self.inv_bind = np.linalg.inv(self.bind)
@@ -182,7 +183,7 @@ class Rig:
         local = np.tile(np.eye(4), (self.J, 1, 1))
         world = np.zeros_like(local)
         for j in range(self.J):
-            local[j, :3, :3] = self.rest_R[j] @ euler_matrix(*delta[j, 3:])
+            local[j, :3, :3] = (self.rest_R[j] @ euler_matrix(*delta[j, 3:])) * self.rest_s[j]
             local[j, :3, 3] = self.rest_t[j] + delta[j, :3]
             p = self.parent[j]
             world[j] = local[j] if p < 0 else world[p] @ local[j]

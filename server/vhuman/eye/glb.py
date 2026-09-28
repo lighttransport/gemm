@@ -167,12 +167,45 @@ class GLB:
 
     def accessor(self, index: int) -> np.ndarray:
         acc = self.doc["accessors"][index]
-        view = self.doc["bufferViews"][acc["bufferView"]]
-        width = {"SCALAR": 1, "VEC2": 2, "VEC3": 3, "VEC4": 4}[acc["type"]]
-        dtype = {FLOAT: "<f4", UINT32: "<u4"}[acc["componentType"]]
-        arr = np.frombuffer(self.bin, dtype=dtype, count=acc["count"] * width,
-                            offset=view.get("byteOffset", 0) + acc.get("byteOffset", 0))
+        width = {"SCALAR": 1, "VEC2": 2, "VEC3": 3, "VEC4": 4, "MAT4": 16}[acc["type"]]
+        dtype = {FLOAT: "<f4", UINT32: "<u4", 5123: "<u2", 5121: "u1"}[acc["componentType"]]
+        if "bufferView" in acc:
+            view = self.doc["bufferViews"][acc["bufferView"]]
+            arr = np.frombuffer(self.bin, dtype=dtype, count=acc["count"] * width,
+                                offset=view.get("byteOffset", 0) + acc.get("byteOffset", 0))
+        else:
+            arr = np.zeros(acc["count"] * width, dtype=dtype)
+        if "sparse" in acc:
+            arr = arr.copy().reshape(-1, width)
+            sparse = acc["sparse"]
+            iv = self.doc["bufferViews"][sparse["indices"]["bufferView"]]
+            vv = self.doc["bufferViews"][sparse["values"]["bufferView"]]
+            it = {UINT32: "<u4", 5123: "<u2", 5121: "u1"}[sparse["indices"]["componentType"]]
+            ii = np.frombuffer(self.bin, dtype=it, count=sparse["count"],
+                               offset=iv.get("byteOffset", 0) + sparse["indices"].get("byteOffset", 0))
+            val = np.frombuffer(self.bin, dtype=dtype, count=sparse["count"] * width,
+                                offset=vv.get("byteOffset", 0) + sparse["values"].get("byteOffset", 0))
+            arr[ii] = val.reshape(-1, width)
         return arr.reshape(-1, width) if width > 1 else arr
+
+    def sparse_accessor(self, index: int) -> tuple[np.ndarray, np.ndarray]:
+        """Return nonzero rows of a sparse glTF accessor without expanding it."""
+        acc = self.doc["accessors"][index]
+        if "sparse" not in acc:
+            dense = self.accessor(index)
+            ids = np.flatnonzero(np.any(dense != 0, axis=1))
+            return ids, dense[ids]
+        sparse = acc["sparse"]
+        iv = self.doc["bufferViews"][sparse["indices"]["bufferView"]]
+        vv = self.doc["bufferViews"][sparse["values"]["bufferView"]]
+        it = {UINT32: "<u4", 5123: "<u2", 5121: "u1"}[sparse["indices"]["componentType"]]
+        width = {"SCALAR": 1, "VEC2": 2, "VEC3": 3, "VEC4": 4}[acc["type"]]
+        ids = np.frombuffer(self.bin, dtype=it, count=sparse["count"],
+                            offset=iv.get("byteOffset", 0) + sparse["indices"].get("byteOffset", 0))
+        vals = np.frombuffer(self.bin, dtype={FLOAT: "<f4"}[acc["componentType"]],
+                             count=sparse["count"] * width,
+                             offset=vv.get("byteOffset", 0) + sparse["values"].get("byteOffset", 0))
+        return ids, vals.reshape(-1, width)
 
     def image(self, index: int) -> np.ndarray:
         view = self.doc["bufferViews"][self.doc["images"][index]["bufferView"]]
