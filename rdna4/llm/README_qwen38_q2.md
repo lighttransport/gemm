@@ -61,12 +61,15 @@ rdna4/llm/run_qwen38_flash_next_q2_rocm.sh --bench \
 ```
 
 With `xmrig` also using roughly 29 CPU cores on the Ryzen 9 3950X, the RX
-9070 XT completed the 1024-token prefill at **3.28 tok/s** and decoded 32
-tokens at **3.35 tok/s**. GPU expert-cache hits were 85.6% / 86.4% for
-prefill / decode, with 7.97 GiB of cached experts and 14.0 GiB peak VRAM
-use. The sequence hash `b9f867f533408c06` matched the smaller-cache run.
-These figures are CPU-contention measurements; the clean-machine rate is
-unknown. The benchmark log is `tmp/qwen38_q2_1k_final.log`.
+9070 XT completed the 1024-token prefill at 3.28 tok/s and decoded 32 tokens
+at 3.35 tok/s. After `xmrig` stopped, the same command reached **7.14
+prefill tok/s** and **6.33 decode tok/s**. The clean run spent 9.50 s in CPU
+expert work during 143.34 s of prefill, and 0.35 s during 5.06 s of decode;
+the scalar GPU/PLE chain now dominates. GPU expert-cache hits were 85.6% /
+86.4% for prefill / decode, with 7.97 GiB of cached experts and 14.0 GiB
+peak VRAM use. The sequence hash `b9f867f533408c06` matched both earlier
+runs. Logs are `tmp/qwen38_q2_1k_final.log` and
+`tmp/qwen38_q2_1k_clean.log`.
 
 The present scalar prefill has no grouped Q2_0 matrix-matrix path. Strata's
 [technical details](https://github.com/Niko1221/Strata/blob/main/docs/DETAILS.md)
