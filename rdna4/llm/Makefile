@@ -133,7 +133,7 @@ reference-sampler-test: reference_sampler.o
 	    -lllama -o tmp/test_reference_sampler
 	env LD_LIBRARY_PATH=$(ROCM_LIB) ./tmp/test_reference_sampler
 
-$(TARGET): $(TEST_SRC) $(RUNNER_SRC) $(ROCEW_SRC) hip_llm_runner.h generation_trace.h qwen35_reference_math.h qwen4_moe_stage.h qwen4_ple_split_test.h qwen4_phase_scratch.h qwen4_hc_native_kernels.h qwen4_hc_native_test.h qwen4_ssm_native_kernels.h qwen4_ssm_native_test.h qwen4_moe_native_kernels.h qwen4_moe_native_test.h qwen4_nextn_forward.h qwen4_nextn_ref.h qwen4_qsa_hip.h qwen4_qsa_test.h qwen4_verify_window.h ../../common/qwen4_qsa.h ../hip_runner_common.h ../rocew.h reference_sampler.o $(BLASLT_OBJ) $(CUDA_MOE_OBJ)
+$(TARGET): $(TEST_SRC) $(RUNNER_SRC) $(ROCEW_SRC) hip_llm_runner.h qwen4_ple_disk.h generation_trace.h qwen35_reference_math.h qwen4_moe_stage.h qwen4_ple_split_test.h qwen4_phase_scratch.h qwen4_hc_native_kernels.h qwen4_hc_native_test.h qwen4_ssm_native_kernels.h qwen4_ssm_native_test.h qwen4_moe_native_kernels.h qwen4_moe_native_test.h qwen4_nextn_forward.h qwen4_nextn_ref.h qwen4_qsa_hip.h qwen4_qsa_test.h qwen4_verify_window.h ../../common/qwen4_qsa.h ../hip_runner_common.h ../rocew.h reference_sampler.o $(BLASLT_OBJ) $(CUDA_MOE_OBJ)
 	$(CC) $(CFLAGS) -o $@ $(TEST_SRC) $(RUNNER_SRC) $(ROCEW_SRC) reference_sampler.o $(BLASLT_OBJ) $(CUDA_MOE_OBJ) $(LDFLAGS)
 
 .PHONY: moe-stage-test moe-stage-gpu-test moe-stage-quality
@@ -280,8 +280,11 @@ test_glm5next_contract: test_glm5next_contract.c ../../common/glm5next.h ../../c
 bench_cpu_qwen_expert: bench_cpu_qwen_expert.c
 	$(CC) -O3 -Wall -Wextra -march=native -fopenmp -o $@ $< -ldl -lm
 
+test_qwen4_q2_ssd: test_qwen4_q2_ssd.c qwen4_ple_disk.h ../../common/gguf_loader.h ../../common/ggml_dequant.h
+	$(CC) -O2 -Wall -Wextra -Wpedantic -pthread -o $@ $< -lm
+
 clean:
-	rm -f $(TARGET) test_fattn_vec_half2 bench_cpu_qwen_expert test_glm5next_contract test_glm5next_ref test_glm5next_cpu_kda test_glm5next_cpu_full test_glm5next_cpu_runtime test_glm5next_nextn mm_blaslt_bridge.o reference_sampler.o cuda_moe_bridge.o qwen35_attention_q8.inc qwen35_dflash2.inc qwen35_matvec_q2k.inc qwen35_matvec_iq.inc qwen35_matvec_multi.inc
+	rm -f $(TARGET) test_qwen4_q2_ssd test_fattn_vec_half2 bench_cpu_qwen_expert test_glm5next_contract test_glm5next_ref test_glm5next_cpu_kda test_glm5next_cpu_full test_glm5next_cpu_runtime test_glm5next_nextn mm_blaslt_bridge.o reference_sampler.o cuda_moe_bridge.o qwen35_attention_q8.inc qwen35_dflash2.inc qwen35_matvec_q2k.inc qwen35_matvec_iq.inc qwen35_matvec_multi.inc
 
 help:
 	@echo "HIP LLM Runner (HIPRTC-based, no hipcc needed)"

@@ -1,4 +1,5 @@
 /*
+#include <string.h>
  * gguf_loader.h - Single-file GGUF v2/v3 loader with optional mmap support
  *
  * Usage:
@@ -81,6 +82,7 @@ enum ggml_dtype {
     GGML_TYPE_MXFP4   = 39,
     GGML_TYPE_NVFP4   = 40,
     GGML_TYPE_Q1_0    = 41,
+    GGML_TYPE_Q2_0    = 42,
     GGML_TYPE_COUNT
 };
 
@@ -250,6 +252,7 @@ static const struct { int block_size; int type_size; } ggml_type_info[] = {
     [GGML_TYPE_MXFP4]   = {32, 17},
     [GGML_TYPE_NVFP4]   = {64, 36},
     [GGML_TYPE_Q1_0]    = {128, 18},
+    [GGML_TYPE_Q2_0]    = {64, 18},
 };
 
 static const char *gguf_type_name(uint32_t type) {
@@ -284,6 +287,7 @@ static const char *ggml_type_name(uint32_t type) {
         [GGML_TYPE_TQ1_0] = "TQ1_0", [GGML_TYPE_TQ2_0] = "TQ2_0",
         [GGML_TYPE_MXFP4] = "MXFP4", [GGML_TYPE_NVFP4] = "NVFP4",
         [GGML_TYPE_Q1_0] = "Q1_0",
+        [GGML_TYPE_Q2_0] = "Q2_0",
     };
     if (type < GGML_TYPE_COUNT && names[type]) return names[type];
     return "unknown";

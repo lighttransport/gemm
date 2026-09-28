@@ -85,6 +85,7 @@ typedef struct {
     int qwen35_native_q8_prefill;
     int qwen35_native_q2k; /* precise Q2_K x Q8_1 decode on gfx1201 */
     int qwen35_native_mmvq; /* also IQ2_XXS/XS/S, IQ3_XXS/S with precise Q8_1 staging */
+    int qwen4_ple_ssd; /* bounded GGUF row reads from SSD */
 } hip_llm_load_options;
 
 typedef struct {

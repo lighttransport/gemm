@@ -1773,6 +1773,7 @@ static void dequantize_row_q8_0_padded(const void *src, float *dst, int n) {
 
 static int quant_type_from_name(const char *s) {
     if (!s) return -1;
+    if (strcmp(s, "Q2_0") == 0)    return GGML_TYPE_Q2_0;
     if (strcmp(s, "Q2_K") == 0)    return GGML_TYPE_Q2_K;
     if (strcmp(s, "Q3_K") == 0)    return GGML_TYPE_Q3_K;
     if (strcmp(s, "Q4_K") == 0)    return GGML_TYPE_Q4_K;
@@ -1805,6 +1806,7 @@ static int run_verify_quant_kernels(void) {
     if (!r) { fprintf(stderr, "hip_llm_init failed\n"); return 1; }
 
     struct { int type; const char *name; deq_row_fn fn; } cases[] = {
+        { GGML_TYPE_Q2_0,    "Q2_0",    dequantize_row_q2_0    },
         { GGML_TYPE_Q2_K,    "Q2_K",    dequantize_row_q2_K    },
         { GGML_TYPE_Q3_K,    "Q3_K",    dequantize_row_q3_K    },
         { GGML_TYPE_Q4_K,    "Q4_K",    dequantize_row_q4_K    },
@@ -1975,6 +1977,7 @@ int main(int argc, char **argv) {
     int qwen4_batched_prefill = 0;
     int qwen4_prefill_staging = 0;
     int qwen4_prefill_stage_mb = 0;
+    int qwen4_ple_ssd = 0;
     int moe_cache_mb = 0;
     int moe_cpu_only = 0;
     hip_llm_kv_cache_type kv_cache_type = HIP_LLM_KV_AUTO;
@@ -2156,6 +2159,17 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--qwen4-prefill-stage-mb") == 0 && i + 1 < argc) {
             qwen4_prefill_staging = 1;
             qwen4_prefill_stage_mb = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--qwen4-ple-backend") == 0 && i + 1 < argc) {
+            const char *backend = argv[++i];
+            if (!strcmp(backend, "ssd")) qwen4_ple_ssd = 1;
+            else if (!strcmp(backend, "mmap")) qwen4_ple_ssd = 0;
+            else { fprintf(stderr, "--qwen4-ple-backend must be ssd or mmap\n"); return 2; }
+        } else if (strcmp(argv[i], "--qwen4-kv-quant") == 0 && i + 1 < argc) {
+            const char *format = argv[++i];
+            if (strcmp(format, "none") && strcmp(format, "i8") && strcmp(format, "fp8")) {
+                fprintf(stderr, "--qwen4-kv-quant must be none, i8, or fp8\n"); return 2;
+            }
+            setenv("LLM_QWEN4_KV_QUANT", format, 1);
         } else if (strcmp(argv[i], "--moe-cache-mb") == 0 && i + 1 < argc) {
             moe_cache_mb = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--moe-cpu") == 0) {
@@ -2318,7 +2332,8 @@ int main(int argc, char **argv) {
             fprintf(stderr, "       [--decode-layout-budget-mib MiB]\n");
             fprintf(stderr, "       [--qwen4-mtp SIDECAR.gguf] [--qwen4-mtp-draft 1..32]\n");
             fprintf(stderr, "       [--qwen4-mtp-cache-mb MiB] [--qwen4-mtp-verify scalar|window]\n");
-            fprintf(stderr, "       [--qwen4-mtp-check] [--qwen4-exact]\n");
+            fprintf(stderr, "       [--qwen4-mtp-check] [--qwen4-exact] [--qwen4-ple-backend ssd|mmap]\n");
+            fprintf(stderr, "       [--qwen4-kv-quant none|i8|fp8] (scaled Qwen4 KV cache)\n");
             fprintf(stderr, "       [--qwen4-mtp-trust-draft] (approximate sidecar-only mode)\n");
             fprintf(stderr, "       [--qwen4-mtp-adaptive] (exact low-acceptance fallback)\n");
             fprintf(stderr, "       [--verify-qwen4-nextn SIDECAR.gguf] [--verify-qwen4-qsa]\n");
@@ -2667,6 +2682,7 @@ int main(int argc, char **argv) {
     load_options.qwen35_native_q8_prefill = qwen35_native_q8_prefill;
     load_options.qwen35_native_q2k = qwen35_native_q2k;
     load_options.qwen35_native_mmvq = qwen35_native_mmvq;
+    load_options.qwen4_ple_ssd = qwen4_ple_ssd;
     load_options.decode_kernel_mode = decode_kernel_mode;
     load_options.decode_layout_mode = decode_layout_mode;
     load_options.decode_layout_cache_path = decode_layout_cache_path;
