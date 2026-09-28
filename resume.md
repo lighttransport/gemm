@@ -1,4 +1,4 @@
-# Resume: GLM-5.3-Flash A64FX kernel efficiency + QLAIR accuracy (updated 2026-09-28 13:28)
+# Resume: GLM-5.3-Flash A64FX kernel efficiency + QLAIR accuracy (updated 2026-09-28 13:31)
 
 ## Goal
 Run GLM-5.3-Flash (GLM53F) efficiently on A64FX. Targets:
@@ -189,7 +189,7 @@ All the new simulator switches are diagnostic and default off, so default QLAIR 
   node completed. Clair `STATUS.md` records the native command and
   `measurements/hw-20260927b/` has the measurement logs.
 
-## Session 2026-09-28 13:03–13:28 (clair commits 84e710d3, 4e42a286; allocation ends 14:00 JST)
+## Session 2026-09-28 13:03–13:31 (clair commits 84e710d3, 4e42a286, fb425fec; allocation ends 14:00 JST)
 
 - Same frozen Q8_0R 64×4096 kernel, only rotating weight copies changed:
   ROT=1 (0.29 MiB, L2) is 37,050 native hardware cycles with zero L2-miss
@@ -210,6 +210,10 @@ All the new simulator switches are diagnostic and default off, so default QLAIR 
   CV. This is a separate cache-residency mismatch, but too noisy for timing
   calibration. Native logs, simulator profiles, and replay commands are in
   Clair `STATUS.md` and `measurements/hw-20260927b/`.
+- Native L1 load-pipe PMU activity barely changes from ROT=1 to ROT=32:
+  pipe-valid cycles increase by only 848 / 947 while total cycles rise by
+  about 52k; pipe completion counts are unchanged. This supports data wait,
+  not extra L1 pipe work, as the source of the HBM increment.
 
 ## Production integration plan (not started; needs the real model on 12 nodes)
 
