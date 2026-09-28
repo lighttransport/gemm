@@ -9,6 +9,7 @@ import json
 import hashlib
 import math
 import os
+import random
 import shutil
 import subprocess
 import threading
@@ -64,7 +65,7 @@ VISEME_POSES = {
     "TH": dict(_mix((E, .3)), tongueOut=.2),
     "DD": dict(_mix((E, .3)), tongueUp=.2),
     "kk": _mix((A, .4)), "CH": _mix((E, .25), (O, .2)),
-    "SS": _mix((I, .25)), "nn": _mix((M, .5)),
+    "SS": _mix((I, .25)), "nn": {"tongueUp": .3},
     "RR": dict(_mix((E, .3)), tongueCurlUp=.2),
     "aa": A, "E": E, "ih": I, "oh": O, "ou": U,
 }
@@ -138,8 +139,85 @@ def _emotion_at(keys: list[dict], t: float) -> dict:
     return keys[-1]["weights"]
 
 
+def _prosody(aux: dict, times: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Sample the aligner's 100 Hz energy and voiced pitch on the rig timeline."""
+    data = aux.get("prosody") or {}
+    hop = float(data.get("hop", 0))
+    rms = np.asarray(data.get("rms_db", []), dtype=np.float64)
+    f0 = np.asarray(data.get("f0_hz", []), dtype=np.float64)
+    if hop <= 0 or not math.isfinite(hop) or len(rms) < 2 or len(f0) != len(rms):
+        return np.ones(len(times)), np.zeros(len(times))
+    if not np.isfinite(rms).all() or not np.isfinite(f0).all():
+        raise ValueError("invalid prosody values")
+    peak = float(np.percentile(rms, 95))
+    floor = peak - 35.0
+    energy = np.clip((np.interp(times, np.arange(len(rms)) * hop, rms) - floor) / 35.0, 0, 1)
+    voiced = f0[(f0 > 60) & (f0 < 600) & (rms > floor)]
+    pitch = np.zeros(len(times))
+    if len(voiced):
+        sampled = np.interp(times, np.arange(len(f0)) * hop, f0)
+        mask = sampled > 60
+        pitch[mask] = np.clip(np.log2(sampled[mask] / np.percentile(voiced, 25)) / .5, -1, 1)
+    return energy, pitch
+
+
+def _phone_at(aux: dict, t: float) -> tuple[str, float]:
+    intervals = aux.get("intervals") or ()
+    for i, interval in enumerate(intervals):
+        start, end = float(interval["start"]), float(interval["end"])
+        if start <= t < end:
+            phone = str(interval["s"])
+            following = str(intervals[i + 1]["s"]) if i + 1 < len(intervals) else ""
+            if phone == "cl":
+                phone = following  # Japanese geminate anticipates the next closure.
+            elif phone == "N" and following in ("p", "py", "b", "by", "m", "my"):
+                phone = "m"  # Moraic nasal assimilates before a bilabial.
+            # A narrow ramp preserves coarticulation at each boundary.
+            return phone, max(0.0, min(1.0, (t - start + .01) / .025,
+                                       (end - t + .01) / .025))
+    return "", 0.0
+
+
+def _secondary(times: np.ndarray, duration: float, seed: int) -> list[dict]:
+    """Repeatable blink and gaze tracks, with a small head follow-through."""
+    rng = random.Random(seed)
+    blinks = []
+    t = .8 + rng.uniform(0, .45)
+    while t < duration - .22:
+        blinks.append(t)
+        t += rng.uniform(2.8, 4.5)
+    targets = [(0.0, 0.0, 0.0)]
+    t = .55 + rng.uniform(0, .3)
+    while t < duration - .4:
+        targets.append((t, rng.uniform(-.13, .13), rng.uniform(-.07, .07)))
+        t += rng.uniform(2.0, 3.2)
+    result = []
+    for now in times:
+        blink = 0.0
+        for start in blinks:
+            phase = now - start
+            if 0 <= phase < .075:
+                blink = max(blink, phase / .075)
+            elif .075 <= phase < .205:
+                blink = max(blink, 1 - (phase - .075) / .13)
+        previous, target = targets[0], targets[0]
+        for point in targets[1:]:
+            if point[0] <= now:
+                previous, target = target, point
+            else:
+                break
+        blend = np.clip((now - target[0]) / .2, 0, 1)
+        blend = blend * blend * (3 - 2 * blend)
+        fade = min(1.0, now / .35, max(0.0, (duration - now) / .35))
+        gx = float((previous[1] * (1 - blend) + target[1] * blend) * fade)
+        gy = float((previous[2] * (1 - blend) + target[2] * blend) * fade)
+        result.append({"blink": blink, "gx": gx, "gy": gy})
+    return result
+
+
 def build_frames(aux: dict, emotion_keyframes=None, speech_strength: float = 1.0,
-                 emotion_strength: float = .6, emotion_provider=None) -> list[dict]:
+                 emotion_strength: float = .6, emotion_provider=None,
+                 secondary_seed: int = 7, secondary_strength: float = 1.0) -> list[dict]:
     """Produce finite, clamped 60-control frames at the aligner's sample times."""
     if aux.get("format") != "ja_align.v1":
         raise ValueError("expected ja_align.v1")
@@ -157,6 +235,9 @@ def build_frames(aux: dict, emotion_keyframes=None, speech_strength: float = 1.0
         raise ValueError("invalid viseme weights")
     speech_strength = _unit(speech_strength, "speech_strength")
     emotion_strength = _unit(emotion_strength, "emotion_strength")
+    secondary_strength = _unit(secondary_strength, "secondary_strength")
+    if type(secondary_seed) is not int or not 0 <= secondary_seed < 2**64:
+        raise ValueError("secondary_seed must be a nonnegative integer")
     keys = validate_emotions(emotion_keyframes, duration)
     names = rigdef.CONTROLS
     matrix = np.array([[VISEME_POSES[v].get(n, 0) for n in names] for v in VISEMES], np.float64)
@@ -164,10 +245,27 @@ def build_frames(aux: dict, emotion_keyframes=None, speech_strength: float = 1.0
     # Symmetric three-frame filter adds no offset to the offline timeline.
     speech = np.pad(speech, ((1, 1), (0, 0)), mode="edge")
     speech = .25 * speech[:-2] + .5 * speech[1:-1] + .25 * speech[2:]
+    times = np.minimum(np.arange(len(speech)) / fps, duration)
+    energy, pitch = _prosody(aux, times)
+    secondary = _secondary(times, duration, secondary_seed)
+    index = {name: i for i, name in enumerate(names)}
     frames = []
     for i, row in enumerate(speech):
-        t = min(i / fps, duration)
+        t = float(times[i])
         out = np.clip(row * speech_strength, 0, 1)
+        # RMS controls vowel aperture; pitch accent adds a subtle brow lift.
+        out[index["jawOpen"]] *= .78 + .22 * energy[i]
+        out[index["browInnerUp"]] += .045 * max(0.0, pitch[i]) * energy[i] * speech_strength
+        phone, closure = _phone_at(aux, t)
+        if phone in ("p", "py", "b", "by", "m", "my"):
+            out[index["jawOpen"]] *= 1 - .75 * closure
+            out[index["mouthClose"]] += .8 * closure * speech_strength
+            for side in ("mouthPressLeft", "mouthPressRight"):
+                out[index[side]] = max(out[index[side]], .72 * closure * speech_strength)
+            if phone in ("m", "my"):
+                out[index["tongueUp"]] *= 1 - closure
+        elif phone in ("n", "ny", "N", "t", "ty", "d", "dy"):
+            out[index["tongueUp"]] = max(out[index["tongueUp"]], .4 * closure * speech_strength)
         weights = _emotion_at(keys, t)
         if emotion_provider is not None:
             provided = emotion_provider(t)
@@ -180,13 +278,29 @@ def build_frames(aux: dict, emotion_keyframes=None, speech_strength: float = 1.0
             weight = _unit(weight, f"emotion {emotion}") * emotion_strength
             for name, value in EMOTION_POSES[emotion].items():
                 if name in EMOTION_MOUTH:
-                    out[names.index(name)] += .35 * weight * value
+                    out[index[name]] += .35 * weight * value
                 elif not name.startswith("mouth") and not name.startswith("jaw") and not name.startswith("tongue"):
-                    out[names.index(name)] += weight * value
-        out = np.clip(out, 0, 1)
+                    out[index[name]] += weight * value
+        motion = secondary[i]
+        blink = motion["blink"] * secondary_strength
+        for side in ("eyeBlinkLeft", "eyeBlinkRight"):
+            out[index[side]] = max(out[index[side]], blink)
+        gx, gy = motion["gx"] * secondary_strength, motion["gy"] * secondary_strength
+        for name, value in (("eyeLookOutLeft", max(0, gx)), ("eyeLookInRight", max(0, gx)),
+                            ("eyeLookInLeft", max(0, -gx)), ("eyeLookOutRight", max(0, -gx)),
+                            ("eyeLookUpLeft", max(0, gy)), ("eyeLookUpRight", max(0, gy)),
+                            ("eyeLookDownLeft", max(0, -gy)), ("eyeLookDownRight", max(0, -gy))):
+            out[index[name]] += value
+        out[index["headYaw"]] = .23 * gx
+        out[index["headPitch"]] = .16 * gy + .025 * pitch[i] * energy[i] * speech_strength
+        for name in rigdef.SIGNED:
+            out[index[name]] = np.clip(out[index[name]], -1, 1)
+        for name in names:
+            if name not in rigdef.SIGNED:
+                out[index[name]] = np.clip(out[index[name]], 0, 1)
         if i == len(speech) - 1:
             out[:] = 0
-        frames.append({"t": round(t, 6), "v": {n: round(float(v), 5) for n, v in zip(names, out) if v >= 1e-5}})
+        frames.append({"t": round(t, 6), "v": {n: round(float(v), 5) for n, v in zip(names, out) if abs(v) >= 1e-5}})
     return frames
 
 
@@ -316,14 +430,21 @@ def speech_job(service, request: dict, progress, cancel, *, model=DEFAULT_MODEL,
                                        runner=emotion_runner, model=emotion_model)
             emotion_keys = analysis["emotion_keyframes"]
             (stage / "emotion.json").write_text(json.dumps(analysis, ensure_ascii=False, indent=2))
+        motion_seed = (seed if request.get("seed") is not None or text else
+                       source_meta.get("secondary_seed", source_meta.get("seed")))
+        if type(motion_seed) is not int or not 0 <= motion_seed < 2**64:
+            motion_seed = 7
+        secondary_strength = _unit(request.get("secondary_strength", 1), "secondary_strength")
         frames = build_frames(aux, emotion_keys, request.get("speech_strength", 1),
-                              request.get("emotion_strength", .6))
+                              request.get("emotion_strength", .6), secondary_seed=motion_seed,
+                              secondary_strength=secondary_strength)
         progress(.8, "writing animation")
         animation = {"format": "vhuman.performance.v1", "fps": aux["visemes"]["fps"],
                      "duration": aux["duration"], "controls": list(rigdef.CONTROLS), "frames": frames,
                      "emotion_keyframes": emotion_keys or [], "emotion_source": "SenseVoiceSmall" if auto_emotion else "manual",
                      "speech_strength": _unit(request.get("speech_strength", 1), "speech_strength"),
-                     "emotion_strength": _unit(request.get("emotion_strength", .6), "emotion_strength")}
+                     "emotion_strength": _unit(request.get("emotion_strength", .6), "emotion_strength"),
+                     "secondary_seed": motion_seed, "secondary_strength": secondary_strength}
         (stage / "animation.json").write_text(json.dumps(animation, ensure_ascii=False, separators=(",", ":")))
         write_lightrig(frames, stage / "lightrig.txt")
         rig_bytes = rig_path.read_bytes()
@@ -337,6 +458,7 @@ def speech_job(service, request: dict, progress, cancel, *, model=DEFAULT_MODEL,
                     "frames": len(frames), "backend": "reused" if source_take else selected,
                     "speaker": request.get("speaker") if text else source_meta.get("speaker"),
                     "seed": seed if text else source_meta.get("seed"),
+                    "secondary_seed": motion_seed, "secondary_strength": secondary_strength,
                     "emotion_source": animation["emotion_source"],
                     "emotion_model": analysis["model"] if auto_emotion else None,
                     "emotion_model_author": analysis["model_author"] if auto_emotion else None,

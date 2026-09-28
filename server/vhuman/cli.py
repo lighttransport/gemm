@@ -276,7 +276,7 @@ def cmd_rig_speech(args) -> dict:
            "speaker": args.speaker, "instruct": args.instruct, "kana": args.kana, "seed": args.seed,
            "ref_wav": args.ref_wav, "ref_text": args.ref_text, "xvec_only": args.xvec_only,
            "emotion_keyframes": emotions, "auto_emotion": args.auto_emotion, "speech_strength": args.speech_strength,
-           "emotion_strength": args.emotion_strength}
+           "emotion_strength": args.emotion_strength, "secondary_strength": args.secondary_strength}
     return speech.speech_job(svc, req, _progress, threading.Event(), model=args.tts_model or speech.DEFAULT_MODEL,
                              aligner=args.aligner or speech.DEFAULT_ALIGNER, backend=args.backend, allow_wav=True,
                              emotion_runner=args.emotion_runner or emotion.DEFAULT_RUNNER,
@@ -409,7 +409,7 @@ def main(argv=None) -> int:
     sp.add_argument("--speaker", default="Ono_Anna")
     sp.add_argument("--instruct", default="")
     sp.add_argument("--kana")
-    sp.add_argument("--seed", type=int, default=7)
+    sp.add_argument("--seed", type=int, help="TTS/motion seed (default 7; a rebuild reuses its source seed)")
     sp.add_argument("--ref-wav")
     sp.add_argument("--ref-text")
     sp.add_argument("--xvec-only", action="store_true")
@@ -418,6 +418,8 @@ def main(argv=None) -> int:
     sp.add_argument("--backend", choices=("auto", "cpu", "cuda"), default="auto")
     sp.add_argument("--speech-strength", type=float, default=1.0)
     sp.add_argument("--emotion-strength", type=float, default=.6)
+    sp.add_argument("--secondary-strength", type=float, default=1.0,
+                    help="strength of baked blink, gaze and head motion (0..1)")
     sp.add_argument("--emotions", default="[]", help="emotion keyframes JSON or @file.json")
     sp.add_argument("--auto-emotion", action="store_true", help="extract emotion keys with SenseVoiceSmall GGUF")
     sp.add_argument("--emotion-runner", help="SenseVoiceSmall GGUF runtime executable")

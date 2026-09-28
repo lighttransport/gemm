@@ -248,19 +248,25 @@ rebuilds animation from a completed take's audio and alignment, without
 repeating TTS or CTC. `--emotions @keys.json` accepts an array such as
 `[{"t":0,"weights":{"joy":1}},{"t":1.5,"weights":{"sadness":1}}]`;
 keyframe times must increase and stay within the audio. Strength defaults
-are 1.0 for speech and 0.6 for emotion; the take seed defaults to 7. A TTS
+are 1.0 for speech, 0.6 for emotion and 1.0 for secondary motion
+(`--secondary-strength`, 0 disables it); the take seed defaults to 7. A TTS
 result with no aligned phonemes fails instead of saving a silent animation.
 The web `/rig` panel creates and
 rebuilds takes with the same job queue. The server accepts text and existing
 take IDs; filesystem WAV paths and reference voice files are CLI-only.
 
 The converter samples `ja_align.v1`'s 15 visemes at its 30 fps frame times,
-uses the rig's existing vowel and closed-lip poses, applies a three-frame
-symmetric filter, and emits a neutral final frame. Speech drives the jaw,
-lips and tongue; manual emotion drives upper-face controls and restrained
-mouth-corner motion. Playback samples the same controls against the WAV
-element's current time, including after seeking. Server `/health` reports
-speech runner/model availability.
+uses the rig's vowel poses, and applies a three-frame symmetric filter. The
+aligner's RMS varies vowel aperture, while voiced F0 adds a small pitch-accent
+brow lift and head pitch. Phone intervals distinguish bilabial closures
+(`m/p/b`) from Japanese `n/N`, which use tongue contact without lip closure.
+Manual emotion drives the upper face and restrained mouth-corner motion.
+Repeatable blinks, gaze shifts and subtle head follow-through are baked into
+the timeline from the take seed; rebuilding a take reuses its seed unless
+overridden. Every take ends on a neutral frame. Playback samples these same
+controls against the WAV element's current time, including after seeking;
+the viewer's random blink and pointer gaze are used only for manual posing.
+Server `/health` reports speech runner/model availability.
 
 Each `<head>/rig/takes/<id>/` contains `audio.wav`, `align.json`,
 `animation.json` (`vhuman.performance.v1`: fps, duration, control names, and
@@ -268,6 +274,12 @@ Each `<head>/rig/takes/<id>/` contains `audio.wav`, `align.json`,
 `rig.usda`), and `manifest.json`. The take listing and guarded file URLs are
 under `/v1/heads/<id>/rig/takes`. Manifests record the rig hash; the viewer
 warns when a rebuilt rig makes an older animation stale.
+`lightrig.txt` contains the standard 51 face controls, including baked blinks
+and gaze; its format cannot carry the extra tongue and signed head controls.
+`animation.json` and `animation.usda` carry the complete motion.
+
+For a Japanese natural-speech review set and ReazonSpeech source constraints,
+see [SPEECH_EVAL.md](SPEECH_EVAL.md).
 
 ### Optional audio emotion suggestions
 

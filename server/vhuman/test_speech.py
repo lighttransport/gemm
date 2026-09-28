@@ -36,7 +36,48 @@ class SpeechTimelineTests(unittest.TestCase):
             self.assertEqual(frames[0]["t"], 0)
             self.assertEqual(frames[-1]["v"], {})
             self.assertTrue(all(set(f["v"]) <= set(rigdef.CONTROLS) for f in frames))
-            self.assertTrue(all(0 <= v <= 1 for f in frames for v in f["v"].values()))
+            self.assertTrue(all((-1 if name in rigdef.SIGNED else 0) <= v <= 1
+                                for f in frames for name, v in f["v"].items()))
+
+    def test_prosody_changes_aperture_and_pitch_accent(self):
+        aux = _aux(2.0)
+        for row in aux["visemes"]["frames"]:
+            row[:] = [float(name == "aa") for name in speech.VISEMES]
+        aux["prosody"] = {"hop": .01, "rms_db": [-45.0] * 100 + [-20.0] * 101,
+                          "f0_hz": [150.0] * 100 + [250.0] * 101}
+        frames = speech.build_frames(aux, secondary_strength=0)
+        self.assertGreater(frames[45]["v"]["jawOpen"], frames[15]["v"]["jawOpen"] + .05)
+        self.assertGreater(frames[45]["v"].get("browInnerUp", 0), 0)
+
+    def test_bilabial_closure_does_not_close_japanese_nasal_n(self):
+        aux = _aux(1.2)
+        for row in aux["visemes"]["frames"]:
+            row[:] = [float(name == "nn") for name in speech.VISEMES]
+        aux["intervals"] = [{"s": "m", "start": .2, "end": .5},
+                            {"s": "n", "start": .6, "end": .9}]
+        frames = speech.build_frames(aux, secondary_strength=0)
+        self.assertGreater(frames[10]["v"].get("mouthClose", 0), .7)
+        self.assertEqual(frames[22]["v"].get("mouthClose", 0), 0)
+        self.assertGreater(frames[22]["v"].get("tongueUp", 0), .3)
+
+    def test_geminate_and_assimilated_nasal_anticipate_bilabial(self):
+        aux = _aux(1.2)
+        aux["intervals"] = [{"s": "N", "start": .2, "end": .4},
+                            {"s": "by", "start": .4, "end": .5},
+                            {"s": "cl", "start": .65, "end": .8},
+                            {"s": "py", "start": .8, "end": .9}]
+        frames = speech.build_frames(aux, secondary_strength=0)
+        self.assertGreater(frames[9]["v"].get("mouthClose", 0), .7)
+        self.assertGreater(frames[22]["v"].get("mouthClose", 0), .7)
+
+    def test_secondary_motion_is_baked_repeatably(self):
+        aux = _aux(4.0)
+        one = speech.build_frames(aux, secondary_seed=31)
+        self.assertEqual(one, speech.build_frames(aux, secondary_seed=31))
+        self.assertNotEqual(one, speech.build_frames(aux, secondary_seed=32))
+        self.assertTrue(any(f["v"].get("eyeBlinkLeft", 0) > .4 for f in one))
+        self.assertTrue(any(f["v"].get("headYaw", 0) < 0 for f in one))
+        self.assertEqual(one[-1]["v"], {})
 
     def test_speech_and_emotion_layers(self):
         frames = speech.build_frames(_aux(), [{"t": 0, "weights": {"joy": 1}},
@@ -92,6 +133,7 @@ class SpeechTakeTests(unittest.TestCase):
                 wav.setframerate(24000)
                 wav.writeframes((3000).to_bytes(2, "little", signed=True) * 12000)
             report = speech.speech_job(service, {"head_id": "h1", "source_take": src.name,
+                                                 "seed": 29,
                                                  "emotion_keyframes": [{"t": 0, "weights": {"joy": 1}}]},
                                        lambda *_: None, threading.Event(), backend="cpu")
             self.assertEqual(report["frames"], 16)
@@ -101,11 +143,21 @@ class SpeechTakeTests(unittest.TestCase):
             self.assertEqual(set(report["urls"]), {"manifest", "audio", "align", "animation", "usd", "lightrig"})
             animation = json.loads(service.take_file("h1", report["id"], "animation.json").read_text())
             self.assertEqual(animation["format"], "vhuman.performance.v1")
+            self.assertEqual(animation["secondary_seed"], 29)
             track = service.take_file("h1", report["id"], "lightrig.txt")
             times, controls = rigdef.read_track(track)
             self.assertEqual(len(times), 16)
             self.assertEqual(len(controls), 16)
+            for frame, values in zip(animation["frames"], controls):
+                self.assertTrue(all(abs(frame["v"].get(name, 0) - values[name]) < 1e-5
+                                    for name in rigdef.LR_FACE_V1))
             self.assertIn("Track", service.take_file("h1", report["id"], "animation.usda").read_text())
+            clone = speech.speech_job(service, {"head_id": "h1", "source_take": report["id"],
+                                                "emotion_keyframes": [{"t": 0, "weights": {"joy": 1}}]},
+                                      lambda *_: None, threading.Event(), backend="cpu")
+            clone_animation = json.loads(service.take_file("h1", clone["id"], "animation.json").read_text())
+            self.assertEqual(clone_animation["secondary_seed"], 29)
+            self.assertEqual(animation["frames"], clone_animation["frames"])
             model = Path(d) / "sensevoice.gguf"
             runner = Path(d) / "sensevoice"
             model.write_bytes(b"fixture")

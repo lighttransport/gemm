@@ -108,8 +108,8 @@ a.dl{color:var(--accent);margin-right:12px;font-size:13px;display:inline-block}
       <label title="expression wrinkle maps (from the subject's expression portraits) blended into the skin normals"><input type="checkbox" id="wrinkles" checked> wrinkles</label>
       <label title="level of detail: LOD0 12.6k, LOD1 ~3.7k, LOD2 ~1.4k head vertices; all driven by the same rig">LOD <select id="lod" style="width:auto"><option value="0">0</option><option value="1">1</option><option value="2">2</option></select></label>
       <label title="post-skinning contact projection: lids outside the eyeballs, lips outside teeth and tongue, upper lip above the lower (exact)"><input type="checkbox" id="exact" checked> exact contacts</label>
-      <label title="random blinks"><input type="checkbox" id="auto-blink" checked> auto blink</label>
-      <label title="eyes (and a little of the head) follow the pointer over the viewer"><input type="checkbox" id="look-at"> look at pointer</label>
+      <label title="random blinks for manual posing; saved takes use baked blinks"><input type="checkbox" id="auto-blink" checked> auto blink</label>
+      <label title="pointer gaze for manual posing; saved takes use baked gaze"><input type="checkbox" id="look-at"> look at pointer</label>
       <label>exposure <input type="range" id="exposure" min="0.3" max="2.5" step="0.05" value="1" style="width:100px"></label>
     </div>
     <div class="card">
@@ -155,6 +155,7 @@ a.dl{color:var(--accent);margin-right:12px;font-size:13px;display:inline-block}
       <div class="tools">
         <label>speech strength <input id="speech-strength" type="range" min="0" max="1" step="0.05" value="1" style="width:95px"></label>
         <label>emotion strength <input id="emotion-strength" type="range" min="0" max="1" step="0.05" value="0.6" style="width:95px"></label>
+        <label>secondary motion <input id="secondary-strength" type="range" min="0" max="1" step="0.05" value="1" style="width:95px"></label>
         <button id="speech-generate" disabled>generate take</button>
         <button id="speech-rebuild" disabled title="Rebuild animation from the selected take without regenerating speech">rebuild animation</button>
       </div>
@@ -373,11 +374,11 @@ $('reset').addEventListener('click', () => { stopAnim(); tweenTo({}, 0.2); });
 let blink = 0, gaze = { x: 0, y: 0 }, pointer = null;
 function effectiveValues() {
   const v = Object.assign({}, state.values);
-  if ($('auto-blink').checked && blink > 0) {
+  if (!state.takeActive && $('auto-blink').checked && blink > 0) {
     v.eyeBlinkLeft = Math.max(v.eyeBlinkLeft || 0, blink);
     v.eyeBlinkRight = Math.max(v.eyeBlinkRight || 0, blink);
   }
-  if ($('look-at').checked) {
+  if (!state.takeActive && $('look-at').checked) {
     const gx = gaze.x, gy = gaze.y;
     v.eyeLookOutLeft = Math.max(0, gx); v.eyeLookInRight = Math.max(0, gx);
     v.eyeLookInLeft = Math.max(0, -gx); v.eyeLookOutRight = Math.max(0, -gx);
@@ -867,6 +868,7 @@ async function loadTake(take) {
   emotionKeys = (animation.emotion_keyframes || []).map((k) => ({ t: +k.t, weights: { ...k.weights } }));
   $('speech-strength').value = animation.speech_strength;
   $('emotion-strength').value = animation.emotion_strength;
+  $('secondary-strength').value = animation.secondary_strength ?? 1;
   $('speech-rebuild').disabled = false;
   $('speech-auto-emotion').checked = false;
   $('speech-msg').textContent = take.rig_stale ? 'Rig changed since export; rebuild this animation for the current rig.'
@@ -922,7 +924,8 @@ async function runSpeechJob(rebuild) {
   const headId = state.current.id;
   const body = { kind: 'rig_speech', head_id: headId, emotion_keyframes: emotionKeys,
                  auto_emotion: $('speech-auto-emotion').checked,
-                 speech_strength: +$('speech-strength').value, emotion_strength: +$('emotion-strength').value };
+                 speech_strength: +$('speech-strength').value, emotion_strength: +$('emotion-strength').value,
+                 secondary_strength: +$('secondary-strength').value };
   if (rebuild) {
     if (!state.take) return;
     body.source_take = state.take.id;
