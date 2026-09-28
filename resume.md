@@ -237,7 +237,7 @@ Picked up the uncommitted work of a previous 4-node session. The whole Q5 varian
 **Prefill GEMM (native):**
 - **Pad the output row stride** (`gemm.c P`): 48T sb256 58.9 → **64.1%** (15.7 TOPS), sb128 58.8%, sb32 41.5%. With ldy = 3072, output tiles fold onto 4 L1 sets. Integration rule: keep `(ldy*4/256) % 64` away from multiples of 16.
 - **CMG-token mode** (`gemm.c t`) runs per-rank shapes (2304 × 4096) at 60.4%.
-- **The 504-token chunk stays at ~50% in every variant tried** (token blocks, K chunks). Output tiles cycle through L2: L1-miss latency 37 → 88.
+- **The 504-token chunk:** at 48 threads, 2304 rows reach 59%. At production's **47 threads** the 11-core CMG straggles, and balancing each CMG's token share by its busiest core's panel count takes 50.2 → **55.5%** (192 tokens: 49.1 → 57.3%). Token blocks, K chunks, a 2D row/token split, output-tile prefetch and next-chunk prefetch do not help much (kept as default-off knobs). A 768-row replica that is L2-hot reaches 66%.
 
 ## Production integration plan (not started; needs the real model on 12 nodes)
 
@@ -261,7 +261,12 @@ Picked up the uncommitted work of a previous 4-node session. The whole Q5 varian
    - Keep `FP_HOLD_LOAD=4` diagnostic until a direct lifetime probe supports it.
    - Acceptance: `measurements/hw-20260927b/eval_probes.sh`, the kernel gate (`compare.py`), and `sprobe/cellcmp.py`.
 2. **Decode.** Integrate panel kernels, repack at load and use flag or hardware barriers into the production runner (`glm53f_iq_bridge.c`, `glm53f_target_decode_12n.c`). Validate on 12 nodes: `build_glm53f_integrated_12n.sh check` bit-identical, then a tok/s A/B. Check production weight page placement: the 2 MiB page effect.
-3. **Prefill.** Fix the 504-token loop nest: keep a token block's output tiles in L1 without re-streaming weights from HBM (per-CMG token blocks sized so the CMG weight replica stays L2-resident, or packed f32 scratch). Test the L2-capacity hypothesis first: weights plus the 2 MiB of activations compete in the 8 MiB L2. Integrate with the padded output stride. W8A8 per-channel remains a gated lossy option.
+3. **Prefill.** Integrate `gk_gemm_panel64` into the production prefill with these rules:
+   - pad the output row stride (`P`);
+   - split tokens across CMGs and panels within a CMG (`t`), with each CMG's token share balanced by its busiest thread (47 threads);
+   - use one weight replica per CMG.
+
+   Remaining kernel gap: 59% (48T) vs 66% when the replica is L2-hot. W8A8 per-channel remains a gated lossy option.
 4. Re-run the qwen38 nine-case event gate; its static cross ELF is off-node.
 
 ## Gotchas
