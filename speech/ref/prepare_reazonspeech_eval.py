@@ -10,6 +10,9 @@ import csv
 import hashlib
 import json
 import math
+import shutil
+import subprocess
+import tarfile
 import wave
 from pathlib import Path
 
@@ -55,6 +58,34 @@ def select_clips(rows, *, seed: int, per_bucket: int) -> list[dict]:
     return selected
 
 
+def archive_rows(tsv: Path, archive: Path, seed: int, limit: int):
+    """Decode only the best hash-ranked names while scanning an official tar."""
+    if not shutil.which("ffmpeg"):
+        raise ValueError("ffmpeg is required for FLAC decoding")
+    metadata = dict(line.rstrip("\n").split("\t", 1) for line in tsv.read_text().splitlines())
+    names = sorted(metadata, key=lambda name: hashlib.sha256(f"{seed}:{name}".encode()).hexdigest())
+    wanted = set(names[:limit])
+    with tarfile.open(archive, "r|") as tar:
+        for member in tar:
+            name = member.name.removeprefix("./")
+            if name not in wanted or not member.isfile():
+                continue
+            stream = tar.extractfile(member)
+            if stream is None:
+                continue
+            flac = stream.read()
+            proc = subprocess.run(["ffmpeg", "-v", "error", "-i", "pipe:0", "-f", "f32le",
+                                   "-ac", "1", "-ar", "16000", "pipe:1"],
+                                  input=flac, capture_output=True, check=False)
+            if proc.returncode:
+                continue
+            wanted.remove(name)
+            yield {"name": name, "transcription": metadata[name],
+                   "audio": {"array": np.frombuffer(proc.stdout, dtype="<f4"), "sampling_rate": 16000}}
+            if not wanted:
+                break
+
+
 def write_set(clips: list[dict], out: Path, fingerprint: str, seed: int) -> None:
     if out.exists() and any(out.iterdir()):
         raise ValueError(f"output directory is not empty: {out}")
@@ -89,18 +120,32 @@ def main() -> None:
     parser.add_argument("--out", type=Path, required=True, help="new output directory (use repo tmp/)")
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--per-bucket", type=int, default=6, help="clips each from 2–4 s and 4–8 s")
+    parser.add_argument("--tsv", type=Path, help="official tiny.tsv; use with --tar instead of datasets")
+    parser.add_argument("--tar", type=Path, help="official 000.tar; use with --tsv")
+    parser.add_argument("--archive-limit", type=int, default=256,
+                        help="top hash-ranked archive names to decode (default 256)")
     args = parser.parse_args()
     if args.per_bucket < 1 or args.seed < 0:
         parser.error("seed and per-bucket must be nonnegative, with at least one clip per bucket")
-    try:
-        from datasets import load_dataset
-    except ImportError as exc:
-        raise SystemExit("install datasets>=2,<4 and its audio dependencies in a local environment") from exc
-    ds = load_dataset("reazon-research/reazonspeech", "tiny", split="train", trust_remote_code=True)
-    clips = select_clips(ds, seed=args.seed, per_bucket=args.per_bucket)
+    if bool(args.tsv) != bool(args.tar):
+        parser.error("pass both --tsv and --tar, or neither")
+    if args.tsv:
+        if args.archive_limit < 2 * args.per_bucket:
+            parser.error("archive-limit must be at least twice per-bucket")
+        clips = select_clips(archive_rows(args.tsv, args.tar, args.seed, args.archive_limit),
+                             seed=args.seed, per_bucket=args.per_bucket)
+        fingerprint = hashlib.sha256(args.tsv.read_bytes()).hexdigest()[:16] + f":{args.tar.stat().st_size}"
+    else:
+        try:
+            from datasets import load_dataset
+        except ImportError as exc:
+            raise SystemExit("install datasets>=2,<4 or pass the official --tsv and --tar") from exc
+        ds = load_dataset("reazon-research/reazonspeech", "tiny", split="train", trust_remote_code=True)
+        clips = select_clips(ds, seed=args.seed, per_bucket=args.per_bucket)
+        fingerprint = getattr(ds, "_fingerprint", "unknown")
     if len(clips) != 2 * args.per_bucket:
         raise SystemExit(f"only {len(clips)} suitable clips found; requested {2 * args.per_bucket}")
-    write_set(clips, args.out, getattr(ds, "_fingerprint", "unknown"), args.seed)
+    write_set(clips, args.out, fingerprint, args.seed)
     print(f"Wrote {len(clips)} clips and review.csv to {args.out}")
 
 

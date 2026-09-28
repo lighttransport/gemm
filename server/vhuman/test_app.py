@@ -72,6 +72,9 @@ class ServerTest(unittest.TestCase):
         status, ctype, body = self.get("/rig")
         self.assertEqual(status, 200)
         self.assertIn(b"class LinearRig", body)
+        status, _, body = self.get("/rig?head=abc&take=123")
+        self.assertEqual(status, 200)
+        self.assertIn(b"params.get('take')", body)
         self.assertIn("rig", json.loads(self.get("/health")[2]))
         for bad in ("/v1/heads/abc/rig/rig.glb", "/v1/heads/abc/rig/../fit.json", "/v1/heads/abc/rig/fit_cache.pkl"):
             self.assertEqual(self.status_of(bad), 404)

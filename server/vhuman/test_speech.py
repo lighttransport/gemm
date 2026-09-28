@@ -70,6 +70,17 @@ class SpeechTimelineTests(unittest.TestCase):
         self.assertGreater(frames[9]["v"].get("mouthClose", 0), .7)
         self.assertGreater(frames[22]["v"].get("mouthClose", 0), .7)
 
+    def test_short_bilabial_reaches_full_closure_at_30_fps(self):
+        aux = _aux(1.2)
+        aux["intervals"] = [{"s": "m", "start": .54, "end": .56}]
+        frames = speech.build_frames(aux, secondary_strength=0)
+        self.assertAlmostEqual(max(f["v"].get("mouthClose", 0) for f in frames), .8)
+        self.assertEqual(frames[17]["v"].get("jawOpen", 0), 0)
+        for row in aux["visemes"]["frames"]:
+            row[:] = [float(name == "PP") for name in speech.VISEMES]
+        frames = speech.build_frames(aux, secondary_strength=0)
+        self.assertEqual(frames[17]["v"].get("mouthPressLeft", 0), 0)
+
     def test_secondary_motion_is_baked_repeatably(self):
         aux = _aux(4.0)
         one = speech.build_frames(aux, secondary_seed=31)
@@ -153,9 +164,11 @@ class SpeechTakeTests(unittest.TestCase):
                                     for name in rigdef.LR_FACE_V1))
             self.assertIn("Track", service.take_file("h1", report["id"], "animation.usda").read_text())
             clone = speech.speech_job(service, {"head_id": "h1", "source_take": report["id"],
+                                                "transcript": "字幕",
                                                 "emotion_keyframes": [{"t": 0, "weights": {"joy": 1}}]},
                                       lambda *_: None, threading.Event(), backend="cpu")
             clone_animation = json.loads(service.take_file("h1", clone["id"], "animation.json").read_text())
+            self.assertEqual(clone["text"], "字幕")
             self.assertEqual(clone_animation["secondary_seed"], 29)
             self.assertEqual(animation["frames"], clone_animation["frames"])
             model = Path(d) / "sensevoice.gguf"

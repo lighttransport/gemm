@@ -863,8 +863,21 @@ async function loadTake(take) {
   state.take = take;
   state.takeFrames = animation.frames;
   state.takeActive = true;
+  const url = new URL(location.href);
+  const initialAt = Number(url.searchParams.get('at'));
+  url.searchParams.set('head', state.current.id);
+  url.searchParams.set('take', take.id);
+  url.searchParams.delete('at');
+  history.replaceState(null, '', url);
+  if (Number.isFinite(initialAt) && initialAt > 0) {
+    speechAudio.addEventListener('loadedmetadata', () => {
+      speechAudio.currentTime = Math.min(initialAt, Math.max(0, speechAudio.duration - .001));
+      updateTakeFrame();
+    }, { once: true });
+  }
   speechAudio.src = take.urls.audio;
   speechAudio.load();
+  if (Number.isFinite(initialAt) && initialAt > 0) speechAudio.currentTime = initialAt;
   emotionKeys = (animation.emotion_keyframes || []).map((k) => ({ t: +k.t, weights: { ...k.weights } }));
   $('speech-strength').value = animation.speech_strength;
   $('emotion-strength').value = animation.emotion_strength;
@@ -898,8 +911,9 @@ async function loadTakes(headId, selectId) {
   }
   state.takes = data.takes;
   if (data.takes.length) {
-    select.value = selectId || data.takes[0].id;
-    await loadTake(data.takes.find((t) => t.id === select.value) || data.takes[0]);
+    const chosen = data.takes.find((t) => t.id === selectId) || data.takes[0];
+    select.value = chosen.id;
+    await loadTake(chosen);
   } else {
     stopAnim(); state.take = null; state.takeFrames = null; speechAudio.removeAttribute('src'); speechAudio.load();
     $('speech-rebuild').disabled = true;
@@ -1167,7 +1181,9 @@ async function select(h) {
   $('build').disabled = !!state.job;
   $('build').textContent = h.rig ? 'Rebuild rig for selected head' : 'Build rig for selected head';
   if (h.rig) {
-    try { await loadRig(h); await loadTakes(h.id); } catch (e) { $('msg').textContent = String(e); $('msg').className = 'msg bad'; }
+    const params = new URLSearchParams(location.search);
+    const takeId = params.get('head') === h.id ? params.get('take') : null;
+    try { await loadRig(h); await loadTakes(h.id, takeId); } catch (e) { $('msg').textContent = String(e); $('msg').className = 'msg bad'; }
   } else {
     $('speech-takes').replaceChildren();
     $('empty').hidden = false;

@@ -242,6 +242,10 @@ python3 -m server.vhuman.cli --work tmp/vhuman-independent rig-speech \
   --head <id> --wav input.wav --backend cpu
 ```
 
+For a known recording, `--transcript '日本語の文'` stores its reference text in
+the take. `--kana 'にほんごのぶん'` additionally forces phoneme alignment to a
+known kana reading; it is passed to the WAV aligner, not inferred from kanji.
+
 For a Base model, use `--tts-model <Base dir> --ref-wav reference.wav`
 and optionally `--ref-text` or `--xvec-only`. `--source-take <take id>`
 rebuilds animation from a completed take's audio and alignment, without
@@ -260,6 +264,10 @@ uses the rig's vowel poses, and applies a three-frame symmetric filter. The
 aligner's RMS varies vowel aperture, while voiced F0 adds a small pitch-accent
 brow lift and head pitch. Phone intervals distinguish bilabial closures
 (`m/p/b`) from Japanese `n/N`, which use tongue contact without lip closure.
+At 30 fps, a very short bilabial is snapped to its nearest frame so the lip
+closure does not disappear between samples. Jaw opening and lip press fade to
+zero at peak closure; a rendered Japanese /m/ frame showed that even small
+residual values exposed a thin teeth strip on this rig.
 Manual emotion drives the upper face and restrained mouth-corner motion.
 Repeatable blinks, gaze shifts and subtle head follow-through are baked into
 the timeline from the take seed; rebuilding a take reuses its seed unless

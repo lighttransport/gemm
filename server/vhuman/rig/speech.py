@@ -161,21 +161,33 @@ def _prosody(aux: dict, times: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return energy, pitch
 
 
-def _phone_at(aux: dict, t: float) -> tuple[str, float]:
+def _phone_at(aux: dict, t: float, frame_index: int, fps: float) -> tuple[str, float]:
     intervals = aux.get("intervals") or ()
+    best_phone, best_score = "", (0.0, -1)
+    bilabial = {"p", "py", "b", "by", "m", "my"}
+    lingual = {"n", "ny", "N", "t", "ty", "d", "dy"}
     for i, interval in enumerate(intervals):
         start, end = float(interval["start"]), float(interval["end"])
-        if start <= t < end:
-            phone = str(interval["s"])
-            following = str(intervals[i + 1]["s"]) if i + 1 < len(intervals) else ""
-            if phone == "cl":
-                phone = following  # Japanese geminate anticipates the next closure.
-            elif phone == "N" and following in ("p", "py", "b", "by", "m", "my"):
-                phone = "m"  # Moraic nasal assimilates before a bilabial.
-            # A narrow ramp preserves coarticulation at each boundary.
-            return phone, max(0.0, min(1.0, (t - start + .01) / .025,
-                                       (end - t + .01) / .025))
-    return "", 0.0
+        if end <= start or t < start - .025 or t > end + .03:
+            continue
+        phone = str(interval["s"])
+        following = str(intervals[i + 1]["s"]) if i + 1 < len(intervals) else ""
+        if phone == "cl":
+            phone = following  # Japanese geminate anticipates the next closure.
+        elif phone == "N" and following in bilabial:
+            phone = "m"  # Moraic nasal assimilates before a bilabial.
+        if phone not in bilabial | lingual:
+            continue
+        # A 20 ms phone can otherwise fall between 30 fps samples. Hold its
+        # center at full closure and allow a short anticipatory/release ramp.
+        strength = ((t - start + .025) / .025 if t < start else
+                    (end + .03 - t) / .03 if t > end else 1.0)
+        if frame_index == int(math.floor((start + end) * .5 * fps + .5)):
+            strength = 1.0
+        score = (max(0.0, min(1.0, strength)), int(phone in bilabial))
+        if score > best_score:
+            best_phone, best_score = phone, score
+    return best_phone, best_score[0]
 
 
 def _secondary(times: np.ndarray, duration: float, seed: int) -> list[dict]:
@@ -256,12 +268,15 @@ def build_frames(aux: dict, emotion_keyframes=None, speech_strength: float = 1.0
         # RMS controls vowel aperture; pitch accent adds a subtle brow lift.
         out[index["jawOpen"]] *= .78 + .22 * energy[i]
         out[index["browInnerUp"]] += .045 * max(0.0, pitch[i]) * energy[i] * speech_strength
-        phone, closure = _phone_at(aux, t)
+        phone, closure = _phone_at(aux, t, i, fps)
         if phone in ("p", "py", "b", "by", "m", "my"):
-            out[index["jawOpen"]] *= 1 - .75 * closure
+            # On this rig even a tiny residual jaw/press opens a visible teeth
+            # slit. The rest lips already meet, so seal these at the peak.
+            seal = min(1.0, closure / .7)
+            out[index["jawOpen"]] *= 1 - seal
             out[index["mouthClose"]] += .8 * closure * speech_strength
             for side in ("mouthPressLeft", "mouthPressRight"):
-                out[index[side]] = max(out[index[side]], .72 * closure * speech_strength)
+                out[index[side]] *= 1 - seal
             if phone in ("m", "my"):
                 out[index["tongueUp"]] *= 1 - closure
         elif phone in ("n", "ny", "N", "t", "ty", "d", "dy"):
@@ -354,6 +369,10 @@ def speech_job(service, request: dict, progress, cancel, *, model=DEFAULT_MODEL,
         raise ValueError("WAV paths are available only through the CLI")
     if text and (not isinstance(text, str) or len(text) > 1000 or "\0" in text):
         raise ValueError("text must be at most 1000 characters")
+    for key in ("kana", "transcript"):
+        value = request.get(key)
+        if value is not None and (not isinstance(value, str) or len(value) > 1000 or "\0" in value):
+            raise ValueError(f"{key} must be at most 1000 characters")
     if request.get("ref_wav") and not allow_wav:
         raise ValueError("reference WAV paths are available only through the CLI")
     seed = request.get("seed") if request.get("seed") is not None else 7
@@ -398,6 +417,8 @@ def speech_job(service, request: dict, progress, cancel, *, model=DEFAULT_MODEL,
                 raise ValueError("ja_align runner or aligner weights missing; see speech/README.md")
             cmd = [str(runner), "--model", str(aligner), "--wav", str(stage / "audio.wav"),
                    "--fps", str(FPS), "--out", str(stage / "align.json")]
+            if request.get("kana"):
+                cmd += ["--kana", request["kana"]]
             if selected == "cuda":
                 cmd += ["--cuda"]
             with gpu.device_session(1536, cancel) if selected == "cuda" else nullcontext():
@@ -454,7 +475,8 @@ def speech_job(service, request: dict, progress, cancel, *, model=DEFAULT_MODEL,
         manifest = {"id": take_id, "head_id": head, "format": animation["format"],
                     "source": "text" if text else "wav" if wav else "source_take",
                     "source_take": source_take,
-                    "text": text or source_meta.get("text", ""), "duration": aux["duration"], "fps": animation["fps"],
+                    "text": text or request.get("transcript") or source_meta.get("text", ""),
+                    "duration": aux["duration"], "fps": animation["fps"],
                     "frames": len(frames), "backend": "reused" if source_take else selected,
                     "speaker": request.get("speaker") if text else source_meta.get("speaker"),
                     "seed": seed if text else source_meta.get("seed"),

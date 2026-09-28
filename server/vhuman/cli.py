@@ -273,7 +273,8 @@ def cmd_rig_speech(args) -> dict:
     svc = EyeService(Path(args.work))
     emotions = json.loads(Path(args.emotions[1:]).read_text() if args.emotions.startswith("@") else args.emotions)
     req = {"head_id": args.head, "text": args.text, "wav": args.wav, "source_take": args.source_take,
-           "speaker": args.speaker, "instruct": args.instruct, "kana": args.kana, "seed": args.seed,
+           "speaker": args.speaker, "instruct": args.instruct, "kana": args.kana,
+           "transcript": args.transcript, "seed": args.seed,
            "ref_wav": args.ref_wav, "ref_text": args.ref_text, "xvec_only": args.xvec_only,
            "emotion_keyframes": emotions, "auto_emotion": args.auto_emotion, "speech_strength": args.speech_strength,
            "emotion_strength": args.emotion_strength, "secondary_strength": args.secondary_strength}
@@ -409,6 +410,7 @@ def main(argv=None) -> int:
     sp.add_argument("--speaker", default="Ono_Anna")
     sp.add_argument("--instruct", default="")
     sp.add_argument("--kana")
+    sp.add_argument("--transcript", help="reference text to store with a WAV take")
     sp.add_argument("--seed", type=int, help="TTS/motion seed (default 7; a rebuild reuses its source seed)")
     sp.add_argument("--ref-wav")
     sp.add_argument("--ref-text")
