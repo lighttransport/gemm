@@ -26,15 +26,17 @@ int main(int argc, char **argv) {
     vh_vk_eval_batch(g, x.data(), frames, 1, out.data(), ms);          // warm up
     printf("memory: inputs %s, readback %s\n", (vh_vk_memory_flags(g) & 1) ? "device-local host-visible" : "host",
            (vh_vk_memory_flags(g) & 2) ? "host-cached" : "uncached");
-    for (int ml = 1; ml >= 0; --ml) {
+    for (int mode = 0; mode < 3; ++mode) {
+        int ml = mode < 2, ct = mode == 0;          // ML + contacts, ML only, linear rig only
+        vh_deformer_set_contact_iterations(d, ct ? 4 : 0);
         if (vh_vk_eval_batch(g, x.data(), frames, ml, out.data(), ms)) { fprintf(stderr, "dispatch failed\n"); return 1; }
         double err = 0;
         for (size_t f = 0; f < frames; f += frames / 8 + 1) {
             vh_deformer_eval(d, x.data() + f * C, ml, ref.data());
             for (size_t i = 0; i < V * 3; ++i) err = std::fmax(err, std::fabs(ref[i] - out[f * V * 3 + i]));
         }
-        printf("ml=%d  dispatch %.3f ms (%.2f us/frame)  host rig %.3f ms  upload %.3f ms  download %.3f ms  max|gpu-cpu| %.2e m\n",
-               ml, ms[2], ms[2] * 1e3 / frames, ms[0], ms[1], ms[3], err);
+        printf("ml=%d contacts=%d  dispatch %.3f ms (%.2f us/frame)  host rig %.3f ms  upload %.3f ms  download %.3f ms  max|gpu-cpu| %.2e m\n",
+               ml, ct, ms[2], ms[2] * 1e3 / frames, ms[0], ms[1], ms[3], err);
     }
     vh_vk_free(g);
     vh_deformer_free(d);

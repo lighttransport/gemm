@@ -13,6 +13,9 @@ using vl_cpp::vulkan::VulkanComputeRunner;
 static const uint32_t kSpirv[] =
 #include "vh_deform.spv.inc"
     ;
+static const uint32_t kSpirvContacts[] =
+#include "vh_contacts.spv.inc"
+    ;
 
 namespace {
 constexpr int FT = 8, MAX_M = 256, MAX_J = 64;
@@ -24,7 +27,11 @@ double now_ms() {
 struct vh_vk {
     vh_deformer *d = nullptr;
     VulkanComputeRunner runner;
-    VulkanComputeRunner::ComputePipeline pipe{};
+    VulkanComputeRunner::ComputePipeline pipe{}, pipe_ct{};
+    VulkanComputeRunner::BufferInfo c_ints{}, c_flts{}, c_scr{};
+    int32_t ct_pc[26] = {};
+    bool has_ct = false;
+    std::vector<float> hscratch;
     VulkanComputeRunner::BufferInfo rest{}, morph{}, sj{}, sw{}, w{}, skin{}, out{}, stage{};
     size_t V = 0, M = 0, J = 0, C = 0, cap = 0;
     std::vector<float> hw, hskin;
@@ -67,6 +74,34 @@ vh_vk *vh_vk_create(vh_deformer *d, int device, int verbose) {
         return nullptr;
     }
     g->have_pipe = true;
+    const vh_contacts *c = vh_deformer_contacts(d);
+    if (c && c->ns <= 512) {
+        std::vector<int32_t> ints;
+        std::vector<float> flts;
+        auto put_i = [&](const int *p, size_t n) { int32_t o = (int32_t)ints.size(); ints.insert(ints.end(), p, p + n); return o; };
+        auto put_f = [&](const float *p, size_t n) { int32_t o = (int32_t)flts.size(); flts.insert(flts.end(), p, p + n); return o; };
+        std::vector<float> thr_t(c->nl * c->ns);                  // (T, L): coalesced
+        for (size_t l = 0; l < c->nl; ++l)
+            for (size_t t = 0; t < c->ns; ++t) thr_t[t * c->nl + l] = c->sph_thr[l * c->ns + t];
+        int32_t *q = g->ct_pc;
+        q[0] = (int32_t)g->V; q[1] = (int32_t)g->J; q[2] = (int32_t)c->ne; q[3] = (int32_t)c->nl;
+        q[4] = (int32_t)c->ns; q[5] = (int32_t)c->np; q[6] = c->up_joints[0]; q[7] = c->up_joints[1];
+        q[9] = put_i(c->eye_ids, c->ne); q[10] = put_i(c->eye_joint, c->ne); q[11] = put_i(c->lip_ids, c->nl);
+        q[12] = put_i(c->sph_joint, c->ns * 2); q[13] = put_i(c->pair_u, c->np); q[14] = put_i(c->pair_l, c->np);
+        q[15] = put_f(c->eye_center, c->ne * 3); q[16] = put_f(c->eye_thr, c->ne);
+        q[17] = put_f(c->sph_center, c->ns * 3); q[18] = put_f(c->sph_weight, c->ns * 2);
+        q[19] = put_f(thr_t.data(), thr_t.size()); q[20] = put_f(c->pair_floor, c->np);
+        q[21] = (int32_t)c->nc; q[22] = VH_CONTACT_SMOOTH_STEPS;
+        if (c->nc) {
+            q[23] = put_i(c->verts, c->nc); q[24] = put_i(c->nbr_ptr, c->nc + 1);
+            q[25] = put_i(c->nbr_idx, (size_t)c->nbr_ptr[c->nc]);
+        }
+        std::vector<uint32_t> spv2(kSpirvContacts, kSpirvContacts + sizeof(kSpirvContacts) / sizeof(kSpirvContacts[0]));
+        std::vector<VkDescriptorSetLayoutBinding> b4(bindings.begin(), bindings.begin() + 5);
+        g->has_ct = g->runner.createComputePipelineWithPushConstants(spv2, b4, sizeof(g->ct_pc), g->pipe_ct) &&
+                    upload(g, g->c_ints, ints.data(), ints.size() * 4) && upload(g, g->c_flts, flts.data(), flts.size() * 4);
+        if (!g->has_ct && verbose) fprintf(stderr, "vhuman_deformer_vk: no contact pipeline: %s\n", g->runner.getLastError().c_str());
+    }
     size_t n3 = g->V * 3;
     if (!upload(g, g->rest, vh_deformer_rest(d), n3 * 4) || !upload(g, g->morph, vh_deformer_morph(d), g->M * n3 * 4) ||
         !upload(g, g->sj, vh_deformer_skin_joints(d), g->V * 16) || !upload(g, g->sw, vh_deformer_skin_weights(d), g->V * 16)) {
@@ -82,7 +117,7 @@ int vh_vk_memory_flags(const vh_vk *g) { return (g->bar_inputs ? 1 : 0) | (g->ca
 static bool ensure(vh_vk *g, size_t frames) {
     if (frames <= g->cap) return true;
     auto &r = g->runner;
-    for (auto *b : {&g->w, &g->skin, &g->out, &g->stage})
+    for (auto *b : {&g->w, &g->skin, &g->out, &g->stage, &g->c_scr})
         if (b->buffer) { r.destroyBuffer(*b); *b = {}; }
     size_t cap = frames < 64 ? 64 : frames;
     VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
@@ -104,7 +139,11 @@ static bool ensure(vh_vk *g, size_t frames) {
         return false;
     g->hw.resize(cap * g->M);
     g->hskin.resize(cap * g->J * 12);
+    g->hscratch.resize(vh_deformer_prepare_scratch(g->d, cap) + 1);
     g->cap = cap;
+    if (g->has_ct && !(r.createDeviceLocalBuffer(cap * (size_t)(g->ct_pc[21] ? g->ct_pc[21] : 1) * 24, g->c_scr) &&
+                       r.updateDescriptorSet(g->pipe_ct, {g->out, g->skin, g->c_ints, g->c_flts, g->c_scr})))
+        return false;
     return r.updateDescriptorSet(g->pipe, {g->rest, g->morph, g->sj, g->sw, g->w, g->skin, g->out});
 }
 
@@ -113,8 +152,7 @@ int vh_vk_eval_batch(vh_vk *g, const float *controls, size_t frames, int use_ml,
     if (!ensure(g, frames)) return -1;
     auto &r = g->runner;
     double t0 = now_ms();
-    for (size_t f = 0; f < frames; ++f)
-        vh_deformer_prepare(g->d, controls + f * g->C, use_ml, g->hw.data() + f * g->M, g->hskin.data() + f * g->J * 12);
+    vh_deformer_prepare_batch(g->d, controls, frames, use_ml, g->hw.data(), g->hskin.data(), g->hscratch.data());
     double t1 = now_ms();
     void *p = nullptr;
     if (!r.mapBuffer(g->w, &p)) return -2;
@@ -130,6 +168,15 @@ int vh_vk_eval_batch(vh_vk *g, const float *controls, size_t frames, int use_ml,
     r.bindDescriptorSets(g->pipe);
     r.pushConstants(g->pipe, pc, sizeof(pc));
     r.dispatch((uint32_t)((g->V + 127) / 128), (uint32_t)((frames + FT - 1) / FT), 1);
+    int iters = vh_deformer_contact_iterations(g->d);
+    if (g->has_ct && iters > 0) {                // exact contacts on the skinned result
+        r.computeBarrier();
+        g->ct_pc[8] = iters;
+        r.bindComputePipeline(g->pipe_ct);
+        r.bindDescriptorSets(g->pipe_ct);
+        r.pushConstants(g->pipe_ct, g->ct_pc, sizeof(g->ct_pc));
+        r.dispatch((uint32_t)frames, 1, 1);
+    }
     if (!r.endRecordingAndSubmit() || !r.waitForCompletion()) return -4;
     double t3 = now_ms();
     if (out) {                                   // device -> host-cached staging -> out
@@ -157,6 +204,9 @@ void vh_vk_free(vh_vk *g) {
     auto &r = g->runner;
     for (auto *b : {&g->rest, &g->morph, &g->sj, &g->sw, &g->w, &g->skin, &g->out, &g->stage})
         if (b->buffer) r.destroyBuffer(*b);
+    for (auto *b : {&g->c_ints, &g->c_flts, &g->c_scr})
+        if (b->buffer) r.destroyBuffer(*b);
+    if (g->has_ct) r.destroyComputePipeline(g->pipe_ct);
     if (g->have_pipe) r.destroyComputePipeline(g->pipe);
     r.cleanup();
     delete g;

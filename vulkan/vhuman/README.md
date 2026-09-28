@@ -20,7 +20,10 @@ here. Readback goes through a host-cached staging buffer. On the tested
 NVIDIA driver that copy ran at only ~0.6 GB/s, so keep outputs on the GPU
 (`out = NULL`) when rendering.
 
-RTX 5060 Ti, reference head (12.6k vertices, 149 morphs), 1024 frames:
-8–12 µs/frame for submit-to-completion. The results equal the CPU deformer
-(`server/vhuman/test_rig`). The GPU was shared with another compute process
-during these measurements.
+A second shader (`shaders/vh_contacts.comp`, one workgroup per frame)
+applies the exact post-skinning contact projection. Contact data is packed
+into one int and one float buffer, with offsets passed as push constants.
+
+Idle RTX 5060 Ti, reference head (12.6k vertices, 149 morphs), 1024 frames:
+2.9 µs/frame deform, 7.8 µs/frame with exact contacts (submit to completion).
+The results equal the CPU deformer (`server/vhuman/test_rig`).

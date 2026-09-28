@@ -14,10 +14,12 @@ make -C cuda/vhuman
 ./cuda/vhuman/bench_vhuman_deformer_cuda <head>/rig/rig_deformer.safetensors 1024
 ```
 
-RTX 5060 Ti, reference head (12.6k vertices), 1024 frames: 2.3 µs/frame in
-the kernel with 117 morphs, and 6.4 µs/frame with 149 morphs (region-split ML
-basis) while another compute process shared the GPU. The CPU deformer takes
-1.9 ms single frame and 0.57 ms/frame batched. Host-side rig preparation takes
-~9 µs/frame. The results equal the CPU deformer
+A second kernel (`vh_contacts`, one block per frame) applies the exact
+post-skinning contact projection (`server/vhuman/rig/contacts.py`). It is on by
+default when the package has contact tensors.
+
+Idle RTX 5060 Ti, reference head (12.6k vertices, 149 morphs), 1024 frames:
+2.2 µs/frame deform, 6.7 µs/frame with exact contacts. Host preparation (MLP as
+two `sgemm_avx2` calls) takes 4.5 µs/frame, and downloading 50 MB takes ~22 ms. The results equal the CPU deformer
 (`test_rig`), and the downloaded positions are 50 MB per 1024 frames. The
 Python wrapper is `server/vhuman/rig/native.py` (`NativeGPU`).

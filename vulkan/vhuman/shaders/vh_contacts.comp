@@ -1,0 +1,134 @@
+#version 450
+// Post-skinning contact projection, one workgroup per frame; the same phases
+// and arithmetic as server/vhuman/rig/contacts.py and ryzen/vhuman_deformer.c.
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) buffer Out { float x[]; };
+layout(std430, binding = 1) readonly buffer Skin { float skin[]; };
+layout(std430, binding = 2) readonly buffer Ints { int ints[]; };
+layout(std430, binding = 3) readonly buffer Floats { float flt[]; };
+layout(std430, binding = 4) buffer Scratch { float scr[]; };      // per frame: x0 (nc x 3), d (nc x 3)
+layout(push_constant) uniform PC {
+  int V, J, ne, nl, ns, np, head, jaw, iters;
+  int o_eye_ids, o_eye_joint, o_lip_ids, o_sph_joint, o_pair_u, o_pair_l;        // into ints
+  int o_eye_center, o_eye_thr, o_sph_center, o_sph_weight, o_sph_thr, o_pair_floor;   // into flt (sph_thr is (T, L))
+  int nc, smoothSteps, o_verts, o_nbr_ptr, o_nbr_idx;                                     // contact graph (ints)
+} pc;
+shared float sc[512 * 3];
+shared float up[3];
+shared int anyMove;
+
+int push(int base, vec3 c, float thr) {
+  vec3 v = vec3(x[base], x[base + 1], x[base + 2]) - c;
+  float dd = sqrt(dot(v, v));
+  if (dd < thr) {
+    float k = thr / (dd > 1e-12 ? dd : 1e-12);
+    x[base] = c.x + v.x * k; x[base + 1] = c.y + v.y * k; x[base + 2] = c.z + v.z * k;
+    return 1;
+  }
+  return 0;
+}
+
+vec3 xf(int s, vec3 p) {      // skin row-major 3x4 at float offset s
+  return vec3(skin[s] * p.x + skin[s + 1] * p.y + skin[s + 2] * p.z + skin[s + 3],
+              skin[s + 4] * p.x + skin[s + 5] * p.y + skin[s + 6] * p.z + skin[s + 7],
+              skin[s + 8] * p.x + skin[s + 9] * p.y + skin[s + 10] * p.z + skin[s + 11]);
+}
+
+void solve(int S, int X, int tid) {
+  vec3 U = vec3(up[0], up[1], up[2]);
+  for (int it = 0; it < pc.iters; ++it) {
+    if (tid == 0) anyMove = 0;
+    barrier();
+    int any = 0;
+    for (int i = tid; i < pc.ne; i += 256) {
+      vec3 c = vec3(flt[pc.o_eye_center + i * 3], flt[pc.o_eye_center + i * 3 + 1], flt[pc.o_eye_center + i * 3 + 2]);
+      any |= push(X + ints[pc.o_eye_ids + i] * 3, xf(S + ints[pc.o_eye_joint + i] * 12, c), flt[pc.o_eye_thr + i]);
+    }
+    memoryBarrierBuffer();
+    barrier();
+    for (int p = tid; p < pc.np; p += 256) {
+      int u = X + ints[pc.o_pair_u + p] * 3, l = X + ints[pc.o_pair_l + p] * 3;
+      float sep = (x[u] - x[l]) * U.x + (x[u + 1] - x[l + 1]) * U.y + (x[u + 2] - x[l + 2]) * U.z;
+      float dl = flt[pc.o_pair_floor + p] - sep;
+      if (dl > 0.0) {
+        dl *= 0.5; any = 1;
+        x[u] += dl * U.x; x[u + 1] += dl * U.y; x[u + 2] += dl * U.z;
+        x[l] -= dl * U.x; x[l + 1] -= dl * U.y; x[l + 2] -= dl * U.z;
+      }
+    }
+    memoryBarrierBuffer();
+    barrier();
+    for (int l = tid; l < pc.nl; l += 256) {
+      int q = X + ints[pc.o_lip_ids + l] * 3;
+      for (int pass = 0; pass < 8; ++pass) {
+        int moved = 0;
+        for (int t = 0; t < pc.ns; ++t)
+          moved |= push(q, vec3(sc[t * 3], sc[t * 3 + 1], sc[t * 3 + 2]), flt[pc.o_sph_thr + t * pc.nl + l]);
+        any |= moved;
+        if (moved == 0) break;
+      }
+    }
+    if (any != 0) atomicOr(anyMove, 1);
+    memoryBarrierBuffer();
+    barrier();
+    if (anyMove == 0) break;      // uniform: every invocation reads the same shared value
+    barrier();
+  }
+}
+
+void main() {
+  int frame = int(gl_WorkGroupID.x), tid = int(gl_LocalInvocationID.x);
+  int S = frame * pc.J * 12, X = frame * pc.V * 3;
+  for (int t = tid; t < pc.ns; t += 256) {
+    float M[12];
+    for (int e = 0; e < 12; ++e) M[e] = 0.0;
+    for (int k = 0; k < 2; ++k) {
+      float w = flt[pc.o_sph_weight + t * 2 + k];
+      if (w == 0.0) continue;
+      int sj = S + ints[pc.o_sph_joint + t * 2 + k] * 12;
+      for (int e = 0; e < 12; ++e) M[e] += w * skin[sj + e];
+    }
+    vec3 p = vec3(flt[pc.o_sph_center + t * 3], flt[pc.o_sph_center + t * 3 + 1], flt[pc.o_sph_center + t * 3 + 2]);
+    sc[t * 3] = M[0] * p.x + M[1] * p.y + M[2] * p.z + M[3];
+    sc[t * 3 + 1] = M[4] * p.x + M[5] * p.y + M[6] * p.z + M[7];
+    sc[t * 3 + 2] = M[8] * p.x + M[9] * p.y + M[10] * p.z + M[11];
+  }
+  if (tid == 0) {
+    int H = S + pc.head * 12, Jw = S + pc.jaw * 12;
+    vec3 u = vec3(skin[H + 1] + skin[Jw + 1], skin[H + 5] + skin[Jw + 5], skin[H + 9] + skin[Jw + 9]);
+    u /= sqrt(dot(u, u));
+    up[0] = u.x; up[1] = u.y; up[2] = u.z;
+  }
+  barrier();
+  for (int i = tid; i < pc.nc; i += 256) {
+    int v = X + ints[pc.o_verts + i] * 3, o = frame * pc.nc * 6 + i * 3;
+    scr[o] = x[v]; scr[o + 1] = x[v + 1]; scr[o + 2] = x[v + 2];
+  }
+  memoryBarrierBuffer();
+  barrier();
+  solve(S, X, tid);
+  if (pc.nc == 0) return;
+  int X0 = frame * pc.nc * 6, D = X0 + pc.nc * 3;
+  for (int step = 0; step < pc.smoothSteps; ++step) {
+    memoryBarrierBuffer();
+    barrier();
+    for (int i = tid; i < pc.nc; i += 256) {
+      int v = X + ints[pc.o_verts + i] * 3;
+      for (int a = 0; a < 3; ++a) scr[D + i * 3 + a] = x[v + a] - scr[X0 + i * 3 + a];
+    }
+    memoryBarrierBuffer();
+    barrier();
+    for (int i = tid; i < pc.nc; i += 256) {
+      int b = ints[pc.o_nbr_ptr + i], e = ints[pc.o_nbr_ptr + i + 1], v = X + ints[pc.o_verts + i] * 3;
+      vec3 m = vec3(0.0);
+      for (int k = b; k < e; ++k) { int n = D + ints[pc.o_nbr_idx + k] * 3; m += vec3(scr[n], scr[n + 1], scr[n + 2]); }
+      for (int a = 0; a < 3; ++a) {
+        float di = scr[D + i * 3 + a], mean = e > b ? m[a] / float(e - b) : di;
+        x[v + a] = scr[X0 + i * 3 + a] + 0.5 * (di + mean);
+      }
+    }
+  }
+  memoryBarrierBuffer();
+  barrier();
+  solve(S, X, tid);
+}

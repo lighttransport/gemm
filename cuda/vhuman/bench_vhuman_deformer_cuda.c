@@ -23,15 +23,17 @@ int main(int argc, char **argv) {
     printf("%s: vertices %zu, morphs %zu, frames %zu\n", vh_gpu_name(g), V, vh_deformer_morphs(d), frames);
     double ms[4];
     vh_gpu_eval_batch(g, x, frames, 1, out, ms);        /* warm up */
-    for (int ml = 1; ml >= 0; --ml) {
+    for (int mode = 0; mode < 3; ++mode) {
+        int ml = mode < 2, ct = mode == 0;          /* ML + contacts, ML only, linear rig only */
+        vh_deformer_set_contact_iterations(d, ct ? 4 : 0);
         if (vh_gpu_eval_batch(g, x, frames, ml, out, ms)) { fprintf(stderr, "launch failed\n"); return 1; }
         double err = 0;
         for (size_t f = 0; f < frames; f += frames / 8 + 1) {
             vh_deformer_eval(d, x + f * C, ml, ref);
             for (size_t i = 0; i < V * 3; ++i) err = fmax(err, fabs(ref[i] - out[f * V * 3 + i]));
         }
-        printf("ml=%d  kernel %.3f ms (%.2f us/frame)  host rig %.3f ms  upload %.3f ms  download %.3f ms  max|gpu-cpu| %.2e m\n",
-               ml, ms[2], ms[2] * 1e3 / frames, ms[0], ms[1], ms[3], err);
+        printf("ml=%d contacts=%d  kernel %.3f ms (%.2f us/frame)  host rig %.3f ms  upload %.3f ms  download %.3f ms  max|gpu-cpu| %.2e m\n",
+               ml, ct, ms[2], ms[2] * 1e3 / frames, ms[0], ms[1], ms[3], err);
     }
     free(x); free(out); free(ref);
     vh_gpu_free(g);

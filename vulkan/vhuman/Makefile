@@ -17,7 +17,10 @@ all: bench_vhuman_deformer_vk libvhuman_deformer_vk.so
 vh_deform.spv.inc: shaders/vh_deform.comp
 	$(GLSLC) -O --target-env=vulkan1.2 -mfmt=c -o $@ $<
 
-bench_vhuman_deformer_vk: bench_vhuman_deformer_vk.cc $(CXXSRC) $(CSRCS) vh_deform.spv.inc vhuman_deformer_vk.h
+vh_contacts.spv.inc: shaders/vh_contacts.comp
+	$(GLSLC) -O --target-env=vulkan1.2 -mfmt=c -o $@ $<
+
+bench_vhuman_deformer_vk: bench_vhuman_deformer_vk.cc $(CXXSRC) $(CSRCS) vh_deform.spv.inc vh_contacts.spv.inc vhuman_deformer_vk.h
 	$(CXX) $(CXXFLAGS) -I. -c vhuman_deformer_vk.cc -o vhuman_deformer_vk.o
 	$(CXX) $(CXXFLAGS) -c ../deps/vulkan-runner.cc -o vulkan-runner.o
 	$(CXX) $(CXXFLAGS) -c ../deps/vkew.cc -o vkew.o
@@ -27,7 +30,7 @@ bench_vhuman_deformer_vk: bench_vhuman_deformer_vk.cc $(CXXSRC) $(CSRCS) vh_defo
 	$(CXX) $(CXXFLAGS) -o $@ bench_vhuman_deformer_vk.cc vhuman_deformer_vk.o vulkan-runner.o vkew.o \
 		vhuman_deformer.o lightrig_mlp2.o gemm_avx2.o $(LDFLAGS)
 
-libvhuman_deformer_vk.so: $(CXXSRC) $(CSRCS) vh_deform.spv.inc vhuman_deformer_vk.h
+libvhuman_deformer_vk.so: $(CXXSRC) $(CSRCS) vh_deform.spv.inc vh_contacts.spv.inc vhuman_deformer_vk.h
 	$(CXX) $(CXXFLAGS) -fPIC -I. -c vhuman_deformer_vk.cc -o vhuman_deformer_vk.pic.o
 	$(CXX) $(CXXFLAGS) -fPIC -c ../deps/vulkan-runner.cc -o vulkan-runner.pic.o
 	$(CXX) $(CXXFLAGS) -fPIC -c ../deps/vkew.cc -o vkew.pic.o
@@ -38,4 +41,4 @@ libvhuman_deformer_vk.so: $(CXXSRC) $(CSRCS) vh_deform.spv.inc vhuman_deformer_v
 		lightrig_mlp2.pic.o gemm_avx2.pic.o $(LDFLAGS)
 
 clean:
-	rm -f *.o bench_vhuman_deformer_vk libvhuman_deformer_vk.so vh_deform.spv.inc
+	rm -f *.o bench_vhuman_deformer_vk libvhuman_deformer_vk.so vh_deform.spv.inc vh_contacts.spv.inc
