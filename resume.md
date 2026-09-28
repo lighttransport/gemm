@@ -1,4 +1,4 @@
-# Resume: GLM-5.3-Flash A64FX kernel efficiency + QLAIR accuracy (updated 2026-09-28 09:20)
+# Resume: GLM-5.3-Flash A64FX kernel efficiency + QLAIR accuracy (updated 2026-09-28 10:20)
 
 ## Goal
 Run GLM-5.3-Flash (GLM53F) efficiently on A64FX. Targets:
@@ -148,6 +148,31 @@ All the new simulator switches are diagnostic and default off, so default QLAIR 
   without its first two cases finishing; the compact campaign supplied the
   paired comparison instead. No simulator default or production kernel changed.
 
+## Session 2026-09-28 09:20–10:20 (clair commits b7f89f30, 5ee1def3)
+
+- Native Q8_0R HBM row sweep used the frozen `bench-c13` ELF on the quiet
+  second node. The rotating weight footprint stayed near 9 MiB, over one
+  CMG's 8 MiB L2. All cases verified correct. At 64/128/256 rows, native
+  hardware cycles were 88,480 / 172,840 / 348,094 (CV 1.9/1.8/1.7%).
+- Native `LD_COMP_WAIT_L2_MISS` (PMU 0x0180) scaled with rows: 51,610 /
+  100,628 / 204,471 cycles at 64/128/256 rows. L2 stream prefetches
+  (0x0233) scaled similarly: 1,044 / 2,056 / 4,004. The simulator's compact
+  256-row profile has 3,710 prefetches but only 71,588 modeled L2-miss wait
+  cycles; the issue is not a gross lack of prefetch requests.
+- The same-ELF event sweep for 16/32/64 rows gives −47.5/−45.0/−43.8%
+  harness-cycle error. At 64 rows, modeled L2-miss wait is 17,913 cycles
+  versus 51,610 native. This is a repeatable per-row gap; the 64-row native
+  CV of 1.8% passes the comparison noise gate. The 16/32-row samples are
+  noisier and are directional only.
+- A diagnostic L2 prefetch-distance change (20 → 4 lines) raised the 16-row
+  simulator result by 9.4% to 14,224 cycles, still 42.5% below the native
+  harness result. Its 230 L2 prefetch requests were unchanged. Keep this
+  diagnostic off. Next isolate demand versus prefetched HBM-line latency and
+  miss overlap, using the 64-row case as the reliable timing gate.
+- All case files, raw logs, comparison JSON, and simulator profiles live in
+  `clair/.../glm53f/measurements/hw-20260927b/`; the new `STATUS.md` section
+  has replay commands and full attribution. No simulator default changed.
+
 ## Production integration plan (not started; needs the real model on 12 nodes)
 
 - **Where Q8_0R is used:**
@@ -165,7 +190,7 @@ All the new simulator switches are diagnostic and default off, so default QLAIR 
 
 ## Next steps (priority)
 1. **Simulator.**
-   - Probe sequential SVE HBM loads to separate latency, memory-level parallelism and per-core bandwidth; the compact Q8 HBM error is −41.4% and ordered fetch release does not move it. Use the frozen `bench-c13` and native logs in `measurements/hw-20260927b/` as the gate.
+   - Isolate demand versus prefetched HBM-line latency and memory-level parallelism. Q8 HBM has a −43.8% event error at 64 rows with 1.8% native CV; its modeled L2-miss wait is 17,913 versus 51,610 native PMU cycles. Use the frozen `bench-c13` and the new row-sweep logs in `measurements/hw-20260927b/` as the gate. The diagnostic L2 prefetch distance 20 → 4 only moved the 16-row simulation by +9.4% and stays off.
    - Design a load-result rename lifetime probe without the 144-cycle FMUL head masking release delay or FADD/LD pipe-use differences. Keep `FP_HOLD_LOAD=4` diagnostic until it is supported directly.
    - Then the K-quant unpack-op residual: q4k_v0/q5k_v0 insensitive to every switch.
    - Then the dependent base-ADD rule (ld8u6 −7.6%).
