@@ -1,4 +1,4 @@
-# Resume: GLM-5.3-Flash A64FX kernel efficiency + QLAIR accuracy (updated 2026-09-28 10:20)
+# Resume: GLM-5.3-Flash A64FX kernel efficiency + QLAIR accuracy (updated 2026-09-28 11:27)
 
 ## Goal
 Run GLM-5.3-Flash (GLM53F) efficiently on A64FX. Targets:
@@ -172,6 +172,22 @@ All the new simulator switches are diagnostic and default off, so default QLAIR 
 - All case files, raw logs, comparison JSON, and simulator profiles live in
   `clair/.../glm53f/measurements/hw-20260927b/`; the new `STATUS.md` section
   has replay commands and full attribution. No simulator default changed.
+
+## Session 2026-09-28 10:20–11:27 (clair commit 7553bbc4)
+
+- `bench.c` now prints the `read`/`hello` roof-probe sink after timing, so
+  the computed result is observable. The native `bench-c14` build has the
+  intended SVE loads in disassembly; its 9 MiB checksum matches an independent
+  calculation and its import allowlist is clean.
+- A 9/10/64 MiB load-only sweep did **not** give a usable HBM miss control:
+  the 64 MiB case ran in 845,412 cycles but the PMU reported zero L2-miss
+  completion wait and zero L2 stream prefetches. The 9 MiB timing was almost
+  unchanged by the sink fix (119,316 → 119,307 cycles). Do not use that byte
+  rate to tune QLAIR's HBM rules. Keep the Q8 row sweep as the miss-path gate.
+- The login-node clang build stalled on shared filesystem faults. Compiling
+  the driver and linking `bench-c14` with clang 21 on the allocated A64FX
+  node completed. Clair `STATUS.md` records the native command and
+  `measurements/hw-20260927b/` has the measurement logs.
 
 ## Production integration plan (not started; needs the real model on 12 nodes)
 
