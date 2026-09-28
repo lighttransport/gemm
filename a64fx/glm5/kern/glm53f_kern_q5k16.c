@@ -138,6 +138,57 @@ static inline void gk_q5_kp16_body(const gk_mv *m, int r0, int r1, int pf) {
 void gk_q5_kp16_v1(const gk_mv *m, int r0, int r1) { gk_q5_kp16_body(m, r0, r1, 0); }
 void gk_q5_kp16_v1pf(const gk_mv *m, int r0, int r1) { gk_q5_kp16_body(m, r0, r1, 16384); }
 
+/* Fold the fifth bit into the nibble before SDOT. This trades vector integer
+ * operations for half as many SDOTs while retaining the compact Q5 panel. */
+#define Q5KP16_MERGED_SUB(J) do {                                                \
+    const uint8_t *qj = q + (J) * 256;                                            \
+    const svuint8_t hb = svld1_u8(p8, hp + 64 * (J));                             \
+    const int8_t *xj = x + 32 * (J);                                              \
+    svint32_t ia = svdup_s32(0), ib = svdup_s32(0);                               \
+    for (int v = 0; v < 4; ++v) {                                                 \
+        const svuint8_t pk = svld1_u8(p8, qj + 64 * v);                           \
+        const svuint8_t lo = svand_n_u8_x(p8, pk, 15);                            \
+        const svuint8_t hi = svlsr_n_u8_x(p8, pk, 4);                             \
+        const svuint8_t h0 = svand_n_u8_x(p8, svlsr_n_u8_x(p8, hb, 2 * v), 1);    \
+        const svuint8_t h1 = svand_n_u8_x(p8, svlsr_n_u8_x(p8, hb, 2 * v + 1), 1);\
+        const svuint8_t w0 = svorr_u8_x(p8, lo, svlsl_n_u8_x(p8, h0, 4));        \
+        const svuint8_t w1 = svorr_u8_x(p8, hi, svlsl_n_u8_x(p8, h1, 4));        \
+        ia = svdot_s32(ia, svreinterpret_s8_u8(w0), gk_bc4_5(xj + 8 * v));       \
+        ib = svdot_s32(ib, svreinterpret_s8_u8(w1), gk_bc4_5(xj + 8 * v + 4));   \
+    }                                                                             \
+    sacc = svmla_s32_x(p32, sacc, svadd_s32_x(p32, ia, ib),                      \
+                       svld1ub_s32(p32, sc + 16 * (J)));                          \
+    macc = svmla_s32_x(p32, macc, svld1ub_s32(p32, mn + 16 * (J)),               \
+                       svdup_n_s32(bs[J]));                                       \
+} while (0)
+
+void gk_q5_kp16_v4pf(const gk_mv *m, int r0, int r1) {
+    const int nsb = m->columns / 256;
+    const size_t pb = (size_t)nsb * Q5KP16_SB_BYTES;
+    const svbool_t p8 = svptrue_b8(), p32 = svptrue_b32();
+    for (int r = r0; r < r1; r += 16) {
+        const uint8_t *panel = m->w + (size_t)(r / 16) * pb;
+        svfloat32_t f0 = svdup_f32(0.0f), f1 = f0;
+        for (int b = 0; b < nsb; ++b) {
+            const uint8_t *q = panel + (size_t)b * Q5KP16_SB_BYTES;
+            const uint8_t *hp = q + 2048, *sc = q + 2560, *mn = q + 2688;
+            for (int l = 0; l < Q5KP16_SB_BYTES; l += 256)
+                __builtin_prefetch(q + 16384 + l, 0, 2);
+            const int8_t *x = m->a->q8k[b].q;
+            const int32_t *bs = m->a->q8k_bsum32 + 8 * b;
+            const float dx = m->a->q8k[b].d;
+            svint32_t sacc = svdup_s32(0), macc = svdup_s32(0);
+#pragma clang loop unroll_count(2)
+            for (int j = 0; j < 8; ++j) Q5KP16_MERGED_SUB(j);
+            const svfloat32_t dd = svmul_n_f32_x(p32, svld1_f32(p32, (const float *)(q + 2816)), dx);
+            const svfloat32_t dm = svmul_n_f32_x(p32, svld1_f32(p32, (const float *)(q + 2880)), dx);
+            f0 = svmla_f32_x(p32, f0, svcvt_f32_s32_x(p32, sacc), dd);
+            f1 = svmls_f32_x(p32, f1, svcvt_f32_s32_x(p32, macc), dm);
+        }
+        svst1_f32(svwhilelt_b32(r, r1), m->y + r, svadd_f32_x(p32, f0, f1));
+    }
+}
+
 /* v2: each sub-block's 16 SDOTs spread over 8 two-deep chains (v parity
  * splits the nibble and high-bit chains) to shorten the per-sub-block
  * critical path that limits v1 once the 128-entry ROB holds ~2 sub-blocks. */
@@ -262,4 +313,75 @@ void gk_q5_kp16_v3pf(const gk_mv *m, int r0, int r1) {
         svst1_f32(svwhilelt_b32(r + 16, r1), m->y + r + 16, svadd_f32_x(p32, fB, gB));
     }
     if (r < r1) gk_q5_kp16_body(m, r, r1, 16384);
+}
+
+/* Q5_KB16 expands each five-bit weight to one byte while repacking. The
+ * 16-row panel grows to 4480 bytes per super-block, but decode uses only
+ * eight SDOTs per 32-column sub-block and no bit extraction. */
+#define Q5KB16_SB_BYTES 4480
+size_t gk_row_bytes_q5_kb16(int columns) { return (size_t)(columns / 256) * 280; }
+
+void gk_pack_q5_kb16(uint8_t *dst, const uint8_t *rows, size_t row_bytes,
+                     int nrows, int columns) {
+    for (int b = 0; b < columns / 256; ++b) {
+        uint8_t *sb = dst + (size_t)b * Q5KB16_SB_BYTES;
+        uint8_t *sc = sb + 4096, *mn = sb + 4224;
+        float *dd = (float *)(sb + 4352), *dm = (float *)(sb + 4416);
+        for (int r = 0; r < 16; ++r) {
+            const gk_block_q5_K *blk = r < nrows
+                ? (const gk_block_q5_K *)(rows + (size_t)r * row_bytes) + b : 0;
+            dd[r] = blk ? gk_h2f5(blk->d) : 0.0f;
+            dm[r] = blk ? gk_h2f5(blk->dmin) : 0.0f;
+            for (int j = 0; j < 8; ++j) {
+                uint8_t s = 0, m = 0;
+                if (blk) gk_k4_5(j, blk->scales, &s, &m);
+                sc[j * 16 + r] = s;
+                mn[j * 16 + r] = m;
+                for (int t = 0; t < 8; ++t)
+                    for (int i = 0; i < 4; ++i)
+                        sb[j * 512 + t * 64 + r * 4 + i] = blk
+                            ? (uint8_t)q5_value(blk, 32 * j + 4 * t + i) : 0;
+            }
+        }
+    }
+}
+
+void gk_q5_kb16_v1pf(const gk_mv *m, int r0, int r1) {
+    const int nsb = m->columns / 256;
+    const size_t pb = (size_t)nsb * Q5KB16_SB_BYTES;
+    const svbool_t p8 = svptrue_b8(), p32 = svptrue_b32();
+    for (int r = r0; r < r1; r += 16) {
+        const uint8_t *panel = m->w + (size_t)(r / 16) * pb;
+        svfloat32_t f0 = svdup_f32(0.0f), f1 = f0;
+        for (int b = 0; b < nsb; ++b) {
+            const uint8_t *q = panel + (size_t)b * Q5KB16_SB_BYTES;
+            for (int l = 0; l < Q5KB16_SB_BYTES; l += 256)
+                __builtin_prefetch(q + 16384 + l, 0, 2);
+            const int8_t *x = m->a->q8k[b].q;
+            const int32_t *bs = m->a->q8k_bsum32 + 8 * b;
+            const float dx = m->a->q8k[b].d;
+            svint32_t sacc = svdup_s32(0), macc = svdup_s32(0);
+#pragma clang loop unroll_count(2)
+            for (int j = 0; j < 8; ++j) {
+                const uint8_t *qj = q + j * 512;
+                const int8_t *xj = x + 32 * j;
+                svint32_t a = svdup_s32(0), c = svdup_s32(0);
+                for (int t = 0; t < 8; t += 2) {
+                    a = svdot_s32(a, svld1_s8(p8, (const int8_t *)(qj + t * 64)),
+                                  gk_bc4_5(xj + 4 * t));
+                    c = svdot_s32(c, svld1_s8(p8, (const int8_t *)(qj + (t + 1) * 64)),
+                                  gk_bc4_5(xj + 4 * (t + 1)));
+                }
+                sacc = svmla_s32_x(p32, sacc, svadd_s32_x(p32, a, c),
+                                   svld1ub_s32(p32, q + 4096 + 16 * j));
+                macc = svmla_s32_x(p32, macc, svld1ub_s32(p32, q + 4224 + 16 * j),
+                                   svdup_n_s32(bs[j]));
+            }
+            f0 = svmla_f32_x(p32, f0, svcvt_f32_s32_x(p32, sacc),
+                             svmul_n_f32_x(p32, svld1_f32(p32, (const float *)(q + 4352)), dx));
+            f1 = svmls_f32_x(p32, f1, svcvt_f32_s32_x(p32, macc),
+                             svmul_n_f32_x(p32, svld1_f32(p32, (const float *)(q + 4416)), dx));
+        }
+        svst1_f32(svwhilelt_b32(r, r1), m->y + r, svadd_f32_x(p32, f0, f1));
+    }
 }

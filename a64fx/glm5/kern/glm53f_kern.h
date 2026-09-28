@@ -87,6 +87,7 @@ void gk_q8_0r16_v3(const gk_mv *m, int r0, int r1);
 void gk_q8_0r16_v3pf(const gk_mv *m, int r0, int r1, int pf_bytes);
 void gk_q8_0r16_v3pf4k(const gk_mv *m, int r0, int r1);
 void gk_q8_0r16_v3pf16k(const gk_mv *m, int r0, int r1);
+void gk_q8_0r16_v3pfimm16k(const gk_mv *m, int r0, int r1);
 void gk_q8_0r16_v3pf64k(const gk_mv *m, int r0, int r1);
 void gk_q8_0r16_v4pf(const gk_mv *m, int r0, int r1);
 
@@ -109,6 +110,11 @@ void gk_q5_kp16_v1(const gk_mv *m, int r0, int r1);
 void gk_q5_kp16_v1pf(const gk_mv *m, int r0, int r1);
 void gk_q5_kp16_v2pf(const gk_mv *m, int r0, int r1);
 void gk_q5_kp16_v3pf(const gk_mv *m, int r0, int r1);
+void gk_q5_kp16_v4pf(const gk_mv *m, int r0, int r1);
+size_t gk_row_bytes_q5_kb16(int columns);
+void gk_pack_q5_kb16(uint8_t *dst, const uint8_t *rows, size_t row_bytes,
+                     int nrows, int columns);
+void gk_q5_kb16_v1pf(const gk_mv *m, int r0, int r1);
 
 /* v1: lossless 16-row Q6_K panel repack (glm53f_kern_q6k16.c), 212 bytes
  * per 256 columns per row. */
