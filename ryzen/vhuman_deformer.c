@@ -242,3 +242,16 @@ void vh_deformer_eval_batch(vh_deformer *d, const float *controls, size_t frames
         lbs(d, P + f * n, out + f * n);
     }
 }
+
+size_t vh_deformer_joints(const vh_deformer *d) { return d->J; }
+const float *vh_deformer_rest(const vh_deformer *d) { return d->rest; }
+const float *vh_deformer_morph(const vh_deformer *d) { return d->morph; }
+const int *vh_deformer_skin_joints(const vh_deformer *d) { return (const int *)d->sj; }
+const float *vh_deformer_skin_weights(const vh_deformer *d) { return d->sw; }
+
+void vh_deformer_prepare(vh_deformer *d, const float *controls, int use_ml, float *w, float *skin12) {
+    inputs(d, controls);
+    skinning(d);
+    weights(d, use_ml, w);
+    for (size_t j = 0; j < d->J; ++j) memcpy(skin12 + j * 12, d->skin + j * 16, sizeof(float) * 12);
+}

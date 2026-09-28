@@ -43,6 +43,15 @@ size_t vh_deformer_batch_scratch(const vh_deformer *d, size_t frames);   /* floa
 void vh_deformer_eval_batch(vh_deformer *d, const float *controls, size_t frames, int use_ml, float *scratch,
                             float *out);
 
+/* Host side of GPU backends: the per-frame rig state (morph weights, M
+ * floats; skinning matrices, J x 12 floats: the top 3 rows, row-major). */
+size_t vh_deformer_joints(const vh_deformer *d);
+void vh_deformer_prepare(vh_deformer *d, const float *controls, int use_ml, float *weights, float *skin12);
+const float *vh_deformer_rest(const vh_deformer *d);           /* V x 3 */
+const float *vh_deformer_morph(const vh_deformer *d);          /* M x V x 3 */
+const int *vh_deformer_skin_joints(const vh_deformer *d);      /* V x 4 */
+const float *vh_deformer_skin_weights(const vh_deformer *d);   /* V x 4 */
+
 #ifdef __cplusplus
 }
 #endif
