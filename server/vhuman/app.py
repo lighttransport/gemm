@@ -171,9 +171,10 @@ class App:
         self.service = EyeService(Path(args.work))
         from . import qwen, baseline
         from .head import pipeline as head_pipeline
-        from .rig import exprdata, job as rig_job, speech as rig_speech
+        from .rig import emotion as rig_emotion, exprdata, job as rig_job, speech as rig_speech
         self.rig_job = rig_job
         self.rig_speech = rig_speech
+        self.rig_emotion = rig_emotion
         self.gpu = gpu
         self.qwen_opts = {"python": args.qwen_python, "mock": args.mock}
         self.jobs = Jobs(Path(args.work) / "jobs", {
@@ -190,7 +191,9 @@ class App:
             "rig_speech": lambda req, prog, cancel: rig_speech.speech_job(
                 self.service, req, prog, cancel, model=getattr(args, "tts_model", None) or rig_speech.DEFAULT_MODEL,
                 aligner=getattr(args, "aligner", None) or rig_speech.DEFAULT_ALIGNER,
-                backend=getattr(args, "tts_backend", "auto")),
+                backend=getattr(args, "tts_backend", "auto"),
+                emotion_runner=getattr(args, "emotion_runner", None) or rig_emotion.DEFAULT_RUNNER,
+                emotion_model=getattr(args, "emotion_model", None) or rig_emotion.DEFAULT_MODEL),
         })
 
     def health(self) -> dict:
@@ -202,6 +205,9 @@ class App:
                     getattr(self.args, "tts_model", None) or self.rig_speech.DEFAULT_MODEL,
                     getattr(self.args, "aligner", None) or self.rig_speech.DEFAULT_ALIGNER,
                     getattr(self.args, "tts_backend", "auto")),
+                "rig_emotion": self.rig_emotion.availability(
+                    getattr(self.args, "emotion_runner", None) or self.rig_emotion.DEFAULT_RUNNER,
+                    getattr(self.args, "emotion_model", None) or self.rig_emotion.DEFAULT_MODEL),
                 "algo_version": P.ALGO_VERSION}
 
 
@@ -391,6 +397,8 @@ def main(argv=None) -> int:
     ap.add_argument("--tts-model", default=None, help="Qwen3-TTS model directory for rig_speech jobs")
     ap.add_argument("--aligner", default=None, help="ja_align.safetensors for rig_speech jobs")
     ap.add_argument("--tts-backend", choices=("auto", "cpu", "cuda"), default="auto")
+    ap.add_argument("--emotion-runner", default=None, help="SenseVoiceSmall GGUF runtime executable")
+    ap.add_argument("--emotion-model", default=None, help="SenseVoiceSmall GGUF model path")
     args = ap.parse_args(argv)
     app = App(args)
     server = ThreadingHTTPServer((args.host, args.port), make_handler(app))

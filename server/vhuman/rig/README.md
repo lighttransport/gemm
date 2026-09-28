@@ -269,11 +269,57 @@ Each `<head>/rig/takes/<id>/` contains `audio.wav`, `align.json`,
 under `/v1/heads/<id>/rig/takes`. Manifests record the rig hash; the viewer
 warns when a rebuilt rig makes an older animation stale.
 
-`speech.build_frames` has an optional timestamped emotion-provider callback.
-The NVIDIA Audio2Emotion-v2.2 model is not loaded or downloaded here: its
-[license](https://huggingface.co/nvidia/Audio2Emotion-v2.2/blob/main/LICENSE)
-restricts it to use in connection with the NVIDIA Audio2Face project.
-This callback is the boundary for a future licensed SDK bridge.
+### Optional audio emotion suggestions
+
+`--auto-emotion` runs Alibaba Group's
+[SenseVoiceSmall GGUF](https://huggingface.co/FunAudioLLM/SenseVoiceSmall-GGUF)
+on the finished WAV in overlapping four-second windows. It supports Japanese
+audio and returns coarse categorical tags (joy, sadness, anger, disgust,
+surprise, fear, neutral). The converter maps these to editable emotion keys;
+the viewer has an opt-in checkbox. A rebuild from an existing take can infer
+new keys without rerunning TTS or alignment. `emotion.json` records the
+window labels, and the manifest names the model. Silent windows and unknown
+tags become neutral. These tags have no calibrated confidence or precise
+onset; published SenseVoice emotion benchmarks use Chinese and English, so
+Japanese extraction needs human review. Manual keys remain available.
+
+Other candidates considered: [emotion2vec+](https://huggingface.co/emotion2vec/emotion2vec_plus_base)
+offers nine classes and frame features, but its published model card does not
+report Japanese-specific accuracy; the
+[Kushinada JTES SER model](https://huggingface.co/imprt/kushinada-hubert-base-jtes-er)
+is trained for Japanese emotion recognition but requires gated access and an
+S3PRL checkpoint workflow. SenseVoiceSmall offers a non-gated, model-owner
+GGUF release and a dependency-free local CPU runtime.
+
+The optional CPU setup uses the project's published AVX2 runtime and Q8
+weights. Keep downloads under ignored `tmp/` (repository guideline):
+
+```sh
+mkdir -p tmp/vhuman-emotion/runtime
+curl -fL -o tmp/vhuman-emotion/funasr-llamacpp-linux-x64-avx2.tar.gz \
+  https://github.com/modelscope/FunASR/releases/download/runtime-llamacpp-v0.2.6/funasr-llamacpp-linux-x64-avx2.tar.gz
+echo 'aaebc5470f846ce915200b35d6e9f9bd0a0d3ed399d39e49bdeb7a1f1782bc70  tmp/vhuman-emotion/funasr-llamacpp-linux-x64-avx2.tar.gz' | sha256sum -c -
+tar -xzf tmp/vhuman-emotion/funasr-llamacpp-linux-x64-avx2.tar.gz -C tmp/vhuman-emotion/runtime
+curl -fL -o tmp/vhuman-emotion/sensevoice-small-q8.gguf \
+  https://huggingface.co/FunAudioLLM/SenseVoiceSmall-GGUF/resolve/90c1c61912018b70ada0fcc024ea24aca62f2e63/sensevoice-small-q8.gguf
+echo '4ae45c94422de949b387e2e0fb10d7e14e4c42c69db30c3444ecc7d4b844b7c5  tmp/vhuman-emotion/sensevoice-small-q8.gguf' | sha256sum -c -
+python3 -m server.vhuman.cli --work tmp/vhuman-independent rig-speech \
+  --head <id> --source-take <take-id> --auto-emotion
+```
+
+Use `--emotion-runner` and `--emotion-model` (same names on the server) for
+other local locations. The [GGUF model card](https://huggingface.co/FunAudioLLM/SenseVoiceSmall-GGUF)
+lists Apache-2.0, while the [source model](https://huggingface.co/FunAudioLLM/SenseVoiceSmall)
+uses the [FunASR Model Open Source License](https://github.com/modelscope/FunASR/blob/main/MODEL_LICENSE),
+which requires source/author attribution and retention of the model name.
+Weights and the third-party runtime are downloaded separately and are never
+bundled into this repository. The runtime accepts 16 kHz mono PCM16; the
+adapter converts the rig WAV before inference.
+
+`speech.build_frames` also has a timestamped emotion-provider callback for
+other future integrations. The NVIDIA Audio2Emotion-v2.2 model remains outside
+this project because its [license](https://huggingface.co/nvidia/Audio2Emotion-v2.2/blob/main/LICENSE)
+restricts it to use in connection with NVIDIA Audio2Face.
 
 ## Provenance and licensing
 

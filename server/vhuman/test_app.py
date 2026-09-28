@@ -125,6 +125,7 @@ class ServerTest(unittest.TestCase):
         self.assertTrue(health["ok"])
         self.assertTrue(health["qwen"]["available"])
         self.assertIn("rig_speech", health)
+        self.assertIn("rig_emotion", health)
         schema = json.loads(self.get("/v1/eye/schema")[2])
         self.assertEqual(len(schema["presets"]), 12)
 

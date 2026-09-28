@@ -145,11 +145,13 @@ a.dl{color:var(--accent);margin-right:12px;font-size:13px;display:inline-block}
       <div class="tools">
         <label>speaker <input id="speech-speaker" value="Ono_Anna" style="width:150px"></label>
         <label>seed <input id="speech-seed" type="number" min="0" step="1" value="7" style="width:75px"></label>
-        <label>emotion <select id="speech-emotion" style="width:115px"><option>neutral</option><option>joy</option><option>sadness</option><option>anger</option><option>disgust</option><option>surprise</option></select></label>
+        <label>emotion <select id="speech-emotion" style="width:115px"><option>neutral</option><option>joy</option><option>sadness</option><option>anger</option><option>disgust</option><option>surprise</option><option>fear</option></select></label>
         <button id="add-emotion" title="Add an emotion key at the audio playhead, or at 0 for a new take">add key</button>
         <button id="clear-emotions">clear keys</button>
       </div>
       <div id="emotion-keys" class="msg"></div>
+      <label><input id="speech-auto-emotion" type="checkbox" style="width:auto"> suggest emotion keys from audio with SenseVoiceSmall (Alibaba Group)</label>
+      <div class="msg">Suggestions replace the keys on the next build. Review and edit the saved keys afterward.</div>
       <div class="tools">
         <label>speech strength <input id="speech-strength" type="range" min="0" max="1" step="0.05" value="1" style="width:95px"></label>
         <label>emotion strength <input id="emotion-strength" type="range" min="0" max="1" step="0.05" value="0.6" style="width:95px"></label>
@@ -181,7 +183,7 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 
 const $ = (id) => document.getElementById(id);
 const state = { heads: [], current: null, rig: null, model: null, values: {}, anim: null, job: null,
-                speechAvailable: false };
+                speechAvailable: false, emotionAvailable: false };
 window.__rigState = state;
 async function api(path, body) {
   const opts = body === undefined ? {} : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) };
@@ -866,11 +868,14 @@ async function loadTake(take) {
   $('speech-strength').value = animation.speech_strength;
   $('emotion-strength').value = animation.emotion_strength;
   $('speech-rebuild').disabled = false;
-  $('speech-msg').textContent = take.rig_stale ? 'Rig changed since export; rebuild this animation for the current rig.' : '';
+  $('speech-auto-emotion').checked = false;
+  $('speech-msg').textContent = take.rig_stale ? 'Rig changed since export; rebuild this animation for the current rig.'
+    : take.emotion_source === 'SenseVoiceSmall' ? 'SenseVoiceSmall suggestions loaded. Review and edit the emotion keys.' : '';
   renderEmotionKeys();
   const links = $('speech-downloads');
   links.replaceChildren();
-  for (const [label, key] of [['WAV', 'audio'], ['controls JSON', 'animation'], ['LightRig track', 'lightrig'], ['USD animation', 'usd']]) {
+  for (const [label, key] of [['WAV', 'audio'], ['controls JSON', 'animation'], ['LightRig track', 'lightrig'], ['USD animation', 'usd'], ['emotion analysis', 'emotion']]) {
+    if (!take.urls[key]) continue;
     const a = document.createElement('a');
     a.className = 'dl'; a.textContent = label; a.href = take.urls[key]; a.download = '';
     links.appendChild(a);
@@ -886,7 +891,7 @@ async function loadTakes(headId, selectId) {
   for (const take of data.takes) {
     const option = document.createElement('option');
     option.value = take.id;
-    option.textContent = `${take.id} · ${take.text || take.source} · ${take.duration.toFixed(2)}s`;
+    option.textContent = `${take.id} · ${take.text || take.source} · ${take.duration.toFixed(2)}s${take.emotion_source === 'SenseVoiceSmall' ? ' · auto emotion' : ''}`;
     select.appendChild(option);
   }
   state.takes = data.takes;
@@ -916,6 +921,7 @@ async function runSpeechJob(rebuild) {
   if (!state.current?.rig || state.speechJob) return;
   const headId = state.current.id;
   const body = { kind: 'rig_speech', head_id: headId, emotion_keyframes: emotionKeys,
+                 auto_emotion: $('speech-auto-emotion').checked,
                  speech_strength: +$('speech-strength').value, emotion_strength: +$('emotion-strength').value };
   if (rebuild) {
     if (!state.take) return;
@@ -1201,6 +1207,9 @@ $('build').addEventListener('click', async () => {
 api('/health').then((h) => {
   $('health').textContent = h.rig?.available ? `rig builder: ${h.rig.python}` : `rig builder unavailable: ${h.rig?.reason || '?'}`;
   state.speechAvailable = !!h.rig_speech?.available;
+  state.emotionAvailable = !!h.rig_emotion?.available;
+  $('speech-auto-emotion').disabled = !state.emotionAvailable;
+  $('speech-auto-emotion').title = state.emotionAvailable ? 'Extract coarse Japanese emotion tags from audio' : 'SenseVoiceSmall model or runtime missing';
   $('speech-generate').disabled = !state.speechAvailable;
   if (!h.rig_speech?.available) {
     $('speech-generate').disabled = true;

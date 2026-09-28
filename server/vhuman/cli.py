@@ -269,16 +269,18 @@ def cmd_rig_track(args) -> dict:
 
 
 def cmd_rig_speech(args) -> dict:
-    from .rig import speech
+    from .rig import emotion, speech
     svc = EyeService(Path(args.work))
     emotions = json.loads(Path(args.emotions[1:]).read_text() if args.emotions.startswith("@") else args.emotions)
     req = {"head_id": args.head, "text": args.text, "wav": args.wav, "source_take": args.source_take,
            "speaker": args.speaker, "instruct": args.instruct, "kana": args.kana, "seed": args.seed,
            "ref_wav": args.ref_wav, "ref_text": args.ref_text, "xvec_only": args.xvec_only,
-           "emotion_keyframes": emotions, "speech_strength": args.speech_strength,
+           "emotion_keyframes": emotions, "auto_emotion": args.auto_emotion, "speech_strength": args.speech_strength,
            "emotion_strength": args.emotion_strength}
     return speech.speech_job(svc, req, _progress, threading.Event(), model=args.tts_model or speech.DEFAULT_MODEL,
-                             aligner=args.aligner or speech.DEFAULT_ALIGNER, backend=args.backend, allow_wav=True)
+                             aligner=args.aligner or speech.DEFAULT_ALIGNER, backend=args.backend, allow_wav=True,
+                             emotion_runner=args.emotion_runner or emotion.DEFAULT_RUNNER,
+                             emotion_model=args.emotion_model or emotion.DEFAULT_MODEL)
 
 
 def cmd_bench(args) -> dict:
@@ -417,6 +419,9 @@ def main(argv=None) -> int:
     sp.add_argument("--speech-strength", type=float, default=1.0)
     sp.add_argument("--emotion-strength", type=float, default=.6)
     sp.add_argument("--emotions", default="[]", help="emotion keyframes JSON or @file.json")
+    sp.add_argument("--auto-emotion", action="store_true", help="extract emotion keys with SenseVoiceSmall GGUF")
+    sp.add_argument("--emotion-runner", help="SenseVoiceSmall GGUF runtime executable")
+    sp.add_argument("--emotion-model", help="SenseVoiceSmall GGUF weights")
     sp.set_defaults(fn=cmd_rig_speech)
     sub.add_parser("replate", help="re-extract the plate library from its source images").set_defaults(fn=cmd_replate)
     sub.add_parser("bench", help="timing targets").set_defaults(fn=cmd_bench)

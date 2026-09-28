@@ -90,7 +90,7 @@ class SpeechTakeTests(unittest.TestCase):
                 wav.setnchannels(1)
                 wav.setsampwidth(2)
                 wav.setframerate(24000)
-                wav.writeframes(bytes(24000))
+                wav.writeframes((3000).to_bytes(2, "little", signed=True) * 12000)
             report = speech.speech_job(service, {"head_id": "h1", "source_take": src.name,
                                                  "emotion_keyframes": [{"t": 0, "weights": {"joy": 1}}]},
                                        lambda *_: None, threading.Event(), backend="cpu")
@@ -106,6 +106,20 @@ class SpeechTakeTests(unittest.TestCase):
             self.assertEqual(len(times), 16)
             self.assertEqual(len(controls), 16)
             self.assertIn("Track", service.take_file("h1", report["id"], "animation.usda").read_text())
+            model = Path(d) / "sensevoice.gguf"
+            runner = Path(d) / "sensevoice"
+            model.write_bytes(b"fixture")
+            runner.write_text("#!/bin/sh\necho '<|ja|><|HAPPY|><|Speech|>hello'\n")
+            runner.chmod(0o755)
+            auto = speech.speech_job(service, {"head_id": "h1", "source_take": src.name, "auto_emotion": True},
+                                     lambda *_: None, threading.Event(), backend="cpu",
+                                     emotion_runner=runner, emotion_model=model)
+            self.assertEqual(auto["emotion_source"], "SenseVoiceSmall")
+            self.assertIn("emotion", auto["urls"])
+            analysis = json.loads(service.take_file("h1", auto["id"], "emotion.json").read_text())
+            self.assertEqual(analysis["windows"][0]["label"], "joy")
+            animation = json.loads(service.take_file("h1", auto["id"], "animation.json").read_text())
+            self.assertGreater(animation["frames"][0]["v"]["cheekSquintLeft"], 0)
             (rig_dir / "rig.json").write_text(json.dumps({**_toy_rig(), "changed": True}))
             self.assertTrue(service.take_summary("h1", report["id"])["rig_stale"])
             with self.assertRaises(ServiceError):

@@ -27,7 +27,8 @@ DEFAULT_MODEL = Path("/mnt/nvme01/models/speech/Qwen3-TTS-12Hz-1.7B-CustomVoice"
 DEFAULT_ALIGNER = Path("/mnt/nvme01/models/speech/japanese-wav2vec2-large-hiragana-ctc/ja_align.safetensors")
 FPS = 30
 VISEMES = ("sil", "PP", "FF", "TH", "DD", "kk", "CH", "SS", "nn", "RR", "aa", "E", "ih", "oh", "ou")
-TAKE_FILES = ("manifest.json", "audio.wav", "align.json", "animation.json", "animation.usda", "lightrig.txt")
+TAKE_FILES = ("manifest.json", "audio.wav", "align.json", "animation.json", "animation.usda", "lightrig.txt",
+              "emotion.json")
 
 
 def availability(model=DEFAULT_MODEL, aligner=DEFAULT_ALIGNER, backend="auto") -> dict:
@@ -79,6 +80,9 @@ EMOTION_POSES = {
                 "mouthUpperUpRight": .7, "browDownLeft": .4, "browDownRight": .4},
     "surprise": {"browInnerUp": 1, "browOuterUpLeft": .8, "browOuterUpRight": .8,
                  "eyeWideLeft": .9, "eyeWideRight": .9, "jawOpen": .4},
+    "fear": {"browInnerUp": .8, "browOuterUpLeft": .5, "browOuterUpRight": .5,
+             "eyeWideLeft": .7, "eyeWideRight": .7, "mouthFrownLeft": .35,
+             "mouthFrownRight": .35},
 }
 EMOTION_MOUTH = {"mouthSmileLeft", "mouthSmileRight", "mouthFrownLeft", "mouthFrownRight",
                  "mouthDimpleLeft", "mouthDimpleRight"}
@@ -223,7 +227,7 @@ def _run(cmd: list[str], cancel, progress) -> None:
 
 
 def speech_job(service, request: dict, progress, cancel, *, model=DEFAULT_MODEL, aligner=DEFAULT_ALIGNER,
-               backend="auto", allow_wav=False) -> dict:
+               backend="auto", allow_wav=False, emotion_runner=None, emotion_model=None) -> dict:
     """Generate a take; model paths come from server options, never HTTP JSON."""
     head = request.get("head_id")
     rig_path = service.rig_file(head, "rig.json")
@@ -241,6 +245,15 @@ def speech_job(service, request: dict, progress, cancel, *, model=DEFAULT_MODEL,
     seed = request.get("seed") if request.get("seed") is not None else 7
     if type(seed) is not int or not 0 <= seed < 2**64:
         raise ValueError("seed must be a nonnegative integer")
+    auto_emotion = request.get("auto_emotion", False)
+    if type(auto_emotion) is not bool:
+        raise ValueError("auto_emotion must be a boolean")
+    if auto_emotion:
+        from . import emotion
+        emotion_runner = emotion_runner or emotion.DEFAULT_RUNNER
+        emotion_model = emotion_model or emotion.DEFAULT_MODEL
+        if not emotion.availability(emotion_runner, emotion_model)["available"]:
+            raise ValueError("SenseVoice runtime or model missing; see server/vhuman/rig/README.md")
     selected = backend
     if selected == "auto":
         cuda_runner = SPEECH / "build" / ("ja_align_cuda" if wav else "tts_ja_cuda")
@@ -296,12 +309,19 @@ def speech_job(service, request: dict, progress, cancel, *, model=DEFAULT_MODEL,
         aux = json.loads((stage / "align.json").read_text())
         if text and not aux.get("phones"):
             raise ValueError("no speech detected in TTS output; try another seed or a longer sentence")
-        frames = build_frames(aux, request.get("emotion_keyframes"), request.get("speech_strength", 1),
+        emotion_keys = request.get("emotion_keyframes")
+        analysis = None
+        if auto_emotion:
+            analysis = emotion.extract(stage / "audio.wav", aux["duration"], stage, cancel, progress,
+                                       runner=emotion_runner, model=emotion_model)
+            emotion_keys = analysis["emotion_keyframes"]
+            (stage / "emotion.json").write_text(json.dumps(analysis, ensure_ascii=False, indent=2))
+        frames = build_frames(aux, emotion_keys, request.get("speech_strength", 1),
                               request.get("emotion_strength", .6))
         progress(.8, "writing animation")
         animation = {"format": "vhuman.performance.v1", "fps": aux["visemes"]["fps"],
                      "duration": aux["duration"], "controls": list(rigdef.CONTROLS), "frames": frames,
-                     "emotion_keyframes": request.get("emotion_keyframes") or [],
+                     "emotion_keyframes": emotion_keys or [], "emotion_source": "SenseVoiceSmall" if auto_emotion else "manual",
                      "speech_strength": _unit(request.get("speech_strength", 1), "speech_strength"),
                      "emotion_strength": _unit(request.get("emotion_strength", .6), "emotion_strength")}
         (stage / "animation.json").write_text(json.dumps(animation, ensure_ascii=False, separators=(",", ":")))
@@ -317,6 +337,9 @@ def speech_job(service, request: dict, progress, cancel, *, model=DEFAULT_MODEL,
                     "frames": len(frames), "backend": "reused" if source_take else selected,
                     "speaker": request.get("speaker") if text else source_meta.get("speaker"),
                     "seed": seed if text else source_meta.get("seed"),
+                    "emotion_source": animation["emotion_source"],
+                    "emotion_model": analysis["model"] if auto_emotion else None,
+                    "emotion_model_author": analysis["model_author"] if auto_emotion else None,
                     "rig_sha256": hashlib.sha256(rig_bytes).hexdigest()[:16]}
         (stage / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2))
         progress(.99, "take ready")
