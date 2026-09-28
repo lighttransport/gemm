@@ -140,6 +140,8 @@ void gk_gemm_panel16_asm(int sb, const uint8_t *w, int K, int r0, int r1, int t0
 size_t gk_panel64_bytes(int sb, int columns);
 extern int gk_gemm_kchunk;
 extern int gk_gemm_tblock;
+extern int gk_gemm_ypf;
+extern int gk_gemm_chunkpf;
 extern int gk_gemm_l1pf;
 void gk_pack_panel64(int sb, uint8_t *dst, const int8_t *q, const float *scale, int nrows, int columns);
 void gk_pack_act6(int sb, int8_t *xp, float *xsp, const int8_t *x, size_t ldx,

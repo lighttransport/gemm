@@ -191,6 +191,13 @@ void gk_pack_act6(int sb, int8_t *xp, float *xsp, const int8_t *x, size_t ldx,
 int gk_gemm_kchunk = 512;
 /* Token block of gk_gemm_panel64 (tokens, multiple of 6; 0 = no blocking). */
 int gk_gemm_tblock = 0;
+/* Prefetch the next 6-token group's output tile (6 x 256 B, write intent)
+ * while the current tile computes: with many tokens the tiles live in L2. */
+int gk_gemm_ypf = 0;
+/* At the start of each K chunk, L2-prefetch the whole next weight chunk (or
+ * the next panel's first chunk): a chunk is reused by every token group, so
+ * one pass of hints per chunk hides the HBM first touch. */
+int gk_gemm_chunkpf = 0;
 
 void gk_gemm_panel64(int sb, const uint8_t *w, int K, int r0, int r1, int t0, int t1,
                      const int8_t *xp, const float *xsp, float *y, size_t ldy) {
@@ -212,12 +219,21 @@ void gk_gemm_panel64(int sb, const uint8_t *w, int K, int r0, int r1, int t0, in
                 for (int u = 0; u < 6; ++u) __builtin_memset(y + (size_t)(t + u) * ldy + r, 0, 64 * 4);
             for (int k0 = 0; k0 < K; k0 += kc) {
                 const int kn = K - k0 < kc ? K - k0 : kc;
-                for (int t = b0; t + 6 <= b1; t += 6)
+                if (gk_gemm_chunkpf) {
+                    const uint8_t *nx = k0 + kc < K ? wr + (size_t)((k0 + kc) / sb) * blk
+                                      : r + 64 < r1 ? wr + pb : 0;
+                    const size_t nb = (size_t)((k0 + kc < K ? (K - k0 - kc < kc ? K - k0 - kc : kc) : kc) / sb) * blk;
+                    for (size_t o = 0; nx && o < nb; o += 256) __builtin_prefetch(nx + o, 0, 2);
+                }
+                for (int t = b0; t + 6 <= b1; t += 6) {
+                    if (gk_gemm_ypf && t + 12 <= b1)
+                        for (int u = 0; u < 6; ++u) __builtin_prefetch(y + (size_t)(t + 6 + u) * ldy + r, 1, 3);
                     (gk_gemm_l1pf == 3 ? gk_gemm_tile6x4p3_asm : gk_gemm_l1pf == 2 ? gk_gemm_tile6x4p2_asm : gk_gemm_l1pf ? gk_gemm_tile6x4pp_asm : gk_gemm_tile6x4p_asm)(
                                          (const int8_t *)(wr + (size_t)(k0 / sb) * blk), kn / sb, sb / 16,
                                          xp + (size_t)(t / 6) * 6 * K + (size_t)(k0 / 4) * 24,
                                          xsp + (size_t)(t / 6) * 6 * (K / sb) + (size_t)(k0 / sb) * 6,
                                          y + (size_t)t * ldy + r, ldy * 4);
+                }
             }
         }
     }
