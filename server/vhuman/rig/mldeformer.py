@@ -53,17 +53,22 @@ def sample_controls(names: list[str], n: int, seed: int = 0) -> np.ndarray:
     pool = [k for k in rigdef.LR_FACE_V1]
     lips = [k for k in pool if k.startswith("mouth")]
     lids = [k for k in pool if k.startswith("eye") or k.startswith("cheekSquint")]
+    tongue = [k for k in names if k.startswith("tongue")]
     X = np.zeros((n, len(names)), np.float32)
     for s in range(n):
         r = rng.random()
         picks = list(rng.choice(pool, size=1 + rng.poisson(2.5), replace=False))
         if r < 0.35:
             picks += ["jawOpen"] + list(rng.choice(lips, size=1 + rng.poisson(1.2), replace=False))
+            if rng.random() < 0.4:
+                picks += list(rng.choice(tongue, size=1 + rng.poisson(0.5), replace=False))
         elif r < 0.55:
             picks += list(rng.choice(lids, size=2 + rng.poisson(1.0), replace=False))
         for k in picks:
             v = float(rng.uniform(0.25, 1.0) ** 0.7)
             X[s, idx[k]] = max(X[s, idx[k]], v)
+            if k.startswith("tongue") and rng.random() < 0.6:
+                X[s, idx[k]] = min(X[s, idx[k]], float(rng.uniform(0.1, 0.6)))
             if rng.random() < 0.5 and _mirror(k) in idx:
                 X[s, idx[_mirror(k)]] = max(X[s, idx[_mirror(k)]], v * rng.uniform(0.85, 1.0))
     X[: max(1, n // 50)] = 0                            # a few neutral samples
@@ -86,18 +91,50 @@ def tooth_spheres(part, joint_index: int, block: int) -> tuple[np.ndarray, np.nd
     return np.asarray(c), np.asarray(r)
 
 
+def tongue_spheres(part, nu: int = 28, nv: int = 20):
+    """Spheres filling the lofted tongue: per cross-section row, three across
+    its width (radius ~ the half thickness), on that row's two joints."""
+    P = part.positions[:nu * nv].reshape(nu, nv, 3)
+    J = part.joints[:nu * nv].reshape(nu, nv, 4)[:, 0, :2]
+    W = part.weights[:nu * nv].reshape(nu, nv, 4)[:, 0, :2]
+    c, r, jj, ww = [], [], [], []
+    for i in range(1, nu - 1):
+        row = P[i]
+        cen = row.mean(0)
+        side = row[np.argmax(row[:, 0])] - row[np.argmin(row[:, 0])]
+        half_w = 0.5 * float(np.linalg.norm(side))
+        side = side / max(np.linalg.norm(side), 1e-9)
+        half_t = 0.5 * float(np.ptp(row @ np.cross(side, P[i + 1].mean(0) - P[i - 1].mean(0))
+                                    / max(np.linalg.norm(P[i + 1].mean(0) - P[i - 1].mean(0)), 1e-9)))
+        rad = max(min(half_t, half_w) * 0.95, 0.0015)
+        for f in (-1.0, 0.0, 1.0):
+            off = f * max(half_w - rad, 0.0)
+            c.append(cen + side * off)
+            r.append(rad)
+            jj.append(J[i])
+            ww.append(W[i])
+    return np.asarray(c), np.asarray(r), np.asarray(jj), np.asarray(ww)
+
+
 class Contacts:
-    """Contact thresholds are relative to the rest pose: a vertex may never get
-    closer than its rest distance (or the margin, whichever is smaller), so
-    the neutral face needs no correction."""
+    """Contacts on the welded template, thresholds relative to the rest pose
+    (a vertex may never get closer than its rest distance or the margin,
+    whichever is smaller), so the neutral face needs no correction:
+    - lid vertices vs the eyeballs (centres on the eye joints);
+    - lip/vestibule vertices vs sphere sets: teeth (rigid on the teeth
+      joints) and the tongue (spheres on its blended chain joints);
+    - upper vs lower lip, per sample pair on rings 1..-2, along the mean of
+      the head's and the jaw's up axes."""
+
+    PAIR_RINGS = (1, 0, -1, -2)
 
     def __init__(self, tmpl: T.Template, feat, skel: dict, teeth: list, device, rest: np.ndarray,
-                 dtype=torch.float32):
+                 tongue=None, dtype=torch.float32):
         names = [j["name"] for j in skel["joints"]]
         ji = {n: i for i, n in enumerate(names)}
         dev = device
-        # lids and the eyeballs
         self.eye = []
+        self._export = {"eye": [], "spheres": {}, "margins_mm": {"eye": EYE_MARGIN_MM, "sphere": TOOTH_MARGIN_MM}}
         eyes = {e["side"]: e for e in feat.eyes}
         for g, side, jn in ((0, "right", "eye_R"), (1, "left", "eye_L")):
             ids = np.flatnonzero((tmpl.group == g) & (tmpl.ring <= 4))
@@ -107,9 +144,14 @@ class Contacts:
             self.eye.append((torch.tensor(ids, device=dev), ji[jn],
                              torch.tensor([*e["center"], 1.0], device=dev, dtype=dtype),
                              torch.tensor(thr, device=dev, dtype=dtype)))
-        # lips/vestibule and the teeth
-        self.lip_ids = torch.tensor(np.flatnonzero((tmpl.group == 2) & (tmpl.ring >= -2) & (tmpl.ring <= 4)),
-                                    device=dev)
+            self._export["eye"].append({"ids": ids.tolist(), "joint": ji[jn], "center": list(map(float, e["center"])),
+                                        "radius_mm": float(e["radius"] * 1000)})
+        lip_np = np.flatnonzero((tmpl.group == 2) & (tmpl.ring >= -2) & (tmpl.ring <= 4))
+        self.lip_ids = torch.tensor(lip_np, device=dev)
+        self._export["lip_ids"] = lip_np.tolist()
+        lip = rest[lip_np]
+        self.spheres = {}
+        sets = []
         cs, rs, js = [], [], []
         for part, jn in teeth:
             block = 10 * 18 + 1                     # mouthparts._crown(lat=10, lon=18) + the tip centre
@@ -118,16 +160,21 @@ class Contacts:
             rs.append(r)
             js.append(np.full(len(c), ji[jn]))
         C = np.concatenate(cs)
-        self.tc = torch.tensor(np.concatenate([C, np.ones((len(C), 1))], 1), device=dev, dtype=dtype)
-        lip = rest[self.lip_ids.cpu().numpy()]
-        d_rest = np.linalg.norm(lip[:, None] - C[None], axis=-1) * 1000             # (L, T)
-        self.tr = torch.tensor(np.minimum(np.concatenate(rs)[None] * 1000 + TOOTH_MARGIN_MM, d_rest),
-                               device=dev, dtype=dtype)
-        self.tj = torch.tensor(np.concatenate(js), device=dev)
-        # upper/lower lip pairs (rings 0 and -1): the upper stays above the lower
+        sets.append(("teeth", C, np.concatenate(rs), np.stack([np.concatenate(js), np.zeros(len(C), int)], 1),
+                     np.stack([np.ones(len(C)), np.zeros(len(C))], 1)))
+        if tongue is not None:
+            sets.append(("tongue", *tongue_spheres(tongue)))
+        for name, C, R, J2, W2 in sets:
+            d_rest = np.linalg.norm(lip[:, None] - C[None], axis=-1) * 1000            # (L, T)
+            thr = np.minimum(R[None] * 1000 + TOOTH_MARGIN_MM, d_rest)
+            self.spheres[name] = (torch.tensor(np.concatenate([C, np.ones((len(C), 1))], 1), device=dev, dtype=dtype),
+                                  torch.tensor(thr, device=dev, dtype=dtype),
+                                  torch.tensor(J2, device=dev), torch.tensor(W2, device=dev, dtype=dtype))
+            self._export["spheres"][name] = {"centers": C.tolist(), "radius_mm": (R * 1000).tolist(),
+                                             "joints": J2.tolist(), "weights": W2.tolist()}
         H, N = T.MOUTH_HALF, T.MOUTH_N
         up, lo = [], []
-        for k in (0, -1):
+        for k in self.PAIR_RINGS:
             ids = tmpl.ring_ids("mouth", k)
             for j in range(1, H):
                 up.append(ids[j])
@@ -138,33 +185,48 @@ class Contacts:
         self.sep0 = torch.tensor(np.minimum(sep0, 0.0), device=dev, dtype=dtype)
         self.head = ji["head"]
         self.jaw = ji["jaw"]
+        self._export.update({"pairs_upper": up, "pairs_lower": lo, "head": ji["head"], "jaw": ji["jaw"]})
 
-    def energy(self, x: torch.Tensor, skin: torch.Tensor) -> tuple[torch.Tensor, dict]:
-        """x (S, V, 3) in mm; skin (S, J, 4, 4) in metres. Squared penetration depths."""
+    def export(self) -> dict:
+        """For the viewer's contact heat map (welded vertex ids; bind-space centres)."""
+        return self._export
+
+    def energy(self, x: torch.Tensor, skin: torch.Tensor, per_vertex: bool = False):
+        """x (S, V, 3) in mm; skin (S, J, 4, 4) in metres. Squared penetration
+        depths; with per_vertex, also the depth per vertex (S, V) in mm."""
         S = x.shape[0]
         e = x.new_zeros(S)
+        depth = torch.zeros(x.shape[:2], device=x.device, dtype=x.dtype) if per_vertex else None
         stats = {}
-        pen_eye = 0
+        pen = 0
         for ids, j, c, R in self.eye:
             cen = (skin[:, j] @ c)[:, :3] * 1000                        # (S, 3)
             d = (x[:, ids] - cen[:, None]).norm(dim=-1)
             p = torch.relu(R - d)
             e = e + (p ** 2).sum(1)
-            pen_eye = pen_eye + (p > 0.05).sum(1)
-        tc = (skin[:, self.tj] @ self.tc[None, :, :, None])[..., :3, 0] * 1000   # (S, T, 3)
+            pen = pen + (p > 0.05).sum(1)
+            if per_vertex:
+                depth[:, ids] = torch.maximum(depth[:, ids], p)
+        stats["eye"] = pen
         q = x[:, self.lip_ids]                                          # (S, L, 3)
-        d = torch.cdist(q, tc)                                          # (S, L, T)
-        p = torch.relu(self.tr[None] - d)
-        e = e + (p ** 2).sum((1, 2))
-        pen_teeth = (p.amax(2) > 0.05).sum(1)
-        # the mean of the head's and the jaw's up axes separates the lips
+        for name, (c, thr, J2, W2) in self.spheres.items():
+            M = (W2[None, :, :, None, None] * skin[:, J2]).sum(2)        # (S, T, 4, 4) blended
+            tc = (M @ c[None, :, :, None])[..., :3, 0] * 1000            # (S, T, 3)
+            p = torch.relu(thr[None] - torch.cdist(q, tc))              # (S, L, T)
+            e = e + (p ** 2).sum((1, 2))
+            stats[name] = (p.amax(2) > 0.05).sum(1)
+            if per_vertex:
+                depth[:, self.lip_ids] = torch.maximum(depth[:, self.lip_ids], p.amax(2))
         up = skin[:, self.head, :3, 1] + skin[:, self.jaw, :3, 1]
         up = up / up.norm(dim=-1, keepdim=True)
         sep = ((x[:, self.pair_u] - x[:, self.pair_l]) * up[:, None]).sum(-1)
         p = torch.relu(self.sep0[None] - sep)
         e = e + (p ** 2).sum(1)
-        pen_lips = (p > 0.05).sum(1)
-        stats = {"eye": pen_eye, "teeth": pen_teeth, "lips": pen_lips}
+        stats["lips"] = (p > 0.05).sum(1)
+        if per_vertex:
+            for ids in (self.pair_u, self.pair_l):
+                depth[:, ids] = torch.maximum(depth[:, ids], p)
+            return e, stats, depth
         return e, stats
 
 
@@ -265,13 +327,13 @@ class MLP2(torch.nn.Module):
 
 
 def train(tr: TorchRig, tmpl: T.Template, contacts: Contacts, out_dir: Path, samples: int = 2048,
-          k: int = 48, hidden: int = 128, batch: int = 128, iters: int = 80, epochs: int = 2500, seed: int = 0,
-          log=print, progress=None) -> dict:
+          k: int = 64, hidden: int = 256, batch: int = 128, iters: int = 100, epochs: int = 2500, seed: int = 0,
+          log=print, progress=None, w_contact: float = 1500.0) -> dict:
     t0 = time.perf_counter()
     dev = tr.rest.device
     torch.manual_seed(seed)
     X = sample_controls(tr.controls, samples, seed)
-    solver = Solver(tr, tmpl, contacts, iters=iters)
+    solver = Solver(tr, tmpl, contacts, iters=iters, w_contact=w_contact)
     res, before, after = [], [], []
     for s in range(0, samples, batch):
         c = torch.tensor(X[s:s + batch], device=dev)
@@ -285,7 +347,7 @@ def train(tr: TorchRig, tmpl: T.Template, contacts: Contacts, out_dir: Path, sam
     N, V = Rm.shape[:2]
     t_solve = time.perf_counter() - t0
     agg = lambda lst, key: int(sum(int(d[key].sum()) for d in lst))       # noqa: E731
-    contact = {key: {"linear": agg(before, key), "solved": agg(after, key)} for key in ("eye", "teeth", "lips")}
+    contact = {key: {"linear": agg(before, key), "solved": agg(after, key)} for key in before[0]}
     # PCA of the residuals
     Y = Rm.reshape(N, -1).to(dev)
     mean = Y.mean(0)

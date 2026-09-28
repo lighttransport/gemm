@@ -65,6 +65,9 @@ table{width:100%;border-collapse:collapse;font-size:12px}
 td{padding:3px 6px;border-bottom:1px solid var(--line)}
 td:first-child{color:var(--muted);width:46%}
 a.dl{color:var(--accent);margin-right:12px;font-size:13px;display:inline-block}
+.legend{display:flex;gap:8px;align-items:center;font:11px ui-monospace,monospace;color:var(--muted)}
+.legend .bar{flex:1;height:10px;border-radius:5px;background:linear-gradient(90deg,#30123b,#4686fb,#1ae4b6,#a2fc3c,#fabb39,#e4460a,#7a0403)}
+.jlabel{position:absolute;font:11px ui-monospace,monospace;color:#fff;background:#000a;padding:1px 4px;border-radius:4px;pointer-events:none;transform:translate(-50%,-140%);white-space:nowrap}
 .preview img{width:100%;border-radius:8px;background:#1b2027;display:block;margin-top:6px}
 @media(max-width:1200px){.layout{grid-template-columns:280px 1fr}.right{grid-column:1 / -1}}
 @media(max-width:800px){.layout{grid-template-columns:1fr}.viewer{height:460px}}
@@ -105,6 +108,23 @@ a.dl{color:var(--accent);margin-right:12px;font-size:13px;display:inline-block}
       <label title="random blinks"><input type="checkbox" id="auto-blink" checked> auto blink</label>
       <label title="eyes (and a little of the head) follow the pointer over the viewer"><input type="checkbox" id="look-at"> look at pointer</label>
       <label>exposure <input type="range" id="exposure" min="0.3" max="2.5" step="0.05" value="1" style="width:100px"></label>
+    </div>
+    <div class="card">
+      <h2>Inspect</h2>
+      <div class="tools">
+        <label>view <select id="viz" style="width:auto">
+          <option value="shaded">shaded</option>
+          <option value="weights">joint weights</option>
+          <option value="displacement">deformation (mm)</option>
+          <option value="ml">ML corrective influence (mm)</option>
+          <option value="contacts">contacts / collisions (mm)</option>
+        </select></label>
+        <label>joint <select id="viz-joint" style="width:auto"></select></label>
+        <label title="joint spheres and names over the skeleton"><input type="checkbox" id="joints"> joint labels</label>
+        <label>range <input type="range" id="viz-range" min="0.1" max="10" step="0.1" value="2" style="width:100px"> <output id="viz-range-v">2.0</output></label>
+      </div>
+      <div class="legend" id="legend"><span id="legend-lo">0</span><div class="bar"></div><span id="legend-hi">2 mm</span></div>
+      <div class="msg" id="viz-msg"></div>
     </div>
     <div class="card">
       <h2>Animation</h2>
@@ -262,7 +282,7 @@ $('wire').addEventListener('change', () => {
   state.model?.traverse((o) => { if (o.isMesh) for (const m of [].concat(o.material)) m.wireframe = $('wire').checked; });
   dirty = true;
 });
-$('ml').addEventListener('change', () => { if (state.rig) { state.rig.mlOn = $('ml').checked; applyRig(); } });
+$('ml').addEventListener('change', () => { if (state.rig) { state.rig.mlOn = $('ml').checked; applyRig(); updateHeat(true); } });
 $('bones').addEventListener('change', () => { if (skelHelper) skelHelper.visible = $('bones').checked; dirty = true; });
 
 // ---- controls UI ----------------------------------------------------------------------
@@ -356,7 +376,228 @@ function applyRig() {
     for (const [name, i] of Object.entries(dict)) mesh.morphTargetInfluences[i] = ev.weights[name] || 0;
   }
   dirty = true;
+  if (typeof updateHeat === 'function' && $('viz').value !== 'shaded') updateHeat(false);
+  if (typeof updateJointMarkers === 'function' && $('joints').checked) { state.model.updateMatrixWorld(true); updateJointMarkers(); }
 }
+
+// ---- inspection: joints, weights and heat maps -----------------------------------------------
+function turbo(t) {       // compact polynomial fit of the Turbo colormap, t in [0, 1]
+  t = Math.min(1, Math.max(0, t));
+  const r = 0.1357 + t * (4.5974 - t * (42.3277 - t * (130.5887 - t * (150.5666 - t * 58.1375))));
+  const g = 0.0914 + t * (2.1856 + t * (4.8052 - t * (14.0195 - t * (4.2109 + t * 2.7747))));
+  const b = 0.1067 + t * (12.5925 - t * (60.1097 - t * (109.0745 - t * (88.5066 - t * 26.8183))));
+  return [Math.min(1, Math.max(0, r)), Math.min(1, Math.max(0, g)), Math.min(1, Math.max(0, b))];
+}
+const viz = { markers: null, labels: [], heatMat: null, originals: new Map(), last: 0, pending: false };
+function heatMeshes() { return state.model ? state.model.children.filter(() => true).flatMap((o) => { const a = []; o.traverse((m) => { if (m.isMesh) a.push(m); }); return a; }) : []; }
+function setHeatMaterials(on) {
+  for (const m of heatMeshes()) {
+    if (/eyeshell/.test(m.name)) { m.visible = !on; continue; }   // a transparent occlusion layer: hide it
+    if (on) {
+      if (!viz.originals.has(m)) viz.originals.set(m, m.material);
+      if (!m.geometry.attributes.color) {
+        const n = m.geometry.attributes.position.count;
+        m.geometry.setAttribute('color', new THREE.BufferAttribute(new Float32Array(n * 3).fill(0.55), 3));
+      }
+      if (!m.userData.heatMat) m.userData.heatMat = new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide });
+      m.material = m.userData.heatMat;
+      m.material.wireframe = $('wire').checked;
+    } else if (viz.originals.has(m)) {
+      m.material = viz.originals.get(m);
+    }
+  }
+}
+function paint(mesh, values, scale, zeroGrey = true) {   // values per vertex (Float32Array) or null (grey)
+  const col = mesh.geometry.attributes.color;
+  if (!col) return;
+  const a = col.array;
+  for (let i = 0; i < col.count; i++) {
+    if (!values) { a[3 * i] = a[3 * i + 1] = a[3 * i + 2] = 0.45; continue; }
+    const c = (values[i] > 0 || !zeroGrey) ? turbo(values[i] / scale) : [0.3, 0.3, 0.33];
+    a[3 * i] = c[0]; a[3 * i + 1] = c[1]; a[3 * i + 2] = c[2];
+  }
+  col.needsUpdate = true;
+}
+function skinMatrix(j) {        // world(j) @ inverse(bind(j)) in the model frame
+  const sk = state.skeleton;
+  return new THREE.Matrix4().multiplyMatrices(sk.bones[j].matrixWorld, sk.boneInverses[j]);
+}
+const _v = new THREE.Vector3();
+function deformedPositions(mesh) {
+  const n = mesh.geometry.attributes.position.count, out = new Float32Array(n * 3);
+  for (let i = 0; i < n; i++) { mesh.getVertexPosition(i, _v); out[3 * i] = _v.x; out[3 * i + 1] = _v.y; out[3 * i + 2] = _v.z; }
+  return out;
+}
+function mlOffsets(mesh) {     // pre-skinning ML corrective offset magnitude (mm) per vertex
+  const n = mesh.geometry.attributes.position.count, acc = new Float32Array(n * 3);
+  const dict = mesh.morphTargetDictionary || {}, infl = mesh.morphTargetInfluences, attrs = mesh.geometry.morphAttributes.position || [];
+  for (const [name, k] of Object.entries(dict)) {
+    if (!name.startsWith('ml_') || !infl[k]) continue;
+    const a = attrs[k].array, w = infl[k];
+    for (let i = 0; i < n * 3; i++) acc[i] += w * a[i];
+  }
+  const out = new Float32Array(n);
+  for (let i = 0; i < n; i++) out[i] = 1000 * Math.hypot(acc[3 * i], acc[3 * i + 1], acc[3 * i + 2]);
+  return out;
+}
+function prepareContacts() {
+  const V = state.vizData;
+  if (!V?.contacts) return null;
+  const nW = V.welded_vertices, rest = new Float32Array(nW * 3);
+  const parts = {};
+  for (const m of heatMeshes()) if (V.parts[m.name]) parts[m.name] = m;
+  for (const [name, m] of Object.entries(parts)) {
+    const vm = V.parts[name].vmap, p = m.geometry.attributes.position.array;
+    for (let i = 0; i < vm.length; i++) for (let c = 0; c < 3; c++) rest[3 * vm[i] + c] = p[3 * i + c];
+  }
+  const C = V.contacts, lip = C.lip_ids, mm = 1000;
+  const eyes = C.eye.map((e) => ({ ...e, thr: Float32Array.from(e.ids, (w) => Math.min(e.radius_mm + C.margins_mm.eye,
+    mm * Math.hypot(rest[3 * w] - e.center[0], rest[3 * w + 1] - e.center[1], rest[3 * w + 2] - e.center[2]))) }));
+  const spheres = Object.entries(C.spheres).map(([name, S]) => {
+    const T = S.centers.length, thr = new Float32Array(lip.length * T);
+    lip.forEach((w, l) => S.centers.forEach((c, t) => {
+      thr[l * T + t] = Math.min(S.radius_mm[t] + C.margins_mm.sphere, mm * Math.hypot(rest[3 * w] - c[0], rest[3 * w + 1] - c[1], rest[3 * w + 2] - c[2]));
+    }));
+    return { name, ...S, thr };
+  });
+  const sep0 = Float32Array.from(C.pairs_upper, (u, i) => Math.min(0, mm * (rest[3 * u + 1] - rest[3 * C.pairs_lower[i] + 1])));
+  return { parts, nW, eyes, spheres, sep0 };
+}
+function contactDepths(ct) {   // per welded vertex, penetration depth (mm) for the current pose
+  const C = state.vizData.contacts, pos = new Float32Array(ct.nW * 3), depth = new Float32Array(ct.nW);
+  for (const [name, m] of Object.entries(ct.parts)) {
+    const vm = state.vizData.parts[name].vmap, p = deformedPositions(m);
+    for (let i = 0; i < vm.length; i++) for (let c = 0; c < 3; c++) pos[3 * vm[i] + c] = p[3 * i + c];
+  }
+  const counts = {};
+  const P = (w) => [pos[3 * w] * 1000, pos[3 * w + 1] * 1000, pos[3 * w + 2] * 1000];
+  for (const e of ct.eyes) {
+    const c = new THREE.Vector3(...e.center).applyMatrix4(skinMatrix(e.joint)).multiplyScalar(1000);
+    let n = 0;
+    e.ids.forEach((w, i) => { const q = P(w), d = Math.hypot(q[0] - c.x, q[1] - c.y, q[2] - c.z), p = e.thr[i] - d; if (p > 0) { depth[w] = Math.max(depth[w], p); if (p > 0.05) n++; } });
+    counts.eye = (counts.eye || 0) + n;
+  }
+  for (const S of ct.spheres) {
+    const T = S.centers.length, cen = [];
+    for (let t = 0; t < T; t++) {
+      const M = new THREE.Matrix4().set(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+      for (let k = 0; k < 2; k++) { const w = S.weights[t][k]; if (!w) continue; const E = skinMatrix(S.joints[t][k]).elements; for (let e = 0; e < 16; e++) M.elements[e] += w * E[e]; }
+      cen.push(new THREE.Vector3(...S.centers[t]).applyMatrix4(M).multiplyScalar(1000));
+    }
+    let n = 0;
+    C.lip_ids.forEach((w, l) => {
+      const q = P(w);
+      let best = 0;
+      for (let t = 0; t < T; t++) { const p = S.thr[l * T + t] - Math.hypot(q[0] - cen[t].x, q[1] - cen[t].y, q[2] - cen[t].z); if (p > best) best = p; }
+      if (best > 0) { depth[w] = Math.max(depth[w], best); if (best > 0.05) n++; }
+    });
+    counts[S.name] = n;
+  }
+  const up = new THREE.Vector3().setFromMatrixColumn(skinMatrix(C.head), 1).add(new THREE.Vector3().setFromMatrixColumn(skinMatrix(C.jaw), 1)).normalize();
+  let n = 0;
+  C.pairs_upper.forEach((u, i) => {
+    const a = P(u), b = P(C.pairs_lower[i]);
+    const sep = (a[0] - b[0]) * up.x + (a[1] - b[1]) * up.y + (a[2] - b[2]) * up.z, p = ct.sep0[i] - sep;
+    if (p > 0) { depth[u] = Math.max(depth[u], p); depth[C.pairs_lower[i]] = Math.max(depth[C.pairs_lower[i]], p); if (p > 0.05) n++; }
+  });
+  counts.lips = n;
+  let max = 0;
+  for (const d of depth) if (d > max) max = d;
+  return { depth, counts, max };
+}
+function updateJointMarkers() {
+  const show = $('joints').checked && state.skeleton;
+  if (!viz.markers && show) {
+    viz.markers = new THREE.Group();
+    const geo = new THREE.SphereGeometry(0.0018, 12, 8);
+    const mat = new THREE.MeshBasicMaterial({ color: 0xffd060, depthTest: false });
+    for (const b of state.skeleton.bones) {
+      const s = new THREE.Mesh(geo, mat);
+      s.renderOrder = 10;
+      viz.markers.add(s);
+      const el = document.createElement('span');
+      el.className = 'jlabel';
+      el.textContent = b.name;
+      viewer.appendChild(el);
+      viz.labels.push(el);
+    }
+    scene.add(viz.markers);
+  }
+  if (!viz.markers) return;
+  viz.markers.visible = !!show;
+  const w = viewer.clientWidth, h = viewer.clientHeight;
+  camera.updateMatrixWorld();          // project() needs the current view (it updates only at render)
+  state.skeleton.bones.forEach((b, i) => {
+    const p = new THREE.Vector3().setFromMatrixPosition(b.matrixWorld);
+    viz.markers.children[i].position.copy(p);
+    const q = p.clone().project(camera), el = viz.labels[i];
+    el.style.display = show && q.z < 1 ? '' : 'none';
+    el.style.left = `${(q.x * 0.5 + 0.5) * w}px`;
+    el.style.top = `${(-q.y * 0.5 + 0.5) * h}px`;
+    el.style.outline = ($('viz').value === 'weights' && +$('viz-joint').value === i) ? '1px solid #ffd060' : '';
+  });
+}
+function updateHeat(force) {
+  const mode = $('viz').value;
+  const range = +$('viz-range').value;
+  $('viz-range-v').value = range.toFixed(1);
+  if (!state.model) return;
+  setHeatMaterials(mode !== 'shaded');
+  $('legend').style.display = mode === 'shaded' ? 'none' : '';
+  $('viz-joint').disabled = mode !== 'weights';
+  if (mode === 'shaded') { $('viz-msg').textContent = ''; dirty = true; return; }
+  const now = performance.now();
+  if (!force && now - viz.last < 90) { viz.pending = true; return; }
+  viz.last = now; viz.pending = false;
+  state.model.updateMatrixWorld(true);
+  state.skeleton.update();
+  const meshes = heatMeshes();
+  if (mode === 'weights') {
+    const j = +$('viz-joint').value;
+    $('legend-hi').textContent = '1.0';
+    for (const m of meshes) {
+      const si = m.geometry.attributes.skinIndex, sw = m.geometry.attributes.skinWeight;
+      if (!si) { paint(m, null, 1); continue; }
+      const vals = new Float32Array(si.count);
+      for (let i = 0; i < si.count; i++) for (let k = 0; k < 4; k++) if (si.getComponent(i, k) === j) vals[i] += sw.getComponent(i, k);
+      paint(m, vals, 1, false);
+    }
+    $('viz-msg').textContent = `weights of ${state.skeleton.bones[j].name}`;
+  } else if (mode === 'displacement') {
+    $('legend-hi').textContent = `${range * 5} mm`;
+    let max = 0;
+    for (const m of meshes) {
+      const rest = m.geometry.attributes.position.array, p = deformedPositions(m), vals = new Float32Array(m.geometry.attributes.position.count);
+      for (let i = 0; i < vals.length; i++) { vals[i] = 1000 * Math.hypot(p[3 * i] - rest[3 * i], p[3 * i + 1] - rest[3 * i + 1], p[3 * i + 2] - rest[3 * i + 2]) + 1e-6; if (vals[i] > max) max = vals[i]; }
+      paint(m, vals, range * 5);
+    }
+    $('viz-msg').textContent = `max displacement ${max.toFixed(2)} mm (skinning + shapes + ML)`;
+  } else if (mode === 'ml') {
+    $('legend-hi').textContent = `${(range * 0.25).toFixed(2)} mm`;
+    let max = 0;
+    for (const m of meshes) { const v = mlOffsets(m); for (const x of v) if (x > max) max = x; paint(m, v, range * 0.25); }
+    $('viz-msg').textContent = state.rig?.ml ? `max ML corrective ${max.toFixed(3)} mm${state.rig.mlOn ? '' : ' (deformer off)'}` : 'no ML deformer in this rig';
+  } else if (mode === 'contacts') {
+    $('legend-hi').textContent = `${(range * 0.5).toFixed(2)} mm`;
+    viz.ct ||= prepareContacts();
+    if (!viz.ct) { $('viz-msg').textContent = 'no contact model (rig built without the ML deformer)'; return; }
+    const r = contactDepths(viz.ct);
+    for (const m of meshes) {
+      const vm = state.vizData.parts[m.name]?.vmap;
+      const vals = new Float32Array(m.geometry.attributes.position.count);
+      if (vm) for (let i = 0; i < vm.length; i++) vals[i] = r.depth[vm[i]];
+      paint(m, vm ? vals : null, range * 0.5);
+    }
+    state.lastContacts = r;
+    $('viz-msg').textContent = `penetrating vertices (>0.05 mm) · ${Object.entries(r.counts).map(([k, v]) => `${k} ${v}`).join(' · ')} · max ${r.max.toFixed(2)} mm · ML ${state.rig?.mlOn && state.rig?.ml ? 'on' : 'off'}`;
+  }
+  dirty = true;
+}
+$('viz').addEventListener('change', () => updateHeat(true));
+$('viz-joint').addEventListener('change', () => updateHeat(true));
+$('viz-range').addEventListener('input', () => updateHeat(true));
+$('joints').addEventListener('change', () => { updateJointMarkers(); dirty = true; });
+controls.addEventListener('change', updateJointMarkers);
 
 // ---- animation ------------------------------------------------------------------------------
 let tween = null;
@@ -455,6 +696,7 @@ function tick(now) {
     if (Math.abs(nx - gaze.x) + Math.abs(ny - gaze.y) > 1e-4) { gaze = { x: nx, y: ny }; changed = true; }
   }
   if (changed) { applyRig(); if (tween || state.anim) syncSliders(); }
+  if (viz.pending && now - viz.last > 90) updateHeat(false);
   if (dirty) { renderer.render(scene, camera); dirty = false; }
 }
 requestAnimationFrame(tick);
@@ -472,6 +714,7 @@ async function loadRig(h) {
   if (state.model) { scene.remove(state.model); state.model.traverse((o) => { o.geometry?.dispose(); }); }
   if (skelHelper) { scene.remove(skelHelper); skelHelper = null; }
   state.model = gltf.scene;
+  state.skeleton = null;
   state.bones = {};
   state.morphMeshes = [];
   gltf.scene.traverse((o) => {
@@ -489,6 +732,14 @@ async function loadRig(h) {
   skelHelper = new THREE.SkeletonHelper(gltf.scene);
   skelHelper.visible = $('bones').checked;
   scene.add(skelHelper);
+  gltf.scene.traverse((o) => { if (o.isSkinnedMesh && !state.skeleton) state.skeleton = o.skeleton; });
+  state.vizData = await fetch(base + 'viz.json').then((r) => (r.ok ? r.json() : null)).catch(() => null);
+  viz.ct = null;
+  for (const el of viz.labels) el.remove();
+  viz.labels = [];
+  if (viz.markers) { scene.remove(viz.markers); viz.markers = null; }
+  viz.originals = new Map();
+  $('viz-joint').innerHTML = def.joints.map((j, i) => `<option value="${i}" ${j.name === 'jaw' ? 'selected' : ''}>${j.name}</option>`).join('');
   state.rig = new LinearRig(def);
   if (def.ml_deformer) {
     const t = await loadSafetensors(base + def.ml_deformer.model);
@@ -502,6 +753,7 @@ async function loadRig(h) {
   buildControls(def);
   applyRig();
   $('empty').hidden = true;
+  updateHeat(true);
   $('vlabel').textContent = `rig.glb · ${def.controls.length} controls · ${def.blendshapes.length} shapes · ${def.joints.length} joints`;
   setView('front');
 }

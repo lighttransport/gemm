@@ -94,9 +94,10 @@ def train_deformer(tmpl, pos, shapes, Jn, W, skel, feat, out, samples, log=print
     jidx = {n: i for i, n in enumerate(names)}
     teeth = [(mouthparts.teeth(skel, up, skel["scale"], jidx)[0], "teeth_upper" if up else "teeth_lower")
              for up in (True, False)]
-    contacts = mldeformer.Contacts(tmpl, feat, skel, teeth, dev, pos)
+    tongue = mouthparts.tongue(skel, skel["scale"], jidx)
+    contacts = mldeformer.Contacts(tmpl, feat, skel, teeth, dev, pos, tongue=tongue)
     stats = mldeformer.train(tr, tmpl, contacts, out, samples=samples, log=log, progress=progress)
-    return mldeformer.MLDeformer(out), stats
+    return mldeformer.MLDeformer(out), stats, contacts.export()
 
 
 STAGES = {"features": .04, "register": .08, "fit_cache": .2, "skeleton_weights": .22, "shapes": .24,
@@ -105,7 +106,7 @@ STAGES = {"features": .04, "register": .08, "fit_cache": .2, "skeleton_weights":
 
 def assemble(folder, out_dir=None, res: int = 2048, iters: int = 600, log=print, cache_dir=None,
              reuse_fit: bool = False, preview: bool = True, keep_asset: bool = False, progress=None,
-             deformer_samples: int = 2048) -> dict:
+             deformer_samples: int = 3072) -> dict:
     t0 = time.perf_counter()
     folder = Path(folder)
     out = Path(out_dir) if out_dir else folder / "rig"
@@ -151,9 +152,9 @@ def assemble(folder, out_dir=None, res: int = 2048, iters: int = 600, log=print,
     t = lap("skeleton_weights", t)
     shapes = expressions.build(F, skel, (Jn, W))
     t = lap("shapes", t)
-    ml, ml_stats = None, None
+    ml, ml_stats, contacts_viz = None, None, None
     if deformer_samples:
-        ml, ml_stats = train_deformer(tmpl, pos, shapes, Jn, W, skel, feat, out, deformer_samples, log=log,
+        ml, ml_stats, contacts_viz = train_deformer(tmpl, pos, shapes, Jn, W, skel, feat, out, deformer_samples, log=log,
                                       progress=(lambda f, m: progress(STAGES["deformer"] + 0.2 * f, m))
                                       if progress else None)
         shapes = dict(shapes, **ml.target_deltas())
@@ -253,6 +254,10 @@ def assemble(folder, out_dir=None, res: int = 2048, iters: int = 600, log=print,
         import pickle
         (out / "asset.pkl").write_bytes(pickle.dumps(asset))
     (out / "rig.json").write_text(json.dumps(rig, indent=1))
+    viz = {"parts": {f"head_{p.name}": {"vmap": p.vmap.tolist()} for p in parts_t}, "contacts": contacts_viz,
+           "welded_vertices": int(len(pos))}
+    (out / "viz.json").write_text(json.dumps(viz, separators=(",", ":"),
+                                             default=lambda o: o.tolist() if hasattr(o, "tolist") else str(o)))
     from . import native
     native_stats = native.write_package(out / "rig_deformer.safetensors", rig, pos, shapes, Jn, W, ml)
     glb_stats = gltf.write(asset, out / "rig.glb")
@@ -381,7 +386,7 @@ def main(argv=None):
     ap.add_argument("--no-preview", action="store_true")
     ap.add_argument("--keep-asset", action="store_true", help="also pickle the assembled asset (debugging)")
     ap.add_argument("--progress", action="store_true", help="print '@progress <fraction> <message>' lines")
-    ap.add_argument("--deformer-samples", type=int, default=2048,
+    ap.add_argument("--deformer-samples", type=int, default=3072,
                     help="ground-truth samples for the ML corrective deformer (0: no deformer)")
     a = ap.parse_args(argv)
     prog = None

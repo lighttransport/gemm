@@ -110,3 +110,48 @@ class Native:
         if self.h:
             self.lib.vh_deformer_free(self.h)
             self.h = None
+
+
+GPU_SOURCES = ("cuda/vhuman/vhuman_deformer_cuda.c", "cuda/cuew.c") + SOURCES
+
+
+def build_gpu_library(out_dir: Path) -> Path:
+    """libvhuman_deformer_cuda.so (gcc + cuew; kernels are NVRTC-compiled at run time)."""
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    lib = out_dir / "libvhuman_deformer_cuda.so"
+    cmd = ["gcc", "-O3", "-mavx2", "-mfma", "-fPIC", "-shared", "-I", str(ROOT / "cuda"), "-I", str(ROOT / "common"),
+           "-o", str(lib), *[str(ROOT / s) for s in GPU_SOURCES], "-ldl", "-lm", "-lpthread"]
+    subprocess.run(cmd, check=True, capture_output=True, text=True)
+    return lib
+
+
+class NativeGPU(Native):
+    """The CUDA backend (cuda/vhuman): same package, batched evaluation."""
+
+    def __init__(self, lib_path, package, device: int = 0):
+        super().__init__(lib_path, package)
+        L = self.lib
+        L.vh_gpu_create.restype = ctypes.c_void_p
+        L.vh_gpu_create.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+        L.vh_gpu_free.argtypes = [ctypes.c_void_p]
+        L.vh_gpu_eval_batch.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_size_t, ctypes.c_int,
+                                        ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_double)]
+        self.g = L.vh_gpu_create(self.h, device, 0)
+        if not self.g:
+            super().close()
+            raise RuntimeError("no CUDA device or driver")
+
+    def eval_gpu(self, controls: np.ndarray, use_ml: bool = True) -> tuple[np.ndarray, list]:
+        x = np.ascontiguousarray(controls, np.float32)
+        out = np.zeros((len(x), self.V, 3), np.float32)
+        ms = (ctypes.c_double * 4)()
+        if self.lib.vh_gpu_eval_batch(self.g, self._p(x), len(x), int(use_ml), self._p(out), ms):
+            raise RuntimeError("GPU deformer launch failed")
+        return out, list(ms)
+
+    def close(self):
+        if getattr(self, "g", None):
+            self.lib.vh_gpu_free(self.g)
+            self.g = None
+        super().close()

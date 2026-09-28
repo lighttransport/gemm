@@ -166,7 +166,7 @@ class RigEndToEndTests(unittest.TestCase):
 
     def test_outputs(self):
         for name in ("rig.glb", "rig.json", "rig.usda", "rig_usd.zip", "rig_report.json", "rig_basecolor.png",
-                     "deformer.lrm", "deformer_basis.safetensors", "rig_deformer.safetensors"):
+                     "deformer.lrm", "deformer_basis.safetensors", "rig_deformer.safetensors", "viz.json"):
             self.assertIn(name, self.summary["files"])
         self.assertEqual(self.summary["report"]["controls"], len(rigdef.CONTROLS))
         self.assertGreaterEqual(self.summary["report"]["shapes"], 50)
@@ -222,6 +222,35 @@ class RigEndToEndTests(unittest.TestCase):
             np.testing.assert_allclose(B[2], N.eval(X[2]), atol=2e-6)
         finally:
             N.close()
+
+    @unittest.skipIf(shutil.which("gcc") is None, "no gcc")
+    def test_gpu_deformer_parity(self):
+        from .rig import native
+        try:
+            lib = native.build_gpu_library(Path(self.tmp.name) / "gpu")
+            G = native.NativeGPU(lib, self.rig_dir / "rig_deformer.safetensors")
+        except (RuntimeError, OSError, subprocess.CalledProcessError) as exc:
+            self.skipTest(f"CUDA unavailable: {exc}")
+        try:
+            rng = np.random.default_rng(1)
+            X = np.zeros((19, G.C), np.float32)                  # not a multiple of the 8-frame tile
+            X[:, :51] = (rng.random((19, 51)) < 0.15) * rng.random((19, 51))
+            out, ms = G.eval_gpu(X)
+            for f in (0, 7, 8, 18):
+                np.testing.assert_allclose(out[f], G.eval(X[f]), atol=2e-6)
+            self.assertGreaterEqual(ms[2], 0.0)
+        finally:
+            G.close()
+
+    def test_viz_export(self):
+        viz = json.loads((self.rig_dir / "viz.json").read_text())
+        self.assertEqual(set(viz["parts"]), {"head_skin", "head_mouth"})
+        c = viz["contacts"]
+        self.assertEqual(set(c["spheres"]), {"teeth", "tongue"})
+        self.assertEqual(len(c["eye"]), 2)
+        self.assertEqual(len(c["pairs_upper"]), len(c["pairs_lower"]))
+        vmax = max(max(p["vmap"]) for p in viz["parts"].values())
+        self.assertLess(vmax, viz["welded_vertices"])
 
     def test_usd_layer(self):
         text = (self.rig_dir / "rig.usda").read_text()

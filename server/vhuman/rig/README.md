@@ -71,9 +71,35 @@ viewer and native C:
    frame (sparse AXPY over active morphs, `lt_mlp2_f32` for the MLP) or a
    batch (`sgemm_avx2` over all morphs), then LBS. `make -C ryzen vhuman &&
    ryzen/bench_vhuman_deformer <head>/rig/rig_deformer.safetensors`.
-   The reference head (12.6k vertices, 101 morphs) takes 0.55 ms/frame with
-   the ML correctives and 0.17 ms without, single-threaded. Parity with numpy
+   The reference head (12.6k vertices, 117 morphs incl. 65 ML) takes
+   1.15 ms/frame with the ML correctives (0.51 ms batched) and 0.18 ms
+   without, single-threaded. Parity with numpy
    is ≈1e-7 m (`test_rig`, via ctypes).
+4. **GPU runtime**: `cuda/vhuman/` (cuew + NVRTC): the host prepares the rig
+   state, and one fused kernel blends morphs (register-tiled over 8 frames)
+   and skins. It runs at ~2.3 µs/frame for 1024-frame batches on an RTX 5060
+   Ti and equals the CPU result.
+
+Contacts (ground truth, the viewer's heat map and `viz.json`): lid vertices vs
+the eyeballs, lip/vestibule vertices vs sphere sets (per-tooth spheres on the
+teeth joints; three spheres per tongue cross-section on the blended tongue
+joints), and upper vs lower lip pairs on rings 1..-2. The sampler includes
+tongue controls with an open jaw. Reference man, held-out contact vertices
+for linear vs linear + ML: eye 16930→1906, teeth 2328→717, lips 6060→2872,
+tongue 289→278. The solver removes tongue contacts, but the network does
+not yet generalise them.
+
+## Inspection (web viewer)
+
+`/rig` → Inspect:
+- **Joint labels**: joint markers and names over the skeleton.
+- **Joint weights**: the selected joint's skin weights as a heat map.
+- **Deformation**: displacement from rest in mm, including skinning, shapes
+  and ML.
+- **ML corrective influence**: the pre-skinning ML offset in mm.
+- **Contacts / collisions**: penetration depth per vertex for the current
+  pose, with counts per contact class. It uses the build's contact model
+  (`viz.json`); toggle "ML deformer" to compare.
 
 ## Rig evaluation (`rig.json`)
 
@@ -136,6 +162,7 @@ Names are our own; the 51 expression controls are the LightRig canonical
 - vchar shows joint-driven controls only through animations (the ROM).
 - The ML deformer corrects sub-millimetre contacts and soft-tissue
   shearing; it cannot add expression detail the procedural shapes lack.
-  Lip-lip contacts are only halved, and the tongue is not part of the contact
-  model. The native runtime covers the welded head; teeth, tongue and eyes are
+  Lip-lip contacts are only about halved, and tongue contacts are solved but
+  not learned. Some lip crossings come from the rig itself (e.g. mouthClose
+  without jawOpen). The native runtime covers the welded head; teeth, tongue and eyes are
   rigid or simply skinned in the exports.
