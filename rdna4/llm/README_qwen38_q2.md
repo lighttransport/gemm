@@ -120,6 +120,17 @@ decode tok/s for eight decode tokens. The PLE table is not the current
 throughput limiter. During the run, ROCm reported manual performance mode and
 memory clock level 0 (96 MHz), even while GPU memory activity was 69%.
 
+The standalone device-memory probe reproduces this clock's bandwidth limit:
+
+```sh
+make -C rdna4/llm tmp/bench_hip_mem_bw
+LD_LIBRARY_PATH=/opt/rocm/lib rdna4/llm/tmp/bench_hip_mem_bw
+```
+
+Four consecutive runs measured 40.77–40.88 GiB/s. After changing the
+manual memory level, rerun this probe and the 1K model command with the same
+model and context settings to quantify the hardware effect.
+
 The Qwen SSD profile now uses the existing vectorized F16 matvec kernel for
 its F16 projections. `LLM_QWEN4_F16_LLAMA=0` restores the original kernel;
 an explicit `LLM_DECODE_WMMA=1` also retains its own path. On the 1K prompt,

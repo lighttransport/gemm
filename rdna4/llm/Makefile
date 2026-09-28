@@ -36,6 +36,11 @@ QSA_MOE_CACHE_MB ?= 128
 
 all: $(TARGET)
 
+# Bounded device-memory probe for diagnosing manual DPM clock settings.
+tmp/bench_hip_mem_bw: bench_hip_mem_bw.cpp
+	mkdir -p tmp
+	$(HIPCC) -O3 --offload-arch=gfx1201 $< -o $@
+
 test_fattn_vec_half2: test_fattn_vec_half2.cu
 	$(HIPCC) -O2 --offload-arch=gfx1201 $< -o $@
 
