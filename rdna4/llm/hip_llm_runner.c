@@ -14800,6 +14800,7 @@ struct hip_llm_runner {
     int qwen4_nextn_start;
     int qwen4_coding_profile;
     int qwen4_batched_prefill;
+    int qwen4_prefill_hc_premix;
     int qwen4_batch_request_tokens; /* current HTTP request length, 0 = unknown */
     int qwen4_prefill_staging;
     int qwen4_stage_slots;       /* slots per bank; two banks are allocated */
@@ -28351,6 +28352,28 @@ static int forward_hc_mix_batched(hip_llm_runner *r, int M, void *norm_w,
     void *na[]={&r->d_hc_norm_batch,&r->d_hc_batch,&norm_w,&ne,&ns,&M,&eps};
     if (LAUNCH(r->fn_hc_norm_batch_f32, M*ns,1,1,256,1,1,256*sizeof(float),
                r->stream,na) != hipSuccess) return -1;
+    const char *exact_f16_env = getenv("LLM_QWEN4_BATCH_HC_EXACT_F16");
+    if (r->is_qwen4exp && exact_f16_env && atoi(exact_f16_env) != 0) {
+        if (down_type != GGML_TYPE_F16 || up_type != GGML_TYPE_F16 ||
+            (inject_w && inject_type != GGML_TYPE_F16)) return -1;
+        launch_matvec_llama_f16_batch(r, r->d_hc_low_batch, down_w,
+                                      r->d_hc_norm_batch, lr, hcd, M);
+        int low_count = M * lr;
+        float scale = 1.0f / (float)ns;
+        void *sa[] = { &r->d_hc_low_batch, &low_count, &scale };
+        if (LAUNCH(r->fn_hc_silu_scale_f32, (low_count + 255) / 256, 1, 1,
+                   256, 1, 1, 0, r->stream, sa) != hipSuccess) return -1;
+        launch_matvec_llama_f16_batch(r, r->d_hc_gate_batch, up_w,
+                                      r->d_hc_low_batch, hcd, lr, M);
+        void *ma[] = { &mixed, &r->d_hc_norm_batch, &r->d_hc_gate_batch,
+                       &ne, &ns, &M };
+        if (LAUNCH(r->fn_hc_mix_batch_f32, (M * ne + 255) / 256, 1, 1,
+                   256, 1, 1, 0, r->stream, ma) != hipSuccess) return -1;
+        if (inject_w)
+            launch_matvec_llama_f16_batch(r, r->d_hc_inject_batch, inject_w,
+                                          r->d_hc_norm_batch, ns, hcd, M);
+        return 0;
+    }
     const char *native_env = getenv("LLM_QWEN4_BATCH_HC_NATIVE");
     if (native_env && atoi(native_env) != 0) {
         if (down_type != GGML_TYPE_Q8_0 || up_type != GGML_TYPE_Q8_0 ||
@@ -30655,15 +30678,19 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
             launch_qwen4_router_native(r,cl,M,r->d_xnorm_batch,
                 r->d_router_logits_batch,r->d_shared_scale_batch)) return -1;
     } else if (router_scalar_env && atoi(router_scalar_env) != 0) {
-        /* Diagnostic parity path: one-row router GEMM fixes the reduction
-         * order and removes batched WMMA tie noise from expert selection.
-         * Keep it opt-in because it intentionally sacrifices prefill rate. */
-        for (int m = 0; m < M; ++m) {
+        /* The <=32-row tile uses the same WMMA variant and reduction shape as
+         * a single row. Larger router GEMMs can perturb borderline routes. */
+        const char *router_tile_env = getenv("LLM_QWEN4_BATCH_ROUTER_TILE");
+        int router_tile = router_tile_env ? atoi(router_tile_env) : 1;
+        if (router_tile < 1 || router_tile > 32) router_tile = 1;
+        for (int m = 0; m < M; m += router_tile) {
+            int rows = M - m;
+            if (rows > router_tile) rows = router_tile;
             if (gemm_run_bf16_w(r,
                     (float *)r->d_router_logits_batch + (size_t)m * ne,
                     cl->moe_gate_w_bf16,
                     (const char *)r->d_xnorm_batch_bf16_moe + (size_t)m * n_embd * 2,
-                    1, ne, n_embd, r->stream) != 0) return -1;
+                    rows, ne, n_embd, r->stream) != 0) return -1;
         }
     } else if (gemm_run_bf16_w(r, r->d_router_logits_batch, cl->moe_gate_w_bf16,
                                 r->d_xnorm_batch_bf16_moe, M, ne, n_embd, r->stream) != 0) return -1;
@@ -31605,9 +31632,11 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
             qwen4_ple_forward(r, cl);
             if (r->qwen4_forward_error) return;
         }
-        forward_hc_mix(r, cl->hc_attn_norm_w, cl->hc_attn_down_w,
-                       cl->hc_attn_down_type, cl->hc_attn_up_w, cl->hc_attn_up_type,
-                       cl->hc_attn_inject_w, cl->hc_attn_inject_type, r->d_xb, trunk == 1 ? 2*l : -1);
+        if (!r->qwen4_prefill_hc_premix)
+            forward_hc_mix(r, cl->hc_attn_norm_w, cl->hc_attn_down_w,
+                           cl->hc_attn_down_type, cl->hc_attn_up_w, cl->hc_attn_up_type,
+                           cl->hc_attn_inject_w, cl->hc_attn_inject_type, r->d_xb,
+                           trunk == 1 ? 2*l : -1);
         debug_f32_state(r, l, "Q4HC attn_mix", r->d_xb, n_embd);
     /* Pre-attention RMSNorm; fused with pending MoE residual from previous layer. */
     } else if (r->moe_add_pending) {
@@ -33586,6 +33615,20 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
             int row_failed = 0;
             void *saved_d_x = r->d_x;
             void *saved_d_hc = r->d_hc;
+            const char *premix_env = getenv("LLM_QWEN4_BATCH_HC_PREMIX");
+            const char *exact_hc_env = getenv("LLM_QWEN4_BATCH_HC_EXACT_F16");
+            int premix = split_scalar_ffn && l != 1 && premix_env &&
+                atoi(premix_env) != 0 && exact_hc_env && atoi(exact_hc_env) != 0 &&
+                cl->hc_attn_down_type == GGML_TYPE_F16 &&
+                cl->hc_attn_up_type == GGML_TYPE_F16 &&
+                cl->hc_attn_inject_type == GGML_TYPE_F16;
+            if (premix && forward_hc_mix_batched(r, M, cl->hc_attn_norm_w,
+                    cl->hc_attn_down_w, cl->hc_attn_down_w_bf16,
+                    cl->hc_attn_down_type, cl->hc_attn_up_w,
+                    cl->hc_attn_up_w_bf16, cl->hc_attn_up_type,
+                    cl->hc_attn_inject_w, cl->hc_attn_inject_type,
+                    r->d_xnorm_batch)) return -1;
+            r->qwen4_prefill_hc_premix = premix;
             for (int m = 0; m < M; m++) {
                 int pos = position_start + m;
                 r->d_x = (char *)r->d_x_batch + (size_t)m * n_embd * sizeof(float);
@@ -33608,6 +33651,18 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
                                    hipMemcpyHostToDevice, r->stream);
                 else
                     hipMemcpy(r->d_position, &pos, sizeof(int), hipMemcpyHostToDevice);
+                if (premix &&
+                    (hipMemcpyAsync(r->d_xb,
+                        (char *)r->d_xnorm_batch + (size_t)m * n_embd * sizeof(float),
+                        (size_t)n_embd * sizeof(float), hipMemcpyDeviceToDevice,
+                        r->stream) != hipSuccess ||
+                     hipMemcpyAsync(r->d_hc_inject,
+                        (char *)r->d_hc_inject_batch +
+                            (size_t)m * r->hc_count * sizeof(float),
+                        (size_t)r->hc_count * sizeof(float),
+                        hipMemcpyDeviceToDevice, r->stream) != hipSuccess)) {
+                    row_failed = 1; break;
+                }
                 /* Grouped exact verification uses the target trunk selector
                  * (2), matching hllm_qwen4_window_forward's scalar replay.
                  * forward_one_layer() uses selector 1 for ordinary decode;
@@ -33652,6 +33707,7 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
             }
             r->d_x = saved_d_x;
             r->d_hc = saved_d_hc;
+            r->qwen4_prefill_hc_premix = 0;
             if (row_failed) return -1;
             if (split_scalar_ffn) goto ffn_section;
             if (prefill_profile) {

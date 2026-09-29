@@ -261,7 +261,8 @@ with the exact hash `b9f867f533408c06`.
 
 The opt-in `LLM_QWEN4_BATCH_SCALAR_STATE_FFN=1` path runs every attention,
 SSM, and PLE state transition in token order, then batches each layer's MoE
-FFN. Scalar router and HC math retain the reference greedy sequence. The
+FFN. The exact F16 HC batch and bounded router tile retain the reference
+greedy sequence. The
 Q2_0 stage can group up to eight assignments for one expert into a weight-
 reuse tile; the per-layer selected-expert check matched all 48 sampled gate/up
 and down outputs bit for bit with an eight-assignment tile. A four-assignment
@@ -270,7 +271,8 @@ tile measured best in the exact 1K/32 run:
 ```sh
 LLM_BMAX=1024 LLM_QWEN4_BATCH_ATTN=0 \
   LLM_QWEN4_BATCH_SCALAR_STATE_FFN=1 \
-  LLM_QWEN4_BATCH_ROUTER_SCALAR=1 LLM_QWEN4_BATCH_HC_SCALAR=1 \
+  LLM_QWEN4_BATCH_ROUTER_SCALAR=1 LLM_QWEN4_BATCH_ROUTER_TILE=32 \
+  LLM_QWEN4_BATCH_HC_EXACT_F16=1 LLM_QWEN4_BATCH_HC_PREMIX=1 \
   LLM_MOE_COPY_PIPELINE=1 LLM_QWEN4_Q2_STAGE_TILE_TASKS=4 \
   LLM_QWEN4_STAGE_PROMOTE=1 LLM_MOE_CPU_DECODE_REFILLS_PER_LAYER=0 \
   rdna4/llm/run_qwen38_flash_next_q2_rocm.sh --bench \
@@ -279,12 +281,16 @@ LLM_BMAX=1024 LLM_QWEN4_BATCH_ATTN=0 \
   --qwen4-prefill-staging --qwen4-prefill-stage-mb 512 --qwen4-kv-quant none
 ```
 
-This reached **56.00 prefill / 32.36 decode tok/s**, with hash
+This reached **70.62 prefill / 32.65 decode tok/s**, with hash
 `b9f867f533408c06` and 15,872 MiB peak VRAM (432 MiB free). The cache
 starts empty; `LLM_QWEN4_STAGE_PROMOTE=1` uses observed routes to retain
-experts for decode. Without promotion, decode fell to 18.11 tok/s. Restricting
-the per-row stream wait to the PLE layer improved prefill from 53.38 to about
-56 tok/s. The benchmark's streamed-chunk mode now honors the explicit
+experts for decode. Without promotion, decode fell to 18.11 tok/s. Batched
+F16 HC projections and layer-entry premixing keep the scalar F16 matvec
+reduction order, while 32-row router groups retain the single-row WMMA tile.
+All 248,320 logits matched bit for bit against the earlier exact staged path
+at both 128 and 1,024 prompt tokens. In paired 1K runs, these changes raised
+prefill from 55.57 to 68.55 tok/s; the 70.62 result above used the same
+settings with 32 decoded tokens. The benchmark's streamed-chunk mode honors the explicit
 `--qwen4-batched-prefill` switch, so bounded tiles can be measured correctly.
 
 An optional `LLM_QWEN4_Q2_EXPERT_PROFILE=/path/to/expert-profile.bin` accepts
@@ -305,26 +311,27 @@ decode trace attributed about 2.3 ms/token to the selected Q2_0 kernels,
 GPU times and exclude host gaps. Reaching the target requires a larger
 change to state/attention execution and the quantized expert matrix path.
 
-### Fastest exact short-context profile measured so far
+### Fastest exact decode profile measured so far
 
 At a 1,152-token maximum context, F16 KV needs only about 30 MiB more VRAM
 than scaled INT8 KV and preserves the same 1K/32 greedy sequence. The
-following opt-in profile reached **32.24 prefill / 35.06 decode tok/s** with
-hash `b9f867f533408c06`, 90.8% decode cache hits, and **15,836 MiB peak
-VRAM** (468 MiB free):
+following opt-in profile reached **33.85 prefill / 36.68 decode tok/s** with
+hash `b9f867f533408c06`, 91.2% decode cache hits, and **16,004 MiB peak
+VRAM** (300 MiB free):
 
 ```sh
 LLM_QWEN4_Q2_CACHE_PROFILE=1 LLM_MOE_CPU_DECODE_REFILLS_PER_LAYER=0 \
+  LLM_QWEN4_EXACT_GPU_TOPK=1 \
   rdna4/llm/run_qwen38_flash_next_q2_rocm.sh --bench \
   --prompt-file tmp/qwen38_1k_prompt.txt --prefill-len 1024 -n 1024 \
-  --decode 32 -s 1152 --moe-cache-mb 10000 --qwen4-kv-quant none
+  --decode 32 -s 1152 --moe-cache-mb 10200 --qwen4-kv-quant none
 ```
 
-The 10,000 MiB cache leaves little room for other GPU processes. F16 KV is
+The 10,200 MiB cache leaves little room for other GPU processes. F16 KV is
 appropriate only for this bounded context profile; the launcher retains
 scaled INT8 KV for its 262K default. Eight CPU threads measured 34.39 decode
 tok/s and 117.71 ms in CPU miss work, versus 16 threads' 35.06 tok/s and
-97.54 ms. HC graphs measured 33.80 tok/s with the 9,000 MiB control and
+97.54 ms in the earlier control. HC graphs measured 33.80 tok/s with the 9,000 MiB control and
 did not help.
 
 Exact MTP with the matching local Q8_0 NextN sidecar accepted most
