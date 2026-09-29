@@ -24,6 +24,8 @@ Pixal3D demo server.
     GET  /rig                       the facial rig page (web/vhuman_rig.html)
     GET  /v1/heads/<id>/rig/<file>  rig outputs
     GET  /v1/heads/<id>/body/<file>  combined avatar outputs
+    GET  /v1/heads/<id>/body/motions[...]
+    POST /v1/body/uploads           raw image/video bytes -> upload id
     GET  /v1/heads/<id>/rig/takes, /v1/heads/<id>/rig/takes/<take>/<file>
     POST /v1/jobs                   {kind: plates|baseline|head|head_skin|expressions|rig|body|rig_speech, ...} -> {id}
     GET  /v1/jobs, /v1/jobs/<id>    POST /v1/jobs/<id>/cancel
@@ -173,7 +175,7 @@ class App:
         from . import qwen, baseline
         from .head import pipeline as head_pipeline
         from .rig import emotion as rig_emotion, exprdata, job as rig_job, speech as rig_speech
-        from .body import job as body_job
+        from .body import job as body_job, motion as body_motion
         self.rig_job = rig_job
         self.rig_speech = rig_speech
         self.rig_emotion = rig_emotion
@@ -193,6 +195,9 @@ class App:
                                                              python=getattr(args, "rig_python", None), mock=args.mock),
             "body": lambda req, prog, cancel: body_job.body_job(self.service, req, prog, cancel,
                         python=args.qwen_python, rig_python=getattr(args, "rig_python", None),
+                        model_dir=getattr(args, "sam3d_body_model", body_job.MODEL_DIR), mock=args.mock),
+            "body_motion": lambda req, prog, cancel: body_motion.fit(self.service, req, prog, cancel,
+                        rig_python=getattr(args, "rig_python", None) or body_job.DEFAULT_RIG_PYTHON,
                         model_dir=getattr(args, "sam3d_body_model", body_job.MODEL_DIR), mock=args.mock),
             "rig_speech": lambda req, prog, cancel: rig_speech.speech_job(
                 self.service, req, prog, cancel, model=getattr(args, "tts_model", None) or rig_speech.DEFAULT_MODEL,
@@ -323,6 +328,8 @@ def make_handler(app: App, quiet: bool = False):
                     return self._file(app.service.rig_file(hid, name))
                 if path.startswith("/v1/heads/") and "/body/" in path:
                     hid, _, name = path[len("/v1/heads/"):].partition("/body/")
+                    if name == "motions":
+                        return self._json(200, {"motions": app.service.list_motions(hid)})
                     return self._file(app.service.body_file(hid, name))
                 if path.startswith("/v1/heads/"):
                     return self._file(app.service.head_file(*path[len("/v1/heads/"):].split("/", 1)))
@@ -361,6 +368,14 @@ def make_handler(app: App, quiet: bool = False):
         def do_POST(self):
             path = self.path.split("?", 1)[0]
             try:
+                if path == "/v1/body/uploads":
+                    from .body.motion import upload, MAX_UPLOAD
+                    length = int(self.headers.get("Content-Length") or 0)
+                    if length > MAX_UPLOAD:
+                        self.close_connection = True
+                        raise TooLarge("body media upload is too large")
+                    return self._json(201, upload(app.service, self.rfile, length,
+                                                  self.headers.get("Content-Type", "")))
                 body = self._body()
                 if path == "/v1/eye/textures":
                     return self._json(200, app.service.textures(body.get("params") or {}, body.get("res", 1024),

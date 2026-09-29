@@ -77,3 +77,35 @@ MHR model):
 ```sh
 python3 -m server.vhuman.cli --mock body --head HEAD_ID --quality preview
 ```
+
+## Fit uploaded pose or motion
+
+Open `/rig`, select a head with a full body avatar, and choose a full-body
+PNG/JPEG/WebP image or MP4/WebM/MOV video in **Fit pose or motion**. The server
+stores at most 64 MiB per upload. For video it samples at 4 fps, up to 32
+frames from the first 8 seconds. A single visible person should occupy most
+of the frame. Transparent images use the alpha bounds; opaque images use an
+OpenCV HOG person box when found, and otherwise use the whole frame.
+
+The job evaluates SAM 3D Body per frame and decodes its MHR pose using the
+avatar's original identity shape. It retargets 127 local body-joint rotations;
+the facial rig and its speech controls stay attached to `mhr_c_head`. The
+viewer offers playback, scrubbing, and simultaneous facial animation. It also
+exports `motion.json` and a posed or animated `motion.glb` in
+`heads/<id>/body/motions/<take>/`. The GLB preserves the existing skin and
+textures. Root translation stays at the avatar bind location; moving-camera
+depth estimates are not interpreted as world motion. Per-frame pose estimates
+receive mild quaternion smoothing, but large occlusions or multiple people can
+still produce poor motion. The GLB uses linear skinning and the bind-pose body
+correctives; dynamic pose correctives and cloth simulation are not included.
+
+CLI equivalent:
+
+```sh
+python3 -m server.vhuman.cli body-motion --head HEAD_ID --media clip.mp4
+```
+
+API: upload raw bytes to `POST /v1/body/uploads` with the media `Content-Type`,
+then submit `POST /v1/jobs` with
+`{"kind":"body_motion","head_id":"HEAD_ID","upload_id":"UPLOAD_ID"}`.
+List results at `GET /v1/heads/HEAD_ID/body/motions`.

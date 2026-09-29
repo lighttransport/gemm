@@ -10,6 +10,7 @@
     python3 -m server.vhuman.cli head --subject "a 30-year-old woman with short dark hair" [--quality standard]
     python3 -m server.vhuman.cli head-fit --portrait P.png --glb pixal3d.glb
     python3 -m server.vhuman.cli rig --head ID [--res 2048]      (template fit, skeleton, shapes, GLB + USD)
+    python3 -m server.vhuman.cli body-motion --head ID --media pose.jpg
     python3 -m server.vhuman.cli rig-track --head ID --track T.txt --out anim.usda   (LightRig track -> UsdSkel)
     python3 -m server.vhuman.cli baseline --source analytic|qwen [--quality preview]
     python3 -m server.vhuman.cli bench
@@ -268,6 +269,21 @@ def cmd_body(args) -> dict:
                              rig_python=args.rig_python, model_dir=args.sam3d_body_model, mock=args.mock)
 
 
+def cmd_body_motion(args) -> dict:
+    import mimetypes
+    from .body import motion
+    svc = EyeService(Path(args.work))
+    media = Path(args.media)
+    ctype = mimetypes.guess_type(media.name)[0]
+    if not ctype:
+        raise ValueError("cannot determine image/video type from file extension")
+    with media.open("rb") as stream:
+        item = motion.upload(svc, stream, media.stat().st_size, ctype)
+    return motion.fit(svc, {"head_id": args.head, "upload_id": item["id"]},
+                      _progress, threading.Event(), model_dir=args.sam3d_body_model,
+                      rig_python=args.rig_python or motion.body_job.DEFAULT_RIG_PYTHON, mock=args.mock)
+
+
 def cmd_rig_track(args) -> dict:
     """Evaluate a LightRig face track on a built rig -> a UsdSkel animation layer."""
     from .rig import rigdef, usd
@@ -417,6 +433,10 @@ def main(argv=None) -> int:
                     help="select Qwen memory preset automatically from free GPU memory")
     sp.add_argument("--garments", default="shirt,pants,shoes", help="comma-separated SAM 3 garment prompts")
     sp.set_defaults(fn=cmd_body)
+    sp = sub.add_parser("body-motion", help="fit uploaded image/video pose to an existing MHR avatar")
+    sp.add_argument("--head", required=True, help="head with an assembled body avatar")
+    sp.add_argument("--media", required=True, help="PNG/JPEG/WebP image or MP4/WebM/MOV video")
+    sp.set_defaults(fn=cmd_body_motion)
     sp = sub.add_parser("rig-track", help="LightRig face track (timestamp + 52 controls per line) -> USD animation")
     sp.add_argument("--head", required=True)
     sp.add_argument("--track", required=True)

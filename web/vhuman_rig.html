@@ -117,6 +117,22 @@ a.dl{color:var(--accent);margin-right:12px;font-size:13px;display:inline-block}
         <div class="ctl"><span>right knee</span><input type="range" data-body-pose="mhr_r_lowleg" min="0" max="70" value="0"><output>0°</output></div>
         <button id="body-pose-reset">reset body pose</button>
       </div>
+      <div id="body-motion-tools" hidden>
+        <label for="body-motion-file">Fit pose or motion from a full-body image or short video</label>
+        <input type="file" id="body-motion-file" accept="image/png,image/jpeg,image/webp,video/mp4,video/webm,video/quicktime">
+        <button class="primary" id="fit-body-motion">Fit uploaded media</button>
+        <div class="msg" id="body-motion-msg">One visible person; videos sample the first 8 seconds at 4 fps.</div>
+        <label for="body-motion-select">Saved fits</label>
+        <select id="body-motion-select"><option value="">select a fit</option></select>
+        <div class="tools">
+          <button id="body-motion-play">▶ play</button>
+          <button id="body-motion-clear">clear</button>
+          <a id="body-motion-glb" class="dl" hidden download>download posed/animated GLB</a>
+          <a id="body-motion-json" class="dl" hidden download>download motion JSON</a>
+        </div>
+        <input id="body-motion-time" type="range" min="0" max="0" step="0.01" value="0" style="width:100%">
+        <output id="body-motion-time-label">0.00 s</output>
+      </div>
     </div>
   </aside>
   <main>
@@ -207,7 +223,7 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 const $ = (id) => document.getElementById(id);
 const state = { heads: [], current: null, rig: null, model: null, values: {}, anim: null, job: null,
                 avatarMode: new URLSearchParams(location.search).get('body') === '1',
-                bodyPose: {},
+                bodyPose: {}, bodyMotion: null, bodyMotionTime: 0, bodyMotionPlaying: false,
                 speechAvailable: false, emotionAvailable: false, bodyAvailable: false };
 window.__rigState = state;
 async function api(path, body) {
@@ -433,6 +449,20 @@ function applyRig() {
     bone.position.set(J.rest_translation[0] + d[0], J.rest_translation[1] + d[1], J.rest_translation[2] + d[2]);
     _m4.copy(state.restR[j]).multiply(eulerZYX(d[3], d[4], d[5]));
     bone.quaternion.setFromRotationMatrix(_m4);
+  }
+  if (state.avatarMode && state.bodyMotion) {
+    const frames = state.bodyMotion.frames;
+    let hi = frames.findIndex((f) => f.t >= state.bodyMotionTime);
+    if (hi < 0) hi = frames.length - 1;
+    const lo = Math.max(0, hi - 1);
+    const a = frames[lo], b = frames[hi];
+    const w = hi === lo ? 0 : THREE.MathUtils.clamp((state.bodyMotionTime - a.t) / (b.t - a.t), 0, 1);
+    for (let j = 0; j < state.bodyMotion.joints.length; j++) {
+      const bone = state.bones[state.bodyMotion.joints[j]];
+      if (!bone) continue;
+      bone.quaternion.fromArray(a.rotations[j]);
+      if (w) bone.quaternion.slerp(new THREE.Quaternion().fromArray(b.rotations[j]), w);
+    }
   }
   if (state.avatarMode) {
     for (const [name, deg] of Object.entries(state.bodyPose)) {
@@ -1079,6 +1109,14 @@ function tick(now) {
     changed = true;
   }
   if (state.takeActive && !speechAudio.paused) updateTakeFrame();
+  if (state.bodyMotionPlaying && state.bodyMotion) {
+    const duration = state.bodyMotion.duration;
+    state.bodyMotionTime = Math.min(duration, (now - state.bodyMotionStart) / 1000);
+    $('body-motion-time').value = state.bodyMotionTime;
+    $('body-motion-time-label').textContent = `${state.bodyMotionTime.toFixed(2)} s`;
+    if (state.bodyMotionTime >= duration) { state.bodyMotionPlaying = false; $('body-motion-play').textContent = '▶ play'; }
+    changed = true;
+  }
   if ($('auto-blink').checked) {
     if (now > nextBlink) { blinkT0 = now; nextBlink = now + 2200 + Math.random() * 3500; }
     const bt = (now - blinkT0) / 1000;
@@ -1176,6 +1214,7 @@ async function loadRig(h) {
     : `rig${hasLod ? suffix : ''}.glb · LOD${hasLod ? lod : 0} · ${nv} head vertices · ${def.controls.length} controls · ${def.blendshapes.length} shapes · ${def.joints.length} joints`;
   setView('front');
   $('body-pose').hidden = !avatar;
+  $('body-motion-tools').hidden = !avatar;
 }
 function showFacts(h) {
   const r = h.rig;
@@ -1230,7 +1269,10 @@ function renderHeads() {
   }
 }
 async function select(h) {
-  if (state.current?.id !== h.id) { ++speechLoadGen; stopAnim(); state.take = null; state.takeFrames = null; }
+  if (state.current?.id !== h.id) {
+    ++speechLoadGen; stopAnim(); state.take = null; state.takeFrames = null;
+    state.bodyMotion = null; state.bodyMotionId = null; state.bodyMotionPlaying = false; state.bodyMotionTime = 0;
+  }
   state.current = h;
   renderHeads();
   showFacts(h);
@@ -1243,7 +1285,7 @@ async function select(h) {
   if (h.rig) {
     const params = new URLSearchParams(location.search);
     const takeId = params.get('head') === h.id ? params.get('take') : null;
-    try { await loadRig(h); await loadTakes(h.id, takeId); } catch (e) { $('msg').textContent = String(e); $('msg').className = 'msg bad'; }
+    try { await loadRig(h); await loadTakes(h.id, takeId); if (h.body) await loadMotions(h.id); } catch (e) { $('msg').textContent = String(e); $('msg').className = 'msg bad'; }
   } else {
     $('speech-takes').replaceChildren();
     $('empty').hidden = false;
@@ -1287,6 +1329,95 @@ $('avatar-mode').addEventListener('change', async () => {
   state.avatarMode = $('avatar-mode').checked;
   $('viz').value = 'shaded';
   if (state.current?.rig) await loadRig(state.current);
+});
+async function loadMotions(headId, selectId = null) {
+  const data = await api(`/v1/heads/${headId}/body/motions`);
+  state.motions = data.motions;
+  const select = $('body-motion-select');
+  select.replaceChildren(new Option('select a fit', ''));
+  for (const m of data.motions) select.add(new Option(`${m.kind} · ${m.frames} frame${m.frames === 1 ? '' : 's'} · ${m.id}`, m.id));
+  const chosen = selectId || state.bodyMotionId;
+  if (chosen && data.motions.some((m) => m.id === chosen)) { select.value = chosen; await selectMotion(chosen); }
+  else if (state.bodyMotionId) await selectMotion('');
+}
+async function selectMotion(id) {
+  state.bodyMotionPlaying = false;
+  $('body-motion-play').textContent = '▶ play';
+  state.bodyMotionId = id || null;
+  if (!id) {
+    state.bodyMotion = null; state.bodyMotionTime = 0;
+    $('body-motion-glb').hidden = $('body-motion-json').hidden = true;
+    applyRig(); return;
+  }
+  const m = state.motions.find((x) => x.id === id);
+  if (!m) return;
+  state.bodyMotion = await api(m.urls.motion);
+  state.bodyMotionTime = 0;
+  $('body-motion-time').max = state.bodyMotion.duration;
+  $('body-motion-time').value = 0;
+  $('body-motion-time-label').textContent = '0.00 s';
+  for (const [name, url] of [['body-motion-glb', m.urls.glb], ['body-motion-json', m.urls.motion]]) {
+    const link = $(name); link.href = url; link.hidden = false;
+  }
+  if (!state.avatarMode) { state.avatarMode = true; $('avatar-mode').checked = true; await loadRig(state.current); }
+  applyRig();
+}
+$('body-motion-select').addEventListener('change', (e) => selectMotion(e.target.value).catch((err) => {
+  $('body-motion-msg').textContent = String(err.message || err); $('body-motion-msg').className = 'msg bad';
+}));
+$('body-motion-play').addEventListener('click', () => {
+  if (!state.bodyMotion || state.bodyMotion.duration <= 0) return;
+  state.bodyMotionPlaying = !state.bodyMotionPlaying;
+  if (state.bodyMotionPlaying) {
+    if (state.bodyMotionTime >= state.bodyMotion.duration) state.bodyMotionTime = 0;
+    state.bodyMotionStart = performance.now() - state.bodyMotionTime * 1000;
+  }
+  $('body-motion-play').textContent = state.bodyMotionPlaying ? '❚❚ pause' : '▶ play';
+});
+$('body-motion-time').addEventListener('input', (e) => {
+  state.bodyMotionPlaying = false; $('body-motion-play').textContent = '▶ play';
+  state.bodyMotionTime = +e.target.value;
+  $('body-motion-time-label').textContent = `${state.bodyMotionTime.toFixed(2)} s`;
+  applyRig();
+});
+$('body-motion-clear').addEventListener('click', () => {
+  $('body-motion-select').value = '';
+  state.bodyMotion = null; state.bodyMotionId = null; state.bodyMotionPlaying = false; state.bodyMotionTime = 0;
+  $('body-motion-glb').hidden = $('body-motion-json').hidden = true;
+  $('body-motion-time').value = 0; $('body-motion-time-label').textContent = '0.00 s';
+  applyRig();
+});
+$('fit-body-motion').addEventListener('click', async () => {
+  const media = $('body-motion-file').files[0];
+  if (!state.current?.body || !media || state.job) return;
+  const msg = $('body-motion-msg'), button = $('fit-body-motion');
+  const headId = state.current.id;
+  button.disabled = true; msg.className = 'msg';
+  try {
+    if (media.size > 64 * 1024 * 1024) throw new Error('media exceeds 64 MiB');
+    msg.textContent = 'uploading media…';
+    const ext = media.name.split('.').pop().toLowerCase();
+    const contentType = media.type || ({ png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp',
+      mp4: 'video/mp4', webm: 'video/webm', mov: 'video/quicktime' })[ext];
+    const response = await fetch('/v1/body/uploads', { method: 'POST', headers: { 'Content-Type': contentType }, body: media });
+    const upload = await response.json();
+    if (!response.ok) throw new Error(upload.error || response.statusText);
+    const job = await api('/v1/jobs', { kind: 'body_motion', head_id: headId, upload_id: upload.id });
+    state.job = job.id;
+    for (;;) {
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      const j = await api(`/v1/jobs/${job.id}`);
+      $('bar').style.width = `${Math.round(j.progress * 100)}%`;
+      msg.textContent = j.message;
+      if (j.state === 'done') {
+        await loadMotions(headId, j.result.id);
+        msg.textContent = `${j.result.frames} frame${j.result.frames === 1 ? '' : 's'} fitted`;
+        break;
+      }
+      if (j.state === 'failed' || j.state === 'cancelled') throw new Error(j.error || j.state);
+    }
+  } catch (e) { msg.textContent = String(e.message || e); msg.className = 'msg bad'; }
+  state.job = null; button.disabled = false;
 });
 document.querySelectorAll('[data-body-pose]').forEach((input) => input.addEventListener('input', () => {
   state.bodyPose[input.dataset.bodyPose] = +input.value;

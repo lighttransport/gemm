@@ -286,17 +286,37 @@ class EyeService:
 
     def body_file(self, hid: str, name: str) -> Path:
         from .body.job import FILES
+        from .body.motion import MOTION_FILES
         if not (isinstance(hid, str) and hid.isalnum() and len(hid) <= 32):
             raise ServiceError("no such file")
         folder, _, base = name.partition("/")
         allowed = name in FILES or (folder == "textures" and base.endswith(".png") and "/" not in base
                                     and all(c.isalnum() or c in "_-." for c in base))
+        if folder == "motions":
+            take, sep, artifact = base.partition("/")
+            allowed = bool(sep and len(take) == 12 and all(c in "0123456789abcdef" for c in take)
+                           and artifact in MOTION_FILES)
         if not allowed:
             raise ServiceError("no such file")
         path = self.work / "heads" / hid / "body" / name
         if not path.is_file():
             raise ServiceError("no such file")
         return path
+
+    def list_motions(self, hid: str) -> list[dict]:
+        self.body_file(hid, "avatar.json")
+        root = self.work / "heads" / hid / "body" / "motions"
+        out = []
+        for path in sorted(root.glob("*/manifest.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+            try:
+                take = path.parent.name
+                manifest = json.loads(self.body_file(hid, f"motions/{take}/manifest.json").read_text())
+                base = f"/v1/heads/{hid}/body/motions/{take}/"
+                manifest["urls"] = {"motion": base + "motion.json", "glb": base + "motion.glb"}
+                out.append(manifest)
+            except (ValueError, ServiceError):
+                continue
+        return out
 
     def take_file(self, hid: str, take_id: str, name: str) -> Path:
         """Only public, fixed-name artifacts from a completed speech take."""
