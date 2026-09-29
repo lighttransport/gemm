@@ -24,7 +24,9 @@ from . import native, rigdef
 from .common import vertex_normals
 
 ROOT = Path(__file__).resolve().parents[3]
-DEFAULT_RUNNER = Path.home() / "work/lightgeom/build/examples/lightphysics_vhuman_face/lightphysics_vhuman_face"
+LOCAL_RUNNER = ROOT / "third_party/LightGeom/build-vhuman/examples/lightphysics_vhuman_face/lightphysics_vhuman_face"
+LEGACY_RUNNER = Path.home() / "work/lightgeom/build/examples/lightphysics_vhuman_face/lightphysics_vhuman_face"
+DEFAULT_RUNNER = LOCAL_RUNNER if LOCAL_RUNNER.is_file() or not LEGACY_RUNNER.is_file() else LEGACY_RUNNER
 
 
 def availability(runner: Path = DEFAULT_RUNNER, python: Path | None = None) -> dict:

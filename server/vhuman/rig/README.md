@@ -21,6 +21,8 @@ python3 -m server.vhuman.cli rig-soft-tissue --head <id> --take <take-id>
 python3 -m server.vhuman.cli rig-track --head <id> --track capture.txt --out anim.usda
 python -m server.vhuman.rig.build <head folder> [--res 2048] [--out DIR]   # in the rig interpreter
 sh server/vhuman/rig/external.sh [--local] [--build]   # LightRig + LightUSD (vchar) under third_party/
+sh server/vhuman/rig/setup_face_sources.sh             # GNM + ICT + private LightGeom, build facial solver
+sh server/vhuman/rig/setup_face_sources.sh --no-build  # check out sources and weights only
 ```
 
 Outputs go to `<head>/rig/`: `rig.glb` (web viewer), `rig.usda` + `textures/`
@@ -61,8 +63,16 @@ positive tetrahedral volume. It writes `soft_tissue.usda` with time samples
 and `soft_tissue_report.json` with volume and tracking diagnostics beside the
 take. This is an optional offline experiment; the take's normal glTF/USD
 animation remains the playback path. Build LightGeom's
-`lightphysics_vhuman_face` target in `~/work/lightgeom/build` first, or pass
-`--lightgeom-runner` to the CLI. Material stiffness and residual gain are
+`lightphysics_vhuman_face` target with `setup_face_sources.sh` first, or pass
+`--lightgeom-runner` to the CLI. The script pins GNM and ICT source revisions,
+checks the GNM weight SHA-256, and checks out LightGeom from
+`git@github.com:lighttransport/LightGeom.git` into `third_party/LightGeom`.
+The private repository requires GitHub SSH access. Its pinned facial solver
+commit is `db64640cbbbb44d73c5ee3ffa3c3b405dee2cec1`; the script reports
+an error if that commit is not yet available on the remote. Run it from any
+directory after installing Git, curl, CMake 3.24+, and a C/C++ compiler.
+The rig interpreter still needs `requirements-rig.txt` as shown above.
+Material stiffness and residual gain are
 fixed experimental values and have not been calibrated to measured human
 facial tissue. The USD is a separate patch and is not yet composited with
 the skinned head in the viewer.
