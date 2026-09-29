@@ -13419,7 +13419,8 @@ static const char *hip_kernel_source =
 "      if(key<tn){const half_raw *kr=key_cache+(size_t)(ts+key)*kv_dim+kv_h*head_dim;\n"
 "        for(int d=lane;d<head_dim;d+=8)sc+=q_sh[d]*half_to_float(kr[d]);\n"
 "        sc+=__shfl_down(sc,4,8);sc+=__shfl_down(sc,2,8);sc+=__shfl_down(sc,1,8);}\n"
-"      if(tid<32)red[tid]=-1e30f;if(lane==0&&key<tn)red[key]=sc;__syncthreads();\n"
+"      if(tid<32)red[tid]=-1e30f;__syncthreads();\n"
+"      if(lane==0&&key<tn)red[key]=sc;__syncthreads();\n"
 "      for(int z=16;z;z>>=1){if(tid<z)red[tid]=fmaxf(red[tid],red[tid+z]);__syncthreads();}\n"
 "      float nm=fmaxf(mi,red[0]),corr=mi<-1e29f?0.0f:__expf(mi-nm);\n"
 "      if(tid<32)prob[tid]=tid<tn?__expf(red[tid]-nm):0.0f;__syncthreads();\n"
@@ -35450,7 +35451,8 @@ static int batched_path_eligible(const hip_llm_runner *r, int M) {
      * sidecar's circular KV cache does not. */
     if (M < r->gemm_m_threshold && !r->qwen35_dflash2) return 0;
     /* Qwen4 carries recurrent/PLE state between chunks.  The single-chunk
-     * batched path is parity-checked, but a 2K request split into multiple
+     * grouped-MoE path has matching greedy hashes on the measured prompts,
+     * but its logits differ from scalar. A 2K request split into multiple
      * device batches has not been proven safe on gfx1201 (a failed experiment
      * caused a GPU VM fault on the second chunk).  Prefer the scalar fallback
      * unless the caller explicitly opts into that diagnostic path. */

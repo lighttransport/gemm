@@ -76,9 +76,9 @@ The scalar prefill measured here had no grouped Q2_0 matrix-matrix path. Strata'
 describe quantized grouped prompt kernels, streaming experts ahead of the
 next layer, and an MTP draft model for speculative decode. Its reported Q2_0
 1K prefill is 494 tok/s; 1,308 tok/s is for a 32K prompt. Its 1K decode is
-84 tok/s with MTP enabled. This repository has only the two base model GGUF
-shards and no matching Flash-Next MTP weights. The 60 decode / 1,200 prefill
-targets are not met by this implementation.
+84 tok/s with MTP enabled. A matching local Q8_0 NextN sidecar is now
+available, but its measured verification cost is described below. The 60
+decode / 1,200 prefill targets are not met by this implementation.
 
 An explicit single-tile batched profile is available with the standard
 `test_hip_llm` build:
@@ -291,11 +291,15 @@ All 248,320 logits matched bit for bit against the earlier staged path
 at both 128 and 1,024 prompt tokens. This compares two versions of the
 grouped MoE path, not grouped MoE against scalar MoE. With the same 9,000 MiB
 cache budget, grouped MoE versus scalar prefill differed by 1.55% relative
-logit L2 at 512 tokens and 5.03% at 1,024 tokens. At 128 tokens, using scalar MoE with the batched F16
-HC path matched all scalar logits bit for bit; grouped MoE with scalar HC
+logit L2 at 512 tokens and 5.03% at 1,024 tokens. At 128 tokens, using
+scalar MoE with the batched F16 HC path matched all scalar logits bit for
+bit; grouped MoE with scalar HC
 still differed by 2.49% relative L2. The grouped route therefore remains an
-opt-in quality experiment despite the matching 1K greedy sequence. In paired
-1K grouped-MoE runs, these changes raised
+opt-in quality experiment despite the matching 1K greedy sequence. A second
+1K prompt drawn from this README also kept its 32-token scalar hash
+`f2bb3fb012426676`, but its grouped logits differed by 3.76% relative L2;
+the paired prefill rates were 30.52 scalar and 67.14 grouped tok/s. In paired
+1K grouped-MoE runs, the HC/router changes raised
 prefill from 55.57 to 68.55 tok/s; the 70.62 result above used the same
 settings with 32 decoded tokens. A 512+512 streamed run changed the 32-token
 greedy hash to `5d1fa86db31017c9` and reached 42.01/33.60 tok/s, so this
@@ -316,7 +320,9 @@ for scalar prefill at the same cache budget. It uses
 `LLM_QWEN4_BATCH_SCALAR_STATE_FFN=1`, `LLM_QWEN4_BATCH_ATTN=0`,
 `LLM_QWEN4_BATCH_HC_EXACT_F16=1`, `LLM_QWEN4_BATCH_HC_PREMIX=1`,
 `LLM_MOE_PREFILL_SCALAR=1`, `LLM_BMAX=1024`, and
-`--qwen4-batched-prefill`, without staging.
+`--qwen4-batched-prefill`, without staging. On the second 1K README prompt,
+this profile again matched all scalar logits bit for bit and reached 36.96
+prefill tok/s versus the scalar profile's 30.52.
 
 An optional `LLM_QWEN4_Q2_EXPERT_PROFILE=/path/to/expert-profile.bin` accepts
 the model-matched STRP ranking format and preloads cache slots at model load.
@@ -335,6 +341,12 @@ decode trace attributed about 2.3 ms/token to the selected Q2_0 kernels,
 5.4 ms/token to F16 matvecs, and 3.0 ms/token to full attention; these are
 GPU times and exclude host gaps. Reaching the target requires a larger
 change to state/attention execution and the quantized expert matrix path.
+The 1,200 tok/s 1K goal allows 0.85 s total, while the grouped Q2 kernels
+alone currently take 2.33 s (a 439 tok/s ceiling if every other cost
+vanished). Exact decode's roughly 21 ms of GPU kernels per token likewise
+caps this implementation near 47 tok/s before CPU misses and host gaps.
+These are implementation bounds from the measured traces, not hardware
+limits for a redesigned engine.
 
 ### Fastest exact decode profile measured so far
 
@@ -358,6 +370,24 @@ scaled INT8 KV for its 262K default. Eight CPU threads measured 34.39 decode
 tok/s and 117.71 ms in CPU miss work, versus 16 threads' 35.06 tok/s and
 97.54 ms in the earlier control. HC graphs measured 33.80 tok/s with the 9,000 MiB control and
 did not help.
+
+With `OMP_PROC_BIND=close OMP_PLACES=cores` on the 16-core Ryzen 9 3950X,
+the 10,200 MiB cache and F16 KV measured **34.58 prefill / 36.94 decode
+tok/s** over 1K/32, leaving 300 MiB VRAM free. The same profile at 10,300
+MiB reached 34.49/37.04 but left only 186 MiB free. An 8/24/32 worker
+sweep at 10,200 MiB measured 35.99/34.39/10.70 decode tok/s; SMT
+oversubscription at 32 workers was severe. INT8 KV at 10,200 MiB measured
+30.66/33.79, slower than F16. Over a longer 128-token continuation, the
+F16 10,200 MiB profile sustained 34.46 decode tok/s with 89.9% expert-cache
+hits. Registering the first eight MoE layers' host expert weights for the
+grouped 1K prefill did not improve it: 68.99 prefill tok/s versus 70.62
+without registration in the earlier control.
+The F16 attention shard sweep (2/4/8 shards) reached 35.72/37.06/36.49
+decode tok/s with the same greedy hash, so it did not materially improve
+on the unsharded 36.94 control. The opt-in `LLM_ATTN_GQA8=1` kernel had a
+shared-memory initialization race; synchronizing its score scratch stopped
+an immediate EOS failure, but it still changed the 32-token hash and slowed
+decode to 29.54 tok/s. Keep the unsharded kernel for this profile.
 
 Exact MTP with the matching local Q8_0 NextN sidecar accepted most
 three-token drafts but reached 29.03 tok/s with scalar target verification

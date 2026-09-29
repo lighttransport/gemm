@@ -3029,7 +3029,7 @@ int main(int argc, char **argv) {
 
         /* Prefill: normally one forward_batch_logits call.  The optional
          * LLM_BENCH_STREAM_CHUNK mode models llama-server-style streamed
-         * prefill: each bounded chunk is submitted as its own validated batch
+         * prefill: each bounded chunk is submitted as its own dispatcher
          * call, while recurrent/KV state carries across calls.  This avoids
          * asking the Qwen4 batched dispatcher to split one oversized request
          * internally (that multi-chunk path is not safe on gfx1201). */
@@ -3066,6 +3066,10 @@ int main(int argc, char **argv) {
                  * length.  Serving-shaped chunk publication keeps a long
                  * request on the validated 1K window instead of enabling a
                  * single unsafe 4K pipeline reservation. */
+                if (publish_chunk && off == 0 && qwen4_batched_prefill)
+                    fprintf(stderr,
+                        "Streamed Qwen4 batched prefill is a numerical diagnostic; "
+                        "compare logits and greedy output against scalar inference\n");
                 if (publish_chunk)
                     hip_llm_set_qwen4_batch_request_tokens(gpu, cc);
                 if (scalar_stream) {
