@@ -55,14 +55,25 @@ static int qwen4_ple_disk_page(qwen4_ple_disk_worker *worker, uint64_t page,
     off_t offset = (off_t)(page * QWEN4_PLE_DISK_PAGE);
     unsigned char *dst = worker->pages + (size_t)slot * QWEN4_PLE_DISK_PAGE;
     int fd = source->direct_fd >= 0 ? source->direct_fd : source->buffered_fd;
-    ssize_t got = pread(fd, dst, QWEN4_PLE_DISK_PAGE, offset);
-    if (got < 0 && source->direct_fd >= 0 && errno == EINVAL) {
-        got = pread(source->buffered_fd, dst, QWEN4_PLE_DISK_PAGE, offset);
-        fd = source->buffered_fd;
+    size_t filled = 0;
+    while (filled < QWEN4_PLE_DISK_PAGE) {
+        ssize_t got = pread(fd, dst + filled, QWEN4_PLE_DISK_PAGE - filled,
+                            offset + (off_t)filled);
+        if (got < 0 && errno == EINTR) continue;
+        if (got < 0 && fd == source->direct_fd && errno == EINVAL) {
+            fd = source->buffered_fd;
+            continue;
+        }
+        if (got < 0) return -1;
+        if (got == 0) break;
+        filled += (size_t)got;
+        /* A partial direct read may leave an unaligned remainder. */
+        if (filled < QWEN4_PLE_DISK_PAGE && fd == source->direct_fd)
+            fd = source->buffered_fd;
     }
-    if (got <= 0) return -1;
-    if (got < QWEN4_PLE_DISK_PAGE)
-        memset(dst + got, 0, QWEN4_PLE_DISK_PAGE - (size_t)got);
+    if (!filled) return -1;
+    if (filled < QWEN4_PLE_DISK_PAGE)
+        memset(dst + filled, 0, QWEN4_PLE_DISK_PAGE - filled);
     if (fd == source->buffered_fd)
         posix_fadvise(fd, offset, QWEN4_PLE_DISK_PAGE, POSIX_FADV_DONTNEED);
     worker->page_tags[slot] = page;

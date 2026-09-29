@@ -1,5 +1,4 @@
 /*
-#include <string.h>
  * gguf_loader.h - Single-file GGUF v2/v3 loader with optional mmap support
  *
  * Usage:
