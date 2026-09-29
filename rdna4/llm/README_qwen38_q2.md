@@ -257,12 +257,12 @@ The exact scalar path remains the default. Disabling prefix graphs did not
 improve 32-token decode: it reached 31.69 tok/s at a 9,000 MiB cache budget,
 with the exact hash `b9f867f533408c06`.
 
-### Exact 1K prefill with ordered state and grouped MoE
+### Ordered-state 1K prefill with grouped MoE
 
 The opt-in `LLM_QWEN4_BATCH_SCALAR_STATE_FFN=1` path runs every attention,
 SSM, and PLE state transition in token order, then batches each layer's MoE
-FFN. The exact F16 HC batch and bounded router tile retain the reference
-greedy sequence. The
+FFN. The F16 HC batch and bounded router tile retain the scalar reference's
+greedy sequence on the measured 1K prompt. The
 Q2_0 stage can group up to eight assignments for one expert into a weight-
 reuse tile; the per-layer selected-expert check matched all 48 sampled gate/up
 and down outputs bit for bit with an eight-assignment tile. A four-assignment
@@ -287,11 +287,36 @@ starts empty; `LLM_QWEN4_STAGE_PROMOTE=1` uses observed routes to retain
 experts for decode. Without promotion, decode fell to 18.11 tok/s. Batched
 F16 HC projections and layer-entry premixing keep the scalar F16 matvec
 reduction order, while 32-row router groups retain the single-row WMMA tile.
-All 248,320 logits matched bit for bit against the earlier exact staged path
-at both 128 and 1,024 prompt tokens. In paired 1K runs, these changes raised
+All 248,320 logits matched bit for bit against the earlier staged path
+at both 128 and 1,024 prompt tokens. This compares two versions of the
+grouped MoE path, not grouped MoE against scalar MoE. With the same 9,000 MiB
+cache budget, grouped MoE versus scalar prefill differed by 1.55% relative
+logit L2 at 512 tokens and 5.03% at 1,024 tokens. At 128 tokens, using scalar MoE with the batched F16
+HC path matched all scalar logits bit for bit; grouped MoE with scalar HC
+still differed by 2.49% relative L2. The grouped route therefore remains an
+opt-in quality experiment despite the matching 1K greedy sequence. In paired
+1K grouped-MoE runs, these changes raised
 prefill from 55.57 to 68.55 tok/s; the 70.62 result above used the same
-settings with 32 decoded tokens. The benchmark's streamed-chunk mode honors the explicit
-`--qwen4-batched-prefill` switch, so bounded tiles can be measured correctly.
+settings with 32 decoded tokens. A 512+512 streamed run changed the 32-token
+greedy hash to `5d1fa86db31017c9` and reached 42.01/33.60 tok/s, so this
+grouped-MoE profile is not validated across an external chunk boundary. The
+same streamed schedule with scalar MoE matched all scalar 1K logits bit for
+bit, which isolates the difference to grouped MoE arithmetic rather than
+the batched-to-scalar state handoff.
+
+For numerical comparisons, use the same cache budget. Scalar and batched-HC
+1K logits matched bit for bit at 9,000 MiB when both used scalar MoE. A scalar
+run with a 10,200 MiB cache differed from the 9,000 MiB scalar run by 2.97%
+relative logit L2 because different experts executed on CPU versus GPU.
+The cache budget is therefore part of the numerical configuration.
+
+The parity-preserving 1K batched-HC/scalar-MoE profile reached **38.60 prefill
+/ 33.49 decode tok/s** at 9,000 MiB, compared with **30.86 prefill tok/s**
+for scalar prefill at the same cache budget. It uses
+`LLM_QWEN4_BATCH_SCALAR_STATE_FFN=1`, `LLM_QWEN4_BATCH_ATTN=0`,
+`LLM_QWEN4_BATCH_HC_EXACT_F16=1`, `LLM_QWEN4_BATCH_HC_PREMIX=1`,
+`LLM_MOE_PREFILL_SCALAR=1`, `LLM_BMAX=1024`, and
+`--qwen4-batched-prefill`, without staging.
 
 An optional `LLM_QWEN4_Q2_EXPERT_PROFILE=/path/to/expert-profile.bin` accepts
 the model-matched STRP ranking format and preloads cache slots at model load.
