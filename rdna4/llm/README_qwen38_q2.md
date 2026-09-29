@@ -307,6 +307,10 @@ grouped-MoE profile is not validated across an external chunk boundary. The
 same streamed schedule with scalar MoE matched all scalar 1K logits bit for
 bit, which isolates the difference to grouped MoE arithmetic rather than
 the batched-to-scalar state handoff.
+On the first 1K prompt, an extended 128-token continuation retained the
+scalar sequence hash `ce9665c9e82dbdcd` and measured 68.31 prefill /
+32.72 decode tok/s with grouped MoE. The same 9,000 MiB scalar control
+measured 31.52 / 31.66 tok/s.
 
 For numerical comparisons, use the same cache budget. Scalar and batched-HC
 1K logits matched bit for bit at 9,000 MiB when both used scalar MoE. A scalar
@@ -387,7 +391,9 @@ decode tok/s with the same greedy hash, so it did not materially improve
 on the unsharded 36.94 control. The opt-in `LLM_ATTN_GQA8=1` kernel had a
 shared-memory initialization race; synchronizing its score scratch stopped
 an immediate EOS failure, but it still changed the 32-token hash and slowed
-decode to 29.54 tok/s. Keep the unsharded kernel for this profile.
+decode to 29.54 tok/s. Exact prefix graph replay captured 47 layer prefixes
+but reached only 36.61 decode tok/s at the same cache setting. Keep the
+unsharded, non-graph path for this profile.
 
 Exact MTP with the matching local Q8_0 NextN sidecar accepted most
 three-token drafts but reached 29.03 tok/s with scalar target verification
