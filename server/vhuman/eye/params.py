@@ -1,7 +1,7 @@
 """Independent procedural-eye controls and user-supplied measurements.
 
-Defaults are synthetic demonstration choices, not measurements of a licensed
-character or a clinical specification. JSON overrides use metres and linear RGB.
+New eyes use the GNM v3 ocular profile; saved unversioned eyes retain the
+original synthetic profile. JSON overrides use metres and linear RGB.
 """
 from __future__ import annotations
 
@@ -12,7 +12,11 @@ import math
 from dataclasses import dataclass
 from typing import Any
 
-ALGO_VERSION = 3          # independent analytic mapping and material model
+ALGO_VERSION = 4          # versioned GNM/legacy anatomical profiles
+GNM_PROFILE = "gnm_v3"
+LEGACY_PROFILE = "legacy_v1"
+GNM_LIMBUS_SIGMA_M = .00044
+GNM_CORNEA_SIGMA_M = .00073
 
 BLEND_METHODS = ("Radial", "Structural")
 IRIS_PATTERNS = tuple(f"pattern_{i}" for i in range(1, 10))
@@ -68,7 +72,7 @@ FIELDS: tuple[FieldSpec, ...] = (
     _f("structure.furrows", .5, 0., 1., live=False),
     _f("structure.freckles", .2, 0., 1., live=False),
     _f("structure.collarette", .5, 0., 1., live=False),
-    _f("pupil.dilation", 1., .25, 2., help="Multiplier of the reference pupil radius."),
+    _f("pupil.dilation", 5. / 3., .25, 2., help="Multiplier of the reference pupil radius; GNM neutral is half the iris."),
     _f("pupil.feather", .15, 0., 1.),
     _f("pupil.scale", 1., .25, 2.),
     _f("cornea.size", .2, .1, .3, help="Iris UV radius; .2 matches the geometric limbus."),
@@ -83,21 +87,24 @@ FIELDS: tuple[FieldSpec, ...] = (
     _f("sclera.vascularity_intensity", .3, 0., 1.),
     _f("sclera.vascularity_coverage", .3, 0., .7),
     FieldSpec("optics.side", "enum", "left", live=False, label="Side", choices=SIDES),
+    FieldSpec("optics.profile", "enum", GNM_PROFILE, live=False, label="Anatomy",
+              choices=(GNM_PROFILE, LEGACY_PROFILE)),
     _f("optics.ior", 1.336, 1.01, 1.6),
     _f("optics.chamber_depth", .0035, .001, .006),
     _f("optics.iris_convexity", 0., -.0005, .0005),
     _f("optics.cornea_roughness", .06, 0., .5),
     _f("optics.sclera_roughness", .12, 0., .7),
-    _f("optics.sclera_radius", .012, .008, .018, live=False, help="User-selected sclera radius in metres."),
+    _f("optics.sclera_radius", .0146, .008, .018, live=False, help="GNM v3 template sclera radius in metres; user adjustable."),
     _f("optics.limbus_radius", .006, .003, .009, live=False, help="User-selected limbus radius in metres."),
-    _f("optics.cornea_radius", .008, .004, .012, live=False, help="User-selected corneal curvature radius in metres."),
+    _f("optics.cornea_radius", .0085, .004, .012, live=False, help="GNM v3 mean corneal curvature radius in metres; user adjustable."),
     _f("optics.limbus_blend", .0005, .0001, .001, live=False, help="Synthetic sphere-junction blend width in metres."),
 )
 
 FIELD_BY_NAME = {spec.name: spec for spec in FIELDS}
 GROUPS = ("iris", "structure", "pupil", "cornea", "sclera", "optics")
 
-# Synthetic reference pupil radius as a fraction of iris radius.
+# The texture atlas retains the original reference radius. New default
+# dilation gives GNM's half-iris neutral pupil without changing old atlases.
 P_REF = 0.30
 
 
@@ -142,6 +149,12 @@ def validate(params: dict | None) -> dict:
     """Defaults overlaid with `params` (nested {group: {key: value}}),
     clamped to the documented artist ranges. Unknown keys are errors."""
     out = defaults()
+    # Previously saved parameter files contain the complete optics group but
+    # have no profile tag. Keep their geometry and pupil response unchanged.
+    old_optics = (params or {}).get("optics", {})
+    if (isinstance(old_optics, dict) and "profile" not in old_optics
+            and all(k in old_optics for k in ("sclera_radius", "limbus_radius", "cornea_radius", "limbus_blend"))):
+        out["optics"]["profile"] = LEGACY_PROFILE
     for group, values in (params or {}).items():
         if group in ("version", "preset", "name"):
             continue
@@ -214,7 +227,7 @@ def structure_key(p: dict, res: int) -> str:
     p = validate(p)
     payload = {"v": ALGO_VERSION, "res": res,
                "structure": p["structure"], "pattern": p["iris"]["pattern"],
-               "side": p["optics"]["side"],
+               "side": p["optics"]["side"], "profile": p["optics"]["profile"],
                "measurements": {k: p["optics"][k] for k in ("sclera_radius", "limbus_radius", "cornea_radius", "limbus_blend")}}
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:24]
 

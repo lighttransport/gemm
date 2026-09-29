@@ -127,7 +127,11 @@ def bake(tmpl: T.Template, skin: Part, pos: np.ndarray, subj, out_dir: Path, res
     k = 8
     d, j = tree.query(p, k=k)
     agree = (subj.normals[j] * n[:, None]).sum(-1) > 0.2
-    score = np.where(agree, d, d + 1.0)
+    # Prefer a similarly oriented sample near the texel, but do not let the
+    # normal test select a distant point across an open neck or scan boundary.
+    # Imported full-head atlases expose more of those boundaries than the
+    # procedural face atlas does.
+    score = np.where(agree, d, d + 0.004)
     best = j[np.arange(len(p)), np.argmin(score, 1)]
     # vertex -> incident triangles (CSR, capped)
     ST = subj.triangles
@@ -199,6 +203,18 @@ def bake(tmpl: T.Template, skin: Part, pos: np.ndarray, subj, out_dir: Path, res
     img_b[ys, xs] = base
     img_o[ys, xs] = orm
     img_n[ys, xs] = (tn * 0.5 + 0.5) * 255
+    # A full-head source topology can cover the back of a scan whose subject
+    # mesh contains only a small face atlas. Extend measured colours over
+    # those texels in UV space, and report their count for quality control.
+    measured = cov.copy()
+    measured[ys[far], xs[far]] = False
+    if far.any() and measured.any():
+        from scipy.ndimage import distance_transform_edt
+        _, nearest = distance_transform_edt(~measured, return_indices=True)
+        for img in (img_b, img_o):
+            img[ys[far], xs[far]] = img[nearest[0, ys[far], xs[far]],
+                                        nearest[1, ys[far], xs[far]]]
+        img_n[ys[far], xs[far]] = [127.5, 127.5, 255]
     img_b = dilate(img_b, cov, 12)
     img_o = dilate(img_o, cov, 12)
     img_n = dilate(img_n, cov, 12)
@@ -209,6 +225,7 @@ def bake(tmpl: T.Template, skin: Part, pos: np.ndarray, subj, out_dir: Path, res
         Image.fromarray(np.clip(np.round(img), 0, 255).astype(np.uint8)).save(out_dir / name)
         out[name] = str(out_dir / name)
     stats = {"res": res, "texels": int(cov.sum()), "far_texels": int(far.sum()),
+             "inferred_texels": int(far.sum()),
              "mean_transfer_mm": round(float(bestd[~lining].mean() * 1000), 3),
              "p95_transfer_mm": round(float(np.percentile(bestd[~lining], 95) * 1000), 3),
              "seconds": round(time.perf_counter() - t0, 2)}

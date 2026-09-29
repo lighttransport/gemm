@@ -69,7 +69,7 @@ def rom_frames(rig: rigdef.Rig):
     return frames
 
 
-def _material_usd(name, spec, tex_dir: Path, rel: str) -> str:
+def _material_usd(name, spec, tex_dir: Path, rel: str, tex_prefix: str = "") -> str:
     g = spec["gltf"]
     pbr = g.get("pbrMetallicRoughness", {})
     imgs = spec.get("images", {})
@@ -82,7 +82,7 @@ def _material_usd(name, spec, tex_dir: Path, rel: str) -> str:
         info = pbr.get(slot) if slot in pbr else g.get(slot)
         if not info or int(info["index"]) not in imgs:
             return None
-        fn = f"{name}_{slot}.png"
+        fn = f"{tex_prefix}{name}_{slot}.png"
         data = imgs[int(info["index"])]
         (tex_dir / fn).write_bytes(data if isinstance(data, (bytes, bytearray)) else b"")
         node = f"Tex_{slot}"
@@ -228,8 +228,9 @@ def write(asset, out: Path, subj=None, name: str = "rig.usda") -> dict:
         L += ["        }"]
         stats["meshes"] += 1
     L += ["    }", '    def Scope "Materials"', "    {"]
+    tex_prefix = "" if name == "rig.usda" else Path(name).stem + "_"
     for key, spec in asset.materials.items():
-        L.append(_material_usd(_ident(key), spec, tex_dir, "textures"))
+        L.append(_material_usd(_ident(key), spec, tex_dir, "textures", tex_prefix))
     L += ["    }", "}", ""]
     text = "\n".join(L)
     (out / name).write_text(text)

@@ -84,10 +84,24 @@ class ParamsTest(unittest.TestCase):
         p = P.validate({"sclera": {"use_custom_tint": True, "tint": [0.9, 0.8, 0.7]}})
         np.testing.assert_allclose(P.sclera_tint(p), [0.9, 0.8, 0.7])
         # Pupil radius scales directly from the synthetic reference ratio.
-        self.assertAlmostEqual(P.pupil_ratio(P.defaults()), P.P_REF)
+        self.assertAlmostEqual(P.pupil_ratio(P.defaults()), .5)
         self.assertAlmostEqual(P.pupil_ratio(P.validate({"pupil": {"dilation": 1.0}})), P.P_REF)
         self.assertAlmostEqual(P.pupil_ratio(P.validate({"pupil": {"scale": 2.2, "dilation": 1.2}})),
                                P.P_REF * 2.0 * 1.2)
+
+    def test_gnm_anatomy_and_saved_legacy_profile(self):
+        fresh = P.defaults()
+        self.assertEqual(fresh["optics"]["profile"], P.GNM_PROFILE)
+        self.assertEqual(fresh["optics"]["sclera_radius"], .0146)
+        self.assertEqual(fresh["optics"]["cornea_radius"], .0085)
+        self.assertAlmostEqual(P.pupil_ratio(fresh), .5)
+        old = P.defaults()
+        old["optics"].pop("profile")
+        old["optics"].update(sclera_radius=.012, cornea_radius=.008)
+        old["pupil"]["dilation"] = 1.0
+        recovered = P.validate(old)
+        self.assertEqual(recovered["optics"]["profile"], P.LEGACY_PROFILE)
+        self.assertAlmostEqual(P.pupil_ratio(recovered), .3)
 
 
 class ChartTest(unittest.TestCase):

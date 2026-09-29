@@ -1,8 +1,8 @@
 """Analytic two-sphere eye geometry, angular atlas mapping and standard optics.
 
-Synthetic defaults: sclera radius 12 mm, limbus radius 6 mm, cornea radius
-8 mm. These are demonstration choices, not clinical measurements. Users may
-override all radii in metres. Frame: +Z gaze, +Y up, +X texture-right."""
+GNM v3 defaults: sclera radius 14.6 mm (template choice), limbus radius 6 mm
+and cornea radius 8.5 mm (physiological means). The former 12/6/8 mm profile
+is retained for saved assets. Frame: +Z gaze, +Y up, +X texture-right."""
 from __future__ import annotations
 
 import math
@@ -21,9 +21,9 @@ LUMA = np.array([0.2126, 0.7152, 0.0722], np.float32)
 
 @dataclass(frozen=True)
 class Profile:
-    sclera_radius: float = 0.012
+    sclera_radius: float = 0.0146
     limbus_radius: float = 0.006
-    cornea_radius: float = 0.008
+    cornea_radius: float = 0.0085
     limbus_blend: float = 0.0005        # smooth-max width of the sclera/cornea junction
 
     @property
@@ -52,6 +52,7 @@ class Profile:
 
 
 ANATOMICAL = Profile()
+LEGACY = Profile(sclera_radius=.012, cornea_radius=.008)
 
 
 def profile_from_params(p: dict) -> Profile:

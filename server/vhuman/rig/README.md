@@ -1,12 +1,12 @@
 # Facial rig for generated heads
 
 Turns a fitted head (Qwen-Image 2.1 portrait → Pixal3D → `head/fit.py`) into
-an animatable face: one fixed template topology fitted to the subject, a
+an animatable face: an imported or procedural template fitted to the subject, a
 template skeleton (neck, head, jaw, eyes, upper/lower teeth, a 4-joint
 tongue), procedural teeth/gums/tongue, skin weights, 52 expression shapes plus
 correctives, a linear rig evaluator, and skinned glTF / UsdSkel exports.
-It is our own replacement for engine auto-rigging and face tools: no engine
-code, assets, DNA files or measured character data are used.
+The rig code is repository authored. GNM v3 and ICT-FaceKit Light assets are
+downloaded separately into the ignored `tmp/vhuman-rig/models/` cache.
 
 ```sh
 # rig interpreter (numpy, Pillow, scipy, PyTorch; CUDA optional)
@@ -15,6 +15,9 @@ VIRTUAL_ENV=tmp/vhuman-rig-venv uv pip install -r server/vhuman/requirements-rig
 
 sh server/vhuman/run.sh                        # http://127.0.0.1:8790/rig
 python3 -m server.vhuman.cli rig --head <id>   # same job without the server
+python3 -m server.vhuman.cli rig --head <id> --face-model ict_facekit_light
+python3 -m server.vhuman.cli rig --head <id> --face-model procedural
+python3 -m server.vhuman.cli rig-soft-tissue --head <id> --take <take-id>
 python3 -m server.vhuman.cli rig-track --head <id> --track capture.txt --out anim.usda
 python -m server.vhuman.rig.build <head folder> [--res 2048] [--out DIR]   # in the rig interpreter
 sh server/vhuman/rig/external.sh [--local] [--build]   # LightRig + LightUSD (vchar) under third_party/
@@ -23,6 +26,46 @@ sh server/vhuman/rig/external.sh [--local] [--build]   # LightRig + LightUSD (vc
 Outputs go to `<head>/rig/`: `rig.glb` (web viewer), `rig.usda` + `textures/`
 (and `rig_usd.zip`), `rig.json` (the rig definition), `rig_*.png` maps,
 `preview.png`, `rig_report.json` (fit, bake and timing statistics).
+
+## Face topologies and anatomy
+
+`gnm_v3` is the default for new builds. Its Apache-2.0 model provides the
+full-head exterior skin and native UV atlas, 253 identity modes and 383
+expression modes in the verified v3 weight file. The loader uses the first
+170 identity modes for fitting. `ict_facekit_light` uses the MIT-licensed
+neutral mesh, 100 identity modes and authored expression OBJ targets. Its
+two UV tiles are packed side by side into one atlas. `procedural` retains the
+previous rig. All three use the fitted procedural scaffold for the skeleton,
+control names, skinning and subject correspondence. Imported skin is exported
+as LOD0; the fitted procedural mouth bag supplies the interior, and the
+existing procedural LOD1/2 provide lower-detail alternatives. `rig.json` and
+`rig_report.json` record the selected source and provenance.
+
+Single-view subjects may not contain enough rear-head texture to cover a full
+GNM or ICT atlas. The baker extends measured skin pixels to unobserved UV
+texels and reports `inferred_texels` and `far_texels`; these counts indicate
+where texture is inferred. GNM's eye measurements set new eye defaults:
+14.6 mm sclera radius, 6 mm limbus radius, 8.5 mm corneal curvature radius,
+and a neutral pupil half the iris radius. Saved eye parameter sets with the
+previous dimensions retain them through the `legacy_v1` profile.
+
+## Offline facial soft tissue
+
+`rig-soft-tissue` takes an existing speech performance (`animation.json`) and
+evaluates the native facial rig, then simulates a cheek, perioral and chin
+patch in LightGeom. The runner retriangulates the patch, extrudes a 5 mm
+tetrahedral layer, pins the inner surface, and solves a 10 kPa Neo-Hookean
+material. It drives the volume with one tenth of the rig motion, then adds
+the simulated residual to the full rig pose. The export is bounded to keep
+positive tetrahedral volume. It writes `soft_tissue.usda` with time samples
+and `soft_tissue_report.json` with volume and tracking diagnostics beside the
+take. This is an optional offline experiment; the take's normal glTF/USD
+animation remains the playback path. Build LightGeom's
+`lightphysics_vhuman_face` target in `~/work/lightgeom/build` first, or pass
+`--lightgeom-runner` to the CLI. Material stiffness and residual gain are
+fixed experimental values and have not been calibrated to measured human
+facial tissue. The USD is a separate patch and is not yet composited with
+the skinned head in the viewer.
 
 ## Pipeline
 

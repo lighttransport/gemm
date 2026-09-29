@@ -31,7 +31,8 @@ def availability(python=None) -> dict:
 
 
 def rig_job(service, request: dict, progress, cancel, python=None, mock: bool = False) -> dict:
-    """{head_id, res (1024|2048|4096), iters}"""
+    """{head_id, res (1024|2048|4096), iters, face_model?}."""
+    from .face_models import SOURCES
     head_id = request.get("head_id")
     folder = service.head_file(head_id, "head.json").parent
     for name in ("head_eyes.glb", "fit.json", "portrait.png"):
@@ -46,8 +47,16 @@ def rig_job(service, request: dict, progress, cancel, python=None, mock: bool = 
     if not py.exists():
         raise ValueError(availability(python)["reason"])
     out = folder / "rig"
+    old_report = out / "rig_report.json"
+    saved_model = None
+    if old_report.exists():
+        saved_model = json.loads(old_report.read_text()).get("face_model", "procedural")
+    face_model = request.get("face_model") or saved_model or "gnm_v3"
+    if face_model not in SOURCES:
+        raise ValueError(f"face_model must be one of {', '.join(SOURCES)}")
     cmd = [str(py), "-m", "server.vhuman.rig.build", str(folder), "--out", str(out), "--res", str(res),
-           "--iters", str(iters), "--cache", str(service.work / "cache" / "rig"), "--progress"]
+           "--iters", str(iters), "--cache", str(service.work / "cache" / "rig"),
+           "--face-model", face_model, "--progress"]
     progress(0.01, "waiting for the GPU")
     lock = (service.work / "mock-gpu.lock") if mock else gpu.LOCK_PATH
     tail = []

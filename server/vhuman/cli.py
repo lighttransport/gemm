@@ -254,7 +254,8 @@ def cmd_rig(args) -> dict:
     """The rig job without the server: a subprocess in the rig interpreter."""
     from .rig import job as rig_job
     svc = EyeService(Path(args.work))
-    return rig_job.rig_job(svc, {"head_id": args.head, "res": args.res, "iters": args.iters}, _progress,
+    return rig_job.rig_job(svc, {"head_id": args.head, "res": args.res, "iters": args.iters,
+                                 "face_model": args.face_model}, _progress,
                            threading.Event(), python=args.rig_python)
 
 
@@ -309,6 +310,14 @@ def cmd_rig_speech(args) -> dict:
                              aligner=args.aligner or speech.DEFAULT_ALIGNER, backend=args.backend, allow_wav=True,
                              emotion_runner=args.emotion_runner or emotion.DEFAULT_RUNNER,
                              emotion_model=args.emotion_model or emotion.DEFAULT_MODEL)
+
+
+def cmd_rig_soft_tissue(args) -> dict:
+    from .rig import soft_tissue
+    svc = EyeService(Path(args.work))
+    return soft_tissue.soft_tissue_job(svc, {"head_id": args.head, "take_id": args.take},
+                                      _progress, threading.Event(), python=args.rig_python,
+                                      runner=Path(args.lightgeom_runner) if args.lightgeom_runner else soft_tissue.DEFAULT_RUNNER)
 
 
 def cmd_bench(args) -> dict:
@@ -422,6 +431,8 @@ def main(argv=None) -> int:
     sp.add_argument("--head", required=True)
     sp.add_argument("--res", type=int, choices=(1024, 2048, 4096), default=2048)
     sp.add_argument("--iters", type=int, default=600)
+    sp.add_argument("--face-model", choices=("gnm_v3", "ict_facekit_light", "procedural"),
+                    help="face topology; existing rigs retain their saved model if omitted")
     sp.set_defaults(fn=cmd_rig)
     sp = sub.add_parser("body", help="Qwen full-body image -> SAM 3D Body -> Pixal3D -> combined avatar")
     sp.add_argument("--head", required=True, help="existing head with a facial rig")
@@ -469,6 +480,11 @@ def main(argv=None) -> int:
     sp.add_argument("--emotion-runner", help="SenseVoiceSmall GGUF runtime executable")
     sp.add_argument("--emotion-model", help="SenseVoiceSmall GGUF weights")
     sp.set_defaults(fn=cmd_rig_speech)
+    sp = sub.add_parser("rig-soft-tissue", help="offline LightGeom facial volume for an existing speech take")
+    sp.add_argument("--head", required=True)
+    sp.add_argument("--take", required=True)
+    sp.add_argument("--lightgeom-runner")
+    sp.set_defaults(fn=cmd_rig_soft_tissue)
     sub.add_parser("replate", help="re-extract the plate library from its source images").set_defaults(fn=cmd_replate)
     sub.add_parser("bench", help="timing targets").set_defaults(fn=cmd_bench)
     args = ap.parse_args(argv)

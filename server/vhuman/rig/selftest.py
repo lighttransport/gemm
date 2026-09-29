@@ -58,7 +58,7 @@ def main(argv=None) -> int:
                                     "wrinkle_group": group}
     (ex / "manifest.json").write_text(json.dumps(man))
     rep = build.assemble(head, head / "rig", res=512, iters=60, cache_dir=out / "cache", preview=False,
-                         log=lambda m: None, deformer_samples=192)
+                         log=lambda m: None, deformer_samples=192, face_model="procedural")
     tm = template.get(out / "cache")
     rig = json.loads((head / "rig" / "rig.json").read_text())
     summary = {"template": template_invariants(tm), "report": {k: rep[k] for k in ("shapes", "controls", "joints")},

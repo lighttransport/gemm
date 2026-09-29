@@ -116,6 +116,20 @@ class SafetensorsTests(unittest.TestCase):
 
 
 class RigFileTests(unittest.TestCase):
+    def test_lod_material_keeps_base_atlas(self):
+        from .rig.usd import _material_usd
+        spec = {"gltf": {"pbrMetallicRoughness": {"baseColorTexture": {"index": 0}}},
+                "images": {0: b"base"}}
+        with tempfile.TemporaryDirectory() as d:
+            tex_dir = Path(d)
+            base = _material_usd("skin", spec, tex_dir, "textures")
+            spec["images"][0] = b"lod"
+            lower = _material_usd("skin", spec, tex_dir, "textures", "rig_lod1_")
+            self.assertIn("skin_baseColorTexture.png", base)
+            self.assertIn("rig_lod1_skin_baseColorTexture.png", lower)
+            self.assertEqual((tex_dir / "skin_baseColorTexture.png").read_bytes(), b"base")
+            self.assertEqual((tex_dir / "rig_lod1_skin_baseColorTexture.png").read_bytes(), b"lod")
+
     def test_rig_file_guard(self):
         from .service import EyeService, ServiceError
         with tempfile.TemporaryDirectory() as d:

@@ -108,6 +108,8 @@ def head_parts(parts_t, pos, shapes, Jn, W) -> list[ExportPart]:
     """Skin and mouth-interior export parts of a (LOD) template with its shapes."""
     out = []
     for p in parts_t:
+        if not len(p.tris):
+            continue
         tris_w = p.vmap[p.tris]
         dn = _shape_normals(pos, tris_w, {k: v for k, v in shapes.items() if not k.startswith("ml_")}, p.vmap)
         sh = {}
@@ -210,7 +212,10 @@ def export_lods(levels, tmpl, pos, shapes, Jn, W, contacts_viz, mouth_parts, car
 
 def assemble(folder, out_dir=None, res: int = 2048, iters: int = 600, log=print, cache_dir=None,
              reuse_fit: bool = False, preview: bool = True, keep_asset: bool = False, progress=None,
-             deformer_samples: int = 4096, lods=(1, 2)) -> dict:
+             deformer_samples: int = 4096, lods=(1, 2), face_model: str = "gnm_v3") -> dict:
+    from . import face_models
+    if face_model not in face_models.SOURCES:
+        raise ValueError(f"face_model must be one of {', '.join(face_models.SOURCES)}")
     t0 = time.perf_counter()
     folder = Path(folder)
     out = Path(out_dir) if out_dir else folder / "rig"
@@ -236,9 +241,14 @@ def assemble(folder, out_dir=None, res: int = 2048, iters: int = 600, log=print,
     subj = load_subject(folder)
     tmpl = template.get(cache_dir)
     cache = out / "fit_cache.pkl"
+    cached = None
     if reuse_fit and cache.exists():
         import pickle
-        feat, fit = pickle.loads(cache.read_bytes())
+        cached = pickle.loads(cache.read_bytes())
+        if len(cached[1].get("positions", ())) != tmpl.n:
+            cached = None
+    if cached is not None:
+        feat, fit = cached
         t = lap("fit_cache", t)
     else:
         feat = features.extract(subj)
@@ -269,11 +279,23 @@ def assemble(folder, out_dir=None, res: int = 2048, iters: int = 600, log=print,
                                       if progress else None)
         shapes = dict(shapes, **ml.target_deltas())
         t = lap("deformer", t)
-    parts_t = meshes.unweld(tmpl, pos)
+    proc_pos, proc_shapes, proc_Jn, proc_W = pos, shapes, Jn, W
+    proc_contacts = contacts_viz
+    source_stats = None
+    source = None
+    if face_model != "procedural":
+        source = face_models.load(face_model)
+        pos, shapes, Jn, W, source_stats = face_models.fit_and_transfer(
+            source, proc_pos, tmpl.tris[tmpl.tri_mat == 0], proc_shapes, proc_Jn, proc_W)
+        contacts_viz = face_models.remap_contacts(proc_contacts, proc_pos, pos, source.triangles)
+        active_tmpl = face_models.as_template(source)
+    else:
+        active_tmpl = tmpl
+    parts_t = meshes.unweld(active_tmpl, pos)
     lining_rgb = tuple(subj.fit.get("fit", {}).get("lining", {}).get("srgb", (150, 100, 85)))
-    baked = bake.bake(tmpl, parts_t[0], pos, subj, out, res=res, lining_srgb=lining_rgb, log=log)
+    baked = bake.bake(active_tmpl, parts_t[0], pos, subj, out, res=res, lining_srgb=lining_rgb, log=log)
     wrinkle_maps = None
-    if (expr_dir / "manifest.json").exists():
+    if face_model == "procedural" and (expr_dir / "manifest.json").exists():
         from . import wrinkles
         brow_y = float(np.mean([b[:, 1].mean() for b in feat.brows]))
         wrinkle_maps = wrinkles.bake(tmpl, parts_t[0], pos, subj, expr_dir, out, res=min(res, 2048), log=log,
@@ -281,6 +303,11 @@ def assemble(folder, out_dir=None, res: int = 2048, iters: int = 600, log=print,
     t = lap("bake", t)
     # ---- parts ---------------------------------------------------------------------------
     parts: list[ExportPart] = head_parts(parts_t, pos, shapes, Jn, W)
+    if source is not None:
+        # Imported sources provide exterior skin only; preserve the fitted
+        # procedural mouth bag as a separate interior material surface.
+        proc_mouth = meshes.unweld(tmpl, proc_pos)[1]
+        parts += head_parts([proc_mouth], proc_pos, proc_shapes, proc_Jn, proc_W)
     mouth_parts = []
     for pm in (*mouthparts.teeth(skel, True, skel["scale"], jidx), *mouthparts.teeth(skel, False, skel["scale"], jidx),
                mouthparts.tongue(skel, skel["scale"], jidx)):
@@ -292,7 +319,7 @@ def assemble(folder, out_dir=None, res: int = 2048, iters: int = 600, log=print,
     # carried eye meshes
     carried = attach.collect(subj.glb, subj.frame)
     materials = carried_materials(carried, subj)
-    parts += carried_parts(carried, pos, tmpl.tris[tmpl.tri_mat == 0], Jn, W, shapes, jidx)
+    parts += carried_parts(carried, pos, active_tmpl.tris[active_tmpl.tri_mat == 0], Jn, W, shapes, jidx)
     # ---- materials ------------------------------------------------------------------------
     rd = {k: Path(v).read_bytes() for k, v in baked["files"].items()}
     materials["skin"] = {"gltf": {"name": "skin", "pbrMetallicRoughness": {
@@ -312,6 +339,9 @@ def assemble(folder, out_dir=None, res: int = 2048, iters: int = 600, log=print,
         "baseColorFactor": [0.68, 0.28, 0.29, 1.0], "metallicFactor": 0.0, "roughnessFactor": 0.45}}}
     shape_names = sorted({n for p in parts for n in p.shapes})
     rig = rig_definition(skel, shape_names)
+    rig["face_model"] = face_model
+    if source_stats:
+        rig["face_model_source"] = {k: v for k, v in source_stats.items() if k != "identity_coefficients"}
     if wrinkle_maps:
         rig["wrinkles"] = wrinkle_maps
     if ml is not None:
@@ -327,8 +357,11 @@ def assemble(folder, out_dir=None, res: int = 2048, iters: int = 600, log=print,
     (out / "rig.json").write_text(json.dumps(rig, indent=1))
     if contacts_viz:
         from . import contacts as contacts_mod
-        contacts_viz = dict(contacts_viz, **contacts_mod.graph(contacts_viz, tmpl.tris))
-    viz = {"parts": {f"head_{p.name}": {"vmap": p.vmap.tolist()} for p in parts_t}, "contacts": contacts_viz,
+        contacts_viz = dict(contacts_viz, **contacts_mod.graph(contacts_viz, active_tmpl.tris))
+    viz_parts = {f"head_{p.name}": {"vmap": p.vmap.tolist()} for p in parts_t if len(p.tris)}
+    if source is not None:
+        viz_parts["head_mouth"] = {"vmap": proc_mouth.vmap.tolist()}
+    viz = {"parts": viz_parts, "contacts": contacts_viz,
            "welded_vertices": int(len(pos))}
     (out / "viz.json").write_text(json.dumps(viz, separators=(",", ":"),
                                              default=lambda o: o.tolist() if hasattr(o, "tolist") else str(o)))
@@ -338,13 +371,33 @@ def assemble(folder, out_dir=None, res: int = 2048, iters: int = 600, log=print,
     glb_stats = gltf.write(asset, out / "rig.glb")
     t = lap("gltf", t)
     usd_stats = usd.write(asset, out, subj)
-    lod_report = export_lods(lods, tmpl, pos, shapes, Jn, W, contacts_viz, mouth_parts, carried, jidx, asset, out,
-                             subj, cache_dir, log=log) if lods else {}
+    if lods and source is not None:
+        # LODs retain the established ring-safe low-resolution mesh. Re-bake
+        # its own atlas because the imported model uses a different UV layout.
+        lod_bake_dir = out / "lod_atlas"
+        lod_bake_dir.mkdir(parents=True, exist_ok=True)
+        proc_parts_t = meshes.unweld(tmpl, proc_pos)
+        lod_baked = bake.bake(tmpl, proc_parts_t[0], proc_pos, subj, lod_bake_dir,
+                              res=res, lining_srgb=lining_rgb, log=log)
+        lod_images = {k: Path(v).read_bytes() for k, v in lod_baked["files"].items()}
+        lod_materials = dict(materials)
+        lod_materials["skin"] = dict(materials["skin"], images={
+            0: lod_images["rig_basecolor.png"], 1: lod_images["rig_orm.png"],
+            2: lod_images["rig_normal.png"]})
+        lod_asset = RigAsset(skel, parts, lod_materials, rig, {"ml": ml})
+        lod_report = export_lods(lods, tmpl, proc_pos, proc_shapes, proc_Jn, proc_W, proc_contacts,
+                                 mouth_parts, carried, jidx, lod_asset, out, subj, cache_dir, log=log)
+        for row in lod_report.values():
+            row["topology"] = "procedural_lod"
+    else:
+        lod_report = export_lods(lods, tmpl, pos, shapes, Jn, W, contacts_viz, mouth_parts, carried, jidx, asset,
+                                 out, subj, cache_dir, log=log) if lods else {}
     usd_stats["zip"] = usd.package(out)
     t = lap("usd", t)
     prev = preview_sheet(asset, out / "preview.png") if preview else []
     t = lap("preview", t)
-    report = {"version": VERSION, "head": folder.name, "template": tmpl.info, "features": feat.info,
+    report = {"version": VERSION, "head": folder.name, "face_model": face_model,
+              "face_model_fit": source_stats, "template": active_tmpl.info, "features": feat.info,
               "register": fit["stats"], "skin": skin_info, "bake": baked["stats"], "gltf": glb_stats,
               "usd": usd_stats, "shapes": len(rig["blendshapes"]), "controls": len(rig["controls"]),
               "deformer": ml_stats, "native_package": native_stats, "expressions": expr_report,
@@ -353,7 +406,9 @@ def assemble(folder, out_dir=None, res: int = 2048, iters: int = 600, log=print,
               "preview": prev}
     (out / "rig_report.json").write_text(json.dumps(report, indent=1, default=float))
     (out / "features.json").write_text(json.dumps(feat.as_dict()))
-    np.savez_compressed(out / "fit.npz", positions=pos, init=fit["init"], chart=fit["chart"])
+    np.savez_compressed(out / "fit.npz", positions=pos,
+                        init=fit["init"] if source is None else pos,
+                        chart=fit["chart"] if source is None else np.zeros((len(pos), 2)))
     return report
 
 
@@ -467,6 +522,7 @@ def main(argv=None):
     ap.add_argument("--lods", default="1,2", help="LOD levels to export besides LOD0 (comma list, '' for none)")
     ap.add_argument("--deformer-samples", type=int, default=4096,
                     help="ground-truth samples for the ML corrective deformer (0: no deformer)")
+    ap.add_argument("--face-model", choices=("gnm_v3", "ict_facekit_light", "procedural"), default="gnm_v3")
     a = ap.parse_args(argv)
     prog = None
     if a.progress:
@@ -476,6 +532,7 @@ def main(argv=None):
     rep = assemble(a.head, a.out, a.res, a.iters, cache_dir=a.cache, reuse_fit=a.reuse_fit,
                    preview=not a.no_preview, keep_asset=a.keep_asset, progress=prog,
                    deformer_samples=a.deformer_samples,
+                   face_model=a.face_model,
                    lods=tuple(int(x) for x in a.lods.split(",") if x.strip()),
                    log=(lambda m: print(m, flush=True)))
     print(json.dumps({k: rep[k] for k in ("seconds", "timings", "shapes", "controls", "register", "bake")},

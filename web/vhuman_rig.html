@@ -87,6 +87,8 @@ a.dl{color:var(--accent);margin-right:12px;font-size:13px;display:inline-block}
       <div class="heads" id="heads"><span class="msg">no fitted heads yet — generate one on the heads page</span></div>
       <label for="res">Skin atlas</label>
       <select id="res"><option value="1024">1024 (fast)</option><option value="2048" selected>2048</option><option value="4096">4096</option></select>
+      <label for="face-model">Face mesh</label>
+      <select id="face-model"><option value="gnm_v3">GNM v3 (default)</option><option value="ict_facekit_light">ICT-FaceKit Light</option><option value="procedural">Procedural</option></select>
       <button class="primary" id="build" disabled>Build rig for selected head</button>
       <div class="progress"><div id="bar"></div></div>
       <div class="msg" id="msg"></div>
@@ -196,6 +198,7 @@ a.dl{color:var(--accent);margin-right:12px;font-size:13px;display:inline-block}
         <label>secondary motion <input id="secondary-strength" type="range" min="0" max="1" step="0.05" value="1" style="width:95px"></label>
         <button id="speech-generate" disabled>generate take</button>
         <button id="speech-rebuild" disabled title="Rebuild animation from the selected take without regenerating speech">rebuild animation</button>
+        <button id="soft-tissue" disabled title="Offline LightGeom facial tissue simulation for the selected take">simulate soft tissue</button>
       </div>
       <label>saved takes <select id="speech-takes"><option value="">none</option></select></label>
       <audio id="speech-audio" controls preload="metadata" style="width:100%;margin-top:8px"></audio>
@@ -955,13 +958,14 @@ async function loadTake(take) {
   $('emotion-strength').value = animation.emotion_strength;
   $('secondary-strength').value = animation.secondary_strength ?? 1;
   $('speech-rebuild').disabled = false;
+  $('soft-tissue').disabled = !state.tissueAvailable;
   $('speech-auto-emotion').checked = false;
   $('speech-msg').textContent = take.rig_stale ? 'Rig changed since export; rebuild this animation for the current rig.'
     : take.emotion_source === 'SenseVoiceSmall' ? 'SenseVoiceSmall suggestions loaded. Review and edit the emotion keys.' : '';
   renderEmotionKeys();
   const links = $('speech-downloads');
   links.replaceChildren();
-  for (const [label, key] of [['WAV', 'audio'], ['controls JSON', 'animation'], ['LightRig track', 'lightrig'], ['USD animation', 'usd'], ['emotion analysis', 'emotion']]) {
+  for (const [label, key] of [['WAV', 'audio'], ['controls JSON', 'animation'], ['LightRig track', 'lightrig'], ['USD animation', 'usd'], ['emotion analysis', 'emotion'], ['soft tissue USD', 'soft_tissue'], ['tissue report', 'soft_tissue_report']]) {
     if (!take.urls[key]) continue;
     const a = document.createElement('a');
     a.className = 'dl'; a.textContent = label; a.href = take.urls[key]; a.download = '';
@@ -989,12 +993,36 @@ async function loadTakes(headId, selectId) {
   } else {
     stopAnim(); state.take = null; state.takeFrames = null; speechAudio.removeAttribute('src'); speechAudio.load();
     $('speech-rebuild').disabled = true;
+    $('soft-tissue').disabled = true;
     $('speech-downloads').replaceChildren();
   }
 }
 $('speech-takes').addEventListener('change', () => {
   const take = state.takes?.find((t) => t.id === $('speech-takes').value);
   if (take) loadTake(take).catch((e) => { $('speech-msg').textContent = String(e); });
+});
+$('soft-tissue').addEventListener('click', async () => {
+  if (!state.current?.rig || !state.take || !state.tissueAvailable || state.tissueJob) return;
+  const headId = state.current.id, takeId = state.take.id;
+  $('soft-tissue').disabled = true;
+  try {
+    const job = await api('/v1/jobs', { kind: 'rig_soft_tissue', head_id: headId, take_id: takeId });
+    state.tissueJob = job.id;
+    for (;;) {
+      await new Promise((r) => setTimeout(r, 1000));
+      const j = await api(`/v1/jobs/${job.id}`);
+      $('speech-msg').textContent = j.message;
+      if (j.state === 'done') break;
+      if (j.state === 'failed' || j.state === 'cancelled') throw new Error(j.error || j.state);
+    }
+    await loadTakes(headId, takeId);
+    $('speech-msg').textContent = 'Soft tissue USD ready';
+  } catch (e) {
+    $('speech-msg').textContent = String(e.message || e);
+  } finally {
+    state.tissueJob = null;
+    $('soft-tissue').disabled = !state.take || !state.tissueAvailable;
+  }
 });
 $('add-emotion').addEventListener('click', () => {
   const t = state.take ? speechAudio.currentTime : 0;
@@ -1180,6 +1208,7 @@ async function loadRig(h) {
   viz.originals = new Map();
   $('viz-joint').innerHTML = def.joints.map((j, i) => `<option value="${i}" ${j.name === 'jaw' ? 'selected' : ''}>${j.name}</option>`).join('');
   state.rig = new LinearRig(def);
+  if (def.face_model) $('face-model').value = def.face_model;
   if (def.ml_deformer) {
     const t = await loadSafetensors(base + def.ml_deformer.model);
     const ranges = Object.fromEntries(def.controls.map((c) => [c.name, [c.min, c.max]]));
@@ -1305,7 +1334,8 @@ $('build').addEventListener('click', async () => {
   $('build').disabled = true;
   $('msg').className = 'msg';
   try {
-    const job = await api('/v1/jobs', { kind: 'rig', head_id: state.current.id, res: +$('res').value });
+    const job = await api('/v1/jobs', { kind: 'rig', head_id: state.current.id, res: +$('res').value,
+      face_model: $('face-model').value });
     state.job = job.id;
     const id = state.current.id;
     for (;;) {
@@ -1461,6 +1491,7 @@ $('build-body').addEventListener('click', async () => {
 api('/health').then((h) => {
   $('health').textContent = h.rig?.available ? `rig builder: ${h.rig.python}` : `rig builder unavailable: ${h.rig?.reason || '?'}`;
   state.speechAvailable = !!h.rig_speech?.available;
+  state.tissueAvailable = !!h.rig_soft_tissue?.available;
   state.emotionAvailable = !!h.rig_emotion?.available;
   state.bodyAvailable = !!h.body?.available;
   $('build-body').disabled = !!state.job || !state.current?.rig || !state.bodyAvailable;
@@ -1469,6 +1500,7 @@ api('/health').then((h) => {
   $('speech-auto-emotion').disabled = !state.emotionAvailable;
   $('speech-auto-emotion').title = state.emotionAvailable ? 'Extract coarse Japanese emotion tags from audio' : 'SenseVoiceSmall model or runtime missing';
   $('speech-generate').disabled = !state.speechAvailable;
+  $('soft-tissue').disabled = !state.tissueAvailable || !state.take;
   if (!h.rig_speech?.available) {
     $('speech-generate').disabled = true;
     $('speech-msg').textContent = 'Speech runner or model missing; see speech/README.md';

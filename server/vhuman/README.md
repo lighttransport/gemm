@@ -99,9 +99,10 @@ raw generated heads, fit metadata and maps remain beside each exported GLB.
 ## Facial rig
 
 `/rig` and `python3 -m server.vhuman.cli rig --head <id>` turn a fitted head
-into a rigged face (template topology fit with PyTorch, jaw/eye/teeth/tongue
-skeleton, 52 expression shapes, a linear rig evaluator, skinned glTF and
-UsdSkel for LightUSD's vchar and LightRig). It needs the interpreter in
+into a rigged face (GNM v3 topology by default, optional ICT-FaceKit Light or
+procedural topology, a jaw/eye/teeth/tongue skeleton, expression shapes, a
+linear rig evaluator, skinned glTF and UsdSkel for LightUSD's vchar and
+LightRig). It needs the interpreter in
 `requirements-rig.txt`. See [rig/README.md](rig/README.md).
 
 ## Tests and limitations

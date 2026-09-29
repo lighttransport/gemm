@@ -30,3 +30,15 @@ THE SOFTWARE.
 
 Other external dependencies are installed separately and retain their package
 licenses. No third-party model weights or generated images are shipped here.
+
+The optional GNM v3 model weights are fetched from
+https://huggingface.co/google/gnm-v3 (Apache-2.0). The pinned
+`v3_0/gnm_head.npz` SHA-256 is
+`61d78bbfb4ad8e0b38495804a4caef3214d3df00f8c3f68761e63b41ce3747eb`.
+The model card at https://huggingface.co/google/gnm-v3 declares Apache-2.0.
+
+ICT-FaceKit Light meshes and shapes are fetched from
+https://github.com/USC-ICT/ICT-FaceKit (MIT), pinned to commit
+`da5f95a607f5e6b37755b38d3385d7f2853732e5`. Its license is at
+https://github.com/USC-ICT/ICT-FaceKit/blob/master/LICENSE.
+The download cache and fitted user assets are excluded from this repository.

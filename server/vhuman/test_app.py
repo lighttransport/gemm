@@ -107,6 +107,12 @@ class ServerTest(unittest.TestCase):
         self.assertTrue(any(t["id"] == take["id"] for t in listing))
         self.assertEqual(self.status_of(take["urls"]["audio"]), 200)
         self.assertEqual(self.status_of(take["urls"]["animation"]), 200)
+        result_dir = rig / "takes" / take["id"]
+        (result_dir / "soft_tissue.usda").write_text("#usda 1.0\n")
+        (result_dir / "soft_tissue_report.json").write_text('{"format":"vhuman.soft_tissue.v1"}')
+        updated = self.app.service.take_summary(head_id, take["id"])
+        self.assertEqual(self.status_of(updated["urls"]["soft_tissue"]), 200)
+        self.assertEqual(self.status_of(updated["urls"]["soft_tissue_report"]), 200)
         request = urllib.request.Request(self.base + take["urls"]["audio"], headers={"Range": "bytes=0-9"})
         with urllib.request.urlopen(request) as response:
             self.assertEqual(response.status, 206)
@@ -128,6 +134,7 @@ class ServerTest(unittest.TestCase):
         self.assertTrue(health["ok"])
         self.assertTrue(health["qwen"]["available"])
         self.assertIn("rig_speech", health)
+        self.assertIn("rig_soft_tissue", health)
         self.assertIn("rig_emotion", health)
         schema = json.loads(self.get("/v1/eye/schema")[2])
         self.assertEqual(len(schema["presets"]), 12)

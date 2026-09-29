@@ -174,10 +174,11 @@ class App:
         self.service = EyeService(Path(args.work))
         from . import qwen, baseline
         from .head import pipeline as head_pipeline
-        from .rig import emotion as rig_emotion, exprdata, job as rig_job, speech as rig_speech
+        from .rig import emotion as rig_emotion, exprdata, job as rig_job, speech as rig_speech, soft_tissue
         from .body import job as body_job, motion as body_motion
         self.rig_job = rig_job
         self.rig_speech = rig_speech
+        self.soft_tissue = soft_tissue
         self.rig_emotion = rig_emotion
         self.body_job = body_job
         self.gpu = gpu
@@ -205,6 +206,8 @@ class App:
                 backend=getattr(args, "tts_backend", "auto"),
                 emotion_runner=getattr(args, "emotion_runner", None) or rig_emotion.DEFAULT_RUNNER,
                 emotion_model=getattr(args, "emotion_model", None) or rig_emotion.DEFAULT_MODEL),
+            "rig_soft_tissue": lambda req, prog, cancel: soft_tissue.soft_tissue_job(
+                self.service, req, prog, cancel, python=getattr(args, "rig_python", None)),
         })
 
     def health(self) -> dict:
@@ -218,6 +221,7 @@ class App:
                     getattr(self.args, "tts_model", None) or self.rig_speech.DEFAULT_MODEL,
                     getattr(self.args, "aligner", None) or self.rig_speech.DEFAULT_ALIGNER,
                     getattr(self.args, "tts_backend", "auto")),
+                "rig_soft_tissue": self.soft_tissue.availability(python=getattr(self.args, "rig_python", None)),
                 "rig_emotion": self.rig_emotion.availability(
                     getattr(self.args, "emotion_runner", None) or self.rig_emotion.DEFAULT_RUNNER,
                     getattr(self.args, "emotion_model", None) or self.rig_emotion.DEFAULT_MODEL),
