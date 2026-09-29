@@ -202,6 +202,16 @@ This prompt-specific allocation remains opt-in because its benefit on other
 requests has not been established. A separate prefill-balance control was
 slower at 31.40/26.56 tok/s with 83.9% prefill hits.
 
+`LLM_MOE_CPU_DECODE_REFILLS_PER_LAYER=0` keeps the prefill's resident cache
+fixed during decode and evaluates every cold route on the CPU. With the Q2
+cache profile above, two exact 1K/32 runs measured **31.06 and 31.75 decode
+tok/s**, both with hash `b9f867f533408c06`; decode expert H2D fell from
+1.17 GiB to zero. The second run reached 31.94 prefill tok/s, 85.3% decode
+cache hits, and 14.664 GiB peak VRAM. The switch remains opt-in because a
+longer continuation may churn away from the fixed resident set. At a 9,000
+MiB cache budget (`--moe-cache-mb 9000`) it reached 33.37 prefill / 30.80
+decode tok/s and used 15.468 GiB peak VRAM, leaving 836 MiB free.
+
 The diagnostic Q2_0 batch path now recognizes Q2_0 projections and supports
 cache layers with more than 128 slots. Q5_0 and IQ4_NL BF16 dequantizers let
 the wider batched body run. Batching through layer 3 reached 32.59 prefill

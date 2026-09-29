@@ -27113,8 +27113,13 @@ static void forward_moe_ffn(hip_llm_runner *r, hip_layer *cl) {
         int miss_count = 0, pipe_hit_count = 0;
         const char *refill_env = getenv("LLM_MOE_CPU_REFILLS_PER_LAYER");
         int cpu_refill_limit = refill_env ? atoi(refill_env) : 1;
+        if (r->decode_mode) {
+            const char *decode_refill_env = getenv("LLM_MOE_CPU_DECODE_REFILLS_PER_LAYER");
+            if (decode_refill_env) cpu_refill_limit = atoi(decode_refill_env);
+        }
         /* There is one pending slot/event per layer. Multiple simultaneous
          * refills would overwrite that slot's identity and H2D map source. */
+        if (cpu_refill_limit < 0) cpu_refill_limit = 0;
         if (cpu_refill_limit > 1) cpu_refill_limit = 1;
         if (cl->moe_pending_slot >= 0) cpu_refill_limit = 0;
         int cpu_refill_count = 0;
