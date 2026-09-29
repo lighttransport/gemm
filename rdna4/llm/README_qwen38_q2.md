@@ -133,6 +133,11 @@ On this card, `sudo rocm-smi --setmclk 5` selects the highest listed memory
 level while keeping performance mode manual. The benchmark launcher does not
 change GPU clock settings.
 
+After the host-side GPU clock reset, the same device-memory probe measured
+**568.21 GiB/s** (16 copies of 256 MiB). `rocm-smi` could not report a clock
+or performance level at that point, but HIP completed the probe and the model
+benchmark. This is 13.9 times the earlier measured device bandwidth.
+
 The Qwen SSD profile now uses the existing vectorized F16 matvec kernel for
 its F16 projections. `LLM_QWEN4_F16_LLAMA=0` restores the original kernel;
 an explicit `LLM_DECODE_WMMA=1` also retains its own path. On the 1K prompt,
@@ -158,6 +163,23 @@ still reported 96 MHz memory clock in manual mode. This is the current
 throughput result, well below the 1,200/60 tok/s target.
 The standard build also passed the same combined profile at 10.38/7.03
 tok/s and the identical hash, so a separate HIPBLASLt build is unnecessary.
+
+After the clock reset, that exact standard-build command reached **31.93
+prefill / 27.60 decode tok/s**, with the same 32-token hash
+`b9f867f533408c06`, 14.646 GiB peak VRAM, and `Result: PASS`. The prefill
+processed 1,024 tokens in 32.072 s; decode generated 32 tokens in 1.159 s.
+The MoE cache hit rate was 85.6% during prefill and 86.6% during decode, with
+35.77 GiB and 1.13 GiB of host-to-device expert transfers respectively.
+The clock reset improved the two rates by 3.08 and 3.93 times, but the
+1,200/60 tok/s targets remain unmet. The current Qwen4 attention batch cap
+is layer 2, whereas the first attention layer in this model is layer 3; the
+SSM batch gate is also off. Thus the layer bodies still run token by token.
+The batch path amortizes MoE work, but batching the layer bodies requires
+numerical parity work before it can replace this path.
+`LLM_DECODE_WMMA=1` on the reset clock measured 30.44/27.03 tok/s and kept
+the same hash, so it is not a speed improvement for this workload. Logs are
+`tmp/qwen38_q2_stock_batch_gpu_reset1024.log` and
+`tmp/qwen38_q2_stock_batch_gpu_reset_wmma1024.log`.
 
 ```sh
 LLM_BMAX=1024 LLM_QWEN4_EXACT_GPU_TOPK=1 \
