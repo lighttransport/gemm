@@ -10857,6 +10857,30 @@ static const char *hip_kernel_source =
 "    size_t out_idx = (size_t)row * n_cols + c;\n"
 "    dst[out_idx] = f32_to_bf16(val);\n"
 "}\n"
+"/* Native Q5_0: [d(f16)][qh(4)][qs(16)], 32 weights per block. */\n"
+"__global__ void dequant_q5_0_to_bf16(bf16_raw *dst, const unsigned char *mat,\n"
+"                                       int n_rows, int n_cols) {\n"
+"    int row=blockIdx.x, c=blockIdx.y*256+threadIdx.x; if(c>=n_cols)return;\n"
+"    int nb=n_cols/32, blk=c>>5, w=c&31;\n"
+"    const unsigned char *bp=mat+(size_t)row*nb*22+(size_t)blk*22;\n"
+"    float d=half_to_float(*(const half_raw *)bp);\n"
+"    unsigned int qh=(unsigned int)bp[2]|((unsigned int)bp[3]<<8)|\n"
+"                    ((unsigned int)bp[4]<<16)|((unsigned int)bp[5]<<24);\n"
+"    const unsigned char *qs=bp+6; int q;\n"
+"    if(w<16) q=(qs[w]&15)|(((qh>>w)&1)<<4);\n"
+"    else { int j=w-16; q=(qs[j]>>4)|(((qh>>(j+16))&1)<<4); }\n"
+"    dst[(size_t)row*n_cols+c]=f32_to_bf16(d*(float)(q-16));\n"
+"}\n"
+"__global__ void dequant_iq4_nl_to_bf16(bf16_raw *dst, const unsigned char *mat,\n"
+"                                        int n_rows, int n_cols) {\n"
+"    int row=blockIdx.x, c=blockIdx.y*256+threadIdx.x; if(c>=n_cols)return;\n"
+"    int nb=n_cols/32, blk=c>>5, w=c&31;\n"
+"    const unsigned char *bp=mat+(size_t)row*nb*18+(size_t)blk*18;\n"
+"    float d=half_to_float(*(const half_raw *)bp);\n"
+"    const unsigned char *qs=bp+2;\n"
+"    int q=w<16 ? (qs[w]&15) : (qs[w-16]>>4);\n"
+"    dst[(size_t)row*n_cols+c]=f32_to_bf16(d*(float)kvalues_iq4nl_dev[q]);\n"
+"}\n"
 "__global__ void dequant_q5_1_to_bf16(bf16_raw *dst, const unsigned char *mat,\n"
 "                                       int n_rows, int n_cols) {\n"
 "    int row=blockIdx.x, c=blockIdx.y*256+threadIdx.x; if(c>=n_cols)return;\n"
@@ -14560,6 +14584,8 @@ struct hip_llm_runner {
     /* K-quant batched-prefill dequant kernels (write BF16 to a staging buffer) */
     hipFunction_t fn_dequant_q8_0_to_bf16;
     hipFunction_t fn_dequant_q4_0_to_bf16;
+    hipFunction_t fn_dequant_q5_0_to_bf16;
+    hipFunction_t fn_dequant_iq4_nl_to_bf16;
     hipFunction_t fn_dequant_q5_1_to_bf16;
     hipFunction_t fn_dequant_q2_K_to_bf16;
     hipFunction_t fn_dequant_q2_0_to_bf16;
@@ -14777,7 +14803,7 @@ struct hip_llm_runner {
     size_t qwen4_stage_q8_bytes;
     int qwen4_stage_task_capacity;
     hipStream_t qwen4_prefill_copy_stream;
-    qwen4_moe_fence qwen4_prefill_cache_fence[128];
+    qwen4_moe_fence qwen4_prefill_cache_fence[512];
     void *qwen4_prefill_q8_stage;
     void *qwen4_nextn_eh_w, *qwen4_nextn_enorm_w, *qwen4_nextn_hnorm_w;
     void *qwen4_nextn_hc_head_norm_w, *qwen4_nextn_hc_head_down_w, *qwen4_nextn_hc_head_up_w;
@@ -15744,6 +15770,8 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(convert_f16_to_bf16);
     GET_FUNC(dequant_q8_0_to_bf16);
     GET_FUNC(dequant_q4_0_to_bf16);
+    GET_FUNC(dequant_q5_0_to_bf16);
+    GET_FUNC(dequant_iq4_nl_to_bf16);
     GET_FUNC(dequant_q5_1_to_bf16);
     GET_FUNC(dequant_q2_K_to_bf16);
     GET_FUNC(dequant_q2_0_to_bf16);
@@ -19696,7 +19724,19 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
                     };
                     const char *prefill_balance = getenv("LLM_QWEN4_PREFILL_CACHE_BALANCE");
                     const char *decode_balance = getenv("LLM_QWEN4_DECODE_CACHE_BALANCE");
-                    if (decode_balance && atoi(decode_balance) != 0) {
+                    const char *q2_profile = getenv("LLM_QWEN4_Q2_CACHE_PROFILE");
+                    if (r->qwen4_ple_ssd && q2_profile && atoi(q2_profile) != 0) {
+                        /* Exact 1K Q2_0 route replay, one refill per layer/token.
+                         * Keep this opt-in: the distribution comes from one
+                         * prompt and may not improve other workloads. */
+                        static const unsigned char q2_target[48] = {
+                            232,207,180,115,121,148,175,174,134,124,168,134,
+                            151,175,146,58,87,119,164,117,106,136,164,113,
+                            129,118,160,117,144,150,131,62,100,127,153,110,
+                            115,121,165,68,70,75,112,75,98,113,110,119
+                        };
+                        w = q2_target[l];
+                    } else if (decode_balance && atoi(decode_balance) != 0) {
                         /* 256K decode traces show the recurrent/deep band
                          * (31, 40, 47 and neighbors) churning while the
                          * earliest layers stay above 95% hit.  Move a fixed
@@ -24668,6 +24708,24 @@ static inline int launch_dequant_q4_0_to_bf16(hip_llm_runner *r,
     return 0;
 }
 
+static inline int launch_dequant_q5_0_to_bf16(hip_llm_runner *r, void *dst,
+                                               void *mat, int n_rows, int n_cols) {
+    if ((n_cols % 32) != 0) return -1;
+    void *args[] = { &dst, &mat, &n_rows, &n_cols };
+    hipError_t e = LAUNCH(r->fn_dequant_q5_0_to_bf16, n_rows, (n_cols+255)/256, 1,
+                          256, 1, 1, 0, r->stream, args);
+    return e == hipSuccess ? 0 : -1;
+}
+
+static inline int launch_dequant_iq4_nl_to_bf16(hip_llm_runner *r, void *dst,
+                                                 void *mat, int n_rows, int n_cols) {
+    if ((n_cols % 32) != 0) return -1;
+    void *args[] = { &dst, &mat, &n_rows, &n_cols };
+    hipError_t e = LAUNCH(r->fn_dequant_iq4_nl_to_bf16, n_rows, (n_cols+255)/256, 1,
+                          256, 1, 1, 0, r->stream, args);
+    return e == hipSuccess ? 0 : -1;
+}
+
 static inline int launch_dequant_q5_1_to_bf16(hip_llm_runner *r, void *dst,
                                                void *mat, int n_rows, int n_cols) {
     if ((n_cols % 32) != 0) return -1;
@@ -24697,11 +24755,14 @@ static inline void launch_convert_f16_to_bf16(hip_llm_runner *r, void *dst,
 /* True if `type` has a per-call dequant kernel suitable for the batched path. */
 static inline int batch_qtype_ok(int type) {
     return type == GGML_TYPE_F32     || type == GGML_TYPE_F16 ||
-           type == GGML_TYPE_Q8_0    || type == GGML_TYPE_Q5_1 ||
-           type == GGML_TYPE_Q2_K    || type == GGML_TYPE_Q3_K ||
+           type == GGML_TYPE_Q8_0    || type == GGML_TYPE_Q5_0 ||
+           type == GGML_TYPE_Q5_1 ||
+           type == GGML_TYPE_Q2_K    || type == GGML_TYPE_Q2_0 ||
+           type == GGML_TYPE_Q3_K ||
            type == GGML_TYPE_Q4_K    || type == GGML_TYPE_Q5_K ||
            type == GGML_TYPE_Q6_K    || type == GGML_TYPE_IQ3_XXS ||
-           type == GGML_TYPE_IQ4_XS  || type == GGML_TYPE_IQ2_XS  ||
+           type == GGML_TYPE_IQ4_XS  || type == GGML_TYPE_IQ4_NL  ||
+           type == GGML_TYPE_IQ2_XS  ||
            type == GGML_TYPE_IQ2_S   || type == GGML_TYPE_IQ3_S   ||
            type == GGML_TYPE_IQ1_S   || type == GGML_TYPE_IQ1_M   ||
            type == GGML_TYPE_TQ1_0   ||
@@ -24772,6 +24833,12 @@ static inline void *get_bf16_weight(hip_llm_runner *r, void *raw_w, void *bf16_w
             return r->d_wbuf_bf16;
         case GGML_TYPE_Q4_0:
             if (launch_dequant_q4_0_to_bf16(r, r->d_wbuf_bf16, raw_w, n_rows, n_cols) != 0) return NULL;
+            return r->d_wbuf_bf16;
+        case GGML_TYPE_Q5_0:
+            if (launch_dequant_q5_0_to_bf16(r, r->d_wbuf_bf16, raw_w, n_rows, n_cols) != 0) return NULL;
+            return r->d_wbuf_bf16;
+        case GGML_TYPE_IQ4_NL:
+            if (launch_dequant_iq4_nl_to_bf16(r, r->d_wbuf_bf16, raw_w, n_rows, n_cols) != 0) return NULL;
             return r->d_wbuf_bf16;
         case GGML_TYPE_Q5_1:
             if (launch_dequant_q5_1_to_bf16(r, r->d_wbuf_bf16, raw_w, n_rows, n_cols) != 0) return NULL;
@@ -30087,14 +30154,14 @@ static int qwen4_prefill_copies_init(hip_llm_runner *r) {
     if (r->qwen4_prefill_copy_stream) return 0;
     if (hipStreamCreateWithFlags(&r->qwen4_prefill_copy_stream,
                                 hipStreamNonBlocking) != hipSuccess) return -1;
-    for (int i = 0; i < 128; ++i)
+    for (int i = 0; i < 512; ++i)
         if (qwen4_moe_fence_init(&r->qwen4_prefill_cache_fence[i])) goto fail;
     if (r->moe_q8_stage_bytes &&
         hipMalloc(&r->qwen4_prefill_q8_stage, r->moe_q8_stage_bytes) != hipSuccess)
         goto fail;
     return 0;
 fail:
-    for (int i = 0; i < 128; ++i)
+    for (int i = 0; i < 512; ++i)
         qwen4_moe_fence_free(&r->qwen4_prefill_cache_fence[i]);
     hipStreamDestroy(r->qwen4_prefill_copy_stream);
     r->qwen4_prefill_copy_stream = NULL;
@@ -30116,7 +30183,7 @@ static int qwen4_prefill_copies_drain(hip_llm_runner *r) {
             r->qwen4_forward_error = 1;
             return -1;
         }
-        for (int i = 0; i < 128; ++i)
+        for (int i = 0; i < 512; ++i)
             qwen4_moe_fence_reset(&r->qwen4_prefill_cache_fence[i]);
         for (int i = 0; i < 2; ++i)
             qwen4_moe_fence_reset(&r->qwen4_stage_bank[i].fence);
@@ -30315,7 +30382,7 @@ static void qwen4_fingerprint(hip_llm_runner *r, int stage, void *src, int n) {
 static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
     int n_embd = r->n_embd, ne = r->n_experts, K = r->n_experts_used;
     int eff = r->expert_ff, sff = r->shared_expert_ff;
-    if (r->is_qwen4exp && (ne > 512 || cl->moe_cache_slots > 128 ||
+    if (r->is_qwen4exp && (ne > 512 || cl->moe_cache_slots > 512 ||
                             qwen4_prefill_copies_init(r))) return -1;
     if (ne > 1024) return -1;  /* cursor[] cap */
     /* 1. Router GEMM: [M,ne] = xnorm[M,n_embd] x Wg[ne,n_embd] (Wg is F32 -> bf16). */
@@ -35943,7 +36010,7 @@ void hip_llm_free(hip_llm_runner *r) {
     if (r->d_hc_low_batch_bf16)    hipFree(r->d_hc_low_batch_bf16);
     if (r->d_hc_inject_batch)      hipFree(r->d_hc_inject_batch);
     for (int i = 0; i < 2; ++i) qwen4_moe_bank_free(&r->qwen4_stage_bank[i]);
-    for (int i = 0; i < 128; ++i)
+    for (int i = 0; i < 512; ++i)
         qwen4_moe_fence_free(&r->qwen4_prefill_cache_fence[i]);
     if (r->qwen4_prefill_q8_stage) hipFree(r->qwen4_prefill_q8_stage);
     if (r->qwen4_prefill_copy_stream) hipStreamDestroy(r->qwen4_prefill_copy_stream);

@@ -181,6 +181,35 @@ the same hash, so it is not a speed improvement for this workload. Logs are
 `tmp/qwen38_q2_stock_batch_gpu_reset1024.log` and
 `tmp/qwen38_q2_stock_batch_gpu_reset_wmma1024.log`.
 
+An extended bandwidth probe measured 26.36 GiB/s for 256 MiB pinned H2D
+copies, but expert-sized 512 KiB copies reached 20.58 GiB/s pinned and
+14.09 GiB/s pageable. The exact 1K run copied 35.77 GiB of experts, which
+would take roughly 2.5 s at the measured pageable rate if serialized. The
+1200 tok/s prefill goal allows only 0.85 s for the whole 1K prompt, so the
+current expert traffic alone exceeds that budget. Kernel tracing of a
+128-token prompt plus eight decode tokens recorded 245,530 dispatches, with
+`matvec_f16_llama_f32` the largest GPU kernel cost. The trace includes setup;
+it is evidence of the scalar launch count, not a phase-isolated timing.
+
+`LLM_QWEN4_Q2_CACHE_PROFILE=1` selects an opt-in expert-cache allocation
+derived from replaying the exact 1K prompt's routed IDs. The replay matched
+the runner's 420,817 cache hits at the existing 6,190-slot allocation and
+projected 427,102 hits with the same slot total. The measured run reached
+**32.58 prefill / 28.60 decode tok/s**, retained hash `b9f867f533408c06`,
+and used 14.664 GiB peak VRAM. Hits rose to 426,977 (86.9%) but H2D was
+still 35.68 GiB: one cold expert is refilled on almost every layer/token.
+This prompt-specific allocation remains opt-in because its benefit on other
+requests has not been established. A separate prefill-balance control was
+slower at 31.40/26.56 tok/s with 83.9% prefill hits.
+
+The diagnostic Q2_0 batch path now recognizes Q2_0 projections and supports
+cache layers with more than 128 slots. Q5_0 and IQ4_NL BF16 dequantizers let
+the wider batched body run. Batching through layer 3 reached 32.59 prefill
+tok/s on 1K but changed the output hash and stopped after 18 decoded tokens.
+On a 128-token logit comparator, the layer-3 path had relative L2 difference
+0.345 from scalar. Scalar MoE reduced it to 0.058, and scalar projections to
+0.048; wider batching also changed the hash. These gates remain diagnostic.
+
 ```sh
 LLM_BMAX=1024 LLM_QWEN4_EXACT_GPU_TOPK=1 \
   LLM_QWEN4_EXACT_PRE_GRAPHS=1 \
