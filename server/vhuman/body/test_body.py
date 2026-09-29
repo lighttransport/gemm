@@ -1,14 +1,21 @@
 """Small checks for the body/face attachment and sparse morph import."""
 from __future__ import annotations
 
+import tempfile
+import threading
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
+from PIL import Image
 
 from ..eye.glb import GLB
 from ..rig.gltf import RigGLB
+from ..service import ROOT
 from .assemble import _joint_entry, _similarity
 from .garments import _fit_extents
+from . import job
 
 
 class BodyGeometryTest(unittest.TestCase):
@@ -57,6 +64,52 @@ class BodyGeometryTest(unittest.TestCase):
         target_top = np.percentile(target[:, 1], 95)
         self.assertLess(abs(np.percentile(fitted[:, 1], 95) - target_top),
                         abs(np.percentile(median_fit[:, 1], 95) - target_top))
+
+
+class GarmentJobTest(unittest.TestCase):
+    def test_distinct_garment_outputs_and_configured_assets(self):
+        (ROOT / "tmp").mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=ROOT / "tmp") as directory:
+            out = Path(directory)
+            Image.new("RGBA", (64, 64), (100, 80, 60, 255)).save(out / "body_image.png")
+            model = out / "assets" / "sam3.safetensors"
+            model.parent.mkdir()
+            model.touch()
+            bpe = out / "tokenizer"
+            bpe.mkdir()
+            (bpe / "vocab.json").touch()
+            (bpe / "merges.txt").touch()
+            commands = []
+
+            def segment(cmd, cancel):
+                commands.append(cmd)
+                np.save(cmd[cmd.index("-o") + 1], np.ones((1, 64, 64), dtype=bool))
+
+            def reconstruct(folder, image, name, quality, mock, cancel):
+                (folder / name).touch()
+                return {"status": "ok"}
+
+            names = ["コート", "シャツ", "shirt", "shirt"]
+            with patch.object(job.gpu, "gpu_status", return_value=None), \
+                 patch.object(job, "_binary", return_value=Path("sam3")), \
+                 patch.object(job, "_run", side_effect=segment), \
+                 patch.object(job, "_pixal", side_effect=reconstruct):
+                records = job._garments(out, names, False, threading.Event(), lambda *_: None,
+                                        model, bpe)
+
+            self.assertEqual([entry["prompt"] for entry in records], names)
+            self.assertTrue(all(entry["status"] == "reconstructed" for entry in records))
+            self.assertEqual(len({entry["name"] for entry in records}), len(names))
+            self.assertEqual(len({entry["glb"] for entry in records}), len(names))
+            self.assertEqual(len({entry["mask"] for entry in records}), len(names))
+            self.assertEqual(len({cmd[cmd.index("-o") + 1] for cmd in commands}), len(names))
+            for cmd, entry in zip(commands, records):
+                self.assertEqual(cmd[1], str(model))
+                self.assertEqual(cmd[cmd.index("--vocab") + 1], str(bpe / "vocab.json"))
+                self.assertEqual(cmd[cmd.index("--merges") + 1], str(bpe / "merges.txt"))
+                self.assertTrue((out / entry["glb"]).is_file())
+                self.assertTrue((out / entry["mask"]).is_file())
+                self.assertTrue((out / f"garment_{entry['name']}_input.png").is_file())
 
 
 if __name__ == "__main__":

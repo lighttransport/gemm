@@ -267,7 +267,8 @@ def cmd_body(args) -> dict:
                               "qwen_preset": args.qwen_preset,
                               "garments": [x.strip() for x in args.garments.split(",") if x.strip()]},
                              _progress, threading.Event(), python=args.qwen_python,
-                             rig_python=args.rig_python, model_dir=args.sam3d_body_model, mock=args.mock)
+                             rig_python=args.rig_python, model_dir=args.sam3d_body_model,
+                             sam3_model=args.sam3_model, clip_bpe=args.clip_bpe, mock=args.mock)
 
 
 def cmd_body_motion(args) -> dict:
@@ -344,13 +345,18 @@ def cmd_bench(args) -> dict:
 
 
 def main(argv=None) -> int:
+    from .body import job as body_job
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--work", default=str(WORK))
     ap.add_argument("--qwen-python", default=str(DEFAULT_QWEN_PY) if DEFAULT_QWEN_PY.exists() else None)
     ap.add_argument("--mock", action="store_true", help="mock Qwen and Pixal3D (no GPU)")
     default_rig = ROOT / "tmp/vhuman-rig-venv/bin/python"
     ap.add_argument("--rig-python", default=str(default_rig) if default_rig.exists() else None)
-    ap.add_argument("--sam3d-body-model", default="/mnt/nvme01/models/sam3d-body")
+    ap.add_argument("--sam3d-body-model", default=str(body_job.MODEL_DIR))
+    ap.add_argument("--sam3-model", default=str(body_job.SAM3_MODEL),
+                    help="optional SAM 3 garment segmentation checkpoint")
+    ap.add_argument("--clip-bpe", default=str(body_job.CLIP_BPE),
+                    help="directory containing garment tokenizer vocab.json and merges.txt")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def with_params(sp):

@@ -215,27 +215,33 @@ def _pixal(out: Path, image: Path, name: str, quality: str, mock: bool, cancel) 
         return baseline.run_pixal3d(image, target, out / (name + ".work"), quality, cancel)
 
 
-def _garments(out: Path, names: list[str], mock: bool, cancel, progress) -> list[dict]:
+def _garments(out: Path, names: list[str], mock: bool, cancel, progress,
+              sam3_model: Path = SAM3_MODEL, clip_bpe: Path = CLIP_BPE) -> list[dict]:
     if not names:
         (out / "garments.json").write_text("[]")
         return []
     source = np.asarray(Image.open(out / "body_image.png").convert("RGBA"))
     use_cuda = gpu.gpu_status() is not None and not mock
+    sam3_model = Path(sam3_model)
+    clip_bpe = Path(clip_bpe)
     entries = []
     for i, name in enumerate(names):
-        slug = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")[:40]
+        stem = re.sub(r"[^a-z0-9]+", "_", name.casefold()).strip("_")[:32] or "item"
+        slug = f"{i + 1:02d}_{stem}"
         record = {"name": slug, "prompt": name}
         try:
             if mock:
                 raise ValueError("segmentation skipped in mock mode")
-            if not SAM3_MODEL.is_file() or not (CLIP_BPE / "vocab.json").is_file():
-                raise ValueError("optional SAM 3 garment segmentation weights or tokenizer missing")
+            required = (sam3_model, clip_bpe / "vocab.json", clip_bpe / "merges.txt")
+            missing = [str(path) for path in required if not path.is_file()]
+            if missing:
+                raise ValueError("optional SAM 3 garment assets missing: " + ", ".join(missing))
             slot_start = .51 + .24 * i / len(names)
             progress(slot_start, f"segmenting {name}")
             mask_npy = out / f"garment_{slug}_masks.npy"
-            cmd = [str(_binary("sam3", use_cuda, cancel)), str(SAM3_MODEL), str(out / "body_image.png"),
+            cmd = [str(_binary("sam3", use_cuda, cancel)), str(sam3_model), str(out / "body_image.png"),
                    "--phrase", name, "-o", str(mask_npy),
-                   "--vocab", str(CLIP_BPE / "vocab.json"), "--merges", str(CLIP_BPE / "merges.txt")]
+                   "--vocab", str(clip_bpe / "vocab.json"), "--merges", str(clip_bpe / "merges.txt")]
             if use_cuda:
                 with gpu.device_session(2048, cancel):
                     _run(cmd, cancel)
@@ -271,7 +277,7 @@ def _garments(out: Path, names: list[str], mock: bool, cancel, progress) -> list
 
 
 def body_job(service, request: dict, progress, cancel, *, python=None, rig_python=None,
-             model_dir=MODEL_DIR, mock=False) -> dict:
+             model_dir=MODEL_DIR, sam3_model=SAM3_MODEL, clip_bpe=CLIP_BPE, mock=False) -> dict:
     head_id = request.get("head_id")
     head = service.head_file(head_id, "head.json").parent
     for name in ("portrait.png", "rig/rig.glb", "rig/rig.json", "rig/features.json"):
@@ -280,6 +286,8 @@ def body_job(service, request: dict, progress, cancel, *, python=None, rig_pytho
         else:
             service.head_file(head_id, name)
     model_dir = Path(model_dir)
+    sam3_model = Path(sam3_model)
+    clip_bpe = Path(clip_bpe)
     rig_python = Path(rig_python) if rig_python else DEFAULT_RIG_PYTHON
     avail = availability(model_dir, rig_python, mock)
     if not avail["available"]:
@@ -315,7 +323,7 @@ def body_job(service, request: dict, progress, cancel, *, python=None, rig_pytho
             raise
         except (RuntimeError, OSError, ValueError) as exc:
             pixal = {"status": "fallback_photo", "reason": str(exc)}
-        garment_report = _garments(out, names, mock, cancel, progress)
+        garment_report = _garments(out, names, mock, cancel, progress, sam3_model, clip_bpe)
         progress(.77, "assembling MHR body and facial rig")
         res = {"preview": 1024, "standard": 2048, "high": 4096}[quality]
         cmd = [str(rig_python), "-m", "server.vhuman.body.assemble", str(head),
@@ -330,7 +338,8 @@ def body_job(service, request: dict, progress, cancel, *, python=None, rig_pytho
         report["garment_attempts"] = garment_report
         report["provenance"] = {"head_id": head_id, "sam3d_body_model_dir": str(model_dir),
                                 "mhr_model": str(model_dir / "dinov3/assets/mhr_model.pt"),
-                                "sam3_model": str(SAM3_MODEL) if names else None}
+                                "sam3_model": str(sam3_model) if names else None,
+                                "clip_bpe": str(clip_bpe) if names else None}
         report["total_seconds"] = round(time.perf_counter() - started, 2)
         (out / "body_report.json").write_text(json.dumps(report, indent=1, default=float))
         published = head / "body"

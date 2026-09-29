@@ -196,7 +196,9 @@ class App:
                                                              python=getattr(args, "rig_python", None), mock=args.mock),
             "body": lambda req, prog, cancel: body_job.body_job(self.service, req, prog, cancel,
                         python=args.qwen_python, rig_python=getattr(args, "rig_python", None),
-                        model_dir=getattr(args, "sam3d_body_model", body_job.MODEL_DIR), mock=args.mock),
+                        model_dir=getattr(args, "sam3d_body_model", body_job.MODEL_DIR),
+                        sam3_model=getattr(args, "sam3_model", body_job.SAM3_MODEL),
+                        clip_bpe=getattr(args, "clip_bpe", body_job.CLIP_BPE), mock=args.mock),
             "body_motion": lambda req, prog, cancel: body_motion.fit(self.service, req, prog, cancel,
                         rig_python=getattr(args, "rig_python", None) or body_job.DEFAULT_RIG_PYTHON,
                         model_dir=getattr(args, "sam3d_body_model", body_job.MODEL_DIR), mock=args.mock),
@@ -413,6 +415,7 @@ def make_handler(app: App, quiet: bool = False):
 
 
 def main(argv=None) -> int:
+    from .body import job as body_job
     ap = argparse.ArgumentParser(description="Virtual-human eye demo server")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8790)
@@ -424,8 +427,12 @@ def main(argv=None) -> int:
     default_rig = ROOT / "tmp/vhuman-rig-venv/bin/python"
     ap.add_argument("--rig-python", default=str(default_rig) if default_rig.exists() else None,
                     help="interpreter for the facial rig builder (numpy, scipy, torch)")
-    ap.add_argument("--sam3d-body-model", default="/mnt/nvme01/models/sam3d-body",
+    ap.add_argument("--sam3d-body-model", default=str(body_job.MODEL_DIR),
                     help="local SAM 3D Body checkpoint directory")
+    ap.add_argument("--sam3-model", default=str(body_job.SAM3_MODEL),
+                    help="optional SAM 3 garment segmentation checkpoint")
+    ap.add_argument("--clip-bpe", default=str(body_job.CLIP_BPE),
+                    help="directory containing garment tokenizer vocab.json and merges.txt")
     ap.add_argument("--tts-model", default=None, help="Qwen3-TTS model directory for rig_speech jobs")
     ap.add_argument("--aligner", default=None, help="ja_align.safetensors for rig_speech jobs")
     ap.add_argument("--tts-backend", choices=("auto", "cpu", "cuda"), default="auto")
