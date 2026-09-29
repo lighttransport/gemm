@@ -50,11 +50,13 @@ int hip_llm_qwen4_exact_enable(hip_llm_runner *r) {
     r->qwen4_coding_profile=0;
     if (!r->qwen4_batched_prefill) hip_llm_set_batched_path(r,0);
     if (r->qwen4_batched_prefill > 0 && r->moe_prefill_batched &&
-        (!getenv("LLM_MOE_PREFILL_SCALAR") ||
-         atoi(getenv("LLM_MOE_PREFILL_SCALAR")) == 0) && r->verbose >= 1)
-        fprintf(stderr,
-                "hip_llm: Qwen4 grouped-MoE prefill is experimental: "
-                "logits can differ from scalar --qwen4-exact output\n");
+        r->verbose >= 1) {
+        const char *scalar_moe = getenv("LLM_MOE_PREFILL_SCALAR");
+        if (!scalar_moe || atoi(scalar_moe) == 0)
+            fprintf(stderr,
+                    "hip_llm: Qwen4 grouped-MoE prefill is experimental: "
+                    "logits can differ from scalar --qwen4-exact output\n");
+    }
     return 0;
 fail:
     hllm_qwen4_qsa_free(r);

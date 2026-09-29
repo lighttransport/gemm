@@ -27,7 +27,8 @@ scaled INT8 storage.
 Cached Q2_0 experts run with two grouped GPU launches per layer, one for
 gate/up and one for down projection. CPU misses use an AVX2 dot product that
 transposes each activation block once for reuse across expert rows. Both paths
-keep the exact top-ten routing and the same greedy output sequence.
+evaluate all ten selected experts. CPU and GPU expert arithmetic can produce
+different logits, even when a measured greedy sequence stays the same.
 
 The launcher defaults to scalar prefill and disables host registration and
 the older mapped miss path. The cache capacity depends on free VRAM at load
@@ -49,6 +50,37 @@ six-token prefill plus two-token decode with 17.3%/29.2% expert-cache hits.
 The cached and CPU-only expert runs produced the same sampled sequence hash.
 These short-run rates do not predict long-context throughput under a different
 GPU load.
+
+## Current 1K results
+
+With `xmrig` stopped and the GPU clocks restored on an RX 9070 XT (16 GiB)
+and Ryzen 9 3950X, the measured profiles are:
+
+| Profile | Prefill tok/s | Decode tok/s | Output check | Peak VRAM |
+| --- | ---: | ---: | --- | ---: |
+| Scalar, F16 KV, 10,200 MiB cache, 32 decode | 34.67 | 37.35 | Scalar greedy hash | 16,004 MiB |
+| Same scalar profile, 128 decode | 34.43 | 36.18 | Scalar greedy hash | 16,004 MiB |
+| Batched HC with scalar MoE, 9,000 MiB cache, 32 decode | 38.60 | 33.49 | Bitwise logits versus scalar at the same cache budget | 15,522 MiB |
+| Staged grouped MoE, 9,000 MiB cache, 32 decode | 70.62 | 32.65 | Matching greedy hash; logits differ | 15,872 MiB |
+
+For the first scalar profile, run:
+
+```sh
+mkdir -p tmp
+head -c 5000 common/ggml_dequant.h > tmp/qwen38_1k_prompt.txt
+OMP_NUM_THREADS=16 OMP_PROC_BIND=close OMP_PLACES=cores \
+  OMP_WAIT_POLICY=ACTIVE LLM_QWEN4_Q2_CACHE_PROFILE=1 \
+  LLM_QWEN4_EXACT_GPU_TOPK=1 LLM_MOE_CPU_DECODE_REFILLS_PER_LAYER=0 \
+  rdna4/llm/run_qwen38_flash_next_q2_rocm.sh --bench \
+  --prompt-file tmp/qwen38_1k_prompt.txt --prefill-len 1024 -n 1024 \
+  --decode 32 -s 1152 --moe-cache-mb 10200 --qwen4-kv-quant none
+```
+
+The 1,200 prefill / 60 decode tok/s goal was not reached. Current grouped
+Q2 kernels alone take 2.33 s for 1K tokens, while the prefill target permits
+0.85 s overall. A 32-token exact decode trace contains about 21 ms of GPU
+kernels per token before CPU and host work. The sections below give the
+measurements and quality limits behind these profiles.
 
 ## 1K prompt measurement
 
@@ -155,12 +187,12 @@ nonblocking Q2 cache-promotion experiment kept the 32-token hash but did not
 improve the short run and lowered cache hits, so the required promotion wait
 remains in place.
 
-The fastest parity-checked profile combines the opt-in 1K batch prefill with
+An earlier parity-checked profile combined the opt-in 1K batch prefill with
 the default vectorized F16 kernel and both exact options above. It measured
 **10.27 prefill / 7.07 decode tok/s** for 1,024 prompt and 32 decode tokens,
 with the same `b9f867f533408c06` hash and 14.65 GiB peak VRAM use. The GPU
-still reported 96 MHz memory clock in manual mode. This is the current
-throughput result, well below the 1,200/60 tok/s target.
+still reported 96 MHz memory clock in manual mode. This result was well
+below the 1,200/60 tok/s target.
 The standard build also passed the same combined profile at 10.38/7.03
 tok/s and the identical hash, so a separate HIPBLASLt build is unnecessary.
 
@@ -262,9 +294,9 @@ with the exact hash `b9f867f533408c06`.
 The opt-in `LLM_QWEN4_BATCH_SCALAR_STATE_FFN=1` path runs every attention,
 SSM, and PLE state transition in token order, then batches each layer's MoE
 FFN. The F16 HC batch and bounded router tile retain the scalar reference's
-greedy sequence on the measured 1K prompt. The
-Q2_0 stage can group up to eight assignments for one expert into a weight-
-reuse tile; the per-layer selected-expert check matched all 48 sampled gate/up
+greedy sequence on the measured 1K prompt. The Q2_0 stage can group up to
+eight assignments for one expert into a weight reuse tile; the per-layer
+selected-expert check matched all 48 sampled gate/up
 and down outputs bit for bit with an eight-assignment tile. A four-assignment
 tile measured best in the exact 1K/32 run:
 
