@@ -174,7 +174,7 @@ class App:
         self.service = EyeService(Path(args.work))
         from . import qwen, baseline
         from .head import pipeline as head_pipeline
-        from .rig import emotion as rig_emotion, exprdata, job as rig_job, speech as rig_speech, soft_tissue
+        from .rig import emotion as rig_emotion, exprdata, job as rig_job, speech as rig_speech, soft_tissue, soft_deformer, video_fit
         from .body import job as body_job, motion as body_motion
         self.rig_job = rig_job
         self.rig_speech = rig_speech
@@ -209,6 +209,10 @@ class App:
                 emotion_runner=getattr(args, "emotion_runner", None) or rig_emotion.DEFAULT_RUNNER,
                 emotion_model=getattr(args, "emotion_model", None) or rig_emotion.DEFAULT_MODEL),
             "rig_soft_tissue": lambda req, prog, cancel: soft_tissue.soft_tissue_job(
+                self.service, req, prog, cancel, python=getattr(args, "rig_python", None)),
+            "rig_train_deformer": lambda req, prog, cancel: soft_deformer.train_job(
+                self.service, req, prog, cancel, python=getattr(args, "rig_python", None)),
+            "rig_fit_video": lambda req, prog, cancel: video_fit.fit_job(
                 self.service, req, prog, cancel, python=getattr(args, "rig_python", None)),
         })
 
@@ -380,6 +384,14 @@ def make_handler(app: App, quiet: bool = False):
                     if length > MAX_UPLOAD:
                         self.close_connection = True
                         raise TooLarge("body media upload is too large")
+                    return self._json(201, upload(app.service, self.rfile, length,
+                                                  self.headers.get("Content-Type", "")))
+                if path == "/v1/rig/uploads":
+                    from .rig.video_fit import upload, MAX_UPLOAD
+                    length = int(self.headers.get("Content-Length") or 0)
+                    if length > MAX_UPLOAD:
+                        self.close_connection = True
+                        raise TooLarge("face video upload is too large")
                     return self._json(201, upload(app.service, self.rfile, length,
                                                   self.headers.get("Content-Type", "")))
                 body = self._body()

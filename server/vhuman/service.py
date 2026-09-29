@@ -342,7 +342,7 @@ class EyeService:
             "manifest": "manifest.json", "audio": "audio.wav", "align": "align.json",
             "animation": "animation.json", "usd": "animation.usda", "lightrig": "lightrig.txt",
             "emotion": "emotion.json", "soft_tissue": "soft_tissue.usda",
-            "soft_tissue_report": "soft_tissue_report.json",
+            "soft_tissue_report": "soft_tissue_report.json", "fit_report": "fit_report.json",
         }.items() if (self.work / "heads" / hid / "rig" / "takes" / take_id / name).is_file()}
         return manifest
 

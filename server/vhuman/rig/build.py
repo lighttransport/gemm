@@ -58,6 +58,17 @@ def _png(img: np.ndarray) -> bytes:
     return buf.getvalue()
 
 
+def _limit_png(source: bytes, size: int) -> bytes:
+    """Use smaller atlases for the mobile rig without changing its UVs."""
+    with Image.open(io.BytesIO(source)) as image:
+        if max(image.size) <= size:
+            return source
+        image.thumbnail((size, size), Image.Resampling.LANCZOS)
+        out = io.BytesIO()
+        image.save(out, format="PNG", optimize=True)
+        return out.getvalue()
+
+
 def rig_definition(skel: dict, shape_names: list[str]) -> dict:
     controls = rigdef.control_table()
     cnames = {c["name"] for c in controls}
@@ -191,7 +202,28 @@ def export_lods(levels, tmpl, pos, shapes, Jn, W, contacts_viz, mouth_parts, car
         parts_t = meshes.unweld(tl, pos_l)
         parts = head_parts(parts_t, pos_l, shapes_l, Jn_l, W_l) + list(mouth_parts)
         parts += carried_parts(carried, pos_l, tl.tris[tl.tri_mat == 0], Jn_l, W_l, shapes_l, jidx)
-        a = RigAsset(asset.skeleton, parts, asset.materials, asset.rig, asset.info)
+        materials = asset.materials
+        mobile_modes = None
+        if lv == 2:
+            # The carried eye shells have many tiny ML targets. Keep their
+            # highest-energy eight modes and all principal eye poses; the
+            # facial skin retains the complete ML corrective basis.
+            energy = {}
+            for part in parts:
+                if not part.name.startswith("eye_"):
+                    continue
+                for name, (_, delta, _) in part.shapes.items():
+                    if name.startswith("ml_") and name != "ml_mean":
+                        energy[name] = energy.get(name, 0.) + float(np.sum(delta * delta))
+            mobile_modes = set(sorted(energy, key=energy.get, reverse=True)[:8])
+            for part in parts:
+                if part.name.startswith("eye_"):
+                    part.shapes = {name: value for name, value in part.shapes.items()
+                                   if not name.startswith("ml_") or name == "ml_mean" or name in mobile_modes}
+            materials = {key: dict(spec, images={index: _limit_png(png, 1024 if key == "skin" else 512)
+                                                  for index, png in spec.get("images", {}).items()})
+                         for key, spec in asset.materials.items()}
+        a = RigAsset(asset.skeleton, parts, materials, asset.rig, asset.info)
         cv = lod.contacts_viz(contacts_viz, idx, w, tl.tris) if contacts_viz else None
         viz = {"parts": {f"head_{p.name}": {"vmap": p.vmap.tolist()} for p in parts_t}, "contacts": cv,
                "welded_vertices": int(len(pos_l)), "lod": lv}
@@ -204,6 +236,8 @@ def export_lods(levels, tmpl, pos, shapes, Jn, W, contacts_viz, mouth_parts, car
         report[lv] = {"vertices": int(tl.n), "triangles": int(len(tl.tris)), "glb_bytes": g["bytes"],
                       "usd_bytes": u["bytes"], "package_bytes": pk["bytes"],
                       "seconds": round(time.perf_counter() - t0, 1)}
+        if mobile_modes is not None:
+            report[lv]["carried_ml_modes"] = sorted(mobile_modes)
         if log:
             log(f"LOD{lv}: {report[lv]}")
     del graph

@@ -10,6 +10,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import signal
 import struct
 import subprocess
@@ -134,6 +135,27 @@ def _write_input(path: Path, rest: np.ndarray, faces: np.ndarray, positions: np.
         f.write(np.ascontiguousarray(positions, dtype="<f4").tobytes())
 
 
+def _read_surface_samples(path: Path, frames: int, vertices: int) -> np.ndarray:
+    """Read the solver's ASCII USD surface without requiring a USD Python build."""
+    rows = []
+    pattern = re.compile(r"^\s*(\d+): \[(.*)\],?\s*$")
+    with path.open() as stream:
+        for line in stream:
+            match = pattern.match(line)
+            if not match:
+                continue
+            if int(match.group(1)) != len(rows):
+                raise ValueError("LightGeom USD frame order differs from the take")
+            numbers = np.fromstring(match.group(2).replace("(", "").replace(")", "").replace(",", " "),
+                                    sep=" ", dtype=np.float32)
+            if numbers.size != vertices * 3 or not np.isfinite(numbers).all():
+                raise ValueError("LightGeom USD contains invalid surface vertices")
+            rows.append(numbers.reshape(vertices, 3))
+    if len(rows) != frames:
+        raise ValueError(f"LightGeom USD has {len(rows)} frames; expected {frames}")
+    return np.stack(rows)
+
+
 def _motion_safe_patch(rest: np.ndarray, positions: np.ndarray, ids: np.ndarray,
                        faces: np.ndarray, thickness: float = .005) -> tuple[np.ndarray, np.ndarray, int]:
     """Remove faces whose driven prisms invert under the requested motion."""
@@ -232,6 +254,7 @@ def simulate(rig_dir: Path, take_dir: Path, runner: Path = DEFAULT_RUNNER,
             stats = json.loads(stdout.strip().splitlines()[-1])
             if stats["min_volume_ratio"] <= 0:
                 raise ValueError("LightGeom reported an inverted facial tetrahedron")
+            surface = _read_surface_samples(partial_usd, len(frames), len(ids))
             partial_usd.replace(output)
         finally:
             if proc.poll() is None:
@@ -241,12 +264,23 @@ def simulate(rig_dir: Path, take_dir: Path, runner: Path = DEFAULT_RUNNER,
         stage.unlink(missing_ok=True)
         partial_usd.unlink(missing_ok=True)
     rig_bytes = (rig_dir / "rig.json").read_bytes()
+    samples = take_dir / "soft_tissue_samples.npz"
+    staged_samples = take_dir / "soft_tissue_samples.partial.npz"
+    np.savez_compressed(staged_samples, ids=ids, faces=faces, rest=rest[ids], target=positions[:, ids],
+                        surface=surface, controls=values, fps=np.float32(fps),
+                        rig_sha256=np.asarray(hashlib.sha256(rig_bytes).hexdigest()[:16]),
+                        geometry_sha256=np.asarray(hashlib.sha256(
+                            (rig_dir / "rig_deformer.safetensors").read_bytes()).hexdigest()[:16]))
+    staged_samples.replace(samples)
+    residual_mm = np.linalg.norm(surface - positions[:, ids], axis=2) * 1000
     report = {"format": "vhuman.soft_tissue.v1", "solver": "LightGeom Neo-Hookean tetra",
               "rig_sha256": hashlib.sha256(rig_bytes).hexdigest()[:16],
               "surface_vertices": int(len(ids)), "surface_triangles": int(len(faces)),
               "motion_culled_triangles": culled,
               "fps": fps, "seconds": len(frames) / fps, "thickness_m": .005,
-              "stats": stats, "usd": output.name}
+              "stats": stats, "residual_p95_mm": float(np.percentile(residual_mm, 95)),
+              "residual_max_mm": float(residual_mm.max()), "samples": samples.name,
+              "usd": output.name}
     (take_dir / "soft_tissue_report.json").write_text(json.dumps(report, indent=2))
     if progress:
         progress(.99, "soft tissue ready")

@@ -20,6 +20,8 @@ RIG_FILES = ("rig.glb", "rig.json", "rig.usda", "rig_usd.zip", "preview.png", "r
              "wm_smile.png", "wm_mouth.png", "expressions/manifest.json", "rig_lod1.glb", "rig_lod2.glb",
              "rig_lod1.usda", "rig_lod2.usda", "rig_deformer_lod1.safetensors", "rig_deformer_lod2.safetensors",
              "viz_lod1.json", "viz_lod2.json")
+RIG_FILES += ("soft_deformer.safetensors", "soft_deformer_lod1.safetensors",
+              "soft_deformer_lod2.safetensors", "soft_deformer_report.json")
 MIN_FREE_MIB = 1536
 
 

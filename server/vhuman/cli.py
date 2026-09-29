@@ -321,6 +321,28 @@ def cmd_rig_soft_tissue(args) -> dict:
                                       runner=Path(args.lightgeom_runner) if args.lightgeom_runner else soft_tissue.DEFAULT_RUNNER)
 
 
+def cmd_rig_train_deformer(args) -> dict:
+    from .rig import soft_deformer
+    svc = EyeService(Path(args.work))
+    return soft_deformer.train_job(svc, {"head_id": args.head, "take_ids": args.takes or None},
+                                   _progress, threading.Event(), python=args.rig_python)
+
+
+def cmd_rig_fit_video(args) -> dict:
+    import mimetypes
+    from .rig import video_fit
+    svc = EyeService(Path(args.work))
+    media = Path(args.video)
+    ctype = mimetypes.guess_type(media.name)[0]
+    if ctype not in video_fit.VIDEO_TYPES:
+        raise ValueError("video must be MP4, WebM or MOV")
+    with media.open("rb") as stream:
+        item = video_fit.upload(svc, stream, media.stat().st_size, ctype)
+    return video_fit.fit_job(svc, {"head_id": args.head, "upload_id": item["id"]},
+                             _progress, threading.Event(), python=args.rig_python,
+                             model=Path(args.model) if args.model else video_fit.MODEL)
+
+
 def cmd_bench(args) -> dict:
     """Timing targets (cold caches): procedural textures and renders."""
     out = {}
@@ -491,6 +513,15 @@ def main(argv=None) -> int:
     sp.add_argument("--take", required=True)
     sp.add_argument("--lightgeom-runner")
     sp.set_defaults(fn=cmd_rig_soft_tissue)
+    sp = sub.add_parser("rig-train-deformer", help="distil LightGeom tissue takes into a browser corrective")
+    sp.add_argument("--head", required=True)
+    sp.add_argument("--takes", nargs="*", help="take ids with rig-soft-tissue samples; default: recent completed takes")
+    sp.set_defaults(fn=cmd_rig_train_deformer)
+    sp = sub.add_parser("rig-fit-video", help="fit a face video to an existing facial rig")
+    sp.add_argument("--head", required=True)
+    sp.add_argument("--video", required=True)
+    sp.add_argument("--model", help="MediaPipe Face Landmarker task file")
+    sp.set_defaults(fn=cmd_rig_fit_video)
     sub.add_parser("replate", help="re-extract the plate library from its source images").set_defaults(fn=cmd_replate)
     sub.add_parser("bench", help="timing targets").set_defaults(fn=cmd_bench)
     args = ap.parse_args(argv)

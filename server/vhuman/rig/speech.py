@@ -29,7 +29,7 @@ DEFAULT_ALIGNER = Path("/mnt/nvme01/models/speech/japanese-wav2vec2-large-hiraga
 FPS = 30
 VISEMES = ("sil", "PP", "FF", "TH", "DD", "kk", "CH", "SS", "nn", "RR", "aa", "E", "ih", "oh", "ou")
 TAKE_FILES = ("manifest.json", "audio.wav", "align.json", "animation.json", "animation.usda", "lightrig.txt",
-              "emotion.json", "soft_tissue.usda", "soft_tissue_report.json")
+              "emotion.json", "soft_tissue.usda", "soft_tissue_report.json", "fit_report.json")
 
 
 def availability(model=DEFAULT_MODEL, aligner=DEFAULT_ALIGNER, backend="auto") -> dict:

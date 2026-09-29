@@ -83,6 +83,22 @@ class ServerTest(unittest.TestCase):
         job = self.wait_job(json.loads(body)["id"])
         self.assertEqual(job["state"], "failed")
 
+    def test_face_video_upload_boundary(self):
+        media = b"\x00\x00\x00\x18ftypisom" + bytes(16)
+        req = urllib.request.Request(self.base + "/v1/rig/uploads", media,
+                                     {"Content-Type": "video/mp4"}, method="POST")
+        with urllib.request.urlopen(req, timeout=10) as response:
+            self.assertEqual(response.status, 201)
+            upload = json.load(response)
+        self.assertEqual(upload["bytes"], len(media))
+        self.assertTrue((self.work / "rig_uploads" / upload["id"] / "source.mp4").is_file())
+        for content_type, payload in (("application/octet-stream", media), ("video/mp4", b"not a video")):
+            req = urllib.request.Request(self.base + "/v1/rig/uploads", payload,
+                                         {"Content-Type": content_type}, method="POST")
+            with self.assertRaises(urllib.error.HTTPError) as error:
+                urllib.request.urlopen(req, timeout=10)
+            self.assertEqual(error.exception.code, 400)
+
     def test_speech_take_job_and_routes(self):
         from .test_rig import _toy_rig
         from .test_speech import _aux
@@ -110,9 +126,11 @@ class ServerTest(unittest.TestCase):
         result_dir = rig / "takes" / take["id"]
         (result_dir / "soft_tissue.usda").write_text("#usda 1.0\n")
         (result_dir / "soft_tissue_report.json").write_text('{"format":"vhuman.soft_tissue.v1"}')
+        (result_dir / "fit_report.json").write_text('{"format":"vhuman.face_video_fit.v1"}')
         updated = self.app.service.take_summary(head_id, take["id"])
         self.assertEqual(self.status_of(updated["urls"]["soft_tissue"]), 200)
         self.assertEqual(self.status_of(updated["urls"]["soft_tissue_report"]), 200)
+        self.assertEqual(self.status_of(updated["urls"]["fit_report"]), 200)
         request = urllib.request.Request(self.base + take["urls"]["audio"], headers={"Range": "bytes=0-9"})
         with urllib.request.urlopen(request) as response:
             self.assertEqual(response.status, 206)

@@ -18,11 +18,15 @@ python3 -m server.vhuman.cli rig --head <id>   # same job without the server
 python3 -m server.vhuman.cli rig --head <id> --face-model ict_facekit_light
 python3 -m server.vhuman.cli rig --head <id> --face-model procedural
 python3 -m server.vhuman.cli rig-soft-tissue --head <id> --take <take-id>
+python3 -m server.vhuman.cli rig-train-deformer --head <id> --takes <take-id> <other-id>
+python3 -m server.vhuman.cli rig-fit-video --head <id> --video clip.mp4
 python3 -m server.vhuman.cli rig-track --head <id> --track capture.txt --out anim.usda
 python -m server.vhuman.rig.build <head folder> [--res 2048] [--out DIR]   # in the rig interpreter
 sh server/vhuman/rig/external.sh [--local] [--build]   # LightRig + LightUSD (vchar) under third_party/
 sh server/vhuman/rig/setup_face_sources.sh             # GNM + ICT + private LightGeom, build facial solver
 sh server/vhuman/rig/setup_face_sources.sh --no-build  # check out sources and weights only
+sh server/vhuman/rig/setup_face_video.sh --install-deps  # optional Face Landmarker
+sh server/vhuman/rig/setup_face_video.sh --with-reference --install-deps  # optional CompSkin check
 ```
 
 Outputs go to `<head>/rig/`: `rig.glb` (web viewer), `rig.usda` + `textures/`
@@ -53,7 +57,7 @@ previous dimensions retain them through the `legacy_v1` profile.
 
 ## Offline facial soft tissue
 
-`rig-soft-tissue` takes an existing speech performance (`animation.json`) and
+`rig-soft-tissue` takes an existing speech or face-video performance (`animation.json`) and
 evaluates the native facial rig, then simulates a cheek, perioral and chin
 patch in LightGeom. The runner retriangulates the patch, extrudes a 5 mm
 tetrahedral layer, pins the inner surface, and solves a 10 kPa Neo-Hookean
@@ -61,8 +65,8 @@ material. It drives the volume with one tenth of the rig motion, then adds
 the simulated residual to the full rig pose. The export is bounded to keep
 positive tetrahedral volume. It writes `soft_tissue.usda` with time samples
 and `soft_tissue_report.json` with volume and tracking diagnostics beside the
-take. This is an optional offline experiment; the take's normal glTF/USD
-animation remains the playback path. Build LightGeom's
+take. It also writes `soft_tissue_samples.npz` with correspondence, controls,
+and simulated surface samples. Build LightGeom's
 `lightphysics_vhuman_face` target with `setup_face_sources.sh` first, or pass
 `--lightgeom-runner` to the CLI. The script pins GNM and ICT source revisions,
 checks the GNM weight SHA-256, and checks out LightGeom from
@@ -72,10 +76,75 @@ commit is `db64640cbbbb44d73c5ee3ffa3c3b405dee2cec1`; the script reports
 an error if that commit is not yet available on the remote. Run it from any
 directory after installing Git, curl, CMake 3.24+, and a C/C++ compiler.
 The rig interpreter still needs `requirements-rig.txt` as shown above.
-Material stiffness and residual gain are
-fixed experimental values and have not been calibrated to measured human
-facial tissue. The USD is a separate patch and is not yet composited with
-the skinned head in the viewer.
+`rig-train-deformer` distils one or more sample takes into a subject-specific,
+second-order 8–16 mode model. It inverse skins the LightGeom residual,
+fades the patch seam and contact vertices, fits a damped recurrence from rig
+controls, and selects mode count and damping on a held-out take (or a
+contiguous tail when only one take exists). The model and LOD bases are
+`soft_deformer*.safetensors`; the browser adds their pre-skin offsets after
+blendshapes and before skinning and exact contacts. A take's coefficients
+are deterministic from its first frame, so seeking does not depend on the
+previous playback position. `soft_deformer_report.json` records full-head
+and active-patch held-out errors. The original USD remains available for
+inspection. Material stiffness and residual gain remain experimental values
+and have not been calibrated to measured human tissue.
+
+The optional face-video path accepts MP4, WebM and MOV up to 64 MiB and 30 s.
+MediaPipe supplies 2D face landmarks and blendshape priors; our PyTorch
+`TorchRig` fits the rig controls with landmark, prior and temporal terms. The
+result is a normal `vhuman.performance.v1` take with an optional extracted WAV
+and a `fit_report.json`. It works best for near-frontal, single-face video
+of the same subject as the rig. This is a 2D fit, so hidden-side motion and
+depth are not recovered. The tracker is only an offline dependency.
+
+For a reproducible public smoke test, run:
+
+```sh
+TMPDIR=$PWD/tmp/vhuman-rig tmp/vhuman-rig-venv/bin/python -m server.vhuman.rig.fetch_speakingfaces_clip
+```
+
+This is a **manual download**. The public source is the
+[ISSAI SpeakingFaces subject-1 archive](https://huggingface.co/datasets/issai/Speaking_Faces/resolve/main/image_audio/sub_1_ia.zip)
+([dataset and license](https://issai.nu.edu.kz/download-speaking-faces/),
+CC BY 4.0). The helper reads only one 72-frame RGB/audio clip by HTTP range
+into ignored `tmp/vhuman-rig/speakingfaces/`; setup, builds, tests and the
+server never fetch it. No SpeakingFaces media is committed to this repository.
+Then run `rig-fit-video` on the generated MP4. Fitting this clip against a
+different person's head checks the tracking and optimizer path, not identity
+or final visual quality. Subject-specific validation still needs an aligned
+rig and independent human ratings.
+
+`reference_compskin.py` compares a sparse PyTorch skinning proxy against
+unmodified functions loaded from Meta's pinned Apache-2.0 CompSkin source
+(`setup_face_video.sh --with-reference`). This is an offline mathematical
+check, not a bundled runtime or an alternative deployed deformer.
+
+The offline-teacher/compact-runtime split follows the practical direction of
+[SoftDECA](https://cg.cs.tu-dortmund.de/publications/2023-softdeca.pdf)
+(differentiable soft facial mechanics) and
+[Neural Volumetric Blendshapes](https://arxiv.org/abs/2212.14784)
+(learned non-rigid motion around explicit controls). We keep the 51 facial
+controls, blendshapes and LBS as the authored motion, and add a small
+subject-specific dynamic residual. [CompSkin](https://github.com/facebookresearch/compskin)
+was examined for sparse deformation compression; our PyTorch check on 512
+vertices and eight facial shapes matched its transform calculation within
+9.4e-10 m. A 12-proxy fit reduced the sampled error from 0.717 to 0.267 mm,
+but the deployed model uses the more predictable modal offset on the existing
+head topology. No reference source or weights are bundled in the product.
+
+On the existing `291dfa911553` head, two LightGeom speech takes trained an
+eight-mode model; held-out patch RMSE fell from 0.0373 to 0.00335 mm. A
+different person's 72-frame [ISSAI SpeakingFaces](https://issai.nu.edu.kz/download-speaking-faces/)
+clip produced 77 resampled frames with a visible face in every frame; the
+mean 2D anchor error fell from 0.00526 to 0.00226 in normalized image units.
+These are fitting checks, not perceptual ratings. Device frame-time and
+subject-matched visual quality still need direct measurement.
+
+LOD2 now downsizes embedded atlases and retains the eight highest-energy ML
+targets on carried eye meshes; the facial skin retains its full ML basis.
+This reduces download and GPU upload size for mobile WebGL2. Measure load,
+frame time and appearance on target devices before choosing LOD2 as a
+shipping default.
 
 ## Pipeline
 
