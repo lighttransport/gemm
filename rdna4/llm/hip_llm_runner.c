@@ -14231,6 +14231,8 @@ struct hip_llm_runner {
     hipFunction_t fn_qwen4_down_accum_q2_selected;
     hipFunction_t fn_qwen4_gateup_silu_q2_grouped;
     hipFunction_t fn_qwen4_down_q2_grouped;
+    hipFunction_t fn_qwen4_gateup_silu_q2_tiled;
+    hipFunction_t fn_qwen4_down_q2_tiled;
     hipFunction_t fn_qwen4_down_accum_q8_selected;
     hipFunction_t fn_qwen4_gateup_silu_q4k_selected;
     hipFunction_t fn_qwen4_gateup_silu_q4k_selected_2w;
@@ -15437,6 +15439,8 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(qwen4_down_accum_q2_selected);
     GET_FUNC(qwen4_gateup_silu_q2_grouped);
     GET_FUNC(qwen4_down_q2_grouped);
+    GET_FUNC(qwen4_gateup_silu_q2_tiled);
+    GET_FUNC(qwen4_down_q2_tiled);
     GET_FUNC(qwen4_down_accum_q8_selected);
     GET_FUNC(qwen4_down_accum_q6k_selected);
     GET_FUNC(qwen4_down_accum_q6k_selected_kpar);
@@ -19005,6 +19009,92 @@ int hip_llm_load_weights(hip_llm_runner *r, gguf_context *gguf, int max_seq_len)
     return hip_llm_load_weights_impl(r, gguf, max_seq_len);
 }
 
+/* STRP is a ranked (layer, expert) list. Populate the existing cache once at
+ * load, so batched prefill can consume popular experts without first uploading
+ * them through the cold staging bank. Only Q2_0 needs this direct-copy path. */
+static int qwen4_preload_q2_profile(hip_llm_runner *r, const char *path) {
+    if (!path || !*path) return 0;
+    FILE *f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "hip_llm: cannot open expert profile %s\n", path); return -1; }
+    char magic[4];
+    uint32_t hdr[5];
+    if (fread(magic, 1, 4, f) != 4 || fread(hdr, 4, 5, f) != 5 ||
+        memcmp(magic, "STRP", 4) || hdr[0] != 1 ||
+        hdr[1] != (uint32_t)r->n_layers || hdr[2] != (uint32_t)r->n_experts ||
+        hdr[4] > hdr[3] || hdr[4] > hdr[1] * hdr[2]) {
+        fprintf(stderr, "hip_llm: invalid or mismatched expert profile %s\n", path);
+        fclose(f); return -1;
+    }
+    size_t n = hdr[4], ne = (size_t)r->n_experts, nl = (size_t)r->n_layers;
+    uint16_t *rank = (uint16_t *)malloc(n * 2 * sizeof(uint16_t));
+    int *chosen = (int *)malloc(nl * ne * sizeof(int));
+    int *count = (int *)calloc(nl, sizeof(int));
+    unsigned char *seen = (unsigned char *)calloc(nl * ne, 1);
+    if (!rank || !chosen || !count || !seen ||
+        fread(rank, sizeof(uint16_t), n * 2, f) != n * 2) {
+        fprintf(stderr, "hip_llm: truncated expert profile %s\n", path);
+        fclose(f); free(rank); free(chosen); free(count); free(seen); return -1;
+    }
+    fclose(f);
+    int rc = 0, total = 0;
+    for (size_t i = 0; i < n; ++i) {
+        int l = rank[i * 2], e = rank[i * 2 + 1];
+        if ((size_t)l >= nl || (size_t)e >= ne || seen[(size_t)l * ne + e]) {
+            fprintf(stderr, "hip_llm: invalid expert profile pair %zu\n", i);
+            rc = -1; goto done;
+        }
+        seen[(size_t)l * ne + e] = 1;
+        hip_layer *cl = &r->layers[l];
+        if (count[l] < cl->moe_cache_slots)
+            chosen[(size_t)l * ne + count[l]++] = e;
+    }
+    for (size_t l = 0; l < nl && !rc; ++l) {
+        hip_layer *cl = &r->layers[l];
+        if (!cl->moe_cache_ids || !cl->d_moe_cache_map) continue;
+        if (cl->moe_gate_exps_type != GGML_TYPE_Q2_0 ||
+            cl->moe_up_exps_type != GGML_TYPE_Q2_0 ||
+            cl->moe_down_exps_type != GGML_TYPE_Q2_0) {
+            fprintf(stderr, "hip_llm: expert profile preload requires Q2_0 experts\n");
+            rc = -1; break;
+        }
+        int *map = (int *)malloc(ne * sizeof(int));
+        if (!map) { rc = -1; break; }
+        for (size_t e = 0; e < ne; ++e) map[e] = -1;
+        for (int s = 0; s < count[l]; ++s) {
+            int e = chosen[l * ne + (size_t)s];
+            const unsigned char *g = (const unsigned char *)cl->moe_gate_exps_host +
+                (size_t)e * cl->moe_exp_stride_gu;
+            const unsigned char *u = (const unsigned char *)cl->moe_up_exps_host +
+                (size_t)e * cl->moe_exp_stride_gu;
+            const unsigned char *d = (const unsigned char *)cl->moe_down_exps_host +
+                (size_t)e * cl->moe_exp_stride_d;
+            if (hipMemcpyAsync((unsigned char *)cl->moe_cache_gate +
+                    (size_t)s * cl->moe_cache_stride_gate, g,
+                    cl->moe_exp_stride_gu, hipMemcpyHostToDevice, r->stream) != hipSuccess ||
+                hipMemcpyAsync((unsigned char *)cl->moe_cache_up +
+                    (size_t)s * cl->moe_cache_stride_up, u,
+                    cl->moe_exp_stride_gu, hipMemcpyHostToDevice, r->stream) != hipSuccess ||
+                hipMemcpyAsync((unsigned char *)cl->moe_cache_down +
+                    (size_t)s * cl->moe_cache_stride_down, d,
+                    cl->moe_exp_stride_d, hipMemcpyHostToDevice, r->stream) != hipSuccess) {
+                rc = -1; break;
+            }
+            cl->moe_cache_ids[s] = e;
+            map[e] = s;
+            ++total;
+        }
+        if (!rc && hipMemcpyAsync(cl->d_moe_cache_map, map,
+                ne * sizeof(int), hipMemcpyHostToDevice, r->stream) != hipSuccess)
+            rc = -1;
+        if (hipStreamSynchronize(r->stream) != hipSuccess) rc = -1;
+        free(map);
+    }
+    if (!rc) fprintf(stderr, "hip_llm: preloaded %d ranked Q2_0 experts from %s\n", total, path);
+done:
+    free(rank); free(chosen); free(count); free(seen);
+    return rc;
+}
+
 int hip_llm_load_weights_sharded(hip_llm_runner *r, gguf_shards *model,
                                  const hip_llm_load_options *options) {
     if (!r || !model || !model->metadata) return -1;
@@ -19839,6 +19929,8 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
             }
             fprintf(stderr, "hip_llm: Qwen4 expert cache: %d..%d slots/layer, %.2f GiB budget\n",
                     min_slots, max_slots, (double)cache_bytes / (double)(1ULL << 30));
+            if (qwen4_preload_q2_profile(r, getenv("LLM_QWEN4_Q2_EXPERT_PROFILE")))
+                return -1;
         }
         /* Device-side expert dispatch is supported only when every routed-expert
          * weight type has an expert-indexed kernel (IQ2_S / IQ3_S / IQ4_XS). */
@@ -20419,7 +20511,7 @@ static int hip_llm_finalize_load(hip_llm_runner *r, int max_seq_len) {
                     size_t per_slot = sg + su + sd;
                     size_t budget = r->requested_qwen4_prefill_stage_bytes ?
                         (size_t)r->requested_qwen4_prefill_stage_bytes : (size_t)512 << 20;
-                    size_t metadata = ((size_t)r->n_experts + 2 * TA) * sizeof(int);
+                    size_t metadata = ((size_t)r->n_experts + 5 * TA) * sizeof(int);
                     size_t q8_bytes = r->moe_q8_stage_bytes;
                     size_t overhead = 2 * (metadata + q8_bytes);
                     int slots = per_slot && budget > overhead ?
@@ -21915,7 +22007,7 @@ static inline int launch_qwen4_experts_grouped(hip_llm_runner *r, hip_layer *cl,
 
 /* Independent expert maps and weight bases isolate cold-expert waves. */
 static inline int launch_qwen4_experts_grouped_stage(hip_llm_runner *r, hip_layer *cl,
-        int expert_ff, int n_embd, int total, int bank, int cached) {
+        int expert_ff, int n_embd, int total, int tiles, int bank, int cached) {
     /* Geometry only: each warp retains the original per-row arithmetic. */
     const char *threads_env = getenv("LLM_QWEN4_STAGE_THREADS");
     int threads = threads_env ? atoi(threads_env) : 256;
@@ -21934,6 +22026,23 @@ static inline int launch_qwen4_experts_grouped_stage(hip_llm_runner *r, hip_laye
         long long gs = (long long)(cached ? cl->moe_cache_stride_gate : r->qwen4_stage_stride_gate);
         long long us = (long long)(cached ? cl->moe_cache_stride_up : r->qwen4_stage_stride_up);
         long long ds = (long long)(cached ? cl->moe_cache_stride_down : r->qwen4_stage_stride_down);
+        if (tiles > 0) {
+            int *tile_e = task_p + r->qwen4_stage_task_capacity;
+            int *tile_start = tile_e + r->qwen4_stage_task_capacity;
+            int *tile_n = tile_start + r->qwen4_stage_task_capacity;
+            void *ga[] = { &r->d_moe_eg, &gate, &up, &r->d_moe_gather_in,
+                           &task_p, &tile_e, &tile_start, &tile_n, &map,
+                           &expert_ff, &n_embd, &gs, &us };
+            if (LAUNCH(r->fn_qwen4_gateup_silu_q2_tiled,
+                       (unsigned)((expert_ff + warps - 1) / warps), tiles, 1,
+                       threads, 1, 1, 0, r->stream, ga) != hipSuccess) return -1;
+            void *da[] = { &r->d_moe_eout, &down_w, &r->d_moe_eg,
+                           &task_p, &tile_e, &tile_start, &tile_n, &map,
+                           &n_embd, &expert_ff, &ds };
+            return LAUNCH(r->fn_qwen4_down_q2_tiled,
+                          (unsigned)((n_embd + warps - 1) / warps), tiles, 1,
+                          threads, 1, 1, 0, r->stream, da) == hipSuccess ? 0 : -1;
+        }
         void *ga[] = { &r->d_moe_eg, &gate, &up, &r->d_moe_gather_in,
                        &task_e, &task_p, &map, &expert_ff, &n_embd, &gs, &us };
         if (LAUNCH(r->fn_qwen4_gateup_silu_q2_grouped,
@@ -30237,16 +30346,43 @@ static int qwen4_prefill_copies_drain(hip_llm_runner *r) {
     return 0;
 }
 
-static int qwen4_stage_metadata(hip_llm_runner *r, qwen4_moe_bank *b, int tasks) {
+static int qwen4_stage_metadata(hip_llm_runner *r, qwen4_moe_bank *b,
+                                int tasks, int *tile_count) {
     int ne = r->n_experts, cap = r->qwen4_stage_task_capacity;
     hipStream_t copy = r->qwen4_prefill_copy_stream;
+    int tiles = 0;
+    const char *tile_env = getenv("LLM_QWEN4_Q2_STAGE_TILE_TASKS");
+    int tile_size = tile_env ? atoi(tile_env) : 0;
+    if (tile_size > 8) tile_size = 8;
+    if (tile_size > 1) {
+        int *task_e = b->host + ne;
+        int *tile_e = b->host + ne + 2 * cap;
+        int *tile_start = tile_e + cap;
+        int *tile_n = tile_start + cap;
+        for (int first = 0; first < tasks;) {
+            int count = 1, e = task_e[first];
+            while (count < tile_size && first + count < tasks &&
+                   task_e[first + count] == e) ++count;
+            tile_e[tiles] = e;
+            tile_start[tiles] = first;
+            tile_n[tiles++] = count;
+            first += count;
+        }
+    }
     if (hipMemcpyAsync(b->device, b->host, (size_t)ne * sizeof(int),
                        hipMemcpyHostToDevice, copy) != hipSuccess ||
         hipMemcpyAsync(b->device + ne, b->host + ne, (size_t)tasks * sizeof(int),
                        hipMemcpyHostToDevice, copy) != hipSuccess ||
         hipMemcpyAsync(b->device + ne + cap, b->host + ne + cap,
-                       (size_t)tasks * sizeof(int), hipMemcpyHostToDevice, copy) != hipSuccess)
+                       (size_t)tasks * sizeof(int), hipMemcpyHostToDevice, copy) != hipSuccess ||
+        (tiles && (hipMemcpyAsync(b->device + ne + 2 * cap, b->host + ne + 2 * cap,
+                       (size_t)tiles * sizeof(int), hipMemcpyHostToDevice, copy) != hipSuccess ||
+                   hipMemcpyAsync(b->device + ne + 3 * cap, b->host + ne + 3 * cap,
+                       (size_t)tiles * sizeof(int), hipMemcpyHostToDevice, copy) != hipSuccess ||
+                   hipMemcpyAsync(b->device + ne + 4 * cap, b->host + ne + 4 * cap,
+                       (size_t)tiles * sizeof(int), hipMemcpyHostToDevice, copy) != hipSuccess)))
         return -1;
+    *tile_count = tiles;
     return 0;
 }
 
@@ -30356,9 +30492,10 @@ static int forward_qwen4_moe_staged(hip_llm_runner *r, hip_layer *cl,
         }
     }
     if (resident_tasks) {
-        if (qwen4_stage_metadata(r, b, resident_tasks) ||
+        int tiles = 0;
+        if (qwen4_stage_metadata(r, b, resident_tasks, &tiles) ||
             qwen4_moe_publish(&b->fence, copy, r->stream) ||
-            launch_qwen4_experts_grouped_stage(r, cl, eff, n_embd, resident_tasks, 0, 1) ||
+            launch_qwen4_experts_grouped_stage(r, cl, eff, n_embd, resident_tasks, tiles, 0, 1) ||
             qwen4_moe_consumed(&b->fence, r->stream)) goto fail;
     }
     /* Stable score order: equal-score experts retain ascending IDs. */
@@ -30412,9 +30549,10 @@ static int forward_qwen4_moe_staged(hip_llm_runner *r, hip_layer *cl,
                 task_p[tasks++] = p;
             }
         }
-        if (qwen4_stage_metadata(r, b, tasks) ||
+        int tiles = 0;
+        if (qwen4_stage_metadata(r, b, tasks, &tiles) ||
             qwen4_moe_publish(&b->fence, copy, r->stream) ||
-            launch_qwen4_experts_grouped_stage(r, cl, eff, n_embd, tasks, bank, 0)) goto fail;
+            launch_qwen4_experts_grouped_stage(r, cl, eff, n_embd, tasks, tiles, bank, 0)) goto fail;
         const char *q2_check = getenv("LLM_QWEN4_Q2_STAGE_CHECK");
         if (q2_check && atoi(q2_check) != 0 &&
             cl->moe_gate_exps_type == GGML_TYPE_Q2_0 && wave == 0 &&
@@ -30437,7 +30575,7 @@ static int forward_qwen4_moe_staged(hip_llm_runner *r, hip_layer *cl,
             }
             if (slot < 0) continue;
             int old = cl->moe_cache_ids[slot];
-            if (old >= 0 && cl->moe_prefill_score[old] > cl->moe_prefill_score[e]) continue;
+            if (old >= 0 && cl->moe_prefill_score[old] >= cl->moe_prefill_score[e]) continue;
             if (hipMemcpyAsync((unsigned char *)cl->moe_cache_gate + (size_t)slot * cl->moe_cache_stride_gate,
                     (unsigned char *)b->gate + (size_t)i * r->qwen4_stage_stride_gate,
                     cl->moe_cache_stride_gate, hipMemcpyDeviceToDevice, r->stream) != hipSuccess ||
@@ -33432,9 +33570,11 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
          * outputs. Keep that prefix scalar, then amortize expert uploads over
          * the whole tile. This is opt-in pending scalar-reference parity. */
         const char *ple_ffn_env = getenv("LLM_QWEN4_BATCH_PLE_FFN");
-        int split_ple_ffn = r->is_qwen4exp && l == 1 && cl->is_moe &&
+        const char *scalar_state_ffn_env = getenv("LLM_QWEN4_BATCH_SCALAR_STATE_FFN");
+        int split_scalar_ffn = r->is_qwen4exp && cl->is_moe &&
             r->moe_prefill_batched && !r->qwen4_grouped_verify &&
-            ple_ffn_env && atoi(ple_ffn_env) != 0;
+            ((l == 1 && ple_ffn_env && atoi(ple_ffn_env) != 0) ||
+             (scalar_state_ffn_env && atoi(scalar_state_ffn_env) != 0));
         /* Qwen4 layer 1 owns the token-dependent PLE n-gram gather and its
          * persistent dilated convolution state.  The generic batched HC path
          * cannot reproduce that state transition without the token IDs, so
@@ -33473,12 +33613,12 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
                  * forward_one_layer() uses selector 1 for ordinary decode;
                  * using it here changes Qwen4 HC branch/state even when every
                  * layer body is otherwise scalar. */
-                if (split_ple_ffn) {
+                if (split_scalar_ffn) {
                     forward_layer_state_phase(r, cl, l, r->d_key_cache[l],
                                               r->d_value_cache[l], 1, 1);
                     /* The PLE gather reuses a host embedding buffer next row.
                      * The scalar MoE previously supplied this completion. */
-                    if (hipStreamSynchronize(r->stream) != hipSuccess ||
+                    if ((l == 1 && hipStreamSynchronize(r->stream) != hipSuccess) ||
                         r->qwen4_forward_error) { row_failed = 1; break; }
                 } else if (r->qwen4_grouped_verify)
                     forward_layer_state(r, &r->layers[l], l,
@@ -33513,7 +33653,7 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
             r->d_x = saved_d_x;
             r->d_hc = saved_d_hc;
             if (row_failed) return -1;
-            if (split_ple_ffn) goto ffn_section;
+            if (split_scalar_ffn) goto ffn_section;
             if (prefill_profile) {
                 if (hipStreamSynchronize(r->stream) != hipSuccess) return -1;
                 fprintf(stderr, "hip_llm: prefill-profile layer=%d M=%d path=scalar-%s ms=%.3f\n",

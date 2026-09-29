@@ -3056,7 +3056,7 @@ int main(int argc, char **argv) {
             int publish_chunk = publish_chunk_env && atoi(publish_chunk_env) != 0;
             /* No batch knob means the runner's parity-safe scalar default. */
             int scalar_stream = (!batch_env || atoi(batch_env) == 0) &&
-                                !qwen35_batched_prefill;
+                                !qwen35_batched_prefill && !qwen4_batched_prefill;
             if (scalar_stream)
                 fprintf(stderr, "Large prefill: scalar streamed forward (dispatcher bypass)\n");
             for (int off = 0; off < n_prefill; off += stream_chunk) {

@@ -257,6 +257,54 @@ The exact scalar path remains the default. Disabling prefix graphs did not
 improve 32-token decode: it reached 31.69 tok/s at a 9,000 MiB cache budget,
 with the exact hash `b9f867f533408c06`.
 
+### Exact 1K prefill with ordered state and grouped MoE
+
+The opt-in `LLM_QWEN4_BATCH_SCALAR_STATE_FFN=1` path runs every attention,
+SSM, and PLE state transition in token order, then batches each layer's MoE
+FFN. Scalar router and HC math retain the reference greedy sequence. The
+Q2_0 stage can group up to eight assignments for one expert into a weight-
+reuse tile; the per-layer selected-expert check matched all 48 sampled gate/up
+and down outputs bit for bit with an eight-assignment tile. A four-assignment
+tile measured best in the exact 1K/32 run:
+
+```sh
+LLM_BMAX=1024 LLM_QWEN4_BATCH_ATTN=0 \
+  LLM_QWEN4_BATCH_SCALAR_STATE_FFN=1 \
+  LLM_QWEN4_BATCH_ROUTER_SCALAR=1 LLM_QWEN4_BATCH_HC_SCALAR=1 \
+  LLM_MOE_COPY_PIPELINE=1 LLM_QWEN4_Q2_STAGE_TILE_TASKS=4 \
+  LLM_QWEN4_STAGE_PROMOTE=1 LLM_MOE_CPU_DECODE_REFILLS_PER_LAYER=0 \
+  rdna4/llm/run_qwen38_flash_next_q2_rocm.sh --bench \
+  --prompt-file tmp/qwen38_1k_prompt.txt --prefill-len 1024 -n 1024 \
+  --decode 32 -s 1152 --moe-cache-mb 9000 --qwen4-batched-prefill \
+  --qwen4-prefill-staging --qwen4-prefill-stage-mb 512 --qwen4-kv-quant none
+```
+
+This reached **56.00 prefill / 32.36 decode tok/s**, with hash
+`b9f867f533408c06` and 15,872 MiB peak VRAM (432 MiB free). The cache
+starts empty; `LLM_QWEN4_STAGE_PROMOTE=1` uses observed routes to retain
+experts for decode. Without promotion, decode fell to 18.11 tok/s. Restricting
+the per-row stream wait to the PLE layer improved prefill from 53.38 to about
+56 tok/s. The benchmark's streamed-chunk mode now honors the explicit
+`--qwen4-batched-prefill` switch, so bounded tiles can be measured correctly.
+
+An optional `LLM_QWEN4_Q2_EXPERT_PROFILE=/path/to/expert-profile.bin` accepts
+the model-matched STRP ranking format and preloads cache slots at model load.
+In the full-batch diagnostic, preload plus an eight-assignment tile reduced
+1K expert H2D from 20.35 to 14.30 GiB and reached 167.42 tok/s, but that
+full-batch path still changes the generated sequence. With the exact split,
+static preload did not improve the combined 1K/32 result enough to recommend
+it over route-based promotion. A 10,000 MiB cache plus 1K batched buffers
+exceeded 16 GiB VRAM; 9,500 MiB left only 24 MiB free and was slower.
+
+The 1,200/60 tok/s goal remains unmet. In the full-batch 1K GPU trace,
+grouped Q2_0 gate/up and down consumed about 2.33 s together, expert H2D
+about 1.69 s, and attention about 0.49 s. Weight reuse lowered grouped
+kernel time in the profiler but did not remove the other costs. The exact
+decode trace attributed about 2.3 ms/token to the selected Q2_0 kernels,
+5.4 ms/token to F16 matvecs, and 3.0 ms/token to full attention; these are
+GPU times and exclude host gaps. Reaching the target requires a larger
+change to state/attention execution and the quantized expert matrix path.
+
 ### Fastest exact short-context profile measured so far
 
 At a 1,152-token maximum context, F16 KV needs only about 30 MiB more VRAM
