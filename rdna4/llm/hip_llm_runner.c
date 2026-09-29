@@ -2137,6 +2137,7 @@ static const char *hip_kernel_source =
 "    }\n"
 "    if(lane==0)acc[row]=total;\n"
 "}\n"
+#include "qwen4_q2_grouped_kernels.h"
 "__global__ void qwen4_down_accum_q8_selected(float *acc, const unsigned char *down,\n"
 "        const float *act, const float *weights, const int *slots, int K,\n"
 "        int rows, int cols, long long ds) {\n"
@@ -14228,6 +14229,8 @@ struct hip_llm_runner {
     hipFunction_t fn_qwen4_gateup_silu_q8_selected;
     hipFunction_t fn_qwen4_gateup_silu_q2_selected;
     hipFunction_t fn_qwen4_down_accum_q2_selected;
+    hipFunction_t fn_qwen4_gateup_silu_q2_grouped;
+    hipFunction_t fn_qwen4_down_q2_grouped;
     hipFunction_t fn_qwen4_down_accum_q8_selected;
     hipFunction_t fn_qwen4_gateup_silu_q4k_selected;
     hipFunction_t fn_qwen4_gateup_silu_q4k_selected_2w;
@@ -15432,6 +15435,8 @@ static int compile_kernels(hip_llm_runner *r) {
     GET_FUNC(qwen4_gateup_silu_q8_selected);
     GET_FUNC(qwen4_gateup_silu_q2_selected);
     GET_FUNC(qwen4_down_accum_q2_selected);
+    GET_FUNC(qwen4_gateup_silu_q2_grouped);
+    GET_FUNC(qwen4_down_q2_grouped);
     GET_FUNC(qwen4_down_accum_q8_selected);
     GET_FUNC(qwen4_down_accum_q6k_selected);
     GET_FUNC(qwen4_down_accum_q6k_selected_kpar);
@@ -21862,6 +21867,25 @@ static inline int launch_qwen4_experts_grouped(hip_llm_runner *r, hip_layer *cl,
     (void)ne;
     int *task_e = (int *)r->d_router_logits_batch;
     int *task_p = task_e + total;
+    if (cl->moe_gate_exps_type == GGML_TYPE_Q2_0 &&
+        cl->moe_up_exps_type == GGML_TYPE_Q2_0 &&
+        cl->moe_down_exps_type == GGML_TYPE_Q2_0) {
+        long long gs = (long long)cl->moe_cache_stride_gate;
+        long long us = (long long)cl->moe_cache_stride_up;
+        long long ds = (long long)cl->moe_cache_stride_down;
+        void *ga[] = { &r->d_moe_eg, &cl->moe_cache_gate, &cl->moe_cache_up,
+                       &r->d_moe_gather_in, &task_e, &task_p, &cl->d_moe_cache_map,
+                       &expert_ff, &n_embd, &gs, &us };
+        if (LAUNCH(r->fn_qwen4_gateup_silu_q2_grouped,
+                   (unsigned)((expert_ff + 7) / 8), total, 1,
+                   256, 1, 1, 0, r->stream, ga) != hipSuccess) return -1;
+        void *da[] = { &r->d_moe_eout, &cl->moe_cache_down, &r->d_moe_eg,
+                       &task_e, &task_p, &cl->d_moe_cache_map,
+                       &n_embd, &expert_ff, &ds };
+        return LAUNCH(r->fn_qwen4_down_q2_grouped,
+                      (unsigned)((n_embd + 7) / 8), total, 1,
+                      256, 1, 1, 0, r->stream, da) == hipSuccess ? 0 : -1;
+    }
     void *ga[] = { &r->d_moe_eg, &cl->moe_cache_gate, &cl->moe_cache_up,
                    &r->d_moe_gather_in, &task_e, &task_p, &cl->d_moe_cache_map,
                    &expert_ff, &n_embd, &cl->moe_cache_stride_gate,
@@ -21904,6 +21928,23 @@ static inline int launch_qwen4_experts_grouped_stage(hip_llm_runner *r, hip_laye
     void *gate = cached ? cl->moe_cache_gate : b->gate;
     void *up = cached ? cl->moe_cache_up : b->up;
     void *down_w = cached ? cl->moe_cache_down : b->down;
+    if (cl->moe_gate_exps_type == GGML_TYPE_Q2_0 &&
+        cl->moe_up_exps_type == GGML_TYPE_Q2_0 &&
+        cl->moe_down_exps_type == GGML_TYPE_Q2_0) {
+        long long gs = (long long)(cached ? cl->moe_cache_stride_gate : r->qwen4_stage_stride_gate);
+        long long us = (long long)(cached ? cl->moe_cache_stride_up : r->qwen4_stage_stride_up);
+        long long ds = (long long)(cached ? cl->moe_cache_stride_down : r->qwen4_stage_stride_down);
+        void *ga[] = { &r->d_moe_eg, &gate, &up, &r->d_moe_gather_in,
+                       &task_e, &task_p, &map, &expert_ff, &n_embd, &gs, &us };
+        if (LAUNCH(r->fn_qwen4_gateup_silu_q2_grouped,
+                   (unsigned)((expert_ff + warps - 1) / warps), total, 1,
+                   threads, 1, 1, 0, r->stream, ga) != hipSuccess) return -1;
+        void *da[] = { &r->d_moe_eout, &down_w, &r->d_moe_eg,
+                       &task_e, &task_p, &map, &n_embd, &expert_ff, &ds };
+        return LAUNCH(r->fn_qwen4_down_q2_grouped,
+                      (unsigned)((n_embd + warps - 1) / warps), total, 1,
+                      threads, 1, 1, 0, r->stream, da) == hipSuccess ? 0 : -1;
+    }
     void *ga[] = { &r->d_moe_eg, &gate, &up,
                    &r->d_moe_gather_in, &task_e, &task_p, &map,
                    &expert_ff, &n_embd, &r->qwen4_stage_stride_gate,
@@ -30209,6 +30250,77 @@ static int qwen4_stage_metadata(hip_llm_runner *r, qwen4_moe_bank *b, int tasks)
     return 0;
 }
 
+/* Diagnostic parity check for one staged Q2_0 assignment. The selected
+ * kernels are the existing scalar-decode arithmetic reference. */
+static int qwen4_check_q2_stage_task(hip_llm_runner *r, qwen4_moe_bank *b,
+                                     int expert, int assignment, int eff,
+                                     int n_embd) {
+    int one = 1, *slot = b->device + expert;
+    long long gs = (long long)r->qwen4_stage_stride_gate;
+    long long us = (long long)r->qwen4_stage_stride_up;
+    long long ds = (long long)r->qwen4_stage_stride_down;
+    float *xin = (float *)r->d_moe_gather_in + (size_t)assignment * n_embd;
+    if (r->d_moe_eout_alias_gather) {
+        /* The down kernel has overwritten gathered inputs. Recover the same
+         * token row from the still-live normalized input batch. */
+        int token = -1;
+        if (hipMemcpy(&token, (int *)r->d_moe_gather_src + assignment,
+                      sizeof(token), hipMemcpyDeviceToHost) != hipSuccess ||
+            token < 0 || token >= r->batch_max) return -1;
+        xin = (float *)r->d_xnorm_batch + (size_t)token * n_embd;
+    }
+    float *gate_ref = (float *)r->d_moe_eu;
+    float *gate_grouped = (float *)r->d_moe_eg + (size_t)assignment * eff;
+    void *ga[] = { &gate_ref, &b->gate, &b->up, &slot, &xin,
+                   &one, &eff, &n_embd, &gs, &us };
+    if (LAUNCH(r->fn_qwen4_gateup_silu_q2_selected,
+               (unsigned)((eff + 7) / 8), 1, 1, 256, 1, 1, 0,
+               r->stream, ga) != hipSuccess) return -1;
+    float *a = (float *)malloc((size_t)eff * sizeof(float));
+    float *v = (float *)malloc((size_t)eff * sizeof(float));
+    float *ao = (float *)malloc((size_t)n_embd * sizeof(float));
+    float *vo = (float *)malloc((size_t)n_embd * sizeof(float));
+    if (!a || !v || !ao || !vo) { free(a); free(v); free(ao); free(vo); return -1; }
+    if (hipMemcpyAsync(a, gate_grouped, (size_t)eff * sizeof(float),
+                       hipMemcpyDeviceToHost, r->stream) != hipSuccess ||
+        hipMemcpyAsync(v, gate_ref, (size_t)eff * sizeof(float),
+                       hipMemcpyDeviceToHost, r->stream) != hipSuccess ||
+        hipStreamSynchronize(r->stream) != hipSuccess)
+        goto fail;
+    int gate_diff = 0, down_diff = 0;
+    double gate_err = 0.0, gate_ref_norm = 0.0;
+    for (int i = 0; i < eff; ++i) {
+        gate_diff += memcmp(a + i, v + i, sizeof(float)) != 0;
+        double d = (double)a[i] - v[i];
+        gate_err += d * d;
+        gate_ref_norm += (double)v[i] * v[i];
+    }
+    float one_f = 1.0f;
+    if (hipMemcpyAsync(r->d_shared_scale_batch, &one_f, sizeof(one_f),
+                       hipMemcpyHostToDevice, r->stream) != hipSuccess) goto fail;
+    float *down_ref = (float *)r->d_moe_eu;
+    float *down_grouped = (float *)r->d_moe_eout + (size_t)assignment * n_embd;
+    void *da[] = { &down_ref, &b->down, &gate_grouped, &r->d_shared_scale_batch,
+                   &slot, &one, &n_embd, &eff, &ds };
+    if (LAUNCH(r->fn_qwen4_down_accum_q2_selected,
+               (unsigned)((n_embd + 7) / 8), 1, 1, 256, 1, 1, 0,
+               r->stream, da) != hipSuccess ||
+        hipMemcpyAsync(ao, down_grouped, (size_t)n_embd * sizeof(float),
+                       hipMemcpyDeviceToHost, r->stream) != hipSuccess ||
+        hipMemcpyAsync(vo, down_ref, (size_t)n_embd * sizeof(float),
+                       hipMemcpyDeviceToHost, r->stream) != hipSuccess ||
+        hipStreamSynchronize(r->stream) != hipSuccess) goto fail;
+    for (int i = 0; i < n_embd; ++i) down_diff += memcmp(ao + i, vo + i, sizeof(float)) != 0;
+    fprintf(stderr, "hip_llm: Q2 stage check expert=%d assignment=%d gate_diff=%d/%d rel_l2=%.6g first=(%.6g,%.6g) down_diff=%d/%d\n",
+            expert, assignment, gate_diff, eff, sqrt(gate_err / fmax(gate_ref_norm, 1e-30)),
+            a[0], v[0], down_diff, n_embd);
+    free(a); free(v); free(ao); free(vo);
+    return gate_diff || down_diff ? -1 : 0;
+fail:
+    free(a); free(v); free(ao); free(vo);
+    return -1;
+}
+
 /* Execute residents first, then bounded cold waves. A bank's immutable metadata
  * and quantized payloads are published together before any consumer starts. */
 static int forward_qwen4_moe_staged(hip_llm_runner *r, hip_layer *cl,
@@ -30303,6 +30415,11 @@ static int forward_qwen4_moe_staged(hip_llm_runner *r, hip_layer *cl,
         if (qwen4_stage_metadata(r, b, tasks) ||
             qwen4_moe_publish(&b->fence, copy, r->stream) ||
             launch_qwen4_experts_grouped_stage(r, cl, eff, n_embd, tasks, bank, 0)) goto fail;
+        const char *q2_check = getenv("LLM_QWEN4_Q2_STAGE_CHECK");
+        if (q2_check && atoi(q2_check) != 0 &&
+            cl->moe_gate_exps_type == GGML_TYPE_Q2_0 && wave == 0 &&
+            qwen4_check_q2_stage_task(r, b, cold[first], offs[cold[first]], eff, n_embd))
+            goto fail;
         r->moe_stats.stage_waves++;
 
         /* Ordered after all resident readers and this wave's down projection.
@@ -30498,8 +30615,10 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
     hipMemsetAsync(r->d_moe_out_batch, 0, (size_t)M * n_embd * sizeof(float), r->stream);
     if (r->is_qwen4exp && r->qwen4_prefill_staging &&
         ((cl->moe_gate_exps_type == GGML_TYPE_Q4_K && cl->moe_up_exps_type == GGML_TYPE_Q4_K) ||
-         (cl->moe_gate_exps_type == GGML_TYPE_Q5_K && cl->moe_up_exps_type == GGML_TYPE_Q5_K)) &&
-        (cl->moe_down_exps_type == GGML_TYPE_Q5_1 ||
+         (cl->moe_gate_exps_type == GGML_TYPE_Q5_K && cl->moe_up_exps_type == GGML_TYPE_Q5_K) ||
+         (cl->moe_gate_exps_type == GGML_TYPE_Q2_0 && cl->moe_up_exps_type == GGML_TYPE_Q2_0)) &&
+        (cl->moe_down_exps_type == GGML_TYPE_Q2_0 ||
+         cl->moe_down_exps_type == GGML_TYPE_Q5_1 ||
          cl->moe_down_exps_type == GGML_TYPE_Q8_0 ||
          cl->moe_down_exps_type == GGML_TYPE_Q6_K)) {
         if (r->verbose >= 2)
@@ -30722,8 +30841,11 @@ static int forward_moe_ffn_batched(hip_llm_runner *r, hip_layer *cl, int M) {
         ((cl->moe_gate_exps_type == GGML_TYPE_Q4_K &&
           cl->moe_up_exps_type == GGML_TYPE_Q4_K) ||
          (cl->moe_gate_exps_type == GGML_TYPE_Q5_K &&
-          cl->moe_up_exps_type == GGML_TYPE_Q5_K)) &&
-         (cl->moe_down_exps_type == GGML_TYPE_Q5_1 ||
+          cl->moe_up_exps_type == GGML_TYPE_Q5_K) ||
+         (cl->moe_gate_exps_type == GGML_TYPE_Q2_0 &&
+          cl->moe_up_exps_type == GGML_TYPE_Q2_0)) &&
+         (cl->moe_down_exps_type == GGML_TYPE_Q2_0 ||
+          cl->moe_down_exps_type == GGML_TYPE_Q5_1 ||
           cl->moe_down_exps_type == GGML_TYPE_Q8_0 ||
           cl->moe_down_exps_type == GGML_TYPE_Q6_K);
     int grouped_tasks = 0;
@@ -32500,7 +32622,8 @@ static void forward_blocks_body(hip_llm_runner *r) {
     const char *sync_layers_env = getenv("LLM_QWEN35_SYNC_LAYERS");
     const int sync_layers = r->is_hybrid && !r->is_qwen4exp &&
                             sync_layers_env && atoi(sync_layers_env) != 0;
-    const char *profile_env = getenv("LLM_QWEN35_PROFILE_DECODE");
+    const char *profile_env = getenv(r->is_qwen4exp ?
+        "LLM_QWEN4_PROFILE_DECODE" : "LLM_QWEN35_PROFILE_DECODE");
     int profile_decode = profile_env && atoi(profile_env) != 0 &&
                          r->decode_mode && r->graph_disabled;
     const char *fold_env = getenv("LLM_QWEN35_FOLD_RESIDUAL");
@@ -33189,11 +33312,13 @@ static int forward_block_batched_dense(hip_llm_runner *r, int M,
         r->batch_q8_valid = 0;
         r->qwen4_fingerprint_layer = l;
         r->qwen35_batch_layer = l;
-        const char *prefill_profile_env = getenv("LLM_QWEN35_PROFILE_PREFILL");
-        int prefill_profile = r->is_hybrid && !r->is_qwen4exp &&
-            prefill_profile_env && atoi(prefill_profile_env) != 0;
+        const char *prefill_profile_env = getenv(r->is_qwen4exp ?
+            "LLM_QWEN4_PROFILE_PREFILL" : "LLM_QWEN35_PROFILE_PREFILL");
+        int prefill_profile = r->is_hybrid && prefill_profile_env &&
+            atoi(prefill_profile_env) != 0;
         if (prefill_profile && hipStreamSynchronize(r->stream) != hipSuccess) return -1;
         double prefill_layer_start = prefill_profile ? hllm_monotonic_ms() : 0.0;
+        double prefill_ffn_start = 0.0;
         if (fingerprint) qwen4_fingerprint(r, 0, r->d_hc_batch,
                                            M * r->hc_count * n_embd);
 
@@ -34705,6 +34830,10 @@ q8q4_attention_done:;
                             (size_t)(M - 1) * n_embd, n_embd);
 
 ffn_section:
+        if (prefill_profile) {
+            if (hipStreamSynchronize(r->stream) != hipSuccess) return -1;
+            prefill_ffn_start = hllm_monotonic_ms();
+        }
         /* ---- Pre-FFN RMSNorm: one batched launch over M rows ---- */
         if (r->is_qwen4exp) {
             const char *hc_scalar_env = getenv("LLM_QWEN4_BATCH_HC_SCALAR");
@@ -34782,6 +34911,15 @@ ffn_section:
                     else
                         forward_hc_combine_batched(r, M, r->d_moe_out_batch);
                 }
+            }
+            if (prefill_profile) {
+                if (hipStreamSynchronize(r->stream) != hipSuccess) return -1;
+                double prefill_layer_end = hllm_monotonic_ms();
+                fprintf(stderr, "hip_llm: prefill-profile layer=%d M=%d path=batch-%s-moe ms=%.3f state=%.3f ffn=%.3f\n",
+                        l, M, cl->is_ssm ? "ssm" : "attn",
+                        prefill_layer_end - prefill_layer_start,
+                        prefill_ffn_start - prefill_layer_start,
+                        prefill_layer_end - prefill_ffn_start);
             }
             continue;
         }

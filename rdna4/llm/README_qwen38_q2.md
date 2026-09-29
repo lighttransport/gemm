@@ -71,7 +71,7 @@ peak VRAM use. The sequence hash `b9f867f533408c06` matched both earlier
 runs. Logs are `tmp/qwen38_q2_1k_final.log` and
 `tmp/qwen38_q2_1k_clean.log`.
 
-The present scalar prefill has no grouped Q2_0 matrix-matrix path. Strata's
+The scalar prefill measured here had no grouped Q2_0 matrix-matrix path. Strata's
 [technical details](https://github.com/Niko1221/Strata/blob/main/docs/DETAILS.md)
 describe quantized grouped prompt kernels, streaming experts ahead of the
 next layer, and an MTP draft model for speculative decode. Its reported Q2_0
@@ -219,6 +219,43 @@ tok/s on 1K but changed the output hash and stopped after 18 decoded tokens.
 On a 128-token logit comparator, the layer-3 path had relative L2 difference
 0.345 from scalar. Scalar MoE reduced it to 0.058, and scalar projections to
 0.048; wider batching also changed the hash. These gates remain diagnostic.
+
+### Grouped Q2_0 prefill diagnostic after the clock reset
+
+The opt-in staged path now has native Q2_0 grouped gate/up and down kernels.
+It groups routed assignments by expert and copies cold experts through two
+staging banks. A bounded arithmetic check compares one staged assignment in
+each layer against the existing selected-expert Q2_0 kernels, including the
+default buffer reuse:
+
+```sh
+LLM_BMAX=128 LLM_QWEN4_BATCH_SSM=1 \
+  LLM_QWEN4_BATCH_ATTN_MAX_LAYER=47 LLM_QWEN4_BATCH_PLE_FFN=1 \
+  LLM_MOE_COPY_PIPELINE=1 LLM_QWEN4_Q2_STAGE_CHECK=1 \
+  rdna4/llm/run_qwen38_flash_next_q2_rocm.sh --bench \
+  --prompt-file tmp/qwen38_1k_prompt.txt --prefill-len 128 -n 128 \
+  --decode 0 -s 256 --qwen4-batched-prefill \
+  --qwen4-prefill-staging --qwen4-prefill-stage-mb 512
+```
+
+All 48 checked assignments matched bit for bit for both the 640 gate/up
+outputs and 2,560 down outputs. The 1K diagnostic reached **157.80 prefill
+tok/s** with 256-thread grouped kernels and the copy pipeline, moving 20.35
+GiB of experts in 143 waves. Peak VRAM was 15,190 MiB. The 128- and
+512-thread variants reached 151.58 and 145.06 tok/s, respectively. The
+corresponding logs are in `tmp/qwen38_q2_reset_q2stage_pipeline*.log` and
+`tmp/qwen38_q2_reset_stage_check_alias128.log`.
+
+The full batched layer path changes the output, so these rates are diagnostic.
+Its 1K prefill profile spent about 0.72 s in the scalar PLE state work and
+roughly 0.11–0.16 s in each batched MoE FFN. Batching only the PLE layer's
+MoE produced the exact 1K/32 sequence when both
+`LLM_QWEN4_BATCH_ROUTER_SCALAR=1` and
+`LLM_QWEN4_BATCH_HC_SCALAR=1` were set, but reached only 30.30 prefill /
+25.98 decode tok/s. Without those precision controls it changed the sequence.
+The exact scalar path remains the default. Disabling prefix graphs did not
+improve 32-token decode: it reached 31.69 tok/s at a 9,000 MiB cache budget,
+with the exact hash `b9f867f533408c06`.
 
 ```sh
 LLM_BMAX=1024 LLM_QWEN4_EXACT_GPU_TOPK=1 \
