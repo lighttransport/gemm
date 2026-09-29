@@ -257,6 +257,38 @@ The exact scalar path remains the default. Disabling prefix graphs did not
 improve 32-token decode: it reached 31.69 tok/s at a 9,000 MiB cache budget,
 with the exact hash `b9f867f533408c06`.
 
+### Fastest exact short-context profile measured so far
+
+At a 1,152-token maximum context, F16 KV needs only about 30 MiB more VRAM
+than scaled INT8 KV and preserves the same 1K/32 greedy sequence. The
+following opt-in profile reached **32.24 prefill / 35.06 decode tok/s** with
+hash `b9f867f533408c06`, 90.8% decode cache hits, and **15,836 MiB peak
+VRAM** (468 MiB free):
+
+```sh
+LLM_QWEN4_Q2_CACHE_PROFILE=1 LLM_MOE_CPU_DECODE_REFILLS_PER_LAYER=0 \
+  rdna4/llm/run_qwen38_flash_next_q2_rocm.sh --bench \
+  --prompt-file tmp/qwen38_1k_prompt.txt --prefill-len 1024 -n 1024 \
+  --decode 32 -s 1152 --moe-cache-mb 10000 --qwen4-kv-quant none
+```
+
+The 10,000 MiB cache leaves little room for other GPU processes. F16 KV is
+appropriate only for this bounded context profile; the launcher retains
+scaled INT8 KV for its 262K default. Eight CPU threads measured 34.39 decode
+tok/s and 117.71 ms in CPU miss work, versus 16 threads' 35.06 tok/s and
+97.54 ms. HC graphs measured 33.80 tok/s with the 9,000 MiB control and
+did not help.
+
+Exact MTP with the matching local Q8_0 NextN sidecar accepted most
+three-token drafts but reached 29.03 tok/s with scalar target verification
+and 23.38 tok/s with the window verifier; both retained the same sequence.
+The current window verifier still replays enough scalar work that speculation
+does not close the 60 tok/s target. The detailed phase trace is enabled by
+`LLM_QWEN4_PROFILE_DECODE_PHASES=1` with `LLM_GRAPH_DISABLE=1`; it found
+roughly 18.9 ms across state/attention phases, 14.2 ms across MoE phases,
+and 1.3 ms across HC combines per profiled decode token. This trace adds
+stream barriers and is diagnostic rather than an end-to-end latency sum.
+
 ```sh
 LLM_BMAX=1024 LLM_QWEN4_EXACT_GPU_TOPK=1 \
   LLM_QWEN4_EXACT_PRE_GRAPHS=1 \

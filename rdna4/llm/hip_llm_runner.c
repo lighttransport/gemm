@@ -31395,6 +31395,14 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
     int kv_dim     = n_kv_heads * head_dim;
     int n_ff       = r->n_ff;
     float eps      = r->rms_norm_eps;
+    const char *qwen4_phase_env = getenv("LLM_QWEN4_PROFILE_DECODE_PHASES");
+    int qwen4_phase_profile = r->is_qwen4exp && r->decode_mode &&
+        trunk == 1 && !attention_only && qwen4_phase_env &&
+        atoi(qwen4_phase_env) != 0;
+    if (qwen4_phase_profile && hipStreamSynchronize(r->stream) != hipSuccess) {
+        r->qwen4_forward_error = 1; return;
+    }
+    double qwen4_phase_start = qwen4_phase_profile ? hllm_monotonic_ms() : 0.0;
     const char *pre_graph_env = getenv("LLM_QWEN_PRE_GRAPHS");
     if (!pre_graph_env)
         pre_graph_env = getenv("LLM_QWEN4_PRE_GRAPHS");
@@ -32289,9 +32297,27 @@ static void forward_layer_state_phase(hip_llm_runner *r, hip_layer *cl, int l,
                             captured, failed);
                 }
             }
+            if (qwen4_phase_profile && hipStreamSynchronize(r->stream) != hipSuccess) {
+                r->qwen4_forward_error = 1; return;
+            }
+            double qwen4_moe_start = qwen4_phase_profile ? hllm_monotonic_ms() : 0.0;
             forward_moe_ffn(r, cl);
+            if (qwen4_phase_profile && hipStreamSynchronize(r->stream) != hipSuccess) {
+                r->qwen4_forward_error = 1; return;
+            }
+            double qwen4_combine_start = qwen4_phase_profile ? hllm_monotonic_ms() : 0.0;
             debug_f32_state(r, l, "Q4 moe_out", r->d_moe_accum, n_embd);
             forward_hc_combine(r, r->d_moe_accum);
+            if (qwen4_phase_profile) {
+                if (hipStreamSynchronize(r->stream) != hipSuccess) {
+                    r->qwen4_forward_error = 1; return;
+                }
+                double qwen4_phase_end = hllm_monotonic_ms();
+                fprintf(stderr, "hip_llm: decode-phase layer=%d pos=%d state=%.3f moe=%.3f combine=%.3f\n",
+                    l, r->cur_position, qwen4_moe_start - qwen4_phase_start,
+                    qwen4_combine_start - qwen4_moe_start,
+                    qwen4_phase_end - qwen4_combine_start);
+            }
             debug_hc_state(r, l, "ffn");
             if (qwen_pre_capturing && qwen_moe_graph) {
                 hipError_t capture_err = hipStreamEndCapture(
