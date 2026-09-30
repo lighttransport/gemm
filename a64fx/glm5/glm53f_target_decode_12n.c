@@ -261,8 +261,7 @@ static glm53f_target_model_12n *target_model_create_with_kda(
     m->batch_output = a256((size_t)PREFILL_BATCH * HIDDEN * sizeof(float));
     m->batch_tmp = a256((size_t)PREFILL_BATCH * HIDDEN * sizeof(float));
     m->kda_defer = getenv("GLM53F_KDA_DEFER") ? atoi(getenv("GLM53F_KDA_DEFER")) : 0;
-    m->kda_async = getenv("GLM53F_KDA_ASYNC") ? atoi(getenv("GLM53F_KDA_ASYNC")) : 0;
-    if (m->kda_async) m->kda_defer = 1;
+    m->kda_async = getenv("GLM53F_KDA_ASYNC") ? atoi(getenv("GLM53F_KDA_ASYNC")) : 1;
     for (int l = 0; l < LAYERS; l++) {
         size_t n = glm53f_kda_state_bytes_12n(m->kda[l]);
         if (n > m->batch_state_stride) m->batch_state_stride = n;
@@ -462,12 +461,13 @@ int glm53f_target_model_step_batch_12n(glm53f_target_model_12n *m,
             int wide_kda = tokens > VERIFY_BATCH &&
                 getenv("GLM53F_KDA_WIDE_TILE") &&
                 atoi(getenv("GLM53F_KDA_WIDE_TILE"));
-            const int defer_kda = wide_kda && (m->prefill.features & GLM53F_PREFILL_COMM) &&
-                !after && m->kda_defer &&
+            const int want_defer = wide_kda && (m->prefill.features & GLM53F_PREFILL_COMM) && !after &&
                 (tokens % GLM53F_KDA_TILE_TOKENS == 0 || tokens % GLM53F_KDA_TILE_TOKENS > 5);
-            const int async_kda = defer_kda && m->kda_async && glm53f_async_available_12n() &&
-                !glm53f_async_begin_12n(m->batch_tmp, m->batch_output, tokens, HIDDEN,
-                                        m->prefill.slab_tokens);
+            /* async: a helper thread on the spare core reduces finished tiles while the next ones are computed (needs the
+             * multi-TNI prefill collective and a free core); otherwise fall back to the per-tile synchronous reduction */
+            const int async_kda = want_defer && m->kda_async && glm53f_async_available_12n() &&
+                !glm53f_async_begin_12n(m->batch_tmp, m->batch_output, tokens, HIDDEN, m->prefill.slab_tokens);
+            const int defer_kda = async_kda || (want_defer && m->kda_defer);
             float *kda_out = async_kda ? m->batch_tmp : m->batch_output;
             if (defer_kda) glm53f_kda_set_defer_reduce_12n(1);
             for (int tile = 0; tile < tokens;

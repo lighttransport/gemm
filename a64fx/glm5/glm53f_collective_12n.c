@@ -7,6 +7,8 @@
 #include <limits.h>
 #include <utofu.h>
 #include <pthread.h>
+#include <omp.h>
+#include <unistd.h>
 #include <sched.h>
 #include <stdatomic.h>
 #include "../utofu-tests/tofu_demo.h"
@@ -93,7 +95,14 @@ static int mtni_drain_tcq(const int *issued) {
     for (int k = 0; k < glm53f_mtni_nt; ++k)
         for (int j = 0; j < issued[k]; ++j) {
             int rc;
-            do { rc = utofu_poll_tcq(glm53f_mtni_vcq[k], 0, &cb); } while (rc == UTOFU_ERR_NOT_FOUND);
+            unsigned long spins = 0;
+            do {
+                rc = utofu_poll_tcq(glm53f_mtni_vcq[k], 0, &cb);
+                if (rc == UTOFU_ERR_NOT_FOUND && (++spins & 0x3FFFFFFul) == 0) {
+                    int r; MPI_Comm_rank(MPI_COMM_WORLD, &r);
+                    fprintf(stderr, "MTNI_WATCHDOG rank=%d drain_tcq stuck k=%d j=%d/%d seq=%llu\n", r, k, j, issued[k], (unsigned long long)glm53f_mtni_seq);
+                }
+            } while (rc == UTOFU_ERR_NOT_FOUND);
             if (rc != UTOFU_SUCCESS) return -1;
         }
     return 0;
@@ -504,24 +513,32 @@ int glm53f_sum_allreduce_slabs_12n(const float *input, float *output,
 static struct {
     pthread_t th; int started, width, slab, total, rc;
     const float *in; float *out;
-    _Atomic int go, stop, ready, done;
+    _Atomic int go, stop, ready, done, stage, cur_t, pin_ok;
 } glm53f_async;
+/* The helper must not share a core with an OpenMP thread.  With OMP_PLACES=cores / close the master sits on the first
+ * core of the job cpuset and thread i on core first+i, so the first free core is first + omp_get_max_threads().  The
+ * thread is created by the (bound) master, so its inherited mask tells us "first".  GLM53F_ASYNC_CORE overrides. */
 static int glm53f_async_pick_core(void) {
     const char *e = getenv("GLM53F_ASYNC_CORE");
     if (e && *e) return atoi(e);
-    cpu_set_t set; int hi = -1;
+    cpu_set_t set;
     CPU_ZERO(&set);
-    if (!sched_getaffinity(0, sizeof set, &set))
-        for (int c = 0; c < 512; ++c) if (CPU_ISSET(c, &set)) hi = c;
-    return hi;
+    if (sched_getaffinity(0, sizeof set, &set)) return -1;
+    if (CPU_COUNT(&set) != 1) return -1; /* OpenMP threads are not bound one per core: no safe spare core */
+    for (int c = 0; c < 512; ++c) if (CPU_ISSET(c, &set)) return c + omp_get_max_threads();
+    return -1;
 }
 static void *glm53f_async_main(void *arg) {
     (void)arg;
     int core = glm53f_async_pick_core();
+    int ok = 0;
     if (core >= 0) {
         cpu_set_t set; CPU_ZERO(&set); CPU_SET(core, &set);
-        sched_setaffinity(0, sizeof set, &set);
+        ok = sched_setaffinity(0, sizeof set, &set) == 0;
+        if (getenv("GLM53F_ASYNC_TRACE")) fprintf(stderr, "ASYNC helper core %d pinned=%d\n", core, ok);
     }
+    atomic_store(&glm53f_async.pin_ok, ok ? 1 : -1);
+    if (!ok) return NULL; /* never spin on a core shared with the compute threads */
     for (;;) {
         while (!atomic_load_explicit(&glm53f_async.go, memory_order_acquire) &&
                !atomic_load_explicit(&glm53f_async.stop, memory_order_acquire))
@@ -534,12 +551,15 @@ static void *glm53f_async_main(void *arg) {
         int t = 0, rc = 0;
         while (t < total) {
             int n = total - t < slab ? total - t : slab;
+            atomic_store(&glm53f_async.cur_t, t); atomic_store(&glm53f_async.stage, 1);
             while (atomic_load_explicit(&glm53f_async.ready, memory_order_acquire) < t + n)
                 __asm__ __volatile__("yield" ::: "memory");
+            atomic_store(&glm53f_async.stage, 2);
             const size_t off = (size_t)t * width;
             if (!rc) rc = n > 5 && glm53f_prefill_algorithm ?
                 glm53f_prefill_reduce_gather(in + off, out + off, n * width, glm53f_prefill_algorithm) :
                 glm53f_sum_allreduce_12n(in + off, out + off, n * width);
+            atomic_store(&glm53f_async.stage, 3);
             t += n;
             if (t == total) glm53f_async.rc = rc; /* before publishing completion */
             atomic_store_explicit(&glm53f_async.done, t, memory_order_release);
@@ -552,9 +572,12 @@ int glm53f_async_begin_12n(const float *input, float *output, int tokens, int wi
     if (!glm53f_async_available_12n() || !input || !output || tokens < 1 || width < 1) return -1;
     int available = glm53f_collective_capacity_12n() / width;
     if (available < 1) return -1;
+    if (glm53f_async.started < 0) return -1; /* pinning failed earlier */
     if (!glm53f_async.started) {
         if (pthread_create(&glm53f_async.th, NULL, glm53f_async_main, NULL)) return -1;
         glm53f_async.started = 1;
+        while (!atomic_load(&glm53f_async.pin_ok)) sched_yield();
+        if (atomic_load(&glm53f_async.pin_ok) < 0) { pthread_join(glm53f_async.th, NULL); glm53f_async.started = -1; return -1; }
     }
     glm53f_async.in = input; glm53f_async.out = output; glm53f_async.width = width;
     glm53f_async.total = tokens; glm53f_async.rc = 0;
@@ -574,8 +597,16 @@ void glm53f_async_ready_12n(int tokens_ready) {
 int glm53f_async_finish_12n(void) {
     static int trace = -1, calls;
     if (trace < 0) trace = getenv("GLM53F_ASYNC_TRACE") != NULL;
-    while (atomic_load_explicit(&glm53f_async.done, memory_order_acquire) < glm53f_async.total)
+    unsigned long spins = 0;
+    while (atomic_load_explicit(&glm53f_async.done, memory_order_acquire) < glm53f_async.total) {
         __asm__ __volatile__("yield" ::: "memory");
+        if ((++spins & 0x1FFFFFFFul) == 0) {
+            int r; MPI_Comm_rank(MPI_COMM_WORLD, &r);
+            fprintf(stderr, "ASYNC_WATCHDOG rank=%d finish waiting done=%d total=%d ready=%d helper_stage=%d helper_t=%d seq=%llu\n", r,
+                    atomic_load(&glm53f_async.done), glm53f_async.total, atomic_load(&glm53f_async.ready),
+                    atomic_load(&glm53f_async.stage), atomic_load(&glm53f_async.cur_t), (unsigned long long)glm53f_mtni_seq);
+        }
+    }
     if (trace) { int r; MPI_Comm_rank(MPI_COMM_WORLD, &r); fprintf(stderr, "ASYNC finish rank=%d call=%d\n", r, calls++); }
     return glm53f_async.rc;
 }
