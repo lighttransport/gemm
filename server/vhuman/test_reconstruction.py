@@ -266,9 +266,40 @@ class ReconstructionTests(unittest.TestCase):
             service=EyeService(Path(d));root=service.work/'heads'/'abc'/'reconstruction'/'def'
             root.mkdir(parents=True);(root/'manifest.json').write_text('{}')
             self.assertEqual(service.reconstruction_file('abc','def','manifest.json'),root/'manifest.json')
+            completion=root/'skin_completion_confidence.png'
+            completion.write_bytes(b'completion map')
+            self.assertEqual(service.reconstruction_file('abc','def',completion.name),completion)
             for name in ('../head.json','geometry.npz/../manifest.json','rig/../../manifest.json'):
                 with self.assertRaises(ServiceError):service.reconstruction_file('abc','def',name)
             with self.assertRaises(ServiceError):service.reconstruction_file('abc','.partial','manifest.json')
+
+    def test_reconstruction_boolean_options_before_subprocess(self):
+        from unittest.mock import patch
+        from .service import EyeService
+        from .reconstruction.job import reconstruction_job
+        import threading
+        class StopBeforeLaunch(Exception):pass
+        with tempfile.TemporaryDirectory(dir=ROOT) as d:
+            service=EyeService(Path(d));head=service.work/'heads'/'abc'
+            head.mkdir(parents=True);(head/'head.json').write_text('{}')
+            base=dict(head_id='abc',build_rig=False)
+            with patch('server.vhuman.reconstruction.job.subprocess.Popen',side_effect=StopBeforeLaunch) as launch, \
+                 patch('server.vhuman.reconstruction.job.gpu.gpu_status',return_value=None):
+                for option in ('spatial_materials','auto_exclusions'):
+                    for value in ('false','true',0,1,None,[],{}):
+                        with self.subTest(option=option,value=value):
+                            with self.assertRaisesRegex(ValueError,option+' must be a boolean'):
+                                reconstruction_job(service,dict(base,**{option:value}),lambda *a:None,
+                                                   threading.Event(),python=Path(__file__),mock=True)
+                    launch.assert_not_called()
+                for options in ({},{'spatial_materials':False,'auto_exclusions':False},
+                                {'spatial_materials':True,'auto_exclusions':True}):
+                    with self.assertRaises(StopBeforeLaunch):
+                        reconstruction_job(service,dict(base,**options),lambda *a:None,
+                                           threading.Event(),python=Path(__file__),mock=True)
+                    command=launch.call_args.args[0]
+                    for option in ('spatial_materials','auto_exclusions'):
+                        self.assertEqual('--'+option.replace('_','-') in command,options.get(option,False))
 
     def test_eye_frame_initialization(self):
         from types import SimpleNamespace

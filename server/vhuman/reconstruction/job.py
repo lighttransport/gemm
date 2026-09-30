@@ -40,6 +40,9 @@ def reconstruction_job(service, request, progress, cancel, *, python=None, mock=
         raise ValueError('invalid roughness/F0 prior')
     detail_um=float(request.get('detail_um',0.))
     if not 0<=detail_um<=30:raise ValueError('detail must be 0..30 micrometres')
+    for option in ('spatial_materials','auto_exclusions'):
+        if type(request.get(option,False)) is not bool:
+            raise ValueError(option+' must be a boolean')
     count = int(request.get('gaussians',0))
     if count not in (0,2000,8000,20000):
         raise ValueError('gaussians must be 0/2000/8000/20000')
