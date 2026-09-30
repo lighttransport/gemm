@@ -620,7 +620,7 @@ int glm53f_sum_allreduce_12n(const float *input, float *output, int count) {
     }
     if (input != output) memcpy(output, input, (size_t)count * sizeof(float));
     static int mtni_decode = -1;
-    if (mtni_decode < 0) mtni_decode = getenv("GLM53F_MTNI_DECODE") ? atoi(getenv("GLM53F_MTNI_DECODE")) : 0;
+    if (mtni_decode < 0) mtni_decode = getenv("GLM53F_MTNI_DECODE") ? atoi(getenv("GLM53F_MTNI_DECODE")) : 1;
     if (glm53f_mtni_active && mtni_decode && count <= glm53f_mtni_max && count >= glm53f_mtni_n)
         return glm53f_mtni_allreduce(output, output, count);
     if (glm53f_utofu_2d)
