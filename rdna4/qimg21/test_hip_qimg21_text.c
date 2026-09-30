@@ -57,6 +57,7 @@ static int text_norm(cuda_qimg_runner *r, CUfunction fn, const qimg21_shards *s,
 }
 
 int main(int argc, char **argv) {
+    int device_index = 0;
     const char *model = NULL, *tokens = NULL, *out = NULL, *dump_dir = NULL;
     const char *dump_tokens = NULL, *dump_rope_table = NULL;
     const char *vision_merged = NULL, *vision_deepstack_dir = NULL, *rope_table_path = NULL;
@@ -68,7 +69,8 @@ int main(int argc, char **argv) {
     int drop = 0, start_layer = 0, layers = 36, dump_layer = 0;
     int image_grid_h = 0, image_grid_w = 0, image_start = -1;
     for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "--model") && i + 1 < argc) model = argv[++i];
+        if (!strcmp(argv[i], "--device") && i+1<argc) { device_index=atoi(argv[++i]); if(device_index<0)return 2; }
+        else if (!strcmp(argv[i], "--model") && i + 1 < argc) model = argv[++i];
         else if (!strcmp(argv[i], "--tokens") && i + 1 < argc) tokens = argv[++i];
         else if (!strcmp(argv[i], "--prompt") && i + 1 < argc) prompt = argv[++i];
         else if (!strcmp(argv[i], "--out") && i + 1 < argc) out = argv[++i];
@@ -220,7 +222,7 @@ int main(int argc, char **argv) {
         memcpy(host, hidden.data, (size_t)n * 4096 * sizeof(float));
         npy_free(&hidden);
     }
-    r = cuda_qimg_init(0, 1);
+    r = cuda_qimg_init(device_index, 1);
     if (!r) goto done;
     if (strcmp(attention_mode, "custom")) {
         const char *plugin_path = !strcmp(attention_mode, "flash-exact")
@@ -260,7 +262,7 @@ int main(int argc, char **argv) {
     if (visual_count && !rope_table_path) {
         npy_f32 base={0};
         float *composed=NULL;
-        if(npy_read_f32("cuda/qimg21/qwen21_text_rope.npy",&base)||base.ndim!=3||
+        if(npy_read_f32("rdna4/qimg21/qwen21_text_rope.npy",&base)||base.ndim!=3||
            base.shape[1]!=128||base.shape[2]!=2) {npy_free(&base);goto done;}
         composed=malloc((size_t)n*128*2*4);
         if(!composed){npy_free(&base);goto done;}
@@ -284,7 +286,7 @@ int main(int argc, char **argv) {
         free(composed);npy_free(&base);
     } else {
         npy_f32 table={0};
-        const char *table_path = rope_table_path ? rope_table_path : "cuda/qimg21/qwen21_text_rope.npy";
+        const char *table_path = rope_table_path ? rope_table_path : "rdna4/qimg21/qwen21_text_rope.npy";
         if(npy_read_f32(table_path,&table) || table.ndim!=3 ||
            table.shape[0]<(size_t)n || table.shape[1]!=128 || table.shape[2]!=2) {
             fprintf(stderr,"text: invalid/missing qwen21_text_rope.npy\n"); npy_free(&table); goto done;

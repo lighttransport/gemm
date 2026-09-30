@@ -185,7 +185,7 @@ class App:
         self.body_job = body_job
         self.gpu = gpu
         self.qwen_opts = {"python": args.qwen_python, "mock": args.mock}
-        self.jobs = Jobs(Path(args.work) / "jobs", {
+        handlers = {
             "plates": lambda req, prog, cancel: qwen.plates_job(self.service, req, prog, cancel, **self.qwen_opts),
             "baseline": lambda req, prog, cancel: baseline.baseline_job(self.service, req, prog, cancel,
                                                                         mock=args.mock, python=args.qwen_python),
@@ -220,11 +220,26 @@ class App:
                 self.service, req, prog, cancel, python=getattr(args, "rig_python", None)),
             "rig_fit_video": lambda req, prog, cancel: video_fit.fit_job(
                 self.service, req, prog, cancel, python=getattr(args, "rig_python", None)),
-        })
+        }
+        def configured(handler):
+            def run(request, progress, cancel):
+                with gpu.execution(getattr(args, "inference_backend", "auto"),
+                                   getattr(args, "device", 0), getattr(args, "models_root", "/mnt/disk1/models")) as selected:
+                    result = handler(request, progress, cancel)
+                    result.setdefault("backend", "mock" if args.mock else selected)
+                    result.setdefault("device", gpu.device_index())
+                    return result
+            return run
+        self.jobs = Jobs(Path(args.work) / "jobs", {name: configured(fn) for name, fn in handlers.items()})
 
     def health(self) -> dict:
+        with gpu.execution(getattr(self.args, "inference_backend", "auto"),
+                           getattr(self.args, "device", 0), getattr(self.args, "models_root", "/mnt/disk1/models")):
+            return self._health()
+
+    def _health(self) -> dict:
         from . import baseline, qwen
-        return {"ok": True, "gpu": self.gpu.gpu_status(), "qwen": qwen.availability(**self.qwen_opts),
+        return {"ok": True, "backend": gpu.backend(), "device": gpu.device_index(), "gpu": self.gpu.gpu_status(), "qwen": qwen.availability(**self.qwen_opts),
                 "pixal3d": baseline.availability(mock=self.args.mock), "plates": len(self.service.list_plates()),
                 "rig": self.rig_job.availability(getattr(self.args, "rig_python", None)),
                 "body": self.body_job.availability(getattr(self.args, "sam3d_body_model", self.body_job.MODEL_DIR),
@@ -455,26 +470,30 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Virtual-human eye demo server")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8790)
+    from . import runtime
+    runtime.add_arguments(ap)
     ap.add_argument("--work", default=str(WORK))
     default_py = ROOT / "tmp/qimg21-ref-venv/bin/python"
-    ap.add_argument("--qwen-python", default=str(default_py) if default_py.exists() else None,
+    ap.add_argument("--qwen-python", default=None,
                     help="interpreter for cuda/qimg21/native_generate.py (needs torch)")
     ap.add_argument("--mock", action="store_true", help="mock Qwen and Pixal3D (no GPU)")
     default_rig = ROOT / "tmp/vhuman-rig-venv/bin/python"
-    ap.add_argument("--rig-python", default=str(default_rig) if default_rig.exists() else None,
+    ap.add_argument("--rig-python", default=None,
                     help="interpreter for the facial rig builder (numpy, scipy, torch)")
-    ap.add_argument("--sam3d-body-model", default=str(body_job.MODEL_DIR),
+    ap.add_argument("--sam3d-body-model", default=None,
                     help="local SAM 3D Body checkpoint directory")
-    ap.add_argument("--sam3-model", default=str(body_job.SAM3_MODEL),
+    ap.add_argument("--sam3-model", default=None,
                     help="optional SAM 3 garment segmentation checkpoint")
-    ap.add_argument("--clip-bpe", default=str(body_job.CLIP_BPE),
+    ap.add_argument("--clip-bpe", default=None,
                     help="directory containing garment tokenizer vocab.json and merges.txt")
     ap.add_argument("--tts-model", default=None, help="Qwen3-TTS model directory for rig_speech jobs")
     ap.add_argument("--aligner", default=None, help="ja_align.safetensors for rig_speech jobs")
-    ap.add_argument("--tts-backend", choices=("auto", "cpu", "cuda"), default="auto")
+    ap.add_argument("--tts-backend", choices=("auto", "cpu", "cuda", "rocm"), default="auto")
     ap.add_argument("--emotion-runner", default=None, help="SenseVoiceSmall GGUF runtime executable")
     ap.add_argument("--emotion-model", default=None, help="SenseVoiceSmall GGUF model path")
     args = ap.parse_args(argv)
+    from . import runtime
+    runtime.configure_args(args)
     app = App(args)
     server = ThreadingHTTPServer((args.host, args.port), make_handler(app))
     server.daemon_threads = True

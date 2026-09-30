@@ -394,7 +394,8 @@ class ReconstructionTests(unittest.TestCase):
                     return 0
                 def poll(self):return 0
             cancel=threading.Event()
-            with patch('server.vhuman.rig.job.subprocess.Popen',Process):
+            with patch('server.vhuman.rig.job.subprocess.Popen',Process), \
+                 patch('server.vhuman.rig.job.gpu.gpu_status', return_value=None):
                 with self.assertRaises(Cancelled):
                     rig_job(service,dict(head_id='abc',reconstruction_run='def',res=1024,iters=50),lambda *a:None,cancel,
                             python=Path(__file__),mock=True)

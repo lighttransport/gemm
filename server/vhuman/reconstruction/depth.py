@@ -58,7 +58,8 @@ def infer(image, installation, out):
     DepthAnythingV2 = module.DepthAnythingV2
     model = DepthAnythingV2(encoder='vits',features=64,out_channels=[48,96,192,384])
     model.load_state_dict(torch.load(weights,map_location='cpu',weights_only=True))
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    from server.vhuman.runtime import torch_device
+    device = torch_device(torch)
     model.to(device).eval()
     with torch.inference_mode():
         depth = model.infer_image(cv2.imread(str(image)))

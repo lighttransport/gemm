@@ -1,44 +1,115 @@
-/* CLI smoke test for HIP SAM 3 (Phase 1 — patch_embed + pos + pre-LN).
- * Runs the implemented stages and prints ours[0][:8] of the ViT embed.
+/* CLI entry for HIP SAM 3 runner — end-to-end text-prompted segmentation.
+ *
+ * Mirrors cpu/sam3/test_sam3.c: tokenize phrase -> vit -> fpn -> text
+ *   -> detr_enc -> detr_dec -> dot_score -> mask_dec -> postprocess.
+ *
+ * Usage:
+ *   test_hip_sam3 <ckpt> <image> --phrase "cat" [-o mask.npy]
+ *     [--vocab <vocab.json>] [--merges <merges.txt>]
+ *     [--score-thr 0.3] [--mask-thr 0.5]
  */
 #include "hip_sam3_runner.h"
+#include "../../cpu/sam3/sam3_clip_bpe.h"
 #define STB_IMAGE_IMPLEMENTATION
 #include "../../common/stb_image.h"
+
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-int main(int argc, char **argv)
-{
-    if (argc < 3) {
-        fprintf(stderr,
-            "Usage: %s <sam3.model.safetensors> <image.jpg>\n", argv[0]);
-        return 1;
-    }
+static void write_npy_u8(const char *path, const uint8_t *data,
+                          int n, int h, int w) {
+    FILE *f = fopen(path, "wb"); if (!f) return;
+    char hdr[256];
+    int L = snprintf(hdr, sizeof(hdr),
+        "{'descr': '|u1', 'fortran_order': False, 'shape': (%d, %d, %d), }",
+        n, h, w);
+    while ((L + 10) % 16 != 0) hdr[L++] = ' ';
+    hdr[L++] = '\n';
+    uint8_t magic[10] = { 0x93, 'N','U','M','P','Y', 1, 0, 0, 0 };
+    uint16_t hl = (uint16_t)L;
+    memcpy(magic + 8, &hl, 2);
+    fwrite(magic, 1, 10, f);
+    fwrite(hdr, 1, L, f);
+    fwrite(data, 1, (size_t)n * h * w, f);
+    fclose(f);
+}
+
+static void usage(const char *p) {
+    fprintf(stderr,
+        "Usage: %s <ckpt> <image> --phrase \"cat\" [-o mask.npy]\n"
+        "       [--vocab vocab.json] [--merges merges.txt]\n"
+        "       [--score-thr 0.3] [--mask-thr 0.5]\n"
+        "       [--device N]   (gfx12 native mixed precision)\n", p);
+}
+
+int main(int argc, char **argv) {
+    if (argc < 5) { usage(argv[0]); return 1; }
     const char *ckpt = argv[1];
     const char *img_path = argv[2];
+    const char *phrase = NULL;
+    const char *out_path = "mask.npy";
+    /* Override via --vocab / --merges. Any CLIP (SD1-style) tokenizer works. */
+    const char *vocab  = "vocab.json";
+    const char *merges = "merges.txt";
+    float score_thr = 0.3f, mask_thr = 0.5f;
+    int device=0;
+
+    for (int i = 3; i < argc; i++) {
+        if (!strcmp(argv[i], "--phrase") && i+1 < argc) phrase = argv[++i];
+        else if (!strcmp(argv[i], "-o") && i+1 < argc) out_path = argv[++i];
+        else if (!strcmp(argv[i], "--vocab") && i+1 < argc) vocab = argv[++i];
+        else if (!strcmp(argv[i], "--merges") && i+1 < argc) merges = argv[++i];
+        else if (!strcmp(argv[i], "--score-thr") && i+1 < argc) score_thr = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "--mask-thr")  && i+1 < argc) mask_thr  = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "--device") && i+1 < argc) { device=atoi(argv[++i]); if(device<0)return 1; }
+        else { usage(argv[0]); return 1; }
+    }
+    if (!phrase) { fprintf(stderr, "--phrase required\n"); return 1; }
 
     int H, W, C;
     unsigned char *rgb = stbi_load(img_path, &W, &H, &C, 3);
     if (!rgb) { fprintf(stderr, "failed to load %s\n", img_path); return 2; }
 
-    hip_sam3_config cfg = { .ckpt_path = ckpt, .image_size = 1008,
-                             .device_ordinal = 0, .verbose = 1 };
-    hip_sam3_ctx *ctx = hip_sam3_create(&cfg);
-    if (!ctx) { stbi_image_free(rgb); return 3; }
+    sam3_clip_bpe *tok = sam3_clip_bpe_load(vocab, merges);
+    if (!tok) { fprintf(stderr, "tokenizer load failed (%s, %s)\n", vocab, merges); return 3; }
+    int32_t ids[32], mask[32];
+    int nv = sam3_clip_bpe_encode(tok, phrase, 32, ids, mask);
+    fprintf(stderr, "tokenized '%s' -> %d tokens\n", phrase, nv);
+    sam3_clip_bpe_free(tok);
 
-    if (hip_sam3_set_image(ctx, rgb, H, W)) {
-        hip_sam3_destroy(ctx); stbi_image_free(rgb); return 4;
+    hip_sam3_config cfg = { .ckpt_path = ckpt, .image_size = 1008,
+                             .device_ordinal = device, .verbose = 1 };
+    hip_sam3_ctx *ctx = hip_sam3_create(&cfg);
+    if (!ctx) { stbi_image_free(rgb); return 4; }
+
+    if (hip_sam3_set_image(ctx, rgb, H, W)) return 5;
+    if (hip_sam3_run_vit(ctx, 31))          return 6;
+    if (hip_sam3_run_fpn(ctx))              return 7;
+    if (hip_sam3_set_input_ids(ctx, ids, mask)) return 8;
+    if (hip_sam3_run_text(ctx))             return 9;
+    if (hip_sam3_run_detr_enc(ctx))         return 10;
+    if (hip_sam3_run_detr_dec(ctx))         return 11;
+    if (hip_sam3_run_dot_score(ctx))        return 12;
+    if (hip_sam3_run_mask_dec(ctx))         return 13;
+    if (hip_sam3_run_postprocess(ctx, H, W, score_thr, mask_thr)) return 14;
+
+    int nk, oh, ow;
+    const float   *scores = hip_sam3_get_final_scores(ctx, &nk);
+    const float   *boxes  = hip_sam3_get_final_boxes(ctx, &nk);
+    const uint8_t *masks  = hip_sam3_get_final_masks(ctx, &nk, &oh, &ow);
+    fprintf(stderr, "kept %d masks @ %dx%d\n", nk, oh, ow);
+    for (int i = 0; i < nk && i < 10; i++) {
+        fprintf(stderr, "  [%d] score=%.4f box=(%.1f, %.1f, %.1f, %.1f)\n",
+                i, scores[i], boxes[i*4], boxes[i*4+1],
+                boxes[i*4+2], boxes[i*4+3]);
+    }
+    if (nk > 0 && masks) {
+        write_npy_u8(out_path, masks, nk, oh, ow);
+        fprintf(stderr, "wrote %s (%d, %d, %d)\n", out_path, nk, oh, ow);
     }
 
-    int n_tok, D;
-    float *emb = (float *)malloc((size_t)5184 * 1024 * sizeof(float));
-    hip_sam3_get_vit_embed(ctx, emb, &n_tok, &D);
-    fprintf(stderr, "vit_embed (%d, %d), tok0[:8]:", n_tok, D);
-    for (int i = 0; i < 8; i++) fprintf(stderr, " %.4f", emb[i]);
-    fprintf(stderr, "\n");
-
-    free(emb);
     hip_sam3_destroy(ctx);
     stbi_image_free(rgb);
     return 0;

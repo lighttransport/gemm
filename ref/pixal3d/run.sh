@@ -17,4 +17,8 @@ mkdir -p "$TMPDIR" "$TORCH_EXTENSIONS_DIR" "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_C
 if [ "$backend" = rocm ] && [ -d /opt/rocm/core/lib ]; then
     export LD_LIBRARY_PATH="/opt/rocm/core/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 fi
+# Native input preparation shares vhuman's pinned ROCm environment.
+if [ "$backend" = rocm ] && { [ "$(basename "${1:-}")" = prepare_input.py ] || [ "${1:-}" = "$project_dir/../../server/pixal3d/app.py" ]; } && [ -x "$project_dir/../../tmp/vhuman-rocm-venv/bin/python" ]; then
+    exec "$project_dir/../../tmp/vhuman-rocm-venv/bin/python" "$@"
+fi
 exec uv run --project "$project_dir" --frozen --extra "$backend" python "$@"

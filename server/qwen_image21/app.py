@@ -26,12 +26,12 @@ from urllib.parse import parse_qs, urlparse
 
 ROOT = Path(__file__).resolve().parents[2]
 WEB = ROOT / "web"
-DEFAULT_MODEL = Path("/mnt/nvme01/models/qimg-21")
+DEFAULT_MODEL = Path("/mnt/disk1/models/qimg-21")
 DEFAULT_QUANT = ROOT / "tmp/qimg21-int8-package"
 DEFAULT_PYTHON = ROOT / "tmp/qimg21-ref-venv/bin/python"
 DEFAULT_FAST = ROOT / "cuda/qimg21/test_cuda_qimg21_fast"
-DEFAULT_FAST_PACKAGES = {"int8": Path("/mnt/nvme01/models/qimg-21-fast/int8-smooth-a0.6"),
-                         "nvfp4": Path("/mnt/nvme01/models/qimg-21-fast/nvfp4-svd-a0.5-m")}
+DEFAULT_FAST_PACKAGES = {"int8": Path("/mnt/disk1/models/qimg-21-fast/int8-smooth-a0.6"),
+                         "nvfp4": Path("/mnt/disk1/models/qimg-21-fast/nvfp4-svd-a0.5-m")}
 # Fast CUDA denoiser presets (test_cuda_qimg21_fast --preset) and the
 # pack_fast.py weight package each needs.
 FAST_PRESETS = {"low8": "int8", "low8-fp4": "nvfp4", "fast12": "int8", "accurate": None}
@@ -638,12 +638,13 @@ class ResidentDenoiser:
     def key_for(demo: "Demo", cfg: dict) -> tuple | None:
         """The setup a run needs, or None when a resident process cannot serve it."""
         preset = cfg.get("preset")
-        if (cfg["backend"] != "cuda" or not preset or cfg["mode"] != "native" or cfg["upscale"] > 1.0
-                or cfg["quantized"] or not demo.model.is_dir() or not demo.preset_available(preset)):
+        if (cfg["backend"] not in ("cuda", "rocm") or not preset or cfg["mode"] != "native" or cfg["upscale"] > 1.0
+                or cfg["quantized"] or not demo.model.is_dir() or not demo.preset_available(preset, cfg["backend"])):
             return None
         kind = FAST_PRESETS[preset]
         package = str(demo.fast_packages[kind]) if kind else ""
-        return (str(demo.fast), demo.fast.stat().st_mtime_ns, str(demo.model), preset, package,
+        binary = demo.fast_binary(cfg["backend"])
+        return (str(binary), binary.stat().st_mtime_ns, str(demo.model), preset, package,
                 cfg["height"] // 16, cfg["width"] // 16, bool(cfg["negative_prompt"]),
                 FAST_ATTENTION.get(cfg.get("attention") or "", ""))
 
@@ -681,6 +682,8 @@ class ResidentDenoiser:
                 return None
             if self.vae_process is not None and self.vae_process.poll() is None:
                 return self.vae_socket_path
+            if self.key[0].find("test_hip_") >= 0:
+                return None
             binary = ROOT / "cuda/qimg21/test_cuda_qimg21_vae"
             if not binary.is_file():
                 return None
@@ -712,7 +715,7 @@ class ResidentDenoiser:
             self.directory.mkdir(parents=True, exist_ok=True)
             self.socket = self.directory / "fast.sock"
             _, _, model, preset, package, h, w, cfg_batch, attention = key
-            command = [str(demo.fast), "--serve", str(self.socket), "--preset", preset, "--model", model,
+            command = [str(key[0]), "--serve", str(self.socket), "--preset", preset, "--model", model,
                        "--height-tokens", str(h), "--width-tokens", str(w),
                        "--serve-cfg", "1" if cfg_batch else "0"]
             if attention:
@@ -782,9 +785,12 @@ class Demo:
         self.resident = ResidentDenoiser(self.work.parent / "qimg21-resident")
         self.reference_server = ResidentReference(self.work.parent / "qimg21-resident")
 
-    def preset_available(self, preset: str) -> bool:
+    def fast_binary(self, backend="cuda") -> Path:
+        return self.fast if backend == "cuda" else ROOT / "rdna4/qimg21/test_hip_qimg21_fast"
+
+    def preset_available(self, preset: str, backend="cuda") -> bool:
         kind = FAST_PRESETS[preset]
-        return self.fast.is_file() and (
+        return (backend != "rocm" or preset != "low8-fp4") and self.fast_binary(backend).is_file() and (
             kind is None or (self.fast_packages.get(kind, Path("/nonexistent")) / "manifest.json").is_file())
 
     def reference_python(self, device: str) -> Path:
@@ -820,7 +826,7 @@ class Demo:
                  "'cuda': bool(torch.cuda.is_available())}))")
         try:
             done = subprocess.run([str(python), "-c", probe], capture_output=True,
-                                  text=True, timeout=PROBE_TIMEOUT)
+                                  text=True, timeout=PROBE_TIMEOUT, env=dict(os.environ, LD_LIBRARY_PATH="/opt/rocm/core/lib:"+os.environ.get("LD_LIBRARY_PATH", "")))
         except (OSError, subprocess.TimeoutExpired) as exc:
             result["reason"] = f"could not probe {python}: {exc}"
             self._probes[str(python)] = result
@@ -937,8 +943,8 @@ class Demo:
         if preset is not None:
             if preset not in FAST_PRESETS:
                 raise ValueError("preset must be one of " + ", ".join(FAST_PRESETS))
-            if backend != "cuda":
-                raise ValueError("fast presets are CUDA only")
+            if backend == "rocm" and preset == "low8-fp4":
+                raise ValueError("NVFP4 is unavailable on RDNA4; use low8 or fast12")
             if quantized:
                 raise ValueError("a fast preset selects its own weights; leave quantized off")
 
@@ -955,7 +961,7 @@ class Demo:
             raise ValueError("upscale must be between 1 (no refine) and 4")
         tiled = upscale > 1.0
         if tiled:
-            if backend != "cuda" or preset is None:
+            if backend not in ("cuda", "rocm") or preset is None:
                 raise ValueError("a tiled refine needs a CUDA fast preset; pick one under "
                                  "'CUDA denoiser'")
             if mode != "native":
@@ -971,7 +977,7 @@ class Demo:
                 if base % 32:
                     raise ValueError(f"upscale {upscale} leaves a {base} px base for a {side} px "
                                      "side, which is not a multiple of 32")
-        fast_native = backend == "cuda" and preset is not None and mode == "native"
+        fast_native = backend in ("cuda", "rocm") and preset is not None and mode == "native"
         limit = SIZE_LIMIT_TILED if tiled else SIZE_LIMIT_FAST if fast_native else SIZE_LIMIT_REFERENCE
         if width > limit or height > limit:
             what = "a tiled refine" if tiled else "a fast CUDA run" if fast_native else "this run"
@@ -1044,7 +1050,7 @@ class Demo:
         if restart_from is not None:
             if not isinstance(restart_from, str) or not re.fullmatch(r"[0-9a-f]{32}", restart_from):
                 raise ValueError("restart_from must be a job id from an earlier result")
-            if backend != "cuda" or preset is None or mode != "native" or upscale > 1.0:
+            if backend not in ("cuda", "rocm") or preset is None or mode != "native" or upscale > 1.0:
                 raise ValueError("refining with more steps needs a CUDA fast preset in native mode, "
                                  "without the tiled refine")
             try:
@@ -1090,6 +1096,10 @@ class Demo:
         """
         log.parent.mkdir(parents=True, exist_ok=True)
         with log.open("w", encoding="utf-8") as stream:
+            env = dict(os.environ) if env is None else dict(env)
+            env["LD_LIBRARY_PATH"] = "/opt/rocm/core/lib:" + env.get("LD_LIBRARY_PATH", "")
+            env["TMPDIR"] = str(ROOT / "tmp/qimg21-runtime")
+            Path(env["TMPDIR"]).mkdir(parents=True, exist_ok=True)
             process = subprocess.Popen(command, cwd=cwd, stdout=stream, stderr=subprocess.STDOUT, env=env)
             if progress:
                 stop = threading.Event()
@@ -1136,11 +1146,11 @@ class Demo:
         if preset:
             # The fast runner's preset sets budget, weights and attention.
             kind = FAST_PRESETS[preset]
-            if not self.preset_available(preset):
+            if not self.preset_available(preset, backend):
                 raise RuntimeError(f"preset {preset} is unavailable: build `make -C cuda/qimg21 fast`"
                                    + (f" and provide the {kind} package" if kind else ""))
             at = command.index("--native-bin")
-            command[at:at + 8] = ["--native-bin", str(self.fast), "--runner", "fast", "--preset", preset]
+            command[at:at + 8] = ["--native-bin", str(self.fast_binary(backend)), "--runner", "fast", "--preset", preset]
             if cfg.get("attention"):
                 command += ["--native-attention", FAST_ATTENTION[cfg["attention"]]]
             if kind:
@@ -1481,6 +1491,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {"ok": True, "model": str(demo.model),
                              "quantized_available": demo.quant.is_dir(),
                              "presets": {name: demo.preset_available(name) for name in FAST_PRESETS},
+                             "presets_by_backend": {backend: {name: demo.preset_available(name, backend) for name in FAST_PRESETS} for backend in ("cuda", "rocm")},
                              "size_limit": {"reference": SIZE_LIMIT_REFERENCE,
                                              "fast": SIZE_LIMIT_FAST, "tiled": SIZE_LIMIT_TILED},
                              "native": {backend: all(components[backend].values())
@@ -1512,7 +1523,12 @@ class Handler(BaseHTTPRequestHandler):
                                        or len(job_id) > 64
                                        or not all(c.isalnum() or c in "-_" for c in job_id)):
                 raise ValueError("job must be 1--64 characters of [A-Za-z0-9_-]")
-            result = self.server.demo.generate(request, job_id)  # type: ignore[attr-defined]
+            if str(ROOT) not in sys.path:
+                sys.path.insert(0, str(ROOT))
+            from server.vhuman.gpu import file_lock
+            backend = request.get("backend", "cuda")
+            with file_lock(ROOT / "tmp/pixal3d/device-locks" / f"{backend}-0.lock", 900):
+                result = self.server.demo.generate(request, job_id)  # type: ignore[attr-defined]
             self._json(200, {"ok": True, **result})
         except (ValueError, json.JSONDecodeError) as exc:
             self._json(400, {"ok": False, "error": str(exc)})
@@ -1532,7 +1548,7 @@ def main() -> int:
     ap.add_argument("--native-rocm", type=Path,
                     default=ROOT / "rdna4/qimg21/test_hip_qimg21_native")
     ap.add_argument("--python-rocm", type=Path,
-                    default=ROOT / "tmp/qimg21-rocm-venv/bin/python")
+                    default=ROOT / "tmp/vhuman-rocm-venv/bin/python")
     ap.add_argument("--python-cpu", type=Path, default=None,
                     help="interpreter for the CPU PyTorch reference; defaults to --python, "
                          "since a CUDA build also runs CPU kernels")

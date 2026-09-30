@@ -59,11 +59,11 @@ The server accepts `POST /v1/jobs` with `{"kind":"body","head_id":"..."}`
 and optional `outfit`, `quality`, `seed`, `steps`, `qwen_preset`, and `garments`
 fields. The rig page has the same controls and can preview body poses with
 facial speech.
-The local body checkpoint directory defaults to `/mnt/nvme01/models/sam3d-body`;
+The local body checkpoint directory defaults to `/mnt/disk1/models/sam3d-body`;
 override it with `--sam3d-body-model` on the CLI or server. Optional garment
 segmentation uses a separate SAM 3 checkpoint (`--sam3-model`, default
-`/mnt/nvme01/models/sam3/sam3.model.safetensors`) and CLIP tokenizer directory
-(`--clip-bpe`, default `/mnt/nvme01/models/clip-bpe`, containing `vocab.json`
+`/mnt/disk1/models/sam3/sam3.model.safetensors`) and CLIP tokenizer directory
+(`--clip-bpe`, default `/mnt/disk1/models/clip-bpe`, containing `vocab.json`
 and `merges.txt`). Pass these options before `body` for the CLI, or when
 starting the server. Missing garment assets are recorded as a body-texture
 fallback. The model files remain outside the repository and are not copied

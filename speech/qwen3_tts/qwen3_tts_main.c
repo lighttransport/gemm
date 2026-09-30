@@ -97,7 +97,15 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--max-frames") && v) { gp.max_frames = atoi(v); i++; }
         else if (!strcmp(a, "--temperature") && v) { gp.temperature = gp.sub_temperature = (float)atof(v); i++; }
         else if (!strcmp(a, "--top-k") && v) { gp.top_k = gp.sub_top_k = atoi(v); i++; }
-        else if (!strcmp(a, "--backend") && v) { use_cuda = !strcmp(v, "cuda"); i++; }
+        else if (!strcmp(a, "--backend") && v) { if (strcmp(v, "cpu") && strcmp(v, "cuda") && strcmp(v, "rocm")) { fprintf(stderr, "invalid backend %s\n", v); return 2; }
+#ifdef QTTS_WITH_HIP
+            if (!strcmp(v, "cuda")) { fprintf(stderr, "ROCm runner cannot select CUDA\n"); return 2; }
+            use_cuda = !strcmp(v, "rocm");
+#else
+            if (!strcmp(v, "rocm")) { fprintf(stderr, "use the ROCm runner\n"); return 2; }
+            use_cuda = !strcmp(v, "cuda");
+#endif
+            i++; }
         else if (!strcmp(a, "--device") && v) { device = atoi(v); i++; }
         else if (!strcmp(a, "--codes-in") && v) { codes_in = v; i++; }
         else if (!strcmp(a, "--greedy")) gp.greedy = 1;

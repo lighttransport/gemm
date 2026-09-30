@@ -216,7 +216,8 @@ def fit(tmpl, pos, subj, feat, shapes: dict, rig_def: dict, skel: dict, joints, 
     from . import template as T
     from .torchrig import TorchRig
     manifest = json.loads((folder / "manifest.json").read_text())
-    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    from server.vhuman.runtime import torch_device
+    dev = torch_device(torch)
     cam = PixalCamera.from_portrait(subj.portrait, math.radians(subj.fit["camera"]["fov_deg"]))
     proj = Projector(cam, subj.frame, dev)
     n_img = np.asarray(Image.open(folder / manifest["ref"]).convert("RGB"))

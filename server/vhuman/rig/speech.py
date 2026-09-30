@@ -24,8 +24,8 @@ from ..service import ROOT
 from . import rigdef, usd
 
 SPEECH = ROOT / "speech"
-DEFAULT_MODEL = Path("/mnt/nvme01/models/speech/Qwen3-TTS-12Hz-1.7B-CustomVoice")
-DEFAULT_ALIGNER = Path("/mnt/nvme01/models/speech/japanese-wav2vec2-large-hiragana-ctc/ja_align.safetensors")
+DEFAULT_MODEL = Path("/mnt/disk1/models/speech/Qwen3-TTS-12Hz-1.7B-CustomVoice")
+DEFAULT_ALIGNER = Path("/mnt/disk1/models/speech/japanese-wav2vec2-large-hiragana-ctc/ja_align.safetensors")
 FPS = 30
 VISEMES = ("sil", "PP", "FF", "TH", "DD", "kk", "CH", "SS", "nn", "RR", "aa", "E", "ih", "oh", "ou")
 TAKE_FILES = ("manifest.json", "audio.wav", "align.json", "animation.json", "animation.usda", "lightrig.txt",
@@ -33,9 +33,8 @@ TAKE_FILES = ("manifest.json", "audio.wav", "align.json", "animation.json", "ani
 
 
 def availability(model=DEFAULT_MODEL, aligner=DEFAULT_ALIGNER, backend="auto") -> dict:
-    cuda_runner = SPEECH / "build" / "tts_ja_cuda"
-    selected = ("cuda" if cuda_runner.is_file() and gpu.gpu_status() else "cpu") if backend == "auto" else backend
-    runner = SPEECH / "build" / ("tts_ja_cuda" if selected == "cuda" else "tts_ja")
+    selected = gpu.backend() if backend == "auto" else backend
+    runner = SPEECH / "build" / ("tts_ja" if selected == "cpu" else f"tts_ja_{selected}")
     missing = [str(path) for path, ok in ((runner, runner.is_file()),
                                          (Path(model), Path(model).is_dir()),
                                          (Path(aligner), Path(aligner).is_file())) if not ok]
@@ -387,12 +386,9 @@ def speech_job(service, request: dict, progress, cancel, *, model=DEFAULT_MODEL,
         emotion_model = emotion_model or emotion.DEFAULT_MODEL
         if not emotion.availability(emotion_runner, emotion_model)["available"]:
             raise ValueError("SenseVoice runtime or model missing; see server/vhuman/rig/README.md")
-    selected = backend
-    if selected == "auto":
-        cuda_runner = SPEECH / "build" / ("ja_align_cuda" if wav else "tts_ja_cuda")
-        selected = "cuda" if cuda_runner.is_file() and gpu.gpu_status() else "cpu"
-    if selected not in ("cpu", "cuda"):
-        raise ValueError("backend must be auto, cpu or cuda")
+    selected = gpu.backend() if backend == "auto" else backend
+    if selected not in ("cpu", "cuda", "rocm"):
+        raise ValueError("backend must be auto, cpu, cuda or rocm")
     out_root = rig_path.parent / "takes"
     out_root.mkdir(exist_ok=True)
     take_id = uuid.uuid4().hex[:12]
@@ -412,23 +408,23 @@ def speech_job(service, request: dict, progress, cancel, *, model=DEFAULT_MODEL,
             if not src.is_file():
                 raise ValueError(f"no such WAV: {src}")
             shutil.copyfile(src, stage / "audio.wav")
-            runner = SPEECH / "build" / ("ja_align_cuda" if selected == "cuda" else "ja_align")
+            runner = SPEECH / "build" / ("ja_align" if selected == "cpu" else f"ja_align_{selected}")
             if not runner.is_file() or not Path(aligner).is_file():
                 raise ValueError("ja_align runner or aligner weights missing; see speech/README.md")
             cmd = [str(runner), "--model", str(aligner), "--wav", str(stage / "audio.wav"),
                    "--fps", str(FPS), "--out", str(stage / "align.json")]
             if request.get("kana"):
                 cmd += ["--kana", request["kana"]]
-            if selected == "cuda":
-                cmd += ["--cuda"]
-            with gpu.device_session(1536, cancel) if selected == "cuda" else nullcontext():
+            if selected in ("cuda", "rocm"):
+                cmd += ["--rocm" if selected == "rocm" else "--cuda", "--device", str(gpu.device_index())]
+            with gpu.device_session(1536, cancel) if selected in ("cuda", "rocm") else nullcontext():
                 _run(cmd, cancel, progress)
         else:
-            runner = SPEECH / "build" / ("tts_ja_cuda" if selected == "cuda" else "tts_ja")
+            runner = SPEECH / "build" / ("tts_ja" if selected == "cpu" else f"tts_ja_{selected}")
             if not runner.is_file() or not Path(model).is_dir() or not Path(aligner).is_file():
                 raise ValueError("tts_ja runner or model weights missing; see speech/README.md")
             cmd = [str(runner), "--model", str(model), "--aligner", str(aligner), "--text", text,
-                   "--backend", selected, "--fps", str(FPS), "--out", str(stage / "audio.wav"),
+                   "--backend", selected, "--device", str(gpu.device_index()), "--fps", str(FPS), "--out", str(stage / "audio.wav"),
                    "--aux", str(stage / "align.json")]
             for arg, key in (("--speaker", "speaker"), ("--instruct", "instruct"), ("--kana", "kana"),
                              ("--ref-wav", "ref_wav"), ("--ref-text", "ref_text")):
@@ -437,7 +433,7 @@ def speech_job(service, request: dict, progress, cancel, *, model=DEFAULT_MODEL,
             cmd += ["--seed", str(seed)]
             if request.get("xvec_only"):
                 cmd += ["--xvec-only"]
-            with gpu.device_session(1536, cancel) if selected == "cuda" else nullcontext():
+            with gpu.device_session(1536, cancel) if selected in ("cuda", "rocm") else nullcontext():
                 _run(cmd, cancel, progress)
         if cancel.is_set():
             raise gpu.Cancelled("cancelled")

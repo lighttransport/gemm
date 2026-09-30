@@ -70,7 +70,7 @@ int main(int argc, char **argv) {
     const char *model = "/mnt/nvme01/models/speech/Qwen3-TTS-12Hz-1.7B-CustomVoice";
     const char *aligner = "/mnt/nvme01/models/speech/japanese-wav2vec2-large-hiragana-ctc/ja_align.safetensors";
     const char *text = NULL, *speaker = "Ono_Anna", *instruct = "", *out_wav = "out.wav", *aux = "aux.json";
-    int use_cuda = 0, xvec_only = 0;
+    int use_cuda = 0, xvec_only = 0, device = 0;
     const char *ref_wav = NULL, *ref_text = NULL;
     qtts_gen_params gp;
     qtts_gen_params_default(&gp);
@@ -78,7 +78,8 @@ int main(int argc, char **argv) {
     ja_align_opts_default(&ao);
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i], *v = i + 1 < argc ? argv[i + 1] : NULL;
-        if (!strcmp(a, "--model") && v) { model = v; i++; }
+        if (!strcmp(a, "--device") && v) { device = atoi(v); i++; }
+        else if (!strcmp(a, "--model") && v) { model = v; i++; }
         else if (!strcmp(a, "--aligner") && v) { aligner = v; i++; }
         else if (!strcmp(a, "--text") && v) { text = v; i++; }
         else if (!strcmp(a, "--speaker") && v) { speaker = v; i++; }
@@ -89,7 +90,15 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--fps") && v) { ao.fps = (float)atof(v); i++; }
         else if (!strcmp(a, "--out") && v) { out_wav = v; i++; }
         else if (!strcmp(a, "--aux") && v) { aux = v; i++; }
-        else if (!strcmp(a, "--backend") && v) { use_cuda = !strcmp(v, "cuda"); i++; }
+        else if (!strcmp(a, "--backend") && v) { if (strcmp(v, "cpu") && strcmp(v, "cuda") && strcmp(v, "rocm")) { fprintf(stderr, "invalid backend %s\n", v); return 2; }
+#ifdef QTTS_WITH_HIP
+            if (!strcmp(v, "cuda")) { fprintf(stderr, "ROCm runner cannot select CUDA\n"); return 2; }
+            use_cuda = !strcmp(v, "rocm");
+#else
+            if (!strcmp(v, "rocm")) { fprintf(stderr, "use the ROCm runner\n"); return 2; }
+            use_cuda = !strcmp(v, "cuda");
+#endif
+            i++; }
         else if (!strcmp(a, "--ref-wav") && v) { ref_wav = v; i++; }
         else if (!strcmp(a, "--ref-text") && v) { ref_text = v; i++; }
         else if (!strcmp(a, "--xvec-only")) xvec_only = 1;
@@ -122,7 +131,7 @@ int main(int argc, char **argv) {
     qtts_cuda *gpu = NULL;
     qtts_backend gbe;
     if (use_cuda) {
-        if (!(gpu = qtts_cuda_create(m, codec, 0, 1))) return 1;
+        if (!(gpu = qtts_cuda_create(m, codec, device, 1))) return 1;
         gbe = qtts_cuda_backend(gpu);
         be = &gbe;
     }
@@ -149,7 +158,7 @@ int main(int argc, char **argv) {
     double t_al0 = now_s();
 #ifdef QTTS_WITH_CUDA
     if (use_cuda) {  /* created after TTS so each runtime keeps its own current context */
-        w2v2_cuda *wg = w2v2_cuda_create(aligner, 0, 0);
+        w2v2_cuda *wg = w2v2_cuda_create(aligner, device, 0);
         if (!wg) return 1;
         t_al0 = now_s();
         arc = ja_align_run_ex(cuda_encoder, wg, wav, n, 24000, &ao, &r);

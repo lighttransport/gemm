@@ -78,6 +78,32 @@ static struct {
     int (*nvDestroy)(jnvrtc_prog *);
 } jcu;
 
+#if defined(JA_WITH_HIP) || defined(QTTS_WITH_HIP)
+#include "../../rdna4/cuda_driver_compat.h"
+static int ja_hip_alloc(jcu_ptr *p, size_t n) { return hipMalloc((void **)p, n); }
+static int ja_hip_free(jcu_ptr p) { return hipFree((void *)(uintptr_t)p); }
+static int ja_hip_h2d(jcu_ptr d, const void *s, size_t n) { return hipMemcpy((void *)(uintptr_t)d,s,n,hipMemcpyHostToDevice); }
+static int ja_hip_d2h(void *d, jcu_ptr s, size_t n) { return hipMemcpy(d,(void *)(uintptr_t)s,n,hipMemcpyDeviceToHost); }
+static int jcu_load(void) {
+    if (rocewInit(ROCEW_INIT_HIP | ROCEW_INIT_HIPRTC)) return -1;
+    jcu.Init = hipInit;
+    jcu.DeviceGet = cuDeviceGet;
+    jcu.DeviceGetName = hipDeviceGetName;
+    jcu.CtxCreate = (void *)hipCtxCreate;
+    jcu.CtxDestroy = (void *)hipCtxDestroy;
+    jcu.CtxSetCurrent = (void *)hipCtxSetCurrent;
+    jcu.CtxSynchronize = hipDeviceSynchronize;
+    jcu.ModuleUnload = (void *)hipModuleUnload;
+    jcu.ModuleGetFunction = (void *)hipModuleGetFunction;
+    jcu.MemAlloc = ja_hip_alloc;
+    jcu.MemFree = ja_hip_free;
+    jcu.MemcpyHtoD = ja_hip_h2d;
+    jcu.MemcpyDtoH = ja_hip_d2h;
+    jcu.LaunchKernel = (void *)hipModuleLaunchKernel;
+    jcu.ok = 1;
+    return 0;
+}
+#else
 static int jcu_load(void) {
     if (jcu.ok) return 0;
     void *cu = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
@@ -104,6 +130,8 @@ static int jcu_load(void) {
     jcu.ok = 1;
     return 0;
 }
+
+#endif
 
 static const char *ja_cuda_src =
 "#define INFINITY __int_as_float(0x7f800000)\n"
@@ -291,6 +319,9 @@ static jcu_ptr jg__tensor(const ja_st *st, const char *name, size_t expect) {
 }
 
 static int jg__compile(w2v2_cuda *g, jcu_device dev, int verbose) {
+#if defined(JA_WITH_HIP) || defined(QTTS_WITH_HIP)
+    return cu_compile_kernels((CUmodule *)&g->mod, dev, ja_cuda_src, "ja_hip", verbose, "ja_align") < 0 ? -1 : 0;
+#else
     int major = 0, minor = 0;
     jcu.DeviceGetAttribute(&major, 75, dev);  /* CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR */
     jcu.DeviceGetAttribute(&minor, 76, dev);  /* ..._MINOR */
@@ -324,6 +355,7 @@ static int jg__compile(w2v2_cuda *g, jcu_device dev, int verbose) {
     int rc = jcu.ModuleLoadData(&g->mod, blob) ? -1 : 0;
     free(blob);
     return rc;
+#endif
 }
 
 w2v2_cuda *w2v2_cuda_create(const char *path, int device, int verbose) {

@@ -5,9 +5,13 @@
 #include <string.h>
 #include <time.h>
 
+#ifdef VHUMAN_WITH_HIP
+#include "../../rdna4/cuda_driver_compat.h"
+#else
 #include "../cuew.h"
 #define CUDA_RUNNER_COMMON_IMPLEMENTATION
 #include "../cuda_runner_common.h"
+#endif
 
 #define FRAMES_PER_THREAD 8
 #define MAX_MORPHS 256
@@ -177,7 +181,7 @@ vh_gpu *vh_gpu_create(vh_deformer *d, int device, int verbose) {
     g->C = vh_deformer_controls(d);
     if (g->M > MAX_MORPHS || g->J > MAX_JOINTS) { free(g); return NULL; }
     CUdevice dev;
-    cuDeviceGet(&dev, device);
+    if (cuDeviceGet(&dev, device) != CUDA_SUCCESS) { free(g); return NULL; }
     cuDeviceGetName(g->name, sizeof(g->name), dev);
     if (cuCtxCreate(&g->ctx, 0, dev) != CUDA_SUCCESS) { free(g); return NULL; }
     if (cu_compile_kernels(&g->mod, dev, kSource, "vhuman_deformer", verbose, "vhuman_deformer") < 0 ||

@@ -30,9 +30,13 @@ const char  *qtts_cuda_device_name(const qtts_cuda *g);
 
 #ifdef QTTS_CUDA_IMPLEMENTATION
 
+#ifdef QTTS_WITH_HIP
+#include "../../rdna4/cuda_driver_compat.h"
+#else
 #include "cuew.h"
 #define CUDA_RUNNER_COMMON_IMPLEMENTATION
 #include "cuda_runner_common.h"
+#endif
 #include "qtts_cuda_kernels.h"
 
 #include <math.h>

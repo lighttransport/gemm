@@ -225,11 +225,13 @@ done:
 }
 
 int main(int argc,char **argv) {
+    int device_index = 0;
     const char *model=NULL,*input=NULL,*input_image=NULL,*output=NULL,*latent_output=NULL;
     const char *preprocessed_output=NULL,*resized_output=NULL;
     int resolution=1024,preprocess_only=0,pipeline_bf16=0;
     for(int i=1;i<argc;i++) {
-        if(!strcmp(argv[i],"--model")&&i+1<argc)model=argv[++i];
+        if (!strcmp(argv[i], "--device") && i+1<argc) { device_index=atoi(argv[++i]); if(device_index<0)return 2; }
+        else if(!strcmp(argv[i],"--model")&&i+1<argc)model=argv[++i];
         else if(!strcmp(argv[i],"--image")&&i+1<argc)input=argv[++i];
         else if(!strcmp(argv[i],"--input-image")&&i+1<argc)input_image=argv[++i];
         else if(!strcmp(argv[i],"--resolution")&&i+1<argc)resolution=atoi(argv[++i]);
@@ -262,7 +264,7 @@ int main(int argc,char **argv) {
     if(preprocess_only){q21_npy_free(&a);return 0;}
     char path[2048];snprintf(path,sizeof(path),"%s/diffusion_pytorch_model.safetensors",model);
     st_context *st=safetensors_open(path);if(!st){q21_npy_free(&a);return 1;}
-    cuda_qimg_runner *r=cuda_qimg_init(0,1);if(!r){safetensors_close(st);q21_npy_free(&a);return 1;}
+    cuda_qimg_runner *r=cuda_qimg_init(device_index,1);if(!r){safetensors_close(st);q21_npy_free(&a);return 1;}
     q21_vae_bf16_mode=pipeline_bf16;
     CUstream original=r->stream;cuStreamSynchronize(original);r->stream=NULL;
     q21_vae_dump_dir=getenv("QIMG21_VAE_DUMP_DIR");if(q21_vae_dump_dir)mkdir(q21_vae_dump_dir,0755);

@@ -124,7 +124,7 @@ class QwenImage21RoutingTest(unittest.TestCase):
     def test_fast_preset_validation(self):
         with tempfile.TemporaryDirectory(dir=ROOT / "tmp", prefix="qimg21-test-") as td:
             demo = self.make_demo(Path(td))
-            for request in ({"prompt": "a", "backend": "rocm", "preset": "low8"},
+            for request in ({"prompt": "a", "backend": "rocm", "preset": "low8-fp4"},
                             {"prompt": "a", "preset": "low8", "quantized": True},
                             {"prompt": "a", "preset": "turbo"}):
                 with self.assertRaises(ValueError):
@@ -202,7 +202,7 @@ class QwenImage21TiledRefineTest(unittest.TestCase):
     def test_tiling_needs_a_cuda_fast_preset(self):
         with tempfile.TemporaryDirectory(dir=ROOT / "tmp", prefix="qimg21-test-") as td:
             demo = self.make_demo(Path(td))
-            for request in ({"prompt": "a", "backend": "rocm", "preset": "low8", "upscale": 2},
+            for request in ({"prompt": "a", "backend": "rocm", "preset": "low8-fp4", "upscale": 2},
                             {"prompt": "a", "backend": "cuda", "upscale": 2},
                             {"prompt": "a", "backend": "cuda", "preset": "low8", "upscale": 2,
                              "mode": "compare"}):

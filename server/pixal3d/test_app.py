@@ -182,7 +182,7 @@ class PixalServerTest(unittest.TestCase):
         commands = []
         with tempfile.TemporaryDirectory(prefix="prepare-", dir=scratch) as td:
             server = self.make_server(Path(td))
-            server.moge = Path("/mnt/disk2/models/moge-2-vitl/model.pt")
+            server.moge = Path("/mnt/disk1/models/moge-2-vitl/model.pt")
 
             def run(command, **kwargs):
                 commands.append(command)

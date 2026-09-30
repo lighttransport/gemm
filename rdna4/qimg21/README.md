@@ -647,3 +647,27 @@ Neither variant replaces vector4 plus exact RoPE.
 Combining the diagnostic FP64 timestep and modulation projections gave
 0.999945683/0.999876798 predictions and failed both trajectory checks on
 the same ROCm reference; it is not selected for production.
+
+## Resident fast runner and gfx12 SageAttention
+
+See [vhuman ROCm setup](../../server/vhuman/ROCM.md) for pinned dependencies,
+rotary table export, weight auditing and validated commands. After setup:
+
+```sh
+make -C rdna4/qimg21 all fast rocew-probe HIPCC=/opt/rocm/core/bin/hipcc GPU_ARCH=gfx1201
+```
+
+`test_hip_qimg21_fast` shares the resident/streaming graph with CUDA and uses
+native BF16/INT8 WMMA plugins. `fast12` and `low8` are supported; NVFP4 is rejected.
+All native runners accept `--device N`. The Sage plugin extracts the pinned
+Apache-2.0 AMD device implementation, retaining its license beside generated
+source, and exposes the same NHD C ABI as the denoiser. It pads query tails,
+smooths K and uses INT8 QK with scaled FP8 V and F32 PV accumulation.
+
+Independent math checks (ROCm Python, from repository root):
+
+```sh
+mkdir -p tmp/qimg21-compiler
+TMPDIR="$PWD/tmp/qimg21-compiler" LD_LIBRARY_PATH=/opt/rocm/core/lib \
+ tmp/vhuman-rocm-venv/bin/python -B rdna4/qimg21/test_fast_plugins.py
+```

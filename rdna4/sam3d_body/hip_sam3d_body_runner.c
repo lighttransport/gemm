@@ -338,6 +338,8 @@ struct hip_sam3d_body_ctx {
 
     f32_2d   encoder_tokens;
     float   *mhr_params;   int mhr_params_n;
+    float decoded_model_params[204], decoded_shape[45];
+    int decoded_mhr_valid;
     float    cam_t[3];
     float    focal_px;
     float   *vertices;     int n_vertices;
@@ -2215,6 +2217,7 @@ int hip_sam3d_body_run_encoder(hip_sam3d_body_ctx *ctx)
 int hip_sam3d_body_run_decoder(hip_sam3d_body_ctx *ctx)
 {
     if (!ctx) return HIP_SAM3D_BODY_E_INVAL;
+    ctx->decoded_mhr_valid = 0;
     if (!ctx->encoder_tokens.data) {
         fprintf(stderr, "[hip_sam3d_body] run_decoder: encoder tokens "
                         "not populated — call run_encoder first\n");
@@ -2543,6 +2546,9 @@ int hip_sam3d_body_run_decoder(hip_sam3d_body_ctx *ctx)
                                    mp_buf, shape_buf, face_buf) != 0) {
         rc_total = -1; goto cleanup;
     }
+    memcpy(ctx->decoded_model_params, mp_buf, sizeof(ctx->decoded_model_params));
+    memcpy(ctx->decoded_shape, shape_buf, sizeof(ctx->decoded_shape));
+    ctx->decoded_mhr_valid = 1;
     t_decode_pose_ms[ti] += sb_time_ms() - t0;
     t0 = sb_time_ms();
     if (sam3d_body_mhr_forward((const sam3d_body_mhr_assets *)ctx->cpu_mhr,
@@ -2737,6 +2743,14 @@ int hip_sam3d_body_get_mhr_params(hip_sam3d_body_ctx *ctx, float *out, int *out_
         memcpy(out, ctx->mhr_params, (size_t)ctx->mhr_params_n * sizeof(float));
     return ctx->mhr_params ? HIP_SAM3D_BODY_E_OK
                            : HIP_SAM3D_BODY_E_NOT_IMPLEMENTED;
+}
+
+int hip_sam3d_body_get_decoded_mhr(hip_sam3d_body_ctx *ctx, float model_params[204], float shape[45])
+{
+    if (!ctx || !ctx->decoded_mhr_valid) return HIP_SAM3D_BODY_E_INVAL;
+    if (model_params) memcpy(model_params, ctx->decoded_model_params, sizeof(ctx->decoded_model_params));
+    if (shape) memcpy(shape, ctx->decoded_shape, sizeof(ctx->decoded_shape));
+    return HIP_SAM3D_BODY_E_OK;
 }
 
 int hip_sam3d_body_get_cam(hip_sam3d_body_ctx *ctx,

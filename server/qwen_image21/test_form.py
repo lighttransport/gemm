@@ -58,7 +58,7 @@ class QwenImage21FormLogicTest(unittest.TestCase):
             ("compare mode", ("low8", "cuda", "compare", 2, 2048, 2048),
              {"fast": False, "tiled": True, "cap": 1024, "ok": False}),
             ("rocm", ("low8", "rocm", "native", 1, 1024, 1024),
-             {"fast": False, "tiled": False, "cap": 1024, "ok": False}),
+             {"fast": True, "tiled": False, "cap": 2048, "ok": True}),
             ("reference mode", ("low8", "cuda", "reference", 1, 1024, 1024),
              {"fast": False, "tiled": False, "cap": 1024, "ok": False}),
         ]
@@ -172,7 +172,7 @@ class QwenImage21FormLogicTest(unittest.TestCase):
         program = (
             "const HEALTH=null;const vals={preset:'accurate'};const $=id=>({value:vals[id]});\n" + code +
             body[body.index("function tiledAllowed("):body.index("function num(id)")] +
-            "const bad=[tiledAllowed('compare','cuda'),tiledAllowed('native','rocm'),!tiledAllowed('native','cuda')];\n"
+            "const bad=[tiledAllowed('compare','cuda'),!tiledAllowed('native','rocm'),!tiledAllowed('native','cuda')];\n"
             "vals.preset='';bad.push(tiledAllowed('native','cuda'));\n"
             "if(bad.some(Boolean)){console.log('FAIL',JSON.stringify(bad));process.exit(1)}\n"
             "console.log('upscale gate ok');\n")

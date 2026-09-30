@@ -8,4 +8,9 @@ set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 cd "$root"
 export PYTHONDONTWRITEBYTECODE=1
-exec python3 -m server.vhuman.app "$@"
+export TMPDIR="$root/tmp/vhuman-runtime"
+mkdir -p "$TMPDIR"
+export LD_LIBRARY_PATH="/opt/rocm/core/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+python=${PYTHON:-python3}
+if [ -x "$root/tmp/vhuman-rocm-venv/bin/python" ]; then python=${PYTHON:-$root/tmp/vhuman-rocm-venv/bin/python}; fi
+exec "$python" -m server.vhuman.app "$@"

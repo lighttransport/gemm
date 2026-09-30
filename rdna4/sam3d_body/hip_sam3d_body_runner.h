@@ -60,6 +60,7 @@ int hip_sam3d_body_get_encoder_tokens(hip_sam3d_body_ctx *ctx,
                                        float *out, int *out_n, int *out_dim);
 int hip_sam3d_body_get_mhr_params(hip_sam3d_body_ctx *ctx,
                                    float *out, int *out_n);
+int hip_sam3d_body_get_decoded_mhr(hip_sam3d_body_ctx *ctx, float model_params[204], float shape[45]);
 int hip_sam3d_body_get_cam(hip_sam3d_body_ctx *ctx,
                             float *out_cam_t_xyz, float *out_focal_px);
 int hip_sam3d_body_get_vertices(hip_sam3d_body_ctx *ctx, float *out, int *out_v);

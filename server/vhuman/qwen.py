@@ -115,11 +115,20 @@ def availability(python=None, mock=False) -> dict:
         from qimg21_i23d.native import NativeBackend
     except Exception as exc:  # noqa: BLE001  (report, never fail /health)
         return {"available": False, "reason": f"qimg21_i23d: {exc}"}
-    if not NativeBackend.available():
+    if not native_available():
         return {"available": False, "reason": "the native Qwen-Image 2.1 runner or its weights are missing"}
     if not python or not Path(python).exists():
         return {"available": False, "reason": "no --qwen-python interpreter (it needs torch)"}
-    return {"available": True, "backend": "native"}
+    return {"available": True, "backend": "native-rocm" if gpu.backend() == "rocm" else "native"}
+
+
+def native_available():
+    if gpu.backend() == "cpu":
+        return False
+    directory = ROOT / ("rdna4" if gpu.backend() == "rocm" else "cuda") / "qimg21"
+    prefix = "test_hip_" if gpu.backend() == "rocm" else "test_cuda_"
+    return all((directory / (prefix + "qimg21_" + name)).is_file()
+               for name in ("fast", "text", "vision", "vae", "vae_encode")) and gpu.model_path("qimg-21").is_dir()
 
 
 def make_backend(python=None, mock=False, preset="fast12"):
@@ -129,7 +138,9 @@ def make_backend(python=None, mock=False, preset="fast12"):
     from qimg21_i23d.native import NativeBackend
     if preset not in ("fast12", "low8"):
         raise ValueError("qwen_preset must be fast12 or low8")
-    return NativeBackend(python=python, preset=preset, resident=preset != "low8")
+    return NativeBackend(model=gpu.model_path("qimg-21"), python=python, preset=preset,
+                         resident=preset != "low8", backend=gpu.backend(), device=gpu.device_index(),
+                         quant_package=gpu.model_path("qimg-21-fast/int8-smooth-a0.6"))
 
 
 def _thumb(photo: np.ndarray, size: int = 160) -> Image.Image:

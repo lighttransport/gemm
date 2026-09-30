@@ -70,7 +70,8 @@ def reconstruction_job(service, request, progress, cancel, *, python=None, mock=
         with gpu.device_session(MIN_FREE_MIB,cancel,lock_path=service.work/'mock-gpu.lock' if mock else gpu.LOCK_PATH,
                                 check_memory=not mock and gpu.gpu_status() is not None):
             progress(.05,'fitting portrait and baking candidate materials')
-            proc = subprocess.Popen(cmd,cwd=ROOT,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,
+            from ..runtime import python_command
+            proc = subprocess.Popen(python_command(cmd),cwd=ROOT,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,
                                     env=dict(os.environ,PYTHONDONTWRITEBYTECODE='1',OPENBLAS_NUM_THREADS='4',OMP_NUM_THREADS='4'))
             stop = threading.Event()
             def watch():

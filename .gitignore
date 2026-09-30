@@ -339,3 +339,13 @@ ryzen/bench_nn_ops
 a64fx/llm/.ds4f_serve*
 a64fx/llm/ds4f_runner.log
 a64fx/llm/ds4f_frontend.log
+
+# Native ROCm vhuman runners (built locally).
+rdna4/rocew_probe
+rdna4/qimg21/test_hip_qimg21_fast
+rdna4/vhuman/bench_vhuman_deformer_hip
+rdna4/sam3/test_hip_sam3
+rdna4/sam3/verify_*
+!rdna4/sam3/verify_*.c
+!rdna4/sam3/verify_*.h
+rdna4/sam3/test_hip_sam3_embed

@@ -3,9 +3,13 @@ CXX ?= c++
 CXXFLAGS ?= -O3 -std=c++17 -Wall -Wextra -fopenmp -fPIC
 CFLAGS ?= -O3 -Wall -Wextra -fPIC
 CFLAGS += -MMD -MP
-LDLIBS = -lopenblas -ldl -lm -lpthread -fopenmp
+LDLIBS = -Wl,--disable-new-dtags -lopenblas -ldl -lm -lpthread -fopenmp
+OPENBLAS_ROOT ?= $(abspath ../../ref/pixal3d/deps/openblas/usr)
+CXXFLAGS += -I$(OPENBLAS_ROOT)/include/x86_64-linux-gnu/openblas-pthread
+CFLAGS += -I$(OPENBLAS_ROOT)/include/x86_64-linux-gnu/openblas-pthread
+LDLIBS += -L$(OPENBLAS_ROOT)/lib/x86_64-linux-gnu/openblas-pthread -Wl,-rpath,$(OPENBLAS_ROOT)/lib/x86_64-linux-gnu/openblas-pthread
 OPENCV_ROOT ?= $(abspath ../../ref/pixal3d/deps/opencv/usr)
-CXXFLAGS += -MMD -MP -I$(OPENCV_ROOT)/include/opencv4
+CXXFLAGS += -MMD -MP -I$(OPENCV_ROOT)/include/opencv4 -I$(OPENCV_ROOT)/include
 LDLIBS += -L$(OPENCV_ROOT)/lib/x86_64-linux-gnu -Wl,-rpath,$(OPENCV_ROOT)/lib/x86_64-linux-gnu -lopencv_core -lopencv_imgproc
 export TMPDIR := $(abspath ../../tmp/pixal3d)
 OBJECTS = io.o math.o engine.o resident.o pointwise.o flow.o conditioning.o decoders.o preprocess.o json.o pipeline.o geometry.o remesh.o simplify.o unwrap.o postprocess.o inpaint_opencv.o glb.o lightrt.o xatlas.o

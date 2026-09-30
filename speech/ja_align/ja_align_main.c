@@ -44,7 +44,14 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--out") && v) { out = v; i++; }
         else if (!strcmp(a, "--posteriors") && v) { post = v; i++; }
         else if (!strcmp(a, "--dump-dir") && v) { o.dump_dir = v; i++; }
-        else if (!strcmp(a, "--cuda")) use_cuda = 1;
+        else if (!strcmp(a, "--cuda") || !strcmp(a, "--rocm")) {
+#ifdef JA_WITH_HIP
+            if (strcmp(a,"--rocm")) { fprintf(stderr,"use --rocm for the HIP build\n"); return 1; }
+#else
+            if (strcmp(a,"--cuda")) { fprintf(stderr,"use the ROCm aligner build\n"); return 1; }
+#endif
+            use_cuda = 1;
+        }
         else if (!strcmp(a, "--device") && v) { device = atoi(v); i++; }
         else { fprintf(stderr, "unknown or incomplete option %s\n", a); return 1; }
     }

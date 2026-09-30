@@ -43,7 +43,11 @@ def _shown(command) -> str:
     return " ".join(parts)
 
 
+_DEVICE = 0
+
 def _run(command: list[str], *, cwd: Path) -> None:
+    if Path(command[0]).name.startswith("test_hip_qimg21_") and "--device" not in command:
+        command = [*command, "--device", str(_DEVICE)]
     print("+", _shown(command), file=sys.stderr)
     start = time.perf_counter()
     name = Path(command[0]).name if "python" not in Path(command[0]).name else Path(command[1]).name
@@ -342,6 +346,7 @@ def _resize_rgba(rgba: np.ndarray, height: int, width: int) -> np.ndarray:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--device", type=int, default=0)
     ap.add_argument("--backend", choices=("cuda", "rocm"), default="cuda")
     ap.add_argument("--model", required=True)
     ap.add_argument("--prompt", default="a red apple on a white table")
@@ -389,7 +394,7 @@ def main() -> int:
     ap.add_argument("--native-attention", choices=(
         "math", "reverse64", "wmma", "wmma-fused", "edit-size-select",
         "mma64", "mma64-flash", "mma64-mixed", "mma64-forward-flash",
-        "mma128-efficient", "cutlass-efficient", "flash"), default=None,
+        "mma128-efficient", "cutlass-efficient", "flash", "sage"), default=None,
         help="oracle attention; with --runner fast it overrides the preset (cutlass-efficient or flash)")
     ap.add_argument("--native-normalization", choices=("default", "vector4"), default=None)
     ap.add_argument("--native-rope", choices=("default", "host-table", "host-table-vector4", "host-table-exact"), default=None)
@@ -451,12 +456,16 @@ def main() -> int:
     ap.add_argument("--quant-package", type=Path,
                     help="pack_fast.py package for int8/nvfp4 presets (default: the preset's package)")
     args = ap.parse_args()
+    global _DEVICE
+    _DEVICE = args.device
+    if args.device < 0:
+        ap.error("--device must be non-negative")
     if args.share_prompt_prefix and args.backend != "cuda":
         raise SystemExit("--share-prompt-prefix needs the CUDA text encoder (--backend cuda)")
     fast_attention = args.native_attention
     if args.runner == "fast":
-        if args.backend != "cuda":
-            ap.error("--runner fast is CUDA only")
+        if args.backend == "rocm" and args.preset == "low8-fp4":
+            ap.error("RDNA4 supports int8 presets; NVFP4 is unsupported")
         if args.quantized_transformer or args.quantize_on_load or args.int8_tensor_core:
             ap.error("--runner fast takes --preset/--quant-package instead of harness quantization flags")
         if fast_attention not in (None, "cutlass-efficient", "flash", "sage"):
@@ -604,7 +613,7 @@ def main() -> int:
         return path if path.is_absolute() else root / path
     native_bin = resolve_binary(args.native_bin, "native")
     if args.runner == "fast" and not args.native_bin:
-        native_bin = root / "cuda/qimg21/test_cuda_qimg21_fast"
+        native_bin = root / ("rdna4/qimg21/test_hip_qimg21_fast" if args.backend == "rocm" else "cuda/qimg21/test_cuda_qimg21_fast")
     text_bin = resolve_binary(args.native_text_bin, "text")
     vision_bin = resolve_binary(args.native_vision_bin, "vision")
     vae_bin = resolve_binary(args.native_vae_bin, "vae")
@@ -924,7 +933,7 @@ def main() -> int:
     def denoise_command(gh, gw, steps, out, extra, target_hw=None):
         """One denoiser invocation. The editing layout's target block is the grid
         the model actually sees, which is the tile when refining."""
-        command = [str(native_bin), *attention_args,
+        command = [str(native_bin), *(["--device", str(args.device)] if args.backend == "rocm" or args.runner == "fast" else []), *attention_args,
                    "--model", str(model),
                    "--prompt-embeds", str(prompt_path),
                    "--height-tokens", str(gh), "--width-tokens", str(gw),
@@ -1006,7 +1015,7 @@ def main() -> int:
             base_vae_tile = 48 if max(base_h_tokens, base_w_tokens) > 64 else 0
             _run([str(vae_bin), "--model", str(model / "vae"), "--latents", str(base_latents),
                   "--height-tokens", str(base_h_tokens), "--width-tokens", str(base_w_tokens),
-                  "--out", str(base_decoded), "--conv", "cudnn", *(["--tf32"] if args.vae_tf32 else []),
+                  "--out", str(base_decoded), *(["--conv", "cudnn"] if args.backend == "cuda" else []), *(["--tf32"] if args.vae_tf32 else []),
                   *((["--tile", str(base_vae_tile), "--tile-overlap", "8", "--tile-bleed", "2"])
                     if base_vae_tile else [])], cwd=root)
             rgba = np.load(base_decoded)
@@ -1093,7 +1102,7 @@ def main() -> int:
     if args.native_vae:
         from PIL import Image
 
-        vae_conv = args.native_vae_conv or ("cudnn" if args.runner == "fast" else "direct")
+        vae_conv = args.native_vae_conv or ("cudnn" if args.runner == "fast" and args.backend == "cuda" else "direct")
 
         decoded_path = work / "native_decoded.npy"
         decode_command = [

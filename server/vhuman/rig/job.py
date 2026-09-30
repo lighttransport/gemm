@@ -77,7 +77,8 @@ def rig_job(service, request: dict, progress, cancel, python=None, mock: bool = 
         check = not mock and gpu.gpu_status() is not None
         with gpu.device_session(MIN_FREE_MIB, cancel, lock_path=lock, check_memory=check):
             env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
-            proc = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
+            from ..runtime import python_command
+            proc = subprocess.Popen(python_command(cmd), cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
             stop = threading.Event()
 
             def watch():

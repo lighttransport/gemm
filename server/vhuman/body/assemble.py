@@ -26,8 +26,8 @@ from ..rig import gltf, usd
 from ..rig.build import ExportPart, RigAsset
 from ..rig.common import normalize, quat_from_matrix, vertex_normals
 
-DEFAULT_MODEL = Path("/mnt/nvme01/models/sam3d-body/dinov3/assets/mhr_model.pt")
-DEFAULT_HEAD = Path("/mnt/nvme01/models/sam3d-body/safetensors/sam3d_body_mhr_head.safetensors")
+DEFAULT_MODEL = Path("/mnt/disk1/models/sam3d-body/dinov3/assets/mhr_model.pt")
+DEFAULT_HEAD = Path("/mnt/disk1/models/sam3d-body/safetensors/sam3d_body_mhr_head.safetensors")
 FLIP_CAMERA = np.array([1.0, -1.0, -1.0])
 FLIP_PIXAL = np.array([-1.0, 1.0, -1.0])
 
@@ -331,12 +331,14 @@ def assemble(head_dir: Path, out: Path, model_path: Path = DEFAULT_MODEL,
     shape = np.asarray(meta["shape"], np.float32)
     if model_params.shape != (204,) or shape.shape != (45,):
         raise ValueError("SAM 3D Body sidecar lacks decoded MHR pose or identity")
-    model = torch.jit.load(str(model_path), map_location="cpu")
+    from server.vhuman.runtime import torch_device
+    device = torch_device(torch)
+    model = torch.jit.load(str(model_path), map_location=device)
     with torch.no_grad():
-        vertices_t, state_t = model(torch.from_numpy(shape[None]),
-                                    torch.from_numpy(model_params[None]), torch.zeros((1, 72)))
-    vertices = vertices_t[0].numpy().astype(np.float64) * .01
-    state = state_t[0].numpy().astype(np.float64)
+        vertices_t, state_t = model(torch.from_numpy(shape[None]).to(device),
+                                    torch.from_numpy(model_params[None]).to(device), torch.zeros((1, 72), device=device))
+    vertices = vertices_t[0].cpu().numpy().astype(np.float64) * .01
+    state = state_t[0].cpu().numpy().astype(np.float64)
     faces = np.asarray(_safetensor(head_assets, "head_pose.faces"), np.int32)
     parity_max = None
     if (out / "body_mhr.glb").is_file():
@@ -356,7 +358,7 @@ def assemble(head_dir: Path, out: Path, model_path: Path = DEFAULT_MODEL,
         raw.node("body", mesh=0)
         raw.write(out / "body_mhr.glb")
     joint_ids, skin_weights = model.get_lbsw()
-    joint_ids, skin_weights = joint_ids.numpy(), skin_weights.numpy()
+    joint_ids, skin_weights = joint_ids.cpu().numpy(), skin_weights.cpu().numpy()
     order = np.argsort(-skin_weights, axis=1)[:, :4]
     joints4 = np.take_along_axis(joint_ids, order, 1).astype(np.uint16)
     weights4 = np.take_along_axis(skin_weights, order, 1).astype(np.float64)

@@ -49,7 +49,7 @@ def availability(mock=False) -> dict:
     try:
         _import_qimg21()
         from qimg21_i23d import reconstruct
-        ok, missing = reconstruct.Pixal3DNative("cuda").available()
+        ok, missing = pixal_runner().available()
     except Exception as exc:  # noqa: BLE001
         return {"available": False, "reason": str(exc)}
     return {"available": ok, "runner": "native", **({} if ok else {"reason": "missing " + ", ".join(missing)})}
@@ -96,12 +96,19 @@ def fake_reconstruction(out: Path, seed: int = 0) -> dict:
     return {"runner": "mock", "seconds": 0.0}
 
 
+def pixal_runner(settings=None):
+    _import_qimg21()
+    from qimg21_i23d import reconstruct
+    return reconstruct.Pixal3DNative(gpu.backend(), settings=settings, device=gpu.device_index(),
+        model_dir=gpu.model_path("Pixal3D"), dinov3=gpu.model_path("dinov3-vitl16/model.safetensors"))
+
+
 def run_pixal3d(rgba: Path, out: Path, work: Path, quality: str = "preview", cancel=None) -> dict:
     _import_qimg21()
     from qimg21_i23d import reconstruct
     settings = reconstruct.ReconSettings.preset(quality)
     settings.cancel = cancel
-    runner = reconstruct.Pixal3DNative("cuda", settings=settings)
+    runner = pixal_runner(settings)
     return runner.single(rgba, out, work, fov_rad=math.radians(FOV_DEG))
 
 

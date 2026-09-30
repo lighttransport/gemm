@@ -1,3 +1,5 @@
+export TMPDIR := $(abspath ../../tmp/body-compiler)
+$(shell mkdir -p $(TMPDIR))
 # HIP/ROCm SAM 3D Body runner (RDNA4, HIPRTC, no hipcc).
 #
 # Port of cuda/sam3d_body/Makefile. CPU helpers (sam3d_body_cpu.c)

@@ -39,11 +39,11 @@ if str(ROOT) not in sys.path:
 from server.qwen_image21.app import Demo as QwenImage21Demo
 from server.pixal3d.i23d import Studio as I23DStudio, StudioCancelled
 
-DEFAULT_MODEL_DIR = Path("/mnt/disk2/models/Pixal3D")
-DEFAULT_DINOV3 = Path("/mnt/disk2/models/dinov3-vitl16/model.safetensors")
+DEFAULT_MODEL_DIR = Path("/mnt/disk1/models/Pixal3D")
+DEFAULT_DINOV3 = Path("/mnt/disk1/models/dinov3-vitl16/model.safetensors")
 DEFAULT_NAF = ROOT / "ref/pixal3d/weights/naf_release.safetensors"
-DEFAULT_RMBG = Path("/mnt/disk2/models/RMBG-2.0")
-DEFAULT_MOGE = Path("/mnt/disk2/models/moge-2-vitl/model.pt")
+DEFAULT_RMBG = Path("/mnt/disk1/models/RMBG-2.0")
+DEFAULT_MOGE = Path("/mnt/disk1/models/moge-2-vitl/model.pt")
 MAX_BODY_BYTES = 256 * 1024 * 1024
 MAX_IMAGE_BYTES = 32 * 1024 * 1024
 MAX_GLB_BYTES = 256 * 1024 * 1024
@@ -501,7 +501,7 @@ class PixalServer:
         self.preview_script = ROOT / "ref/pixal3d/preview_glb.py"
         self.preview_renderer = ROOT / "ref/pixal3d/.cache/preview_render"
         self.qwen_image = QwenImage21Demo(
-            Path(getattr(args, "qwen_model", "/mnt/nvme01/models/qimg-21")),
+            Path(getattr(args, "qwen_model", "/mnt/disk1/models/qimg-21")),
             Path(getattr(args, "qwen_quant_package", ROOT / "tmp/qimg21-int8-package")),
             Path(getattr(args, "qwen_python", ROOT / "tmp/qimg21-ref-venv/bin/python")),
             self.work_dir / "qwen-image21",
@@ -510,14 +510,18 @@ class PixalServer:
             native_rocm=Path(getattr(
                 args, "qwen_native_rocm", ROOT / "rdna4/qimg21/test_hip_qimg21_native")),
             python_rocm=Path(getattr(
-                args, "qwen_python_rocm", ROOT / "tmp/qimg21-rocm-venv/bin/python")))
+                args, "qwen_python_rocm", ROOT / "tmp/vhuman-rocm-venv/bin/python")))
         # Text/Image -> 3D: Qwen-Image 2.1 (qimg21_i23d) + Pixal3D, with the
         # same runner binary and weights as the reconstruction tab.
         def image_model():
             from qimg21_i23d.native import NativeBackend
-            return NativeBackend(model=self.qwen_image.model, python=self.qwen_image.python)
+            backend = getattr(args, "backend", "cuda")
+            backend = "cuda" if backend == "cpu" else backend
+            python = self.qwen_image.python_rocm if backend == "rocm" else self.qwen_image.python
+            return NativeBackend(model=self.qwen_image.model, python=python, backend=backend,
+                                 device=getattr(args, "device", 0), quant_package=Path("/mnt/disk1/models/qimg-21-fast/int8-smooth-a0.6"))
         self.i23d = I23DStudio(
-            self.work_dir / "i23d", backend_factory=image_model,
+            self.work_dir / "i23d", backend_factory=image_model, backend=getattr(args, "backend", "cuda"),
             native_options={"binary": self.binary, "model_dir": self.model_dir, "dinov3": self.dinov3,
                             "naf": self.naf},
             reference_options={"model_dir": self.model_dir})
@@ -557,7 +561,7 @@ class PixalServer:
         device = bounded_integer(request.get("device", 0), "device", 0, 255)
         if device != self.QWEN_DEVICE:
             raise ValueError(f"the Text/Image to 3D studio runs on CUDA device {self.QWEN_DEVICE}")
-        with self.execution_lock("cuda", device, self.args.timeout, cancel):
+        with self.execution_lock("rocm" if self.args.backend == "rocm" else "cuda", device, self.args.timeout, cancel):
             self.release_gpu(keep="i23d", device=device)
             try:
                 return self.i23d.run(request, cancel, progress)
@@ -577,9 +581,9 @@ class PixalServer:
                 raise DeviceBusy(f"{backend.upper()} device remained busy for {timeout:g}s")
         try:
             remaining = max(0.0, deadline - time.monotonic())
-            if backend == "cuda":
+            if backend in ("cuda", "rocm"):
                 with cancellable_file_lock(
-                        self.device_lock_dir / f"cuda-{device}.lock", remaining, cancel):
+                        self.device_lock_dir / f"{backend}-{device}.lock", remaining, cancel):
                     yield max(0.0, deadline - time.monotonic())
             else:
                 yield remaining
@@ -742,7 +746,7 @@ class PixalServer:
                     if auto_mask or view_mask_path is not None:
                         prepared = run_dir / f"view{index:02d}-prepared.png"
                         metadata = run_dir / f"view{index:02d}-prepared.json"
-                        prep = [str(self.python_launcher), backend, str(self.prepare_script),
+                        prep = [str(self.python_launcher), backend, str(self.prepare_script), "--device-index", str(device),
                                 "--input", str(view_path), "--output", str(prepared),
                                 "--metadata", str(metadata),
                                 "--fov", str(frame.get("camera_angle_x", fov)),
@@ -781,7 +785,7 @@ class PixalServer:
                 if auto_mask or auto_camera or (mask_path is not None and request.get("reference")):
                     prepared = run_dir / "prepared.png"
                     metadata = run_dir / "prepared.json"
-                    prep = [str(self.python_launcher), backend, str(self.prepare_script),
+                    prep = [str(self.python_launcher), backend, str(self.prepare_script), "--device-index", str(device),
                             "--input", str(image_path), "--output", str(prepared),
                             "--metadata", str(metadata), "--mesh-scale", str(mesh_scale),
                             "--device", "cpu" if backend == "cpu" else "cuda"]
@@ -1585,9 +1589,9 @@ class JobQueue:
                         self.pixal, result, cancel,
                         render_comparison=request.get("render_comparison", False))
                 self._store_artifacts(job_id, result)
+                self._append_log(job_id, "complete")
                 self._update(job_id, state="complete", phase="complete", progress=100, result=result,
                              completed_at=time.time())
-                self._append_log(job_id, "complete")
             except JobCancelled:
                 with self.lock:
                     shutting_down = self.jobs[job_id].get("_shutdown", False)
@@ -1850,11 +1854,11 @@ def main() -> None:
     p.add_argument("--device-lock-dir", default=str(ROOT / "tmp/pixal3d/device-locks"))
     p.add_argument("--i23d-idle", type=float, default=600,
                    help="seconds before an idle Text/Image to 3D studio releases its resident image model")
-    p.add_argument("--qwen-model", default="/mnt/nvme01/models/qimg-21")
+    p.add_argument("--qwen-model", default="/mnt/disk1/models/qimg-21")
     p.add_argument("--qwen-quant-package", default=str(ROOT / "tmp/qimg21-int8-package"))
     p.add_argument("--qwen-python", default=str(ROOT / "tmp/qimg21-ref-venv/bin/python"))
     p.add_argument("--qwen-native", default=str(ROOT / "cuda/qimg21/test_cuda_qimg21_native"))
-    p.add_argument("--qwen-python-rocm", default=str(ROOT / "tmp/qimg21-rocm-venv/bin/python"))
+    p.add_argument("--qwen-python-rocm", default=str(ROOT / "tmp/vhuman-rocm-venv/bin/python"))
     p.add_argument("--qwen-native-rocm", default=str(ROOT / "rdna4/qimg21/test_hip_qimg21_native"))
     p.add_argument("--min-free-disk-mib", type=int, default=1024)
     p.add_argument("--job-log-bytes", type=int, default=65536)

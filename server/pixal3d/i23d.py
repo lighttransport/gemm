@@ -89,7 +89,8 @@ def _text(request, key, required=True, limit=20000):
 class Studio:
     def __init__(self, root: Path, *, backend_factory=None, native_options: dict | None = None,
                  reference_options: dict | None = None, runner_factory=None, ttl: float = 24 * 3600,
-                 image_limit: int = 32 << 20):
+                 image_limit: int = 32 << 20, backend: str = "cuda"):
+        self.hardware_backend = backend
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         self.ttl, self.image_limit = ttl, image_limit
@@ -112,8 +113,8 @@ class Studio:
 
     def _pixal3d_runner(self, name: str, settings):
         if name == "native":
-            return reconstruct.Pixal3DNative("cuda", settings=settings, **self.native_options)
-        return reconstruct.Pixal3DReference("cuda", settings=settings, **self.reference_options)
+            return reconstruct.Pixal3DNative(self.hardware_backend, settings=settings, **self.native_options)
+        return reconstruct.Pixal3DReference(self.hardware_backend, settings=settings, **self.reference_options)
 
     def backend(self):
         with self.lock:
@@ -233,10 +234,10 @@ class Studio:
 
     def health(self) -> dict:
         from qimg21_i23d.native import NativeBackend
-        native = reconstruct.Pixal3DNative("cuda", **self.native_options).available()
-        reference = reconstruct.Pixal3DReference("cuda", **self.reference_options).available()
+        native = reconstruct.Pixal3DNative(self.hardware_backend, **self.native_options).available()
+        reference = reconstruct.Pixal3DReference(self.hardware_backend, **self.reference_options).available()
         model = self.image_model_path or NativeBackend.__init__.__defaults__[0]
-        return {"image_model_ready": NativeBackend.available(model), "pixal3d_native_ready": native[0],
+        return {"image_model_ready": NativeBackend.available(model, self.hardware_backend), "pixal3d_native_ready": native[0],
                 "pixal3d_reference_ready": reference[0], "moge_ready": reconstruct.MOGE.exists(),
                 "image_model_resident": bool(self._backend is not None and
                                              getattr(self._backend, "_fast", None) and

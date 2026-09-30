@@ -12,6 +12,8 @@ int main(int argc, char **argv) {
         return 2;
     }
     size_t frames = argc > 2 ? (size_t)atol(argv[2]) : 1024;
+    if (!frames || frames > 1048576) return 2;
+    int failed = 0;
     vh_deformer *d = vh_deformer_load(argv[1]);
     if (!d) { fprintf(stderr, "cannot load %s\n", argv[1]); return 1; }
     vh_gpu *g = vh_gpu_create(d, 0, 1);
@@ -30,13 +32,14 @@ int main(int argc, char **argv) {
         double err = 0;
         for (size_t f = 0; f < frames; f += frames / 8 + 1) {
             vh_deformer_eval(d, x + f * C, ml, ref);
-            for (size_t i = 0; i < V * 3; ++i) err = fmax(err, fabs(ref[i] - out[f * V * 3 + i]));
+            for (size_t i = 0; i < V * 3; ++i) { float value=out[f * V * 3 + i]; if(!isfinite(value))failed=1; err = fmax(err, fabs(ref[i] - value)); }
         }
+        if (err > 1e-4) failed=1;
         printf("ml=%d contacts=%d  kernel %.3f ms (%.2f us/frame)  host rig %.3f ms  upload %.3f ms  download %.3f ms  max|gpu-cpu| %.2e m\n",
                ml, ct, ms[2], ms[2] * 1e3 / frames, ms[0], ms[1], ms[3], err);
     }
     free(x); free(out); free(ref);
     vh_gpu_free(g);
     vh_deformer_free(d);
-    return 0;
+    return failed;
 }
