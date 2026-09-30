@@ -49,6 +49,18 @@ typedef struct {
     int type, rows, columns;
 } glm53f_native_matrix;
 
+/* Shared-expert description for the fused routed+shared decode step. gu[0..1] / dn carry the output buffers
+ * (gate, up, result); act is the SwiGLU buffer; act_x / act_h are native activation storages. */
+typedef struct {
+    glm53f_native_matrix gu[2], dn;
+    void *act_x, *act_h;
+    float *act;
+    int rows, x_q8k, x_q80, h_q8k, h_q80;
+} glm53f_iq_shared;
+int glm53f_iq_expert_weighted_shared(float *output, const glm53f_iq_part *parts, const float *weights, int count,
+                                     const float *input, const glm53f_iq_shared *sh);
+
+
 int glm53f_native_type_supported(int type);
 /* Bytes per row for any native type, including GLM53F_NATIVE_Q8_0R. */
 size_t glm53f_native_row_size(int type, int columns);

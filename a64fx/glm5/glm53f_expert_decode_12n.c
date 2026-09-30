@@ -208,7 +208,7 @@ struct glm53f_moe_stage_context_12n {
     float *int8_scales[NLAYERS];
     int int8_enabled;
     int profile;
-    double profile_phase[3];
+    double profile_phase[4];
     double gn_phase[8]; /* native: 0 total, 1 x-quant, 2 old-expert loop, 3 shared, 4 combine, 5 task wall, 6 avg busy, 7 tasks */
     unsigned long long occupancy[5]; /* 0, 1, 2-3, 4-7, >=8 tokens/expert. */
     void *i8_prefill_storage;
@@ -644,12 +644,37 @@ fail:
     glm53f_moe_stage_free_12n(c);
     return NULL;
 }
+/* Routed experts + native shared expert in a single parallel region (glm53f_iq_expert_weighted_shared).
+ * Returns 1 when the step was computed into c->scratch->local_output, 0 to fall back to the separate paths. */
+static int moe_fused_shared(glm53f_moe_stage_context_12n *c, int t, const float *x, const glm53f_expert_part *part,
+                            const float *part_weight, int npart) {
+    static int enabled = -1;
+    if (enabled < 0) { const char *e = getenv("GLM53F_MOE_FUSE_SHARED"); enabled = !e || !*e || atoi(e); }
+    if (!enabled || !c->nsh_native || npart < 1 || npart > 9) return 0;
+    glm53f_iq_part iq[9];
+    for (int k = 0; k < npart; ++k) {
+        if (!part[k].gate_type && !part[k].down_type) return 0;
+        iq[k] = (glm53f_iq_part){part[k].gate_up, part[k].down, part[k].gate_type, part[k].down_type, part[k].inter};
+    }
+    const int in = c->nsh_in;
+    glm53f_iq_shared sh = {
+        .gu = {{c->nsh_gv, c->nsh_g[t], c->nsh_gt[t], in, 4096}, {c->nsh_uv, c->nsh_u[t], c->nsh_ut[t], in, 4096}},
+        .dn = {c->nsh_out, c->nsh_d[t], c->nsh_dt[t], 4096, in},
+        .act_x = c->nsh_act_x, .act_h = c->nsh_act_h, .act = c->nsh_act, .rows = in,
+        .x_q8k = !nsh_is_q80(c->nsh_gt[t]) || !nsh_is_q80(c->nsh_ut[t]),
+        .x_q80 = nsh_is_q80(c->nsh_gt[t]) || nsh_is_q80(c->nsh_ut[t]),
+        .h_q8k = !nsh_is_q80(c->nsh_dt[t]), .h_q80 = nsh_is_q80(c->nsh_dt[t])};
+    double tn = c->profile ? MPI_Wtime() : 0.0;
+    if (glm53f_iq_expert_weighted_shared(c->scratch->local_output, iq, part_weight, npart, x, &sh)) return 0;
+    if (c->profile) c->profile_phase[3] += MPI_Wtime() - tn;
+    return 1;
+}
 void glm53f_moe_stage_set_layer_12n(glm53f_moe_stage_context_12n*c,int layer){if(c)c->active_layer=layer;}
 int glm53f_moe_stage_sublayer_12n(void*context,float*out,const float*x){glm53f_moe_stage_context_12n*c=context;int li=c->active_layer-c->first_layer,selected[8],npart=0;float route_weight[8],part_weight[9];glm53f_expert_part part[9];int8_t router_qx[4096];float router_xs=0;if(li<0||li>=c->layer_count)return-1;double t=c->profile?MPI_Wtime():0.0;
 #pragma omp parallel for schedule(static)
     for(int e=0;e<NEXPERTS;e++)if(!c->router_i8)c->router_logits[e]=glm53f_dot_bf16_sve(c->router_w+((size_t)li*NEXPERTS+e)*4096,x,4096);if(c->router_i8){if(glm53f_i8_quantize_x(router_qx,&router_xs,x,4096))return-1;
 #pragma omp parallel for schedule(static)
-    for(int q=0;q<NEXPERTS/16;q++){int g=q/4,j=q%4;glm53f_i8_dot16(c->router_logits+q*16,c->router_i8+((size_t)li*NEXPERTS+g*64)*4096+j*64,c->router_i8_scale+(size_t)li*NEXPERTS+q*16,router_qx,router_xs,4096);}}glm53f_router_topk(c->router_logits,c->router_bias+(size_t)li*NEXPERTS,NEXPERTS,8,2.5f,selected,route_weight);if(c->profile){c->profile_phase[0]+=MPI_Wtime()-t;t=MPI_Wtime();}int table_layer=c->active_layer-FIRST_LAYER;if(c->int8_enabled){if(moe_int8_local(c,c->scratch->local_output,x,c->router_i8?router_qx:NULL,router_xs,selected,route_weight,table_layer))return-1;if(c->profile){c->profile_phase[1]+=MPI_Wtime()-t;t=MPI_Wtime();}int rc=glm53f_sum_allreduce_12n(c->scratch->local_output,out,4096);if(c->profile)c->profile_phase[2]+=MPI_Wtime()-t;return rc;}for(int k=0;k<8;k++){expert_offset*p=&c->table[table_layer*NEXPERTS+selected[k]];if(p->gate_up==UINT64_MAX)continue;part[npart]=(glm53f_expert_part){c->blob+p->gate_up,p->gate_up_scale==UINT64_MAX?NULL:(const float*)(c->blob+p->gate_up_scale),c->blob+p->down,p->down_scale==UINT64_MAX?NULL:(const float*)(c->blob+p->down_scale),p->inter,p->gate_type,p->down_type};part_weight[npart++]=route_weight[k];}if(c->shared_blob&&!c->nsh_native){shared_offset*p=&c->shared[table_layer];part[npart]=(glm53f_expert_part){c->shared_blob+p->gate_up,(const float*)(c->shared_blob+p->gate_up_scale),c->shared_blob+p->down,(const float*)(c->shared_blob+p->down_scale),p->inter,0,0};part_weight[npart++]=1.0f;}glm53f_moe_local_12n(c->scratch->local_output,part,part_weight,npart,x,c->scratch);if(c->nsh_native&&nsh_accumulate(c,table_layer,x,c->scratch->local_output))return-1;if(c->profile){c->profile_phase[1]+=MPI_Wtime()-t;t=MPI_Wtime();}int rc=glm53f_sum_allreduce_12n(c->scratch->local_output,out,4096);if(c->profile)c->profile_phase[2]+=MPI_Wtime()-t;return rc;}
+    for(int q=0;q<NEXPERTS/16;q++){int g=q/4,j=q%4;glm53f_i8_dot16(c->router_logits+q*16,c->router_i8+((size_t)li*NEXPERTS+g*64)*4096+j*64,c->router_i8_scale+(size_t)li*NEXPERTS+q*16,router_qx,router_xs,4096);}}glm53f_router_topk(c->router_logits,c->router_bias+(size_t)li*NEXPERTS,NEXPERTS,8,2.5f,selected,route_weight);if(c->profile){c->profile_phase[0]+=MPI_Wtime()-t;t=MPI_Wtime();}int table_layer=c->active_layer-FIRST_LAYER;if(c->int8_enabled){if(moe_int8_local(c,c->scratch->local_output,x,c->router_i8?router_qx:NULL,router_xs,selected,route_weight,table_layer))return-1;if(c->profile){c->profile_phase[1]+=MPI_Wtime()-t;t=MPI_Wtime();}int rc=glm53f_sum_allreduce_12n(c->scratch->local_output,out,4096);if(c->profile)c->profile_phase[2]+=MPI_Wtime()-t;return rc;}for(int k=0;k<8;k++){expert_offset*p=&c->table[table_layer*NEXPERTS+selected[k]];if(p->gate_up==UINT64_MAX)continue;part[npart]=(glm53f_expert_part){c->blob+p->gate_up,p->gate_up_scale==UINT64_MAX?NULL:(const float*)(c->blob+p->gate_up_scale),c->blob+p->down,p->down_scale==UINT64_MAX?NULL:(const float*)(c->blob+p->down_scale),p->inter,p->gate_type,p->down_type};part_weight[npart++]=route_weight[k];}if(c->shared_blob&&!c->nsh_native){shared_offset*p=&c->shared[table_layer];part[npart]=(glm53f_expert_part){c->shared_blob+p->gate_up,(const float*)(c->shared_blob+p->gate_up_scale),c->shared_blob+p->down,(const float*)(c->shared_blob+p->down_scale),p->inter,0,0};part_weight[npart++]=1.0f;}if(!moe_fused_shared(c,table_layer,x,part,part_weight,npart)){glm53f_moe_local_12n(c->scratch->local_output,part,part_weight,npart,x,c->scratch);{double tn=c->profile?MPI_Wtime():0.0;if(c->nsh_native&&nsh_accumulate(c,table_layer,x,c->scratch->local_output))return-1;if(c->profile)c->profile_phase[3]+=MPI_Wtime()-tn;}}if(c->profile){c->profile_phase[1]+=MPI_Wtime()-t;t=MPI_Wtime();}int rc=glm53f_sum_allreduce_12n(c->scratch->local_output,out,4096);if(c->profile)c->profile_phase[2]+=MPI_Wtime()-t;return rc;}
 
 void glm53f_moe_stage_profile_reset_12n(glm53f_moe_stage_context_12n *c) {
     if (c) {
@@ -670,8 +695,8 @@ void glm53f_moe_stage_profile_report_12n(const glm53f_moe_stage_context_12n *c,
     }
     if (!c->rank) {
         double d = positions ? positions : 1;
-        printf("GLM53F_MOE_PROFILE label=%s router=%.3f local=%.3f allreduce=%.3f ms_pos\n",
-               label?label:"target", p[0]*1e3/d, p[1]*1e3/d, p[2]*1e3/d);
+        printf("GLM53F_MOE_PROFILE label=%s router=%.3f local=%.3f allreduce=%.3f nsh_in_local=%.3f ms_pos\n",
+               label?label:"target", p[0]*1e3/d, p[1]*1e3/d, p[2]*1e3/d,c->profile_phase[3]*1e3/d);
         printf("GLM53F_MOE_RANK_MIN label=%s router=%.3f local=%.3f allreduce=%.3f ms_pos\n",
                label?label:"target", minimum[0]*1e3/d, minimum[1]*1e3/d, minimum[2]*1e3/d);
         printf("GLM53F_MOE_PROFILE_DETAIL label=%s native_total=%.3f xquant=%.3f native_tasks_wall=%.3f native_avg_busy=%.3f old_expert_loop=%.3f shared=%.3f combine=%.3f tasks_per_call=%.1f ms_pos\n",

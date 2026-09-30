@@ -572,8 +572,11 @@ void glm53f_async_ready_12n(int tokens_ready) {
     atomic_store_explicit(&glm53f_async.ready, tokens_ready, memory_order_release);
 }
 int glm53f_async_finish_12n(void) {
+    static int trace = -1, calls;
+    if (trace < 0) trace = getenv("GLM53F_ASYNC_TRACE") != NULL;
     while (atomic_load_explicit(&glm53f_async.done, memory_order_acquire) < glm53f_async.total)
         __asm__ __volatile__("yield" ::: "memory");
+    if (trace) { int r; MPI_Comm_rank(MPI_COMM_WORLD, &r); fprintf(stderr, "ASYNC finish rank=%d call=%d\n", r, calls++); }
     return glm53f_async.rc;
 }
 
