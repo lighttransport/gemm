@@ -89,6 +89,10 @@ a.dl{color:var(--accent);margin-right:12px;font-size:13px;display:inline-block}
       <select id="res"><option value="1024">1024 (fast)</option><option value="2048" selected>2048</option><option value="4096">4096</option></select>
       <label for="face-model">Face mesh</label>
       <select id="face-model"><option value="gnm_v3">GNM v3 (default)</option><option value="ict_facekit_light">ICT-FaceKit Light</option><option value="procedural">Procedural</option></select>
+      <label>Reconstruction candidate</label>
+      <select id="reconstruction"><option value="">Accepted rig</option></select>
+      <button id="refine-portrait">Refine portrait</button>
+      <label><input type="checkbox" id="gaussian-preview" style="width:auto"> Gaussian radiance preview</label>
       <button class="primary" id="build" disabled>Build rig for selected head</button>
       <div class="progress"><div id="bar"></div></div>
       <div class="msg" id="msg"></div>
@@ -228,6 +232,8 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { SkinRenderer } from '/vhuman_skin_shader.js';
+import { BoundGaussians } from '/vhuman_gaussian.js';
 
 const $ = (id) => document.getElementById(id);
 const state = { heads: [], current: null, rig: null, model: null, values: {}, anim: null, job: null,
@@ -403,7 +409,19 @@ renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
 renderer.toneMapping = THREE.NeutralToneMapping;
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 viewer.prepend(renderer.domElement);
+const skinRenderer = new SkinRenderer(renderer);
+window.__skinRenderer = skinRenderer;
 const scene = new THREE.Scene();
+const skinControl = document.createElement('label');
+skinControl.style.cssText='position:absolute;right:12px;bottom:12px;z-index:3;background:#171c24;padding:8px;border-radius:8px';
+skinControl.innerHTML='<input type="checkbox" style="width:auto"> Skin scattering <span></span>';
+const skinToggle=skinControl.querySelector('input'), skinTiming=skinControl.querySelector('span');
+skinToggle.disabled=!skinRenderer.supported;
+skinControl.title=skinRenderer.status;
+renderer.domElement.parentElement.append(skinControl);
+skinToggle.onchange=()=>{skinRenderer.enabled=skinToggle.checked; dirty=true;};
+setInterval(()=>{skinTiming.textContent=skinRenderer.enabled?`${skinRenderer.ms.toFixed(1)} ms CPU`:'';},1000);
+
 const pmrem = new THREE.PMREMGenerator(renderer);
 scene.environment = pmrem.fromScene(new RoomEnvironment(renderer), 0.03).texture;
 const key = new THREE.DirectionalLight(0xffffff, 1.4);
@@ -863,11 +881,13 @@ const CONTACT_ITERS = 4, SPHERE_PASSES = 8, SMOOTH_STEPS = 2;
 function patchMaterial(m) {
   if (m.userData.contactPatched) return;
   m.userData.contactPatched = true;
-  m.onBeforeCompile = (sh) => {
+  const previous = m.onBeforeCompile, previousKey = m.customProgramCacheKey.bind(m);
+  m.onBeforeCompile = (sh, renderer) => {
+    previous.call(m, sh, renderer);
     sh.vertexShader = sh.vertexShader.replace('#include <common>', '#include <common>\nattribute vec3 contactOffset;\nattribute vec3 deformOffset;')
       .replace('#include <morphtarget_vertex>', '#include <morphtarget_vertex>\ntransformed += contactOffset + deformOffset;');
   };
-  m.customProgramCacheKey = () => 'contactOffset+deformOffset';
+  m.customProgramCacheKey = () => previousKey() + '|contactOffset+deformOffset';
   m.needsUpdate = true;
 }
 function setupContactOffsets() {
@@ -1025,7 +1045,7 @@ function projectContacts() {
 }
 $('exact').addEventListener('change', () => { projectContacts(); updateHeat(true); });
 $('wrinkles').addEventListener('change', () => applyRig());
-$('lod').addEventListener('change', () => { if (state.current?.rig) loadRig(state.current).then(() => applyRig()); });
+$('lod').addEventListener('change', () => { if (state.current?.rig || state.candidate) loadRig(state.current).then(() => applyRig()); });
 Object.assign(state, { applyRig: () => applyRig(), projectContacts, updateHeat });     // for tests and debugging
 
 // ---- animation ------------------------------------------------------------------------------
@@ -1384,21 +1404,84 @@ function tick(now) {
   }
   if (changed) { applyRig(); if (tween || state.anim) syncSliders(); }
   if (viz.pending && now - viz.last > 90) updateHeat(false);
-  if (dirty) { renderer.render(scene, camera); dirty = false; }
+  if (dirty) { const start=performance.now();updateGaussians(); skinRenderer.render(scene, camera); skinRenderer.ms=performance.now()-start; dirty = false; }
 }
 requestAnimationFrame(tick);
 
 // ---- loading ------------------------------------------------------------------------------
 const loader = new GLTFLoader();
 let loadGen = 0;
+$('reconstruction').onchange=async()=>{state.candidate=$('reconstruction').value||null;await loadRig(state.current);};
+$('refine-portrait').onclick=async()=>{
+  if(!state.current)return;
+  $('refine-portrait').disabled=true;
+  try{
+    const submitted=await api('/v1/jobs',{kind:'rig_refine_portrait',head_id:state.current.id,gaussians:2000});
+    const id=submitted.job?.id||submitted.id;
+    for(;;){
+      const j=await api(`/v1/jobs/${id}`);const job=j.job||j;
+      if(job.state==='failed'||job.state==='cancelled')throw Error(job.error||job.state);
+      if(job.state==='done'){
+        const data=await api(`/v1/heads/${state.current.id}/reconstruction`);
+        state.candidates=data.candidates;
+        $('reconstruction').replaceChildren(new Option('Accepted rig',''),...data.candidates.filter(c=>c.rig).map(c=>new Option(c.id,c.id)));
+        state.candidate=job.result.run_id;$('reconstruction').value=state.candidate;await loadRig(state.current);break;
+      }
+      await new Promise(r=>setTimeout(r,1000));
+    }
+  }catch(e){$('msg').textContent=String(e);}finally{$('refine-portrait').disabled=false;}
+};
+$('gaussian-preview').onchange=async()=>{
+  if($('gaussian-preview').checked&&+$('lod').value){$('lod').value='0';await loadRig(state.current);}
+  if(state.gaussian)state.gaussian.mesh.visible=$('gaussian-preview').checked;dirty=true;
+};
+function updateGaussians(){
+  if(!state.gaussian?.mesh.visible||!state.vizData)return;
+  state.model.updateMatrixWorld(true);state.skeleton?.update();camera.updateMatrixWorld(true);
+  const pos=new Float32Array(state.vizData.welded_vertices*3);
+  const matrices=state.skeleton.bones.map((_,j)=>skinMatrix(j).elements);
+  state.model.traverse(m=>{
+    const vm=state.vizData.parts[m.name]?.vmap;
+    if(!m.isSkinnedMesh||!vm)return;
+    const geometry=m.geometry, a=geometry.attributes;
+    const p=new Float32Array(a.position.array);
+    const morphs=geometry.morphAttributes.position||[];
+    for(let k=0;k<morphs.length;k++){
+      const weight=m.morphTargetInfluences[k];if(!weight)continue;
+      const delta=morphs[k].array;
+      for(let i=0;i<p.length;i++)p[i]+=weight*(geometry.morphTargetsRelative?delta[i]:delta[i]-a.position.array[i]);
+    }
+    for(const name of ['deformOffset','contactOffset']){
+      const delta=a[name]?.array;if(delta)for(let i=0;i<p.length;i++)p[i]+=delta[i];
+    }
+    const bind=m.bindMatrix.elements,inv=m.bindMatrixInverse.elements,world=m.matrixWorld.elements;
+    for(let i=0;i<vm.length;i++){
+      const x=p[i*3],y=p[i*3+1],z=p[i*3+2];
+      const bx=bind[0]*x+bind[4]*y+bind[8]*z+bind[12],by=bind[1]*x+bind[5]*y+bind[9]*z+bind[13],bz=bind[2]*x+bind[6]*y+bind[10]*z+bind[14];
+      let sx=0,sy=0,sz=0;
+      for(let k=0;k<4;k++){
+        const w=a.skinWeight.array[i*4+k];if(!w)continue;const mat=matrices[a.skinIndex.array[i*4+k]];
+        sx+=w*(mat[0]*bx+mat[4]*by+mat[8]*bz+mat[12]);sy+=w*(mat[1]*bx+mat[5]*by+mat[9]*bz+mat[13]);sz+=w*(mat[2]*bx+mat[6]*by+mat[10]*bz+mat[14]);
+      }
+      const rx=inv[0]*sx+inv[4]*sy+inv[8]*sz+inv[12],ry=inv[1]*sx+inv[5]*sy+inv[9]*sz+inv[13],rz=inv[2]*sx+inv[6]*sy+inv[10]*sz+inv[14];
+      pos[vm[i]*3]=world[0]*rx+world[4]*ry+world[8]*rz+world[12];
+      pos[vm[i]*3+1]=world[1]*rx+world[5]*ry+world[9]*rz+world[13];
+      pos[vm[i]*3+2]=world[2]*rx+world[6]*ry+world[10]*rz+world[14];
+    }
+  });
+  state.gaussian.update(pos,camera);
+}
+
 async function loadRig(h) {
   const gen = ++loadGen;
+  if(state.gaussian){scene.remove(state.gaussian.mesh);state.gaussian.dispose();state.gaussian=null;}
   $('empty').hidden = false;
   $('empty').textContent = 'loading rig…';
   const avatar = state.avatarMode && !!h.body;
-  const base = `/v1/heads/${h.id}/${avatar ? 'body' : 'rig'}/`;
-  const lod = avatar ? 0 : +$('lod').value, suffix = lod ? `_lod${lod}` : '';
-  const hasLod = !lod || (h.rig?.lods || []).includes(lod);
+  const base = state.candidate && !avatar ? `/v1/heads/${h.id}/reconstruction/${state.candidate}/rig/` : `/v1/heads/${h.id}/${avatar ? 'body' : 'rig'}/`;
+  const lod = avatar || (state.candidate && $('gaussian-preview').checked) ? 0 : +$('lod').value, suffix = lod ? `_lod${lod}` : '';
+  const candidateRig=state.candidates?.find(c=>c.id===state.candidate)?.rig;
+  const hasLod = !lod || ((state.candidate?candidateRig:h.rig)?.lods || []).includes(lod);
   const [def, gltf] = await Promise.all([api(base + (avatar ? 'avatar.json' : 'rig.json')),
     loader.loadAsync(base + (avatar ? 'avatar.glb' : hasLod ? `rig${suffix}.glb` : 'rig.glb'))]);
   if (gen !== loadGen) return;
@@ -1474,6 +1557,15 @@ async function loadRig(h) {
     state.wrinkles = { def: def.wrinkles, maps };
     gltf.scene.traverse((o) => { if (o.isMesh && o.name === 'head_skin') for (const mat of [].concat(o.material)) patchWrinkles(mat, state.wrinkles); });
   }
+  const gaussianCount=state.candidates?.find(c=>c.id===state.candidate)?.manifest?.gaussians||0;
+  $('gaussian-preview').disabled=!gaussianCount;
+  if(!gaussianCount)$('gaussian-preview').checked=false;
+  if(state.candidate&&gaussianCount&&!avatar&&!lod){
+    const response=await fetch(`/v1/heads/${h.id}/reconstruction/${state.candidate}/gaussians.json`);
+    if(response.ok){const binding=await response.json();state.gaussian=new BoundGaussians(binding,binding.triangles);
+      state.gaussian.mesh.visible=$('gaussian-preview').checked;scene.add(state.gaussian.mesh);}
+  }
+  skinRenderer.patch(gltf.scene);
   $('wrinkles').disabled = !state.wrinkles;
   applyRig();
   if (state.takeActive && state.takeFrames?.length) updateTakeFrame();
@@ -1544,6 +1636,11 @@ async function select(h) {
     state.bodyMotion = null; state.bodyMotionId = null; state.bodyMotionPlaying = false; state.bodyMotionTime = 0;
   }
   state.current = h;
+  state.candidate = new URLSearchParams(location.search).get("head") === h.id ? new URLSearchParams(location.search).get("reconstruction") : null;
+  const candidates = await api(`/v1/heads/${h.id}/reconstruction`);
+  state.candidates=candidates.candidates;
+  $("reconstruction").replaceChildren(new Option("Accepted rig", ""), ...candidates.candidates.filter(c=>c.rig).map(c=>new Option(c.id,c.id)));
+  $("reconstruction").value = state.candidate || "";
   renderHeads();
   showFacts(h);
   $('build').disabled = !!state.job;
@@ -1553,7 +1650,7 @@ async function select(h) {
   if (!h.body) { state.avatarMode = false; $('avatar-mode').checked = false; }
   else $('avatar-mode').checked = state.avatarMode;
   $('build').textContent = h.rig ? 'Rebuild rig for selected head' : 'Build rig for selected head';
-  if (h.rig) {
+  if (h.rig || state.candidate) {
     const params = new URLSearchParams(location.search);
     const takeId = params.get('head') === h.id ? params.get('take') : null;
     try { await loadRig(h); await loadTakes(h.id, takeId); if (h.body) await loadMotions(h.id); } catch (e) { $('msg').textContent = String(e); $('msg').className = 'msg bad'; }

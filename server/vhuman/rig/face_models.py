@@ -36,6 +36,25 @@ class Source:
     authored_shapes: dict[str, np.ndarray]
     fit_mask: np.ndarray
     provenance: dict
+    eye_centers: np.ndarray | None = None
+    expression_names: list[str] | None = None
+
+
+def fingerprint(source: Source) -> str:
+    """Fingerprint loaded topology/bases, including mutable local ICT files."""
+    h = hashlib.sha256(source.name.encode())
+    def array(label, values):
+        if values is None:
+            return
+        a = np.ascontiguousarray(values)
+        h.update(label.encode()+b'\0'+str(a.shape).encode()+a.dtype.str.encode())
+        h.update(a.view(np.uint8))
+    for label in ('vertices','triangles','triangle_uvs','identity_basis','expression_basis','eye_centers'):
+        array(label,getattr(source,label))
+    for name,shape in sorted(source.authored_shapes.items()):
+        array(name,shape)
+    h.update(str(source.expression_names).encode())
+    return h.hexdigest()
 
 
 def _sha256(path: Path) -> str:
@@ -145,7 +164,9 @@ def load(name: str, cache: Path | None = None) -> Source:
                           {"model": name, "version": str(z["version"]), "sha256": GNM_SHA256,
                            "license": "Apache-2.0", "expression_dim": len(eb),
                            "identity_dim": len(z["vertex_identity_basis"]),
-                           "source": "https://huggingface.co/google/gnm-v3"})
+                           "source": "https://huggingface.co/google/gnm-v3"},
+                          eye_centers=z["template_joint_positions"][[3, 2]].astype(np.float32),
+                          expression_names=z["expression_names"].tolist())
     folder = _ict_path(cache)
     vertices, tris, uv = _obj(folder / "generic_neutral_mesh.obj")
     if len(vertices) != 26719:
@@ -173,10 +194,21 @@ def load(name: str, cache: Path | None = None) -> Source:
         v = _obj(path, faces=False)
         if len(v) == len(vertices):
             shapes[path.stem] = ((v[ids] - vertices[ids]) * .01).astype(np.float32)
+    sclera_ids = {"M_ScleraRight": set(), "M_ScleraLeft": set()}
+    active = None
+    for line in (folder / "generic_neutral_mesh.obj").read_text().splitlines():
+        if line.startswith("usemtl "):
+            active = line.split()[1]
+        elif line.startswith("f ") and active in sclera_ids:
+            sclera_ids[active].update(int(c.split("/")[0])-1 for c in line.split()[1:])
+    eye_centers = []
+    for material_name in ("M_ScleraRight", "M_ScleraLeft"):
+        eye = vertices[sorted(sclera_ids[material_name])] * .01
+        eye_centers.append((eye.min(0)+eye.max(0))*.5)
     return Source(name, neutral, tris, uv, identity, None, shapes, exterior[ids],
                   {"model": name, "revision": ICT_REVISION, "license": "MIT",
                    "identity_dim": len(identity), "authored_shapes": len(shapes),
-                   "source": "https://github.com/USC-ICT/ICT-FaceKit"})
+                   "source": "https://github.com/USC-ICT/ICT-FaceKit"}, eye_centers=np.array(eye_centers))
 
 
 def _similarity(a: np.ndarray, b: np.ndarray) -> tuple[float, np.ndarray, np.ndarray]:
@@ -262,28 +294,51 @@ def _ict_name(name: str) -> list[str]:
     return [name]
 
 
+def merged_influences(joints, weights, limit=4):
+    """Merge repeated triangle-corner joint slots before retaining influences."""
+    joints = np.asarray(joints, np.int32)
+    weights = np.asarray(weights, np.float64)
+    n = len(joints)
+    combined = np.zeros((n, int(joints.max())+1), np.float64)
+    np.add.at(combined, (np.repeat(np.arange(n), joints.shape[1]), joints.reshape(-1)), weights.reshape(-1))
+    k = min(limit, combined.shape[1])
+    selected = np.argsort(-combined, axis=1)[:, :k]
+    values = np.take_along_axis(combined, selected, axis=1)
+    out_j, out_w = np.zeros((n,limit),np.int32), np.zeros((n,limit),np.float32)
+    out_j[:,:k],out_w[:,:k] = selected,values
+    out_w /= np.maximum(out_w.sum(1,keepdims=True),1e-12)
+    return out_j,out_w
+
+
 def fit_and_transfer(src: Source, proc_pos: np.ndarray, proc_tris: np.ndarray,
-                     proc_shapes: dict, proc_joints: np.ndarray, proc_weights: np.ndarray):
+                     proc_shapes: dict, proc_joints: np.ndarray, proc_weights: np.ndarray, *, fitted=None):
     from scipy.spatial import cKDTree
-    pos, scale, R, identity = _fit_identity(src, proc_pos)
-    # The statistical identity gives a plausible starting shape. Project the
-    # visible skin onto the already fitted subject surface so the imported UV
-    # atlas is baked from nearby source texels, then propagate that residual
-    # gently into the socket/mouth interior.
-    fit = np.flatnonzero(src.fit_mask)
-    fit_tri, fit_bary, _ = _closest_map(pos[fit], proc_pos, proc_tris)
-    disp = _map_values(proc_pos, fit_tri, fit_bary) - pos[fit]
-    length = np.linalg.norm(disp, axis=1, keepdims=True)
-    disp *= np.minimum(1., .025 / np.maximum(length, 1e-12))
-    from scipy.spatial import cKDTree as Tree
-    tree_fit = Tree(pos[fit])
-    _, nearest_fit = tree_fit.query(pos, k=min(6, len(fit)))
-    if nearest_fit.ndim == 1:
-        nearest_fit = nearest_fit[:, None]
-    correction = .75 * disp + .25 * disp[nearest_fit[fit]].mean(1)
-    pos[fit] += correction
-    interior = np.flatnonzero(~src.fit_mask)
-    pos[interior] += .35 * disp[nearest_fit[interior]].mean(1)
+    if fitted is not None:
+        pos, scale, R = fitted
+        pos = np.asarray(pos, np.float64).copy()
+        if pos.shape != src.vertices.shape or not np.isfinite(pos).all():
+            raise ValueError('fitted source geometry mismatch')
+        identity = np.zeros(0)
+    else:
+        pos, scale, R, identity = _fit_identity(src, proc_pos)
+        # The statistical identity gives a plausible starting shape. Project the
+        # visible skin onto the already fitted subject surface so the imported UV
+        # atlas is baked from nearby source texels, then propagate that residual
+        # gently into the socket/mouth interior.
+        fit = np.flatnonzero(src.fit_mask)
+        fit_tri, fit_bary, _ = _closest_map(pos[fit], proc_pos, proc_tris)
+        disp = _map_values(proc_pos, fit_tri, fit_bary) - pos[fit]
+        length = np.linalg.norm(disp, axis=1, keepdims=True)
+        disp *= np.minimum(1., .025 / np.maximum(length, 1e-12))
+        from scipy.spatial import cKDTree as Tree
+        tree_fit = Tree(pos[fit])
+        _, nearest_fit = tree_fit.query(pos, k=min(6, len(fit)))
+        if nearest_fit.ndim == 1:
+            nearest_fit = nearest_fit[:, None]
+        correction = .75 * disp + .25 * disp[nearest_fit[fit]].mean(1)
+        pos[fit] += correction
+        interior = np.flatnonzero(~src.fit_mask)
+        pos[interior] += .35 * disp[nearest_fit[interior]].mean(1)
     ids, bary, error = _closest_map(pos, proc_pos, proc_tris)
     shapes = {name: _map_values(delta, ids, bary).astype(np.float32)
               for name, delta in proc_shapes.items()}
@@ -318,10 +373,7 @@ def fit_and_transfer(src: Source, proc_pos: np.ndarray, proc_tris: np.ndarray,
     # Interpolate all influences, then keep the four largest per source vertex.
     jcat = proc_joints[ids].reshape(len(pos), -1)
     wcat = (proc_weights[ids] * bary[:, :, None]).reshape(len(pos), -1)
-    order = np.argsort(-wcat, axis=1)[:, :4]
-    J = np.take_along_axis(jcat, order, axis=1).astype(np.int32)
-    W = np.take_along_axis(wcat, order, axis=1).astype(np.float32)
-    W /= np.maximum(W.sum(1, keepdims=True), 1e-12)
+    J, W = merged_influences(jcat, wcat)
     stats = dict(src.provenance, identity_coefficients=identity.tolist(),
                  median_surface_distance_mm=round(float(np.median(error)) * 1000, 3),
                  p95_surface_distance_mm=round(float(np.quantile(error, .95)) * 1000, 3),

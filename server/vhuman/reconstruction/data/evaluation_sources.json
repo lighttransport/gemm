@@ -1,0 +1,80 @@
+{
+  "format": "vhuman.evaluation_sources.v1",
+  "download": "explicit user-authorized download_datasets CLI; default /mnt/nvme02/data/vhuman, assets never bundled in Git",
+  "sources": [
+    {
+      "name": "SpeakingFaces",
+      "url": "https://issai.nu.edu.kz/download-speaking-faces/",
+      "media_url": "https://huggingface.co/datasets/issai/Speaking_Faces/resolve/main/image_audio/sub_1_ia.zip",
+      "purpose": "speech/expression sequence; manually annotate landmarks and occlusion; not calibrated 3D ground truth",
+      "license": "CC-BY-4.0, verified on official dataset download page",
+      "evaluation": "subject-disjoint; independent annotated frames; do not fit on evaluated frames",
+      "calibration": "RGB/thermal alignment does not establish synchronized calibrated multi-view 3D truth"
+    },
+    {
+      "name": "Multiface",
+      "url": "https://github.com/facebookresearch/multiface",
+      "download_instructions": "https://github.com/facebookresearch/multiface/blob/main/documentation/INSTALLATION.md",
+      "license": "CC-BY-NC-4.0; research evaluation only, excluded from permissive runtime/training distribution",
+      "purpose": "calibrated held-out camera views, tracked geometry and expression sequences",
+      "evaluation": "disjoint capture frames/cameras; transform KRT/head pose/mesh into H metres before evaluation; native tracked topology needs explicit correspondence",
+      "starter_size": "16.2 GB mini dataset per official README",
+      "calibration": "camera KRT, tracked meshes/head poses, textures and audio",
+      "priority": 1
+    },
+    {
+      "name": "NeRSemble v2 and benchmark",
+      "url": "https://github.com/tobias-kirschstein/nersemble-benchmark",
+      "project_url": "https://tobias-kirschstein.github.io/nersemble/",
+      "download_instructions": "https://github.com/tobias-kirschstein/nersemble-data",
+      "access": "approval request required; received download URL stays private",
+      "license": "dataset access terms; exact media license not verified from publicly readable documentation, do not infer from toolkit code",
+      "calibration": "16 synchronized calibrated cameras, color correction; benchmark pointclouds and optional FLAME tracking",
+      "starter_size": "SVFR 125 MB / 391 portraits; monocular avatar 144 MB; NVS 3.34 GB without all pointclouds, per official benchmark README",
+      "purpose": "posed/neutral portrait geometry, held-out views and dynamic expression quality",
+      "evaluation": "hidden benchmark targets unavailable locally; use independent public validation split for tuning, official submission for final scoring; FLAME model license is separate",
+      "priority": 2
+    },
+    {
+      "name": "Digital Emily 2",
+      "url": "https://vgl.ict.usc.edu/Data/DigitalEmily2/",
+      "access": "direct manual links for OBJ, maps, camera calibration and EXR references",
+      "license": "research/illustration only, noncommercial and no redistribution notice on official page; not permissive",
+      "calibration": "reference cameras plus unpolarized, cross/parallel-polarized and specular-only point-light images",
+      "purpose": "single-subject skin/normal/displacement, diffuse/specular separation and renderer material validation",
+      "evaluation": "verify exposure, light power/direction and map conventions from archives before treating as calibrated BRDF fitting truth; preserve source mesh for independent comparison",
+      "priority": 3
+    },
+    {
+      "name": "NoW",
+      "url": "https://now.is.tue.mpg.de/dataset.html",
+      "license_url": "https://now.is.tue.mpg.de/license.html",
+      "access": "registration/login required",
+      "license": "custom noncommercial scientific/educational/artistic use; no redistribution",
+      "calibration": "2054 real portraits, 100 subjects; independent neutral scans, 20 validation subjects with public ground truth after access",
+      "purpose": "neutral identity under profile pose, expressions and occlusions",
+      "evaluation": "use official scan-distance alignment protocol; scan topology differs from GNM/ICT; not a calibrated photograph-camera or BRDF dataset"
+    },
+    {
+      "name": "FaceScape",
+      "url": "https://nju-3dv.github.io/projects/FaceScape/",
+      "documentation": "https://github.com/zhuhao-nju/facescape",
+      "access": "license agreement and email request required; current download site relocated January 2026",
+      "license": "custom noncommercial research with restrictions on publishing portraits/rendered models",
+      "calibration": "multi-view imagery, camera parameters and corresponding meshes; uniform-topology models and 4K displacement/texture maps",
+      "purpose": "high-resolution geometry, multi-expression likeness and cross-view consistency",
+      "evaluation": "keep held-out subjects, expressions and views; use surface-distance evaluation across topology or explicit correspondence"
+    },
+    {
+      "name": "FaceOLAT",
+      "url": "https://gvv-assets.mpi-inf.mpg.de/FaceOLAT/",
+      "documentation": "https://github.com/prraoo/FaceOLAT",
+      "access": "registration/login and research terms required; full dataset about 9 TB",
+      "license": "academic research only per processing repository; exact terms at access site",
+      "calibration": "multi-view 4K one-light-at-a-time captures; availability/completeness of camera/light metadata must be checked per release",
+      "purpose": "future high-frequency portrait relighting and diffuse/specular fitting evaluation",
+      "evaluation": "request a small processed subject subset; preprocessing is substantial and tracking pipeline is marked TODO in current processing README"
+    }
+  ],
+  "verified_date": "2026-09-30"
+}

@@ -225,6 +225,35 @@ class EyePageTest(unittest.TestCase):
         if getattr(cls, "work", None):
             shutil.rmtree(cls.work, ignore_errors=True)
 
+    def test_skin_diffusion_composition(self):
+        """Float passes preserve constant diffuse and mask opaque non-skin."""
+        self.cdp.call("Page.navigate", {"url": self.base + "/rig"})
+        self.cdp.wait_for("!!(document.querySelector('#reconstruction') && window.__skinRenderer)")
+        result = self.cdp.evaluate("""(async()=>{
+          const THREE=await import('three'), {SkinRenderer}=await import('/vhuman_skin_shader.js');
+          const renderer=new THREE.WebGLRenderer({preserveDrawingBuffer:true});renderer.setSize(64,64);
+          renderer.toneMapping=THREE.NeutralToneMapping;renderer.outputColorSpace=THREE.SRGBColorSpace;
+          const skin=new SkinRenderer(renderer);if(!skin.supported){renderer.dispose();return {skip:true};}
+          const scene=new THREE.Scene(),camera=new THREE.PerspectiveCamera(40,1,.01,10);camera.position.z=1;
+          const material=new THREE.MeshStandardMaterial({name:'skin',color:0xcc8877,roughness:.5});
+          scene.add(new THREE.Mesh(new THREE.PlaneGeometry(2,2),material));
+          const light=new THREE.DirectionalLight(0xffffff,2);light.position.set(.2,.4,1);scene.add(light);
+          const blocker=new THREE.Mesh(new THREE.SphereGeometry(.05,16,16),new THREE.MeshBasicMaterial({color:0}));
+          blocker.position.set(.12,0,.1);scene.add(blocker);
+          skin.patch(scene);
+          function read(){const bytes=new Uint8Array(64*64*4);renderer.getContext().readPixels(0,0,64,64,renderer.getContext().RGBA,renderer.getContext().UNSIGNED_BYTE,bytes);return bytes;}
+          skin.render(scene,camera);const before=read();skin.enabled=true;skin.render(scene,camera);const after=read();
+          const point=(b,x,y)=>Array.from(b.slice((y*64+x)*4,(y*64+x)*4+4));
+          const result={before:point(before,24,32),after:point(after,24,32),blocked:point(after,44,32)};
+          skin.dispose();renderer.dispose();return result;
+        })()""")
+        if result.get("skip"):
+            self.skipTest("float WebGL2 targets unavailable")
+        self.assertGreater(sum(result["after"][:3]), 100)
+        for a, b in zip(result["before"], result["after"]):
+            self.assertLessEqual(abs(a-b), 3)
+        self.assertLess(sum(result["blocked"][:3]), 10)
+
     def test_page(self):
         cdp = self.cdp
         cdp.wait_for("window.__eyeReady === true", timeout=180)

@@ -23,6 +23,7 @@ uniform vec3 uHorizon;
 uniform float uExposure;
 uniform float uOrtho;
 uniform vec3 uCamDir;
+uniform float uSkinPass;
 uniform float uRaw;                 // 1: linear radiance out (environment capture)
 varying vec3 vWorld;
 
@@ -282,7 +283,7 @@ void main() {
   // the depth of the surface hit, not of the proxy: lids and eyeshells in front occlude it
   vec4 clip = uProj * viewMatrix * (uWorldFromEye * vec4(x, 1.0));
   gl_FragDepth = clamp(0.5 * clip.z / clip.w + 0.5, 0.0, 1.0);
-  gl_FragColor = vec4(toSRGB(neutral(col * uExposure)), 1.0);
+  gl_FragColor = uSkinPass > .5 ? vec4(0.) : (uRaw > .5 ? vec4(col, 1.) : vec4(toSRGB(neutral(col * uExposure)), 1.0));
 }`;
 
 // ---------------------------------------------------------------- uniforms and materials
@@ -302,7 +303,7 @@ export function makeStudioUniforms() {
     uBoxSize: { value: [new THREE.Vector2(), new THREE.Vector2()] },
     uBoxRad: { value: [0, 0] },
     uSky: { value: new THREE.Vector3() }, uGround: { value: new THREE.Vector3() }, uHorizon: { value: new THREE.Vector3() },
-    uExposure: { value: 1 }, uOrtho: { value: 0 }, uCamDir: { value: new THREE.Vector3(0, 0, -1) }, uRaw: { value: 0 },
+    uExposure: { value: 1 }, uOrtho: { value: 0 }, uCamDir: { value: new THREE.Vector3(0, 0, -1) }, uRaw: { value: 0 }, uSkinPass: { value: 0 },
   };
 }
 

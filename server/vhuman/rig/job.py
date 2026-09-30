@@ -8,6 +8,8 @@ import os
 import subprocess
 import sys
 import threading
+import shutil
+import uuid
 from pathlib import Path
 
 from .. import gpu
@@ -22,6 +24,7 @@ RIG_FILES = ("rig.glb", "rig.json", "rig.usda", "rig_usd.zip", "preview.png", "r
              "viz_lod1.json", "viz_lod2.json")
 RIG_FILES += ("soft_deformer.safetensors", "soft_deformer_lod1.safetensors",
               "soft_deformer_lod2.safetensors", "soft_deformer_report.json")
+RIG_FILES += ("skin_material.json", "rig_coverage.png", "rig_confidence.png", "rig_specular.png")
 MIN_FREE_MIB = 1536
 
 
@@ -49,49 +52,73 @@ def rig_job(service, request: dict, progress, cancel, python=None, mock: bool = 
     if not py.exists():
         raise ValueError(availability(python)["reason"])
     out = folder / "rig"
+    candidate = request.get("reconstruction_run")
+    if candidate:
+        manifest = service.reconstruction_file(head_id, candidate, "manifest.json")
+        out = manifest.parent / "rig"
     old_report = out / "rig_report.json"
-    saved_model = None
+    saved_model = json.loads(manifest.read_text()).get("face_model") if candidate else None
     if old_report.exists():
         saved_model = json.loads(old_report.read_text()).get("face_model", "procedural")
     face_model = request.get("face_model") or saved_model or "gnm_v3"
     if face_model not in SOURCES:
         raise ValueError(f"face_model must be one of {', '.join(SOURCES)}")
-    cmd = [str(py), "-m", "server.vhuman.rig.build", str(folder), "--out", str(out), "--res", str(res),
+    build_out = out.parent / (".rig-" + uuid.uuid4().hex + ".partial") if candidate else out
+    cmd = [str(py), "-m", "server.vhuman.rig.build", str(folder), "--out", str(build_out), "--res", str(res),
            "--iters", str(iters), "--cache", str(service.work / "cache" / "rig"),
            "--face-model", face_model, "--progress"]
-    progress(0.01, "waiting for the GPU")
-    lock = (service.work / "mock-gpu.lock") if mock else gpu.LOCK_PATH
-    tail = []
-    # PyTorch falls back to the CPU without a CUDA device; then only the lock is taken
-    check = not mock and gpu.gpu_status() is not None
-    with gpu.device_session(MIN_FREE_MIB, cancel, lock_path=lock, check_memory=check):
-        env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
-        proc = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
-        stop = threading.Event()
+    if candidate:
+        cmd.extend(["--reconstruction", str(manifest.parent)])
+    try:
+        progress(0.01, "waiting for the GPU")
+        lock = (service.work / "mock-gpu.lock") if mock else gpu.LOCK_PATH
+        tail = []
+        # PyTorch falls back to the CPU without a CUDA device; then only the lock is taken
+        check = not mock and gpu.gpu_status() is not None
+        with gpu.device_session(MIN_FREE_MIB, cancel, lock_path=lock, check_memory=check):
+            env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+            proc = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
+            stop = threading.Event()
 
-        def watch():
-            while not stop.wait(0.5):
-                if cancel.is_set() and proc.poll() is None:
-                    proc.terminate()
-        threading.Thread(target=watch, daemon=True).start()
-        try:
-            for line in proc.stdout:
-                line = line.rstrip()
-                if line.startswith("@progress "):
-                    _, f, msg = line.split(" ", 2)
-                    progress(0.02 + 0.96 * float(f), msg)
-                elif line:
-                    tail = (tail + [line])[-30:]
-            rc = proc.wait()
-        finally:
-            stop.set()
-    if cancel.is_set():
-        raise gpu.Cancelled("cancelled")
-    if rc != 0:
-        raise RuntimeError("rig build failed: " + " | ".join(tail[-6:]))
-    report = json.loads((out / "rig_report.json").read_text())
-    return {"id": head_id, "seconds": report.get("seconds"), "glb_url": f"/v1/heads/{head_id}/rig/rig.glb",
-            "usd_url": f"/v1/heads/{head_id}/rig/rig_usd.zip"}
+            def watch():
+                while not stop.wait(0.5):
+                    if cancel.is_set() and proc.poll() is None:
+                        proc.terminate()
+            threading.Thread(target=watch, daemon=True).start()
+            try:
+                for line in proc.stdout:
+                    line = line.rstrip()
+                    if line.startswith("@progress "):
+                        _, f, msg = line.split(" ", 2)
+                        progress(0.02 + 0.96 * float(f), msg)
+                    elif line:
+                        tail = (tail + [line])[-30:]
+                rc = proc.wait()
+            finally:
+                stop.set()
+        if cancel.is_set():
+            raise gpu.Cancelled("cancelled")
+        if rc != 0:
+            raise RuntimeError("rig build failed: " + " | ".join(tail[-6:]))
+        report = json.loads((build_out / "rig_report.json").read_text())
+        if candidate:
+            backup = out.parent / (".rig-" + uuid.uuid4().hex + ".backup")
+            if out.exists():
+                out.replace(backup)
+            try:
+                build_out.replace(out)
+            except BaseException:
+                if backup.exists():
+                    backup.replace(out)
+                raise
+            shutil.rmtree(backup, ignore_errors=True)
+    except BaseException:
+        if candidate:
+            shutil.rmtree(build_out, ignore_errors=True)
+        raise
+    base = f"/v1/heads/{head_id}/" + (f"reconstruction/{candidate}/rig/" if candidate else "rig/")
+    return {"id": head_id, "seconds": report.get("seconds"), "glb_url": base + "rig.glb",
+            "usd_url": base + "rig_usd.zip"}
 
 
 def main():                                 # pragma: no cover - convenience

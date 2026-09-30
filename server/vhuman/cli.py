@@ -255,8 +255,18 @@ def cmd_rig(args) -> dict:
     from .rig import job as rig_job
     svc = EyeService(Path(args.work))
     return rig_job.rig_job(svc, {"head_id": args.head, "res": args.res, "iters": args.iters,
-                                 "face_model": args.face_model}, _progress,
+                                 "face_model": args.face_model, "reconstruction_run": args.reconstruction_run}, _progress,
                            threading.Event(), python=args.rig_python)
+
+
+def cmd_reconstruction(args):
+    from .reconstruction.job import reconstruction_job
+    req = dict(head_id=getattr(args, 'head', None), portrait=getattr(args, 'portrait', None),
+               face_model=args.face_model, observations=args.observations, profile=args.profile,
+               gaussians=args.gaussians, depth_installation=args.depth_installation,
+               res=args.res, iterations=args.iterations, build_rig=not args.no_rig, roughness=args.roughness, f0=args.f0)
+    return reconstruction_job(EyeService(Path(args.work)), req, _progress, threading.Event(),
+                              python=args.rig_python, direct=getattr(args, 'portrait', None) is not None)
 
 
 def cmd_body(args) -> dict:
@@ -461,7 +471,22 @@ def main(argv=None) -> int:
     sp.add_argument("--iters", type=int, default=600)
     sp.add_argument("--face-model", choices=("gnm_v3", "ict_facekit_light", "procedural"),
                     help="face topology; existing rigs retain their saved model if omitted")
+    sp.add_argument("--reconstruction-run", help="build an isolated reconstruction candidate rig")
     sp.set_defaults(fn=cmd_rig)
+    for name in ("rig-refine-portrait", "portrait-reconstruct"):
+        sp = sub.add_parser(name, help="fit an isolated image-guided facial candidate")
+        sp.add_argument("--head" if name == "rig-refine-portrait" else "--portrait", required=True)
+        sp.add_argument("--face-model", choices=("gnm_v3", "ict_facekit_light"), default="gnm_v3")
+        sp.add_argument("--observations", help="manual face_observations.v1 JSON")
+        sp.add_argument("--profile", choices=("geometry", "material", "full"), default="full")
+        sp.add_argument("--res", type=int, choices=(256, 512, 1024), default=512)
+        sp.add_argument("--iterations", type=int, default=80)
+        sp.add_argument("--gaussians", type=int, choices=(0, 2000, 8000, 20000), default=0)
+        sp.add_argument("--depth-installation")
+        sp.add_argument("--roughness", type=float, default=.55, help="artist prior, .08..1")
+        sp.add_argument("--f0", type=float, default=.028, help="dielectric reflectance prior, .005...04")
+        sp.add_argument("--no-rig", action="store_true")
+        sp.set_defaults(fn=cmd_reconstruction)
     sp = sub.add_parser("body", help="Qwen full-body image -> SAM 3D Body -> Pixal3D -> combined avatar")
     sp.add_argument("--head", required=True, help="existing head with a facial rig")
     sp.add_argument("--outfit", default="plain fitted shirt, trousers and shoes")

@@ -369,7 +369,8 @@ def export_head(out: Path, mesh: dict, keep: np.ndarray, poses: list[EyePose], e
 
 
 def fit_head(portrait, head_glb, out_dir, fov_deg: float = 20.0, plates: list[dict] | None = None,
-             plate_loader=None, res: int = 1024, iris_info: dict | None = None, skin_params: dict | None = None) -> dict:
+             plate_loader=None, res: int = 1024, iris_info: dict | None = None, skin_params: dict | None = None,
+             anatomical_poses: list[EyePose] | None = None) -> dict:
     """The whole fit: eyes in the portrait, rays onto the head, carve, export."""
     skin_params = skin.validate(skin_params)
     started = time.perf_counter()
@@ -378,7 +379,22 @@ def fit_head(portrait, head_glb, out_dir, fov_deg: float = 20.0, plates: list[di
     eyes = L.find_eyes(portrait)
     cam = PixalCamera.from_portrait(portrait, math.radians(fov_deg))
     mesh = mesh_from_glb(Path(head_glb))
-    poses, info = fit_eyes(cam, mesh, eyes)
+    if anatomical_poses is None:
+        poses, info = fit_eyes(cam, mesh, eyes)
+    else:
+        poses = anatomical_poses
+        if len(poses) != 2 or {p.side for p in poses} != {"left", "right"}:
+            raise ValueError("two anatomical eye poses required")
+        for pose in poses:
+            if (pose.units_per_m <= 0 or not np.isfinite(pose.center).all()
+                    or not np.isfinite(pose.surface).all()
+                    or not np.allclose(pose.rotation.T @ pose.rotation, np.eye(3), atol=1e-5)):
+                raise ValueError("invalid anatomical eye pose")
+        k = float(poses[0].units_per_m)
+        if not np.isclose(k, poses[1].units_per_m):
+            raise ValueError("eye pose metric scales disagree")
+        info = dict(units_per_m=k, eye_initialization="source anatomical centres; assumed IPD scale",
+                    head_height_m=float(np.ptp(mesh["positions"][:, 1]) / k), depth={})
     keep = carve(mesh, cam, eyes, poses)
     # Cut the fissures along the smoothed contour and drape the lids onto the eyeballs.
     mesh, keep, wrap_info, lining = lids.wrap(mesh, keep, cam, eyes, poses)

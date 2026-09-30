@@ -246,7 +246,7 @@ def export_lods(levels, tmpl, pos, shapes, Jn, W, contacts_viz, mouth_parts, car
 
 def assemble(folder, out_dir=None, res: int = 2048, iters: int = 600, log=print, cache_dir=None,
              reuse_fit: bool = False, preview: bool = True, keep_asset: bool = False, progress=None,
-             deformer_samples: int = 4096, lods=(1, 2), face_model: str = "gnm_v3") -> dict:
+             deformer_samples: int = 4096, lods=(1, 2), face_model: str = "gnm_v3", reconstruction=None) -> dict:
     from . import face_models
     if face_model not in face_models.SOURCES:
         raise ValueError(f"face_model must be one of {', '.join(face_models.SOURCES)}")
@@ -273,6 +273,28 @@ def assemble(folder, out_dir=None, res: int = 2048, iters: int = 600, log=print,
 
     t = time.perf_counter()
     subj = load_subject(folder)
+    fitted_source = None
+    if reconstruction is not None:
+        from ..reconstruction.pipeline import subject_override
+        from ..reconstruction.fitting import topology_hash
+        reconstruction = Path(reconstruction)
+        manifest = json.loads((reconstruction / "manifest.json").read_text())
+        from ..reconstruction.observations import sha256
+        if manifest.get("source_head_sha256") != sha256(folder / "head_eyes.glb"):
+            raise ValueError("candidate source head changed")
+        if manifest.get("geometry_sha256") != sha256(reconstruction / "geometry.npz"):
+            raise ValueError("candidate geometry hash mismatch")
+        if manifest["face_model"] != face_model:
+            raise ValueError("candidate face model mismatch")
+        src = face_models.load(face_model)
+        expected_source = manifest.get("source_loaded_sha256")
+        if expected_source is not None and expected_source != face_models.fingerprint(src):
+            raise ValueError("candidate source model weights changed")
+        with np.load(reconstruction / "geometry.npz", allow_pickle=False) as z:
+            if topology_hash(z["triangles"]) != topology_hash(src.triangles):
+                raise ValueError("candidate topology mismatch")
+            fitted_source = (z["neutral"], float(z["scale"]), z["rotation"])
+        subj = subject_override(subj, reconstruction)
     tmpl = template.get(cache_dir)
     cache = out / "fit_cache.pkl"
     cached = None
@@ -313,6 +335,12 @@ def assemble(folder, out_dir=None, res: int = 2048, iters: int = 600, log=print,
                                       if progress else None)
         shapes = dict(shapes, **ml.target_deltas())
         t = lap("deformer", t)
+    if reconstruction is not None and contacts_viz is None:
+        from . import mldeformer
+        teeth = [(mouthparts.teeth(skel, up, skel["scale"], jidx)[0], "teeth_upper" if up else "teeth_lower")
+                 for up in (True, False)]
+        tongue = mouthparts.tongue(skel, skel["scale"], jidx)
+        contacts_viz = mldeformer.Contacts(tmpl, feat, skel, teeth, "cpu", pos, tongue=tongue).export()
     proc_pos, proc_shapes, proc_Jn, proc_W = pos, shapes, Jn, W
     proc_contacts = contacts_viz
     source_stats = None
@@ -320,14 +348,18 @@ def assemble(folder, out_dir=None, res: int = 2048, iters: int = 600, log=print,
     if face_model != "procedural":
         source = face_models.load(face_model)
         pos, shapes, Jn, W, source_stats = face_models.fit_and_transfer(
-            source, proc_pos, tmpl.tris[tmpl.tri_mat == 0], proc_shapes, proc_Jn, proc_W)
+            source, proc_pos, tmpl.tris[tmpl.tri_mat == 0], proc_shapes, proc_Jn, proc_W, fitted=fitted_source)
         contacts_viz = face_models.remap_contacts(proc_contacts, proc_pos, pos, source.triangles)
         active_tmpl = face_models.as_template(source)
     else:
         active_tmpl = tmpl
     parts_t = meshes.unweld(active_tmpl, pos)
     lining_rgb = tuple(subj.fit.get("fit", {}).get("lining", {}).get("srgb", (150, 100, 85)))
-    baked = bake.bake(active_tmpl, parts_t[0], pos, subj, out, res=res, lining_srgb=lining_rgb, log=log)
+    if reconstruction is not None:
+        from ..reconstruction.export import bake_model_atlas
+        baked = bake_model_atlas(reconstruction, out, res)
+    else:
+        baked = bake.bake(active_tmpl, parts_t[0], pos, subj, out, res=res, lining_srgb=lining_rgb, log=log)
     wrinkle_maps = None
     if face_model == "procedural" and (expr_dir / "manifest.json").exists():
         from . import wrinkles
@@ -360,6 +392,9 @@ def assemble(folder, out_dir=None, res: int = 2048, iters: int = 600, log=print,
         "baseColorTexture": {"index": 0}, "metallicRoughnessTexture": {"index": 1}, "metallicFactor": 1.0,
         "roughnessFactor": 1.0}, "normalTexture": {"index": 2}},
         "images": {0: rd["rig_basecolor.png"], 1: rd["rig_orm.png"], 2: rd["rig_normal.png"]}}
+    if reconstruction is not None:
+        from ..reconstruction.export import apply_material
+        apply_material(materials["skin"], baked, subj, out)
     mt = bake.mouth_texture()
     Image.fromarray(mt).save(out / "rig_mouth.png")
     materials["mouth"] = {"gltf": {"name": "mouth", "doubleSided": True, "pbrMetallicRoughness": {
@@ -405,7 +440,11 @@ def assemble(folder, out_dir=None, res: int = 2048, iters: int = 600, log=print,
     glb_stats = gltf.write(asset, out / "rig.glb")
     t = lap("gltf", t)
     usd_stats = usd.write(asset, out, subj)
-    if lods and source is not None:
+    if lods and source is not None and reconstruction is not None:
+        from . import source_lod
+        lod_report = source_lod.export(lods, source, pos, shapes, Jn, W, contacts_viz, mouth_parts, carried, jidx,
+                                       asset, out, subj, log)
+    elif lods and source is not None:
         # LODs retain the established ring-safe low-resolution mesh. Re-bake
         # its own atlas because the imported model uses a different UV layout.
         lod_bake_dir = out / "lod_atlas"
@@ -546,6 +585,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("head", help="a fitted head folder (portrait.png, head_eyes.glb, fit.json, skin maps)")
     ap.add_argument("--out", default=None)
+    ap.add_argument("--reconstruction", help="completed reconstruction candidate directory")
     ap.add_argument("--res", type=int, default=2048, help="skin atlas resolution")
     ap.add_argument("--iters", type=int, default=600, help="registration iterations")
     ap.add_argument("--cache", default="tmp/vhuman-rig/cache", help="template cache directory")
@@ -566,7 +606,7 @@ def main(argv=None):
     rep = assemble(a.head, a.out, a.res, a.iters, cache_dir=a.cache, reuse_fit=a.reuse_fit,
                    preview=not a.no_preview, keep_asset=a.keep_asset, progress=prog,
                    deformer_samples=a.deformer_samples,
-                   face_model=a.face_model,
+                   face_model=a.face_model, reconstruction=a.reconstruction,
                    lods=tuple(int(x) for x in a.lods.split(",") if x.strip()),
                    log=(lambda m: print(m, flush=True)))
     print(json.dumps({k: rep[k] for k in ("seconds", "timings", "shapes", "controls", "register", "bake")},

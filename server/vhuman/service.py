@@ -268,6 +268,47 @@ class EyeService:
             raise ServiceError("no such file")
         return path
 
+    def reconstruction_file(self, hid: str, run_id: str, name: str) -> Path:
+        from .reconstruction import FILES
+        from .rig.job import RIG_FILES
+        if not all(isinstance(x, str) and x.isalnum() and len(x) <= 32 for x in (hid, run_id)):
+            raise ServiceError("no such file")
+        root = self.work / "heads" / hid / "reconstruction" / run_id
+        if not (root / "manifest.json").is_file():
+            raise ServiceError("no such candidate")
+        ok = name in FILES
+        if name.startswith(('view_','exclusion_','silhouette_')) and name.endswith('.png') and '/' not in name:
+            try:
+                observations = json.loads((root/'observations.json').read_text())
+                ok = any(name==view.get(key) for view in observations.get('views',[])
+                         for key in ('image','exclusion_mask','silhouette_mask'))
+            except (OSError,ValueError):
+                ok = False
+        if name.startswith("rig/"):
+            rel = name[4:]
+            ok = rel in RIG_FILES or (rel.startswith("textures/") and rel.endswith(".png")
+                and "/" not in rel[9:] and ".." not in rel
+                and all(c.isalnum() or c in "_-./" for c in rel))
+        path = root / name
+        if not ok or not path.resolve().is_relative_to(root.resolve()) or not path.is_file():
+            raise ServiceError("no such file")
+        return path
+
+    def list_reconstructions(self, hid: str) -> list:
+        folder = self.head_file(hid, "head.json").parent
+        out = []
+        for path in sorted((folder / "reconstruction").glob("*/manifest.json")):
+            rid = path.parent.name
+            if not rid.isalnum():
+                continue
+            base = f"/v1/heads/{hid}/reconstruction/{rid}/"
+            try:
+                manifest = json.loads(path.read_text())
+            except ValueError:
+                continue
+            out.append(dict(id=rid, manifest=manifest, rig=self._rig_summary(path.parent, base), base=base))
+        return out
+
     @staticmethod
     def _body_summary(folder: Path, base: str) -> dict | None:
         report_path = folder / "body" / "body_report.json"

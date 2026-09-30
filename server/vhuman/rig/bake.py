@@ -58,6 +58,10 @@ def dilate(img: np.ndarray, covered: np.ndarray, steps: int) -> np.ndarray:
         cnt = np.zeros(cov.shape, np.float32)
         for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
             m = np.roll(np.roll(cov, dy, 0), dx, 1)
+            if dy > 0: m[:dy] = False
+            if dy < 0: m[dy:] = False
+            if dx > 0: m[:, :dx] = False
+            if dx < 0: m[:, dx:] = False
             acc += np.roll(np.roll(img, dy, 0), dx, 1) * m[..., None]
             cnt += m
         new = (~cov) & (cnt > 0)
@@ -223,6 +227,21 @@ def bake(tmpl: T.Template, skin: Part, pos: np.ndarray, subj, out_dir: Path, res
     out = {}
     for name, img in (("rig_basecolor.png", img_b), ("rig_orm.png", img_o), ("rig_normal.png", img_n)):
         Image.fromarray(np.clip(np.round(img), 0, 255).astype(np.uint8)).save(out_dir / name)
+        out[name] = str(out_dir / name)
+    for channel in ("coverage", "confidence", "specular"):
+        path = subj.folder / f"skin_{channel}.png"
+        if not path.is_file():
+            continue
+        source = np.asarray(Image.open(path).convert("RGB"))
+        values = _sample(source, suv)
+        if channel in ("coverage", "confidence"):
+            values[far | lining] = 0
+        image = np.zeros((res, res, 3), np.float32)
+        image[ys, xs] = values
+        if channel == "specular":
+            image = dilate(image, cov, 12)
+        name = f"rig_{channel}.png"
+        Image.fromarray(np.uint8(np.clip(image, 0, 255))).save(out_dir / name)
         out[name] = str(out_dir / name)
     stats = {"res": res, "texels": int(cov.sum()), "far_texels": int(far.sum()),
              "inferred_texels": int(far.sum()),

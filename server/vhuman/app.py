@@ -176,6 +176,8 @@ class App:
         from .head import pipeline as head_pipeline
         from .rig import emotion as rig_emotion, exprdata, job as rig_job, speech as rig_speech, soft_tissue, soft_deformer, video_fit
         from .body import job as body_job, motion as body_motion
+        from .reconstruction.job import reconstruction_job
+        from .reconstruction.upload import server_request
         self.rig_job = rig_job
         self.rig_speech = rig_speech
         self.soft_tissue = soft_tissue
@@ -192,6 +194,10 @@ class App:
             "head_skin": lambda req, prog, cancel: head_pipeline.skin_job(self.service, req, prog, cancel),
             "expressions": lambda req, prog, cancel: exprdata.expressions_job(self.service, req, prog, cancel,
                                                                               python=args.qwen_python, mock=args.mock),
+            "rig_refine_portrait": lambda req, prog, cancel: reconstruction_job(self.service, server_request(self.service, req), prog, cancel,
+                python=getattr(args, "rig_python", None), mock=args.mock),
+            "portrait_reconstruct": lambda req, prog, cancel: reconstruction_job(self.service, server_request(self.service, req, direct=True), prog, cancel,
+                python=getattr(args, "rig_python", None), mock=args.mock, direct=True),
             "rig": lambda req, prog, cancel: rig_job.rig_job(self.service, req, prog, cancel,
                                                              python=getattr(args, "rig_python", None), mock=args.mock),
             "body": lambda req, prog, cancel: body_job.body_job(self.service, req, prog, cancel,
@@ -325,6 +331,16 @@ def make_handler(app: App, quiet: bool = False):
                                       {"Cache-Control": "no-cache"})
                 if path == "/v1/heads":
                     return self._json(200, {"heads": app.service.list_heads()})
+                if path in ("/vhuman_skin_shader.js", "/vhuman_gaussian.js"):
+                    return self._file(ROOT / "web" / path[1:])
+                if path.startswith("/v1/heads/") and "/reconstruction" in path:
+                    hid, _, tail = path[len("/v1/heads/"):].partition("/reconstruction")
+                    if tail in ("", "/"):
+                        return self._json(200, {"candidates": app.service.list_reconstructions(hid)})
+                    rid, sep, name = tail.lstrip("/").partition("/")
+                    if not sep:
+                        return self._error(404, "no such file")
+                    return self._file(app.service.reconstruction_file(hid, rid, name))
                 if path.startswith("/v1/heads/") and "/rig/takes" in path:
                     hid, _, tail = path[len("/v1/heads/"):].partition("/rig/takes")
                     if tail == "":
@@ -378,6 +394,14 @@ def make_handler(app: App, quiet: bool = False):
         def do_POST(self):
             path = self.path.split("?", 1)[0]
             try:
+                if path == "/v1/portrait/uploads":
+                    from .reconstruction.upload import upload, MAX_UPLOAD
+                    length = int(self.headers.get("Content-Length") or 0)
+                    if length > MAX_UPLOAD:
+                        self.close_connection = True
+                        raise TooLarge("portrait upload too large")
+                    return self._json(201, upload(app.service, self.rfile, length,
+                                                 self.headers.get("Content-Type", "")))
                 if path == "/v1/body/uploads":
                     from .body.motion import upload, MAX_UPLOAD
                     length = int(self.headers.get("Content-Length") or 0)

@@ -86,7 +86,7 @@ def _material_usd(name, spec, tex_dir: Path, rel: str, tex_prefix: str = "") -> 
         data = imgs[int(info["index"])]
         (tex_dir / fn).write_bytes(data if isinstance(data, (bytes, bytearray)) else b"")
         node = f"Tex_{slot}"
-        tex_nodes.append((node, f"@{rel}/{fn}@", key == "normal"))
+        tex_nodes.append((node, f"@{rel}/{fn}@", key))
         return f"</Character/Materials/{name}/{node}.outputs:{channel}>"
 
     c = tex("baseColorTexture", "diffuse")
@@ -105,6 +105,15 @@ def _material_usd(name, spec, tex_dir: Path, rel: str, tex_prefix: str = "") -> 
     else:
         lines.append(f"                float inputs:roughness = {_f(pbr.get('roughnessFactor', 0.5))}")
     lines.append(f"                float inputs:metallic = {_f(0.0)}")
+    specular = g.get("extensions", {}).get("KHR_materials_specular")
+    if specular:
+        intensity = float(specular.get("specularFactor", 1))
+        color = specular.get("specularColorFactor", [1, 1, 1])
+        f0 = [min(.04 * float(c), 1) * intensity for c in color]
+        if "dielectric_f0" in g.get("extras", {}):
+            f0 = [float(g["extras"]["dielectric_f0"])] * 3
+        lines.append("                int inputs:useSpecularWorkflow = 1")
+        lines.append(f"                color3f inputs:specularColor = ({_f(f0[0])}, {_f(f0[1])}, {_f(f0[2])})")
     n = tex("normalTexture", "normal")
     if n:
         lines.append(f"                normal3f inputs:normal.connect = {n}")
@@ -113,11 +122,12 @@ def _material_usd(name, spec, tex_dir: Path, rel: str, tex_prefix: str = "") -> 
     lines += ["                token outputs:surface", "            }"]
     lines += ['            def Shader "Reader"', "            {", '                uniform token info:id = "UsdPrimvarReader_float2"',
               '                string inputs:varname = "st"', "                float2 outputs:result", "            }"]
-    for node, path, is_normal in tex_nodes:
+    for node, path, semantic in tex_nodes:
+        is_normal = semantic == "normal"
         lines += [f'            def Shader "{node}"', "            {", '                uniform token info:id = "UsdUVTexture"',
                   f"                asset inputs:file = {path}",
                   f"                float2 inputs:st.connect = </Character/Materials/{name}/Reader.outputs:result>",
-                  f'                token inputs:sourceColorSpace = "{"raw" if is_normal else "auto"}"']
+                  f'                token inputs:sourceColorSpace = "{"raw" if semantic in ("normal", "rough") else "auto"}"']
         if is_normal:
             lines += ["                float4 inputs:scale = (2, 2, 2, 1)", "                float4 inputs:bias = (-1, -1, -1, 0)"]
         lines += ['                token inputs:wrapS = "clamp"', '                token inputs:wrapT = "clamp"',

@@ -148,6 +148,7 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { SkinRenderer } from '/vhuman_skin_shader.js';
 import * as Eye from '/vhuman_eye_shader.js';
 
 const $ = (id) => document.getElementById(id);
@@ -169,7 +170,19 @@ renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
 renderer.toneMapping = THREE.NeutralToneMapping;
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 viewer.prepend(renderer.domElement);
+const skinRenderer = new SkinRenderer(renderer);
+window.__skinRenderer = skinRenderer;
 const scene = new THREE.Scene();
+const skinControl = document.createElement('label');
+skinControl.style.cssText='position:absolute;right:12px;bottom:12px;z-index:3;background:#171c24;padding:8px;border-radius:8px';
+skinControl.innerHTML='<input type="checkbox" style="width:auto"> Skin scattering <span></span>';
+const skinToggle=skinControl.querySelector('input'), skinTiming=skinControl.querySelector('span');
+skinToggle.disabled=!skinRenderer.supported;
+skinControl.title=skinRenderer.status;
+renderer.domElement.parentElement.append(skinControl);
+skinToggle.onchange=()=>{skinRenderer.enabled=skinToggle.checked; render();};
+setInterval(()=>{skinTiming.textContent=skinRenderer.enabled?`${skinRenderer.ms.toFixed(1)} ms CPU`:'';},1000);
+
 const pmrem = new THREE.PMREMGenerator(renderer);
 const roomEnv = pmrem.fromScene(new RoomEnvironment(renderer), 0.03).texture;
 const key = new THREE.DirectionalLight(0xffffff, 1.2);
@@ -206,7 +219,7 @@ function resize() {
   camera.updateProjectionMatrix();
   render();
 }
-function render() { renderer.render(scene, camera); }
+function render() { skinRenderer.render(scene, camera); }
 window.addEventListener('resize', resize);
 
 function setView(name) {
@@ -297,6 +310,12 @@ async function loadHead(h) {
   const gltf = await loader.loadAsync(h.urls.head_eyes);
   if (generation !== headLoadGeneration) return;
   state.model = gltf.scene;
+  skinRenderer.unitsPerM=h.fit?.units_per_m||1;
+  try {
+    const mask=await new THREE.TextureLoader().loadAsync(`/v1/heads/${h.id}/skin_mask.png`);
+    mask.flipY=false;mask.colorSpace=THREE.NoColorSpace;
+    state.model.traverse(o=>{if(o.isMesh)for(const m of [].concat(o.material))if(m.name==='head')m.userData.skinMask=mask;});
+  }catch(_){} // imported legacy heads can lack a authored skin mask
   scene.add(state.model);
   const box = new THREE.Box3().setFromObject(state.model);
   box.getCenter(headCenter);
