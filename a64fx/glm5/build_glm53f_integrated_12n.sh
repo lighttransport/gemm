@@ -38,7 +38,7 @@ obj() {
 bin() {
     local name=$1
     shift
-    "$cc" "${cflags[@]}" "$@" -lm -ltofucom -o "$bin_dir/$name"
+    "$cc" "${cflags[@]}" "$@" -lm -lpthread -ltofucom -o "$bin_dir/$name"
 }
 obj collective glm53f_collective_12n.c
 obj kda glm53f_kda_layer_12n.c -DGLM53F_KDA_NO_MAIN
@@ -47,13 +47,15 @@ obj dense glm53f_dense_ffn_12n.c "${external[@]}" -DGLM53F_DENSE_NO_MAIN
 obj moe glm53f_expert_decode_12n.c "${external[@]}" -DGLM53F_EXPERT_NO_MAIN
 obj iq_bridge glm53f_iq_bridge.c
 obj q8_panel kern/glm53f_kern_q8r16.c
+obj gemm_kern kern/glm53f_kern_gemm.c
+"$cc" "${cflags[@]}" -c kern/glm53f_kern_gemm_asm.S -o "$build_dir/gemm_asm.o"
 obj head glm53f_target_head_12n.c "${external[@]}" -DGLM53F_TARGET_HEAD_NO_MAIN
 obj embedding glm53f_embedding_12n.c "${external[@]}"
-objects=("$build_dir/q8_panel.o")
+objects=("$build_dir/q8_panel.o" "$build_dir/gemm_kern.o" "$build_dir/gemm_asm.o")
 for name in collective kda sparse dense moe iq_bridge head embedding; do
     objects+=("$build_dir/$name.o")
 done
-kernels=("$build_dir/iq_bridge.o" "$build_dir/q8_panel.o" "$build_dir/collective.o")
+kernels=("$build_dir/iq_bridge.o" "$build_dir/q8_panel.o" "$build_dir/collective.o" "$build_dir/gemm_kern.o" "$build_dir/gemm_asm.o")
 bin glm53f_target_decode_12n glm53f_target_decode_12n.c "${objects[@]}"
 for name in q2_stage q2_embed_stage q2_dense_stage q2_sparse_stage q2_kda_stage \
             q2_shexp_stage q2_core_patch q2_shared_patch core_stage core_add_routers; do

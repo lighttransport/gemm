@@ -18,9 +18,15 @@ bash a64fx/glm5/run_glm53f_12n.sh decode 1 128
 # Generate from whitespace-separated token IDs.
 bash a64fx/glm5/run_glm53f_12n.sh generate prompt.ids output.ids 256 \
   --prefill-chunk 512 --prefill-mode fast --prefill-features 27 \
-  --prefill-slab 16 --prefill-collective tree-packed --decode-window 128
+  --prefill-slab 32 --prefill-collective mpi-rsag --decode-window 128
 python3 a64fx/glm5/glm5_tokenizer.py decode-file output.ids
 ```
+
+Prefill communication (measured with `bench_glm53f_allreduce_12n.c`, 8 MiB = 512 tokens x 4096 fp32 across 12 nodes):
+`mpi-rsag` with 32-token slabs takes 5.7 ms, `tree-packed` 11.5 ms and the decode collective in 4-token calls 17 ms.
+The MoE combine reduces the whole 512-token chunk with one `MPI_Allreduce` (3.4 ms); `GLM53F_MOE_AR_SLAB` selects the
+call size (0 = the original 4-token decode-collective calls, up to 32 = uTofu-wrapper slabs, above 32 = raw MPI).
+Also set `XOS_MMM_L_PAGING_POLICY=demand:demand:demand`; the previous `...:prepage` policy placed weights badly.
 
 The default is **UD-Q4_K_XL with native GGUF-derived weights**. Routed experts
 retain Q4_K/Q5_K/Q6_K blocks; dense, KDA, sparse and shared-expert projections

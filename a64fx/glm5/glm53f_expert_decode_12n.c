@@ -18,6 +18,8 @@
 #include "glm53f_collective_12n.h"
 #include "glm53f_int8.h"
 #include "glm53f_prefill.h"
+#include "glm53f_moe_grouped_native.h"
+#include "kern/glm53f_kern.h"
 #include "../../common/glm53f_safetensors.h"
 #include "../../common/glm53f_ref.h"
 
@@ -207,8 +209,21 @@ struct glm53f_moe_stage_context_12n {
     int int8_enabled;
     int profile;
     double profile_phase[3];
+    double gn_phase[8]; /* native: 0 total, 1 x-quant, 2 old-expert loop, 3 shared, 4 combine, 5 task wall, 6 avg busy, 7 tasks */
     unsigned long long occupancy[5]; /* 0, 1, 2-3, 4-7, >=8 tokens/expert. */
     void *i8_prefill_storage;
+    /* Grouped prefill straight from native GGUF Q4_K gate/up + Q5_K down (default on; GLM53F_MOE_NATIVE_GROUPED=0 disables;
+     * =2 also recomputes with the per-token decode kernels and reports the relative difference). */
+    int gn_mode, rg_mode, sg_mode, ar_slab;
+    uint16_t *sg_gu[NLAYERS], *sg_dn[NLAYERS];
+    uint8_t *s8_gu[NLAYERS], *s8_dn[NLAYERS];
+    int8_t *s8_xq, *s8_xp, *s8_a8, *s8_xp2; float *s8_xs, *s8_bt, *s8_xsp, *s8_ygu, *s8_as, *s8_asp, *s8_bd, *s8_y;
+    float *sg_up, *sg_act, *sg_out;
+    uint16_t *router_wt; /* tiled router weights for gmn_router_run */
+    int8_t *gn_xq;
+    float *gn_xs, *gn_bt, *gn_verify;
+    void *gn_threads;
+    int gn_nthreads;
     /* Native GGUF shared expert (GLM53F_Q2_SHEXP_STAGE): rank-local rows of
      * gate/up and columns of down, used by single-token decode. */
     int nsh_native, nsh_in;
@@ -591,6 +606,9 @@ glm53f_moe_stage_context_12n *glm53f_moe_stage_create_12n(
                 NEXPERTS * sizeof(float))) goto fail;
     }
     glm53f_st_close(st); st = NULL;
+    if (posix_memalign((void **)&c->router_wt, 256, (size_t)layer_count * NEXPERTS * 4096 * sizeof(uint16_t))) goto fail;
+    for (int li = 0; li < layer_count; ++li)
+        gmn_router_pack(c->router_wt + (size_t)li * NEXPERTS * 4096, c->router_w + (size_t)li * NEXPERTS * 4096, 4096);
 #if defined(__GLIBC__)
     malloc_trim(0);
 #endif
@@ -605,10 +623,20 @@ glm53f_moe_stage_context_12n *glm53f_moe_stage_create_12n(
     }
     {
         const char *nsh = getenv("GLM53F_Q2_SHEXP_STAGE");
-        if (nsh && *nsh && nsh_load(c, nsh)) {
+        if (nsh && *nsh && c->first_layer < 45 && nsh_load(c, nsh)) {
             fprintf(stderr, "rank=%d failed to load GLM53F_Q2_SHEXP_STAGE=%s\n", rank, nsh);
             goto fail;
         }
+    }
+    {
+        const char *gn = getenv("GLM53F_MOE_NATIVE_GROUPED");
+        c->gn_mode = gn && *gn ? atoi(gn) : 1;
+        const char *rg = getenv("GLM53F_MOE_ROUTER_GEMM");
+        c->rg_mode = rg && *rg ? atoi(rg) : 1;
+        const char *sg = getenv("GLM53F_MOE_SHARED_GEMM");
+        c->sg_mode = sg && *sg ? atoi(sg) : 1;
+        const char *as = getenv("GLM53F_MOE_AR_SLAB");
+        c->ar_slab = as && *as ? atoi(as) : 512;
     }
     return c;
 fail:
@@ -646,6 +674,9 @@ void glm53f_moe_stage_profile_report_12n(const glm53f_moe_stage_context_12n *c,
                label?label:"target", p[0]*1e3/d, p[1]*1e3/d, p[2]*1e3/d);
         printf("GLM53F_MOE_RANK_MIN label=%s router=%.3f local=%.3f allreduce=%.3f ms_pos\n",
                label?label:"target", minimum[0]*1e3/d, minimum[1]*1e3/d, minimum[2]*1e3/d);
+        printf("GLM53F_MOE_PROFILE_DETAIL label=%s native_total=%.3f xquant=%.3f native_tasks_wall=%.3f native_avg_busy=%.3f old_expert_loop=%.3f shared=%.3f combine=%.3f tasks_per_call=%.1f ms_pos\n",
+               label?label:"target", c->gn_phase[0]*1e3/d, c->gn_phase[1]*1e3/d, c->gn_phase[5]*1e3/d, c->gn_phase[6]*1e3/d,
+               c->gn_phase[2]*1e3/d, c->gn_phase[3]*1e3/d, c->gn_phase[4]*1e3/d, c->gn_phase[7]);
         printf("GLM53F_MOE_OCCUPANCY empty=%llu one=%llu two_three=%llu four_seven=%llu eight_plus=%llu\n",
                c->occupancy[0],c->occupancy[1],c->occupancy[2],c->occupancy[3],c->occupancy[4]);
     }
@@ -800,19 +831,415 @@ static int moe_prefill_int8_local(glm53f_moe_stage_context_12n *c, float *out,
     return failed ? -1 : 0;
 }
 
+
+/* ---- grouped prefill directly from native GGUF Q4_K (gate/up) + Q5_K (down) ---------------------------- */
+enum { GN_MAXM = 96, GN_LDY_DN = 4096 + 64, GN_MAXINTER = 512 };
+typedef struct {
+    int8_t *xp, *xp2, *a8;
+    float *xsp, *Bg, *ygu, *as, *asp, *mina, *yd;
+    uint8_t *cbuf;
+    double busy;
+} gn_tbuf;
+typedef struct { int e, off, n; } gn_task;
+
+void dequantize_row_q4_K(const void *src, float *dst, int n);
+void dequantize_row_q5_K(const void *src, float *dst, int n);
+void dequantize_row_q6_K(const void *src, float *dst, int n);
+
+static void *gn_alloc(size_t n) {
+    void *p = NULL;
+    if (posix_memalign(&p, 256, n ? n : 256)) return NULL;
+    memset(p, 0, n);
+    return p;
+}
+
+static int gn_thread_init(gn_tbuf *b) {
+    b->xp = gn_alloc((size_t)GN_MAXM * 4096);
+    b->xsp = gn_alloc((size_t)GN_MAXM * 128 * 4);
+    b->Bg = gn_alloc((size_t)GN_MAXM * 128 * 4);
+    b->xp2 = gn_alloc((size_t)GN_MAXM * GN_MAXINTER);
+    b->a8 = gn_alloc((size_t)GN_MAXM * GN_MAXINTER);
+    b->as = gn_alloc((size_t)GN_MAXM * 16 * 4);
+    b->asp = gn_alloc((size_t)GN_MAXM * 16 * 4);
+    b->ygu = gn_alloc((size_t)GN_MAXM * 2 * GN_MAXINTER * 4);
+    b->mina = gn_alloc((size_t)(4096 / 32) * 64 * 4);
+    b->yd = gn_alloc((size_t)GN_MAXM * GN_LDY_DN * 4);
+    b->cbuf = gn_alloc((size_t)(GMN_KC / 32) * GMN_BLK);
+    return !(b->xp && b->xsp && b->Bg && b->xp2 && b->a8 && b->as && b->asp && b->ygu && b->mina && b->yd && b->cbuf);
+}
+
+static int gn_expert_eligible(const glm53f_moe_stage_context_12n *c, const expert_offset *ep) {
+    const int q6 = ep->down_type == GLM53F_GGML_Q6_K;
+    return ep->gate_up != UINT64_MAX && (ep->gate_type == GLM53F_GGML_Q4_K || ep->gate_type == GLM53F_GGML_Q5_K) &&
+           (ep->down_type == GLM53F_GGML_Q5_K || (q6 && ep->inter == 256)) &&
+           ep->inter >= 256 && ep->inter % 256 == 0 && ep->inter <= GN_MAXINTER &&
+           !(((uintptr_t)(c->blob + ep->gate_up)) & 3) && !(((uintptr_t)(c->blob + ep->down)) & (q6 ? 1 : 3));
+}
+
+/* Computes batch_routes rows for every eligible expert and sets handled[e].  x is [tokens][4096] float. */
+static int moe_native_grouped(glm53f_moe_stage_context_12n *c, const float *x, int tokens, int table_layer,
+                              int (*selected)[8], unsigned char *handled) {
+    enum { H = 4096 };
+    static const int8_t zrow[H];
+    static const float zxs[H / 32];
+    if (!c->gn_xq) {
+        c->gn_xq = gn_alloc((size_t)GLM53F_PREFILL_MAX_TOKENS * H);
+        c->gn_xs = gn_alloc((size_t)GLM53F_PREFILL_MAX_TOKENS * (H / 32) * 4);
+        c->gn_bt = gn_alloc((size_t)GLM53F_PREFILL_MAX_TOKENS * (H / 32) * 4);
+        c->gn_nthreads = omp_get_max_threads();
+        c->gn_threads = calloc((size_t)c->gn_nthreads, sizeof(gn_tbuf));
+        if (!c->gn_xq || !c->gn_xs || !c->gn_bt || !c->gn_threads) return -1;
+    }
+    gn_tbuf *tbs = (gn_tbuf *)c->gn_threads;
+    int cnt[NEXPERTS], base[NEXPERTS + 1];
+    memset(cnt, 0, sizeof(cnt));
+    unsigned char elig[NEXPERTS];
+    for (int e = 0; e < NEXPERTS; ++e)
+        elig[e] = (unsigned char)gn_expert_eligible(c, &c->table[table_layer * NEXPERTS + e]);
+    for (int t = 0; t < tokens; ++t)
+        for (int k = 0; k < 8; ++k)
+            if (elig[selected[t][k]]) cnt[selected[t][k]]++;
+    base[0] = 0;
+    for (int e = 0; e < NEXPERTS; ++e) base[e + 1] = base[e] + cnt[e];
+    const int total = base[NEXPERTS];
+    if (!total) return 0;
+    int *plist = (int *)malloc((size_t)total * 2 * sizeof(int));
+    gn_task *tasks = (gn_task *)malloc((size_t)(NEXPERTS + total / GN_MAXM + 1) * sizeof(gn_task));
+    if (!plist || !tasks) { free(plist); free(tasks); return -1; }
+    {
+        int fill[NEXPERTS];
+        memset(fill, 0, sizeof(fill));
+        for (int t = 0; t < tokens; ++t)
+            for (int k = 0; k < 8; ++k) {
+                int e = selected[t][k];
+                if (!elig[e]) continue;
+                int i = base[e] + fill[e]++;
+                plist[2 * i] = t;
+                plist[2 * i + 1] = k;
+            }
+    }
+    int ntasks = 0;
+    for (int e = 0; e < NEXPERTS; ++e)
+        for (int off = 0; off < cnt[e]; off += GN_MAXM) {
+            tasks[ntasks++] = (gn_task){e, base[e] + off, cnt[e] - off < GN_MAXM ? cnt[e] - off : GN_MAXM};
+            handled[e] = 1;
+        }
+    for (int i = 1; i < ntasks; ++i) { /* largest groups first */
+        gn_task v = tasks[i];
+        int j = i - 1;
+        while (j >= 0 && tasks[j].n < v.n) { tasks[j + 1] = tasks[j]; --j; }
+        tasks[j + 1] = v;
+    }
+    int failed = 0, next = 0;
+    double gt0 = c->profile ? MPI_Wtime() : 0.0;
+#pragma omp parallel for schedule(static)
+    for (int t = 0; t < tokens; ++t)
+        gmn_quant_row(x + (size_t)t * H, H, c->gn_xq + (size_t)t * H, c->gn_xs + (size_t)t * (H / 32),
+                      c->gn_bt + (size_t)t * (H / 32));
+    double gt1 = c->profile ? MPI_Wtime() : 0.0;
+    for (int i = 0; i < c->gn_nthreads; ++i) tbs[i].busy = 0.0;
+#pragma omp parallel
+    {
+        gn_tbuf *B = &tbs[omp_get_thread_num()];
+        if (!B->xp && gn_thread_init(B)) {
+#pragma omp atomic write
+            failed = 1;
+        }
+        for (; !failed;) {
+            int ti = __atomic_fetch_add(&next, 1, __ATOMIC_RELAXED);
+            if (ti >= ntasks) break;
+            const gn_task tk = tasks[ti];
+            double tb0 = c->profile ? MPI_Wtime() : 0.0;
+            const expert_offset *ep = &c->table[table_layer * NEXPERTS + tk.e];
+            const int m = tk.n, mpad = (m + 5) / 6 * 6, inter = ep->inter, nbi = inter / 32;
+            for (int g = 0; g < mpad / 6; ++g) {
+                const int8_t *rows[6];
+                const float *xsr[6];
+                for (int u = 0; u < 6; ++u) {
+                    int sl = g * 6 + u;
+                    if (sl < m) {
+                        int t = plist[2 * (tk.off + sl)];
+                        rows[u] = c->gn_xq + (size_t)t * H;
+                        xsr[u] = c->gn_xs + (size_t)t * (H / 32);
+                    } else { rows[u] = zrow; xsr[u] = zxs; }
+                }
+                gmn_pack6(B->xp + (size_t)g * 6 * H, B->xsp + (size_t)g * 6 * (H / 32), rows, xsr, H);
+            }
+            for (int sl = 0; sl < mpad; ++sl) {
+                if (sl < m) memcpy(B->Bg + (size_t)sl * (H / 32), c->gn_bt + (size_t)plist[2 * (tk.off + sl)] * (H / 32), (H / 32) * 4);
+                else memset(B->Bg + (size_t)sl * (H / 32), 0, (H / 32) * 4);
+            }
+            const size_t ldg = (size_t)2 * inter;
+            const int gtype = ep->gate_type == GLM53F_GGML_Q5_K ? GMN_TYPE_Q5K : GMN_TYPE_Q4K;
+            gmn_gemm(gtype, c->blob + ep->gate_up, gmn_row_bytes(gtype, H), H, 2 * inter, mpad,
+                     B->xp, B->xsp, B->Bg, B->ygu, ldg, B->cbuf, B->mina, 1);
+            float *bd = B->Bg; /* gate/up min-correction input is no longer needed */
+            if (ep->down_type == GLM53F_GGML_Q6_K) { /* 16-column scale blocks, no min term */
+                const int nb16 = inter / 16;
+                gmn_swiglu_quant16(B->ygu, ldg, inter, m, mpad, B->a8, B->as);
+                for (int g = 0; g < mpad / 6; ++g) {
+                    const int8_t *rows[6];
+                    const float *xsr[6];
+                    for (int u = 0; u < 6; ++u) {
+                        rows[u] = B->a8 + (size_t)(g * 6 + u) * inter;
+                        xsr[u] = B->as + (size_t)(g * 6 + u) * nb16;
+                    }
+                    gmn_pack6_sb(B->xp2 + (size_t)g * 6 * inter, B->asp + (size_t)g * 6 * nb16, rows, xsr, inter, 16);
+                }
+                gmn_gemm_q6(c->blob + ep->down, GMN_Q6K_BYTES * (size_t)(inter / 256), inter, H, mpad,
+                            B->xp2, B->asp, B->yd, GN_LDY_DN, B->cbuf);
+            } else {
+            gmn_swiglu_quant(B->ygu, ldg, inter, m, mpad, B->a8, B->as, bd);
+            for (int g = 0; g < mpad / 6; ++g) {
+                const int8_t *rows[6];
+                const float *xsr[6];
+                for (int u = 0; u < 6; ++u) {
+                    rows[u] = B->a8 + (size_t)(g * 6 + u) * inter;
+                    xsr[u] = B->as + (size_t)(g * 6 + u) * nbi;
+                }
+                gmn_pack6(B->xp2 + (size_t)g * 6 * inter, B->asp + (size_t)g * 6 * nbi, rows, xsr, inter);
+            }
+            gmn_gemm(GMN_TYPE_Q5K, c->blob + ep->down, gmn_row_bytes(GMN_TYPE_Q5K, inter), inter, H, mpad,
+                     B->xp2, B->asp, bd, B->yd, GN_LDY_DN, B->cbuf, B->mina, 1);
+            }
+            for (int sl = 0; sl < m; ++sl) {
+                const int t = plist[2 * (tk.off + sl)], k = plist[2 * (tk.off + sl) + 1];
+                memcpy(c->batch_routes + ((size_t)t * 8 + k) * H, B->yd + (size_t)sl * GN_LDY_DN, H * sizeof(float));
+            }
+            if (c->profile) B->busy += MPI_Wtime() - tb0;
+        }
+    }
+    if (c->profile) {
+        double busy = 0;
+        for (int i = 0; i < c->gn_nthreads; ++i) busy += tbs[i].busy;
+        c->gn_phase[1] += gt1 - gt0;
+        c->gn_phase[5] += MPI_Wtime() - gt1;
+        c->gn_phase[6] += busy / c->gn_nthreads;
+        c->gn_phase[7] += ntasks;
+    }
+    free(plist);
+    free(tasks);
+    return failed ? -1 : 0;
+}
+
+
+
+/* ---- shared expert (native Q8_0 GGUF) through the int8 panel64 tile GEMM ------------------------------------ */
+static float s8_q80_scale(const uint8_t *p) { _Float16 h; memcpy(&h, p, 2); return (float)h; }
+
+/* Convert `rows` x `cols` Q8_0-family weights to panel64 (sb=32); returns malloc'd buffer of rows/64 panels. */
+static uint8_t *s8_convert(int type, const uint8_t *src, int rows, int cols) {
+    const size_t pbytes = gk_panel64_bytes(32, cols);
+    uint8_t *dst = (uint8_t *)gn_alloc((size_t)(rows / 64) * pbytes);
+    if (!dst) return NULL;
+    const int nb = cols / 32;
+    const size_t rb_r = (size_t)cols + (size_t)nb * 4, rb_q = (size_t)nb * 34;
+    int8_t *q = (int8_t *)malloc((size_t)64 * cols);
+    float *sc = (float *)malloc((size_t)64 * nb * sizeof(float));
+    if (!q || !sc) { free(q); free(sc); free(dst); return NULL; }
+    for (int panel = 0; panel < rows / 64; ++panel) {
+        for (int r = 0; r < 64; ++r) {
+            const int row = panel * 64 + r;
+            for (int b = 0; b < nb; ++b) {
+                if (type == GLM53F_NATIVE_Q8_0R) {
+                    memcpy(q + (size_t)r * cols + b * 32, src + (size_t)row * rb_r + b * 32, 32);
+                    memcpy(&sc[(size_t)r * nb + b], src + (size_t)row * rb_r + cols + (size_t)b * 4, 4);
+                } else if (type == GLM53F_GGML_Q8_0) {
+                    const uint8_t *blk = src + (size_t)row * rb_q + (size_t)b * 34;
+                    sc[(size_t)r * nb + b] = s8_q80_scale(blk);
+                    memcpy(q + (size_t)r * cols + b * 32, blk + 2, 32);
+                } else { /* GLM53F_NATIVE_Q8_0R16: 16-row panels, 576 B per 32 columns */
+                    const size_t pb16 = (size_t)nb * 576;
+                    const uint8_t *blk = src + (size_t)(row / 16) * pb16 + (size_t)b * 576;
+                    const int rr = row % 16;
+                    for (int j = 0; j < 8; ++j) memcpy(q + (size_t)r * cols + b * 32 + 4 * j, blk + j * 64 + rr * 4, 4);
+                    memcpy(&sc[(size_t)r * nb + b], blk + 512 + rr * 4, 4);
+                }
+            }
+        }
+        gk_pack_panel64(32, dst + (size_t)panel * pbytes, q, sc, 64, cols);
+    }
+    free(q); free(sc);
+    return dst;
+}
+
+static int moe_shared_q8(glm53f_moe_stage_context_12n *c, float *dst, const float *x, int tokens, int layer) {
+    enum { H = 4096, LDY_DN = 4096 + 64 };
+    const int in = c->nsh_in;
+    if (!nsh_is_q80(c->nsh_gt[layer]) || !nsh_is_q80(c->nsh_ut[layer]) || !nsh_is_q80(c->nsh_dt[layer]) ||
+        in < 64 || in % 64 || in > 256 || c->nsh_gt[layer] != c->nsh_ut[layer]) return -2;
+    if (!c->s8_gu[layer]) {
+        /* gate rows first, then up rows, in one panel64 matrix of 2*in rows */
+        uint8_t *g = s8_convert(c->nsh_gt[layer], c->nsh_g[layer], in, H);
+        uint8_t *u = s8_convert(c->nsh_ut[layer], c->nsh_u[layer], in, H);
+        uint8_t *d = s8_convert(c->nsh_dt[layer], c->nsh_d[layer], H, in);
+        if (!g || !u || !d) { free(g); free(u); free(d); return -1; }
+        const size_t gb = (size_t)(in / 64) * gk_panel64_bytes(32, H);
+        uint8_t *gu = (uint8_t *)gn_alloc(2 * gb);
+        if (!gu) { free(g); free(u); free(d); return -1; }
+        memcpy(gu, g, gb); memcpy(gu + gb, u, gb);
+        free(g); free(u);
+        c->s8_gu[layer] = gu; c->s8_dn[layer] = d;
+    }
+    const int T = GLM53F_PREFILL_MAX_TOKENS + 6;
+    if (!c->s8_xq) {
+        c->s8_xq = (int8_t *)gn_alloc((size_t)T * H); c->s8_xs = (float *)gn_alloc((size_t)T * (H / 32) * 4);
+        c->s8_bt = (float *)gn_alloc((size_t)T * (H / 32) * 4);
+        c->s8_xp = (int8_t *)gn_alloc((size_t)T * H); c->s8_xsp = (float *)gn_alloc((size_t)T * (H / 32) * 4);
+        c->s8_ygu = (float *)gn_alloc((size_t)T * 2 * 256 * 4);
+        c->s8_a8 = (int8_t *)gn_alloc((size_t)T * 256); c->s8_as = (float *)gn_alloc((size_t)T * 8 * 4); c->s8_bd = (float *)gn_alloc((size_t)T * 8 * 4);
+        c->s8_xp2 = (int8_t *)gn_alloc((size_t)T * 256); c->s8_asp = (float *)gn_alloc((size_t)T * 8 * 4);
+        c->s8_y = (float *)gn_alloc((size_t)T * LDY_DN * 4);
+        if (!c->s8_xq || !c->s8_xs || !c->s8_bt || !c->s8_xp || !c->s8_xsp || !c->s8_ygu || !c->s8_a8 || !c->s8_as ||
+            !c->s8_bd || !c->s8_xp2 || !c->s8_asp || !c->s8_y) return -1;
+    }
+    const int mpad = (tokens + 5) / 6 * 6, ngroups = mpad / 6, gu_rows = 2 * in, nb = H / 32;
+    int8_t *zrow = c->s8_xq + (size_t)tokens * H; /* rows tokens..mpad-1 stay zero */
+    (void)zrow;
+#pragma omp parallel for schedule(static)
+    for (int tk = 0; tk < mpad; ++tk) {
+        if (tk < tokens) gmn_quant_row(x + (size_t)tk * H, H, c->s8_xq + (size_t)tk * H, c->s8_xs + (size_t)tk * nb, c->s8_bt + (size_t)tk * nb);
+        else { memset(c->s8_xq + (size_t)tk * H, 0, H); memset(c->s8_xs + (size_t)tk * nb, 0, nb * 4); }
+    }
+#pragma omp parallel for schedule(static)
+    for (int g = 0; g < ngroups; ++g) {
+        const int8_t *rows[6]; const float *xsr[6];
+        for (int u = 0; u < 6; ++u) { rows[u] = c->s8_xq + (size_t)(g * 6 + u) * H; xsr[u] = c->s8_xs + (size_t)(g * 6 + u) * nb; }
+        gmn_pack6(c->s8_xp + (size_t)g * 6 * H, c->s8_xsp + (size_t)g * 6 * nb, rows, xsr, H);
+    }
+    const int gch = 8, nch = (ngroups + gch - 1) / gch, gpanels = gu_rows / 64;
+#pragma omp parallel for schedule(dynamic, 1)
+    for (int task = 0; task < gpanels * nch; ++task) {
+        const int pnl = task / nch, ch = task % nch;
+        const int t0 = ch * gch * 6, t1 = ((ch + 1) * gch * 6 < mpad) ? (ch + 1) * gch * 6 : mpad;
+        gk_gemm_panel64(32, c->s8_gu[layer], H, pnl * 64, pnl * 64 + 64, t0, t1, c->s8_xp, c->s8_xsp, c->s8_ygu, (size_t)gu_rows);
+    }
+    gmn_swiglu_quant(c->s8_ygu, (size_t)gu_rows, in, tokens, mpad, c->s8_a8, c->s8_as, c->s8_bd);
+    const int nbi = in / 32;
+#pragma omp parallel for schedule(static)
+    for (int g = 0; g < ngroups; ++g) {
+        const int8_t *rows[6]; const float *xsr[6];
+        for (int u = 0; u < 6; ++u) { rows[u] = c->s8_a8 + (size_t)(g * 6 + u) * in; xsr[u] = c->s8_as + (size_t)(g * 6 + u) * nbi; }
+        gmn_pack6(c->s8_xp2 + (size_t)g * 6 * in, c->s8_asp + (size_t)g * 6 * nbi, rows, xsr, in);
+    }
+    const int dch = 4, dnch = (ngroups + dch - 1) / dch;
+#pragma omp parallel for schedule(dynamic, 1)
+    for (int task = 0; task < (H / 64) * dnch; ++task) {
+        const int pnl = task / dnch, ch = task % dnch;
+        const int t0 = ch * dch * 6, t1 = ((ch + 1) * dch * 6 < mpad) ? (ch + 1) * dch * 6 : mpad;
+        gk_gemm_panel64(32, c->s8_dn[layer], in, pnl * 64, pnl * 64 + 64, t0, t1, c->s8_xp2, c->s8_asp, c->s8_y, (size_t)LDY_DN);
+    }
+#pragma omp parallel for schedule(static)
+    for (int tk = 0; tk < tokens; ++tk) memcpy(dst + (size_t)tk * H, c->s8_y + (size_t)tk * LDY_DN, H * sizeof(float));
+    return 0;
+}
+
+/* Shared expert for a token batch through the bf16 tile GEMM. dst is [tokens][4096]. Returns 0, or -2 if unsupported. */
+static int moe_shared_gemm(glm53f_moe_stage_context_12n *c, float *dst, const float *x, int tokens, int table_layer) {
+    enum { H = 4096 };
+    if (c->nsh_native) return moe_shared_q8(c, dst, x, tokens, table_layer);
+    const shared_offset *sp = &c->shared[table_layer];
+    const int inter = sp->inter, gu_rows = 2 * inter;
+    if (!c->shared_blob || c->nsh_native || inter < 16 || gu_rows % 32 || inter > 512) {
+        static int said;
+        if (!said++ && !c->rank) fprintf(stderr, "GLM53F_MOE_SHARED_GEMM unsupported: shared_blob=%d nsh_native=%d inter=%d\n", c->shared_blob != NULL, c->nsh_native, inter);
+        return -2;
+    }
+    if (!c->sg_gu[table_layer]) {
+        uint16_t *gu = gn_alloc((size_t)gu_rows * H * sizeof(uint16_t)), *dn = gn_alloc((size_t)H * inter * sizeof(uint16_t));
+        if (!gu || !dn) { free(gu); free(dn); return -1; }
+        gmn_fp8_pack_tiles(gu, c->shared_blob + sp->gate_up, gu_rows, H);
+        gmn_fp8_pack_tiles(dn, c->shared_blob + sp->down, H, inter);
+        c->sg_gu[table_layer] = gu; c->sg_dn[table_layer] = dn;
+    }
+    if (!c->sg_up) {
+        c->sg_up = gn_alloc((size_t)GLM53F_PREFILL_MAX_TOKENS * 2 * 512 * sizeof(float));
+        c->sg_act = gn_alloc((size_t)GLM53F_PREFILL_MAX_TOKENS * 512 * sizeof(float));
+        if (!c->sg_up || !c->sg_act) return -1;
+    }
+    const uint16_t *gu = c->sg_gu[table_layer], *dn = c->sg_dn[table_layer];
+    const float *gscale = (const float *)(c->shared_blob + sp->gate_up_scale), *dscale = (const float *)(c->shared_blob + sp->down_scale);
+    const int gblocks = (H + 127) / 128, dblocks = (inter + 127) / 128;
+    const int ngroups = (tokens + 5) / 6, gch = 4, nch = (ngroups + gch - 1) / gch;
+    const int gtiles = gu_rows / 32, dtiles = H / 32;
+#pragma omp parallel for schedule(dynamic, 1)
+    for (int task = 0; task < gtiles * nch; ++task) {
+        const int tile = task / nch, ch = task % nch;
+        for (int g = ch * gch; g < ngroups && g < (ch + 1) * gch; ++g) {
+            const int t0 = g * 6, n = tokens - t0 < 6 ? tokens - t0 : 6;
+            gmn_fp8g_run(c->sg_up + (size_t)t0 * gu_rows + tile * 32, gu_rows, gu + (size_t)tile * H * 32,
+                         gscale + (size_t)((tile * 32) / 128) * gblocks, x + (size_t)t0 * H, H, H, n);
+        }
+    }
+    {
+        const svbool_t pg = svptrue_b32();
+#pragma omp parallel for schedule(static)
+        for (int t = 0; t < tokens; ++t) {
+            const float *g = c->sg_up + (size_t)t * gu_rows, *u = g + inter;
+            for (int i = 0; i < inter; i += 16) {
+                const svbool_t p = svwhilelt_b32(i, inter);
+                svfloat32_t gv = svmax_n_f32_x(p, svmin_n_f32_x(p, svld1_f32(p, g + i), 10.f), -100.f);
+                svfloat32_t uv = svmax_n_f32_x(p, svmin_n_f32_x(p, svld1_f32(p, u + i), 10.f), -10.f);
+                svst1_f32(p, c->sg_act + (size_t)t * inter + i,
+                          svmul_f32_x(p, svdiv_f32_x(p, gv, svadd_n_f32_x(p, gmn_expf(p, svneg_f32_x(p, gv)), 1.f)), uv));
+            }
+        }
+        (void)pg;
+    }
+#pragma omp parallel for schedule(dynamic, 1)
+    for (int task = 0; task < dtiles * nch; ++task) {
+        const int tile = task / nch, ch = task % nch;
+        for (int g = ch * gch; g < ngroups && g < (ch + 1) * gch; ++g) {
+            const int t0 = g * 6, n = tokens - t0 < 6 ? tokens - t0 : 6;
+            gmn_fp8g_run(dst + (size_t)t0 * H + tile * 32, H, dn + (size_t)tile * inter * 32,
+                         dscale + (size_t)((tile * 32) / 128) * dblocks, c->sg_act + (size_t)t0 * inter, inter, inter, n);
+        }
+    }
+    return 0;
+}
+
 static int moe_prefill_grouped(glm53f_moe_stage_context_12n *c, float *out,
         const float *x, int tokens, int li, int table_layer) {
     enum { H = 4096, PANEL = 4 };
     int selected[GLM53F_PREFILL_MAX_TOKENS][8];
     float route_weight[GLM53F_PREFILL_MAX_TOKENS][8];
     double begin = c->profile ? MPI_Wtime() : 0.0;
-    for (int base = 0; base < tokens; base += PANEL) {
-        int n = tokens - base;
-        if (n > PANEL) n = PANEL;
-        glm53f_mv_bf16_batch(c->batch_router + (size_t)base * NEXPERTS,
-            c->router_w + (size_t)li * NEXPERTS * H,
-            x + (size_t)base * H, n, NEXPERTS, H);
+    if (c->rg_mode && c->router_wt) {
+        const int gch = 4, ngroups = (tokens + 5) / 6, nch = (ngroups + gch - 1) / gch;
+        const uint16_t *wl = c->router_wt + (size_t)li * NEXPERTS * H;
+#pragma omp parallel for schedule(dynamic, 1)
+        for (int task = 0; task < GMN_RTILES * nch; ++task) {
+            const int tile = task / nch, ch = task % nch;
+            for (int g = ch * gch; g < ngroups && g < (ch + 1) * gch; ++g) {
+                const int t0 = g * 6, n = tokens - t0 < 6 ? tokens - t0 : 6;
+                gmn_router_run(c->batch_router + (size_t)t0 * NEXPERTS + tile * GMN_RTILE, NEXPERTS, wl, tile,
+                               x + (size_t)t0 * H, H, H, n);
+            }
+        }
     }
+    if (!c->rg_mode || c->rg_mode == 2 || !c->router_wt) {
+        float *ref = c->rg_mode == 2 ? (float *)malloc((size_t)tokens * NEXPERTS * sizeof(float)) : c->batch_router;
+        for (int base = 0; base < tokens; base += PANEL) {
+            int n = tokens - base;
+            if (n > PANEL) n = PANEL;
+            glm53f_mv_bf16_batch(ref + (size_t)base * NEXPERTS,
+                c->router_w + (size_t)li * NEXPERTS * H,
+                x + (size_t)base * H, n, NEXPERTS, H);
+        }
+        if (c->rg_mode == 2 && ref) { /* verify: compare against the GEMM logits and their top-8 sets */
+            double se = 0, sr = 0; int flips = 0;
+            for (int t = 0; t < tokens; ++t) {
+                int sa[8], sb[8]; float wa[8], wb[8];
+                glm53f_router_topk(c->batch_router + (size_t)t * NEXPERTS, c->router_bias + (size_t)li * NEXPERTS, NEXPERTS, 8, 2.5f, sa, wa);
+                glm53f_router_topk(ref + (size_t)t * NEXPERTS, c->router_bias + (size_t)li * NEXPERTS, NEXPERTS, 8, 2.5f, sb, wb);
+                for (int a = 0; a < 8; ++a) { int f = 0; for (int b = 0; b < 8; ++b) f |= sa[a] == sb[b]; flips += !f; }
+                for (int e = 0; e < NEXPERTS; ++e) { double d = (double)c->batch_router[(size_t)t * NEXPERTS + e] - ref[(size_t)t * NEXPERTS + e]; se += d * d; sr += (double)ref[(size_t)t * NEXPERTS + e] * ref[(size_t)t * NEXPERTS + e]; }
+            }
+            if (!c->rank) fprintf(stderr, "GLM53F_MOE_ROUTER_VERIFY layer=%d tokens=%d rel_l2=%.3e topk_slots_changed=%d of %d\n", c->active_layer, tokens, sqrt(se / (sr + 1e-30)), flips, tokens * 8);
+            free(ref);
+        }
+    }
+#pragma omp parallel for schedule(static)
     for (int t = 0; t < tokens; ++t)
         glm53f_router_topk(c->batch_router + (size_t)t * NEXPERTS,
             c->router_bias + (size_t)li * NEXPERTS, NEXPERTS, 8, 2.5f,
@@ -822,10 +1249,24 @@ static int moe_prefill_grouped(glm53f_moe_stage_context_12n *c, float *out,
         begin = MPI_Wtime();
     }
     moe_profile_occupancy(c, &selected[0][0], tokens);
-    memset(c->batch_routes, 0, (size_t)tokens * 8 * H * sizeof(float));
+    /* batch_routes rows of experts without a part on this rank are never read (see the combine below). */
+    unsigned char native_done[NEXPERTS];
+    memset(native_done, 0, sizeof(native_done));
+    double gp0 = c->profile ? MPI_Wtime() : 0.0;
+    if (c->gn_mode && moe_native_grouped(c, x, tokens, table_layer, selected, native_done)) return -1;
+    double gp1 = c->profile ? MPI_Wtime() : 0.0;
+    if (c->gn_mode) c->gn_phase[0] += gp1 - gp0;
+    if (c->gn_mode == 2) { /* verify: keep the native rows, recompute everything with the decode kernels */
+        if (!c->gn_verify) c->gn_verify = gn_alloc((size_t)GLM53F_PREFILL_MAX_TOKENS * 8 * H * sizeof(float));
+        if (!c->gn_verify) return -1;
+        memcpy(c->gn_verify, c->batch_routes, (size_t)tokens * 8 * H * sizeof(float));
+    }
+    unsigned char verify_mask[NEXPERTS];
+    memcpy(verify_mask, native_done, sizeof(verify_mask));
+    if (c->gn_mode == 2) memset(native_done, 0, sizeof(native_done));
     for (int e = 0; e < NEXPERTS; ++e) {
         expert_offset *ep = &c->table[table_layer * NEXPERTS + e];
-        if (ep->gate_up == UINT64_MAX) continue;
+        if (ep->gate_up == UINT64_MAX || native_done[e]) continue;
         glm53f_expert_part part = {c->blob + ep->gate_up,
             ep->gate_up_scale == UINT64_MAX ? NULL :
                 (const float *)(c->blob + ep->gate_up_scale),
@@ -880,11 +1321,81 @@ static int moe_prefill_grouped(glm53f_moe_stage_context_12n *c, float *out,
             }
         }
     }
+    double gp2 = c->profile ? MPI_Wtime() : 0.0;
+    c->gn_phase[2] += c->profile ? gp2 - gp1 : 0.0;
+    if (c->gn_mode == 2) {
+        double se = 0, sr = 0;
+        long rows_checked = 0;
+        for (int t = 0; t < tokens; ++t)
+            for (int k = 0; k < 8; ++k) {
+                if (!verify_mask[selected[t][k]]) continue;
+                const float *a = c->gn_verify + ((size_t)t * 8 + k) * H, *b = c->batch_routes + ((size_t)t * 8 + k) * H;
+                for (int i = 0; i < H; ++i) { double d = (double)a[i] - b[i]; se += d * d; sr += (double)b[i] * b[i]; }
+                ++rows_checked;
+            }
+        if (!c->rank)
+            fprintf(stderr, "GLM53F_MOE_NATIVE_VERIFY layer=%d tokens=%d rows=%ld rel_l2=%.4e\n",
+                    c->active_layer, tokens, rows_checked, sqrt(se / (sr + 1e-30)));
+        /* exact fp32 reference (dequantized weights, fp32 activations) for up to 3 tokens of the first native expert */
+        int e0 = -1;
+        for (int e = 0; e < NEXPERTS && e0 < 0; ++e) if (verify_mask[e]) e0 = e;
+        for (int e = 0; e < NEXPERTS; ++e) /* prefer an expert with Q6_K down when the layer has one */
+            if (verify_mask[e] && c->table[table_layer * NEXPERTS + e].down_type == GLM53F_GGML_Q6_K) { e0 = e; break; }
+        if (e0 >= 0 && !c->rank) {
+            const expert_offset *ep = &c->table[table_layer * NEXPERTS + e0];
+            const int inter = ep->inter;
+            float *wg = (float *)malloc((size_t)2 * inter * H * sizeof(float)), *wd = (float *)malloc((size_t)H * inter * sizeof(float));
+            const int dq6 = ep->down_type == GLM53F_GGML_Q6_K;
+            const int gq5 = ep->gate_type == GLM53F_GGML_Q5_K;
+            const size_t grb = (gq5 ? 176 : 144) * (H / 256), drb = (dq6 ? 210 : 176) * (size_t)(inter / 256);
+            if (wg && wd) {
+                for (int r = 0; r < 2 * inter; ++r) {
+                    if (gq5) dequantize_row_q5_K(c->blob + ep->gate_up + (size_t)r * grb, wg + (size_t)r * H, H);
+                    else dequantize_row_q4_K(c->blob + ep->gate_up + (size_t)r * grb, wg + (size_t)r * H, H);
+                }
+                for (int r = 0; r < H; ++r) {
+                    if (dq6) dequantize_row_q6_K(c->blob + ep->down + (size_t)r * drb, wd + (size_t)r * inter, inter);
+                    else dequantize_row_q5_K(c->blob + ep->down + (size_t)r * drb, wd + (size_t)r * inter, inter);
+                }
+                double en = 0, eo = 0, sy = 0; int used = 0;
+                for (int t = 0; t < tokens && used < 3; ++t)
+                    for (int k = 0; k < 8 && used < 3; ++k) {
+                        if (selected[t][k] != e0) continue;
+                        float a[GN_MAXINTER];
+                        for (int j = 0; j < inter; ++j) {
+                            double g = 0, u = 0;
+                            for (int i = 0; i < H; ++i) { g += (double)wg[(size_t)j * H + i] * x[(size_t)t * H + i]; u += (double)wg[(size_t)(inter + j) * H + i] * x[(size_t)t * H + i]; }
+                            float gf = (float)g, uf = (float)u;
+                            if (gf > 10) gf = 10; if (gf < -100) gf = -100; if (uf > 10) uf = 10; if (uf < -10) uf = -10;
+                            a[j] = gf / (1.0f + expf(-gf)) * uf;
+                        }
+                        for (int r = 0; r < H; ++r) {
+                            double y = 0;
+                            for (int j = 0; j < inter; ++j) y += (double)wd[(size_t)r * inter + j] * a[j];
+                            double dn = c->gn_verify[((size_t)t * 8 + k) * H + r] - y, dold = c->batch_routes[((size_t)t * 8 + k) * H + r] - y;
+                            en += dn * dn; eo += dold * dold; sy += y * y;
+                        }
+                        ++used;
+                    }
+                fprintf(stderr, "GLM53F_MOE_NATIVE_EXACT layer=%d expert=%d rows=%d err_native=%.4e err_decode_kernel=%.4e\n",
+                        c->active_layer, e0, used, sqrt(en / (sy + 1e-30)), sqrt(eo / (sy + 1e-30)));
+            }
+            free(wg); free(wd);
+        }
+    }
     shared_offset *sp = &c->shared[table_layer];
     glm53f_expert_part shared = {c->shared_blob + sp->gate_up,
         (const float *)(c->shared_blob + sp->gate_up_scale),
         c->shared_blob + sp->down,
         (const float *)(c->shared_blob + sp->down_scale), sp->inter, 0, 0};
+    int shared_done = 0;
+    if (c->sg_mode) {
+        if (!c->sg_out && c->sg_mode == 2) c->sg_out = gn_alloc((size_t)GLM53F_PREFILL_MAX_TOKENS * H * sizeof(float));
+        int rc = moe_shared_gemm(c, c->sg_mode == 2 ? c->sg_out : c->batch_local, x, tokens, table_layer);
+        if (rc == -1) return -1;
+        shared_done = rc == 0 && c->sg_mode != 2;
+    }
+    if (!shared_done)
     for (int base = 0; base < tokens; base += PANEL) {
         int n = tokens - base;
         if (n > PANEL) n = PANEL;
@@ -896,20 +1407,36 @@ static int moe_prefill_grouped(glm53f_moe_stage_context_12n *c, float *out,
         for (int q = 0; q < n * H; ++q)
             c->batch_local[(size_t)base * H + q] = c->batch_shared[q];
     }
+    if (c->sg_mode == 2 && c->sg_out) {
+        double se = 0, sr = 0;
+        for (size_t i = 0; i < (size_t)tokens * H; ++i) { double d = (double)c->sg_out[i] - c->batch_local[i]; se += d * d; sr += (double)c->batch_local[i] * c->batch_local[i]; }
+        if (!c->rank) fprintf(stderr, "GLM53F_MOE_SHARED_VERIFY layer=%d tokens=%d rel_l2=%.3e\n", c->active_layer, tokens, sqrt(se / (sr + 1e-30)));
+    }
+    double gp3 = c->profile ? MPI_Wtime() : 0.0;
+    c->gn_phase[3] += c->profile ? gp3 - gp2 : 0.0;
 #pragma omp parallel for schedule(static)
     for (int q = 0; q < tokens * H; ++q) {
         int t = q / H, i = q - t * H;
         float routed = 0.0f;
         for (int k = 0; k < 8; ++k)
-            routed += route_weight[t][k] *
-                c->batch_routes[((size_t)t * 8 + k) * H + i];
+            if (c->table[table_layer * NEXPERTS + selected[t][k]].gate_up != UINT64_MAX)
+                routed += route_weight[t][k] *
+                    c->batch_routes[((size_t)t * 8 + k) * H + i];
         c->batch_local[q] += routed;
     }
+    if (c->profile) c->gn_phase[4] += MPI_Wtime() - gp3;
     if (c->profile) {
         c->profile_phase[1] += MPI_Wtime() - begin;
         begin = MPI_Wtime();
     }
-    for (int base = 0; base < tokens; base += PANEL) {
+    if (c->ar_slab > 32) { /* whole-chunk MPI_Allreduce calls: 3.4 ms per 512 tokens vs 17 ms for 4-token panels */
+        for (int base = 0; base < tokens; base += c->ar_slab) {
+            int n = tokens - base < c->ar_slab ? tokens - base : c->ar_slab;
+            if (glm53f_sum_allreduce_mpi_12n(c->batch_local + (size_t)base * H, out + (size_t)base * H, n * H)) return -1;
+        }
+    } else if (c->ar_slab > 0) { /* uTofu-wrapper slabs of at most 32 tokens */
+        if (glm53f_sum_allreduce_slabs_12n(c->batch_local, out, tokens, H, c->ar_slab)) return -1;
+    } else for (int base = 0; base < tokens; base += PANEL) {
         int n = tokens - base;
         if (n > PANEL) n = PANEL;
         if (glm53f_sum_allreduce_12n(c->batch_local + (size_t)base * H,
@@ -1100,7 +1627,7 @@ int glm53f_moe_stage_sublayer_batch_12n(glm53f_moe_stage_context_12n*c,float*out
     for(int q=0;q<tokens*H;q++){int t=q/H,i=q-t*H;float v=0.0f;for(int k=0;k<counts[t];k++)v+=weights[t*MAXP+k]*y[((size_t)t*MAXP+k)*H+i];c->batch_local[q]=v+c->batch_shared[q];}
     int rc=glm53f_sum_allreduce_12n(c->batch_local,out,tokens*H);return rc;
 }
-void glm53f_moe_stage_free_12n(glm53f_moe_stage_context_12n*c){if(!c)return;for(int l=0;l<NLAYERS;l++){free(c->nsh_g[l]);free(c->nsh_u[l]);free(c->nsh_d[l]);}free(c->nsh_gv);free(c->nsh_uv);free(c->nsh_act);free(c->nsh_out);free(c->nsh_act_x);free(c->nsh_act_h);free(c->i8_prefill_storage);for(int l=0;l<NLAYERS;l++)free(c->int8_scales[l]);free(c->task_output);free(c->task_activation);free(c->task_up);free(c->batch_routes);free(c->batch_group_x);free(c->batch_router);free(c->batch_local);free(c->batch_shared);free(c->batch_activation);free(c->batch_up);free(c->scratch);free(c->router_logits);free(c->router_bias);free(c->router_i8_scale);free(c->router_i8);free(c->router_w);free(c->shared_blob);free(c->blob);free(c->table);free(c);}
+void glm53f_moe_stage_free_12n(glm53f_moe_stage_context_12n*c){if(!c)return;for(int l=0;l<NLAYERS;l++){free(c->s8_gu[l]);free(c->s8_dn[l]);}free(c->s8_xq);free(c->s8_xs);free(c->s8_bt);free(c->s8_xp);free(c->s8_xsp);free(c->s8_ygu);free(c->s8_a8);free(c->s8_as);free(c->s8_bd);free(c->s8_xp2);free(c->s8_asp);free(c->s8_y);for(int l=0;l<NLAYERS;l++){free(c->sg_gu[l]);free(c->sg_dn[l]);}free(c->sg_up);free(c->sg_act);free(c->sg_out);if(c->gn_threads){gn_tbuf*tb=(gn_tbuf*)c->gn_threads;for(int i=0;i<c->gn_nthreads;i++){free(tb[i].xp);free(tb[i].xp2);free(tb[i].a8);free(tb[i].xsp);free(tb[i].Bg);free(tb[i].ygu);free(tb[i].as);free(tb[i].asp);free(tb[i].mina);free(tb[i].yd);free(tb[i].cbuf);}free(c->gn_threads);}free(c->gn_xq);free(c->gn_xs);free(c->gn_bt);free(c->gn_verify);for(int l=0;l<NLAYERS;l++){free(c->nsh_g[l]);free(c->nsh_u[l]);free(c->nsh_d[l]);}free(c->nsh_gv);free(c->nsh_uv);free(c->nsh_act);free(c->nsh_out);free(c->nsh_act_x);free(c->nsh_act_h);free(c->i8_prefill_storage);for(int l=0;l<NLAYERS;l++)free(c->int8_scales[l]);free(c->task_output);free(c->task_activation);free(c->task_up);free(c->batch_routes);free(c->batch_group_x);free(c->batch_router);free(c->batch_local);free(c->batch_shared);free(c->batch_activation);free(c->batch_up);free(c->scratch);free(c->router_logits);free(c->router_bias);free(c->router_i8_scale);free(c->router_i8);free(c->router_wt);free(c->router_w);free(c->shared_blob);free(c->blob);free(c->table);free(c);}
 
 #ifndef GLM53F_EXPERT_NO_MAIN
 int main(int argc, char **argv) {

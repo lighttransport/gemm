@@ -8,6 +8,23 @@
 #include <string.h>
 #include <stdlib.h>
 #include <omp.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+/* Optional decode profile (GLM53F_MHC_DETAIL=1): seconds per stage, printed at exit. */
+static double glm53f_mhc_acc[8]; static long glm53f_mhc_calls[2]; static int glm53f_mhc_detail = -1;
+static inline double glm53f_mhc_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
+static void glm53f_mhc_report(void) {
+    if (glm53f_mhc_calls[0])
+        fprintf(stderr, "GLM53F_MHC_DETAIL us per pre-call: sumsq=%.1f logits=%.1f sigmoid+sinkhorn=%.1f collapse=%.1f copy+rmsnorm=%.1f | post=%.1f (pre calls=%ld post calls=%ld)\n",
+                glm53f_mhc_acc[0] * 1e6 / glm53f_mhc_calls[0], glm53f_mhc_acc[1] * 1e6 / glm53f_mhc_calls[0], glm53f_mhc_acc[2] * 1e6 / glm53f_mhc_calls[0],
+                glm53f_mhc_acc[3] * 1e6 / glm53f_mhc_calls[0], glm53f_mhc_acc[4] * 1e6 / glm53f_mhc_calls[0],
+                glm53f_mhc_calls[1] ? glm53f_mhc_acc[5] * 1e6 / glm53f_mhc_calls[1] : 0.0, glm53f_mhc_calls[0], glm53f_mhc_calls[1]);
+}
+static inline int glm53f_mhc_detail_on(void) {
+    if (glm53f_mhc_detail < 0) { glm53f_mhc_detail = getenv("GLM53F_MHC_DETAIL") != NULL; if (glm53f_mhc_detail) atexit(glm53f_mhc_report); }
+    return glm53f_mhc_detail;
+}
 #include "glm53f_prefill.h"
 #include "../../common/glm53f_ref.h"
 
@@ -88,9 +105,97 @@ static inline void glm53f_mhc_mv_batch4(
         glm53f_mhc_row_batch4(out, weight, input, tokens, row);
 }
 
+
+/* ---- fast decode mHC: ONE team, ~5 barriers, no serial 4K-element passes ----------------------------------
+ * [post of the previous site] -> per-thread sum of squares of the new streams -> 24 logits -> sigmoid/Sinkhorn
+ * (one thread) -> collapse + residual copy + per-thread sum of squares of the collapsed vector -> RMS-normalize.
+ * Same formulas as glm53f_mhc_pre_sve / glm53f_mhc_post_pre_sve; only the summation partition of the two
+ * double-precision norm reductions differs (thread partials in thread order). */
+static double glm53f_mhc_part1[128 * 8], glm53f_mhc_part2[128 * 8];
+static int glm53f_mhc_fast_mode = -1;
+static inline int glm53f_mhc_fast_on(void) {
+    if (glm53f_mhc_fast_mode < 0) glm53f_mhc_fast_mode = getenv("GLM53F_MHC_FAST") ? atoi(getenv("GLM53F_MHC_FAST")) : 1;
+    return glm53f_mhc_fast_mode;
+}
+static inline void glm53f_mhc_fast(float *streams, const float *sublayer, glm53f_mhc_scratch *scratch,
+        const glm53f_mhc_site *site, const uint16_t *norm, int do_post) {
+    float logits[GLM53F_MHC_MIX];
+#pragma omp parallel shared(logits)
+    {
+        const int tid = omp_get_thread_num(), nt = omp_get_num_threads();
+        if (nt > 128) abort();
+        /* 1. new streams (post) + partial sum of squares over this thread's contiguous slice */
+        {
+            const int lo = (int)((long)GLM53F_MHC_FLAT * tid / nt), hi = (int)((long)GLM53F_MHC_FLAT * (tid + 1) / nt);
+            double ss = 0.0;
+            if (do_post) {
+                for (int i = lo; i < hi; ++i) {
+                    const int k = i / GLM53F_MHC_WIDTH, d = i - k * GLM53F_MHC_WIDTH;
+                    double v = (double)scratch->post[k] * sublayer[d];
+                    for (int j = 0; j < GLM53F_MHC_STREAMS; ++j)
+                        v += (double)scratch->combine[(size_t)j * GLM53F_MHC_STREAMS + k] *
+                             scratch->residual[(size_t)j * GLM53F_MHC_WIDTH + d];
+                    streams[i] = (float)v;
+                    ss += (double)streams[i] * streams[i];
+                }
+            } else {
+                for (int i = lo; i < hi; ++i) ss += (double)streams[i] * streams[i];
+            }
+            glm53f_mhc_part1[tid * 8] = ss;
+        }
+#pragma omp barrier
+        double total = 0.0;
+        for (int t = 0; t < nt; ++t) total += glm53f_mhc_part1[t * 8];
+        const float inv = 1.0f / sqrtf((float)(total / GLM53F_MHC_FLAT) + 1e-5f);
+        /* 2. 24 mixing logits */
+#pragma omp for schedule(static)
+        for (int m = 0; m < GLM53F_MHC_MIX; ++m)
+            logits[m] = glm53f_mhc_dot_bf16_sve(site->fn + (size_t)m * GLM53F_MHC_FLAT, streams, GLM53F_MHC_FLAT) * inv;
+        /* 3. sigmoids + Sinkhorn on one thread (implicit barrier) */
+#pragma omp single
+        {
+            for (int k = 0; k < GLM53F_MHC_STREAMS; ++k) {
+                logits[k] = glm53f_sigmoid(logits[k] * site->scale[0] + site->base[k]) + 1e-6f;
+                scratch->post[k] = 2.0f * glm53f_sigmoid(logits[GLM53F_MHC_STREAMS + k] * site->scale[1] +
+                                                         site->base[GLM53F_MHC_STREAMS + k]);
+            }
+            for (int m = 0; m < GLM53F_MHC_STREAMS * GLM53F_MHC_STREAMS; ++m)
+                scratch->combine[m] = logits[2 * GLM53F_MHC_STREAMS + m] * site->scale[2] + site->base[2 * GLM53F_MHC_STREAMS + m];
+            glm53f_mhc_sinkhorn(scratch->combine, GLM53F_MHC_STREAMS, 20, 1e-6f);
+        }
+        /* 4. collapse + residual copy + partial sum of squares of the collapsed vector */
+        {
+            const int lo = (int)((long)GLM53F_MHC_WIDTH * tid / nt), hi = (int)((long)GLM53F_MHC_WIDTH * (tid + 1) / nt);
+            double ss = 0.0;
+            for (int d = lo; d < hi; ++d) {
+                float value = 0.0f;
+                for (int k = 0; k < GLM53F_MHC_STREAMS; ++k) {
+                    const float sv = streams[(size_t)k * GLM53F_MHC_WIDTH + d];
+                    value += logits[k] * sv;
+                    scratch->residual[(size_t)k * GLM53F_MHC_WIDTH + d] = sv;
+                }
+                scratch->collapsed[d] = value;
+                ss += (double)value * value;
+            }
+            glm53f_mhc_part2[tid * 8] = ss;
+        }
+#pragma omp barrier
+        /* 5. RMS-normalize this thread's slice of the collapsed vector */
+        {
+            const int lo = (int)((long)GLM53F_MHC_WIDTH * tid / nt), hi = (int)((long)GLM53F_MHC_WIDTH * (tid + 1) / nt);
+            double total2 = 0.0;
+            for (int t = 0; t < nt; ++t) total2 += glm53f_mhc_part2[t * 8];
+            const float inv2 = 1.0f / sqrtf((float)(total2 / GLM53F_MHC_WIDTH) + 1e-5f);
+            for (int d = lo; d < hi; ++d)
+                scratch->normalized[d] = scratch->collapsed[d] * inv2 * glm53f_bf16_to_f32(norm[d]);
+        }
+    }
+}
+
 static inline void glm53f_mhc_pre_sve(
         glm53f_mhc_scratch *scratch, const float *streams,
         const glm53f_mhc_site *site, const uint16_t *norm) {
+    if (glm53f_mhc_fast_on()) { glm53f_mhc_fast((float *)streams, NULL, scratch, site, norm, 0); return; }
     double sumsq = 0.0;
     float logits[GLM53F_MHC_MIX];
 #if GLM53F_MHC_FUSED
@@ -110,15 +215,18 @@ static inline void glm53f_mhc_pre_sve(
                 GLM53F_MHC_FLAT) * (float)sumsq;
     }
 #else
+    const int dtl = glm53f_mhc_detail_on(); double t0 = dtl ? glm53f_mhc_now() : 0.0, t1 = 0, t2 = 0, t3 = 0, t4 = 0;
 #pragma omp parallel for reduction(+:sumsq)
     for (int i = 0; i < GLM53F_MHC_FLAT; ++i)
         sumsq += (double)streams[i] * streams[i];
     float inv = 1.0f / sqrtf((float)(sumsq / GLM53F_MHC_FLAT) + 1e-5f);
+    if (dtl) t1 = glm53f_mhc_now();
 #pragma omp parallel for schedule(static)
     for (int m = 0; m < GLM53F_MHC_MIX; ++m)
         logits[m] = glm53f_mhc_dot_bf16_sve(
             site->fn + (size_t)m * GLM53F_MHC_FLAT, streams,
             GLM53F_MHC_FLAT) * inv;
+    if (dtl) t2 = glm53f_mhc_now();
 #endif
     for (int k = 0; k < GLM53F_MHC_STREAMS; ++k) {
         logits[k] = glm53f_sigmoid(logits[k] * site->scale[0] + site->base[k]) + 1e-6f;
@@ -130,6 +238,9 @@ static inline void glm53f_mhc_pre_sve(
         scratch->combine[m] = logits[2 * GLM53F_MHC_STREAMS + m] *
                               site->scale[2] + site->base[2 * GLM53F_MHC_STREAMS + m];
     glm53f_mhc_sinkhorn(scratch->combine, GLM53F_MHC_STREAMS, 20, 1e-6f);
+#if !GLM53F_MHC_FUSED
+    if (dtl) t3 = glm53f_mhc_now();
+#endif
 #pragma omp parallel for schedule(static)
     for (int d = 0; d < GLM53F_MHC_WIDTH; ++d) {
         float value = 0.0f;
@@ -137,9 +248,19 @@ static inline void glm53f_mhc_pre_sve(
             value += logits[k] * streams[(size_t)k * GLM53F_MHC_WIDTH + d];
         scratch->collapsed[d] = value;
     }
+#if !GLM53F_MHC_FUSED
+    if (dtl) t4 = glm53f_mhc_now();
+#endif
     memcpy(scratch->residual, streams, sizeof(scratch->residual));
     glm53f_rmsnorm_bf16(scratch->normalized, scratch->collapsed, norm,
                         GLM53F_MHC_WIDTH, 1e-5f);
+#if !GLM53F_MHC_FUSED
+    if (dtl) {
+        double t5 = glm53f_mhc_now();
+        glm53f_mhc_acc[0] += t1 - t0; glm53f_mhc_acc[1] += t2 - t1; glm53f_mhc_acc[2] += t3 - t2;
+        glm53f_mhc_acc[3] += t4 - t3; glm53f_mhc_acc[4] += t5 - t4; glm53f_mhc_calls[0]++;
+    }
+#endif
 }
 
 static inline void glm53f_mhc_pre_prefill_sve(
@@ -224,6 +345,7 @@ static inline void glm53f_mhc_pre_batch_sve(
 
 static inline void glm53f_mhc_post_sve(
         float *streams, const float *sublayer, const glm53f_mhc_scratch *scratch) {
+    const double dt0 = glm53f_mhc_detail_on() ? glm53f_mhc_now() : 0.0;
 #pragma omp parallel for collapse(2) schedule(static)
         for (int k = 0; k < GLM53F_MHC_STREAMS; ++k)
         for (int d = 0; d < GLM53F_MHC_WIDTH; ++d) {
@@ -240,6 +362,7 @@ static inline void glm53f_mhc_post_sve(
 #endif
             streams[(size_t)k * GLM53F_MHC_WIDTH + d] = (float)v;
         }
+    if (glm53f_mhc_detail_on()) { glm53f_mhc_acc[5] += glm53f_mhc_now() - dt0; glm53f_mhc_calls[1]++; }
 }
 
 /* Finish one site and prepare the next in one team. This is deliberately an
@@ -249,6 +372,7 @@ static inline void glm53f_mhc_post_sve(
 static inline void glm53f_mhc_post_pre_sve(
         float *streams, const float *sublayer, glm53f_mhc_scratch *scratch,
         const glm53f_mhc_site *next_site, const uint16_t *next_norm) {
+    if (glm53f_mhc_fast_on()) { glm53f_mhc_fast(streams, sublayer, scratch, next_site, next_norm, 1); return; }
     double sumsq = 0.0;
     float inv = 0.0f, logits[GLM53F_MHC_MIX];
 #pragma omp parallel shared(sumsq,inv,logits)

@@ -89,7 +89,7 @@ Validated on twelve native A64FX ranks:
 Same allocation, 47 threads, `demand:demand:prepage`, 8049 prompt-only tokens,
 256 new tokens, fast recipe:
 `--prefill-chunk 512 --prefill-mode fast --prefill-features 27
---prefill-slab 16 --prefill-collective tree-packed --decode-window 128`.
+--prefill-slab 16 --prefill-collective tree-packed --decode-window 128 (historical recipe; see README for the current one)`.
 
 | Binary/prefill | Prompt tok/s | Decode tok/s | Min MemAvailable |
 | --- | ---: | ---: | ---: |

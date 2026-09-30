@@ -10,6 +10,7 @@
 #include "glm53f_prefill.h"
 #include "glm53f_prefill_gemm.h"
 #include "glm53f_mla_prefill.h"
+#include "glm53f_moe_grouped_native.h"
 #include "glm53f_state_io.h"
 #include "glm53f_iq_bridge.h"
 #define GLM53F_CP_BF16_LATENT 1
@@ -72,6 +73,7 @@ struct glm53f_sparse_context_12n {
     uint8_t *q2_qa,*q2_qb,*q2_kva,*q2_vb,*q2_op;
     int q2_native,q2_qa_type,q2_op_type,q2_qb_type,q2_kva_type,q2_vb_type;
     float *q8v_ql,*q8v_log,*q8v_va,*q8v_sum;
+    float *mlb_qs,*mlb_ql,*mlb_va,*mlb_out,*mlb_ref,*mlb_lg; unsigned char *mlb_act; size_t mlb_act_bytes; int mlb_threads;
     unsigned char *q8v_act;
     size_t q8v_act_bytes;
     float *qas,*qbs,*kvas,*ops;
@@ -171,6 +173,7 @@ static int sparse_native_load(glm53f_sparse_context_12n *c) {
     const char *stage = getenv("GLM53F_Q2_SPARSE_STAGE");
     char blob[PATH_MAX], manifest[PATH_MAX], name[256];
     if (!stage || !*stage) return 0;
+    if (c->layer >= 45) return 0; /* MTP draft layer: not in the target native image, uses the FP8 checkpoint path */
     snprintf(blob, sizeof(blob), "%s/rank%02d.blob", stage, c->rank);
     snprintf(manifest, sizeof(manifest), "%s/rank%02d.manifest", stage, c->rank);
 #define LOAD(S, T, R, C, P, TP) do { \
@@ -1102,6 +1105,226 @@ static void sparse_mv_bf16_wide(const glm53f_prefill_config *config,
                 weight + (size_t)r * cols, x + (size_t)t * cols, n, cols);
         }
 }
+
+/* ---- batched native MLA for prefill ---------------------------------------------------------------
+ * Bit-identical to mla_heads_q8_value (same per-dot lane-wise FMA chains, same F16 rounding of the latent rows,
+ * same softmax and v_b path), but register-blocked so that independent chains hide FMA latency: the logits use
+ * 4 keys x heads accumulators sharing every loaded latent vector, the values use heads x 4 vectors, and the
+ * absorb step reuses each bf16 weight vector for up to six tokens.  All heads of a token are handled by one
+ * thread; the 32-token attention micro-batch is spread over the team. */
+static inline svfloat32_t mlb_r16(svbool_t p, svfloat32_t v) {
+    return svcvt_f32_f16_x(p, svcvt_f16_f32_x(p, v));
+}
+#define MLB_SLOTS (TOPK + KPOOL)
+
+static inline __attribute__((always_inline)) void mlb_absorb(float *ql, const float *qs, const uint16_t *wk,
+        int hn, int h, int d0, int g, const int n, int tokens) {
+    (void)tokens;
+    const svbool_t pg = svptrue_b32();
+#define MLB_A_DECL(U) svfloat32_t a##U##0 = svdup_f32(0), a##U##1 = a##U##0, a##U##2 = a##U##0, a##U##3 = a##U##0
+    MLB_A_DECL(0); MLB_A_DECL(1); MLB_A_DECL(2); MLB_A_DECL(3); MLB_A_DECL(4); MLB_A_DECL(5);
+#undef MLB_A_DECL
+    for (int j = 0; j < KD; ++j) {
+        const uint16_t *wp = wk + (size_t)j * LAT + d0;
+        const svfloat32_t w0 = svreinterpret_f32_u32(svlsl_n_u32_x(pg, svld1uh_u32(pg, wp), 16));
+        const svfloat32_t w1 = svreinterpret_f32_u32(svlsl_n_u32_x(pg, svld1uh_u32(pg, wp + 16), 16));
+        const svfloat32_t w2 = svreinterpret_f32_u32(svlsl_n_u32_x(pg, svld1uh_u32(pg, wp + 32), 16));
+        const svfloat32_t w3 = svreinterpret_f32_u32(svlsl_n_u32_x(pg, svld1uh_u32(pg, wp + 48), 16));
+#define MLB_A_STEP(U) if ((U) < n) { const float x = qs[((size_t)(g + (U)) * hn + h) * KD + j]; \
+        a##U##0 = svmla_n_f32_x(pg, a##U##0, w0, x); a##U##1 = svmla_n_f32_x(pg, a##U##1, w1, x); \
+        a##U##2 = svmla_n_f32_x(pg, a##U##2, w2, x); a##U##3 = svmla_n_f32_x(pg, a##U##3, w3, x); }
+        MLB_A_STEP(0) MLB_A_STEP(1) MLB_A_STEP(2) MLB_A_STEP(3) MLB_A_STEP(4) MLB_A_STEP(5)
+#undef MLB_A_STEP
+    }
+#define MLB_A_ST(U) if ((U) < n) { float *o = ql + ((size_t)(g + (U)) * hn + h) * LAT + d0; \
+        svst1(pg, o, a##U##0); svst1(pg, o + 16, a##U##1); svst1(pg, o + 32, a##U##2); svst1(pg, o + 48, a##U##3); }
+    MLB_A_ST(0) MLB_A_ST(1) MLB_A_ST(2) MLB_A_ST(3) MLB_A_ST(4) MLB_A_ST(5)
+#undef MLB_A_ST
+}
+
+/* logits[h][t] = f32dot(ql[h], round16(cache[sel[t]])) for NH heads, 4 keys at a time. */
+static inline __attribute__((always_inline)) void mlb_logits(float *lg, const float *ql, const float *cache,
+        const int *sel, int nt, const int NH) {
+    const svbool_t pg = svptrue_b32();
+    int t = 0;
+    for (; t + 4 <= nt; t += 4) {
+        const float *z0 = cache + (size_t)sel[t] * LAT, *z1 = cache + (size_t)sel[t + 1] * LAT;
+        const float *z2 = cache + (size_t)sel[t + 2] * LAT, *z3 = cache + (size_t)sel[t + 3] * LAT;
+#define MLB_L_DECL(H) svfloat32_t l0_##H = svdup_f32(0), l1_##H = l0_##H, l2_##H = l0_##H, l3_##H = l0_##H
+        MLB_L_DECL(0); MLB_L_DECL(1); MLB_L_DECL(2); MLB_L_DECL(3); MLB_L_DECL(4); MLB_L_DECL(5);
+#undef MLB_L_DECL
+        for (int d = 0; d < LAT; d += 16) {
+            const svfloat32_t v0 = mlb_r16(pg, svld1(pg, z0 + d)), v1 = mlb_r16(pg, svld1(pg, z1 + d));
+            const svfloat32_t v2 = mlb_r16(pg, svld1(pg, z2 + d)), v3 = mlb_r16(pg, svld1(pg, z3 + d));
+#define MLB_L_STEP(H) if ((H) < NH) { const svfloat32_t q = svld1(pg, ql + (size_t)(H) * LAT + d); \
+            l0_##H = svmla_f32_x(pg, l0_##H, q, v0); l1_##H = svmla_f32_x(pg, l1_##H, q, v1); \
+            l2_##H = svmla_f32_x(pg, l2_##H, q, v2); l3_##H = svmla_f32_x(pg, l3_##H, q, v3); }
+            MLB_L_STEP(0) MLB_L_STEP(1) MLB_L_STEP(2) MLB_L_STEP(3) MLB_L_STEP(4) MLB_L_STEP(5)
+#undef MLB_L_STEP
+        }
+#define MLB_L_ST(H) if ((H) < NH) { float *o = lg + (size_t)(H) * MLB_SLOTS + t; \
+        o[0] = svaddv_f32(pg, l0_##H); o[1] = svaddv_f32(pg, l1_##H); o[2] = svaddv_f32(pg, l2_##H); o[3] = svaddv_f32(pg, l3_##H); }
+        MLB_L_ST(0) MLB_L_ST(1) MLB_L_ST(2) MLB_L_ST(3) MLB_L_ST(4) MLB_L_ST(5)
+#undef MLB_L_ST
+    }
+    for (; t < nt; ++t) {
+        const float *z0 = cache + (size_t)sel[t] * LAT;
+#define MLB_T_DECL(H) svfloat32_t s##H = svdup_f32(0)
+        MLB_T_DECL(0); MLB_T_DECL(1); MLB_T_DECL(2); MLB_T_DECL(3); MLB_T_DECL(4); MLB_T_DECL(5);
+#undef MLB_T_DECL
+        for (int d = 0; d < LAT; d += 16) {
+            const svfloat32_t v0 = mlb_r16(pg, svld1(pg, z0 + d));
+#define MLB_T_STEP(H) if ((H) < NH) s##H = svmla_f32_x(pg, s##H, svld1(pg, ql + (size_t)(H) * LAT + d), v0);
+            MLB_T_STEP(0) MLB_T_STEP(1) MLB_T_STEP(2) MLB_T_STEP(3) MLB_T_STEP(4) MLB_T_STEP(5)
+#undef MLB_T_STEP
+        }
+#define MLB_T_ST(H) if ((H) < NH) lg[(size_t)(H) * MLB_SLOTS + t] = svaddv_f32(pg, s##H);
+        MLB_T_ST(0) MLB_T_ST(1) MLB_T_ST(2) MLB_T_ST(3) MLB_T_ST(4) MLB_T_ST(5)
+#undef MLB_T_ST
+    }
+}
+
+/* va[h][d] = sum_t p[h][t] * round16(cache[sel[t]][d]) in key order, 64 columns at a time. va rows: va + h*va_stride. */
+static inline __attribute__((always_inline)) void mlb_values(float *va, size_t va_stride, const float *lg,
+        const float *cache, const int *sel, int nt, const int NH) {
+    const svbool_t pg = svptrue_b32();
+    for (int db = 0; db < LAT; db += 64) {
+#define MLB_V_DECL(H) svfloat32_t v##H##0 = svdup_f32(0), v##H##1 = v##H##0, v##H##2 = v##H##0, v##H##3 = v##H##0
+        MLB_V_DECL(0); MLB_V_DECL(1); MLB_V_DECL(2); MLB_V_DECL(3); MLB_V_DECL(4); MLB_V_DECL(5);
+#undef MLB_V_DECL
+        for (int t = 0; t < nt; ++t) {
+            const float *z = cache + (size_t)sel[t] * LAT + db;
+            const svfloat32_t z0 = mlb_r16(pg, svld1(pg, z)), z1 = mlb_r16(pg, svld1(pg, z + 16));
+            const svfloat32_t z2 = mlb_r16(pg, svld1(pg, z + 32)), z3 = mlb_r16(pg, svld1(pg, z + 48));
+#define MLB_V_STEP(H) if ((H) < NH) { const float x = lg[(size_t)(H) * MLB_SLOTS + t]; \
+            v##H##0 = svmla_n_f32_x(pg, v##H##0, z0, x); v##H##1 = svmla_n_f32_x(pg, v##H##1, z1, x); \
+            v##H##2 = svmla_n_f32_x(pg, v##H##2, z2, x); v##H##3 = svmla_n_f32_x(pg, v##H##3, z3, x); }
+            MLB_V_STEP(0) MLB_V_STEP(1) MLB_V_STEP(2) MLB_V_STEP(3) MLB_V_STEP(4) MLB_V_STEP(5)
+#undef MLB_V_STEP
+        }
+#define MLB_V_ST(H) if ((H) < NH) { float *o = va + (size_t)(H) * va_stride + db; \
+        svst1(pg, o, v##H##0); svst1(pg, o + 16, v##H##1); svst1(pg, o + 32, v##H##2); svst1(pg, o + 48, v##H##3); }
+        MLB_V_ST(0) MLB_V_ST(1) MLB_V_ST(2) MLB_V_ST(3) MLB_V_ST(4) MLB_V_ST(5)
+#undef MLB_V_ST
+    }
+}
+
+static void mlb_token(float *va, size_t va_stride, float *lg, const float *ql, const float *cache,
+        const int *sel, int nt, int NH) {
+    switch (NH) {
+#define MLB_CASE(N) case N: mlb_logits(lg, ql, cache, sel, nt, N); break;
+    MLB_CASE(1) MLB_CASE(2) MLB_CASE(3) MLB_CASE(4) MLB_CASE(5) MLB_CASE(6)
+#undef MLB_CASE
+    }
+    for (int h = 0; h < NH; ++h) {
+        float *l = lg + (size_t)h * MLB_SLOTS;
+        const svbool_t pt = svptrue_b32();
+        svfloat32_t vmx = svdup_f32(-INFINITY);
+        int t = 0;
+        for (; t + 16 <= nt; t += 16) vmx = svmax_f32_x(pt, vmx, svld1_f32(pt, l + t));
+        float mx = svmaxv_f32(pt, vmx);
+        for (; t < nt; ++t) if (l[t] > mx) mx = l[t];
+        /* vector exp (rel. error ~1e-7) replaces 12k scalar expf calls per token */
+        svfloat32_t vsum = svdup_f32(0);
+        for (t = 0; t < nt; t += 16) {
+            const svbool_t p = svwhilelt_b32(t, nt);
+            svfloat32_t e = gmn_expf(p, svsub_n_f32_x(p, svld1_f32(p, l + t), mx));
+            svst1_f32(p, l + t, e);
+            vsum = svadd_f32_m(p, vsum, e);
+        }
+        const float sum = svaddv_f32(pt, vsum);
+        for (t = 0; t < nt; t += 16) {
+            const svbool_t p = svwhilelt_b32(t, nt);
+            svst1_f32(p, l + t, svdiv_n_f32_x(p, svld1_f32(p, l + t), sum));
+        }
+    }
+    switch (NH) {
+#define MLB_CASE(N) case N: mlb_values(va, va_stride, lg, cache, sel, nt, N); break;
+    MLB_CASE(1) MLB_CASE(2) MLB_CASE(3) MLB_CASE(4) MLB_CASE(5) MLB_CASE(6)
+#undef MLB_CASE
+    }
+}
+
+/* Returns 0 on success, -2 when unsupported (caller falls back), -1 on error. */
+static int mla_native_batch(glm53f_sparse_context_12n *c, glm53f_sparse_prefill_workspace_12n *w, int tokens) {
+    enum { TCAP = GLM53F_PREFILL_ATTN_TOKENS };
+    const int hn = c->hn, cols = hn * VD;
+    if ((int)svcntw() != 16 || hn < 1 || hn > 6 || tokens < 1 || tokens > TCAP || !c->q2_native) return -2;
+    if (!c->mlb_qs) {
+        c->mlb_threads = omp_get_max_threads();
+        c->mlb_qs = a256((size_t)TCAP * hn * KD * sizeof(float));
+        c->mlb_ql = a256((size_t)TCAP * hn * LAT * sizeof(float));
+        c->mlb_va = a256((size_t)hn * TCAP * LAT * sizeof(float));
+        c->mlb_out = a256((size_t)hn * TCAP * VD * sizeof(float));
+        c->mlb_lg = a256((size_t)c->mlb_threads * 8 * MLB_SLOTS * sizeof(float));
+        c->mlb_act_bytes = (glm53f_native_act_bytes(LAT) + 255) & ~(size_t)255;
+        c->mlb_act = a256((size_t)hn * TCAP * c->mlb_act_bytes);
+    }
+    const size_t row_bytes = glm53f_native_row_size(c->q2_vb_type, LAT);
+    float *qs = c->mlb_qs, *ql = c->mlb_ql, *va = c->mlb_va, *out = c->mlb_out;
+    const size_t va_stride = (size_t)tokens * LAT;
+#pragma omp parallel for schedule(static)
+    for (int i = 0; i < tokens * hn * KD; ++i)
+        qs[i] = w->query[(size_t)(i / (hn * KD)) * c->qd + (i % (hn * KD))] / sqrtf((float)KD);
+    const int ng = (tokens + 5) / 6;
+#pragma omp parallel for schedule(static)
+    for (int item = 0; item < hn * 8 * ng; ++item) {
+        const int h = item / (8 * ng), d0 = ((item / ng) % 8) * 64, g = (item % ng) * 6;
+        const int n = tokens - g < 6 ? tokens - g : 6;
+        const uint16_t *wk = c->kvb + (size_t)h * (KD + VD) * LAT;
+        switch (n) {
+#define MLB_CASE(N) case N: mlb_absorb(ql, qs, wk, hn, h, d0, g, N, tokens); break;
+        MLB_CASE(1) MLB_CASE(2) MLB_CASE(3) MLB_CASE(4) MLB_CASE(5) MLB_CASE(6)
+#undef MLB_CASE
+        }
+    }
+#pragma omp parallel for schedule(dynamic, 1)
+    for (int t = 0; t < tokens; ++t) {
+        float *lg = c->mlb_lg + (size_t)omp_get_thread_num() * 8 * MLB_SLOTS;
+        /* va is head-major [h][t][LAT]: hand mlb_values the token's row of head 0 and a head stride of tokens*LAT. */
+        mlb_token(va + (size_t)t * LAT, va_stride, lg, ql + (size_t)t * hn * LAT, c->latent, w->selected[t], w->count[t], hn);
+    }
+    {
+        /* Prepare the activations with the exact per-head function of the reference path (tie-breaking in the
+         * Q8 quantizer differs in glm53f_native_matvec_batch), then run the pre-prepared batch matvec. */
+        const int q80 = c->q2_vb_type == GLM53F_GGML_Q8_0 || c->q2_vb_type == GLM53F_NATIVE_Q8_0R;
+        int bad = 0;
+#pragma omp parallel reduction(|:bad)
+        {
+            for (int h = 0; h < hn; ++h) {
+#pragma omp for schedule(static)
+                for (int t = 0; t < tokens; ++t)
+                    if (glm53f_native_act_prepare(c->mlb_act + ((size_t)h * tokens + t) * c->mlb_act_bytes,
+                            va + (size_t)h * va_stride + (size_t)t * LAT, LAT, !q80, q80)) bad = 1;
+                glm53f_native_matrix m = {out + (size_t)h * tokens * VD, c->q2_vb + (size_t)h * VD * row_bytes, c->q2_vb_type, VD, LAT};
+                if (glm53f_native_matvec_batch_team(&m, 1, c->mlb_act + (size_t)h * tokens * c->mlb_act_bytes, c->mlb_act_bytes, tokens)) bad = 1;
+            }
+        }
+        if (bad) return -1;
+    }
+#pragma omp parallel for schedule(static)
+    for (int i = 0; i < tokens * cols; ++i) {
+        const int t = i / cols, r = i % cols, h = r / VD, j = r % VD;
+        w->attn[(size_t)t * cols + r] = out[((size_t)h * tokens + t) * VD + j];
+    }
+    return 0;
+}
+
+static int mla_native_reference(glm53f_sparse_context_12n *c, glm53f_sparse_prefill_workspace_12n *w, int tokens) {
+    const int cols = c->hn * VD;
+    for (int t = 0; t < tokens; ++t) {
+            const int ns = w->count[t];
+#pragma omp parallel for schedule(static)
+            for (int i = 0; i < ns; ++i)
+                for (int d = 0; d < LAT; ++d)
+                    c->packed[(size_t)i * LAT + d] =
+                        (float)(_Float16)c->latent[(size_t)w->selected[t][i] * LAT + d];
+            if (mla_heads_q8_value(c, w->attn + (size_t)t * cols,
+                    w->query + (size_t)t * c->qd, c->packed, NULL, ns)) return -1;
+        }
+    return 0;
+}
+
 int glm53f_sparse_prefill_12n(glm53f_sparse_context_12n *c,
         glm53f_sparse_prefill_workspace_12n *w, float *out,
         const float *x, int tokens) {
@@ -1158,7 +1381,7 @@ int glm53f_sparse_prefill_12n(glm53f_sparse_context_12n *c,
     begin = sparse_clock(c);
     /* Future cache rows may be materialized, but select_incremental bounds
      * both completed pools and the raw tail by this query's own position. */
-    if (!c->q2_native && getenv("GLM53F_SPARSE_INDEX_BATCH") && atoi(getenv("GLM53F_SPARSE_INDEX_BATCH"))) {
+    if (getenv("GLM53F_SPARSE_INDEX_BATCH") && atoi(getenv("GLM53F_SPARSE_INDEX_BATCH"))) {
         if (sparse_select_prefill(c, w, base, tokens)) return -1;
     } else for (int t = 0; t < tokens; ++t) {
         int length = base + t + 1;
@@ -1172,19 +1395,98 @@ int glm53f_sparse_prefill_12n(glm53f_sparse_context_12n *c,
     c->profile_phase[1] += sparse_clock(c) - begin;
     begin = sparse_clock(c);
     int sharded = !getenv("GLM53F_SPARSE_NO_PACK");
+    int mlb_mode = getenv("GLM53F_SPARSE_MLA_BATCH") ? atoi(getenv("GLM53F_SPARSE_MLA_BATCH")) : 1, mlb_done = 0;
+    if (c->q2_native && mlb_mode && tokens >= 2) {
+        int rc = mla_native_batch(c, w, tokens);
+        if (rc == -1) return -1;
+        mlb_done = rc == 0;
+        if (mlb_done && mlb_mode == 2) {
+            if (!c->mlb_ref) c->mlb_ref = a256((size_t)GLM53F_PREFILL_ATTN_TOKENS * cols * sizeof(float));
+            memcpy(c->mlb_ref, w->attn, (size_t)tokens * cols * sizeof(float));
+            if (mla_native_batch(c, w, tokens) == 0) { /* self-consistency: a second run must be bitwise equal */
+                long bad2 = 0, total2 = (long)tokens * cols;
+                for (long i = 0; i < total2; ++i) bad2 += memcmp(&c->mlb_ref[i], &w->attn[i], 4) != 0;
+                if (!c->rank && bad2) fprintf(stderr, "GLM53F_SPARSE_MLA_SELF layer=%d nondeterministic_floats=%ld\n", c->layer, bad2);
+            }
+            mlb_done = 0; /* recompute with the reference path, then compare bitwise */
+        }
+    }
     if (c->q2_native) {
+      if (!mlb_done) {
         /* Selection and the F16 cache view are bounded by each query's
          * position even though projections materialized future cache rows. */
-        for (int t = 0; t < tokens; ++t) {
-            const int ns = w->count[t];
-#pragma omp parallel for schedule(static)
-            for (int i = 0; i < ns; ++i)
-                for (int d = 0; d < LAT; ++d)
-                    c->packed[(size_t)i * LAT + d] =
-                        (float)(_Float16)c->latent[(size_t)w->selected[t][i] * LAT + d];
-            if (mla_heads_q8_value(c, w->attn + (size_t)t * cols,
-                    w->query + (size_t)t * c->qd, c->packed, NULL, ns)) return -1;
+        if (mla_native_reference(c, w, tokens)) return -1;
+        if (mlb_mode == 2) { /* determinism of the reference path itself */
+            static float *first = NULL; static size_t cap = 0;
+            const size_t need = (size_t)tokens * cols;
+            if (cap < need) { free(first); first = malloc(need * sizeof(float)); cap = need; }
+            memcpy(first, w->attn, need * sizeof(float));
+            if (mla_native_reference(c, w, tokens)) return -1;
+            long bad3 = 0;
+            for (size_t i = 0; i < need; ++i) bad3 += memcmp(&first[i], &w->attn[i], 4) != 0;
+            if (!c->rank && bad3) fprintf(stderr, "GLM53F_SPARSE_MLA_REFSELF layer=%d nondeterministic_floats=%ld\n", c->layer, bad3);
         }
+        if (mlb_mode == 2 && c->mlb_ref) {
+            long bad = 0, total = (long)tokens * cols;
+            for (long i = 0; i < total; ++i) bad += memcmp(&c->mlb_ref[i], &w->attn[i], 4) != 0;
+            if (!c->rank) fprintf(stderr, "GLM53F_SPARSE_MLA_VERIFY layer=%d tokens=%d mismatching_floats=%ld of %ld\n", c->layer, tokens, bad, total);
+            if (!c->rank && bad) {
+                int shown = 0; const int hn_ = c->hn;
+                for (long i = 0; i < total && shown < 3; i += VD) {
+                    long cnt = 0;
+                    for (int j = 0; j < VD; ++j) cnt += memcmp(&c->mlb_ref[i + j], &w->attn[i + j], 4) != 0;
+                    if (cnt) {
+                        int t = (int)(i / cols), h = (int)((i % cols) / VD);
+                        fprintf(stderr, "GLM53F_SPARSE_MLA_VERIFY_DETAIL t=%d h=%d nt=%d base=%d differing=%ld new0=%.9g old0=%.9g new1=%.9g old1=%.9g\n",
+                                t, h, w->count[t], base, cnt, c->mlb_ref[i], w->attn[i], c->mlb_ref[i + 1], w->attn[i + 1]);
+                        if (shown == 0) { /* double-precision reference of the batched path's intermediates */
+                            const int nt = w->count[t];
+                            const uint16_t *wk = c->kvb + (size_t)h * (KD + VD) * LAT;
+                            double *qlr = malloc(LAT * sizeof(double)), *pr = malloc((size_t)nt * sizeof(double)), *var = calloc(LAT, sizeof(double));
+                            const float *qq = w->query + (size_t)t * c->qd + h * KD;
+                            for (int d = 0; d < LAT; ++d) {
+                                double a = 0;
+                                for (int j = 0; j < KD; ++j) {
+                                    uint32_t bits = (uint32_t)wk[(size_t)j * LAT + d] << 16; float wf; memcpy(&wf, &bits, 4);
+                                    a += (double)(qq[j] / sqrtf((float)KD)) * wf;
+                                }
+                                qlr[d] = a;
+                            }
+                            double mx = -1e300, sm = 0;
+                            for (int i = 0; i < nt; ++i) {
+                                double a = 0;
+                                for (int d = 0; d < LAT; ++d) a += qlr[d] * (double)(float)(_Float16)c->latent[(size_t)w->selected[t][i] * LAT + d];
+                                pr[i] = a; if (a > mx) mx = a;
+                            }
+                            for (int i = 0; i < nt; ++i) { pr[i] = exp(pr[i] - mx); sm += pr[i]; }
+                            for (int i = 0; i < nt; ++i)
+                                for (int d = 0; d < LAT; ++d) var[d] += pr[i] / sm * (double)(float)(_Float16)c->latent[(size_t)w->selected[t][i] * LAT + d];
+                            double eq = 0, sq = 0, ev = 0, sv = 0;
+                            const float *qln = c->mlb_ql + ((size_t)t * hn_ + h) * LAT, *van = c->mlb_va + ((size_t)h * tokens + t) * LAT;
+                            for (int d = 0; d < LAT; ++d) { eq += (qln[d] - qlr[d]) * (qln[d] - qlr[d]); sq += qlr[d] * qlr[d]; ev += (van[d] - var[d]) * (van[d] - var[d]); sv += var[d] * var[d]; }
+                            /* the reference path's own intermediate for this token (c->q8v_va after the call) */
+                            double eo = 0;
+                            {
+                                const int ns = nt;
+                                for (int i = 0; i < ns; ++i)
+                                    for (int d = 0; d < LAT; ++d)
+                                        c->packed[(size_t)i * LAT + d] = (float)(_Float16)c->latent[(size_t)w->selected[t][i] * LAT + d];
+                                float tmp[8 * VD];
+                                mla_heads_q8_value(c, tmp, w->query + (size_t)t * c->qd, c->packed, NULL, ns);
+                                const float *vao = c->q8v_va + (size_t)h * LAT, *qlo = c->q8v_ql + (size_t)h * LAT;
+                                double eql = 0;
+                                for (int d = 0; d < LAT; ++d) { eo += (vao[d] - var[d]) * (vao[d] - var[d]); eql += (qlo[d] - qlr[d]) * (qlo[d] - qlr[d]); }
+                                fprintf(stderr, "GLM53F_SPARSE_MLA_REF_OLD t=%d h=%d old_ql_rel=%.3e old_va_rel=%.3e\n", t, h, sqrt(eql / (sq + 1e-300)), sqrt(eo / (sv + 1e-300)));
+                            }
+                            fprintf(stderr, "GLM53F_SPARSE_MLA_REF t=%d h=%d nt=%d new_ql_rel=%.3e new_va_rel=%.3e\n", t, h, nt, sqrt(eq / (sq + 1e-300)), sqrt(ev / (sv + 1e-300)));
+                            free(qlr); free(pr); free(var);
+                        }
+                        ++shown;
+                    }
+                }
+            }
+        }
+      }
     } else {
 #pragma omp parallel for collapse(2) schedule(static) reduction(|:failed)
         for (int t = 0; t < tokens; ++t)
@@ -1215,7 +1517,7 @@ int glm53f_sparse_prefill_12n(glm53f_sparse_context_12n *c,
     c->profile_phase[5] += sparse_clock(c) - begin;
     return 0;
 }
-void glm53f_sparse_free_12n(glm53f_sparse_context_12n*c){if(!c)return;free(c->q8v_ql);free(c->q8v_va);free(c->q8v_log);free(c->q8v_sum);free(c->q8v_act);for(int i=0;i<4;i++){free(c->int8_scale[i]);free(c->int8_weight[i]);}free(c->q2_op);free(c->q2_vb);free(c->q2_kva);free(c->q2_qb);free(c->q2_qa);free(c->cp_bf16_gather);free(c->cp_bf16_local);free(c->hot_latent);free(c->batch_partial);free(c->batch_attn);free(c->packed_index);free(c->packed);free(c->pool_score_global);free(c->pool_score_local);free(c->pool_score_cache);free(c->cp_candidate_gather);free(c->cp_candidate_local);free(c->cp_pack_index);free(c->cp_cur_gate);free(c->cp_cur_key);free(c->cp_cur_latent);free(c->cp_exchange);free(c->cp_gather);free(c->cp_pack);free(c->cp_pool);free(c->cp_gate);free(c->cp_key);free(c->cp_latent);free(c->apef);free(c->selected);free(c->partial);free(c->attn);free(c->pool);free(c->iw);free(c->iq);free(c->gcache);free(c->key);free(c->latent);free(c->query);free(c->qres);free(c->wp);free(c->wqb);free(c->ape);free(c->gatew);free(c->knb);free(c->knw);free(c->wk);free(c->ops);free(c->op);free(c->kvb);free(c->kvan);free(c->kvas);free(c->kva);free(c->qbs);free(c->qb);free(c->qan);free(c->qas);free(c->qa);free(c);}
+void glm53f_sparse_free_12n(glm53f_sparse_context_12n*c){if(!c)return;free(c->mlb_qs);free(c->mlb_ql);free(c->mlb_va);free(c->mlb_out);free(c->mlb_ref);free(c->mlb_lg);free(c->mlb_act);free(c->q8v_ql);free(c->q8v_va);free(c->q8v_log);free(c->q8v_sum);free(c->q8v_act);for(int i=0;i<4;i++){free(c->int8_scale[i]);free(c->int8_weight[i]);}free(c->q2_op);free(c->q2_vb);free(c->q2_kva);free(c->q2_qb);free(c->q2_qa);free(c->cp_bf16_gather);free(c->cp_bf16_local);free(c->hot_latent);free(c->batch_partial);free(c->batch_attn);free(c->packed_index);free(c->packed);free(c->pool_score_global);free(c->pool_score_local);free(c->pool_score_cache);free(c->cp_candidate_gather);free(c->cp_candidate_local);free(c->cp_pack_index);free(c->cp_cur_gate);free(c->cp_cur_key);free(c->cp_cur_latent);free(c->cp_exchange);free(c->cp_gather);free(c->cp_pack);free(c->cp_pool);free(c->cp_gate);free(c->cp_key);free(c->cp_latent);free(c->apef);free(c->selected);free(c->partial);free(c->attn);free(c->pool);free(c->iw);free(c->iq);free(c->gcache);free(c->key);free(c->latent);free(c->query);free(c->qres);free(c->wp);free(c->wqb);free(c->ape);free(c->gatew);free(c->knb);free(c->knw);free(c->wk);free(c->ops);free(c->op);free(c->kvb);free(c->kvan);free(c->kvas);free(c->kva);free(c->qbs);free(c->qb);free(c->qan);free(c->qas);free(c->qa);free(c);}
 #ifndef GLM53F_SPARSE_NO_MAIN
 int main(int argc,char**argv){
     int rank,nr,layer=argc>3?atoi(argv[3]):43,tokens=argc>2?atoi(argv[2]):512,h0,hn,qd;char n[256];glm53f_st_context*st;

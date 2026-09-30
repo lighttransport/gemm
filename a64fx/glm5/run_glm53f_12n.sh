@@ -66,9 +66,19 @@ if [ "$command" = check ]; then
         mpi_run "check-dense-$layer" "$GLM53F_BIN_DIR/glm53f_dense_batch_check" "$model" "$layer"
         grep 'PASS' "$last_log".*.0
     done
-    mpi_run check-sparse "$GLM53F_BIN_DIR/glm53f_sparse_batch_check" "$model" 3 2046 32
+    # Exact-path gate (per-token reference MLA), then the register-blocked batched MLA against the same reference.
+    # The batched MLA is not bit-identical (a 1e-8 difference in the value accumulation can flip a Q8 tie), so it is
+    # gated with an explicit tolerance instead of exactness.
+    (export GLM53F_SPARSE_MLA_BATCH=0; mpi_run check-sparse "$GLM53F_BIN_DIR/glm53f_sparse_batch_check" "$model" 3 2046 32)
+    grep 'PASS' "$last_log".*.0
+    (export GLM53F_SPARSE_MLA_BATCH=1 GLM53F_SPARSE_CHECK_TOL=2e-4; mpi_run check-sparse-mla-batch "$GLM53F_BIN_DIR/glm53f_sparse_batch_check" "$model" 3 2046 32)
     grep 'PASS' "$last_log".*.0
     export GLM53F_CHECK_WIDE_PREFILL=1
+    # The exact scalar-vs-batch gates compare against the per-token decode kernels; the grouped native MoE path is
+    # numerically different (closer to exact fp32), so it is validated separately with GLM53F_MOE_NATIVE_GROUPED=2.
+    # The MoE combine reduction order (GLM53F_MOE_AR_SLAB) is likewise pinned to the decode collective here; the faster
+    # collectives are validated by bench_glm53f_allreduce_12n (result check) and end-to-end generation.
+    export GLM53F_MOE_NATIVE_GROUPED=0 GLM53F_SPARSE_MLA_BATCH=0 GLM53F_MOE_ROUTER_GEMM=0 GLM53F_MOE_SHARED_GEMM=0 GLM53F_MOE_AR_SLAB=0 GLM53F_IQ_FAST=0
     mpi_run check-target "$GLM53F_BIN_DIR/glm53f_target_batch_check_12n" "$model" "$routed" "$shared" \
         --prefill-mode fast --prefill-features 27 --prefill-slab 16 --prefill-collective tree-packed
     grep 'PASS' "$last_log".*.0

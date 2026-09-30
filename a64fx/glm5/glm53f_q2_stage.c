@@ -16,6 +16,7 @@
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <unistd.h>
+#include <pthread.h>
 
 enum { NLAYERS = 45, NEXPERTS = 288, HIDDEN = 4096, INTER = 2048,
        PARTS = 8, PART_INTER = 256 };
@@ -174,6 +175,46 @@ static int put_down(int out, FILE *manifest, uint64_t *offset, uint64_t *hash,
     return 0;
 }
 
+
+/* ---- read-ahead pool: the shared filesystem is latency-bound for a single synchronous reader (about 5 MB/s per
+ * node observed).  Worker threads read the exact ranges the main loop will consume, staying at most `lead` experts
+ * ahead, so the client cache is warm when the main thread arrives.  Data are read and discarded. ---- */
+typedef struct {
+    const tensor_ref *gate, *up, *down;
+    int n, lead, next, consumed;
+    int expert[NEXPERTS], part[NEXPERTS];
+} prefetch_t;
+
+static void discard_read(const tensor_ref *r, uint64_t relative, size_t bytes, uint8_t *scratch, size_t cap) {
+    while (bytes) {
+        size_t n = bytes < cap ? bytes : cap;
+        ssize_t got = pread(r->fd, scratch, n, (off_t)(r->base + relative));
+        if (got <= 0) return;
+        relative += (uint64_t)got; bytes -= (size_t)got;
+    }
+}
+
+static void *prefetch_worker(void *arg) {
+    prefetch_t *p = arg;
+    const size_t cap = 4u << 20;
+    uint8_t *scratch = malloc(cap);
+    if (!scratch) return NULL;
+    for (;;) {
+        int i = __atomic_fetch_add(&p->next, 1, __ATOMIC_RELAXED);
+        if (i >= p->n) break;
+        while (i > __atomic_load_n(&p->consumed, __ATOMIC_ACQUIRE) + p->lead) usleep(300);
+        const int e = p->expert[i], part = p->part[i];
+        size_t rb = row_bytes(p->gate->ti->type, HIDDEN);
+        uint64_t base = (uint64_t)e * INTER * rb + (uint64_t)part * PART_INTER * rb;
+        discard_read(p->gate, base, PART_INTER * rb, scratch, cap);
+        discard_read(p->up, base, PART_INTER * rb, scratch, cap);
+        size_t full_rb = row_bytes(p->down->ti->type, INTER);
+        discard_read(p->down, (uint64_t)e * HIDDEN * full_rb, (size_t)HIDDEN * full_rb, scratch, cap);
+    }
+    free(scratch);
+    return NULL;
+}
+
 int main(int argc, char **argv) {
     int rank, ranks, dry = 0, out = -1, first_layer = 3, layer_count = NLAYERS - 3;
     char blob[4096], manifest_path[4096], blob_tmp[4096], manifest_tmp[4096];
@@ -247,6 +288,23 @@ int main(int argc, char **argv) {
             gate.ti->dims[2] != NEXPERTS || down.ti->dims[0] != INTER ||
             down.ti->dims[1] != HIDDEN || down.ti->dims[2] != NEXPERTS)
             die(rank, "expert tensor contract");
+        static prefetch_t pf;
+        pthread_t pool[64];
+        int npool = 0;
+        {
+            const char *e = getenv("GLM53F_STAGE_PREFETCH");
+            int want = e && *e ? atoi(e) : 16;
+            if (want > 64) want = 64;
+            pf.gate = &gate; pf.up = &up; pf.down = &down; pf.n = 0; pf.next = 0; pf.consumed = 0;
+            pf.lead = getenv("GLM53F_STAGE_LEAD") ? atoi(getenv("GLM53F_STAGE_LEAD")) : 40;
+            for (int expert = 0; expert < NEXPERTS; ++expert) {
+                int part = owned_part(expert, rank);
+                if (part >= 0) { pf.expert[pf.n] = expert; pf.part[pf.n] = part; ++pf.n; }
+            }
+            if (!dry) for (int t = 0; t < want && t < pf.n; ++t)
+                if (!pthread_create(&pool[npool], NULL, prefetch_worker, &pf)) ++npool;
+        }
+        int done_items = 0;
         for (int expert = 0; expert < NEXPERTS; ++expert) {
             int part = owned_part(expert, rank);
             if (part < 0) continue;
@@ -255,7 +313,10 @@ int main(int argc, char **argv) {
                 put_down(out, manifest, &offset, &hash, &down,
                          layer, expert, part, in, packed, dry))
                 die(rank, "expert payload");
+            __atomic_store_n(&pf.consumed, ++done_items, __ATOMIC_RELEASE);
         }
+        __atomic_store_n(&pf.consumed, 1 << 30, __ATOMIC_RELEASE);
+        for (int t = 0; t < npool; ++t) pthread_join(pool[t], NULL);
         if (!dry && (layer & 3) == 3) {
             fdatasync(out); posix_fadvise(out, 0, 0, POSIX_FADV_DONTNEED);
         }

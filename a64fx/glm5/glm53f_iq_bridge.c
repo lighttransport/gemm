@@ -8,6 +8,8 @@
 #include "../../common/glm5.h"
 #include "glm53f_iq_bridge.h"
 #include "kern/glm53f_kern.h"
+#include "glm53f_iq_fast.h"
+#include <omp.h>
 
 int glm53f_iq_type_supported(int type) {
     return type == GLM53F_GGML_Q4_K || type == GLM53F_GGML_Q5_K ||
@@ -663,9 +665,9 @@ int glm53f_iq_matvec(
                               NULL, NULL, 0, rows, columns, input);
 }
 
-int glm53f_iq_expert_weighted(
+static int iq_expert_weighted_impl(
         float *output, const glm53f_iq_part *parts, const float *weights,
-        int count, const float *input, float *gate_up, float *activation) {
+        int count, const float *input, float *gate_up, float *activation, int fast_override) {
     enum { HIDDEN = 4096, GU_STRIDE = 1024, ACT_STRIDE = 512 };
     glm5_iq_q8_block input_q[HIDDEN / 256];
     glm5_iq_q8_block act_q[9][ACT_STRIDE / 256];
@@ -683,10 +685,34 @@ int glm53f_iq_expert_weighted(
         gate_rb[k] = dequant_row_size((uint32_t)parts[k].gate_type, HIDDEN);
         down_rb[k] = dequant_row_size((uint32_t)parts[k].down_type, parts[k].inter);
     }
+    /* Full-width Q4_K/Q5_K row kernels (glm53f_iq_fast.h); GLM53F_IQ_FAST=0 keeps the reference loops. */
+    static int fast_env = -1;
+    if (fast_env < 0) { const char *e = getenv("GLM53F_IQ_FAST"); fast_env = !e || !*e ? 1 : atoi(e); iqf_init(); }
+    int fast = fast_override >= 0 ? fast_override : fast_env == 1;
+    for (int k = 0; k < count; ++k)
+        fast &= (parts[k].gate_type == GLM53F_GGML_Q4_K || parts[k].gate_type == GLM53F_GGML_Q5_K) &&
+                (parts[k].down_type == GLM53F_GGML_Q4_K || parts[k].down_type == GLM53F_GGML_Q5_K) &&
+                parts[k].inter <= 512;
+    iqf_act in_a[HIDDEN / 256] __attribute__((aligned(64)));
+    iqf_act act_a[9][2] __attribute__((aligned(64)));
+    if (fast) iqf_prepare(in_a, (const iqf_src_block *)input_q, gate_blocks);
+    int total_gate_rows = 0;
+    for (int k = 0; k < count; ++k) total_gate_rows += 2 * parts[k].inter;
 #pragma omp parallel
     {
-        int total_gate_rows = 0;
-        for (int k = 0; k < count; ++k) total_gate_rows += 2 * parts[k].inter;
+        if (fast) {
+            const int nt = omp_get_num_threads(), tid = omp_get_thread_num();
+            const int q0 = (int)((long long)total_gate_rows * tid / nt), q1 = (int)((long long)total_gate_rows * (tid + 1) / nt);
+            int base = 0, k = 0;
+            for (int q = q0; q < q1;) {
+                while (q >= base + 2 * parts[k].inter) base += 2 * parts[k++].inter;
+                const int r = q - base, n = (base + 2 * parts[k].inter < q1 ? base + 2 * parts[k].inter : q1) - q;
+                iqf_rows(gate_up + (size_t)k * GU_STRIDE + r, parts[k].gate_up + (size_t)r * gate_rb[k], gate_rb[k], n,
+                         in_a, gate_blocks, parts[k].gate_type == GLM53F_GGML_Q5_K);
+                q += n;
+            }
+#pragma omp barrier
+        } else
 #pragma omp for schedule(static)
         for (int q = 0; q < total_gate_rows; ++q) {
             int k = 0, r = q;
@@ -708,9 +734,26 @@ int glm53f_iq_expert_weighted(
             }
         }
 #pragma omp single
-        for (int k = 0; k < count; ++k)
-            glm5_iq_quant_q8(act_q[k], activation + (size_t)k * ACT_STRIDE,
-                             parts[k].inter);
+        for (int k = 0; k < count; ++k) {
+            glm5_iq_quant_q8(act_q[k], activation + (size_t)k * ACT_STRIDE, parts[k].inter);
+            if (fast) iqf_prepare(act_a[k], (const iqf_src_block *)act_q[k], parts[k].inter / 256);
+        }
+        if (fast) {
+            const int nt = omp_get_num_threads(), tid = omp_get_thread_num();
+            const int r0 = (int)((long long)HIDDEN * tid / nt), r1 = (int)((long long)HIDDEN * (tid + 1) / nt);
+            float tmp[9][64];
+            for (int r = r0; r < r1; r += 64) {
+                const int n = r1 - r < 64 ? r1 - r : 64;
+                for (int k = 0; k < count; ++k)
+                    iqf_rows(tmp[k], parts[k].down + (size_t)r * down_rb[k], down_rb[k], n, act_a[k],
+                             parts[k].inter / 256, parts[k].down_type == GLM53F_GGML_Q5_K);
+                for (int i = 0; i < n; ++i) {
+                    float sum = 0.0f;
+                    for (int k = 0; k < count; ++k) sum += weights[k] * tmp[k][i];
+                    output[r + i] = sum;
+                }
+            }
+        } else
 #pragma omp for schedule(static)
         for (int r = 0; r < HIDDEN; ++r) {
             float sum = 0.0f;
@@ -722,5 +765,24 @@ int glm53f_iq_expert_weighted(
             output[r] = sum;
         }
     }
+    return 0;
+}
+
+int glm53f_iq_expert_weighted(
+        float *output, const glm53f_iq_part *parts, const float *weights,
+        int count, const float *input, float *gate_up, float *activation) {
+    static int mode = -1;
+    if (mode < 0) { const char *e = getenv("GLM53F_IQ_FAST"); mode = !e || !*e ? 1 : atoi(e); iqf_init(); }
+    if (mode != 2) return iq_expert_weighted_impl(output, parts, weights, count, input, gate_up, activation, mode == 1);
+    /* verify: run the reference loops into scratch and compare the fast result against them */
+    static float ref[4096], gu2[9 * 1024], act2[9 * 512];
+    static double worst; static long calls;
+    if (iq_expert_weighted_impl(ref, parts, weights, count, input, gu2, act2, 0)) return -1;
+    if (iq_expert_weighted_impl(output, parts, weights, count, input, gate_up, activation, 1)) return -1;
+    double se = 0, sr = 0;
+    for (int i = 0; i < 4096; ++i) { double d = output[i] - ref[i]; se += d * d; sr += (double)ref[i] * ref[i]; }
+    double rel = sqrt(se / (sr + 1e-30));
+    if (rel > worst) worst = rel;
+    if (++calls % 2000 == 0) fprintf(stderr, "GLM53F_IQ_FAST_VERIFY calls=%ld worst_rel_l2=%.3e last=%.3e\n", calls, worst, rel);
     return 0;
 }

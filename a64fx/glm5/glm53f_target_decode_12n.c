@@ -19,6 +19,8 @@
 #include "glm53f_target_layer_12n.h"
 #include "glm53f_target_model_12n.h"
 #include "glm53f_collective_12n.h"
+#include <sys/syscall.h>
+#include <unistd.h>
 #include "glm53f_state_io.h"
 #include "glm53f_prefill_gemm.h"
 
@@ -134,7 +136,7 @@ struct glm53f_target_model_12n {
     float *streams;
     const float *last_streams;
     glm53f_target_layer_scratch_12n *batch_scratch;
-    float *batch_streams, *batch_normalized, *batch_output;
+    float *batch_streams, *batch_normalized, *batch_output, *batch_tmp; int kda_defer, kda_async;
     glm53f_sparse_prefill_workspace_12n *sparse_prefill;
     glm53f_state_io *trace;
     unsigned char *batch_state;
@@ -171,7 +173,7 @@ int glm53f_target_model_configure_prefill_12n(glm53f_target_model_12n *m,
     if (c.slab_tokens != 4 && c.slab_tokens != 8 && c.slab_tokens != 16 &&
         c.slab_tokens != 32) return -1;
     if (c.features & ~GLM53F_PREFILL_FAST_ALL) return -1;
-    if (c.collective < 0 || c.collective > 4) return -1;
+    if (c.collective < 0 || c.collective > 5) return -1;
     for (int l = 0; l < LAYERS; ++l)
         if (m->sparse[l] && glm53f_sparse_length_12n(m->sparse[l])) return -1;
     if (c.mode != GLM53F_PREFILL_FAST) c.features = 0;
@@ -219,7 +221,7 @@ static glm53f_target_model_12n *target_model_create_with_kda(
     glm53f_target_model_12n *m = calloc(1, sizeof(*m));
     if (!m || capacity < 1) goto fail;
     m->profile = getenv("GLM53F_PROFILE") != NULL;
-    m->mhc_chained = getenv("GLM53F_MHC_CHAINED") && atoi(getenv("GLM53F_MHC_CHAINED"));
+    m->mhc_chained = getenv("GLM53F_MHC_CHAINED") ? atoi(getenv("GLM53F_MHC_CHAINED")) : 1;
     MPI_Comm_size(MPI_COMM_WORLD, &ranks);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     if (ranks != 12) { fprintf(stderr, "GLM53F_TARGET_CREATE_FAIL rank=%d phase=ranks value=%d\n", rank, ranks); goto fail; }
@@ -257,6 +259,10 @@ static glm53f_target_model_12n *target_model_create_with_kda(
     m->batch_streams = a256((size_t)PREFILL_BATCH * FLAT * sizeof(float));
     m->batch_normalized = a256((size_t)PREFILL_BATCH * HIDDEN * sizeof(float));
     m->batch_output = a256((size_t)PREFILL_BATCH * HIDDEN * sizeof(float));
+    m->batch_tmp = a256((size_t)PREFILL_BATCH * HIDDEN * sizeof(float));
+    m->kda_defer = getenv("GLM53F_KDA_DEFER") ? atoi(getenv("GLM53F_KDA_DEFER")) : 0;
+    m->kda_async = getenv("GLM53F_KDA_ASYNC") ? atoi(getenv("GLM53F_KDA_ASYNC")) : 0;
+    if (m->kda_async) m->kda_defer = 1;
     for (int l = 0; l < LAYERS; l++) {
         size_t n = glm53f_kda_state_bytes_12n(m->kda[l]);
         if (n > m->batch_state_stride) m->batch_state_stride = n;
@@ -456,23 +462,42 @@ int glm53f_target_model_step_batch_12n(glm53f_target_model_12n *m,
             int wide_kda = tokens > VERIFY_BATCH &&
                 getenv("GLM53F_KDA_WIDE_TILE") &&
                 atoi(getenv("GLM53F_KDA_WIDE_TILE"));
+            const int defer_kda = wide_kda && (m->prefill.features & GLM53F_PREFILL_COMM) &&
+                !after && m->kda_defer &&
+                (tokens % GLM53F_KDA_TILE_TOKENS == 0 || tokens % GLM53F_KDA_TILE_TOKENS > 5);
+            const int async_kda = defer_kda && m->kda_async && glm53f_async_available_12n() &&
+                !glm53f_async_begin_12n(m->batch_tmp, m->batch_output, tokens, HIDDEN,
+                                        m->prefill.slab_tokens);
+            float *kda_out = async_kda ? m->batch_tmp : m->batch_output;
+            if (defer_kda) glm53f_kda_set_defer_reduce_12n(1);
             for (int tile = 0; tile < tokens;
-                 tile += wide_kda ? GLM53F_PREFILL_ATTN_TOKENS : KERNEL_BATCH) {
+                 tile += wide_kda ? GLM53F_KDA_TILE_TOKENS : KERNEL_BATCH) {
                 int n = tokens - tile;
-                if (wide_kda && n > GLM53F_PREFILL_ATTN_TOKENS)
-                    n = GLM53F_PREFILL_ATTN_TOKENS;
+                if (wide_kda && n > GLM53F_KDA_TILE_TOKENS)
+                    n = GLM53F_KDA_TILE_TOKENS;
                 if (!wide_kda && n > KERNEL_BATCH) n = KERNEL_BATCH;
                 if (glm53f_kda_sublayer_batch_capture_12n(
-                        m->kda[l], m->batch_output + (size_t)tile * HIDDEN,
+                        m->kda[l], kda_out + (size_t)tile * HIDDEN,
                         m->batch_normalized + (size_t)tile * HIDDEN, n,
                         after ? m->batch_state +
                             (size_t)tile * m->batch_state_stride : NULL,
                         m->batch_state_stride))
                     return -1;
+                if (async_kda) glm53f_async_ready_12n(tile + n);
                 if (m->profile) {
                     double phase[3];
                     glm53f_kda_last_phase_12n(m->kda[l], phase);
                     for (int p = 0; p < 3; ++p) m->batch_kda[p] += phase[p];
+                }
+            }
+            if (defer_kda) {
+                glm53f_kda_set_defer_reduce_12n(0);
+                if (async_kda) {
+                    if (glm53f_async_finish_12n()) return -1;
+                } else {
+                    memcpy(m->batch_tmp, m->batch_output, (size_t)tokens * HIDDEN * sizeof(float));
+                    if (glm53f_sum_allreduce_slabs_12n(m->batch_tmp, m->batch_output, tokens, HIDDEN,
+                                                       m->prefill.slab_tokens)) return -1;
                 }
             }
             if (after)
@@ -857,6 +882,13 @@ int main(int argc, char **argv) {
     MPI_Init(&argc, &argv);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &ranks);
+    /* Weights are loaded by one thread; first touch would pile ~14 GiB onto the loader's CMG (8 GiB) and its
+     * neighbour. Interleave pages over the four compute CMGs (nodes 4-7) so all HBM stacks serve every phase. */
+    if (!getenv("GLM53F_NUMA_INTERLEAVE") || atoi(getenv("GLM53F_NUMA_INTERLEAVE"))) {
+        unsigned long mask = 0xF0UL;
+        long rc = syscall(SYS_set_mempolicy, 3 /* MPOL_INTERLEAVE */, &mask, 8UL);
+        if (!rank) fprintf(stderr, "GLM53F_NUMA_INTERLEAVE %s\n", rc == 0 ? "enabled" : "unavailable");
+    }
     if (argc < 4 || ranks != 12) {
         if (!rank) fprintf(stderr,"usage: %s MODEL ROUTED_STAGE SHARED_STAGE [token=1] [steps=1] [OPTIONS]\n       %s MODEL ROUTED_STAGE SHARED_STAGE --generate PROMPT_IDS OUTPUT_IDS MAX_NEW [OPTIONS]\noptions: --capacity N --weight-format fp8|int8 --int8-kda --cache-format fp32|bf16 --temperature T --top-p P --seed N --touch-cache --load-only --prefill-chunk N --decode-window N --cp-hot-prefix N --ignore-eos (generate only)\n",argv[0],argv[0]);
         MPI_Abort(MPI_COMM_WORLD,2);

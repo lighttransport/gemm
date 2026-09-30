@@ -6,6 +6,8 @@
 #include "glm53f_mtp_12n.h"
 #include "glm53f_collective_12n.h"
 #include "glm53f_target_model_12n.h"
+#include <sys/syscall.h>
+#include <unistd.h>
 
 enum { HIDDEN = 4096, MAX_DRAFT = 4 };
 
@@ -48,6 +50,10 @@ int main(int argc, char **argv) {
     MPI_Init(&argc, &argv);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &ranks);
+    if (!getenv("GLM53F_NUMA_INTERLEAVE") || atoi(getenv("GLM53F_NUMA_INTERLEAVE"))) {
+        unsigned long mask = 0xF0UL; /* interleave weights over the four compute CMGs (see glm53f_target_decode_12n.c) */
+        syscall(SYS_set_mempolicy, 3L, &mask, 8UL);
+    }
     if (argc < 7 || ranks != 12) {
         if (!rank) fprintf(stderr,"usage: %s MODEL TARGET_ROUTED TARGET_SHARED MTP_ROUTED MTP_SHARED [token=1] [cycles=1] [drafts=1] [warmup=128]\n",argv[0]);
         MPI_Abort(MPI_COMM_WORLD,2);

@@ -28,6 +28,9 @@ mpi_run mtp-preflight bash -c '
 ' bash "$mtp_routed" "$mtp_shared"
 require_ranks 'GLM53F_MTP_PREFLIGHT=PASS'
 export GLM53F_PROFILE=1
+# The MTP draft layer (layer 45) is read from the safetensors model directory, not from the compact core image;
+# glm53f_env.sh forces REPACK_REQUIRE for native targets, so relax it for the speculative binary.
+export GLM53F_REPACK_REQUIRE=${GLM53F_REPACK_REQUIRE_MTP:-0}
 export GLM53F_KDA_BATCH_TEAM=${GLM53F_KDA_BATCH_TEAM:-1}
 export GLM53F_Q4_BATCH_SHARED=${GLM53F_Q4_BATCH_SHARED:-1}
 export GLM53F_SPARSE_BATCH_OP=${GLM53F_SPARSE_BATCH_OP:-0}

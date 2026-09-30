@@ -72,7 +72,7 @@ int main(int argc, char **argv) {
         r2 += (double)a[i] * a[i];
     }
     double rel = sqrt(d2 / (r2 + 1e-30));
-    local_ok &= rel < 3e-6;
+    local_ok &= rel < (getenv("GLM53F_SPARSE_CHECK_TOL") ? atof(getenv("GLM53F_SPARSE_CHECK_TOL")) : 3e-6);
     double rollback_d2=0.0,rollback_r2=0.0;
     if(warm>=1){local_ok&=!glm53f_sparse_restore_length_12n(ca,warm+1);
         local_ok&=!glm53f_sparse_restore_length_12n(cb,warm+1);

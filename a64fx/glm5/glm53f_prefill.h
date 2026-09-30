@@ -37,6 +37,7 @@ static inline int glm53f_prefill_option(glm53f_prefill_config *c,
         else if (!strcmp(value, "ring")) c->collective = 2;
         else if (!strcmp(value, "tree-rsag")) c->collective = 3;
         else if (!strcmp(value, "tree-packed")) c->collective = 4;
+        else if (!strcmp(value, "mtni")) c->collective = 5;
         else return -1;
     } else {
         char *end;
