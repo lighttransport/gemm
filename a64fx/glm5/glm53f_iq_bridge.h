@@ -29,6 +29,10 @@ typedef struct {
 
 int glm53f_iq_type_supported(int type);
 size_t glm53f_iq_row_size(int type, int columns);
+/* CMG-affine placement of one routed-expert part (see glm53f_iq_bridge.c); call before the pages are first touched. */
+int glm53f_iq_affine_enabled(void);
+void glm53f_iq_place_part(const uint8_t *gate_up, size_t gate_row_bytes, int gate_rows, const uint8_t *down,
+                          size_t down_row_bytes, int down_rows);
 int glm53f_iq_expert_weighted(
     float *output, const glm53f_iq_part *parts, const float *weights,
     int count, const float *input, float *gate_up, float *activation);
@@ -59,6 +63,9 @@ int glm53f_native_repack_rowwise(int type, const uint8_t *source, int rows,
 size_t glm53f_native_act_bytes(int columns);
 int glm53f_native_act_prepare(void *storage, const float *input, int columns,
                               int need_q8k, int need_q80);
+/* Team version: call from every thread of an enclosing parallel region; quantizes in parallel and returns with the
+ * activation ready (implicit barrier). Bit-identical to glm53f_native_act_prepare. */
+int glm53f_native_act_prepare_team(void *storage, const float *input, int columns, int need_q8k, int need_q80);
 /* Orphaned omp-for over all rows of up to eight same-input matrices; call
  * from every thread of an enclosing team after one thread prepared the
  * activation and the team synchronized. */

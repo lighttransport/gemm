@@ -60,7 +60,10 @@ static const uint32_t iqf_sel2[16] = {4, 4, 4, 4, 4, 4, 4, 4, 6, 6, 6, 6, 6, 6, 
 static const uint32_t iqf_sel3[16] = {5, 5, 5, 5, 5, 5, 5, 5, 7, 7, 7, 7, 7, 7, 7, 7};
 
 #ifndef IQF_PF_BYTES
-#define IQF_PF_BYTES 3072
+#define IQF_PF_BYTES 4096
+#endif
+#ifndef IQF_PF_LVL
+#define IQF_PF_LVL 0
 #endif
 #define IQF_DECL_K \
     const svbool_t iqf_p32 = svptrue_b32(), iqf_p8 = svptrue_b8(), iqf_pg8 = svwhilelt_b32(0, 8), iqf_pb32 = svwhilelt_b8(0, 32); \
@@ -85,7 +88,7 @@ static inline __attribute__((always_inline)) svfloat32_t iqf_block(svfloat32_t a
     svbool_t p32, svbool_t p8, svbool_t pg8, svbool_t pb32,
     svuint32_t iA, svuint32_t iB, svuint32_t iC, svuint32_t iD, svuint32_t mA, svuint32_t mH, svuint32_t mC, svuint32_t sC,
     svuint32_t t0, svuint32_t t1, svuint32_t t2, svuint32_t t3, svuint8_t vrep, svuint8_t vs0, svuint8_t vs1, svuint8_t vs2, svuint8_t vs3) {
-    __builtin_prefetch(blk + IQF_PF_BYTES, 0, 1);
+    __builtin_prefetch(blk + IQF_PF_BYTES, 0, IQF_PF_LVL);
     const float dd = (float)*(const __fp16 *)blk, dm = (float)*(const __fp16 *)(blk + 2);
     const svuint32_t Q = svld1ub_u32(p32, blk + 4);
     const svuint32_t va = svtbl_u32(Q, iA), vb = svtbl_u32(Q, iB), vc = svtbl_u32(Q, iC), vd = svtbl_u32(Q, iD);
@@ -114,8 +117,8 @@ static inline __attribute__((always_inline)) svfloat32_t iqf_block(svfloat32_t a
     dots = svmla_s32_x(p32, dots, d2, svreinterpret_s32_u32(svtbl_u32(sc, t2)));
     dots = svmla_s32_x(p32, dots, d3, svreinterpret_s32_u32(svtbl_u32(sc, t3)));
     const svint32_t msum = svmul_s32_z(pg8, svreinterpret_s32_u32(mn), svld1_s32(pg8, ab->s));
-    acc = svmla_n_f32_x(p32, acc, svcvt_f32_s32_x(p32, dots), ab->d * dd);
-    return svmla_n_f32_x(p32, acc, svcvt_f32_s32_x(p32, msum), -ab->d * dm);
+    acc = svmla_n_f32_x(p32, acc, svcvt_f32_s32_x(p32, msum), -ab->d * dm);
+    return svmla_n_f32_x(p32, acc, svcvt_f32_s32_x(p32, dots), ab->d * dd);
 }
 
 #define IQF_CALL(acc, blk, ab) iqf_block(acc, blk, ab, q5, iqf_p32, iqf_p8, iqf_pg8, iqf_pb32, k_iA, k_iB, k_iC, k_iD, k_mA, k_mH, k_mC, k_sC, k_t0, k_t1, k_t2, k_t3, k_vrep, k_vs0, k_vs1, k_vs2, k_vs3)
@@ -128,6 +131,23 @@ static inline void iqf_rows(float *out, const uint8_t *row0, size_t rb, int nrow
     IQF_DECL_K
     const size_t bsz = q5 ? 176 : 144;
     int r = 0;
+    if (blocks == 1) {
+        /* one super-block per row (down projections): four rows at a time, reduced with a UZP/ADD tree instead of one
+         * FADDV per row */
+        for (; r + 3 < nrows; r += 4) {
+            const uint8_t *row = row0 + (size_t)r * rb;
+            svfloat32_t a0 = IQF_CALL(svdup_f32(0.0f), row, a), a1 = IQF_CALL(svdup_f32(0.0f), row + rb, a),
+                        a2 = IQF_CALL(svdup_f32(0.0f), row + 2 * rb, a), a3 = IQF_CALL(svdup_f32(0.0f), row + 3 * rb, a);
+            svfloat32_t t01 = svadd_f32_x(iqf_p32, svuzp1_f32(a0, a1), svuzp2_f32(a0, a1));
+            svfloat32_t t23 = svadd_f32_x(iqf_p32, svuzp1_f32(a2, a3), svuzp2_f32(a2, a3));
+            svfloat32_t u = svadd_f32_x(iqf_p32, svuzp1_f32(t01, t23), svuzp2_f32(t01, t23));
+            u = svadd_f32_x(iqf_p32, svuzp1_f32(u, u), svuzp2_f32(u, u));
+            u = svadd_f32_x(iqf_p32, svuzp1_f32(u, u), svuzp2_f32(u, u));
+            float tmp[16];
+            svst1_f32(iqf_p32, tmp, u);
+            out[r] = tmp[0]; out[r + 1] = tmp[1]; out[r + 2] = tmp[2]; out[r + 3] = tmp[3];
+        }
+    }
     for (; r + 1 < nrows; r += 2) {
         const uint8_t *rowa = row0 + (size_t)r * rb, *rowb = rowa + rb;
         svfloat32_t acca = svdup_f32(0.0f), accb = acca;
@@ -144,6 +164,45 @@ static inline void iqf_rows(float *out, const uint8_t *row0, size_t rb, int nrow
         for (int b = 0; b < blocks; ++b) acc = IQF_CALL(acc, row + (size_t)b * bsz, a + b);
         out[r] = svaddv_f32(iqf_p32, acc);
     }
+}
+
+/* ---- SwiGLU + Q8 quantisation of one 256-column activation block, straight into the prepared layout ---- */
+static inline svfloat32_t iqf_expf(svbool_t pg, svfloat32_t x) {
+    x = svmax_n_f32_x(pg, svmin_n_f32_x(pg, x, 88.f), -87.f);
+    svfloat32_t n = svrintn_f32_x(pg, svmul_n_f32_x(pg, x, 1.4426950408889634f));
+    svfloat32_t r = svmls_n_f32_x(pg, x, n, 0.693145751953125f);
+    r = svmls_n_f32_x(pg, r, n, 1.428606765330187e-06f);
+    svfloat32_t q = svdup_n_f32(1.0f / 720.f);
+    q = svmad_n_f32_x(pg, q, r, 1.0f / 120.f); q = svmad_n_f32_x(pg, q, r, 1.0f / 24.f);
+    q = svmad_n_f32_x(pg, q, r, 1.0f / 6.f);   q = svmad_n_f32_x(pg, q, r, 0.5f);
+    q = svmad_n_f32_x(pg, q, r, 1.0f);         q = svmad_n_f32_x(pg, q, r, 1.0f);
+    return svscale_f32_x(pg, q, svcvt_s32_f32_x(pg, n));
+}
+
+/* g/u point at 256 gate / up floats; same clamps as the reference (g in [-100,10], u in [-10,10]) and the same
+ * amax/127 Q8 quantiser as glm5_iq_quant_q8. */
+static inline void iqf_swiglu_block(iqf_act *o, const float *g, const float *u) {
+    const svbool_t pg = svptrue_b32();
+    float a[256];
+    svfloat32_t am = svdup_f32(0.f);
+    for (int i = 0; i < 256; i += 16) {
+        svfloat32_t gv = svmax_n_f32_x(pg, svmin_n_f32_x(pg, svld1_f32(pg, g + i), 10.f), -100.f);
+        svfloat32_t uv = svmax_n_f32_x(pg, svmin_n_f32_x(pg, svld1_f32(pg, u + i), 10.f), -10.f);
+        svfloat32_t v = svmul_f32_x(pg, svdiv_f32_x(pg, gv, svadd_n_f32_x(pg, iqf_expf(pg, svneg_f32_x(pg, gv)), 1.f)), uv);
+        svst1_f32(pg, a + i, v);
+        am = svmax_f32_x(pg, am, svabs_f32_x(pg, v));
+    }
+    const float amax = svmaxv_f32(pg, am);
+    const float inv = amax > 0.f ? 127.f / amax : 0.f;
+    iqf_src_block tmp;
+    tmp.d = amax > 0.f ? amax / 127.f : 0.f;
+    for (int i = 0; i < 256; i += 16) {
+        svfloat32_t v = svrintn_f32_x(pg, svmul_n_f32_x(pg, svld1_f32(pg, a + i), inv));
+        svint32_t iv = svcvt_s32_f32_x(pg, v);
+        iv = svmin_n_s32_x(pg, svmax_n_s32_x(pg, iv, -127), 127);
+        svst1b_s32(pg, tmp.q + i, iv);
+    }
+    iqf_prepare(o, &tmp, 1);
 }
 
 #endif

@@ -112,6 +112,7 @@ static inline void glm53f_mhc_mv_batch4(
  * Same formulas as glm53f_mhc_pre_sve / glm53f_mhc_post_pre_sve; only the summation partition of the two
  * double-precision norm reductions differs (thread partials in thread order). */
 static double glm53f_mhc_part1[128 * 8], glm53f_mhc_part2[128 * 8];
+static inline void glm53f_mhc_sinkhorn_fast(float *comb, int hc, int iters, float eps);
 static int glm53f_mhc_fast_mode = -1;
 static inline int glm53f_mhc_fast_on(void) {
     if (glm53f_mhc_fast_mode < 0) glm53f_mhc_fast_mode = getenv("GLM53F_MHC_FAST") ? atoi(getenv("GLM53F_MHC_FAST")) : 1;
@@ -161,7 +162,7 @@ static inline void glm53f_mhc_fast(float *streams, const float *sublayer, glm53f
             }
             for (int m = 0; m < GLM53F_MHC_STREAMS * GLM53F_MHC_STREAMS; ++m)
                 scratch->combine[m] = logits[2 * GLM53F_MHC_STREAMS + m] * site->scale[2] + site->base[2 * GLM53F_MHC_STREAMS + m];
-            glm53f_mhc_sinkhorn(scratch->combine, GLM53F_MHC_STREAMS, 20, 1e-6f);
+            glm53f_mhc_sinkhorn_fast(scratch->combine, GLM53F_MHC_STREAMS, 20, 1e-6f);
         }
         /* 4. collapse + residual copy + partial sum of squares of the collapsed vector */
         {
@@ -192,10 +193,137 @@ static inline void glm53f_mhc_fast(float *streams, const float *sublayer, glm53f
     }
 }
 
+/* Variant with distributed mixing dots (GLM53F_MHC_FAST=2): every thread computes the 24 partial dot products over the
+ * slice of the streams it just produced, so the logits need one barrier (shared with the sum of squares) instead of a
+ * 24-way work split whose dot chains dominate; Sinkhorn runs redundantly on every thread (thread 0 publishes post /
+ * combine).  Two barriers in total.  Summation order of the logits differs from mode 1 (fp32 rounding only). */
+/* Bit-identical SVE version of glm53f_mhc_sinkhorn for hc == 4: the whole 4x4 matrix lives in one 16-lane vector
+ * (lane = 4 * row + col).  Every lane recomputes its row / column sum with the same ordered additions
+ * ((eps + c0) + c1 + c2 + c3) as the scalar loops and divides by it, so the result equals the scalar code exactly. */
+static inline void glm53f_mhc_sinkhorn4_sve(float *comb, int iters, float eps) {
+    const svbool_t pg = svptrue_b32();
+    uint32_t rowidx[4][16], colidx[4][16];
+    for (int l = 0; l < 16; ++l)
+        for (int j = 0; j < 4; ++j) { rowidx[j][l] = (uint32_t)((l >> 2) * 4 + j); colidx[j][l] = (uint32_t)(j * 4 + (l & 3)); }
+    const svuint32_t r0 = svld1_u32(pg, rowidx[0]), r1 = svld1_u32(pg, rowidx[1]), r2 = svld1_u32(pg, rowidx[2]),
+                     r3 = svld1_u32(pg, rowidx[3]), c0 = svld1_u32(pg, colidx[0]), c1 = svld1_u32(pg, colidx[1]),
+                     c2 = svld1_u32(pg, colidx[2]), c3 = svld1_u32(pg, colidx[3]);
+    /* initial row softmax (expf per element: keep the scalar code, it matches the reference bit for bit) */
+    for (int i = 0; i < 4; ++i) {
+        float mx = comb[i * 4], sum = 0.0f;
+        for (int j = 1; j < 4; ++j) if (comb[i * 4 + j] > mx) mx = comb[i * 4 + j];
+        for (int j = 0; j < 4; ++j) { comb[i * 4 + j] = expf(comb[i * 4 + j] - mx) + eps; sum += comb[i * 4 + j]; }
+        for (int j = 0; j < 4; ++j) comb[i * 4 + j] /= sum;
+    }
+    svfloat32_t m = svld1_f32(pg, comb);
+    for (int z = 0; z < iters; ++z) {
+        if (z > 0) {
+            svfloat32_t s = svdup_n_f32(eps);
+            s = svadd_f32_x(pg, s, svtbl_f32(m, r0)); s = svadd_f32_x(pg, s, svtbl_f32(m, r1));
+            s = svadd_f32_x(pg, s, svtbl_f32(m, r2)); s = svadd_f32_x(pg, s, svtbl_f32(m, r3));
+            m = svdiv_f32_x(pg, m, s);
+        }
+        svfloat32_t s = svdup_n_f32(eps);
+        s = svadd_f32_x(pg, s, svtbl_f32(m, c0)); s = svadd_f32_x(pg, s, svtbl_f32(m, c1));
+        s = svadd_f32_x(pg, s, svtbl_f32(m, c2)); s = svadd_f32_x(pg, s, svtbl_f32(m, c3));
+        m = svdiv_f32_x(pg, m, s);
+    }
+    svst1_f32(pg, comb, m);
+}
+static inline void glm53f_mhc_sinkhorn_fast(float *comb, int hc, int iters, float eps) {
+    if (hc == 4) glm53f_mhc_sinkhorn4_sve(comb, iters, eps); else glm53f_mhc_sinkhorn(comb, hc, iters, eps);
+}
+static float glm53f_mhc_pdot[128 * 32];
+static double glm53f_mhc_stamp[8]; static int glm53f_mhc_stamp_on;
+static inline void glm53f_mhc_fast2(float *streams, const float *sublayer, glm53f_mhc_scratch *scratch,
+        const glm53f_mhc_site *site, const uint16_t *norm, int do_post) {
+#pragma omp parallel
+    {
+        const int tid = omp_get_thread_num(), nt = omp_get_num_threads();
+        if (nt > 128) abort();
+        double tq0 = 0, tq1 = 0, tq2 = 0, tq3 = 0, tq4 = 0;
+        if (tid == 0) tq0 = glm53f_mhc_now();
+        const int lo = (int)((long)GLM53F_MHC_FLAT * tid / nt), hi = (int)((long)GLM53F_MHC_FLAT * (tid + 1) / nt);
+        double ss = 0.0;
+        if (do_post) {
+            for (int i = lo; i < hi; ++i) {
+                const int k = i / GLM53F_MHC_WIDTH, d = i - k * GLM53F_MHC_WIDTH;
+                double v = (double)scratch->post[k] * sublayer[d];
+                for (int j = 0; j < GLM53F_MHC_STREAMS; ++j)
+                    v += (double)scratch->combine[(size_t)j * GLM53F_MHC_STREAMS + k] *
+                         scratch->residual[(size_t)j * GLM53F_MHC_WIDTH + d];
+                streams[i] = (float)v;
+                ss += (double)streams[i] * streams[i];
+            }
+        } else {
+            for (int i = lo; i < hi; ++i) ss += (double)streams[i] * streams[i];
+        }
+        glm53f_mhc_part1[tid * 8] = ss;
+        if (tid == 0) tq1 = glm53f_mhc_now();
+        for (int m = 0; m < GLM53F_MHC_MIX; ++m)
+            glm53f_mhc_pdot[tid * 32 + m] = glm53f_mhc_dot_bf16_sve(site->fn + (size_t)m * GLM53F_MHC_FLAT + lo, streams + lo, hi - lo);
+        if (tid == 0) tq2 = glm53f_mhc_now();
+#pragma omp barrier
+        if (tid == 0) tq3 = glm53f_mhc_now();
+        double total = 0.0;
+        for (int t = 0; t < nt; ++t) total += glm53f_mhc_part1[t * 8];
+        const float inv = 1.0f / sqrtf((float)(total / GLM53F_MHC_FLAT) + 1e-5f);
+        float logits[GLM53F_MHC_MIX], post[GLM53F_MHC_STREAMS], comb[GLM53F_MHC_STREAMS * GLM53F_MHC_STREAMS];
+        for (int m = 0; m < GLM53F_MHC_MIX; ++m) {
+            float v = 0.f;
+            for (int t = 0; t < nt; ++t) v += glm53f_mhc_pdot[t * 32 + m];
+            logits[m] = v * inv;
+        }
+        for (int k = 0; k < GLM53F_MHC_STREAMS; ++k) {
+            logits[k] = glm53f_sigmoid(logits[k] * site->scale[0] + site->base[k]) + 1e-6f;
+            post[k] = 2.0f * glm53f_sigmoid(logits[GLM53F_MHC_STREAMS + k] * site->scale[1] + site->base[GLM53F_MHC_STREAMS + k]);
+        }
+        for (int m = 0; m < GLM53F_MHC_STREAMS * GLM53F_MHC_STREAMS; ++m)
+            comb[m] = logits[2 * GLM53F_MHC_STREAMS + m] * site->scale[2] + site->base[2 * GLM53F_MHC_STREAMS + m];
+        glm53f_mhc_sinkhorn(comb, GLM53F_MHC_STREAMS, 20, 1e-6f);
+        if (tid == 0) tq4 = glm53f_mhc_now();
+        if (tid == 0) {
+            for (int k = 0; k < GLM53F_MHC_STREAMS; ++k) scratch->post[k] = post[k];
+            for (int m = 0; m < GLM53F_MHC_STREAMS * GLM53F_MHC_STREAMS; ++m) scratch->combine[m] = comb[m];
+        }
+        {
+            const int lo2 = (int)((long)GLM53F_MHC_WIDTH * tid / nt), hi2 = (int)((long)GLM53F_MHC_WIDTH * (tid + 1) / nt);
+            double ss2 = 0.0;
+            for (int d = lo2; d < hi2; ++d) {
+                float value = 0.0f;
+                for (int k = 0; k < GLM53F_MHC_STREAMS; ++k) {
+                    const float sv = streams[(size_t)k * GLM53F_MHC_WIDTH + d];
+                    value += logits[k] * sv;
+                    scratch->residual[(size_t)k * GLM53F_MHC_WIDTH + d] = sv;
+                }
+                scratch->collapsed[d] = value;
+                ss2 += (double)value * value;
+            }
+            glm53f_mhc_part2[tid * 8] = ss2;
+        }
+        const double tq5 = tid == 0 ? glm53f_mhc_now() : 0.0;
+#pragma omp barrier
+        const double tq6 = tid == 0 ? glm53f_mhc_now() : 0.0;
+        {
+            const int lo2 = (int)((long)GLM53F_MHC_WIDTH * tid / nt), hi2 = (int)((long)GLM53F_MHC_WIDTH * (tid + 1) / nt);
+            double total2 = 0.0;
+            for (int t = 0; t < nt; ++t) total2 += glm53f_mhc_part2[t * 8];
+            const float inv2 = 1.0f / sqrtf((float)(total2 / GLM53F_MHC_WIDTH) + 1e-5f);
+            for (int d = lo2; d < hi2; ++d)
+                scratch->normalized[d] = scratch->collapsed[d] * inv2 * glm53f_bf16_to_f32(norm[d]);
+        }
+        if (tid == 0 && glm53f_mhc_stamp_on) {
+            const double te = glm53f_mhc_now();
+            glm53f_mhc_stamp[0] += tq1 - tq0; glm53f_mhc_stamp[1] += tq2 - tq1; glm53f_mhc_stamp[2] += tq3 - tq2; glm53f_mhc_stamp[3] += tq4 - tq3;
+            glm53f_mhc_stamp[4] += tq5 - tq4; glm53f_mhc_stamp[5] += tq6 - tq5; glm53f_mhc_stamp[6] += te - tq6; glm53f_mhc_stamp[7] += 1;
+        }
+    }
+}
+
 static inline void glm53f_mhc_pre_sve(
         glm53f_mhc_scratch *scratch, const float *streams,
         const glm53f_mhc_site *site, const uint16_t *norm) {
-    if (glm53f_mhc_fast_on()) { glm53f_mhc_fast((float *)streams, NULL, scratch, site, norm, 0); return; }
+    if (glm53f_mhc_fast_on()) { if (glm53f_mhc_fast_on() == 2) glm53f_mhc_fast2((float *)streams, NULL, scratch, site, norm, 0); else glm53f_mhc_fast((float *)streams, NULL, scratch, site, norm, 0); return; }
     double sumsq = 0.0;
     float logits[GLM53F_MHC_MIX];
 #if GLM53F_MHC_FUSED
@@ -237,7 +365,7 @@ static inline void glm53f_mhc_pre_sve(
     for (int m = 0; m < GLM53F_MHC_STREAMS * GLM53F_MHC_STREAMS; ++m)
         scratch->combine[m] = logits[2 * GLM53F_MHC_STREAMS + m] *
                               site->scale[2] + site->base[2 * GLM53F_MHC_STREAMS + m];
-    glm53f_mhc_sinkhorn(scratch->combine, GLM53F_MHC_STREAMS, 20, 1e-6f);
+    glm53f_mhc_sinkhorn_fast(scratch->combine, GLM53F_MHC_STREAMS, 20, 1e-6f);
 #if !GLM53F_MHC_FUSED
     if (dtl) t3 = glm53f_mhc_now();
 #endif
@@ -301,7 +429,7 @@ static inline void glm53f_mhc_pre_prefill_sve(
             for (int m = 0; m < GLM53F_MHC_STREAMS * GLM53F_MHC_STREAMS; ++m)
                 q->combine[m] = z[2 * GLM53F_MHC_STREAMS + m] * site->scale[2] +
                     site->base[2 * GLM53F_MHC_STREAMS + m];
-            glm53f_mhc_sinkhorn(q->combine, GLM53F_MHC_STREAMS, 20, 1e-6f);
+            glm53f_mhc_sinkhorn_fast(q->combine, GLM53F_MHC_STREAMS, 20, 1e-6f);
             for (int d = 0; d < GLM53F_MHC_WIDTH; ++d) {
                 float v = 0;
                 for (int k = 0; k < GLM53F_MHC_STREAMS; ++k)
@@ -338,7 +466,7 @@ static inline void glm53f_mhc_pre_batch_sve(
         glm53f_mhc_mv_batch4(logits + (size_t)base * GLM53F_MHC_MIX,
             site->fn, streams + (size_t)base * GLM53F_MHC_FLAT, n);
     }
-    for(int t=0;t<tokens;t++){glm53f_mhc_scratch*q=(glm53f_mhc_scratch*)((unsigned char*)scratch+(size_t)t*scratch_stride);const float*s=streams+(size_t)t*GLM53F_MHC_FLAT;float*z=logits+(size_t)t*GLM53F_MHC_MIX;for(int m=0;m<GLM53F_MHC_MIX;m++)z[m]*=inv[t];for(int k=0;k<GLM53F_MHC_STREAMS;k++){z[k]=glm53f_sigmoid(z[k]*site->scale[0]+site->base[k])+1e-6f;q->post[k]=2.0f*glm53f_sigmoid(z[GLM53F_MHC_STREAMS+k]*site->scale[1]+site->base[GLM53F_MHC_STREAMS+k]);}for(int m=0;m<GLM53F_MHC_STREAMS*GLM53F_MHC_STREAMS;m++)q->combine[m]=z[2*GLM53F_MHC_STREAMS+m]*site->scale[2]+site->base[2*GLM53F_MHC_STREAMS+m];glm53f_mhc_sinkhorn(q->combine,GLM53F_MHC_STREAMS,20,1e-6f);
+    for(int t=0;t<tokens;t++){glm53f_mhc_scratch*q=(glm53f_mhc_scratch*)((unsigned char*)scratch+(size_t)t*scratch_stride);const float*s=streams+(size_t)t*GLM53F_MHC_FLAT;float*z=logits+(size_t)t*GLM53F_MHC_MIX;for(int m=0;m<GLM53F_MHC_MIX;m++)z[m]*=inv[t];for(int k=0;k<GLM53F_MHC_STREAMS;k++){z[k]=glm53f_sigmoid(z[k]*site->scale[0]+site->base[k])+1e-6f;q->post[k]=2.0f*glm53f_sigmoid(z[GLM53F_MHC_STREAMS+k]*site->scale[1]+site->base[GLM53F_MHC_STREAMS+k]);}for(int m=0;m<GLM53F_MHC_STREAMS*GLM53F_MHC_STREAMS;m++)q->combine[m]=z[2*GLM53F_MHC_STREAMS+m]*site->scale[2]+site->base[2*GLM53F_MHC_STREAMS+m];glm53f_mhc_sinkhorn_fast(q->combine,GLM53F_MHC_STREAMS,20,1e-6f);
 #pragma omp parallel for schedule(static)
         for(int d=0;d<GLM53F_MHC_WIDTH;d++){float v=0;for(int k=0;k<GLM53F_MHC_STREAMS;k++)v+=z[k]*s[(size_t)k*GLM53F_MHC_WIDTH+d];q->collapsed[d]=v;}memcpy(q->residual,s,sizeof(q->residual));glm53f_rmsnorm_bf16(q->normalized,q->collapsed,norm,GLM53F_MHC_WIDTH,1e-5f);memcpy(normalized+(size_t)t*GLM53F_MHC_WIDTH,q->normalized,GLM53F_MHC_WIDTH*4);}
 }
@@ -372,7 +500,7 @@ static inline void glm53f_mhc_post_sve(
 static inline void glm53f_mhc_post_pre_sve(
         float *streams, const float *sublayer, glm53f_mhc_scratch *scratch,
         const glm53f_mhc_site *next_site, const uint16_t *next_norm) {
-    if (glm53f_mhc_fast_on()) { glm53f_mhc_fast(streams, sublayer, scratch, next_site, next_norm, 1); return; }
+    if (glm53f_mhc_fast_on()) { if (glm53f_mhc_fast_on() == 2) glm53f_mhc_fast2(streams, sublayer, scratch, next_site, next_norm, 1); else glm53f_mhc_fast(streams, sublayer, scratch, next_site, next_norm, 1); return; }
     double sumsq = 0.0;
     float inv = 0.0f, logits[GLM53F_MHC_MIX];
 #pragma omp parallel shared(sumsq,inv,logits)
@@ -408,7 +536,7 @@ static inline void glm53f_mhc_post_pre_sve(
             for (int m = 0; m < GLM53F_MHC_STREAMS * GLM53F_MHC_STREAMS; ++m)
                 scratch->combine[m] = logits[2 * GLM53F_MHC_STREAMS + m] *
                                       next_site->scale[2] + next_site->base[2 * GLM53F_MHC_STREAMS + m];
-            glm53f_mhc_sinkhorn(scratch->combine, GLM53F_MHC_STREAMS, 20, 1e-6f);
+            glm53f_mhc_sinkhorn_fast(scratch->combine, GLM53F_MHC_STREAMS, 20, 1e-6f);
         }
 #pragma omp for schedule(static)
         for (int d = 0; d < GLM53F_MHC_WIDTH; ++d) {

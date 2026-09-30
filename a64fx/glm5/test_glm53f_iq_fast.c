@@ -45,5 +45,22 @@ int main(void) {
         }
         free(w); free(x); free(ref); free(got);
     }
+    { /* down-projection shape: one super-block per row, 4096 rows, Q5_K */
+        const int rows = 4096, blocks = 1; const size_t rb = 176;
+        uint8_t *w = aligned_alloc(256, (size_t)rows * rb);
+        for (size_t i = 0; i < (size_t)rows * rb; ++i) w[i] = (uint8_t)rand();
+        for (int r = 0; r < rows; ++r) { _Float16 d = (_Float16)0.002f, m = (_Float16)0.001f; memcpy(w + r * rb, &d, 2); memcpy(w + r * rb + 2, &m, 2); }
+        float x[256]; for (int i = 0; i < 256; ++i) x[i] = (float)(rand() % 2001 - 1000) / 500.0f;
+        glm5_iq_q8_block xq[1]; glm5_iq_quant_q8(xq, x, 256);
+        iqf_act act[1] __attribute__((aligned(64))); iqf_prepare(act, (const iqf_src_block *)xq, 1);
+        float *ref = malloc(rows * 4), *got = malloc(rows * 4);
+        for (int r = 0; r < rows; ++r) ref[r] = iq_row(GLM53F_GGML_Q5_K, w + r * rb, xq, 1);
+        iqf_rows(got, w, rb, rows, act, 1, 1);
+        double se = 0, sr = 0; for (int r = 0; r < rows; ++r) { double d = got[r] - ref[r]; se += d * d; sr += (double)ref[r] * ref[r]; }
+        double t0 = now(); for (int it = 0; it < 50; ++it) for (int r = 0; r < rows; ++r) ref[r] = iq_row(GLM53F_GGML_Q5_K, w + r * rb, xq, 1);
+        double t1 = now(); for (int it = 0; it < 50; ++it) iqf_rows(got, w, rb, rows, act, 1, 1);
+        double t2 = now();
+        printf("down shape Q5_K 1 block/row: rel_l2=%.2e old %.1f cyc/row new %.1f cyc/row\n", sqrt(se / sr), (t1 - t0) / (50.0 * rows) * 2e9, (t2 - t1) / (50.0 * rows) * 2e9);
+    }
     return 0;
 }
