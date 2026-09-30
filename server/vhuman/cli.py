@@ -264,7 +264,8 @@ def cmd_reconstruction(args):
     req = dict(head_id=getattr(args, 'head', None), portrait=getattr(args, 'portrait', None),
                face_model=args.face_model, observations=args.observations, profile=args.profile,
                gaussians=args.gaussians, depth_installation=args.depth_installation,
-               res=args.res, iterations=args.iterations, build_rig=not args.no_rig, roughness=args.roughness, f0=args.f0)
+               res=args.res, iterations=args.iterations, build_rig=not args.no_rig, roughness=args.roughness, f0=args.f0,
+               detail_um=args.detail_um,spatial_materials=args.spatial_materials,auto_exclusions=args.auto_exclusions)
     return reconstruction_job(EyeService(Path(args.work)), req, _progress, threading.Event(),
                               python=args.rig_python, direct=getattr(args, 'portrait', None) is not None)
 
@@ -485,6 +486,9 @@ def main(argv=None) -> int:
         sp.add_argument("--depth-installation")
         sp.add_argument("--roughness", type=float, default=.55, help="artist prior, .08..1")
         sp.add_argument("--f0", type=float, default=.028, help="dielectric reflectance prior, .005...04")
+        sp.add_argument("--detail-um",type=float,default=0.,help="optional authored normal detail, 0..30 micrometres")
+        sp.add_argument("--spatial-materials",action="store_true",help="regional fit only with calibrated multi-light observations")
+        sp.add_argument("--auto-exclusions",action="store_true",help="photo/model-derived occlusion heuristic for texture baking")
         sp.add_argument("--no-rig", action="store_true")
         sp.set_defaults(fn=cmd_reconstruction)
     sp = sub.add_parser("body", help="Qwen full-body image -> SAM 3D Body -> Pixal3D -> combined avatar")

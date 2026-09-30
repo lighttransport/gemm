@@ -63,7 +63,29 @@ def complete_surface(points, normals, colors, measured, max_distance=.02):
     return out
 
 
-def bake_portrait(vertices, triangles, triangle_uvs, views, cameras, out, res=512, roughness=.55, f0=.028):
+def fuse_samples(colors,confidence):
+    """Robust linear-color fusion; suppress conflicting views without inventing data."""
+    colors,confidence=np.asarray(colors,float),np.asarray(confidence,float)
+    if colors.ndim!=3 or colors.shape[-1]!=3 or confidence.shape!=colors.shape[:2]:
+        raise ValueError('expected colors[views,samples,3] and confidence[views,samples]')
+    if not np.isfinite(colors).all() or not np.isfinite(confidence).all() or (confidence<0).any():
+        raise ValueError('invalid color/confidence samples')
+    order=np.argsort(colors,axis=0)
+    sorted_color=np.take_along_axis(colors,order,axis=0)
+    sorted_weight=np.take_along_axis(np.repeat(confidence[...,None],3,axis=2),order,axis=0)
+    cumulative=np.cumsum(sorted_weight,axis=0);half=sorted_weight.sum(0)*.5
+    index=(cumulative>=half[None]).argmax(0)
+    median=np.take_along_axis(sorted_color,index[None],axis=0)[0]
+    error=np.linalg.norm(colors-median[None],axis=2)
+    robust=confidence*np.minimum(1,.08/np.maximum(error,1e-9))
+    weight=robust.sum(0)
+    color=(colors*robust[...,None]).sum(0)/np.maximum(weight[:,None],1e-9)
+    return color,weight,dict(method='weighted median/Huber linear-color fusion',
+        conflicting_samples=int(((error>.12)&(confidence>.1)).any(0).sum()),
+        downweighted_observations=int(((robust<confidence*.8)&(confidence>.1)).sum()))
+
+
+def bake_portrait(vertices, triangles, triangle_uvs, views, cameras, out, res=512, roughness=.55, f0=.028, spatial_materials=False):
     if not .08<=roughness<=1. or not .005<=f0<=.04:
         raise ValueError("roughness must be .08..1; F0 .005...04")
     from scipy.ndimage import distance_transform_edt
@@ -83,7 +105,7 @@ def bake_portrait(vertices, triangles, triangle_uvs, views, cameras, out, res=51
     accum = np.zeros((len(p), 3))
     weight = np.zeros(len(p))
     lighting = []
-    observations, normals, directions, confidences = [], [], [], []
+    observations, normals, directions, confidences, albedos = [], [], [], [], []
     for vi, (view, cam) in enumerate(zip(views, cameras)):
         surface = vertices[vi] if vertices.ndim == 3 else vertices
         p = (surface[triangles[t]]*b[..., None]).sum(1)
@@ -118,10 +140,14 @@ def bake_portrait(vertices, triangles, triangle_uvs, views, cameras, out, res=51
         calibration=view.get("lighting")
         observations.append(srgb_to_linear(image[iy,ix,:3]/255.) / (calibration.get("exposure",1) if calibration else 1))
         normals.append(n);directions.append(viewdir);confidences.append(conf)
+        albedos.append(rgb)
         accum += rgb*conf[:,None]
         weight += conf
         lighting.append(light)
+    fused,weight,fusion=fuse_samples(np.asarray(albedos),np.asarray(confidences))
+    accum=fused*weight[:,None]
     reflectance = dict(status='artist prior',reason='calibrated multi-light observations absent')
+    spatial=None
     if len(views)>=3 and all(v.get('lighting') for v in views):
         from .reflectance import fit
         try:
@@ -130,12 +156,25 @@ def bake_portrait(vertices, triangles, triangle_uvs, views, cameras, out, res=51
             accum=fitted*weight[:,None]
         except ValueError as exc:
             reflectance=dict(status='artist prior',reason=str(exc))
+        if spatial_materials:
+            from .emily import fit_regions
+            # Fixed atlas quadrants; region fits inherit the held-out light gate.
+            regions=(xx>=res//2).astype(int)+2*(yy>=res//2).astype(int)
+            local_albedo,local_material,reports=fit_regions(np.asarray(observations),np.asarray(normals),
+                np.asarray(directions),np.asarray(confidences),[v['lighting'] for v in views],regions,roughness,f0)
+            accepted=np.array([reports[str(int(r))]['status']=='fitted global scalar' for r in regions])
+            fused=accum/np.maximum(weight[:,None],1e-9)
+            fused[accepted]=local_albedo[accepted];accum=fused*weight[:,None]
+            spatial=dict(regions=reports,accepted_samples=int(accepted.sum()),
+                         method='four UV regions; supplied calibration, held-out light improvement gate')
     measured = weight > .1
     if not measured.any():
         raise ValueError('no visible skin texels; check camera and winding')
     color = np.zeros((res,res,3), float)
-    color[yy,xx] = complete_surface(neutral_points,neutral_normals,
+    from .texture_completion import harmonic
+    completed,completion_confidence,completion_report=harmonic(neutral_points,neutral_normals,
                                   accum/np.maximum(weight[:,None],1e-9),measured)
+    color[yy,xx] = completed
     observed = np.zeros((res,res), bool)
     observed[yy[measured],xx[measured]] = True
     # UV gutter padding only. Covered hidden skin was completed in metric space.
@@ -145,21 +184,29 @@ def bake_portrait(vertices, triangles, triangle_uvs, views, cameras, out, res=51
     orm = np.tile(np.array([255,round(roughness*255),0],np.uint8),(res,res,1))
     normal = np.tile(np.array([128,128,255],np.uint8),(res,res,1))
     spec = np.full((res,res),round(f0/.04*255),np.uint8)
+    if spatial is not None:
+        orm[yy,xx,1]=np.uint8(np.clip(local_material[:,0],0,1)*255+.5)
+        spec[yy,xx]=np.uint8(np.clip(local_material[:,1]/.04,0,1)*255+.5)
+        orm[~covered]=orm[nearest[0][~covered],nearest[1][~covered]]
+        spec[~covered]=spec[nearest[0][~covered],nearest[1][~covered]]
     confidence = np.zeros((res,res),np.uint8)
     confidence[yy,xx] = np.uint8(np.clip(weight,0,1)*255)
-    for name, data in [('basecolor',base),('orm',orm),('normal',normal),('specular',spec),
+    completion_map=np.zeros((res,res),np.uint8)
+    completion_map[yy,xx]=np.uint8(completion_confidence*255+.5)
+    for name, data in [('completion_confidence',completion_map),('basecolor',base),('orm',orm),('normal',normal),('specular',spec),
                        ('coverage',observed.astype(np.uint8)*255),('confidence',confidence)]:
         Image.fromarray(data).save(out/f'skin_{name}.png')
     manifest = dict(format='vhuman.skin_material.v1', units='metres',
-                    maps={k:f'skin_{k}.png' for k in ['basecolor','orm','normal','specular','coverage','confidence']},
+                    maps={k:f'skin_{k}.png' for k in ['basecolor','orm','normal','specular','coverage','confidence','completion_confidence']},
                     semantics=dict(basecolor='sRGB albedo estimate',orm='linear R=AO G=roughness B=metallic',
                                    normal='linear tangent-space +Y',specular='linear scalar intensity; exporter packs glTF alpha, F0=.04*A',
-                                   coverage='observed only, not completed',confidence='visible fit confidence'),
-                    lighting=lighting, reflectance=reflectance,roughness=dict(value=roughness,status=reflectance['status']),
+                                   coverage='observed only, not completed',confidence='visible fit confidence',
+                                   completion_confidence='bounded completion proximity heuristic; not measured certainty'),
+                    lighting=lighting, fusion=fusion, reflectance=reflectance,spatial_reflectance=spatial,roughness=dict(value=roughness,status=reflectance['status']),
                     f0=dict(value=f0,status=reflectance['status']), sss=dict(enabled=False,radii_m=[.0012,.0006,.0003],
                     status='authored profile, not measured anatomy'),
                     observed_texels=int(observed.sum()),covered_texels=int(covered.sum()),
-                    completion=dict(method='normal-aware surface-space weighted completion to median skin',max_distance_m=.02),
+                    completion=completion_report,
                     limitations=['single-view lighting/albedo ambiguity','bounded low-detail completion; no hidden detail recovery',
                                  'pores/wrinkles are separate authored detail; no material predictor'])
     (out/'skin_material.json').write_text(json.dumps(manifest,indent=2))

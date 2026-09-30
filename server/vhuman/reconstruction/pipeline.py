@@ -82,8 +82,9 @@ def direct_seed(image, out, model):
 
 def run(folder, *, observation_file=None, profile='full', face_model='gnm_v3',
         res=512, iterations=80, build_rig=False, rig_iters=80, depth_installation=None,
-        gaussian_count=0, run_id=None, roughness=.55, f0=.028):
+        gaussian_count=0, run_id=None, roughness=.55, f0=.028, detail_um=0., spatial_materials=False, auto_exclusions=False):
     folder = Path(folder)
+    if not 0<=detail_um<=30:raise ValueError('detail must be 0..30 micrometres')
     run_id = run_id or uuid.uuid4().hex[:16]
     if not run_id.isalnum() or len(run_id)>32:
         raise ValueError('invalid reconstruction run id')
@@ -115,6 +116,19 @@ def run(folder, *, observation_file=None, profile='full', face_model='gnm_v3',
         if profile in ('geometry','full'):
             neutral,captured,cams,report = fitting.fit(src,initial,doc['views'],scale=scale,rotation=rotation,iterations=iterations,
                                                                          surface_prior=(subject.positions,subject.normals))
+        exclusions=[]
+        if auto_exclusions:
+            from .occlusion import bake_masks
+            for i,(view,cam) in enumerate(zip(doc['views'],cams)):
+                if view.get('exclusion_mask_path'):
+                    exclusions.append(dict(status='manual mask retained'));continue
+                path=staging/f'auto_exclusion_{i}.png'
+                try:
+                    exclusion=bake_masks(captured[i],src.triangles,view,cam,path)
+                    view['exclusion_mask_path']=str(path)
+                    view['exclusion_kind']='photo/model-derived heuristic; not independent annotation'
+                except ValueError as exc:exclusion=dict(status='skipped',reason=str(exc))
+                exclusions.append(exclusion)
         for i,v in enumerate(doc['views']):
             name = f'view_{i}.png'
             v['source_sha256'] = v['sha256']
@@ -166,7 +180,13 @@ def run(folder, *, observation_file=None, profile='full', face_model='gnm_v3',
             (staging/'depth.json').write_text(json.dumps(depth_report,indent=2))
         np.savez_compressed(staging/'geometry.npz',neutral=neutral,captured=captured,
                             triangles=src.triangles,triangle_uvs=src.triangle_uvs,scale=scale,rotation=rotation)
-        material = materials.bake_portrait(captured,src.triangles,src.triangle_uvs,doc['views'],cams,staging,res=res,roughness=roughness,f0=f0)
+        material = materials.bake_portrait(captured,src.triangles,src.triangle_uvs,doc['views'],cams,staging,res=res,roughness=roughness,f0=f0,spatial_materials=spatial_materials)
+        if detail_um:
+            from .detail import atlas
+            normal,detail=atlas(neutral,src.triangles,src.triangle_uvs,res,detail_um)
+            Image.fromarray(normal).save(staging/'skin_normal.png')
+            material['authored_detail']=detail
+            (staging/'skin_material.json').write_text(json.dumps(material,indent=2))
         if gaussian_count:
             from . import gaussian
             # Observed skin only; analytic eyes and mouth are never attachment sources.
@@ -181,8 +201,9 @@ def run(folder, *, observation_file=None, profile='full', face_model='gnm_v3',
                         portrait_sha256=observations.sha256(subject.portrait),
                         topology_sha256=fitting.topology_hash(src.triangles),geometry_sha256=observations.sha256(staging/'geometry.npz'),geometry=report,material=material,
                         depth=depth_report,gaussians=gaussian_count,
+                        auto_exclusions=exclusions,
                         deformation='rest geometry changed: prior compact soft deformer invalid; rebuild required',
-                        config=dict(res=res,iterations=iterations,roughness=roughness,f0=f0),seconds=round(time.perf_counter()-started,2))
+                        config=dict(res=res,iterations=iterations,roughness=roughness,f0=f0,detail_um=detail_um,spatial_materials=spatial_materials,auto_exclusions=auto_exclusions),seconds=round(time.perf_counter()-started,2))
         (staging/'manifest.json').write_text(json.dumps(manifest,indent=2))
         if build_rig:
             from ..rig.build import assemble
@@ -211,12 +232,15 @@ def main():
     ap.add_argument('--gaussians',type=int,default=0)
     ap.add_argument('--roughness',type=float,default=.55)
     ap.add_argument('--f0',type=float,default=.028)
+    ap.add_argument('--detail-um',type=float,default=0.,help='optional authored normal detail, 0..30 micrometres')
+    ap.add_argument('--spatial-materials',action='store_true',help='regional reflectance fitting only with calibrated multi-light observations')
+    ap.add_argument('--auto-exclusions',action='store_true',help='optional photo/model-derived occlusion heuristic for texture baking')
     a = ap.parse_args()
     if a.portrait:
         direct_seed(Path(a.portrait),Path(a.folder),a.face_model)
     result = run(a.folder,observation_file=a.observations,profile=a.profile,face_model=a.face_model,
                  res=a.res,iterations=a.iterations,build_rig=a.rig,depth_installation=a.depth_installation,
-                 gaussian_count=a.gaussians,run_id=a.run_id,roughness=a.roughness,f0=a.f0)
+                 gaussian_count=a.gaussians,run_id=a.run_id,roughness=a.roughness,f0=a.f0,detail_um=a.detail_um,spatial_materials=a.spatial_materials,auto_exclusions=a.auto_exclusions)
     print(json.dumps(result))
 
 if __name__=='__main__':

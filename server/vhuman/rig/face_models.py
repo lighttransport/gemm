@@ -128,8 +128,12 @@ def _obj(path: Path, *, faces: bool = True):
                 corners = [x.split("/") for x in line.split()[1:]]
                 for i in range(1, len(corners) - 1):
                     part = [corners[j] for j in (0, i, i + 1)]
-                    tri.append([int(x[0]) - 1 for x in part])
-                    tri_uv.append([int(x[1]) - 1 for x in part])
+                    vi=[int(x[0])-1 if int(x[0])>0 else len(pos)+int(x[0]) for x in part]
+                    ui=[int(x[1])-1 if int(x[1])>0 else len(uv)+int(x[1]) for x in part]
+                    if any(not 0<=j<len(pos) for j in vi) or any(not 0<=j<len(uv) for j in ui):
+                        raise ValueError('OBJ index outside defined vertices/UVs')
+                    tri.append(vi)
+                    tri_uv.append(ui)
     p = np.asarray(pos, np.float32)
     if not faces:
         return p

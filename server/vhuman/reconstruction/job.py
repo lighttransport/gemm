@@ -38,12 +38,16 @@ def reconstruction_job(service, request, progress, cancel, *, python=None, mock=
     roughness,f0 = float(request.get('roughness',.55)),float(request.get('f0',.028))
     if not .08<=roughness<=1. or not .005<=f0<=.04:
         raise ValueError('invalid roughness/F0 prior')
+    detail_um=float(request.get('detail_um',0.))
+    if not 0<=detail_um<=30:raise ValueError('detail must be 0..30 micrometres')
     count = int(request.get('gaussians',0))
     if count not in (0,2000,8000,20000):
         raise ValueError('gaussians must be 0/2000/8000/20000')
     cmd = [str(py),'-m','server.vhuman.reconstruction.pipeline',str(folder),'--run-id',run_id,
            '--profile',profile,'--face-model',model,'--res',str(res),'--iterations',str(iterations),
-           '--roughness',str(roughness),'--f0',str(f0)]
+           '--roughness',str(roughness),'--f0',str(f0),'--detail-um',str(detail_um)]
+    if request.get('spatial_materials',False):cmd.append('--spatial-materials')
+    if request.get('auto_exclusions',False):cmd.append('--auto-exclusions')
     if request.get('build_rig',True):
         cmd.append('--rig')
     for key,flag in [('observations','--observations'),('depth_installation','--depth-installation')]:

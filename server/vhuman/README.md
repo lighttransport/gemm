@@ -138,7 +138,7 @@ OPENBLAS_NUM_THREADS=4 OMP_NUM_THREADS=4 tmp/vhuman-rig-venv/bin/python \
   calibrated cameras to metres and the renderer's camera convention. Horizontal
   and vertical focal lengths and skew are preserved through resizing, material
   baking, silhouettes and evaluation. Nonzero distortion is rejected.
-- **SpeakingFaces:** fits frames 0/24/48 and evaluates disjoint frames 12/36/60;
+- **SpeakingFaces:** fits frames 0/24/48/71 and evaluates disjoint frames 12/36/60;
   exports raw holdout, training diagnostic and pose-aligned mouth reports. These
   use estimated MediaPipe annotations and assumed intrinsics/IPD. Preparation
   needs the cached GNM model; `--fit-speakingfaces` enables the bounded 50-iteration
@@ -157,7 +157,7 @@ silently used as independent segmentation annotations. The captured texture is
 appearance, not intrinsic albedo. Reference NPZ files must never be passed as
 predicted surfaces and reported as reconstruction quality.
 
-Validated run `tmp/public-dataset-eval-02` (2026-09-30): nine calibrated Multiface
+Earlier three-training-frame run `tmp/public-dataset-eval-02` (2026-09-30): nine calibrated Multiface
 views, maximum projection difference **0.0064 pixels**, maximum tracked
 OBJ/head-transform difference **0.000077 mm**; 30 affected numerical/import tests
 passed. SpeakingFaces training landmark RMS was 4.69/4.32/4.32 pixels. Raw
@@ -166,6 +166,220 @@ holdout RMS was **14.63/20.52/15.74 pixels**; pose-aligned mouth RMS was
 estimated-annotation diagnostics establish neither scan likeness nor temporal
 animation quality. All generated fixtures, fitted candidates and preview media
 are ignored local artifacts; dataset media licenses still apply.
+
+### Scan, animated holdout, material and learned-cue experiments
+
+The next quality pass adds original offline modules; none changes the runtime rig
+format or enables an experimental predictor automatically. All output paths are
+restricted to an external directory or ignored `tmp/`.
+
+```sh
+# Once: official linear EXR decoder in the existing utility environment.
+UV_CACHE_DIR=tmp/uv-download-cache uv pip install \
+  --python tmp/vhuman-rig-venv/bin/python OpenEXR==3.4.4
+
+# Requires the annotated Multiface fixture prepared above.
+OPENBLAS_NUM_THREADS=4 OMP_NUM_THREADS=4 tmp/vhuman-rig-venv/bin/python \
+  -m server.vhuman.reconstruction.scan \
+  --prepared tmp/public-dataset-evaluation/multiface --out tmp/scan-evaluation
+
+OPENBLAS_NUM_THREADS=4 OMP_NUM_THREADS=4 tmp/vhuman-rig-venv/bin/python \
+  -m server.vhuman.reconstruction.emily --root /mnt/nvme02/data/vhuman \
+  --out tmp/emily-material-evaluation
+
+tmp/vhuman-rig-venv/bin/python -m server.vhuman.reconstruction.learned_cues \
+  synthesize --out tmp/cue-training/synthetic.npz
+tmp/vhuman-rig-venv/bin/python -m server.vhuman.reconstruction.learned_cues \
+  train --dataset tmp/cue-training/synthetic.npz --out tmp/cue-training/model --steps 600
+tmp/vhuman-rig-venv/bin/python -m server.vhuman.reconstruction.learned_cues \
+  validate-real --checkpoint tmp/cue-training/model \
+  --prepared tmp/public-dataset-evaluation/multiface \
+  --candidate tmp/scan-evaluation/pca --out tmp/cue-training/real-evaluation
+
+OPENBLAS_NUM_THREADS=4 OMP_NUM_THREADS=4 tmp/vhuman-rig-venv/bin/python \
+  -m unittest server.vhuman.test_quality server.vhuman.test_dataset_preparation \
+  server.vhuman.test_reconstruction server.vhuman.test_app
+```
+
+**Scan correspondence:** fitting-camera annotation rays locate scan-surface
+anchors; cross-camera agreement gates metric similarity alignment. Cameras remain
+fixed, and simultaneous fitting views share one expression state. Dense
+correspondence stores reference triangle IDs, barycentrics and confidence.
+Normal/distance checks, a sparse Laplacian, protected landmarks, a tapered facial
+ROI and a 2 mm displacement cap control correction. Exact point-to-triangle
+distance is evaluated over fixed facial sample IDs; it is not nearest-vertex
+distance. Camera holdouts and the distinction between scan fitting and unseen
+expression evaluation are explicit. The alignment/correction frame is marked in
+each geometry result. This is research evaluation, not a released training asset.
+
+**Animated holdout:** `sequence.predict` interpolates captured training geometry
+and quaternion pose, using only target timestamps. It rejects extrapolation,
+checks topology safety and writes predicted NPZ surfaces independently of
+references. The updated SpeakingFaces preparation brackets the holdout with frame
+71 and emits `animated-held-out/report.json`. This is a deterministic interpolation
+baseline, not an audio-conditioned generator or held-out landmark optimization.
+
+**Material and texture polish:** Emily's OBJ uses negative relative indices;
+the loaders resolve them when each face is read. Skin is selected by material,
+avoiding eyes/lashes. Linear EXRs retain negative values in recorded samples;
+clipping is limited to fitting and previews. Camera-to-world/-Z projection with
+centimetre scale and forward radial/tangential distortion is checked visually.
+Coarse visibility bounds the reference processing. Regional specular/diffuse
+ratio fits use two cameras and score the third, with independently optimized
+baseline gains. The absolute flash power, exposure and polarization gains are
+unknown: these are **relative roughness diagnostics with fixed artist F0**, not
+calibrated physical F0/SSS recovery. The official
+[Emily reference source](https://vgl.ict.usc.edu/Data/DigitalEmily2/) and
+[OpenEXR decoder API](https://openexr.com/en/latest/python.html) are the references.
+
+For observations with supplied multi-light radiance/exposure calibration,
+`--spatial-materials` on `portrait-reconstruct`/`rig-refine-portrait` enables four
+UV-region GGX fits, retaining priors in rejected regions. Robust weighted-median/
+Huber linear-color fusion suppresses conflicting camera samples. Optional
+`--detail-um 5` bakes metric-space authored normal detail on the actual imported
+topology, with a common world-space field and atlas-footprint frequency limit.
+It changes neither geometry nor animation cost; it is an artist prior and does
+not recover portrait pores. Zero detail remains the default. Geometry changes
+still require the existing deformer rebuild. `--auto-exclusions` optionally
+filters projected skin samples using robust cheek chromaticity and darkness,
+preserving lip colors and estimated brow bands. It runs after geometry fitting,
+manual masks take precedence, and its derived masks are explicitly not ground
+truth. Held-out quality scoring retains its original annotations/masks.
+
+**Learned cues (v3):** the original 19,876-parameter PyTorch model predicts a bounded
+normal residual around a pose/crop-matched rendered geometry prior, plus a mask
+probability. The v3 residual is capped at 0.15 per component before normalization.
+Its 32 synthetic views contain eight independent GNM identities, our NumPy/GGX
+renderer, procedural albedo, random poses/lights, white balance, exposure, noise
+and backgrounds. Identities 0–5 train the
+model; 6–7 are held out. No real dataset images, restricted checkpoints or their
+labels enter optimization. The checkpoint uses our existing safetensors writer;
+code/model hashes, seeds, identity splits and gates are recorded. Adoption must
+beat both the pose-matched synthetic geometry prior and a frozen real scan comparison
+against rendered GNM. Predicted confidence cannot hide normal errors because the
+evaluation mask is fixed by the reference. Mask probability is not calibrated
+normal uncertainty. Learned cues remain experimental/off by default, including
+after a synthetic gate passes.
+
+First-pass quality artifacts (2026-09-30; cue v2 is a historical experiment):
+
+| Experiment | Local run | Result |
+| --- | --- | --- |
+| Fixed-camera GNM scan fit | `tmp/vhuman-quality-scan-04` | PCA RMS 4.41/4.38/4.36 mm → dense 3.76/3.72/3.95 mm; protected landmark RMS unchanged |
+| SpeakingFaces interpolation | `tmp/vhuman-quality-speech-final` | Neutral holdout RMS 14.55/20.45/15.69 px → animated 4.69/8.22/8.03 px; target annotations unused |
+| Emily relative material fit | `tmp/vhuman-quality-emily-03` | 9 linear EXRs; 3,240/3,384/2,635 visible samples; two of four regions accepted, two retain priors |
+| Synthetic residual normal predictor | `tmp/vhuman-quality-cues-02/trained` | 12.46° mean held-out error vs 16.00° mean-template baseline; 600 CPU steps |
+| Frozen real normal comparison | `tmp/vhuman-quality-cues-real-02` | Learned 38.85/38.70/37.77° vs rendered GNM 20.59/20.62/19.60°; real gate failed, predictor remains disabled |
+| Optional baking exclusions | SpeakingFaces `quality03` | Four views exclude 2,585–3,660 pixels each; robust fusion downweights 2,203 conflicting observations; masks remain heuristic |
+
+The regression command above passed all 53 tests in 60.1 seconds. Its log is
+`tmp/vhuman-quality-regressions-final.log`. Generated media, fitted assets and
+checkpoints remain outside tracked source files.
+
+These are small research pilots. Scan evaluation covers one identity and supplied
+tracked surfaces, not independent manual anatomy. Speech interpolation misses
+rapid unsampled articulation. Relative Emily fits do not establish physical
+material recovery. Synthetic improvement alone never enables learned geometry
+correction or a production training claim.
+
+### Broader evaluation and calibration pass
+
+The second pass uses frozen, training-only geometry for an unseen expression and
+adds uniform-area **bidirectional** point-to-triangle scoring. It does not align
+predictions to held-out scans or claim to predict unseen expression controls.
+Emily is prepared separately as a second subject from its undistorted linear
+cross-polarized references; preview exposure normalization is not material
+calibration. Detector annotations remain estimated. For independent landmarks
+and skin outlines, the photo-only annotation kit starts blank and excludes all
+model/detector overlays; it still requires human annotation.
+
+```sh
+tmp/vhuman-rig-venv/bin/python -m server.vhuman.reconstruction.prepare_datasets \
+  --root /mnt/nvme02/data/vhuman --out tmp/cross-expression-target \
+  --datasets multiface --expression E061_Lips_Puffed
+tmp/vhuman-rig-venv/bin/python -m server.vhuman.reconstruction.benchmark \
+  --scan tmp/vhuman-quality-scan-04 --target tmp/cross-expression-target/multiface \
+  --out tmp/cross-expression-evaluation
+tmp/vhuman-rig-venv/bin/python -m server.vhuman.reconstruction.prepare_emily \
+  --root /mnt/nvme02/data/vhuman --out tmp/emily-scan-fixture
+tmp/vhuman-rig-venv/bin/python -m server.vhuman.reconstruction.scan \
+  --prepared tmp/emily-scan-fixture --out tmp/emily-scan-evaluation
+tmp/vhuman-rig-venv/bin/python -m server.vhuman.reconstruction.annotation_review \
+  --observations tmp/cross-expression-target/multiface/held-out.json \
+  --out tmp/independent-annotations
+
+# Existing local Japanese clips only; no corpus download happens here.
+tmp/vhuman-rig-venv/bin/python -m speech.ref.run_motion_benchmark \
+  --clips tmp/reazon-motion-pilot --work tmp/vhuman-independent \
+  --head 650ac67354cd --out tmp/japanese-motion-evaluation \
+  --backend cuda --limit 12 --tts
+```
+
+The Japanese runner produces source-WAV and TTS takes with the production
+aligner, animation JSON, LightRig and USD tracks, hashes, consistency diagnostics
+and a human review CSV. ReazonSpeech has no synchronized facial ground truth:
+closure scores reuse alignment and cannot establish independent lip-sync timing
+or perceptual quality. No ratings are invented and the perceptual gate stays
+false. These previously downloaded local clips are not redistributed or added
+to the repository; no new gated dataset download is performed.
+
+**Measured materials:** `reconstruction.calibration --capture capture.json
+--out tmp/measured-lighting.json` recovers the linear RGB radiance gauge from
+measured Lambertian gray-card reflectance, card normal, light direction,
+exposure and independently estimated ambient. Supply three or more EXR views in
+`vhuman.gray_card_capture.v1`: top-level `reflectance` (RGB, 0..1) and `views`
+with `image`, `sha256`, integer `card_roi` `[x0,y0,x1,y1]`, `card_normal_h`,
+`direction_h`, `exposure` and `ambient_rgb`. ROI samples must be uniform and
+non-grazing. Copy each resulting `lighting` object to the corresponding portrait
+observation to use the existing calibrated GGX fitting gate. Measurements from a
+separate card capture must use the same illumination and exposure as the portrait.
+The RGB gauge is not absolute lamp power in watts; near-field lights need a
+position-dependent model. Ordinary Emily references lack these measurements, so
+absolute F0 remains unresolved there.
+
+`reconstruction.calibration --line-scan measurement.npz --out tmp/scattering.json`
+fits effective Gaussian RGB scattering widths from measured skin distances
+`distance_m` and background/illumination-corrected `linear_rgb`. A held-out sample
+split gates each channel; widths remain disabled by default. This approximates a
+renderer profile and does not recover tissue layers or volumetric BSSRDF.
+The narrow-light footprint must be measured/deconvolved before interpreting
+widths as skin scattering. Controlled synthetic recovery tests validate the
+implementation; no measured real capture has been supplied.
+
+**Texture completion:** surface-neighborhood harmonic completion keeps measured
+colors exact, limits edges to 4 mm and normal agreement above 0.7, and limits
+completion to 20 mm from observations. Distant regions retain a median prior.
+`skin_completion_confidence.png` labels proximity-based completion separately
+from measured `skin_coverage.png`; it is a heuristic, not recovered texture or
+uncertainty calibration. This does not improve hair/glasses segmentation itself.
+
+**Cue v3:** synthetic train/test identities remain disjoint; training never uses
+real capture media. Real inference uses the same pose-matched geometry prior as
+its baseline and a crop derived solely from the fitting ROI. Standalone `infer`
+requires `--prior` pointing to an NPZ with a unit `normals[64,64,3]` map matched
+to the RGB crop. Earlier v2 checkpoints are intentionally rejected. V3 must
+improve the stronger prior by 5%, then pass independent real-subject validation;
+passing a small pilot never enables it by default.
+
+Second-pass validation (2026-09-30):
+
+| Experiment | Local artifact | Result |
+| --- | --- | --- |
+| Unseen Multiface expression | `tmp/vhuman-cross-expression-01/report.json` | Symmetric RMS 5.24/5.56/5.29 mm → 4.65/5.20/5.03 mm; no target fitting |
+| Japanese production speech | `tmp/vhuman-japanese-motion-01/report.json` | 12 WAV + 12 TTS takes; track consistency passes; 19 source and 24 TTS aligned bilabial events reach closure ≥0.7; 8 source-WAV takes have alignment warnings; no TTS warnings |
+| Second scan subject (Emily) | `tmp/vhuman-quality-emily-scan-01/report.json` | One-way PCA 6.71 mm → dense 6.15 mm; landmarks remain 11.98 px; bidirectional 13.05 → 12.68 mm fails the stronger 5% gate; estimated anchors, neutral scan pilot |
+| Surface texture completion | `tmp/vhuman-quality-texture-02/skin_material.json` | 23,616 measured texels retained, 8,456 nearby samples completed; evidence coverage unchanged; measured albedo pixels identical; held-out appearance diagnostic 0.09350/0.09414/0.08471 → 0.09343/0.09409/0.08463 |
+| Cue v3 synthetic | `tmp/vhuman-quality-cues-03/trained/report.json` | 9.35° vs pose-matched prior 9.57°; fails the 5% gate |
+| Cue v3 real, fixed fitting ROI crop | `tmp/vhuman-quality-cues-real-04/report.json` | Learned 21.42/21.40/19.05° vs prior 21.82/21.79/19.07°; mask IoU 0.69–0.71; real gate fails, stays disabled |
+
+The API/speech regression run passed all 67 affected tests in
+110.8 seconds (`tmp/vhuman-quality-round2-regressions.log`). After the final
+normal-compatibility safeguard, all 47 numerical/dataset/reconstruction tests
+passed in 4.1 seconds (`tmp/vhuman-quality-round2-final-numerical.log`).
+Compile and diff checks also passed. Primary sources for
+capture conventions and missing measurement context are the
+[Multiface release](https://github.com/facebookresearch/multiface) and
+[Digital Emily 2 release](https://vgl.ict.usc.edu/Data/DigitalEmily2/).
 
 See the [implementation record and setup](../../doc/vhuman-face-reconstruction-adoption-plan.md)
 for API uploads/jobs, observation semantics, model pins and validation limits.

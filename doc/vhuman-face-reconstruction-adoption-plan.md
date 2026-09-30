@@ -263,12 +263,22 @@ viseme/control demonstration, not an audio-driven public speech evaluation.
 Screenshots and browser recordings belong under ignored `tmp/reconstruction-browser`.
 There is no public clip, model weight, or generated screenshot committed here.
 
-Remaining quality work: dense anatomical correspondence, concave silhouette and
-occlusion segmentation, scan/multi-view quality evaluation, spatially varying
-calibrated reflectance, authored pore/detail integration on imported topologies,
-and physical-device mobile performance measurements. Single-photo hidden regions
-are conservative completion; no claim of scan-level geometry or recovered hidden
-texture is made. No new dense predictor or Gaussian generator training was added.
+The subsequent dataset quality pass adds scan correspondence and calibrated
+camera holdouts, training-only animated interpolation, linear Emily processing,
+regional reflectance fits, robust texture fusion, authored metric normal detail,
+and a compact synthetic normal-predictor training experiment. See the quality
+commands and recorded numerical results in `server/vhuman/README.md`.
+
+Remaining quality work includes reviewed anatomical correspondence across more
+identities, automatic occlusion segmentation, measured flash power/exposure for
+absolute Emily F0/SSS recovery, realistic authored pore maps, physical-device
+mobile measurements, and real-domain acceptance of learned cues. The initial
+synthetic model lost to a mean-template baseline; its revised residual model
+improves synthetic normal error from 16.00 to 12.46 degrees but still loses to
+rendered GNM on the real scan pilot. It remains disabled for geometry refinement.
+Single-photo hidden regions remain conservative completion, with no recovered
+hidden-detail claim. No Gaussian generator or learned material completion was
+trained; the optional training work is the normal/mask predictor only.
 
 
 ## Decisions and first deliverable
@@ -558,3 +568,34 @@ code, weights, datasets, example assets, and output provenance independently.
 Synthetic fixtures may be generated reproducibly in tests without bundling
 model weights. This documentation step installs no new dependencies and
 performs no reconstruction, training, or device benchmark.
+
+
+## Second quality pass: implemented and gated (2026-09-30)
+
+- Frozen correction is evaluated on the separate Multiface Lips Puffed expression
+  with uniform-area bidirectional surface distance and no target fitting/ICP.
+  Emily now supplies a separate neutral scan subject; both remain research-only
+  local validation assets and use explicitly estimated detector/ray anchors.
+- A photo-only landmark/skin-outline annotation kit excludes source annotations
+  and all fitted overlays. Independent human labels are still pending; exporting
+  the kit does not establish manual ground truth.
+- Production Japanese evaluation runs 12 local source WAVs and 12 TTS versions
+  through the installed aligner and rig exporter. Consistency passes, while eight
+  source takes flag alignment warnings. ReazonSpeech has no face ground truth;
+  human review remains necessary and its perceptual gate is false.
+- Original gray-card calibration recovers a measured linear RGB irradiance gauge;
+  original spatial line-spread fitting estimates effective RGB scattering widths.
+  Controlled synthetic recovery tests pass. Real gray-card/light-footprint
+  measurements are absent, so Emily absolute F0 and tissue SSS remain unresolved.
+  No exposure or light-power values are invented.
+- Surface-neighborhood harmonic texture completion preserves measured pixels,
+  restricts metric distance/normal compatibility, and exports a separate completion
+  confidence map. Human/learned hair and glasses segmentation remains future work.
+- Cue v3 takes a fitting-only pose/crop-matched rendered geometry prior, bounds
+  residuals, and randomizes synthetic illumination/colors/noise/backgrounds. It
+  fails the stronger synthetic and real gates, so remains disabled. There is no
+  real-capture training or runtime adoption based on this experiment.
+
+See [the vhuman README](../server/vhuman/README.md#broader-evaluation-and-calibration-pass)
+for commands, exact local reports, measured input schemas, and test results.
+No new gated corpus is downloaded; generated media/checkpoints stay outside Git.

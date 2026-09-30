@@ -69,7 +69,8 @@ head height or move the model's sockets. This is a neutral initialization.
     return p, float(scale), rotation, np.zeros(0)
 
 
-def fit(source, initial, views, *, scale=1., rotation=None, max_modes=24, iterations=80, surface_prior=None):
+def fit(source, initial, views, *, scale=1., rotation=None, max_modes=24, iterations=80, surface_prior=None,
+        freeze_pose=False, expression_groups=None):
     from scipy.optimize import least_squares
     from scipy.spatial.transform import Rotation
     from scipy.spatial import cKDTree
@@ -87,6 +88,9 @@ def fit(source, initial, views, *, scale=1., rotation=None, max_modes=24, iterat
     expression_modes = np.zeros(0, int) if expr is None else np.argsort(-np.mean(expr**2, axis=(1,2)))[:12]
     eb = np.zeros((0, len(initial), 3)) if expr is None else scale*expr[expression_modes] @ rotation.T
     ni, ne, nv = len(ib), len(eb), len(views)
+    groups=list(range(nv)) if expression_groups is None else list(expression_groups)
+    if len(groups)!=nv:raise ValueError('expression group count mismatch')
+    unique=list(dict.fromkeys(groups));group_index=[unique.index(g) for g in groups];ng=len(unique)
     cams = [Camera.from_dict(v['camera']) for v in views]
     from .correspondence import attachments, occlusion_weight
     anatomical = attachments(source)
@@ -110,13 +114,13 @@ def fit(source, initial, views, *, scale=1., rotation=None, max_modes=24, iterat
     eye_guard = np.linalg.norm(initial,axis=1)<0  # no implicit anatomical guess
     if source.eye_centers is not None:
         # Initial model eye centres have already been transformed to H's origin.
-        eye_h = scale*(source.eye_centers-source.eye_centers.mean(0))@rotation.T
+        eye_h = np.array([initial[anatomical[name]].mean(0) for name in ('eye_right','eye_left')]) if all(name in anatomical for name in ('eye_right','eye_left')) else scale*(source.eye_centers-source.eye_centers.mean(0))@rotation.T
         eye_guard = np.min(np.linalg.norm(initial[:,None]-eye_h[None],axis=2),axis=1)<.022
     # Pose translation and expression are independent per view; shared identity.
-    count = ni + nv*(6+ne)
+    count = ni + ng*(6+ne)
     x = np.zeros(count)
     def split(x, j):
-        off = ni+j*(6+ne)
+        off = ni+group_index[j]*(6+ne)
         return x[:ni], x[off:off+3], x[off+6:off+6+ne], x[off+3:off+6]
     def neutral(x):
         return initial + np.einsum('i,ivc->vc', x[:ni], ib)
@@ -156,24 +160,29 @@ def fit(source, initial, views, *, scale=1., rotation=None, max_modes=24, iterat
         residual.extend(((p[sample]-initial[sample])*50).reshape(-1))
         return np.asarray(residual)
     lo, hi = np.full(count, -2.), np.full(count, 2.)
-    for j in range(nv):
+    for j in range(ng):
         off = ni+j*(6+ne)
         lo[off:off+3], hi[off:off+3] = -.03, .03
         lo[off+3:off+6], hi[off+3:off+6] = -.8, .8
         if authored:
             lo[off+6:off+6+ne],hi[off+6:off+6+ne] = 0,1
     # Camera/pose first, then shared identity and expression.
-    pose_ids = np.array([ni+j*(6+ne)+k for j in range(nv) for k in range(6)], int)
+    pose_ids = np.array([ni+j*(6+ne)+k for j in range(ng) for k in range(6)], int)
     def pose_fun(y):
         xx = x.copy()
         xx[pose_ids] = y
         return objective(xx)
-    pose = least_squares(pose_fun, x[pose_ids], bounds=(lo[pose_ids], hi[pose_ids]),
-                         loss='soft_l1', max_nfev=iterations)
-    x[pose_ids] = pose.x
+    if not freeze_pose:
+        pose = least_squares(pose_fun, x[pose_ids], bounds=(lo[pose_ids], hi[pose_ids]),
+                             loss='soft_l1', max_nfev=iterations)
+        x[pose_ids] = pose.x
     before = float(np.mean(objective(np.zeros(count))**2))
-    solve = least_squares(objective, x, bounds=(lo, hi), loss='soft_l1', max_nfev=iterations)
-    x = solve.x
+    active=np.setdiff1d(np.arange(count),pose_ids) if freeze_pose else np.arange(count)
+    if not len(active):raise ValueError('no free shape parameters with fixed pose')
+    def active_objective(parameters):
+        full=x.copy();full[active]=parameters;return objective(full)
+    solve = least_squares(active_objective, x[active], bounds=(lo[active], hi[active]), loss='soft_l1', max_nfev=iterations)
+    x[active] = solve.x
     candidate = neutral(x)
     factor = 1.
     while not safe_geometry(initial, candidate, source.triangles) and factor > 1/128:
@@ -211,6 +220,8 @@ def fit(source, initial, views, *, scale=1., rotation=None, max_modes=24, iterat
                   expression_modes=expression_modes.tolist(), expression_steps=expression_steps,
                   expression_labels=[expression_names[i] for i in expression_modes] if expression_names else None,
                   pose_rotations=[split(x,j)[3].tolist() for j in range(nv)],
+                  pose_translations=[split(x,j)[1].tolist() for j in range(nv)],
+                  pose_calibration='fixed' if freeze_pose else 'estimated nuisance pose',expression_groups=groups,
                   anchors=[{a[0]: a[1].tolist() for a in v} for v in anchors], safe_step=factor,
                   correspondence='topology-pinned anatomy with explicit annotation overrides' if anatomical else 'provisional projected nearest vertex',
                   silhouettes=['mask distance field' if s is not None else 'convex support or absent' for s in silhouettes],

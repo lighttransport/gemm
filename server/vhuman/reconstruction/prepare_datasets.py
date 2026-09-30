@@ -157,7 +157,7 @@ def speakingfaces(root,out,fit=False):
     provenance=json.loads((source/'download_manifest.json').read_text())
     provenance.update(annotations='MediaPipe estimates, not manual ground truth',
                       calibration='assumed intrinsics/IPD; monocular smoke evaluation')
-    for split,indices in [('fit',[0,24,48]),('held-out',[12,36,60])]:
+    for split,indices in [('fit',[0,24,48,71]),('held-out',[12,36,60])]:
         views=[]
         for i in indices:
             view=observations.observe(source/'frames'/f'{i:05d}.png',camera)['views'][0]
@@ -171,8 +171,12 @@ def speakingfaces(root,out,fit=False):
         evaluate(candidate,out/'fit.json',out/'training-diagnostic',allow_training=True)
         raw=evaluate(candidate,out/'held-out.json',out/'held-out')
         aligned=evaluate(candidate,out/'held-out.json',out/'pose-aligned-diagnostic',pose_align=True)
+        from .sequence import predict
+        prediction=predict(candidate,np.array([12,36,60])/28,out/'predicted_surfaces.npz')
+        animated=evaluate(candidate,out/'held-out.json',out/'animated-held-out',surfaces=out/'predicted_surfaces.npz')
         result.update(status='evaluated',heldout_rms_px=[v['landmarks']['rms_px'] for v in raw['views']],
-                      aligned_mouth_rms_px=[v['pose_alignment_diagnostic'].get('expression_landmarks',{}).get('rms_px') for v in aligned['views']])
+                      aligned_mouth_rms_px=[v['pose_alignment_diagnostic'].get('expression_landmarks',{}).get('rms_px') for v in aligned['views']],
+                      animated_rms_px=[v['landmarks']['rms_px'] for v in animated['views']],prediction=prediction)
     write_json(out/'report.json',result)
     return result
 
