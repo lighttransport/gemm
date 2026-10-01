@@ -236,7 +236,8 @@ def refine(tmpl: T.Template, subj, pos: np.ndarray, fixed: np.ndarray, skin: np.
     import torch
     from scipy.spatial import cKDTree
     from .common import edges as edge_list
-    dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    from ..runtime import torch_device
+    dev = torch.device(device if device is not None else torch_device(torch))
     tris = tmpl.tris[tmpl.tri_mat == 0]
     E = edge_list(tris)
     L0 = _template_edge_lengths(tmpl, pos, E)
@@ -257,10 +258,12 @@ def refine(tmpl: T.Template, subj, pos: np.ndarray, fixed: np.ndarray, skin: np.
     # uniform Laplacian (bending): neighbours' mean
     n = len(pos)
     deg = np.bincount(E.reshape(-1), minlength=n).astype(np.float64)
+    degt = torch.tensor(deg, device=dev).clamp(min=1)[:, None]
     opt = torch.optim.Adam([var], lr=3e-4)
     w_plane, w_point, w_edge, w_bend = 1.0, 0.05, 0.3, 0.05
     q = n_ = None
-    stats = {"device": str(dev), "iters": iters}
+    actual_backend = "cpu" if dev.type == "cpu" else ("rocm" if torch.version.hip else "cuda")
+    stats = {"backend": actual_backend, "device": str(dev), "iters": iters}
     for it in range(iters):
         if it % 25 == 0:
             with torch.no_grad():
@@ -291,7 +294,6 @@ def refine(tmpl: T.Template, subj, pos: np.ndarray, fixed: np.ndarray, skin: np.
         acc = torch.zeros_like(X)
         acc.index_add_(0, Et[:, 0], X[Et[:, 1]])
         acc.index_add_(0, Et[:, 1], X[Et[:, 0]])
-        degt = torch.tensor(deg, device=dev).clamp(min=1)[:, None]
         lap = acc / degt - X
         e_bend = (lap[idx] ** 2).sum(1).mean()
         loss = (w_plane * e_plane + w_point * e_point + w_edge * e_edge + w_bend * e_bend) * 1e6

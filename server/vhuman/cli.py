@@ -15,9 +15,9 @@
     python3 -m server.vhuman.cli baseline --source analytic|qwen [--quality preview]
     python3 -m server.vhuman.cli bench
 
-Every command prints a JSON summary on stdout. GPU commands take the CUDA
-lock shared with the Pixal3D demo server and need --qwen-python (default
-tmp/qimg21-ref-venv/bin/python) for Qwen-Image.
+Every command prints a JSON summary on stdout. GPU commands take the backend/
+device lock shared with the Pixal3D demo server. Use --backend rocm --device 0
+for AMD; the installed ROCm interpreter is selected automatically for Qwen-Image.
 """
 from __future__ import annotations
 

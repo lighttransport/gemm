@@ -67,12 +67,19 @@ Select ROCm in the standalone Qwen page. Its default GPU is device 0.
 | SAM 3 | Full text-prompted segmentation, including CLIP tokenization and mask export |
 | SAM 3D Body | DINOv3 + decoder, GLB and decoded MHR sidecar export |
 | Body assembly/motion | ROCm PyTorch MHR pose/identity decoding; portable assembly/export |
-| Facial rig | ROCm registration, expression fitting and ML deformer training |
+| Facial rig | Registration, shape smoothing, expression fitting and ML training on the configured ROCm device |
 | Deformer playback | Native HIP blendshapes, skinning, ML and contact kernels; existing browser rendering |
 | Speech | Native HIP Qwen3-TTS and Japanese wav2vec2 alignment |
 | Video/soft-deformer fitting | Selected ROCm PyTorch device; CPU observation/geometry and LightGeom teacher retained |
 | Portrait depth | ROCm PyTorch with the verified Depth Anything V2 Small checkpoint |
 | Speech emotion | Native SenseVoice Q8 through ggml HIP, with explicit backend/device arguments |
+
+Registration and shape smoothing honor `--backend` and `--device`, including
+explicit CPU execution on a ROCm host. Registration reports the actual backend
+and PyTorch device. An unavailable GPU ordinal reports the detected device count;
+ROCm smoothing requires a working matching PyTorch interpreter. CPU smoothing
+retains its NumPy fallback. Sparse adjacency is checked before multiplication,
+and registration uploads its constant degree tensor once instead of each iteration.
 
 NVFP4 remains CUDA-only and is rejected on ROCm. The historical
 `--int8-gemm cutlass` spelling selects the HIP WMMA plugin on ROCm; the CUDA
@@ -164,7 +171,7 @@ export LD_LIBRARY_PATH="/opt/rocm/core/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 tmp/vhuman-rocm-venv/bin/python -B rdna4/qimg21/test_fast_plugins.py
 make -C cpu/pixal3d test
 tmp/vhuman-rocm-venv/bin/python -B -m unittest \
- server.vhuman.test_runtime server.vhuman.test_app server.vhuman.test_rig \
+ server.vhuman.test_runtime server.vhuman.test_app server.vhuman.test_rig server.vhuman.test_rig_backend \
  server.vhuman.test_speech server.vhuman.test_reconstruction \
  server.vhuman.body.test_body server.vhuman.body.test_motion \
  server.qwen_image21.test_app server.qwen_image21.test_form server.pixal3d.test_app
@@ -177,6 +184,10 @@ round-trip checks. The dedicated studio suite passed another 10 tests. Dataset
 tests need scratch storage with at least 4 GiB free because the downloader
 enforces that reserve. Local HTTP/socket tests and GPU validation require access
 outside a restricted sandbox.
+
+After the rig device-policy polish, 59 affected workflow tests and all 22 rig
+integration tests passed. The small CPU/RDNA4 comparison preserves fixed vertices
+and agrees within 1e-9 m for registration and 1e-12 m for smoothed shape deltas.
 
 All three browser tests pass with offscreen X11 rendering under Xvfb: the eye
 editor, generated head viewer, and skin diffusion composition. The test harness

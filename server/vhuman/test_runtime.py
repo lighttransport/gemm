@@ -3,9 +3,29 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from unittest.mock import Mock
+from types import SimpleNamespace
 from . import gpu, runtime
 
 class RuntimeTest(unittest.TestCase):
+    def test_torch_rocm_uses_configured_ordinal_and_rejects_missing_device(self):
+        cuda = SimpleNamespace(is_available=lambda: True, device_count=lambda: 2, set_device=Mock())
+        torch = SimpleNamespace(cuda=cuda, version=SimpleNamespace(hip="7.14"))
+        with gpu.execution('rocm', 1):
+            self.assertEqual(runtime.torch_device(torch), 'cuda:1')
+        cuda.set_device.assert_called_once_with(1)
+        cuda.set_device.reset_mock()
+        with gpu.execution('rocm', 2), self.assertRaisesRegex(RuntimeError, 'rocm device 2 unavailable'):
+            runtime.torch_device(torch)
+        cuda.set_device.assert_not_called()
+
+    def test_torch_wrong_build_fails_before_device_selection(self):
+        cuda = SimpleNamespace(is_available=lambda: True, set_device=Mock())
+        torch = SimpleNamespace(cuda=cuda, version=SimpleNamespace(hip=None))
+        with gpu.execution('rocm'), self.assertRaisesRegex(RuntimeError, 'wrong PyTorch build for rocm'):
+            runtime.torch_device(torch)
+        cuda.set_device.assert_not_called()
+
     def test_rocm_interpreter_defaults_and_explicit_override(self):
         from argparse import Namespace
         args = Namespace(inference_backend='rocm', device=1, models_root='/mnt/disk1/models',

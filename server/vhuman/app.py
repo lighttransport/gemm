@@ -5,7 +5,7 @@
 
 CPU endpoints answer synchronously (procedural textures take well under a
 second and are cached); GPU work (Qwen iris plates, the Pixal3D baseline)
-runs as jobs on one worker, under the CUDA device lock shared with the
+runs as jobs on one worker, under the backend/device lock shared with the
 Pixal3D demo server.
 
     GET  /                          the page (web/vhuman_eye.html)

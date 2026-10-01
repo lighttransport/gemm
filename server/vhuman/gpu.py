@@ -126,7 +126,7 @@ def file_lock(path: Path, timeout: float, cancel: threading.Event | None = None)
 @contextmanager
 def device_session(min_free_mib: int, cancel: threading.Event | None = None, timeout: float = 900.0,
                    lock_path: Path = LOCK_PATH, check_memory: bool = True):
-    """Hold the shared CUDA lock and require `min_free_mib` free."""
+    """Hold the shared backend/device lock and require `min_free_mib` free."""
     if lock_path == LOCK_PATH:
         lock_path = LOCK_PATH.parent / f"{backend()}-{device_index()}.lock"
     with file_lock(lock_path, timeout, cancel):

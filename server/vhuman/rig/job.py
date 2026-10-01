@@ -1,6 +1,6 @@
 """The rig as a server job: run rig/build.py in the rig interpreter (numpy,
 scipy, PyTorch) as a subprocess, relay its progress, honour cancellation.
-The registration uses CUDA when present, under the shared device lock."""
+Registration uses the configured CPU/CUDA/ROCm device under the shared lock."""
 from __future__ import annotations
 
 import json
@@ -73,7 +73,7 @@ def rig_job(service, request: dict, progress, cancel, python=None, mock: bool = 
         progress(0.01, "waiting for the GPU")
         lock = (service.work / "mock-gpu.lock") if mock else gpu.LOCK_PATH
         tail = []
-        # PyTorch falls back to the CPU without a CUDA device; then only the lock is taken
+        # Auto selection uses CPU when no GPU is detected; explicit GPU requests stay strict.
         check = not mock and gpu.gpu_status() is not None
         with gpu.device_session(MIN_FREE_MIB, cancel, lock_path=lock, check_memory=check):
             env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")

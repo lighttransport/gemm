@@ -47,8 +47,12 @@ def torch_device(torch):
         raise RuntimeError(f"{selected} PyTorch device unavailable")
     if bool(torch.version.hip) != (selected == "rocm"):
         raise RuntimeError(f"wrong PyTorch build for {selected}; select the matching interpreter")
-    torch.cuda.set_device(gpu.device_index())
-    return f"cuda:{gpu.device_index()}"
+    device = gpu.device_index()
+    count = torch.cuda.device_count()
+    if device >= count:
+        raise RuntimeError(f"{selected} device {device} unavailable; detected {count} device(s)")
+    torch.cuda.set_device(device)
+    return f"cuda:{device}"
 
 def main():
     import argparse, runpy, sys, os
