@@ -1,6 +1,6 @@
 # Resume: GLM53F Strata-inspired optimization, 12 A64FX nodes
 
-Updated 2026-10-02 00:19 JST. Implementation is experimental and opt-in.
+Updated 2026-10-02 00:36 JST. Implementation is experimental and opt-in.
 Targets: complete 45-layer UD-Q4_K_XL/top-8, saved ~8K single request,
 100+ delivered decode tokens/s and 2000+ prefill tokens/s. Neither target
 has been demonstrated. See `a64fx/glm5/GLM53F_STRATA.md` for code map,
@@ -47,8 +47,8 @@ Staging PID 719 and initial campaign PID 8758 have exited.
   `GLM53F_SPARSE_FUSE_FRONT=0` for the exact gates. Baseline sparse reference:
   `rel_l2=0 rollback_rel_l2=0`; batched MLA `rel_l2=7.55019511e-05`, rollback 0,
   below the explicit 2e-4 tolerance. Baseline target batch/prefill also PASS.
-- Continuation PID **11370**, `tmp/glm53f-strata-campaign-v11.sh`,
-  log `tmp/campaign-strata-v11.log`. Started at 00:18 after both gates; restores
+- Previous continuation PID **11370** (exited after persistent trials at owner stress initialization),, `tmp/glm53f-strata-campaign-v11.sh`,
+  log `tmp/campaign-strata-v11.log`. Started at 00:18 after both gates; restored
   production projection defaults before frozen resident 8K trials;
   full-state executor comparison; persistent 8K;
   300-iteration mixed MPI/uTofu owner stress; overlap 8K; adaptive lookup
@@ -57,6 +57,14 @@ Staging PID 719 and initial campaign PID 8758 have exited.
   Outputs `tmp/strata-v10b/`. Every throughput comparison uses one warm trial
   and three timed trials, 256 transitions and strict generated-ID checks.
   `set -e` stops at first failure. Never launch competing MPI work.
+- Current continuation PID **12978**, `tmp/glm53f-strata-campaign-v12.sh`,
+  log `tmp/campaign-strata-v12.log`. Rebuilt diagnostic stress executable
+  `a64fx/glm5/build/bench_glm53f_async_reduce_v11` with an initial OpenMP
+  team region. The first stress invocation failed because Fujitsu had not
+  yet bound the master; affinity probe confirms broad mask before the first
+  region and singleton mask afterward. Corrected stress 300 iterations PASS.
+  Now running overlap 8K, then remaining lookup/index/MLA/pages/panel/MTP.
+  No inference binary was changed for this diagnostic correction.
 - Earlier waiting campaigns v5/v6/v7/v8/v9/v10 were canceled before MPI started.
   Never modify a running build script or source while its compiler reads it.
 
@@ -99,8 +107,15 @@ source fingerprints matched before the MTP completion/report addition.
 
 Baseline/candidate component and full-model batch/prefill gates PASS.
 The candidate gate includes every accepted-prefix continuation. Native
-twelve-rank lookup controller also PASS. Full-state executor, owner stress,
-throughput and MTP results are **pending**.
+twelve-rank lookup controller also PASS. Full-state executor (32 saved
+positions) has zero hidden bit mismatches and bit-exact complete state.
+Owner stress 300 iterations PASS after team initialization correction.
+
+Frozen baseline medians: **29.989745 decode / 303.243600 prefill tok/s**.
+Persistent/fused medians: **30.764120 / 303.341836** (+2.58% decode, same
+prefill), all 257 generated IDs match. Below promotion threshold and targets.
+Reports/logs/IDs retrieved into the evidence directory. Remaining overlap,
+lookup, index, MLA, page/panel and MTP results are **pending**.
 Do not promote defaults or claim the target from kernel timings. Verify all
 accepted-prefix states, generated-ID comparisons and sampled memory before
 interpreting the campaign. PP3×TP4 is approved for evaluation if TP12 remains

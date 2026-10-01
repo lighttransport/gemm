@@ -22,6 +22,14 @@ int main(int argc, char **argv) {
     memset(junk, 0, (size_t)jt * 4096 * 4);
     const int owner = getenv("GLM53F_COMM_OWNER") && atoi(getenv("GLM53F_COMM_OWNER"));
     int gathered[12];
+    /* Fujitsu binds the master on the first OpenMP region, rather than at
+     * process startup. Establish that binding before the helper inherits it;
+     * model prefill already executes compute regions before async_begin. */
+    int workers = 0;
+#pragma omp parallel reduction(+:workers)
+    workers += 1;
+    if (workers != omp_get_max_threads()) MPI_Abort(MPI_COMM_WORLD, 2);
+    if (!rank) printf("ASYNC_STRESS_TEAM threads=%d\n", workers);
     volatile double sink = 0;
     for (int it = 0; it < iters; ++it) {
         const float base = (float)(rank + 1) + (it % 5);

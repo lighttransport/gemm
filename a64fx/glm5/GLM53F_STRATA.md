@@ -123,6 +123,8 @@ Native A64FX measurements, job 52068253, normal 2 GHz, compact 2×3×2:
 | Eight-head sparse index, 8193 synthetic pool entries | Bit-exact PASS; 47 threads 0.374730 → 0.143590 ms (2.610×); 48 threads 0.366679 → 0.138360 ms (2.650×) |
 | Register MLA absorbed query, six heads | Bit-exact PASS at 1/12/47/48 threads in fast and conservative builds; 47 threads 15.439987 → 8.599758 µs (1.795×), conservative 1.785× |
 | Warm persistent team, internal timer, 4000 jobs/repeat | 12 threads 1.576126 µs/job; 47 threads 4.595131; 48 threads 4.694641 |
+| Full-state executor, 32 saved prompt positions | Hidden outputs and complete attention state bit-exact PASS with persistent/fused/index/MLA paths |
+| Serialized MPI/uTofu owner stress | 300 iterations PASS, 515-token ragged slab stream, interleaved MPI sum/byte gather/uTofu sum |
 | Launcher contracts | 16 local tests PASS |
 | Strict resident MTP reporting | Six local tests PASS, including incomplete/reference/token/accounting failures |
 | Lookup rejection/rollback controller | 28 cases PASS with a local serial MPI shim and native twelve-rank MPI |
@@ -137,8 +139,24 @@ projection accumulation. The initial frozen baseline check failed with
 projection GEMM enabled; this was also present before the Strata changes.
 The launcher now prints the actual sparse log from inside its subshell.
 
-Full-state executor, mixed-transport stress, resident 8K throughput and MTP
-depth sweep are running serially after staging completed at 00:07 JST.
+Staging completed at 00:07 JST. Full-state executor and mixed-transport
+stress gates PASS. The stress test initializes its OpenMP compute team
+before creating the helper: Fujitsu establishes master affinity on the
+first parallel region. Before that, the helper correctly refuses to guess
+a spare core from a broad CPU mask.
+
+Completed resident 8K results (8049 prompt IDs, 256 decode transitions,
+one warm trial plus three timed trials, 47 threads):
+
+| Path | Decode median (min–max), tok/s | Prefill median (min–max), tok/s | Baseline IDs |
+| --- | --- | --- | --- |
+| Frozen a90f7972 | 29.989745 (29.853840–29.994162) | 303.243600 (302.496074–303.640411) | Reference |
+| Persistent executor + fused router | 30.764120 (30.440834–30.774790) | 303.341836 (302.805230–303.411221) | All 257 identical |
+
+Persistent/fused decode improves 2.58%, below the 5% promotion threshold;
+prefill is unchanged. Minimum memory headroom is above 10.9 GiB. Neither
+target is met. Overlap, lookup, index, register MLA, page/panel controls and
+the MTP depth sweep remain pending in the serial continuation.
 Historical full-run rates were roughly 29–30 decode tokens/s and 285–301
 prefill tokens/s at 8K. Those are earlier measurements, not candidate results.
 
