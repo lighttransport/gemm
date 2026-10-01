@@ -13,6 +13,7 @@ static inline int glm53f_runtime_option(int argc, char **argv, int *index) {
     else if (!strcmp(key, "--collective-owner")) env = "GLM53F_COMM_OWNER";
     else if (!strcmp(key, "--moe-combine-kernel")) env = "GLM53F_MOE_COMBINE";
     else if (!strcmp(key, "--index-kernel")) env = "GLM53F_INDEX_HEADS";
+    else if (!strcmp(key, "--mla-kernel")) env = "GLM53F_MLA_REGISTERS";
     else return 0;
     if (*index + 1 >= argc) return -1;
     const char *value = argv[++*index];
@@ -23,6 +24,7 @@ static inline int glm53f_runtime_option(int argc, char **argv, int *index) {
              (!strcmp(key, "--router-kernel") && !strcmp(value, "fused")) ||
              (!strcmp(key, "--moe-combine-kernel") && !strcmp(value, "vector")) ||
              (!strcmp(key, "--index-kernel") && !strcmp(value, "heads")) ||
+             (!strcmp(key, "--mla-kernel") && !strcmp(value, "registers")) ||
              (!strcmp(key, "--decode-executor") && !strcmp(value, "persistent"))) enabled = 1;
     else if (!strcmp(key, "--moe-combine-kernel") && !strcmp(value, "overlap")) enabled = 2;
     else return -1;

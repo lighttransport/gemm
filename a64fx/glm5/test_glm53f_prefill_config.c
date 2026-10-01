@@ -45,6 +45,9 @@ int main(void) {
     failed |= parse("--index-kernel", "heads", &c) != 1 || strcmp(getenv("GLM53F_INDEX_HEADS"), "1");
     failed |= parse("--index-kernel", "legacy", &c) != 1 || strcmp(getenv("GLM53F_INDEX_HEADS"), "0");
     failed |= parse("--index-kernel", "invalid", &c) != -1;
+    failed |= parse("--mla-kernel", "registers", &c) != 1 || strcmp(getenv("GLM53F_MLA_REGISTERS"), "1");
+    failed |= parse("--mla-kernel", "legacy", &c) != 1 || strcmp(getenv("GLM53F_MLA_REGISTERS"), "0");
+    failed |= parse("--mla-kernel", "invalid", &c) != -1;
     printf("PREFILL_CONFIG %s\n", failed ? "FAIL" : "PASS");
     return failed;
 }

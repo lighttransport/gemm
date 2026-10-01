@@ -11,6 +11,7 @@
 #include "glm53f_prefill.h"
 #include "glm53f_prefill_gemm.h"
 #include "glm53f_mla_prefill.h"
+#include "glm53f_mla_absorb.h"
 #include "glm53f_moe_grouped_native.h"
 #include "glm53f_q80_panel64.h"
 #include "glm53f_state_io.h"
@@ -489,7 +490,7 @@ static void ensure_mla_shards(glm53f_sparse_context_12n*c){if(c->mla_ql)return;s
  * phases are work-shared by one team; every output element keeps the serial
  * accumulation order (j for ql, t for va), so results match the former
  * single-threaded loop. */
-struct mla_value_call { glm53f_sparse_context_12n *c; float *out; const float *q, *z; const int *selected; int nt, bad; };
+struct mla_value_call { glm53f_sparse_context_12n *c; float *out; const float *q, *z; const int *selected; int nt, bad, registers; };
 static void mla_value_worker(void *context) {
     struct mla_value_call *a = context;
     glm53f_sparse_context_12n *c = a->c;
@@ -508,6 +509,10 @@ static void mla_value_worker(void *context) {
             const int h=w/NDC,d0=(w%NDC)*DC;
             const uint16_t*wk=c->kvb+(size_t)h*(KD+VD)*LAT;
             float*o=ql+(size_t)h*LAT;
+            if (a->registers) {
+                glm53f_mla_absorb64(o, wk, q + (size_t)h * KD, d0);
+                continue;
+            }
             for(int d=d0;d<d0+DC;d++)o[d]=0.0f;
             for(int j=0;j<KD;j++){float x=q[(size_t)h*KD+j]/sqrtf((float)KD);
                 for(int d=d0;d<d0+DC;d+=vl){svbool_t p=svwhilelt_b32(d,LAT);
@@ -565,7 +570,9 @@ static int mla_heads_q8_value(glm53f_sparse_context_12n*c,float*out,
         c->q8v_act=a256((size_t)hn*c->q8v_act_bytes);
     }
     int bad=0;
-    struct mla_value_call call = {c, out, q, z, selected, nt, 0};
+    const char *registers = getenv("GLM53F_MLA_REGISTERS");
+    struct mla_value_call call = {c, out, q, z, selected, nt, 0,
+        registers && atoi(registers) && svcntw() == 16};
     if (glm53f_team_available()) glm53f_team_dispatch(mla_value_worker, &call);
     else {
 #pragma omp parallel

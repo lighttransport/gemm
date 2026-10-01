@@ -64,6 +64,7 @@ int main(int argc, char **argv) {
     setenv("GLM53F_MHC_FAST", "1", 1);
     setenv("GLM53F_ROUTER_FUSE", "0", 1);
     setenv("GLM53F_INDEX_HEADS", "0", 1);
+    setenv("GLM53F_MLA_REGISTERS", "0", 1);
     glm53f_target_model_12n *m = glm53f_target_model_create_12n(argv[1], argv[2], argv[3], count + 1);
     glm53f_target_snapshot_12n *initial = m ? glm53f_target_snapshot_create_12n(m) : NULL;
     float *hidden = malloc((size_t)count * H * sizeof(float));
@@ -75,6 +76,7 @@ int main(int argc, char **argv) {
         glm53f_target_trace_open_12n(m, argv[5], 1)) MPI_Abort(MPI_COMM_WORLD, 2);
     setenv("GLM53F_ROUTER_FUSE", "1", 1);
     setenv("GLM53F_INDEX_HEADS", "1", 1);
+    setenv("GLM53F_MLA_REGISTERS", "1", 1);
     struct check_call call = {m, input, token, hidden, logit, count, 0, 0, 0, 0};
     glm53f_team_run(persistent_control, &call);
     call.failed |= glm53f_target_trace_close_12n(m) != 0;

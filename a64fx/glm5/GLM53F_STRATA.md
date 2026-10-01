@@ -18,6 +18,7 @@ The implementations here are independent; no Strata source was copied.
 | Suffix drafting and measured policy | `glm53f_lookup_spec_12n.c`: depth 1–4 suffix proposals, target verification, prefix rollback, bonus/correction token, and fallback based on elapsed time per delivered token |
 | Bounded communication ownership | `glm53f_collective_12n.c`: optional serialized owner for mixed MPI/uTofu requests while draining published prefill slabs |
 | Reuse across independent heads | Sparse index scores reuse key vectors across eight independent head accumulators, retaining each head's reduction order |
+| Keep intermediate accumulators in registers | Native MLA absorbed-query projection uses four SVE accumulators per 64-column tile instead of repeatedly updating scratch |
 
 Persistent decode outlines mHC, projections, KDA, sparse attention, dense FFN,
 routed/shared experts and the vocabulary head into reusable team callbacks.
@@ -36,6 +37,7 @@ available for reference. CLI switches:
 --collective-owner legacy|serialized
 --moe-combine-kernel legacy|vector|overlap
 --index-kernel legacy|heads
+--mla-kernel legacy|registers
 ```
 
 MTP retains its legacy executor and rejects `--decode-executor persistent`.
@@ -119,6 +121,7 @@ Native A64FX measurements, job 52068253, normal 2 GHz, compact 2×3×2:
 | Conservative builds of expert/mHC tests | Same thread/mode checks PASS without fast-math |
 | Vector MoE combine, all 256 route masks and 63-row ragged tiles | Bit-exact PASS at 1, 12, 47 and 48 threads |
 | Eight-head sparse index, 8193 synthetic pool entries | Bit-exact PASS; 47 threads 0.374730 → 0.143590 ms (2.610×); 48 threads 0.366679 → 0.138360 ms (2.650×) |
+| Register MLA absorbed query, six heads | Bit-exact PASS at 1/12/47/48 threads in fast and conservative builds; 47 threads 15.439987 → 8.599758 µs (1.795×), conservative 1.785× |
 | Warm persistent team, internal timer, 4000 jobs/repeat | 12 threads 1.576126 µs/job; 47 threads 4.595131; 48 threads 4.694641 |
 | Launcher contracts | 16 local tests PASS |
 | Strict resident MTP reporting | Six local tests PASS, including incomplete/reference/token/accounting failures |
@@ -129,6 +132,12 @@ Full-model state, every-prefix rollback, mixed-transport stress, resident
 8K throughput and MTP depth sweep are queued after model staging.
 Historical full-run rates were roughly 29–30 decode tokens/s and 285–301
 prefill tokens/s at 8K. Those are earlier measurements, not candidate results.
+
+The queue also compares `XOS_MMM_L_HPAGE_TYPE=none` with the original page
+policy, then the existing `GLM53F_NATIVE_Q8_PANEL=1` path with the row layout
+under that same page policy. The panel can change floating-point reduction
+order; promotion still requires identical generated IDs and no material
+prefill regression. These controls are separate from the register MLA kernel.
 
 ## Remaining architecture decision
 

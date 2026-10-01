@@ -97,7 +97,7 @@ class LauncherTest(unittest.TestCase):
         names = ['glm53f_target_decode_12n', 'tofu_topo_helper', 'glm53f_core_stage',
                  'glm53f_core_add_routers', 'glm53f_decode_stage']
         names += ['test_glm53f_' + kind for kind in ('kquant', 'native_batch', 'prefill_config', 'state_io',
-                                                    'team', 'mhc_team', 'iq_grouped', 'lookup', 'lookup_spec', 'moe_combine', 'index_heads')]
+                                                    'team', 'mhc_team', 'iq_grouped', 'lookup', 'lookup_spec', 'moe_combine', 'index_heads', 'mla_absorb')]
         names += ['bench_glm53f_run_12n']
         names += ['glm53f_' + kind for kind in ('kda_callback_check', 'dense_batch_check', 'sparse_batch_check',
                                                'target_batch_check_12n', 'executor_check_12n', 'spec_decode_12n')]
