@@ -2,6 +2,7 @@
 import hashlib
 import io
 import json
+import os
 import shutil
 from pathlib import Path
 import tarfile
@@ -12,7 +13,8 @@ import zipfile
 from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 from .reconstruction import download_datasets as d
 
-ROOT=Path(__file__).resolve().parents[2]/'tmp/test-dataset-download'
+ROOT=Path(os.environ.get('VHUMAN_DATASET_TEST_ROOT',
+    str(Path(__file__).resolve().parents[2]/'tmp/test-dataset-download'))).absolute()
 ROOT.mkdir(parents=True,exist_ok=True)
 
 

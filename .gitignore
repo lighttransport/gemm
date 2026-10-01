@@ -256,6 +256,9 @@ cuda/llm/scan/deltanet_chunk_test
 
 # Vulkan CMake build directories (regenerate via cmake)
 vulkan/build/
+vulkan/vhuman/vh_deform.spv.inc
+vulkan/vhuman/vh_contacts.spv.inc
+vulkan/vhuman/bench_vhuman_deformer_vk
 vulkan/build_t2/
 cuda/pixal3d/build-windows/
 cuda/pixal3d/build-wsl/

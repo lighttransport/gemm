@@ -150,6 +150,10 @@ Artifacts and exact runner output are in `tmp/rocm-validation/`.
 - Independent BF16/INT8 GEMM and rectangular/masked attention checks pass.
   INT8 matches its reference exactly, including tails. Sage max error <0.073
   against F32 attention in these fixtures.
+- Vulkan deformer on RX 9070 XT (RADV GFX1201), 32 frames: maximum CPU
+  difference 1.49e-8 m for linear/ML deformation and 1.39e-5 m with contacts.
+  A separate NumPy contact-reference check passed on seven sampled poses, with
+  no eye, sphere, or lip penetrations above the existing 0.05 mm criterion.
 
 Verification commands:
 
@@ -166,14 +170,13 @@ tmp/vhuman-rocm-venv/bin/python -B -m unittest \
  server.qwen_image21.test_app server.qwen_image21.test_form server.pixal3d.test_app
 ```
 
-The initial regression run passed 178 tests (12 optional tests skipped); the
-dedicated studio suite passed another 10 tests. After installing the optional
-modules, 45 focused emotion/speech/runtime/reconstruction tests passed, followed
-by 163 non-browser regressions (four optional tests skipped). The eight dataset
-download tests also passed independently (one gated dataset skipped). Dataset tests
-need scratch storage with at least 4 GiB free because the downloader enforces
-that reserve. Local HTTP/socket tests and GPU validation require access outside
-a restricted sandbox.
+The finalized combined validation command ran 188 tests in 692.6 seconds:
+187 passed and only the optional aria2c download test skipped. This includes
+browser rendering, native HIP/Vulkan parity, checked triangulation, and OpenEXR
+round-trip checks. The dedicated studio suite passed another 10 tests. Dataset
+tests need scratch storage with at least 4 GiB free because the downloader
+enforces that reserve. Local HTTP/socket tests and GPU validation require access
+outside a restricted sandbox.
 
 All three browser tests pass with offscreen X11 rendering under Xvfb: the eye
 editor, generated head viewer, and skin diffusion composition. The test harness
@@ -188,11 +191,45 @@ Plain headless Chromium still fails to create a WebGL context on this host
 (`BindToCurrentSequence failed`); use the Xvfb command above for browser checks.
 
 The rig integration suite also passed 22 tests with the ROCm interpreter
-explicitly selected (one Vulkan test skipped because glslc is unavailable).
+explicitly selected, including the native HIP and Vulkan deformer checks.
 The native Python GPU wrapper selects the HIP library on ROCm; its 19-frame
 deformer test passed CPU parity at 2e-6 tolerance, including batch tile tails.
 
 ```sh
-VHUMAN_RIG_PYTHON="$PWD/tmp/vhuman-rocm-venv/bin/python" \
+PATH="$PWD/tmp/vhuman-tools/bin:$PATH" \
+ VHUMAN_RIG_PYTHON="$PWD/tmp/vhuman-rocm-venv/bin/python" \
  tmp/vhuman-rocm-venv/bin/python -B -m unittest server.vhuman.test_rig -v
 ```
+
+### Reproducing validation dependencies
+
+After the ROCm and optional-model setup, build the local shader compiler and
+install the pinned checked-triangulation and OpenEXR dependencies with:
+
+```sh
+sh server/vhuman/setup_validation.sh
+sh server/vhuman/setup_validation.sh --run
+```
+
+`--run` runs the combined virtual-human suite, exports the local compiler on
+PATH, selects the ROCm rig interpreter, and launches Chromium under Xvfb. It
+requires `xvfb-run`, `xauth`, Chromium, a C++ compiler, Git, CMake, Ninja, and uv.
+On Ubuntu, the system prerequisites can be installed with:
+
+```sh
+sudo apt-get install build-essential git cmake ninja-build xvfb xauth chromium-browser aria2
+```
+
+The compiler setup builds [Shaderc v2026.3](https://github.com/google/shaderc/tree/2c8cae778eec0283b44acbe7ed1a386865d78799)
+at an immutable commit, with the exact glslang, SPIRV-Headers, and SPIRV-Tools
+revisions from its release DEPS. It avoids a system installation and builds only
+the glslc target. Sources, build files, binary checksum, and revision metadata
+stay under `tmp/vhuman-tools`; repeat runs reuse the verified checkouts/build.
+The standalone command is `python3 vulkan/tools/setup_glslc.py --jobs 4`.
+
+For a small root filesystem, use `--tools-root /mnt/disk1/vhuman-validation-tools`
+or symlink `tmp/vhuman-tools` onto disk1 before setup. The combined command puts
+dataset downloader test scratch under the tools directory, which needs 4 GiB
+free (override with `VHUMAN_DATASET_TEST_ROOT`). `aria2c` enables the remaining
+optional parallel-download test; actual
+restricted dataset downloads still require approved access and a manifest.
