@@ -1,125 +1,164 @@
 # Resume: GLM53F Strata-inspired optimization, 12 A64FX nodes
 
-Updated 2026-10-02 00:36 JST. Implementation is experimental and opt-in.
-Targets: complete 45-layer UD-Q4_K_XL/top-8, saved ~8K single request,
-100+ delivered decode tokens/s and 2000+ prefill tokens/s. Neither target
-has been demonstrated. See `a64fx/glm5/GLM53F_STRATA.md` for code map,
-validated kernel results, flags and exact measurement commands.
+Updated 2026-10-02 02:23 JST. TP12 implementation, native validation and
+short/8K/synthetic 32K qualification complete. All new paths remain opt-in.
+Targets: complete 45-layer UD-Q4_K_XL/top-8, saved ~8K single
+request, 100+ delivered decode and 2000+ prefill tok/s. Neither target met.
+See `a64fx/glm5/GLM53F_STRATA.md` for implementation, gates and commands.
 
-## Live allocation and isolated deployment
+## Allocation and isolated deployment
 
-- PJM job **52068253**, twelve nodes, compact 2×3×2, normal 2 GHz, eco 0,
-  six-hour allocation started about 20:40 JST; compute node `d26-2014c`.
-- SSH endpoint `fugaku1`, login1 account u14346.
-- Isolated snapshot `$HOME/work/gemm/glm53f-strata-20261001`.
-  Leave the original remote `$HOME/work/gemm/glm53f` checkout untouched.
-- Local tmux session `glm53f-strata`; bridge state and helper in
-  `tmp/bash-http-glm53f-strata/`. Local HTTP port 42446 → reverse port
-  32446 → compute port 21264. Helper reads a Bash program from stdin:
-  `python3 tmp/bash-http-glm53f-strata/remote.py`.
-- Four-node job 52067029 belongs to other work; leave it alone.
+- PJM **52068253**, 12 nodes, compact 2×3×2, normal 2 GHz, eco 0; six hours
+  from about 20:40 JST October 1 to 02:40 JST October 2. Node `d26-2014c`.
+- SSH `fugaku1`, login1 u14346. Isolated remote snapshot
+  `$HOME/work/gemm/glm53f-strata-20261001`; preserve original `~/work/gemm/glm53f`.
+- Local tmux `glm53f-strata`. Bridge state/helper:
+  `tmp/bash-http-glm53f-strata/remote.py`, stdin Bash, 50-second timeout
+  does not terminate a remote command. HTTP 42446 → reverse 32446 → 21264.
+  Use nohup for long jobs and never overlap MPI launches.
+- Job 52067029 belongs to other work; leave it alone. No `/tmp` use.
+- Staging finished 00:07 JST: `SENTINEL glm53f_stage_12n=OK`.
+  Allocation-local routed weights `/local/glm53f-q4-routed-52068253`,
+  native `/local/glm53f-q4-native-52068253-{core,shared,dense,sparse,kda,shexp}`,
+  embed/head `/local/glm53f-q4-{embed,head}-52068253`.
+  MTP staged `/local/glm53f-mtp-{routed,shared}-52068253`.
+  All `/local` stages disappear after allocation restart; stage boundedly.
 
-## Running jobs
+## Completed queue
 
-Staging completed at 00:07 JST: `SENTINEL glm53f_stage_12n=OK`.
-All routed and native stages are now available in `/local` on this allocation.
-Staging PID 719 and initial campaign PID 8758 have exited.
+No builds, staging or inference MPI jobs remain running in this campaign.
+The allocation/bridge may remain live until about 02:40 JST.
 
-- Full candidate-v7 build PID **6483** completed PASS, `tmp/build-strata-v7.log`.
-  Objects `/local/glm53f-strata-v7-52068253`, shared binaries
-  `a64fx/glm5/build/candidate-v7`.
-- Timer-safe incremental candidate-v8 build PID **6572** completed PASS,
-  `tmp/build-strata-v8.log`, script `tmp/glm53f-strata-build-v8.sh`.
-  It waited for v7, then extracted its archive and compiled changed files.
-  Objects `/local/glm53f-strata-v8-52068253`, shared binaries
-  `a64fx/glm5/build/candidate-v8`. Unchanged tools symlink to v7.
-- Candidate-v9 MTP completion/report build PID **7842** completed PASS,
-  `tmp/build-strata-v9.log`. Core binaries symlink to v8; MTP main is relinked
-  with a final completion record. Binaries `a64fx/glm5/build/candidate-v9`.
-- Candidate-v10 MLA integration build PID **8274** completed PASS,
-  `tmp/build-strata-v10.log`. Objects `/local/glm53f-strata-v10-52068253`,
-  binaries `a64fx/glm5/build/candidate-v10`; unchanged tools symlink to v9.
-- Exact-gate rerun PID **10730**, `tmp/glm53f-strata-exact-gates-v11.sh`,
-  log `tmp/exact-gates-v11.log`. Baseline and candidate PASS at 00:18.
-  The initial frozen baseline and candidate checks both failed the sparse
-  boundary test because projection GEMM was enabled while comparing against
-  scalar decode. Rerun pins `GLM53F_SPARSE_GEMM=0` and
-  `GLM53F_SPARSE_FUSE_FRONT=0` for the exact gates. Baseline sparse reference:
-  `rel_l2=0 rollback_rel_l2=0`; batched MLA `rel_l2=7.55019511e-05`, rollback 0,
-  below the explicit 2e-4 tolerance. Baseline target batch/prefill also PASS.
-- Previous continuation PID **11370** (exited after persistent trials at owner stress initialization),, `tmp/glm53f-strata-campaign-v11.sh`,
-  log `tmp/campaign-strata-v11.log`. Started at 00:18 after both gates; restored
-  production projection defaults before frozen resident 8K trials;
-  full-state executor comparison; persistent 8K;
-  300-iteration mixed MPI/uTofu owner stress; overlap 8K; adaptive lookup
-  depths 1–4; index/vector-combine 8K; register MLA 8K; controlled huge-page
-  and Q8 panel comparisons; MTP staging and resident depths 1–4.
-  Outputs `tmp/strata-v10b/`. Every throughput comparison uses one warm trial
-  and three timed trials, 256 transitions and strict generated-ID checks.
-  `set -e` stops at first failure. Never launch competing MPI work.
-- Current continuation PID **12978**, `tmp/glm53f-strata-campaign-v12.sh`,
-  log `tmp/campaign-strata-v12.log`. Rebuilt diagnostic stress executable
-  `a64fx/glm5/build/bench_glm53f_async_reduce_v11` with an initial OpenMP
-  team region. The first stress invocation failed because Fujitsu had not
-  yet bound the master; affinity probe confirms broad mask before the first
-  region and singleton mask afterward. Corrected stress 300 iterations PASS.
-  Now running overlap 8K, then remaining lookup/index/MLA/pages/panel/MTP.
-  No inference binary was changed for this diagnostic correction.
-- Earlier waiting campaigns v5/v6/v7/v8/v9/v10 were canceled before MPI started.
-  Never modify a running build script or source while its compiler reads it.
+- Final hardware controls v17 PID15784 **PASS**: sparse+pages and 48-thread
+  baselines/candidates. All candidate IDs match, including 47 vs 48 threads.
+- Final synthetic 32196-position qualification v19 PID16787 **PASS**, log
+  `tmp/qualification-32k-v19.log`. All three trials plus warmup finish, all
+  257 IDs match frozen baseline. Median baseline 27.747994 decode / 265.965590
+  prefill; candidate 31.450699 / 287.156697 (+13.34% / +7.97%). Minimum
+  headroom baseline 10656768 KiB, candidate 10699520 KiB, both above 10 GiB.
+  Outputs `tmp/strata-v10b/repeated32k-{baseline,candidate}-v19.*`, report
+  `repeated32k-v19.json`. Report recomputed locally byte-identical.
+- Initial v16 32K attempt failed beyond 16K because packed index-score
+  reduction exceeded the fixed 131072-float benchmark reservation. Commit
+  **071fdcf3** sizes it to max(131072,32*floor(prompt/4)); same harness fix
+  applied to frozen and candidate kernels. No relaxed correctness gate.
+- v18 build **PASS**, objects `/local/glm53f-strata-v18-52068253`, bins
+  `a64fx/glm5/build/{baseline,candidate}-v18`. Baseline uses frozen a90
+  objects plus scalar-loop compatibility `baseline_sequence.c`; lookup off.
+  Candidate retains v15 objects. Build script `tmp/glm53f-strata-32k-v18.sh`;
+  fresh run script `tmp/glm53f-strata-32k-v19.sh`. New dirs initially missed
+  `tofu_topo_helper`; symlinks supplied before v19, which completed PASS.
+- Previous campaigns/build/stage PIDs exited. Never overwrite running
+  compiler sources/scripts or existing exclusive outputs. Use fresh tags.
 
-## Frozen reference and archives
+## Source and binary provenance
 
-Baseline source revision **a90f7972**. Frozen binaries
-`a64fx/glm5/build/baseline`, objects `/local/glm53f-build-52068253`.
-Frozen original check script `a64fx/glm5/run_glm53f_baseline_check.sh`.
+Base **a90f7972**, frozen bins `a64fx/glm5/build/baseline`, objects
+`/local/glm53f-build-52068253`. Original checker is
+`a64fx/glm5/run_glm53f_baseline_check.sh`. Code commits:
 
-Local archive SHA256:
+- **86fd586f** persistent executor, grouped experts, fused router, serialized
+  communication owner, lookup controller, native kernels and resident harness.
+- **58e3539e** strict complete MTP reference validation.
+- **ba6a2140** register MLA absorbed query.
+- **d3644d79** exact sparse gate isolates projection GEMM and reports real logs.
+- **f9992c7b** owner stress initializes OpenMP before helper affinity selection.
+- **a70a9994** reporter reads actual `.greedy` reference suffix.
+- **bfcf404e** sparse owner preserves original index uTofu reduction order;
+  adds direct regular-vs-async exact boundary check.
+- **174945d3** recurring 16-cycle lookup cost checks and late-cost regression.
+- **071fdcf3** prompt-sized collective reservation and prefill failure context.
 
-- Baseline `tmp/glm53f-strata-base.tar`:
+Object sets: full v7 `/local/glm53f-strata-v7-52068253`; timer-safe target,
+head and lookup v8; v9 MTP completion; v10 MLA; v14 sparse/collective owner
+correction; v15 lookup policy. Latest general bins `candidate-v15` symlink
+unchanged v14/v10/v9/v8/v7 tools. Native build warnings are existing unused
+static helpers. Final audit checks 422 tracked code/script files; all match
+after refreshing the single stale reporter test (runtime source already
+matched). Strata studied locally at `~/work/Strata`,
+`glm53f` revision e486a95, independent implementation, no source copied.
+
+Archives SHA256:
+- `tmp/glm53f-strata-base.tar`:
   `d9940e19d7324cbd26ef1357b3a9760c0f113dea23cc327bc8ff41d387968168`.
-- Full v7 `tmp/glm53f-strata-v7.tar`:
+- `tmp/glm53f-strata-v7.tar`:
   `cc0fbcb4f2ec2a1dbe41d54a1b5ac6bf13dfe7e03a4d64d463a5fc2b13c05f7a`.
-- Incremental v8 `tmp/glm53f-strata-v8-timers.tar`:
+- `tmp/glm53f-strata-v8-timers.tar`:
   `02322782e6542a320c952950597d767cb5d1dfd8f20ceff31bf66068e9bf3381`.
-  Includes target/head/lookup/benchmark/prefill/spec timers and the
-  fast-math-safe finite checks in the executor diagnostic.
 
-Saved remote prompt `tmp/prompt8k.ids`: **8049 IDs**. Historical prefill
-reported 8048 positions because it excluded the final scalar position;
-new resident benchmark includes all 8049 and the final vocabulary head.
-Also `tmp/prompt4k.ids`. Short and derived 32K qualification remain pending.
+## Validated results
 
-## Evidence and outstanding work
+Saved fixture `tmp/prompt8k.ids` has **8049 IDs**. Benchmark counts all
+positions and final head; older prefill reports counted 8048. All throughput
+comparisons have one warm + three timed trials, rank-max elapsed, 256 decode
+transitions / 257 output IDs, sampled memory guards and strict completeness.
+Primary 47-thread results (decode / prefill median tok/s):
 
-Retrieved native test logs live locally in
-`tmp/glm53f-strata-evidence-20261001/`. Persistent expert/mHC tests pass
-bit-exact at 1/12/47/48 threads in fast and conservative builds. Vector MoE
-combine passes all 256 route masks and ragged tails. Sparse index microbench
-passes bit-exact and is ~2.6× faster at 47/48 threads. Warm pool dispatch
-is ~4.6 µs/job at 47 threads, measured internally, excluding ELF startup.
-Local launcher 16 tests, strict MTP reporter six tests, and lookup controller
-28 mock-state cases pass. Register MLA projection is bit-exact at
-1/12/47/48 threads in fast/conservative builds, ~1.8× at 47 threads.
-Implementation commit **86fd586f**, strict MTP report commit **58e3539e**,
-register MLA commit **ba6a2140**; all 311 deployed
-source fingerprints matched before the MTP completion/report addition.
+| Configuration | Decode | Prefill | Exact IDs |
+| --- | --- | --- | --- |
+| Frozen a90 | 29.989745 | 303.243600 | Reference |
+| Persistent/fused | 30.764120 | 303.341836 | PASS |
+| Above + index heads/vector combine | 30.713757 | 321.368333 | PASS |
+| Above + register MLA | 30.894098 | 318.750066 | PASS |
+| Above + page type none | **33.066761** | **327.644514** | PASS |
+| Corrected sparse-only async, original pages | 30.879418 | 325.856357 | PASS |
+| Corrected sparse-only async, pages none | 32.826162 | 335.438950 | PASS |
 
-Baseline/candidate component and full-model batch/prefill gates PASS.
-The candidate gate includes every accepted-prefix continuation. Native
-twelve-rank lookup controller also PASS. Full-state executor (32 saved
-positions) has zero hidden bit mismatches and bit-exact complete state.
-Owner stress 300 iterations PASS after team initialization correction.
+Best balanced 47-thread candidate improves frozen decode 10.26%, prefill
+8.05%; retains row-Q8 layout, no MoE/sparse async. Owner setting was serialized
+in its 8K trial but never active (no async begin). Short/32K use owner off.
+Sparse+pages is below incremental promotion threshold. 48-thread baseline
+with pages none: 31.326396 / 302.705849; candidate 33.402963 / 317.928989,
+exact, +6.63%/+5.03%. Compared with 47-thread candidate, +1.02% decode but
+-2.97% prefill, so keep 47 for qualification. Prefill trial variation is larger
+at 48 threads (300.170450–320.935217).
 
-Frozen baseline medians: **29.989745 decode / 303.243600 prefill tok/s**.
-Persistent/fused medians: **30.764120 / 303.341836** (+2.58% decode, same
-prefill), all 257 generated IDs match. Below promotion threshold and targets.
-Reports/logs/IDs retrieved into the evidence directory. Remaining overlap,
-lookup, index, MLA, page/panel and MTP results are **pending**.
-Do not promote defaults or claim the target from kernel timings. Verify all
-accepted-prefix states, generated-ID comparisons and sampled memory before
-interpreting the campaign. PP3×TP4 is approved for evaluation if TP12 remains
-insufficient, but is not implemented; it needs new TP4 stage images,
-stage-local communicators, explicit layer ranges and four-stream handoffs.
+128-ID short fixture: baseline 36.575832 / 267.477754; candidate
+40.431636 / 282.637846, all 257 IDs exact, +10.54%/+5.67%.
 
-No push is authorized. Preserve unrelated untracked q38fn and tmp artifacts.
+Lookup depths 1–4 original medians: 30.305971, 30.247893, 29.430768, 26.709574,
+all exact; no promotion. Revised recurring-cost depth 4 **30.549583**, exact,
+14.38% faster than old depth 4, below plain. Unit 29 PASS locally and 12 ranks;
+old policy fails delayed-cost regression.
+
+MTP complete 128-cycle/depth 1–4 sweep passes every delivered token against
+its own scalar-prefill plain reference: 768 tokens at 30.685 tok/s. Medians
+28.988085, 26.196257, 22.001181, 17.897930; delivered 352, 403, 419, 419/trial.
+Acceptance 96/128, 147/256, 163/384, 163/512. Scalar MTP prefill and resident
+batched prefill have different greedy streams (first difference prediction 14);
+MTP exactness does not claim the batched baseline stream. No MTP speedup.
+MTP min headroom 10.3 GiB; resident 8K above 10.9 GiB.
+
+Rejected: combined sparse/MoE overlap diverges at ID 18 (1852/198); Q8 panel 1
+at ID 6 (61102/563). Never promote their throughput. Original sparse async
+MPI detour changes reduction order; fixed owner retains uTofu, full 8K exact.
+MoE overlap still replaces whole-chunk MPI with slabs and remains excluded.
+
+Native gates: team/expert/mHC/vector/index/MLA exact at 1/12/47/48 threads,
+fast and conservative where relevant. Index kernel ~2.6×; MLA query ~1.8×;
+these are not whole-model rates. Full-state 32 positions hidden bit mismatches 0,
+complete KDA/sparse state BIT_EXACT. Every-prefix verification continuation
+PASS. Sparse layer 3 warm 2046 tokens 32: reference error 0, batched MLA rel-L2
+7.55019511e-05 < 2e-4, rollback 0. Exact gate pins projection GEMM / fused front 0;
+the original baseline also fails with projection GEMM 1. New direct native
+regular-vs-owner async check rel-L2=0 / rollback 0. Mixed MPI/uToFu owner stress 300
+PASS after first-team affinity initialization. Local launcher 16 / report 6 PASS.
+
+## Evidence and next architecture work
+
+Local `tmp/glm53f-strata-evidence-20261001/` holds reports, rank-0 logs,
+metadata hashes and IDs; remote `tmp/strata-v10b/` holds complete campaign.
+Final 32K report/logs/IDs/scripts are retrieved. Committed aggregate:
+`a64fx/glm5/strata-validation-20261002.json`. Use strict reporting, never
+acceptance alone. Review `GLM53F_STRATA.md` for exact commands.
+
+Best 8K rank-0 phase profile: decode ~29.8 ms summed local phases, attention 15.7
+(KDA 6.27 / sparse 9.44), mHC 5.73, FFN 7.89; end-to-end rank maximum ~30.2 ms.
+Prefill ~3.07 ms/position, attention 1.60 (sparse 1.11), FFN 1.17, mHC 0.247.
+100/2000 require a larger architecture/kernel change than pool overhead.
+PP3×TP4 is approved for evaluation if TP12 remains insufficient, but is not
+implemented/qualified. Needs TP4 stage images, layer ownership, stage-local
+collectives, four-stream handoffs and full-state exact gates. Single dependent
+decode latency includes every stage; do not assume 3× pipeline speedup.
+
+No push authorized. Preserve unrelated untracked q38fn and tmp artifacts.

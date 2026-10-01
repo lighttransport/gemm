@@ -1,6 +1,6 @@
 # Strata-inspired GLM53F optimization: implementation and validation
 
-Updated 2026-10-01. Targets are **100 delivered decode tokens/s and 2000
+Updated 2026-10-02. Targets are **100 delivered decode tokens/s and 2000
 prefill tokens/s**, on twelve A64FX nodes, the complete 45-layer
 UD-Q4_K_XL model, top-8 routing, and the saved roughly 8K coding prompt.
 These targets have **not been demonstrated** by the changes below.
@@ -60,12 +60,16 @@ bash a64fx/glm5/run_glm53f_12n.sh check
 bash a64fx/glm5/run_glm53f_12n.sh executor-check tmp/prompt8k.ids 32
 
 # Use the frozen baseline GLM53F_BIN_DIR for the first command.
+unset XOS_MMM_L_HPAGE_TYPE
 bash a64fx/glm5/run_glm53f_12n.sh benchmark tmp/prompt8k.ids tmp/baseline.ids \
   --transitions 256 --repetitions 3 > tmp/baseline.log 2>&1
 # Switch GLM53F_BIN_DIR to the candidate binaries.
+export XOS_MMM_L_HPAGE_TYPE=none GLM53F_NATIVE_Q8_PANEL=0
+export GLM53F_SPARSE_ASYNC=0 GLM53F_KDA_ASYNC=0
 bash a64fx/glm5/run_glm53f_12n.sh benchmark tmp/prompt8k.ids tmp/candidate.ids \
   --transitions 256 --repetitions 3 --decode-executor persistent \
   --router-kernel fused --verify-kernel grouped --index-kernel heads \
+  --mla-kernel registers --collective-owner serialized \
   --moe-combine-kernel vector > tmp/candidate.log 2>&1
 python3 a64fx/glm5/compare_glm53f_runs.py \
   --baseline tmp/baseline.log --candidate tmp/candidate.log \
@@ -86,7 +90,7 @@ Promotion requires at least 5% median improvement with no greater than 2%
 regression in the other phase. Target attainment is a separate report field.
 
 Lookup options: `--speculation lookup --draft-depth 1..4 --spec-policy
-adaptive|always`. Adaptive policy evaluates after sixteen cycles, comparing
+adaptive|always`. Adaptive policy evaluates every sixteen cycles, comparing
 maximum rank elapsed time per completed token with the plain warm trial.
 For the MTP sweep, stage MTP first, enable
 `GLM53F_SPEC_SELF_REFERENCE=1`, then run:
@@ -127,7 +131,7 @@ Native A64FX measurements, job 52068253, normal 2 GHz, compact 2×3×2:
 | Serialized MPI/uTofu owner stress | 300 iterations PASS, 515-token ragged slab stream, interleaved MPI sum/byte gather/uTofu sum |
 | Launcher contracts | 16 local tests PASS |
 | Strict resident MTP reporting | Six local tests PASS, including incomplete/reference/token/accounting failures |
-| Lookup rejection/rollback controller | 28 cases PASS with a local serial MPI shim and native twelve-rank MPI |
+| Lookup rejection/rollback controller | 29 cases PASS locally and on twelve ranks, including late verification-cost growth |
 
 The index result is a kernel microbenchmark, not whole-model acceleration.
 Baseline and candidate full-model batch/prefill checks PASS, including
@@ -153,27 +157,100 @@ one warm trial plus three timed trials, 47 threads):
 | Frozen a90f7972 | 29.989745 (29.853840–29.994162) | 303.243600 (302.496074–303.640411) | Reference |
 | Persistent executor + fused router | 30.764120 (30.440834–30.774790) | 303.341836 (302.805230–303.411221) | All 257 identical |
 
-Persistent/fused decode improves 2.58%, below the 5% promotion threshold;
-prefill is unchanged. Minimum memory headroom is above 10.9 GiB. Neither
-target is met. Overlap, lookup, index, register MLA, page/panel controls and
-the MTP depth sweep remain pending in the serial continuation.
-Historical full-run rates were roughly 29–30 decode tokens/s and 285–301
-prefill tokens/s at 8K. Those are earlier measurements, not candidate results.
+Additional exact 8K comparisons:
 
-The queue also compares `XOS_MMM_L_HPAGE_TYPE=none` with the original page
-policy, then the existing `GLM53F_NATIVE_Q8_PANEL=1` path with the row layout
-under that same page policy. The panel can change floating-point reduction
-order; promotion still requires identical generated IDs and no material
-prefill regression. These controls are separate from the register MLA kernel.
+| Path | Decode median, tok/s | Prefill median, tok/s |
+| --- | --- | --- |
+| Persistent + fused + index heads + vector combine | 30.713757 | 321.368333 |
+| Above + register MLA | 30.894098 | 318.750066 |
+| Above + `XOS_MMM_L_HPAGE_TYPE=none` | 33.066761 | 327.644514 |
+
+The page control is the best balanced 47-thread exact result: +10.26% decode and
++8.05% prefill against the frozen baseline. Q8 panels fail baseline-ID
+comparison and remain rejected. Combined sparse/MoE overlap also fails
+IDs (first divergence at position 18); its throughput does not qualify.
+Sparse overlap's MPI index detour changed reduction order. The corrected
+serialized-owner path keeps index sums on their original uTofu reduction;
+its native regular-vs-async boundary check is bit-exact, with zero rollback
+error. The owner stress also passes 300 iterations. Corrected sparse-only
+async matches all 257 IDs: 30.879418 decode / 325.856357 prefill tok/s.
+With page type `none`, it reaches 32.826162 / 335.438950, versus the simpler
+page candidate's 33.066761 / 327.644514. This is a 2.38% prefill improvement
+and a 0.73% decode regression, below the 5% promotion threshold. MoE overlap
+still changes the baseline large MPI sum to uTofu slabs and is excluded.
+
+The 48-thread page candidate passes the same stream at 33.402963 decode /
+317.928989 prefill tok/s. Its own 48-thread frozen baseline with page type
+`none` reaches 31.326396 / 302.705849 (+6.63% decode, +5.03% prefill).
+Versus 47 threads, decode gains only 1.02% while prefill loses 2.97%; 47
+threads remain selected. The 48-thread prefill range is 300.170450–320.935217.
+
+Lookup depths 1–4 all match IDs but original decode medians are 30.305971,
+30.247893, 29.430768 and 26.709574 tok/s. The one-shot adaptive check missed
+later expensive verification. Recurring 16-cycle cost checks pass the
+new delayed-cost regression; the old implementation fails it. All 29
+controller cases pass natively. The revised depth-4 median is 30.549583
+(30.485636–30.557937), 14.38% faster than the old policy, but below plain
+decode. Lookup remains opt-in.
+
+The complete MTP depth sweep passes every delivered ID against its own
+plain greedy reference, with 128 cycles, one warmup and three timed trials
+per depth. The reference delivers 768 tokens at 30.685 tok/s:
+
+| MTP depth | Delivered tokens/trial | Acceptance | Decode median (min–max), tok/s |
+| --- | --- | --- | --- |
+| 1 | 352 | 96/128 | 28.988085 (28.987217–28.988481) |
+| 2 | 403 | 147/256 | 26.196257 (26.194406–26.196963) |
+| 3 | 419 | 163/384 | 22.001181 (22.000102–22.001270) |
+| 4 | 419 | 163/512 | 17.897930 (17.896856–17.899092) |
+
+MTP uses scalar prefill through 8048 positions and retains the last prompt
+ID as its next target input. The resident benchmark uses batched prefill
+through all 8049 positions. These recipes produce different greedy streams
+(first observed difference at prediction 14). The MTP equivalence claim
+uses its scalar-prefill reference, not the batched-prefill baseline. The
+best MTP depth is slower than its own reference, so it is not promoted.
+Minimum MTP memory headroom is above 10.3 GiB.
+
+The selected page candidate passes the 128-ID short-prompt comparison:
+frozen baseline 36.575832 decode / 267.477754 prefill tok/s; candidate
+40.431636 (40.362345–40.440925) / 282.637846 (282.577122–282.934887).
+All 257 IDs match, improving decode 10.54% and prefill 5.67%.
+
+The synthetic long-context fixture repeats the saved 8049 IDs four times
+(32196 positions). Its first baseline attempt failed during prefill because
+the benchmark reserved only 32×4096 floats for collectives. Packed sparse
+index scores require up to 32×floor(context/4) floats. The harness now
+reserves the larger count while preserving the original reservation through
+16K. Frozen baseline kernels and candidate kernels receive the identical
+harness fix (commit `071fdcf3`). Corrected qualification passes all 257 IDs:
+
+| Synthetic 32196-token context | Decode median (min–max), tok/s | Prefill median (min–max), tok/s |
+| --- | --- | --- |
+| Frozen baseline | 27.747994 (27.739213–27.766317) | 265.965590 (265.657743–266.020143) |
+| Candidate, page type none | 31.450699 (30.927964–31.469004) | 287.156697 (286.600822–287.428617) |
+
+This improves decode 13.34% and prefill 7.97%. Minimum sampled headroom is
+10656768 KiB for baseline and 10699520 KiB for candidate, both above 10 GiB.
+The locally recomputed report is byte-identical to the remote report.
+
+All measured model configurations retain 45 layers and top-8 routing.
+Neither 100 decode nor 2000 prefill tok/s has been reached. Historical rates
+were roughly 29–30 decode and 285–301 prefill tok/s at 8K; the frozen
+three-trial baseline above supersedes those historical measurements.
+Reports, logs and token outputs are retained locally in
+`tmp/glm53f-strata-evidence-20261001/` and remotely in `tmp/strata-v10b/`.
+Committed comparison reports and binary/prompt/topology metadata are in
+`strata-validation-20261002.json`. The 8K page trial has owner enabled but
+inactive because async is off; short/32K trials have owner off.
 
 ## Remaining architecture decision
 
-First measure the TP12 candidate with exact generated-ID checks and complete
-phase profiles. If TP12 remains insufficient, evaluate PP3×TP4 using newly
-staged TP4 expert parts, explicit layer ownership, stage-local collectives,
+The measured TP12 candidate remains below both targets. The next architecture
+evaluation is PP3×TP4 using newly staged TP4 expert parts, explicit layer ownership, stage-local collectives,
 and full four-stream handoffs. Current stage images and runtime assume
 twelve ranks; a PP configuration cannot be selected by changing a launch
 flag. PP3×TP4 is not implemented or qualified. For a single dependent decode
 request, account for inter-stage latency rather than assuming threefold
-pipeline speedup. Short prompts, derived 32K prompts, and memory headroom
-also require qualification before promoting defaults.
+pipeline speedup. Short and synthetic 32K qualification pass. All new paths
+remain opt-in; the synthetic fixture does not replace a real long coding prompt.
