@@ -645,6 +645,9 @@ static void *glm53f_async_main(void *arg) {
     return NULL;
 }
 int glm53f_async_available_12n(void) { return glm53f_utofu_active && glm53f_prefill_algorithm == 5; }
+int glm53f_async_owner_12n(void) {
+    return atomic_load(&glm53f_owner_enabled) && atomic_load(&glm53f_owner_active);
+}
 int glm53f_async_begin_12n(const float *input, float *output, int tokens, int width, int slab_tokens) {
     if (!glm53f_async_available_12n() || !input || !output || tokens < 1 || width < 1 || slab_tokens < 1) return -1;
     int available = glm53f_collective_capacity_12n() / width;

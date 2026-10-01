@@ -3,6 +3,7 @@
 #include <mpi.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include "glm53f_sparse_12n.h"
 #include "glm53f_collective_12n.h"
 
@@ -19,13 +20,17 @@ int main(int argc, char **argv) {
     float *x = malloc((size_t)(warm + tokens) * HIDDEN * sizeof(*x));
     float *a = malloc((size_t)tokens * HIDDEN * sizeof(*a));
     float *b = malloc((size_t)tokens * HIDDEN * sizeof(*b));
-    MPI_Init(&argc, &argv);
+    int provided;
+    MPI_Init_thread(&argc, &argv, MPI_THREAD_SERIALIZED, &provided);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &ranks);
-    if (argc < 2 || ranks != 12 || warm < 0 || !x || !a || !b)
+    int async_check = getenv("GLM53F_SPARSE_CHECK_ASYNC") != NULL;
+    if (argc < 2 || ranks != 12 || warm < 0 || !x || !a || !b ||
+        provided < MPI_THREAD_SERIALIZED || (async_check && !prefill))
         MPI_Abort(MPI_COMM_WORLD, 2);
     if (getenv("GLM53F_UTOFU") && glm53f_collective_init_12n(
             getenv("TOFU_TOPO_PATH"), GLM53F_PREFILL_ATTN_TOKENS * HIDDEN)) MPI_Abort(MPI_COMM_WORLD, 2);
+    if (async_check && glm53f_collective_prefill_algorithm_12n(5)) MPI_Abort(MPI_COMM_WORLD, 2);
     int compare_cp = getenv("GLM53F_SPARSE_COMPARE_CP") != NULL;
     if (compare_cp) setenv("GLM53F_SPARSE_CP", "0", 1);
     glm53f_sparse_context_12n *ca = glm53f_sparse_create_12n(
@@ -46,21 +51,38 @@ int main(int argc, char **argv) {
     }
     MPI_Barrier(MPI_COMM_WORLD);
     double t0 = MPI_Wtime();
-    for (int t = 0; t < tokens; t++)
-        local_ok &= !glm53f_sparse_sublayer_12n(
-            ca, a + (size_t)t * HIDDEN,
+    glm53f_prefill_config config = {GLM53F_PREFILL_FAST, async_check ? 32 : 16, GLM53F_PREFILL_FAST_DEFAULT, NULL, 0};
+    config.features &= ~GLM53F_PREFILL_GEMM;
+    if (async_check) {
+        glm53f_sparse_configure_prefill_12n(ca, &config);
+        glm53f_sparse_prefill_workspace_12n *w = glm53f_sparse_prefill_workspace_create_12n();
+        local_ok &= w && !glm53f_sparse_prefill_12n(ca, w, a,
+            x + (size_t)warm * HIDDEN, tokens);
+        glm53f_sparse_prefill_workspace_free_12n(w);
+    } else for (int t = 0; t < tokens; t++)
+        local_ok &= !glm53f_sparse_sublayer_12n(ca, a + (size_t)t * HIDDEN,
             x + (size_t)(warm + t) * HIDDEN);
     double seq = MPI_Wtime() - t0;
     MPI_Barrier(MPI_COMM_WORLD);
     t0 = MPI_Wtime();
     if (prefill) {
-        glm53f_prefill_config config = {GLM53F_PREFILL_FAST, 16, GLM53F_PREFILL_FAST_DEFAULT, NULL, 0};
         /* No BF16 GEMM arena is needed for native projection tests. */
         config.features &= ~GLM53F_PREFILL_GEMM;
         glm53f_sparse_configure_prefill_12n(cb, &config);
         glm53f_sparse_prefill_workspace_12n *w = glm53f_sparse_prefill_workspace_create_12n();
-        local_ok &= w && !glm53f_sparse_prefill_12n(cb, w, b,
+        float *partial = async_check ? malloc((size_t)tokens * HIDDEN * sizeof(float)) : NULL;
+        if (async_check && (!partial || glm53f_collective_prefill_algorithm_12n(5) ||
+                glm53f_async_begin_12n(partial, b, tokens, HIDDEN, 32))) MPI_Abort(MPI_COMM_WORLD, 2);
+        if (async_check && !glm53f_async_owner_12n()) MPI_Abort(MPI_COMM_WORLD, 2);
+        if (async_check) glm53f_sparse_set_defer_reduce_12n(1);
+        local_ok &= w && !glm53f_sparse_prefill_12n(cb, w, async_check ? partial : b,
             x + (size_t)warm * HIDDEN, tokens);
+        if (async_check) {
+            glm53f_sparse_set_defer_reduce_12n(0);
+            glm53f_async_ready_12n(tokens);
+            local_ok &= !glm53f_async_finish_12n();
+        }
+        free(partial);
         glm53f_sparse_prefill_workspace_free_12n(w);
     } else local_ok &= !glm53f_sparse_sublayer_batch_12n(
         cb, b, x + (size_t)warm * HIDDEN, tokens);
@@ -73,6 +95,7 @@ int main(int argc, char **argv) {
     }
     double rel = sqrt(d2 / (r2 + 1e-30));
     local_ok &= rel < (getenv("GLM53F_SPARSE_CHECK_TOL") ? atof(getenv("GLM53F_SPARSE_CHECK_TOL")) : 3e-6);
+    if (async_check) local_ok &= !memcmp(a, b, (size_t)tokens * HIDDEN * sizeof(float));
     double rollback_d2=0.0,rollback_r2=0.0;
     if(warm>=1){local_ok&=!glm53f_sparse_restore_length_12n(ca,warm+1);
         local_ok&=!glm53f_sparse_restore_length_12n(cb,warm+1);
@@ -86,7 +109,7 @@ int main(int argc, char **argv) {
     if (!rank)
         printf("GLM53F_SPARSE_BATCH mode=%s layer=%d warm=%d tokens=%d rel_l2=%.9g rollback_rel_l2=%.9g "
                "seq_ms=%.3f batch_ms=%.3f speedup=%.3f %s\n",
-               compare_cp ? "replicated-vs-cp" : "replicated",
+               async_check ? "prefill-vs-owner-async" : compare_cp ? "replicated-vs-cp" : "replicated",
                layer, warm, tokens, rel,rollback_rel,sm * 1e3, bm * 1e3, sm / bm,
                ok ? "PASS" : "FAIL");
     if (!rank) {
@@ -95,7 +118,7 @@ int main(int argc, char **argv) {
             FILE *rf = fopen(report, "w");
             if (rf) {
                 fprintf(rf, "GLM53F_SPARSE_BATCH mode=%s layer=%d warm=%d tokens=%d rel_l2=%.9g rollback_rel_l2=%.9g seq_ms=%.3f batch_ms=%.3f speedup=%.3f %s\n",
-                        compare_cp ? "replicated-vs-cp" : "replicated", layer,
+                        async_check ? "prefill-vs-owner-async" : compare_cp ? "replicated-vs-cp" : "replicated", layer,
                         warm, tokens, rel, rollback_rel, sm * 1e3, bm * 1e3,
                         sm / bm, ok ? "PASS" : "FAIL");
                 fclose(rf);

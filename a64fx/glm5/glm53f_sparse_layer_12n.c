@@ -662,10 +662,14 @@ static void sparse_gemm_run(const uint8_t *wp, int K, int R, const float *x, int
 static int sp_defer_reduce;
 void glm53f_sparse_set_defer_reduce_12n(int on) { sp_defer_reduce = on; }
 static inline int sp_ar(const float *in, float *out, int n) {
-    return sp_defer_reduce ? glm53f_sum_allreduce_mpi_12n(in, out, n) : glm53f_sum_allreduce_12n(in, out, n);
+    /* The owner serializes uTofu with the output stream, preserving decode's
+     * reduction order. Only the legacy helper needs the MPI detour. */
+    return sp_defer_reduce && !glm53f_async_owner_12n() ?
+        glm53f_sum_allreduce_mpi_12n(in, out, n) : glm53f_sum_allreduce_12n(in, out, n);
 }
 static inline int sp_ar_prefill(const float *in, float *out, int n) {
-    return sp_defer_reduce ? glm53f_sum_allreduce_mpi_12n(in, out, n) : glm53f_sum_allreduce_prefill_12n(in, out, n);
+    return sp_defer_reduce && !glm53f_async_owner_12n() ?
+        glm53f_sum_allreduce_mpi_12n(in, out, n) : glm53f_sum_allreduce_prefill_12n(in, out, n);
 }
 void glm53f_sparse_prewarm_12n(glm53f_sparse_context_12n *c) {
     if (c && c->q2_native && !c->cp) (void)sparse_gemm_setup(c);
