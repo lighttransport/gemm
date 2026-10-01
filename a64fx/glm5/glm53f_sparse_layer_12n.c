@@ -12,6 +12,7 @@
 #include "glm53f_prefill_gemm.h"
 #include "glm53f_mla_prefill.h"
 #include "glm53f_moe_grouped_native.h"
+#include "glm53f_q80_panel64.h"
 #include "glm53f_state_io.h"
 #include "glm53f_iq_bridge.h"
 #define GLM53F_CP_BF16_LATENT 1
@@ -76,6 +77,8 @@ struct glm53f_sparse_context_12n {
     float *q8v_ql,*q8v_log,*q8v_va,*q8v_sum;
     float *mlb_qs,*mlb_ql,*mlb_va,*mlb_out,*mlb_ref,*mlb_lg; unsigned char *mlb_act; size_t mlb_act_bytes; int mlb_threads;
     unsigned char *q8v_act;
+    uint8_t *sg_w1, *sg_wqb, *sg_wop; int sg_state; /* int8 panel64 GEMM copies of q_a|kv_a and q_b (prefill front) */
+    int8_t *sg_xq, *sg_xp, *sg_qq, *sg_qp, *sg_oq, *sg_op; float *sg_xs, *sg_xsp, *sg_bt, *sg_qs, *sg_qsp, *sg_y1, *sg_yq, *sg_os, *sg_osp, *sg_yo;
     unsigned char *front_act_x, *front_act_q; /* fused decode front: native activations of x and of qres */
     size_t q8v_act_bytes;
     float *qas,*qbs,*kvas,*ops;
@@ -507,6 +510,74 @@ void glm53f_sparse_prefetch_plan_12n(const glm53f_sparse_context_12n *c) {
     const glm53f_native_matrix aq = {NULL, c->q2_qb, c->q2_qb_type, c->qd, QA};
     glm53f_pf_add_matvec(ax, 2);
     glm53f_pf_add_matvec(&aq, 1);
+}
+/* ---- int8 panel64 GEMM for the native Q8_0 prefill projections (q_a|kv_a and q_b), as in the KDA prefill ------------- */
+enum { SG_T = GLM53F_PREFILL_ATTN_TOKENS + 4 };
+static inline void sg_pack(int8_t *xp, float *xsp, const int8_t *xq, const float *xs, int K, int ng) {
+    const int nb = K / 32;
+#pragma omp for schedule(static)
+    for (int g = 0; g < ng; ++g) {
+        const int8_t *rows[6]; const float *xsr[6];
+        for (int u = 0; u < 6; ++u) { rows[u] = xq + (size_t)(g * 6 + u) * K; xsr[u] = xs + (size_t)(g * 6 + u) * nb; }
+        gmn_pack6(xp + (size_t)g * 6 * K, xsp + (size_t)g * 6 * nb, rows, xsr, K);
+    }
+}
+static uint8_t *sg_concat(uint8_t *a, size_t ab, uint8_t *b, size_t bb) {
+    uint8_t *out = NULL;
+    if (posix_memalign((void **)&out, 256, ab + bb)) return NULL;
+    memcpy(out, a, ab); memcpy(out + ab, b, bb);
+    free(a); free(b);
+    return out;
+}
+static int sparse_gemm_setup(glm53f_sparse_context_12n *c) {
+    if (c->sg_state) return c->sg_state > 0;
+    c->sg_state = -1;
+    const char *e = getenv("GLM53F_SPARSE_GEMM");
+    if (e && *e && !atoi(e)) return 0;
+    if (!c->q2_native || c->cp || c->qd % 64 || !glm53f_q80_family(c->q2_qa_type) || !glm53f_q80_family(c->q2_kva_type) ||
+        !glm53f_q80_family(c->q2_qb_type)) return 0;
+    uint8_t *qa = glm53f_q80_to_panel64(c->q2_qa_type, c->q2_qa, QA, H), *kv = glm53f_q80_to_panel64(c->q2_kva_type, c->q2_kva, LAT, H);
+    uint8_t *qb = glm53f_q80_to_panel64(c->q2_qb_type, c->q2_qb, c->qd, QA);
+    const int ocols = c->hn * VD;
+    uint8_t *opw = glm53f_q80_family(c->q2_op_type) ? glm53f_q80_to_panel64(c->q2_op_type, c->q2_op, H, ocols) : NULL;
+    if (!qa || !kv || !qb) { free(qa); free(kv); free(qb); free(opw); return 0; }
+    const size_t pb = gk_panel64_bytes(32, H);
+    c->sg_w1 = sg_concat(qa, (size_t)(QA / 64) * pb, kv, (size_t)(LAT / 64) * pb);
+    c->sg_wqb = qb;
+    c->sg_wop = opw; /* may be NULL: o_proj then keeps the native path */
+    if (!c->sg_w1) return 0;
+    c->sg_xq = a256((size_t)SG_T * H); c->sg_xp = a256((size_t)SG_T * H); c->sg_xs = a256((size_t)SG_T * (H / 32) * 4);
+    c->sg_xsp = a256((size_t)SG_T * (H / 32) * 4); c->sg_bt = a256((size_t)SG_T * (H / 32) * 4);
+    c->sg_qq = a256((size_t)SG_T * QA); c->sg_qp = a256((size_t)SG_T * QA); c->sg_qs = a256((size_t)SG_T * (QA / 32) * 4);
+    c->sg_qsp = a256((size_t)SG_T * (QA / 32) * 4);
+    c->sg_y1 = a256((size_t)SG_T * (QA + LAT) * 4); c->sg_yq = a256((size_t)SG_T * c->qd * 4);
+    if (opw) {
+        c->sg_oq = a256((size_t)SG_T * ocols); c->sg_op = a256((size_t)SG_T * ocols); c->sg_os = a256((size_t)SG_T * (ocols / 32) * 4);
+        c->sg_osp = a256((size_t)SG_T * (ocols / 32) * 4); c->sg_yo = a256((size_t)SG_T * H * 4);
+        memset(c->sg_oq, 0, (size_t)SG_T * ocols);
+    }
+    memset(c->sg_xq, 0, (size_t)SG_T * H); memset(c->sg_qq, 0, (size_t)SG_T * QA);
+    c->sg_state = 1;
+    return 1;
+}
+/* y[t][r] = W x[t] for tokens <= GLM53F_PREFILL_ATTN_TOKENS; one parallel region */
+static void sparse_gemm_run(const uint8_t *wp, int K, int R, const float *x, int tokens, int8_t *xq, float *xs, int8_t *xp,
+                            float *xsp, float *bt, float *y) {
+    const int mpad = (tokens + 5) / 6 * 6, ng = mpad / 6, nb = K / 32, panels = R / 64, nch = (ng + 2) / 3;
+#pragma omp parallel
+    {
+#pragma omp for schedule(static)
+        for (int t = 0; t < mpad; ++t) {
+            if (t < tokens) gmn_quant_row(x + (size_t)t * K, K, xq + (size_t)t * K, xs + (size_t)t * nb, bt + (size_t)t * nb);
+            else { memset(xq + (size_t)t * K, 0, K); memset(xs + (size_t)t * nb, 0, nb * 4); }
+        }
+        sg_pack(xp, xsp, xq, xs, K, ng);
+#pragma omp for schedule(dynamic, 1)
+        for (int task = 0; task < panels * nch; ++task) {
+            const int pnl = task / nch, ch = task % nch, t0 = ch * 18, t1 = (ch + 1) * 18 < mpad ? (ch + 1) * 18 : mpad;
+            gk_gemm_panel64(32, wp, K, pnl * 64, pnl * 64 + 64, t0, t1, xp, xsp, y, (size_t)R);
+        }
+    }
 }
 static inline int sp_is_q80(int type) {
     return type == GLM53F_GGML_Q8_0 || type == GLM53F_NATIVE_Q8_0R || type == GLM53F_NATIVE_Q8_0R16;
@@ -1388,6 +1459,9 @@ static int mla_native_reference(glm53f_sparse_context_12n *c, glm53f_sparse_pref
     return 0;
 }
 
+static double sp_front_acc[10]; static long sp_front_tokens; static double sp_front_t; static int sp_front_on = -1, sp_front_atexit;
+static void sp_front_report(void) { if (sp_front_tokens) fprintf(stderr, "GLM53F_SPARSE_FRONT_DETAIL us/token/layer: qa+kva=%.2f rms_qa=%.2f qb=%.2f rms_kva=%.2f wk=%.2f keyln=%.2f gate=%.2f wqb=%.2f wp=%.2f (tokens=%ld)\n", sp_front_acc[0]*1e6/sp_front_tokens, sp_front_acc[1]*1e6/sp_front_tokens, sp_front_acc[2]*1e6/sp_front_tokens, sp_front_acc[3]*1e6/sp_front_tokens, sp_front_acc[4]*1e6/sp_front_tokens, sp_front_acc[5]*1e6/sp_front_tokens, sp_front_acc[6]*1e6/sp_front_tokens, sp_front_acc[7]*1e6/sp_front_tokens, sp_front_acc[8]*1e6/sp_front_tokens, sp_front_tokens); }
+#define SPF(I) do { if (sp_front_on) { double n_ = sparse_clock(c); sp_front_acc[I] += n_ - sp_front_t; sp_front_t = n_; } } while (0)
 int glm53f_sparse_prefill_12n(glm53f_sparse_context_12n *c,
         glm53f_sparse_prefill_workspace_12n *w, float *out,
         const float *x, int tokens) {
@@ -1407,39 +1481,62 @@ int glm53f_sparse_prefill_12n(glm53f_sparse_context_12n *c,
     }
     int base = c->length, cols = c->hn * VD, failed = 0;
     double begin = sparse_clock(c);
+    if (sp_front_on < 0) sp_front_on = getenv("GLM53F_SPARSE_FRONT_DETAIL") != NULL;
+    if (sp_front_on) { if (!sp_front_atexit) { sp_front_atexit = 1; atexit(sp_front_report); } sp_front_tokens += tokens; sp_front_t = sparse_clock(c); }
     glm53f_prefill_config projection_config = c->prefill;
     /* Native prefill retains decode's F32 accumulation for the compact
      * indexer too; its BF16 GEMM recipe rounds activations differently. */
     if (c->q2_native) projection_config.features &= ~GLM53F_PREFILL_GEMM;
-    if (c->q2_native) {
+    const int sg = c->q2_native && sparse_gemm_setup(c);
+    if (sg) {
+        sparse_gemm_run(c->sg_w1, H, QA + LAT, x, tokens, c->sg_xq, c->sg_xs, c->sg_xp, c->sg_xsp, c->sg_bt, c->sg_y1);
+#pragma omp parallel for schedule(static)
+        for (int t = 0; t < tokens; ++t) {
+            memcpy(w->qres + (size_t)t * QA, c->sg_y1 + (size_t)t * (QA + LAT), QA * sizeof(float));
+            memcpy(c->latent + (size_t)(base + t) * LAT, c->sg_y1 + (size_t)t * (QA + LAT) + QA, LAT * sizeof(float));
+        }
+    } else if (c->q2_native) {
         glm53f_native_matrix front[2] = {
             {w->qres,c->q2_qa,c->q2_qa_type,QA,H},
             {c->latent+(size_t)base*LAT,c->q2_kva,c->q2_kva_type,LAT,H}};
         if (glm53f_native_matvec_batch(front, 2, x, tokens)) return -1;
     } else sparse_mv_fp8_wide(&c->prefill, w->qres, c->qa, c->qas, x, tokens, QA, H);
+    SPF(0); /* q_a + kv_a */
 #pragma omp parallel for schedule(static)
     for (int t = 0; t < tokens; ++t)
         glm53f_rmsnorm_bf16(w->qres + (size_t)t * QA, w->qres + (size_t)t * QA, c->qan, QA, 1e-5f);
-    if (c->q2_native) {
+    SPF(1); /* rmsnorm q_a */
+    if (sg) {
+        sparse_gemm_run(c->sg_wqb, QA, c->qd, w->qres, tokens, c->sg_qq, c->sg_qs, c->sg_qp, c->sg_qsp, c->sg_bt, c->sg_yq);
+#pragma omp parallel for schedule(static)
+        for (int t = 0; t < tokens; ++t) memcpy(w->query + (size_t)t * c->qd, c->sg_yq + (size_t)t * c->qd, c->qd * sizeof(float));
+    } else if (c->q2_native) {
         glm53f_native_matrix qb = {w->query,c->q2_qb,c->q2_qb_type,c->qd,QA};
         if (glm53f_native_matvec_batch(&qb, 1, w->qres, tokens)) return -1;
     } else {
         sparse_mv_fp8_wide(&c->prefill, w->query, c->qb, c->qbs, w->qres, tokens, c->qd, QA);
         sparse_mv_fp8_wide(&c->prefill, c->latent + (size_t)base * LAT, c->kva, c->kvas, x, tokens, LAT, H);
     }
+    SPF(2); /* q_b */
 #pragma omp parallel for schedule(static)
     for (int t = 0; t < tokens; ++t) {
         float *latent = c->latent + (size_t)(base + t) * LAT;
         glm53f_rmsnorm_bf16(latent, latent, c->kvan, LAT, 1e-5f);
     }
+    SPF(3); /* rmsnorm kv_a */
     sparse_mv_bf16_wide(&projection_config, w->raw, c->wk, x, tokens, ID, H);
+    SPF(4); /* wk */
 #pragma omp parallel for schedule(static)
     for (int t = 0; t < tokens; ++t)
         glm53f_layernorm_bf16(c->key + (size_t)(base + t) * ID,
             w->raw + (size_t)t * ID, c->knw, c->knb, ID, 1e-6f);
+    SPF(5); /* key layernorm */
     sparse_mv_bf16_wide(&projection_config, c->gcache + (size_t)base * ID, c->gatew, x, tokens, ID, H);
+    SPF(6); /* gate */
     sparse_mv_bf16_wide(&projection_config, w->iq, c->wqb, w->qres, tokens, IH * ID, QA);
+    SPF(7); /* wqb */
     sparse_mv_bf16_wide(&projection_config, w->iw, c->wp, x, tokens, IH, H);
+    SPF(8); /* wp */
     c->profile_phase[0] += sparse_clock(c) - begin;
     begin = sparse_clock(c);
     /* Future cache rows may be materialized, but select_incremental bounds
@@ -1569,7 +1666,11 @@ int glm53f_sparse_prefill_12n(glm53f_sparse_context_12n *c,
     if (failed) return -1;
     c->length += tokens;
     begin = sparse_clock(c);
-    if (c->q2_native) {
+    if (sg && c->sg_wop) {
+        sparse_gemm_run(c->sg_wop, cols, H, w->attn, tokens, c->sg_oq, c->sg_os, c->sg_op, c->sg_osp, c->sg_bt, c->sg_yo);
+#pragma omp parallel for schedule(static)
+        for (int t = 0; t < tokens; ++t) memcpy(w->partial + (size_t)t * H, c->sg_yo + (size_t)t * H, H * sizeof(float));
+    } else if (c->q2_native) {
         glm53f_native_matrix op = {w->partial,c->q2_op,c->q2_op_type,H,cols};
         if (glm53f_native_matvec_batch(&op, 1, w->attn, tokens)) return -1;
     } else sparse_mv_fp8_wide(&c->prefill, w->partial, c->op, c->ops, w->attn, tokens, H, cols);

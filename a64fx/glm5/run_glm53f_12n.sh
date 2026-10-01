@@ -81,7 +81,7 @@ if [ "$command" = check ]; then
     # numerically different (closer to exact fp32), so it is validated separately with GLM53F_MOE_NATIVE_GROUPED=2.
     # The MoE combine reduction order (GLM53F_MOE_AR_SLAB) is likewise pinned to the decode collective here; the faster
     # collectives are validated by bench_glm53f_allreduce_12n (result check) and end-to-end generation.
-    export GLM53F_MOE_NATIVE_GROUPED=0 GLM53F_SPARSE_MLA_BATCH=0 GLM53F_MOE_ROUTER_GEMM=0 GLM53F_MOE_SHARED_GEMM=0 GLM53F_MOE_AR_SLAB=0 GLM53F_IQ_FAST=0 GLM53F_MTNI_DECODE=0 GLM53F_MHC_FAST=0 GLM53F_MOE_FUSE_SHARED=0 GLM53F_KDA_ASYNC=0
+    export GLM53F_MOE_NATIVE_GROUPED=0 GLM53F_SPARSE_MLA_BATCH=0 GLM53F_MOE_ROUTER_GEMM=0 GLM53F_MOE_SHARED_GEMM=0 GLM53F_MOE_AR_SLAB=0 GLM53F_IQ_FAST=0 GLM53F_MTNI_DECODE=0 GLM53F_MHC_FAST=0 GLM53F_MOE_FUSE_SHARED=0 GLM53F_KDA_ASYNC=0 GLM53F_SPARSE_GEMM=0 GLM53F_SPARSE_FUSE_FRONT=0
     mpi_run check-target "$GLM53F_BIN_DIR/glm53f_target_batch_check_12n" "$model" "$routed" "$shared" \
         --prefill-mode fast --prefill-features 27 --prefill-slab 16 --prefill-collective tree-packed
     grep 'PASS' "$last_log".*.0
