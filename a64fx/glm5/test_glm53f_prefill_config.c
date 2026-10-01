@@ -43,9 +43,12 @@ int main(void) {
     failed |= parse("--moe-combine-kernel", "overlap", &c) != 1 || strcmp(getenv("GLM53F_MOE_COMBINE"), "2");
     failed |= parse("--moe-combine-kernel", "invalid", &c) != -1;
     failed |= parse("--index-kernel", "heads", &c) != 1 || strcmp(getenv("GLM53F_INDEX_HEADS"), "1");
+    failed |= parse("--index-kernel", "keys4", &c) != 1 || strcmp(getenv("GLM53F_INDEX_HEADS"), "2");
     failed |= parse("--index-kernel", "legacy", &c) != 1 || strcmp(getenv("GLM53F_INDEX_HEADS"), "0");
     failed |= parse("--index-kernel", "invalid", &c) != -1;
     failed |= parse("--mla-kernel", "registers", &c) != 1 || strcmp(getenv("GLM53F_MLA_REGISTERS"), "1");
+    failed |= parse("--mla-kernel", "values", &c) != 1 || strcmp(getenv("GLM53F_MLA_REGISTERS"), "2");
+    failed |= parse("--mla-kernel", "fp16-cache", &c) != 1 || strcmp(getenv("GLM53F_MLA_REGISTERS"), "3");
     failed |= parse("--mla-kernel", "legacy", &c) != 1 || strcmp(getenv("GLM53F_MLA_REGISTERS"), "0");
     failed |= parse("--mla-kernel", "invalid", &c) != -1;
     printf("PREFILL_CONFIG %s\n", failed ? "FAIL" : "PASS");

@@ -26,8 +26,11 @@ static inline int glm53f_runtime_option(int argc, char **argv, int *index) {
              (!strcmp(key, "--index-kernel") && !strcmp(value, "heads")) ||
              (!strcmp(key, "--mla-kernel") && !strcmp(value, "registers")) ||
              (!strcmp(key, "--decode-executor") && !strcmp(value, "persistent"))) enabled = 1;
-    else if (!strcmp(key, "--moe-combine-kernel") && !strcmp(value, "overlap")) enabled = 2;
+    else if ((!strcmp(key, "--moe-combine-kernel") && !strcmp(value, "overlap")) ||
+             (!strcmp(key, "--index-kernel") && !strcmp(value, "keys4")) ||
+             (!strcmp(key, "--mla-kernel") && !strcmp(value, "values"))) enabled = 2;
+    else if (!strcmp(key, "--mla-kernel") && !strcmp(value, "fp16-cache")) enabled = 3;
     else return -1;
-    return setenv(env, enabled == 2 ? "2" : enabled ? "1" : "0", 1) ? -1 : 1;
+    return setenv(env, enabled == 3 ? "3" : enabled == 2 ? "2" : enabled ? "1" : "0", 1) ? -1 : 1;
 }
 #endif

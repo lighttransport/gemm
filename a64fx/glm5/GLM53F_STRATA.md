@@ -5,6 +5,36 @@ prefill tokens/s**, on twelve A64FX nodes, the complete 45-layer
 UD-Q4_K_XL model, top-8 routing, and the saved roughly 8K coding prompt.
 These targets have **not been demonstrated** by the changes below.
 
+## October 2 continuation (qualification pending)
+
+The new opt-in candidates preserve the existing arithmetic and reduction
+order: four-key index scoring reuses query vectors, MLA values keep four
+64-column accumulators in SVE registers, and a derived FP16 latent view
+avoids repeated rounding and selected-row packing. The canonical FP32
+cache remains available for reference and state traces. The derived view
+is allocated only for native replicated caches at the A64FX vector length;
+context-parallel caches retain their existing path. Appends refresh each
+row, and rollback hides future rows using the canonical context length.
+Cache memory accounting includes the additional two bytes per latent.
+
+Native fast/conservative value and conversion checks pass at 1/12/47/48
+threads. The actual prefill logits/softmax/value kernels match byte for
+byte across 60 cases (all 1–6 head counts, contiguous/reversed selections,
+key counts 1/7/128/2048/2051, and output guards). Index arithmetic also
+passes the native fast/conservative thread-count matrix. These arithmetic
+results do not establish a whole-model throughput improvement.
+
+PJM 52075759 is staging boundedly before a sequential campaign. The campaign
+will compare the previously qualified page-none/47-thread configuration,
+a rebuilt control, independent index/value ablations, and both cache/index
+combinations. Complete output IDs, sampled memory headroom, independent
+five-trial confirmation, 1024-transition decode, short128, and synthetic
+32K are required before promotion. A complete-state legacy/persistent
+checker can exercise the new kernels using diagnostic
+`GLM53F_EXECUTOR_INDEX_KERNEL=2 GLM53F_EXECUTOR_MLA_KERNEL=3`; it frees the
+reference before loading a fresh cache-enabled candidate.
+See the active allocation and queue in `../../resume-strata.md`.
+
 ## Implementation
 
 The source studied is `~/work/Strata`, branch `glm53f`, revision `e486a95`.
@@ -36,8 +66,8 @@ available for reference. CLI switches:
 --verify-kernel legacy|grouped
 --collective-owner legacy|serialized
 --moe-combine-kernel legacy|vector|overlap
---index-kernel legacy|heads
---mla-kernel legacy|registers
+--index-kernel legacy|heads|keys4
+--mla-kernel legacy|registers|values|fp16-cache
 ```
 
 MTP retains its legacy executor and rejects `--decode-executor persistent`.

@@ -1,0 +1,43 @@
+{
+  "status": "NATIVE_ARITHMETIC_PASS_FULL_MODEL_PENDING",
+  "allocation": 52075759,
+  "nodes": 12,
+  "clock_ghz": 2,
+  "eco": 0,
+  "candidate": "candidate-cache-v3",
+  "production_thread_count": 47,
+  "kernel_options": [
+    "--index-kernel keys4",
+    "--mla-kernel values",
+    "--mla-kernel fp16-cache"
+  ],
+  "native_compiler": "FCC -Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast -fopenmp -Wall -Wextra",
+  "math_builds": [
+    "-ffast-math -fno-math-errno",
+    "conservative"
+  ],
+  "parallel_index_value_thread_counts": [
+    1,
+    12,
+    47,
+    48
+  ],
+  "prefill_attention_cases_per_invocation": 60,
+  "prefill_attention_scope": "Serial production worker kernel; head counts 1..6, forward/reverse selections, 1/7/128/2048/2051 keys, exact logits/softmax/values/canaries",
+  "timing_qualification": "Native probes ran during model staging; their rates must not be used as whole-model throughput evidence.",
+  "whole_model_gates": "Queued after staging: sparse scalar/batch/rollback/cache-view parity, 128-position complete-state comparison, 8K ablations, independent repeats, 1024-transition stress, short128 and synthetic32K",
+  "artifacts": {
+    "iq-rows4-probe.log": "a199aac6d84b2ba7ce9fe8941226018d8bc0d6cdcc2c6cd6ec1dd6060b8ffb84",
+    "build-cache-v3.log": "99a0ab850b30404797c99ab9a5c4eee069c83a31643f3ceda23dd61252fad679",
+    "build-executor-cache.log": "e601a9863a1d11d435cee629a87b41af3cf257fa41fcb514f1db9dbaa584c0db",
+    "cache-v3-native-unit-contended.log": "20ce74c25d8e5df860156ce754a38b05ba0ffcd227e8102dc84af7f5db325968"
+  },
+  "source_archives": {
+    "glm53f-cache-v3-update.tar.gz": "dd5397015c0a1ce40196b01cd526314c755aedefa955ae35443f3f9b541a1de0",
+    "glm53f-executor-cache-update.tar.gz": "274e59a7a4b9f1dd74accfecb4a63ee38cd7a85eb4057d2ce5d085c92b319992"
+  },
+  "rejected_runtime_experiments": [
+    "Wider mHC tiles: native probes slower; implementation removed",
+    "Four-row IQ probe: no clear main-projection benefit; remains outside runtime"
+  ]
+}

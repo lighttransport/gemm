@@ -61,6 +61,12 @@ int main(int argc, char **argv) {
     }
     MPI_Bcast(input, count, MPI_INT, 0, MPI_COMM_WORLD);
     if (glm53f_collective_init_12n(getenv("TOFU_TOPO_PATH"), 5 * H)) MPI_Abort(MPI_COMM_WORLD, 2);
+    const char *index_env = getenv("GLM53F_EXECUTOR_INDEX_KERNEL");
+    const char *mla_env = getenv("GLM53F_EXECUTOR_MLA_KERNEL");
+    int index_kernel = index_env ? atoi(index_env) : 1;
+    int mla_kernel = mla_env ? atoi(mla_env) : 1;
+    if (index_kernel < 0 || index_kernel > 2 || mla_kernel < 0 || mla_kernel > 3)
+        MPI_Abort(MPI_COMM_WORLD, 2);
     setenv("GLM53F_MHC_FAST", "1", 1);
     setenv("GLM53F_ROUTER_FUSE", "0", 1);
     setenv("GLM53F_INDEX_HEADS", "0", 1);
@@ -72,11 +78,22 @@ int main(int argc, char **argv) {
         glm53f_target_trace_open_12n(m, argv[5], 0)) MPI_Abort(MPI_COMM_WORLD, 2);
     for (int t = 0; t < count; ++t)
         if (glm53f_target_model_step_12n(m, input[t], token + t, logit + t, hidden + (size_t)t * H)) MPI_Abort(MPI_COMM_WORLD, 2);
-    if (glm53f_target_trace_close_12n(m) || glm53f_target_snapshot_restore_12n(m, initial) ||
-        glm53f_target_trace_open_12n(m, argv[5], 1)) MPI_Abort(MPI_COMM_WORLD, 2);
+    if (glm53f_target_trace_close_12n(m)) MPI_Abort(MPI_COMM_WORLD, 2);
+    char index_value[16], mla_value[16];
+    snprintf(index_value, sizeof(index_value), "%d", index_kernel);
+    snprintf(mla_value, sizeof(mla_value), "%d", mla_kernel);
     setenv("GLM53F_ROUTER_FUSE", "1", 1);
-    setenv("GLM53F_INDEX_HEADS", "1", 1);
-    setenv("GLM53F_MLA_REGISTERS", "1", 1);
+    setenv("GLM53F_INDEX_HEADS", index_value, 1);
+    setenv("GLM53F_MLA_REGISTERS", mla_value, 1);
+    if (mla_kernel == 3) {
+        /* Cache allocation is a startup option. Free the reference before
+         * loading a fresh candidate so two resident models never coexist. */
+        glm53f_target_snapshot_free_12n(initial); initial = NULL;
+        glm53f_target_model_free_12n(m);
+        m = glm53f_target_model_create_12n(argv[1], argv[2], argv[3], count + 1);
+        if (!m) MPI_Abort(MPI_COMM_WORLD, 2);
+    } else if (glm53f_target_snapshot_restore_12n(m, initial)) MPI_Abort(MPI_COMM_WORLD, 2);
+    if (glm53f_target_trace_open_12n(m, argv[5], 1)) MPI_Abort(MPI_COMM_WORLD, 2);
     struct check_call call = {m, input, token, hidden, logit, count, 0, 0, 0, 0};
     glm53f_team_run(persistent_control, &call);
     call.failed |= glm53f_target_trace_close_12n(m) != 0;
@@ -87,8 +104,8 @@ int main(int argc, char **argv) {
     MPI_Allreduce(&rel, &maximum, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
     int mismatches;
     MPI_Allreduce(&call.bit_mismatches, &mismatches, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
-    if (!rank) printf("GLM53F_EXECUTOR_CHECK tokens=%d hidden_bit_mismatches=%d hidden_rel_l2=%.9g state=%s %s\n",
-        count, mismatches, maximum, all ? "BIT_EXACT" : "UNCHECKED_OR_MISMATCH", all ? "PASS" : "FAIL");
+    if (!rank) printf("GLM53F_EXECUTOR_CHECK tokens=%d index_kernel=%d mla_kernel=%d hidden_bit_mismatches=%d hidden_rel_l2=%.9g state=%s %s\n",
+        count, index_kernel, mla_kernel, mismatches, maximum, all ? "BIT_EXACT" : "UNCHECKED_OR_MISMATCH", all ? "PASS" : "FAIL");
     free(hidden); glm53f_target_snapshot_free_12n(initial);
     glm53f_target_model_free_12n(m); glm53f_collective_free_12n();
     MPI_Finalize(); return all ? 0 : 1;

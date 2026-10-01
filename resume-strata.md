@@ -1,12 +1,48 @@
 # Resume: GLM53F Strata-inspired optimization, 12 A64FX nodes
 
-Updated 2026-10-02 02:23 JST. TP12 implementation, native validation and
+Updated 2026-10-02 05:23 JST. New optimization campaign is active; prior results below remain the qualified baseline.
+
+Previous campaign: TP12 implementation, native validation and
 short/8K/synthetic 32K qualification complete. All new paths remain opt-in.
 Targets: complete 45-layer UD-Q4_K_XL/top-8, saved ~8K single
 request, 100+ delivered decode and 2000+ prefill tok/s. Neither target met.
 See `a64fx/glm5/GLM53F_STRATA.md` for implementation, gates and commands.
 
-## Allocation and isolated deployment
+## Active continuation (October 2)
+
+- PJM **52075759**, 12 nodes, 2×3×2, normal 2 GHz / eco 0, approximately
+  04:05–10:05 JST; compute bridge on `f28-0008c`, tmux `glm53f-strata-next2`.
+  Same isolated remote snapshot and HTTP forwarding as below.
+- Bounded stage PID **685**, log `tmp/strata-20261002/stage.log`; routed
+  rank-zero log `tmp/glm53f-q4-52075759/routed-stage-keys4-stage.1.0`.
+  Layer 20 / 6.67 GB at 05:15. Wait for stage exit and OK sentinel before MPI.
+- Immutable builds **candidate-keys4-v1** and **candidate-values-v1** complete.
+  Build logs `tmp/strata-20261002/build-{keys4-v2,values-v1}.log` remotely.
+  Native fast/conservative index keys4 and MLA register-value arithmetic
+  checks pass at 1/12/47/48 threads. Measurements during staging are contended;
+  no new whole-model throughput result or promotion yet.
+- Working tree adds opt-in `--index-kernel keys4` and `--mla-kernel values`.
+  Derived FP16 latent cache integrated behind `--mla-kernel fp16-cache`;
+  **candidate-cache-v3** builds, native fast/conservative value/conversion
+  gates pass at 1/12/47/48 threads. Actual prefill attention has 60 byte-exact
+  cases across all head counts, selections and key tails, both compilers.
+  Whole-model gates remain pending. Wider mHC tiles rejected
+  for slower native probes; no runtime mHC tile path retained.
+- Unset `OPAL_PREFIX OMPI_CC OMPI_CXX` before invoking system `mpifcc`.
+  Never use global `set -e` in the persistent bridge shell; use child scripts.
+- Detached campaign PID **3675**, `tmp/strata-20261002/kernel-campaign.log`,
+  waits for stage completion, then runs uncontended native arithmetic/timing,
+  sparse scalar/batch/rollback and byte-exact derived-cache comparison gates,
+  followed by a 128-position complete-state legacy/candidate comparison.
+  Scripts `tmp/glm53f-kernel-campaign-20261002.{sh,py}` contain sequential
+  8K ablations, five-trial confirmation, 1024-transition stress, short128 and
+  repeated32K qualification. No new whole-model result yet.
+- Next: collect sequential
+  8K old-best/control/index/value/cache ablations with exact complete IDs and
+  rank-max timings; qualify selected exact balanced improvement.
+
+## Previous allocation and isolated deployment (expired)
+
 
 - PJM **52068253**, 12 nodes, compact 2×3×2, normal 2 GHz, eco 0; six hours
   from about 20:40 JST October 1 to 02:40 JST October 2. Node `d26-2014c`.

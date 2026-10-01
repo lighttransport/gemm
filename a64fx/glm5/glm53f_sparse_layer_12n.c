@@ -12,6 +12,7 @@
 #include "glm53f_prefill_gemm.h"
 #include "glm53f_mla_prefill.h"
 #include "glm53f_mla_absorb.h"
+#include "glm53f_mla_cache_f16.h"
 #include "glm53f_moe_grouped_native.h"
 #include "glm53f_q80_panel64.h"
 #include "glm53f_state_io.h"
@@ -91,7 +92,7 @@ struct glm53f_sparse_context_12n {
     float *mla_ql,*mla_log,*mla_part,*mla_va;
     float *cp_latent,*cp_key,*cp_gate,*cp_pool,*cp_pack,*cp_exchange,*cp_gather;
     uint16_t *cp_bf16_local, *cp_bf16_gather;
-    uint16_t *hot_latent;
+    uint16_t *hot_latent, *latent_f16;
     int hot_prefix;
     float *cp_cur_latent,*cp_cur_key,*cp_cur_gate;
     int *cp_pack_index;
@@ -351,7 +352,11 @@ glm53f_sparse_context_12n*glm53f_sparse_create_format_12n(const char*model,int l
                 rank, layer);
         MPI_Abort(MPI_COMM_WORLD, 2);
     }
-    glm53f_st_close(st);c->qres=a256(QA*4);c->query=a256((size_t)qd*4);if(c->cp){c->cp_latent=a256((size_t)c->local_capacity*LAT*(c->latent_bf16?2:4));c->cp_key=a256((size_t)c->local_capacity*ID*4);c->cp_gate=a256((size_t)c->local_capacity*ID*4);c->cp_pool=a256((size_t)(c->pool_capacity+1)*ID*4);c->cp_pack=a256((size_t)(TOPK+KPOOL)*LAT*4);c->cp_exchange=a256((size_t)2*KPOOL*ID*4);c->cp_cur_latent=a256(LAT*4);c->cp_cur_key=a256(ID*4);c->cp_cur_gate=a256(ID*4);c->cp_pack_index=a256((size_t)(TOPK+KPOOL)*sizeof(int));int nc=c->pool_capacity+1>TOPK/KPOOL?c->pool_capacity+1:TOPK/KPOOL;c->cp_candidate_local=a256((size_t)nc*sizeof(cp_candidate));c->cp_candidate_gather=a256((size_t)nr*(TOPK/KPOOL)*sizeof(cp_candidate));}else{c->latent=a256((size_t)capacity*LAT*4);c->key=a256((size_t)capacity*ID*4);c->gcache=a256((size_t)capacity*ID*4);c->pool=a256((size_t)(capacity/KPOOL+1)*ID*4);c->pool_score_cache=a256((size_t)(capacity/KPOOL+1)*sizeof(pool_score));c->pool_score_local=a256((size_t)(capacity/KPOOL+1)*sizeof(float));c->pool_score_global=a256((size_t)(capacity/KPOOL+1)*sizeof(float));c->packed=a256((size_t)(TOPK+KPOOL)*LAT*4);c->packed_index=a256((size_t)(TOPK+KPOOL)*sizeof(int));for(int i=0;i<TOPK+KPOOL;i++)c->packed_index[i]=i;}c->iq=a256((size_t)IH*ID*4);c->iw=a256(IH*4);c->attn=a256((size_t)hn*VD*4);c->partial=a256(H*4);c->selected=a256((size_t)(TOPK+KPOOL)*sizeof(int));c->apef=a256(KPOOL*ID*4);for(int i=0;i<KPOOL*ID;i++)c->apef[i]=glm53f_bf16_to_f32(c->ape[i]);if(getenv("GLM53F_TOUCH_CACHE")){if(c->cp){memset(c->cp_latent,0,(size_t)c->local_capacity*LAT*(c->latent_bf16?2:4));memset(c->cp_key,0,(size_t)c->local_capacity*ID*4);memset(c->cp_gate,0,(size_t)c->local_capacity*ID*4);memset(c->cp_pool,0,(size_t)(c->pool_capacity+1)*ID*4);}else{memset(c->latent,0,(size_t)capacity*LAT*4);memset(c->key,0,(size_t)capacity*ID*4);memset(c->gcache,0,(size_t)capacity*ID*4);memset(c->pool,0,(size_t)(capacity/KPOOL+1)*ID*4);}}return c;}
+    glm53f_st_close(st);
+    const char *mla_mode = getenv("GLM53F_MLA_REGISTERS");
+    if (!c->cp && c->q2_native && svcntw() == 16 && mla_mode && atoi(mla_mode) >= 3)
+        c->latent_f16 = a256((size_t)capacity * LAT * sizeof(uint16_t));
+    c->qres=a256(QA*4);c->query=a256((size_t)qd*4);if(c->cp){c->cp_latent=a256((size_t)c->local_capacity*LAT*(c->latent_bf16?2:4));c->cp_key=a256((size_t)c->local_capacity*ID*4);c->cp_gate=a256((size_t)c->local_capacity*ID*4);c->cp_pool=a256((size_t)(c->pool_capacity+1)*ID*4);c->cp_pack=a256((size_t)(TOPK+KPOOL)*LAT*4);c->cp_exchange=a256((size_t)2*KPOOL*ID*4);c->cp_cur_latent=a256(LAT*4);c->cp_cur_key=a256(ID*4);c->cp_cur_gate=a256(ID*4);c->cp_pack_index=a256((size_t)(TOPK+KPOOL)*sizeof(int));int nc=c->pool_capacity+1>TOPK/KPOOL?c->pool_capacity+1:TOPK/KPOOL;c->cp_candidate_local=a256((size_t)nc*sizeof(cp_candidate));c->cp_candidate_gather=a256((size_t)nr*(TOPK/KPOOL)*sizeof(cp_candidate));}else{c->latent=a256((size_t)capacity*LAT*4);c->key=a256((size_t)capacity*ID*4);c->gcache=a256((size_t)capacity*ID*4);c->pool=a256((size_t)(capacity/KPOOL+1)*ID*4);c->pool_score_cache=a256((size_t)(capacity/KPOOL+1)*sizeof(pool_score));c->pool_score_local=a256((size_t)(capacity/KPOOL+1)*sizeof(float));c->pool_score_global=a256((size_t)(capacity/KPOOL+1)*sizeof(float));c->packed=a256((size_t)(TOPK+KPOOL)*LAT*4);c->packed_index=a256((size_t)(TOPK+KPOOL)*sizeof(int));for(int i=0;i<TOPK+KPOOL;i++)c->packed_index[i]=i;}c->iq=a256((size_t)IH*ID*4);c->iw=a256(IH*4);c->attn=a256((size_t)hn*VD*4);c->partial=a256(H*4);c->selected=a256((size_t)(TOPK+KPOOL)*sizeof(int));c->apef=a256(KPOOL*ID*4);for(int i=0;i<KPOOL*ID;i++)c->apef[i]=glm53f_bf16_to_f32(c->ape[i]);if(getenv("GLM53F_TOUCH_CACHE")){if(c->cp){memset(c->cp_latent,0,(size_t)c->local_capacity*LAT*(c->latent_bf16?2:4));memset(c->cp_key,0,(size_t)c->local_capacity*ID*4);memset(c->cp_gate,0,(size_t)c->local_capacity*ID*4);memset(c->cp_pool,0,(size_t)(c->pool_capacity+1)*ID*4);}else{memset(c->latent,0,(size_t)capacity*LAT*4);memset(c->key,0,(size_t)capacity*ID*4);memset(c->gcache,0,(size_t)capacity*ID*4);memset(c->pool,0,(size_t)(capacity/KPOOL+1)*ID*4);}}return c;}
 glm53f_sparse_context_12n *glm53f_sparse_create_12n(const char *model, int layer, int capacity) {
     return glm53f_sparse_create_format_12n(model, layer, capacity, 0);
 }
@@ -402,6 +407,7 @@ int glm53f_sparse_touch_cache_12n(glm53f_sparse_context_12n *c) {
             memset(c->hot_latent, 0, (size_t)c->hot_prefix * LAT * sizeof(uint16_t));
     } else {
         memset(c->latent, 0, (size_t)c->capacity * LAT * 4);
+        if (c->latent_f16) memset(c->latent_f16, 0, (size_t)c->capacity * LAT * sizeof(uint16_t));
         memset(c->key, 0, (size_t)c->capacity * ID * 4);
         memset(c->gcache, 0, (size_t)c->capacity * ID * 4);
         memset(c->pool, 0, (size_t)(c->capacity / KPOOL + 1) * ID * 4);
@@ -414,7 +420,8 @@ int glm53f_sparse_restore_length_12n(glm53f_sparse_context_12n*c,int length){if(
 int glm53f_sparse_is_context_parallel_12n(const glm53f_sparse_context_12n*c){return c?c->cp:0;}
 size_t glm53f_sparse_cache_bytes_12n(const glm53f_sparse_context_12n *c) {
     if (!c) return 0;
-    if (!c->cp) return ((size_t)c->capacity * (LAT + 2 * ID) + (size_t)(c->capacity / KPOOL + 1) * ID) * 4;
+    if (!c->cp) return ((size_t)c->capacity * (LAT + 2 * ID) + (size_t)(c->capacity / KPOOL + 1) * ID) * 4
+        + (c->latent_f16 ? (size_t)c->capacity * LAT * sizeof(uint16_t) : 0);
     size_t n = (size_t)c->local_capacity * LAT * (c->latent_bf16 ? 2 : 4);
     n += ((size_t)c->local_capacity * 2 * ID + (size_t)(c->pool_capacity + 1) * ID + (size_t)(TOPK + KPOOL) * LAT + 2 * KPOOL * ID) * 4;
     if (c->cp_gather) n += (size_t)(TOPK + KPOOL) * LAT * 4;
@@ -429,7 +436,7 @@ static int sp_ar(const float *in, float *out, int n);
 struct pool_score_call { glm53f_sparse_context_12n *c; int tokens, np; };
 static int index_heads_enabled(void) {
     const char *e = getenv("GLM53F_INDEX_HEADS");
-    return e && atoi(e) && !glm53f_sparse_scalar_reference;
+    return e && !glm53f_sparse_scalar_reference ? atoi(e) : 0;
 }
 static void pool_score_worker(void *context) {
     struct pool_score_call *a = context;
@@ -446,6 +453,22 @@ static void pool_score_worker(void *context) {
                 if (dot > 0) score += c->iw[h] * (float)(dot / sqrt((double)ID)) / sqrtf((float)IH);
             }
             c->pool_score_cache[p] = (pool_score){score, p};
+        }
+    } else if (heads == 2) {
+        int span = 4 * c->ranks;
+#pragma omp for schedule(static)
+        for (int group = 0; group < (a->np + span - 1) / span; ++group) {
+            int base = group * span, end = base + span;
+            if (end > a->np) end = a->np;
+            for (int p = base; p < end; ++p) c->pool_score_local[p] = 0;
+            int first = base + c->rank;
+            int n = first < end ? (end - 1 - first) / c->ranks + 1 : 0;
+            if (n) {
+                float score[4];
+                glm53f_index_score_f32_keys4(score, c->iq, c->iw,
+                    c->pool + (size_t)first * ID, (size_t)c->ranks * ID, n);
+                for (int k = 0; k < n; ++k) c->pool_score_local[first + k * c->ranks] = score[k];
+            }
         }
     } else {
 #pragma omp for schedule(static)
@@ -490,7 +513,7 @@ static void ensure_mla_shards(glm53f_sparse_context_12n*c){if(c->mla_ql)return;s
  * phases are work-shared by one team; every output element keeps the serial
  * accumulation order (j for ql, t for va), so results match the former
  * single-threaded loop. */
-struct mla_value_call { glm53f_sparse_context_12n *c; float *out; const float *q, *z; const int *selected; int nt, bad, registers; };
+struct mla_value_call { glm53f_sparse_context_12n *c; float *out; const float *q, *z; const int *selected; int nt, bad, registers; const uint16_t *half; };
 static void mla_value_worker(void *context) {
     struct mla_value_call *a = context;
     glm53f_sparse_context_12n *c = a->c;
@@ -522,7 +545,14 @@ static void mla_value_worker(void *context) {
 #pragma omp for schedule(static)
         for(int w=0;w<hn*nt;w++){
             const int h=w/nt,t=w%nt,r=selected?selected[t]:t;
-            lg[(size_t)h*SLOTS+t]=f32dot(ql+(size_t)h*LAT,z+(size_t)r*LAT,LAT);
+            if (a->half) {
+                const svbool_t p = svptrue_b32();
+                svfloat32_t dot = svdup_f32(0);
+                for (int d = 0; d < LAT; d += 16)
+                    dot = svmla_f32_x(p, dot, svld1_f32(p, ql + (size_t)h * LAT + d),
+                        glm53f_mla_cache_f16_load(p, a->half + (size_t)r * LAT + d));
+                lg[(size_t)h*SLOTS+t] = svaddv_f32(p, dot);
+            } else lg[(size_t)h*SLOTS+t]=f32dot(ql+(size_t)h*LAT,z+(size_t)r*LAT,LAT);
         }
 #pragma omp for schedule(static)
         for(int h=0;h<hn;h++){
@@ -536,6 +566,14 @@ static void mla_value_worker(void *context) {
             const int h=w/NDC,d0=(w%NDC)*DC;
             const float*l=lg+(size_t)h*SLOTS;
             float*o=va+(size_t)h*LAT;
+            if (a->half) {
+                glm53f_mla_value64_f16(o, a->half, l, hsum + h, selected, nt, d0);
+                continue;
+            }
+            if (a->registers >= 2) {
+                glm53f_mla_value64(o, z, l, hsum + h, selected, nt, d0);
+                continue;
+            }
             for(int d=d0;d<d0+DC;d++)o[d]=0.0f;
             for(int t=0;t<nt;t++){int r=selected?selected[t]:t;float x=l[t]/hsum[h];
                 for(int d=d0;d<d0+DC;d+=vl){svbool_t p=svwhilelt_b32(d,LAT);
@@ -572,7 +610,8 @@ static int mla_heads_q8_value(glm53f_sparse_context_12n*c,float*out,
     int bad=0;
     const char *registers = getenv("GLM53F_MLA_REGISTERS");
     struct mla_value_call call = {c, out, q, z, selected, nt, 0,
-        registers && atoi(registers) && svcntw() == 16};
+        registers && svcntw() == 16 ? atoi(registers) : 0,
+        selected == c->selected ? c->latent_f16 : NULL};
     if (glm53f_team_available()) glm53f_team_dispatch(mla_value_worker, &call);
     else {
 #pragma omp parallel
@@ -790,6 +829,8 @@ static int sparse_attention_local_replicated(glm53f_sparse_context_12n *c,
     mv_b16(c->iq, c->wqb, c->qres, IH * ID, QA);
     mv_b16(c->iw, c->wp, x, IH, H);
     }
+    if (c->latent_f16) glm53f_mla_cache_f16_store(c->latent_f16 + (size_t)pos * LAT,
+        c->latent + (size_t)pos * LAT, LAT);
     c->profile_phase[0] += sparse_clock(c) - begin;
     begin = sparse_clock(c);
     if (getenv("GLM53F_SPARSE_REFERENCE"))
@@ -803,15 +844,18 @@ static int sparse_attention_local_replicated(glm53f_sparse_context_12n *c,
     if (ns < 1) return -1;
     begin = sparse_clock(c);
     if (c->q2_native) {
-        struct sparse_pack_call call = {c, ns};
-        if (glm53f_team_available()) glm53f_team_dispatch(sparse_pack_worker, &call);
-        else {
+        if (!c->latent_f16) {
+            struct sparse_pack_call call = {c, ns};
+            if (glm53f_team_available()) glm53f_team_dispatch(sparse_pack_worker, &call);
+            else {
 #pragma omp parallel
-            { sparse_pack_worker(&call); }
+                { sparse_pack_worker(&call); }
+            }
+            c->profile_phase[2] += sparse_clock(c) - begin;
+            begin = sparse_clock(c);
         }
-        c->profile_phase[2] += sparse_clock(c) - begin;
-        begin = sparse_clock(c);
-        if (mla_heads_q8_value(c,attn,c->query,c->packed,NULL,ns)) return -1;
+        if (mla_heads_q8_value(c,attn,c->query,c->packed,
+                c->latent_f16 ? c->selected : NULL,ns)) return -1;
     } else if (tokens > TOPK + KPOOL - 1 && !getenv("GLM53F_SPARSE_NO_PACK")) {
 #pragma omp parallel for schedule(static)
         for (int i = 0; i < ns; ++i)
@@ -1112,6 +1156,7 @@ int glm53f_sparse_cache_append_12n(glm53f_sparse_context_12n *c, const float *x)
     if (c->q2_native) glm53f_iq_matvec(latent, c->q2_kva, c->q2_kva_type, LAT, H, x);
     else mv_f8(latent, c->kva, c->kvas, x, LAT, H);
     glm53f_rmsnorm_bf16(latent, latent, c->kvan, LAT, 1e-5f);
+    if (c->latent_f16) glm53f_mla_cache_f16_store(c->latent_f16 + (size_t)pos * LAT, latent, LAT);
     mv_b16(raw, c->wk, x, ID, H);
     glm53f_layernorm_bf16(c->key + (size_t)pos * ID, raw,
                          c->knw, c->knb, ID, 1e-5f);
@@ -1260,6 +1305,29 @@ static int sparse_select_prefill(glm53f_sparse_context_12n *c,
         for (int t = 0; t < tokens; ++t)
             if (base + t + 1 <= TOPK + KPOOL - 1)
                 glm53f_index_query_transpose(w->qt[t], w->iq + (size_t)t * IH * ID);
+        if (heads == 2 && base > TOPK + KPOOL - 1) {
+            int span = 4 * c->ranks;
+#pragma omp for collapse(2) schedule(static)
+            for (int t = 0; t < tokens; ++t)
+                for (int group = 0; group < (pools + span - 1) / span; ++group) {
+                    int start = group * span, end = start + span;
+                    if (end > pools) end = pools;
+                    for (int p = start; p < end; ++p)
+                        w->score_local[(size_t)t * w->score_stride + p] = 0;
+                    int np = (base + t + 1) / KPOOL;
+                    if (end > np) end = np;
+                    int first = start + c->rank;
+                    int n = first < end ? (end - 1 - first) / c->ranks + 1 : 0;
+                    if (n) {
+                        float score[4];
+                        glm53f_index_score_f32_keys4(score, w->iq + (size_t)t * IH * ID,
+                            w->iw + (size_t)t * IH, c->pool + (size_t)first * ID,
+                            (size_t)c->ranks * ID, n);
+                        for (int k = 0; k < n; ++k)
+                            w->score_local[(size_t)t * w->score_stride + first + k * c->ranks] = score[k];
+                    }
+                }
+        } else {
 #pragma omp for collapse(2) schedule(static)
         for (int t = 0; t < tokens; ++t)
             for (int p = 0; p < score_columns; ++p) {
@@ -1283,6 +1351,7 @@ static int sparse_select_prefill(glm53f_sparse_context_12n *c,
                 }
                 w->score_local[(size_t)t * w->score_stride + p] = score;
             }
+        }
     }
     if (c->prefill.features & GLM53F_PREFILL_COMM) {
         int first = TOPK + KPOOL - 1 - base;
@@ -1369,9 +1438,6 @@ static void sparse_mv_bf16_wide(const glm53f_prefill_config *config,
  * 4 keys x heads accumulators sharing every loaded latent vector, the values use heads x 4 vectors, and the
  * absorb step reuses each bf16 weight vector for up to six tokens.  All heads of a token are handled by one
  * thread; the 32-token attention micro-batch is spread over the team. */
-static inline svfloat32_t mlb_r16(svbool_t p, svfloat32_t v) {
-    return svcvt_f32_f16_x(p, svcvt_f16_f32_x(p, v));
-}
 #define MLB_SLOTS (TOPK + KPOOL)
 
 static inline __attribute__((always_inline)) void mlb_absorb(float *ql, const float *qs, const uint16_t *wk,
@@ -1399,108 +1465,7 @@ static inline __attribute__((always_inline)) void mlb_absorb(float *ql, const fl
 #undef MLB_A_ST
 }
 
-/* logits[h][t] = f32dot(ql[h], round16(cache[sel[t]])) for NH heads, 4 keys at a time. */
-static inline __attribute__((always_inline)) void mlb_logits(float *lg, const float *ql, const float *cache,
-        const int *sel, int nt, const int NH) {
-    const svbool_t pg = svptrue_b32();
-    int t = 0;
-    for (; t + 4 <= nt; t += 4) {
-        const float *z0 = cache + (size_t)sel[t] * LAT, *z1 = cache + (size_t)sel[t + 1] * LAT;
-        const float *z2 = cache + (size_t)sel[t + 2] * LAT, *z3 = cache + (size_t)sel[t + 3] * LAT;
-#define MLB_L_DECL(H) svfloat32_t l0_##H = svdup_f32(0), l1_##H = l0_##H, l2_##H = l0_##H, l3_##H = l0_##H
-        MLB_L_DECL(0); MLB_L_DECL(1); MLB_L_DECL(2); MLB_L_DECL(3); MLB_L_DECL(4); MLB_L_DECL(5);
-#undef MLB_L_DECL
-        for (int d = 0; d < LAT; d += 16) {
-            const svfloat32_t v0 = mlb_r16(pg, svld1(pg, z0 + d)), v1 = mlb_r16(pg, svld1(pg, z1 + d));
-            const svfloat32_t v2 = mlb_r16(pg, svld1(pg, z2 + d)), v3 = mlb_r16(pg, svld1(pg, z3 + d));
-#define MLB_L_STEP(H) if ((H) < NH) { const svfloat32_t q = svld1(pg, ql + (size_t)(H) * LAT + d); \
-            l0_##H = svmla_f32_x(pg, l0_##H, q, v0); l1_##H = svmla_f32_x(pg, l1_##H, q, v1); \
-            l2_##H = svmla_f32_x(pg, l2_##H, q, v2); l3_##H = svmla_f32_x(pg, l3_##H, q, v3); }
-            MLB_L_STEP(0) MLB_L_STEP(1) MLB_L_STEP(2) MLB_L_STEP(3) MLB_L_STEP(4) MLB_L_STEP(5)
-#undef MLB_L_STEP
-        }
-#define MLB_L_ST(H) if ((H) < NH) { float *o = lg + (size_t)(H) * MLB_SLOTS + t; \
-        o[0] = svaddv_f32(pg, l0_##H); o[1] = svaddv_f32(pg, l1_##H); o[2] = svaddv_f32(pg, l2_##H); o[3] = svaddv_f32(pg, l3_##H); }
-        MLB_L_ST(0) MLB_L_ST(1) MLB_L_ST(2) MLB_L_ST(3) MLB_L_ST(4) MLB_L_ST(5)
-#undef MLB_L_ST
-    }
-    for (; t < nt; ++t) {
-        const float *z0 = cache + (size_t)sel[t] * LAT;
-#define MLB_T_DECL(H) svfloat32_t s##H = svdup_f32(0)
-        MLB_T_DECL(0); MLB_T_DECL(1); MLB_T_DECL(2); MLB_T_DECL(3); MLB_T_DECL(4); MLB_T_DECL(5);
-#undef MLB_T_DECL
-        for (int d = 0; d < LAT; d += 16) {
-            const svfloat32_t v0 = mlb_r16(pg, svld1(pg, z0 + d));
-#define MLB_T_STEP(H) if ((H) < NH) s##H = svmla_f32_x(pg, s##H, svld1(pg, ql + (size_t)(H) * LAT + d), v0);
-            MLB_T_STEP(0) MLB_T_STEP(1) MLB_T_STEP(2) MLB_T_STEP(3) MLB_T_STEP(4) MLB_T_STEP(5)
-#undef MLB_T_STEP
-        }
-#define MLB_T_ST(H) if ((H) < NH) lg[(size_t)(H) * MLB_SLOTS + t] = svaddv_f32(pg, s##H);
-        MLB_T_ST(0) MLB_T_ST(1) MLB_T_ST(2) MLB_T_ST(3) MLB_T_ST(4) MLB_T_ST(5)
-#undef MLB_T_ST
-    }
-}
-
-/* va[h][d] = sum_t p[h][t] * round16(cache[sel[t]][d]) in key order, 64 columns at a time. va rows: va + h*va_stride. */
-static inline __attribute__((always_inline)) void mlb_values(float *va, size_t va_stride, const float *lg,
-        const float *cache, const int *sel, int nt, const int NH) {
-    const svbool_t pg = svptrue_b32();
-    for (int db = 0; db < LAT; db += 64) {
-#define MLB_V_DECL(H) svfloat32_t v##H##0 = svdup_f32(0), v##H##1 = v##H##0, v##H##2 = v##H##0, v##H##3 = v##H##0
-        MLB_V_DECL(0); MLB_V_DECL(1); MLB_V_DECL(2); MLB_V_DECL(3); MLB_V_DECL(4); MLB_V_DECL(5);
-#undef MLB_V_DECL
-        for (int t = 0; t < nt; ++t) {
-            const float *z = cache + (size_t)sel[t] * LAT + db;
-            const svfloat32_t z0 = mlb_r16(pg, svld1(pg, z)), z1 = mlb_r16(pg, svld1(pg, z + 16));
-            const svfloat32_t z2 = mlb_r16(pg, svld1(pg, z + 32)), z3 = mlb_r16(pg, svld1(pg, z + 48));
-#define MLB_V_STEP(H) if ((H) < NH) { const float x = lg[(size_t)(H) * MLB_SLOTS + t]; \
-            v##H##0 = svmla_n_f32_x(pg, v##H##0, z0, x); v##H##1 = svmla_n_f32_x(pg, v##H##1, z1, x); \
-            v##H##2 = svmla_n_f32_x(pg, v##H##2, z2, x); v##H##3 = svmla_n_f32_x(pg, v##H##3, z3, x); }
-            MLB_V_STEP(0) MLB_V_STEP(1) MLB_V_STEP(2) MLB_V_STEP(3) MLB_V_STEP(4) MLB_V_STEP(5)
-#undef MLB_V_STEP
-        }
-#define MLB_V_ST(H) if ((H) < NH) { float *o = va + (size_t)(H) * va_stride + db; \
-        svst1(pg, o, v##H##0); svst1(pg, o + 16, v##H##1); svst1(pg, o + 32, v##H##2); svst1(pg, o + 48, v##H##3); }
-        MLB_V_ST(0) MLB_V_ST(1) MLB_V_ST(2) MLB_V_ST(3) MLB_V_ST(4) MLB_V_ST(5)
-#undef MLB_V_ST
-    }
-}
-
-static void mlb_token(float *va, size_t va_stride, float *lg, const float *ql, const float *cache,
-        const int *sel, int nt, int NH) {
-    switch (NH) {
-#define MLB_CASE(N) case N: mlb_logits(lg, ql, cache, sel, nt, N); break;
-    MLB_CASE(1) MLB_CASE(2) MLB_CASE(3) MLB_CASE(4) MLB_CASE(5) MLB_CASE(6)
-#undef MLB_CASE
-    }
-    for (int h = 0; h < NH; ++h) {
-        float *l = lg + (size_t)h * MLB_SLOTS;
-        const svbool_t pt = svptrue_b32();
-        svfloat32_t vmx = svdup_f32(-INFINITY);
-        int t = 0;
-        for (; t + 16 <= nt; t += 16) vmx = svmax_f32_x(pt, vmx, svld1_f32(pt, l + t));
-        float mx = svmaxv_f32(pt, vmx);
-        for (; t < nt; ++t) if (l[t] > mx) mx = l[t];
-        /* vector exp (rel. error ~1e-7) replaces 12k scalar expf calls per token */
-        svfloat32_t vsum = svdup_f32(0);
-        for (t = 0; t < nt; t += 16) {
-            const svbool_t p = svwhilelt_b32(t, nt);
-            svfloat32_t e = gmn_expf(p, svsub_n_f32_x(p, svld1_f32(p, l + t), mx));
-            svst1_f32(p, l + t, e);
-            vsum = svadd_f32_m(p, vsum, e);
-        }
-        const float sum = svaddv_f32(pt, vsum);
-        for (t = 0; t < nt; t += 16) {
-            const svbool_t p = svwhilelt_b32(t, nt);
-            svst1_f32(p, l + t, svdiv_n_f32_x(p, svld1_f32(p, l + t), sum));
-        }
-    }
-    switch (NH) {
-#define MLB_CASE(N) case N: mlb_values(va, va_stride, lg, cache, sel, nt, N); break;
-    MLB_CASE(1) MLB_CASE(2) MLB_CASE(3) MLB_CASE(4) MLB_CASE(5) MLB_CASE(6)
-#undef MLB_CASE
-    }
-}
+#include "glm53f_mla_attention.h"
 
 /* Returns 0 on success, -2 when unsupported (caller falls back), -1 on error. */
 static int mla_native_batch(glm53f_sparse_context_12n *c, glm53f_sparse_prefill_workspace_12n *w, int tokens) {
@@ -1539,7 +1504,7 @@ static int mla_native_batch(glm53f_sparse_context_12n *c, glm53f_sparse_prefill_
     for (int t = 0; t < tokens; ++t) {
         float *lg = c->mlb_lg + (size_t)omp_get_thread_num() * 8 * MLB_SLOTS;
         /* va is head-major [h][t][LAT]: hand mlb_values the token's row of head 0 and a head stride of tokens*LAT. */
-        mlb_token(va + (size_t)t * LAT, va_stride, lg, ql + (size_t)t * hn * LAT, c->latent, w->selected[t], w->count[t], hn);
+        mlb_token(va + (size_t)t * LAT, va_stride, lg, ql + (size_t)t * hn * LAT, c->latent, c->latent_f16, w->selected[t], w->count[t], hn);
     }
     {
         /* Prepare the activations with the exact per-head function of the reference path (tie-breaking in the
@@ -1645,6 +1610,7 @@ int glm53f_sparse_prefill_12n(glm53f_sparse_context_12n *c,
     for (int t = 0; t < tokens; ++t) {
         float *latent = c->latent + (size_t)(base + t) * LAT;
         glm53f_rmsnorm_bf16(latent, latent, c->kvan, LAT, 1e-5f);
+        if (c->latent_f16) glm53f_mla_cache_f16_store(c->latent_f16 + (size_t)(base + t) * LAT, latent, LAT);
     }
     SPF(3); /* rmsnorm kv_a */
     sparse_mv_bf16_wide(&projection_config, w->raw, c->wk, x, tokens, ID, H);
@@ -1805,7 +1771,7 @@ int glm53f_sparse_prefill_12n(glm53f_sparse_context_12n *c,
     c->profile_phase[5] += sparse_clock(c) - begin;
     return 0;
 }
-void glm53f_sparse_free_12n(glm53f_sparse_context_12n*c){if(!c)return;free(c->mlb_qs);free(c->mlb_ql);free(c->mlb_va);free(c->mlb_out);free(c->mlb_ref);free(c->mlb_lg);free(c->mlb_act);free(c->q8v_ql);free(c->q8v_va);free(c->q8v_log);free(c->q8v_sum);free(c->q8v_act);for(int i=0;i<4;i++){free(c->int8_scale[i]);free(c->int8_weight[i]);}free(c->q2_op);free(c->q2_vb);free(c->q2_kva);free(c->q2_qb);free(c->q2_qa);free(c->cp_bf16_gather);free(c->cp_bf16_local);free(c->hot_latent);free(c->batch_partial);free(c->batch_attn);free(c->packed_index);free(c->packed);free(c->pool_score_global);free(c->pool_score_local);free(c->pool_score_cache);free(c->cp_candidate_gather);free(c->cp_candidate_local);free(c->cp_pack_index);free(c->cp_cur_gate);free(c->cp_cur_key);free(c->cp_cur_latent);free(c->cp_exchange);free(c->cp_gather);free(c->cp_pack);free(c->cp_pool);free(c->cp_gate);free(c->cp_key);free(c->cp_latent);free(c->apef);free(c->selected);free(c->partial);free(c->attn);free(c->pool);free(c->iw);free(c->iq);free(c->gcache);free(c->key);free(c->latent);free(c->query);free(c->qres);free(c->wp);free(c->wqb);free(c->ape);free(c->gatew);free(c->knb);free(c->knw);free(c->wk);free(c->ops);free(c->op);free(c->kvb);free(c->kvan);free(c->kvas);free(c->kva);free(c->qbs);free(c->qb);free(c->qan);free(c->qas);free(c->qa);free(c);}
+void glm53f_sparse_free_12n(glm53f_sparse_context_12n*c){if(!c)return;free(c->mlb_qs);free(c->mlb_ql);free(c->mlb_va);free(c->mlb_out);free(c->mlb_ref);free(c->mlb_lg);free(c->mlb_act);free(c->q8v_ql);free(c->q8v_va);free(c->q8v_log);free(c->q8v_sum);free(c->q8v_act);for(int i=0;i<4;i++){free(c->int8_scale[i]);free(c->int8_weight[i]);}free(c->q2_op);free(c->q2_vb);free(c->q2_kva);free(c->q2_qb);free(c->q2_qa);free(c->cp_bf16_gather);free(c->cp_bf16_local);free(c->hot_latent);free(c->latent_f16);free(c->batch_partial);free(c->batch_attn);free(c->packed_index);free(c->packed);free(c->pool_score_global);free(c->pool_score_local);free(c->pool_score_cache);free(c->cp_candidate_gather);free(c->cp_candidate_local);free(c->cp_pack_index);free(c->cp_cur_gate);free(c->cp_cur_key);free(c->cp_cur_latent);free(c->cp_exchange);free(c->cp_gather);free(c->cp_pack);free(c->cp_pool);free(c->cp_gate);free(c->cp_key);free(c->cp_latent);free(c->apef);free(c->selected);free(c->partial);free(c->attn);free(c->pool);free(c->iw);free(c->iq);free(c->gcache);free(c->key);free(c->latent);free(c->query);free(c->qres);free(c->wp);free(c->wqb);free(c->ape);free(c->gatew);free(c->knb);free(c->knw);free(c->wk);free(c->ops);free(c->op);free(c->kvb);free(c->kvan);free(c->kvas);free(c->kva);free(c->qbs);free(c->qb);free(c->qan);free(c->qas);free(c->qa);free(c);}
 #ifndef GLM53F_SPARSE_NO_MAIN
 int main(int argc,char**argv){
     int rank,nr,layer=argc>3?atoi(argv[3]):43,tokens=argc>2?atoi(argv[2]):512,h0,hn,qd;char n[256];glm53f_st_context*st;
