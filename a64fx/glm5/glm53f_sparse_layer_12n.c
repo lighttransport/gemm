@@ -422,6 +422,7 @@ size_t glm53f_sparse_cache_bytes_12n(const glm53f_sparse_context_12n *c) {
     return n;
 }
 static void update_completed_pool(glm53f_sparse_context_12n*c,int pool){float*pk=c->pool+(size_t)pool*ID;for(int d=0;d<ID;d++){float mx=-INFINITY,den=0,val=0;for(int z=0;z<KPOOL;z++){float a=c->gcache[(size_t)(pool*KPOOL+z)*ID+d]+c->apef[(size_t)z*ID+d];if(a>mx)mx=a;}for(int z=0;z<KPOOL;z++){float a=expf(c->gcache[(size_t)(pool*KPOOL+z)*ID+d]+c->apef[(size_t)z*ID+d]-mx);den+=a;val+=a*c->key[(size_t)(pool*KPOOL+z)*ID+d];}pk[d]=val/den;}}
+static int sp_ar(const float *in, float *out, int n);
 static int select_incremental(glm53f_sparse_context_12n*c,int tokens){int np=tokens/KPOOL,nc=TOPK/KPOOL,out=0;if(nc>np)nc=np;
     if(tokens<=TOPK+KPOOL-1){
 #pragma omp parallel for schedule(static)
@@ -430,7 +431,7 @@ static int select_incremental(glm53f_sparse_context_12n*c,int tokens){int np=tok
     }
 #pragma omp parallel for schedule(static)
     for(int p=0;p<np;p++){float s=0;if(p%c->ranks==c->rank){const float*pk=c->pool+(size_t)p*ID;for(int h=0;h<IH;h++){float dot=f32dot(c->iq+(size_t)h*ID,pk,ID);if(dot>0)s+=c->iw[h]*dot/sqrtf((float)(ID*IH));}}c->pool_score_local[p]=s;}
-    if(glm53f_sum_allreduce_12n(c->pool_score_local,c->pool_score_global,np))return-1;
+    if(sp_ar(c->pool_score_local,c->pool_score_global,np))return-1;
     pool_top_exact(c->pool_score_cache,c->pool_score_global,np,nc);
 expand: for(int i=0;i<nc;i++)for(int z=0;z<KPOOL;z++)c->selected[out++]=c->pool_score_cache[i].id*KPOOL+z;for(int z=np*KPOOL;z<tokens;z++)c->selected[out++]=z;return out;}
 static void ensure_mla_shards(glm53f_sparse_context_12n*c){if(c->mla_ql)return;size_t base=(size_t)(TOPK+KPOOL)*LAT,n=base+(size_t)c->hn*(2*LAT+TOPK+KPOOL+8*LAT);float*p=realloc(c->packed,n*4);if(!p)MPI_Abort(MPI_COMM_WORLD,2);c->packed=p;c->mla_ql=p+base;c->mla_log=c->mla_ql+(size_t)c->hn*LAT;c->mla_part=c->mla_log+(size_t)c->hn*(TOPK+KPOOL);c->mla_va=c->mla_part+(size_t)c->hn*8*LAT;}
@@ -578,6 +579,16 @@ static void sparse_gemm_run(const uint8_t *wp, int K, int R, const float *x, int
             gk_gemm_panel64(32, wp, K, pnl * 64, pnl * 64 + 64, t0, t1, xp, xsp, y, (size_t)R);
         }
     }
+}
+/* Prefill async reduction (target decode): the o_proj partials of a tile are reduced by a helper thread on the spare core, so
+ * every OTHER collective of the tile (index scores, pool scores) goes through MPI to avoid sharing the multi-TNI state. */
+static int sp_defer_reduce;
+void glm53f_sparse_set_defer_reduce_12n(int on) { sp_defer_reduce = on; }
+static inline int sp_ar(const float *in, float *out, int n) {
+    return sp_defer_reduce ? glm53f_sum_allreduce_mpi_12n(in, out, n) : glm53f_sum_allreduce_12n(in, out, n);
+}
+static inline int sp_ar_prefill(const float *in, float *out, int n) {
+    return sp_defer_reduce ? glm53f_sum_allreduce_mpi_12n(in, out, n) : glm53f_sum_allreduce_prefill_12n(in, out, n);
 }
 static inline int sp_is_q80(int type) {
     return type == GLM53F_GGML_Q8_0 || type == GLM53F_NATIVE_Q8_0R || type == GLM53F_NATIVE_Q8_0R16;
@@ -1174,13 +1185,13 @@ static int sparse_select_prefill(glm53f_sparse_context_12n *c,
                        (size_t)((base + t + 1) / KPOOL) * sizeof(float));
             }
             w->score_offsets[tokens] = total;
-            if (glm53f_sum_allreduce_prefill_12n(w->score_packed_local,
+            if (sp_ar_prefill(w->score_packed_local,
                     w->score_packed_global, total)) return -1;
         }
     } else for (int t = 0; t < tokens; ++t) {
         int length = base + t + 1;
         if (length > TOPK + KPOOL - 1 &&
-            glm53f_sum_allreduce_12n(w->score_local + (size_t)t * w->score_stride,
+            sp_ar(w->score_local + (size_t)t * w->score_stride,
                 w->score_global + (size_t)t * w->score_stride, length / KPOOL)) return -1;
     }
 #pragma omp parallel for schedule(static)
@@ -1675,6 +1686,7 @@ int glm53f_sparse_prefill_12n(glm53f_sparse_context_12n *c,
         if (glm53f_native_matvec_batch(&op, 1, w->attn, tokens)) return -1;
     } else sparse_mv_fp8_wide(&c->prefill, w->partial, c->op, c->ops, w->attn, tokens, H, cols);
     c->profile_phase[4] += sparse_clock(c) - begin;
+    if (sp_defer_reduce) { memcpy(out, w->partial, (size_t)tokens * H * sizeof(float)); return 0; } /* reduced by the caller's helper */
     begin = sparse_clock(c);
     if (glm53f_sum_allreduce_slabs_12n(w->partial, out, tokens, H,
             c->prefill.features & GLM53F_PREFILL_COMM ? c->prefill.slab_tokens : 1)) return -1;

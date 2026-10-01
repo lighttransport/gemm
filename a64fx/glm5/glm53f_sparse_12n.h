@@ -31,6 +31,8 @@ glm53f_sparse_context_12n *glm53f_sparse_create_format_12n(
 int glm53f_sparse_convert_int8_12n(glm53f_sparse_context_12n *context);
 void glm53f_sparse_reset_12n(glm53f_sparse_context_12n *context);
 void glm53f_sparse_free_12n(glm53f_sparse_context_12n *context);
+/* Prefill only: leave the tile's o_proj partial unreduced in `out` and route the other collectives through MPI. */
+void glm53f_sparse_set_defer_reduce_12n(int on);
 void glm53f_sparse_prefetch_plan_12n(const glm53f_sparse_context_12n *c);
 int glm53f_sparse_sublayer_12n(
     void *context, float *output, const float *normalized_input);

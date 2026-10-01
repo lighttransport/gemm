@@ -136,7 +136,7 @@ struct glm53f_target_model_12n {
     float *streams;
     const float *last_streams;
     glm53f_target_layer_scratch_12n *batch_scratch;
-    float *batch_streams, *batch_normalized, *batch_output, *batch_tmp; int kda_defer, kda_async;
+    float *batch_streams, *batch_normalized, *batch_output, *batch_tmp; int kda_defer, kda_async, sparse_async;
     glm53f_sparse_prefill_workspace_12n *sparse_prefill;
     glm53f_state_io *trace;
     unsigned char *batch_state;
@@ -261,6 +261,7 @@ static glm53f_target_model_12n *target_model_create_with_kda(
     m->batch_output = a256((size_t)PREFILL_BATCH * HIDDEN * sizeof(float));
     m->batch_tmp = a256((size_t)PREFILL_BATCH * HIDDEN * sizeof(float));
     m->kda_defer = getenv("GLM53F_KDA_DEFER") ? atoi(getenv("GLM53F_KDA_DEFER")) : 0;
+    m->sparse_async = getenv("GLM53F_SPARSE_ASYNC") ? atoi(getenv("GLM53F_SPARSE_ASYNC")) : 0; /* hangs after ~2k tokens of context: see memory notes */
     m->kda_async = getenv("GLM53F_KDA_ASYNC") ? atoi(getenv("GLM53F_KDA_ASYNC")) : 1;
     for (int l = 0; l < LAYERS; l++) {
         size_t n = glm53f_kda_state_bytes_12n(m->kda[l]);
@@ -530,16 +531,29 @@ int glm53f_target_model_step_batch_12n(glm53f_target_model_12n *m,
             if (wide_sparse && !m->sparse_prefill)
                 m->sparse_prefill = glm53f_sparse_prefill_workspace_create_12n();
             int panel = wide_sparse ? GLM53F_PREFILL_ATTN_TOKENS : KERNEL_BATCH;
+            /* async: the helper thread reduces finished tiles' o_proj partials while the next tile is computed (all other
+             * collectives of the tile use MPI meanwhile, see glm53f_sparse_set_defer_reduce_12n) */
+            const int async_sp = wide_sparse && (m->prefill.features & GLM53F_PREFILL_COMM) && !after && m->sparse_async &&
+                !glm53f_sparse_is_context_parallel_12n(m->sparse[l]) &&
+                glm53f_async_available_12n() &&
+                !glm53f_async_begin_12n(m->batch_tmp, m->batch_output, tokens, HIDDEN, m->prefill.slab_tokens);
+            float *sp_out = async_sp ? m->batch_tmp : m->batch_output;
+            if (async_sp) glm53f_sparse_set_defer_reduce_12n(1);
             for (int tile = 0; tile < tokens; tile += panel) {
                 int n = tokens - tile;
                 if (n > panel) n = panel;
                 int rc = wide_sparse ? glm53f_sparse_prefill_12n(m->sparse[l],
-                    m->sparse_prefill, m->batch_output + (size_t)tile * HIDDEN,
+                    m->sparse_prefill, sp_out + (size_t)tile * HIDDEN,
                     m->batch_normalized + (size_t)tile * HIDDEN, n) :
                     glm53f_sparse_sublayer_batch_12n(
                         m->sparse[l], m->batch_output + (size_t)tile * HIDDEN,
                         m->batch_normalized + (size_t)tile * HIDDEN, n);
                 if (rc) return -1;
+                if (async_sp) glm53f_async_ready_12n(tile + n);
+            }
+            if (async_sp) {
+                glm53f_sparse_set_defer_reduce_12n(0);
+                if (glm53f_async_finish_12n()) return -1;
             }
             if (after)
                 for (int t = 0; t < tokens; t++) {
