@@ -7,12 +7,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 enum { STEPS = 128 };
 struct glm53f_target_model_12n { int position, bulk_calls; uint64_t hash; };
 struct glm53f_target_snapshot_12n { int position; uint64_t hash; };
 static int reference[STEPS + 1];
 static uint64_t expected_hash[STEPS + 1];
+static int slow_after;
 static uint64_t append(uint64_t hash, int token) { return hash * UINT64_C(1000003) + (unsigned)token + 1; }
 glm53f_target_snapshot_12n *glm53f_target_snapshot_create_12n(const glm53f_target_model_12n *m) {
     return m ? calloc(1, sizeof(glm53f_target_snapshot_12n)) : NULL;
@@ -24,6 +26,10 @@ int glm53f_target_snapshot_restore_12n(glm53f_target_model_12n *m, const glm53f_
 static int step(glm53f_target_model_12n *m, int input) {
     m->hash = append(m->hash, input);
     ++m->position;
+    if (slow_after && m->position > slow_after) {
+        struct timespec pause = {0, 2000000};
+        nanosleep(&pause, NULL);
+    }
     return m->position <= STEPS && m->hash == expected_hash[m->position] ?
         reference[m->position] : 2000 + m->position;
 }
@@ -83,6 +89,29 @@ int main(int argc, char **argv) {
             }
         }
     }
+    /* An inexpensive first window must not prevent fallback when later
+     * verification becomes more expensive. The toy target delays later
+     * steps, leaving token/state correctness independent of wall time. */
+    slow_after = 32;
+    reference[0] = 12;
+    expected_hash[0] = 0;
+    for (int j = 1; j <= STEPS; ++j) {
+        reference[j] = 100 + j;
+        expected_hash[j] = append(expected_hash[j - 1], reference[j - 1]);
+    }
+    glm53f_target_model_12n late = {0};
+    glm53f_lookup_workspace_12n *w = glm53f_lookup_workspace_create_12n(&late, STEPS + 11);
+    int ids[STEPS + 1];
+    glm53f_lookup_stats_12n stats;
+    struct observer_state observer = {0};
+    int rc = w ? glm53f_lookup_decode_12n(&late, w, prompt, 10, 12,
+        STEPS, 4, 0.001, ids, &stats, observe, &observer) : -1;
+    int bad = rc || memcmp(ids, reference, sizeof(ids)) || late.position != STEPS ||
+        late.hash != expected_hash[STEPS] || !late.bulk_calls || observer.failed ||
+        observer.last != STEPS || stats.cycles <= 16 || stats.cycles >= STEPS;
+    if (bad) fprintf(stderr, "LOOKUP_SPEC_LATE_COST_FAIL rc=%d cycles=%d bulk=%d\n", rc, stats.cycles, late.bulk_calls);
+    failed |= bad; ++cases;
+    glm53f_lookup_workspace_free_12n(w);
     printf("GLM53F_LOOKUP_SPEC %s cases=%d\n", failed ? "FAIL" : "PASS", cases);
     MPI_Finalize();
     return failed ? 1 : 0;

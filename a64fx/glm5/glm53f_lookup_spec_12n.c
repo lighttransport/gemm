@@ -49,13 +49,14 @@ int glm53f_lookup_decode_12n(glm53f_target_model_12n *m,
     w->history[prompt_count] = ids[0] = first;
     int completed = 0;
     double begin = glm53f_clock();
+    int window_completed = 0, window_cycles = 0;
     while (completed < transitions) {
         /* All ranks choose the same policy from maximum elapsed time. A local
          * timing decision could diverge collective order and deadlock. */
-        if (stats->cycles == 16 && plain_seconds_per_token > 0) {
+        if (stats->cycles - window_cycles >= 16 && plain_seconds_per_token > 0) {
             double local = glm53f_clock() - begin, maximum;
             MPI_Allreduce(&local, &maximum, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
-            if (maximum / completed > plain_seconds_per_token * 1.05) {
+            if (maximum / (completed - window_completed) > plain_seconds_per_token * 1.05) {
                 double start = glm53f_clock();
                 int remaining = transitions - completed;
                 /* A single resident team handles the complete fallback suffix.
@@ -69,6 +70,11 @@ int glm53f_lookup_decode_12n(glm53f_target_model_12n *m,
                 if (observer) observer(observer_context, completed);
                 break;
             }
+            /* Recheck later windows: an initially cheap no-hit prefix does
+             * not predict the cost once verification starts finding drafts. */
+            begin = glm53f_clock();
+            window_completed = completed;
+            window_cycles = stats->cycles;
         }
         int draft[4], input[5], prediction[5];
         float logits[5];
