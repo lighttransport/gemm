@@ -590,6 +590,9 @@ static inline int sp_ar(const float *in, float *out, int n) {
 static inline int sp_ar_prefill(const float *in, float *out, int n) {
     return sp_defer_reduce ? glm53f_sum_allreduce_mpi_12n(in, out, n) : glm53f_sum_allreduce_prefill_12n(in, out, n);
 }
+void glm53f_sparse_prewarm_12n(glm53f_sparse_context_12n *c) {
+    if (c && c->q2_native && !c->cp) (void)sparse_gemm_setup(c);
+}
 static inline int sp_is_q80(int type) {
     return type == GLM53F_GGML_Q8_0 || type == GLM53F_NATIVE_Q8_0R || type == GLM53F_NATIVE_Q8_0R16;
 }

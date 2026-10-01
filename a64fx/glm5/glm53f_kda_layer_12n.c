@@ -37,7 +37,7 @@ static double kd_acc[8]; static long kd_tokens; static int kd_atexit_set;
 static double kd_dec[8]; static long kd_dec_calls;
 static double kd_sub[8], kd_st; static int kd_sub_on;
 #define KS(I) do { if (kd_sub_on) { _Pragma("omp barrier") _Pragma("omp master") { double n_ = MPI_Wtime(); kd_sub[I] += n_ - kd_st; kd_st = n_; } } } while (0)
-static void kd_report(void){int r=0;MPI_Comm_rank(MPI_COMM_WORLD,&r);(void)r;if(kd_dec_calls&&getenv("GLM53F_KDA_DETAIL"))fprintf(stderr,"GLM53F_KDA_DECODE_DETAIL us per layer-call: proj=%.1f conv=%.1f fb+norm+decay=%.1f recurrence=%.1f gb+rmsnorm=%.1f oproj=%.1f allreduce=%.1f (calls=%ld)\n",kd_dec[0]*1e6/kd_dec_calls,kd_dec[1]*1e6/kd_dec_calls,kd_dec[2]*1e6/kd_dec_calls,kd_dec[3]*1e6/kd_dec_calls,kd_dec[4]*1e6/kd_dec_calls,kd_dec[5]*1e6/kd_dec_calls,kd_dec[6]*1e6/kd_dec_calls,kd_dec_calls);if(kd_tokens&&getenv("GLM53F_KDA_BATCH_DETAIL"))fprintf(stderr,"GLM53F_KDA_BATCH_DETAIL us_per_token_per_layer: proj=%.2f conv=%.2f prep=%.2f rec=%.2f norm=%.2f oproj=%.2f allreduce=%.2f (tokens=%ld)\n",kd_acc[0]*1e6/kd_tokens,kd_acc[1]*1e6/kd_tokens,kd_acc[2]*1e6/kd_tokens,kd_acc[3]*1e6/kd_tokens,kd_acc[4]*1e6/kd_tokens,kd_acc[5]*1e6/kd_tokens,kd_acc[6]*1e6/kd_tokens,kd_tokens);if(kd_tokens&&kd_sub[5]>0)fprintf(stderr,"GLM53F_KDA_GEMM_SUB us_per_token_per_layer: quant1=%.2f gemm1=%.2f copy1=%.2f quant2=%.2f gemm2=%.2f copy2=%.2f\n",kd_sub[0]*1e6/kd_tokens,kd_sub[1]*1e6/kd_tokens,kd_sub[2]*1e6/kd_tokens,kd_sub[3]*1e6/kd_tokens,kd_sub[4]*1e6/kd_tokens,kd_sub[5]*1e6/kd_tokens);}
+static void kd_report(void){int r=0;MPI_Comm_rank(MPI_COMM_WORLD,&r);(void)r;if(kd_dec_calls&&getenv("GLM53F_KDA_DETAIL"))fprintf(stderr,"GLM53F_KDA_DECODE_DETAIL us per layer-call: proj=%.1f conv=%.1f fb+norm+decay=%.1f recurrence=%.1f gb+rmsnorm=%.1f oproj=%.1f allreduce=%.1f (calls=%ld)\n",kd_dec[0]*1e6/kd_dec_calls,kd_dec[1]*1e6/kd_dec_calls,kd_dec[2]*1e6/kd_dec_calls,kd_dec[3]*1e6/kd_dec_calls,kd_dec[4]*1e6/kd_dec_calls,kd_dec[5]*1e6/kd_dec_calls,kd_dec[6]*1e6/kd_dec_calls,kd_dec_calls);if(kd_tokens&&getenv("GLM53F_KDA_BATCH_DETAIL"))fprintf(stderr,"GLM53F_KDA_BATCH_DETAIL us_per_token_per_layer: proj=%.2f conv=%.2f prep=%.2f rec=%.2f norm=%.2f oproj=%.2f allreduce=%.2f (tokens=%ld)\n",kd_acc[0]*1e6/kd_tokens,kd_acc[1]*1e6/kd_tokens,kd_acc[2]*1e6/kd_tokens,kd_acc[3]*1e6/kd_tokens,kd_acc[4]*1e6/kd_tokens,kd_acc[5]*1e6/kd_tokens,kd_acc[6]*1e6/kd_tokens,kd_tokens);if(kd_tokens&&kd_sub[5]>0)fprintf(stderr,"GLM53F_KDA_GEMM_SUB us_per_token_per_layer: quant1=%.2f gemm1=%.2f copy1=%.2f quant2=%.2f gemm2=%.2f copy2=%.2f pre-region=%.2f\n",kd_sub[0]*1e6/kd_tokens,kd_sub[1]*1e6/kd_tokens,kd_sub[2]*1e6/kd_tokens,kd_sub[3]*1e6/kd_tokens,kd_sub[4]*1e6/kd_tokens,kd_sub[5]*1e6/kd_tokens,kd_sub[6]*1e6/kd_tokens);}
 static void *a256(size_t n){void*p=NULL;if(posix_memalign(&p,256,n))p=NULL;if(!p)MPI_Abort(MPI_COMM_WORLD,2);return p;}
 static inline void kda_l2norm(float *x,int n,float eps){double ss=0.0;for(int i=0;i<n;i++)ss+=(double)x[i]*x[i];float scale=1.0f/fmaxf(sqrtf((float)ss),eps);for(int i=0;i<n;i++)x[i]*=scale;}
 static inline void dot8(float*y,const uint16_t*w,const float*x,int n){
@@ -655,6 +655,10 @@ static void kda_gemm_oproj(glm53f_kda_context_12n *c, int tokens) {
 
 static int kda_defer_reduce;
 void glm53f_kda_set_defer_reduce_12n(int on) { kda_defer_reduce = on; }
+/* Build the prefill panel copies / conv tables now (model load time) instead of inside the first prefill call. */
+void glm53f_kda_prewarm_12n(glm53f_kda_context_12n *c) {
+    if (c && c->q2_native) { (void)kda_gemm_setup(c); (void)kda_conv_setup(c); }
+}
 int glm53f_kda_sublayer_batch_capture_12n(glm53f_kda_context_12n *c,
         float *out, const float *x, int tokens, void *states, size_t stride) {
     size_t bytes = glm53f_kda_state_bytes_12n(c);
@@ -707,6 +711,7 @@ int glm53f_kda_sublayer_batch_capture_12n(glm53f_kda_context_12n *c,
     const int kd_detail = getenv("GLM53F_KDA_BATCH_DETAIL") != NULL;
     kd_sub_on = kd_detail;
     double kd_t = start; (void)kd_t;
+    if (kd_detail) kd_sub[6] += MPI_Wtime() - start; /* serial setup before the team starts */
 #pragma omp parallel shared(front_end, kd_t)
     {
         if (c->q2_native) {

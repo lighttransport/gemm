@@ -89,6 +89,7 @@ if [ "$command" = check ]; then
     exit
 fi
 if [ "$command" = generate ]; then
+    export GLM53F_PREWARM=${GLM53F_PREWARM:-1} # build the prefill GEMM panel copies at load time, not inside the first prefill
     mpi_run generate "$GLM53F_BIN_DIR/glm53f_target_decode_12n" "$model" "$routed" "$shared" --generate "$@"
 else
     if [ "$#" -ge 2 ]; then shift 2; elif [ "$#" = 1 ]; then shift; fi

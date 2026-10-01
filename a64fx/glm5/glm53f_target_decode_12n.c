@@ -239,6 +239,10 @@ static glm53f_target_model_12n *target_model_create_with_kda(
     for (int l = 0; l < LAYERS; ++l) {
         if (l % 4 == 3) m->sparse[l] = glm53f_sparse_create_format_12n(model_dir, l, capacity, latent_bf16);
         else m->kda[l] = glm53f_kda_create_12n(model_dir, l);
+        if (getenv("GLM53F_PREWARM") && atoi(getenv("GLM53F_PREWARM"))) { /* prefill GEMM panel copies at load time */
+            glm53f_sparse_prewarm_12n(m->sparse[l]);
+            glm53f_kda_prewarm_12n(m->kda[l]);
+        }
         if (!m->sparse[l] && !m->kda[l]) {
             fprintf(stderr, "GLM53F_TARGET_CREATE_FAIL rank=%d phase=attention layer=%d\n", rank, l);
             goto fail;

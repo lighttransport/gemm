@@ -19,6 +19,8 @@ int glm53f_kda_sublayer_batch_12n(
     const float *normalized_input, int tokens);
 /* Token tile of the batched KDA prefill path (buffers and GEMM scratch are sized for it). */
 enum { GLM53F_KDA_TILE_TOKENS = 64 };
+/* Builds the prefill panel GEMM copies now (model load) instead of inside the first prefill call. */
+void glm53f_kda_prewarm_12n(glm53f_kda_context_12n *c);
 /* Registers this layer's decode front matrices in the prefetch plan (glm53f_pf_plan.h). */
 void glm53f_kda_prefetch_plan_12n(const glm53f_kda_context_12n *c);
 /* Prefill only: leave per-rank partial outputs unreduced (the caller runs the collective). */
