@@ -14,6 +14,7 @@ import numpy as np
 from . import rigdef
 from . import safetensors as st
 from .rigdef import ATTRS
+from .. import gpu
 
 ROOT = Path(__file__).resolve().parents[3]
 SOURCES = ("ryzen/vhuman_deformer.c", "ryzen/lightrig_mlp2.c", "ryzen/gemm_avx2.c")
@@ -125,21 +126,28 @@ class Native:
 GPU_SOURCES = ("cuda/vhuman/vhuman_deformer_cuda.c", "cuda/cuew.c") + SOURCES
 
 
-def build_gpu_library(out_dir: Path) -> Path:
-    """libvhuman_deformer_cuda.so (gcc + cuew; kernels are NVRTC-compiled at run time)."""
+def build_gpu_library(out_dir: Path, backend: str = "auto") -> Path:
+    """Build the CUDA/NVRTC or ROCm/HIPRTC implementation of the same GPU ABI."""
+    selected = gpu.backend() if backend == "auto" else backend
+    if selected == "cpu":
+        raise RuntimeError("no CUDA or ROCm device detected")
+    if selected not in ("cuda", "rocm"):
+        raise ValueError("native GPU backend must be auto, cuda or rocm")
+    sources = (("rdna4/vhuman/vhuman_deformer_hip.c", "rdna4/rocew.c") + SOURCES
+               if selected == "rocm" else GPU_SOURCES)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    lib = out_dir / "libvhuman_deformer_cuda.so"
+    lib = out_dir / f"libvhuman_deformer_{'hip' if selected == 'rocm' else 'cuda'}.so"
     cmd = ["gcc", "-O3", "-mavx2", "-mfma", "-fPIC", "-shared", "-I", str(ROOT / "cuda"), "-I", str(ROOT / "common"),
-           "-o", str(lib), *[str(ROOT / s) for s in GPU_SOURCES], "-ldl", "-lm", "-lpthread"]
+           "-o", str(lib), *[str(ROOT / s) for s in sources], "-ldl", "-lm", "-lpthread"]
     subprocess.run(cmd, check=True, capture_output=True, text=True)
     return lib
 
 
 class NativeGPU(Native):
-    """The CUDA backend (cuda/vhuman): same package, batched evaluation."""
+    """The CUDA or ROCm backend: same package, batched evaluation."""
 
-    def __init__(self, lib_path, package, device: int = 0):
+    def __init__(self, lib_path, package, device: int | None = None):
         super().__init__(lib_path, package)
         L = self.lib
         L.vh_gpu_create.restype = ctypes.c_void_p
@@ -147,10 +155,10 @@ class NativeGPU(Native):
         L.vh_gpu_free.argtypes = [ctypes.c_void_p]
         L.vh_gpu_eval_batch.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_size_t, ctypes.c_int,
                                         ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_double)]
-        self.g = L.vh_gpu_create(self.h, device, 0)
+        self.g = L.vh_gpu_create(self.h, gpu.device_index() if device is None else device, 0)
         if not self.g:
             super().close()
-            raise RuntimeError("no CUDA device or driver")
+            raise RuntimeError("no compatible GPU device or driver")
 
     def eval_gpu(self, controls: np.ndarray, use_ml: bool = True) -> tuple[np.ndarray, list]:
         x = np.ascontiguousarray(controls, np.float32)

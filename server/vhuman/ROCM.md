@@ -175,7 +175,24 @@ need scratch storage with at least 4 GiB free because the downloader enforces
 that reserve. Local HTTP/socket tests and GPU validation require access outside
 a restricted sandbox.
 
-Headless Chromium browser checks are limited on this host: the installed browser
-fails to create a WebGL context even with the test harness's SwiftShader flags
-(`BindToCurrentSequence failed`). This does not affect the native/PyTorch ROCm
-inference checks above.
+All three browser tests pass with offscreen X11 rendering under Xvfb: the eye
+editor, generated head viewer, and skin diffusion composition. The test harness
+uses explicit X11/ANGLE SwiftShader rendering and disables first-run dialogs:
+
+```sh
+VHUMAN_BROWSER_MODE=xvfb xvfb-run -a -s '-screen 0 1280x900x24' \
+ tmp/vhuman-rocm-venv/bin/python -B -m unittest server.vhuman.test_browser -v
+```
+
+Plain headless Chromium still fails to create a WebGL context on this host
+(`BindToCurrentSequence failed`); use the Xvfb command above for browser checks.
+
+The rig integration suite also passed 22 tests with the ROCm interpreter
+explicitly selected (one Vulkan test skipped because glslc is unavailable).
+The native Python GPU wrapper selects the HIP library on ROCm; its 19-frame
+deformer test passed CPU parity at 2e-6 tolerance, including batch tile tails.
+
+```sh
+VHUMAN_RIG_PYTHON="$PWD/tmp/vhuman-rocm-venv/bin/python" \
+ tmp/vhuman-rocm-venv/bin/python -B -m unittest server.vhuman.test_rig -v
+```

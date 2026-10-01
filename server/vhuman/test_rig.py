@@ -275,7 +275,7 @@ class RigEndToEndTests(unittest.TestCase):
             lib = native.build_gpu_library(Path(self.tmp.name) / "gpu")
             G = native.NativeGPU(lib, self.rig_dir / "rig_deformer.safetensors")
         except (RuntimeError, OSError, subprocess.CalledProcessError) as exc:
-            self.skipTest(f"CUDA unavailable: {exc}")
+            self.skipTest(f"CUDA/ROCm unavailable: {exc}")
         try:
             rng = np.random.default_rng(1)
             X = np.zeros((19, G.C), np.float32)                  # not a multiple of the 8-frame tile
