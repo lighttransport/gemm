@@ -4,9 +4,16 @@
 #include <string.h>
 #include "glm53f_runtime.h"
 /* The outer layer tile is independent of verification snapshots, arithmetic
- * panels, and collective payloads. Attention scratch stays bounded at 32. */
+ * panels, and collective payloads. Attention scratch is bounded at build time. */
+#ifndef GLM53F_PREFILL_ATTN_PANEL
+#define GLM53F_PREFILL_ATTN_PANEL 32
+#endif
+#if GLM53F_PREFILL_ATTN_PANEL != 32 && GLM53F_PREFILL_ATTN_PANEL != 47 && \
+    GLM53F_PREFILL_ATTN_PANEL != 48 && GLM53F_PREFILL_ATTN_PANEL != 64
+#error "GLM53F_PREFILL_ATTN_PANEL must be 32, 47, 48 or 64"
+#endif
 enum { GLM53F_PREFILL_MAX_TOKENS = 512, GLM53F_PREFILL_V5_TOKENS = 256,
-       GLM53F_PREFILL_ATTN_TOKENS = 32 };
+       GLM53F_PREFILL_ATTN_TOKENS = GLM53F_PREFILL_ATTN_PANEL };
 enum { GLM53F_PREFILL_LEGACY = 0, GLM53F_PREFILL_V5 = 1, GLM53F_PREFILL_FAST = 2 };
 enum { GLM53F_PREFILL_COMM = 1, GLM53F_PREFILL_RECURRENCE = 2,
        GLM53F_PREFILL_GEMM = 4, GLM53F_PREFILL_EXPERT16 = 8,

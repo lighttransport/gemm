@@ -65,7 +65,7 @@ int main(int argc, char **argv) {
     const char *mla_env = getenv("GLM53F_EXECUTOR_MLA_KERNEL");
     int index_kernel = index_env ? atoi(index_env) : 1;
     int mla_kernel = mla_env ? atoi(mla_env) : 1;
-    if (index_kernel < 0 || index_kernel > 2 || mla_kernel < 0 || mla_kernel > 3)
+    if (index_kernel < 0 || index_kernel > 4 || mla_kernel < 0 || mla_kernel > 3)
         MPI_Abort(MPI_COMM_WORLD, 2);
     setenv("GLM53F_MHC_FAST", "1", 1);
     setenv("GLM53F_ROUTER_FUSE", "0", 1);

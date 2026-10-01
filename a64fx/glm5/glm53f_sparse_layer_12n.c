@@ -6,6 +6,7 @@
 #include "glm53f_pf_plan.h"
 #include "glm53f_collective_12n.h"
 #include "glm53f_index_score.h"
+#include "glm53f_pool_select.h"
 #include "glm53f_cache_bf16.h"
 #include "glm53f_int8.h"
 #include "glm53f_prefill.h"
@@ -59,10 +60,14 @@ static void mv_f8(float*y,const uint8_t*w,const float*s,const float*x,int rows,i
     for(int r=nb*8;r<rows;r++)y[r]=fp8dot(w+(size_t)r*cols,s+(size_t)(r/128)*sb,x,cols);
 }
 static void *tensor(glm53f_st_context*st,const char*n,int rank){const st_tensor_info*t=glm53f_st_find(st,n,NULL);if(!t){fprintf(stderr,"missing %s\n",n);MPI_Abort(MPI_COMM_WORLD,2);}void*p=a256(t->nbytes);readp(st,n,0,p,t->nbytes,rank);return p;}
-typedef struct{float score;int id;} pool_score;
-static int pool_cmp(const void*a,const void*b){const pool_score*x=a,*y=b;if(x->score>y->score)return -1;if(x->score<y->score)return 1;return x->id<y->id?-1:x->id>y->id;}
-static void pool_heap_down(pool_score*h,int n,int p){for(;;){int w=p,l=2*p+1,r=l+1;if(l<n&&pool_cmp(h+l,h+w)>0)w=l;if(r<n&&pool_cmp(h+r,h+w)>0)w=r;if(w==p)return;pool_score t=h[p];h[p]=h[w];h[w]=t;p=w;}}
-static void pool_top_exact(pool_score*h,const float*score,int np,int nc){for(int p=0;p<nc;p++)h[p]=(pool_score){score[p],p};for(int p=nc/2;p-->0;)pool_heap_down(h,nc,p);for(int p=nc;p<np;p++){pool_score x={score[p],p};if(pool_cmp(&x,h)<0){h[0]=x;pool_heap_down(h,nc,0);}}qsort(h,nc,sizeof(*h),pool_cmp);}
+typedef glm53f_pool_score pool_score;
+#define pool_cmp glm53f_pool_cmp
+static void pool_top_exact(pool_score *h, const float *score, int np, int nc, int *ids) {
+    const char *e = getenv("GLM53F_POOL_PARTITION_4K");
+    if (e && atoi(e) && np <= 4096 && np > nc)
+        glm53f_pool_top_partition(h, score, np, nc, ids);
+    else glm53f_pool_top_heap(h, score, np, nc);
+}
 #ifndef GLM53F_SPARSE_NO_MAIN
 static int select_cached(const float*pool,int*selected,const float*q,const float*hw,
                          int tokens){int np=tokens/KPOOL,nc=TOPK/KPOOL;if(nc>np)nc=np;pool_score*score=a256((size_t)(np?np:1)*sizeof(*score));int out=0;
@@ -433,7 +438,7 @@ size_t glm53f_sparse_cache_bytes_12n(const glm53f_sparse_context_12n *c) {
 }
 static void update_completed_pool(glm53f_sparse_context_12n*c,int pool){float*pk=c->pool+(size_t)pool*ID;for(int d=0;d<ID;d++){float mx=-INFINITY,den=0,val=0;for(int z=0;z<KPOOL;z++){float a=c->gcache[(size_t)(pool*KPOOL+z)*ID+d]+c->apef[(size_t)z*ID+d];if(a>mx)mx=a;}for(int z=0;z<KPOOL;z++){float a=expf(c->gcache[(size_t)(pool*KPOOL+z)*ID+d]+c->apef[(size_t)z*ID+d]-mx);den+=a;val+=a*c->key[(size_t)(pool*KPOOL+z)*ID+d];}pk[d]=val/den;}}
 static int sp_ar(const float *in, float *out, int n);
-struct pool_score_call { glm53f_sparse_context_12n *c; int tokens, np; };
+struct pool_score_call { glm53f_sparse_context_12n *c; int tokens, np, replicated; };
 static int index_heads_enabled(void) {
     const char *e = getenv("GLM53F_INDEX_HEADS");
     return e && !glm53f_sparse_scalar_reference ? atoi(e) : 0;
@@ -441,7 +446,9 @@ static int index_heads_enabled(void) {
 static void pool_score_worker(void *context) {
     struct pool_score_call *a = context;
     glm53f_sparse_context_12n *c = a->c;
-    const int heads = index_heads_enabled();
+    const int mode = index_heads_enabled();
+    const int replicated = a->replicated;
+    const int heads = mode == 3 || mode == 4 ? mode - 2 : mode;
     if (a->tokens <= TOPK + KPOOL - 1) {
 #pragma omp for schedule(static)
         for (int p = 0; p < a->np; ++p) {
@@ -455,26 +462,27 @@ static void pool_score_worker(void *context) {
             c->pool_score_cache[p] = (pool_score){score, p};
         }
     } else if (heads == 2) {
-        int span = 4 * c->ranks;
+        const int stride = replicated ? 1 : c->ranks;
+        int span = 4 * stride;
 #pragma omp for schedule(static)
         for (int group = 0; group < (a->np + span - 1) / span; ++group) {
             int base = group * span, end = base + span;
             if (end > a->np) end = a->np;
             for (int p = base; p < end; ++p) c->pool_score_local[p] = 0;
-            int first = base + c->rank;
-            int n = first < end ? (end - 1 - first) / c->ranks + 1 : 0;
+            int first = base + (replicated ? 0 : c->rank);
+            int n = first < end ? (end - 1 - first) / stride + 1 : 0;
             if (n) {
                 float score[4];
                 glm53f_index_score_f32_keys4(score, c->iq, c->iw,
-                    c->pool + (size_t)first * ID, (size_t)c->ranks * ID, n);
-                for (int k = 0; k < n; ++k) c->pool_score_local[first + k * c->ranks] = score[k];
+                    c->pool + (size_t)first * ID, (size_t)stride * ID, n);
+                for (int k = 0; k < n; ++k) c->pool_score_local[first + k * stride] = score[k];
             }
         }
     } else {
 #pragma omp for schedule(static)
         for (int p = 0; p < a->np; ++p) {
             float score = 0;
-            if (p % c->ranks == c->rank) {
+            if (replicated || p % c->ranks == c->rank) {
                 const float *pk = c->pool + (size_t)p * ID;
                 if (heads) score = glm53f_index_score_f32_heads(c->iq, c->iw, pk);
                 else {
@@ -488,10 +496,12 @@ static void pool_score_worker(void *context) {
         }
     }
 }
-static int select_incremental(glm53f_sparse_context_12n *c, int tokens) {
+static int select_incremental(glm53f_sparse_context_12n *c, int tokens, int decode) {
     int np = tokens / KPOOL, nc = TOPK / KPOOL, out = 0;
     if (nc > np) nc = np;
-    struct pool_score_call call = {c, tokens, np};
+    const int mode = index_heads_enabled();
+    const int replicated = decode && (mode == 3 || mode == 4);
+    struct pool_score_call call = {c, tokens, np, replicated};
     if (glm53f_team_available()) glm53f_team_dispatch(pool_score_worker, &call);
     else {
 #pragma omp parallel
@@ -499,8 +509,15 @@ static int select_incremental(glm53f_sparse_context_12n *c, int tokens) {
     }
     if (tokens <= TOPK + KPOOL - 1) qsort(c->pool_score_cache, np, sizeof(pool_score), pool_cmp);
     else {
-        if (sp_ar(c->pool_score_local, c->pool_score_global, np)) return -1;
-        pool_top_exact(c->pool_score_cache, c->pool_score_global, np, nc);
+        /* Replicated caches permit independent decode selection. Prefill
+         * still distributes its much larger score matrix across ranks. */
+        const float *scores = c->pool_score_local;
+        if (!replicated) {
+            if (sp_ar(scores, c->pool_score_global, np)) return -1;
+            scores = c->pool_score_global;
+        }
+        pool_top_exact(c->pool_score_cache, scores, np, nc,
+            (int *)(replicated ? c->pool_score_global : c->pool_score_local));
     }
     for (int i = 0; i < nc; ++i)
         for (int z = 0; z < KPOOL; ++z) c->selected[out++] = c->pool_score_cache[i].id * KPOOL + z;
@@ -838,7 +855,7 @@ static int sparse_attention_local_replicated(glm53f_sparse_context_12n *c,
             c->key, c->gcache, c->apef, tokens, KPOOL, TOPK, IH, ID);
     else {
         if (tokens % KPOOL == 0) update_completed_pool(c, tokens / KPOOL - 1);
-        ns = select_incremental(c, tokens);
+        ns = select_incremental(c, tokens, 1);
     }
     c->profile_phase[1] += sparse_clock(c) - begin;
     if (ns < 1) return -1;
@@ -1277,7 +1294,8 @@ void glm53f_sparse_prefill_workspace_free_12n(glm53f_sparse_prefill_workspace_12
 static int sparse_select_prefill(glm53f_sparse_context_12n *c,
         glm53f_sparse_prefill_workspace_12n *w, int base, int tokens) {
     int pools = (base + tokens) / KPOOL;
-    const int heads = index_heads_enabled();
+    const int mode = index_heads_enabled();
+    const int heads = mode == 3 || mode == 4 ? mode - 2 : mode;
     if (w->score_stride < pools || !w->score_stride) {
         int cap = 512;
         while (cap < pools) cap *= 2;
@@ -1384,7 +1402,8 @@ static int sparse_select_prefill(glm53f_sparse_context_12n *c,
         else if (c->prefill.features & GLM53F_PREFILL_COMM)
             scores = w->score_packed_global + w->score_offsets[t];
         else scores = w->score_global + (size_t)t * w->score_stride;
-        pool_top_exact(w->top[t], scores, np, nc);
+        pool_top_exact(w->top[t], scores, np, nc,
+            (int *)(w->score_local + (size_t)t * w->score_stride));
         int count = 0;
         for (int p = 0; p < nc; ++p)
             for (int z = 0; z < KPOOL; ++z) w->selected[t][count++] = w->top[t][p].id * KPOOL + z;
@@ -1637,7 +1656,7 @@ int glm53f_sparse_prefill_12n(glm53f_sparse_context_12n *c,
         memcpy(c->iq, w->iq + (size_t)t * IH * ID, IH * ID * sizeof(float));
         memcpy(c->iw, w->iw + (size_t)t * IH, IH * sizeof(float));
         if (length % KPOOL == 0) update_completed_pool(c, length / KPOOL - 1);
-        w->count[t] = select_incremental(c, length);
+        w->count[t] = select_incremental(c, length, 0);
         if (w->count[t] < 1) return -1;
         memcpy(w->selected[t], c->selected, (size_t)w->count[t] * sizeof(int));
     }

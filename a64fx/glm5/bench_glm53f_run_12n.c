@@ -111,8 +111,8 @@ int main(int argc, char **argv) {
 #else
         const int fast_math = 0;
 #endif
-        printf("GLM53F_BENCH_CONFIG {\"ranks\":12,\"threads\":%d,\"fast_math\":%d,\"prefill_chunk\":%d,\"prefill_features\":%u,\"collective\":%d,\"persistent\":%d,\"grouped_verify\":%d,\"router_fused\":%d,\"serialized_owner\":%d}\n",
-            omp_get_max_threads(), fast_math, chunk, config.features, config.collective,
+        printf("GLM53F_BENCH_CONFIG {\"ranks\":12,\"threads\":%d,\"fast_math\":%d,\"prefill_chunk\":%d,\"attention_panel\":%d,\"prefill_features\":%u,\"collective\":%d,\"persistent\":%d,\"grouped_verify\":%d,\"router_fused\":%d,\"serialized_owner\":%d}\n",
+            omp_get_max_threads(), fast_math, chunk, GLM53F_PREFILL_ATTN_TOKENS, config.features, config.collective,
             getenv("GLM53F_DECODE_EXECUTOR") ? !!atoi(getenv("GLM53F_DECODE_EXECUTOR")) : 0,
             getenv("GLM53F_VERIFY_GROUPED") ? !!atoi(getenv("GLM53F_VERIFY_GROUPED")) : 0,
             getenv("GLM53F_ROUTER_FUSE") ? !!atoi(getenv("GLM53F_ROUTER_FUSE")) : 0,
@@ -150,7 +150,8 @@ int main(int argc, char **argv) {
      * covers contexts through 16K. Keep the original reservation for short
      * prompts, and reserve the packed selector reduction for longer ones. */
     int collective_count = GLM53F_PREFILL_ATTN_TOKENS * (count / 4);
-    if (collective_count < 32 * 4096) collective_count = 32 * 4096;
+    if (collective_count < GLM53F_PREFILL_ATTN_TOKENS * 4096)
+        collective_count = GLM53F_PREFILL_ATTN_TOKENS * 4096;
     check(glm53f_collective_init_12n(getenv("TOFU_TOPO_PATH"), collective_count));
     check(glm53f_collective_prefill_algorithm_12n(config.collective));
     double load = glm53f_clock();

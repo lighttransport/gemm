@@ -13,13 +13,15 @@ static inline int glm53f_runtime_option(int argc, char **argv, int *index) {
     else if (!strcmp(key, "--collective-owner")) env = "GLM53F_COMM_OWNER";
     else if (!strcmp(key, "--moe-combine-kernel")) env = "GLM53F_MOE_COMBINE";
     else if (!strcmp(key, "--index-kernel")) env = "GLM53F_INDEX_HEADS";
+    else if (!strcmp(key, "--pool-selector")) env = "GLM53F_POOL_PARTITION_4K";
     else if (!strcmp(key, "--mla-kernel")) env = "GLM53F_MLA_REGISTERS";
     else return 0;
     if (*index + 1 >= argc) return -1;
     const char *value = argv[++*index];
     int enabled;
-    if (!strcmp(value, "legacy")) enabled = 0;
-    else if ((!strcmp(key, "--verify-kernel") && !strcmp(value, "grouped")) ||
+    if ((!strcmp(key, "--pool-selector") && !strcmp(value, "heap")) || !strcmp(value, "legacy")) enabled = 0;
+    else if ((!strcmp(key, "--pool-selector") && !strcmp(value, "partition4k")) ||
+             (!strcmp(key, "--verify-kernel") && !strcmp(value, "grouped")) ||
              (!strcmp(key, "--collective-owner") && !strcmp(value, "serialized")) ||
              (!strcmp(key, "--router-kernel") && !strcmp(value, "fused")) ||
              (!strcmp(key, "--moe-combine-kernel") && !strcmp(value, "vector")) ||
@@ -29,8 +31,10 @@ static inline int glm53f_runtime_option(int argc, char **argv, int *index) {
     else if ((!strcmp(key, "--moe-combine-kernel") && !strcmp(value, "overlap")) ||
              (!strcmp(key, "--index-kernel") && !strcmp(value, "keys4")) ||
              (!strcmp(key, "--mla-kernel") && !strcmp(value, "values"))) enabled = 2;
-    else if (!strcmp(key, "--mla-kernel") && !strcmp(value, "fp16-cache")) enabled = 3;
+    else if ((!strcmp(key, "--mla-kernel") && !strcmp(value, "fp16-cache")) ||
+             (!strcmp(key, "--index-kernel") && !strcmp(value, "replicated-heads"))) enabled = 3;
+    else if (!strcmp(key, "--index-kernel") && !strcmp(value, "replicated-keys4")) enabled = 4;
     else return -1;
-    return setenv(env, enabled == 3 ? "3" : enabled == 2 ? "2" : enabled ? "1" : "0", 1) ? -1 : 1;
+    return setenv(env, enabled == 4 ? "4" : enabled == 3 ? "3" : enabled == 2 ? "2" : enabled ? "1" : "0", 1) ? -1 : 1;
 }
 #endif

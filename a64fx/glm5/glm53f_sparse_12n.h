@@ -12,7 +12,7 @@ int glm53f_sparse_state_io_12n(const glm53f_sparse_context_12n *context,
                                struct glm53f_state_io *io);
 glm53f_sparse_prefill_workspace_12n *glm53f_sparse_prefill_workspace_create_12n(void);
 void glm53f_sparse_prefill_workspace_free_12n(glm53f_sparse_prefill_workspace_12n *workspace);
-/* At most 32 positions. A model shares one workspace across its sparse layers. */
+/* At most GLM53F_PREFILL_ATTN_TOKENS positions. A model shares one workspace across its sparse layers. */
 int glm53f_sparse_prefill_12n(glm53f_sparse_context_12n *context,
     glm53f_sparse_prefill_workspace_12n *workspace, float *output,
     const float *normalized_input, int tokens);

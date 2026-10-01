@@ -2,7 +2,10 @@
 # Shared native build. "all" retains the historical developer tool set.
 set -euo pipefail
 mode=${1:-all}
-case "$mode" in runtime|check|all) ;; *) echo "usage: $0 [runtime|check|all]" >&2; exit 2;; esac
+case "$mode" in runtime|check|all) ;; *) echo "usage: $0 [runtime|check|all] [32|47|48|64]" >&2; exit 2;; esac
+attention_panel=${2:-32}
+case "$attention_panel" in 32|47|48|64) ;; *) echo "error: attention panel must be 32, 47, 48 or 64" >&2; exit 2;; esac
+[ "$#" -le 2 ] || { echo "error: too many build arguments" >&2; exit 2; }
 cd "$(dirname "$0")"
 build_dir=${GLM53F_BUILD_DIR:-/local/glm53f-build-${PJM_JOBID:-manual}}
 if [ ! -d /local ]; then build_dir=${GLM53F_BUILD_DIR:-../../tmp/glm53f-build}; fi
@@ -22,7 +25,7 @@ else
     echo "error: set GLM53F_MPICC to a working MPI C wrapper" >&2
     exit 2
 fi
-cflags=(-O3 -march=armv8.2-a+sve -ffp-contract=fast -fopenmp -Wall -Wextra -I. -I../../common)
+cflags=("-DGLM53F_PREFILL_ATTN_PANEL=$attention_panel" -O3 -march=armv8.2-a+sve -ffp-contract=fast -fopenmp -Wall -Wextra -I. -I../../common)
 case "$(basename "$cc")" in mpifcc|mpiFCC) cflags=(-Nclang "${cflags[@]}");; esac
 [ "${GLM53F_FAST_MATH:-0}" != 1 ] || cflags+=(-ffast-math)
 [ "${GLM53F_NO_MATH_ERRNO:-0}" != 1 ] || cflags+=(-fno-math-errno)
@@ -76,7 +79,7 @@ if [ "$mode" != runtime ]; then
     obj lookup_spec glm53f_lookup_spec_12n.c
     bin test_glm53f_lookup_spec test_glm53f_lookup_spec.c "$build_dir/lookup_spec.o"
     bin bench_glm53f_run_12n bench_glm53f_run_12n.c "$build_dir/lookup_spec.o" "${objects[@]}" "$build_dir/target.o"
-    for name in kquant native_batch prefill_config state_io iq_grouped mhc_team lookup moe_combine index_heads index_keys4 mla_absorb mla_value mla_cache_f16 mla_attention; do
+    for name in kquant native_batch prefill_config state_io iq_grouped mhc_team lookup moe_combine index_heads index_keys4 pool_select mla_absorb mla_value mla_cache_f16 mla_attention; do
         bin "test_glm53f_$name" "test_glm53f_$name.c" "$build_dir/q8_panel.o" "$build_dir/team.o"
     done
     bin glm53f_kda_callback_check glm53f_kda_callback_check.c "$build_dir/kda.o" "${kernels[@]}"

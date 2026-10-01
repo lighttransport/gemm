@@ -42,8 +42,13 @@ int main(void) {
     failed |= parse("--moe-combine-kernel", "vector", &c) != 1 || strcmp(getenv("GLM53F_MOE_COMBINE"), "1");
     failed |= parse("--moe-combine-kernel", "overlap", &c) != 1 || strcmp(getenv("GLM53F_MOE_COMBINE"), "2");
     failed |= parse("--moe-combine-kernel", "invalid", &c) != -1;
+    failed |= parse("--pool-selector", "partition4k", &c) != 1 || strcmp(getenv("GLM53F_POOL_PARTITION_4K"), "1");
+    failed |= parse("--pool-selector", "heap", &c) != 1 || strcmp(getenv("GLM53F_POOL_PARTITION_4K"), "0");
+    failed |= parse("--pool-selector", "invalid", &c) != -1;
     failed |= parse("--index-kernel", "heads", &c) != 1 || strcmp(getenv("GLM53F_INDEX_HEADS"), "1");
     failed |= parse("--index-kernel", "keys4", &c) != 1 || strcmp(getenv("GLM53F_INDEX_HEADS"), "2");
+    failed |= parse("--index-kernel", "replicated-heads", &c) != 1 || strcmp(getenv("GLM53F_INDEX_HEADS"), "3");
+    failed |= parse("--index-kernel", "replicated-keys4", &c) != 1 || strcmp(getenv("GLM53F_INDEX_HEADS"), "4");
     failed |= parse("--index-kernel", "legacy", &c) != 1 || strcmp(getenv("GLM53F_INDEX_HEADS"), "0");
     failed |= parse("--index-kernel", "invalid", &c) != -1;
     failed |= parse("--mla-kernel", "registers", &c) != 1 || strcmp(getenv("GLM53F_MLA_REGISTERS"), "1");
