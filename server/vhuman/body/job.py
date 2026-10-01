@@ -1,6 +1,7 @@
 """Qwen full-body image -> SAM 3D Body -> Pixal3D -> combined avatar job."""
 from __future__ import annotations
 
+from contextlib import nullcontext
 import json
 import math
 import os
@@ -332,7 +333,7 @@ def body_job(service, request: dict, progress, cancel, *, python=None, rig_pytho
                "--out", str(out), "--model", str(model_dir / "dinov3/assets/mhr_model.pt"),
                "--head-assets", str(model_dir / "safetensors/sam3d_body_mhr_head.safetensors"),
                "--res", str(res)]
-        with gpu.device_session(1024, cancel):
+        with gpu.device_session(1024, cancel) if gpu.backend() != "cpu" else nullcontext():
             _run(cmd, cancel, timeout=1200)
         report = json.loads((out / "body_report.json").read_text())
         report["generation"] = generated

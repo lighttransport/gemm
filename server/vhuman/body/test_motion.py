@@ -2,9 +2,13 @@
 from __future__ import annotations
 
 import io
+import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 from PIL import Image
@@ -12,9 +16,41 @@ from PIL import Image
 from ..eye.glb import GLB, GLBBuilder
 from ..service import ROOT, EyeService, ServiceError
 from .motion import _continuous, _export_glb, upload
+from . import motion
 
 
 class BodyMotionTest(unittest.TestCase):
+    def test_cpu_motion_decode_does_not_require_gpu(self):
+        with tempfile.TemporaryDirectory(dir=ROOT / "tmp") as folder:
+            root = Path(folder)
+            avatar = root / "avatar.glb"
+            avatar.touch()
+            (root / "avatar.json").write_text("{}")
+            (root / "body_mhr.glb.json").write_text(json.dumps({"shape": [0.] * 45}))
+            model = root / "model/dinov3/assets/mhr_model.pt"
+            model.parent.mkdir(parents=True)
+            model.touch()
+            python = root / "python"
+            python.touch()
+            service = SimpleNamespace(body_file=lambda hid, name: root / name)
+
+            def decode(command, cancel, **kwargs):
+                output = Path(command[command.index("--output") + 1])
+                output.write_text(json.dumps({"duration": 0.}))
+
+            with motion.gpu.execution("cpu"), \
+                 mock.patch.object(motion, "source_file", return_value=(avatar, {"kind": "image", "sha256": "test"})), \
+                 mock.patch.object(motion, "_frames", return_value=[avatar]), \
+                 mock.patch.object(motion, "_bbox", return_value=(0, 0, 1, 1)), \
+                 mock.patch.object(motion, "_sam_frame", return_value=root / "pose.json"), \
+                 mock.patch.object(motion.body_job, "_run", side_effect=decode) as runner, \
+                 mock.patch.object(motion.gpu, "device_session", side_effect=AssertionError("CPU needs no GPU")):
+                result = motion.fit(service, {"head_id": "head", "upload_id": "upload"},
+                                    lambda *_: None, threading.Event(), model_dir=root / "model", rig_python=python)
+            runner.assert_called_once()
+            self.assertEqual(result["frames"], 1)
+            self.assertEqual(result["duration"], 0.)
+
     def test_uploaded_image_is_verified_and_bounded(self):
         with tempfile.TemporaryDirectory(dir=ROOT / "tmp") as folder:
             service = EyeService(Path(folder))

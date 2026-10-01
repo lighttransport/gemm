@@ -7,6 +7,7 @@ monocular camera translation is not a reliable world-space motion track.
 """
 from __future__ import annotations
 
+from contextlib import nullcontext
 import argparse
 import hashlib
 import json
@@ -277,7 +278,7 @@ def fit(service, request: dict, progress, cancel, *, model_dir=body_job.MODEL_DI
                "--source-glb", str(avatar), "--output", str(output),
                "--kind", upload_meta["kind"], "--fps", str(FPS),
                *map(str, sidecars)]
-        with gpu.device_session(1024, cancel):
+        with gpu.device_session(1024, cancel) if gpu.backend() != "cpu" else nullcontext():
             body_job._run(cmd, cancel, timeout=300)
         motion = json.loads(output.read_text())
         manifest = {"id": take_id, "head_id": hid, "kind": upload_meta["kind"],
