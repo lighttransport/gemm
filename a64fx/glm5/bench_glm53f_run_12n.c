@@ -145,7 +145,13 @@ int main(int argc, char **argv) {
     if (!prompt) MPI_Abort(MPI_COMM_WORLD, 2);
     MPI_Bcast(prompt, count, MPI_INT, 0, MPI_COMM_WORLD);
     if (!strcmp(argv[4], argv[5])) MPI_Abort(MPI_COMM_WORLD, 2);
-    check(glm53f_collective_init_12n(getenv("TOFU_TOPO_PATH"), 32 * 4096));
+    /* Sparse prefill packs up to 32 index rows, each with floor(context/4)
+     * pooled scores. The output projection's 32*4096 reservation alone only
+     * covers contexts through 16K. Keep the original reservation for short
+     * prompts, and reserve the packed selector reduction for longer ones. */
+    int collective_count = GLM53F_PREFILL_ATTN_TOKENS * (count / 4);
+    if (collective_count < 32 * 4096) collective_count = 32 * 4096;
+    check(glm53f_collective_init_12n(getenv("TOFU_TOPO_PATH"), collective_count));
     check(glm53f_collective_prefill_algorithm_12n(config.collective));
     double load = glm53f_clock();
     glm53f_target_model_12n *m = glm53f_target_model_create_12n(
@@ -171,8 +177,11 @@ int main(int argc, char **argv) {
         double begin = glm53f_clock();
         for (int t = 0; t < count; t += chunk) {
             int n = count - t < chunk ? count - t : chunk;
-            check(glm53f_target_model_step_batch_12n(m, prompt + t, n,
-                                                    NULL, NULL, NULL, NULL));
+            int rc = glm53f_target_model_step_batch_12n(m, prompt + t, n,
+                                                      NULL, NULL, NULL, NULL);
+            if (rc) fprintf(stderr, "GLM53F_BENCH_PREFILL_FAIL rank=%d trial=%d offset=%d tokens=%d collective_count=%d rc=%d\n",
+                            rank, trial, t, n, collective_count, rc);
+            check(rc);
             long h = headroom();
             if (h < minimum) minimum = h;
         }
