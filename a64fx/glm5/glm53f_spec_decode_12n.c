@@ -322,5 +322,7 @@ int main(int argc, char **argv) {
     free(prompt);
     for(int i=0;i<max_draft+1;i++)glm53f_target_snapshot_free_12n(snapshot[i]);
     free(draft_hidden[1]);free(draft_hidden[0]);free(target_hidden);free(verify_hidden);glm53f_mtp_free_12n(mtp);glm53f_target_model_free_12n(target_model);glm53f_collective_free_12n();
+    if (!rank) printf("GLM53F_SPEC_COMPLETE {\"variants\":%d,\"repetitions\":%d,\"cycles\":%d,\"status\":\"%s\"}\n",
+        variants, repetitions, cycles, all_pass ? "PASS" : "FAIL");
     MPI_Finalize();return all_pass?0:1;
 }

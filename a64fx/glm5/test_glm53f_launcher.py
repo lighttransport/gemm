@@ -56,6 +56,8 @@ elif name == 'glm53f_target_decode_12n':
     if mode == 'GENERATE': print('GLM53F_TARGET_TIMING prompt_tok_s=40 decode_tok_s=30')
 elif name == 'glm53f_spec_decode_12n':
     print('GLM53F_SPEC_REFERENCE PASS')
+    if not os.environ.get('MOCK_SPEC_INCOMPLETE'):
+        print('GLM53F_SPEC_COMPLETE {"status":"PASS"}')
 elif name == 'test_glm53f_lookup_spec':
     print('GLM53F_LOOKUP_SPEC PASS cases=28')
 elif name == 'glm53f_executor_check_12n':
@@ -242,6 +244,13 @@ class LauncherTest(unittest.TestCase):
         call = next(c for c in self.records() if c['name'] == 'glm53f_spec_decode_12n')
         self.assertEqual(call['args'][5:], ['1', '128', '4', '0', '--repetitions', '3',
                                            '--draft-sweep', '--ignore-eos', '--verify-kernel', 'grouped'])
+
+    def test_mtp_rejects_missing_completion(self):
+        result = subprocess.run(['bash', str(MODULE / 'run_glm53f_q4_mtp_12n.sh'),
+                                 str(self.prompt), str(self.root / 'mtp.ids'), '1', '1'],
+                                cwd=str(REPO), env=dict(self.env, MOCK_SPEC_INCOMPLETE='1'),
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=30)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
 
     def test_mtp_stage_reads_checkpoint_without_target_repack(self):
         result = subprocess.run(['bash', str(MODULE / 'run_glm53f_mtp_stage_12n.sh')],

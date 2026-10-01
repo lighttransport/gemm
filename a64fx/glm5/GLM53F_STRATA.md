@@ -91,8 +91,15 @@ For the MTP sweep, stage MTP first, enable
 
 ```bash
 bash a64fx/glm5/run_glm53f_q4_mtp_12n.sh tmp/prompt8k.ids tmp/mtp.ids 128 4 \
-  --repetitions 3 --draft-sweep --ignore-eos --verify-kernel grouped
+  --repetitions 3 --draft-sweep --ignore-eos --verify-kernel grouped > tmp/mtp.log 2>&1
+python3 a64fx/glm5/report_glm53f_spec_runs.py --log tmp/mtp.log \
+  --ids-prefix tmp/mtp.ids --cycles 128 --output tmp/mtp-report.json
 ```
+
+The report requires
+the final completion record, one warmup and at least three timed trials per
+depth, exact cycle/delivery accounting, every delivered ID matching the
+greedy reference, and the memory guard. Use `--ignore-eos` for fixed cycles.
 
 A speculative trial is evidence of greedy equivalence only when the
 reference check covers every delivered token. Acceptance rate alone is
@@ -113,7 +120,8 @@ Native A64FX measurements, job 52068253, normal 2 GHz, compact 2×3×2:
 | Vector MoE combine, all 256 route masks and 63-row ragged tiles | Bit-exact PASS at 1, 12, 47 and 48 threads |
 | Eight-head sparse index, 8193 synthetic pool entries | Bit-exact PASS; 47 threads 0.374730 → 0.143590 ms (2.610×); 48 threads 0.366679 → 0.138360 ms (2.650×) |
 | Warm persistent team, internal timer, 4000 jobs/repeat | 12 threads 1.576126 µs/job; 47 threads 4.595131; 48 threads 4.694641 |
-| Launcher contracts | 15 local tests PASS |
+| Launcher contracts | 16 local tests PASS |
+| Strict resident MTP reporting | Six local tests PASS, including incomplete/reference/token/accounting failures |
 | Lookup rejection/rollback controller | 28 cases PASS with a local serial MPI shim; native twelve-rank check pending |
 
 The index result is a kernel microbenchmark, not whole-model acceleration.

@@ -44,4 +44,5 @@ export GLM53F_SPARSE_BATCH_OP=${GLM53F_SPARSE_BATCH_OP:-0}
 export GLM53F_SPEC_PROMPT_IDS=$prompt GLM53F_SPEC_OUTPUT_IDS=$output
 mpi_run speculate "${GLM53F_SPEC_BINARY:-$GLM53F_BIN_DIR/glm53f_spec_decode_12n}" \
     "$model" "$routed" "$shared" "$mtp_routed" "$mtp_shared" 1 "$cycles" "$drafts" 0 "$@"
-grep -E 'GLM53F_SPEC_(PHASE|DECODE|REFERENCE|VARIANT|TRIAL)' "$last_log".*.0
+grep -E 'GLM53F_SPEC_(PHASE|DECODE|REFERENCE|VARIANT|TRIAL|COMPLETE)' "$last_log".*.0
+grep -q '^GLM53F_SPEC_COMPLETE .*"status":"PASS"' "$last_log".*.0 || fail 'speculative run did not complete'
