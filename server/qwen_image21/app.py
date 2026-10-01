@@ -85,6 +85,17 @@ STAGE_PATTERNS = (
 )
 
 
+def request_backend(request: dict) -> str:
+    """Resolve legacy mode aliases before choosing a device lock or runner."""
+    if not isinstance(request, dict):
+        raise ValueError("request must be a JSON object")
+    mode = request.get("mode")
+    backend = mode if mode in ("cuda", "rocm") else request.get("backend", "cuda")
+    if backend not in ("cuda", "rocm"):
+        raise ValueError("backend must be cuda or rocm")
+    return backend
+
+
 class Progress:
     """Turns a pipeline log into stage and step events with timings.
 
@@ -915,7 +926,7 @@ class Demo:
         # A request that names a backend but omits mode is a native request.
         # Keep the legacy mode=cuda/rocm shorthand for older clients.
         mode = request.get("mode", "native" if "backend" in request else "cuda")
-        backend = request.get("backend", "cuda")
+        backend = request_backend(request)
         # Preserve the original API where mode=cuda meant native CUDA.  New
         # callers should use backend=cuda|rocm and mode=native|reference|compare.
         if mode in {"cuda", "rocm"}:
@@ -1526,7 +1537,7 @@ class Handler(BaseHTTPRequestHandler):
             if str(ROOT) not in sys.path:
                 sys.path.insert(0, str(ROOT))
             from server.vhuman.gpu import file_lock
-            backend = request.get("backend", "cuda")
+            backend = request_backend(request)
             with file_lock(ROOT / "tmp/pixal3d/device-locks" / f"{backend}-0.lock", 900):
                 result = self.server.demo.generate(request, job_id)  # type: ignore[attr-defined]
             self._json(200, {"ok": True, **result})

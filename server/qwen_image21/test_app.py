@@ -8,7 +8,7 @@ from unittest import mock
 from server.qwen_image21.app import (MAX_EVENTS, Demo, Progress, REFERENCE_DEVICES, ROOT, ResidentDenoiser,
                                      ResidentReference, send_resident,
                                      StepPreviews, compare_runs, denoised_estimate, flow_sigmas,
-                                     generation_seconds, timing_breakdown)
+                                     generation_seconds, timing_breakdown, Handler)
 import time
 
 
@@ -28,6 +28,38 @@ def assume_reference(demo: Demo, *devices: str) -> None:
 
 
 class QwenImage21RoutingTest(unittest.TestCase):
+    def test_endpoint_locks_resolved_backend_before_generation(self):
+        import io
+        import json
+        from types import SimpleNamespace
+        for request, expected in (({"prompt": "apple", "mode": "rocm"}, "rocm"),
+                                  ({"prompt": "apple", "backend": "cuda", "mode": "rocm"}, "rocm"),
+                                  ({"prompt": "apple", "backend": "rocm"}, "rocm")):
+            with self.subTest(request=request):
+                body = json.dumps(request).encode()
+                handler = SimpleNamespace(path="/api/generate", headers={"Content-Length": str(len(body))},
+                    rfile=io.BytesIO(body), server=SimpleNamespace(demo=mock.Mock()), _json=mock.Mock())
+                handler.server.demo.generate.return_value = {}
+                with mock.patch("server.vhuman.gpu.file_lock") as lock:
+                    Handler.do_POST(handler)
+                self.assertEqual(lock.call_args.args[0].name, f"{expected}-0.lock")
+                handler._json.assert_called_once_with(200, {"ok": True})
+
+    def test_endpoint_rejects_backend_path_before_lock(self):
+        import io
+        import json
+        from types import SimpleNamespace
+        for request in ({"backend": "../../escape"}, {"backend": ["rocm"]}, []):
+            with self.subTest(request=request):
+                body = json.dumps(request).encode()
+                handler = SimpleNamespace(path="/api/generate", headers={"Content-Length": str(len(body))},
+                    rfile=io.BytesIO(body), server=SimpleNamespace(demo=mock.Mock()), _json=mock.Mock())
+                with mock.patch("server.vhuman.gpu.file_lock") as lock:
+                    Handler.do_POST(handler)
+                lock.assert_not_called()
+                handler.server.demo.generate.assert_not_called()
+                self.assertEqual(handler._json.call_args.args[0], 400)
+
     def make_demo(self, root: Path) -> Demo:
         demo = Demo(root / "model", root / "quant", root / "cuda-python",
                     root / "work", root / "cuda-native", "127.0.0.1", 0,
