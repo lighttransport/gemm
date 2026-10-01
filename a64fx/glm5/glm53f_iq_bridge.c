@@ -393,10 +393,10 @@ int glm53f_native_repack_rowwise(int type, const uint8_t *source, int rows,
 }
 
 #ifndef GLM53F_Q8R_PF
-#define GLM53F_Q8R_PF 0
+#define GLM53F_Q8R_PF 16384 /* synthetic sweep: 16 KiB ahead with pldl2keep is ~20% faster than none on 7-12 MB matvecs */
 #endif
 #ifndef GLM53F_Q8R_PF_LVL
-#define GLM53F_Q8R_PF_LVL 0
+#define GLM53F_Q8R_PF_LVL 2
 #endif
 /* Up to four repacked rows share each activation vector.  Per lane this is
  * acc += float(sdot) * (dw * dx), exactly q8_0_q8_0_row's operation order. */

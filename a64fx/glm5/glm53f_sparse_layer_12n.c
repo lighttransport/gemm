@@ -75,6 +75,7 @@ struct glm53f_sparse_context_12n {
     float *q8v_ql,*q8v_log,*q8v_va,*q8v_sum;
     float *mlb_qs,*mlb_ql,*mlb_va,*mlb_out,*mlb_ref,*mlb_lg; unsigned char *mlb_act; size_t mlb_act_bytes; int mlb_threads;
     unsigned char *q8v_act;
+    unsigned char *front_act_x, *front_act_q; /* fused decode front: native activations of x and of qres */
     size_t q8v_act_bytes;
     float *qas,*qbs,*kvas,*ops;
     uint16_t *qan,*kvan,*kvb,*wk,*knw,*knb,*gatew,*ape,*wqb,*wp;
@@ -498,11 +499,64 @@ static int mla_heads_q8_value(glm53f_sparse_context_12n*c,float*out,
     }
     return bad?-1:0;
 }
+static inline int sp_is_q80(int type) {
+    return type == GLM53F_GGML_Q8_0 || type == GLM53F_NATIVE_Q8_0R || type == GLM53F_NATIVE_Q8_0R16;
+}
+/* Decode front of the replicated sparse layer in ONE parallel region (GLM53F_SPARSE_FUSE_FRONT=0 disables):
+ * q_a / kv_a (native Q8_0) and the three bf16 index projections of x, then q_b and the bf16 index query projection
+ * of the normalised q_a.  Same kernels and per-row arithmetic as the separate calls, so results are bit-identical. */
+static int sparse_front_fused(glm53f_sparse_context_12n *c, int pos, const float *x, float *raw) {
+    if (!c->q2_native || glm53f_sparse_scalar_reference) return 0;
+    static int enabled = -1;
+    if (enabled < 0) { const char *e = getenv("GLM53F_SPARSE_FUSE_FRONT"); enabled = !e || !*e || atoi(e); }
+    if (!enabled || !sp_is_q80(c->q2_qa_type) || !sp_is_q80(c->q2_kva_type) || !sp_is_q80(c->q2_qb_type)) return 0;
+    if (!c->front_act_x) {
+        c->front_act_x = a256((glm53f_native_act_bytes(H) + 255) & ~(size_t)255);
+        c->front_act_q = a256((glm53f_native_act_bytes(QA) + 255) & ~(size_t)255);
+    }
+    float *latent = c->latent + (size_t)pos * LAT;
+    const glm53f_native_matrix ax[2] = {{c->qres, c->q2_qa, c->q2_qa_type, QA, H},
+                                        {latent, c->q2_kva, c->q2_kva_type, LAT, H}};
+    const glm53f_native_matrix aq = {c->query, c->q2_qb, c->q2_qb_type, c->qd, QA};
+    float *gout = c->gcache + (size_t)pos * ID;
+    int bad = 0;
+#pragma omp parallel reduction(|:bad)
+    {
+        bad |= glm53f_native_act_prepare_team(c->front_act_x, x, H, 0, 1) != 0;
+        bad |= glm53f_native_matvec_team(ax, 2, c->front_act_x) != 0;      /* barrier */
+        /* bf16 projections of x: wk (ID rows), gatew (ID rows), wp (IH rows) in 8-row blocks */
+#pragma omp for schedule(static)
+        for (int t = 0; t < ID / 8 * 2 + IH / 8; ++t) {
+            if (t < ID / 8) b16dot8(raw + t * 8, c->wk + (size_t)t * 8 * H, x, H);
+            else if (t < 2 * ID / 8) b16dot8(gout + (t - ID / 8) * 8, c->gatew + (size_t)(t - ID / 8) * 8 * H, x, H);
+            else b16dot8(c->iw + (t - 2 * ID / 8) * 8, c->wp + (size_t)(t - 2 * ID / 8) * 8 * H, x, H);
+        }
+#pragma omp single
+        {
+            glm53f_rmsnorm_bf16(c->qres, c->qres, c->qan, QA, 1e-5f);
+            glm53f_rmsnorm_bf16(latent, latent, c->kvan, LAT, 1e-5f);
+            glm53f_layernorm_bf16(c->key + (size_t)pos * ID, raw, c->knw, c->knb, ID, 1e-6f);
+        }
+        bad |= glm53f_native_act_prepare_team(c->front_act_q, c->qres, QA, 0, 1) != 0;
+        bad |= glm53f_native_matvec_team(&aq, 1, c->front_act_q) != 0;     /* barrier */
+#pragma omp for schedule(static)
+        for (int b = 0; b < IH * ID / 8; ++b) b16dot8(c->iq + b * 8, c->wqb + (size_t)b * 8 * QA, c->qres, QA);
+    }
+    return bad ? -1 : 1;
+}
 static int sparse_attention_local_replicated(glm53f_sparse_context_12n *c,
                                              float *attn, const float *x) {
     if (c->length >= c->capacity) return -1;
     int pos = c->length, tokens = pos + 1, ns;
     double begin = sparse_clock(c);
+    float raw[ID];
+    const int fused = sparse_front_fused(c, pos, x, raw);
+    if (fused < 0) return -1;
+    if (fused) {
+        sparse_dump(c, "q_a_norm", c->qres, QA * sizeof(float));
+        sparse_dump(c, "q_b", c->query, (size_t)c->qd * sizeof(float));
+        sparse_dump(c, "kv_a_norm", c->latent + (size_t)pos * LAT, LAT * sizeof(float));
+    } else {
     if (c->q2_native) {
         if (glm53f_iq_matvec(c->qres, c->q2_qa, c->q2_qa_type,
                              QA, H, x)) return -1;
@@ -528,13 +582,13 @@ static int sparse_attention_local_replicated(glm53f_sparse_context_12n *c,
     sparse_dump(c, "q_b", c->query, (size_t)c->qd * sizeof(float));
     sparse_dump(c, "kv_a_norm", c->latent + (size_t)pos * LAT,
                 LAT * sizeof(float));
-    float raw[ID];
     mv_b16(raw, c->wk, x, ID, H);
     glm53f_layernorm_bf16(c->key + (size_t)pos * ID, raw,
                           c->knw, c->knb, ID, 1e-6f);
     mv_b16(c->gcache + (size_t)pos * ID, c->gatew, x, ID, H);
     mv_b16(c->iq, c->wqb, c->qres, IH * ID, QA);
     mv_b16(c->iw, c->wp, x, IH, H);
+    }
     c->profile_phase[0] += sparse_clock(c) - begin;
     begin = sparse_clock(c);
     if (getenv("GLM53F_SPARSE_REFERENCE"))

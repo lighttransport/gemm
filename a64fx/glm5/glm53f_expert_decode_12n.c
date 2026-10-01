@@ -669,10 +669,28 @@ static int moe_fused_shared(glm53f_moe_stage_context_12n *c, int t, const float 
     if (c->profile) c->profile_phase[3] += MPI_Wtime() - tn;
     return 1;
 }
+/* Eight bf16 weight rows against one vector: eight independent accumulator chains (same per-row accumulation order as
+ * glm53f_dot_bf16_sve, so the logits are bit-identical) instead of one latency-bound chain per row. */
+static void router_dot8(float *y, const uint16_t *w, const float *x, int n) {
+    svfloat32_t a0 = svdup_f32(0), a1 = a0, a2 = a0, a3 = a0, a4 = a0, a5 = a0, a6 = a0, a7 = a0;
+    const int vl = (int)svcntw();
+    for (int i = 0; i < n; i += vl) {
+        const svbool_t p = svwhilelt_b32(i, n);
+        const svfloat32_t xv = svld1(p, x + i);
+#define RD8(N, A) do { svuint32_t z = svlsl_n_u32_x(p, svld1uh_u32(p, w + (size_t)(N) * n + i), 16); \
+                       A = svmla_x(p, A, svreinterpret_f32_u32(z), xv); } while (0)
+        RD8(0, a0); RD8(1, a1); RD8(2, a2); RD8(3, a3); RD8(4, a4); RD8(5, a5); RD8(6, a6); RD8(7, a7);
+#undef RD8
+    }
+    const svbool_t p = svptrue_b32();
+    y[0] = svaddv_f32(p, a0); y[1] = svaddv_f32(p, a1); y[2] = svaddv_f32(p, a2); y[3] = svaddv_f32(p, a3);
+    y[4] = svaddv_f32(p, a4); y[5] = svaddv_f32(p, a5); y[6] = svaddv_f32(p, a6); y[7] = svaddv_f32(p, a7);
+}
 void glm53f_moe_stage_set_layer_12n(glm53f_moe_stage_context_12n*c,int layer){if(c)c->active_layer=layer;}
 int glm53f_moe_stage_sublayer_12n(void*context,float*out,const float*x){glm53f_moe_stage_context_12n*c=context;int li=c->active_layer-c->first_layer,selected[8],npart=0;float route_weight[8],part_weight[9];glm53f_expert_part part[9];int8_t router_qx[4096];float router_xs=0;if(li<0||li>=c->layer_count)return-1;double t=c->profile?MPI_Wtime():0.0;
+if(!c->router_i8){
 #pragma omp parallel for schedule(static)
-    for(int e=0;e<NEXPERTS;e++)if(!c->router_i8)c->router_logits[e]=glm53f_dot_bf16_sve(c->router_w+((size_t)li*NEXPERTS+e)*4096,x,4096);if(c->router_i8){if(glm53f_i8_quantize_x(router_qx,&router_xs,x,4096))return-1;
+    for(int b=0;b<NEXPERTS/8;b++)router_dot8(c->router_logits+b*8,c->router_w+((size_t)li*NEXPERTS+b*8)*4096,x,4096);}if(c->router_i8){if(glm53f_i8_quantize_x(router_qx,&router_xs,x,4096))return-1;
 #pragma omp parallel for schedule(static)
     for(int q=0;q<NEXPERTS/16;q++){int g=q/4,j=q%4;glm53f_i8_dot16(c->router_logits+q*16,c->router_i8+((size_t)li*NEXPERTS+g*64)*4096+j*64,c->router_i8_scale+(size_t)li*NEXPERTS+q*16,router_qx,router_xs,4096);}}glm53f_router_topk(c->router_logits,c->router_bias+(size_t)li*NEXPERTS,NEXPERTS,8,2.5f,selected,route_weight);if(c->profile){c->profile_phase[0]+=MPI_Wtime()-t;t=MPI_Wtime();}int table_layer=c->active_layer-FIRST_LAYER;if(c->int8_enabled){if(moe_int8_local(c,c->scratch->local_output,x,c->router_i8?router_qx:NULL,router_xs,selected,route_weight,table_layer))return-1;if(c->profile){c->profile_phase[1]+=MPI_Wtime()-t;t=MPI_Wtime();}int rc=glm53f_sum_allreduce_12n(c->scratch->local_output,out,4096);if(c->profile)c->profile_phase[2]+=MPI_Wtime()-t;return rc;}for(int k=0;k<8;k++){expert_offset*p=&c->table[table_layer*NEXPERTS+selected[k]];if(p->gate_up==UINT64_MAX)continue;part[npart]=(glm53f_expert_part){c->blob+p->gate_up,p->gate_up_scale==UINT64_MAX?NULL:(const float*)(c->blob+p->gate_up_scale),c->blob+p->down,p->down_scale==UINT64_MAX?NULL:(const float*)(c->blob+p->down_scale),p->inter,p->gate_type,p->down_type};part_weight[npart++]=route_weight[k];}if(c->shared_blob&&!c->nsh_native){shared_offset*p=&c->shared[table_layer];part[npart]=(glm53f_expert_part){c->shared_blob+p->gate_up,(const float*)(c->shared_blob+p->gate_up_scale),c->shared_blob+p->down,(const float*)(c->shared_blob+p->down_scale),p->inter,0,0};part_weight[npart++]=1.0f;}if(!moe_fused_shared(c,table_layer,x,part,part_weight,npart)){glm53f_moe_local_12n(c->scratch->local_output,part,part_weight,npart,x,c->scratch);{double tn=c->profile?MPI_Wtime():0.0;if(c->nsh_native&&nsh_accumulate(c,table_layer,x,c->scratch->local_output))return-1;if(c->profile)c->profile_phase[3]+=MPI_Wtime()-tn;}}if(c->profile){c->profile_phase[1]+=MPI_Wtime()-t;t=MPI_Wtime();}int rc=glm53f_sum_allreduce_12n(c->scratch->local_output,out,4096);if(c->profile)c->profile_phase[2]+=MPI_Wtime()-t;return rc;}
 

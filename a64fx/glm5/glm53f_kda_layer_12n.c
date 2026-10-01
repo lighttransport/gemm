@@ -205,6 +205,19 @@ glm53f_kda_context_12n *glm53f_kda_create_12n(const char *model,int layer){int r
     glm53f_st_close(st);if(kda_native_load(c)){fprintf(stderr,"rank=%d layer=%d failed to load GLM53F_Q2_KDA_STAGE\n",rank,layer);glm53f_kda_free_12n(c);return NULL;}c->qkv=a256((size_t)3*qd*4);c->small=a256(D*4);c->gate=a256(qd*4);c->decay=a256(qd*4);c->beta=a256(hn*4);c->core=a256(qd*4);c->normed=a256(qd*4);c->work=a256(qd*4);c->conv=a256((size_t)3*qd*KERNEL*4);c->state=a256((size_t)hn*D*D*4);c->partial=a256(H*4);c->batch_partial=a256((size_t)GLM53F_KDA_TILE_TOKENS*H*4);c->bq=a256((size_t)GLM53F_KDA_TILE_TOKENS*qd*4);c->bk=a256((size_t)GLM53F_KDA_TILE_TOKENS*qd*4);c->bv=a256((size_t)GLM53F_KDA_TILE_TOKENS*qd*4);c->bsmall_f=a256((size_t)GLM53F_KDA_TILE_TOKENS*D*4);c->bsmall_g=a256((size_t)GLM53F_KDA_TILE_TOKENS*D*4);c->bgate_f=a256((size_t)GLM53F_KDA_TILE_TOKENS*qd*4);c->bgate_g=a256((size_t)GLM53F_KDA_TILE_TOKENS*qd*4);c->bbeta=a256((size_t)GLM53F_KDA_TILE_TOKENS*hn*4);c->bnormed=a256((size_t)GLM53F_KDA_TILE_TOKENS*qd*4);glm53f_kda_reset_12n(c);return c;}
 
 void glm53f_kda_reset_12n(glm53f_kda_context_12n*c){if(!c)return;memset(c->conv,0,(size_t)3*c->qd*KERNEL*4);memset(c->state,0,(size_t)c->hn*D*D*4);}
+/* Issue (non-blocking) L2 prefetches for this thread's static row slice of a native matrix that a LATER stage of the
+ * layer will read.  The slice is the one native_matvec_team gives this thread, so the lines land in the CMG that uses
+ * them.  Decode is latency bound, so the memory system is idle during the other stages of the layer. */
+static inline void kda_prefetch_rows(const glm53f_native_matrix *m) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("GLM53F_KDA_PREFETCH"); on = !e || !*e || atoi(e); }
+    if (!on || !m->weight) return;
+    const int nt = omp_get_num_threads(), tid = omp_get_thread_num();
+    const size_t rb = glm53f_native_row_size(m->type, m->columns);
+    if (!rb) return;
+    const size_t lo = (size_t)((long long)m->rows * tid / nt) * rb, hi = (size_t)((long long)m->rows * (tid + 1) / nt) * rb;
+    for (size_t o = lo; o < hi; o += 256) __builtin_prefetch(m->weight + o, 0, 2);
+}
 static int kda_local(glm53f_kda_context_12n*c,float*out,const float*x){
     weights*w=&c->w;int qd=c->qd,hn=c->hn;double td=c->detail_profile?MPI_Wtime():0;
     double t0=MPI_Wtime();float*q=c->qkv,*k=q+qd,*v=k+qd;
@@ -214,6 +227,11 @@ static int kda_local(glm53f_kda_context_12n*c,float*out,const float*x){
     {
         /* detail_profile is uniform across this team. Keep timing singles
          * inside the condition so disabled instrumentation adds no barriers. */
+        if (c->q2_native && c->q2_aux) {
+            const glm53f_native_matrix pfb = {NULL, c->q2_fb, c->q2_fb_type, qd, D}, pgb = {NULL, c->q2_gb, c->q2_gb_type, qd, D};
+            kda_prefetch_rows(&pfb);
+            kda_prefetch_rows(&pgb);
+        }
         if (c->q2_native) {
             /* One team: one thread quantizes x, then Q/K/V (and the x-input
              * auxiliary projections) share one work-shared row loop.  The
@@ -281,6 +299,10 @@ static int kda_local(glm53f_kda_context_12n*c,float*out,const float*x){
         if(c->detail_profile){
 #pragma omp single
             {double t=MPI_Wtime();c->detail[2]=t-td;td=t;}
+        }
+        if (c->q2_native && c->q2_op_cols == qd) {
+            const glm53f_native_matrix pop = {NULL, c->q2_op, c->q2_op_type, H, qd};
+            kda_prefetch_rows(&pop);
         }
 #pragma omp for schedule(static)
         for(int h=0;h<hn;h++)glm53f_kda_step_vec_streamed(c->state+(size_t)h*D*D,q+(size_t)h*D,k+(size_t)h*D,v+(size_t)h*D,c->decay+(size_t)h*D,c->beta[h],D,D,c->core+(size_t)h*D,c->work+(size_t)h*D);
