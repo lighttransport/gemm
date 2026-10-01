@@ -1,7 +1,7 @@
 #!/bin/sh
 # Reproduce the optional GNM/ICT face models and LightGeom facial solver.
 #
-#   sh server/vhuman/rig/setup_face_sources.sh [--no-build]
+#   sh server/vhuman/rig/setup_face_sources.sh [--no-build] [--teacher-only]
 #
 # Requires git, curl, sha256sum, CMake >= 3.24, and a C/C++ compiler. The
 # LightGeom checkout uses GitHub SSH; the caller needs access to its private
@@ -13,10 +13,12 @@ root=$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)
 models="$root/tmp/vhuman-rig/models"
 lightgeom="$root/third_party/LightGeom"
 build=1
+teacher_only=0
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --no-build) build=0 ;;
+        --teacher-only) teacher_only=1 ;;
         -h|--help) sed -n '2,9p' "$0"; exit 0 ;;
         *) printf 'unknown option: %s\n' "$1" >&2; exit 2 ;;
     esac
@@ -87,6 +89,7 @@ checksum() {
     [ "${actual%% *}" = "$gnm_hash" ]
 }
 
+if [ "$teacher_only" -eq 0 ]; then
 checkout 'GNM v3' "$gnm_url" "$gnm_rev" "$models/gnm-v3/source"
 gnm_weight="$models/gnm-v3/gnm_head.npz"
 if ! checksum "$gnm_weight"; then
@@ -102,6 +105,8 @@ printf 'GNM weight SHA-256 %s -> %s\n' "$gnm_hash" "$gnm_weight"
 checkout 'ICT-FaceKit' "$ict_url" "$ict_rev" "$models/ict-facekit/source"
 [ -f "$models/ict-facekit/source/FaceXModel/generic_neutral_mesh.obj" ] ||
     die 'ICT-FaceKit neutral mesh is missing'
+
+fi
 
 checkout 'LightGeom' "$lightgeom_url" "$lightgeom_rev" "$lightgeom"
 [ -f "$lightgeom/examples/lightphysics_vhuman_face/main.c" ] ||

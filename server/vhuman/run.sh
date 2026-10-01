@@ -10,6 +10,8 @@ cd "$root"
 export PYTHONDONTWRITEBYTECODE=1
 export TMPDIR="$root/tmp/vhuman-runtime"
 mkdir -p "$TMPDIR"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$root/tmp/vhuman-cache}"
+mkdir -p "$XDG_CACHE_HOME"
 export LD_LIBRARY_PATH="/opt/rocm/core/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 python=${PYTHON:-python3}
 if [ -x "$root/tmp/vhuman-rocm-venv/bin/python" ]; then python=${PYTHON:-$root/tmp/vhuman-rocm-venv/bin/python}; fi

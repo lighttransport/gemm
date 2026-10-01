@@ -13,6 +13,8 @@ def configure_args(args):
     temp = root / "tmp/vhuman-runtime"
     temp.mkdir(parents=True, exist_ok=True)
     os.environ["TMPDIR"] = str(temp)
+    cache = os.environ.setdefault("XDG_CACHE_HOME", str(root / "tmp/vhuman-cache"))
+    Path(cache).mkdir(parents=True, exist_ok=True)
     gpu.configure(getattr(args, "inference_backend", "auto"), getattr(args, "device", 0),
                   getattr(args, "models_root", "/mnt/disk1/models"))
     for key, relative in (("sam3d_body_model", "sam3d-body"), ("sam3_model", "sam3/sam3.model.safetensors"),

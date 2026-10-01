@@ -249,7 +249,8 @@ def train(rig_dir: Path, take_dirs: list[Path], *, max_modes: int = 16) -> dict:
             staged_manifest = manifest_path.with_name("manifest.json.soft.partial")
             staged_manifest.write_text(json.dumps(manifest, indent=2))
             staged_manifest.replace(manifest_path)
-    report = {"format": meta["format"], "takes": [Path(t).name for t in take_dirs],
+    report = {"format": meta["format"], "backend": gpu.backend(), "device": device,
+              "takes": [Path(t).name for t in take_dirs],
               "split": split, "modes": modes, "frequency_hz": frequency, "damping": damping,
               "heldout_baseline_rmse_mm": baseline_mm, "heldout_model_rmse_mm": model_mm,
               "heldout_patch_baseline_rmse_mm": patch_baseline_mm,

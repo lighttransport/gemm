@@ -71,7 +71,8 @@ Select ROCm in the standalone Qwen page. Its default GPU is device 0.
 | Deformer playback | Native HIP blendshapes, skinning, ML and contact kernels; existing browser rendering |
 | Speech | Native HIP Qwen3-TTS and Japanese wav2vec2 alignment |
 | Video/soft-deformer fitting | Selected ROCm PyTorch device; CPU observation/geometry and LightGeom teacher retained |
-| Optional portrait depth | Selected ROCm PyTorch device when the verified Small checkpoint is installed |
+| Portrait depth | ROCm PyTorch with the verified Depth Anything V2 Small checkpoint |
+| Speech emotion | Native SenseVoice Q8 through ggml HIP, with explicit backend/device arguments |
 
 NVFP4 remains CUDA-only and is rejected on ROCm. The historical
 `--int8-gemm cutlass` spelling selects the HIP WMMA plugin on ROCm; the CUDA
@@ -86,24 +87,36 @@ free-memory checks report contention rather than assuming an idle GPU.
 
 ## Weight audit
 
-All required assets for the tested main workflow are present. The audit lists
-paths and returns a nonzero status if a required asset is absent. These optional
-weights are missing on this machine:
+All required and optional weights are now installed on this machine. The audit
+lists their paths and returns a nonzero status if a required asset is absent.
+Depth Anything V2 Small includes its verified manifest and pinned source;
+SenseVoice includes the Q8 model and native gfx1201 runtime; MediaPipe includes
+the pinned Face Landmarker model. The private LightGeom CPU teacher is also
+built and available.
 
-- `tmp/vhuman-rig/models/depth-anything-v2-small/depth_anything_v2_vits.pth`
-  (also needs its verified installation manifest and pinned source).
-- `tmp/vhuman-emotion/sensevoice-small-q8.gguf`
-  (also needs the optional SenseVoice runtime).
-- `tmp/vhuman-rig/models/face_landmarker.task`
-  (also needs MediaPipe for uploaded face-video observation; see
-  `server/vhuman/rig/setup_face_video.sh`).
+Reproduce the optional installation with:
 
-The optional CPU LightGeom teacher is also absent (`third_party/LightGeom`);
-its private source and facial runner are needed for soft-tissue simulation.
-See `server/vhuman/rig/setup_face_sources.sh`.
+```sh
+sh server/vhuman/setup_optional_rocm.sh --with-lightgeom
+```
 
-Their dependent features report missing assets. They do not prevent image,
-head, body, rig, speech or native reconstruction jobs.
+Omit `--with-lightgeom` to skip private source access. The teacher-only setup
+preserves previously checksum-verified GNM/ICT archive installations. Depth and
+emotion setup verify existing revisions/checksums and reuse valid weights.
+
+Native SenseVoice uses the [signed FunASR v0.2.6 release](https://github.com/modelscope/FunASR/releases/tag/runtime-llamacpp-v0.2.6)
+and its pinned ggml dependency. `rdna4/sensevoice` generates a small CLI overlay
+without modifying upstream source, adding explicit `--backend rocm --device N`.
+The [Q8 checkpoint](https://huggingface.co/FunAudioLLM/SenseVoiceSmall-GGUF/blob/cebc2cdd171e895d783040dbd15f10f3a76f7151/sensevoice-small-q8.gguf)
+is SHA-256 verified. Emotion jobs use the configured speech backend and the
+shared GPU lock; CPU remains available. MediaPipe observation and the LightGeom
+teacher run on CPU, with fitting and compact deformer training on ROCm.
+
+Environment, source/build products and task compiler caches live under
+`tmp/vhuman-emotion`, `third_party/LightGeom` and `tmp/vhuman-cache`. On this
+machine these are disk1-backed symlinks. Launchers default `XDG_CACHE_HOME` to
+the task cache, preserving an explicit user override and avoiding new global
+compiler-cache growth on the nearly full root filesystem.
 
 ## Validation on this machine
 
@@ -125,6 +138,15 @@ Artifacts and exact runner output are in `tmp/rocm-validation/`.
 - HIP deformer on that rig: 32 frames, maximum CPU difference 1.49e-8 m;
   ML+contacts 58.22 us/frame, ML without contacts 6.41 us/frame.
 - Japanese TTS: 0.88 s audio in 1.85 s plus 0.17 s alignment (5.3 s loading).
+- Depth Anything V2 Small: finite 256×256 depth on ROCm. MediaPipe detected all
+  six test portrait frames; ROCm fitting reduced normalized landmark error
+  from 0.001280 to 0.001040.
+- Native SenseVoice: CPU/ROCm tag parity on the 0.88 s Japanese clip
+  (`EMO_UNKNOWN`); CPU 0.89 s, ROCm 4.49 s including startup. This short clip
+  validates execution rather than emotion quality or a GPU speedup.
+- LightGeom teacher: 16 frames, 1062 surface vertices, 6135 tetrahedra,
+  minimum volume ratio 0.846149. ROCm compact training produced eight modes
+  and both LOD models; held-out patch RMSE decreased from 0.01431 to 0.00390 mm.
 - Independent BF16/INT8 GEMM and rectangular/masked attention checks pass.
   INT8 matches its reference exactly, including tails. Sage max error <0.073
   against F32 attention in these fixtures.
@@ -144,6 +166,16 @@ tmp/vhuman-rocm-venv/bin/python -B -m unittest \
  server.qwen_image21.test_app server.qwen_image21.test_form server.pixal3d.test_app
 ```
 
-The last regression run passed 178 tests (12 optional tests skipped); the dedicated studio suite passed another
-10 tests. Local
-HTTP/socket tests and GPU validation require access outside a restricted sandbox.
+The initial regression run passed 178 tests (12 optional tests skipped); the
+dedicated studio suite passed another 10 tests. After installing the optional
+modules, 45 focused emotion/speech/runtime/reconstruction tests passed, followed
+by 163 non-browser regressions (four optional tests skipped). The eight dataset
+download tests also passed independently (one gated dataset skipped). Dataset tests
+need scratch storage with at least 4 GiB free because the downloader enforces
+that reserve. Local HTTP/socket tests and GPU validation require access outside
+a restricted sandbox.
+
+Headless Chromium browser checks are limited on this host: the installed browser
+fails to create a WebGL context even with the test harness's SwiftShader flags
+(`BindToCurrentSequence failed`). This does not affect the native/PyTorch ROCm
+inference checks above.

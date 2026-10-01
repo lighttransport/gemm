@@ -5,6 +5,8 @@ root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 export TMPDIR="$root/tmp/vhuman-rocm-tmp"
 export UV_CACHE_DIR="$root/tmp/uv-cache"
 mkdir -p "$TMPDIR" "$UV_CACHE_DIR"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$root/tmp/vhuman-cache}"
+mkdir -p "$XDG_CACHE_HOME"
 export LD_LIBRARY_PATH="/opt/rocm/core/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 python="$root/tmp/vhuman-rocm-venv/bin/python"
 if [ ! -x "$python" ]; then uv venv --python 3.12 "$root/tmp/vhuman-rocm-venv"; fi

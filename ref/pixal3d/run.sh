@@ -5,6 +5,8 @@ backend=${1:?Usage: run.sh cpu|cuda|rocm SCRIPT [ARGS...]}
 shift
 case "$backend" in cpu|cuda|rocm) ;; *) echo "Invalid backend: $backend" >&2; exit 2;; esac
 export TMPDIR="$project_dir/../../tmp/pixal3d"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$project_dir/../../tmp/vhuman-cache}"
+mkdir -p "$XDG_CACHE_HOME"
 export UV_CACHE_DIR="$project_dir/.cache/uv"
 export UV_PYTHON_INSTALL_DIR="$project_dir/.cache/python"
 export UV_PROJECT_ENVIRONMENT="$project_dir/.venv-$backend"

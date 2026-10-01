@@ -341,6 +341,7 @@ a64fx/llm/ds4f_runner.log
 a64fx/llm/ds4f_frontend.log
 
 # Native ROCm vhuman runners (built locally).
+ref/pixal3d/deps
 rdna4/rocew_probe
 rdna4/qimg21/test_hip_qimg21_fast
 rdna4/vhuman/bench_vhuman_deformer_hip

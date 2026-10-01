@@ -444,7 +444,7 @@ def speech_job(service, request: dict, progress, cancel, *, model=DEFAULT_MODEL,
         analysis = None
         if auto_emotion:
             analysis = emotion.extract(stage / "audio.wav", aux["duration"], stage, cancel, progress,
-                                       runner=emotion_runner, model=emotion_model)
+                                       runner=emotion_runner, model=emotion_model, backend=selected)
             emotion_keys = analysis["emotion_keyframes"]
             (stage / "emotion.json").write_text(json.dumps(analysis, ensure_ascii=False, indent=2))
         motion_seed = (seed if request.get("seed") is not None or text else

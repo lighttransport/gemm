@@ -2,7 +2,8 @@
 set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 export TMPDIR="$root/tmp/qimg21-runtime"
-mkdir -p "$TMPDIR"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$root/tmp/vhuman-cache}"
+mkdir -p "$TMPDIR" "$XDG_CACHE_HOME"
 python="$root/tmp/qimg21-ref-venv/bin/python"
 if [ ! -x "$python" ] && [ -x "$root/tmp/vhuman-rocm-venv/bin/python" ]; then
     python="$root/tmp/vhuman-rocm-venv/bin/python"

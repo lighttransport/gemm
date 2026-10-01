@@ -229,6 +229,7 @@ def fit_observations(rig_dir: Path, direct: np.ndarray, landmarks: np.ndarray,
         error_before = float(torch.linalg.vector_norm((baseline + offset - observed)[valid], dim=-1).mean())
         error_after = float(torch.linalg.vector_norm((result - observed)[valid], dim=-1).mean())
     return controls.detach().cpu().numpy(), {"landmark_error_before_normalized": error_before,
+                                        "backend": gpu.backend(), "device": device,
                                         "landmark_error_after_normalized": error_after,
                                         "valid_frames": int(valid.sum()), "frames": len(valid),
                                         "projection_scale": scale}
