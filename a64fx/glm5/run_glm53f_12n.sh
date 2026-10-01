@@ -114,10 +114,19 @@ if [ "$command" = check ]; then
     # Exact-path gate (per-token reference MLA), then the register-blocked batched MLA against the same reference.
     # The batched MLA is not bit-identical (a 1e-8 difference in the value accumulation can flip a Q8 tie), so it is
     # gated with an explicit tolerance instead of exactness.
-    (export GLM53F_SPARSE_MLA_BATCH=0; mpi_run check-sparse "$GLM53F_BIN_DIR/glm53f_sparse_batch_check" "$model" 3 2046 32)
-    grep 'PASS' "$last_log".*.0
-    (export GLM53F_SPARSE_MLA_BATCH=1 GLM53F_SPARSE_CHECK_TOL=2e-4; mpi_run check-sparse-mla-batch "$GLM53F_BIN_DIR/glm53f_sparse_batch_check" "$model" 3 2046 32)
-    grep 'PASS' "$last_log".*.0
+    # Q8 projection GEMM changes accumulation/quantization relative to decode.
+    # Disable it and fused decode projection in both MLA checks so they isolate
+    # the MLA implementation; production GEMM is checked by generated IDs.
+    (
+        export GLM53F_SPARSE_GEMM=0 GLM53F_SPARSE_FUSE_FRONT=0 GLM53F_SPARSE_MLA_BATCH=0
+        mpi_run check-sparse "$GLM53F_BIN_DIR/glm53f_sparse_batch_check" "$model" 3 2046 32
+        grep 'GLM53F_SPARSE_BATCH .* PASS' "$last_log".*.0
+    )
+    (
+        export GLM53F_SPARSE_GEMM=0 GLM53F_SPARSE_FUSE_FRONT=0 GLM53F_SPARSE_MLA_BATCH=1 GLM53F_SPARSE_CHECK_TOL=2e-4
+        mpi_run check-sparse-mla-batch "$GLM53F_BIN_DIR/glm53f_sparse_batch_check" "$model" 3 2046 32
+        grep 'GLM53F_SPARSE_BATCH .* PASS' "$last_log".*.0
+    )
     export GLM53F_CHECK_WIDE_PREFILL=1
     # The exact scalar-vs-batch gates compare against the per-token decode kernels; the grouped native MoE path is
     # numerically different (closer to exact fp32), so it is validated separately with GLM53F_MOE_NATIVE_GROUPED=2.

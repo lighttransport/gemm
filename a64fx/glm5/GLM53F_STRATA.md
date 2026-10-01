@@ -125,11 +125,20 @@ Native A64FX measurements, job 52068253, normal 2 GHz, compact 2×3×2:
 | Warm persistent team, internal timer, 4000 jobs/repeat | 12 threads 1.576126 µs/job; 47 threads 4.595131; 48 threads 4.694641 |
 | Launcher contracts | 16 local tests PASS |
 | Strict resident MTP reporting | Six local tests PASS, including incomplete/reference/token/accounting failures |
-| Lookup rejection/rollback controller | 28 cases PASS with a local serial MPI shim; native twelve-rank check pending |
+| Lookup rejection/rollback controller | 28 cases PASS with a local serial MPI shim and native twelve-rank MPI |
 
 The index result is a kernel microbenchmark, not whole-model acceleration.
-Full-model state, every-prefix rollback, mixed-transport stress, resident
-8K throughput and MTP depth sweep are queued after model staging.
+Baseline and candidate full-model batch/prefill checks PASS, including
+every-prefix continuation in the candidate. At the 2048-token sparse
+boundary, scalar-reference MLA and rollback have zero error; batched MLA
+relative L2 is 7.55019511e-05 and rollback error is zero. Exact checks pin
+projection GEMM and fused front off to isolate MLA from nonidentical
+projection accumulation. The initial frozen baseline check failed with
+projection GEMM enabled; this was also present before the Strata changes.
+The launcher now prints the actual sparse log from inside its subshell.
+
+Full-state executor, mixed-transport stress, resident 8K throughput and MTP
+depth sweep are running serially after staging completed at 00:07 JST.
 Historical full-run rates were roughly 29–30 decode tokens/s and 285–301
 prefill tokens/s at 8K. Those are earlier measurements, not candidate results.
 

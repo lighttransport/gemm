@@ -36,7 +36,10 @@ rank = int(os.environ.get('PMIX_RANK', '0'))
 with open(os.environ['MOCK_CALLS'], 'a') as log:
     log.write(json.dumps({'name': name, 'args': sys.argv[1:], 'rank': rank,
         'native': os.environ.get('GLM53F_Q2_KDA_STAGE'),
-        'core': os.environ.get('GLM53F_REPACK_DIR')}) + '\n')
+        'core': os.environ.get('GLM53F_REPACK_DIR'),
+        'sparse_gemm': os.environ.get('GLM53F_SPARSE_GEMM'),
+        'sparse_fuse': os.environ.get('GLM53F_SPARSE_FUSE_FRONT'),
+        'sparse_mla': os.environ.get('GLM53F_SPARSE_MLA_BATCH')}) + '\n')
 if name == 'tofu_topo_helper':
     Path('tofu_topo.txt').write_text('\n'.join(str(i) for i in range(12)) + '\n')
 elif name == 'glm53f_core_stage':
@@ -60,6 +63,8 @@ elif name == 'glm53f_spec_decode_12n':
         print('GLM53F_SPEC_COMPLETE {"status":"PASS"}')
 elif name == 'test_glm53f_lookup_spec':
     print('GLM53F_LOOKUP_SPEC PASS cases=28')
+elif name == 'glm53f_sparse_batch_check':
+    print('GLM53F_SPARSE_BATCH mode=replicated PASS')
 elif name == 'glm53f_executor_check_12n':
     print('GLM53F_EXECUTOR_CHECK tokens=32 state=BIT_EXACT PASS')
 elif name == 'bench_glm53f_run_12n':
@@ -215,12 +220,16 @@ class LauncherTest(unittest.TestCase):
         self.assertEqual(call['core'], self.env['GLM53F_REPACK_STAGE_DIR'])
 
     def test_check_runs_component_and_full_model_gates(self):
-        result = self.run_cli('check')
+        result = self.run_cli('check', GLM53F_SPARSE_GEMM='1', GLM53F_SPARSE_FUSE_FRONT='1')
         self.assertEqual(result.returncode, 0, result.stdout)
         calls = self.records()
         state = next(c for c in calls if c['name'] == 'test_glm53f_state_io')
         self.assertEqual(state['args'], [self.env['GLM53F_LOG_DIR']])
         self.assertEqual(sum(c['name'] == 'glm53f_dense_batch_check' for c in calls), 36)
+        sparse = [c for c in calls if c['name'] == 'glm53f_sparse_batch_check']
+        self.assertEqual(len(sparse), 24)
+        self.assertEqual({c['sparse_mla'] for c in sparse}, {'0', '1'})
+        self.assertTrue(all(c['sparse_gemm'] == '0' and c['sparse_fuse'] == '0' for c in sparse))
         target = next(c for c in calls if c['name'] == 'glm53f_target_batch_check_12n')
         self.assertIn('--prefill-mode', target['args'])
 

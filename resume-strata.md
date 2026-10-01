@@ -1,6 +1,6 @@
 # Resume: GLM53F Strata-inspired optimization, 12 A64FX nodes
 
-Updated 2026-10-01 23:48 JST. Implementation is experimental and opt-in.
+Updated 2026-10-02 00:19 JST. Implementation is experimental and opt-in.
 Targets: complete 45-layer UD-Q4_K_XL/top-8, saved ~8K single request,
 100+ delivered decode tokens/s and 2000+ prefill tokens/s. Neither target
 has been demonstrated. See `a64fx/glm5/GLM53F_STRATA.md` for code map,
@@ -21,13 +21,10 @@ validated kernel results, flags and exact measurement commands.
 
 ## Running jobs
 
-**Do not launch another mpiexec while staging PID 719 is alive.**
+Staging completed at 00:07 JST: `SENTINEL glm53f_stage_12n=OK`.
+All routed and native stages are now available in `/local` on this allocation.
+Staging PID 719 and initial campaign PID 8758 have exited.
 
-- Staging PID **719**, log `tmp/stage.log`, rank logs
-  `tmp/glm53f-q4-52068253/routed-stage-719.1.{rank}`.
-  At 23:47 JST rank 0 completed layer 42 (~14.7 GB), out of 45. Shared filesystem staging is slow.
-  Wait for `SENTINEL glm53f_stage_12n=OK`; do not restart the partial blob.
-  Native dense/sparse/KDA/shared/core staging follows routed staging.
 - Full candidate-v7 build PID **6483** completed PASS, `tmp/build-strata-v7.log`.
   Objects `/local/glm53f-strata-v7-52068253`, shared binaries
   `a64fx/glm5/build/candidate-v7`.
@@ -42,16 +39,24 @@ validated kernel results, flags and exact measurement commands.
 - Candidate-v10 MLA integration build PID **8274** completed PASS,
   `tmp/build-strata-v10.log`. Objects `/local/glm53f-strata-v10-52068253`,
   binaries `a64fx/glm5/build/candidate-v10`; unchanged tools symlink to v9.
-- Waiting campaign PID **8758**, script `tmp/glm53f-strata-campaign-v10b.sh`,
-  log `tmp/campaign-strata-v10b.log`. It waits for staging and v10 build,
-  then runs serially: frozen baseline gates and resident 8K trials;
-  candidate gates and full-state executor comparison; persistent 8K;
+- Exact-gate rerun PID **10730**, `tmp/glm53f-strata-exact-gates-v11.sh`,
+  log `tmp/exact-gates-v11.log`. Baseline and candidate PASS at 00:18.
+  The initial frozen baseline and candidate checks both failed the sparse
+  boundary test because projection GEMM was enabled while comparing against
+  scalar decode. Rerun pins `GLM53F_SPARSE_GEMM=0` and
+  `GLM53F_SPARSE_FUSE_FRONT=0` for the exact gates. Baseline sparse reference:
+  `rel_l2=0 rollback_rel_l2=0`; batched MLA `rel_l2=7.55019511e-05`, rollback 0,
+  below the explicit 2e-4 tolerance. Baseline target batch/prefill also PASS.
+- Continuation PID **11370**, `tmp/glm53f-strata-campaign-v11.sh`,
+  log `tmp/campaign-strata-v11.log`. Started at 00:18 after both gates; restores
+  production projection defaults before frozen resident 8K trials;
+  full-state executor comparison; persistent 8K;
   300-iteration mixed MPI/uTofu owner stress; overlap 8K; adaptive lookup
-  depths 1–4; index/vector-combine 8K; register MLA 8K; controlled huge-page and existing
-  Q8 panel 8K comparisons; MTP staging and resident depths 1–4.
-  Outputs `tmp/strata-v10b/`, including a strict reference-checked MTP report. Every baseline/candidate benchmark has one warm
-  trial and three timed trials, 256 decode transitions, strict generated IDs.
-  `set -e` stops at the first failed gate; inspect logs and fix failures.
+  depths 1–4; index/vector-combine 8K; register MLA 8K; controlled huge-page
+  and Q8 panel comparisons; MTP staging and resident depths 1–4.
+  Outputs `tmp/strata-v10b/`. Every throughput comparison uses one warm trial
+  and three timed trials, 256 transitions and strict generated-ID checks.
+  `set -e` stops at first failure. Never launch competing MPI work.
 - Earlier waiting campaigns v5/v6/v7/v8/v9/v10 were canceled before MPI started.
   Never modify a running build script or source while its compiler reads it.
 
@@ -88,10 +93,14 @@ is ~4.6 µs/job at 47 threads, measured internally, excluding ELF startup.
 Local launcher 16 tests, strict MTP reporter six tests, and lookup controller
 28 mock-state cases pass. Register MLA projection is bit-exact at
 1/12/47/48 threads in fast/conservative builds, ~1.8× at 47 threads.
-Implementation commit **86fd586f**, strict MTP report commit **58e3539e**; all 311 deployed
+Implementation commit **86fd586f**, strict MTP report commit **58e3539e**,
+register MLA commit **ba6a2140**; all 311 deployed
 source fingerprints matched before the MTP completion/report addition.
 
-Full-model gates, owner stress, throughput and MTP results are **pending**.
+Baseline/candidate component and full-model batch/prefill gates PASS.
+The candidate gate includes every accepted-prefix continuation. Native
+twelve-rank lookup controller also PASS. Full-state executor, owner stress,
+throughput and MTP results are **pending**.
 Do not promote defaults or claim the target from kernel timings. Verify all
 accepted-prefix states, generated-ID comparisons and sampled memory before
 interpreting the campaign. PP3×TP4 is approved for evaluation if TP12 remains
