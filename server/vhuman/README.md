@@ -511,6 +511,11 @@ algorithms, artifact compatibility, and validation gates.
 
 ## Licensing and provenance
 
+The [neural avatar runtime](realtime/README.md) adds timestamped native TTS
+features/PCM, causal facial motion, and an Apache gsplat renderer on top of the
+existing rig. Its diagnostic benchmarks are separate from appearance quality;
+commercial appearance training requires new, cleared identity assets.
+
 Repository-authored code is under the root MIT license. NumPy, Pillow and
 Three.js are external dependencies with their own permissive licenses; the
 optional mapbox-earcut bindings declare ISC and earcut has its own notices.

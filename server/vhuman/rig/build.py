@@ -428,14 +428,17 @@ def assemble(folder, out_dir=None, res: int = 2048, iters: int = 600, log=print,
         from . import contacts as contacts_mod
         contacts_viz = dict(contacts_viz, **contacts_mod.graph(contacts_viz, active_tmpl.tris))
     viz_parts = {f"head_{p.name}": {"vmap": p.vmap.tolist()} for p in parts_t if len(p.tris)}
+    from . import native
+    native_pos, native_shapes, native_joints, native_weights = pos, shapes, Jn, W
     if source is not None:
-        viz_parts["head_mouth"] = {"vmap": proc_mouth.vmap.tolist()}
+        native_pos, native_shapes, native_joints, native_weights, mouth_map = native.append_surface(
+            pos, shapes, Jn, W, proc_mouth.vmap, proc_pos, proc_shapes, proc_Jn, proc_W)
+        viz_parts["head_mouth"] = {"vmap": mouth_map.tolist()}
     viz = {"parts": viz_parts, "contacts": contacts_viz,
-           "welded_vertices": int(len(pos))}
+           "welded_vertices": int(len(native_pos))}
     (out / "viz.json").write_text(json.dumps(viz, separators=(",", ":"),
                                              default=lambda o: o.tolist() if hasattr(o, "tolist") else str(o)))
-    from . import native
-    native_stats = native.write_package(out / "rig_deformer.safetensors", rig, pos, shapes, Jn, W, ml,
+    native_stats = native.write_package(out / "rig_deformer.safetensors", rig, native_pos, native_shapes, native_joints, native_weights, ml,
                                         contacts_viz=contacts_viz)
     glb_stats = gltf.write(asset, out / "rig.glb")
     t = lap("gltf", t)

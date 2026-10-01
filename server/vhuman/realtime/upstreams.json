@@ -1,0 +1,25 @@
+{
+  "format": "vhuman.upstreams.v1",
+  "review_date": "2026-10-01",
+  "gsplat": {
+    "repository": "https://github.com/nerfstudio-project/gsplat",
+    "revision": "512d366b67073d77ca099ede742683c165dfc23b",
+    "license": "Apache-2.0",
+    "build": "3DGS RGB only; sm_120; CUDA 13.2; per-repository cache",
+    "tested_torch": "2.14.0+cu130"
+  },
+  "identity_generator": {
+    "model": "https://huggingface.co/black-forest-labs/FLUX.2-klein-4B",
+    "revision": "e7b7dc27f91deacad38e78976d1f2b499d76a294",
+    "license": "Apache-2.0",
+    "diffusers": "0.37.1",
+    "transformers": "4.57.1",
+    "huggingface_hub": "0.36.0"
+  },
+  "tts": {
+    "model": "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+    "license": "Apache-2.0",
+    "revision_policy": "adapter revision must identify exact local model weights; hash before corpus capture",
+    "implementation": "speech/qwen3_tts, original MIT native runner"
+  }
+}

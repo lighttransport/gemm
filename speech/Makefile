@@ -10,7 +10,7 @@ CUDADIR := ../cuda
 QT      := qwen3_tts
 JA      := ja_align
 
-QT_HDRS := $(QT)/qtts_clone.h $(QT)/qtts_spk.h $(QT)/qtts_codec_enc.h $(QT)/qtts_ops.h $(QT)/qtts_codec.h $(QT)/qtts_talker.h $(QT)/qtts_tokenizer.h $(QT)/wav_io.h
+QT_HDRS := $(QT)/qtts_clone.h $(QT)/qtts_spk.h $(QT)/qtts_codec_enc.h $(QT)/qtts_ops.h $(QT)/qtts_codec.h $(QT)/qtts_codec_stream.h $(QT)/qtts_talker.h $(QT)/qtts_tokenizer.h $(QT)/wav_io.h
 JA_HDRS := $(wildcard $(JA)/*.h)
 
 all: $(BUILD)/qwen3_tts $(BUILD)/test_codec $(BUILD)/test_tokenizer $(BUILD)/ja_align $(BUILD)/test_w2v2
@@ -22,6 +22,9 @@ $(BUILD)/qwen3_tts: $(QT)/qwen3_tts_main.c $(QT_HDRS) | $(BUILD)
 	$(CC) $(CFLAGS) -I$(COMMON) -I$(QT) -o $@ $< -lm
 
 $(BUILD)/test_codec: tests/test_codec.c $(QT_HDRS) | $(BUILD)
+	$(CC) $(CFLAGS) -I$(COMMON) -I$(QT) -o $@ $< -lm
+
+$(BUILD)/test_codec_stream: tests/test_codec_stream.c $(QT_HDRS) | $(BUILD)
 	$(CC) $(CFLAGS) -I$(COMMON) -I$(QT) -o $@ $< -lm
 
 $(BUILD)/test_tokenizer: tests/test_tokenizer.c $(QT)/qtts_tokenizer.h | $(BUILD)

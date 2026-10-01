@@ -430,7 +430,7 @@ qtts_cuda *qtts_cuda_create(qtts_model *m, qtts_codec *c, int device, int verbos
     if (verbose) {
         size_t fr = 0, tot = 0;
         cuMemGetInfo(&fr, &tot);
-        fprintf(stderr, "qtts_cuda: %s, %.2f GB used by the process context, %.2f GB free\n", g->name,
+        fprintf(stderr, "qtts_cuda: %s, %.2f GB globally used (includes other processes), %.2f GB free\n", g->name,
                 (tot - fr) / 1e9, fr / 1e9);
     }
     return g;

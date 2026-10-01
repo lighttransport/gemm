@@ -88,6 +88,17 @@ int  qtts_generate(qtts_model *m, const qtts_backend *be, const int32_t *text_id
                    const int32_t *instruct_ids, int n_instruct, const char *speaker, const char *language,
                    const qtts_gen_params *gp, int capture, qtts_gen_result *out,
                    void (*on_frame)(void *user, const int32_t *codes16, int frame), void *user);
+/* Borrowed features are valid only during this callback; copy before returning.
+ * hidden is the normed talker state used to predict this codec frame, not the
+ * state for the next frame. Return nonzero to cancel after committing the frame.
+ * sample_start uses the exact 24 kHz / 1920-sample codec clock (12.5 Hz). */
+typedef int (*qtts_feature_fn)(void *user, const int32_t *codes16,
+                              const float *hidden, int hidden_size, int64_t sample_start);
+int qtts_generate_ex(qtts_model *m, const qtts_backend *be, const int32_t *text_ids, int n_text,
+                     const int32_t *instruct_ids, int n_instruct, const char *speaker, const char *language,
+                     const qtts_gen_params *gp, int capture, qtts_gen_result *out,
+                     void (*on_frame)(void *user, const int32_t *codes16, int frame), void *user,
+                     qtts_feature_fn on_feature, void *feature_user);
 /* host-side helpers shared with other backends */
 void qtts_codec_embed_sum(const qtts_model *m, const int32_t *codes, float *x);  /* x[H] = sum of 16 rows */
 void qtts_gen_result_free(qtts_gen_result *r);
@@ -514,10 +525,11 @@ static int qtl__sub_sample(void *ud, float *logits, int n) {
     return qtl__sample(logits, n, s->gp->greedy, s->gp->sub_temperature, s->gp->sub_top_k, s->gp->sub_top_p, s->rng);
 }
 
-int qtts_generate(qtts_model *m, const qtts_backend *be_in, const int32_t *ids, int n_ids,
+int qtts_generate_ex(qtts_model *m, const qtts_backend *be_in, const int32_t *ids, int n_ids,
                   const int32_t *inst, int n_inst, const char *speaker, const char *language,
                   const qtts_gen_params *gp, int capture, qtts_gen_result *out,
-                  void (*on_frame)(void *user, const int32_t *codes16, int frame), void *user) {
+                  void (*on_frame)(void *user, const int32_t *codes16, int frame), void *user,
+                  qtts_feature_fn on_feature, void *feature_user) {
     int H = m->talker.hidden, V = m->codec_vocab, G = m->num_groups;
     memset(out, 0, sizeof(*out));
     if (n_ids < 9) { fprintf(stderr, "qtts: text ids too short\n"); return -1; }
@@ -681,6 +693,11 @@ int qtts_generate(qtts_model *m, const qtts_backend *be_in, const int32_t *ids, 
         codes[0] = c0;
         if ((rc = be->predict(be->ctx, codes, qtl__sub_sample, &sub))) break;
         if (on_frame) on_frame(user, codes, frames);
+        if (on_feature && on_feature(feature_user, codes, last, H, (int64_t)frames * 1920)) {
+            frames++;
+            rc = 1; /* cancellation: result includes the already emitted frame */
+            break;
+        }
         /* next talker input: sum of all codebook embeddings + trailing text */
         qtts_codec_embed_sum(m, codes, x);
         const float *tt = frames < n_trailing ? trailing + (size_t)frames * H : e_pad;
@@ -694,6 +711,14 @@ int qtts_generate(qtts_model *m, const qtts_backend *be_in, const int32_t *ids, 
     if (!capture) free(pre);
     free(sp); free(trailing); free(logits); free(x); free(seen); free(last); free(cpu.last);
     return rc;
+}
+
+int qtts_generate(qtts_model *m, const qtts_backend *be, const int32_t *ids, int n_ids,
+                  const int32_t *inst, int n_inst, const char *speaker, const char *language,
+                  const qtts_gen_params *gp, int capture, qtts_gen_result *out,
+                  void (*on_frame)(void *user, const int32_t *codes16, int frame), void *user) {
+    return qtts_generate_ex(m, be, ids, n_ids, inst, n_inst, speaker, language,
+                            gp, capture, out, on_frame, user, NULL, NULL);
 }
 
 void qtts_gen_result_free(qtts_gen_result *r) {

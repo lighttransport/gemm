@@ -1,0 +1,18 @@
+[
+  {"text":"こんにちは。今日はいい天気ですね。", "split":"train"},
+  {"text":"青い空と白い雲が見えます。", "split":"train"},
+  {"text":"明日の朝、駅で友達に会います。", "split":"train"},
+  {"text":"パンと牛乳を買って帰りましょう。", "split":"train"},
+  {"text":"少し待ってください。今、確認しています。", "split":"train"},
+  {"text":"赤い花が庭に咲いています。", "split":"train"},
+  {"text":"新しい映画を一緒に見ませんか。", "split":"train"},
+  {"text":"この箱の中には何が入っていますか。", "split":"train"},
+  {"text":"音楽を聞きながらゆっくり歩きます。", "split":"train"},
+  {"text":"水を飲んで、少し休みましょう。", "split":"train"},
+  {"text":"大きな犬と小さな猫が遊んでいます。", "split":"train"},
+  {"text":"おはようございます。今日もよろしくお願いします。", "split":"train"},
+  {"text":"温かいコーヒーを一杯ください。", "split":"validation"},
+  {"text":"週末は公園に行こうと思っています。", "split":"validation"},
+  {"text":"右に曲がって、橋を渡ってください。", "split":"validation"},
+  {"text":"ありがとうございます。また明日お会いしましょう。", "split":"validation"}
+]

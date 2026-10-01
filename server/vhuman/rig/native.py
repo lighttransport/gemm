@@ -19,6 +19,23 @@ ROOT = Path(__file__).resolve().parents[3]
 SOURCES = ("ryzen/vhuman_deformer.c", "ryzen/lightrig_mlp2.c", "ryzen/gemm_avx2.c")
 
 
+def append_surface(rest, shapes, joints, weights, vmap, source_rest, source_shapes, source_joints, source_weights):
+    """Append a carried deformable surface in the package's own vertex namespace.
+
+    Exterior-only imported face models do not contain the procedural mouth bag.
+    Keep its original deformation data and remap its GLB vertices explicitly.
+    """
+    vmap = np.asarray(vmap)
+    if vmap.ndim != 1 or vmap.dtype.kind not in "iu" or (vmap < 0).any() or (vmap >= len(source_rest)).any():
+        raise ValueError("invalid carried surface map")
+    ids = np.unique(vmap)
+    mapping = (len(rest) + np.searchsorted(ids, vmap)).astype(np.int32)
+    zero = np.zeros_like(source_rest)
+    extended_shapes = {name: np.concatenate((delta, source_shapes.get(name, zero)[ids])) for name, delta in shapes.items()}
+    return (np.concatenate((rest, source_rest[ids])), extended_shapes,
+            np.concatenate((joints, source_joints[ids])), np.concatenate((weights, source_weights[ids])), mapping)
+
+
 def write_package(path, rig_def: dict, rest: np.ndarray, shapes: dict, joints: np.ndarray, weights: np.ndarray,
                   ml=None, contacts_viz: dict | None = None) -> dict:
     R = rigdef.Rig(rig_def)

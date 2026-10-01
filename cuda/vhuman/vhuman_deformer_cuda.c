@@ -144,6 +144,9 @@ static const char *kSource =
 struct vh_gpu {
     vh_deformer *d;
     CUcontext ctx;
+    CUdevice device;
+    int shared, owns_stream, upload_pending;
+    CUevent upload_ready;
     CUmodule mod;
     CUfunction fn, fn_ct;
     int has_ct;
@@ -163,11 +166,11 @@ static double now_ms(void) {
     return t.tv_sec * 1e3 + t.tv_nsec * 1e-6;
 }
 
-vh_gpu *vh_gpu_create(vh_deformer *d, int device, int verbose) {
+static vh_gpu *create_impl(vh_deformer *d, int device, uintptr_t stream, int shared, int verbose) {
     if (cuewInit(CUEW_INIT_CUDA | CUEW_INIT_NVRTC) != CUEW_SUCCESS) return NULL;
     if (cuInit(0) != CUDA_SUCCESS) return NULL;
     int count = 0;
-    if (cuDeviceGetCount(&count) != CUDA_SUCCESS || device >= count) return NULL;
+    if (cuDeviceGetCount(&count) != CUDA_SUCCESS || device < 0 || device >= count) return NULL;
     vh_gpu *g = calloc(1, sizeof(*g));
     if (!g) return NULL;
     g->d = d;
@@ -178,14 +181,21 @@ vh_gpu *vh_gpu_create(vh_deformer *d, int device, int verbose) {
     if (g->M > MAX_MORPHS || g->J > MAX_JOINTS) { free(g); return NULL; }
     CUdevice dev;
     cuDeviceGet(&dev, device);
+    g->device = dev;
+    g->shared = shared;
     cuDeviceGetName(g->name, sizeof(g->name), dev);
-    if (cuCtxCreate(&g->ctx, 0, dev) != CUDA_SUCCESS) { free(g); return NULL; }
+    CUresult context_result = shared ? cuDevicePrimaryCtxRetain(&g->ctx, dev) : cuCtxCreate(&g->ctx, 0, dev);
+    if (context_result != CUDA_SUCCESS) { free(g); return NULL; }
+    cuCtxSetCurrent(g->ctx);
     if (cu_compile_kernels(&g->mod, dev, kSource, "vhuman_deformer", verbose, "vhuman_deformer") < 0 ||
         cuModuleGetFunction(&g->fn, g->mod, "vh_deform") != CUDA_SUCCESS) {
         vh_gpu_free(g);
         return NULL;
     }
-    cuStreamCreate(&g->stream, CU_STREAM_NON_BLOCKING);
+    g->owns_stream = !shared;
+    if (shared) g->stream = (CUstream)stream;
+    else if (cuStreamCreate(&g->stream, CU_STREAM_NON_BLOCKING) != CUDA_SUCCESS) { vh_gpu_free(g); return NULL; }
+    if (cuEventCreate(&g->upload_ready, CU_EVENT_DISABLE_TIMING) != CUDA_SUCCESS) { vh_gpu_free(g); return NULL; }
     const vh_contacts *c = vh_deformer_contacts(d);
     if (c && c->ns <= 512 && cuModuleGetFunction(&g->fn_ct, g->mod, "vh_contacts") == CUDA_SUCCESS) {
         g->c_eye_ids = cu_upload_raw(c->eye_ids, c->ne * 4);
@@ -223,18 +233,26 @@ vh_gpu *vh_gpu_create(vh_deformer *d, int device, int verbose) {
     return g;
 }
 
+vh_gpu *vh_gpu_create(vh_deformer *d, int device, int verbose) { return create_impl(d, device, 0, 0, verbose); }
+vh_gpu *vh_gpu_create_shared(vh_deformer *d, int device, uintptr_t stream, int verbose) {
+    return create_impl(d, device, stream, 1, verbose);
+}
+uintptr_t vh_gpu_vertices_device(const vh_gpu *g) { return (uintptr_t)g->out; }
+
 const char *vh_gpu_name(const vh_gpu *g) { return g->name; }
 
 static int ensure(vh_gpu *g, size_t frames) {
     if (frames <= g->cap_frames) return 0;
+    cuStreamSynchronize(g->stream);
     CU_FREE(g->w); CU_FREE(g->skin); CU_FREE(g->out); CU_FREE(g->c_scratch);
-    free(g->h_w); free(g->h_skin);
+    if (g->h_w) { cuMemFreeHost(g->h_w); g->h_w = NULL; }
+    if (g->h_skin) { cuMemFreeHost(g->h_skin); g->h_skin = NULL; }
     size_t cap = frames < 64 ? 64 : frames;
     if (cuMemAlloc(&g->w, cap * g->M * 4) != CUDA_SUCCESS || cuMemAlloc(&g->skin, cap * g->J * 48) != CUDA_SUCCESS ||
         cuMemAlloc(&g->out, cap * g->V * 12) != CUDA_SUCCESS) return -1;
     if (g->nc && cuMemAlloc(&g->c_scratch, cap * (size_t)g->nc * 24) != CUDA_SUCCESS) return -1;
-    g->h_w = malloc(cap * g->M * 4);
-    g->h_skin = malloc(cap * g->J * 48);
+    if (cuMemAllocHost((void **)&g->h_w, cap * g->M * 4) != CUDA_SUCCESS ||
+        cuMemAllocHost((void **)&g->h_skin, cap * g->J * 48) != CUDA_SUCCESS) return -1;
     free(g->h_scratch);
     g->h_scratch = malloc(vh_deformer_prepare_scratch(g->d, cap) * 4 + 4);
 
@@ -243,26 +261,30 @@ static int ensure(vh_gpu *g, size_t frames) {
     return 0;
 }
 
-int vh_gpu_eval_batch(vh_gpu *g, const float *controls, size_t frames, int use_ml, float *out, double *ms4) {
+static int eval_impl(vh_gpu *g, const float *controls, size_t frames, int use_ml, float *out, double *ms4, int async) {
     if (!frames) return 0;
     cuCtxSetCurrent(g->ctx);
     if (ensure(g, frames)) return -1;
+    if (g->upload_pending && cuEventSynchronize(g->upload_ready) != CUDA_SUCCESS) return -2;
     double t0 = now_ms();
     vh_deformer_prepare_batch(g->d, controls, frames, use_ml, g->h_w, g->h_skin, g->h_scratch);
     double t1 = now_ms();
-    cuMemcpyHtoDAsync(g->w, g->h_w, frames * g->M * 4, g->stream);
-    cuMemcpyHtoDAsync(g->skin, g->h_skin, frames * g->J * 48, g->stream);
-    CUevent e0, e1;
-    cuEventCreate(&e0, 0);
-    cuEventCreate(&e1, 0);
-    cuStreamSynchronize(g->stream);
+    if (cuMemcpyHtoDAsync(g->w, g->h_w, frames * g->M * 4, g->stream) != CUDA_SUCCESS ||
+        cuMemcpyHtoDAsync(g->skin, g->h_skin, frames * g->J * 48, g->stream) != CUDA_SUCCESS) return -2;
+    cuEventRecord(g->upload_ready, g->stream);
+    g->upload_pending = 1;
+    CUevent e0 = NULL, e1 = NULL;
+    if (!async) {
+        cuEventCreate(&e0, 0); cuEventCreate(&e1, 0);
+        cuStreamSynchronize(g->stream);
+    }
     double t2 = now_ms();
     int V = (int)g->V, M = (int)g->M, J = (int)g->J, F = (int)frames;
     void *args[] = {&g->rest, &g->morph, &g->sj, &g->sw, &g->w, &g->skin, &g->out, &V, &M, &J, &F};
     unsigned block = 128;
     unsigned gx = (unsigned)((g->V + block - 1) / block), gy = (unsigned)((frames + FRAMES_PER_THREAD - 1) / FRAMES_PER_THREAD);
     unsigned smem = (unsigned)(FRAMES_PER_THREAD * (g->M + g->J * 12) * 4);
-    cuEventRecord(e0, g->stream);
+    if (!async) cuEventRecord(e0, g->stream);
     CUresult r = cuLaunchKernel(g->fn, gx, gy, 1, block, 1, 1, smem, g->stream, args, NULL);
     int iters = vh_deformer_contact_iterations(g->d);
     if (g->has_ct && iters > 0) {
@@ -275,6 +297,7 @@ int vh_gpu_eval_batch(vh_gpu *g, const float *controls, size_t frames, int use_m
                          &g->c_verts, &g->c_nbr_ptr, &g->c_nbr_idx, &g->nc, &smooth, &g->c_scratch};
         if (r == CUDA_SUCCESS) r = cuLaunchKernel(g->fn_ct, (unsigned)frames, 1, 1, 256, 1, 1, 0, g->stream, cargs, NULL);
     }
+    if (async) return r == CUDA_SUCCESS ? 0 : -2;
     cuEventRecord(e1, g->stream);
     cuEventSynchronize(e1);
     float kms = 0;
@@ -294,18 +317,33 @@ int vh_gpu_eval_batch(vh_gpu *g, const float *controls, size_t frames, int use_m
     return 0;
 }
 
+int vh_gpu_eval_batch(vh_gpu *g, const float *controls, size_t frames, int use_ml, float *out, double *ms4) {
+    return eval_impl(g, controls, frames, use_ml, out, ms4, 0);
+}
+int vh_gpu_submit(vh_gpu *g, const float *controls, int use_ml) {
+    if (!g || !g->shared || !controls) return -1;
+    return eval_impl(g, controls, 1, use_ml, NULL, NULL, 1);
+}
+
 void vh_gpu_free(vh_gpu *g) {
     if (!g) return;
     if (g->ctx) cuCtxSetCurrent(g->ctx);
+    if (g->ctx) cuStreamSynchronize(g->stream);
     CU_FREE(g->rest); CU_FREE(g->morph); CU_FREE(g->sj); CU_FREE(g->sw);
     CU_FREE(g->w); CU_FREE(g->skin); CU_FREE(g->out);
     CU_FREE(g->c_eye_ids); CU_FREE(g->c_eye_joint); CU_FREE(g->c_eye_center); CU_FREE(g->c_eye_thr);
     CU_FREE(g->c_lip_ids); CU_FREE(g->c_sph_center); CU_FREE(g->c_sph_joint); CU_FREE(g->c_sph_weight);
     CU_FREE(g->c_sph_thr); CU_FREE(g->c_pair_u); CU_FREE(g->c_pair_l); CU_FREE(g->c_pair_floor);
     CU_FREE(g->c_verts); CU_FREE(g->c_nbr_ptr); CU_FREE(g->c_nbr_idx); CU_FREE(g->c_scratch);
-    free(g->h_w); free(g->h_skin); free(g->h_scratch);
-    if (g->stream) cuStreamDestroy(g->stream);
+    if (g->h_w) cuMemFreeHost(g->h_w);
+    if (g->h_skin) cuMemFreeHost(g->h_skin);
+    free(g->h_scratch);
+    if (g->upload_ready) cuEventDestroy(g->upload_ready);
+    if (g->stream && g->owns_stream) cuStreamDestroy(g->stream);
     if (g->mod) cuModuleUnload(g->mod);
-    if (g->ctx) cuCtxDestroy(g->ctx);
+    if (g->ctx) {
+        if (g->shared) cuDevicePrimaryCtxRelease(g->device);
+        else cuCtxDestroy(g->ctx);
+    }
     free(g);
 }

@@ -12,6 +12,7 @@
 #define VHUMAN_DEFORMER_CUDA_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 #include "../../ryzen/vhuman_deformer.h"
 
@@ -23,6 +24,15 @@ typedef struct vh_gpu vh_gpu;
 
 /* device index; returns NULL without a CUDA driver/device. */
 vh_gpu *vh_gpu_create(vh_deformer *d, int device, int verbose);
+/* Retain the device primary context; borrow the caller's CUDA stream.
+ * The caller must keep that stream alive until vh_gpu_free. */
+vh_gpu *vh_gpu_create_shared(vh_deformer *d, int device, uintptr_t stream, int verbose);
+/* Enqueue one frame without a device/stream completion wait. Host inputs are
+ * copied to persistent pinned staging. Call/consume on the borrowed stream.
+ * The returned device view is borrowed, overwritten on the next submit, and
+ * invalid after free. Do not retain it across submits without a device copy. */
+int vh_gpu_submit(vh_gpu *g, const float *controls, int use_ml);
+uintptr_t vh_gpu_vertices_device(const vh_gpu *g);
 void vh_gpu_free(vh_gpu *g);
 const char *vh_gpu_name(const vh_gpu *g);
 
