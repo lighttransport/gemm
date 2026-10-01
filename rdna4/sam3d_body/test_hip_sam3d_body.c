@@ -22,6 +22,9 @@
 #define RT_DETR_IMPLEMENTATION
 #include "../../common/rt_detr.h"
 
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#define TINY_GLTF_IMPLEMENTATION
+#include "../../common/tiny_gltf.h"
 #include "hip_sam3d_body_runner.h"
 
 #include <stdint.h>
@@ -35,6 +38,77 @@ static double cli_time_ms(void)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec * 1.0e-6;
+}
+
+static int write_sidecar_json(hip_sam3d_body_ctx *ctx,
+                               const char *out_path,
+                               const float bbox[4], int has_bbox,
+                               int auto_bbox_used, float auto_bbox_score,
+                               float auto_bbox_threshold,
+                               int iw, int ih)
+{
+    char json_path[1024];
+    snprintf(json_path, sizeof(json_path), "%s.json", out_path);
+    FILE *jf = fopen(json_path, "w");
+    if (!jf) return -1;
+
+    int np = 0; hip_sam3d_body_get_mhr_params(ctx, NULL, &np);
+    int nk3 = 0, nk2 = 0;
+    hip_sam3d_body_get_keypoints_3d(ctx, NULL, &nk3);
+    hip_sam3d_body_get_keypoints_2d(ctx, NULL, &nk2);
+    float *mp = np  ? (float *)malloc((size_t)np  * sizeof(float)) : NULL;
+    float *k3 = nk3 ? (float *)malloc((size_t)nk3 * 3 * sizeof(float)) : NULL;
+    float *k2 = nk2 ? (float *)malloc((size_t)nk2 * 2 * sizeof(float)) : NULL;
+    float cam_t[3] = {0}, focal_px = 0;
+    float model_params[204], shape[45];
+    if (mp) hip_sam3d_body_get_mhr_params(ctx, mp, &np);
+    if (k3) hip_sam3d_body_get_keypoints_3d(ctx, k3, &nk3);
+    if (k2) hip_sam3d_body_get_keypoints_2d(ctx, k2, &nk2);
+    hip_sam3d_body_get_cam(ctx, cam_t, &focal_px);
+    if (hip_sam3d_body_get_decoded_mhr(ctx, model_params, shape)) { fclose(jf); free(mp); free(k3); free(k2); return -1; }
+
+    fprintf(jf, "{\n");
+    if (has_bbox) {
+        fprintf(jf, "  \"bbox\": [%.3f, %.3f, %.3f, %.3f],\n",
+                bbox[0], bbox[1], bbox[2], bbox[3]);
+        fprintf(jf, "  \"bbox_source\": \"%s\",\n",
+                auto_bbox_used ? "auto" : "manual");
+        if (auto_bbox_used) {
+            fprintf(jf,
+                    "  \"auto_bbox\": {\"detector\": \"rt-detr-s\", "
+                    "\"score\": %.6f, \"threshold\": %.6f},\n",
+                    auto_bbox_score, auto_bbox_threshold);
+        }
+    }
+    fprintf(jf, "  \"image\": {\"width\": %d, \"height\": %d},\n", iw, ih);
+    fprintf(jf, "  \"focal_px\": %.6f,\n", focal_px);
+    fprintf(jf, "  \"cam_t\": [%.6f, %.6f, %.6f],\n",
+            cam_t[0], cam_t[1], cam_t[2]);
+    fprintf(jf, "  \"mhr_params\": [");
+    for (int i = 0; i < np; i++)
+        fprintf(jf, "%s%.6g", i ? "," : "", mp[i]);
+    fprintf(jf, "],\n");
+    fprintf(jf, "  \"model_params\": [");
+    for (int i = 0; i < 204; i++) fprintf(jf, "%s%.9g", i ? "," : "", model_params[i]);
+    fprintf(jf, "],\n  \"shape\": [");
+    for (int i = 0; i < 45; i++) fprintf(jf, "%s%.9g", i ? "," : "", shape[i]);
+    fprintf(jf, "],\n");
+    fprintf(jf, "  \"keypoints_3d\": [");
+    for (int i = 0; i < nk3; i++)
+        fprintf(jf, "%s[%.6f,%.6f,%.6f]", i ? "," : "",
+                k3[i*3+0], k3[i*3+1], k3[i*3+2]);
+    fprintf(jf, "],\n");
+    fprintf(jf, "  \"keypoints_2d\": [");
+    for (int i = 0; i < nk2; i++)
+        fprintf(jf, "%s[%.3f,%.3f]", i ? "," : "",
+                k2[i*2+0], k2[i*2+1]);
+    fprintf(jf, "]\n}\n");
+    fclose(jf);
+    free(mp); free(k3); free(k2);
+    fprintf(stderr, "[test_hip_sam3d_body] wrote %s "
+                    "(mhr_params=%d kp3d=%d kp2d=%d)\n",
+            json_path, np, nk3, nk2);
+    return 0;
 }
 
 static void print_usage(const char *prog)
@@ -68,6 +142,7 @@ int main(int argc, char **argv)
     int auto_bbox = 0;
     const char *rt_detr_model = "/mnt/disk01/models/rt_detr_s/model.safetensors";
     float auto_thresh = 0.5f;
+    float auto_bbox_score = 0.0f;
     hip_sam3d_body_backbone_t backbone = HIP_SAM3D_BODY_BACKBONE_DINOV3;
 
     int positional = 0;
@@ -142,7 +217,8 @@ int main(int argc, char **argv)
             stbi_image_free(pixels);
             return 4;
         }
-        bbox[0] = box.x0; bbox[1] = box.y0;
+        auto_bbox_score = box.score;
+            bbox[0] = box.x0; bbox[1] = box.y0;
         bbox[2] = box.x1; bbox[3] = box.y1;
         has_bbox = 1;
         if (verbose)
@@ -190,7 +266,11 @@ int main(int argc, char **argv)
         int32_t *faces = (int32_t *)malloc((size_t)nf * 3 * sizeof(int32_t));
         hip_sam3d_body_get_vertices(ctx, verts, &nv);
         hip_sam3d_body_get_faces(ctx, faces, &nf);
-        rc = obj_write(out_path, verts, nv, faces, nf);
+        if (strlen(out_path) >= 4 && !strcmp(out_path + strlen(out_path) - 4, ".glb"))
+            rc = tinygltf_write_glb_mesh(out_path, verts, nv, (int *)faces, nf);
+        else rc = obj_write(out_path, verts, nv, faces, nf);
+        if (!rc) rc = write_sidecar_json(ctx, out_path, bbox, has_bbox, auto_bbox, auto_bbox_score,
+                                   auto_thresh, iw, ih);
         free(verts); free(faces);
         if (rc == 0)
             fprintf(stderr, "[test_hip_sam3d_body] wrote %s (V=%d F=%d)\n",

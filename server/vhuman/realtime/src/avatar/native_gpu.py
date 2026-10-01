@@ -37,11 +37,13 @@ def release(pointer):
 class NativeSharedGPU(Native):
     def __init__(self, package, build_dir, device=0, stream=None):
         import torch
+        if torch.version.hip:
+            raise RuntimeError("the shared-context Gaussian runtime requires CUDA PyTorch")
         self.torch = torch
         self.device = device
         self.stream = stream or torch.cuda.current_stream(device)
         if self.stream.device.index != device: raise ValueError("stream/device mismatch")
-        super().__init__(build_gpu_library(build_dir), package)
+        super().__init__(build_gpu_library(build_dir, backend="cuda"), package)
         self.live_views = 0
         L = self.lib
         L.vh_gpu_create_shared.argtypes = [C.c_void_p, C.c_int, C.c_size_t, C.c_int]

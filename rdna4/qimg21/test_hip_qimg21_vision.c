@@ -223,6 +223,7 @@ static int build_position_embedding(const qimg21_shards *shards, int h, int w, f
 }
 
 int main(int argc, char **argv) {
+    int device_index = 0;
     const char *model = NULL, *pixels = NULL, *image = NULL, *hidden = NULL, *out = NULL;
     const char *norm1_override = NULL, *norm2_override = NULL;
     const char *pixels_out = NULL, *patch_out = NULL, *dump_dir = NULL;
@@ -233,7 +234,8 @@ int main(int argc, char **argv) {
     const char *layer_norm_mode = "nvrtc";
     int h = 0, w = 0, max_blocks = 0, block_index = 0;
     for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "--model") && i + 1 < argc) model = argv[++i];
+        if (!strcmp(argv[i], "--device") && i+1<argc) { device_index=atoi(argv[++i]); if(device_index<0)return 2; }
+        else if (!strcmp(argv[i], "--model") && i + 1 < argc) model = argv[++i];
         else if (!strcmp(argv[i], "--pixel-values") && i + 1 < argc) pixels = argv[++i];
         else if (!strcmp(argv[i], "--image") && i + 1 < argc) image = argv[++i];
         else if (!strcmp(argv[i], "--hidden") && i + 1 < argc) hidden = argv[++i];
@@ -285,7 +287,7 @@ int main(int argc, char **argv) {
     if ((image ? load_vision_patches(image, &input, &h, &w) :
          npy_read_f32(pixels ? pixels : hidden, &input)) || input.ndim != 2 ||
         input.shape[0] != (size_t)h * w || input.shape[1] != (size_t)((pixels || image) ? 1536 : 1152) ||
-        npy_read_f32("cuda/qimg21/qwen21_vision_rope.npy", &vision_rope_table) ||
+        npy_read_f32("rdna4/qimg21/qwen21_vision_rope.npy", &vision_rope_table) ||
         vision_rope_table.ndim != 3 || vision_rope_table.shape[1] != 18 ||
         vision_rope_table.shape[2] != 2 || vision_rope_table.shape[0] < (size_t)(h > w ? h : w) ||
         (norm1_override && (npy_read_f32(norm1_override, &norm1_input) || norm1_input.ndim != 2 ||
@@ -310,7 +312,7 @@ int main(int argc, char **argv) {
         if (!shards.st[shards.n]) goto fail;
         shards.n++;
     }
-    cuda_qimg_runner *r = cuda_qimg_init(0, 1);
+    cuda_qimg_runner *r = cuda_qimg_init(device_index, 1);
     CUmodule module = NULL;
     CUfunction add_pos = NULL, layer_norm = NULL;
     CUfunction linear_epilogue = NULL, patch_epilogue = NULL, bf16_epilogue = NULL, vision_rope = NULL, vision_attn = NULL;

@@ -354,7 +354,7 @@ class GpuLockTest(unittest.TestCase):
         from . import gpu
         src = (ROOT / "server/pixal3d/app.py").read_text()
         self.assertIn("device-locks", src)
-        self.assertIn('f"cuda-{device}.lock"', src)
+        self.assertIn('f"{backend}-{device}.lock"', src)
         self.assertEqual(gpu.LOCK_PATH, ROOT / "tmp/pixal3d/device-locks/cuda-0.lock")
 
     def test_lock_excludes_and_cancels(self):

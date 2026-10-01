@@ -5,9 +5,13 @@
 #include <string.h>
 #include <time.h>
 
+#ifdef VHUMAN_WITH_HIP
+#include "../../rdna4/cuda_driver_compat.h"
+#else
 #include "../cuew.h"
 #define CUDA_RUNNER_COMMON_IMPLEMENTATION
 #include "../cuda_runner_common.h"
+#endif
 
 #define FRAMES_PER_THREAD 8
 #define MAX_MORPHS 256
@@ -167,6 +171,11 @@ static double now_ms(void) {
 }
 
 static vh_gpu *create_impl(vh_deformer *d, int device, uintptr_t stream, int shared, int verbose) {
+#ifdef VHUMAN_WITH_HIP
+    /* The HIP batch backend owns its context. Borrowing a PyTorch primary
+     * context/stream is currently supported only by the CUDA runtime. */
+    if (shared) return NULL;
+#endif
     if (cuewInit(CUEW_INIT_CUDA | CUEW_INIT_NVRTC) != CUEW_SUCCESS) return NULL;
     if (cuInit(0) != CUDA_SUCCESS) return NULL;
     int count = 0;
@@ -180,11 +189,15 @@ static vh_gpu *create_impl(vh_deformer *d, int device, uintptr_t stream, int sha
     g->C = vh_deformer_controls(d);
     if (g->M > MAX_MORPHS || g->J > MAX_JOINTS) { free(g); return NULL; }
     CUdevice dev;
-    cuDeviceGet(&dev, device);
+    if (cuDeviceGet(&dev, device) != CUDA_SUCCESS) { free(g); return NULL; }
     g->device = dev;
     g->shared = shared;
     cuDeviceGetName(g->name, sizeof(g->name), dev);
+#ifdef VHUMAN_WITH_HIP
+    CUresult context_result = cuCtxCreate(&g->ctx, 0, dev);
+#else
     CUresult context_result = shared ? cuDevicePrimaryCtxRetain(&g->ctx, dev) : cuCtxCreate(&g->ctx, 0, dev);
+#endif
     if (context_result != CUDA_SUCCESS) { free(g); return NULL; }
     cuCtxSetCurrent(g->ctx);
     if (cu_compile_kernels(&g->mod, dev, kSource, "vhuman_deformer", verbose, "vhuman_deformer") < 0 ||
@@ -342,8 +355,11 @@ void vh_gpu_free(vh_gpu *g) {
     if (g->stream && g->owns_stream) cuStreamDestroy(g->stream);
     if (g->mod) cuModuleUnload(g->mod);
     if (g->ctx) {
+#ifndef VHUMAN_WITH_HIP
         if (g->shared) cuDevicePrimaryCtxRelease(g->device);
-        else cuCtxDestroy(g->ctx);
+        else
+#endif
+            cuCtxDestroy(g->ctx);
     }
     free(g);
 }

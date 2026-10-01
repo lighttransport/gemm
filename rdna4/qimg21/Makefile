@@ -1,3 +1,5 @@
+export TMPDIR := $(abspath ../../tmp/qimg21-compiler)
+$(shell mkdir -p $(TMPDIR))
 # Native Qwen Image 2.1 denoiser for RDNA4.
 # Host code is plain C; HIP and HIPRTC are loaded dynamically through rocew.
 CC ?= gcc
@@ -60,3 +62,21 @@ rocew-probe: ../rocew_probe.c ../rocew.c ../rocew.h
 
 clean:
 	rm -f $(TARGET) libq21_hip_attention.so
+
+fast: test_hip_qimg21_fast libq21_hip_fast_gemm.so libq21_hip_fast_attention.so libq21_hip_fast_sage.so
+
+test_hip_qimg21_fast: test_hip_qimg21_fast.c ../../cuda/qimg21/test_cuda_qimg21_fast.c fast_blas.h ../cuda_driver_compat.h ../rocew.c
+	$(CC) $(CFLAGS) -Wno-pointer-arith -o $@.new $< ../rocew.c $(LDFLAGS)
+	mv $@.new $@
+
+libq21_hip_fast_gemm.so: fast_gemm.hip
+	$(HIPCC) -std=c++17 -O3 -ffp-contract=off --offload-arch=$(GPU_ARCH) -fPIC -shared $< -o $@
+
+../../tmp/qimg21/sage_device.inc: extract_sage.py
+	python3 $< $@
+
+libq21_hip_fast_sage.so: fast_sage.hip ../../tmp/qimg21/sage_device.inc
+	$(HIPCC) -I../../tmp/rocwmma/library/include -std=c++17 -O3 -ffp-contract=off --offload-arch=$(GPU_ARCH) -fPIC -shared $< -o $@
+
+libq21_hip_fast_attention.so: fast_attention.hip
+	$(HIPCC) -std=c++17 -O3 -ffp-contract=off --offload-arch=$(GPU_ARCH) -fPIC -shared $< -o $@

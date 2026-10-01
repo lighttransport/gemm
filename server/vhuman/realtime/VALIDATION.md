@@ -189,3 +189,19 @@ POSIX dynamic-loader function-pointer casts in cuew; these were not changed here
 MediaPipe's native runtime stalled inside the execution sandbox; the identified
 audit was stopped and the same command succeeded outside it. No old research
 portrait was used in the new fitting or capture paths.
+
+## ROCm update integration
+
+Merged `origin/pixal3d` through `c4386898`. The native HIP batch path retains
+its own context; CUDA primary-context borrowing remains exclusive to the
+realtime Gaussian path. That path explicitly builds CUDA and rejects ROCm
+PyTorch before creating native resources. Both native libraries compile here;
+actual AMD GPU execution cannot be validated on this NVIDIA-only host.
+
+Integration checks: CPU/runtime/backend/body tests ran41 with one ROCm hardware
+skip; four CUDA/training tests and both real resident TTS cancellation/reuse
+tests passed. The additional backend-isolation tests pass without GPU access.
+CPU, CUDA and all three ROCm speech runners build with `-Wall -Wextra -Werror`;
+speech CTC/DSP correctness checks pass. Server tests use a local mocked MoGe
+model fixture, and socket tests require execution outside the socket-restricted
+sandbox.

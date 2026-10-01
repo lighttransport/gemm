@@ -2,7 +2,7 @@
 from types import SimpleNamespace
 import threading
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from .src.pipeline.cleanup import close_resources
 from .src.pipeline.live import validate_appearance
@@ -11,6 +11,28 @@ from .src.ui.output import FrameOutput
 
 
 class LifecycleTests(unittest.TestCase):
+    def test_shared_renderer_rejects_rocm_torch_before_build(self):
+        import torch
+        from .src.avatar.native_gpu import NativeSharedGPU
+        with patch.object(torch.version, "hip", "test-rocm"), \
+             patch("server.vhuman.realtime.src.avatar.native_gpu.build_gpu_library") as build:
+            with self.assertRaisesRegex(RuntimeError, "requires CUDA PyTorch"):
+                NativeSharedGPU("unused", "unused")
+            build.assert_not_called()
+
+    def test_shared_renderer_explicitly_builds_cuda(self):
+        import torch
+        from .. import gpu
+        from .src.avatar.native_gpu import NativeSharedGPU
+        stream = SimpleNamespace(device=SimpleNamespace(index=0), cuda_stream=7)
+        with gpu.execution("rocm"), patch.object(torch.version, "hip", None), \
+             patch.object(torch.cuda, "current_stream", return_value=stream), \
+             patch("server.vhuman.realtime.src.avatar.native_gpu.build_gpu_library",
+                   side_effect=RuntimeError("stop before loading library")) as build:
+            with self.assertRaisesRegex(RuntimeError, "stop before loading library"):
+                NativeSharedGPU("unused", "test-build")
+            build.assert_called_once_with("test-build", backend="cuda")
+
     def test_untrained_production_appearance_requires_diagnostic(self):
         avatar = SimpleNamespace(metadata={"purpose": "production", "trained": False})
         with self.assertRaisesRegex(ValueError, "untrained appearance"):

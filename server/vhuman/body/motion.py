@@ -7,6 +7,7 @@ monocular camera translation is not a reliable world-space motion track.
 """
 from __future__ import annotations
 
+from contextlib import nullcontext
 import argparse
 import hashlib
 import json
@@ -155,7 +156,7 @@ def _sam_frame(image: Path, out: Path, bbox: tuple[int, ...], model_dir: Path, c
     binary = body_job._binary("sam3d_body", use_cuda, cancel)
     cmd = [str(binary), "--safetensors-dir", str(model_dir / "safetensors"),
            "--mhr-assets", str(model_dir / "safetensors"), "--image", str(image),
-           "--bbox", *map(str, bbox), "--backbone", "dinov3", "-o", str(out)]
+           "--bbox", *map(str, bbox), "--device", str(gpu.device_index()), "--backbone", "dinov3", "-o", str(out)]
     if use_cuda:
         with gpu.device_session(2048, cancel):
             body_job._run(cmd, cancel)
@@ -166,7 +167,9 @@ def _sam_frame(image: Path, out: Path, bbox: tuple[int, ...], model_dir: Path, c
 
 def _decode(model_path: Path, identity: np.ndarray, sidecars: list[Path]) -> tuple[list[str], np.ndarray]:
     import torch
-    model = torch.jit.load(str(model_path), map_location="cpu")
+    from server.vhuman.runtime import torch_device
+    device = torch_device(torch)
+    model = torch.jit.load(str(model_path), map_location=device)
     poses = []
     for path in sidecars:
         p = np.asarray(json.loads(path.read_text())["model_params"], np.float32)
@@ -180,9 +183,9 @@ def _decode(model_path: Path, identity: np.ndarray, sidecars: list[Path]) -> tup
     with torch.no_grad():
         for start in range(0, len(params), 4):
             batch = params[start:start + 4]
-            _, state = model(torch.from_numpy(np.repeat(identity[None], len(batch), axis=0)),
-                             torch.from_numpy(batch), torch.zeros((len(batch), 72)))
-            global_q = state.numpy()[:, :, 3:7].astype(np.float64)
+            _, state = model(torch.from_numpy(np.repeat(identity[None], len(batch), axis=0)).to(device),
+                             torch.from_numpy(batch).to(device), torch.zeros((len(batch), 72), device=device))
+            global_q = state.cpu().numpy()[:, :, 3:7].astype(np.float64)
             global_q /= np.maximum(np.linalg.norm(global_q, axis=2, keepdims=True), 1e-9)
             local = global_q.copy()
             from scipy.spatial.transform import Rotation
@@ -275,7 +278,8 @@ def fit(service, request: dict, progress, cancel, *, model_dir=body_job.MODEL_DI
                "--source-glb", str(avatar), "--output", str(output),
                "--kind", upload_meta["kind"], "--fps", str(FPS),
                *map(str, sidecars)]
-        body_job._run(cmd, cancel, timeout=300)
+        with gpu.device_session(1024, cancel) if gpu.backend() != "cpu" else nullcontext():
+            body_job._run(cmd, cancel, timeout=300)
         motion = json.loads(output.read_text())
         manifest = {"id": take_id, "head_id": hid, "kind": upload_meta["kind"],
                     "source_upload_id": upload_id, "source_sha256": upload_meta["sha256"],

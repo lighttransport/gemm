@@ -16,10 +16,19 @@
  * The command line is a superset of the harness, so regression.py and
  * editing_regression.py can drive it through --native-bin/--native-binary. */
 #define main qimg21_oracle_main
+#ifdef Q21F_HIP
+#include "../../rdna4/qimg21/test_hip_qimg21_native.c"
+#undef cu_compile_kernels
+#include "../../rdna4/cuda_driver_compat.h"
+#include "../../rdna4/qimg21/fast_blas.h"
+#else
 #include "test_cuda_qimg21_native.c"
+#endif
 #undef main
 #include "qimg21_fast_kernels.h"
+#ifndef Q21F_HIP
 #include "qimg21_fast_fp4.h"
+#endif
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
@@ -28,6 +37,17 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifdef Q21F_HIP
+#define Q21F_I8_PLUGIN "rdna4/qimg21/libq21_hip_fast_gemm.so"
+#define Q21F_SAGE_PLUGIN "rdna4/qimg21/libq21_hip_fast_sage.so"
+#define Q21F_FLASH_PLUGIN "rdna4/qimg21/libq21_hip_fast_attention.so"
+#define Q21F_ATTN_PLUGIN Q21F_FLASH_PLUGIN
+#else
+#define Q21F_I8_PLUGIN "cuda/qimg21/libq21_fast_int8.so"
+#define Q21F_SAGE_PLUGIN "cuda/qimg21/libq21_fast_sage.so"
+#define Q21F_FLASH_PLUGIN "cuda/qimg21/libq21_fast_flash.so"
+#define Q21F_ATTN_PLUGIN "cuda/qimg21/libq21_fast_attention.so"
+#endif
 #define Q21F_D 4096
 #define Q21F_F 12288
 #define Q21F_HEADS 32
@@ -1059,8 +1079,13 @@ int main(int argc, char **argv) {
     const char *layout_path = NULL, *negative_layout_path = NULL, *condition_path = NULL;
     const char *out_path = "native_latents.npy", *dump_dir = NULL, *pred_dir = NULL;
     const char *plugin_path = NULL;
+#ifdef Q21F_HIP
+    const char *rope_path = "rdna4/qimg21/qwen21_rope_freqs.npy";
+#else
     const char *rope_path = "cuda/qimg21/qwen21_rope_freqs.npy";
+#endif
     const char *stage_dir = NULL, *calib_path = NULL, *package = NULL, *bf16_blocks = NULL, *refine_path = NULL;
+    int device_index = 0;
     int int8_weights = 0, tail_blocks = 0, fp4_cutlass = 1, i8_cutlass = 1;
     char tail_list[160] = "";
     int ih = 16, iw = 16, steps = 1, verbose = 1, cfg_batch = 1, plan_only = 0, profile = 0, fused_gemm = 1;
@@ -1146,6 +1171,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--serve-prompt-tokens") && more) serve_prompt_tokens = atoi(argv[++i]);
         else if (!strcmp(a, "--serve-condition-tokens") && more) serve_condition_tokens = atoi(argv[++i]);
         else if (!strcmp(a, "--quant-package") && more) package = argv[++i];
+        else if (!strcmp(a, "--device") && more) { device_index = atoi(argv[++i]); if (device_index < 0) return 2; }
         else if (!strcmp(a, "--fp4-gemm") && more) {
             const char *m = argv[++i];
             if (strcmp(m, "cutlass") && strcmp(m, "omma")) { q21f_usage(argv[0]); return 2; }
@@ -1272,6 +1298,11 @@ int main(int argc, char **argv) {
     q21f_runtime rt;
     q21f_state st;
     q21f_branch br[2];
+#ifdef Q21F_HIP
+    (void)fp4_cutlass;
+    if (int8_weights == 2) { fprintf(stderr, "fast: NVFP4 is unsupported on RDNA4; use int8\n"); return 2; }
+    if (int8_weights && !i8_cutlass) { fprintf(stderr, "fast: RDNA4 INT8 requires --int8-gemm cutlass (HIP WMMA plugin)\n"); return 2; }
+#endif
     qimg21_shards shards = {{0}, 0};
     void *staging = NULL;
     uint16_t *pinned_te = NULL;
@@ -1371,7 +1402,7 @@ inputs_done:;
         fprintf(stderr, __VA_ARGS__); fprintf(stderr, " %.3f s\n", now_ - phase_mark); phase_mark = now_; } while (0)
     REQ(cuewInit(CUEW_INIT_CUDA | CUEW_INIT_NVRTC) == CUEW_SUCCESS, "cuewInit failed");
     CK(cuInit(0));
-    CK(cuDeviceGet(&rt.device, 0));
+    CK(cuDeviceGet(&rt.device, device_index));
     CK(cuDevicePrimaryCtxRetain(&rt.context, rt.device));
     CK(cuCtxSetCurrent(rt.context));
     CK(cuStreamCreate(&rt.compute, CU_STREAM_NON_BLOCKING));
@@ -1388,6 +1419,7 @@ inputs_done:;
     GETF(mod_prepare, "mod_prepare"); GETF(scale_prepare, "scale_prepare"); GETF(norm_mod, "norm_mod");
     GETF(qk_norm_rope, "qk_norm_rope"); GETF(swiglu, "swiglu");
     GETF(norm_mod_q8, "norm_mod_q8"); GETF(quant_rows, "quant_rows"); GETF(dequant, "dequant");
+#ifndef Q21F_HIP
     /* Block-scaled FP4 MMA needs the architecture-specific target (sm_120a). */
     REQ(cu_compile_kernels_ex(&rt.fp4_module, rt.device, q21f_fp4_src, "qimg21_fast_fp4.cu", verbose, "fast-fp4",
                               CU_COMPILE_ARCH_A) >= 0, "FP4 kernel compile failed");
@@ -1401,8 +1433,9 @@ inputs_done:;
         *(void **)&rt.fp4_gemm = dlsym(rt.fp4_plugin, "q21f_fp4_gemm");
         REQ(rt.fp4_gemm, "q21f_fp4_gemm missing");
     }
+#endif
     if (int8_weights == 1 && i8_cutlass) {
-        rt.i8_plugin = dlopen("cuda/qimg21/libq21_fast_int8.so", RTLD_NOW | RTLD_LOCAL);
+        rt.i8_plugin = dlopen(Q21F_I8_PLUGIN, RTLD_NOW | RTLD_LOCAL);
         REQ(rt.i8_plugin, "cannot load CUTLASS INT8 plugin: %s (use --int8-gemm cublas)", dlerror());
         *(void **)&rt.i8_gemm = dlsym(rt.i8_plugin, "q21f_i8_gemm");
         REQ(rt.i8_gemm, "q21f_i8_gemm missing");
@@ -1412,14 +1445,14 @@ inputs_done:;
     /* cutlass-efficient is PyTorch's memory-efficient kernel (reference
      * parity); flash is upstream FlashAttention-2 (faster, not bit-exact). */
     if (!plugin_path)
-        plugin_path = flash ? "cuda/qimg21/libq21_fast_flash.so" : "cuda/qimg21/libq21_fast_attention.so";
+        plugin_path = flash ? Q21F_FLASH_PLUGIN : Q21F_ATTN_PLUGIN;
     rt.plugin = dlopen(plugin_path, RTLD_NOW | RTLD_LOCAL);
     REQ(rt.plugin && (rt.attention = (q21f_attention_fn)dlsym(rt.plugin, flash ? "q21f_flash_attention"
                                                                                : "q21f_attention")),
         "cannot load attention plugin %s: %s", plugin_path, dlerror());
     if (flash == 2) {
         /* SageAttention2-style INT8 Q.K / FP8 P.V (not bit-comparable). */
-        rt.sage_plugin = dlopen("cuda/qimg21/libq21_fast_sage.so", RTLD_NOW | RTLD_LOCAL);
+        rt.sage_plugin = dlopen(Q21F_SAGE_PLUGIN, RTLD_NOW | RTLD_LOCAL);
         REQ(rt.sage_plugin && (rt.sage = (q21f_sage_fn)dlsym(rt.sage_plugin, "q21f_sage_attention")),
             "cannot load cuda/qimg21/libq21_fast_sage.so: %s", dlerror());
         rt.sage_accum = rt_sage_accum;
@@ -1490,7 +1523,16 @@ inputs_done:;
     CK(cuMemGetInfo(&free_bytes, &total_bytes));
     /* The budget covers this process: explicit allocations plus a fixed
      * allowance for the context, cuBLAS and module images. */
-    const size_t allowance = 512 * Q21F_MIB;
+    size_t allowance = 512 * Q21F_MIB;
+#ifdef Q21F_HIP
+    if (flash == 2) {
+        int max_prefix = br[0].prefix;
+        for (int i=1;i<nb;i++) if(br[i].prefix>max_prefix)max_prefix=br[i].prefix;
+        size_t qrows = ((size_t)(max_prefix>T?max_prefix:T)+127)/128*128;
+        size_t krows = (size_t)max_prefix+T;
+        allowance += Q21F_HEADS*128*(qrows*5+krows*6)+Q21F_HEADS*((qrows+31)/32+(krows+63)/64+128)*4+2048;
+    }
+#endif
     size_t budget = budget_mib > 0 ? (size_t)(budget_mib * Q21F_MIB) : free_bytes;
     size_t usable = budget > allowance ? budget - allowance : 0;
     if (usable > free_bytes - (free_bytes > 256 * Q21F_MIB ? 256 * Q21F_MIB : 0))
@@ -1764,6 +1806,7 @@ serve_next:;
             } else if (!strcmp(a, "--preset") && v) {
                 seen_preset = 1; status = !preset || strcmp(req_argv[++i], preset->name) ? 3 : 0;
             }
+            else if (!strcmp(a, "--device") && v) status = atoi(req_argv[++i]) != device_index ? 3 : 0;
             else if (!strcmp(a, "--height-tokens") && v) status = atoi(req_argv[++i]) != ih ? 3 : 0;
             else if (!strcmp(a, "--width-tokens") && v) status = atoi(req_argv[++i]) != iw ? 3 : 0;
             else if (!strcmp(a, "--attention") && v) {
@@ -2105,6 +2148,9 @@ fail:
     if (rt.fp4_plugin) dlclose(rt.fp4_plugin);
     if (rt.i8_plugin) dlclose(rt.i8_plugin);
     if (rt.sage_plugin) dlclose(rt.sage_plugin);
+#ifdef Q21F_HIP
+    q21f_hip_blas_destroy(rt.blas);
+#endif
     free(host_out); free(host_pred); free(sigmas);
     free(fine0); free(fine); free(fine_w); free(tile_in); free(tile_out); free(eps_field);
     npy_free(&pe); npy_free(&ne); npy_free(&la); npy_free(&cond); npy_free(&rope); npy_free(&base_grid);

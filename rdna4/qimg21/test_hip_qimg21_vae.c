@@ -560,9 +560,11 @@ static int qimg21_vae_decode(cuda_qimg_runner *r, const st_context *st,
 #define Q21_DECODER_ENTRY main
 #endif
 int Q21_DECODER_ENTRY(int argc, char **argv) {
+    int device_index = 0;
     const char *model=NULL,*latent_path=NULL,*out_path=NULL; int h=0,w=0,verbose=1;
     for(int i=1;i<argc;i++){
-        if(!strcmp(argv[i],"--model")&&i+1<argc)model=argv[++i];
+        if (!strcmp(argv[i], "--device") && i+1<argc) { device_index=atoi(argv[++i]); if(device_index<0)return 2; }
+        else if(!strcmp(argv[i],"--model")&&i+1<argc)model=argv[++i];
         else if(!strcmp(argv[i],"--latents")&&i+1<argc)latent_path=argv[++i];
         else if(!strcmp(argv[i],"--height-tokens")&&i+1<argc)h=atoi(argv[++i]);
         else if(!strcmp(argv[i],"--width-tokens")&&i+1<argc)w=atoi(argv[++i]);
@@ -591,7 +593,7 @@ int Q21_DECODER_ENTRY(int argc, char **argv) {
     }
     char st_path[1024]; snprintf(st_path,sizeof(st_path),"%s/diffusion_pytorch_model.safetensors",model);
     st_context *st=safetensors_open(st_path); if(!st){q21_npy_free(&a);return 1;}
-    cuda_qimg_runner *r=cuda_qimg_init(0,verbose); if(!r){safetensors_close(st);q21_npy_free(&a);return 1;}
+    cuda_qimg_runner *r=cuda_qimg_init(device_index,verbose); if(!r){safetensors_close(st);q21_npy_free(&a);return 1;}
     /* The shared VAE helpers use synchronous default-stream D2D copies for
      * residuals. Keep their kernels on that same stream: a nonblocking
      * stream otherwise races those copies and intermittently loses residuals. */

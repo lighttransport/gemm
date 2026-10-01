@@ -1,6 +1,7 @@
 """Qwen full-body image -> SAM 3D Body -> Pixal3D -> combined avatar job."""
 from __future__ import annotations
 
+from contextlib import nullcontext
 import json
 import math
 import os
@@ -18,9 +19,9 @@ from PIL import Image, ImageDraw
 from .. import baseline, gpu, qwen
 from ..service import ROOT
 
-MODEL_DIR = Path("/mnt/nvme01/models/sam3d-body")
-SAM3_MODEL = Path("/mnt/nvme01/models/sam3/sam3.model.safetensors")
-CLIP_BPE = Path("/mnt/nvme01/models/clip-bpe")
+MODEL_DIR = Path("/mnt/disk1/models/sam3d-body")
+SAM3_MODEL = Path("/mnt/disk1/models/sam3/sam3.model.safetensors")
+CLIP_BPE = Path("/mnt/disk1/models/clip-bpe")
 DEFAULT_RIG_PYTHON = ROOT / "tmp/vhuman-rig-venv/bin/python"
 FILES = ("body_image.png", "body_image_raw.png", "body_mhr.glb", "body_mhr.glb.json",
          "pixal3d_full.glb", "body_basecolor.png", "avatar.glb", "avatar.usda", "avatar_usd.zip",
@@ -55,11 +56,12 @@ def availability(model_dir=MODEL_DIR, rig_python=None, mock=False) -> dict:
     has_gpu = gpu.gpu_status() is not None
     return {"available": not missing and (mock or has_gpu), "model_dir": str(model_dir),
             "missing": missing, "gpu": has_gpu, "mock": mock,
-            "reason": "Qwen-Image 2.1 and Pixal3D require a CUDA GPU" if not mock and not has_gpu else None}
+            "reason": "Qwen-Image 2.1 and Pixal3D require a CUDA or ROCm GPU" if not mock and not has_gpu else None}
 
 
 def _run(cmd: list[str], cancel, *, cwd=ROOT, timeout=2400) -> str:
-    proc = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    from ..runtime import python_command
+    proc = subprocess.Popen(python_command(cmd), cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             text=True, env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
     lines = []
     stop = threading.Event()
@@ -90,12 +92,13 @@ def _run(cmd: list[str], cancel, *, cwd=ROOT, timeout=2400) -> str:
 
 
 def _binary(kind: str, use_cuda: bool, cancel) -> Path:
-    directory = ROOT / ("cuda" if use_cuda else "cpu") / kind
-    name = ("test_cuda_" if use_cuda else "test_") + kind
+    selected = gpu.backend() if use_cuda else "cpu"
+    directory = ROOT / {"cuda": "cuda", "rocm": "rdna4", "cpu": "cpu"}[selected] / kind
+    name = {"cuda": "test_cuda_", "rocm": "test_hip_", "cpu": "test_"}[selected] + kind
     path = directory / name
     if not path.is_file():
         cmd = ["make", "-C", str(directory), name]
-        if not use_cuda:
+        if selected == "cpu":
             cmd.append("ARCH=native")
         _run(cmd, cancel, timeout=600)
     return path
@@ -187,7 +190,7 @@ def _sam_body(out: Path, bbox, model_dir: Path, mock: bool, cancel) -> dict:
     binary = _binary("sam3d_body", use_cuda, cancel)
     cmd = [str(binary), "--safetensors-dir", str(model_dir / "safetensors"),
            "--mhr-assets", str(model_dir / "safetensors"), "--image", str(out / "body_image.png"),
-           "--bbox", *[str(n) for n in bbox], "--backbone", "dinov3", "-o", str(out / "body_mhr.glb")]
+           "--bbox", *[str(n) for n in bbox], "--device", str(gpu.device_index()), "--backbone", "dinov3", "-o", str(out / "body_mhr.glb")]
     lock = gpu.LOCK_PATH if use_cuda else None
     if lock:
         with gpu.device_session(2048, cancel):
@@ -197,7 +200,7 @@ def _sam_body(out: Path, bbox, model_dir: Path, mock: bool, cancel) -> dict:
     meta = json.loads((out / "body_mhr.glb.json").read_text())
     if len(meta.get("model_params", [])) != 204:
         raise ValueError("SAM 3D Body runner lacks decoded MHR parameters; rebuild it")
-    return {"backend": "cuda" if use_cuda else "cpu", "bbox": bbox}
+    return {"backend": gpu.backend() if use_cuda else "cpu", "bbox": bbox}
 
 
 def _pixal(out: Path, image: Path, name: str, quality: str, mock: bool, cancel) -> dict:
@@ -210,7 +213,7 @@ def _pixal(out: Path, image: Path, name: str, quality: str, mock: bool, cancel) 
             from qimg21_i23d import reconstruct
             settings = reconstruct.ReconSettings.preset("preview", triangle_target=80_000)
             settings.cancel = cancel
-            runner = reconstruct.Pixal3DNative("cuda", settings=settings)
+            runner = baseline.pixal_runner(settings)
             return runner.single(image, target, out / (name + ".work"), fov_rad=math.radians(20))
         return baseline.run_pixal3d(image, target, out / (name + ".work"), quality, cancel)
 
@@ -240,7 +243,7 @@ def _garments(out: Path, names: list[str], mock: bool, cancel, progress,
             progress(slot_start, f"segmenting {name}")
             mask_npy = out / f"garment_{slug}_masks.npy"
             cmd = [str(_binary("sam3", use_cuda, cancel)), str(sam3_model), str(out / "body_image.png"),
-                   "--phrase", name, "-o", str(mask_npy),
+                   "--device", str(gpu.device_index()), "--phrase", name, "-o", str(mask_npy),
                    "--vocab", str(clip_bpe / "vocab.json"), "--merges", str(clip_bpe / "merges.txt")]
             if use_cuda:
                 with gpu.device_session(2048, cancel):
@@ -330,7 +333,8 @@ def body_job(service, request: dict, progress, cancel, *, python=None, rig_pytho
                "--out", str(out), "--model", str(model_dir / "dinov3/assets/mhr_model.pt"),
                "--head-assets", str(model_dir / "safetensors/sam3d_body_mhr_head.safetensors"),
                "--res", str(res)]
-        _run(cmd, cancel, timeout=1200)
+        with gpu.device_session(1024, cancel) if gpu.backend() != "cpu" else nullcontext():
+            _run(cmd, cancel, timeout=1200)
         report = json.loads((out / "body_report.json").read_text())
         report["generation"] = generated
         report["sam3d_body"] = sam

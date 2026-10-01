@@ -98,7 +98,8 @@ def train_deformer(tmpl, pos, shapes, Jn, W, skel, feat, out, samples, log=print
     """The ML corrective deformer (mldeformer.py) on the welded template."""
     import torch
     from . import mldeformer, torchrig
-    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    from server.vhuman.runtime import torch_device
+    dev = torch_device(torch)
     rig0 = rig_definition(skel, sorted(shapes))
     tr = torchrig.TorchRig(rig0, pos, shapes, Jn, W, device=dev)
     names = [j["name"] for j in skel["joints"]]

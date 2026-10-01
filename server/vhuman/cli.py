@@ -15,9 +15,9 @@
     python3 -m server.vhuman.cli baseline --source analytic|qwen [--quality preview]
     python3 -m server.vhuman.cli bench
 
-Every command prints a JSON summary on stdout. GPU commands take the CUDA
-lock shared with the Pixal3D demo server and need --qwen-python (default
-tmp/qimg21-ref-venv/bin/python) for Qwen-Image.
+Every command prints a JSON summary on stdout. GPU commands take the backend/
+device lock shared with the Pixal3D demo server. Use --backend rocm --device 0
+for AMD; the installed ROCm interpreter is selected automatically for Qwen-Image.
 """
 from __future__ import annotations
 
@@ -380,15 +380,17 @@ def cmd_bench(args) -> dict:
 def main(argv=None) -> int:
     from .body import job as body_job
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    from . import runtime
+    runtime.add_arguments(ap)
     ap.add_argument("--work", default=str(WORK))
-    ap.add_argument("--qwen-python", default=str(DEFAULT_QWEN_PY) if DEFAULT_QWEN_PY.exists() else None)
+    ap.add_argument("--qwen-python", default=None)
     ap.add_argument("--mock", action="store_true", help="mock Qwen and Pixal3D (no GPU)")
     default_rig = ROOT / "tmp/vhuman-rig-venv/bin/python"
-    ap.add_argument("--rig-python", default=str(default_rig) if default_rig.exists() else None)
-    ap.add_argument("--sam3d-body-model", default=str(body_job.MODEL_DIR))
-    ap.add_argument("--sam3-model", default=str(body_job.SAM3_MODEL),
+    ap.add_argument("--rig-python", default=None)
+    ap.add_argument("--sam3d-body-model", default=None)
+    ap.add_argument("--sam3-model", default=None,
                     help="optional SAM 3 garment segmentation checkpoint")
-    ap.add_argument("--clip-bpe", default=str(body_job.CLIP_BPE),
+    ap.add_argument("--clip-bpe", default=None,
                     help="directory containing garment tokenizer vocab.json and merges.txt")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
@@ -527,7 +529,7 @@ def main(argv=None) -> int:
     sp.add_argument("--xvec-only", action="store_true")
     sp.add_argument("--tts-model")
     sp.add_argument("--aligner")
-    sp.add_argument("--backend", choices=("auto", "cpu", "cuda"), default="auto")
+    sp.add_argument("--backend", choices=("auto", "cpu", "cuda", "rocm"), default="auto")
     sp.add_argument("--speech-strength", type=float, default=1.0)
     sp.add_argument("--emotion-strength", type=float, default=.6)
     sp.add_argument("--secondary-strength", type=float, default=1.0,
@@ -554,6 +556,8 @@ def main(argv=None) -> int:
     sub.add_parser("replate", help="re-extract the plate library from its source images").set_defaults(fn=cmd_replate)
     sub.add_parser("bench", help="timing targets").set_defaults(fn=cmd_bench)
     args = ap.parse_args(argv)
+    from . import runtime
+    runtime.configure_args(args)
     try:
         result = args.fn(args)
     except (P.ParamError, ValueError, extract.ExtractError) as exc:

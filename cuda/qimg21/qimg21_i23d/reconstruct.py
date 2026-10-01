@@ -34,10 +34,10 @@ from . import imageops
 
 ROOT = Path(__file__).resolve().parents[3]
 PIXAL3D = ROOT / "ref/pixal3d"
-MODEL_DIR = Path("/mnt/disk2/models/Pixal3D")
-DINOV3 = Path("/mnt/disk2/models/dinov3-vitl16/model.safetensors")
+MODEL_DIR = Path("/mnt/disk1/models/Pixal3D")
+DINOV3 = Path("/mnt/disk1/models/dinov3-vitl16/model.safetensors")
 NAF = PIXAL3D / "weights/naf_release.safetensors"
-MOGE = Path("/mnt/disk2/models/moge-2-vitl/model.pt")
+MOGE = Path("/mnt/disk1/models/moge-2-vitl/model.pt")
 MAX_FRAMES = 16
 BACKENDS = ("cuda", "rocm", "cpu")
 

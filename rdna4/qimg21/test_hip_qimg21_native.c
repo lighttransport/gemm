@@ -749,6 +749,7 @@ done:
 }
 
 int main(int argc, char **argv) {
+    int device_index = 0;
     const char *model = NULL, *prompt_path = NULL, *latent_path = NULL;
     const char *negative_prompt_path = NULL;
     const char *editing_layout_path = NULL, *condition_path = NULL;
@@ -761,12 +762,13 @@ int main(int argc, char **argv) {
     float guidance_scale = 1.0f;
     float manual_t = -1.0f;
     for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "--model") && i + 1 < argc) model = argv[++i];
+        if (!strcmp(argv[i], "--device") && i+1<argc) { device_index=atoi(argv[++i]); if(device_index<0)return 2; }
+        else if (!strcmp(argv[i], "--model") && i + 1 < argc) model = argv[++i];
         else if (!strcmp(argv[i], "--rope") && i+1<argc) {
             const char *mode=argv[++i];
             if(!strcmp(mode,"host-table"))qimg21_host_rope=1;
             else if(!strcmp(mode,"host-table-vector4"))qimg21_host_rope=2;
-            else if(!strcmp(mode,"host-table-exact")){qimg21_host_rope=2;qimg21_rope_base_path="cuda/qimg21/qwen21_rope_freqs.npy";}
+            else if(!strcmp(mode,"host-table-exact")){qimg21_host_rope=2;qimg21_rope_base_path="rdna4/qimg21/qwen21_rope_freqs.npy";}
             else if(!strcmp(mode,"default"))qimg21_host_rope=0;
             else return 2;
         }
@@ -928,7 +930,7 @@ int main(int argc, char **argv) {
         if(!packed)return 1;
         memcpy(packed,condition.data,(size_t)nc*64*sizeof(float));
     }
-    const float *p=pe.data; cuda_qimg_runner*r=cuda_qimg_init(0,verbose);if(!r)return 1;
+    const float *p=pe.data; cuda_qimg_runner*r=cuda_qimg_init(device_index,verbose);if(!r)return 1;
     if(qimg21_int8_tensor_core) {
         if(!r->gemm_int8_s32 || !r->quant_act_perrow_int8 || !r->dequant_int32_to_bf16) {
             fprintf(stderr,"native: INT8 tensor-core kernels unavailable\n");cuda_qimg_free(r);return 1;

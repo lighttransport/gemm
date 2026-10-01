@@ -51,7 +51,10 @@ if [ "$with_reference" -eq 1 ]; then
 fi
 
 if [ "$install_deps" -eq 1 ]; then
-    python="$root/tmp/vhuman-rig-venv/bin/python"
+    python=${VHUMAN_PYTHON:-$root/tmp/vhuman-rig-venv/bin/python}
+    export TMPDIR="$root/tmp/vhuman-runtime"
+    export UV_CACHE_DIR="$root/tmp/uv-cache"
+    mkdir -p "$TMPDIR" "$UV_CACHE_DIR"
     [ -x "$python" ] || { printf 'create the vhuman rig venv first\n' >&2; exit 1; }
     uv pip install --python "$python" 'mediapipe==0.10.32' 'remotezip==0.12.6'
     if [ "$with_reference" -eq 1 ]; then

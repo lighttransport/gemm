@@ -256,6 +256,9 @@ cuda/llm/scan/deltanet_chunk_test
 
 # Vulkan CMake build directories (regenerate via cmake)
 vulkan/build/
+vulkan/vhuman/vh_deform.spv.inc
+vulkan/vhuman/vh_contacts.spv.inc
+vulkan/vhuman/bench_vhuman_deformer_vk
 vulkan/build_t2/
 cuda/pixal3d/build-windows/
 cuda/pixal3d/build-wsl/
@@ -339,3 +342,14 @@ ryzen/bench_nn_ops
 a64fx/llm/.ds4f_serve*
 a64fx/llm/ds4f_runner.log
 a64fx/llm/ds4f_frontend.log
+
+# Native ROCm vhuman runners (built locally).
+ref/pixal3d/deps
+rdna4/rocew_probe
+rdna4/qimg21/test_hip_qimg21_fast
+rdna4/vhuman/bench_vhuman_deformer_hip
+rdna4/sam3/test_hip_sam3
+rdna4/sam3/verify_*
+!rdna4/sam3/verify_*.c
+!rdna4/sam3/verify_*.h
+rdna4/sam3/test_hip_sam3_embed

@@ -1,9 +1,7 @@
-/* HIP/RDNA4 SAM 3 runner — public interface (Phase 1 scaffolding).
+/* HIP/RDNA4 SAM 3 runner — public interface.
  *
- * Current coverage: preprocess (ImageNet) + patch_embed (k=14 s=14) +
- * pos_embed tile + pre-block LayerNorm. Subsequent ViT blocks, FPN,
- * CLIP text, DETR encoder/decoder, mask decoder and post-process are
- * staged in follow-up passes against ref/sam3 dumps.
+ * Coverage: image preprocessing, ViT, FPN, CLIP text, DETR, mask decoder
+ * and text-prompted segmentation postprocessing.
  */
 #ifndef HIP_SAM3_RUNNER_H_
 #define HIP_SAM3_RUNNER_H_

@@ -13,6 +13,11 @@ Chrome over the DevTools protocol (WebGL through SwiftShader) and checks:
 
     python3 -m unittest server.vhuman.test_browser -v
 
+For offscreen X11 rendering instead of Chrome's headless mode:
+
+    VHUMAN_BROWSER_MODE=xvfb xvfb-run -a -s '-screen 0 1280x900x24' \\
+        python3 -m unittest server.vhuman.test_browser -v
+
 Skips when Chrome is missing or unpkg.com (three.js) is unreachable.
 """
 from __future__ import annotations
@@ -162,6 +167,11 @@ class Cdp:
 class EyePageTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        mode = os.environ.get("VHUMAN_BROWSER_MODE", "headless")
+        if mode not in ("headless", "xvfb"):
+            raise ValueError("VHUMAN_BROWSER_MODE must be headless or xvfb")
+        if mode == "xvfb" and not os.environ.get("DISPLAY"):
+            raise RuntimeError("Run the xvfb browser mode under xvfb-run")
         if not unpkg_reachable():
             raise unittest.SkipTest("unpkg.com (three.js) is unreachable")
         SCRATCH.mkdir(parents=True, exist_ok=True)
@@ -186,15 +196,22 @@ class EyePageTest(unittest.TestCase):
                                        + (cls.work / "server.log").read_text()[-2000:])
                 time.sleep(0.2)
         profile = cls.work / "chrome-profile"
+        chrome_flags = ["--headless=new"] if mode == "headless" else ["--ozone-platform=x11"]
+        cls.chrome_log = (cls.work / "chrome.log").open("w")
         cls.chrome = subprocess.Popen(
-            [find_chrome(), "--headless=new", "--no-sandbox", "--use-angle=swiftshader",
+            [find_chrome(), *chrome_flags, "--no-first-run", "--no-default-browser-check",
+             "--no-sandbox", "--use-gl=angle", "--use-angle=swiftshader",
              "--enable-unsafe-swiftshader", "--ignore-gpu-blocklist", "--window-size=1280,900",
              "--remote-debugging-port=0", f"--user-data-dir={profile}", "about:blank"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            stdout=cls.chrome_log, stderr=subprocess.STDOUT)
         active = profile / "DevToolsActivePort"
-        deadline = time.monotonic() + 20
-        while not active.is_file() and time.monotonic() < deadline:
+        deadline = time.monotonic() + 60
+        while not active.is_file() and time.monotonic() < deadline and cls.chrome.poll() is None:
             time.sleep(0.05)
+        if not active.is_file():
+            detail = (cls.work / "chrome.log").read_text()[-4000:]
+            cls.tearDownClass()
+            raise RuntimeError("Chromium did not start: " + detail)
         port = int(active.read_text().splitlines()[0])
         target = json.loads(urlopen(Request(f"http://127.0.0.1:{port}/json/new", method="PUT"), timeout=5).read())
         cls.cdp = Cdp(target["webSocketDebuggerUrl"])
@@ -222,6 +239,8 @@ class EyePageTest(unittest.TestCase):
                     proc.kill()
         if getattr(cls, "log", None):
             cls.log.close()
+        if getattr(cls, "chrome_log", None):
+            cls.chrome_log.close()
         if getattr(cls, "work", None):
             shutil.rmtree(cls.work, ignore_errors=True)
 

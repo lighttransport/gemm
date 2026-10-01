@@ -1,7 +1,29 @@
 #include "rocew.h"
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
-int main(void) {
+int main(int argc, char **argv) {
+    if (argc == 4 && !strcmp(argv[1], "--json") && !strcmp(argv[2], "--device")) {
+        char *end;
+        long device = strtol(argv[3], &end, 10);
+        if (*end || device < 0 || device > 65535) return 2;
+        if (rocewInit(ROCEW_INIT_HIP) != ROCEW_SUCCESS) return 1;
+        hipDeviceProp_t p;
+        size_t free_bytes, total_bytes;
+        if (hipSetDevice((int)device) || hipGetDeviceProperties(&p, (int)device) ||
+            hipMemGetInfo(&free_bytes, &total_bytes)) return 1;
+        /* Escape the device name, which is supplied by the runtime. */
+        printf("{\"backend\":\"rocm\",\"device\":%ld,\"name\":\"", device);
+        for (const unsigned char *s = (const unsigned char *)p.name; *s; s++) {
+            if (*s < 32) printf("\\u%04x", *s);
+            else { if (*s == '"' || *s == '\\') putchar('\\'); putchar(*s); }
+        }
+        printf("\",\"arch\":\"%s\",\"free_mib\":%zu,\"total_mib\":%zu}\n",
+               p.gcnArchName, free_bytes >> 20, total_bytes >> 20);
+        return 0;
+    }
+    if (argc != 1) return 2;
     int rc = rocewInit(ROCEW_INIT_HIP | ROCEW_INIT_HIPRTC);
     printf("rocew_init=%d hip=%d hiprtc=%d\n", rc,
            rocewHipAvailable(), rocewHiprtcAvailable());

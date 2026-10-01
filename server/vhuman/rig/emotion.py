@@ -12,6 +12,7 @@ import subprocess
 import threading
 import wave
 from pathlib import Path
+from contextlib import nullcontext
 
 import numpy as np
 
@@ -105,8 +106,12 @@ def _keys(windows: list[dict], duration: float) -> list[dict]:
     return keys
 
 
-def _infer(runner: Path, model: Path, wav: Path, cancel: threading.Event) -> tuple[str, str]:
-    proc = subprocess.Popen([str(runner), "-m", str(model), "-a", str(wav), "--keep-tags"],
+def _infer(runner: Path, model: Path, wav: Path, cancel: threading.Event,
+           backend="cpu") -> tuple[str, str]:
+    command = [str(runner), "-m", str(model), "-a", str(wav), "--keep-tags"]
+    if backend != "cpu":
+        command += ["--backend", backend, "--device", str(gpu.device_index())]
+    proc = subprocess.Popen(command,
                             cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     stop = threading.Event()
 
@@ -130,9 +135,11 @@ def _infer(runner: Path, model: Path, wav: Path, cancel: threading.Event) -> tup
 
 
 def extract(wav: Path, duration: float, work: Path, cancel: threading.Event, progress,
-            *, runner=DEFAULT_RUNNER, model=DEFAULT_MODEL) -> dict:
+            *, runner=DEFAULT_RUNNER, model=DEFAULT_MODEL, backend="cpu") -> dict:
     """Infer coarse categorical emotion keys from an existing aligned WAV."""
     wav, work = Path(wav).resolve(), Path(work).resolve()
+    if backend not in ("cpu", "cuda", "rocm"):
+        raise ValueError("emotion backend must be cpu, cuda or rocm")
     runner, model = Path(runner).resolve(), Path(model).resolve()
     status = availability(runner, model)
     if not status["available"]:
@@ -160,7 +167,9 @@ def extract(wav: Path, duration: float, work: Path, cancel: threading.Event, pro
                 out.setframerate(SAMPLE_RATE)
                 out.writeframes(np.clip(np.rint(clip * 32768), -32768, 32767).astype("<i2").tobytes())
             try:
-                tag, label = _infer(runner, model, path, cancel)
+                with gpu.execution(backend, gpu.device_index(), gpu.model_path("")):
+                    with gpu.device_session(1024, cancel) if backend != "cpu" else nullcontext():
+                        tag, label = _infer(runner, model, path, cancel, backend)
             finally:
                 path.unlink(missing_ok=True)
         windows.append({"start": round(start, 3), "end": round(end, 3),
@@ -169,6 +178,7 @@ def extract(wav: Path, duration: float, work: Path, cancel: threading.Event, pro
     with model.open("rb") as file:
         digest = hashlib.file_digest(file, "sha256").hexdigest()
     return {"format": "vhuman.emotion.v1", "provider": "SenseVoiceSmall", "model": MODEL_NAME,
+            "backend": backend,
             "model_author": "Alibaba Group", "model_url": "https://huggingface.co/FunAudioLLM/SenseVoiceSmall-GGUF",
             "model_sha256": digest,
             "language": "ja", "window_seconds": WINDOW_SECONDS, "windows": windows,

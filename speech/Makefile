@@ -1,3 +1,5 @@
+export TMPDIR := $(abspath ../tmp/speech-compiler)
+$(shell mkdir -p $(TMPDIR))
 # speech/: Qwen3-TTS runner (CPU + CUDA) and the ja_align Japanese CTC aligner.
 #   make            -> CPU tools in build/
 #   make cuda       -> CUDA runner (NVRTC via cuew; no CUDA toolkit link)
@@ -67,3 +69,16 @@ clean:
 	rm -rf $(BUILD)
 
 .PHONY: all test cuda clean
+
+# Portable graphs compiled against the dynamic HIP driver boundary.
+$(BUILD)/qwen3_tts_rocm $(BUILD)/tts_ja_rocm $(BUILD)/ja_align_rocm: ../rdna4/rocew.c ../rdna4/cuda_driver_compat.h
+
+rocm: $(BUILD)/qwen3_tts_rocm $(BUILD)/tts_ja_rocm $(BUILD)/ja_align_rocm
+HIP_DEPS = ../rdna4/cuda_driver_compat.h ../rdna4/rocew.h ../rdna4/hip_runner_common.h
+$(BUILD)/qwen3_tts_rocm: $(QT)/qwen3_tts_main.c $(QT)/qtts_cuda.h $(QT)/qtts_cuda_kernels.h $(QT_HDRS) $(HIP_DEPS) | $(BUILD)
+	$(CC) $(CFLAGS) -DQTTS_WITH_CUDA -DQTTS_WITH_HIP -I$(COMMON) -I$(QT) -o $@ $< ../rdna4/rocew.c -ldl -lm -lpthread
+$(BUILD)/tts_ja_rocm: tts_ja_main.c $(QT)/qtts_cuda.h $(QT)/qtts_cuda_kernels.h $(QT_HDRS) $(JA_HDRS) $(HIP_DEPS) | $(BUILD)
+	$(CC) $(CFLAGS) -DQTTS_WITH_CUDA -DQTTS_WITH_HIP -I$(COMMON) -I$(QT) -I$(JA) -o $@ $< ../rdna4/rocew.c -ldl -lm -lpthread
+$(BUILD)/ja_align_rocm: $(JA)/ja_align_main.c $(JA_HDRS) $(HIP_DEPS) | $(BUILD)
+	$(CC) $(CFLAGS) -DJA_WITH_CUDA -DJA_WITH_HIP -I$(JA) -o $@ $< ../rdna4/rocew.c -ldl -lm
+.PHONY: rocm

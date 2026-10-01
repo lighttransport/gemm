@@ -8,12 +8,26 @@ import threading
 import unittest
 import wave
 from pathlib import Path
+from unittest.mock import patch, MagicMock
 
 from .rig import emotion
 from .service import ROOT
 
 
 class EmotionTests(unittest.TestCase):
+    def test_rocm_runner_receives_backend_and_device(self):
+        process = MagicMock()
+        process.communicate.return_value = ('<|ja|><|HAPPY|><|Speech|>', None)
+        process.returncode = 0
+        with emotion.gpu.execution('rocm', 3), \
+             patch.object(emotion.subprocess, 'Popen', return_value=process) as launch:
+            result = emotion._infer(Path('runner'), Path('model'), Path('audio.wav'),
+                                    threading.Event(), backend='rocm')
+        command = launch.call_args.args[0]
+        self.assertEqual(command[command.index('--backend') + 1], 'rocm')
+        self.assertEqual(command[command.index('--device') + 1], '3')
+        self.assertEqual(result, ('HAPPY', 'joy'))
+
     def test_tags_and_missing_tags(self):
         self.assertEqual(emotion.parse_tag("log\n<|ja|><|HAPPY|><|Speech|>こんにちは"), ("HAPPY", "joy"))
         self.assertEqual(emotion.parse_tag("<|EMO_UNKNOWN|>"), ("EMO_UNKNOWN", "neutral"))

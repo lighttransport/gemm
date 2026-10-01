@@ -5,6 +5,7 @@ TorchRig projection and temporal optimizer; browser playback has no tracker.
 """
 from __future__ import annotations
 
+from contextlib import nullcontext
 import argparse
 import hashlib
 import json
@@ -21,6 +22,7 @@ import numpy as np
 
 from ..service import ServiceError
 from . import rigdef, safetensors as st
+from .. import runtime, gpu
 
 VIDEO_TYPES = {"video/mp4": ".mp4", "video/webm": ".webm", "video/quicktime": ".mov"}
 MAX_UPLOAD = 64 << 20
@@ -173,7 +175,7 @@ def _anchor_rig(rig_dir: Path):
     base_names = {b["name"] for b in definition["blendshapes"]}
     shapes = {name: package["morph"][i, ids] for i, name in enumerate(morph_names) if name in base_names}
     rig = TorchRig(definition, rest[ids], shapes, package["skin.joints"][ids],
-                   package["skin.weights"][ids], device="cpu")
+                   package["skin.weights"][ids], device=runtime.torch_device(__import__("torch")))
     return rig, definition, rest[ids]
 
 
@@ -183,6 +185,7 @@ def fit_observations(rig_dir: Path, direct: np.ndarray, landmarks: np.ndarray,
     import torch
 
     torch.set_num_threads(min(4, os.cpu_count() or 1))
+    device = runtime.torch_device(torch)
     rig, definition, anchor_rest = _anchor_rig(rig_dir)
     if direct.shape != (len(landmarks), len(definition["controls"])) or landmarks.shape != (len(direct), len(ANCHORS), 2):
         raise ValueError("invalid video observation shapes")
@@ -196,10 +199,10 @@ def fit_observations(rig_dir: Path, direct: np.ndarray, landmarks: np.ndarray,
     scale = float(observed_distance / eye_distance)
     center = landmarks[:, 0] - np.stack((scale * np.full(len(direct), anchor_rest[0, 0]),
                                          -scale * np.full(len(direct), anchor_rest[0, 1])), axis=1)
-    prior = torch.from_numpy(direct)
-    observed = torch.from_numpy(landmarks)
-    center_t = torch.from_numpy(center.astype(np.float32))
-    confidence = torch.from_numpy(valid.astype(np.float32))[:, None, None]
+    prior = torch.from_numpy(direct).to(device)
+    observed = torch.from_numpy(landmarks).to(device)
+    center_t = torch.from_numpy(center.astype(np.float32)).to(device)
+    confidence = torch.from_numpy(valid.astype(np.float32)).to(device)[:, None, None]
     with torch.no_grad():
         baseline = rig(prior)["pos"][..., :2]
         baseline = torch.stack((baseline[..., 0], -baseline[..., 1]), -1) * scale + center_t[:, None]
@@ -207,7 +210,7 @@ def fit_observations(rig_dir: Path, direct: np.ndarray, landmarks: np.ndarray,
         offset = observed[reference] - baseline[reference]
     controls = torch.nn.Parameter(prior.clone())
     optimizer = torch.optim.Adam([controls], lr=.025)
-    anchor_weight = torch.tensor([.5, 1.5, 1.5, .5, 1.5, 1.5, .3, .3])[None, :, None]
+    anchor_weight = torch.tensor([.5, 1.5, 1.5, .5, 1.5, 1.5, .3, .3], device=device)[None, :, None]
     for _ in range(steps):
         optimizer.zero_grad()
         posed = rig(controls)["pos"][..., :2]
@@ -219,13 +222,14 @@ def fit_observations(rig_dir: Path, direct: np.ndarray, landmarks: np.ndarray,
         loss.backward()
         optimizer.step()
         with torch.no_grad():
-            controls.clamp_(torch.from_numpy(lo), torch.from_numpy(hi))
+            controls.clamp_(torch.from_numpy(lo).to(device), torch.from_numpy(hi).to(device))
     with torch.no_grad():
         result = rig(controls)["pos"][..., :2]
         result = torch.stack((result[..., 0], -result[..., 1]), -1) * scale + center_t[:, None] + offset
         error_before = float(torch.linalg.vector_norm((baseline + offset - observed)[valid], dim=-1).mean())
         error_after = float(torch.linalg.vector_norm((result - observed)[valid], dim=-1).mean())
-    return controls.detach().numpy(), {"landmark_error_before_normalized": error_before,
+    return controls.detach().cpu().numpy(), {"landmark_error_before_normalized": error_before,
+                                        "backend": gpu.backend(), "device": device,
                                         "landmark_error_after_normalized": error_after,
                                         "valid_frames": int(valid.sum()), "frames": len(valid),
                                         "projection_scale": scale}
@@ -269,36 +273,37 @@ def fit_job(service, request: dict, progress, cancel, *, python=None, model: Pat
     cmd = [str(py), "-m", "server.vhuman.rig.video_fit", "decode", str(rig_path.parent),
            str(source), str(stage), "--model", str(model)]
     progress(.02, "observing facial video")
-    proc = subprocess.Popen(cmd, cwd=Path(__file__).resolve().parents[3], stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, text=True, start_new_session=True,
-                            env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
-    try:
-        while proc.poll() is None:
-            if cancel.is_set():
-                os.killpg(proc.pid, signal.SIGTERM)
-                proc.communicate(timeout=5)
-                raise RuntimeError("face video fitting cancelled")
-            import time
-            time.sleep(.1)
-        output = proc.communicate()[0]
-        if proc.returncode:
-            raise RuntimeError("face video fitting failed: " + output[-1500:])
-        report = json.loads((stage / "fit_report.json").read_text())
-        manifest = {"id": take_id, "head_id": head, "format": "vhuman.performance.v1",
-                    "source": "face_video", "source_upload_id": upload_meta["id"],
-                    "source_sha256": upload_meta["sha256"], "duration": report["duration"],
-                    "fps": FPS, "frames": report["frames"],
-                    "rig_sha256": hashlib.sha256(rig_path.read_bytes()).hexdigest()[:16]}
-        (stage / "manifest.json").write_text(json.dumps(manifest, indent=2))
-        stage.rename(root / take_id)
-        progress(.99, "face video take ready")
-        return service.take_summary(head, take_id)
-    finally:
-        if proc.poll() is None:
-            proc.terminate()
-            proc.wait()
-        if stage.exists():
-            shutil.rmtree(stage, ignore_errors=True)
+    with gpu.device_session(1536, cancel) if gpu.backend() != "cpu" else nullcontext():
+        proc = subprocess.Popen(runtime.python_command(cmd), cwd=Path(__file__).resolve().parents[3], stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, start_new_session=True,
+                                env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
+        try:
+            while proc.poll() is None:
+                if cancel.is_set():
+                    os.killpg(proc.pid, signal.SIGTERM)
+                    proc.communicate(timeout=5)
+                    raise RuntimeError("face video fitting cancelled")
+                import time
+                time.sleep(.1)
+            output = proc.communicate()[0]
+            if proc.returncode:
+                raise RuntimeError("face video fitting failed: " + output[-1500:])
+            report = json.loads((stage / "fit_report.json").read_text())
+            manifest = {"id": take_id, "head_id": head, "format": "vhuman.performance.v1",
+                        "source": "face_video", "source_upload_id": upload_meta["id"],
+                        "source_sha256": upload_meta["sha256"], "duration": report["duration"],
+                        "fps": FPS, "frames": report["frames"],
+                        "rig_sha256": hashlib.sha256(rig_path.read_bytes()).hexdigest()[:16]}
+            (stage / "manifest.json").write_text(json.dumps(manifest, indent=2))
+            stage.rename(root / take_id)
+            progress(.99, "face video take ready")
+            return service.take_summary(head, take_id)
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                proc.wait()
+            if stage.exists():
+                shutil.rmtree(stage, ignore_errors=True)
 
 
 def main(argv=None):

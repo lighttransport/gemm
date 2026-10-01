@@ -6,6 +6,7 @@ post-skinning contacts remain responsible for the principal motion.
 """
 from __future__ import annotations
 
+from contextlib import nullcontext
 import argparse
 import hashlib
 import json
@@ -18,6 +19,7 @@ from pathlib import Path
 import numpy as np
 
 from . import rigdef, safetensors as st
+from .. import runtime, gpu
 
 
 def _inputs(rig: rigdef.Rig, controls: np.ndarray) -> np.ndarray:
@@ -176,12 +178,13 @@ def train(rig_dir: Path, take_dirs: list[Path], *, max_modes: int = 16) -> dict:
     rank = min(max_modes, len(train_matrix) - 1)
     if rank < 4:
         raise ValueError("too few tissue frames for a modal model")
-    source = torch.from_numpy(train_matrix)
-    with torch.random.fork_rng(devices=[]):
+    device = runtime.torch_device(torch)
+    source = torch.from_numpy(train_matrix).to(device)
+    with torch.random.fork_rng(devices=[] if device == "cpu" else [gpu.device_index()]):
         torch.manual_seed(23)
         _, _, vectors = torch.pca_lowrank(source, q=min(rank + 4, min(source.shape) - 1),
                                           center=False, niter=2)
-    basis = vectors[:, :rank].T.contiguous().numpy().astype(np.float32)
+    basis = vectors[:, :rank].T.contiguous().cpu().numpy().astype(np.float32)
     candidates = sorted(set(k for k in (8, 12, 16) if k <= rank) | {rank})
     scores = []
     for modes in candidates:
@@ -246,7 +249,8 @@ def train(rig_dir: Path, take_dirs: list[Path], *, max_modes: int = 16) -> dict:
             staged_manifest = manifest_path.with_name("manifest.json.soft.partial")
             staged_manifest.write_text(json.dumps(manifest, indent=2))
             staged_manifest.replace(manifest_path)
-    report = {"format": meta["format"], "takes": [Path(t).name for t in take_dirs],
+    report = {"format": meta["format"], "backend": gpu.backend(), "device": device,
+              "takes": [Path(t).name for t in take_dirs],
               "split": split, "modes": modes, "frequency_hz": frequency, "damping": damping,
               "heldout_baseline_rmse_mm": baseline_mm, "heldout_model_rmse_mm": model_mm,
               "heldout_patch_baseline_rmse_mm": patch_baseline_mm,
@@ -276,24 +280,25 @@ def train_job(service, request: dict, progress, cancel, *, python=None) -> dict:
         raise ValueError(f"rig interpreter is missing: {py}")
     progress(.05, "fitting compact tissue modes")
     cmd = [str(py), "-m", "server.vhuman.rig.soft_deformer", str(rig_dir), *map(str, takes)]
-    proc = subprocess.Popen(cmd, cwd=Path(__file__).resolve().parents[3], stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, text=True, start_new_session=True,
-                            env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
-    try:
-        while proc.poll() is None:
-            if cancel.is_set():
-                os.killpg(proc.pid, signal.SIGTERM)
-                proc.communicate(timeout=5)
-                raise RuntimeError("soft deformer training cancelled")
-            import time
-            time.sleep(.1)
-        output = proc.communicate()[0]
-        if proc.returncode:
-            raise RuntimeError("soft deformer training failed: " + output[-1500:])
-    finally:
-        if proc.poll() is None:
-            proc.terminate()
-            proc.wait()
+    with gpu.device_session(1536, cancel) if gpu.backend() != "cpu" else nullcontext():
+        proc = subprocess.Popen(runtime.python_command(cmd), cwd=Path(__file__).resolve().parents[3], stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, start_new_session=True,
+                                env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
+        try:
+            while proc.poll() is None:
+                if cancel.is_set():
+                    os.killpg(proc.pid, signal.SIGTERM)
+                    proc.communicate(timeout=5)
+                    raise RuntimeError("soft deformer training cancelled")
+                import time
+                time.sleep(.1)
+            output = proc.communicate()[0]
+            if proc.returncode:
+                raise RuntimeError("soft deformer training failed: " + output[-1500:])
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                proc.wait()
     report = json.loads((rig_dir / "soft_deformer_report.json").read_text())
     progress(.99, "soft deformer ready")
     return {"head_id": head, "report": report,

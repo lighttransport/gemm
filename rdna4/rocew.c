@@ -264,8 +264,8 @@ static int loadHIP(void)
     const char* hip_paths[] = { NULL };
 #else
     const char* hip_paths[] = {
-        /* Prefer the installed RDNA4 ROCm 10 runtime over an older system
-         * libamdhip64.so.5 that may be present in the dynamic linker cache. */
+        /* Prefer the active ROCm installation over stale linker-cache entries. */
+        "/opt/rocm/core/lib/libamdhip64.so",
         "/opt/rocm/core-10.0/lib/libamdhip64.so",
         "/opt/rocm/core-10.0/lib/libamdhip64.so.10",
         "libamdhip64.so",
@@ -421,6 +421,7 @@ static int loadHIPRTC(void)
 {
 #ifdef _WIN32
     const char* hiprtc_paths[] = {
+        "/opt/rocm/core/lib/libhiprtc.so",
         "hiprtc0604.dll",
         "hiprtc.dll",
         "hiprtc0601.dll",
@@ -431,9 +432,11 @@ static int loadHIPRTC(void)
     };
 #elif defined(__APPLE__)
     /* HIPRTC is not supported on macOS */
-    const char* hiprtc_paths[] = { NULL };
+    const char* hiprtc_paths[] = {
+        "/opt/rocm/core/lib/libhiprtc.so", NULL };
 #else
     const char* hiprtc_paths[] = {
+        "/opt/rocm/core/lib/libhiprtc.so",
         "/opt/rocm/core-10.0/lib/libhiprtc.so",
         "/opt/rocm/core-10.0/lib/libhiprtc.so.10",
         "libhiprtc.so",

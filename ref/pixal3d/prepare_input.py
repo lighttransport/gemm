@@ -20,7 +20,13 @@ p.add_argument("--moge-model", type=Path)
 p.add_argument("--fov", type=float, default=-1.0)
 p.add_argument("--mesh-scale", type=float, default=1.0)
 p.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
+p.add_argument("--device-index", type=int, default=0)
 a = p.parse_args()
+if a.device_index < 0:
+    p.error("--device-index must be non-negative")
+if a.device == "cuda":
+    import torch
+    torch.cuda.set_device(a.device_index)
 if not math.isfinite(a.mesh_scale) or a.mesh_scale <= 0:
     p.error("--mesh-scale must be positive")
 if a.fov > 0 and (not math.isfinite(a.fov) or a.fov >= math.pi):

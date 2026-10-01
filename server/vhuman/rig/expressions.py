@@ -267,7 +267,7 @@ def _mouth_close(F: Fields, skel: dict, skin_w: tuple, mask: np.ndarray) -> np.n
     return np.linalg.solve(A, want[..., None])[..., 0]
 
 
-def smooth_shapes(F: Fields, S: dict, iters: int = 4) -> dict:
+def smooth_shapes(F: Fields, S: dict, iters: int = 4, *, device: str | None = None) -> dict:
     """Light Laplacian smoothing of every delta field over the skin (lid and
     lip ring-0 vertices held: their motion is exact)."""
     tm = F.tmpl
@@ -276,12 +276,13 @@ def smooth_shapes(F: Fields, S: dict, iters: int = 4) -> dict:
     hold = ((F.eye_k <= 0) & (F.eye_side >= 0)) | (F.lip_k <= 0)
     try:
         import torch
-        dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        from ..runtime import torch_device
+        dev = torch.device(device if device is not None else torch_device(torch))
         i = torch.tensor(np.concatenate([E[:, 0], E[:, 1]]), device=dev)
         j = torch.tensor(np.concatenate([E[:, 1], E[:, 0]]), device=dev)
         deg = torch.bincount(i, minlength=n).clamp(min=1).double()
         vals = torch.ones(len(i), dtype=torch.float64, device=dev)
-        A = torch.sparse_coo_tensor(torch.stack([i, j]), vals, (n, n)).coalesce()
+        A = torch.sparse_coo_tensor(torch.stack([i, j]), vals, (n, n), check_invariants=True).coalesce()
         names = list(S)
         X = torch.tensor(np.concatenate([S[k] for k in names], 1), device=dev)
         X0 = X.clone()
@@ -291,7 +292,11 @@ def smooth_shapes(F: Fields, S: dict, iters: int = 4) -> dict:
             X = torch.where(H, X0, X + 0.5 * (avg - X))
         Xn = X.cpu().numpy()
         return {k: Xn[:, 3 * c:3 * c + 3] for c, k in enumerate(names)}
-    except ImportError:
+    except ImportError as exc:
+        from .. import gpu
+        selected = gpu.backend() if device is None else device.split(":", 1)[0]
+        if selected != "cpu":
+            raise RuntimeError(f"PyTorch unavailable for {selected} smoothing; select the matching interpreter") from exc
         deg = np.bincount(E.reshape(-1), minlength=n).astype(np.float64)
         out = {}
         for k, d in S.items():

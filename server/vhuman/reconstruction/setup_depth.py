@@ -29,17 +29,22 @@ def main():
     source = out/'source'
     if not source.exists():
         subprocess.run(['git','clone','https://github.com/DepthAnything/Depth-Anything-V2.git',str(source)],check=True)
-    subprocess.run(['git','-C',str(source),'checkout','--detach',a.code_revision],check=True)
+        subprocess.run(['git','-C',str(source),'checkout','--detach',a.code_revision],check=True)
+    revision = subprocess.check_output(['git','-C',str(source),'rev-parse','HEAD'],text=True).strip()
+    dirty = subprocess.check_output(['git','-C',str(source),'status','--porcelain','--untracked-files=no'],text=True)
+    if revision != a.code_revision or dirty:
+        raise ValueError('depth source must be a clean checkout at the selected revision')
     url = f'https://huggingface.co/depth-anything/Depth-Anything-V2-Small/resolve/{a.weight_revision}/depth_anything_v2_vits.pth'
     weights = out/'depth_anything_v2_vits.pth'
     partial = out/'weights.partial'
-    try:
-        urllib.request.urlretrieve(url,partial)
-        if sha256(partial)!=a.weight_sha256:
-            raise ValueError('Small checkpoint hash mismatch')
-        partial.replace(weights)
-    finally:
-        partial.unlink(missing_ok=True)
+    if not weights.is_file() or sha256(weights)!=a.weight_sha256:
+        try:
+            urllib.request.urlretrieve(url,partial)
+            if sha256(partial)!=a.weight_sha256:
+                raise ValueError('Small checkpoint hash mismatch')
+            partial.replace(weights)
+        finally:
+            partial.unlink(missing_ok=True)
     (out/'installation.json').write_text(json.dumps(dict(model='Depth-Anything-V2-Small',license='Apache-2.0',
         code_revision=a.code_revision,weight_revision=a.weight_revision,weights_sha256=a.weight_sha256,source=url),indent=2))
 

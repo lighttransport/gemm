@@ -325,7 +325,15 @@ class Solver:
             x = x_lin + off
             _, after = self.c.energy(x, skin)
             # back to the rest frame, before skinning: A r_pre = r_posed
-            r_pre = torch.linalg.solve(lin["blend"], off[..., None])[..., 0]
+            if torch.version.hip and off.is_cuda:
+                # ROCm's batched getrs allocates per-matrix pointer workspace;
+                # bound each launch for the many tiny skinning systems.
+                a = lin["blend"].reshape(-1, 3, 3)
+                b = off.reshape(-1, 3, 1)
+                r_pre = torch.cat([torch.linalg.solve(a[i:i+4096], b[i:i+4096])
+                                   for i in range(0, len(a), 4096)]).reshape_as(off)
+            else:
+                r_pre = torch.linalg.solve(lin["blend"], off[..., None])[..., 0]
         return {"residual_mm": r_pre, "before": before, "after": after, "offset_mm": off.detach()}
 
 
