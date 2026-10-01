@@ -59,6 +59,9 @@ if [ "$command" = check ]; then
     for test in kquant native_batch prefill_config; do "$GLM53F_BIN_DIR/test_glm53f_$test"; done
     "$GLM53F_BIN_DIR/test_glm53f_state_io" "$logdir"
     export GLM53F_KDA_BATCH_TEAM=1 GLM53F_KDA_WIDE_TILE=1 GLM53F_KDA_PREFILL=1 GLM53F_SPARSE_BATCH_OP=1
+    # The KDA exact gates compare against the sequential decode path: pin the faster (non bit-identical) prefill paths off;
+    # they are validated separately by GLM53F_KDA_GEMM=2 and end-to-end token comparison.
+    export GLM53F_KDA_GEMM=0 GLM53F_KDA_CONV_VEC=0 GLM53F_KDA_NATIVE_COLUMN=0 GLM53F_KDA_ASYNC=0
     mpi_run check-kda "$GLM53F_BIN_DIR/glm53f_kda_callback_check" "$model" 44 32
     # Tests reduce their status across ranks and return nonzero on failure.
     grep 'PASS' "$last_log".*.0
@@ -78,7 +81,7 @@ if [ "$command" = check ]; then
     # numerically different (closer to exact fp32), so it is validated separately with GLM53F_MOE_NATIVE_GROUPED=2.
     # The MoE combine reduction order (GLM53F_MOE_AR_SLAB) is likewise pinned to the decode collective here; the faster
     # collectives are validated by bench_glm53f_allreduce_12n (result check) and end-to-end generation.
-    export GLM53F_MOE_NATIVE_GROUPED=0 GLM53F_SPARSE_MLA_BATCH=0 GLM53F_MOE_ROUTER_GEMM=0 GLM53F_MOE_SHARED_GEMM=0 GLM53F_MOE_AR_SLAB=0 GLM53F_IQ_FAST=0
+    export GLM53F_MOE_NATIVE_GROUPED=0 GLM53F_SPARSE_MLA_BATCH=0 GLM53F_MOE_ROUTER_GEMM=0 GLM53F_MOE_SHARED_GEMM=0 GLM53F_MOE_AR_SLAB=0 GLM53F_IQ_FAST=0 GLM53F_MTNI_DECODE=0 GLM53F_MHC_FAST=0 GLM53F_MOE_FUSE_SHARED=0 GLM53F_KDA_ASYNC=0
     mpi_run check-target "$GLM53F_BIN_DIR/glm53f_target_batch_check_12n" "$model" "$routed" "$shared" \
         --prefill-mode fast --prefill-features 27 --prefill-slab 16 --prefill-collective tree-packed
     grep 'PASS' "$last_log".*.0
