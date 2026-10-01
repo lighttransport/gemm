@@ -27,10 +27,13 @@ __attribute__((noinline)) static void reference(float *out, const float *z,
 }
 int main(void) {
     enum { HEADS = 6, SLOTS = 2052 };
-    float *z = malloc((size_t)SLOTS * 512 * sizeof(float));
-    uint16_t *half = malloc((size_t)SLOTS * 512 * sizeof(uint16_t));
+    float *z = aligned_alloc(256, (size_t)SLOTS * 512 * sizeof(float));
+    uint16_t *half = aligned_alloc(256, (size_t)SLOTS * 512 * sizeof(uint16_t));
     float *prob = malloc((size_t)HEADS * SLOTS * sizeof(float));
-    float sum[HEADS], expected[HEADS * 512], actual[HEADS * 512];
+    float sum[HEADS];
+    /* Runtime tiles start on distinct cache lines. Avoid benchmark-only
+     * scratch false sharing when adjacent workers update their tiles. */
+    _Alignas(256) float expected[HEADS * 512], actual[HEADS * 512];
     int selected[SLOTS];
     if (!z || !prob || !half || svcntw() != 16) return 2;
     uint32_t seed = 113;

@@ -1,6 +1,6 @@
 # Resume: GLM53F Strata-inspired optimization, 12 A64FX nodes
 
-Updated 2026-10-02 05:23 JST. New optimization campaign is active; prior results below remain the qualified baseline.
+Updated 2026-10-02 05:47 JST. New optimization campaign is active; prior results below remain the qualified baseline.
 
 Previous campaign: TP12 implementation, native validation and
 short/8K/synthetic 32K qualification complete. All new paths remain opt-in.
@@ -15,7 +15,7 @@ See `a64fx/glm5/GLM53F_STRATA.md` for implementation, gates and commands.
   Same isolated remote snapshot and HTTP forwarding as below.
 - Bounded stage PID **685**, log `tmp/strata-20261002/stage.log`; routed
   rank-zero log `tmp/glm53f-q4-52075759/routed-stage-keys4-stage.1.0`.
-  Layer 20 / 6.67 GB at 05:15. Wait for stage exit and OK sentinel before MPI.
+  Layer 34 / 11.78 GB at 05:45. Wait for stage exit and OK sentinel before MPI.
 - Immutable builds **candidate-keys4-v1** and **candidate-values-v1** complete.
   Build logs `tmp/strata-20261002/build-{keys4-v2,values-v1}.log` remotely.
   Native fast/conservative index keys4 and MLA register-value arithmetic
@@ -26,6 +26,9 @@ See `a64fx/glm5/GLM53F_STRATA.md` for implementation, gates and commands.
   **candidate-cache-v3** builds, native fast/conservative value/conversion
   gates pass at 1/12/47/48 threads. Actual prefill attention has 60 byte-exact
   cases across all head counts, selections and key tails, both compilers.
+  Aligned native value outputs now match runtime cache-line boundaries;
+  updated fast/conservative arithmetic still passes. Earlier unaligned
+  scratch timing could include false sharing and is not promotion evidence.
   Whole-model gates remain pending. Wider mHC tiles rejected
   for slower native probes; no runtime mHC tile path retained.
 - Unset `OPAL_PREFIX OMPI_CC OMPI_CXX` before invoking system `mpifcc`.

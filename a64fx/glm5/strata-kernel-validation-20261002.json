@@ -30,14 +30,22 @@
     "iq-rows4-probe.log": "a199aac6d84b2ba7ce9fe8941226018d8bc0d6cdcc2c6cd6ec1dd6060b8ffb84",
     "build-cache-v3.log": "99a0ab850b30404797c99ab9a5c4eee069c83a31643f3ceda23dd61252fad679",
     "build-executor-cache.log": "e601a9863a1d11d435cee629a87b41af3cf257fa41fcb514f1db9dbaa584c0db",
-    "cache-v3-native-unit-contended.log": "20ce74c25d8e5df860156ce754a38b05ba0ffcd227e8102dc84af7f5db325968"
+    "cache-v3-native-unit-contended.log": "20ce74c25d8e5df860156ce754a38b05ba0ffcd227e8102dc84af7f5db325968",
+    "cache-aligned-native-unit-contended.log": "657ea99e653a028eb9f171f64af3624e158dc3d4eeaabbbc646dd12a3f4cafa6",
+    "cache-fixed512-native-unit-contended.log": "1951c3f632591dd570f8dc14fa99b3a033f8a69ad5a1207f1d9b3e50016d32b5",
+    "mhc-rows4-probe.log": "d1976311451ea618a4e0133e80f8c1cd2ed4e3c620bcbf878f66ea024726a2ab"
   },
   "source_archives": {
     "glm53f-cache-v3-update.tar.gz": "dd5397015c0a1ce40196b01cd526314c755aedefa955ae35443f3f9b541a1de0",
-    "glm53f-executor-cache-update.tar.gz": "274e59a7a4b9f1dd74accfecb4a63ee38cd7a85eb4057d2ce5d085c92b319992"
+    "glm53f-executor-cache-update.tar.gz": "274e59a7a4b9f1dd74accfecb4a63ee38cd7a85eb4057d2ce5d085c92b319992",
+    "glm53f-cache-unit-aligned.tar.gz": "e5e9b5eeca0a291c6ae1f36bc6c19df84b4a11f90565563c6eda7857c4f33812"
   },
   "rejected_runtime_experiments": [
     "Wider mHC tiles: native probes slower; implementation removed",
-    "Four-row IQ probe: no clear main-projection benefit; remains outside runtime"
-  ]
+    "Four-row IQ probe: no clear main-projection benefit; remains outside runtime",
+    "Four-row mHC decode projection: byte-exact, slower at production thread count; not integrated",
+    "Fixed 512-bit SVE compile flag: FCC 7.1.0 ACLE header rejects -msve-vector-bits=N; not built"
+  ],
+  "value_microbenchmark_alignment_bytes": 256,
+  "value_microbenchmark_note": "Scratch and register outputs now use runtime-equivalent alignment; earlier unaligned scratch timing could include false sharing."
 }
