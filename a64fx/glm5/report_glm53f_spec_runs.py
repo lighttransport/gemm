@@ -16,7 +16,7 @@ def read_ids(path):
 
 
 def report(log, prefix, cycles, depths, reference_path=None):
-    reference = read_ids(reference_path or str(prefix) + '.ref.greedy')
+    reference = read_ids(reference_path or str(prefix) + '.greedy')
     groups, complete = {}, None
     for line in Path(log).read_text().splitlines():
         if line.startswith('GLM53F_SPEC_COMPLETE '):

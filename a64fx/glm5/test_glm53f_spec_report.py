@@ -16,7 +16,7 @@ class SpecReportTest(unittest.TestCase):
         self.prefix = Path(self.temp.name) / 'run.ids'
         self.log = Path(self.temp.name) / 'run.log'
         self.reference = list(range(100, 120))
-        Path(str(self.prefix) + '.ref.greedy').write_text('\n'.join(map(str, self.reference)))
+        Path(str(self.prefix) + '.greedy').write_text('\n'.join(map(str, self.reference)))
         self.rows = []
         self.complete = dict(variants=2, repetitions=3, cycles=4, status='PASS')
         for variant, depth in enumerate((1, 2)):
