@@ -127,7 +127,8 @@ static int on_feature(void *user, const int32_t *codes, const float *hidden, int
 }
 
 /* Persistent local stdin worker: one JSON {"text":"..."} request per line.
- * Files/pipes receive ordinary headers per utterance and explicit end markers.
+ * PCM receives a request-start acknowledgement before its ordinary header;
+ * both pipes receive ordinary headers per utterance and explicit end markers.
  * SIGUSR1 cancels at a codec-frame boundary; state is reset for the next request. */
 static int serve_requests(qtts_model *m, const qtts_backend *be, const bpe_vocab *vocab, qtts_codec *codec,
                           const char *speaker, const char *language, const qtts_gen_params *params,
@@ -152,6 +153,11 @@ static int serve_requests(qtts_model *m, const qtts_backend *be, const bpe_vocab
         json_free(request);
         if (count + params->max_frames + 32 > 2400) { free(ids); status = 1; break; }
         cancel_requested = 0;
+        /* Acknowledge only after resetting cancellation. The client must wait
+         * for this marker before signalling, including before the first PCM. */
+        if (fwrite("VHTTSBEG", 1, 8, stdout) != 8 || fflush(stdout)) {
+            free(ids); status = 1; break;
+        }
         qtts_codec_stream *decoder = qtts_codec_stream_create(codec);
         feature_sink sink = { .features=features, .pcm=stdout, .decoder=decoder, .start=now_s() };
         if (!decoder || feature_headers(&sink, qtts_model_hidden(m))) { qtts_codec_stream_free(decoder); free(ids); status = 1; break; }

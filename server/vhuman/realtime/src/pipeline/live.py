@@ -15,6 +15,15 @@ from ..renderer.gaussian import GaussianRenderer
 from ..renderer.camera import for_avatar
 from ..tts.native import NativeTTS
 from .session import Session
+from .cleanup import close_resources
+
+
+def validate_appearance(avatar, diagnostic=False):
+    if not diagnostic:
+        if avatar.metadata.get("purpose") != "production":
+            raise ValueError("diagnostic appearance requires --diagnostic")
+        if avatar.metadata.get("trained") is not True:
+            raise ValueError("untrained appearance requires --diagnostic")
 
 
 def run(args, work):
@@ -29,8 +38,7 @@ def run(args, work):
         adapter = MotionAdapter(args.adapter, args.revision, allow_diagnostic=args.diagnostic)
         if adapter.text_feed != args.text_feed: raise ValueError("motion adapter/TTS text-feed mismatch; recapture and retrain")
         avatar = GaussianAvatar.load(args.avatar, rig.triangles)
-        if avatar.metadata["purpose"] != "production" and not args.diagnostic:
-            raise ValueError("diagnostic appearance requires --diagnostic")
+        validate_appearance(avatar, args.diagnostic)
         if tuple(avatar.metadata["control_names"]) != rig.names: raise ValueError("avatar/rig control mismatch")
         renderer = GaussianRenderer(avatar, rig.triangles)
         from ..ui.output import FrameOutput
@@ -136,11 +144,5 @@ def run(args, work):
         return {"ticks": ticks, "audio_samples": session.accepted, "metrics": session.metrics.report(),
                 "sink": args.sink, "purpose": avatar.metadata["purpose"]}
     finally:
-        if source: source.close()
-        if sampler: sampler.close()
-        if device: device.close()
-        if output: output.close()
         vertices = None
-        if shared: shared.close()
-        if ring: ring.close()
-        rig.close()
+        close_resources(source, sampler, device, output, shared, ring, rig)

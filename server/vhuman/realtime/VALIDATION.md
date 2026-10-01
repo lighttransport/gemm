@@ -171,14 +171,21 @@ sh server/vhuman/realtime/run.sh stress-tts --model "$MODEL" \
 sh server/vhuman/realtime/run.sh audit-references --head "$HEAD" \
   --identity tmp/vhuman-realtime/clean-identity-001 --output tmp/vhuman-realtime/expression-audit.json
 tmp/vhuman-rig-venv/bin/python -m unittest server.vhuman.realtime.test_runtime \
-  server.vhuman.realtime.test_training.MotionTrainingTests server.vhuman.realtime.test_output -v
+  server.vhuman.realtime.test_training.MotionTrainingTests server.vhuman.realtime.test_output \
+  server.vhuman.realtime.test_lifecycle -v
 # Real-GPU tests use run.sh's gsplat build environment:
 # python -m unittest server.vhuman.realtime.test_gpu server.vhuman.realtime.test_training -v
 tmp/vhuman-rig-venv/bin/python -m unittest server.vhuman.realtime.test_resident -v
 ```
 
-CPU/output tests21 passed; CUDA/deformation/appearance tests4 passed; real resident
-request/cancel/reuse passed. CPU and CUDA speech runners build warning-clean.
+CPU/output/lifecycle tests27 passed; CUDA/deformation/appearance tests4 passed;
+both real resident request/cancel/reuse tests passed, including cancellation while
+the worker was paused before request setup. Cancellation waits for the native
+request-start acknowledgement; appearance inference requires a trained bundle
+outside diagnostic mode; cleanup attempts all releases and preserves the original
+runtime error. CPU and CUDA speech runners build with `-Wall -Wextra -Werror`.
+Strict `-Wpedantic -Werror` also diagnoses existing NVRTC overlength strings and
+POSIX dynamic-loader function-pointer casts in cuew; these were not changed here.
 MediaPipe's native runtime stalled inside the execution sandbox; the identified
 audit was stopped and the same command succeeded outside it. No old research
 portrait was used in the new fitting or capture paths.

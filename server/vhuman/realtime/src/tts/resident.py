@@ -23,6 +23,7 @@ class ResidentTTS:
         self.done_audio = threading.Event(); self.done_features = threading.Event()
         self.done_audio.set(); self.done_features.set()
         self.discard = threading.Event(); self.threads = []
+        self.request_started = threading.Event()
         self.started_ns = self.first_audio_ns = None
         self.startup = StartupMeter()
         self.epoch = -1
@@ -69,9 +70,10 @@ class ResidentTTS:
         for thread in self.threads: thread.join()
         self.epoch = epoch; self.discard.clear()
         self.done_audio.clear(); self.done_features.clear()
+        self.request_started.clear()
         self.started_ns = time.monotonic_ns(); self.first_audio_ns = None
         self.startup = StartupMeter()
-        self.threads = [threading.Thread(target=self._pump, args=(read_pcm(self.process.stdout, epoch, True), self.audio, self.done_audio, True)),
+        self.threads = [threading.Thread(target=self._pump, args=(self._pcm_records(epoch), self.audio, self.done_audio, True)),
                         threading.Thread(target=self._pump, args=(read_features(self.feature_pipe, self.revision, epoch, True), self.features, self.done_features))]
         for thread in self.threads: thread.start()
         request = memoryview((json.dumps({"text": text}, ensure_ascii=False) + "\n").encode("utf-8"))
@@ -79,6 +81,12 @@ class ResidentTTS:
             written = self.process.stdin.write(request)
             if not written: raise RuntimeError("native request pipe closed")
             request = request[written:]
+
+    def _pcm_records(self, epoch):
+        if read_exact(self.process.stdout, 8) != b"VHTTSBEG":
+            raise RuntimeError("invalid native request-start marker")
+        self.request_started.set()
+        yield from read_pcm(self.process.stdout, epoch, True)
 
     def check(self):
         if not self.errors.empty(): raise self.errors.get()
@@ -88,6 +96,11 @@ class ResidentTTS:
     def cancel(self):
         self.discard.set()
         if not self.done_audio.is_set() or not self.done_features.is_set():
+            deadline = time.monotonic() + 3
+            while not self.request_started.wait(.05):
+                self.check()
+                if time.monotonic() >= deadline:
+                    self.close(); raise RuntimeError("request-start timed out; worker terminated")
             self.process.send_signal(signal.SIGUSR1)
         for thread in self.threads: thread.join(timeout=3)
         if any(t.is_alive() for t in self.threads):

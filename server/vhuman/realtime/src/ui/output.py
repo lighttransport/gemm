@@ -1,5 +1,6 @@
 """Explicit CPU transfer/compositing stage; optional display, recording and camera."""
 from pathlib import Path
+from contextlib import ExitStack
 import subprocess
 import time
 import wave
@@ -83,10 +84,22 @@ class FrameOutput:
         return True
 
     def close(self):
-        if self.audio_file: self.audio_file.close()
+        # Recording/mux failures must not skip camera or window shutdown.
+        with ExitStack() as stack:
+            if self.pygame: stack.callback(self.pygame.quit)
+            if self.camera: stack.callback(self.camera.close)
+            if self.encoder: stack.callback(self._finish_recording)
+            if self.audio_file: stack.callback(self.audio_file.close)
+
+    def _finish_recording(self):
         if self.encoder:
-            self.encoder.stdin.close()
-            if self.encoder.wait(timeout=20): raise RuntimeError("ffmpeg recording failed")
+            try:
+                self.encoder.stdin.close()
+                if self.encoder.wait(timeout=20): raise RuntimeError("ffmpeg recording failed")
+            finally:
+                if self.encoder.poll() is None:
+                    self.encoder.kill()
+                    self.encoder.wait()
             if self.audio_file:
                 subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "warning", "-y",
                     "-i", str(self.silent_path), "-i", str(self.audio_path),
@@ -94,5 +107,3 @@ class FrameOutput:
                     str(self.video_path)], check=True)
                 self.silent_path.unlink()
             else: self.silent_path.replace(self.video_path)
-        if self.camera: self.camera.close()
-        if self.pygame: self.pygame.quit()

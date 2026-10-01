@@ -1,6 +1,9 @@
 """Optional real-model integration checks; absent local weights skip explicitly."""
 from pathlib import Path
 import queue
+import os
+import signal
+import threading
 import time
 import unittest
 from .src.avatar.provenance import sha256
@@ -13,6 +16,33 @@ RUNNER = ROOT / "tmp/vhuman-realtime/speech/qwen3_tts_cuda"
 
 
 class ResidentIntegrationTests(unittest.TestCase):
+    def test_cancel_before_request_start_and_reuse(self):
+        if not RUNNER.exists() or not (MODEL / "model.safetensors").exists():
+            self.skipTest("requires locally built CUDA runner and Qwen0.6B weights")
+        worker = ResidentTTS(RUNNER, MODEL, sha256(MODEL / "model.safetensors"), WORK / "early-cancel",
+                             max_frames=256, threads=4)
+        timer = None
+        try:
+            pid = worker.process.pid
+            # Simulate a descheduled worker: cancellation arrives before parsing
+            # and resetting its request state, rather than after the first PCM.
+            os.kill(pid, signal.SIGSTOP)
+            worker.submit("今日は天気が良いので、公園を散歩しながら、これからの計画についてゆっくり話しましょう。" * 5, 0)
+            timer = threading.Timer(.1, lambda: os.kill(pid, signal.SIGCONT))
+            timer.start()
+            start = time.monotonic()
+            worker.cancel()
+            self.assertLess(time.monotonic() - start, 3)
+            self.assertEqual(worker.process.pid, pid)
+            self.assertTrue(worker.audio.empty() and worker.features.empty())
+            worker.submit("ありがとう。", 1)
+            self._drain(worker, 1)
+            self.assertEqual(worker.process.pid, pid)
+        finally:
+            if timer: timer.join()
+            if worker.process.poll() is None: os.kill(worker.process.pid, signal.SIGCONT)
+            worker.close()
+
     def test_repeated_requests_cancel_and_reuse(self):
         if not RUNNER.exists() or not (MODEL / "model.safetensors").exists():
             self.skipTest("requires locally built CUDA runner and Qwen0.6B weights")

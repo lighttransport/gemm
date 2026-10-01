@@ -121,15 +121,19 @@ The Python subprocess adapter uses separate pipes and bounded reader queues.
 The one-shot adapter uses EOF and reloads weights per utterance. `ResidentTTS`
 uses `--serve-stdin` to retain weights/context across requests. It waits for
 `VHTTSRDY`, writes one JSON line `{"text":"こんにちは。"}` per request, and reads
-an ordinary PCM/feature header per utterance. PCM EOS is sample=-1,count=0;
+`VHTTSBEG` request-start acknowledgement before the ordinary PCM header and an
+ordinary feature header per utterance. PCM EOS is sample=-1,count=0;
 feature EOS is sample=-1 followed by zero tokens/hidden. Missing EOS is an error.
 `submit(text, epoch)` requires increasing epochs and drained previous queues;
-`cancel()` sends SIGUSR1, discards/drains both streams through EOS, joins readers,
+`cancel()` waits for the request-start acknowledgement before sending SIGUSR1,
+discards/drains both streams through EOS, joins readers,
 and leaves the worker reusable. `close()` stops the process. Use `--resident`
 for live warm serving; the CLI handles one turn, while the Python API can reuse
 one worker across many turns. Model identity is the actual local
 `model.safetensors` SHA256, verified before starting the worker; codec/tokenizer
 hashes should also become part of future full-model receipts.
+Rebuild the native runner when updating this module: resident framing now includes
+the request-start acknowledgement, and older resident binaries are incompatible.
 
 ## Clean identity and appearance training
 
