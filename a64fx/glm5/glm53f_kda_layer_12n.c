@@ -8,6 +8,7 @@
 #include "../../common/glm53f_ref.h"
 #include "../../common/glm53f_arch.h"
 #include "glm53f_kda_12n.h"
+#include "glm53f_pf_plan.h"
 #include "glm53f_collective_12n.h"
 #include <arm_sve.h>
 #include <mpi.h>
@@ -205,6 +206,15 @@ glm53f_kda_context_12n *glm53f_kda_create_12n(const char *model,int layer){int r
     glm53f_st_close(st);if(kda_native_load(c)){fprintf(stderr,"rank=%d layer=%d failed to load GLM53F_Q2_KDA_STAGE\n",rank,layer);glm53f_kda_free_12n(c);return NULL;}c->qkv=a256((size_t)3*qd*4);c->small=a256(D*4);c->gate=a256(qd*4);c->decay=a256(qd*4);c->beta=a256(hn*4);c->core=a256(qd*4);c->normed=a256(qd*4);c->work=a256(qd*4);c->conv=a256((size_t)3*qd*KERNEL*4);c->state=a256((size_t)hn*D*D*4);c->partial=a256(H*4);c->batch_partial=a256((size_t)GLM53F_KDA_TILE_TOKENS*H*4);c->bq=a256((size_t)GLM53F_KDA_TILE_TOKENS*qd*4);c->bk=a256((size_t)GLM53F_KDA_TILE_TOKENS*qd*4);c->bv=a256((size_t)GLM53F_KDA_TILE_TOKENS*qd*4);c->bsmall_f=a256((size_t)GLM53F_KDA_TILE_TOKENS*D*4);c->bsmall_g=a256((size_t)GLM53F_KDA_TILE_TOKENS*D*4);c->bgate_f=a256((size_t)GLM53F_KDA_TILE_TOKENS*qd*4);c->bgate_g=a256((size_t)GLM53F_KDA_TILE_TOKENS*qd*4);c->bbeta=a256((size_t)GLM53F_KDA_TILE_TOKENS*hn*4);c->bnormed=a256((size_t)GLM53F_KDA_TILE_TOKENS*qd*4);glm53f_kda_reset_12n(c);return c;}
 
 void glm53f_kda_reset_12n(glm53f_kda_context_12n*c){if(!c)return;memset(c->conv,0,(size_t)3*c->qd*KERNEL*4);memset(c->state,0,(size_t)c->hn*D*D*4);}
+/* Prefetch plan (glm53f_pf_plan.h) for the front projections of this layer's decode step. */
+void glm53f_kda_prefetch_plan_12n(const glm53f_kda_context_12n *c) {
+    if (!c || !c->q2_native) return;
+    const int qd = c->qd, hn = c->hn;
+    const glm53f_native_matrix mx[6] = {
+        {NULL, c->q2_q, c->q2_q_type, qd, H}, {NULL, c->q2_k, c->q2_k_type, qd, H}, {NULL, c->q2_v, c->q2_v_type, qd, H},
+        {NULL, c->q2_fa, c->q2_fa_type, D, H}, {NULL, c->q2_ga, c->q2_ga_type, D, H}, {NULL, c->q2_b, c->q2_b_type, hn, H}};
+    glm53f_pf_add_matvec(mx, c->q2_aux ? 6 : 3);
+}
 /* Issue (non-blocking) L2 prefetches for this thread's static row slice of a native matrix that a LATER stage of the
  * layer will read.  The slice is the one native_matvec_team gives this thread, so the lines land in the CMG that uses
  * them.  Decode is latency bound, so the memory system is idle during the other stages of the layer. */

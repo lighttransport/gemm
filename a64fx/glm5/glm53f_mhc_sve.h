@@ -26,6 +26,7 @@ static inline int glm53f_mhc_detail_on(void) {
     return glm53f_mhc_detail;
 }
 #include "glm53f_prefill.h"
+#include "glm53f_pf_plan.h"
 #include "../../common/glm53f_ref.h"
 
 /* The default remains the validated implementation.  The fused variant keeps
@@ -125,6 +126,7 @@ static inline void glm53f_mhc_fast(float *streams, const float *sublayer, glm53f
     {
         const int tid = omp_get_thread_num(), nt = omp_get_num_threads();
         if (nt > 128) abort();
+        glm53f_pf_run(tid); /* weights of an upcoming stage, prefetched while the mHC math runs (glm53f_pf_plan.h) */
         /* 1. new streams (post) + partial sum of squares over this thread's contiguous slice */
         {
             const int lo = (int)((long)GLM53F_MHC_FLAT * tid / nt), hi = (int)((long)GLM53F_MHC_FLAT * (tid + 1) / nt);

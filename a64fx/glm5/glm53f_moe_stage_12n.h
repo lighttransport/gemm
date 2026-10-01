@@ -9,6 +9,8 @@ void glm53f_moe_configure_prefill_12n(glm53f_moe_stage_context_12n *context,
 glm53f_moe_stage_context_12n *glm53f_moe_stage_create_12n(
     const char *routed_stage, const char *shared_stage,
     const char *model_dir, int first_layer, int layer_count);
+/* Prefetch-plan registration for MoE layer `layer` (see glm53f_pf_plan.h). */
+void glm53f_moe_stage_prefetch_plan_12n(glm53f_moe_stage_context_12n *c, int layer);
 void glm53f_moe_stage_set_layer_12n(
     glm53f_moe_stage_context_12n *context, int layer);
 /* Destructive only to the private anonymous copy; /local files stay FP8. */

@@ -3,6 +3,7 @@
 #include "glm53f_sparse_core_12n.c"
 #undef main
 #include "glm53f_sparse_12n.h"
+#include "glm53f_pf_plan.h"
 #include "glm53f_collective_12n.h"
 #include "glm53f_index_score.h"
 #include "glm53f_cache_bf16.h"
@@ -498,6 +499,14 @@ static int mla_heads_q8_value(glm53f_sparse_context_12n*c,float*out,
         }
     }
     return bad?-1:0;
+}
+/* Prefetch plan (glm53f_pf_plan.h): the native q_a / kv_a / q_b matvecs of this layer's decode front. */
+void glm53f_sparse_prefetch_plan_12n(const glm53f_sparse_context_12n *c) {
+    if (!c || !c->q2_native || c->cp) return;
+    const glm53f_native_matrix ax[2] = {{NULL, c->q2_qa, c->q2_qa_type, QA, H}, {NULL, c->q2_kva, c->q2_kva_type, LAT, H}};
+    const glm53f_native_matrix aq = {NULL, c->q2_qb, c->q2_qb_type, c->qd, QA};
+    glm53f_pf_add_matvec(ax, 2);
+    glm53f_pf_add_matvec(&aq, 1);
 }
 static inline int sp_is_q80(int type) {
     return type == GLM53F_GGML_Q8_0 || type == GLM53F_NATIVE_Q8_0R || type == GLM53F_NATIVE_Q8_0R16;

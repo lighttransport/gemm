@@ -13,6 +13,7 @@
 #define __ARM_FEATURE_SVE 1
 #endif
 #include "glm53f_expert_kern.h"
+#include "glm53f_pf_plan.h"
 #include "glm53f_moe_12n.h"
 #include "glm53f_moe_stage_12n.h"
 #include "glm53f_collective_12n.h"
@@ -685,6 +686,19 @@ static void router_dot8(float *y, const uint16_t *w, const float *x, int n) {
     const svbool_t p = svptrue_b32();
     y[0] = svaddv_f32(p, a0); y[1] = svaddv_f32(p, a1); y[2] = svaddv_f32(p, a2); y[3] = svaddv_f32(p, a3);
     y[4] = svaddv_f32(p, a4); y[5] = svaddv_f32(p, a5); y[6] = svaddv_f32(p, a6); y[7] = svaddv_f32(p, a7);
+}
+/* Prefetch plan (glm53f_pf_plan.h) for MoE layer `layer`: router weights and the native shared expert. */
+void glm53f_moe_stage_prefetch_plan_12n(glm53f_moe_stage_context_12n *c, int layer) {
+    const int li = layer - c->first_layer, t = layer - FIRST_LAYER;
+    if (!c || li < 0 || li >= c->layer_count) return;
+    if (c->router_w && !c->router_i8) glm53f_pf_add_tasks(c->router_w + (size_t)li * NEXPERTS * 4096, (size_t)8 * 4096 * sizeof(uint16_t), NEXPERTS / 8);
+    if (c->nsh_native) {
+        const int in = c->nsh_in;
+        const glm53f_native_matrix gu[2] = {{NULL, c->nsh_g[t], c->nsh_gt[t], in, 4096}, {NULL, c->nsh_u[t], c->nsh_ut[t], in, 4096}};
+        const glm53f_native_matrix dn = {NULL, c->nsh_d[t], c->nsh_dt[t], 4096, in};
+        glm53f_pf_add_matvec(gu, 2);
+        glm53f_pf_add_matvec(&dn, 1);
+    }
 }
 void glm53f_moe_stage_set_layer_12n(glm53f_moe_stage_context_12n*c,int layer){if(c)c->active_layer=layer;}
 int glm53f_moe_stage_sublayer_12n(void*context,float*out,const float*x){glm53f_moe_stage_context_12n*c=context;int li=c->active_layer-c->first_layer,selected[8],npart=0;float route_weight[8],part_weight[9];glm53f_expert_part part[9];int8_t router_qx[4096];float router_xs=0;if(li<0||li>=c->layer_count)return-1;double t=c->profile?MPI_Wtime():0.0;

@@ -321,6 +321,17 @@ int glm53f_target_model_set_cp_hot_prefix_12n(glm53f_target_model_12n *m,
     return 0;
 }
 
+/* Register the weights of the stage that follows the next mHC region (see glm53f_pf_plan.h). */
+static void target_plan_attention(const glm53f_target_model_12n *m, int l) {
+    glm53f_pf_clear();
+    if (l >= LAYERS) return;
+    if (m->kda[l]) glm53f_kda_prefetch_plan_12n(m->kda[l]);
+    else if (m->sparse[l]) glm53f_sparse_prefetch_plan_12n(m->sparse[l]);
+}
+static void target_plan_ffn(glm53f_target_model_12n *m, int l) {
+    glm53f_pf_clear();
+    if (l >= 3) glm53f_moe_stage_prefetch_plan_12n(m->moe, l);
+}
 int glm53f_target_model_step_12n(glm53f_target_model_12n *m, int token,
         int *next_token, float *next_logit, float *target_hidden) {
     double begin = m && m->profile ? MPI_Wtime() : 0.0;
@@ -332,6 +343,7 @@ int glm53f_target_model_step_12n(glm53f_target_model_12n *m, int token,
         const glm53f_target_layer_weights_12n *w = &m->layer_weight[l];
         if (!m->mhc_chained || !l) {
             begin = m->profile ? MPI_Wtime() : 0.0;
+            target_plan_attention(m, l);
             glm53f_mhc_pre_sve(&m->scratch->mhc, m->streams, &w->attention_mhc,
                                w->input_norm);
             if (m->profile) m->scalar_phase[1] += MPI_Wtime() - begin;
@@ -353,6 +365,7 @@ int glm53f_target_model_step_12n(glm53f_target_model_12n *m, int token,
             m->scalar_detail[m->kda[l] ? 0 : 1] += elapsed;
         }
         begin = m->profile ? MPI_Wtime() : 0.0;
+        target_plan_ffn(m, l);
         if (m->mhc_chained)
             glm53f_mhc_post_pre_sve(m->streams, m->scratch->sublayer_output,
                                     &m->scratch->mhc, &w->ffn_mhc,
@@ -390,6 +403,7 @@ int glm53f_target_model_step_12n(glm53f_target_model_12n *m, int token,
         begin = m->profile ? MPI_Wtime() : 0.0;
         if (m->mhc_chained && l + 1 < LAYERS) {
             const glm53f_target_layer_weights_12n *next = &m->layer_weight[l + 1];
+            target_plan_attention(m, l + 1);
             glm53f_mhc_post_pre_sve(m->streams, m->scratch->sublayer_output,
                                     &m->scratch->mhc, &next->attention_mhc,
                                     next->input_norm);
