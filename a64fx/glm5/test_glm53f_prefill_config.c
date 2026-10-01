@@ -20,14 +20,31 @@ int main(void) {
     const char *bad[] = {"0", "3", "5", "31", "33", "256", "512", "-1", "16junk", ""};
     for (unsigned i = 0; i < sizeof(bad)/sizeof(bad[0]); ++i)
         failed |= parse("--prefill-slab", bad[i], &c) != -1;
-    const char *collectives[] = {"utofu", "mpi-rsag", "ring", "tree-rsag", "tree-packed"};
-    for (int i = 0; i < 5; ++i)
+    const char *collectives[] = {"utofu", "mpi-rsag", "ring", "tree-rsag", "tree-packed", "mtni"};
+    for (int i = 0; i < 6; ++i)
         failed |= parse("--prefill-collective", collectives[i], &c) != 1 || c.collective != i;
     failed |= parse("--prefill-collective", "unknown", &c) != -1;
     failed |= parse("--prefill-features", "0", &c) != 1 || c.features != 0;
     failed |= parse("--prefill-features", "31", &c) != 1 || c.features != GLM53F_PREFILL_FAST_ALL;
     failed |= parse("--prefill-features", "32", &c) != -1;
     failed |= parse("--unknown", "1", &c) != 0;
+    failed |= parse("--verify-kernel", "grouped", &c) != 1 || strcmp(getenv("GLM53F_VERIFY_GROUPED"), "1");
+    failed |= parse("--verify-kernel", "legacy", &c) != 1 || strcmp(getenv("GLM53F_VERIFY_GROUPED"), "0");
+    failed |= parse("--verify-kernel", "invalid", &c) != -1;
+    failed |= parse("--collective-owner", "serialized", &c) != 1 || strcmp(getenv("GLM53F_COMM_OWNER"), "1");
+    failed |= parse("--collective-owner", "legacy", &c) != 1 || strcmp(getenv("GLM53F_COMM_OWNER"), "0");
+    failed |= parse("--collective-owner", NULL, &c) != -1;
+    failed |= parse("--router-kernel", "fused", &c) != 1 || strcmp(getenv("GLM53F_ROUTER_FUSE"), "1");
+    failed |= parse("--decode-executor", "persistent", &c) != 1 || strcmp(getenv("GLM53F_DECODE_EXECUTOR"), "1");
+    failed |= parse("--decode-executor", "legacy", &c) != 1 || strcmp(getenv("GLM53F_DECODE_EXECUTOR"), "0");
+    failed |= parse("--decode-executor", "invalid", &c) != -1;
+    failed |= parse("--moe-combine-kernel", "legacy", &c) != 1 || strcmp(getenv("GLM53F_MOE_COMBINE"), "0");
+    failed |= parse("--moe-combine-kernel", "vector", &c) != 1 || strcmp(getenv("GLM53F_MOE_COMBINE"), "1");
+    failed |= parse("--moe-combine-kernel", "overlap", &c) != 1 || strcmp(getenv("GLM53F_MOE_COMBINE"), "2");
+    failed |= parse("--moe-combine-kernel", "invalid", &c) != -1;
+    failed |= parse("--index-kernel", "heads", &c) != 1 || strcmp(getenv("GLM53F_INDEX_HEADS"), "1");
+    failed |= parse("--index-kernel", "legacy", &c) != 1 || strcmp(getenv("GLM53F_INDEX_HEADS"), "0");
+    failed |= parse("--index-kernel", "invalid", &c) != -1;
     printf("PREFILL_CONFIG %s\n", failed ? "FAIL" : "PASS");
     return failed;
 }

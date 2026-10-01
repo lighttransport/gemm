@@ -11,6 +11,8 @@ glm53f_moe_stage_context_12n *glm53f_moe_stage_create_12n(
     const char *model_dir, int first_layer, int layer_count);
 /* Prefetch-plan registration for MoE layer `layer` (see glm53f_pf_plan.h). */
 void glm53f_moe_stage_prefetch_plan_12n(glm53f_moe_stage_context_12n *c, int layer);
+/* Called by every thread after mHC normalization in an enclosing team. */
+void glm53f_moe_router_team_12n(void *context, const float *input);
 void glm53f_moe_stage_set_layer_12n(
     glm53f_moe_stage_context_12n *context, int layer);
 /* Destructive only to the private anonymous copy; /local files stay FP8. */

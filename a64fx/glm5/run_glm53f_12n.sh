@@ -10,6 +10,8 @@ usage() {
         '  stage                               stage/reuse this allocation weights' \
         '  decode [TOKEN=1 STEPS=128 OPTIONS...] reuse binaries and stages' \
         '  generate PROMPT_IDS OUTPUT_IDS N [OPTIONS...]' \
+        '  benchmark PROMPT_IDS OUTPUT_IDS [OPTIONS...] snapshot-reset warm trials' \
+        '  executor-check PROMPT_IDS [N=32]      compare full legacy/persistent state' \
         '  check                               build and run kernel/component/full-model checks' \
         'Defaults: Q4 native, 12 ranks, 47 threads; GLM53F_BUILD=0 skips run/check builds.' \
         'Paths: GLM53F_GGUF, GLM53F_MODEL_DIR, GLM53F_BIN_DIR, GLM53F_LOG_DIR.' \
@@ -19,7 +21,7 @@ command=${1:-run}
 [ "$#" = 0 ] || shift
 case "$command" in
     -h|--help|help) usage; exit 0 ;;
-    run|build|stage|decode|generate|check) ;;
+    run|build|stage|decode|generate|benchmark|executor-check|check) ;;
     *) usage >&2; fail "unknown command: $command" ;;
 esac
 source "$(dirname "$0")/scripts/glm53f_env.sh"
@@ -32,11 +34,22 @@ if [ "$command" = build ]; then
 fi
 require_allocation
 case "$command" in stage|check) [ "$#" = 0 ] || fail "$command takes no arguments";; esac
-if [ "$command" = generate ]; then
-    [ "$#" -ge 3 ] || fail 'generate requires PROMPT_IDS OUTPUT_IDS N'
+if [ "$command" = executor-check ]; then
+    [ "$#" -ge 1 ] && [ "$#" -le 2 ] || fail 'executor-check requires PROMPT_IDS [N]'
+    [ -s "$1" ] || fail "missing or empty prompt IDs: $1"
+    count=${2:-32}
+    [[ "$count" =~ ^[0-9]+$ ]] && [ "$count" -ge 1 ] && [ "$count" -le 512 ] || fail 'N must be 1..512'
+fi
+if [ "$command" = generate ] || [ "$command" = benchmark ]; then
+    if [ "$command" = benchmark ]; then
+        [ "$#" -ge 2 ] || fail 'benchmark requires PROMPT_IDS OUTPUT_IDS'
+        [ ! -e "$2" ] || fail "benchmark output already exists: $2"
+    else
+        [ "$#" -ge 3 ] || fail 'generate requires PROMPT_IDS OUTPUT_IDS N'
+        [[ "$3" =~ ^[0-9]+$ ]] && [ "$3" -ge 1 ] && [ "$3" -le 32768 ] || fail 'N must be 1..32768'
+    fi
     [ -s "$1" ] || fail "missing or empty prompt IDs: $1"
     [ "$(realpath -m "$1")" != "$(realpath -m "$2")" ] || fail 'prompt and output paths must differ'
-    [[ "$3" =~ ^[0-9]+$ ]] && [ "$3" -ge 1 ] && [ "$3" -le 32768 ] || fail 'N must be 1..32768'
 elif [ "$command" = run ] || [ "$command" = decode ]; then
     token=${1:-${GLM53F_TARGET_INPUT_TOKEN:-1}}
     steps=${2:-${GLM53F_TARGET_STEPS:-128}}
@@ -55,8 +68,37 @@ if [ "$command" = run ] || [ "$command" = stage ]; then
     [ "$command" != stage ] || exit 0
 fi
 prepare_runtime
+if [ "$command" = executor-check ]; then
+    [ -x "$GLM53F_BIN_DIR/glm53f_executor_check_12n" ] || fail 'executor check missing; build check or all first'
+    mpi_run executor-check "$GLM53F_BIN_DIR/glm53f_executor_check_12n" "$model" "$routed" "$shared" "$1" "$logdir/executor-state-$run_tag" "$count"
+    grep 'GLM53F_EXECUTOR_CHECK' "$last_log".*.0
+    grep -q 'GLM53F_EXECUTOR_CHECK .*state=BIT_EXACT PASS' "$last_log".*.0 || fail 'executor state check failed'
+    exit
+fi
+if [ "$command" = benchmark ]; then
+    export GLM53F_PREWARM=${GLM53F_PREWARM:-1}
+    [ -x "$GLM53F_BIN_DIR/bench_glm53f_run_12n" ] || fail 'benchmark executable missing; build check or all first'
+    {
+        printf 'job=%s quant=%s native=%s source_rev=%s\n' "$job" "$quant" "$native" "${GLM53F_BENCH_SOURCE_REV:-unrecorded}"
+        printf 'arguments: '; printf '%q ' "$@"; printf '\n'
+        sha256sum "$GLM53F_BIN_DIR/bench_glm53f_run_12n" "$1" "$topo_path"
+        for key in GLM53F_PREWARM GLM53F_NUMA_INTERLEAVE GLM53F_IQ_FAST GLM53F_MHC_FAST \
+            GLM53F_NATIVE_Q8_PANEL GLM53F_VERIFY_GROUPED GLM53F_ROUTER_FUSE GLM53F_DECODE_EXECUTOR \
+            GLM53F_COMM_OWNER GLM53F_MOE_COMBINE GLM53F_INDEX_HEADS GLM53F_KDA_ASYNC GLM53F_SPARSE_ASYNC GLM53F_MTNI_DECODE \
+            OMP_NUM_THREADS OMP_PROC_BIND OMP_PLACES FLIB_BARRIER XOS_MMM_L_PAGING_POLICY; do
+            printf '%s=%s\n' "$key" "${!key-}"
+        done
+    } > "$logdir/benchmark-metadata-$run_tag.txt"
+    mpi_run benchmark "$GLM53F_BIN_DIR/bench_glm53f_run_12n" "$model" "$routed" "$shared" "$@"
+    grep '^GLM53F_BENCH_' "$last_log".*.0
+    grep -q '^GLM53F_BENCH_COMPLETE .*"status":"PASS"' "$last_log".*.0 || fail 'benchmark did not complete'
+    exit
+fi
 if [ "$command" = check ]; then
-    for test in kquant native_batch prefill_config; do "$GLM53F_BIN_DIR/test_glm53f_$test"; done
+    for test in kquant native_batch prefill_config team mhc_team lookup moe_combine index_heads; do "$GLM53F_BIN_DIR/test_glm53f_$test"; done
+    for iq_mode in 0 1; do GLM53F_IQ_FAST=$iq_mode "$GLM53F_BIN_DIR/test_glm53f_iq_grouped"; done
+    mpi_run check-lookup "$GLM53F_BIN_DIR/test_glm53f_lookup_spec"
+    grep 'GLM53F_LOOKUP_SPEC PASS' "$last_log".*.0
     "$GLM53F_BIN_DIR/test_glm53f_state_io" "$logdir"
     export GLM53F_KDA_BATCH_TEAM=1 GLM53F_KDA_WIDE_TILE=1 GLM53F_KDA_PREFILL=1 GLM53F_SPARSE_BATCH_OP=1
     # The KDA exact gates compare against the sequential decode path: pin the faster (non bit-identical) prefill paths off;

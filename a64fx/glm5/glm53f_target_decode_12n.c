@@ -1,4 +1,5 @@
 /* Persistent real-weight 45-layer GLM-5.3F greedy target decode. */
+#include "glm53f_clock.h"
 #include <mpi.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -18,6 +19,7 @@
 #include "glm53f_target_head_12n.h"
 #include "glm53f_target_layer_12n.h"
 #include "glm53f_target_model_12n.h"
+#include "glm53f_team.h"
 #include "glm53f_collective_12n.h"
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -339,23 +341,23 @@ static void target_plan_ffn(glm53f_target_model_12n *m, int l) {
 }
 int glm53f_target_model_step_12n(glm53f_target_model_12n *m, int token,
         int *next_token, float *next_logit, float *target_hidden) {
-    double begin = m && m->profile ? MPI_Wtime() : 0.0;
+    double begin = m && m->profile ? glm53f_clock() : 0.0;
     if (!m || !next_token || !next_logit ||
         glm53f_embedding_streams_12n(m->embedding, token, m->streams)) return -1;
     if (target_sublayer_trace(m->streams, FLAT, "hc_init", 0)) return -1;
-    if (m->profile) m->scalar_phase[0] += MPI_Wtime() - begin;
+    if (m->profile) m->scalar_phase[0] += glm53f_clock() - begin;
     for (int l = 0; l < LAYERS; ++l) {
         const glm53f_target_layer_weights_12n *w = &m->layer_weight[l];
         if (!m->mhc_chained || !l) {
-            begin = m->profile ? MPI_Wtime() : 0.0;
+            begin = m->profile ? glm53f_clock() : 0.0;
             target_plan_attention(m, l);
             glm53f_mhc_pre_sve(&m->scratch->mhc, m->streams, &w->attention_mhc,
                                w->input_norm);
-            if (m->profile) m->scalar_phase[1] += MPI_Wtime() - begin;
+            if (m->profile) m->scalar_phase[1] += glm53f_clock() - begin;
         }
         if (target_sublayer_trace(m->scratch->mhc.normalized, HIDDEN,
                                   "attn_norm", l)) return -1;
-        begin = m->profile ? MPI_Wtime() : 0.0;
+        begin = m->profile ? glm53f_clock() : 0.0;
         int rc = m->kda[l] ?
             glm53f_kda_sublayer_12n(m->kda[l], m->scratch->sublayer_output,
                                     m->scratch->mhc.normalized) :
@@ -365,13 +367,22 @@ int glm53f_target_model_step_12n(glm53f_target_model_12n *m, int token,
         if (target_sublayer_trace(m->scratch->sublayer_output, HIDDEN,
                                   "kda_out", l)) return -1;
         if (m->profile) {
-            double elapsed = MPI_Wtime() - begin;
+            double elapsed = glm53f_clock() - begin;
             m->scalar_phase[2] += elapsed;
             m->scalar_detail[m->kda[l] ? 0 : 1] += elapsed;
         }
-        begin = m->profile ? MPI_Wtime() : 0.0;
+        begin = m->profile ? glm53f_clock() : 0.0;
         target_plan_ffn(m, l);
-        if (m->mhc_chained)
+        const int fuse_router = l >= 3 && glm53f_mhc_fast_on() == 1 &&
+            getenv("GLM53F_ROUTER_FUSE") && atoi(getenv("GLM53F_ROUTER_FUSE"));
+        if (fuse_router) {
+            glm53f_moe_stage_set_layer_12n(m->moe, l);
+            if (!m->mhc_chained)
+                glm53f_mhc_post_sve(m->streams, m->scratch->sublayer_output, &m->scratch->mhc);
+            glm53f_mhc_fast_route(m->streams, m->scratch->sublayer_output,
+                &m->scratch->mhc, &w->ffn_mhc, w->post_attention_norm,
+                m->mhc_chained, glm53f_moe_router_team_12n, m->moe);
+        } else if (m->mhc_chained)
             glm53f_mhc_post_pre_sve(m->streams, m->scratch->sublayer_output,
                                     &m->scratch->mhc, &w->ffn_mhc,
                                     w->post_attention_norm);
@@ -381,12 +392,12 @@ int glm53f_target_model_step_12n(glm53f_target_model_12n *m, int token,
             glm53f_mhc_pre_sve(&m->scratch->mhc, m->streams, &w->ffn_mhc,
                                w->post_attention_norm);
         }
-        if (m->profile) m->scalar_phase[1] += MPI_Wtime() - begin;
+        if (m->profile) m->scalar_phase[1] += glm53f_clock() - begin;
         if (target_sublayer_trace(m->streams, FLAT,
                                   "hc_attn_post", l)) return -1;
         if (target_sublayer_trace(m->scratch->mhc.normalized, HIDDEN,
                                   "ffn_norm", l)) return -1;
-        begin = m->profile ? MPI_Wtime() : 0.0;
+        begin = m->profile ? glm53f_clock() : 0.0;
         if (l < 3) {
             rc = glm53f_dense_ffn_sublayer_12n(
                 m->dense[l], m->scratch->sublayer_output,
@@ -401,11 +412,11 @@ int glm53f_target_model_step_12n(glm53f_target_model_12n *m, int token,
         if (target_sublayer_trace(m->scratch->sublayer_output, HIDDEN,
                                   "ffn_out", l)) return -1;
         if (m->profile) {
-            double elapsed = MPI_Wtime() - begin;
+            double elapsed = glm53f_clock() - begin;
             m->scalar_phase[3] += elapsed;
             m->scalar_detail[l < 3 ? 2 : 3] += elapsed;
         }
-        begin = m->profile ? MPI_Wtime() : 0.0;
+        begin = m->profile ? glm53f_clock() : 0.0;
         if (m->mhc_chained && l + 1 < LAYERS) {
             const glm53f_target_layer_weights_12n *next = &m->layer_weight[l + 1];
             target_plan_attention(m, l + 1);
@@ -416,10 +427,10 @@ int glm53f_target_model_step_12n(glm53f_target_model_12n *m, int token,
             glm53f_mhc_post_sve(m->streams, m->scratch->sublayer_output,
                                 &m->scratch->mhc);
         if (target_sublayer_trace(m->streams, FLAT, "l_last", l)) return -1;
-        if (m->profile) m->scalar_phase[1] += MPI_Wtime() - begin;
+        if (m->profile) m->scalar_phase[1] += glm53f_clock() - begin;
         if (target_layer_trace(m->streams, l)) return -1;
     }
-    begin = m->profile ? MPI_Wtime() : 0.0;
+    begin = m->profile ? glm53f_clock() : 0.0;
     if (target_hidden) {
 #pragma omp parallel for schedule(static)
         for (int i = 0; i < HIDDEN; ++i) {
@@ -434,17 +445,48 @@ int glm53f_target_model_step_12n(glm53f_target_model_12n *m, int token,
     int rc = glm53f_target_head_argmax_12n(
         m->head, m->streams, next_token, next_logit);
     if (m->profile) {
-        m->scalar_phase[4] += MPI_Wtime() - begin;
+        m->scalar_phase[4] += glm53f_clock() - begin;
         m->scalar_steps++;
     }
     return rc;
+}
+
+struct decode_sequence_call {
+    glm53f_target_model_12n *model;
+    int transitions, *ids, rc;
+    void (*observer)(void *, int);
+    void *observer_context;
+};
+static void decode_sequence_controller(void *context) {
+    struct decode_sequence_call *a = context;
+    float logit;
+    for (int t = 0; t < a->transitions; ++t) {
+        a->rc = glm53f_target_model_step_12n(a->model, a->ids[t], &a->ids[t + 1], &logit, NULL);
+        if (a->rc) break;
+        if (a->observer) a->observer(a->observer_context, t + 1);
+    }
+}
+int glm53f_target_decode_sequence_12n(glm53f_target_model_12n *m,
+        int first, int transitions, int *ids,
+        void (*observer)(void *, int), void *observer_context) {
+    if (!m || !ids || first < 0 || first >= 154880 || transitions < 1) return -1;
+    const int persistent = getenv("GLM53F_DECODE_EXECUTOR") && atoi(getenv("GLM53F_DECODE_EXECUTOR"));
+    /* Persistent native callbacks currently require the production mHC recipe.
+     * Keep unsupported diagnostic arithmetic on the explicit legacy executor. */
+    if (persistent && (!glm53f_team_run || glm53f_mhc_fast_on() != 1 || !m->mhc_chained ||
+        !getenv("GLM53F_Q2_KDA_STAGE") || !getenv("GLM53F_Q2_SPARSE_STAGE"))) return -1;
+    ids[0] = first;
+    struct decode_sequence_call call = {m, transitions, ids, 0, observer, observer_context};
+    if (persistent) glm53f_team_run(decode_sequence_controller, &call);
+    else decode_sequence_controller(&call);
+    return call.rc;
 }
 
 int glm53f_target_model_step_batch_12n(glm53f_target_model_12n *m,
                                        const int *input, int tokens, int *next,
                                        float *logit, float *hidden,
                                        glm53f_target_snapshot_12n **after) {
-    double begin = m && m->profile ? MPI_Wtime() : 0.0;
+    double begin = m && m->profile ? glm53f_clock() : 0.0;
     if (!m || !input || (!next != !logit) || tokens < 1 ||
         tokens > PREFILL_BATCH ||
         ((next || hidden || after) && tokens > VERIFY_BATCH))
@@ -464,17 +506,17 @@ int glm53f_target_model_step_batch_12n(glm53f_target_model_12n *m,
         if (glm53f_embedding_streams_12n(m->embedding, input[t],
                                          m->batch_streams + (size_t)t * FLAT))
             return -1;
-    if (m->profile) m->batch_phase[0] += MPI_Wtime() - begin;
+    if (m->profile) m->batch_phase[0] += glm53f_clock() - begin;
     size_t state_off = 0;
     for (int l = 0; l < LAYERS; l++) {
         const glm53f_target_layer_weights_12n *w = &m->layer_weight[l];
-        begin = m->profile ? MPI_Wtime() : 0.0;
+        begin = m->profile ? glm53f_clock() : 0.0;
         glm53f_mhc_pre_batch_sve(&m->batch_scratch[0].mhc, m->batch_streams,
                                  &w->attention_mhc, w->input_norm, tokens,
                                  sizeof(*m->batch_scratch),
                                  m->batch_normalized);
-        if (m->profile) m->batch_phase[1] += MPI_Wtime() - begin;
-        begin = m->profile ? MPI_Wtime() : 0.0;
+        if (m->profile) m->batch_phase[1] += glm53f_clock() - begin;
+        begin = m->profile ? glm53f_clock() : 0.0;
         if (m->kda[l]) {
             size_t bytes = glm53f_kda_state_bytes_12n(m->kda[l]);
             int wide_kda = tokens > VERIFY_BATCH &&
@@ -567,11 +609,11 @@ int glm53f_target_model_step_batch_12n(glm53f_target_model_12n *m,
                 }
         }
         if (m->profile) {
-            double elapsed = MPI_Wtime() - begin;
+            double elapsed = glm53f_clock() - begin;
             m->batch_phase[2] += elapsed;
             m->batch_detail[m->kda[l] ? 0 : 1] += elapsed;
         }
-        begin = m->profile ? MPI_Wtime() : 0.0;
+        begin = m->profile ? glm53f_clock() : 0.0;
         glm53f_mhc_post_batch_sve(m->batch_streams, m->batch_output,
                                   &m->batch_scratch[0].mhc, tokens,
                                   sizeof(m->batch_scratch[0]));
@@ -579,8 +621,8 @@ int glm53f_target_model_step_batch_12n(glm53f_target_model_12n *m,
                                  &w->ffn_mhc, w->post_attention_norm, tokens,
                                  sizeof(*m->batch_scratch),
                                  m->batch_normalized);
-        if (m->profile) m->batch_phase[1] += MPI_Wtime() - begin;
-        begin = m->profile ? MPI_Wtime() : 0.0;
+        if (m->profile) m->batch_phase[1] += glm53f_clock() - begin;
+        begin = m->profile ? glm53f_clock() : 0.0;
         if (l < 3) {
             if (tokens > VERIFY_BATCH) {
                 for (int tile = 0; tile < tokens; tile += KERNEL_BATCH) {
@@ -621,19 +663,19 @@ int glm53f_target_model_step_batch_12n(glm53f_target_model_12n *m,
         }
 batch_ffn_done:
         if (m->profile) {
-            double elapsed = MPI_Wtime() - begin;
+            double elapsed = glm53f_clock() - begin;
             m->batch_phase[3] += elapsed;
             m->batch_detail[l < 3 ? 2 : 3] += elapsed;
         }
-        begin = m->profile ? MPI_Wtime() : 0.0;
+        begin = m->profile ? glm53f_clock() : 0.0;
         glm53f_mhc_post_batch_sve(m->batch_streams, m->batch_output,
                                   &m->batch_scratch[0].mhc, tokens,
                                   sizeof(m->batch_scratch[0]));
-        if (m->profile) m->batch_phase[1] += MPI_Wtime() - begin;
+        if (m->profile) m->batch_phase[1] += glm53f_clock() - begin;
     }
     if (after && state_off != after[0]->kda_bytes)
         return -1;
-    begin = m->profile ? MPI_Wtime() : 0.0;
+    begin = m->profile ? glm53f_clock() : 0.0;
     /* Reduce all returned hidden states in one OpenMP region.  The previous
      * per-position parallel regions paid team wake-up/barrier overhead for
      * every verified token (and made the cost grow discontinuously with the
@@ -655,7 +697,7 @@ batch_ffn_done:
     int rc = next ? glm53f_target_head_argmax_batch_12n(
         m->head, m->batch_streams, tokens, next, logit) : 0;
     if (m->profile) {
-        m->batch_phase[4] += MPI_Wtime() - begin;
+        m->batch_phase[4] += glm53f_clock() - begin;
         m->batch_calls++;
         m->batch_positions += tokens;
     }
@@ -900,6 +942,99 @@ static int read_token_ids(const char *path, int **ids_out, int *count_out) {
     return 0;
 }
 
+struct target_run_call {
+    glm53f_target_model_12n *model;
+    int generate, rank, ranks, prompt_count, steps, total_steps, first_step;
+    int token, generated, window_tokens, completed_steps, decode_window, ignore_eos;
+    int *generated_ids, *prompt_ids;
+    float temperature, top_p;
+    uint64_t sample_state;
+    double prompt_elapsed, decode_elapsed, window_begin;
+    long run_minimum_kb;
+};
+static void target_run_controller(void *context) {
+    struct target_run_call *a = context;
+    glm53f_target_model_12n *model = a->model;
+    int *generated_ids = a->generated_ids, *prompt_ids = a->prompt_ids;
+    float temperature = a->temperature, top_p = a->top_p;
+    uint64_t sample_state = a->sample_state;
+    long run_minimum_kb = a->run_minimum_kb;
+    int generate = a->generate;
+    int rank = a->rank;
+    int ranks = a->ranks;
+    int prompt_count = a->prompt_count;
+    int steps = a->steps;
+    int total_steps = a->total_steps;
+    int first_step = a->first_step;
+    int decode_window = a->decode_window;
+    int ignore_eos = a->ignore_eos;
+    int token = a->token;
+    int generated = a->generated;
+    int window_tokens = a->window_tokens;
+    int completed_steps = a->completed_steps;
+    double prompt_elapsed = a->prompt_elapsed;
+    double decode_elapsed = a->decode_elapsed;
+    double window_begin = a->window_begin;
+    for(int step=first_step;step<total_steps;step++){
+        double step_begin=glm53f_clock();
+        if(generate&&step==prompt_count-1){window_begin=step_begin;glm53f_target_profile_reset_12n(model);}
+        float value;
+        int greedy_token;
+        if(glm53f_target_model_step_12n(model,token,&greedy_token,&value,NULL))MPI_Abort(MPI_COMM_WORLD,2);
+        token = target_sample_token(model, rank, ranks, temperature, top_p, &sample_state, greedy_token);
+        double step_elapsed=glm53f_clock()-step_begin;
+        if(generate&&step<prompt_count-1)prompt_elapsed+=step_elapsed;else decode_elapsed+=step_elapsed;
+        completed_steps++;
+        if (step % 32 == 31 || step + 1 == total_steps ||
+            (generate && step >= prompt_count - 1 && (token == 154820 || token == 154827 || token == 154829))) {
+            long available_kb = target_available_kb(), minimum_kb;
+            MPI_Allreduce(&available_kb, &minimum_kb, 1, MPI_LONG, MPI_MIN, MPI_COMM_WORLD);
+            if (minimum_kb < run_minimum_kb) run_minimum_kb = minimum_kb;
+            if (minimum_kb < 2L * 1024 * 1024) {
+                if (!rank) fprintf(stderr, "GLM53F_TARGET_HEADROOM step=%d min_MemAvailable_GiB=%.6f reject\n", step, minimum_kb / 1048576.0);
+                MPI_Abort(MPI_COMM_WORLD, 3);
+            }
+        }
+        if (generate && !rank && step < prompt_count - 1 && (step + 1) % 512 == 0) {
+            printf("GLM53F_TARGET_PROMPT completed=%d total=%d tok_s=%.3f\n",
+                   step + 1, prompt_count - 1, (step + 1) / prompt_elapsed);
+            fflush(stdout);
+        }
+        if (generate && step >= prompt_count - 1) {
+            if (!rank) {
+                generated_ids[generated] = token;
+            }
+            generated++;
+            window_tokens++;
+            if (window_tokens >= decode_window || (ignore_eos && generated == steps)) {
+                double now = glm53f_clock(), local_window = now - window_begin, global_window;
+                MPI_Reduce(&local_window, &global_window, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+                if (!rank) {
+                    int context_end = prompt_count + generated - 1;
+                    printf("GLM53F_TARGET_DECODE_WINDOW end=%d context_end=%d tokens=%d tok_s=%.3f\n",
+                           generated, context_end, window_tokens, window_tokens / global_window);
+                    fflush(stdout);
+                }
+                window_begin = glm53f_clock();
+                window_tokens = 0;
+            }
+        }
+        if (!generate && !rank) printf("GLM53F_TARGET_TOKEN step=%d token=%d logit=%.9g\n",step,token,value);
+        if(generate && !ignore_eos && step>=prompt_count-1 &&
+           (token==154820||token==154827||token==154829)) break;
+        if (generate && step + 1 < prompt_count) token = prompt_ids[step + 1];
+    }
+    a->token = token;
+    a->generated = generated;
+    a->window_tokens = window_tokens;
+    a->completed_steps = completed_steps;
+    a->prompt_elapsed = prompt_elapsed;
+    a->decode_elapsed = decode_elapsed;
+    a->window_begin = window_begin;
+    a->sample_state = sample_state;
+    a->run_minimum_kb = run_minimum_kb;
+ }
+
 int main(int argc, char **argv) {
     int rank, ranks, token, steps, generate = 0;
     int requested_capacity = 0, touch_cache = 0, load_only = 0, use_int8 = 0, int8_kda = 0, latent_bf16 = 0;
@@ -911,7 +1046,8 @@ int main(int argc, char **argv) {
     int *prompt_ids = NULL, *generated_ids = NULL, prompt_count = 0, generated = 0;
     const char *output_ids = NULL;
     glm53f_target_model_12n *model;
-    MPI_Init(&argc, &argv);
+    int provided;
+    MPI_Init_thread(&argc, &argv, MPI_THREAD_SERIALIZED, &provided);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &ranks);
     /* Weights are loaded by one thread; first touch would pile ~14 GiB onto the loader's CMG (8 GiB) and its
@@ -1006,7 +1142,7 @@ int main(int argc, char **argv) {
     if (generate && capacity < prompt_count + steps) capacity = prompt_count + steps;
     if(capacity<steps)MPI_Abort(MPI_COMM_WORLD,2);
     if(getenv("GLM53F_UTOFU")){const char*topo=getenv("TOFU_TOPO_PATH");if(!topo)topo="../utofu-tests/tofu_topo.txt";if(glm53f_collective_init_12n(topo,(prefill_config.mode == GLM53F_PREFILL_FAST ? 32 : 8)*HIDDEN))MPI_Abort(MPI_COMM_WORLD,2);}
-    double load_begin = MPI_Wtime();
+    double load_begin = glm53f_clock();
     model=target_model_create_with_kda(argv[1],argv[2],argv[3],capacity,int8_kda,latent_bf16);
     if(!model)MPI_Abort(MPI_COMM_WORLD,2);
     if (cp_hot_prefix && glm53f_target_model_set_cp_hot_prefix_12n(model, cp_hot_prefix))
@@ -1019,7 +1155,7 @@ int main(int argc, char **argv) {
     malloc_trim(0);
 #endif
     if (touch_cache && glm53f_target_model_touch_cache_12n(model)) MPI_Abort(MPI_COMM_WORLD, 2);
-    double local_load = MPI_Wtime() - load_begin, global_load;
+    double local_load = glm53f_clock() - load_begin, global_load;
     MPI_Reduce(&local_load, &global_load, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     if (!rank) {
         printf("GLM53F_TARGET_LOAD seconds=%.6f cp_hot_prefix=%d\n",
@@ -1042,7 +1178,7 @@ int main(int argc, char **argv) {
         return 0;
     }
     glm53f_target_profile_reset_12n(model);
-    MPI_Barrier(MPI_COMM_WORLD);double begin=MPI_Wtime(),prompt_elapsed=0.0,decode_elapsed=0.0,window_begin=begin;
+    MPI_Barrier(MPI_COMM_WORLD);double begin=glm53f_clock(),prompt_elapsed=0.0,decode_elapsed=0.0,window_begin=begin;
     int window_tokens = 0;
     int total_steps = generate ? prompt_count + steps - 1 : steps;
     int completed_steps = 0;
@@ -1056,10 +1192,10 @@ int main(int argc, char **argv) {
         for (int base = 0; base < prompt_count - 1; base += prefill_chunk) {
             int n = prompt_count - 1 - base;
             if (n > prefill_chunk) n = prefill_chunk;
-            double tile_begin = MPI_Wtime();
+            double tile_begin = glm53f_clock();
             if (glm53f_target_model_step_batch_12n(model, prompt_ids + base,
                     n, NULL, NULL, NULL, NULL)) MPI_Abort(MPI_COMM_WORLD, 2);
-            prompt_elapsed += MPI_Wtime() - tile_begin;
+            prompt_elapsed += glm53f_clock() - tile_begin;
             completed_steps += n;
             long available_kb = target_available_kb(), minimum_kb;
             MPI_Allreduce(&available_kb, &minimum_kb, 1, MPI_LONG, MPI_MIN, MPI_COMM_WORLD);
@@ -1075,57 +1211,48 @@ int main(int argc, char **argv) {
         token = prompt_ids[first_step];
         glm53f_target_profile_report_12n(model, "prefill");
     }
-    for(int step=first_step;step<total_steps;step++){
-        double step_begin=MPI_Wtime();
-        if(generate&&step==prompt_count-1){window_begin=step_begin;glm53f_target_profile_reset_12n(model);}
-        float value;
-        int greedy_token;
-        if(glm53f_target_model_step_12n(model,token,&greedy_token,&value,NULL))MPI_Abort(MPI_COMM_WORLD,2);
-        token = target_sample_token(model, rank, ranks, temperature, top_p, &sample_state, greedy_token);
-        double step_elapsed=MPI_Wtime()-step_begin;
-        if(generate&&step<prompt_count-1)prompt_elapsed+=step_elapsed;else decode_elapsed+=step_elapsed;
-        completed_steps++;
-        if (step % 32 == 31 || step + 1 == total_steps ||
-            (generate && step >= prompt_count - 1 && (token == 154820 || token == 154827 || token == 154829))) {
-            long available_kb = target_available_kb(), minimum_kb;
-            MPI_Allreduce(&available_kb, &minimum_kb, 1, MPI_LONG, MPI_MIN, MPI_COMM_WORLD);
-            if (minimum_kb < run_minimum_kb) run_minimum_kb = minimum_kb;
-            if (minimum_kb < 2L * 1024 * 1024) {
-                if (!rank) fprintf(stderr, "GLM53F_TARGET_HEADROOM step=%d min_MemAvailable_GiB=%.6f reject\n", step, minimum_kb / 1048576.0);
-                MPI_Abort(MPI_COMM_WORLD, 3);
-            }
-        }
-        if (generate && !rank && step < prompt_count - 1 && (step + 1) % 512 == 0) {
-            printf("GLM53F_TARGET_PROMPT completed=%d total=%d tok_s=%.3f\n",
-                   step + 1, prompt_count - 1, (step + 1) / prompt_elapsed);
-            fflush(stdout);
-        }
-        if (generate && step >= prompt_count - 1) {
-            if (!rank) {
-                generated_ids[generated] = token;
-            }
-            generated++;
-            window_tokens++;
-            if (window_tokens >= decode_window || (ignore_eos && generated == steps)) {
-                double now = MPI_Wtime(), local_window = now - window_begin, global_window;
-                MPI_Reduce(&local_window, &global_window, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
-                if (!rank) {
-                    int context_end = prompt_count + generated - 1;
-                    printf("GLM53F_TARGET_DECODE_WINDOW end=%d context_end=%d tokens=%d tok_s=%.3f\n",
-                           generated, context_end, window_tokens, window_tokens / global_window);
-                    fflush(stdout);
-                }
-                window_begin = MPI_Wtime();
-                window_tokens = 0;
-            }
-        }
-        if (!generate && !rank) printf("GLM53F_TARGET_TOKEN step=%d token=%d logit=%.9g\n",step,token,value);
-        if(generate && !ignore_eos && step>=prompt_count-1 &&
-           (token==154820||token==154827||token==154829)) break;
-        if (generate && step + 1 < prompt_count) token = prompt_ids[step + 1];
-    }
+    struct target_run_call call = {
+        .model = model,
+        .generate = generate,
+        .rank = rank,
+        .ranks = ranks,
+        .prompt_count = prompt_count,
+        .steps = steps,
+        .total_steps = total_steps,
+        .first_step = first_step,
+        .token = token,
+        .generated = generated,
+        .window_tokens = window_tokens,
+        .completed_steps = completed_steps,
+        .decode_window = decode_window,
+        .ignore_eos = ignore_eos,
+        .generated_ids = generated_ids,
+        .prompt_ids = prompt_ids,
+        .temperature = temperature,
+        .top_p = top_p,
+        .sample_state = sample_state,
+        .prompt_elapsed = prompt_elapsed,
+        .decode_elapsed = decode_elapsed,
+        .window_begin = window_begin,
+        .run_minimum_kb = run_minimum_kb,
+    };
+    if (getenv("GLM53F_DECODE_EXECUTOR") && atoi(getenv("GLM53F_DECODE_EXECUTOR"))) {
+        if (!glm53f_team_run || glm53f_mhc_fast_on() != 1 || !model->mhc_chained ||
+            !getenv("GLM53F_Q2_KDA_STAGE") || !getenv("GLM53F_Q2_SPARSE_STAGE"))
+            MPI_Abort(MPI_COMM_WORLD, 2);
+        glm53f_team_run(target_run_controller, &call);
+    } else target_run_controller(&call);
+    token = call.token;
+    generated = call.generated;
+    window_tokens = call.window_tokens;
+    completed_steps = call.completed_steps;
+    prompt_elapsed = call.prompt_elapsed;
+    decode_elapsed = call.decode_elapsed;
+    window_begin = call.window_begin;
+    sample_state = call.sample_state;
+    run_minimum_kb = call.run_minimum_kb;
     if (generate && window_tokens > 0) {
-        double local_window = MPI_Wtime() - window_begin, global_window;
+        double local_window = glm53f_clock() - window_begin, global_window;
         MPI_Reduce(&local_window, &global_window, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
         if (!rank) {
             int context_end = prompt_count + generated - 1;
@@ -1134,7 +1261,7 @@ int main(int argc, char **argv) {
             fflush(stdout);
         }
     }
-    double elapsed=MPI_Wtime()-begin,max_elapsed;MPI_Reduce(&elapsed,&max_elapsed,1,MPI_DOUBLE,MPI_MAX,0,MPI_COMM_WORLD);
+    double elapsed=glm53f_clock()-begin,max_elapsed;MPI_Reduce(&elapsed,&max_elapsed,1,MPI_DOUBLE,MPI_MAX,0,MPI_COMM_WORLD);
     double local_phase_seconds[2] = {prompt_elapsed, decode_elapsed}, phase_seconds[2];
     MPI_Reduce(local_phase_seconds, phase_seconds, 2, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     if(!rank){

@@ -1,3 +1,4 @@
+#include "glm53f_clock.h"
 #include <mpi.h>
 #include <math.h>
 #include <stdio.h>
@@ -116,7 +117,8 @@ int main(int argc, char **argv) {
     const char *qualify_prefix = NULL;
     int trace_compare = 0, bad_option = 0, sweep = 0, chunk_sweep = 0, scalar = 0, recipe_sweep = 0;
     int weight_format = -1; /* Omitted preserves GLM53F_PREFILL_INT8 behavior. */
-    MPI_Init(&argc, &argv);
+    int provided;
+    MPI_Init_thread(&argc, &argv, MPI_THREAD_SERIALIZED, &provided);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &ranks);
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -257,7 +259,7 @@ int main(int argc, char **argv) {
         }
         glm53f_target_profile_reset_12n(m);
         MPI_Barrier(MPI_COMM_WORLD);
-        double begin = MPI_Wtime();
+        double begin = glm53f_clock();
         long minimum_kb = LONG_MAX;
         int next_memory_sample = 0;
         for (int base = 0; base < positions; base += chunk) {
@@ -283,7 +285,7 @@ int main(int argc, char **argv) {
         long final_kb = available_kb();
         if (final_kb < minimum_kb) minimum_kb = final_kb;
         if (final_kb < 2L * 1048576) MPI_Abort(MPI_COMM_WORLD, 5);
-        double elapsed = MPI_Wtime() - begin, maximum;
+        double elapsed = glm53f_clock() - begin, maximum;
         MPI_Reduce(&elapsed, &maximum, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
         long global_minimum_kb;
         MPI_Reduce(&minimum_kb, &global_minimum_kb, 1, MPI_LONG, MPI_MIN, 0, MPI_COMM_WORLD);

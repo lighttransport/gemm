@@ -59,6 +59,8 @@ it is not an automatic first-run conversion.
 | `stage` | no | yes/reuse | no |
 | `decode [TOKEN STEPS OPTIONS...]` | no | no | scalar decode |
 | `generate PROMPT_IDS OUTPUT_IDS N [OPTIONS...]` | no | no | prompt + generation |
+| `benchmark PROMPT_IDS OUTPUT_IDS [OPTIONS...]` | no | no | resident warmup + snapshot-reset timed trials |
+| `executor-check PROMPT_IDS [N=32]` | no | no | complete legacy/persistent stream and state comparison |
 | `check` | check tools | no | kernels, components, full-model batch/rollback |
 
 Use `GLM53F_BUILD=0` to skip builds in `run` or `check`. Build before a
@@ -70,6 +72,11 @@ Options after decode/generate arguments are passed to the C runner, including
 `--capacity`, `--temperature`, `--top-p`, `--seed`, `--prefill-chunk`,
 `--prefill-mode`, `--decode-window`, `--touch-cache` and `--ignore-eos`.
 The launcher preserves the required `--generate` argument position.
+
+The opt-in persistent executor, grouped verification, lookup speculation,
+communication owner and their measurement protocol are described in
+[Strata-inspired optimization](GLM53F_STRATA.md). New paths have kernel
+validation; full-model performance qualification is still pending.
 
 For tokenization of an already rendered chat prompt:
 

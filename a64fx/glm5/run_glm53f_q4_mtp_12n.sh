@@ -2,11 +2,18 @@
 # Experimental draft/verify runner; shares the native target launch contract.
 set -euo pipefail
 fail() { echo "error: $*" >&2; exit 2; }
-if [ "$#" -lt 2 ] || [ "$#" -gt 4 ]; then
-    fail "usage: $0 PROMPT_IDS OUTPUT_IDS [cycles=128] [drafts=1]"
+if [ "$#" -lt 2 ]; then
+    fail "usage: $0 PROMPT_IDS OUTPUT_IDS [cycles=128] [drafts=1] [OPTIONS...]"
 fi
-[ -s "$1" ] || fail "missing or empty prompt IDs: $1"
-[ "$(realpath -m "$1")" != "$(realpath -m "$2")" ] || fail 'prompt and output paths must differ'
+prompt=$1 output=$2
+shift 2
+cycles=128 drafts=1
+if [ "$#" -gt 0 ] && [[ "$1" != --* ]]; then cycles=$1; shift; fi
+if [ "$#" -gt 0 ] && [[ "$1" != --* ]]; then drafts=$1; shift; fi
+[[ "$cycles" =~ ^[0-9]+$ ]] && [ "$cycles" -ge 1 ] && [ "$cycles" -le 32768 ] || fail 'cycles must be 1..32768'
+[[ "$drafts" =~ ^[0-9]+$ ]] && [ "$drafts" -ge 1 ] && [ "$drafts" -le 4 ] || fail 'drafts must be 1..4'
+[ -s "$prompt" ] || fail "missing or empty prompt IDs: $prompt"
+[ "$(realpath -m "$prompt")" != "$(realpath -m "$output")" ] || fail 'prompt and output paths must differ'
 source "$(dirname "$0")/scripts/glm53f_env.sh"
 source "$glm53f_dir/scripts/glm53f_launch.sh"
 require_allocation
@@ -34,7 +41,7 @@ export GLM53F_REPACK_REQUIRE=${GLM53F_REPACK_REQUIRE_MTP:-0}
 export GLM53F_KDA_BATCH_TEAM=${GLM53F_KDA_BATCH_TEAM:-1}
 export GLM53F_Q4_BATCH_SHARED=${GLM53F_Q4_BATCH_SHARED:-1}
 export GLM53F_SPARSE_BATCH_OP=${GLM53F_SPARSE_BATCH_OP:-0}
-export GLM53F_SPEC_PROMPT_IDS=$1 GLM53F_SPEC_OUTPUT_IDS=$2
+export GLM53F_SPEC_PROMPT_IDS=$prompt GLM53F_SPEC_OUTPUT_IDS=$output
 mpi_run speculate "${GLM53F_SPEC_BINARY:-$GLM53F_BIN_DIR/glm53f_spec_decode_12n}" \
-    "$model" "$routed" "$shared" "$mtp_routed" "$mtp_shared" 1 "${3:-128}" "${4:-1}" 0
-grep -E 'GLM53F_SPEC_(PHASE|DECODE|REFERENCE|VARIANT)' "$last_log".*.0
+    "$model" "$routed" "$shared" "$mtp_routed" "$mtp_shared" 1 "$cycles" "$drafts" 0 "$@"
+grep -E 'GLM53F_SPEC_(PHASE|DECODE|REFERENCE|VARIANT|TRIAL)' "$last_log".*.0

@@ -56,6 +56,13 @@ elif name == 'glm53f_target_decode_12n':
     if mode == 'GENERATE': print('GLM53F_TARGET_TIMING prompt_tok_s=40 decode_tok_s=30')
 elif name == 'glm53f_spec_decode_12n':
     print('GLM53F_SPEC_REFERENCE PASS')
+elif name == 'test_glm53f_lookup_spec':
+    print('GLM53F_LOOKUP_SPEC PASS cases=28')
+elif name == 'glm53f_executor_check_12n':
+    print('GLM53F_EXECUTOR_CHECK tokens=32 state=BIT_EXACT PASS')
+elif name == 'bench_glm53f_run_12n':
+    if not os.environ.get('MOCK_BENCH_INCOMPLETE'):
+        print('GLM53F_BENCH_COMPLETE {"status":"PASS"}')
 elif name == 'test_glm53f_state_io':
     if len(sys.argv) != 2 or not Path(sys.argv[1]).is_dir(): sys.exit(2)
     print('STATE_IO PASS')
@@ -87,9 +94,11 @@ class LauncherTest(unittest.TestCase):
         program.chmod(0o755)
         names = ['glm53f_target_decode_12n', 'tofu_topo_helper', 'glm53f_core_stage',
                  'glm53f_core_add_routers', 'glm53f_decode_stage']
-        names += ['test_glm53f_' + kind for kind in ('kquant', 'native_batch', 'prefill_config', 'state_io')]
+        names += ['test_glm53f_' + kind for kind in ('kquant', 'native_batch', 'prefill_config', 'state_io',
+                                                    'team', 'mhc_team', 'iq_grouped', 'lookup', 'lookup_spec', 'moe_combine', 'index_heads')]
+        names += ['bench_glm53f_run_12n']
         names += ['glm53f_' + kind for kind in ('kda_callback_check', 'dense_batch_check', 'sparse_batch_check',
-                                               'target_batch_check_12n', 'spec_decode_12n')]
+                                               'target_batch_check_12n', 'executor_check_12n', 'spec_decode_12n')]
         names += ['glm53f_q2_' + kind for kind in
                   ('stage', 'embed_stage', 'head_stage', 'dense_stage', 'sparse_stage',
                    'kda_stage', 'shexp_stage', 'core_patch', 'shared_patch')]
@@ -139,6 +148,15 @@ class LauncherTest(unittest.TestCase):
         self.assertEqual(calls[0]['native'], self.env['GLM53F_Q2_KDA_STAGE'])
         self.assertFalse(any('_stage' in c['name'] for c in self.records()))
 
+    def test_executor_check_forwards_prompt_and_bounded_steps(self):
+        result = self.run_cli('executor-check', str(self.prompt), '32')
+        self.assertEqual(result.returncode, 0, result.stdout)
+        calls = [c for c in self.records() if c['name'] == 'glm53f_executor_check_12n']
+        self.assertEqual(len(calls), 12)
+        self.assertEqual(calls[0]['args'][3], str(self.prompt))
+        self.assertEqual(calls[0]['args'][5], '32')
+        self.assertNotEqual(self.run_cli('executor-check', str(self.prompt), '513').returncode, 0)
+
     def test_generate_paths_and_option_order(self):
         output = str(self.root / 'output with spaces.ids')
         result = self.run_cli('generate', str(self.prompt), output, '2', '--prefill-chunk', '32')
@@ -156,6 +174,30 @@ class LauncherTest(unittest.TestCase):
         self.assertNotEqual(self.run_cli('decode', GLM53F_BIN_DIR='/local/missing-bin').returncode, 0)
         self.assertNotEqual(self.run_cli('decode', GLM53F_RUN_TAG='../escape').returncode, 0)
         self.assertFalse(self.records())
+
+    def test_benchmark_records_inputs_and_forwards_runtime_options(self):
+        output = str(self.root / 'benchmark with spaces.ids')
+        result = self.run_cli('benchmark', str(self.prompt), output, '--transitions', '256',
+                              '--decode-executor', 'persistent', SECRET_DO_NOT_LOG='private-value')
+        self.assertEqual(result.returncode, 0, result.stdout)
+        calls = [c for c in self.records() if c['name'] == 'bench_glm53f_run_12n']
+        self.assertEqual(len(calls), 12)
+        self.assertEqual(calls[0]['args'][3:], [str(self.prompt), output, '--transitions', '256',
+                                              '--decode-executor', 'persistent'])
+        files = list(Path(self.env['GLM53F_LOG_DIR']).glob('benchmark-metadata-*'))
+        self.assertEqual(len(files), 1)
+        metadata = files[0].read_text()
+        self.assertIn('OMP_NUM_THREADS=47', metadata)
+        self.assertNotIn('private-value', metadata)
+
+    def test_benchmark_rejects_existing_output_and_incomplete_run(self):
+        output = self.root / 'existing.ids'
+        output.write_text('preserve\n')
+        self.assertNotEqual(self.run_cli('benchmark', str(self.prompt), str(output)).returncode, 0)
+        self.assertEqual(output.read_text(), 'preserve\n')
+        self.assertFalse(self.records())
+        result = self.run_cli('benchmark', str(self.prompt), str(self.root / 'new.ids'), MOCK_BENCH_INCOMPLETE='1')
+        self.assertNotEqual(result.returncode, 0)
 
     def test_missing_rank_manifest_prevents_loading(self):
         (Path(self.env['GLM53F_Q2_KDA_STAGE']) / 'rank07.manifest').unlink()
@@ -189,6 +231,17 @@ class LauncherTest(unittest.TestCase):
         call = next(c for c in self.records() if c['name'] == 'glm53f_spec_decode_12n')
         self.assertEqual(call['native'], self.env['GLM53F_Q2_KDA_STAGE'])
         self.assertEqual(call['args'][2], self.env['GLM53F_GGUF_SHARED_STAGE'])
+
+    def test_mtp_forwards_resident_trial_options(self):
+        result = subprocess.run(['bash', str(MODULE / 'run_glm53f_q4_mtp_12n.sh'),
+                                 str(self.prompt), str(self.root / 'mtp.ids'), '128', '4',
+                                 '--repetitions', '3', '--draft-sweep', '--ignore-eos', '--verify-kernel', 'grouped'],
+                                cwd=str(REPO), env=self.env, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, universal_newlines=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        call = next(c for c in self.records() if c['name'] == 'glm53f_spec_decode_12n')
+        self.assertEqual(call['args'][5:], ['1', '128', '4', '0', '--repetitions', '3',
+                                           '--draft-sweep', '--ignore-eos', '--verify-kernel', 'grouped'])
 
     def test_mtp_stage_reads_checkpoint_without_target_repack(self):
         result = subprocess.run(['bash', str(MODULE / 'run_glm53f_mtp_stage_12n.sh')],

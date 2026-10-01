@@ -40,11 +40,14 @@ int main(int argc, char **argv) {
         glm53f_target_model_configure_prefill_12n(m,&config)) MPI_Abort(MPI_COMM_WORLD,2);
     glm53f_target_snapshot_12n *initial = glm53f_target_snapshot_create_12n(m);
     glm53f_target_snapshot_12n *seq_final = glm53f_target_snapshot_create_12n(m);
-    glm53f_target_snapshot_12n *after[TOKENS];
-    for (int t = 0; t < TOKENS; t++) after[t] = glm53f_target_snapshot_create_12n(m);
+    glm53f_target_snapshot_12n *after[TOKENS], *seq_after[TOKENS];
+    for (int t = 0; t < TOKENS; t++) {
+        after[t] = glm53f_target_snapshot_create_12n(m);
+        seq_after[t] = glm53f_target_snapshot_create_12n(m);
+    }
     if (!m || !initial || !seq_final) MPI_Abort(MPI_COMM_WORLD, 2);
     for (int t = 0; t < TOKENS; t++)
-        if (!after[t]) MPI_Abort(MPI_COMM_WORLD, 2);
+        if (!after[t] || !seq_after[t]) MPI_Abort(MPI_COMM_WORLD, 2);
     local_ok &= !glm53f_target_snapshot_save_12n(m, initial);
     /* Rejected requests must not inspect the deliberately five-element input
      * or advance state. Larger prompt-only tiles have no verification outputs. */
@@ -60,9 +63,11 @@ int main(int argc, char **argv) {
     local_ok &= glm53f_target_model_readout_12n(m, &probe_bat, &probe_bat_logit) != 0;
     MPI_Barrier(MPI_COMM_WORLD);
     double t0 = MPI_Wtime();
-    for (int t = 0; t < TOKENS; t++)
+    for (int t = 0; t < TOKENS; t++) {
         local_ok &= !glm53f_target_model_step_12n(
             m, input[t], &seq[t], &seq_logit[t], NULL);
+        local_ok &= !glm53f_target_snapshot_save_12n(m, seq_after[t]);
+    }
     double seq_sec = MPI_Wtime() - t0;
     local_ok &= !glm53f_target_snapshot_save_12n(m, seq_final);
     local_ok &= !glm53f_target_snapshot_restore_12n(m, initial);
@@ -86,6 +91,16 @@ int main(int argc, char **argv) {
     local_ok &= probe_seq == probe_bat;
     local_ok &= fabsf(probe_seq_logit - probe_bat_logit) <=
                 2e-5f * fmaxf(1.0f, fabsf(probe_seq_logit));
+    /* Every accepted-prefix length must resume like scalar execution, including
+     * immediate rejection and the full accepted window. */
+    for (int t = 0; t < TOKENS; ++t) {
+        local_ok &= !glm53f_target_snapshot_restore_12n(m, seq_after[t]);
+        local_ok &= !glm53f_target_model_step_12n(m, 1618, &probe_seq, &probe_seq_logit, NULL);
+        local_ok &= !glm53f_target_snapshot_restore_12n(m, after[t]);
+        local_ok &= !glm53f_target_model_step_12n(m, 1618, &probe_bat, &probe_bat_logit, NULL);
+        local_ok &= probe_seq == probe_bat && fabsf(probe_seq_logit - probe_bat_logit) <=
+                    2e-5f * fmaxf(1.0f, fabsf(probe_seq_logit));
+    }
     MPI_Allreduce(&local_ok, &ok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
     double seq_max, bat_max;
     MPI_Reduce(&seq_sec, &seq_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
@@ -139,7 +154,7 @@ int main(int argc, char **argv) {
             scalar_token, batch_token, scalar_logit, batch_logit, probe_seq, probe_bat,
             probe_seq_logit, probe_bat_logit, wide_ok ? "PASS" : "FAIL");
     }
-    for (int t = 0; t < TOKENS; t++) glm53f_target_snapshot_free_12n(after[t]);
+    for (int t = 0; t < TOKENS; t++) { glm53f_target_snapshot_free_12n(after[t]); glm53f_target_snapshot_free_12n(seq_after[t]); }
     glm53f_target_snapshot_free_12n(seq_final);
     glm53f_target_snapshot_free_12n(initial);
     glm53f_target_profile_report_12n(m, "batch_check");

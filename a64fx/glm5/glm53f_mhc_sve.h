@@ -26,6 +26,7 @@ static inline int glm53f_mhc_detail_on(void) {
     return glm53f_mhc_detail;
 }
 #include "glm53f_prefill.h"
+#include "glm53f_team.h"
 #include "glm53f_pf_plan.h"
 #include "../../common/glm53f_ref.h"
 
@@ -119,10 +120,9 @@ static inline int glm53f_mhc_fast_on(void) {
     if (glm53f_mhc_fast_mode < 0) glm53f_mhc_fast_mode = getenv("GLM53F_MHC_FAST") ? atoi(getenv("GLM53F_MHC_FAST")) : 1;
     return glm53f_mhc_fast_mode;
 }
-static inline void glm53f_mhc_fast(float *streams, const float *sublayer, glm53f_mhc_scratch *scratch,
-        const glm53f_mhc_site *site, const uint16_t *norm, int do_post) {
-    float logits[GLM53F_MHC_MIX];
-#pragma omp parallel shared(logits)
+static inline void glm53f_mhc_fast_team(float *streams, const float *sublayer, glm53f_mhc_scratch *scratch,
+        const glm53f_mhc_site *site, const uint16_t *norm, int do_post, float *logits,
+        void (*after_normalize)(void *, const float *), void *context) {
     {
         const int tid = omp_get_thread_num(), nt = omp_get_num_threads();
         if (nt > 128) abort();
@@ -192,7 +192,45 @@ static inline void glm53f_mhc_fast(float *streams, const float *sublayer, glm53f
             for (int d = lo; d < hi; ++d)
                 scratch->normalized[d] = scratch->collapsed[d] * inv2 * glm53f_bf16_to_f32(norm[d]);
         }
+        if (after_normalize) {
+#pragma omp barrier
+            after_normalize(context, scratch->normalized);
+        }
     }
+}
+
+typedef struct {
+    float *streams;
+    const float *sublayer;
+    glm53f_mhc_scratch *scratch;
+    const glm53f_mhc_site *site;
+    const uint16_t *norm;
+    int do_post;
+    float logits[GLM53F_MHC_MIX];
+    void (*after_normalize)(void *, const float *);
+    void *context;
+} glm53f_mhc_call;
+static void glm53f_mhc_worker(void *context) {
+    glm53f_mhc_call *a = context;
+    glm53f_mhc_fast_team(a->streams, a->sublayer, a->scratch, a->site, a->norm,
+        a->do_post, a->logits, a->after_normalize, a->context);
+}
+static inline void glm53f_mhc_fast_route(float *streams, const float *sublayer,
+        glm53f_mhc_scratch *scratch, const glm53f_mhc_site *site,
+        const uint16_t *norm, int do_post,
+        void (*after_normalize)(void *, const float *), void *context) {
+    glm53f_mhc_call call = {streams, sublayer, scratch, site, norm, do_post,
+                           {0}, after_normalize, context};
+    if (glm53f_team_available()) glm53f_team_dispatch(glm53f_mhc_worker, &call);
+    else {
+#pragma omp parallel
+        { glm53f_mhc_worker(&call); }
+    }
+}
+static inline void glm53f_mhc_fast(float *streams, const float *sublayer,
+        glm53f_mhc_scratch *scratch, const glm53f_mhc_site *site,
+        const uint16_t *norm, int do_post) {
+    glm53f_mhc_fast_route(streams, sublayer, scratch, site, norm, do_post, NULL, NULL);
 }
 
 /* Variant with distributed mixing dots (GLM53F_MHC_FAST=2): every thread computes the 24 partial dot products over the
@@ -473,10 +511,13 @@ static inline void glm53f_mhc_pre_batch_sve(
         for(int d=0;d<GLM53F_MHC_WIDTH;d++){float v=0;for(int k=0;k<GLM53F_MHC_STREAMS;k++)v+=z[k]*s[(size_t)k*GLM53F_MHC_WIDTH+d];q->collapsed[d]=v;}memcpy(q->residual,s,sizeof(q->residual));glm53f_rmsnorm_bf16(q->normalized,q->collapsed,norm,GLM53F_MHC_WIDTH,1e-5f);memcpy(normalized+(size_t)t*GLM53F_MHC_WIDTH,q->normalized,GLM53F_MHC_WIDTH*4);}
 }
 
-static inline void glm53f_mhc_post_sve(
-        float *streams, const float *sublayer, const glm53f_mhc_scratch *scratch) {
-    const double dt0 = glm53f_mhc_detail_on() ? glm53f_mhc_now() : 0.0;
-#pragma omp parallel for collapse(2) schedule(static)
+typedef struct { float *streams; const float *sublayer; const glm53f_mhc_scratch *scratch; } glm53f_mhc_post_call;
+static void glm53f_mhc_post_worker(void *context) {
+    glm53f_mhc_post_call *a = context;
+    float *streams = a->streams;
+    const float *sublayer = a->sublayer;
+    const glm53f_mhc_scratch *scratch = a->scratch;
+#pragma omp for collapse(2) schedule(static)
         for (int k = 0; k < GLM53F_MHC_STREAMS; ++k)
         for (int d = 0; d < GLM53F_MHC_WIDTH; ++d) {
 #if GLM53F_MHC_POST_FLOAT
@@ -492,6 +533,16 @@ static inline void glm53f_mhc_post_sve(
 #endif
             streams[(size_t)k * GLM53F_MHC_WIDTH + d] = (float)v;
         }
+ }
+static inline void glm53f_mhc_post_sve(
+        float *streams, const float *sublayer, const glm53f_mhc_scratch *scratch) {
+    const double dt0 = glm53f_mhc_detail_on() ? glm53f_mhc_now() : 0.0;
+    glm53f_mhc_post_call call = {streams, sublayer, scratch};
+    if (glm53f_team_available()) glm53f_team_dispatch(glm53f_mhc_post_worker, &call);
+    else {
+#pragma omp parallel
+        { glm53f_mhc_post_worker(&call); }
+    }
     if (glm53f_mhc_detail_on()) { glm53f_mhc_acc[5] += glm53f_mhc_now() - dt0; glm53f_mhc_calls[1]++; }
 }
 

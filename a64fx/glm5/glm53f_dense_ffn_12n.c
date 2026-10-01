@@ -18,6 +18,7 @@
 #include "glm53f_dense_ffn_12n.h"
 #include "glm53f_collective_12n.h"
 #include "glm53f_iq_bridge.h"
+#include "glm53f_team.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
@@ -138,10 +139,21 @@ glm53f_dense_ffn_context_12n*glm53f_dense_ffn_create_12n(const char*model,int la
     glm53f_st_close(st);st=NULL;}c->gv=a256(in*4);c->uv=a256(in*4);c->act=a256(in*4);c->part=a256(H*4);c->bgv=a256((size_t)4*in*4);c->buv=a256((size_t)4*in*4);c->bact=a256((size_t)4*in*4);c->bpart=a256((size_t)4*H*4);return c;
 fail:if(st)glm53f_st_close(st);glm53f_dense_ffn_free_12n(c);return NULL;}
 void glm53f_dense_ffn_free_12n(glm53f_dense_ffn_context_12n*c){if(!c)return;free(c->bpart);free(c->bact);free(c->buv);free(c->bgv);free(c->part);free(c->act);free(c->uv);free(c->gv);free(c->ds);free(c->d);free(c->us);free(c->gs);free(c->u);free(c->g);free(c);}
+static void dense_activation_worker(void *context) {
+    glm53f_dense_ffn_context_12n *c = context;
+#pragma omp for schedule(static)
+    for (int j = 0; j < c->in; ++j) {
+        float a = c->gv[j] > 10 ? 10 : c->gv[j], b = c->uv[j] > 10 ? 10 : c->uv[j] < -10 ? -10 : c->uv[j];
+        c->act[j] = a / (1 + expf(-a)) * b;
+    }
+}
 int glm53f_dense_ffn_sublayer_12n(void*context,float*out,const float*x){glm53f_dense_ffn_context_12n*c=context;if(!c)return-1;
     if(c->q2){if(glm53f_iq_matvec_2(c->gv,c->g,c->gtype,c->uv,c->u,c->utype,c->in,H,x))return-1;
-#pragma omp parallel for schedule(static)
-        for(int j=0;j<c->in;j++){float a=c->gv[j]>10?10:c->gv[j],b=c->uv[j]>10?10:c->uv[j]<-10?-10:c->uv[j];c->act[j]=a/(1+expf(-a))*b;}
+        if (glm53f_team_available()) glm53f_team_dispatch(dense_activation_worker, c);
+        else {
+#pragma omp parallel
+            { dense_activation_worker(c); }
+        }
         if(glm53f_iq_matvec(c->part,c->d,c->dtype,H,c->in,c->act))return-1;
         return glm53f_sum_allreduce_12n(c->part,out,H);}
     /* Gate and up projections have identical shape and input.  Run them in

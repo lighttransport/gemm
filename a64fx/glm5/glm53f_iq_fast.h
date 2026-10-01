@@ -84,6 +84,28 @@ static inline void iqf_init(void) {
     }
 }
 
+/* Arithmetic shared by scalar and paired rows; each token retains its lane
+ * accumulation order while weight unpacking is shared across the pair. */
+static inline __attribute__((always_inline)) svfloat32_t iqf_accumulate(
+        svfloat32_t acc, const iqf_act *ab, float dd, float dm,
+        svuint32_t sc, svuint32_t mn, svuint8_t l0, svuint8_t h0,
+        svuint8_t l1, svuint8_t h1, svbool_t p32, svbool_t p8,
+        svbool_t pg8, svuint32_t t0, svuint32_t t1,
+        svuint32_t t2, svuint32_t t3) {
+    const svint32_t z = svdup_n_s32(0);
+    const svint32_t d0 = svdot_s32(z, svreinterpret_s8_u8(l0), svld1_s8(p8, ab->v[0]));
+    const svint32_t d1 = svdot_s32(z, svreinterpret_s8_u8(h0), svld1_s8(p8, ab->v[1]));
+    const svint32_t d2 = svdot_s32(z, svreinterpret_s8_u8(l1), svld1_s8(p8, ab->v[2]));
+    const svint32_t d3 = svdot_s32(z, svreinterpret_s8_u8(h1), svld1_s8(p8, ab->v[3]));
+    svint32_t dots = svmul_s32_x(p32, d0, svreinterpret_s32_u32(svtbl_u32(sc, t0)));
+    dots = svmla_s32_x(p32, dots, d1, svreinterpret_s32_u32(svtbl_u32(sc, t1)));
+    dots = svmla_s32_x(p32, dots, d2, svreinterpret_s32_u32(svtbl_u32(sc, t2)));
+    dots = svmla_s32_x(p32, dots, d3, svreinterpret_s32_u32(svtbl_u32(sc, t3)));
+    const svint32_t msum = svmul_s32_z(pg8, svreinterpret_s32_u32(mn), svld1_s32(pg8, ab->s));
+    acc = svmla_n_f32_x(p32, acc, svcvt_f32_s32_x(p32, msum), -ab->d * dm);
+    return svmla_n_f32_x(p32, acc, svcvt_f32_s32_x(p32, dots), ab->d * dd);
+}
+
 static inline __attribute__((always_inline)) svfloat32_t iqf_block(svfloat32_t acc, const uint8_t *blk, const iqf_act *ab, int q5,
     svbool_t p32, svbool_t p8, svbool_t pg8, svbool_t pb32,
     svuint32_t iA, svuint32_t iB, svuint32_t iC, svuint32_t iD, svuint32_t mA, svuint32_t mH, svuint32_t mC, svuint32_t sC,
@@ -107,21 +129,38 @@ static inline __attribute__((always_inline)) svfloat32_t iqf_block(svfloat32_t a
         l1 = svadd_u8_x(p8, l1, svlsl_n_u8_x(p8, svand_n_u8_x(p8, svlsr_u8_x(p8, hv, vs2), 1), 4));
         h1 = svadd_u8_x(p8, h1, svlsl_n_u8_x(p8, svand_n_u8_x(p8, svlsr_u8_x(p8, hv, vs3), 1), 4));
     }
-    const svint32_t z = svdup_n_s32(0);
-    const svint32_t d0 = svdot_s32(z, svreinterpret_s8_u8(l0), svld1_s8(p8, ab->v[0]));
-    const svint32_t d1 = svdot_s32(z, svreinterpret_s8_u8(h0), svld1_s8(p8, ab->v[1]));
-    const svint32_t d2 = svdot_s32(z, svreinterpret_s8_u8(l1), svld1_s8(p8, ab->v[2]));
-    const svint32_t d3 = svdot_s32(z, svreinterpret_s8_u8(h1), svld1_s8(p8, ab->v[3]));
-    svint32_t dots = svmul_s32_x(p32, d0, svreinterpret_s32_u32(svtbl_u32(sc, t0)));
-    dots = svmla_s32_x(p32, dots, d1, svreinterpret_s32_u32(svtbl_u32(sc, t1)));
-    dots = svmla_s32_x(p32, dots, d2, svreinterpret_s32_u32(svtbl_u32(sc, t2)));
-    dots = svmla_s32_x(p32, dots, d3, svreinterpret_s32_u32(svtbl_u32(sc, t3)));
-    const svint32_t msum = svmul_s32_z(pg8, svreinterpret_s32_u32(mn), svld1_s32(pg8, ab->s));
-    acc = svmla_n_f32_x(p32, acc, svcvt_f32_s32_x(p32, msum), -ab->d * dm);
-    return svmla_n_f32_x(p32, acc, svcvt_f32_s32_x(p32, dots), ab->d * dd);
+    return iqf_accumulate(acc, ab, dd, dm, sc, mn, l0, h0, l1, h1, p32, p8, pg8, t0, t1, t2, t3);
+}
+
+static inline __attribute__((always_inline)) svfloat32_t iqf_block_pair(svfloat32_t acc, svfloat32_t *other, const uint8_t *blk, const iqf_act *ab, const iqf_act *ab1, int q5,
+    svbool_t p32, svbool_t p8, svbool_t pg8, svbool_t pb32,
+    svuint32_t iA, svuint32_t iB, svuint32_t iC, svuint32_t iD, svuint32_t mA, svuint32_t mH, svuint32_t mC, svuint32_t sC,
+    svuint32_t t0, svuint32_t t1, svuint32_t t2, svuint32_t t3, svuint8_t vrep, svuint8_t vs0, svuint8_t vs1, svuint8_t vs2, svuint8_t vs3) {
+    __builtin_prefetch(blk + IQF_PF_BYTES, 0, IQF_PF_LVL);
+    const float dd = (float)*(const __fp16 *)blk, dm = (float)*(const __fp16 *)(blk + 2);
+    const svuint32_t Q = svld1ub_u32(p32, blk + 4);
+    const svuint32_t va = svtbl_u32(Q, iA), vb = svtbl_u32(Q, iB), vc = svtbl_u32(Q, iC), vd = svtbl_u32(Q, iD);
+    const svuint32_t sc = svorr_u32_x(p32, svand_u32_x(p32, va, mA),
+                                      svlsr_n_u32_x(p32, svand_u32_x(p32, vb, mH), 2));
+    const svuint32_t mn = svorr_u32_x(p32, svlsr_u32_x(p32, svand_u32_x(p32, vc, mC), sC),
+                                      svlsr_n_u32_x(p32, svand_u32_x(p32, vd, mH), 2));
+    const uint8_t *qs = blk + (q5 ? 48 : 16);
+    const svuint8_t qa = svld1_u8(p8, qs), qb = svld1_u8(p8, qs + 64);
+    svuint8_t l0 = svand_n_u8_x(p8, qa, 15), h0 = svlsr_n_u8_x(p8, qa, 4);
+    svuint8_t l1 = svand_n_u8_x(p8, qb, 15), h1 = svlsr_n_u8_x(p8, qb, 4);
+    if (q5) {
+        const svuint8_t hv = svtbl_u8(svld1_u8(pb32, blk + 16), vrep);
+        l0 = svadd_u8_x(p8, l0, svlsl_n_u8_x(p8, svand_n_u8_x(p8, svlsr_u8_x(p8, hv, vs0), 1), 4));
+        h0 = svadd_u8_x(p8, h0, svlsl_n_u8_x(p8, svand_n_u8_x(p8, svlsr_u8_x(p8, hv, vs1), 1), 4));
+        l1 = svadd_u8_x(p8, l1, svlsl_n_u8_x(p8, svand_n_u8_x(p8, svlsr_u8_x(p8, hv, vs2), 1), 4));
+        h1 = svadd_u8_x(p8, h1, svlsl_n_u8_x(p8, svand_n_u8_x(p8, svlsr_u8_x(p8, hv, vs3), 1), 4));
+    }
+    *other = iqf_accumulate(*other, ab1, dd, dm, sc, mn, l0, h0, l1, h1, p32, p8, pg8, t0, t1, t2, t3);
+    return iqf_accumulate(acc, ab, dd, dm, sc, mn, l0, h0, l1, h1, p32, p8, pg8, t0, t1, t2, t3);
 }
 
 #define IQF_CALL(acc, blk, ab) iqf_block(acc, blk, ab, q5, iqf_p32, iqf_p8, iqf_pg8, iqf_pb32, k_iA, k_iB, k_iC, k_iD, k_mA, k_mH, k_mC, k_sC, k_t0, k_t1, k_t2, k_t3, k_vrep, k_vs0, k_vs1, k_vs2, k_vs3)
+#define IQF_CALL_PAIR(acc, other, blk, ab, ab1) iqf_block_pair(acc, other, blk, ab, ab1, q5, iqf_p32, iqf_p8, iqf_pg8, iqf_pb32, k_iA, k_iB, k_iC, k_iD, k_mA, k_mH, k_mC, k_sC, k_t0, k_t1, k_t2, k_t3, k_vrep, k_vs0, k_vs1, k_vs2, k_vs3)
 
 /* out[i] = dot(row0 + i*rb, activation) for i in [0, nrows).  q5 = 0: Q4_K (144 B/block), 1: Q5_K (176 B/block).
  * Two rows are interleaved so the TBL/SDOT latency chains of one row hide behind the other. iqf_init() must
@@ -163,6 +202,48 @@ static inline void iqf_rows(float *out, const uint8_t *row0, size_t rb, int nrow
         svfloat32_t acc = svdup_f32(0.0f);
         for (int b = 0; b < blocks; ++b) acc = IQF_CALL(acc, row + (size_t)b * bsz, a + b);
         out[r] = svaddv_f32(iqf_p32, acc);
+    }
+}
+
+/* The four-row reduction is the scalar kernel's tree, including ragged
+ * tails. It is used separately for each position of a paired down projection. */
+static inline void iqf_reduce_four(float *out, svfloat32_t a0,
+        svfloat32_t a1, svfloat32_t a2, svfloat32_t a3) {
+    const svbool_t pg = svptrue_b32();
+    svfloat32_t t01 = svadd_f32_x(pg, svuzp1_f32(a0, a1), svuzp2_f32(a0, a1));
+    svfloat32_t t23 = svadd_f32_x(pg, svuzp1_f32(a2, a3), svuzp2_f32(a2, a3));
+    svfloat32_t u = svadd_f32_x(pg, svuzp1_f32(t01, t23), svuzp2_f32(t01, t23));
+    u = svadd_f32_x(pg, svuzp1_f32(u, u), svuzp2_f32(u, u));
+    u = svadd_f32_x(pg, svuzp1_f32(u, u), svuzp2_f32(u, u));
+    float tmp[16];
+    svst1_f32(pg, tmp, u);
+    memcpy(out, tmp, 4 * sizeof(float));
+}
+static inline void iqf_rows_pair(float *out0, float *out1,
+        const uint8_t *row0, size_t rb, int nrows,
+        const iqf_act *a, const iqf_act *a1, int blocks, int q5) {
+    IQF_DECL_K
+    const size_t bsz = q5 ? 176 : 144;
+    int r = 0;
+    if (blocks == 1) {
+        for (; r + 3 < nrows; r += 4) {
+            const uint8_t *w = row0 + (size_t)r * rb;
+            svfloat32_t b0 = svdup_f32(0), b1 = b0, b2 = b0, b3 = b0;
+            svfloat32_t a0 = IQF_CALL_PAIR(svdup_f32(0), &b0, w, a, a1);
+            svfloat32_t a2 = IQF_CALL_PAIR(svdup_f32(0), &b2, w + 2 * rb, a, a1);
+            svfloat32_t aa1 = IQF_CALL_PAIR(svdup_f32(0), &b1, w + rb, a, a1);
+            svfloat32_t a3 = IQF_CALL_PAIR(svdup_f32(0), &b3, w + 3 * rb, a, a1);
+            iqf_reduce_four(out0 + r, a0, aa1, a2, a3);
+            iqf_reduce_four(out1 + r, b0, b1, b2, b3);
+        }
+    }
+    for (; r < nrows; ++r) {
+        const uint8_t *w = row0 + (size_t)r * rb;
+        svfloat32_t acc = svdup_f32(0), other = acc;
+        for (int b = 0; b < blocks; ++b)
+            acc = IQF_CALL_PAIR(acc, &other, w + (size_t)b * bsz, a + b, a1 + b);
+        out0[r] = svaddv_f32(iqf_p32, acc);
+        out1[r] = svaddv_f32(iqf_p32, other);
     }
 }
 

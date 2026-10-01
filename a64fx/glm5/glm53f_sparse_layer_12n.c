@@ -15,6 +15,8 @@
 #include "glm53f_q80_panel64.h"
 #include "glm53f_state_io.h"
 #include "glm53f_iq_bridge.h"
+#include "glm53f_team.h"
+#include "glm53f_clock.h"
 #define GLM53F_CP_BF16_LATENT 1
 #include <errno.h>
 #include <inttypes.h>
@@ -230,7 +232,7 @@ void glm53f_sparse_configure_prefill_12n(glm53f_sparse_context_12n *c,
 }
 
 static double sparse_clock(const glm53f_sparse_context_12n *c) {
-    return c->profile ? MPI_Wtime() : 0.0;
+    return c->profile ? glm53f_clock() : 0.0;
 }
 void glm53f_sparse_profile_add_12n(const glm53f_sparse_context_12n *c,
                                   double *seconds) {
@@ -423,42 +425,84 @@ size_t glm53f_sparse_cache_bytes_12n(const glm53f_sparse_context_12n *c) {
 }
 static void update_completed_pool(glm53f_sparse_context_12n*c,int pool){float*pk=c->pool+(size_t)pool*ID;for(int d=0;d<ID;d++){float mx=-INFINITY,den=0,val=0;for(int z=0;z<KPOOL;z++){float a=c->gcache[(size_t)(pool*KPOOL+z)*ID+d]+c->apef[(size_t)z*ID+d];if(a>mx)mx=a;}for(int z=0;z<KPOOL;z++){float a=expf(c->gcache[(size_t)(pool*KPOOL+z)*ID+d]+c->apef[(size_t)z*ID+d]-mx);den+=a;val+=a*c->key[(size_t)(pool*KPOOL+z)*ID+d];}pk[d]=val/den;}}
 static int sp_ar(const float *in, float *out, int n);
-static int select_incremental(glm53f_sparse_context_12n*c,int tokens){int np=tokens/KPOOL,nc=TOPK/KPOOL,out=0;if(nc>np)nc=np;
-    if(tokens<=TOPK+KPOOL-1){
-#pragma omp parallel for schedule(static)
-        for(int p=0;p<np;p++){float s=0;const float*pk=c->pool+(size_t)p*ID;for(int h=0;h<IH;h++){double dot=0;for(int d=0;d<ID;d++)dot+=(double)c->iq[(size_t)h*ID+d]*pk[d];if(dot>0)s+=c->iw[h]*(float)(dot/sqrt((double)ID))/sqrtf((float)IH);}c->pool_score_cache[p]=(pool_score){s,p};}
-        qsort(c->pool_score_cache,np,sizeof(pool_score),pool_cmp);goto expand;
+struct pool_score_call { glm53f_sparse_context_12n *c; int tokens, np; };
+static int index_heads_enabled(void) {
+    const char *e = getenv("GLM53F_INDEX_HEADS");
+    return e && atoi(e) && !glm53f_sparse_scalar_reference;
+}
+static void pool_score_worker(void *context) {
+    struct pool_score_call *a = context;
+    glm53f_sparse_context_12n *c = a->c;
+    const int heads = index_heads_enabled();
+    if (a->tokens <= TOPK + KPOOL - 1) {
+#pragma omp for schedule(static)
+        for (int p = 0; p < a->np; ++p) {
+            float score = 0;
+            const float *pk = c->pool + (size_t)p * ID;
+            for (int h = 0; h < IH; ++h) {
+                double dot = 0;
+                for (int d = 0; d < ID; ++d) dot += (double)c->iq[(size_t)h * ID + d] * pk[d];
+                if (dot > 0) score += c->iw[h] * (float)(dot / sqrt((double)ID)) / sqrtf((float)IH);
+            }
+            c->pool_score_cache[p] = (pool_score){score, p};
+        }
+    } else {
+#pragma omp for schedule(static)
+        for (int p = 0; p < a->np; ++p) {
+            float score = 0;
+            if (p % c->ranks == c->rank) {
+                const float *pk = c->pool + (size_t)p * ID;
+                if (heads) score = glm53f_index_score_f32_heads(c->iq, c->iw, pk);
+                else {
+                    for (int h = 0; h < IH; ++h) {
+                        float dot = f32dot(c->iq + (size_t)h * ID, pk, ID);
+                        if (dot > 0) score += c->iw[h] * dot / sqrtf((float)(ID * IH));
+                    }
+                }
+            }
+            c->pool_score_local[p] = score;
+        }
     }
-#pragma omp parallel for schedule(static)
-    for(int p=0;p<np;p++){float s=0;if(p%c->ranks==c->rank){const float*pk=c->pool+(size_t)p*ID;for(int h=0;h<IH;h++){float dot=f32dot(c->iq+(size_t)h*ID,pk,ID);if(dot>0)s+=c->iw[h]*dot/sqrtf((float)(ID*IH));}}c->pool_score_local[p]=s;}
-    if(sp_ar(c->pool_score_local,c->pool_score_global,np))return-1;
-    pool_top_exact(c->pool_score_cache,c->pool_score_global,np,nc);
-expand: for(int i=0;i<nc;i++)for(int z=0;z<KPOOL;z++)c->selected[out++]=c->pool_score_cache[i].id*KPOOL+z;for(int z=np*KPOOL;z<tokens;z++)c->selected[out++]=z;return out;}
+}
+static int select_incremental(glm53f_sparse_context_12n *c, int tokens) {
+    int np = tokens / KPOOL, nc = TOPK / KPOOL, out = 0;
+    if (nc > np) nc = np;
+    struct pool_score_call call = {c, tokens, np};
+    if (glm53f_team_available()) glm53f_team_dispatch(pool_score_worker, &call);
+    else {
+#pragma omp parallel
+        { pool_score_worker(&call); }
+    }
+    if (tokens <= TOPK + KPOOL - 1) qsort(c->pool_score_cache, np, sizeof(pool_score), pool_cmp);
+    else {
+        if (sp_ar(c->pool_score_local, c->pool_score_global, np)) return -1;
+        pool_top_exact(c->pool_score_cache, c->pool_score_global, np, nc);
+    }
+    for (int i = 0; i < nc; ++i)
+        for (int z = 0; z < KPOOL; ++z) c->selected[out++] = c->pool_score_cache[i].id * KPOOL + z;
+    for (int z = np * KPOOL; z < tokens; ++z) c->selected[out++] = z;
+    return out;
+}
 static void ensure_mla_shards(glm53f_sparse_context_12n*c){if(c->mla_ql)return;size_t base=(size_t)(TOPK+KPOOL)*LAT,n=base+(size_t)c->hn*(2*LAT+TOPK+KPOOL+8*LAT);float*p=realloc(c->packed,n*4);if(!p)MPI_Abort(MPI_COMM_WORLD,2);c->packed=p;c->mla_ql=p+base;c->mla_log=c->mla_ql+(size_t)c->hn*LAT;c->mla_part=c->mla_log+(size_t)c->hn*(TOPK+KPOOL);c->mla_va=c->mla_part+(size_t)c->hn*8*LAT;}
 /* Native Q8 value path: absorbed-query logits over the FP16-rounded latent
  * rows, softmax, value accumulation, then the per-head GGUF v_b matvec.  All
  * phases are work-shared by one team; every output element keeps the serial
  * accumulation order (j for ql, t for va), so results match the former
  * single-threaded loop. */
-static int mla_heads_q8_value(glm53f_sparse_context_12n*c,float*out,
-        const float*q,const float*z,const int*selected,int nt){
+struct mla_value_call { glm53f_sparse_context_12n *c; float *out; const float *q, *z; const int *selected; int nt, bad; };
+static void mla_value_worker(void *context) {
+    struct mla_value_call *a = context;
+    glm53f_sparse_context_12n *c = a->c;
     enum { DC = 64, NDC = LAT / DC, SLOTS = TOPK + KPOOL };
-    const size_t row_bytes=glm53f_native_row_size(c->q2_vb_type,LAT);
-    const int hn=c->hn,vl=(int)svcntw();
-    if(nt<1||nt>SLOTS||hn>8)return-1;
-    if(!c->q8v_ql){
-        c->q8v_act_bytes=(glm53f_native_act_bytes(LAT)+255)&~(size_t)255;
-        c->q8v_ql=a256((size_t)hn*LAT*sizeof(float));
-        c->q8v_va=a256((size_t)hn*LAT*sizeof(float));
-        c->q8v_log=a256((size_t)hn*SLOTS*sizeof(float));
-        c->q8v_sum=a256((size_t)hn*sizeof(float));
-        c->q8v_act=a256((size_t)hn*c->q8v_act_bytes);
-    }
-    float*ql=c->q8v_ql,*va=c->q8v_va,*lg=c->q8v_log,*hsum=c->q8v_sum;
-    const int q80=c->q2_vb_type==GLM53F_GGML_Q8_0||c->q2_vb_type==GLM53F_NATIVE_Q8_0R;
-    int bad=0;
-#pragma omp parallel reduction(|:bad)
-    {
+    const size_t row_bytes = glm53f_native_row_size(c->q2_vb_type, LAT);
+    const int hn = c->hn, vl = (int)svcntw(), nt = a->nt;
+    float *out = a->out;
+    const float *q = a->q, *z = a->z;
+    const int *selected = a->selected;
+    float *ql = c->q8v_ql, *va = c->q8v_va, *lg = c->q8v_log, *hsum = c->q8v_sum;
+    const int q80 = c->q2_vb_type == GLM53F_GGML_Q8_0 || c->q2_vb_type == GLM53F_NATIVE_Q8_0R;
+    int bad = 0;
+
 #pragma omp for schedule(static)
         for(int w=0;w<hn*NDC;w++){
             const int h=w/NDC,d0=(w%NDC)*DC;
@@ -501,7 +545,33 @@ static int mla_heads_q8_value(glm53f_sparse_context_12n*c,float*out,
                 c->q2_vb_type,VD,LAT};
             if(glm53f_native_matvec_team(&m,1,c->q8v_act+(size_t)h*c->q8v_act_bytes))bad=1;
         }
+
+    if (bad) {
+#pragma omp atomic write
+        a->bad = 1;
     }
+}
+static int mla_heads_q8_value(glm53f_sparse_context_12n*c,float*out,
+        const float*q,const float*z,const int*selected,int nt){
+    enum { SLOTS = TOPK + KPOOL };
+    const int hn = c->hn;
+    if(nt<1||nt>SLOTS||hn>8)return-1;
+    if(!c->q8v_ql){
+        c->q8v_act_bytes=(glm53f_native_act_bytes(LAT)+255)&~(size_t)255;
+        c->q8v_ql=a256((size_t)hn*LAT*sizeof(float));
+        c->q8v_va=a256((size_t)hn*LAT*sizeof(float));
+        c->q8v_log=a256((size_t)hn*SLOTS*sizeof(float));
+        c->q8v_sum=a256((size_t)hn*sizeof(float));
+        c->q8v_act=a256((size_t)hn*c->q8v_act_bytes);
+    }
+    int bad=0;
+    struct mla_value_call call = {c, out, q, z, selected, nt, 0};
+    if (glm53f_team_available()) glm53f_team_dispatch(mla_value_worker, &call);
+    else {
+#pragma omp parallel
+        { mla_value_worker(&call); }
+    }
+    bad = call.bad;
     return bad?-1:0;
 }
 /* Prefetch plan (glm53f_pf_plan.h): the native q_a / kv_a / q_b matvecs of this layer's decode front. */
@@ -599,23 +669,18 @@ static inline int sp_is_q80(int type) {
 /* Decode front of the replicated sparse layer in ONE parallel region (GLM53F_SPARSE_FUSE_FRONT=0 disables):
  * q_a / kv_a (native Q8_0) and the three bf16 index projections of x, then q_b and the bf16 index query projection
  * of the normalised q_a.  Same kernels and per-row arithmetic as the separate calls, so results are bit-identical. */
-static int sparse_front_fused(glm53f_sparse_context_12n *c, int pos, const float *x, float *raw) {
-    if (!c->q2_native || glm53f_sparse_scalar_reference) return 0;
-    static int enabled = -1;
-    if (enabled < 0) { const char *e = getenv("GLM53F_SPARSE_FUSE_FRONT"); enabled = !e || !*e || atoi(e); }
-    if (!enabled || !sp_is_q80(c->q2_qa_type) || !sp_is_q80(c->q2_kva_type) || !sp_is_q80(c->q2_qb_type)) return 0;
-    if (!c->front_act_x) {
-        c->front_act_x = a256((glm53f_native_act_bytes(H) + 255) & ~(size_t)255);
-        c->front_act_q = a256((glm53f_native_act_bytes(QA) + 255) & ~(size_t)255);
-    }
-    float *latent = c->latent + (size_t)pos * LAT;
+struct sparse_front_call { glm53f_sparse_context_12n *c; int pos, bad; const float *x; float *raw; };
+static void sparse_front_worker(void *context) {
+    struct sparse_front_call *a = context;
+    glm53f_sparse_context_12n *c = a->c;
+    int pos = a->pos, bad = 0;
+    const float *x = a->x;
+    float *raw = a->raw, *latent = c->latent + (size_t)pos * LAT;
     const glm53f_native_matrix ax[2] = {{c->qres, c->q2_qa, c->q2_qa_type, QA, H},
-                                        {latent, c->q2_kva, c->q2_kva_type, LAT, H}};
+        {latent, c->q2_kva, c->q2_kva_type, LAT, H}};
     const glm53f_native_matrix aq = {c->query, c->q2_qb, c->q2_qb_type, c->qd, QA};
     float *gout = c->gcache + (size_t)pos * ID;
-    int bad = 0;
-#pragma omp parallel reduction(|:bad)
-    {
+
         bad |= glm53f_native_act_prepare_team(c->front_act_x, x, H, 0, 1) != 0;
         bad |= glm53f_native_matvec_team(ax, 2, c->front_act_x) != 0;      /* barrier */
         /* bf16 projections of x: wk (ID rows), gatew (ID rows), wp (IH rows) in 8-row blocks */
@@ -635,8 +700,39 @@ static int sparse_front_fused(glm53f_sparse_context_12n *c, int pos, const float
         bad |= glm53f_native_matvec_team(&aq, 1, c->front_act_q) != 0;     /* barrier */
 #pragma omp for schedule(static)
         for (int b = 0; b < IH * ID / 8; ++b) b16dot8(c->iq + b * 8, c->wqb + (size_t)b * 8 * QA, c->qres, QA);
+
+    if (bad) {
+#pragma omp atomic write
+        a->bad = 1;
     }
+}
+static int sparse_front_fused(glm53f_sparse_context_12n *c, int pos, const float *x, float *raw) {
+    if (!c->q2_native || glm53f_sparse_scalar_reference) return 0;
+    static int enabled = -1;
+    if (enabled < 0) { const char *e = getenv("GLM53F_SPARSE_FUSE_FRONT"); enabled = !e || !*e || atoi(e); }
+    if (!enabled || !sp_is_q80(c->q2_qa_type) || !sp_is_q80(c->q2_kva_type) || !sp_is_q80(c->q2_qb_type)) return 0;
+    if (!c->front_act_x) {
+        c->front_act_x = a256((glm53f_native_act_bytes(H) + 255) & ~(size_t)255);
+        c->front_act_q = a256((glm53f_native_act_bytes(QA) + 255) & ~(size_t)255);
+    }
+    int bad = 0;
+    struct sparse_front_call call = {c, pos, 0, x, raw};
+    if (glm53f_team_available()) glm53f_team_dispatch(sparse_front_worker, &call);
+    else {
+#pragma omp parallel
+        { sparse_front_worker(&call); }
+    }
+    bad = call.bad;
     return bad ? -1 : 1;
+}
+struct sparse_pack_call { glm53f_sparse_context_12n *c; int ns; };
+static void sparse_pack_worker(void *context) {
+    struct sparse_pack_call *a = context;
+    glm53f_sparse_context_12n *c = a->c;
+#pragma omp for schedule(static)
+    for (int i = 0; i < a->ns; ++i)
+        for (int d = 0; d < LAT; ++d)
+            c->packed[(size_t)i * LAT + d] = (float)(_Float16)c->latent[(size_t)c->selected[i] * LAT + d];
 }
 static int sparse_attention_local_replicated(glm53f_sparse_context_12n *c,
                                              float *attn, const float *x) {
@@ -696,11 +792,12 @@ static int sparse_attention_local_replicated(glm53f_sparse_context_12n *c,
     if (ns < 1) return -1;
     begin = sparse_clock(c);
     if (c->q2_native) {
-#pragma omp parallel for schedule(static)
-        for (int i = 0; i < ns; ++i)
-            for (int d = 0; d < LAT; ++d)
-                c->packed[(size_t)i * LAT + d] =
-                    (float)(_Float16)c->latent[(size_t)c->selected[i] * LAT + d];
+        struct sparse_pack_call call = {c, ns};
+        if (glm53f_team_available()) glm53f_team_dispatch(sparse_pack_worker, &call);
+        else {
+#pragma omp parallel
+            { sparse_pack_worker(&call); }
+        }
         c->profile_phase[2] += sparse_clock(c) - begin;
         begin = sparse_clock(c);
         if (mla_heads_q8_value(c,attn,c->query,c->packed,NULL,ns)) return -1;
@@ -964,8 +1061,7 @@ static int sparse_attention_local_cp(glm53f_sparse_context_12n *c, float *attn, 
         cp_top_exact(local, local_pools, choose);
     for (int i = local_pools; i < choose; i++)
         local[i] = (cp_candidate){-INFINITY, INT_MAX};
-    if (choose && MPI_Allgather(local, choose * (int)sizeof(*local), MPI_BYTE, gather, choose * (int)sizeof(*local),
-                                MPI_BYTE, MPI_COMM_WORLD) != MPI_SUCCESS)
+    if (choose && glm53f_allgather_bytes_12n(local, gather, choose * (int)sizeof(*local)))
         return -1;
     if (choose) {
         if (getenv("GLM53F_CP_TOP_REFERENCE"))
@@ -1125,6 +1221,7 @@ void glm53f_sparse_prefill_workspace_free_12n(glm53f_sparse_prefill_workspace_12
 static int sparse_select_prefill(glm53f_sparse_context_12n *c,
         glm53f_sparse_prefill_workspace_12n *w, int base, int tokens) {
     int pools = (base + tokens) / KPOOL;
+    const int heads = index_heads_enabled();
     if (w->score_stride < pools || !w->score_stride) {
         int cap = 512;
         while (cap < pools) cap *= 2;
@@ -1166,7 +1263,8 @@ static int sparse_select_prefill(glm53f_sparse_context_12n *c,
                         const float *q = w->iq + (size_t)t * IH * ID;
                         /* Long-context baseline uses FP32 SVE dots, not the
                          * short-context FP64 index arithmetic. Keep both. */
-                        for (int h = 0; h < IH; ++h) {
+                        if (heads) score = glm53f_index_score_f32_heads(q, hw, key);
+                        else for (int h = 0; h < IH; ++h) {
                             float dot = f32dot(q + (size_t)h * ID, key, ID);
                             if (dot > 0) score += hw[h] * dot / sqrtf((float)(ID * IH));
                         }
@@ -1719,9 +1817,9 @@ int main(int argc,char**argv){
     /* Build the persistent cache state once. Decode only refreshes the current
      * token and scores already-compressed completed pools. */
     mv_f8(qres,qa,qas,x,QA,H);glm53f_rmsnorm_bf16(qres,qres,qan,QA,1e-5f);mv_f8(latent+(size_t)(tokens-1)*LAT,kva,kvas,x,LAT,H);glm53f_rmsnorm_bf16(latent+(size_t)(tokens-1)*LAT,latent+(size_t)(tokens-1)*LAT,kvan,LAT,1e-5f);{float raw[ID];mv_b16(raw,wk,x,ID,H);glm53f_layernorm_bf16(key+(size_t)(tokens-1)*ID,raw,knw,knb,ID,1e-6f);}mv_b16(gcache+(size_t)(tokens-1)*ID,gatew,x,ID,H);mv_b16(iq,wqb,qres,IH*ID,QA);mv_b16(iw,wp,x,IH,H);glm53f_index_select_decode(pool,sel,iq,iw,key,gcache,apef,tokens,KPOOL,TOPK,IH,ID);
-    for(int pass=0;pass<2;pass++){glm53f_sparse_scalar_reference=getenv("GLM53F_SPARSE_LAYER_SCALAR_CHECK")&&pass==1;double t0=MPI_Wtime();mv_f8(qres,qa,qas,x,QA,H);glm53f_rmsnorm_bf16(qres,qres,qan,QA,1e-5f);mv_f8(query,qb,qbs,qres,qd,QA);mv_f8(latent+(size_t)(tokens-1)*LAT,kva,kvas,x,LAT,H);glm53f_rmsnorm_bf16(latent+(size_t)(tokens-1)*LAT,latent+(size_t)(tokens-1)*LAT,kvan,LAT,1e-5f);float raw[ID];mv_b16(raw,wk,x,ID,H);glm53f_layernorm_bf16(key+(size_t)(tokens-1)*ID,raw,knw,knb,ID,1e-6f);mv_b16(gcache+(size_t)(tokens-1)*ID,gatew,x,ID,H);mv_b16(iq,wqb,qres,IH*ID,QA);mv_b16(iw,wp,x,IH,H);ns[pass]=select_cached(pool,sel,iq,iw,tokens);double t1=MPI_Wtime();if(mla_heads(attn,query,latent,kvb,sel,ns[pass],hn))MPI_Abort(MPI_COMM_WORLD,2);double t2=MPI_Wtime();
+    for(int pass=0;pass<2;pass++){glm53f_sparse_scalar_reference=getenv("GLM53F_SPARSE_LAYER_SCALAR_CHECK")&&pass==1;double t0=glm53f_clock();mv_f8(qres,qa,qas,x,QA,H);glm53f_rmsnorm_bf16(qres,qres,qan,QA,1e-5f);mv_f8(query,qb,qbs,qres,qd,QA);mv_f8(latent+(size_t)(tokens-1)*LAT,kva,kvas,x,LAT,H);glm53f_rmsnorm_bf16(latent+(size_t)(tokens-1)*LAT,latent+(size_t)(tokens-1)*LAT,kvan,LAT,1e-5f);float raw[ID];mv_b16(raw,wk,x,ID,H);glm53f_layernorm_bf16(key+(size_t)(tokens-1)*ID,raw,knw,knb,ID,1e-6f);mv_b16(gcache+(size_t)(tokens-1)*ID,gatew,x,ID,H);mv_b16(iq,wqb,qres,IH*ID,QA);mv_b16(iw,wp,x,IH,H);ns[pass]=select_cached(pool,sel,iq,iw,tokens);double t1=glm53f_clock();if(mla_heads(attn,query,latent,kvb,sel,ns[pass],hn))MPI_Abort(MPI_COMM_WORLD,2);double t2=glm53f_clock();
 #pragma omp parallel for schedule(static)
-        for(int r=0;r<H;r++)partial[r]=fp8dot(op+(size_t)r*local_cols,ops+(size_t)(r/128)*local_blocks,attn,local_cols);double t3=MPI_Wtime();MPI_Allreduce(partial,out[pass],H,MPI_FLOAT,MPI_SUM,MPI_COMM_WORLD);double t4=MPI_Wtime();ph[pass][0]=t1-t0;ph[pass][1]=t2-t1;ph[pass][2]=t3-t2;ph[pass][3]=t4-t3;el[pass]=t4-t0;}
+        for(int r=0;r<H;r++)partial[r]=fp8dot(op+(size_t)r*local_cols,ops+(size_t)(r/128)*local_blocks,attn,local_cols);double t3=glm53f_clock();MPI_Allreduce(partial,out[pass],H,MPI_FLOAT,MPI_SUM,MPI_COMM_WORLD);double t4=glm53f_clock();ph[pass][0]=t1-t0;ph[pass][1]=t2-t1;ph[pass][2]=t3-t2;ph[pass][3]=t4-t3;el[pass]=t4-t0;}
     double se=0,sr=0,ma=0;for(int i=0;i<H;i++){double de=(double)out[1][i]-out[0][i];se+=de*de;sr+=(double)out[0][i]*out[0][i];if(fabs(de)>ma)ma=fabs(de);}double rel=sqrt(se/(sr+1e-30));int scalar_check=getenv("GLM53F_SPARSE_LAYER_SCALAR_CHECK")!=NULL;int ok=ns[0]==ns[1]&&(scalar_check?rel<2e-5:!memcmp(out[0],out[1],H*4)),all;MPI_Allreduce(&ok,&all,1,MPI_INT,MPI_MIN,MPI_COMM_WORLD);float me,mp[4];MPI_Allreduce(&el[1],&me,1,MPI_FLOAT,MPI_MAX,MPI_COMM_WORLD);MPI_Allreduce(ph[1],mp,4,MPI_FLOAT,MPI_MAX,MPI_COMM_WORLD);double ss=0;for(int i=0;i<H;i++)ss+=(double)out[0][i]*out[0][i];if(!rank)printf("GLM53F_SPARSE_LAYER_12N layer=%d tokens=%d selected=%d max_ms=%.3f front_ms=%.3f mla_ms=%.3f oproj_ms=%.3f ar_ms=%.3f rms=%.9g scalar_rel_l2=%.9g scalar_max_abs=%.9g repeat=%s %s\n",layer,tokens,ns[0],me*1e3f,mp[0]*1e3f,mp[1]*1e3f,mp[2]*1e3f,mp[3]*1e3f,sqrt(ss/H),rel,ma,all?(scalar_check?"SCALAR_PASS":"BIT_EXACT"):"FAIL",all?"PASS":"FAIL");MPI_Finalize();return all?0:1;
 }
 #endif

@@ -1,0 +1,31 @@
+#ifndef GLM53F_RUNTIME_H
+#define GLM53F_RUNTIME_H
+#include <stdlib.h>
+#include <string.h>
+
+/* Startup-only switches shared by generation, benchmarking and verification.
+ * Parse before model creation: scratch and communication ownership depend on them. */
+static inline int glm53f_runtime_option(int argc, char **argv, int *index) {
+    const char *key = argv[*index], *env;
+    if (!strcmp(key, "--verify-kernel")) env = "GLM53F_VERIFY_GROUPED";
+    else if (!strcmp(key, "--decode-executor")) env = "GLM53F_DECODE_EXECUTOR";
+    else if (!strcmp(key, "--router-kernel")) env = "GLM53F_ROUTER_FUSE";
+    else if (!strcmp(key, "--collective-owner")) env = "GLM53F_COMM_OWNER";
+    else if (!strcmp(key, "--moe-combine-kernel")) env = "GLM53F_MOE_COMBINE";
+    else if (!strcmp(key, "--index-kernel")) env = "GLM53F_INDEX_HEADS";
+    else return 0;
+    if (*index + 1 >= argc) return -1;
+    const char *value = argv[++*index];
+    int enabled;
+    if (!strcmp(value, "legacy")) enabled = 0;
+    else if ((!strcmp(key, "--verify-kernel") && !strcmp(value, "grouped")) ||
+             (!strcmp(key, "--collective-owner") && !strcmp(value, "serialized")) ||
+             (!strcmp(key, "--router-kernel") && !strcmp(value, "fused")) ||
+             (!strcmp(key, "--moe-combine-kernel") && !strcmp(value, "vector")) ||
+             (!strcmp(key, "--index-kernel") && !strcmp(value, "heads")) ||
+             (!strcmp(key, "--decode-executor") && !strcmp(value, "persistent"))) enabled = 1;
+    else if (!strcmp(key, "--moe-combine-kernel") && !strcmp(value, "overlap")) enabled = 2;
+    else return -1;
+    return setenv(env, enabled == 2 ? "2" : enabled ? "1" : "0", 1) ? -1 : 1;
+}
+#endif

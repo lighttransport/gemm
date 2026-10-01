@@ -7,6 +7,7 @@
 #define GLM5_IMPL
 #include "../../common/glm5.h"
 #include "glm53f_iq_bridge.h"
+#include "glm53f_team.h"
 #include "kern/glm53f_kern.h"
 #include "glm53f_iq_fast.h"
 #include <omp.h>
@@ -558,6 +559,24 @@ int glm53f_native_matvec_team(const glm53f_native_matrix *m, int count,
     return 0;
 }
 
+struct native_call { const glm53f_native_matrix *m; int count, bad; const void *act; };
+static void native_worker(void *context) {
+    struct native_call *a = context;
+    if (glm53f_native_matvec_team(a->m, a->count, a->act)) {
+#pragma omp atomic write
+        a->bad = 1;
+    }
+}
+int glm53f_native_matvec_prepared_n(const glm53f_native_matrix *m, int count, const void *act) {
+    struct native_call call = {m, count, 0, act};
+    if (glm53f_team_available()) glm53f_team_dispatch(native_worker, &call);
+    else {
+#pragma omp parallel
+        { native_worker(&call); }
+    }
+    return call.bad ? -1 : 0;
+}
+
 int glm53f_native_matvec_n(const glm53f_native_matrix *m, int count,
                            const float *input) {
     int need_q8k = 0, need_q80 = 0, columns, rc = 0;
@@ -575,8 +594,7 @@ int glm53f_native_matvec_n(const glm53f_native_matrix *m, int count,
         free(act);
         return -1;
     }
-#pragma omp parallel reduction(|:rc)
-    rc |= glm53f_native_matvec_team(m, count, act) != 0;
+    rc = glm53f_native_matvec_prepared_n(m, count, act);
     free(act);
     return rc ? -1 : 0;
 }
@@ -661,7 +679,7 @@ int glm53f_iq_matvec_2(
         float *output1, const uint8_t *weight1, int weight1_type,
         int rows, int columns, const float *input) {
     if (native_is_q80(weight0_type) ||
-        (output1 && native_is_q80(weight1_type))) {
+        (output1 && native_is_q80(weight1_type)) || glm53f_team_available()) {
         if (!output0 || !weight0 || (!!output1 != !!weight1)) return -1;
         glm53f_native_matrix m[2] = {
             {output0, weight0, weight0_type, rows, columns},
@@ -697,7 +715,7 @@ int glm53f_iq_matvec_2(
 int glm53f_iq_matvec(
         float *output, const uint8_t *weight, int weight_type,
         int rows, int columns, const float *input) {
-    if (weight_type == GLM53F_NATIVE_Q8_0R) {
+    if (weight_type == GLM53F_NATIVE_Q8_0R || glm53f_team_available()) {
         glm53f_native_matrix m = {output, weight, weight_type, rows, columns};
         return glm53f_native_matvec_n(&m, 1, input);
     }
@@ -767,25 +785,28 @@ void glm53f_iq_place_part(const uint8_t *gate_up, size_t gate_row_bytes, int gat
 
 /* Decode routed-expert step on the native Q4_K/Q5_K rows: input quantisation, gate/up, SwiGLU+quantisation and down
  * projection in one parallel region (three barriers, no serial sections). */
-static int iq_expert_fast(float *output, const glm53f_iq_part *parts, const float *weights, int count,
-                          const float *input, const glm53f_iq_shared *sh) {
+struct iq_fast_call {
+    float *output, *gate_up;
+    const glm53f_iq_part *parts;
+    const float *weights, *input;
+    const glm53f_iq_shared *sh;
+    const size_t *gate_rb, *down_rb;
+    iqf_act *in_a, (*act_a)[2];
+    int count, affine, timing, total_gate_rows, bad;
+    double *ts1, *ts2, *ts3;
+};
+static void iq_fast_worker(void *context) {
+    struct iq_fast_call *a = context;
     enum { HIDDEN = 4096, GU_STRIDE = 1024 };
-    size_t gate_rb[9], down_rb[9];
-    for (int k = 0; k < count; ++k) {
-        gate_rb[k] = dequant_row_size((uint32_t)parts[k].gate_type, HIDDEN);
-        down_rb[k] = dequant_row_size((uint32_t)parts[k].down_type, parts[k].inter);
-    }
-    const int timing = getenv("GLM53F_IQ_TIMING") != NULL;
-    int affine = glm53f_iq_affine_enabled() && omp_get_max_threads() >= 37 && omp_get_max_threads() <= 48 && count >= 1;
-    for (int k = 0; k < count && affine; ++k) affine = parts[k].inter == 256;
-    double ts0 = timing ? iq_stamp() : 0, ts1 = 0, ts2 = 0, ts3 = 0;
-    iqf_act in_a[HIDDEN / 256] __attribute__((aligned(64)));
-    iqf_act act_a[9][2] __attribute__((aligned(64)));
-    float gate_up[9 * GU_STRIDE] __attribute__((aligned(256)));
-    int total_gate_rows = 0, bad = 0;
-    for (int k = 0; k < count; ++k) total_gate_rows += 2 * parts[k].inter;
-#pragma omp parallel reduction(|:bad)
-    {
+    float *output = a->output, *gate_up = a->gate_up;
+    const glm53f_iq_part *parts = a->parts;
+    const float *weights = a->weights, *input = a->input;
+    const glm53f_iq_shared *sh = a->sh;
+    const size_t *gate_rb = a->gate_rb, *down_rb = a->down_rb;
+    iqf_act *in_a = a->in_a, (*act_a)[2] = a->act_a;
+    const int count = a->count, affine = a->affine, timing = a->timing, total_gate_rows = a->total_gate_rows;
+    int bad = 0;
+
 #pragma omp for schedule(static)
         for (int b = 0; b < HIDDEN / 256; ++b) {
             iqf_src_block tmp;
@@ -794,7 +815,7 @@ static int iq_expert_fast(float *output, const glm53f_iq_part *parts, const floa
         }
         if (sh) bad |= glm53f_native_act_prepare_team(sh->act_x, input, HIDDEN, sh->x_q8k, sh->x_q80) != 0;
 #pragma omp master
-        if (timing) ts1 = iq_stamp();
+        if (timing) (*a->ts1) = iq_stamp();
         if (affine) {
             /* threads of CMG c stream rows [bound[c], bound[c+1]) of every part, split evenly among the CMG's threads */
             const int nt = omp_get_num_threads(), tid = omp_get_thread_num(), cmg = tid / 12 > 3 ? 3 : tid / 12;
@@ -829,7 +850,7 @@ static int iq_expert_fast(float *output, const glm53f_iq_part *parts, const floa
 #pragma omp barrier
         }
 #pragma omp master
-        if (timing) ts2 = iq_stamp();
+        if (timing) (*a->ts2) = iq_stamp();
 #pragma omp for schedule(static) nowait
         for (int task = 0; task < count * 2; ++task) {
             const int k = task >> 1, blk = task & 1;
@@ -853,7 +874,7 @@ static int iq_expert_fast(float *output, const glm53f_iq_part *parts, const floa
 #pragma omp barrier
         }
 #pragma omp master
-        if (timing) ts3 = iq_stamp();
+        if (timing) (*a->ts3) = iq_stamp();
         {
             const int nt = omp_get_num_threads(), tid = omp_get_thread_num();
             int r0, r1;
@@ -880,14 +901,140 @@ static int iq_expert_fast(float *output, const glm53f_iq_part *parts, const floa
                 }
             }
         }
+
+    if (bad) {
+#pragma omp atomic write
+        a->bad = 1;
     }
-    if (bad) return -1;
+}
+
+static int iq_expert_fast(float *output, const glm53f_iq_part *parts, const float *weights, int count,
+                          const float *input, const glm53f_iq_shared *sh) {
+    enum { HIDDEN = 4096, GU_STRIDE = 1024 };
+    size_t gate_rb[9], down_rb[9];
+    for (int k = 0; k < count; ++k) {
+        gate_rb[k] = dequant_row_size((uint32_t)parts[k].gate_type, HIDDEN);
+        down_rb[k] = dequant_row_size((uint32_t)parts[k].down_type, parts[k].inter);
+    }
+    const int timing = getenv("GLM53F_IQ_TIMING") != NULL;
+    int affine = glm53f_iq_affine_enabled() && omp_get_max_threads() >= 37 && omp_get_max_threads() <= 48 && count >= 1;
+    for (int k = 0; k < count && affine; ++k) affine = parts[k].inter == 256;
+    double ts0 = timing ? iq_stamp() : 0, ts1 = 0, ts2 = 0, ts3 = 0;
+    iqf_act in_a[HIDDEN / 256] __attribute__((aligned(64)));
+    iqf_act act_a[9][2] __attribute__((aligned(64)));
+    float gate_up[9 * GU_STRIDE] __attribute__((aligned(256)));
+    int total_gate_rows = 0, bad = 0;
+    for (int k = 0; k < count; ++k) total_gate_rows += 2 * parts[k].inter;
+    struct iq_fast_call call = {output, gate_up, parts, weights, input, sh,
+        gate_rb, down_rb, in_a, act_a, count, affine, timing, total_gate_rows, 0, &ts1, &ts2, &ts3};
+    if (glm53f_team_available()) glm53f_team_dispatch(iq_fast_worker, &call);
+    else {
+#pragma omp parallel
+        { iq_fast_worker(&call); }
+    }
+    bad = call.bad;
     if (timing) {
         const double te = iq_stamp();
         glm53f_iq_stage_us[0] += ts1 - ts0; glm53f_iq_stage_us[1] += ts2 - ts1; glm53f_iq_stage_us[2] += ts3 - ts2;
         glm53f_iq_stage_us[4] += te - ts3; glm53f_iq_stage_us[5] += 1;
     }
-    return 0;
+    return bad ? -1 : 0;
+}
+
+struct iq_reference_call {
+    float *output, *gate_up, *activation;
+    const glm53f_iq_part *parts;
+    const float *weights;
+    glm5_iq_q8_block *input_q, (*act_q)[2];
+    const size_t *gate_rb, *down_rb;
+    iqf_act *in_a, (*act_a)[2];
+    int count, fast, timing, total_gate_rows;
+    double *ts2, *ts3, *ts4;
+};
+static void iq_reference_worker(void *context) {
+    struct iq_reference_call *a = context;
+    enum { HIDDEN = 4096, GU_STRIDE = 1024, ACT_STRIDE = 512 };
+    float *output = a->output, *gate_up = a->gate_up, *activation = a->activation;
+    const glm53f_iq_part *parts = a->parts;
+    const float *weights = a->weights;
+    glm5_iq_q8_block *input_q = a->input_q, (*act_q)[2] = a->act_q;
+    const size_t *gate_rb = a->gate_rb, *down_rb = a->down_rb;
+    iqf_act *in_a = a->in_a, (*act_a)[2] = a->act_a;
+    const int count = a->count, fast = a->fast, timing = a->timing, total_gate_rows = a->total_gate_rows;
+    const int gate_blocks = HIDDEN / 256;
+
+        if (fast) {
+            const int nt = omp_get_num_threads(), tid = omp_get_thread_num();
+            const int q0 = (int)((long long)total_gate_rows * tid / nt), q1 = (int)((long long)total_gate_rows * (tid + 1) / nt);
+            int base = 0, k = 0;
+            for (int q = q0; q < q1;) {
+                while (q >= base + 2 * parts[k].inter) base += 2 * parts[k++].inter;
+                const int r = q - base, n = (base + 2 * parts[k].inter < q1 ? base + 2 * parts[k].inter : q1) - q;
+                iqf_rows(gate_up + (size_t)k * GU_STRIDE + r, parts[k].gate_up + (size_t)r * gate_rb[k], gate_rb[k], n,
+                         in_a, gate_blocks, parts[k].gate_type == GLM53F_GGML_Q5_K);
+                q += n;
+            }
+#pragma omp barrier
+        } else
+#pragma omp for schedule(static)
+        for (int q = 0; q < total_gate_rows; ++q) {
+            int k = 0, r = q;
+            while (r >= 2 * parts[k].inter) r -= 2 * parts[k++].inter;
+            gate_up[(size_t)k * GU_STRIDE + r] = iq_row(
+                parts[k].gate_type, parts[k].gate_up + (size_t)r * gate_rb[k],
+                input_q, gate_blocks);
+        }
+#pragma omp master
+        if (timing) (*a->ts2) = iq_stamp();
+#pragma omp for schedule(static)
+        for (int q = 0; q < count * ACT_STRIDE; ++q) {
+            int k = q / ACT_STRIDE, i = q - k * ACT_STRIDE;
+            if (i < parts[k].inter) {
+                float g = gate_up[(size_t)k * GU_STRIDE + i];
+                float u = gate_up[(size_t)k * GU_STRIDE + parts[k].inter + i];
+                if (g > 10) g = 10; if (g < -100) g = -100;
+                if (u > 10) u = 10; if (u < -10) u = -10;
+                activation[(size_t)k * ACT_STRIDE + i] =
+                    (g / (1.0f + expf(-g))) * u;
+            }
+        }
+#pragma omp master
+        if (timing) (*a->ts3) = iq_stamp();
+#pragma omp barrier
+#pragma omp single
+        for (int k = 0; k < count; ++k) {
+            glm5_iq_quant_q8(act_q[k], activation + (size_t)k * ACT_STRIDE, parts[k].inter);
+            if (fast) iqf_prepare(act_a[k], (const iqf_src_block *)act_q[k], parts[k].inter / 256);
+        }
+#pragma omp master
+        if (timing) (*a->ts4) = iq_stamp();
+        if (fast) {
+            const int nt = omp_get_num_threads(), tid = omp_get_thread_num();
+            const int r0 = (int)((long long)HIDDEN * tid / nt), r1 = (int)((long long)HIDDEN * (tid + 1) / nt);
+            float tmp[9][64];
+            for (int r = r0; r < r1; r += 64) {
+                const int n = r1 - r < 64 ? r1 - r : 64;
+                for (int k = 0; k < count; ++k)
+                    iqf_rows(tmp[k], parts[k].down + (size_t)r * down_rb[k], down_rb[k], n, act_a[k],
+                             parts[k].inter / 256, parts[k].down_type == GLM53F_GGML_Q5_K);
+                for (int i = 0; i < n; ++i) {
+                    float sum = 0.0f;
+                    for (int k = 0; k < count; ++k) sum += weights[k] * tmp[k][i];
+                    output[r + i] = sum;
+                }
+            }
+        } else
+#pragma omp for schedule(static)
+        for (int r = 0; r < HIDDEN; ++r) {
+            float sum = 0.0f;
+            for (int k = 0; k < count; ++k)
+                sum += weights[k] * iq_row(
+                    parts[k].down_type,
+                    parts[k].down + (size_t)r * down_rb[k], act_q[k],
+                    parts[k].inter / 256);
+            output[r] = sum;
+        }
+
 }
 
 static int iq_expert_weighted_impl(
@@ -926,84 +1073,186 @@ static int iq_expert_weighted_impl(
     int total_gate_rows = 0;
     for (int k = 0; k < count; ++k) total_gate_rows += 2 * parts[k].inter;
     if (timing) ts1 = iq_stamp();
+    struct iq_reference_call call = {output, gate_up, activation, parts, weights,
+        input_q, act_q, gate_rb, down_rb, in_a, act_a, count, fast, timing, total_gate_rows, &ts2, &ts3, &ts4};
+    if (glm53f_team_available()) glm53f_team_dispatch(iq_reference_worker, &call);
+    else {
 #pragma omp parallel
-    {
-        if (fast) {
-            const int nt = omp_get_num_threads(), tid = omp_get_thread_num();
-            const int q0 = (int)((long long)total_gate_rows * tid / nt), q1 = (int)((long long)total_gate_rows * (tid + 1) / nt);
-            int base = 0, k = 0;
-            for (int q = q0; q < q1;) {
-                while (q >= base + 2 * parts[k].inter) base += 2 * parts[k++].inter;
-                const int r = q - base, n = (base + 2 * parts[k].inter < q1 ? base + 2 * parts[k].inter : q1) - q;
-                iqf_rows(gate_up + (size_t)k * GU_STRIDE + r, parts[k].gate_up + (size_t)r * gate_rb[k], gate_rb[k], n,
-                         in_a, gate_blocks, parts[k].gate_type == GLM53F_GGML_Q5_K);
-                q += n;
-            }
-#pragma omp barrier
-        } else
-#pragma omp for schedule(static)
-        for (int q = 0; q < total_gate_rows; ++q) {
-            int k = 0, r = q;
-            while (r >= 2 * parts[k].inter) r -= 2 * parts[k++].inter;
-            gate_up[(size_t)k * GU_STRIDE + r] = iq_row(
-                parts[k].gate_type, parts[k].gate_up + (size_t)r * gate_rb[k],
-                input_q, gate_blocks);
-        }
-#pragma omp master
-        if (timing) ts2 = iq_stamp();
-#pragma omp for schedule(static)
-        for (int q = 0; q < count * ACT_STRIDE; ++q) {
-            int k = q / ACT_STRIDE, i = q - k * ACT_STRIDE;
-            if (i < parts[k].inter) {
-                float g = gate_up[(size_t)k * GU_STRIDE + i];
-                float u = gate_up[(size_t)k * GU_STRIDE + parts[k].inter + i];
-                if (g > 10) g = 10; if (g < -100) g = -100;
-                if (u > 10) u = 10; if (u < -10) u = -10;
-                activation[(size_t)k * ACT_STRIDE + i] =
-                    (g / (1.0f + expf(-g))) * u;
-            }
-        }
-#pragma omp master
-        if (timing) ts3 = iq_stamp();
-#pragma omp barrier
-#pragma omp single
-        for (int k = 0; k < count; ++k) {
-            glm5_iq_quant_q8(act_q[k], activation + (size_t)k * ACT_STRIDE, parts[k].inter);
-            if (fast) iqf_prepare(act_a[k], (const iqf_src_block *)act_q[k], parts[k].inter / 256);
-        }
-#pragma omp master
-        if (timing) ts4 = iq_stamp();
-        if (fast) {
-            const int nt = omp_get_num_threads(), tid = omp_get_thread_num();
-            const int r0 = (int)((long long)HIDDEN * tid / nt), r1 = (int)((long long)HIDDEN * (tid + 1) / nt);
-            float tmp[9][64];
-            for (int r = r0; r < r1; r += 64) {
-                const int n = r1 - r < 64 ? r1 - r : 64;
-                for (int k = 0; k < count; ++k)
-                    iqf_rows(tmp[k], parts[k].down + (size_t)r * down_rb[k], down_rb[k], n, act_a[k],
-                             parts[k].inter / 256, parts[k].down_type == GLM53F_GGML_Q5_K);
-                for (int i = 0; i < n; ++i) {
-                    float sum = 0.0f;
-                    for (int k = 0; k < count; ++k) sum += weights[k] * tmp[k][i];
-                    output[r + i] = sum;
-                }
-            }
-        } else
-#pragma omp for schedule(static)
-        for (int r = 0; r < HIDDEN; ++r) {
-            float sum = 0.0f;
-            for (int k = 0; k < count; ++k)
-                sum += weights[k] * iq_row(
-                    parts[k].down_type,
-                    parts[k].down + (size_t)r * down_rb[k], act_q[k],
-                    parts[k].inter / 256);
-            output[r] = sum;
-        }
+        { iq_reference_worker(&call); }
     }
     if (timing) {
         const double te = iq_stamp();
         glm53f_iq_stage_us[0] += ts1 - ts0; glm53f_iq_stage_us[1] += ts2 - ts1; glm53f_iq_stage_us[2] += ts3 - ts2;
         glm53f_iq_stage_us[3] += ts4 - ts3; glm53f_iq_stage_us[4] += te - ts4; glm53f_iq_stage_us[5] += 1;
+    }
+    return 0;
+}
+
+struct glm53f_iq_batch_scratch {
+    glm5_iq_q8_block input_q[4][16], hidden_q[4][8][2];
+    iqf_act input_a[4][16], hidden_a[4][8][2];
+    float gate_up[4][8][1024], routes[4][8][4096];
+};
+glm53f_iq_batch_scratch *glm53f_iq_batch_scratch_create(void) {
+    glm53f_iq_batch_scratch *s = NULL;
+    if (posix_memalign((void **)&s, 256, sizeof(*s))) return NULL;
+    return s;
+}
+void glm53f_iq_batch_scratch_free(glm53f_iq_batch_scratch *s) { free(s); }
+
+int glm53f_iq_expert_weighted_batch(float *output,
+        const glm53f_iq_part *parts, const float *weights, const int *counts,
+        int part_stride, const float *input, int tokens,
+        glm53f_iq_batch_scratch *s) {
+    struct job {
+        glm53f_iq_part p;
+        int fast, count, token[4], slot[4];
+        size_t gate_rb, down_rb;
+    } jobs[32];
+    int njobs = 0, fast[4], prefix[33] = {0};
+    const char *e = getenv("GLM53F_IQ_FAST");
+    const int mode = e && *e ? atoi(e) : 1;
+    if (!output || !parts || !weights || !counts || !input || !s ||
+        tokens < 1 || tokens > 4 || part_stride < 8 || (mode != 0 && mode != 1) ||
+        glm53f_iq_affine_enabled()) return -1;
+    pthread_once(&glm5_iq_lut_once, glm5_iq_init_luts);
+    iqf_init();
+    for (int t = 0; t < tokens; ++t) {
+        if (counts[t] < 0 || counts[t] > 8) return -1;
+        fast[t] = mode == 1;
+        for (int k = 0; k < counts[t]; ++k) {
+            const glm53f_iq_part *p = parts + t * part_stride + k;
+            if (!p->gate_up || !p->down || !glm53f_iq_type_supported(p->gate_type) ||
+                !glm53f_iq_type_supported(p->down_type) || p->inter < 256 ||
+                p->inter > 512 || p->inter % 256) return -1;
+            fast[t] &= (p->gate_type == GLM53F_GGML_Q4_K || p->gate_type == GLM53F_GGML_Q5_K) &&
+                       (p->down_type == GLM53F_GGML_Q4_K || p->down_type == GLM53F_GGML_Q5_K);
+        }
+        if (!fast[t]) continue; /* Preserve the reference expf/vectorization contract. */
+        for (int k = 0; k < counts[t]; ++k) {
+            const glm53f_iq_part *p = parts + t * part_stride + k;
+            int j = 0;
+            for (; j < njobs; ++j)
+                if (jobs[j].count < 4 && jobs[j].fast == fast[t] && jobs[j].p.gate_up == p->gate_up &&
+                    jobs[j].p.down == p->down && jobs[j].p.gate_type == p->gate_type &&
+                    jobs[j].p.down_type == p->down_type && jobs[j].p.inter == p->inter) break;
+            if (j == njobs) {
+                jobs[j].p = *p; jobs[j].fast = fast[t]; jobs[j].count = 0;
+                jobs[j].gate_rb = glm53f_iq_row_size(p->gate_type, 4096);
+                jobs[j].down_rb = glm53f_iq_row_size(p->down_type, p->inter);
+                ++njobs;
+            }
+            int n = jobs[j].count++;
+            jobs[j].token[n] = t; jobs[j].slot[n] = k;
+        }
+    }
+    for (int j = 0; j < njobs; ++j)
+        prefix[j + 1] = prefix[j] + 2 * jobs[j].p.inter / 32;
+#pragma omp parallel
+    {
+#pragma omp for collapse(2) schedule(static)
+        for (int t = 0; t < tokens; ++t)
+            for (int b = 0; b < 16; ++b) {
+                glm5_iq_quant_q8(&s->input_q[t][b], input + (size_t)t * 4096 + b * 256, 256);
+                if (fast[t]) iqf_prepare(&s->input_a[t][b], (const iqf_src_block *)&s->input_q[t][b], 1);
+            }
+#pragma omp for schedule(static)
+        for (int q = 0; q < prefix[njobs]; ++q) {
+            int j = 0;
+            while (q >= prefix[j + 1]) ++j;
+            const struct job *job = jobs + j;
+            int r = (q - prefix[j]) * 32;
+            const uint8_t *w = job->p.gate_up + (size_t)r * job->gate_rb;
+            for (int n = 0; n < job->count;) {
+                int t = job->token[n], k = job->slot[n];
+                if (job->fast && n + 1 < job->count) {
+                    int t1 = job->token[n + 1], k1 = job->slot[n + 1];
+                    iqf_rows_pair(s->gate_up[t][k] + r, s->gate_up[t1][k1] + r,
+                        w, job->gate_rb, 32, s->input_a[t], s->input_a[t1], 16,
+                        job->p.gate_type == GLM53F_GGML_Q5_K);
+                    n += 2;
+                } else {
+                    if (job->fast) iqf_rows(s->gate_up[t][k] + r, w, job->gate_rb,
+                        32, s->input_a[t], 16, job->p.gate_type == GLM53F_GGML_Q5_K);
+                    else for (int i = 0; i < 32; ++i)
+                        s->gate_up[t][k][r + i] = iq_row(job->p.gate_type,
+                            w + (size_t)i * job->gate_rb, s->input_q[t], 16);
+                    ++n;
+                }
+            }
+        }
+#pragma omp for collapse(2) schedule(static)
+        for (int t = 0; t < tokens; ++t)
+            for (int k = 0; k < 8; ++k) {
+                if (!fast[t] || k >= counts[t]) continue;
+                int inter = parts[t * part_stride + k].inter;
+                if (fast[t]) {
+                    for (int b = 0; b < inter / 256; ++b)
+                        iqf_swiglu_block(&s->hidden_a[t][k][b], s->gate_up[t][k] + b * 256,
+                                        s->gate_up[t][k] + inter + b * 256);
+                } else {
+                    float activation[512];
+                    for (int i = 0; i < inter; ++i) {
+                        float g = s->gate_up[t][k][i], u = s->gate_up[t][k][inter + i];
+                        if (g > 10) g = 10;
+                        if (g < -100) g = -100;
+                        if (u > 10) u = 10;
+                        if (u < -10) u = -10;
+                        activation[i] = (g / (1 + expf(-g))) * u;
+                    }
+                    glm5_iq_quant_q8(s->hidden_q[t][k], activation, inter);
+                }
+            }
+#pragma omp for collapse(2) schedule(static)
+        for (int j = 0; j < njobs; ++j)
+            for (int owner = 0; owner < omp_get_num_threads(); ++owner) {
+                /* Match scalar thread boundaries: its four-row down reduction
+                 * and ragged FADDV tails have different rounding trees. */
+                const int nt = omp_get_num_threads();
+                const int r0 = 4096 * owner / nt, r1 = 4096 * (owner + 1) / nt;
+                const struct job *job = jobs + j;
+                for (int r = r0; r < r1; r += 64) {
+                const int rows = r1 - r < 64 ? r1 - r : 64;
+                const uint8_t *w = job->p.down + (size_t)r * job->down_rb;
+                for (int n = 0; n < job->count;) {
+                    int t = job->token[n], k = job->slot[n];
+                    if (job->fast && n + 1 < job->count) {
+                        int t1 = job->token[n + 1], k1 = job->slot[n + 1];
+                        iqf_rows_pair(s->routes[t][k] + r, s->routes[t1][k1] + r,
+                            w, job->down_rb, rows, s->hidden_a[t][k], s->hidden_a[t1][k1],
+                            job->p.inter / 256, job->p.down_type == GLM53F_GGML_Q5_K);
+                        n += 2;
+                    } else {
+                        if (job->fast) iqf_rows(s->routes[t][k] + r, w, job->down_rb,
+                            rows, s->hidden_a[t][k], job->p.inter / 256,
+                            job->p.down_type == GLM53F_GGML_Q5_K);
+                        else for (int i = 0; i < rows; ++i)
+                            s->routes[t][k][r + i] = iq_row(job->p.down_type,
+                                w + (size_t)i * job->down_rb, s->hidden_q[t][k], job->p.inter / 256);
+                        ++n;
+                    }
+                }
+                }
+            }
+#pragma omp for collapse(2) schedule(static)
+        for (int t = 0; t < tokens; ++t)
+            for (int r = 0; r < 4096; ++r) {
+                if (!fast[t]) continue;
+                float sum = 0;
+                for (int k = 0; k < counts[t]; ++k)
+                    sum += weights[t * part_stride + k] * s->routes[t][k][r];
+                output[(size_t)t * 4096 + r] = sum;
+            }
+    }
+    for (int t = 0; t < tokens; ++t) {
+        if (fast[t]) continue;
+        if (!counts[t]) memset(output + (size_t)t * 4096, 0, 4096 * sizeof(float));
+        else {
+            float activation[8 * 512];
+            if (glm53f_iq_expert_weighted(output + (size_t)t * 4096,
+                    parts + t * part_stride, weights + t * part_stride, counts[t],
+                    input + (size_t)t * 4096, &s->gate_up[t][0][0], activation)) return -1;
+        }
     }
     return 0;
 }

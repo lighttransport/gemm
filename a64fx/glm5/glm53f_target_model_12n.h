@@ -36,6 +36,13 @@ int glm53f_target_trace_close_12n(glm53f_target_model_12n *model);
 int glm53f_target_model_step_12n(
     glm53f_target_model_12n *model, int input_token,
     int *next_token, float *next_logit, float *target_hidden);
+/* Greedy transitions after an already predicted first token. ids[0] receives
+ * first; ids[1..transitions] are the following predictions. Optional observer
+ * runs on the controller after each transition. The persistent executor keeps
+ * one OpenMP team alive for this entire sequence. */
+int glm53f_target_decode_sequence_12n(glm53f_target_model_12n *model,
+    int first, int transitions, int *ids,
+    void (*observer)(void *, int), void *observer_context);
 /* Prompt-only calls accept up to 256 positions, or 512 with the fast recipe.
  * Calls returning logits, hidden states, or snapshots retain the limit five. */
 int glm53f_target_model_step_batch_12n(

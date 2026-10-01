@@ -16,6 +16,9 @@
 #include "glm53f_pf_plan.h"
 #include "glm53f_moe_12n.h"
 #include "glm53f_moe_stage_12n.h"
+#include "glm53f_team.h"
+#include "glm53f_clock.h"
+#include "glm53f_moe_combine.h"
 #include "glm53f_collective_12n.h"
 #include "glm53f_int8.h"
 #include "glm53f_prefill.h"
@@ -205,9 +208,10 @@ struct glm53f_moe_stage_context_12n {
     glm53f_moe_scratch_12n *scratch;
     float *batch_up, *batch_activation, *batch_shared, *batch_local;
     float *batch_router, *batch_group_x, *batch_routes;
+    glm53f_iq_batch_scratch *verify_scratch;
     float *task_up, *task_activation, *task_output;
     float *int8_scales[NLAYERS];
-    int int8_enabled;
+    int int8_enabled, router_ready;
     int profile;
     double profile_phase[4];
     double gn_phase[8]; /* native: 0 total, 1 x-quant, 2 old-expert loop, 3 shared, 4 combine, 5 task wall, 6 avg busy, 7 tasks */
@@ -322,16 +326,18 @@ static int nsh_is_q80(int type) {
 /* output += shared_expert(x) for this rank's intermediate slice.  One team:
  * quantize x, gate/up rows, SwiGLU (the MoE clamp), quantize the activation,
  * then down rows.  Every stage follows llama.cpp's Q8_0 vec_dot contract. */
-static int nsh_accumulate(glm53f_moe_stage_context_12n *c, int t,
-                          const float *x, float *output) {
-    const int in = c->nsh_in;
-    glm53f_native_matrix gu[2] = {
-        {c->nsh_gv, c->nsh_g[t], c->nsh_gt[t], in, 4096},
+struct shared_call { glm53f_moe_stage_context_12n *c; int layer, bad; const float *x; float *output; };
+static void shared_worker(void *context) {
+    struct shared_call *a = context;
+    glm53f_moe_stage_context_12n *c = a->c;
+    const int in = c->nsh_in, t = a->layer;
+    const float *x = a->x;
+    float *output = a->output;
+    glm53f_native_matrix gu[2] = {{c->nsh_gv, c->nsh_g[t], c->nsh_gt[t], in, 4096},
         {c->nsh_uv, c->nsh_u[t], c->nsh_ut[t], in, 4096}};
     glm53f_native_matrix dn = {c->nsh_out, c->nsh_d[t], c->nsh_dt[t], 4096, in};
     int bad = 0;
-#pragma omp parallel reduction(|:bad)
-    {
+
 #pragma omp single
         bad |= glm53f_native_act_prepare(c->nsh_act_x, x, 4096,
                    !nsh_is_q80(gu[0].type) || !nsh_is_q80(gu[1].type),
@@ -353,7 +359,22 @@ static int nsh_accumulate(glm53f_moe_stage_context_12n *c, int t,
         bad |= glm53f_native_matvec_team(&dn, 1, c->nsh_act_h) != 0;
 #pragma omp for schedule(static)
         for (int i = 0; i < 4096; ++i) output[i] += c->nsh_out[i];
+
+    if (bad) {
+#pragma omp atomic write
+        a->bad = 1;
     }
+}
+static int nsh_accumulate(glm53f_moe_stage_context_12n *c, int t,
+                          const float *x, float *output) {
+    int bad = 0;
+    struct shared_call call = {c, t, 0, x, output};
+    if (glm53f_team_available()) glm53f_team_dispatch(shared_worker, &call);
+    else {
+#pragma omp parallel
+        { shared_worker(&call); }
+    }
+    bad = call.bad;
     return bad ? -1 : 0;
 }
 
@@ -596,6 +617,10 @@ glm53f_moe_stage_context_12n *glm53f_moe_stage_create_12n(
         posix_memalign((void **)&c->batch_group_x, 256, (size_t)4 * 4096 * 4) ||
         posix_memalign((void **)&c->batch_routes, 256,
                       (size_t)GLM53F_PREFILL_MAX_TOKENS * 8 * 4096 * 4)) goto fail;
+    if (getenv("GLM53F_VERIFY_GROUPED") && atoi(getenv("GLM53F_VERIFY_GROUPED"))) {
+        c->verify_scratch = glm53f_iq_batch_scratch_create();
+        if (!c->verify_scratch) goto fail;
+    }
     if (!rank) fprintf(stderr, "GLM53F_MOE_LOAD phase=router_read bytes=%zu\n", wn);
     for (int li = 0; li < layer_count; ++li) {
         char n[256];
@@ -665,9 +690,9 @@ static int moe_fused_shared(glm53f_moe_stage_context_12n *c, int t, const float 
         .x_q8k = !nsh_is_q80(c->nsh_gt[t]) || !nsh_is_q80(c->nsh_ut[t]),
         .x_q80 = nsh_is_q80(c->nsh_gt[t]) || nsh_is_q80(c->nsh_ut[t]),
         .h_q8k = !nsh_is_q80(c->nsh_dt[t]), .h_q80 = nsh_is_q80(c->nsh_dt[t])};
-    double tn = c->profile ? MPI_Wtime() : 0.0;
+    double tn = c->profile ? glm53f_clock() : 0.0;
     if (glm53f_iq_expert_weighted_shared(c->scratch->local_output, iq, part_weight, npart, x, &sh)) return 0;
-    if (c->profile) c->profile_phase[3] += MPI_Wtime() - tn;
+    if (c->profile) c->profile_phase[3] += glm53f_clock() - tn;
     return 1;
 }
 /* Eight bf16 weight rows against one vector: eight independent accumulator chains (same per-row accumulation order as
@@ -700,17 +725,40 @@ void glm53f_moe_stage_prefetch_plan_12n(glm53f_moe_stage_context_12n *c, int lay
         glm53f_pf_add_matvec(&dn, 1);
     }
 }
+void glm53f_moe_router_team_12n(void *context, const float *x) {
+    glm53f_moe_stage_context_12n *c = context;
+    const int li = c->active_layer - c->first_layer;
+    if (c->router_i8 || li < 0 || li >= c->layer_count) return;
+#pragma omp for schedule(static)
+    for (int b = 0; b < NEXPERTS / 8; ++b)
+        router_dot8(c->router_logits + b * 8,
+            c->router_w + ((size_t)li * NEXPERTS + b * 8) * 4096, x, 4096);
+#pragma omp single
+    c->router_ready = 1;
+}
+struct router_call { glm53f_moe_stage_context_12n *c; const float *x; };
+static void router_worker(void *context) {
+    struct router_call *a = context;
+    glm53f_moe_router_team_12n(a->c, a->x);
+}
 void glm53f_moe_stage_set_layer_12n(glm53f_moe_stage_context_12n*c,int layer){if(c)c->active_layer=layer;}
-int glm53f_moe_stage_sublayer_12n(void*context,float*out,const float*x){glm53f_moe_stage_context_12n*c=context;int li=c->active_layer-c->first_layer,selected[8],npart=0;float route_weight[8],part_weight[9];glm53f_expert_part part[9];int8_t router_qx[4096];float router_xs=0;if(li<0||li>=c->layer_count)return-1;double t=c->profile?MPI_Wtime():0.0;
-if(!c->router_i8){
+int glm53f_moe_stage_sublayer_12n(void*context,float*out,const float*x){glm53f_moe_stage_context_12n*c=context;int li=c->active_layer-c->first_layer,selected[8],npart=0;float route_weight[8],part_weight[9];glm53f_expert_part part[9];int8_t router_qx[4096];float router_xs=0;if(li<0||li>=c->layer_count)return-1;double t=c->profile?glm53f_clock():0.0;
+if(!c->router_ready&&!c->router_i8){
+    if (glm53f_team_available()) {
+        struct router_call call = {c, x};
+        glm53f_team_dispatch(router_worker, &call);
+    } else {
 #pragma omp parallel for schedule(static)
-    for(int b=0;b<NEXPERTS/8;b++)router_dot8(c->router_logits+b*8,c->router_w+((size_t)li*NEXPERTS+b*8)*4096,x,4096);}if(c->router_i8){if(glm53f_i8_quantize_x(router_qx,&router_xs,x,4096))return-1;
+        for(int b=0;b<NEXPERTS/8;b++)router_dot8(c->router_logits+b*8,c->router_w+((size_t)li*NEXPERTS+b*8)*4096,x,4096);
+    }
+}if(c->router_i8){if(glm53f_i8_quantize_x(router_qx,&router_xs,x,4096))return-1;
 #pragma omp parallel for schedule(static)
-    for(int q=0;q<NEXPERTS/16;q++){int g=q/4,j=q%4;glm53f_i8_dot16(c->router_logits+q*16,c->router_i8+((size_t)li*NEXPERTS+g*64)*4096+j*64,c->router_i8_scale+(size_t)li*NEXPERTS+q*16,router_qx,router_xs,4096);}}glm53f_router_topk(c->router_logits,c->router_bias+(size_t)li*NEXPERTS,NEXPERTS,8,2.5f,selected,route_weight);if(c->profile){c->profile_phase[0]+=MPI_Wtime()-t;t=MPI_Wtime();}int table_layer=c->active_layer-FIRST_LAYER;if(c->int8_enabled){if(moe_int8_local(c,c->scratch->local_output,x,c->router_i8?router_qx:NULL,router_xs,selected,route_weight,table_layer))return-1;if(c->profile){c->profile_phase[1]+=MPI_Wtime()-t;t=MPI_Wtime();}int rc=glm53f_sum_allreduce_12n(c->scratch->local_output,out,4096);if(c->profile)c->profile_phase[2]+=MPI_Wtime()-t;return rc;}for(int k=0;k<8;k++){expert_offset*p=&c->table[table_layer*NEXPERTS+selected[k]];if(p->gate_up==UINT64_MAX)continue;part[npart]=(glm53f_expert_part){c->blob+p->gate_up,p->gate_up_scale==UINT64_MAX?NULL:(const float*)(c->blob+p->gate_up_scale),c->blob+p->down,p->down_scale==UINT64_MAX?NULL:(const float*)(c->blob+p->down_scale),p->inter,p->gate_type,p->down_type};part_weight[npart++]=route_weight[k];}if(c->shared_blob&&!c->nsh_native){shared_offset*p=&c->shared[table_layer];part[npart]=(glm53f_expert_part){c->shared_blob+p->gate_up,(const float*)(c->shared_blob+p->gate_up_scale),c->shared_blob+p->down,(const float*)(c->shared_blob+p->down_scale),p->inter,0,0};part_weight[npart++]=1.0f;}if(!moe_fused_shared(c,table_layer,x,part,part_weight,npart)){glm53f_moe_local_12n(c->scratch->local_output,part,part_weight,npart,x,c->scratch);{double tn=c->profile?MPI_Wtime():0.0;if(c->nsh_native&&nsh_accumulate(c,table_layer,x,c->scratch->local_output))return-1;if(c->profile)c->profile_phase[3]+=MPI_Wtime()-tn;}}if(c->profile){c->profile_phase[1]+=MPI_Wtime()-t;t=MPI_Wtime();}int rc=glm53f_sum_allreduce_12n(c->scratch->local_output,out,4096);if(c->profile)c->profile_phase[2]+=MPI_Wtime()-t;return rc;}
+    for(int q=0;q<NEXPERTS/16;q++){int g=q/4,j=q%4;glm53f_i8_dot16(c->router_logits+q*16,c->router_i8+((size_t)li*NEXPERTS+g*64)*4096+j*64,c->router_i8_scale+(size_t)li*NEXPERTS+q*16,router_qx,router_xs,4096);}}c->router_ready=0;glm53f_router_topk(c->router_logits,c->router_bias+(size_t)li*NEXPERTS,NEXPERTS,8,2.5f,selected,route_weight);if(c->profile){c->profile_phase[0]+=glm53f_clock()-t;t=glm53f_clock();}int table_layer=c->active_layer-FIRST_LAYER;if(c->int8_enabled){if(moe_int8_local(c,c->scratch->local_output,x,c->router_i8?router_qx:NULL,router_xs,selected,route_weight,table_layer))return-1;if(c->profile){c->profile_phase[1]+=glm53f_clock()-t;t=glm53f_clock();}int rc=glm53f_sum_allreduce_12n(c->scratch->local_output,out,4096);if(c->profile)c->profile_phase[2]+=glm53f_clock()-t;return rc;}for(int k=0;k<8;k++){expert_offset*p=&c->table[table_layer*NEXPERTS+selected[k]];if(p->gate_up==UINT64_MAX)continue;part[npart]=(glm53f_expert_part){c->blob+p->gate_up,p->gate_up_scale==UINT64_MAX?NULL:(const float*)(c->blob+p->gate_up_scale),c->blob+p->down,p->down_scale==UINT64_MAX?NULL:(const float*)(c->blob+p->down_scale),p->inter,p->gate_type,p->down_type};part_weight[npart++]=route_weight[k];}if(c->shared_blob&&!c->nsh_native){shared_offset*p=&c->shared[table_layer];part[npart]=(glm53f_expert_part){c->shared_blob+p->gate_up,(const float*)(c->shared_blob+p->gate_up_scale),c->shared_blob+p->down,(const float*)(c->shared_blob+p->down_scale),p->inter,0,0};part_weight[npart++]=1.0f;}if(!moe_fused_shared(c,table_layer,x,part,part_weight,npart)){glm53f_moe_local_12n(c->scratch->local_output,part,part_weight,npart,x,c->scratch);{double tn=c->profile?glm53f_clock():0.0;if(c->nsh_native&&nsh_accumulate(c,table_layer,x,c->scratch->local_output))return-1;if(c->profile)c->profile_phase[3]+=glm53f_clock()-tn;}}if(c->profile){c->profile_phase[1]+=glm53f_clock()-t;t=glm53f_clock();}int rc=glm53f_sum_allreduce_12n(c->scratch->local_output,out,4096);if(c->profile)c->profile_phase[2]+=glm53f_clock()-t;return rc;}
 
 void glm53f_moe_stage_profile_reset_12n(glm53f_moe_stage_context_12n *c) {
     if (c) {
         memset(c->profile_phase, 0, sizeof(c->profile_phase));
+        memset(c->gn_phase, 0, sizeof(c->gn_phase));
         memset(c->occupancy, 0, sizeof(c->occupancy));
     }
 }
@@ -988,12 +1036,12 @@ static int moe_native_grouped(glm53f_moe_stage_context_12n *c, const float *x, i
         tasks[j + 1] = v;
     }
     int failed = 0, next = 0;
-    double gt0 = c->profile ? MPI_Wtime() : 0.0;
+    double gt0 = c->profile ? glm53f_clock() : 0.0;
 #pragma omp parallel for schedule(static)
     for (int t = 0; t < tokens; ++t)
         gmn_quant_row(x + (size_t)t * H, H, c->gn_xq + (size_t)t * H, c->gn_xs + (size_t)t * (H / 32),
                       c->gn_bt + (size_t)t * (H / 32));
-    double gt1 = c->profile ? MPI_Wtime() : 0.0;
+    double gt1 = c->profile ? glm53f_clock() : 0.0;
     for (int i = 0; i < c->gn_nthreads; ++i) tbs[i].busy = 0.0;
 #pragma omp parallel
     {
@@ -1006,7 +1054,7 @@ static int moe_native_grouped(glm53f_moe_stage_context_12n *c, const float *x, i
             int ti = __atomic_fetch_add(&next, 1, __ATOMIC_RELAXED);
             if (ti >= ntasks) break;
             const gn_task tk = tasks[ti];
-            double tb0 = c->profile ? MPI_Wtime() : 0.0;
+            double tb0 = c->profile ? glm53f_clock() : 0.0;
             const expert_offset *ep = &c->table[table_layer * NEXPERTS + tk.e];
             const int m = tk.n, mpad = (m + 5) / 6 * 6, inter = ep->inter, nbi = inter / 32;
             for (int g = 0; g < mpad / 6; ++g) {
@@ -1063,14 +1111,14 @@ static int moe_native_grouped(glm53f_moe_stage_context_12n *c, const float *x, i
                 const int t = plist[2 * (tk.off + sl)], k = plist[2 * (tk.off + sl) + 1];
                 memcpy(c->batch_routes + ((size_t)t * 8 + k) * H, B->yd + (size_t)sl * GN_LDY_DN, H * sizeof(float));
             }
-            if (c->profile) B->busy += MPI_Wtime() - tb0;
+            if (c->profile) B->busy += glm53f_clock() - tb0;
         }
     }
     if (c->profile) {
         double busy = 0;
         for (int i = 0; i < c->gn_nthreads; ++i) busy += tbs[i].busy;
         c->gn_phase[1] += gt1 - gt0;
-        c->gn_phase[5] += MPI_Wtime() - gt1;
+        c->gn_phase[5] += glm53f_clock() - gt1;
         c->gn_phase[6] += busy / c->gn_nthreads;
         c->gn_phase[7] += ntasks;
     }
@@ -1255,12 +1303,45 @@ static int moe_shared_gemm(glm53f_moe_stage_context_12n *c, float *dst, const fl
     return 0;
 }
 
+/* Returns 0 for the legacy combine, 1 for vector combine, 2 when output has
+ * also been reduced. One bounded slab becomes visible after every worker has
+ * completed it; input remains live until the owner reports all slabs done. */
+static int moe_prefill_combine(glm53f_moe_stage_context_12n *c, float *out,
+        int tokens, int table_layer, const int selected[][8], const float weight[][8]) {
+    const char *setting = getenv("GLM53F_MOE_COMBINE");
+    int mode = setting ? atoi(setting) : 0;
+    if (!mode) return 0;
+    const float *route[GLM53F_PREFILL_MAX_TOKENS][8];
+    for (int t = 0; t < tokens; ++t)
+        for (int k = 0; k < 8; ++k)
+            route[t][k] = c->table[table_layer * NEXPERTS + selected[t][k]].gate_up == UINT64_MAX ?
+                NULL : c->batch_routes + ((size_t)t * 8 + k) * 4096;
+    int overlap = mode == 2 && glm53f_async_available_12n();
+    int slab = overlap ? c->prefill.slab_tokens : tokens;
+    if (overlap && glm53f_async_begin_12n(c->batch_local, out, tokens, 4096, slab)) return -1;
+#pragma omp parallel
+    {
+        for (int base = 0; base < tokens; base += slab) {
+            int end = base + slab < tokens ? base + slab : tokens;
+#pragma omp for collapse(2) schedule(static)
+            for (int t = base; t < end; ++t)
+                for (int r = 0; r < 4096; r += 64)
+                    glm53f_moe_combine_rows(c->batch_local + (size_t)t * 4096,
+                        route[t], weight[t], r, r + 64);
+#pragma omp single
+            { if (overlap) glm53f_async_ready_12n(end); }
+        }
+    }
+    if (overlap && glm53f_async_finish_12n()) return -1;
+    return overlap ? 2 : 1;
+}
+
 static int moe_prefill_grouped(glm53f_moe_stage_context_12n *c, float *out,
         const float *x, int tokens, int li, int table_layer) {
     enum { H = 4096, PANEL = 4 };
     int selected[GLM53F_PREFILL_MAX_TOKENS][8];
     float route_weight[GLM53F_PREFILL_MAX_TOKENS][8];
-    double begin = c->profile ? MPI_Wtime() : 0.0;
+    double begin = c->profile ? glm53f_clock() : 0.0;
     if (c->rg_mode && c->router_wt) {
         const int gch = 4, ngroups = (tokens + 5) / 6, nch = (ngroups + gch - 1) / gch;
         const uint16_t *wl = c->router_wt + (size_t)li * NEXPERTS * H;
@@ -1302,16 +1383,16 @@ static int moe_prefill_grouped(glm53f_moe_stage_context_12n *c, float *out,
             c->router_bias + (size_t)li * NEXPERTS, NEXPERTS, 8, 2.5f,
             selected[t], route_weight[t]);
     if (c->profile) {
-        c->profile_phase[0] += MPI_Wtime() - begin;
-        begin = MPI_Wtime();
+        c->profile_phase[0] += glm53f_clock() - begin;
+        begin = glm53f_clock();
     }
     moe_profile_occupancy(c, &selected[0][0], tokens);
     /* batch_routes rows of experts without a part on this rank are never read (see the combine below). */
     unsigned char native_done[NEXPERTS];
     memset(native_done, 0, sizeof(native_done));
-    double gp0 = c->profile ? MPI_Wtime() : 0.0;
+    double gp0 = c->profile ? glm53f_clock() : 0.0;
     if (c->gn_mode && moe_native_grouped(c, x, tokens, table_layer, selected, native_done)) return -1;
-    double gp1 = c->profile ? MPI_Wtime() : 0.0;
+    double gp1 = c->profile ? glm53f_clock() : 0.0;
     if (c->gn_mode) c->gn_phase[0] += gp1 - gp0;
     if (c->gn_mode == 2) { /* verify: keep the native rows, recompute everything with the decode kernels */
         if (!c->gn_verify) c->gn_verify = gn_alloc((size_t)GLM53F_PREFILL_MAX_TOKENS * 8 * H * sizeof(float));
@@ -1378,7 +1459,7 @@ static int moe_prefill_grouped(glm53f_moe_stage_context_12n *c, float *out,
             }
         }
     }
-    double gp2 = c->profile ? MPI_Wtime() : 0.0;
+    double gp2 = c->profile ? glm53f_clock() : 0.0;
     c->gn_phase[2] += c->profile ? gp2 - gp1 : 0.0;
     if (c->gn_mode == 2) {
         double se = 0, sr = 0;
@@ -1469,8 +1550,11 @@ static int moe_prefill_grouped(glm53f_moe_stage_context_12n *c, float *out,
         for (size_t i = 0; i < (size_t)tokens * H; ++i) { double d = (double)c->sg_out[i] - c->batch_local[i]; se += d * d; sr += (double)c->batch_local[i] * c->batch_local[i]; }
         if (!c->rank) fprintf(stderr, "GLM53F_MOE_SHARED_VERIFY layer=%d tokens=%d rel_l2=%.3e\n", c->active_layer, tokens, sqrt(se / (sr + 1e-30)));
     }
-    double gp3 = c->profile ? MPI_Wtime() : 0.0;
+    double gp3 = c->profile ? glm53f_clock() : 0.0;
     c->gn_phase[3] += c->profile ? gp3 - gp2 : 0.0;
+    int combined = moe_prefill_combine(c, out, tokens, table_layer, selected, route_weight);
+    if (combined < 0) return -1;
+    if (!combined) {
 #pragma omp parallel for schedule(static)
     for (int q = 0; q < tokens * H; ++q) {
         int t = q / H, i = q - t * H;
@@ -1481,11 +1565,13 @@ static int moe_prefill_grouped(glm53f_moe_stage_context_12n *c, float *out,
                     c->batch_routes[((size_t)t * 8 + k) * H + i];
         c->batch_local[q] += routed;
     }
-    if (c->profile) c->gn_phase[4] += MPI_Wtime() - gp3;
-    if (c->profile) {
-        c->profile_phase[1] += MPI_Wtime() - begin;
-        begin = MPI_Wtime();
     }
+    if (c->profile) c->gn_phase[4] += glm53f_clock() - gp3;
+    if (c->profile) {
+        c->profile_phase[1] += glm53f_clock() - begin;
+        begin = glm53f_clock();
+    }
+    if (combined == 2) return 0;
     if (c->ar_slab > 32) { /* whole-chunk MPI_Allreduce calls: 3.4 ms per 512 tokens vs 17 ms for 4-token panels */
         for (int base = 0; base < tokens; base += c->ar_slab) {
             int n = tokens - base < c->ar_slab ? tokens - base : c->ar_slab;
@@ -1499,7 +1585,7 @@ static int moe_prefill_grouped(glm53f_moe_stage_context_12n *c, float *out,
         if (glm53f_sum_allreduce_12n(c->batch_local + (size_t)base * H,
                                     out + (size_t)base * H, n * H)) return -1;
     }
-    if (c->profile) c->profile_phase[2] += MPI_Wtime() - begin;
+    if (c->profile) c->profile_phase[2] += glm53f_clock() - begin;
     return 0;
 }
 
@@ -1517,7 +1603,7 @@ int glm53f_moe_stage_sublayer_batch_12n(glm53f_moe_stage_context_12n*c,float*out
             (grouped || router_prefill || (getenv("GLM53F_MOE_I8_BATCH_ROUTER") &&
             atoi(getenv("GLM53F_MOE_I8_BATCH_ROUTER"))));
         if (batch_router) {
-            double begin = c->profile ? MPI_Wtime() : 0.0;
+            double begin = c->profile ? glm53f_clock() : 0.0;
             int selected[GLM53F_PREFILL_MAX_TOKENS][8];
             float route_weight[GLM53F_PREFILL_MAX_TOKENS][8];
             const uint16_t *router = c->router_w + (size_t)li * NEXPERTS * 4096;
@@ -1557,22 +1643,22 @@ int glm53f_moe_stage_sublayer_batch_12n(glm53f_moe_stage_context_12n*c,float*out
                         2.5f, selected[t], route_weight[t]);
             }
             if (c->profile) {
-                c->profile_phase[0] += MPI_Wtime() - begin;
-                begin = MPI_Wtime();
+                c->profile_phase[0] += glm53f_clock() - begin;
+                begin = glm53f_clock();
             }
             moe_profile_occupancy(c, &selected[0][0], tokens);
             if (grouped) {
                 if (moe_prefill_int8_local(c, c->batch_local, x, tokens,
                                            table_layer, selected, route_weight)) return -1;
                 if (c->profile) {
-                    c->profile_phase[1] += MPI_Wtime() - begin;
-                    begin = MPI_Wtime();
+                    c->profile_phase[1] += glm53f_clock() - begin;
+                    begin = glm53f_clock();
                 }
                 int slab = tokens > 5 && (c->prefill.features & GLM53F_PREFILL_COMM) ?
                            c->prefill.slab_tokens : 1;
                 if (glm53f_sum_allreduce_slabs_12n(c->batch_local, out,
                                                    tokens, 4096, slab)) return -1;
-                if (c->profile) c->profile_phase[2] += MPI_Wtime() - begin;
+                if (c->profile) c->profile_phase[2] += glm53f_clock() - begin;
                 return 0;
             }
             for (int t = 0; t < tokens; ++t) {
@@ -1580,14 +1666,14 @@ int glm53f_moe_stage_sublayer_batch_12n(glm53f_moe_stage_context_12n*c,float*out
                         x + (size_t)t * 4096, NULL, 0.0f, selected[t],
                         route_weight[t], table_layer)) return -1;
                 if (c->profile) {
-                    c->profile_phase[1] += MPI_Wtime() - begin;
-                    begin = MPI_Wtime();
+                    c->profile_phase[1] += glm53f_clock() - begin;
+                    begin = glm53f_clock();
                 }
                 if (glm53f_sum_allreduce_12n(c->scratch->local_output,
                         out + (size_t)t * 4096, 4096)) return -1;
                 if (c->profile) {
-                    c->profile_phase[2] += MPI_Wtime() - begin;
-                    begin = MPI_Wtime();
+                    c->profile_phase[2] += glm53f_clock() - begin;
+                    begin = glm53f_clock();
                 }
             }
             return 0;
@@ -1607,7 +1693,19 @@ int glm53f_moe_stage_sublayer_batch_12n(glm53f_moe_stage_context_12n*c,float*out
         counts[t]=npart;
     }
     if (c->nsh_native) {
-        for (int t = 0; t < tokens; ++t) {
+        int grouped = 0;
+        if (c->verify_scratch) {
+            glm53f_iq_part iq[4 * MAXP];
+            for (int t = 0; t < tokens; ++t)
+                for (int k = 0; k < counts[t]; ++k) {
+                    const glm53f_expert_part *p = parts + t * MAXP + k;
+                    iq[t * MAXP + k] = (glm53f_iq_part){p->gate_up, p->down,
+                        p->gate_type, p->down_type, p->inter};
+                }
+            grouped = glm53f_iq_expert_weighted_batch(c->batch_local, iq,
+                weights, counts, MAXP, x, tokens, c->verify_scratch) == 0;
+        }
+        for (int t = 0; t < tokens && !grouped; ++t) {
             if (!counts[t]) memset(c->batch_local + (size_t)t * H, 0, H * sizeof(float));
             else glm53f_moe_local_12n(c->batch_local + (size_t)t * H,
                 parts + t * MAXP, weights + t * MAXP, counts[t],
@@ -1684,7 +1782,7 @@ int glm53f_moe_stage_sublayer_batch_12n(glm53f_moe_stage_context_12n*c,float*out
     for(int q=0;q<tokens*H;q++){int t=q/H,i=q-t*H;float v=0.0f;for(int k=0;k<counts[t];k++)v+=weights[t*MAXP+k]*y[((size_t)t*MAXP+k)*H+i];c->batch_local[q]=v+c->batch_shared[q];}
     int rc=glm53f_sum_allreduce_12n(c->batch_local,out,tokens*H);return rc;
 }
-void glm53f_moe_stage_free_12n(glm53f_moe_stage_context_12n*c){if(!c)return;for(int l=0;l<NLAYERS;l++){free(c->s8_gu[l]);free(c->s8_dn[l]);}free(c->s8_xq);free(c->s8_xs);free(c->s8_bt);free(c->s8_xp);free(c->s8_xsp);free(c->s8_ygu);free(c->s8_a8);free(c->s8_as);free(c->s8_bd);free(c->s8_xp2);free(c->s8_asp);free(c->s8_y);for(int l=0;l<NLAYERS;l++){free(c->sg_gu[l]);free(c->sg_dn[l]);}free(c->sg_up);free(c->sg_act);free(c->sg_out);if(c->gn_threads){gn_tbuf*tb=(gn_tbuf*)c->gn_threads;for(int i=0;i<c->gn_nthreads;i++){free(tb[i].xp);free(tb[i].xp2);free(tb[i].a8);free(tb[i].xsp);free(tb[i].Bg);free(tb[i].ygu);free(tb[i].as);free(tb[i].asp);free(tb[i].mina);free(tb[i].yd);free(tb[i].cbuf);}free(c->gn_threads);}free(c->gn_xq);free(c->gn_xs);free(c->gn_bt);free(c->gn_verify);for(int l=0;l<NLAYERS;l++){free(c->nsh_g[l]);free(c->nsh_u[l]);free(c->nsh_d[l]);}free(c->nsh_gv);free(c->nsh_uv);free(c->nsh_act);free(c->nsh_out);free(c->nsh_act_x);free(c->nsh_act_h);free(c->i8_prefill_storage);for(int l=0;l<NLAYERS;l++)free(c->int8_scales[l]);free(c->task_output);free(c->task_activation);free(c->task_up);free(c->batch_routes);free(c->batch_group_x);free(c->batch_router);free(c->batch_local);free(c->batch_shared);free(c->batch_activation);free(c->batch_up);free(c->scratch);free(c->router_logits);free(c->router_bias);free(c->router_i8_scale);free(c->router_i8);free(c->router_wt);free(c->router_w);free(c->shared_blob);free(c->blob);free(c->table);free(c);}
+void glm53f_moe_stage_free_12n(glm53f_moe_stage_context_12n*c){if(!c)return;for(int l=0;l<NLAYERS;l++){free(c->s8_gu[l]);free(c->s8_dn[l]);}free(c->s8_xq);free(c->s8_xs);free(c->s8_bt);free(c->s8_xp);free(c->s8_xsp);free(c->s8_ygu);free(c->s8_a8);free(c->s8_as);free(c->s8_bd);free(c->s8_xp2);free(c->s8_asp);free(c->s8_y);for(int l=0;l<NLAYERS;l++){free(c->sg_gu[l]);free(c->sg_dn[l]);}free(c->sg_up);free(c->sg_act);free(c->sg_out);if(c->gn_threads){gn_tbuf*tb=(gn_tbuf*)c->gn_threads;for(int i=0;i<c->gn_nthreads;i++){free(tb[i].xp);free(tb[i].xp2);free(tb[i].a8);free(tb[i].xsp);free(tb[i].Bg);free(tb[i].ygu);free(tb[i].as);free(tb[i].asp);free(tb[i].mina);free(tb[i].yd);free(tb[i].cbuf);}free(c->gn_threads);}free(c->gn_xq);free(c->gn_xs);free(c->gn_bt);free(c->gn_verify);for(int l=0;l<NLAYERS;l++){free(c->nsh_g[l]);free(c->nsh_u[l]);free(c->nsh_d[l]);}free(c->nsh_gv);free(c->nsh_uv);free(c->nsh_act);free(c->nsh_out);free(c->nsh_act_x);free(c->nsh_act_h);free(c->i8_prefill_storage);for(int l=0;l<NLAYERS;l++)free(c->int8_scales[l]);free(c->task_output);free(c->task_activation);free(c->task_up);glm53f_iq_batch_scratch_free(c->verify_scratch);free(c->batch_routes);free(c->batch_group_x);free(c->batch_router);free(c->batch_local);free(c->batch_shared);free(c->batch_activation);free(c->batch_up);free(c->scratch);free(c->router_logits);free(c->router_bias);free(c->router_i8_scale);free(c->router_i8);free(c->router_wt);free(c->router_w);free(c->shared_blob);free(c->blob);free(c->table);free(c);}
 
 #ifndef GLM53F_EXPERT_NO_MAIN
 int main(int argc, char **argv) {

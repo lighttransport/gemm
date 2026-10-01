@@ -2,6 +2,7 @@
 #define GLM53F_PREFILL_H
 #include <stdlib.h>
 #include <string.h>
+#include "glm53f_runtime.h"
 /* The outer layer tile is independent of verification snapshots, arithmetic
  * panels, and collective payloads. Attention scratch stays bounded at 32. */
 enum { GLM53F_PREFILL_MAX_TOKENS = 512, GLM53F_PREFILL_V5_TOKENS = 256,
@@ -16,12 +17,14 @@ typedef struct {
     int slab_tokens;             /* 4, 8, 16 or 32; independent of arithmetic. */
     unsigned features;           /* Diagnostic ablation; zero keeps v5 kernels. */
     float *gemm_arena;            /* Internal model-owned scratch; callers use NULL. */
-    int collective;              /* 0=default, 1=MPI, 2=ring, 3=tree, 4=packed tree. */
+    int collective;              /* 0=default, 1=MPI, 2=ring, 3=tree, 4=packed tree, 5=multi-TNI. */
 } glm53f_prefill_config;
 
 /* Shared argument parser. Returns 1 if consumed, 0 if unknown, -1 if invalid. */
 static inline int glm53f_prefill_option(glm53f_prefill_config *c,
                                        int argc, char **argv, int *index) {
+    int runtime = glm53f_runtime_option(argc, argv, index);
+    if (runtime) return runtime;
     const char *key = argv[*index];
     if (strcmp(key, "--prefill-mode") && strcmp(key, "--prefill-slab") &&
         strcmp(key, "--prefill-features") && strcmp(key, "--prefill-collective")) return 0;

@@ -36,6 +36,16 @@ void glm53f_iq_place_part(const uint8_t *gate_up, size_t gate_row_bytes, int gat
 int glm53f_iq_expert_weighted(
     float *output, const glm53f_iq_part *parts, const float *weights,
     int count, const float *input, float *gate_up, float *activation);
+typedef struct glm53f_iq_batch_scratch glm53f_iq_batch_scratch;
+glm53f_iq_batch_scratch *glm53f_iq_batch_scratch_create(void);
+void glm53f_iq_batch_scratch_free(glm53f_iq_batch_scratch *scratch);
+/* Up to four native verification positions, each with up to eight parts.
+ * Parts/weights use part_stride entries per token. Grouping preserves each
+ * token's scalar fast/reference selection and original route-sum order. */
+int glm53f_iq_expert_weighted_batch(float *output,
+    const glm53f_iq_part *parts, const float *weights, const int *counts,
+    int part_stride, const float *input, int tokens,
+    glm53f_iq_batch_scratch *scratch);
 
 int glm53f_iq_matvec(
     float *output, const uint8_t *weight, int weight_type,
@@ -83,6 +93,7 @@ int glm53f_native_act_prepare_team(void *storage, const float *input, int column
  * activation and the team synchronized. */
 int glm53f_native_matvec_team(const glm53f_native_matrix *m, int count,
                               const void *activation);
+int glm53f_native_matvec_prepared_n(const glm53f_native_matrix *m, int count, const void *activation);
 int glm53f_native_matvec_n(const glm53f_native_matrix *m, int count,
                            const float *input);
 /* Token-major inputs/outputs: input stride = columns, each output stride =
