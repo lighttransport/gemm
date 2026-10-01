@@ -1,4 +1,4 @@
-# Resume: GLM-5.3-Flash A64FX kernel efficiency + QLAIR accuracy (updated 2026-09-28 21:30)
+# Resume: GLM-5.3-Flash A64FX kernel efficiency + QLAIR accuracy (updated 2026-10-01 18:30)
 
 ## Goal
 Run GLM-5.3-Flash (GLM53F) efficiently on A64FX. Targets:
@@ -266,26 +266,80 @@ result. See `kern/KERNELS.md`. Clair gained `glm53f/sprobe/random_line.c`, a
 same-ELF scalar/SVE random-line control; its 4/16 MiB native/event comparison
 is in `glm53f/STATUS.md`. The event HBM path remains uncalibrated.
 
+## Session 2026-09-30 – 2026-10-01: 12-node integrated optimization (glm53f commits 1e4e2317..d283eed8, pushed)
+
+Real model (UD-Q4_K_XL, 12 ranks × 47 threads, compact `NODE_SPEC=2x3x2` allocations). All numbers are end-to-end
+on 12 nodes.
+
+| | start | now (HEAD d283eed8) |
+|---|---|---|
+| Decode, 128 steps | 20.9–24.5 tok/s | 38.1–38.8 tok/s (26.0 ms/token) |
+| Prefill, 8k prompt | 41.8 tok/s | 285 tok/s (301 with load-time prewarm, see below) |
+
+Decode per token (ms): attention 11.2, FFN 9.4 (router 1.6, routed+shared 4.1, allreduce 2.7), mHC 4.9, head 0.44.
+Prefill per position (ms, 8k): KDA 0.66, sparse 1.2 (MLA 0.57, allreduce 0.27, front 0.25, index 0.21), MoE 1.24, mHC 0.25.
+
+**Landed (default on; each has an env switch to disable, and the exact `check` gate pins it off):**
+- Prefill MoE: grouped native Q4_K/Q5_K/Q6_K GEMM through the panel64 int8 tile (`GLM53F_MOE_NATIVE_GROUPED`), router GEMM,
+  shared expert GEMM, whole-chunk MPI combine.
+- Prefill attention: batched native MLA (`GLM53F_SPARSE_MLA_BATCH`); KDA column recurrence + int8 panel GEMM projections
+  + vector conv + 64-token tile (`GLM53F_KDA_GEMM`, `GLM53F_KDA_TILE_TOKENS`); sparse q_a|kv_a, q_b, o_proj on the same
+  panel GEMM (`GLM53F_SPARSE_GEMM`).
+- Async KDA tile reduction on the spare core 59 (`GLM53F_KDA_ASYNC`): KDA 0.81 → 0.66 ms/pos, tokens identical.
+- Multi-TNI uTofu allreduce (`--prefill-collective mtni`, and decode `GLM53F_MTNI_DECODE`).
+- Decode: full-width SVE Q4_K/Q5_K rows (`glm53f_iq_fast.h`, `GLM53F_IQ_FAST`) fused with the native shared expert in one
+  region (`GLM53F_MOE_FUSE_SHARED`); single-team mHC (`GLM53F_MHC_FAST`) with bit-identical SVE Sinkhorn; fused sparse
+  front (`GLM53F_SPARSE_FUSE_FRONT`); KDA early weight prefetch (`GLM53F_KDA_PREFETCH`); Q8_0R prefetch 16 KiB ahead.
+- NUMA: `MPOL_INTERLEAVE` over the compute CMGs (`GLM53F_NUMA_INTERLEAVE`) and a per-CMG re-touch of the lm_head table
+  (head 2.37 → 0.45 ms).
+- `GLM53F_PREWARM=1` (set by the `generate` runner) builds the KDA/sparse panel copies at model load. This moves ~1 s of
+  one-time setup out of the timed prefill (285 → 301 tok/s on 8k); steady-state per-token speed is unchanged, so do not
+  compare 301 with older prefill numbers.
+- MTP speculative decode runs (`run_glm53f_q4_mtp_12n.sh`), alpha 0.77, greedy-equivalent, but at 27.8 tok/s it is slower
+  than plain decode: the batched verify is per-token in KDA/MoE.
+
+**Tried and left off / reverted:**
+- `GLM53F_SPARSE_ASYNC=1` (async sparse o_proj reduction with MPI for the other tile collectives): stalls once the
+  context passes ~2k tokens (likely concurrent MPI + raw uTofu on one TNI).
+- `GLM53F_PF_PLAN=1` (prefetch next-stage weights during mHC): attention/FFN −1.7 ms but mHC +1–3 ms; net neutral.
+- mHC next-site prefetch, 256 B-aligned mHC slices (synthetic −6%, real decode worse), `GLM53F_MHC_FAST=2`,
+  CMG-affine expert placement, scalar-pipe Q4_K min term, thread count / soft barrier sweeps: no gain.
+
+**Lessons:**
+- The async-KDA "hang" was starvation: a pthread created by the bound OpenMP master inherits core 12. Pin helpers to
+  `first core + omp_get_max_threads()`.
+- `__builtin_prefetch(p, 0, 1)` (L3 keep) does nothing on A64FX; use locality 0 or 2. Q8_0R wants 16 KiB look-ahead.
+- Synthetic single-node benchmarks predict kernel changes well (MoE rows, Q8 prefetch) but not mHC/barrier-structure
+  changes; always confirm on the 12-node decode.
+- Decode is latency/sync bound (~18 µs fixed cost per matvec stage × ~270 stages); prefill TP comm has a floor of about
+  0.57 ms/pos (≈1750 tok/s cap) at one-link Tofu ingest.
+
+**Gate:** `run_glm53f_12n.sh check` passed at 8dac6c41 with the fast paths pinned off. It was not rerun after the sparse
+GEMM / prewarm commits (those were validated by identical generated tokens on 8k).
+
+**Benchmarks added:** `bench_glm53f_iq_decode.c` (decode MoE step + read floor + prefetch sweep), `bench_glm53f_native_q8.c`,
+`bench_glm53f_mhc.c`, `bench_glm53f_allreduce_12n.c`, `bench_glm53f_async_reduce.c`, `bench_glm53f_moe_{native,q4,grouped}.c`,
+`test_glm53f_iq_fast.c`. Run synthetic benches with `OMP_WAIT_POLICY=active FLIB_BARRIER=HARD`.
+
 ## Next steps (priority)
 1. **Simulator.**
    - Memory model: the Nagare engine owns it now. Feed it `sprobe` cells0 (native direct streams, random, L2) plus the PMU groups. The event backend's candidate `HBM_LATENCY=238` is physically backed but not promoted.
    - Event core: scalar random-load MLP (LCG `ldr` loop: 11 sim vs 29 native cycles/iter; `/local/stf3.*` repro described in STATUS). Then the K-quant unpack residual and the ld8u6 base-ADD rule.
    - Keep `FP_HOLD_LOAD=4` diagnostic until a direct lifetime probe supports it.
    - Acceptance: `measurements/hw-20260927b/eval_probes.sh`, the kernel gate (`compare.py`), and `sprobe/cellcmp.py`.
-2. **Decode.** Validate the opt-in Q8 panel path on 12 nodes with a real
-   model token and tok/s A/B. Expect close numerical agreement rather than
-   bit identity because the panel accumulates FP32 blocks in a new order.
-   Then integrate K-quant panels and evaluate flag or hardware barriers in
-   `glm53f_target_decode_12n.c`. Check production weight page placement.
-3. **Prefill.** Integrate `gk_gemm_panel64` into the production prefill with these rules:
-   - pad the output row stride (`P`);
-   - split tokens across CMGs and panels within a CMG (`t`), with each CMG's token share balanced by its busiest thread (47 threads);
-   - use one weight replica per CMG.
-
-   Remaining kernel gap: 59% (48T) vs 66% when the replica is L2-hot. W8A8 per-channel remains a gated lossy option.
+2. **Decode (38.5 tok/s).** Remaining levers: multi-token verify kernels so MTP pays off (verify(2) costs ~2× one
+   step today); merge the router into the mHC region (~0.4 ms); vectorise the mHC post step; fewer stages per layer.
+   100 tok/s needs a persistent per-layer kernel or similar, not more incremental fusions.
+3. **Prefill (285 tok/s steady state).** Rerun the exact `check` gate on HEAD. Next: sparse async reduction without
+   the MPI/uTofu conflict (one collective owner), MoE combine overlap, MLA (0.57 ms/pos). Beyond ~1750 tok/s the
+   TP allreduce layout itself has to change.
 4. Re-run the qwen38 nine-case event gate; its static cross ELF is off-node.
 
 ## Gotchas
+- **Staging** a new 12-node job takes 20 min to 4 h (Lustre load); use the wide-striped copy `~/models/glm53f-gguf-wide/`.
+  The interactive job lasts 6 h; check `pjstat` start time rather than the queue estimate.
+- **Fugaku FS lags rsync'd files:** compile only after the file is visible (md5) and use fresh script names.
+- **Only one mpiexec per allocation** ("plexec must be started sequentially"); kill leftovers before the next run.
 - **XOS paging:** export `XOS_MMM_L_PAGING_POLICY=demand:demand:demand` (`hwexec.sh` does).
 - **Atomics under QLAIR:** they work in functional and legacy modes since d00b417c, but the event backend rejects them. Harnesses still skip spin barriers when CNTFRQ == 2e9.
 - **SVE and syscalls:** any inline `svc` must clobber z0–z31/p0–p15 (`qsys.h`), or native SVE state is silently lost.
