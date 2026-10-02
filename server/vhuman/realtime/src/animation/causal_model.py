@@ -1,4 +1,4 @@
-"""Trainable direct-TTS adapter. No untrained checkpoint is accepted for inference."""
+"""Optional Torch reference for legacy adapters and native training parity."""
 import torch
 from torch import nn
 
@@ -33,7 +33,23 @@ class CausalMotion(nn.Module):
 
 class ReferenceMotionAdapter:
     def __init__(self, checkpoint, revision, device="cpu", allow_diagnostic=False):
-        data = torch.load(checkpoint, map_location="cpu", weights_only=True)
+        from pathlib import Path
+        import json
+        source = Path(checkpoint)
+        bundle = source if source.is_dir() else source.with_suffix('.native')
+        metadata = bundle/'native.json'
+        if metadata.is_file() and json.loads(metadata.read_text()).get('training_backend') == 'repository_cpu_gemm':
+            from ....rig import safetensors
+            from ..avatar.provenance import sha256
+            data = json.loads(metadata.read_text())
+            weights = bundle/'motion.safetensors'
+            if (sha256(weights) != data['weights_sha256'] or
+                    (source.is_file() and sha256(source) != data['source_sha256'])):
+                raise ValueError('native training checkpoint checksum mismatch')
+            tensors, _ = safetensors.load(weights)
+            data.update(format='vhuman.tts_motion.v1',state_dict={k:torch.tensor(v.copy()) for k,v in tensors.items()})
+        else:
+            data = torch.load(checkpoint, map_location="cpu", weights_only=True)
         if data.get("format") != "vhuman.tts_motion.v1" or not data.get("trained") or data.get("tts_revision") != revision:
             raise ValueError("checkpoint is untrained, incompatible, or uses different TTS weights")
         if data.get("purpose") != "production" and not (allow_diagnostic and data.get("purpose") == "diagnostic"):

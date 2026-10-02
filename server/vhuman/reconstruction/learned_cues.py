@@ -173,10 +173,9 @@ def infer(image,checkpoint,out,prior_file=None):
 
 def validate_real(checkpoint,prepared,candidate,out):
     """Real scan-normal ablation; evaluates frozen weights, never optimizes them."""
-    import torch
     from PIL import Image
     from scipy.ndimage import binary_erosion
-    from ..rig import safetensors as st
+    from ..native_models import run_image_model
     from ..rig.common import vertex_normals
     from . import observations
     checkpoint,prepared,candidate,out=map(Path,(checkpoint,prepared,candidate,out))
@@ -184,8 +183,6 @@ def validate_real(checkpoint,prepared,candidate,out):
     report=json.loads((checkpoint/'report.json').read_text())
     if report.get('architecture')!=ARCHITECTURE:raise ValueError('unsupported cue architecture; train with the current implementation')
     if sha256(checkpoint/'normal_cue.safetensors')!=report['weights_sha256']:raise ValueError('cue checkpoint changed')
-    tensors,_=st.load(checkpoint/'normal_cue.safetensors');model=network(report.get('resolution',64))
-    model.load_state_dict({k:torch.tensor(v) for k,v in tensors.items()});model.eval()
     doc=observations.load(prepared/'held-out.json')
     with np.load(prepared/'held-out_reference.npz',allow_pickle=False) as z:truth=z['positions'];tri=z['triangles']
     manifest=json.loads((candidate/'manifest.json').read_text())
@@ -222,8 +219,9 @@ def validate_real(checkpoint,prepared,candidate,out):
         n=(bn[base_tri[base_ids[by,bx]]]*base_bary[by,bx,:,None]).sum(1)@camera.rotation.T
         n/=np.maximum(np.linalg.norm(n,axis=1,keepdims=True),1e-9);base[by,bx]=n
         image=np.asarray(Image.open(view['image_path']).convert('RGB').transform((64,64),Image.Transform.AFFINE,(span/64,0,left,0,span/64,top),resample=Image.Resampling.BILINEAR),np.float32)/255
-        with torch.inference_mode():prediction,logits=model(torch.tensor(image.transpose(2,0,1)[None]),torch.tensor(base.transpose(2,0,1)[None]))
-        estimated=prediction[0].permute(1,2,0).numpy();probability=torch.sigmoid(logits)[0,0].numpy()
+        inputs=np.concatenate((image,base),axis=2).transpose(2,0,1)
+        prediction=run_image_model('cues',checkpoint/'normal_cue.safetensors',inputs)
+        estimated=prediction[:3].transpose(1,2,0);probability=prediction[3]
         estimated_metrics=metrics(estimated.transpose(2,0,1)[None],gt.transpose(2,0,1)[None],mask[None])
         baseline_metrics=metrics(base.transpose(2,0,1)[None],gt.transpose(2,0,1)[None],mask[None])
         union=((probability>.5)|(ids>=0)).sum();iou=float(((probability>.5)&(ids>=0)).sum()/max(union,1))

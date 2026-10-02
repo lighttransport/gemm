@@ -29,7 +29,7 @@ CUDA driver/NVRTC, and the native binaries. The default Gaussian renderer does
 not import Torch, gsplat, ONNX or another model runtime. Build it with:
 
 ```sh
-make -C cpu/vhuman libvhuman_motion.so
+make -C cpu/vhuman libvhuman_motion.so libvhuman_training.so
 make -C cuda/vhuman libvhuman_runtime.so libvhuman_splat.so
 # Use a NumPy/Pillow/SciPy interpreter; the existing framework-free environment:
 tmp/mhr-native/runtime/bin/python -m server.vhuman.realtime doctor
@@ -73,8 +73,10 @@ sh server/vhuman/realtime/run.sh doctor
 
 The live speech-to-expression adapter runs its two-layer GRU through
 `cpu/vhuman/libvhuman_motion.so`, with repository CPU GEMM and no Torch/ONNX
-inference. Training automatically exports a sibling `.native/` bundle. Convert
-older trained checkpoints once with a Torch-capable interpreter:
+inference. Motion training also runs in native C++ with repository CPU GEMM,
+GRU backpropagation, gradient clipping and AdamW. It writes safetensors and JSON
+directly to a `.native/` bundle. Convert older Torch checkpoints once with a
+Torch-capable interpreter:
 
 ```sh
 python -m server.vhuman.realtime.src.animation.export_native \
@@ -83,9 +85,12 @@ python -m server.vhuman.realtime.src.animation.export_native \
 
 `--adapter` accepts the exported directory or the original `.pt` path (resolved
 to its sibling `.native/` directory with a source-hash check). Missing or stale
-exports fail explicitly. Existing revision, diagnostic/production and epoch/
-sequence checks remain in force. Offline training and explicit gsplat reference
-comparisons still use Torch; the complete live inference process is framework-free.
+exports fail explicitly. For new training, prefer a `.native` directory output.
+A file-shaped output such as `motion.pt` is now a JSON training receipt with a
+sibling `.native/` bundle, rather than a Torch checkpoint. Existing revision,
+diagnostic/production and epoch/sequence checks remain in force. Gaussian
+appearance training and explicit gsplat reference comparisons still use Torch;
+native motion training and the complete live inference process are framework-free.
 
 For scheduling, audio replay, native model adapters, geometry and receipt tools,
 install only `requirements-runtime.txt` in a separate interpreter and run
@@ -339,9 +344,9 @@ adapter compatibility. Features from different hidden sizes cannot be mixed.
 
 ```sh
 sh server/vhuman/realtime/run.sh train-motion --manifest motion-corpus.json \
-  --output tmp/vhuman-realtime/motion.pt --epochs 20
+  --output tmp/vhuman-realtime/motion.native --epochs 20
 sh server/vhuman/realtime/run.sh live --rig "$RIG" \
-  --avatar tmp/vhuman-realtime/avatar.npz --adapter tmp/vhuman-realtime/motion.pt \
+  --avatar tmp/vhuman-realtime/avatar.npz --adapter tmp/vhuman-realtime/motion.native \
   --model /mnt/nvme01/models/speech/Qwen3-TTS-12Hz-0.6B-CustomVoice \
   --revision ACTUAL_MODEL_SAFETENSORS_SHA256 \
   --text 'こんにちは。' --sink device --resident --tts-threads 4 --display
@@ -353,13 +358,30 @@ with recurrent state reset per utterance epoch. Training uses active-control wei
 Huber loss and temporal velocity; validation features never set normalization. Named retargeting handles tongueOut in
 the extra controls. Missing controls become neutral. No LLM is integrated.
 
+Native training currently uses CPU, at most 32 feature records per truncated
+backpropagation chunk, and an explicit thread budget (default 4). Optimizer resume
+is not implemented. Initialization follows the reference distributions with a
+NumPy seed; it does not reproduce Torch's random stream. CPU reference checks
+passed with maximum forward error 5.96e-8, gradient error 1.49e-8, and AdamW error
+4.77e-7 when supplied identical gradients. GPU and visual quality validation of
+newly trained assets are deferred.
+
+```sh
+python -m unittest server.vhuman.test_native_training \
+  server.vhuman.realtime.test_training.MotionTrainingTests -v
+# Optional CPU Torch oracle, isolated from the training runtime:
+python ref/vhuman/verify_motion_training.py --output tmp/motion-training-parity.json
+```
+
 
 ## Reproduce the exercised clean PoC
 
 The following generated assets exist locally under ignored `tmp/`. They are not
 bundled pretrained production models. Recreating the identity can produce a
 slightly different portrait across library/hardware changes; manifests record
-seeds, revisions and image hashes.
+seeds, revisions and image hashes. This section records the earlier assets and
+their legacy training run; its quality results do not validate the new native
+trainer.
 
 ```sh
 HEAD=tmp/vhuman-realtime/clean-heads/heads/f17ebe3fd0e6

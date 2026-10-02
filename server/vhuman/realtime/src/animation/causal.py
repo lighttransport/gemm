@@ -1,4 +1,4 @@
-"""Framework-free streaming adapter; the Torch model is imported only for training."""
+"""Framework-free streaming adapter; Torch is an optional legacy/reference model."""
 from .native_motion import MotionAdapter
 
 

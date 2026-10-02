@@ -29,6 +29,9 @@ for name in ('server.vhuman.cli', 'server.vhuman.video', 'server.vhuman.rig.mlde
              'server.vhuman.realtime.src.avatar.native_identity',
              'server.vhuman.realtime.src.benchmark.motion',
              'server.vhuman.realtime.src.benchmark.appearance',
+             'server.vhuman.realtime.src.animation.train',
+             'server.vhuman.rig.soft_deformer',
+             'server.vhuman.reconstruction.learned_cues',
              'server.vhuman.realtime.src.renderer.gaussian'):
     importlib.import_module(name)
 from server.vhuman.video_backend import select

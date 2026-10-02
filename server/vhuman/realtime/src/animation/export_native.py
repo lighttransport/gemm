@@ -1,4 +1,4 @@
-"""Offline conversion of trained motion adapters; Torch is used only here."""
+"""Native training bundle writer and optional legacy Torch conversion."""
 import argparse
 import hashlib
 import json
@@ -10,6 +10,35 @@ def sha256(path):
     with open(path,'rb') as f:
         for b in iter(lambda:f.read(8<<20),b''):h.update(b)
     return h.hexdigest()
+
+
+def save_training(checkpoint, data, tensors):
+    """Write safetensors directly; file-shaped outputs are JSON receipts.
+
+    Directory outputs are native bundles. File outputs (including old .pt CLI
+    paths) keep the existing sibling-.native runtime resolution. No pickle or
+    framework serialization is used by native training.
+    """
+    from ....rig import safetensors
+    checkpoint = Path(checkpoint)
+    directory = not checkpoint.suffix or checkpoint.suffix == '.native' or checkpoint.is_dir()
+    bundle = checkpoint if directory else checkpoint.with_suffix('.native')
+    bundle.mkdir(parents=True, exist_ok=True)
+    source = bundle/'training.json' if directory else checkpoint
+    source.parent.mkdir(parents=True, exist_ok=True)
+    data = dict(data, format='vhuman.native_motion_training.v1', backend='repository_cpu_gemm')
+    safetensors.save(bundle/'motion.safetensors', tensors)
+    data['weights_sha256'] = sha256(bundle/'motion.safetensors')
+    partial = source.with_name(source.name+'.partial')
+    partial.write_text(json.dumps(data, indent=2, allow_nan=False)+'\n')
+    partial.replace(source)
+    spec = {k:data[k] for k in ('trained','purpose','hidden_size','names','ranges','tts_revision')}
+    spec.update(format='vhuman.native_motion.v1', text_feed=data.get('text_feed','incremental'),
+                weights_sha256=data['weights_sha256'], source_sha256=sha256(source), training_backend=data['backend'])
+    partial = bundle/'native.json.partial'
+    partial.write_text(json.dumps(spec,indent=2,allow_nan=False)+'\n')
+    partial.replace(bundle/'native.json')
+    return bundle
 
 
 def export(checkpoint, output=None):

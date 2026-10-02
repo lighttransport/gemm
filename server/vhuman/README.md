@@ -781,6 +781,9 @@ Further dependency removal (items 6, 9, 10 and 12):
 | Video parity campaign | Framework-free dump conversion, bounded-memory comparison and 144-case coverage audit; official inference is an isolated Torch oracle |
 | Rig asset helpers | Contact export and shape smoothing use NumPy/SciPy; corrective training loads `mldeformer_training` lazily |
 | Motion evaluation | Native GRU by default; Torch full-sequence comparison only with `--reference-parity` |
+| Motion training | Native CPU embedding/projection/GRU forward and backpropagation, weighted Huber/temporal loss, gradient clipping and AdamW; direct safetensors/JSON output |
+| Modal soft-deformer training | Repository CPU GEMM for bounded randomized PCA; NumPy thin QR/SVD and oscillator/ridge fitting; no Torch or GPU session |
+| Frozen normal-cue evaluation | Existing native image runner for real-domain evaluation; no Torch model loading |
 | Identity reference creation | Native FLUX.2 F16/repository-GEMM neutral and reference-conditioned expressions; full distilled-4B four-step T2I/I2I parity passed with CUDA text encoding and FP32 KV storage; no Torch/ONNX inference |
 
 Photo and video landmark/blendshape inference now uses the native C++ executor
@@ -804,6 +807,19 @@ path ran successfully on RTX 5060 Ti without Torch or ONNX installed. The new
 Hunyuan backend passed the complete fast12 image-to-video pipeline described
 above; its quality profiles and expression timing remain experimental.
 
+Training dependency removal is incremental. Motion training and modal PCA now
+use `cpu/vhuman/libvhuman_training.so`, with repository GEMM and native AdamW;
+NumPy/SciPy remain ordinary array, factorization and geometry dependencies. CPU
+GRU checks cover forward/state, all parameter gradients, chunk boundaries and
+optimizer updates. Complete motion and modal training also pass with Torch,
+ONNX and other model frameworks blocked. The optional CPU oracle is
+`ref/vhuman/verify_motion_training.py`; reports are under
+`tmp/vhuman-native-training/`. New training quality and GPU checks are deferred.
+Remaining Torch training paths include contact/ARAP corrective fitting and its
+MLP, the normal-cue CNN, Gaussian appearance fitting, and some registration and
+expression optimizers. Legacy checkpoint conversion and independent reference
+checks retain optional framework imports.
+
 GPU checks on 2026-10-02 also passed the saved independent RMBG and MoGe
 oracles. RMBG maximum alpha error was 1.42e-5 (output mask at most one uint8
 level); MoGe maximum output error was 1.17e-5 and FOV error 8.17e-7 radians.
@@ -813,7 +829,7 @@ SM return value. Reports are under `tmp/vhuman-native-gpu/`.
 Build from the repository root:
 
 ```sh
-make -C cpu/vhuman vhuman_models libvhuman_motion.so test
+make -C cpu/vhuman vhuman_models libvhuman_motion.so libvhuman_training.so test
 make -C cuda/vhuman
 ```
 
