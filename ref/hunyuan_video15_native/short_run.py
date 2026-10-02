@@ -31,6 +31,33 @@ def experiment_lock(cancel):
         finally:fcntl.flock(file,fcntl.LOCK_UN)
 
 
+def terminate_group(process):
+    """Stop descendants even when their session leader has already exited."""
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.wait(timeout=.5)
+    deadline = time.monotonic() + .5
+    while True:
+        live = False
+        for path in Path('/proc').iterdir():
+            if not path.name.isdigit():
+                continue
+            try:
+                fields = (path / 'stat').read_text().rsplit(')', 1)[1].split()
+            except (FileNotFoundError, ProcessLookupError, PermissionError):
+                continue
+            if int(fields[2]) == process.pid and fields[0] not in ('Z', 'X'):
+                live = True
+                break
+        if not live:
+            return
+        if time.monotonic() >= deadline:
+            raise TimeoutError('experiment process group did not terminate')
+        time.sleep(.01)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--out', type=Path, required=True)
@@ -57,7 +84,7 @@ def main():
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, lambda unused, unused_frame: cancel.set())
     started = time.monotonic()
-    timer = threading.Timer(args.seconds - .75, cancel.set)
+    timer = threading.Timer(args.seconds - min(3., args.seconds * .75), cancel.set)
     timer.start()
     report = dict(schema='hv15n.short_experiment.v1', status='running', command=command,
                   budget_seconds=args.seconds, full_pipeline_acceptance=False,
@@ -73,26 +100,25 @@ def main():
     try:
         with experiment_lock(cancel),gpu_reservation(args.native_pid, args.native_run, report, write, cancel):
             try:
+                if cancel.is_set():
+                    raise TimeoutError('experiment cancelled before launch')
                 with args.out.with_suffix('.log').open('w') as log:
                     process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, env=env, start_new_session=True)
                     sampler.start(process.pid)
                     while process.poll() is None:
                         if cancel.wait(.05):
-                            os.killpg(process.pid, signal.SIGKILL)
-                            process.wait(timeout=.5)
                             raise TimeoutError('experiment cancelled or exceeded wall-clock budget')
                     report.update(returncode=process.returncode, status='pass' if process.returncode == 0 else 'failed')
             finally:
-                if process is not None and process.poll() is None:
-                    os.killpg(process.pid, signal.SIGKILL)
-                    process.wait(timeout=.5)
+                if process is not None:
+                    try:
+                        terminate_group(process)
+                    finally:
+                        process = None
     except BaseException as error:
         report.update(status='timeout' if isinstance(error, TimeoutError) else 'failed', error=str(error))
     finally:
-        # Terminate before releasing/resuming the reservation even on errors.
-        if process is not None and process.poll() is None:
-            os.killpg(process.pid, signal.SIGKILL)
-            process.wait(timeout=.5)
+        # The inner finally drains the group before releasing the reservation.
         sampler.close()
         timer.cancel()
         report.update(elapsed_seconds=time.monotonic() - started,

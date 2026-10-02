@@ -20,23 +20,44 @@ def samples(values,warm):
 def pair(entry):
     native,reference=[Path(entry[name]) for name in ('native','reference')]
     parity_path=native/'parity.json';parity=json.loads(parity_path.read_text())
-    if not parity['pass_all'] or parity.get('full_pipeline_acceptance') is not False:
+    results=parity.get('results',{})
+    if (parity.get('pass_all') is not True or parity.get('full_pipeline_acceptance') is not False
+        or not results or any(v.get('pass') is not True for v in results.values())
+        or any(v.get('pass_all') is not True for v in parity.get('frames',[]))):
         raise ValueError('an accepted bounded parity report is required')
+    for field,suffix in (('outputs','.f32'),('output_metadata','.json')):
+        hashes=parity.get(field,{})
+        if set(hashes)!=set(results):raise ValueError('parity report lacks complete artifact hashes; rerun compare')
+        for name in results:
+            for backend,folder in (('native',native),('reference',reference)):
+                if hashes[name].get(backend)!=digest(folder/(name+suffix)):
+                    raise ValueError('stale parity artifact: '+backend+' '+name+suffix)
+    for backend,folder in (('native',native),('reference',reference)):
+        if parity.get('timing_sha256',{}).get(backend)!=digest(folder/'timing.json'):
+            raise ValueError('stale or unbound replay timing: '+backend)
+        receipt=folder.with_suffix('.json')
+        expected=parity.get('receipt_sha256',{}).get(backend)
+        if expected!=(digest(receipt) if receipt.is_file() else None):
+            raise ValueError('stale replay execution receipt: '+backend)
     timings=[json.loads((folder/'timing.json').read_text()) for folder in (native,reference)]
     warm=entry.get('warm',True)
     n,r=[samples(t['wall_seconds'],warm) for t in timings]
     receipts=[]
-    for folder in (native,reference):
+    for backend,folder,timing in zip(('native','reference'),(native,reference),timings):
         path=folder.with_suffix('.json')
         if path.is_file():
             receipt=json.loads(path.read_text())
-            if receipt['status']!='pass' or receipt['elapsed_seconds']>=60:
+            if receipt['status']!='pass' or not 0<receipt['elapsed_seconds']<60:
                 raise ValueError('replay execution failed or exceeded one minute')
-            if receipt.get('sampled_peak_vram_mib',0)>14336:raise ValueError('VRAM budget exceeded')
+            peak=receipt.get('sampled_peak_vram_mib')
+            if peak is not None and not 0<=peak<=14336:raise ValueError('invalid VRAM sample or budget exceeded')
             receipts.append(dict(path=str(path),sha256=digest(path),elapsed_seconds=receipt['elapsed_seconds'],
                                  sampled_peak_vram_mib=receipt.get('sampled_peak_vram_mib'),
                                  executable_sha256=receipt.get('executable_sha256')))
-        else:receipts.append(None)
+        else:
+            if backend=='native' or timing.get('device')!='cpu_fp32':
+                raise ValueError('GPU replay requires a bounded execution receipt')
+            receipts.append(None)
     return dict(label=entry['label'],scope='warm_component' if warm else 'staged_block_segment',
                 native=n,reference=r,native_over_reference=n['median']/r['median'],
                 on_par_or_faster=n['median']<=r['median'],parity=parity['results'],

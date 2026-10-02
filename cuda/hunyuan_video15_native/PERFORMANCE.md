@@ -66,13 +66,19 @@ and quality of the optimized build remain provisional**, including later
 denoising steps and VAE tile blending.
 
 Receipts, raw fixtures and outputs are under `tmp/hv15-native/opt-results/`.
-`performance-v2.json` summarizes accepted replay pairs (SHA256
-`3f4e52da9b77064390655d1e1f71be1695ff208fc9006cdee4084790bfd536f6`). The state-carry
+`performance-v3.json` summarizes accepted replay pairs (SHA256
+`95f60b7406405d2685801a820c221b6eb56dfcfd91655aa61488ec2b45de531b`).
+The pre-push audit rechecks the same saved tensors and leaves all timing samples
+unchanged; `performance-v2.json` is retained as the earlier report. The state-carry
 reports are `fast-chain16-54-v1/chain.json` (preceded by `fast-chain0-*` and
 `fast-chain8-*`) and `quality-pair8-54-v1/chain.json` (preceded by
 `quality-pair0-*`). Each GPU receipt binds its executable/source hashes,
-timing budget, memory samples and baseline pause interval. Parity reports bind
-fixture hashes; newer reports also bind raw output hashes.
+timing budget, memory samples and baseline pause interval. Refreshed parity
+reports bind fixture, raw output, metadata, timing and execution receipt hashes;
+the reporter rejects changed or unbound artifacts. Audit regression tests cover
+descendant cleanup before releasing the GPU and baseline resumption after a
+stalled monitor. A strict repository GPU math check passes in 3.42 seconds with
+zero vendor/fallback calls, and the frozen baseline resumes unchanged.
 Reproduction is documented in the
 [bounded replay procedure](../../ref/hunyuan_video15_native/README.md#bounded-optimization-replays).
 

@@ -100,7 +100,7 @@ def gpu_reservation(pid, run, report, write, cancel):
             if proc_record(pid)["state"] != "T":
                 cancel.wait(.25)
                 continue
-            sample = subprocess.check_output(["nvidia-smi", "pmon", "-c", "1", "-s", "u"], text=True)
+            sample = subprocess.check_output(["nvidia-smi", "pmon", "-c", "1", "-s", "u"], text=True, timeout=2)
             rows = [line.split() for line in sample.splitlines() if line.strip() and not line.lstrip().startswith("#")]
             owned = next((row for row in rows if row[1] == str(pid)), None)
             utilization = 0 if owned is None or owned[3] == "-" else int(owned[3])

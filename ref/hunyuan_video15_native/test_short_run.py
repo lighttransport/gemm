@@ -2,7 +2,9 @@
 from contextlib import contextmanager,nullcontext
 import importlib.util
 import json
+import os
 from pathlib import Path
+import signal
 import sys
 import tempfile
 import unittest
@@ -22,7 +24,7 @@ class Sampler:
 
 
 class ShortRun(unittest.TestCase):
-    def invoke(self,command,seconds=2):
+    def invoke(self,command,seconds=2,check_descendant=False):
         with tempfile.TemporaryDirectory(dir=SCRATCH) as directory:
             report=Path(directory)/'receipt.json'
             released=[]
@@ -33,6 +35,15 @@ class ShortRun(unittest.TestCase):
                     # Every Popen must have been waited before resuming a baseline.
                     for process in spawned: self.assertIsNotNone(process.poll())
                     released.append(True)
+                    if check_descendant:
+                        pid=int(report.with_suffix('.log').read_text().strip())
+                        try:
+                            state=(Path('/proc')/str(pid)/'stat').read_text().rsplit(')',1)[1].split()[0]
+                        except FileNotFoundError:
+                            state='X'
+                        if state not in ('Z','X'):
+                            os.kill(pid,signal.SIGKILL)
+                        self.assertIn(state,('Z','X'),'descendant still running when reservation released')
             spawned=[]
             original=runner.subprocess.Popen
             def spawn(*args,**kwargs):
@@ -57,6 +68,12 @@ class ShortRun(unittest.TestCase):
 
     def test_success(self):
         code,result=self.invoke('print("PASS")')
+        self.assertEqual(code,0)
+        self.assertEqual(result['status'],'pass')
+
+    def test_exited_leader_cannot_leave_descendant(self):
+        command='import subprocess,sys;child=subprocess.Popen([sys.executable,"-c","import time;time.sleep(30)"]);print(child.pid,flush=True)'
+        code,result=self.invoke(command,check_descendant=True)
         self.assertEqual(code,0)
         self.assertEqual(result['status'],'pass')
 

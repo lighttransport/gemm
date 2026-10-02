@@ -138,8 +138,10 @@ OPENBLAS_NUM_THREADS=1 python3 ref/hunyuan_video15_native/replay.py compare \
 ```
 
 Each receipt/output directory must be fresh. `short_run.py` defaults to a
-55-second budget and kills the child process group on failure or timeout
-before resuming its baseline. Imports, loading, compilation, reservations and
+55-second budget and terminates the child process group before resuming its
+baseline, including descendants left after a successful leader exit. It reserves
+time for cleanup and limits each GPU-idle monitor call to two seconds.
+Imports, loading, compilation, reservations and
 capture writes count toward that budget. It serializes short experiments,
 samples process VRAM/RSS, rejects VRAM above 14,336 MiB, and records executable,
 private/shared source hashes. Scratch and compiler caches stay in the repository.
@@ -180,7 +182,8 @@ buffer reuse, weight transfers/cache hits, kernel calls and managed VRAM.
 `compare` reads bounded chunks of raw float32 outputs, fails on missing,
 empty, mismatched or nonfinite data, applies cosine ≥0.9999 and relative L2
 ≤0.02, and checks every decoded frame separately. Fixture hashes, checkpoint
-identity and output hashes bind the gate to its inputs. No replay receipt can
+identity, raw output/metadata, timing and execution receipt hashes bind the gate
+to its inputs and measured run. No replay receipt can
 satisfy full-pipeline acceptance. Final speed/quality still require the normal
 complete-video gates when that work is authorized.
 
@@ -188,7 +191,11 @@ complete-video gates when that work is authorized.
 pairs. Each entry provides `label`, `native`, `reference`, and optional `warm`
 (default true). Warm comparisons require a cold plus at least two warm samples;
 staged one-forward segments use `warm: false`. Reports retain the remaining
-performance gaps. See the measured
+performance gaps. Changed or unbound artifacts are rejected; rerun `compare`
+with the original fixtures to refresh older parity reports. GPU timings require
+a successful bounded execution receipt. Existing CPU encoder references are
+explicitly identified as `cpu_fp32` and may have no launcher receipt.
+See the measured
 [candidate results](../../cuda/hunyuan_video15_native/PERFORMANCE.md#optimized-bounded-replays).
 
 ```sh

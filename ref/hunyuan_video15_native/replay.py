@@ -208,7 +208,10 @@ def main():
         atomic_json(args.actual / 'parity.json', dict(results=result, frames=frames,pass_all=all(v['pass'] for v in result.values()) and all(v['pass_all'] for v in frames),
                     scope='bounded_production_shape_replay', full_pipeline_acceptance=False,
                     fixture_sha256=digest(args.fixture / 'case.json'),
-                    outputs={name:{backend:digest(folder/(name+'.f32')) for backend,folder in (('native',args.actual),('reference',args.out))} for name in names}))
+                    outputs={name:{backend:digest(folder/(name+'.f32')) for backend,folder in (('native',args.actual),('reference',args.out))} for name in names},
+                    output_metadata={name:{backend:digest(folder/(name+'.json')) for backend,folder in (('native',args.actual),('reference',args.out))} for name in names},
+                    timing_sha256={backend:digest(folder/'timing.json') if (folder/'timing.json').is_file() else None for backend,folder in (('native',args.actual),('reference',args.out))},
+                    receipt_sha256={backend:digest(folder.with_suffix('.json')) if folder.with_suffix('.json').is_file() else None for backend,folder in (('native',args.actual),('reference',args.out))}))
         print(json.dumps(result))
         if not all(v['pass'] for v in result.values()) or not all(v['pass_all'] for v in frames):
             raise ValueError('replay parity failed')
