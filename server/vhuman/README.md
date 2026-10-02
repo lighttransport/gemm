@@ -15,8 +15,44 @@ The default `--video-backend repo` selects repository GEMM and rejects cuBLAS
 fallback. Build with `make -C cuda/hunyuan_video15_native`, stage the pinned model
 assets, then launch with `--video-model DIR --video-experimental`. The standalone
 `video` CLI uses an existing head portrait. This backend currently supports 81
-frames; GPU parity, expression quality and the 16 GB memory fit are unverified.
+frames. A complete fast12 image-to-video run passed numerical parity and the
+16 GB memory budget on RTX 5060 Ti; expression timing remains experimental.
 The runner uses public Google SigLIP; FLUX.1-Redux is not used.
+
+The 2026-10-02 validation used 480×848, 81 frames at 24 fps, seed 42 and
+12 denoising steps. All encoders, all denoising intermediates, the final latent
+and all 81 decoded frames passed independent references (FP32 text/vision
+encoders, official FP16 DiT/VAE). Final latent relative L2 was `0.002146`, decoded
+RGB `0.003141`, and the worst frame `0.006661`. This prompt contains no quoted
+text, so ByT5 used its empty-text branch. The run made 6,068,402 repository-GEMM
+calls with zero cuBLAS/fallback calls. Sampled peak process VRAM was 3,108 MiB
+and host RSS 16,237 MiB. Wall time was 3,690 seconds; this was a validation run
+with two short concurrent encoder probes, not an isolated performance benchmark.
+
+The full independent reference was first accepted for a matching cuBLAS baseline.
+`ref/vhuman/verify_hunyuan_backend.py` then checked both generation receipts,
+model hashes, recipe, byte-identical noise and prepared images before comparing
+the strict-GEMM run directly with those saved reference tensors. This comparison
+requires no Torch. Reports, manifests, a contact sheet and the completed video
+are under `tmp/hv15-integration-review/`. Reproduce the final comparison with:
+
+```sh
+tmp/mhr-native/runtime/bin/python ref/vhuman/verify_hunyuan_backend.py \
+  --candidate-run tmp/hv15-integration-review/full-repo-run \
+  --candidate-actual tmp/hv15-integration-review/full-repo-captures \
+  --baseline-run tmp/hv15-integration-review/full-fast12-v5/run \
+  --baseline-actual tmp/hv15-integration-review/full-fast12-v5/actual \
+  --baseline-reference tmp/hv15-integration-review/full-fast12-v5/reference \
+  --output tmp/hv15-integration-review/full-repo-parity.json
+python -m unittest ref.vhuman.test_hunyuan_backend
+```
+
+The generated face and framing remain stable, but “smiles gently, then relaxes”
+produces a sustained broad smile. Native landmarks detected a face in all 81
+frames; mean left/right smile scores were 0.009 initially, 0.975 at peak and
+0.963 at the end. These are diagnostics, not perceptual acceptance. Quality50
+T2V/I2V profiles, quoted-text rendering and the wider expression matrix remain
+unvalidated; this fast12 result does not promote those profiles.
 
 The explicit `--video-backend legacy` retains the
 [ggml-based runner](../../cuda/hunyuan_video15/README.md) and its 81/121-frame
@@ -741,7 +777,7 @@ Further dependency removal (items 6, 9, 10 and 12):
 | Path | Current dependency boundary |
 |---|---|
 | Live rig and Gaussian rendering | Native C/C++ CUDA deformation, covariance bounds, projection, tile sorting, rasterization, streams/events and sRGB/alpha download; no Torch/gsplat inference |
-| Hunyuan server inference | Repository C++/CUDA backend with strict repository GEMM and no vendor fallback; GPU parity pending |
+| Hunyuan server inference | Repository C++/CUDA backend; full fast12 I2V pipeline and all 81 frames passed independent references, 3,108 MiB peak VRAM, zero cuBLAS/fallback calls; quality profiles remain unvalidated |
 | Video parity campaign | Framework-free dump conversion, bounded-memory comparison and 144-case coverage audit; official inference is an isolated Torch oracle |
 | Rig asset helpers | Contact export and shape smoothing use NumPy/SciPy; corrective training loads `mldeformer_training` lazily |
 | Motion evaluation | Native GRU by default; Torch full-sequence comparison only with `--reference-parity` |
@@ -765,8 +801,8 @@ Photographic-reference conditioning now has a native VAE encoder and DiT path.
 Registration/optimization, training
 and checkpoint export may still use Torch. The live speech/GRU/rig/render/record
 path ran successfully on RTX 5060 Ti without Torch or ONNX installed. The new
-Hunyuan backend still needs full model/pipeline validation; its repository-only
-GPU kernel tests passed with zero cuBLAS/fallback calls.
+Hunyuan backend passed the complete fast12 image-to-video pipeline described
+above; its quality profiles and expression timing remain experimental.
 
 GPU checks on 2026-10-02 also passed the saved independent RMBG and MoGe
 oracles. RMBG maximum alpha error was 1.42e-5 (output mask at most one uint8
