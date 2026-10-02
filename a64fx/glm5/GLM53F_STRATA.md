@@ -298,11 +298,21 @@ stopped with exact final streams/state but mismatched per-position means;
 complete state with zero bit mismatches (minimum7.835 GiB). The short128 state run then fails during rank4 MTP context creation before
 timing; a benchmark diagnostic retry confirms context=0 with workspace and
 hidden allocation successful. Tensor/component diagnostics are cross-built
-in candidate-mtp-v7 for the next allocation. No MTP acceptance or throughput
-result is claimed. See [MTP progress](strata-mtp-progress-20261002.json).
-There is **no new full-model MTP throughput or promotion result yet**.
-`tmp/strata-mtp-20261002/` contains frozen source hashes, build logs and
-campaign scripts; `resume-strata.md` records the current queue state.
+in candidate-mtp-v7. Reading the complete preserved rank4 log identifies a
+compact-core miss for `layers.45.enorm.weight`: the reader cached strictness
+from target initialization and ignored the benchmark's temporary MTP fallback.
+The reader now caches the core image but evaluates `GLM53F_REPACK_REQUIRE`
+on each read. A distinct-payload fixture checks target core reuse, exact draft
+checkpoint fallback and restored strict rejection in both row/column paths,
+from strict-first and optional-first initialization. All40 checks, ASan/UBSan
+and18 launcher tests pass; both old-header counterfactuals fail.
+
+Immutable candidate-mtp-v8 cross-build passes with the repaired shared reader.
+Fresh PJM52097252 restaging and serial native/full-model qualification are
+queued. There is **no new full-model MTP throughput or promotion result yet**.
+See [loader regression/build record](strata-repack-policy-20261002.json) and
+[MTP progress](strata-mtp-progress-20261002.json). `resume-strata.md` records
+the active staging and qualification owners; old allocation paths are expired.
 
 ## mHC synchronization candidate (October 2)
 

@@ -79,11 +79,15 @@ typedef struct {
 static int glm53f_st_repack_read(const char *kind, const char *name,
                                  size_t a, size_t b, size_t c,
                                  void *dst, size_t nbytes) {
-    static int initialized, fd = -1, strict;
+    static int initialized, fd = -1;
     static glm53f_st_repack_entry *entries;
     static int nentries;
     const char *dir = getenv("GLM53F_REPACK_DIR");
     if (!dir || !*dir) return 1;
+    /* Cache the core image, not its policy. Target construction requires the
+     * core, while MTP temporarily permits checkpoint fallback for layer 45. */
+    const char *require = getenv("GLM53F_REPACK_REQUIRE");
+    const int strict = require && atoi(require) != 0;
     if (!initialized) {
         char manifest[4096], blob[4096], line[8192], parsed_name[512];
         const char *rank_s = getenv("PMIX_RANK");
@@ -92,8 +96,6 @@ static int glm53f_st_repack_read(const char *kind, const char *name,
         if (!rank_s || !*rank_s) rank_s = getenv("PJM_MPI_RANK");
         if (!rank_s || !*rank_s) rank_s = getenv("OMPI_COMM_WORLD_RANK");
         if (rank_s && *rank_s) rank = atoi(rank_s);
-        const char *require = getenv("GLM53F_REPACK_REQUIRE");
-        strict = require && atoi(require) != 0;
         if (snprintf(manifest, sizeof(manifest), "%s/rank%02d.core.manifest", dir, rank) >= (int)sizeof(manifest) ||
             snprintf(blob, sizeof(blob), "%s/rank%02d.core.blob", dir, rank) >= (int)sizeof(blob) ||
             !(f = fopen(manifest, "r"))) {

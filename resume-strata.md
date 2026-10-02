@@ -1,12 +1,13 @@
 # Resume: GLM53F Strata-inspired optimization, 12 A64FX nodes
 
-Updated 2026-10-02 18:23 JST. Capacity4096 is fully qualified and promoted:
-35.462134 decode /412.273634 prefill tok/s, +10.6% prefill against its fresh
-control. Q8 and lookup complete without promotion. Opt-in MoE padding is
-implemented; its exact full-model gates pass, but confirmation rejects promotion.
-Corrected MTP prompt checks pass, but the short run exposes rank4 context
-construction failure. Fresh PJM52097252 is restaging; mHC qualification follows.
-Normalized MTP needs tensor/component diagnosis before decode qualification. Neither 100/2000 target is met.
+Updated 2026-10-02 18:46 JST. Capacity4096 remains the promoted recipe:
+35.462134 decode /412.273634 prefill tok/s. Neither 100/2000 target is met.
+The normalized MTP constructor failure is diagnosed and fixed: compact-core
+strictness was cached from target creation and ignored temporary checkpoint
+fallback for layer45. Local regression, old-header counterfactual, sanitizers,
+18 launcher tests and isolated A64FX cross-build pass. Fresh PJM52097252 is
+restaging; corrected serial qualification PID597 follows stage PID134.
+No new acceptance or full-model MTP throughput result is available yet.
 
 Previous campaign: TP12 implementation, native validation and
 short/8K/synthetic 32K qualification complete. All new paths remain opt-in.
@@ -15,6 +16,47 @@ request, 100+ delivered decode and 2000+ prefill tok/s. Neither target met.
 See `a64fx/glm5/GLM53F_STRATA.md` for implementation, gates and commands.
 
 ## Active continuation (October 2, afternoon)
+
+**Current loader-policy fix and queue.** `common/glm53f_safetensors.h` caches
+only the core image and reads `GLM53F_REPACK_REQUIRE` per request. The preserved
+rank4 log exposes the missing `model.language_model.layers.45.enorm.weight`
+entry before the constructor failure. Strict target loading initializes the
+cache; MTP then temporarily allows layer45 checkpoint reads and restores
+strictness. The old reader retained strictness throughout. Regression fixture
+uses distinct target core bytes and draft checkpoint bytes, row and column
+reads, both initialization policies and repeated strict/optional transitions:
+40 exact checks pass; both old-header runs fail. ASan/UBSan and18 launcher
+checks pass. See [loader evidence](a64fx/glm5/strata-repack-policy-20261002.json).
+
+Immutable **candidate-mtp-v8** rebuilds the shared reader implementation in
+KDA and relinks the diagnostic benchmark/checker, normal runner and MTP cache
+checker, preserving other math objects. Cross-build sentinel passes. Benchmark
+SHA `35a1777695f8926c4c9f897859bcfa25cd7f6e1c6a41e3419f068854a762b24a`,
+checker `c48d409f5459b195dc82bfab7c9361e676c52e6c3cdaa2836481edfee941d3ce`.
+Frozen update-v1 SHA
+`37760e30b8d2bbef0b3aafebd699e0d5b5127c5f2293b29eb3a937be255fb79c`.
+
+Fresh **PJM52097252**,12 nodes compact2×3×2, normal2GHz/eco0, starts18:18
+and expires00:18 JST October3. Bridge host`c30-7008c`,42446→32446→21264;
+local tmux`glm53f-strata-next4`. Same isolated remote checkout and helper.
+**Stage PID134** owns `tmp/strata-next-20261002-1818/stage.sh`; its PID file
+contains `STRATA_NEXT4_STAGE_PID=134`. Driver requires routed/native/embed/
+head/core/shared and layer45 sentinels before native validation. Fresh stage
+paths have suffix52097252;52085859 paths are expired. Do not overlap MPI.
+
+**Qualification PID597**, `tmp/strata-repack-20261002/driver.{sh,pid,log}`,
+waits for staging then runs native fast/conservative policy checks, controller/
+cache gates, corrected8049 prompt means, short128/8K MTP fullstate and fresh/
+rebuilt controls. Depths1–4 adaptive/always count only delivered transitions
+and include teacher forcing in prefill. Independent five-trial confirmation
+precedes context stress for candidates meeting1.05 decode/.98 prefill ratios.
+Independent mHC state/timing qualification follows even if MTP rejects. New
+outputs are `tmp/strata-repack-20261002/results/` and
+`tmp/strata-mhc-sync-20261002/results-next4/`; new-run guard00:00 JST October3.
+The first queued PID544 exited before MPI because its PID guard parsed the
+labelled staging PID file as a number; repaired PID597 is the current queue.
+
+The following earlier allocation records are retained as historical evidence.
 
 The promoted recipe compiles capacity 4096 and attention panel 47, then selects
 `--prefill-chunk 4096`. Keep 47 threads, page `none`, Q8 panel 0, sparse async 0,
@@ -99,7 +141,7 @@ next, followed by independent timed controls/depths. **candidate-mtp-v5** retain
 `6367bc1999ea2fc7a6cf63799f4e77305f4c08d559c10f9ec6f0012b07bef618`.
 Benchmark SHA `c6c1a6381ccb30adbdf186c67d09f9f44b45c2aa79afee73dc560b2b7efd9040`.
 Frozen source-v3 SHA `337e92cc60624c75078f78f3d4feea6693c2fa846215f408565b84cdda21e618`.
-Stages `/local/glm53f-mtp-{routed,shared}-52085859` already exist; do not restage.
+The previous stages `/local/glm53f-mtp-{routed,shared}-52085859` belonged to the expired allocation; current stages use52097252.
 `campaign-v2.log` failed. **Completed MTP state campaign PID20602 (failed short construction)**,
 `state-campaign-v3.{sh,py,log}`, uses new `state-results-v3/` outputs. It checks
 corrected prompt means, short128 and8K depth4-always full decode state with
@@ -109,8 +151,7 @@ with `GLM53F_BENCH_CREATE_FAIL rank=4 phase=mtp context=0 workspace=1 hidden=1`.
 No IDs/acceptance/throughput result exists. Candidate-mtp-v7 adds tensor-read /
 component-pointer failure logs; its cross-build passes. Benchmark SHA
 `48f42109d53905515396c0cf8d7109bbe757364cdc6649d7b70cd32cdda418e1`.
-Next job must diagnose construction before short/8K state and multitrial
-qualification. See [MTP progress](a64fx/glm5/strata-mtp-progress-20261002.json). Include every teacher-forcing cost in prefill
+This constructor diagnosis is complete and fixed in candidate-mtp-v8 above; short/8K state and multitrial qualification remain pending. See [MTP progress](a64fx/glm5/strata-mtp-progress-20261002.json). Include every teacher-forcing cost in prefill
 and count only delivered target transitions in decode. No MTP throughput or
 acceptance result exists yet. See [native MTP record](a64fx/glm5/strata-mtp-native-20261002.json).
 

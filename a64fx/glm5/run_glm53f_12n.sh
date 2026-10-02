@@ -96,6 +96,7 @@ if [ "$command" = benchmark ]; then
 fi
 if [ "$command" = check ]; then
     for test in kquant native_batch moe_layout prefill_config team mhc_team lookup moe_combine index_heads index_keys4 pool_select mla_absorb mla_value mla_cache_f16 mla_attention; do "$GLM53F_BIN_DIR/test_glm53f_$test"; done
+    for required in 1 0; do "$GLM53F_BIN_DIR/test_glm53f_repack_policy" "$logdir" "$required"; done
     for iq_mode in 0 1; do GLM53F_IQ_FAST=$iq_mode "$GLM53F_BIN_DIR/test_glm53f_iq_grouped"; done
     mpi_run check-lookup "$GLM53F_BIN_DIR/test_glm53f_lookup_spec"
     grep 'GLM53F_LOOKUP_SPEC PASS' "$last_log".*.0

@@ -1,0 +1,84 @@
+{
+  "status": "Loader-policy regression and cross-build PASS; post-stage native/full-model MTP qualification queued; no new throughput claim",
+  "allocation": 52097252,
+  "candidate": "candidate-mtp-v8",
+  "root_cause": {
+    "previous_allocation": 52085859,
+    "diagnostic": "GLM53F_REPACK_MISS kind=R name=model.language_model.layers.45.enorm.weight a=0 b=8192 c=0",
+    "behavior": "Compact-core strictness was cached on the first target read, so temporary MTP checkpoint fallback was ignored.",
+    "fix": "Keep the cached core image but evaluate GLM53F_REPACK_REQUIRE for every read."
+  },
+  "regression": {
+    "initial_policies": [
+      1,
+      0
+    ],
+    "cases_per_policy": 20,
+    "checks": [
+      "Distinct compact target bytes remain exact in row/column reads",
+      "Missing draft rows/columns fall back to exact checkpoint bytes only while optional",
+      "Restored strict mode rejects draft rows/columns"
+    ],
+    "gcc_flags": "-std=c11 -O2 -Wall -Wextra -Wpedantic -Werror",
+    "fixed": "40 cases PASS",
+    "counterfactual_old_header": "Both initial policies fail with exit1 and 18 attempted cases each",
+    "sanitizers": "ASan/UBSan both initial policies PASS; leak detection disabled under tracing",
+    "launcher": "18 tests PASS; check invokes both policy orders",
+    "shell_syntax": "Build/launcher/campaign PASS"
+  },
+  "cross_build": {
+    "status": "MTP_REPACK_POLICY_CROSS_BUILD_PASS",
+    "compiler": "FCCpx/mpifccpx Clang frontend, tcsds-1.2.43",
+    "arch": "armv8.2-a+sve",
+    "capacity": 4096,
+    "attention_panel": 47,
+    "native_policy_math_modes": [
+      "fast",
+      "conservative"
+    ],
+    "rebuilt": [
+      "KDA object owning shared safetensors implementation",
+      "Benchmark",
+      "Prompt-state checker",
+      "Normal runner",
+      "MTP cache checker",
+      "Both policy-unit math modes"
+    ],
+    "other_math_objects": "Frozen existing normalized-MTP/mHC source and objects; no arithmetic change",
+    "artifact_sha256": {
+      "bench_glm53f_run_12n": "35a1777695f8926c4c9f897859bcfa25cd7f6e1c6a41e3419f068854a762b24a",
+      "glm53f_prefill_chunk_check_12n": "c48d409f5459b195dc82bfab7c9361e676c52e6c3cdaa2836481edfee941d3ce",
+      "glm53f_target_decode_12n": "74d63493f55b947927ab6363550a31b87fb3b4e59eae435ad1d6d48d5f4c5af5",
+      "test_glm53f_mtp_cache_12n": "62a0df9477146d77956b03af64407b38567a74cadbb271a7c8a080563a485506",
+      "test_glm53f_repack_policy-conservative": "662c42f949461bc5421737c4d97ce79145dbb5f540e6dc0baa083f4c08e44f3b",
+      "test_glm53f_repack_policy-fast": "de7c0132427c39f48d4e824074c6212ba833170ddb0eb6a3ee1e5b09fb7b843b"
+    },
+    "update_archive_sha256": "37760e30b8d2bbef0b3aafebd699e0d5b5127c5f2293b29eb3a937be255fb79c"
+  },
+  "source_sha256": {
+    "common/glm53f_safetensors.h": "d95774cb426e67236f31c6bf54a386b337db520f069d5866b7d9ea89911b630e",
+    "a64fx/glm5/test_glm53f_repack_policy.c": "b4d7cb6029708107149e2baa576859cabf8e175e6167939524d0fe1172bfbc95",
+    "a64fx/glm5/build_glm53f_integrated_12n.sh": "df37fdffb1817a61df1b70e3b5489c6a2649f16751561629ccb68f0a92c79dde",
+    "a64fx/glm5/run_glm53f_12n.sh": "e859f03f6730b61d3156c186f5d979f63c91fafa6fd8dffd7cfdf7ea87b50cd8",
+    "a64fx/glm5/test_glm53f_launcher.py": "ca3869b82648ea667326c792e9391aeef1442f12adcce33b62da98f5d57305c5"
+  },
+  "queue": {
+    "stage_pid": 134,
+    "driver_pid": 597,
+    "remote_directory": "~/work/gemm/glm53f-strata-20261001/tmp/strata-repack-20261002",
+    "serial_phases": [
+      "Wait for routed/native/embed/head/core/shared and layer45 staging sentinels",
+      "Native fast/conservative policy units",
+      "Native896-case MTP controller and2051-position cache/rollback check",
+      "8049 prompt means/full-state gate",
+      "Short128 and8K depth4-always full-state gates",
+      "Fresh/rebuilt controls and depths1-4 adaptive/always",
+      "Independent5-trial confirmation; context stress only if promotion thresholds pass",
+      "Independent mHC full-state gate and full-model timing"
+    ],
+    "new_run_deadline_JST": "2026-10-03 00:00:00",
+    "stages": "Fresh52097252 paths; old52085859 allocation expired"
+  },
+  "targets_met": false,
+  "promoted": false
+}

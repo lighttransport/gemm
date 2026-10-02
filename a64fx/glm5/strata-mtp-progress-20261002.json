@@ -1,5 +1,5 @@
 {
-  "status": "Normalized MTP prompt8049 gate PASS; short128 state run fails during MTP context construction on rank4 before timing; no throughput or acceptance claim",
+  "status": "Previous constructor failure diagnosed and loader fixed; local regression/counterfactual/sanitizers/cross-build PASS; native/full-model rerun queued on52097252",
   "allocation": 52085859,
   "prompt_gate": [
     "GLM53F_PREFILL_CHUNK_CHECK tokens=8049 reference_chunk=4096 candidate_chunk=4096 capacity=4096 compare_moe_layout=0 hidden_bit_mismatches=0 capture_hidden=1 prompt_hidden_bit_mismatches=0 state=BIT_EXACT first_token=624/624 min_MemAvailable_GiB=7.834778 PASS"
@@ -14,18 +14,20 @@
     "8049-position prompt mean/finalstream/complete KDA/sparse state"
   ],
   "incomplete": [
+    "Native loader-policy regression after fresh staging",
     "Short128 MTP decode/fullstate",
     "8K MTP decode/fullstate",
     "Fresh/rebuilt throughput controls and delivered-transition depth sweep",
-    "Independent confirmation and contextstress",
-    "Tensor/component constructor diagnostic retry"
+    "Independent confirmation and contextstress"
   ],
   "artifacts": {
     "prompt_checker": "candidate-mtp-v5",
     "failed_benchmark": "candidate-mtp-v6",
     "component_diagnostic": "candidate-mtp-v7",
     "v6_benchmark_sha256": "305802c9c46d45ddc3f17c47bd391aceb07e74b9e8eb1c89b646369a0af385e4",
-    "v7_benchmark_sha256": "48f42109d53905515396c0cf8d7109bbe757364cdc6649d7b70cd32cdda418e1"
+    "v7_benchmark_sha256": "48f42109d53905515396c0cf8d7109bbe757364cdc6649d7b70cd32cdda418e1",
+    "loader_fix": "candidate-mtp-v8",
+    "v8_benchmark_sha256": "35a1777695f8926c4c9f897859bcfa25cd7f6e1c6a41e3419f068854a762b24a"
   },
   "evidence": {
     "remote_directory": "~/work/gemm/glm53f-strata-20261001/tmp/strata-mtp-20261002",
@@ -44,5 +46,13 @@
   },
   "next_allocation": 52097252,
   "targets_met": false,
-  "promoted": false
+  "promoted": false,
+  "constructor_root_cause": {
+    "previous_allocation": 52085859,
+    "diagnostic": "GLM53F_REPACK_MISS kind=R name=model.language_model.layers.45.enorm.weight a=0 b=8192 c=0",
+    "behavior": "Compact-core strictness was cached on the first target read, so temporary MTP checkpoint fallback was ignored.",
+    "fix": "Keep the cached core image but evaluate GLM53F_REPACK_REQUIRE for every read."
+  },
+  "loader_fix_record": "strata-repack-policy-20261002.json",
+  "active_driver_pid": 597
 }
