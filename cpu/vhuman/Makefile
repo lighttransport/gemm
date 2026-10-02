@@ -32,8 +32,8 @@ tokenizer_probe: tokenizer_probe.c ../../common/gguf_loader.h ../../common/bpe_t
 libvhuman_landmarks.so: landmarks.cpp $(AVX_OBJ)
 	$(CXX) -O3 -std=c++17 -Wall -Wextra -Wpedantic -fopenmp $(if $(AVX_OBJ),-mavx2 -mfma) -fPIC -shared -o $@ $< $(AVX_OBJ)
 
-libvhuman_training.so: training.cpp $(AVX_OBJ)
+libvhuman_training.so: training.cpp corrective_training.cpp $(AVX_OBJ)
 	$(CXX) -O3 -std=c++17 -Wall -Wextra -Wpedantic -fopenmp $(if $(AVX_OBJ),-DVH_TRAIN_AVX2 -mavx2 -mfma) -fPIC -shared -o $@ $< $(AVX_OBJ)
 
-test_vhuman_training: test_vhuman_training.cpp training.cpp $(AVX_OBJ)
+test_vhuman_training: test_vhuman_training.cpp training.cpp corrective_training.cpp $(AVX_OBJ)
 	$(CXX) -O3 -std=c++17 -Wall -Wextra -Wpedantic -fopenmp $(if $(AVX_OBJ),-DVH_TRAIN_AVX2 -mavx2 -mfma) -o $@ $< $(AVX_OBJ)

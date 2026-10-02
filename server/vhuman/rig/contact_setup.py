@@ -129,6 +129,6 @@ def export_contacts(tmpl, feat, skel, teeth, rest, tongue=None):
     for ring in (1, 0, -1, -2):
         ids = tmpl.ring_ids('mouth', ring)
         for j in range(1, T.MOUTH_HALF):
-            up.append(ids[j]); lo.append(ids[T.MOUTH_N - j])
+            up.append(int(ids[j])); lo.append(int(ids[T.MOUTH_N - j]))
     result.update(pairs_upper=up, pairs_lower=lo, head=joints['head'], jaw=joints['jaw'])
     return result

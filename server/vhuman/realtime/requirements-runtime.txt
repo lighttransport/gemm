@@ -6,6 +6,6 @@ scipy
 opencv-python-headless
 # Optional output packages: pygame, pyvirtualcam, nvidia-ml-py.
 # CUDA inference rendering uses libvhuman_splat.so and libvhuman_runtime.so.
-# Native motion and modal soft-deformer training require no model framework.
-# Optional Torch paths: Gaussian appearance, cue CNN and corrective training,
+# Native motion, corrective and modal soft-deformer training need no framework.
+# Optional Torch paths: Gaussian appearance, cue CNN and registration fitting,
 # legacy checkpoint conversion, and explicit offline reference checks.

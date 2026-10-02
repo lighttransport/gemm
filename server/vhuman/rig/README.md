@@ -156,11 +156,11 @@ shipping default.
 | Texture | `bake.py` | Per texel: closest subject surface point → subject UV; base colour / ORM resampled, normal map re-expressed into the template's tangent frames (keeps geometric detail the template lacks). |
 | Skeleton | `skeleton.py` | Joint placement from features (jaw hinge in front of/below the ear, incisors behind the lip seam, tongue along the mouth floor, eyes at the fitted eyeballs). |
 | Weights | `skinning.py` | root/neck/head/jaw; lips split exactly at the seam, jaw boundary from the mouth corners to the hinge, surface diffusion. |
-| Shapes | `expressions.py` | 51 `lr.face.v1` expression shapes + 4 correctives. Lids rotate about the eyeball centre (blink closes each upper sample onto its lower partner); `mouthClose` is solved against the jaw skinning; light PyTorch sparse-Laplacian smoothing. |
+| Shapes | `expressions.py` | 51 `lr.face.v1` expression shapes + 4 correctives. Lids rotate about the eyeball centre (blink closes each upper sample onto its lower partner); `mouthClose` is solved against the jaw skinning; NumPy/SciPy sparse-Laplacian smoothing. |
 | Mouth | `mouthparts.py` | 28 teeth on a smooth dental arch (overbite/overjet), swept gums, lofted tongue skinned to the tongue chain. |
 | Carried meshes | `attach.py` | Eyeballs from `head_eyes.glb` (rigid on the eye joints); tearlines, caruncles and eyeshells follow the lids through a surface wrap. |
 | Rig | `rigdef.py` | Controls → correctives → sparse joint-delta matrix + blendshape weights (+ ML corrective weights) → LBS. Identical code in `web/vhuman_rig.html`. |
-| Deformer | `torchrig.py`, `mldeformer.py`, `mlruntime.py`, `native.py` | Batched PyTorch rig, contact/ARAP ground truth, PCA + MLP2 training, numpy runtime, native package + ctypes. |
+| Deformer | `native_corrective.py`, `mldeformer_training.py`, `mlruntime.py`, `native.py` | Native CPU contact/ARAP ground truth, repository GEMM/AdamW and MLP backpropagation, bounded regional PCA, NumPy runtime, native package + ctypes. |
 | Export | `gltf.py`, `usd.py` | glTF: one skin, sparse morph targets (POSITION + NORMAL), `extras.targetNames`. USD: SkelRoot/Skeleton/BlendShape, vchar control metadata, a range-of-motion `SkelAnimation`. |
 
 ## Deformer
@@ -170,7 +170,7 @@ viewer and native C:
 
 1. **Linear rig** (below): blendshapes, correctives and LBS.
 2. **ML corrective deformer** (`mldeformer.py`, trained per head during the
-   build; `--deformer-samples 0` skips it). A PyTorch ground-truth solve
+   build; `--deformer-samples 0` skips it). A native C++ ground-truth solve
    relaxes the linear result for ~2k sampled control combinations:
    anchoring to the rig, ARAP soft tissue against the rest shape (rotations
    by a batched polar Newton iteration), and contacts. Lids stay outside
@@ -185,7 +185,7 @@ viewer and native C:
    - morph targets `ml_mean`, `ml_00…` in rig.glb and rig.usda, with weights
      from the MLP (`rig.json` `ml_deformer`).
    - `deformer.json`: statistics, including contacts on held-out controls for
-     the linear rig and for linear + ML (reference man: eye 11403→2132,
+     the linear rig and for linear + ML (earlier Torch-trained reference man: eye 11403→2132,
      teeth 1782→756, lips 3607→1723 contact vertices).
 3. **Native runtime**: `ryzen/vhuman_deformer.{h,c}` loads
    `rig_deformer.safetensors` (written by `native.py`: the welded head,
@@ -210,6 +210,33 @@ Contacts (ground truth, the viewer's heat map and `viz.json`): lid vertices vs
 the eyeballs, lip/vestibule vertices vs sphere sets (per-tooth spheres on the
 teeth joints; three spheres per tongue cross-section on the blended tongue
 joints), and upper vs lower lip pairs on rings 1..-2.
+
+Corrective training now runs on CPU without Torch/ONNX. Build
+`make -C cpu/vhuman libvhuman_training.so`; the builder uses this path by default.
+Sphere/lip contact energies and gradients, edge/anchor gradients, twelve-step
+polar rotations, MLP forward/backpropagation and AdamW are native C++.
+Batched rig projections and morph blending use repository GEMM; NumPy handles
+small skin transforms and 3x3 inverse-skinning solves. Regional randomized PCA
+uses repository GEMM and NumPy thin QR/SVD. PCA and initialization use a NumPy
+random stream, so newly trained weights need independent quality evaluation.
+The `.lrm` and basis formats stay compatible with existing runtimes. Optional
+solve caches are non-pickle NPZ (`vhuman.corrective_solve.v1`) and reject changes
+to controls, rig geometry, contacts and solver settings; old Torch caches are
+not loaded. Optimizer resume and GPU training are not implemented.
+
+```sh
+make -C cpu/vhuman test
+python -m unittest server.vhuman.test_native_corrective -v
+# Optional CPU math oracle, in an interpreter with Torch:
+python ref/vhuman/verify_corrective_training.py \
+  --output tmp/vhuman-native-corrective/parity.json
+```
+
+The CPU oracle passed: solve offset/residual error 4.03e-6 mm, MLP forward error
+1.79e-7, gradient error 3.82e-6 and ten-step AdamW error 8.95e-8. A synthetic
+complete solve/train/cache/export/load test passes with model frameworks blocked.
+These checks establish math and dependency boundaries; GPU and visual quality
+checks are deferred, and earlier contact-quality figures above refer to old assets.
 
 Rig-level contact fixes (before any learning):
 - **mouthClose** is driven by the corrective mouthClose × jawOpen: it

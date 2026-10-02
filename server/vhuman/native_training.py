@@ -26,6 +26,11 @@ def library():
         'vh_train_motion_size': ([C.c_void_p], C.c_size_t),
         'vh_train_motion_compute': ([C.c_void_p, FP, IP, FP, FP, FP, FP, FP,
                                     C.c_int, C.c_int, C.c_double, C.POINTER(C.c_double)], C.c_int),
+        'vh_train_mlp': ([FP, FP, FP, FP, FP, C.c_int, C.c_int, C.c_int, C.c_int], C.c_int),
+        'vh_train_spheres': ([FP, IP, FP, FP, C.c_int, C.c_int, C.c_int, C.c_int, FP, FP, FP], C.c_int),
+        'vh_train_pairs': ([FP, IP, IP, FP, FP, C.c_int, C.c_int, C.c_int, FP, FP, FP], C.c_int),
+        'vh_train_arap': ([FP, FP, IP, FP, C.c_int, C.c_int, C.c_int, C.c_double, FP, FP], C.c_int),
+        'vh_train_rotations': ([FP, FP, FP, FP, IP, IP, C.c_int, C.c_int, C.c_int, C.c_int, FP], C.c_int),
     }
     for name, (arguments, result) in declarations.items():
         function = getattr(lib, name)

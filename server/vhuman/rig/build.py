@@ -96,18 +96,16 @@ def _shape_normals(pos, tris, shapes: dict, vmap: np.ndarray):
 
 def train_deformer(tmpl, pos, shapes, Jn, W, skel, feat, out, samples, log=print, progress=None):
     """The ML corrective deformer (mldeformer.py) on the welded template."""
-    import torch
-    from . import mldeformer, torchrig
-    from server.vhuman.runtime import torch_device
-    dev = torch_device(torch)
+    from . import mldeformer
+    from .native_corrective import NativeRig
     rig0 = rig_definition(skel, sorted(shapes))
-    tr = torchrig.TorchRig(rig0, pos, shapes, Jn, W, device=dev)
+    tr = NativeRig(rig0, pos, shapes, Jn, W)
     names = [j["name"] for j in skel["joints"]]
     jidx = {n: i for i, n in enumerate(names)}
     teeth = [(mouthparts.teeth(skel, up, skel["scale"], jidx)[0], "teeth_upper" if up else "teeth_lower")
              for up in (True, False)]
     tongue = mouthparts.tongue(skel, skel["scale"], jidx)
-    contacts = mldeformer.Contacts(tmpl, feat, skel, teeth, dev, pos, tongue=tongue)
+    contacts = mldeformer.Contacts(tmpl, feat, skel, teeth, 'cpu', pos, tongue=tongue)
     stats = mldeformer.train(tr, tmpl, contacts, out, samples=samples, log=log, progress=progress)
     return mldeformer.MLDeformer(out), stats, contacts.export()
 

@@ -58,7 +58,7 @@ class AssetDependencyTests(unittest.TestCase):
         except ImportError:
             self.skipTest('optional training oracle unavailable')
         from .rig.contact_setup import export_contacts
-        from .rig.mldeformer_training import Contacts
+        from ref.vhuman.corrective_torch_reference import Contacts
         tmpl, feat, skel, teeth, rest = fixture()
         expected = Contacts(tmpl, feat, skel, teeth, 'cpu', rest).export()
         self.assertEqual(export_contacts(tmpl, feat, skel, teeth, rest), expected)

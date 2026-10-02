@@ -783,6 +783,7 @@ Further dependency removal (items 6, 9, 10 and 12):
 | Motion evaluation | Native GRU by default; Torch full-sequence comparison only with `--reference-parity` |
 | Motion training | Native CPU embedding/projection/GRU forward and backpropagation, weighted Huber/temporal loss, gradient clipping and AdamW; direct safetensors/JSON output |
 | Modal soft-deformer training | Repository CPU GEMM for bounded randomized PCA; NumPy thin QR/SVD and oscillator/ridge fitting; no Torch or GPU session |
+| Corrective deformer training | Native C++ contact/ARAP rotations and analytic gradients, repository-GEMM MLP backpropagation and AdamW; NumPy small skin transforms/solves and bounded regional PCA; no model framework |
 | Frozen normal-cue evaluation | Existing native image runner for real-domain evaluation; no Torch model loading |
 | Identity reference creation | Native FLUX.2 F16/repository-GEMM neutral and reference-conditioned expressions; full distilled-4B four-step T2I/I2I parity passed with CUDA text encoding and FP32 KV storage; no Torch/ONNX inference |
 
@@ -807,17 +808,18 @@ path ran successfully on RTX 5060 Ti without Torch or ONNX installed. The new
 Hunyuan backend passed the complete fast12 image-to-video pipeline described
 above; its quality profiles and expression timing remain experimental.
 
-Training dependency removal is incremental. Motion training and modal PCA now
-use `cpu/vhuman/libvhuman_training.so`, with repository GEMM and native AdamW;
+Training dependency removal is incremental. Motion and corrective training and
+modal PCA use `cpu/vhuman/libvhuman_training.so`, with repository GEMM and AdamW;
 NumPy/SciPy remain ordinary array, factorization and geometry dependencies. CPU
 GRU checks cover forward/state, all parameter gradients, chunk boundaries and
-optimizer updates. Complete motion and modal training also pass with Torch,
-ONNX and other model frameworks blocked. The optional CPU oracle is
-`ref/vhuman/verify_motion_training.py`; reports are under
-`tmp/vhuman-native-training/`. New training quality and GPU checks are deferred.
-Remaining Torch training paths include contact/ARAP corrective fitting and its
-MLP, the normal-cue CNN, Gaussian appearance fitting, and some registration and
-expression optimizers. Legacy checkpoint conversion and independent reference
+optimizer updates. Complete motion, corrective and modal training pass with
+Torch, ONNX and other model frameworks blocked. Optional CPU oracles are
+`ref/vhuman/verify_motion_training.py` and `ref/vhuman/verify_corrective_training.py`;
+reports are under `tmp/vhuman-native-training/` and `tmp/vhuman-native-corrective/`.
+New training quality and GPU checks are deferred.
+Remaining Torch training paths include the normal-cue CNN, Gaussian appearance
+fitting, and some registration and expression optimizers. Legacy checkpoint
+conversion and independent reference
 checks retain optional framework imports.
 
 GPU checks on 2026-10-02 also passed the saved independent RMBG and MoGe

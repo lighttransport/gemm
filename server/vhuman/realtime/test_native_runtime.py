@@ -31,6 +31,8 @@ for name in ('server.vhuman.cli', 'server.vhuman.video', 'server.vhuman.rig.mlde
              'server.vhuman.realtime.src.benchmark.appearance',
              'server.vhuman.realtime.src.animation.train',
              'server.vhuman.rig.soft_deformer',
+             'server.vhuman.rig.mldeformer_training',
+             'server.vhuman.rig.native_corrective',
              'server.vhuman.reconstruction.learned_cues',
              'server.vhuman.realtime.src.renderer.gaussian'):
     importlib.import_module(name)

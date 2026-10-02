@@ -70,6 +70,62 @@ int main()
     model.compute(input+2*h,codes+32,target+2*o,bounds,weights,chunk_state,chunk_prediction+2*o,2,0,0);
     for (int i=0;i<t*o;++i) close_enough(chunk_prediction[i],prediction[i],2e-6,2e-6,"chunk prediction");
     for (int i=0;i<256;++i) close_enough(chunk_state[i],state[i],2e-6,2e-6,"chunk recurrent state");
-    std::puts("PASS: repository GEMM transposes, clipped AdamW, all 13 GRU parameter blocks, recurrent chunk state");
+    // Independent finite differences across all four corrective MLP blocks.
+    constexpr int bn=3,bi=4,bh=5,bo=2;
+    constexpr size_t mlp_count=bh*bi+bh+bo*bh+bo;
+    float mx[bn*bi],mp[mlp_count],up[bn*bo],mg[mlp_count],my[bn*bo];
+    for (float &value:mx) value=random(rng);
+    for (float &value:mp) value=random(rng);
+    for (float &value:up) value=random(rng);
+    require(!vh_train_mlp(my,mg,mx,mp,up,bn,bi,bh,bo),"native MLP backward failed");
+    const size_t mlp_offsets[]={0,bh*bi,bh*bi+bh,bh*bi+bh+bo*bh,mlp_count};
+    for (int block=0;block<4;++block) {
+        size_t best=mlp_offsets[block];
+        for (size_t i=best;i<mlp_offsets[block+1];++i) if (std::abs(mg[i])>std::abs(mg[best])) best=i;
+        float original=mp[best],epsilon=.001f;double numeric[2]={};
+        for (int sign=0;sign<2;++sign) {
+            mp[best]=original+(sign?epsilon:-epsilon);
+            require(!vh_train_mlp(my,nullptr,mx,mp,nullptr,bn,bi,bh,bo),"native MLP forward failed");
+            for (int i=0;i<bn*bo;++i) numeric[sign]+=double(my[i])*up[i];
+        }
+        mp[best]=original;
+        close_enough(mg[best],(numeric[1]-numeric[0])/(2*epsilon),3e-6,.005,"corrective MLP gradient");
+    }
+    // One-vertex squared sphere penetration has an independent closed form.
+    float sx[]={.3f,.4f,0},center[]={0,0,0},threshold[]={.8f},sg[3],depth[1],energy[1];int32_t si[]={0};
+    require(!vh_train_spheres(sx,si,center,threshold,1,1,1,1,sg,depth,energy),"sphere gradient failed");
+    close_enough(energy[0],.09,1e-7,1e-6,"sphere energy");
+    close_enough(sg[0],-.36,1e-7,1e-6,"sphere x gradient");
+    close_enough(sg[1],-.48,1e-7,1e-6,"sphere y gradient");
+    float px[]={0,0,0,0,1,0},axis[]={0,1,0},floor[]={0},pg[6];int32_t upper[]={0},lower[]={1};
+    require(!vh_train_pairs(px,upper,lower,axis,floor,1,2,1,pg,depth,energy),"lip pair failed");
+    close_enough(energy[0],1,1e-7,1e-6,"pair energy");
+    close_enough(pg[1],-2,1e-7,1e-6,"upper pair gradient");
+    close_enough(pg[4],2,1e-7,1e-6,"lower pair gradient");
+    float rest[]={0,0,0,1,0,0,0,1,0,0,0,1};
+    int32_t mesh_edges[]={0,1,0,2,0,3,1,2,1,3,2,3},mesh_faces[]={0,2,1,0,1,3,0,3,2,1,2,3};
+    float edge_rest[18],normal_rest[12]={},normal_scale[4]={},rg[12],rot[36];
+    for (int e=0;e<6;++e) {
+        int a=mesh_edges[e*2],b=mesh_edges[e*2+1];float norm2=0;
+        for (int j=0;j<3;++j) { float d=rest[b*3+j]-rest[a*3+j];edge_rest[e*3+j]=d;norm2+=d*d; }
+        normal_scale[a]+=norm2/3;normal_scale[b]+=norm2/3;
+    }
+    for (int f=0;f<4;++f) {
+        float a[3],b[3],n[3];
+        for (int j=0;j<3;++j) { a[j]=rest[mesh_faces[f*3+1]*3+j]-rest[mesh_faces[f*3]*3+j];b[j]=rest[mesh_faces[f*3+2]*3+j]-rest[mesh_faces[f*3]*3+j]; }
+        cross3(a,b,n);
+        for (int c=0;c<3;++c) for (int j=0;j<3;++j) normal_rest[mesh_faces[f*3+c]*3+j]+=n[j];
+    }
+    for (int vtx=0;vtx<4;++vtx) {
+        float *n=normal_rest+vtx*3;float length=std::sqrt(n[0]*n[0]+n[1]*n[1]+n[2]*n[2]);
+        for (int j=0;j<3;++j) n[j]/=length;
+    }
+    require(!vh_train_arap(rest,rest,mesh_edges,edge_rest,1,4,6,.4,rg,energy),"ARAP failed");
+    close_enough(energy[0],0,1e-7,0,"rest ARAP energy");
+    for (float value:rg) close_enough(value,0,1e-7,0,"rest ARAP gradient");
+    require(!vh_train_rotations(rest,edge_rest,normal_rest,normal_scale,mesh_edges,mesh_faces,1,4,6,4,rot),"polar rotation failed");
+    for (int vtx=0;vtx<4;++vtx) for (int j=0;j<3;++j) for (int k=0;k<3;++k)
+        close_enough(rot[vtx*9+j*3+k],j==k?1:0,2e-6,0,"rest polar identity");
+    std::puts("PASS: repository GEMM, AdamW, GRU gradients/state, corrective MLP gradients and contact energy");
     return 0;
 }

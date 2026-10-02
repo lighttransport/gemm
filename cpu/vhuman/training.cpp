@@ -210,6 +210,8 @@ struct motion_trainer {
     }
 };
 
+#include "corrective_training.cpp"
+
 extern "C" {
 const char *vh_train_error() { return train_error.c_str(); }
 int vh_train_set_threads(int threads)
