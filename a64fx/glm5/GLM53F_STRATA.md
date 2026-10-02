@@ -109,7 +109,7 @@ throughput measurements above.
 ## Q8 continuation (October 2 afternoon, pending full-run qualification)
 
 PJM 52085859 provides another six-hour 12-node allocation, approximately
-12:17–18:17 JST. Bounded restaging is active; the native build passed. Best qualified
+12:17–18:17 JST. Bounded restaging and the native build passed. Best qualified
 throughput remains **35.742137 decode /370.754010 prefill tok/s**.
 
 The candidates add exact assembly 4×4 and 2×8 row/position tiles, an eight-row
@@ -130,7 +130,8 @@ settings and lacked NUMA interleave, so it cannot select a production kernel.
 
 The immutable `candidate-q8-v6` integrated build passed all 64 configurations
 (fast/conservative ×1/12/47/48 threads ×2 row modes ×4 tile modes), including
-independently prepared head inputs. The source archive matches current code.
+independently prepared head inputs. Its Q8 and MLA kernels match the committed
+3529192d implementation; later MTP/mHC changes have separate frozen archives.
 The six-head decode projection probe is byte-exact and measures 19.893→6.001 µs
 for rows4 separate→fused during staging; it needs an uncontended repeat.
 The record is [native Q8 evidence](strata-q8-native-20261002.json).
@@ -140,6 +141,13 @@ comparison and full 8K/short/32K output and throughput gates. Local evidence
 is `tmp/strata-q8-20261002/`; current progress and artifact hashes are in
 `native-progress.json`. `resume-strata.md` records live PIDs and source paths.
 Neither target has been met; no new runtime setting has been promoted.
+
+All seven 8K Q8 ablations return the exact 257-ID stream. Independent five-trial
+confirmation of ASM4 plus fused MLA projections measures **35.540871 decode /
+377.077157 prefill tok/s**, against **35.609336 /371.931478** for the fresh frozen
+control: −0.19% decode /+1.38% prefill. This misses the 5% promotion threshold.
+Stress1024 and short128 also match all IDs; repeated32K is still running.
+Completed reports are recorded in [Q8 full-model progress](strata-q8-full-20261002.json).
 
 The next experiment increases outer prefill workspace capacity to 4096 while
 keeping 47-position attention and all arithmetic unchanged. Larger route
@@ -198,6 +206,51 @@ prompt-hidden, cache replay, short/8K full-state and timed depth gates.
 There is **no new full-model MTP throughput or promotion result yet**.
 `tmp/strata-mtp-20261002/` contains frozen source hashes, build logs and
 campaign scripts; `resume-strata.md` records the current queue state.
+
+## mHC synchronization candidate (October 2)
+
+`--mhc-kernel fused-sync` removes the barrier between mixing logits and their
+coefficient calculation. Each worker retains the original BF16 dot chain and
+contiguous row allocation. An acquire/release completion counter transfers the
+completed logits to their last owner, which computes sigmoid/Sinkhorn before
+the remaining publication barrier. Norm partitions, FP64 post accumulation,
+collapse, and normalized-input publication remain unchanged. The default is
+`legacy`; this candidate applies to the validated `GLM53F_MHC_FAST=1` path.
+
+Native arithmetic passes 14 fast/conservative ×1/3/12/23/24/47/48-thread
+configurations, each with 384 chained calls. Every stream endpoint, complete
+scratch and published normalized input matches byte-for-byte across ordinary
+OpenMP and persistent teams. The prior team test also passes all 14 settings.
+Tests require finite stream and normalized values.
+
+A separate one-node PJM **52089999** ran these gates and a 90-site probe without
+contending with the 12-node campaign. At 47 threads with fast math and the
+persistent executor, six-trial medians are **47.444470→46.666629 µs/call**
+(+1.67%). Synthetic weight placement differs from the production model;
+these numbers do not establish full-model throughput. Requested `FLIB_BARRIER=HARD`
+overrides `OMP_PROC_BIND`; unsupported thread counts use the runtime's software
+barrier fallback. Full evidence and hashes are in
+[mHC native record](strata-mhc-native-20261002.json).
+
+FCC cross compilation on the login node avoids compute contention. Immutable
+full-model artifacts are `candidate-mhc-sync-v4`, capacity4096 /attention47,
+from `tmp/strata-mhc-sync-20261002/source-v3.tar.gz`. The full-model queue waits
+for existing Q8/capacity/lookup/MTP work, then requires zero hidden bit mismatches
+and complete KDA/sparse state before timing. Fresh frozen/rebuilt controls,
+independent confirmation and qualifying-candidate context stress follow.
+Allocation guards defer incomplete work; no full-model mHC result exists yet.
+
+Reproduce the arithmetic and probe after building the integrated `check` tools:
+
+```bash
+OMP_NUM_THREADS=47 FLIB_BARRIER=HARD ./test_glm53f_mhc_sync
+fcc -Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast -fopenmp \
+    -ffast-math -fno-math-errno -Wall -Wextra -I. -I../../common \
+    bench_glm53f_mhc_sync.c glm53f_team.c -lm -lpthread -o bench_glm53f_mhc_sync
+OMP_NUM_THREADS=47 OMP_PROC_BIND=close OMP_PLACES=cores OMP_WAIT_POLICY=active \
+    FLIB_BARRIER=HARD XOS_MMM_L_HPAGE_TYPE=none \
+    XOS_MMM_L_PAGING_POLICY=demand:demand:demand ./bench_glm53f_mhc_sync
+```
 
 ## Implementation
 

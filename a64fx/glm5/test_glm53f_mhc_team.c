@@ -26,10 +26,10 @@ int main(void) {
     for (int r = 0; r < REPS; ++r) glm53f_mhc_fast(a, sub, sa, &site, norm, 1);
 #pragma omp parallel shared(logits)
     {
-        glm53f_mhc_fast_team(b, NULL, sb, &site, norm, 0, logits, publish, published);
+        glm53f_mhc_fast_team(b, NULL, sb, &site, norm, 0, logits, publish, published, 0, NULL);
 #pragma omp barrier
         for (int r = 0; r < REPS; ++r) {
-            glm53f_mhc_fast_team(b, sub, sb, &site, norm, 1, logits, publish, published);
+            glm53f_mhc_fast_team(b, sub, sb, &site, norm, 1, logits, publish, published, 0, NULL);
 #pragma omp barrier
         }
     }

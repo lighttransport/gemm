@@ -17,6 +17,7 @@ static inline int glm53f_runtime_option(int argc, char **argv, int *index) {
     else if (!strcmp(key, "--q8-row-kernel")) env = "GLM53F_NATIVE_Q8_ROWS8";
     else if (!strcmp(key, "--q8-prefill-kernel")) env = "GLM53F_NATIVE_Q8_TILE2X8";
     else if (!strcmp(key, "--mla-projection-kernel")) env = "GLM53F_MLA_FUSED_PROJECTION";
+    else if (!strcmp(key, "--mhc-kernel")) env = "GLM53F_MHC_FUSED_SYNC";
     else if (!strcmp(key, "--mla-kernel")) env = "GLM53F_MLA_REGISTERS";
     else return 0;
     if (*index + 1 >= argc) return -1;
@@ -32,6 +33,7 @@ static inline int glm53f_runtime_option(int argc, char **argv, int *index) {
              (!strcmp(key, "--collective-owner") && !strcmp(value, "serialized")) ||
              (!strcmp(key, "--router-kernel") && !strcmp(value, "fused")) ||
              (!strcmp(key, "--mla-projection-kernel") && !strcmp(value, "fused")) ||
+             (!strcmp(key, "--mhc-kernel") && !strcmp(value, "fused-sync")) ||
              (!strcmp(key, "--moe-combine-kernel") && !strcmp(value, "vector")) ||
              (!strcmp(key, "--index-kernel") && !strcmp(value, "heads")) ||
              (!strcmp(key, "--mla-kernel") && !strcmp(value, "registers")) ||

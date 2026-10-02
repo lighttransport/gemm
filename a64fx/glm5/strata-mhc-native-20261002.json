@@ -1,0 +1,315 @@
+{
+  "status": "Native arithmetic and synthetic latency PASS; full-model qualification pending; opt-in only",
+  "native_job": {
+    "job_id": 52089999,
+    "nodes": 1,
+    "host": "a25-0203c",
+    "requested_frequency_mhz": 2000,
+    "requested_eco_state": 0,
+    "start_jst": "2026-10-02 15:12:53",
+    "end_jst": "2026-10-02 15:13:09"
+  },
+  "settings": {
+    "compiler": "FCC cross compiler fccpx -Nclang, native A64FX execution",
+    "flags": [
+      "-O3",
+      "-march=armv8.2-a+sve",
+      "-ffp-contract=fast",
+      "-fopenmp",
+      "-Wall",
+      "-Wextra"
+    ],
+    "fast_math_extra_flags": [
+      "-ffast-math",
+      "-fno-math-errno"
+    ],
+    "omp_proc_bind_requested": "close",
+    "omp_places": "cores",
+    "omp_wait_policy": "active",
+    "flib_barrier_requested": "HARD",
+    "runtime_affinity_note": "Fujitsu overrides OMP_PROC_BIND to FALSE for HARD and falls back to software barriers for unsupported thread counts, including 1.",
+    "page_type": "none",
+    "paging": "demand:demand:demand",
+    "prefetch_plan": 0
+  },
+  "unit_gates": {
+    "math": [
+      "fast",
+      "conservative"
+    ],
+    "threads": [
+      1,
+      3,
+      12,
+      23,
+      24,
+      47,
+      48
+    ],
+    "configurations": 14,
+    "calls_per_configuration": 384,
+    "paths": [
+      "legacy OpenMP",
+      "fused-sync OpenMP",
+      "fused-sync persistent team"
+    ],
+    "checks": [
+      "every chained stream endpoint byte-exact",
+      "complete mHC scratch byte-exact",
+      "normalized input publication byte-exact",
+      "finite streams and normalized outputs"
+    ],
+    "legacy_team_configurations_pass": 14,
+    "result": "PASS"
+  },
+  "microbenchmark": {
+    "sites": 90,
+    "rounds_per_trial": 8,
+    "timed_trials_per_kernel": 6,
+    "order": "alternating legacy/fused and fused/legacy",
+    "results": [
+      {
+        "math": "fast",
+        "threads": 47,
+        "persistent": false,
+        "legacy_us": [
+          51.915314,
+          51.627556,
+          51.718288,
+          51.354369,
+          51.813987,
+          51.750077
+        ],
+        "fused_sync_us": [
+          50.375197,
+          50.269564,
+          50.193071,
+          50.198701,
+          50.188767,
+          50.265259
+        ],
+        "legacy_median_us": 51.7341825,
+        "fused_sync_median_us": 50.23198,
+        "speedup": 1.0299053013637927
+      },
+      {
+        "math": "fast",
+        "threads": 47,
+        "persistent": true,
+        "legacy_us": [
+          48.105584,
+          47.441655,
+          47.634708,
+          47.447284,
+          47.420793,
+          47.306882
+        ],
+        "fused_sync_us": [
+          46.677722,
+          46.652555,
+          46.652555,
+          46.858191,
+          46.655536,
+          46.732028
+        ],
+        "legacy_median_us": 47.4444695,
+        "fused_sync_median_us": 46.666629,
+        "speedup": 1.0166680241677624
+      },
+      {
+        "math": "fast",
+        "threads": 48,
+        "persistent": false,
+        "legacy_us": [
+          51.809682,
+          52.36533,
+          51.983198,
+          52.413676,
+          52.42659,
+          52.276585
+        ],
+        "fused_sync_us": [
+          51.172243,
+          51.025218,
+          50.963958,
+          51.065286,
+          50.797396,
+          50.755342
+        ],
+        "legacy_median_us": 52.3209575,
+        "fused_sync_median_us": 50.994588,
+        "speedup": 1.026010005218593
+      },
+      {
+        "math": "fast",
+        "threads": 48,
+        "persistent": true,
+        "legacy_us": [
+          48.977799,
+          49.166547,
+          49.33046,
+          49.306949,
+          49.127804,
+          48.834748
+        ],
+        "fused_sync_us": [
+          48.044655,
+          48.245655,
+          48.208237,
+          48.141678,
+          48.137373,
+          48.190355
+        ],
+        "legacy_median_us": 49.1471755,
+        "fused_sync_median_us": 48.1660165,
+        "speedup": 1.020370358009573
+      },
+      {
+        "math": "conservative",
+        "threads": 47,
+        "persistent": false,
+        "legacy_us": [
+          54.941906,
+          55.109792,
+          55.09456,
+          55.081646,
+          54.961112,
+          55.055486
+        ],
+        "fused_sync_us": [
+          53.997503,
+          53.908428,
+          53.878956,
+          53.861075,
+          53.826306,
+          53.854121
+        ],
+        "legacy_median_us": 55.068566000000004,
+        "fused_sync_median_us": 53.8700155,
+        "speedup": 1.02224893549548
+      },
+      {
+        "math": "conservative",
+        "threads": 47,
+        "persistent": true,
+        "legacy_us": [
+          51.307016,
+          51.490466,
+          51.49742,
+          51.673585,
+          51.630537,
+          51.477883
+        ],
+        "fused_sync_us": [
+          50.377846,
+          50.397052,
+          50.497055,
+          50.419569,
+          50.409635,
+          50.388773
+        ],
+        "legacy_median_us": 51.493943,
+        "fused_sync_median_us": 50.403343500000005,
+        "speedup": 1.0216374435557036
+      },
+      {
+        "math": "conservative",
+        "threads": 48,
+        "persistent": false,
+        "legacy_us": [
+          53.315361,
+          53.455432,
+          53.435895,
+          53.516693,
+          53.526296,
+          53.730607
+        ],
+        "fused_sync_us": [
+          50.880512,
+          50.919255,
+          50.822232,
+          50.927864,
+          50.909652,
+          50.889121
+        ],
+        "legacy_median_us": 53.4860625,
+        "fused_sync_median_us": 50.899386500000006,
+        "speedup": 1.0508193944538013
+      },
+      {
+        "math": "conservative",
+        "threads": 48,
+        "persistent": true,
+        "legacy_us": [
+          49.798687,
+          49.927831,
+          49.722195,
+          49.132109,
+          49.587422,
+          49.133102
+        ],
+        "fused_sync_us": [
+          46.711167,
+          46.611163,
+          46.591626,
+          46.440297,
+          46.585997,
+          46.390295
+        ],
+        "legacy_median_us": 49.6548085,
+        "fused_sync_median_us": 46.5888115,
+        "speedup": 1.065809727728298
+      }
+    ],
+    "limits": [
+      "Synthetic weights; does not reproduce production NUMA placement.",
+      "Microseconds per mHC call are not full-model tok/s."
+    ]
+  },
+  "frozen_sources": {
+    "native_math_archive_sha256": "3f408313171e0363f51c210329e7a759359fcad7dab38554c46d1b34406ce5cd",
+    "integrated_archive_sha256": "172b42af43e0268534dd7590275d4fdb47b4d7726505660c578d6caa8af61e7e",
+    "math_file_hashes": {
+      "a64fx/glm5/glm53f_mhc_sve.h": "aa7c7c430f15db0013cfcca2d97e7738e8622a7a0457199cf82b06bb1bf44663",
+      "a64fx/glm5/test_glm53f_mhc_sync.c": "08e38a86411133ae088432e1508a06a649ac1aeaf28ae406c1ffca5ef87c4ba8",
+      "a64fx/glm5/bench_glm53f_mhc_sync.c": "deab491a99a6deacea658fdf3bc2c652b4b042b0b8358c29510c52470acacb86",
+      "a64fx/glm5/test_glm53f_mhc_team.c": "562a8f134ee21ec7aa22ddec0e09d9824f47da9e015b2ef8febac4b826256634"
+    },
+    "integrated_source_note": "v3 adds only resident benchmark mHC kernel metadata to v2; all math and native test sources are identical."
+  },
+  "integrated_build": {
+    "status": "CROSS_BUILD_PASS",
+    "binary_directory": "candidate-mhc-sync-v4",
+    "compiled_capacity": 4096,
+    "attention_panel": 47,
+    "dependencies": "Unmodified native objects from candidate-mtp-v3, rebuilt target and runner/checkers",
+    "binary_sha256": {
+      "bench_glm53f_run_12n": "50fa19bbbca7a2f6a92ce5d870ce41735c3b613055bbd08cb101e0df431e1a32",
+      "glm53f_executor_check_12n": "1ab31e3a620666977ac5450074e73332ae89b7c675c405fbc44fb76816b0a3df",
+      "glm53f_prefill_chunk_check_12n": "cbf325329672eda2ee12154378ff91cacf7c1d3807b21ea2b9eb3ed8906dbc21",
+      "glm53f_target_decode_12n": "04685820d966ce10975478ef025e3a80289f725a7c2391847719d47abeb0d24f"
+    }
+  },
+  "evidence_logs": {
+    "build-login-v2.log": "f9d2b124ca0496b70a7fd83662b2460a6e25ef4c9a47c39efb164f2d6d99f18b",
+    "native-probe-v2-52089999.log": "fa6f875a311bf63031bfa627559b1200aadf14ff631fed75d18787b658c9c814",
+    "build-integrated-login-v4.log": "fe6b64bf688ca38b4ab6db286969e0e40fc1aebefc93f47384848b9dad91dd8d"
+  },
+  "full_model_queue": {
+    "pid": 12537,
+    "allocation": 52085859,
+    "directory": "tmp/strata-mhc-sync-20261002",
+    "waits_for": [
+      9278,
+      9417,
+      9420,
+      9424
+    ],
+    "gate": "128 positions, zero hidden bit mismatches, complete KDA/sparse state byte-exact",
+    "benchmark": "Fresh frozen/rebuilt controls, 8K 256 transitions, 3 trials; eligible candidate independent 5 trials; qualifying result stress1024/short128/repeated32K",
+    "promote_only_after_all_gates": true,
+    "start_deadline_jst": "2026-10-02 17:35:00",
+    "per_run_deadline_jst": "2026-10-02 18:00:00"
+  },
+  "targets_met": false
+}

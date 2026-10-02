@@ -1,6 +1,6 @@
 # Resume: GLM53F Strata-inspired optimization, 12 A64FX nodes
 
-Updated 2026-10-02 14:35 JST. Staging and the Q8 full-state gate passed; 8K timing and serial capacity/lookup/normalized-MTP queues are active in PJM 52085859.
+Updated 2026-10-02 15:43 JST. Q8 ablations/confirmation are complete and context qualification continues. Exact mHC synchronization passes native probes; its full-model queue follows capacity/lookup/normalized-MTP in PJM 52085859.
 
 Previous campaign: TP12 implementation, native validation and
 short/8K/synthetic 32K qualification complete. All new paths remain opt-in.
@@ -10,6 +10,46 @@ See `a64fx/glm5/GLM53F_STRATA.md` for implementation, gates and commands.
 
 ## Active continuation (October 2, afternoon)
 
+- Current turn makes implementation/validation progress. New opt-in
+  `--mhc-kernel fused-sync` removes one mixing-logit/coefficient barrier using
+  last-owner acquire/release publication. Original dot/reduction/post/collapse
+  arithmetic is retained; default remains legacy. Benchmark CONFIG reports
+  the selector. Executor checker can switch reference0/candidate1 using
+  `GLM53F_EXECUTOR_MHC_KERNEL=1`; campaign requires zero hidden bit mismatches.
+- Native mHC validation used a separate bounded one-node PJM **52089999**,
+  host `a25-0203c`, normal2GHz/eco0 requested, completed15:13. No contention
+  with the 12-node model campaign. All14 fast/conservative ×1/3/12/23/24/47/48
+  configurations pass384 chained calls each, exact streams/full scratch/
+  normalized publication and finite outputs. Prior team test passes all14.
+  At fast47/persistent, six-trial synthetic medians47.444470→46.666629µs
+  (+1.67%). Synthetic NUMA placement differs from production; not full tok/s.
+  `FLIB_BARRIER=HARD` overrides affinity and falls back to software barriers
+  for unsupported thread counts. Evidence `strata-mhc-native-20261002.json`.
+- MHC builds run on the login node via `fccpx`/`mpifccpx`, avoiding native
+  timing interference. Integrated **candidate-mhc-sync-v4** cross-build PASS,
+  capacity4096/attention47. Frozen source-v3 SHA
+  `172b42af43e0268534dd7590275d4fdb47b4d7726505660c578d6caa8af61e7e`.
+  Benchmark SHA `50fa19bbbca7a2f6a92ce5d870ce41735c3b613055bbd08cb101e0df431e1a32`.
+  Scratch/source/objects in remote `tmp/strata-mhc-sync-20261002/` because
+  the login node has no `/local`. Unmodified native dependencies are from
+  `/local/glm53f-mtp-v3-52085859`; rebuilt target and runner/checkers use the
+  new source. Native mathematical sources match source-v2/v3 exactly; v3
+  only adds benchmark CONFIG metadata. Build/probe logs are retrieved locally.
+- MHC full-model queue **PID12537**, `tmp/strata-mhc-sync-20261002/campaign.log`,
+  waits for owned PIDs9278/9417/9420/9424. Native gates/build must pass first.
+  Then128-position exact full-state check, fresh frozen/rebuilt controls and
+  8K256-transition ablation. Eligible candidate gets independent5-trial
+  confirmation; only a threshold-passing candidate gets stress1024/short128/
+  repeated32K, and promotion follows completion. Start guard17:35, per-run
+  guard18:00JST defer incomplete work. No full-model mHC result yet. Inspect
+  live PIDs/logs before any resume; do not launch duplicate MPI work.
+- Q8 full-run update: all7 ablations are exact257-ID streams. Independent5
+  confirmation of ASM4+fused: **35.540871 /377.077157**, fresh frozen control
+  **35.609336 /371.931478** decode/prefill tok/s; ratios0.998077 /1.013835.
+  No promotion (5% threshold). Stress1024 and short128 match all IDs;
+  repeated32K is active at15:33. Complete reports are recorded in
+  `a64fx/glm5/strata-q8-full-20261002.json`. Best independently qualified
+  settings remain35.742137 /370.754010; both targets remain unmet.
 - Persistent objective remains 100+ delivered decode /2000+ prefill tok/s for
   the complete 45-layer model and saved 8049-ID single request. Best independently
   qualified result remains **35.742137 /370.754010**; neither target is met.
@@ -31,7 +71,7 @@ See `a64fx/glm5/GLM53F_STRATA.md` for implementation, gates and commands.
   PID 2812 has exited. Log `tmp/strata-q8-20261002/build-integrated-v6.log`.
   All 64 fast/conservative ×1/12/47/48 threads ×2 row modes ×4 tile modes
   pass 126 cases each, including independent inputs and mixed/tail cases.
-  Frozen archive code/script files match the current implementation.
+  Q8/MLA kernel files match committed3529192d; later MTP/mHC changes use separate archives.
   Committed evidence record `a64fx/glm5/strata-q8-native-20261002.json`.
   v5 failed because the wrapper's default prefix points at a missing
   installation; v5b failed because the archive omitted uTofu headers.

@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
+#include <stdatomic.h>
 /* Optional decode profile (GLM53F_MHC_DETAIL=1): seconds per stage, printed at exit. */
 static double glm53f_mhc_acc[8]; static long glm53f_mhc_calls[2]; static int glm53f_mhc_detail = -1;
 static inline double glm53f_mhc_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
@@ -116,16 +117,37 @@ static inline void glm53f_mhc_mv_batch4(
 static double glm53f_mhc_part1[128 * 8], glm53f_mhc_part2[128 * 8];
 static inline void glm53f_mhc_sinkhorn_fast(float *comb, int hc, int iters, float eps);
 static int glm53f_mhc_fast_mode = -1;
+static inline int glm53f_mhc_fused_sync_on(void) {
+    /* Read on the controller before publication, also allowing diagnostic
+     * reference/candidate switches with one restored resident model. */
+    const char *e = getenv("GLM53F_MHC_FUSED_SYNC");
+    return e && *e && atoi(e);
+}
 static inline int glm53f_mhc_fast_on(void) {
     if (glm53f_mhc_fast_mode < 0) glm53f_mhc_fast_mode = getenv("GLM53F_MHC_FAST") ? atoi(getenv("GLM53F_MHC_FAST")) : 1;
     return glm53f_mhc_fast_mode;
 }
+static inline void glm53f_mhc_coefficients(float *logits,
+        glm53f_mhc_scratch *scratch, const glm53f_mhc_site *site) {
+    for (int k = 0; k < GLM53F_MHC_STREAMS; ++k) {
+        logits[k] = glm53f_sigmoid(logits[k] * site->scale[0] + site->base[k]) + 1e-6f;
+        scratch->post[k] = 2.0f * glm53f_sigmoid(logits[GLM53F_MHC_STREAMS + k] * site->scale[1] +
+                                                 site->base[GLM53F_MHC_STREAMS + k]);
+    }
+    for (int m = 0; m < GLM53F_MHC_STREAMS * GLM53F_MHC_STREAMS; ++m)
+        scratch->combine[m] = logits[2 * GLM53F_MHC_STREAMS + m] * site->scale[2] + site->base[2 * GLM53F_MHC_STREAMS + m];
+    glm53f_mhc_sinkhorn_fast(scratch->combine, GLM53F_MHC_STREAMS, 20, 1e-6f);
+}
 static inline void glm53f_mhc_fast_team(float *streams, const float *sublayer, glm53f_mhc_scratch *scratch,
         const glm53f_mhc_site *site, const uint16_t *norm, int do_post, float *logits,
-        void (*after_normalize)(void *, const float *), void *context) {
+        void (*after_normalize)(void *, const float *), void *context,
+        int fused_sync, _Atomic int *mix_pending) {
     {
         const int tid = omp_get_thread_num(), nt = omp_get_num_threads();
         if (nt > 128) abort();
+        if (fused_sync && !tid)
+            atomic_store_explicit(mix_pending, nt < GLM53F_MHC_MIX ? nt : GLM53F_MHC_MIX,
+                                  memory_order_relaxed);
         glm53f_pf_run(tid); /* weights of an upcoming stage, prefetched while the mHC math runs (glm53f_pf_plan.h) */
         /* 1. new streams (post) + partial sum of squares over this thread's contiguous slice */
         {
@@ -150,21 +172,30 @@ static inline void glm53f_mhc_fast_team(float *streams, const float *sublayer, g
         double total = 0.0;
         for (int t = 0; t < nt; ++t) total += glm53f_mhc_part1[t * 8];
         const float inv = 1.0f / sqrtf((float)(total / GLM53F_MHC_FLAT) + 1e-5f);
-        /* 2. 24 mixing logits */
-#pragma omp for schedule(static)
-        for (int m = 0; m < GLM53F_MHC_MIX; ++m)
-            logits[m] = glm53f_mhc_dot_bf16_sve(site->fn + (size_t)m * GLM53F_MHC_FLAT, streams, GLM53F_MHC_FLAT) * inv;
-        /* 3. sigmoids + Sinkhorn on one thread (implicit barrier) */
-#pragma omp single
-        {
-            for (int k = 0; k < GLM53F_MHC_STREAMS; ++k) {
-                logits[k] = glm53f_sigmoid(logits[k] * site->scale[0] + site->base[k]) + 1e-6f;
-                scratch->post[k] = 2.0f * glm53f_sigmoid(logits[GLM53F_MHC_STREAMS + k] * site->scale[1] +
-                                                         site->base[GLM53F_MHC_STREAMS + k]);
+        /* 2. 24 mixing logits. The fused scheduler keeps OpenMP's contiguous
+         * static row ownership and each row's original accumulator chain.
+         * The final owner acquires all previous owners' logit writes through
+         * the counter's RMW sequence, then computes the coefficients while
+         * the other workers wait at the sole publication barrier. */
+        if (fused_sync) {
+            const int chunk = GLM53F_MHC_MIX / nt, rem = GLM53F_MHC_MIX % nt;
+            const int lo = tid * chunk + (tid < rem ? tid : rem);
+            const int hi = lo + chunk + (tid < rem);
+            if (hi > lo) {
+                for (int m = lo; m < hi; ++m)
+                    logits[m] = glm53f_mhc_dot_bf16_sve(site->fn + (size_t)m * GLM53F_MHC_FLAT,
+                                                      streams, GLM53F_MHC_FLAT) * inv;
+                if (atomic_fetch_sub_explicit(mix_pending, 1, memory_order_acq_rel) == 1)
+                    glm53f_mhc_coefficients(logits, scratch, site);
             }
-            for (int m = 0; m < GLM53F_MHC_STREAMS * GLM53F_MHC_STREAMS; ++m)
-                scratch->combine[m] = logits[2 * GLM53F_MHC_STREAMS + m] * site->scale[2] + site->base[2 * GLM53F_MHC_STREAMS + m];
-            glm53f_mhc_sinkhorn_fast(scratch->combine, GLM53F_MHC_STREAMS, 20, 1e-6f);
+#pragma omp barrier
+        } else {
+#pragma omp for schedule(static)
+            for (int m = 0; m < GLM53F_MHC_MIX; ++m)
+                logits[m] = glm53f_mhc_dot_bf16_sve(site->fn + (size_t)m * GLM53F_MHC_FLAT, streams, GLM53F_MHC_FLAT) * inv;
+            /* 3. sigmoids + Sinkhorn on one thread (implicit barrier) */
+#pragma omp single
+            { glm53f_mhc_coefficients(logits, scratch, site); }
         }
         /* 4. collapse + residual copy + partial sum of squares of the collapsed vector */
         {
@@ -209,18 +240,24 @@ typedef struct {
     float logits[GLM53F_MHC_MIX];
     void (*after_normalize)(void *, const float *);
     void *context;
+    int fused_sync;
+    _Alignas(256) _Atomic int mix_pending;
 } glm53f_mhc_call;
 static void glm53f_mhc_worker(void *context) {
     glm53f_mhc_call *a = context;
     glm53f_mhc_fast_team(a->streams, a->sublayer, a->scratch, a->site, a->norm,
-        a->do_post, a->logits, a->after_normalize, a->context);
+        a->do_post, a->logits, a->after_normalize, a->context,
+        a->fused_sync, &a->mix_pending);
 }
 static inline void glm53f_mhc_fast_route(float *streams, const float *sublayer,
         glm53f_mhc_scratch *scratch, const glm53f_mhc_site *site,
         const uint16_t *norm, int do_post,
         void (*after_normalize)(void *, const float *), void *context) {
-    glm53f_mhc_call call = {streams, sublayer, scratch, site, norm, do_post,
-                           {0}, after_normalize, context};
+    glm53f_mhc_call call = {.streams = streams, .sublayer = sublayer,
+        .scratch = scratch, .site = site, .norm = norm, .do_post = do_post,
+        .after_normalize = after_normalize, .context = context,
+        .fused_sync = glm53f_mhc_fused_sync_on()};
+    atomic_init(&call.mix_pending, 0);
     if (glm53f_team_available()) glm53f_team_dispatch(glm53f_mhc_worker, &call);
     else {
 #pragma omp parallel
