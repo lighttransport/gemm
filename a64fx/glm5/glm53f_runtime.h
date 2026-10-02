@@ -19,6 +19,7 @@ static inline int glm53f_runtime_option(int argc, char **argv, int *index) {
     else if (!strcmp(key, "--mla-projection-kernel")) env = "GLM53F_MLA_FUSED_PROJECTION";
     else if (!strcmp(key, "--moe-prefill-layout")) env = "GLM53F_MOE_GU_PAD";
     else if (!strcmp(key, "--mhc-kernel")) env = "GLM53F_MHC_FUSED_SYNC";
+    else if (!strcmp(key, "--mhc-verify-kernel")) env = "GLM53F_MHC_BATCH_TEAM";
     else if (!strcmp(key, "--mla-kernel")) env = "GLM53F_MLA_REGISTERS";
     else return 0;
     if (*index + 1 >= argc) return -1;
@@ -37,6 +38,7 @@ static inline int glm53f_runtime_option(int argc, char **argv, int *index) {
              (!strcmp(key, "--router-kernel") && !strcmp(value, "fused")) ||
              (!strcmp(key, "--mla-projection-kernel") && !strcmp(value, "fused")) ||
              (!strcmp(key, "--mhc-kernel") && !strcmp(value, "fused-sync")) ||
+             (!strcmp(key, "--mhc-verify-kernel") && !strcmp(value, "team")) ||
              (!strcmp(key, "--moe-combine-kernel") && !strcmp(value, "vector")) ||
              (!strcmp(key, "--index-kernel") && !strcmp(value, "heads")) ||
              (!strcmp(key, "--mla-kernel") && !strcmp(value, "registers")) ||

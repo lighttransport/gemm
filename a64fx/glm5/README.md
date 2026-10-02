@@ -94,6 +94,13 @@ and compares every delivered ID with a plain warmup. Optional
 outside timing. This candidate has native/unit validation; full-model timing
 is still pending. See the Strata document for its serial qualification gates.
 
+`--mhc-verify-kernel team` selects one OpenMP team for 2–5-position mHC
+verification batches. The default is `legacy`. Native fast/conservative
+checks cover every scratch/output byte, finite values, guards and single-token
+and larger-prefill fallbacks. Full-model state and delivered-throughput
+qualification is queued; the native component gain is not model tok/s.
+See [mHC batch evidence](strata-mhc-batch-native-20261002.json).
+
 For tokenization of an already rendered chat prompt:
 
 ```bash

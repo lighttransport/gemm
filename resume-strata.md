@@ -1,12 +1,14 @@
 # Resume: GLM53F Strata-inspired optimization, 12 A64FX nodes
 
-Updated 2026-10-02 18:46 JST. Capacity4096 remains the promoted recipe:
+Updated 2026-10-02 19:28 JST. Capacity4096 remains the promoted recipe:
 35.462134 decode /412.273634 prefill tok/s. Neither 100/2000 target is met.
 The normalized MTP constructor failure is diagnosed and fixed: compact-core
 strictness was cached from target creation and ignored temporary checkpoint
 fallback for layer45. Local regression, old-header counterfactual, sanitizers,
 18 launcher tests and isolated A64FX cross-build pass. Fresh PJM52097252 is
 restaging; corrected serial qualification PID597 follows stage PID134.
+Exact opt-in mHC verification teams now pass9408 native cases and isolated
+11–20% component gains; full-model qualification PID2343 follows PID597.
 No new acceptance or full-model MTP throughput result is available yet.
 
 Previous campaign: TP12 implementation, native validation and
@@ -55,6 +57,46 @@ outputs are `tmp/strata-repack-20261002/results/` and
 `tmp/strata-mhc-sync-20261002/results-next4/`; new-run guard00:00 JST October3.
 The first queued PID544 exited before MPI because its PID guard parsed the
 labelled staging PID file as a number; repaired PID597 is the current queue.
+
+**Opt-in `--mhc-verify-kernel team`**, default`legacy`, retains2–5-position
+per-token FP64 norm partitions and four-position BF16 dot chains in one team.
+Independent coefficients and a collapsed token/dimension workshare avoid
+per-token team creation; serial residual/RMS loops retain their order. Source
+adds `test_glm53f_mhc_batch.c`, a component benchmark, runtime parsing,
+benchmark CONFIG and launcher checks. The first prototype regresses from extra
+barriers; coalesced v2 is positive. Integrated native PJM52099051 passes14
+fast/conservative ×1/3/12/23/24/47/48 configurations,672 cases each (9408).
+Every scratch/output byte, finite value and stride/tail guard passes across
+1–7 positions and both prefill settings; singleton/larger fallbacks are covered.
+Local warning-clean parser and18 launcher tests pass.
+
+Integrated fast47 medians for2/4/5 positions are73.972013→66.419442,
+136.360857→116.944313 and176.522467→147.008234 µs/call: component gains
+11.37%/16.60%/20.08%. These are seven alternating trials over90 synthetic
+sites with serial first-touch weights, excluding model collectives, not tok/s.
+See [mHC batch record](a64fx/glm5/strata-mhc-batch-native-20261002.json).
+
+Immutable **candidate-mhc-batch-v1**, capacity4096 /attention47, rebuilds
+only target/benchmark/checker/normal runner around the existing normalized
+MTP objects and repaired shared reader. Benchmark SHA
+`2127762f8e8c7440cbdc238ebcec439eebca5b2bf6493ec27e114b3726598714`,
+checker `17ad0196780b91576d09d2ef7537904c695a00e5f64cbc287cbe58fe705d3765`.
+Update-v3 SHA `405865cdead156c83b0ba1fcf22018c6ee08821c678fc811474b53f01b2837dc`.
+**Full-model PID2343** waits for owned PID597, checks stage/build/native
+sentinels and refuses overlapping MPI. Scripts/logs
+`tmp/strata-mhc-batch-20261002/full-{driver,campaign}.{sh,py,pid,log}`;
+outputs`full-results-v1/`. It gates8049 means, short128 and8K full target state,
+then fresh/rebuilt controls, fresh legacy MTP depth2/4, and1–4 adaptive/always
+with the new mHC helper. All teacher forcing/replay costs remain counted.
+New-run guard00:00 JST October3. No whole-model gain or promotion is claimed.
+
+**Rejected MoE prefetch probe**, PJM52098579: all210 mixed Q4/Q5 gate-up,
+Q5/Q6 down and guarded routing cases pass across fast/conservative and
+1/3/12/47/48 settings. Parallel ordered-output hashes match. At47/C4096,
+original23.325920 ms versus L1=24.143934, L1+L2=28.395891 and doubled-L1+L2=
+27.171850 ms reject every variant. Small512-cohort L1 gains do not justify
+changing the selected4096 recipe. No production code change. Record committed
+as30e39ee5; see [prefetch rejection](a64fx/glm5/strata-moe-prefetch-native-20261002.json).
 
 The following earlier allocation records are retained as historical evidence.
 

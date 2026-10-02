@@ -1,0 +1,438 @@
+{
+  "status": "Integrated native exactness and cross-build PASS; full-model state/timing qualification queued; no promoted setting",
+  "runtime_option": "--mhc-verify-kernel legacy|team",
+  "default": "legacy",
+  "scope": "Only2-5-position mHC batches; scalar and larger prefill retain existing paths",
+  "implementation": "One OpenMP team retains per-token FP64 norm partitions and4-position BF16 SVE dot chains; independent coefficients and a single collapsed token/dimension workshare; original serial residual copy/RMS chain.",
+  "native": {
+    "allocation": 52099051,
+    "requested_hardware": "One A64FX node, normal2000MHz/eco0, separate from12-node staging",
+    "compiler": "FCC Clang frontend, -O3 -march=armv8.2-a+sve -ffp-contract=fast -fopenmp -Wall -Wextra",
+    "math_modes": [
+      "fast-math/no-math-errno",
+      "conservative"
+    ],
+    "threads": [
+      1,
+      3,
+      12,
+      23,
+      24,
+      47,
+      48
+    ],
+    "configurations": 14,
+    "cases_per_configuration": 672,
+    "total_cases": 9408,
+    "case_dimensions": "1-7 tokens \u00d712 input distributions \u00d74 repetitions \u00d7prefill mode0/1; selector0 reference versus selector1 candidate",
+    "checks": [
+      "Every scratch byte and exported normalized float",
+      "Strided scratch/output tail guards",
+      "Finite normalized values",
+      "Single-token and6/7-token fallbacks"
+    ],
+    "sentinel": "MHC_BATCH_INTEGRATED_NATIVE_PROBE_PASS",
+    "performance": [
+      {
+        "math": "fast",
+        "threads": 47,
+        "tokens": 2,
+        "trials_per_mode": 7,
+        "legacy_median_us": 73.972013,
+        "candidate_median_us": 66.419442,
+        "ratio": 1.1137102446599898
+      },
+      {
+        "math": "fast",
+        "threads": 47,
+        "tokens": 4,
+        "trials_per_mode": 7,
+        "legacy_median_us": 136.360857,
+        "candidate_median_us": 116.944313,
+        "ratio": 1.1660323918444844
+      },
+      {
+        "math": "fast",
+        "threads": 47,
+        "tokens": 5,
+        "trials_per_mode": 7,
+        "legacy_median_us": 176.522467,
+        "candidate_median_us": 147.008234,
+        "ratio": 1.2007658496190086
+      },
+      {
+        "math": "fast",
+        "threads": 48,
+        "tokens": 2,
+        "trials_per_mode": 7,
+        "legacy_median_us": 74.005789,
+        "candidate_median_us": 67.508221,
+        "ratio": 1.096248544306922
+      },
+      {
+        "math": "fast",
+        "threads": 48,
+        "tokens": 4,
+        "trials_per_mode": 7,
+        "legacy_median_us": 136.611197,
+        "candidate_median_us": 116.344955,
+        "ratio": 1.174190982324932
+      },
+      {
+        "math": "fast",
+        "threads": 48,
+        "tokens": 5,
+        "trials_per_mode": 7,
+        "legacy_median_us": 176.766846,
+        "candidate_median_us": 147.302283,
+        "ratio": 1.2000278773683366
+      },
+      {
+        "math": "conservative",
+        "threads": 47,
+        "tokens": 2,
+        "trials_per_mode": 7,
+        "legacy_median_us": 109.677845,
+        "candidate_median_us": 100.260973,
+        "ratio": 1.0939236047509733
+      },
+      {
+        "math": "conservative",
+        "threads": 47,
+        "tokens": 4,
+        "trials_per_mode": 7,
+        "legacy_median_us": 209.113624,
+        "candidate_median_us": 182.830625,
+        "ratio": 1.1437559982087246
+      },
+      {
+        "math": "conservative",
+        "threads": 47,
+        "tokens": 5,
+        "trials_per_mode": 7,
+        "legacy_median_us": 268.38647,
+        "candidate_median_us": 230.686532,
+        "ratio": 1.1634249631877078
+      },
+      {
+        "math": "conservative",
+        "threads": 48,
+        "tokens": 2,
+        "trials_per_mode": 7,
+        "legacy_median_us": 109.82222,
+        "candidate_median_us": 100.458331,
+        "ratio": 1.0932116720115528
+      },
+      {
+        "math": "conservative",
+        "threads": 48,
+        "tokens": 4,
+        "trials_per_mode": 7,
+        "legacy_median_us": 208.638774,
+        "candidate_median_us": 182.658434,
+        "ratio": 1.1422345491038208
+      },
+      {
+        "math": "conservative",
+        "threads": 48,
+        "tokens": 5,
+        "trials_per_mode": 7,
+        "legacy_median_us": 267.566575,
+        "candidate_median_us": 230.194463,
+        "ratio": 1.1623501778146592
+      }
+    ],
+    "performance_limits": "90 distinct sites, four rounds, seven alternating trials; serial first-touch synthetic weights, no model collectives; component ratios are not delivered tok/s."
+  },
+  "earlier_prototypes": [
+    {
+      "allocation": 52098284,
+      "version": "v1",
+      "exactness": "14 \u00d7240 cases PASS",
+      "outcome": "Extra publication barriers regress fast-math47/48 timings; rejected",
+      "performance": [
+        {
+          "math": "fast",
+          "threads": 47,
+          "tokens": 2,
+          "trials_per_mode": 7,
+          "legacy_median_us": 74.038903,
+          "candidate_median_us": 75.649553,
+          "ratio": 0.9787090612419086
+        },
+        {
+          "math": "fast",
+          "threads": 47,
+          "tokens": 4,
+          "trials_per_mode": 7,
+          "legacy_median_us": 137.213866,
+          "candidate_median_us": 140.839153,
+          "ratio": 0.9742593808413488
+        },
+        {
+          "math": "fast",
+          "threads": 47,
+          "tokens": 5,
+          "trials_per_mode": 7,
+          "legacy_median_us": 177.958277,
+          "candidate_median_us": 178.894732,
+          "ratio": 0.9947653293669934
+        },
+        {
+          "math": "fast",
+          "threads": 48,
+          "tokens": 2,
+          "trials_per_mode": 7,
+          "legacy_median_us": 74.089236,
+          "candidate_median_us": 76.074733,
+          "ratio": 0.9739007036672742
+        },
+        {
+          "math": "fast",
+          "threads": 48,
+          "tokens": 4,
+          "trials_per_mode": 7,
+          "legacy_median_us": 137.06949,
+          "candidate_median_us": 143.800179,
+          "ratio": 0.9531941542298079
+        },
+        {
+          "math": "fast",
+          "threads": 48,
+          "tokens": 5,
+          "trials_per_mode": 7,
+          "legacy_median_us": 177.982781,
+          "candidate_median_us": 182.171663,
+          "ratio": 0.9770058529904291
+        },
+        {
+          "math": "conservative",
+          "threads": 47,
+          "tokens": 2,
+          "trials_per_mode": 7,
+          "legacy_median_us": 110.252698,
+          "candidate_median_us": 110.955371,
+          "ratio": 0.9936670663739207
+        },
+        {
+          "math": "conservative",
+          "threads": 47,
+          "tokens": 4,
+          "trials_per_mode": 7,
+          "legacy_median_us": 210.242139,
+          "candidate_median_us": 211.438868,
+          "ratio": 0.994340070908817
+        },
+        {
+          "math": "conservative",
+          "threads": 47,
+          "tokens": 5,
+          "trials_per_mode": 7,
+          "legacy_median_us": 269.877248,
+          "candidate_median_us": 268.572569,
+          "ratio": 1.0048578267127497
+        },
+        {
+          "math": "conservative",
+          "threads": 48,
+          "tokens": 2,
+          "trials_per_mode": 7,
+          "legacy_median_us": 109.557973,
+          "candidate_median_us": 112.377935,
+          "ratio": 0.9749064440452657
+        },
+        {
+          "math": "conservative",
+          "threads": 48,
+          "tokens": 4,
+          "trials_per_mode": 7,
+          "legacy_median_us": 209.222237,
+          "candidate_median_us": 218.700038,
+          "ratio": 0.9566630116452014
+        },
+        {
+          "math": "conservative",
+          "threads": 48,
+          "tokens": 5,
+          "trials_per_mode": 7,
+          "legacy_median_us": 269.005696,
+          "candidate_median_us": 278.178189,
+          "ratio": 0.967026555773573
+        }
+      ]
+    },
+    {
+      "allocation": 52098446,
+      "version": "v2",
+      "exactness": "14 \u00d7240 cases PASS",
+      "outcome": "Coalesced coefficient/collapse workshares improve fast-math47 medians22-33%; integrated as opt-in",
+      "performance": [
+        {
+          "math": "fast",
+          "threads": 47,
+          "tokens": 2,
+          "trials_per_mode": 7,
+          "legacy_median_us": 81.197421,
+          "candidate_median_us": 66.541963,
+          "ratio": 1.220243848231529
+        },
+        {
+          "math": "fast",
+          "threads": 47,
+          "tokens": 4,
+          "trials_per_mode": 7,
+          "legacy_median_us": 151.194466,
+          "candidate_median_us": 115.505854,
+          "ratio": 1.3089766515210564
+        },
+        {
+          "math": "fast",
+          "threads": 47,
+          "tokens": 5,
+          "trials_per_mode": 7,
+          "legacy_median_us": 195.691321,
+          "candidate_median_us": 146.652593,
+          "ratio": 1.3343870503537567
+        },
+        {
+          "math": "fast",
+          "threads": 48,
+          "tokens": 2,
+          "trials_per_mode": 7,
+          "legacy_median_us": 81.533194,
+          "candidate_median_us": 66.708194,
+          "ratio": 1.2222365666202863
+        },
+        {
+          "math": "fast",
+          "threads": 48,
+          "tokens": 4,
+          "trials_per_mode": 7,
+          "legacy_median_us": 151.513682,
+          "candidate_median_us": 116.488669,
+          "ratio": 1.3006731324228624
+        },
+        {
+          "math": "fast",
+          "threads": 48,
+          "tokens": 5,
+          "trials_per_mode": 7,
+          "legacy_median_us": 196.911229,
+          "candidate_median_us": 148.88578,
+          "ratio": 1.3225657211857302
+        },
+        {
+          "math": "conservative",
+          "threads": 47,
+          "tokens": 2,
+          "trials_per_mode": 7,
+          "legacy_median_us": 116.431051,
+          "candidate_median_us": 103.208092,
+          "ratio": 1.1281194017228804
+        },
+        {
+          "math": "conservative",
+          "threads": 47,
+          "tokens": 4,
+          "trials_per_mode": 7,
+          "legacy_median_us": 221.635898,
+          "candidate_median_us": 188.094378,
+          "ratio": 1.1783228204726033
+        },
+        {
+          "math": "conservative",
+          "threads": 47,
+          "tokens": 5,
+          "trials_per_mode": 7,
+          "legacy_median_us": 284.63006,
+          "candidate_median_us": 236.288706,
+          "ratio": 1.204585969504611
+        },
+        {
+          "math": "conservative",
+          "threads": 48,
+          "tokens": 2,
+          "trials_per_mode": 7,
+          "legacy_median_us": 117.158227,
+          "candidate_median_us": 103.919374,
+          "ratio": 1.1273954267661388
+        },
+        {
+          "math": "conservative",
+          "threads": 48,
+          "tokens": 4,
+          "trials_per_mode": 7,
+          "legacy_median_us": 222.89753,
+          "candidate_median_us": 190.258688,
+          "ratio": 1.171549811170778
+        },
+        {
+          "math": "conservative",
+          "threads": 48,
+          "tokens": 5,
+          "trials_per_mode": 7,
+          "legacy_median_us": 286.489063,
+          "candidate_median_us": 239.305364,
+          "ratio": 1.1971694165618452
+        }
+      ]
+    }
+  ],
+  "cross_build": {
+    "sentinel": "MHC_BATCH_INTEGRATED_CROSS_BUILD_PASS",
+    "candidate": "candidate-mhc-batch-v1",
+    "capacity": 4096,
+    "attention_panel": 47,
+    "base": "Existing normalized MTP objects; shared reader fixed in candidate-mtp-v8; target object rebuilt with new mHC helper",
+    "artifact_sha256": {
+      "/home/u14346/work/gemm/glm53f-strata-20261001/tmp/strata-mhc-batch-20261002/bin-v3/bench-conservative": "7ec4ee20672440033451a0e5b303b390e8b4ce77a9708154c1dd98d645f889e8",
+      "/home/u14346/work/gemm/glm53f-strata-20261001/tmp/strata-mhc-batch-20261002/bin-v3/bench-fast": "48694d0db90f5a46ba2289338fb0838dd1a2cb0dc8026d8d43cc14c56628ed3b",
+      "/home/u14346/work/gemm/glm53f-strata-20261001/tmp/strata-mhc-batch-20261002/bin-v3/config-conservative": "d1833a7e6c96a68b6a035a11c5e8a7a9b73a691f9de383c412fa1571e0356086",
+      "/home/u14346/work/gemm/glm53f-strata-20261001/tmp/strata-mhc-batch-20261002/bin-v3/config-fast": "3be0fc787f1542879133d93760409c1147353a2ab50a652f402317bfe0b283bc",
+      "/home/u14346/work/gemm/glm53f-strata-20261001/tmp/strata-mhc-batch-20261002/bin-v3/test-conservative": "c1a74bf4a024f86a8d00d52e5da78753029ddcb74651094b21f9698d86208603",
+      "/home/u14346/work/gemm/glm53f-strata-20261001/tmp/strata-mhc-batch-20261002/bin-v3/test-fast": "04a7f773b01f7edbe751e59312e13bb419f564b94213580350c5adb8f778f969",
+      "/home/u14346/work/gemm/glm53f-strata-20261001/a64fx/glm5/build/candidate-mhc-batch-v1/bench_glm53f_run_12n": "2127762f8e8c7440cbdc238ebcec439eebca5b2bf6493ec27e114b3726598714",
+      "/home/u14346/work/gemm/glm53f-strata-20261001/a64fx/glm5/build/candidate-mhc-batch-v1/glm53f_prefill_chunk_check_12n": "17ad0196780b91576d09d2ef7537904c695a00e5f64cbc287cbe58fe705d3765",
+      "/home/u14346/work/gemm/glm53f-strata-20261001/a64fx/glm5/build/candidate-mhc-batch-v1/glm53f_target_decode_12n": "6312666f4f2ea27d3dabeb4d5019f62380824b498046e5b1aad3b8b1ed3a49a6"
+    },
+    "update_archive_sha256": "405865cdead156c83b0ba1fcf22018c6ee08821c678fc811474b53f01b2837dc"
+  },
+  "source_sha256": {
+    "a64fx/glm5/glm53f_mhc_sve.h": "695f90d8647f4294990b9a8506e8e3c56a694fde8d960e487663a578727275b0",
+    "a64fx/glm5/glm53f_runtime.h": "3122e2f10adca3b1913a241004d082e5507922b39a45075e788415b00d026382",
+    "a64fx/glm5/test_glm53f_mhc_batch.c": "668d31e9c158cb835b3aad43187c9b1f2d80d516cdfd7f30ba1237122080b5c1",
+    "a64fx/glm5/bench_glm53f_mhc_batch.c": "1354a4741a586687e0becd2288dbd97f8a88ad78dceeecfdab94411b657562a8"
+  },
+  "local_checks": [
+    "Warning-clean GCC runtime parser PASS",
+    "18 launcher tests PASS",
+    "Shell syntax and diff checks PASS"
+  ],
+  "evidence": {
+    "directory": "tmp/strata-mhc-batch-20261002",
+    "sha256": {
+      "build-integrated-v3.log": "714b8646afae086fdef8f18ed76a1c230d5ceef01a78551031df0a3fff22ab5e",
+      "native-probe-v3-52099051.log": "f50798bc6d8f7c213efbea4b43ad39dd7832a37d692d4c3d5c4b35d8b6c154f3",
+      "native-probe-52098284.log": "0a8bbc7eb70e536bd850b3e6d8d5e816313dc0dc87d09b1ad57b2f2345380538",
+      "native-probe-v2-52098446.log": "a9fb75e724b906e7cf6e5e9933fba72948923ec45853087471e81f3f4b5f1dd1"
+    }
+  },
+  "full_model_queue": {
+    "allocation": 52097252,
+    "driver_pid": 2343,
+    "waits_for_owned_driver_pid": 597,
+    "directory": "~/work/gemm/glm53f-strata-20261001/tmp/strata-mhc-batch-20261002",
+    "phases": [
+      "8049 prompt capture/fullstate",
+      "Short128 and8K depth4-always decode fullstate",
+      "Fresh frozen/rebuilt controls",
+      "Fresh legacy MTP depth2/4 controls",
+      "MTP depths1-4 adaptive/always with mHC team",
+      "Five-trial confirmation and qualifying context stress"
+    ],
+    "deadline_JST": "2026-10-03 00:00:00",
+    "no_overlapping_MPI": true
+  },
+  "targets_met": false,
+  "promoted": false
+}

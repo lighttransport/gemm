@@ -358,6 +358,61 @@ OMP_NUM_THREADS=47 OMP_PROC_BIND=close OMP_PLACES=cores OMP_WAIT_POLICY=active \
     XOS_MMM_L_PAGING_POLICY=demand:demand:demand ./bench_glm53f_mhc_sync
 ```
 
+## Small-batch mHC verification candidate (October 2 evening)
+
+`--mhc-verify-kernel team` keeps one OpenMP team across 2–5-position mHC
+verification. Each position retains the original FP64 norm partition and
+four-position BF16 SVE dot chain. Coefficients are independent across tokens;
+one collapsed token/dimension workshare replaces per-token teams. Residual
+copies and serial RMS normalization keep their original order. Default is
+`legacy`; scalar decode and larger prefill retain their existing paths.
+
+The first isolated prototype passes exactness but regresses: extra publication
+barriers erase the saved team overhead. A second prototype coalesces
+coefficients/collapse workshares and improves its same-job 47-thread synthetic
+medians22–33%. The integrated public selector is measured independently:
+fast47 medians are73.972013→66.419442 µs for2 positions,
+136.360857→116.944313 µs for4, and176.522467→147.008234 µs for5:
+11.37%/16.60%/20.08% component speedups. Ninety distinct synthetic sites,
+four rounds and seven alternating trials exclude model collectives and use
+serial first-touch weights; these are not delivered model tok/s.
+
+Separate one-node PJM52099051 passes14 fast/conservative ×1/3/12/23/24/47/48
+configurations,672 cases each (9408 total). Every scratch byte and normalized
+output matches, with finite outputs and stride/tail guards. Cases cover1–7
+positions and prefill mode0/1, including single-token and larger-batch fallback.
+The local warning-clean runtime parser and18 launcher tests pass.
+
+Immutable `candidate-mhc-batch-v1` cross-build passes, with capacity4096 and
+attention47. It retains the normalized MTP objects and repaired shared reader,
+and rebuilds the target object. Benchmark SHA
+`2127762f8e8c7440cbdc238ebcec439eebca5b2bf6493ec27e114b3726598714`.
+Serial full-model qualification PID2343 follows PID597 on PJM52097252:
+8049 prompt capture, short/8K fullstate, fresh/rebuilt controls, fresh legacy
+MTP controls, then the depth sweep. Promotion still requires independent
+confirmation and qualifying context stress. See
+[native/build record](strata-mhc-batch-native-20261002.json).
+
+The prefill MoE probe of existing L1/L2 assembly prefetch variants also passes
+all210 mixed-format chain/guard cases and parallel output hashes. All three
+variants regress at selected47-thread/C4096: ratios0.9661/0.8215/0.8585.
+No production prefetch change is made. See
+[native rejection](strata-moe-prefetch-native-20261002.json).
+
+Reproduce the small-batch native checks and component sweep:
+
+```bash
+fcc -Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast -fopenmp \
+    -ffast-math -fno-math-errno -Wall -Wextra -I. -I../../common \
+    test_glm53f_mhc_batch.c glm53f_team.c -lm -lpthread -o test_glm53f_mhc_batch
+OMP_NUM_THREADS=47 FLIB_BARRIER=HARD ./test_glm53f_mhc_batch
+fcc -Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast -fopenmp \
+    -ffast-math -fno-math-errno -Wall -Wextra -I. -I../../common \
+    bench_glm53f_mhc_batch.c glm53f_team.c -lm -lpthread -o bench_glm53f_mhc_batch
+OMP_NUM_THREADS=47 OMP_PROC_BIND=close OMP_PLACES=cores OMP_WAIT_POLICY=active \
+    FLIB_BARRIER=HARD XOS_MMM_L_HPAGE_TYPE=none ./bench_glm53f_mhc_batch
+```
+
 ## Implementation
 
 The source studied is `~/work/Strata`, branch `glm53f`, revision `e486a95`.
