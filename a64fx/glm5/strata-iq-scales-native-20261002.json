@@ -1912,7 +1912,7 @@
     "status": "Queued after serial MPI diagnostics on PJM52097252",
     "candidate": "candidate-iq-scale-words-v2",
     "driver": "tmp/strata-iq-scales-20261002/full-driver.sh",
-    "waits_owned_pid": 14193,
+    "waits_owned_pid": 16162,
     "required_gates": [
       "128-position legacy/persistent hidden and complete-state comparison",
       "8049 prompt hidden means/final streams/full KDA+sparse state with explicit flag0 versus1",
@@ -1921,7 +1921,16 @@
     ],
     "new_run_deadline_jst": "2026-10-03 00:00:00",
     "outputs": "tmp/strata-iq-scales-20261002/full-results-v1/",
-    "owned_pid": 15502
+    "owned_pid": 16341,
+    "driver_sha256": "b9d731bb001690a766b0b5d59be97e25135315608ab4c527332bb3aeaa6f1990",
+    "queue_repair": {
+      "stopped_pid": 15502,
+      "reason": "Prerequisite overlap probe exited on its MPI overlap guard; model driver also refused overlapping MPI before running its executor gate.",
+      "repaired_prerequisite_pid": 16162,
+      "observed_wait": "IQ_WORDS_WAIT owner_pid=16162 owner_args=bash tmp/strata-mpi-overlap-20261002/driver.sh",
+      "failure_log": "tmp/strata-iq-scales-20261002/full-driver-guard-failure-15502.log",
+      "verified_jst": "2026-10-02 22:22:28"
+    }
   },
   "runtime_affinity_note": "FLIB_BARRIER=HARD overrides requested OMP_PROC_BIND=close toFALSE; unsupported thread counts use software-barrier fallback."
 }

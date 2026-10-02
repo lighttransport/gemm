@@ -775,7 +775,7 @@ and diagnostic tools keep-Werror; only pre-existing GLM5 graph warnings are
 suppressed in its bridge/grouped translation units. The initial failed build
 log is preserved. Immutable candidate-iq-scale-words-v2 has explicit128-step
 executor and8049 prompt-hidden/full-state gates before fresh/rebuilt controls.
-PID15502 waits for serial MPI diagnostics on the current allocation. No new
+PID16341 waits for serial MPI diagnostics on the current allocation. No new
 model gain is claimed. See [scale extraction evidence](strata-iq-scales-native-20261002.json).
 
 A separate12-rank slab diagnostic waits for the mHC-batch and KDA campaigns.
@@ -783,9 +783,12 @@ It compares every FP32 result against the legacy512-token MPI sum over six
 input distributions and three chunk lengths before timing eligible slabs.
 A nonblocking pipeline probe retains the original512-token boundaries and
 compares windows1/2/4/8 against blocking MPI across90 cases. Only fully exact
-candidates enter seven rotating64MiB timing trials. PID14193 follows the slab
+candidates enter seven rotating64MiB timing trials. PID16162 follows the slab
 probe PID9686. No collective size or algorithm has changed in the model. See
-[MPI diagnostic queue](strata-mpi-progress-20261002.json).
+[MPI diagnostic queue](strata-mpi-progress-20261002.json). The first pipeline
+queue had a prerequisite-name typo; overlap guards stopped both new drivers
+before MPI. Corrected owners16162/16341 are verified waiting on their expected
+predecessors, with the original refusal logs preserved.
 
 ## Remaining architecture decision
 

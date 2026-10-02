@@ -1,6 +1,6 @@
 # Resume: GLM53F Strata-inspired optimization, 12 A64FX nodes
 
-Updated 2026-10-02 22:13 JST. Capacity4096 remains the promoted recipe:
+Updated 2026-10-02 22:23 JST. Capacity4096 remains the promoted recipe:
 35.462134 decode /412.273634 prefill tok/s. Neither 100/2000 target is met.
 The normalized MTP constructor failure is diagnosed and fixed: compact-core
 strictness was cached from target creation and ignored temporary checkpoint
@@ -12,7 +12,7 @@ Exact opt-in mHC verification teams now pass9408 native cases and isolated
 Corrected short128/8K MTP full-state gates pass; all eight depth/policy variants
 are token-exact but slower. mHC synchronization is also exact and slower. New opt-in KDA columns pass9504 native cases;
 serial full-model PID8008 follows PID2343. The opt-in Q5 scale-word path passes
-8400 native primitive cases plus mixed expert-chain/paired-row gates; PID15502
+8400 native primitive cases plus mixed expert-chain/paired-row gates; PID16341
 follows MPI diagnostics. No new setting is promoted.
 
 Previous campaign: TP12 implementation, native validation and
@@ -162,7 +162,7 @@ Only exact slabs enter seven alternating64MiB timing trials. No production
 collective is changed; cross-build-Werror PASS. Frozen source SHA
 `b1bcca18aa5900bddb9803ad65c43eadbb41d3b7cdcd568112261e7812765560`.
 
-**MPI nonblocking diagnostic PID14193**, scripts/logs in
+**MPI nonblocking diagnostic PID16162**, scripts/logs in
 `tmp/strata-mpi-overlap-20261002/`, follows owned slab PID9686. It retains512-token
 message and tail boundaries, checks every float in90 distribution/shape/window
 cases, and times only exact windows0/1/2/4/8. Source
@@ -170,6 +170,14 @@ cases, and times only exact windows0/1/2/4/8. Source
 binary`bd38a6e49be57e4ff7490a79d7fc780feefa15e3a7ff4fd1e59b75d692b328b3`.
 Standalone MPI probes are now committed source candidates; no model collective
 change or timing claim. See [MPI queue](a64fx/glm5/strata-mpi-progress-20261002.json).
+
+The first overlap owner14193 used an incorrect prerequisite script match
+(`strata-mpi-overlaps` rather than `strata-mpi-slabs`). Its final overlap guard
+refused MPI; downstream IQ owner15502 also refused before its executor gate.
+Both logs are preserved as`driver-guard-failure-14193.log` and
+`full-driver-guard-failure-15502.log`. Corrected owner16162 waits9686, IQ16341
+waits16162. Both verify an active prerequisite's exact argv and log its wait;
+actual process/wait logs checked22:22JST. No diagnostic/model MPI overlapped.
 
 **Private prepared-weight probes.** Panel-cache PJM52100843/52101197 pass840
 mixed-format chain/guard cases. Corrected parallel placement and amortized
@@ -202,7 +210,7 @@ checker`c10accfca6269f15be2f40fc08456391540afba34ebdce7318948ee3c2906dc4`,
 executor`cb653398801ecc1cd533dda55382aef613b1701c92b186ff10a877d3d34fae7a`.
 Source-integrated-v5 SHA`eb7a31ba679d51c238be5a448a5af51d98d26c9a01eb12db2ed3fd5fd2a09c59`;
 checker update-v6 SHA`0a8982e5e068add257bca00c4b3c7231ca256d5cb924ce5273f8d14e3790f308`.
-**Full-model PID15502** waits owned MPI-overlap PID14193, then requires128-step
+**Full-model PID16341** waits owned MPI-overlap PID16162, then requires128-step
 executor state,8049 means/streams/fullstate with flag0/1, fresh/rebuilt controls,
 three-trial word candidate, and conditional five-trial/context qualification.
 Scripts`tmp/strata-iq-scales-20261002/full-{driver,campaign}.{sh,py,pid,log}`;

@@ -22,7 +22,7 @@
     "outputs": "tmp/strata-mpi-slabs-20261002/native-results.log"
   },
   "overlap": {
-    "owned_pid": 14193,
+    "owned_pid": 16162,
     "waits_owned_pid": 9686,
     "source": "bench_glm53f_mpi_overlap_12n.c",
     "source_sha256": "3155fa550d067d0a53d7e501fa54a63c70b690b16a07f0b53e2f99b06f85a54c",
@@ -37,7 +37,16 @@
       8
     ],
     "baseline": "Window0 blocking MPI_Allreduce; others MPI_Iallreduce/Waitall with unchanged chunk/tail boundaries",
-    "outputs": "tmp/strata-mpi-overlap-20261002/native-results.log"
+    "outputs": "tmp/strata-mpi-overlap-20261002/native-results.log",
+    "driver_sha256": "f2a0ace6b0be4e53cb024586f91b0650ca58d99e16e4978a3f602be9c1d420c7",
+    "queue_repair": {
+      "stopped_pid": 14193,
+      "reason": "Generated prerequisite match incorrectly named strata-mpi-overlaps instead of strata-mpi-slabs. The final guard refused overlapping MPI before any probe ran.",
+      "fix": "Correct script match and explicitly reject an active prerequisite PID with unexpected argv before waiting.",
+      "observed_wait": "MPI_OVERLAP_WAIT owner_pid=9686 owner_args=bash tmp/strata-mpi-slabs-20261002/driver.sh",
+      "failure_log": "tmp/strata-mpi-overlap-20261002/driver-guard-failure-14193.log",
+      "verified_jst": "2026-10-02 22:22:28"
+    }
   },
   "common": {
     "compiler": "mpifccpx -Nclang -O3 -march=armv8.2-a+sve -Wall -Wextra -Werror, no fast-math",
