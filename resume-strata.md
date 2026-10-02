@@ -1,6 +1,6 @@
 # Resume: GLM53F Strata-inspired optimization, 12 A64FX nodes
 
-Updated 2026-10-02 13:16 JST. Native Q8 build/arithmetic passed; bounded staging and queued full-model campaign are active in PJM 52085859.
+Updated 2026-10-02 13:31 JST. Native Q8 and larger-prefill-capacity builds passed; bounded staging and serial qualification queues are active in PJM 52085859.
 
 Previous campaign: TP12 implementation, native validation and
 short/8K/synthetic 32K qualification complete. All new paths remain opt-in.
@@ -64,6 +64,29 @@ See `a64fx/glm5/GLM53F_STRATA.md` for implementation, gates and commands.
   Scripts `campaign.{sh,py}`. All MPI steps run serially after staging.
   No new end-to-end result or promotion yet. Check live PIDs and logs before
   resuming; do not duplicate or overlap this campaign.
+- Q8 kernel implementation committed **3529192d**, 15 files, native arithmetic
+  and integrated build passed; full-model qualification still pending.
+- Larger prefill outer chunks are a second opt-in experiment: native
+  **candidate-capacity4096-v1** build **PASS**, 47-token attention panels,
+  unchanged Q8 v6 kernels, compiled workspace capacity 4096. Default remains
+  512. Build command now accepts a third capacity argument (512/1024/2048/4096),
+  and existing `--prefill-chunk` chooses the runtime chunk within that bound.
+  Local config passes all 16 capacity/panel combinations and invalid bounds.
+  Build PID 5385 and endpoint checker build PID 5772 have exited successfully.
+  Frozen sources: `source-v6.tar.gz` plus `capacity-update-v1.tar.gz`; checker
+  adds `capacity-update-v2.tar.gz` in separate scratch, without changing live
+  build sources. Logs `build-capacity-{v1,checker-v2}.log`. Scratch
+  `/local/glm53f-capacity-v1-52085859`, checker source
+  `/local/glm53f-capacity-checker-v2-52085859`.
+- Capacity campaign **PID 5910**, `capacity-campaign.log`, waits until Q8
+  PID 3129 completes successfully. It then compares 512 vs 512/1024/2048/4096
+  final hidden streams and complete KDA/sparse state on all ranks using one
+  restored model and bounded endpoint trace I/O. Failed chunk gates remain
+  rejected; no relaxed comparison. Complete 8K IDs, rebuilt-512 control,
+  ablations, independent five-trial confirmation, stress1024, short128 and
+  repeated32K follow serially. Evidence `capacity-native-progress.json`,
+  outputs `capacity-results/`, scripts `capacity-{campaign,gate}.*`.
+  Neither endpoint gates nor new throughput results have run yet.
 - Original remote working tree remains untouched; isolated snapshot remains
   `~/work/gemm/glm53f-strata-20261001`. No pushes authorized or performed.
 

@@ -141,6 +141,16 @@ is `tmp/strata-q8-20261002/`; current progress and artifact hashes are in
 `native-progress.json`. `resume-strata.md` records live PIDs and source paths.
 Neither target has been met; no new runtime setting has been promoted.
 
+The next experiment increases outer prefill workspace capacity to 4096 while
+keeping 47-position attention and all arithmetic unchanged. Larger route
+cohorts reuse expert expansion across more positions. The default remains
+512; the third build argument bounds capacity and `--prefill-chunk` selects
+512/1024/2048/4096 during trials. Native capacity/checker compilation and
+16 local capacity/panel configurations pass. The queued serial campaign
+first requires exact final hidden streams and complete KDA/sparse state
+against 512, then full IDs, fresh controls, confirmation and context stress.
+No larger-chunk throughput or memory-headroom result exists yet.
+
 ## Implementation
 
 The source studied is `~/work/Strata`, branch `glm53f`, revision `e486a95`.

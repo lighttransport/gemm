@@ -2,10 +2,12 @@
 # Shared native build. "all" retains the historical developer tool set.
 set -euo pipefail
 mode=${1:-all}
-case "$mode" in runtime|check|all) ;; *) echo "usage: $0 [runtime|check|all] [32|47|48|64]" >&2; exit 2;; esac
+case "$mode" in runtime|check|all) ;; *) echo "usage: $0 [runtime|check|all] [32|47|48|64] [512|1024|2048|4096]" >&2; exit 2;; esac
 attention_panel=${2:-32}
 case "$attention_panel" in 32|47|48|64) ;; *) echo "error: attention panel must be 32, 47, 48 or 64" >&2; exit 2;; esac
-[ "$#" -le 2 ] || { echo "error: too many build arguments" >&2; exit 2; }
+prefill_capacity=${3:-512}
+case "$prefill_capacity" in 512|1024|2048|4096) ;; *) echo "error: prefill capacity must be 512, 1024, 2048 or 4096" >&2; exit 2;; esac
+[ "$#" -le 3 ] || { echo "error: too many build arguments" >&2; exit 2; }
 cd "$(dirname "$0")"
 build_dir=${GLM53F_BUILD_DIR:-/local/glm53f-build-${PJM_JOBID:-manual}}
 if [ ! -d /local ]; then build_dir=${GLM53F_BUILD_DIR:-../../tmp/glm53f-build}; fi
@@ -25,7 +27,7 @@ else
     echo "error: set GLM53F_MPICC to a working MPI C wrapper" >&2
     exit 2
 fi
-cflags=("-DGLM53F_PREFILL_ATTN_PANEL=$attention_panel" -O3 -march=armv8.2-a+sve -ffp-contract=fast -fopenmp -Wall -Wextra -I. -I../../common)
+cflags=("-DGLM53F_PREFILL_ATTN_PANEL=$attention_panel" "-DGLM53F_PREFILL_CAPACITY=$prefill_capacity" -O3 -march=armv8.2-a+sve -ffp-contract=fast -fopenmp -Wall -Wextra -I. -I../../common)
 case "$(basename "$cc")" in mpifcc|mpiFCC) cflags=(-Nclang "${cflags[@]}");; esac
 [ "${GLM53F_FAST_MATH:-0}" != 1 ] || cflags+=(-ffast-math)
 [ "${GLM53F_NO_MATH_ERRNO:-0}" != 1 ] || cflags+=(-fno-math-errno)
@@ -87,6 +89,7 @@ if [ "$mode" != runtime ]; then
     bin glm53f_sparse_batch_check glm53f_sparse_batch_check.c "$build_dir/sparse.o" "$build_dir/kda.o" "${kernels[@]}"
     bin glm53f_target_batch_check_12n glm53f_target_batch_check_12n.c "${objects[@]}" "$build_dir/target.o"
     bin glm53f_executor_check_12n glm53f_executor_check_12n.c "${objects[@]}" "$build_dir/target.o"
+    bin glm53f_prefill_chunk_check_12n glm53f_prefill_chunk_check_12n.c "${objects[@]}"
 fi
 if [ "$mode" = all ]; then
     bin glm53f_decode_stage glm53f_decode_stage.c

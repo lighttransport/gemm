@@ -125,6 +125,16 @@ The old Q4/Q2 launch scripts are thin aliases. Use
 [alternate workflows](GLM53F_EXPERIMENTS.md) for Q2, hybrid, MTP and the
 separate llama.cpp Q8 path.
 
+Larger outer prefill chunks can be evaluated with
+`build_glm53f_integrated_12n.sh check 47 4096`, then explicit
+`--prefill-chunk 1024|2048|4096` on the benchmark or generation runner.
+The third build argument bounds shared model/expert workspaces; accepted
+capacities are 512 (default), 1024, 2048 and 4096. Attention panels and
+verification snapshots keep their own limits. The benchmark records both
+capacity and the actual chunk. Larger chunks remain unqualified experiments.
+`glm53f_prefill_chunk_check_12n` compares a 512-token reference with another
+chunk using exact final hidden streams and complete KDA/sparse endpoint state.
+
 ## Memory and staging rules
 
 - Each node has 32 GiB HBM. Q4 routed weights alone occupy

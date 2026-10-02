@@ -43,7 +43,8 @@ int glm53f_target_model_step_12n(
 int glm53f_target_decode_sequence_12n(glm53f_target_model_12n *model,
     int first, int transitions, int *ids,
     void (*observer)(void *, int), void *observer_context);
-/* Prompt-only calls accept up to 256 positions, or 512 with the fast recipe.
+/* Prompt-only calls accept up to 256 positions, or the compiled
+ * GLM53F_PREFILL_MAX_TOKENS capacity with the fast recipe.
  * Calls returning logits, hidden states, or snapshots retain the limit five. */
 int glm53f_target_model_step_batch_12n(
     glm53f_target_model_12n *model, const int *input_tokens, int tokens,

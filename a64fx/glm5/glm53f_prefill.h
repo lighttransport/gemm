@@ -13,7 +13,17 @@
     GLM53F_PREFILL_ATTN_PANEL != 48 && GLM53F_PREFILL_ATTN_PANEL != 64
 #error "GLM53F_PREFILL_ATTN_PANEL must be 32, 47, 48 or 64"
 #endif
-enum { GLM53F_PREFILL_MAX_TOKENS = 512, GLM53F_PREFILL_V5_TOKENS = 256,
+/* Larger outer chunks reuse expert expansion across more routed positions.
+ * Keep their workspace allocation explicit and bounded independently of the
+ * attention panels and verification snapshots. */
+#ifndef GLM53F_PREFILL_CAPACITY
+#define GLM53F_PREFILL_CAPACITY 512
+#endif
+#if GLM53F_PREFILL_CAPACITY != 512 && GLM53F_PREFILL_CAPACITY != 1024 && \
+    GLM53F_PREFILL_CAPACITY != 2048 && GLM53F_PREFILL_CAPACITY != 4096
+#error "GLM53F_PREFILL_CAPACITY must be 512, 1024, 2048 or 4096"
+#endif
+enum { GLM53F_PREFILL_MAX_TOKENS = GLM53F_PREFILL_CAPACITY, GLM53F_PREFILL_V5_TOKENS = 256,
        GLM53F_PREFILL_ATTN_TOKENS = GLM53F_PREFILL_ATTN_PANEL };
 /* Output panels and packed pool scores share the collective reservation. */
 static inline int glm53f_prefill_collective_count(int positions, int hidden) {
