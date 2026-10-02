@@ -1,0 +1,186 @@
+{
+  "status": "Native exactness PASS; reject all three variants for selected47-thread/C4096 recipe; no production change",
+  "allocation": 52098579,
+  "hardware": "Separate single A64FX node; normal2000MHz/eco0 requested",
+  "variants": {
+    "0": "Original packed assembly",
+    "1": "L1 prefetch",
+    "2": "L1 plus16KiB L2 weight prefetch",
+    "3": "Double L1 distances plus16KiB L2"
+  },
+  "exactness": {
+    "math_modes": [
+      "fast",
+      "conservative"
+    ],
+    "threads": [
+      1,
+      3,
+      12,
+      47,
+      48
+    ],
+    "configurations": 10,
+    "cases_per_configuration": 21,
+    "total_cases": 210,
+    "checks": "All three prefetch variants vs original full Q4/Q5 gate/up, Q5/Q6 down chains, intermediate256/512, ragged cohorts5-385, route/output guards; parallel ordered-output hashes agree"
+  },
+  "performance": [
+    {
+      "threads": 47,
+      "chunk": 512,
+      "mode": 0,
+      "trials": 7,
+      "median_ms": 5.055904,
+      "ratio": 1.0,
+      "output_hash": "c6fedbebd6607547"
+    },
+    {
+      "threads": 47,
+      "chunk": 512,
+      "mode": 3,
+      "trials": 7,
+      "median_ms": 5.506992,
+      "ratio": 0.9180881323234171,
+      "output_hash": "c6fedbebd6607547"
+    },
+    {
+      "threads": 47,
+      "chunk": 512,
+      "mode": 1,
+      "trials": 7,
+      "median_ms": 4.920006,
+      "ratio": 1.0276215110306777,
+      "output_hash": "c6fedbebd6607547"
+    },
+    {
+      "threads": 47,
+      "chunk": 512,
+      "mode": 2,
+      "trials": 7,
+      "median_ms": 5.463123,
+      "ratio": 0.9254604005804006,
+      "output_hash": "c6fedbebd6607547"
+    },
+    {
+      "threads": 47,
+      "chunk": 4096,
+      "mode": 0,
+      "trials": 7,
+      "median_ms": 23.32592,
+      "ratio": 1.0,
+      "output_hash": "608c84aefb58eb0b"
+    },
+    {
+      "threads": 47,
+      "chunk": 4096,
+      "mode": 3,
+      "trials": 7,
+      "median_ms": 27.17185,
+      "ratio": 0.8584590302095735,
+      "output_hash": "608c84aefb58eb0b"
+    },
+    {
+      "threads": 47,
+      "chunk": 4096,
+      "mode": 1,
+      "trials": 7,
+      "median_ms": 24.143934,
+      "ratio": 0.9661192745142526,
+      "output_hash": "608c84aefb58eb0b"
+    },
+    {
+      "threads": 47,
+      "chunk": 4096,
+      "mode": 2,
+      "trials": 7,
+      "median_ms": 28.395891,
+      "ratio": 0.8214540617866156,
+      "output_hash": "608c84aefb58eb0b"
+    },
+    {
+      "threads": 48,
+      "chunk": 512,
+      "mode": 0,
+      "trials": 7,
+      "median_ms": 4.343987,
+      "ratio": 1.0,
+      "output_hash": "c6fedbebd6607547"
+    },
+    {
+      "threads": 48,
+      "chunk": 512,
+      "mode": 3,
+      "trials": 7,
+      "median_ms": 4.899025,
+      "ratio": 0.8867043952623227,
+      "output_hash": "c6fedbebd6607547"
+    },
+    {
+      "threads": 48,
+      "chunk": 512,
+      "mode": 1,
+      "trials": 7,
+      "median_ms": 4.240036,
+      "ratio": 1.0245165371237415,
+      "output_hash": "c6fedbebd6607547"
+    },
+    {
+      "threads": 48,
+      "chunk": 512,
+      "mode": 2,
+      "trials": 7,
+      "median_ms": 4.992008,
+      "ratio": 0.8701883089930946,
+      "output_hash": "c6fedbebd6607547"
+    },
+    {
+      "threads": 48,
+      "chunk": 4096,
+      "mode": 0,
+      "trials": 7,
+      "median_ms": 23.028851,
+      "ratio": 1.0,
+      "output_hash": "608c84aefb58eb0b"
+    },
+    {
+      "threads": 48,
+      "chunk": 4096,
+      "mode": 3,
+      "trials": 7,
+      "median_ms": 26.839018,
+      "ratio": 0.8580362739054015,
+      "output_hash": "608c84aefb58eb0b"
+    },
+    {
+      "threads": 48,
+      "chunk": 4096,
+      "mode": 1,
+      "trials": 7,
+      "median_ms": 24.021864,
+      "ratio": 0.9586621171446146,
+      "output_hash": "608c84aefb58eb0b"
+    },
+    {
+      "threads": 48,
+      "chunk": 4096,
+      "mode": 2,
+      "trials": 7,
+      "median_ms": 28.103828,
+      "ratio": 0.8194204362480442,
+      "output_hash": "608c84aefb58eb0b"
+    }
+  ],
+  "limits": "Synthetic chain excludes router/shared/collectives. C512 mode1 gains2.5-2.8%, but all selectedC4096 variants regress3.5-21.7%; no full-model qualification warranted.",
+  "source_archive_sha256": "b88dae366803bbbaa4556bdd9a06f2220934c0d6dea1d5d4da887f37bbb0c25d",
+  "evidence": {
+    "directory": "tmp/strata-moe-prefetch-20261002",
+    "sha256": {
+      "build-login.log": "501a800d7379e9c2dfe82f9dab685e71ecdd1f8bfcded23ad154ba1f75495250",
+      "native-probe-52098579.log": "b38be965d557bfc9b2c8c123af247db40985ced0480a79a9c356c4f8a8693178"
+    }
+  },
+  "build_warnings": "Inherited unused gguf helper declarations in the diagnostic benchmark; no new arithmetic warning",
+  "targets_met": false,
+  "promoted": false
+}
