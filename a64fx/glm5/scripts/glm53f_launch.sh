@@ -5,7 +5,10 @@ require_allocation() {
 mpi_run() {
     local label=$1
     shift
-    last_log="$logdir/$label-$run_tag"
+    glm53f_mpi_sequence=$((${glm53f_mpi_sequence:-0} + 1))
+    # A parent shell and a nested launcher can reuse the same run tag. Keep
+    # each launch's rank files separate, including repeated preflight calls.
+    last_log="$logdir/$label-$run_tag-$BASHPID-$glm53f_mpi_sequence"
     "$mpiexec_bin" -n 12 -of-proc "$last_log" "$@"
 }
 require_ranks() {

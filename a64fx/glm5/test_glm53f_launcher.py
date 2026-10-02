@@ -197,6 +197,22 @@ class LauncherTest(unittest.TestCase):
         self.assertIn('OMP_NUM_THREADS=47', metadata)
         self.assertNotIn('private-value', metadata)
 
+    def test_repeated_run_tag_isolates_preflight_logs(self):
+        for _ in range(2):
+            result = self.run_cli('decode', '1', '2', GLM53F_RUN_TAG='shared-tag')
+            self.assertEqual(result.returncode, 0, result.stdout)
+        logs = list(Path(self.env['GLM53F_LOG_DIR']).glob('preflight-shared-tag-*.*.0'))
+        self.assertEqual(len(logs), 2)
+        self.assertEqual(len([c for c in self.records() if c['name'] == 'glm53f_target_decode_12n']), 24)
+
+    def test_repeated_run_tag_rejects_new_missing_manifest(self):
+        result = self.run_cli('decode', '1', '2', GLM53F_RUN_TAG='shared-tag')
+        self.assertEqual(result.returncode, 0, result.stdout)
+        (Path(self.env['GLM53F_Q2_HEAD_STAGE']) / 'rank07.manifest').unlink()
+        result = self.run_cli('decode', '1', '2', GLM53F_RUN_TAG='shared-tag')
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(len([c for c in self.records() if c['name'] == 'glm53f_target_decode_12n']), 12)
+
     def test_benchmark_rejects_existing_output_and_incomplete_run(self):
         output = self.root / 'existing.ids'
         output.write_text('preserve\n')
