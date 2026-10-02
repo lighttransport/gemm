@@ -40,4 +40,23 @@
 "    if (tid == 0) Y[row] = red[0];\n" \
 "}\n"
 
+/* Device-resident training GEMM, including both transpose forms. Row-major
+ * C[M,N]=op(A)[M,K]op(B)[K,N]. Shared tiles avoid rereading K per output. */
+#define CUDA_GEMM_F32_TRAIN_SRC \
+"__global__ void gemm_f32_train(float *C,const float *A,const float *B,\n" \
+"    int M,int N,int K,int ta,int tb) {\n" \
+"    __shared__ float a[16][16],b[16][16];\n" \
+"    int x=threadIdx.x,y=threadIdx.y,r=blockIdx.y*16+y,c=blockIdx.x*16+x;\n" \
+"    float sum=0;\n" \
+"    for(int base=0;base<K;base+=16) {\n" \
+"        int ka=base+x,kb=base+y;\n" \
+"        a[y][x]=(r<M&&ka<K)?A[ta?(size_t)ka*M+r:(size_t)r*K+ka]:0;\n" \
+"        b[y][x]=(c<N&&kb<K)?B[tb?(size_t)c*K+kb:(size_t)kb*N+c]:0;\n" \
+"        __syncthreads();\n" \
+"        for(int k=0;k<16;++k)sum+=a[y][k]*b[k][x];\n" \
+"        __syncthreads();\n" \
+"    }\n" \
+"    if(r<M&&c<N)C[(size_t)r*N+c]=sum;\n" \
+"}\n"
+
 #endif

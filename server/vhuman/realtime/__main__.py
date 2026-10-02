@@ -208,6 +208,8 @@ def main():
         if name == "fit-appearance":
             p.add_argument("--count", type=int, default=50000); p.add_argument("--steps", type=int, default=1000)
             p.add_argument("--threads", type=int, default=4)
+            p.add_argument("--device", default="cpu", help="cpu, cuda, or cuda:N")
+            p.add_argument("--memory-mb", type=int, default=512)
         else:
             p.add_argument("--epochs", type=int, default=20)
             p.add_argument("--threads", type=int, default=4)
@@ -241,7 +243,8 @@ def main():
         result = run(args, WORK)
     elif args.command == "fit-appearance":
         from .src.avatar.train import fit
-        result = fit(args.manifest, args.output, args.count, args.steps, threads=args.threads)
+        result = fit(args.manifest, args.output, args.count, args.steps, device=args.device,
+                     threads=args.threads, memory_mb=args.memory_mb)
     elif args.command == "evaluate-appearance":
         from .src.benchmark.appearance import evaluate
         result = evaluate(args.manifest, args.avatar, args.output)

@@ -71,6 +71,16 @@ class NativeImageTrainingTests(unittest.TestCase):
         np.testing.assert_allclose(actual[1],image[1,0]*.5,atol=1e-7)
         np.testing.assert_array_equal(actual[2],np.full(3,.01,np.float32))
 
+    def test_appearance_warm_start_preserves_render_and_control_order(self):
+        model,avatar,v,t,ctrl,view,k,target,mask=appearance_fixture()
+        before=model.compute(v,ctrl,view,k,(15,13))[0]
+        model.export(avatar);avatar.metadata['covariance_policy']='trace-v1'
+        restored=AppearanceTrainer(avatar,t);restored.load_avatar(avatar)
+        after=restored.compute(v,ctrl,view,k,(15,13))[0]
+        np.testing.assert_allclose(before,after,atol=2e-7,rtol=2e-6)
+        avatar.metadata['control_names'].reverse()
+        with self.assertRaisesRegex(ValueError,'same trace-v1 binding'):restored.load_avatar(avatar)
+
     def test_complete_cue_and_appearance_training_without_frameworks(self):
         script='''
 import importlib.abc,sys,json,numpy as np

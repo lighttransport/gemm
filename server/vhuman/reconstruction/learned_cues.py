@@ -1,4 +1,4 @@
-"""Original compact native CPU normal/mask experiment, synthetic data only.
+"""Original compact native CPU/CUDA normal/mask experiment, synthetic data only.
 
 Apache GNM geometry is rendered with our own BRDF and procedural albedo. Real
 Multiface/Emily/SpeakingFaces media is never used for optimization or labels.
@@ -15,9 +15,9 @@ ARCHITECTURE='geometry_prior_residual_cnn_v3'
 CODE_SHA256=sha256(Path(__file__))
 
 
-def network(side=64,threads=4):
+def network(side=64,threads=4,device='cpu',resident=False,memory_mb=512):
     from .native_cue_training import CueNet
-    return CueNet(side,threads=threads)
+    return CueNet(side,threads=threads,device=device,resident=resident,memory_mb=memory_mb)
 
 
 def synthesize(out,identities=8,views=4,side=64):
@@ -82,10 +82,10 @@ def metrics(predicted,truth,mask):
     return dict(mean_degrees=float(angles.mean()),median_degrees=float(np.median(angles)),p95_degrees=float(np.quantile(angles,.95)))
 
 
-def train(dataset,out,steps=400,device='cpu',threads=4):
+def train(dataset,out,steps=400,device='cpu',threads=4,memory_mb=512):
     from ..rig import safetensors as st
-    from scipy.ndimage import binary_erosion
-    if device != 'cpu':raise ValueError('native cue training currently supports CPU')
+    from ..native_gpu_training import device_index
+    gpu=device_index(device) is not None
     rng=np.random.default_rng(1234)
     dataset,out=Path(dataset),artifact_path(out)
     if out.exists():raise ValueError('choose a fresh training directory')
@@ -102,23 +102,32 @@ def train(dataset,out,steps=400,device='cpu',threads=4):
     identities=np.unique(groups);heldout=identities[-max(1,len(identities)//4):]
     fit=~np.isin(groups,heldout);test=~fit
     if fit.sum()<4 or test.sum()<2:raise ValueError('identity-separated fit/holdout required')
-    model=network(rgb.shape[-1],threads)
+    model=network(rgb.shape[-1],threads,device,resident=gpu,memory_mb=memory_mb)
     mean=(truth[fit]*mask[fit,None]).sum(0)/np.maximum(mask[fit].sum(0)[None],1)
     mean/=np.maximum(np.linalg.norm(mean,axis=0,keepdims=True),1e-9)
     mean[:,mask[fit].sum(0)==0]=np.array([0,0,1])[:,None]
     model.prior[:]=mean[None]
     fit_rgb,fit_prior,fit_truth,fit_mask=rgb[fit],priors[fit],truth[fit],mask[fit]
-    for step in range(steps):
-        ids=rng.integers(fit.sum(),size=min(8,fit.sum()))
-        model.compute(fit_rgb[ids],fit_prior[ids],fit_truth[ids],fit_mask[ids],update=True)
-    predictions=[];confidences=[]
-    for start in range(0,test.sum(),8):
-        normal,logits=model(rgb[test][start:start+8],priors[test][start:start+8])
-        predictions.append(normal)
-        confidences.append(1/(1+np.exp(-np.clip(logits[:,0],-80,80))))
+    try:
+        for step in range(steps):
+            ids=rng.integers(fit.sum(),size=min(8,fit.sum()))
+            model.compute(fit_rgb[ids],fit_prior[ids],fit_truth[ids],fit_mask[ids],update=True,
+                          return_gradient=False,return_output=False)
+        predictions=[];confidences=[]
+        for start in range(0,test.sum(),8):
+            normal,logits=model(rgb[test][start:start+8],priors[test][start:start+8])
+            predictions.append(normal)
+            confidences.append(1/(1+np.exp(-np.clip(logits[:,0],-80,80))))
+        model.sync_parameters()
+        peak_bytes=model._gpu.peak_bytes if gpu else 0
+    finally:model.close()
     predicted=np.concatenate(predictions);confidence=np.concatenate(confidences)
     # Fixed reference masks score normals; predicted confidence cannot hide errors.
-    interior=np.array([binary_erosion(row,iterations=1) for row in mask[test]])
+    # One cross-shaped binary erosion with zero border, using only NumPy.
+    interior=np.zeros_like(mask[test])
+    source=mask[test]
+    interior[:,1:-1,1:-1]=(source[:,1:-1,1:-1]&source[:,:-2,1:-1]&source[:,2:,1:-1]&
+                          source[:,1:-1,:-2]&source[:,1:-1,2:])
     learned=metrics(predicted,truth[test],interior)
     flat=np.zeros_like(predicted);flat[:,2]=1
     baseline=metrics(flat,truth[test],interior)
@@ -127,7 +136,7 @@ def train(dataset,out,steps=400,device='cpu',threads=4):
     out.mkdir(parents=True)
     st.save(out/'normal_cue.safetensors',model.state_dict())
     np.savez_compressed(out/'heldout.npz',rgb=rgb[test],normals=predicted,truth=truth[test],confidence=confidence,mask=mask[test])
-    report=dict(format='vhuman.normal_cue.v1',architecture=ARCHITECTURE,code_sha256=CODE_SHA256,training_backend='repository_cpu_gemm',weights_sha256=sha256(out/'normal_cue.safetensors'),dataset_sha256=manifest['dataset_sha256'],
+    report=dict(format='vhuman.normal_cue.v1',architecture=ARCHITECTURE,code_sha256=CODE_SHA256,training_backend='repository_cuda_gemm' if gpu else 'repository_cpu_gemm',cuda_peak_bytes=peak_bytes,cuda_memory_budget_mb=memory_mb if gpu else None,weights_sha256=sha256(out/'normal_cue.safetensors'),dataset_sha256=manifest['dataset_sha256'],
                 training_identities=identities[~np.isin(identities,heldout)].tolist(),heldout_identities=heldout.tolist(),
                 steps=steps,device=device,thread_budget=threads,resolution=int(rgb.shape[-1]),parameters=int(model.parameters.size),
                 heldout_normals=learned,flat_baseline=baseline,geometry_prior_baseline=template,synthetic_gate_passed=bool(accepted),
@@ -230,12 +239,13 @@ def validate_real(checkpoint,prepared,candidate,out):
 def main():
     parser=argparse.ArgumentParser(description=__doc__);sub=parser.add_subparsers(dest='action',required=True)
     synth=sub.add_parser('synthesize');synth.add_argument('--out',type=Path,required=True)
-    fit=sub.add_parser('train');fit.add_argument('--dataset',type=Path,required=True);fit.add_argument('--out',type=Path,required=True);fit.add_argument('--steps',type=int,default=400);fit.add_argument('--device',choices=['cpu'],default='cpu')
+    fit=sub.add_parser('train');fit.add_argument('--dataset',type=Path,required=True);fit.add_argument('--out',type=Path,required=True);fit.add_argument('--steps',type=int,default=400);fit.add_argument('--device',default='cpu',help='cpu, cuda, or cuda:N')
+    fit.add_argument('--memory-mb',type=int,default=512)
     fit.add_argument('--threads',type=int,default=4)
     predict=sub.add_parser('infer');predict.add_argument('--image',type=Path,required=True);predict.add_argument('--prior',type=Path,required=True);predict.add_argument('--checkpoint',type=Path,required=True);predict.add_argument('--out',type=Path,required=True)
     validate=sub.add_parser('validate-real')
     for name in ('checkpoint','prepared','candidate','out'):validate.add_argument('--'+name,type=Path,required=True)
-    a=parser.parse_args();result=synthesize(a.out) if a.action=='synthesize' else train(a.dataset,a.out,a.steps,a.device,a.threads) if a.action=='train' else validate_real(a.checkpoint,a.prepared,a.candidate,a.out) if a.action=='validate-real' else infer(a.image,a.checkpoint,a.out,a.prior)
+    a=parser.parse_args();result=synthesize(a.out) if a.action=='synthesize' else train(a.dataset,a.out,a.steps,a.device,a.threads,a.memory_mb) if a.action=='train' else validate_real(a.checkpoint,a.prepared,a.candidate,a.out) if a.action=='validate-real' else infer(a.image,a.checkpoint,a.out,a.prior)
     print(json.dumps(result))
 
 

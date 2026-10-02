@@ -89,7 +89,8 @@ exports fail explicitly. For new training, prefer a `.native` directory output.
 A file-shaped output such as `motion.pt` is now a JSON training receipt with a
 sibling `.native/` bundle, rather than a Torch checkpoint. Existing revision,
 diagnostic/production and epoch/sequence checks remain in force. Motion and
-Gaussian appearance training are native CPU paths. Explicit gsplat reference
+Gaussian appearance training have native CPU paths, with CUDA available for
+appearance and reconstruction cue CNN training. Explicit gsplat reference
 comparisons retain optional Torch; training and live inference are framework-free.
 
 For scheduling, audio replay, native model adapters, geometry and receipt tools,
@@ -341,14 +342,27 @@ Repository GEMM computes expression projections; native AdamW with zero decay
 implements Adam. The renderer uses FP64 local math with FP32 parameters and
 outputs. Sorting, clipping and tile membership are piecewise constant. The
 appearance rasterizer currently runs serially; `--threads` controls GEMM work.
-Large 50k-splat training speed and GPU backward execution remain unvalidated.
+An explicit `--device cuda:0 --memory-mb 512` selects native CUDA forward,
+analytic backward, repository GEMM and persistent Adam state, with no Torch,
+ONNX, cuBLAS or gsplat. CLI updates retain parameters/moments on the device and
+skip full image/gradient downloads. CUDA projection/raster derivatives use the
+same FP64 local math; host sorting/tile bins remain. A 50k-splat 256x256 brief
+test took 41–51 ms/update under GPU contention, versus 473 ms for a matched CPU
+step, using about 44 MiB of tracked CUDA buffers. This is not an idle benchmark.
 Start CPU integration checks with a small count and step budget. Checkpoints
-retain `vhuman.gaussian_avatar.v1` and `trace-v1` covariance semantics.
+retain `vhuman.gaussian_avatar.v1` and `trace-v1` covariance semantics. See
+[native CUDA training](../../../cuda/vhuman/README.md#native-image-model-training)
+for API lifetime/residency, validation commands and limitations.
 
 ```sh
 make -C cpu/vhuman libvhuman_training.so test
 python -m server.vhuman.realtime fit-appearance --manifest appearance.json \
   --output tmp/vhuman-realtime/native-avatar.npz --count 512 --steps 50 --threads 4
+make -C cuda/vhuman libvhuman_training_cuda.so
+python -m server.vhuman.test_native_gpu_training --gpu -v
+python -m server.vhuman.realtime fit-appearance --manifest appearance.json \
+  --output tmp/vhuman-realtime/native-gpu-avatar.npz --count 50000 --steps 1000 \
+  --device cuda:0 --memory-mb 512
 python -m unittest server.vhuman.test_native_image_training \
   server.vhuman.realtime.test_training -v
 # Optional CPU Torch math oracle; no gsplat or GPU needed:
@@ -359,9 +373,14 @@ python ref/vhuman/verify_image_training.py \
 Synthetic full training/export/load and gradient checks pass with model
 frameworks blocked. Independent CPU checks cover CNN training and Gaussian
 projection, compositing and optimizer updates, including several tiles and
-visibility/clipping branches. GPU kernel parity and visual quality of newly
-trained assets remain deferred. Earlier appearance quality figures refer to
-the previous fitted assets.
+visibility/clipping branches. Brief CUDA tests cover forward/backward, optimizer
+updates and framework-blocked training/export. Visual checks show cold-fit holes
+after two updates; an imported neutral fit retained its appearance through one
+GPU update/export. FP32 inference still has sparse differences from FP64 training
+(mean RGBA error 2.03e-7, max 0.00720; three pixels above 0.001 at 256x256).
+Cue warm-start held-out normals worsened after two updates, so cues remain off
+by default. Convergence, real geometry and expression quality remain unvalidated.
+Earlier appearance quality figures refer to the previous fitted assets.
 
 ## Direct-TTS motion training and live integration
 
