@@ -1,19 +1,22 @@
 # Resume: GLM53F Strata-inspired optimization, 12 A64FX nodes
 
-Updated 2026-10-02 22:53 JST. Capacity4096 remains the promoted recipe:
+Updated 2026-10-03. Capacity4096 remains the promoted TP12 recipe:
 35.462134 decode /412.273634 prefill tok/s. Neither 100/2000 target is met.
-The normalized MTP constructor failure is diagnosed and fixed: compact-core
-strictness was cached from target creation and ignored temporary checkpoint
-fallback for layer45. Local regression, old-header counterfactual, sanitizers,
-18 launcher tests and isolated A64FX cross-build pass. Fresh PJM52097252
-staging is complete; PID597 completes MTP and mHC synchronization qualification.
-Exact opt-in mHC verification teams now pass9408 native cases and isolated
-11–20% component gains; full-model qualification PID2343 follows PID597.
-Corrected short128/8K MTP full-state gates pass; all eight depth/policy variants
-are token-exact but slower. mHC synchronization is also exact and slower. New opt-in KDA columns pass9504 native cases;
-serial full-model PID8008 follows PID2343. The opt-in Q5 scale-word path passes
-8400 native primitive cases plus mixed expert-chain/paired-row gates; PID16341
-follows MPI diagnostics. No new setting is promoted.
+The approved prefill-first PP3×TP4 architecture is being implemented.
+Distribution/pipeline foundations pass native12-node correctness. Routed
+4×512 native slicing passes24 exact cases across six formats; real-model
+metadata-only sizing passes all12 ranks. Full PP model integration is pending.
+PJM52106727 is the fresh12-node normal2GHz/eco0 allocation, bridge42446→32446→21264,
+host d25-0010s, isolated checkout unchanged. Local launcher tmux socket is
+`tmp/tmux-glm53f/pp1.sock`, session`glm53f-pp1`. PJM52097252 has expired.
+
+Previous queued experiments are terminal and none is promoted: KDA columns
+passes full-state/8049 gates, but independent five-trial confirmation gives
+0.985182 decode /0.997147 prefill ratios. Q5 scale words gives0.981789/0.990258;
+parallel scalar-exp MLA softmax gives0.991603/0.995107 (three-trial screens).
+MPI slabs preserve bits only at512; nonblocking reduction windows1/2/4/8
+fail the existing TP12 bit-exact gate. PP still needs its own token-exact,
+bounded-state qualification.
 
 Previous campaign: TP12 implementation, native validation and
 short/8K/synthetic 32K qualification complete. All new paths remain opt-in.

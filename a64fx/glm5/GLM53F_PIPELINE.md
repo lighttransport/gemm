@@ -70,6 +70,37 @@ Final fixture binary SHA256:
 `43fcf3684aa66ed323f5d9b186d0efe4589953b9cb1c230ca52662bb117199cb`.
 The shared check build now builds both test programs.
 
+## Routed native shards
+
+`glm53f_pp_routed_stage` is a separate build using shared bounded native
+staging code. It accepts the pipeline options, derives owned MoE layers from
+the cuts and assigns one of four512-channel parts per expert to each TP rank.
+Its `GLM53F_PP_ROUTED_V1` header records layout, world/stage/TP rank, cuts,
+layer interval and part count/width. A source metadata stamp covers the input
+path and every GGUF shard's size, nanosecond mtime, tensor count and data offset.
+The stamp checks metadata for reuse; per-payload FNV1a hashes check the copied
+bytes independently. Entries record bytes/hash, source names and row/column/
+expert ranges. TP12 retains eight256-channel parts and a separate namespace.
+Gate/up scratch follows the widest native format;512-channel Q6_K rows exceed
+the old1MiB buffer. Down-column staging remains128-row bounded.
+
+On fresh PJM52106727, `test_glm53f_pp_routed` passes24 exact payload checks
+across Q4_K/Q5_K/Q6_K/IQ2_XS/IQ3_XXS/IQ4_XS, all288 ownership maps, byte and
+rolling-hash checks, and rank/layer/source-stamp mismatch rejection. Metadata-
+only sizing of the real model passes all12 ranks:
+
+| Stage | Routed layers | Bytes per rank | GiB per rank |
+| --- | --- | ---: | ---: |
+| 0 | 3:15 | 13447987200 | 12.5244 |
+| 1 | 15:30 | 16420700160 | 15.2930 |
+| 2 | 30:45 | 16500916224 | 15.3677 |
+
+No full routed image has been staged. These sizes exclude attention,
+embedding/head, shared/dense weights, caches and workspaces. The checked
+`glm53f_memory_budget` ledger rejects overflow and insufficient6GiB headroom;
+complete component accounting and resident-loader integration remain pending.
+See [machine-readable evidence](strata-pipeline-foundation-20261003.json).
+
 ## Remaining model integration
 
 1. Stage-specific native manifests, source/tensor byte coverage and hashes;

@@ -1,0 +1,69 @@
+{
+  "date": "2026-10-03",
+  "hardware": "12 A64FX nodes, normal2GHz/eco0, compact2x3x2",
+  "pipeline_job": 52097252,
+  "routed_final_job": 52106727,
+  "pipeline_binary_sha256": "43fcf3684aa66ed323f5d9b186d0efe4589953b9cb1c230ca52662bb117199cb",
+  "routed_fixture_binary_sha256": "154eba56339f4cbac1ed8c280482ce234b5c062f842d3519decc9a20f6a1a3f5",
+  "routed_stager_binary_sha256": "5ff4f5566014b2b5fc963613594744353d51a6bfb9de1540dea976a2a2731dc3",
+  "pipeline": {
+    "layouts": [
+      "tp12",
+      "pp3-tp4"
+    ],
+    "microbatches": [
+      512,
+      1024,
+      2048
+    ],
+    "schedules": [
+      "serialized",
+      "two-slot"
+    ],
+    "lengths": [
+      "1",
+      "mb-1",
+      "mb",
+      "mb+1",
+      "4mb",
+      "4mb+3",
+      "8049"
+    ],
+    "repeats": 2,
+    "full_width": 16384,
+    "full_width_positions": "4mb+3",
+    "stage1_callback_failure": "world abort observed",
+    "correctness": "PASS"
+  },
+  "routed": {
+    "parts": 4,
+    "channels_per_part": 512,
+    "native_formats": 6,
+    "exact_payload_cases": 24,
+    "expert_coverage": 288,
+    "manifest_contract_and_source_stamp_mismatch": "rejected",
+    "real_model_dry_run_bytes_by_world_rank": {
+      "0": 13447987200,
+      "1": 13447987200,
+      "10": 16500916224,
+      "11": 16500916224,
+      "2": 13447987200,
+      "3": 13447987200,
+      "4": 16420700160,
+      "5": 16420700160,
+      "6": 16420700160,
+      "7": 16420700160,
+      "8": 16500916224,
+      "9": 16500916224
+    },
+    "resident_images_staged": false
+  },
+  "memory_preflight": "overflow-safe ledger and >=6GiB guard implemented; whole-model inventory and loader integration pending",
+  "full_model_pp_correctness": "pending",
+  "full_model_pp_throughput": null,
+  "promoted_tp12_tok_s": {
+    "decode": 35.462134,
+    "prefill": 412.273634
+  },
+  "target_met": false
+}

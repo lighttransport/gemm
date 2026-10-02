@@ -1,4 +1,5 @@
 #include "glm53f_parallel.h"
+#include "glm53f_memory_budget.h"
 #include <assert.h>
 #include <stdio.h>
 
@@ -59,6 +60,16 @@ int main(void) {
     assert(glm53f_pipeline_buffer_bytes(1024, 16383, &bytes) < 0);
     assert(glm53f_pipeline_buffer_bytes(1024, 0, &bytes) < 0);
     assert(glm53f_pipeline_buffer_bytes(1024, 16384, NULL) < 0);
+    const uint64_t gib = UINT64_C(1024) * 1024 * 1024;
+    glm53f_memory_budget budget = {0, 0}; uint64_t headroom;
+    assert(!glm53f_memory_budget_add(&budget, 20 * gib, 2 * gib));
+    assert(!glm53f_memory_budget_fits(&budget, 28 * gib, &headroom) && headroom == 6 * gib);
+    assert(glm53f_memory_budget_fits(&budget, 28 * gib - 1, &headroom) < 0);
+    assert(glm53f_memory_budget_fits(&budget, 21 * gib, &headroom) < 0);
+    assert(glm53f_memory_budget_add(&budget, UINT64_MAX, 0) < 0);
+    assert(budget.resident == 20 * gib && budget.transient == 2 * gib);
+    assert(glm53f_memory_budget_add(&budget, 0, UINT64_MAX) < 0);
+    assert(budget.resident == 20 * gib && budget.transient == 2 * gib);
     printf("GLM53F_PARALLEL_PASS cut_layouts=%d ranks=12\n", layouts);
     return 0;
 }
