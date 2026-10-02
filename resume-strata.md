@@ -1,15 +1,17 @@
 # Resume: GLM53F Strata-inspired optimization, 12 A64FX nodes
 
-Updated 2026-10-02 19:28 JST. Capacity4096 remains the promoted recipe:
+Updated 2026-10-02 20:48 JST. Capacity4096 remains the promoted recipe:
 35.462134 decode /412.273634 prefill tok/s. Neither 100/2000 target is met.
 The normalized MTP constructor failure is diagnosed and fixed: compact-core
 strictness was cached from target creation and ignored temporary checkpoint
 fallback for layer45. Local regression, old-header counterfactual, sanitizers,
-18 launcher tests and isolated A64FX cross-build pass. Fresh PJM52097252 is
-restaging; corrected serial qualification PID597 follows stage PID134.
+18 launcher tests and isolated A64FX cross-build pass. Fresh PJM52097252
+staging is complete; corrected serial qualification PID597 is measuring MTP.
 Exact opt-in mHC verification teams now pass9408 native cases and isolated
 11–20% component gains; full-model qualification PID2343 follows PID597.
-No new acceptance or full-model MTP throughput result is available yet.
+Corrected short128/8K MTP full-state gates pass, but depth1 measurements are
+slower than the fresh control. New opt-in KDA columns pass9504 native cases;
+serial full-model PID8008 follows PID2343. No new setting is promoted.
 
 Previous campaign: TP12 implementation, native validation and
 short/8K/synthetic 32K qualification complete. All new paths remain opt-in.
@@ -41,10 +43,12 @@ Frozen update-v1 SHA
 Fresh **PJM52097252**,12 nodes compact2×3×2, normal2GHz/eco0, starts18:18
 and expires00:18 JST October3. Bridge host`c30-7008c`,42446→32446→21264;
 local tmux`glm53f-strata-next4`. Same isolated remote checkout and helper.
-**Stage PID134** owns `tmp/strata-next-20261002-1818/stage.sh`; its PID file
+**Stage PID134 completed** `tmp/strata-next-20261002-1818/stage.sh`; its PID file
 contains `STRATA_NEXT4_STAGE_PID=134`. Driver requires routed/native/embed/
 head/core/shared and layer45 sentinels before native validation. Fresh stage
 paths have suffix52097252;52085859 paths are expired. Do not overlap MPI.
+`STRATA_NEXT4_STAGE_PASS`, routed/native12-rank and layer45 staging sentinels
+pass. Rank0 routed bytes15456534528, hash80c171ac9f66d851.
 
 **Qualification PID597**, `tmp/strata-repack-20261002/driver.{sh,pid,log}`,
 waits for staging then runs native fast/conservative policy checks, controller/
@@ -57,6 +61,18 @@ outputs are `tmp/strata-repack-20261002/results/` and
 `tmp/strata-mhc-sync-20261002/results-next4/`; new-run guard00:00 JST October3.
 The first queued PID544 exited before MPI because its PID guard parsed the
 labelled staging PID file as a number; repaired PID597 is the current queue.
+
+Current native loader policy80 cases, controller896 cases/rank and2051-position
+cache/rollback checks pass. The8049 captured prompt means/final streams/full
+state are exact, minimum9.318 GiB available. Short128 and8K depth4-always each
+pass warmup/timed full-state checks. Single-trial acceptance75/208 and87/163,
+decode20.412241/22.443641, prefill262.568944/366.245609 tok/s; these correctness
+fixtures are not confirmed performance gains. Fresh three-trial plain control
+is34.731006 /410.553527, rebuilt34.761139 /409.565019. Depth1 adaptive
+33.987156 /369.971770 and always34.053932 /368.136477 both regress, all257
+IDs exact. Remaining depths continue. Current results and hashes are added
+to [MTP progress](a64fx/glm5/strata-mtp-progress-20261002.json), retaining the
+old allocation's constructor failure evidence.
 
 **Opt-in `--mhc-verify-kernel team`**, default`legacy`, retains2–5-position
 per-token FP64 norm partitions and four-position BF16 dot chains in one team.
@@ -89,6 +105,42 @@ outputs`full-results-v1/`. It gates8049 means, short128 and8K full target state,
 then fresh/rebuilt controls, fresh legacy MTP depth2/4, and1–4 adaptive/always
 with the new mHC helper. All teacher forcing/replay costs remain counted.
 New-run guard00:00 JST October3. No whole-model gain or promotion is claimed.
+
+**Opt-in KDA columns** adds separate `--kda-decode-kernel legacy|columns` and
+`--kda-prefill-kernel legacy|columns`; defaults remainlegacy. Canonical64-value
+halves use four SVE accumulators and original chronological FMA/scalar-expf
+chains. Decode factor preparation joins existing norm work; prefill retains
+existing preparation and removes pack/unpack. Small verification batches keep
+the existing path. Native integrated PJM52100343 passes18×528=9504 exact cases,
+fast/conservative threads1/3/12/23/24/47/48 plus benchmark prechecks. Guards,
+finite representations and every output/state float match; benchmark hashes
+match. Parser,18 launcher/six reporting tests and-Werror cross-build pass.
+
+Fast47 component decode medians5/6 heads13.722314→7.478396 and
+13.690525→7.576413 µs/token (1.835×/1.807×). Actual packed16 prefill at47
+positions2.358822→2.764641 for5 heads regresses,3.276987→2.871168 for6 heads
+improves1.141×; at64 positions ratios0.835/1.127. Synthetic serial first-touch,
+factor/packing included, projections/norm/collectives excluded: no model gain
+claim. FLIB_BARRIER=HARD overrides requested close binding toFALSE.
+
+Immutable **candidate-kda-columns-v1** capacity4096 /attention47 benchmark
+SHA`5f3cf4fcb7cf9522fc3322ba4ec881274c66d9c8c3735b8797a730007dd24143`,
+checker`45214b6b97426a766a2f2e01339d33f5721e7409dbb2fd3033bac98aeb467c3a`,
+executor`5c9fb8acc48ad3f05a0184a90a4a9cfac3ba1050d4f10927908784c4a223aaca`.
+Frozen source-integrated-v4 archive
+`21cabb8aa7210fb233ba0eefbfe58f4aef435ca64c5b9c7af46ac960773a2b8c`.
+Build/native PASS sentinels observed. Initial executor link lackedtarget.o;
+corrected link and complete warning-clean build pass; failed log retained.
+
+**Full-model PID8008** waits for owned PID2343. Scripts/logs in
+`tmp/strata-kda-columns-20261002/full-{driver,campaign}.{sh,py,pid,log}`;
+outputs`full-results-v1/`. Decode128 hidden/fullstate and8049 prompt means/
+streams/fullstate compare reference flags0 against candidate1 after restoration.
+Only independently passing selectors enter fresh qualified/rebuilt controls
+and three-trial decode-only/prefill-only/both runs. Balanced positive best gets
+five-trial confirmation; qualifying≥1.05 improvement with≥.98 other metric
+gets1024 stress, short128 and repeated32K gates. New-run guard00:00 JST October3.
+See [KDA native/build record](a64fx/glm5/strata-kda-columns-native-20261002.json).
 
 **Rejected MoE prefetch probe**, PJM52098579: all210 mixed Q4/Q5 gate-up,
 Q5/Q6 down and guarded routing cases pass across fast/conservative and

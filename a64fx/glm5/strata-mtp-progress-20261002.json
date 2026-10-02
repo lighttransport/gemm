@@ -1,5 +1,5 @@
 {
-  "status": "Previous constructor failure diagnosed and loader fixed; local regression/counterfactual/sanitizers/cross-build PASS; native/full-model rerun queued on52097252",
+  "status": "Corrected native loader/controller/cache,8049 prompt and short/8K full-state gates PASS; depth sweep active; no promotion",
   "allocation": 52085859,
   "prompt_gate": [
     "GLM53F_PREFILL_CHUNK_CHECK tokens=8049 reference_chunk=4096 candidate_chunk=4096 capacity=4096 compare_moe_layout=0 hidden_bit_mismatches=0 capture_hidden=1 prompt_hidden_bit_mismatches=0 state=BIT_EXACT first_token=624/624 min_MemAvailable_GiB=7.834778 PASS"
@@ -14,11 +14,8 @@
     "8049-position prompt mean/finalstream/complete KDA/sparse state"
   ],
   "incomplete": [
-    "Native loader-policy regression after fresh staging",
-    "Short128 MTP decode/fullstate",
-    "8K MTP decode/fullstate",
-    "Fresh/rebuilt throughput controls and delivered-transition depth sweep",
-    "Independent confirmation and contextstress"
+    "Remaining depth1-4 adaptive/always delivered-transition throughput measurements",
+    "Independent confirmation and contextstress if thresholds pass"
   ],
   "artifacts": {
     "prompt_checker": "candidate-mtp-v5",
@@ -54,5 +51,222 @@
     "fix": "Keep the cached core image but evaluate GLM53F_REPACK_REQUIRE for every read."
   },
   "loader_fix_record": "strata-repack-policy-20261002.json",
-  "active_driver_pid": 597
+  "active_driver_pid": 597,
+  "current_rerun": {
+    "allocation": 52097252,
+    "candidate": "candidate-mtp-v8",
+    "staging": "STRATA_NEXT4_STAGE_PASS; all12 routed/native/embed/head/core/shared ranks and layer45 stages complete",
+    "native_policy": "80 cases PASS: fast/conservative xstrict-first/optional-first x20 cases",
+    "controller": "896 cases/rank PASS on12 ranks",
+    "cache": "GLM53F_MTP_CACHE warm=2051 full_ms=2.233 cache_ms=0.248 draft=303/303 logit=9.67123222/9.67123222 hidden_bitwise=exact PASS",
+    "prompt_gate": "GLM53F_PREFILL_CHUNK_CHECK tokens=8049 reference_chunk=4096 candidate_chunk=4096 capacity=4096 compare_moe_layout=0 hidden_bit_mismatches=0 capture_hidden=1 prompt_hidden_bit_mismatches=0 state=BIT_EXACT first_token=624/624 min_MemAvailable_GiB=9.318298 PASS",
+    "state_gates": {
+      "short-state-gate": {
+        "state": "BIT_EXACT for warmup and timed trial",
+        "trials": 1,
+        "trial": {
+          "trial": 0,
+          "prompt_tokens": 128,
+          "decode_transitions": 128,
+          "prefill_seconds": 0.487491011,
+          "decode_seconds": 6.270746979,
+          "prefill_tok_s": 262.568944,
+          "decode_tok_s": 20.412241,
+          "minimum_available_kb": 10658880,
+          "tokens_equal": true
+        },
+        "mtp": {
+          "trial": 0,
+          "depth": 4,
+          "adaptive": 0,
+          "accepted": 75,
+          "proposed": 208,
+          "cycles": 53,
+          "fallback_tokens": 0,
+          "cache_synchronized": 1,
+          "draft_seconds": 0.357983047,
+          "verify_seconds": 5.876683133,
+          "replay_seconds": 0.035333444,
+          "plain_seconds": 0.0
+        },
+        "acceptance": 0.3605769230769231,
+        "limit": "Single-trial correctness fixture; not an independently confirmed throughput gain"
+      },
+      "8k-state-gate": {
+        "state": "BIT_EXACT for warmup and timed trial",
+        "trials": 1,
+        "trial": {
+          "trial": 0,
+          "prompt_tokens": 8049,
+          "decode_transitions": 128,
+          "prefill_seconds": 21.977055302,
+          "decode_seconds": 5.703174518,
+          "prefill_tok_s": 366.245609,
+          "decode_tok_s": 22.443641,
+          "minimum_available_kb": 8766208,
+          "tokens_equal": true
+        },
+        "mtp": {
+          "trial": 0,
+          "depth": 4,
+          "adaptive": 0,
+          "accepted": 87,
+          "proposed": 163,
+          "cycles": 41,
+          "fallback_tokens": 0,
+          "cache_synchronized": 1,
+          "draft_seconds": 0.356199298,
+          "verify_seconds": 5.307660634,
+          "replay_seconds": 0.038581878,
+          "plain_seconds": 0.0
+        },
+        "acceptance": 0.5337423312883436,
+        "limit": "Single-trial correctness fixture; not an independently confirmed throughput gain"
+      }
+    },
+    "throughput_comparisons": {
+      "rebuilt-control": {
+        "baseline": {
+          "prompt_tokens": 8049,
+          "decode_transitions": 256,
+          "trials": 3,
+          "prefill": {
+            "median_tok_s": 410.553527,
+            "min_tok_s": 409.14476,
+            "max_tok_s": 410.704488
+          },
+          "decode": {
+            "median_tok_s": 34.731006,
+            "min_tok_s": 34.681569,
+            "max_tok_s": 34.877455
+          }
+        },
+        "candidate": {
+          "prompt_tokens": 8049,
+          "decode_transitions": 256,
+          "trials": 3,
+          "prefill": {
+            "median_tok_s": 409.565019,
+            "min_tok_s": 409.074977,
+            "max_tok_s": 409.620556
+          },
+          "decode": {
+            "median_tok_s": 34.761139,
+            "min_tok_s": 34.315685,
+            "max_tok_s": 34.768232
+          }
+        },
+        "speedup": {
+          "prefill": 0.9975922554916938,
+          "decode": 1.0008676109180368
+        },
+        "tokens_equal": true,
+        "token_sha256": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da",
+        "promotion_candidate": false,
+        "target_met": false
+      },
+      "1-adaptive": {
+        "baseline": {
+          "prompt_tokens": 8049,
+          "decode_transitions": 256,
+          "trials": 3,
+          "prefill": {
+            "median_tok_s": 410.553527,
+            "min_tok_s": 409.14476,
+            "max_tok_s": 410.704488
+          },
+          "decode": {
+            "median_tok_s": 34.731006,
+            "min_tok_s": 34.681569,
+            "max_tok_s": 34.877455
+          }
+        },
+        "candidate": {
+          "prompt_tokens": 8049,
+          "decode_transitions": 256,
+          "trials": 3,
+          "prefill": {
+            "median_tok_s": 369.97177,
+            "min_tok_s": 368.734463,
+            "max_tok_s": 370.066693
+          },
+          "decode": {
+            "median_tok_s": 33.987156,
+            "min_tok_s": 33.959725,
+            "max_tok_s": 34.217463
+          }
+        },
+        "speedup": {
+          "prefill": 0.9011535540894282,
+          "decode": 0.978582538035322
+        },
+        "tokens_equal": true,
+        "token_sha256": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da",
+        "promotion_candidate": false,
+        "target_met": false
+      },
+      "1-always": {
+        "baseline": {
+          "prompt_tokens": 8049,
+          "decode_transitions": 256,
+          "trials": 3,
+          "prefill": {
+            "median_tok_s": 410.553527,
+            "min_tok_s": 409.14476,
+            "max_tok_s": 410.704488
+          },
+          "decode": {
+            "median_tok_s": 34.731006,
+            "min_tok_s": 34.681569,
+            "max_tok_s": 34.877455
+          }
+        },
+        "candidate": {
+          "prompt_tokens": 8049,
+          "decode_transitions": 256,
+          "trials": 3,
+          "prefill": {
+            "median_tok_s": 368.136477,
+            "min_tok_s": 367.768272,
+            "max_tok_s": 368.252681
+          },
+          "decode": {
+            "median_tok_s": 34.053932,
+            "min_tok_s": 33.808045,
+            "max_tok_s": 34.186737
+          }
+        },
+        "speedup": {
+          "prefill": 0.8966832648839965,
+          "decode": 0.9805052004540267
+        },
+        "tokens_equal": true,
+        "token_sha256": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da",
+        "promotion_candidate": false,
+        "target_met": false
+      }
+    },
+    "evidence_hashes": {
+      "short-state-gate.log": "54ed8464cdde5c0086b6cc8f169881809250186eb7489f3a5fdada5da840e4b7",
+      "short-state-gate.ids": "3d761d710296618a4df8c9e0172ac72aa85401f000304a813a2d6bf15286e8c1",
+      "8k-state-gate.log": "a70d2d50a6896ba25ca2bbb309a54ce39e69b8fb279f0c9af3c60331ada054e2",
+      "8k-state-gate.ids": "d7090eb8a28046417fc662dc19c34f326c59e22f383d7e9131ca922230363b72",
+      "rebuilt-control.log": "cee942a5f3042ad193c46b0002d4c1a3502f29e64cdbaa32377bc77d1c3118dc",
+      "rebuilt-control.ids": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da",
+      "rebuilt-control.json": "9a0f51b1c88f965c41ad02ea8ece49d1933fb473d2aa8bb95ba715ceb6202905",
+      "1-adaptive.log": "5a1627402c4fdb019c2556415602cf3cdd281f7a53debaa2508ce660642e2e33",
+      "1-adaptive.ids": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da",
+      "1-adaptive.json": "4e3ef3e231a83dd8aa78b12370a403cdcfe44791ec20dd067ddeeed679b972ed",
+      "1-always.log": "35ba1027af6e675a5240a22fd44ef88ea7e01ce631ecfe97ad42af5d70d374f3",
+      "1-always.ids": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da",
+      "1-always.json": "36afa4df7d1a398bb7ed3192223ccc4e127facb6aebabe3971b8a5da38d11f3a",
+      "native/policy-conservative-0.log": "049668b01d03a0b3c0513758ef2b964ba675d6ea9bb069b50f5fe9912b873be7",
+      "native/policy-conservative-1.log": "940532a5f8056044c21fa1a3f1ab90bc4518f1f904b74be872684e04c8c1ac83",
+      "native/policy-fast-0.log": "049668b01d03a0b3c0513758ef2b964ba675d6ea9bb069b50f5fe9912b873be7",
+      "native/policy-fast-1.log": "940532a5f8056044c21fa1a3f1ab90bc4518f1f904b74be872684e04c8c1ac83",
+      "prompt-hidden-gate.log": "753fd0aebc2e387b08a6d75d0a962340381801fdccd0f29359b960e7c2cb210b",
+      "native-driver.log": "920902c4238a545d5fc14503307009c4a3b3f23d81d3932faa072c7bd40a7222"
+    },
+    "status": "8K and short state gates PASS; depth sweep active; no MTP promotion"
+  }
 }

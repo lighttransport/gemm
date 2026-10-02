@@ -308,8 +308,19 @@ from strict-first and optional-first initialization. All40 checks, ASan/UBSan
 and18 launcher tests pass; both old-header counterfactuals fail.
 
 Immutable candidate-mtp-v8 cross-build passes with the repaired shared reader.
-Fresh PJM52097252 restaging and serial native/full-model qualification are
-queued. There is **no new full-model MTP throughput or promotion result yet**.
+Fresh PJM52097252 staging is complete on all12 ranks, including layer45.
+Native loader policy passes80 cases, controller896 cases per rank and the
+2051-position cache/rollback gate passes. The8049 prompt means, final streams
+and complete state pass exactly, with minimum9.318 GiB available. Both short128
+and8K depth4-always runs pass complete target state for warmup and timed trials.
+Their single-trial acceptance is75/208 and87/163; these correctness fixtures
+measure20.412241 and22.443641 decode tok/s and establish no speedup.
+
+Fresh three-trial capacity control measures34.731006 decode /410.553527
+prefill tok/s; rebuilt plain control measures34.761139 /409.565019, with257
+identical IDs. Depth1 adaptive measures33.987156 /369.971770 and always
+34.053932 /368.136477, both slower and token-exact. Remaining depth measurements
+are active. There is **no MTP promotion**.
 See [loader regression/build record](strata-repack-policy-20261002.json) and
 [MTP progress](strata-mtp-progress-20261002.json). `resume-strata.md` records
 the active staging and qualification owners; old allocation paths are expired.
@@ -411,6 +422,51 @@ fcc -Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast -fopenmp \
     bench_glm53f_mhc_batch.c glm53f_team.c -lm -lpthread -o bench_glm53f_mhc_batch
 OMP_NUM_THREADS=47 OMP_PROC_BIND=close OMP_PLACES=cores OMP_WAIT_POLICY=active \
     FLIB_BARRIER=HARD XOS_MMM_L_HPAGE_TYPE=none ./bench_glm53f_mhc_batch
+```
+
+## KDA column recurrence candidate (October 2 evening)
+
+`--kda-decode-kernel columns` and `--kda-prefill-kernel columns` are separate
+opt-in selectors; both default to `legacy`. A64FX512-bit SVE owns one64-value
+half of each canonical128×128 head state. Four vector accumulators retain
+the original chronological key FMA chains and scaled-query multiplication.
+Decode computes the same scalar `expf` factors within the existing norm/decay
+workshare, then dispatches10/12 column tasks for5/6 local heads. Prefill keeps
+the existing factor/normalization preparation and removes packed-state copy
+and unpack workshares. Small verification batches retain their existing path.
+Snapshot layout and arithmetic precision are unchanged.
+
+Integrated native PJM52100343 passes14 fast/conservative ×1/3/12/23/24/47/48
+thread configurations and four benchmark prechecks:18×528=9504 exact cases.
+The test compares every output/state float bit, finite IEEE representations
+and state/packed/output guards over5/6 heads,12 input distributions and11
+lengths through129. Parallel benchmark hashes also match. Runtime parser,
+18 launcher tests, six reporting tests and warning-clean cross-build pass.
+
+Seven alternating fast47 synthetic trials measure13.722314→7.478396 µs/token
+for5-head scalar decode and13.690525→7.576413 for6 heads (1.835×/1.807×).
+The **actual packed16 prefill baseline** at47 positions measures
+2.358822→2.764641 for5 heads (regression), and3.276987→2.871168 for6 heads
+(1.141×). At64 positions the ratios are0.835/1.127. These include factor
+preparation and packing, exclude model projections/normalization/collectives,
+and use synthetic serial first-touch; they do not establish model tok/s.
+Requested `FLIB_BARRIER=HARD` overrides `OMP_PROC_BIND` toFALSE.
+
+Immutable `candidate-kda-columns-v1` is built with capacity4096 /attention47.
+Frozen source archive SHA
+`21cabb8aa7210fb233ba0eefbfe58f4aef435ca64c5b9c7af46ac960773a2b8c`;
+benchmark SHA `5f3cf4fcb7cf9522fc3322ba4ec881274c66d9c8c3735b8797a730007dd24143`.
+Serial PID8008 follows owned PID2343 on PJM52097252. Decode hidden/fullstate
+and all8049 prefill means/streams/fullstate gates precede fresh controls and
+decode-only, prefill-only and combined measurements. Independent five-trial
+confirmation and qualifying context stress precede promotion. No KDA setting
+is promoted. See [native/build record](strata-kda-columns-native-20261002.json).
+
+Reproduce the native recurrence checks after an integrated build:
+
+```bash
+OMP_NUM_THREADS=47 FLIB_BARRIER=HARD ./test_glm53f_kda_columns
+OMP_NUM_THREADS=47 FLIB_BARRIER=HARD ./test_glm53f_kda_columns --bench
 ```
 
 ## Implementation

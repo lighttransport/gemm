@@ -16,6 +16,7 @@
 #include "glm53f_expert_kern.h"
 #include "glm53f_int8.h"
 #include "glm53f_kda_prefill.h"
+#include "glm53f_kda_columns_sve.h"
 #include "glm53f_prefill_gemm.h"
 #include "glm53f_iq_bridge.h"
 #include "glm53f_team.h"
@@ -98,7 +99,7 @@ struct glm53f_kda_context_12n {
     glm53f_prefill_config prefill;
     weights w;
     float *qkv,*small,*gate,*decay,*beta,*core,*normed,*work;
-    float *conv,*state,*partial,*batch_partial;
+    float *conv,*state,*partial,*batch_partial,*decode_factor;
     float *bq,*bk,*bv,*bsmall_f,*bsmall_g,*bgate_f,*bgate_g,*bbeta,*bnormed;
     float *prefill_state, *prefill_decay, *prefill_core;
     double phase[3], detail[5];
@@ -236,6 +237,7 @@ struct kda_call {
     const int8_t *quant_x;
     float scale_x;
     double *td;
+    int columns;
 };
 static void kda_worker(void *context) {
     struct kda_call *a = context;
@@ -317,7 +319,15 @@ static void kda_worker(void *context) {
         mv_team(c->beta,w->b,x,hn,H);
         }
 #pragma omp for schedule(static)
-        for(int h=0;h<hn;h++){kda_l2norm(q+(size_t)h*D,D,1e-6f);kda_l2norm(k+(size_t)h*D,D,1e-6f);glm53f_kda_safe_log_decay(c->decay+(size_t)h*D,c->gate+(size_t)h*D,w->dt+(size_t)h*D,w->al[h],-5.0f,D);c->beta[h]=glm53f_sigmoid(c->beta[h]);}
+        for(int h=0;h<hn;h++){
+            kda_l2norm(q+(size_t)h*D,D,1e-6f);
+            kda_l2norm(k+(size_t)h*D,D,1e-6f);
+            glm53f_kda_safe_log_decay(c->decay+(size_t)h*D,c->gate+(size_t)h*D,w->dt+(size_t)h*D,w->al[h],-5.0f,D);
+            c->beta[h]=glm53f_sigmoid(c->beta[h]);
+            if (a->columns)
+                for (int d = 0; d < D; ++d)
+                    c->decode_factor[h * D + d] = glm53f_kda_scalar_factor(c->decay[h * D + d]);
+        }
         if(c->detail_profile){
 #pragma omp single
             {double t=glm53f_clock();c->detail[2]=t-(*a->td);(*a->td)=t;}
@@ -326,8 +336,17 @@ static void kda_worker(void *context) {
             const glm53f_native_matrix pop = {NULL, c->q2_op, c->q2_op_type, H, qd};
             kda_prefetch_rows(&pop);
         }
+        if (a->columns) {
+#pragma omp for collapse(2) schedule(static)
+            for (int h = 0; h < hn; ++h)
+                for (int block = 0; block < 2; ++block)
+                    glm53f_kda_columns64_sve(c->state + (size_t)h * D * D + block * 64,
+                        c->core + h * D + block * 64, q + h * D, k + h * D,
+                        v + h * D + block * 64, c->decode_factor + h * D, c->beta[h]);
+        } else {
 #pragma omp for schedule(static)
-        for(int h=0;h<hn;h++)glm53f_kda_step_vec_streamed(c->state+(size_t)h*D*D,q+(size_t)h*D,k+(size_t)h*D,v+(size_t)h*D,c->decay+(size_t)h*D,c->beta[h],D,D,c->core+(size_t)h*D,c->work+(size_t)h*D);
+            for(int h=0;h<hn;h++)glm53f_kda_step_vec_streamed(c->state+(size_t)h*D*D,q+(size_t)h*D,k+(size_t)h*D,v+(size_t)h*D,c->decay+(size_t)h*D,c->beta[h],D,D,c->core+(size_t)h*D,c->work+(size_t)h*D);
+        }
         if(c->detail_profile){
 #pragma omp single
             {double t=glm53f_clock();c->detail[3]=t-(*a->td);(*a->td)=t;}
@@ -358,7 +377,10 @@ static int kda_local(glm53f_kda_context_12n*c,float*out,const float*x){
     double t0=glm53f_clock();float*q=c->qkv,*k=q+qd,*v=k+qd;
     int8_t quant_x[H], quant_o[QKV]; float scale_x = 0, scale_o = 0;
     if (c->int8_enabled && glm53f_i8_quantize_x(quant_x, &scale_x, x, H)) return -1;
-    struct kda_call call = {c, x, quant_x, scale_x, &td};
+    const char *column_env = getenv("GLM53F_KDA_DECODE_COLUMNS");
+    int columns = column_env && atoi(column_env);
+    if (columns && !c->decode_factor) c->decode_factor = a256((size_t)qd * sizeof(float));
+    struct kda_call call = {c, x, quant_x, scale_x, &td, columns};
     if (glm53f_team_available()) glm53f_team_dispatch(kda_worker, &call);
     else {
 #pragma omp parallel
@@ -724,6 +746,8 @@ int glm53f_kda_sublayer_batch_capture_12n(glm53f_kda_context_12n *c,
     const char *native_col_env = getenv("GLM53F_KDA_NATIVE_COLUMN");
     int column_recurrence = (!c->q2_native || !native_col_env || atoi(native_col_env)) && !states && tokens > 5 &&
                            (c->prefill.features & GLM53F_PREFILL_RECURRENCE);
+    const char *column_env = getenv("GLM53F_KDA_PREFILL_COLUMNS");
+    int columns64 = column_recurrence && column_env && atoi(column_env);
     if (column_recurrence && !c->prefill_state) {
         c->prefill_state = a256((size_t)hn * D * D * sizeof(float));
         c->prefill_decay = a256((size_t)GLM53F_KDA_TILE_TOKENS * qd * sizeof(float));
@@ -840,26 +864,39 @@ int glm53f_kda_sublayer_batch_capture_12n(glm53f_kda_context_12n *c,
                         c->bbeta[(size_t)t * hn + h] = glm53f_sigmoid(c->bbeta[(size_t)t * hn + h]);
                     }
                 KD_MARK(2);
+                if (columns64) {
 #pragma omp for collapse(2) schedule(static)
-                for (int h = 0; h < hn; ++h)
-                    for (int block = 0; block < 8; ++block) {
-                        float *packed = c->prefill_state + ((size_t)h * 8 + block) * D * 16;
-                        float *canonical = c->state + (size_t)h * D * D + block * 16;
+                    for (int h = 0; h < hn; ++h)
+                        for (int block = 0; block < 2; ++block)
+                            for (int t = 0; t < tokens; ++t) {
+                                size_t off = (size_t)t * qd + h * D;
+                                glm53f_kda_columns64_sve(c->state + (size_t)h * D * D + block * 64,
+                                    c->prefill_core + off + block * 64,
+                                    c->bq + off, c->bk + off, c->bv + off + block * 64,
+                                    c->prefill_decay + off, c->bbeta[(size_t)t * hn + h]);
+                            }
+                } else {
+#pragma omp for collapse(2) schedule(static)
+                    for (int h = 0; h < hn; ++h)
+                        for (int block = 0; block < 8; ++block) {
+                            float *packed = c->prefill_state + ((size_t)h * 8 + block) * D * 16;
+                            float *canonical = c->state + (size_t)h * D * D + block * 16;
+                            for (int d = 0; d < D; ++d)
+                                memcpy(packed + d * 16, canonical + d * D, 16 * sizeof(float));
+                            glm53f_kda_column_tile(packed, c->prefill_core + h * D + block * 16,
+                                c->bq + h * D, c->bk + h * D, c->bv + h * D + block * 16,
+                                c->prefill_decay + h * D, c->bbeta + h, tokens, qd, hn);
+                        }
+                    /* Separate row-owned unpack: adjacent column tasks would
+                     * false-share canonical state's 256-byte cache lines. */
+#pragma omp for collapse(2) schedule(static)
+                    for (int h = 0; h < hn; ++h)
                         for (int d = 0; d < D; ++d)
-                            memcpy(packed + d * 16, canonical + d * D, 16 * sizeof(float));
-                        glm53f_kda_column_tile(packed, c->prefill_core + h * D + block * 16,
-                            c->bq + h * D, c->bk + h * D, c->bv + h * D + block * 16,
-                            c->prefill_decay + h * D, c->bbeta + h, tokens, qd, hn);
-                    }
-                /* Separate row-owned unpack: adjacent column tasks would
-                 * false-share canonical state's 256-byte cache lines. */
-#pragma omp for collapse(2) schedule(static)
-                for (int h = 0; h < hn; ++h)
-                    for (int d = 0; d < D; ++d)
-                        for (int block = 0; block < 8; ++block)
-                            memcpy(c->state + ((size_t)h * D + d) * D + block * 16,
-                                c->prefill_state + ((size_t)h * 8 + block) * D * 16 + d * 16,
-                                16 * sizeof(float));
+                            for (int block = 0; block < 8; ++block)
+                                memcpy(c->state + ((size_t)h * D + d) * D + block * 16,
+                                    c->prefill_state + ((size_t)h * 8 + block) * D * 16 + d * 16,
+                                    16 * sizeof(float));
+                }
                 KD_MARK(3);
 #pragma omp for collapse(2) schedule(static)
                 for (int h = 0; h < hn; ++h)
@@ -994,7 +1031,7 @@ void glm53f_kda_last_detail_12n(const glm53f_kda_context_12n*c,double p[5]){memc
 size_t glm53f_kda_state_bytes_12n(const glm53f_kda_context_12n*c){return c?((size_t)c->hn*D*D+(size_t)3*c->qd*KERNEL)*sizeof(float):0;}
 int glm53f_kda_save_state_12n(const glm53f_kda_context_12n*c,void*dst,size_t bytes){size_t sb=c?(size_t)c->hn*D*D*sizeof(float):0,need=glm53f_kda_state_bytes_12n(c);if(!c||!dst||bytes<need)return-1;memcpy(dst,c->state,sb);memcpy((unsigned char*)dst+sb,c->conv,need-sb);return 0;}
 int glm53f_kda_restore_state_12n(glm53f_kda_context_12n*c,const void*src,size_t bytes){size_t sb=c?(size_t)c->hn*D*D*sizeof(float):0,need=glm53f_kda_state_bytes_12n(c);if(!c||!src||bytes<need)return-1;memcpy(c->state,src,sb);memcpy(c->conv,(const unsigned char*)src+sb,need-sb);return 0;}
-void glm53f_kda_free_12n(glm53f_kda_context_12n*c){if(!c)return;free(c->kg_cw);free(c->kg_w1);free(c->kg_w2f);free(c->kg_w2g);free(c->kg_w3);free(c->kg_xq);free(c->kg_xp);free(c->kg_q2f);free(c->kg_q2g);free(c->kg_p2f);free(c->kg_p2g);free(c->kg_oq);free(c->kg_op);free(c->kg_xs);free(c->kg_xsp);free(c->kg_bt);free(c->kg_y1);free(c->kg_y2f);free(c->kg_y2g);free(c->kg_y3);free(c->kg_s2f);free(c->kg_s2g);free(c->kg_sp2f);free(c->kg_sp2g);free(c->kg_os);free(c->kg_osp);free(c->kg_cmp);free(c->batch_act);free(c->act_out);free(c->act_small);free(c->act_x);free(c->small_g);free(c->q2_gb);free(c->q2_ga);free(c->q2_b);free(c->q2_fb);free(c->q2_fa);free(c->q2_normed);free(c->q2_op);free(c->q2_v);free(c->q2_k);free(c->q2_q);free(c->prefill_state);free(c->prefill_decay);free(c->prefill_core);for(int m=0;m<4;m++){free(c->int8_weight[m]);free(c->int8_scale[m]);}free(c->bnormed);free(c->bbeta);free(c->bgate_g);free(c->bgate_f);free(c->bsmall_g);free(c->bsmall_f);free(c->bv);free(c->bk);free(c->bq);free(c->batch_partial);free(c->partial);free(c->state);free(c->conv);free(c->work);free(c->normed);free(c->core);free(c->beta);free(c->decay);free(c->gate);free(c->small);free(c->qkv);free(c->w.op);free(c->w.on);free(c->w.ga);free(c->w.fa);free(c->w.gb);free(c->w.b);free(c->w.fb);free(c->w.vc);free(c->w.kc);free(c->w.qc);free(c->w.v);free(c->w.k);free(c->w.q);free(c->w.dt);free(c->w.al);free(c);}
+void glm53f_kda_free_12n(glm53f_kda_context_12n*c){if(!c)return;free(c->decode_factor);free(c->kg_cw);free(c->kg_w1);free(c->kg_w2f);free(c->kg_w2g);free(c->kg_w3);free(c->kg_xq);free(c->kg_xp);free(c->kg_q2f);free(c->kg_q2g);free(c->kg_p2f);free(c->kg_p2g);free(c->kg_oq);free(c->kg_op);free(c->kg_xs);free(c->kg_xsp);free(c->kg_bt);free(c->kg_y1);free(c->kg_y2f);free(c->kg_y2g);free(c->kg_y3);free(c->kg_s2f);free(c->kg_s2g);free(c->kg_sp2f);free(c->kg_sp2g);free(c->kg_os);free(c->kg_osp);free(c->kg_cmp);free(c->batch_act);free(c->act_out);free(c->act_small);free(c->act_x);free(c->small_g);free(c->q2_gb);free(c->q2_ga);free(c->q2_b);free(c->q2_fb);free(c->q2_fa);free(c->q2_normed);free(c->q2_op);free(c->q2_v);free(c->q2_k);free(c->q2_q);free(c->prefill_state);free(c->prefill_decay);free(c->prefill_core);for(int m=0;m<4;m++){free(c->int8_weight[m]);free(c->int8_scale[m]);}free(c->bnormed);free(c->bbeta);free(c->bgate_g);free(c->bgate_f);free(c->bsmall_g);free(c->bsmall_f);free(c->bv);free(c->bk);free(c->bq);free(c->batch_partial);free(c->partial);free(c->state);free(c->conv);free(c->work);free(c->normed);free(c->core);free(c->beta);free(c->decay);free(c->gate);free(c->small);free(c->qkv);free(c->w.op);free(c->w.on);free(c->w.ga);free(c->w.fa);free(c->w.gb);free(c->w.b);free(c->w.fb);free(c->w.vc);free(c->w.kc);free(c->w.qc);free(c->w.v);free(c->w.k);free(c->w.q);free(c->w.dt);free(c->w.al);free(c);}
 
 #ifndef GLM53F_KDA_NO_MAIN
 int main(int argc,char**argv){

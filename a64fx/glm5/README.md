@@ -101,6 +101,13 @@ and larger-prefill fallbacks. Full-model state and delivered-throughput
 qualification is queued; the native component gain is not model tok/s.
 See [mHC batch evidence](strata-mhc-batch-native-20261002.json).
 
+`--kda-decode-kernel columns` and `--kda-prefill-kernel columns` independently
+select an A64FX SVE recurrence over 64-value halves of the canonical state.
+Both default to `legacy`. Native checks pass 9,504 exact state/output cases;
+decode component timings improve, while prefill results depend on head count.
+The serial 12-node state and throughput campaign is queued. See
+[KDA column evidence](strata-kda-columns-native-20261002.json).
+
 For tokenization of an already rendered chat prompt:
 
 ```bash

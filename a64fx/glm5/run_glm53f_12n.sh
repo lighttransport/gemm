@@ -83,7 +83,7 @@ if [ "$command" = benchmark ]; then
         printf 'arguments: '; printf '%q ' "$@"; printf '\n'
         sha256sum "$GLM53F_BIN_DIR/bench_glm53f_run_12n" "$1" "$topo_path"
         for key in GLM53F_PREWARM GLM53F_NUMA_INTERLEAVE GLM53F_IQ_FAST GLM53F_MHC_FAST \
-            GLM53F_NATIVE_Q8_PANEL GLM53F_NATIVE_Q8_ROWS8 GLM53F_NATIVE_Q8_TILE2X8 GLM53F_MLA_FUSED_PROJECTION GLM53F_VERIFY_GROUPED GLM53F_MHC_BATCH_TEAM GLM53F_MOE_GU_PAD GLM53F_ROUTER_FUSE GLM53F_DECODE_EXECUTOR \
+            GLM53F_NATIVE_Q8_PANEL GLM53F_NATIVE_Q8_ROWS8 GLM53F_NATIVE_Q8_TILE2X8 GLM53F_MLA_FUSED_PROJECTION GLM53F_VERIFY_GROUPED GLM53F_MHC_BATCH_TEAM GLM53F_KDA_DECODE_COLUMNS GLM53F_KDA_PREFILL_COLUMNS GLM53F_MOE_GU_PAD GLM53F_ROUTER_FUSE GLM53F_DECODE_EXECUTOR \
             GLM53F_COMM_OWNER GLM53F_MOE_COMBINE GLM53F_INDEX_HEADS GLM53F_MLA_REGISTERS GLM53F_POOL_PARTITION_4K GLM53F_KDA_ASYNC GLM53F_SPARSE_ASYNC GLM53F_MTNI_DECODE \
             OMP_NUM_THREADS OMP_PROC_BIND OMP_PLACES FLIB_BARRIER XOS_MMM_L_PAGING_POLICY XOS_MMM_L_HPAGE_TYPE; do
             printf '%s=%s\n' "$key" "${!key-}"
@@ -95,7 +95,7 @@ if [ "$command" = benchmark ]; then
     exit
 fi
 if [ "$command" = check ]; then
-    for test in kquant native_batch moe_layout prefill_config team mhc_team mhc_batch lookup moe_combine index_heads index_keys4 pool_select mla_absorb mla_value mla_cache_f16 mla_attention; do "$GLM53F_BIN_DIR/test_glm53f_$test"; done
+    for test in kquant native_batch moe_layout prefill_config team mhc_team mhc_batch kda_columns lookup moe_combine index_heads index_keys4 pool_select mla_absorb mla_value mla_cache_f16 mla_attention; do "$GLM53F_BIN_DIR/test_glm53f_$test"; done
     for required in 1 0; do "$GLM53F_BIN_DIR/test_glm53f_repack_policy" "$logdir" "$required"; done
     for iq_mode in 0 1; do GLM53F_IQ_FAST=$iq_mode "$GLM53F_BIN_DIR/test_glm53f_iq_grouped"; done
     mpi_run check-lookup "$GLM53F_BIN_DIR/test_glm53f_lookup_spec"
