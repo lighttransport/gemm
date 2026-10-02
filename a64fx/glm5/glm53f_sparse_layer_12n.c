@@ -85,7 +85,7 @@ struct glm53f_sparse_context_12n {
     uint8_t *q2_qa,*q2_qb,*q2_kva,*q2_vb,*q2_op;
     int q2_native,q2_qa_type,q2_op_type,q2_qb_type,q2_kva_type,q2_vb_type;
     float *q8v_ql,*q8v_log,*q8v_va,*q8v_sum;
-    float q8v_maximum[8];
+    float q8v_maximum[16];
     float *mlb_qs,*mlb_ql,*mlb_va,*mlb_out,*mlb_ref,*mlb_lg; unsigned char *mlb_act; size_t mlb_act_bytes; int mlb_threads;
     unsigned char *q8v_act;
     uint8_t *sg_w1, *sg_wqb, *sg_wop; int sg_state; /* int8 panel64 GEMM copies of q_a|kv_a and q_b (prefill front) */
@@ -610,12 +610,17 @@ static void mla_value_worker(void *context) {
         if (fused && atoi(fused)) {
             glm53f_native_matrix m[8];
             const void *activation[8];
-            for (int h = 0; h < hn; ++h) {
-                m[h] = (glm53f_native_matrix){out + (size_t)h * VD,
-                    c->q2_vb + (size_t)h * VD * row_bytes, c->q2_vb_type, VD, LAT};
-                activation[h] = c->q8v_act + (size_t)h * c->q8v_act_bytes;
+            const int group = hn > 8 ? 4 : 8;
+            for (int base = 0; base < hn; base += group) {
+                const int n = hn - base < group ? hn - base : group;
+                for (int h = 0; h < n; ++h) {
+                    const int head = base + h;
+                    m[h] = (glm53f_native_matrix){out + (size_t)head * VD,
+                        c->q2_vb + (size_t)head * VD * row_bytes, c->q2_vb_type, VD, LAT};
+                    activation[h] = c->q8v_act + (size_t)head * c->q8v_act_bytes;
+                }
+                if (glm53f_native_matvec_multi_team(m, n, activation)) bad = 1;
             }
-            if (glm53f_native_matvec_multi_team(m, hn, activation)) bad = 1;
         } else {
             for (int h = 0; h < hn; ++h) {
                 glm53f_native_matrix m = {out + (size_t)h * VD,
@@ -634,7 +639,7 @@ static int mla_heads_q8_value(glm53f_sparse_context_12n*c,float*out,
         const float*q,const float*z,const int*selected,int nt){
     enum { SLOTS = TOPK + KPOOL };
     const int hn = c->hn;
-    if(nt<1||nt>SLOTS||hn>8)return-1;
+    if(nt<1||nt>SLOTS||hn<1||hn>16)return-1;
     if(!c->q8v_ql){
         c->q8v_act_bytes=(glm53f_native_act_bytes(LAT)+255)&~(size_t)255;
         c->q8v_ql=a256((size_t)hn*LAT*sizeof(float));
@@ -1511,7 +1516,7 @@ static inline __attribute__((always_inline)) void mlb_absorb(float *ql, const fl
 static int mla_native_batch(glm53f_sparse_context_12n *c, glm53f_sparse_prefill_workspace_12n *w, int tokens) {
     enum { TCAP = GLM53F_PREFILL_ATTN_TOKENS };
     const int hn = c->hn, cols = hn * VD;
-    if ((int)svcntw() != 16 || hn < 1 || hn > 6 || tokens < 1 || tokens > TCAP || !c->q2_native) return -2;
+    if ((int)svcntw() != 16 || hn < 1 || hn > 16 || tokens < 1 || tokens > TCAP || !c->q2_native) return -2;
     if (!c->mlb_qs) {
         c->mlb_threads = omp_get_max_threads();
         c->mlb_qs = a256((size_t)TCAP * hn * KD * sizeof(float));
@@ -1540,12 +1545,15 @@ static int mla_native_batch(glm53f_sparse_context_12n *c, glm53f_sparse_prefill_
 #undef MLB_CASE
         }
     }
-#pragma omp parallel for schedule(dynamic, 1)
+    if (omp_get_max_threads() > c->mlb_threads) return -1;
+    int attention_bad = 0;
+#pragma omp parallel for schedule(dynamic, 1) reduction(|:attention_bad)
     for (int t = 0; t < tokens; ++t) {
         float *lg = c->mlb_lg + (size_t)omp_get_thread_num() * 8 * MLB_SLOTS;
         /* va is head-major [h][t][LAT]: hand mlb_values the token's row of head 0 and a head stride of tokens*LAT. */
-        mlb_token(va + (size_t)t * LAT, va_stride, lg, ql + (size_t)t * hn * LAT, c->latent, c->latent_f16, w->selected[t], w->count[t], hn);
+        attention_bad |= mlb_token_grouped(va + (size_t)t * LAT, va_stride, lg, ql + (size_t)t * hn * LAT, c->latent, c->latent_f16, w->selected[t], w->count[t], hn) != 0;
     }
+    if (attention_bad) return -1;
     {
         /* Prepare the activations with the exact per-head function of the reference path (tie-breaking in the
          * Q8 quantizer differs in glm53f_native_matvec_batch), then run the pre-prepared batch matvec. */

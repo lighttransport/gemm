@@ -63,7 +63,7 @@ for name in team collective kda sparse dense moe iq_bridge head embedding; do
 done
 kernels=("$build_dir/team.o" "$build_dir/iq_bridge.o" "$build_dir/q8_panel.o" "$build_dir/collective.o" "$build_dir/gemm_kern.o" "$build_dir/gemm_asm.o")
 bin glm53f_target_decode_12n glm53f_target_decode_12n.c "${objects[@]}"
-for name in q2_stage q2_embed_stage q2_dense_stage q2_sparse_stage q2_kda_stage \
+for name in pp_routed_stage q2_stage q2_embed_stage q2_dense_stage q2_sparse_stage q2_kda_stage \
             q2_shexp_stage q2_core_patch q2_shared_patch core_stage core_add_routers; do
     bin "glm53f_$name" "glm53f_$name.c"
 done
@@ -76,6 +76,8 @@ if [ "$bin_dir" = . ]; then bin ../utofu-tests/tofu_topo_helper ../utofu-tests/t
 
 if [ "$mode" != runtime ]; then
     obj target glm53f_target_decode_12n.c -DGLM53F_TARGET_MODEL_NO_MAIN
+    bin test_glm53f_dense_dist test_glm53f_dense_dist.c glm53f_dist.c "$build_dir/dense.o" "$build_dir/kda.o" "${kernels[@]}"
+    bin test_glm53f_pp_routed test_glm53f_pp_routed.c
     bin test_glm53f_parallel test_glm53f_parallel.c
     bin test_glm53f_pipeline test_glm53f_pipeline.c glm53f_dist.c glm53f_pipeline.c
     bin test_glm53f_team test_glm53f_team.c "$build_dir/team.o"
@@ -90,7 +92,7 @@ if [ "$mode" != runtime ]; then
     bin bench_glm53f_run_12n bench_glm53f_run_12n.c "$build_dir/lookup_spec.o" "$build_dir/mtp_spec.o" "$build_dir/mtp.o" "${objects[@]}" "$build_dir/target.o"
     bin test_glm53f_moe_layout test_glm53f_moe_layout.c "$build_dir/gemm_asm.o"
     bin test_glm53f_repack_policy test_glm53f_repack_policy.c
-    for name in kquant native_batch prefill_config state_io iq_grouped mhc_team mhc_sync mhc_batch kda_columns iq_scale_words lookup moe_combine index_heads index_keys4 pool_select mla_absorb mla_value mla_cache_f16 mla_attention mla_softmax; do
+    for name in kquant native_batch prefill_config state_io iq_grouped mhc_team mhc_sync mhc_batch kda_columns iq_scale_words lookup moe_combine index_heads index_keys4 pool_select mla_absorb mla_value mla_cache_f16 mla_attention mla_groups mla_softmax; do
         bin "test_glm53f_$name" "test_glm53f_$name.c" "$build_dir/q8_panel.o" "$build_dir/team.o" "$build_dir/gemm_asm.o"
     done
     bin glm53f_kda_callback_check glm53f_kda_callback_check.c "$build_dir/kda.o" "${kernels[@]}"

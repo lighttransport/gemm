@@ -115,4 +115,26 @@ static void mlb_token(float *va, size_t va_stride, float *lg, const float *ql, c
     }
 }
 
+/* PP TP4 has sixteen local heads. Preserve the existing 1..6-head path;
+ * larger slices use four-head groups and reuse temporary logits. lg needs
+ * six*SLOTS floats for the legacy path and four*SLOTS for grouped slices.
+ * Only the final group's logits remain; va stores all head values. */
+static inline int mlb_token_grouped(float *va, size_t va_stride, float *lg,
+        const float *ql, const float *cache, const uint16_t *half,
+        const int *sel, int nt, int heads) {
+    if (!va || !lg || !ql || !cache || !sel || va_stride < GLM53F_MLA_ATTENTION_LAT ||
+        nt < 1 || nt > GLM53F_MLA_ATTENTION_SLOTS || heads < 1 || heads > 16) return -1;
+    if (heads <= 6) {
+        mlb_token(va, va_stride, lg, ql, cache, half, sel, nt, heads);
+    } else {
+        for (int base = 0; base < heads; base += 4) {
+            const int n = heads - base < 4 ? heads - base : 4;
+            mlb_token(va + (size_t)base * va_stride, va_stride, lg,
+                ql + (size_t)base * GLM53F_MLA_ATTENTION_LAT,
+                cache, half, sel, nt, n);
+        }
+    }
+    return 0;
+}
+
 #endif

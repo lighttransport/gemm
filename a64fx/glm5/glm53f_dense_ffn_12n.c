@@ -16,6 +16,7 @@
 #endif
 #include "glm53f_expert_kern.h"
 #include "glm53f_dense_ffn_12n.h"
+#include "glm53f_pp_manifest.h"
 #include "glm53f_collective_12n.h"
 #include "glm53f_iq_bridge.h"
 #include "glm53f_team.h"
@@ -40,9 +41,9 @@ static void mv(float*y,const uint8_t*w,const float*s,const float*x,int rows,int 
 #pragma omp parallel for schedule(static)
     for(int r=0;r<rows;r++)y[r]=dot(w+(size_t)r*cols,s+(size_t)(r/B)*nb,x,cols);}
 #endif
-struct glm53f_dense_ffn_context_12n{int rank,i0,in,lb,hb;uint8_t*g,*u,*d;float*gs,*us,*ds,*gv,*uv,*act,*part,*bgv,*buv,*bact,*bpart;int q2,gtype,utype,dtype;};
+struct glm53f_dense_ffn_context_12n{int rank,i0,in,lb,hb;uint8_t*g,*u,*d;float*gs,*us,*ds,*gv,*uv,*act,*part,*bgv,*buv,*bact,*bpart;int q2,gtype,utype,dtype;const glm53f_dist *dist;int image_rank;};
 
-typedef struct { uint64_t offset; int type, rows, columns; } q2_dense_entry;
+typedef struct { uint64_t offset, hash; int type, rows, columns, check_hash; } q2_dense_entry;
 
 static size_t q2_row_bytes(int type, int columns) {
     return glm53f_native_type_supported(type) ?
@@ -50,19 +51,30 @@ static size_t q2_row_bytes(int type, int columns) {
 }
 
 static int q2_find_entry(const char *manifest, const char *name,
-                         q2_dense_entry *entry) {
+                         q2_dense_entry *entry, int require_hash) {
     FILE *f = fopen(manifest, "r");
     char line[1024], type_name[32], got[256];
     unsigned long long offset;
-    int type, rows, columns;
+    int type, rows, columns, found = 0;
     if (!f) return -1;
     while (fgets(line, sizeof(line), f)) {
         if (sscanf(line, "%llu %d %31s %d %d %255s", &offset, &type,
                    type_name, &rows, &columns, got) == 6 &&
             !strcmp(got, name)) {
-            *entry = (q2_dense_entry){(uint64_t)offset, type, rows, columns};
-            fclose(f);
-            return 0;
+            *entry = (q2_dense_entry){.offset=(uint64_t)offset, .type=type,
+                .rows=rows, .columns=columns};
+            if (!require_hash) { fclose(f); return 0; }
+            found = 1;
+            continue;
+        }
+        unsigned long long payload_offset, bytes, hash;
+        if (found && sscanf(line, "# PAYLOAD offset=%llu bytes=%llu fnv1a=%llx",
+                &payload_offset, &bytes, &hash) == 3 && payload_offset == entry->offset) {
+            size_t rb = q2_row_bytes(entry->type, entry->columns);
+            if (!rb || entry->rows < 1 || (size_t)entry->rows > SIZE_MAX / rb ||
+                bytes != (size_t)entry->rows * rb) break;
+            entry->hash = (uint64_t)hash; entry->check_hash = 1;
+            fclose(f); return 0;
         }
     }
     fclose(f);
@@ -75,16 +87,23 @@ static int q2_read_entry(int fd, const q2_dense_entry *entry, uint8_t **data) {
     size_t bytes = (size_t)entry->rows * row;
     if (!row || !bytes || !(*data = a256(bytes))) return -1;
     unsigned char *p = *data;
-    uint64_t offset = entry->offset;
+    uint64_t offset = entry->offset, hash = UINT64_C(1469598103934665603);
     while (bytes) {
-        ssize_t got = pread(fd, p, bytes, (off_t)offset);
+        size_t n = bytes < (1u << 20) ? bytes : (1u << 20);
+        ssize_t got = pread(fd, p, n, (off_t)offset);
         if (got < 0) { if (errno == EINTR) continue; return -1; }
         if (!got) { errno = EIO; return -1; }
+        if (entry->check_hash) {
+            for (ssize_t i = 0; i < got; ++i) {
+                hash ^= p[i]; hash *= UINT64_C(1099511628211);
+            }
+            (void)posix_fadvise(fd, (off_t)offset, got, POSIX_FADV_DONTNEED);
+        }
         p += got;
         offset += (uint64_t)got;
         bytes -= (size_t)got;
     }
-    return 0;
+    return !entry->check_hash || hash == entry->hash ? 0 : -1;
 }
 
 static int q2_repack(uint8_t **data, int *type, int rows, int columns) {
@@ -100,14 +119,16 @@ static int load_q2_dense(glm53f_dense_ffn_context_12n *c,
     char manifest[4096], blob[4096], name[256];
     q2_dense_entry gate, up, down;
     int fd;
-    snprintf(manifest, sizeof(manifest), "%s/rank%02d.manifest", stage, c->rank);
-    snprintf(blob, sizeof(blob), "%s/rank%02d.blob", stage, c->rank);
+    snprintf(manifest, sizeof(manifest), "%s/rank%02d.manifest", stage, c->image_rank);
+    snprintf(blob, sizeof(blob), "%s/rank%02d.blob", stage, c->image_rank);
+    if (c->dist && glm53f_pp_manifest_check(manifest, "DENSE", c->dist,
+            c->dist->map.first_layer, c->dist->map.end_layer)) return -1;
     snprintf(name, sizeof(name), "blk.%d.ffn_gate.weight", layer);
-    if (q2_find_entry(manifest, name, &gate)) return -1;
+    if (q2_find_entry(manifest, name, &gate, c->dist != NULL)) return -1;
     snprintf(name, sizeof(name), "blk.%d.ffn_up.weight", layer);
-    if (q2_find_entry(manifest, name, &up)) return -1;
+    if (q2_find_entry(manifest, name, &up, c->dist != NULL)) return -1;
     snprintf(name, sizeof(name), "blk.%d.ffn_down.weight", layer);
-    if (q2_find_entry(manifest, name, &down)) return -1;
+    if (q2_find_entry(manifest, name, &down, c->dist != NULL)) return -1;
     if (gate.rows != c->in || gate.columns != H ||
         up.rows != c->in || up.columns != H ||
         down.rows != H || down.columns != c->in ||
@@ -131,13 +152,42 @@ static int load_q2_dense(glm53f_dense_ffn_context_12n *c,
     return 0;
 }
 
-glm53f_dense_ffn_context_12n*glm53f_dense_ffn_create_12n(const char*model,int layer){int rank,nr,i0,in;char n[256];glm53f_st_context*st=NULL;glm53f_dense_ffn_context_12n*c;const char*q2_stage=getenv("GLM53F_Q2_DENSE_STAGE");MPI_Comm_rank(MPI_COMM_WORLD,&rank);MPI_Comm_size(MPI_COMM_WORLD,&nr);if(nr!=12||layer<0||layer>2||glm53f_block_aligned_slice(I,B,rank,nr,&i0,&in))return NULL;c=calloc(1,sizeof(*c));if(!c)MPI_Abort(MPI_COMM_WORLD,2);c->rank=rank;c->i0=i0;c->in=in;c->hb=H/B;c->lb=in/B;
+static glm53f_dense_ffn_context_12n *dense_create(
+        const glm53f_dist *dist, const char *model, const char *q2_stage, int layer) {
+    int rank, nr, i0, in; char n[256]; glm53f_st_context *st = NULL;
+    glm53f_dense_ffn_context_12n *c;
+    if (dist) {
+        if (!dist->initialized || dist->config.layout != GLM53F_PP3_TP4 ||
+            layer < dist->map.first_layer || layer >= dist->map.end_layer ||
+            !q2_stage || !*q2_stage) return NULL;
+        rank = dist->map.tp_rank; nr = dist->map.tp_size;
+    } else {
+        MPI_Comm_rank(MPI_COMM_WORLD, &rank); MPI_Comm_size(MPI_COMM_WORLD, &nr);
+        if (nr != 12) return NULL;
+    }
+    if (layer < 0 || layer > 2 || glm53f_block_aligned_slice(I,B,rank,nr,&i0,&in)) return NULL;
+    c = calloc(1, sizeof(*c)); if (!c) MPI_Abort(MPI_COMM_WORLD, 2);
+    c->dist = dist; c->image_rank = dist ? dist->map.world_rank : rank;
+    c->rank=rank;c->i0=i0;c->in=in;c->hb=H/B;c->lb=in/B;
     if(q2_stage&&*q2_stage){if(load_q2_dense(c,q2_stage,layer))goto fail;}else{st=glm53f_st_open(model);if(!st)goto fail;
 #define N(S) snprintf(n,sizeof n,"model.language_model.layers.%d.mlp.%s",layer,S)
     c->g=a256((size_t)in*H);N("gate_proj.weight");rd(st,n,(size_t)i0*H,c->g,(size_t)in*H,rank);c->u=a256((size_t)in*H);N("up_proj.weight");rd(st,n,(size_t)i0*H,c->u,(size_t)in*H,rank);c->gs=a256((size_t)c->lb*c->hb*4);N("gate_proj.weight_scale_inv");rd(st,n,(size_t)(i0/B)*c->hb*4,c->gs,(size_t)c->lb*c->hb*4,rank);c->us=a256((size_t)c->lb*c->hb*4);N("up_proj.weight_scale_inv");rd(st,n,(size_t)(i0/B)*c->hb*4,c->us,(size_t)c->lb*c->hb*4,rank);c->d=a256((size_t)H*in);N("down_proj.weight");rd_cols(st,n,c->d,H,I,i0,in,rank);c->ds=a256((size_t)(H/B)*c->lb*4);N("down_proj.weight_scale_inv");rd_scale_cols(st,n,c->ds,H/B,I/B,i0/B,c->lb,rank);
 #undef N
     glm53f_st_close(st);st=NULL;}c->gv=a256(in*4);c->uv=a256(in*4);c->act=a256(in*4);c->part=a256(H*4);c->bgv=a256((size_t)4*in*4);c->buv=a256((size_t)4*in*4);c->bact=a256((size_t)4*in*4);c->bpart=a256((size_t)4*H*4);return c;
 fail:if(st)glm53f_st_close(st);glm53f_dense_ffn_free_12n(c);return NULL;}
+glm53f_dense_ffn_context_12n *glm53f_dense_ffn_create_12n(const char *model, int layer) {
+    return dense_create(NULL, model, getenv("GLM53F_Q2_DENSE_STAGE"), layer);
+}
+glm53f_dense_ffn_context_12n *glm53f_dense_ffn_create_dist(const glm53f_dist *dist,
+        const char *model, const char *stage, int layer) {
+    return dist ? dense_create(dist, model, stage, layer) : NULL;
+}
+static int dense_sum(const glm53f_dense_ffn_context_12n *c,
+        const float *input, float *output, int count) {
+    if (!c->dist) return glm53f_sum_allreduce_12n(input, output, count);
+    return MPI_Allreduce(input, output, count, MPI_FLOAT, MPI_SUM,
+        c->dist->tp) == MPI_SUCCESS ? 0 : -1;
+}
 void glm53f_dense_ffn_free_12n(glm53f_dense_ffn_context_12n*c){if(!c)return;free(c->bpart);free(c->bact);free(c->buv);free(c->bgv);free(c->part);free(c->act);free(c->uv);free(c->gv);free(c->ds);free(c->d);free(c->us);free(c->gs);free(c->u);free(c->g);free(c);}
 static void dense_activation_worker(void *context) {
     glm53f_dense_ffn_context_12n *c = context;
@@ -155,7 +205,7 @@ int glm53f_dense_ffn_sublayer_12n(void*context,float*out,const float*x){glm53f_d
             { dense_activation_worker(c); }
         }
         if(glm53f_iq_matvec(c->part,c->d,c->dtype,H,c->in,c->act))return-1;
-        return glm53f_sum_allreduce_12n(c->part,out,H);}
+        return dense_sum(c,c->part,out,H);}
     /* Gate and up projections have identical shape and input.  Run them in
      * one OpenMP team so the short decode path pays one launch/barrier while
      * retaining the original row order and arithmetic. */
@@ -164,7 +214,7 @@ int glm53f_dense_ffn_sublayer_12n(void*context,float*out,const float*x){glm53f_d
 #pragma omp parallel for schedule(static)
     for(int j=0;j<c->in;j++){float a=c->gv[j]>10?10:c->gv[j],b=c->uv[j]>10?10:c->uv[j]<-10?-10:c->uv[j];c->act[j]=a/(1+expf(-a))*b;}
 #pragma omp parallel for schedule(static)
-    for(int r=0;r<H;r++)c->part[r]=dot(c->d+(size_t)r*c->in,c->ds+(size_t)(r/B)*c->lb,c->act,c->in);return glm53f_sum_allreduce_12n(c->part,out,H);}
+    for(int r=0;r<H;r++)c->part[r]=dot(c->d+(size_t)r*c->in,c->ds+(size_t)(r/B)*c->lb,c->act,c->in);return dense_sum(c,c->part,out,H);}
 int glm53f_dense_ffn_sublayer_batch_12n(glm53f_dense_ffn_context_12n*c,float*out,const float*x,int tokens){if(!c||!out||!x||tokens<1||tokens>4)return-1;
     if(c->q2){
         glm53f_native_matrix gu[2] = {
@@ -174,11 +224,11 @@ int glm53f_dense_ffn_sublayer_batch_12n(glm53f_dense_ffn_context_12n*c,float*out
 #pragma omp parallel for schedule(static)
         for(int q=0;q<tokens*c->in;q++){float a=c->bgv[q]>10?10:c->bgv[q],b=c->buv[q]>10?10:c->buv[q]<-10?-10:c->buv[q];c->bact[q]=a/(1+expf(-a))*b;}
         if(glm53f_native_matvec_batch(&down,1,c->bact,tokens))return-1;
-        return glm53f_sum_allreduce_12n(c->bpart,out,tokens*H);
+        return dense_sum(c,c->bpart,out,tokens*H);
     }
     glm53f_mv_fp8_block128_bits_batch(c->bgv,c->g,c->gs,x,tokens,c->in,H);glm53f_mv_fp8_block128_bits_batch(c->buv,c->u,c->us,x,tokens,c->in,H);
 #pragma omp parallel for schedule(static)
-    for(int q=0;q<tokens*c->in;q++){float a=c->bgv[q]>10?10:c->bgv[q],b=c->buv[q]>10?10:c->buv[q]<-10?-10:c->buv[q];c->bact[q]=a/(1+expf(-a))*b;}glm53f_mv_fp8_block128_bits_batch(c->bpart,c->d,c->ds,c->bact,tokens,H,c->in);return glm53f_sum_allreduce_12n(c->bpart,out,tokens*H);}
+    for(int q=0;q<tokens*c->in;q++){float a=c->bgv[q]>10?10:c->bgv[q],b=c->buv[q]>10?10:c->buv[q]<-10?-10:c->buv[q];c->bact[q]=a/(1+expf(-a))*b;}glm53f_mv_fp8_block128_bits_batch(c->bpart,c->d,c->ds,c->bact,tokens,H,c->in);return dense_sum(c,c->bpart,out,tokens*H);}
 #ifndef GLM53F_DENSE_NO_MAIN
 int main(int argc,char**argv){int rank,nr,layer=argc>2?atoi(argv[2]):0,i0,in;char n[256];glm53f_st_context*st;uint8_t*g,*u,*d;float*gs,*us,*ds,*x,*gv,*uv,*act,*part,*out[2];MPI_Init(&argc,&argv);MPI_Comm_rank(MPI_COMM_WORLD,&rank);MPI_Comm_size(MPI_COMM_WORLD,&nr);if(argc<2||nr!=12||layer<0||layer>2){if(!rank)fprintf(stderr,"usage: mpiexec -np 12 %s MODEL_DIR [layer=0]\n",argv[0]);MPI_Finalize();return 2;}if(glm53f_block_aligned_slice(I,B,rank,nr,&i0,&in))MPI_Abort(MPI_COMM_WORLD,2);st=glm53f_st_open(argv[1]);if(!st)MPI_Abort(MPI_COMM_WORLD,2);
 #define N(S) snprintf(n,sizeof n,"model.language_model.layers.%d.mlp.%s",layer,S)

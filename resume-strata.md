@@ -10,6 +10,15 @@ PJM52106727 is the fresh12-node normal2GHz/eco0 allocation, bridge42446â†’32446â
 host d25-0010s, isolated checkout unchanged. Local launcher tmux socket is
 `tmp/tmux-glm53f/pp1.sock`, session`glm53f-pp1`. PJM52097252 has expired.
 
+Dense stage-local constructor fixtures pass three cut configurations with
+synthetic Q4_K weights. The16-head MLA primitive passes15360 bit-exact native
+cases across both math modes. The owned-layer executor refactor is uncommitted
+pending full-model gates. On PJM52106727, detached staging PID551 precedes
+full-model gate PID854, then shard hash/corruption fixtures PID2130. Logs live
+under `tmp/strata-pipeline-20261002/`; do not overlap these MPI launches.
+New dense/routed hash-aware staging and KDA distribution changes are in progress;
+no full PP model or throughput result exists yet.
+
 Previous queued experiments are terminal and none is promoted: KDA columns
 passes full-state/8049 gates, but independent five-trial confirmation gives
 0.985182 decode /0.997147 prefill ratios. Q5 scale words gives0.981789/0.990258;

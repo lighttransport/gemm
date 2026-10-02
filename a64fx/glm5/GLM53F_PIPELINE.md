@@ -101,6 +101,32 @@ embedding/head, shared/dense weights, caches and workspaces. The checked
 complete component accounting and resident-loader integration remain pending.
 See [machine-readable evidence](strata-pipeline-foundation-20261003.json).
 
+## Dense context and 16-head MLA
+
+`glm53f_dense_ffn_create_dist` borrows the explicit distribution context,
+requires an owned dense layer and a PP native image, and partitions the
+12288 intermediate channels into four3072-channel slices. It uses world-rank
+image filenames and stage-local reductions. The loader checks the PP header,
+entry shapes/byte counts and FNV1a hashes before native repacking; reads are
+bounded to1MiB and release source cache pages. Legacy constructors retain their
+TP12 path.
+
+On PJM52106727, `test_glm53f_dense_dist DIR` passes three cuts (`15,30`, `1,3`,
+`1,2`), covering dense layers on all stages. Scalar and batch1–4 callbacks pass
+with synthetic zero Q4_K weights; legacy headers, corruption, missing paths
+and wrong ownership are rejected. This validates the interface and collectives;
+real-model dense math and full PP integration remain pending.
+
+`glm53f_mlb_token_grouped` extends the existing MLA primitive to16 heads,
+using four-head groups above the legacy six-head range. Values for all heads
+are retained; scratch logits belong to the final group. Sparse-layer helpers
+also accept16 heads and group fused projections within the eight-matrix native
+limit. Native `test_glm53f_mla_groups` passes640 bit-exact cases per node in
+both conservative and production-fast math builds (15360 cases total), covering
+heads1–16, selected counts through2052, two selection orders, FP32/FP16 latent
+values, stride padding and output/scratch canaries. Full-model sparse qualification
+is pending; its PP constructor is not yet connected.
+
 ## Remaining model integration
 
 1. Stage-specific native manifests, source/tensor byte coverage and hashes;
