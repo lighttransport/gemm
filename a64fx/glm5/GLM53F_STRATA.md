@@ -5,7 +5,7 @@ prefill tokens/s**, on twelve A64FX nodes, the complete 45-layer
 UD-Q4_K_XL model, top-8 routing, and the saved roughly 8K coding prompt.
 These targets have **not been demonstrated** by the changes below.
 
-## October 2 continuation (qualification pending)
+## October 2 qualification (complete)
 
 The new opt-in candidates preserve the existing arithmetic and reduction
 order: four-key index scoring reuses query vectors, MLA values keep four
@@ -24,16 +24,82 @@ key counts 1/7/128/2048/2051, and output guards). Index arithmetic also
 passes the native fast/conservative thread-count matrix. These arithmetic
 results do not establish a whole-model throughput improvement.
 
-PJM 52075759 is staging boundedly before a sequential campaign. The campaign
-will compare the previously qualified page-none/47-thread configuration,
-a rebuilt control, independent index/value ablations, and both cache/index
+PJM 52075759 completed bounded staging at 06:30 JST. Uncontended native
+units and byte-exact derived-cache prefill/rollback checks pass; the
+128-position full-model executor comparison also passes bit-exactly.
+Initial same-allocation 8K cache-heads medians are 34.079982 decode and
+345.582371 prefill tok/s versus 32.731477 / 329.018991 for the frozen
+control (+4.1% / +5.0%), with complete output IDs exact. Independent
+five-trial confirmation also passes: 33.939857 / 346.234747 versus
+32.610212 / 327.987043 (+4.08% / +5.56%). Full1024-transition
+stress, short128 and repeated32K complete-ID qualification also passes.
+The cache-heads configuration qualifies for promotion. Synthetic32K
+medians are 32.385736 / 316.830563 versus 31.326356 / 286.622911
+(+3.4% / +10.5%); short128 rates are essentially unchanged. The campaign
+compared the previously qualified page-none/47-thread configuration, a
+rebuilt control, independent index/value ablations, and both cache/index
 combinations. Complete output IDs, sampled memory headroom, independent
 five-trial confirmation, 1024-transition decode, short128, and synthetic
 32K are required before promotion. A complete-state legacy/persistent
 checker can exercise the new kernels using diagnostic
 `GLM53F_EXECUTOR_INDEX_KERNEL=2 GLM53F_EXECUTOR_MLA_KERNEL=3`; it frees the
 reference before loading a fresh cache-enabled candidate.
-See the active allocation and queue in `../../resume-strata.md`.
+Replicated decode scoring removes the score allreduce but yielded no
+whole-model improvement. Both `replicated-heads` and `replicated-keys4`
+passed strict sparse gates and complete 257-ID comparisons; decode ratios
+were 0.996676 and 0.997061 against cache-heads. They remain experimental.
+
+### Selected selector/panel configuration
+
+`--pool-selector partition4k` uses bounded ID partitioning with the exact
+original descending-score/ascending-ID order, sorts only the selected 512
+entries, and reuses dead reduction scratch. NaNs, bad pivots and more than
+4096 pools retain the heap. Default selection remains `heap`; default
+attention width remains 32. Native fast/conservative 120-case oracle/bounds
+checks, local ASan/UBSan, and native strict prefill/decode/rollback gates pass.
+
+The selected configuration adds a 47-token attention panel to the qualified
+cache-heads runtime: build `build_glm53f_integrated_12n.sh check 47`, then use
+`--index-kernel heads --mla-kernel fp16-cache --pool-selector partition4k`
+alongside persistent decode, fused router, grouped verification and vector
+MoE combine. Keep 47 threads, page type `none`, Q8 panel 0, sparse async 0 and
+KDA async 1. All 45 layers and top-8 routing remain active.
+
+Same-allocation ablations reject replicated decode scoring, confirm the
+rebuilt 32/heap control is unchanged, and select 47 over 64. Independent
+confirmation and every context check complete with exact output IDs.
+The control below is the immutable qualified cache-v3 binary; candidate is
+candidate-panel47-v1. Every rate is a median of complete rank-max trials.
+
+| Workload | Decode control → candidate (tok/s) | Prefill control → candidate (tok/s) | Decode gain | Prefill gain |
+| --- | --- | --- | --- | --- |
+| 8K, 256 transitions, 5 trials | 33.793083 → 35.742137 | 345.065496 → 370.754010 | +5.77% | +7.44% |
+| 8K, 1024 transitions, 3 trials | 34.040300 → 35.746584 | 344.113402 → 371.903716 | +5.01% | +8.08% |
+| Short 128, 256 transitions, 3 trials | 40.436245 → 40.660046 | 282.005617 → 285.918131 | +0.55% | +1.39% |
+| Synthetic 32196, 256 transitions, 3 trials | 32.275942 → 32.185018 | 316.484767 → 341.961472 | -0.28% | +8.05% |
+
+All 257 IDs match for 256 transitions and all 1025 match for stress1024.
+Minimum sampled memory headroom across these runs is **9.831 GiB**.
+32K uses the 8K prompt repeated four times; it is synthetic context evidence.
+Targets 100/2000 remain unmet. All new settings stay opt-in.
+
+Strict native panel gates compare 32 against 47/64 over 91 positions at
+warm 2046/8049, including rollback; selector gates cover warm 2046/2051
+prefill 32 and warm 8049 decode 4. All comparisons require memcmp equality
+on every rank. The benchmark records its compiled panel width and sizes
+collective reservations for both output and packed-score payloads.
+
+Implementation commit `c461079c` matches the frozen runtime source archives.
+The committed [kernel qualification record](strata-kernel-validation-20261002.json)
+contains comparisons, settings, binary/source/evidence hashes and rejected
+experiments. See [resume](../../resume-strata.md) for the allocation and
+immutable remote build paths. No inference campaign remains running.
+
+Rank-zero diagnostic medians identify the remaining work: decode KDA 6.405,
+mHC 5.764 and MoE 7.582 ms/token; prefill MoE stays near 1.02 ms/token. Sparse
+prefill falls 0.966→0.760 ms/token and decode index 3.459→2.108 ms/token.
+These nested component timers overlap and are separate from the rank-max
+throughput measurements above.
 
 ## Implementation
 
@@ -66,8 +132,9 @@ available for reference. CLI switches:
 --verify-kernel legacy|grouped
 --collective-owner legacy|serialized
 --moe-combine-kernel legacy|vector|overlap
---index-kernel legacy|heads|keys4
+--index-kernel legacy|heads|keys4|replicated-heads|replicated-keys4
 --mla-kernel legacy|registers|values|fp16-cache
+--pool-selector heap|partition4k
 ```
 
 MTP retains its legacy executor and rejects `--decode-executor persistent`.
@@ -78,32 +145,42 @@ exposed through the resident benchmark; it is not a serving API.
 ## Reproduce the full-model gates and measurements
 
 Run serially in one twelve-node allocation after bounded staging completes.
-Use separate frozen baseline and candidate binaries compiled with identical
-math flags. Preserve prompt, paging, thread count and collectives between
-runs. Never overlap a staging MPI job with these launches.
+Use separate control and candidate binaries compiled with identical math
+flags. The completed campaign also checks the rebuilt 32/heap control against
+the immutable cache-v3 binary before comparing the selector/panels. Preserve
+prompt, paging, thread count and collectives between runs. Never overlap a staging MPI job with these launches.
 
 ```bash
+unset OPAL_PREFIX OMPI_CC OMPI_CXX
+export GLM53F_MPICC=mpifcc
 export GLM53F_BUILD=0 OMP_NUM_THREADS=47
-export XOS_MMM_L_PAGING_POLICY=demand:demand:demand
-bash a64fx/glm5/build_glm53f_integrated_12n.sh all
-bash a64fx/glm5/run_glm53f_12n.sh check
-bash a64fx/glm5/run_glm53f_12n.sh executor-check tmp/prompt8k.ids 32
+export OMP_PROC_BIND=close OMP_PLACES=cores OMP_WAIT_POLICY=active FLIB_BARRIER=HARD
+export GLM53F_PREWARM=1 GLM53F_PROFILE=1
+export GLM53F_FAST_MATH=1 GLM53F_NO_MATH_ERRNO=1
+export XOS_MMM_L_PAGING_POLICY=demand:demand:demand XOS_MMM_L_HPAGE_TYPE=none
+export GLM53F_NATIVE_Q8_PANEL=0 GLM53F_COMM_OWNER=0
+export GLM53F_SPARSE_ASYNC=0 GLM53F_KDA_ASYNC=1
+export GLM53F_BIN_DIR="$PWD/tmp/glm53f-panel32-bin"
+bash a64fx/glm5/build_glm53f_integrated_12n.sh check 32
+export GLM53F_BIN_DIR="$PWD/tmp/glm53f-panel47-bin"
+bash a64fx/glm5/build_glm53f_integrated_12n.sh check 47
 
-# Use the frozen baseline GLM53F_BIN_DIR for the first command.
-unset XOS_MMM_L_HPAGE_TYPE
-bash a64fx/glm5/run_glm53f_12n.sh benchmark tmp/prompt8k.ids tmp/baseline.ids \
-  --transitions 256 --repetitions 3 > tmp/baseline.log 2>&1
-# Switch GLM53F_BIN_DIR to the candidate binaries.
-export XOS_MMM_L_HPAGE_TYPE=none GLM53F_NATIVE_Q8_PANEL=0
-export GLM53F_SPARSE_ASYNC=0 GLM53F_KDA_ASYNC=0
-bash a64fx/glm5/run_glm53f_12n.sh benchmark tmp/prompt8k.ids tmp/candidate.ids \
-  --transitions 256 --repetitions 3 --decode-executor persistent \
+# Sequential runs; use unique output names for each independent repeat.
+export GLM53F_BIN_DIR="$PWD/tmp/glm53f-panel32-bin"
+bash a64fx/glm5/run_glm53f_12n.sh benchmark tmp/prompt8k.ids tmp/control.ids \
+  --transitions 256 --repetitions 5 --decode-executor persistent \
   --router-kernel fused --verify-kernel grouped --index-kernel heads \
-  --mla-kernel registers --collective-owner serialized \
-  --moe-combine-kernel vector > tmp/candidate.log 2>&1
+  --mla-kernel fp16-cache --moe-combine-kernel vector --pool-selector heap \
+  > tmp/control.log 2>&1
+export GLM53F_BIN_DIR="$PWD/tmp/glm53f-panel47-bin"
+bash a64fx/glm5/run_glm53f_12n.sh benchmark tmp/prompt8k.ids tmp/candidate.ids \
+  --transitions 256 --repetitions 5 --decode-executor persistent \
+  --router-kernel fused --verify-kernel grouped --index-kernel heads \
+  --mla-kernel fp16-cache --moe-combine-kernel vector --pool-selector partition4k \
+  > tmp/candidate.log 2>&1
 python3 a64fx/glm5/compare_glm53f_runs.py \
-  --baseline tmp/baseline.log --candidate tmp/candidate.log \
-  --baseline-ids tmp/baseline.ids --candidate-ids tmp/candidate.ids \
+  --baseline tmp/control.log --candidate tmp/candidate.log \
+  --baseline-ids tmp/control.ids --candidate-ids tmp/candidate.ids \
   --output tmp/comparison.json
 ```
 

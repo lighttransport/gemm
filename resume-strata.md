@@ -1,6 +1,6 @@
 # Resume: GLM53F Strata-inspired optimization, 12 A64FX nodes
 
-Updated 2026-10-02 05:47 JST. New optimization campaign is active; prior results below remain the qualified baseline.
+Updated 2026-10-02 09:23 JST. All cache/selector/panel qualifications complete; no campaign or native unit job remains running.
 
 Previous campaign: TP12 implementation, native validation and
 short/8K/synthetic 32K qualification complete. All new paths remain opt-in.
@@ -8,20 +8,20 @@ Targets: complete 45-layer UD-Q4_K_XL/top-8, saved ~8K single
 request, 100+ delivered decode and 2000+ prefill tok/s. Neither target met.
 See `a64fx/glm5/GLM53F_STRATA.md` for implementation, gates and commands.
 
-## Active continuation (October 2)
+## Completed continuation (October 2)
 
 - PJM **52075759**, 12 nodes, 2×3×2, normal 2 GHz / eco 0, approximately
   04:05–10:05 JST; compute bridge on `f28-0008c`, tmux `glm53f-strata-next2`.
   Same isolated remote snapshot and HTTP forwarding as below.
 - Bounded stage PID **685**, log `tmp/strata-20261002/stage.log`; routed
   rank-zero log `tmp/glm53f-q4-52075759/routed-stage-keys4-stage.1.0`.
-  Layer 34 / 11.78 GB at 05:45. Wait for stage exit and OK sentinel before MPI.
+  All ranks completed layer 44; stage finished at 06:30 with the OK sentinel.
 - Immutable builds **candidate-keys4-v1** and **candidate-values-v1** complete.
   Build logs `tmp/strata-20261002/build-{keys4-v2,values-v1}.log` remotely.
   Native fast/conservative index keys4 and MLA register-value arithmetic
   checks pass at 1/12/47/48 threads. Measurements during staging are contended;
   no new whole-model throughput result or promotion yet.
-- Working tree adds opt-in `--index-kernel keys4` and `--mla-kernel values`.
+- Committed candidates add opt-in `--index-kernel keys4` and `--mla-kernel values`.
   Derived FP16 latent cache integrated behind `--mla-kernel fp16-cache`;
   **candidate-cache-v3** builds, native fast/conservative value/conversion
   gates pass at 1/12/47/48 threads. Actual prefill attention has 60 byte-exact
@@ -29,7 +29,10 @@ See `a64fx/glm5/GLM53F_STRATA.md` for implementation, gates and commands.
   Aligned native value outputs now match runtime cache-line boundaries;
   updated fast/conservative arithmetic still passes. Earlier unaligned
   scratch timing could include false sharing and is not promotion evidence.
-  Whole-model gates remain pending. Wider mHC tiles rejected
+  Uncontended native units passed. Sparse scalar/batch and strict derived-cache
+  prefill/rollback comparisons passed; 128-position full executor state
+  gate passed with zero hidden/state bit mismatches.
+  Wider mHC tiles rejected
   for slower native probes; no runtime mHC tile path retained.
 - Unset `OPAL_PREFIX OMPI_CC OMPI_CXX` before invoking system `mpifcc`.
   Never use global `set -e` in the persistent bridge shell; use child scripts.
@@ -39,10 +42,76 @@ See `a64fx/glm5/GLM53F_STRATA.md` for implementation, gates and commands.
   followed by a 128-position complete-state legacy/candidate comparison.
   Scripts `tmp/glm53f-kernel-campaign-20261002.{sh,py}` contain sequential
   8K ablations, five-trial confirmation, 1024-transition stress, short128 and
-  repeated32K qualification. No new whole-model result yet.
-- Next: collect sequential
-  8K old-best/control/index/value/cache ablations with exact complete IDs and
-  rank-max timings; qualify selected exact balanced improvement.
+  repeated32K qualification. Same-allocation 8K medians: old-best
+  **32.731477 / 329.018991**, rebuilt control **32.777221 / 326.879995**,
+  keys4 **32.685680 / 328.203548** decode/prefill tok/s. Both compared
+  candidates match all 257 output IDs; neither is promoted. Value/cache
+  ablations finished: values **33.357720 / 329.070713**, keys4-values
+  **33.628723 / 328.824199**, cache-heads **34.079982 / 345.582371**,
+  cache-keys4 **34.034069 / 345.518427**. All complete 257-ID streams exact.
+  Independent five-trial confirmation passed: control **32.610212 /
+  327.987043**, cache-heads **33.939857 / 346.234747** (+4.08% / +5.56%).
+  All IDs exact. Stress1024 also passes (1025 IDs): **34.311308 /
+  345.120441** vs **32.991032 / 329.546116**. Short128 exact: **40.651945 /
+  281.451159** vs **40.450590 / 282.981541** (essentially unchanged).
+  Repeated32K qualification passes: **32.385736 / 316.830563** vs
+  **31.326356 / 286.622911** (+3.4% / +10.5%). All complete IDs exact;
+  `ALL_KERNEL_QUALIFICATIONS_PASS` / `KERNEL_CAMPAIGN_PASS` at 07:52.
+  Cache-heads now qualifies for promotion; targets remain unmet.
+- Replicated-index PID **6995** completed at 08:08. Both decode variants
+  match all 257 IDs but are rejected for throughput: replicated-heads
+  decode/prefill ratios **0.996676 / 1.003960**, replicated-keys4
+  **0.997061 / 1.002729** against cache-heads. Strict sparse comparisons
+  passed at warm2046/2051 (prefill32) and warm8049 (decode4/rollback).
+  Log `tmp/strata-replicated-20261002/campaign.log`.
+- Selector/panel campaign **PID 10777 completed**, log
+  `tmp/strata-panels-20261002/campaign.log`; `PANEL_QUALIFICATIONS_PASS` /
+  `PANEL_CAMPAIGN_PASS`. Immutable builds candidate-panel32-v1 /
+  candidate-panel47-v1 / candidate-panel64-v1 pass. Panel 47 selected.
+- Implementation **c461079c**, 13 files, 276+/47-. Opt-in bounded selector
+  `--pool-selector partition4k` uses 513..4096 pools, exact original ordering,
+  dead score-reduction scratch and original heap fallback. Default heap and
+  attention panel 32 remain available; build argument 47 selects the winner.
+- Independent five-trial confirmation: control **33.793083 /345.065496**,
+  panel 47 **35.742137 /370.754010** decode/prefill tok/s, **+5.77% /+7.44%**,
+  all 257 IDs exact. Promotion decision true; 100/2000 targets remain unmet.
+- Stress1024: control **34.040300 /
+  344.113402**, candidate **35.746584 /
+  371.903716**, all 1025 IDs exact.
+- Short128: control **40.436245 /
+  282.005617**, candidate **40.660046 /
+  285.918131**, all 257 IDs exact, no regression.
+- Repeated32K (32196 promptIDs): control
+  **32.275942 /316.484767**, candidate
+  **32.185018 /341.961472**,
+  all 257 IDs exact. Synthetic 8K repeated 4x. Minimum across panel campaign
+  **9.831 GiB** sampled headroom.
+- All local 120-case selector oracle/bounds, ASan/UBSan (LeakSanitizer
+  disabled), config 32/47/48/64 and launcher 16 checks pass. Native fast and
+  conservative selector 120-case tests pass after timing; final unit waiter
+  PID 12302 completed, `selector-final-units.log`: `SELECTOR_FINAL_UNITS_PASS`.
+  Strict selector prefill/decode/rollback and 32-vs47/64 panel gates pass.
+- Qualified bin `a64fx/glm5/build/candidate-panel47-v1/bench_glm53f_run_12n`;
+  native objects `/local/glm53f-panel47-build-52075759`, full frozen source
+  `/local/glm53f-panel47-build-52075759/src/a64fx/glm5`.
+  Flags: persistent decode, fused router, grouped verify, vector MoE,
+  heads index, fp16-cache MLA, partition4k selector; 47 threads/page none,
+  Q8 panel 0/sparse async 0/KDA async 1/collective owner 0. Build-time panel 47.
+- Rank-zero diagnostic medians: sparse prefill 0.966→0.760 ms/token;
+  decode index 3.459→2.108 ms/token. Candidate KDA 6.405, mHC 5.764,
+  MoE 7.582 ms/token decode; prefill MoE about 1.02 ms/token unchanged.
+  Parent/child timers overlap and are not rank-max throughput.
+- Evidence copied locally to `tmp/glm53f-strata-evidence-20261002/`;
+  `replicated/` holds rejected replicas, `panels/` holds native gates,
+  complete logs/IDs/reports and binary/prompt/topology metadata. All 10
+  follow-up reports recomputed locally and match remote JSON exactly.
+  Committed record `a64fx/glm5/strata-kernel-validation-20261002.json`.
+- Immutable source archives: `tmp/glm53f-replicated-index-update.tar.gz`,
+  `tmp/glm53f-prefill-panels-update.tar.gz`, `tmp/glm53f-selector-update.tar.gz`.
+  Scripts `tmp/build-glm53f-prefill-panels.sh` and
+  `tmp/glm53f-prefill-panels-campaign-20261002.{sh,py}` run serially.
+  No push. Allocation 52075759 remains live until approximately 10:05 JST;
+  stages disappear when it expires. Do not overlap subsequent timed MPI jobs.
 
 ## Previous allocation and isolated deployment (expired)
 

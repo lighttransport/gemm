@@ -1,5 +1,5 @@
 {
-  "status": "CACHE_FULL_MODEL_QUALIFICATION_PASS_FOLLOWUPS_PENDING",
+  "status": "CACHE_SELECTOR_PANEL_FULL_MODEL_QUALIFICATION_PASS",
   "allocation": 52075759,
   "nodes": 12,
   "clock_ghz": 2,
@@ -24,7 +24,7 @@
   ],
   "prefill_attention_cases_per_invocation": 60,
   "prefill_attention_scope": "Serial production worker kernel; head counts 1..6, forward/reverse selections, 1/7/128/2048/2051 keys, exact logits/softmax/values/canaries",
-  "timing_qualification": "Uncontended native arithmetic checks pass; isolated kernel probe rates are not whole-model evidence. Same-allocation 8K ablations and independent five-trial confirmation use complete rank-max trials. Longer context qualification remains pending.",
+  "timing_qualification": "Sequential uncontended 12-node full-model campaigns, same-allocation controls, complete rank-max warmup/timed trials, independent five-trial confirmations and exact stress/short/synthetic32K ID streams. Targets remain unmet.",
   "whole_model_gates": {
     "executor_positions": 128,
     "index_kernel": 2,
@@ -42,7 +42,7 @@
       "rollback_rel_l2": 0,
       "comparison": "memcmp exact"
     },
-    "throughput": "pending"
+    "throughput": "PASS; see independent_confirmation/context_qualification for cache and experimental_followups.prefill_attention_panels for selector/panels"
   },
   "artifacts": {
     "iq-rows4-probe.log": "a199aac6d84b2ba7ce9fe8941226018d8bc0d6cdcc2c6cd6ec1dd6060b8ffb84",
@@ -96,12 +96,123 @@
     "repeated32k-old-best.ids": "f19c884513db7886a2166727b36094306df13bbab02418b8a343d457d488e6d9",
     "repeated32k-old-best.log": "53ae65a255e0f2dbc33baac45b3f564a5b9e6c4d37dd8da97768b581719c3ecb",
     "repeated32k.json": "475e174a924721a0da8cd23074f5c2c378eff0267b12eb8c516b00abba6aba8f",
-    "kernel-campaign.log": "c104f6a43966f042cd3a6c0e73bf3c514b0134ea985b64ffbd05da194c106ddc"
+    "kernel-campaign.log": "c104f6a43966f042cd3a6c0e73bf3c514b0134ea985b64ffbd05da194c106ddc",
+    "replicated/build.log": "e7b04a33dfe14fcface2db18934849aab573a847f95f40128a16335ee64da3ef",
+    "replicated/campaign.log": "7324c40d2ab17272b2b70f1bda2aef1e2e53872852eeadb62f9af8c6d8e2113a",
+    "replicated/pool-select-probe.log": "0e9a9eebe60d284eac3e33328c8369cfca6ae50f108737f4ad75e8d82c15b729",
+    "replicated/preflight-replicated-gates.69.0": "ef925696e0cc43e67f60714bc54fa9b8d9ce36677fc5ac9a2a905fb02f6f6abe",
+    "replicated/rep-control.ids": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da",
+    "replicated/rep-control.log": "ead1f3d798b76d857489417a3229d619d9cd3c81d81c5100fea4b196a4585eae",
+    "replicated/rep-heads.ids": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da",
+    "replicated/rep-heads.json": "43ba33f6baae79b6bcb45f11070219856d6ee3f2677091f1f213d4b16dd85e64",
+    "replicated/rep-heads.log": "26977cd11c1f354bf944e90962ea62a4edb0de652ff4d2fd16db053aaa92396b",
+    "replicated/rep-keys4.ids": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da",
+    "replicated/rep-keys4.json": "8d2e86478cba365660214fbb08222c8687d5ce5c46278ffdd88562710c5b2150",
+    "replicated/rep-keys4.log": "2168db8f9c26002186297d4bcec2b653cd5a50232a2a157ae940c2fa24018e91",
+    "replicated/replicated-m3-decode-8049-replicated-gates.73.0": "e6418e1bd46f086e29dc1a4ed328c23f23a7fdc8bddd2a77068536f7ebffd0d1",
+    "replicated/replicated-m3-prefill-2046-replicated-gates.71.0": "a20a0b462b9677ff2ab91fabea51ed84b711b789188bf49117036e0681265454",
+    "replicated/replicated-m3-prefill-2051-replicated-gates.72.0": "b6924f6868845a0313d3793bbf980456da854842792fa312fddf83411f099443",
+    "replicated/replicated-m4-decode-8049-replicated-gates.76.0": "3af0989c5fe8a04031f6c7d374eaeaf71256d20d701e2d21d4259ec5f0e11c72",
+    "replicated/replicated-m4-prefill-2046-replicated-gates.74.0": "b2c5ff56b0362dda61a769a4af2ddecfb4f8af57e5649245b47d282477f8d436",
+    "replicated/replicated-m4-prefill-2051-replicated-gates.75.0": "afe2f97b1d67e6dd585a880878dfbd2492292bf6116c528f03aaf32b1cec7c19",
+    "replicated/softmax-probe.log": "6961e4c9cdf2fe3ea5d5c0a368bcafc50ece0473d48b8415765da1c8954d3f38",
+    "panels/benchmark-kernel-confirm-control.112.0": "1b4c3d824f9ad62a322c91c4578090420077b6ec5e85fec610334aa001c861c8",
+    "panels/benchmark-kernel-confirm-panel47.115.0": "b9104be05b5fcde070f797da7591f760fa337bd44a7b7fbb5355f3fcb8acae3e",
+    "panels/build-32.log": "eecb1a7685151bd9c652ce27a8e448ab06c7b2fc4c1f4371d2011db471b5624c",
+    "panels/build-47.log": "22964f9b45d15d36f07062ee2b61df92dabf194f7d4a197283b5dd5d5693215a",
+    "panels/build-64.log": "7f0256ad8467f7e3e1546c3b88ac931d1205de660846d34732fbe78b91447241",
+    "panels/campaign.log": "71bdfc7ac8745a1cb72344a75f520010abeeee7aa8deb43d603ef114d98cae6d",
+    "panels/confirm-control.ids": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da",
+    "panels/confirm-control.log": "acf7b5c88525143a74328a221259638c2ab570e782f1f01bfcddf5ebb18c622b",
+    "panels/confirm-panel47.ids": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da",
+    "panels/confirm-panel47.log": "ee0d37663f8fa65b61489b500d6973cea3d49afcb9e69f9bb75f615581851b4e",
+    "panels/confirmation.json": "3899871ff960ada34a79d4c4ad983404810616e003580556313b6a18241f8c4f",
+    "panels/metadata/benchmark-metadata-kernel-cache-heads.txt": "c4c70b87844bad5fc60820f3d916c57dbe28c4e50ae1b2248831d7f29e4b93d3",
+    "panels/metadata/benchmark-metadata-kernel-cache-keys4.txt": "619c0a41b8165b418dbfc3d067dcd4a5e8da30d2cae43053c89ca8edd201c909",
+    "panels/metadata/benchmark-metadata-kernel-confirm-cache-heads.txt": "355cb2eaf85bfb41ba7a9dba29370581821117e909af8bfab3ff5982034d3e37",
+    "panels/metadata/benchmark-metadata-kernel-confirm-control.txt": "acd78a072180c1991fd88709f5292e4a5359c8e3efdac94375dbf76424c96a18",
+    "panels/metadata/benchmark-metadata-kernel-confirm-old-best.txt": "4400f0cc30b604c9472098273fb7abd5633bbb8d9c28e6e96f4a499374ff41a7",
+    "panels/metadata/benchmark-metadata-kernel-confirm-panel47.txt": "276ddb6fc3517b7ff3c7cadefeca8e749dbf57f29ddb8818e9221c3d7d766ef2",
+    "panels/metadata/benchmark-metadata-kernel-keys4-values.txt": "d0276ebdd35afcbd924df2f2f8f3646f1a83611549dd1edfad6bf4bb824b12bb",
+    "panels/metadata/benchmark-metadata-kernel-keys4.txt": "90a7e43811d5ba6c4f2c65bb3792bc20019a4e181233d0bcf8afa1be0d4374a6",
+    "panels/metadata/benchmark-metadata-kernel-new-control.txt": "8699206f9312a3ff5d446a371f86e8b4b7b765092fc4f01ce7b52a1f6473cd2e",
+    "panels/metadata/benchmark-metadata-kernel-old-best.txt": "1857cb0d3a67ca8e3096c55652f2395240095b515e9a130c7462b5b8e9fa13f8",
+    "panels/metadata/benchmark-metadata-kernel-panel-control.txt": "a3d49677014085ebfb83aa5eccb84b618b2261d8ed2fec3d63fd9c3d14aa56ec",
+    "panels/metadata/benchmark-metadata-kernel-panel32-heap.txt": "00231c1279f2431027e97b4c7cc95a4e270c6f0806cd5d906a8a55211e842cce",
+    "panels/metadata/benchmark-metadata-kernel-panel47.txt": "0dfae9d8dbbc41b6bd1b6bdd2f5fc74d7e88fb52ba1f22646a0854475cd8597a",
+    "panels/metadata/benchmark-metadata-kernel-panel64.txt": "cbce17eefd8c4bed0ea2db783ed18287c29ec8b25fddbb6ead2767f9dd9d56e0",
+    "panels/metadata/benchmark-metadata-kernel-rep-control.txt": "632ea23a99504f787d7bc42019d70874bddf41f707dcb41ac4f4323282035cf4",
+    "panels/metadata/benchmark-metadata-kernel-rep-heads.txt": "379ed38235fca81e9c40cc7387ef3c4fb3b849cd63d4795343fb472de93157a1",
+    "panels/metadata/benchmark-metadata-kernel-rep-keys4.txt": "925eaa8e30d16a30ad11ba87bedf9cba259efb699522772d0f1e7ba177b5a30b",
+    "panels/metadata/benchmark-metadata-kernel-repeated32k-cache-heads.txt": "de09f54b546c603d79c0526449a9fd387bb1b174a7ee611c3d40010a174ddbb4",
+    "panels/metadata/benchmark-metadata-kernel-repeated32k-control.txt": "e5538afdf7834266370ff9f586c1226e35a7b5d6b93e899b06d58ea2191da4b3",
+    "panels/metadata/benchmark-metadata-kernel-repeated32k-old-best.txt": "aa1de3004ec2b89ab918d54cd1db219053dc4e80b72687978dbf00479fa788fe",
+    "panels/metadata/benchmark-metadata-kernel-repeated32k-panel47.txt": "7fc90653cd66955ec44e9e98e2ca5a7b77b3126cd3f6db8a868593e079a1fca5",
+    "panels/metadata/benchmark-metadata-kernel-selector32.txt": "897ac21441608fc3ece32f5b031d3c8a4e592ce7893102b1005cca0f8dae36a8",
+    "panels/metadata/benchmark-metadata-kernel-short128-cache-heads.txt": "9be529f9b58434aa67e28ccb176ef3542bd1bc3c08e6debbe1bd75c8806be28a",
+    "panels/metadata/benchmark-metadata-kernel-short128-control.txt": "3f75f9fdb93c4f8ded6ac525f221cd1e897313e777942ba4ff122d5c0cacc461",
+    "panels/metadata/benchmark-metadata-kernel-short128-old-best.txt": "3ecdb49c508f8ce5e8dd98ed23e2979589f626e299f9daebc97101c2bbb934a3",
+    "panels/metadata/benchmark-metadata-kernel-short128-panel47.txt": "6ed243fe2952e9fefd63732ab9d68a437fb40bd0ac9b076e76d01c2095af77db",
+    "panels/metadata/benchmark-metadata-kernel-stress-cache-heads.txt": "30e3c991c0593a41bdd6e03ed99877aefe073375d79e14b97b10d9bd31b7c5c4",
+    "panels/metadata/benchmark-metadata-kernel-stress-control.txt": "f5d34d739c9441a0a77bfaf7cca63048305421708e0a01699d29124dca5c7f9c",
+    "panels/metadata/benchmark-metadata-kernel-stress-old-best.txt": "0661f69c4153cf1fbfead706616300b161f90b135a3a66dc2b829c2203b215a0",
+    "panels/metadata/benchmark-metadata-kernel-stress-panel47.txt": "668614cade694f4326a15c02789b28547589b30c6cb4e46d0f29603611329f62",
+    "panels/metadata/benchmark-metadata-kernel-values.txt": "62a6ad1b9c3eef8b1963860013b755a2d76f55b29ca9989d10e2a7b46e8effa7",
+    "panels/native-profile-summary.json": "aa1bd6dafb7262383ae828cbda610d00f12751a63d22e9efd2b11a2ded530abd",
+    "panels/native-source-audit.json": "148b24241b016a86d022980866948e21298868fd84becb0fa2ba6d48ea422a89",
+    "panels/panel-47-2046-panel-gates.91.0": "43b607699380cd1f7e4df90b36fb76c2e872d91b6e519bf0992369ae4bb20341",
+    "panels/panel-47-8049-panel-gates.92.0": "ff3aa63cd515800773d7cb70bfff8d9afdabd38808e0160e85f7ae4638049b84",
+    "panels/panel-64-2046-panel-gates.93.0": "27f60c827e036f2031ea112f5bdd5a0526bc616a9a6ff9afd8851b191fa5c858",
+    "panels/panel-64-8049-panel-gates.94.0": "6da3e7b803d074296010401f2158bb6d6d61fc3323377e00ae9df01fad530ab8",
+    "panels/panel-choice.json": "91f0f26d0cda7fe8a3654799dd4925098ea064884dc0f9f7154ef69016af31c1",
+    "panels/panel-control.ids": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da",
+    "panels/panel-control.log": "5ec3a5bbaa35683bd6fec6dd97e05abc36123ebeea84708683b94f11c719f15f",
+    "panels/panel32-heap.ids": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da",
+    "panels/panel32-heap.json": "4317f2cc2d032bf6d1dd2ea44a59b6bfa8d445034e47c099271dab4691c0abf1",
+    "panels/panel32-heap.log": "65bfcc2e9aa206d38a7c7d8ee0bbe62e29eb7027423b954462213221cd2e8d78",
+    "panels/panel47.ids": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da",
+    "panels/panel47.json": "ca1b1f74ebec70ebc239a6351d54090cef84b937776de3a107fd037898fa835a",
+    "panels/panel47.log": "f1e086ff87cf489b9fe8775c8d6ce0543347daeb59e55b04b9954019ea044046",
+    "panels/panel64.ids": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da",
+    "panels/panel64.json": "1dfda6ae6fa51d3d9f123d1057654fbe250b5150a5dae889a0bda771430e74b9",
+    "panels/panel64.log": "227b5e868e827d9deab6f69cf2238d14bebad8f8b9534b9a0c918fc201ccc3ca",
+    "panels/preflight-kernel-confirm-control.110.0": "ef925696e0cc43e67f60714bc54fa9b8d9ce36677fc5ac9a2a905fb02f6f6abe",
+    "panels/preflight-kernel-confirm-panel47.113.0": "ef925696e0cc43e67f60714bc54fa9b8d9ce36677fc5ac9a2a905fb02f6f6abe",
+    "panels/preflight-panel-gates.86.0": "ef925696e0cc43e67f60714bc54fa9b8d9ce36677fc5ac9a2a905fb02f6f6abe",
+    "panels/promotion-decision.json": "fea5960078de7073315a129803e905ed2d0e089cf0e301cdd5bc47a1a499660c",
+    "panels/repeated32k-control.ids": "f19c884513db7886a2166727b36094306df13bbab02418b8a343d457d488e6d9",
+    "panels/repeated32k-control.log": "9c5db9eef17c78f8fc95b6f3126f8b2369f0c5c2876da4ee7bd8643cc6b52b54",
+    "panels/repeated32k-panel47.ids": "f19c884513db7886a2166727b36094306df13bbab02418b8a343d457d488e6d9",
+    "panels/repeated32k-panel47.log": "2dc3a7d616b53ec790b90c57b0b48d378e78c3d00d5405e77d178d18599bc89d",
+    "panels/repeated32k.json": "1b79e1ed3c9a7d5b15339d251861483477acaf30634530606abfb7671f6c2f69",
+    "panels/selector-decode-8049-panel-gates.90.0": "4bbb2c262eb89e159ec64d1a1122bb3ce098230825d58606b6ea04e26e9e2d77",
+    "panels/selector-final-units.log": "cfda9f9be823f8d73402874851fb603462de85e347d1a244a6c6d3ba0d9ec109",
+    "panels/selector-prefill-2046-panel-gates.88.0": "6b3eddb859f9366d7eefe84c51368d9b9c33f6999cd9d0e676a556b2438045fe",
+    "panels/selector-prefill-2051-panel-gates.89.0": "258a2ecda4a47a4bf304dd066940e0d83d14360f6a9328f0e94704cb6550d59b",
+    "panels/selector32.ids": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da",
+    "panels/selector32.json": "a5bd7d5e4cd84fb8c2769dc83de4811b2e02f4fc07d15625a5628921913554dd",
+    "panels/selector32.log": "b611284f2608629a72e9fbfc054658f00a3d942edc1e426c793821e204bd171c",
+    "panels/short128-control.ids": "755a1eb001981a241a5da51d6aff58d0d5ab751f860f0c202805d2b0a624a309",
+    "panels/short128-control.log": "79401353a851a8a862601b0265fee1524a386f4d97f6df7bbd8e6a3954a9881e",
+    "panels/short128-panel47.ids": "755a1eb001981a241a5da51d6aff58d0d5ab751f860f0c202805d2b0a624a309",
+    "panels/short128-panel47.log": "560ebba5357c67d919a81a1a02e29384cca1a67076e1e8ea8c86efd6efb54a78",
+    "panels/short128.json": "9b2287c2d7149a8e0ac8962dcd6dee390fadb5de6ec797dbaf8a73eb2e0d9013",
+    "panels/stress-control.ids": "6b179961fe8f21a03cec1d2ff9e6688a2e3e90e980bb8da2d06570576a7240b0",
+    "panels/stress-control.log": "dbe0a8f66e3f013dbe93580c458cdc5db881a1e3c8cebaf495d07ed003a2ef43",
+    "panels/stress-panel47.ids": "6b179961fe8f21a03cec1d2ff9e6688a2e3e90e980bb8da2d06570576a7240b0",
+    "panels/stress-panel47.log": "824b3ff763c2e52009f373bafce9ccc2bd097962c566bc0571554f412d008d66",
+    "panels/stress.json": "49cb5d7af5cf5e277cb09e85144471bc87a36bfd5c594e88a197ecb25b4ce651",
+    "panels/waiter-8380.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
   },
   "source_archives": {
     "glm53f-cache-v3-update.tar.gz": "dd5397015c0a1ce40196b01cd526314c755aedefa955ae35443f3f9b541a1de0",
     "glm53f-executor-cache-update.tar.gz": "274e59a7a4b9f1dd74accfecb4a63ee38cd7a85eb4057d2ce5d085c92b319992",
-    "glm53f-cache-unit-aligned.tar.gz": "e5e9b5eeca0a291c6ae1f36bc6c19df84b4a11f90565563c6eda7857c4f33812"
+    "glm53f-cache-unit-aligned.tar.gz": "e5e9b5eeca0a291c6ae1f36bc6c19df84b4a11f90565563c6eda7857c4f33812",
+    "glm53f-keys4-snapshot.tar.gz": "6175ff1be4ec7f95b6e2a528532dbf3eb7e4daf11fb0047f90eaaee75e7b376b",
+    "glm53f-values-update.tar.gz": "fd08b0d06c5b383f27cb2ea04299dc2cc6da8b9d2c2b6f67d9285e329f3e0a65",
+    "glm53f-replicated-index-update.tar.gz": "d55b74ce4f1d91f293d009f153b484f1a8942525a659769804ad3e6a99891c57",
+    "glm53f-prefill-panels-update.tar.gz": "f62cb726c17233e957801a5295edbbd0b681f42e9b29eafd603bf246ac4cc713",
+    "glm53f-selector-update.tar.gz": "5623a555c39391af84ab5896399f406430a87f53ae8319e69ed1a1a7df7288bf"
   },
   "rejected_runtime_experiments": [
     "Wider mHC tiles: native probes slower; implementation removed",
@@ -115,6 +226,10 @@
     {
       "name": "compile-time latent-cache dtype specialization",
       "reason": "byte-exact but controlled same-process timing was 0.877x; prototype retained only under tmp/"
+    },
+    {
+      "name": "Parallel MLA softmax prototype",
+      "reason": "Native fast-math bit-exact checks failed30 cases despite isolated speedup; not integrated"
     }
   ],
   "value_microbenchmark_alignment_bytes": 256,
@@ -176,19 +291,654 @@
   },
   "experimental_followups": {
     "replicated_decode_index": {
-      "queued_pid": 6995,
-      "native_build_and_gates": "pending",
-      "archive_sha256": "d55b74ce4f1d91f293d009f153b484f1a8942525a659769804ad3e6a99891c57"
+      "status": "EXACT_BUT_REJECTED_NO_THROUGHPUT_GAIN",
+      "source_commit": "c461079c",
+      "immutable_build": "candidate-replicated-v1",
+      "native_build_and_gates": "PASS; modes3/4, warm2046/2051 prefill32, warm8049 decode4, strict output/rollback memcmp on all12 ranks",
+      "ablation_reports": {
+        "rep-heads": {
+          "baseline": {
+            "prompt_tokens": 8049,
+            "decode_transitions": 256,
+            "trials": 3,
+            "prefill": {
+              "median_tok_s": 343.866263,
+              "min_tok_s": 342.65532,
+              "max_tok_s": 343.8692
+            },
+            "decode": {
+              "median_tok_s": 33.818332,
+              "min_tok_s": 33.794502,
+              "max_tok_s": 33.824349
+            }
+          },
+          "candidate": {
+            "prompt_tokens": 8049,
+            "decode_transitions": 256,
+            "trials": 3,
+            "prefill": {
+              "median_tok_s": 345.227987,
+              "min_tok_s": 343.883604,
+              "max_tok_s": 345.236147
+            },
+            "decode": {
+              "median_tok_s": 33.705932,
+              "min_tok_s": 33.692963,
+              "max_tok_s": 33.707885
+            }
+          },
+          "speedup": {
+            "prefill": 1.0039600395459556,
+            "decode": 0.9966763588458473
+          },
+          "tokens_equal": true,
+          "token_sha256": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da",
+          "promotion_candidate": false,
+          "target_met": false
+        },
+        "rep-keys4": {
+          "baseline": {
+            "prompt_tokens": 8049,
+            "decode_transitions": 256,
+            "trials": 3,
+            "prefill": {
+              "median_tok_s": 343.866263,
+              "min_tok_s": 342.65532,
+              "max_tok_s": 343.8692
+            },
+            "decode": {
+              "median_tok_s": 33.818332,
+              "min_tok_s": 33.794502,
+              "max_tok_s": 33.824349
+            }
+          },
+          "candidate": {
+            "prompt_tokens": 8049,
+            "decode_transitions": 256,
+            "trials": 3,
+            "prefill": {
+              "median_tok_s": 344.804537,
+              "min_tok_s": 343.488396,
+              "max_tok_s": 344.824032
+            },
+            "decode": {
+              "median_tok_s": 33.718956,
+              "min_tok_s": 33.613694,
+              "max_tok_s": 33.742793
+            }
+          },
+          "speedup": {
+            "prefill": 1.0027286014970302,
+            "decode": 0.9970614754151683
+          },
+          "tokens_equal": true,
+          "token_sha256": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da",
+          "promotion_candidate": false,
+          "target_met": false
+        }
+      },
+      "promoted": false
     },
     "prefill_attention_panels": {
-      "queued_pid": 8380,
-      "default": 32,
-      "timed_candidates": [
+      "status": "FULL_MODEL_QUALIFICATION_PASS",
+      "source_commit": "c461079c",
+      "default_panel": 32,
+      "default_selector": "heap",
+      "timed_panels": [
+        32,
         47,
         64
       ],
-      "native_build_and_gates": "pending",
-      "archive_sha256": "f62cb726c17233e957801a5295edbbd0b681f42e9b29eafd603bf246ac4cc713"
+      "builds": [
+        "candidate-panel32-v1",
+        "candidate-panel47-v1",
+        "candidate-panel64-v1"
+      ],
+      "native_source_audit": {
+        "status": "FROZEN_NATIVE_SOURCE_MATCH_PASS",
+        "native_source_directory": "/local/glm53f-panel47-build-52075759/src",
+        "source_archives": {
+          "glm53f-keys4-snapshot.tar.gz": "6175ff1be4ec7f95b6e2a528532dbf3eb7e4daf11fb0047f90eaaee75e7b376b",
+          "glm53f-values-update.tar.gz": "fd08b0d06c5b383f27cb2ea04299dc2cc6da8b9d2c2b6f67d9285e329f3e0a65",
+          "glm53f-cache-v3-update.tar.gz": "dd5397015c0a1ce40196b01cd526314c755aedefa955ae35443f3f9b541a1de0",
+          "glm53f-replicated-index-update.tar.gz": "d55b74ce4f1d91f293d009f153b484f1a8942525a659769804ad3e6a99891c57",
+          "glm53f-prefill-panels-update.tar.gz": "f62cb726c17233e957801a5295edbbd0b681f42e9b29eafd603bf246ac4cc713",
+          "glm53f-selector-update.tar.gz": "5623a555c39391af84ab5896399f406430a87f53ae8319e69ed1a1a7df7288bf"
+        },
+        "source_files": {
+          "a64fx/glm5/glm53f_sparse_layer_12n.c": "5df64c85e7964d59c9983350d8e514b77a046fbb2198b7f51fd4590a834335b6",
+          "a64fx/glm5/glm53f_sparse_batch_check.c": "aceab2fc027d0f44f34476341f402202930e9911ec0482cf48c1162551d4bb36",
+          "a64fx/glm5/glm53f_executor_check_12n.c": "3e5ffd1b5e3349dd466094edf84740cf30e4df103a383a391c47b767d8c2755f",
+          "a64fx/glm5/glm53f_runtime.h": "41ae4e6382c861c0d0db41c92634698fc5fa0d567c01a38466bafe7586fc481a",
+          "a64fx/glm5/test_glm53f_prefill_config.c": "1ef9f70827fb3a7d28642df26d51bdc253861b7062f64d90a88c95d478f3d164",
+          "a64fx/glm5/glm53f_prefill.h": "48ecf4424bef9026590c726d99b4d4aace84aa95728132988266f4925f60619d",
+          "a64fx/glm5/glm53f_sparse_12n.h": "b2ea7984021e6ccdec8209b4143685da80a17fbbbb85ca84c41b6e6d44523bb7",
+          "a64fx/glm5/bench_glm53f_run_12n.c": "1c37d632afca6d2262266b9e956e1455340754989db35c2827b73d123fc1d942",
+          "a64fx/glm5/build_glm53f_integrated_12n.sh": "ca704dac437ab8c986faaa9c9836fb7f4c714a07222c92d4f31b3f76c2ed9e09",
+          "a64fx/glm5/glm53f_pool_select.h": "9bcc0b09a6e7465a0ff694f49cff9e3a940c069c27a13d1297d34f857c59a3a8",
+          "a64fx/glm5/test_glm53f_pool_select.c": "a9a50ada38163e9bb31143f8207b8a613e59fb6058ab4c3bdd09d9677dd6c65c"
+        },
+        "benchmark_sha256": "919c00a2292ab1c2ffa70784f72a68e15b4e72eb90a10d9df30917e12e4d8032"
+      },
+      "native_build_and_gates": "PASS; pool120 cases, MLA60 cases per build; selector strict prefill32 at warm2046/2051 and decode4 at warm8049; panels32-vs47/64 strict91-position prefill/output/rollback at warm2046/8049, all12 ranks",
+      "selector_native_math_builds": [
+        "fast",
+        "conservative"
+      ],
+      "selector_sanitizers": "Local AddressSanitizer/UBSan PASS120; LeakSanitizer disabled because ptrace sandbox unsupported",
+      "selector_scope": "513..4096 pools; bounded median-of-three ID partition, exact original score/ID ordering, original heap fallback for NaNs/depth limit/long contexts; scratch reuses dead score reduction input, no added memory",
+      "ablation_reports": {
+        "panel32-heap": {
+          "baseline": {
+            "prompt_tokens": 8049,
+            "decode_transitions": 256,
+            "trials": 3,
+            "prefill": {
+              "median_tok_s": 343.795448,
+              "min_tok_s": 343.753743,
+              "max_tok_s": 343.859949
+            },
+            "decode": {
+              "median_tok_s": 33.81102,
+              "min_tok_s": 33.805844,
+              "max_tok_s": 33.818205
+            }
+          },
+          "candidate": {
+            "prompt_tokens": 8049,
+            "decode_transitions": 256,
+            "trials": 3,
+            "prefill": {
+              "median_tok_s": 344.150223,
+              "min_tok_s": 344.13733,
+              "max_tok_s": 344.165934
+            },
+            "decode": {
+              "median_tok_s": 33.68234,
+              "min_tok_s": 33.6822,
+              "max_tok_s": 33.683036
+            }
+          },
+          "speedup": {
+            "prefill": 1.0010319362925362,
+            "decode": 0.9961941402536807
+          },
+          "tokens_equal": true,
+          "token_sha256": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da",
+          "promotion_candidate": false,
+          "target_met": false
+        },
+        "selector32": {
+          "baseline": {
+            "prompt_tokens": 8049,
+            "decode_transitions": 256,
+            "trials": 3,
+            "prefill": {
+              "median_tok_s": 343.795448,
+              "min_tok_s": 343.753743,
+              "max_tok_s": 343.859949
+            },
+            "decode": {
+              "median_tok_s": 33.81102,
+              "min_tok_s": 33.805844,
+              "max_tok_s": 33.818205
+            }
+          },
+          "candidate": {
+            "prompt_tokens": 8049,
+            "decode_transitions": 256,
+            "trials": 3,
+            "prefill": {
+              "median_tok_s": 348.611841,
+              "min_tok_s": 348.593018,
+              "max_tok_s": 348.649035
+            },
+            "decode": {
+              "median_tok_s": 35.290809,
+              "min_tok_s": 35.290716,
+              "max_tok_s": 35.295515
+            }
+          },
+          "speedup": {
+            "prefill": 1.0140094728653883,
+            "decode": 1.043766470221839
+          },
+          "tokens_equal": true,
+          "token_sha256": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da",
+          "promotion_candidate": false,
+          "target_met": false
+        },
+        "panel47": {
+          "baseline": {
+            "prompt_tokens": 8049,
+            "decode_transitions": 256,
+            "trials": 3,
+            "prefill": {
+              "median_tok_s": 343.795448,
+              "min_tok_s": 343.753743,
+              "max_tok_s": 343.859949
+            },
+            "decode": {
+              "median_tok_s": 33.81102,
+              "min_tok_s": 33.805844,
+              "max_tok_s": 33.818205
+            }
+          },
+          "candidate": {
+            "prompt_tokens": 8049,
+            "decode_transitions": 256,
+            "trials": 3,
+            "prefill": {
+              "median_tok_s": 373.634965,
+              "min_tok_s": 373.394196,
+              "max_tok_s": 373.67676
+            },
+            "decode": {
+              "median_tok_s": 35.788601,
+              "min_tok_s": 35.788017,
+              "max_tok_s": 35.793208
+            }
+          },
+          "speedup": {
+            "prefill": 1.0867943923446013,
+            "decode": 1.0584892440393694
+          },
+          "tokens_equal": true,
+          "token_sha256": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da",
+          "promotion_candidate": true,
+          "target_met": false
+        },
+        "panel64": {
+          "baseline": {
+            "prompt_tokens": 8049,
+            "decode_transitions": 256,
+            "trials": 3,
+            "prefill": {
+              "median_tok_s": 343.795448,
+              "min_tok_s": 343.753743,
+              "max_tok_s": 343.859949
+            },
+            "decode": {
+              "median_tok_s": 33.81102,
+              "min_tok_s": 33.805844,
+              "max_tok_s": 33.818205
+            }
+          },
+          "candidate": {
+            "prompt_tokens": 8049,
+            "decode_transitions": 256,
+            "trials": 3,
+            "prefill": {
+              "median_tok_s": 364.938468,
+              "min_tok_s": 364.932709,
+              "max_tok_s": 364.947895
+            },
+            "decode": {
+              "median_tok_s": 35.466854,
+              "min_tok_s": 35.444178,
+              "max_tok_s": 35.479869
+            }
+          },
+          "speedup": {
+            "prefill": 1.0614988363662103,
+            "decode": 1.0489732045942417
+          },
+          "tokens_equal": true,
+          "token_sha256": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da",
+          "promotion_candidate": true,
+          "target_met": false
+        }
+      },
+      "diagnostic_profile": {
+        "scope": "Diagnostic rank-zero component timers, medians of five timed confirmation trials after the untimed warmup; these are not rank-max throughput measurements. Parent/child timers overlap and must not be summed.",
+        "runs": {
+          "control": {
+            "prefill": {
+              "target": {
+                "ms_pos": 2.905,
+                "embed": 0.052,
+                "mhc": 0.238,
+                "attention": 1.456,
+                "ffn": 1.158,
+                "head": 0.0
+              },
+              "target_detail": {
+                "kda": 0.49,
+                "sparse": 0.966,
+                "dense_ffn": 0.138,
+                "moe": 1.02
+              },
+              "sparse": {
+                "front": 0.206,
+                "index": 0.152,
+                "pack": 0.0,
+                "mla": 0.474,
+                "output": 0.057,
+                "allreduce": 0.169,
+                "cp_unsplit": 0.0
+              },
+              "moe": {
+                "router": 0.142,
+                "local": 0.581,
+                "allreduce": 0.341,
+                "nsh_in_local": 0.0
+              }
+            },
+            "decode": {
+              "target": {
+                "ms_pos": 29.611,
+                "embed": 0.094,
+                "mhc": 5.699,
+                "attention": 15.159,
+                "ffn": 8.257,
+                "head": 0.402
+              },
+              "target_detail": {
+                "kda": 6.654,
+                "sparse": 8.506,
+                "dense_ffn": 0.363,
+                "moe": 7.893
+              },
+              "sparse": {
+                "front": 1.65,
+                "index": 3.459,
+                "pack": 0.0,
+                "mla": 2.648,
+                "output": 0.313,
+                "allreduce": 0.822,
+                "cp_unsplit": 0.0
+              },
+              "moe": {
+                "router": 0.77,
+                "local": 4.64,
+                "allreduce": 2.399,
+                "nsh_in_local": 3.985
+              }
+            }
+          },
+          "panel47": {
+            "prefill": {
+              "target": {
+                "ms_pos": 2.703,
+                "embed": 0.052,
+                "mhc": 0.237,
+                "attention": 1.249,
+                "ffn": 1.165,
+                "head": 0.0
+              },
+              "target_detail": {
+                "kda": 0.489,
+                "sparse": 0.76,
+                "dense_ffn": 0.14,
+                "moe": 1.025
+              },
+              "sparse": {
+                "front": 0.178,
+                "index": 0.107,
+                "pack": 0.0,
+                "mla": 0.347,
+                "output": 0.049,
+                "allreduce": 0.153,
+                "cp_unsplit": 0.0
+              },
+              "moe": {
+                "router": 0.142,
+                "local": 0.586,
+                "allreduce": 0.354,
+                "nsh_in_local": 0.0
+              }
+            },
+            "decode": {
+              "target": {
+                "ms_pos": 27.623,
+                "embed": 0.101,
+                "mhc": 5.764,
+                "attention": 13.434,
+                "ffn": 7.924,
+                "head": 0.402
+              },
+              "target_detail": {
+                "kda": 6.405,
+                "sparse": 7.026,
+                "dense_ffn": 0.342,
+                "moe": 7.582
+              },
+              "sparse": {
+                "front": 1.66,
+                "index": 2.108,
+                "pack": 0.0,
+                "mla": 2.503,
+                "output": 0.318,
+                "allreduce": 0.951,
+                "cp_unsplit": 0.0
+              },
+              "moe": {
+                "router": 0.758,
+                "local": 4.656,
+                "allreduce": 2.114,
+                "nsh_in_local": 3.963
+              }
+            }
+          }
+        }
+      },
+      "choice": {
+        "variant": [
+          "panel47",
+          "candidate-panel47-v1",
+          "heads",
+          "fp16-cache"
+        ]
+      },
+      "promotion_decision": {
+        "variant": [
+          "panel47",
+          "candidate-panel47-v1",
+          "heads",
+          "fp16-cache"
+        ],
+        "decode_ratio": 1.0576761226550415,
+        "prefill_ratio": 1.0744453279095745,
+        "promote": true
+      },
+      "independent_confirmation": {
+        "baseline": {
+          "prompt_tokens": 8049,
+          "decode_transitions": 256,
+          "trials": 5,
+          "prefill": {
+            "median_tok_s": 345.065496,
+            "min_tok_s": 344.263668,
+            "max_tok_s": 345.279318
+          },
+          "decode": {
+            "median_tok_s": 33.793083,
+            "min_tok_s": 33.720467,
+            "max_tok_s": 33.809765
+          }
+        },
+        "candidate": {
+          "prompt_tokens": 8049,
+          "decode_transitions": 256,
+          "trials": 5,
+          "prefill": {
+            "median_tok_s": 370.75401,
+            "min_tok_s": 369.893002,
+            "max_tok_s": 371.01116
+          },
+          "decode": {
+            "median_tok_s": 35.742137,
+            "min_tok_s": 35.285674,
+            "max_tok_s": 35.762195
+          }
+        },
+        "speedup": {
+          "prefill": 1.0744453279095745,
+          "decode": 1.0576761226550415
+        },
+        "tokens_equal": true,
+        "token_sha256": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da",
+        "promotion_candidate": true,
+        "target_met": false
+      },
+      "context_qualification": {
+        "stress": {
+          "baseline": {
+            "prompt_tokens": 8049,
+            "decode_transitions": 1024,
+            "trials": 3,
+            "prefill": {
+              "median_tok_s": 344.113402,
+              "min_tok_s": 342.91227,
+              "max_tok_s": 344.204756
+            },
+            "decode": {
+              "median_tok_s": 34.0403,
+              "min_tok_s": 33.863302,
+              "max_tok_s": 34.083052
+            }
+          },
+          "candidate": {
+            "prompt_tokens": 8049,
+            "decode_transitions": 1024,
+            "trials": 3,
+            "prefill": {
+              "median_tok_s": 371.903716,
+              "min_tok_s": 371.754637,
+              "max_tok_s": 372.180345
+            },
+            "decode": {
+              "median_tok_s": 35.746584,
+              "min_tok_s": 35.638673,
+              "max_tok_s": 35.809086
+            }
+          },
+          "speedup": {
+            "prefill": 1.080759173686586,
+            "decode": 1.050125410175586
+          },
+          "tokens_equal": true,
+          "token_sha256": "6b179961fe8f21a03cec1d2ff9e6688a2e3e90e980bb8da2d06570576a7240b0",
+          "promotion_candidate": true,
+          "target_met": false
+        },
+        "short128": {
+          "baseline": {
+            "prompt_tokens": 128,
+            "decode_transitions": 256,
+            "trials": 3,
+            "prefill": {
+              "median_tok_s": 282.005617,
+              "min_tok_s": 281.921443,
+              "max_tok_s": 282.408384
+            },
+            "decode": {
+              "median_tok_s": 40.436245,
+              "min_tok_s": 40.343473,
+              "max_tok_s": 40.483635
+            }
+          },
+          "candidate": {
+            "prompt_tokens": 128,
+            "decode_transitions": 256,
+            "trials": 3,
+            "prefill": {
+              "median_tok_s": 285.918131,
+              "min_tok_s": 285.910416,
+              "max_tok_s": 286.172792
+            },
+            "decode": {
+              "median_tok_s": 40.660046,
+              "min_tok_s": 40.363217,
+              "max_tok_s": 40.690443
+            }
+          },
+          "speedup": {
+            "prefill": 1.0138738867743902,
+            "decode": 1.0055346632705386
+          },
+          "tokens_equal": true,
+          "token_sha256": "755a1eb001981a241a5da51d6aff58d0d5ab751f860f0c202805d2b0a624a309",
+          "promotion_candidate": false,
+          "target_met": false
+        },
+        "repeated32k": {
+          "baseline": {
+            "prompt_tokens": 32196,
+            "decode_transitions": 256,
+            "trials": 3,
+            "prefill": {
+              "median_tok_s": 316.484767,
+              "min_tok_s": 316.43136,
+              "max_tok_s": 316.785347
+            },
+            "decode": {
+              "median_tok_s": 32.275942,
+              "min_tok_s": 32.264092,
+              "max_tok_s": 32.285404
+            }
+          },
+          "candidate": {
+            "prompt_tokens": 32196,
+            "decode_transitions": 256,
+            "trials": 3,
+            "prefill": {
+              "median_tok_s": 341.961472,
+              "min_tok_s": 341.728627,
+              "max_tok_s": 342.119059
+            },
+            "decode": {
+              "median_tok_s": 32.185018,
+              "min_tok_s": 31.813553,
+              "max_tok_s": 32.202894
+            }
+          },
+          "speedup": {
+            "prefill": 1.0804989928630595,
+            "decode": 0.9971829172329036
+          },
+          "tokens_equal": true,
+          "token_sha256": "f19c884513db7886a2166727b36094306df13bbab02418b8a343d457d488e6d9",
+          "promotion_candidate": true,
+          "target_met": false
+        }
+      },
+      "qualified_options": [
+        "--decode-executor persistent",
+        "--router-kernel fused",
+        "--verify-kernel grouped",
+        "--moe-combine-kernel vector",
+        "--index-kernel heads",
+        "--mla-kernel fp16-cache",
+        "--pool-selector partition4k"
+      ],
+      "qualified_build_panel": 47,
+      "qualified_binary_sha256": "919c00a2292ab1c2ffa70784f72a68e15b4e72eb90a10d9df30917e12e4d8032",
+      "qualified_hardware_settings": {
+        "threads": 47,
+        "pages": "none",
+        "native_q8_panel": 0,
+        "sparse_async": 0,
+        "kda_async": 1,
+        "collective_owner": 0,
+        "FLIB_BARRIER": "HARD (runtime overrides OMP_PROC_BIND to FALSE, same for control/candidate)"
+      },
+      "target_met": false,
+      "minimum_available_kb_per_run": {
+        "stress-panel47": 11397376,
+        "panel32-heap": 11457216,
+        "stress-control": 11422912,
+        "selector32": 11462400,
+        "panel-control": 11466048,
+        "panel47": 11428096,
+        "repeated32k-panel47": 10308992,
+        "short128-control": 11906048,
+        "panel64": 11410112,
+        "repeated32k-control": 10335488,
+        "short128-panel47": 11888064,
+        "confirm-panel47": 11449344,
+        "confirm-control": 11457024
+      }
     }
   },
   "independent_confirmation": {
@@ -371,5 +1121,6 @@
     ],
     "complete_output_ids_equal": true,
     "target_met": false
-  }
+  },
+  "latest_qualified_candidate": "candidate-panel47-v1"
 }
