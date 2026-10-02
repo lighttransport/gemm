@@ -1,6 +1,6 @@
 # Resume: GLM53F Strata-inspired optimization, 12 A64FX nodes
 
-Updated 2026-10-02 13:31 JST. Native Q8 and larger-prefill-capacity builds passed; bounded staging and serial qualification queues are active in PJM 52085859.
+Updated 2026-10-02 14:35 JST. Staging and the Q8 full-state gate passed; 8K timing and serial capacity/lookup/normalized-MTP queues are active in PJM 52085859.
 
 Previous campaign: TP12 implementation, native validation and
 short/8K/synthetic 32K qualification complete. All new paths remain opt-in.
@@ -18,7 +18,7 @@ See `a64fx/glm5/GLM53F_STRATA.md` for implementation, gates and commands.
   `l31-4004b`; repository-local tmux socket `tmp/tmux-glm53f`, session
   `glm53f-strata-next3`. Bridge ports remain 42446→32446→21264.
   Live bridge session `tmp/bash-http-glm53f-strata/session`.
-- Detached native probe/stage **PID 200**, remote
+- Completed native probe/stage **PID 200**, remote
   `tmp/strata-q8-20261002/driver-v1.log`, `probe-v1.log`, `stage.log`.
   Frozen source `source-v1.tar.gz`, native scratch
   `/local/glm53f-q8-tiles-52085859`. Arithmetic sweeps use fast/conservative
@@ -54,16 +54,21 @@ See `a64fx/glm5/GLM53F_STRATA.md` for implementation, gates and commands.
   rows4 separate **19.893 µs** vs fused **6.001 µs**, rows8 separate
   **18.290 µs** vs fused **5.875 µs**. All are staging-time diagnostics.
   Evidence `tmp/strata-q8-20261002/native-progress.json`.
-- Post-stage campaign **PID 3129**, `tmp/strata-q8-20261002/campaign.log`,
-  waits on live stage PID 200 and build PID 2812, checks both completion
-  sentinels, then runs five uncontended projection/tile probe repeats;
+- Post-stage campaign original PID3129 stopped after four successful sparse
+  gates because a nested launcher reused a preflight log prefix. The original
+  `campaign.log` and rank logs are preserved. Staging/build sentinels and five
+  uncontended projection/tile repeats passed; sparse gates passed:
   actual sparse prefill47 at warm2046 and decode/rollback4 at warm8049;
   128-position hidden/full-state executor gate; 8K frozen/rebuilt controls
   and row/tile/fused ablations; independent five-trial confirmation; 1024
   transitions; short128 and repeated32K exact-output qualification.
   Scripts `campaign.{sh,py}`. All MPI steps run serially after staging.
-  No new end-to-end result or promotion yet. Check live PIDs and logs before
-  resuming; do not duplicate or overlap this campaign.
+  No new end-to-end result or promotion yet. Launcher log isolation is fixed
+  and committed **1294562c** (18 local tests PASS). Resumed **PID9278**,
+  `campaign-resume-v2.{sh,log}`, retains the passed sparse gates and runs the
+  remaining work. The 128-position gate passes zero hidden bit mismatches and
+  complete byte-exact KDA/sparse state. Full 8K timing has begun. Check live
+  PIDs/logs before resuming; do not duplicate or overlap this campaign.
 - Q8 kernel implementation committed **3529192d**, 15 files, native arithmetic
   and integrated build passed; full-model qualification still pending.
 - Larger prefill outer chunks are a second opt-in experiment: native
@@ -78,8 +83,9 @@ See `a64fx/glm5/GLM53F_STRATA.md` for implementation, gates and commands.
   build sources. Logs `build-capacity-{v1,checker-v2}.log`. Scratch
   `/local/glm53f-capacity-v1-52085859`, checker source
   `/local/glm53f-capacity-checker-v2-52085859`.
-- Capacity campaign **PID 5910**, `capacity-campaign.log`, waits until Q8
-  PID 3129 completes successfully. It then compares 512 vs 512/1024/2048/4096
+- Capacity campaign **PID9417**, `capacity-campaign-v2.log`, waits until Q8
+  PID9278 completes successfully. Original PID5910 stopped on the missing
+  parent success sentinel without launching its MPI checks. It then compares 512 vs 512/1024/2048/4096
   final hidden streams and complete KDA/sparse state on all ranks using one
   restored model and bounded endpoint trace I/O. Failed chunk gates remain
   rejected; no relaxed comparison. Complete 8K IDs, rebuilt-512 control,
@@ -87,6 +93,59 @@ See `a64fx/glm5/GLM53F_STRATA.md` for implementation, gates and commands.
   repeated32K follow serially. Evidence `capacity-native-progress.json`,
   outputs `capacity-results/`, scripts `capacity-{campaign,gate}.*`.
   Neither endpoint gates nor new throughput results have run yet.
+- Bounded prefill capacity/checker implementation committed **5abb7cf2**,
+  8 files. Native builds and local 16-test launcher suite pass. No promotion.
+- Fresh lookup sweep **PID9420**, `lookup-campaign-v2.log`, waits on capacity
+  PID9417 and its success sentinel. Original PID6185 stopped safely before MPI. New ASM4 verification changes the prior
+  cost rationale, so test depths 1–4 adaptive and depth4 always against a
+  fresh plain control, then independent five-trial confirmation/stress1024
+  only for a positive candidate. Use the promoted capacity if one qualifies;
+  otherwise 512. Exact IDs and delivered-transition accounting remain required.
+  Scripts `lookup-campaign.{sh,py}`, outputs `lookup-results/`.
+- Stage completed around14:22: routed layer44, 15,456,534,528 bytes per rank,
+  native compact/embedding/head images and all rank sentinels PASS. Driver has
+  `Q8_NEXT_STAGE_PASS`; stage log has `glm53f_stage_12n=OK`. MemAvailable in the
+  following target-state gate is about10.5 GiB after resident weight loading.
+  No additional MPI job overlapped stage. Native MTP build PID7986 held only
+  the owned waiting timing queue and released it automatically on completion.
+  Remote `rg` is absent; use Python/grep for remote searches.
+- New opt-in normalized MTP backend implemented in the resident benchmark:
+  `--speculation mtp --mtp-routed-stage PATH --mtp-shared-stage PATH` plus
+  draft depth/policy. Uses real batched prefill hiddens and cache-only teacher
+  forcing, verifies the known input and drafts together, retains actual target
+  parent hiddens and replays accepted inputs. Bonus input remains unconsumed.
+  Includes all priming in prefill timing and all speculative work in decode.
+- Local Strata `glm_decode.cpp` and upstream GLM5-Next export post-head-norm
+  parent hiddens. New backend applies the target output norm to prompt means,
+  copies actual normalized target head hiddens after verification, and chains
+  actual MTP shared-head normalized hiddens. Historical scalar MTP runner's
+  raw-hidden API remains unchanged. Its earlier stream/timing cannot qualify
+  this saved batched 8K stream.
+- MTP native builds PASS: immutable `candidate-mtp-v3`, with a diagnostic-only
+  checker update in `candidate-mtp-v4`. Scratch `/local/glm53f-mtp-v3-52085859`;
+  full frozen `source-v3.tar.gz` SHA337e92cc60624c75078f78f3d4feea6693c2fa846215f408565b84cdda21e618,
+  plus `checker-update-v4.tar.gz` SHA d054d56b10dcfb3391e50029ffa2204854c24787567514bc55c57f653e36683c.
+  Native benchmark SHA c6c1a6381ccb30adbdf186c67d09f9f44b45c2aa79afee73dc560b2b7efd9040;
+  checker SHA d26e60cfad836dfd47356fbe8cc8d56b2f78844a176339ca0966d249cbf649df.
+  Build logs `tmp/strata-mtp-20261002/build-{v1,state-v2,v3,checker-v4}.log`
+  retrieved locally. Full native MPI/controller and model qualification pending.
+- MTP unit gates: 896 context-sensitive acceptance/rejection/fallback cases
+  PASS locally and native mock; ASan/UBSan PASS (LSan disabled because tracing
+  prevents leak checking). Eight native head-norm/export configurations PASS,
+  fast/conservative ×1/12/47/48 threads, 18 cases each through4096 positions.
+  Source hashes of all12 changed code/build files match the frozen native source.
+  Evidence `a64fx/glm5/strata-mtp-native-20261002.json`.
+- MTP serial campaign **PID9424**, `tmp/strata-mtp-20261002/campaign-v2.log`,
+  waits on lookup PID9420 and checker success. Original PID9236 stopped safely
+  on the missing lookup sentinel; no MTP weights have staged yet. Then stage
+  checkpoint layer45 only via immutable candidate-v15; 12-rank controller/cache
+  replay gates; all8049 prompt hiddens and complete endpoint state; short/8K
+  decode endpoint state; fresh/rebuilt controls; depth1–4 adaptive/always,
+  independent5-trial confirmation and stress/short/repeated32K if positive.
+  Production priming cost is included. Deadline guard defers incomplete work
+  before allocation expiry. Scripts `campaign-v2.sh`, `campaign.py`,
+  `hidden-gate.sh`; results `tmp/strata-mtp-20261002/results/`. No MTP full-model
+  throughput, acceptance or promotion result exists yet.
 - Original remote working tree remains untouched; isolated snapshot remains
   `~/work/gemm/glm53f-strata-20261001`. No pushes authorized or performed.
 

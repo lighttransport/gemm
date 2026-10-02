@@ -67,5 +67,8 @@ static int mtp_run(glm53f_mtp_context_12n*c,int token,const float*hidden,int*dra
 int glm53f_mtp_forward_12n(glm53f_mtp_context_12n*c,int token,const float*hidden,int*draft,float*logit,float*draft_hidden){return mtp_run(c,token,hidden,draft,logit,draft_hidden,0);}
 int glm53f_mtp_cache_append_12n(glm53f_mtp_context_12n*c,int token,const float*hidden){return mtp_run(c,token,hidden,NULL,NULL,NULL,1);}
 int glm53f_mtp_length_12n(const glm53f_mtp_context_12n*c){return c?glm53f_sparse_length_12n(c->attention):-1;}
+int glm53f_mtp_head_hidden_12n(const glm53f_mtp_context_12n *c, float *hidden) {
+    return c ? glm53f_target_head_hidden_12n(c->head, hidden, 1) : -1;
+}
 int glm53f_mtp_restore_length_12n(glm53f_mtp_context_12n*c,int length){return c?glm53f_sparse_restore_length_12n(c->attention,length):-1;}
 void glm53f_mtp_free_12n(glm53f_mtp_context_12n*c){if(!c)return;free(c->head_streams);free(c->sublayer);free(c->normalized);free(c->fusion);free(c->pair);free(c->embed_streams);glm53f_target_head_free_12n(c->head);glm53f_moe_stage_free_12n(c->moe);glm53f_sparse_free_12n(c->attention);glm53f_embedding_free_12n(c->embedding);free(c->eh);free(c->post_norm);free(c->input_norm);free(c->hnorm);free(c->enorm);free(c);}

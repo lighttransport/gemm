@@ -4,6 +4,7 @@
 #include "glm53f_clock.h"
 #include "glm53f_target_model_12n.h"
 #include "glm53f_lookup_spec_12n.h"
+#include "glm53f_mtp_spec_12n.h"
 #include "glm53f_collective_12n.h"
 #include <mpi.h>
 #include <stdio.h>
@@ -62,8 +63,8 @@ int main(int argc, char **argv) {
     MPI_Init_thread(&argc, &argv, MPI_THREAD_SERIALIZED, &provided);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &ranks);
-    if (argc < 6 || ranks != 12) {
-        if (!rank) fprintf(stderr, "usage: %s MODEL ROUTED SHARED PROMPT_IDS OUTPUT_IDS [--transitions 256] [--repetitions 3] [--prefill-chunk 512] [--speculation none|lookup] [--draft-depth 1..4] [--spec-policy adaptive|always] [prefill/runtime options]\n", argv[0]);
+    if (argc < 6 || ranks != 12 || provided < MPI_THREAD_SERIALIZED) {
+        if (!rank) fprintf(stderr, "usage: %s MODEL ROUTED SHARED PROMPT_IDS OUTPUT_IDS [--transitions 256] [--repetitions 3] [--prefill-chunk 512] [--speculation none|lookup|mtp] [--mtp-routed-stage PATH] [--mtp-shared-stage PATH] [--draft-depth 1..4] [--spec-policy adaptive|always] [--decode-state-check TRACE_PREFIX] [prefill/runtime options]\n", argv[0]);
         MPI_Finalize();
         return 2;
     }
@@ -74,6 +75,8 @@ int main(int argc, char **argv) {
     }
     int transitions = 256, repetitions = 3, chunk = 512;
     int speculation = 0, draft_depth = 4, adaptive = 1;
+    const char *mtp_routed = NULL, *mtp_shared = NULL;
+    const char *state_check = NULL;
     glm53f_prefill_config config = {GLM53F_PREFILL_FAST, 32, 27, NULL, 5};
     for (int i = 6; i < argc; ++i) {
         int rc = glm53f_prefill_option(&config, argc, argv, &i);
@@ -84,6 +87,7 @@ int main(int argc, char **argv) {
             if (++i == argc) MPI_Abort(MPI_COMM_WORLD, 2);
             if (!strcmp(key, "--speculation")) {
                 if (!strcmp(argv[i], "lookup")) speculation = 1;
+                else if (!strcmp(argv[i], "mtp")) speculation = 2;
                 else if (!strcmp(argv[i], "none")) speculation = 0;
                 else MPI_Abort(MPI_COMM_WORLD, 2);
             } else {
@@ -91,6 +95,18 @@ int main(int argc, char **argv) {
                 else if (!strcmp(argv[i], "always")) adaptive = 0;
                 else MPI_Abort(MPI_COMM_WORLD, 2);
             }
+            continue;
+        }
+        if (!strcmp(argv[i], "--mtp-routed-stage") || !strcmp(argv[i], "--mtp-shared-stage")) {
+            const char *key = argv[i];
+            if (++i == argc || !*argv[i]) MPI_Abort(MPI_COMM_WORLD, 2);
+            if (!strcmp(key, "--mtp-routed-stage")) mtp_routed = argv[i];
+            else mtp_shared = argv[i];
+            continue;
+        }
+        if (!strcmp(argv[i], "--decode-state-check")) {
+            if (++i == argc || !*argv[i]) MPI_Abort(MPI_COMM_WORLD, 2);
+            state_check = argv[i];
             continue;
         }
         int *dst = NULL, limit = 0;
@@ -103,6 +119,8 @@ int main(int argc, char **argv) {
     }
     if (config.mode != GLM53F_PREFILL_FAST && chunk > 256)
         MPI_Abort(MPI_COMM_WORLD, 2);
+    if ((speculation == 2 && (!mtp_routed || !mtp_shared)) ||
+        (speculation != 2 && (mtp_routed || mtp_shared))) MPI_Abort(MPI_COMM_WORLD, 2);
     FILE *output = NULL;
     if (!rank && !(output = fopen(argv[5], "wx"))) MPI_Abort(MPI_COMM_WORLD, 2);
     if (!rank) {
@@ -157,6 +175,26 @@ int main(int argc, char **argv) {
         argv[1], argv[2], argv[3], count + transitions + 1);
     if (!m) MPI_Abort(MPI_COMM_WORLD, 2);
     check(glm53f_target_model_configure_prefill_12n(m, &config));
+    glm53f_mtp_context_12n *mtp = NULL;
+    glm53f_mtp_spec_workspace_12n *mtp_workspace = NULL;
+    float *prompt_hidden = NULL;
+    float parent_hidden[4096];
+    if (speculation == 2) {
+        /* Layer 45 comes from the checkpoint. Relax the compact target-only
+         * requirement during its construction, retaining all target stages. */
+        const char *old_requirement = getenv("GLM53F_REPACK_REQUIRE");
+        char *saved_requirement = old_requirement ? strdup(old_requirement) : NULL;
+        if (old_requirement && !saved_requirement) MPI_Abort(MPI_COMM_WORLD, 2);
+        check(setenv("GLM53F_REPACK_REQUIRE", "0", 1));
+        mtp = glm53f_mtp_create_12n(argv[1], mtp_routed, mtp_shared,
+                                  count + transitions + draft_depth + 1);
+        check(saved_requirement ? setenv("GLM53F_REPACK_REQUIRE", saved_requirement, 1) :
+                                  unsetenv("GLM53F_REPACK_REQUIRE"));
+        free(saved_requirement);
+        mtp_workspace = glm53f_mtp_spec_workspace_create_12n(m);
+        prompt_hidden = malloc((size_t)chunk * 4096 * sizeof(float));
+        if (!mtp || !mtp_workspace || !prompt_hidden) MPI_Abort(MPI_COMM_WORLD, 2);
+    }
     load = elapsed(load);
     glm53f_target_snapshot_12n *empty = glm53f_target_snapshot_create_12n(m);
     glm53f_target_snapshot_12n *primed = glm53f_target_snapshot_create_12n(m);
@@ -164,28 +202,39 @@ int main(int argc, char **argv) {
     int *ids = malloc((size_t)(transitions + 1) * sizeof(int));
     if (!empty || !primed || !reference || !ids) MPI_Abort(MPI_COMM_WORLD, 2);
     check(glm53f_target_snapshot_save_12n(m, empty));
-    glm53f_lookup_workspace_12n *lookup = speculation ?
+    glm53f_lookup_workspace_12n *lookup = speculation == 1 ?
         glm53f_lookup_workspace_create_12n(m, count + transitions + 1) : NULL;
-    if (speculation && !lookup) MPI_Abort(MPI_COMM_WORLD, 2);
+    if (speculation == 1 && !lookup) MPI_Abort(MPI_COMM_WORLD, 2);
     long minimum = headroom();
     double warmup_prefill = 0, warmup_decode = 0;
     for (int trial = -1; trial < repetitions; ++trial) {
         check(glm53f_target_snapshot_restore_12n(m, empty));
+        if (mtp) check(glm53f_mtp_restore_length_12n(mtp, 0));
         glm53f_target_profile_reset_12n(m);
         MPI_Barrier(MPI_COMM_WORLD);
         double begin = glm53f_clock();
         for (int t = 0; t < count; t += chunk) {
             int n = count - t < chunk ? count - t : chunk;
-            int rc = glm53f_target_model_step_batch_12n(m, prompt + t, n,
-                                                      NULL, NULL, NULL, NULL);
+            int rc = mtp ? glm53f_target_model_prefill_hidden_12n(m, prompt + t, n, prompt_hidden) :
+                glm53f_target_model_step_batch_12n(m, prompt + t, n, NULL, NULL, NULL, NULL);
             if (rc) fprintf(stderr, "GLM53F_BENCH_PREFILL_FAIL rank=%d trial=%d offset=%d tokens=%d collective_count=%d rc=%d\n",
                             rank, trial, t, n, collective_count, rc);
             check(rc);
+            if (mtp) {
+                check(glm53f_target_model_normalize_hidden_12n(m, prompt_hidden, n));
+                for (int j = 0; j < n && t + j + 1 < count; ++j)
+                    check(glm53f_mtp_cache_append_12n(mtp, prompt[t + j + 1],
+                                                    prompt_hidden + (size_t)j * 4096));
+                if (t + n == count)
+                    memcpy(parent_hidden, prompt_hidden + (size_t)(n - 1) * 4096,
+                           sizeof(parent_hidden));
+            }
             long h = headroom();
             if (h < minimum) minimum = h;
         }
         float logit;
         check(glm53f_target_model_readout_12n(m, &ids[0], &logit));
+        if (mtp) check(glm53f_target_model_head_hidden_12n(m, parent_hidden, 1));
         double prefill = elapsed(begin);
         glm53f_target_profile_report_12n(m, "bench-prefill");
         check(glm53f_target_snapshot_save_12n(m, primed));
@@ -195,7 +244,12 @@ int main(int argc, char **argv) {
         begin = glm53f_clock();
         struct memory_guard guard = {minimum, transitions, 0};
         glm53f_lookup_stats_12n spec_stats = {0};
-        if (trial >= 0 && speculation)
+        glm53f_mtp_spec_stats_12n mtp_stats = {0};
+        if (trial >= 0 && speculation == 2)
+            check(glm53f_mtp_spec_decode_12n(m, mtp, mtp_workspace, count, parent_hidden,
+                ids[0], transitions, draft_depth, adaptive ? warmup_decode / transitions : 0,
+                ids, &mtp_stats, guard_decode, &guard));
+        else if (trial >= 0 && speculation == 1)
             check(glm53f_lookup_decode_12n(m, lookup, prompt, count, ids[0], transitions,
                 draft_depth, adaptive ? warmup_decode / transitions : 0,
                 ids, &spec_stats, guard_decode, &guard));
@@ -207,14 +261,26 @@ int main(int argc, char **argv) {
                             (size_t)(transitions + 1) * sizeof(int)), all;
         MPI_Allreduce(&equal, &all, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
         if (!all) MPI_Abort(MPI_COMM_WORLD, 4);
+        if (state_check) {
+            /* Endpoint I/O runs outside timing. Compare complete KDA/sparse
+             * state against the plain warmup, including rejected suffixes. */
+            check(glm53f_target_trace_open_12n(m, state_check, trial >= 0));
+            check(glm53f_target_trace_close_12n(m));
+            if (!rank) printf("GLM53F_BENCH_STATE trial=%d state=BIT_EXACT PASS\n", trial);
+        }
         if (trial < 0) {
             memcpy(reference, ids, (size_t)(transitions + 1) * sizeof(int));
             warmup_prefill = prefill; warmup_decode = decode;
         } else if (!rank) {
             printf("GLM53F_BENCH_SPEC {\"trial\":%d,\"lookup\":%d,\"depth\":%d,\"adaptive\":%d,\"accepted\":%d,\"proposed\":%d,\"cycles\":%d,\"fallback_tokens\":%d,\"lookup_seconds\":%.9f,\"verify_seconds\":%.9f,\"rollback_seconds\":%.9f,\"plain_seconds\":%.9f}\n",
-                trial, speculation, draft_depth, adaptive, spec_stats.accepted, spec_stats.proposed,
+                trial, speculation == 1, draft_depth, adaptive, spec_stats.accepted, spec_stats.proposed,
                 spec_stats.cycles, spec_stats.fallback_tokens, spec_stats.lookup_seconds,
                 spec_stats.verify_seconds, spec_stats.rollback_seconds, spec_stats.plain_seconds);
+            if (mtp) printf("GLM53F_BENCH_MTP {\"trial\":%d,\"depth\":%d,\"adaptive\":%d,\"accepted\":%d,\"proposed\":%d,\"cycles\":%d,\"fallback_tokens\":%d,\"cache_synchronized\":%d,\"draft_seconds\":%.9f,\"verify_seconds\":%.9f,\"replay_seconds\":%.9f,\"plain_seconds\":%.9f}\n",
+                trial, draft_depth, adaptive, mtp_stats.accepted, mtp_stats.proposed,
+                mtp_stats.cycles, mtp_stats.fallback_tokens, mtp_stats.cache_synchronized,
+                mtp_stats.draft_seconds, mtp_stats.verify_seconds, mtp_stats.replay_seconds,
+                mtp_stats.plain_seconds);
             printf("GLM53F_BENCH_TRIAL {\"trial\":%d,\"prompt_tokens\":%d,\"decode_transitions\":%d,\"prefill_seconds\":%.9f,\"decode_seconds\":%.9f,\"prefill_tok_s\":%.6f,\"decode_tok_s\":%.6f,\"minimum_available_kb\":%ld,\"tokens_equal\":true}\n",
                    trial, count, transitions, prefill, decode,
                    count / prefill, transitions / decode, minimum);
@@ -228,6 +294,9 @@ int main(int argc, char **argv) {
                repetitions, load, warmup_prefill, warmup_decode, minimum);
     }
     glm53f_lookup_workspace_free_12n(lookup);
+    free(prompt_hidden);
+    glm53f_mtp_spec_workspace_free_12n(mtp_workspace);
+    glm53f_mtp_free_12n(mtp);
     free(ids); free(reference); free(prompt);
     glm53f_target_snapshot_free_12n(primed);
     glm53f_target_snapshot_free_12n(empty);

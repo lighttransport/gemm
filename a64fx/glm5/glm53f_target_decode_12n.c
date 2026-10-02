@@ -482,14 +482,15 @@ int glm53f_target_decode_sequence_12n(glm53f_target_model_12n *m,
     return call.rc;
 }
 
-int glm53f_target_model_step_batch_12n(glm53f_target_model_12n *m,
+static int target_step_batch(glm53f_target_model_12n *m,
                                        const int *input, int tokens, int *next,
                                        float *logit, float *hidden,
-                                       glm53f_target_snapshot_12n **after) {
+                                       glm53f_target_snapshot_12n **after,
+                                       int prompt_hidden) {
     double begin = m && m->profile ? glm53f_clock() : 0.0;
     if (!m || !input || (!next != !logit) || tokens < 1 ||
         tokens > PREFILL_BATCH ||
-        ((next || hidden || after) && tokens > VERIFY_BATCH))
+        ((next || (hidden && !prompt_hidden) || after) && tokens > VERIFY_BATCH))
         return -1;
     if (tokens > GLM53F_PREFILL_V5_TOKENS) {
         if (m->prefill.mode != GLM53F_PREFILL_FAST) return -1;
@@ -497,7 +498,9 @@ int glm53f_target_model_step_batch_12n(glm53f_target_model_12n *m,
             /* A long-capacity CP model retains the old 256-token scheduler. */
             for (int t=0;t<tokens;t+=GLM53F_PREFILL_V5_TOKENS) {
                 int n=tokens-t<GLM53F_PREFILL_V5_TOKENS ? tokens-t : GLM53F_PREFILL_V5_TOKENS;
-                if (glm53f_target_model_step_batch_12n(m,input+t,n,NULL,NULL,NULL,NULL)) return -1;
+                if (target_step_batch(m, input+t, n, NULL, NULL,
+                        hidden ? hidden + (size_t)t * HIDDEN : NULL, NULL,
+                        prompt_hidden)) return -1;
             }
             return 0;
         }
@@ -702,6 +705,27 @@ batch_ffn_done:
         m->batch_positions += tokens;
     }
     return rc;
+}
+
+int glm53f_target_model_step_batch_12n(glm53f_target_model_12n *m,
+        const int *input, int tokens, int *next, float *logit, float *hidden,
+        glm53f_target_snapshot_12n **after) {
+    return target_step_batch(m, input, tokens, next, logit, hidden, after, 0);
+}
+
+int glm53f_target_model_prefill_hidden_12n(glm53f_target_model_12n *m,
+        const int *input, int tokens, float *hidden) {
+    if (!hidden) return -1;
+    return target_step_batch(m, input, tokens, NULL, NULL, hidden, NULL, 1);
+}
+
+int glm53f_target_model_normalize_hidden_12n(const glm53f_target_model_12n *m,
+        float *hidden, int tokens) {
+    return m ? glm53f_target_head_normalize_12n(m->head, hidden, tokens) : -1;
+}
+int glm53f_target_model_head_hidden_12n(const glm53f_target_model_12n *m,
+        float *hidden, int tokens) {
+    return m ? glm53f_target_head_hidden_12n(m->head, hidden, tokens) : -1;
 }
 
 int glm53f_target_trace_open_12n(glm53f_target_model_12n *m, const char *prefix, int compare) {

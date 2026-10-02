@@ -85,6 +85,15 @@ prefill tile, and separate MLA head projections. Native integrated builds
 link the assembly tiles; standalone bridge builds use the C fallback when
 that object is absent. See the Strata document for qualification status.
 
+The resident benchmark also supports opt-in `--speculation mtp` with
+`--mtp-routed-stage PATH --mtp-shared-stage PATH`, `--draft-depth 1..4` and
+`--spec-policy adaptive|always`. It primes from actual batched prompt hiddens,
+uses post-head-norm parent/draft hiddens, includes teacher forcing in prefill
+and compares every delivered ID with a plain warmup. Optional
+`--decode-state-check TRACE_PREFIX` compares complete target endpoint state
+outside timing. This candidate has native/unit validation; full-model timing
+is still pending. See the Strata document for its serial qualification gates.
+
 For tokenization of an already rendered chat prompt:
 
 ```bash

@@ -50,6 +50,17 @@ int glm53f_target_model_step_batch_12n(
     glm53f_target_model_12n *model, const int *input_tokens, int tokens,
     int *next_tokens, float *next_logits, float *target_hidden,
     glm53f_target_snapshot_12n **state_after_each_token);
+/* Prompt-only execution with every position's collapsed target hidden state.
+ * Caller supplies tokens*4096 floats. Uses the same prefill recipe/panels as
+ * step_batch; logits and verification snapshots retain their five-token limit. */
+int glm53f_target_model_prefill_hidden_12n(glm53f_target_model_12n *model,
+    const int *input_tokens, int tokens, float *target_hidden);
+/* MTP uses post-output-norm hiddens. Normalize prompt means in place, or copy
+ * the actual normalized hiddens of the last scalar/verification head call. */
+int glm53f_target_model_normalize_hidden_12n(const glm53f_target_model_12n *model,
+    float *target_hidden, int tokens);
+int glm53f_target_model_head_hidden_12n(const glm53f_target_model_12n *model,
+    float *target_hidden, int tokens);
 void glm53f_target_profile_reset_12n(glm53f_target_model_12n *model);
 void glm53f_target_profile_report_12n(
     const glm53f_target_model_12n *model, const char *label);

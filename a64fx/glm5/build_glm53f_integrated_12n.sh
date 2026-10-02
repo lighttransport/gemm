@@ -79,8 +79,13 @@ if [ "$mode" != runtime ]; then
     bin test_glm53f_team test_glm53f_team.c "$build_dir/team.o"
     bin bench_glm53f_async_reduce bench_glm53f_async_reduce.c "$build_dir/collective.o"
     obj lookup_spec glm53f_lookup_spec_12n.c
+    obj mtp glm53f_mtp_12n.c "${external[@]}"
+    obj mtp_spec glm53f_mtp_spec_12n.c
     bin test_glm53f_lookup_spec test_glm53f_lookup_spec.c "$build_dir/lookup_spec.o"
-    bin bench_glm53f_run_12n bench_glm53f_run_12n.c "$build_dir/lookup_spec.o" "${objects[@]}" "$build_dir/target.o"
+    bin test_glm53f_mtp_spec test_glm53f_mtp_spec.c
+    bin test_glm53f_head_hidden -ffunction-sections -fdata-sections -Wl,--gc-sections test_glm53f_head_hidden.c
+    bin test_glm53f_mtp_cache_12n test_glm53f_mtp_cache_12n.c "${objects[@]}" "$build_dir/mtp.o"
+    bin bench_glm53f_run_12n bench_glm53f_run_12n.c "$build_dir/lookup_spec.o" "$build_dir/mtp_spec.o" "$build_dir/mtp.o" "${objects[@]}" "$build_dir/target.o"
     for name in kquant native_batch prefill_config state_io iq_grouped mhc_team lookup moe_combine index_heads index_keys4 pool_select mla_absorb mla_value mla_cache_f16 mla_attention; do
         bin "test_glm53f_$name" "test_glm53f_$name.c" "$build_dir/q8_panel.o" "$build_dir/team.o" "$build_dir/gemm_asm.o"
     done
@@ -94,9 +99,7 @@ fi
 if [ "$mode" = all ]; then
     bin glm53f_decode_stage glm53f_decode_stage.c
     bin glm53f_repack_trace glm53f_repack_trace.c
-    obj mtp glm53f_mtp_12n.c "${external[@]}"
     bin glm53f_spec_decode_12n glm53f_spec_decode_12n.c "${objects[@]}" "$build_dir/target.o" "$build_dir/mtp.o"
-    bin test_glm53f_mtp_cache_12n test_glm53f_mtp_cache_12n.c "${objects[@]}" "$build_dir/mtp.o"
     bin glm53f_prefill_12n glm53f_prefill_12n.c "${objects[@]}" "$build_dir/target.o"
     bin test_glm53f_kda_reference_12n test_glm53f_kda_reference_12n.c "$build_dir/kda.o" "${kernels[@]}"
     bin test_glm53f_iq_bridge test_glm53f_iq_bridge.c "$build_dir/iq_bridge.o" "$build_dir/q8_panel.o"

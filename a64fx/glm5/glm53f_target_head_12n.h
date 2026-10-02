@@ -8,6 +8,12 @@ glm53f_target_head_context_12n *glm53f_target_head_create_12n(
 glm53f_target_head_context_12n *glm53f_target_head_create_with_norm_12n(
     const char *model_dir, const char *norm_tensor);
 void glm53f_target_head_free_12n(glm53f_target_head_context_12n *context);
+/* Apply this head's output norm to collapsed hiddens, in place. */
+int glm53f_target_head_normalize_12n(const glm53f_target_head_context_12n *context,
+    float *hidden, int tokens);
+/* Copy the actual normalized hiddens of the latest successful head call. */
+int glm53f_target_head_hidden_12n(const glm53f_target_head_context_12n *context,
+    float *hidden, int tokens);
 /* Diagnostic view of the most recent scalar vocabulary shard; invalidated
  * by the next head evaluation. No communication and no ownership transfer. */
 const float *glm53f_target_head_logits_12n(const glm53f_target_head_context_12n *context,

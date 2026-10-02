@@ -1,0 +1,114 @@
+{
+  "date": "2026-10-02",
+  "allocation": 52085859,
+  "hardware": "12 A64FX nodes, normal 2 GHz, eco0",
+  "status": "native and local tests PASS; full-model qualification queued, no throughput promotion",
+  "implementation": {
+    "prompt_hidden": "same batched target recipe, collapsed means normalized by output norm for MTP priming",
+    "decode_parent": "actual latest target head normalized hidden",
+    "draft_parent": "actual latest MTP shared-head normalized hidden",
+    "controller": "known input plus drafts in one verifier window, accepted target snapshots, true-parent cache replay, unconsumed bonus",
+    "fallback": "rank-max recurring cost check; persistent plain suffix; clear stale MTP cache"
+  },
+  "sources": {
+    "source-v1.tar.gz": "8ed65c497334c78dd431e516314c982747ee2c9a13691591131f47385ce26293",
+    "source-v3.tar.gz": "337e92cc60624c75078f78f3d4feea6693c2fa846215f408565b84cdda21e618",
+    "bench-state-update-v2.tar.gz": "5c3ec1392d8673b273d1a38e6ea0d130c6e367954b786266e8ce5f9860d76c17",
+    "checker-update-v4.tar.gz": "d054d56b10dcfb3391e50029ffa2204854c24787567514bc55c57f653e36683c",
+    "build-v1.log": "2db8d2a3e46a824ab2bdae2e542923b4462ef20206a398ba6ce69297a6db01aa",
+    "build-state-v2.log": "33163ea161398bd89f22dd0fc094bb9391a826cd7d9b67dc4cb8f7ba8da55290",
+    "build-v3.log": "97c8c34120744c459ef82fefee9737479554c7055556af01941398f81f3274ba",
+    "build-checker-v4.log": "d072b30cefa3a0403cf9357acffea2731afa9aad05ad989621d501f180743afb"
+  },
+  "native_binaries": {
+    "/home/u14346/work/gemm/glm53f-strata-20261001/a64fx/glm5/build/candidate-mtp-v3/bench_glm53f_run_12n": "c6c1a6381ccb30adbdf186c67d09f9f44b45c2aa79afee73dc560b2b7efd9040",
+    "/home/u14346/work/gemm/glm53f-strata-20261001/a64fx/glm5/build/candidate-mtp-v3/glm53f_target_decode_12n": "e50973d78a243b40bf135dd03e34af36b5f0c93bf97ddceb6e1e68ea74ed47d3",
+    "/home/u14346/work/gemm/glm53f-strata-20261001/a64fx/glm5/build/candidate-mtp-v3/glm53f_prefill_chunk_check_12n": "6e94c537083f66036ce84a4873c93955d9419afc114485091b43c186a6ebe618",
+    "/home/u14346/work/gemm/glm53f-strata-20261001/a64fx/glm5/build/candidate-mtp-v3/test_glm53f_mtp_cache_12n": "49c3303e8f8f0077f3c2a8787cf0e5f8b1e235603571a514034751f4087bf31b",
+    "/home/u14346/work/gemm/glm53f-strata-20261001/a64fx/glm5/build/candidate-mtp-v4/glm53f_prefill_chunk_check_12n": "d26e60cfad836dfd47356fbe8cc8d56b2f78844a176339ca0966d249cbf649df"
+  },
+  "tests": {
+    "local_controller": {
+      "cases": 896,
+      "result": "PASS"
+    },
+    "asan_ubsan": {
+      "cases": 896,
+      "result": "PASS",
+      "leak_detection": false,
+      "reason": "LeakSanitizer unavailable under tracing"
+    },
+    "native_controller": {
+      "cases": 896,
+      "result": "PASS",
+      "mpi": "single-node mock during staging; real 12-rank queue pending"
+    },
+    "native_head_hidden": {
+      "configurations": 8,
+      "cases_each": 18,
+      "math": [
+        "fast",
+        "conservative"
+      ],
+      "threads": [
+        1,
+        12,
+        47,
+        48
+      ],
+      "result": "PASS",
+      "normalization_tolerance": "1e-6 * (1 + abs(reference)); exported cached hiddens byte-exact"
+    },
+    "launcher": {
+      "tests": 18,
+      "result": "PASS"
+    }
+  },
+  "qualification": {
+    "prompt_ids": 8049,
+    "delivered_transitions": 256,
+    "full_prompt_hidden_and_endpoint_gate": "queued",
+    "short_and_8k_decode_state_gate": "queued",
+    "depths": [
+      1,
+      2,
+      3,
+      4
+    ],
+    "policies": [
+      "adaptive",
+      "always"
+    ],
+    "includes_mtp_teacher_forcing_in_prefill": true,
+    "includes_draft_verify_restore_replay_in_decode": true,
+    "whole_model_throughput_result": null,
+    "promoted": false
+  },
+  "queues": {
+    "q8": {
+      "pid": 9278,
+      "log": "tmp/strata-q8-20261002/campaign-resume-v2.log"
+    },
+    "capacity": {
+      "pid": 9417,
+      "log": "tmp/strata-q8-20261002/capacity-campaign-v2.log"
+    },
+    "lookup": {
+      "pid": 9420,
+      "log": "tmp/strata-q8-20261002/lookup-campaign-v2.log"
+    },
+    "mtp": {
+      "pid": 9424,
+      "log": "tmp/strata-mtp-20261002/campaign-v2.log"
+    }
+  },
+  "best_independently_qualified": {
+    "decode_tok_s": 35.742137,
+    "prefill_tok_s": 370.75401
+  },
+  "targets": {
+    "decode_tok_s": 100,
+    "prefill_tok_s": 2000,
+    "met": false
+  }
+}

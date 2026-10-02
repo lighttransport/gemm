@@ -151,6 +151,54 @@ first requires exact final hidden streams and complete KDA/sparse state
 against 512, then full IDs, fresh controls, confirmation and context stress.
 No larger-chunk throughput or memory-headroom result exists yet.
 
+## Batched-prefill MTP candidate (October 2)
+
+The resident benchmark now accepts `--speculation mtp` with explicit
+`--mtp-routed-stage` and `--mtp-shared-stage` paths. It captures every prompt
+position's stream mean using the same batched prefill recipe, applies the
+output norm, and teacher-forces the draft cache with the next prompt token.
+The first decode parent is copied from the actual target head's normalized
+hidden. Chained proposals use the actual MTP shared-head normalized hidden.
+This follows the post-norm target export in the
+[GLM5-Next graph](https://github.com/ggml-org/llama.cpp/blob/master/src/models/glm5-next.cpp)
+and the normalized parent/draft hiddens in local Strata `glm_decode.cpp`.
+The historical scalar-prefill MTP runner's raw-hidden contract is preserved.
+
+Each verification window processes the already predicted input together with
+its drafts. It restores the accepted target snapshot, retains the first exact
+MTP pair, and replays accepted draft inputs with actual verified parent
+hiddens. The bonus input is left for the next window. A recurring rank-wide
+cost check can switch to a persistent plain suffix and clears the stale draft
+cache. Draft/verify work remains outside the persistent target team; those
+kernels are not all aware of persistent dispatch.
+
+Prefill timing includes hidden capture, normalization and MTP teacher forcing.
+Decode timing includes draft, verify, restore and replay. The benchmark counts
+only delivered target transitions, compares every ID with a plain warmup on
+its actual batched prompt stream, and can additionally compare complete
+KDA/sparse endpoint state with `--decode-state-check TRACE_PREFIX` outside the
+timed interval. The prompt checker adds `--capture-hidden` and an optional
+`--reference-chunk N` to check every captured position against the original
+prefill call at the selected chunk.
+
+Local controller tests pass **896** cases: all acceptance/rejection prefixes,
+depths 1–4, ragged delivery, context-dependent target rollback, approximate
+draft hiddens, normalized-hidden selection, teacher forcing, observer bounds
+and adaptive fallback. Address/undefined-behavior sanitizers pass with leak
+detection disabled because LeakSanitizer cannot run under this environment's
+tracing. Native output-norm/export tests pass **eight** fast/conservative ×
+1/12/47/48-thread configurations, 18 cases each through capacity4096. The
+integrated normalized MTP build passes. Evidence is
+[strata MTP native record](strata-mtp-native-20261002.json).
+
+Immutable native artifacts are `candidate-mtp-v3` plus the diagnostic-only
+checker update in `candidate-mtp-v4`. A serial queue waits for Q8, capacity
+and lookup qualification, then stages only checkpoint layer45 and runs
+prompt-hidden, cache replay, short/8K full-state and timed depth gates.
+There is **no new full-model MTP throughput or promotion result yet**.
+`tmp/strata-mtp-20261002/` contains frozen source hashes, build logs and
+campaign scripts; `resume-strata.md` records the current queue state.
+
 ## Implementation
 
 The source studied is `~/work/Strata`, branch `glm53f`, revision `e486a95`.
@@ -187,8 +235,8 @@ available for reference. CLI switches:
 --pool-selector heap|partition4k
 ```
 
-MTP retains its legacy executor and rejects `--decode-executor persistent`.
-Its resident trial mode restores target/MTP state, sweeps draft depths, and
+The historical `glm53f_spec_decode_12n` MTP runner retains its legacy executor
+and rejects `--decode-executor persistent`. Its resident trial mode restores target/MTP state, sweeps draft depths, and
 buffers output outside the timed interval. Lookup speculation is currently
 exposed through the resident benchmark; it is not a serving API.
 
