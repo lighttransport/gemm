@@ -76,6 +76,8 @@ if [ "$bin_dir" = . ]; then bin ../utofu-tests/tofu_topo_helper ../utofu-tests/t
 
 if [ "$mode" != runtime ]; then
     obj target glm53f_target_decode_12n.c -DGLM53F_TARGET_MODEL_NO_MAIN
+    bin test_glm53f_parallel test_glm53f_parallel.c
+    bin test_glm53f_pipeline test_glm53f_pipeline.c glm53f_dist.c glm53f_pipeline.c
     bin test_glm53f_team test_glm53f_team.c "$build_dir/team.o"
     bin bench_glm53f_async_reduce bench_glm53f_async_reduce.c "$build_dir/collective.o"
     obj lookup_spec glm53f_lookup_spec_12n.c

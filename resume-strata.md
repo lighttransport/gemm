@@ -21,6 +21,20 @@ Targets: complete 45-layer UD-Q4_K_XL/top-8, saved ~8K single
 request, 100+ delivered decode and 2000+ prefill tok/s. Neither target met.
 See `a64fx/glm5/GLM53F_STRATA.md` for implementation, gates and commands.
 
+## PP3×TP4 implementation (October 3)
+
+The user approved the prefill-first architecture prototype and token-exact
+numerical-state contract. The distribution context and serialized/two-slot
+pipeline foundation are implemented and pass native 12-node correctness
+checks, including full-width multiple-slot reuse and middle-stage abort.
+Host configuration/ownership tests cover all946 legal cuts. Shared check
+build includes both fixtures. See
+[a64fx/glm5/GLM53F_PIPELINE.md](a64fx/glm5/GLM53F_PIPELINE.md) for exact commands,
+binary hash, protocol and remaining implementation. Full-model constructors,
+PP native staging, 16-head MLA, canonical state export and runner integration
+are still pending; no PP model throughput is claimed. TP12 remains promoted
+at35.462134 decode /412.273634 prefill tok/s; neither target is met.
+
 ## Active continuation (October 2, afternoon)
 
 **Current loader-policy fix and queue.** `common/glm53f_safetensors.h` caches
