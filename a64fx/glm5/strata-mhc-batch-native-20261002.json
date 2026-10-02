@@ -1,5 +1,5 @@
 {
-  "status": "Integrated native exactness and cross-build PASS; full-model state/timing qualification queued; no promoted setting",
+  "status": "Integrated native exactness and cross-build PASS; full-model exact gates pass but every measured MTP variant slower than plain decode; rejected",
   "runtime_option": "--mhc-verify-kernel legacy|team",
   "default": "legacy",
   "scope": "Only2-5-position mHC batches; scalar and larger prefill retain existing paths",
@@ -434,5 +434,6 @@
     "no_overlapping_MPI": true
   },
   "targets_met": false,
-  "promoted": false
+  "promoted": false,
+  "full_model_record": "strata-mhc-batch-full-20261002.json"
 }
