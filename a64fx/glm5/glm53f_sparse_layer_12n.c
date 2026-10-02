@@ -14,6 +14,7 @@
 #include "glm53f_mla_prefill.h"
 #include "glm53f_mla_absorb.h"
 #include "glm53f_mla_cache_f16.h"
+#include "glm53f_mla_softmax.h"
 #include "glm53f_moe_grouped_native.h"
 #include "glm53f_q80_panel64.h"
 #include "glm53f_state_io.h"
@@ -84,6 +85,7 @@ struct glm53f_sparse_context_12n {
     uint8_t *q2_qa,*q2_qb,*q2_kva,*q2_vb,*q2_op;
     int q2_native,q2_qa_type,q2_op_type,q2_qb_type,q2_kva_type,q2_vb_type;
     float *q8v_ql,*q8v_log,*q8v_va,*q8v_sum;
+    float q8v_maximum[8];
     float *mlb_qs,*mlb_ql,*mlb_va,*mlb_out,*mlb_ref,*mlb_lg; unsigned char *mlb_act; size_t mlb_act_bytes; int mlb_threads;
     unsigned char *q8v_act;
     uint8_t *sg_w1, *sg_wqb, *sg_wop; int sg_state; /* int8 panel64 GEMM copies of q_a|kv_a and q_b (prefill front) */
@@ -530,7 +532,7 @@ static void ensure_mla_shards(glm53f_sparse_context_12n*c){if(c->mla_ql)return;s
  * phases are work-shared by one team; every output element keeps the serial
  * accumulation order (j for ql, t for va), so results match the former
  * single-threaded loop. */
-struct mla_value_call { glm53f_sparse_context_12n *c; float *out; const float *q, *z; const int *selected; int nt, bad, registers; const uint16_t *half; };
+struct mla_value_call { glm53f_sparse_context_12n *c; float *out; const float *q, *z; const int *selected; int nt, bad, registers; const uint16_t *half; int parallel_softmax; };
 static void mla_value_worker(void *context) {
     struct mla_value_call *a = context;
     glm53f_sparse_context_12n *c = a->c;
@@ -571,6 +573,9 @@ static void mla_value_worker(void *context) {
                 lg[(size_t)h*SLOTS+t] = svaddv_f32(p, dot);
             } else lg[(size_t)h*SLOTS+t]=f32dot(ql+(size_t)h*LAT,z+(size_t)r*LAT,LAT);
         }
+    if (a->parallel_softmax && nt >= 128) {
+        glm53f_mla_softmax_parallel(lg, hsum, c->q8v_maximum, hn, nt, SLOTS);
+    } else {
 #pragma omp for schedule(static)
         for(int h=0;h<hn;h++){
             float*l=lg+(size_t)h*SLOTS,mx=-INFINITY,sum=0;
@@ -578,6 +583,7 @@ static void mla_value_worker(void *context) {
             for(int t=0;t<nt;t++){l[t]=expf(l[t]-mx);sum+=l[t];}
             hsum[h]=sum;
         }
+    }
 #pragma omp for schedule(static)
         for(int w=0;w<hn*NDC;w++){
             const int h=w/NDC,d0=(w%NDC)*DC;
@@ -639,9 +645,11 @@ static int mla_heads_q8_value(glm53f_sparse_context_12n*c,float*out,
     }
     int bad=0;
     const char *registers = getenv("GLM53F_MLA_REGISTERS");
+    const char *softmax = getenv("GLM53F_MLA_PARALLEL_SOFTMAX");
     struct mla_value_call call = {c, out, q, z, selected, nt, 0,
         registers && svcntw() == 16 ? atoi(registers) : 0,
-        selected == c->selected ? c->latent_f16 : NULL};
+        selected == c->selected ? c->latent_f16 : NULL,
+        softmax && atoi(softmax) && omp_get_max_threads() > 1};
     if (glm53f_team_available()) glm53f_team_dispatch(mla_value_worker, &call);
     else {
 #pragma omp parallel

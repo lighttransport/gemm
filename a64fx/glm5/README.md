@@ -216,3 +216,9 @@ the full 8049-position state gate passes, but five-trial full-model prefill
 improvement is only 0.04%, below promotion. Keep tight in the qualified recipe. Use
 `--compare-moe-prefill-layout --capture-hidden` with the prompt-endpoint checker
 and equal reference/candidate chunk sizes to isolate the layout change.
+
+The opt-in `--mla-softmax-kernel parallel` scalar MLA worker passes native
+exponent/sum bit checks and improves isolated five/six-head softmax timing.
+Default`legacy` remains selected while full-model state/timing qualification
+runs. See [Strata optimization evidence](GLM53F_STRATA.md) and
+[softmax record](strata-mla-softmax-native-20261002.json).

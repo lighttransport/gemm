@@ -800,3 +800,27 @@ flag. PP3×TP4 is not implemented or qualified. For a single dependent decode
 request, account for inter-stage latency rather than assuming threefold
 pipeline speedup. Short and synthetic 32K qualification pass. All new paths
 remain opt-in; the synthetic fixture does not replace a real long coding prompt.
+
+The completed mHC verification-team full sweep passes captured8049 prompt
+means and short128/8K target state, with every257-ID output exact. Fresh plain
+control34.455058 /408.171302 tok/s outperforms all eight team+MTP variants.
+Teams recover only1.69%/0.92% versus fresh legacy MTP depths2/4; promotion
+is rejected. See [full mHC team results](strata-mhc-batch-full-20261002.json).
+KDA decode128 and8049 prompt-hidden/full-state gates also pass; its fresh
+control and candidate timing comparisons continue onPJM52097252.
+
+`--mla-softmax-kernel parallel`, default`legacy`, revisits scalar native MLA
+softmax. Its original prototype failed because forced sequential summation
+changed FCC fast-math bits. The new path retains scalar expf and compiler
+sum policy, distributes64-key tasks, then computes per-head sums. Integrated
+native17820 cases pass for each logit stride2052/2056 across two math modes,
+five thread counts, nine inputs and33 token/tail counts. At47 threads and
+production stride2052, five/six-head timings improve2.654×/2.421×, with
+seven alternating90-step component trials including input restoration.
+The opt-in sparse worker adds8-float maximum scratch and retains legacy for
+small<128 or one-thread calls. Wide prefill softmax is unchanged. Explicit
+reference/candidate flags in the executor and captured prompt/state checker
+prevent same-candidate comparisons. Strict-Werror integrated build, parser,
+18 launcher and six reporting checks pass. Candidate-mla-softmax-v1 waits
+behind Q5 in the serial qualification queue asPID19483. No model gain is
+claimed. See [softmax native evidence](strata-mla-softmax-native-20261002.json).

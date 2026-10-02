@@ -10,6 +10,10 @@ static int parse(const char *key, const char *value, glm53f_prefill_config *c) {
 int main(void) {
     glm53f_prefill_config c = {GLM53F_PREFILL_LEGACY, 32, GLM53F_PREFILL_FAST_DEFAULT, NULL, 0};
     int failed = 0;
+    failed |= parse("--mla-softmax-kernel", "parallel", &c) != 1 || strcmp(getenv("GLM53F_MLA_PARALLEL_SOFTMAX"), "1");
+    failed |= parse("--mla-softmax-kernel", "legacy", &c) != 1 || strcmp(getenv("GLM53F_MLA_PARALLEL_SOFTMAX"), "0");
+    failed |= parse("--mla-softmax-kernel", "fused", &c) != -1;
+    failed |= parse("--mla-softmax-kernel", NULL, &c) != -1;
     failed |= parse("--kda-decode-kernel", "columns", &c) != 1 || strcmp(getenv("GLM53F_KDA_DECODE_COLUMNS"), "1");
     failed |= parse("--kda-decode-kernel", "legacy", &c) != 1 || strcmp(getenv("GLM53F_KDA_DECODE_COLUMNS"), "0");
     failed |= parse("--kda-decode-kernel", "team", &c) != -1;

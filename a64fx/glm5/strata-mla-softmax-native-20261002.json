@@ -1,0 +1,192 @@
+{
+  "status": "Opt-in parallel scalar-exp MLA softmax; native primitive exactness and warning-clean integrated cross-build PASS; full-model gates/timing queued",
+  "runtime_option": "--mla-softmax-kernel legacy|parallel",
+  "default": "legacy",
+  "scope": "Scalar native MLA decode/verification worker, tokens>=128, more than1 thread; wide prefill vector softmax unchanged",
+  "implementation": "Orphaned workshares for per-head maximum,64-key scalar expf tasks,per-head compiler reduction. Keeps original expf and fast-math vector reduction policy; earlier sequential-reduction prototype failed exactness.8-float per-context maximum scratch; no weight/cache format change. Snapshot option per call for exact reference/candidate gate toggling.",
+  "native": {
+    "allocations": [
+      52104939,
+      52105064,
+      52105148
+    ],
+    "hardware": "One A64FX node per job, normal2000MHz/eco0",
+    "compiler": "FCC Clang -O3 -march=armv8.2-a+sve -ffp-contract=fast -fopenmp -Wall -Wextra -Werror",
+    "math_modes": [
+      "fast-math/no-math-errno",
+      "conservative"
+    ],
+    "threads": [
+      1,
+      3,
+      12,
+      47,
+      48
+    ],
+    "production_stride": 2052,
+    "cases_per_configuration": 1782,
+    "configurations": 10,
+    "total_cases": 17820,
+    "additional_stride2056_cases": 17820,
+    "input_distributions": [
+      "random",
+      "wide100",
+      "tiny",
+      "zero",
+      "sparse high/underflow",
+      "negative offset1000",
+      "positive offset1000",
+      "small exact integers",
+      "negative zero"
+    ],
+    "heads": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6
+    ],
+    "token_counts": [
+      1,
+      2,
+      3,
+      7,
+      15,
+      16,
+      17,
+      31,
+      32,
+      33,
+      47,
+      48,
+      49,
+      63,
+      64,
+      65,
+      127,
+      128,
+      129,
+      255,
+      256,
+      257,
+      511,
+      512,
+      513,
+      1023,
+      1024,
+      1025,
+      2047,
+      2048,
+      2049,
+      2051,
+      2052
+    ],
+    "checks": "Every exponent and sum float bit; logits, sums and maximum scratch tail guards; finite sum IEEE representations",
+    "sentinel": "MLA_SOFTMAX_INTEGRATED_PROBE_COMPLETE, all10 individual CASE_PASS and zero CASE_FAIL",
+    "timing": "Seven alternating trials/mode,90 steps in one OpenMP region, includes same parallel input restore for each call; synthetic component only, no model projections/cache/collective. Serial allocation first touch.",
+    "performance": [
+      {
+        "math": "fast",
+        "heads": 5,
+        "threads": 47,
+        "legacy_us": 45.646562,
+        "parallel_us": 17.197927,
+        "ratio": 2.65419
+      },
+      {
+        "math": "fast",
+        "heads": 6,
+        "threads": 47,
+        "legacy_us": 45.866436,
+        "parallel_us": 18.943681,
+        "ratio": 2.4212
+      },
+      {
+        "math": "fast",
+        "heads": 5,
+        "threads": 48,
+        "legacy_us": 45.455827,
+        "parallel_us": 17.121103,
+        "ratio": 2.654959
+      },
+      {
+        "math": "fast",
+        "heads": 6,
+        "threads": 48,
+        "legacy_us": 45.487616,
+        "parallel_us": 16.609828,
+        "ratio": 2.738596
+      },
+      {
+        "math": "conservative",
+        "heads": 5,
+        "threads": 47,
+        "legacy_us": 45.702193,
+        "parallel_us": 29.72285,
+        "ratio": 1.537611
+      },
+      {
+        "math": "conservative",
+        "heads": 6,
+        "threads": 47,
+        "legacy_us": 45.765771,
+        "parallel_us": 30.300352,
+        "ratio": 1.510404
+      },
+      {
+        "math": "conservative",
+        "heads": 5,
+        "threads": 48,
+        "legacy_us": 45.845244,
+        "parallel_us": 29.789077,
+        "ratio": 1.538995
+      },
+      {
+        "math": "conservative",
+        "heads": 6,
+        "threads": 48,
+        "legacy_us": 45.821402,
+        "parallel_us": 29.778481,
+        "ratio": 1.538742
+      }
+    ],
+    "binding": "FLIB_BARRIER=HARD overrides requested close binding toFALSE"
+  },
+  "cross_build": {
+    "candidate": "candidate-mla-softmax-v1",
+    "sentinel": "MLA_SOFTMAX_MODEL_CROSS_PASS",
+    "strict_werror": true,
+    "initial_failure": "Frozen IQ archive omitted sparse-core C dependency. Added core source and architecture header, plus original external-reader/no-main build defines; failed log preserved."
+  },
+  "full_model": {
+    "allocation": 52097252,
+    "owned_pid": 19483,
+    "waits_owned_pid": 16341,
+    "observed_wait": "MLA_SOFTMAX_WAIT owner_pid=16341 owner_args=bash tmp/strata-iq-scales-20261002/full-driver.sh",
+    "gates": "Explicit128-step reference0/candidate1 executor hidden/fullstate,8049 prompt-hidden/fullstate comparison0/1, fresh/rebuilt controls,3-trial candidate and independent5-trial confirmation before promotion/contextstress. New-run guard00:00JST.",
+    "outputs": "tmp/strata-mla-softmax-20261002/full-results-v1/"
+  },
+  "local_checks": [
+    "Host conservative1782 cases at3 threads PASS (stride2056)",
+    "Warning-clean runtime parser PASS",
+    "18 launcher tests PASS",
+    "6 reporting tests PASS",
+    "Shell/Python/JSON/diff checks PASS"
+  ],
+  "evidence_sha256": {
+    "probe.c": "bd0f2a9d997911fd574c80053b4a151912bd91c3e439b28a0792019504ee127d",
+    "integrated-src/glm53f_mla_softmax.h": "d7890388300ebc914772756670e95a41ad1ea48e53bbc489e535a473144a272b",
+    "integrated-src/test_glm53f_mla_softmax.c": "1d2a89c6f35ffc439dc31257e03b01676925936657466a93bbdb4868d9ea6b6c",
+    "native-52104939.log": "d07560f7b8e4a19fb125472aececea02b3d3855e74360b9bf3a2b03436147b67",
+    "native-integrated-52105064.log": "64b4031f933e6848cf1733f3b75409db54efd36104ab60ce37f274bfcfce42d8",
+    "native-integrated-52105148.log": "e061d766cc937ae87fdd7539c5fbf2dddeb82ed33297d64a3d1f7651a4da8449",
+    "source-model-v1.tar.gz": "bf648a5a0e50ff777d317d2c3c3907e4348e5bc9dbe298cfbe6eb2ece0ca0f68",
+    "build-model-v1.log": "3c01e2006fe5c61060cce3dd27f011014e308cc6e997bd1103af31bd0599b36c",
+    "full-driver.sh": "96ec7c7066b2235a0f85a76877544b9d1d7987a55e1042d2f46ac44f9a158bba",
+    "full-campaign.py": "1674dc84d87ad29f2b9069177f096fef55a9c14a1e780d14ae1071c1514367a5",
+    "hidden-gate.sh": "efdd27eb76d7d2284595e0153a0f85a15154067bdcff0398dc5a7ee3889d7659"
+  },
+  "promote": false,
+  "targets_met": false
+}

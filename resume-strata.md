@@ -1,6 +1,6 @@
 # Resume: GLM53F Strata-inspired optimization, 12 A64FX nodes
 
-Updated 2026-10-02 22:23 JST. Capacity4096 remains the promoted recipe:
+Updated 2026-10-02 22:53 JST. Capacity4096 remains the promoted recipe:
 35.462134 decode /412.273634 prefill tok/s. Neither 100/2000 target is met.
 The normalized MTP constructor failure is diagnosed and fixed: compact-core
 strictness was cached from target creation and ignored temporary checkpoint
@@ -110,13 +110,19 @@ MTP objects and repaired shared reader. Benchmark SHA
 `2127762f8e8c7440cbdc238ebcec439eebca5b2bf6493ec27e114b3726598714`,
 checker `17ad0196780b91576d09d2ef7537904c695a00e5f64cbc287cbe58fe705d3765`.
 Update-v3 SHA `405865cdead156c83b0ba1fcf22018c6ee08821c678fc811474b53f01b2837dc`.
-**Full-model PID2343** is active after owned PID597 completed; it checks stage/build/native
+**Full-model PID2343 completed** by22:35 with `MHC_BATCH_FULL_QUALIFICATIONS_PASS`; it checks stage/build/native
 sentinels and refuses overlapping MPI. Scripts/logs
 `tmp/strata-mhc-batch-20261002/full-{driver,campaign}.{sh,py,pid,log}`;
 outputs`full-results-v1/`. It gates8049 means, short128 and8K full target state,
 then fresh/rebuilt controls, fresh legacy MTP depth2/4, and1–4 adaptive/always
 with the new mHC helper. All teacher forcing/replay costs remain counted.
-New-run guard00:00 JST October3. No whole-model gain or promotion is claimed.
+New-run guard00:00 JST October3. All eight MTP plus team variants are exact but
+slower than fresh plain34.455058 decode /408.171302 prefill. Decode ratios
+0.9913/0.9877 (depth1 adaptive/always),0.9498/0.9753 (depth2),
+0.9301/0.8732 (depth3),0.8804/0.7213 (depth4); all prefill ratios
+0.8967–0.9023. Teams improve versus fresh legacy MTP only1.69%/0.92%
+for depths2/4 always. Rejected; no five-trial/context promotion checks needed.
+See [full team result](a64fx/glm5/strata-mhc-batch-full-20261002.json).
 
 **Opt-in KDA columns** adds separate `--kda-decode-kernel legacy|columns` and
 `--kda-prefill-kernel legacy|columns`; defaults remainlegacy. Canonical64-value
@@ -144,7 +150,9 @@ Frozen source-integrated-v4 archive
 Build/native PASS sentinels observed. Initial executor link lackedtarget.o;
 corrected link and complete warning-clean build pass; failed log retained.
 
-**Full-model PID8008** waits for owned PID2343. Scripts/logs in
+**Full-model PID8008 is active** after owned PID2343 completed. Decode128 hidden/full
+state and8049 captured means/final streams/full state gates PASS bit-exact.
+Fresh control finished22:39; rebuilt control and candidate timings follow. Scripts/logs in
 `tmp/strata-kda-columns-20261002/full-{driver,campaign}.{sh,py,pid,log}`;
 outputs`full-results-v1/`. Decode128 hidden/fullstate and8049 prompt means/
 streams/fullstate compare reference flags0 against candidate1 after restoration.
@@ -641,3 +649,42 @@ MPI/build/native timing with stage. Require `STRATA_NEXT4_STAGE_PASS`; inspect
 owned processes before resuming constructor diagnostic/mHC qualification.
 No overlap of12-node allocations. Old52085859 has expired and all its queues
 have exited. Preserve its completed reports and failed diagnostic traces.
+
+**Opt-in MLA `--mla-softmax-kernel parallel`**, defaultlegacy, splits scalar
+expf across64-key workshares while retaining the compiler's original sum
+policy. The earlier prototype forced sequential reduction and failed30
+fast-math cases; removing that mismatch passes the isolated probe. Integrated
+native PJM52105064/52105148 each passes17820 cases, at logit strides2056/2052,
+nine input distributions,1–6 heads,33 token/tail counts, fast/conservative
+threads1/3/12/47/48. Every exponent/sum bit, finite sum and scratch/tail guard
+passes. At production stride2052,47-thread five/six-head medians are
+45.646562→17.197927 /45.866436→18.943681 µs (2.654×/2.421×). Seven
+alternating trials include same90-step input restore inside one OpenMP team;
+component timing excludes other attention/model work. FLIB_BARRIER=HARD
+sets requested close binding toFALSE.
+
+Warning-clean integrated **candidate-mla-softmax-v1** uses capacity4096 and
+attention47. Sparse worker snapshots flag per call, with8-float maximum
+scratch; small<128 and one-thread calls retainlegacy. Wide prefill softmax
+is unchanged. Parser,18 launcher/six reporting checks and strict-Werror
+cross-build pass. Frozen source SHA
+`bf648a5a0e50ff777d317d2c3c3907e4348e5bc9dbe298cfbe6eb2ece0ca0f68`;
+benchmark`5f3a3fe29c511d2f626bded6d96469849608261a039d63594c85304298bcdb5a`.
+Initial IQ-based archive omitted sparse-core source; added dependency/original
+external-reader/no-main build defines; failed log preserved.
+
+**Full-model PID19483** waits for verified owned Q5 PID16341, actualprocess
+and wait log checked22:52. Serial chain isKDA8008→MPI slabs9686→MPI
+nonblocking16162→Q5 16341→softmax19483. Scripts/logs in
+`tmp/strata-mla-softmax-20261002/full-{driver,campaign}.{sh,py,pid,log}`;
+outputs`full-results-v1/`. Explicit128-step reference0/candidate1 executor
+hidden/fullstate and8049 prompt-hidden/state comparison precede fresh/rebuilt
+controls and3-trial timing. Candidate positive>1.005 decode/.98 prefill gets
+independent5-trial confirmation; promotion still requires≥1.05/.98 and
+1024/short128/repeated32K exact qualification. New-run guard00:00JST;
+resume unfinished work after next allocation/staging. No whole-model gain or
+promotion. See [MLA evidence](a64fx/glm5/strata-mla-softmax-native-20261002.json).
+
+KDA rebuilt-control ratios0.99982 decode /1.00093 prefill. Initial decode-only
+ratios0.99248/1.00041 and prefill-only0.99758/0.99529 are exact but unhelpful;
+both variant continues. Neither target met; capacity4096 remains promoted.
