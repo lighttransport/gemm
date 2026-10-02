@@ -2,6 +2,7 @@
 #define PIXAL3D_HV15_NATIVE_H
 #include <stddef.h>
 #include <stdint.h>
+#define HV15N_DEFAULT_MODEL_DIR "/mnt/nvme02/data/models/hv15"
 #ifdef __cplusplus
 extern "C" {
 #endif

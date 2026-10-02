@@ -62,7 +62,7 @@ Use a Python environment with `huggingface_hub`, `numpy`, and `safetensors`:
 
 ```sh
 tmp/qimg21-ref-venv/bin/python cuda/hunyuan_video15_native/stage_models.py \
-  --out tmp/hv15-native/model --reuse tmp/hunyuan-video15-model --transport aria2
+  --out /mnt/nvme02/data/models/hv15 --reuse tmp/hunyuan-video15-model --transport aria2
 ```
 
 Omit `--reuse` for fresh downloads; `--transport hub` is the default.
@@ -76,16 +76,24 @@ deduplicated ASCII/curved quotations, EOS, and the upstream 256-token limit.
 The public prompt interface follows the upstream plain glyph formatter; custom
 font/color control tokens are not an exposed generation option.
 
+The local model package is `/mnt/nvme02/data/models/hv15`, including quality
+I2V/T2V and Fast12 I2V checkpoints, shared encoders/VAE, tokenizer and pinned
+reference configurations. The C API, native runner, generator, vHuman adapter
+and bounded replay tool default to this directory. Use `--model DIR` (or
+`hv15n_config.model_dir`) to select another installation; on b550, use
+`--model /mnt/disk01/data/models/hv15`. The old `tmp/hv15-native/model` path is a
+compatibility symlink so the frozen running quality campaign can finish.
+
 ## Generate and publish
 
 ```sh
 python3 cuda/hunyuan_video15_native/generate.py \
-  --model tmp/hv15-native/model --out tmp/hv15-native/t2v-run \
+  --model /mnt/nvme02/data/models/hv15 --out tmp/hv15-native/t2v-run \
   --task t2v --preset quality --prompt 'A person smiles naturally.' \
   --dump-dir tmp/hv15-native/t2v-captures --allow-experimental
 
 python3 cuda/hunyuan_video15_native/vhuman_adapter.py generate \
-  --work tmp/vhuman --head HEAD_ID --model tmp/hv15-native/model \
+  --work tmp/vhuman --head HEAD_ID --model /mnt/nvme02/data/models/hv15 \
   --preset quality --prompt 'The same person smiles gently, fixed frontal camera.' \
   --seed 42 --allow-experimental
 ```
@@ -148,7 +156,7 @@ directory and a Torch-capable reference interpreter:
 
 ```sh
 python3 cuda/hunyuan_video15_native/validate_quality.py \
-  --model tmp/hv15-native/model --image tmp/hv15-native/prepared/input.png \
+  --model /mnt/nvme02/data/models/hv15 --image tmp/hv15-native/prepared/input.png \
   --out tmp/hv15-native/quality-campaign \
   --reference-python tmp/qimg21-ref-venv/bin/python
 ```

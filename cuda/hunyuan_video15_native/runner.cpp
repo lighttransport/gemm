@@ -51,6 +51,7 @@ int main(int argc, char **argv) {
             if (arg == "--help") {
                 std::cout << "Native repository HunyuanVideo-1.5 CUDA runner\n"
                              "--generate --model DIR --task i2v|t2v --preset quality|fast12 --prompt TEXT\n"
+                             "model default: " HV15N_DEFAULT_MODEL_DIR "\n"
                              "--image PREPARED.png --vision-pixels CHW.f32 (I2V only)\n"
                              "--width 480 --height 848 --frames 81 --seed N --out-dir EMPTY_DIR\n"
                              "--device 0 --vram-budget-mib 14336 --offload block\n"
@@ -92,7 +93,7 @@ int main(int argc, char **argv) {
         request.vision_pixels = text("--vision-pixels", nullptr);
         request.noise_file = text("--noise-file", nullptr);
         request.dump_dir = text("--dump-dir", nullptr);
-        config.model_dir = text("--model", nullptr);
+        config.model_dir = text("--model", config.model_dir);
         config.gemm = text("--gemm", config.gemm);
         config.gemm_fallback = text("--gemm-fallback", config.gemm_fallback);
         auto number = [&](const char *key, int &destination) {

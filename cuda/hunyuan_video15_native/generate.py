@@ -15,6 +15,7 @@ import time
 
 ROOT = Path(__file__).resolve().parents[2]
 RUNNER = ROOT / "tmp/hv15-native/build/hv15n"
+DEFAULT_MODEL = Path("/mnt/nvme02/data/models/hv15")
 UPSTREAM = "60783e704160023913bee78f0b47036d393d4dfa"
 
 
@@ -198,7 +199,7 @@ def package_frames(frames, out, *, cancel=None, log=None):
         image.save(out / "poster.png")
 
 
-def generate(*, model, out, prompt, task="i2v", preset="quality", image=None, negative_prompt="",
+def generate(*, model=DEFAULT_MODEL, out, prompt, task="i2v", preset="quality", image=None, negative_prompt="",
              seed=42, device=0, vram_budget_mib=14336, gemm="repo", gemm_fallback="cublas",
              runner=RUNNER, allow_experimental=False, keep_frames=False, noise_file=None,
              dump_dir=None, cancel=None, progress=None):
@@ -295,7 +296,8 @@ def generate(*, model, out, prompt, task="i2v", preset="quality", image=None, ne
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    for option in ("model", "out", "prompt"):
+    parser.add_argument("--model", default=str(DEFAULT_MODEL), help="model package directory (default: %(default)s)")
+    for option in ("out", "prompt"):
         parser.add_argument("--" + option, required=True)
     parser.add_argument("--task", choices=("i2v", "t2v"), default="i2v")
     parser.add_argument("--preset", choices=("quality", "fast12"), default="quality")

@@ -20,7 +20,7 @@ diffusers, safetensors, and the pinned upstream's dependencies. Set `TMPDIR` to
 an existing repository scratch directory before invoking it.
 
 ```sh
-MODEL=tmp/hv15-native/model
+MODEL=/mnt/nvme02/data/models/hv15
 ACTUAL=tmp/hv15-native/i2v-captures
 OUT=tmp/hv15-native/i2v-reference
 RUN=tmp/hv15-native/i2v-run/manifest.json
@@ -82,7 +82,7 @@ and the final numerical comparison are outside the generation timer.
 
 ```sh
 tmp/qimg21-ref-venv/bin/python ref/hunyuan_video15_native/benchmark.py \
-  --model tmp/hv15-native/model --out tmp/hv15-native/reference-performance \
+  --model /mnt/nvme02/data/models/hv15 --out tmp/hv15-native/reference-performance \
   --fast-native-run tmp/hv15-integration-review/full-repo-run \
   --fast-native-captures tmp/hv15-integration-review/full-repo-captures \
   --quality-native-run tmp/hv15-native/full-quality-i2v-v1 \

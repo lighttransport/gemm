@@ -11,7 +11,7 @@ import shutil
 import sys
 import threading
 import uuid
-from generate import ROOT, RUNNER, atomic_json, digest, generate, run_process
+from generate import ROOT, RUNNER, DEFAULT_MODEL, atomic_json, digest, generate, run_process
 
 sys.path.insert(0, str(ROOT))
 REVIEWS = ("identity", "expression", "camera", "visibility", "artifacts")
@@ -271,7 +271,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     commands = ap.add_subparsers(dest="command", required=True)
     gen = commands.add_parser("generate")
-    for key in ("work", "head", "model", "prompt"):
+    gen.add_argument("--model", default=str(DEFAULT_MODEL), help="model package directory (default: %(default)s)")
+    for key in ("work", "head", "prompt"):
         gen.add_argument("--" + key, required=True)
     gen.add_argument("--preset", choices=("quality", "fast12"), default="quality")
     gen.add_argument("--negative-prompt", default="")

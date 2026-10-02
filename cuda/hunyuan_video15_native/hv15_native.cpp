@@ -19,7 +19,7 @@ static int failure(char *error, size_t capacity, const std::string &message) {
 extern "C" {
 void hv15n_config_defaults(hv15n_config *c) {
     if (c)
-        *c = {nullptr, 0, 14336, "repo", "cublas"};
+        *c = {HV15N_DEFAULT_MODEL_DIR, 0, 14336, "repo", "cublas"};
 }
 void hv15n_request_defaults(hv15n_request *r) {
     if (r)

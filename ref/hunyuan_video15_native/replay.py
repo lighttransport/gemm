@@ -8,7 +8,7 @@ import time
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 import numpy as np
-from cuda.hunyuan_video15_native.generate import atomic_json, digest
+from cuda.hunyuan_video15_native.generate import DEFAULT_MODEL, atomic_json, digest
 
 
 def save(directory, name, array):
@@ -68,7 +68,7 @@ def main():
     p.add_argument('--fixture', type=Path, required=True)
     p.add_argument('--out', type=Path)
     p.add_argument('--actual', type=Path)
-    p.add_argument('--model', type=Path, default=ROOT / 'tmp/hv15-native/model')
+    p.add_argument('--model', type=Path, default=DEFAULT_MODEL)
     p.add_argument('--captures', type=Path, default=ROOT / 'tmp/hv15-native/reference-performance-v2/fast12/reference')
     p.add_argument('--upstream', type=Path, default=ROOT / 'tmp/hunyuan-video15-upstream')
     p.add_argument('--rows', type=int, default=34138)
