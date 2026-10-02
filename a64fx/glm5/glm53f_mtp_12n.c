@@ -45,11 +45,33 @@ static void mtp_norm(float*out,const float*x,const uint16_t*w){double ss=0;
     for(int i=0;i<MTP_H;i++)out[i]=x[i]*inv*glm53f_bf16_to_f32(w[i]);}
 
 glm53f_mtp_context_12n*glm53f_mtp_create_12n(const char*model,const char*routed,const char*shared,int capacity){glm53f_mtp_context_12n*c=calloc(1,sizeof(*c));glm53f_st_context*st;char name[128];if(!c)return NULL;MPI_Comm_rank(MPI_COMM_WORLD,&c->rank);MPI_Comm_size(MPI_COMM_WORLD,&c->ranks);if(c->ranks!=12||capacity<1)goto fail;c->row0=(int)((long long)MTP_H*c->rank/c->ranks);c->rows=(int)((long long)MTP_H*(c->rank+1)/c->ranks)-c->row0;st=glm53f_st_open(model);if(!st)goto fail;
-#define ALLOC_READ(F,N,Z,O) do{c->F=mtp_a256(Z);if(!c->F||glm53f_st_read(st,N,O,c->F,Z))goto fail_st;}while(0)
+#define ALLOC_READ(F,N,Z,O) do { \
+    c->F = mtp_a256(Z); \
+    if (!c->F) { \
+        fprintf(stderr, "GLM53F_MTP_CREATE_FAIL rank=%d phase=allocation tensor=%s bytes=%zu\n", \
+                c->rank, N, (size_t)(Z)); \
+        goto fail_st; \
+    } \
+    int read_rc = glm53f_st_read(st, N, O, c->F, Z); \
+    if (read_rc) { \
+        fprintf(stderr, "GLM53F_MTP_CREATE_FAIL rank=%d phase=read tensor=%s offset=%zu bytes=%zu rc=%d\n", \
+                c->rank, N, (size_t)(O), (size_t)(Z), read_rc); \
+        goto fail_st; \
+    } \
+} while (0)
     ALLOC_READ(enorm,"model.language_model.layers.45.enorm.weight",MTP_H*2,0);ALLOC_READ(hnorm,"model.language_model.layers.45.hnorm.weight",MTP_H*2,0);ALLOC_READ(input_norm,"model.language_model.layers.45.input_layernorm.weight",MTP_H*2,0);ALLOC_READ(post_norm,"model.language_model.layers.45.post_attention_layernorm.weight",MTP_H*2,0);snprintf(name,sizeof(name),"model.language_model.layers.45.eh_proj.weight");ALLOC_READ(eh,name,(size_t)c->rows*2*MTP_H*2,(size_t)c->row0*2*MTP_H*2);
 #undef ALLOC_READ
     glm53f_st_close(st);c->embedding=glm53f_embedding_create_12n(model);c->attention=glm53f_sparse_create_12n(model,45,capacity);c->moe=glm53f_moe_stage_create_12n(routed,shared,model,45,1);c->head=glm53f_target_head_create_with_norm_12n(model,"model.language_model.layers.45.shared_head.norm.weight");c->embed_streams=mtp_a256((size_t)MTP_STREAMS*MTP_H*4);c->pair=mtp_a256((size_t)2*MTP_H*4);c->fusion=mtp_a256(MTP_H*4);c->normalized=mtp_a256(MTP_H*4);c->sublayer=mtp_a256(MTP_H*4);c->head_streams=mtp_a256((size_t)MTP_STREAMS*MTP_H*4);if(!c->embedding||!c->attention||!c->moe||!c->head||!c->embed_streams||!c->pair||!c->fusion||!c->normalized||!c->sublayer||!c->head_streams)goto fail;return c;
-fail_st:glm53f_st_close(st);fail:glm53f_mtp_free_12n(c);return NULL;}
+fail_st:glm53f_st_close(st);
+fail:
+    fprintf(stderr, "GLM53F_MTP_CREATE_FAIL rank=%d capacity=%d ranks=%d enorm=%d hnorm=%d input_norm=%d post_norm=%d eh=%d embedding=%d attention=%d moe=%d head=%d buffers=%d/%d/%d/%d/%d/%d\n",
+            c->rank, capacity, c->ranks, !!c->enorm, !!c->hnorm, !!c->input_norm,
+            !!c->post_norm, !!c->eh, !!c->embedding, !!c->attention, !!c->moe,
+            !!c->head, !!c->embed_streams, !!c->pair, !!c->fusion,
+            !!c->normalized, !!c->sublayer, !!c->head_streams);
+    glm53f_mtp_free_12n(c);
+    return NULL;
+}
 
 static int mtp_run(glm53f_mtp_context_12n*c,int token,const float*hidden,int*draft,float*logit,float*draft_hidden,int cache_only){if(!c||!hidden||(!cache_only&&(!draft||!logit)))return-1;if(glm53f_embedding_streams_12n(c->embedding,token,c->embed_streams))return-1;
     /* Training shifts the token embedding by one position.  There is no

@@ -1,0 +1,48 @@
+{
+  "status": "Normalized MTP prompt8049 gate PASS; short128 state run fails during MTP context construction on rank4 before timing; no throughput or acceptance claim",
+  "allocation": 52085859,
+  "prompt_gate": [
+    "GLM53F_PREFILL_CHUNK_CHECK tokens=8049 reference_chunk=4096 candidate_chunk=4096 capacity=4096 compare_moe_layout=0 hidden_bit_mismatches=0 capture_hidden=1 prompt_hidden_bit_mismatches=0 state=BIT_EXACT first_token=624/624 min_MemAvailable_GiB=7.834778 PASS"
+  ],
+  "short_failure": [
+    "GLM53F_BENCH_CREATE_FAIL rank=4 phase=mtp context=0 workspace=1 hidden=1"
+  ],
+  "native_completed": [
+    "Layer45 bounded staging",
+    "896-case native controller",
+    "2051-position full/cache-only/rollback hiddenbitwise gate",
+    "8049-position prompt mean/finalstream/complete KDA/sparse state"
+  ],
+  "incomplete": [
+    "Short128 MTP decode/fullstate",
+    "8K MTP decode/fullstate",
+    "Fresh/rebuilt throughput controls and delivered-transition depth sweep",
+    "Independent confirmation and contextstress",
+    "Tensor/component constructor diagnostic retry"
+  ],
+  "artifacts": {
+    "prompt_checker": "candidate-mtp-v5",
+    "failed_benchmark": "candidate-mtp-v6",
+    "component_diagnostic": "candidate-mtp-v7",
+    "v6_benchmark_sha256": "305802c9c46d45ddc3f17c47bd391aceb07e74b9e8eb1c89b646369a0af385e4",
+    "v7_benchmark_sha256": "48f42109d53905515396c0cf8d7109bbe757364cdc6649d7b70cd32cdda418e1"
+  },
+  "evidence": {
+    "remote_directory": "~/work/gemm/glm53f-strata-20261001/tmp/strata-mtp-20261002",
+    "hashes": {
+      "mtp-prompt-hidden-mtp-normalized-hidden-gate-21059-2.176.0": "f2a143a9f1f4710d55fbe180aaeaf3f40fc0996b20da07305b4dcfe7cd64ad87",
+      "benchmark-mtp-normalized-short-state-gate-21463-2.182.4": "7158a274b6b1db61d0cbac1d6b349bab6bf1d3a1d77c823601850165f6e72eb7",
+      "state-campaign-v3.log": "83fe892412ac3b203ce6be81d0aef1ec086f2228ae2af0f446fe0c7073e02ff7",
+      "state-diagnostic-v6.log": "69a47e24196ab6a6cac36820b2a8a139643fa8fc79b886d2f461f8eb8da38b01",
+      "build-diagnostic-v6.log": "371a0e67dbf5e0f973fdaabecb480c0adf51a19ebcd30a5f31f53613ca235efe",
+      "build-diagnostic-v7.log": "47c88d5f9e17f2e27dbac6d44d289af3bfd71772d904deaf30d4be4f7730637a"
+    },
+    "diagnostic_source_hashes": {
+      "a64fx/glm5/bench_glm53f_run_12n.c": "ac7b4e56f08bbc10cc4006b173c7952194b1c5b44ec533cf6a225e0dc9fd131a",
+      "a64fx/glm5/glm53f_mtp_12n.c": "cca5d26e4e2f80ca81b8009ecf4b0a0c8abd8a17b60f438cb1f93a8c9d36dc49"
+    }
+  },
+  "next_allocation": 52097252,
+  "targets_met": false,
+  "promoted": false
+}

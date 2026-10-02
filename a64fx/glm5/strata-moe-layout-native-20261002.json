@@ -987,7 +987,7 @@
       "build_log_sha256": "98a76dabb0a4838b157cec6affac7d112f0ecf2b9093e2c8cf9222f2d8466467",
       "prompt_gate": "GLM53F_PREFILL_CHUNK_CHECK tokens=8049 reference_chunk=4096 candidate_chunk=4096 capacity=4096 compare_moe_layout=1 hidden_bit_mismatches=0 capture_hidden=1 prompt_hidden_bit_mismatches=0 state=BIT_EXACT first_token=624/624 min_MemAvailable_GiB=7.843750 PASS",
       "prompt_gate_log_sha256": "93283067340ae313ed06e90583cdfad71af95d65589039ab3acb025d53d767d7",
-      "full_model_performance": "Active; fresh frozen/rebuilt control and padded trials; not promoted"
+      "full_model_performance": "Complete exact8K controls/five-trial confirmation PASS; decode ratio0.997335/prefill1.000427; no promotion; see strata-moe-layout-full-20261002.json"
     }
   }
 }

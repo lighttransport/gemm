@@ -1,11 +1,12 @@
 # Resume: GLM53F Strata-inspired optimization, 12 A64FX nodes
 
-Updated 2026-10-02 17:43 JST. Capacity4096 is fully qualified and promoted:
+Updated 2026-10-02 18:23 JST. Capacity4096 is fully qualified and promoted:
 35.462134 decode /412.273634 prefill tok/s, +10.6% prefill against its fresh
 control. Q8 and lookup complete without promotion. Opt-in MoE padding is
-implemented and in strict full-model qualification; mHC follows serially.
-Normalized MTP stopped on a prompt-mean diagnostic discrepancy and needs the
-corrected checker. Neither 100/2000 target is met.
+implemented; its exact full-model gates pass, but confirmation rejects promotion.
+Corrected MTP prompt checks pass, but the short run exposes rank4 context
+construction failure. Fresh PJM52097252 is restaging; mHC qualification follows.
+Normalized MTP needs tensor/component diagnosis before decode qualification. Neither 100/2000 target is met.
 
 Previous campaign: TP12 implementation, native validation and
 short/8K/synthetic 32K qualification complete. All new paths remain opt-in.
@@ -72,12 +73,14 @@ Frozen update-v1 SHA `4c09c011af39a9b294d8a13dd968ef2071cb0251e7260ef6c72c1233b5
 The full8049-position prompt gate passes zero mean/final-stream mismatches
 and complete bit-exact KDA/sparse state, with minimum headroom7.844 GiB.
 
-**Live layout PID19989**, `tmp/strata-moe-layout-20261002/`
+**Completed layout PID19989**, `tmp/strata-moe-layout-20261002/`
 `campaign-resume-v3.{sh,log}` / `campaign-v3.py`: fresh frozen control,
 rebuilt-tight control and padded three-trial timings, then qualifying independent
 confirmation/context checks. Start guard17:45; new-run guard18:00 JST.
-No layout throughput promotion is claimed. Inspect live processes before any
-resume; never duplicate or overlap timed MPI work.
+Independent confirmation is 34.979754 /410.735112 vs35.073216 /410.559835,
+ratios0.997335 /1.000427. All IDs exact; no promotion and no contextstress.
+`MOE_LAYOUT_CAMPAIGN_PASS` observed18:00; tight remains selected. See
+[full layout record](a64fx/glm5/strata-moe-layout-full-20261002.json).
 
 Initial layout/mHC launches stopped on missing topology helpers. The verified
 capacity helper was copied into their isolated builds (SHA
@@ -89,29 +92,40 @@ reference loop eliminated all8049-position discrepancies in the layout gate;
 strict memcmp remains. Old logs and traces are preserved.
 
 Normalized MTP layer45 staging passes, as do 896 native controller cases and
-2051-position full/cache-only/rollback hidden-bit checks. Its own corrected
-prompt checker still needs a rerun, followed by short/8K state checks and timed
-depths. **candidate-mtp-v5** retains v3 math/v4 benchmark, with checker SHA
+2051-position full/cache-only/rollback hidden-bit checks. Its corrected
+prompt checker now passes all8049-position means, final streams and complete
+state with zero bit mismatches (minimum7.835 GiB); short/8K state checks are
+next, followed by independent timed controls/depths. **candidate-mtp-v5** retains v3 math/v4 benchmark, with checker SHA
 `6367bc1999ea2fc7a6cf63799f4e77305f4c08d559c10f9ec6f0012b07bef618`.
 Benchmark SHA `c6c1a6381ccb30adbdf186c67d09f9f44b45c2aa79afee73dc560b2b7efd9040`.
 Frozen source-v3 SHA `337e92cc60624c75078f78f3d4feea6693c2fa846215f408565b84cdda21e618`.
 Stages `/local/glm53f-mtp-{routed,shared}-52085859` already exist; do not restage.
-`campaign-v2.log` failed; no MTP campaign is active. Resume with new output
-paths after the live queue exits. Include every teacher-forcing cost in prefill
+`campaign-v2.log` failed. **Completed MTP state campaign PID20602 (failed short construction)**,
+`state-campaign-v3.{sh,py,log}`, uses new `state-results-v3/` outputs. It checks
+corrected prompt means, short128 and8K depth4-always full decode state with
+one timed128-transition trial each. This bounded state campaign is diagnostic,
+not promotion; guards18:07 start/18:08 new-run, ahead of18:17 expiry. The short128 run aborts before timing. Diagnostic retry PID21455 also exits
+with `GLM53F_BENCH_CREATE_FAIL rank=4 phase=mtp context=0 workspace=1 hidden=1`.
+No IDs/acceptance/throughput result exists. Candidate-mtp-v7 adds tensor-read /
+component-pointer failure logs; its cross-build passes. Benchmark SHA
+`48f42109d53905515396c0cf8d7109bbe757364cdc6649d7b70cd32cdda418e1`.
+Next job must diagnose construction before short/8K state and multitrial
+qualification. See [MTP progress](a64fx/glm5/strata-mtp-progress-20261002.json). Include every teacher-forcing cost in prefill
 and count only delivered target transitions in decode. No MTP throughput or
 acceptance result exists yet. See [native MTP record](a64fx/glm5/strata-mtp-native-20261002.json).
 
-**Live mHC resume PID20136** follows layout PID19989 serially:
-`tmp/strata-mhc-sync-20261002/campaign-resume-v2.{sh,pid,log}`. Artifact
+**Deferred mHC resume PID20607 (exit75)** followed MTP PID20602 serially:
+`tmp/strata-mhc-sync-20261002/campaign-resume-v3.{sh,pid,log}`. Artifact
 **candidate-mhc-sync-v4** has passed cross-build and all14 fast/conservative
 native configurations (384 chained calls each), separate PJM52089999. Synthetic
 fast47/persistent47.444470→46.666629 µs is +1.67%, not full-model tok/s.
 Full-model128-position exact-state gate precedes fresh/rebuilt controls and
-fused-sync timings. Start guard17:55; new-run guard18:00. Benchmark SHA
+fused-sync timings. Start/new-run guard18:00; likely deferred after MTP. Previous waiting
+PID20136 was stopped before any MPI to prioritize bounded MTP state checks. Benchmark SHA
 `50fa19bbbca7a2f6a92ce5d870ce41735c3b613055bbd08cb101e0df431e1a32`.
 See [native mHC record](a64fx/glm5/strata-mhc-native-20261002.json).
 
-Current allocation **PJM52085859**,12 nodes2×3×2, requested normal2GHz/eco0,
+Previous allocation **PJM52085859**,12 nodes2×3×2, requested normal2GHz/eco0,
 starts12:17:07 and expires18:17:07 JST. Host`l31-4004b`; local tmux socket
 `tmp/tmux-glm53f`, session`glm53f-strata-next3`; bridge ports42446→32446→21264.
 Isolated remote repo`~/work/gemm/glm53f-strata-20261001`; helper
@@ -402,3 +416,16 @@ collectives, four-stream handoffs and full-state exact gates. Single dependent
 decode latency includes every stage; do not assume 3× pipeline speedup.
 
 No push authorized. Preserve unrelated untracked q38fn and tmp artifacts.
+
+Current allocation is **PJM52097252**, same12 nodes2×3×2, normal2GHz/eco0,
+starts18:18 JST and expires about00:18 JST October3. Host`c30-7008c`; tmux
+`glm53f-strata-next4`; same42446→32446→21264 ports. Fresh bridge session obtained;
+old ID archived as `tmp/bash-http-glm53f-strata/session-52085859-final`.
+**Target/MTP staging is active, PID134**, see
+`tmp/strata-next-20261002-1818/{stage.pid,driver.log,stage.log,mtp-stage.log}`.
+It uses immutable candidate-v15 and validates every rank sentinel before
+staging only layer45. All `/local` prefixes use newjob52097252. Do not overlap
+MPI/build/native timing with stage. Require `STRATA_NEXT4_STAGE_PASS`; inspect
+owned processes before resuming constructor diagnostic/mHC qualification.
+No overlap of12-node allocations. Old52085859 has expired and all its queues
+have exited. Preserve its completed reports and failed diagnostic traces.

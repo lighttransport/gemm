@@ -45,7 +45,15 @@ static double elapsed(double begin) {
     MPI_Allreduce(&dt, &maximum, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
     return maximum;
 }
-static void check(int rc) { if (rc) MPI_Abort(MPI_COMM_WORLD, 2); }
+static void check_at(int rc, int line) {
+    if (rc) {
+        int rank;
+        MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+        fprintf(stderr, "GLM53F_BENCH_CHECK_FAIL rank=%d line=%d rc=%d\n", rank, line, rc);
+        MPI_Abort(MPI_COMM_WORLD, 2);
+    }
+}
+#define check(rc) check_at((rc), __LINE__)
 
 struct memory_guard { long minimum; int transitions, last_interval; };
 static void guard_decode(void *context, int completed) {
@@ -175,7 +183,10 @@ int main(int argc, char **argv) {
     double load = glm53f_clock();
     glm53f_target_model_12n *m = glm53f_target_model_create_12n(
         argv[1], argv[2], argv[3], count + transitions + 1);
-    if (!m) MPI_Abort(MPI_COMM_WORLD, 2);
+    if (!m) {
+        fprintf(stderr, "GLM53F_BENCH_CREATE_FAIL rank=%d phase=target\n", rank);
+        MPI_Abort(MPI_COMM_WORLD, 2);
+    }
     check(glm53f_target_model_configure_prefill_12n(m, &config));
     glm53f_mtp_context_12n *mtp = NULL;
     glm53f_mtp_spec_workspace_12n *mtp_workspace = NULL;
@@ -195,14 +206,22 @@ int main(int argc, char **argv) {
         free(saved_requirement);
         mtp_workspace = glm53f_mtp_spec_workspace_create_12n(m);
         prompt_hidden = malloc((size_t)chunk * 4096 * sizeof(float));
-        if (!mtp || !mtp_workspace || !prompt_hidden) MPI_Abort(MPI_COMM_WORLD, 2);
+        if (!mtp || !mtp_workspace || !prompt_hidden) {
+            fprintf(stderr, "GLM53F_BENCH_CREATE_FAIL rank=%d phase=mtp context=%d workspace=%d hidden=%d\n",
+                    rank, !!mtp, !!mtp_workspace, !!prompt_hidden);
+            MPI_Abort(MPI_COMM_WORLD, 2);
+        }
     }
     load = elapsed(load);
     glm53f_target_snapshot_12n *empty = glm53f_target_snapshot_create_12n(m);
     glm53f_target_snapshot_12n *primed = glm53f_target_snapshot_create_12n(m);
     int *reference = malloc((size_t)(transitions + 1) * sizeof(int));
     int *ids = malloc((size_t)(transitions + 1) * sizeof(int));
-    if (!empty || !primed || !reference || !ids) MPI_Abort(MPI_COMM_WORLD, 2);
+    if (!empty || !primed || !reference || !ids) {
+        fprintf(stderr, "GLM53F_BENCH_CREATE_FAIL rank=%d phase=snapshot empty=%d primed=%d reference=%d ids=%d\n",
+                rank, !!empty, !!primed, !!reference, !!ids);
+        MPI_Abort(MPI_COMM_WORLD, 2);
+    }
     check(glm53f_target_snapshot_save_12n(m, empty));
     glm53f_lookup_workspace_12n *lookup = speculation == 1 ?
         glm53f_lookup_workspace_create_12n(m, count + transitions + 1) : NULL;

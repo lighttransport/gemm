@@ -191,6 +191,7 @@ The expert scheduler, scale/minimum accumulation and SwiGLU quantization stay
 as in the existing native path. This option affects grouped prefill; scalar
 decode and grouped verification retain their kernels. Benchmark CONFIG reports
 `moe_gu_padding`. Native expert-chain diagnostics show about 2% at 47 threads;
-full-model throughput/state qualification is pending. Use
+the full 8049-position state gate passes, but five-trial full-model prefill
+improvement is only 0.04%, below promotion. Keep tight in the qualified recipe. Use
 `--compare-moe-prefill-layout --capture-hidden` with the prompt-endpoint checker
 and equal reference/candidate chunk sizes to isolate the layout change.

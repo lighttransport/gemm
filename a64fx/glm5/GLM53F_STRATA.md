@@ -243,8 +243,12 @@ confirmation and context gates. The first checker used a serial reference
 mean loop that disagreed with the export under FCC fast math despite exact
 final streams/state. A diagnostic-only revision uses the export's flattened
 OpenMP loop structure; it retains strict memcmp. The revised checker passes all 8049 prompt means, final streams and complete
-state with zero bit mismatches (7.844 GiB minimum sampled headroom). Fresh
-control/rebuilt/padded timing is active; no layout promotion is claimed.
+state with zero bit mismatches (7.844 GiB minimum sampled headroom). Independent five-trial
+confirmation measures 34.979754 decode /410.735112 prefill tok/s versus
+35.073216 /410.559835 for a fresh control: −0.27% /+0.04%. All 257 IDs match.
+The initial three-trial +0.77% prefill gain does not survive confirmation, so
+tight layout remains selected. Context stress is not run for this rejected
+candidate. See [full-model layout record](strata-moe-layout-full-20261002.json).
 
 ## Batched-prefill MTP candidate (October 2)
 
@@ -290,8 +294,12 @@ Immutable native artifacts retain `candidate-mtp-v3` math and the benchmark
 from `candidate-mtp-v4`. Layer45 staging, the 896-case native controller and
 2051-position full/cache-only/rollback gates pass. The prompt mean diagnostic
 stopped with exact final streams/state but mismatched per-position means;
-`candidate-mtp-v5` contains the revised checker described above. Full-model
-qualification must resume with new outputs after the live serial queue.
+`candidate-mtp-v5` contains the revised checker described above. The revised prompt checker now passes all 8049 means, final streams and
+complete state with zero bit mismatches (minimum7.835 GiB). The short128 state run then fails during rank4 MTP context creation before
+timing; a benchmark diagnostic retry confirms context=0 with workspace and
+hidden allocation successful. Tensor/component diagnostics are cross-built
+in candidate-mtp-v7 for the next allocation. No MTP acceptance or throughput
+result is claimed. See [MTP progress](strata-mtp-progress-20261002.json).
 There is **no new full-model MTP throughput or promotion result yet**.
 `tmp/strata-mtp-20261002/` contains frozen source hashes, build logs and
 campaign scripts; `resume-strata.md` records the current queue state.
