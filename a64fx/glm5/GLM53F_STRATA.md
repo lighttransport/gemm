@@ -88,6 +88,11 @@ warm 2046/8049, including rollback; selector gates cover warm 2046/2051
 prefill 32 and warm 8049 decode 4. All comparisons require memcmp equality
 on every rank. The benchmark records its compiled panel width and sizes
 collective reservations for both output and packed-score payloads.
+The normal generation/prefill entrypoints share the same bounded integer
+reservation helper. Native normal generation with 8049 prompt IDs matches
+all 32 generated IDs between panels 32 and 47; local capacity/overflow tests
+pass for 32/47/48/64. The normal runner retains its existing scalar final
+prompt token; its gate is separate from resident benchmark throughput.
 
 Implementation commit `c461079c` matches the frozen runtime source archives.
 The committed [kernel qualification record](strata-kernel-validation-20261002.json)

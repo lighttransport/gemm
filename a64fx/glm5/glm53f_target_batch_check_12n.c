@@ -32,7 +32,9 @@ int main(int argc, char **argv) {
     const char *topology = getenv("TOFU_TOPO_PATH");
     if (getenv("GLM53F_UTOFU") &&
             glm53f_collective_init_12n(topology,
-                (config.mode == GLM53F_PREFILL_FAST ? 32 : TOKENS) * 4096))
+                (config.mode == GLM53F_PREFILL_FAST
+                    ? glm53f_prefill_collective_count(wide_check ? 33 : TOKENS + 1, 4096)
+                    : TOKENS * 4096)))
         MPI_Abort(MPI_COMM_WORLD, 2);
     glm53f_target_model_12n *m = glm53f_target_model_create_12n(
         argv[1], argv[2], argv[3], wide_check ? 33 : TOKENS + 1);

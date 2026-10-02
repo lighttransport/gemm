@@ -10,6 +10,14 @@ static int parse(const char *key, const char *value, glm53f_prefill_config *c) {
 int main(void) {
     glm53f_prefill_config c = {GLM53F_PREFILL_LEGACY, 32, GLM53F_PREFILL_FAST_DEFAULT, NULL, 0};
     int failed = 0;
+    failed |= glm53f_prefill_collective_count(8049, 4096) != GLM53F_PREFILL_ATTN_TOKENS * 4096;
+    failed |= glm53f_prefill_collective_count(16387, 4096) != GLM53F_PREFILL_ATTN_TOKENS * 4096;
+    failed |= glm53f_prefill_collective_count(16388, 4096) != GLM53F_PREFILL_ATTN_TOKENS * 4097;
+    failed |= glm53f_prefill_collective_count(32196, 4096) != GLM53F_PREFILL_ATTN_TOKENS * 8049;
+    failed |= glm53f_prefill_collective_count(-1, 4096) != -1;
+    failed |= glm53f_prefill_collective_count(0, 0) != -1;
+    failed |= glm53f_prefill_collective_count(INT_MAX, 4096) != -1;
+    failed |= glm53f_prefill_collective_count(0, INT_MAX) != -1;
     failed |= parse("--prefill-mode", "v5", &c) != 1 || c.mode != GLM53F_PREFILL_V5;
     failed |= parse("--prefill-mode", "fast", &c) != 1 || c.mode != GLM53F_PREFILL_FAST;
     failed |= parse("--prefill-mode", "unknown", &c) != -1;

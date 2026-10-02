@@ -186,14 +186,14 @@ int main(int argc, char **argv) {
         if (file) fclose(file);
     }
     MPI_Bcast(input, positions, MPI_INT, 0, MPI_COMM_WORLD);
-    /* The outer prompt tile is consumed by four-position arithmetic panels;
-     * no collective carries the complete tile.  Register only the largest
-     * actual payload, avoiding a needlessly large uTofu region at chunk 32. */
+    /* Reserve the output panels and packed pool scores, rather than the
+     * complete outer prompt tile. Legacy arithmetic uses four positions. */
     int collective_tokens = sweep || chunk_sweep ? 4 : chunk < 4 ? chunk : 4;
-    if (config.mode == GLM53F_PREFILL_FAST) collective_tokens = 32;
+    int collective_count = config.mode == GLM53F_PREFILL_FAST
+        ? glm53f_prefill_collective_count(positions, 4096) : collective_tokens * 4096;
     if (getenv("GLM53F_UTOFU") &&
         glm53f_collective_init_12n(getenv("TOFU_TOPO_PATH"),
-                                  collective_tokens * 4096))
+                                  collective_count))
         MPI_Abort(MPI_COMM_WORLD, 2);
     glm53f_target_model_12n *m = glm53f_target_model_create_12n(
         argv[1], argv[2], argv[3], positions + (qualify_prefix ? 256 : 1));

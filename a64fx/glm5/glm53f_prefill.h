@@ -2,6 +2,7 @@
 #define GLM53F_PREFILL_H
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 #include "glm53f_runtime.h"
 /* The outer layer tile is independent of verification snapshots, arithmetic
  * panels, and collective payloads. Attention scratch is bounded at build time. */
@@ -14,6 +15,14 @@
 #endif
 enum { GLM53F_PREFILL_MAX_TOKENS = 512, GLM53F_PREFILL_V5_TOKENS = 256,
        GLM53F_PREFILL_ATTN_TOKENS = GLM53F_PREFILL_ATTN_PANEL };
+/* Output panels and packed pool scores share the collective reservation. */
+static inline int glm53f_prefill_collective_count(int positions, int hidden) {
+    if (positions < 0 || hidden < 1) return -1;
+    int count = positions / 4;
+    if (count < hidden) count = hidden;
+    if (count > INT_MAX / GLM53F_PREFILL_ATTN_TOKENS) return -1;
+    return GLM53F_PREFILL_ATTN_TOKENS * count;
+}
 enum { GLM53F_PREFILL_LEGACY = 0, GLM53F_PREFILL_V5 = 1, GLM53F_PREFILL_FAST = 2 };
 enum { GLM53F_PREFILL_COMM = 1, GLM53F_PREFILL_RECURRENCE = 2,
        GLM53F_PREFILL_GEMM = 4, GLM53F_PREFILL_EXPERT16 = 8,

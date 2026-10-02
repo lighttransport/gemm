@@ -202,7 +202,16 @@
     "panels/stress-panel47.ids": "6b179961fe8f21a03cec1d2ff9e6688a2e3e90e980bb8da2d06570576a7240b0",
     "panels/stress-panel47.log": "824b3ff763c2e52009f373bafce9ccc2bd097962c566bc0571554f412d008d66",
     "panels/stress.json": "49cb5d7af5cf5e277cb09e85144471bc87a36bfd5c594e88a197ecb25b4ce651",
-    "panels/waiter-8380.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    "panels/waiter-8380.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "runner/preflight-runner-panel47.137.0": "ef925696e0cc43e67f60714bc54fa9b8d9ce36677fc5ac9a2a905fb02f6f6abe",
+    "runner/preflight-runner-panel32.134.0": "ef925696e0cc43e67f60714bc54fa9b8d9ce36677fc5ac9a2a905fb02f6f6abe",
+    "runner/panel-runner-check.log": "33e07023908d76c829e5015dd5d3fa0c494cc3a116188d435af79bc069684a94",
+    "runner/panel32.ids": "e530811b6e456763642e3f96b9989c61c56ef2e3a72df6be3195162693dc5754",
+    "runner/panel32.log": "6ba54e9c04eab34383cf991bc30f6212bcae362e19ffdfd9c6b42fb5c964f9d8",
+    "runner/panel47.log": "c014bce31da8bf0bc2216e44cadc4b690101a86db6a0b083e7f078d7b341d8ef",
+    "runner/generate-runner-panel32.136.0": "c1ae3d0683959bbdb43767c264e4427eefc7b2fe6f73d046c0ead815a8fa8d22",
+    "runner/panel47.ids": "e530811b6e456763642e3f96b9989c61c56ef2e3a72df6be3195162693dc5754",
+    "runner/generate-runner-panel47.139.0": "654f8476e6886d5c94f03a312b09f875658c9027f8b33edd4202b78126302b01"
   },
   "source_archives": {
     "glm53f-cache-v3-update.tar.gz": "dd5397015c0a1ce40196b01cd526314c755aedefa955ae35443f3f9b541a1de0",
@@ -212,7 +221,8 @@
     "glm53f-values-update.tar.gz": "fd08b0d06c5b383f27cb2ea04299dc2cc6da8b9d2c2b6f67d9285e329f3e0a65",
     "glm53f-replicated-index-update.tar.gz": "d55b74ce4f1d91f293d009f153b484f1a8942525a659769804ad3e6a99891c57",
     "glm53f-prefill-panels-update.tar.gz": "f62cb726c17233e957801a5295edbbd0b681f42e9b29eafd603bf246ac4cc713",
-    "glm53f-selector-update.tar.gz": "5623a555c39391af84ab5896399f406430a87f53ae8319e69ed1a1a7df7288bf"
+    "glm53f-selector-update.tar.gz": "5623a555c39391af84ab5896399f406430a87f53ae8319e69ed1a1a7df7288bf",
+    "glm53f-panel-runner-reservation-fix.tar.gz": "b0d96f153ab96d230bcd53eb5241d360e23140ec352ed2534b6f0c7e16201b36"
   },
   "rejected_runtime_experiments": [
     "Wider mHC tiles: native probes slower; implementation removed",
@@ -1122,5 +1132,41 @@
     "complete_output_ids_equal": true,
     "target_met": false
   },
-  "latest_qualified_candidate": "candidate-panel47-v1"
+  "latest_qualified_candidate": "candidate-panel47-v1",
+  "entrypoint_reservation_fix": {
+    "status": "NATIVE_NORMAL_GENERATION_PASS",
+    "scope": "Shared bounded collective reservation for benchmark, normal generation, prefill driver and diagnostic checkers; preserves the qualified benchmark sizes and kernels",
+    "normal_generation_prompt_tokens": 8049,
+    "normal_generation_ids": 32,
+    "panel32_vs47_ids_equal": true,
+    "native_config_test_panels": [
+      32,
+      47
+    ],
+    "local_config_test_panels": [
+      32,
+      47,
+      48,
+      64
+    ],
+    "capacity_bounds": [
+      "8K output floor",
+      "16K pool boundary",
+      "synthetic32196 pool payload",
+      "negative/zero invalid inputs",
+      "INT_MAX overflow"
+    ],
+    "native_syntax_checked_entrypoints": [
+      "glm53f_prefill_12n",
+      "glm53f_target_batch_check_12n",
+      "glm53f_sparse_batch_check",
+      "bench_glm53f_run_12n"
+    ],
+    "native_runner_binaries": {
+      "32": "0f379bf2304c3e6962e446a8b9329aa19582edf68a5215288b3be46468397b2d",
+      "47": "e011a5f36b9c9a6351b39c2d6adb8c3a2cda3f8a534872902378a3cb694a0ed0"
+    },
+    "source_scope": "8e99c023 + integer reservation correction; prior candidate-panel47-v1 throughput binary unchanged",
+    "performance_scope": "Normal runner check is correctness evidence, not a new resident benchmark throughput result; it retains the existing scalar final-prompt-token convention"
+  }
 }

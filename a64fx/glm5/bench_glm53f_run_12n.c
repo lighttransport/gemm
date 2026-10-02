@@ -149,9 +149,7 @@ int main(int argc, char **argv) {
      * pooled scores. The output projection's 32*4096 reservation alone only
      * covers contexts through 16K. Keep the original reservation for short
      * prompts, and reserve the packed selector reduction for longer ones. */
-    int collective_count = GLM53F_PREFILL_ATTN_TOKENS * (count / 4);
-    if (collective_count < GLM53F_PREFILL_ATTN_TOKENS * 4096)
-        collective_count = GLM53F_PREFILL_ATTN_TOKENS * 4096;
+    int collective_count = glm53f_prefill_collective_count(count, 4096);
     check(glm53f_collective_init_12n(getenv("TOFU_TOPO_PATH"), collective_count));
     check(glm53f_collective_prefill_algorithm_12n(config.collective));
     double load = glm53f_clock();

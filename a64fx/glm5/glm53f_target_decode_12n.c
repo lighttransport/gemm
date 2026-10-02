@@ -1141,7 +1141,13 @@ int main(int argc, char **argv) {
         MPI_Abort(MPI_COMM_WORLD, 2);
     if (generate && capacity < prompt_count + steps) capacity = prompt_count + steps;
     if(capacity<steps)MPI_Abort(MPI_COMM_WORLD,2);
-    if(getenv("GLM53F_UTOFU")){const char*topo=getenv("TOFU_TOPO_PATH");if(!topo)topo="../utofu-tests/tofu_topo.txt";if(glm53f_collective_init_12n(topo,(prefill_config.mode == GLM53F_PREFILL_FAST ? 32 : 8)*HIDDEN))MPI_Abort(MPI_COMM_WORLD,2);}
+    if (getenv("GLM53F_UTOFU")) {
+        const char *topo = getenv("TOFU_TOPO_PATH");
+        if (!topo) topo = "../utofu-tests/tofu_topo.txt";
+        int count = prefill_config.mode == GLM53F_PREFILL_FAST
+            ? glm53f_prefill_collective_count(capacity, HIDDEN) : 8 * HIDDEN;
+        if (glm53f_collective_init_12n(topo, count)) MPI_Abort(MPI_COMM_WORLD, 2);
+    }
     double load_begin = glm53f_clock();
     model=target_model_create_with_kda(argv[1],argv[2],argv[3],capacity,int8_kda,latent_bf16);
     if(!model)MPI_Abort(MPI_COMM_WORLD,2);

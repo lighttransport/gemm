@@ -47,7 +47,7 @@ int main(int argc, char **argv) {
         provided < MPI_THREAD_SERIALIZED || (async_check && !prefill))
         MPI_Abort(MPI_COMM_WORLD, 2);
     if (getenv("GLM53F_UTOFU") && glm53f_collective_init_12n(
-            getenv("TOFU_TOPO_PATH"), GLM53F_PREFILL_ATTN_TOKENS * HIDDEN)) MPI_Abort(MPI_COMM_WORLD, 2);
+            getenv("TOFU_TOPO_PATH"), glm53f_prefill_collective_count(warm + tokens, HIDDEN))) MPI_Abort(MPI_COMM_WORLD, 2);
     if (async_check && glm53f_collective_prefill_algorithm_12n(5)) MPI_Abort(MPI_COMM_WORLD, 2);
     int compare_selector = getenv("GLM53F_SPARSE_COMPARE_SELECTOR") != NULL;
     int compare_cp = getenv("GLM53F_SPARSE_COMPARE_CP") != NULL;

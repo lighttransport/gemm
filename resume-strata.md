@@ -1,6 +1,6 @@
 # Resume: GLM53F Strata-inspired optimization, 12 A64FX nodes
 
-Updated 2026-10-02 09:23 JST. All cache/selector/panel qualifications complete; no campaign or native unit job remains running.
+Updated 2026-10-02 09:23 JST. All benchmark and normal-runner qualifications complete; no inference or validation job remains running.
 
 Previous campaign: TP12 implementation, native validation and
 short/8K/synthetic 32K qualification complete. All new paths remain opt-in.
@@ -68,6 +68,17 @@ See `a64fx/glm5/GLM53F_STRATA.md` for implementation, gates and commands.
   `tmp/strata-panels-20261002/campaign.log`; `PANEL_QUALIFICATIONS_PASS` /
   `PANEL_CAMPAIGN_PASS`. Immutable builds candidate-panel32-v1 /
   candidate-panel47-v1 / candidate-panel64-v1 pass. Panel 47 selected.
+- Normal-runner reservation follow-up **PID 13836 completed**, log
+  `tmp/panel-runner-check.log`, `PANEL_RUNNER_CHECK_PASS`. Shared integer
+  reservation helper covers compiled output panels and packed pool scores
+  in all fast-prefill entrypoints; invalid/overflow counts are rejected.
+  Config tests pass locally at 32/47/48/64 and natively at 32/47. Native normal
+  generation panel 32-vs47 matches all 32 generated IDs after 8049 prompt IDs.
+  This separate gate retains the normal runner's scalar final prompt token;
+  the resident benchmark throughput binary remains unchanged.
+  Normal runner bin `a64fx/glm5/build/candidate-panel47-runner-v1/`.
+  Evidence `tmp/glm53f-strata-evidence-20261002/runner/`; frozen correction
+  `tmp/glm53f-panel-runner-reservation-fix.tar.gz`.
 - Implementation **c461079c**, 13 files, 276+/47-. Opt-in bounded selector
   `--pool-selector partition4k` uses 513..4096 pools, exact original ordering,
   dead score-reduction scratch and original heap fallback. Default heap and
