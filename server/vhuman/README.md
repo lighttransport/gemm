@@ -747,9 +747,22 @@ Further dependency removal (items 6, 9, 10 and 12):
 | Motion evaluation | Native GRU by default; Torch full-sequence comparison only with `--reference-parity` |
 | Identity reference creation | Native FLUX.2 BF16/repository-GEMM neutral generation exercised on5060Ti; quality/full conditioning parity open; expressions still use explicit `torch-reference` |
 
-MediaPipe landmark detection and photographic-reference conditioning remain
-runtime ports to complete. Manual observation files
-already avoid MediaPipe for reconstruction. Registration/optimization, training
+Photo and video landmark/blendshape inference now uses the native C++ executor
+and repository AVX2 GEMM. The pinned MediaPipe task is converted with NumPy and
+the standard library; OpenCV supplies image sampling, with no TFLite/MediaPipe
+runtime. All13 expression references passed against MediaPipe IMAGE mode:
+worst landmark error0.077pixels. Six independent network-tensor checks passed,
+as did rotated/wide images and blank/two-face detection. Video observation uses
+independent per-frame inference; it does not reproduce MediaPipe's VIDEO-mode
+tracking state. The rig optimizer retains temporal regularization.
+Build with `make -C cpu/vhuman libvhuman_landmarks.so`; setup_face_video.sh also
+builds this library. Run `python -m unittest server.vhuman.test_native_landmarks`
+and the optional oracle `ref/vhuman/verify_landmarks.py` (requires ai-edge-litert
+and MediaPipe only in the reference environment). Reports are under
+`tmp/vhuman-landmarks/{parity,expression-parity,geometry-parity}`.
+
+Photographic-reference conditioning remains a runtime port to complete.
+Registration/optimization, training
 and checkpoint export may still use Torch. The live speech/GRU/rig/render/record
 path ran successfully on RTX 5060 Ti without Torch or ONNX installed. The new
 Hunyuan backend still needs full model/pipeline validation; its repository-only

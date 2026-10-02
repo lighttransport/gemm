@@ -91,22 +91,20 @@ def observe(image, camera=None, task=None):
     task = Path(task) if task else MODEL_CACHE / 'face_landmarker.task'
     if not task.is_file() or sha256(task) != TASK_SHA256:
         raise ValueError('verified MediaPipe task missing; run setup_face_video.sh or provide manual observations')
-    import mediapipe as mp
-    from mediapipe.tasks.python import vision
+    from ..native_landmarks import FaceLandmarker
     image = Path(image).resolve()
-    options = vision.FaceLandmarkerOptions(base_options=mp.tasks.BaseOptions(model_asset_path=str(task)),
-                                           running_mode=vision.RunningMode.IMAGE, num_faces=2)
-    with vision.FaceLandmarker.create_from_options(options) as tracker:
-        result = tracker.detect(mp.Image.create_from_file(str(image)))
-    if len(result.face_landmarks) != 1:
-        raise ValueError('expected exactly one detected face; use manual observations')
     with Image.open(image) as im:
         w, h = im.size
-    p = np.array([[v.x*w, v.y*h] for v in result.face_landmarks[0]])
+        rgb = np.asarray(im.convert('RGB'))
+    with FaceLandmarker(task) as tracker:
+        result = tracker.detect(rgb, blendshapes=False)
+    if len(result) != 1:
+        raise ValueError('expected exactly one detected face; use manual observations')
+    p = result[0]['landmarks'][:, :2] * [w, h]
     view = dict(image=str(image), sha256=sha256(image), pixel_sha256=pixel_sha256(image), size=[w, h],
                 anchors={name: dict(xy=p[ids].mean(0).tolist(), weight=.8) for name, ids in ANCHORS.items()})
     if camera is not None:
         view['camera'] = camera.as_dict()
     return dict(format=FORMAT, coordinates='original image pixels, top-left, pixel centres',
                 scale='assumed IPD unless supplied by user', tracker=dict(sha256=TASK_SHA256,
-                source='Google MediaPipe face_landmarker float16 v1'), views=[view])
+                source='Google MediaPipe face_landmarker float16 v1', backend='native_gemm'), views=[view])

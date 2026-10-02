@@ -43,3 +43,15 @@ https://github.com/USC-ICT/ICT-FaceKit (MIT), pinned to commit
 `da5f95a607f5e6b37755b38d3385d7f2853732e5`. Its license is at
 https://github.com/USC-ICT/ICT-FaceKit/blob/master/LICENSE.
 The download cache and fitted user assets are excluded from this repository.
+# MediaPipe face model metadata
+
+`native_landmarks.py` uses the 146-landmark subset and 52 blendshape names from
+Google MediaPipe `v0.10.21`, `face_blendshapes_graph.cc` (Copyright 2023 The
+MediaPipe Authors), licensed under Apache License 2.0:
+https://www.apache.org/licenses/LICENSE-2.0
+
+Source: https://github.com/google-ai-edge/mediapipe/blob/v0.10.21/mediapipe/tasks/cc/vision/face_landmarker/face_blendshapes_graph.cc
+
+The C++ executor is an independent implementation. Model weights are downloaded
+separately by `rig/setup_face_video.sh`, verified by SHA256, and remain outside
+the repository. Exported graph receipts retain their source task/tensor hashes.

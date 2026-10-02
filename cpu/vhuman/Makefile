@@ -23,7 +23,10 @@ vhuman_models: ../../common/vhuman_models.c $(wildcard ../../common/*.h) ../../c
 	$(CC) $(CFLAGS) $(VH_EXTRA_FLAGS) -o $@ $< $(AVX_OBJ) $(VH_EXTRA_SRC) -lm -lpthread $(VH_EXTRA_LIBS)
 .PHONY: clean
 clean:
-	rm -f vhuman_models libvhuman_motion.so test_vhuman_ops gemm_avx2.o tokenizer_probe
+	rm -f vhuman_models libvhuman_motion.so libvhuman_landmarks.so test_vhuman_ops gemm_avx2.o tokenizer_probe
 
 tokenizer_probe: tokenizer_probe.c ../../common/gguf_loader.h ../../common/bpe_tokenizer.h
 	$(CC) $(CFLAGS) -o $@ $< -lm
+
+libvhuman_landmarks.so: landmarks.cpp $(AVX_OBJ)
+	$(CXX) -O3 -std=c++17 -Wall -Wextra -Wpedantic -fopenmp $(if $(AVX_OBJ),-mavx2 -mfma) -fPIC -shared -o $@ $< $(AVX_OBJ)

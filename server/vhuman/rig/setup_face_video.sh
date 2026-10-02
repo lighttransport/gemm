@@ -34,6 +34,7 @@ if [ ! -f "$model" ] || [ "$(sha256sum "$model" | cut -d ' ' -f 1)" != "$hash" ]
     trap - EXIT
 fi
 printf 'MediaPipe Face Landmarker %s\n' "$model"
+make -C "$root/cpu/vhuman" libvhuman_landmarks.so
 
 if [ "$with_reference" -eq 1 ]; then
     if [ ! -d "$reference/.git" ]; then
@@ -56,7 +57,7 @@ if [ "$install_deps" -eq 1 ]; then
     export UV_CACHE_DIR="$root/tmp/uv-cache"
     mkdir -p "$TMPDIR" "$UV_CACHE_DIR"
     [ -x "$python" ] || { printf 'create the vhuman rig venv first\n' >&2; exit 1; }
-    uv pip install --python "$python" 'mediapipe==0.10.32' 'remotezip==0.12.6'
+    uv pip install --python "$python" 'numpy' 'pillow' 'opencv-python-headless' 'remotezip==0.12.6'
     if [ "$with_reference" -eq 1 ]; then
         uv pip install --python "$python" 'libigl==2.6.3'
     fi

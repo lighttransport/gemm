@@ -3,6 +3,7 @@
 numpy
 pillow
 scipy
+opencv-python-headless
 # Optional output packages: pygame, pyvirtualcam, nvidia-ml-py.
 # CUDA inference rendering uses libvhuman_splat.so and libvhuman_runtime.so.
 # Torch/gsplat are needed only for training and explicit offline reference checks.

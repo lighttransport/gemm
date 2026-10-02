@@ -1,6 +1,6 @@
 """Optional face-video observations and PyTorch fitting of the vhuman rig.
 
-MediaPipe supplies observations only. The fitted controls are found by our
+Native repository inference of the pinned MediaPipe models supplies observations. The fitted controls are found by our
 TorchRig projection and temporal optimizer; browser playback has no tracker.
 """
 from __future__ import annotations
@@ -112,44 +112,33 @@ def _extract(source: Path, stage: Path) -> list[Path]:
 
 
 def _observe(paths: list[Path], model: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    # MediaPipe's package initializer imports its unused audio task. On some
-    # headless hosts that stalls while PortAudio probes devices. Load only the
-    # vision task in this dedicated fitting subprocess.
-    import sys
-    import types
-
-    cache = Path(__file__).resolve().parents[3] / "tmp/vhuman-rig/matplotlib"
-    cache.mkdir(parents=True, exist_ok=True)
-    os.environ.setdefault("MPLCONFIGDIR", str(cache))
-    sys.modules.setdefault("mediapipe.tasks.python.audio", types.ModuleType("mediapipe.tasks.python.audio"))
-    import mediapipe as mp
+    from ..native_landmarks import FaceLandmarker
+    from PIL import Image
 
     if not model.is_file():
         raise ValueError(f"face landmarker model is missing: {model}; run setup_face_video.sh")
-    options = mp.tasks.vision.FaceLandmarkerOptions(
-        base_options=mp.tasks.BaseOptions(model_asset_path=str(model)),
-        running_mode=mp.tasks.vision.RunningMode.VIDEO, num_faces=2,
-        output_face_blendshapes=True, output_facial_transformation_matrixes=True)
     names = list(rigdef.CONTROLS)
     controls = np.zeros((len(paths), len(names)), np.float32)
     landmarks = np.zeros((len(paths), len(ANCHORS), 2), np.float32)
     valid = np.zeros(len(paths), bool)
-    with mp.tasks.vision.FaceLandmarker.create_from_options(options) as tracker:
+    # Per-image inference is deterministic and independent of frame sampling.
+    # Temporal regularization remains in fit_observations, below.
+    with FaceLandmarker(model) as tracker:
         for i, path in enumerate(paths):
-            image = mp.Image.create_from_file(str(path))
-            result = tracker.detect_for_video(image, round(i * 1000 / FPS))
-            if len(result.face_landmarks) > 1:
+            with Image.open(path) as image:
+                result = tracker.detect(np.asarray(image.convert('RGB')))
+            if len(result) > 1:
                 raise ValueError("face video must contain exactly one visible face")
-            if not result.face_landmarks:
+            if not result:
                 continue
             valid[i] = True
-            points = result.face_landmarks[0]
+            points = result[0]['landmarks']
             for j, (_, index) in enumerate(ANCHORS):
-                chosen = [points[k] for k in (index if isinstance(index, tuple) else (index,))]
-                landmarks[i, j] = [np.mean([p.x for p in chosen]), np.mean([p.y for p in chosen])]
-            for category in result.face_blendshapes[0]:
-                if category.category_name in rigdef.CONTROLS:
-                    controls[i, names.index(category.category_name)] = category.score
+                ids = list(index) if isinstance(index, tuple) else [index]
+                landmarks[i, j] = points[ids, :2].mean(0)
+            for name, score in result[0]['blendshapes'].items():
+                if name in names:
+                    controls[i, names.index(name)] = score
     if valid.mean() < .8:
         raise ValueError("face is missing in more than 20% of video frames")
     observed = np.flatnonzero(valid)
