@@ -30,7 +30,12 @@ export TMPDIR=$PWD/tmp/hv15-native/reference-tmp
 
 $PY ref/hunyuan_video15_native/verify.py --model "$MODEL" --actual "$ACTUAL" --out "$OUT" \
   --generation-manifest "$RUN" --phase encoders \
-  --components qwen_hidden qwen_negative_hidden byt5_hidden siglip_hidden vae_encoded \
+  --components qwen_hidden qwen_negative_hidden byt5_hidden siglip_hidden \
+  --image tmp/hv15-native/i2v-run/input.png --vision-pixels tmp/hv15-native/i2v-run/vision_pixels.f32
+
+flock -w 900 tmp/pixal3d/device-locks/cuda-0.lock $PY ref/hunyuan_video15_native/verify.py \
+  --model "$MODEL" --actual "$ACTUAL" --out "$OUT" \
+  --generation-manifest "$RUN" --phase encoders --components vae_encoded \
   --image tmp/hv15-native/i2v-run/input.png --vision-pixels tmp/hv15-native/i2v-run/vision_pixels.f32
 
 flock -w 900 tmp/pixal3d/device-locks/cuda-0.lock $PY ref/hunyuan_video15_native/verify.py \
@@ -41,8 +46,10 @@ $PY ref/hunyuan_video15_native/verify.py --model "$MODEL" --actual "$ACTUAL" --o
   --generation-manifest "$RUN" --phase compare
 ```
 
-Acquire the device lock for `encoders` too when it includes `vae_encoded`.
-For T2V omit `siglip_hidden`/`vae_encoded`, `--image`, and `--vision-pixels`.
+CPU encoder checks can run while another job holds the GPU lock. The VAE phase
+merges its tensor receipts with those CPU results in the same output directory;
+run these phases sequentially to avoid concurrent receipt writes.
+For T2V omit `siglip_hidden`, the VAE encoder command, `--image`, and `--vision-pixels`.
 For fast12 omit `qwen_negative_hidden`. The denoiser consumes the independently
 computed reference conditioning and matched native noise, uses the official
 Euler scheduler, and compares every saved step. The decoder consumes the

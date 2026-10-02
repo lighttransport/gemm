@@ -4,8 +4,9 @@ Hardware: NVIDIA RTX 5060 Ti, 16 GiB, compute capability 12.0. Reference source:
 `60783e704160023913bee78f0b47036d393d4dfa`. Model revisions and SHA256 values
 are recorded by `stage_models.py` in its separate model manifest.
 
-These are component results. They do **not** establish acceptance of a complete
-quality T2V or I2V pipeline, a full 81-frame decoded video, or trained rig quality.
+The checks below include independent component comparisons and one completed
+native fast12 video. They do **not** establish independent complete-video parity,
+acceptance of either quality pipeline, or trained rig quality.
 Runtime receipts keep `parity: unverified` and require `--allow-experimental`.
 
 ## Verified correctness
@@ -62,6 +63,50 @@ The 33,390×2,048 by 8,192×2,048 memory probe reports about 1,368 MiB of live
 tensors with device memory growth below that amount plus the 512 MiB guard.
 The original/private GEMM kernels use 72/92 registers and zero local bytes.
 This isolates GEMM scratch behavior; it is not a full model memory-fit result.
+
+## Complete native fast12 execution
+
+On 2026-10-02, the native runtime completed all 12 denoising steps and decoded
+all 81 frames at 480×848, 24 fps, using the explicit `--gemm cublas` comparison
+backend. The seed was 42 and the prompt was
+`The same person smiles gently, then relaxes. Fixed frontal camera.`
+The MP4 was decoded independently with FFmpeg, which reported exactly 81 frames.
+
+| Measurement | Result |
+|---|---:|
+| Generation and packaging time | 3206.22 s (53.44 min) |
+| Managed allocation peak | 2965.52 MiB |
+| Sampled process VRAM peak | 3206 MiB |
+| Sampled host RSS peak | 16740.80 MiB |
+| Measured memory budget | Pass, 14336 MiB |
+| GEMM calls | 6,068,402 cuBLAS; zero repo calls |
+| Attention calls | 815 |
+
+Local artifacts are `tmp/hv15-native/full-fast12-v5/{clip.mp4,manifest.json,
+metrics.json,codec_check.log}` and `tmp/hv15-native/full-fast12-captures-v5/`.
+The captures include matched noise, conditioning, every denoising step, the
+final latent, and the full decoded tensor. The manifest binds the executed
+binary, source, input and pinned weights to this run.
+
+Independent CPU references for this exact completed run pass:
+
+| Component | Cosine | Relative L2 |
+|---|---:|---:|
+| Qwen hidden state 26 | 0.999999999999531 | 9.69e-7 |
+| SigLIP, including portrait preprocessing | 0.999999999944709 | 1.05e-5 |
+| ByT5 empty glyph condition (no quoted text in this prompt) | 1 | 0 |
+
+The receipts are in `tmp/hv15-native/full-fast12-v5-reference/`. The nonempty
+ByT5 encoder comparison is recorded in the component table above.
+Full-resolution VAE, all-step denoising, and all-frame independent comparisons
+remain pending while another job holds the shared CUDA lock.
+
+A same-input repo/cuBLAS first-step cross-check also passes: relative L2 is
+8.80e-5 for the full portrait latent, 2.39e-4 for the DiT prediction, and 4.31e-6
+for the updated latent; noise and encoder captures are byte-identical.
+This backend cross-check does not substitute for independent pipeline parity
+or a complete repo-GEMM video benchmark. Neither complete 50-step quality
+pipeline has yet been validated.
 
 For complete reference phases and exact capture requirements, see
 [the reference instructions](../../ref/hunyuan_video15_native/README.md).
