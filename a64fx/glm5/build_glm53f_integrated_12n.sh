@@ -80,7 +80,7 @@ if [ "$mode" != runtime ]; then
     bin test_glm53f_lookup_spec test_glm53f_lookup_spec.c "$build_dir/lookup_spec.o"
     bin bench_glm53f_run_12n bench_glm53f_run_12n.c "$build_dir/lookup_spec.o" "${objects[@]}" "$build_dir/target.o"
     for name in kquant native_batch prefill_config state_io iq_grouped mhc_team lookup moe_combine index_heads index_keys4 pool_select mla_absorb mla_value mla_cache_f16 mla_attention; do
-        bin "test_glm53f_$name" "test_glm53f_$name.c" "$build_dir/q8_panel.o" "$build_dir/team.o"
+        bin "test_glm53f_$name" "test_glm53f_$name.c" "$build_dir/q8_panel.o" "$build_dir/team.o" "$build_dir/gemm_asm.o"
     done
     bin glm53f_kda_callback_check glm53f_kda_callback_check.c "$build_dir/kda.o" "${kernels[@]}"
     bin glm53f_dense_batch_check glm53f_dense_batch_check.c "$build_dir/dense.o" "$build_dir/kda.o" "${kernels[@]}"

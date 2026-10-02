@@ -600,10 +600,23 @@ static void mla_value_worker(void *context) {
         for(int h=0;h<hn;h++)
             if(glm53f_native_act_prepare(c->q8v_act+(size_t)h*c->q8v_act_bytes,
                     va+(size_t)h*LAT,LAT,!q80,q80))bad=1;
-        for(int h=0;h<hn;h++){
-            glm53f_native_matrix m={out+(size_t)h*VD,c->q2_vb+(size_t)h*VD*row_bytes,
-                c->q2_vb_type,VD,LAT};
-            if(glm53f_native_matvec_team(&m,1,c->q8v_act+(size_t)h*c->q8v_act_bytes))bad=1;
+        const char *fused = getenv("GLM53F_MLA_FUSED_PROJECTION");
+        if (fused && atoi(fused)) {
+            glm53f_native_matrix m[8];
+            const void *activation[8];
+            for (int h = 0; h < hn; ++h) {
+                m[h] = (glm53f_native_matrix){out + (size_t)h * VD,
+                    c->q2_vb + (size_t)h * VD * row_bytes, c->q2_vb_type, VD, LAT};
+                activation[h] = c->q8v_act + (size_t)h * c->q8v_act_bytes;
+            }
+            if (glm53f_native_matvec_multi_team(m, hn, activation)) bad = 1;
+        } else {
+            for (int h = 0; h < hn; ++h) {
+                glm53f_native_matrix m = {out + (size_t)h * VD,
+                    c->q2_vb + (size_t)h * VD * row_bytes, c->q2_vb_type, VD, LAT};
+                if (glm53f_native_matvec_team(&m, 1,
+                        c->q8v_act + (size_t)h * c->q8v_act_bytes)) bad = 1;
+            }
         }
 
     if (bad) {

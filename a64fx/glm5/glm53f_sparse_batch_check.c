@@ -25,6 +25,15 @@ static int run_panels(glm53f_sparse_context_12n *c, float *out, const float *x,
     return bad ? -1 : 0;
 }
 
+/* Runtime-read switches permit one-context-at-a-time exact comparisons. */
+static void q8_variant(int mode, int candidate) {
+    if (!mode) return;
+    char value[2] = {(char)('0' + (candidate ? mode : 0)), 0};
+    setenv("GLM53F_NATIVE_Q8_TILE2X8", value, 1);
+    setenv("GLM53F_NATIVE_Q8_ROWS8", candidate ? "1" : "0", 1);
+    setenv("GLM53F_MLA_FUSED_PROJECTION", candidate ? "1" : "0", 1);
+}
+
 int main(int argc, char **argv) {
     int rank, ranks, ok, local_ok = 1;
     int layer = argc > 2 ? atoi(argv[2]) : 3;
@@ -49,6 +58,8 @@ int main(int argc, char **argv) {
     if (getenv("GLM53F_UTOFU") && glm53f_collective_init_12n(
             getenv("TOFU_TOPO_PATH"), glm53f_prefill_collective_count(warm + tokens, HIDDEN))) MPI_Abort(MPI_COMM_WORLD, 2);
     if (async_check && glm53f_collective_prefill_algorithm_12n(5)) MPI_Abort(MPI_COMM_WORLD, 2);
+    const char *q8_env = getenv("GLM53F_SPARSE_COMPARE_Q8");
+    int compare_q8 = q8_env ? atoi(q8_env) : 0;
     int compare_selector = getenv("GLM53F_SPARSE_COMPARE_SELECTOR") != NULL;
     int compare_cp = getenv("GLM53F_SPARSE_COMPARE_CP") != NULL;
     int compare_cache = getenv("GLM53F_SPARSE_COMPARE_CACHE") != NULL;
@@ -56,6 +67,9 @@ int main(int argc, char **argv) {
     int compare_index = index_env ? atoi(index_env) : 0;
     if (index_env && ((compare_index != 3 && compare_index != 4) ||
             compare_cp || compare_cache || async_check)) MPI_Abort(MPI_COMM_WORLD, 2);
+    if (q8_env && (compare_q8 < 1 || compare_q8 > 3 || compare_cp ||
+            compare_cache || compare_index || compare_selector || compare_panel ||
+            async_check)) MPI_Abort(MPI_COMM_WORLD, 2);
     char index_value[2] = {(char)('0' + compare_index), 0};
     if (compare_selector && (compare_cp || compare_cache || compare_index ||
             compare_panel || async_check)) MPI_Abort(MPI_COMM_WORLD, 2);
@@ -77,27 +91,30 @@ int main(int argc, char **argv) {
             x[(size_t)t * HIDDEN + i] =
                 (float)(((i * 17 + t * 31 + 5) % 251) - 125) / 125.0f;
     for (int t = 0; t < warm; t++) {
+        q8_variant(compare_q8, 0);
         if (compare_selector) setenv("GLM53F_POOL_PARTITION_4K", "0", 1);
         if (compare_index) setenv("GLM53F_INDEX_HEADS", "1", 1);
         local_ok &= !glm53f_sparse_sublayer_12n(
             ca, a, x + (size_t)t * HIDDEN);
+        q8_variant(compare_q8, 1);
         if (compare_selector) setenv("GLM53F_POOL_PARTITION_4K", "1", 1);
         if (compare_index) setenv("GLM53F_INDEX_HEADS", index_value, 1);
         local_ok &= !glm53f_sparse_sublayer_12n(
             cb, b, x + (size_t)t * HIDDEN);
-        if (compare_index || compare_selector) local_ok &= !memcmp(a, b, HIDDEN * sizeof(float));
+        if (compare_index || compare_selector || compare_q8) local_ok &= !memcmp(a, b, HIDDEN * sizeof(float));
     }
     MPI_Barrier(MPI_COMM_WORLD);
     double t0 = MPI_Wtime();
     glm53f_prefill_config config = {GLM53F_PREFILL_FAST, async_check ? 32 : 16, GLM53F_PREFILL_FAST_DEFAULT, NULL, 0};
     config.features &= ~GLM53F_PREFILL_GEMM;
+    q8_variant(compare_q8, 0);
     if (compare_selector) setenv("GLM53F_POOL_PARTITION_4K", "0", 1);
     if (compare_index) setenv("GLM53F_INDEX_HEADS", "1", 1);
     if (compare_panel) {
         config.features = GLM53F_PREFILL_COMM | GLM53F_PREFILL_RECURRENCE |
             GLM53F_PREFILL_EXPERT16 | GLM53F_PREFILL_MLA_REG;
         local_ok &= !run_panels(ca, a, x + (size_t)warm * HIDDEN, tokens, 32, &config);
-    } else if (async_check || compare_cache || ((compare_index || compare_selector) && prefill)) {
+    } else if (async_check || compare_cache || ((compare_index || compare_selector || compare_q8) && prefill)) {
         glm53f_sparse_configure_prefill_12n(ca, &config);
         glm53f_sparse_prefill_workspace_12n *w = glm53f_sparse_prefill_workspace_create_12n();
         local_ok &= w && !glm53f_sparse_prefill_12n(ca, w, a,
@@ -109,6 +126,7 @@ int main(int argc, char **argv) {
     double seq = MPI_Wtime() - t0;
     MPI_Barrier(MPI_COMM_WORLD);
     t0 = MPI_Wtime();
+    q8_variant(compare_q8, 1);
     if (compare_selector) setenv("GLM53F_POOL_PARTITION_4K", "1", 1);
     if (compare_index) setenv("GLM53F_INDEX_HEADS", index_value, 1);
     if (compare_panel) {
@@ -132,7 +150,7 @@ int main(int argc, char **argv) {
         }
         free(partial);
         glm53f_sparse_prefill_workspace_free_12n(w);
-    } else if (compare_index || compare_selector) {
+    } else if (compare_index || compare_selector || compare_q8) {
         for (int t = 0; t < tokens; ++t)
             local_ok &= !glm53f_sparse_sublayer_12n(cb, b + (size_t)t * HIDDEN,
                 x + (size_t)(warm + t) * HIDDEN);
@@ -147,15 +165,17 @@ int main(int argc, char **argv) {
     }
     double rel = sqrt(d2 / (r2 + 1e-30));
     local_ok &= rel < (getenv("GLM53F_SPARSE_CHECK_TOL") ? atof(getenv("GLM53F_SPARSE_CHECK_TOL")) : 3e-6);
-    if (async_check || compare_cache || compare_index || compare_panel || compare_selector) local_ok &= !memcmp(a, b, (size_t)tokens * HIDDEN * sizeof(float));
+    if (async_check || compare_cache || compare_index || compare_panel || compare_selector || compare_q8) local_ok &= !memcmp(a, b, (size_t)tokens * HIDDEN * sizeof(float));
     double rollback_d2 = 0.0, rollback_r2 = 0.0;
     if (warm >= 1) {
         local_ok &= !glm53f_sparse_restore_length_12n(ca, warm + 1);
         local_ok &= !glm53f_sparse_restore_length_12n(cb, warm + 1);
         for (int t = 1; t < tokens; ++t) {
+            q8_variant(compare_q8, 0);
             if (compare_selector) setenv("GLM53F_POOL_PARTITION_4K", "0", 1);
             if (compare_index) setenv("GLM53F_INDEX_HEADS", "1", 1);
             local_ok &= !glm53f_sparse_sublayer_12n(ca, a, x + (size_t)(warm + t) * HIDDEN);
+            q8_variant(compare_q8, 1);
             if (compare_selector) setenv("GLM53F_POOL_PARTITION_4K", "1", 1);
             if (compare_index) setenv("GLM53F_INDEX_HEADS", index_value, 1);
             local_ok &= !glm53f_sparse_sublayer_12n(cb, b, x + (size_t)(warm + t) * HIDDEN);
@@ -164,7 +184,7 @@ int main(int argc, char **argv) {
                 rollback_d2 += d * d;
                 rollback_r2 += (double)a[i] * a[i];
             }
-            if (compare_cache || compare_index || compare_panel || compare_selector) local_ok &= !memcmp(a, b, HIDDEN * sizeof(float));
+            if (compare_cache || compare_index || compare_panel || compare_selector || compare_q8) local_ok &= !memcmp(a, b, HIDDEN * sizeof(float));
         }
     }
     double rollback_rel=sqrt(rollback_d2/(rollback_r2+1e-30));
@@ -176,7 +196,7 @@ int main(int argc, char **argv) {
     if (!rank)
         printf("GLM53F_SPARSE_BATCH mode=%s layer=%d warm=%d tokens=%d rel_l2=%.9g rollback_rel_l2=%.9g "
                "seq_ms=%.3f batch_ms=%.3f speedup=%.3f %s\n",
-               async_check ? "prefill-vs-owner-async" : compare_cache ? "fp32-vs-derived-fp16" : compare_panel ? "prefill32-vs-panel" : compare_selector ? "heap-vs-partition4k" : compare_index ? "distributed-vs-replicated-index" : compare_cp ? "replicated-vs-cp" : "replicated",
+               async_check ? "prefill-vs-owner-async" : compare_q8 ? "legacy-vs-q8-tiles-and-fused-projection" : compare_cache ? "fp32-vs-derived-fp16" : compare_panel ? "prefill32-vs-panel" : compare_selector ? "heap-vs-partition4k" : compare_index ? "distributed-vs-replicated-index" : compare_cp ? "replicated-vs-cp" : "replicated",
                layer, warm, tokens, rel,rollback_rel,sm * 1e3, bm * 1e3, sm / bm,
                ok ? "PASS" : "FAIL");
     if (!rank && compare_panel) printf("GLM53F_SPARSE_PANEL width=%d positions=%d\n", compare_panel, tokens);
@@ -186,7 +206,7 @@ int main(int argc, char **argv) {
             FILE *rf = fopen(report, "w");
             if (rf) {
                 fprintf(rf, "GLM53F_SPARSE_BATCH mode=%s layer=%d warm=%d tokens=%d rel_l2=%.9g rollback_rel_l2=%.9g seq_ms=%.3f batch_ms=%.3f speedup=%.3f %s\n",
-                        async_check ? "prefill-vs-owner-async" : compare_cache ? "fp32-vs-derived-fp16" : compare_panel ? "prefill32-vs-panel" : compare_selector ? "heap-vs-partition4k" : compare_index ? "distributed-vs-replicated-index" : compare_cp ? "replicated-vs-cp" : "replicated", layer,
+                        async_check ? "prefill-vs-owner-async" : compare_q8 ? "legacy-vs-q8-tiles-and-fused-projection" : compare_cache ? "fp32-vs-derived-fp16" : compare_panel ? "prefill32-vs-panel" : compare_selector ? "heap-vs-partition4k" : compare_index ? "distributed-vs-replicated-index" : compare_cp ? "replicated-vs-cp" : "replicated", layer,
                         warm, tokens, rel, rollback_rel, sm * 1e3, bm * 1e3,
                         sm / bm, ok ? "PASS" : "FAIL");
                 fclose(rf);

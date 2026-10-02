@@ -445,6 +445,64 @@ static inline void q8_0r_rows(float *out, const uint8_t *w, size_t rb,
     if (nrows > 3) out[3] = svaddv_f32(p32, acc3);
 }
 
+/* Eight independent decode rows; retain each row's original lane order. */
+static inline void q8_0r_rows8(float *out, const uint8_t *w, size_t rb,
+                              int nrows, const native_act *a) {
+    const int columns = a->columns, pairs = columns / 64;
+    const svbool_t p8 = svptrue_b8(), p32 = svptrue_b32();
+    const svbool_t lo8 = svptrue_pat_b32(SV_VL8);
+    const int8_t *q[8];
+    const float *d[8];
+    for (int r = 0; r < 8; ++r) {
+        const int rr = r < nrows ? r : 0;
+        q[r] = (const int8_t *)(w + (size_t)rr * rb);
+        d[r] = (const float *)(w + (size_t)rr * rb + columns);
+    }
+    svfloat32_t acc0 = svdup_f32(0.0f), acc1 = acc0, acc2 = acc0, acc3 = acc0;
+    svfloat32_t acc4 = acc0, acc5 = acc0, acc6 = acc0, acc7 = acc0;
+    for (int k = 0; k < pairs; ++k) {
+#if GLM53F_Q8R_PF
+        if ((k & 3) == 0) {   /* one 256 B line per row every four 64-byte steps, GLM53F_Q8R_PF bytes ahead */
+            __builtin_prefetch(q[0] + 64 * k + GLM53F_Q8R_PF, 0, GLM53F_Q8R_PF_LVL);
+            if (nrows > 1) __builtin_prefetch(q[1] + 64 * k + GLM53F_Q8R_PF, 0, GLM53F_Q8R_PF_LVL);
+            if (nrows > 2) __builtin_prefetch(q[2] + 64 * k + GLM53F_Q8R_PF, 0, GLM53F_Q8R_PF_LVL);
+            if (nrows > 3) __builtin_prefetch(q[3] + 64 * k + GLM53F_Q8R_PF, 0, GLM53F_Q8R_PF_LVL);
+            if (nrows > 4) __builtin_prefetch(q[4] + 64 * k + GLM53F_Q8R_PF, 0, GLM53F_Q8R_PF_LVL);
+            if (nrows > 5) __builtin_prefetch(q[5] + 64 * k + GLM53F_Q8R_PF, 0, GLM53F_Q8R_PF_LVL);
+            if (nrows > 6) __builtin_prefetch(q[6] + 64 * k + GLM53F_Q8R_PF, 0, GLM53F_Q8R_PF_LVL);
+            if (nrows > 7) __builtin_prefetch(q[7] + 64 * k + GLM53F_Q8R_PF, 0, GLM53F_Q8R_PF_LVL);
+        }
+#endif
+        const svint8_t xv = svld1_s8(p8, a->xq + 64 * k);
+        const svfloat32_t xs = svld1_f32(p32, a->xpat + 16 * k);
+#define GLM53F_Q8R_ROW(R, ACC) do { \
+        const svint8_t wv = svld1_s8(p8, q[R] + 64 * k); \
+        const svfloat32_t ws = svsel_f32(lo8, svdup_f32(d[R][2 * k]), \
+                                         svdup_f32(d[R][2 * k + 1])); \
+        ACC = svmla_f32_m(p32, ACC, \
+            svcvt_f32_s32_x(p32, svdot_s32(svdup_s32(0), wv, xv)), \
+            svmul_f32_x(p32, ws, xs)); \
+    } while (0)
+        GLM53F_Q8R_ROW(0, acc0);
+        if (nrows > 1) GLM53F_Q8R_ROW(1, acc1);
+        if (nrows > 2) GLM53F_Q8R_ROW(2, acc2);
+        if (nrows > 3) GLM53F_Q8R_ROW(3, acc3);
+        if (nrows > 4) GLM53F_Q8R_ROW(4, acc4);
+        if (nrows > 5) GLM53F_Q8R_ROW(5, acc5);
+        if (nrows > 6) GLM53F_Q8R_ROW(6, acc6);
+        if (nrows > 7) GLM53F_Q8R_ROW(7, acc7);
+#undef GLM53F_Q8R_ROW
+    }
+    out[0] = svaddv_f32(p32, acc0);
+    if (nrows > 1) out[1] = svaddv_f32(p32, acc1);
+    if (nrows > 2) out[2] = svaddv_f32(p32, acc2);
+    if (nrows > 3) out[3] = svaddv_f32(p32, acc3);
+    if (nrows > 4) out[4] = svaddv_f32(p32, acc4);
+    if (nrows > 5) out[5] = svaddv_f32(p32, acc5);
+    if (nrows > 6) out[6] = svaddv_f32(p32, acc6);
+    if (nrows > 7) out[7] = svaddv_f32(p32, acc7);
+}
+
 static inline float native_row(int type, const uint8_t *row,
                                const native_act *a) {
     if (type == GLM53F_NATIVE_Q8_0R) {
@@ -506,6 +564,151 @@ static inline void q8_0r_tile4(float *out, int stride, const uint8_t *w,
 #undef Q8R_STORE
 }
 
+/* Optional exact assembly tiles; standalone bridge tests retain the C path
+ * when the assembly object is omitted. Native integrated builds link both. */
+extern void gk_q8r_tile4x4_exact_asm(float *, int, const uint8_t *, size_t,
+    int, const int8_t *const *, const float *const *) __attribute__((weak));
+extern void gk_q8r_tile2x8_exact_asm(float *, int, const uint8_t *, size_t,
+    int, const int8_t *const *, const float *const *) __attribute__((weak));
+static inline void q8_0r_tile_asm(float *out, int stride, const uint8_t *w,
+        size_t rb, const native_act **a, int tokens) {
+    const int8_t *xq[8];
+    const float *xpat[8];
+    for (int t = 0; t < tokens; ++t) {
+        xq[t] = a[t]->xq;
+        xpat[t] = a[t]->xpat;
+    }
+    if (tokens == 8) gk_q8r_tile2x8_exact_asm(out, stride, w, rb, a[0]->columns, xq, xpat);
+    else gk_q8r_tile4x4_exact_asm(out, stride, w, rb, a[0]->columns, xq, xpat);
+}
+
+/* Two rows x eight positions: sixteen accumulators, unchanged per-lane FMAs. */
+static inline void q8_0r_tile2x8(float *out, int stride, const uint8_t *w,
+        size_t rb, const native_act *a[8]) {
+    const int columns = a[0]->columns;
+    const svbool_t p8 = svptrue_b8(), pg = svptrue_b32();
+    const svbool_t lo8 = svptrue_pat_b32(SV_VL8);
+    svfloat32_t a00 = svdup_f32(0);
+    svfloat32_t a01 = svdup_f32(0);
+    svfloat32_t a02 = svdup_f32(0);
+    svfloat32_t a03 = svdup_f32(0);
+    svfloat32_t a04 = svdup_f32(0);
+    svfloat32_t a05 = svdup_f32(0);
+    svfloat32_t a06 = svdup_f32(0);
+    svfloat32_t a07 = svdup_f32(0);
+    svfloat32_t a10 = svdup_f32(0);
+    svfloat32_t a11 = svdup_f32(0);
+    svfloat32_t a12 = svdup_f32(0);
+    svfloat32_t a13 = svdup_f32(0);
+    svfloat32_t a14 = svdup_f32(0);
+    svfloat32_t a15 = svdup_f32(0);
+    svfloat32_t a16 = svdup_f32(0);
+    svfloat32_t a17 = svdup_f32(0);
+    for (int k = 0; k < columns / 64; ++k) {
+        const float *d0 = (const float *)(w + (size_t)0 * rb + columns);
+        const svint8_t w0 = svld1_s8(p8, (const int8_t *)(w + (size_t)0 * rb) + 64 * k);
+        const svfloat32_t s0 = svsel_f32(lo8, svdup_f32(d0[2*k]), svdup_f32(d0[2*k+1]));
+        const float *d1 = (const float *)(w + (size_t)1 * rb + columns);
+        const svint8_t w1 = svld1_s8(p8, (const int8_t *)(w + (size_t)1 * rb) + 64 * k);
+        const svfloat32_t s1 = svsel_f32(lo8, svdup_f32(d1[2*k]), svdup_f32(d1[2*k+1]));
+        {
+            const svint8_t xv = svld1_s8(p8, a[0]->xq + 64*k);
+            const svfloat32_t xs = svld1_f32(pg, a[0]->xpat + 16*k);
+            a00 = svmla_f32_m(pg, a00,
+                svcvt_f32_s32_x(pg, svdot_s32(svdup_s32(0), w0, xv)),
+                svmul_f32_x(pg, s0, xs));
+            a10 = svmla_f32_m(pg, a10,
+                svcvt_f32_s32_x(pg, svdot_s32(svdup_s32(0), w1, xv)),
+                svmul_f32_x(pg, s1, xs));
+        }
+        {
+            const svint8_t xv = svld1_s8(p8, a[1]->xq + 64*k);
+            const svfloat32_t xs = svld1_f32(pg, a[1]->xpat + 16*k);
+            a01 = svmla_f32_m(pg, a01,
+                svcvt_f32_s32_x(pg, svdot_s32(svdup_s32(0), w0, xv)),
+                svmul_f32_x(pg, s0, xs));
+            a11 = svmla_f32_m(pg, a11,
+                svcvt_f32_s32_x(pg, svdot_s32(svdup_s32(0), w1, xv)),
+                svmul_f32_x(pg, s1, xs));
+        }
+        {
+            const svint8_t xv = svld1_s8(p8, a[2]->xq + 64*k);
+            const svfloat32_t xs = svld1_f32(pg, a[2]->xpat + 16*k);
+            a02 = svmla_f32_m(pg, a02,
+                svcvt_f32_s32_x(pg, svdot_s32(svdup_s32(0), w0, xv)),
+                svmul_f32_x(pg, s0, xs));
+            a12 = svmla_f32_m(pg, a12,
+                svcvt_f32_s32_x(pg, svdot_s32(svdup_s32(0), w1, xv)),
+                svmul_f32_x(pg, s1, xs));
+        }
+        {
+            const svint8_t xv = svld1_s8(p8, a[3]->xq + 64*k);
+            const svfloat32_t xs = svld1_f32(pg, a[3]->xpat + 16*k);
+            a03 = svmla_f32_m(pg, a03,
+                svcvt_f32_s32_x(pg, svdot_s32(svdup_s32(0), w0, xv)),
+                svmul_f32_x(pg, s0, xs));
+            a13 = svmla_f32_m(pg, a13,
+                svcvt_f32_s32_x(pg, svdot_s32(svdup_s32(0), w1, xv)),
+                svmul_f32_x(pg, s1, xs));
+        }
+        {
+            const svint8_t xv = svld1_s8(p8, a[4]->xq + 64*k);
+            const svfloat32_t xs = svld1_f32(pg, a[4]->xpat + 16*k);
+            a04 = svmla_f32_m(pg, a04,
+                svcvt_f32_s32_x(pg, svdot_s32(svdup_s32(0), w0, xv)),
+                svmul_f32_x(pg, s0, xs));
+            a14 = svmla_f32_m(pg, a14,
+                svcvt_f32_s32_x(pg, svdot_s32(svdup_s32(0), w1, xv)),
+                svmul_f32_x(pg, s1, xs));
+        }
+        {
+            const svint8_t xv = svld1_s8(p8, a[5]->xq + 64*k);
+            const svfloat32_t xs = svld1_f32(pg, a[5]->xpat + 16*k);
+            a05 = svmla_f32_m(pg, a05,
+                svcvt_f32_s32_x(pg, svdot_s32(svdup_s32(0), w0, xv)),
+                svmul_f32_x(pg, s0, xs));
+            a15 = svmla_f32_m(pg, a15,
+                svcvt_f32_s32_x(pg, svdot_s32(svdup_s32(0), w1, xv)),
+                svmul_f32_x(pg, s1, xs));
+        }
+        {
+            const svint8_t xv = svld1_s8(p8, a[6]->xq + 64*k);
+            const svfloat32_t xs = svld1_f32(pg, a[6]->xpat + 16*k);
+            a06 = svmla_f32_m(pg, a06,
+                svcvt_f32_s32_x(pg, svdot_s32(svdup_s32(0), w0, xv)),
+                svmul_f32_x(pg, s0, xs));
+            a16 = svmla_f32_m(pg, a16,
+                svcvt_f32_s32_x(pg, svdot_s32(svdup_s32(0), w1, xv)),
+                svmul_f32_x(pg, s1, xs));
+        }
+        {
+            const svint8_t xv = svld1_s8(p8, a[7]->xq + 64*k);
+            const svfloat32_t xs = svld1_f32(pg, a[7]->xpat + 16*k);
+            a07 = svmla_f32_m(pg, a07,
+                svcvt_f32_s32_x(pg, svdot_s32(svdup_s32(0), w0, xv)),
+                svmul_f32_x(pg, s0, xs));
+            a17 = svmla_f32_m(pg, a17,
+                svcvt_f32_s32_x(pg, svdot_s32(svdup_s32(0), w1, xv)),
+                svmul_f32_x(pg, s1, xs));
+        }
+    }
+    out[(size_t)0 * stride + 0] = svaddv_f32(pg, a00);
+    out[(size_t)0 * stride + 1] = svaddv_f32(pg, a10);
+    out[(size_t)1 * stride + 0] = svaddv_f32(pg, a01);
+    out[(size_t)1 * stride + 1] = svaddv_f32(pg, a11);
+    out[(size_t)2 * stride + 0] = svaddv_f32(pg, a02);
+    out[(size_t)2 * stride + 1] = svaddv_f32(pg, a12);
+    out[(size_t)3 * stride + 0] = svaddv_f32(pg, a03);
+    out[(size_t)3 * stride + 1] = svaddv_f32(pg, a13);
+    out[(size_t)4 * stride + 0] = svaddv_f32(pg, a04);
+    out[(size_t)4 * stride + 1] = svaddv_f32(pg, a14);
+    out[(size_t)5 * stride + 0] = svaddv_f32(pg, a05);
+    out[(size_t)5 * stride + 1] = svaddv_f32(pg, a15);
+    out[(size_t)6 * stride + 0] = svaddv_f32(pg, a06);
+    out[(size_t)6 * stride + 1] = svaddv_f32(pg, a16);
+    out[(size_t)7 * stride + 0] = svaddv_f32(pg, a07);
+    out[(size_t)7 * stride + 1] = svaddv_f32(pg, a17);
+}
 static int native_is_q80(int type) {
     return type == GLM53F_GGML_Q8_0 || type == GLM53F_NATIVE_Q8_0R ||
            type == GLM53F_NATIVE_Q8_0R16;
@@ -520,19 +723,20 @@ static int native_check(int type, int columns, const native_act *a) {
 
 /* Orphaned work-sharing: call from every thread of an existing team.  The
  * trailing implicit barrier publishes all outputs to the team. */
-int glm53f_native_matvec_team(const glm53f_native_matrix *m, int count,
-                              const void *activation) {
-    const native_act *a = activation;
+static int native_matvec_multi_team(const glm53f_native_matrix *m, int count,
+        const void *const *activation, int shared) {
     int total = 0, bad = 0, group[8], start[9];
     size_t rb[8];
     if (!m || count < 1 || count > 8) return -1;
+    const char *rows8_env = getenv("GLM53F_NATIVE_Q8_ROWS8");
+    const int rows8 = rows8_env && atoi(rows8_env);
     for (int i = 0; i < count; ++i) {
         rb[i] = glm53f_native_row_size(m[i].type, m[i].columns);
         bad |= !m[i].output || !m[i].weight || m[i].rows < 1 || !rb[i] ||
-               native_check(m[i].type, m[i].columns, a);
-        /* Work items are four-row groups for repacked Q8_0, rows otherwise. */
+               native_check(m[i].type, m[i].columns, activation[shared ? 0 : i]);
+        /* Repacked Q8 rows share activations in groups of four or eight. */
         group[i] = m[i].type == GLM53F_NATIVE_Q8_0R16 ? 16 :
-                   m[i].type == GLM53F_NATIVE_Q8_0R ? 4 : 1;
+                   m[i].type == GLM53F_NATIVE_Q8_0R ? (rows8 ? 8 : 4) : 1;
         bad |= group[i] == 16 && m[i].rows % 16 != 0;
         start[i] = total;
         total += (m[i].rows + group[i] - 1) / group[i];
@@ -544,9 +748,13 @@ int glm53f_native_matvec_team(const glm53f_native_matrix *m, int count,
         int i = 0;
         while (q >= start[i + 1]) ++i;
         const int r = (q - start[i]) * group[i];
+        const native_act *a = activation[shared ? 0 : i];
         if (group[i] == 16) {
             q8_0r16_rows(m[i].output, m[i].weight, m[i].rows,
                           m[i].columns, r, a);
+        } else if (group[i] == 8) {
+            const int n = m[i].rows - r < 8 ? m[i].rows - r : 8;
+            q8_0r_rows8(m[i].output + r, m[i].weight + (size_t)r * rb[i], rb[i], n, a);
         } else if (group[i] == 4) {
             const int n = m[i].rows - r < 4 ? m[i].rows - r : 4;
             q8_0r_rows(m[i].output + r, m[i].weight + (size_t)r * rb[i],
@@ -557,6 +765,18 @@ int glm53f_native_matvec_team(const glm53f_native_matrix *m, int count,
         }
     }
     return 0;
+}
+
+int glm53f_native_matvec_team(const glm53f_native_matrix *m, int count,
+        const void *activation) {
+    return native_matvec_multi_team(m, count, &activation, 1);
+}
+
+/* Independent inputs with one row scheduler and one trailing barrier. */
+int glm53f_native_matvec_multi_team(const glm53f_native_matrix *m, int count,
+        const void *const *activation) {
+    if (!activation) return -1;
+    return native_matvec_multi_team(m, count, activation, 0);
 }
 
 struct native_call { const glm53f_native_matrix *m; int count, bad; const void *act; };
@@ -605,6 +825,13 @@ int glm53f_native_matvec_batch_team(const glm53f_native_matrix *m, int count,
     size_t rb[8];
     if (!m || count < 1 || count > 8 || !activation || tokens < 1 ||
         activation_stride < glm53f_native_act_bytes(m[0].columns)) return -1;
+    const char *tile_env = getenv("GLM53F_NATIVE_Q8_TILE2X8");
+    const int tile_mode = tile_env ? atoi(tile_env) : 0;
+    int tile2x8 = tile_mode == 1 || tile_mode == 3;
+    const int tile_asm = tile_mode >= 2 && svcntw() == 16;
+    for (int i = 0; i < count; ++i)
+        if (m[i].type != GLM53F_NATIVE_Q8_0R) tile2x8 = 0;
+    const int token_tile = tile2x8 ? 8 : 4;
     for (int i = 0; i < count; ++i) {
         rb[i] = glm53f_native_row_size(m[i].type, m[i].columns);
         if (!m[i].output || !m[i].weight || m[i].rows < 1 || !rb[i]) return -1;
@@ -613,7 +840,7 @@ int glm53f_native_matvec_batch_team(const glm53f_native_matrix *m, int count,
                     (const native_act *)((const uint8_t *)activation +
                                           (size_t)t * activation_stride))) return -1;
         group[i] = m[i].type == GLM53F_NATIVE_Q8_0R16 ? 16 :
-                   m[i].type == GLM53F_NATIVE_Q8_0R ? 4 : 1;
+                   m[i].type == GLM53F_NATIVE_Q8_0R ? (tile2x8 ? 2 : 4) : 1;
         if (group[i] == 16 && m[i].rows % 16 != 0) return -1;
         start[i] = total;
         total += (m[i].rows + group[i] - 1) / group[i];
@@ -621,15 +848,15 @@ int glm53f_native_matvec_batch_team(const glm53f_native_matrix *m, int count,
     start[count] = total;
 #pragma omp for collapse(2) schedule(static)
     for (int q = 0; q < total; ++q)
-        for (int t = 0; t < tokens; t += 4) {
+        for (int t = 0; t < tokens; t += token_tile) {
             int i = 0;
             while (q >= start[i + 1]) ++i;
             const int r = (q - start[i]) * group[i];
             const int nr = m[i].rows - r < group[i] ? m[i].rows - r : group[i];
-            const int nt = tokens - t < 4 ? tokens - t : 4;
+            const int nt = tokens - t < token_tile ? tokens - t : token_tile;
             const uint8_t *row = m[i].weight + (size_t)r * rb[i];
             float *out = m[i].output + (size_t)t * m[i].rows + r;
-            const native_act *a[4];
+            const native_act *a[8];
             for (int j = 0; j < nt; ++j)
                 a[j] = (const native_act *)((const uint8_t *)activation +
                                             (size_t)(t + j) * activation_stride);
@@ -637,10 +864,15 @@ int glm53f_native_matvec_batch_team(const glm53f_native_matrix *m, int count,
                 for (int j = 0; j < nt; ++j)
                     q8_0r16_rows(m[i].output + (size_t)(t + j) * m[i].rows,
                         m[i].weight, m[i].rows, m[i].columns, r, a[j]);
-            } else if (group[i] == 4 && nr == 4 && nt == 4)
-                q8_0r_tile4(out, m[i].rows, row, rb[i], a);
+            } else if (group[i] == 2 && nr == 2 && nt == 8) {
+                if (tile_asm && gk_q8r_tile2x8_exact_asm) q8_0r_tile_asm(out, m[i].rows, row, rb[i], a, 8);
+                else q8_0r_tile2x8(out, m[i].rows, row, rb[i], a);
+            } else if (group[i] == 4 && nr == 4 && nt == 4) {
+                if (tile_asm && gk_q8r_tile4x4_exact_asm) q8_0r_tile_asm(out, m[i].rows, row, rb[i], a, 4);
+                else q8_0r_tile4(out, m[i].rows, row, rb[i], a);
+            }
             else for (int j = 0; j < nt; ++j) {
-                if (group[i] == 4)
+                if (group[i] == 4 || group[i] == 2)
                     q8_0r_rows(out + (size_t)j * m[i].rows, row, rb[i], nr, a[j]);
                 else out[(size_t)j * m[i].rows] = native_row(m[i].type, row, a[j]);
             }

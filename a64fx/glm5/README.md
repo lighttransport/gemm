@@ -78,6 +78,13 @@ communication owner and their measurement protocol are described in
 [Strata-inspired optimization](GLM53F_STRATA.md). New paths have kernel
 validation; full-model performance qualification is still pending.
 
+Experimental exact Q8 switches are `--q8-row-kernel rows4|rows8`,
+`--q8-prefill-kernel tile4x4|tile2x8|tile4x4-asm|tile2x8-asm`, and
+`--mla-projection-kernel legacy|fused`. Defaults retain rows4, the C 4×4
+prefill tile, and separate MLA head projections. Native integrated builds
+link the assembly tiles; standalone bridge builds use the C fallback when
+that object is absent. See the Strata document for qualification status.
+
 For tokenization of an already rendered chat prompt:
 
 ```bash

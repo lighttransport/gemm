@@ -10,6 +10,17 @@ static int parse(const char *key, const char *value, glm53f_prefill_config *c) {
 int main(void) {
     glm53f_prefill_config c = {GLM53F_PREFILL_LEGACY, 32, GLM53F_PREFILL_FAST_DEFAULT, NULL, 0};
     int failed = 0;
+    failed |= parse("--mla-projection-kernel", "fused", &c) != 1 || strcmp(getenv("GLM53F_MLA_FUSED_PROJECTION"), "1");
+    failed |= parse("--mla-projection-kernel", "legacy", &c) != 1 || strcmp(getenv("GLM53F_MLA_FUSED_PROJECTION"), "0");
+    failed |= parse("--mla-projection-kernel", "tile4x4-asm", &c) != -1;
+    failed |= parse("--q8-row-kernel", "rows8", &c) != 1 || strcmp(getenv("GLM53F_NATIVE_Q8_ROWS8"), "1");
+    failed |= parse("--q8-row-kernel", "rows4", &c) != 1 || strcmp(getenv("GLM53F_NATIVE_Q8_ROWS8"), "0");
+    failed |= parse("--q8-prefill-kernel", "tile2x8", &c) != 1 || strcmp(getenv("GLM53F_NATIVE_Q8_TILE2X8"), "1");
+    failed |= parse("--q8-prefill-kernel", "tile4x4-asm", &c) != 1 || strcmp(getenv("GLM53F_NATIVE_Q8_TILE2X8"), "2");
+    failed |= parse("--q8-prefill-kernel", "tile2x8-asm", &c) != 1 || strcmp(getenv("GLM53F_NATIVE_Q8_TILE2X8"), "3");
+    failed |= parse("--q8-prefill-kernel", "tile4x4", &c) != 1 || strcmp(getenv("GLM53F_NATIVE_Q8_TILE2X8"), "0");
+    failed |= parse("--q8-row-kernel", "tile2x8", &c) != -1;
+    failed |= parse("--q8-prefill-kernel", "rows8", &c) != -1;
     failed |= glm53f_prefill_collective_count(8049, 4096) != GLM53F_PREFILL_ATTN_TOKENS * 4096;
     failed |= glm53f_prefill_collective_count(16387, 4096) != GLM53F_PREFILL_ATTN_TOKENS * 4096;
     failed |= glm53f_prefill_collective_count(16388, 4096) != GLM53F_PREFILL_ATTN_TOKENS * 4097;

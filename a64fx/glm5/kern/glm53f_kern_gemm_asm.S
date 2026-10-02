@@ -1760,3 +1760,233 @@ gk_gemm_tile6x4p3_asm:
     ldp d8, d9, [sp], #64
     ret
     .size gk_gemm_tile6x4p3_asm, .-gk_gemm_tile6x4p3_asm
+
+/* Exact row-major Q8_0R projection tiles. Keep sixteen FP32 accumulators
+ * in z0..z15 and retain the C kernel's per-64-column SDOT/FMA/reduction order.
+ * Arguments: out, output row stride (floats), weights, weight row bytes,
+ * columns, xq pointers, xpat pointers. Requires 512-bit SVE and full tiles.
+ * Only ABI-preserved D8..D15 are saved; no accumulator spills in either loop.
+ */
+.macro Q8R_SAVE
+    sub sp, sp, #64
+    stp d8, d9, [sp, #0]
+    stp d10, d11, [sp, #16]
+    stp d12, d13, [sp, #32]
+    stp d14, d15, [sp, #48]
+    ptrue p0.b
+    ptrue p1.s
+    ptrue p2.s, vl8
+    sxtw x1, w1
+    lsl x1, x1, #2
+    mov x10, #0
+.endm
+.macro Q8R_RESTORE
+    ldp d8, d9, [sp, #0]
+    ldp d10, d11, [sp, #16]
+    ldp d12, d13, [sp, #32]
+    ldp d14, d15, [sp, #48]
+    add sp, sp, #64
+    ret
+.endm
+.macro Q8R_ZERO
+    dup z0.s, #0
+    dup z1.s, #0
+    dup z2.s, #0
+    dup z3.s, #0
+    dup z4.s, #0
+    dup z5.s, #0
+    dup z6.s, #0
+    dup z7.s, #0
+    dup z8.s, #0
+    dup z9.s, #0
+    dup z10.s, #0
+    dup z11.s, #0
+    dup z12.s, #0
+    dup z13.s, #0
+    dup z14.s, #0
+    dup z15.s, #0
+.endm
+.macro Q8R_SCALE reg, pointer
+    ld1rw {z\reg\().s}, p1/z, [\pointer]
+    ld1rw {z28.s}, p1/z, [\pointer, #4]
+    sel z\reg\().s, p2, z\reg\().s, z28.s
+.endm
+.macro Q8R_X token
+    ldr x9, [x5, #(8 * \token)]
+    ld1b {z24.b}, p0/z, [x9, x10]
+    ldr x9, [x6, #(8 * \token)]
+    add x9, x9, x10
+    ld1w {z25.s}, p1/z, [x9]
+.endm
+.macro Q8R_FMA acc, weight, scale
+    dup z26.s, #0
+    sdot z26.s, z\weight\().b, z24.b
+    scvtf z26.s, p1/m, z26.s
+    fmul z27.s, z\scale\().s, z25.s
+    fmla z\acc\().s, p1/m, z26.s, z27.s
+.endm
+
+.global gk_q8r_tile4x4_exact_asm
+.type gk_q8r_tile4x4_exact_asm, %function
+.p2align 3
+gk_q8r_tile4x4_exact_asm:
+    Q8R_SAVE
+    Q8R_ZERO
+    mov x12, x3
+    add x3, x2, x12
+    add x7, x3, x12
+    add x8, x7, x12
+    add x13, x2, x4
+    add x14, x3, x4
+    add x15, x7, x4
+    add x16, x8, x4
+    lsr x4, x4, #6
+.Lq8r4x4_loop:
+    ld1b {z16.b}, p0/z, [x2, x10]
+    ld1b {z17.b}, p0/z, [x3, x10]
+    ld1b {z18.b}, p0/z, [x7, x10]
+    ld1b {z19.b}, p0/z, [x8, x10]
+    Q8R_SCALE 20, x13
+    Q8R_SCALE 21, x14
+    Q8R_SCALE 22, x15
+    Q8R_SCALE 23, x16
+    Q8R_X 0
+    Q8R_FMA 0, 16, 20
+    Q8R_FMA 1, 17, 21
+    Q8R_FMA 2, 18, 22
+    Q8R_FMA 3, 19, 23
+    Q8R_X 1
+    Q8R_FMA 4, 16, 20
+    Q8R_FMA 5, 17, 21
+    Q8R_FMA 6, 18, 22
+    Q8R_FMA 7, 19, 23
+    Q8R_X 2
+    Q8R_FMA 8, 16, 20
+    Q8R_FMA 9, 17, 21
+    Q8R_FMA 10, 18, 22
+    Q8R_FMA 11, 19, 23
+    Q8R_X 3
+    Q8R_FMA 12, 16, 20
+    Q8R_FMA 13, 17, 21
+    Q8R_FMA 14, 18, 22
+    Q8R_FMA 15, 19, 23
+    add x10, x10, #64
+    add x13, x13, #8
+    add x14, x14, #8
+    add x15, x15, #8
+    add x16, x16, #8
+    subs x4, x4, #1
+    b.ne .Lq8r4x4_loop
+    faddv s16, p1, z0.s
+    faddv s17, p1, z1.s
+    faddv s18, p1, z2.s
+    faddv s19, p1, z3.s
+    stp s16, s17, [x0]
+    stp s18, s19, [x0, #8]
+    add x0, x0, x1
+    faddv s16, p1, z4.s
+    faddv s17, p1, z5.s
+    faddv s18, p1, z6.s
+    faddv s19, p1, z7.s
+    stp s16, s17, [x0]
+    stp s18, s19, [x0, #8]
+    add x0, x0, x1
+    faddv s16, p1, z8.s
+    faddv s17, p1, z9.s
+    faddv s18, p1, z10.s
+    faddv s19, p1, z11.s
+    stp s16, s17, [x0]
+    stp s18, s19, [x0, #8]
+    add x0, x0, x1
+    faddv s16, p1, z12.s
+    faddv s17, p1, z13.s
+    faddv s18, p1, z14.s
+    faddv s19, p1, z15.s
+    stp s16, s17, [x0]
+    stp s18, s19, [x0, #8]
+    Q8R_RESTORE
+.size gk_q8r_tile4x4_exact_asm, .-gk_q8r_tile4x4_exact_asm
+
+.global gk_q8r_tile2x8_exact_asm
+.type gk_q8r_tile2x8_exact_asm, %function
+.p2align 3
+gk_q8r_tile2x8_exact_asm:
+    Q8R_SAVE
+    Q8R_ZERO
+    add x3, x2, x3
+    add x13, x2, x4
+    add x14, x3, x4
+    lsr x4, x4, #6
+.Lq8r2x8_loop:
+    ld1b {z16.b}, p0/z, [x2, x10]
+    ld1b {z17.b}, p0/z, [x3, x10]
+    Q8R_SCALE 20, x13
+    Q8R_SCALE 21, x14
+    Q8R_X 0
+    Q8R_FMA 0, 16, 20
+    Q8R_FMA 1, 17, 21
+    Q8R_X 1
+    Q8R_FMA 2, 16, 20
+    Q8R_FMA 3, 17, 21
+    Q8R_X 2
+    Q8R_FMA 4, 16, 20
+    Q8R_FMA 5, 17, 21
+    Q8R_X 3
+    Q8R_FMA 6, 16, 20
+    Q8R_FMA 7, 17, 21
+    Q8R_X 4
+    Q8R_FMA 8, 16, 20
+    Q8R_FMA 9, 17, 21
+    Q8R_X 5
+    Q8R_FMA 10, 16, 20
+    Q8R_FMA 11, 17, 21
+    Q8R_X 6
+    Q8R_FMA 12, 16, 20
+    Q8R_FMA 13, 17, 21
+    Q8R_X 7
+    Q8R_FMA 14, 16, 20
+    Q8R_FMA 15, 17, 21
+    add x10, x10, #64
+    add x13, x13, #8
+    add x14, x14, #8
+    subs x4, x4, #1
+    b.ne .Lq8r2x8_loop
+    faddv s16, p1, z0.s
+    faddv s17, p1, z1.s
+    stp s16, s17, [x0]
+    add x0, x0, x1
+    faddv s16, p1, z2.s
+    faddv s17, p1, z3.s
+    stp s16, s17, [x0]
+    add x0, x0, x1
+    faddv s16, p1, z4.s
+    faddv s17, p1, z5.s
+    stp s16, s17, [x0]
+    add x0, x0, x1
+    faddv s16, p1, z6.s
+    faddv s17, p1, z7.s
+    stp s16, s17, [x0]
+    add x0, x0, x1
+    faddv s16, p1, z8.s
+    faddv s17, p1, z9.s
+    stp s16, s17, [x0]
+    add x0, x0, x1
+    faddv s16, p1, z10.s
+    faddv s17, p1, z11.s
+    stp s16, s17, [x0]
+    add x0, x0, x1
+    faddv s16, p1, z12.s
+    faddv s17, p1, z13.s
+    stp s16, s17, [x0]
+    add x0, x0, x1
+    faddv s16, p1, z14.s
+    faddv s17, p1, z15.s
+    stp s16, s17, [x0]
+    Q8R_RESTORE
+.size gk_q8r_tile2x8_exact_asm, .-gk_q8r_tile2x8_exact_asm
+.purgem Q8R_SAVE
+.purgem Q8R_RESTORE
+.purgem Q8R_ZERO
+.purgem Q8R_SCALE
+.purgem Q8R_X
+.purgem Q8R_FMA

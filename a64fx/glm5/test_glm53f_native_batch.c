@@ -40,6 +40,21 @@ int main(void) {
         for (int t = 0; t < TOKENS; ++t)
             if (glm53f_native_act_prepare(act + t * stride,
                     x + (size_t)t * n, n, 0, 1)) return 1;
+        for (int t = 0; t < TOKENS; ++t) {
+            m[0].output = out + (size_t)t * ROWS;
+            if (glm53f_native_matvec_prepared_n(m, 1, act + (size_t)t * stride)) return 1;
+        }
+        m[0].output = out;
+        if (memcmp(out, ref, sizeof(ref))) return 1;
+        /* Separate activation pointers exercise fused head projections. */
+        for (int t = 1; t < TOKENS; ++t) {
+            const void *activation[2] = {act, act + (size_t)t * stride};
+            int bad = 0;
+#pragma omp parallel reduction(|:bad)
+            bad |= glm53f_native_matvec_multi_team(m, 2, activation) != 0;
+            if (bad || memcmp(out, ref, ROWS * sizeof(float)) ||
+                memcmp(other, ref + (size_t)t * ROWS, ROWS * sizeof(float))) return 1;
+        }
         for (size_t b = 0; b < sizeof(batches) / sizeof(batches[0]); ++b) {
             int tokens = batches[b], bad = 0;
             if (glm53f_native_matvec_batch(m, 2, x, tokens) ||
@@ -56,7 +71,13 @@ int main(void) {
                 fprintf(stderr, "FAIL native batch team columns=%d tokens=%d\n", n, tokens);
                 return 1;
             }
-            ++cases;
+            /* The homogeneous repacked path can use the eight-position tile. */
+            if (glm53f_native_matvec_batch(m, 1, x, tokens) ||
+                memcmp(out, ref, (size_t)tokens * ROWS * sizeof(float))) return 1;
+#pragma omp parallel reduction(|:bad)
+            bad |= glm53f_native_matvec_batch_team(m, 1, act, stride, tokens) != 0;
+            if (bad || memcmp(out, ref, (size_t)tokens * ROWS * sizeof(float))) return 1;
+            cases += 2;
         }
         free(act);
         free(packed);

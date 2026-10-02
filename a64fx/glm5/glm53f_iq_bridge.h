@@ -93,6 +93,10 @@ int glm53f_native_act_prepare_team(void *storage, const float *input, int column
  * activation and the team synchronized. */
 int glm53f_native_matvec_team(const glm53f_native_matrix *m, int count,
                               const void *activation);
+/* One separately prepared input per matrix; call from every team thread.
+ * Output order and per-row arithmetic match separate matvec_team calls. */
+int glm53f_native_matvec_multi_team(const glm53f_native_matrix *m, int count,
+    const void *const *activation);
 int glm53f_native_matvec_prepared_n(const glm53f_native_matrix *m, int count, const void *activation);
 int glm53f_native_matvec_n(const glm53f_native_matrix *m, int count,
                            const float *input);

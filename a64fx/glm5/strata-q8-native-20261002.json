@@ -1,0 +1,164 @@
+{
+  "status": "integrated native build and byte-exact arithmetic passed; sparse and whole-model qualification queued after stage",
+  "job": 52085859,
+  "scope": "complete GLM53F 45-layer UD-Q4_K_XL/top8, 12 A64FX nodes, primary 8049-ID prompt",
+  "best_qualified": {
+    "decode_tok_s": 35.742137,
+    "prefill_tok_s": 370.75401
+  },
+  "targets": {
+    "decode_tok_s": 100,
+    "prefill_tok_s": 2000,
+    "met": false
+  },
+  "native_assembly_units": {
+    "compilers": [
+      "FCC 7.1 fast",
+      "FCC 7.1 conservative"
+    ],
+    "threads": [
+      1,
+      12,
+      47,
+      48
+    ],
+    "tile_modes": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "configurations": 32,
+    "cases_per_configuration": 126,
+    "rows": 37,
+    "tokens": "1,2,3,4,5,7,16,31,32",
+    "columns": [
+      32,
+      96,
+      128,
+      640,
+      768,
+      1024,
+      4096
+    ],
+    "comparison": "byte-exact against raw-Q8 scalar contract",
+    "strong_assembly_symbols": true
+  },
+  "timing_limitations": [
+    "decode v1 probe inherited XOS page settings and did not enable interleave",
+    "noinline and assembly probes ran during bounded model staging; diagnostic only",
+    "uncontended repeats and complete-state/full-output tests queued after staging"
+  ],
+  "artifacts": {
+    "source-v1.tar.gz": {
+      "bytes": 2252346,
+      "sha256": "195b47b6f61e39aa7a492a4e0189fce21edfca891d59c6309d84379efae572e6"
+    },
+    "source-v6.tar.gz": {
+      "bytes": 2403255,
+      "sha256": "2798ceb2fbf445df740192ea4289516532785a872f38448f22d474ea60449aec"
+    },
+    "probe-v1.log": {
+      "bytes": 61195,
+      "sha256": "68c21b1a8b6cc8a60715b99f08fb19e0dffdf9b9c4f4194561b9813a0e825b75"
+    },
+    "probe-noinline-v2.log": {
+      "bytes": 5592,
+      "sha256": "37c41c09934d710b1ea30d2f9f1c77bd951bcdaade145067b49927454be8e363"
+    },
+    "probe-asm-v4.log": {
+      "bytes": 9899,
+      "sha256": "84e4e0218530b9dc9e3cc4bbc9be74cdd86929ca13d4e457bc555cd0ceed4336"
+    },
+    "iq_bridge-v1.s": {
+      "bytes": 2690344,
+      "sha256": "4c3f551b297e00464140245c45f1762f93df4df2e02fcbea5e61f16772586bc7"
+    },
+    "iq_bridge-noinline-v2.s": {
+      "bytes": 2646143,
+      "sha256": "b847344c2f3134cd0e9291c47e44756a642810ee2c35c02d495fad0d5a50696d"
+    },
+    "campaign.sh": {
+      "bytes": 2450,
+      "sha256": "41587639efb3b74864fe5d3b747c63f280a8eabc469220ed57e3f317667b3dfc"
+    },
+    "campaign.py": {
+      "bytes": 3822,
+      "sha256": "46263c96ebd24412539b93384b4ea4f5f3e24ba4251697cc54bd288aa5cfcb7f"
+    },
+    "build-integrated-v6.sh": {
+      "bytes": 1970,
+      "sha256": "ecc2324d7e6e391852d68df7fa019637a4882f66d92200d5403699cc8f73158b"
+    },
+    "build-integrated-v6.log": {
+      "bytes": 64133,
+      "sha256": "4754e38e37613eb5ec63888073e8709c1d60f9ad6037f802c4286912fd60a285"
+    },
+    "bench_mla_projections.c": {
+      "bytes": 2686,
+      "sha256": "efcdd8c42d1a7a64928c6710a06fa3b53d93b547693aeb3c24fc4b2a103d89f3"
+    },
+    "bench_q8_batch.c": {
+      "bytes": 2498,
+      "sha256": "d1ebd30f04cb7ff8024aa583662d23ebf084f71d4cf6901d1372fe4adcf093a2"
+    }
+  },
+  "native_integrated_units": {
+    "compilers": [
+      "FCC 7.1 fast",
+      "FCC 7.1 conservative"
+    ],
+    "threads": [
+      1,
+      12,
+      47,
+      48
+    ],
+    "tile_modes": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "configurations": 64,
+    "cases_per_configuration": 126,
+    "rows": 37,
+    "tokens": "1,2,3,4,5,7,16,31,32",
+    "columns": [
+      32,
+      96,
+      128,
+      640,
+      768,
+      1024,
+      4096
+    ],
+    "comparison": "byte-exact against raw-Q8 scalar contract",
+    "strong_assembly_symbols": true,
+    "row_modes": [
+      0,
+      1
+    ],
+    "build": "candidate-q8-v6",
+    "compiled_prefill_panel": 47,
+    "source_archive_sha256": "2798ceb2fbf445df740192ea4289516532785a872f38448f22d474ea60449aec",
+    "archive_code_files_matched": 443
+  },
+  "binary_sha256": {
+    "bench_glm53f_run_12n": "f5e2000b724892f080cb26487e3f184d64605a7b05bb95392ee9c4bbccc61621",
+    "glm53f_target_decode_12n": "5729e60fc9c96898267e00435ae5f5a7e2348cb6678cc6149b93165d2c3f1eb6"
+  },
+  "contended_projection_probe": {
+    "head_count": 6,
+    "rows_per_head": 128,
+    "columns": 512,
+    "mean_us": {
+      "rows4_separate": 19.893,
+      "rows4_fused": 6.001,
+      "rows8_separate": 18.29,
+      "rows8_fused": 5.875
+    },
+    "comparison": "BIT_EXACT",
+    "performance_qualified": false
+  }
+}

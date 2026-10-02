@@ -98,13 +98,48 @@ Implementation commit `c461079c` matches the frozen runtime source archives.
 The committed [kernel qualification record](strata-kernel-validation-20261002.json)
 contains comparisons, settings, binary/source/evidence hashes and rejected
 experiments. See [resume](../../resume-strata.md) for the allocation and
-immutable remote build paths. No inference campaign remains running.
+immutable remote build paths. A subsequent Q8 campaign is active; see the continuation below and `resume-strata.md`.
 
 Rank-zero diagnostic medians identify the remaining work: decode KDA 6.405,
 mHC 5.764 and MoE 7.582 ms/token; prefill MoE stays near 1.02 ms/token. Sparse
 prefill falls 0.966→0.760 ms/token and decode index 3.459→2.108 ms/token.
 These nested component timers overlap and are separate from the rank-max
 throughput measurements above.
+
+## Q8 continuation (October 2 afternoon, pending full-run qualification)
+
+PJM 52085859 provides another six-hour 12-node allocation, approximately
+12:17–18:17 JST. Bounded restaging is active; the native build passed. Best qualified
+throughput remains **35.742137 decode /370.754010 prefill tok/s**.
+
+The candidates add exact assembly 4×4 and 2×8 row/position tiles, an eight-row
+C decode kernel, and a fused scheduler for independent MLA head projections.
+The assembly keeps the original per-64-column integer dot, scale product,
+FP32 FMA, and final lane reduction order. It avoids the compiler's many
+accumulator spills without changing weight/activation formats. Runtime
+switches are opt-in: `--q8-row-kernel rows8`,
+`--q8-prefill-kernel tile4x4-asm|tile2x8-asm`, and
+`--mla-projection-kernel fused`. Original kernels remain the defaults.
+
+Native assembly arithmetic passed 32 configurations (fast/conservative FCC,
+1/12/47/48 threads and four tile modes), 126 cases per configuration with
+mixed formats and tails. Staging-time diagnostics show encouraging ASM4
+projection times, but are **not performance qualification**. A no-inline-only
+experiment was slower and rejected. The earlier decode probe inherited page
+settings and lacked NUMA interleave, so it cannot select a production kernel.
+
+The immutable `candidate-q8-v6` integrated build passed all 64 configurations
+(fast/conservative ×1/12/47/48 threads ×2 row modes ×4 tile modes), including
+independently prepared head inputs. The source archive matches current code.
+The six-head decode projection probe is byte-exact and measures 19.893→6.001 µs
+for rows4 separate→fused during staging; it needs an uncontended repeat.
+The record is [native Q8 evidence](strata-q8-native-20261002.json).
+A serial post-stage campaign is queued for uncontended probes, sparse
+prefill/decode/rollback, complete-state
+comparison and full 8K/short/32K output and throughput gates. Local evidence
+is `tmp/strata-q8-20261002/`; current progress and artifact hashes are in
+`native-progress.json`. `resume-strata.md` records live PIDs and source paths.
+Neither target has been met; no new runtime setting has been promoted.
 
 ## Implementation
 

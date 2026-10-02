@@ -67,6 +67,14 @@ int main(int argc, char **argv) {
     int mla_kernel = mla_env ? atoi(mla_env) : 1;
     if (index_kernel < 0 || index_kernel > 4 || mla_kernel < 0 || mla_kernel > 3)
         MPI_Abort(MPI_COMM_WORLD, 2);
+    const char *q8_env = getenv("GLM53F_EXECUTOR_Q8_KERNEL");
+    int q8_kernel = q8_env ? atoi(q8_env) : 0;
+    if (q8_kernel < 0 || q8_kernel > 3) MPI_Abort(MPI_COMM_WORLD, 2);
+    if (q8_kernel) {
+        setenv("GLM53F_NATIVE_Q8_ROWS8", "0", 1);
+        setenv("GLM53F_NATIVE_Q8_TILE2X8", "0", 1);
+        setenv("GLM53F_MLA_FUSED_PROJECTION", "0", 1);
+    }
     setenv("GLM53F_MHC_FAST", "1", 1);
     setenv("GLM53F_ROUTER_FUSE", "0", 1);
     setenv("GLM53F_INDEX_HEADS", "0", 1);
@@ -82,6 +90,12 @@ int main(int argc, char **argv) {
     char index_value[16], mla_value[16];
     snprintf(index_value, sizeof(index_value), "%d", index_kernel);
     snprintf(mla_value, sizeof(mla_value), "%d", mla_kernel);
+    if (q8_kernel) {
+        char value[2] = {(char)('0' + q8_kernel), 0};
+        setenv("GLM53F_NATIVE_Q8_ROWS8", "1", 1);
+        setenv("GLM53F_NATIVE_Q8_TILE2X8", value, 1);
+        setenv("GLM53F_MLA_FUSED_PROJECTION", "1", 1);
+    }
     setenv("GLM53F_ROUTER_FUSE", "1", 1);
     setenv("GLM53F_INDEX_HEADS", index_value, 1);
     setenv("GLM53F_MLA_REGISTERS", mla_value, 1);
@@ -104,8 +118,8 @@ int main(int argc, char **argv) {
     MPI_Allreduce(&rel, &maximum, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
     int mismatches;
     MPI_Allreduce(&call.bit_mismatches, &mismatches, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
-    if (!rank) printf("GLM53F_EXECUTOR_CHECK tokens=%d index_kernel=%d mla_kernel=%d hidden_bit_mismatches=%d hidden_rel_l2=%.9g state=%s %s\n",
-        count, index_kernel, mla_kernel, mismatches, maximum, all ? "BIT_EXACT" : "UNCHECKED_OR_MISMATCH", all ? "PASS" : "FAIL");
+    if (!rank) printf("GLM53F_EXECUTOR_CHECK tokens=%d index_kernel=%d mla_kernel=%d q8_kernel=%d hidden_bit_mismatches=%d hidden_rel_l2=%.9g state=%s %s\n",
+        count, index_kernel, mla_kernel, q8_kernel, mismatches, maximum, all ? "BIT_EXACT" : "UNCHECKED_OR_MISMATCH", all ? "PASS" : "FAIL");
     free(hidden); glm53f_target_snapshot_free_12n(initial);
     glm53f_target_model_free_12n(m); glm53f_collective_free_12n();
     MPI_Finalize(); return all ? 0 : 1;

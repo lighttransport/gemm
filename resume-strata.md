@@ -1,12 +1,71 @@
 # Resume: GLM53F Strata-inspired optimization, 12 A64FX nodes
 
-Updated 2026-10-02 09:23 JST. All benchmark and normal-runner qualifications complete; no inference or validation job remains running.
+Updated 2026-10-02 13:16 JST. Native Q8 build/arithmetic passed; bounded staging and queued full-model campaign are active in PJM 52085859.
 
 Previous campaign: TP12 implementation, native validation and
 short/8K/synthetic 32K qualification complete. All new paths remain opt-in.
 Targets: complete 45-layer UD-Q4_K_XL/top-8, saved ~8K single
 request, 100+ delivered decode and 2000+ prefill tok/s. Neither target met.
 See `a64fx/glm5/GLM53F_STRATA.md` for implementation, gates and commands.
+
+## Active continuation (October 2, afternoon)
+
+- Persistent objective remains 100+ delivered decode /2000+ prefill tok/s for
+  the complete 45-layer model and saved 8049-ID single request. Best independently
+  qualified result remains **35.742137 /370.754010**; neither target is met.
+- Fresh PJM **52085859**, 12 nodes, compact 2×3×2, normal 2 GHz /eco 0,
+  starts 12:17 JST and expires approximately 18:17 JST. Compute host
+  `l31-4004b`; repository-local tmux socket `tmp/tmux-glm53f`, session
+  `glm53f-strata-next3`. Bridge ports remain 42446→32446→21264.
+  Live bridge session `tmp/bash-http-glm53f-strata/session`.
+- Detached native probe/stage **PID 200**, remote
+  `tmp/strata-q8-20261002/driver-v1.log`, `probe-v1.log`, `stage.log`.
+  Frozen source `source-v1.tar.gz`, native scratch
+  `/local/glm53f-q8-tiles-52085859`. Arithmetic sweeps use fast/conservative
+  FCC, 1/12/47/48 threads and every row/tile setting. Then an uncontended
+  synthetic decode probe precedes bounded 12-rank staging with immutable
+  `candidate-v15` stage tools. Never overlap an additional MPI job with stage.
+- Frozen current candidate **source-v6.tar.gz**, shared immutable binary target
+  **candidate-q8-v6**, scratch `/local/glm53f-q8-integrated-v6-52085859`.
+  Complete integrated build/64-configuration arithmetic sweep **PASS**;
+  PID 2812 has exited. Log `tmp/strata-q8-20261002/build-integrated-v6.log`.
+  All 64 fast/conservative ×1/12/47/48 threads ×2 row modes ×4 tile modes
+  pass 126 cases each, including independent inputs and mixed/tail cases.
+  Frozen archive code/script files match the current implementation.
+  Committed evidence record `a64fx/glm5/strata-q8-native-20261002.json`.
+  v5 failed because the wrapper's default prefix points at a missing
+  installation; v5b failed because the archive omitted uTofu headers.
+  Both were corrected before v6: set `OPAL_PREFIX=/opt/FJSVxtclanga/tcsds-1.2.43`,
+  clear `OMPI_CC OMPI_CXX`, and archive tracked `a64fx/utofu-tests` dependencies.
+- Experimental opt-in: `--q8-row-kernel rows8`, prefill `tile2x8` / `tile4x4-asm` /
+  `tile2x8-asm`, and `--mla-projection-kernel fused`. Defaults are original
+  rows4 / C tile4x4 / separate head projections. Fused projections preserve
+  each independently prepared input with one shared row scheduler/barrier.
+  C rows8 and wider tile have no promotion evidence. No-inline/unroll-only
+  experiment is slower and rejected. Exact assembly tiles retain sixteen
+  accumulators without loop spills; 32 native configurations passed
+  fast/conservative ×1/12/47/48 threads ×4 tile modes, 126 cases each.
+  Mixed descriptors and row/position tails preserve original arithmetic.
+- Staging-time assembly diagnostics: C4→ASM4 at 32 positions, 768×4096
+  **130.480→98.809 µs**, 1536×4096 **244.362→182.748 µs**, and production
+  per-head 128×512 **21.032→11.286 µs**. These are contended diagnostics,
+  not uncontended kernel qualification or full-model tok/s claims.
+  The six-head 128×512 decode projection probe also passes byte-exactly:
+  rows4 separate **19.893 µs** vs fused **6.001 µs**, rows8 separate
+  **18.290 µs** vs fused **5.875 µs**. All are staging-time diagnostics.
+  Evidence `tmp/strata-q8-20261002/native-progress.json`.
+- Post-stage campaign **PID 3129**, `tmp/strata-q8-20261002/campaign.log`,
+  waits on live stage PID 200 and build PID 2812, checks both completion
+  sentinels, then runs five uncontended projection/tile probe repeats;
+  actual sparse prefill47 at warm2046 and decode/rollback4 at warm8049;
+  128-position hidden/full-state executor gate; 8K frozen/rebuilt controls
+  and row/tile/fused ablations; independent five-trial confirmation; 1024
+  transitions; short128 and repeated32K exact-output qualification.
+  Scripts `campaign.{sh,py}`. All MPI steps run serially after staging.
+  No new end-to-end result or promotion yet. Check live PIDs and logs before
+  resuming; do not duplicate or overlap this campaign.
+- Original remote working tree remains untouched; isolated snapshot remains
+  `~/work/gemm/glm53f-strata-20261001`. No pushes authorized or performed.
 
 ## Completed continuation (October 2)
 
@@ -34,7 +93,9 @@ See `a64fx/glm5/GLM53F_STRATA.md` for implementation, gates and commands.
   gate passed with zero hidden/state bit mismatches.
   Wider mHC tiles rejected
   for slower native probes; no runtime mHC tile path retained.
-- Unset `OPAL_PREFIX OMPI_CC OMPI_CXX` before invoking system `mpifcc`.
+- Historical wrapper setup cleared `OPAL_PREFIX OMPI_CC OMPI_CXX`. For the
+  current allocation, clear `OMPI_CC OMPI_CXX` and set
+  `OPAL_PREFIX=/opt/FJSVxtclanga/tcsds-1.2.43`; the unconfigured default is missing.
   Never use global `set -e` in the persistent bridge shell; use child scripts.
 - Detached campaign PID **3675**, `tmp/strata-20261002/kernel-campaign.log`,
   waits for stage completion, then runs uncontended native arithmetic/timing,
