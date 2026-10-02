@@ -1,0 +1,106 @@
+/* Identical-input real-weight KDA diagnostic; no full-model residency. */
+#define GLM53F_KDA_NO_MAIN
+#include "glm53f_kda_layer_12n.c"
+#include <inttypes.h>
+static int report(const float *reference, const float *actual, int count,
+        int layer, int tokens, const char *field) {
+    double norm = 0, error = 0;
+    uint64_t bits = 0;
+    int finite = 1;
+    for (int i = 0; i < count; ++i) {
+        uint32_t a, b;
+        memcpy(&a, reference + i, 4); memcpy(&b, actual + i, 4);
+        finite &= (a & 0x7f800000u) != 0x7f800000u &&
+                  (b & 0x7f800000u) != 0x7f800000u;
+        bits += a != b;
+        double delta = (double)actual[i] - reference[i];
+        norm += (double)reference[i] * reference[i]; error += delta * delta;
+    }
+    double relative = norm ? sqrt(error / norm) : 0;
+    int pass = finite && (norm ? relative <= 1e-3 : !bits);
+    printf("GLM53F_KDA_CROSS layer=%d tokens=%d field=%s rel_l2=%.17g bit_mismatches=%" PRIu64 " finite=%d %s\n",
+        layer, tokens, field, relative, bits, finite, pass ? "PASS" : "FAIL");
+    fflush(stdout);
+    return !pass;
+}
+
+
+static void gather_heads(const float *input, float *output, int width,
+        const glm53f_kda_context_12n *c, MPI_Comm comm, int ranks) {
+    int counts[12], offsets[12];
+    for (int r = 0; r < ranks; ++r) {
+        int first, count; glm53f_balanced_slice(NH, r, ranks, &first, &count);
+        counts[r] = count * width; offsets[r] = first * width;
+    }
+    MPI_Gatherv(input, c->hn * width, MPI_FLOAT, output, counts, offsets,
+        MPI_FLOAT, 0, comm);
+}
+int main(int argc, char **argv) {
+    int rank, ranks, provided, failed = 0;
+    MPI_Init_thread(&argc, &argv, MPI_THREAD_SERIALIZED, &provided);
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank); MPI_Comm_size(MPI_COMM_WORLD, &ranks);
+    if (argc != 5 || ranks != 12 || provided < MPI_THREAD_SERIALIZED)
+        MPI_Abort(MPI_COMM_WORLD, 2);
+    glm53f_parallel_config config = glm53f_parallel_default();
+    config.layout = GLM53F_PP3_TP4;
+    glm53f_dist dist;
+    if (glm53f_dist_init(&dist, MPI_COMM_WORLD, &config)) MPI_Abort(MPI_COMM_WORLD, 2);
+    dist.core_stage = argv[4];
+    if (setenv("GLM53F_Q2_KDA_STAGE", argv[2], 1) ||
+        setenv("GLM53F_KDA_WIDE_TILE", "1", 1) ||
+        setenv("GLM53F_KDA_BATCH_TEAM", "1", 1) ||
+        setenv("GLM53F_KDA_PREFILL", "1", 1)) MPI_Abort(MPI_COMM_WORLD, 2);
+    float *x = a256(64 * H * sizeof(float));
+    float *reference = a256(64 * H * sizeof(float));
+    float *actual = a256(64 * H * sizeof(float));
+    float *wide_reference = a256(NH * D * D * sizeof(float));
+    float *wide_actual = a256(NH * D * D * sizeof(float));
+    for (int i = 0; i < 64 * H; ++i)
+        x[i] = (float)(((i * 17 + 3) % 251) - 125) / 125.0f;
+    glm53f_prefill_config prefill = {GLM53F_PREFILL_FAST, 32, 27, NULL, 1};
+    for (int layer = 0; layer < 3; ++layer) {
+        glm53f_kda_context_12n *a = glm53f_kda_create_12n(argv[1], layer);
+        glm53f_kda_context_12n *b = dist.map.stage == 0 ?
+            glm53f_kda_create_dist(&dist, argv[1], argv[3], layer) : NULL;
+        if (!a || (dist.map.stage == 0 && !b)) MPI_Abort(MPI_COMM_WORLD, 2);
+        glm53f_kda_configure_prefill_12n(a, &prefill);
+        if (b) glm53f_kda_configure_prefill_12n(b, &prefill);
+        for (int test = 0; test < 3; ++test) {
+            int tokens = test == 0 ? 1 : test == 1 ? 64 : 63;
+            glm53f_kda_reset_12n(a); if (b) glm53f_kda_reset_12n(b);
+            int rc = test == 0 ? glm53f_kda_sublayer_12n(a, reference, x) :
+                glm53f_kda_sublayer_batch_12n(a, reference, x, tokens);
+            if (rc) MPI_Abort(MPI_COMM_WORLD, 2);
+            if (b) {
+                rc = test == 0 ? glm53f_kda_sublayer_12n(b, actual, x) :
+                    glm53f_kda_sublayer_batch_12n(b, actual, x, tokens);
+                if (rc) MPI_Abort(MPI_COMM_WORLD, 2);
+            }
+            if (!rank) printf("GLM53F_KDA_CROSS_PATH layer=%d tokens=%d TP12_gemm=%d TP4_gemm=%d native_aux=%d,%d\n",
+                layer, tokens, a->kg_state, b->kg_state, a->q2_aux, b->q2_aux);
+            gather_heads(a->state, wide_reference, D * D, a, MPI_COMM_WORLD, 12);
+            if (b) gather_heads(b->state, wide_actual, D * D, b, dist.tp, 4);
+            if (!rank) failed |= report(wide_reference, wide_actual, NH * D * D, layer, tokens, "state");
+            for (int kind = 0; kind < 3; ++kind) {
+                gather_heads(a->conv + kind * a->qd * KERNEL, wide_reference, D * KERNEL, a, MPI_COMM_WORLD, 12);
+                if (b) gather_heads(b->conv + kind * b->qd * KERNEL, wide_actual, D * KERNEL, b, dist.tp, 4);
+                if (!rank) failed |= report(wide_reference, wide_actual, NH * D * KERNEL, layer, tokens, kind == 0 ? "q_conv" : kind == 1 ? "k_conv" : "v_conv");
+            }
+            for (int t = 0; t < tokens; ++t) {
+                gather_heads(test ? a->bnormed + t * a->qd : a->normed,
+                    wide_reference, D, a, MPI_COMM_WORLD, 12);
+                if (b) gather_heads(test ? b->bnormed + t * b->qd : b->normed,
+                    wide_actual, D, b, dist.tp, 4);
+                if (!rank) failed |= report(wide_reference, wide_actual, NH * D,
+                    layer, tokens, "normed");
+            }
+            if (!rank) failed |= report(reference, actual, tokens * H, layer, tokens, "output");
+            MPI_Barrier(MPI_COMM_WORLD);
+        }
+        glm53f_kda_free_12n(a); glm53f_kda_free_12n(b);
+    }
+    MPI_Bcast(&failed, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    if (!rank) printf("GLM53F_KDA_CROSS_LAYOUT_%s\n", failed ? "FAIL" : "PASS");
+    free(wide_actual); free(wide_reference); free(actual); free(reference); free(x);
+    glm53f_dist_free(&dist); MPI_Finalize(); return failed ? 1 : 0;
+}

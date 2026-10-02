@@ -1,0 +1,34 @@
+{
+  "date": "2026-10-03",
+  "allocation": 52116293,
+  "status": "identical_input_component_gates_PASS_full_PP_gate_still_FAIL",
+  "promoted": false,
+  "layers": [
+    0,
+    1,
+    2
+  ],
+  "dense": {
+    "cases": 36,
+    "gate_up_activation": "bit-exact",
+    "maximum_output_relative_l2": 1.52553964892421e-07,
+    "binary_sha256": "a9b8f8012fad0a219c15c1855ba94f03290c39c4135fee5f166334c7c9004e65"
+  },
+  "kda": {
+    "tiles": [
+      1,
+      63,
+      64
+    ],
+    "state_convolution_normalized_heads": "bit-exact",
+    "maximum_output_relative_l2": 1.7531556467061643e-07,
+    "fast_path": "KDA_BATCH_TEAM=1 KDA_WIDE_TILE=1 KDA_PREFILL=1; features27; GEMM state1 verified for both layouts at63/64",
+    "binary_sha256": "e1d3cf3a101cdb46c929633ee777b9a4ac55776135ecb7869761b4a72651b066"
+  },
+  "limitations": [
+    "Synthetic identical inputs, MPI reductions, isolated first three layers; not an actual-prompt end-to-end PP qualification",
+    "Initial KDA v1 lacked batch-team flag and checked uninitialized bnormed after scalar fallback. Those norm failures were diagnostic fixture errors, preserved in kda-cross-v1 rank logs; corrected v2 passes."
+  ],
+  "inference": "Local projection/state kernels do not show large intrinsic partition errors; small final-output rounding and subsequent quantization amplification remain to be isolated through mHC with actual prompt inputs.",
+  "log_root": "tmp/strata-pipeline-20261003"
+}
