@@ -781,7 +781,7 @@ Further dependency removal (items 6, 9, 10 and 12):
 | Video parity campaign | Framework-free dump conversion, bounded-memory comparison and 144-case coverage audit; official inference is an isolated Torch oracle |
 | Rig asset helpers | Contact export and shape smoothing use NumPy/SciPy; corrective training loads `mldeformer_training` lazily |
 | Motion evaluation | Native GRU by default; Torch full-sequence comparison only with `--reference-parity` |
-| Identity reference creation | Native FLUX.2 F16/repository-GEMM neutral and reference-conditioned expression paths; full distilled-4B four-step T2I/I2I parity passed with CPU text conditioning; CUDA text precision validation in progress |
+| Identity reference creation | Native FLUX.2 F16/repository-GEMM neutral and reference-conditioned expressions; full distilled-4B four-step T2I/I2I parity passed with CUDA text encoding and FP32 KV storage; no Torch/ONNX inference |
 
 Photo and video landmark/blendshape inference now uses the native C++ executor
 and repository AVX2 GEMM. The pinned MediaPipe task is converted with NumPy and

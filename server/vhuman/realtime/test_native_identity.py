@@ -28,7 +28,9 @@ class NativeIdentityTests(unittest.TestCase):
 
     def fake_generate(self, command, **kwargs):
         self.assertIn('--no-dumps', command)
-        self.assertNotIn('--gpu-enc', command)
+        self.assertIn('--gpu-enc', command)
+        self.assertIn('--no-text-cache', command)
+        self.assertNotIn('--keep-gpu-enc', command)
         self.assertEqual(command[command.index('--weight-type') + 1], 'f16')
         self.assertEqual(command[command.index('--conditioning') + 1], 'diffusers')
         self.assertEqual(command[command.index('--gemm') + 1], 'repo')
@@ -45,6 +47,7 @@ class NativeIdentityTests(unittest.TestCase):
             self.assertEqual(result['images'], 1)
             manifest = json.loads((output / 'manifest.json').read_text())
             self.assertEqual(manifest['parity'], 'unverified')
+            self.assertEqual(manifest['text_backend'], 'cuda_f32_kv')
             self.assertEqual(manifest['provenance'][0]['conditioning'], [])
             native.generate(output, self.config, 7, 'neutral', runner=self.runner, resume=True)
             run.assert_called_once()
@@ -84,6 +87,9 @@ class NativeIdentityTests(unittest.TestCase):
         for i, receipt in enumerate(spec['provenance'][1:], 1):
             self.assertEqual(receipt['seed'], 7+i)
             self.assertEqual(receipt['conditioning'], [spec['provenance'][0]['sha256']])
+        with patch.dict(native.EXPRESSION_PROMPTS, {'smile': 'Changed expression recipe'}):
+            with self.assertRaisesRegex(ValueError, 'prompt/control receipt differs'):
+                native.generate(output, self.config, 7, 'neutral', expressions=True, resume=True, runner=self.runner)
 
     def test_hf_cache_symlinks_are_hash_checked(self):
         weights = self.root / 'encoder/weights.safetensors'

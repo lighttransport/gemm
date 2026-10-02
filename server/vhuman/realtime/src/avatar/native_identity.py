@@ -10,6 +10,18 @@ from .provenance import sha256, verify_files
 
 ROOT = Path(__file__).resolve().parents[5]
 MODEL = 'black-forest-labs/FLUX.2-klein-4B'
+# Model-specific wording; preserve the shared expression names/control schema.
+EXPRESSION_PROMPTS = {
+    'smile': ('A restrained closed-mouth smile: both mouth corners rise gently while the upper and lower '
+              'lips remain fully touching. The lips cover every tooth. The jaw stays closed. '
+              'The eyes and eyebrows remain relaxed.'),
+    'brows_up': ('The person looks astonished, raising both eyebrows very high so the eyebrows sit '
+                 'noticeably farther above the eyes. Both eyes are wide open. The forehead has '
+                 'horizontal creases, and the lips remain closed and relaxed.'),
+    'jaw_open': ('Open the mouth wide to say ah, with the lower jaw lowered, front teeth visible and '
+                 'tongue resting flat. Keep the lips soft and unrounded, their width unchanged from '
+                 'the neutral reference. The cheeks and eyebrows stay relaxed. No smile or lip pursing.'),
+}
 
 
 def load_assets(config):
@@ -77,7 +89,8 @@ def generate(output, config, seed, prompt, *, expressions=False, resume=False,
         raise ValueError('native identity generation requires --native-assets with verified FLUX.2 component paths')
     specs = [('neutral', prompt, {})]
     if expressions:
-        specs += [(name, KEEP + ' ' + text, controls) for name, (text, controls, _) in EXPRESSIONS.items()]
+        specs += [(name, KEEP + ' ' + EXPRESSION_PROMPTS.get(name, text), controls)
+                  for name, (text, controls, _) in EXPRESSIONS.items()]
     if type(seed) is not int or not 0 <= seed <= 2**63-len(specs) or type(device) is not int or device < 0:
         raise ValueError('invalid seed/device')
     runner = Path(runner) if runner else ROOT / 'cuda/flux2/test_cuda_flux2'
@@ -87,7 +100,7 @@ def generate(output, config, seed, prompt, *, expressions=False, resume=False,
     asset_hash, runner_hash = sha256(config), sha256(runner)
     output = Path(output).resolve()
     manifest_path = output / 'manifest.json'
-    recipe = 'diffusers_512_right_padding_reference_t10'
+    recipe = 'diffusers_512_right_padding_reference_t10_cuda_f32_kv'
     if manifest_path.exists():
         manifest = json.loads(manifest_path.read_text())
         if (not resume or manifest.get('backend') != 'native_flux2' or
@@ -110,7 +123,8 @@ def generate(output, config, seed, prompt, *, expressions=False, resume=False,
                         backend='native_flux2', assets_sha256=asset_hash, assets=assets, runner_sha256=runner_hash,
                         neutral_prompt=prompt, conditioning_recipe=recipe, references=[], provenance=[],
                         requires_manual_identity_and_pose_QA=True, parity='unverified',
-                        precision='F16 DiT weights converted from selected checkpoint', gemm='repo')
+                        precision='F16 DiT weights converted from selected checkpoint', gemm='repo',
+                        text_backend='cuda_f32_kv')
     def checkpoint():
         partial = manifest_path.with_suffix('.json.partial')
         partial.write_text(json.dumps(manifest, indent=2) + '\n')
@@ -124,6 +138,7 @@ def generate(output, config, seed, prompt, *, expressions=False, resume=False,
                    '--enc', str(paths['encoder']), '--tok', str(paths['tokenizer']), '--prompt', text,
                    '--height', '512', '--width', '512', '--steps', '4', '--seed', str(seed + index),
                    '--weight-type', 'f16', '--gemm', 'repo', '--conditioning', 'diffusers',
+                   '--gpu-enc', '--no-text-cache',
                    '--device', str(device), '--no-dumps', '--out', str(ppm)]
         if index:
             with Image.open(output / 'neutral.png') as neutral:

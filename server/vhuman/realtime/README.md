@@ -179,22 +179,25 @@ the request-start acknowledgement, and older resident binaries are incompatible.
 
 ## Clean identity and appearance training
 
+After staging the hashed assets described below, generate native references:
+
 ```sh
-sh server/vhuman/realtime/run.sh generate-identity \
-  --identity-backend torch-reference \
-  --output tmp/vhuman-realtime/clean-identity-001 --expressions
+python -m server.vhuman.realtime generate-identity \
+  --native-assets tmp/vhuman-realtime/flux2-assets.json \
+  --output tmp/vhuman-realtime/native-identity --expressions
 # Uses only the newly generated neutral image as expression conditioning.
 tmp/vhuman-rig-venv/bin/python -m server.vhuman.cli \
   --work tmp/vhuman-realtime/clean-heads \
   --rig-python tmp/vhuman-rig-venv/bin/python portrait-reconstruct \
-  --portrait tmp/vhuman-realtime/clean-identity-001/neutral.png \
+  --portrait tmp/vhuman-realtime/native-identity/neutral.png \
   --face-model gnm_v3 --profile full --res 512 --gaussians 0
 ```
 
-The command above explicitly selects the offline Torch reference provider.
 The default `--identity-backend native` invokes the existing C/CUDA FLUX.2
 runner for a neutral portrait and, with `--expressions`, twelve image-conditioned
-expression portraits. It requires hashed, locally staged assets:
+expression portraits. `--identity-backend torch-reference` explicitly selects
+the optional offline Torch oracle. Native generation requires hashed, locally
+staged assets:
 
 ```sh
 make -C cuda/flux2
@@ -230,25 +233,49 @@ image is checkpointed with its prompt, controls, seed and conditioning hash;
 `--resume` can extend a neutral-only identity or continue interrupted expressions.
 Approximate expression labels still require visual review.
 
-The independent FP32 Qwen comparison passed with relative L2 `1.29e-5`, including
-padding-query states. Full four-step distilled-4B comparisons passed using original
-BF16 DiT weights and independently computed FP32 Qwen/DiT/VAE references:
+The native adapter uses CUDA text encoding with FP32 KV storage, releases that
+encoder before loading the DiT and disables sidecar text-weight caches so verified
+model directories remain unchanged. Its full padded features match independent
+FP32 Qwen with relative L2 `2.35e-5` (`1.29e-5` for the optional CPU encoder).
+Full four-step distilled-4B comparisons passed using original BF16 DiT weights
+and independently computed FP32 Qwen/DiT/VAE references:
 
-| CPU text conditioning | Final latent relative L2 | Decoded RGB relative L2 |
+| CUDA text conditioning | Final latent relative L2 | Decoded RGB relative L2 |
 |---|---:|---:|
-| Text-to-image, 512 square | 0.002419 | 0.002299 |
-| One reference image, 512 square | 0.004878 | 0.001673 |
+| Text-to-image, 512 square | 0.001882 | 0.001363 |
+| One reference image, 512 square | 0.004880 | 0.001700 |
+| Text-to-image, 256×384 | 0.001267 | 0.001003 |
+| One reference image, 256×384 | 0.005067 | 0.002101 |
 
 Every intermediate velocity and Euler latent passed the 2% relative-L2 gate.
 The image encoder alone had relative L2 `0.006803` against FP32. Validation uses
 `ref/vhuman/verify_flux2.py`, outside inference; receipts and tensors are under
-`tmp/vhuman-flux2-parity/`. The adapter still uses CPU text extraction pending the final image comparison
-for CUDA text. CUDA Qwen now uses FP32 KV storage and corrected IEEE half
-weight conversion; its full padded features match FP32 with relative L2
-`2.35e-5`. The old converter discarded half subnormals, and old F16 sidecar
+`tmp/vhuman-flux2-parity/`. The optional CPU text path also passed both full
+pipelines (decoded relative L2 `0.002299` / `0.001673`). CUDA Qwen uses corrected
+IEEE half weight conversion. The old converter discarded half subnormals, and old F16 sidecar
 caches are invalidated by a format-version bump. The converter passes exhaustive
 BF16/F16 and half-rounding-boundary checks against x86 F16C hardware. Earlier compact
 text/FP8 smoke outputs are not parity or quality evidence for this recipe.
+These results cover distilled Klein 4B, four steps and one image reference;
+base/9B checkpoints and multiple references are not validated by these checks.
+
+On RTX 5060 Ti, a real native adapter neutral-to-smile run and resume passed
+without importing Torch/ONNX/MediaPipe. Peak process VRAM was 8,636 / 9,008 MiB,
+host RSS 22,210 / 22,125 MiB, and generation took 61.8 / 71.0 seconds. The
+complete twelve-expression scheduling, interrupted generation, changed-prompt
+rejection and hash-checked resume have separate unit coverage.
+
+Native Klein prompts for smile, raised brows and jaw opening were refined using
+one fixed reference portrait and seeds 8/9/10. The smile now keeps lips closed
+(jaw-open score 0.036 → 0.0014); raised-brow scores improved from 0.313 inner /
+0.041 and 0.074 outer to 0.790 / 0.915 and 0.846. The jaw-opening image increased
+its jaw score from 0.629 to 0.736 while reducing mean smile score from 0.698 to
+0.276 without introducing strong lip pursing. A second identity also produced a
+closed-mouth smile in the adapter smoke test. These native landmark scores and
+visual checks are diagnostics; residual expression mixing and approximate
+control labels still require review before training. The other nine expression
+prompts have not received this native quality check. Final contact sheets and
+receipts are in `tmp/vhuman-flux2-parity/expressions-final/` and `adapter-smoke/`.
 
 Reference generator: [Apache FLUX.2-klein-4B](https://huggingface.co/black-forest-labs/FLUX.2-klein-4B)
 at `e7b7dc27f91deacad38e78976d1f2b499d76a294`. Model CPU offload limits peak VRAM.
