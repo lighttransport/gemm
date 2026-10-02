@@ -182,14 +182,15 @@ int hv15n_generate(hv15n_context *ctx, const hv15n_request *r, const hv15n_callb
             Weights weights(denoiser);
             for (int step = 0; step < steps; step++) {
                 notify(step, steps);
-                auto positive = dit(g, weights, latent, condition, text, glyph, vision, sigmas[step] * 1000.f,
-                                    sigmas[step + 1] * 1000.f);
-                if (step == 0)
-                    g.dump(positive, dump, "dit_first", true);
-                if (steps == 50) {
-                    Tensor empty;
-                    auto uncond = dit(g, weights, latent, condition, negative, empty, vision,
-                                      sigmas[step] * 1000.f, sigmas[step + 1] * 1000.f);
+                Tensor positive,uncond;
+                if(steps==50) {
+                    auto predictions=dit_pair(g,weights,latent,condition,text,negative,glyph,vision,
+                                              sigmas[step]*1000.f,sigmas[step+1]*1000.f);
+                    positive=std::move(predictions.first);uncond=std::move(predictions.second);
+                } else positive=dit(g,weights,latent,condition,text,glyph,vision,
+                                    sigmas[step]*1000.f,sigmas[step+1]*1000.f);
+                if(step==0)g.dump(positive,dump,"dit_first",true);
+                if(steps==50) {
                     auto difference = g.op(positive, 1, &uncond, nullptr, -1.f);
                     positive = g.op(uncond, 1, &difference, nullptr, 6.f);
                 }

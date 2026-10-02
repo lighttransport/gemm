@@ -15,6 +15,10 @@ test or the fast12 result.
 
 Measured component results and exact checks are in [VALIDATION.md](VALIDATION.md).
 Measured native/PyTorch timing comparisons are in [PERFORMANCE.md](PERFORMANCE.md).
+The optimized build has passed production-shape block, attention, encoder and
+VAE tile checks. Its full-video performance and quality remain provisional.
+Use a separate `BUILD=../../tmp/hv15-native/opt-build` while a frozen baseline
+or quality campaign is running; do not rebuild that campaign's runner.
 
 Supported requests are 480×848, 81 frames, 24 fps: quality T2V and I2V use
 50 Euler steps, CFG 6, shift 5; distilled I2V uses 12 steps, CFG 1, shift 7 and
@@ -93,16 +97,30 @@ video listing can discover this layout without a server change. T2V uses the
 standalone generator because it does not have an input head portrait.
 
 `--gemm repo` selects the repository's FP16-input/FP32-accumulate PTX GEMM.
-Tall matrices use a private 64×128 tile derived from the same repository PTX
-fragments; small matrices use its original 16×256 tile. Shared GEMM sources
-are read-only inputs. DiT attention tensors are released before its large MLP.
+Compatible large projections use repository v7 with padded grids and guarded
+tails. Other shapes retain the private original GEMM paths. Shared GEMM and
+FlashAttention2 sources are read-only inputs. DiT uses FP16 FlashAttention2
+with FP32 softmax reductions, fused head normalization/RoPE/packing,
+normalization/modulation and residual gates. Unsupported dimensions, masks,
+GQA and encoder attention retain the existing paths. Attention tensors are
+released before the large MLP. Quality processes both CFG branches per block
+so they share each weight upload; its CFG-6 arithmetic and Euler schedule remain
+unchanged.
 `--gemm-fallback cublas` explicitly permits IEEE FP32 cuBLAS for the encoders.
 `--gemm-fallback error` uses the native IEEE kernel for those operations, avoiding
 cuBLAS entirely. `--gemm cublas` selects the comparison backend. Call counts and
-fallback counts are recorded. Activations and online softmax sums are FP32.
-Attention uses bounded key tiles rather than an N×N score allocation. Weights
-are mapped on the host and uploaded by operation; VAE spatial tiles retain
-full temporal context and only two completed rows on the host.
+fallback counts are recorded. Encoder projections use IEEE FP32 arithmetic,
+including a private register-tiled kernel in strict repo mode. Residual states
+and reductions stay FP32; DiT attention and fused VAE norm/SiLU intermediates
+use FP16. Attention uses bounded tiles rather than an N×N score allocation.
+Weights are mapped on the host, transferred through bounded pinned staging,
+and cached by immutable file identity. DiT overlaps next-block transfer with
+compute, retaining a fixed six-block prefix; its other blocks stream through
+the same reusable buffer pool. VAE convolutions use an implicit-GEMM gather
+derived privately from repository v7, with a bounded FP16 im2col fallback.
+VAE spatial tiles retain full temporal context and only two completed rows on
+the host. The C API and vHuman adapter accept the same arguments and outputs;
+select an isolated candidate with the existing `--runner` argument.
 
 `--vram-budget-mib` defaults to 14336 and caps managed allocations at the budget
 minus 3072 MiB for driver/vendor workspace. The Python wrapper also samples

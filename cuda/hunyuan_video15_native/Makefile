@@ -9,7 +9,7 @@ CFLAGS ?= -O2 -Wall -Wextra
 LDLIBS := -ldl -lm -lpcre2-8 -pthread
 SOURCES := gpu.cpp loader.cpp encoders.cpp dit.cpp vae.cpp hv15_native.cpp
 OBJECTS := $(addprefix $(BUILD)/,$(SOURCES:.cpp=.o)) $(BUILD)/cuew.o $(BUILD)/cublasew.o
-HEADERS := $(wildcard *.hpp) hv15_native.h ../cuew.h ../cublasew.h ../gemm/cuda_gemm_ptx_kernels.h $(ROOT)/common/safetensors.h $(ROOT)/common/stb_image.h
+HEADERS := $(wildcard *.hpp) hv15_native.h ../cuew.h ../cublasew.h ../gemm/cuda_gemm_ptx_kernels.h ../fa2/cuda_fa2_kernels.h $(ROOT)/common/safetensors.h $(ROOT)/common/stb_image.h
 .PHONY: all test compile-kernels clean
 all: $(BUILD)/hv15n $(BUILD)/libhv15n.so $(BUILD)/tokenizer_probe $(BUILD)/component_probe
 $(BUILD):
@@ -38,4 +38,7 @@ test: all $(BUILD)/test_host
 compile-kernels: $(BUILD)/hv15n
 	$(BUILD)/hv15n --compile-kernels
 clean:
-	rm -f $(OBJECTS) $(BUILD)/hv15n $(BUILD)/libhv15n.so $(BUILD)/test_host $(BUILD)/test_gpu $(BUILD)/component_probe $(BUILD)/tokenizer_probe
+	rm -f $(OBJECTS) $(BUILD)/hv15n $(BUILD)/libhv15n.so $(BUILD)/test_host $(BUILD)/test_gpu $(BUILD)/component_probe $(BUILD)/tokenizer_probe $(BUILD)/replay_probe
+
+$(BUILD)/replay_probe: replay_probe.cpp $(OBJECTS)
+	TMPDIR=$(abspath $(BUILD)) $(CXX) $(CXXFLAGS) $^ $(LDLIBS) -o $@

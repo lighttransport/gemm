@@ -24,6 +24,12 @@ __global__ void convert_half(half*y,const float*x,int rows,int channels,int padd
     int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=rows*padded)return;
     int r=i/padded,c=i%padded; y[i]=__float2half(c<channels?x[r*channels+c]:0.f);
 }
+__global__ void convert_float(float*y,const half*x,int count) {
+    int i=blockIdx.x*blockDim.x+threadIdx.x; if(i<count)y[i]=__half2float(x[i]);
+}
+__global__ void convert_bfloat(float*y,const unsigned short*x,int count) {
+    int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<count)y[i]=__uint_as_float((unsigned)x[i]<<16);
+}
 __global__ void hv15n_norm(float*y,const float*x,const float*w,const float*b,int rows,int channels,int rms,float eps) {
     int row=blockIdx.x,tid=threadIdx.x;if(row>=rows)return;
     __shared__ float s[256],q[256];float sum=0.f,sq=0.f;
@@ -33,6 +39,45 @@ __global__ void hv15n_norm(float*y,const float*x,const float*w,const float*b,int
     float mean=rms?0.f:s[0]/channels;
     float inverse=rms==2?sqrtf(float(channels))/fmaxf(sqrtf(q[0]),1.e-12f):rsqrtf(fmaxf(q[0]/channels-mean*mean,0.f)+eps);
     for(int c=tid;c<channels;c+=256)y[row*channels+c]=(x[row*channels+c]-mean)*inverse*(w?w[c]:1.f)+(b?b[c]:0.f);
+}
+__global__ void norm_silu_half(half*y,const float*x,const float*w,const float*b,int rows,int c) {
+    int row=blockIdx.x*8+(threadIdx.x>>5),lane=threadIdx.x&31;if(row>=rows)return;
+    float square=0.f;for(int j=lane;j<c;j+=32){float v=x[row*c+j];square+=v*v;}
+    for(int d=16;d;d>>=1)square+=__shfl_xor_sync(0xffffffff,square,d);
+    float inverse=sqrtf(float(c))/fmaxf(sqrtf(square),1.e-12f);
+    for(int j=lane;j<c;j+=32){float v=x[row*c+j]*inverse*w[j]+(b?b[j]:0.f);y[row*c+j]=__float2half(v/(1.f+expf(-v)));}
+}
+__global__ void modulate_norm(float*y,const float*x,const float*mod,int rows,int c,int start) {
+    int row=blockIdx.x,tid=threadIdx.x;__shared__ float sum[256],sq[256];float a=0.f,b=0.f;
+    for(int j=tid;j<c;j+=256){float v=x[row*c+j];a+=v;b+=v*v;}
+    sum[tid]=a;sq[tid]=b;__syncthreads();
+    for(int d=128;d;d>>=1){if(tid<d){sum[tid]+=sum[tid+d];sq[tid]+=sq[tid+d];}__syncthreads();}
+    float mean=sum[0]/c,inverse=rsqrtf(fmaxf(sq[0]/c-mean*mean,0.f)+1.e-6f);
+    for(int j=tid;j<c;j+=256)y[row*c+j]=(x[row*c+j]-mean)*inverse*(1.f+mod[start+c+j])+mod[start+j];
+}
+__global__ void gate_add(float*y,const float*x,const float*z,const float*mod,int count,int c,int start) {
+    int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<count)y[i]=x[i]+z[i]*mod[start+i%c];
+}
+__global__ void qkv_heads(half*q,half*k,half*v,const float*packed,const float*qw,const float*kw,
+                         int rows,int height,int width,int image) {
+    int row=blockIdx.x,head=blockIdx.y,d=threadIdx.x;__shared__ float qa[128],ka[128],qs[128],ks[128];
+    int base=row*6144+head*128;
+    float a=packed[base+d],b=packed[base+2048+d];qs[d]=a*a;ks[d]=b*b;__syncthreads();
+    for(int s=64;s;s>>=1){if(d<s){qs[d]+=qs[d+s];ks[d]+=ks[d+s];}__syncthreads();}
+    qa[d]=a*rsqrtf(qs[0]/128.f+1.e-6f)*qw[d];ka[d]=b*rsqrtf(ks[0]/128.f+1.e-6f)*kw[d];__syncthreads();
+    if(image){int first=d&~1,axis=first<16?0:first<72?1:2,axisdim=axis==0?16:56;
+        int frequency=(first-(axis==0?0:axis==1?16:72))/2;
+        int position=axis==0?row/(height*width):axis==1?(row/width)%height:row%width;
+        float angle=position*powf(256.f,-2.f*frequency/axisdim),c=cosf(angle),s=sinf(angle);
+        a=(d&1)?qa[d]*c+qa[d-1]*s:qa[d]*c-qa[d+1]*s;
+        b=(d&1)?ka[d]*c+ka[d-1]*s:ka[d]*c-ka[d+1]*s;
+    }else{a=qa[d];b=ka[d];}
+    int out=(head*rows+row)*128+d;q[out]=__float2half(a);k[out]=__float2half(b);v[out]=__float2half(packed[base+4096+d]);
+}
+__global__ void concat_heads(half*y,const half*a,const half*b,int ar,int br,int heads,int dim) {
+    int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=(ar+br)*heads*dim)return;
+    int d=i%dim,r=(i/dim)%(ar+br),h=i/(dim*(ar+br));
+    y[i]=r<ar?a[(h*ar+r)*dim+d]:b[(h*br+r-ar)*dim+d];
 }
 __global__ void columns(float*y,const float*x,int rows,int oldc,int start,int nc) {
     int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<rows*nc)y[i]=x[(i/nc)*oldc+start+i%nc];
@@ -47,6 +92,39 @@ __global__ void gemm_ieee(float*y,const float*x,const float*w,int m,int n,int k)
         b[threadIdx.y][threadIdx.x]=(c<n&&kb<k)?w[c*k+kb]:0.f;__syncthreads();
         for(int j=0;j<16;j++)s=fmaf(a[threadIdx.y][j],b[j][threadIdx.x],s);__syncthreads();}
     if(r<m&&c<n)y[r*n+c]=s;
+}
+// Four-by-four register outputs retain IEEE FP32 arithmetic for encoders.
+__global__ void gemm_ieee_tiled(float*y,const float*x,const float*w,int m,int n,int k) {
+    __shared__ float a[64][17],b[64][17];
+    int tr=threadIdx.y,tc=threadIdx.x,tid=tr*16+tc;
+    float sum[4][4]={};
+    for(int base=0;base<k;base+=16) {
+        #pragma unroll
+        for(int i=0;i<4;i++) {
+            int at=tid+256*i,row=at/16,col=at%16,r=blockIdx.y*64+row,c=blockIdx.x*64+row;
+            a[row][col]=(r<m&&base+col<k)?x[(size_t)r*k+base+col]:0.f;
+            b[row][col]=(c<n&&base+col<k)?w[(size_t)c*k+base+col]:0.f;
+        }
+        __syncthreads();
+        #pragma unroll
+        for(int j=0;j<16;j++) {
+            #pragma unroll
+            for(int i=0;i<4;i++) {
+                float av=a[tr+16*i][j];
+                #pragma unroll
+                for(int c=0;c<4;c++)sum[i][c]=fmaf(av,b[tc+16*c][j],sum[i][c]);
+            }
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for(int i=0;i<4;i++) {
+        int r=blockIdx.y*64+tr+16*i;
+        #pragma unroll
+        for(int j=0;j<4;j++) {
+            int c=blockIdx.x*64+tc+16*j;if(r<m&&c<n)y[(size_t)r*n+c]=sum[i][j];
+        }
+    }
 }
 __global__ void rope(float*y,int rows,int heads,int dim,int kind,int height,int width,float theta) {
     int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=rows*heads*(dim/2))return;
@@ -63,6 +141,14 @@ __global__ void rope(float*y,int rows,int heads,int dim,int kind,int height,int 
 __global__ void pack_heads(half*y,const float*x,int rows,int heads,int dim) {
     int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=rows*heads*dim)return;
     int d=i%dim,r=(i/dim)%rows,h=i/(dim*rows);y[i]=__float2half(x[(r*heads+h)*dim+d]);
+}
+__global__ void unpack_heads_half(float*y,const half*x,int rows,int heads,int dim) {
+    int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=rows*heads*dim)return;
+    int d=i%dim,h=(i/dim)%heads,r=i/(dim*heads);y[i]=__half2float(x[(h*rows+r)*dim+d]);
+}
+__global__ void join_condition(float*y,const float*x,const float*c,int rows) {
+    int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=rows*65)return;
+    int r=i/65,d=i%65;y[i]=d<32?x[r*32+d]:c[r*33+d-32];
 }
 __global__ void pack_keys(half*y,const float*x,int rows,int heads,int dim,int start,int tile,int transpose_mode) {
     int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=heads*tile*dim)return;
@@ -111,6 +197,18 @@ __global__ void im2col(float*y,const float*x,int t,int h,int w,int c,int kt,int 
     int xx=r%w+dx-pw,yy=(r/w)%h+dy-ph,tt=r/(h*w)+dt-pt;
     if(replicate){xx=max(0,min(w-1,xx));yy=max(0,min(h-1,yy));tt=max(0,min(t-1,tt));}
     y[i]=(xx>=0&&xx<w&&yy>=0&&yy<h&&tt>=0&&tt<t)?x[((tt*h+yy)*w+xx)*c+channel]:0.f;
+}
+__global__ void im2col_half(half*y,const float*x,int t,int h,int w,int c,int kt,int kh,int kw,int pt,int ph,int pw,int replicate,int start,int count) {
+    int i=blockIdx.x*blockDim.x+threadIdx.x,k=c*kt*kh*kw;if(i>=count*k)return;
+    int r=start+i/k,j=i%k,dx=j%kw;j/=kw;int dy=j%kh;j/=kh;int dt=j%kt,channel=j/kt;
+    int xx=r%w+dx-pw,yy=(r/w)%h+dy-ph,tt=r/(h*w)+dt-pt;
+    if(replicate){xx=max(0,min(w-1,xx));yy=max(0,min(h-1,yy));tt=max(0,min(t-1,tt));}
+    y[i]=(xx>=0&&xx<w&&yy>=0&&yy<h&&tt>=0&&tt<t)?x[((tt*h+yy)*w+xx)*c+channel]:0.f;
+}
+__global__ void reorder_conv_half(half*y,const half*x,int outputs,int channels,int volume) {
+    int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=outputs*channels*volume)return;
+    int c=i%channels,p=(i/channels)%volume,n=i/(channels*volume);
+    y[i]=x[(n*channels+c)*volume+p];
 }
 __global__ void mean_rows(float*y,const float*x,int rows,int channels) {
     int c=blockIdx.x*blockDim.x+threadIdx.x;if(c>=channels)return;float sum=0.f;for(int r=0;r<rows;r++)sum+=x[r*channels+c];y[c]=sum/rows;

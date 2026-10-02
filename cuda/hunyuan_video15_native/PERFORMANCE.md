@@ -6,6 +6,76 @@ noise, prompt and 480×848, 81-frame I2V recipe. Native uses repository GEMM
 with zero vendor/fallback calls. The reference uses the clean official source
 at `60783e704160023913bee78f0b47036d393d4dfa`.
 
+## Optimized bounded replays
+
+The isolated candidate implements stream-ordered buffer reuse, pinned weight
+prefetch, immutable weight caching, repository v7 GEMM, FP16 FlashAttention2,
+fused DiT operations, implicit-GEMM VAE convolution and fused norm/SiLU.
+Encoder arithmetic remains IEEE FP32; register tiling accelerates its GEMM,
+and raw F16/BF16 weights convert exactly to FP32 on the GPU.
+
+Each new GPU command has a 55-second watchdog, including loading, compilation,
+capture writes and reservation overhead. The measurements below are medians of
+the two warm forwards after the first forward, with CUDA synchronization.
+Setup and complete experiment times are recorded separately. The native
+candidate uses **zero cuBLAS/fallback calls**. Desktop graphics remain active.
+
+| Production-shape component | Native | PyTorch reference | Native/reference |
+|---|---:|---:|---:|
+| Joint attention, 34,138 tokens, 16×128 heads | 0.425 s | 0.482 s | 0.881× |
+| Complete first Fast12 DiT block | 0.549 s | 0.635 s | 0.864× |
+| VAE interior tile, 81×128×128 output | 1.504 s | 1.714 s | 0.878× |
+| VAE edge tile, 81×80×96 output | 0.699 s | 0.787 s | 0.888× |
+| Qwen layer, IEEE FP32 | 0.0223 s | 0.5568 s | 0.040× |
+| SigLIP layer, IEEE FP32 | 0.0330 s | 0.1596 s | 0.207× |
+| ByT5 layer, IEEE FP32 | 0.00117 s | 0.02425 s | 0.048× |
+| MLP GEMM, 33,390×8,192×2,048 | 0.0423 s | 0.0369 s | **1.144×** |
+| Final quality projections, CFG and Euler update | 0.00994 s | 0.01797 s | 0.553× |
+
+Encoder references use the same FP32 CPU/16-thread policy as the original
+benchmark; native encoder layers execute on CUDA. DiT/VAE references use
+FP16 CUDA. Native GEMM writes FP32 output and converts FP32 inputs, while the
+reference consumes and writes FP16. The isolated MLP GEMM still has a 14.4%
+gap; the complete measured DiT block and VAE tiles are faster than PyTorch.
+These component measurements do not establish complete-video throughput.
+
+A matching legacy VAE interior tile takes **25.872 s** for its first forward,
+versus **3.876 s** for the candidate including initial weight transfer: 6.68×
+faster. Its convolution chunks fall from 12,609 to 44 per tile. The historical
+whole-video VAE gap below must not be treated as a newly measured candidate
+whole-video speedup. The private encoder register tile reduces a warmed Qwen
+layer from 0.06154 s to 0.02187 s; exact raw-weight transfer then reduces its
+first forward from 1.395 s to 0.357 s. Repository v6 was also measured on the
+MLP shape (0.0869 s warm) and rejected because it was slower than v7.
+
+Independent native/reference states are carried through all **54 blocks** of
+the first Fast12 I2V step and both branches of the first quality I2V step in
+segments of at most eight blocks. Every segment passes cosine ≥0.9999 and
+relative L2 ≤0.02. Final projection, CFG-6 prediction and first Euler update
+also pass. The quality guided prediction relative L2 is 0.00899; its updated
+latent is 5.77e-5. The worst final quality text-state relative L2 is 0.01174.
+Four consecutive positive/negative quality T2V blocks also pass, with maximum
+relative L2 0.000662. Both VAE tiles pass all 81 per-frame gates, with maximum frame relative L2
+0.000298. Qwen/SigLIP/ByT5 layer errors are at most 3.15e-6.
+
+The largest sampled candidate process VRAM is 9,584 MiB, below the approved
+14,336 MiB cap. Pinned host staging is bounded to 768 MiB. The owned quality
+baseline resumes after every check; its original binary and verifier remain
+unchanged. No new full-video acceptance run was started. **Full-video speed
+and quality of the optimized build remain provisional**, including later
+denoising steps and VAE tile blending.
+
+Receipts, raw fixtures and outputs are under `tmp/hv15-native/opt-results/`.
+`performance-v2.json` summarizes accepted replay pairs (SHA256
+`3f4e52da9b77064390655d1e1f71be1695ff208fc9006cdee4084790bfd536f6`). The state-carry
+reports are `fast-chain16-54-v1/chain.json` (preceded by `fast-chain0-*` and
+`fast-chain8-*`) and `quality-pair8-54-v1/chain.json` (preceded by
+`quality-pair0-*`). Each GPU receipt binds its executable/source hashes,
+timing budget, memory samples and baseline pause interval. Parity reports bind
+fixture hashes; newer reports also bind raw output hashes.
+Reproduction is documented in the
+[bounded replay procedure](../../ref/hunyuan_video15_native/README.md#bounded-optimization-replays).
+
 ## Completed Fast12 video
 
 Both runs complete 12 Euler steps, CFG 1, shift 7, decode all 81 frames and

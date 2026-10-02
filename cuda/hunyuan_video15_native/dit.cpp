@@ -15,7 +15,7 @@ static Tensor time_embed(Gpu &g, Weights &w, const std::string &prefix,
 static Tensor mlp(Gpu &g, Weights &w, const std::string &prefix,
                   const Tensor &x, int activation) {
   auto hidden = g.linear(w, prefix + ".fc1", x);
-  hidden = g.op(hidden, activation);
+  hidden = g.optimized ? g.activate(std::move(hidden), activation) : g.op(hidden, activation);
   return g.linear(w, prefix + ".fc2", hidden);
 }
 static Tensor head_norm(Gpu &g, Weights &w, const std::string &prefix, Tensor x,
@@ -28,12 +28,14 @@ static Tensor head_norm(Gpu &g, Weights &w, const std::string &prefix, Tensor x,
   return y;
 }
 static Tensor modulate(Gpu &g, const Tensor &x, const Tensor &mod, int start) {
+  if (g.optimized) return g.modulate(x,mod,start);
   auto shift = g.columns(mod, start, x.channels()),
        scale = g.columns(mod, start + x.channels(), x.channels());
   return g.op(g.bare_norm(x), 7, &scale, &shift);
 }
 static Tensor gate_residual(Gpu &g, const Tensor &x, const Tensor &delta,
                             const Tensor &mod, int start) {
+  if (g.optimized) return g.gated(x,delta,mod,start);
   auto gate = g.columns(mod, start, x.channels());
   auto change = g.op(delta, 8, &gate);
   return g.op(x, 1, &change);
@@ -59,22 +61,89 @@ static Tensor refined_text(Gpu &g, Weights &w, const Tensor &text, float time) {
   }
   return x;
 }
-Tensor dit(Gpu &g, Weights &w, const Tensor &latent, const Tensor &conditioning,
+std::pair<Tensor, Tensor> dit_block(Gpu &g, Weights &w, int index, Tensor img, Tensor txt,
+                                    const Tensor &vec, int height, int width) {
+  require(index >= 0 && index < 54, "DiT block index");
+    g.poll();
+    auto p = "double_blocks." + std::to_string(index);
+    auto active = g.op(vec, 3);
+    auto im = g.linear(w, p + ".img_mod.linear", active),
+         tm = g.linear(w, p + ".txt_mod.linear", active);
+    auto iqkv = g.linear(w, p + ".img_attn_qkv", modulate(g, img, im, 0)),
+         tqkv = g.linear(w, p + ".txt_attn_qkv", modulate(g, txt, tm, 0));
+    Tensor q,k,v;
+    if (g.optimized && !g.vendor) {
+      auto image = g.qkv_heads(w,p+".img_attn",iqkv,height,width,true);
+      auto text = g.qkv_heads(w,p+".txt_attn",tqkv,height,width,false);
+      iqkv={}; tqkv={};
+      q=g.concat(image[0],text[0]);k=g.concat(image[1],text[1]);v=g.concat(image[2],text[2]);
+    } else {
+    auto iq = head_norm(g, w, p + ".img_attn_q_norm", g.columns(iqkv, 0, 2048),
+                        16),
+         ik = head_norm(g, w, p + ".img_attn_k_norm",
+                        g.columns(iqkv, 2048, 2048), 16),
+         iv = g.columns(iqkv, 4096, 2048);
+    auto tq = head_norm(g, w, p + ".txt_attn_q_norm", g.columns(tqkv, 0, 2048),
+                        16),
+         tk = head_norm(g, w, p + ".txt_attn_k_norm",
+                        g.columns(tqkv, 2048, 2048), 16),
+         tv = g.columns(tqkv, 4096, 2048);
+    iqkv = {};
+    tqkv = {};
+    g.rotary(iq, 16, 1, height, width, 256.f);
+    g.rotary(ik, 16, 1, height, width, 256.f);
+    q = g.concat(iq, tq); k = g.concat(ik, tk); v = g.concat(iv, tv);
+    iq = {};
+    ik = {};
+    iv = {};
+    tq = {};
+    tk = {};
+    tv = {};
+    }
+    auto attention = g.attention(q, k, v, 16, 16);
+    q = {};
+    k = {};
+    v = {};
+    auto delta =
+        g.linear(w, p + ".img_attn_proj", g.rows(attention, 0, img.rows()));
+    auto text_delta = g.linear(w, p + ".txt_attn_proj",
+                               g.rows(attention, img.rows(), txt.rows()));
+    attention = {};
+    img = gate_residual(g, img, delta, im, 4096);
+    delta = mlp(g, w, p + ".img_mlp", modulate(g, img, im, 6144), 4);
+    img = gate_residual(g, img, delta, im, 10240);
+    txt = gate_residual(g, txt, text_delta, tm, 4096);
+    delta = mlp(g, w, p + ".txt_mlp", modulate(g, txt, tm, 6144), 4);
+    txt = gate_residual(g, txt, delta, tm, 10240);
+  return {img, txt};
+}
+void dit_blocks(Gpu &g, Weights &w, std::vector<DitState> &states,
+                int first, int count, int height, int width) {
+    require(first >= 0 && count > 0 && first + count <= 54 && !states.empty(),
+            "DiT block range/states");
+    g.prefetch_block(w, first);
+    for (int index = first; index < first + count; ++index) {
+        if (index + 1 < first + count) g.prefetch_block(w, index + 1);
+        g.wait_block(index);
+        for (auto &state : states) {
+            auto output = dit_block(g, w, index, state.img, state.txt, state.vec, height, width);
+            state.img = std::move(output.first);
+            state.txt = std::move(output.second);
+        }
+        if (index > first) g.release_block(w, index - 1);
+    }
+    g.release_block(w, first + count - 1);
+}
+static DitState prepare_dit(Gpu &g, Weights &w, const Tensor &latent, const Tensor &conditioning,
            const Tensor &text, const Tensor &glyph, const Tensor &vision,
            float time, float next_time) {
   require(latent.shape.size() == 4 && latent.channels() == 32 &&
               conditioning.channels() == 33 &&
               latent.rows() == conditioning.rows(),
           "DiT conditioning shape");
-  auto l = g.download(latent), c = g.download(conditioning);
-  std::vector<float> joined(size_t(latent.rows()) * 65);
-  for (int r = 0; r < latent.rows(); r++) {
-    std::copy_n(l.data() + size_t(r) * 32, 32, joined.data() + size_t(r) * 65);
-    std::copy_n(c.data() + size_t(r) * 33, 33,
-                joined.data() + size_t(r) * 65 + 32);
-  }
-  auto input =
-      g.upload(joined, {latent.shape[0], latent.shape[1], latent.shape[2], 65});
+  auto input = g.empty({latent.shape[0], latent.shape[1], latent.shape[2], 65});
+  g.launch("join_condition", int((input.count() + 255) / 256), 1, 1, 256, 1, 0,
+           input.pointer, latent.pointer, conditioning.pointer, latent.rows());
   auto img = g.conv(w, "img_in.proj", input, false);
   img.shape = {img.rows(), 2048};
   auto vec = time_embed(g, w, "time_in", time);
@@ -106,54 +175,33 @@ Tensor dit(Gpu &g, Weights &w, const Tensor &latent, const Tensor &conditioning,
     z = g.op(z, 6, nullptr, &type);
     txt = g.concat(z, txt);
   }
-  for (int i = 0; i < 54; i++) {
-    g.poll();
-    auto p = "double_blocks." + std::to_string(i);
-    auto active = g.op(vec, 3);
-    auto im = g.linear(w, p + ".img_mod.linear", active),
-         tm = g.linear(w, p + ".txt_mod.linear", active);
-    auto iqkv = g.linear(w, p + ".img_attn_qkv", modulate(g, img, im, 0)),
-         tqkv = g.linear(w, p + ".txt_attn_qkv", modulate(g, txt, tm, 0));
-    auto iq = head_norm(g, w, p + ".img_attn_q_norm", g.columns(iqkv, 0, 2048),
-                        16),
-         ik = head_norm(g, w, p + ".img_attn_k_norm",
-                        g.columns(iqkv, 2048, 2048), 16),
-         iv = g.columns(iqkv, 4096, 2048);
-    auto tq = head_norm(g, w, p + ".txt_attn_q_norm", g.columns(tqkv, 0, 2048),
-                        16),
-         tk = head_norm(g, w, p + ".txt_attn_k_norm",
-                        g.columns(tqkv, 2048, 2048), 16),
-         tv = g.columns(tqkv, 4096, 2048);
-    iqkv = {};
-    tqkv = {};
-    g.rotary(iq, 16, 1, latent.shape[1], latent.shape[2], 256.f);
-    g.rotary(ik, 16, 1, latent.shape[1], latent.shape[2], 256.f);
-    auto q = g.concat(iq, tq), k = g.concat(ik, tk), v = g.concat(iv, tv);
-    iq = {};
-    ik = {};
-    iv = {};
-    tq = {};
-    tk = {};
-    tv = {};
-    auto attention = g.attention(q, k, v, 16, 16);
-    q = {};
-    k = {};
-    v = {};
-    auto delta =
-        g.linear(w, p + ".img_attn_proj", g.rows(attention, 0, img.rows()));
-    auto text_delta = g.linear(w, p + ".txt_attn_proj",
-                               g.rows(attention, img.rows(), txt.rows()));
-    attention = {};
-    img = gate_residual(g, img, delta, im, 4096);
-    delta = mlp(g, w, p + ".img_mlp", modulate(g, img, im, 6144), 4);
-    img = gate_residual(g, img, delta, im, 10240);
-    txt = gate_residual(g, txt, text_delta, tm, 4096);
-    delta = mlp(g, w, p + ".txt_mlp", modulate(g, txt, tm, 6144), 4);
-    txt = gate_residual(g, txt, delta, tm, 10240);
-  }
-  auto mod = g.linear(w, "final_layer.adaLN_modulation.1", g.op(vec, 3));
-  auto out = g.linear(w, "final_layer.linear", modulate(g, img, mod, 0));
-  out.shape = latent.shape;
+  return {img,txt,vec,latent.shape};
+}
+Tensor dit_finish(Gpu &g,Weights &w,const DitState &state) {
+  auto mod = g.linear(w, "final_layer.adaLN_modulation.1", g.op(state.vec, 3));
+  auto out = g.linear(w, "final_layer.linear", modulate(g, state.img, mod, 0));
+  out.shape = state.shape;
   return out;
+}
+Tensor dit(Gpu &g, Weights &w, const Tensor &latent, const Tensor &conditioning,
+           const Tensor &text, const Tensor &glyph, const Tensor &vision, float time, float next_time) {
+  std::vector<DitState> states{prepare_dit(g,w,latent,conditioning,text,glyph,vision,time,next_time)};
+  dit_blocks(g,w,states,0,54,latent.shape[1],latent.shape[2]);
+  return dit_finish(g,w,states[0]);
+}
+std::pair<Tensor,Tensor> dit_pair(Gpu &g,Weights &w,const Tensor &latent,const Tensor &conditioning,
+                                 const Tensor &text,const Tensor &negative,const Tensor &glyph,
+                                 const Tensor &vision,float time,float next_time) {
+  if(!g.optimized || g.vendor) {
+    Tensor empty;
+    return {dit(g,w,latent,conditioning,text,glyph,vision,time,next_time),
+            dit(g,w,latent,conditioning,negative,empty,vision,time,next_time)};
+  }
+  Tensor empty;
+  std::vector<DitState> states{
+      prepare_dit(g,w,latent,conditioning,text,glyph,vision,time,next_time),
+      prepare_dit(g,w,latent,conditioning,negative,empty,vision,time,next_time)};
+  dit_blocks(g,w,states,0,54,latent.shape[1],latent.shape[2]);
+  return {dit_finish(g,w,states[0]),dit_finish(g,w,states[1])};
 }
 } // namespace hv15n

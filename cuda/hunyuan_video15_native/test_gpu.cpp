@@ -72,6 +72,33 @@ static void attention_test(Gpu &g, int rows, int heads, int kvheads, int dim,
           precise || biased || heads != kvheads ? 2.e-5 : .004,
           precise ? "IEEE attention" : "repository attention");
 }
+static void convolution_test(Gpu &g, bool causal) {
+  int t=3,h=4,width=5,c=16,n=7,kt=causal?3:1,kh=3,kw=3;
+  auto input=values(size_t(t)*h*width*c),weight=values(size_t(n)*c*kt*kh*kw,.6f),bias=values(n,.3f);
+  fs::path directory=std::getenv("TMPDIR")?std::getenv("TMPDIR"):"tmp/hv15-native/tests";
+  fs::create_directories(directory);
+  fs::path path=directory/(causal?"conv_causal.safetensors":"conv_zero.safetensors");
+  size_t bytes=weight.size()*4;
+  std::string header="{\"layer.weight\":{\"dtype\":\"F32\",\"shape\":["+std::to_string(n)+","+std::to_string(c)+","+std::to_string(kt)+",3,3],\"data_offsets\":[0,"+std::to_string(bytes)+"]},\"layer.bias\":{\"dtype\":\"F32\",\"shape\":[7],\"data_offsets\":["+std::to_string(bytes)+","+std::to_string(bytes+28)+"]}}";
+  while(header.size()%8)header+=' ';
+  uint64_t length=header.size();
+  {std::ofstream file(path,std::ios::binary);file.write(reinterpret_cast<const char*>(&length),8);file<<header;
+   file.write(reinterpret_cast<const char*>(weight.data()),bytes);file.write(reinterpret_cast<const char*>(bias.data()),28);}
+  std::vector<float> expected(size_t(t)*h*width*n);
+  for(int f=0;f<t;f++)for(int y=0;y<h;y++)for(int x=0;x<width;x++)for(int o=0;o<n;o++) {
+    double sum=bias[o];
+    for(int ci=0;ci<c;ci++)for(int a=0;a<kt;a++)for(int b=0;b<kh;b++)for(int d=0;d<kw;d++) {
+      int ff=f+a-(causal?kt-1:0),yy=y+b-1,xx=x+d-1;
+      if(causal){ff=std::max(0,std::min(t-1,ff));yy=std::max(0,std::min(h-1,yy));xx=std::max(0,std::min(width-1,xx));}
+      if(ff<0||ff>=t||yy<0||yy>=h||xx<0||xx>=width)continue;
+      sum+=double(input[((ff*h+yy)*width+xx)*c+ci])*weight[(((o*c+ci)*kt+a)*kh+b)*kw+d];
+    }
+    expected[((f*h+y)*width+x)*n+o]=float(sum);
+  }
+  {Weights weights(path);auto x=g.upload(input,{t,h,width,c});
+   for(int repeat=0;repeat<2;repeat++)compare(g.download(g.conv(weights,"layer",x,causal)),expected,.004,"implicit conv tail/padding/cache");}
+  fs::remove(path);
+}
 int main(int argc, char **argv) {
   try {
     bool vendor = argc > 1 && std::string(argv[1]) == "cublas";
@@ -107,7 +134,7 @@ int main(int argc, char **argv) {
       return 0;
     }
     for (auto shape :
-         {std::array<int, 3>{19, 384, 1472}, std::array<int, 3>{2083, 273, 37}})
+         {std::array<int, 3>{19, 384, 1472}, std::array<int, 3>{2083, 273, 37}, std::array<int,3>{259,273,64}})
       for (bool precise : {false, true}) {
         int m = shape[0], n = shape[1], k = shape[2];
         auto x = values(m * k), w = values(n * k, .5f);
@@ -126,11 +153,43 @@ int main(int argc, char **argv) {
       }
     for (int mask : {0, 1, 2})
       attention_test(g, 137, 2, 2, 32, mask, false, false);
+    attention_test(g,137,2,2,128,0,false,false);
+    convolution_test(g,true);convolution_test(g,false);
     attention_test(g, 2049, 2, 2, 32, 1, false, false);
     attention_test(g, 17, 4, 2, 16, 1, true, false);
     attention_test(g, 19, 6, 6, 64, 0, true, true);
     auto x = values(11 * 37);
     auto tensor = g.upload(x, {11, 37});
+    {
+      auto modulation = g.upload(values(6 * 37, .4f), {1, 6 * 37});
+      auto shift = g.columns(modulation, 0, 37), scale = g.columns(modulation, 37, 37);
+      compare(g.download(g.modulate(tensor, modulation, 0)),
+              g.download(g.op(g.bare_norm(tensor), 7, &scale, &shift)),
+              2.e-5, "fused modulation");
+      auto delta = g.upload(values(x.size(), .3f), tensor.shape);
+      auto gate = g.columns(modulation, 2 * 37, 37), change = g.op(delta, 8, &gate);
+      compare(g.download(g.gated(tensor, delta, modulation, 2 * 37)),
+              g.download(g.op(tensor, 1, &change)), 2.e-5, "fused gate residual");
+      bool rejected = false;
+      try { g.activate(tensor, 3); } catch (const std::exception &) { rejected = true; }
+      require(rejected, "in-place activation accepted aliased storage");
+      for (int mode : {3, 4, 5})
+        compare(g.download(g.activate(g.clone(tensor), mode)),
+                g.download(g.op(tensor, mode)), 2.e-5, "exclusive activation");
+      auto reused = g.buffer_reuses;
+      for (int i = 0; i < 8; ++i) {
+        Tensor result;
+        { auto input = g.upload(x, tensor.shape); result = g.op(input, 3); }
+        compare(g.download(result), g.download(g.op(tensor, 3)),
+                2.e-5, "stream-ordered buffer reuse");
+      }
+      require(g.buffer_reuses > reused, "buffer pool was not reused");
+      rejected = false;
+      auto reserved = g.allocated;
+      try { Allocation impossible(&g, g.budget + 1); }
+      catch (const std::exception &) { rejected = true; }
+      require(rejected && g.allocated <= reserved, "budget failure leaked an allocation");
+    }
     for (int mode : {0, 1, 2}) {
       auto expected = x;
       for (int r = 0; r < 11; ++r) {

@@ -116,3 +116,84 @@ pause subtraction and rejection of missing/invalid timing samples:
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover \
   -s ref/hunyuan_video15_native -p 'test_benchmark.py' -v
 ```
+
+## Bounded optimization replays
+
+Build the candidate separately from a frozen quality campaign:
+
+```sh
+make -C cuda/hunyuan_video15_native BUILD=../../tmp/hv15-native/opt-build -j4 \
+  all ../../tmp/hv15-native/opt-build/replay_probe ../../tmp/hv15-native/opt-build/test_gpu
+
+REPLAY_DIR=tmp/hv15-native/replay-example
+python3 ref/hunyuan_video15_native/replay.py prepare --case gemm \
+  --fixture "$REPLAY_DIR/fixture" --rows 33390
+python3 ref/hunyuan_video15_native/short_run.py --out "$REPLAY_DIR/native.json" -- \
+  tmp/hv15-native/opt-build/replay_probe "$REPLAY_DIR/fixture" "$REPLAY_DIR/native" candidate
+python3 ref/hunyuan_video15_native/short_run.py --out "$REPLAY_DIR/reference.json" -- \
+  tmp/qimg21-ref-venv/bin/python ref/hunyuan_video15_native/replay.py reference \
+  --fixture "$REPLAY_DIR/fixture" --out "$REPLAY_DIR/reference"
+OPENBLAS_NUM_THREADS=1 python3 ref/hunyuan_video15_native/replay.py compare \
+  --fixture "$REPLAY_DIR/fixture" --out "$REPLAY_DIR/reference" --actual "$REPLAY_DIR/native"
+```
+
+Each receipt/output directory must be fresh. `short_run.py` defaults to a
+55-second budget and kills the child process group on failure or timeout
+before resuming its baseline. Imports, loading, compilation, reservations and
+capture writes count toward that budget. It serializes short experiments,
+samples process VRAM/RSS, rejects VRAM above 14,336 MiB, and records executable,
+private/shared source hashes. Scratch and compiler caches stay in the repository.
+Normal checks take the shared CUDA lock. To borrow an owned baseline's existing
+reservation, add `--native-pid PID --native-run RUN` to each short-run command;
+the launcher verifies the PID's start time, output path and family lock ownership.
+Pause intervals are appended to that baseline's separate performance sidecar.
+
+`prepare --case attention` uses 34,138 tokens, 16 heads and dimension 128 by
+default. `prepare --case dit_block --profile fast12_i2v|quality_i2v|quality_t2v`
+uses the official first-block hook and independent encoder/noise captures in
+`--captures`; run preparation itself through the bounded launcher and reference
+interpreter. `--negative` selects negative Qwen conditioning. Only prefix
+weights are loaded. `prepare --case dit_pair --actual POSITIVE_FIXTURE
+--negative-fixture NEGATIVE_FIXTURE` combines previously captured CFG states.
+Choose `--blocks 4` or `8` for streamed block measurements. Each repeated
+forward restarts from its fixture inputs.
+
+`advance --actual PREVIOUS_OUTPUT --out NEXT_FIXTURE` carries that backend's
+image/text states into the next segment. Advance native and reference outputs
+independently to detect accumulated drift. `replay_chain.py --native-fixture
+FIXTURE --reference-fixture FIXTURE --out CHAIN` automates consecutive segments
+through block 53. A whole chain can take several minutes; each GPU command has
+its own 55-second watchdog. `finish` creates a final-projection/CFG/first-Euler
+fixture after block 53 using `noise_input.npy` in `--captures`. These are first-step
+checks with matched official prefix inputs, rather than complete generations.
+
+`prepare --case vae_decode --captures REFERENCE` crops a 21×8×8 latent tile from
+`latent_final.npy`, retaining all temporal context and decoding all 81 frames.
+Use `--tile-row 48 --tile-column 24` for the 5×6 edge tile. `conv` isolates a
+production convolution selected by `--prefix`. `qwen`, `siglip` and `byt5`
+prepare one encoder layer from its `NAME_embedding.f32/.json` diagnostics in
+`--captures`; these independent Transformers references run FP32 on CPU.
+Encoder GEMM/attention semantics are preserved.
+
+The native probe records CUDA-event and synchronized wall times, setup time,
+buffer reuse, weight transfers/cache hits, kernel calls and managed VRAM.
+`compare` reads bounded chunks of raw float32 outputs, fails on missing,
+empty, mismatched or nonfinite data, applies cosine ≥0.9999 and relative L2
+≤0.02, and checks every decoded frame separately. Fixture hashes, checkpoint
+identity and output hashes bind the gate to its inputs. No replay receipt can
+satisfy full-pipeline acceptance. Final speed/quality still require the normal
+complete-video gates when that work is authorized.
+
+`report_replays.py --spec PAIRS.json --out REPORT.json` summarizes accepted
+pairs. Each entry provides `label`, `native`, `reference`, and optional `warm`
+(default true). Warm comparisons require a cold plus at least two warm samples;
+staged one-forward segments use `warm: false`. Reports retain the remaining
+performance gaps. See the measured
+[candidate results](../../cuda/hunyuan_video15_native/PERFORMANCE.md#optimized-bounded-replays).
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover \
+  -s ref/hunyuan_video15_native -p 'test_*.py'
+python3 ref/hunyuan_video15_native/short_run.py --out tmp/hv15-native/math-check.json -- \
+  tmp/hv15-native/opt-build/test_gpu repo-only
+```

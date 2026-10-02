@@ -68,5 +68,45 @@ extern "C" __global__ void gemm_f16_large(float *Y, const half_raw *X,
     }
 }
 )CUDA";
+// Reuse the repository v7 MMA pipeline with THWC convolution gathers.
+inline std::string implicit_conv_source(const std::string &base) {
+    std::string source = base;
+    auto replace = [&](const std::string &from, const std::string &to) {
+        size_t position = 0, count = 0;
+        while ((position = source.find(from, position)) != std::string::npos) {
+            source.replace(position, from.size(), to);
+            position += to.size(); count++;
+        }
+        require(count > 0, "repository convolution source signature changed");
+    };
+    replace("gemm_f16_v7", "conv_f16_implicit");
+    replace("int M, int N, int K)", "int M, int N, int K, int T, int H, int Wd, int C, int KT, int KH, int KW, int replicate)");
+    replace("if (cta_m >= M) return;", "if (cta_m >= M || cta_n >= N) return;");
+    for (const std::string &offset : {std::string("0"), std::string("next_k")}) {
+        replace("const half_raw *src = &X[(size_t)g_row_a * K + " + offset + " + col_a];",
+                "long long offset = conv_offset(g_row_a, " + offset + " + col_a, T,H,Wd,C,KT,KH,KW,replicate);\n"
+                "            const half_raw *src = X + (offset < 0 ? 0 : offset);\n"
+                "            int valid_bytes = offset < 0 ? 0 : 16;");
+    }
+    replace("\"r\"(dA), \"l\"(src));", "\"r\"(dA), \"l\"(src), \"r\"(valid_bytes));");
+    // Only A gathers need zero-fill; B retains its original aligned copies.
+    size_t pos = 0;
+    while ((pos = source.find("int valid_bytes", pos)) != std::string::npos) {
+        auto instruction = source.find("cp.async.cg.shared.global [%0], [%1], 16;", pos);
+        require(instruction != std::string::npos, "convolution gather instruction");
+        source.replace(instruction, std::string("cp.async.cg.shared.global [%0], [%1], 16;").size(), "cp.async.cg.shared.global [%0], [%1], 16, %2;");
+        pos = instruction + 45;
+    }
+    return R"CUDA(
+__device__ __forceinline__ long long conv_offset(int r, int k, int T,int H,int W,int C,int KT,int KH,int KW,int replicate) {
+    int channel=k%C, point=k/C;
+    int dx=point%KW-KW/2,dy=(point/KW)%KH-KH/2,dt=point/(KW*KH)-(replicate?KT-1:0);
+    int x=r%W+dx,y=(r/W)%H+dy,t=r/(W*H)+dt;
+    if(replicate){x=max(0,min(W-1,x));y=max(0,min(H-1,y));t=max(0,min(T-1,t));}
+    if(x<0||x>=W||y<0||y>=H||t<0||t>=T)return -1;
+    return ((long long)t*H*W+y*W+x)*C+channel;
+}
+)CUDA" + source;
+}
 }
 #endif

@@ -126,9 +126,12 @@ inline void decode_f16(const uint16_t *input, float *output, size_t count) {
     output[i] = half_float(input[i]);
 }
 struct Weights {
+  std::string identity;
   std::unique_ptr<st_context, decltype(&safetensors_close)> context{
       nullptr, safetensors_close};
   explicit Weights(const fs::path &path) {
+    identity = fs::absolute(path).string() + ":" + std::to_string(fs::file_size(path)) +
+               ":" + std::to_string(fs::last_write_time(path).time_since_epoch().count());
     context.reset(safetensors_open(path.c_str()));
     require(bool(context), "cannot mmap weights: " + path.string());
     require(context->data_offset <= context->map_size,

@@ -22,17 +22,10 @@ static Tensor embedding(Gpu &g, Weights &w, const std::string &name, const std::
     }
     return g.upload(values, {int(tokens.size()), shape[1]});
 }
-Tensor qwen(Gpu &g, Weights &w, const Tokenizer &tokenizer, const std::string &prompt) {
-    auto prefix = qwen_prefix();
-    int crop = int(tokenizer.encode(prefix).size());
-    auto tokens = tokenizer.encode(prefix + prompt + "<|im_end|>\n<|im_start|>assistant\n");
-    if (tokens.size() > size_t(crop + 1000))
-        tokens.resize(size_t(crop + 1000));
-    auto x = embedding(g, w, "model.embed_tokens.weight", tokens);
+Tensor encoder_block(Gpu &g, Weights &w, const std::string &kind, int i, Tensor x) {
     fs::path diagnostic = std::getenv("HV15N_DIAGNOSTIC_DIR") ? std::getenv("HV15N_DIAGNOSTIC_DIR") : "";
-    if (!diagnostic.empty())
-        g.dump(x, diagnostic, "qwen_embedding");
-    for (int i = 0; i < 26; i++) {
+    if (kind == "qwen") {
+        require(i >= 0 && i < 26, "encoder block index");
         auto p = "model.layers." + std::to_string(i);
         auto z = g.norm(w, p + ".input_layernorm", x, 1);
         auto q = g.linear(w, p + ".self_attn.q_proj", z, true),
@@ -58,23 +51,8 @@ Tensor qwen(Gpu &g, Weights &w, const Tokenizer &tokenizer, const std::string &p
         auto product = g.op(up, 2, &gate);
         out = g.linear(w, p + ".mlp.down_proj", product, true);
         x = g.op(x, 1, &out);
-    }
-    return g.clone(g.rows(x, crop, x.rows() - crop));
-}
-Tensor siglip(Gpu &g, Weights &w, const fs::path &pixels) {
-    fs::path diagnostic = std::getenv("HV15N_DIAGNOSTIC_DIR") ? std::getenv("HV15N_DIAGNOSTIC_DIR") : "";
-    auto input = g.upload(read_f32(pixels, 3 * 384 * 384), {3, 384, 384});
-    auto patches = g.empty({729, 3 * 14 * 14});
-    g.launch("vision_patches", int((patches.count() + 255) / 256), 1, 1, 256, 1, 0, patches.pointer,
-             input.pointer, 27, 384, 14);
-    auto x = g.linear(w, "vision_model.embeddings.patch_embedding", patches, true);
-    auto positions = g.weight(w, "vision_model.embeddings.position_embedding.weight");
-    x = g.op(x, 1, &positions);
-    if (!diagnostic.empty()) {
-        g.dump(patches, diagnostic, "siglip_patches");
-        g.dump(x, diagnostic, "siglip_embedding");
-    }
-    for (int i = 0; i < 27; i++) {
+    } else if (kind == "siglip") {
+        require(i >= 0 && i < 27, "encoder block index");
         auto p = "vision_model.encoder.layers." + std::to_string(i);
         auto z = g.norm(w, p + ".layer_norm1", x, 0, 1.e-6f);
         auto q = g.linear(w, p + ".self_attn.q_proj", z, true),
@@ -89,19 +67,9 @@ Tensor siglip(Gpu &g, Weights &w, const fs::path &pixels) {
         x = g.op(x, 1, &out);
         if (i == 0 && !diagnostic.empty())
             g.dump(x, diagnostic, "siglip_layer0");
-    }
-    return g.norm(w, "vision_model.post_layernorm", x, 0, 1.e-6f);
-}
-Tensor byt5(Gpu &g, Weights &w, const std::string &prompt) {
-    auto tokens = byt5_tokens(prompt);
-    if (tokens.empty())
-        return {};
-    auto x = embedding(g, w, "shared.weight", tokens);
-    fs::path diagnostic = std::getenv("HV15N_DIAGNOSTIC_DIR") ? std::getenv("HV15N_DIAGNOSTIC_DIR") : "";
-    if (!diagnostic.empty())
-        g.dump(x, diagnostic, "byt5_embedding");
-    auto bias = g.weight(w, "encoder.block.0.layer.0.SelfAttention.relative_attention_bias.weight");
-    for (int i = 0; i < 12; i++) {
+    } else if (kind == "byt5") {
+        require(i >= 0 && i < 12, "encoder block index");
+        auto bias = g.weight(w, "encoder.block.0.layer.0.SelfAttention.relative_attention_bias.weight");
         auto p = "encoder.block." + std::to_string(i);
         auto z = g.norm(w, p + ".layer.0.layer_norm", x, 1);
         auto a = p + ".layer.0.SelfAttention";
@@ -123,7 +91,50 @@ Tensor byt5(Gpu &g, Weights &w, const std::string &prompt) {
         auto product = g.op(gate, 2, &up);
         out = g.linear(w, a + ".wo", product, true);
         x = g.op(x, 1, &out);
+    } else throw std::runtime_error("unknown encoder block");
+    return x;
+}
+Tensor qwen(Gpu &g, Weights &w, const Tokenizer &tokenizer, const std::string &prompt) {
+    auto prefix = qwen_prefix();
+    int crop = int(tokenizer.encode(prefix).size());
+    auto tokens = tokenizer.encode(prefix + prompt + "<|im_end|>\n<|im_start|>assistant\n");
+    if (tokens.size() > size_t(crop + 1000))
+        tokens.resize(size_t(crop + 1000));
+    auto x = embedding(g, w, "model.embed_tokens.weight", tokens);
+    fs::path diagnostic = std::getenv("HV15N_DIAGNOSTIC_DIR") ? std::getenv("HV15N_DIAGNOSTIC_DIR") : "";
+    if (!diagnostic.empty())
+        g.dump(x, diagnostic, "qwen_embedding");
+    for (int i = 0; i < 26; i++)
+        x = encoder_block(g, w, "qwen", i, x);
+    return g.clone(g.rows(x, crop, x.rows() - crop));
+}
+Tensor siglip(Gpu &g, Weights &w, const fs::path &pixels) {
+    fs::path diagnostic = std::getenv("HV15N_DIAGNOSTIC_DIR") ? std::getenv("HV15N_DIAGNOSTIC_DIR") : "";
+    auto input = g.upload(read_f32(pixels, 3 * 384 * 384), {3, 384, 384});
+    auto patches = g.empty({729, 3 * 14 * 14});
+    g.launch("vision_patches", int((patches.count() + 255) / 256), 1, 1, 256, 1, 0, patches.pointer,
+             input.pointer, 27, 384, 14);
+    auto x = g.linear(w, "vision_model.embeddings.patch_embedding", patches, true);
+    auto positions = g.weight(w, "vision_model.embeddings.position_embedding.weight");
+    x = g.op(x, 1, &positions);
+    if (!diagnostic.empty()) {
+        g.dump(patches, diagnostic, "siglip_patches");
+        g.dump(x, diagnostic, "siglip_embedding");
     }
+    for (int i = 0; i < 27; i++)
+        x = encoder_block(g, w, "siglip", i, x);
+    return g.norm(w, "vision_model.post_layernorm", x, 0, 1.e-6f);
+}
+Tensor byt5(Gpu &g, Weights &w, const std::string &prompt) {
+    auto tokens = byt5_tokens(prompt);
+    if (tokens.empty())
+        return {};
+    auto x = embedding(g, w, "shared.weight", tokens);
+    fs::path diagnostic = std::getenv("HV15N_DIAGNOSTIC_DIR") ? std::getenv("HV15N_DIAGNOSTIC_DIR") : "";
+    if (!diagnostic.empty())
+        g.dump(x, diagnostic, "byt5_embedding");
+    for (int i = 0; i < 12; i++)
+        x = encoder_block(g, w, "byt5", i, x);
     return g.norm(w, "encoder.final_layer_norm", x, 1);
 }
 } // namespace hv15n

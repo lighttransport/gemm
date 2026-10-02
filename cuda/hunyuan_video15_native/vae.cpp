@@ -1,9 +1,9 @@
 #include "models.hpp"
 namespace hv15n {
 static Tensor residual(Gpu &g, Weights &w, const std::string &p, const Tensor &x) {
-    auto z = g.op(g.norm(w, p + ".norm1", x, 2), 3);
+    auto z = g.optimized ? g.norm_silu(w,p+".norm1",x) : g.op(g.norm(w, p + ".norm1", x, 2), 3);
     z = g.conv(w, p + ".conv1.conv", z);
-    z = g.op(g.norm(w, p + ".norm2", z, 2), 3);
+    z = g.optimized ? g.norm_silu(w,p+".norm2",z) : g.op(g.norm(w, p + ".norm2", z, 2), 3);
     z = g.conv(w, p + ".conv2.conv", z);
     auto skip = x;
     if (w.has(p + ".nin_shortcut.weight"))
@@ -44,7 +44,7 @@ Tensor vae(Gpu &g, Weights &w, const Tensor &input, bool encode) {
         }
         x = middle(g, w, "encoder.mid", x);
         auto skip = g.channel_map(x, 64, true);
-        x = g.op(g.norm(w, "encoder.norm_out", x, 2), 3);
+        x = g.optimized ? g.norm_silu(w,"encoder.norm_out",x) : g.op(g.norm(w, "encoder.norm_out", x, 2), 3);
         x = g.conv(w, "encoder.conv_out.conv", x);
         x = g.op(x, 1, &skip);
         return g.op(g.columns(x, 0, 32), 0, nullptr, nullptr, 1.03682f);
@@ -69,7 +69,7 @@ Tensor vae(Gpu &g, Weights &w, const Tensor &input, bool encode) {
             x = std::move(y);
         }
     }
-    x = g.op(g.norm(w, "decoder.norm_out", x, 2), 3);
+    x = g.optimized ? g.norm_silu(w,"decoder.norm_out",x) : g.op(g.norm(w, "decoder.norm_out", x, 2), 3);
     return g.conv(w, "decoder.conv_out.conv", x);
 }
 struct Tile {
