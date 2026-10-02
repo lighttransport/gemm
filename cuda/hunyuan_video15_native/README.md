@@ -5,10 +5,13 @@ depend on ggml, stable-diffusion.cpp, or PyTorch for generation. PyTorch is used
 only by `ref/hunyuan_video15_native/verify.py`. No shared server/UI, existing
 model port, GEMM source, or live rig needs modification.
 
-The current runtime remains **experimental**. Kernel and component checks do
-not establish full-resolution, complete-video parity. Generation requires
-`--allow-experimental`; receipts retain `parity: unverified` until an independent
-full pipeline comparison passes. Never infer acceptance from a bounded test.
+The current runtime remains **experimental**. A complete fast12 I2V run has
+passed independent comparisons for all 12 steps and all 81 decoded frames,
+including strict repository GEMM. The quality T2V/I2V profiles remain under
+validation. Generation requires `--allow-experimental`; generation receipts
+retain `parity: unverified`, with accepted comparisons stored in separate
+reference reports. Never infer acceptance of another profile from a bounded
+test or the fast12 result.
 
 Measured component results and exact checks are in [VALIDATION.md](VALIDATION.md).
 
@@ -20,6 +23,9 @@ capability 12.x, CUDA/NVRTC, at least 64 GiB host RAM, and FFmpeg for MP4 packag
 ## Build and test
 
 From the repository root:
+
+The build needs a C++17 compiler and PCRE2 headers/library. The Python wrapper
+and tests need NumPy and Pillow; MP4 packaging needs FFmpeg.
 
 ```sh
 make -C cuda/hunyuan_video15_native -j4
@@ -114,6 +120,35 @@ See [the reference procedure](../../ref/hunyuan_video15_native/README.md).
 Every required tensor must meet cosine ≥0.9999 and relative L2 ≤0.02. Every
 decoded frame is also compared separately. Missing captures, missing components,
 nonfinite values, or an incomplete 81-frame video fail validation.
+
+`validate_quality.py` runs both full 50-step quality profiles with strict repo
+GEMM and no vendor fallback, then executes the independent encoder, denoising,
+decoder and final comparison stages for each. It takes the shared GPU lock for
+CUDA stages; CPU encoder checks run without that lock. Choose a fresh campaign
+directory and a Torch-capable reference interpreter:
+
+```sh
+python3 cuda/hunyuan_video15_native/validate_quality.py \
+  --model tmp/hv15-native/model --image tmp/hv15-native/prepared/input.png \
+  --out tmp/hv15-native/quality-campaign \
+  --reference-python tmp/qimg21-ref-venv/bin/python
+```
+
+`campaign.json` records the controller PID, current task/stage, fixed inputs and
+binary hashes, errors, and completed report hashes. A failed or cancelled stage
+stops the campaign. `pass_both_quality_pipelines` becomes true only after both
+complete independent gates pass; this never publishes a clip or promotes a rig.
+The current quality run uses the same prompt, seed 42 and portrait as the fast12
+validation. Per-run `runner.log` files report generation progress.
+
+Send SIGTERM to the controller to cancel its work. Re-run the same command with
+`--resume` to reuse completed native generation, check frozen inputs/binaries,
+and repeat the final gate. Failed native runs retain diagnostic captures and
+need fresh output/capture directories for a retry. To supervise an already
+running I2V generator, add `--adopt-run RUN --adopt-captures CAPTURES --adopt-pid PID`.
+Use the Python generator PID, rather than its native child PID. Adoption binds
+the PID's start time and output directory; cancellation sends SIGINT to that
+wrapper so its normal child cleanup runs. A completed adopted run needs no PID.
 
 ## Reviewed synthetic candidate training
 

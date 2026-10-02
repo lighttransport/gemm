@@ -4,9 +4,9 @@ Hardware: NVIDIA RTX 5060 Ti, 16 GiB, compute capability 12.0. Reference source:
 `60783e704160023913bee78f0b47036d393d4dfa`. Model revisions and SHA256 values
 are recorded by `stage_models.py` in its separate model manifest.
 
-The checks below include independent component comparisons and one completed
-native fast12 video. They do **not** establish independent complete-video parity,
-acceptance of either quality pipeline, or trained rig quality.
+The checks below include independent component comparisons and complete fast12
+video parity. They do **not** establish acceptance of either quality pipeline
+or trained rig quality.
 Runtime receipts keep `parity: unverified` and require `--allow-experimental`.
 
 ## Verified correctness
@@ -47,10 +47,13 @@ flock -w 30 tmp/pixal3d/device-locks/cuda-0.lock tmp/hv15-native/build/test_gpu 
 
 The build is warning-clean with `-Wall -Wextra -Wpedantic`. Host tests include
 all 65,536 half encodings, schedule/bucket checks, glyph parsing, tokenizer and
-request bounds. Ten Python tests exercise process cancellation, actual FFmpeg
+request bounds. Fourteen Python tests exercise process cancellation, actual FFmpeg
 81-frame packaging, atomic publication through the existing video listing,
 crop restoration and fitted expression controls, review/seed/hash gates,
-candidate failure state, and fail-closed reference acceptance.
+candidate failure state, and fail-closed reference acceptance. The quality
+controller tests also verify lock cancellation/release, exact generation
+receipt checks, PID-bound adoption cleanup, and preservation of a real Python
+virtual environment when its interpreter is a symlink.
 
 GPU tests pass against independent double-precision CPU calculations for
 FP16 and IEEE GEMM (including tall/tail matrices), multi-key-tile attention,
@@ -98,15 +101,40 @@ Independent CPU references for this exact completed run pass:
 
 The receipts are in `tmp/hv15-native/full-fast12-v5-reference/`. The nonempty
 ByT5 encoder comparison is recorded in the component table above.
-Full-resolution VAE, all-step denoising, and all-frame independent comparisons
-remain pending while another job holds the shared CUDA lock.
+On 2026-10-03, the full portrait VAE comparison passed and all reference tensors
+from the other agent's completed integration review were audited against the
+exact generation manifest, pinned receipts, shapes and capture hashes. Those
+verified independent references were copied into the isolated reference output;
+the final `compare` phase then passed for all 20 required captures and 81 frames.
+
+| Full fast12 comparison | Cosine | Relative L2 |
+|---|---:|---:|
+| Portrait VAE, 848×480 | 0.999999809 | 6.53e-4 |
+| First DiT prediction | 0.999998721 | 1.60e-3 |
+| Final latent (all 12 steps pass) | 0.999996716 | 2.56e-3 |
+| Decoded RGB, all 81 frames | 0.999991876 | 4.03e-3 |
+| Worst decoded frame | 0.999967295 | 8.09e-3 |
+
+The integration review also completed a strict repository-GEMM fast12 run with
+zero cuBLAS/fallback calls. A read-only audit verified its exact input noise,
+prepared images, complete recipe, manifests, reference ledger, all tensor
+hashes and comparison report. Final latent relative L2 is 2.15e-3, full RGB
+3.14e-3, and worst frame 6.66e-3; all 81 frames pass. Sampled VRAM is 3108 MiB,
+host RSS 16237.23 MiB, and wall time 3690.20 s (with concurrent encoder probes,
+so this is not an isolated performance benchmark). The report is
+`tmp/hv15-integration-review/full-repo-parity.json`, SHA256
+`2ad09e60e363120d34434fc1b72b17fd86e2e011092dd3cd9b9f493e93ece448`;
+the audit receipt is `tmp/hv15-native/full-repo-fast12-audit.json`.
 
 A same-input repo/cuBLAS first-step cross-check also passes: relative L2 is
 8.80e-5 for the full portrait latent, 2.39e-4 for the DiT prediction, and 4.31e-6
 for the updated latent; noise and encoder captures are byte-identical.
-This backend cross-check does not substitute for independent pipeline parity
-or a complete repo-GEMM video benchmark. Neither complete 50-step quality
-pipeline has yet been validated.
+This first-step backend cross-check remains distinct from the complete
+independent comparisons above. Neither complete 50-step quality pipeline has
+yet been validated. The resumable controller has started that campaign at
+`tmp/hv15-native/quality-campaign-v2/`, adopting the strict-GEMM I2V run at
+`tmp/hv15-native/full-quality-i2v-v1/` before queuing T2V. Its receipt remains
+`pass_both_quality_pipelines: false` while work is pending.
 
 For complete reference phases and exact capture requirements, see
 [the reference instructions](../../ref/hunyuan_video15_native/README.md).
