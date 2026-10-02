@@ -318,10 +318,22 @@ measure20.412241 and22.443641 decode tok/s and establish no speedup.
 
 Fresh three-trial capacity control measures34.731006 decode /410.553527
 prefill tok/s; rebuilt plain control measures34.761139 /409.565019, with257
-identical IDs. Depth1 adaptive measures33.987156 /369.971770 and always
-34.053932 /368.136477, both slower and token-exact. Remaining depth measurements
-are active. There is **no MTP promotion**.
-See [loader regression/build record](strata-repack-policy-20261002.json) and
+identical IDs. The completed three-trial sweep retains all257 IDs for every
+variant, with medians below the fresh control:
+
+| Depth/policy | Decode tok/s | Prefill tok/s |
+| --- | --- | --- |
+| 1 adaptive /always | 33.987156 /34.053932 | 369.971770 /368.136477 |
+| 2 adaptive /always | 32.665228 /32.874727 | 369.006941 /368.602888 |
+| 3 adaptive /always | 32.214399 /29.439538 | 369.467560 /368.798539 |
+| 4 adaptive /always | 30.309639 /24.220955 | 369.454096 /364.506573 |
+
+Depth1 always accepts122/133 proposals in the first trial (91.7%), but its
+two-position verification cost still exceeds the delivered plain-decode cost.
+Teacher forcing lowers prefill throughput for every variant. There is **no
+MTP promotion**; no candidate enters confirmation or context stress.
+See [completed normalized sweep](strata-mtp-normalized-full-20261002.json),
+[loader regression/build record](strata-repack-policy-20261002.json) and
 [MTP progress](strata-mtp-progress-20261002.json). `resume-strata.md` records
 the active staging and qualification owners; old allocation paths are expired.
 
@@ -352,10 +364,14 @@ barrier fallback. Full evidence and hashes are in
 
 FCC cross compilation on the login node avoids compute contention. Immutable
 full-model artifacts are `candidate-mhc-sync-v4`, capacity4096 /attention47,
-from `tmp/strata-mhc-sync-20261002/source-v3.tar.gz`. The repaired full-model queue follows the active layout campaign, then requires zero hidden bit mismatches
-and complete KDA/sparse state before timing. Fresh frozen/rebuilt controls,
-independent confirmation and qualifying-candidate context stress follow.
-Allocation guards defer incomplete work; no full-model mHC result exists yet.
+from `tmp/strata-mhc-sync-20261002/source-v3.tar.gz`. Full-model qualification
+completes on PJM52097252:128-position hidden/full-state gate passes exactly,
+and all257 delivered IDs match in three timed8K trials. Fresh control measures
+34.574158 decode /409.300622 prefill tok/s; fused-sync measures34.337024 /
+408.123134 (ratios0.99314 /0.99712). The rebuilt legacy control remains stable.
+This candidate is rejected for promotion; confirmation and context stress are
+not run because no initial gain qualifies. See
+[full-model mHC synchronization record](strata-mhc-sync-full-20261002.json).
 
 Reproduce the arithmetic and probe after building the integrated `check` tools:
 
@@ -719,6 +735,57 @@ Reports, logs and token outputs are retained locally in
 Committed comparison reports and binary/prompt/topology metadata are in
 `strata-validation-20261002.json`. The 8K page trial has owner enabled but
 inactive because async is off; short/32K trials have owner off.
+
+## Prepared native weight probes (October 2 evening)
+
+Strata's prepared CPU weights and budgeted expert caches motivate two bounded
+native probes. Neither changes the selected model recipe. Reusing exact
+expanded int8 panels first regresses with serial placement/repeated lookup.
+Parallel first touch and one lookup per GEMM improve warm direct reuse:
+fast47/C4096 original23.120880→21.759033 ms (1.063×), fast48/C4096
+22.960901→21.479845 ms (1.069×), with full-output hashes exact. Mixed-format
+chain/output guards pass840 cases across the two probes.
+
+The synthetic layer costs720MiB and about62ms to prepare. At47 threads,
+roughly46 chunk uses are needed to repay preparation; the8049 request has
+only two outer chunks. Forty-two synthetic layers would need29.5GiB of extra
+HBM on top of resident weights. The bounded warm component gain does not
+justify a model-wide expanded cache. See
+[panel-cache native evidence](strata-moe-panel-cache-native-20261002.json).
+
+A smaller sidecar keeps native Q4/Q5 payload and prepares only scale/minimum
+metadata. Its5880 native cases and output hashes pass exactly. At47 threads,
+warm4096-column kernels improve1.23–1.24×, while shorter-column gains are
+smaller. The24-byte sidecar adds16.7% Q4 or13.6% Q5 bytes. A192-matrix
+streaming probe passes6144 exact matrix cases, but47-thread gate/up gains
+fall to4–13%; two-block Q5 down regresses4%. The16-byte layout passes7560
+unit cases and12288 streamed matrix cases, but both two-block down shapes
+regress about9%. Prepared metadata remains outside the model. A direct native
+byte-extraction probe checks whether fewer live vector constants can help
+without a sidecar. It passes5880 primitive and6144 streamed matrix cases;
+Q5 component ratios at47 threads are1.057/1.061 for4096-column gate/up,
+1.039/1.039 for256/512-column down. Q4 stays on the original path.
+
+`--moe-scale-kernel words`, default`legacy`, now exposes this Q5 extraction in
+eligible scalar routed+shared decode. Native integrated PJM52103308 passes8400
+primitive cases across ordinary/persistent teams,400 mixed Q4/Q5/Q6 expert
+chains and14200 paired-row comparisons. Two math modes and threads1/3/12/47/48
+pass, as do local parser,18 launcher and six reporting checks. New primitive
+and diagnostic tools keep-Werror; only pre-existing GLM5 graph warnings are
+suppressed in its bridge/grouped translation units. The initial failed build
+log is preserved. Immutable candidate-iq-scale-words-v2 has explicit128-step
+executor and8049 prompt-hidden/full-state gates before fresh/rebuilt controls.
+PID15502 waits for serial MPI diagnostics on the current allocation. No new
+model gain is claimed. See [scale extraction evidence](strata-iq-scales-native-20261002.json).
+
+A separate12-rank slab diagnostic waits for the mHC-batch and KDA campaigns.
+It compares every FP32 result against the legacy512-token MPI sum over six
+input distributions and three chunk lengths before timing eligible slabs.
+A nonblocking pipeline probe retains the original512-token boundaries and
+compares windows1/2/4/8 against blocking MPI across90 cases. Only fully exact
+candidates enter seven rotating64MiB timing trials. PID14193 follows the slab
+probe PID9686. No collective size or algorithm has changed in the model. See
+[MPI diagnostic queue](strata-mpi-progress-20261002.json).
 
 ## Remaining architecture decision
 

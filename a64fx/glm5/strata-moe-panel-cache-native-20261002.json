@@ -1,0 +1,516 @@
+{
+  "status": "Exact bounded native probes PASS; warm direct panel reuse improves after placement/lookup correction; not integrated or promoted",
+  "scope": "Private one-layer MoE prefill cache probe; original quantized model storage unchanged",
+  "implementation": "Cache exact expanded int8 panels and row-scale/min float bits; copy mode uses original chunk scratch; direct mode reads cached chunks with original GEMM and correction chains",
+  "native": {
+    "allocations": [
+      52100843,
+      52101197
+    ],
+    "requested_hardware": "Separate one-node A64FX2000MHz/eco0 allocations",
+    "compiler": "FCC -Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast -fopenmp -Wall -Wextra -Werror; benchmark only -Wno-unused-function for pre-existing GGUF reference helper declarations",
+    "math_modes": [
+      "fast-math/no-math-errno",
+      "conservative"
+    ],
+    "threads": [
+      1,
+      3,
+      12,
+      47,
+      48
+    ],
+    "exact_cases_per_probe": 420,
+    "total_exact_cases": 840,
+    "checks": "Mixed Q4/Q5 gate-up, Q5/Q6 down fallback, intermediate256/512, ragged5-385 selected routes and sentinel output guards; parallel full-output hashes match for all timing variants",
+    "variants": [
+      {
+        "version": "v2",
+        "allocation": 52100843,
+        "implementation": "Serial first-touch and repeated linear lookup",
+        "summary": {
+          "units": [
+            {
+              "math": "fast",
+              "threads": 1,
+              "cases": 42,
+              "status": "PASS"
+            },
+            {
+              "math": "fast",
+              "threads": 3,
+              "cases": 42,
+              "status": "PASS"
+            },
+            {
+              "math": "fast",
+              "threads": 12,
+              "cases": 42,
+              "status": "PASS"
+            },
+            {
+              "math": "fast",
+              "threads": 47,
+              "cases": 42,
+              "status": "PASS"
+            },
+            {
+              "math": "fast",
+              "threads": 48,
+              "cases": 42,
+              "status": "PASS"
+            },
+            {
+              "math": "conservative",
+              "threads": 1,
+              "cases": 42,
+              "status": "PASS"
+            },
+            {
+              "math": "conservative",
+              "threads": 3,
+              "cases": 42,
+              "status": "PASS"
+            },
+            {
+              "math": "conservative",
+              "threads": 12,
+              "cases": 42,
+              "status": "PASS"
+            },
+            {
+              "math": "conservative",
+              "threads": 47,
+              "cases": 42,
+              "status": "PASS"
+            },
+            {
+              "math": "conservative",
+              "threads": 48,
+              "cases": 42,
+              "status": "PASS"
+            }
+          ],
+          "total_exact_cases": 420,
+          "performance": [
+            {
+              "threads": 47,
+              "C": 512,
+              "mode": 0,
+              "median_ms": 5.00989,
+              "trials": 7,
+              "ratio": 1.0,
+              "admission": {
+                "bytes": 0,
+                "seconds": 9.54e-07
+              },
+              "output_hash": "c6fedbebd6607547"
+            },
+            {
+              "threads": 47,
+              "C": 512,
+              "mode": 1,
+              "median_ms": 6.152153,
+              "trials": 7,
+              "ratio": 0.8143311780444993,
+              "admission": {
+                "bytes": 754974720,
+                "seconds": 0.194533825
+              },
+              "output_hash": "c6fedbebd6607547"
+            },
+            {
+              "threads": 47,
+              "C": 512,
+              "mode": 2,
+              "median_ms": 5.63097,
+              "trials": 7,
+              "ratio": 0.8897028398304379,
+              "admission": {
+                "bytes": 754974720,
+                "seconds": 0.194163084
+              },
+              "output_hash": "c6fedbebd6607547"
+            },
+            {
+              "threads": 47,
+              "C": 4096,
+              "mode": 0,
+              "median_ms": 23.037195,
+              "trials": 7,
+              "ratio": 1.0,
+              "admission": {
+                "bytes": 0,
+                "seconds": 0.0
+              },
+              "output_hash": "608c84aefb58eb0b"
+            },
+            {
+              "threads": 47,
+              "C": 4096,
+              "mode": 1,
+              "median_ms": 25.164127,
+              "trials": 7,
+              "ratio": 0.9154776162113631,
+              "admission": {
+                "bytes": 754974720,
+                "seconds": 0.19419384
+              },
+              "output_hash": "608c84aefb58eb0b"
+            },
+            {
+              "threads": 47,
+              "C": 4096,
+              "mode": 2,
+              "median_ms": 23.96512,
+              "trials": 7,
+              "ratio": 0.9612801855363129,
+              "admission": {
+                "bytes": 754974720,
+                "seconds": 0.194681168
+              },
+              "output_hash": "608c84aefb58eb0b"
+            },
+            {
+              "threads": 48,
+              "C": 512,
+              "mode": 0,
+              "median_ms": 4.379988,
+              "trials": 7,
+              "ratio": 1.0,
+              "admission": {
+                "bytes": 0,
+                "seconds": 0.0
+              },
+              "output_hash": "c6fedbebd6607547"
+            },
+            {
+              "threads": 48,
+              "C": 512,
+              "mode": 1,
+              "median_ms": 6.142139,
+              "trials": 7,
+              "ratio": 0.713104669236564,
+              "admission": {
+                "bytes": 754974720,
+                "seconds": 0.194899082
+              },
+              "output_hash": "c6fedbebd6607547"
+            },
+            {
+              "threads": 48,
+              "C": 512,
+              "mode": 2,
+              "median_ms": 5.675077,
+              "trials": 7,
+              "ratio": 0.7717935809505316,
+              "admission": {
+                "bytes": 754974720,
+                "seconds": 0.194613934
+              },
+              "output_hash": "c6fedbebd6607547"
+            },
+            {
+              "threads": 48,
+              "C": 4096,
+              "mode": 0,
+              "median_ms": 22.789001,
+              "trials": 7,
+              "ratio": 1.0,
+              "admission": {
+                "bytes": 0,
+                "seconds": 0.0
+              },
+              "output_hash": "608c84aefb58eb0b"
+            },
+            {
+              "threads": 48,
+              "C": 4096,
+              "mode": 1,
+              "median_ms": 24.729967,
+              "trials": 7,
+              "ratio": 0.9215136033137449,
+              "admission": {
+                "bytes": 754974720,
+                "seconds": 0.194519043
+              },
+              "output_hash": "608c84aefb58eb0b"
+            },
+            {
+              "threads": 48,
+              "C": 4096,
+              "mode": 2,
+              "median_ms": 23.488998,
+              "trials": 7,
+              "ratio": 0.9701989416491925,
+              "admission": {
+                "bytes": 754974720,
+                "seconds": 0.194532871
+              },
+              "output_hash": "608c84aefb58eb0b"
+            }
+          ]
+        },
+        "frozen_source_archive_sha256": "72f15bfeeec37708e11bf26ae7d6402a9ed2ded4839c1ce8e653eb4f79d09d98",
+        "evidence_sha256": {
+          "native-probe-52100843.log": "5115eea59a7e7cbed7dd16e1e910ac5f430310cb386d51f1d3910c37ff7e3bb3",
+          "build-login.log": "f57b0591c0158ff4d1ac62bd8099e93753084e87e5803875a3e570dac65ed510",
+          "native-summary-v2.json": "5957a74df52ddd004d595400d2a845c4478727c7ac16758cb49637fa0036023b"
+        }
+      },
+      {
+        "version": "v3",
+        "allocation": 52101197,
+        "implementation": "Parallel first-touch, sorted binary lookup, one lookup per direct GEMM",
+        "summary": {
+          "units": [
+            {
+              "math": "fast",
+              "threads": 1,
+              "cases": 42,
+              "status": "PASS"
+            },
+            {
+              "math": "fast",
+              "threads": 3,
+              "cases": 42,
+              "status": "PASS"
+            },
+            {
+              "math": "fast",
+              "threads": 12,
+              "cases": 42,
+              "status": "PASS"
+            },
+            {
+              "math": "fast",
+              "threads": 47,
+              "cases": 42,
+              "status": "PASS"
+            },
+            {
+              "math": "fast",
+              "threads": 48,
+              "cases": 42,
+              "status": "PASS"
+            },
+            {
+              "math": "conservative",
+              "threads": 1,
+              "cases": 42,
+              "status": "PASS"
+            },
+            {
+              "math": "conservative",
+              "threads": 3,
+              "cases": 42,
+              "status": "PASS"
+            },
+            {
+              "math": "conservative",
+              "threads": 12,
+              "cases": 42,
+              "status": "PASS"
+            },
+            {
+              "math": "conservative",
+              "threads": 47,
+              "cases": 42,
+              "status": "PASS"
+            },
+            {
+              "math": "conservative",
+              "threads": 48,
+              "cases": 42,
+              "status": "PASS"
+            }
+          ],
+          "total_exact_cases": 420,
+          "performance": [
+            {
+              "threads": 47,
+              "C": 512,
+              "mode": 0,
+              "median_ms": 5.015135,
+              "trials": 7,
+              "ratio": 1.0,
+              "admission": {
+                "bytes": 0,
+                "seconds": 9.54e-07
+              },
+              "output_hash": "c6fedbebd6607547"
+            },
+            {
+              "threads": 47,
+              "C": 512,
+              "mode": 1,
+              "median_ms": 4.944801,
+              "trials": 7,
+              "ratio": 1.0142238282187694,
+              "admission": {
+                "bytes": 754974720,
+                "seconds": 0.061783075
+              },
+              "output_hash": "c6fedbebd6607547"
+            },
+            {
+              "threads": 47,
+              "C": 512,
+              "mode": 2,
+              "median_ms": 4.126072,
+              "trials": 7,
+              "ratio": 1.2154744270095141,
+              "admission": {
+                "bytes": 754974720,
+                "seconds": 0.061969042
+              },
+              "output_hash": "c6fedbebd6607547"
+            },
+            {
+              "threads": 47,
+              "C": 4096,
+              "mode": 0,
+              "median_ms": 23.12088,
+              "trials": 7,
+              "ratio": 1.0,
+              "admission": {
+                "bytes": 0,
+                "seconds": 9.54e-07
+              },
+              "output_hash": "608c84aefb58eb0b"
+            },
+            {
+              "threads": 47,
+              "C": 4096,
+              "mode": 1,
+              "median_ms": 23.36812,
+              "trials": 7,
+              "ratio": 0.9894197736060923,
+              "admission": {
+                "bytes": 754974720,
+                "seconds": 0.061650038
+              },
+              "output_hash": "608c84aefb58eb0b"
+            },
+            {
+              "threads": 47,
+              "C": 4096,
+              "mode": 2,
+              "median_ms": 21.759033,
+              "trials": 7,
+              "ratio": 1.0625876618689811,
+              "admission": {
+                "bytes": 754974720,
+                "seconds": 0.06161809
+              },
+              "output_hash": "608c84aefb58eb0b"
+            },
+            {
+              "threads": 48,
+              "C": 512,
+              "mode": 0,
+              "median_ms": 4.313946,
+              "trials": 7,
+              "ratio": 1.0,
+              "admission": {
+                "bytes": 0,
+                "seconds": 0.0
+              },
+              "output_hash": "c6fedbebd6607547"
+            },
+            {
+              "threads": 48,
+              "C": 512,
+              "mode": 1,
+              "median_ms": 4.611015,
+              "trials": 7,
+              "ratio": 0.9355740547363215,
+              "admission": {
+                "bytes": 754974720,
+                "seconds": 0.063238144
+              },
+              "output_hash": "c6fedbebd6607547"
+            },
+            {
+              "threads": 48,
+              "C": 512,
+              "mode": 2,
+              "median_ms": 4.063129,
+              "trials": 7,
+              "ratio": 1.0617300115256,
+              "admission": {
+                "bytes": 754974720,
+                "seconds": 0.063301086
+              },
+              "output_hash": "c6fedbebd6607547"
+            },
+            {
+              "threads": 48,
+              "C": 4096,
+              "mode": 0,
+              "median_ms": 22.960901,
+              "trials": 7,
+              "ratio": 1.0,
+              "admission": {
+                "bytes": 0,
+                "seconds": 9.54e-07
+              },
+              "output_hash": "608c84aefb58eb0b"
+            },
+            {
+              "threads": 48,
+              "C": 4096,
+              "mode": 1,
+              "median_ms": 23.025036,
+              "trials": 7,
+              "ratio": 0.9972145537579181,
+              "admission": {
+                "bytes": 754974720,
+                "seconds": 0.062041044
+              },
+              "output_hash": "608c84aefb58eb0b"
+            },
+            {
+              "threads": 48,
+              "C": 4096,
+              "mode": 2,
+              "median_ms": 21.479845,
+              "trials": 7,
+              "ratio": 1.0689509631005252,
+              "admission": {
+                "bytes": 754974720,
+                "seconds": 0.062559128
+              },
+              "output_hash": "608c84aefb58eb0b"
+            }
+          ]
+        },
+        "frozen_source_archive_sha256": "695a394c544b5541ca19aa22ac7a8cb2ae0010f7598104043dff6bcf1a635da6",
+        "evidence_sha256": {
+          "native-probe-v3-52101197.log": "eb851f1cb8290262b703c7afd6e8a47da1e40d1efa926a5862b3b5aca6ce3a92",
+          "build-login-v3.log": "a21cdeb5f8b91107a58bc5ebbaad2f5aeb3a1e02425374e7bed3d0eabf1e70a8",
+          "native-summary-v3.json": "f8a2107657187b32952846bf904828296ef608cf99628cb4930634f56bcf0a91"
+        }
+      }
+    ]
+  },
+  "assessment": {
+    "selected_fast47_C4096": "23.120880ms original versus21.759033ms direct warm cache (1.06259 ratio); copy23.368120ms regresses",
+    "fast48_C4096": "22.960901ms original versus21.479845ms direct warm cache (1.06895 ratio)",
+    "admission": "720MiB per synthetic layer;61.6-63.3ms parallel admission,194-195ms serial. Component timing excludes admission, explicitly reported.",
+    "single_request_limit": "At47/C4096, savings1.361847ms per chunk-layer require about46 chunks to amortize61.61809ms admission. The8049-ID request has two outer chunks. A full42-layer cache at this synthetic geometry requires about29.5GiB in addition to resident weights.",
+    "decision": "Retain private probe for bounded reuse studies; no production cache, no full-model tok/s gain claimed"
+  },
+  "queue_next": {
+    "MPI_slab_probe": {
+      "allocation": 52097252,
+      "pid": 9686,
+      "wait_for_owned_pid": 8008,
+      "scope": "Every output bit against existing512-token raw MPI reductions before eligible slab timing; no model collective change"
+    },
+    "IQ_scale_metadata_probe": "Smaller lossless metadata sidecar cross-built; native arithmetic/component probe pending"
+  },
+  "evidence_remote_directory": "~/work/gemm/glm53f-strata-20261001/tmp/strata-moe-panel-cache-20261002",
+  "targets_met": false,
+  "promoted": false
+}

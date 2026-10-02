@@ -1,0 +1,1927 @@
+{
+  "status": "Exact native direct scale-word extraction implemented opt-in for Q5; integrated native validation PASS; full-model qualification queued; prepared sidecars not integrated",
+  "scope": "Private Q4_K/Q5_K decode probe; not integrated or promoted",
+  "implementation": "24-byte sidecar per256 weights contains eight decoded scale bytes, eight minimum bytes and exact FP16-to-FP32 scale/minimum values. Native quantized payload, SDOT/FMA/minimum-correction and original lane reduction order remain unchanged.",
+  "allocation": 52101439,
+  "hardware": "One A64FX node, requested2000MHz/eco0",
+  "compiler": "FCC -Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast -fopenmp -Wall -Wextra -Werror; fast adds-ffast-math -fno-math-errno",
+  "correctness": {
+    "total_cases": 5880,
+    "math": [
+      "fast",
+      "conservative"
+    ],
+    "threads": [
+      1,
+      3,
+      12,
+      47,
+      48
+    ],
+    "checks": "Every output float bit and prefix/tail guard, finite IEEE representations; ragged1-4096 rows,256/512/4096 columns,7 input distributions; benchmark hashes match",
+    "result": "PASS"
+  },
+  "benchmark": {
+    "trials": 7,
+    "persistent_dispatches_per_trial": 90,
+    "order": "Alternating reference/candidate",
+    "scope": "Warm synthetic matrices; preparation outside timing, model routing/projection/collectives excluded",
+    "results": [
+      {
+        "math": "fast",
+        "threads": 47,
+        "q5": 0,
+        "rows": 512,
+        "blocks": 16,
+        "legacy_us": 8.077092,
+        "metadata_us": 6.543265,
+        "speedup": 1.2344130949915677,
+        "output_hash": "82382c69976d5c28"
+      },
+      {
+        "math": "fast",
+        "threads": 47,
+        "q5": 0,
+        "rows": 1024,
+        "blocks": 16,
+        "legacy_us": 11.822912,
+        "metadata_us": 9.645356,
+        "speedup": 1.2257621180597171,
+        "output_hash": "f19a5aa59e9bd965"
+      },
+      {
+        "math": "fast",
+        "threads": 47,
+        "q5": 0,
+        "rows": 4096,
+        "blocks": 1,
+        "legacy_us": 5.933974,
+        "metadata_us": 5.555153,
+        "speedup": 1.0681927212445814,
+        "output_hash": "7e3dd4ba380d9861"
+      },
+      {
+        "math": "fast",
+        "threads": 47,
+        "q5": 0,
+        "rows": 4096,
+        "blocks": 2,
+        "legacy_us": 8.60956,
+        "metadata_us": 7.600254,
+        "speedup": 1.1327989827708391,
+        "output_hash": "5282faf59a02b41a"
+      },
+      {
+        "math": "fast",
+        "threads": 47,
+        "q5": 1,
+        "rows": 512,
+        "blocks": 16,
+        "legacy_us": 10.36591,
+        "metadata_us": 8.355247,
+        "speedup": 1.2406467456916592,
+        "output_hash": "57714cc443a82855"
+      },
+      {
+        "math": "fast",
+        "threads": 47,
+        "q5": 1,
+        "rows": 1024,
+        "blocks": 16,
+        "legacy_us": 15.221702,
+        "metadata_us": 12.334188,
+        "speedup": 1.2341065338066843,
+        "output_hash": "51cd7390c9c4fcc0"
+      },
+      {
+        "math": "fast",
+        "threads": 47,
+        "q5": 1,
+        "rows": 4096,
+        "blocks": 1,
+        "legacy_us": 6.765789,
+        "metadata_us": 6.100867,
+        "speedup": 1.1089881159513886,
+        "output_hash": "7f85b6fc3c7d5124"
+      },
+      {
+        "math": "fast",
+        "threads": 47,
+        "q5": 1,
+        "rows": 4096,
+        "blocks": 2,
+        "legacy_us": 10.111597,
+        "metadata_us": 8.654594,
+        "speedup": 1.1683502426572523,
+        "output_hash": "83478a4f361ef9a6"
+      },
+      {
+        "math": "fast",
+        "threads": 48,
+        "q5": 0,
+        "rows": 512,
+        "blocks": 16,
+        "legacy_us": 7.989671,
+        "metadata_us": 6.612142,
+        "speedup": 1.2083332451117959,
+        "output_hash": "82382c69976d5c28"
+      },
+      {
+        "math": "fast",
+        "threads": 48,
+        "q5": 0,
+        "rows": 1024,
+        "blocks": 16,
+        "legacy_us": 11.833509,
+        "metadata_us": 9.732776,
+        "speedup": 1.2158410919967746,
+        "output_hash": "f19a5aa59e9bd965"
+      },
+      {
+        "math": "fast",
+        "threads": 48,
+        "q5": 0,
+        "rows": 4096,
+        "blocks": 1,
+        "legacy_us": 5.576346,
+        "metadata_us": 5.555153,
+        "speedup": 1.003815016436091,
+        "output_hash": "7e3dd4ba380d9861"
+      },
+      {
+        "math": "fast",
+        "threads": 48,
+        "q5": 0,
+        "rows": 4096,
+        "blocks": 2,
+        "legacy_us": 8.066495,
+        "metadata_us": 7.099575,
+        "speedup": 1.136194067954772,
+        "output_hash": "5282faf59a02b41a"
+      },
+      {
+        "math": "fast",
+        "threads": 48,
+        "q5": 1,
+        "rows": 512,
+        "blocks": 16,
+        "legacy_us": 10.355314,
+        "metadata_us": 8.400281,
+        "speedup": 1.2327342382951236,
+        "output_hash": "57714cc443a82855"
+      },
+      {
+        "math": "fast",
+        "threads": 48,
+        "q5": 1,
+        "rows": 1024,
+        "blocks": 16,
+        "legacy_us": 15.277333,
+        "metadata_us": 12.334188,
+        "speedup": 1.2386168428760775,
+        "output_hash": "51cd7390c9c4fcc0"
+      },
+      {
+        "math": "fast",
+        "threads": 48,
+        "q5": 1,
+        "rows": 4096,
+        "blocks": 1,
+        "legacy_us": 6.734,
+        "metadata_us": 6.069077,
+        "speedup": 1.1095591636092275,
+        "output_hash": "7f85b6fc3c7d5124"
+      },
+      {
+        "math": "fast",
+        "threads": 48,
+        "q5": 1,
+        "rows": 4096,
+        "blocks": 2,
+        "legacy_us": 10.111597,
+        "metadata_us": 8.601613,
+        "speedup": 1.1755466096882061,
+        "output_hash": "83478a4f361ef9a6"
+      },
+      {
+        "math": "conservative",
+        "threads": 47,
+        "q5": 0,
+        "rows": 512,
+        "blocks": 16,
+        "legacy_us": 8.787049,
+        "metadata_us": 7.110172,
+        "speedup": 1.235841974005692,
+        "output_hash": "82382c69976d5c28"
+      },
+      {
+        "math": "conservative",
+        "threads": 47,
+        "q5": 0,
+        "rows": 1024,
+        "blocks": 16,
+        "legacy_us": 12.079875,
+        "metadata_us": 9.610918,
+        "speedup": 1.2568908609978775,
+        "output_hash": "f19a5aa59e9bd965"
+      },
+      {
+        "math": "conservative",
+        "threads": 47,
+        "q5": 0,
+        "rows": 4096,
+        "blocks": 1,
+        "legacy_us": 6.275707,
+        "metadata_us": 5.812115,
+        "speedup": 1.079763046670618,
+        "output_hash": "7e3dd4ba380d9861"
+      },
+      {
+        "math": "conservative",
+        "threads": 47,
+        "q5": 0,
+        "rows": 4096,
+        "blocks": 2,
+        "legacy_us": 9.012222,
+        "metadata_us": 7.920795,
+        "speedup": 1.1377926079389757,
+        "output_hash": "5282faf59a02b41a"
+      },
+      {
+        "math": "conservative",
+        "threads": 47,
+        "q5": 1,
+        "rows": 512,
+        "blocks": 16,
+        "legacy_us": 11.256006,
+        "metadata_us": 9.335412,
+        "speedup": 1.2057321090917037,
+        "output_hash": "57714cc443a82855"
+      },
+      {
+        "math": "conservative",
+        "threads": 47,
+        "q5": 1,
+        "rows": 1024,
+        "blocks": 16,
+        "legacy_us": 16.342269,
+        "metadata_us": 12.845463,
+        "speedup": 1.272221094716477,
+        "output_hash": "51cd7390c9c4fcc0"
+      },
+      {
+        "math": "conservative",
+        "threads": 47,
+        "q5": 1,
+        "rows": 4096,
+        "blocks": 1,
+        "legacy_us": 7.078383,
+        "metadata_us": 6.135305,
+        "speedup": 1.1537133035765947,
+        "output_hash": "7f85b6fc3c7d5124"
+      },
+      {
+        "math": "conservative",
+        "threads": 47,
+        "q5": 1,
+        "rows": 4096,
+        "blocks": 2,
+        "legacy_us": 10.622872,
+        "metadata_us": 9.197659,
+        "speedup": 1.1549538855484858,
+        "output_hash": "83478a4f361ef9a6"
+      },
+      {
+        "math": "conservative",
+        "threads": 48,
+        "q5": 0,
+        "rows": 512,
+        "blocks": 16,
+        "legacy_us": 8.977784,
+        "metadata_us": 7.043944,
+        "speedup": 1.2745393773715408,
+        "output_hash": "82382c69976d5c28"
+      },
+      {
+        "math": "conservative",
+        "threads": 48,
+        "q5": 0,
+        "rows": 1024,
+        "blocks": 16,
+        "legacy_us": 12.954076,
+        "metadata_us": 10.413594,
+        "speedup": 1.2439582338239805,
+        "output_hash": "f19a5aa59e9bd965"
+      },
+      {
+        "math": "conservative",
+        "threads": 48,
+        "q5": 0,
+        "rows": 4096,
+        "blocks": 1,
+        "legacy_us": 5.867746,
+        "metadata_us": 5.520715,
+        "speedup": 1.062859792617442,
+        "output_hash": "7e3dd4ba380d9861"
+      },
+      {
+        "math": "conservative",
+        "threads": 48,
+        "q5": 0,
+        "rows": 4096,
+        "blocks": 2,
+        "legacy_us": 8.52214,
+        "metadata_us": 7.711516,
+        "speedup": 1.1051186303704745,
+        "output_hash": "5282faf59a02b41a"
+      },
+      {
+        "math": "conservative",
+        "threads": 48,
+        "q5": 1,
+        "rows": 512,
+        "blocks": 16,
+        "legacy_us": 11.356672,
+        "metadata_us": 9.343359,
+        "speedup": 1.2154806424541753,
+        "output_hash": "57714cc443a82855"
+      },
+      {
+        "math": "conservative",
+        "threads": 48,
+        "q5": 1,
+        "rows": 1024,
+        "blocks": 16,
+        "legacy_us": 16.376707,
+        "metadata_us": 13.465352,
+        "speedup": 1.2162108350379552,
+        "output_hash": "51cd7390c9c4fcc0"
+      },
+      {
+        "math": "conservative",
+        "threads": 48,
+        "q5": 1,
+        "rows": 4096,
+        "blocks": 1,
+        "legacy_us": 6.964472,
+        "metadata_us": 6.389618,
+        "speedup": 1.089966880649203,
+        "output_hash": "7f85b6fc3c7d5124"
+      },
+      {
+        "math": "conservative",
+        "threads": 48,
+        "q5": 1,
+        "rows": 4096,
+        "blocks": 2,
+        "legacy_us": 10.257297,
+        "metadata_us": 9.07845,
+        "speedup": 1.1298511309750012,
+        "output_hash": "83478a4f361ef9a6"
+      }
+    ]
+  },
+  "memory": {
+    "bytes_per256_weights": 24,
+    "native_q4_overhead_fraction": 0.16666666666666666,
+    "native_q5_overhead_fraction": 0.13636363636363635,
+    "decision": "Keep the probe bounded. Confirm streaming benefit and whole-rank headroom before any model sidecar allocation."
+  },
+  "streaming_probe": {
+    "source_archive_sha256": "8c314fa9d74b42373d720a08fc2ef19d0d137540f469a10854468c987979e785",
+    "parts": 192,
+    "trials": 7,
+    "dispatches_per_trial": 384,
+    "math": [
+      "fast",
+      "conservative"
+    ],
+    "threads": [
+      47,
+      48
+    ],
+    "maximum_weight_bytes": 553648128,
+    "maximum_metadata_bytes": 75497472,
+    "status": "Native PASS",
+    "allocation": 52101769,
+    "exact_matrix_cases": 6144,
+    "unit_precheck_cases": 1680,
+    "results": [
+      {
+        "math": "fast",
+        "threads": 47,
+        "q5": 0,
+        "rows": 512,
+        "blocks": 16,
+        "legacy_us": 10.937452,
+        "metadata_us": 10.49228,
+        "speedup": 1.0424285284037407
+      },
+      {
+        "math": "fast",
+        "threads": 47,
+        "q5": 0,
+        "rows": 1024,
+        "blocks": 16,
+        "legacy_us": 13.99219,
+        "metadata_us": 13.049692,
+        "speedup": 1.072223773557261
+      },
+      {
+        "math": "fast",
+        "threads": 47,
+        "q5": 0,
+        "rows": 4096,
+        "blocks": 1,
+        "legacy_us": 8.840735,
+        "metadata_us": 8.846323,
+        "speedup": 0.9993683251222005
+      },
+      {
+        "math": "fast",
+        "threads": 47,
+        "q5": 0,
+        "rows": 4096,
+        "blocks": 2,
+        "legacy_us": 11.312465,
+        "metadata_us": 11.25286,
+        "speedup": 1.0052968756387264
+      },
+      {
+        "math": "fast",
+        "threads": 47,
+        "q5": 1,
+        "rows": 512,
+        "blocks": 16,
+        "legacy_us": 13.060247,
+        "metadata_us": 11.98488,
+        "speedup": 1.0897269726522085
+      },
+      {
+        "math": "fast",
+        "threads": 47,
+        "q5": 1,
+        "rows": 1024,
+        "blocks": 16,
+        "legacy_us": 17.60448,
+        "metadata_us": 15.58351,
+        "speedup": 1.1296864441964614
+      },
+      {
+        "math": "fast",
+        "threads": 47,
+        "q5": 1,
+        "rows": 4096,
+        "blocks": 1,
+        "legacy_us": 10.375554,
+        "metadata_us": 9.432435,
+        "speedup": 1.0999868008631917
+      },
+      {
+        "math": "fast",
+        "threads": 47,
+        "q5": 1,
+        "rows": 4096,
+        "blocks": 2,
+        "legacy_us": 12.453025,
+        "metadata_us": 12.986983,
+        "speedup": 0.9588851390657861
+      },
+      {
+        "math": "fast",
+        "threads": 48,
+        "q5": 0,
+        "rows": 512,
+        "blocks": 16,
+        "legacy_us": 10.880331,
+        "metadata_us": 10.484209,
+        "speedup": 1.0377827263840314
+      },
+      {
+        "math": "fast",
+        "threads": 48,
+        "q5": 0,
+        "rows": 1024,
+        "blocks": 16,
+        "legacy_us": 13.999641,
+        "metadata_us": 13.060247,
+        "speedup": 1.0719277361293396
+      },
+      {
+        "math": "fast",
+        "threads": 48,
+        "q5": 0,
+        "rows": 4096,
+        "blocks": 1,
+        "legacy_us": 8.719042,
+        "metadata_us": 8.755053,
+        "speedup": 0.9958868324383644
+      },
+      {
+        "math": "fast",
+        "threads": 48,
+        "q5": 0,
+        "rows": 4096,
+        "blocks": 2,
+        "legacy_us": 11.134893,
+        "metadata_us": 11.33047,
+        "speedup": 0.9827388449022856
+      },
+      {
+        "math": "fast",
+        "threads": 48,
+        "q5": 1,
+        "rows": 512,
+        "blocks": 16,
+        "legacy_us": 13.150896,
+        "metadata_us": 12.046968,
+        "speedup": 1.0916353392820501
+      },
+      {
+        "math": "fast",
+        "threads": 48,
+        "q5": 1,
+        "rows": 1024,
+        "blocks": 16,
+        "legacy_us": 17.622486,
+        "metadata_us": 15.648703,
+        "speedup": 1.126130772626971
+      },
+      {
+        "math": "fast",
+        "threads": 48,
+        "q5": 1,
+        "rows": 4096,
+        "blocks": 1,
+        "legacy_us": 10.364378,
+        "metadata_us": 9.458512,
+        "speedup": 1.0957725697234406
+      },
+      {
+        "math": "fast",
+        "threads": 48,
+        "q5": 1,
+        "rows": 4096,
+        "blocks": 2,
+        "legacy_us": 12.392799,
+        "metadata_us": 12.978911,
+        "speedup": 0.9548412035493579
+      },
+      {
+        "math": "conservative",
+        "threads": 47,
+        "q5": 0,
+        "rows": 512,
+        "blocks": 16,
+        "legacy_us": 11.578202,
+        "metadata_us": 10.726353,
+        "speedup": 1.0794164614944146
+      },
+      {
+        "math": "conservative",
+        "threads": 47,
+        "q5": 0,
+        "rows": 1024,
+        "blocks": 16,
+        "legacy_us": 14.849007,
+        "metadata_us": 13.617178,
+        "speedup": 1.0904614010333127
+      },
+      {
+        "math": "conservative",
+        "threads": 47,
+        "q5": 0,
+        "rows": 4096,
+        "blocks": 1,
+        "legacy_us": 8.898477,
+        "metadata_us": 8.812174,
+        "speedup": 1.0097936105210814
+      },
+      {
+        "math": "conservative",
+        "threads": 47,
+        "q5": 0,
+        "rows": 4096,
+        "blocks": 2,
+        "legacy_us": 11.61173,
+        "metadata_us": 11.6614,
+        "speedup": 0.9957406486356698
+      },
+      {
+        "math": "conservative",
+        "threads": 47,
+        "q5": 1,
+        "rows": 512,
+        "blocks": 16,
+        "legacy_us": 13.697892,
+        "metadata_us": 12.609487,
+        "speedup": 1.0863163584688258
+      },
+      {
+        "math": "conservative",
+        "threads": 47,
+        "q5": 1,
+        "rows": 1024,
+        "blocks": 16,
+        "legacy_us": 18.648803,
+        "metadata_us": 16.60424,
+        "speedup": 1.1231349944351563
+      },
+      {
+        "math": "conservative",
+        "threads": 47,
+        "q5": 1,
+        "rows": 4096,
+        "blocks": 1,
+        "legacy_us": 10.140861,
+        "metadata_us": 9.958322,
+        "speedup": 1.018330297011886
+      },
+      {
+        "math": "conservative",
+        "threads": 47,
+        "q5": 1,
+        "rows": 4096,
+        "blocks": 2,
+        "legacy_us": 12.622525,
+        "metadata_us": 13.150896,
+        "speedup": 0.9598224333916108
+      },
+      {
+        "math": "conservative",
+        "threads": 48,
+        "q5": 0,
+        "rows": 512,
+        "blocks": 16,
+        "legacy_us": 11.388212,
+        "metadata_us": 10.749946,
+        "speedup": 1.059373879645535
+      },
+      {
+        "math": "conservative",
+        "threads": 48,
+        "q5": 0,
+        "rows": 1024,
+        "blocks": 16,
+        "legacy_us": 14.849007,
+        "metadata_us": 13.65381,
+        "speedup": 1.0875357867144775
+      },
+      {
+        "math": "conservative",
+        "threads": 48,
+        "q5": 0,
+        "rows": 4096,
+        "blocks": 1,
+        "legacy_us": 8.377557,
+        "metadata_us": 8.804724,
+        "speedup": 0.9514843395431815
+      },
+      {
+        "math": "conservative",
+        "threads": 48,
+        "q5": 0,
+        "rows": 4096,
+        "blocks": 2,
+        "legacy_us": 11.312465,
+        "metadata_us": 11.707967,
+        "speedup": 0.9662194128152223
+      },
+      {
+        "math": "conservative",
+        "threads": 48,
+        "q5": 1,
+        "rows": 512,
+        "blocks": 16,
+        "legacy_us": 13.789162,
+        "metadata_us": 12.695789,
+        "speedup": 1.0861209177310682
+      },
+      {
+        "math": "conservative",
+        "threads": 48,
+        "q5": 1,
+        "rows": 1024,
+        "blocks": 16,
+        "legacy_us": 18.695369,
+        "metadata_us": 16.554569,
+        "speedup": 1.1293177732383126
+      },
+      {
+        "math": "conservative",
+        "threads": 48,
+        "q5": 1,
+        "rows": 4096,
+        "blocks": 1,
+        "legacy_us": 10.229647,
+        "metadata_us": 9.664024,
+        "speedup": 1.0585287246803194
+      },
+      {
+        "math": "conservative",
+        "threads": 48,
+        "q5": 1,
+        "rows": 4096,
+        "blocks": 2,
+        "legacy_us": 12.700136,
+        "metadata_us": 13.088807,
+        "speedup": 0.9703050858645865
+      }
+    ],
+    "native_log_sha256": "8614dfbb7dce76b4f9d44e39cf577b9e9b220ef6a90d86c4faa867d9a2d8453a",
+    "binary_sha256": {
+      "fast": "afecf69def55a50c82decd2614f8e921d691b77e42afef9f920a0080282dcbd6",
+      "conservative": "8c8e8494b7ef9f4450f06dca97edab06058b31cefdf34380d650a7d020932fbc"
+    }
+  },
+  "evidence": {
+    "source_archive_sha256": "d839fdca30cb098cfeea23c2474e4709f1f7c848ec6935568634678cb948a895",
+    "native_log_sha256": "d7a49478d1728f3fe9258fec3992593734834f286c5a65d46dda84a39bdb2510",
+    "binary_sha256": {
+      "fast": "dfe8bbb608914b4c3f5beeb073b71aab70e8285c7a7344c2c046ce12ee3c671b",
+      "conservative": "add6e093f94b22679e6f445f28d925af080ad737f2771d2dead5455f4d24a56b"
+    },
+    "local": "tmp/strata-iq-scales-20261002",
+    "native_log": "native-probe-52101439.log"
+  },
+  "promote": false,
+  "targets_met": false,
+  "compact_probe": {
+    "status": "Native PASS; not integrated or promoted",
+    "allocation": 52101898,
+    "bytes_per256_weights": 16,
+    "memory_change": "Remove float d/dm fields; read original FP16 scales from native block",
+    "source_archive_sha256": "30969f07b5e8b99fcd53b80f240517e17164245864d26c961f3310032f38d6b5",
+    "matrix_pool_parts": 192,
+    "unit_math": [
+      "fast",
+      "conservative"
+    ],
+    "unit_threads": [
+      1,
+      3,
+      12,
+      47,
+      48
+    ],
+    "stream_threads": [
+      47,
+      48
+    ],
+    "timed_trials_per_mode": 7,
+    "stream_dispatches_per_trial": 384,
+    "binary_sha256": {
+      "fast": "a91280613c684f3c3b52b0ae33ed58c02b697a03603b8e18df6ac8cc736d517e",
+      "conservative": "4570b4563c40de31d44b9dcc0ee30fc0ee843e61cd0cc2a693570d488e192910"
+    },
+    "unit_cases": 7560,
+    "stream_gate_cases": 12288,
+    "results": [
+      {
+        "math": "fast",
+        "variant": "wide",
+        "threads": 47,
+        "q5": 0,
+        "rows": 512,
+        "blocks": 16,
+        "legacy_us": 11.072805,
+        "metadata_us": 10.469308,
+        "speedup": 1.0576444020941977
+      },
+      {
+        "math": "fast",
+        "variant": "wide",
+        "threads": 47,
+        "q5": 0,
+        "rows": 1024,
+        "blocks": 16,
+        "legacy_us": 13.968597,
+        "metadata_us": 12.99195,
+        "speedup": 1.075173241892095
+      },
+      {
+        "math": "fast",
+        "variant": "wide",
+        "threads": 47,
+        "q5": 0,
+        "rows": 4096,
+        "blocks": 1,
+        "legacy_us": 8.8724,
+        "metadata_us": 8.762504,
+        "speedup": 1.0125416205230835
+      },
+      {
+        "math": "fast",
+        "variant": "wide",
+        "threads": 47,
+        "q5": 0,
+        "rows": 4096,
+        "blocks": 2,
+        "legacy_us": 11.762604,
+        "metadata_us": 11.275833,
+        "speedup": 1.0431694048679152
+      },
+      {
+        "math": "fast",
+        "variant": "wide",
+        "threads": 47,
+        "q5": 1,
+        "rows": 512,
+        "blocks": 16,
+        "legacy_us": 13.101225,
+        "metadata_us": 11.924033,
+        "speedup": 1.098724315841796
+      },
+      {
+        "math": "fast",
+        "variant": "wide",
+        "threads": 47,
+        "q5": 1,
+        "rows": 1024,
+        "blocks": 16,
+        "legacy_us": 17.622486,
+        "metadata_us": 15.643115,
+        "speedup": 1.1265330466470391
+      },
+      {
+        "math": "fast",
+        "variant": "wide",
+        "threads": 47,
+        "q5": 1,
+        "rows": 4096,
+        "blocks": 1,
+        "legacy_us": 10.47117,
+        "metadata_us": 10.021031,
+        "speedup": 1.0449194299468787
+      },
+      {
+        "math": "fast",
+        "variant": "wide",
+        "threads": 47,
+        "q5": 1,
+        "rows": 4096,
+        "blocks": 2,
+        "legacy_us": 12.51325,
+        "metadata_us": 12.997538,
+        "speedup": 0.9627400204561817
+      },
+      {
+        "math": "fast",
+        "variant": "compact",
+        "threads": 47,
+        "q5": 0,
+        "rows": 512,
+        "blocks": 16,
+        "legacy_us": 10.625149,
+        "metadata_us": 10.163834,
+        "speedup": 1.0453878920100428
+      },
+      {
+        "math": "fast",
+        "variant": "compact",
+        "threads": 47,
+        "q5": 0,
+        "rows": 1024,
+        "blocks": 16,
+        "legacy_us": 13.430292,
+        "metadata_us": 13.384968,
+        "speedup": 1.0033861866535654
+      },
+      {
+        "math": "fast",
+        "variant": "compact",
+        "threads": 47,
+        "q5": 0,
+        "rows": 4096,
+        "blocks": 1,
+        "legacy_us": 8.815279,
+        "metadata_us": 8.969257,
+        "speedup": 0.9828326917157129
+      },
+      {
+        "math": "fast",
+        "variant": "compact",
+        "threads": 47,
+        "q5": 0,
+        "rows": 4096,
+        "blocks": 2,
+        "legacy_us": 11.643395,
+        "metadata_us": 12.807548,
+        "speedup": 0.9091041470233021
+      },
+      {
+        "math": "fast",
+        "variant": "compact",
+        "threads": 47,
+        "q5": 1,
+        "rows": 512,
+        "blocks": 16,
+        "legacy_us": 13.335918,
+        "metadata_us": 11.531015,
+        "speedup": 1.1565259432929365
+      },
+      {
+        "math": "fast",
+        "variant": "compact",
+        "threads": 47,
+        "q5": 1,
+        "rows": 1024,
+        "blocks": 16,
+        "legacy_us": 17.971421,
+        "metadata_us": 16.447778,
+        "speedup": 1.0926351875615052
+      },
+      {
+        "math": "fast",
+        "variant": "compact",
+        "threads": 47,
+        "q5": 1,
+        "rows": 4096,
+        "blocks": 1,
+        "legacy_us": 10.417153,
+        "metadata_us": 9.919206,
+        "speedup": 1.0502002882085522
+      },
+      {
+        "math": "fast",
+        "variant": "compact",
+        "threads": 47,
+        "q5": 1,
+        "rows": 4096,
+        "blocks": 2,
+        "legacy_us": 12.82307,
+        "metadata_us": 14.031306,
+        "speedup": 0.9138899828711596
+      },
+      {
+        "math": "fast",
+        "variant": "wide",
+        "threads": 48,
+        "q5": 0,
+        "rows": 512,
+        "blocks": 16,
+        "legacy_us": 10.875364,
+        "metadata_us": 10.536363,
+        "speedup": 1.0321743850321026
+      },
+      {
+        "math": "fast",
+        "variant": "wide",
+        "threads": 48,
+        "q5": 0,
+        "rows": 1024,
+        "blocks": 16,
+        "legacy_us": 13.994674,
+        "metadata_us": 13.088187,
+        "speedup": 1.06925993646026
+      },
+      {
+        "math": "fast",
+        "variant": "wide",
+        "threads": 48,
+        "q5": 0,
+        "rows": 4096,
+        "blocks": 1,
+        "legacy_us": 8.49242,
+        "metadata_us": 8.833284,
+        "speedup": 0.9614114071278586
+      },
+      {
+        "math": "fast",
+        "variant": "wide",
+        "threads": 48,
+        "q5": 0,
+        "rows": 4096,
+        "blocks": 2,
+        "legacy_us": 11.200706,
+        "metadata_us": 11.200085,
+        "speedup": 1.000055446007776
+      },
+      {
+        "math": "fast",
+        "variant": "wide",
+        "threads": 48,
+        "q5": 1,
+        "rows": 512,
+        "blocks": 16,
+        "legacy_us": 13.148412,
+        "metadata_us": 12.042001,
+        "speedup": 1.0918793313503294
+      },
+      {
+        "math": "fast",
+        "variant": "wide",
+        "threads": 48,
+        "q5": 1,
+        "rows": 1024,
+        "blocks": 16,
+        "legacy_us": 17.645458,
+        "metadata_us": 15.684714,
+        "speedup": 1.1250098662940238
+      },
+      {
+        "math": "fast",
+        "variant": "wide",
+        "threads": 48,
+        "q5": 1,
+        "rows": 4096,
+        "blocks": 1,
+        "legacy_us": 10.396043,
+        "metadata_us": 9.836008,
+        "speedup": 1.0569372249392235
+      },
+      {
+        "math": "fast",
+        "variant": "wide",
+        "threads": 48,
+        "q5": 1,
+        "rows": 4096,
+        "blocks": 2,
+        "legacy_us": 12.453025,
+        "metadata_us": 13.028582,
+        "speedup": 0.9558235117221506
+      },
+      {
+        "math": "fast",
+        "variant": "compact",
+        "threads": 48,
+        "q5": 0,
+        "rows": 512,
+        "blocks": 16,
+        "legacy_us": 10.510286,
+        "metadata_us": 10.065114,
+        "speedup": 1.0442292059483878
+      },
+      {
+        "math": "fast",
+        "variant": "compact",
+        "threads": 48,
+        "q5": 0,
+        "rows": 1024,
+        "blocks": 16,
+        "legacy_us": 13.452644,
+        "metadata_us": 13.452644,
+        "speedup": 1.0
+      },
+      {
+        "math": "fast",
+        "variant": "compact",
+        "threads": 48,
+        "q5": 0,
+        "rows": 4096,
+        "blocks": 1,
+        "legacy_us": 8.869295,
+        "metadata_us": 8.864328,
+        "speedup": 1.0005603357637487
+      },
+      {
+        "math": "fast",
+        "variant": "compact",
+        "threads": 48,
+        "q5": 0,
+        "rows": 4096,
+        "blocks": 2,
+        "legacy_us": 11.119992,
+        "metadata_us": 12.533739,
+        "speedup": 0.8872046880823032
+      },
+      {
+        "math": "fast",
+        "variant": "compact",
+        "threads": 48,
+        "q5": 1,
+        "rows": 512,
+        "blocks": 16,
+        "legacy_us": 13.340885,
+        "metadata_us": 11.565164,
+        "speedup": 1.1535404945403283
+      },
+      {
+        "math": "fast",
+        "variant": "compact",
+        "threads": 48,
+        "q5": 1,
+        "rows": 1024,
+        "blocks": 16,
+        "legacy_us": 18.028542,
+        "metadata_us": 16.776224,
+        "speedup": 1.0746483833310763
+      },
+      {
+        "math": "fast",
+        "variant": "compact",
+        "threads": 48,
+        "q5": 1,
+        "rows": 4096,
+        "blocks": 1,
+        "legacy_us": 10.4215,
+        "metadata_us": 9.757777,
+        "speedup": 1.0680198983846423
+      },
+      {
+        "math": "fast",
+        "variant": "compact",
+        "threads": 48,
+        "q5": 1,
+        "rows": 4096,
+        "blocks": 2,
+        "legacy_us": 12.862186,
+        "metadata_us": 14.140581,
+        "speedup": 0.9095938844379874
+      },
+      {
+        "math": "conservative",
+        "variant": "wide",
+        "threads": 47,
+        "q5": 0,
+        "rows": 512,
+        "blocks": 16,
+        "legacy_us": 11.380141,
+        "metadata_us": 10.653709,
+        "speedup": 1.0681858308688552
+      },
+      {
+        "math": "conservative",
+        "variant": "wide",
+        "threads": 47,
+        "q5": 0,
+        "rows": 1024,
+        "blocks": 16,
+        "legacy_us": 14.890606,
+        "metadata_us": 13.658777,
+        "speedup": 1.090185892924381
+      },
+      {
+        "math": "conservative",
+        "variant": "wide",
+        "threads": 47,
+        "q5": 0,
+        "rows": 4096,
+        "blocks": 1,
+        "legacy_us": 8.669371,
+        "metadata_us": 8.828317,
+        "speedup": 0.9819958889106496
+      },
+      {
+        "math": "conservative",
+        "variant": "wide",
+        "threads": 47,
+        "q5": 0,
+        "rows": 4096,
+        "blocks": 2,
+        "legacy_us": 11.624768,
+        "metadata_us": 11.760121,
+        "speedup": 0.9884905095789406
+      },
+      {
+        "math": "conservative",
+        "variant": "wide",
+        "threads": 47,
+        "q5": 1,
+        "rows": 512,
+        "blocks": 16,
+        "legacy_us": 13.732041,
+        "metadata_us": 12.58341,
+        "speedup": 1.0912813776233945
+      },
+      {
+        "math": "conservative",
+        "variant": "wide",
+        "threads": 47,
+        "q5": 1,
+        "rows": 1024,
+        "blocks": 16,
+        "legacy_us": 18.687919,
+        "metadata_us": 16.58313,
+        "speedup": 1.126923505996757
+      },
+      {
+        "math": "conservative",
+        "variant": "wide",
+        "threads": 47,
+        "q5": 1,
+        "rows": 4096,
+        "blocks": 1,
+        "legacy_us": 10.247032,
+        "metadata_us": 10.015443,
+        "speedup": 1.0231231908563607
+      },
+      {
+        "math": "conservative",
+        "variant": "wide",
+        "threads": 47,
+        "q5": 1,
+        "rows": 4096,
+        "blocks": 2,
+        "legacy_us": 12.661641,
+        "metadata_us": 13.078252,
+        "speedup": 0.968144749007742
+      },
+      {
+        "math": "conservative",
+        "variant": "compact",
+        "threads": 47,
+        "q5": 0,
+        "rows": 512,
+        "blocks": 16,
+        "legacy_us": 11.192635,
+        "metadata_us": 10.505319,
+        "speedup": 1.0654255239655264
+      },
+      {
+        "math": "conservative",
+        "variant": "compact",
+        "threads": 47,
+        "q5": 0,
+        "rows": 1024,
+        "blocks": 16,
+        "legacy_us": 14.244889,
+        "metadata_us": 13.880432,
+        "speedup": 1.0262568917163386
+      },
+      {
+        "math": "conservative",
+        "variant": "compact",
+        "threads": 47,
+        "q5": 0,
+        "rows": 4096,
+        "blocks": 1,
+        "legacy_us": 9.33061,
+        "metadata_us": 8.768092,
+        "speedup": 1.0641551206351394
+      },
+      {
+        "math": "conservative",
+        "variant": "compact",
+        "threads": 47,
+        "q5": 0,
+        "rows": 4096,
+        "blocks": 2,
+        "legacy_us": 12.258068,
+        "metadata_us": 12.856598,
+        "speedup": 0.9534456937986239
+      },
+      {
+        "math": "conservative",
+        "variant": "compact",
+        "threads": 47,
+        "q5": 1,
+        "rows": 512,
+        "blocks": 16,
+        "legacy_us": 13.533359,
+        "metadata_us": 12.572855,
+        "speedup": 1.0763950590379034
+      },
+      {
+        "math": "conservative",
+        "variant": "compact",
+        "threads": 47,
+        "q5": 1,
+        "rows": 1024,
+        "blocks": 16,
+        "legacy_us": 18.091251,
+        "metadata_us": 16.887983,
+        "speedup": 1.0712499532951922
+      },
+      {
+        "math": "conservative",
+        "variant": "compact",
+        "threads": 47,
+        "q5": 1,
+        "rows": 4096,
+        "blocks": 1,
+        "legacy_us": 10.419016,
+        "metadata_us": 10.192394,
+        "speedup": 1.0222344230413383
+      },
+      {
+        "math": "conservative",
+        "variant": "compact",
+        "threads": 47,
+        "q5": 1,
+        "rows": 4096,
+        "blocks": 2,
+        "legacy_us": 12.922411,
+        "metadata_us": 13.695409,
+        "speedup": 0.9435578740291729
+      },
+      {
+        "math": "conservative",
+        "variant": "wide",
+        "threads": 48,
+        "q5": 0,
+        "rows": 512,
+        "blocks": 16,
+        "legacy_us": 11.390696,
+        "metadata_us": 10.705863,
+        "speedup": 1.063968033216939
+      },
+      {
+        "math": "conservative",
+        "variant": "wide",
+        "threads": 48,
+        "q5": 0,
+        "rows": 1024,
+        "blocks": 16,
+        "legacy_us": 14.903645,
+        "metadata_us": 13.65381,
+        "speedup": 1.0915374536484688
+      },
+      {
+        "math": "conservative",
+        "variant": "wide",
+        "threads": 48,
+        "q5": 0,
+        "rows": 4096,
+        "blocks": 1,
+        "legacy_us": 8.755053,
+        "metadata_us": 8.784235,
+        "speedup": 0.9966779121915568
+      },
+      {
+        "math": "conservative",
+        "variant": "wide",
+        "threads": 48,
+        "q5": 0,
+        "rows": 4096,
+        "blocks": 2,
+        "legacy_us": 11.302531,
+        "metadata_us": 11.698032,
+        "speedup": 0.9661908088471634
+      },
+      {
+        "math": "conservative",
+        "variant": "wide",
+        "threads": 48,
+        "q5": 1,
+        "rows": 512,
+        "blocks": 16,
+        "legacy_us": 13.760601,
+        "metadata_us": 12.643635,
+        "speedup": 1.088342157931639
+      },
+      {
+        "math": "conservative",
+        "variant": "wide",
+        "threads": 48,
+        "q5": 1,
+        "rows": 1024,
+        "blocks": 16,
+        "legacy_us": 18.700336,
+        "metadata_us": 16.599273,
+        "speedup": 1.1265756036424004
+      },
+      {
+        "math": "conservative",
+        "variant": "wide",
+        "threads": 48,
+        "q5": 1,
+        "rows": 4096,
+        "blocks": 1,
+        "legacy_us": 10.200466,
+        "metadata_us": 9.831041,
+        "speedup": 1.0375774040612789
+      },
+      {
+        "math": "conservative",
+        "variant": "wide",
+        "threads": 48,
+        "q5": 1,
+        "rows": 4096,
+        "blocks": 2,
+        "legacy_us": 12.643014,
+        "metadata_us": 13.109297,
+        "speedup": 0.9644311209060258
+      },
+      {
+        "math": "conservative",
+        "variant": "compact",
+        "threads": 48,
+        "q5": 0,
+        "rows": 512,
+        "blocks": 16,
+        "legacy_us": 10.939936,
+        "metadata_us": 10.416533,
+        "speedup": 1.0502473327737742
+      },
+      {
+        "math": "conservative",
+        "variant": "compact",
+        "threads": 48,
+        "q5": 0,
+        "rows": 1024,
+        "blocks": 16,
+        "legacy_us": 14.312565,
+        "metadata_us": 13.911476,
+        "speedup": 1.0288315201061338
+      },
+      {
+        "math": "conservative",
+        "variant": "compact",
+        "threads": 48,
+        "q5": 0,
+        "rows": 4096,
+        "blocks": 1,
+        "legacy_us": 8.877988,
+        "metadata_us": 8.61225,
+        "speedup": 1.030855815843711
+      },
+      {
+        "math": "conservative",
+        "variant": "compact",
+        "threads": 48,
+        "q5": 0,
+        "rows": 4096,
+        "blocks": 2,
+        "legacy_us": 11.478861,
+        "metadata_us": 12.450541,
+        "speedup": 0.9219568049291995
+      },
+      {
+        "math": "conservative",
+        "variant": "compact",
+        "threads": 48,
+        "q5": 1,
+        "rows": 512,
+        "blocks": 16,
+        "legacy_us": 13.504798,
+        "metadata_us": 11.867533,
+        "speedup": 1.1379616976839246
+      },
+      {
+        "math": "conservative",
+        "variant": "compact",
+        "threads": 48,
+        "q5": 1,
+        "rows": 1024,
+        "blocks": 16,
+        "legacy_us": 18.117328,
+        "metadata_us": 16.950071,
+        "speedup": 1.068864431305332
+      },
+      {
+        "math": "conservative",
+        "variant": "compact",
+        "threads": 48,
+        "q5": 1,
+        "rows": 4096,
+        "blocks": 1,
+        "legacy_us": 10.179977,
+        "metadata_us": 9.61187,
+        "speedup": 1.0591047319616265
+      },
+      {
+        "math": "conservative",
+        "variant": "compact",
+        "threads": 48,
+        "q5": 1,
+        "rows": 4096,
+        "blocks": 2,
+        "legacy_us": 12.908752,
+        "metadata_us": 13.328468,
+        "speedup": 0.9685098092293877
+      }
+    ],
+    "native_log_sha256": "3556e3fb0ee2b76b3a607fe7a9846a5de5817e5b37ec340f3f7a5ee84625197c",
+    "decision": "Sixteen-byte metadata does not provide a consistent improvement:47-thread Q4 gate/up512 gains4.5%,1024 is flat; Q5 gate/up512 gains15.7%,1024 gains9.3%; both two-block down shapes regress about9%. Retain original model kernels."
+  },
+  "direct_extraction_probe": {
+    "status": "Native PASS; Q5 improves, Q4 retains legacy",
+    "source_archive_sha256": "82d859cad4e1c351e9546ef9432f2b0191a4dca4f210a09eab1df462c7554287",
+    "implementation": "Three scalar packed-scale word loads and per-byte masks create exact64-bit scale/minimum words; two SVE unsigned unpack steps replace metadata lookup tables. Original SDOT/FMA/reductions unchanged. No weight sidecar.",
+    "binary_sha256": {
+      "fast": "bae185a7dda23d757d70813e1137dccc033ba5c73e6b484c3ba5e20785f71c53",
+      "conservative": "239bfa67cc5ae45b7a5ae4e065dbe0f8dce30e789c586dce90739f1576e6ff5f"
+    },
+    "allocation": 52102269,
+    "unit_cases": 5880,
+    "stream_gate_cases": 6144,
+    "results": [
+      {
+        "math": "fast",
+        "threads": 47,
+        "q5": 0,
+        "rows": 512,
+        "blocks": 16,
+        "legacy_us": 9.713074,
+        "direct_us": 9.674579,
+        "speedup": 1.0039789845118843
+      },
+      {
+        "math": "fast",
+        "threads": 47,
+        "q5": 0,
+        "rows": 1024,
+        "blocks": 16,
+        "legacy_us": 12.164315,
+        "direct_us": 12.070561,
+        "speedup": 1.0077671617748338
+      },
+      {
+        "math": "fast",
+        "threads": 47,
+        "q5": 0,
+        "rows": 4096,
+        "blocks": 1,
+        "legacy_us": 7.744879,
+        "direct_us": 8.002544,
+        "speedup": 0.9678021139277709
+      },
+      {
+        "math": "fast",
+        "threads": 47,
+        "q5": 0,
+        "rows": 4096,
+        "blocks": 2,
+        "legacy_us": 10.392939,
+        "direct_us": 10.429571,
+        "speedup": 0.9964876791193042
+      },
+      {
+        "math": "fast",
+        "threads": 47,
+        "q5": 1,
+        "rows": 512,
+        "blocks": 16,
+        "legacy_us": 12.046968,
+        "direct_us": 11.401251,
+        "speedup": 1.0566356270903956
+      },
+      {
+        "math": "fast",
+        "threads": 47,
+        "q5": 1,
+        "rows": 1024,
+        "blocks": 16,
+        "legacy_us": 16.135474,
+        "direct_us": 15.203531,
+        "speedup": 1.0612977998334727
+      },
+      {
+        "math": "fast",
+        "threads": 47,
+        "q5": 1,
+        "rows": 4096,
+        "blocks": 1,
+        "legacy_us": 9.497007,
+        "direct_us": 9.143725,
+        "speedup": 1.0386365512961075
+      },
+      {
+        "math": "fast",
+        "threads": 47,
+        "q5": 1,
+        "rows": 4096,
+        "blocks": 2,
+        "legacy_us": 11.437883,
+        "direct_us": 11.008233,
+        "speedup": 1.0390298788188803
+      },
+      {
+        "math": "fast",
+        "threads": 48,
+        "q5": 0,
+        "rows": 512,
+        "blocks": 16,
+        "legacy_us": 9.799376,
+        "direct_us": 9.695689,
+        "speedup": 1.0106941342693645
+      },
+      {
+        "math": "fast",
+        "threads": 48,
+        "q5": 0,
+        "rows": 1024,
+        "blocks": 16,
+        "legacy_us": 12.086083,
+        "direct_us": 12.120232,
+        "speedup": 0.9971824796753066
+      },
+      {
+        "math": "fast",
+        "threads": 48,
+        "q5": 0,
+        "rows": 4096,
+        "blocks": 1,
+        "legacy_us": 7.799516,
+        "direct_us": 8.172045,
+        "speedup": 0.9544142255702213
+      },
+      {
+        "math": "fast",
+        "threads": 48,
+        "q5": 0,
+        "rows": 4096,
+        "blocks": 2,
+        "legacy_us": 10.059526,
+        "direct_us": 9.994954,
+        "speedup": 1.0064604599480897
+      },
+      {
+        "math": "fast",
+        "threads": 48,
+        "q5": 1,
+        "rows": 512,
+        "blocks": 16,
+        "legacy_us": 11.862566,
+        "direct_us": 11.205673,
+        "speedup": 1.0586214678939854
+      },
+      {
+        "math": "fast",
+        "threads": 48,
+        "q5": 1,
+        "rows": 1024,
+        "blocks": 16,
+        "legacy_us": 16.101326,
+        "direct_us": 15.239542,
+        "speedup": 1.0565492060063222
+      },
+      {
+        "math": "fast",
+        "threads": 48,
+        "q5": 1,
+        "rows": 4096,
+        "blocks": 1,
+        "legacy_us": 9.508183,
+        "direct_us": 9.221335,
+        "speedup": 1.0311069926426055
+      },
+      {
+        "math": "fast",
+        "threads": 48,
+        "q5": 1,
+        "rows": 4096,
+        "blocks": 2,
+        "legacy_us": 11.549642,
+        "direct_us": 11.046727,
+        "speedup": 1.0455261544890173
+      },
+      {
+        "math": "conservative",
+        "threads": 47,
+        "q5": 0,
+        "rows": 512,
+        "blocks": 16,
+        "legacy_us": 9.955838,
+        "direct_us": 9.825453,
+        "speedup": 1.0132701260695054
+      },
+      {
+        "math": "conservative",
+        "threads": 47,
+        "q5": 0,
+        "rows": 1024,
+        "blocks": 16,
+        "legacy_us": 12.828037,
+        "direct_us": 12.528151,
+        "speedup": 1.023936972024044
+      },
+      {
+        "math": "conservative",
+        "threads": 47,
+        "q5": 0,
+        "rows": 4096,
+        "blocks": 1,
+        "legacy_us": 7.713214,
+        "direct_us": 7.609526,
+        "speedup": 1.0136260786808535
+      },
+      {
+        "math": "conservative",
+        "threads": 47,
+        "q5": 0,
+        "rows": 4096,
+        "blocks": 2,
+        "legacy_us": 10.528912,
+        "direct_us": 10.502214,
+        "speedup": 1.002542130640263
+      },
+      {
+        "math": "conservative",
+        "threads": 47,
+        "q5": 1,
+        "rows": 512,
+        "blocks": 16,
+        "legacy_us": 12.239441,
+        "direct_us": 11.781231,
+        "speedup": 1.0388932192230167
+      },
+      {
+        "math": "conservative",
+        "threads": 47,
+        "q5": 1,
+        "rows": 1024,
+        "blocks": 16,
+        "legacy_us": 16.77312,
+        "direct_us": 15.913819,
+        "speedup": 1.0539971580674632
+      },
+      {
+        "math": "conservative",
+        "threads": 47,
+        "q5": 1,
+        "rows": 4096,
+        "blocks": 1,
+        "legacy_us": 9.377177,
+        "direct_us": 8.997197,
+        "speedup": 1.0422331532809608
+      },
+      {
+        "math": "conservative",
+        "threads": 47,
+        "q5": 1,
+        "rows": 4096,
+        "blocks": 2,
+        "legacy_us": 11.783714,
+        "direct_us": 11.377657,
+        "speedup": 1.0356889823625375
+      },
+      {
+        "math": "conservative",
+        "threads": 48,
+        "q5": 0,
+        "rows": 512,
+        "blocks": 16,
+        "legacy_us": 9.958322,
+        "direct_us": 9.817382,
+        "speedup": 1.014356169496104
+      },
+      {
+        "math": "conservative",
+        "threads": 48,
+        "q5": 0,
+        "rows": 1024,
+        "blocks": 16,
+        "legacy_us": 12.792026,
+        "direct_us": 12.474135,
+        "speedup": 1.0254840115166302
+      },
+      {
+        "math": "conservative",
+        "threads": 48,
+        "q5": 0,
+        "rows": 4096,
+        "blocks": 1,
+        "legacy_us": 7.9715,
+        "direct_us": 7.898236,
+        "speedup": 1.0092759952981907
+      },
+      {
+        "math": "conservative",
+        "threads": 48,
+        "q5": 0,
+        "rows": 4096,
+        "blocks": 2,
+        "legacy_us": 10.164455,
+        "direct_us": 10.220955,
+        "speedup": 0.9944721408126735
+      },
+      {
+        "math": "conservative",
+        "threads": 48,
+        "q5": 1,
+        "rows": 512,
+        "blocks": 16,
+        "legacy_us": 12.245029,
+        "direct_us": 11.58379,
+        "speedup": 1.0570831308233315
+      },
+      {
+        "math": "conservative",
+        "threads": 48,
+        "q5": 1,
+        "rows": 1024,
+        "blocks": 16,
+        "legacy_us": 16.661361,
+        "direct_us": 15.757357,
+        "speedup": 1.0573702810693442
+      },
+      {
+        "math": "conservative",
+        "threads": 48,
+        "q5": 1,
+        "rows": 4096,
+        "blocks": 1,
+        "legacy_us": 9.539227,
+        "direct_us": 9.192154,
+        "speedup": 1.0377575266906973
+      },
+      {
+        "math": "conservative",
+        "threads": 48,
+        "q5": 1,
+        "rows": 4096,
+        "blocks": 2,
+        "legacy_us": 11.734664,
+        "direct_us": 11.364619,
+        "speedup": 1.0325611443727238
+      }
+    ],
+    "native_log_sha256": "8bf15aef00021f76dbf925d84476819733732a739fc74bb54f8c952a6968a622"
+  },
+  "integrated": {
+    "option": "--moe-scale-kernel legacy|words",
+    "default": "legacy",
+    "scope": "Q5 rows in eligible scalar routed+shared fast decode. Q4, unsupported types, verification row pairs and wide prefill retain original paths. No extra weight storage.",
+    "implementation_files": [
+      "glm53f_iq_scale_words.h",
+      "glm53f_iq_bridge.c",
+      "glm53f_runtime.h",
+      "test_glm53f_iq_scale_words.c",
+      "test_glm53f_iq_grouped.c"
+    ],
+    "native": {
+      "job": 52103308,
+      "primitive_cases": 8400,
+      "expert_chain_cases": 400,
+      "paired_row_cases": 14200,
+      "math": [
+        "fast",
+        "conservative"
+      ],
+      "threads": [
+        1,
+        3,
+        12,
+        47,
+        48
+      ],
+      "unit_lines": [
+        "GLM53F_IQ_SCALE_WORDS_UNIT threads=1 cases=840 rows_and_guards=BIT_EXACT PASS",
+        "GLM53F_IQ_SCALE_WORDS_UNIT threads=3 cases=840 rows_and_guards=BIT_EXACT PASS",
+        "GLM53F_IQ_SCALE_WORDS_UNIT threads=12 cases=840 rows_and_guards=BIT_EXACT PASS",
+        "GLM53F_IQ_SCALE_WORDS_UNIT threads=47 cases=840 rows_and_guards=BIT_EXACT PASS",
+        "GLM53F_IQ_SCALE_WORDS_UNIT threads=48 cases=840 rows_and_guards=BIT_EXACT PASS",
+        "GLM53F_IQ_SCALE_WORDS_UNIT threads=1 cases=840 rows_and_guards=BIT_EXACT PASS",
+        "GLM53F_IQ_SCALE_WORDS_UNIT threads=3 cases=840 rows_and_guards=BIT_EXACT PASS",
+        "GLM53F_IQ_SCALE_WORDS_UNIT threads=12 cases=840 rows_and_guards=BIT_EXACT PASS",
+        "GLM53F_IQ_SCALE_WORDS_UNIT threads=47 cases=840 rows_and_guards=BIT_EXACT PASS",
+        "GLM53F_IQ_SCALE_WORDS_UNIT threads=48 cases=840 rows_and_guards=BIT_EXACT PASS"
+      ],
+      "expert_lines": [
+        "GLM53F_IQ_GROUPED cases=20 row_pairs=710 iq_fast=1 threads=1 bitwise=PASS",
+        "GLM53F_IQ_GROUPED cases=20 row_pairs=710 iq_fast=1 threads=1 bitwise=PASS",
+        "GLM53F_IQ_GROUPED cases=20 row_pairs=710 iq_fast=1 threads=3 bitwise=PASS",
+        "GLM53F_IQ_GROUPED cases=20 row_pairs=710 iq_fast=1 threads=3 bitwise=PASS",
+        "GLM53F_IQ_GROUPED cases=20 row_pairs=710 iq_fast=1 threads=12 bitwise=PASS",
+        "GLM53F_IQ_GROUPED cases=20 row_pairs=710 iq_fast=1 threads=12 bitwise=PASS",
+        "GLM53F_IQ_GROUPED cases=20 row_pairs=710 iq_fast=1 threads=47 bitwise=PASS",
+        "GLM53F_IQ_GROUPED cases=20 row_pairs=710 iq_fast=1 threads=47 bitwise=PASS",
+        "GLM53F_IQ_GROUPED cases=20 row_pairs=710 iq_fast=1 threads=48 bitwise=PASS",
+        "GLM53F_IQ_GROUPED cases=20 row_pairs=710 iq_fast=1 threads=48 bitwise=PASS",
+        "GLM53F_IQ_GROUPED cases=20 row_pairs=710 iq_fast=1 threads=1 bitwise=PASS",
+        "GLM53F_IQ_GROUPED cases=20 row_pairs=710 iq_fast=1 threads=1 bitwise=PASS",
+        "GLM53F_IQ_GROUPED cases=20 row_pairs=710 iq_fast=1 threads=3 bitwise=PASS",
+        "GLM53F_IQ_GROUPED cases=20 row_pairs=710 iq_fast=1 threads=3 bitwise=PASS",
+        "GLM53F_IQ_GROUPED cases=20 row_pairs=710 iq_fast=1 threads=12 bitwise=PASS",
+        "GLM53F_IQ_GROUPED cases=20 row_pairs=710 iq_fast=1 threads=12 bitwise=PASS",
+        "GLM53F_IQ_GROUPED cases=20 row_pairs=710 iq_fast=1 threads=47 bitwise=PASS",
+        "GLM53F_IQ_GROUPED cases=20 row_pairs=710 iq_fast=1 threads=47 bitwise=PASS",
+        "GLM53F_IQ_GROUPED cases=20 row_pairs=710 iq_fast=1 threads=48 bitwise=PASS",
+        "GLM53F_IQ_GROUPED cases=20 row_pairs=710 iq_fast=1 threads=48 bitwise=PASS"
+      ],
+      "native_log_sha256": "a975f9dddf1c18c10a0973ebb20f89fbcb33f394e20ae46c7103f1e7065d5210"
+    },
+    "local_checks": [
+      "Warning-clean runtime parser PASS",
+      "18 launcher checks PASS",
+      "6 reporting checks PASS",
+      "Shell syntax/Python compile/JSON parse/diff checks PASS"
+    ],
+    "build": {
+      "status": "PASS",
+      "source_integrated_v5_sha256": "eb7a31ba679d51c238be5a448a5af51d98d26c9a01eb12db2ed3fd5fd2a09c59",
+      "checker_update_v6_sha256": "0a8982e5e068add257bca00c4b3c7231ca256d5cb924ce5273f8d14e3790f308",
+      "flags": "FCC -Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast -fopenmp -Wall -Wextra -Werror; fast adds-ffast-math -fno-math-errno",
+      "legacy_header_warning_exception": "Only IQ bridge/grouped test include the existing GLM5 synthetic graph: -Wno-unused-function -Wno-unused-variable -Wno-missing-field-initializers. New primitive/parser/checker/benchmark builds keep strict-Werror. The initial failed common-header build log is preserved.",
+      "candidate": "candidate-iq-scale-words-v2",
+      "binary_sha256": {
+        "benchmark": "88f57070f3516057e671ca955ebd9bcafaf2a2e27f1b33c887ee61331adaf86c",
+        "checker": "c10accfca6269f15be2f40fc08456391540afba34ebdce7318948ee3c2906dc4",
+        "executor": "cb653398801ecc1cd533dda55382aef613b1701c92b186ff10a877d3d34fae7a",
+        "runner": "a36a5e42cb709491014b17f63bef064a56fb74626f5cb37f0eeb318e276dd002"
+      },
+      "unit_binary_sha256": {
+        "fast": "ea61675f326d0bb10cdd1fccd747e9fa3ec6cb3ae903a8bdd544a154ee9bb355",
+        "conservative": "58cdf304737a5a654b7c504826b84c6222ca4f86167f281b5e1a0d7234edebd0"
+      }
+    }
+  },
+  "full_model": {
+    "status": "Queued after serial MPI diagnostics on PJM52097252",
+    "candidate": "candidate-iq-scale-words-v2",
+    "driver": "tmp/strata-iq-scales-20261002/full-driver.sh",
+    "waits_owned_pid": 14193,
+    "required_gates": [
+      "128-position legacy/persistent hidden and complete-state comparison",
+      "8049 prompt hidden means/final streams/full KDA+sparse state with explicit flag0 versus1",
+      "Fresh frozen/rebuilt legacy three-trial controls, exact257-ID word candidate",
+      "Independent five-trial confirmation and stress1024/short128/repeated32K only when promotion threshold qualifies"
+    ],
+    "new_run_deadline_jst": "2026-10-03 00:00:00",
+    "outputs": "tmp/strata-iq-scales-20261002/full-results-v1/",
+    "owned_pid": 15502
+  },
+  "runtime_affinity_note": "FLIB_BARRIER=HARD overrides requested OMP_PROC_BIND=close toFALSE; unsupported thread counts use software-barrier fallback."
+}

@@ -76,7 +76,7 @@ int main(void) {
     int counts[4], cases = 0;
     if (!gu || !act || !scratch || rows_pair()) return 1;
     for (int e = 0; e < EXPERTS; ++e) {
-        int inter = e & 1 ? 512 : 256, gt = e == 3 ? 14 : 12, dt = e == 2 ? 12 : 13;
+        int inter = e & 1 ? 512 : 256, gt = e == 3 ? 14 : e == 1 ? 13 : 12, dt = e == 2 ? 12 : 13;
         experts[e] = (glm53f_iq_part){matrix(gt, 2 * inter, H), matrix(dt, H, inter), gt, dt, inter};
         if (!experts[e].gate_up || !experts[e].down) return 1;
     }

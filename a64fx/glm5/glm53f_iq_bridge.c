@@ -10,6 +10,7 @@
 #include "glm53f_team.h"
 #include "kern/glm53f_kern.h"
 #include "glm53f_iq_fast.h"
+#include "glm53f_iq_scale_words.h"
 #include <omp.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -1015,6 +1016,16 @@ void glm53f_iq_place_part(const uint8_t *gate_up, size_t gate_row_bytes, int gat
     iq_bind_rows(down, down_row_bytes, bound);
 }
 
+/* Startup-selected native scale extraction. Only Q5 uses the word path:
+ * streaming Q4 did not improve consistently. Fallbacks remain unchanged. */
+static inline void iq_fast_rows(float *out, const uint8_t *weight, size_t row_bytes,
+        int rows, const iqf_act *activation, int blocks, int q5, int scale_words) {
+    if (scale_words && q5)
+        iqfw_rows(out, weight, row_bytes, rows, activation, blocks, q5);
+    else
+        iqf_rows(out, weight, row_bytes, rows, activation, blocks, q5);
+}
+
 /* Decode routed-expert step on the native Q4_K/Q5_K rows: input quantisation, gate/up, SwiGLU+quantisation and down
  * projection in one parallel region (three barriers, no serial sections). */
 struct iq_fast_call {
@@ -1024,7 +1035,7 @@ struct iq_fast_call {
     const glm53f_iq_shared *sh;
     const size_t *gate_rb, *down_rb;
     iqf_act *in_a, (*act_a)[2];
-    int count, affine, timing, total_gate_rows, bad;
+    int count, affine, timing, total_gate_rows, scale_words, bad;
     double *ts1, *ts2, *ts3;
 };
 static void iq_fast_worker(void *context) {
@@ -1060,8 +1071,8 @@ static void iq_fast_worker(void *context) {
             for (long long q = t0; q < t1;) {
                 const int k = (int)(q / rows_c), r = bound[cmg] + (int)(q % rows_c);
                 long long n = (k + 1) * (long long)rows_c - q; if (q + n > t1) n = t1 - q;
-                iqf_rows(gate_up + (size_t)k * GU_STRIDE + r, parts[k].gate_up + (size_t)r * gate_rb[k], gate_rb[k], (int)n,
-                         in_a, HIDDEN / 256, parts[k].gate_type == GLM53F_GGML_Q5_K);
+                iq_fast_rows(gate_up + (size_t)k * GU_STRIDE + r, parts[k].gate_up + (size_t)r * gate_rb[k], gate_rb[k], (int)n,
+                         in_a, HIDDEN / 256, parts[k].gate_type == GLM53F_GGML_Q5_K, a->scale_words);
                 q += n;
             }
         } else {
@@ -1071,8 +1082,8 @@ static void iq_fast_worker(void *context) {
             for (int q = q0; q < q1;) {
                 while (q >= base + 2 * parts[k].inter) base += 2 * parts[k++].inter;
                 const int r = q - base, n = (base + 2 * parts[k].inter < q1 ? base + 2 * parts[k].inter : q1) - q;
-                iqf_rows(gate_up + (size_t)k * GU_STRIDE + r, parts[k].gate_up + (size_t)r * gate_rb[k], gate_rb[k], n,
-                         in_a, HIDDEN / 256, parts[k].gate_type == GLM53F_GGML_Q5_K);
+                iq_fast_rows(gate_up + (size_t)k * GU_STRIDE + r, parts[k].gate_up + (size_t)r * gate_rb[k], gate_rb[k], n,
+                         in_a, HIDDEN / 256, parts[k].gate_type == GLM53F_GGML_Q5_K, a->scale_words);
                 q += n;
             }
         }
@@ -1124,8 +1135,8 @@ static void iq_fast_worker(void *context) {
             for (int r = r0; r < r1; r += 64) {
                 const int n = r1 - r < 64 ? r1 - r : 64;
                 for (int k = 0; k < count; ++k)
-                    iqf_rows(tmp[k], parts[k].down + (size_t)r * down_rb[k], down_rb[k], n, act_a[k],
-                             parts[k].inter / 256, parts[k].down_type == GLM53F_GGML_Q5_K);
+                    iq_fast_rows(tmp[k], parts[k].down + (size_t)r * down_rb[k], down_rb[k], n, act_a[k],
+                             parts[k].inter / 256, parts[k].down_type == GLM53F_GGML_Q5_K, a->scale_words);
                 for (int i = 0; i < n; ++i) {
                     float sum = 0.0f;
                     for (int k = 0; k < count; ++k) sum += weights[k] * tmp[k][i];
@@ -1157,8 +1168,10 @@ static int iq_expert_fast(float *output, const glm53f_iq_part *parts, const floa
     float gate_up[9 * GU_STRIDE] __attribute__((aligned(256)));
     int total_gate_rows = 0, bad = 0;
     for (int k = 0; k < count; ++k) total_gate_rows += 2 * parts[k].inter;
+    const char *scale_env = getenv("GLM53F_IQ_SCALE_WORDS");
+    const int scale_words = scale_env && atoi(scale_env) != 0;
     struct iq_fast_call call = {output, gate_up, parts, weights, input, sh,
-        gate_rb, down_rb, in_a, act_a, count, affine, timing, total_gate_rows, 0, &ts1, &ts2, &ts3};
+        gate_rb, down_rb, in_a, act_a, count, affine, timing, total_gate_rows, scale_words, 0, &ts1, &ts2, &ts3};
     if (glm53f_team_available()) glm53f_team_dispatch(iq_fast_worker, &call);
     else {
 #pragma omp parallel

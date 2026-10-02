@@ -102,7 +102,7 @@ class LauncherTest(unittest.TestCase):
         names = ['glm53f_target_decode_12n', 'tofu_topo_helper', 'glm53f_core_stage',
                  'glm53f_core_add_routers', 'glm53f_decode_stage']
         names += ['test_glm53f_' + kind for kind in ('kquant', 'native_batch', 'moe_layout', 'prefill_config', 'state_io',
-                                                    'team', 'mhc_team', 'mhc_batch', 'kda_columns', 'iq_grouped', 'lookup', 'lookup_spec', 'moe_combine', 'index_heads', 'index_keys4', 'pool_select', 'mla_absorb', 'mla_value', 'mla_cache_f16', 'mla_attention')]
+                                                    'team', 'mhc_team', 'mhc_batch', 'kda_columns', 'iq_scale_words', 'iq_grouped', 'lookup', 'lookup_spec', 'moe_combine', 'index_heads', 'index_keys4', 'pool_select', 'mla_absorb', 'mla_value', 'mla_cache_f16', 'mla_attention')]
         names += ['bench_glm53f_run_12n', 'test_glm53f_repack_policy']
         names += ['glm53f_' + kind for kind in ('kda_callback_check', 'dense_batch_check', 'sparse_batch_check',
                                                'target_batch_check_12n', 'executor_check_12n', 'spec_decode_12n')]
@@ -243,6 +243,7 @@ class LauncherTest(unittest.TestCase):
         self.assertEqual(sum(c['name'] == 'test_glm53f_moe_layout' for c in calls), 1)
         self.assertEqual(sum(c['name'] == 'test_glm53f_mhc_batch' for c in calls), 1)
         self.assertEqual(sum(c['name'] == 'test_glm53f_kda_columns' for c in calls), 1)
+        self.assertEqual(sum(c['name'] == 'test_glm53f_iq_scale_words' for c in calls), 1)
         policies = [c['args'] for c in calls if c['name'] == 'test_glm53f_repack_policy']
         self.assertEqual(policies, [[self.env['GLM53F_LOG_DIR'], '1'], [self.env['GLM53F_LOG_DIR'], '0']])
         state = next(c for c in calls if c['name'] == 'test_glm53f_state_io')

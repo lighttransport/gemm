@@ -1,5 +1,5 @@
 {
-  "status": "Corrected native loader/controller/cache,8049 prompt and short/8K full-state gates PASS; depth sweep active; no promotion",
+  "status": "Corrected native/prompt/short/8K state and complete depth sweep PASS; all MTP variants slower and rejected",
   "allocation": 52097252,
   "candidate": "candidate-mtp-v8",
   "root_cause": {
@@ -273,6 +273,246 @@
         "token_sha256": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da",
         "promotion_candidate": false,
         "target_met": false
+      },
+      "2-adaptive": {
+        "baseline": {
+          "prompt_tokens": 8049,
+          "decode_transitions": 256,
+          "trials": 3,
+          "prefill": {
+            "median_tok_s": 410.553527,
+            "min_tok_s": 409.14476,
+            "max_tok_s": 410.704488
+          },
+          "decode": {
+            "median_tok_s": 34.731006,
+            "min_tok_s": 34.681569,
+            "max_tok_s": 34.877455
+          }
+        },
+        "candidate": {
+          "prompt_tokens": 8049,
+          "decode_transitions": 256,
+          "trials": 3,
+          "prefill": {
+            "median_tok_s": 369.006941,
+            "min_tok_s": 367.50974,
+            "max_tok_s": 369.093286
+          },
+          "decode": {
+            "median_tok_s": 32.665228,
+            "min_tok_s": 32.603804,
+            "max_tok_s": 33.068732
+          }
+        },
+        "speedup": {
+          "prefill": 0.8988034853735406,
+          "decode": 0.9405206402601756
+        },
+        "tokens_equal": true,
+        "token_sha256": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da",
+        "promotion_candidate": false,
+        "target_met": false
+      },
+      "2-always": {
+        "baseline": {
+          "prompt_tokens": 8049,
+          "decode_transitions": 256,
+          "trials": 3,
+          "prefill": {
+            "median_tok_s": 410.553527,
+            "min_tok_s": 409.14476,
+            "max_tok_s": 410.704488
+          },
+          "decode": {
+            "median_tok_s": 34.731006,
+            "min_tok_s": 34.681569,
+            "max_tok_s": 34.877455
+          }
+        },
+        "candidate": {
+          "prompt_tokens": 8049,
+          "decode_transitions": 256,
+          "trials": 3,
+          "prefill": {
+            "median_tok_s": 368.602888,
+            "min_tok_s": 367.264733,
+            "max_tok_s": 368.752379
+          },
+          "decode": {
+            "median_tok_s": 32.874727,
+            "min_tok_s": 32.78876,
+            "max_tok_s": 33.176496
+          }
+        },
+        "speedup": {
+          "prefill": 0.8978193189410842,
+          "decode": 0.9465526855167973
+        },
+        "tokens_equal": true,
+        "token_sha256": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da",
+        "promotion_candidate": false,
+        "target_met": false
+      },
+      "3-adaptive": {
+        "baseline": {
+          "prompt_tokens": 8049,
+          "decode_transitions": 256,
+          "trials": 3,
+          "prefill": {
+            "median_tok_s": 410.553527,
+            "min_tok_s": 409.14476,
+            "max_tok_s": 410.704488
+          },
+          "decode": {
+            "median_tok_s": 34.731006,
+            "min_tok_s": 34.681569,
+            "max_tok_s": 34.877455
+          }
+        },
+        "candidate": {
+          "prompt_tokens": 8049,
+          "decode_transitions": 256,
+          "trials": 3,
+          "prefill": {
+            "median_tok_s": 369.46756,
+            "min_tok_s": 369.425577,
+            "max_tok_s": 370.037504
+          },
+          "decode": {
+            "median_tok_s": 32.214399,
+            "min_tok_s": 32.138776,
+            "max_tok_s": 32.265334
+          }
+        },
+        "speedup": {
+          "prefill": 0.8999254316477958,
+          "decode": 0.9275400487967438
+        },
+        "tokens_equal": true,
+        "token_sha256": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da",
+        "promotion_candidate": false,
+        "target_met": false
+      },
+      "3-always": {
+        "baseline": {
+          "prompt_tokens": 8049,
+          "decode_transitions": 256,
+          "trials": 3,
+          "prefill": {
+            "median_tok_s": 410.553527,
+            "min_tok_s": 409.14476,
+            "max_tok_s": 410.704488
+          },
+          "decode": {
+            "median_tok_s": 34.731006,
+            "min_tok_s": 34.681569,
+            "max_tok_s": 34.877455
+          }
+        },
+        "candidate": {
+          "prompt_tokens": 8049,
+          "decode_transitions": 256,
+          "trials": 3,
+          "prefill": {
+            "median_tok_s": 368.798539,
+            "min_tok_s": 368.030957,
+            "max_tok_s": 369.248229
+          },
+          "decode": {
+            "median_tok_s": 29.439538,
+            "min_tok_s": 29.426062,
+            "max_tok_s": 29.464448
+          }
+        },
+        "speedup": {
+          "prefill": 0.898295873122532,
+          "decode": 0.8476442634572692
+        },
+        "tokens_equal": true,
+        "token_sha256": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da",
+        "promotion_candidate": false,
+        "target_met": false
+      },
+      "4-adaptive": {
+        "baseline": {
+          "prompt_tokens": 8049,
+          "decode_transitions": 256,
+          "trials": 3,
+          "prefill": {
+            "median_tok_s": 410.553527,
+            "min_tok_s": 409.14476,
+            "max_tok_s": 410.704488
+          },
+          "decode": {
+            "median_tok_s": 34.731006,
+            "min_tok_s": 34.681569,
+            "max_tok_s": 34.877455
+          }
+        },
+        "candidate": {
+          "prompt_tokens": 8049,
+          "decode_transitions": 256,
+          "trials": 3,
+          "prefill": {
+            "median_tok_s": 369.454096,
+            "min_tok_s": 368.682567,
+            "max_tok_s": 369.674909
+          },
+          "decode": {
+            "median_tok_s": 30.309639,
+            "min_tok_s": 30.227282,
+            "max_tok_s": 30.339504
+          }
+        },
+        "speedup": {
+          "prefill": 0.8998926368984769,
+          "decode": 0.8726968346381905
+        },
+        "tokens_equal": true,
+        "token_sha256": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da",
+        "promotion_candidate": false,
+        "target_met": false
+      },
+      "4-always": {
+        "baseline": {
+          "prompt_tokens": 8049,
+          "decode_transitions": 256,
+          "trials": 3,
+          "prefill": {
+            "median_tok_s": 410.553527,
+            "min_tok_s": 409.14476,
+            "max_tok_s": 410.704488
+          },
+          "decode": {
+            "median_tok_s": 34.731006,
+            "min_tok_s": 34.681569,
+            "max_tok_s": 34.877455
+          }
+        },
+        "candidate": {
+          "prompt_tokens": 8049,
+          "decode_transitions": 256,
+          "trials": 3,
+          "prefill": {
+            "median_tok_s": 364.506573,
+            "min_tok_s": 364.088287,
+            "max_tok_s": 365.003271
+          },
+          "decode": {
+            "median_tok_s": 24.220955,
+            "min_tok_s": 24.179964,
+            "max_tok_s": 24.277006
+          }
+        },
+        "speedup": {
+          "prefill": 0.8878417770845263,
+          "decode": 0.6973870840366674
+        },
+        "tokens_equal": true,
+        "token_sha256": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da",
+        "promotion_candidate": false,
+        "target_met": false
       }
     },
     "evidence_hashes": {
@@ -296,6 +536,7 @@
       "prompt-hidden-gate.log": "753fd0aebc2e387b08a6d75d0a962340381801fdccd0f29359b960e7c2cb210b",
       "native-driver.log": "920902c4238a545d5fc14503307009c4a3b3f23d81d3932faa072c7bd40a7222"
     },
-    "status": "8K and short state gates PASS; depth sweep active; no MTP promotion"
-  }
+    "status": "Completed all eight depth/policy measurements; no MTP promotion"
+  },
+  "completed_full_record": "strata-mtp-normalized-full-20261002.json"
 }

@@ -137,7 +137,7 @@ int main(int argc, char **argv) {
 #else
         const int fast_math = 0;
 #endif
-        printf("GLM53F_BENCH_CONFIG {\"ranks\":12,\"threads\":%d,\"fast_math\":%d,\"prefill_chunk\":%d,\"prefill_capacity\":%d,\"attention_panel\":%d,\"prefill_features\":%u,\"collective\":%d,\"persistent\":%d,\"grouped_verify\":%d,\"router_fused\":%d,\"mhc_fused_sync\":%d,\"mhc_batch_team\":%d,\"kda_decode_columns\":%d,\"kda_prefill_columns\":%d,\"moe_gu_padding\":%d,\"serialized_owner\":%d}\n",
+        printf("GLM53F_BENCH_CONFIG {\"ranks\":12,\"threads\":%d,\"fast_math\":%d,\"prefill_chunk\":%d,\"prefill_capacity\":%d,\"attention_panel\":%d,\"prefill_features\":%u,\"collective\":%d,\"persistent\":%d,\"grouped_verify\":%d,\"router_fused\":%d,\"mhc_fused_sync\":%d,\"mhc_batch_team\":%d,\"kda_decode_columns\":%d,\"kda_prefill_columns\":%d,\"iq_scale_words\":%d,\"moe_gu_padding\":%d,\"serialized_owner\":%d}\n",
             omp_get_max_threads(), fast_math, chunk, GLM53F_PREFILL_MAX_TOKENS, GLM53F_PREFILL_ATTN_TOKENS, config.features, config.collective,
             getenv("GLM53F_DECODE_EXECUTOR") ? !!atoi(getenv("GLM53F_DECODE_EXECUTOR")) : 0,
             getenv("GLM53F_VERIFY_GROUPED") ? !!atoi(getenv("GLM53F_VERIFY_GROUPED")) : 0,
@@ -146,6 +146,7 @@ int main(int argc, char **argv) {
             getenv("GLM53F_MHC_BATCH_TEAM") ? !!atoi(getenv("GLM53F_MHC_BATCH_TEAM")) : 0,
             getenv("GLM53F_KDA_DECODE_COLUMNS") ? !!atoi(getenv("GLM53F_KDA_DECODE_COLUMNS")) : 0,
             getenv("GLM53F_KDA_PREFILL_COLUMNS") ? !!atoi(getenv("GLM53F_KDA_PREFILL_COLUMNS")) : 0,
+            getenv("GLM53F_IQ_SCALE_WORDS") && atoi(getenv("GLM53F_IQ_SCALE_WORDS")),
             getenv("GLM53F_MOE_GU_PAD") && atoi(getenv("GLM53F_MOE_GU_PAD")) ? 64 : 0,
             getenv("GLM53F_COMM_OWNER") ? !!atoi(getenv("GLM53F_COMM_OWNER")) : 0);
         fflush(stdout);

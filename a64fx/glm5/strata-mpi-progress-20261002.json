@@ -1,0 +1,63 @@
+{
+  "status": "Read-only native collective diagnostics queued; no production collective change",
+  "allocation": 52097252,
+  "model": "Complete45-layer GLM53F UD-Q4_K_XL/top8,12 ranks; diagnostics are standalone synthetic collective calls",
+  "slabs": {
+    "owned_pid": 9686,
+    "waits_owned_pid": 8008,
+    "source": "bench_glm53f_mpi_slabs_12n.c",
+    "source_sha256": "b1bcca18aa5900bddb9803ad65c43eadbb41d3b7cdcd568112261e7812765560",
+    "binary_sha256": "531436b8f5bd4fbebd8a6f0e5f22587e9c2a0a7be48fed8b7f597edadf7f1539",
+    "gate_cases": 126,
+    "reference_slab_tokens": 512,
+    "candidate_slab_tokens": [
+      64,
+      128,
+      256,
+      512,
+      1024,
+      2048,
+      4096
+    ],
+    "outputs": "tmp/strata-mpi-slabs-20261002/native-results.log"
+  },
+  "overlap": {
+    "owned_pid": 14193,
+    "waits_owned_pid": 9686,
+    "source": "bench_glm53f_mpi_overlap_12n.c",
+    "source_sha256": "3155fa550d067d0a53d7e501fa54a63c70b690b16a07f0b53e2f99b06f85a54c",
+    "binary_sha256": "bd38a6e49be57e4ff7490a79d7fc780feefa15e3a7ff4fd1e59b75d692b328b3",
+    "gate_cases": 90,
+    "message_boundary_tokens": 512,
+    "windows": [
+      0,
+      1,
+      2,
+      4,
+      8
+    ],
+    "baseline": "Window0 blocking MPI_Allreduce; others MPI_Iallreduce/Waitall with unchanged chunk/tail boundaries",
+    "outputs": "tmp/strata-mpi-overlap-20261002/native-results.log"
+  },
+  "common": {
+    "compiler": "mpifccpx -Nclang -O3 -march=armv8.2-a+sve -Wall -Wextra -Werror, no fast-math",
+    "gate_distributions": [
+      "Random signs/exponents",
+      "Near cancellation",
+      "Wide exponents",
+      "Tiny values",
+      "Exactly representable quarter values",
+      "ULP-adjacent positive values"
+    ],
+    "gate_lengths": [
+      128,
+      3953,
+      4096
+    ],
+    "checks": "Every output float bit on every rank, compare against original512-token blocking MPI sum. Only candidates exact in all distributions/shapes are timed.",
+    "timing": "Seven rotating-order64MiB reductions; rank-max elapsed time. Buffers use serial first touch; component timing does not establish whole-model throughput.",
+    "guard": "Wait owned prerequisite; refuse overlapping12-node MPI; defer new runs after00:00JST"
+  },
+  "promote": false,
+  "targets_met": false
+}

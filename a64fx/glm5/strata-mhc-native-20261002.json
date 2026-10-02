@@ -1,5 +1,5 @@
 {
-  "status": "Native arithmetic and synthetic latency PASS; full-model qualification pending; opt-in only",
+  "status": "Native arithmetic PASS; full-model state/token qualification PASS with no throughput gain; opt-in only",
   "native_job": {
     "job_id": 52089999,
     "nodes": 1,
@@ -311,5 +311,6 @@
     "start_deadline_jst": "2026-10-02 17:35:00",
     "per_run_deadline_jst": "2026-10-02 18:00:00"
   },
-  "targets_met": false
+  "targets_met": false,
+  "completed_full_model_record": "strata-mhc-sync-full-20261002.json"
 }

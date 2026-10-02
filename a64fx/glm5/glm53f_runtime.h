@@ -11,6 +11,7 @@ static inline int glm53f_runtime_option(int argc, char **argv, int *index) {
     else if (!strcmp(key, "--decode-executor")) env = "GLM53F_DECODE_EXECUTOR";
     else if (!strcmp(key, "--router-kernel")) env = "GLM53F_ROUTER_FUSE";
     else if (!strcmp(key, "--collective-owner")) env = "GLM53F_COMM_OWNER";
+    else if (!strcmp(key, "--moe-scale-kernel")) env = "GLM53F_IQ_SCALE_WORDS";
     else if (!strcmp(key, "--moe-combine-kernel")) env = "GLM53F_MOE_COMBINE";
     else if (!strcmp(key, "--index-kernel")) env = "GLM53F_INDEX_HEADS";
     else if (!strcmp(key, "--pool-selector")) env = "GLM53F_POOL_PARTITION_4K";
@@ -42,6 +43,7 @@ static inline int glm53f_runtime_option(int argc, char **argv, int *index) {
              (!strcmp(key, "--mhc-kernel") && !strcmp(value, "fused-sync")) ||
              (!strcmp(key, "--mhc-verify-kernel") && !strcmp(value, "team")) ||
              ((!strcmp(key, "--kda-decode-kernel") || !strcmp(key, "--kda-prefill-kernel")) && !strcmp(value, "columns")) ||
+             (!strcmp(key, "--moe-scale-kernel") && !strcmp(value, "words")) ||
              (!strcmp(key, "--moe-combine-kernel") && !strcmp(value, "vector")) ||
              (!strcmp(key, "--index-kernel") && !strcmp(value, "heads")) ||
              (!strcmp(key, "--mla-kernel") && !strcmp(value, "registers")) ||

@@ -14,6 +14,10 @@ int main(void) {
     failed |= parse("--kda-decode-kernel", "legacy", &c) != 1 || strcmp(getenv("GLM53F_KDA_DECODE_COLUMNS"), "0");
     failed |= parse("--kda-decode-kernel", "team", &c) != -1;
     failed |= parse("--kda-decode-kernel", NULL, &c) != -1;
+    failed |= parse("--moe-scale-kernel", "words", &c) != 1 || strcmp(getenv("GLM53F_IQ_SCALE_WORDS"), "1");
+    failed |= parse("--moe-scale-kernel", "legacy", &c) != 1 || strcmp(getenv("GLM53F_IQ_SCALE_WORDS"), "0");
+    failed |= parse("--moe-scale-kernel", "columns", &c) != -1;
+    failed |= parse("--moe-scale-kernel", NULL, &c) != -1;
     failed |= parse("--kda-prefill-kernel", "columns", &c) != 1 || strcmp(getenv("GLM53F_KDA_PREFILL_COLUMNS"), "1");
     failed |= parse("--kda-prefill-kernel", "legacy", &c) != 1 || strcmp(getenv("GLM53F_KDA_PREFILL_COLUMNS"), "0");
     failed |= parse("--kda-prefill-kernel", "team", &c) != -1;

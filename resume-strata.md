@@ -1,17 +1,19 @@
 # Resume: GLM53F Strata-inspired optimization, 12 A64FX nodes
 
-Updated 2026-10-02 20:48 JST. Capacity4096 remains the promoted recipe:
+Updated 2026-10-02 22:13 JST. Capacity4096 remains the promoted recipe:
 35.462134 decode /412.273634 prefill tok/s. Neither 100/2000 target is met.
 The normalized MTP constructor failure is diagnosed and fixed: compact-core
 strictness was cached from target creation and ignored temporary checkpoint
 fallback for layer45. Local regression, old-header counterfactual, sanitizers,
 18 launcher tests and isolated A64FX cross-build pass. Fresh PJM52097252
-staging is complete; corrected serial qualification PID597 is measuring MTP.
+staging is complete; PID597 completes MTP and mHC synchronization qualification.
 Exact opt-in mHC verification teams now pass9408 native cases and isolated
 11–20% component gains; full-model qualification PID2343 follows PID597.
-Corrected short128/8K MTP full-state gates pass, but depth1 measurements are
-slower than the fresh control. New opt-in KDA columns pass9504 native cases;
-serial full-model PID8008 follows PID2343. No new setting is promoted.
+Corrected short128/8K MTP full-state gates pass; all eight depth/policy variants
+are token-exact but slower. mHC synchronization is also exact and slower. New opt-in KDA columns pass9504 native cases;
+serial full-model PID8008 follows PID2343. The opt-in Q5 scale-word path passes
+8400 native primitive cases plus mixed expert-chain/paired-row gates; PID15502
+follows MPI diagnostics. No new setting is promoted.
 
 Previous campaign: TP12 implementation, native validation and
 short/8K/synthetic 32K qualification complete. All new paths remain opt-in.
@@ -70,9 +72,19 @@ decode20.412241/22.443641, prefill262.568944/366.245609 tok/s; these correctness
 fixtures are not confirmed performance gains. Fresh three-trial plain control
 is34.731006 /410.553527, rebuilt34.761139 /409.565019. Depth1 adaptive
 33.987156 /369.971770 and always34.053932 /368.136477 both regress, all257
-IDs exact. Remaining depths continue. Current results and hashes are added
+IDs exact. The remaining adaptive/always decode medians are depth2
+32.665228/32.874727, depth3 32.214399/29.439538, depth4 30.309639/24.220955.
+All257 IDs match; every prefill median regresses. The complete sweep rejects
+promotion. See [normalized full record](a64fx/glm5/strata-mtp-normalized-full-20261002.json).
+Current results and hashes are added
 to [MTP progress](a64fx/glm5/strata-mtp-progress-20261002.json), retaining the
 old allocation's constructor failure evidence.
+
+**mHC synchronization completed**:128-position hidden/full-state gate exact,
+all257 IDs exact, three-trial control34.574158 /409.300622 versus fused-sync
+34.337024 /408.123134. Ratios0.99314/.99712 reject promotion. Both campaigns
+end with `REPACK_NEXT4_CAMPAIGN_PASS` at21:28. See
+[full mHC result](a64fx/glm5/strata-mhc-sync-full-20261002.json).
 
 **Opt-in `--mhc-verify-kernel team`**, default`legacy`, retains2–5-position
 per-token FP64 norm partitions and four-position BF16 dot chains in one team.
@@ -98,7 +110,7 @@ MTP objects and repaired shared reader. Benchmark SHA
 `2127762f8e8c7440cbdc238ebcec439eebca5b2bf6493ec27e114b3726598714`,
 checker `17ad0196780b91576d09d2ef7537904c695a00e5f64cbc287cbe58fe705d3765`.
 Update-v3 SHA `405865cdead156c83b0ba1fcf22018c6ee08821c678fc811474b53f01b2837dc`.
-**Full-model PID2343** waits for owned PID597, checks stage/build/native
+**Full-model PID2343** is active after owned PID597 completed; it checks stage/build/native
 sentinels and refuses overlapping MPI. Scripts/logs
 `tmp/strata-mhc-batch-20261002/full-{driver,campaign}.{sh,py,pid,log}`;
 outputs`full-results-v1/`. It gates8049 means, short128 and8K full target state,
@@ -141,6 +153,63 @@ and three-trial decode-only/prefill-only/both runs. Balanced positive best gets
 five-trial confirmation; qualifying≥1.05 improvement with≥.98 other metric
 gets1024 stress, short128 and repeated32K gates. New-run guard00:00 JST October3.
 See [KDA native/build record](a64fx/glm5/strata-kda-columns-native-20261002.json).
+
+**MPI slab diagnostic PID9686**, scripts/logs in
+`tmp/strata-mpi-slabs-20261002/`, waits for owned KDA PID8008. Every float must
+match original512-token raw MPI slabs across six distributions,128/3953/4096
+positions and candidate slabs64/128/256/512/1024/2048/4096 (126 gates).
+Only exact slabs enter seven alternating64MiB timing trials. No production
+collective is changed; cross-build-Werror PASS. Frozen source SHA
+`b1bcca18aa5900bddb9803ad65c43eadbb41d3b7cdcd568112261e7812765560`.
+
+**MPI nonblocking diagnostic PID14193**, scripts/logs in
+`tmp/strata-mpi-overlap-20261002/`, follows owned slab PID9686. It retains512-token
+message and tail boundaries, checks every float in90 distribution/shape/window
+cases, and times only exact windows0/1/2/4/8. Source
+`bench_glm53f_mpi_overlap_12n.c` SHA`3155fa550d067d0a53d7e501fa54a63c70b690b16a07f0b53e2f99b06f85a54c`;
+binary`bd38a6e49be57e4ff7490a79d7fc780feefa15e3a7ff4fd1e59b75d692b328b3`.
+Standalone MPI probes are now committed source candidates; no model collective
+change or timing claim. See [MPI queue](a64fx/glm5/strata-mpi-progress-20261002.json).
+
+**Private prepared-weight probes.** Panel-cache PJM52100843/52101197 pass840
+mixed-format chain/guard cases. Corrected parallel placement and amortized
+lookup yield1.063×/1.069× warm C4096 component gains at47/48 threads, but
+720MiB/layer and~62ms admission require~46 chunk uses to repay cost. No
+integration/promotion; see [cache record](a64fx/glm5/strata-moe-panel-cache-native-20261002.json).
+Metadata PJM52101439 passes5880 exact cases; warm Q4/Q5 decode kernels gain
+1.23–1.24× at47 threads for4096 columns. Private24-byte/256-weight sidecar
+adds16.7%/13.6% bytes. Streaming PJM52101769 passes6144 exact matrix cases
+and1680 unit prechecks:47-thread gate/up gains fall to4–13%, two-block Q5
+down regresses4%. Compact16-byte metadata PJM52101898 completes after-Werror
+build. It completes7560 unit and12288 streamed matrix cases exactly, but
+both two-block down shapes regress~9%; neither layout is integrated. Direct
+native packed-word extraction is frozen/cross-building without weight sidecars.
+Source-direct-v4 SHA`82d859cad4e1c351e9546ef9432f2b0191a4dca4f210a09eab1df462c7554287`.
+Direct PJM52102269 completes5880 units and6144 streamed matrix cases exactly;
+Q5 component ratios1.057/1.061 gate/up and1.039/1.039 down at47. Q4 stayslegacy.
+
+**Opt-in Q5 `--moe-scale-kernel words`**, defaultlegacy, keeps native weight
+bytes and original SDOT/FMA/reduction chains. Integrated PJM52103308 passes
+8400 primitive ordinary/persistent cases,400 mixed Q4/Q5/Q6 expert chains,
+14200 paired-row comparisons and two parser configurations. Local parser,
+18 launcher/six reporting checks pass. Cross-builds retain-Werror on new
+primitive/diagnostic tools; only bridge/grouped units suppress pre-existing
+GLM5 graph warnings (initial failed log preserved).
+
+Immutable **candidate-iq-scale-words-v2**, capacity4096 /attention47,
+benchmark SHA`88f57070f3516057e671ca955ebd9bcafaf2a2e27f1b33c887ee61331adaf86c`,
+checker`c10accfca6269f15be2f40fc08456391540afba34ebdce7318948ee3c2906dc4`,
+executor`cb653398801ecc1cd533dda55382aef613b1701c92b186ff10a877d3d34fae7a`.
+Source-integrated-v5 SHA`eb7a31ba679d51c238be5a448a5af51d98d26c9a01eb12db2ed3fd5fd2a09c59`;
+checker update-v6 SHA`0a8982e5e068add257bca00c4b3c7231ca256d5cb924ce5273f8d14e3790f308`.
+**Full-model PID15502** waits owned MPI-overlap PID14193, then requires128-step
+executor state,8049 means/streams/fullstate with flag0/1, fresh/rebuilt controls,
+three-trial word candidate, and conditional five-trial/context qualification.
+Scripts`tmp/strata-iq-scales-20261002/full-{driver,campaign}.{sh,py,pid,log}`;
+outputs`full-results-v1/`, new-run guard00:00JST October3. Scratch`tmp/strata-iq-scales-20261002/`;
+stream archive SHA`8c314fa9d74b42373d720a08fc2ef19d0d137540f469a10854468c987979e785`.
+No model-memory allocation or model speedup claim; see
+[metadata record](a64fx/glm5/strata-iq-scales-native-20261002.json).
 
 **Rejected MoE prefetch probe**, PJM52098579: all210 mixed Q4/Q5 gate-up,
 Q5/Q6 down and guarded routing cases pass across fast/conservative and

@@ -1,0 +1,247 @@
+{
+  "status": "Full-model exact state/token qualification PASS; no delivered throughput gain; rejected for promotion",
+  "allocation": 52097252,
+  "candidate": "candidate-mhc-sync-v4",
+  "baseline": "Fresh candidate-capacity4096-v1",
+  "recipe": "Complete45-layer UD-Q4_K_XL/top8,12 A64FX ranks,8049-ID request,capacity4096/attention47/chunk4096,47 threads/page none; qualified persistent runtime recipe",
+  "executor_gate": "GLM53F_EXECUTOR_CHECK tokens=128 index_kernel=1 mla_kernel=3 q8_kernel=0 mhc_kernel=1 hidden_bit_mismatches=0 hidden_rel_l2=0 state=BIT_EXACT PASS",
+  "native_gate_record": "strata-mhc-native-20261002.json",
+  "comparisons": {
+    "rebuilt-control": {
+      "baseline": {
+        "prompt_tokens": 8049,
+        "decode_transitions": 256,
+        "trials": 3,
+        "prefill": {
+          "median_tok_s": 409.300622,
+          "min_tok_s": 408.584427,
+          "max_tok_s": 409.729044
+        },
+        "decode": {
+          "median_tok_s": 34.574158,
+          "min_tok_s": 34.551694,
+          "max_tok_s": 35.034636
+        }
+      },
+      "candidate": {
+        "prompt_tokens": 8049,
+        "decode_transitions": 256,
+        "trials": 3,
+        "prefill": {
+          "median_tok_s": 409.207071,
+          "min_tok_s": 408.717772,
+          "max_tok_s": 409.686129
+        },
+        "decode": {
+          "median_tok_s": 34.463625,
+          "min_tok_s": 34.445148,
+          "max_tok_s": 34.952602
+        }
+      },
+      "speedup": {
+        "prefill": 0.9997714369464115,
+        "decode": 0.9968030168659495
+      },
+      "tokens_equal": true,
+      "token_sha256": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da",
+      "promotion_candidate": false,
+      "target_met": false
+    },
+    "fused-sync": {
+      "baseline": {
+        "prompt_tokens": 8049,
+        "decode_transitions": 256,
+        "trials": 3,
+        "prefill": {
+          "median_tok_s": 409.300622,
+          "min_tok_s": 408.584427,
+          "max_tok_s": 409.729044
+        },
+        "decode": {
+          "median_tok_s": 34.574158,
+          "min_tok_s": 34.551694,
+          "max_tok_s": 35.034636
+        }
+      },
+      "candidate": {
+        "prompt_tokens": 8049,
+        "decode_transitions": 256,
+        "trials": 3,
+        "prefill": {
+          "median_tok_s": 408.123134,
+          "min_tok_s": 407.705196,
+          "max_tok_s": 408.656542
+        },
+        "decode": {
+          "median_tok_s": 34.337024,
+          "min_tok_s": 34.326919,
+          "max_tok_s": 34.797967
+        }
+      },
+      "speedup": {
+        "prefill": 0.9971231707534518,
+        "decode": 0.9931412935638231
+      },
+      "tokens_equal": true,
+      "token_sha256": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da",
+      "promotion_candidate": false,
+      "target_met": false
+    }
+  },
+  "trials": {
+    "frozen-control": [
+      {
+        "trial": 0,
+        "prompt_tokens": 8049,
+        "decode_transitions": 256,
+        "prefill_seconds": 19.699722937,
+        "decode_seconds": 7.409188067,
+        "prefill_tok_s": 408.584427,
+        "decode_tok_s": 34.551694,
+        "minimum_available_kb": 9975360,
+        "tokens_equal": true
+      },
+      {
+        "trial": 1,
+        "prompt_tokens": 8049,
+        "decode_transitions": 256,
+        "prefill_seconds": 19.644689888,
+        "decode_seconds": 7.404374024,
+        "prefill_tok_s": 409.729044,
+        "decode_tok_s": 34.574158,
+        "minimum_available_kb": 9971968,
+        "tokens_equal": true
+      },
+      {
+        "trial": 2,
+        "prompt_tokens": 8049,
+        "decode_transitions": 256,
+        "prefill_seconds": 19.665252296,
+        "decode_seconds": 7.307054567,
+        "prefill_tok_s": 409.300622,
+        "decode_tok_s": 35.034636,
+        "minimum_available_kb": 9971968,
+        "tokens_equal": true
+      }
+    ],
+    "rebuilt-control": [
+      {
+        "trial": 0,
+        "prompt_tokens": 8049,
+        "decode_transitions": 256,
+        "prefill_seconds": 19.693295864,
+        "decode_seconds": 7.324204277,
+        "prefill_tok_s": 408.717772,
+        "decode_tok_s": 34.952602,
+        "minimum_available_kb": 9993984,
+        "tokens_equal": true
+      },
+      {
+        "trial": 1,
+        "prompt_tokens": 8049,
+        "decode_transitions": 256,
+        "prefill_seconds": 19.669748071,
+        "decode_seconds": 7.428121786,
+        "prefill_tok_s": 409.207071,
+        "decode_tok_s": 34.463625,
+        "minimum_available_kb": 9993984,
+        "tokens_equal": true
+      },
+      {
+        "trial": 2,
+        "prompt_tokens": 8049,
+        "decode_transitions": 256,
+        "prefill_seconds": 19.646747692,
+        "decode_seconds": 7.432106166,
+        "prefill_tok_s": 409.686129,
+        "decode_tok_s": 34.445148,
+        "minimum_available_kb": 9993984,
+        "tokens_equal": true
+      }
+    ],
+    "fused-sync": [
+      {
+        "trial": 0,
+        "prompt_tokens": 8049,
+        "decode_transitions": 256,
+        "prefill_seconds": 19.721989076,
+        "decode_seconds": 7.457704029,
+        "prefill_tok_s": 408.123134,
+        "decode_tok_s": 34.326919,
+        "minimum_available_kb": 9994496,
+        "tokens_equal": true
+      },
+      {
+        "trial": 1,
+        "prompt_tokens": 8049,
+        "decode_transitions": 256,
+        "prefill_seconds": 19.742206072,
+        "decode_seconds": 7.455509297,
+        "prefill_tok_s": 407.705196,
+        "decode_tok_s": 34.337024,
+        "minimum_available_kb": 9994496,
+        "tokens_equal": true
+      },
+      {
+        "trial": 2,
+        "prompt_tokens": 8049,
+        "decode_transitions": 256,
+        "prefill_seconds": 19.696246553,
+        "decode_seconds": 7.356751689,
+        "prefill_tok_s": 408.656542,
+        "decode_tok_s": 34.797967,
+        "minimum_available_kb": 9985216,
+        "tokens_equal": true
+      }
+    ]
+  },
+  "choice": {
+    "promote": false,
+    "chunk": 4096,
+    "runtime_args": [
+      "--decode-executor",
+      "persistent",
+      "--router-kernel",
+      "fused",
+      "--verify-kernel",
+      "grouped",
+      "--moe-combine-kernel",
+      "vector",
+      "--index-kernel",
+      "heads",
+      "--mla-kernel",
+      "fp16-cache",
+      "--pool-selector",
+      "partition4k",
+      "--q8-row-kernel",
+      "rows4",
+      "--q8-prefill-kernel",
+      "tile4x4",
+      "--mla-projection-kernel",
+      "legacy",
+      "--mhc-kernel",
+      "fused-sync"
+    ],
+    "decode_ratio": 0.9931412935638231,
+    "prefill_ratio": 0.9971231707534518,
+    "targets_met": false
+  },
+  "decision": "Keep legacy mHC synchronization. No independent confirmation or context stress because initial exact candidate does not improve throughput.",
+  "targets_met": false,
+  "evidence": {
+    "local": "tmp/strata-mhc-sync-20261002/current-next4",
+    "remote": "tmp/strata-mhc-sync-20261002/results-next4/",
+    "sha256": {
+      "campaign.log": "6e585f3100efd8a3c2fb0cab3c4226518fc6b9ac8b04445b5f3a39983bdb4fdd",
+      "choice.json": "e80bf64a00a2d144a38ccbf852c027c2918e48dbb433dd1434b362255893332c",
+      "frozen-control.ids": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da",
+      "frozen-control.log": "f276367c6a85db236403163cc5dc144abbebd8fc3fa9a1b7f3d192052fd0f6f3",
+      "fused-sync.ids": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da",
+      "fused-sync.json": "7e5d81253755068c5bf874c2f3d5d21c3ed5016c9e5041c8a98d0b597d399681",
+      "fused-sync.log": "46ea20dc47748bdf3b10d671c12b732dfc0190b4bad48619fc74a94f061ce1c0",
+      "rebuilt-control.ids": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da",
+      "rebuilt-control.json": "bc5c7b8ecaad740d95417946b71fc797c1ef7b15a7ba865100b9fa980abaff8b",
+      "rebuilt-control.log": "2a0bef49d9744b57452adee7d7f43f1b99bf657299d195e8fac759315e85b87e"
+    }
+  }
+}

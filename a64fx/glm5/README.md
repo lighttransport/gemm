@@ -91,8 +91,9 @@ The resident benchmark also supports opt-in `--speculation mtp` with
 uses post-head-norm parent/draft hiddens, includes teacher forcing in prefill
 and compares every delivered ID with a plain warmup. Optional
 `--decode-state-check TRACE_PREFIX` compares complete target endpoint state
-outside timing. This candidate has native/unit validation; full-model timing
-is still pending. See the Strata document for its serial qualification gates.
+outside timing. The normalized native/full-model sweep passes exact state/token
+gates, but every depth/policy is slower than plain decode. MTP remains opt-in; see
+[normalized MTP results](strata-mtp-normalized-full-20261002.json).
 
 `--mhc-verify-kernel team` selects one OpenMP team for 2–5-position mHC
 verification batches. The default is `legacy`. Native fast/conservative
@@ -107,6 +108,12 @@ Both default to `legacy`. Native checks pass 9,504 exact state/output cases;
 decode component timings improve, while prefill results depend on head count.
 The serial 12-node state and throughput campaign is queued. See
 [KDA column evidence](strata-kda-columns-native-20261002.json).
+
+`--moe-scale-kernel words` selects native Q5 scale/minimum extraction with
+packed scalar words and SVE unpacking. Default is `legacy`; weights stay native.
+The component probe improves streamed Q5 kernels, while Q4 keeps its existing
+path. Full-model state/token and throughput qualification is queued. See
+[scale extraction evidence](strata-iq-scales-native-20261002.json).
 
 For tokenization of an already rendered chat prompt:
 
