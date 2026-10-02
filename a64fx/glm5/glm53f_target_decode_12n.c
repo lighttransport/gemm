@@ -303,7 +303,19 @@ static glm53f_target_model_12n *target_model_create(
                 !!m->batch_output, !!m->batch_state);
         goto fail;
     }
-    if(!rank){size_t bytes=0;int cp=0;for(int l=0;l<LAYERS;l++)if(m->sparse[l]){bytes+=glm53f_sparse_cache_bytes_12n(m->sparse[l]);cp+=glm53f_sparse_is_context_parallel_12n(m->sparse[l]);}printf("GLM53F_TARGET_CACHE capacity=%d sparse_layers=11 cp_layers=%d bytes_rank=%zu GiB_rank=%.3f\n",capacity,cp,bytes,bytes/1073741824.0);}
+    if ((!dist && !rank) || (dist && !dist->map.tp_rank)) {
+        size_t bytes = 0;
+        int cp = 0, sparse_layers = 0;
+        for (int l = m->first_layer; l < m->end_layer; ++l) if (m->sparse[l]) {
+            bytes += glm53f_sparse_cache_bytes_12n(m->sparse[l]);
+            cp += glm53f_sparse_is_context_parallel_12n(m->sparse[l]);
+            ++sparse_layers;
+        }
+        if (dist) printf("GLM53F_PP_CACHE rank=%d stage=%d capacity=%d sparse_layers=%d cp_layers=%d bytes_rank=%zu GiB_rank=%.3f\n",
+            rank, dist->map.stage, capacity, sparse_layers, cp, bytes, bytes / 1073741824.0);
+        else printf("GLM53F_TARGET_CACHE capacity=%d sparse_layers=11 cp_layers=%d bytes_rank=%zu GiB_rank=%.3f\n",
+            capacity, cp, bytes, bytes / 1073741824.0);
+    }
     return m;
 fail:
     glm53f_target_model_free_12n(m);

@@ -26,7 +26,7 @@ then stages owned PP images, then short serialized/two-slot PP captures.
 Logs/scripts are in `tmp/strata-pipeline-20261002/`; stage root
 `/local/glm53f-pp3-tp4-52106727-15-30`, frozen binaries
 `a64fx/glm5/build/pp-native-v1`. Strict runner SHA
-`2c4ad8b65bec6eb95e58c21b253dccca9bec49f10f641b649050a49ca0b1e4ce`.
+`e53bf76b40a177780bdbf3b035df810dee216dafd51f7a707e33204cd764ebb4`.
 The rebuilt TP12 full-state regression and short diagnostic control have passed.
 Owned routed staging is active; per-stage prefill compute/receive/send-wait
 maxima are now reported by the runner to guide cut balancing. The staged

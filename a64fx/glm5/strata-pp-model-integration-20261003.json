@@ -14,7 +14,7 @@
     "prefill_tok_s": 412.273634,
     "timing_boundary": "historical 8048-prefix control; not directly comparable to new full-prompt timing"
   },
-  "runner_sha256": "2c4ad8b65bec6eb95e58c21b253dccca9bec49f10f641b649050a49ca0b1e4ce",
+  "runner_sha256": "e53bf76b40a177780bdbf3b035df810dee216dafd51f7a707e33204cd764ebb4",
   "core_stage_sha256": "0b1643637dd0192239112d72915442b0e5a711f568adffcf201cf40a6cd7f5fa",
   "implemented": [
     "owned component constructors and native images",
@@ -84,5 +84,5 @@
   "logs": "tmp/strata-pipeline-20261002/{full-driver,repair-fixture-driver,pp-full-driver}.log",
   "remote_checkout": "~/work/gemm/glm53f-strata-20261001",
   "stage_root": "/local/glm53f-pp3-tp4-52106727-15-30",
-  "runner_change_after_TP12_gate": "PP-only per-stage timing reduction after both timed phases; TP12 code and model math unchanged"
+  "runner_change_after_TP12_gate": "PP-only post-timing stage reductions and accurate owned-cache reporting; TP12 math unchanged"
 }
