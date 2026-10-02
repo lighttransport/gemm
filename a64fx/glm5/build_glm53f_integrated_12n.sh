@@ -86,6 +86,7 @@ if [ "$mode" != runtime ]; then
     bin test_glm53f_head_hidden -ffunction-sections -fdata-sections -Wl,--gc-sections test_glm53f_head_hidden.c
     bin test_glm53f_mtp_cache_12n test_glm53f_mtp_cache_12n.c "${objects[@]}" "$build_dir/mtp.o"
     bin bench_glm53f_run_12n bench_glm53f_run_12n.c "$build_dir/lookup_spec.o" "$build_dir/mtp_spec.o" "$build_dir/mtp.o" "${objects[@]}" "$build_dir/target.o"
+    bin test_glm53f_moe_layout test_glm53f_moe_layout.c "$build_dir/gemm_asm.o"
     for name in kquant native_batch prefill_config state_io iq_grouped mhc_team mhc_sync lookup moe_combine index_heads index_keys4 pool_select mla_absorb mla_value mla_cache_f16 mla_attention; do
         bin "test_glm53f_$name" "test_glm53f_$name.c" "$build_dir/q8_panel.o" "$build_dir/team.o" "$build_dir/gemm_asm.o"
     done

@@ -966,7 +966,7 @@ static int gn_thread_init(gn_tbuf *b) {
     b->a8 = gn_alloc((size_t)GN_MAXM * GN_MAXINTER);
     b->as = gn_alloc((size_t)GN_MAXM * 16 * 4);
     b->asp = gn_alloc((size_t)GN_MAXM * 16 * 4);
-    b->ygu = gn_alloc((size_t)GN_MAXM * 2 * GN_MAXINTER * 4);
+    b->ygu = gn_alloc((size_t)GN_MAXM * (2 * GN_MAXINTER + 64) * 4);
     b->mina = gn_alloc((size_t)(4096 / 32) * 64 * 4);
     b->yd = gn_alloc((size_t)GN_MAXM * GN_LDY_DN * 4);
     b->cbuf = gn_alloc((size_t)(GMN_KC / 32) * GMN_BLK);
@@ -985,6 +985,10 @@ static int gn_expert_eligible(const glm53f_moe_stage_context_12n *c, const exper
 static int moe_native_grouped(glm53f_moe_stage_context_12n *c, const float *x, int tokens, int table_layer,
                               int (*selected)[8], unsigned char *handled) {
     enum { H = 4096 };
+    /* Padding breaks gate/up output-stride aliases in the 256-byte L1 sets.
+     * Capture the startup selector once, outside expert tasks. */
+    const char *pad_env = getenv("GLM53F_MOE_GU_PAD");
+    const int gu_padding = pad_env && atoi(pad_env) ? 64 : 0;
     static const int8_t zrow[H];
     static const float zxs[H / 32];
     if (!c->gn_xq) {
@@ -1074,7 +1078,7 @@ static int moe_native_grouped(glm53f_moe_stage_context_12n *c, const float *x, i
                 if (sl < m) memcpy(B->Bg + (size_t)sl * (H / 32), c->gn_bt + (size_t)plist[2 * (tk.off + sl)] * (H / 32), (H / 32) * 4);
                 else memset(B->Bg + (size_t)sl * (H / 32), 0, (H / 32) * 4);
             }
-            const size_t ldg = (size_t)2 * inter;
+            const size_t ldg = (size_t)2 * inter + gu_padding;
             const int gtype = ep->gate_type == GLM53F_GGML_Q5_K ? GMN_TYPE_Q5K : GMN_TYPE_Q4K;
             gmn_gemm(gtype, c->blob + ep->gate_up, gmn_row_bytes(gtype, H), H, 2 * inter, mpad,
                      B->xp, B->xsp, B->Bg, B->ygu, ldg, B->cbuf, B->mina, 1);

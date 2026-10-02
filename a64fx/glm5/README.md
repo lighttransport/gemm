@@ -182,3 +182,15 @@ Run `python3 a64fx/glm5/test_glm53f_launcher.py -v` without model access.
 Use `bash a64fx/glm5/run_glm53f_12n.sh check` after staging for native
 12-node regression checks. See [validation](GLM53F_VALIDATION.md) for
 acceptance gates, evidence, and remaining work.
+
+### Experimental routed-expert prefill layout
+
+`--moe-prefill-layout padded` gives grouped gate/up outputs an extra 64-float
+stride, avoiding L1 set aliases at larger route cohorts. `tight` is the default.
+The expert scheduler, scale/minimum accumulation and SwiGLU quantization stay
+as in the existing native path. This option affects grouped prefill; scalar
+decode and grouped verification retain their kernels. Benchmark CONFIG reports
+`moe_gu_padding`. Native expert-chain diagnostics show about 2% at 47 threads;
+full-model throughput/state qualification is pending. Use
+`--compare-moe-prefill-layout --capture-hidden` with the prompt-endpoint checker
+and equal reference/candidate chunk sizes to isolate the layout change.

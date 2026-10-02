@@ -41,20 +41,25 @@ static int run_prompt(glm53f_target_model_12n *m, const int *ids,
                 m, ids + offset, n, candidate_hidden) :
             glm53f_target_model_step_batch_12n(m, ids + offset, n, NULL, NULL, NULL, NULL);
         if (rc) return -1;
-        if (reference_hidden) {
+        if (reference_hidden && !candidate_hidden) {
+            /* Use the export's flattened OpenMP loop. A serial nested loop
+             * can be reassociated differently by FCC under -ffast-math. */
+#pragma omp parallel for schedule(static)
+            for (int k = 0; k < n * HIDDEN; k++) {
+                int t = k / HIDDEN, i = k % HIDDEN;
+                const float *stream = m->batch_streams + (size_t)t * FLAT;
+                float z = 0;
+                for (int s = 0; s < STREAMS; s++)
+                    z += stream[(size_t)s * HIDDEN + i];
+                reference_hidden[(size_t)(offset + t) * HIDDEN + i] = z / STREAMS;
+            }
+        } else if (reference_hidden) {
             for (int t = 0; t < n; ++t)
-                for (int i = 0; i < HIDDEN; ++i) {
-                    float *ref = reference_hidden + (size_t)(offset + t) * HIDDEN + i;
-                    if (candidate_hidden)
-                        *hidden_mismatches += memcmp(ref,
-                            candidate_hidden + (size_t)t * HIDDEN + i, sizeof(float)) != 0;
-                    else {
-                        const float *stream = m->batch_streams + (size_t)t * FLAT;
-                        float value = 0;
-                        for (int s = 0; s < STREAMS; ++s) value += stream[(size_t)s * HIDDEN + i];
-                        *ref = value / STREAMS;
-                    }
-                }
+                for (int i = 0; i < HIDDEN; ++i)
+                    *hidden_mismatches += memcmp(reference_hidden +
+                        (size_t)(offset + t) * HIDDEN + i,
+                        candidate_hidden + (size_t)t * HIDDEN + i,
+                        sizeof(float)) != 0;
         }
         long local = available_kb(), minimum;
         MPI_Allreduce(&local, &minimum, 1, MPI_LONG, MPI_MIN, MPI_COMM_WORLD);
@@ -71,7 +76,7 @@ int main(int argc, char **argv) {
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &ranks);
     if (argc < 7 || ranks != 12 || provided < MPI_THREAD_SERIALIZED) {
-        if (!rank) fprintf(stderr, "usage: %s MODEL ROUTED SHARED PROMPT_IDS TRACE_PREFIX CHUNK [--reference-chunk 512] [--capture-hidden] [prefill/runtime options]\n", argv[0]);
+        if (!rank) fprintf(stderr, "usage: %s MODEL ROUTED SHARED PROMPT_IDS TRACE_PREFIX CHUNK [--reference-chunk 512] [--capture-hidden] [--compare-moe-prefill-layout] [prefill/runtime options]\n", argv[0]);
         MPI_Abort(MPI_COMM_WORLD, 2);
     }
     char *end;
@@ -79,9 +84,10 @@ int main(int argc, char **argv) {
     if (!*argv[6] || *end || chunk < 1 || chunk > GLM53F_PREFILL_MAX_TOKENS)
         MPI_Abort(MPI_COMM_WORLD, 2);
     glm53f_prefill_config config = {GLM53F_PREFILL_FAST, 32, 27, NULL, 5};
-    int capture_hidden = 0;
+    int capture_hidden = 0, compare_layout = 0;
     int reference_chunk = 512;
     for (int i = 7; i < argc; ++i) {
+        if (!strcmp(argv[i], "--compare-moe-prefill-layout")) { compare_layout = 1; continue; }
         if (!strcmp(argv[i], "--capture-hidden")) { capture_hidden = 1; continue; }
         if (!strcmp(argv[i], "--reference-chunk")) {
             if (++i == argc) MPI_Abort(MPI_COMM_WORLD, 2);
@@ -95,6 +101,7 @@ int main(int argc, char **argv) {
             MPI_Abort(MPI_COMM_WORLD, 2);
     }
     if (config.mode != GLM53F_PREFILL_FAST) MPI_Abort(MPI_COMM_WORLD, 2);
+    if (compare_layout && setenv("GLM53F_MOE_GU_PAD", "0", 1)) MPI_Abort(MPI_COMM_WORLD, 2);
     int *ids = malloc(LIMIT * sizeof(int));
     if (!ids) MPI_Abort(MPI_COMM_WORLD, 2);
     int count = rank ? 0 : read_prompt(argv[4], ids, LIMIT);
@@ -133,6 +140,7 @@ int main(int argc, char **argv) {
     if (glm53f_target_trace_open_12n(m, argv[5], 0) ||
         glm53f_target_trace_close_12n(m) ||
         glm53f_target_snapshot_restore_12n(m, empty)) MPI_Abort(MPI_COMM_WORLD, 2);
+    if (compare_layout && setenv("GLM53F_MOE_GU_PAD", "1", 1)) MPI_Abort(MPI_COMM_WORLD, 2);
     if (run_prompt(m, ids, count, (int)chunk, &minimum_kb,
             reference_hidden, candidate_hidden, &hidden_mismatches) || !m->last_streams ||
         glm53f_target_model_readout_12n(m, &token, &logit)) MPI_Abort(MPI_COMM_WORLD, 3);
@@ -148,8 +156,8 @@ int main(int argc, char **argv) {
     MPI_Allreduce(&state_ok, &all_state, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
     MPI_Allreduce(&mismatches, &max_mismatches, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
     MPI_Allreduce(&hidden_mismatches, &max_hidden_mismatches, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
-    if (!rank) printf("GLM53F_PREFILL_CHUNK_CHECK tokens=%d reference_chunk=%d candidate_chunk=%ld capacity=%d hidden_bit_mismatches=%d capture_hidden=%d prompt_hidden_bit_mismatches=%d state=%s first_token=%d/%d min_MemAvailable_GiB=%.6f %s\n",
-        count, reference_chunk, chunk, GLM53F_PREFILL_MAX_TOKENS, max_mismatches,
+    if (!rank) printf("GLM53F_PREFILL_CHUNK_CHECK tokens=%d reference_chunk=%d candidate_chunk=%ld capacity=%d compare_moe_layout=%d hidden_bit_mismatches=%d capture_hidden=%d prompt_hidden_bit_mismatches=%d state=%s first_token=%d/%d min_MemAvailable_GiB=%.6f %s\n",
+        count, reference_chunk, chunk, GLM53F_PREFILL_MAX_TOKENS, compare_layout, max_mismatches,
         capture_hidden, max_hidden_mismatches,
         all_state ? "BIT_EXACT" : "MISMATCH", ref_token, token, minimum_kb / 1048576.0,
         all_ok ? "PASS" : "FAIL");

@@ -1,0 +1,239 @@
+{
+  "status": "Complete exact lookup ablation PASS; no variant promoted",
+  "allocation": 52085859,
+  "workload": "Complete45-layer UD-Q4_K_XL/top8, saved8049-ID single request;256 delivered transitions; three trials",
+  "settings": {
+    "threads": 47,
+    "page_type": "none",
+    "capacity": 4096,
+    "runtime_chunk": 4096,
+    "attention_panel": 47,
+    "q8_panel": 0,
+    "sparse_async": 0
+  },
+  "control": "Qualified candidate-capacity4096-v1 plain, rows4/Ctile4x4/legacy projections",
+  "candidate": "Same binary; lookup depths1\u20134 adaptive, depth4 always; ASM4 verification and fused MLA projection",
+  "choice": {
+    "promote": false,
+    "reason": "No exact lookup variant improves within prefill guard",
+    "targets_met": false
+  },
+  "reports": {
+    "1-adaptive": {
+      "baseline": {
+        "prompt_tokens": 8049,
+        "decode_transitions": 256,
+        "trials": 3,
+        "prefill": {
+          "median_tok_s": 410.495658,
+          "min_tok_s": 409.763137,
+          "max_tok_s": 410.743064
+        },
+        "decode": {
+          "median_tok_s": 35.337484,
+          "min_tok_s": 35.097121,
+          "max_tok_s": 35.346794
+        }
+      },
+      "candidate": {
+        "prompt_tokens": 8049,
+        "decode_transitions": 256,
+        "trials": 3,
+        "prefill": {
+          "median_tok_s": 417.425813,
+          "min_tok_s": 416.98657,
+          "max_tok_s": 417.457583
+        },
+        "decode": {
+          "median_tok_s": 35.324151,
+          "min_tok_s": 35.225562,
+          "max_tok_s": 35.33135
+        }
+      },
+      "speedup": {
+        "prefill": 1.016882407560082,
+        "decode": 0.999622695266024
+      },
+      "tokens_equal": true,
+      "token_sha256": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da",
+      "promotion_candidate": false,
+      "target_met": false
+    },
+    "2-adaptive": {
+      "baseline": {
+        "prompt_tokens": 8049,
+        "decode_transitions": 256,
+        "trials": 3,
+        "prefill": {
+          "median_tok_s": 410.495658,
+          "min_tok_s": 409.763137,
+          "max_tok_s": 410.743064
+        },
+        "decode": {
+          "median_tok_s": 35.337484,
+          "min_tok_s": 35.097121,
+          "max_tok_s": 35.346794
+        }
+      },
+      "candidate": {
+        "prompt_tokens": 8049,
+        "decode_transitions": 256,
+        "trials": 3,
+        "prefill": {
+          "median_tok_s": 418.067864,
+          "min_tok_s": 418.02546,
+          "max_tok_s": 418.172896
+        },
+        "decode": {
+          "median_tok_s": 35.314544,
+          "min_tok_s": 35.292944,
+          "max_tok_s": 35.344804
+        }
+      },
+      "speedup": {
+        "prefill": 1.0184464947495255,
+        "decode": 0.9993508309759686
+      },
+      "tokens_equal": true,
+      "token_sha256": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da",
+      "promotion_candidate": false,
+      "target_met": false
+    },
+    "3-adaptive": {
+      "baseline": {
+        "prompt_tokens": 8049,
+        "decode_transitions": 256,
+        "trials": 3,
+        "prefill": {
+          "median_tok_s": 410.495658,
+          "min_tok_s": 409.763137,
+          "max_tok_s": 410.743064
+        },
+        "decode": {
+          "median_tok_s": 35.337484,
+          "min_tok_s": 35.097121,
+          "max_tok_s": 35.346794
+        }
+      },
+      "candidate": {
+        "prompt_tokens": 8049,
+        "decode_transitions": 256,
+        "trials": 3,
+        "prefill": {
+          "median_tok_s": 418.903423,
+          "min_tok_s": 417.650346,
+          "max_tok_s": 418.970984
+        },
+        "decode": {
+          "median_tok_s": 34.94061,
+          "min_tok_s": 34.938362,
+          "max_tok_s": 34.984963
+        }
+      },
+      "speedup": {
+        "prefill": 1.0204819827838472,
+        "decode": 0.988769036301509
+      },
+      "tokens_equal": true,
+      "token_sha256": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da",
+      "promotion_candidate": false,
+      "target_met": false
+    },
+    "4-adaptive": {
+      "baseline": {
+        "prompt_tokens": 8049,
+        "decode_transitions": 256,
+        "trials": 3,
+        "prefill": {
+          "median_tok_s": 410.495658,
+          "min_tok_s": 409.763137,
+          "max_tok_s": 410.743064
+        },
+        "decode": {
+          "median_tok_s": 35.337484,
+          "min_tok_s": 35.097121,
+          "max_tok_s": 35.346794
+        }
+      },
+      "candidate": {
+        "prompt_tokens": 8049,
+        "decode_transitions": 256,
+        "trials": 3,
+        "prefill": {
+          "median_tok_s": 416.950511,
+          "min_tok_s": 416.492803,
+          "max_tok_s": 417.479383
+        },
+        "decode": {
+          "median_tok_s": 34.99751,
+          "min_tok_s": 34.95729,
+          "max_tok_s": 35.047678
+        }
+      },
+      "speedup": {
+        "prefill": 1.0157245341679109,
+        "decode": 0.9903792245084566
+      },
+      "tokens_equal": true,
+      "token_sha256": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da",
+      "promotion_candidate": false,
+      "target_met": false
+    },
+    "4-always": {
+      "baseline": {
+        "prompt_tokens": 8049,
+        "decode_transitions": 256,
+        "trials": 3,
+        "prefill": {
+          "median_tok_s": 410.495658,
+          "min_tok_s": 409.763137,
+          "max_tok_s": 410.743064
+        },
+        "decode": {
+          "median_tok_s": 35.337484,
+          "min_tok_s": 35.097121,
+          "max_tok_s": 35.346794
+        }
+      },
+      "candidate": {
+        "prompt_tokens": 8049,
+        "decode_transitions": 256,
+        "trials": 3,
+        "prefill": {
+          "median_tok_s": 415.614228,
+          "min_tok_s": 415.467083,
+          "max_tok_s": 415.636504
+        },
+        "decode": {
+          "median_tok_s": 30.413327,
+          "min_tok_s": 30.020756,
+          "max_tok_s": 30.489961
+        }
+      },
+      "speedup": {
+        "prefill": 1.012469242731917,
+        "decode": 0.8606534353153155
+      },
+      "tokens_equal": true,
+      "token_sha256": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da",
+      "promotion_candidate": false,
+      "target_met": false
+    }
+  },
+  "evidence": {
+    "remote_directory": "~/work/gemm/glm53f-strata-20261001/tmp/strata-q8-20261002/lookup-results",
+    "report_sha256": {
+      "1-adaptive.json": "ba7cf6180bb38dc4d3cbf6f2f59e33060d9c43e0b1438ea86125ffb73520c83d",
+      "2-adaptive.json": "31517044182157390acfecb49f9845eddda8b440cc2de51404bf1a49d5216390",
+      "3-adaptive.json": "bea126155fdaa62410599c06ae59a7dd33804baeb41d288642099316be3e1f4f",
+      "4-adaptive.json": "e03f6eb893e93f072a6f0549b60145d9ccdd9b56fd9f7e5c8c3b1953bedf7295",
+      "4-always.json": "cbde1a228e97ba61cdbcfac9f00baf13b6694aaa505bfb2d168212a85627af5d",
+      "choice.json": "d06134677a49a2a899881a85fdac58792f4330484a55829c364bd80714321a71"
+    },
+    "campaign_sentinels": [
+      "LOOKUP_Q8_QUALIFICATIONS_PASS",
+      "LOOKUP_Q8_CAMPAIGN_PASS"
+    ]
+  },
+  "targets_met": false
+}

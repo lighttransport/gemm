@@ -129,12 +129,13 @@ int main(int argc, char **argv) {
 #else
         const int fast_math = 0;
 #endif
-        printf("GLM53F_BENCH_CONFIG {\"ranks\":12,\"threads\":%d,\"fast_math\":%d,\"prefill_chunk\":%d,\"prefill_capacity\":%d,\"attention_panel\":%d,\"prefill_features\":%u,\"collective\":%d,\"persistent\":%d,\"grouped_verify\":%d,\"router_fused\":%d,\"mhc_fused_sync\":%d,\"serialized_owner\":%d}\n",
+        printf("GLM53F_BENCH_CONFIG {\"ranks\":12,\"threads\":%d,\"fast_math\":%d,\"prefill_chunk\":%d,\"prefill_capacity\":%d,\"attention_panel\":%d,\"prefill_features\":%u,\"collective\":%d,\"persistent\":%d,\"grouped_verify\":%d,\"router_fused\":%d,\"mhc_fused_sync\":%d,\"moe_gu_padding\":%d,\"serialized_owner\":%d}\n",
             omp_get_max_threads(), fast_math, chunk, GLM53F_PREFILL_MAX_TOKENS, GLM53F_PREFILL_ATTN_TOKENS, config.features, config.collective,
             getenv("GLM53F_DECODE_EXECUTOR") ? !!atoi(getenv("GLM53F_DECODE_EXECUTOR")) : 0,
             getenv("GLM53F_VERIFY_GROUPED") ? !!atoi(getenv("GLM53F_VERIFY_GROUPED")) : 0,
             getenv("GLM53F_ROUTER_FUSE") ? !!atoi(getenv("GLM53F_ROUTER_FUSE")) : 0,
             getenv("GLM53F_MHC_FUSED_SYNC") ? !!atoi(getenv("GLM53F_MHC_FUSED_SYNC")) : 0,
+            getenv("GLM53F_MOE_GU_PAD") && atoi(getenv("GLM53F_MOE_GU_PAD")) ? 64 : 0,
             getenv("GLM53F_COMM_OWNER") ? !!atoi(getenv("GLM53F_COMM_OWNER")) : 0);
         fflush(stdout);
     }

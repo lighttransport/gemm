@@ -10,6 +10,11 @@ static int parse(const char *key, const char *value, glm53f_prefill_config *c) {
 int main(void) {
     glm53f_prefill_config c = {GLM53F_PREFILL_LEGACY, 32, GLM53F_PREFILL_FAST_DEFAULT, NULL, 0};
     int failed = 0;
+    failed |= parse("--moe-prefill-layout", "padded", &c) != 1 || strcmp(getenv("GLM53F_MOE_GU_PAD"), "1");
+    failed |= parse("--moe-prefill-layout", "tight", &c) != 1 || strcmp(getenv("GLM53F_MOE_GU_PAD"), "0");
+    failed |= parse("--moe-prefill-layout", "legacy", &c) != 1 || strcmp(getenv("GLM53F_MOE_GU_PAD"), "0");
+    failed |= parse("--moe-prefill-layout", "panels", &c) != -1;
+    failed |= parse("--moe-prefill-layout", NULL, &c) != -1;
     failed |= parse("--mhc-kernel", "fused-sync", &c) != 1 || strcmp(getenv("GLM53F_MHC_FUSED_SYNC"), "1");
     failed |= parse("--mhc-kernel", "legacy", &c) != 1 || strcmp(getenv("GLM53F_MHC_FUSED_SYNC"), "0");
     failed |= parse("--mhc-kernel", "distributed", &c) != -1;

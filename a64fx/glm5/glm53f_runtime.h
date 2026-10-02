@@ -17,16 +17,19 @@ static inline int glm53f_runtime_option(int argc, char **argv, int *index) {
     else if (!strcmp(key, "--q8-row-kernel")) env = "GLM53F_NATIVE_Q8_ROWS8";
     else if (!strcmp(key, "--q8-prefill-kernel")) env = "GLM53F_NATIVE_Q8_TILE2X8";
     else if (!strcmp(key, "--mla-projection-kernel")) env = "GLM53F_MLA_FUSED_PROJECTION";
+    else if (!strcmp(key, "--moe-prefill-layout")) env = "GLM53F_MOE_GU_PAD";
     else if (!strcmp(key, "--mhc-kernel")) env = "GLM53F_MHC_FUSED_SYNC";
     else if (!strcmp(key, "--mla-kernel")) env = "GLM53F_MLA_REGISTERS";
     else return 0;
     if (*index + 1 >= argc) return -1;
     const char *value = argv[++*index];
     int enabled;
-    if ((!strcmp(key, "--q8-row-kernel") && !strcmp(value, "rows4")) ||
+    if ((!strcmp(key, "--moe-prefill-layout") && !strcmp(value, "tight")) ||
+        (!strcmp(key, "--q8-row-kernel") && !strcmp(value, "rows4")) ||
         (!strcmp(key, "--q8-prefill-kernel") && !strcmp(value, "tile4x4")) ||
         (!strcmp(key, "--pool-selector") && !strcmp(value, "heap")) || !strcmp(value, "legacy")) enabled = 0;
-    else if ((!strcmp(key, "--q8-row-kernel") && !strcmp(value, "rows8")) ||
+    else if ((!strcmp(key, "--moe-prefill-layout") && !strcmp(value, "padded")) ||
+             (!strcmp(key, "--q8-row-kernel") && !strcmp(value, "rows8")) ||
              (!strcmp(key, "--q8-prefill-kernel") && !strcmp(value, "tile2x8")) ||
              (!strcmp(key, "--pool-selector") && !strcmp(value, "partition4k")) ||
              (!strcmp(key, "--verify-kernel") && !strcmp(value, "grouped")) ||

@@ -1,0 +1,1871 @@
+{
+  "status": "Native correctness PASS; register-accumulation experiment rejected by native timing; production unchanged",
+  "job": 52093052,
+  "host": "a26-3103c",
+  "frequency_mhz_requested": 2000,
+  "eco_state_requested": 0,
+  "workload": "Synthetic packed panel64 INT8 GEMM, ordered FP32 scale-block FMAs, distinct token inputs; not full-model throughput",
+  "isolated_from_model_job": 52085859,
+  "experiment": "3 tokens x 64 rows; two calls per six-token packed group; FP32 sums remain in registers across scale blocks",
+  "decision": "reject",
+  "reason": "All 47/48-thread shapes regress, so no runtime path is integrated. Fewer integer accumulators and duplicated weight loads are plausible causes inferred from the implementation; hardware counters were not measured.",
+  "unit_configurations": [
+    {
+      "math": "fast",
+      "threads": 1,
+      "cases": 240,
+      "status": "PASS"
+    },
+    {
+      "math": "fast",
+      "threads": 3,
+      "cases": 240,
+      "status": "PASS"
+    },
+    {
+      "math": "fast",
+      "threads": 12,
+      "cases": 240,
+      "status": "PASS"
+    },
+    {
+      "math": "fast",
+      "threads": 47,
+      "cases": 240,
+      "status": "PASS"
+    },
+    {
+      "math": "fast",
+      "threads": 48,
+      "cases": 240,
+      "status": "PASS"
+    },
+    {
+      "math": "conservative",
+      "threads": 1,
+      "cases": 240,
+      "status": "PASS"
+    },
+    {
+      "math": "conservative",
+      "threads": 3,
+      "cases": 240,
+      "status": "PASS"
+    },
+    {
+      "math": "conservative",
+      "threads": 12,
+      "cases": 240,
+      "status": "PASS"
+    },
+    {
+      "math": "conservative",
+      "threads": 47,
+      "cases": 240,
+      "status": "PASS"
+    },
+    {
+      "math": "conservative",
+      "threads": 48,
+      "cases": 240,
+      "status": "PASS"
+    }
+  ],
+  "probe_shapes": [
+    {
+      "threads": 1,
+      "scale_block": 16,
+      "columns": 256,
+      "tokens": 18,
+      "output_stride": 4160,
+      "legacy_median_us": 3.397465,
+      "registers3_median_us": 3.397465,
+      "speedup": 1.0,
+      "trials": [
+        {
+          "trial": 0,
+          "legacy_us": 3.437201,
+          "registers3_us": 3.397465,
+          "status": "PASS"
+        },
+        {
+          "trial": 1,
+          "legacy_us": 3.372629,
+          "registers3_us": 3.392498,
+          "status": "PASS"
+        },
+        {
+          "trial": 2,
+          "legacy_us": 3.397465,
+          "registers3_us": 3.397465,
+          "status": "PASS"
+        },
+        {
+          "trial": 3,
+          "legacy_us": 3.397465,
+          "registers3_us": 3.397465,
+          "status": "PASS"
+        },
+        {
+          "trial": 4,
+          "legacy_us": 3.372629,
+          "registers3_us": 3.372629,
+          "status": "PASS"
+        },
+        {
+          "trial": 5,
+          "legacy_us": 3.397465,
+          "registers3_us": 3.397465,
+          "status": "PASS"
+        },
+        {
+          "trial": 6,
+          "legacy_us": 3.372629,
+          "registers3_us": 3.377597,
+          "status": "PASS"
+        }
+      ]
+    },
+    {
+      "threads": 1,
+      "scale_block": 32,
+      "columns": 256,
+      "tokens": 18,
+      "output_stride": 4160,
+      "legacy_median_us": 2.39412,
+      "registers3_median_us": 2.771616,
+      "speedup": 0.8637993141907104,
+      "trials": [
+        {
+          "trial": 0,
+          "legacy_us": 2.399087,
+          "registers3_us": 2.766649,
+          "status": "PASS"
+        },
+        {
+          "trial": 1,
+          "legacy_us": 2.399087,
+          "registers3_us": 2.771616,
+          "status": "PASS"
+        },
+        {
+          "trial": 2,
+          "legacy_us": 2.39412,
+          "registers3_us": 2.771616,
+          "status": "PASS"
+        },
+        {
+          "trial": 3,
+          "legacy_us": 2.39412,
+          "registers3_us": 2.746781,
+          "status": "PASS"
+        },
+        {
+          "trial": 4,
+          "legacy_us": 2.39412,
+          "registers3_us": 2.771616,
+          "status": "PASS"
+        },
+        {
+          "trial": 5,
+          "legacy_us": 2.39412,
+          "registers3_us": 2.771616,
+          "status": "PASS"
+        },
+        {
+          "trial": 6,
+          "legacy_us": 2.399087,
+          "registers3_us": 2.751748,
+          "status": "PASS"
+        }
+      ]
+    },
+    {
+      "threads": 1,
+      "scale_block": 32,
+      "columns": 4096,
+      "tokens": 6,
+      "output_stride": 576,
+      "legacy_median_us": 12.641152,
+      "registers3_median_us": 14.66771,
+      "speedup": 0.8618354194349357,
+      "trials": [
+        {
+          "trial": 0,
+          "legacy_us": 12.665987,
+          "registers3_us": 14.687578,
+          "status": "PASS"
+        },
+        {
+          "trial": 1,
+          "legacy_us": 12.626251,
+          "registers3_us": 14.662743,
+          "status": "PASS"
+        },
+        {
+          "trial": 2,
+          "legacy_us": 12.621284,
+          "registers3_us": 14.66771,
+          "status": "PASS"
+        },
+        {
+          "trial": 3,
+          "legacy_us": 12.621284,
+          "registers3_us": 14.687578,
+          "status": "PASS"
+        },
+        {
+          "trial": 4,
+          "legacy_us": 12.646119,
+          "registers3_us": 14.66771,
+          "status": "PASS"
+        },
+        {
+          "trial": 5,
+          "legacy_us": 12.646119,
+          "registers3_us": 14.66771,
+          "status": "PASS"
+        },
+        {
+          "trial": 6,
+          "legacy_us": 12.641152,
+          "registers3_us": 14.687578,
+          "status": "PASS"
+        }
+      ]
+    },
+    {
+      "threads": 1,
+      "scale_block": 32,
+      "columns": 4096,
+      "tokens": 18,
+      "output_stride": 576,
+      "legacy_median_us": 41.246414,
+      "registers3_median_us": 45.94028,
+      "speedup": 0.8978267872986407,
+      "trials": [
+        {
+          "trial": 0,
+          "legacy_us": 41.271249,
+          "registers3_us": 45.955181,
+          "status": "PASS"
+        },
+        {
+          "trial": 1,
+          "legacy_us": 41.231513,
+          "registers3_us": 45.960148,
+          "status": "PASS"
+        },
+        {
+          "trial": 2,
+          "legacy_us": 41.246414,
+          "registers3_us": 45.960148,
+          "status": "PASS"
+        },
+        {
+          "trial": 3,
+          "legacy_us": 41.271249,
+          "registers3_us": 45.94028,
+          "status": "PASS"
+        },
+        {
+          "trial": 4,
+          "legacy_us": 41.226546,
+          "registers3_us": 45.94028,
+          "status": "PASS"
+        },
+        {
+          "trial": 5,
+          "legacy_us": 41.226546,
+          "registers3_us": 45.935313,
+          "status": "PASS"
+        },
+        {
+          "trial": 6,
+          "legacy_us": 41.251381,
+          "registers3_us": 45.94028,
+          "status": "PASS"
+        }
+      ]
+    },
+    {
+      "threads": 1,
+      "scale_block": 32,
+      "columns": 4096,
+      "tokens": 72,
+      "output_stride": 576,
+      "legacy_median_us": 166.043639,
+      "registers3_median_us": 183.875362,
+      "speedup": 0.9030227714793024,
+      "trials": [
+        {
+          "trial": 0,
+          "legacy_us": 166.043639,
+          "registers3_us": 183.81079,
+          "status": "PASS"
+        },
+        {
+          "trial": 1,
+          "legacy_us": 166.063507,
+          "registers3_us": 183.850527,
+          "status": "PASS"
+        },
+        {
+          "trial": 2,
+          "legacy_us": 166.038672,
+          "registers3_us": 184.06411,
+          "status": "PASS"
+        },
+        {
+          "trial": 3,
+          "legacy_us": 166.043639,
+          "registers3_us": 183.855494,
+          "status": "PASS"
+        },
+        {
+          "trial": 4,
+          "legacy_us": 166.018804,
+          "registers3_us": 183.875362,
+          "status": "PASS"
+        },
+        {
+          "trial": 5,
+          "legacy_us": 166.043639,
+          "registers3_us": 183.875362,
+          "status": "PASS"
+        },
+        {
+          "trial": 6,
+          "legacy_us": 166.043639,
+          "registers3_us": 183.875362,
+          "status": "PASS"
+        }
+      ]
+    },
+    {
+      "threads": 1,
+      "scale_block": 32,
+      "columns": 4096,
+      "tokens": 48,
+      "output_stride": 3136,
+      "legacy_median_us": 112.101436,
+      "registers3_median_us": 122.666359,
+      "speedup": 0.913872694305698,
+      "trials": [
+        {
+          "trial": 0,
+          "legacy_us": 111.892819,
+          "registers3_us": 122.641524,
+          "status": "PASS"
+        },
+        {
+          "trial": 1,
+          "legacy_us": 112.061699,
+          "registers3_us": 122.666359,
+          "status": "PASS"
+        },
+        {
+          "trial": 2,
+          "legacy_us": 112.106403,
+          "registers3_us": 122.686227,
+          "status": "PASS"
+        },
+        {
+          "trial": 3,
+          "legacy_us": 112.126271,
+          "registers3_us": 122.666359,
+          "status": "PASS"
+        },
+        {
+          "trial": 4,
+          "legacy_us": 112.101436,
+          "registers3_us": 122.646491,
+          "status": "PASS"
+        },
+        {
+          "trial": 5,
+          "legacy_us": 112.334887,
+          "registers3_us": 122.646491,
+          "status": "PASS"
+        },
+        {
+          "trial": 6,
+          "legacy_us": 111.917655,
+          "registers3_us": 122.686227,
+          "status": "PASS"
+        }
+      ]
+    },
+    {
+      "threads": 1,
+      "scale_block": 128,
+      "columns": 4096,
+      "tokens": 48,
+      "output_stride": 3136,
+      "legacy_median_us": 76.18467,
+      "registers3_median_us": 98.521511,
+      "speedup": 0.7732795531323103,
+      "trials": [
+        {
+          "trial": 0,
+          "legacy_us": 76.18467,
+          "registers3_us": 98.521511,
+          "status": "PASS"
+        },
+        {
+          "trial": 1,
+          "legacy_us": 76.209505,
+          "registers3_us": 98.417203,
+          "status": "PASS"
+        },
+        {
+          "trial": 2,
+          "legacy_us": 76.169769,
+          "registers3_us": 98.561247,
+          "status": "PASS"
+        },
+        {
+          "trial": 3,
+          "legacy_us": 76.189637,
+          "registers3_us": 98.516544,
+          "status": "PASS"
+        },
+        {
+          "trial": 4,
+          "legacy_us": 76.18467,
+          "registers3_us": 98.566214,
+          "status": "PASS"
+        },
+        {
+          "trial": 5,
+          "legacy_us": 76.18467,
+          "registers3_us": 98.521511,
+          "status": "PASS"
+        },
+        {
+          "trial": 6,
+          "legacy_us": 76.169769,
+          "registers3_us": 98.541379,
+          "status": "PASS"
+        }
+      ]
+    },
+    {
+      "threads": 1,
+      "scale_block": 256,
+      "columns": 4096,
+      "tokens": 192,
+      "output_stride": 2368,
+      "legacy_median_us": 287.15531,
+      "registers3_median_us": 382.999579,
+      "speedup": 0.7497535917656974,
+      "trials": [
+        {
+          "trial": 0,
+          "legacy_us": 287.15531,
+          "registers3_us": 383.079052,
+          "status": "PASS"
+        },
+        {
+          "trial": 1,
+          "legacy_us": 287.175179,
+          "registers3_us": 382.920106,
+          "status": "PASS"
+        },
+        {
+          "trial": 2,
+          "legacy_us": 286.996365,
+          "registers3_us": 383.079052,
+          "status": "PASS"
+        },
+        {
+          "trial": 3,
+          "legacy_us": 287.334124,
+          "registers3_us": 382.920106,
+          "status": "PASS"
+        },
+        {
+          "trial": 4,
+          "legacy_us": 287.15531,
+          "registers3_us": 382.999579,
+          "status": "PASS"
+        },
+        {
+          "trial": 5,
+          "legacy_us": 287.254651,
+          "registers3_us": 383.079052,
+          "status": "PASS"
+        },
+        {
+          "trial": 6,
+          "legacy_us": 287.095706,
+          "registers3_us": 382.999579,
+          "status": "PASS"
+        }
+      ]
+    },
+    {
+      "threads": 1,
+      "scale_block": 256,
+      "columns": 4096,
+      "tokens": 504,
+      "output_stride": 2368,
+      "legacy_median_us": 740.845998,
+      "registers3_median_us": 993.569692,
+      "speedup": 0.745640697341239,
+      "trials": [
+        {
+          "trial": 0,
+          "legacy_us": 740.925471,
+          "registers3_us": 993.430614,
+          "status": "PASS"
+        },
+        {
+          "trial": 1,
+          "legacy_us": 740.845998,
+          "registers3_us": 993.490219,
+          "status": "PASS"
+        },
+        {
+          "trial": 2,
+          "legacy_us": 740.985076,
+          "registers3_us": 993.669033,
+          "status": "PASS"
+        },
+        {
+          "trial": 3,
+          "legacy_us": 740.746657,
+          "registers3_us": 993.569692,
+          "status": "PASS"
+        },
+        {
+          "trial": 4,
+          "legacy_us": 740.985076,
+          "registers3_us": 995.417436,
+          "status": "PASS"
+        },
+        {
+          "trial": 5,
+          "legacy_us": 740.508238,
+          "registers3_us": 994.404157,
+          "status": "PASS"
+        },
+        {
+          "trial": 6,
+          "legacy_us": 740.408897,
+          "registers3_us": 993.430614,
+          "status": "PASS"
+        }
+      ]
+    },
+    {
+      "threads": 1,
+      "scale_block": 32,
+      "columns": 4096,
+      "tokens": 192,
+      "output_stride": 2368,
+      "legacy_median_us": 459.253788,
+      "registers3_median_us": 497.758389,
+      "speedup": 0.9226439938514024,
+      "trials": [
+        {
+          "trial": 0,
+          "legacy_us": 459.333261,
+          "registers3_us": 497.837861,
+          "status": "PASS"
+        },
+        {
+          "trial": 1,
+          "legacy_us": 459.253788,
+          "registers3_us": 497.758389,
+          "status": "PASS"
+        },
+        {
+          "trial": 2,
+          "legacy_us": 459.154447,
+          "registers3_us": 497.758389,
+          "status": "PASS"
+        },
+        {
+          "trial": 3,
+          "legacy_us": 459.253788,
+          "registers3_us": 497.73852,
+          "status": "PASS"
+        },
+        {
+          "trial": 4,
+          "legacy_us": 459.253788,
+          "registers3_us": 497.837861,
+          "status": "PASS"
+        },
+        {
+          "trial": 5,
+          "legacy_us": 459.333261,
+          "registers3_us": 497.73852,
+          "status": "PASS"
+        },
+        {
+          "trial": 6,
+          "legacy_us": 459.253788,
+          "registers3_us": 497.817993,
+          "status": "PASS"
+        }
+      ]
+    },
+    {
+      "threads": 1,
+      "scale_block": 32,
+      "columns": 4096,
+      "tokens": 504,
+      "output_stride": 2368,
+      "legacy_median_us": 1204.073429,
+      "registers3_median_us": 1305.500666,
+      "speedup": 0.92230778609193,
+      "trials": [
+        {
+          "trial": 0,
+          "legacy_us": 1205.662886,
+          "registers3_us": 1305.580139,
+          "status": "PASS"
+        },
+        {
+          "trial": 1,
+          "legacy_us": 1203.993956,
+          "registers3_us": 1305.500666,
+          "status": "PASS"
+        },
+        {
+          "trial": 2,
+          "legacy_us": 1204.013824,
+          "registers3_us": 1305.580139,
+          "status": "PASS"
+        },
+        {
+          "trial": 3,
+          "legacy_us": 1204.252243,
+          "registers3_us": 1305.500666,
+          "status": "PASS"
+        },
+        {
+          "trial": 4,
+          "legacy_us": 1204.013824,
+          "registers3_us": 1305.500666,
+          "status": "PASS"
+        },
+        {
+          "trial": 5,
+          "legacy_us": 1204.431057,
+          "registers3_us": 1305.500666,
+          "status": "PASS"
+        },
+        {
+          "trial": 6,
+          "legacy_us": 1204.073429,
+          "registers3_us": 1305.580139,
+          "status": "PASS"
+        }
+      ]
+    },
+    {
+      "threads": 47,
+      "scale_block": 16,
+      "columns": 256,
+      "tokens": 18,
+      "output_stride": 4160,
+      "legacy_median_us": 3.417333,
+      "registers3_median_us": 3.457069,
+      "speedup": 0.9885058701460688,
+      "trials": [
+        {
+          "trial": 0,
+          "legacy_us": 3.462036,
+          "registers3_us": 3.457069,
+          "status": "PASS"
+        },
+        {
+          "trial": 1,
+          "legacy_us": 3.412366,
+          "registers3_us": 3.462036,
+          "status": "PASS"
+        },
+        {
+          "trial": 2,
+          "legacy_us": 3.412366,
+          "registers3_us": 3.457069,
+          "status": "PASS"
+        },
+        {
+          "trial": 3,
+          "legacy_us": 3.417333,
+          "registers3_us": 3.457069,
+          "status": "PASS"
+        },
+        {
+          "trial": 4,
+          "legacy_us": 3.417333,
+          "registers3_us": 3.462036,
+          "status": "PASS"
+        },
+        {
+          "trial": 5,
+          "legacy_us": 3.645817,
+          "registers3_us": 3.457069,
+          "status": "PASS"
+        },
+        {
+          "trial": 6,
+          "legacy_us": 3.417333,
+          "registers3_us": 3.457069,
+          "status": "PASS"
+        }
+      ]
+    },
+    {
+      "threads": 47,
+      "scale_block": 32,
+      "columns": 256,
+      "tokens": 18,
+      "output_stride": 4160,
+      "legacy_median_us": 2.438823,
+      "registers3_median_us": 2.811352,
+      "speedup": 0.867491157279487,
+      "trials": [
+        {
+          "trial": 0,
+          "legacy_us": 2.498428,
+          "registers3_us": 2.811352,
+          "status": "PASS"
+        },
+        {
+          "trial": 1,
+          "legacy_us": 2.458692,
+          "registers3_us": 2.811352,
+          "status": "PASS"
+        },
+        {
+          "trial": 2,
+          "legacy_us": 2.418955,
+          "registers3_us": 2.811352,
+          "status": "PASS"
+        },
+        {
+          "trial": 3,
+          "legacy_us": 2.438823,
+          "registers3_us": 2.816319,
+          "status": "PASS"
+        },
+        {
+          "trial": 4,
+          "legacy_us": 2.438823,
+          "registers3_us": 2.811352,
+          "status": "PASS"
+        },
+        {
+          "trial": 5,
+          "legacy_us": 2.433856,
+          "registers3_us": 2.816319,
+          "status": "PASS"
+        },
+        {
+          "trial": 6,
+          "legacy_us": 2.438823,
+          "registers3_us": 2.831221,
+          "status": "PASS"
+        }
+      ]
+    },
+    {
+      "threads": 47,
+      "scale_block": 32,
+      "columns": 4096,
+      "tokens": 6,
+      "output_stride": 576,
+      "legacy_median_us": 13.77364,
+      "registers3_median_us": 15.91444,
+      "speedup": 0.86548065781768,
+      "trials": [
+        {
+          "trial": 0,
+          "legacy_us": 13.60476,
+          "registers3_us": 15.899539,
+          "status": "PASS"
+        },
+        {
+          "trial": 1,
+          "legacy_us": 13.768673,
+          "registers3_us": 15.91444,
+          "status": "PASS"
+        },
+        {
+          "trial": 2,
+          "legacy_us": 13.77364,
+          "registers3_us": 15.894572,
+          "status": "PASS"
+        },
+        {
+          "trial": 3,
+          "legacy_us": 13.788541,
+          "registers3_us": 15.91444,
+          "status": "PASS"
+        },
+        {
+          "trial": 4,
+          "legacy_us": 13.753772,
+          "registers3_us": 15.939275,
+          "status": "PASS"
+        },
+        {
+          "trial": 5,
+          "legacy_us": 13.77364,
+          "registers3_us": 15.959144,
+          "status": "PASS"
+        },
+        {
+          "trial": 6,
+          "legacy_us": 13.788541,
+          "registers3_us": 15.874704,
+          "status": "PASS"
+        }
+      ]
+    },
+    {
+      "threads": 47,
+      "scale_block": 32,
+      "columns": 4096,
+      "tokens": 18,
+      "output_stride": 576,
+      "legacy_median_us": 45.210123,
+      "registers3_median_us": 50.226847,
+      "speedup": 0.9001186755760322,
+      "trials": [
+        {
+          "trial": 0,
+          "legacy_us": 45.185288,
+          "registers3_us": 50.271551,
+          "status": "PASS"
+        },
+        {
+          "trial": 1,
+          "legacy_us": 45.170387,
+          "registers3_us": 50.187111,
+          "status": "PASS"
+        },
+        {
+          "trial": 2,
+          "legacy_us": 45.249859,
+          "registers3_us": 50.187111,
+          "status": "PASS"
+        },
+        {
+          "trial": 3,
+          "legacy_us": 45.229991,
+          "registers3_us": 50.266584,
+          "status": "PASS"
+        },
+        {
+          "trial": 4,
+          "legacy_us": 45.269728,
+          "registers3_us": 50.231814,
+          "status": "PASS"
+        },
+        {
+          "trial": 5,
+          "legacy_us": 45.210123,
+          "registers3_us": 50.206979,
+          "status": "PASS"
+        },
+        {
+          "trial": 6,
+          "legacy_us": 45.145551,
+          "registers3_us": 50.226847,
+          "status": "PASS"
+        }
+      ]
+    },
+    {
+      "threads": 47,
+      "scale_block": 32,
+      "columns": 4096,
+      "tokens": 72,
+      "output_stride": 576,
+      "legacy_median_us": 196.97845,
+      "registers3_median_us": 211.730599,
+      "speedup": 0.9303258524291049,
+      "trials": [
+        {
+          "trial": 0,
+          "legacy_us": 197.355946,
+          "registers3_us": 211.770336,
+          "status": "PASS"
+        },
+        {
+          "trial": 1,
+          "legacy_us": 197.023153,
+          "registers3_us": 211.626291,
+          "status": "PASS"
+        },
+        {
+          "trial": 2,
+          "legacy_us": 196.854273,
+          "registers3_us": 211.730599,
+          "status": "PASS"
+        },
+        {
+          "trial": 3,
+          "legacy_us": 197.003285,
+          "registers3_us": 211.606423,
+          "status": "PASS"
+        },
+        {
+          "trial": 4,
+          "legacy_us": 196.874142,
+          "registers3_us": 211.710731,
+          "status": "PASS"
+        },
+        {
+          "trial": 5,
+          "legacy_us": 196.97845,
+          "registers3_us": 211.790204,
+          "status": "PASS"
+        },
+        {
+          "trial": 6,
+          "legacy_us": 196.938713,
+          "registers3_us": 211.730599,
+          "status": "PASS"
+        }
+      ]
+    },
+    {
+      "threads": 47,
+      "scale_block": 32,
+      "columns": 4096,
+      "tokens": 48,
+      "output_stride": 3136,
+      "legacy_median_us": 128.145019,
+      "registers3_median_us": 140.294433,
+      "speedup": 0.9134005980123245,
+      "trials": [
+        {
+          "trial": 0,
+          "legacy_us": 127.956271,
+          "registers3_us": 139.728189,
+          "status": "PASS"
+        },
+        {
+          "trial": 1,
+          "legacy_us": 128.601988,
+          "registers3_us": 140.085816,
+          "status": "PASS"
+        },
+        {
+          "trial": 2,
+          "legacy_us": 128.274163,
+          "registers3_us": 140.791138,
+          "status": "PASS"
+        },
+        {
+          "trial": 3,
+          "legacy_us": 128.145019,
+          "registers3_us": 140.294433,
+          "status": "PASS"
+        },
+        {
+          "trial": 4,
+          "legacy_us": 128.353635,
+          "registers3_us": 140.582522,
+          "status": "PASS"
+        },
+        {
+          "trial": 5,
+          "legacy_us": 127.981106,
+          "registers3_us": 140.205026,
+          "status": "PASS"
+        },
+        {
+          "trial": 6,
+          "legacy_us": 128.060579,
+          "registers3_us": 140.393774,
+          "status": "PASS"
+        }
+      ]
+    },
+    {
+      "threads": 47,
+      "scale_block": 128,
+      "columns": 4096,
+      "tokens": 48,
+      "output_stride": 3136,
+      "legacy_median_us": 86.853902,
+      "registers3_median_us": 109.791756,
+      "speedup": 0.791078539630972,
+      "trials": [
+        {
+          "trial": 0,
+          "legacy_us": 87.335706,
+          "registers3_us": 109.707316,
+          "status": "PASS"
+        },
+        {
+          "trial": 1,
+          "legacy_us": 86.670121,
+          "registers3_us": 109.896064,
+          "status": "PASS"
+        },
+        {
+          "trial": 2,
+          "legacy_us": 86.898605,
+          "registers3_us": 109.727184,
+          "status": "PASS"
+        },
+        {
+          "trial": 3,
+          "legacy_us": 86.540977,
+          "registers3_us": 109.791756,
+          "status": "PASS"
+        },
+        {
+          "trial": 4,
+          "legacy_us": 86.853902,
+          "registers3_us": 109.747052,
+          "status": "PASS"
+        },
+        {
+          "trial": 5,
+          "legacy_us": 86.749593,
+          "registers3_us": 109.9358,
+          "status": "PASS"
+        },
+        {
+          "trial": 6,
+          "legacy_us": 87.017814,
+          "registers3_us": 109.85136,
+          "status": "PASS"
+        }
+      ]
+    },
+    {
+      "threads": 47,
+      "scale_block": 256,
+      "columns": 4096,
+      "tokens": 192,
+      "output_stride": 2368,
+      "legacy_median_us": 390.66871,
+      "registers3_median_us": 486.910343,
+      "speedup": 0.8023421880771179,
+      "trials": [
+        {
+          "trial": 0,
+          "legacy_us": 386.158625,
+          "registers3_us": 486.155351,
+          "status": "PASS"
+        },
+        {
+          "trial": 1,
+          "legacy_us": 389.834245,
+          "registers3_us": 484.844049,
+          "status": "PASS"
+        },
+        {
+          "trial": 2,
+          "legacy_us": 389.575958,
+          "registers3_us": 486.254692,
+          "status": "PASS"
+        },
+        {
+          "trial": 3,
+          "legacy_us": 390.827656,
+          "registers3_us": 487.50639,
+          "status": "PASS"
+        },
+        {
+          "trial": 4,
+          "legacy_us": 390.907129,
+          "registers3_us": 487.844149,
+          "status": "PASS"
+        },
+        {
+          "trial": 5,
+          "legacy_us": 391.085943,
+          "registers3_us": 486.910343,
+          "status": "PASS"
+        },
+        {
+          "trial": 6,
+          "legacy_us": 390.66871,
+          "registers3_us": 486.930211,
+          "status": "PASS"
+        }
+      ]
+    },
+    {
+      "threads": 47,
+      "scale_block": 256,
+      "columns": 4096,
+      "tokens": 504,
+      "output_stride": 2368,
+      "legacy_median_us": 1308.58024,
+      "registers3_median_us": 1573.741436,
+      "speedup": 0.8315090459370735,
+      "trials": [
+        {
+          "trial": 0,
+          "legacy_us": 1305.24238,
+          "registers3_us": 1577.993234,
+          "status": "PASS"
+        },
+        {
+          "trial": 1,
+          "legacy_us": 1309.315364,
+          "registers3_us": 1573.741436,
+          "status": "PASS"
+        },
+        {
+          "trial": 2,
+          "legacy_us": 1308.58024,
+          "registers3_us": 1574.575901,
+          "status": "PASS"
+        },
+        {
+          "trial": 3,
+          "legacy_us": 1306.752364,
+          "registers3_us": 1571.834087,
+          "status": "PASS"
+        },
+        {
+          "trial": 4,
+          "legacy_us": 1304.745674,
+          "registers3_us": 1573.503017,
+          "status": "PASS"
+        },
+        {
+          "trial": 5,
+          "legacy_us": 1310.845216,
+          "registers3_us": 1571.158568,
+          "status": "PASS"
+        },
+        {
+          "trial": 6,
+          "legacy_us": 1312.573751,
+          "registers3_us": 1579.840978,
+          "status": "PASS"
+        }
+      ]
+    },
+    {
+      "threads": 47,
+      "scale_block": 32,
+      "columns": 4096,
+      "tokens": 192,
+      "output_stride": 2368,
+      "legacy_median_us": 607.172648,
+      "registers3_median_us": 642.577807,
+      "speedup": 0.9449013666293644,
+      "trials": [
+        {
+          "trial": 0,
+          "legacy_us": 608.007113,
+          "registers3_us": 642.180443,
+          "status": "PASS"
+        },
+        {
+          "trial": 1,
+          "legacy_us": 607.172648,
+          "registers3_us": 642.597675,
+          "status": "PASS"
+        },
+        {
+          "trial": 2,
+          "legacy_us": 607.669353,
+          "registers3_us": 642.577807,
+          "status": "PASS"
+        },
+        {
+          "trial": 3,
+          "legacy_us": 607.589881,
+          "registers3_us": 642.816226,
+          "status": "PASS"
+        },
+        {
+          "trial": 4,
+          "legacy_us": 606.516997,
+          "registers3_us": 643.650691,
+          "status": "PASS"
+        },
+        {
+          "trial": 5,
+          "legacy_us": 606.25871,
+          "registers3_us": 642.418861,
+          "status": "PASS"
+        },
+        {
+          "trial": 6,
+          "legacy_us": 606.099765,
+          "registers3_us": 641.683737,
+          "status": "PASS"
+        }
+      ]
+    },
+    {
+      "threads": 47,
+      "scale_block": 32,
+      "columns": 4096,
+      "tokens": 504,
+      "output_stride": 2368,
+      "legacy_median_us": 2016.663551,
+      "registers3_median_us": 2115.40858,
+      "speedup": 0.953321060558429,
+      "trials": [
+        {
+          "trial": 0,
+          "legacy_us": 2006.33208,
+          "registers3_us": 2113.660177,
+          "status": "PASS"
+        },
+        {
+          "trial": 1,
+          "legacy_us": 2016.663551,
+          "registers3_us": 2112.766107,
+          "status": "PASS"
+        },
+        {
+          "trial": 2,
+          "legacy_us": 2017.577489,
+          "registers3_us": 2115.84568,
+          "status": "PASS"
+        },
+        {
+          "trial": 3,
+          "legacy_us": 2016.246319,
+          "registers3_us": 2115.40858,
+          "status": "PASS"
+        },
+        {
+          "trial": 4,
+          "legacy_us": 2018.491427,
+          "registers3_us": 2117.256323,
+          "status": "PASS"
+        },
+        {
+          "trial": 5,
+          "legacy_us": 2015.511195,
+          "registers3_us": 2116.084099,
+          "status": "PASS"
+        },
+        {
+          "trial": 6,
+          "legacy_us": 2017.835776,
+          "registers3_us": 2112.825712,
+          "status": "PASS"
+        }
+      ]
+    },
+    {
+      "threads": 48,
+      "scale_block": 16,
+      "columns": 256,
+      "tokens": 18,
+      "output_stride": 4160,
+      "legacy_median_us": 3.437201,
+      "registers3_median_us": 3.457069,
+      "speedup": 0.9942529350730344,
+      "trials": [
+        {
+          "trial": 0,
+          "legacy_us": 3.437201,
+          "registers3_us": 3.476938,
+          "status": "PASS"
+        },
+        {
+          "trial": 1,
+          "legacy_us": 3.397465,
+          "registers3_us": 3.462036,
+          "status": "PASS"
+        },
+        {
+          "trial": 2,
+          "legacy_us": 3.437201,
+          "registers3_us": 3.437201,
+          "status": "PASS"
+        },
+        {
+          "trial": 3,
+          "legacy_us": 3.437201,
+          "registers3_us": 3.457069,
+          "status": "PASS"
+        },
+        {
+          "trial": 4,
+          "legacy_us": 3.437201,
+          "registers3_us": 3.457069,
+          "status": "PASS"
+        },
+        {
+          "trial": 5,
+          "legacy_us": 3.442168,
+          "registers3_us": 3.457069,
+          "status": "PASS"
+        },
+        {
+          "trial": 6,
+          "legacy_us": 3.437201,
+          "registers3_us": 3.457069,
+          "status": "PASS"
+        }
+      ]
+    },
+    {
+      "threads": 48,
+      "scale_block": 32,
+      "columns": 256,
+      "tokens": 18,
+      "output_stride": 4160,
+      "legacy_median_us": 2.458692,
+      "registers3_median_us": 2.831221,
+      "speedup": 0.8684210805161447,
+      "trials": [
+        {
+          "trial": 0,
+          "legacy_us": 2.707044,
+          "registers3_us": 2.836188,
+          "status": "PASS"
+        },
+        {
+          "trial": 1,
+          "legacy_us": 2.438823,
+          "registers3_us": 2.831221,
+          "status": "PASS"
+        },
+        {
+          "trial": 2,
+          "legacy_us": 2.458692,
+          "registers3_us": 2.831221,
+          "status": "PASS"
+        },
+        {
+          "trial": 3,
+          "legacy_us": 2.433856,
+          "registers3_us": 2.836188,
+          "status": "PASS"
+        },
+        {
+          "trial": 4,
+          "legacy_us": 2.458692,
+          "registers3_us": 2.836188,
+          "status": "PASS"
+        },
+        {
+          "trial": 5,
+          "legacy_us": 2.438823,
+          "registers3_us": 2.831221,
+          "status": "PASS"
+        },
+        {
+          "trial": 6,
+          "legacy_us": 2.458692,
+          "registers3_us": 2.831221,
+          "status": "PASS"
+        }
+      ]
+    },
+    {
+      "threads": 48,
+      "scale_block": 32,
+      "columns": 4096,
+      "tokens": 6,
+      "output_stride": 576,
+      "legacy_median_us": 13.063351,
+      "registers3_median_us": 15.561779,
+      "speedup": 0.8394510036416788,
+      "trials": [
+        {
+          "trial": 0,
+          "legacy_us": 13.122956,
+          "registers3_us": 15.561779,
+          "status": "PASS"
+        },
+        {
+          "trial": 1,
+          "legacy_us": 13.08322,
+          "registers3_us": 15.541911,
+          "status": "PASS"
+        },
+        {
+          "trial": 2,
+          "legacy_us": 13.058384,
+          "registers3_us": 15.561779,
+          "status": "PASS"
+        },
+        {
+          "trial": 3,
+          "legacy_us": 13.058384,
+          "registers3_us": 15.541911,
+          "status": "PASS"
+        },
+        {
+          "trial": 4,
+          "legacy_us": 13.063351,
+          "registers3_us": 15.561779,
+          "status": "PASS"
+        },
+        {
+          "trial": 5,
+          "legacy_us": 13.063351,
+          "registers3_us": 15.561779,
+          "status": "PASS"
+        },
+        {
+          "trial": 6,
+          "legacy_us": 13.103088,
+          "registers3_us": 15.561779,
+          "status": "PASS"
+        }
+      ]
+    },
+    {
+      "threads": 48,
+      "scale_block": 32,
+      "columns": 4096,
+      "tokens": 18,
+      "output_stride": 576,
+      "legacy_median_us": 44.768055,
+      "registers3_median_us": 49.690406,
+      "speedup": 0.9009396099520699,
+      "trials": [
+        {
+          "trial": 0,
+          "legacy_us": 44.768055,
+          "registers3_us": 49.75001,
+          "status": "PASS"
+        },
+        {
+          "trial": 1,
+          "legacy_us": 44.773022,
+          "registers3_us": 49.685438,
+          "status": "PASS"
+        },
+        {
+          "trial": 2,
+          "legacy_us": 44.748187,
+          "registers3_us": 49.66557,
+          "status": "PASS"
+        },
+        {
+          "trial": 3,
+          "legacy_us": 44.787923,
+          "registers3_us": 49.690406,
+          "status": "PASS"
+        },
+        {
+          "trial": 4,
+          "legacy_us": 44.753154,
+          "registers3_us": 49.710274,
+          "status": "PASS"
+        },
+        {
+          "trial": 5,
+          "legacy_us": 44.773022,
+          "registers3_us": 49.730142,
+          "status": "PASS"
+        },
+        {
+          "trial": 6,
+          "legacy_us": 44.748187,
+          "registers3_us": 49.620867,
+          "status": "PASS"
+        }
+      ]
+    },
+    {
+      "threads": 48,
+      "scale_block": 32,
+      "columns": 4096,
+      "tokens": 72,
+      "output_stride": 576,
+      "legacy_median_us": 196.312865,
+      "registers3_median_us": 214.497248,
+      "speedup": 0.9152232340062469,
+      "trials": [
+        {
+          "trial": 0,
+          "legacy_us": 196.645657,
+          "registers3_us": 214.39294,
+          "status": "PASS"
+        },
+        {
+          "trial": 1,
+          "legacy_us": 196.292996,
+          "registers3_us": 214.750568,
+          "status": "PASS"
+        },
+        {
+          "trial": 2,
+          "legacy_us": 196.268161,
+          "registers3_us": 214.522084,
+          "status": "PASS"
+        },
+        {
+          "trial": 3,
+          "legacy_us": 196.312865,
+          "registers3_us": 214.417775,
+          "status": "PASS"
+        },
+        {
+          "trial": 4,
+          "legacy_us": 196.417173,
+          "registers3_us": 214.497248,
+          "status": "PASS"
+        },
+        {
+          "trial": 5,
+          "legacy_us": 196.352601,
+          "registers3_us": 214.541952,
+          "status": "PASS"
+        },
+        {
+          "trial": 6,
+          "legacy_us": 196.143985,
+          "registers3_us": 214.149555,
+          "status": "PASS"
+        }
+      ]
+    },
+    {
+      "threads": 48,
+      "scale_block": 32,
+      "columns": 4096,
+      "tokens": 48,
+      "output_stride": 3136,
+      "legacy_median_us": 127.434731,
+      "registers3_median_us": 138.978163,
+      "speedup": 0.9169406779394544,
+      "trials": [
+        {
+          "trial": 0,
+          "legacy_us": 128.249327,
+          "registers3_us": 139.335791,
+          "status": "PASS"
+        },
+        {
+          "trial": 1,
+          "legacy_us": 127.434731,
+          "registers3_us": 139.082472,
+          "status": "PASS"
+        },
+        {
+          "trial": 2,
+          "legacy_us": 127.434731,
+          "registers3_us": 138.978163,
+          "status": "PASS"
+        },
+        {
+          "trial": 3,
+          "legacy_us": 127.290686,
+          "registers3_us": 138.893723,
+          "status": "PASS"
+        },
+        {
+          "trial": 4,
+          "legacy_us": 127.459566,
+          "registers3_us": 139.0179,
+          "status": "PASS"
+        },
+        {
+          "trial": 5,
+          "legacy_us": 127.707918,
+          "registers3_us": 138.898691,
+          "status": "PASS"
+        },
+        {
+          "trial": 6,
+          "legacy_us": 127.290686,
+          "registers3_us": 138.853987,
+          "status": "PASS"
+        }
+      ]
+    },
+    {
+      "threads": 48,
+      "scale_block": 128,
+      "columns": 4096,
+      "tokens": 48,
+      "output_stride": 3136,
+      "legacy_median_us": 87.186694,
+      "registers3_median_us": 108.872851,
+      "speedup": 0.800812077567437,
+      "trials": [
+        {
+          "trial": 0,
+          "legacy_us": 86.645285,
+          "registers3_us": 108.937422,
+          "status": "PASS"
+        },
+        {
+          "trial": 1,
+          "legacy_us": 87.231398,
+          "registers3_us": 108.962258,
+          "status": "PASS"
+        },
+        {
+          "trial": 2,
+          "legacy_us": 87.102254,
+          "registers3_us": 108.957291,
+          "status": "PASS"
+        },
+        {
+          "trial": 3,
+          "legacy_us": 87.186694,
+          "registers3_us": 108.813246,
+          "status": "PASS"
+        },
+        {
+          "trial": 4,
+          "legacy_us": 87.122122,
+          "registers3_us": 108.872851,
+          "status": "PASS"
+        },
+        {
+          "trial": 5,
+          "legacy_us": 87.251266,
+          "registers3_us": 108.852983,
+          "status": "PASS"
+        },
+        {
+          "trial": 6,
+          "legacy_us": 87.315838,
+          "registers3_us": 108.684103,
+          "status": "PASS"
+        }
+      ]
+    },
+    {
+      "threads": 48,
+      "scale_block": 256,
+      "columns": 4096,
+      "tokens": 192,
+      "output_stride": 2368,
+      "legacy_median_us": 387.072563,
+      "registers3_median_us": 483.234723,
+      "speedup": 0.801003207296426,
+      "trials": [
+        {
+          "trial": 0,
+          "legacy_us": 385.99968,
+          "registers3_us": 482.420127,
+          "status": "PASS"
+        },
+        {
+          "trial": 1,
+          "legacy_us": 387.589137,
+          "registers3_us": 484.248002,
+          "status": "PASS"
+        },
+        {
+          "trial": 2,
+          "legacy_us": 386.675199,
+          "registers3_us": 482.420127,
+          "status": "PASS"
+        },
+        {
+          "trial": 3,
+          "legacy_us": 387.489796,
+          "registers3_us": 483.254592,
+          "status": "PASS"
+        },
+        {
+          "trial": 4,
+          "legacy_us": 386.754672,
+          "registers3_us": 483.49301,
+          "status": "PASS"
+        },
+        {
+          "trial": 5,
+          "legacy_us": 387.748082,
+          "registers3_us": 482.996305,
+          "status": "PASS"
+        },
+        {
+          "trial": 6,
+          "legacy_us": 387.072563,
+          "registers3_us": 483.234723,
+          "status": "PASS"
+        }
+      ]
+    },
+    {
+      "threads": 48,
+      "scale_block": 256,
+      "columns": 4096,
+      "tokens": 504,
+      "output_stride": 2368,
+      "legacy_median_us": 1298.169295,
+      "registers3_median_us": 1563.767592,
+      "speedup": 0.8301548782832174,
+      "trials": [
+        {
+          "trial": 0,
+          "legacy_us": 1300.990582,
+          "registers3_us": 1563.588778,
+          "status": "PASS"
+        },
+        {
+          "trial": 1,
+          "legacy_us": 1298.824946,
+          "registers3_us": 1566.151778,
+          "status": "PASS"
+        },
+        {
+          "trial": 2,
+          "legacy_us": 1296.420892,
+          "registers3_us": 1564.999421,
+          "status": "PASS"
+        },
+        {
+          "trial": 3,
+          "legacy_us": 1297.593117,
+          "registers3_us": 1563.767592,
+          "status": "PASS"
+        },
+        {
+          "trial": 4,
+          "legacy_us": 1296.99707,
+          "registers3_us": 1561.760902,
+          "status": "PASS"
+        },
+        {
+          "trial": 5,
+          "legacy_us": 1298.169295,
+          "registers3_us": 1563.251019,
+          "status": "PASS"
+        },
+        {
+          "trial": 6,
+          "legacy_us": 1303.831736,
+          "registers3_us": 1567.085584,
+          "status": "PASS"
+        }
+      ]
+    },
+    {
+      "threads": 48,
+      "scale_block": 32,
+      "columns": 4096,
+      "tokens": 192,
+      "output_stride": 2368,
+      "legacy_median_us": 612.179438,
+      "registers3_median_us": 640.491645,
+      "speedup": 0.9557961337653359,
+      "trials": [
+        {
+          "trial": 0,
+          "legacy_us": 608.325005,
+          "registers3_us": 639.915466,
+          "status": "PASS"
+        },
+        {
+          "trial": 1,
+          "legacy_us": 613.252322,
+          "registers3_us": 640.908877,
+          "status": "PASS"
+        },
+        {
+          "trial": 2,
+          "legacy_us": 612.179438,
+          "registers3_us": 639.239947,
+          "status": "PASS"
+        },
+        {
+          "trial": 3,
+          "legacy_us": 613.013903,
+          "registers3_us": 640.491645,
+          "status": "PASS"
+        },
+        {
+          "trial": 4,
+          "legacy_us": 611.2655,
+          "registers3_us": 640.511513,
+          "status": "PASS"
+        },
+        {
+          "trial": 5,
+          "legacy_us": 611.662865,
+          "registers3_us": 641.008218,
+          "status": "PASS"
+        },
+        {
+          "trial": 6,
+          "legacy_us": 612.417857,
+          "registers3_us": 639.498234,
+          "status": "PASS"
+        }
+      ]
+    },
+    {
+      "threads": 48,
+      "scale_block": 32,
+      "columns": 4096,
+      "tokens": 504,
+      "output_stride": 2368,
+      "legacy_median_us": 2015.491327,
+      "registers3_median_us": 2118.845781,
+      "speedup": 0.9512213418613121,
+      "trials": [
+        {
+          "trial": 0,
+          "legacy_us": 2010.405064,
+          "registers3_us": 2108.911673,
+          "status": "PASS"
+        },
+        {
+          "trial": 1,
+          "legacy_us": 2013.246218,
+          "registers3_us": 2114.752928,
+          "status": "PASS"
+        },
+        {
+          "trial": 2,
+          "legacy_us": 2018.173536,
+          "registers3_us": 2118.845781,
+          "status": "PASS"
+        },
+        {
+          "trial": 3,
+          "legacy_us": 2018.829187,
+          "registers3_us": 2120.574315,
+          "status": "PASS"
+        },
+        {
+          "trial": 4,
+          "legacy_us": 2012.173335,
+          "registers3_us": 2115.746339,
+          "status": "PASS"
+        },
+        {
+          "trial": 5,
+          "legacy_us": 2015.491327,
+          "registers3_us": 2119.680246,
+          "status": "PASS"
+        },
+        {
+          "trial": 6,
+          "legacy_us": 2021.412055,
+          "registers3_us": 2119.660378,
+          "status": "PASS"
+        }
+      ]
+    }
+  ],
+  "source_archive": {
+    "path": "~/work/gemm/glm53f-strata-20261001/tmp/strata-gemm-acc-20261002/source-v1.tar.gz",
+    "sha256": "aae7ea04167aa1118ace505940e8cd89d551bb5eee477c0ec7421d384a4fef8f"
+  },
+  "local_raw_log": "tmp/strata-gemm-acc-20261002/native-probe-52093052.log",
+  "raw_log_sha256": "6789ba565deb322e97a111c906ded41764ceca48bf1ad2a36bd4d499356a16c6",
+  "build_log_sha256": "c7c2cbcffd6655dd02e651018e92c16a4db821fecee916b9dc3e2b63a93eca8a",
+  "commands": [
+    "bash tmp/strata-gemm-acc-20261002/build-login.sh (Fugaku login fccpx)",
+    "pjsub --no-check-directory tmp/strata-gemm-acc-20261002/native-probe.pjm"
+  ],
+  "full_model_result": null,
+  "targets_met": false
+}

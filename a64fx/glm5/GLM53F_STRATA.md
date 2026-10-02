@@ -98,7 +98,7 @@ Implementation commit `c461079c` matches the frozen runtime source archives.
 The committed [kernel qualification record](strata-kernel-validation-20261002.json)
 contains comparisons, settings, binary/source/evidence hashes and rejected
 experiments. See [resume](../../resume-strata.md) for the allocation and
-immutable remote build paths. A subsequent Q8 campaign is active; see the continuation below and `resume-strata.md`.
+immutable remote build paths. The Q8, capacity and lookup continuations are complete; see below and `resume-strata.md`.
 
 Rank-zero diagnostic medians identify the remaining work: decode KDA 6.405,
 mHC 5.764 and MoE 7.582 ms/token; prefill MoE stays near 1.02 ms/token. Sparse
@@ -106,11 +106,12 @@ prefill falls 0.966→0.760 ms/token and decode index 3.459→2.108 ms/token.
 These nested component timers overlap and are separate from the rank-max
 throughput measurements above.
 
-## Q8 continuation (October 2 afternoon, pending full-run qualification)
+## Q8 and prefill-capacity qualification (October 2 afternoon)
 
 PJM 52085859 provides another six-hour 12-node allocation, approximately
-12:17–18:17 JST. Bounded restaging and the native build passed. Best qualified
-throughput remains **35.742137 decode /370.754010 prefill tok/s**.
+12:17–18:17 JST. Bounded restaging and the native build passed. The newly qualified capacity4096 recipe measures **35.462134 decode /412.273634
+prefill tok/s** in independent confirmation. The earlier panel47 recipe measured
+35.742137 /370.754010 on its previous allocation.
 
 The candidates add exact assembly 4×4 and 2×8 row/position tiles, an eight-row
 C decode kernel, and a fused scheduler for independent MLA head projections.
@@ -135,12 +136,11 @@ independently prepared head inputs. Its Q8 and MLA kernels match the committed
 The six-head decode projection probe is byte-exact and measures 19.893→6.001 µs
 for rows4 separate→fused during staging; it needs an uncontended repeat.
 The record is [native Q8 evidence](strata-q8-native-20261002.json).
-A serial post-stage campaign is queued for uncontended probes, sparse
-prefill/decode/rollback, complete-state
-comparison and full 8K/short/32K output and throughput gates. Local evidence
-is `tmp/strata-q8-20261002/`; current progress and artifact hashes are in
-`native-progress.json`. `resume-strata.md` records live PIDs and source paths.
-Neither target has been met; no new runtime setting has been promoted.
+The serial post-stage campaign completed uncontended probes, sparse
+prefill/decode/rollback gates, complete-state comparison and full 8K/short/32K
+output and throughput checks. Local evidence is `tmp/strata-q8-20261002/`;
+`resume-strata.md` records artifact hashes and remote paths. No Q8 kernel was
+promoted; neither target has been met.
 
 All seven 8K Q8 ablations return the exact 257-ID stream. Independent five-trial
 confirmation of ASM4 plus fused MLA projections measures **35.540871 decode /
@@ -151,15 +151,100 @@ campaign passes at15:48. Repeated32K measures32.101995→31.984868 decode and
 343.931969→345.949648 prefill tok/s, below the promotion threshold.
 Completed reports are recorded in [Q8 full-model progress](strata-q8-full-20261002.json).
 
-The next experiment increases outer prefill workspace capacity to 4096 while
-keeping 47-position attention and all arithmetic unchanged. Larger route
-cohorts reuse expert expansion across more positions. The default remains
-512; the third build argument bounds capacity and `--prefill-chunk` selects
-512/1024/2048/4096 during trials. Native capacity/checker compilation and
-16 local capacity/panel configurations pass. The queued serial campaign
-first requires exact final hidden streams and complete KDA/sparse state
-against 512, then full IDs, fresh controls, confirmation and context stress.
-No larger-chunk throughput or memory-headroom result exists yet.
+Increasing outer prefill capacity to 4096 reuses expert expansion across larger
+route cohorts while retaining 47-position attention panels and all arithmetic.
+The source defaults remain 512. Build with
+`build_glm53f_integrated_12n.sh check 47 4096` and explicitly use
+`--prefill-chunk 4096` with the qualified runtime recipe above.
+
+All four endpoint gates (512/1024/2048/4096) pass exact final hidden streams and
+complete KDA/sparse state. Initial three-trial 8K prefill rates are 393.653658,
+404.138154 and 409.149771 tok/s at chunks 1024, 2048 and 4096. Independent
+five-trial confirmation qualifies 4096 for promotion:
+
+| Workload | Decode control → candidate (tok/s) | Prefill control → candidate (tok/s) |
+| --- | --- | --- |
+| 8K, 256 transitions, 5 trials | 35.141258 → 35.462134 | 372.683205 → 412.273634 |
+| 8K, 1024 transitions, 3 trials | 35.314212 → 35.212835 | 373.726670 → 411.918596 |
+| Short 128, 256 transitions, 3 trials | 39.920756 → 39.901375 | 284.522204 → 285.306876 |
+| Repeated 32196, 256 transitions, 3 trials | 31.789555 → 31.700983 | 343.959284 → 372.389918 |
+
+The confirmation gains are +0.91% decode and +10.62% prefill. All 257 output
+IDs match in 256-transition runs and all 1025 match in stress1024. Context
+qualification and `CAPACITY_CAMPAIGN_PASS` complete before promotion. See
+[capacity full-model evidence](strata-capacity-full-20261002.json) for exact
+controls, settings, reports and hashes.
+
+A subsequent lookup sweep uses this capacity4096 recipe. All five variants
+(depths 1–4 adaptive and depth4 always, with ASM4 verification/fused projections)
+match all IDs but none improves decode within the guard. Decode ratios are
+0.999623, 0.999351, 0.988769, 0.990379 and 0.860653 against a fresh qualified
+plain control. No lookup setting is promoted. See
+[lookup full-model evidence](strata-lookup-full-20261002.json).
+
+## Rejected packed GEMM register-accumulation probe (October 2)
+
+An isolated three-token ×64-row SVE tile keeps12 FP32 sums in registers
+across scale blocks; two calls consume each unchanged six-token packed
+input group. The original per-block integer dot and ordered scale/FMAs
+are retained, including initial sums from preceding K chunks. Native
+one-node PJM52093052 (normal2GHz/eco0 requested) completes independently
+of the twelve-node campaign. All2400 fast/conservative ×1/3/12/47/48-thread
+cases pass every output/guard bit against the original assembly and an
+independent ordered-FMA scalar reference. Cases cover scale blocks16–256,
+K up to4096, nonzero initial sums, segmented K loops and varied strides.
+
+Seven alternating-order trials per shape reject the candidate. At47
+threads, representative legacy→candidate medians are45.210→50.227µs for
+sb32/K4096/18tokens,128.145→140.294µs for48tokens, and390.669→486.910µs for
+sb256/192tokens. Fewer integer accumulators and duplicated weight loads
+are plausible causes, inferred from the implementation rather than counters.
+No production kernel or default changes. The immutable source archive,
+logs, all33 shape/thread medians and raw trials are identified in
+[the native rejection record](strata-gemm-acc-native-20261002.json).
+
+A second isolated probe (PJM52093332) compares96 versus192 whole-group
+tokens in the original native Q4_K/Q5_K chain, including SwiGLU/requant.
+All51 split/unsplit reference-part checks and all ordered output hashes
+pass. At47threads/C4096, seven-trial medians23.262978→25.341034ms regress
+8.94%; at48threads they improve22.965908→22.023916ms (+4.28%). The probe
+uses parallel first-touch weights, so these are diagnostic timings and
+cannot qualify production NUMA placement. Keep the96-token production
+limit. See [group-limit evidence](strata-group-limit-native-20261002.json).
+Expert-major panel scheduling was also rejected. Separate one-node probes
+pass 210 mixed-format native chain/guard cases per scheduler, but 47-thread
+C4096 medians regress 23.663998→26.950121 ms for 64-row panels and
+23.608920→25.372030 ms for coarser gate/up256/down512 panels. An independent
+idle-allocation repeat confirms the latter regression (21.792890→23.293020 ms).
+The prototype is retained in immutable scratch archives rather than production.
+
+## Experimental MoE prefill output padding (October 2)
+
+`--moe-prefill-layout padded` adds 64 floats to each private gate/up output
+stride while retaining the existing 96-token expert scheduler and every
+GEMM, SwiGLU and quantization operation. The default remains `tight`. Added
+scratch is about 1.1 MiB per rank at 47 workers. A same-host, uncontended
+synthetic expert-chain probe improves 21.781921→21.356106 ms at 47 threads
+and C4096 (~2%); it excludes router/collective work and establishes no
+full-model tok/s gain. All parallel ordered-output hashes remain exact.
+
+The committed mixed-format unit covers Q4/Q5 gate/up, Q5/Q6 down,
+intermediates 256/512, ragged cohorts 5–385 and untouched route guards. All
+210 native comparisons pass fast/conservative builds under OMP settings
+1/3/12/47/48; this unit exercises a serial worker chain. Integrated FCC
+cross-build passes. Evidence and immutable source/log hashes are in
+[native layout record](strata-moe-layout-native-20261002.json).
+
+Full-model qualification uses `--compare-moe-prefill-layout --capture-hidden`
+with equal reference/candidate chunk4096. It requires every prompt mean,
+final hidden stream and complete KDA/sparse state to match byte-for-byte.
+Fresh frozen and rebuilt-tight controls precede padded timings, independent
+confirmation and context gates. The first checker used a serial reference
+mean loop that disagreed with the export under FCC fast math despite exact
+final streams/state. A diagnostic-only revision uses the export's flattened
+OpenMP loop structure; it retains strict memcmp. The revised checker passes all 8049 prompt means, final streams and complete
+state with zero bit mismatches (7.844 GiB minimum sampled headroom). Fresh
+control/rebuilt/padded timing is active; no layout promotion is claimed.
 
 ## Batched-prefill MTP candidate (October 2)
 
@@ -201,10 +286,12 @@ tracing. Native output-norm/export tests pass **eight** fast/conservative ×
 integrated normalized MTP build passes. Evidence is
 [strata MTP native record](strata-mtp-native-20261002.json).
 
-Immutable native artifacts are `candidate-mtp-v3` plus the diagnostic-only
-checker update in `candidate-mtp-v4`. A serial queue waits for Q8, capacity
-and lookup qualification, then stages only checkpoint layer45 and runs
-prompt-hidden, cache replay, short/8K full-state and timed depth gates.
+Immutable native artifacts retain `candidate-mtp-v3` math and the benchmark
+from `candidate-mtp-v4`. Layer45 staging, the 896-case native controller and
+2051-position full/cache-only/rollback gates pass. The prompt mean diagnostic
+stopped with exact final streams/state but mismatched per-position means;
+`candidate-mtp-v5` contains the revised checker described above. Full-model
+qualification must resume with new outputs after the live serial queue.
 There is **no new full-model MTP throughput or promotion result yet**.
 `tmp/strata-mtp-20261002/` contains frozen source hashes, build logs and
 campaign scripts; `resume-strata.md` records the current queue state.
@@ -236,8 +323,7 @@ barrier fallback. Full evidence and hashes are in
 
 FCC cross compilation on the login node avoids compute contention. Immutable
 full-model artifacts are `candidate-mhc-sync-v4`, capacity4096 /attention47,
-from `tmp/strata-mhc-sync-20261002/source-v3.tar.gz`. The full-model queue waits
-for existing Q8/capacity/lookup/MTP work, then requires zero hidden bit mismatches
+from `tmp/strata-mhc-sync-20261002/source-v3.tar.gz`. The repaired full-model queue follows the active layout campaign, then requires zero hidden bit mismatches
 and complete KDA/sparse state before timing. Fresh frozen/rebuilt controls,
 independent confirmation and qualifying-candidate context stress follow.
 Allocation guards defer incomplete work; no full-model mHC result exists yet.
@@ -288,6 +374,7 @@ available for reference. CLI switches:
 --index-kernel legacy|heads|keys4|replicated-heads|replicated-keys4
 --mla-kernel legacy|registers|values|fp16-cache
 --pool-selector heap|partition4k
+--moe-prefill-layout tight|padded
 ```
 
 The historical `glm53f_spec_decode_12n` MTP runner retains its legacy executor

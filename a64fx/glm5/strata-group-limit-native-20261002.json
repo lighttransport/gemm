@@ -1,0 +1,688 @@
+{
+  "status": "Native Q4_K/Q5_K grouped expert chain correctness PASS; larger whole-group limit rejected for the 47-thread recipe",
+  "job": 52093332,
+  "host": "c25-7112c",
+  "frequency_mhz_requested": 2000,
+  "eco_state_requested": 0,
+  "isolated_from_model_job": 52085859,
+  "workload": "Synthetic 192 owned expert parts with deterministic routes, Q4_K gate/up plus Q5_K down and original SwiGLU/requant; expert chain only, no routing/collective timing",
+  "placement": "Weights copied with parallel first-touch, not production global NUMA interleave; timings are diagnostics, not full-model qualification",
+  "decision": "Do not integrate/promote the 192-token whole-group limit; investigate row-panel scheduling and output-stride padding",
+  "summary": [
+    {
+      "threads": 47,
+      "route_chunk": 512,
+      "legacy96_median_ms": 5.034924,
+      "candidate192_median_ms": 5.029917,
+      "speedup": 1.000995443861201,
+      "ordered_output_fnv1a64": "c6fedbebd6607547",
+      "legacy96_trials_ms": [
+        5.034924,
+        5.034924,
+        5.073071,
+        5.041122,
+        5.038023,
+        5.02491,
+        5.01895
+      ],
+      "candidate192_trials_ms": [
+        5.020857,
+        5.026817,
+        5.03993,
+        5.029917,
+        5.038023,
+        5.03397,
+        5.021811
+      ]
+    },
+    {
+      "threads": 47,
+      "route_chunk": 1024,
+      "legacy96_median_ms": 7.615089,
+      "candidate192_median_ms": 7.625103,
+      "speedup": 0.9986867062648203,
+      "ordered_output_fnv1a64": "01bac09d27ce959e",
+      "legacy96_trials_ms": [
+        7.632971,
+        7.612944,
+        7.627964,
+        7.613897,
+        7.615089,
+        7.61199,
+        7.632017
+      ],
+      "candidate192_trials_ms": [
+        7.62105,
+        7.625818,
+        7.633924,
+        7.625103,
+        7.628918,
+        7.615089,
+        7.607937
+      ]
+    },
+    {
+      "threads": 47,
+      "route_chunk": 2048,
+      "legacy96_median_ms": 13.257027,
+      "candidate192_median_ms": 13.323069,
+      "speedup": 0.9950430340036519,
+      "ordered_output_fnv1a64": "7ac0aa87b6fb56f2",
+      "legacy96_trials_ms": [
+        13.256073,
+        13.263941,
+        13.272047,
+        13.257027,
+        13.243914,
+        13.258934,
+        13.256073
+      ],
+      "candidate192_trials_ms": [
+        13.296127,
+        13.303041,
+        13.33499,
+        13.341904,
+        13.327837,
+        13.323069,
+        13.321877
+      ]
+    },
+    {
+      "threads": 47,
+      "route_chunk": 4096,
+      "legacy96_median_ms": 23.262978,
+      "candidate192_median_ms": 25.341034,
+      "speedup": 0.9179964006204324,
+      "ordered_output_fnv1a64": "608c84aefb58eb0b",
+      "legacy96_trials_ms": [
+        23.276091,
+        23.262978,
+        23.260117,
+        23.276091,
+        23.256779,
+        23.249865,
+        23.267984
+      ],
+      "candidate192_trials_ms": [
+        25.475979,
+        25.298119,
+        25.314093,
+        25.267839,
+        25.341034,
+        25.361061,
+        25.397062
+      ]
+    },
+    {
+      "threads": 48,
+      "route_chunk": 512,
+      "legacy96_median_ms": 4.350901,
+      "candidate192_median_ms": 4.317045,
+      "speedup": 1.0078424014574785,
+      "ordered_output_fnv1a64": "c6fedbebd6607547",
+      "legacy96_trials_ms": [
+        4.350901,
+        4.351139,
+        4.339933,
+        4.352093,
+        4.370928,
+        4.331112,
+        4.333973
+      ],
+      "candidate192_trials_ms": [
+        4.306793,
+        4.325867,
+        4.317045,
+        4.323006,
+        4.315138,
+        4.321098,
+        4.309893
+      ]
+    },
+    {
+      "threads": 48,
+      "route_chunk": 1024,
+      "legacy96_median_ms": 6.716013,
+      "candidate192_median_ms": 6.700993,
+      "speedup": 1.002241458840503,
+      "ordered_output_fnv1a64": "01bac09d27ce959e",
+      "legacy96_trials_ms": [
+        6.716013,
+        6.71792,
+        6.706953,
+        6.725073,
+        6.701946,
+        6.726027,
+        6.697893
+      ],
+      "candidate192_trials_ms": [
+        6.710052,
+        6.700993,
+        6.692886,
+        6.693125,
+        6.701946,
+        6.717205,
+        6.69384
+      ]
+    },
+    {
+      "threads": 48,
+      "route_chunk": 2048,
+      "legacy96_median_ms": 11.543989,
+      "candidate192_median_ms": 11.546135,
+      "speedup": 0.9998141369384647,
+      "ordered_output_fnv1a64": "7ac0aa87b6fb56f2",
+      "legacy96_trials_ms": [
+        11.568069,
+        11.543989,
+        11.523962,
+        11.55901,
+        11.526823,
+        11.53183,
+        11.629105
+      ],
+      "candidate192_trials_ms": [
+        11.545181,
+        11.550903,
+        11.558056,
+        11.542082,
+        11.539936,
+        11.574984,
+        11.546135
+      ]
+    },
+    {
+      "threads": 48,
+      "route_chunk": 4096,
+      "legacy96_median_ms": 22.965908,
+      "candidate192_median_ms": 22.023916,
+      "speedup": 1.042771321866647,
+      "ordered_output_fnv1a64": "608c84aefb58eb0b",
+      "legacy96_trials_ms": [
+        22.969007,
+        22.95804,
+        22.979021,
+        22.95208,
+        22.965908,
+        22.951126,
+        22.968054
+      ],
+      "candidate192_trials_ms": [
+        22.023916,
+        22.099972,
+        22.010088,
+        21.990061,
+        22.087812,
+        22.011042,
+        22.077084
+      ]
+    }
+  ],
+  "unit_checks": [
+    {
+      "config": {
+        "math": "fast",
+        "threads": "47",
+        "C": "512",
+        "limit": "96"
+      },
+      "result": "GROUP_BITS part=22 M=25 limit=96 full_chain=BIT_EXACT"
+    },
+    {
+      "config": {
+        "math": "fast",
+        "threads": "47",
+        "C": "512",
+        "limit": "96"
+      },
+      "result": "GROUP_BITS part=96 M=12 limit=96 full_chain=BIT_EXACT"
+    },
+    {
+      "config": {
+        "math": "fast",
+        "threads": "47",
+        "C": "512",
+        "limit": "96"
+      },
+      "result": "GROUP_BITS part=191 M=19 limit=96 full_chain=BIT_EXACT"
+    },
+    {
+      "config": {
+        "math": "fast",
+        "threads": "47",
+        "C": "512",
+        "limit": "192"
+      },
+      "result": "GROUP_BITS part=22 M=25 limit=192 full_chain=BIT_EXACT"
+    },
+    {
+      "config": {
+        "math": "fast",
+        "threads": "47",
+        "C": "512",
+        "limit": "192"
+      },
+      "result": "GROUP_BITS part=96 M=12 limit=192 full_chain=BIT_EXACT"
+    },
+    {
+      "config": {
+        "math": "fast",
+        "threads": "47",
+        "C": "512",
+        "limit": "192"
+      },
+      "result": "GROUP_BITS part=191 M=19 limit=192 full_chain=BIT_EXACT"
+    },
+    {
+      "config": {
+        "math": "fast",
+        "threads": "47",
+        "C": "1024",
+        "limit": "96"
+      },
+      "result": "GROUP_BITS part=56 M=41 limit=96 full_chain=BIT_EXACT"
+    },
+    {
+      "config": {
+        "math": "fast",
+        "threads": "47",
+        "C": "1024",
+        "limit": "96"
+      },
+      "result": "GROUP_BITS part=96 M=23 limit=96 full_chain=BIT_EXACT"
+    },
+    {
+      "config": {
+        "math": "fast",
+        "threads": "47",
+        "C": "1024",
+        "limit": "96"
+      },
+      "result": "GROUP_BITS part=191 M=36 limit=96 full_chain=BIT_EXACT"
+    },
+    {
+      "config": {
+        "math": "fast",
+        "threads": "47",
+        "C": "1024",
+        "limit": "192"
+      },
+      "result": "GROUP_BITS part=56 M=41 limit=192 full_chain=BIT_EXACT"
+    },
+    {
+      "config": {
+        "math": "fast",
+        "threads": "47",
+        "C": "1024",
+        "limit": "192"
+      },
+      "result": "GROUP_BITS part=96 M=23 limit=192 full_chain=BIT_EXACT"
+    },
+    {
+      "config": {
+        "math": "fast",
+        "threads": "47",
+        "C": "1024",
+        "limit": "192"
+      },
+      "result": "GROUP_BITS part=191 M=36 limit=192 full_chain=BIT_EXACT"
+    },
+    {
+      "config": {
+        "math": "fast",
+        "threads": "47",
+        "C": "2048",
+        "limit": "96"
+      },
+      "result": "GROUP_BITS part=56 M=76 limit=96 full_chain=BIT_EXACT"
+    },
+    {
+      "config": {
+        "math": "fast",
+        "threads": "47",
+        "C": "2048",
+        "limit": "96"
+      },
+      "result": "GROUP_BITS part=96 M=44 limit=96 full_chain=BIT_EXACT"
+    },
+    {
+      "config": {
+        "math": "fast",
+        "threads": "47",
+        "C": "2048",
+        "limit": "96"
+      },
+      "result": "GROUP_BITS part=191 M=60 limit=96 full_chain=BIT_EXACT"
+    },
+    {
+      "config": {
+        "math": "fast",
+        "threads": "47",
+        "C": "2048",
+        "limit": "192"
+      },
+      "result": "GROUP_BITS part=56 M=76 limit=192 full_chain=BIT_EXACT"
+    },
+    {
+      "config": {
+        "math": "fast",
+        "threads": "47",
+        "C": "2048",
+        "limit": "192"
+      },
+      "result": "GROUP_BITS part=96 M=44 limit=192 full_chain=BIT_EXACT"
+    },
+    {
+      "config": {
+        "math": "fast",
+        "threads": "47",
+        "C": "2048",
+        "limit": "192"
+      },
+      "result": "GROUP_BITS part=191 M=60 limit=192 full_chain=BIT_EXACT"
+    },
+    {
+      "config": {
+        "math": "fast",
+        "threads": "47",
+        "C": "4096",
+        "limit": "96"
+      },
+      "result": "GROUP_BITS part=186 M=149 limit=96 full_chain=BIT_EXACT"
+    },
+    {
+      "config": {
+        "math": "fast",
+        "threads": "47",
+        "C": "4096",
+        "limit": "96"
+      },
+      "result": "GROUP_BITS part=96 M=96 limit=96 full_chain=BIT_EXACT"
+    },
+    {
+      "config": {
+        "math": "fast",
+        "threads": "47",
+        "C": "4096",
+        "limit": "96"
+      },
+      "result": "GROUP_BITS part=191 M=122 limit=96 full_chain=BIT_EXACT"
+    },
+    {
+      "config": {
+        "math": "fast",
+        "threads": "47",
+        "C": "4096",
+        "limit": "192"
+      },
+      "result": "GROUP_BITS part=186 M=149 limit=192 full_chain=BIT_EXACT"
+    },
+    {
+      "config": {
+        "math": "fast",
+        "threads": "47",
+        "C": "4096",
+        "limit": "192"
+      },
+      "result": "GROUP_BITS part=96 M=96 limit=192 full_chain=BIT_EXACT"
+    },
+    {
+      "config": {
+        "math": "fast",
+        "threads": "47",
+        "C": "4096",
+        "limit": "192"
+      },
+      "result": "GROUP_BITS part=191 M=122 limit=192 full_chain=BIT_EXACT"
+    },
+    {
+      "config": {
+        "math": "fast",
+        "threads": "48",
+        "C": "512",
+        "limit": "96"
+      },
+      "result": "GROUP_BITS part=22 M=25 limit=96 full_chain=BIT_EXACT"
+    },
+    {
+      "config": {
+        "math": "fast",
+        "threads": "48",
+        "C": "512",
+        "limit": "96"
+      },
+      "result": "GROUP_BITS part=96 M=12 limit=96 full_chain=BIT_EXACT"
+    },
+    {
+      "config": {
+        "math": "fast",
+        "threads": "48",
+        "C": "512",
+        "limit": "96"
+      },
+      "result": "GROUP_BITS part=191 M=19 limit=96 full_chain=BIT_EXACT"
+    },
+    {
+      "config": {
+        "math": "fast",
+        "threads": "48",
+        "C": "512",
+        "limit": "192"
+      },
+      "result": "GROUP_BITS part=22 M=25 limit=192 full_chain=BIT_EXACT"
+    },
+    {
+      "config": {
+        "math": "fast",
+        "threads": "48",
+        "C": "512",
+        "limit": "192"
+      },
+      "result": "GROUP_BITS part=96 M=12 limit=192 full_chain=BIT_EXACT"
+    },
+    {
+      "config": {
+        "math": "fast",
+        "threads": "48",
+        "C": "512",
+        "limit": "192"
+      },
+      "result": "GROUP_BITS part=191 M=19 limit=192 full_chain=BIT_EXACT"
+    },
+    {
+      "config": {
+        "math": "fast",
+        "threads": "48",
+        "C": "1024",
+        "limit": "96"
+      },
+      "result": "GROUP_BITS part=56 M=41 limit=96 full_chain=BIT_EXACT"
+    },
+    {
+      "config": {
+        "math": "fast",
+        "threads": "48",
+        "C": "1024",
+        "limit": "96"
+      },
+      "result": "GROUP_BITS part=96 M=23 limit=96 full_chain=BIT_EXACT"
+    },
+    {
+      "config": {
+        "math": "fast",
+        "threads": "48",
+        "C": "1024",
+        "limit": "96"
+      },
+      "result": "GROUP_BITS part=191 M=36 limit=96 full_chain=BIT_EXACT"
+    },
+    {
+      "config": {
+        "math": "fast",
+        "threads": "48",
+        "C": "1024",
+        "limit": "192"
+      },
+      "result": "GROUP_BITS part=56 M=41 limit=192 full_chain=BIT_EXACT"
+    },
+    {
+      "config": {
+        "math": "fast",
+        "threads": "48",
+        "C": "1024",
+        "limit": "192"
+      },
+      "result": "GROUP_BITS part=96 M=23 limit=192 full_chain=BIT_EXACT"
+    },
+    {
+      "config": {
+        "math": "fast",
+        "threads": "48",
+        "C": "1024",
+        "limit": "192"
+      },
+      "result": "GROUP_BITS part=191 M=36 limit=192 full_chain=BIT_EXACT"
+    },
+    {
+      "config": {
+        "math": "fast",
+        "threads": "48",
+        "C": "2048",
+        "limit": "96"
+      },
+      "result": "GROUP_BITS part=56 M=76 limit=96 full_chain=BIT_EXACT"
+    },
+    {
+      "config": {
+        "math": "fast",
+        "threads": "48",
+        "C": "2048",
+        "limit": "96"
+      },
+      "result": "GROUP_BITS part=96 M=44 limit=96 full_chain=BIT_EXACT"
+    },
+    {
+      "config": {
+        "math": "fast",
+        "threads": "48",
+        "C": "2048",
+        "limit": "96"
+      },
+      "result": "GROUP_BITS part=191 M=60 limit=96 full_chain=BIT_EXACT"
+    },
+    {
+      "config": {
+        "math": "fast",
+        "threads": "48",
+        "C": "2048",
+        "limit": "192"
+      },
+      "result": "GROUP_BITS part=56 M=76 limit=192 full_chain=BIT_EXACT"
+    },
+    {
+      "config": {
+        "math": "fast",
+        "threads": "48",
+        "C": "2048",
+        "limit": "192"
+      },
+      "result": "GROUP_BITS part=96 M=44 limit=192 full_chain=BIT_EXACT"
+    },
+    {
+      "config": {
+        "math": "fast",
+        "threads": "48",
+        "C": "2048",
+        "limit": "192"
+      },
+      "result": "GROUP_BITS part=191 M=60 limit=192 full_chain=BIT_EXACT"
+    },
+    {
+      "config": {
+        "math": "fast",
+        "threads": "48",
+        "C": "4096",
+        "limit": "96"
+      },
+      "result": "GROUP_BITS part=186 M=149 limit=96 full_chain=BIT_EXACT"
+    },
+    {
+      "config": {
+        "math": "fast",
+        "threads": "48",
+        "C": "4096",
+        "limit": "96"
+      },
+      "result": "GROUP_BITS part=96 M=96 limit=96 full_chain=BIT_EXACT"
+    },
+    {
+      "config": {
+        "math": "fast",
+        "threads": "48",
+        "C": "4096",
+        "limit": "96"
+      },
+      "result": "GROUP_BITS part=191 M=122 limit=96 full_chain=BIT_EXACT"
+    },
+    {
+      "config": {
+        "math": "fast",
+        "threads": "48",
+        "C": "4096",
+        "limit": "192"
+      },
+      "result": "GROUP_BITS part=186 M=149 limit=192 full_chain=BIT_EXACT"
+    },
+    {
+      "config": {
+        "math": "fast",
+        "threads": "48",
+        "C": "4096",
+        "limit": "192"
+      },
+      "result": "GROUP_BITS part=96 M=96 limit=192 full_chain=BIT_EXACT"
+    },
+    {
+      "config": {
+        "math": "fast",
+        "threads": "48",
+        "C": "4096",
+        "limit": "192"
+      },
+      "result": "GROUP_BITS part=191 M=122 limit=192 full_chain=BIT_EXACT"
+    },
+    {
+      "config": {
+        "math": "conservative",
+        "threads": "47",
+        "C": "4096",
+        "limit": "192"
+      },
+      "result": "GROUP_BITS part=186 M=149 limit=192 full_chain=BIT_EXACT"
+    },
+    {
+      "config": {
+        "math": "conservative",
+        "threads": "47",
+        "C": "4096",
+        "limit": "192"
+      },
+      "result": "GROUP_BITS part=96 M=96 limit=192 full_chain=BIT_EXACT"
+    },
+    {
+      "config": {
+        "math": "conservative",
+        "threads": "47",
+        "C": "4096",
+        "limit": "192"
+      },
+      "result": "GROUP_BITS part=191 M=122 limit=192 full_chain=BIT_EXACT"
+    }
+  ],
+  "scalar_reference": "All 17 runs pass three dequantized-float reference parts, gate/up and down rel-L2 below2e-4; exact chain split/unsplit checks pass",
+  "source_sha256": "d73bf1ca1c1b66386124548ddcc07a7df579d8510bc5e813a24d4b38fc65e272",
+  "log_sha256": "68e1bd96fe20085ed3f4639a2582905416d5d490c09326fc2be52b08f728861e",
+  "build_log_sha256": "a173b4ca463340ba43f84079b9e913c2da2fa8d3b7496922037c721a3c4a4183",
+  "raw_directory": "tmp/strata-group-limit-20261002/",
+  "targets_met": false
+}
