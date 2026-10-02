@@ -318,7 +318,7 @@ preserving lip colors and estimated brow bands. It runs after geometry fitting,
 manual masks take precedence, and its derived masks are explicitly not ground
 truth. Held-out quality scoring retains its original annotations/masks.
 
-**Learned cues (v3):** the original 19,876-parameter PyTorch model predicts a bounded
+**Learned cues (v3):** the original 19,876-parameter CNN predicts a bounded
 normal residual around a pose/crop-matched rendered geometry prior, plus a mask
 probability. The v3 residual is capped at 0.15 per component before normalization.
 Its 32 synthetic views contain eight independent GNM identities, our NumPy/GGX
@@ -332,6 +332,30 @@ against rendered GNM. Predicted confidence cannot hide normal errors because the
 evaluation mask is fixed by the reference. Mask probability is not calibrated
 normal uncertainty. Learned cues remain experimental/off by default, including
 after a synthetic gate passes.
+
+Cue training now uses native C++ convolution forward/reverse passes (all five
+layers), SiLU, bilinear resize, tanh residual normalization, cosine/prior loss
+and stable mask BCE. Repository GEMM and native AdamW perform the model updates.
+It preserves the safetensors names, training-only fallback prior, independent
+identity split and synthetic/real adoption gates. Initialization and minibatch
+sampling use NumPy's random stream; archived Torch-trained quality results below
+do not validate newly trained weights. The native trainer currently supports CPU
+with batches up to 8 and square crops up to 128 pixels.
+
+```sh
+make -C cpu/vhuman libvhuman_training.so
+python -m server.vhuman.reconstruction.learned_cues train \
+  --dataset tmp/vhuman-cues/dataset.npz --out tmp/vhuman-cues/native-trained \
+  --steps 400 --device cpu --threads 4
+python -m unittest server.vhuman.test_native_image_training -v
+```
+
+Independent CPU math comparisons passed with normal error 1.20e-7, maximum
+gradient error 3.73e-9 and one-step AdamW error 6.64e-7. Gaussian appearance
+training is also native CPU; see `realtime/README.md`. The combined optional
+oracle is `ref/vhuman/verify_image_training.py`, with reports under
+`tmp/vhuman-native-image-training/`. GPU, gsplat kernel parity and newly trained
+visual quality remain deferred.
 
 First-pass quality artifacts (2026-09-30; cue v2 is a historical experiment):
 
@@ -756,7 +780,7 @@ DA3 and DINOv2 runners rebuild with the shared changes.
 Items 1–4 of the framework-removal work are implemented in C, using repository
 GEMM. Runtime Python handles image IO, NumPy arrays, SciPy camera fitting and
 ctypes/subprocess calls; these four inference paths import neither Torch nor
-ONNX. Offline export, training and reference comparisons still use Torch.
+ONNX. Legacy export and optional reference comparisons retain Torch.
 
 | Component | Native implementation | Production integration |
 |---|---|---|
@@ -770,7 +794,7 @@ is not evaluated; this is not a complete metric-depth/normal API. The cue
 checkpoint currently fails its synthetic quality gate and remains disabled for
 production inference. Numerical equivalence does not establish expression or
 appearance quality on new identities. Live inference now uses the repository
-C++/CUDA Gaussian renderer; Torch/gsplat remain offline training/reference tools.
+C++/CUDA Gaussian renderer; Torch/gsplat remain optional reference tools.
 
 Further dependency removal (items 6, 9, 10 and 12):
 
@@ -785,6 +809,8 @@ Further dependency removal (items 6, 9, 10 and 12):
 | Modal soft-deformer training | Repository CPU GEMM for bounded randomized PCA; NumPy thin QR/SVD and oscillator/ridge fitting; no Torch or GPU session |
 | Corrective deformer training | Native C++ contact/ARAP rotations and analytic gradients, repository-GEMM MLP backpropagation and AdamW; NumPy small skin transforms/solves and bounded regional PCA; no model framework |
 | Frozen normal-cue evaluation | Existing native image runner for real-domain evaluation; no Torch model loading |
+| Cue CNN training | Native convolution/SiLU/resize/normalization reverse passes and normal/mask losses; repository GEMM/AdamW; direct compatible safetensors output |
+| Gaussian appearance training | Native CPU trace-v1 deformation/projection and analytic alpha reverse pass for all six parameter groups, repository GEMM and Adam; no Torch/gsplat/CUDA requirement |
 | Identity reference creation | Native FLUX.2 F16/repository-GEMM neutral and reference-conditioned expressions; full distilled-4B four-step T2I/I2I parity passed with CUDA text encoding and FP32 KV storage; no Torch/ONNX inference |
 
 Photo and video landmark/blendshape inference now uses the native C++ executor
@@ -808,17 +834,20 @@ path ran successfully on RTX 5060 Ti without Torch or ONNX installed. The new
 Hunyuan backend passed the complete fast12 image-to-video pipeline described
 above; its quality profiles and expression timing remain experimental.
 
-Training dependency removal is incremental. Motion and corrective training and
-modal PCA use `cpu/vhuman/libvhuman_training.so`, with repository GEMM and AdamW;
+Training dependency removal is incremental. Motion, corrective, cue CNN and
+Gaussian appearance training and modal PCA use `cpu/vhuman/libvhuman_training.so`,
+with repository GEMM and AdamW;
 NumPy/SciPy remain ordinary array, factorization and geometry dependencies. CPU
 GRU checks cover forward/state, all parameter gradients, chunk boundaries and
-optimizer updates. Complete motion, corrective and modal training pass with
+optimizer updates. Complete motion, corrective, cue CNN, Gaussian and modal training pass with
 Torch, ONNX and other model frameworks blocked. Optional CPU oracles are
-`ref/vhuman/verify_motion_training.py` and `ref/vhuman/verify_corrective_training.py`;
-reports are under `tmp/vhuman-native-training/` and `tmp/vhuman-native-corrective/`.
+`ref/vhuman/verify_motion_training.py`, `ref/vhuman/verify_corrective_training.py`
+and `ref/vhuman/verify_image_training.py`; reports are under
+`tmp/vhuman-native-training/`, `tmp/vhuman-native-corrective/` and
+`tmp/vhuman-native-image-training/`.
 New training quality and GPU checks are deferred.
-Remaining Torch training paths include the normal-cue CNN, Gaussian appearance
-fitting, and some registration and expression optimizers. Legacy checkpoint
+Remaining Torch training paths include registration and expression/video
+optimizers. Legacy checkpoint
 conversion and independent reference
 checks retain optional framework imports.
 

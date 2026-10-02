@@ -95,9 +95,7 @@ else: raise AssertionError('modified source receipt accepted')
 
 
 class AppearanceTrainingTests(unittest.TestCase):
-    def test_cuda_appearance_fit_changes_radiance(self):
-        import torch
-        if not torch.cuda.is_available(): self.skipTest("CUDA required")
+    def test_native_cpu_appearance_fit_changes_radiance(self):
         from .src.avatar.train import fit
         from .src.avatar.bundle import GaussianAvatar
         WORK.mkdir(parents=True, exist_ok=True)
@@ -117,10 +115,8 @@ class AppearanceTrainingTests(unittest.TestCase):
         self.assertLess(float(avatar.arrays["rgb"].mean()), .5)
         self.assertEqual(avatar.metadata["purpose"], "diagnostic")
         self.assertEqual(avatar.metadata["covariance_policy"], "trace-v1")
-        from .src.benchmark.appearance import evaluate
-        report = evaluate(manifest, WORK / "fitted.npz", WORK / "evaluation")
-        self.assertEqual(report["evaluation"], "training-reconstruction")
-        self.assertTrue(np.isfinite(report["frames"][0]["linear_l1"]))
+        self.assertEqual(result['backend'],'repository_cpu_gemm')
+        self.assertEqual(avatar.metadata['training_device'],'cpu')
 
 
 if __name__ == "__main__": unittest.main()

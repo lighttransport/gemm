@@ -126,6 +126,47 @@ int main()
     require(!vh_train_rotations(rest,edge_rest,normal_rest,normal_scale,mesh_edges,mesh_faces,1,4,6,4,rot),"polar rotation failed");
     for (int vtx=0;vtx<4;++vtx) for (int j=0;j<3;++j) for (int k=0;k<3;++k)
         close_enough(rot[vtx*9+j*3+k],j==k?1:0,2e-6,0,"rest polar identity");
-    std::puts("PASS: repository GEMM, AdamW, GRU gradients/state, corrective MLP gradients and contact energy");
+    constexpr int ch=5,cw=7;
+    float cue_input[6*ch*cw],cue_truth[3*ch*cw],cue_mask[ch*cw],cue_out[4*ch*cw];
+    std::vector<float> cue_parameters(19876),cue_gradient(19876);
+    for(float &value:cue_parameters)value=random(rng)*.4f;
+    for(float &value:cue_input)value=random(rng);
+    for(int i=0;i<ch*cw;++i) { cue_input[5*ch*cw+i]=1;cue_mask[i]=i%3?1:0; }
+    for(float &value:cue_truth)value=random(rng);
+    double cue_loss=0;
+    require(!vh_train_cues(cue_parameters.data(),cue_input,cue_truth,cue_mask,1,ch,cw,cue_out,cue_gradient.data(),&cue_loss),"cue CNN reverse failed");
+    std::vector<float> cue_analytic=cue_gradient;
+    const size_t cue_offsets[]={0,2400,2416,5872,5896,12808,12840,19752,19776,19872,19876};
+    for(int block=0;block<10;++block) {
+        size_t best=cue_offsets[block];for(size_t i=best;i<cue_offsets[block+1];++i)if(std::abs(cue_analytic[i])>std::abs(cue_analytic[best]))best=i;
+        float original=cue_parameters[best],epsilon=.004f;double numeric[2];
+        for(int sign=0;sign<2;++sign) {
+            cue_parameters[best]=original+(sign?epsilon:-epsilon);
+            require(!vh_train_cues(cue_parameters.data(),cue_input,cue_truth,cue_mask,1,ch,cw,cue_out,cue_gradient.data(),&numeric[sign]),"cue CNN numeric loss failed");
+        }
+        cue_parameters[best]=original;
+        close_enough(cue_analytic[best],(numeric[1]-numeric[0])/(2*epsilon),1e-5,.01,"cue CNN parameter gradient");
+    }
+    float ap[40]={},av[]={-.08f,-.07f,.95f,.09f,-.06f,1.02f,.01f,.1f,.98f},ab[]={.2f,.3f,.5f},ac[]={.6f};
+    int32_t ai[]={0,1,2};float camera[25]={};camera[0]=camera[5]=camera[10]=camera[15]=camera[24]=1;
+    camera[16]=45;camera[20]=47;camera[18]=3;camera[21]=2;
+    ap[3]=1;ap[4]=std::log(.15f);ap[5]=std::log(.13f);ap[6]=std::log(.00015f);ap[7]=.2f;
+    for(int i=8;i<40;++i)ap[i]=random(rng)*.1f;
+    float at[ch*cw*3],am[ch*cw],ar[ch*cw*4],ag[40];double aloss[2];
+    std::fill(at,at+ch*cw*3,.08f);std::fill(am,am+ch*cw,.2f);
+    require(!vh_train_appearance(ap,av,ai,ab,ac,camera,1,3,1,cw,ch,at,am,ar,ag,aloss),"Gaussian training reverse failed");
+    const int groups[][2]={{0,3},{3,4},{4,7},{7,8},{8,32},{32,40}};
+    float analytic_appearance[40];std::memcpy(analytic_appearance,ag,sizeof(ag));
+    for(const auto &group:groups) {
+        int best=group[0];for(int i=best;i<group[1];++i)if(std::abs(analytic_appearance[i])>std::abs(analytic_appearance[best]))best=i;
+        float original=ap[best],epsilon=.002f;double numeric[2];
+        for(int sign=0;sign<2;++sign) {
+            ap[best]=original+(sign?epsilon:-epsilon);
+            require(!vh_train_appearance(ap,av,ai,ab,ac,camera,1,3,1,cw,ch,at,am,ar,ag,aloss),"Gaussian numeric loss failed");numeric[sign]=aloss[0];
+        }
+        ap[best]=original;
+        close_enough(analytic_appearance[best],(numeric[1]-numeric[0])/(2*epsilon),2e-6,.01,"Gaussian parameter gradient");
+    }
+    std::puts("PASS: repository GEMM, AdamW, GRU, corrective, CNN and Gaussian training math");
     return 0;
 }

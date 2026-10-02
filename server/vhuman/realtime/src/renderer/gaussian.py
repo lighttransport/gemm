@@ -1,7 +1,7 @@
 """Default inference renderer; no Torch or gsplat imports.
 
-Training uses its differentiable backend directly. The optional offline oracle
-is explicitly available from gsplat_reference.
+Appearance training uses the native CPU differentiable renderer. The optional
+offline oracle is explicitly available from gsplat_reference.
 """
 from .native import NativeGaussianRenderer as GaussianRenderer
 from .frame import FrameHandle

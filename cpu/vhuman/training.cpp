@@ -211,6 +211,8 @@ struct motion_trainer {
 };
 
 #include "corrective_training.cpp"
+#include "cue_training.cpp"
+#include "appearance_training.cpp"
 
 extern "C" {
 const char *vh_train_error() { return train_error.c_str(); }

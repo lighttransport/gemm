@@ -1,4 +1,4 @@
-"""Original compact PyTorch normal/mask experiment, synthetic data only.
+"""Original compact native CPU normal/mask experiment, synthetic data only.
 
 Apache GNM geometry is rendered with our own BRDF and procedural albedo. Real
 Multiface/Emily/SpeakingFaces media is never used for optimization or labels.
@@ -15,25 +15,9 @@ ARCHITECTURE='geometry_prior_residual_cnn_v3'
 CODE_SHA256=sha256(Path(__file__))
 
 
-def network(side=64):
-    import torch
-    from torch import nn
-    class CueNet(nn.Module):
-        def __init__(self):
-            super().__init__()
-            prior=torch.zeros((1,3,side,side));prior[:,2]=1
-            self.register_buffer('prior',prior)
-            self.encoder=nn.Sequential(nn.Conv2d(6,16,5,padding=2),nn.SiLU(),
-                nn.Conv2d(16,24,3,stride=2,padding=1),nn.SiLU(),
-                nn.Conv2d(24,32,3,stride=2,padding=1),nn.SiLU())
-            self.decoder=nn.Sequential(nn.Conv2d(32,24,3,padding=1),nn.SiLU(),nn.Conv2d(24,4,1))
-        def forward(self,image,geometry_prior=None):
-            prior=nn.functional.interpolate(self.prior if geometry_prior is None else geometry_prior,size=image.shape[-2:],mode='bilinear',align_corners=False).expand(len(image),-1,-1,-1)
-            raw=self.decoder(self.encoder(torch.cat((image,prior),dim=1)))
-            raw=nn.functional.interpolate(raw,size=image.shape[-2:],mode='bilinear',align_corners=False)
-            normals=nn.functional.normalize(prior+torch.tanh(raw[:,:3])*.15,dim=1,eps=1e-6)
-            return normals,raw[:,3:4]
-    return CueNet()
+def network(side=64,threads=4):
+    from .native_cue_training import CueNet
+    return CueNet(side,threads=threads)
 
 
 def synthesize(out,identities=8,views=4,side=64):
@@ -98,38 +82,41 @@ def metrics(predicted,truth,mask):
     return dict(mean_degrees=float(angles.mean()),median_degrees=float(np.median(angles)),p95_degrees=float(np.quantile(angles,.95)))
 
 
-def train(dataset,out,steps=400,device='cpu'):
-    import torch
+def train(dataset,out,steps=400,device='cpu',threads=4):
     from ..rig import safetensors as st
     from scipy.ndimage import binary_erosion
-    torch.set_num_threads(4);torch.manual_seed(1234);np.random.seed(1234)
+    if device != 'cpu':raise ValueError('native cue training currently supports CPU')
+    rng=np.random.default_rng(1234)
     dataset,out=Path(dataset),artifact_path(out)
     if out.exists():raise ValueError('choose a fresh training directory')
     manifest=json.loads(dataset.with_suffix('.json').read_text())
     if manifest.get('format')!='vhuman.synthetic_cues.v1' or manifest.get('real_media_used') is not False or sha256(dataset)!=manifest['dataset_sha256']:
         raise ValueError('verified synthetic-only cue dataset required')
-    if not 50<=steps<=5000:raise ValueError('steps must be 50..5000')
+    if type(steps) is not int or not 50<=steps<=5000:raise ValueError('steps must be 50..5000')
     with np.load(dataset,allow_pickle=False) as z:rgb=z['rgb'].transpose(0,3,1,2);truth=z['normals'].transpose(0,3,1,2);mask=z['mask'];groups=z['identity'];priors=z['prior'].transpose(0,3,1,2)
+    if (rgb.ndim!=4 or rgb.shape[1]!=3 or not 1<=len(rgb)<=512 or not 1<=rgb.shape[-1]<=128 or
+            rgb.shape[-2]!=rgb.shape[-1] or truth.shape!=rgb.shape or priors.shape!=rgb.shape or
+            mask.shape!=(len(rgb),*rgb.shape[2:]) or mask.dtype!=bool or groups.shape!=(len(rgb),) or
+            groups.dtype.kind not in 'iu' or not all(np.isfinite(a).all() for a in (rgb,truth,priors)) or
+            (rgb<0).any() or (rgb>1).any()):raise ValueError('invalid bounded synthetic cue tensors')
     identities=np.unique(groups);heldout=identities[-max(1,len(identities)//4):]
     fit=~np.isin(groups,heldout);test=~fit
     if fit.sum()<4 or test.sum()<2:raise ValueError('identity-separated fit/holdout required')
-    model=network(rgb.shape[-1]).to(device);optimizer=torch.optim.AdamW(model.parameters(),lr=.003,weight_decay=1e-4)
+    model=network(rgb.shape[-1],threads)
     mean=(truth[fit]*mask[fit,None]).sum(0)/np.maximum(mask[fit].sum(0)[None],1)
     mean/=np.maximum(np.linalg.norm(mean,axis=0,keepdims=True),1e-9)
     mean[:,mask[fit].sum(0)==0]=np.array([0,0,1])[:,None]
-    model.prior.copy_(torch.tensor(mean[None],device=device))
-    prior_tensor=torch.tensor(priors[fit],device=device)
-    x=torch.tensor(rgb[fit],device=device);y=torch.tensor(truth[fit],device=device);m=torch.tensor(mask[fit,None],dtype=torch.float32,device=device)
+    model.prior[:]=mean[None]
+    fit_rgb,fit_prior,fit_truth,fit_mask=rgb[fit],priors[fit],truth[fit],mask[fit]
     for step in range(steps):
-        ids=torch.randint(len(x),(min(8,len(x)),),device=device);normal,logits=model(x[ids],prior_tensor[ids])
-        cosine=(1-(normal*y[ids]).sum(1,keepdim=True))*m[ids]
-        loss=cosine.sum()/m[ids].sum().clamp_min(1)+torch.nn.functional.binary_cross_entropy_with_logits(logits,m[ids])*.15
-        loss+=((normal-prior_tensor[ids])**2*m[ids]).sum()/m[ids].sum().clamp_min(1)*.02
-        optimizer.zero_grad();loss.backward();optimizer.step()
-    model.eval()
-    with torch.inference_mode():
-        predicted,logits=model(torch.tensor(rgb[test],device=device),torch.tensor(priors[test],device=device))
-    predicted=predicted.cpu().numpy();confidence=torch.sigmoid(logits).cpu().numpy()[:,0]
+        ids=rng.integers(fit.sum(),size=min(8,fit.sum()))
+        model.compute(fit_rgb[ids],fit_prior[ids],fit_truth[ids],fit_mask[ids],update=True)
+    predictions=[];confidences=[]
+    for start in range(0,test.sum(),8):
+        normal,logits=model(rgb[test][start:start+8],priors[test][start:start+8])
+        predictions.append(normal)
+        confidences.append(1/(1+np.exp(-np.clip(logits[:,0],-80,80))))
+    predicted=np.concatenate(predictions);confidence=np.concatenate(confidences)
     # Fixed reference masks score normals; predicted confidence cannot hide errors.
     interior=np.array([binary_erosion(row,iterations=1) for row in mask[test]])
     learned=metrics(predicted,truth[test],interior)
@@ -138,11 +125,11 @@ def train(dataset,out,steps=400,device='cpu'):
     template=metrics(priors[test],truth[test],interior)
     accepted=learned['mean_degrees']<template['mean_degrees']*.95
     out.mkdir(parents=True)
-    st.save(out/'normal_cue.safetensors',{k:v.detach().cpu().numpy() for k,v in model.state_dict().items()})
+    st.save(out/'normal_cue.safetensors',model.state_dict())
     np.savez_compressed(out/'heldout.npz',rgb=rgb[test],normals=predicted,truth=truth[test],confidence=confidence,mask=mask[test])
-    report=dict(format='vhuman.normal_cue.v1',architecture=ARCHITECTURE,code_sha256=CODE_SHA256,torch_version=torch.__version__,weights_sha256=sha256(out/'normal_cue.safetensors'),dataset_sha256=manifest['dataset_sha256'],
+    report=dict(format='vhuman.normal_cue.v1',architecture=ARCHITECTURE,code_sha256=CODE_SHA256,training_backend='repository_cpu_gemm',weights_sha256=sha256(out/'normal_cue.safetensors'),dataset_sha256=manifest['dataset_sha256'],
                 training_identities=identities[~np.isin(identities,heldout)].tolist(),heldout_identities=heldout.tolist(),
-                steps=steps,device=device,resolution=int(rgb.shape[-1]),parameters=sum(p.numel() for p in model.parameters()),
+                steps=steps,device=device,thread_budget=threads,resolution=int(rgb.shape[-1]),parameters=int(model.parameters.size),
                 heldout_normals=learned,flat_baseline=baseline,geometry_prior_baseline=template,synthetic_gate_passed=bool(accepted),
                 real_geometry_gate_passed=False,default_enabled=False,
                 limitations=['synthetic normal/mask pilot; no real-domain accuracy claim',
@@ -243,11 +230,12 @@ def validate_real(checkpoint,prepared,candidate,out):
 def main():
     parser=argparse.ArgumentParser(description=__doc__);sub=parser.add_subparsers(dest='action',required=True)
     synth=sub.add_parser('synthesize');synth.add_argument('--out',type=Path,required=True)
-    fit=sub.add_parser('train');fit.add_argument('--dataset',type=Path,required=True);fit.add_argument('--out',type=Path,required=True);fit.add_argument('--steps',type=int,default=400);fit.add_argument('--device',choices=['cpu','cuda'],default='cpu')
+    fit=sub.add_parser('train');fit.add_argument('--dataset',type=Path,required=True);fit.add_argument('--out',type=Path,required=True);fit.add_argument('--steps',type=int,default=400);fit.add_argument('--device',choices=['cpu'],default='cpu')
+    fit.add_argument('--threads',type=int,default=4)
     predict=sub.add_parser('infer');predict.add_argument('--image',type=Path,required=True);predict.add_argument('--prior',type=Path,required=True);predict.add_argument('--checkpoint',type=Path,required=True);predict.add_argument('--out',type=Path,required=True)
     validate=sub.add_parser('validate-real')
     for name in ('checkpoint','prepared','candidate','out'):validate.add_argument('--'+name,type=Path,required=True)
-    a=parser.parse_args();result=synthesize(a.out) if a.action=='synthesize' else train(a.dataset,a.out,a.steps,a.device) if a.action=='train' else validate_real(a.checkpoint,a.prepared,a.candidate,a.out) if a.action=='validate-real' else infer(a.image,a.checkpoint,a.out,a.prior)
+    a=parser.parse_args();result=synthesize(a.out) if a.action=='synthesize' else train(a.dataset,a.out,a.steps,a.device,a.threads) if a.action=='train' else validate_real(a.checkpoint,a.prepared,a.candidate,a.out) if a.action=='validate-real' else infer(a.image,a.checkpoint,a.out,a.prior)
     print(json.dumps(result))
 
 

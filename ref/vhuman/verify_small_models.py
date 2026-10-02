@@ -13,7 +13,7 @@ def main():
     ap.add_argument('--cues',type=Path,required=True);ap.add_argument('--motion',type=Path,required=True)
     ap.add_argument('--out',type=Path,required=True);a=ap.parse_args();a.out.mkdir(parents=True,exist_ok=True)
     import torch
-    from server.vhuman.reconstruction.learned_cues import network
+    from ref.vhuman.cue_torch_reference import network
     from server.vhuman.rig import safetensors
     from server.vhuman.native_models import run_image_model
     from server.vhuman.realtime.src.animation.causal_model import ReferenceMotionAdapter

@@ -88,14 +88,14 @@ to its sibling `.native/` directory with a source-hash check). Missing or stale
 exports fail explicitly. For new training, prefer a `.native` directory output.
 A file-shaped output such as `motion.pt` is now a JSON training receipt with a
 sibling `.native/` bundle, rather than a Torch checkpoint. Existing revision,
-diagnostic/production and epoch/sequence checks remain in force. Gaussian
-appearance training and explicit gsplat reference comparisons still use Torch;
-native motion training and the complete live inference process are framework-free.
+diagnostic/production and epoch/sequence checks remain in force. Motion and
+Gaussian appearance training are native CPU paths. Explicit gsplat reference
+comparisons retain optional Torch; training and live inference are framework-free.
 
 For scheduling, audio replay, native model adapters, geometry and receipt tools,
 install only `requirements-runtime.txt` in a separate interpreter and run
 `python -m server.vhuman.realtime ...`. The broader setup above is for the
-gsplat compatibility renderer and offline training/reference generation.
+gsplat compatibility renderer and offline reference generation.
 `doctor` probes the CUDA driver through the native library without importing
 Torch. Held-out `evaluate-motion` uses the native GRU; `--reference-parity`
 explicitly enables the optional Torch full-sequence oracle.
@@ -309,8 +309,9 @@ Appearance corpus JSON:
 `frames.npz` (no pickle): vertices[F,V,3] in metres, triangles[T,3] integer,
 images[F,H,W,3] in **linear RGB** over black, controls[F,C], view[F,4,4],
 intrinsics[F,3,3]. Cameras must be calibrated to the final rig after contact
-projection. gsplat uses camera +Z forward; vhuman's reconstruction camera uses
--Z forward, so flip Y/Z in its world-to-camera transform and retain focal/skew.
+projection. Native splatting uses camera +Z forward; vhuman's reconstruction camera
+uses -Z forward, so flip Y/Z in its world-to-camera transform. Appearance fitting
+currently requires pinhole intrinsics without skew.
 `export-neutral` exports the calibrated clean portrait and final posed rig with
 an explicit Y/Z conversion and projection parity check. It uses a projected
 convex mask and marks the result **diagnostic**. Expression registration,
@@ -330,6 +331,37 @@ legacy bundles retain their versioned eigenvalue policy. Explicit mask/alpha
 supervision prevents a bright transparent face from satisfying RGB loss. Format `vhuman.gaussian_avatar.v1` preserves
 control order, topology SHA256, provenance, fixed-light assumption and purpose.
 There is no relighting model, densification or automatic quality acceptance yet.
+
+Appearance fitting now uses `cpu/vhuman/libvhuman_training.so`, with no Torch,
+gsplat or CUDA requirement. The CPU renderer follows the native CUDA pinhole/EWA,
+tile ordering, visibility thresholds and front-to-back alpha rules. Its analytic
+compositing reverse pass and four local projection derivatives update RGB,
+opacity, diagonal covariance, normal offset, color basis and expression matrix.
+Repository GEMM computes expression projections; native AdamW with zero decay
+implements Adam. The renderer uses FP64 local math with FP32 parameters and
+outputs. Sorting, clipping and tile membership are piecewise constant. The
+appearance rasterizer currently runs serially; `--threads` controls GEMM work.
+Large 50k-splat training speed and GPU backward execution remain unvalidated.
+Start CPU integration checks with a small count and step budget. Checkpoints
+retain `vhuman.gaussian_avatar.v1` and `trace-v1` covariance semantics.
+
+```sh
+make -C cpu/vhuman libvhuman_training.so test
+python -m server.vhuman.realtime fit-appearance --manifest appearance.json \
+  --output tmp/vhuman-realtime/native-avatar.npz --count 512 --steps 50 --threads 4
+python -m unittest server.vhuman.test_native_image_training \
+  server.vhuman.realtime.test_training -v
+# Optional CPU Torch math oracle; no gsplat or GPU needed:
+python ref/vhuman/verify_image_training.py \
+  --output tmp/vhuman-native-image-training/parity.json
+```
+
+Synthetic full training/export/load and gradient checks pass with model
+frameworks blocked. Independent CPU checks cover CNN training and Gaussian
+projection, compositing and optimizer updates, including several tiles and
+visibility/clipping branches. GPU kernel parity and visual quality of newly
+trained assets remain deferred. Earlier appearance quality figures refer to
+the previous fitted assets.
 
 ## Direct-TTS motion training and live integration
 

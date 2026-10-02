@@ -207,6 +207,7 @@ def main():
         p = commands.add_parser(name); p.add_argument("--manifest", required=True); p.add_argument("--output", required=True)
         if name == "fit-appearance":
             p.add_argument("--count", type=int, default=50000); p.add_argument("--steps", type=int, default=1000)
+            p.add_argument("--threads", type=int, default=4)
         else:
             p.add_argument("--epochs", type=int, default=20)
             p.add_argument("--threads", type=int, default=4)
@@ -240,7 +241,7 @@ def main():
         result = run(args, WORK)
     elif args.command == "fit-appearance":
         from .src.avatar.train import fit
-        result = fit(args.manifest, args.output, args.count, args.steps)
+        result = fit(args.manifest, args.output, args.count, args.steps, threads=args.threads)
     elif args.command == "evaluate-appearance":
         from .src.benchmark.appearance import evaluate
         result = evaluate(args.manifest, args.avatar, args.output)
