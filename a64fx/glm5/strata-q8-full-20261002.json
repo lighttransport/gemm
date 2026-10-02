@@ -1,5 +1,5 @@
 {
-  "status": "Seven 8K ablations and independent five-trial confirmation complete; full context qualification still in progress at 15:33 JST",
+  "status": "Full Q8 qualification PASS: seven 8K ablations, independent five-trial confirmation, stress1024, short128 and repeated32K; below promotion threshold",
   "allocation": 52085859,
   "binaries": {
     "reference": "candidate-panel47-v1",
@@ -430,6 +430,46 @@
       "token_sha256": "6b179961fe8f21a03cec1d2ff9e6688a2e3e90e980bb8da2d06570576a7240b0",
       "promotion_candidate": false,
       "target_met": false
+    },
+    "repeated32k": {
+      "baseline": {
+        "prompt_tokens": 32196,
+        "decode_transitions": 256,
+        "trials": 3,
+        "prefill": {
+          "median_tok_s": 343.931969,
+          "min_tok_s": 343.931921,
+          "max_tok_s": 343.998086
+        },
+        "decode": {
+          "median_tok_s": 32.101995,
+          "min_tok_s": 32.083809,
+          "max_tok_s": 32.119284
+        }
+      },
+      "candidate": {
+        "prompt_tokens": 32196,
+        "decode_transitions": 256,
+        "trials": 3,
+        "prefill": {
+          "median_tok_s": 345.949648,
+          "min_tok_s": 345.680701,
+          "max_tok_s": 345.954151
+        },
+        "decode": {
+          "median_tok_s": 31.984868,
+          "min_tok_s": 31.460964,
+          "max_tok_s": 32.009968
+        }
+      },
+      "speedup": {
+        "prefill": 1.0058665061170864,
+        "decode": 0.9963514105587518
+      },
+      "tokens_equal": true,
+      "token_sha256": "f19c884513db7886a2166727b36094306df13bbab02418b8a343d457d488e6d9",
+      "promotion_candidate": false,
+      "target_met": false
     }
   },
   "report_sha256": {
@@ -443,8 +483,11 @@
     "rows8-asm4-fused.json": "87eea0f3b5bab8f11917e03e350b8dbaf95e2e10ccb2b272ba10300f32f1c881",
     "rows8.json": "cfc1a04e221de8b8d098938a939ab60841cf63d2c34f3572d19b2447f5cf1b28",
     "short128.json": "eb27b8aebf6bf6fd5f8bda78242b9160563c8bdaf3be5f17fe013afa27ed618e",
-    "stress.json": "991c5a4bf2a472f802a922e685fd439c43f220cbad9b21332537e2a7272ea8e3"
+    "stress.json": "991c5a4bf2a472f802a922e685fd439c43f220cbad9b21332537e2a7272ea8e3",
+    "repeated32k.json": "2cc59342f210563abf4fc2262121ea4718ed4b042f2c016738106162793d3ca7"
   },
   "promotion": false,
-  "targets_met": false
+  "targets_met": false,
+  "completed_at_observation_jst": "2026-10-02 15:48:08",
+  "completed_campaign_log_sha256": "2ae592ff35496c9d740b6ad1777c337e0f9d80c561dcb0244748aba42d9f841d"
 }

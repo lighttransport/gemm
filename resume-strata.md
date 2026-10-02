@@ -1,6 +1,6 @@
 # Resume: GLM53F Strata-inspired optimization, 12 A64FX nodes
 
-Updated 2026-10-02 15:43 JST. Q8 ablations/confirmation are complete and context qualification continues. Exact mHC synchronization passes native probes; its full-model queue follows capacity/lookup/normalized-MTP in PJM 52085859.
+Updated 2026-10-02 15:48 JST. Q8 full qualification is complete without promotion; capacity is next in the serial queue. Exact mHC synchronization passes native probes; its full-model queue follows capacity/lookup/normalized-MTP in PJM 52085859.
 
 Previous campaign: TP12 implementation, native validation and
 short/8K/synthetic 32K qualification complete. All new paths remain opt-in.
@@ -46,10 +46,11 @@ See `a64fx/glm5/GLM53F_STRATA.md` for implementation, gates and commands.
 - Q8 full-run update: all7 ablations are exact257-ID streams. Independent5
   confirmation of ASM4+fused: **35.540871 /377.077157**, fresh frozen control
   **35.609336 /371.931478** decode/prefill tok/s; ratios0.998077 /1.013835.
-  No promotion (5% threshold). Stress1024 and short128 match all IDs;
-  repeated32K is active at15:33. Complete reports are recorded in
+  No promotion (5% threshold). Stress1024, short128 and repeated32K match
+  all IDs; Q8_CAMPAIGN_PASS is observed at15:48 and PID9278 has exited.
+  Repeated32K ratios are0.996351 decode /1.005867 prefill. Complete reports are recorded in
   `a64fx/glm5/strata-q8-full-20261002.json`. Best independently qualified
-  settings remain35.742137 /370.754010; both targets remain unmet.
+  promoted settings remain35.742137 /370.754010; both targets remain unmet.
 - Persistent objective remains 100+ delivered decode /2000+ prefill tok/s for
   the complete 45-layer model and saved 8049-ID single request. Best independently
   qualified result remains **35.742137 /370.754010**; neither target is met.

@@ -146,7 +146,9 @@ All seven 8K Q8 ablations return the exact 257-ID stream. Independent five-trial
 confirmation of ASM4 plus fused MLA projections measures **35.540871 decode /
 377.077157 prefill tok/s**, against **35.609336 /371.931478** for the fresh frozen
 control: −0.19% decode /+1.38% prefill. This misses the 5% promotion threshold.
-Stress1024 and short128 also match all IDs; repeated32K is still running.
+Stress1024, short128 and repeated32K also match all IDs; the complete
+campaign passes at15:48. Repeated32K measures32.101995→31.984868 decode and
+343.931969→345.949648 prefill tok/s, below the promotion threshold.
 Completed reports are recorded in [Q8 full-model progress](strata-q8-full-20261002.json).
 
 The next experiment increases outer prefill workspace capacity to 4096 while
