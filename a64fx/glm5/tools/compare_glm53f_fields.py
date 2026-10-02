@@ -102,7 +102,7 @@ def read_capture(prefix, require_hidden=True):
         raise ValueError('incomplete KDA head coverage')
     if len(selected) != 11 or not all(f'streams.{s}' in fields for s in range(4)):
         raise ValueError('incomplete sparse or final-stream capture')
-    if require_hidden and (not hidden_count or lengths != {hidden_count}):
+    if len(lengths) != 1 or (require_hidden and (not hidden_count or lengths != {hidden_count})):
         raise ValueError("missing full-prompt streams or inconsistent token count")
     return fields, selected
 

@@ -2,7 +2,8 @@
 
 The prototype targets prefill on the same 45-layer UD-Q4_K_XL, top8 model
 and 12 A64FX nodes. The promoted TP12 configuration remains the production
-path. PP3×TP4 is not yet connected to a runnable full model.
+path. PP3×TP4 runs the full model, but its short cross-layout correctness
+gate fails; it remains experimental.
 
 ## Implemented foundation
 
@@ -95,10 +96,10 @@ only sizing of the real model passes all12 ranks:
 | 1 | 15:30 | 16420700160 | 15.2930 |
 | 2 | 30:45 | 16500916224 | 15.3677 |
 
-No full routed image has been staged. These sizes exclude attention,
+Full routed images are now staged on all12 nodes. These sizes exclude attention,
 embedding/head, shared/dense weights, caches and workspaces. The checked
 `glm53f_memory_budget` ledger rejects overflow and insufficient6GiB headroom;
-complete component accounting and resident-loader integration remain pending.
+complete component accounting and resident-loader integration are implemented.
 See [machine-readable evidence](strata-pipeline-foundation-20261003.json).
 
 ## Dense context and 16-head MLA
@@ -115,7 +116,8 @@ On PJM52106727, `test_glm53f_dense_dist DIR` passes three cuts (`15,30`, `1,3`,
 `1,2`), covering dense layers on all stages. Scalar and batch1–4 callbacks pass
 with synthetic zero Q4_K weights; legacy headers, corruption, missing paths
 and wrong ownership are rejected. This validates the interface and collectives;
-real-model dense math and full PP integration remain pending.
+real-model dense arithmetic still needs cross-layout isolation; PP integration
+is implemented.
 
 `glm53f_mlb_token_grouped` extends the existing MLA primitive to16 heads,
 using four-head groups above the legacy six-head range. Values for all heads
@@ -124,10 +126,11 @@ also accept16 heads and group fused projections within the eight-matrix native
 limit. Native `test_glm53f_mla_groups` passes640 bit-exact cases per node in
 both conservative and production-fast math builds (15360 cases total), covering
 heads1–16, selected counts through2052, two selection orders, FP32/FP16 latent
-values, stride padding and output/scratch canaries. Full-model sparse qualification
-is pending; its PP constructor is not yet connected.
+values, stride padding and output/scratch canaries. The PP sparse constructor
+is connected; full-model sparse cross-layout qualification fails downstream
+of the first recurrent-state tolerance failure.
 
-## Remaining model integration
+## Model integration requirements
 
 1. Stage-specific native manifests, source/tensor byte coverage and hashes;
    explicit rejection of TP12 images; bounded staging and >=6GiB memory
@@ -170,7 +173,8 @@ native MPI launches. The resident constructor accounts for native/compact
 weights, vocabulary transients, repacks/derived panels, replicated sparse KV,
 recurrent state, MoE/attention workspaces and pipeline slots. It rejects a
 conservative peak leaving less than6GiB and checks headroom after loading.
-This inventory is an upper bound; real PP peak measurements remain pending.
+This inventory is an upper bound. Short real PP runs retain at least
+11.047729GiB MemAvailable; long-prompt peak qualification remains pending.
 Never construct a TP12 and PP model simultaneously on a node.
 
 ```sh
@@ -192,6 +196,9 @@ reference schedule. PP generation is greedy with FP32 cache; unsupported
 conversion/CP settings are rejected. Prefill timing includes the complete
 prompt, pipeline transfer/fill/drain and first readout. Generated token1 comes
 from that readout, so129 output IDs measure128 subsequent decode transitions.
+As in TP12, the prefix is batched and the last prompt token uses scalar
+kernels. Subsequent decode uses the owned scalar executor. PP beta weights
+retain the rowwise layout so sixteen-row slices use the same GEMM beta path.
 Each PP stage also reports its maximum compute, receive and send-wait time
 to guide contiguous-cut balancing. The TP12 runner additionally reports `GLM53F_TARGET_FULL_PROMPT_TIMING` using
 the same full-prompt/first-readout and post-first-token timing boundary; its
@@ -230,5 +237,35 @@ pass eight sizes through2049, owner boundaries/duplicates and signed-zero
 bits. The pipeline fixture also passes128 sequential full-width transitions
 for both layouts and all three microbatches. Host reader/ASan/UBSan,
 40 legacy repack-policy cases and canonical comparison rejection tests pass.
-Full real-weight PP load, cross-layout numerical/ID gates, stress/32K and
-whole-model performance are still pending. No PP promotion or100/2000 claim.
+These owned-executor bit-exact tests run within TP12; they establish stage
+boundary correctness, not TP4 arithmetic equivalence. The additional scalar
+boundary fixture passes8 positions, streams/state/readout bit-exact.
+
+Full real-weight PP source/hash/load gates pass on all12 ranks. Matched-v1
+short128 runs finish129 outputs with at least11.047729GiB headroom. The
+cross-layout gate fails: IDs first differ at output20 (TP12=279, PP=1817),
+8879 of9403 prefill fields fail, worst relative L2=0.5283578003. Layer0 state
+is bit-exact; layer1 worst0.0004914237 passes, layer2 worst0.0044615013 fails.
+Post-decode has8752 failed fields of8763, worst relative L2=3.4331042148.
+Serialized/two-slot prefill and post-decode (128 transitions) are bit-exact
+on this one-prefix-microbatch case;
+multiple-microbatch, stress/32K and performance qualification remain gated.
+No PP promotion or100/2000 claim.
+
+For bounded comparison directly on Fugaku's login host without NumPy:
+
+```sh
+gcc -std=c11 -O2 -Wall -Wextra -Werror -Wpedantic -ffp-contract=off \
+  tools/compare_glm53f_field_stream.c -lm -o "$WORK/compare_field_stream"
+python3 tools/compare_glm53f_fields_stream.py "$TP12_PREFIX" "$PP_PREFIX" \
+  --checker "$WORK/compare_field_stream" \
+  --reference-ids "$TP12_IDS" --candidate-ids "$PP_IDS"
+```
+
+Use the repository's `tmp/` directory for `$WORK`. Add `--phase decode` for
+post-decode state or `--bit-exact` for same-layout schedule comparisons.
+The C backend bounds operand buffers and caches16 independent file cursors;
+the Python3.6 frontend validates canonical metadata and reports per-layer
+worst norms. Normal and ASan/UBSan host tests pass, including replica
+corruption and cross-layout fixtures. On actual retry2 captures, failing
+fields and changes match NumPy; worst norms agree within1e-12.

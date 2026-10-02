@@ -1,6 +1,6 @@
 {
   "date": "2026-10-03",
-  "status": "experimental_integration_native_PP_model_pending",
+  "status": "experimental_PP_short_cross_layout_gate_FAILED",
   "layout": "pp3-tp4",
   "cuts": [
     15,
@@ -14,7 +14,7 @@
     "prefill_tok_s": 412.273634,
     "timing_boundary": "historical 8048-prefix control; not directly comparable to new full-prompt timing"
   },
-  "runner_sha256": "e53bf76b40a177780bdbf3b035df810dee216dafd51f7a707e33204cd764ebb4",
+  "runner_sha256": "983210354eba1f33591cae9c5308b7ab0a99093c10c89e492d6afd9ad2459cbb",
   "core_stage_sha256": "0b1643637dd0192239112d72915442b0e5a711f568adffcf201cf40a6cd7f5fa",
   "implemented": [
     "owned component constructors and native images",
@@ -25,7 +25,9 @@
     "source/layout/hash gates",
     "conservative memory preflight with six GiB reserve",
     "canonical prompt/state/route export and offline comparator",
-    "full-prompt and first-readout timing"
+    "full-prompt and first-readout timing",
+    "owned scalar decoder with TP12 bit-exact boundary fixture",
+    "bounded host-only canonical C streaming comparator (Python 3.6 compatible)"
   ],
   "native_pass": {
     "TP12_owned_executor": {
@@ -50,14 +52,25 @@
     "core_reader": "all twelve ranks; row/column/hash rejection",
     "embedding_sizes": 8,
     "pipeline_sequential_steps_per_configuration": 128,
-    "source_and_inventory_configurations": 48
+    "source_and_inventory_configurations": 48,
+    "TP12_owned_scalar_executor": {
+      "positions": 8,
+      "cuts": [
+        15,
+        30
+      ],
+      "streams_state_readout": "bit-exact",
+      "minimum_headroom_GiB": 10.762634
+    }
   },
   "host_pass": [
     "946 legal cut layouts",
     "context reader and ASan/UBSan",
     "40 legacy repack-policy cases",
     "typed-state float and exact-metadata tests",
-    "canonical comparison threshold/nonfinite/zero-norm/coverage/selection/route tests"
+    "canonical comparison threshold/nonfinite/zero-norm/coverage/selection/route tests",
+    "C streaming comparator direct arithmetic/metadata guards and cross-layout fixture: normal and ASan/UBSan PASS; LeakSanitizer disabled under ptrace",
+    "C stream versus NumPy on real retry2 captures: same failing fields and changes, worst relative L2 difference below 1e-12; self comparison bit-exact"
   ],
   "short_TP12_export_self_check": {
     "prefill_fields": 9403,
@@ -66,8 +79,6 @@
   },
   "preserved_failure": "original routed fixture launch used a missing executable; repaired integrated-path native fixtures pass",
   "pending": [
-    "complete PP native staging",
-    "real PP resident load and measured headroom",
     "TP12 versus PP canonical state and exact IDs",
     "serialized versus two-slot exact equality across multiple microbatches",
     "8049, 1024-step stress, short128 and repeated32K gates",
@@ -81,8 +92,164 @@
     "zero_norm": "bit-exact",
     "ids": "exact"
   },
-  "logs": "tmp/strata-pipeline-20261002/{full-driver,repair-fixture-driver,pp-full-driver}.log",
+  "logs": "tmp/strata-pipeline-20261002/{full-driver,repair-fixture-driver,pp-full-driver,pp-scalar-v1-driver,pp-matched-v1-driver}.log; short-matched-{prefill,decode,schedules-prefill,schedules-decode}.json",
   "remote_checkout": "~/work/gemm/glm53f-strata-20261001",
   "stage_root": "/local/glm53f-pp3-tp4-52106727-15-30",
-  "runner_change_after_TP12_gate": "PP-only post-timing stage reductions and accurate owned-cache reporting; TP12 math unchanged"
+  "runner_change_after_TP12_gate": "PP native-only shared readiness, scalar owned decode, rowwise beta GEMM, TP12-matched prefix/last-token boundary; legacy TP12 math unchanged",
+  "native_images": {
+    "all_eight_components_all_twelve_ranks": "PASS",
+    "file_bytes": {
+      "routed": {
+        "0": 13447987200,
+        "1": 13447987200,
+        "10": 16500916224,
+        "11": 16500916224,
+        "2": 13447987200,
+        "3": 13447987200,
+        "4": 16420700160,
+        "5": 16420700160,
+        "6": 16420700160,
+        "7": 16420700160,
+        "8": 16500916224,
+        "9": 16500916224
+      },
+      "dense": {
+        "0": 120324096,
+        "1": 120324096,
+        "10": 0,
+        "11": 0,
+        "2": 120324096,
+        "3": 120324096,
+        "4": 0,
+        "5": 0,
+        "6": 0,
+        "7": 0,
+        "8": 0,
+        "9": 0
+      },
+      "shared": {
+        "0": 80216064,
+        "1": 80216064,
+        "10": 100270080,
+        "11": 100270080,
+        "2": 80216064,
+        "3": 80216064,
+        "4": 100270080,
+        "5": 100270080,
+        "6": 100270080,
+        "7": 100270080,
+        "8": 100270080,
+        "9": 100270080
+      },
+      "kda": {
+        "0": 448708608,
+        "1": 448708608,
+        "10": 411316224,
+        "11": 411316224,
+        "2": 448708608,
+        "3": 448708608,
+        "4": 411316224,
+        "5": 411316224,
+        "6": 411316224,
+        "7": 411316224,
+        "8": 411316224,
+        "9": 411316224
+      },
+      "sparse": {
+        "0": 106954752,
+        "1": 106954752,
+        "10": 142606336,
+        "11": 142606336,
+        "2": 106954752,
+        "3": 106954752,
+        "4": 142606336,
+        "5": 142606336,
+        "6": 142606336,
+        "7": 142606336,
+        "8": 142606336,
+        "9": 142606336
+      },
+      "embed": {
+        "0": 634388480,
+        "1": 634388480,
+        "10": 0,
+        "11": 0,
+        "2": 634388480,
+        "3": 634388480,
+        "4": 0,
+        "5": 0,
+        "6": 0,
+        "7": 0,
+        "8": 0,
+        "9": 0
+      },
+      "head": {
+        "0": 0,
+        "1": 0,
+        "10": 634388480,
+        "11": 634388480,
+        "2": 0,
+        "3": 0,
+        "4": 0,
+        "5": 0,
+        "6": 0,
+        "7": 0,
+        "8": 634388480,
+        "9": 634388480
+      },
+      "core": {
+        "0": 1061907328,
+        "1": 1061907328,
+        "10": 1053355264,
+        "11": 1053355264,
+        "2": 1061907328,
+        "3": 1061907328,
+        "4": 1053346944,
+        "5": 1053346944,
+        "6": 1053346944,
+        "7": 1053346944,
+        "8": 1053355264,
+        "9": 1053355264
+      }
+    }
+  },
+  "first_PP_load": {
+    "minimum_MemAvailable_GiB": 11.53125,
+    "source_and_payload_checks": "PASS",
+    "prefill": "failed in stage0 callback; preserved original log",
+    "fix": "batch readiness must accept native shared image without legacy FP8 shared blob",
+    "retry_pid": 9451,
+    "retry_runner_sha256": "e12d4893ff74ad8be9b61616136ad125840b4ffe983ef8e7a384e79d6ac58a72"
+  },
+  "short_PP_matched_v1": {
+    "terminal_driver_pid": 10241,
+    "prompt_tokens": 128,
+    "generated_tokens": 129,
+    "decode_transitions": 128,
+    "microbatch": 512,
+    "minimum_MemAvailable_GiB": 11.047729,
+    "ids_exact": false,
+    "first_id_mismatch_zero_based": 19,
+    "reference_token": 279,
+    "candidate_token": 1817,
+    "prefill": {
+      "fields": 9403,
+      "failed_fields": 8879,
+      "worst_field": "prompt32.stream2",
+      "worst_relative_l2": 0.5283578002551788,
+      "layer0_worst_relative_l2": 0.0,
+      "layer1_worst_relative_l2": 0.0004914237475638933,
+      "layer2_worst_relative_l2": 0.004461501252951867
+    },
+    "post_decode": {
+      "fields": 8763,
+      "failed_fields": 8752,
+      "worst_field": "layer0.head16.state",
+      "worst_relative_l2": 3.4331042147968875
+    },
+    "serialized_two_slot_prefill": "bit-exact including IDs and route/selection fields; prefix fits one microbatch, not a multiple-microbatch qualification",
+    "serialized_two_slot_post_decode": "bit-exact all8763 canonical fields including IDs/routes/selections after128 transitions",
+    "performance": "diagnostic export timings only; no qualified throughput",
+    "next_investigation": "isolate layer0/1 dense and KDA output projections and TP4 reduction arithmetic with identical inputs; current state capture does not identify the offending projection"
+  }
 }

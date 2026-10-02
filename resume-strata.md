@@ -5,7 +5,7 @@ Updated 2026-10-03. Capacity4096 remains the promoted TP12 recipe:
 The approved prefill-first PP3×TP4 architecture is being implemented.
 Distribution/pipeline foundations pass native12-node correctness. Routed
 4×512 native slicing passes24 exact cases across six formats; real-model
-metadata-only sizing passes all12 ranks. Real PP model qualification is pending.
+metadata-only sizing passes all12 ranks. Real PP short cross-layout correctness fails; qualification is incomplete.
 PJM52106727 is the fresh12-node normal2GHz/eco0 allocation, bridge42446→32446→21264,
 host d25-0010s, isolated checkout unchanged. Local launcher tmux socket is
 `tmp/tmux-glm53f/pp1.sock`, session`glm53f-pp1`. PJM52097252 has expired.
@@ -19,33 +19,56 @@ minimum headroom9.036316GiB. Canonical full-prompt means/streams, per-head
 state and post-decode fields plus route/selection diagnostics are implemented;
 host rejection tests and the legacy40-case repack policy pass.
 
-**Active queue (04:00 JST):** native repair fixtures PID7928 have passed.
-Guarded PP driver **PID8053** now follows that sentinel, first checks the new
-TP12 graph against frozen full-state traces and captures a short TP12 control,
-then stages owned PP images, then short serialized/two-slot PP captures.
-Logs/scripts are in `tmp/strata-pipeline-20261002/`; stage root
-`/local/glm53f-pp3-tp4-52106727-15-30`, frozen binaries
-`a64fx/glm5/build/pp-native-v1`. Strict runner SHA
-`e53bf76b40a177780bdbf3b035df810dee216dafd51f7a707e33204cd764ebb4`.
-The rebuilt TP12 full-state regression and short diagnostic control have passed.
-Owned routed staging is active; per-stage prefill compute/receive/send-wait
-maxima are now reported by the runner to guide cut balancing. The staged
-`pp-canonical-driver.sh` requires `short-pp-canonical.pass` from local comparisons
-before any full8049 TP12/PP serialized1024 or two-slot512/1024/2048 exports.
- native image/source/inventory fixture passes48
-configurations on `/local`. Core conversion releases complete source tensors
-and bounds dirty writeback; current core-stager SHA
-`0b1643637dd0192239112d72915442b0e5a711f568adffcf201cf40a6cd7f5fa`.
-PJM52106727 expires about06:23 JST; driver cutoff05:55. Never overlap MPI
-with this queue. Earlier551/854/2130/2556/6270 queues are terminal; the original
-routed fixture launch pointed to a missing binary, its failed log is preserved,
-and the repaired integrated-path fixtures pass. Do not require its failed
-sentinel or revive an earlier queue.
+**Native status (05:10 JST):** all eight PP image components on all12 ranks
+are staged. All drivers through matched-v1 PID10241 are terminal. The first
+model load passed source/hash checks with11.531250GiB headroom, then exposed
+an incorrect MoE guard requiring a legacy shared blob for native-only PP.
+The guard and null legacy-pointer arithmetic are fixed. Fresh immutable
+runner paths are required: one same-path retry failed to pick up diagnostics.
 
-Real PP resident load and cross-layout/state/ID validation remain pending;
-no PP throughput or promotion exists. Fresh timing must use full prompt plus
-first readout for both layouts;129 output IDs measure128 post-prompt decode
-transitions. Inspect the exact process and terminal sentinels before proceeding.
+Owned scalar execution now matches TP12 streams/state/readout bit-exact over
+8 positions and cuts15,30 (minimum10.762634GiB). PP beta projection retains
+the TP12 rowwise GEMM path; PP prefill now batches count-1 positions and uses
+scalar kernels for the last prompt token, including both within timing.
+Legacy TP12 scalar arithmetic is unchanged.
+
+**Short PP correctness FAILS.** Matched-v1 serialized/two-slot runs completed
+128 prompt positions and128 decode transitions. IDs first differ at zero-based
+index19: TP12=279, PP=1817. Prefill compares9403 fields:8879 fail; worst
+prompt32.stream2 rel-L2=0.5283578003. Layer0 is bit-exact; layer1 worst is
+0.0004914237, layer2 worst0.0044615013 (first tolerance failure). Post-decode
+has8752 failed fields of8763, worstlayer0.head16.state rel-L2=3.4331042148.
+Route/selection changes are recorded. Serialized/two-slot prefill is bit-exact
+including IDs, routes and selections, but the prefix fits one microbatch;
+this does not establish multiple-microbatch equivalence. Post-decode schedule comparison also passes all8763 canonical fields
+bit-exact after128 transitions. These diagnostic timings are not
+qualified performance. Do not create correctness sentinels or promote PP.
+
+Logs/scripts: `tmp/strata-pipeline-20261002/`; stage root
+`/local/glm53f-pp3-tp4-52106727-15-30`; binaries
+`a64fx/glm5/build/pp-native-v1`. Immutable `glm53f_pp_runner_matched_v1` SHA
+`983210354eba1f33591cae9c5308b7ab0a99093c10c89e492d6afd9ad2459cbb`.
+Core-stager SHA
+`0b1643637dd0192239112d72915442b0e5a711f568adffcf201cf40a6cd7f5fa`.
+Core conversion releases complete source tensors and bounds dirty writeback.
+Source/inventory fixture passes48 `/local` configurations. TP12 rebuilt
+full-state regression and short export control pass.
+
+`tools/compare_glm53f_fields_stream.py --checker BINARY` uses only Python3.6
+stdlib and bounded C buffers. Run it directly on Fugaku login against shared
+captures; avoid downloading multi-GiB 8K exports. Strict host GCC and normal/
+ASan/UBSan math, replica, metadata and cross-layout tests pass; LeakSanitizer
+is disabled under ptrace. Real retry2 results match NumPy failing field sets,
+changes and worst norms within1e-12; same-file self tests are bit-exact.
+
+The full/performance/stress drivers are staged, not launched: short and full
+canonical sentinels are absent. They still reference retry2; update to a
+passing immutable candidate before use. Their ID checks now compare parsed
+integers (TP12 writes spaces, PP writes lines). Allocation expires~06:23 JST,
+new-run cutoff05:55; never overlap MPI. Next: isolate dense and KDA output
+projections and TP4 reduction arithmetic at layers0/1 using identical inputs.
+Exact layer0 state and first layer2 failure suggest partition-dependent
+arithmetic, but do not identify the offending projection.
 
 Previous queued experiments are terminal and none is promoted: KDA columns
 passes full-state/8049 gates, but independent five-trial confirmation gives
@@ -72,7 +95,7 @@ build includes both fixtures. See
 [a64fx/glm5/GLM53F_PIPELINE.md](a64fx/glm5/GLM53F_PIPELINE.md) for exact commands,
 binary hash, protocol and remaining implementation. Full-model constructors,
 PP native staging, 16-head MLA, canonical state export and runner integration
-are implemented; real PP image/load/performance qualification remains pending; no PP model throughput is claimed. TP12 remains promoted
+are implemented; real PP image/load pass, but short cross-layout correctness fails; no PP model throughput is claimed. TP12 remains promoted
 at35.462134 decode /412.273634 prefill tok/s; neither target is met.
 
 ## Active continuation (October 2, afternoon)
