@@ -155,6 +155,9 @@ typedef struct {
     int use_moe;
     int n_vocab;
     int max_seq_len;
+    /* Optional valid-prefix key count for padded query extraction through
+     * transformer_forward_partial's standard attention path. Zero disables. */
+    int partial_attention_key_limit;
     float rope_freq_base;
     float rms_norm_eps;
 
@@ -9317,6 +9320,8 @@ static float *tf_forward_blocks_range(transformer_model *m, int position, int po
             /* Multi-head attention with GQA */
             TF_PROF_BEGIN("attention", l, "attention", "FP32");
             int seq_len = position + 1;
+            if (m->partial_attention_key_limit > 0 && seq_len > m->partial_attention_key_limit)
+                seq_len = m->partial_attention_key_limit;
             float scale = 1.0f / sqrtf((float)head_dim);
 
             if (m->n_threads > 1 && n_heads >= m->n_threads && m->pool_alive) {

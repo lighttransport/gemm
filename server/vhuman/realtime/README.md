@@ -193,39 +193,62 @@ tmp/vhuman-rig-venv/bin/python -m server.vhuman.cli \
 
 The command above explicitly selects the offline Torch reference provider.
 The default `--identity-backend native` invokes the existing C/CUDA FLUX.2
-runner for a neutral portrait. It requires hashed, locally staged assets:
+runner for a neutral portrait and, with `--expressions`, twelve image-conditioned
+expression portraits. It requires hashed, locally staged assets:
 
 ```sh
 make -C cuda/flux2
+python ref/vhuman/export_flux2_weights.py \
+  --source /path/to/FLUX.2-klein-4B/transformer/diffusion_pytorch_model.safetensors \
+  --output tmp/vhuman-realtime/flux2-dit-bf16.safetensors
 python ref/vhuman/export_flux2_tokenizer.py \
   --source /path/to/FLUX.2-klein-4B/tokenizer \
   --output tmp/vhuman-realtime/flux2-tokenizer.gguf
 python -m server.vhuman.realtime.src.avatar.native_identity \
-  --dit /path/to/dit.safetensors --vae /path/to/vae.safetensors \
+  --dit tmp/vhuman-realtime/flux2-dit-bf16.safetensors --vae /path/to/vae.safetensors \
   --encoder /path/to/text_encoder --tokenizer tmp/vhuman-realtime/flux2-tokenizer.gguf \
   --revision SOURCE_REVISION --output tmp/vhuman-realtime/flux2-assets.json
 python -m server.vhuman.realtime generate-identity \
   --native-assets tmp/vhuman-realtime/flux2-assets.json \
-  --output tmp/vhuman-realtime/native-neutral
+  --output tmp/vhuman-realtime/native-identity --expressions
 ```
 
 The tokenizer exporter uses only Python's standard library and writes source/output
 hash receipts. Its token IDs, including the non-thinking chat template, were
 checked against the pinned Qwen tokenizer for English and Japanese prompts.
-The adapter explicitly selects BF16 DiT weights and repository GEMM; expanding
-the whole DiT to FP32 exceeds the 16 GB target. HF snapshot symlinks are accepted
-only after verifying their content hashes.
+The adapter selects F16 DiT computation and repository GEMM for the 16 GB
+budget. The exporter preserves source BF16 bytes while changing tensor names,
+concatenating QKV and permuting the final scale/shift rows; the runner converts
+weights to F16 during upload. HF snapshot
+symlinks are accepted only after verifying their content hashes.
 
-The native adapter never downloads weights or switches to Torch. Full Diffusers
-conditioning parity remains open: the current native runner zero-pads compact
-text features, whereas Diffusers retains hidden states for padding queries.
-The 5060 Ti BF16 smoke run produced a 512x512 portrait: CPU text encoding106.8s,
-CUDA/model setup65.9s, four denoising steps6.0s and VAE decode1.0s. The image has
-low contrast and patterned skin artifacts; it is not accepted as a quality or
-parity result. Output and hashed receipts are in
-`tmp/vhuman-native-renderer/native-neutral-bf16/`.
-Image-conditioned expression generation still requires the explicit reference provider; passing
-`--expressions` to the native provider fails with a clear message.
+The native adapter never downloads weights or switches to Torch. It uses
+Diffusers' 512 right-padded text queries, masks padding keys, normalizes VAE
+reference latents and assigns reference tokens time coordinate 10. The generated
+neutral portrait is the sole image reference for every expression. Each completed
+image is checkpointed with its prompt, controls, seed and conditioning hash;
+`--resume` can extend a neutral-only identity or continue interrupted expressions.
+Approximate expression labels still require visual review.
+
+The independent FP32 Qwen comparison passed with relative L2 `1.29e-5`, including
+padding-query states. Full four-step distilled-4B comparisons passed using original
+BF16 DiT weights and independently computed FP32 Qwen/DiT/VAE references:
+
+| CPU text conditioning | Final latent relative L2 | Decoded RGB relative L2 |
+|---|---:|---:|
+| Text-to-image, 512 square | 0.002419 | 0.002299 |
+| One reference image, 512 square | 0.004878 | 0.001673 |
+
+Every intermediate velocity and Euler latent passed the 2% relative-L2 gate.
+The image encoder alone had relative L2 `0.006803` against FP32. Validation uses
+`ref/vhuman/verify_flux2.py`, outside inference; receipts and tensors are under
+`tmp/vhuman-flux2-parity/`. The adapter still uses CPU text extraction pending the final image comparison
+for CUDA text. CUDA Qwen now uses FP32 KV storage and corrected IEEE half
+weight conversion; its full padded features match FP32 with relative L2
+`2.35e-5`. The old converter discarded half subnormals, and old F16 sidecar
+caches are invalidated by a format-version bump. The converter passes exhaustive
+BF16/F16 and half-rounding-boundary checks against x86 F16C hardware. Earlier compact
+text/FP8 smoke outputs are not parity or quality evidence for this recipe.
 
 Reference generator: [Apache FLUX.2-klein-4B](https://huggingface.co/black-forest-labs/FLUX.2-klein-4B)
 at `e7b7dc27f91deacad38e78976d1f2b499d76a294`. Model CPU offload limits peak VRAM.

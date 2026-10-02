@@ -49,6 +49,13 @@ int cuda_llm_load_weights_gemma4_safetensors(cuda_llm_runner *r,
 /* Run one token through the transformer. Returns pointer to F32 hidden state [n_embd].
  * The returned pointer is valid until the next call (host-side buffer). */
 float *cuda_llm_forward(cuda_llm_runner *r, int32_t token_id, int position);
+
+/* Single-query encoder extraction: preserve RoPE position, attend only to keys
+ * [0, min(position+1, key_limit)). Standard attention only; no persistent mask. */
+float *cuda_llm_forward_masked(cuda_llm_runner *r, int32_t token_id, int position, int key_limit);
+/* Dedicated encoder mode: replace/clear the standard KV cache with FP32.
+ * Disables decode graphs; supports sequential forward only (prefill rejects). */
+int cuda_llm_enable_encoder_f32_cache(cuda_llm_runner *r);
 int cuda_llm_forward_nohost(cuda_llm_runner *r, int32_t token_id, int position);
 
 /* Run one token and return logits [n_vocab]. Applies lm_head after hidden state.

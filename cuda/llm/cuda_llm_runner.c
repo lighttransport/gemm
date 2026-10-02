@@ -8,6 +8,7 @@
  */
 
 #include "cuda_llm_runner.h"
+#include "half_convert.h"
 #include "../cuew.h"
 #include "../cublasew.h"
 #include "../cuda_runner_common.h"
@@ -447,6 +448,74 @@ static const char *cuda_kernel_source =
 "        float acc = 0.0f;\n"
 "        for (int t = 0; t < seq_len; t++)\n"
 "            acc += scores[t] * half_to_float(value_cache[(size_t)t * kv_dim + kv_h * head_dim + d]);\n"
+"        out_h[d] = acc;\n"
+"    }\n"
+"}\n"
+"\n"
+"/* Encoder-only FP32 KV: padded queries amplify F16 cache rounding. */\n"
+"__global__ void kv_cache_store_f32(float *kc, float *vc, const float *k, const float *v, int pos, int dim) {\n"
+"    int i=blockIdx.x*blockDim.x+threadIdx.x;\n"
+"    if(i<dim) { kc[(size_t)pos*dim+i]=k[i]; vc[(size_t)pos*dim+i]=v[i]; }\n"
+"}\n"
+"__global__ void attn_decode_kv32(float *out, const float *q,\n"
+"                                 const float *key_cache, const float *value_cache,\n"
+"                                 int n_heads, int n_kv_heads, int head_dim,\n"
+"                                 int kv_dim, int seq_len, float scale) {\n"
+"    extern __shared__ float smem[];\n"
+"    int h = blockIdx.x;\n"
+"    if (h >= n_heads) return;\n"
+"    int tid = threadIdx.x;\n"
+"    int nthreads = blockDim.x;\n"
+"    int gqa_ratio = n_heads / n_kv_heads;\n"
+"    int kv_h = h / gqa_ratio;\n"
+"    const float *q_h = q + h * head_dim;\n"
+"    int warp_id = tid / 32, lane = tid % 32;\n"
+"\n"
+"    /* Pass 1: QK scores with fused online softmax max+sum */\n"
+"    float *scores = smem;\n"
+"    float local_max = -1e30f;\n"
+"    for (int t = tid; t < seq_len; t += nthreads) {\n"
+"        const float *k_t = key_cache + (size_t)t * kv_dim + kv_h * head_dim;\n"
+"        float s = 0.0f;\n"
+"        for (int d = 0; d < head_dim; d++) s += q_h[d] * k_t[d];\n"
+"        s *= scale;\n"
+"        scores[t] = s;\n"
+"        if (s > local_max) local_max = s;\n"
+"    }\n"
+"    /* Cross-warp max reduction */\n"
+"    for (int off = 16; off > 0; off >>= 1)\n"
+"        local_max = fmaxf(local_max, __shfl_down_sync(0xFFFFFFFF, local_max, off));\n"
+"    __shared__ float wm[8];\n"
+"    if (lane == 0) wm[warp_id] = local_max;\n"
+"    __syncthreads();\n"
+"    if (tid == 0) { float m = wm[0]; for (int w = 1; w < (nthreads+31)/32; w++) if(wm[w]>m) m=wm[w]; wm[0]=m; }\n"
+"    __syncthreads();\n"
+"    float max_val = wm[0];\n"
+"\n"
+"    /* Exp + sum (fused) */\n"
+"    float local_sum = 0.0f;\n"
+"    for (int t = tid; t < seq_len; t += nthreads) {\n"
+"        float e = expf(scores[t] - max_val);\n"
+"        scores[t] = e;\n"
+"        local_sum += e;\n"
+"    }\n"
+"    for (int off = 16; off > 0; off >>= 1)\n"
+"        local_sum += __shfl_down_sync(0xFFFFFFFF, local_sum, off);\n"
+"    __shared__ float ws[8];\n"
+"    if (lane == 0) ws[warp_id] = local_sum;\n"
+"    __syncthreads();\n"
+"    if (tid == 0) { float s = 0.0f; for (int w = 0; w < (nthreads+31)/32; w++) s+=ws[w]; ws[0]=1.0f/s; }\n"
+"    __syncthreads();\n"
+"    float inv_sum = ws[0];\n"
+"    for (int t = tid; t < seq_len; t += nthreads) scores[t] *= inv_sum;\n"
+"    __syncthreads();\n"
+"\n"
+"    /* Pass 2: V accumulation */\n"
+"    float *out_h = out + h * head_dim;\n"
+"    for (int d = tid; d < head_dim; d += nthreads) {\n"
+"        float acc = 0.0f;\n"
+"        for (int t = 0; t < seq_len; t++)\n"
+"            acc += scores[t] * value_cache[(size_t)t * kv_dim + kv_h * head_dim + d];\n"
 "        out_h[d] = acc;\n"
 "    }\n"
 "}\n"
@@ -4397,25 +4466,17 @@ static const char *cuda_kernel_source =
 "    if (i < n) out[i] = half_to_float(in[i]);\n"
 "}\n"
 "\n"
-"__device__ __forceinline__ unsigned short bf16_to_f16_trunc(unsigned short v) {\n"
+"__device__ __forceinline__ unsigned short bf16_to_f16_rn(unsigned short v) {\n"
 "    unsigned int bits = ((unsigned int)v) << 16;\n"
-"    unsigned short sign = (unsigned short)((bits >> 16) & 0x8000u);\n"
-"    int exp = (int)((bits >> 23) & 0xffu) - 127;\n"
-"    unsigned int mant = bits & 0x7fffffu;\n"
-"    if (exp > 15) return (unsigned short)(sign | 0x7c00u);\n"
-"    if (exp < -14) {\n"
-"        if (exp < -24) return sign;\n"
-"        mant |= 0x800000u;\n"
-"        mant >>= (-1 - exp);\n"
-"        return (unsigned short)(sign | (unsigned short)(mant >> 13));\n"
-"    }\n"
-"    return (unsigned short)(sign | (unsigned short)((exp + 15) << 10) | (unsigned short)(mant >> 13));\n"
+"    float number;\n"
+"    asm(\"mov.b32 %0, %1;\" : \"=f\"(number) : \"r\"(bits));\n"
+"    return float_to_half(number);\n"
 "}\n"
 "\n"
 "__global__ void bf16_to_f16_inplace(unsigned short *data, int n) {\n"
 "    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
 "    if (i >= n) return;\n"
-"    data[i] = bf16_to_f16_trunc(data[i]);\n"
+"    data[i] = bf16_to_f16_rn(data[i]);\n"
 "}\n"
 "\n"
 "/* Batched F16 embedding lookup: output[token, i] = embd[token_ids[token], i] */\n"
@@ -8890,6 +8951,7 @@ struct cuda_llm_runner {
     CUfunction fn_kv_cache_store_q8;
     CUfunction fn_attn_decode_q8;
     CUfunction fn_attn_decode_f32;
+    CUfunction fn_attn_decode_kv32, fn_kv_cache_store_f32;
     CUfunction fn_silu_mul_f32;
     CUfunction fn_add_f32;
     CUfunction fn_quantize_f32_to_int8;
@@ -9069,6 +9131,8 @@ struct cuda_llm_runner {
     int n_deepstack;        /* number of deepstack layers (VLM injection, 0 = none) */
     int hidden_snapshot_layers[3];
     int n_hidden_snapshots;
+    int decode_key_limit;  /* Scoped by cuda_llm_forward_masked; zero normally. */
+    int encoder_cache_f32; /* Dedicated sequential encoder extraction. */
 
     /* Hybrid SSM params (Qwen3.5) */
     int is_hybrid;
@@ -9532,6 +9596,8 @@ lookup_funcs:
     GET_FUNC(kv_cache_store_q8);
     GET_FUNC(attn_decode_q8);
     GET_FUNC(attn_decode_f32);
+    GET_FUNC(attn_decode_kv32);
+    GET_FUNC(kv_cache_store_f32);
     GET_FUNC(silu_mul_f32);
     GET_FUNC(add_f32);
     GET_FUNC(quantize_f32_to_int8);
@@ -10099,7 +10165,6 @@ static int upload_norm_f32(cuda_llm_runner *r, CUdeviceptr *d_ptr, const qtensor
 /* Upload Q8_0 tensor data to GPU with padding for alignment.
  * Each 34-byte Q8_0 block (2B scale + 32B qs) is padded to 36 bytes
  * (2B scale + 2B pad + 32B qs) so int32 reads of qs data are 4-byte aligned. */
-static uint16_t cllm_f32_to_f16(float f);
 
 static int upload_q8_0_raw(cuda_llm_runner *r, CUdeviceptr *d_ptr, const qtensor *t) {
     if (!t->data) { *d_ptr = 0; return 0; }
@@ -10218,39 +10283,6 @@ static int upload_kquant_raw_bm(CUdeviceptr *d_ptr_bm, const qtensor *t, int bm_
     return 0;
 }
 
-/* F32 → F16 conversion (truncation, no rounding) */
-static uint16_t cllm_f32_to_f16(float f) {
-    union { float f; uint32_t i; } u;
-    u.f = f;
-    uint32_t x = u.i;
-    uint16_t sign = (uint16_t)((x >> 16) & 0x8000);
-    int32_t exp = ((x >> 23) & 0xFF) - 127;
-    uint32_t mant = x & 0x7FFFFF;
-    if (exp > 15) return sign | 0x7C00;
-    if (exp < -14) {
-        if (exp < -24) return sign;
-        mant |= 0x800000;
-        mant >>= (-1 - exp);
-        return sign | (uint16_t)(mant >> 13);
-    }
-    return sign | (uint16_t)((exp + 15) << 10) | (uint16_t)(mant >> 13);
-}
-
-static uint16_t cllm_bf16_to_f16(uint16_t v) {
-    uint32_t bits = (uint32_t)v << 16;
-    uint16_t sign = (uint16_t)((bits >> 16) & 0x8000);
-    int32_t exp = (int32_t)((bits >> 23) & 0xFF) - 127;
-    uint32_t mant = bits & 0x7FFFFF;
-    if (exp > 15) return sign | 0x7C00;
-    if (exp < -14) {
-        if (exp < -24) return sign;
-        mant |= 0x800000;
-        mant >>= (-1 - exp);
-        return sign | (uint16_t)(mant >> 13);
-    }
-    return sign | (uint16_t)((exp + 15) << 10) | (uint16_t)(mant >> 13);
-}
-
 static float cllm_fp8_e4m3_to_f32(uint8_t b) {
     uint32_t sign = (b >> 7) & 1u;
     uint32_t exp  = (b >> 3) & 0xFu;
@@ -10366,7 +10398,7 @@ typedef struct {
 static cllm_f16cache_t g_f16cache = {0};
 
 #define CLLM_F16CACHE_MAGIC 0x43464C4331u  /* "1CLFC" */
-#define CLLM_F16CACHE_VERSION 3u
+#define CLLM_F16CACHE_VERSION 4u
 
 static uint64_t cllm_f16cache_hash64(const void *data, size_t n, uint64_t h) {
     const uint8_t *p = (const uint8_t *)data;
@@ -12910,7 +12942,8 @@ static inline void launch_kv_store(cuda_llm_runner *r, CUdeviceptr key_cache, CU
                                     CUdeviceptr k, CUdeviceptr v, int position, int kv_dim) {
     if (r->kv_cache_q8) return; /* Q8 path handles store separately */
     int use_ptr = !r->disable_graph && r->d_pos_seq;
-    CUfunction fn = use_ptr ? r->fn_kv_cache_store_f16_ptr : r->fn_kv_cache_store_f16;
+    CUfunction fn = r->encoder_cache_f32 ? r->fn_kv_cache_store_f32
+                     : use_ptr ? r->fn_kv_cache_store_f16_ptr : r->fn_kv_cache_store_f16;
     void *pos_arg = use_ptr ? (void*)&r->d_pos_seq : (void*)&position;
     void *args[] = { &key_cache, &value_cache, &k, &v, pos_arg, &kv_dim };
     cuLaunchKernel(fn, (kv_dim + 255) / 256, 1, 1, 256, 1, 1, 0, r->stream, args, NULL);
@@ -12932,9 +12965,12 @@ static inline void launch_attention(cuda_llm_runner *r, CUdeviceptr out, CUdevic
                                      CUdeviceptr key_cache, CUdeviceptr value_cache,
                                      int n_heads, int n_kv_heads, int head_dim,
                                      int kv_dim, int seq_len, float scale) {
+    if (r->decode_key_limit > 0 && seq_len > r->decode_key_limit)
+        seq_len = r->decode_key_limit;
     int use_ptr = !r->disable_graph && r->d_pos_seq;
     /* Use pointer variant only for graph capture/replay. */
-    CUfunction fn = use_ptr ? r->fn_attn_decode_f32_ptr : r->fn_attn_decode_f32;
+    CUfunction fn = r->encoder_cache_f32 ? r->fn_attn_decode_kv32
+                     : use_ptr ? r->fn_attn_decode_f32_ptr : r->fn_attn_decode_f32;
     /* seq_len is at d_seq_ptr (d_pos_seq[1]), pre-computed for graph-capture persistence */
     void *sl_arg = use_ptr ? (void*)&r->d_seq_ptr : (void*)&seq_len;
     size_t smem = (use_ptr ? (size_t)r->max_seq_len : seq_len) * sizeof(float);
@@ -13737,6 +13773,54 @@ static float *cuda_llm_forward_blocks(cuda_llm_runner *r, int position, int appl
 static float *cuda_llm_prefill_sequential(cuda_llm_runner *r, const int32_t *token_ids,
                                            const float *embeddings, int embd_stride,
                                            int n_tokens, int start_pos);
+
+int cuda_llm_enable_encoder_f32_cache(cuda_llm_runner *r) {
+    if (!r || !r->weights_loaded || r->is_hybrid || r->is_gemma4 || r->kv_cache_q8 ||
+        cuda_llm_bind_context(r) != 0) return -1;
+    if (r->encoder_cache_f32) return 0;
+    CUdeviceptr *keys = calloc(r->n_layers, sizeof(CUdeviceptr));
+    CUdeviceptr *values = calloc(r->n_layers, sizeof(CUdeviceptr));
+    size_t bytes = (size_t)r->max_seq_len * r->n_kv_heads * r->head_dim * sizeof(float);
+    if (!keys || !values) goto fail;
+    for (int l = 0; l < r->n_layers; l++) {
+        if (cuMemAlloc(&keys[l], bytes) != CUDA_SUCCESS ||
+            cuMemAlloc(&values[l], bytes) != CUDA_SUCCESS ||
+            cuMemsetD8(keys[l], 0, bytes) != CUDA_SUCCESS ||
+            cuMemsetD8(values[l], 0, bytes) != CUDA_SUCCESS) goto fail;
+    }
+    if (cuStreamSynchronize(r->stream) != CUDA_SUCCESS) goto fail;
+    for (int l = 0; l < r->n_layers; l++) {
+        cuMemFree(r->d_key_cache[l]);
+        cuMemFree(r->d_value_cache[l]);
+    }
+    free(r->d_key_cache); free(r->d_value_cache);
+    r->d_key_cache = keys; r->d_value_cache = values;
+    r->encoder_cache_f32 = 1;
+    r->disable_graph = 1;
+    return 0;
+fail:
+    for (int l = 0; l < r->n_layers; l++) {
+        if (keys && keys[l]) cuMemFree(keys[l]);
+        if (values && values[l]) cuMemFree(values[l]);
+    }
+    free(keys); free(values);
+    return -1;
+}
+
+float *cuda_llm_forward_masked(cuda_llm_runner *r, int32_t token_id, int position, int key_limit) {
+    if (!r || key_limit < 1 || key_limit > r->max_seq_len ||
+        r->is_hybrid || r->is_gemma4 || r->kv_cache_q8) return NULL;
+    /* A decode graph captures scalar mask parameters. Keep this scoped path
+     * outside graph replay, including the pointer attention kernel variant. */
+    int saved_graph = r->disable_graph;
+    int saved_limit = r->decode_key_limit;
+    r->disable_graph = 1;
+    r->decode_key_limit = key_limit;
+    float *result = cuda_llm_forward(r, token_id, position);
+    r->decode_key_limit = saved_limit;
+    r->disable_graph = saved_graph;
+    return result;
+}
 
 float *cuda_llm_forward(cuda_llm_runner *r, int32_t token_id, int position) {
     if (!r || !r->weights_loaded) return NULL;
@@ -17546,7 +17630,7 @@ static float *cuda_llm_prefill_sequential(cuda_llm_runner *r, const int32_t *tok
 float *cuda_llm_prefill(cuda_llm_runner *r, const int32_t *token_ids,
                          const float *embeddings, int embd_stride,
                          int n_tokens, int start_pos) {
-    if (!r || n_tokens <= 0) return NULL;
+    if (!r || n_tokens <= 0 || r->encoder_cache_f32) return NULL;
     if (cuda_llm_bind_context(r) != 0) return NULL;
 
     if (r->is_hybrid && !r->is_gemma4) {
@@ -19087,7 +19171,8 @@ int cuda_llm_reset_state(cuda_llm_runner *r) {
                 cu_async_zero(r->d_value_cache[l], kv_cache_bytes, r->stream, "cuda_llm value_cache");
             }
         } else if (kv_dim > 0) {
-            size_t kv_cache_bytes = (size_t)r->max_seq_len * kv_dim * sizeof(uint16_t);
+            size_t kv_cache_bytes = (size_t)r->max_seq_len * kv_dim *
+                                    (r->encoder_cache_f32 ? sizeof(float) : sizeof(uint16_t));
             for (int l = 0; l < r->n_layers; l++) {
                 cu_async_zero(r->d_key_cache[l],   kv_cache_bytes, r->stream, "cuda_llm key_cache");
                 cu_async_zero(r->d_value_cache[l], kv_cache_bytes, r->stream, "cuda_llm value_cache");

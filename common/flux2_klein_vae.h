@@ -95,7 +95,7 @@ typedef struct {
      * Applied as: latent_p[c] = latent_p[c] * bn_std[c] + bn_mean[c] */
     float *bn_mean;  /* [128] */
     float *bn_var;   /* [128] */
-    float  bn_eps;   /* 1e-5 */
+    float  bn_eps;   /* 1e-4 */
     int    bn_n_ch;  /* 128 = latent_channels * patch_size^2 */
 
     void *st_ctx;  /* safetensors context (kept for mmap lifetime) */
@@ -509,7 +509,7 @@ flux2_vae_model *flux2_vae_load(const char *path) {
     /* Batch norm parameters for latent de-normalization (patchified space, 128 ch) */
     m->bn_mean = flux2_vae_load_tensor(st, "bn.running_mean", NULL);
     m->bn_var  = flux2_vae_load_tensor(st, "bn.running_var",  NULL);
-    m->bn_eps  = 1e-5f;
+    m->bn_eps  = 1e-4f;  /* pinned AutoencoderKLFlux2 batch_norm_eps */
     /* bn_n_ch = latent_channels * 4 (for 2x2 patchification) */
     m->bn_n_ch = m->bn_mean ? 128 : 0;
 
@@ -629,6 +629,7 @@ void flux2_vae_free(flux2_vae_model *m) {
     free(m->conv_in_w); free(m->conv_in_b);
     free(m->norm_out_w); free(m->norm_out_b);
     free(m->conv_out_w); free(m->conv_out_b);
+    free(m->bn_mean); free(m->bn_var);
     /* mid_block */
 #define FREE_RB(rb) do { \
     free(rb.norm1_w); free(rb.norm1_b); \
@@ -667,11 +668,8 @@ void flux2_vae_decode(float *rgb_out, const float *latent,
     int lc = m->latent_channels;
     int ng = m->num_groups;
     int h = lat_h, w = lat_w;
-    /* NOTE: The BN stats (bn.running_mean/var) in the safetensors are training
-     * artifacts and should NOT be applied during inference. The DiT outputs
-     * latents already in the correct space for the VAE decoder. Applying the
-     * BN denormalization (latent * sqrt(var) + mean) over-saturates the image
-     * and introduces visible artifacts. Verified against diffusers VAE. */
+    /* This API takes raw VAE latents. The pipeline must undo DiT latent batch
+     * normalization before calling it, matching AutoencoderKLFlux2.decode. */
     float *latent_bn = (float *)malloc((size_t)lc * lat_h * lat_w * sizeof(float));
     memcpy(latent_bn, latent, (size_t)lc * lat_h * lat_w * sizeof(float));
     latent = latent_bn;

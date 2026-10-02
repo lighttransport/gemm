@@ -47,11 +47,14 @@ $(MMVQ_CUBIN): mmvq_kernels.cu mmq_vendor/mmvq.cuh
 	$(NVCC) -cubin -arch=sm_120a -std=c++17 -O3 $(MMQ_INCLUDES) -o $@ $<
 
 $(TARGET): $(TEST_SRC) $(RUNNER_SRC) $(CUEW_SRC) $(CUBLASEW_SRC) $(MOE_CUBIN) $(FA2_CUBIN) \
-          cuda_llm_runner.h ../cuew.h ../cublasew.h
+          cuda_llm_runner.h half_convert.h ../cuew.h ../cublasew.h
 	$(CC) $(CFLAGS) -o $@ $(TEST_SRC) $(RUNNER_SRC) $(CUEW_SRC) $(CUBLASEW_SRC) $(LDFLAGS)
 
+test_half_convert: test_half_convert.c half_convert.h
+	$(CC) -O2 -Wall -Wextra -Wpedantic -mf16c -o $@ $< -lm
+
 test_gemma4_st: test_gemma4_st.c $(RUNNER_SRC) $(CUEW_SRC) $(CUBLASEW_SRC) $(MOE_CUBIN) $(FA2_CUBIN) \
-          cuda_llm_runner.h ../cuew.h ../cublasew.h \
+          cuda_llm_runner.h half_convert.h ../cuew.h ../cublasew.h \
           ../../common/gemma4_audio_encoder.h ../../common/gemma4_audio_mel.h
 	$(CC) $(CFLAGS) -o $@ test_gemma4_st.c $(RUNNER_SRC) $(CUEW_SRC) $(CUBLASEW_SRC) $(LDFLAGS)
 
@@ -59,7 +62,7 @@ run: $(TARGET)
 	@echo "Usage: ./$(TARGET) <model.gguf> [-t \"prompt\"] [-n max_tokens] [-s max_seq_len]"
 
 clean:
-	rm -f $(TARGET) $(MOE_CUBIN)
+	rm -f $(TARGET) $(MOE_CUBIN) test_half_convert
 
 help:
 	@echo "CUDA LLM Runner (NVRTC-based, no nvcc needed)"

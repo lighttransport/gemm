@@ -40,6 +40,7 @@
 #include "../llm/cuda_llm_runner.h"
 #include "../../common/flux2_klein_text_encoder.h"
 #include "cuda_flux2_runner.h"
+#include "cuda_flux2_encode.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -52,6 +53,17 @@ static const char *DEFAULT_DIT = "/mnt/disk01/models/klein2-4b/diffusion_models/
 static const char *DEFAULT_VAE = "/mnt/disk01/models/klein2-4b/vae/flux2-vae.safetensors";
 static const char *DEFAULT_ENC = "/mnt/disk01/models/klein2-4b/text_encoder";
 static const char *DEFAULT_TOK = "/mnt/disk01/models/Qwen3-VL-4B-Instruct-GGUF/Qwen3VL-4B-Instruct-Q8_0.gguf";
+
+static float *read_f32_exact(const char *path,size_t count) {
+    FILE *f=fopen(path,"rb");if(!f)return NULL;
+    float *data=malloc(count*sizeof(float));
+    if(!data || fread(data,sizeof(float),count,f)!=count || fgetc(f)!=EOF) {
+        free(data);fclose(f);return NULL;
+    }
+    fclose(f);
+    for(size_t i=0;i<count;i++)if(!isfinite(data[i])) { free(data);return NULL; }
+    return data;
+}
 
 /* ---- PRNG: Box-Muller with pair caching ---- */
 static uint64_t rng_state = 42;
@@ -1749,7 +1761,8 @@ static int run_generate_once(cuda_flux2_runner *r,
                          const float *txt_hidden, int n_txt, int enc_embd,
                          int out_h, int out_w, int n_steps,
                          uint64_t seed, int is_distilled, float cfg_scale,
-                         const char *out_path, int dump_intermediates) {
+                         const char *out_path, int dump_intermediates, const float *reference_latent,
+                         int diffusers_conditioning) {
     struct timespec t_start, t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t_start);
 
@@ -1765,6 +1778,9 @@ static int run_generate_once(cuda_flux2_runner *r,
     int lc = FLUX2_VAE_LATENT_CHANNELS;
     int ps = (r->pin == lc * 4) ? 2 : 1;
     int n_img = (lat_h / ps) * (lat_w / ps);
+    int n_all_img = n_img * (reference_latent ? 2 : 1);
+    r->image_grid_width = lat_w / ps;
+    r->reference_tokens_start = reference_latent ? n_img : 0;
     int pin = r->pin;
     if (lat_h <= 0 || lat_w <= 0 || (lat_h % ps) != 0 || (lat_w % ps) != 0) {
         fprintf(stderr, "generate: output size %dx%d is incompatible with latent patch size ps=%d\n",
@@ -1780,9 +1796,13 @@ static int run_generate_once(cuda_flux2_runner *r,
     float *latent = (float *)malloc(lat_sz * sizeof(float));
     if (!latent) return 1;
     for (size_t i = 0; i < lat_sz; i++) latent[i] = randn();
+    if (dump_intermediates) {
+        int shape[] = {lc, lat_h, lat_w};
+        save_npy_f32("cuda_flux2_noise.npy", latent, 3, shape);
+    }
 
-    float *img_tok = (float *)malloc((size_t)n_img * pin * sizeof(float));
-    float *vel_out = (float *)malloc((size_t)n_img * pin * sizeof(float));
+    float *img_tok = (float *)malloc((size_t)n_all_img * pin * sizeof(float));
+    float *vel_out = (float *)malloc((size_t)n_all_img * pin * sizeof(float));
     float *vel_lat = (float *)calloc(lat_sz, sizeof(float));
     float *txt_uncond = NULL;
     float *vel_uncond = NULL;
@@ -1792,7 +1812,7 @@ static int run_generate_once(cuda_flux2_runner *r,
     }
     if (!is_distilled && cfg_scale > 1.0f) {
         txt_uncond = (float *)calloc((size_t)n_txt * r->txt_dim, sizeof(float));
-        vel_uncond = (float *)malloc((size_t)n_img * pin * sizeof(float));
+        vel_uncond = (float *)malloc((size_t)n_all_img * pin * sizeof(float));
         if (!txt_uncond || !vel_uncond) {
             free(txt_uncond); free(vel_uncond);
             free(img_tok); free(vel_out); free(vel_lat); free(latent);
@@ -1803,6 +1823,20 @@ static int run_generate_once(cuda_flux2_runner *r,
     qimg_scheduler sched;
     if (is_distilled) flux2_sched_distilled(&sched, n_steps);
     else              flux2_sched_base(&sched, n_steps, n_img);
+    if(diffusers_conditioning) {
+        double m200=.00016927*n_img+.45666666,m10=.0000873809524*n_img+1.89833333;
+        double slope=(m200-m10)/190.,mu=n_img>4300?m200:slope*n_steps+m200-200*slope;
+        float shift=(float)exp(mu);
+        sched.n_steps=n_steps;
+        for(int i=0;i<n_steps;i++) {
+            float sigma=1.f-(float)i/n_steps;
+            sched.sigmas[i]=shift*sigma/(1.f+(shift-1.f)*sigma);
+            sched.timesteps[i]=sched.sigmas[i];
+        }
+        sched.sigmas[n_steps]=0.f;
+        for(int i=0;i<n_steps;i++)sched.dt[i]=sched.sigmas[i+1]-sched.sigmas[i];
+    }
+    if(reference_latent)flux2_patchify(img_tok+(size_t)n_img*pin,reference_latent,lc,lat_h,lat_w,ps);
 
     /* Denoising loop */
     fprintf(stderr, "\n[2/3] Denoising (%d steps)...\n", n_steps);
@@ -1816,7 +1850,7 @@ static int run_generate_once(cuda_flux2_runner *r,
         flux2_patchify(img_tok, latent, lc, lat_h, lat_w, ps);
 
         if (is_distilled || cfg_scale <= 1.0f) {
-            if (cuda_flux2_dit_step(r, img_tok, n_img, txt_hidden, n_txt,
+            if (cuda_flux2_dit_step(r, img_tok, n_all_img, txt_hidden, n_txt,
                                     t_sigma, 0.0f, vel_out) != 0) {
                 free(txt_uncond); free(vel_uncond);
                 free(img_tok); free(vel_out); free(vel_lat); free(latent);
@@ -1827,9 +1861,9 @@ static int run_generate_once(cuda_flux2_runner *r,
             for(int i=0;i<n_img*pin;i++){if(vel_out[i]<vmn)vmn=vel_out[i];if(vel_out[i]>vmx)vmx=vel_out[i];vsum+=vel_out[i];}
             fprintf(stderr, "    vel: min=%.4f max=%.4f mean=%.6f\n", vmn, vmx, vsum/(n_img*pin));
         } else {
-            if (cuda_flux2_dit_step(r, img_tok, n_img, txt_uncond, n_txt,
+            if (cuda_flux2_dit_step(r, img_tok, n_all_img, txt_uncond, n_txt,
                                     t_sigma, 0.0f, vel_uncond) != 0 ||
-                cuda_flux2_dit_step(r, img_tok, n_img, txt_hidden, n_txt,
+                cuda_flux2_dit_step(r, img_tok, n_all_img, txt_hidden, n_txt,
                                     t_sigma, 0.0f, vel_out) != 0) {
                 free(txt_uncond); free(vel_uncond);
                 free(img_tok); free(vel_out); free(vel_lat); free(latent);
@@ -1901,6 +1935,17 @@ static int run_generate_once(cuda_flux2_runner *r,
         free(latent);
         return 1;
     }
+    /* DiT predicts normalized patchified latents. AutoencoderKLFlux2.decode
+     * consumes raw VAE latents; undo BN using each subpixel's channel stats. */
+    if (!r->vae->bn_mean || !r->vae->bn_var || r->vae->bn_n_ch != lc*4) {
+        fprintf(stderr, "generate: required FLUX.2 latent batch normalization missing\n");
+        free(rgb); free(latent); return 1;
+    }
+    for (int c=0;c<lc;c++) for (int y=0;y<lat_h;y++) for (int x=0;x<lat_w;x++) {
+        int b=c*4+(y%2)*2+x%2;
+        size_t i=((size_t)c*lat_h+y)*lat_w+x;
+        latent[i]=latent[i]*sqrtf(r->vae->bn_var[b]+r->vae->bn_eps)+r->vae->bn_mean[b];
+    }
     if (cuda_flux2_vae_decode(r, latent, lat_h, lat_w, rgb) != 0) {
         free(rgb); free(latent);
         return 1;
@@ -1919,6 +1964,10 @@ static int run_generate_once(cuda_flux2_runner *r,
             (t1.tv_sec-t0.tv_sec)+(t1.tv_nsec-t0.tv_nsec)*1e-9);
 
     save_ppm(out_path, rgb, out_h, out_w);
+    if (dump_intermediates) {
+        int shape[] = {3,out_h,out_w};
+        save_npy_f32("cuda_flux2_decoded.npy",rgb,3,shape);
+    }
 
     clock_gettime(CLOCK_MONOTONIC, &t1);
     double total = (t1.tv_sec-t_start.tv_sec)+(t1.tv_nsec-t_start.tv_nsec)*1e-9;
@@ -1934,7 +1983,14 @@ static int run_generate(const char *dit_path, const char *vae_path,
                          int out_h, int out_w, int n_steps,
                          uint64_t seed, int is_distilled, float cfg_scale,
                          int use_gpu_enc, int keep_gpu_enc, int device_id, int repeat,
-                         const char *out_override, int dump_intermediates) {
+                         const char *out_override, int dump_intermediates, int padded_queries, int text_only,
+                         const char *reference_image, const char *text_features) {
+    if (out_h < 16 || out_w < 16 || out_h > 1024 || out_w > 1024 ||
+        out_h % 16 || out_w % 16 || n_steps < 1 || n_steps > QIMG_SCHED_MAX_STEPS ||
+        repeat < 1 || repeat > 1000 || device_id < 0) {
+        fprintf(stderr, "generate: expected 16..1024 dimensions divisible by 16 and bounded steps/repeats\n");
+        return 2;
+    }
     fprintf(stderr, "\n=== Flux.2 Klein GPU Pipeline ===\n");
     fprintf(stderr, "Runs: %d\n", repeat);
     fprintf(stderr, "Intermediate dumps: %s\n", dump_intermediates ? "on" : "off");
@@ -1946,25 +2002,28 @@ static int run_generate(const char *dit_path, const char *vae_path,
     fprintf(stderr, "\n[setup] Text encoder (%s)...\n", use_gpu_enc ? "GPU" : "CPU");
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
-    flux2_text_enc *enc = use_gpu_enc
+    flux2_text_enc *enc = text_features ? NULL : use_gpu_enc
         ? flux2_text_enc_load_gpu(enc_path, tok_path, device_id)
         : flux2_text_enc_load_safetensors(enc_path, tok_path);
-    if (!enc) return 1;
+    if (!enc && !text_features) return 1;
+    if(enc)enc->padded_queries = padded_queries;
 
     int rc = 1;
     flux2_text_enc *enc_hold = NULL;
     float *txt_hidden_raw = NULL;
     float *txt_hidden = NULL;
+    float *reference_latent = NULL;
     cuda_flux2_runner *r = NULL;
-    int n_txt = 0;
-    int enc_embd = enc->n_embd;
+    int n_txt = text_features ? 512 : 0;
+    int enc_embd = enc ? enc->n_embd : FLUX2_TXT_DIM;
 
-    txt_hidden_raw = flux2_text_enc_encode(enc, prompt, &n_txt);
+    txt_hidden_raw = text_features ? read_f32_exact(text_features,(size_t)512*enc_embd)
+                                  : flux2_text_enc_encode(enc, prompt, &n_txt);
     if (!txt_hidden_raw) {
         flux2_text_enc_free(enc);
         goto cleanup;
     }
-    if (use_gpu_enc && keep_gpu_enc) {
+    if (enc && use_gpu_enc && keep_gpu_enc) {
         enc_hold = enc;
     } else {
         flux2_text_enc_free(enc);
@@ -1984,7 +2043,13 @@ static int run_generate(const char *dit_path, const char *vae_path,
            (size_t)real_txt * enc_embd * sizeof(float));
     free(txt_hidden_raw); txt_hidden_raw = NULL;
     n_txt = FLUX2_KLEIN_TXT_LEN;
-    fprintf(stderr, "Padded text to %d tokens (front-pad zeros)\n", n_txt);
+    fprintf(stderr, "Text conditioning: %d tokens (%s)\n", n_txt,
+            padded_queries ? "right-padded query states" : "compact, front-pad zeros");
+    if (text_only) {
+        int shape[]={n_txt,enc_embd};
+        save_npy_f32(out_override ? out_override : "cuda_flux2_text_hidden.npy",txt_hidden,2,shape);
+        rc=0; goto cleanup;
+    }
 
     fprintf(stderr, "\n[setup] Init CUDA + load DiT + VAE...\n");
     clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -1997,6 +2062,25 @@ static int run_generate(const char *dit_path, const char *vae_path,
     if (cuda_flux2_load_vae(r, vae_path) != 0) {
         if (enc_hold) fprintf(stderr, "VAE load failed with GPU text encoder resident; retry without --keep-gpu-enc on lower-VRAM cards.\n");
         goto cleanup;
+    }
+    if(reference_image) {
+        float *image=read_f32_exact(reference_image,(size_t)3*out_h*out_w);
+        size_t count=(size_t)32*(out_h/8)*(out_w/8);
+        reference_latent=malloc(count*sizeof(float));
+        if(!image || !reference_latent || cuda_flux2_vae_encode(r,image,out_h,out_w,reference_latent)) {
+            free(image);goto cleanup;
+        }
+        free(image);
+        if(!r->vae->bn_mean || !r->vae->bn_var)goto cleanup;
+        for(int c=0;c<32;c++)for(int y=0;y<out_h/8;y++)for(int x=0;x<out_w/8;x++) {
+            int b=c*4+(y%2)*2+x%2;
+            size_t i=((size_t)c*(out_h/8)+y)*(out_w/8)+x;
+            reference_latent[i]=(reference_latent[i]-r->vae->bn_mean[b])/sqrtf(r->vae->bn_var[b]+r->vae->bn_eps);
+        }
+        if(dump_intermediates) {
+            int shape[]={32,out_h/8,out_w/8};
+            save_npy_f32("cuda_flux2_reference_latent.npy",reference_latent,3,shape);
+        }
     }
     clock_gettime(CLOCK_MONOTONIC, &t1);
     fprintf(stderr, "Shared init+load: %.1f s\n",
@@ -2011,13 +2095,14 @@ static int run_generate(const char *dit_path, const char *vae_path,
         fprintf(stderr, "\n--- Run %d/%d ---\n", i + 1, repeat);
         rc = run_generate_once(r, prompt, txt_hidden, n_txt, enc_embd, out_h, out_w, n_steps,
                                seed + (uint64_t)i, is_distilled, cfg_scale, out_path,
-                               dump_intermediates);
+                               dump_intermediates, reference_latent, padded_queries);
         if (rc != 0) break;
     }
 
 cleanup:
     free(txt_hidden);
     free(txt_hidden_raw);
+    free(reference_latent);
     if (enc_hold) flux2_text_enc_free(enc_hold);
     if (r) cuda_flux2_free(r);
     return rc;
@@ -2031,6 +2116,8 @@ int main(int argc, char **argv) {
     const char *prompt = "a red apple on a white table";
     const char *mode = NULL;
     const char *weight_type = NULL, *gemm_backend = NULL;
+    const char *reference_image = NULL, *text_features = NULL;
+    int padded_queries = 0;
 
     int out_h = 256, out_w = 256, n_steps = 4, repeat = 1, n_txt = 8;
     int is_distilled = 1, use_gpu_enc = 0, keep_gpu_enc = 0, device_id = 0;
@@ -2053,9 +2140,20 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--test-text-gpu") == 0) mode = "text_gpu";
         else if (strcmp(argv[i], "--test-kernels") == 0) mode = "kernels";
         else if (strcmp(argv[i], "--generate")  == 0) mode = "gen";
+        else if (strcmp(argv[i], "--encode-text") == 0) mode = "encode";
+        else if (strcmp(argv[i], "--reference-image-f32") == 0 && i+1<argc) reference_image=argv[++i];
+        else if (strcmp(argv[i], "--text-features-f32") == 0 && i+1<argc) text_features=argv[++i];
+        else if (strcmp(argv[i], "--conditioning") == 0 && i+1<argc) {
+            const char *value=argv[++i];
+            if (strcmp(value,"diffusers") && strcmp(value,"compact")) {
+                fprintf(stderr,"--conditioning expects diffusers or compact\n");return 2;
+            }
+            padded_queries=!strcmp(value,"diffusers");
+        }
         else if (strcmp(argv[i], "--base")       == 0) { is_distilled = 0; n_steps = 20; }
         else if (strcmp(argv[i], "--distilled")  == 0) { is_distilled = 1; n_steps = 4; }
         else if (strcmp(argv[i], "--gpu-enc")    == 0) use_gpu_enc = 1;
+        else if (strcmp(argv[i], "--no-text-cache") == 0) setenv("FLUX2_F16CACHE_DISABLE", "1", 1);
         else if (strcmp(argv[i], "--keep-gpu-enc") == 0) { use_gpu_enc = 1; keep_gpu_enc = 1; }
         else if (strcmp(argv[i], "--no-dumps") == 0) dump_intermediates = 0;
         else if (strcmp(argv[i], "--weight-type") == 0 && i+1<argc) weight_type = argv[++i];
@@ -2115,8 +2213,10 @@ int main(int argc, char **argv) {
             "          [--dit PATH] [--vae PATH] [--enc PATH]\n"
             "          [--prompt TEXT] [--height H] [--width W]\n"
             "          [--steps N] [--repeat N] [--n-txt N] [--img-scale S] [--txt-scale S] [--timestep T] [--real-text] [--real-latent] [--seed S] [--cfg SCALE]\n"
-            "          [--base|--distilled] [--gpu-enc] [--keep-gpu-enc] [--no-dumps] [--device N]\n"
-            "          [--weight-type f32|f16|bf16|fp8] [--gemm repo|auto]\n",
+            "          [--base|--distilled] [--gpu-enc] [--no-text-cache] [--keep-gpu-enc] [--no-dumps] [--device N]\n"
+            "          [--weight-type f32|f16|bf16|fp8] [--gemm repo|auto]\n"
+            "          [--conditioning compact|diffusers] [--encode-text]\n"
+            "          [--reference-image-f32 PATH] [--text-features-f32 PATH]\n",
             argv[0]);
         return 1;
     }
@@ -2132,11 +2232,12 @@ int main(int argc, char **argv) {
     if (strcmp(mode, "vae")  == 0) return test_vae(vae_path, out_h/8, out_w/8);
     if (strcmp(mode, "text") == 0) return test_text_enc(enc_path, tok_path, prompt, device_id);
     if (strcmp(mode, "text_gpu") == 0) return test_text_enc_gpu_repeat(enc_path, tok_path, prompt, device_id);
-    if (strcmp(mode, "gen")  == 0)
+    if (strcmp(mode, "gen") == 0 || strcmp(mode,"encode") == 0)
         return run_generate(dit_path, vae_path, enc_path, tok_path, prompt,
                             out_h, out_w, n_steps, seed, is_distilled,
                             cfg_scale, use_gpu_enc, keep_gpu_enc, device_id, repeat,
-                            out_path, dump_intermediates);
+                            out_path, dump_intermediates, padded_queries, !strcmp(mode,"encode"),
+                            reference_image, text_features);
 
     fprintf(stderr, "Unknown mode: %s\n", mode);
     return 1;

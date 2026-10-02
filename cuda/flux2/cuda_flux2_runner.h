@@ -760,6 +760,13 @@ static const char *flux2_kernel_src =
 "}\n"
 
 /* Patch-space latent affine using BN stats indexed by 2x2 patch position. */
+"__global__ void flux2_vae_downsample2x_f32(float *out, const float *inp, int C, int H, int W) {\n"
+"    int i=blockIdx.x*blockDim.x+threadIdx.x, h=H/2, w=W/2;\n"
+"    if(i>=C*h*w)return;\n"
+"    int c=i/(h*w), y=(i/w)%h, x=i%w;\n"
+"    out[i]=inp[(long)c*H*W+(2*y+1)*W+2*x+1];\n"
+"}\n"
+
 "__global__ void flux2_vae_latent_bn_f32(float *__restrict__ out,\n"
 "    const float *__restrict__ inp, const float *__restrict__ mean,\n"
 "    const float *__restrict__ std, int lc, int h, int w, int ps) {\n"
@@ -1256,20 +1263,23 @@ static const char *flux2_kernel_src =
 "    }\n"
 "}\n"
 
-/* RoPE for image tokens: axis 2 = row, axis 3 = col. theta=2000 */
+/* Image positions are (time,row,column,0). A reference image uses time=10. */
 "__global__ void flux2_rope_img_f32(float *x, int n_tok, int n_heads,\n"
-"    int head_dim, int lat_w, float theta) {\n"
+"    int head_dim, int lat_w, float theta, int ref_start) {\n"
 "    int tok = blockIdx.z, head = blockIdx.y;\n"
 "    int pair = blockIdx.x * blockDim.x + threadIdx.x;\n"
 "    if (tok >= n_tok || head >= n_heads || pair >= head_dim / 2) return;\n"
 "    int axis_dim = head_dim / 4;\n"
 "    int n_pairs = axis_dim / 2;\n"
 "    int ax = -1, p_in_ax = -1;\n"
-"    if (pair >= n_pairs && pair < 2 * n_pairs) { ax = 1; p_in_ax = pair - n_pairs; }\n"
+"    if (pair < n_pairs) { ax = 0; p_in_ax = pair; }\n"
+"    else if (pair < 2 * n_pairs) { ax = 1; p_in_ax = pair - n_pairs; }\n"
 "    else if (pair >= 2 * n_pairs && pair < 3 * n_pairs) { ax = 2; p_in_ax = pair - 2 * n_pairs; }\n"
 "    if (ax < 0) return;\n"
-"    int row = tok / lat_w, col = tok % lat_w;\n"
-"    float pos = (ax == 1) ? (float)row : (float)col;\n"
+"    int ref = ref_start > 0 && tok >= ref_start;\n"
+"    int local = ref ? tok-ref_start : tok;\n"
+"    int row = local / lat_w, col = local % lat_w;\n"
+"    float pos = ax == 0 ? (ref ? 10.f : 0.f) : ax == 1 ? (float)row : (float)col;\n"
 "    float freq = pos / powf(theta, (float)(2 * p_in_ax) / (float)axis_dim);\n"
 "    float cos_f = cosf(freq), sin_f = sinf(freq);\n"
 "    long idx = (long)tok * n_heads * head_dim + head * head_dim + pair * 2;\n"
@@ -3237,6 +3247,8 @@ struct cuda_flux2_runner {
     int use_f16_v7;
     int max_tok;
     int gpu_loaded;
+    int image_grid_width;       /* Explicit packed width; zero preserves legacy inference. */
+    int reference_tokens_start; /* Single reference image offset; zero for T2I. */
     int use_gpu_dbl_attn;
     int debug_dbl_attn;
     int profile_step;
@@ -4253,7 +4265,7 @@ static void op_swiglu(cuda_flux2_runner *r, CUdeviceptr out, CUdeviceptr in,
 static void op_rope_img(cuda_flux2_runner *r, CUdeviceptr x, int n_tok,
                         int n_heads, int hd, int lat_w, float theta) {
     unsigned gx = (unsigned)((hd/2 + 31) / 32);
-    void *args[] = {&x, &n_tok, &n_heads, &hd, &lat_w, &theta};
+    void *args[] = {&x, &n_tok, &n_heads, &hd, &lat_w, &theta, &r->reference_tokens_start};
     cuLaunchKernel(r->fn_rope_img, gx, (unsigned)n_heads, (unsigned)n_tok,
                    32, 1, 1, 0, r->stream, args, NULL);
 }
@@ -5197,7 +5209,7 @@ int cuda_flux2_load_dit(cuda_flux2_runner *r, const char *path) {
                     free(a); free(ml);
                     l2_scale = -1.0f;
                 } else {
-                    /* BF16/F32: dequant + split as F32 */
+                    /* Unquantized checkpoint: preserve the selected GPU weight format. */
                     const flux2_mat *l2 = &m->sblk[i].linear2;
                     int l2_in = l2->cols;
                     float *a = (float *)malloc((size_t)Hd * Hd * sizeof(float));
@@ -5206,8 +5218,8 @@ int cuda_flux2_load_dit(cuda_flux2_runner *r, const char *path) {
                         memcpy(a + (size_t)r2 * Hd, l2->w + (size_t)r2 * l2_in, (size_t)Hd * sizeof(float));
                         memcpy(ml + (size_t)r2 * nf, l2->w + (size_t)r2 * l2_in + Hd, (size_t)nf * sizeof(float));
                     }
-                    r->gpu_sblk[i].l2_attn_w = gpu_upload_f32(a, Hd * Hd);
-                    r->gpu_sblk[i].l2_mlp_w  = gpu_upload_f32(ml, Hd * nf);
+                    r->gpu_sblk[i].l2_attn_w = gpu_upload_f32_auto(a, Hd * Hd, g_flux2_upload_mode);
+                    r->gpu_sblk[i].l2_mlp_w  = gpu_upload_f32_auto(ml, Hd * nf, g_flux2_upload_mode);
                     free(a); free(ml);
                     l2_scale = -1.0f;  /* F32 path sentinel (dequantized, not FP8 bytes) */
                 }
@@ -5521,6 +5533,7 @@ int cuda_flux2_dit_step(cuda_flux2_runner *r,
         lat_w_p = (int)sqrtf((float)n_img);
         if (lat_w_p * lat_w_p != n_img) lat_w_p = n_img; /* fallback to 1D */
     }
+    if (r->image_grid_width > 0) lat_w_p = r->image_grid_width;
     float theta = FLUX2_ROPE_THETA;
 
     if (r->profile_step) { cuCtxSynchronize(); clock_gettime(CLOCK_MONOTONIC, &_pt1); }
@@ -6304,9 +6317,7 @@ int cuda_flux2_vae_decode(cuda_flux2_runner *r,
 
     if (!d_x) goto done;
 
-    /* NOTE: BN stats (bn.running_mean/var) are training artifacts — do NOT apply.
-     * The DiT outputs latents in the correct space for the VAE decoder.
-     * Applying BN denorm over-saturates and causes visible artifacts. */
+    /* Raw VAE latents: pipeline callers undo DiT batch normalization first. */
 
     if (m->pqc_w) {
         CUdeviceptr d_tmp = 0;

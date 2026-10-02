@@ -13,9 +13,9 @@ TOK       = /mnt/disk01/models/Qwen3-VL-4B-Instruct-GGUF/Qwen3VL-4B-Instruct-Q8_
 
 all: test_cuda_flux2
 
-test_cuda_flux2: test_cuda_flux2.c cuda_flux2_runner.h \
+test_cuda_flux2: test_cuda_flux2.c cuda_flux2_runner.h cuda_flux2_encode.h \
 		../cuda_runner_common.h ../cuda_kernels_common.h ../cuew.h \
-		../llm/cuda_llm_runner.h ../llm/cuda_llm_runner.c \
+		../llm/cuda_llm_runner.h ../llm/cuda_llm_runner.c ../llm/half_convert.h \
 		../../common/safetensors.h ../../common/gguf_loader.h \
 		../../common/ggml_dequant.h ../../common/transformer.h \
 		../../common/bpe_tokenizer.h ../../common/qwen_image_scheduler.h \

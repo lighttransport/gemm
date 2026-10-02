@@ -745,7 +745,7 @@ Further dependency removal (items 6, 9, 10 and 12):
 | Video parity campaign | Framework-free dump conversion, bounded-memory comparison and 144-case coverage audit; official inference is an isolated Torch oracle |
 | Rig asset helpers | Contact export and shape smoothing use NumPy/SciPy; corrective training loads `mldeformer_training` lazily |
 | Motion evaluation | Native GRU by default; Torch full-sequence comparison only with `--reference-parity` |
-| Identity reference creation | Native FLUX.2 BF16/repository-GEMM neutral generation exercised on5060Ti; quality/full conditioning parity open; expressions still use explicit `torch-reference` |
+| Identity reference creation | Native FLUX.2 F16/repository-GEMM neutral and reference-conditioned expression paths; full distilled-4B four-step T2I/I2I parity passed with CPU text conditioning; CUDA text precision validation in progress |
 
 Photo and video landmark/blendshape inference now uses the native C++ executor
 and repository AVX2 GEMM. The pinned MediaPipe task is converted with NumPy and
@@ -761,7 +761,7 @@ and the optional oracle `ref/vhuman/verify_landmarks.py` (requires ai-edge-liter
 and MediaPipe only in the reference environment). Reports are under
 `tmp/vhuman-landmarks/{parity,expression-parity,geometry-parity}`.
 
-Photographic-reference conditioning remains a runtime port to complete.
+Photographic-reference conditioning now has a native VAE encoder and DiT path.
 Registration/optimization, training
 and checkpoint export may still use Torch. The live speech/GRU/rig/render/record
 path ran successfully on RTX 5060 Ti without Torch or ONNX installed. The new

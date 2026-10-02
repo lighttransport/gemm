@@ -44,6 +44,7 @@ typedef struct {
     int   n_layers;     /* total transformer layers */
     int   use_gpu;
     int   owns_resources;
+    int   padded_queries; /* CPU/CUDA: 512 right-padded queries, mask padding keys. */
 } flux2_text_enc;
 
 /* Load from a single merged safetensors file (ComfyUI qwen_3_4b.safetensors).
@@ -745,9 +746,21 @@ float *flux2_text_enc_encode(flux2_text_enc *enc, const char *text,
     }
     fprintf(stderr, "flux2_text_enc: '%s' → %d tokens (chat template)\n", text, n_tok);
 
-    /* This compact profile emits only real tokens. Diffusers emits all 512
-     * hidden states (including padding queries), so this profile is not an
-     * exact Diffusers conditioning match. Keep that parity limitation explicit. */
+    int real_tokens = n_tok;
+    if (enc->padded_queries) {
+#ifndef CUDA_LLM_RUNNER_H
+        if (enc->use_gpu) {
+            fprintf(stderr, "flux2_text_enc: padded-query extraction requires CPU or CUDA encoder\n");
+            return NULL;
+        }
+#endif
+        /* Qwen2TokenizerFast defaults to right padding with <|endoftext|>.
+         * Keep query positions, but exclude every padding key from attention. */
+        int32_t pad_id[2];
+        if (bpe_tokenize(vocab, "<|endoftext|>", 13, pad_id, 2) != 1) return NULL;
+        for (int i=n_tok;i<MAX_SEQ;i++) toks[i]=pad_id[0];
+        n_tok=MAX_SEQ;
+    }
 
     /* Output dim = 3 * n_embd_inner (last 3 layers concatenated) */
     int n_inner = enc->n_embd_inner;
@@ -760,25 +773,36 @@ float *flux2_text_enc_encode(flux2_text_enc *enc, const char *text,
         /* GPU path: capture the same intermediate hidden states as the CPU
          * reference after layers 8, 17, and 26. */
         cuda_llm_runner *gpu = (cuda_llm_runner *)enc->model;
+        if (enc->padded_queries && cuda_llm_enable_encoder_f32_cache(gpu) != 0) {
+            fprintf(stderr, "flux2_text_enc: FP32 encoder cache allocation failed\n");
+            free(hidden);
+            return NULL;
+        }
         if (cuda_llm_reset_state(gpu) != 0) {
             fprintf(stderr, "flux2_text_enc: cuda_llm_reset_state failed\n");
             free(hidden);
             return NULL;
         }
+        cuda_llm_set_max_layers(gpu, 27);
         for (int i = 0; i < n_tok; i++) {
             float *dst = hidden + (size_t)i * n_out;
-            if (!cuda_llm_forward(gpu, toks[i], i)) {
+            float *state = enc->padded_queries ? cuda_llm_forward_masked(gpu, toks[i], i, real_tokens)
+                                              : cuda_llm_forward(gpu, toks[i], i);
+            if (!state) {
                 fprintf(stderr, "flux2_text_enc: cuda_llm_forward failed at token %d/%d\n", i + 1, n_tok);
+                cuda_llm_set_max_layers(gpu, 0);
                 free(hidden);
                 return NULL;
             }
             if (cuda_llm_read_hidden_snapshots(gpu, dst, 3, n_inner) != 0) {
                 fprintf(stderr, "flux2_text_enc: cuda_llm_read_hidden_snapshots failed at token %d/%d\n",
                         i + 1, n_tok);
+                cuda_llm_set_max_layers(gpu, 0);
                 free(hidden);
                 return NULL;
             }
         }
+        cuda_llm_set_max_layers(gpu, 0);
 #elif defined(HIP_LLM_RUNNER_H)
         hip_llm_runner *gpu = (hip_llm_runner *)enc->model;
         hip_llm_reset_state(gpu);
@@ -799,7 +823,7 @@ float *flux2_text_enc_encode(flux2_text_enc *enc, const char *text,
 #endif
     } else {
         transformer_model *mdl = (transformer_model *)enc->model;
-        int nl = mdl->n_layers;
+        mdl->partial_attention_key_limit = enc->padded_queries ? real_tokens : 0;
         /* Diffusers Flux2KleinPipeline uses hidden_states at indices (9, 18, 27).
          * HuggingFace convention: hidden_states[k] = output of transformer layer k-1.
          * So we extract after layers 8, 17, 26 (0-indexed) by running partial segments.
@@ -813,8 +837,9 @@ float *flux2_text_enc_encode(flux2_text_enc *enc, const char *text,
             memcpy(dst + n_inner, mdl->x, n_inner * sizeof(float));   /* hs[18] */
             transformer_forward_partial(mdl, i, 18, 27);
             memcpy(dst + 2 * n_inner, mdl->x, n_inner * sizeof(float)); /* hs[27] */
-            transformer_forward_partial(mdl, i, 27, nl); /* run remaining layers for KV cache */
+            /* Layers 27+ cannot affect any of the requested hidden states. */
         }
+        mdl->partial_attention_key_limit = 0;
     }
 
     if (out_n_tokens) *out_n_tokens = n_tok;
