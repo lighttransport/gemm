@@ -505,6 +505,105 @@ int glm53f_target_model_step_12n(glm53f_target_model_12n *m, int token,
     return rc;
 }
 
+/* Sequential PP decode uses the qualified scalar sublayers and chained mHC
+ * arithmetic. A stage boundary publishes all four streams before the next
+ * stage computes its input normalization. The legacy full scalar path above
+ * remains unchanged. */
+int glm53f_target_model_layers_scalar_12n(glm53f_target_model_12n *m,
+        float *streams, int first, int end) {
+    if (!m || !streams || m->trace || first < m->first_layer ||
+        end > m->end_layer || first >= end) return -1;
+    double begin;
+    for (int l = first; l < end; ++l) {
+        const glm53f_target_layer_weights_12n *w = &m->layer_weight[l];
+        if (!m->mhc_chained || l == first) {
+            begin = m->profile ? glm53f_clock() : 0.0;
+            target_plan_attention(m, l);
+            glm53f_mhc_pre_sve(&m->scratch->mhc, streams, &w->attention_mhc,
+                               w->input_norm);
+            if (m->profile) m->scalar_phase[1] += glm53f_clock() - begin;
+        }
+        if (target_sublayer_trace(m->scratch->mhc.normalized, HIDDEN,
+                                  "attn_norm", l)) return -1;
+        begin = m->profile ? glm53f_clock() : 0.0;
+        int rc = m->kda[l] ?
+            glm53f_kda_sublayer_12n(m->kda[l], m->scratch->sublayer_output,
+                                    m->scratch->mhc.normalized) :
+            glm53f_sparse_sublayer_12n(m->sparse[l], m->scratch->sublayer_output,
+                                       m->scratch->mhc.normalized);
+        if (rc) return -1;
+        if (target_sublayer_trace(m->scratch->sublayer_output, HIDDEN,
+                                  "kda_out", l)) return -1;
+        if (m->profile) {
+            double elapsed = glm53f_clock() - begin;
+            m->scalar_phase[2] += elapsed;
+            m->scalar_detail[m->kda[l] ? 0 : 1] += elapsed;
+        }
+        begin = m->profile ? glm53f_clock() : 0.0;
+        target_plan_ffn(m, l);
+        const int fuse_router = l >= 3 && glm53f_mhc_fast_on() == 1 &&
+            getenv("GLM53F_ROUTER_FUSE") && atoi(getenv("GLM53F_ROUTER_FUSE"));
+        if (fuse_router) {
+            glm53f_moe_stage_set_layer_12n(m->moe, l);
+            if (!m->mhc_chained)
+                glm53f_mhc_post_sve(streams, m->scratch->sublayer_output, &m->scratch->mhc);
+            glm53f_mhc_fast_route(streams, m->scratch->sublayer_output,
+                &m->scratch->mhc, &w->ffn_mhc, w->post_attention_norm,
+                m->mhc_chained, glm53f_moe_router_team_12n, m->moe);
+        } else if (m->mhc_chained)
+            glm53f_mhc_post_pre_sve(streams, m->scratch->sublayer_output,
+                                    &m->scratch->mhc, &w->ffn_mhc,
+                                    w->post_attention_norm);
+        else {
+            glm53f_mhc_post_sve(streams, m->scratch->sublayer_output,
+                                &m->scratch->mhc);
+            glm53f_mhc_pre_sve(&m->scratch->mhc, streams, &w->ffn_mhc,
+                               w->post_attention_norm);
+        }
+        if (m->profile) m->scalar_phase[1] += glm53f_clock() - begin;
+        if (target_sublayer_trace(streams, FLAT,
+                                  "hc_attn_post", l)) return -1;
+        if (target_sublayer_trace(m->scratch->mhc.normalized, HIDDEN,
+                                  "ffn_norm", l)) return -1;
+        begin = m->profile ? glm53f_clock() : 0.0;
+        if (l < 3) {
+            rc = glm53f_dense_ffn_sublayer_12n(
+                m->dense[l], m->scratch->sublayer_output,
+                m->scratch->mhc.normalized);
+        } else {
+            glm53f_moe_stage_set_layer_12n(m->moe, l);
+            rc = glm53f_moe_stage_sublayer_12n(
+                m->moe, m->scratch->sublayer_output,
+                m->scratch->mhc.normalized);
+        }
+        if (rc) return -1;
+        if (target_sublayer_trace(m->scratch->sublayer_output, HIDDEN,
+                                  "ffn_out", l)) return -1;
+        if (m->profile) {
+            double elapsed = glm53f_clock() - begin;
+            m->scalar_phase[3] += elapsed;
+            m->scalar_detail[l < 3 ? 2 : 3] += elapsed;
+        }
+        begin = m->profile ? glm53f_clock() : 0.0;
+        if (m->mhc_chained && l + 1 < end) {
+            const glm53f_target_layer_weights_12n *next = &m->layer_weight[l + 1];
+            target_plan_attention(m, l + 1);
+            glm53f_mhc_post_pre_sve(streams, m->scratch->sublayer_output,
+                                    &m->scratch->mhc, &next->attention_mhc,
+                                    next->input_norm);
+        } else
+            glm53f_mhc_post_sve(streams, m->scratch->sublayer_output,
+                                &m->scratch->mhc);
+        if (target_sublayer_trace(streams, FLAT, "l_last", l)) return -1;
+        if (m->profile) m->scalar_phase[1] += glm53f_clock() - begin;
+        if (target_layer_trace(streams, l)) return -1;
+    }
+    memmove(m->streams, streams, FLAT * sizeof(float));
+    m->last_streams = m->streams;
+    if (end == LAYERS && target_export_hidden_write(m, streams, 1)) return -1;
+    return 0;
+}
+
 struct decode_sequence_call {
     glm53f_target_model_12n *model;
     int transitions, *ids, rc;
@@ -539,6 +638,12 @@ int glm53f_target_decode_sequence_12n(glm53f_target_model_12n *m,
 /* Shared layer executor: all tensors remain token-major four-stream FP32.
  * Embedding/readout stay with the caller. Snapshot packing retains the TP12
  * full-layer ABI; partial stage calls do not capture verification snapshots. */
+static int target_layer_failure(const glm53f_target_model_12n *m, int layer,
+        const char *phase) {
+    if (m->dist) fprintf(stderr, "GLM53F_PP_LAYER_FAIL rank=%d layer=%d phase=%s\n",
+        m->dist->map.world_rank, layer, phase);
+    return -1;
+}
 static int target_layers_batch(glm53f_target_model_12n *m, float *streams,
         int tokens, int first, int end, glm53f_target_snapshot_12n **after) {
     if (!m || !streams || tokens < 1 || tokens > PREFILL_BATCH ||
@@ -581,7 +686,7 @@ static int target_layers_batch(glm53f_target_model_12n *m, float *streams,
                         after ? m->batch_state +
                             (size_t)tile * m->batch_state_stride : NULL,
                         m->batch_state_stride))
-                    return -1;
+                    return target_layer_failure(m, l, "kda");
                 if (async_kda) glm53f_async_ready_12n(tile + n);
                 if (m->profile) {
                     double phase[3];
@@ -632,7 +737,7 @@ static int target_layers_batch(glm53f_target_model_12n *m, float *streams,
                     glm53f_sparse_sublayer_batch_12n(
                         m->sparse[l], m->batch_output + (size_t)tile * HIDDEN,
                         m->batch_normalized + (size_t)tile * HIDDEN, n);
-                if (rc) return -1;
+                if (rc) return target_layer_failure(m, l, "sparse");
                 if (async_sp) glm53f_async_ready_12n(tile + n);
             }
             if (async_sp) {
@@ -669,7 +774,7 @@ static int target_layers_batch(glm53f_target_model_12n *m, float *streams,
                     if (glm53f_dense_ffn_sublayer_batch_12n(
                             m->dense[l], m->batch_output + (size_t)tile * HIDDEN,
                             m->batch_normalized + (size_t)tile * HIDDEN, panel))
-                        return -1;
+                        return target_layer_failure(m, l, "dense");
                 }
                 goto batch_ffn_done;
             }
@@ -687,7 +792,7 @@ static int target_layers_batch(glm53f_target_model_12n *m, float *streams,
             if (tokens > VERIFY_BATCH) {
                 if (glm53f_moe_stage_sublayer_batch_12n(
                         m->moe, m->batch_output, m->batch_normalized, tokens))
-                    return -1;
+                    return target_layer_failure(m, l, "moe");
                 goto batch_ffn_done;
             }
             int n = tokens < 5 ? tokens : 4;

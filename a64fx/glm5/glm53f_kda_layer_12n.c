@@ -163,7 +163,12 @@ static int kda_native_load_one(const char*blob,const char*manifest,const char*wa
     if(require_hash&&hash!=expected_hash){close(fd);free(p);return-1;}
     close(fd);
     uint8_t*packed=NULL;int packed_type=(int)type;
-    if(glm53f_native_repack((int)type,p,rows,cols,&packed,&packed_type)){free(p);return-1;}
+    /* TP12 beta has five/six rows and uses the rowwise layout, allowing it
+     * to share the padded GEMM front. Keep that arithmetic for sixteen-head
+     * PP slices instead of selecting a different beta projection kernel. */
+    int rowwise = require_hash && strstr(wanted, ".ssm_beta.weight") != NULL;
+    if((rowwise ? glm53f_native_repack_rowwise : glm53f_native_repack)(
+            (int)type,p,rows,cols,&packed,&packed_type)){free(p);return-1;}
     if(packed){free(p);p=packed;}
     *output=p;*loaded_type=packed_type;return 0;}
 static int kda_native_load(glm53f_kda_context_12n*c){

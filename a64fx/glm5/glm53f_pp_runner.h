@@ -10,17 +10,33 @@ static int target_pp_produce(void *context, const glm53f_dist *d,
         float *streams, int offset, int tokens, int flat) {
     target_pp_call *c = context;
     (void)d;
-    if (flat != FLAT || (c->decode && tokens != 1)) return -1;
-    return glm53f_target_model_embed_batch_12n(c->model,
+    if (flat != FLAT || (c->decode && tokens != 1)) {
+        fprintf(stderr, "GLM53F_PP_CALLBACK_FAIL rank=%d phase=embedding_shape flat=%d expected=%d decode=%d tokens=%d\n",
+            d->map.world_rank, flat, FLAT, c->decode, tokens);
+        return -1;
+    }
+    int rc = glm53f_target_model_embed_batch_12n(c->model,
         c->decode ? &c->token : c->prompt + offset, tokens, streams);
+    if (rc) fprintf(stderr, "GLM53F_PP_CALLBACK_FAIL rank=%d phase=embedding offset=%d tokens=%d\n",
+        d->map.world_rank, offset, tokens);
+    return rc;
 }
 static int target_pp_execute(void *context, const glm53f_dist *d,
         float *streams, int offset, int tokens, int flat) {
     target_pp_call *c = context;
     (void)offset;
-    if (flat != FLAT) return -1;
-    return glm53f_target_model_layers_batch_12n(c->model, streams, tokens,
-        d->map.first_layer, d->map.end_layer);
+    if (flat != FLAT) {
+        fprintf(stderr, "GLM53F_PP_CALLBACK_FAIL rank=%d phase=layer_shape flat=%d expected=%d\n",
+            d->map.world_rank, flat, FLAT);
+        return -1;
+    }
+    int rc = c->decode ? glm53f_target_model_layers_scalar_12n(c->model, streams,
+        d->map.first_layer, d->map.end_layer) :
+        glm53f_target_model_layers_batch_12n(c->model, streams, tokens,
+            d->map.first_layer, d->map.end_layer);
+    if (rc) fprintf(stderr, "GLM53F_PP_CALLBACK_FAIL rank=%d phase=layers offset=%d tokens=%d\n",
+        d->map.world_rank, offset, tokens);
+    return rc;
 }
 static int target_pp_consume(void *context, const glm53f_dist *d,
         float *streams, int offset, int tokens, int flat) {
@@ -83,12 +99,26 @@ static int target_pp_run(const glm53f_parallel_config *parallel,
     if (state_export && target_export_hidden_begin(model, state_export, count)) MPI_Abort(d.world, 2);
     if (state_export && model->moe && glm53f_moe_set_route_export_12n(model->moe, state_export)) MPI_Abort(d.world, 2);
     target_pp_call c = {model, prompt, 0, 0};
-    glm53f_pipeline_profile profile;
+    glm53f_pipeline_profile profile = {0}, last_profile;
+    float *streams = a256(FLAT * sizeof(float));
+    if (!streams) MPI_Abort(d.world, 2);
     float logit = 0.0f;
     MPI_Barrier(d.world); begin = MPI_Wtime();
-    if (glm53f_pipeline_run(&d, count, FLAT, schedule, target_pp_produce,
-            target_pp_execute, target_pp_consume, &c, &profile) ||
+    /* Match TP12's arithmetic boundary: batch the prefix, then execute the
+     * last prompt position with scalar decode kernels before first readout.
+     * Both operations remain inside the full-prompt timing window. */
+    if (count > 1 && glm53f_pipeline_run(&d, count - 1, FLAT, schedule,
+            target_pp_produce, target_pp_execute, target_pp_consume, &c, &profile))
+        MPI_Abort(d.world, 2);
+    c.decode = 1; c.token = prompt[count - 1];
+    if (glm53f_pipeline_step(&d, 0, FLAT, target_pp_produce, target_pp_execute,
+            target_pp_consume, &c, streams, &last_profile) ||
         target_pp_readout(&c, &d, &logit)) MPI_Abort(d.world, 2);
+    profile.compute_seconds += last_profile.compute_seconds;
+    profile.receive_seconds += last_profile.receive_seconds;
+    profile.send_wait_seconds += last_profile.send_wait_seconds;
+    profile.positions += last_profile.positions;
+    profile.microbatches += last_profile.microbatches;
     elapsed = MPI_Wtime() - begin;
     double prefill_seconds;
     MPI_Allreduce(&elapsed, &prefill_seconds, 1, MPI_DOUBLE, MPI_MAX, d.world);
@@ -97,8 +127,6 @@ static int target_pp_run(const glm53f_parallel_config *parallel,
     if (!d.map.world_rank) ids[0] = c.token;
     int generated = 1, decode_steps = 0;
     c.decode = 1;
-    float *streams = a256(FLAT * sizeof(float));
-    if (!streams) MPI_Abort(d.world, 2);
     MPI_Barrier(d.world); begin = MPI_Wtime();
     while (generated < steps && (ignore_eos || !target_pp_eos(c.token))) {
         if (glm53f_pipeline_step(&d, decode_steps, FLAT, target_pp_produce,

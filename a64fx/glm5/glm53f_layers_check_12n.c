@@ -88,9 +88,44 @@ int main(int argc, char **argv) {
     failed |= glm53f_target_trace_open_12n(m, argv[5], 1) != 0;
     if (m->trace) failed |= glm53f_target_trace_close_12n(m) != 0;
     failed |= mismatches != 0;
+    /* Check scalar ownership boundaries separately from prefill. The full
+     * TP12 scalar implementation is the unchanged reference. */
+    int scalar_count = count < 8 ? count : 8;
+    char scalar_prefix[4096];
+    int prefix_bytes = snprintf(scalar_prefix, sizeof(scalar_prefix), "%s.scalar", argv[5]);
+    if (prefix_bytes < 0 || prefix_bytes >= (int)sizeof(scalar_prefix) ||
+        glm53f_target_snapshot_restore_12n(m, empty)) MPI_Abort(MPI_COMM_WORLD, 2);
+    for (int t = 0; t < scalar_count; ++t) {
+        if (glm53f_target_model_step_12n(m, ids[t], &reference_token, &reference_logit, NULL))
+            MPI_Abort(MPI_COMM_WORLD, 2);
+        memcpy(reference + (size_t)t * FLAT, m->streams, FLAT * sizeof(float));
+    }
+    if (glm53f_target_trace_open_12n(m, scalar_prefix, 0) ||
+        glm53f_target_trace_close_12n(m) || glm53f_target_snapshot_restore_12n(m, empty))
+        MPI_Abort(MPI_COMM_WORLD, 2);
+    uint64_t scalar_mismatches = 0;
+    for (int t = 0; t < scalar_count; ++t) {
+        if (glm53f_target_model_embed_batch_12n(m, ids + t, 1, streams) ||
+            glm53f_target_model_layers_scalar_12n(m, streams, 0, 15) ||
+            glm53f_target_model_layers_scalar_12n(m, streams, 15, 30) ||
+            glm53f_target_model_layers_scalar_12n(m, streams, 30, 45)) MPI_Abort(MPI_COMM_WORLD, 2);
+        for (int j = 0; j < FLAT; ++j) {
+            scalar_mismatches += memcmp(streams + j, reference + (size_t)t * FLAT + j, sizeof(float)) != 0;
+            failed |= !finite_bits(streams[j]);
+        }
+    }
+    failed |= glm53f_target_model_readout_12n(m, &token, &logit) != 0;
+    failed |= token != reference_token || memcmp(&logit, &reference_logit, sizeof(float)) != 0;
+    failed |= glm53f_target_trace_open_12n(m, scalar_prefix, 1) != 0;
+    if (m->trace) failed |= glm53f_target_trace_close_12n(m) != 0;
+    failed |= scalar_mismatches != 0;
     int all_failed; uint64_t maximum;
     MPI_Allreduce(&failed, &all_failed, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
     MPI_Allreduce(&mismatches, &maximum, 1, MPI_UINT64_T, MPI_MAX, MPI_COMM_WORLD);
+    uint64_t scalar_maximum;
+    MPI_Allreduce(&scalar_mismatches, &scalar_maximum, 1, MPI_UINT64_T, MPI_MAX, MPI_COMM_WORLD);
+    if (!rank) printf("GLM53F_SCALAR_LAYERS_CHECK tokens=%d cuts=15,30 streams_bit_mismatches=%" PRIu64 " %s\n",
+        scalar_count, scalar_maximum, all_failed ? "FAIL" : "PASS");
     if (!rank) printf("GLM53F_LAYERS_CHECK tokens=%d batch=%ld cuts=15,30 streams_bit_mismatches=%" PRIu64
         " state_and_readout=%s min_MemAvailable_GiB=%.6f %s\n", count, batch, maximum,
         all_failed ? "FAIL" : "BIT_EXACT", minimum_kb / 1048576.0, all_failed ? "FAIL" : "PASS");

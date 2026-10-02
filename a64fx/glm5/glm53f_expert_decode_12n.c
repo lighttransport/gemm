@@ -1584,7 +1584,8 @@ static int moe_prefill_grouped(glm53f_moe_stage_context_12n *c, float *out,
         }
     }
     shared_offset *sp = &c->shared[table_layer];
-    glm53f_expert_part shared = {c->shared_blob + sp->gate_up,
+    glm53f_expert_part shared = {0};
+    if (!c->nsh_native) shared = (glm53f_expert_part){c->shared_blob + sp->gate_up,
         (const float *)(c->shared_blob + sp->gate_up_scale),
         c->shared_blob + sp->down,
         (const float *)(c->shared_blob + sp->down_scale), sp->inter, 0, 0};
@@ -1653,7 +1654,7 @@ static int moe_prefill_grouped(glm53f_moe_stage_context_12n *c, float *out,
 
 int glm53f_moe_stage_sublayer_batch_12n(glm53f_moe_stage_context_12n*c,float*out,const float*x,int tokens){
     int li=c?c->active_layer-c->first_layer:-1,table_layer=c?c->active_layer-FIRST_LAYER:-1;
-    if(!c||!out||!x||tokens<1||tokens>GLM53F_PREFILL_MAX_TOKENS||li<0||li>=c->layer_count||!c->shared_blob)return-1;
+    if(!c||!out||!x||tokens<1||tokens>GLM53F_PREFILL_MAX_TOKENS||li<0||li>=c->layer_count||(!c->shared_blob&&!c->nsh_native))return-1;
     if (tokens > 4 && !c->int8_enabled)
         return moe_prefill_grouped(c, out, x, tokens, li, table_layer);
     if (c->int8_enabled) {
