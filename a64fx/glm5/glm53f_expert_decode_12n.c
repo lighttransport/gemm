@@ -27,6 +27,9 @@
 #include "../../common/glm53f_safetensors.h"
 #include "../../common/glm53f_ref.h"
 
+#include "glm53f_pp_native.h"
+#include "glm53f_pp_core.h"
+#include "glm53f_pp_routed_manifest.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
@@ -141,7 +144,7 @@ static int load_shared_manifest(const char *path, shared_offset *table) {
     return found;
 }
 
-static unsigned char *load_anon(const char *path, size_t *bytes, int rank) {
+static unsigned char *load_anon_guard(const char *path, size_t *bytes, int rank, long minimum) {
     const size_t chunk = 64u << 20;
     struct stat st;
     int fd = open(path, O_RDONLY);
@@ -149,9 +152,9 @@ static unsigned char *load_anon(const char *path, size_t *bytes, int rank) {
     if (fd < 0) return NULL;
     if (fstat(fd, &st) || st.st_size <= 0) { close(fd); return NULL; }
     long available = mem_available();
-    if (available < st.st_size + (2L << 30)) {
+    if (available < minimum || st.st_size > available - minimum) {
         fprintf(stderr, "GLM53F_LOAD_HEADROOM rank=%d need_GiB=%.3f available_GiB=%.3f reject\n",
-            rank, st.st_size / 1073741824.0 + 2, available / 1073741824.0);
+            rank, st.st_size / 1073741824.0 + minimum / 1073741824.0, available / 1073741824.0);
         close(fd); return NULL;
     }
     if (posix_memalign((void **)&data, 256, (size_t)st.st_size)) { close(fd); return NULL; }
@@ -162,7 +165,7 @@ static unsigned char *load_anon(const char *path, size_t *bytes, int rank) {
         ssize_t got = pread(fd, data + off, n, (off_t)off);
         if (got != (ssize_t)n) { free(data); close(fd); return NULL; }
         posix_fadvise(fd, (off_t)off, (off_t)n, POSIX_FADV_DONTNEED);
-        if (mem_available() < (2L << 30)) {
+        if (mem_available() < minimum) {
             fprintf(stderr, "GLM53F_LOAD_HEADROOM rank=%d offset=%zu reject\n", rank, off);
             free(data); close(fd); return NULL;
         }
@@ -195,9 +198,14 @@ static void route8(int token, int layer, int expert[8]) {
 }
 #endif
 
+static unsigned char *load_anon(const char *path,size_t *bytes,int rank){return load_anon_guard(path,bytes,rank,2L<<30);}
 struct glm53f_moe_stage_context_12n {
     glm53f_prefill_config prefill;
     int rank, first_layer, layer_count, active_layer;
+    const glm53f_dist *dist;
+    int image_rank;
+    FILE *route_export[NLAYERS];
+    const char *pp_shared;
     expert_offset *table;
     shared_offset shared[NLAYERS];
     unsigned char *blob, *shared_blob;
@@ -238,6 +246,19 @@ struct glm53f_moe_stage_context_12n {
     void *nsh_act_x, *nsh_act_h;
 };
 
+static int moe_sum(const glm53f_moe_stage_context_12n *c,const float *input,float *output,int count){
+    if(!c->dist)return glm53f_sum_allreduce_12n(input,output,count);
+    return MPI_Allreduce(input==output?MPI_IN_PLACE:input,output,count,MPI_FLOAT,MPI_SUM,c->dist->tp)==MPI_SUCCESS?0:-1;
+}
+static int moe_sum_mpi(const glm53f_moe_stage_context_12n *c,const float *input,float *output,int count){
+    return c->dist?moe_sum(c,input,output,count):glm53f_sum_allreduce_mpi_12n(input,output,count);
+}
+static int moe_sum_slabs(const glm53f_moe_stage_context_12n *c,const float *input,float *output,int tokens,int columns,int slab){
+    if(!c->dist)return glm53f_sum_allreduce_slabs_12n(input,output,tokens,columns,slab);
+    if(slab<1)return-1;for(int base=0;base<tokens;base+=slab){int n=tokens-base;if(n>slab)n=slab;
+        if(moe_sum(c,input+(size_t)base*columns,output+(size_t)base*columns,n*columns))return-1;}
+    return 0;
+}
 static int nsh_load_one(int fd, const char *manifest, const char *wanted,
                         int rows, int cols, uint8_t **out, int *out_type) {
     FILE *f = fopen(manifest, "r");
@@ -279,8 +300,11 @@ static int nsh_load_one(int fd, const char *manifest, const char *wanted,
 static int nsh_load(glm53f_moe_stage_context_12n *c, const char *stage) {
     char blob[PATH_MAX], manifest[PATH_MAX], name[128], line[8192];
     int in = 0, i0 = 0, fd;
-    snprintf(blob, sizeof(blob), "%s/rank%02d.blob", stage, c->rank);
-    snprintf(manifest, sizeof(manifest), "%s/rank%02d.manifest", stage, c->rank);
+    snprintf(blob, sizeof(blob), "%s/rank%02d.blob", stage, c->image_rank);
+    snprintf(manifest, sizeof(manifest), "%s/rank%02d.manifest", stage, c->image_rank);
+    if(c->dist){if(glm53f_pp_manifest_check(manifest,"SHARED",c->dist,c->dist->map.first_layer,c->dist->map.end_layer))return-1;
+        in=512;i0=c->dist->map.tp_rank*512;
+    }else{
     FILE *f = fopen(manifest, "r");
     if (!f) return -1;
     while (fgets(line, sizeof(line), f)) {
@@ -288,16 +312,17 @@ static int nsh_load(glm53f_moe_stage_context_12n *c, const char *stage) {
         if (line[0] == '#' && p && sscanf(p, " slice=%d+%d", &i0, &in) == 2) break;
     }
     fclose(f);
+    }
     if (in < 64 || in % 64 || (fd = open(blob, O_RDONLY)) < 0) return -1;
     int rc = 0;
     for (int li = 0; li < c->layer_count && !rc; ++li) {
         int layer = c->first_layer + li, t = layer - FIRST_LAYER;
         snprintf(name, sizeof(name), "blk.%d.ffn_gate_shexp.weight", layer);
-        rc |= nsh_load_one(fd, manifest, name, in, 4096, &c->nsh_g[t], &c->nsh_gt[t]);
+        rc |= c->dist?glm53f_pp_native_load(fd,manifest,name,-1,in,4096,1,&c->nsh_g[t],&c->nsh_gt[t]):nsh_load_one(fd,manifest,name,in,4096,&c->nsh_g[t],&c->nsh_gt[t]);
         snprintf(name, sizeof(name), "blk.%d.ffn_up_shexp.weight", layer);
-        rc |= nsh_load_one(fd, manifest, name, in, 4096, &c->nsh_u[t], &c->nsh_ut[t]);
+        rc |= c->dist?glm53f_pp_native_load(fd,manifest,name,-1,in,4096,1,&c->nsh_u[t],&c->nsh_ut[t]):nsh_load_one(fd,manifest,name,in,4096,&c->nsh_u[t],&c->nsh_ut[t]);
         snprintf(name, sizeof(name), "blk.%d.ffn_down_shexp.weight", layer);
-        rc |= nsh_load_one(fd, manifest, name, 4096, in, &c->nsh_d[t], &c->nsh_dt[t]);
+        rc |= c->dist?glm53f_pp_native_load(fd,manifest,name,-1,4096,in,1,&c->nsh_d[t],&c->nsh_dt[t]):nsh_load_one(fd,manifest,name,4096,in,&c->nsh_d[t],&c->nsh_dt[t]);
     }
     close(fd);
     if (rc) return -1;
@@ -572,36 +597,41 @@ static int moe_int8_local(glm53f_moe_stage_context_12n *c, float *out,
     return failed ? -1 : 0;
 }
 
-glm53f_moe_stage_context_12n *glm53f_moe_stage_create_12n(
-        const char*routed_stage,const char*shared_stage,const char*model_dir,
+static glm53f_moe_stage_context_12n *moe_create(
+        const glm53f_dist *dist,const char*routed_stage,const char*shared_stage,const char*pp_shared,const char*model_dir,
         int first_layer, int layer_count) {
     int rank, nr;
     char path[512];
     size_t bytes;
     glm53f_st_context *st = NULL;
     glm53f_moe_stage_context_12n *c;
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &nr);
-    if (nr != 12 || first_layer < FIRST_LAYER || layer_count < 1 ||
-        first_layer + layer_count > LAST_LAYER) return NULL;
+    if(dist){if(!dist->initialized||dist->config.layout!=GLM53F_PP3_TP4||first_layer<dist->map.first_layer||first_layer+layer_count>dist->map.end_layer||!routed_stage||!pp_shared||shared_stage)return NULL;
+        rank=dist->map.tp_rank;nr=dist->map.tp_size;
+    }else{MPI_Comm_rank(MPI_COMM_WORLD,&rank);MPI_Comm_size(MPI_COMM_WORLD,&nr);if(nr!=12)return NULL;}
+    if(first_layer<FIRST_LAYER||layer_count<1||first_layer+layer_count>(dist?45:LAST_LAYER))return NULL;
     c = calloc(1, sizeof(*c));
     if (!c) return NULL;
+    c->dist=dist;c->image_rank=dist?dist->map.world_rank:rank;c->pp_shared=pp_shared;
     c->rank = rank; c->first_layer = first_layer;
     c->layer_count = layer_count; c->active_layer = first_layer;
     c->profile = getenv("GLM53F_PROFILE") != NULL;
     c->table = malloc((size_t)NLAYERS * NEXPERTS * sizeof(*c->table));
     if (!c->table) goto fail;
-    snprintf(path, sizeof(path), "%s/rank%02d.manifest", routed_stage, rank);
-    if (load_manifest(path, c->table) < layer_count * 96 * 4) goto fail;
+    snprintf(path, sizeof(path), "%s/rank%02d.manifest", routed_stage, c->image_rank);
+    if(dist){char blob[512];struct stat st;
+        int z=snprintf(blob,sizeof(blob),"%s/rank%02d.blob",routed_stage,c->image_rank);
+        if(z<0||z>=(int)sizeof(blob)||stat(blob,&st)||st.st_size<1||glm53f_pp_routed_validate(path,dist,first_layer,first_layer+layer_count,(uint64_t)st.st_size,NULL))goto fail;
+    }
+    if (load_manifest(path, c->table) < layer_count * (dist?288*2:96*4)) goto fail;
     if (shared_stage) {
-        snprintf(path, sizeof(path), "%s/rank%02d.manifest", shared_stage, rank);
+        snprintf(path, sizeof(path), "%s/rank%02d.manifest", shared_stage, c->image_rank);
         if (load_shared_manifest(path, c->shared) != layer_count * 4) goto fail;
     }
     /* The checkpoint index/parser has a substantial transient allocation.
      * Finish all router reads and release parser pages BEFORE loading 23.6 GiB
      * of routed experts. Opening metadata after that load can OOM at 512K. */
     if (!rank) fprintf(stderr, "GLM53F_MOE_LOAD phase=router_open\n");
-    st = glm53f_st_open(model_dir);
+    st = dist?glm53f_pp_core_open(dist,model_dir):glm53f_st_open(model_dir);
     if (!st) goto fail;
     size_t wn = (size_t)layer_count * NEXPERTS * 4096 * sizeof(uint16_t);
     size_t bn = (size_t)layer_count * NEXPERTS * sizeof(float);
@@ -639,16 +669,18 @@ glm53f_moe_stage_context_12n *glm53f_moe_stage_create_12n(
     malloc_trim(0);
 #endif
     if (!rank) fprintf(stderr, "GLM53F_MOE_LOAD phase=resident_weights\n");
-    snprintf(path, sizeof(path), "%s/rank%02d.blob", routed_stage, rank);
-    c->blob = load_anon(path, &bytes, rank);
+    snprintf(path, sizeof(path), "%s/rank%02d.blob", routed_stage, c->image_rank);
+    c->blob = load_anon_guard(path,&bytes,rank,dist?6L<<30:2L<<30);
+    if(c->blob&&dist){char manifest[512];snprintf(manifest,sizeof(manifest),"%s/rank%02d.manifest",routed_stage,c->image_rank);
+        if(glm53f_pp_routed_validate(manifest,dist,first_layer,first_layer+layer_count,bytes,c->blob))goto fail;}
     if (!c->blob) goto fail;
     if (shared_stage) {
-        snprintf(path, sizeof(path), "%s/rank%02d.blob", shared_stage, rank);
+        snprintf(path, sizeof(path), "%s/rank%02d.blob", shared_stage, c->image_rank);
         c->shared_blob = load_anon(path, &bytes, rank);
         if (!c->shared_blob) goto fail;
     }
     {
-        const char *nsh = getenv("GLM53F_Q2_SHEXP_STAGE");
+        const char *nsh = dist?pp_shared:getenv("GLM53F_Q2_SHEXP_STAGE");
         if (nsh && *nsh && c->first_layer < 45 && nsh_load(c, nsh)) {
             fprintf(stderr, "rank=%d failed to load GLM53F_Q2_SHEXP_STAGE=%s\n", rank, nsh);
             goto fail;
@@ -670,6 +702,8 @@ fail:
     glm53f_moe_stage_free_12n(c);
     return NULL;
 }
+glm53f_moe_stage_context_12n *glm53f_moe_stage_create_12n(const char *routed,const char *shared,const char *model,int first,int count){return moe_create(NULL,routed,shared,NULL,model,first,count);}
+glm53f_moe_stage_context_12n *glm53f_moe_stage_create_dist(const glm53f_dist *dist,const char *routed,const char *native_shared,const char *model,int first,int count){return dist?moe_create(dist,routed,NULL,native_shared,model,first,count):NULL;}
 /* Routed experts + native shared expert in a single parallel region (glm53f_iq_expert_weighted_shared).
  * Returns 1 when the step was computed into c->scratch->local_output, 0 to fall back to the separate paths. */
 static int moe_fused_shared(glm53f_moe_stage_context_12n *c, int t, const float *x, const glm53f_expert_part *part,
@@ -742,6 +776,28 @@ static void router_worker(void *context) {
     glm53f_moe_router_team_12n(a->c, a->x);
 }
 void glm53f_moe_stage_set_layer_12n(glm53f_moe_stage_context_12n*c,int layer){if(c)c->active_layer=layer;}
+int glm53f_moe_set_route_export_12n(glm53f_moe_stage_context_12n *c,const char *prefix) {
+    if(!c||!prefix||!*prefix)return-1;
+    if(c->rank)return 0;
+    for(int layer=c->first_layer;layer<c->first_layer+c->layer_count;layer++){
+        int local=layer-FIRST_LAYER;char path[4096];
+        int n=snprintf(path,sizeof(path),"%s.layer%02d.routes",prefix,layer);
+        if(n<0||n>=(int)sizeof(path)||c->route_export[local]||!(c->route_export[local]=fopen(path,"wbx")))return-1;
+    }
+    return 0;
+}
+static int moe_trace_routes(glm53f_moe_stage_context_12n *c,const int *selected,const float *weight,int tokens) {
+    int layer=c->active_layer-FIRST_LAYER;
+    if(layer<0||layer>=NLAYERS)return-1;
+    FILE *f=c->route_export[layer];if(!f)return 0;
+    for(int t=0;t<tokens;t++){
+        int32_t ids[8];for(int k=0;k<8;k++)ids[k]=selected[t*8+k];
+        if(fwrite(ids,sizeof(ids),1,f)!=1||fwrite(weight+t*8,8*sizeof(float),1,f)!=1)return-1;
+    }
+    /* Diagnostics are excluded from speed runs. Flush before capture retrieval. */
+    if(fflush(f)||fsync(fileno(f)))return-1;
+    return 0;
+}
 int glm53f_moe_stage_sublayer_12n(void*context,float*out,const float*x){glm53f_moe_stage_context_12n*c=context;int li=c->active_layer-c->first_layer,selected[8],npart=0;float route_weight[8],part_weight[9];glm53f_expert_part part[9];int8_t router_qx[4096];float router_xs=0;if(li<0||li>=c->layer_count)return-1;double t=c->profile?glm53f_clock():0.0;
 if(!c->router_ready&&!c->router_i8){
     if (glm53f_team_available()) {
@@ -753,7 +809,7 @@ if(!c->router_ready&&!c->router_i8){
     }
 }if(c->router_i8){if(glm53f_i8_quantize_x(router_qx,&router_xs,x,4096))return-1;
 #pragma omp parallel for schedule(static)
-    for(int q=0;q<NEXPERTS/16;q++){int g=q/4,j=q%4;glm53f_i8_dot16(c->router_logits+q*16,c->router_i8+((size_t)li*NEXPERTS+g*64)*4096+j*64,c->router_i8_scale+(size_t)li*NEXPERTS+q*16,router_qx,router_xs,4096);}}c->router_ready=0;glm53f_router_topk(c->router_logits,c->router_bias+(size_t)li*NEXPERTS,NEXPERTS,8,2.5f,selected,route_weight);if(c->profile){c->profile_phase[0]+=glm53f_clock()-t;t=glm53f_clock();}int table_layer=c->active_layer-FIRST_LAYER;if(c->int8_enabled){if(moe_int8_local(c,c->scratch->local_output,x,c->router_i8?router_qx:NULL,router_xs,selected,route_weight,table_layer))return-1;if(c->profile){c->profile_phase[1]+=glm53f_clock()-t;t=glm53f_clock();}int rc=glm53f_sum_allreduce_12n(c->scratch->local_output,out,4096);if(c->profile)c->profile_phase[2]+=glm53f_clock()-t;return rc;}for(int k=0;k<8;k++){expert_offset*p=&c->table[table_layer*NEXPERTS+selected[k]];if(p->gate_up==UINT64_MAX)continue;part[npart]=(glm53f_expert_part){c->blob+p->gate_up,p->gate_up_scale==UINT64_MAX?NULL:(const float*)(c->blob+p->gate_up_scale),c->blob+p->down,p->down_scale==UINT64_MAX?NULL:(const float*)(c->blob+p->down_scale),p->inter,p->gate_type,p->down_type};part_weight[npart++]=route_weight[k];}if(c->shared_blob&&!c->nsh_native){shared_offset*p=&c->shared[table_layer];part[npart]=(glm53f_expert_part){c->shared_blob+p->gate_up,(const float*)(c->shared_blob+p->gate_up_scale),c->shared_blob+p->down,(const float*)(c->shared_blob+p->down_scale),p->inter,0,0};part_weight[npart++]=1.0f;}if(!moe_fused_shared(c,table_layer,x,part,part_weight,npart)){glm53f_moe_local_12n(c->scratch->local_output,part,part_weight,npart,x,c->scratch);{double tn=c->profile?glm53f_clock():0.0;if(c->nsh_native&&nsh_accumulate(c,table_layer,x,c->scratch->local_output))return-1;if(c->profile)c->profile_phase[3]+=glm53f_clock()-tn;}}if(c->profile){c->profile_phase[1]+=glm53f_clock()-t;t=glm53f_clock();}int rc=glm53f_sum_allreduce_12n(c->scratch->local_output,out,4096);if(c->profile)c->profile_phase[2]+=glm53f_clock()-t;return rc;}
+    for(int q=0;q<NEXPERTS/16;q++){int g=q/4,j=q%4;glm53f_i8_dot16(c->router_logits+q*16,c->router_i8+((size_t)li*NEXPERTS+g*64)*4096+j*64,c->router_i8_scale+(size_t)li*NEXPERTS+q*16,router_qx,router_xs,4096);}}c->router_ready=0;glm53f_router_topk(c->router_logits,c->router_bias+(size_t)li*NEXPERTS,NEXPERTS,8,2.5f,selected,route_weight);if(moe_trace_routes(c,selected,route_weight,1))return-1;if(c->profile){c->profile_phase[0]+=glm53f_clock()-t;t=glm53f_clock();}int table_layer=c->active_layer-FIRST_LAYER;if(c->int8_enabled){if(moe_int8_local(c,c->scratch->local_output,x,c->router_i8?router_qx:NULL,router_xs,selected,route_weight,table_layer))return-1;if(c->profile){c->profile_phase[1]+=glm53f_clock()-t;t=glm53f_clock();}int rc=moe_sum(c,c->scratch->local_output,out,4096);if(c->profile)c->profile_phase[2]+=glm53f_clock()-t;return rc;}for(int k=0;k<8;k++){expert_offset*p=&c->table[table_layer*NEXPERTS+selected[k]];if(p->gate_up==UINT64_MAX)continue;part[npart]=(glm53f_expert_part){c->blob+p->gate_up,p->gate_up_scale==UINT64_MAX?NULL:(const float*)(c->blob+p->gate_up_scale),c->blob+p->down,p->down_scale==UINT64_MAX?NULL:(const float*)(c->blob+p->down_scale),p->inter,p->gate_type,p->down_type};part_weight[npart++]=route_weight[k];}if(c->shared_blob&&!c->nsh_native){shared_offset*p=&c->shared[table_layer];part[npart]=(glm53f_expert_part){c->shared_blob+p->gate_up,(const float*)(c->shared_blob+p->gate_up_scale),c->shared_blob+p->down,(const float*)(c->shared_blob+p->down_scale),p->inter,0,0};part_weight[npart++]=1.0f;}if(!moe_fused_shared(c,table_layer,x,part,part_weight,npart)){glm53f_moe_local_12n(c->scratch->local_output,part,part_weight,npart,x,c->scratch);{double tn=c->profile?glm53f_clock():0.0;if(c->nsh_native&&nsh_accumulate(c,table_layer,x,c->scratch->local_output))return-1;if(c->profile)c->profile_phase[3]+=glm53f_clock()-tn;}}if(c->profile){c->profile_phase[1]+=glm53f_clock()-t;t=glm53f_clock();}int rc=moe_sum(c,c->scratch->local_output,out,4096);if(c->profile)c->profile_phase[2]+=glm53f_clock()-t;return rc;}
 
 void glm53f_moe_stage_profile_reset_12n(glm53f_moe_stage_context_12n *c) {
     if (c) {
@@ -766,8 +822,8 @@ void glm53f_moe_stage_profile_report_12n(const glm53f_moe_stage_context_12n *c,
                                         long positions, const char *label) {
     if (!c || !c->profile) return;
     double p[3], minimum[3];
-    MPI_Reduce(c->profile_phase,p,3,MPI_DOUBLE,MPI_MAX,0,MPI_COMM_WORLD);
-    MPI_Reduce(c->profile_phase,minimum,3,MPI_DOUBLE,MPI_MIN,0,MPI_COMM_WORLD);
+    MPI_Reduce(c->profile_phase,p,3,MPI_DOUBLE,MPI_MAX,0,c->dist?c->dist->tp:MPI_COMM_WORLD);
+    MPI_Reduce(c->profile_phase,minimum,3,MPI_DOUBLE,MPI_MIN,0,c->dist?c->dist->tp:MPI_COMM_WORLD);
     if (getenv("GLM53F_PROFILE_RANKS")) {
         double d = positions ? positions : 1;
         printf("GLM53F_MOE_RANK rank=%d router_ms=%.6f local_ms=%.6f allreduce_ms=%.6f\n",
@@ -1176,7 +1232,7 @@ static int moe_shared_q8(glm53f_moe_stage_context_12n *c, float *dst, const floa
     enum { H = 4096, LDY_DN = 4096 + 64 };
     const int in = c->nsh_in;
     if (!nsh_is_q80(c->nsh_gt[layer]) || !nsh_is_q80(c->nsh_ut[layer]) || !nsh_is_q80(c->nsh_dt[layer]) ||
-        in < 64 || in % 64 || in > 256 || c->nsh_gt[layer] != c->nsh_ut[layer]) return -2;
+        in < 64 || in % 64 || in > (c->dist?512:256) || c->nsh_gt[layer] != c->nsh_ut[layer]) return -2;
     if (!c->s8_gu[layer]) {
         /* gate rows first, then up rows, in one panel64 matrix of 2*in rows */
         uint8_t *g = s8_convert(c->nsh_gt[layer], c->nsh_g[layer], in, H);
@@ -1192,12 +1248,13 @@ static int moe_shared_q8(glm53f_moe_stage_context_12n *c, float *dst, const floa
     }
     const int T = GLM53F_PREFILL_MAX_TOKENS + 6;
     if (!c->s8_xq) {
+        const size_t width=c->dist?512u:256u, blocks=width/32;
         c->s8_xq = (int8_t *)gn_alloc((size_t)T * H); c->s8_xs = (float *)gn_alloc((size_t)T * (H / 32) * 4);
         c->s8_bt = (float *)gn_alloc((size_t)T * (H / 32) * 4);
         c->s8_xp = (int8_t *)gn_alloc((size_t)T * H); c->s8_xsp = (float *)gn_alloc((size_t)T * (H / 32) * 4);
-        c->s8_ygu = (float *)gn_alloc((size_t)T * 2 * 256 * 4);
-        c->s8_a8 = (int8_t *)gn_alloc((size_t)T * 256); c->s8_as = (float *)gn_alloc((size_t)T * 8 * 4); c->s8_bd = (float *)gn_alloc((size_t)T * 8 * 4);
-        c->s8_xp2 = (int8_t *)gn_alloc((size_t)T * 256); c->s8_asp = (float *)gn_alloc((size_t)T * 8 * 4);
+        c->s8_ygu = (float *)gn_alloc((size_t)T * 2 * width * 4);
+        c->s8_a8 = (int8_t *)gn_alloc((size_t)T * width); c->s8_as = (float *)gn_alloc((size_t)T * blocks * 4); c->s8_bd = (float *)gn_alloc((size_t)T * blocks * 4);
+        c->s8_xp2 = (int8_t *)gn_alloc((size_t)T * width); c->s8_asp = (float *)gn_alloc((size_t)T * blocks * 4);
         c->s8_y = (float *)gn_alloc((size_t)T * LDY_DN * 4);
         if (!c->s8_xq || !c->s8_xs || !c->s8_bt || !c->s8_xp || !c->s8_xsp || !c->s8_ygu || !c->s8_a8 || !c->s8_as ||
             !c->s8_bd || !c->s8_xp2 || !c->s8_asp || !c->s8_y) return -1;
@@ -1320,7 +1377,7 @@ static int moe_prefill_combine(glm53f_moe_stage_context_12n *c, float *out,
         for (int k = 0; k < 8; ++k)
             route[t][k] = c->table[table_layer * NEXPERTS + selected[t][k]].gate_up == UINT64_MAX ?
                 NULL : c->batch_routes + ((size_t)t * 8 + k) * 4096;
-    int overlap = mode == 2 && glm53f_async_available_12n();
+    int overlap = !c->dist && mode == 2 && glm53f_async_available_12n();
     int slab = overlap ? c->prefill.slab_tokens : tokens;
     if (overlap && glm53f_async_begin_12n(c->batch_local, out, tokens, 4096, slab)) return -1;
 #pragma omp parallel
@@ -1390,6 +1447,7 @@ static int moe_prefill_grouped(glm53f_moe_stage_context_12n *c, float *out,
         c->profile_phase[0] += glm53f_clock() - begin;
         begin = glm53f_clock();
     }
+    if(moe_trace_routes(c,&selected[0][0],&route_weight[0][0],tokens))return-1;
     moe_profile_occupancy(c, &selected[0][0], tokens);
     /* batch_routes rows of experts without a part on this rank are never read (see the combine below). */
     unsigned char native_done[NEXPERTS];
@@ -1579,14 +1637,14 @@ static int moe_prefill_grouped(glm53f_moe_stage_context_12n *c, float *out,
     if (c->ar_slab > 32) { /* whole-chunk MPI_Allreduce calls: 3.4 ms per 512 tokens vs 17 ms for 4-token panels */
         for (int base = 0; base < tokens; base += c->ar_slab) {
             int n = tokens - base < c->ar_slab ? tokens - base : c->ar_slab;
-            if (glm53f_sum_allreduce_mpi_12n(c->batch_local + (size_t)base * H, out + (size_t)base * H, n * H)) return -1;
+            if (moe_sum_mpi(c,c->batch_local + (size_t)base * H, out + (size_t)base * H, n * H)) return -1;
         }
     } else if (c->ar_slab > 0) { /* uTofu-wrapper slabs of at most 32 tokens */
-        if (glm53f_sum_allreduce_slabs_12n(c->batch_local, out, tokens, H, c->ar_slab)) return -1;
+        if (moe_sum_slabs(c,c->batch_local, out, tokens, H, c->ar_slab)) return -1;
     } else for (int base = 0; base < tokens; base += PANEL) {
         int n = tokens - base;
         if (n > PANEL) n = PANEL;
-        if (glm53f_sum_allreduce_12n(c->batch_local + (size_t)base * H,
+        if (moe_sum(c,c->batch_local + (size_t)base * H,
                                     out + (size_t)base * H, n * H)) return -1;
     }
     if (c->profile) c->profile_phase[2] += glm53f_clock() - begin;
@@ -1650,7 +1708,8 @@ int glm53f_moe_stage_sublayer_batch_12n(glm53f_moe_stage_context_12n*c,float*out
                 c->profile_phase[0] += glm53f_clock() - begin;
                 begin = glm53f_clock();
             }
-            moe_profile_occupancy(c, &selected[0][0], tokens);
+            if(moe_trace_routes(c,&selected[0][0],&route_weight[0][0],tokens))return-1;
+    moe_profile_occupancy(c, &selected[0][0], tokens);
             if (grouped) {
                 if (moe_prefill_int8_local(c, c->batch_local, x, tokens,
                                            table_layer, selected, route_weight)) return -1;
@@ -1660,7 +1719,7 @@ int glm53f_moe_stage_sublayer_batch_12n(glm53f_moe_stage_context_12n*c,float*out
                 }
                 int slab = tokens > 5 && (c->prefill.features & GLM53F_PREFILL_COMM) ?
                            c->prefill.slab_tokens : 1;
-                if (glm53f_sum_allreduce_slabs_12n(c->batch_local, out,
+                if (moe_sum_slabs(c,c->batch_local, out,
                                                    tokens, 4096, slab)) return -1;
                 if (c->profile) c->profile_phase[2] += glm53f_clock() - begin;
                 return 0;
@@ -1673,7 +1732,7 @@ int glm53f_moe_stage_sublayer_batch_12n(glm53f_moe_stage_context_12n*c,float*out
                     c->profile_phase[1] += glm53f_clock() - begin;
                     begin = glm53f_clock();
                 }
-                if (glm53f_sum_allreduce_12n(c->scratch->local_output,
+                if (moe_sum(c,c->scratch->local_output,
                         out + (size_t)t * 4096, 4096)) return -1;
                 if (c->profile) {
                     c->profile_phase[2] += glm53f_clock() - begin;
@@ -1692,7 +1751,7 @@ int glm53f_moe_stage_sublayer_batch_12n(glm53f_moe_stage_context_12n*c,float*out
     for(int t=0;t<tokens;t++){int selected[8],npart=0;float route_weight[8];const float*xt=x+(size_t)t*H;
 #pragma omp parallel for schedule(static)
         for(int e=0;e<NEXPERTS;e++)c->router_logits[e]=glm53f_dot_bf16_sve(c->router_w+((size_t)li*NEXPERTS+e)*H,xt,H);
-        glm53f_router_topk(c->router_logits,c->router_bias+(size_t)li*NEXPERTS,NEXPERTS,8,2.5f,selected,route_weight);
+        glm53f_router_topk(c->router_logits,c->router_bias+(size_t)li*NEXPERTS,NEXPERTS,8,2.5f,selected,route_weight);if(moe_trace_routes(c,selected,route_weight,1))return-1;
         for(int k=0;k<8;k++){expert_offset*p=&c->table[table_layer*NEXPERTS+selected[k]];if(p->gate_up==UINT64_MAX)continue;parts[t*MAXP+npart]=(glm53f_expert_part){c->blob+p->gate_up,p->gate_up_scale==UINT64_MAX?NULL:(const float*)(c->blob+p->gate_up_scale),c->blob+p->down,p->down_scale==UINT64_MAX?NULL:(const float*)(c->blob+p->down_scale),p->inter,p->gate_type,p->down_type};weights[t*MAXP+npart++]=route_weight[k];}
         counts[t]=npart;
     }
@@ -1718,7 +1777,7 @@ int glm53f_moe_stage_sublayer_batch_12n(glm53f_moe_stage_context_12n*c,float*out
         if (nsh_batch(c, table_layer, x, tokens)) return -1;
 #pragma omp parallel for schedule(static)
         for (int q = 0; q < tokens * H; ++q) c->batch_local[q] += c->batch_shared[q];
-        return glm53f_sum_allreduce_12n(c->batch_local, out, tokens * H);
+        return moe_sum(c,c->batch_local, out, tokens * H);
     }
     int has_iq=0;
     for(int t=0;t<tokens&&!has_iq;t++)
@@ -1757,7 +1816,7 @@ int glm53f_moe_stage_sublayer_batch_12n(glm53f_moe_stage_context_12n*c,float*out
                                       c->batch_activation, c->batch_shared);
 #pragma omp parallel for schedule(static)
             for (int q = 0; q < tokens*H; q++) c->batch_local[q] += c->batch_shared[q];
-            return glm53f_sum_allreduce_12n(c->batch_local, out, tokens*H);
+            return moe_sum(c,c->batch_local, out, tokens*H);
         }
         for(int t=0;t<tokens;t++){
             int n=counts[t];
@@ -1769,7 +1828,7 @@ int glm53f_moe_stage_sublayer_batch_12n(glm53f_moe_stage_context_12n*c,float*out
             glm53f_moe_local_12n(c->batch_local+(size_t)t*H,
                 parts+t*MAXP,weights+t*MAXP,n+1,x+(size_t)t*H,c->scratch);
         }
-        return glm53f_sum_allreduce_12n(c->batch_local,out,tokens*H);
+        return moe_sum(c,c->batch_local,out,tokens*H);
     }
     if(!c->task_up){if(posix_memalign((void**)&c->task_up,256,4*9*1024*4)||posix_memalign((void**)&c->task_activation,256,4*9*512*4)||posix_memalign((void**)&c->task_output,256,4*9*H*4))return-1;}
     float*up=c->task_up; float*act=c->task_activation; float*y=c->task_output;
@@ -1784,9 +1843,9 @@ int glm53f_moe_stage_sublayer_batch_12n(glm53f_moe_stage_context_12n*c,float*out
     glm53f_expert_tokens_bits(&shared,tokens,x,c->batch_up,c->batch_activation,c->batch_shared);
 #pragma omp parallel for schedule(static)
     for(int q=0;q<tokens*H;q++){int t=q/H,i=q-t*H;float v=0.0f;for(int k=0;k<counts[t];k++)v+=weights[t*MAXP+k]*y[((size_t)t*MAXP+k)*H+i];c->batch_local[q]=v+c->batch_shared[q];}
-    int rc=glm53f_sum_allreduce_12n(c->batch_local,out,tokens*H);return rc;
+    int rc=moe_sum(c,c->batch_local,out,tokens*H);return rc;
 }
-void glm53f_moe_stage_free_12n(glm53f_moe_stage_context_12n*c){if(!c)return;for(int l=0;l<NLAYERS;l++){free(c->s8_gu[l]);free(c->s8_dn[l]);}free(c->s8_xq);free(c->s8_xs);free(c->s8_bt);free(c->s8_xp);free(c->s8_xsp);free(c->s8_ygu);free(c->s8_a8);free(c->s8_as);free(c->s8_bd);free(c->s8_xp2);free(c->s8_asp);free(c->s8_y);for(int l=0;l<NLAYERS;l++){free(c->sg_gu[l]);free(c->sg_dn[l]);}free(c->sg_up);free(c->sg_act);free(c->sg_out);if(c->gn_threads){gn_tbuf*tb=(gn_tbuf*)c->gn_threads;for(int i=0;i<c->gn_nthreads;i++){free(tb[i].xp);free(tb[i].xp2);free(tb[i].a8);free(tb[i].xsp);free(tb[i].Bg);free(tb[i].ygu);free(tb[i].as);free(tb[i].asp);free(tb[i].mina);free(tb[i].yd);free(tb[i].cbuf);}free(c->gn_threads);}free(c->gn_xq);free(c->gn_xs);free(c->gn_bt);free(c->gn_verify);for(int l=0;l<NLAYERS;l++){free(c->nsh_g[l]);free(c->nsh_u[l]);free(c->nsh_d[l]);}free(c->nsh_gv);free(c->nsh_uv);free(c->nsh_act);free(c->nsh_out);free(c->nsh_act_x);free(c->nsh_act_h);free(c->i8_prefill_storage);for(int l=0;l<NLAYERS;l++)free(c->int8_scales[l]);free(c->task_output);free(c->task_activation);free(c->task_up);glm53f_iq_batch_scratch_free(c->verify_scratch);free(c->batch_routes);free(c->batch_group_x);free(c->batch_router);free(c->batch_local);free(c->batch_shared);free(c->batch_activation);free(c->batch_up);free(c->scratch);free(c->router_logits);free(c->router_bias);free(c->router_i8_scale);free(c->router_i8);free(c->router_wt);free(c->router_w);free(c->shared_blob);free(c->blob);free(c->table);free(c);}
+void glm53f_moe_stage_free_12n(glm53f_moe_stage_context_12n*c){if(!c)return;for(int l=0;l<NLAYERS;l++){if(c->route_export[l])fclose(c->route_export[l]);free(c->s8_gu[l]);free(c->s8_dn[l]);}free(c->s8_xq);free(c->s8_xs);free(c->s8_bt);free(c->s8_xp);free(c->s8_xsp);free(c->s8_ygu);free(c->s8_a8);free(c->s8_as);free(c->s8_bd);free(c->s8_xp2);free(c->s8_asp);free(c->s8_y);for(int l=0;l<NLAYERS;l++){free(c->sg_gu[l]);free(c->sg_dn[l]);}free(c->sg_up);free(c->sg_act);free(c->sg_out);if(c->gn_threads){gn_tbuf*tb=(gn_tbuf*)c->gn_threads;for(int i=0;i<c->gn_nthreads;i++){free(tb[i].xp);free(tb[i].xp2);free(tb[i].a8);free(tb[i].xsp);free(tb[i].Bg);free(tb[i].ygu);free(tb[i].as);free(tb[i].asp);free(tb[i].mina);free(tb[i].yd);free(tb[i].cbuf);}free(c->gn_threads);}free(c->gn_xq);free(c->gn_xs);free(c->gn_bt);free(c->gn_verify);for(int l=0;l<NLAYERS;l++){free(c->nsh_g[l]);free(c->nsh_u[l]);free(c->nsh_d[l]);}free(c->nsh_gv);free(c->nsh_uv);free(c->nsh_act);free(c->nsh_out);free(c->nsh_act_x);free(c->nsh_act_h);free(c->i8_prefill_storage);for(int l=0;l<NLAYERS;l++)free(c->int8_scales[l]);free(c->task_output);free(c->task_activation);free(c->task_up);glm53f_iq_batch_scratch_free(c->verify_scratch);free(c->batch_routes);free(c->batch_group_x);free(c->batch_router);free(c->batch_local);free(c->batch_shared);free(c->batch_activation);free(c->batch_up);free(c->scratch);free(c->router_logits);free(c->router_bias);free(c->router_i8_scale);free(c->router_i8);free(c->router_wt);free(c->router_w);free(c->shared_blob);free(c->blob);free(c->table);free(c);}
 
 #ifndef GLM53F_EXPERT_NO_MAIN
 int main(int argc, char **argv) {

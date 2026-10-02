@@ -2,11 +2,15 @@
 #define GLM53F_KDA_12N_H
 #include <stddef.h>
 #include "glm53f_prefill.h"
+#include "glm53f_dist.h"
 
 typedef struct glm53f_kda_context_12n glm53f_kda_context_12n;
 
 glm53f_kda_context_12n *glm53f_kda_create_12n(
     const char *model_dir, int layer);
+/* Borrows dist for its lifetime; requires an owned KDA layer and PP native image. */
+glm53f_kda_context_12n *glm53f_kda_create_dist(
+    const glm53f_dist *dist, const char *model_dir, const char *native_stage, int layer);
 void glm53f_kda_reset_12n(glm53f_kda_context_12n *context);
 void glm53f_kda_configure_prefill_12n(glm53f_kda_context_12n *context,
                                      const glm53f_prefill_config *config);
@@ -33,6 +37,7 @@ void glm53f_kda_last_phase_12n(
     const glm53f_kda_context_12n *context, double phase_seconds[3]);
 void glm53f_kda_last_detail_12n(
     const glm53f_kda_context_12n *context, double phase_seconds[5]);
+int glm53f_kda_head_range_12n(const glm53f_kda_context_12n *context, int *first, int *count);
 size_t glm53f_kda_state_bytes_12n(const glm53f_kda_context_12n *context);
 int glm53f_kda_save_state_12n(
     const glm53f_kda_context_12n *context, void *snapshot, size_t bytes);

@@ -126,3 +126,38 @@ int glm53f_pipeline_run(const glm53f_dist *d, int positions, int flat,
     if (profile) *profile = p;
     return 0;
 }
+
+/* One-token decode keeps a caller-owned 64KiB stream buffer. A completed
+ * step must be followed by the caller's world token broadcast before reuse. */
+int glm53f_pipeline_step(const glm53f_dist *d,int sequence,int flat,
+        glm53f_pipeline_callback producer,glm53f_pipeline_callback executor,
+        glm53f_pipeline_callback consumer,void *context,float *streams,
+        glm53f_pipeline_profile *profile) {
+    if(!d||!d->initialized)return-1;
+    int valid=sequence>=0&&flat>=4&&flat%4==0&&streams&&executor&&(!d->map.stage?producer!=NULL:1)&&
+        (d->map.stage==d->map.stages-1?consumer!=NULL:1),all;
+    int settings[2]={sequence,flat},low[2],high[2];
+    if(MPI_Allreduce(&valid,&all,1,MPI_INT,MPI_MIN,d->world)!=MPI_SUCCESS||
+       MPI_Allreduce(settings,low,2,MPI_INT,MPI_MIN,d->world)!=MPI_SUCCESS||
+       MPI_Allreduce(settings,high,2,MPI_INT,MPI_MAX,d->world)!=MPI_SUCCESS)return fail(d,"step_settings");
+    if(!all||memcmp(low,high,sizeof(low)))return-1;
+    pipeline_header header={0};glm53f_pipeline_profile p={0};double t=MPI_Wtime();
+    if(d->map.stage){MPI_Status status;int count;
+        if(MPI_Recv(&header,sizeof(header),MPI_BYTE,d->map.stage-1,8,d->pipeline,&status)!=MPI_SUCCESS||
+           MPI_Get_count(&status,MPI_BYTE,&count)!=MPI_SUCCESS||count!=(int)sizeof(header))return fail(d,"step_header_count");
+        if(header.magic!=UINT64_C(0x474c4d5050335434)||header.sequence!=sequence||header.offset!=sequence||header.tokens!=1||header.flat!=flat||header.source_stage!=d->map.stage-1||memcmp(header.cuts,d->config.cuts,sizeof(header.cuts)))return fail(d,"step_header");
+        if(MPI_Recv(streams,flat,MPI_FLOAT,d->map.stage-1,9,d->pipeline,&status)!=MPI_SUCCESS||
+           MPI_Get_count(&status,MPI_FLOAT,&count)!=MPI_SUCCESS||count!=flat)return fail(d,"step_payload");
+        p.receive_seconds=MPI_Wtime()-t;
+    }
+    t=MPI_Wtime();
+    if((!d->map.stage&&producer(context,d,streams,sequence,1,flat))||executor(context,d,streams,sequence,1,flat)||
+       (d->map.stage==d->map.stages-1&&consumer(context,d,streams,sequence,1,flat)))return fail(d,"step_callback");
+    p.compute_seconds=MPI_Wtime()-t;
+    if(d->map.stage<d->map.stages-1){header.magic=UINT64_C(0x474c4d5050335434);header.sequence=sequence;header.offset=sequence;header.tokens=1;header.flat=flat;header.source_stage=d->map.stage;memcpy(header.cuts,d->config.cuts,sizeof(header.cuts));t=MPI_Wtime();
+        if(MPI_Send(&header,sizeof(header),MPI_BYTE,d->map.stage+1,8,d->pipeline)!=MPI_SUCCESS||
+           MPI_Send(streams,flat,MPI_FLOAT,d->map.stage+1,9,d->pipeline)!=MPI_SUCCESS)return fail(d,"step_send");
+        p.send_wait_seconds=MPI_Wtime()-t;
+    }
+    p.microbatches=p.positions=1;if(profile)*profile=p;return 0;
+}

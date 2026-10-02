@@ -81,9 +81,25 @@ int main(int argc, char **argv) {
             CHECK(!glm53f_pipeline_run(&d, 4 * batches[b] + 3, 4 * 4096,
                 GLM53F_PIPELINE_OVERLAP, produce, execute, consume, &f, NULL));
         }
+        memset(&f, 0, sizeof(f));
+        float *step_streams = malloc(16384 * sizeof(float));
+        CHECK(step_streams != NULL);
+        CHECK(glm53f_pipeline_step(&d, 0, 15, produce, execute, consume, &f,
+            step_streams, NULL) == -1);
+        CHECK(glm53f_pipeline_step(&d, rank ? 0 : 1, 16384, produce, execute,
+            consume, &f, step_streams, NULL) == -1);
+        for (int step = 0; step < 128; ++step) {
+            CHECK(!glm53f_pipeline_step(&d, step, 16384, produce, execute,
+                consume, &f, step_streams, NULL));
+            int next = d.map.stage == d.map.stages - 1 ? step + 1 : -1;
+            CHECK(MPI_Bcast(&next, 1, MPI_INT, (d.map.stages - 1) * d.map.tp_size,
+                d.world) == MPI_SUCCESS);
+            CHECK(next == step + 1 && f.executed == step + 1);
+        }
+        free(step_streams);
         glm53f_dist_free(&d);
         CHECK(!d.initialized);
     }
-    if (!rank) puts("GLM53F_PIPELINE_PASS layouts=2 batches=3 schedules=2 tails=7 repeats=2");
+    if (!rank) puts("GLM53F_PIPELINE_PASS layouts=2 batches=3 schedules=2 tails=7 repeats=2 decode_steps=128");
     MPI_Finalize(); return 0;
 }

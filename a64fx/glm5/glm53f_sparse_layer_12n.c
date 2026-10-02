@@ -3,6 +3,9 @@
 #include "glm53f_sparse_core_12n.c"
 #undef main
 #include "glm53f_sparse_12n.h"
+#include "glm53f_pp_manifest.h"
+#include "glm53f_pp_core.h"
+#include "glm53f_pp_native.h"
 #include "glm53f_pf_plan.h"
 #include "glm53f_collective_12n.h"
 #include "glm53f_index_score.h"
@@ -80,6 +83,9 @@ typedef struct{float score;int id;} cp_candidate;
 
 struct glm53f_sparse_context_12n {
     glm53f_prefill_config prefill;
+    const glm53f_dist *dist;
+    const char *native_stage;
+    int image_rank;
     int rank,ranks,layer,h0,hn,qd,capacity,length,cp,local_capacity,pool_capacity,latent_bf16,prefix_replicated;
     uint8_t *qa,*qb,*kva,*op;
     uint8_t *q2_qa,*q2_qb,*q2_kva,*q2_vb,*q2_op;
@@ -114,10 +120,25 @@ struct glm53f_sparse_context_12n {
     double profile_phase[GLM53F_SPARSE_PROFILE_PHASES];
 };
 
+static MPI_Comm sparse_comm(const glm53f_sparse_context_12n *c){return c->dist?c->dist->tp:MPI_COMM_WORLD;}
+static int sparse_sum(const glm53f_sparse_context_12n *c,const float *input,float *output,int count){
+    if(!c->dist)return glm53f_sum_allreduce_12n(input,output,count);
+    return MPI_Allreduce(input==output?MPI_IN_PLACE:input,output,count,MPI_FLOAT,MPI_SUM,c->dist->tp)==MPI_SUCCESS?0:-1;
+}
+static int sparse_sum_slabs(const glm53f_sparse_context_12n *c,const float *input,float *output,int tokens,int columns,int slab){
+    if(!c->dist)return glm53f_sum_allreduce_slabs_12n(input,output,tokens,columns,slab);
+    if(slab<1)return-1;
+    for(int base=0;base<tokens;base+=slab){int n=tokens-base;if(n>slab)n=slab;
+        if(sparse_sum(c,input+(size_t)base*columns,output+(size_t)base*columns,n*columns))return-1;}
+    return 0;
+}
 static int sparse_native_load_one(const char *blob, const char *manifest,
         const char *wanted, int expected_type, int expected_rows,
         int expected_cols, uint8_t **output, int *loaded_type,
-        int allow_panel) {
+        int allow_panel, int require_hash) {
+    if(require_hash){int fd=open(blob,O_RDONLY);if(fd<0)return-1;
+        int rc=glm53f_pp_native_load(fd,manifest,wanted,expected_type,expected_rows,expected_cols,allow_panel,output,loaded_type);
+        close(fd);return rc;}
     FILE *m = fopen(manifest, "r");
     char line[512], type_name[32], name[256];
     uint64_t offset;
@@ -186,22 +207,22 @@ static int sparse_native_load_one(const char *blob, const char *manifest,
 }
 
 static int sparse_native_load(glm53f_sparse_context_12n *c) {
-    const char *stage = getenv("GLM53F_Q2_SPARSE_STAGE");
+    const char *stage = c->dist?c->native_stage:getenv("GLM53F_Q2_SPARSE_STAGE");
     char blob[PATH_MAX], manifest[PATH_MAX], name[256];
     if (!stage || !*stage) return 0;
     if (c->layer >= 45) return 0; /* MTP draft layer: not in the target native image, uses the FP8 checkpoint path */
-    snprintf(blob, sizeof(blob), "%s/rank%02d.blob", stage, c->rank);
-    snprintf(manifest, sizeof(manifest), "%s/rank%02d.manifest", stage, c->rank);
+    snprintf(blob, sizeof(blob), "%s/rank%02d.blob", stage, c->image_rank);
+    snprintf(manifest, sizeof(manifest), "%s/rank%02d.manifest", stage, c->image_rank);
 #define LOAD(S, T, R, C, P, TP) do { \
     snprintf(name, sizeof(name), "blk.%d." S, c->layer); \
-    if (sparse_native_load_one(blob, manifest, name, T, R, C, &c->P, TP, 1)) return -1; \
+    if (sparse_native_load_one(blob, manifest, name, T, R, C, &c->P, TP, 1, c->dist!=NULL)) return -1; \
 } while (0)
     LOAD("attn_q_a.weight", -1, QA, H, q2_qa, &c->q2_qa_type);
     LOAD("attn_q_b.weight", GLM53F_GGML_Q8_0, c->qd, QA, q2_qb, &c->q2_qb_type);
     LOAD("attn_kv_a_mqa.weight", GLM53F_GGML_Q8_0, LAT, H, q2_kva, &c->q2_kva_type);
     snprintf(name, sizeof(name), "blk.%d.attn_v_b.weight", c->layer);
     if (sparse_native_load_one(blob, manifest, name, GLM53F_GGML_Q8_0,
-            c->hn * VD, LAT, &c->q2_vb, &c->q2_vb_type, 0)) return -1;
+            c->hn * VD, LAT, &c->q2_vb, &c->q2_vb_type, 0, c->dist!=NULL)) return -1;
     LOAD("attn_output.weight", -1, H, c->hn * VD, q2_op, &c->q2_op_type);
 #undef LOAD
     c->q2_native = 1;
@@ -213,7 +234,7 @@ int glm53f_sparse_native_stage_probe_12n(int layer) {
     MPI_Comm_rank(MPI_COMM_WORLD, &c.rank);
     MPI_Comm_size(MPI_COMM_WORLD, &c.ranks);
     if (c.ranks != 12 || layer < 3 || layer >= 45 || layer % 4 != 3) return -1;
-    c.layer = layer;
+    c.layer = layer;c.image_rank=c.rank;
     glm53f_balanced_slice(NH, c.rank, c.ranks, &c.h0, &c.hn);
     c.qd = c.hn * KD;
     int rc = sparse_native_load(&c);
@@ -349,7 +370,12 @@ int glm53f_sparse_set_hot_prefix_12n(glm53f_sparse_context_12n *c, int hot_prefi
     return 0;
 }
 
-glm53f_sparse_context_12n*glm53f_sparse_create_format_12n(const char*model,int layer,int capacity,int latent_bf16){int rank,nr,h0,hn,qd;char n[256];glm53f_st_context*st;glm53f_sparse_context_12n*c;MPI_Comm_rank(MPI_COMM_WORLD,&rank);MPI_Comm_size(MPI_COMM_WORLD,&nr);if(nr!=12||capacity<1)return NULL;glm53f_balanced_slice(NH,rank,nr,&h0,&hn);qd=hn*KD;st=glm53f_st_open(model);if(!st)return NULL;c=calloc(1,sizeof(*c));if(!c)MPI_Abort(MPI_COMM_WORLD,2);c->rank=rank;c->ranks=nr;c->layer=layer;c->h0=h0;c->hn=hn;c->qd=qd;c->capacity=capacity;c->cp=getenv("GLM53F_SPARSE_CP")?atoi(getenv("GLM53F_SPARSE_CP"))!=0:capacity>=65536;c->latent_bf16=latent_bf16!=0;c->prefix_replicated=getenv("GLM53F_CP_PREFIX_REPLICATED")&&atoi(getenv("GLM53F_CP_PREFIX_REPLICATED"));if(c->latent_bf16)c->cp=1;c->local_capacity=(capacity+nr-1)/nr;c->pool_capacity=(capacity/KPOOL+nr-1)/nr;
+static glm53f_sparse_context_12n *sparse_create(const glm53f_dist *dist,const char *model,const char *native_stage,int layer,int capacity,int latent_bf16){int rank,nr,h0,hn,qd;char n[256];glm53f_st_context*st;glm53f_sparse_context_12n*c;
+    if(dist){if(!dist->initialized||dist->config.layout!=GLM53F_PP3_TP4||layer<dist->map.first_layer||layer>=dist->map.end_layer||layer%4!=3||!native_stage||!*native_stage)return NULL;rank=dist->map.tp_rank;nr=dist->map.tp_size;
+        char manifest[PATH_MAX];int z=snprintf(manifest,sizeof(manifest),"%s/rank%02d.manifest",native_stage,dist->map.world_rank);
+        if(z<0||z>=(int)sizeof(manifest)||glm53f_pp_manifest_check(manifest,"SPARSE",dist,dist->map.first_layer,dist->map.end_layer))return NULL;
+    }else{MPI_Comm_rank(MPI_COMM_WORLD,&rank);MPI_Comm_size(MPI_COMM_WORLD,&nr);if(nr!=12)return NULL;}
+    if(capacity<1)return NULL;glm53f_balanced_slice(NH,rank,nr,&h0,&hn);qd=hn*KD;st=dist?glm53f_pp_core_open(dist,model):glm53f_st_open(model);if(!st)return NULL;c=calloc(1,sizeof(*c));if(!c)MPI_Abort(MPI_COMM_WORLD,2);c->dist=dist;c->native_stage=native_stage;c->image_rank=dist?dist->map.world_rank:rank;c->rank=rank;c->ranks=nr;c->layer=layer;c->h0=h0;c->hn=hn;c->qd=qd;c->capacity=capacity;c->cp=dist?0:getenv("GLM53F_SPARSE_CP")?atoi(getenv("GLM53F_SPARSE_CP"))!=0:capacity>=65536;c->latent_bf16=latent_bf16!=0;c->prefix_replicated=!dist&&getenv("GLM53F_CP_PREFIX_REPLICATED")&&atoi(getenv("GLM53F_CP_PREFIX_REPLICATED"));if(c->latent_bf16)c->cp=1;c->local_capacity=(capacity+nr-1)/nr;c->pool_capacity=(capacity/KPOOL+nr-1)/nr;
 #define N(S) snprintf(n,sizeof n,"model.language_model.layers.%d.self_attn.%s",layer,S)
     N("q_a_proj.weight");c->qa=tensor(st,n,rank);N("q_a_proj.weight_scale_inv");c->qas=tensor(st,n,rank);N("q_a_layernorm.weight");c->qan=tensor(st,n,rank);N("q_b_proj.weight");c->qb=a256((size_t)qd*QA);readp(st,n,(size_t)h0*KD*QA,c->qb,(size_t)qd*QA,rank);N("q_b_proj.weight_scale_inv");{int nb=QA/128,tiles=qd/128;c->qbs=a256((size_t)tiles*nb*4);readp(st,n,(size_t)(h0*KD/128)*nb*4,c->qbs,(size_t)tiles*nb*4,rank);}N("kv_a_proj_with_mqa.weight");c->kva=tensor(st,n,rank);N("kv_a_proj_with_mqa.weight_scale_inv");c->kvas=tensor(st,n,rank);N("kv_a_layernorm.weight");c->kvan=tensor(st,n,rank);N("kv_b_proj.weight");c->kvb=a256((size_t)hn*(KD+VD)*LAT*2);readp(st,n,(size_t)h0*(KD+VD)*LAT*2,c->kvb,(size_t)hn*(KD+VD)*LAT*2,rank);{int oc0=h0*VD,ocn=hn*VD,ob=QKV/128,ob0=oc0/128,obn=ocn/128;N("o_proj.weight");c->op=a256((size_t)H*ocn);if(glm53f_st_read_columns(st,n,QKV,oc0,ocn,c->op))MPI_Abort(MPI_COMM_WORLD,2);N("o_proj.weight_scale_inv");c->ops=a256((size_t)(H/128)*obn*sizeof(float));if(glm53f_st_read_columns(st,n,(size_t)ob*sizeof(float),(size_t)ob0*sizeof(float),(size_t)obn*sizeof(float),c->ops))MPI_Abort(MPI_COMM_WORLD,2);}N("indexer.wk.weight");c->wk=tensor(st,n,rank);N("indexer.k_norm.weight");c->knw=tensor(st,n,rank);N("indexer.k_norm.bias");c->knb=tensor(st,n,rank);N("indexer.index_kpool_compress_gate");c->gatew=tensor(st,n,rank);N("indexer.index_kpool_compress_ape");c->ape=tensor(st,n,rank);N("indexer.wq_b.weight");c->wqb=tensor(st,n,rank);N("indexer.weights_proj.weight");c->wp=tensor(st,n,rank);
 #undef N
@@ -364,6 +390,8 @@ glm53f_sparse_context_12n*glm53f_sparse_create_format_12n(const char*model,int l
     if (!c->cp && c->q2_native && svcntw() == 16 && mla_mode && atoi(mla_mode) >= 3)
         c->latent_f16 = a256((size_t)capacity * LAT * sizeof(uint16_t));
     c->qres=a256(QA*4);c->query=a256((size_t)qd*4);if(c->cp){c->cp_latent=a256((size_t)c->local_capacity*LAT*(c->latent_bf16?2:4));c->cp_key=a256((size_t)c->local_capacity*ID*4);c->cp_gate=a256((size_t)c->local_capacity*ID*4);c->cp_pool=a256((size_t)(c->pool_capacity+1)*ID*4);c->cp_pack=a256((size_t)(TOPK+KPOOL)*LAT*4);c->cp_exchange=a256((size_t)2*KPOOL*ID*4);c->cp_cur_latent=a256(LAT*4);c->cp_cur_key=a256(ID*4);c->cp_cur_gate=a256(ID*4);c->cp_pack_index=a256((size_t)(TOPK+KPOOL)*sizeof(int));int nc=c->pool_capacity+1>TOPK/KPOOL?c->pool_capacity+1:TOPK/KPOOL;c->cp_candidate_local=a256((size_t)nc*sizeof(cp_candidate));c->cp_candidate_gather=a256((size_t)nr*(TOPK/KPOOL)*sizeof(cp_candidate));}else{c->latent=a256((size_t)capacity*LAT*4);c->key=a256((size_t)capacity*ID*4);c->gcache=a256((size_t)capacity*ID*4);c->pool=a256((size_t)(capacity/KPOOL+1)*ID*4);c->pool_score_cache=a256((size_t)(capacity/KPOOL+1)*sizeof(pool_score));c->pool_score_local=a256((size_t)(capacity/KPOOL+1)*sizeof(float));c->pool_score_global=a256((size_t)(capacity/KPOOL+1)*sizeof(float));c->packed=a256((size_t)(TOPK+KPOOL)*LAT*4);c->packed_index=a256((size_t)(TOPK+KPOOL)*sizeof(int));for(int i=0;i<TOPK+KPOOL;i++)c->packed_index[i]=i;}c->iq=a256((size_t)IH*ID*4);c->iw=a256(IH*4);c->attn=a256((size_t)hn*VD*4);c->partial=a256(H*4);c->selected=a256((size_t)(TOPK+KPOOL)*sizeof(int));c->apef=a256(KPOOL*ID*4);for(int i=0;i<KPOOL*ID;i++)c->apef[i]=glm53f_bf16_to_f32(c->ape[i]);if(getenv("GLM53F_TOUCH_CACHE")){if(c->cp){memset(c->cp_latent,0,(size_t)c->local_capacity*LAT*(c->latent_bf16?2:4));memset(c->cp_key,0,(size_t)c->local_capacity*ID*4);memset(c->cp_gate,0,(size_t)c->local_capacity*ID*4);memset(c->cp_pool,0,(size_t)(c->pool_capacity+1)*ID*4);}else{memset(c->latent,0,(size_t)capacity*LAT*4);memset(c->key,0,(size_t)capacity*ID*4);memset(c->gcache,0,(size_t)capacity*ID*4);memset(c->pool,0,(size_t)(capacity/KPOOL+1)*ID*4);}}return c;}
+glm53f_sparse_context_12n *glm53f_sparse_create_format_12n(const char *model,int layer,int capacity,int latent_bf16){return sparse_create(NULL,model,NULL,layer,capacity,latent_bf16);}
+glm53f_sparse_context_12n *glm53f_sparse_create_dist(const glm53f_dist *dist,const char *model,const char *native_stage,int layer,int capacity,int latent_bf16){return dist?sparse_create(dist,model,native_stage,layer,capacity,latent_bf16):NULL;}
 glm53f_sparse_context_12n *glm53f_sparse_create_12n(const char *model, int layer, int capacity) {
     return glm53f_sparse_create_format_12n(model, layer, capacity, 0);
 }
@@ -439,7 +467,7 @@ size_t glm53f_sparse_cache_bytes_12n(const glm53f_sparse_context_12n *c) {
     return n;
 }
 static void update_completed_pool(glm53f_sparse_context_12n*c,int pool){float*pk=c->pool+(size_t)pool*ID;for(int d=0;d<ID;d++){float mx=-INFINITY,den=0,val=0;for(int z=0;z<KPOOL;z++){float a=c->gcache[(size_t)(pool*KPOOL+z)*ID+d]+c->apef[(size_t)z*ID+d];if(a>mx)mx=a;}for(int z=0;z<KPOOL;z++){float a=expf(c->gcache[(size_t)(pool*KPOOL+z)*ID+d]+c->apef[(size_t)z*ID+d]-mx);den+=a;val+=a*c->key[(size_t)(pool*KPOOL+z)*ID+d];}pk[d]=val/den;}}
-static int sp_ar(const float *in, float *out, int n);
+static int sp_ar(const glm53f_sparse_context_12n *c, const float *in, float *out, int n);
 struct pool_score_call { glm53f_sparse_context_12n *c; int tokens, np, replicated; };
 static int index_heads_enabled(void) {
     const char *e = getenv("GLM53F_INDEX_HEADS");
@@ -515,7 +543,7 @@ static int select_incremental(glm53f_sparse_context_12n *c, int tokens, int deco
          * still distributes its much larger score matrix across ranks. */
         const float *scores = c->pool_score_local;
         if (!replicated) {
-            if (sp_ar(scores, c->pool_score_global, np)) return -1;
+            if (sp_ar(c,scores, c->pool_score_global, np)) return -1;
             scores = c->pool_score_global;
         }
         pool_top_exact(c->pool_score_cache, scores, np, nc,
@@ -743,13 +771,15 @@ static void sparse_gemm_run(const uint8_t *wp, int K, int R, const float *x, int
  * every OTHER collective of the tile (index scores, pool scores) goes through MPI to avoid sharing the multi-TNI state. */
 static int sp_defer_reduce;
 void glm53f_sparse_set_defer_reduce_12n(int on) { sp_defer_reduce = on; }
-static inline int sp_ar(const float *in, float *out, int n) {
+static inline int sp_ar(const glm53f_sparse_context_12n *c, const float *in, float *out, int n) {
     /* The owner serializes uTofu with the output stream, preserving decode's
      * reduction order. Only the legacy helper needs the MPI detour. */
+    if(c->dist)return sparse_sum(c,in,out,n);
     return sp_defer_reduce && !glm53f_async_owner_12n() ?
         glm53f_sum_allreduce_mpi_12n(in, out, n) : glm53f_sum_allreduce_12n(in, out, n);
 }
-static inline int sp_ar_prefill(const float *in, float *out, int n) {
+static inline int sp_ar_prefill(const glm53f_sparse_context_12n *c, const float *in, float *out, int n) {
+    if(c->dist)return sparse_sum(c,in,out,n);
     return sp_defer_reduce && !glm53f_async_owner_12n() ?
         glm53f_sum_allreduce_mpi_12n(in, out, n) : glm53f_sum_allreduce_prefill_12n(in, out, n);
 }
@@ -961,7 +991,7 @@ static int cp_exchange_selected(glm53f_sparse_context_12n *c, int ns) {
                 cp_read_latent(c->cp_pack + (size_t)i * LAT, c, p / c->ranks);
             c->cp_pack_index[i] = i;
         }
-        return MPI_Allreduce(MPI_IN_PLACE, c->cp_pack, ns * LAT, MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD) == MPI_SUCCESS ? 0 : -1;
+        return MPI_Allreduce(MPI_IN_PLACE, c->cp_pack, ns * LAT, MPI_FLOAT, MPI_SUM, sparse_comm(c)) == MPI_SUCCESS ? 0 : -1;
     }
     /* The hot prefix is computed identically on every rank. Avoid the
      * selected-row collective while the complete selected set is resident. */
@@ -1011,9 +1041,9 @@ static int cp_exchange_selected(glm53f_sparse_context_12n *c, int ns) {
     if (c->latent_bf16) {
         if (MPI_Allgatherv(c->cp_bf16_local, counts[c->rank], MPI_UINT16_T,
                 c->cp_bf16_gather, counts, offsets, MPI_UINT16_T,
-                MPI_COMM_WORLD) != MPI_SUCCESS) return -1;
+                sparse_comm(c)) != MPI_SUCCESS) return -1;
     } else if (MPI_Allgatherv(c->cp_pack, counts[c->rank], MPI_FLOAT, c->cp_gather,
-            counts, offsets, MPI_FLOAT, MPI_COMM_WORLD) != MPI_SUCCESS) return -1;
+            counts, offsets, MPI_FLOAT, sparse_comm(c)) != MPI_SUCCESS) return -1;
 #pragma omp parallel for schedule(static)
     for (int i = 0; i < ns; ++i) {
         float *destination = c->cp_pack + (size_t)i * LAT;
@@ -1081,7 +1111,7 @@ static int sparse_attention_local_cp(glm53f_sparse_context_12n *c, float *attn, 
                 memcpy(c->cp_exchange + (size_t)(KPOOL + z) * ID, c->cp_gate + (size_t)s * ID, ID * 4);
             }
         }
-        if (glm53f_sum_allreduce_12n(c->cp_exchange, c->cp_exchange,
+        if (sparse_sum(c,c->cp_exchange, c->cp_exchange,
                                     2 * KPOOL * ID))
             return -1;
         if (powner == c->rank || prefix) {
@@ -1159,7 +1189,7 @@ static int sparse_attention_local_cp(glm53f_sparse_context_12n *c, float *attn, 
         cp_top_exact(local, local_pools, choose);
     for (int i = local_pools; i < choose; i++)
         local[i] = (cp_candidate){-INFINITY, INT_MAX};
-    if (choose && glm53f_allgather_bytes_12n(local, gather, choose * (int)sizeof(*local)))
+    if (choose && (c->dist ? (MPI_Allgather(local,choose*(int)sizeof(*local),MPI_BYTE,gather,choose*(int)sizeof(*local),MPI_BYTE,c->dist->tp)!=MPI_SUCCESS) : glm53f_allgather_bytes_12n(local,gather,choose*(int)sizeof(*local))))
         return -1;
     if (choose) {
         if (getenv("GLM53F_CP_TOP_REFERENCE"))
@@ -1218,7 +1248,7 @@ int glm53f_sparse_sublayer_12n(void*context,float*out,const float*x){glm53f_spar
     else glm53f_mv_fp8_block128_bits(c->partial,c->op,c->ops,c->attn,H,local_cols);
     c->profile_phase[4] += sparse_clock(c) - begin;
     begin = sparse_clock(c);
-    int rc = glm53f_sum_allreduce_12n(c->partial,out,H);
+    int rc = sparse_sum(c,c->partial,out,H);
     if (!rc) sparse_dump(c, "dsa_out", out, H * sizeof(float));
     c->profile_phase[5] += sparse_clock(c) - begin;
     return rc;}
@@ -1229,7 +1259,7 @@ int glm53f_sparse_output_reference_12n(glm53f_sparse_context_12n*c,float*out,
     if(c->q2_native){if(glm53f_iq_matvec(c->partial,c->q2_op,c->q2_op_type,H,cols,local))return-1;}
     else if(c->int8_enabled)sparse_mv_int8(c->partial,c->int8_weight[3],c->int8_scale[3],local,H,cols);
     else glm53f_mv_fp8_block128_bits(c->partial,c->op,c->ops,local,H,cols);
-    return glm53f_sum_allreduce_12n(c->partial,out,H);
+    return sparse_sum(c,c->partial,out,H);
 }
 int glm53f_sparse_value_reference_12n(glm53f_sparse_context_12n*c,float*out,
         const float*kv_latent){
@@ -1280,22 +1310,22 @@ int glm53f_sparse_sublayer_batch_12n(glm53f_sparse_context_12n *c,
     begin = sparse_clock(c);
     if (batch_mode == 2) {
         for (int t = 0; t < tokens; ++t)
-            if (glm53f_sum_allreduce_12n(c->batch_partial + (size_t)t * H,
+            if (sparse_sum(c,c->batch_partial + (size_t)t * H,
                                          out + (size_t)t * H, H)) return -1;
         c->profile_phase[5] += sparse_clock(c) - begin;
         return 0;
     }
-    int rc = glm53f_sum_allreduce_12n(c->batch_partial, out, tokens * H);
+    int rc = sparse_sum(c,c->batch_partial, out, tokens * H);
     c->profile_phase[5] += sparse_clock(c) - begin;
     return rc;
 }
 struct glm53f_sparse_prefill_workspace_12n {
     float qres[GLM53F_PREFILL_ATTN_TOKENS * QA];
-    float query[GLM53F_PREFILL_ATTN_TOKENS * 6 * KD];
+    float query[GLM53F_PREFILL_ATTN_TOKENS * 16 * KD];
     float iq[GLM53F_PREFILL_ATTN_TOKENS * IH * ID];
     float iw[GLM53F_PREFILL_ATTN_TOKENS * IH];
     float raw[GLM53F_PREFILL_ATTN_TOKENS * ID];
-    float attn[GLM53F_PREFILL_ATTN_TOKENS * 6 * VD];
+    float attn[GLM53F_PREFILL_ATTN_TOKENS * 16 * VD];
     float partial[GLM53F_PREFILL_ATTN_TOKENS * H];
     int selected[GLM53F_PREFILL_ATTN_TOKENS][TOPK + KPOOL];
     int count[GLM53F_PREFILL_ATTN_TOKENS];
@@ -1410,13 +1440,13 @@ static int sparse_select_prefill(glm53f_sparse_context_12n *c,
                        (size_t)((base + t + 1) / KPOOL) * sizeof(float));
             }
             w->score_offsets[tokens] = total;
-            if (sp_ar_prefill(w->score_packed_local,
+            if (sp_ar_prefill(c,w->score_packed_local,
                     w->score_packed_global, total)) return -1;
         }
     } else for (int t = 0; t < tokens; ++t) {
         int length = base + t + 1;
         if (length > TOPK + KPOOL - 1 &&
-            sp_ar(w->score_local + (size_t)t * w->score_stride,
+            sp_ar(c,w->score_local + (size_t)t * w->score_stride,
                 w->score_global + (size_t)t * w->score_stride, length / KPOOL)) return -1;
     }
 #pragma omp parallel for schedule(static)
@@ -1768,7 +1798,7 @@ int glm53f_sparse_prefill_12n(glm53f_sparse_context_12n *c,
                                 for (int i = 0; i < ns; ++i)
                                     for (int d = 0; d < LAT; ++d)
                                         c->packed[(size_t)i * LAT + d] = (float)(_Float16)c->latent[(size_t)w->selected[t][i] * LAT + d];
-                                float tmp[8 * VD];
+                                float tmp[16 * VD];
                                 mla_heads_q8_value(c, tmp, w->query + (size_t)t * c->qd, c->packed, NULL, ns);
                                 const float *vao = c->q8v_va + (size_t)h * LAT, *qlo = c->q8v_ql + (size_t)h * LAT;
                                 double eql = 0;
@@ -1814,7 +1844,7 @@ int glm53f_sparse_prefill_12n(glm53f_sparse_context_12n *c,
     c->profile_phase[4] += sparse_clock(c) - begin;
     if (sp_defer_reduce) { memcpy(out, w->partial, (size_t)tokens * H * sizeof(float)); return 0; } /* reduced by the caller's helper */
     begin = sparse_clock(c);
-    if (glm53f_sum_allreduce_slabs_12n(w->partial, out, tokens, H,
+    if (sparse_sum_slabs(c,w->partial, out, tokens, H,
             c->prefill.features & GLM53F_PREFILL_COMM ? c->prefill.slab_tokens : 1)) return -1;
     c->profile_phase[5] += sparse_clock(c) - begin;
     return 0;

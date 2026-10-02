@@ -152,3 +152,82 @@ is pending; its PP constructor is not yet connected.
    promotion requires >=5% prefill gain and <=2% decode regression plus all
    correctness gates. The 100/2000 goal requires both rates on one qualified
    12-node configuration.
+
+## Owned model and runner (October 3)
+
+The experimental PP runner now binds explicit stage-local contexts in every
+component. KDA and sparse attention own sixteen heads; dense layers own3072
+channels, routed expert parts512 channels and shared slices512 channels.
+Embedding lives on stage0; final normalization and the vocabulary head live
+on stage2. Native PP core reads use a context-scoped reader, bypassing the
+legacy process-global TP12 repack image. Metadata and payloads are checked
+before binding; source stamps describe shard metadata, while payload hashes
+cover the actual staged bytes. PP image namespaces reject TP12 headers.
+
+`stage_glm53f_pp_12n.sh` builds owned images directly from GGUF below `/local`
+with bounded reads/writeback and source-cache release. It refuses overlapping
+native MPI launches. The resident constructor accounts for native/compact
+weights, vocabulary transients, repacks/derived panels, replicated sparse KV,
+recurrent state, MoE/attention workspaces and pipeline slots. It rejects a
+conservative peak leaving less than6GiB and checks headroom after loading.
+This inventory is an upper bound; real PP peak measurements remain pending.
+Never construct a TP12 and PP model simultaneously on a node.
+
+```sh
+# Use the shared build, keeping experimental binaries separate from controls.
+GLM53F_BIN_DIR=build/pp-native-v1 bash build_glm53f_integrated_12n.sh check 47 4096
+bash stage_glm53f_pp_12n.sh "$GGUF" "$PP_ROOT" build/pp-native-v1 "$STAGE_LOGS" \
+  --pipeline-cuts 15,30
+mpiexec -n 12 build/pp-native-v1/glm53f_target_decode_12n \
+  "$MODEL_METADATA" "$PP_ROOT/routed" "$PP_ROOT/shared" \
+  --generate "$PROMPT_IDS" "$OUTPUT_IDS" 129 \
+  --parallel-layout pp3-tp4 --pp-image-root "$PP_ROOT" \
+  --pipeline-cuts 15,30 --pipeline-microbatch 1024 --pipeline-schedule two-slot \
+  --prefill-mode fast --prefill-features 27 --prefill-slab 32 \
+  --capacity 16384 --ignore-eos
+```
+
+`--pipeline-schedule serialized` uses the same callbacks and ownership for the
+reference schedule. PP generation is greedy with FP32 cache; unsupported
+conversion/CP settings are rejected. Prefill timing includes the complete
+prompt, pipeline transfer/fill/drain and first readout. Generated token1 comes
+from that readout, so129 output IDs measure128 subsequent decode transitions.
+The TP12 runner additionally reports `GLM53F_TARGET_FULL_PROMPT_TIMING` using
+the same full-prompt/first-readout and post-first-token timing boundary; its
+historical timing record remains available. Neither new timing record is
+comparable directly to the older8048-prefix/128-readout denominator.
+
+`--state-export PREFIX` is diagnostic: it exports every prompt token's four
+streams, final streams, per-layer/head KDA state, replicated sparse persistent
+fields and selected indices, expert routes for all executed positions, and
+post-decode state at `PREFIX.decode`. Files are exclusive, bounded and flushed;
+such runs do not qualify throughput. After retrieving all rank files:
+
+```sh
+python3 tools/compare_glm53f_fields.py "$TP12_PREFIX" "$PP_PREFIX" \
+  --reference-ids "$TP12_IDS" --candidate-ids "$PP_IDS"
+python3 tools/compare_glm53f_fields.py "$TP12_PREFIX" "$PP_PREFIX" --phase decode \
+  --reference-ids "$TP12_IDS" --candidate-ids "$PP_IDS"
+# Require exact same-cut/same-microbatch schedule behavior separately.
+python3 tools/compare_glm53f_fields.py "$SERIAL_PREFIX" "$PIPELINE_PREFIX" --bit-exact \
+  --reference-ids "$SERIAL_IDS" --candidate-ids "$PIPELINE_IDS"
+```
+
+The comparator requires complete canonical head coverage, exact structural
+metadata/shapes, finite FP32 fields, per-token means/streams and per-head
+recurrent/convolution fields at rel-L2<=1e-3, and exact zero-norm fields.
+Generated IDs must match exactly. Route and sparse-selection changes are
+reported independently; `--bit-exact` also requires their exact equality.
+Both prefill and post-decode captures must pass.
+
+Native PJM52106727 gates now pass: owned executor short128 and8049 positions
+at microbatches512/1024/2048 are bit-exact in streams, state and readout, with
+minimum headroom9.036316GiB; dense28 format/partition cases, shared28,
+KDA16, sparse12 and routed corruption/ownership fixtures pass. Core-context
+row/column/hash rejection passes all12 ranks; packed embedding broadcasts
+pass eight sizes through2049, owner boundaries/duplicates and signed-zero
+bits. The pipeline fixture also passes128 sequential full-width transitions
+for both layouts and all three microbatches. Host reader/ASan/UBSan,
+40 legacy repack-policy cases and canonical comparison rejection tests pass.
+Full real-weight PP load, cross-layout numerical/ID gates, stress/32K and
+whole-model performance are still pending. No PP promotion or100/2000 claim.

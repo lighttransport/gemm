@@ -1,0 +1,87 @@
+{
+  "date": "2026-10-03",
+  "status": "experimental_integration_native_PP_model_pending",
+  "layout": "pp3-tp4",
+  "cuts": [
+    15,
+    30
+  ],
+  "allocation": 52106727,
+  "promoted": false,
+  "targets_met": false,
+  "best_previous_recipe": {
+    "decode_tok_s": 35.462134,
+    "prefill_tok_s": 412.273634,
+    "timing_boundary": "historical 8048-prefix control; not directly comparable to new full-prompt timing"
+  },
+  "runner_sha256": "61b17d8725dadfcbbbcbc5b7a50bd2bc9ce277cc5e5fc6a2918ebf8a70ef3db4",
+  "core_stage_sha256": "0b1643637dd0192239112d72915442b0e5a711f568adffcf201cf40a6cd7f5fa",
+  "implemented": [
+    "owned component constructors and native images",
+    "sixteen-head stage-local attention",
+    "serialized and two-slot prefill",
+    "sequential pipeline decode",
+    "packed embedding broadcast",
+    "source/layout/hash gates",
+    "conservative memory preflight with six GiB reserve",
+    "canonical prompt/state/route export and offline comparator",
+    "full-prompt and first-readout timing"
+  ],
+  "native_pass": {
+    "TP12_owned_executor": {
+      "prompt_lengths": [
+        128,
+        8049
+      ],
+      "microbatches": [
+        512,
+        1024,
+        2048
+      ],
+      "streams_state_readout": "bit-exact",
+      "minimum_headroom_GiB": 9.036316
+    },
+    "rebuilt_TP12_against_frozen_state": "bit-exact",
+    "dense_cases": 28,
+    "shared_cases": 28,
+    "routed_format_partition_cases": 24,
+    "kda_cases": 16,
+    "sparse_cases": 12,
+    "core_reader": "all twelve ranks; row/column/hash rejection",
+    "embedding_sizes": 8,
+    "pipeline_sequential_steps_per_configuration": 128,
+    "source_and_inventory_configurations": 48
+  },
+  "host_pass": [
+    "946 legal cut layouts",
+    "context reader and ASan/UBSan",
+    "40 legacy repack-policy cases",
+    "typed-state float and exact-metadata tests",
+    "canonical comparison threshold/nonfinite/zero-norm/coverage/selection/route tests"
+  ],
+  "short_TP12_export_self_check": {
+    "prefill_fields": 9403,
+    "decode_fields": 8763,
+    "meaning": "validates actual export completeness and finiteness only; not cross-layout equivalence"
+  },
+  "preserved_failure": "original routed fixture launch used a missing executable; repaired integrated-path native fixtures pass",
+  "pending": [
+    "complete PP native staging",
+    "real PP resident load and measured headroom",
+    "TP12 versus PP canonical state and exact IDs",
+    "serialized versus two-slot exact equality across multiple microbatches",
+    "8049, 1024-step stress, short128 and repeated32K gates",
+    "microbatch and cut profiling",
+    "three-trial screen and five-trial independent confirmation against fresh TP12"
+  ],
+  "promotion_gate": {
+    "prefill_gain_min": 0.05,
+    "decode_regression_max": 0.02,
+    "state_relative_l2_max": 0.001,
+    "zero_norm": "bit-exact",
+    "ids": "exact"
+  },
+  "logs": "tmp/strata-pipeline-20261002/{full-driver,repair-fixture-driver,pp-full-driver}.log",
+  "remote_checkout": "~/work/gemm/glm53f-strata-20261001",
+  "stage_root": "/local/glm53f-pp3-tp4-52106727-15-30"
+}

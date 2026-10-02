@@ -57,13 +57,15 @@ obj gemm_kern kern/glm53f_kern_gemm.c
 "$cc" "${cflags[@]}" -c kern/glm53f_kern_gemm_asm.S -o "$build_dir/gemm_asm.o"
 obj head glm53f_target_head_12n.c "${external[@]}" -DGLM53F_TARGET_HEAD_NO_MAIN
 obj embedding glm53f_embedding_12n.c "${external[@]}"
+obj dist glm53f_dist.c
+obj pipeline glm53f_pipeline.c
 objects=("$build_dir/q8_panel.o" "$build_dir/gemm_kern.o" "$build_dir/gemm_asm.o")
-for name in team collective kda sparse dense moe iq_bridge head embedding; do
+for name in team collective kda sparse dense moe iq_bridge head embedding dist pipeline; do
     objects+=("$build_dir/$name.o")
 done
 kernels=("$build_dir/team.o" "$build_dir/iq_bridge.o" "$build_dir/q8_panel.o" "$build_dir/collective.o" "$build_dir/gemm_kern.o" "$build_dir/gemm_asm.o")
 bin glm53f_target_decode_12n glm53f_target_decode_12n.c "${objects[@]}"
-for name in pp_routed_stage q2_stage q2_embed_stage q2_dense_stage q2_sparse_stage q2_kda_stage \
+for name in pp_routed_stage pp_core_stage pp_dense_stage pp_shared_stage pp_kda_stage pp_sparse_stage pp_embed_stage pp_head_stage q2_stage q2_embed_stage q2_dense_stage q2_sparse_stage q2_kda_stage \
             q2_shexp_stage q2_core_patch q2_shared_patch core_stage core_add_routers; do
     bin "glm53f_$name" "glm53f_$name.c"
 done
@@ -76,8 +78,17 @@ if [ "$bin_dir" = . ]; then bin ../utofu-tests/tofu_topo_helper ../utofu-tests/t
 
 if [ "$mode" != runtime ]; then
     obj target glm53f_target_decode_12n.c -DGLM53F_TARGET_MODEL_NO_MAIN
+    bin glm53f_layers_check_12n glm53f_layers_check_12n.c "${objects[@]}"
     bin test_glm53f_dense_dist test_glm53f_dense_dist.c glm53f_dist.c "$build_dir/dense.o" "$build_dir/kda.o" "${kernels[@]}"
     bin test_glm53f_pp_routed test_glm53f_pp_routed.c
+    bin test_glm53f_pp_dense test_glm53f_pp_dense.c
+    bin test_glm53f_pp_shared -DGLM53F_PP_SHARED_FIXTURE test_glm53f_pp_dense.c
+    bin test_glm53f_pp_kda test_glm53f_pp_kda.c
+    bin test_glm53f_pp_sparse test_glm53f_pp_sparse.c
+    bin test_glm53f_pp_core test_glm53f_pp_core.c glm53f_dist.c
+    bin test_glm53f_pp_images test_glm53f_pp_images.c
+    bin test_glm53f_pp_embedding test_glm53f_pp_embedding.c glm53f_dist.c
+    bin test_glm53f_st_slice test_glm53f_st_slice.c
     bin test_glm53f_parallel test_glm53f_parallel.c
     bin test_glm53f_pipeline test_glm53f_pipeline.c glm53f_dist.c glm53f_pipeline.c
     bin test_glm53f_team test_glm53f_team.c "$build_dir/team.o"

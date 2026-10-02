@@ -49,6 +49,10 @@ static int read_exact(int fd, uint64_t off, void *dst, size_t bytes) {
 }
 
 static int write_exact(int fd, uint64_t off, const void *src, size_t bytes) {
+#ifdef GLM53F_PP_CORE_STAGE
+    static uint64_t pending;
+    const size_t initial_bytes=bytes;
+#endif
     const unsigned char *p = src;
     while (bytes) {
         ssize_t put = pwrite(fd, p, bytes, (off_t)off);
@@ -56,6 +60,13 @@ static int write_exact(int fd, uint64_t off, const void *src, size_t bytes) {
         if (!put) { errno = EIO; return -1; }
         p += put; off += (uint64_t)put; bytes -= (size_t)put;
     }
+#ifdef GLM53F_PP_CORE_STAGE
+    pending+=initial_bytes;
+    if(pending>=(1u<<20)){
+        if(fdatasync(fd))return-1;
+        (void)posix_fadvise(fd,0,0,POSIX_FADV_DONTNEED);pending=0;
+    }
+#endif
     return 0;
 }
 
@@ -66,6 +77,27 @@ static size_t tensor_row_bytes(const tensor_ref *t) {
         cols % (uint64_t)ggml_type_info[type].block_size) return 0;
     return (size_t)(cols / (uint64_t)ggml_type_info[type].block_size) *
            (size_t)ggml_type_info[type].type_size;
+}
+
+static void release_tensor_cache(const tensor_ref *t) {
+#ifdef GLM53F_PP_CORE_STAGE
+    uint64_t bytes = tensor_row_bytes(t);
+    for (uint32_t d = 1; d < t->info->n_dims; ++d) {
+        if (!t->info->dims[d] || bytes > UINT64_MAX / t->info->dims[d]) return;
+        bytes *= t->info->dims[d];
+    }
+    /* Row advice alone leaves partial pages cached for quantized rows.
+     * Release the complete tensor, including its boundary pages, after use. */
+    long page = sysconf(_SC_PAGESIZE);
+    if (page <= 0 || t->base > UINT64_MAX - bytes ||
+        t->base + bytes > INT64_MAX - (uint64_t)page) return;
+    uint64_t begin = t->base / (uint64_t)page * (uint64_t)page;
+    uint64_t end = (t->base + bytes + (uint64_t)page - 1) /
+                   (uint64_t)page * (uint64_t)page;
+    (void)posix_fadvise(t->fd, (off_t)begin, (off_t)(end - begin), POSIX_FADV_DONTNEED);
+#else
+    (void)t;
+#endif
 }
 
 static tensor_ref find_tensor(const gguf_context *g, const char *name) {
@@ -88,6 +120,9 @@ static int read_row(const tensor_ref *t, uint64_t row, void *raw, float *values)
     for (uint32_t d = 1; d < t->info->n_dims; ++d) rows *= t->info->dims[d];
     if (!bytes || row >= rows || read_exact(t->fd, t->base + row * bytes, raw, bytes))
         return -1;
+#ifdef GLM53F_PP_CORE_STAGE
+    (void)posix_fadvise(t->fd,(off_t)(t->base+row*bytes),bytes,POSIX_FADV_DONTNEED);
+#endif
     return dequant_row(t->info->type, raw, values, (int)t->info->dims[0]);
 }
 
@@ -175,6 +210,7 @@ static int patch_linear(int blob_fd, const image_entry *e, const tensor_ref *t,
                             out, (size_t)coln * (size_t)element_bytes)) goto fail;
         }
     }
+    release_tensor_cache(t);
     free(out); free(values); free(raw); return 0;
 fail:
     free(out); free(values); free(raw); return -1;
@@ -253,6 +289,7 @@ static int quantize_dense_slice(int blob_fd, const image_entry *weight,
             write_exact(blob_fd, scale->blob + (rb / BLOCK) * (cols / BLOCK) * sizeof(float),
                         scales, (size_t)(cols / BLOCK) * sizeof(float))) goto fail;
     }
+    release_tensor_cache(t);
     free(scales); free(quant); free(tile); free(row); free(raw); return 0;
 fail:
     free(scales); free(quant); free(tile); free(row); free(raw); return -1;
@@ -330,6 +367,7 @@ static int patch_kda(int blob_fd, const char *manifest,
     BF("self_attn.o_proj.weight", "attn_output.weight");
 #undef F32
 #undef BF
+#ifndef GLM53F_PP_CORE_STAGE
     if (layer < 3 &&
         (patch_fp8_named(blob_fd, manifest, g, layer,
              "mlp.gate_proj.weight", "mlp.gate_proj.weight_scale_inv",
@@ -340,6 +378,7 @@ static int patch_kda(int blob_fd, const char *manifest,
          patch_fp8_named(blob_fd, manifest, g, layer,
              "mlp.down_proj.weight", "mlp.down_proj.weight_scale_inv",
              "ffn_down.weight"))) return -1;
+#endif
     return 0;
 }
 
@@ -384,6 +423,8 @@ static int patch_sparse_kv_b(int blob_fd, const char *manifest,
                 e.blob + (uint64_t)lh * (KD + VD) * LATENT * sizeof(uint16_t),
                 out, (size_t)(KD + VD) * LATENT * sizeof(uint16_t))) goto fail;
     }
+    release_tensor_cache(&kt);
+    release_tensor_cache(&vt);
     free(out); free(k); free(row); free(vraw); free(kraw); return 0;
 fail:
     free(out); free(k); free(row); free(vraw); free(kraw); return -1;

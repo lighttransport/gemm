@@ -8,6 +8,8 @@ typedef struct {
     glm53f_parallel_map map;
     MPI_Comm world, tp, pipeline;
     int initialized;
+    /* Optional PP compact core path, borrowed alongside model images. */
+    const char *core_stage;
 } glm53f_dist;
 /* Collective on world, on the MPI main/controller thread. Requires at least
  * MPI_THREAD_SERIALIZED. Communicators are owned; world is borrowed. The

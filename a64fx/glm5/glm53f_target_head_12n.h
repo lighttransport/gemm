@@ -1,5 +1,6 @@
 #ifndef GLM53F_TARGET_HEAD_12N_H
 #define GLM53F_TARGET_HEAD_12N_H
+#include "glm53f_dist.h"
 
 typedef struct glm53f_target_head_context_12n glm53f_target_head_context_12n;
 
@@ -7,6 +8,9 @@ glm53f_target_head_context_12n *glm53f_target_head_create_12n(
     const char *model_dir);
 glm53f_target_head_context_12n *glm53f_target_head_create_with_norm_12n(
     const char *model_dir, const char *norm_tensor);
+/* Stage2 only; borrows dist and requires a PP vocabulary image. */
+glm53f_target_head_context_12n *glm53f_target_head_create_dist(
+    const glm53f_dist *dist, const char *model_dir, const char *native_stage);
 void glm53f_target_head_free_12n(glm53f_target_head_context_12n *context);
 /* Apply this head's output norm to collapsed hiddens, in place. */
 int glm53f_target_head_normalize_12n(const glm53f_target_head_context_12n *context,

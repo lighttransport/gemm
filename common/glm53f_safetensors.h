@@ -35,6 +35,11 @@ typedef struct {
     int n_shards;
     glm53f_st_entry *entries;
     int n_entries;
+    /* Optional explicit compact-image reader. Owns slice_context when the
+     * close hook is supplied; absence preserves the historical loader. */
+    int (*slice_reader)(void *, const char *, const char *, size_t, size_t, size_t, void *, size_t);
+    void (*slice_close)(void *);
+    void *slice_context;
 } glm53f_st_context;
 
 glm53f_st_context *glm53f_st_open(const char *model_dir);
@@ -272,6 +277,7 @@ fail:
 void glm53f_st_close(glm53f_st_context *ctx) {
     int i;
     if (!ctx) return;
+    if (ctx->slice_close) ctx->slice_close(ctx->slice_context);
     for (i = 0; i < ctx->n_entries; ++i) free(ctx->entries[i].name);
     for (i = 0; i < ctx->n_shards; ++i) {
         if (ctx->shards[i].fd >= 0) close(ctx->shards[i].fd);
@@ -311,6 +317,7 @@ int glm53f_st_read(const glm53f_st_context *ctx, const char *name,
     const st_tensor_info *t = glm53f_st_find(ctx, name, &owner);
     int i, fd, rc = -1;
     if (!t || !owner || offset > t->nbytes || nbytes > t->nbytes - offset || !dst) return -1;
+    if (ctx->slice_reader) return ctx->slice_reader(ctx->slice_context,"R",name,offset,nbytes,0,dst,nbytes);
     glm53f_st_trace("R", name, offset, nbytes, 0);
     { int repacked = glm53f_st_repack_read("R", name, offset, nbytes, 0, dst, nbytes);
       if (repacked <= 0) return repacked; }
@@ -349,6 +356,7 @@ int glm53f_st_read_columns(const glm53f_st_context *ctx, const char *name,
         column_offset > row_bytes || column_bytes > row_bytes - column_offset ||
         t->nbytes % row_bytes || !dst) return -1;
     rows = t->nbytes / row_bytes;
+    if (ctx->slice_reader) return ctx->slice_reader(ctx->slice_context,"C",name,row_bytes,column_offset,column_bytes,dst,rows*column_bytes);
     glm53f_st_trace("C", name, row_bytes, column_offset, column_bytes);
     { int repacked = glm53f_st_repack_read("C", name, row_bytes, column_offset,
                                             column_bytes, dst, rows * column_bytes);

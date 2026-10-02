@@ -5,19 +5,43 @@ Updated 2026-10-03. Capacity4096 remains the promoted TP12 recipe:
 The approved prefill-first PP3×TP4 architecture is being implemented.
 Distribution/pipeline foundations pass native12-node correctness. Routed
 4×512 native slicing passes24 exact cases across six formats; real-model
-metadata-only sizing passes all12 ranks. Full PP model integration is pending.
+metadata-only sizing passes all12 ranks. Real PP model qualification is pending.
 PJM52106727 is the fresh12-node normal2GHz/eco0 allocation, bridge42446→32446→21264,
 host d25-0010s, isolated checkout unchanged. Local launcher tmux socket is
 `tmp/tmux-glm53f/pp1.sock`, session`glm53f-pp1`. PJM52097252 has expired.
 
-Dense stage-local constructor fixtures pass three cut configurations with
-synthetic Q4_K weights. The16-head MLA primitive passes15360 bit-exact native
-cases across both math modes. The owned-layer executor refactor is uncommitted
-pending full-model gates. On PJM52106727, detached staging PID551 precedes
-full-model gate PID854, then shard hash/corruption fixtures PID2130. Logs live
-under `tmp/strata-pipeline-20261002/`; do not overlap these MPI launches.
-New dense/routed hash-aware staging and KDA distribution changes are in progress;
-no full PP model or throughput result exists yet.
+The PP runner and all owned component constructors/stagers are now connected
+and cross-built. Native fixtures pass dense/shared28 cases each, KDA16,
+sparse12, core reader/hash checks, eight packed-embedding sizes and128 full-width
+sequential pipeline steps at both layouts/all microbatches. Real TP12 owned
+executor short128 and8049 at512/1024/2048 passes bit-exact streams/state/readout;
+minimum headroom9.036316GiB. Canonical full-prompt means/streams, per-head
+state and post-decode fields plus route/selection diagnostics are implemented;
+host rejection tests and the legacy40-case repack policy pass.
+
+**Active queue (03:55 JST):** native repair fixtures PID7928 have passed.
+Guarded PP driver **PID8053** now follows that sentinel, first checks the new
+TP12 graph against frozen full-state traces and captures a short TP12 control,
+then stages owned PP images, then short serialized/two-slot PP captures.
+Logs/scripts are in `tmp/strata-pipeline-20261002/`; stage root
+`/local/glm53f-pp3-tp4-52106727-15-30`, frozen binaries
+`a64fx/glm5/build/pp-native-v1`. Strict runner SHA
+`61b17d8725dadfcbbbcbc5b7a50bd2bc9ce277cc5e5fc6a2918ebf8a70ef3db4`.
+The rebuilt TP12 full-state regression and short diagnostic control have passed.
+Owned routed staging is active; native image/source/inventory fixture passes48
+configurations on `/local`. Core conversion releases complete source tensors
+and bounds dirty writeback; current core-stager SHA
+`0b1643637dd0192239112d72915442b0e5a711f568adffcf201cf40a6cd7f5fa`.
+PJM52106727 expires about06:23 JST; driver cutoff05:55. Never overlap MPI
+with this queue. Earlier551/854/2130/2556/6270 queues are terminal; the original
+routed fixture launch pointed to a missing binary, its failed log is preserved,
+and the repaired integrated-path fixtures pass. Do not require its failed
+sentinel or revive an earlier queue.
+
+Real PP resident load and cross-layout/state/ID validation remain pending;
+no PP throughput or promotion exists. Fresh timing must use full prompt plus
+first readout for both layouts;129 output IDs measure128 post-prompt decode
+transitions. Inspect the exact process and terminal sentinels before proceeding.
 
 Previous queued experiments are terminal and none is promoted: KDA columns
 passes full-state/8049 gates, but independent five-trial confirmation gives
@@ -44,7 +68,7 @@ build includes both fixtures. See
 [a64fx/glm5/GLM53F_PIPELINE.md](a64fx/glm5/GLM53F_PIPELINE.md) for exact commands,
 binary hash, protocol and remaining implementation. Full-model constructors,
 PP native staging, 16-head MLA, canonical state export and runner integration
-are still pending; no PP model throughput is claimed. TP12 remains promoted
+are implemented; real PP image/load/performance qualification remains pending; no PP model throughput is claimed. TP12 remains promoted
 at35.462134 decode /412.273634 prefill tok/s; neither target is met.
 
 ## Active continuation (October 2, afternoon)

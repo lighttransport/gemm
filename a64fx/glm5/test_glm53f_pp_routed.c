@@ -77,6 +77,11 @@ int main(int argc, char **argv) {
                     }
                 }
                 assert(actual_hash == hash);
+                unsigned char original = pattern((uint64_t)part * PART_INTER * rb), corrupt = original ^ 1;
+                assert(pwrite(out, &corrupt, 1, 0) == 1);
+                assert(!stage_complete(manifest_path, destination, 3, 12, 0));
+                assert(pwrite(out, &original, 1, 0) == 1);
+                assert(stage_complete(manifest_path, destination, 3, 12, 0));
                 assert(!close(out)); assert(!unlink(destination)); assert(!unlink(manifest_path)); ++cases;
             }
             assert(!close(fd)); assert(!unlink(source));

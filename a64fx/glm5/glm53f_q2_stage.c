@@ -19,6 +19,7 @@
 #include <pthread.h>
 #ifdef GLM53F_PP_ROUTED_STAGE
 #include "glm53f_parallel.h"
+#include "glm53f_pp_blob.h"
 static glm53f_parallel_config pp_config;
 static glm53f_parallel_map pp_map;
 static uint64_t pp_source_identity;
@@ -167,6 +168,9 @@ static int stage_complete(const char *manifest_path, const char *blob_path,
     char line[2048];
     uint64_t bytes = UINT64_MAX;
     int header = 0;
+#ifdef GLM53F_PP_ROUTED_STAGE
+    uint64_t expected_hash = 0; int has_hash = 0;
+#endif
     if (!f || stat(blob_path, &st)) { if (f) fclose(f); return 0; }
     while (fgets(line, sizeof(line), f)) {
         unsigned long long got_bytes;
@@ -175,9 +179,20 @@ static int stage_complete(const char *manifest_path, const char *blob_path,
         if (!strcmp(line, expected)) header = 1;
         if (sscanf(line, "# COMPLETE bytes=%llu", &got_bytes) == 1)
             bytes = (uint64_t)got_bytes;
+#ifdef GLM53F_PP_ROUTED_STAGE
+        unsigned long long got_hash;
+        if (sscanf(line, "# COMPLETE bytes=%llu fnv1a=%llx", &got_bytes, &got_hash) == 2) {
+            expected_hash = (uint64_t)got_hash; has_hash = 1;
+        }
+#endif
     }
     fclose(f);
+#ifdef GLM53F_PP_ROUTED_STAGE
+    return header && bytes == (uint64_t)st.st_size && has_hash &&
+        !glm53f_pp_blob_verify(blob_path, bytes, expected_hash);
+#else
     return header && bytes == (uint64_t)st.st_size;
+#endif
 }
 
 static int put_gate_up(int out, FILE *manifest, uint64_t *offset,

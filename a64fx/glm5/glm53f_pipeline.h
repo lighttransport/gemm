@@ -17,4 +17,10 @@ int glm53f_pipeline_run(const glm53f_dist *d, int positions, int flat,
     glm53f_pipeline_schedule schedule, glm53f_pipeline_callback producer,
     glm53f_pipeline_callback executor, glm53f_pipeline_callback consumer,
     void *context, glm53f_pipeline_profile *profile);
+/* Sequential decode using caller storage. Call collectively in sequence;
+ * broadcast the stage2 token on world after each successful step. */
+int glm53f_pipeline_step(const glm53f_dist *d, int sequence, int flat,
+    glm53f_pipeline_callback producer, glm53f_pipeline_callback executor,
+    glm53f_pipeline_callback consumer, void *context, float *streams,
+    glm53f_pipeline_profile *profile);
 #endif
