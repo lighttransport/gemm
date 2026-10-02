@@ -127,6 +127,16 @@ static int target_pp_run(const glm53f_parallel_config *parallel,
     MPI_Reduce(times, maximum, 3, MPI_DOUBLE, MPI_MAX, 0, d.world);
     if (!d.map.world_rank) printf("GLM53F_PP_PIPELINE compute_max=%.6f receive_max=%.6f send_wait_max=%.6f microbatches=%d\n",
         maximum[0], maximum[1], maximum[2], profile.microbatches);
+    double stage_times[9] = {0}, stage_maximum[9];
+    memcpy(stage_times + 3 * d.map.stage, times, sizeof(times));
+    MPI_Reduce(stage_times, stage_maximum, 9, MPI_DOUBLE, MPI_MAX, 0, d.world);
+    if (!d.map.world_rank) for (int stage = 0; stage < 3; ++stage) {
+        int first = stage == 0 ? 0 : parallel->cuts[stage - 1];
+        int end = stage == 2 ? LAYERS : parallel->cuts[stage];
+        printf("GLM53F_PP_STAGE stage=%d layers=%d:%d compute_max=%.6f receive_max=%.6f send_wait_max=%.6f\n",
+            stage, first, end, stage_maximum[3 * stage],
+            stage_maximum[3 * stage + 1], stage_maximum[3 * stage + 2]);
+    }
     free(streams); glm53f_target_model_free_12n(model); glm53f_dist_free(&d);
     return 0;
 }

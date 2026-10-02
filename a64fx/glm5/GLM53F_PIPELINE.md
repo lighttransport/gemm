@@ -192,7 +192,8 @@ reference schedule. PP generation is greedy with FP32 cache; unsupported
 conversion/CP settings are rejected. Prefill timing includes the complete
 prompt, pipeline transfer/fill/drain and first readout. Generated token1 comes
 from that readout, so129 output IDs measure128 subsequent decode transitions.
-The TP12 runner additionally reports `GLM53F_TARGET_FULL_PROMPT_TIMING` using
+Each PP stage also reports its maximum compute, receive and send-wait time
+to guide contiguous-cut balancing. The TP12 runner additionally reports `GLM53F_TARGET_FULL_PROMPT_TIMING` using
 the same full-prompt/first-readout and post-first-token timing boundary; its
 historical timing record remains available. Neither new timing record is
 comparable directly to the older8048-prefix/128-readout denominator.

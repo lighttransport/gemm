@@ -19,16 +19,20 @@ minimum headroom9.036316GiB. Canonical full-prompt means/streams, per-head
 state and post-decode fields plus route/selection diagnostics are implemented;
 host rejection tests and the legacy40-case repack policy pass.
 
-**Active queue (03:55 JST):** native repair fixtures PID7928 have passed.
+**Active queue (04:00 JST):** native repair fixtures PID7928 have passed.
 Guarded PP driver **PID8053** now follows that sentinel, first checks the new
 TP12 graph against frozen full-state traces and captures a short TP12 control,
 then stages owned PP images, then short serialized/two-slot PP captures.
 Logs/scripts are in `tmp/strata-pipeline-20261002/`; stage root
 `/local/glm53f-pp3-tp4-52106727-15-30`, frozen binaries
 `a64fx/glm5/build/pp-native-v1`. Strict runner SHA
-`61b17d8725dadfcbbbcbc5b7a50bd2bc9ce277cc5e5fc6a2918ebf8a70ef3db4`.
+`2c4ad8b65bec6eb95e58c21b253dccca9bec49f10f641b649050a49ca0b1e4ce`.
 The rebuilt TP12 full-state regression and short diagnostic control have passed.
-Owned routed staging is active; native image/source/inventory fixture passes48
+Owned routed staging is active; per-stage prefill compute/receive/send-wait
+maxima are now reported by the runner to guide cut balancing. The staged
+`pp-canonical-driver.sh` requires `short-pp-canonical.pass` from local comparisons
+before any full8049 TP12/PP serialized1024 or two-slot512/1024/2048 exports.
+ native image/source/inventory fixture passes48
 configurations on `/local`. Core conversion releases complete source tensors
 and bounds dirty writeback; current core-stager SHA
 `0b1643637dd0192239112d72915442b0e5a711f568adffcf201cf40a6cd7f5fa`.
