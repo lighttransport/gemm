@@ -2,7 +2,7 @@
 
 This directory implements the standalone C/C++ runtime and adapter. It does not
 depend on ggml, stable-diffusion.cpp, or PyTorch for generation. PyTorch is used
-only by `ref/hunyuan_video15_native/verify.py`. No shared server/UI, existing
+only by the independent reference and benchmark tools. No shared server/UI, existing
 model port, GEMM source, or live rig needs modification.
 
 The current runtime remains **experimental**. A complete fast12 I2V run has
@@ -14,6 +14,7 @@ reference reports. Never infer acceptance of another profile from a bounded
 test or the fast12 result.
 
 Measured component results and exact checks are in [VALIDATION.md](VALIDATION.md).
+Measured native/PyTorch timing comparisons are in [PERFORMANCE.md](PERFORMANCE.md).
 
 Supported requests are 480×848, 81 frames, 24 fps: quality T2V and I2V use
 50 Euler steps, CFG 6, shift 5; distilled I2V uses 12 steps, CFG 1, shift 7 and
