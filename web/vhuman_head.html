@@ -120,6 +120,20 @@ a.dl{color:var(--accent);margin-right:14px;font-size:13px}
       <h2>Heads</h2>
       <div class="heads" id="heads"><span class="msg">none yet</span></div>
     </div>
+    <div class="card">
+      <h2>Expression video</h2>
+      <label for="video-expression">Expression</label>
+      <select id="video-expression"><option>smile</option><option>laugh</option><option>surprise</option><option>sad</option><option>angry</option><option>blink</option></select>
+      <label for="video-preset">Preset</label>
+      <select id="video-preset"><option value="quality">Quality · 50 steps</option><option value="fast12">Fast · 12 steps</option></select>
+      <label for="video-frames">Length</label>
+      <select id="video-frames"><option value="81">3.4 seconds</option><option value="121">5 seconds</option></select>
+      <label for="video-prompt">Motion prompt (optional)</label><textarea id="video-prompt" placeholder="Leave blank to use the selected expression"></textarea>
+      <button class="primary" id="video-go" disabled>Generate video</button>
+      <button id="video-cancel" disabled>Cancel video</button>
+      <div class="msg" id="video-msg">Pick a head portrait first.</div>
+      <div id="video-clips"></div>
+    </div>
   </aside>
   <main>
     <div class="viewer" id="viewer"><span class="label" id="vlabel">GLB · head + eyes</span><div class="empty" id="empty">pick or generate a head</div></div>
@@ -285,6 +299,8 @@ async function loadHead(h) {
   window.__headReady = false;
   state.current = h;
   $('apply-skin').disabled = false;
+  $('video-go').disabled = !videoAvailable || !!videoJob;
+  refreshVideos(h.id);
   document.querySelectorAll('.head').forEach((el) => el.classList.toggle('sel', el.dataset.id === h.id));
   $('empty').textContent = 'loading…';
   $('empty').style.display = 'flex';
@@ -429,7 +445,72 @@ async function poll(id) {
   setTimeout(() => poll(id), 1500);
 }
 
+let videoAvailable = false, videoJob = null;
+async function refreshVideos(headId) {
+  const result = await api(`/v1/heads/${headId}/videos`);
+  if (state.current?.id !== headId) return;
+  $('video-clips').replaceChildren();
+  for (const clip of result.videos) {
+    const label = document.createElement('p');
+    label.textContent = `${clip.request.expression || 'video'} · ${clip.backend}`;
+    const player = document.createElement('video');
+    player.controls = true; player.playsInline = true; player.preload = 'metadata';
+    player.src = clip.url; player.poster = clip.poster; player.style.width = '100%';
+    $('video-clips').append(label, player);
+  }
+}
+async function pollVideo(id, headId) {
+  if (videoJob !== id) return;
+  try {
+    const job = await api(`/v1/jobs/${id}`);
+    $('video-msg').textContent = job.state === 'failed' ? job.error : `${job.state} · ${job.message}`;
+    if (['done', 'failed', 'cancelled'].includes(job.state)) {
+      videoJob = null; $('video-cancel').disabled = true;
+      $('video-go').disabled = !videoAvailable || !state.current;
+      if (job.state === 'done') {
+        try { await refreshVideos(headId); }
+        catch (error) { $('video-msg').textContent = error.message; }
+      }
+      return;
+    }
+    setTimeout(() => pollVideo(id, headId), 1500);
+  } catch (error) {
+    $('video-msg').textContent = error.message;
+    setTimeout(() => pollVideo(id, headId), 3000);
+  }
+}
+$('video-go').addEventListener('click', async () => {
+  if (!state.current || videoJob) return;
+  const headId = state.current.id;
+  videoJob = 'submitting';
+  $('video-go').disabled = true;
+  try {
+    const job = await api('/v1/jobs', {kind: 'video_generate',
+      head_id: headId, expression: $('video-expression').value, preset: $('video-preset').value,
+      frames: Number($('video-frames').value), seed: Number($('seed').value), prompt: $('video-prompt').value});
+    videoJob = job.id; $('video-cancel').disabled = false;
+    pollVideo(job.id, headId);
+  } catch (error) {
+    videoJob = null;
+    $('video-msg').textContent = error.message;
+    $('video-go').disabled = !videoAvailable || !state.current;
+  }
+});
+$('video-cancel').addEventListener('click', async () => {
+  if (videoJob) {
+    try { await api(`/v1/jobs/${videoJob}/cancel`, {}); }
+    catch (error) { $('video-msg').textContent = error.message; }
+  }
+});
+
 api('/health').then((h) => {
+  videoAvailable = !!h.video?.available;
+  for (const option of $('video-preset').options) option.disabled = !h.video?.presets?.includes(option.value);
+  if ($('video-preset').selectedOptions[0]?.disabled) $('video-preset').value = h.video?.presets?.[0] || 'quality';
+  $('video-go').disabled = !videoAvailable || !state.current;
+  if (!videoAvailable) $('video-msg').textContent = 'Video backend needs model setup and experimental enablement.';
+  else if (h.video.mock) $('video-msg').textContent = 'Mock mode: static portrait clip.';
+  else $('video-msg').textContent = 'Experimental video backend; quality and memory fit are unverified.';
   const g = h.gpu ? `${h.gpu.name} · ${h.gpu.free_mib} MiB free` : 'no GPU';
   $('health').textContent = `${g} · Qwen ${h.qwen.available ? 'ready' : 'n/a'} · Pixal3D ${h.pixal3d.available ? 'ready' : 'n/a'}`;
 }).catch(() => {});

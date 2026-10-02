@@ -297,12 +297,24 @@ metadata with:
 ref/pixal3d/run.sh cpu ref/pixal3d/prepare_refs.py
 ref/pixal3d/run.sh cpu ref/pixal3d/prepare_auto_models.py \
   --model-root /mnt/disk2/models
-ref/pixal3d/run.sh cuda ref/pixal3d/prepare_input.py \
+# Offline conversion once, using a Torch-capable reference environment:
+ref/pixal3d/run.sh cpu ref/vhuman/moge_reference.py \
+  --checkpoint /mnt/disk2/models/moge-2-vitl/model.pt --out tmp/moge-native
+make -C cpu/vhuman vhuman_models
+# Production preparation needs only NumPy/Pillow/SciPy plus the native runner:
+python ref/pixal3d/prepare_input.py --device cpu \
   --input input.png --output tmp/pixal3d/prepared.png \
   --metadata tmp/pixal3d/prepared.json \
   --rembg-model /mnt/disk2/models/RMBG-2.0 \
-  --moge-model /mnt/disk2/models/moge-2-vitl/model.pt
+  --moge-model tmp/moge-native
 ```
+
+RMBG reads the existing safetensors directly. MoGe uses the exported native
+bundle; passing an old `model.pt` path requires a sibling `native/` bundle.
+For hybrid CUDA preparation, build `make -C cuda/vhuman vhuman_models` and
+select `--device cuda`. The server uses its current Python interpreter for
+preparation. See [native model validation](../../server/vhuman/README.md#native-background-camera-cue-and-speech-motion-inference)
+for parity results and current GPU validation limits.
 
 The downloader fetches only the Transformers inference files for RMBG-2.0. It
 skips the repository's duplicate PyTorch checkpoint, ONNX variants, and sample

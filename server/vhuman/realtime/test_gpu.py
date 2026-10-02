@@ -22,7 +22,7 @@ class NativeGPUChecks(unittest.TestCase):
                 expected = rig.eval(controls)
                 with torch.cuda.stream(stream):
                     vertices = rig.submit(controls)
-                    saved = vertices.clone()
+                    saved = torch.from_dlpack(vertices).clone()
                 stream.synchronize()
                 np.testing.assert_allclose(saved.cpu().numpy(), expected, atol=2e-6, rtol=2e-5)
                 with self.assertRaises(RuntimeError): rig.close()
@@ -33,11 +33,12 @@ class NativeGPUChecks(unittest.TestCase):
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class GaussianGPUChecks(unittest.TestCase):
     def test_deform_and_rasterize(self):
-        from .src.renderer.gaussian import GaussianRenderer
+        from .src.renderer.gsplat_reference import GaussianRenderer
         vertices = np.array([[-.1, -.1, 1], [.1, -.1, 1], [0, .1, 1]], np.float32)
         triangles = np.array([[0, 1, 2]], np.int32)
         avatar = bind(vertices, triangles, ["jawOpen"], count=128)
         renderer = GaussianRenderer(avatar, triangles)
+        self.addCleanup(renderer.close)
         tensor = torch.tensor(vertices, device="cuda")
         actual = renderer.deform(tensor)
         expected = deform(avatar, vertices, triangles)
@@ -50,6 +51,7 @@ class GaussianGPUChecks(unittest.TestCase):
         avatar.arrays["color_basis"][:] = 2
         avatar.arrays["expression_matrix"][:] = 1
         renderer = GaussianRenderer(avatar, triangles)
+        self.addCleanup(renderer.close)
         controls = np.ones(1, np.float32)
         actual = renderer.deform(tensor, torch.tensor(controls, device="cuda"))
         expected = deform(avatar, vertices, triangles, controls)
@@ -58,9 +60,19 @@ class GaussianGPUChecks(unittest.TestCase):
         view = torch.eye(4, device="cuda")
         intrinsics = torch.tensor([[200., 0, 64], [0, 200, 64], [0, 0, 1]], device="cuda")
         handle = renderer.render(tensor, view, intrinsics, (128, 128))
+        self.addCleanup(handle.ready.close)
         handle.ready.synchronize()
         self.assertTrue(torch.isfinite(handle.rgba).all())
         self.assertGreater(float(handle.rgba[..., 3].max()), 0)
+        # Presentation goes through native CUDA, with a separately evaluated CPU oracle.
+        from .src.avatar.cuda_runtime import library
+        rgba = handle.rgba.cpu().numpy()
+        for alpha in (False, True):
+            expected = np.empty((128, 128, 4 if alpha else 3), np.uint8)
+            self.assertEqual(library().vh_pixels_cpu(rgba.ctypes.data, 128*128, .18,
+                                                     int(alpha), expected.ctypes.data), 0)
+            actual = handle.pixels(straight_alpha=alpha)
+            self.assertLessEqual(abs(actual.astype(int)-expected.astype(int)).max(), 1)
 
 
 if __name__ == "__main__": unittest.main()

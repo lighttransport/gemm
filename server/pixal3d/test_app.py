@@ -68,7 +68,7 @@ class PixalServerTest(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="web-", dir=scratch) as td:
             server = self.make_server(Path(td))
 
-            def native_run(command, **kwargs):
+            def native_run(command, *args, **kwargs):
                 output = Path(command[command.index("--output") + 1])
                 if str(server.prepare_script) in command:
                     output.write_bytes(b"prepared-rgba")
@@ -102,7 +102,7 @@ class PixalServerTest(unittest.TestCase):
                      "fov": 0.9},
                 ],
             }
-            with mock.patch.object(app.subprocess, "run", side_effect=native_run):
+            with mock.patch.object(app, "run_command", side_effect=native_run):
                 result = server.infer(request)
 
         self.assertEqual(base64.b64decode(result["glb_b64"]), b"glTF-test")
@@ -182,10 +182,13 @@ class PixalServerTest(unittest.TestCase):
         commands = []
         with tempfile.TemporaryDirectory(prefix="prepare-", dir=scratch) as td:
             server = self.make_server(Path(td))
-            server.moge = Path(td) / "mock-moge.pt"
-            server.moge.write_bytes(b"mock model; subprocess inference is stubbed")
+            server.moge = Path(td) / "mock-moge-native"
+            server.moge.mkdir()
+            (server.moge / 'native.json').write_text(json.dumps({'format': 'vhuman.moge2_camera.v1'}))
+            for name in ('dinov2.safetensors', 'heads.safetensors'):
+                (server.moge / name).write_bytes(b'mock; subprocess inference is stubbed')
 
-            def run(command, **kwargs):
+            def run(command, *args, **kwargs):
                 commands.append(command)
                 output = Path(command[command.index("--output") + 1])
                 if str(server.prepare_script) in command:
@@ -202,10 +205,12 @@ class PixalServerTest(unittest.TestCase):
 
             request = {"backend": "cuda", "image_b64": base64.b64encode(b"rgba").decode(),
                        "auto_camera": True}
-            with mock.patch.object(app.subprocess, "run", side_effect=run):
+            with mock.patch.object(app, "run_command", side_effect=run):
                 result = server.infer(request)
 
         self.assertEqual(result["preparation"]["camera_source"], "moge-2")
+        self.assertEqual(commands[0][:2], [sys.executable, str(server.prepare_script)])
+        self.assertEqual(commands[0][commands[0].index('--device') + 1], 'cuda')
         native = commands[1]
         self.assertEqual(native[native.index("--input") + 1].split("/")[-1], "prepared.png")
         self.assertEqual(native[native.index("--fov") + 1], "0.6")
@@ -219,7 +224,7 @@ class PixalServerTest(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="mask-reference-", dir=scratch) as td:
             server = self.make_server(Path(td))
 
-            def run(command, **kwargs):
+            def run(command, *args, **kwargs):
                 commands.append(command)
                 output = Path(command[command.index("--output") + 1])
                 if str(server.prepare_script) in command:
@@ -241,7 +246,7 @@ class PixalServerTest(unittest.TestCase):
                 "image_b64": base64.b64encode(b"rgb").decode(),
                 "mask_b64": base64.b64encode(b"mask").decode(),
             }
-            with mock.patch.object(app.subprocess, "run", side_effect=run):
+            with mock.patch.object(app, "run_command", side_effect=run):
                 native = server.infer(request)
                 reference = server.reference(app.reference_request(request, native))
 
@@ -264,7 +269,7 @@ class PixalServerTest(unittest.TestCase):
                 "reference_to_native": {"p95": 0.03, "normal_abs_cosine_mean": 0.97}}}
             captured = {}
 
-            def run(command, **kwargs):
+            def run(command, *args, **kwargs):
                 captured["command"] = command
                 return subprocess.CompletedProcess(command, 0, json.dumps(measured), "")
 
@@ -274,7 +279,7 @@ class PixalServerTest(unittest.TestCase):
             reference = {"glb_b64": base64.b64encode(b"reference").decode(),
                          "mesh_summary": {"vertices": 9, "triangles": 7,
                                           "bounds": [[0, 0, 0], [1, 1, 1]]}}
-            with mock.patch.object(app.subprocess, "run", side_effect=run):
+            with mock.patch.object(app, "run_command", side_effect=run):
                 result = dict(native, reference=reference)
                 app.attach_comparison(server, result)
 
@@ -303,7 +308,7 @@ class PixalServerTest(unittest.TestCase):
                              "rgb_rmse": 0.02, "rgb_psnr": 33.98,
                              "silhouette_iou": 0.99}]}
 
-            def run(command, **kwargs):
+            def run(command, *args, **kwargs):
                 if str(server.preview_script) in command:
                     output_dir = Path(command[command.index("--output-dir") + 1])
                     output_dir.mkdir(parents=True)
@@ -320,7 +325,7 @@ class PixalServerTest(unittest.TestCase):
                                      "bounds": [[0, 0, 0], [1, 1, 1]]},
                     "_artifact_files": {"reference.glb": reference_path},
                 }}
-            with mock.patch.object(app.subprocess, "run", side_effect=run):
+            with mock.patch.object(app, "run_command", side_effect=run):
                 app.attach_comparison(server, result, render_comparison=True)
 
             self.assertEqual(result["comparison"]["renders"][0]["rgb_psnr"], 33.98)
@@ -335,7 +340,7 @@ class PixalServerTest(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="reference-", dir=scratch) as td:
             server = self.make_server(Path(td))
 
-            def reference_run(command, **kwargs):
+            def reference_run(command, *args, **kwargs):
                 views_dir = Path(command[command.index("--views_dir") + 1])
                 output = Path(command[command.index("--output") + 1])
                 captured["command"] = command
@@ -351,7 +356,7 @@ class PixalServerTest(unittest.TestCase):
                 "views": [{"image_b64": encoded,
                            "transform_matrix": IDENTITY, "fov": 0.85}],
             }
-            with mock.patch.object(app.subprocess, "run", side_effect=reference_run):
+            with mock.patch.object(app, "run_command", side_effect=reference_run):
                 result = server.reference(request)
 
         self.assertEqual(base64.b64decode(result["glb_b64"]), b"glTF-reference")
@@ -369,7 +374,7 @@ class PixalServerTest(unittest.TestCase):
             artifact_dir = Path(td) / "results" / ("e" * 32)
             artifact_dir.mkdir(parents=True)
 
-            def run(command, **kwargs):
+            def run(command, *args, **kwargs):
                 output = Path(command[command.index("--output") + 1])
                 if str(server.prepare_script) in command:
                     input_path = Path(command[command.index("--input") + 1])
@@ -404,7 +409,7 @@ class PixalServerTest(unittest.TestCase):
                      "transform_matrix": IDENTITY},
                 ],
             }
-            with mock.patch.object(app.subprocess, "run", side_effect=run):
+            with mock.patch.object(app, "run_command", side_effect=run):
                 native = server.infer(request)
                 reference = server.reference(app.reference_request(request, native))
             captured["native_artifact"] = native["_artifact_files"]["native.glb"].read_bytes()
@@ -504,6 +509,36 @@ class PixalServerTest(unittest.TestCase):
                             timeout=20, cancel=cancel)
         timer.cancel()
         self.assertLess(time.monotonic() - started, 2)
+
+    def test_preparation_cancel_and_timeout_stop_native_grandchild(self):
+        import threading
+        child_code = 'import signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); time.sleep(30)'
+        parent_code = ("import subprocess,sys,time; p=subprocess.Popen([sys.executable,'-c'," +
+                       repr(child_code) + "]); print(p.pid,file=sys.stderr,flush=True); time.sleep(30)")
+        for mode in ('cancel', 'timeout'):
+            with self.subTest(mode=mode):
+                cancel = threading.Event()
+                pids = []
+                def progress(line):
+                    pids.append(int(line))
+                    if mode == 'cancel':
+                        cancel.set()
+                error = app.JobCancelled if mode == 'cancel' else subprocess.TimeoutExpired
+                with self.assertRaises(error):
+                    app.run_command([sys.executable, '-c', parent_code], timeout=.5,
+                                    cancel=cancel, progress=progress)
+                self.assertEqual(len(pids), 1)
+                status = Path('/proc') / str(pids[0]) / 'stat'
+                deadline = time.monotonic() + 1
+                while status.exists() and time.monotonic() < deadline:
+                    try:
+                        if status.read_text().split()[2] == 'Z':
+                            break
+                    except FileNotFoundError:
+                        break
+                    time.sleep(.01)
+                if status.exists():
+                    self.assertEqual(status.read_text().split()[2], 'Z')
 
     def test_cuda_file_lock_wait_is_cancellable_and_bounded(self):
         scratch = app.ROOT / "tmp/pixal3d/tests"

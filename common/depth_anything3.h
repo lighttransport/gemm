@@ -455,6 +455,10 @@ static void da3_attention(float *out, const float *qkv, int n_tok, int dim,
 /* General Conv2d: weight[C_out, C_in, kH, kW], bias[C_out] */
 static void da3_conv2d(float *dst, const float *src, const float *weight, const float *bias,
                        int H, int W, int Ci, int Co, int kH, int kW, int stride, int pad) {
+#ifdef DA3_CONV2D_OVERRIDE
+    DA3_CONV2D_OVERRIDE(dst,src,weight,bias,H,W,Ci,Co,kH,kW,stride,pad);
+    return;
+#endif
     int Ho = (H + 2 * pad - kH) / stride + 1;
     int Wo = (W + 2 * pad - kW) / stride + 1;
     for (int co = 0; co < Co; co++) {

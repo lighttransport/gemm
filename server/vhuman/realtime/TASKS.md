@@ -5,6 +5,11 @@ as appearance quality, or rendering FPS as conversational latency.
 
 ## Implemented and exercised
 
+The table retains earlier Torch/gsplat measurements as historical evidence.
+The default inference renderer now uses the repository C++/CUDA implementation;
+see [README.md](README.md#verification-and-measured-limits) for current native
+measurements. Training and explicit oracle checks can still use Torch/gsplat.
+
 | Task | Success criterion / evidence |
 |---|---|
 | Typed sample-positioned audio/motion/features | Invalid shape/range/timestamps fail; records own immutable data |
@@ -20,6 +25,7 @@ as appearance quality, or rendering FPS as conversational latency.
 | Versioned Gaussian bundle | Topology/order/provenance/finite SPD/bounds checks; atomic save/load; rigid covariance parity |
 | CUDA primary-context rig and DLPack view | Four poses/contacts match CPU; borrowed view retains owner and prevents premature free |
 | gsplat RGB build on sm_120 | Pinned Apache upstream builds with CUDA13.2 and Torch2.14; rasterization finite and visible |
+| Native CUDA Gaussian inference and output | Both covariance policies match NumPy; four real-avatar poses match gsplat with worst mean RGBA error2.03e-7; framework-free512 render91FPS; native TTS-to-MP4 run36.5FPS |
 | Appearance fitter | Synthetic gradient test plus clean neutral50k/1000-step fit; photographic quality unvalidated |
 | Static/dynamic render benchmarks | 50k splats:167FPS512 static;136FPS720-square animated; no appearance claim |
 | Incremental offline/device replay + live wiring | Code paths implemented; replay/pipe tests exercised; clean trained diagnostic live run55.5FPS; hardware audio/quality validation pending |

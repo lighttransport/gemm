@@ -341,7 +341,7 @@ def assemble(folder, out_dir=None, res: int = 2048, iters: int = 600, log=print,
         teeth = [(mouthparts.teeth(skel, up, skel["scale"], jidx)[0], "teeth_upper" if up else "teeth_lower")
                  for up in (True, False)]
         tongue = mouthparts.tongue(skel, skel["scale"], jidx)
-        contacts_viz = mldeformer.Contacts(tmpl, feat, skel, teeth, "cpu", pos, tongue=tongue).export()
+        contacts_viz = mldeformer.export_contacts(tmpl, feat, skel, teeth, pos, tongue=tongue)
     proc_pos, proc_shapes, proc_Jn, proc_W = pos, shapes, Jn, W
     proc_contacts = contacts_viz
     source_stats = None

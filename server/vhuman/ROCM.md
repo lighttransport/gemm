@@ -66,12 +66,12 @@ Select ROCm in the standalone Qwen page. Its default GPU is device 0.
 | Input preparation | ROCm PyTorch RMBG-2.0 and MoGe-2 |
 | SAM 3 | Full text-prompted segmentation, including CLIP tokenization and mask export |
 | SAM 3D Body | DINOv3 + decoder, GLB and decoded MHR sidecar export |
-| Body assembly/motion | ROCm PyTorch MHR pose/identity decoding; portable assembly/export |
+| Body assembly/motion | Native CPU MHR decoding on ROCm configurations; native skeleton-only motion; portable assembly/export (see [migration](README.md#native-mhr-decoding)) |
 | Facial rig | Registration, shape smoothing, expression fitting and ML training on the configured ROCm device |
 | Deformer playback | Native HIP blendshapes, skinning, ML and contact kernels; existing browser rendering |
 | Speech | Native HIP Qwen3-TTS and Japanese wav2vec2 alignment |
 | Video/soft-deformer fitting | Selected ROCm PyTorch device; CPU observation/geometry and LightGeom teacher retained |
-| Portrait depth | ROCm PyTorch with the verified Depth Anything V2 Small checkpoint |
+| Portrait depth | Native CPU Depth Anything V2 Small on ROCm configurations; shared DINOv2/DA3 operators, no PyTorch inference |
 | Speech emotion | Native SenseVoice Q8 through ggml HIP, with explicit backend/device arguments |
 
 Registration and shape smoothing honor `--backend` and `--device`, including

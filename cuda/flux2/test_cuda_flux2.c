@@ -2030,6 +2030,7 @@ int main(int argc, char **argv) {
     const char *tok_path = DEFAULT_TOK;
     const char *prompt = "a red apple on a white table";
     const char *mode = NULL;
+    const char *weight_type = NULL, *gemm_backend = NULL;
 
     int out_h = 256, out_w = 256, n_steps = 4, repeat = 1, n_txt = 8;
     int is_distilled = 1, use_gpu_enc = 0, keep_gpu_enc = 0, device_id = 0;
@@ -2057,6 +2058,8 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--gpu-enc")    == 0) use_gpu_enc = 1;
         else if (strcmp(argv[i], "--keep-gpu-enc") == 0) { use_gpu_enc = 1; keep_gpu_enc = 1; }
         else if (strcmp(argv[i], "--no-dumps") == 0) dump_intermediates = 0;
+        else if (strcmp(argv[i], "--weight-type") == 0 && i+1<argc) weight_type = argv[++i];
+        else if (strcmp(argv[i], "--gemm") == 0 && i+1<argc) gemm_backend = argv[++i];
         else if (strcmp(argv[i], "--dit")    == 0 && i+1<argc) dit_path = argv[++i];
         else if (strcmp(argv[i], "--vae")    == 0 && i+1<argc) vae_path = argv[++i];
         else if (strcmp(argv[i], "--enc")    == 0 && i+1<argc) enc_path = argv[++i];
@@ -2079,6 +2082,27 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--verbose")== 0 && i+1<argc) verbose  = atoi(argv[++i]);
         else if (strcmp(argv[i], "--out")    == 0 && i+1<argc) out_path = argv[++i];
     }
+    /* Explicit arguments override legacy environment defaults. */
+    if (weight_type) {
+        if (strcmp(weight_type, "f32") && strcmp(weight_type, "f16") &&
+            strcmp(weight_type, "bf16") && strcmp(weight_type, "fp8")) {
+            fprintf(stderr, "--weight-type expects f32, f16, bf16, or fp8\n");
+            return 2;
+        }
+        setenv("FLUX2_F16_GEMM", !strcmp(weight_type, "f16") ? "1" : "0", 1);
+        setenv("FLUX2_BF16_GEMM", !strcmp(weight_type, "bf16") ? "1" : "0", 1);
+        setenv("FLUX2_FP8_GEMM", !strcmp(weight_type, "fp8") ? "1" : "0", 1);
+        setenv("FLUX2_FP8_BF16", "0", 1);
+        setenv("FLUX2_FP4", "0", 1);
+    }
+    if (gemm_backend) {
+        if (strcmp(gemm_backend, "repo") && strcmp(gemm_backend, "auto")) {
+            fprintf(stderr, "--gemm expects repo or auto\n");
+            return 2;
+        }
+        setenv("FLUX2_CUBLASLT_FP8", !strcmp(gemm_backend, "repo") ? "0" : "1", 1);
+        setenv("FLUX2_CUBLASLT_BF16", !strcmp(gemm_backend, "repo") ? "0" : "1", 1);
+    }
     if (flux2_env_enabled("FLUX2_KEEP_GPU_ENC")) {
         use_gpu_enc = 1;
         keep_gpu_enc = 1;
@@ -2091,7 +2115,8 @@ int main(int argc, char **argv) {
             "          [--dit PATH] [--vae PATH] [--enc PATH]\n"
             "          [--prompt TEXT] [--height H] [--width W]\n"
             "          [--steps N] [--repeat N] [--n-txt N] [--img-scale S] [--txt-scale S] [--timestep T] [--real-text] [--real-latent] [--seed S] [--cfg SCALE]\n"
-            "          [--base|--distilled] [--gpu-enc] [--keep-gpu-enc] [--no-dumps] [--device N]\n",
+            "          [--base|--distilled] [--gpu-enc] [--keep-gpu-enc] [--no-dumps] [--device N]\n"
+            "          [--weight-type f32|f16|bf16|fp8] [--gemm repo|auto]\n",
             argv[0]);
         return 1;
     }

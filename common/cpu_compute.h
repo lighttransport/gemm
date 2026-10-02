@@ -378,29 +378,29 @@ static inline float cpu_keys_bicubic(float a) {
 
 static inline void cpu_interp_pos_embed_bicubic(const float *pe_orig, int M,
                                          float *pe_out, int gh, int gw, int dim) {
-    const float interp_offset = 0.1f;
-    float sx = ((float)gw + interp_offset) / (float)M;
-    float sy = ((float)gh + interp_offset) / (float)M;
+    /* PyTorch computes inverse scale from the double-valued scale_factor.
+     * Bicubic keeps negative/over-edge source coordinates and clamps only
+     * the four sampled indices. Clamping coordinates loses border lobes. */
+    float sx = (float)((double)M / ((double)gw + 0.1));
+    float sy = (float)((double)M / ((double)gh + 0.1));
     for (int y = 0; y < gh; y++) {
-        float fy = ((float)y + 0.5f) / sy - 0.5f;
-        if (fy < 0) fy = 0;
-        if (fy > (float)(M - 1)) fy = (float)(M - 1);
-        int iy = (int)fy; float dy = fy - iy;
+        float fy = ((float)y + 0.5f) * sy - 0.5f;
+        int iy = (int)floorf(fy); float dy = fy - iy;
         for (int x = 0; x < gw; x++) {
-            float fx = ((float)x + 0.5f) / sx - 0.5f;
-            if (fx < 0) fx = 0;
-            if (fx > (float)(M - 1)) fx = (float)(M - 1);
-            int ix = (int)fx; float dx = fx - ix;
+            float fx = ((float)x + 0.5f) * sx - 0.5f;
+            int ix = (int)floorf(fx); float dx = fx - ix;
             for (int d = 0; d < dim; d++) {
                 float val = 0.0f;
                 for (int jj = -1; jj <= 2; jj++) {
                     int sy2 = iy + jj; if (sy2 < 0) sy2 = 0; if (sy2 >= M) sy2 = M - 1;
                     float wy = cpu_keys_bicubic(dy - (float)jj);
+                    float row = 0.0f;
                     for (int ii = -1; ii <= 2; ii++) {
                         int sx2 = ix + ii; if (sx2 < 0) sx2 = 0; if (sx2 >= M) sx2 = M - 1;
                         float wx = cpu_keys_bicubic(dx - (float)ii);
-                        val += pe_orig[sy2 * M * dim + sx2 * dim + d] * wy * wx;
+                        row += pe_orig[sy2 * M * dim + sx2 * dim + d] * wx;
                     }
+                    val += row * wy;
                 }
                 pe_out[(y * gw + x) * dim + d] = val;
             }

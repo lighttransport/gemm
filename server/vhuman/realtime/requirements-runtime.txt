@@ -1,0 +1,8 @@
+# Core scheduling, native model adapters, asset IO, and CPU geometry helpers.
+# No ML framework is required by these modules.
+numpy
+pillow
+scipy
+# Optional output packages: pygame, pyvirtualcam, nvidia-ml-py.
+# CUDA inference rendering uses libvhuman_splat.so and libvhuman_runtime.so.
+# Torch/gsplat are needed only for training and explicit offline reference checks.

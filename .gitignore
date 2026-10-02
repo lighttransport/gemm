@@ -1,5 +1,6 @@
 # Prerequisites
 *.d
+cpu/vhuman/tokenizer_probe
 
 # Compiled Object files
 *.slo
@@ -353,3 +354,30 @@ rdna4/sam3/verify_*
 !rdna4/sam3/verify_*.c
 !rdna4/sam3/verify_*.h
 rdna4/sam3/test_hip_sam3_embed
+
+# HunyuanVideo-1.5 reference tools (weights and dumps stay under tmp/).
+!ref/hunyuan_video15/
+!ref/hunyuan_video15/*.py
+!ref/hunyuan_video15/README.md
+
+# Standalone native MHR runners
+/cpu/sam3d_body/mhr_decode
+/cuda/sam3d_body/mhr_decode
+/cuda/sam3d_body/test_mhr_compile
+/cpu/da2/da2_depth
+/cuda/da2/da2_depth
+/cpu/da2/test_da2_ops
+/cuda/da2/test_da2_ops
+!ref/da2/
+!ref/da2/*.py
+/cpu/rmbg/swin_backbone
+/cpu/rmbg/test_swin
+/cuda/rmbg/swin_backbone
+/cuda/rmbg/test_swin
+!ref/rmbg/
+!ref/rmbg/*.py
+/cpu/vhuman/vhuman_models
+/cpu/vhuman/test_vhuman_ops
+/cuda/vhuman/vhuman_models
+!ref/vhuman/
+!ref/vhuman/*.py

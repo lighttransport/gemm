@@ -47,7 +47,7 @@ class MotionTrainingTests(unittest.TestCase):
         model.reset(1)
         self.assertEqual(model.push(TTSFeatureFrame(0, 1920, codes[0], hidden[0], "synthetic-test")), [])
         from .src.benchmark.motion import evaluate
-        report = evaluate(manifest, checkpoint, WORK / "motion-evaluation.json")
+        report = evaluate(manifest, checkpoint, WORK / "motion-evaluation.json", reference_parity=True)
         self.assertEqual(len(report["takes"]), 1)
         self.assertLess(report["takes"][0]["step_full_max_error"], 1e-5)
 

@@ -1,4 +1,4 @@
-"""Explicit CPU transfer/compositing stage; optional display, recording and camera."""
+"""Native GPU compositing/download; optional display, recording and camera."""
 from pathlib import Path
 from contextlib import ExitStack
 import subprocess
@@ -34,15 +34,7 @@ class FrameOutput:
 
     def prepare(self, handle):
         """Warm conversion kernels before playback, or produce a composited RGB8 frame."""
-        handle.ready.synchronize()
-        import torch
-        rgba = handle.rgba
-        # Premultiplied renderer RGB over a fixed grey background, then sRGB.
-        linear = (rgba[..., :3] + (1 - rgba[..., 3:4]) * .18).clamp(0, 1)
-        rgb = torch.where(linear <= .0031308, linear * 12.92, 1.055 * linear.pow(1/2.4) - .055)
-        # Transfer RGB8, not RGBA float32; keep color conversion on the GPU.
-        pixels = rgb.mul(255).round().to(torch.uint8).contiguous().cpu().numpy()
-        return pixels
+        return handle.pixels()
 
     def audio(self, pcm):
         """Record actual headless playout, including jitter/underrun silence."""

@@ -377,6 +377,15 @@ def cmd_bench(args) -> dict:
     return out
 
 
+def cmd_video(args) -> dict:
+    from . import video
+    return video.video_job(EyeService(Path(args.work)),
+        {"head_id": args.head, "expression": args.expression, "prompt": args.prompt,
+         "preset": args.preset, "frames": args.frames, "seed": args.seed},
+        _progress, threading.Event(), model=args.model, runner=args.runner,
+        mock=args.mock, allow_experimental=args.allow_experimental, backend=args.video_backend)
+
+
 def main(argv=None) -> int:
     from .body import job as body_job
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -553,6 +562,18 @@ def main(argv=None) -> int:
     sp.add_argument("--video", required=True)
     sp.add_argument("--model", help="MediaPipe Face Landmarker task file")
     sp.set_defaults(fn=cmd_rig_fit_video)
+    sp = sub.add_parser("video", help="generate a silent expression video from an existing head portrait")
+    sp.add_argument("--head", required=True)
+    sp.add_argument("--expression", choices=("smile", "laugh", "surprise", "sad", "angry", "blink"), default="smile")
+    sp.add_argument("--prompt", default="")
+    sp.add_argument("--preset", choices=("quality", "fast12"), default="quality")
+    sp.add_argument("--frames", type=int, choices=(81, 121), default=81)
+    sp.add_argument("--seed", type=int, default=42)
+    sp.add_argument("--model", help="prepared model directory")
+    sp.add_argument("--runner", help="native video executable")
+    sp.add_argument("--video-backend", choices=("repo", "legacy"), default="repo")
+    sp.add_argument("--allow-experimental", action="store_true")
+    sp.set_defaults(fn=cmd_video)
     sub.add_parser("replate", help="re-extract the plate library from its source images").set_defaults(fn=cmd_replate)
     sub.add_parser("bench", help="timing targets").set_defaults(fn=cmd_bench)
     args = ap.parse_args(argv)

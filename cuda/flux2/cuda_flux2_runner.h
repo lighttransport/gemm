@@ -5276,7 +5276,29 @@ int cuda_flux2_load_dit(cuda_flux2_runner *r, const char *path) {
 
     if (st_fp8) safetensors_close(st_fp8);
 
-    cuCtxSynchronize();
+    /* Do not launch the DiT after a failed/partial upload (e.g. a 4B F32
+     * checkpoint on a 16 GB card). Freeing the runner releases partial loads. */
+    int complete = r->d_img_in_w && r->d_txt_in_w && r->d_t_fc1_w && r->d_t_fc2_w &&
+        r->d_mod_img_w && r->d_mod_txt_w && r->d_mod_sgl_w && r->d_out_mod_w && r->d_out_proj_w;
+    for (int i = 0; i < r->n_dbl; ++i) {
+        flux2_gpu_stream_t *streams[] = {&r->gpu_dblk[i].img, &r->gpu_dblk[i].txt};
+        for (int j = 0; j < 2; ++j) {
+            flux2_gpu_stream_t *s = streams[j];
+            complete = complete && (s->qkv_w || s->qkv4.qw) &&
+                (s->proj_w || s->proj4.qw) && (s->mlp_up_w || s->mlp_up4.qw) &&
+                (s->mlp_dn_w || s->mlp_dn4.qw) && s->q_norm && s->k_norm;
+        }
+    }
+    for (int i = 0; i < r->n_sgl; ++i) {
+        flux2_gpu_sblk_t *s = &r->gpu_sblk[i];
+        complete = complete && (s->linear1_w || s->linear14.qw) &&
+            (s->l2_attn_w || s->l2_attn4.qw) && (s->l2_mlp_w || s->l2_mlp4.qw) &&
+            s->q_norm && s->k_norm;
+    }
+    if (!complete || cuCtxSynchronize() != CUDA_SUCCESS) {
+        fprintf(stderr, "cuda_flux2: incomplete DiT weight upload; check GPU memory and checkpoint tensors\n");
+        return -1;
+    }
     clock_gettime(CLOCK_MONOTONIC, &t1);
     double dt = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9;
     if (r->verbose >= 1)

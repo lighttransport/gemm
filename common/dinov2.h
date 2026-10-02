@@ -89,6 +89,10 @@ dinov2_result  dinov2_encode(dinov2_model *m, const uint8_t *rgb,
  * step. Pass in_h = in_w = grid*patch_size. */
 dinov2_result  dinov2_encode_f32(dinov2_model *m, const float *chw,
                                  int w, int h, int n_threads);
+/* Capture normalized patch tokens after selected blocks; caller owns outputs.
+ * Input dimensions must match the model's configured grid. */
+int dinov2_intermediates_f32(dinov2_model *m, const float *chw, int w, int h,
+                            const int *layers, int count, float **outputs, int n_threads);
 /* Strip the n_register register tokens from a result, leaving only
  * [CLS, patch_0, ..., patch_{N-1}] = (1 + n_patches) tokens. Matches
  * the standard dinov2 Dino.forward output layout. Rewrites r in place. */
@@ -148,8 +152,13 @@ static void dinov2_batch_gemm(float *dst, const qtensor *W, const qtensor *bias,
         cpu_gemm_f16(dst, (const uint16_t *)W->data, (float *)b, src,
                      n_tok, n_out, n_in, n_threads);
     } else if (W->type == GGML_TYPE_F32) {
+#ifdef DINOV2_GEMM_F32
+        DINOV2_GEMM_F32(dst, (const float *)W->data, b, src,
+                        n_tok, n_out, n_in, n_threads);
+#else
         cpu_gemm_f32(dst, (const float *)W->data, b, src,
                         n_tok, n_out, n_in, n_threads);
+#endif
     } else {
         /* Quantized: dequant the whole matrix once, then F32 GEMM. */
         float *Wf = qt_dequant(W);
@@ -340,7 +349,7 @@ void dinov2_free(dinov2_model *m) {
 /* Core encode — operates on a pre-normalized float32 CHW buffer already
  * at (target_h, target_w) = (grid*patch, grid*patch). */
 static dinov2_result dinov2_encode_core(dinov2_model *m, float *img_norm,
-                                        int n_threads);
+                                        int n_threads, const int *layers, int count, float **captures);
 
 dinov2_result dinov2_encode(dinov2_model *m, const uint8_t *rgb,
                             int img_w, int img_h, int n_threads) {
@@ -371,7 +380,7 @@ dinov2_result dinov2_encode(dinov2_model *m, const uint8_t *rgb,
             }
         }
     }
-    return dinov2_encode_core(m, img_norm, n_threads);
+    return dinov2_encode_core(m, img_norm, n_threads, NULL, 0, NULL);
 }
 
 dinov2_result dinov2_encode_f32(dinov2_model *m, const float *chw,
@@ -391,7 +400,7 @@ dinov2_result dinov2_encode_f32(dinov2_model *m, const float *chw,
     size_t n = (size_t)3 * target_h * target_w;
     float *img_norm = (float *)malloc(n * sizeof(float));
     memcpy(img_norm, chw, n * sizeof(float));
-    return dinov2_encode_core(m, img_norm, n_threads);
+    return dinov2_encode_core(m, img_norm, n_threads, NULL, 0, NULL);
 }
 
 void dinov2_result_drop_registers(dinov2_result *r, int n_register) {
@@ -408,7 +417,7 @@ void dinov2_result_drop_registers(dinov2_result *r, int n_register) {
 
 /* img_norm is consumed (freed) by this function. */
 static dinov2_result dinov2_encode_core(dinov2_model *m, float *img_norm,
-                                        int n_threads) {
+                                        int n_threads, const int *layers, int count, float **captures) {
     dinov2_result result = {0};
     int ps  = m->patch_size;
     int gh  = m->grid_h, gw = m->grid_w;
@@ -556,6 +565,10 @@ static dinov2_result dinov2_encode_core(dinov2_model *m, float *img_norm,
         #pragma omp parallel for schedule(static)
 #endif
         for (int i = 0; i < n_nd; i++) hidden[i] += ffn_out[i];
+        for (int j = 0; j < count; j++) if (layers[j] == L) {
+            dinov2_layernorm_batch(captures[j], hidden + (size_t)patch_start * dim,
+                                   &m->norm_w, &m->norm_b, np, dim, m->ln_eps);
+        }
     }
 
     free(ln_buf); free(qkv); free(attn_out);
@@ -582,6 +595,28 @@ static dinov2_result dinov2_encode_core(dinov2_model *m, float *img_norm,
     result.n_tokens = nt;
     result.dim = dim;
     return result;
+}
+
+int dinov2_intermediates_f32(dinov2_model *m, const float *chw, int w, int h,
+                            const int *layers, int count, float **outputs, int n_threads) {
+    if (!m || !chw || !layers || !outputs || count < 1 || count > m->n_blocks ||
+        w != m->grid_w * m->patch_size || h != m->grid_h * m->patch_size) return -1;
+    for (int i=0; i<count; i++) outputs[i]=NULL;
+    for (int i=0; i<count; i++) {
+        if (layers[i]<0 || layers[i]>=m->n_blocks) goto fail;
+        outputs[i]=malloc((size_t)m->n_patches*m->dim*sizeof(float));
+        if (!outputs[i]) goto fail;
+    }
+    float *input=malloc((size_t)3*w*h*sizeof(float));
+    if (!input) goto fail;
+    memcpy(input,chw,(size_t)3*w*h*sizeof(float));
+    dinov2_result result=dinov2_encode_core(m,input,n_threads,layers,count,outputs);
+    if (!result.features) goto fail;
+    dinov2_result_free(&result);
+    return 0;
+fail:
+    for (int i=0; i<count; i++) { free(outputs[i]); outputs[i]=NULL; }
+    return -1;
 }
 
 void dinov2_result_free(dinov2_result *r) {

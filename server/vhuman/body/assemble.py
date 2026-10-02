@@ -26,7 +26,6 @@ from ..rig import gltf, usd
 from ..rig.build import ExportPart, RigAsset
 from ..rig.common import normalize, quat_from_matrix, vertex_normals
 
-DEFAULT_MODEL = Path("/mnt/disk1/models/sam3d-body/dinov3/assets/mhr_model.pt")
 DEFAULT_HEAD = Path("/mnt/disk1/models/sam3d-body/safetensors/sam3d_body_mhr_head.safetensors")
 FLIP_CAMERA = np.array([1.0, -1.0, -1.0])
 FLIP_PIXAL = np.array([-1.0, 1.0, -1.0])
@@ -295,9 +294,9 @@ def _face_parts(face_dir: Path, alignment: np.ndarray, joints_offset: int,
     return parts, mats
 
 
-def _mhr_rig(model, state: np.ndarray):
-    names = ["mhr_" + n for n in model.get_joint_names()]
-    parents = model.character_torch.skeleton.joint_parents.cpu().numpy().astype(int)
+def _mhr_rig(rig, state: np.ndarray):
+    names = rig["names"]
+    parents = rig["parents"]
     bind = np.stack([_state_matrix(s) for s in state])
     joints = [_joint_entry(n, names[parents[i]] if parents[i] >= 0 else None,
                            bind[i], bind[parents[i]] if parents[i] >= 0 else None)
@@ -320,9 +319,9 @@ def _face_rig(face_dir: Path, alignment: np.ndarray, body_head_bind: np.ndarray,
     return definition, joints
 
 
-def assemble(head_dir: Path, out: Path, model_path: Path = DEFAULT_MODEL,
-             head_assets: Path = DEFAULT_HEAD, res: int = 2048) -> dict:
-    import torch
+def assemble(head_dir: Path, out: Path, model_path: Path | None = None,
+             head_assets: Path = DEFAULT_HEAD, res: int = 2048, *, mhr_assets: Path | None = None) -> dict:
+    from . import mhr
     start = time.perf_counter()
     out.mkdir(parents=True, exist_ok=True)
     face_dir = head_dir / "rig"
@@ -331,14 +330,10 @@ def assemble(head_dir: Path, out: Path, model_path: Path = DEFAULT_MODEL,
     shape = np.asarray(meta["shape"], np.float32)
     if model_params.shape != (204,) or shape.shape != (45,):
         raise ValueError("SAM 3D Body sidecar lacks decoded MHR pose or identity")
-    from server.vhuman.runtime import torch_device
-    device = torch_device(torch)
-    model = torch.jit.load(str(model_path), map_location=device)
-    with torch.no_grad():
-        vertices_t, state_t = model(torch.from_numpy(shape[None]).to(device),
-                                    torch.from_numpy(model_params[None]).to(device), torch.zeros((1, 72), device=device))
-    vertices = vertices_t[0].cpu().numpy().astype(np.float64) * .01
-    state = state_t[0].cpu().numpy().astype(np.float64)
+    vertices_batch, state_batch, rig, decode_report = mhr.decode(
+        mhr.resolve_assets(mhr_assets, model_path), model_params[None], shape)
+    vertices = vertices_batch[0].astype(np.float64) * .01
+    state = state_batch[0].astype(np.float64)
     faces = np.asarray(_safetensor(head_assets, "head_pose.faces"), np.int32)
     parity_max = None
     if (out / "body_mhr.glb").is_file():
@@ -357,13 +352,12 @@ def assemble(head_dir: Path, out: Path, model_path: Path = DEFAULT_MODEL,
         raw.doc["meshes"].append({"name": "body", "primitives": [prim]})
         raw.node("body", mesh=0)
         raw.write(out / "body_mhr.glb")
-    joint_ids, skin_weights = model.get_lbsw()
-    joint_ids, skin_weights = joint_ids.cpu().numpy(), skin_weights.cpu().numpy()
+    joint_ids, skin_weights = rig["joint_indices"], rig["skin_weights"]
     order = np.argsort(-skin_weights, axis=1)[:, :4]
     joints4 = np.take_along_axis(joint_ids, order, 1).astype(np.uint16)
     weights4 = np.take_along_axis(skin_weights, order, 1).astype(np.float64)
     weights4 /= np.maximum(weights4.sum(1, keepdims=True), 1e-9)
-    body_joints, names, bind = _mhr_rig(model, state)
+    body_joints, names, bind = _mhr_rig(rig, state)
     head_index = names.index("mhr_c_head")
     neck_index = names.index("mhr_c_neck")
     neck_y = float(bind[neck_index, 1, 3])
@@ -422,6 +416,7 @@ def assemble(head_dir: Path, out: Path, model_path: Path = DEFAULT_MODEL,
               "seconds": round(time.perf_counter() - start, 2),
               "limitations": ["MHR pose correctives are baked at the generated bind pose",
                               "A single source view does not determine unseen garment geometry"]}
+    report["mhr_decoder"] = decode_report
     (out / "body_report.json").write_text(json.dumps(report, indent=1, default=float))
     return report
 
@@ -430,11 +425,12 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("head_dir", type=Path)
     ap.add_argument("--out", type=Path, required=True)
-    ap.add_argument("--model", type=Path, default=DEFAULT_MODEL)
+    ap.add_argument("--model", type=Path, help="legacy locator; use --mhr-assets")
+    ap.add_argument("--mhr-assets", type=Path)
     ap.add_argument("--head-assets", type=Path, default=DEFAULT_HEAD)
     ap.add_argument("--res", type=int, choices=(1024, 2048, 4096), default=2048)
     args = ap.parse_args(argv)
-    print(json.dumps(assemble(args.head_dir, args.out, args.model, args.head_assets, args.res), default=float),
+    print(json.dumps(assemble(args.head_dir, args.out, args.model, args.head_assets, args.res, mhr_assets=args.mhr_assets), default=float),
           flush=True)
     return 0
 

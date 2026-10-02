@@ -7,6 +7,40 @@ portable glTF export, portrait-based eye fitting and optional Qwen/Pixal3D jobs.
 The runtime requires no Unreal Engine installation, source, content or measured
 character data. Engine-specific import/export adapters are not included.
 
+## Portrait expression videos
+
+The head page can queue silent expression clips through the experimental
+[repository HunyuanVideo-1.5 CUDA runner](../../cuda/hunyuan_video15_native/).
+The default `--video-backend repo` selects repository GEMM and rejects cuBLAS
+fallback. Build with `make -C cuda/hunyuan_video15_native`, stage the pinned model
+assets, then launch with `--video-model DIR --video-experimental`. The standalone
+`video` CLI uses an existing head portrait. This backend currently supports 81
+frames; GPU parity, expression quality and the 16 GB memory fit are unverified.
+The runner uses public Google SigLIP; FLUX.1-Redux is not used.
+
+The explicit `--video-backend legacy` retains the
+[ggml-based runner](../../cuda/hunyuan_video15/README.md) and its 81/121-frame
+interface. The following measurements apply **only to that legacy backend**:
+a fast12/81-frame
+smoke test on RTX 5060 Ti 16GB measured 12,624 MiB peak VRAM. All 12 denoising
+steps passed the official FP16 reference with saved native conditioning/noise
+(final latent relative L2 0.002447). The corrected spatial VAE tiling and IEEE
+FP32 SigLIP path also passed a full fast12/81 portrait pipeline check against
+independently computed official component outputs: decoded relative L2
+0.001776, all 81 frames passing. That run peaked at 13,300 MiB VRAM and took
+32.1 minutes. Its brief blink prompt gives shorter closures, but requesting
+one blink still produces two; count and natural timing remain experimental.
+This validates the assembled reference at native encoder precision. Other
+profiles, upstream all-FP16 equivalence and the expression matrix remain under
+validation. Generated clips
+are previews and are not automatically used for rig fitting or training.
+
+The reference tools now accept fast12 121-frame captures and an explicit
+`--encoder-dtype float16`. A coverage audit requires three portraits, six
+expressions, two seeds, two presets and both lengths (144 cases). Missing runs
+remain missing; numerical parity does not certify visual expression quality.
+See [validation commands](../../ref/hunyuan_video15/README.md).
+
 ## Image-guided reconstruction candidates
 
 Refine a fitted head without replacing its accepted rig:
@@ -511,10 +545,330 @@ The [adoption plan](../../doc/vhuman-face-reconstruction-adoption-plan.md) maps
 these ideas to staged implementation, permissive dependencies, original
 algorithms, artifact compatibility, and validation gates.
 
+## Native MHR decoding
+
+Body assembly and uploaded-motion retargeting use the standalone C MHR runner.
+These stages require NumPy, SciPy and Pillow, but do not import PyTorch, ONNX or
+ONNX Runtime. They consume an existing facial rig; image generation, portrait
+preparation and facial-rig training still have their existing dependencies.
+This is the first step of the native migration, followed by portrait depth,
+RMBG/MoGe preparation, and the remaining rig/realtime inference modules.
+
+Build from the repository root:
+
+```sh
+make -C cpu/sam3d_body mhr_decode
+make -C cuda/sam3d_body mhr_decode test_mhr_compile
+cuda/sam3d_body/test_mhr_compile
+```
+
+The CPU executable dispatches pose-corrective projection to repository AVX2
+GEMM when available, with a portable C fallback. The CUDA executable uses our
+FP32 GEMV and blend kernels through cuew/NVRTC, keeps weights resident across
+frames, and does not link or load cuBLAS. Host skeleton transforms retain the
+existing FP64 accumulation. CUDA full decoding allocates about 658 MiB of model
+and scratch device buffers, excluding the CUDA context/compiler. Actual peak
+VRAM still needs measurement on the target GPU.
+
+Assembly follows the configured CUDA/CPU backend; ROCm configurations currently
+use native CPU MHR. Motion retargeting uses the native CPU skeleton-only path
+and skips all vertex decoding. Reports identify the actual decoder backend.
+MHR outputs retain centimetres and xyzw quaternions; assembly converts to metres.
+
+### One-time asset migration
+
+Existing `sam3d_body_mhr_jit.safetensors` and `.json` exports need two small
+companions: `sam3d_body_mhr_jit_rig.safetensors` and `_rig.json`. They contain
+joint names, original skin weights/indices, parents and provenance hashes.
+Generate them with an **offline export interpreter** containing Torch and
+safetensors (substitute your model directory):
+
+```sh
+MHR_EXPORT_PYTHON=tmp/qimg21-ref-venv/bin/python
+"$MHR_EXPORT_PYTHON" ref/sam3d-body/dump_mhr_assets.py \
+  --mhr-model /path/to/sam3d-body/dinov3/assets/mhr_model.pt \
+  --out-dir /path/to/sam3d-body/safetensors --rig-only
+```
+
+For a new export, omit `--rig-only`. Runtime requires only the exported assets;
+there is no automatic TorchScript fallback or checkpoint download. The body
+job resolves assets from its configured SAM3D Body directory. Standalone
+assembly and motion commands accept `--mhr-assets DIR`. Legacy `--model` only
+locates the standard sibling safetensors directory; it never opens the `.pt`.
+
+The native executable accepts `--mhr-assets DIR --params POSES.npy --shape
+SHAPE.npy [--face FACE.npy] --output-dir DIR`, plus `--backend cpu|cuda`,
+`--device N`, `--threads N` and `--skeleton-only`. Input files are little-endian,
+C-order float32 NumPy v1 matrices: pose `[B,204]`, identity `[B,45]`, optional
+face `[B,72]`; batch sizes must match. Output files are `vertices.npy`
+`[B,18439,3]` and `skeleton.npy` `[B,127,8]`. The skeleton-only mode omits vertices.
+The Python adapter also broadcasts a single `[45]` identity across frames.
+
+### Validation
+
+Generate the offline oracle and compare a selected native runner:
+
+```sh
+"$MHR_EXPORT_PYTHON" ref/sam3d-body/verify_native_mhr.py \
+  --model /path/to/sam3d-body/dinov3/assets/mhr_model.pt \
+  --assets /path/to/sam3d-body/safetensors \
+  --runner cpu/sam3d_body/mhr_decode --backend cpu \
+  --pose-sidecar /path/to/body_mhr.glb.json --out tmp/mhr-reference
+make -C cpu/sam3d_body verify_mhr_stages
+cpu/sam3d_body/verify_mhr_stages \
+  --mhr-assets /path/to/sam3d-body/safetensors --refdir tmp/mhr-reference/stages -t 4
+MHR_TEST_ASSETS=/path/to/sam3d-body/safetensors MHR_TEST_REFS=tmp/mhr-reference \
+  python -m unittest server.vhuman.body.test_mhr server.vhuman.body.test_body server.vhuman.body.test_motion
+```
+
+For the CUDA parity run, change `--runner` to `cuda/sam3d_body/mhr_decode` and
+`--backend` to `cuda`. Set `MHR_REQUIRE_FRAMEWORK_FREE=1` when running the unit
+suite in a NumPy/SciPy/Pillow-only interpreter. No CUDA device is needed for
+`test_mhr_compile`; its success establishes compilation, not numerical parity.
+
+Validation on 2026-10-02: CPU full/skeleton decoding passed batches 1/4/5,
+including nonzero identity and facial coefficients. Maximum vertex error was
+`1.06812e-4 cm` (about 1.1 micrometres); all seven existing stage checks passed.
+The framework-free suite passed 16 tests, including malformed inputs, invalid
+asset indices, missing metadata and cancellation of native child processes.
+Assembly exported GLB/USD with 127 body joints, 12 face joints, 604 morph targets
+and both garments accepted. Body skin indices/weights matched the prior avatar
+exactly; five-frame motion quaternion error was below `1.2e-7 rad`.
+
+CPU full decoding took roughly 0.3 s/frame; five-frame skeleton decoding took
+about 1.8 ms, excluding process startup and asset checksum verification. Both
+CUDA sources compiled for sm_120. CUDA numerical parity and peak-memory checks
+remain pending because this validation environment had no `/dev/nvidia*` devices.
+
+## Native Depth Anything V2 Small
+
+The optional portrait-depth stage now runs without Torch, ONNX, or ONNX Runtime.
+It reuses the repository DINOv2 backbone and DA3 DPT convolution, fusion and
+resize operations, with DA2-specific feature taps (blocks 2/5/8/11), tensor-name
+mapping and ReLU output. FP32 dense layers and tiled im2col convolutions use
+repository GEMM. Relative inverse depth is returned at the original image size;
+the existing alignment rejection gate and protected-eye/lip displacement bound
+are unchanged. OpenCV remains a preprocessing dependency for exact cubic resize.
+
+Export the existing pinned Small installation once from an **offline** interpreter
+with Torch, safetensors, NumPy and OpenCV:
+
+```sh
+python ref/da2/export_reference.py \
+  --installation tmp/vhuman-rig/models/depth-anything-v2-small \
+  --out tmp/vhuman-rig/models/depth-anything-v2-small/native
+make -C cpu/da2 da2_depth test_da2_ops
+make -C cuda/da2 da2_depth test_da2_ops
+cpu/da2/test_da2_ops
+```
+
+`setup_depth` also accepts `--export-python /path/to/export/python`. Runtime
+needs `installation.json` and `native/{native.json,dinov2.safetensors,
+depth_head.safetensors}`; it verifies model identity and exported checksums.
+The `.pth` checkpoint and upstream Python checkout are needed only for export
+and reference generation. Existing `--depth-installation` requests continue to
+work after conversion. Missing native assets produce an explicit export error.
+
+The CPU implementation is the validated path (AVX2/FMA on x86). The initial CUDA
+path offloads FP32 GEMM while retaining attention and image operations on the
+CPU; reports identify `cuda_gemm_cpu_attention`. It has no cuBLAS dependency.
+ROCm configurations currently select native CPU depth. CUDA execution and
+performance remain unverified because this environment has no NVIDIA device.
+
+Input preprocessing preserves upstream RGB normalization, lower-bound resize,
+rounding to multiples of 14, and float64 OpenCV interpolation before float32
+conversion. Native inference is bounded to 4096 patches and four-megapixel
+output images; extreme aspect ratios fail explicitly. No resolution reduction
+or model substitution occurs silently.
+
+The port also corrects shared DINOv2 bicubic positional interpolation at image
+borders: clamp sample indices, not sampling coordinates. This matters for
+non-square/upscaled patch grids and is covered by a PyTorch-derived border test.
+
+Generate and validate independent intermediate/output references:
+
+```sh
+# Offline export/reference interpreter:
+python ref/da2/export_reference.py \
+  --installation tmp/vhuman-rig/models/depth-anything-v2-small \
+  --out tmp/da2-reference --image /path/to/portrait.png
+# Native runtime interpreter: NumPy + OpenCV, no frameworks.
+python ref/da2/verify_native.py --fixture tmp/da2-reference \
+  --runner cpu/da2/da2_depth
+DA2_TEST_INSTALLATION=tmp/vhuman-rig/models/depth-anything-v2-small \
+DA2_TEST_FIXTURE=tmp/da2-reference DA2_REQUIRE_FRAMEWORK_FREE=1 \
+  python -m unittest server.vhuman.test_depth_native server.vhuman.test_reconstruction
+```
+
+For GPU validation use `cuda/da2/da2_depth --backend cuda` in the verifier and
+`cuda/da2/test_da2_ops --cuda` for isolated GEMM/convolution checks. Intermediate
+features/fusion use max/mean gates of `1e-3`/`1e-4`. Internal relative-depth
+maximum error permits `max(2e-4, 1e-4 * reference_peak)`; final original-image
+depth retains absolute max/mean gates of `2e-4`/`2e-5`.
+
+Validation on 2026-10-02 passed three independent fixtures: a small rectangular
+image, a 518x518 portrait input, and a 518x686 portrait input. Preprocessing was
+byte-exact; maximum final relative-depth errors were `3.58e-6`, `4.10e-5`, and
+`1.64e-4`. CPU inference took about 5.0 s (square) and 7.2 s (rectangular) using
+four threads; rectangular peak host RSS was about 244 MiB. The framework-free
+suite ran 33 tests: 32 passed and the Torch-only reference test was skipped.
+GEMM, padded/strided convolution and bicubic-border unit checks passed. Existing
+DA3 and DINOv2 runners rebuild with the shared changes.
+
+## Native background, camera, cue and speech-motion inference
+
+Items 1–4 of the framework-removal work are implemented in C, using repository
+GEMM. Runtime Python handles image IO, NumPy arrays, SciPy camera fitting and
+ctypes/subprocess calls; these four inference paths import neither Torch nor
+ONNX. Offline export, training and reference comparisons still use Torch.
+
+| Component | Native implementation | Production integration |
+|---|---|---|
+| RMBG2 | Two-scale Swin-L, complete BiRefNet decoder, deformable convolutions and alpha output | Pixal3D preparation and Qimg21 background removal |
+| MoGe-2 camera | DINOv2-L/14, feature neck, point/mask heads | Pixal3D preparation and Qimg21 camera estimation |
+| Learned cues | Geometry-prior residual normal/mask CNN | Optional reconstruction cue inference, with existing quality gate |
+| Speech motion | Normalization, code embeddings, projection, two-layer streaming GRU and bounded controls | Live motion adapter via native shared library |
+
+MoGe implements the path needed for camera intrinsics. Its metric-scale head
+is not evaluated; this is not a complete metric-depth/normal API. The cue
+checkpoint currently fails its synthetic quality gate and remains disabled for
+production inference. Numerical equivalence does not establish expression or
+appearance quality on new identities. Live inference now uses the repository
+C++/CUDA Gaussian renderer; Torch/gsplat remain offline training/reference tools.
+
+Further dependency removal (items 6, 9, 10 and 12):
+
+| Path | Current dependency boundary |
+|---|---|
+| Live rig and Gaussian rendering | Native C/C++ CUDA deformation, covariance bounds, projection, tile sorting, rasterization, streams/events and sRGB/alpha download; no Torch/gsplat inference |
+| Hunyuan server inference | Repository C++/CUDA backend with strict repository GEMM and no vendor fallback; GPU parity pending |
+| Video parity campaign | Framework-free dump conversion, bounded-memory comparison and 144-case coverage audit; official inference is an isolated Torch oracle |
+| Rig asset helpers | Contact export and shape smoothing use NumPy/SciPy; corrective training loads `mldeformer_training` lazily |
+| Motion evaluation | Native GRU by default; Torch full-sequence comparison only with `--reference-parity` |
+| Identity reference creation | Native FLUX.2 BF16/repository-GEMM neutral generation exercised on5060Ti; quality/full conditioning parity open; expressions still use explicit `torch-reference` |
+
+MediaPipe landmark detection and photographic-reference conditioning remain
+runtime ports to complete. Manual observation files
+already avoid MediaPipe for reconstruction. Registration/optimization, training
+and checkpoint export may still use Torch. The live speech/GRU/rig/render/record
+path ran successfully on RTX 5060 Ti without Torch or ONNX installed. The new
+Hunyuan backend still needs full model/pipeline validation; its repository-only
+GPU kernel tests passed with zero cuBLAS/fallback calls.
+
+GPU checks on 2026-10-02 also passed the saved independent RMBG and MoGe
+oracles. RMBG maximum alpha error was 1.42e-5 (output mask at most one uint8
+level); MoGe maximum output error was 1.17e-5 and FOV error 8.17e-7 radians.
+The CUDA linear initializer was corrected to accept the compiler's positive
+SM return value. Reports are under `tmp/vhuman-native-gpu/`.
+
+Build from the repository root:
+
+```sh
+make -C cpu/vhuman vhuman_models libvhuman_motion.so test
+make -C cuda/vhuman
+```
+
+The image runner supports `--task rmbg|moge|cues`, bounded finite raw FP32 CHW
+input and FP32 CHW output. RMBG returns logits; MoGe returns XYZ plus mask
+probability; cues return normals plus mask probability. The adapters apply
+RMBG's exact PIL resize/normalization/uint8-alpha semantics and MoGe's camera
+fit. Full RMBG runs at 1024 square; MoGe defaults to 3,600 tokens, with image
+size up to 2048 per axis to accommodate padded foreground crops.
+
+CPU math uses AVX2/FMA GEMM on x86, with a scalar alternative. The CUDA image
+runner offloads linear projections and convolution GEMMs through
+`cuda/gemm/cuda_linear_f32.h`; attention, sampling and layout operations remain
+on CPU. It uploads weights per projection and is not yet optimized for GPU
+residency. Neither image runner links vendor BLAS. The small streaming GRU
+uses CPU GEMM with one thread per packet. CUDA builds pass, but GPU numerical
+parity, throughput and 16 GB VRAM behavior remain unverified on this host.
+
+RMBG reads the existing FP32 `model.safetensors` directly. Export MoGe and
+existing trained motion checkpoints once using a Torch-capable interpreter:
+
+```sh
+python ref/vhuman/moge_reference.py \
+  --checkpoint /path/to/moge-2-vitl/model.pt --out tmp/vhuman-native/moge-native
+python -m server.vhuman.realtime.src.animation.export_native \
+  tmp/vhuman-realtime/motion-v3.pt
+```
+
+MoGe export writes `dinov2.safetensors`, `heads.safetensors` and a hashed
+`native.json`. Pass the exported directory to `--moge-model` in preparation,
+or `--moge` in the Pixal3D server. A legacy `model.pt` argument resolves to its
+sibling `native/` directory and does not load Torch. Motion export creates
+`motion-v3.native/`; `--adapter` accepts that directory or the original `.pt`
+path, checking the source hash when the latter is used. Training now exports
+native motion assets automatically. Missing or stale assets fail explicitly.
+Cue inference reads its existing FP32 safetensors checkpoint.
+
+```sh
+# This interpreter needs NumPy, Pillow and SciPy, but no Torch/ONNX.
+python ref/pixal3d/prepare_input.py --device cpu \
+  --input portrait.png --output tmp/prepared.png --metadata tmp/prepared.json \
+  --rembg-model /path/to/RMBG-2.0 --moge-model tmp/vhuman-native/moge-native
+```
+
+Both server preparation paths use the current Python interpreter. ROCm callers
+use the native CPU image models; CUDA callers select the hybrid CUDA runner.
+Job cancellation and timeout terminate the preparation process group, including
+native children.
+
+Independent FP32 Torch comparisons on 2026-10-02 produced:
+
+| Check | Measured maximum error |
+|---|---|
+| Full RMBG2, 1024 square portrait | Alpha `1.05e-5`; resized uint8 mask differs by at most 1 |
+| MoGe camera, 512 square / 3,600 tokens | XYZ/mask `1.17e-5`; FOV `1.4e-6` radians |
+| Cue network, 64 square and 57×83 | `8.65e-7` |
+| Motion GRU, 40 consecutive packets | `2.69e-7`; reset output bit-exact |
+
+RMBG logits have maximum error `0.00542` in saturated regions; alpha is the
+relevant output gate. CPU runs with four threads took about 72 seconds for
+RMBG and 87 seconds for MoGe. These are single-fixture measurements, not GPU
+performance or visual-quality claims. Both production Python adapters also ran
+successfully in an environment without Torch, ONNX or ONNX Runtime.
+
+Reproduce the offline oracles with the appropriate reference environments,
+then compare with an ordinary NumPy/Pillow/SciPy interpreter:
+
+```sh
+# Requires Torch/torchvision/timm/transformers/safetensors and pinned local RMBG source.
+python ref/vhuman/rmbg_reference.py --model /path/to/RMBG-2.0 \
+  --image portrait.png --out tmp/vhuman-native/rmbg1024
+# Requires the local moge-upstream dependencies; also exports native assets.
+python ref/vhuman/moge_reference.py --checkpoint /path/to/moge-2-vitl/model.pt \
+  --image portrait.png --side 512 --tokens 3600 --out tmp/vhuman-native/moge-native
+
+python ref/vhuman/verify_images.py --fixture tmp/vhuman-native/rmbg1024
+python ref/vhuman/verify_images.py --fixture tmp/vhuman-native/moge-native
+# For GPU comparisons add --backend cuda --runner cuda/vhuman/vhuman_models.
+# Torch reference + native comparison for the two small models:
+python ref/vhuman/verify_small_models.py --cues /path/to/trained-cues \
+  --motion tmp/vhuman-realtime/motion-v3.pt --out tmp/vhuman-native/small-models
+
+python -m unittest server.vhuman.test_native_models server.vhuman.test_reconstruction
+python -m unittest server.pixal3d.test_app server.pixal3d.test_i23d_studio
+```
+
+Image verification records complete-buffer errors and hashes. Fixed gates are
+alpha max/mean `<1e-3`/`<1e-5`, resized mask difference `<=1`; MoGe output
+max/mean `<1e-4`/`<1e-5` and FOV difference `<1e-4` radians. Small models use
+maximum error `<2e-5`. The C unit tests independently check convolution,
+deformable sampling and antialiased resize, and pass ASan/UBSan checks.
+Framework-free replay tests optionally use `VHUMAN_NATIVE_FIXTURES` pointing to
+the fixture root (including `cues/` and `motion.native/` asset directories);
+`VHUMAN_REQUIRE_FRAMEWORK_FREE=1` asserts that ML frameworks are absent.
+
+The standalone backbone runners remain available in `cpu/rmbg` and
+`cuda/rmbg`. Their independent feature-map oracle and verifier are in
+`ref/rmbg`; odd/rectangular and both production encoder scales passed before
+the full decoder port.
+
 ## Licensing and provenance
 
 The [neural avatar runtime](realtime/README.md) adds timestamped native TTS
-features/PCM, causal facial motion, and an Apache gsplat renderer on top of the
+features/PCM, causal facial motion, and a native CUDA Gaussian renderer on top of the
 existing rig. Its diagnostic benchmarks are separate from appearance quality;
 commercial appearance training requires new, cleared identity assets.
 

@@ -1,0 +1,23 @@
+# Attach owned CUDA code without changing the pinned dependency's build files.
+if(NOT CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
+    return()
+endif()
+enable_language(CUDA)
+set_property(GLOBAL PROPERTY HV15_CUDA_SOURCE "${CMAKE_CURRENT_LIST_DIR}/cuda_attention.cu")
+set_property(GLOBAL PROPERTY HV15_CUDA_INCLUDE "${CMAKE_CURRENT_LIST_DIR}")
+set_property(GLOBAL PROPERTY HV15_PROGRESS_SOURCE "${CMAKE_CURRENT_LIST_DIR}/progress.cpp")
+set_property(GLOBAL PROPERTY HV15_MATH_SOURCE "${CMAKE_CURRENT_LIST_DIR}/cuda_math.cu")
+function(hv15_attach_cuda)
+    get_property(hv15_source GLOBAL PROPERTY HV15_CUDA_SOURCE)
+    get_property(hv15_include GLOBAL PROPERTY HV15_CUDA_INCLUDE)
+    get_property(hv15_progress GLOBAL PROPERTY HV15_PROGRESS_SOURCE)
+    get_property(hv15_math GLOBAL PROPERTY HV15_MATH_SOURCE)
+    target_sources(stable-diffusion PRIVATE "${hv15_source}" "${hv15_progress}" "${hv15_math}")
+    set_source_files_properties("${hv15_math}" PROPERTIES
+        COMPILE_DEFINITIONS "$<TARGET_PROPERTY:ggml-cuda,COMPILE_DEFINITIONS>"
+        INCLUDE_DIRECTORIES "$<TARGET_PROPERTY:ggml-cuda,INCLUDE_DIRECTORIES>")
+    target_link_libraries(stable-diffusion PRIVATE CUDA::cublas)
+    set_target_properties(stable-diffusion PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+    target_include_directories(stable-diffusion PRIVATE "${hv15_include}" "${CMAKE_CURRENT_SOURCE_DIR}/ggml/src")
+endfunction()
+cmake_language(DEFER CALL hv15_attach_cuda)

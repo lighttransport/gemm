@@ -233,12 +233,13 @@ class Studio:
         return path
 
     def health(self) -> dict:
+        from server.vhuman.native_models import moge_ready
         from qimg21_i23d.native import NativeBackend
         native = reconstruct.Pixal3DNative(self.hardware_backend, **self.native_options).available()
         reference = reconstruct.Pixal3DReference(self.hardware_backend, **self.reference_options).available()
         model = self.image_model_path or NativeBackend.__init__.__defaults__[0]
         return {"image_model_ready": NativeBackend.available(model, self.hardware_backend), "pixal3d_native_ready": native[0],
-                "pixal3d_reference_ready": reference[0], "moge_ready": reconstruct.MOGE.exists(),
+                "pixal3d_reference_ready": reference[0], "moge_ready": moge_ready(reconstruct.MOGE),
                 "image_model_resident": bool(self._backend is not None and
                                              getattr(self._backend, "_fast", None) and
                                              self._backend._fast.alive())}

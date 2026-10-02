@@ -8,6 +8,8 @@
 #ifndef CUDA_SAM3D_BODY_KERNELS_H_
 #define CUDA_SAM3D_BODY_KERNELS_H_
 
+#include "../gemm/cuda_gemm_f32_kernels.h"
+
 /* The shared cuda_kernels_common_src opens an `extern "C" {` block that
  * this string is concatenated inside — kernels here must NOT redeclare
  * extern "C", and the final string must close the block with a `}`. */
@@ -319,18 +321,7 @@ static const char cuda_sam3d_body_kernels_src[] =
      *
      * Grid: (ceil(N/16), ceil(D_out/16))   Block: (16, 16).
      */
-    "__global__ void gemm_f32_bias(float *Y, const float *X, const float *W,\n"
-    "                              const float *b,\n"
-    "                              int N, int D_in, int D_out) {\n"
-    "    int n = blockIdx.x * blockDim.x + threadIdx.x;\n"
-    "    int d = blockIdx.y * blockDim.y + threadIdx.y;\n"
-    "    if (n >= N || d >= D_out) return;\n"
-    "    const float *xr = X + (size_t)n * D_in;\n"
-    "    const float *wr = W + (size_t)d * D_in;\n"
-    "    float acc = (b ? b[d] : 0.0f);\n"
-    "    for (int k = 0; k < D_in; k++) acc += wr[k] * xr[k];\n"
-    "    Y[(size_t)n * D_out + d] = acc;\n"
-    "}\n"
+    CUDA_GEMM_F32_BIAS_SRC
 
     /* add_two_f32: out = a + b (element-wise). */
     "__global__ void add_two_f32(float *out, const float *a, const float *b,\n"
@@ -1127,25 +1118,7 @@ static const char cuda_sam3d_body_kernels_src[] =
      * which serializes all 3000 FMAs for the 55317-row MHR projection. This
      * kernel uses one block per row and reduces across D_in in shared memory.
      */
-    "__global__ void mhr_matvec_f32(float *Y,\n"
-    "                               const float *W,\n"
-    "                               const float *X,\n"
-    "                               int D_in, int D_out) {\n"
-    "    int row = blockIdx.x;\n"
-    "    if (row >= D_out) return;\n"
-    "    int tid = threadIdx.x;\n"
-    "    float acc = 0.0f;\n"
-    "    const float *wr = W + (size_t)row * D_in;\n"
-    "    for (int k = tid; k < D_in; k += blockDim.x) acc += wr[k] * X[k];\n"
-    "    __shared__ float red[256];\n"
-    "    red[tid] = acc;\n"
-    "    __syncthreads();\n"
-    "    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {\n"
-    "        if (tid < stride) red[tid] += red[tid + stride];\n"
-    "        __syncthreads();\n"
-    "    }\n"
-    "    if (tid == 0) Y[row] = red[0];\n"
-    "}\n"
+    CUDA_GEMV_F32_SRC
 
     /* mhr_keypoints_from_mesh_f32 — Stage 12 keypoint regression.
      *

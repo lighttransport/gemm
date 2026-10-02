@@ -27,12 +27,10 @@ def validate_appearance(avatar, diagnostic=False):
 
 
 def run(args, work):
-    import torch
     if args.motion_threads < 1: raise ValueError("motion threads must be positive")
-    torch.set_num_threads(args.motion_threads)
     work = Path(work)
     rig = RigAvatar(args.rig, work / "native")
-    shared = ring = device = source = output = sampler = None
+    shared = ring = device = source = output = sampler = adapter = renderer = handle = None
     vertices = None
     try:
         adapter = MotionAdapter(args.adapter, args.revision, allow_diagnostic=args.diagnostic)
@@ -43,17 +41,17 @@ def run(args, work):
         renderer = GaussianRenderer(avatar, rig.triangles)
         from ..ui.output import FrameOutput
         output = FrameOutput(display=args.display, video=args.video, virtual_camera=args.virtual_camera)
-        shared = NativeSharedGPU(Path(args.rig) / "rig_deformer.safetensors", work / "native")
+        shared = NativeSharedGPU(Path(args.rig) / "rig_deformer.safetensors", work / "native", runtime=renderer.runtime)
         library = build_device(work / "native/libaudio.so") if args.sink == "device" else build(work / "native/libpcm.so")
         ring = PcmRing(library)
         session = Session(ring, rig.names, rig.ranges)
         if args.sink == "device": device = AudioDevice(ring, library)
-        view, intrinsics = [torch.tensor(x, device="cuda") for x in for_avatar(avatar, rig.rest)]
+        view, intrinsics = for_avatar(avatar, rig.rest)
         # Resolve CUDA library/kernel initialization before starting audio playback.
         for _ in range(3):
             neutral = np.zeros(len(rig.names), np.float32)
             vertices = shared.submit(neutral)
-            handle = renderer.render(vertices, view, intrinsics, controls=torch.tensor(neutral, device="cuda"))
+            handle = renderer.render(vertices, view, intrinsics, controls=neutral)
             handle.ready.synchronize()
         if args.display or args.video or args.virtual_camera: output.prepare(handle)
         if args.resident:
@@ -113,7 +111,7 @@ def run(args, work):
                 with session.metrics.wall("rig_submit_wall_ms"):
                     vertices = shared.submit(controls)
                 with session.metrics.wall("render_completion_wall_ms"):
-                    handle = renderer.render(vertices, view, intrinsics, controls=torch.tensor(controls, device="cuda"), sample_position=position)
+                    handle = renderer.render(vertices, view, intrinsics, controls=controls, sample_position=position)
                     handle.ready.synchronize()
                 # Initial display/record path intentionally synchronizes; optimization is a separate measurement.
                 with session.metrics.wall("compositing_wall_ms"):
@@ -125,7 +123,8 @@ def run(args, work):
                 previous_render_ns = rendered_ns
                 ticks += 1
                 session.metrics.add("audio_buffer_ms", ring.depth / 24)
-                session.metrics.add("torch_allocated_mib", torch.cuda.memory_allocated()/2**20)
+                for name, value in renderer.memory_stats().items():
+                    session.metrics.add(name, value)
             if source.done_audio.is_set() and source.done_features.is_set() and source.audio.empty() and source.features.empty() and pending is None and ring.depth == 0:
                 if not device or session.clock.position() >= session.accepted: break
             # Drop expired frame slots; never accelerate audio to catch up frames.
@@ -144,5 +143,5 @@ def run(args, work):
         return {"ticks": ticks, "audio_samples": session.accepted, "metrics": session.metrics.report(),
                 "sink": args.sink, "purpose": avatar.metadata["purpose"]}
     finally:
-        vertices = None
-        close_resources(source, sampler, device, output, shared, ring, rig)
+        vertices = handle = None
+        close_resources(source, sampler, device, output, shared, ring, rig, adapter, renderer)

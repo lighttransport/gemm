@@ -27,44 +27,83 @@ def align(relative, metric, confidence):
                     median_error_m=float(error),weight=.05,convention='affine relative inverse depth to inverse metric depth')
 
 
-def infer(image, installation, out):
-    import sys
-    import torch
-    import cv2
+def _native_manifest(installation):
     installation = Path(installation)
-    manifest = json.loads((installation/'installation.json').read_text())
-    weights = installation/'depth_anything_v2_vits.pth'
-    if manifest['model']!='Depth-Anything-V2-Small' or sha256(weights)!=manifest['weights_sha256']:
-        raise ValueError('unverified Small depth checkpoint')
-    sys.path.insert(0,str(installation/'source'))
-    # Upstream uses torchvision only for sequential dictionary transforms.
-    # Load the pinned module with our tiny composition adapter; do not install
-    # a torchvision wheel that could downgrade this environment's CUDA torch.
+    manifest = json.loads((installation / 'installation.json').read_text())
+    native = installation / 'native'
+    try:
+        converted = json.loads((native / 'native.json').read_text())
+    except FileNotFoundError as exc:
+        raise ValueError('Native DA2 assets missing; run ref/da2/export_reference.py with '
+                         '--installation DIR --out DIR/native in the offline export environment') from exc
+    if (manifest.get('model') != 'Depth-Anything-V2-Small' or converted.get('version') != 1 or
+            converted.get('model') != manifest['model'] or converted.get('source') != manifest or
+            converted.get('dtype') != 'F32'):
+        raise ValueError('unverified Small native depth export')
+    for name in ('dinov2.safetensors', 'depth_head.safetensors'):
+        if not (native / name).is_file() or sha256(native / name) != converted.get('files', {}).get(name):
+            raise ValueError('native depth checkpoint checksum mismatch: ' + name)
+    return native, manifest
+
+
+def _preprocess(image, input_size=518):
+    # Preserve the pinned upstream's float64 OpenCV cubic resize and rounding.
+    import cv2
+    if not isinstance(input_size, int) or not 14 <= input_size <= 1024:
+        raise ValueError('depth input size must be between 14 and 1024')
+    raw = cv2.imread(str(image))
+    if raw is None:
+        raise ValueError('depth image cannot be decoded')
+    h, w = raw.shape[:2]
+    if h * w > 4194304:
+        raise ValueError('depth image exceeds four megapixels')
+    scale = max(input_size / h, input_size / w)
+    def multiple(value):
+        result = int(np.round(value / 14) * 14)
+        return int(np.ceil(value / 14) * 14) if result < input_size else result
+    nh, nw = multiple(h * scale), multiple(w * scale)
+    if (nh // 14) * (nw // 14) > 4096:
+        raise ValueError('depth aspect ratio exceeds the native 4096-patch limit')
+    rgb = cv2.cvtColor(raw, cv2.COLOR_BGR2RGB) / 255.0
+    rgb = cv2.resize(rgb, (nw, nh), interpolation=cv2.INTER_CUBIC)
+    rgb = (rgb - np.asarray([.485, .456, .406])) / np.asarray([.229, .224, .225])
+    return np.ascontiguousarray(rgb.transpose(2, 0, 1), dtype=np.float32), h, w
+
+
+def infer(image, installation, out, *, input_size=518, threads=4):
     import subprocess
-    import types
-    source_root = installation/'source'
-    revision = subprocess.check_output(['git','-C',str(source_root),'rev-parse','HEAD'],text=True).strip()
-    dirty = subprocess.check_output(['git','-C',str(source_root),'status','--porcelain','--untracked-files=no'],text=True)
-    if revision != manifest['code_revision'] or dirty:
-        raise ValueError('depth source revision changed or working tree modified')
-    source = (source_root/'depth_anything_v2/dpt.py').read_text()
-    old = 'from torchvision.transforms import Compose'
-    if source.count(old) != 1:
-        raise ValueError('unsupported depth transform import')
-    source = source.replace(old,'from server.vhuman.reconstruction.depth import Compose')
-    module = types.ModuleType('depth_anything_v2.dpt')
-    module.__package__ = 'depth_anything_v2'
-    exec(compile(source,str(source_root/'depth_anything_v2/dpt.py'),'exec'),module.__dict__)
-    DepthAnythingV2 = module.DepthAnythingV2
-    model = DepthAnythingV2(encoder='vits',features=64,out_channels=[48,96,192,384])
-    model.load_state_dict(torch.load(weights,map_location='cpu',weights_only=True))
-    from server.vhuman.runtime import torch_device
-    device = torch_device(torch)
-    model.to(device).eval()
-    with torch.inference_mode():
-        depth = model.infer_image(cv2.imread(str(image)))
-    np.save(out,depth.astype(np.float32),allow_pickle=False)
-    return dict(model=manifest,adapter='original sequential transform adapter; no torchvision wheel',convention='relative inverse depth, original uncropped image pixels',device=device)
+    import tempfile
+    from .. import gpu
+    from ..service import ROOT
+    native, manifest = _native_manifest(installation)
+    chw, h, w = _preprocess(image, input_size)
+    requested = gpu.backend()
+    backend = 'cuda' if requested == 'cuda' else 'cpu'
+    directory = ROOT / backend / 'da2'
+    subprocess.run(['make', '-s', '-C', str(directory), 'da2_depth'],
+                   check=True, capture_output=True, text=True)
+    temp = ROOT / 'tmp/vhuman-runtime'
+    temp.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='da2-', dir=temp) as folder:
+        folder = Path(folder)
+        chw.tofile(folder / 'input.f32')
+        cmd = [str(directory / 'da2_depth'), '--backbone', str((native / 'dinov2.safetensors').resolve()),
+               '--head', str((native / 'depth_head.safetensors').resolve()),
+               '--input', str(folder / 'input.f32'), '--output', str(folder / 'depth.f32'),
+               '--width', str(chw.shape[2]), '--height', str(chw.shape[1]),
+               '--output-width', str(w), '--output-height', str(h),
+               '--backend', backend, '--device', str(gpu.device_index()), '--threads', str(threads)]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1200)
+        if proc.returncode:
+            raise RuntimeError('Native DA2 failed: ' + proc.stderr[-4000:])
+        depth = np.fromfile(folder / 'depth.f32', dtype='<f4')
+        if depth.size != h * w or not np.isfinite(depth).all() or np.any(depth < 0):
+            raise ValueError('invalid native relative depth output')
+        report = json.loads(proc.stdout)
+    np.save(out, depth.reshape(h, w), allow_pickle=False)
+    return dict(model=manifest, adapter='native DINOv2 + DA3 DPT with repository GEMM',
+                convention='relative inverse depth, original uncropped image pixels',
+                device=backend, requested_backend=requested, runner=report)
 
 
 def refine(vertices, triangles, camera, aligned, confidence, protected_pixels=()):

@@ -1,4 +1,4 @@
-"""Registration and shape smoothing must honor the configured execution device."""
+"""Registration honors the configured device; asset smoothing is framework-free CPU."""
 from importlib.util import find_spec
 import builtins
 from types import SimpleNamespace
@@ -72,7 +72,7 @@ class RigBackendTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 expressions.smooth_shapes(self.fields, self.shapes)
 
-    def test_missing_torch_does_not_silently_fall_back_from_rocm(self):
+    def test_smoothing_has_no_torch_dependency_under_any_fitting_backend(self):
         original_import = builtins.__import__
 
         def without_torch(name, *args, **kwargs):
@@ -83,9 +83,9 @@ class RigBackendTests(unittest.TestCase):
         with gpu.execution("cpu"):
             reference = expressions.smooth_shapes(self.fields, self.shapes, iters=2)
         with gpu.execution("rocm"), patch.object(builtins, "__import__", side_effect=without_torch):
-            with self.assertRaisesRegex(RuntimeError, "PyTorch unavailable for rocm smoothing"):
-                expressions.smooth_shapes(self.fields, self.shapes)
-            actual = expressions.smooth_shapes(self.fields, self.shapes, iters=2, device="cpu")
+            actual = expressions.smooth_shapes(self.fields, self.shapes, iters=2)
+            with self.assertRaisesRegex(ValueError, 'CPU asset preparation'):
+                expressions.smooth_shapes(self.fields, self.shapes, device='cuda')
         np.testing.assert_allclose(actual["smile"], reference["smile"], atol=1e-12, rtol=0)
 
 

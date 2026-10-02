@@ -14,13 +14,18 @@ WORK = Path("tmp/vhuman-realtime")
 
 
 def doctor():
-    import torch
-    report = {"torch": torch.__version__, "torch_cuda": torch.version.cuda,
-              "cuda_available": torch.cuda.is_available()}
-    if torch.cuda.is_available():
-        free, total = torch.cuda.mem_get_info()
-        report.update(gpu=torch.cuda.get_device_name(), capability=torch.cuda.get_device_capability(),
-                      free_mib=free/2**20, total_mib=total/2**20)
+    from .src.avatar.cuda_runtime import CudaRuntime
+    import importlib.util
+    report = {'cuda_available': False, 'renderer': 'native-cuda',
+              'torch_installed': importlib.util.find_spec('torch') is not None,
+              'gsplat_installed': importlib.util.find_spec('gsplat') is not None}
+    try:
+        runtime = CudaRuntime()
+    except RuntimeError as error:
+        report['cuda_error'] = str(error)
+    else:
+        report['cuda_available'] = True
+        runtime.close()
     return report
 
 
@@ -43,11 +48,10 @@ def replay(args):
     library = build_device(WORK / "native/libaudio.so") if args.sink == "device" else build(WORK / "native/libpcm.so")
     ring = PcmRing(library)
     session = Session(ring, names, ranges)
-    renderer = rig = device = shared = None
+    renderer = rig = device = shared = handle = None
     vertices = None
     try:
         if args.avatar:
-            import torch
             from .src.avatar.rig import RigAvatar
             from .src.renderer.gaussian import GaussianRenderer
             from .src.renderer.camera import for_avatar
@@ -57,8 +61,8 @@ def replay(args):
             renderer = GaussianRenderer(avatar, rig.triangles)
             if args.rig_backend == "cuda":
                 from .src.avatar.native_gpu import NativeSharedGPU
-                shared = NativeSharedGPU(Path(args.rig) / "rig_deformer.safetensors", WORK / "native")
-            view, intrinsics = [torch.tensor(x, device="cuda") for x in for_avatar(avatar, rig.rest)]
+                shared = NativeSharedGPU(Path(args.rig) / "rig_deformer.safetensors", WORK / "native", runtime=renderer.runtime)
+            view, intrinsics = for_avatar(avatar, rig.rest)
         if args.sink == "device": device = AudioDevice(ring, library)
         head, index, ticks = 0, 0, 0
         output = Path(args.output); output.parent.mkdir(parents=True, exist_ok=True)
@@ -83,8 +87,8 @@ def replay(args):
                 if renderer:
                     start = time.monotonic_ns()
                     mapped = retarget(controls, names, rig.names)
-                    vertices = shared.submit(mapped) if shared else torch.tensor(rig.deform(mapped), device="cuda")
-                    handle = renderer.render(vertices, view, intrinsics, controls=torch.tensor(mapped, device="cuda"), sample_position=position)
+                    vertices = shared.submit(mapped) if shared else rig.deform(mapped)
+                    handle = renderer.render(vertices, view, intrinsics, controls=mapped, sample_position=position)
                     handle.ready.synchronize()
                     session.metrics.add("rig_plus_render_wall_ms", (time.monotonic_ns()-start)/1e6)
                 log.write(json.dumps({"sample_position": position, "controls": controls.tolist()}) + "\n")
@@ -92,60 +96,52 @@ def replay(args):
                 if device: time.sleep(1/60)
         return {"samples": len(pcm), "ticks": ticks, "metrics": session.metrics.report(), "output": str(output)}
     finally:
-        if device: device.close()
-        vertices = None
-        if shared: shared.close()
-        if rig: rig.close()
-        ring.close()
+        from .src.pipeline.cleanup import close_resources
+        vertices = handle = None
+        close_resources(device, shared, renderer, rig, ring)
 
 
 def render(args):
-    import torch
     from .src.avatar.rig import RigAvatar
     from .src.renderer.gaussian import GaussianRenderer
     from .src.renderer.camera import for_avatar
     from PIL import Image
     rig = RigAvatar(args.rig, WORK / "native")
-    shared = None
+    shared = renderer = handle = begin = end = None
     vertices = None
     try:
         avatar = GaussianAvatar.load(args.avatar, rig.triangles)
         renderer = GaussianRenderer(avatar, rig.triangles)
-        view, intrinsics = [torch.tensor(x, device="cuda") for x in for_avatar(avatar, rig.rest, (args.res, args.res))]
+        view, intrinsics = for_avatar(avatar, rig.rest, (args.res, args.res))
         if args.rig_backend == "cuda":
             from .src.avatar.native_gpu import NativeSharedGPU
-            shared = NativeSharedGPU(Path(args.rig) / "rig_deformer.safetensors", WORK / "native")
+            shared = NativeSharedGPU(Path(args.rig) / "rig_deformer.safetensors", WORK / "native", runtime=renderer.runtime)
         zero = np.zeros(len(rig.names), np.float32)
-        vertices = shared.submit(zero) if shared else torch.tensor(rig.deform(zero), device="cuda")
+        vertices = shared.submit(zero) if shared else rig.deform(zero)
         for _ in range(5): renderer.render(vertices, view, intrinsics, (args.res, args.res)).ready.synchronize()
-        torch.cuda.reset_peak_memory_stats()
+        renderer.reset_memory_stats()
         start = time.monotonic_ns()
-        begin, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-        begin.record()
+        begin = renderer.runtime.record()
         for index in range(args.frames):
             controls = zero.copy()
             if args.animate:
                 controls[rig.names.index("jawOpen")] = .3 + .3 * np.sin(index * .1)
-                vertices = shared.submit(controls) if shared else torch.tensor(rig.deform(controls), device="cuda")
-            handle = renderer.render(vertices, view, intrinsics, (args.res, args.res), torch.tensor(controls, device="cuda"))
-        end.record(); end.synchronize()
+                vertices = shared.submit(controls) if shared else rig.deform(controls)
+            handle = renderer.render(vertices, view, intrinsics, (args.res, args.res), controls)
+        end = renderer.runtime.record(); end.synchronize()
         elapsed = (time.monotonic_ns()-start)/1e9
         output = Path(args.output); output.parent.mkdir(parents=True, exist_ok=True)
-        rgba = handle.rgba.clamp(0, 1)
-        straight = (rgba[..., :3] / rgba[..., 3:4].clamp_min(1e-8)).clamp(0, 1)
-        srgb = torch.where(straight <= .0031308, straight * 12.92, 1.055 * straight.pow(1/2.4) - .055)
-        png = torch.cat((srgb, rgba[..., 3:4]), -1).mul(255).round().to(torch.uint8).cpu().numpy()
+        png = handle.pixels(straight_alpha=True)
         Image.fromarray(png, "RGBA").save(output)
         return dict(purpose=avatar.metadata["purpose"], trained=avatar.metadata["trained"], frames=args.frames,
                     animated=args.animate, rig_backend=args.rig_backend,
                     gaussians=len(avatar.arrays["triangle"]), fps_wall=args.frames/elapsed,
                     gpu_ms_per_frame=begin.elapsed_time(end)/args.frames,
-                    allocated_peak_mib=torch.cuda.max_memory_allocated()/2**20,
-                    reserved_peak_mib=torch.cuda.max_memory_reserved()/2**20, output=str(output))
+                    **renderer.memory_stats(), output=str(output))
     finally:
-        vertices = None
-        if shared: shared.close()
-        rig.close()
+        from .src.pipeline.cleanup import close_resources
+        vertices = handle = None
+        close_resources(begin, end, shared, renderer, rig)
 
 
 def main():
@@ -153,6 +149,10 @@ def main():
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("doctor")
     p = commands.add_parser("generate-identity")
+    p.add_argument('--identity-backend', choices=('native', 'torch-reference'), default='native')
+    p.add_argument('--native-assets', help='Hashed native FLUX.2 component manifest')
+    p.add_argument('--identity-runner', help='Repository FLUX.2 executable')
+    p.add_argument('--identity-device', type=int, default=0)
     p.add_argument("--output", required=True); p.add_argument("--seed", type=int, default=7)
     p.add_argument("--cache", default=str(WORK / "cache/hf")); p.add_argument("--expressions", action="store_true")
     p.add_argument("--resume", action="store_true")
@@ -195,6 +195,7 @@ def main():
     p.add_argument("--threads", type=int, default=4)
     p.add_argument("--text-feed", choices=["incremental", "full"], default="incremental")
     p = commands.add_parser("evaluate-motion")
+    p.add_argument("--reference-parity", action="store_true", help="Offline Torch reference comparison")
     for name in ("manifest", "checkpoint", "output"): p.add_argument("--"+name, required=True)
     p = commands.add_parser("stress-tts")
     for name in ("model", "runner", "output"): p.add_argument("--"+name, required=True)
@@ -213,7 +214,9 @@ def main():
     if args.command == "doctor": result = doctor()
     elif args.command == "generate-identity":
         from .src.avatar.generate import generate
-        result = generate(args.output, args.cache, args.seed, args.expressions, args.resume)
+        result = generate(args.output, args.cache, args.seed, args.expressions, args.resume,
+                          backend=args.identity_backend, native_assets=args.native_assets,
+                          runner=args.identity_runner, device=args.identity_device)
     elif args.command == "export-neutral":
         from .src.avatar.corpus import export_neutral
         result = export_neutral(args.head, args.identity, args.output, WORK / "native")
@@ -246,7 +249,7 @@ def main():
         result = collect(args.rig, args.model, args.runner, args.aligner, args.align_model, args.sentences, args.output, WORK, args.threads, args.text_feed)
     elif args.command == "evaluate-motion":
         from .src.benchmark.motion import evaluate
-        result = evaluate(args.manifest, args.checkpoint, args.output)
+        result = evaluate(args.manifest, args.checkpoint, args.output, reference_parity=args.reference_parity)
     elif args.command == "stress-tts":
         from .src.benchmark.tts import stress
         result = stress(args.model, args.runner, args.output, WORK/"tts-soak", args.requests, args.threads, args.text_feed)

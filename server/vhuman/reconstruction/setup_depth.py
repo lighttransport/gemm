@@ -18,6 +18,7 @@ def main():
     ap.add_argument('--weight-revision',default='03876f8651c73a60fe4c2c48294e09fcb6838fcf')
     ap.add_argument('--weight-sha256',default='715fade13be8f229f8a70cc02066f656f2423a59effd0579197bbf57860e1378')
     ap.add_argument('--out',default='tmp/vhuman-rig/models/depth-anything-v2-small')
+    ap.add_argument('--export-python',help='optional offline Torch/safetensors/OpenCV interpreter for native export')
     a = ap.parse_args()
     for revision in (a.code_revision,a.weight_revision):
         if not re.fullmatch('[0-9a-f]{40}',revision):
@@ -47,6 +48,9 @@ def main():
             partial.unlink(missing_ok=True)
     (out/'installation.json').write_text(json.dumps(dict(model='Depth-Anything-V2-Small',license='Apache-2.0',
         code_revision=a.code_revision,weight_revision=a.weight_revision,weights_sha256=a.weight_sha256,source=url),indent=2))
+    if a.export_python:
+        exporter=Path(__file__).resolve().parents[3]/'ref/da2/export_reference.py'
+        subprocess.run([a.export_python,str(exporter),'--installation',str(out),'--out',str(out/'native')],check=True)
 
 if __name__=='__main__':
     main()

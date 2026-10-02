@@ -16,7 +16,7 @@ TARGET     = test_cuda_sam3d_body
 
 VERIFIES = verify_dinov3 verify_vith verify_ray_cond verify_build_tokens verify_decoder_layer verify_kp_update verify_mhr_head verify_decoder verify_mhr verify_end_to_end
 
-COMMON_DEPS = cuda_sam3d_body_runner.h cuda_sam3d_body_kernels.h \
+COMMON_DEPS = cuda_sam3d_body_runner.h cuda_sam3d_body_kernels.h ../gemm/cuda_gemm_f32_kernels.h \
               ../cuew.h ../cublasew.h ../cuda_kernels_common.h ../cuda_runner_common.h \
               ../cuda_hip_compat.h ../../common/safetensors.h \
               ../../common/sam3d_body_decoder.h ../../common/sam3d_body_mhr.h \
@@ -114,4 +114,20 @@ verify-end-to-end: check-backbone check-e2e-image verify_end_to_end
 	./verify_end_to_end --safetensors-dir $(SFT) --mhr-assets $(MHR) --refdir $(REFDIR) --image "$(E2E_IMAGE)" --bbox $(E2E_BBOX) --backbone $(BACKBONE) --threshold $(E2E_THRESHOLD) --threshold-2d $(E2E_THRESHOLD_2D)
 
 clean:
-	rm -f $(TARGET) $(VERIFIES)
+	rm -f $(TARGET) $(VERIFIES) mhr_decode mhr_gemm_avx2.o test_mhr_compile
+
+# Framework-free MHR only; baseline host ISA, isolated optional AVX2 object.
+MHR_CFLAGS = -O3 -Wall -Wextra -fopenmp
+MHR_DEPS = ../../common/mhr_decode_cli.c ../../common/sam3d_body_mhr.h ../../common/safetensors.h
+MHR_AVX2_OBJ =
+ifneq (,$(filter x86_64 amd64,$(shell uname -m)))
+MHR_CFLAGS += -DMHR_HAVE_AVX2
+MHR_AVX2_OBJ = mhr_gemm_avx2.o
+mhr_gemm_avx2.o: ../../ryzen/gemm_avx2.c ../../ryzen/gemm_avx2.h
+	$(CC) -O3 -Wall -Wextra -mavx2 -mfma -c $< -o $@
+endif
+mhr_decode: $(MHR_DEPS) $(MHR_AVX2_OBJ) mhr_decode_cuda.h ../gemm/cuda_gemm_f32_kernels.h ../cuew.c ../cuew.h ../cuda_runner_common.h
+	$(CC) $(MHR_CFLAGS) -Wno-unused-function -DMHR_CUDA -o $@ ../../common/mhr_decode_cli.c $(MHR_AVX2_OBJ) ../cuew.c -lm -ldl -lpthread -fopenmp
+
+test_mhr_compile: test_mhr_compile.c mhr_decode_cuda.h ../gemm/cuda_gemm_f32_kernels.h ../cuew.c ../cuew.h ../cuda_runner_common.h
+	$(CC) -O2 -Wall -Wextra -Wno-unused-function -o $@ $< ../cuew.c -lm -ldl -lpthread

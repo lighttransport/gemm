@@ -36,6 +36,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from server.vhuman.native_models import moge_ready
 from server.qwen_image21.app import Demo as QwenImage21Demo
 from server.pixal3d.i23d import Studio as I23DStudio, StudioCancelled
 
@@ -181,12 +182,29 @@ class UploadStore:
         return True
 
 
+def stop_command_group(process):
+    """Stop the preparation interpreter and its native inference children."""
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+    except ProcessLookupError:
+        pass
+    finally:
+        # A child may ignore TERM even when its parent has already exited.
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait()
+
+
 def run_command(command: list[str], timeout: float, cancel: threading.Event | None = None,
                 progress=None) -> subprocess.CompletedProcess:
-    if cancel is None and progress is None:
-        return subprocess.run(command, capture_output=True, text=True, timeout=timeout)
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                               text=True, bufsize=1)
+                               text=True, bufsize=1, start_new_session=True)
     stdout_lines: list[str] = []
     stderr_lines: list[str] = []
 
@@ -206,17 +224,11 @@ def run_command(command: list[str], timeout: float, cancel: threading.Event | No
     while process.poll() is None:
         if cancel is not None and cancel.is_set():
             cancelled = True
-            process.terminate()
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
+            stop_command_group(process)
             break
         if time.monotonic() >= deadline:
             timed_out = True
-            process.kill()
-            process.wait()
+            stop_command_group(process)
             break
         time.sleep(0.1)
     for reader in readers:
@@ -356,8 +368,8 @@ def model_ready(model_dir: Path, dino: Path, naf: Path) -> bool:
 
 
 def rmbg_ready(path: Path) -> bool:
-    return ((path / "config.json").is_file() and
-            (any(path.glob("*.safetensors")) or any(path.glob("pytorch_model*.bin"))))
+    weights = path / "model.safetensors" if path.is_dir() else path
+    return weights.is_file() and weights.suffix == '.safetensors'
 
 
 def reference_environment_ready(backend: str) -> tuple[bool, list[str]]:
@@ -628,7 +640,7 @@ class PixalServer:
                 "device_lock": {"cuda": True, "rocm": True,
                                  "directory": str(self.device_lock_dir)},
                 "preparation": {"mask_ready": rmbg_ready(self.rembg),
-                                "camera_ready": self.moge.is_file(),
+                                "camera_ready": moge_ready(self.moge),
                                 "render_comparison_ready": (
                                     self.preview_script.is_file() and
                                     self.preview_renderer.is_file())},
@@ -678,8 +690,8 @@ class PixalServer:
         auto_camera = boolean(request.get("auto_camera", False), "auto_camera")
         if multiview and auto_camera:
             raise ValueError("auto_camera is only available for single-view inference")
-        if auto_camera and not self.moge.is_file():
-            raise ValueError(f"automatic camera estimation is unavailable; missing MoGe model: {self.moge}")
+        if auto_camera and not moge_ready(self.moge):
+            raise ValueError(f"automatic camera estimation is unavailable; missing native MoGe bundle: {self.moge}")
         image = None if multiview else decode_b64(request.get("image_b64"), "image_b64", MAX_IMAGE_BYTES)
         mask = None if multiview else (decode_b64(request["mask_b64"], "mask_b64", MAX_IMAGE_BYTES) if request.get("mask_b64") else None)
         ext = str(request.get("image_ext", ".png")).lower()
@@ -746,12 +758,12 @@ class PixalServer:
                     if auto_mask or view_mask_path is not None:
                         prepared = run_dir / f"view{index:02d}-prepared.png"
                         metadata = run_dir / f"view{index:02d}-prepared.json"
-                        prep = [str(self.python_launcher), backend, str(self.prepare_script), "--device-index", str(device),
+                        prep = [sys.executable, str(self.prepare_script), "--device-index", str(device),
                                 "--input", str(view_path), "--output", str(prepared),
                                 "--metadata", str(metadata),
                                 "--fov", str(frame.get("camera_angle_x", fov)),
                                 "--mesh-scale", str(mesh_scale), "--device",
-                                "cpu" if backend == "cpu" else "cuda"]
+                                "cuda" if backend == "cuda" else "cpu"]
                         if view_mask_path is not None:
                             prep += ["--mask", str(view_mask_path)]
                         elif auto_mask:
@@ -785,10 +797,10 @@ class PixalServer:
                 if auto_mask or auto_camera or (mask_path is not None and request.get("reference")):
                     prepared = run_dir / "prepared.png"
                     metadata = run_dir / "prepared.json"
-                    prep = [str(self.python_launcher), backend, str(self.prepare_script), "--device-index", str(device),
+                    prep = [sys.executable, str(self.prepare_script), "--device-index", str(device),
                             "--input", str(image_path), "--output", str(prepared),
                             "--metadata", str(metadata), "--mesh-scale", str(mesh_scale),
-                            "--device", "cpu" if backend == "cpu" else "cuda"]
+                            "--device", "cuda" if backend == "cuda" else "cpu"]
                     if mask_path:
                         prep += ["--mask", str(mask_path)]
                     if auto_mask:

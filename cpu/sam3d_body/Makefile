@@ -189,4 +189,17 @@ verify-end-to-end-raw: check-backbone check-e2e-image verify_end_to_end
 	./verify_end_to_end --safetensors-dir $(SFT) --mhr-assets $(MHR) --refdir $(REFDIR) --image "$(E2E_IMAGE)" --bbox $(E2E_BBOX) --backbone $(BACKBONE) --threshold $(E2E_THRESHOLD) --threshold-2d $(E2E_THRESHOLD_2D)
 
 clean:
-	rm -f test_sam3d_body $(VERIFIES)
+	rm -f test_sam3d_body $(VERIFIES) mhr_decode mhr_gemm_avx2.o
+
+# Framework-free MHR only; baseline host ISA, isolated optional AVX2 object.
+MHR_CFLAGS = -O3 -Wall -Wextra -Wno-unused-function -fopenmp
+MHR_DEPS = ../../common/mhr_decode_cli.c ../../common/sam3d_body_mhr.h ../../common/safetensors.h
+MHR_AVX2_OBJ =
+ifneq (,$(filter x86_64 amd64,$(shell uname -m)))
+MHR_CFLAGS += -DMHR_HAVE_AVX2
+MHR_AVX2_OBJ = mhr_gemm_avx2.o
+mhr_gemm_avx2.o: ../../ryzen/gemm_avx2.c ../../ryzen/gemm_avx2.h
+	$(CC) -O3 -Wall -Wextra -mavx2 -mfma -c $< -o $@
+endif
+mhr_decode: $(MHR_DEPS) $(MHR_AVX2_OBJ)
+	$(CC) $(MHR_CFLAGS) -o $@ ../../common/mhr_decode_cli.c $(MHR_AVX2_OBJ) -lm -fopenmp

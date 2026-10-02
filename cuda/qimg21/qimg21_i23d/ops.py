@@ -637,7 +637,7 @@ def reconstruct_3d(source, out_dir, reconstructors, *, mode: str = "multiview", 
     elif mode == "single":
         if fov_deg is None:
             camera = recon.estimate_camera(source, out_dir, getattr(reconstructors[0], "backend", "cuda"),
-                                           mesh_scale)
+                                           mesh_scale, cancel=getattr(getattr(reconstructors[0], 'settings', None), 'cancel', None))
             fov = float(camera["fov"])
             record["camera"] = {"fov_rad": fov, "source": camera.get("camera_source", "moge-2")}
         else:

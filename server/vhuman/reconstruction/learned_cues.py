@@ -152,9 +152,7 @@ def train(dataset,out,steps=400,device='cpu'):
 
 
 def infer(image,checkpoint,out,prior_file=None):
-    import torch
     from PIL import Image
-    from ..rig import safetensors as st
     checkpoint,out=Path(checkpoint),artifact_path(out)
     report=json.loads((checkpoint/'report.json').read_text())
     if report.get('architecture')!=ARCHITECTURE:raise ValueError('unsupported cue architecture; train with the current implementation')
@@ -165,11 +163,11 @@ def infer(image,checkpoint,out,prior_file=None):
     with np.load(prior_file,allow_pickle=False) as z:geometry_prior=z['normals']
     if geometry_prior.shape!=(side,side,3) or not np.isfinite(geometry_prior).all() or not np.allclose(np.linalg.norm(geometry_prior,axis=2),1,atol=.01):raise ValueError('unit geometry prior matching RGB crop required')
     rgb=np.asarray(Image.open(image).convert('RGB').resize((side,side)),np.float32)/255
-    weights,_=st.load(checkpoint/'normal_cue.safetensors')
-    model=network(side);model.load_state_dict({k:torch.tensor(v) for k,v in weights.items()});model.eval()
-    with torch.inference_mode():normal,logits=model(torch.tensor(rgb.transpose(2,0,1)[None]),torch.tensor(geometry_prior.transpose(2,0,1)[None],dtype=torch.float32))
+    from ..native_models import run_image_model
+    inputs=np.concatenate((rgb,geometry_prior),axis=2).transpose(2,0,1)
+    result=run_image_model('cues',checkpoint/'normal_cue.safetensors',inputs)
     out.parent.mkdir(parents=True,exist_ok=True)
-    np.savez_compressed(out,normals=normal[0].permute(1,2,0).numpy(),mask_probability=torch.sigmoid(logits)[0,0].numpy())
+    np.savez_compressed(out,normals=result[:3].transpose(1,2,0),mask_probability=result[3])
     return dict(status='experimental inference',real_geometry_gate_passed=False,image_sha256=sha256(image),geometry_prior_sha256=sha256(prior_file))
 
 

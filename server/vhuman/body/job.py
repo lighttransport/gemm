@@ -7,6 +7,7 @@ import math
 import os
 import re
 import shutil
+import signal
 import subprocess
 import threading
 import time
@@ -49,7 +50,9 @@ def availability(model_dir=MODEL_DIR, rig_python=None, mock=False) -> dict:
     model_dir = Path(model_dir)
     required = [model_dir / "safetensors/sam3d_body_mhr_jit.safetensors",
                 model_dir / "safetensors/sam3d_body_dinov3.safetensors",
-                model_dir / "dinov3/assets/mhr_model.pt",
+                model_dir / "safetensors/sam3d_body_mhr_jit.json",
+                model_dir / "safetensors/sam3d_body_mhr_jit_rig.json",
+                model_dir / "safetensors/sam3d_body_mhr_jit_rig.safetensors",
                 model_dir / "safetensors/sam3d_body_mhr_head.safetensors",
                 Path(rig_python) if rig_python else DEFAULT_RIG_PYTHON]
     missing = [str(p) for p in required if not p.is_file()]
@@ -62,7 +65,7 @@ def availability(model_dir=MODEL_DIR, rig_python=None, mock=False) -> dict:
 def _run(cmd: list[str], cancel, *, cwd=ROOT, timeout=2400) -> str:
     from ..runtime import python_command
     proc = subprocess.Popen(python_command(cmd), cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            text=True, env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
+                            text=True, start_new_session=True, env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
     lines = []
     stop = threading.Event()
     def watch():
@@ -71,10 +74,16 @@ def _run(cmd: list[str], cancel, *, cwd=ROOT, timeout=2400) -> str:
             if proc.poll() is not None:
                 return
             if cancel.is_set():
-                proc.terminate()
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
                 return
             if time.monotonic() >= deadline:
-                proc.kill()
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
                 return
     threading.Thread(target=watch, daemon=True).start()
     try:
@@ -84,6 +93,13 @@ def _run(cmd: list[str], cancel, *, cwd=ROOT, timeout=2400) -> str:
         code = proc.wait()
     finally:
         stop.set()
+        proc.stdout.close()
+        if proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.wait()
     if cancel.is_set():
         raise gpu.Cancelled("cancelled")
     if code:
@@ -330,10 +346,10 @@ def body_job(service, request: dict, progress, cancel, *, python=None, rig_pytho
         progress(.77, "assembling MHR body and facial rig")
         res = {"preview": 1024, "standard": 2048, "high": 4096}[quality]
         cmd = [str(rig_python), "-m", "server.vhuman.body.assemble", str(head),
-               "--out", str(out), "--model", str(model_dir / "dinov3/assets/mhr_model.pt"),
+               "--out", str(out), "--mhr-assets", str(model_dir / "safetensors"),
                "--head-assets", str(model_dir / "safetensors/sam3d_body_mhr_head.safetensors"),
                "--res", str(res)]
-        with gpu.device_session(1024, cancel) if gpu.backend() != "cpu" else nullcontext():
+        with gpu.device_session(2048, cancel) if gpu.backend() == "cuda" else nullcontext():
             _run(cmd, cancel, timeout=1200)
         report = json.loads((out / "body_report.json").read_text())
         report["generation"] = generated
@@ -341,7 +357,7 @@ def body_job(service, request: dict, progress, cancel, *, python=None, rig_pytho
         report["pixal3d_run"] = {k: pixal.get(k) for k in ("runner", "seconds", "status", "reason") if k in pixal}
         report["garment_attempts"] = garment_report
         report["provenance"] = {"head_id": head_id, "sam3d_body_model_dir": str(model_dir),
-                                "mhr_model": str(model_dir / "dinov3/assets/mhr_model.pt"),
+                                "mhr_assets": str(model_dir / "safetensors"),
                                 "sam3_model": str(sam3_model) if names else None,
                                 "clip_bpe": str(clip_bpe) if names else None}
         report["total_seconds"] = round(time.perf_counter() - started, 2)

@@ -172,7 +172,7 @@ class App:
     def __init__(self, args):
         self.args = args
         self.service = EyeService(Path(args.work))
-        from . import qwen, baseline
+        from . import qwen, baseline, video
         from .head import pipeline as head_pipeline
         from .rig import emotion as rig_emotion, exprdata, job as rig_job, speech as rig_speech, soft_tissue, soft_deformer, video_fit
         from .body import job as body_job, motion as body_motion
@@ -186,6 +186,10 @@ class App:
         self.gpu = gpu
         self.qwen_opts = {"python": args.qwen_python, "mock": args.mock}
         handlers = {
+            "video_generate": lambda req, prog, cancel: video.video_job(self.service, req, prog, cancel,
+                model=getattr(args, "video_model", None), runner=getattr(args, "video_runner", None),
+                mock=args.mock, allow_experimental=getattr(args, "video_experimental", False),
+                backend=getattr(args, "video_backend", "repo")),
             "plates": lambda req, prog, cancel: qwen.plates_job(self.service, req, prog, cancel, **self.qwen_opts),
             "baseline": lambda req, prog, cancel: baseline.baseline_job(self.service, req, prog, cancel,
                                                                         mock=args.mock, python=args.qwen_python),
@@ -238,8 +242,12 @@ class App:
             return self._health()
 
     def _health(self) -> dict:
-        from . import baseline, qwen
-        return {"ok": True, "backend": gpu.backend(), "device": gpu.device_index(), "gpu": self.gpu.gpu_status(), "qwen": qwen.availability(**self.qwen_opts),
+        from . import baseline, qwen, video
+        return {"video": video.availability(getattr(self.args, "video_model", None),
+                    getattr(self.args, "video_runner", None), mock=self.args.mock,
+                    allow_experimental=getattr(self.args, "video_experimental", False),
+                    backend=getattr(self.args, "video_backend", "repo")),
+                "ok": True, "backend": gpu.backend(), "device": gpu.device_index(), "gpu": self.gpu.gpu_status(), "qwen": qwen.availability(**self.qwen_opts),
                 "pixal3d": baseline.availability(mock=self.args.mock), "plates": len(self.service.list_plates()),
                 "rig": self.rig_job.availability(getattr(self.args, "rig_python", None)),
                 "body": self.body_job.availability(getattr(self.args, "sam3d_body_model", self.body_job.MODEL_DIR),
@@ -288,8 +296,8 @@ def make_handler(app: App, quiet: bool = False):
             if path.suffix in (".glb", ".zip"):
                 headers["Content-Disposition"] = f'attachment; filename="{path.name}"'
             data = path.read_bytes()
-            if path.suffix == ".wav":
-                ctype = "audio/wav"
+            if path.suffix in (".wav", ".mp4"):
+                ctype = "audio/wav" if path.suffix == ".wav" else "video/mp4"
                 headers["Accept-Ranges"] = "bytes"
                 request_range = self.headers.get("Range")
                 if request_range:
@@ -348,6 +356,15 @@ def make_handler(app: App, quiet: bool = False):
                     return self._json(200, {"heads": app.service.list_heads()})
                 if path in ("/vhuman_skin_shader.js", "/vhuman_gaussian.js"):
                     return self._file(ROOT / "web" / path[1:])
+                if path.startswith("/v1/heads/") and "/videos" in path:
+                    from . import video
+                    hid, _, tail = path[len("/v1/heads/"):].partition("/videos")
+                    if tail == "":
+                        return self._json(200, {"videos": video.list_videos(app.service, hid)})
+                    parts = tail.lstrip("/").split("/")
+                    if len(parts) != 2 or not tail.startswith("/"):
+                        return self._error(404, "no such video file")
+                    return self._file(video.video_file(app.service, hid, parts[0], parts[1]))
                 if path.startswith("/v1/heads/") and "/reconstruction" in path:
                     hid, _, tail = path[len("/v1/heads/"):].partition("/reconstruction")
                     if tail in ("", "/"):
@@ -491,6 +508,10 @@ def main(argv=None) -> int:
     ap.add_argument("--tts-backend", choices=("auto", "cpu", "cuda", "rocm"), default="auto")
     ap.add_argument("--emotion-runner", default=None, help="SenseVoiceSmall GGUF runtime executable")
     ap.add_argument("--emotion-model", default=None, help="SenseVoiceSmall GGUF model path")
+    ap.add_argument("--video-model", help="prepared HunyuanVideo-1.5 directory containing model.json")
+    ap.add_argument("--video-backend", choices=("repo", "legacy"), default="repo")
+    ap.add_argument("--video-runner", help="native HunyuanVideo-1.5 executable")
+    ap.add_argument("--video-experimental", action="store_true", help="enable unvalidated native video generation")
     args = ap.parse_args(argv)
     from . import runtime
     runtime.configure_args(args)

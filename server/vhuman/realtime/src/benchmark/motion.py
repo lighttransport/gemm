@@ -4,16 +4,30 @@ from pathlib import Path
 import numpy as np
 
 
-def evaluate(manifest, checkpoint, output, threads=1):
-    import torch
-    from ..animation.causal import MotionAdapter
-    from ..avatar.provenance import verify_files, sha256
-    torch.set_num_threads(threads)
+def evaluate(manifest, checkpoint, output, threads=1, *, reference_parity=False):
+    from contextlib import closing
+    from ..animation.native_motion import MotionAdapter
+    from ..avatar.provenance import verify_files
     manifest = Path(manifest); spec = json.loads(manifest.read_text())
     if spec.get("format") != "vhuman.motion_corpus.v1": raise ValueError("unsupported corpus")
     verify_files(spec["provenance"], manifest.parent, "motion-training")
-    adapter = MotionAdapter(checkpoint, spec["tts_revision"], allow_diagnostic=True)
-    if list(adapter.model.names) != spec["names"]: raise ValueError("control order mismatch")
+    oracle = None
+    if reference_parity:
+        import torch
+        from ..animation.causal_model import ReferenceMotionAdapter
+        torch.set_num_threads(threads)
+        oracle = ReferenceMotionAdapter(checkpoint, spec['tts_revision'], allow_diagnostic=True)
+    with closing(MotionAdapter(checkpoint, spec['tts_revision'], allow_diagnostic=True)) as adapter:
+        if list(adapter.model.names) != spec['names']:
+            raise ValueError('control order mismatch')
+        return _evaluate_takes(adapter, oracle, spec, manifest, checkpoint, output)
+
+
+def _evaluate_takes(adapter, oracle, spec, manifest, checkpoint, output):
+    from ..pipeline.protocol import TTSFeatureFrame
+    from ..avatar.provenance import sha256
+    if oracle is not None:
+        import torch
     errors, baselines, targets, details = [], [], [], []
     receipts = {r["path"] for r in spec["provenance"]}
     for item in spec["takes"]:
@@ -23,16 +37,21 @@ def evaluate(manifest, checkpoint, output, threads=1):
         if not path.is_relative_to(manifest.parent.resolve()): raise ValueError("take escapes corpus")
         with np.load(path, allow_pickle=False) as data:
             h, c, target = data["hidden"], data["codes"], data["controls"]
-            state, output_steps = None, []
-            with torch.inference_mode():
-                for i in range(len(h)):
-                    value, state = adapter.model(torch.tensor(h[i:i+1])[None], torch.tensor(c[i:i+1], dtype=torch.long)[None], state)
-                    output_steps.append(value[0, 0].numpy())
+            if not len(h) or len(c) != len(h) or target.shape != (len(h), 8, len(spec['names'])) or not np.isfinite(target).all():
+                raise ValueError('invalid evaluation take')
+            adapter.reset(0)
+            output_steps = []
+            for i in range(len(h)):
+                frames = adapter.push(TTSFeatureFrame(0, i*1920, c[i], h[i], spec['tts_revision']))
+                output_steps.append(np.stack([frame.controls for frame in frames]))
             pred = np.stack(output_steps)
-            with torch.inference_mode():
-                full, _ = adapter.model(torch.tensor(h)[None], torch.tensor(c, dtype=torch.long)[None])
-            parity = float(abs(pred-full[0].numpy()).max())
-            if parity > 1e-5: raise RuntimeError("trained student step/full parity failed")
+            parity = None
+            if oracle is not None:
+                with torch.inference_mode():
+                    full, _ = oracle.model(torch.tensor(h)[None], torch.tensor(c, dtype=torch.long)[None])
+                parity = float(abs(pred-full[0].numpy()).max())
+                if parity > 2e-5:
+                    raise RuntimeError('native student/reference full-sequence parity failed')
             errors.append(abs(pred-target).mean(axis=(0, 1)))
             baselines.append(abs(target).mean(axis=(0, 1)))
             targets.append(abs(target).max(axis=(0, 1)))
@@ -51,8 +70,8 @@ def evaluate(manifest, checkpoint, output, threads=1):
     # Equal-utterance weighting is deliberate; long takes must not hide failures.
     mae, neutral = np.mean(errors, 0), np.mean(baselines, 0)
     active = np.max(targets, 0) > .05
-    result = dict(format="vhuman.motion_evaluation.v1", checkpoint_sha256=sha256(checkpoint), corpus_sha256=sha256(manifest),
-        evaluation="sentence-held-out teacher agreement", purpose="diagnostic", takes=details,
+    result = dict(format="vhuman.motion_evaluation.v1", checkpoint_sha256=sha256(Path(checkpoint)/'native.json' if Path(checkpoint).is_dir() else checkpoint), corpus_sha256=sha256(manifest),
+        evaluation="sentence-held-out teacher agreement", backend="native_cpu", reference_parity_checked=oracle is not None, purpose="diagnostic", takes=details,
         active_mae=float(mae[active].mean()) if active.any() else None,
         active_neutral_mae=float(neutral[active].mean()) if active.any() else None,
         controls={n: dict(mae=float(e), neutral_mae=float(b)) for n,e,b in zip(spec["names"],mae,neutral)})

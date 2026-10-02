@@ -27,9 +27,11 @@ class BodyMotionTest(unittest.TestCase):
             avatar.touch()
             (root / "avatar.json").write_text("{}")
             (root / "body_mhr.glb.json").write_text(json.dumps({"shape": [0.] * 45}))
-            model = root / "model/dinov3/assets/mhr_model.pt"
-            model.parent.mkdir(parents=True)
-            model.touch()
+            from .mhr import ASSET_FILES
+            assets = root / "model/safetensors"
+            assets.mkdir(parents=True)
+            for name in ASSET_FILES:
+                (assets / name).touch()
             python = root / "python"
             python.touch()
             service = SimpleNamespace(body_file=lambda hid, name: root / name)

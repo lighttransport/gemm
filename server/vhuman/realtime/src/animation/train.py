@@ -91,4 +91,6 @@ def train(manifest, output, epochs=20, device="cpu", seed=7, threads=4):
                 objective="active-control weighted Huber plus temporal velocity", active_controls=[n for n, a in zip(spec["names"], activity) if a > .05])
     partial = output.with_name(output.name + ".partial")
     torch.save(data, partial); partial.replace(output)
+    from .export_native import export
+    export(output)
     return reports[-1]

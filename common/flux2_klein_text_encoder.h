@@ -723,10 +723,10 @@ float *flux2_text_enc_encode(flux2_text_enc *enc, const char *text,
      *   text = tokenizer.apply_chat_template(messages, tokenize=False,
      *              add_generation_prompt=True, enable_thinking=False)
      * With enable_thinking=False the template is:
-     *   <|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n
+     *   <|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n
      */
     const char *prefix = "<|im_start|>user\n";
-    const char *suffix = "<|im_end|>\n<|im_start|>assistant\n";
+    const char *suffix = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
     size_t chat_len = strlen(prefix) + strlen(text) + strlen(suffix);
     char *chat_text = (char *)malloc(chat_len + 1);
     if (!chat_text) return NULL;
@@ -745,9 +745,9 @@ float *flux2_text_enc_encode(flux2_text_enc *enc, const char *text,
     }
     fprintf(stderr, "flux2_text_enc: '%s' → %d tokens (chat template)\n", text, n_tok);
 
-    /* Do NOT pad: feeding only real tokens to the DiT is equivalent to using
-     * attention_mask (as diffusers does) since padding tokens carry no content.
-     * Padding to MAX_SEQ=512 makes the DiT forward ~17× slower for short prompts. */
+    /* This compact profile emits only real tokens. Diffusers emits all 512
+     * hidden states (including padding queries), so this profile is not an
+     * exact Diffusers conditioning match. Keep that parity limitation explicit. */
 
     /* Output dim = 3 * n_embd_inner (last 3 layers concatenated) */
     int n_inner = enc->n_embd_inner;

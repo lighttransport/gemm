@@ -7,7 +7,6 @@ monocular camera translation is not a reliable world-space motion track.
 """
 from __future__ import annotations
 
-from contextlib import nullcontext
 import argparse
 import hashlib
 import json
@@ -165,36 +164,27 @@ def _sam_frame(image: Path, out: Path, bbox: tuple[int, ...], model_dir: Path, c
     return sidecar
 
 
-def _decode(model_path: Path, identity: np.ndarray, sidecars: list[Path]) -> tuple[list[str], np.ndarray]:
-    import torch
-    from server.vhuman.runtime import torch_device
-    device = torch_device(torch)
-    model = torch.jit.load(str(model_path), map_location=device)
+def _decode(model_path: Path | None, identity: np.ndarray, sidecars: list[Path], *, mhr_assets=None) -> tuple[list[str], np.ndarray]:
+    from . import mhr
     poses = []
     for path in sidecars:
         p = np.asarray(json.loads(path.read_text())["model_params"], np.float32)
         if p.shape != (204,) or not np.isfinite(p).all():
             raise ValueError(f"invalid MHR pose in {path.name}")
         poses.append(p)
-    params = np.stack(poses)
-    names = ["mhr_" + n for n in model.get_joint_names()]
-    parents = model.character_torch.skeleton.joint_parents.cpu().numpy().astype(int)
-    tracks = []
-    with torch.no_grad():
-        for start in range(0, len(params), 4):
-            batch = params[start:start + 4]
-            _, state = model(torch.from_numpy(np.repeat(identity[None], len(batch), axis=0)).to(device),
-                             torch.from_numpy(batch).to(device), torch.zeros((len(batch), 72), device=device))
-            global_q = state.cpu().numpy()[:, :, 3:7].astype(np.float64)
-            global_q /= np.maximum(np.linalg.norm(global_q, axis=2, keepdims=True), 1e-9)
-            local = global_q.copy()
-            from scipy.spatial.transform import Rotation
-            for j, parent in enumerate(parents):
-                if parent >= 0:
-                    local[:, j] = (Rotation.from_quat(global_q[:, parent]).inv() *
-                                   Rotation.from_quat(global_q[:, j])).as_quat()
-            tracks.append(local)
-    return names, np.concatenate(tracks)
+    if not poses:
+        raise ValueError("MHR motion requires at least one pose")
+    _, state, rig, _ = mhr.decode(mhr.resolve_assets(mhr_assets, model_path),
+                                 np.stack(poses), identity, skeleton_only=True)
+    global_q = state[:, :, 3:7].astype(np.float64)
+    global_q /= np.maximum(np.linalg.norm(global_q, axis=2, keepdims=True), 1e-9)
+    local = global_q.copy()
+    from scipy.spatial.transform import Rotation
+    for j, parent in enumerate(rig["parents"]):
+        if parent >= 0:
+            local[:, j] = (Rotation.from_quat(global_q[:, parent]).inv() *
+                           Rotation.from_quat(global_q[:, j])).as_quat()
+    return rig["names"], local
 
 
 def _continuous(rotations: np.ndarray) -> np.ndarray:
@@ -254,8 +244,9 @@ def fit(service, request: dict, progress, cancel, *, model_dir=body_job.MODEL_DI
         raise ValueError("avatar lacks its MHR identity parameters")
     model_dir = Path(model_dir)
     rig_python = Path(rig_python)
-    if not rig_python.is_file() or not (model_dir / "dinov3/assets/mhr_model.pt").is_file():
-        raise ValueError("MHR model or rig Python is missing")
+    from .mhr import ASSET_FILES
+    if not rig_python.is_file() or any(not (model_dir / "safetensors" / n).is_file() for n in ASSET_FILES):
+        raise ValueError("Native MHR assets or rig Python is missing")
     take_id = uuid.uuid4().hex[:12]
     root = avatar.parent / "motions"
     stage = root / ("." + take_id)
@@ -274,12 +265,11 @@ def fit(service, request: dict, progress, cancel, *, model_dir=body_job.MODEL_DI
         output = stage / "motion.json"
         cmd = [str(rig_python), "-m", "server.vhuman.body.motion", "decode",
                "--avatar-json", str(avatar_json), "--identity", str(body_meta),
-               "--model", str(model_dir / "dinov3/assets/mhr_model.pt"),
+               "--mhr-assets", str(model_dir / "safetensors"),
                "--source-glb", str(avatar), "--output", str(output),
                "--kind", upload_meta["kind"], "--fps", str(FPS),
                *map(str, sidecars)]
-        with gpu.device_session(1024, cancel) if gpu.backend() != "cpu" else nullcontext():
-            body_job._run(cmd, cancel, timeout=300)
+        body_job._run(cmd, cancel, timeout=300)
         motion = json.loads(output.read_text())
         manifest = {"id": take_id, "head_id": hid, "kind": upload_meta["kind"],
                     "source_upload_id": upload_id, "source_sha256": upload_meta["sha256"],
@@ -308,7 +298,8 @@ def decode_main(argv=None) -> int:
     ap.add_argument("mode", choices=("decode",))
     ap.add_argument("--avatar-json", type=Path, required=True)
     ap.add_argument("--identity", type=Path, required=True)
-    ap.add_argument("--model", type=Path, required=True)
+    ap.add_argument("--model", type=Path, help="legacy locator; use --mhr-assets")
+    ap.add_argument("--mhr-assets", type=Path)
     ap.add_argument("--source-glb", type=Path, required=True)
     ap.add_argument("--output", type=Path, required=True)
     ap.add_argument("--kind", choices=("image", "video"), required=True)
@@ -317,7 +308,7 @@ def decode_main(argv=None) -> int:
     a = ap.parse_args(argv)
     definition = json.loads(a.avatar_json.read_text())
     identity = np.asarray(json.loads(a.identity.read_text())["shape"], np.float32)
-    names, rotations = _decode(a.model, identity, list(map(Path, a.sidecars)))
+    names, rotations = _decode(a.model, identity, list(map(Path, a.sidecars)), mhr_assets=a.mhr_assets)
     avatar_names = {j["name"] for j in definition["joints"]}
     if not set(names) <= avatar_names:
         raise ValueError("avatar MHR skeleton differs from decoder")

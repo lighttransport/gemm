@@ -23,9 +23,12 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import signal
 import shutil
 import struct
 import subprocess
+import sys
 import time
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
@@ -122,7 +125,7 @@ def _run(cmd: list[str], log: Path, timeout: float, cancel=None) -> str:
     with log.open("w") as stream:
         stream.write("+ " + " ".join(cmd) + "\n")
         stream.flush()
-        process = subprocess.Popen(cmd, cwd=ROOT, stdout=stream, stderr=subprocess.STDOUT)
+        process = subprocess.Popen(cmd, cwd=ROOT, stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
         deadline = time.monotonic() + timeout
         try:
             while process.poll() is None:
@@ -133,11 +136,19 @@ def _run(cmd: list[str], log: Path, timeout: float, cancel=None) -> str:
                 time.sleep(0.2)
         finally:
             if process.poll() is None:
-                process.terminate()
                 try:
-                    process.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    process.kill()
+                    os.killpg(process.pid, signal.SIGTERM)
+                    try:
+                        process.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        pass
+                except ProcessLookupError:
+                    pass
+                finally:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
                     process.wait()
         code = process.returncode
     text = log.read_text(errors="replace")
@@ -153,19 +164,20 @@ def _launcher(backend: str) -> Path:
 
 
 def estimate_camera(rgba_path: Path, work: Path, backend: str = "cuda", mesh_scale: float = 1.0,
-                    moge: Path = MOGE) -> dict:
+                    moge: Path = MOGE, cancel=None) -> dict:
     """MoGe-2 FOV for an RGBA object, through ref/pixal3d/prepare_input.py
     (as the demo server's auto_camera does). Returns its metadata:
     fov (radians), distance, mesh_scale, camera_source."""
-    if not Path(moge).exists():
-        raise ReconstructionError(f"MoGe-2 checkpoint missing: {moge}; pass a FOV instead")
-    env = "cpu" if backend == "cpu" else backend
+    sys.path.insert(0, str(ROOT))
+    from server.vhuman.native_models import moge_ready
+    if not moge_ready(moge):
+        raise ReconstructionError(f"Native MoGe-2 bundle missing: {moge}; export it or pass a FOV")
     work = Path(work).resolve()
     prepared, metadata = work / "camera_prepared.png", work / "camera.json"
-    _run([str(PIXAL3D / "run.sh"), env, str(PIXAL3D / "prepare_input.py"), "--input", str(Path(rgba_path).resolve()),
+    _run([sys.executable, str(PIXAL3D / "prepare_input.py"), "--input", str(Path(rgba_path).resolve()),
           "--output", str(prepared), "--metadata", str(metadata), "--moge-model", str(moge),
-          "--mesh-scale", str(mesh_scale), "--device", "cpu" if backend == "cpu" else "cuda"],
-         work / "camera.log", 1800)
+          "--mesh-scale", str(mesh_scale), "--device", "cuda" if backend == "cuda" else "cpu"],
+         work / "camera.log", 1800, cancel)
     return json.loads(metadata.read_text())
 
 

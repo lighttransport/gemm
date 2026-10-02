@@ -14,7 +14,7 @@ Implemented paths:
 ```
 native Qwen talker -> hidden state + 16 RVQ tokens -> causal GRU -> named controls
                   -> stateful CPU codec -> timestamped PCM -> native audio ring
-named controls -> native CUDA rig/contact -> borrowed device vertices -> gsplat
+named controls -> native CUDA rig/contact -> borrowed vertices -> native CUDA Gaussian renderer
 PortAudio DAC sample clock -> silence-aware speech sample position -> interpolation
 ```
 
@@ -23,6 +23,21 @@ allows diagnostic bundles. A trained flag records optimization, not a quality
 certification. No pretrained direct-Qwen motion adapter is bundled.
 
 ## Setup
+
+Inference now requires only the packages in `requirements-runtime.txt`, the
+CUDA driver/NVRTC, and the native binaries. The default Gaussian renderer does
+not import Torch, gsplat, ONNX or another model runtime. Build it with:
+
+```sh
+make -C cpu/vhuman libvhuman_motion.so
+make -C cuda/vhuman libvhuman_runtime.so libvhuman_splat.so
+# Use a NumPy/Pillow/SciPy interpreter; the existing framework-free environment:
+tmp/mhr-native/runtime/bin/python -m server.vhuman.realtime doctor
+```
+
+The following larger environment is needed only for offline training and the
+explicit `renderer.gsplat_reference` oracle. `run.sh` remains a convenience
+wrapper for that environment; direct module invocation needs no Torch settings.
 
 Run from repository root on Linux. The tested machine has Python 3.12,
 PyTorch **2.14.0+cu130**, CUDA toolkit **13.2**, driver **615.71.09** and an RTX
@@ -46,12 +61,39 @@ uv pip install --python tmp/vhuman-rig-venv/bin/python \
   filelock fsspec hf-xet requests packaging importlib_metadata zipp \
   httpx==0.28.1 httpcore==1.0.9 anyio sniffio h11
 
+make -C cpu/vhuman libvhuman_motion.so
+make -C cuda/vhuman libvhuman_runtime.so
+
 # Native playback requires libportaudio development headers (portaudio19-dev on Ubuntu).
 make -C speech BUILD=../tmp/vhuman-realtime/speech \
   ../tmp/vhuman-realtime/speech/qwen3_tts_cuda \
   ../tmp/vhuman-realtime/speech/test_codec_stream
 sh server/vhuman/realtime/run.sh doctor
 ```
+
+The live speech-to-expression adapter runs its two-layer GRU through
+`cpu/vhuman/libvhuman_motion.so`, with repository CPU GEMM and no Torch/ONNX
+inference. Training automatically exports a sibling `.native/` bundle. Convert
+older trained checkpoints once with a Torch-capable interpreter:
+
+```sh
+python -m server.vhuman.realtime.src.animation.export_native \
+  tmp/vhuman-realtime/motion-v3.pt
+```
+
+`--adapter` accepts the exported directory or the original `.pt` path (resolved
+to its sibling `.native/` directory with a source-hash check). Missing or stale
+exports fail explicitly. Existing revision, diagnostic/production and epoch/
+sequence checks remain in force. Offline training and explicit gsplat reference
+comparisons still use Torch; the complete live inference process is framework-free.
+
+For scheduling, audio replay, native model adapters, geometry and receipt tools,
+install only `requirements-runtime.txt` in a separate interpreter and run
+`python -m server.vhuman.realtime ...`. The broader setup above is for the
+gsplat compatibility renderer and offline training/reference generation.
+`doctor` probes the CUDA driver through the native library without importing
+Torch. Held-out `evaluate-motion` uses the native GRU; `--reference-parity`
+explicitly enables the optional Torch full-sequence oracle.
 
 `run.sh` restricts the JIT build to 3DGS/RGB/sm_120. The initial RGB build took
 about 144 seconds here. The default all-feature build spent more than 25 minutes
@@ -139,6 +181,7 @@ the request-start acknowledgement, and older resident binaries are incompatible.
 
 ```sh
 sh server/vhuman/realtime/run.sh generate-identity \
+  --identity-backend torch-reference \
   --output tmp/vhuman-realtime/clean-identity-001 --expressions
 # Uses only the newly generated neutral image as expression conditioning.
 tmp/vhuman-rig-venv/bin/python -m server.vhuman.cli \
@@ -148,7 +191,43 @@ tmp/vhuman-rig-venv/bin/python -m server.vhuman.cli \
   --face-model gnm_v3 --profile full --res 512 --gaussians 0
 ```
 
-Generator: [Apache FLUX.2-klein-4B](https://huggingface.co/black-forest-labs/FLUX.2-klein-4B)
+The command above explicitly selects the offline Torch reference provider.
+The default `--identity-backend native` invokes the existing C/CUDA FLUX.2
+runner for a neutral portrait. It requires hashed, locally staged assets:
+
+```sh
+make -C cuda/flux2
+python ref/vhuman/export_flux2_tokenizer.py \
+  --source /path/to/FLUX.2-klein-4B/tokenizer \
+  --output tmp/vhuman-realtime/flux2-tokenizer.gguf
+python -m server.vhuman.realtime.src.avatar.native_identity \
+  --dit /path/to/dit.safetensors --vae /path/to/vae.safetensors \
+  --encoder /path/to/text_encoder --tokenizer tmp/vhuman-realtime/flux2-tokenizer.gguf \
+  --revision SOURCE_REVISION --output tmp/vhuman-realtime/flux2-assets.json
+python -m server.vhuman.realtime generate-identity \
+  --native-assets tmp/vhuman-realtime/flux2-assets.json \
+  --output tmp/vhuman-realtime/native-neutral
+```
+
+The tokenizer exporter uses only Python's standard library and writes source/output
+hash receipts. Its token IDs, including the non-thinking chat template, were
+checked against the pinned Qwen tokenizer for English and Japanese prompts.
+The adapter explicitly selects BF16 DiT weights and repository GEMM; expanding
+the whole DiT to FP32 exceeds the 16 GB target. HF snapshot symlinks are accepted
+only after verifying their content hashes.
+
+The native adapter never downloads weights or switches to Torch. Full Diffusers
+conditioning parity remains open: the current native runner zero-pads compact
+text features, whereas Diffusers retains hidden states for padding queries.
+The 5060 Ti BF16 smoke run produced a 512x512 portrait: CPU text encoding106.8s,
+CUDA/model setup65.9s, four denoising steps6.0s and VAE decode1.0s. The image has
+low contrast and patterned skin artifacts; it is not accepted as a quality or
+parity result. Output and hashed receipts are in
+`tmp/vhuman-native-renderer/native-neutral-bf16/`.
+Image-conditioned expression generation still requires the explicit reference provider; passing
+`--expressions` to the native provider fails with a clear message.
+
+Reference generator: [Apache FLUX.2-klein-4B](https://huggingface.co/black-forest-labs/FLUX.2-klein-4B)
 at `e7b7dc27f91deacad38e78976d1f2b499d76a294`. Model CPU offload limits peak VRAM.
 Generated expression control labels are approximate and require identity/pose QA.
 The provider writes checksums, seeds, conditioning origins and a manifest.
@@ -300,14 +379,93 @@ Motion interpolates at the DAC speech position; it holds then eases to neutral
 after stale motion. Integer rate conversion avoids long-session rounding drift.
 An overflow stops the session instead of overwriting unplayed audio/motion.
 
-Native CUDA rig retains the primary context and borrows Torch's stream. Pinned
-host rig staging has an upload fence; one fused deformation/contact operation is
-enqueued per frame. DLPack views retain the owner, are overwritten by the next
-submit and must be released before close. Copy on the same stream for persistent
-geometry. A caller using another stream must wait on an explicitly recorded
-Torch CUDA event. TTS runs in a separate process/private context in this PoC.
+The C CUDA runtime retains the primary context and owns a nonblocking stream.
+Native rig submission returns a borrowed
+`DeviceView`, without importing Torch. Pinned host rig staging has an upload
+fence; one fused deformation/contact operation is enqueued per frame. DLPack
+exports retain the owner and accept only the same stream. Views are overwritten
+by the next submit and must be released before close; copy on the same stream
+for persistent geometry. Completion/timing events, RGB/alpha conversion and
+pinned output download use the native library. Rendering deforms and projects
+Gaussians on CUDA, bins/sorts their tile intersections on the host, then blends
+pixels on CUDA. Frames own independent device allocations. The renderer checks
+frame/event/rig lifetimes before closing. TTS runs in a separate process/private
+context. Earlier gsplat FPS figures below describe the previous integration.
+
+Both `trace-v1` and `eigen-v1` covariance policies are supported, with fixed-light
+RGB, pinhole cameras and 16x16 tiles. This is an inference renderer, not a
+differentiable training backend. It has no third-party GEMM or rasterizer dependency.
+The eight expression coefficients and 3x3 transforms use direct fixed-size math.
+Output is bounded to 4096x4096 and eight million tile intersections; exceeding
+the overlap budget fails explicitly. Host sorting limits speed relative to the
+previous gsplat backend.
 
 ## Verification and measured limits
+
+With GPU permissions enabled, the new path was exercised on RTX 5060 Ti 16 GB:
+
+- Synthetic geometry matched NumPy for both covariance policies; native/gsplat
+  maximum RGBA error was 1.73e-6. Retained frames, clipped/degenerate geometry,
+  native output conversion and close guards passed on CUDA.
+- The trained 50k-Gaussian neutral avatar passed four pose comparisons. Worst
+  mean RGBA error was 2.03e-7 and relative L2 2.78e-5. A few pixels differed by
+  up to 0.00572 near discrete rasterization/ordering thresholds.
+- A framework-free 120-frame animated CLI render measured 91 FPS at 512x512.
+  Renderer-managed peak allocation was 22.5 MiB, excluding rig, CUDA context,
+  output staging and TTS allocations; this is not whole-process VRAM.
+- Native resident TTS → GRU → rig → render → MP4 completed 211 frames/5.6 seconds
+  of speech at 36.5 presentation FPS. Render completion p95 was 23.65 ms. Some
+  underrun silence occurred; this does not certify lip-sync or appearance quality.
+
+Reports and outputs: `tmp/vhuman-native-renderer/{clean-parity,live-report.json,live.mp4}`.
+Reproduce independent real-avatar comparison with a Torch/gsplat oracle environment:
+
+```sh
+python ref/vhuman/verify_renderer.py --rig PATH_TO_RIG --avatar PATH_TO_AVATAR \
+  --out tmp/vhuman-renderer-check --reference --frames 60
+# Omit --reference to run entirely without Torch/gsplat.
+python -m unittest server.vhuman.realtime.test_native_renderer -v
+# Optional training + oracle environment: 4 tests passed on the 5060 Ti.
+python -m unittest server.vhuman.realtime.test_training.AppearanceTrainingTests \
+  server.vhuman.realtime.test_native_renderer -v
+```
+
+The final framework-free regression command passed38 tests with one optional
+Torch oracle skipped:
+
+```sh
+TMPDIR="$PWD/tmp/vhuman-native-runtime" tmp/mhr-native/runtime/bin/python -m unittest \
+  ref.hunyuan_video15.test_compare ref.hunyuan_video15.test_validation_matrix \
+  server.vhuman.realtime.test_native_runtime server.vhuman.realtime.test_native_identity \
+  server.vhuman.realtime.test_lifecycle server.vhuman.realtime.test_output \
+  server.vhuman.test_video server.vhuman.test_asset_dependencies ref.vhuman.test_flux2_tokenizer
+```
+
+Initial dependency-removal checks (2026-10-02, before enabling sandbox GPU access):
+
+```sh
+TMPDIR="$PWD/tmp/vhuman-native-runtime" tmp/mhr-native/runtime/bin/python -m unittest \
+  ref.hunyuan_video15.test_compare ref.hunyuan_video15.test_validation_matrix \
+  server.vhuman.realtime.test_native_runtime server.vhuman.realtime.test_native_identity \
+  server.vhuman.realtime.test_lifecycle server.vhuman.realtime.test_output \
+  server.vhuman.test_video server.vhuman.test_asset_dependencies
+# 37 tests: 36 passed, optional Torch oracle skipped.
+
+TMPDIR="$PWD/tmp/vhuman-native-runtime" tmp/vhuman-rig-venv/bin/python -m unittest \
+  server.vhuman.test_asset_dependencies server.vhuman.test_rig_backend \
+  server.vhuman.realtime.test_training.MotionTrainingTests
+# 8 tests: 7 passed, ROCm hardware test skipped.
+
+make -C cuda/hunyuan_video15_native \
+  BUILD="$PWD/tmp/hv15-integration-review/build" test compile-kernels
+# Host math/tokenizer/request checks, Python orchestration tests and compute_120 compilation passed.
+```
+
+The native presentation CPU math matched an independent NumPy formula within
+one RGB8 level; DLPack ownership and close guards passed host tests. The 12
+local HTTP tests passed with loopback socket access. No GPU stream-lifetime,
+rendering-performance or new model-parity claim follows from these host checks.
+Earlier GPU measurements follow below.
 
 ```sh
 tmp/vhuman-rig-venv/bin/python -m unittest server.vhuman.realtime.test_runtime -v

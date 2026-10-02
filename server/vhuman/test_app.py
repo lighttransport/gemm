@@ -68,6 +68,38 @@ class ServerTest(unittest.TestCase):
             time.sleep(0.2)
         self.fail("job did not finish")
 
+    def test_video_job_routes_and_range(self):
+        from PIL import Image
+        head = self.work / "heads/videotest"
+        head.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (64, 64), (90, 110, 130)).save(head / "portrait.png")
+        status, _, body = self.post("/v1/jobs", {"kind": "video_generate", "head_id": "videotest", "expression": "smile"})
+        self.assertEqual(status, 202)
+        job = self.wait_job(json.loads(body)["id"])
+        self.assertEqual(job["state"], "done", job)
+        listing = json.loads(self.get("/v1/heads/videotest/videos")[2])["videos"]
+        self.assertEqual(len(listing), 1)
+        url = listing[0]["url"]
+        status, ctype, body = self.get(url)
+        self.assertEqual((status, ctype), (200, "video/mp4"))
+        request = urllib.request.Request(self.base + url, headers={"Range": "bytes=0-31"})
+        with urllib.request.urlopen(request) as response:
+            self.assertEqual(response.status, 206)
+            self.assertEqual(response.read(), body[:32])
+        request = urllib.request.Request(self.base + url, method="HEAD")
+        with urllib.request.urlopen(request) as response:
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.read(), b"")
+            self.assertEqual(int(response.headers["Content-Length"]), len(body))
+        base = url.rsplit("/", 1)[0]
+        self.assertEqual(self.status_of(base + "/runner.log"), 404)
+        self.assertEqual(self.status_of(base + "/../portrait.png"), 404)
+        status, _, body = self.post("/v1/jobs", {"kind": "video_generate", "head_id": "videotest", "frames": 80})
+        self.assertEqual(status, 202)
+        job = self.wait_job(json.loads(body)["id"])
+        self.assertEqual(job["state"], "failed")
+        self.assertIn("frames", job["error"])
+
     def test_rig_page_and_routes(self):
         status, ctype, body = self.get("/rig")
         self.assertEqual(status, 200)

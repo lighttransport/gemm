@@ -11,8 +11,8 @@ coordinates of fields.py, scaled by the subject's size:
   detected landmarks;
 - mouthClose is solved against the jaw's skinning so that jawOpen +
   mouthClose meet the lips halfway.
-A final pass smooths each field lightly over the surface (PyTorch sparse
-Laplacian when available) so no shape tears across the ring patches.
+A final CPU pass smooths each field with a SciPy sparse Laplacian so no
+shape tears across the ring patches; asset preparation needs no Torch.
 """
 from __future__ import annotations
 
@@ -270,44 +270,34 @@ def _mouth_close(F: Fields, skel: dict, skin_w: tuple, mask: np.ndarray) -> np.n
 def smooth_shapes(F: Fields, S: dict, iters: int = 4, *, device: str | None = None) -> dict:
     """Light Laplacian smoothing of every delta field over the skin (lid and
     lip ring-0 vertices held: their motion is exact)."""
+    if device not in (None, 'cpu'):
+        raise ValueError('shape smoothing is CPU asset preparation; use device="cpu"')
+    if type(iters) is not int or iters < 0:
+        raise ValueError('invalid smoothing iteration count')
     tm = F.tmpl
+    if np.asarray(tm.tris).dtype.kind not in 'iu' or (tm.tris < 0).any() or (tm.tris >= tm.n).any():
+        raise RuntimeError('invalid smoothing triangle indices')
     E = edges(tm.tris)
     n = tm.n
+    if any(np.shape(value) != (n, 3) or not np.isfinite(value).all() for value in S.values()):
+        raise ValueError('invalid smoothing shape array')
     hold = ((F.eye_k <= 0) & (F.eye_side >= 0)) | (F.lip_k <= 0)
-    try:
-        import torch
-        from ..runtime import torch_device
-        dev = torch.device(device if device is not None else torch_device(torch))
-        i = torch.tensor(np.concatenate([E[:, 0], E[:, 1]]), device=dev)
-        j = torch.tensor(np.concatenate([E[:, 1], E[:, 0]]), device=dev)
-        deg = torch.bincount(i, minlength=n).clamp(min=1).double()
-        vals = torch.ones(len(i), dtype=torch.float64, device=dev)
-        A = torch.sparse_coo_tensor(torch.stack([i, j]), vals, (n, n), check_invariants=True).coalesce()
-        names = list(S)
-        X = torch.tensor(np.concatenate([S[k] for k in names], 1), device=dev)
-        X0 = X.clone()
-        H = torch.tensor(hold, device=dev)[:, None]
-        for _ in range(iters):
-            avg = torch.sparse.mm(A, X) / deg[:, None]
-            X = torch.where(H, X0, X + 0.5 * (avg - X))
-        Xn = X.cpu().numpy()
-        return {k: Xn[:, 3 * c:3 * c + 3] for c, k in enumerate(names)}
-    except ImportError as exc:
-        from .. import gpu
-        selected = gpu.backend() if device is None else device.split(":", 1)[0]
-        if selected != "cpu":
-            raise RuntimeError(f"PyTorch unavailable for {selected} smoothing; select the matching interpreter") from exc
-        deg = np.bincount(E.reshape(-1), minlength=n).astype(np.float64)
-        out = {}
-        for k, d in S.items():
-            x = d.copy()
-            for _ in range(iters):
-                acc = np.zeros_like(x)
-                np.add.at(acc, E[:, 0], x[E[:, 1]])
-                np.add.at(acc, E[:, 1], x[E[:, 0]])
-                x = np.where(hold[:, None], d, x + 0.5 * (acc / np.maximum(deg, 1)[:, None] - x))
-            out[k] = x
-        return out
+    # Asset preparation uses CPU sparse arithmetic; no training runtime is needed.
+    # This stage is CPU-only even when an earlier fitting stage used CUDA.
+    from scipy.sparse import coo_matrix
+    i = np.concatenate([E[:, 0], E[:, 1]])
+    j = np.concatenate([E[:, 1], E[:, 0]])
+    adjacency = coo_matrix((np.ones(len(i), np.float64), (i, j)), shape=(n, n)).tocsr()
+    degree = np.maximum(np.bincount(i, minlength=n), 1)[:, None]
+    if not S:
+        return {}
+    names = list(S)
+    original = np.concatenate([S[name] for name in names], axis=1).astype(np.float64)
+    values = original.copy()
+    for _ in range(iters):
+        average = (adjacency @ values) / degree
+        values = np.where(hold[:, None], original, values + .5 * (average - values))
+    return {name: values[:, 3*c:3*c+3] for c, name in enumerate(names)}
 
 
 def sparse(S: dict, tol: float = 2e-6) -> dict:

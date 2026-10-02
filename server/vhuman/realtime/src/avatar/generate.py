@@ -11,7 +11,18 @@ PROMPT = ("Photorealistic studio headshot of an original fictional adult woman, 
           "plain grey background, soft even fixed lighting, neutral expression, relaxed closed lips.")
 
 
-def generate(output, cache, seed=7, expressions=False, resume=False):
+def generate(output, cache, seed=7, expressions=False, resume=False, *,
+             backend='native', native_assets=None, runner=None, device=0):
+    if backend == 'native':
+        from .native_identity import generate as native_generate
+        return native_generate(output, native_assets, seed, PROMPT, expressions=expressions,
+                               resume=resume, runner=runner, device=device)
+    if backend != 'torch-reference':
+        raise ValueError('unsupported identity backend')
+    return generate_reference(output, cache, seed, expressions, resume)
+
+
+def generate_reference(output, cache, seed=7, expressions=False, resume=False):
     import torch
     from diffusers import Flux2KleinPipeline
     from ....rig.exprdata import EXPRESSIONS, KEEP

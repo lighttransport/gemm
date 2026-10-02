@@ -9,7 +9,7 @@ DEPS = vhuman_deformer_cuda.h ../../ryzen/vhuman_deformer.h ../cuew.h ../cuda_ru
 
 .PHONY: all clean
 
-all: bench_vhuman_deformer_cuda libvhuman_deformer_cuda.so
+all: bench_vhuman_deformer_cuda libvhuman_deformer_cuda.so vhuman_models libvhuman_runtime.so libvhuman_splat.so
 
 bench_vhuman_deformer_cuda: bench_vhuman_deformer_cuda.c $(SRCS) $(DEPS)
 	$(CC) $(CFLAGS) -o $@ bench_vhuman_deformer_cuda.c $(SRCS) $(LDFLAGS)
@@ -18,4 +18,20 @@ libvhuman_deformer_cuda.so: $(SRCS) $(DEPS)
 	$(CC) $(CFLAGS) -fPIC -shared -o $@ $(SRCS) $(LDFLAGS)
 
 clean:
-	rm -f bench_vhuman_deformer_cuda libvhuman_deformer_cuda.so
+	rm -f bench_vhuman_deformer_cuda libvhuman_deformer_cuda.so vhuman_models gemm_avx2.o libvhuman_runtime.so libvhuman_splat.so splat_cuew.o
+
+# Native RMBG2, MoGe2 camera and reconstruction cue models.
+gemm_avx2.o: ../../ryzen/gemm_avx2.c ../../ryzen/gemm_avx2.h
+	$(CC) -O3 -mavx2 -mfma -fPIC -c $< -o $@
+
+vhuman_models: ../../common/vhuman_models.c $(wildcard ../../common/*.h) ../../common/swin_runner.c gemm_avx2.o ../cuew.c ../gemm/cuda_linear_f32.h ../gemm/cuda_gemm_f32_kernels.h
+	$(CC) $(CFLAGS) -fopenmp -mf16c -DSWIN_HAVE_AVX2 -DSWIN_CUDA -Wno-unused-function -o $@ $< gemm_avx2.o ../cuew.c $(LDFLAGS)
+
+libvhuman_runtime.so: vhuman_runtime.c vhuman_runtime.h ../cuew.c ../cuew.h
+	$(CC) $(CFLAGS) -fPIC -shared -o $@ vhuman_runtime.c ../cuew.c $(LDFLAGS)
+
+splat_cuew.o: ../cuew.c ../cuew.h
+	$(CC) $(CFLAGS) -fPIC -c $< -o $@
+
+libvhuman_splat.so: vhuman_splat.cpp vhuman_splat_kernels.h splat_cuew.o
+	$(CXX) -O3 -std=c++17 -Wall -Wextra -Wpedantic -fPIC -shared -o $@ vhuman_splat.cpp splat_cuew.o $(LDFLAGS)

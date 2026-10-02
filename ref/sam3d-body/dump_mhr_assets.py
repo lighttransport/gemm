@@ -25,9 +25,34 @@ import argparse
 import json
 import os
 import sys
+import hashlib
 
 import torch
 from safetensors.torch import save_file
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def export_rig(m, model_path, out_dir, name):
+    """Small companion export; leaves the large existing weight file intact."""
+    indices, weights = m.get_lbsw()
+    path = os.path.join(out_dir, name + "_rig.safetensors")
+    save_file({"joint_indices": indices.detach().cpu().to(torch.int32).contiguous(),
+               "skin_weights": weights.detach().cpu().float().contiguous(),
+               "joint_parents": m.character_torch.skeleton.joint_parents.detach().cpu().to(torch.int32).contiguous()}, path)
+    meta = {"version": 1, "joint_names": list(m.get_joint_names()),
+            "source_sha256": sha256(model_path), "rig_sha256": sha256(path),
+            "weights_sha256": sha256(os.path.join(out_dir, name + ".safetensors")),
+            "constants_sha256": sha256(os.path.join(out_dir, name + ".json")),
+            "units": "cm", "quaternion_order": "xyzw"}
+    with open(os.path.join(out_dir, name + "_rig.json"), "w") as f:
+        json.dump(meta, f, indent=2)
 
 
 # Keys we pull out of the jit module. Names on the left are what we
@@ -95,6 +120,8 @@ def main():
                     default="/mnt/disk01/models/sam3d-body/safetensors")
     ap.add_argument("--name", default="sam3d_body_mhr_jit",
                     help="base name for the output .safetensors / .json pair")
+    ap.add_argument("--rig-only", action="store_true",
+                    help="export assembly metadata beside an existing weight export")
     args = ap.parse_args()
 
     if not os.path.exists(args.mhr_model):
@@ -103,6 +130,9 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
 
     m = torch.jit.load(args.mhr_model, map_location="cpu")
+    if args.rig_only:
+        export_rig(m, args.mhr_model, args.out_dir, args.name)
+        return 0
 
     tensors = {}
     manifest = []
@@ -157,6 +187,7 @@ def main():
             "manifest": manifest,
         }, f, indent=2)
     print(f"[dump_mhr_assets] wrote {json_path}", file=sys.stderr)
+    export_rig(m, args.mhr_model, args.out_dir, args.name)
     return 0
 
 

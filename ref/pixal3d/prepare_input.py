@@ -16,7 +16,7 @@ p.add_argument("--metadata", type=Path, required=True)
 p.add_argument("--camera-image", type=Path, help="Optional cropped RGB input used by MoGe")
 p.add_argument("--mask", type=Path)
 p.add_argument("--rembg-model", type=Path)
-p.add_argument("--moge-model", type=Path)
+p.add_argument("--moge-model", type=Path, help="Exported native MoGe directory (or model.pt with sibling native/)")
 p.add_argument("--fov", type=float, default=-1.0)
 p.add_argument("--mesh-scale", type=float, default=1.0)
 p.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
@@ -24,9 +24,6 @@ p.add_argument("--device-index", type=int, default=0)
 a = p.parse_args()
 if a.device_index < 0:
     p.error("--device-index must be non-negative")
-if a.device == "cuda":
-    import torch
-    torch.cuda.set_device(a.device_index)
 if not math.isfinite(a.mesh_scale) or a.mesh_scale <= 0:
     p.error("--mesh-scale must be positive")
 if a.fov > 0 and (not math.isfinite(a.fov) or a.fov >= math.pi):
@@ -38,23 +35,10 @@ def useful_alpha(image: Image.Image) -> bool:
 
 
 def remove_background(image: Image.Image, model_path: Path, device: str) -> Image.Image:
-    weights = list(model_path.glob("*.safetensors")) + list(model_path.glob("pytorch_model*.bin"))
-    if not (model_path.is_dir() and (model_path / "config.json").is_file() and weights):
-        raise RuntimeError(f"RMBG model directory is missing: {model_path}")
-    import torch
-    from torchvision import transforms
-    from transformers import AutoModelForImageSegmentation
-    model = AutoModelForImageSegmentation.from_pretrained(
-        model_path, trust_remote_code=True, local_files_only=True).eval().to(device)
-    transform = transforms.Compose([
-        transforms.Resize((1024, 1024)), transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-    ])
-    with torch.inference_mode():
-        prediction = model(transform(image.convert("RGB")).unsqueeze(0).to(device))[-1].sigmoid().cpu()
-    mask = transforms.ToPILImage()(prediction[0].squeeze()).resize(image.size)
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from server.vhuman.native_models import rmbg_alpha
     output = image.convert("RGBA")
-    output.putalpha(mask)
+    output.putalpha(rmbg_alpha(image, model_path, backend=device, device=a.device_index))
     return output
 
 
@@ -76,24 +60,9 @@ def camera_image(image: Image.Image) -> Image.Image:
 
 
 def estimate_fov(image: Image.Image, model_path: Path, device: str) -> float:
-    if not model_path.exists():
-        raise RuntimeError(f"MoGe-2 checkpoint is missing: {model_path}")
-    source = Path(__file__).with_name("moge-upstream")
-    if source.is_dir():
-        sys.path.insert(0, str(source))
-    try:
-        from moge.model.v2 import MoGeModel
-    except ImportError as exc:
-        raise RuntimeError("MoGe-2 support is not installed in this project environment") from exc
-    import torch
-    tensor = torch.from_numpy(np.asarray(image, dtype=np.float32) / 255.0).permute(2, 0, 1).to(device)
-    model = MoGeModel.from_pretrained(model_path).eval().to(device)
-    with torch.inference_mode():
-        intrinsics = model.infer(tensor)["intrinsics"].squeeze().cpu().numpy()
-    fx = float(intrinsics[0, 0]) * image.width
-    if not math.isfinite(fx) or fx <= 0:
-        raise RuntimeError("MoGe-2 returned invalid camera intrinsics")
-    return 2 * math.atan(image.width / (2 * fx))
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from server.vhuman.native_models import moge_camera
+    return moge_camera(image, model_path, backend=device, device=a.device_index)["fov"]
 
 
 image = Image.open(a.input)
