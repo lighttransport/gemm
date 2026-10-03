@@ -10,6 +10,14 @@ static int parse(const char *key, const char *value, glm53f_prefill_config *c) {
 int main(void) {
     glm53f_prefill_config c = {GLM53F_PREFILL_LEGACY, 32, GLM53F_PREFILL_FAST_DEFAULT, NULL, 0};
     int failed = 0;
+    failed |= parse("--verify-head-kernel", "shared", &c) != 1 || strcmp(getenv("GLM53F_HEAD_VERIFY_SHARED"), "1");
+    failed |= parse("--verify-head-kernel", "legacy", &c) != 1 || strcmp(getenv("GLM53F_HEAD_VERIFY_SHARED"), "0");
+    failed |= parse("--verify-head-kernel", "bad", &c) != -1;
+    failed |= parse("--verify-head-kernel", NULL, &c) != -1;
+    failed |= parse("--embedding-batch-kernel", "packed", &c) != 1 || strcmp(getenv("GLM53F_EMBED_BATCH_PACKED"), "1");
+    failed |= parse("--embedding-batch-kernel", "legacy", &c) != 1 || strcmp(getenv("GLM53F_EMBED_BATCH_PACKED"), "0");
+    failed |= parse("--embedding-batch-kernel", "bad", &c) != -1;
+    failed |= parse("--embedding-batch-kernel", NULL, &c) != -1;
     const char *dense_tiles[] = {"4", "16", "32", "64"};
     for (int i = 0; i < 4; ++i)
         failed |= parse("--dense-prefill-tile", dense_tiles[i], &c) != 1 ||

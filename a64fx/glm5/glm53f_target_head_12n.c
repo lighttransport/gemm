@@ -14,6 +14,7 @@
 #include "glm53f_pp_core.h"
 #include "glm53f_team.h"
 #include <arm_sve.h>
+#include "glm53f_head_verify_sve.h"
 #include <mpi.h>
 #include <omp.h>
 #include <sys/syscall.h>
@@ -166,8 +167,17 @@ int glm53f_target_head_argmax_batch_12n(glm53f_target_head_context_12n*c,const f
     for(int t=0;t<tokens;t++)
         for(int i=0;i<H;i++){float*h=c->hidden+(size_t)t*H,*z=c->x+(size_t)t*H;z[i]=h[i]*invs[t]*glm53f_bf16_to_f32(c->norm[i]);}
     double t1=glm53f_clock();if(c->q2_head){
+        const char *shared=getenv("GLM53F_HEAD_VERIFY_SHARED");
+        if(tokens>1&&shared&&atoi(shared)){
+#pragma omp parallel for schedule(static)
+            for(int r=0;r<c->rn/2;r++)glm53f_head_f32_pair_batch(
+                c->logits+2*r,c->rn,c->q2_head+(size_t)2*r*H,c->x,tokens,H);
+            if(c->rn%2){int r=c->rn-1;for(int t=0;t<tokens;t++)
+                c->logits[(size_t)t*c->rn+r]=dot_f32(c->q2_head+(size_t)r*H,c->x+(size_t)t*H,H);}
+        }else{
 #pragma omp parallel for collapse(2) schedule(static)
-        for(int t=0;t<tokens;t++)for(int r=0;r<c->rn;r++)c->logits[(size_t)t*c->rn+r]=dot_f32(c->q2_head+(size_t)r*H,c->x+(size_t)t*H,H);
+            for(int t=0;t<tokens;t++)for(int r=0;r<c->rn;r++)c->logits[(size_t)t*c->rn+r]=dot_f32(c->q2_head+(size_t)r*H,c->x+(size_t)t*H,H);
+        }
     }else{int n=tokens<5?tokens:4;glm53f_mv_bf16_batch(c->logits,c->head,c->x,n,c->rn,H);if(tokens==5){float*z=c->x+(size_t)4*H,*l=c->logits+(size_t)4*c->rn;
 #pragma omp parallel for schedule(static)
         for(int r=0;r<c->rn;r++)l[r]=dot_bf16(c->head+(size_t)r*H,z,H);}}for(int t=0;t<tokens;t++){float*l=c->logits+(size_t)t*c->rn;in[t].value=-INFINITY;in[t].index=-1;for(int r=0;r<c->rn;r++){int id=c->r0+r;if(l[r]>in[t].value||(l[r]==in[t].value&&id<in[t].index)){in[t].value=l[r];in[t].index=id;}}}double t2=glm53f_clock();int rc=MPI_Allreduce(in,best,tokens,MPI_FLOAT_INT,MPI_MAXLOC,c->dist?c->dist->tp:MPI_COMM_WORLD);double t3=glm53f_clock();for(int t=0;t<tokens;t++){token[t]=best[t].index;value[t]=best[t].value;}c->phase[0]=t1-t0;c->phase[1]=t2-t1;c->phase[2]=t3-t2;c->hidden_tokens=rc==MPI_SUCCESS?tokens:0;return rc==MPI_SUCCESS?0:-1;}

@@ -25,16 +25,17 @@
 #include <stdlib.h>
 #include <string.h>
 
-enum { MTP_H = 4096, MTP_STREAMS = 4 };
+enum { MTP_H = 4096, MTP_STREAMS = 4, MTP_PRIME_TILE = 64 };
 
 struct glm53f_mtp_context_12n {
-    int rank, ranks, row0, rows;
+    int rank, ranks, row0, rows, capacity;
     uint16_t *enorm, *hnorm, *input_norm, *post_norm, *eh;
     glm53f_embedding_context_12n *embedding;
     glm53f_sparse_context_12n *attention;
     glm53f_moe_stage_context_12n *moe;
     glm53f_target_head_context_12n *head;
     float *embed_streams, *pair, *fusion, *normalized, *sublayer, *head_streams;
+    float *prime_storage;
 };
 
 static void *mtp_a256(size_t n){void*p=NULL;return posix_memalign(&p,256,n)?NULL:p;}
@@ -44,7 +45,7 @@ static void mtp_norm(float*out,const float*x,const uint16_t*w){double ss=0;
 #pragma omp parallel for schedule(static)
     for(int i=0;i<MTP_H;i++)out[i]=x[i]*inv*glm53f_bf16_to_f32(w[i]);}
 
-glm53f_mtp_context_12n*glm53f_mtp_create_12n(const char*model,const char*routed,const char*shared,int capacity){glm53f_mtp_context_12n*c=calloc(1,sizeof(*c));glm53f_st_context*st;char name[128];if(!c)return NULL;MPI_Comm_rank(MPI_COMM_WORLD,&c->rank);MPI_Comm_size(MPI_COMM_WORLD,&c->ranks);if(c->ranks!=12||capacity<1)goto fail;c->row0=(int)((long long)MTP_H*c->rank/c->ranks);c->rows=(int)((long long)MTP_H*(c->rank+1)/c->ranks)-c->row0;st=glm53f_st_open(model);if(!st)goto fail;
+glm53f_mtp_context_12n*glm53f_mtp_create_12n(const char*model,const char*routed,const char*shared,int capacity){glm53f_mtp_context_12n*c=calloc(1,sizeof(*c));glm53f_st_context*st;char name[128];if(!c)return NULL;MPI_Comm_rank(MPI_COMM_WORLD,&c->rank);MPI_Comm_size(MPI_COMM_WORLD,&c->ranks);if(c->ranks!=12||capacity<1)goto fail;c->capacity=capacity;c->row0=(int)((long long)MTP_H*c->rank/c->ranks);c->rows=(int)((long long)MTP_H*(c->rank+1)/c->ranks)-c->row0;st=glm53f_st_open(model);if(!st)goto fail;
 #define ALLOC_READ(F,N,Z,O) do { \
     c->F = mtp_a256(Z); \
     if (!c->F) { \
@@ -88,9 +89,66 @@ static int mtp_run(glm53f_mtp_context_12n*c,int token,const float*hidden,int*dra
     for(int i=0;i<MTP_H;i++)c->fusion[i]+=c->sublayer[i];if(draft_hidden)memcpy(draft_hidden,c->fusion,MTP_H*4);for(int s=0;s<MTP_STREAMS;s++)memcpy(c->head_streams+(size_t)s*MTP_H,c->fusion,MTP_H*4);return glm53f_target_head_argmax_12n(c->head,c->head_streams,draft,logit);}
 int glm53f_mtp_forward_12n(glm53f_mtp_context_12n*c,int token,const float*hidden,int*draft,float*logit,float*draft_hidden){return mtp_run(c,token,hidden,draft,logit,draft_hidden,0);}
 int glm53f_mtp_cache_append_12n(glm53f_mtp_context_12n*c,int token,const float*hidden){return mtp_run(c,token,hidden,NULL,NULL,NULL,1);}
+/* Prefill-only: preserve scalar norms, dot chains and cache updates. The
+ * gathered layout is rank-major; unpacking restores token-major fusion rows. */
+int glm53f_mtp_cache_append_batch_12n(glm53f_mtp_context_12n *c,
+        const int *tokens, const float *hidden, int count) {
+    if (!c || !tokens || !hidden || count < 1 || count > MTP_PRIME_TILE ||
+        count > c->capacity - glm53f_mtp_length_12n(c)) return -1;
+    if (!c->prime_storage) {
+        c->prime_storage = mtp_a256((size_t)MTP_PRIME_TILE * MTP_H * 8 * sizeof(float));
+        if (!c->prime_storage) return -1;
+    }
+    float *embed = c->prime_storage;
+    float *pair = embed + (size_t)MTP_PRIME_TILE * MTP_H * 4;
+    float *local = pair + (size_t)MTP_PRIME_TILE * MTP_H * 2;
+    float *gather = local + (size_t)MTP_PRIME_TILE * MTP_H;
+    if (glm53f_embedding_streams_packed_12n(c->embedding, tokens, count, embed)) return -1;
+    int base = glm53f_mtp_length_12n(c);
+    if (!base) memset(embed, 0, (size_t)MTP_STREAMS * MTP_H * sizeof(float));
+    for (int t = 0; t < count; ++t) {
+        mtp_norm(pair + (size_t)t * 2 * MTP_H,
+                 embed + (size_t)t * MTP_STREAMS * MTP_H, c->enorm);
+        mtp_norm(pair + ((size_t)t * 2 + 1) * MTP_H,
+                 hidden + (size_t)t * MTP_H, c->hnorm);
+    }
+#pragma omp parallel for collapse(2) schedule(static)
+    for (int block = 0; block < c->rows / 4; ++block)
+        for (int base_token = 0; base_token < count; base_token += 4) {
+            int n = count - base_token; if (n > 4) n = 4;
+            glm53f_matvec_bf16_4x4(local + (size_t)base_token * c->rows + block * 4,
+                c->rows, c->eh + (size_t)block * 4 * 2 * MTP_H,
+                pair + (size_t)base_token * 2 * MTP_H, n, 2 * MTP_H);
+        }
+#pragma omp parallel for collapse(2) schedule(static)
+    for (int t = 0; t < count; ++t)
+        for (int r = c->rows / 4 * 4; r < c->rows; ++r)
+            local[(size_t)t * c->rows + r] = glm53f_dot_bf16_sve(
+                c->eh + (size_t)r * 2 * MTP_H, pair + (size_t)t * 2 * MTP_H, 2 * MTP_H);
+    int counts[12], offsets[12], offset = 0;
+    for (int r = 0; r < c->ranks; ++r) {
+        int row0 = (int)((long long)MTP_H * r / c->ranks);
+        int rows = (int)((long long)MTP_H * (r + 1) / c->ranks) - row0;
+        offsets[r] = offset; counts[r] = count * rows; offset += counts[r];
+    }
+    if (MPI_Allgatherv(local, count * c->rows, MPI_FLOAT, gather, counts,
+                       offsets, MPI_FLOAT, MPI_COMM_WORLD) != MPI_SUCCESS) return -1;
+    for (int t = 0; t < count; ++t) {
+        for (int r = 0; r < c->ranks; ++r) {
+            int row0 = (int)((long long)MTP_H * r / c->ranks);
+            int rows = counts[r] / count;
+            memcpy(c->fusion + row0, gather + offsets[r] + (size_t)t * rows,
+                   (size_t)rows * sizeof(float));
+        }
+        memcpy(c->head_streams, c->fusion, MTP_H * sizeof(float));
+        /* Fusion is complete, so its input-pair storage can be reused. */
+        mtp_norm(pair + (size_t)t * MTP_H, c->fusion, c->input_norm);
+    }
+    return glm53f_sparse_cache_append_batch_12n(c->attention, pair, count);
+}
 int glm53f_mtp_length_12n(const glm53f_mtp_context_12n*c){return c?glm53f_sparse_length_12n(c->attention):-1;}
 int glm53f_mtp_head_hidden_12n(const glm53f_mtp_context_12n *c, float *hidden) {
     return c ? glm53f_target_head_hidden_12n(c->head, hidden, 1) : -1;
 }
 int glm53f_mtp_restore_length_12n(glm53f_mtp_context_12n*c,int length){return c?glm53f_sparse_restore_length_12n(c->attention,length):-1;}
-void glm53f_mtp_free_12n(glm53f_mtp_context_12n*c){if(!c)return;free(c->head_streams);free(c->sublayer);free(c->normalized);free(c->fusion);free(c->pair);free(c->embed_streams);glm53f_target_head_free_12n(c->head);glm53f_moe_stage_free_12n(c->moe);glm53f_sparse_free_12n(c->attention);glm53f_embedding_free_12n(c->embedding);free(c->eh);free(c->post_norm);free(c->input_norm);free(c->hnorm);free(c->enorm);free(c);}
+void glm53f_mtp_free_12n(glm53f_mtp_context_12n*c){if(!c)return;free(c->prime_storage);free(c->head_streams);free(c->sublayer);free(c->normalized);free(c->fusion);free(c->pair);free(c->embed_streams);glm53f_target_head_free_12n(c->head);glm53f_moe_stage_free_12n(c->moe);glm53f_sparse_free_12n(c->attention);glm53f_embedding_free_12n(c->embedding);free(c->eh);free(c->post_norm);free(c->input_norm);free(c->hnorm);free(c->enorm);free(c);}

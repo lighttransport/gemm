@@ -53,6 +53,9 @@ int glm53f_sparse_value_reference_12n(
 /* Append only persistent KV/indexer state; no query or attention output. */
 int glm53f_sparse_cache_append_12n(
     glm53f_sparse_context_12n *context, const float *normalized_input);
+/* Exact FP8 replicated-cache priming, 1..64 rows; other formats fall back. */
+int glm53f_sparse_cache_append_batch_12n(
+    glm53f_sparse_context_12n *context, const float *normalized_input, int tokens);
 int glm53f_sparse_sublayer_batch_12n(
     glm53f_sparse_context_12n *context, float *output,
     const float *normalized_input, int tokens);

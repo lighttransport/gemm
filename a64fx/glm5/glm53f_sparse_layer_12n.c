@@ -1238,6 +1238,52 @@ int glm53f_sparse_cache_append_12n(glm53f_sparse_context_12n *c, const float *x)
     c->length++;
     return 0;
 }
+/* MTP priming needs only three persistent projections. Four-token kernels
+ * reuse the same weights while preserving each scalar row's FMA chain. */
+int glm53f_sparse_cache_append_batch_12n(glm53f_sparse_context_12n *c,
+        const float *x, int tokens) {
+    if (!c || !x || tokens < 1 || tokens > 64 || tokens > c->capacity - c->length) return -1;
+    if (c->cp || c->q2_native || glm53f_sparse_scalar_reference) {
+        for (int t = 0; t < tokens; ++t)
+            if (glm53f_sparse_cache_append_12n(c, x + (size_t)t * H)) return -1;
+        return 0;
+    }
+    int base = c->length;
+    float raw[64 * ID];
+#pragma omp parallel for collapse(2) schedule(static)
+    for (int r = 0; r < LAT; r += 4)
+        for (int t = 0; t < tokens; t += 4) {
+            int n = tokens - t; if (n > 4) n = 4;
+            glm53f_matvec_fp8_bits_4x4(c->latent + (size_t)(base + t) * LAT + r,
+                LAT, c->kva + (size_t)r * H, c->kvas + (size_t)(r / 128) * (H / 128),
+                x + (size_t)t * H, n, H);
+        }
+#pragma omp parallel for schedule(static)
+    for (int t = 0; t < tokens; ++t) {
+        float *latent = c->latent + (size_t)(base + t) * LAT;
+        glm53f_rmsnorm_bf16(latent, latent, c->kvan, LAT, 1e-5f);
+        if (c->latent_f16) glm53f_mla_cache_f16_store(c->latent_f16 + (size_t)(base + t) * LAT, latent, LAT);
+    }
+#pragma omp parallel for collapse(2) schedule(static)
+    for (int r = 0; r < ID; r += 4)
+        for (int t = 0; t < tokens; t += 4) {
+            int n = tokens - t; if (n > 4) n = 4;
+            glm53f_matvec_bf16_4x4(raw + (size_t)t * ID + r, ID,
+                c->wk + (size_t)r * H, x + (size_t)t * H, n, H);
+            glm53f_matvec_bf16_4x4(c->gcache + (size_t)(base + t) * ID + r, ID,
+                c->gatew + (size_t)r * H, x + (size_t)t * H, n, H);
+        }
+#pragma omp parallel for schedule(static)
+    for (int t = 0; t < tokens; ++t)
+        glm53f_layernorm_bf16(c->key + (size_t)(base + t) * ID,
+            raw + (size_t)t * ID, c->knw, c->knb, ID, 1e-5f);
+    for (int t = 0; t < tokens; ++t) {
+        int pos = base + t;
+        if ((pos + 1) % KPOOL == 0) update_completed_pool(c, (pos + 1) / KPOOL - 1);
+    }
+    c->length += tokens;
+    return 0;
+}
 int glm53f_sparse_sublayer_12n(void*context,float*out,const float*x){glm53f_sparse_context_12n*c=context;if(!c||sparse_attention_local(c,c->attn,x))return-1;int local_cols=c->hn*VD;
     double begin = sparse_clock(c);
     /* The output projection is the largest sparse-layer matvec.  Use the

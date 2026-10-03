@@ -109,22 +109,39 @@ int glm53f_embedding_streams_12n(
     return 0;
 }
 
-/* PP prefill broadcasts packed rows once per owner, then restores original
+/* Batched embedding broadcasts packed rows once per owner, then restores original
  * token order and duplicates four streams locally. FP32 bits are untouched. */
-int glm53f_embedding_streams_batch_12n(glm53f_embedding_context_12n *c,
+int glm53f_embedding_streams_packed_12n(glm53f_embedding_context_12n *c,
         const int *ids,int tokens,float *streams) {
     if(!c||!ids||!streams||tokens<1||tokens>4096)return-1;
-    if(!c->dist){for(int t=0;t<tokens;t++)if(glm53f_embedding_streams_12n(c,ids[t],streams+(size_t)t*GLM53F_EMBED_STREAMS*GLM53F_EMBED_HIDDEN))return-1;return 0;}
     for(int t=0;t<tokens;t++)if(ids[t]<0||ids[t]>=GLM53F_EMBED_VOCAB)return-1;
     float *packed=malloc((size_t)tokens*GLM53F_EMBED_HIDDEN*sizeof(float));if(!packed)return-1;
     for(int owner=0;owner<c->ranks;owner++){
         int begin=(int)((long long)GLM53F_EMBED_VOCAB*owner/c->ranks),end=(int)((long long)GLM53F_EMBED_VOCAB*(owner+1)/c->ranks),count=0;
         for(int t=0;t<tokens;t++)if(ids[t]>=begin&&ids[t]<end){
-            if(owner==c->rank)memcpy(packed+(size_t)count*GLM53F_EMBED_HIDDEN,c->q2_weight+(size_t)(ids[t]-c->row0)*GLM53F_EMBED_HIDDEN,GLM53F_EMBED_HIDDEN*sizeof(float));count++;}
+            if(owner==c->rank){
+                float *dst=packed+(size_t)count*GLM53F_EMBED_HIDDEN;
+                size_t offset=(size_t)(ids[t]-c->row0)*GLM53F_EMBED_HIDDEN;
+                if(c->q2_weight)memcpy(dst,c->q2_weight+offset,GLM53F_EMBED_HIDDEN*sizeof(float));
+                else for(int i=0;i<GLM53F_EMBED_HIDDEN;i++)dst[i]=glm53f_bf16_to_f32(c->weight[offset+i]);
+            }
+            count++;}
         if(!count)continue;
-        if(MPI_Bcast(packed,count*GLM53F_EMBED_HIDDEN,MPI_FLOAT,owner,c->dist->tp)!=MPI_SUCCESS){free(packed);return-1;}
+        if(MPI_Bcast(packed,count*GLM53F_EMBED_HIDDEN,MPI_FLOAT,owner,c->dist?c->dist->tp:MPI_COMM_WORLD)!=MPI_SUCCESS){free(packed);return-1;}
         int i=0;for(int t=0;t<tokens;t++)if(ids[t]>=begin&&ids[t]<end){
             for(int h=0;h<GLM53F_EMBED_STREAMS;h++)memcpy(streams+((size_t)t*GLM53F_EMBED_STREAMS+h)*GLM53F_EMBED_HIDDEN,packed+(size_t)i*GLM53F_EMBED_HIDDEN,GLM53F_EMBED_HIDDEN*sizeof(float));i++;}
     }
     free(packed);return 0;
+}
+
+int glm53f_embedding_streams_batch_12n(glm53f_embedding_context_12n *c,
+        const int *ids, int tokens, float *streams) {
+    if (!c || !ids || !streams || tokens < 1 || tokens > 4096) return -1;
+    const char *packed = getenv("GLM53F_EMBED_BATCH_PACKED");
+    if (c->dist || (packed && atoi(packed)))
+        return glm53f_embedding_streams_packed_12n(c, ids, tokens, streams);
+    for (int t = 0; t < tokens; ++t)
+        if (glm53f_embedding_streams_12n(c, ids[t],
+                streams + (size_t)t * GLM53F_EMBED_STREAMS * GLM53F_EMBED_HIDDEN)) return -1;
+    return 0;
 }

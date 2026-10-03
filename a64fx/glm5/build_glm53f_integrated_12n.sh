@@ -90,6 +90,7 @@ if [ "$mode" != runtime ]; then
     bin test_glm53f_pp_sparse test_glm53f_pp_sparse.c
     bin test_glm53f_pp_core test_glm53f_pp_core.c glm53f_dist.c
     bin test_glm53f_pp_images test_glm53f_pp_images.c
+    bin test_glm53f_embedding_batch_12n test_glm53f_embedding_batch_12n.c
     bin test_glm53f_pp_embedding test_glm53f_pp_embedding.c glm53f_dist.c
     bin test_glm53f_st_slice test_glm53f_st_slice.c
     bin test_glm53f_parallel test_glm53f_parallel.c
@@ -101,7 +102,9 @@ if [ "$mode" != runtime ]; then
     obj mtp_spec glm53f_mtp_spec_12n.c
     bin test_glm53f_lookup_spec test_glm53f_lookup_spec.c "$build_dir/lookup_spec.o"
     bin test_glm53f_mtp_spec test_glm53f_mtp_spec.c
+    bin test_glm53f_head_verify test_glm53f_head_verify.c
     bin test_glm53f_head_hidden -ffunction-sections -fdata-sections -Wl,--gc-sections test_glm53f_head_hidden.c
+    bin test_glm53f_mtp_prime_12n "${external[@]}" test_glm53f_mtp_prime_12n.c "${objects[@]}"
     bin test_glm53f_mtp_cache_12n test_glm53f_mtp_cache_12n.c "${objects[@]}" "$build_dir/mtp.o"
     bin bench_glm53f_run_12n bench_glm53f_run_12n.c "$build_dir/lookup_spec.o" "$build_dir/mtp_spec.o" "$build_dir/mtp.o" "${objects[@]}" "$build_dir/target.o"
     bin test_glm53f_moe_layout test_glm53f_moe_layout.c "$build_dir/gemm_asm.o"

@@ -18,6 +18,10 @@ int glm53f_mtp_head_hidden_12n(const glm53f_mtp_context_12n *context, float *hid
 int glm53f_mtp_cache_append_12n(
     glm53f_mtp_context_12n *context, int input_token,
     const float *target_hidden);
+/* Same cache contract, one batched embedding/fusion exchange; 1..64 pairs. */
+int glm53f_mtp_cache_append_batch_12n(
+    glm53f_mtp_context_12n *context, const int *input_tokens,
+    const float *target_hidden, int count);
 int glm53f_mtp_restore_length_12n(
     glm53f_mtp_context_12n *context, int length);
 

@@ -13,6 +13,9 @@ void glm53f_embedding_free_12n(glm53f_embedding_context_12n *context);
 int glm53f_embedding_streams_12n(
     glm53f_embedding_context_12n *context, int token, float *streams);
 
+/* Broadcast packed rows per vocabulary owner; FP32/BF16 bits are preserved. */
+int glm53f_embedding_streams_packed_12n(
+    glm53f_embedding_context_12n *context, const int *ids, int tokens, float *streams);
 int glm53f_embedding_streams_batch_12n(
     glm53f_embedding_context_12n *context, const int *ids, int tokens, float *streams);
 

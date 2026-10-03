@@ -72,7 +72,7 @@ int main(int argc, char **argv) {
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &ranks);
     if (argc < 6 || ranks != 12 || provided < MPI_THREAD_SERIALIZED) {
-        if (!rank) fprintf(stderr, "usage: %s MODEL ROUTED SHARED PROMPT_IDS OUTPUT_IDS [--transitions 256] [--repetitions 3] [--prefill-chunk 512] [--speculation none|lookup|mtp] [--mtp-routed-stage PATH] [--mtp-shared-stage PATH] [--draft-depth 1..4] [--spec-policy adaptive|always] [--decode-state-check TRACE_PREFIX] [prefill/runtime options]\n", argv[0]);
+        if (!rank) fprintf(stderr, "usage: %s MODEL ROUTED SHARED PROMPT_IDS OUTPUT_IDS [--transitions 256] [--repetitions 3] [--prefill-chunk 512] [--speculation none|lookup|mtp] [--mtp-prime-batch 1|64] [--mtp-routed-stage PATH] [--mtp-shared-stage PATH] [--draft-depth 1..4] [--spec-policy adaptive|always] [--decode-state-check TRACE_PREFIX] [prefill/runtime options]\n", argv[0]);
         MPI_Finalize();
         return 2;
     }
@@ -82,11 +82,15 @@ int main(int argc, char **argv) {
         if (!rank) fprintf(stderr, "GLM53F_NUMA_INTERLEAVE %s\n", rc == 0 ? "enabled" : "unavailable");
     }
     int transitions = 256, repetitions = 3, chunk = 512;
-    int speculation = 0, draft_depth = 4, adaptive = 1;
+    int speculation = 0, draft_depth = 4, adaptive = 1, mtp_prime_batch = 1;
     const char *mtp_routed = NULL, *mtp_shared = NULL;
     const char *state_check = NULL;
     glm53f_prefill_config config = {GLM53F_PREFILL_FAST, 32, 27, NULL, 5};
     for (int i = 6; i < argc; ++i) {
+        if (!strcmp(argv[i], "--mtp-prime-batch")) {
+            if (++i == argc || (strcmp(argv[i], "1") && strcmp(argv[i], "64"))) MPI_Abort(MPI_COMM_WORLD, 2);
+            mtp_prime_batch = atoi(argv[i]); continue;
+        }
         int rc = glm53f_prefill_option(&config, argc, argv, &i);
         if (rc < 0) MPI_Abort(MPI_COMM_WORLD, 2);
         if (rc) continue;
@@ -128,7 +132,7 @@ int main(int argc, char **argv) {
     if (config.mode != GLM53F_PREFILL_FAST && chunk > 256)
         MPI_Abort(MPI_COMM_WORLD, 2);
     if ((speculation == 2 && (!mtp_routed || !mtp_shared)) ||
-        (speculation != 2 && (mtp_routed || mtp_shared))) MPI_Abort(MPI_COMM_WORLD, 2);
+        (speculation != 2 && (mtp_routed || mtp_shared || mtp_prime_batch != 1))) MPI_Abort(MPI_COMM_WORLD, 2);
     FILE *output = NULL;
     if (!rank && !(output = fopen(argv[5], "wx"))) MPI_Abort(MPI_COMM_WORLD, 2);
     if (!rank) {
@@ -231,6 +235,7 @@ int main(int argc, char **argv) {
     glm53f_lookup_workspace_12n *lookup = speculation == 1 ?
         glm53f_lookup_workspace_create_12n(m, count + transitions + 1) : NULL;
     if (speculation == 1 && !lookup) MPI_Abort(MPI_COMM_WORLD, 2);
+    if (!rank) printf("GLM53F_BENCH_MTP_PRIME batch=%d verify_head_shared=%d embedding_packed=%d\n", mtp_prime_batch, getenv("GLM53F_HEAD_VERIFY_SHARED") && atoi(getenv("GLM53F_HEAD_VERIFY_SHARED")), getenv("GLM53F_EMBED_BATCH_PACKED") && atoi(getenv("GLM53F_EMBED_BATCH_PACKED")));
     long minimum = headroom();
     double warmup_prefill = 0, warmup_decode = 0;
     for (int trial = -1; trial < repetitions; ++trial) {
@@ -248,9 +253,16 @@ int main(int argc, char **argv) {
             check(rc);
             if (mtp) {
                 check(glm53f_target_model_normalize_hidden_12n(m, prompt_hidden, n));
-                for (int j = 0; j < n && t + j + 1 < count; ++j)
-                    check(glm53f_mtp_cache_append_12n(mtp, prompt[t + j + 1],
-                                                    prompt_hidden + (size_t)j * 4096));
+                int pairs = n;
+                if (t + n == count) --pairs;
+                for (int j = 0; j < pairs; j += mtp_prime_batch) {
+                    int tile = pairs - j < mtp_prime_batch ? pairs - j : mtp_prime_batch;
+                    if (mtp_prime_batch == 1)
+                        check(glm53f_mtp_cache_append_12n(mtp, prompt[t + j + 1],
+                                                       prompt_hidden + (size_t)j * 4096));
+                    else check(glm53f_mtp_cache_append_batch_12n(mtp, prompt + t + j + 1,
+                                                               prompt_hidden + (size_t)j * 4096, tile));
+                }
                 if (t + n == count)
                     memcpy(parent_hidden, prompt_hidden + (size_t)(n - 1) * 4096,
                            sizeof(parent_hidden));

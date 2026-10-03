@@ -24,6 +24,8 @@ static inline int glm53f_runtime_option(int argc, char **argv, int *index) {
     else if (!strcmp(key, "--pool-selector")) env = "GLM53F_POOL_PARTITION_4K";
     else if (!strcmp(key, "--q8-row-kernel")) env = "GLM53F_NATIVE_Q8_ROWS8";
     else if (!strcmp(key, "--q8-prefill-kernel")) env = "GLM53F_NATIVE_Q8_TILE2X8";
+    else if (!strcmp(key, "--embedding-batch-kernel")) env = "GLM53F_EMBED_BATCH_PACKED";
+    else if (!strcmp(key, "--verify-head-kernel")) env = "GLM53F_HEAD_VERIFY_SHARED";
     else if (!strcmp(key, "--mla-softmax-kernel")) env = "GLM53F_MLA_PARALLEL_SOFTMAX";
     else if (!strcmp(key, "--mla-projection-kernel")) env = "GLM53F_MLA_FUSED_PROJECTION";
     else if (!strcmp(key, "--moe-prefill-layout")) env = "GLM53F_MOE_GU_PAD";
@@ -48,6 +50,8 @@ static inline int glm53f_runtime_option(int argc, char **argv, int *index) {
              (!strcmp(key, "--collective-owner") && !strcmp(value, "serialized")) ||
              (!strcmp(key, "--router-kernel") && !strcmp(value, "fused")) ||
              (!strcmp(key, "--mla-projection-kernel") && !strcmp(value, "fused")) ||
+             (!strcmp(key, "--embedding-batch-kernel") && !strcmp(value, "packed")) ||
+             (!strcmp(key, "--verify-head-kernel") && !strcmp(value, "shared")) ||
              (!strcmp(key, "--mla-softmax-kernel") && !strcmp(value, "parallel")) ||
              (!strcmp(key, "--mhc-kernel") && !strcmp(value, "fused-sync")) ||
              (!strcmp(key, "--mhc-verify-kernel") && !strcmp(value, "team")) ||

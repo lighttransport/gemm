@@ -5,6 +5,38 @@ prefill tokens/s**, on twelve A64FX nodes, the complete 45-layer
 UD-Q4_K_XL model, top-8 routing, and the saved roughly 8K coding prompt.
 These targets have **not been demonstrated** by the changes below.
 
+## Batched MTP priming and verification weights (October3; native exact)
+
+Three independent opt-in candidates are implemented. The benchmark's
+`--mtp-prime-batch 1|64` batches teacher-forced prompt pairs. It retains the
+existing first-position mask and norm reductions, uses the existing exact
+BF164×4 fusion kernel, gathers rank-major shards once per tile, and appends
+FP8/BF16 cache projections with identical scalar chains. Native/CP cache
+formats use the original scalar fallback. Scratch is allocated lazily and
+bounded at8MiB per rank; this option does not omit prompt priming from timing.
+
+`--verify-head-kernel legacy|shared` shares FP32 vocabulary weight loads across
+2–5 verification positions. Every row retains the original single-accumulator
+SVE chain and horizontal sum; ordinary scalar readout is unchanged.
+`--embedding-batch-kernel legacy|packed` packs broadcasts per vocabulary owner
+for TP12 prefill. Both FP32/BF16 row storage are supported; PP retains its
+existing packed behavior. All TP12 defaults remain legacy/1.
+
+The shared `check` build includes `test_glm53f_embedding_batch_12n`,
+`test_glm53f_head_verify`, and `test_glm53f_mtp_prime_12n`. The latter compares
+persistent state and draft readout before/after pool-crossing rollback and
+measures five alternating scalar/batch64 priming pairs. These fixtures must
+pass before full-model timing. On PJM52128881 all20 embedding cases and
+150 head cases per fast/conservative1/47/48-thread configuration pass on
+each of12 ranks. All36 actual-weight MTP state/rollback cases pass. Five
+2051-position priming pairs give a2.663894× median speedup;47-thread fast
+head medians are1.846/2.783/3.227/3.378× for2/3/4/5 positions. These are
+component measurements. Short128 and full8049 target-state speculative
+gates pass BIT_EXACT; the performance sweep is running. No promotion or
+qualified model gain is claimed. The best accepted rates remain35.462134
+decode /412.273634 prefill tok/s. See
+[native evidence](strata-mtp-batch-native-20261003.json).
+
 ## Native dense prefill tiles (October3; exact but no promotion)
 
 `--dense-prefill-tile 4|16|32|64` selects the native dense batching capacity
