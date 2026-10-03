@@ -1,0 +1,71 @@
+{
+  "source": "/mnt/nvme01/models/glm53f/base",
+  "output": "/mnt/nvme01/models/glm53f/reap",
+  "corpus": "artifacts/corpus",
+  "quality_report": "artifacts/quality-local.json",
+  "llama_cpp": "vendor/llama.cpp",
+  "ggml_library": "vendor/llama.cpp/build-compression/bin/libggml-base.so",
+  "seed": 42,
+  "keep_experts": 116,
+  "weight_budget_bytes": 46000000000,
+  "host_limit_gib": 130,
+  "gpu_limit_gib": 10,
+  "reserve_disk_gib": 4,
+  "corpus_limit_gib": 2,
+  "corpus_tokens": 8000000,
+  "calibration_windows": 512,
+  "quant_windows": 128,
+  "sequence_length": 2048,
+  "image_tokens": 512,
+  "activation_reservoir": 128,
+  "activation_budget_gib": 3,
+  "tile_rows": 32,
+  "gsq_epochs": 10,
+  "gsq_lr": 0.0001,
+  "gsq_scale_lr": 5e-05,
+  "gsq_temperature": [
+    2.0,
+    0.05
+  ],
+  "rco_steps": 100,
+  "rco_lr": 0.05,
+  "rco_temperature": [
+    1.0,
+    0.1
+  ],
+  "expert_types": [
+    "Q2_K",
+    "Q3_K"
+  ],
+  "dense_types": [
+    "Q4_K",
+    "Q6_K",
+    "Q8_0"
+  ],
+  "corpus_mix": {
+    "instructions": 0.45,
+    "code": 0.25,
+    "trajectories": 0.15,
+    "general": 0.05,
+    "vision": 0.1
+  },
+  "code_languages": [
+    "python",
+    "c",
+    "c++",
+    "javascript",
+    "typescript",
+    "go",
+    "rust",
+    "java"
+  ],
+  "vision_subsets": [
+    "websight",
+    "docvqa",
+    "chartqa",
+    "textcaps"
+  ],
+  "kda_chunk_size": 16,
+  "runtime_tile_rows": 1024,
+  "work_dir": "artifacts/compression"
+}

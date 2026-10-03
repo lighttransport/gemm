@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "glm-reap"
+version = "0.1.0"
+description = "Streaming GLM-5.3-Flash expert pruning and native GGUF optimization"
+requires-python = ">=3.10"
+dependencies = ["numpy>=2,<3", "safetensors>=0.6", "torch==2.11.0", "torchvision==0.26.0", "transformers==5.16.1", "datasets>=4,<6", "huggingface-hub>=0.34", "pillow>=11", "scipy>=1.15", "psutil>=7", "jinja2>=3", "threadpoolctl>=3"]
+
+[project.scripts]
+glm-reap = "glm_reap.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
