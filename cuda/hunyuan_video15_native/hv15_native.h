@@ -33,6 +33,10 @@ int hv15n_generate(hv15n_context *context, const hv15n_request *request, const h
                    char *error, size_t capacity);
 /* JSON valid until the next generation or destruction. */
 const char *hv15n_metrics(const hv15n_context *context);
+/* Optional ROCm attention provider; configure an idle context before generation.
+ * The existing configuration struct and CUDA ABI remain unchanged. */
+int hv15n_set_aotriton_bridge(hv15n_context *context, const char *path,
+                            char *error, size_t capacity);
 void hv15n_cancel(hv15n_context *context);
 void hv15n_free(hv15n_context *context);
 #ifdef __cplusplus

@@ -57,6 +57,8 @@ int main(int argc, char **argv) {
         r.task = "t2v";
         r.prompt = "A person smiles";
         char error[512];
+        require(hv15n_set_aotriton_bridge(nullptr, "missing", error, sizeof(error)) != 0,
+                "null attention-provider context accepted");
         require(hv15n_validate(&r, error, sizeof(error)) == 0, "T2V rejected");
         r.preset = "fast12";
         require(hv15n_validate(&r, error, sizeof(error)) != 0, "fast12 T2V accepted");

@@ -1,7 +1,12 @@
 #ifndef PIXAL3D_HV15N_GPU_HPP
 #define PIXAL3D_HV15N_GPU_HPP
+#ifdef HV15N_ROCM
+#include "../../rdna4/video_common/hip_platform.hpp"
+#include "../../rdna4/video_common/aotriton_bridge.h"
+#else
 #include "../cublasew.h"
 #include "../cuew.h"
+#endif
 #include "host.hpp"
 #include <atomic>
 #include <array>
@@ -22,6 +27,9 @@ struct Tensor {
   std::vector<int> shape;
   int element_bytes = 4;
   int packed_heads = 0;
+#ifdef HV15N_ROCM
+  bool fp16_values = false; // Logical dtype when stored in the F32 operator buffers.
+#endif
   size_t count() const { return product(shape); }
   size_t bytes() const { return count() * element_bytes; }
   int channels() const { return shape.back(); }
@@ -48,6 +56,15 @@ struct Gpu {
   uint64_t allocations = 0, buffer_reuses = 0, upload_bytes = 0, weight_hits = 0;
   uint64_t flash_calls = 0, gemm_v7_calls = 0, conv_chunks = 0;
   uint64_t ieee_tiled_calls = 0;
+#ifdef HV15N_ROCM
+  uint64_t f16_tiled_calls = 0;
+  bool dit_fp16 = false;
+  std::unique_ptr<void, int (*)(void *)> aot_library{nullptr, dlclose};
+  video_aotriton_forward_fn aot_forward = nullptr, aot_heads = nullptr;
+  uint64_t aot_calls = 0;
+  void use_aotriton(const char *path);
+  Tensor round_half(Tensor input);
+#endif
   std::atomic<bool> cancelled{false};
   CUresult deferred_error = CUDA_SUCCESS;
   std::function<bool()> cancel_check;

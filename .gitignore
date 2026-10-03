@@ -381,3 +381,10 @@ rdna4/sam3/test_hip_sam3_embed
 /cuda/vhuman/vhuman_models
 !ref/vhuman/
 !ref/vhuman/*.py
+!ref/minimax_h3_native/
+ref/minimax_h3_native/*
+!ref/minimax_h3_native/*.py
+!ref/minimax_h3_native/README.md
+
+# Repository scratch may be an existing symlink.
+/tmp

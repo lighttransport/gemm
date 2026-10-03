@@ -99,12 +99,75 @@ static void convolution_test(Gpu &g, bool causal) {
    for(int repeat=0;repeat<2;repeat++)compare(g.download(g.conv(weights,"layer",x,causal)),expected,.004,"implicit conv tail/padding/cache");}
   fs::remove(path);
 }
+#ifdef HV15N_ROCM
+static void convolution_rounding_test(Gpu &g) {
+    const int channels = 2, outputs = 4, rows = 60;
+    auto half = [](float value) { return float((_Float16)value); };
+    fs::path directory = std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "tmp/hv15-native/tests";
+    fs::create_directories(directory);
+    for (int kernel : {1, 3}) {
+        std::vector<float> input(rows * channels),
+            weight(outputs * channels * kernel * kernel, 0.f);
+        std::vector<float> bias(outputs, half(.1f));
+        for (int row = 0; row < rows; ++row)
+            input[row * channels] = half((row - 27) * .01317f);
+        for (int out = 0; out < outputs; ++out)
+            weight[out * channels * kernel * kernel + (kernel * kernel) / 2] = half(.3333f);
+        size_t bytes = weight.size() * sizeof(float);
+        std::string header =
+            "{\"layer.weight\":{\"dtype\":\"F32\",\"shape\":[4,2,1," + std::to_string(kernel) +
+            "," + std::to_string(kernel) + "],\"data_offsets\":[0," + std::to_string(bytes) +
+            "]},\"layer.bias\":{\"dtype\":\"F32\",\"shape\":[4],\"data_offsets\":[" +
+            std::to_string(bytes) + "," + std::to_string(bytes + 16) + "]}}";
+        while (header.size() % 8)
+            header += ' ';
+        fs::path path = directory / ("conv_rounding_" + std::to_string(kernel) + ".safetensors");
+        {
+            std::ofstream file(path, std::ios::binary);
+            uint64_t length = header.size();
+            file.write(reinterpret_cast<const char *>(&length), sizeof(length));
+            file << header;
+            file.write(reinterpret_cast<const char *>(weight.data()), bytes);
+            file.write(reinterpret_cast<const char *>(bias.data()), 16);
+        }
+        {
+            Weights weights(path);
+            auto x = g.upload(input, {3, 4, 5, channels});
+            g.dit_fp16 = true;
+            auto result = g.conv(weights, "layer", x, false);
+            auto actual = g.download(result);
+            int adversarial = 0;
+            for (int row = 0; row < rows; ++row) {
+                float core = input[row * channels] * half(.3333f);
+                float expected = half(half(core) + bias[0]);
+                adversarial += expected != half(core + bias[0]);
+                for (int out = 0; out < outputs; ++out)
+                    require(actual[row * outputs + out] == expected,
+                            "FP16 convolution before bias");
+            }
+            require(result.fp16_values && adversarial > 0,
+                    "adversarial convolution rounding fixture");
+            g.dit_fp16 = false;
+        }
+        fs::remove(path);
+    }
+    std::cout << "PASS FP16 convolution core/bias boundaries (pointwise and im2col)\n";
+}
+#endif
 int main(int argc, char **argv) {
   try {
+#ifdef HV15N_ROCM
+    bool vendor = argc > 1 && std::string(argv[1]) == "hipblas";
+#else
     bool vendor = argc > 1 && std::string(argv[1]) == "cublas";
+#endif
     bool fallback = !(argc > 1 && std::string(argv[1]) == "repo-only");
     bool memory = argc > 1 && std::string(argv[1]) == "memory";
     Gpu g(0, memory ? 14336 : 4096, vendor, fallback);
+#ifdef HV15N_ROCM
+    convolution_rounding_test(g);
+#endif
+#ifndef HV15N_ROCM
     for (const char *name : {"gemm_f16", "gemm_f16_large"}) {
       CUfunction fn;
       int local = 0, regs = 0;
@@ -117,6 +180,7 @@ int main(int argc, char **argv) {
       std::cout << name << " local_bytes=" << local << " registers=" << regs
                 << '\n';
     }
+#endif
     if (memory) {
       size_t before = 0, after = 0, total = 0;
       g.check(cuMemGetInfo(&before, &total), "memory before");
