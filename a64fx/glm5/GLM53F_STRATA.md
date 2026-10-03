@@ -5,7 +5,7 @@ prefill tokens/s**, on twelve A64FX nodes, the complete 45-layer
 UD-Q4_K_XL model, top-8 routing, and the saved roughly 8K coding prompt.
 These targets have **not been demonstrated** by the changes below.
 
-## MTP rejected-window restore (October4; host exact, native queued)
+## MTP rejected-window restore (October4; complete, small screen gain, no promotion)
 
 `--mtp-target-restore legacy|rejection`, default `legacy`, follows Strata's
 fully accepted window handling (`glm_decode.cpp:4842–4857`, branch `glm53f`,
@@ -19,13 +19,20 @@ true-parent MTP cache contents and restore-call counts. Every rejection prefix,
 depths1..4, short/ragged tails and adaptive fallback are covered. Strict GCC,
 ASan/UBSan (leak detection disabled), CLI parser,18 launcher tests and6 reporting
 tests pass. The host MPI shim does not validate distributed behavior.
-A separate warning-clean FCC candidate is built. Driver13463 waits for
-successful owner10801 completion, idle MPI and allocation headroom, then runs
-native12-rank controller, short/full state and long1024 plain/MTP screens.
-No native-model correctness or speedup is claimed yet. See
-[restore experiment](strata-mtp-rejection-restore-20261004.json).
+A separate warning-clean FCC candidate passes1792 cases on all12 ranks
+(21504 instances). Seven complete model runs/13 timed trials pass every
+129/1025-ID comparison and short/full raw endpoint state equality across
+all12 ranks; minimum available8.339111GiB. Long MTP legacy→rejection rates
+are34.780039→35.609712 decode and395.545316→393.476985 prefill tok/s:
++2.3855% decode/−0.5229% prefill in a three-trial screen. All three trials
+retain500 accepted/523 proposed/523 cycles/1 fallback and synchronized cache.
+Median combined timed prefill/decode falls49.810134→49.179866s; fresh plain
+is49.286350s. The roughly0.22% advantage over plain excludes load/IO and
+is not paired confirmation. No promotion. See
+[restore model evidence](strata-mtp-rejection-restore-model-20261004.json) and
+[implementation and native evidence](strata-mtp-rejection-restore-20261004.json).
 
-## Prescaled MLA value-cache reuse (October4; native exact, model pending)
+## Prescaled MLA value-cache reuse (October4; complete, modest combined gain, no promotion)
 
 `--mla-value-kernel legacy|normalized2`, default`legacy`, divides each
 probability once with the original volatile divisor, then shares half-cache
@@ -44,17 +51,18 @@ three key orders, counts through2052 including511/512/513, zeros and FP32
 subnormal probabilities, and both in-place/separate normalization buffers.
 These are component timings, not model tok/s.
 
-Immutable`candidate-mla-values-model-v1` is built warning-clean. Its serial
-campaign tests combined normalized2 values, split6 prefill and packed
-embedding, with heads3 scores fixed in same-binary controls. Short/full
-state gates, fresh frozen/prior-score controls, five alternating pairs and
-long1024 plain/MTP comparisons are underway. Five alternating pairs confirm
-median paired gains2.9427% prefill/0.7268% decode, with exact IDs. Absolute
-rate medians are401.299720→413.108692 prefill and34.025137→34.272419 decode.
-These gains do not pass the5% promotion threshold.
-The [running checkpoint](strata-mla-values-model-checkpoint-20261004.json)
-records completed screens, five pairs and raw short/full endpoint hashes.
-No promotion; combined gains do not isolate the value kernel. See [integrated native evidence](strata-mla-values-integrated-native-20261004.json),
+Immutable`candidate-mla-values-model-v1` completes23 runs/41 timed trials.
+Five alternating same-binary pairs confirm median paired gains2.9427%
+prefill/0.7268% decode, with all257 IDs exact. Absolute medians are
+401.299720→413.108692 prefill and34.025137→34.272419 decode tok/s.
+Every129/257/1025-ID count/reference passes; short/full raw endpoints match
+on all12 ranks; minimum available8.278198GiB. Combined options include
+normalized2 values, split6 prefill and packed embedding; scores are fixed
+heads3 in both controls. This does not isolate the value kernel's model gain.
+Long MTP combined screen gains1.3177% prefill/0.0670% decode versus MTP control,
+but combined timed phases49.766999s exceed plain combined49.509115s.
+No promotion. See [completed model report](strata-mla-values-model-20261004.json),
+[integrated native evidence](strata-mla-values-integrated-native-20261004.json),
 [unscaled rejection](strata-mla-values-native-20261004.json) and
 [prescale prototypes](strata-mla-values-prescale-native-20261004.json).
 

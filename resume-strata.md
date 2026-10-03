@@ -36,41 +36,38 @@ helper out-of-place/in-place cases across two math modes and1/47 threads;
 511/512/513 boundaries, zeros/subnormals and canaries are covered.
 See`strata-mla-values-integrated-native-20261004.json`.
 
-Immutable`candidate-mla-values-model-v1` built warning-clean FCC fast math,
-panel47/capacity4096. Active driver10801 is the only MPI owner; prior owners
-472/674/2857/9032 are terminal/PASS. Driver7012 was canceled while idle before
-MPI to broaden its unlaunched prescale fixture. New campaign
-`campaign-values-model-v1.py` uses`results-values-model/`: short/full combined
-state gates, fresh frozen/prior-score controls, isolated value screen, five
-alternating combined pairs (normalized2+split6 prefill+packed embedding),
-and long1024 plain/MTP comparisons. Scores useheads3 throughout except
-frozen. Raw short/full cross-option endpoint states pass byte-for-byte on all12 ranks.
-Screens: isolated values402.033771 prefill/34.235902 decode versus same-binary
-legacy401.166466/34.132069; combined413.304226/34.275158. Five pairs confirm+2.9427% prefill/+0.7268% decode, with all257 IDs exact;
-median absolute rates401.299720→413.108692 prefill and34.025137→34.272419
-decode. Long plain/MTP comparisons continue. The running checkpoint is
-`a64fx/glm5/strata-mla-values-model-checkpoint-20261004.json` (19 runs/29
-timed trials); no promotion, and combined gain does not isolate values.
-Scratch`tmp/strata-mla-logits-20261003/` archives immutable sources/provenance
-and completed phases. Do not restage or overlap MPI. Defaults and qualified
-recipe stay35.462134 decode/412.273634 prefill; targets remain unmet.
+**October4 campaigns complete:** owner10801 is terminal/PASS,23 model
+runs/41 trials. Five alternating combined pairs confirm+2.9427% prefill/
++0.7268% decode; absolute medians401.299720→413.108692 prefill and
+34.025137→34.272419 decode. All129/257/1025 IDs and raw short/full states
+match; minimum available8.278198GiB. Long MTP combined gains1.3177%
+prefill/0.0670% decode over MTP control, but49.766999s timed phases exceed
+plain combined49.509115s. No promotion. Final report
+`a64fx/glm5/strata-mla-values-model-20261004.json` verifies immutable source
+via commit5fbc0f66, because current runtime adds the later restore option.
 
-**Next queued experiment:** opt-in `--mtp-target-restore legacy|rejection`,
-default legacy, skips target snapshot restore on fully accepted windows while
-retaining rejected-prefix restores and MTP replay. Both modes pass1792 host
-controller cases, strict CLI and ASan/UBSan;18 launcher/6 reporting tests pass.
-Separate FCC candidate `candidate-mtp-rejection-restore-v1` built warning-clean.
-Waiting driver13463 depends on10801 terminal/PASS, refuses concurrent MPI,
-and respects04:35 new-run margin. Its seven model runs follow a1792-case
-12-rank native gate: short/full legacy/rejection states and long1024
-plain/MTP screens. No native model result yet. Scratch
-`tmp/strata-mtp-restore-20261004/`; report
-`a64fx/glm5/strata-mtp-rejection-restore-20261004.json`.
-The value-model recorder now verifies source hashes via commit5fbc0f66 because
-the current runtime header adds the new restore option; its immutable candidate
-and measurements retain their original source. Do not rebuild either candidate
-in place or overlap MPI. Finish value report, then audit restore endpoint files
-with bounded frontend reads and archive both campaigns' rank0 logs.
+Restore experiment commit9b3d9a1d is complete: owner13463 terminal/PASS,
+1792 native cases per rank/21504 instances, seven model runs/13 trials.
+Short/full raw endpoints match all12 ranks; all129/1025 IDs exact;
+minimum available8.339111GiB. MTP restore legacy→rejection screens show
+34.780039→35.609712 decode (+2.3855%) and395.545316→393.476985 prefill
+(−0.5229%). Three trials keep500/523 accepted/proposed,523 cycles,1fallback
+and cache_synchronized1. Combined timed phases49.810134→49.179866s;
+fresh plain49.286350s. The roughly0.22% advantage is unpaired and excludes
+load/IO; no promotion. See`strata-mtp-rejection-restore-model-20261004.json`.
+
+At04:42 JST both owners are gone and MPI is idle. Allocation52138572 ends
+05:02:57; no further model runs this allocation (new-run margin04:35).
+Persistent session94d5067e expired while idle; archived as
+`session-idle-expired-52138572-0440` and a fresh bridge session was created.
+Do not restage until a new allocation; `/local` images vanish at expiry.
+Scratch`tmp/strata-mla-logits-20261003/` and
+`tmp/strata-mtp-restore-20261004/` contain completed campaigns, bounded state
+audits, rank0 profiles, hashes and record scripts. Qualified recipe/defaults
+stay35.462134 decode/412.273634 prefill;100/2000 targets remain unmet.
+Next priority: larger prefill cost (MoE/collectives or early-layer PP rounding
+isolation); further restore timing needs alternating paired confirmation,
+not promotion from its small three-trial screen.
 
 Bridge session49515107 died at00:31 JST when an optional missing-log read hit
 leaked interactive`set -e`; detached owners survived and were verified from
