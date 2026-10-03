@@ -1,0 +1,4595 @@
+{
+  "date": "2026-10-03",
+  "allocation": 52128881,
+  "implementation_commit": "79d67a35",
+  "hardware": "12 A64FX nodes compact2x3x2 normal2GHz/eco0",
+  "threads": 47,
+  "compiler": "FCC clang SVE fast math, attention panel47, capacity4096",
+  "status": "full_model_exact_no_plain_promotion",
+  "mtp_feature_improvement_confirmed": true,
+  "promoted": false,
+  "targets_met": false,
+  "qualified_plain_recipe_unchanged": {
+    "decode_tok_s": 35.462134,
+    "prefill_tok_s": 412.273634
+  },
+  "native_evidence": "strata-mtp-batch-native-20261003.json",
+  "model": "complete45-layer UD-Q4_K_XL GLM5.3F, top8 routing; checkpoint MTP layer45",
+  "prompt_tokens": 8049,
+  "capture_counts": {
+    "short_gate_prompt": 128,
+    "short_gate_transitions": 128,
+    "full_gate_prompt": 8049,
+    "full_gate_transitions": 128,
+    "screen_transitions": 256,
+    "long_transitions": 1024
+  },
+  "exactness": "Native cache/rollback is BIT_EXACT; short/full target endpoint states BIT_EXACT; every complete257/1025-ID performance capture matches frozen plain output. Every MTP feature pair also has identical accepted/proposed/cycles/fallback counts.",
+  "benchmark_options": [
+    "--prefill-chunk",
+    "4096",
+    "--decode-executor",
+    "persistent",
+    "--router-kernel",
+    "fused",
+    "--verify-kernel",
+    "grouped",
+    "--moe-combine-kernel",
+    "vector",
+    "--index-kernel",
+    "heads",
+    "--mla-kernel",
+    "fp16-cache",
+    "--pool-selector",
+    "partition4k",
+    "--q8-row-kernel",
+    "rows4",
+    "--q8-prefill-kernel",
+    "tile4x4",
+    "--mla-projection-kernel",
+    "legacy"
+  ],
+  "environment": {
+    "OMP_NUM_THREADS": 47,
+    "OMP_PROC_BIND": "close",
+    "OMP_PLACES": "cores",
+    "OMP_WAIT_POLICY": "active",
+    "FLIB_BARRIER": "HARD",
+    "GLM53F_PREWARM": 1,
+    "GLM53F_PROFILE": 1,
+    "GLM53F_FAST_MATH": 1,
+    "GLM53F_NO_MATH_ERRNO": 1,
+    "GLM53F_DENSE_PREFILL_TILE": 4
+  },
+  "scripts_sha256": {
+    "build-v5.sh": "b07872786ef8bdcf55471c1d966c6608135090baf6fc62b4632286f8b1bcfdfd",
+    "build-embedding-test.sh": "640ab6dd325ee0c9df37398e47fe8affdfa5e7bb0319bc375c0975cde558df78",
+    "driver-v7.sh": "f5a5cad130b8610f501ff68f780a18e607418d93b91f661834c6a3b3eca4c621",
+    "campaign-v5.py": "550c15b1994b68f9a57242ce483e6505b5a44fb2e4815be579f6237d68155e68",
+    "driver-confirmation-v1.sh": "97b9099e8e15f6ab70493db791da98f8d838d9aecf72830a993f8effd207490c",
+    "confirmation-v1.py": "31461bf3d380659febd0c7d5d3dbc8b7153e0f6f89fa2296f0822cd7ff407206"
+  },
+  "exact_run_commands": {
+    "short-state-gate": {
+      "argv": [
+        "bash",
+        "a64fx/glm5/run_glm53f_12n.sh",
+        "benchmark",
+        "/vol0006/mdt0/data/hp250467/work/gemm/glm53f-strata-20261001/tmp/strata-mtp-batch-20261003/results/short128.prompt.ids",
+        "/vol0006/mdt0/data/hp250467/work/gemm/glm53f-strata-20261001/tmp/strata-mtp-batch-20261003/results/short-state-gate.ids",
+        "--prefill-chunk",
+        "4096",
+        "--transitions",
+        "128",
+        "--repetitions",
+        "1",
+        "--decode-executor",
+        "persistent",
+        "--router-kernel",
+        "fused",
+        "--verify-kernel",
+        "grouped",
+        "--moe-combine-kernel",
+        "vector",
+        "--index-kernel",
+        "heads",
+        "--mla-kernel",
+        "fp16-cache",
+        "--pool-selector",
+        "partition4k",
+        "--q8-row-kernel",
+        "rows4",
+        "--q8-prefill-kernel",
+        "tile4x4",
+        "--mla-projection-kernel",
+        "legacy",
+        "--embedding-batch-kernel",
+        "packed",
+        "--verify-head-kernel",
+        "shared",
+        "--speculation",
+        "mtp",
+        "--draft-depth",
+        "4",
+        "--spec-policy",
+        "always",
+        "--mtp-prime-batch",
+        "64",
+        "--mtp-routed-stage",
+        "/local/glm53f-mtp-routed-52128881",
+        "--mtp-shared-stage",
+        "/local/glm53f-mtp-shared-52128881",
+        "--decode-state-check",
+        "/vol0006/mdt0/data/hp250467/work/gemm/glm53f-strata-20261001/tmp/strata-mtp-batch-20261003/results/short-state-gate.state"
+      ],
+      "variant": {
+        "source": "mtp",
+        "depth": 4,
+        "policy": "always",
+        "prime": 64,
+        "shared": true
+      },
+      "state": true,
+      "baseline": false
+    },
+    "frozen-control": {
+      "argv": [
+        "bash",
+        "a64fx/glm5/run_glm53f_12n.sh",
+        "benchmark",
+        "tmp/prompt8k.ids",
+        "/vol0006/mdt0/data/hp250467/work/gemm/glm53f-strata-20261001/tmp/strata-mtp-batch-20261003/results/frozen-control.ids",
+        "--prefill-chunk",
+        "4096",
+        "--transitions",
+        "256",
+        "--repetitions",
+        "3",
+        "--decode-executor",
+        "persistent",
+        "--router-kernel",
+        "fused",
+        "--verify-kernel",
+        "grouped",
+        "--moe-combine-kernel",
+        "vector",
+        "--index-kernel",
+        "heads",
+        "--mla-kernel",
+        "fp16-cache",
+        "--pool-selector",
+        "partition4k",
+        "--q8-row-kernel",
+        "rows4",
+        "--q8-prefill-kernel",
+        "tile4x4",
+        "--mla-projection-kernel",
+        "legacy"
+      ],
+      "variant": null,
+      "state": false,
+      "baseline": true
+    },
+    "rebuilt-control": {
+      "argv": [
+        "bash",
+        "a64fx/glm5/run_glm53f_12n.sh",
+        "benchmark",
+        "tmp/prompt8k.ids",
+        "/vol0006/mdt0/data/hp250467/work/gemm/glm53f-strata-20261001/tmp/strata-mtp-batch-20261003/results/rebuilt-control.ids",
+        "--prefill-chunk",
+        "4096",
+        "--transitions",
+        "256",
+        "--repetitions",
+        "3",
+        "--decode-executor",
+        "persistent",
+        "--router-kernel",
+        "fused",
+        "--verify-kernel",
+        "grouped",
+        "--moe-combine-kernel",
+        "vector",
+        "--index-kernel",
+        "heads",
+        "--mla-kernel",
+        "fp16-cache",
+        "--pool-selector",
+        "partition4k",
+        "--q8-row-kernel",
+        "rows4",
+        "--q8-prefill-kernel",
+        "tile4x4",
+        "--mla-projection-kernel",
+        "legacy",
+        "--embedding-batch-kernel",
+        "legacy",
+        "--verify-head-kernel",
+        "legacy"
+      ],
+      "variant": null,
+      "state": false,
+      "baseline": false
+    },
+    "packed-prefill": {
+      "argv": [
+        "bash",
+        "a64fx/glm5/run_glm53f_12n.sh",
+        "benchmark",
+        "tmp/prompt8k.ids",
+        "/vol0006/mdt0/data/hp250467/work/gemm/glm53f-strata-20261001/tmp/strata-mtp-batch-20261003/results/packed-prefill.ids",
+        "--prefill-chunk",
+        "4096",
+        "--transitions",
+        "256",
+        "--repetitions",
+        "3",
+        "--decode-executor",
+        "persistent",
+        "--router-kernel",
+        "fused",
+        "--verify-kernel",
+        "grouped",
+        "--moe-combine-kernel",
+        "vector",
+        "--index-kernel",
+        "heads",
+        "--mla-kernel",
+        "fp16-cache",
+        "--pool-selector",
+        "partition4k",
+        "--q8-row-kernel",
+        "rows4",
+        "--q8-prefill-kernel",
+        "tile4x4",
+        "--mla-projection-kernel",
+        "legacy",
+        "--embedding-batch-kernel",
+        "packed",
+        "--verify-head-kernel",
+        "legacy"
+      ],
+      "variant": null,
+      "state": false,
+      "baseline": false
+    },
+    "full-state-gate": {
+      "argv": [
+        "bash",
+        "a64fx/glm5/run_glm53f_12n.sh",
+        "benchmark",
+        "tmp/prompt8k.ids",
+        "/vol0006/mdt0/data/hp250467/work/gemm/glm53f-strata-20261001/tmp/strata-mtp-batch-20261003/results/full-state-gate.ids",
+        "--prefill-chunk",
+        "4096",
+        "--transitions",
+        "128",
+        "--repetitions",
+        "1",
+        "--decode-executor",
+        "persistent",
+        "--router-kernel",
+        "fused",
+        "--verify-kernel",
+        "grouped",
+        "--moe-combine-kernel",
+        "vector",
+        "--index-kernel",
+        "heads",
+        "--mla-kernel",
+        "fp16-cache",
+        "--pool-selector",
+        "partition4k",
+        "--q8-row-kernel",
+        "rows4",
+        "--q8-prefill-kernel",
+        "tile4x4",
+        "--mla-projection-kernel",
+        "legacy",
+        "--embedding-batch-kernel",
+        "packed",
+        "--verify-head-kernel",
+        "shared",
+        "--speculation",
+        "mtp",
+        "--draft-depth",
+        "4",
+        "--spec-policy",
+        "always",
+        "--mtp-prime-batch",
+        "64",
+        "--mtp-routed-stage",
+        "/local/glm53f-mtp-routed-52128881",
+        "--mtp-shared-stage",
+        "/local/glm53f-mtp-shared-52128881",
+        "--decode-state-check",
+        "/vol0006/mdt0/data/hp250467/work/gemm/glm53f-strata-20261001/tmp/strata-mtp-batch-20261003/results/full-state-gate.state"
+      ],
+      "variant": {
+        "source": "mtp",
+        "depth": 4,
+        "policy": "always",
+        "prime": 64,
+        "shared": true
+      },
+      "state": true,
+      "baseline": false
+    },
+    "mtp-scalar-d1": {
+      "argv": [
+        "bash",
+        "a64fx/glm5/run_glm53f_12n.sh",
+        "benchmark",
+        "tmp/prompt8k.ids",
+        "/vol0006/mdt0/data/hp250467/work/gemm/glm53f-strata-20261001/tmp/strata-mtp-batch-20261003/results/mtp-scalar-d1.ids",
+        "--prefill-chunk",
+        "4096",
+        "--transitions",
+        "256",
+        "--repetitions",
+        "3",
+        "--decode-executor",
+        "persistent",
+        "--router-kernel",
+        "fused",
+        "--verify-kernel",
+        "grouped",
+        "--moe-combine-kernel",
+        "vector",
+        "--index-kernel",
+        "heads",
+        "--mla-kernel",
+        "fp16-cache",
+        "--pool-selector",
+        "partition4k",
+        "--q8-row-kernel",
+        "rows4",
+        "--q8-prefill-kernel",
+        "tile4x4",
+        "--mla-projection-kernel",
+        "legacy",
+        "--embedding-batch-kernel",
+        "packed",
+        "--verify-head-kernel",
+        "legacy",
+        "--speculation",
+        "mtp",
+        "--draft-depth",
+        "1",
+        "--spec-policy",
+        "always",
+        "--mtp-prime-batch",
+        "1",
+        "--mtp-routed-stage",
+        "/local/glm53f-mtp-routed-52128881",
+        "--mtp-shared-stage",
+        "/local/glm53f-mtp-shared-52128881"
+      ],
+      "variant": {
+        "source": "mtp",
+        "depth": 1,
+        "policy": "always",
+        "prime": 1,
+        "shared": false
+      },
+      "state": false,
+      "baseline": false
+    },
+    "mtp-batch-d1": {
+      "argv": [
+        "bash",
+        "a64fx/glm5/run_glm53f_12n.sh",
+        "benchmark",
+        "tmp/prompt8k.ids",
+        "/vol0006/mdt0/data/hp250467/work/gemm/glm53f-strata-20261001/tmp/strata-mtp-batch-20261003/results/mtp-batch-d1.ids",
+        "--prefill-chunk",
+        "4096",
+        "--transitions",
+        "256",
+        "--repetitions",
+        "3",
+        "--decode-executor",
+        "persistent",
+        "--router-kernel",
+        "fused",
+        "--verify-kernel",
+        "grouped",
+        "--moe-combine-kernel",
+        "vector",
+        "--index-kernel",
+        "heads",
+        "--mla-kernel",
+        "fp16-cache",
+        "--pool-selector",
+        "partition4k",
+        "--q8-row-kernel",
+        "rows4",
+        "--q8-prefill-kernel",
+        "tile4x4",
+        "--mla-projection-kernel",
+        "legacy",
+        "--embedding-batch-kernel",
+        "packed",
+        "--verify-head-kernel",
+        "legacy",
+        "--speculation",
+        "mtp",
+        "--draft-depth",
+        "1",
+        "--spec-policy",
+        "always",
+        "--mtp-prime-batch",
+        "64",
+        "--mtp-routed-stage",
+        "/local/glm53f-mtp-routed-52128881",
+        "--mtp-shared-stage",
+        "/local/glm53f-mtp-shared-52128881"
+      ],
+      "variant": {
+        "source": "mtp",
+        "depth": 1,
+        "policy": "always",
+        "prime": 64,
+        "shared": false
+      },
+      "state": false,
+      "baseline": false
+    },
+    "mtp-shared-d1": {
+      "argv": [
+        "bash",
+        "a64fx/glm5/run_glm53f_12n.sh",
+        "benchmark",
+        "tmp/prompt8k.ids",
+        "/vol0006/mdt0/data/hp250467/work/gemm/glm53f-strata-20261001/tmp/strata-mtp-batch-20261003/results/mtp-shared-d1.ids",
+        "--prefill-chunk",
+        "4096",
+        "--transitions",
+        "256",
+        "--repetitions",
+        "3",
+        "--decode-executor",
+        "persistent",
+        "--router-kernel",
+        "fused",
+        "--verify-kernel",
+        "grouped",
+        "--moe-combine-kernel",
+        "vector",
+        "--index-kernel",
+        "heads",
+        "--mla-kernel",
+        "fp16-cache",
+        "--pool-selector",
+        "partition4k",
+        "--q8-row-kernel",
+        "rows4",
+        "--q8-prefill-kernel",
+        "tile4x4",
+        "--mla-projection-kernel",
+        "legacy",
+        "--embedding-batch-kernel",
+        "packed",
+        "--verify-head-kernel",
+        "shared",
+        "--speculation",
+        "mtp",
+        "--draft-depth",
+        "1",
+        "--spec-policy",
+        "always",
+        "--mtp-prime-batch",
+        "64",
+        "--mtp-routed-stage",
+        "/local/glm53f-mtp-routed-52128881",
+        "--mtp-shared-stage",
+        "/local/glm53f-mtp-shared-52128881"
+      ],
+      "variant": {
+        "source": "mtp",
+        "depth": 1,
+        "policy": "always",
+        "prime": 64,
+        "shared": true
+      },
+      "state": false,
+      "baseline": false
+    },
+    "mtp-shared-d2-adaptive": {
+      "argv": [
+        "bash",
+        "a64fx/glm5/run_glm53f_12n.sh",
+        "benchmark",
+        "tmp/prompt8k.ids",
+        "/vol0006/mdt0/data/hp250467/work/gemm/glm53f-strata-20261001/tmp/strata-mtp-batch-20261003/results/mtp-shared-d2-adaptive.ids",
+        "--prefill-chunk",
+        "4096",
+        "--transitions",
+        "256",
+        "--repetitions",
+        "3",
+        "--decode-executor",
+        "persistent",
+        "--router-kernel",
+        "fused",
+        "--verify-kernel",
+        "grouped",
+        "--moe-combine-kernel",
+        "vector",
+        "--index-kernel",
+        "heads",
+        "--mla-kernel",
+        "fp16-cache",
+        "--pool-selector",
+        "partition4k",
+        "--q8-row-kernel",
+        "rows4",
+        "--q8-prefill-kernel",
+        "tile4x4",
+        "--mla-projection-kernel",
+        "legacy",
+        "--embedding-batch-kernel",
+        "packed",
+        "--verify-head-kernel",
+        "shared",
+        "--speculation",
+        "mtp",
+        "--draft-depth",
+        "2",
+        "--spec-policy",
+        "adaptive",
+        "--mtp-prime-batch",
+        "64",
+        "--mtp-routed-stage",
+        "/local/glm53f-mtp-routed-52128881",
+        "--mtp-shared-stage",
+        "/local/glm53f-mtp-shared-52128881"
+      ],
+      "variant": {
+        "source": "mtp",
+        "depth": 2,
+        "policy": "adaptive",
+        "prime": 64,
+        "shared": true
+      },
+      "state": false,
+      "baseline": false
+    },
+    "mtp-shared-d4-adaptive": {
+      "argv": [
+        "bash",
+        "a64fx/glm5/run_glm53f_12n.sh",
+        "benchmark",
+        "tmp/prompt8k.ids",
+        "/vol0006/mdt0/data/hp250467/work/gemm/glm53f-strata-20261001/tmp/strata-mtp-batch-20261003/results/mtp-shared-d4-adaptive.ids",
+        "--prefill-chunk",
+        "4096",
+        "--transitions",
+        "256",
+        "--repetitions",
+        "3",
+        "--decode-executor",
+        "persistent",
+        "--router-kernel",
+        "fused",
+        "--verify-kernel",
+        "grouped",
+        "--moe-combine-kernel",
+        "vector",
+        "--index-kernel",
+        "heads",
+        "--mla-kernel",
+        "fp16-cache",
+        "--pool-selector",
+        "partition4k",
+        "--q8-row-kernel",
+        "rows4",
+        "--q8-prefill-kernel",
+        "tile4x4",
+        "--mla-projection-kernel",
+        "legacy",
+        "--embedding-batch-kernel",
+        "packed",
+        "--verify-head-kernel",
+        "shared",
+        "--speculation",
+        "mtp",
+        "--draft-depth",
+        "4",
+        "--spec-policy",
+        "adaptive",
+        "--mtp-prime-batch",
+        "64",
+        "--mtp-routed-stage",
+        "/local/glm53f-mtp-routed-52128881",
+        "--mtp-shared-stage",
+        "/local/glm53f-mtp-shared-52128881"
+      ],
+      "variant": {
+        "source": "mtp",
+        "depth": 4,
+        "policy": "adaptive",
+        "prime": 64,
+        "shared": true
+      },
+      "state": false,
+      "baseline": false
+    },
+    "lookup-shared-d4-adaptive": {
+      "argv": [
+        "bash",
+        "a64fx/glm5/run_glm53f_12n.sh",
+        "benchmark",
+        "tmp/prompt8k.ids",
+        "/vol0006/mdt0/data/hp250467/work/gemm/glm53f-strata-20261001/tmp/strata-mtp-batch-20261003/results/lookup-shared-d4-adaptive.ids",
+        "--prefill-chunk",
+        "4096",
+        "--transitions",
+        "256",
+        "--repetitions",
+        "3",
+        "--decode-executor",
+        "persistent",
+        "--router-kernel",
+        "fused",
+        "--verify-kernel",
+        "grouped",
+        "--moe-combine-kernel",
+        "vector",
+        "--index-kernel",
+        "heads",
+        "--mla-kernel",
+        "fp16-cache",
+        "--pool-selector",
+        "partition4k",
+        "--q8-row-kernel",
+        "rows4",
+        "--q8-prefill-kernel",
+        "tile4x4",
+        "--mla-projection-kernel",
+        "legacy",
+        "--embedding-batch-kernel",
+        "packed",
+        "--verify-head-kernel",
+        "shared",
+        "--speculation",
+        "lookup",
+        "--draft-depth",
+        "4",
+        "--spec-policy",
+        "adaptive"
+      ],
+      "variant": {
+        "source": "lookup",
+        "depth": 4,
+        "policy": "adaptive",
+        "shared": true
+      },
+      "state": false,
+      "baseline": false
+    },
+    "lookup-shared-d4-always": {
+      "argv": [
+        "bash",
+        "a64fx/glm5/run_glm53f_12n.sh",
+        "benchmark",
+        "tmp/prompt8k.ids",
+        "/vol0006/mdt0/data/hp250467/work/gemm/glm53f-strata-20261001/tmp/strata-mtp-batch-20261003/results/lookup-shared-d4-always.ids",
+        "--prefill-chunk",
+        "4096",
+        "--transitions",
+        "256",
+        "--repetitions",
+        "3",
+        "--decode-executor",
+        "persistent",
+        "--router-kernel",
+        "fused",
+        "--verify-kernel",
+        "grouped",
+        "--moe-combine-kernel",
+        "vector",
+        "--index-kernel",
+        "heads",
+        "--mla-kernel",
+        "fp16-cache",
+        "--pool-selector",
+        "partition4k",
+        "--q8-row-kernel",
+        "rows4",
+        "--q8-prefill-kernel",
+        "tile4x4",
+        "--mla-projection-kernel",
+        "legacy",
+        "--embedding-batch-kernel",
+        "packed",
+        "--verify-head-kernel",
+        "shared",
+        "--speculation",
+        "lookup",
+        "--draft-depth",
+        "4",
+        "--spec-policy",
+        "always"
+      ],
+      "variant": {
+        "source": "lookup",
+        "depth": 4,
+        "policy": "always",
+        "shared": true
+      },
+      "state": false,
+      "baseline": false
+    },
+    "long1024-control": {
+      "argv": [
+        "bash",
+        "a64fx/glm5/run_glm53f_12n.sh",
+        "benchmark",
+        "tmp/prompt8k.ids",
+        "/vol0006/mdt0/data/hp250467/work/gemm/glm53f-strata-20261001/tmp/strata-mtp-batch-20261003/results/long1024-control.ids",
+        "--prefill-chunk",
+        "4096",
+        "--transitions",
+        "1024",
+        "--repetitions",
+        "3",
+        "--decode-executor",
+        "persistent",
+        "--router-kernel",
+        "fused",
+        "--verify-kernel",
+        "grouped",
+        "--moe-combine-kernel",
+        "vector",
+        "--index-kernel",
+        "heads",
+        "--mla-kernel",
+        "fp16-cache",
+        "--pool-selector",
+        "partition4k",
+        "--q8-row-kernel",
+        "rows4",
+        "--q8-prefill-kernel",
+        "tile4x4",
+        "--mla-projection-kernel",
+        "legacy"
+      ],
+      "variant": null,
+      "state": false,
+      "baseline": true
+    },
+    "long1024-mtp": {
+      "argv": [
+        "bash",
+        "a64fx/glm5/run_glm53f_12n.sh",
+        "benchmark",
+        "tmp/prompt8k.ids",
+        "/vol0006/mdt0/data/hp250467/work/gemm/glm53f-strata-20261001/tmp/strata-mtp-batch-20261003/results/long1024-mtp.ids",
+        "--prefill-chunk",
+        "4096",
+        "--transitions",
+        "1024",
+        "--repetitions",
+        "3",
+        "--decode-executor",
+        "persistent",
+        "--router-kernel",
+        "fused",
+        "--verify-kernel",
+        "grouped",
+        "--moe-combine-kernel",
+        "vector",
+        "--index-kernel",
+        "heads",
+        "--mla-kernel",
+        "fp16-cache",
+        "--pool-selector",
+        "partition4k",
+        "--q8-row-kernel",
+        "rows4",
+        "--q8-prefill-kernel",
+        "tile4x4",
+        "--mla-projection-kernel",
+        "legacy",
+        "--embedding-batch-kernel",
+        "packed",
+        "--verify-head-kernel",
+        "shared",
+        "--speculation",
+        "mtp",
+        "--draft-depth",
+        "1",
+        "--spec-policy",
+        "adaptive",
+        "--mtp-prime-batch",
+        "64",
+        "--mtp-routed-stage",
+        "/local/glm53f-mtp-routed-52128881",
+        "--mtp-shared-stage",
+        "/local/glm53f-mtp-shared-52128881"
+      ],
+      "variant": {
+        "source": "mtp",
+        "depth": 1,
+        "policy": "adaptive",
+        "prime": 64,
+        "shared": true
+      },
+      "state": false,
+      "baseline": false
+    },
+    "long1024-mtp-always": {
+      "argv": [
+        "bash",
+        "a64fx/glm5/run_glm53f_12n.sh",
+        "benchmark",
+        "tmp/prompt8k.ids",
+        "/vol0006/mdt0/data/hp250467/work/gemm/glm53f-strata-20261001/tmp/strata-mtp-batch-20261003/results/long1024-mtp-always.ids",
+        "--prefill-chunk",
+        "4096",
+        "--transitions",
+        "1024",
+        "--repetitions",
+        "3",
+        "--decode-executor",
+        "persistent",
+        "--router-kernel",
+        "fused",
+        "--verify-kernel",
+        "grouped",
+        "--moe-combine-kernel",
+        "vector",
+        "--index-kernel",
+        "heads",
+        "--mla-kernel",
+        "fp16-cache",
+        "--pool-selector",
+        "partition4k",
+        "--q8-row-kernel",
+        "rows4",
+        "--q8-prefill-kernel",
+        "tile4x4",
+        "--mla-projection-kernel",
+        "legacy",
+        "--embedding-batch-kernel",
+        "packed",
+        "--verify-head-kernel",
+        "shared",
+        "--speculation",
+        "mtp",
+        "--draft-depth",
+        "1",
+        "--spec-policy",
+        "always",
+        "--mtp-prime-batch",
+        "64",
+        "--mtp-routed-stage",
+        "/local/glm53f-mtp-routed-52128881",
+        "--mtp-shared-stage",
+        "/local/glm53f-mtp-shared-52128881"
+      ],
+      "variant": {
+        "source": "mtp",
+        "depth": 1,
+        "policy": "always",
+        "prime": 64,
+        "shared": true
+      },
+      "state": false,
+      "baseline": false
+    },
+    "mtp-feature-confirm-0-0": {
+      "argv": [
+        "bash",
+        "a64fx/glm5/run_glm53f_12n.sh",
+        "benchmark",
+        "tmp/prompt8k.ids",
+        "/vol0006/mdt0/data/hp250467/work/gemm/glm53f-strata-20261001/tmp/strata-mtp-batch-20261003/results/mtp-feature-confirm-0-0.ids",
+        "--prefill-chunk",
+        "4096",
+        "--transitions",
+        "256",
+        "--repetitions",
+        "1",
+        "--decode-executor",
+        "persistent",
+        "--router-kernel",
+        "fused",
+        "--verify-kernel",
+        "grouped",
+        "--moe-combine-kernel",
+        "vector",
+        "--index-kernel",
+        "heads",
+        "--mla-kernel",
+        "fp16-cache",
+        "--pool-selector",
+        "partition4k",
+        "--q8-row-kernel",
+        "rows4",
+        "--q8-prefill-kernel",
+        "tile4x4",
+        "--mla-projection-kernel",
+        "legacy",
+        "--embedding-batch-kernel",
+        "packed",
+        "--verify-head-kernel",
+        "legacy",
+        "--speculation",
+        "mtp",
+        "--draft-depth",
+        "1",
+        "--spec-policy",
+        "always",
+        "--mtp-prime-batch",
+        "1",
+        "--mtp-routed-stage",
+        "/local/glm53f-mtp-routed-52128881",
+        "--mtp-shared-stage",
+        "/local/glm53f-mtp-shared-52128881"
+      ],
+      "variant": {
+        "source": "mtp",
+        "depth": 1,
+        "policy": "always",
+        "prime": 1,
+        "shared": false
+      },
+      "state": false,
+      "baseline": false
+    },
+    "mtp-feature-confirm-0-1": {
+      "argv": [
+        "bash",
+        "a64fx/glm5/run_glm53f_12n.sh",
+        "benchmark",
+        "tmp/prompt8k.ids",
+        "/vol0006/mdt0/data/hp250467/work/gemm/glm53f-strata-20261001/tmp/strata-mtp-batch-20261003/results/mtp-feature-confirm-0-1.ids",
+        "--prefill-chunk",
+        "4096",
+        "--transitions",
+        "256",
+        "--repetitions",
+        "1",
+        "--decode-executor",
+        "persistent",
+        "--router-kernel",
+        "fused",
+        "--verify-kernel",
+        "grouped",
+        "--moe-combine-kernel",
+        "vector",
+        "--index-kernel",
+        "heads",
+        "--mla-kernel",
+        "fp16-cache",
+        "--pool-selector",
+        "partition4k",
+        "--q8-row-kernel",
+        "rows4",
+        "--q8-prefill-kernel",
+        "tile4x4",
+        "--mla-projection-kernel",
+        "legacy",
+        "--embedding-batch-kernel",
+        "packed",
+        "--verify-head-kernel",
+        "shared",
+        "--speculation",
+        "mtp",
+        "--draft-depth",
+        "1",
+        "--spec-policy",
+        "always",
+        "--mtp-prime-batch",
+        "64",
+        "--mtp-routed-stage",
+        "/local/glm53f-mtp-routed-52128881",
+        "--mtp-shared-stage",
+        "/local/glm53f-mtp-shared-52128881"
+      ],
+      "variant": {
+        "source": "mtp",
+        "depth": 1,
+        "policy": "always",
+        "prime": 64,
+        "shared": true
+      },
+      "state": false,
+      "baseline": false
+    },
+    "mtp-feature-confirm-1-1": {
+      "argv": [
+        "bash",
+        "a64fx/glm5/run_glm53f_12n.sh",
+        "benchmark",
+        "tmp/prompt8k.ids",
+        "/vol0006/mdt0/data/hp250467/work/gemm/glm53f-strata-20261001/tmp/strata-mtp-batch-20261003/results/mtp-feature-confirm-1-1.ids",
+        "--prefill-chunk",
+        "4096",
+        "--transitions",
+        "256",
+        "--repetitions",
+        "1",
+        "--decode-executor",
+        "persistent",
+        "--router-kernel",
+        "fused",
+        "--verify-kernel",
+        "grouped",
+        "--moe-combine-kernel",
+        "vector",
+        "--index-kernel",
+        "heads",
+        "--mla-kernel",
+        "fp16-cache",
+        "--pool-selector",
+        "partition4k",
+        "--q8-row-kernel",
+        "rows4",
+        "--q8-prefill-kernel",
+        "tile4x4",
+        "--mla-projection-kernel",
+        "legacy",
+        "--embedding-batch-kernel",
+        "packed",
+        "--verify-head-kernel",
+        "shared",
+        "--speculation",
+        "mtp",
+        "--draft-depth",
+        "1",
+        "--spec-policy",
+        "always",
+        "--mtp-prime-batch",
+        "64",
+        "--mtp-routed-stage",
+        "/local/glm53f-mtp-routed-52128881",
+        "--mtp-shared-stage",
+        "/local/glm53f-mtp-shared-52128881"
+      ],
+      "variant": {
+        "source": "mtp",
+        "depth": 1,
+        "policy": "always",
+        "prime": 64,
+        "shared": true
+      },
+      "state": false,
+      "baseline": false
+    },
+    "mtp-feature-confirm-1-0": {
+      "argv": [
+        "bash",
+        "a64fx/glm5/run_glm53f_12n.sh",
+        "benchmark",
+        "tmp/prompt8k.ids",
+        "/vol0006/mdt0/data/hp250467/work/gemm/glm53f-strata-20261001/tmp/strata-mtp-batch-20261003/results/mtp-feature-confirm-1-0.ids",
+        "--prefill-chunk",
+        "4096",
+        "--transitions",
+        "256",
+        "--repetitions",
+        "1",
+        "--decode-executor",
+        "persistent",
+        "--router-kernel",
+        "fused",
+        "--verify-kernel",
+        "grouped",
+        "--moe-combine-kernel",
+        "vector",
+        "--index-kernel",
+        "heads",
+        "--mla-kernel",
+        "fp16-cache",
+        "--pool-selector",
+        "partition4k",
+        "--q8-row-kernel",
+        "rows4",
+        "--q8-prefill-kernel",
+        "tile4x4",
+        "--mla-projection-kernel",
+        "legacy",
+        "--embedding-batch-kernel",
+        "packed",
+        "--verify-head-kernel",
+        "legacy",
+        "--speculation",
+        "mtp",
+        "--draft-depth",
+        "1",
+        "--spec-policy",
+        "always",
+        "--mtp-prime-batch",
+        "1",
+        "--mtp-routed-stage",
+        "/local/glm53f-mtp-routed-52128881",
+        "--mtp-shared-stage",
+        "/local/glm53f-mtp-shared-52128881"
+      ],
+      "variant": {
+        "source": "mtp",
+        "depth": 1,
+        "policy": "always",
+        "prime": 1,
+        "shared": false
+      },
+      "state": false,
+      "baseline": false
+    },
+    "mtp-feature-confirm-2-0": {
+      "argv": [
+        "bash",
+        "a64fx/glm5/run_glm53f_12n.sh",
+        "benchmark",
+        "tmp/prompt8k.ids",
+        "/vol0006/mdt0/data/hp250467/work/gemm/glm53f-strata-20261001/tmp/strata-mtp-batch-20261003/results/mtp-feature-confirm-2-0.ids",
+        "--prefill-chunk",
+        "4096",
+        "--transitions",
+        "256",
+        "--repetitions",
+        "1",
+        "--decode-executor",
+        "persistent",
+        "--router-kernel",
+        "fused",
+        "--verify-kernel",
+        "grouped",
+        "--moe-combine-kernel",
+        "vector",
+        "--index-kernel",
+        "heads",
+        "--mla-kernel",
+        "fp16-cache",
+        "--pool-selector",
+        "partition4k",
+        "--q8-row-kernel",
+        "rows4",
+        "--q8-prefill-kernel",
+        "tile4x4",
+        "--mla-projection-kernel",
+        "legacy",
+        "--embedding-batch-kernel",
+        "packed",
+        "--verify-head-kernel",
+        "legacy",
+        "--speculation",
+        "mtp",
+        "--draft-depth",
+        "1",
+        "--spec-policy",
+        "always",
+        "--mtp-prime-batch",
+        "1",
+        "--mtp-routed-stage",
+        "/local/glm53f-mtp-routed-52128881",
+        "--mtp-shared-stage",
+        "/local/glm53f-mtp-shared-52128881"
+      ],
+      "variant": {
+        "source": "mtp",
+        "depth": 1,
+        "policy": "always",
+        "prime": 1,
+        "shared": false
+      },
+      "state": false,
+      "baseline": false
+    },
+    "mtp-feature-confirm-2-1": {
+      "argv": [
+        "bash",
+        "a64fx/glm5/run_glm53f_12n.sh",
+        "benchmark",
+        "tmp/prompt8k.ids",
+        "/vol0006/mdt0/data/hp250467/work/gemm/glm53f-strata-20261001/tmp/strata-mtp-batch-20261003/results/mtp-feature-confirm-2-1.ids",
+        "--prefill-chunk",
+        "4096",
+        "--transitions",
+        "256",
+        "--repetitions",
+        "1",
+        "--decode-executor",
+        "persistent",
+        "--router-kernel",
+        "fused",
+        "--verify-kernel",
+        "grouped",
+        "--moe-combine-kernel",
+        "vector",
+        "--index-kernel",
+        "heads",
+        "--mla-kernel",
+        "fp16-cache",
+        "--pool-selector",
+        "partition4k",
+        "--q8-row-kernel",
+        "rows4",
+        "--q8-prefill-kernel",
+        "tile4x4",
+        "--mla-projection-kernel",
+        "legacy",
+        "--embedding-batch-kernel",
+        "packed",
+        "--verify-head-kernel",
+        "shared",
+        "--speculation",
+        "mtp",
+        "--draft-depth",
+        "1",
+        "--spec-policy",
+        "always",
+        "--mtp-prime-batch",
+        "64",
+        "--mtp-routed-stage",
+        "/local/glm53f-mtp-routed-52128881",
+        "--mtp-shared-stage",
+        "/local/glm53f-mtp-shared-52128881"
+      ],
+      "variant": {
+        "source": "mtp",
+        "depth": 1,
+        "policy": "always",
+        "prime": 64,
+        "shared": true
+      },
+      "state": false,
+      "baseline": false
+    },
+    "mtp-feature-confirm-3-1": {
+      "argv": [
+        "bash",
+        "a64fx/glm5/run_glm53f_12n.sh",
+        "benchmark",
+        "tmp/prompt8k.ids",
+        "/vol0006/mdt0/data/hp250467/work/gemm/glm53f-strata-20261001/tmp/strata-mtp-batch-20261003/results/mtp-feature-confirm-3-1.ids",
+        "--prefill-chunk",
+        "4096",
+        "--transitions",
+        "256",
+        "--repetitions",
+        "1",
+        "--decode-executor",
+        "persistent",
+        "--router-kernel",
+        "fused",
+        "--verify-kernel",
+        "grouped",
+        "--moe-combine-kernel",
+        "vector",
+        "--index-kernel",
+        "heads",
+        "--mla-kernel",
+        "fp16-cache",
+        "--pool-selector",
+        "partition4k",
+        "--q8-row-kernel",
+        "rows4",
+        "--q8-prefill-kernel",
+        "tile4x4",
+        "--mla-projection-kernel",
+        "legacy",
+        "--embedding-batch-kernel",
+        "packed",
+        "--verify-head-kernel",
+        "shared",
+        "--speculation",
+        "mtp",
+        "--draft-depth",
+        "1",
+        "--spec-policy",
+        "always",
+        "--mtp-prime-batch",
+        "64",
+        "--mtp-routed-stage",
+        "/local/glm53f-mtp-routed-52128881",
+        "--mtp-shared-stage",
+        "/local/glm53f-mtp-shared-52128881"
+      ],
+      "variant": {
+        "source": "mtp",
+        "depth": 1,
+        "policy": "always",
+        "prime": 64,
+        "shared": true
+      },
+      "state": false,
+      "baseline": false
+    },
+    "mtp-feature-confirm-3-0": {
+      "argv": [
+        "bash",
+        "a64fx/glm5/run_glm53f_12n.sh",
+        "benchmark",
+        "tmp/prompt8k.ids",
+        "/vol0006/mdt0/data/hp250467/work/gemm/glm53f-strata-20261001/tmp/strata-mtp-batch-20261003/results/mtp-feature-confirm-3-0.ids",
+        "--prefill-chunk",
+        "4096",
+        "--transitions",
+        "256",
+        "--repetitions",
+        "1",
+        "--decode-executor",
+        "persistent",
+        "--router-kernel",
+        "fused",
+        "--verify-kernel",
+        "grouped",
+        "--moe-combine-kernel",
+        "vector",
+        "--index-kernel",
+        "heads",
+        "--mla-kernel",
+        "fp16-cache",
+        "--pool-selector",
+        "partition4k",
+        "--q8-row-kernel",
+        "rows4",
+        "--q8-prefill-kernel",
+        "tile4x4",
+        "--mla-projection-kernel",
+        "legacy",
+        "--embedding-batch-kernel",
+        "packed",
+        "--verify-head-kernel",
+        "legacy",
+        "--speculation",
+        "mtp",
+        "--draft-depth",
+        "1",
+        "--spec-policy",
+        "always",
+        "--mtp-prime-batch",
+        "1",
+        "--mtp-routed-stage",
+        "/local/glm53f-mtp-routed-52128881",
+        "--mtp-shared-stage",
+        "/local/glm53f-mtp-shared-52128881"
+      ],
+      "variant": {
+        "source": "mtp",
+        "depth": 1,
+        "policy": "always",
+        "prime": 1,
+        "shared": false
+      },
+      "state": false,
+      "baseline": false
+    },
+    "mtp-feature-confirm-4-0": {
+      "argv": [
+        "bash",
+        "a64fx/glm5/run_glm53f_12n.sh",
+        "benchmark",
+        "tmp/prompt8k.ids",
+        "/vol0006/mdt0/data/hp250467/work/gemm/glm53f-strata-20261001/tmp/strata-mtp-batch-20261003/results/mtp-feature-confirm-4-0.ids",
+        "--prefill-chunk",
+        "4096",
+        "--transitions",
+        "256",
+        "--repetitions",
+        "1",
+        "--decode-executor",
+        "persistent",
+        "--router-kernel",
+        "fused",
+        "--verify-kernel",
+        "grouped",
+        "--moe-combine-kernel",
+        "vector",
+        "--index-kernel",
+        "heads",
+        "--mla-kernel",
+        "fp16-cache",
+        "--pool-selector",
+        "partition4k",
+        "--q8-row-kernel",
+        "rows4",
+        "--q8-prefill-kernel",
+        "tile4x4",
+        "--mla-projection-kernel",
+        "legacy",
+        "--embedding-batch-kernel",
+        "packed",
+        "--verify-head-kernel",
+        "legacy",
+        "--speculation",
+        "mtp",
+        "--draft-depth",
+        "1",
+        "--spec-policy",
+        "always",
+        "--mtp-prime-batch",
+        "1",
+        "--mtp-routed-stage",
+        "/local/glm53f-mtp-routed-52128881",
+        "--mtp-shared-stage",
+        "/local/glm53f-mtp-shared-52128881"
+      ],
+      "variant": {
+        "source": "mtp",
+        "depth": 1,
+        "policy": "always",
+        "prime": 1,
+        "shared": false
+      },
+      "state": false,
+      "baseline": false
+    },
+    "mtp-feature-confirm-4-1": {
+      "argv": [
+        "bash",
+        "a64fx/glm5/run_glm53f_12n.sh",
+        "benchmark",
+        "tmp/prompt8k.ids",
+        "/vol0006/mdt0/data/hp250467/work/gemm/glm53f-strata-20261001/tmp/strata-mtp-batch-20261003/results/mtp-feature-confirm-4-1.ids",
+        "--prefill-chunk",
+        "4096",
+        "--transitions",
+        "256",
+        "--repetitions",
+        "1",
+        "--decode-executor",
+        "persistent",
+        "--router-kernel",
+        "fused",
+        "--verify-kernel",
+        "grouped",
+        "--moe-combine-kernel",
+        "vector",
+        "--index-kernel",
+        "heads",
+        "--mla-kernel",
+        "fp16-cache",
+        "--pool-selector",
+        "partition4k",
+        "--q8-row-kernel",
+        "rows4",
+        "--q8-prefill-kernel",
+        "tile4x4",
+        "--mla-projection-kernel",
+        "legacy",
+        "--embedding-batch-kernel",
+        "packed",
+        "--verify-head-kernel",
+        "shared",
+        "--speculation",
+        "mtp",
+        "--draft-depth",
+        "1",
+        "--spec-policy",
+        "always",
+        "--mtp-prime-batch",
+        "64",
+        "--mtp-routed-stage",
+        "/local/glm53f-mtp-routed-52128881",
+        "--mtp-shared-stage",
+        "/local/glm53f-mtp-shared-52128881"
+      ],
+      "variant": {
+        "source": "mtp",
+        "depth": 1,
+        "policy": "always",
+        "prime": 64,
+        "shared": true
+      },
+      "state": false,
+      "baseline": false
+    }
+  },
+  "campaign": {
+    "status": "screen_and_long_generation_complete",
+    "promoted": false,
+    "targets_met": false,
+    "allocation": 52128881,
+    "prefill_includes_mtp_teacher_forcing": true,
+    "screens": {
+      "mtp-scalar-d1": {
+        "prefill_ratio": 0.8921198710499801,
+        "decode_ratio": 0.9586655446897795
+      },
+      "mtp-batch-d1": {
+        "prefill_ratio": 0.9476495526161579,
+        "decode_ratio": 0.9502048044274671
+      },
+      "mtp-shared-d1": {
+        "prefill_ratio": 0.9524347311669578,
+        "decode_ratio": 0.9624187677908087
+      },
+      "mtp-shared-d2-adaptive": {
+        "prefill_ratio": 0.946134572766788,
+        "decode_ratio": 0.9300941291875157
+      },
+      "mtp-shared-d4-adaptive": {
+        "prefill_ratio": 0.9452465023845195,
+        "decode_ratio": 0.8587032990557464
+      },
+      "lookup-shared-d4-adaptive": {
+        "prefill_ratio": 0.9942889634814134,
+        "decode_ratio": 0.9603399619700381
+      },
+      "lookup-shared-d4-always": {
+        "prefill_ratio": 0.9918844905207476,
+        "decode_ratio": 0.8443379143260066
+      }
+    },
+    "confirmation": [],
+    "native_gates": true,
+    "binary_sha256": {
+      "frozen": "938d7b7c7a41aa6c2b9c2a51aecee897a2b423430b4eaf0de4ccddc335db4ec5",
+      "candidate": "d41ef5c447159c2b9c5916d5db4846bd2c7667a7ce6070fa0e10a49f7ad19b6b"
+    },
+    "runs": {
+      "short-state-gate": {
+        "prefill": 275.413231,
+        "decode": 20.574571,
+        "trials": [
+          {
+            "trial": 0,
+            "prompt_tokens": 128,
+            "decode_transitions": 128,
+            "prefill_seconds": 0.464756176,
+            "decode_seconds": 6.221271736,
+            "prefill_tok_s": 275.413231,
+            "decode_tok_s": 20.574571,
+            "minimum_available_kb": 10071168,
+            "tokens_equal": true
+          }
+        ],
+        "variant": {
+          "source": "mtp",
+          "depth": 4,
+          "policy": "always",
+          "prime": 64,
+          "shared": true
+        },
+        "mtp_stats": [
+          {
+            "trial": 0,
+            "depth": 4,
+            "adaptive": 0,
+            "accepted": 75,
+            "proposed": 208,
+            "cycles": 53,
+            "fallback_tokens": 0,
+            "cache_synchronized": 1,
+            "draft_seconds": 0.369208045,
+            "verify_seconds": 5.810029545,
+            "replay_seconds": 0.041221584,
+            "plain_seconds": 0.0
+          }
+        ],
+        "lookup_stats": [
+          {
+            "trial": 0,
+            "lookup": 0,
+            "depth": 4,
+            "adaptive": 0,
+            "accepted": 0,
+            "proposed": 0,
+            "cycles": 0,
+            "fallback_tokens": 0,
+            "lookup_seconds": 0.0,
+            "verify_seconds": 0.0,
+            "rollback_seconds": 0.0,
+            "plain_seconds": 0.0
+          }
+        ],
+        "output_id_count": 129,
+        "output_ids_sha256": "3d761d710296618a4df8c9e0172ac72aa85401f000304a813a2d6bf15286e8c1"
+      },
+      "frozen-control": {
+        "prefill": 410.478727,
+        "decode": 34.978736,
+        "trials": [
+          {
+            "trial": 0,
+            "prompt_tokens": 8049,
+            "decode_transitions": 256,
+            "prefill_seconds": 19.608811539,
+            "decode_seconds": 7.320097694,
+            "prefill_tok_s": 410.478727,
+            "decode_tok_s": 34.972211,
+            "minimum_available_kb": 9350336,
+            "tokens_equal": true
+          },
+          {
+            "trial": 1,
+            "prompt_tokens": 8049,
+            "decode_transitions": 256,
+            "prefill_seconds": 19.600563922,
+            "decode_seconds": 7.317731019,
+            "prefill_tok_s": 410.65145,
+            "decode_tok_s": 34.983521,
+            "minimum_available_kb": 9350336,
+            "tokens_equal": true
+          },
+          {
+            "trial": 2,
+            "prompt_tokens": 8049,
+            "decode_transitions": 256,
+            "prefill_seconds": 19.641958241,
+            "decode_seconds": 7.318732072,
+            "prefill_tok_s": 409.786025,
+            "decode_tok_s": 34.978736,
+            "minimum_available_kb": 9334912,
+            "tokens_equal": true
+          }
+        ],
+        "variant": null,
+        "mtp_stats": [],
+        "lookup_stats": [
+          {
+            "trial": 0,
+            "lookup": 0,
+            "depth": 4,
+            "adaptive": 1,
+            "accepted": 0,
+            "proposed": 0,
+            "cycles": 0,
+            "fallback_tokens": 0,
+            "lookup_seconds": 0.0,
+            "verify_seconds": 0.0,
+            "rollback_seconds": 0.0,
+            "plain_seconds": 0.0
+          },
+          {
+            "trial": 1,
+            "lookup": 0,
+            "depth": 4,
+            "adaptive": 1,
+            "accepted": 0,
+            "proposed": 0,
+            "cycles": 0,
+            "fallback_tokens": 0,
+            "lookup_seconds": 0.0,
+            "verify_seconds": 0.0,
+            "rollback_seconds": 0.0,
+            "plain_seconds": 0.0
+          },
+          {
+            "trial": 2,
+            "lookup": 0,
+            "depth": 4,
+            "adaptive": 1,
+            "accepted": 0,
+            "proposed": 0,
+            "cycles": 0,
+            "fallback_tokens": 0,
+            "lookup_seconds": 0.0,
+            "verify_seconds": 0.0,
+            "rollback_seconds": 0.0,
+            "plain_seconds": 0.0
+          }
+        ],
+        "output_id_count": 257,
+        "output_ids_sha256": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da"
+      },
+      "rebuilt-control": {
+        "prefill": 402.46302,
+        "decode": 34.64702,
+        "trials": [
+          {
+            "trial": 0,
+            "prompt_tokens": 8049,
+            "decode_transitions": 256,
+            "prefill_seconds": 19.999352974,
+            "decode_seconds": 7.388113938,
+            "prefill_tok_s": 402.46302,
+            "decode_tok_s": 34.650251,
+            "minimum_available_kb": 9472576,
+            "tokens_equal": true
+          },
+          {
+            "trial": 1,
+            "prompt_tokens": 8049,
+            "decode_transitions": 256,
+            "prefill_seconds": 19.998192852,
+            "decode_seconds": 7.388802774,
+            "prefill_tok_s": 402.486368,
+            "decode_tok_s": 34.64702,
+            "minimum_available_kb": 9472064,
+            "tokens_equal": true
+          },
+          {
+            "trial": 2,
+            "prompt_tokens": 8049,
+            "decode_transitions": 256,
+            "prefill_seconds": 20.002572175,
+            "decode_seconds": 7.411593021,
+            "prefill_tok_s": 402.398248,
+            "decode_tok_s": 34.540483,
+            "minimum_available_kb": 9462848,
+            "tokens_equal": true
+          }
+        ],
+        "variant": null,
+        "mtp_stats": [],
+        "lookup_stats": [
+          {
+            "trial": 0,
+            "lookup": 0,
+            "depth": 4,
+            "adaptive": 1,
+            "accepted": 0,
+            "proposed": 0,
+            "cycles": 0,
+            "fallback_tokens": 0,
+            "lookup_seconds": 0.0,
+            "verify_seconds": 0.0,
+            "rollback_seconds": 0.0,
+            "plain_seconds": 0.0
+          },
+          {
+            "trial": 1,
+            "lookup": 0,
+            "depth": 4,
+            "adaptive": 1,
+            "accepted": 0,
+            "proposed": 0,
+            "cycles": 0,
+            "fallback_tokens": 0,
+            "lookup_seconds": 0.0,
+            "verify_seconds": 0.0,
+            "rollback_seconds": 0.0,
+            "plain_seconds": 0.0
+          },
+          {
+            "trial": 2,
+            "lookup": 0,
+            "depth": 4,
+            "adaptive": 1,
+            "accepted": 0,
+            "proposed": 0,
+            "cycles": 0,
+            "fallback_tokens": 0,
+            "lookup_seconds": 0.0,
+            "verify_seconds": 0.0,
+            "rollback_seconds": 0.0,
+            "plain_seconds": 0.0
+          }
+        ],
+        "output_id_count": 257,
+        "output_ids_sha256": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da"
+      },
+      "packed-prefill": {
+        "prefill": 407.402491,
+        "decode": 34.490333,
+        "trials": [
+          {
+            "trial": 0,
+            "prompt_tokens": 8049,
+            "decode_transitions": 256,
+            "prefill_seconds": 19.756874759,
+            "decode_seconds": 7.421668655,
+            "prefill_tok_s": 407.402491,
+            "decode_tok_s": 34.493591,
+            "minimum_available_kb": 9403648,
+            "tokens_equal": true
+          },
+          {
+            "trial": 1,
+            "prompt_tokens": 8049,
+            "decode_transitions": 256,
+            "prefill_seconds": 19.758088941,
+            "decode_seconds": 7.42236968,
+            "prefill_tok_s": 407.377456,
+            "decode_tok_s": 34.490333,
+            "minimum_available_kb": 9401728,
+            "tokens_equal": true
+          },
+          {
+            "trial": 2,
+            "prompt_tokens": 8049,
+            "decode_transitions": 256,
+            "prefill_seconds": 19.756611012,
+            "decode_seconds": 7.425686836,
+            "prefill_tok_s": 407.40793,
+            "decode_tok_s": 34.474925,
+            "minimum_available_kb": 9401728,
+            "tokens_equal": true
+          }
+        ],
+        "variant": null,
+        "mtp_stats": [],
+        "lookup_stats": [
+          {
+            "trial": 0,
+            "lookup": 0,
+            "depth": 4,
+            "adaptive": 1,
+            "accepted": 0,
+            "proposed": 0,
+            "cycles": 0,
+            "fallback_tokens": 0,
+            "lookup_seconds": 0.0,
+            "verify_seconds": 0.0,
+            "rollback_seconds": 0.0,
+            "plain_seconds": 0.0
+          },
+          {
+            "trial": 1,
+            "lookup": 0,
+            "depth": 4,
+            "adaptive": 1,
+            "accepted": 0,
+            "proposed": 0,
+            "cycles": 0,
+            "fallback_tokens": 0,
+            "lookup_seconds": 0.0,
+            "verify_seconds": 0.0,
+            "rollback_seconds": 0.0,
+            "plain_seconds": 0.0
+          },
+          {
+            "trial": 2,
+            "lookup": 0,
+            "depth": 4,
+            "adaptive": 1,
+            "accepted": 0,
+            "proposed": 0,
+            "cycles": 0,
+            "fallback_tokens": 0,
+            "lookup_seconds": 0.0,
+            "verify_seconds": 0.0,
+            "rollback_seconds": 0.0,
+            "plain_seconds": 0.0
+          }
+        ],
+        "output_id_count": 257,
+        "output_ids_sha256": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da",
+        "ratio_to_rebuilt_control": {
+          "prefill": 1.0122731052408245,
+          "decode": 0.9954776197202531
+        }
+      },
+      "full-state-gate": {
+        "prefill": 384.041844,
+        "decode": 22.761902,
+        "trials": [
+          {
+            "trial": 0,
+            "prompt_tokens": 8049,
+            "decode_transitions": 128,
+            "prefill_seconds": 20.958653642,
+            "decode_seconds": 5.623431679,
+            "prefill_tok_s": 384.041844,
+            "decode_tok_s": 22.761902,
+            "minimum_available_kb": 8160128,
+            "tokens_equal": true
+          }
+        ],
+        "variant": {
+          "source": "mtp",
+          "depth": 4,
+          "policy": "always",
+          "prime": 64,
+          "shared": true
+        },
+        "mtp_stats": [
+          {
+            "trial": 0,
+            "depth": 4,
+            "adaptive": 0,
+            "accepted": 87,
+            "proposed": 163,
+            "cycles": 41,
+            "fallback_tokens": 0,
+            "cache_synchronized": 1,
+            "draft_seconds": 0.387055547,
+            "verify_seconds": 5.189828516,
+            "replay_seconds": 0.045832104,
+            "plain_seconds": 0.0
+          }
+        ],
+        "lookup_stats": [
+          {
+            "trial": 0,
+            "lookup": 0,
+            "depth": 4,
+            "adaptive": 0,
+            "accepted": 0,
+            "proposed": 0,
+            "cycles": 0,
+            "fallback_tokens": 0,
+            "lookup_seconds": 0.0,
+            "verify_seconds": 0.0,
+            "rollback_seconds": 0.0,
+            "plain_seconds": 0.0
+          }
+        ],
+        "output_id_count": 129,
+        "output_ids_sha256": "d7090eb8a28046417fc662dc19c34f326c59e22f383d7e9131ca922230363b72"
+      },
+      "mtp-scalar-d1": {
+        "prefill": 366.196229,
+        "decode": 33.532909,
+        "trials": [
+          {
+            "trial": 0,
+            "prompt_tokens": 8049,
+            "decode_transitions": 256,
+            "prefill_seconds": 21.980018809,
+            "decode_seconds": 7.634291484,
+            "prefill_tok_s": 366.196229,
+            "decode_tok_s": 33.532909,
+            "minimum_available_kb": 8279872,
+            "tokens_equal": true
+          },
+          {
+            "trial": 1,
+            "prompt_tokens": 8049,
+            "decode_transitions": 256,
+            "prefill_seconds": 21.977716215,
+            "decode_seconds": 7.611388435,
+            "prefill_tok_s": 366.234595,
+            "decode_tok_s": 33.633811,
+            "minimum_available_kb": 8260544,
+            "tokens_equal": true
+          },
+          {
+            "trial": 2,
+            "prompt_tokens": 8049,
+            "decode_transitions": 256,
+            "prefill_seconds": 22.009071448,
+            "decode_seconds": 7.75532489,
+            "prefill_tok_s": 365.712839,
+            "decode_tok_s": 33.009578,
+            "minimum_available_kb": 8258432,
+            "tokens_equal": true
+          }
+        ],
+        "variant": {
+          "source": "mtp",
+          "depth": 1,
+          "policy": "always",
+          "prime": 1,
+          "shared": false
+        },
+        "mtp_stats": [
+          {
+            "trial": 0,
+            "depth": 1,
+            "adaptive": 0,
+            "accepted": 122,
+            "proposed": 133,
+            "cycles": 133,
+            "fallback_tokens": 1,
+            "cache_synchronized": 1,
+            "draft_seconds": 0.288907936,
+            "verify_seconds": 7.222036236,
+            "replay_seconds": 0.091266332,
+            "plain_seconds": 0.030401289
+          },
+          {
+            "trial": 1,
+            "depth": 1,
+            "adaptive": 0,
+            "accepted": 122,
+            "proposed": 133,
+            "cycles": 133,
+            "fallback_tokens": 1,
+            "cache_synchronized": 1,
+            "draft_seconds": 0.287688719,
+            "verify_seconds": 7.200663625,
+            "replay_seconds": 0.090981428,
+            "plain_seconds": 0.030363539
+          },
+          {
+            "trial": 2,
+            "depth": 1,
+            "adaptive": 0,
+            "accepted": 122,
+            "proposed": 133,
+            "cycles": 133,
+            "fallback_tokens": 1,
+            "cache_synchronized": 1,
+            "draft_seconds": 0.289637186,
+            "verify_seconds": 7.343420372,
+            "replay_seconds": 0.090224017,
+            "plain_seconds": 0.030368382
+          }
+        ],
+        "lookup_stats": [
+          {
+            "trial": 0,
+            "lookup": 0,
+            "depth": 1,
+            "adaptive": 0,
+            "accepted": 0,
+            "proposed": 0,
+            "cycles": 0,
+            "fallback_tokens": 0,
+            "lookup_seconds": 0.0,
+            "verify_seconds": 0.0,
+            "rollback_seconds": 0.0,
+            "plain_seconds": 0.0
+          },
+          {
+            "trial": 1,
+            "lookup": 0,
+            "depth": 1,
+            "adaptive": 0,
+            "accepted": 0,
+            "proposed": 0,
+            "cycles": 0,
+            "fallback_tokens": 0,
+            "lookup_seconds": 0.0,
+            "verify_seconds": 0.0,
+            "rollback_seconds": 0.0,
+            "plain_seconds": 0.0
+          },
+          {
+            "trial": 2,
+            "lookup": 0,
+            "depth": 1,
+            "adaptive": 0,
+            "accepted": 0,
+            "proposed": 0,
+            "cycles": 0,
+            "fallback_tokens": 0,
+            "lookup_seconds": 0.0,
+            "verify_seconds": 0.0,
+            "rollback_seconds": 0.0,
+            "plain_seconds": 0.0
+          }
+        ],
+        "output_id_count": 257,
+        "output_ids_sha256": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da",
+        "ratio_to_rebuilt_control": {
+          "prefill": 0.9098878923087146,
+          "decode": 0.9678439588743851
+        }
+      },
+      "mtp-batch-d1": {
+        "prefill": 388.989982,
+        "decode": 33.236963,
+        "trials": [
+          {
+            "trial": 0,
+            "prompt_tokens": 8049,
+            "decode_transitions": 256,
+            "prefill_seconds": 20.621380906,
+            "decode_seconds": 7.702268082,
+            "prefill_tok_s": 390.323036,
+            "decode_tok_s": 33.236963,
+            "minimum_available_kb": 8241152,
+            "tokens_equal": true
+          },
+          {
+            "trial": 1,
+            "prompt_tokens": 8049,
+            "decode_transitions": 256,
+            "prefill_seconds": 20.767340072,
+            "decode_seconds": 7.678018891,
+            "prefill_tok_s": 387.579727,
+            "decode_tok_s": 33.341934,
+            "minimum_available_kb": 8227968,
+            "tokens_equal": true
+          },
+          {
+            "trial": 2,
+            "prompt_tokens": 8049,
+            "decode_transitions": 256,
+            "prefill_seconds": 20.692049621,
+            "decode_seconds": 7.710465893,
+            "prefill_tok_s": 388.989982,
+            "decode_tok_s": 33.201625,
+            "minimum_available_kb": 8200064,
+            "tokens_equal": true
+          }
+        ],
+        "variant": {
+          "source": "mtp",
+          "depth": 1,
+          "policy": "always",
+          "prime": 64,
+          "shared": false
+        },
+        "mtp_stats": [
+          {
+            "trial": 0,
+            "depth": 1,
+            "adaptive": 0,
+            "accepted": 122,
+            "proposed": 133,
+            "cycles": 133,
+            "fallback_tokens": 1,
+            "cache_synchronized": 1,
+            "draft_seconds": 0.306542876,
+            "verify_seconds": 7.265098699,
+            "replay_seconds": 0.09750584,
+            "plain_seconds": 0.031514418
+          },
+          {
+            "trial": 1,
+            "depth": 1,
+            "adaptive": 0,
+            "accepted": 122,
+            "proposed": 133,
+            "cycles": 133,
+            "fallback_tokens": 1,
+            "cache_synchronized": 1,
+            "draft_seconds": 0.295437824,
+            "verify_seconds": 7.255075644,
+            "replay_seconds": 0.094208756,
+            "plain_seconds": 0.031652158
+          },
+          {
+            "trial": 2,
+            "depth": 1,
+            "adaptive": 0,
+            "accepted": 122,
+            "proposed": 133,
+            "cycles": 133,
+            "fallback_tokens": 1,
+            "cache_synchronized": 1,
+            "draft_seconds": 0.298777723,
+            "verify_seconds": 7.282340152,
+            "replay_seconds": 0.09612959,
+            "plain_seconds": 0.031598676
+          }
+        ],
+        "lookup_stats": [
+          {
+            "trial": 0,
+            "lookup": 0,
+            "depth": 1,
+            "adaptive": 0,
+            "accepted": 0,
+            "proposed": 0,
+            "cycles": 0,
+            "fallback_tokens": 0,
+            "lookup_seconds": 0.0,
+            "verify_seconds": 0.0,
+            "rollback_seconds": 0.0,
+            "plain_seconds": 0.0
+          },
+          {
+            "trial": 1,
+            "lookup": 0,
+            "depth": 1,
+            "adaptive": 0,
+            "accepted": 0,
+            "proposed": 0,
+            "cycles": 0,
+            "fallback_tokens": 0,
+            "lookup_seconds": 0.0,
+            "verify_seconds": 0.0,
+            "rollback_seconds": 0.0,
+            "plain_seconds": 0.0
+          },
+          {
+            "trial": 2,
+            "lookup": 0,
+            "depth": 1,
+            "adaptive": 0,
+            "accepted": 0,
+            "proposed": 0,
+            "cycles": 0,
+            "fallback_tokens": 0,
+            "lookup_seconds": 0.0,
+            "verify_seconds": 0.0,
+            "rollback_seconds": 0.0,
+            "plain_seconds": 0.0
+          }
+        ],
+        "output_id_count": 257,
+        "output_ids_sha256": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da",
+        "ratio_to_rebuilt_control": {
+          "prefill": 0.966523537988658,
+          "decode": 0.9593022141586781
+        }
+      },
+      "mtp-shared-d1": {
+        "prefill": 390.954196,
+        "decode": 33.664192,
+        "trials": [
+          {
+            "trial": 0,
+            "prompt_tokens": 8049,
+            "decode_transitions": 256,
+            "prefill_seconds": 20.546283268,
+            "decode_seconds": 7.618199474,
+            "prefill_tok_s": 391.749685,
+            "decode_tok_s": 33.603741,
+            "minimum_available_kb": 8238016,
+            "tokens_equal": true
+          },
+          {
+            "trial": 1,
+            "prompt_tokens": 8049,
+            "decode_transitions": 256,
+            "prefill_seconds": 20.67555332,
+            "decode_seconds": 7.595713299,
+            "prefill_tok_s": 389.300343,
+            "decode_tok_s": 33.70322,
+            "minimum_available_kb": 8227392,
+            "tokens_equal": true
+          },
+          {
+            "trial": 2,
+            "prompt_tokens": 8049,
+            "decode_transitions": 256,
+            "prefill_seconds": 20.588089552,
+            "decode_seconds": 7.604519475,
+            "prefill_tok_s": 390.954196,
+            "decode_tok_s": 33.664192,
+            "minimum_available_kb": 8221504,
+            "tokens_equal": true
+          }
+        ],
+        "variant": {
+          "source": "mtp",
+          "depth": 1,
+          "policy": "always",
+          "prime": 64,
+          "shared": true
+        },
+        "mtp_stats": [
+          {
+            "trial": 0,
+            "depth": 1,
+            "adaptive": 0,
+            "accepted": 122,
+            "proposed": 133,
+            "cycles": 133,
+            "fallback_tokens": 1,
+            "cache_synchronized": 1,
+            "draft_seconds": 0.304302324,
+            "verify_seconds": 7.18360726,
+            "replay_seconds": 0.097172221,
+            "plain_seconds": 0.031521764
+          },
+          {
+            "trial": 1,
+            "depth": 1,
+            "adaptive": 0,
+            "accepted": 122,
+            "proposed": 133,
+            "cycles": 133,
+            "fallback_tokens": 1,
+            "cache_synchronized": 1,
+            "draft_seconds": 0.295350591,
+            "verify_seconds": 7.172566256,
+            "replay_seconds": 0.094466753,
+            "plain_seconds": 0.031713444
+          },
+          {
+            "trial": 2,
+            "depth": 1,
+            "adaptive": 0,
+            "accepted": 122,
+            "proposed": 133,
+            "cycles": 133,
+            "fallback_tokens": 1,
+            "cache_synchronized": 1,
+            "draft_seconds": 0.297223142,
+            "verify_seconds": 7.178584269,
+            "replay_seconds": 0.09504478,
+            "plain_seconds": 0.032042345
+          }
+        ],
+        "lookup_stats": [
+          {
+            "trial": 0,
+            "lookup": 0,
+            "depth": 1,
+            "adaptive": 0,
+            "accepted": 0,
+            "proposed": 0,
+            "cycles": 0,
+            "fallback_tokens": 0,
+            "lookup_seconds": 0.0,
+            "verify_seconds": 0.0,
+            "rollback_seconds": 0.0,
+            "plain_seconds": 0.0
+          },
+          {
+            "trial": 1,
+            "lookup": 0,
+            "depth": 1,
+            "adaptive": 0,
+            "accepted": 0,
+            "proposed": 0,
+            "cycles": 0,
+            "fallback_tokens": 0,
+            "lookup_seconds": 0.0,
+            "verify_seconds": 0.0,
+            "rollback_seconds": 0.0,
+            "plain_seconds": 0.0
+          },
+          {
+            "trial": 2,
+            "lookup": 0,
+            "depth": 1,
+            "adaptive": 0,
+            "accepted": 0,
+            "proposed": 0,
+            "cycles": 0,
+            "fallback_tokens": 0,
+            "lookup_seconds": 0.0,
+            "verify_seconds": 0.0,
+            "rollback_seconds": 0.0,
+            "plain_seconds": 0.0
+          }
+        ],
+        "output_id_count": 257,
+        "output_ids_sha256": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da",
+        "ratio_to_rebuilt_control": {
+          "prefill": 0.9714040211694482,
+          "decode": 0.971633115921658
+        }
+      },
+      "mtp-shared-d2-adaptive": {
+        "prefill": 388.368115,
+        "decode": 32.533517,
+        "trials": [
+          {
+            "trial": 0,
+            "prompt_tokens": 8049,
+            "decode_transitions": 256,
+            "prefill_seconds": 20.66920902,
+            "decode_seconds": 7.912034244,
+            "prefill_tok_s": 389.419837,
+            "decode_tok_s": 32.355775,
+            "minimum_available_kb": 8188800,
+            "tokens_equal": true
+          },
+          {
+            "trial": 1,
+            "prompt_tokens": 8049,
+            "decode_transitions": 256,
+            "prefill_seconds": 20.756027612,
+            "decode_seconds": 7.868808103,
+            "prefill_tok_s": 387.790966,
+            "decode_tok_s": 32.533517,
+            "minimum_available_kb": 8188800,
+            "tokens_equal": true
+          },
+          {
+            "trial": 2,
+            "prompt_tokens": 8049,
+            "decode_transitions": 256,
+            "prefill_seconds": 20.72518235,
+            "decode_seconds": 7.866475477,
+            "prefill_tok_s": 388.368115,
+            "decode_tok_s": 32.543164,
+            "minimum_available_kb": 8188800,
+            "tokens_equal": true
+          }
+        ],
+        "variant": {
+          "source": "mtp",
+          "depth": 2,
+          "policy": "adaptive",
+          "prime": 64,
+          "shared": true
+        },
+        "mtp_stats": [
+          {
+            "trial": 0,
+            "depth": 2,
+            "adaptive": 1,
+            "accepted": 15,
+            "proposed": 32,
+            "cycles": 16,
+            "fallback_tokens": 225,
+            "cache_synchronized": 0,
+            "draft_seconds": 0.083589514,
+            "verify_seconds": 1.222461263,
+            "replay_seconds": 0.012311249,
+            "plain_seconds": 6.593593907
+          },
+          {
+            "trial": 1,
+            "depth": 2,
+            "adaptive": 1,
+            "accepted": 15,
+            "proposed": 32,
+            "cycles": 16,
+            "fallback_tokens": 225,
+            "cache_synchronized": 0,
+            "draft_seconds": 0.072610971,
+            "verify_seconds": 1.228912035,
+            "replay_seconds": 0.01312167,
+            "plain_seconds": 6.554099494
+          },
+          {
+            "trial": 2,
+            "depth": 2,
+            "adaptive": 1,
+            "accepted": 15,
+            "proposed": 32,
+            "cycles": 16,
+            "fallback_tokens": 225,
+            "cache_synchronized": 0,
+            "draft_seconds": 0.072357515,
+            "verify_seconds": 1.21365252,
+            "replay_seconds": 0.010970597,
+            "plain_seconds": 6.569417589
+          }
+        ],
+        "lookup_stats": [
+          {
+            "trial": 0,
+            "lookup": 0,
+            "depth": 2,
+            "adaptive": 1,
+            "accepted": 0,
+            "proposed": 0,
+            "cycles": 0,
+            "fallback_tokens": 0,
+            "lookup_seconds": 0.0,
+            "verify_seconds": 0.0,
+            "rollback_seconds": 0.0,
+            "plain_seconds": 0.0
+          },
+          {
+            "trial": 1,
+            "lookup": 0,
+            "depth": 2,
+            "adaptive": 1,
+            "accepted": 0,
+            "proposed": 0,
+            "cycles": 0,
+            "fallback_tokens": 0,
+            "lookup_seconds": 0.0,
+            "verify_seconds": 0.0,
+            "rollback_seconds": 0.0,
+            "plain_seconds": 0.0
+          },
+          {
+            "trial": 2,
+            "lookup": 0,
+            "depth": 2,
+            "adaptive": 1,
+            "accepted": 0,
+            "proposed": 0,
+            "cycles": 0,
+            "fallback_tokens": 0,
+            "lookup_seconds": 0.0,
+            "verify_seconds": 0.0,
+            "rollback_seconds": 0.0,
+            "plain_seconds": 0.0
+          }
+        ],
+        "output_id_count": 257,
+        "output_ids_sha256": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da",
+        "ratio_to_rebuilt_control": {
+          "prefill": 0.9649783848463892,
+          "decode": 0.9389989961618634
+        }
+      },
+      "mtp-shared-d4-adaptive": {
+        "prefill": 388.003581,
+        "decode": 30.036356,
+        "trials": [
+          {
+            "trial": 0,
+            "prompt_tokens": 8049,
+            "decode_transitions": 256,
+            "prefill_seconds": 20.737766439,
+            "decode_seconds": 8.546260063,
+            "prefill_tok_s": 388.132445,
+            "decode_tok_s": 29.954623,
+            "minimum_available_kb": 8194048,
+            "tokens_equal": true
+          },
+          {
+            "trial": 1,
+            "prompt_tokens": 8049,
+            "decode_transitions": 256,
+            "prefill_seconds": 20.80742195,
+            "decode_seconds": 8.523004517,
+            "prefill_tok_s": 386.833122,
+            "decode_tok_s": 30.036356,
+            "minimum_available_kb": 8185472,
+            "tokens_equal": true
+          },
+          {
+            "trial": 2,
+            "prompt_tokens": 8049,
+            "decode_transitions": 256,
+            "prefill_seconds": 20.744653909,
+            "decode_seconds": 8.507162576,
+            "prefill_tok_s": 388.003581,
+            "decode_tok_s": 30.09229,
+            "minimum_available_kb": 8157888,
+            "tokens_equal": true
+          }
+        ],
+        "variant": {
+          "source": "mtp",
+          "depth": 4,
+          "policy": "adaptive",
+          "prime": 64,
+          "shared": true
+        },
+        "mtp_stats": [
+          {
+            "trial": 0,
+            "depth": 4,
+            "adaptive": 1,
+            "accepted": 25,
+            "proposed": 64,
+            "cycles": 16,
+            "fallback_tokens": 215,
+            "cache_synchronized": 0,
+            "draft_seconds": 0.152567835,
+            "verify_seconds": 2.091472006,
+            "replay_seconds": 0.01615185,
+            "plain_seconds": 6.285825277
+          },
+          {
+            "trial": 1,
+            "depth": 4,
+            "adaptive": 1,
+            "accepted": 25,
+            "proposed": 64,
+            "cycles": 16,
+            "fallback_tokens": 215,
+            "cache_synchronized": 0,
+            "draft_seconds": 0.143783038,
+            "verify_seconds": 2.09098505,
+            "replay_seconds": 0.014725884,
+            "plain_seconds": 6.273254709
+          },
+          {
+            "trial": 2,
+            "depth": 4,
+            "adaptive": 1,
+            "accepted": 25,
+            "proposed": 64,
+            "cycles": 16,
+            "fallback_tokens": 215,
+            "cache_synchronized": 0,
+            "draft_seconds": 0.143026045,
+            "verify_seconds": 2.083086382,
+            "replay_seconds": 0.014670484,
+            "plain_seconds": 6.266148413
+          }
+        ],
+        "lookup_stats": [
+          {
+            "trial": 0,
+            "lookup": 0,
+            "depth": 4,
+            "adaptive": 1,
+            "accepted": 0,
+            "proposed": 0,
+            "cycles": 0,
+            "fallback_tokens": 0,
+            "lookup_seconds": 0.0,
+            "verify_seconds": 0.0,
+            "rollback_seconds": 0.0,
+            "plain_seconds": 0.0
+          },
+          {
+            "trial": 1,
+            "lookup": 0,
+            "depth": 4,
+            "adaptive": 1,
+            "accepted": 0,
+            "proposed": 0,
+            "cycles": 0,
+            "fallback_tokens": 0,
+            "lookup_seconds": 0.0,
+            "verify_seconds": 0.0,
+            "rollback_seconds": 0.0,
+            "plain_seconds": 0.0
+          },
+          {
+            "trial": 2,
+            "lookup": 0,
+            "depth": 4,
+            "adaptive": 1,
+            "accepted": 0,
+            "proposed": 0,
+            "cycles": 0,
+            "fallback_tokens": 0,
+            "lookup_seconds": 0.0,
+            "verify_seconds": 0.0,
+            "rollback_seconds": 0.0,
+            "plain_seconds": 0.0
+          }
+        ],
+        "output_id_count": 257,
+        "output_ids_sha256": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da",
+        "ratio_to_rebuilt_control": {
+          "prefill": 0.964072627095031,
+          "decode": 0.866924659032725
+        }
+      },
+      "lookup-shared-d4-adaptive": {
+        "prefill": 408.134468,
+        "decode": 33.591478,
+        "trials": [
+          {
+            "trial": 0,
+            "prompt_tokens": 8049,
+            "decode_transitions": 256,
+            "prefill_seconds": 19.714410114,
+            "decode_seconds": 7.595565693,
+            "prefill_tok_s": 408.280032,
+            "decode_tok_s": 33.703875,
+            "minimum_available_kb": 9312320,
+            "tokens_equal": true
+          },
+          {
+            "trial": 1,
+            "prompt_tokens": 8049,
+            "decode_transitions": 256,
+            "prefill_seconds": 19.77206255,
+            "decode_seconds": 7.624477704,
+            "prefill_tok_s": 407.089548,
+            "decode_tok_s": 33.57607,
+            "minimum_available_kb": 9293888,
+            "tokens_equal": true
+          },
+          {
+            "trial": 2,
+            "prompt_tokens": 8049,
+            "decode_transitions": 256,
+            "prefill_seconds": 19.721441398,
+            "decode_seconds": 7.620980555,
+            "prefill_tok_s": 408.134468,
+            "decode_tok_s": 33.591478,
+            "minimum_available_kb": 9293888,
+            "tokens_equal": true
+          }
+        ],
+        "variant": {
+          "source": "lookup",
+          "depth": 4,
+          "policy": "adaptive",
+          "shared": true
+        },
+        "mtp_stats": [],
+        "lookup_stats": [
+          {
+            "trial": 0,
+            "lookup": 1,
+            "depth": 4,
+            "adaptive": 1,
+            "accepted": 0,
+            "proposed": 4,
+            "cycles": 32,
+            "fallback_tokens": 255,
+            "lookup_seconds": 0.013393242,
+            "verify_seconds": 0.138668484,
+            "rollback_seconds": 0.001226473,
+            "plain_seconds": 7.442007311
+          },
+          {
+            "trial": 1,
+            "lookup": 1,
+            "depth": 4,
+            "adaptive": 1,
+            "accepted": 0,
+            "proposed": 4,
+            "cycles": 32,
+            "fallback_tokens": 255,
+            "lookup_seconds": 0.013394692,
+            "verify_seconds": 0.12796626,
+            "rollback_seconds": 0.001225652,
+            "plain_seconds": 7.481624644
+          },
+          {
+            "trial": 2,
+            "lookup": 1,
+            "depth": 4,
+            "adaptive": 1,
+            "accepted": 0,
+            "proposed": 4,
+            "cycles": 32,
+            "fallback_tokens": 255,
+            "lookup_seconds": 0.013393762,
+            "verify_seconds": 0.127088158,
+            "rollback_seconds": 0.001226633,
+            "plain_seconds": 7.479006779
+          }
+        ],
+        "output_id_count": 257,
+        "output_ids_sha256": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da",
+        "ratio_to_rebuilt_control": {
+          "prefill": 1.0140918487368107,
+          "decode": 0.9695344072881306
+        }
+      },
+      "lookup-shared-d4-always": {
+        "prefill": 407.147483,
+        "decode": 29.533873,
+        "trials": [
+          {
+            "trial": 0,
+            "prompt_tokens": 8049,
+            "decode_transitions": 256,
+            "prefill_seconds": 19.721885692,
+            "decode_seconds": 8.702058687,
+            "prefill_tok_s": 408.125274,
+            "decode_tok_s": 29.418326,
+            "minimum_available_kb": 9333440,
+            "tokens_equal": true
+          },
+          {
+            "trial": 1,
+            "prompt_tokens": 8049,
+            "decode_transitions": 256,
+            "prefill_seconds": 19.769249081,
+            "decode_seconds": 8.668013165,
+            "prefill_tok_s": 407.147483,
+            "decode_tok_s": 29.533873,
+            "minimum_available_kb": 9313536,
+            "tokens_equal": true
+          },
+          {
+            "trial": 2,
+            "prompt_tokens": 8049,
+            "decode_transitions": 256,
+            "prefill_seconds": 19.798873282,
+            "decode_seconds": 8.65705455,
+            "prefill_tok_s": 406.538286,
+            "decode_tok_s": 29.571259,
+            "minimum_available_kb": 9313536,
+            "tokens_equal": true
+          }
+        ],
+        "variant": {
+          "source": "lookup",
+          "depth": 4,
+          "policy": "always",
+          "shared": true
+        },
+        "mtp_stats": [],
+        "lookup_stats": [
+          {
+            "trial": 0,
+            "lookup": 1,
+            "depth": 4,
+            "adaptive": 0,
+            "accepted": 91,
+            "proposed": 154,
+            "cycles": 165,
+            "fallback_tokens": 126,
+            "lookup_seconds": 0.063633889,
+            "verify_seconds": 4.896311695,
+            "rollback_seconds": 0.047825763,
+            "plain_seconds": 3.690990044
+          },
+          {
+            "trial": 1,
+            "lookup": 1,
+            "depth": 4,
+            "adaptive": 0,
+            "accepted": 91,
+            "proposed": 154,
+            "cycles": 165,
+            "fallback_tokens": 126,
+            "lookup_seconds": 0.06342152,
+            "verify_seconds": 4.866584517,
+            "rollback_seconds": 0.047817645,
+            "plain_seconds": 3.686887852
+          },
+          {
+            "trial": 2,
+            "lookup": 1,
+            "depth": 4,
+            "adaptive": 0,
+            "accepted": 91,
+            "proposed": 154,
+            "cycles": 165,
+            "fallback_tokens": 126,
+            "lookup_seconds": 0.063566803,
+            "verify_seconds": 4.859923689,
+            "rollback_seconds": 0.047872454,
+            "plain_seconds": 3.682393889
+          }
+        ],
+        "output_id_count": 257,
+        "output_ids_sha256": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da",
+        "ratio_to_rebuilt_control": {
+          "prefill": 1.011639486778189,
+          "decode": 0.8524217378579746
+        }
+      },
+      "long1024-control": {
+        "prefill": 412.428817,
+        "decode": 34.929742,
+        "trials": [
+          {
+            "trial": 0,
+            "prompt_tokens": 8049,
+            "decode_transitions": 1024,
+            "prefill_seconds": 19.516095067,
+            "decode_seconds": 29.315990801,
+            "prefill_tok_s": 412.428817,
+            "decode_tok_s": 34.929742,
+            "minimum_available_kb": 9334208,
+            "tokens_equal": true
+          },
+          {
+            "trial": 1,
+            "prompt_tokens": 8049,
+            "decode_transitions": 1024,
+            "prefill_seconds": 19.51936986,
+            "decode_seconds": 29.462993969,
+            "prefill_tok_s": 412.359623,
+            "decode_tok_s": 34.755463,
+            "minimum_available_kb": 9334208,
+            "tokens_equal": true
+          },
+          {
+            "trial": 2,
+            "prompt_tokens": 8049,
+            "decode_transitions": 1024,
+            "prefill_seconds": 19.507484809,
+            "decode_seconds": 29.298646569,
+            "prefill_tok_s": 412.610856,
+            "decode_tok_s": 34.95042,
+            "minimum_available_kb": 9334208,
+            "tokens_equal": true
+          }
+        ],
+        "variant": null,
+        "mtp_stats": [],
+        "lookup_stats": [
+          {
+            "trial": 0,
+            "lookup": 0,
+            "depth": 4,
+            "adaptive": 1,
+            "accepted": 0,
+            "proposed": 0,
+            "cycles": 0,
+            "fallback_tokens": 0,
+            "lookup_seconds": 0.0,
+            "verify_seconds": 0.0,
+            "rollback_seconds": 0.0,
+            "plain_seconds": 0.0
+          },
+          {
+            "trial": 1,
+            "lookup": 0,
+            "depth": 4,
+            "adaptive": 1,
+            "accepted": 0,
+            "proposed": 0,
+            "cycles": 0,
+            "fallback_tokens": 0,
+            "lookup_seconds": 0.0,
+            "verify_seconds": 0.0,
+            "rollback_seconds": 0.0,
+            "plain_seconds": 0.0
+          },
+          {
+            "trial": 2,
+            "lookup": 0,
+            "depth": 4,
+            "adaptive": 1,
+            "accepted": 0,
+            "proposed": 0,
+            "cycles": 0,
+            "fallback_tokens": 0,
+            "lookup_seconds": 0.0,
+            "verify_seconds": 0.0,
+            "rollback_seconds": 0.0,
+            "plain_seconds": 0.0
+          }
+        ],
+        "output_id_count": 1025,
+        "output_ids_sha256": "6b179961fe8f21a03cec1d2ff9e6688a2e3e90e980bb8da2d06570576a7240b0",
+        "ratio_to_rebuilt_control": {
+          "prefill": 1.0247620191291116,
+          "decode": 1.0081600668686657
+        }
+      },
+      "long1024-mtp": {
+        "prefill": 389.203736,
+        "decode": 33.990409,
+        "trials": [
+          {
+            "trial": 0,
+            "prompt_tokens": 8049,
+            "decode_transitions": 1024,
+            "prefill_seconds": 20.674670668,
+            "decode_seconds": 30.126145575,
+            "prefill_tok_s": 389.316963,
+            "decode_tok_s": 33.990409,
+            "minimum_available_kb": 8166208,
+            "tokens_equal": true
+          },
+          {
+            "trial": 1,
+            "prompt_tokens": 8049,
+            "decode_transitions": 1024,
+            "prefill_seconds": 20.75983494,
+            "decode_seconds": 30.073875141,
+            "prefill_tok_s": 387.719846,
+            "decode_tok_s": 34.049486,
+            "minimum_available_kb": 8145152,
+            "tokens_equal": true
+          },
+          {
+            "trial": 2,
+            "prompt_tokens": 8049,
+            "decode_transitions": 1024,
+            "prefill_seconds": 20.680685326,
+            "decode_seconds": 30.2811303,
+            "prefill_tok_s": 389.203736,
+            "decode_tok_s": 33.816439,
+            "minimum_available_kb": 8124096,
+            "tokens_equal": true
+          }
+        ],
+        "variant": {
+          "source": "mtp",
+          "depth": 1,
+          "policy": "adaptive",
+          "prime": 64,
+          "shared": true
+        },
+        "mtp_stats": [
+          {
+            "trial": 0,
+            "depth": 1,
+            "adaptive": 1,
+            "accepted": 58,
+            "proposed": 64,
+            "cycles": 64,
+            "fallback_tokens": 902,
+            "cache_synchronized": 0,
+            "draft_seconds": 0.155363102,
+            "verify_seconds": 3.517114324,
+            "replay_seconds": 0.049266099,
+            "plain_seconds": 26.403630202
+          },
+          {
+            "trial": 1,
+            "depth": 1,
+            "adaptive": 1,
+            "accepted": 58,
+            "proposed": 64,
+            "cycles": 64,
+            "fallback_tokens": 902,
+            "cache_synchronized": 0,
+            "draft_seconds": 0.145468211,
+            "verify_seconds": 3.470536678,
+            "replay_seconds": 0.046304111,
+            "plain_seconds": 26.410888201
+          },
+          {
+            "trial": 2,
+            "depth": 1,
+            "adaptive": 1,
+            "accepted": 58,
+            "proposed": 64,
+            "cycles": 64,
+            "fallback_tokens": 902,
+            "cache_synchronized": 0,
+            "draft_seconds": 0.146071364,
+            "verify_seconds": 3.473972308,
+            "replay_seconds": 0.047225411,
+            "plain_seconds": 26.613175317
+          }
+        ],
+        "lookup_stats": [
+          {
+            "trial": 0,
+            "lookup": 0,
+            "depth": 1,
+            "adaptive": 1,
+            "accepted": 0,
+            "proposed": 0,
+            "cycles": 0,
+            "fallback_tokens": 0,
+            "lookup_seconds": 0.0,
+            "verify_seconds": 0.0,
+            "rollback_seconds": 0.0,
+            "plain_seconds": 0.0
+          },
+          {
+            "trial": 1,
+            "lookup": 0,
+            "depth": 1,
+            "adaptive": 1,
+            "accepted": 0,
+            "proposed": 0,
+            "cycles": 0,
+            "fallback_tokens": 0,
+            "lookup_seconds": 0.0,
+            "verify_seconds": 0.0,
+            "rollback_seconds": 0.0,
+            "plain_seconds": 0.0
+          },
+          {
+            "trial": 2,
+            "lookup": 0,
+            "depth": 1,
+            "adaptive": 1,
+            "accepted": 0,
+            "proposed": 0,
+            "cycles": 0,
+            "fallback_tokens": 0,
+            "lookup_seconds": 0.0,
+            "verify_seconds": 0.0,
+            "rollback_seconds": 0.0,
+            "plain_seconds": 0.0
+          }
+        ],
+        "output_id_count": 1025,
+        "output_ids_sha256": "6b179961fe8f21a03cec1d2ff9e6688a2e3e90e980bb8da2d06570576a7240b0",
+        "ratio_to_rebuilt_control": {
+          "prefill": 0.9670546526237368,
+          "decode": 0.9810485577114569
+        }
+      }
+    },
+    "packed_prefill_ratios": {
+      "prefill": 0.9925057358697178,
+      "decode": 0.9860371455389355
+    },
+    "selected_variant": [
+      "mtp-shared-d1",
+      {
+        "source": "mtp",
+        "depth": 1,
+        "policy": "always",
+        "prime": 64,
+        "shared": true
+      }
+    ],
+    "long1024_ratios": {
+      "prefill": 0.9436870556986322,
+      "decode": 0.9731079319165885
+    },
+    "promotion_threshold_pass": false
+  },
+  "mtp_feature_confirmation": {
+    "status": "feature_confirmation_complete",
+    "promoted": false,
+    "targets_met": false,
+    "allocation": 52128881,
+    "prefill_includes_mtp_teacher_forcing": true,
+    "screens": {},
+    "confirmation": [],
+    "native_gates": true,
+    "binary_sha256": {
+      "frozen": "938d7b7c7a41aa6c2b9c2a51aecee897a2b423430b4eaf0de4ccddc335db4ec5",
+      "candidate": "d41ef5c447159c2b9c5916d5db4846bd2c7667a7ce6070fa0e10a49f7ad19b6b"
+    },
+    "comparison": "same candidate binary; MTP scalar prime1/legacy head versus prime64/shared head; packed target embedding in both",
+    "previous_campaign_status": "screen_and_long_generation_complete",
+    "pairs": [
+      {
+        "pair": 0,
+        "prefill_ratio": 1.066175273645089,
+        "decode_ratio": 1.0045993988293715,
+        "scalar_prefill": 364.973844,
+        "batch_prefill": 389.126088,
+        "scalar_decode": 33.166291,
+        "batch_decode": 33.318836
+      },
+      {
+        "pair": 1,
+        "prefill_ratio": 1.0627094906641792,
+        "decode_ratio": 1.0127965599515387,
+        "scalar_prefill": 365.507338,
+        "batch_prefill": 388.428117,
+        "scalar_decode": 32.888839,
+        "batch_decode": 33.309703
+      },
+      {
+        "pair": 2,
+        "prefill_ratio": 1.07401244159547,
+        "decode_ratio": 1.0355488177505565,
+        "scalar_prefill": 364.609347,
+        "batch_prefill": 391.594975,
+        "scalar_decode": 32.931925,
+        "batch_decode": 34.102616
+      },
+      {
+        "pair": 3,
+        "prefill_ratio": 1.0664668635350945,
+        "decode_ratio": 1.0082464202922314,
+        "scalar_prefill": 365.011296,
+        "batch_prefill": 389.272452,
+        "scalar_decode": 33.059193,
+        "batch_decode": 33.331813
+      },
+      {
+        "pair": 4,
+        "prefill_ratio": 1.0462104837828978,
+        "decode_ratio": 1.0161312299010872,
+        "scalar_prefill": 365.188581,
+        "batch_prefill": 382.064122,
+        "scalar_decode": 33.224745,
+        "batch_decode": 33.760701
+      }
+    ],
+    "runs": {
+      "long1024-mtp-always": {
+        "prefill": 389.345006,
+        "decode": 34.38719,
+        "trials": [
+          {
+            "trial": 0,
+            "prompt_tokens": 8049,
+            "decode_transitions": 1024,
+            "prefill_seconds": 20.592328288,
+            "decode_seconds": 29.778530938,
+            "prefill_tok_s": 390.873722,
+            "decode_tok_s": 34.38719,
+            "minimum_available_kb": 8164224,
+            "tokens_equal": true
+          },
+          {
+            "trial": 1,
+            "prompt_tokens": 8049,
+            "decode_transitions": 1024,
+            "prefill_seconds": 20.815984252,
+            "decode_seconds": 29.788835777,
+            "prefill_tok_s": 386.674005,
+            "decode_tok_s": 34.375294,
+            "minimum_available_kb": 8136960,
+            "tokens_equal": true
+          },
+          {
+            "trial": 2,
+            "prompt_tokens": 8049,
+            "decode_transitions": 1024,
+            "prefill_seconds": 20.673181579,
+            "decode_seconds": 29.74642509,
+            "prefill_tok_s": 389.345006,
+            "decode_tok_s": 34.424305,
+            "minimum_available_kb": 8136960,
+            "tokens_equal": true
+          }
+        ],
+        "variant": {
+          "source": "mtp",
+          "depth": 1,
+          "policy": "always",
+          "prime": 64,
+          "shared": true
+        },
+        "mtp_stats": [
+          {
+            "trial": 0,
+            "depth": 1,
+            "adaptive": 0,
+            "accepted": 500,
+            "proposed": 523,
+            "cycles": 523,
+            "fallback_tokens": 1,
+            "cache_synchronized": 1,
+            "draft_seconds": 1.152672403,
+            "verify_seconds": 28.210751354,
+            "replay_seconds": 0.377743202,
+            "plain_seconds": 0.031321105
+          },
+          {
+            "trial": 1,
+            "depth": 1,
+            "adaptive": 0,
+            "accepted": 500,
+            "proposed": 523,
+            "cycles": 523,
+            "fallback_tokens": 1,
+            "cache_synchronized": 1,
+            "draft_seconds": 1.130696543,
+            "verify_seconds": 28.244386982,
+            "replay_seconds": 0.37605975,
+            "plain_seconds": 0.031683336
+          },
+          {
+            "trial": 2,
+            "depth": 1,
+            "adaptive": 0,
+            "accepted": 500,
+            "proposed": 523,
+            "cycles": 523,
+            "fallback_tokens": 1,
+            "cache_synchronized": 1,
+            "draft_seconds": 1.131670571,
+            "verify_seconds": 28.200885378,
+            "replay_seconds": 0.375796506,
+            "plain_seconds": 0.031993487
+          }
+        ],
+        "lookup_stats": [
+          {
+            "trial": 0,
+            "lookup": 0,
+            "depth": 1,
+            "adaptive": 0,
+            "accepted": 0,
+            "proposed": 0,
+            "cycles": 0,
+            "fallback_tokens": 0,
+            "lookup_seconds": 0.0,
+            "verify_seconds": 0.0,
+            "rollback_seconds": 0.0,
+            "plain_seconds": 0.0
+          },
+          {
+            "trial": 1,
+            "lookup": 0,
+            "depth": 1,
+            "adaptive": 0,
+            "accepted": 0,
+            "proposed": 0,
+            "cycles": 0,
+            "fallback_tokens": 0,
+            "lookup_seconds": 0.0,
+            "verify_seconds": 0.0,
+            "rollback_seconds": 0.0,
+            "plain_seconds": 0.0
+          },
+          {
+            "trial": 2,
+            "lookup": 0,
+            "depth": 1,
+            "adaptive": 0,
+            "accepted": 0,
+            "proposed": 0,
+            "cycles": 0,
+            "fallback_tokens": 0,
+            "lookup_seconds": 0.0,
+            "verify_seconds": 0.0,
+            "rollback_seconds": 0.0,
+            "plain_seconds": 0.0
+          }
+        ],
+        "output_id_count": 1025,
+        "output_ids_sha256": "6b179961fe8f21a03cec1d2ff9e6688a2e3e90e980bb8da2d06570576a7240b0"
+      },
+      "mtp-feature-confirm-0-0": {
+        "prefill": 364.973844,
+        "decode": 33.166291,
+        "trials": [
+          {
+            "trial": 0,
+            "prompt_tokens": 8049,
+            "decode_transitions": 256,
+            "prefill_seconds": 22.053635191,
+            "decode_seconds": 7.718680457,
+            "prefill_tok_s": 364.973844,
+            "decode_tok_s": 33.166291,
+            "minimum_available_kb": 8217856,
+            "tokens_equal": true
+          }
+        ],
+        "variant": {
+          "source": "mtp",
+          "depth": 1,
+          "policy": "always",
+          "prime": 1,
+          "shared": false
+        },
+        "mtp_stats": [
+          {
+            "trial": 0,
+            "depth": 1,
+            "adaptive": 0,
+            "accepted": 122,
+            "proposed": 133,
+            "cycles": 133,
+            "fallback_tokens": 1,
+            "cache_synchronized": 1,
+            "draft_seconds": 0.291726311,
+            "verify_seconds": 7.303882552,
+            "replay_seconds": 0.090930607,
+            "plain_seconds": 0.030589133
+          }
+        ],
+        "lookup_stats": [
+          {
+            "trial": 0,
+            "lookup": 0,
+            "depth": 1,
+            "adaptive": 0,
+            "accepted": 0,
+            "proposed": 0,
+            "cycles": 0,
+            "fallback_tokens": 0,
+            "lookup_seconds": 0.0,
+            "verify_seconds": 0.0,
+            "rollback_seconds": 0.0,
+            "plain_seconds": 0.0
+          }
+        ],
+        "output_id_count": 257,
+        "output_ids_sha256": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da"
+      },
+      "mtp-feature-confirm-0-1": {
+        "prefill": 389.126088,
+        "decode": 33.318836,
+        "trials": [
+          {
+            "trial": 0,
+            "prompt_tokens": 8049,
+            "decode_transitions": 256,
+            "prefill_seconds": 20.684812052,
+            "decode_seconds": 7.683341678,
+            "prefill_tok_s": 389.126088,
+            "decode_tok_s": 33.318836,
+            "minimum_available_kb": 8266816,
+            "tokens_equal": true
+          }
+        ],
+        "variant": {
+          "source": "mtp",
+          "depth": 1,
+          "policy": "always",
+          "prime": 64,
+          "shared": true
+        },
+        "mtp_stats": [
+          {
+            "trial": 0,
+            "depth": 1,
+            "adaptive": 0,
+            "accepted": 122,
+            "proposed": 133,
+            "cycles": 133,
+            "fallback_tokens": 1,
+            "cache_synchronized": 1,
+            "draft_seconds": 0.307862294,
+            "verify_seconds": 7.24698194,
+            "replay_seconds": 0.095031215,
+            "plain_seconds": 0.031851497
+          }
+        ],
+        "lookup_stats": [
+          {
+            "trial": 0,
+            "lookup": 0,
+            "depth": 1,
+            "adaptive": 0,
+            "accepted": 0,
+            "proposed": 0,
+            "cycles": 0,
+            "fallback_tokens": 0,
+            "lookup_seconds": 0.0,
+            "verify_seconds": 0.0,
+            "rollback_seconds": 0.0,
+            "plain_seconds": 0.0
+          }
+        ],
+        "output_id_count": 257,
+        "output_ids_sha256": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da"
+      },
+      "mtp-feature-confirm-1-1": {
+        "prefill": 388.428117,
+        "decode": 33.309703,
+        "trials": [
+          {
+            "trial": 0,
+            "prompt_tokens": 8049,
+            "decode_transitions": 256,
+            "prefill_seconds": 20.721980865,
+            "decode_seconds": 7.685448271,
+            "prefill_tok_s": 388.428117,
+            "decode_tok_s": 33.309703,
+            "minimum_available_kb": 8165440,
+            "tokens_equal": true
+          }
+        ],
+        "variant": {
+          "source": "mtp",
+          "depth": 1,
+          "policy": "always",
+          "prime": 64,
+          "shared": true
+        },
+        "mtp_stats": [
+          {
+            "trial": 0,
+            "depth": 1,
+            "adaptive": 0,
+            "accepted": 122,
+            "proposed": 133,
+            "cycles": 133,
+            "fallback_tokens": 1,
+            "cache_synchronized": 1,
+            "draft_seconds": 0.317786654,
+            "verify_seconds": 7.235815684,
+            "replay_seconds": 0.098781199,
+            "plain_seconds": 0.031588265
+          }
+        ],
+        "lookup_stats": [
+          {
+            "trial": 0,
+            "lookup": 0,
+            "depth": 1,
+            "adaptive": 0,
+            "accepted": 0,
+            "proposed": 0,
+            "cycles": 0,
+            "fallback_tokens": 0,
+            "lookup_seconds": 0.0,
+            "verify_seconds": 0.0,
+            "rollback_seconds": 0.0,
+            "plain_seconds": 0.0
+          }
+        ],
+        "output_id_count": 257,
+        "output_ids_sha256": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da"
+      },
+      "mtp-feature-confirm-1-0": {
+        "prefill": 365.507338,
+        "decode": 32.888839,
+        "trials": [
+          {
+            "trial": 0,
+            "prompt_tokens": 8049,
+            "decode_transitions": 256,
+            "prefill_seconds": 22.021445681,
+            "decode_seconds": 7.783795484,
+            "prefill_tok_s": 365.507338,
+            "decode_tok_s": 32.888839,
+            "minimum_available_kb": 8222720,
+            "tokens_equal": true
+          }
+        ],
+        "variant": {
+          "source": "mtp",
+          "depth": 1,
+          "policy": "always",
+          "prime": 1,
+          "shared": false
+        },
+        "mtp_stats": [
+          {
+            "trial": 0,
+            "depth": 1,
+            "adaptive": 0,
+            "accepted": 122,
+            "proposed": 133,
+            "cycles": 133,
+            "fallback_tokens": 1,
+            "cache_synchronized": 1,
+            "draft_seconds": 0.295586411,
+            "verify_seconds": 7.364025302,
+            "replay_seconds": 0.092128111,
+            "plain_seconds": 0.030514525
+          }
+        ],
+        "lookup_stats": [
+          {
+            "trial": 0,
+            "lookup": 0,
+            "depth": 1,
+            "adaptive": 0,
+            "accepted": 0,
+            "proposed": 0,
+            "cycles": 0,
+            "fallback_tokens": 0,
+            "lookup_seconds": 0.0,
+            "verify_seconds": 0.0,
+            "rollback_seconds": 0.0,
+            "plain_seconds": 0.0
+          }
+        ],
+        "output_id_count": 257,
+        "output_ids_sha256": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da"
+      },
+      "mtp-feature-confirm-2-0": {
+        "prefill": 364.609347,
+        "decode": 32.931925,
+        "trials": [
+          {
+            "trial": 0,
+            "prompt_tokens": 8049,
+            "decode_transitions": 256,
+            "prefill_seconds": 22.075682032,
+            "decode_seconds": 7.77361169,
+            "prefill_tok_s": 364.609347,
+            "decode_tok_s": 32.931925,
+            "minimum_available_kb": 8210112,
+            "tokens_equal": true
+          }
+        ],
+        "variant": {
+          "source": "mtp",
+          "depth": 1,
+          "policy": "always",
+          "prime": 1,
+          "shared": false
+        },
+        "mtp_stats": [
+          {
+            "trial": 0,
+            "depth": 1,
+            "adaptive": 0,
+            "accepted": 122,
+            "proposed": 133,
+            "cycles": 133,
+            "fallback_tokens": 1,
+            "cache_synchronized": 1,
+            "draft_seconds": 0.293728187,
+            "verify_seconds": 7.355141831,
+            "replay_seconds": 0.092083785,
+            "plain_seconds": 0.031098425
+          }
+        ],
+        "lookup_stats": [
+          {
+            "trial": 0,
+            "lookup": 0,
+            "depth": 1,
+            "adaptive": 0,
+            "accepted": 0,
+            "proposed": 0,
+            "cycles": 0,
+            "fallback_tokens": 0,
+            "lookup_seconds": 0.0,
+            "verify_seconds": 0.0,
+            "rollback_seconds": 0.0,
+            "plain_seconds": 0.0
+          }
+        ],
+        "output_id_count": 257,
+        "output_ids_sha256": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da"
+      },
+      "mtp-feature-confirm-2-1": {
+        "prefill": 391.594975,
+        "decode": 34.102616,
+        "trials": [
+          {
+            "trial": 0,
+            "prompt_tokens": 8049,
+            "decode_transitions": 256,
+            "prefill_seconds": 20.554400637,
+            "decode_seconds": 7.5067555,
+            "prefill_tok_s": 391.594975,
+            "decode_tok_s": 34.102616,
+            "minimum_available_kb": 8222912,
+            "tokens_equal": true
+          }
+        ],
+        "variant": {
+          "source": "mtp",
+          "depth": 1,
+          "policy": "always",
+          "prime": 64,
+          "shared": true
+        },
+        "mtp_stats": [
+          {
+            "trial": 0,
+            "depth": 1,
+            "adaptive": 0,
+            "accepted": 122,
+            "proposed": 133,
+            "cycles": 133,
+            "fallback_tokens": 1,
+            "cache_synchronized": 1,
+            "draft_seconds": 0.304316249,
+            "verify_seconds": 7.074125604,
+            "replay_seconds": 0.095457167,
+            "plain_seconds": 0.031210714
+          }
+        ],
+        "lookup_stats": [
+          {
+            "trial": 0,
+            "lookup": 0,
+            "depth": 1,
+            "adaptive": 0,
+            "accepted": 0,
+            "proposed": 0,
+            "cycles": 0,
+            "fallback_tokens": 0,
+            "lookup_seconds": 0.0,
+            "verify_seconds": 0.0,
+            "rollback_seconds": 0.0,
+            "plain_seconds": 0.0
+          }
+        ],
+        "output_id_count": 257,
+        "output_ids_sha256": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da"
+      },
+      "mtp-feature-confirm-3-1": {
+        "prefill": 389.272452,
+        "decode": 33.331813,
+        "trials": [
+          {
+            "trial": 0,
+            "prompt_tokens": 8049,
+            "decode_transitions": 256,
+            "prefill_seconds": 20.677034721,
+            "decode_seconds": 7.680350201,
+            "prefill_tok_s": 389.272452,
+            "decode_tok_s": 33.331813,
+            "minimum_available_kb": 8200192,
+            "tokens_equal": true
+          }
+        ],
+        "variant": {
+          "source": "mtp",
+          "depth": 1,
+          "policy": "always",
+          "prime": 64,
+          "shared": true
+        },
+        "mtp_stats": [
+          {
+            "trial": 0,
+            "depth": 1,
+            "adaptive": 0,
+            "accepted": 122,
+            "proposed": 133,
+            "cycles": 133,
+            "fallback_tokens": 1,
+            "cache_synchronized": 1,
+            "draft_seconds": 0.307917774,
+            "verify_seconds": 7.243250396,
+            "replay_seconds": 0.096088587,
+            "plain_seconds": 0.031506594
+          }
+        ],
+        "lookup_stats": [
+          {
+            "trial": 0,
+            "lookup": 0,
+            "depth": 1,
+            "adaptive": 0,
+            "accepted": 0,
+            "proposed": 0,
+            "cycles": 0,
+            "fallback_tokens": 0,
+            "lookup_seconds": 0.0,
+            "verify_seconds": 0.0,
+            "rollback_seconds": 0.0,
+            "plain_seconds": 0.0
+          }
+        ],
+        "output_id_count": 257,
+        "output_ids_sha256": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da"
+      },
+      "mtp-feature-confirm-3-0": {
+        "prefill": 365.011296,
+        "decode": 33.059193,
+        "trials": [
+          {
+            "trial": 0,
+            "prompt_tokens": 8049,
+            "decode_transitions": 256,
+            "prefill_seconds": 22.051372357,
+            "decode_seconds": 7.743685635,
+            "prefill_tok_s": 365.011296,
+            "decode_tok_s": 33.059193,
+            "minimum_available_kb": 8212800,
+            "tokens_equal": true
+          }
+        ],
+        "variant": {
+          "source": "mtp",
+          "depth": 1,
+          "policy": "always",
+          "prime": 1,
+          "shared": false
+        },
+        "mtp_stats": [
+          {
+            "trial": 0,
+            "depth": 1,
+            "adaptive": 0,
+            "accepted": 122,
+            "proposed": 133,
+            "cycles": 133,
+            "fallback_tokens": 1,
+            "cache_synchronized": 1,
+            "draft_seconds": 0.291417784,
+            "verify_seconds": 7.326846313,
+            "replay_seconds": 0.093360907,
+            "plain_seconds": 0.030511581
+          }
+        ],
+        "lookup_stats": [
+          {
+            "trial": 0,
+            "lookup": 0,
+            "depth": 1,
+            "adaptive": 0,
+            "accepted": 0,
+            "proposed": 0,
+            "cycles": 0,
+            "fallback_tokens": 0,
+            "lookup_seconds": 0.0,
+            "verify_seconds": 0.0,
+            "rollback_seconds": 0.0,
+            "plain_seconds": 0.0
+          }
+        ],
+        "output_id_count": 257,
+        "output_ids_sha256": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da"
+      },
+      "mtp-feature-confirm-4-0": {
+        "prefill": 365.188581,
+        "decode": 33.224745,
+        "trials": [
+          {
+            "trial": 0,
+            "prompt_tokens": 8049,
+            "decode_transitions": 256,
+            "prefill_seconds": 22.040667251,
+            "decode_seconds": 7.705100481,
+            "prefill_tok_s": 365.188581,
+            "decode_tok_s": 33.224745,
+            "minimum_available_kb": 8194496,
+            "tokens_equal": true
+          }
+        ],
+        "variant": {
+          "source": "mtp",
+          "depth": 1,
+          "policy": "always",
+          "prime": 1,
+          "shared": false
+        },
+        "mtp_stats": [
+          {
+            "trial": 0,
+            "depth": 1,
+            "adaptive": 0,
+            "accepted": 122,
+            "proposed": 133,
+            "cycles": 133,
+            "fallback_tokens": 1,
+            "cache_synchronized": 1,
+            "draft_seconds": 0.290360317,
+            "verify_seconds": 7.291453458,
+            "replay_seconds": 0.091111884,
+            "plain_seconds": 0.030588471
+          }
+        ],
+        "lookup_stats": [
+          {
+            "trial": 0,
+            "lookup": 0,
+            "depth": 1,
+            "adaptive": 0,
+            "accepted": 0,
+            "proposed": 0,
+            "cycles": 0,
+            "fallback_tokens": 0,
+            "lookup_seconds": 0.0,
+            "verify_seconds": 0.0,
+            "rollback_seconds": 0.0,
+            "plain_seconds": 0.0
+          }
+        ],
+        "output_id_count": 257,
+        "output_ids_sha256": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da"
+      },
+      "mtp-feature-confirm-4-1": {
+        "prefill": 382.064122,
+        "decode": 33.760701,
+        "trials": [
+          {
+            "trial": 0,
+            "prompt_tokens": 8049,
+            "decode_transitions": 256,
+            "prefill_seconds": 21.067144341,
+            "decode_seconds": 7.582781004,
+            "prefill_tok_s": 382.064122,
+            "decode_tok_s": 33.760701,
+            "minimum_available_kb": 8197248,
+            "tokens_equal": true
+          }
+        ],
+        "variant": {
+          "source": "mtp",
+          "depth": 1,
+          "policy": "always",
+          "prime": 64,
+          "shared": true
+        },
+        "mtp_stats": [
+          {
+            "trial": 0,
+            "depth": 1,
+            "adaptive": 0,
+            "accepted": 122,
+            "proposed": 133,
+            "cycles": 133,
+            "fallback_tokens": 1,
+            "cache_synchronized": 1,
+            "draft_seconds": 0.30513316,
+            "verify_seconds": 7.14849605,
+            "replay_seconds": 0.096049379,
+            "plain_seconds": 0.031455312
+          }
+        ],
+        "lookup_stats": [
+          {
+            "trial": 0,
+            "lookup": 0,
+            "depth": 1,
+            "adaptive": 0,
+            "accepted": 0,
+            "proposed": 0,
+            "cycles": 0,
+            "fallback_tokens": 0,
+            "lookup_seconds": 0.0,
+            "verify_seconds": 0.0,
+            "rollback_seconds": 0.0,
+            "plain_seconds": 0.0
+          }
+        ],
+        "output_id_count": 257,
+        "output_ids_sha256": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da"
+      }
+    },
+    "always_long1024_ratios": {
+      "prefill": 0.9440295875348594,
+      "decode": 0.9844673344566931
+    },
+    "median_paired_ratios": {
+      "prefill": 1.066175273645089,
+      "decode": 1.0127965599515387
+    },
+    "feature_improvement_threshold_pass": true
+  },
+  "rank0_phase_profile_medians": {
+    "benchmark-mtp-batch3-frozen-control-4278-2.30.0": {
+      "bench-prefill/batch": {
+        "calls": 2.0,
+        "positions": 8049.0,
+        "ms_pos": 2.455,
+        "embed": 0.05,
+        "mhc": 0.207,
+        "attention": 1.2245,
+        "ffn": 0.9744999999999999,
+        "head": 0.0
+      },
+      "bench-decode/scalar": {
+        "steps": 256.0,
+        "ms_pos": 28.4225,
+        "embed": 0.09,
+        "mhc": 5.6884999999999994,
+        "attention": 13.973,
+        "ffn": 8.2775,
+        "head": 0.394
+      }
+    },
+    "benchmark-mtp-batch3-full-state-gate-4732-2.39.0": {
+      "bench-prefill/batch": {
+        "calls": 2.0,
+        "positions": 8049.0,
+        "ms_pos": 2.5685000000000002,
+        "embed": 0.025500000000000002,
+        "mhc": 0.2075,
+        "attention": 1.301,
+        "ffn": 1.0345,
+        "head": 0.001
+      },
+      "bench-decode/scalar": {
+        "steps": 128.0,
+        "ms_pos": 29.624,
+        "embed": 0.252,
+        "mhc": 5.792,
+        "attention": 14.353,
+        "ffn": 8.774,
+        "head": 0.453
+      },
+      "bench-decode/batch": {
+        "calls": 41.0,
+        "positions": 204.0,
+        "ms_pos": 26.204,
+        "embed": 0.24,
+        "mhc": 4.593,
+        "attention": 13.062,
+        "ffn": 8.122,
+        "head": 0.187
+      }
+    },
+    "benchmark-mtp-batch3-long1024-control-6137-2.63.0": {
+      "bench-prefill/batch": {
+        "calls": 2.0,
+        "positions": 8049.0,
+        "ms_pos": 2.4415,
+        "embed": 0.05,
+        "mhc": 0.208,
+        "attention": 1.211,
+        "ffn": 0.972,
+        "head": 0.0
+      },
+      "bench-decode/scalar": {
+        "steps": 1024.0,
+        "ms_pos": 28.691,
+        "embed": 0.09,
+        "mhc": 5.7435,
+        "attention": 14.103,
+        "ffn": 8.359,
+        "head": 0.394
+      }
+    },
+    "benchmark-mtp-batch3-long1024-mtp-6396-2.66.0": {
+      "bench-prefill/batch": {
+        "calls": 2.0,
+        "positions": 8049.0,
+        "ms_pos": 2.4935,
+        "embed": 0.024,
+        "mhc": 0.207,
+        "attention": 1.275,
+        "ffn": 0.9884999999999999,
+        "head": 0.001
+      },
+      "bench-decode/scalar": {
+        "steps": 902.0,
+        "ms_pos": 29.447499999999998,
+        "embed": 0.1055,
+        "mhc": 5.9544999999999995,
+        "attention": 14.444500000000001,
+        "ffn": 8.5625,
+        "head": 0.397
+      },
+      "bench-decode/batch": {
+        "calls": 64.0,
+        "positions": 128.0,
+        "ms_pos": 27.544,
+        "embed": 0.185,
+        "mhc": 5.605,
+        "attention": 13.018,
+        "ffn": 8.509,
+        "head": 0.232
+      }
+    },
+    "benchmark-mtp-batch3-long1024-mtp-always-6721-2.71.0": {
+      "bench-prefill/batch": {
+        "calls": 2.0,
+        "positions": 8049.0,
+        "ms_pos": 2.495,
+        "embed": 0.0245,
+        "mhc": 0.207,
+        "attention": 1.2715,
+        "ffn": 0.9915,
+        "head": 0.001
+      },
+      "bench-decode/scalar": {
+        "steps": 1.0,
+        "ms_pos": 31.734,
+        "embed": 1.462,
+        "mhc": 6.298,
+        "attention": 14.675999999999998,
+        "ffn": 8.797,
+        "head": 0.42
+      },
+      "bench-decode/batch": {
+        "calls": 523.0,
+        "positions": 1046.0,
+        "ms_pos": 27.546,
+        "embed": 0.088,
+        "mhc": 5.616,
+        "attention": 12.953,
+        "ffn": 8.653,
+        "head": 0.236
+      }
+    },
+    "benchmark-mtp-batch3-lookup-shared-d4-adaptive-5691-2.57.0": {
+      "bench-prefill/batch": {
+        "calls": 2.0,
+        "positions": 8049.0,
+        "ms_pos": 2.4715,
+        "embed": 0.0235,
+        "mhc": 0.207,
+        "attention": 1.27,
+        "ffn": 0.9715,
+        "head": 0.0
+      },
+      "bench-decode/scalar": {
+        "steps": 255.0,
+        "ms_pos": 29.869,
+        "embed": 0.097,
+        "mhc": 6.015499999999999,
+        "attention": 14.523,
+        "ffn": 8.812000000000001,
+        "head": 0.3935
+      },
+      "bench-decode/batch": {
+        "calls": 1.0,
+        "positions": 5.0,
+        "ms_pos": 26.661,
+        "embed": 0.268,
+        "mhc": 4.613,
+        "attention": 13.259,
+        "ffn": 8.313,
+        "head": 0.212
+      }
+    },
+    "benchmark-mtp-batch3-lookup-shared-d4-always-5912-2.60.0": {
+      "bench-prefill/batch": {
+        "calls": 2.0,
+        "positions": 8049.0,
+        "ms_pos": 2.476,
+        "embed": 0.024,
+        "mhc": 0.207,
+        "attention": 1.2679999999999998,
+        "ffn": 0.978,
+        "head": 0.0
+      },
+      "bench-decode/scalar": {
+        "steps": 126.0,
+        "ms_pos": 29.582500000000003,
+        "embed": 0.1925,
+        "mhc": 5.8045,
+        "attention": 14.423,
+        "ffn": 8.77,
+        "head": 0.3945
+      },
+      "bench-decode/batch": {
+        "calls": 39.0,
+        "positions": 193.0,
+        "ms_pos": 26.205,
+        "embed": 0.21,
+        "mhc": 4.558,
+        "attention": 13.07,
+        "ffn": 8.194,
+        "head": 0.178
+      }
+    },
+    "benchmark-mtp-batch3-mtp-batch-d1-5013-2.45.0": {
+      "bench-prefill/batch": {
+        "calls": 2.0,
+        "positions": 8049.0,
+        "ms_pos": 2.495,
+        "embed": 0.0245,
+        "mhc": 0.207,
+        "attention": 1.271,
+        "ffn": 0.992,
+        "head": 0.001
+      },
+      "bench-decode/scalar": {
+        "steps": 1.0,
+        "ms_pos": 31.578,
+        "embed": 1.2065000000000001,
+        "mhc": 6.2465,
+        "attention": 14.7555,
+        "ffn": 8.8855,
+        "head": 0.427
+      },
+      "bench-decode/batch": {
+        "calls": 133.0,
+        "positions": 266.0,
+        "ms_pos": 27.874,
+        "embed": 0.141,
+        "mhc": 5.555,
+        "attention": 12.884,
+        "ffn": 8.674,
+        "head": 0.619
+      }
+    },
+    "benchmark-mtp-batch3-mtp-feature-confirm-0-0-6869-2.74.0": {
+      "bench-prefill/batch": {
+        "calls": 2.0,
+        "positions": 8049.0,
+        "ms_pos": 2.5615,
+        "embed": 0.025500000000000002,
+        "mhc": 0.207,
+        "attention": 1.3130000000000002,
+        "ffn": 1.0145,
+        "head": 0.001
+      },
+      "bench-decode/scalar": {
+        "steps": 128.5,
+        "ms_pos": 30.371499999999997,
+        "embed": 0.122,
+        "mhc": 6.1385,
+        "attention": 14.728,
+        "ffn": 8.978,
+        "head": 0.40449999999999997
+      },
+      "bench-decode/batch": {
+        "calls": 133.0,
+        "positions": 266.0,
+        "ms_pos": 27.998,
+        "embed": 0.099,
+        "mhc": 5.568,
+        "attention": 12.995,
+        "ffn": 8.718,
+        "head": 0.618
+      }
+    },
+    "benchmark-mtp-batch3-mtp-feature-confirm-0-1-6999-2.77.0": {
+      "bench-prefill/batch": {
+        "calls": 2.0,
+        "positions": 8049.0,
+        "ms_pos": 2.561,
+        "embed": 0.025500000000000002,
+        "mhc": 0.2075,
+        "attention": 1.3125,
+        "ffn": 1.0150000000000001,
+        "head": 0.001
+      },
+      "bench-decode/scalar": {
+        "steps": 128.5,
+        "ms_pos": 30.993000000000002,
+        "embed": 0.755,
+        "mhc": 6.115,
+        "attention": 14.7715,
+        "ffn": 8.937999999999999,
+        "head": 0.4135
+      },
+      "bench-decode/batch": {
+        "calls": 133.0,
+        "positions": 266.0,
+        "ms_pos": 27.824,
+        "embed": 0.107,
+        "mhc": 5.605,
+        "attention": 13.132,
+        "ffn": 8.746,
+        "head": 0.234
+      }
+    },
+    "benchmark-mtp-batch3-mtp-feature-confirm-1-0-7399-2.83.0": {
+      "bench-prefill/batch": {
+        "calls": 2.0,
+        "positions": 8049.0,
+        "ms_pos": 2.557,
+        "embed": 0.025500000000000002,
+        "mhc": 0.2065,
+        "attention": 1.3145,
+        "ffn": 1.0095,
+        "head": 0.001
+      },
+      "bench-decode/scalar": {
+        "steps": 128.5,
+        "ms_pos": 30.3035,
+        "embed": 0.115,
+        "mhc": 6.1355,
+        "attention": 14.7515,
+        "ffn": 8.896,
+        "head": 0.406
+      },
+      "bench-decode/batch": {
+        "calls": 133.0,
+        "positions": 266.0,
+        "ms_pos": 28.282,
+        "embed": 0.109,
+        "mhc": 5.617,
+        "attention": 13.148,
+        "ffn": 8.789,
+        "head": 0.618
+      }
+    },
+    "benchmark-mtp-batch3-mtp-feature-confirm-1-1-7197-2.80.0": {
+      "bench-prefill/batch": {
+        "calls": 2.0,
+        "positions": 8049.0,
+        "ms_pos": 2.5635,
+        "embed": 0.025500000000000002,
+        "mhc": 0.2085,
+        "attention": 1.3125,
+        "ffn": 1.0165,
+        "head": 0.001
+      },
+      "bench-decode/scalar": {
+        "steps": 128.5,
+        "ms_pos": 31.052500000000002,
+        "embed": 0.678,
+        "mhc": 6.1205,
+        "attention": 14.771,
+        "ffn": 9.07,
+        "head": 0.413
+      },
+      "bench-decode/batch": {
+        "calls": 133.0,
+        "positions": 266.0,
+        "ms_pos": 27.703,
+        "embed": 0.137,
+        "mhc": 5.487,
+        "attention": 13.129,
+        "ffn": 8.72,
+        "head": 0.23
+      }
+    },
+    "benchmark-mtp-batch3-mtp-feature-confirm-2-0-7600-2.86.0": {
+      "bench-prefill/batch": {
+        "calls": 2.0,
+        "positions": 8049.0,
+        "ms_pos": 2.559,
+        "embed": 0.025500000000000002,
+        "mhc": 0.207,
+        "attention": 1.314,
+        "ffn": 1.012,
+        "head": 0.001
+      },
+      "bench-decode/scalar": {
+        "steps": 128.5,
+        "ms_pos": 30.624499999999998,
+        "embed": 0.1245,
+        "mhc": 6.0760000000000005,
+        "attention": 15.102,
+        "ffn": 8.9145,
+        "head": 0.40800000000000003
+      },
+      "bench-decode/batch": {
+        "calls": 133.0,
+        "positions": 266.0,
+        "ms_pos": 28.248,
+        "embed": 0.11,
+        "mhc": 5.611,
+        "attention": 13.139,
+        "ffn": 8.769,
+        "head": 0.619
+      }
+    },
+    "benchmark-mtp-batch3-mtp-feature-confirm-2-1-7799-2.89.0": {
+      "bench-prefill/batch": {
+        "calls": 2.0,
+        "positions": 8049.0,
+        "ms_pos": 2.547,
+        "embed": 0.025500000000000002,
+        "mhc": 0.2075,
+        "attention": 1.302,
+        "ffn": 1.011,
+        "head": 0.001
+      },
+      "bench-decode/scalar": {
+        "steps": 128.5,
+        "ms_pos": 30.771,
+        "embed": 0.6475,
+        "mhc": 6.000500000000001,
+        "attention": 14.7395,
+        "ffn": 8.962,
+        "head": 0.422
+      },
+      "bench-decode/batch": {
+        "calls": 133.0,
+        "positions": 266.0,
+        "ms_pos": 27.098,
+        "embed": 0.112,
+        "mhc": 5.513,
+        "attention": 12.824,
+        "ffn": 8.412,
+        "head": 0.237
+      }
+    },
+    "benchmark-mtp-batch3-mtp-feature-confirm-3-0-8197-2.95.0": {
+      "bench-prefill/batch": {
+        "calls": 2.0,
+        "positions": 8049.0,
+        "ms_pos": 2.5625,
+        "embed": 0.025500000000000002,
+        "mhc": 0.207,
+        "attention": 1.3159999999999998,
+        "ffn": 1.013,
+        "head": 0.001
+      },
+      "bench-decode/scalar": {
+        "steps": 128.5,
+        "ms_pos": 30.374000000000002,
+        "embed": 0.12,
+        "mhc": 6.115,
+        "attention": 14.814499999999999,
+        "ffn": 8.913,
+        "head": 0.41100000000000003
+      },
+      "bench-decode/batch": {
+        "calls": 133.0,
+        "positions": 266.0,
+        "ms_pos": 28.12,
+        "embed": 0.105,
+        "mhc": 5.572,
+        "attention": 13.054,
+        "ffn": 8.771,
+        "head": 0.618
+      }
+    },
+    "benchmark-mtp-batch3-mtp-feature-confirm-3-1-7996-2.92.0": {
+      "bench-prefill/batch": {
+        "calls": 2.0,
+        "positions": 8049.0,
+        "ms_pos": 2.564,
+        "embed": 0.025500000000000002,
+        "mhc": 0.2065,
+        "attention": 1.314,
+        "ffn": 1.0165,
+        "head": 0.001
+      },
+      "bench-decode/scalar": {
+        "steps": 128.5,
+        "ms_pos": 30.8915,
+        "embed": 0.6135,
+        "mhc": 6.124,
+        "attention": 14.8105,
+        "ffn": 8.927499999999998,
+        "head": 0.4165
+      },
+      "bench-decode/batch": {
+        "calls": 133.0,
+        "positions": 266.0,
+        "ms_pos": 27.773,
+        "embed": 0.128,
+        "mhc": 5.574,
+        "attention": 13.089,
+        "ffn": 8.747,
+        "head": 0.235
+      }
+    },
+    "benchmark-mtp-batch3-mtp-feature-confirm-4-0-8399-2.98.0": {
+      "bench-prefill/batch": {
+        "calls": 2.0,
+        "positions": 8049.0,
+        "ms_pos": 2.5545,
+        "embed": 0.025500000000000002,
+        "mhc": 0.2075,
+        "attention": 1.3115,
+        "ffn": 1.009,
+        "head": 0.001
+      },
+      "bench-decode/scalar": {
+        "steps": 128.5,
+        "ms_pos": 30.4655,
+        "embed": 0.182,
+        "mhc": 6.1445,
+        "attention": 14.778500000000001,
+        "ffn": 8.958,
+        "head": 0.403
+      },
+      "bench-decode/batch": {
+        "calls": 133.0,
+        "positions": 266.0,
+        "ms_pos": 28.043,
+        "embed": 0.12,
+        "mhc": 5.599,
+        "attention": 13.033,
+        "ffn": 8.674,
+        "head": 0.616
+      }
+    },
+    "benchmark-mtp-batch3-mtp-feature-confirm-4-1-8595-2.101.0": {
+      "bench-prefill/batch": {
+        "calls": 2.0,
+        "positions": 8049.0,
+        "ms_pos": 2.6115,
+        "embed": 0.025500000000000002,
+        "mhc": 0.2065,
+        "attention": 1.31,
+        "ffn": 1.0685,
+        "head": 0.001
+      },
+      "bench-decode/scalar": {
+        "steps": 128.5,
+        "ms_pos": 31.014499999999998,
+        "embed": 0.606,
+        "mhc": 6.118,
+        "attention": 14.7975,
+        "ffn": 9.0755,
+        "head": 0.418
+      },
+      "bench-decode/batch": {
+        "calls": 133.0,
+        "positions": 266.0,
+        "ms_pos": 27.38,
+        "embed": 0.113,
+        "mhc": 5.477,
+        "attention": 12.971,
+        "ffn": 8.587,
+        "head": 0.231
+      }
+    },
+    "benchmark-mtp-batch3-mtp-scalar-d1-4870-2.42.0": {
+      "bench-prefill/batch": {
+        "calls": 2.0,
+        "positions": 8049.0,
+        "ms_pos": 2.4745,
+        "embed": 0.024,
+        "mhc": 0.208,
+        "attention": 1.27,
+        "ffn": 0.972,
+        "head": 0.001
+      },
+      "bench-decode/scalar": {
+        "steps": 1.0,
+        "ms_pos": 30.3475,
+        "embed": 0.1055,
+        "mhc": 6.2195,
+        "attention": 14.701,
+        "ffn": 8.901499999999999,
+        "head": 0.4185
+      },
+      "bench-decode/batch": {
+        "calls": 133.0,
+        "positions": 266.0,
+        "ms_pos": 27.714,
+        "embed": 0.06,
+        "mhc": 5.54,
+        "attention": 12.861,
+        "ffn": 8.581,
+        "head": 0.616
+      }
+    },
+    "benchmark-mtp-batch3-mtp-shared-d1-5149-2.48.0": {
+      "bench-prefill/batch": {
+        "calls": 2.0,
+        "positions": 8049.0,
+        "ms_pos": 2.483,
+        "embed": 0.024,
+        "mhc": 0.207,
+        "attention": 1.2675,
+        "ffn": 0.9844999999999999,
+        "head": 0.001
+      },
+      "bench-decode/scalar": {
+        "steps": 1.0,
+        "ms_pos": 31.643500000000003,
+        "embed": 1.2365,
+        "mhc": 6.208,
+        "attention": 14.7875,
+        "ffn": 8.924,
+        "head": 0.425
+      },
+      "bench-decode/batch": {
+        "calls": 133.0,
+        "positions": 266.0,
+        "ms_pos": 27.545,
+        "embed": 0.128,
+        "mhc": 5.572,
+        "attention": 12.897,
+        "ffn": 8.716,
+        "head": 0.232
+      }
+    },
+    "benchmark-mtp-batch3-mtp-shared-d2-adaptive-5291-2.51.0": {
+      "bench-prefill/batch": {
+        "calls": 2.0,
+        "positions": 8049.0,
+        "ms_pos": 2.495,
+        "embed": 0.0245,
+        "mhc": 0.206,
+        "attention": 1.2774999999999999,
+        "ffn": 0.989,
+        "head": 0.001
+      },
+      "bench-decode/scalar": {
+        "steps": 225.0,
+        "ms_pos": 29.351999999999997,
+        "embed": 0.13,
+        "mhc": 6.0255,
+        "attention": 14.261,
+        "ffn": 8.543,
+        "head": 0.3925
+      },
+      "bench-decode/batch": {
+        "calls": 16.0,
+        "positions": 48.0,
+        "ms_pos": 26.154,
+        "embed": 0.384,
+        "mhc": 4.921,
+        "attention": 12.346,
+        "ffn": 8.298,
+        "head": 0.181
+      }
+    },
+    "benchmark-mtp-batch3-mtp-shared-d4-adaptive-5462-2.54.0": {
+      "bench-prefill/batch": {
+        "calls": 2.0,
+        "positions": 8049.0,
+        "ms_pos": 2.4989999999999997,
+        "embed": 0.024,
+        "mhc": 0.207,
+        "attention": 1.2765,
+        "ffn": 0.9935,
+        "head": 0.001
+      },
+      "bench-decode/scalar": {
+        "steps": 215.0,
+        "ms_pos": 29.4225,
+        "embed": 0.1345,
+        "mhc": 6.115,
+        "attention": 14.317499999999999,
+        "ffn": 8.467,
+        "head": 0.3965
+      },
+      "bench-decode/batch": {
+        "calls": 16.0,
+        "positions": 80.0,
+        "ms_pos": 27.034,
+        "embed": 0.297,
+        "mhc": 4.662,
+        "attention": 13.439,
+        "ffn": 8.424,
+        "head": 0.216
+      }
+    },
+    "benchmark-mtp-batch3-packed-prefill-4591-2.36.0": {
+      "bench-prefill/batch": {
+        "calls": 2.0,
+        "positions": 8049.0,
+        "ms_pos": 2.471,
+        "embed": 0.023,
+        "mhc": 0.206,
+        "attention": 1.271,
+        "ffn": 0.971,
+        "head": 0.0
+      },
+      "bench-decode/scalar": {
+        "steps": 256.0,
+        "ms_pos": 29.012,
+        "embed": 0.0885,
+        "mhc": 5.937,
+        "attention": 14.1255,
+        "ffn": 8.468,
+        "head": 0.3925
+      }
+    },
+    "benchmark-mtp-batch3-rebuilt-control-4450-2.33.0": {
+      "bench-prefill/batch": {
+        "calls": 2.0,
+        "positions": 8049.0,
+        "ms_pos": 2.503,
+        "embed": 0.05,
+        "mhc": 0.208,
+        "attention": 1.27,
+        "ffn": 0.9744999999999999,
+        "head": 0.0
+      },
+      "bench-decode/scalar": {
+        "steps": 256.0,
+        "ms_pos": 28.929499999999997,
+        "embed": 0.087,
+        "mhc": 5.947,
+        "attention": 14.0505,
+        "ffn": 8.436,
+        "head": 0.3925
+      }
+    },
+    "benchmark-mtp-batch3-short-state-gate-4123-2.27.0": {
+      "bench-prefill/batch": {
+        "calls": 1.0,
+        "positions": 128.0,
+        "ms_pos": 5.805000000000001,
+        "embed": 0.0545,
+        "mhc": 0.46399999999999997,
+        "attention": 1.4545,
+        "ffn": 3.8305,
+        "head": 0.0015
+      },
+      "bench-decode/scalar": {
+        "steps": 128.0,
+        "ms_pos": 26.071,
+        "embed": 0.148,
+        "mhc": 5.847,
+        "attention": 10.995,
+        "ffn": 8.669,
+        "head": 0.412
+      },
+      "bench-decode/batch": {
+        "calls": 53.0,
+        "positions": 261.0,
+        "ms_pos": 23.071,
+        "embed": 0.1,
+        "mhc": 4.591,
+        "attention": 9.86,
+        "ffn": 8.331,
+        "head": 0.188
+      }
+    }
+  },
+  "interpretation": [
+    "The five-pair feature comparison measures improvement within MTP, not against plain decode.",
+    "Packed TP12 embedding does not qualify for promotion.",
+    "MTP and lookup screens do not qualify as a plain-decode replacement.",
+    "The rebuilt default differs from the frozen plain baseline; both controls and ratios are retained.",
+    "No new default, context-wide promotion, push, or100/2000 tok/s claim."
+  ],
+  "complete_run_count": 25,
+  "timed_trial_count": 51,
+  "minimum_available_kb": 8124096,
+  "minimum_available_gib": 7.74774169921875,
+  "remote_final_sha256": {
+    "test_glm53f_head_verify.c": "89e24994a7594d7cd54f454bd14620fffa652b69f54150873fdaa7bb3b36aa0c",
+    "glm53f_head_verify_sve.h": "9bedbe5d94b543885646a9b2bfcf86072534ed33113874fa1f69805383fe9059",
+    "bench_glm53f_run_12n": "d41ef5c447159c2b9c5916d5db4846bd2c7667a7ce6070fa0e10a49f7ad19b6b"
+  }
+}

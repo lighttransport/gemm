@@ -5,15 +5,15 @@ prefill tokens/s**, on twelve A64FX nodes, the complete 45-layer
 UD-Q4_K_XL model, top-8 routing, and the saved roughly 8K coding prompt.
 These targets have **not been demonstrated** by the changes below.
 
-## Batched MTP priming and verification weights (October3; native exact)
+## Batched MTP priming and verification weights (October3; qualified MTP gain)
 
 Three independent opt-in candidates are implemented. The benchmark's
 `--mtp-prime-batch 1|64` batches teacher-forced prompt pairs. It retains the
 existing first-position mask and norm reductions, uses the existing exact
-BF164×4 fusion kernel, gathers rank-major shards once per tile, and appends
+BF16 4×4 fusion kernel, gathers rank-major shards once per tile, and appends
 FP8/BF16 cache projections with identical scalar chains. Native/CP cache
 formats use the original scalar fallback. Scratch is allocated lazily and
-bounded at8MiB per rank; this option does not omit prompt priming from timing.
+bounded at8MiB per rank; timing includes complete prompt priming.
 
 `--verify-head-kernel legacy|shared` shares FP32 vocabulary weight loads across
 2–5 verification positions. Every row retains the original single-accumulator
@@ -22,20 +22,69 @@ SVE chain and horizontal sum; ordinary scalar readout is unchanged.
 for TP12 prefill. Both FP32/BF16 row storage are supported; PP retains its
 existing packed behavior. All TP12 defaults remain legacy/1.
 
-The shared `check` build includes `test_glm53f_embedding_batch_12n`,
-`test_glm53f_head_verify`, and `test_glm53f_mtp_prime_12n`. The latter compares
-persistent state and draft readout before/after pool-crossing rollback and
-measures five alternating scalar/batch64 priming pairs. These fixtures must
-pass before full-model timing. On PJM52128881 all20 embedding cases and
-150 head cases per fast/conservative1/47/48-thread configuration pass on
-each of12 ranks. All36 actual-weight MTP state/rollback cases pass. Five
-2051-position priming pairs give a2.663894× median speedup;47-thread fast
-head medians are1.846/2.783/3.227/3.378× for2/3/4/5 positions. These are
-component measurements. Short128 and full8049 target-state speculative
-gates pass BIT_EXACT; the performance sweep is running. No promotion or
-qualified model gain is claimed. The best accepted rates remain35.462134
-decode /412.273634 prefill tok/s. See
+PJM52128881,12 A64FX nodes/normal2GHz/eco0,47 threads and FCC fast math:
+all20 embedding and36 actual-weight MTP state/rollback cases pass on every
+rank. Head tests pass150 cases per fast/conservative1/47/48-thread setting,
+both with the original inputs and a stronger dataset varying signs, all23
+mantissa bits and16 exponents independently per rank (21600 case instances).
+Five2051-position priming pairs give2.663894×. The stronger head fixture's
+47-thread fast paired medians are1.863/2.809/3.257/3.387× for2/3/4/5 positions.
+These are component measurements. See
 [native evidence](strata-mtp-batch-native-20261003.json).
+
+Short128/full8049 speculative endpoint states pass BIT_EXACT. All25 complete
+model runs/51 timed trials pass their expected129/257/1025-ID counts; every
+screen and long output matches the frozen plain reference. Minimum available
+memory is7.748GiB. Five alternating fresh pairs compare scalar MTP priming/
+legacy head with batch64/shared head, using the same candidate binary and
+packed target embedding in both. Acceptance remains exactly122/133 in every
+pair. Median paired gains are **+6.6175% MTP prefill /+1.2797% MTP decode**.
+Median absolute rates are:
+
+| Same-binary MTP depth1/always | Prefill tok/s | Decode tok/s |
+|---|---:|---:|
+| Prime1, legacy head |365.011296|33.059193|
+| Prime64, shared head |389.126088|33.331813|
+
+The percentage uses the median of five paired ratios, rather than the ratio
+of absolute-rate medians. The last pair improves prefill only4.62%; all five
+improve decode, and the paired medians pass the5%/2% feature threshold.
+**This qualifies an improvement within MTP, not a replacement for plain decode.**
+The fresh plain screen is34.978736 decode/410.478727 prefill; packed plain
+is34.490333/407.402491. MTP depths2/4 adaptive and both lookup policies lose.
+At1024 transitions, plain is34.929742/412.428817; adaptive MTP is33.990409/
+389.203736 and always MTP is34.387190/389.345006. All1025 IDs match. Adaptive
+MTP falls back for902 transitions, so the always-on run separately measures
+sustained speculation. Depth1 still spends about54ms per verification cycle;
+high acceptance does not remove that cost. Packed embedding cuts its prefill
+phase0.050→0.023ms/token, but attention/FFN dominate. The rebuilt default
+control also has higher sparse-MLA time than the frozen binary; both controls
+and phase profiles are preserved.
+
+**No plain promotion; retain the qualified35.462134 decode/412.273634 prefill
+recipe. Neither100/2000 target is met.** New paths stay opt-in; no context-wide
+promotion or32K MTP qualification is claimed. Full commands, binary/source
+hashes, all trials, paired results and profiles are in
+[full-model evidence](strata-mtp-batch-full-20261003.json). Implementation is
+commit`79d67a35`; the runtime benchmark remained immutable throughout.
+
+Native fixture reproduction after staging, with the shared `check` build:
+
+```sh
+BIN="$PWD/a64fx/glm5/build/mtp-check"
+export OMP_NUM_THREADS=47 OMP_PROC_BIND=close OMP_PLACES=cores FLIB_BARRIER=HARD
+GLM53F_BIN_DIR="$BIN" GLM53F_FAST_MATH=1 GLM53F_NO_MATH_ERRNO=1 \
+  bash a64fx/glm5/build_glm53f_integrated_12n.sh check 47 4096
+mpiexec -n 12 /usr/bin/numactl --interleave=4,5,6,7 "$BIN/test_glm53f_embedding_batch_12n"
+mpiexec -n 12 /usr/bin/numactl --interleave=4,5,6,7 "$BIN/test_glm53f_head_verify"
+GLM53F_REPACK_REQUIRE=0 mpiexec -n 12 /usr/bin/numactl --interleave=4,5,6,7 \
+  "$BIN/test_glm53f_mtp_prime_12n" "$MODEL" "$MTP_ROUTED" "$MTP_SHARED" /local/mtp-prime-check
+```
+
+Select the measured MTP feature with `--speculation mtp --draft-depth 1
+--spec-policy always --mtp-prime-batch 64 --verify-head-kernel shared
+--embedding-batch-kernel packed`, plus both MTP stage paths and the recorded
+baseline options. The priming option is currently benchmark-only.
 
 ## Native dense prefill tiles (October3; exact but no promotion)
 
@@ -880,14 +929,17 @@ predecessors, with the original refusal logs preserved.
 
 ## Remaining architecture decision
 
-The measured TP12 candidate remains below both targets. The next architecture
-evaluation is PP3×TP4 using newly staged TP4 expert parts, explicit layer ownership, stage-local collectives,
-and full four-stream handoffs. Current stage images and runtime assume
-twelve ranks; a PP configuration cannot be selected by changing a launch
-flag. PP3×TP4 is not implemented or qualified. For a single dependent decode
+The measured TP12 candidate remains below both targets. PP3×TP4 now connects
+owned constructors/stagers, layer ownership, stage-local collectives and
+four-stream handoffs. Native components, slicing and distribution fixtures
+pass, but real-model cross-layout output first differs atID index19, so PP
+is not qualified. Exact component/virtual-TP12 isolation results and the
+remaining early-layer replay are recorded in`resume-strata.md` and
+`strata-cross-layout-isolation-20261003.json`. For a single dependent decode
 request, account for inter-stage latency rather than assuming threefold
-pipeline speedup. Short and synthetic 32K qualification pass. All new paths
-remain opt-in; the synthetic fixture does not replace a real long coding prompt.
+pipeline speedup. The promoted TP12 recipe passes short/synthetic32K checks;
+this does not qualify the new MTP feature at32K or replace a real long coding
+prompt. All new paths remain opt-in.
 
 The completed mHC verification-team full sweep passes captured8049 prompt
 means and short128/8K target state, with every257-ID output exact. Fresh plain

@@ -13,45 +13,65 @@ hoste25-0002g, remote checkout unchanged. Local tmux socket
 `tmp/tmux-glm53f/pp1.sock`, launcher session`glm53f-mtp3`. Other allocations
 must not be touched.
 
-**October3 evening continuation (in progress):** pre-push audit found that
+**October3 evening continuation (complete):** pre-push audit found that
 canonical field CLI tools could pass mismatched generation/capture lengths.
 Commit`bf849e3b` requires explicit`--prompt-tokens`/`--output-tokens`, checks
 state positions and complete route lengths, and rejects truncated matching ID
-lists. Count, stream, NumPy, parser, loader-policy, team and launcher tests pass.
+lists. Count, stream, NumPy, parser, loader-policy, team and18 launcher tests pass.
 No push authorized; unrelated`a64fx/remote-dev-procedure.md` remains modified.
 
-New opt-in candidates, based on Strata's batched MTP priming and weight reuse:
-`--mtp-prime-batch 1|64` (benchmark only),
+Commit`79d67a35` adds three opt-in candidates based on Strata batched priming
+and weight reuse: benchmark`--mtp-prime-batch 1|64`,
 `--verify-head-kernel legacy|shared`, and
-`--embedding-batch-kernel legacy|packed`. Defaults retain TP12 behavior.
-The MTP path retains the first-position embedding mask, scalar norm reductions,
-four-token BF16 fusion chains, FP8/BF16 persistent projection chains and pool
-updates. It allocates8MiB lazily and batches vocabulary-owner broadcasts and
-fusion gathers. The verification head reuses FP32 weights across2–5 positions
-without changing each output's single-accumulator chain.
+`--embedding-batch-kernel legacy|packed`. Defaults remain legacy/1. The MTP
+path retains the first-position mask, scalar norm reductions, four-token
+BF16 fusion chains, FP8/BF16 cache chains and ordered pool updates; lazy
+scratch8MiB. Native/CP fallback is scalar. The head shares FP32 loads across
+2–5 positions with each original single-accumulator SVE chain.
 
-Immutable candidate`a64fx/glm5/build/candidate-mtp-prime-v5` cross-builds with
-FCC fast math, panel47/capacity4096, `-Wall -Wextra -Werror`; benchmark SHA
+Immutable runtime`a64fx/glm5/build/candidate-mtp-prime-v5`, FCC fast math,
+panel47/capacity4096,`-Wall -Wextra -Werror`; benchmark SHA
 `d41ef5c447159c2b9c5916d5db4846bd2c7667a7ce6070fa0e10a49f7ad19b6b`.
-Native gates **PASS**. Full target+MTP stagingPID129 is terminal/PASS;
-sequential driverPID1469 is running the performance campaign in
-`tmp/strata-mtp-batch-20261003/driver-v7.{sh,log}`. Superseded waiting drivers
-were terminated before any MPI benchmark; do not launch a second MPI job.
-The driver checks packed embedding(FP32/BF16), verification-head fast/
-conservative1/47/48-thread arithmetic, MTP state/rollback and five paired
-priming timings, then short/full model states, frozen/rebuilt/packed controls,
-MTP and lookup screens, optional five-pair confirmation and1024-transition
-stress. Campaign`campaign-v5.py`; source/build/scripts/logs all under
-`tmp/strata-mtp-batch-20261003/`. All20 embedding cases,150 head cases per
-math/thread combination and36 MTP state/rollback cases pass on12 ranks.
-Five priming pairs give2.663894×; fast47-thread head gives1.846–3.378×.
-Short128/full8049 speculative target-state gates pass BIT_EXACT. Frozen
-control34.978736/410.478727, rebuilt34.647020/402.463020, packed prefill
-34.490333/407.402491(screen medians, decode/prefill). Packed misses promotion.
-The MTP/lookup screens and long1024 stress continue. Monitor`driver-v7.log`
-and`results/performance.json`; do not overlap MPI jobs. Native evidence is
-`a64fx/glm5/strata-mtp-batch-native-20261003.json`. No model gain or promotion
-is claimed. The qualified TP12 recipe remains35.462134/412.273634.
+All native gates PASS:20 embedding cases per rank(FP32/BF16),36 actual-weight
+MTP cache/rollback cases, and150 head cases per fast/conservative1/47/48-thread
+setting. The final head fixture uses varied signs/mantissas/exponents and
+rank seeds after a simple-input test weakness was found; immutablev6 passes
+10800 additional case instances, with the runtime binary unchanged. Priming
+five-pair component median2.663894×; strong head47-thread medians1.863/2.809/
+3.257/3.387× at2/3/4/5 positions. See`strata-mtp-batch-native-20261003.json`.
+
+Short128/full8049 speculative target endpoint states pass BIT_EXACT.
+All25 completed model runs/51 timed trials pass full129/257/1025 output
+counts and greedy-exact IDs; minimum available7.747742GiB. Five fresh
+alternating same-binary MTP pairs confirm **+6.6175% prefill/+1.2797% decode**.
+Scalar versus batch64/shared median rates are365.011296→389.126088 prefill,
+33.059193→33.331813 decode. Percentages are medians of paired ratios, not
+ratios of absolute-rate medians. Acceptance is identical122/133 in every
+pair. Last prefill pair only improves4.62%, retained in the report.
+
+**No plain-decode promotion.** Fresh frozen screen34.978736/410.478727,
+rebuilt34.647020/402.463020, packed34.490333/407.402491(decode/prefill).
+MTP depths2/4 adaptive and both lookup policies lose. Long1024 plain:
+34.929742/412.428817; adaptive MTP33.990409/389.203736 (902 fallback tokens);
+always MTP34.387190/389.345006. Every1025-ID output is exact. Depth1 target
+verification still costs about54ms per cycle; high acceptance alone cannot
+reach100 tok/s. Packed prefill halves the embedding phase0.050→0.023ms/token,
+but attention/FFN dominate. The rebuilt default has higher sparse-MLA time
+than frozen; profiles and both controls are retained. Feature gains are
+within MTP, not a faster replacement for plain decode. No32K MTP qualification
+or context-wide promotion is claimed; best qualified TP12 remains35.462134/
+412.273634. See`strata-mtp-batch-full-20261003.json` for all commands/hashes,
+trials, pairs and profiles. Next work should reduce actual verification and
+attention/FFN costs rather than assume deeper drafting will deliver the target.
+
+StagingPID129 and drivers1469/5423/7048 are terminal/PASS; no MPI benchmark
+remains active. PJM52128881 stays allocated until~23:18 JST, guard23:00; staged
+`/local/glm53f-*-52128881` images remain reusable until expiry. Do not restage
+or launch overlapping MPI jobs. Scripts/logs/results are under
+`tmp/strata-mtp-batch-20261003/`: `driver-v7`, `driver-confirmation-v1`,
+`driver-head-stress-v6`; build/runtimev5 and head-fixturev6 are immutable.
+Superseded waiting drivers stopped before any benchmark. Bridge ownership
+and allocation details above remain current. Nothing was pushed.
 
 The PP runner and all owned component constructors/stagers are now connected
 and cross-built. Native fixtures pass dense/shared28 cases each, KDA16,

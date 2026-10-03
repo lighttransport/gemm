@@ -6,6 +6,15 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Vary exponent and all mantissa bits so additions exercise FP32 rounding. */
+static float rounding_input(size_t index, uint32_t seed) {
+    uint32_t mix = (uint32_t)index * UINT32_C(1664525) + seed;
+    mix ^= mix >> 15; mix *= UINT32_C(2246822519); mix ^= mix >> 13;
+    uint32_t bits = (mix & UINT32_C(0x807fffff)) |
+                    ((UINT32_C(118) + ((mix >> 24) & 15u)) << 23);
+    float value; memcpy(&value, &bits, sizeof(value)); return value;
+}
+
 static float reference_dot(const float *w,const float *x,int n) {
     svfloat32_t a=svdup_f32(0);
     for(int i=0;i<n;i+=(int)svcntw()){
@@ -27,6 +36,7 @@ static void project(float *out,const float *w,const float *x,int rows,int cols,i
 }
 int main(int argc,char **argv) {
     MPI_Init(&argc,&argv);int rank;MPI_Comm_rank(MPI_COMM_WORLD,&rank);
+    if(!rank)puts("GLM53F_HEAD_VERIFY_INPUT varied_f32=1 exponent_range=118:133 per_rank_seed=1");
     const int columns[]={16,31,32,127,128,4096}, row_counts[]={1,2,3,17,12907};
     int ok=1,cases=0;
     for(size_t c=0;c<sizeof(columns)/sizeof(columns[0]);c++)for(size_t r=0;r<sizeof(row_counts)/sizeof(row_counts[0]);r++){
@@ -34,8 +44,8 @@ int main(int argc,char **argv) {
         size_t size=(size_t)rows*cols,output=(size_t)5*stride+2;
         float *w=malloc(size*4),*x=malloc((size_t)5*cols*4),*a=malloc(output*4),*b=malloc(output*4);
         if(!w||!x||!a||!b)MPI_Abort(MPI_COMM_WORLD,2);
-        for(size_t i=0;i<size;i++)w[i]=(float)((int)(i*31%257)-128)/128;
-        for(int i=0;i<5*cols;i++)x[i]=(float)((i*17+13)%251-125)/128;
+        for(size_t i=0;i<size;i++)w[i]=rounding_input(i,UINT32_C(77)+(uint32_t)rank);
+        for(int i=0;i<5*cols;i++)x[i]=rounding_input((size_t)i,UINT32_C(131)+(uint32_t)rank);
         for(int tokens=1;tokens<=5;tokens++){
             for(size_t i=0;i<output;i++)a[i]=b[i]=12345;
             project(a+1,w,x,rows,cols,tokens,0);project(b+1,w,x,rows,cols,tokens,1);

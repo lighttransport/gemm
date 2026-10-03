@@ -2,7 +2,7 @@
   "date": "2026-10-03",
   "allocation": 52128881,
   "hardware": "12 A64FX nodes compact2x3x2 normal2GHz/eco0",
-  "status": "native_exact_pass_full_model_pending",
+  "status": "native_exact_pass_with_varied_fp32_rounding_stress",
   "promoted": false,
   "targets_met": false,
   "default_options": {
@@ -1038,5 +1038,934 @@
     "Component speedups do not establish whole-model token throughput.",
     "All TP12 candidate paths remain opt-in.",
     "Synthetic cache fixture uses actual weights; complete coding-prompt qualification is separate."
-  ]
+  ],
+  "full_model_evidence": "strata-mtp-batch-full-20261003.json",
+  "implementation_commit": "79d67a35",
+  "original_head_fixture_input": "binary fractions; original timings retained, supplemented by varied mantissa/exponent stress",
+  "head_rounding_stress": {
+    "ranks": 12,
+    "case_instances": 10800,
+    "finite_and_guards": true,
+    "bit_exact": true,
+    "input": "all23 mantissa bits, signs, IEEE exponent118..133, independent per-rank seeds",
+    "source_sha256": "89e24994a7594d7cd54f454bd14620fffa652b69f54150873fdaa7bb3b36aa0c",
+    "kernel_header_sha256": "9bedbe5d94b543885646a9b2bfcf86072534ed33113874fa1f69805383fe9059",
+    "binary_sha256": {
+      "/home/u14346/work/gemm/glm53f-strata-20261001/a64fx/glm5/build/candidate-head-stress-v6/test_glm53f_head_verify-conservative": "d824b68aa905aff98ec4651750488905c9b2bdb7b9f234bf77eed6ed554ced47",
+      "/home/u14346/work/gemm/glm53f-strata-20261001/a64fx/glm5/build/candidate-head-stress-v6/test_glm53f_head_verify-fast": "32aa5f30be763d940a9b1e93882050dfb46270849e5bd8e12f7094afe736161b"
+    },
+    "variants": {
+      "fast-1": {
+        "cases_per_rank": 150,
+        "paired_timings": [
+          {
+            "tokens": 2,
+            "pair": 0,
+            "legacy_seconds": 0.034936383,
+            "shared_seconds": 0.01344916,
+            "speedup": 2.597662818
+          },
+          {
+            "tokens": 2,
+            "pair": 1,
+            "legacy_seconds": 0.034935953,
+            "shared_seconds": 0.013442147,
+            "speedup": 2.598986194
+          },
+          {
+            "tokens": 2,
+            "pair": 2,
+            "legacy_seconds": 0.034938957,
+            "shared_seconds": 0.01344748,
+            "speedup": 2.598178744
+          },
+          {
+            "tokens": 2,
+            "pair": 3,
+            "legacy_seconds": 0.03493621,
+            "shared_seconds": 0.013450713,
+            "speedup": 2.597350014
+          },
+          {
+            "tokens": 2,
+            "pair": 4,
+            "legacy_seconds": 0.034939733,
+            "shared_seconds": 0.013454147,
+            "speedup": 2.596949042
+          },
+          {
+            "tokens": 3,
+            "pair": 0,
+            "legacy_seconds": 0.052406863,
+            "shared_seconds": 0.017956557,
+            "speedup": 2.918536334
+          },
+          {
+            "tokens": 3,
+            "pair": 1,
+            "legacy_seconds": 0.052412323,
+            "shared_seconds": 0.017954753,
+            "speedup": 2.919133618
+          },
+          {
+            "tokens": 3,
+            "pair": 2,
+            "legacy_seconds": 0.05240964,
+            "shared_seconds": 0.017956303,
+            "speedup": 2.918732137
+          },
+          {
+            "tokens": 3,
+            "pair": 3,
+            "legacy_seconds": 0.052411697,
+            "shared_seconds": 0.01794947,
+            "speedup": 2.919957889
+          },
+          {
+            "tokens": 3,
+            "pair": 4,
+            "legacy_seconds": 0.052409997,
+            "shared_seconds": 0.01795666,
+            "speedup": 2.918694023
+          },
+          {
+            "tokens": 4,
+            "pair": 0,
+            "legacy_seconds": 0.069890463,
+            "shared_seconds": 0.0304352,
+            "speedup": 2.296369436
+          },
+          {
+            "tokens": 4,
+            "pair": 1,
+            "legacy_seconds": 0.069889303,
+            "shared_seconds": 0.030440213,
+            "speedup": 2.295953127
+          },
+          {
+            "tokens": 4,
+            "pair": 2,
+            "legacy_seconds": 0.069891933,
+            "shared_seconds": 0.03044769,
+            "speedup": 2.295475741
+          },
+          {
+            "tokens": 4,
+            "pair": 3,
+            "legacy_seconds": 0.069885677,
+            "shared_seconds": 0.030430063,
+            "speedup": 2.296599782
+          },
+          {
+            "tokens": 4,
+            "pair": 4,
+            "legacy_seconds": 0.06989125,
+            "shared_seconds": 0.03043765,
+            "speedup": 2.29621043
+          },
+          {
+            "tokens": 5,
+            "pair": 0,
+            "legacy_seconds": 0.08736761,
+            "shared_seconds": 0.046878883,
+            "speedup": 1.863687947
+          },
+          {
+            "tokens": 5,
+            "pair": 1,
+            "legacy_seconds": 0.08736473,
+            "shared_seconds": 0.04686473,
+            "speedup": 1.864189341
+          },
+          {
+            "tokens": 5,
+            "pair": 2,
+            "legacy_seconds": 0.087365833,
+            "shared_seconds": 0.046880497,
+            "speedup": 1.863585918
+          },
+          {
+            "tokens": 5,
+            "pair": 3,
+            "legacy_seconds": 0.087362227,
+            "shared_seconds": 0.04685958,
+            "speedup": 1.864340793
+          },
+          {
+            "tokens": 5,
+            "pair": 4,
+            "legacy_seconds": 0.087367223,
+            "shared_seconds": 0.046836597,
+            "speedup": 1.865362336
+          }
+        ],
+        "median_paired_speedup": {
+          "2": 2.597662818,
+          "3": 2.918732137,
+          "4": 2.29621043,
+          "5": 1.864189341
+        }
+      },
+      "fast-47": {
+        "cases_per_rank": 150,
+        "paired_timings": [
+          {
+            "tokens": 2,
+            "pair": 0,
+            "legacy_seconds": 0.00092123,
+            "shared_seconds": 0.00049172,
+            "speedup": 1.873484555
+          },
+          {
+            "tokens": 2,
+            "pair": 1,
+            "legacy_seconds": 0.00092831,
+            "shared_seconds": 0.000494434,
+            "speedup": 1.877522318
+          },
+          {
+            "tokens": 2,
+            "pair": 2,
+            "legacy_seconds": 0.000918227,
+            "shared_seconds": 0.00049756,
+            "speedup": 1.845459032
+          },
+          {
+            "tokens": 2,
+            "pair": 3,
+            "legacy_seconds": 0.000920426,
+            "shared_seconds": 0.000494267,
+            "speedup": 1.862206559
+          },
+          {
+            "tokens": 2,
+            "pair": 4,
+            "legacy_seconds": 0.000916067,
+            "shared_seconds": 0.000491663,
+            "speedup": 1.863199428
+          },
+          {
+            "tokens": 3,
+            "pair": 0,
+            "legacy_seconds": 0.00138204,
+            "shared_seconds": 0.00049316,
+            "speedup": 2.802418388
+          },
+          {
+            "tokens": 3,
+            "pair": 1,
+            "legacy_seconds": 0.001379847,
+            "shared_seconds": 0.00049128,
+            "speedup": 2.808675887
+          },
+          {
+            "tokens": 3,
+            "pair": 2,
+            "legacy_seconds": 0.00139107,
+            "shared_seconds": 0.000493947,
+            "speedup": 2.816234412
+          },
+          {
+            "tokens": 3,
+            "pair": 3,
+            "legacy_seconds": 0.00138285,
+            "shared_seconds": 0.000491053,
+            "speedup": 2.816088568
+          },
+          {
+            "tokens": 3,
+            "pair": 4,
+            "legacy_seconds": 0.001384127,
+            "shared_seconds": 0.000492847,
+            "speedup": 2.808433014
+          },
+          {
+            "tokens": 4,
+            "pair": 0,
+            "legacy_seconds": 0.001826427,
+            "shared_seconds": 0.000560693,
+            "speedup": 3.257442473
+          },
+          {
+            "tokens": 4,
+            "pair": 1,
+            "legacy_seconds": 0.001832073,
+            "shared_seconds": 0.00056216,
+            "speedup": 3.258989179
+          },
+          {
+            "tokens": 4,
+            "pair": 2,
+            "legacy_seconds": 0.00182632,
+            "shared_seconds": 0.00056349,
+            "speedup": 3.24108713
+          },
+          {
+            "tokens": 4,
+            "pair": 3,
+            "legacy_seconds": 0.00183187,
+            "shared_seconds": 0.00056077,
+            "speedup": 3.26670564
+          },
+          {
+            "tokens": 4,
+            "pair": 4,
+            "legacy_seconds": 0.001827224,
+            "shared_seconds": 0.000561334,
+            "speedup": 3.255147435
+          },
+          {
+            "tokens": 5,
+            "pair": 0,
+            "legacy_seconds": 0.00228675,
+            "shared_seconds": 0.000679933,
+            "speedup": 3.363198093
+          },
+          {
+            "tokens": 5,
+            "pair": 1,
+            "legacy_seconds": 0.002298347,
+            "shared_seconds": 0.000677546,
+            "speedup": 3.392160932
+          },
+          {
+            "tokens": 5,
+            "pair": 2,
+            "legacy_seconds": 0.00228404,
+            "shared_seconds": 0.00067438,
+            "speedup": 3.386874002
+          },
+          {
+            "tokens": 5,
+            "pair": 3,
+            "legacy_seconds": 0.002277363,
+            "shared_seconds": 0.000672313,
+            "speedup": 3.387353954
+          },
+          {
+            "tokens": 5,
+            "pair": 4,
+            "legacy_seconds": 0.002278773,
+            "shared_seconds": 0.000671433,
+            "speedup": 3.393894041
+          }
+        ],
+        "median_paired_speedup": {
+          "2": 1.863199428,
+          "3": 2.808675887,
+          "4": 3.257442473,
+          "5": 3.387353954
+        }
+      },
+      "fast-48": {
+        "cases_per_rank": 150,
+        "paired_timings": [
+          {
+            "tokens": 2,
+            "pair": 0,
+            "legacy_seconds": 0.00161064,
+            "shared_seconds": 0.00048586,
+            "speedup": 3.315028449
+          },
+          {
+            "tokens": 2,
+            "pair": 1,
+            "legacy_seconds": 0.00158171,
+            "shared_seconds": 0.000484577,
+            "speedup": 3.264106485
+          },
+          {
+            "tokens": 2,
+            "pair": 2,
+            "legacy_seconds": 0.001605613,
+            "shared_seconds": 0.000484773,
+            "speedup": 3.312090955
+          },
+          {
+            "tokens": 2,
+            "pair": 3,
+            "legacy_seconds": 0.001618303,
+            "shared_seconds": 0.000483233,
+            "speedup": 3.348905695
+          },
+          {
+            "tokens": 2,
+            "pair": 4,
+            "legacy_seconds": 0.001603757,
+            "shared_seconds": 0.00048602,
+            "speedup": 3.299775163
+          },
+          {
+            "tokens": 3,
+            "pair": 0,
+            "legacy_seconds": 0.002087637,
+            "shared_seconds": 0.00049301,
+            "speedup": 4.234469305
+          },
+          {
+            "tokens": 3,
+            "pair": 1,
+            "legacy_seconds": 0.00207796,
+            "shared_seconds": 0.000486506,
+            "speedup": 4.27118643
+          },
+          {
+            "tokens": 3,
+            "pair": 2,
+            "legacy_seconds": 0.002075207,
+            "shared_seconds": 0.000488793,
+            "speedup": 4.24557244
+          },
+          {
+            "tokens": 3,
+            "pair": 3,
+            "legacy_seconds": 0.002071833,
+            "shared_seconds": 0.000487704,
+            "speedup": 4.248140837
+          },
+          {
+            "tokens": 3,
+            "pair": 4,
+            "legacy_seconds": 0.002062777,
+            "shared_seconds": 0.000492927,
+            "speedup": 4.184753638
+          },
+          {
+            "tokens": 4,
+            "pair": 0,
+            "legacy_seconds": 0.003027863,
+            "shared_seconds": 0.000558897,
+            "speedup": 5.417573536
+          },
+          {
+            "tokens": 4,
+            "pair": 1,
+            "legacy_seconds": 0.00306892,
+            "shared_seconds": 0.000557763,
+            "speedup": 5.502192098
+          },
+          {
+            "tokens": 4,
+            "pair": 2,
+            "legacy_seconds": 0.003032237,
+            "shared_seconds": 0.000560333,
+            "speedup": 5.411487235
+          },
+          {
+            "tokens": 4,
+            "pair": 3,
+            "legacy_seconds": 0.003057713,
+            "shared_seconds": 0.000557477,
+            "speedup": 5.484917233
+          },
+          {
+            "tokens": 4,
+            "pair": 4,
+            "legacy_seconds": 0.00300381,
+            "shared_seconds": 0.000558223,
+            "speedup": 5.381018851
+          },
+          {
+            "tokens": 5,
+            "pair": 0,
+            "legacy_seconds": 0.00227513,
+            "shared_seconds": 0.000658903,
+            "speedup": 3.452904061
+          },
+          {
+            "tokens": 5,
+            "pair": 1,
+            "legacy_seconds": 0.00227911,
+            "shared_seconds": 0.000657397,
+            "speedup": 3.466871582
+          },
+          {
+            "tokens": 5,
+            "pair": 2,
+            "legacy_seconds": 0.0022851,
+            "shared_seconds": 0.000656497,
+            "speedup": 3.480748315
+          },
+          {
+            "tokens": 5,
+            "pair": 3,
+            "legacy_seconds": 0.002278876,
+            "shared_seconds": 0.000656627,
+            "speedup": 3.470580949
+          },
+          {
+            "tokens": 5,
+            "pair": 4,
+            "legacy_seconds": 0.0022864,
+            "shared_seconds": 0.000658467,
+            "speedup": 3.472308788
+          }
+        ],
+        "median_paired_speedup": {
+          "2": 3.312090955,
+          "3": 4.24557244,
+          "4": 5.417573536,
+          "5": 3.470580949
+        }
+      },
+      "conservative-1": {
+        "cases_per_rank": 150,
+        "paired_timings": [
+          {
+            "tokens": 2,
+            "pair": 0,
+            "legacy_seconds": 0.03509586,
+            "shared_seconds": 0.013721527,
+            "speedup": 2.557722691
+          },
+          {
+            "tokens": 2,
+            "pair": 1,
+            "legacy_seconds": 0.035076213,
+            "shared_seconds": 0.013723567,
+            "speedup": 2.555910911
+          },
+          {
+            "tokens": 2,
+            "pair": 2,
+            "legacy_seconds": 0.035097724,
+            "shared_seconds": 0.01372415,
+            "speedup": 2.55736954
+          },
+          {
+            "tokens": 2,
+            "pair": 3,
+            "legacy_seconds": 0.035088327,
+            "shared_seconds": 0.01373073,
+            "speedup": 2.555459627
+          },
+          {
+            "tokens": 2,
+            "pair": 4,
+            "legacy_seconds": 0.035076413,
+            "shared_seconds": 0.013726777,
+            "speedup": 2.555327727
+          },
+          {
+            "tokens": 3,
+            "pair": 0,
+            "legacy_seconds": 0.052625853,
+            "shared_seconds": 0.018601077,
+            "speedup": 2.82918318
+          },
+          {
+            "tokens": 3,
+            "pair": 1,
+            "legacy_seconds": 0.052630524,
+            "shared_seconds": 0.01859742,
+            "speedup": 2.829990587
+          },
+          {
+            "tokens": 3,
+            "pair": 2,
+            "legacy_seconds": 0.052624013,
+            "shared_seconds": 0.018597404,
+            "speedup": 2.829643028
+          },
+          {
+            "tokens": 3,
+            "pair": 3,
+            "legacy_seconds": 0.052629373,
+            "shared_seconds": 0.01859382,
+            "speedup": 2.830476632
+          },
+          {
+            "tokens": 3,
+            "pair": 4,
+            "legacy_seconds": 0.052628193,
+            "shared_seconds": 0.01859419,
+            "speedup": 2.830356842
+          },
+          {
+            "tokens": 4,
+            "pair": 0,
+            "legacy_seconds": 0.07018345,
+            "shared_seconds": 0.031537983,
+            "speedup": 2.225362652
+          },
+          {
+            "tokens": 4,
+            "pair": 1,
+            "legacy_seconds": 0.0701833,
+            "shared_seconds": 0.031543353,
+            "speedup": 2.224979048
+          },
+          {
+            "tokens": 4,
+            "pair": 2,
+            "legacy_seconds": 0.070190677,
+            "shared_seconds": 0.03153645,
+            "speedup": 2.225700002
+          },
+          {
+            "tokens": 4,
+            "pair": 3,
+            "legacy_seconds": 0.070205137,
+            "shared_seconds": 0.03154676,
+            "speedup": 2.225430971
+          },
+          {
+            "tokens": 4,
+            "pair": 4,
+            "legacy_seconds": 0.070182177,
+            "shared_seconds": 0.031534627,
+            "speedup": 2.225559133
+          },
+          {
+            "tokens": 5,
+            "pair": 0,
+            "legacy_seconds": 0.08774101,
+            "shared_seconds": 0.047906463,
+            "speedup": 1.831506727
+          },
+          {
+            "tokens": 5,
+            "pair": 1,
+            "legacy_seconds": 0.087737257,
+            "shared_seconds": 0.047880473,
+            "speedup": 1.832422504
+          },
+          {
+            "tokens": 5,
+            "pair": 2,
+            "legacy_seconds": 0.08773946,
+            "shared_seconds": 0.04790837,
+            "speedup": 1.831401498
+          },
+          {
+            "tokens": 5,
+            "pair": 3,
+            "legacy_seconds": 0.087745913,
+            "shared_seconds": 0.047896827,
+            "speedup": 1.831977596
+          },
+          {
+            "tokens": 5,
+            "pair": 4,
+            "legacy_seconds": 0.087771613,
+            "shared_seconds": 0.047902687,
+            "speedup": 1.832289988
+          }
+        ],
+        "median_paired_speedup": {
+          "2": 2.555910911,
+          "3": 2.829990587,
+          "4": 2.225430971,
+          "5": 1.831977596
+        }
+      },
+      "conservative-47": {
+        "cases_per_rank": 150,
+        "paired_timings": [
+          {
+            "tokens": 2,
+            "pair": 0,
+            "legacy_seconds": 0.00091815,
+            "shared_seconds": 0.00049787,
+            "speedup": 1.844156605
+          },
+          {
+            "tokens": 2,
+            "pair": 1,
+            "legacy_seconds": 0.000923547,
+            "shared_seconds": 0.000494733,
+            "speedup": 1.866757193
+          },
+          {
+            "tokens": 2,
+            "pair": 2,
+            "legacy_seconds": 0.00091837,
+            "shared_seconds": 0.000496713,
+            "speedup": 1.84889308
+          },
+          {
+            "tokens": 2,
+            "pair": 3,
+            "legacy_seconds": 0.000920403,
+            "shared_seconds": 0.00049292,
+            "speedup": 1.86724583
+          },
+          {
+            "tokens": 2,
+            "pair": 4,
+            "legacy_seconds": 0.000908903,
+            "shared_seconds": 0.00049792,
+            "speedup": 1.825400131
+          },
+          {
+            "tokens": 3,
+            "pair": 0,
+            "legacy_seconds": 0.001384443,
+            "shared_seconds": 0.00049589,
+            "speedup": 2.791836346
+          },
+          {
+            "tokens": 3,
+            "pair": 1,
+            "legacy_seconds": 0.00138681,
+            "shared_seconds": 0.000496347,
+            "speedup": 2.794036191
+          },
+          {
+            "tokens": 3,
+            "pair": 2,
+            "legacy_seconds": 0.00138292,
+            "shared_seconds": 0.000494787,
+            "speedup": 2.79498124
+          },
+          {
+            "tokens": 3,
+            "pair": 3,
+            "legacy_seconds": 0.001391103,
+            "shared_seconds": 0.000495813,
+            "speedup": 2.80570099
+          },
+          {
+            "tokens": 3,
+            "pair": 4,
+            "legacy_seconds": 0.00139027,
+            "shared_seconds": 0.00049712,
+            "speedup": 2.796648548
+          },
+          {
+            "tokens": 4,
+            "pair": 0,
+            "legacy_seconds": 0.00184132,
+            "shared_seconds": 0.00057203,
+            "speedup": 3.218921459
+          },
+          {
+            "tokens": 4,
+            "pair": 1,
+            "legacy_seconds": 0.00182881,
+            "shared_seconds": 0.000569477,
+            "speedup": 3.211386422
+          },
+          {
+            "tokens": 4,
+            "pair": 2,
+            "legacy_seconds": 0.001822827,
+            "shared_seconds": 0.00057356,
+            "speedup": 3.178092691
+          },
+          {
+            "tokens": 4,
+            "pair": 3,
+            "legacy_seconds": 0.00183753,
+            "shared_seconds": 0.000571473,
+            "speedup": 3.215426185
+          },
+          {
+            "tokens": 4,
+            "pair": 4,
+            "legacy_seconds": 0.001815007,
+            "shared_seconds": 0.000597836,
+            "speedup": 3.035958678
+          },
+          {
+            "tokens": 5,
+            "pair": 0,
+            "legacy_seconds": 0.002283913,
+            "shared_seconds": 0.0006895,
+            "speedup": 3.31241966
+          },
+          {
+            "tokens": 5,
+            "pair": 1,
+            "legacy_seconds": 0.002287617,
+            "shared_seconds": 0.00069034,
+            "speedup": 3.313753265
+          },
+          {
+            "tokens": 5,
+            "pair": 2,
+            "legacy_seconds": 0.00226693,
+            "shared_seconds": 0.00069186,
+            "speedup": 3.27657308
+          },
+          {
+            "tokens": 5,
+            "pair": 3,
+            "legacy_seconds": 0.002279757,
+            "shared_seconds": 0.00069106,
+            "speedup": 3.298927253
+          },
+          {
+            "tokens": 5,
+            "pair": 4,
+            "legacy_seconds": 0.002276707,
+            "shared_seconds": 0.000687533,
+            "speedup": 3.311412832
+          }
+        ],
+        "median_paired_speedup": {
+          "2": 1.84889308,
+          "3": 2.79498124,
+          "4": 3.211386422,
+          "5": 3.311412832
+        }
+      },
+      "conservative-48": {
+        "cases_per_rank": 150,
+        "paired_timings": [
+          {
+            "tokens": 2,
+            "pair": 0,
+            "legacy_seconds": 0.00161418,
+            "shared_seconds": 0.000494407,
+            "speedup": 3.264883414
+          },
+          {
+            "tokens": 2,
+            "pair": 1,
+            "legacy_seconds": 0.001601803,
+            "shared_seconds": 0.00049629,
+            "speedup": 3.227555293
+          },
+          {
+            "tokens": 2,
+            "pair": 2,
+            "legacy_seconds": 0.001623783,
+            "shared_seconds": 0.00049248,
+            "speedup": 3.297155994
+          },
+          {
+            "tokens": 2,
+            "pair": 3,
+            "legacy_seconds": 0.001627337,
+            "shared_seconds": 0.000494827,
+            "speedup": 3.288700761
+          },
+          {
+            "tokens": 2,
+            "pair": 4,
+            "legacy_seconds": 0.001619816,
+            "shared_seconds": 0.00049159,
+            "speedup": 3.29505621
+          },
+          {
+            "tokens": 3,
+            "pair": 0,
+            "legacy_seconds": 0.002073107,
+            "shared_seconds": 0.00048852,
+            "speedup": 4.243647661
+          },
+          {
+            "tokens": 3,
+            "pair": 1,
+            "legacy_seconds": 0.002063123,
+            "shared_seconds": 0.000486997,
+            "speedup": 4.236421784
+          },
+          {
+            "tokens": 3,
+            "pair": 2,
+            "legacy_seconds": 0.002068247,
+            "shared_seconds": 0.000487847,
+            "speedup": 4.239542872
+          },
+          {
+            "tokens": 3,
+            "pair": 3,
+            "legacy_seconds": 0.002100317,
+            "shared_seconds": 0.000490103,
+            "speedup": 4.285458022
+          },
+          {
+            "tokens": 3,
+            "pair": 4,
+            "legacy_seconds": 0.002072077,
+            "shared_seconds": 0.00049012,
+            "speedup": 4.227693159
+          },
+          {
+            "tokens": 4,
+            "pair": 0,
+            "legacy_seconds": 0.003021377,
+            "shared_seconds": 0.00058001,
+            "speedup": 5.209180541
+          },
+          {
+            "tokens": 4,
+            "pair": 1,
+            "legacy_seconds": 0.003024427,
+            "shared_seconds": 0.000582603,
+            "speedup": 5.191229693
+          },
+          {
+            "tokens": 4,
+            "pair": 2,
+            "legacy_seconds": 0.002989827,
+            "shared_seconds": 0.00058243,
+            "speedup": 5.133364852
+          },
+          {
+            "tokens": 4,
+            "pair": 3,
+            "legacy_seconds": 0.003059863,
+            "shared_seconds": 0.000581057,
+            "speedup": 5.266030886
+          },
+          {
+            "tokens": 4,
+            "pair": 4,
+            "legacy_seconds": 0.00306717,
+            "shared_seconds": 0.000587177,
+            "speedup": 5.223590853
+          },
+          {
+            "tokens": 5,
+            "pair": 0,
+            "legacy_seconds": 0.002293023,
+            "shared_seconds": 0.000821607,
+            "speedup": 2.790901843
+          },
+          {
+            "tokens": 5,
+            "pair": 1,
+            "legacy_seconds": 0.002287263,
+            "shared_seconds": 0.000817333,
+            "speedup": 2.79844615
+          },
+          {
+            "tokens": 5,
+            "pair": 2,
+            "legacy_seconds": 0.002280713,
+            "shared_seconds": 0.000819667,
+            "speedup": 2.782489014
+          },
+          {
+            "tokens": 5,
+            "pair": 3,
+            "legacy_seconds": 0.002277057,
+            "shared_seconds": 0.000818696,
+            "speedup": 2.7813197
+          },
+          {
+            "tokens": 5,
+            "pair": 4,
+            "legacy_seconds": 0.002289174,
+            "shared_seconds": 0.00081637,
+            "speedup": 2.804088052
+          }
+        ],
+        "median_paired_speedup": {
+          "2": 3.288700761,
+          "3": 4.239542872,
+          "4": 5.209180541,
+          "5": 2.790901843
+        }
+      }
+    },
+    "commands": [
+      "bash tmp/strata-mtp-batch-20261003/build-head-stress-v6.sh",
+      "bash tmp/strata-mtp-batch-20261003/driver-head-stress-v6.sh"
+    ],
+    "runtime_candidate_unchanged": true
+  }
 }
