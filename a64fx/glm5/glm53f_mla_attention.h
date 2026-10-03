@@ -77,6 +77,40 @@ static inline void mlb_logits_heads3_team(float *lg, const float *ql,
     }
 }
 
+/* Six-head decode values: divide each probability once, then share half-cache
+ * loads across two heads and32 columns. Probability and normalized storage may
+ * alias. All team members enter together; both work-sharing barriers remain. */
+static inline void mlb_values_normalized2_team(float *out, const float *probability,
+        float *normalized, const uint16_t *cache, const float *sum,
+        const int *selected, int nt) {
+#pragma omp for schedule(static)
+    for (int w = 0; w < 6 * nt; ++w) {
+        const int h = w / nt, t = w % nt;
+        normalized[(size_t)h * GLM53F_MLA_ATTENTION_SLOTS + t] =
+            probability[(size_t)h * GLM53F_MLA_ATTENTION_SLOTS + t] /
+            *((const volatile float *)sum + h);
+    }
+    const svbool_t pg = svptrue_b32();
+#pragma omp for schedule(static)
+    for (int w = 0; w < 3 * 16; ++w) {
+        const int h = (w / 16) * 2, begin = (w % 16) * 32;
+        svfloat32_t a = svdup_f32(0), b = a, c = a, d = a;
+        for (int t = 0; t < nt; ++t) {
+            const uint16_t *z = cache + (size_t)selected[t] * GLM53F_MLA_ATTENTION_LAT + begin;
+            const svfloat32_t z0 = glm53f_mla_cache_f16_load(pg, z);
+            const svfloat32_t z1 = glm53f_mla_cache_f16_load(pg, z + 16);
+            const float x = normalized[(size_t)h * GLM53F_MLA_ATTENTION_SLOTS + t];
+            const float y = normalized[(size_t)(h + 1) * GLM53F_MLA_ATTENTION_SLOTS + t];
+            a = svmla_n_f32_x(pg, a, z0, x); b = svmla_n_f32_x(pg, b, z1, x);
+            c = svmla_n_f32_x(pg, c, z0, y); d = svmla_n_f32_x(pg, d, z1, y);
+        }
+        float *o = out + (size_t)h * GLM53F_MLA_ATTENTION_LAT + begin;
+        svst1_f32(pg, o, a); svst1_f32(pg, o + 16, b);
+        svst1_f32(pg, o + GLM53F_MLA_ATTENTION_LAT, c);
+        svst1_f32(pg, o + GLM53F_MLA_ATTENTION_LAT + 16, d);
+    }
+}
+
 /* va[h][d] = sum_t p[h][t] * round16(cache[sel[t]][d]) in key order, 64 columns at a time. va rows: va + h*va_stride. */
 static inline __attribute__((always_inline)) void mlb_values(float *va, size_t va_stride, const float *lg,
         const float *cache, const uint16_t *half, const int *sel, int nt, const int NH) {

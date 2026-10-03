@@ -1,0 +1,1309 @@
+{
+  "date": "2026-10-04",
+  "allocation": 52138572,
+  "hardware": "12 A64FX nodes compact2x3x2 normal2GHz/eco0",
+  "production_changed": false,
+  "whole_model_measured": false,
+  "modes": {
+    "0": "legacy one head x64 columns",
+    "1": "two heads x32 columns",
+    "2": "three heads x16 columns"
+  },
+  "arithmetic": "Same volatile per-key division, ascending-key SVE FMA chain and half-cache conversion as legacy value64_f16",
+  "heads": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6
+  ],
+  "selected_counts": [
+    1,
+    3,
+    4,
+    7,
+    15,
+    16,
+    17,
+    127,
+    128,
+    2048,
+    2051,
+    2052
+  ],
+  "orders": [
+    "ascending",
+    "reverse",
+    "permuted"
+  ],
+  "input": "Varied signs/mantissas/exponents106..137 and per-rank seeds; positive unnormalized probabilities and nontrivial divisors",
+  "finite_guards": "IEEE exponent checks and entire strided output/canary memcmp",
+  "measurement": "12-rank maximum,100 calls inside one team, varying2052..2006 counts; seven rotating mode sweeps",
+  "total_case_instances": 20736,
+  "native": {
+    "values-fast-1.log": {
+      "cases_per_rank": 432,
+      "ranks": 12,
+      "case_instances": 5184,
+      "status": "BIT_EXACT PASS",
+      "trials": [
+        {
+          "heads": 5,
+          "trial": 0,
+          "mode": 0,
+          "seconds": 0.12243943
+        },
+        {
+          "heads": 5,
+          "trial": 0,
+          "mode": 1,
+          "seconds": 0.239435569
+        },
+        {
+          "heads": 5,
+          "trial": 0,
+          "mode": 2,
+          "seconds": 0.47407685
+        },
+        {
+          "heads": 5,
+          "trial": 1,
+          "mode": 1,
+          "seconds": 0.23943341
+        },
+        {
+          "heads": 5,
+          "trial": 1,
+          "mode": 2,
+          "seconds": 0.47407899
+        },
+        {
+          "heads": 5,
+          "trial": 1,
+          "mode": 0,
+          "seconds": 0.1224984
+        },
+        {
+          "heads": 5,
+          "trial": 2,
+          "mode": 2,
+          "seconds": 0.47407682
+        },
+        {
+          "heads": 5,
+          "trial": 2,
+          "mode": 0,
+          "seconds": 0.12249799
+        },
+        {
+          "heads": 5,
+          "trial": 2,
+          "mode": 1,
+          "seconds": 0.23944163
+        },
+        {
+          "heads": 5,
+          "trial": 3,
+          "mode": 0,
+          "seconds": 0.12249193
+        },
+        {
+          "heads": 5,
+          "trial": 3,
+          "mode": 1,
+          "seconds": 0.2394372
+        },
+        {
+          "heads": 5,
+          "trial": 3,
+          "mode": 2,
+          "seconds": 0.47407724
+        },
+        {
+          "heads": 5,
+          "trial": 4,
+          "mode": 1,
+          "seconds": 0.239440161
+        },
+        {
+          "heads": 5,
+          "trial": 4,
+          "mode": 2,
+          "seconds": 0.47408237
+        },
+        {
+          "heads": 5,
+          "trial": 4,
+          "mode": 0,
+          "seconds": 0.12249931
+        },
+        {
+          "heads": 5,
+          "trial": 5,
+          "mode": 2,
+          "seconds": 0.474076129
+        },
+        {
+          "heads": 5,
+          "trial": 5,
+          "mode": 0,
+          "seconds": 0.12250355
+        },
+        {
+          "heads": 5,
+          "trial": 5,
+          "mode": 1,
+          "seconds": 0.23943768
+        },
+        {
+          "heads": 5,
+          "trial": 6,
+          "mode": 0,
+          "seconds": 0.12248701
+        },
+        {
+          "heads": 5,
+          "trial": 6,
+          "mode": 1,
+          "seconds": 0.23943255
+        },
+        {
+          "heads": 5,
+          "trial": 6,
+          "mode": 2,
+          "seconds": 0.47408056
+        },
+        {
+          "heads": 6,
+          "trial": 0,
+          "mode": 0,
+          "seconds": 0.14701328
+        },
+        {
+          "heads": 6,
+          "trial": 0,
+          "mode": 1,
+          "seconds": 0.287236
+        },
+        {
+          "heads": 6,
+          "trial": 0,
+          "mode": 2,
+          "seconds": 0.570217061
+        },
+        {
+          "heads": 6,
+          "trial": 1,
+          "mode": 1,
+          "seconds": 0.28723844
+        },
+        {
+          "heads": 6,
+          "trial": 1,
+          "mode": 2,
+          "seconds": 0.57021617
+        },
+        {
+          "heads": 6,
+          "trial": 1,
+          "mode": 0,
+          "seconds": 0.146991709
+        },
+        {
+          "heads": 6,
+          "trial": 2,
+          "mode": 2,
+          "seconds": 0.57021683
+        },
+        {
+          "heads": 6,
+          "trial": 2,
+          "mode": 0,
+          "seconds": 0.14700862
+        },
+        {
+          "heads": 6,
+          "trial": 2,
+          "mode": 1,
+          "seconds": 0.287236069
+        },
+        {
+          "heads": 6,
+          "trial": 3,
+          "mode": 0,
+          "seconds": 0.1469837
+        },
+        {
+          "heads": 6,
+          "trial": 3,
+          "mode": 1,
+          "seconds": 0.28723674
+        },
+        {
+          "heads": 6,
+          "trial": 3,
+          "mode": 2,
+          "seconds": 0.57021904
+        },
+        {
+          "heads": 6,
+          "trial": 4,
+          "mode": 1,
+          "seconds": 0.287240519
+        },
+        {
+          "heads": 6,
+          "trial": 4,
+          "mode": 2,
+          "seconds": 0.5702165
+        },
+        {
+          "heads": 6,
+          "trial": 4,
+          "mode": 0,
+          "seconds": 0.146993849
+        },
+        {
+          "heads": 6,
+          "trial": 5,
+          "mode": 2,
+          "seconds": 0.570215439
+        },
+        {
+          "heads": 6,
+          "trial": 5,
+          "mode": 0,
+          "seconds": 0.14699547
+        },
+        {
+          "heads": 6,
+          "trial": 5,
+          "mode": 1,
+          "seconds": 0.2872413
+        },
+        {
+          "heads": 6,
+          "trial": 6,
+          "mode": 0,
+          "seconds": 0.14698934
+        },
+        {
+          "heads": 6,
+          "trial": 6,
+          "mode": 1,
+          "seconds": 0.287232921
+        },
+        {
+          "heads": 6,
+          "trial": 6,
+          "mode": 2,
+          "seconds": 0.57021587
+        }
+      ],
+      "paired_ratios": {
+        "5": {
+          "1": [
+            0.5113669222637511,
+            0.5116178230932767,
+            0.511598547002875,
+            0.511582703105449,
+            0.5116071985935559,
+            0.5116302079104675,
+            0.5115720899267873
+          ],
+          "2": [
+            0.25826916036925235,
+            0.25839238309210877,
+            0.2583927009972772,
+            0.25837968935188704,
+            0.25839246036506275,
+            0.2584048056973567,
+            0.2583675019283642
+          ]
+        },
+        "6": {
+          "1": [
+            0.5118205238897632,
+            0.5117410782484406,
+            0.5118041773507213,
+            0.5117162240457123,
+            0.5117448245524163,
+            0.5117490764733345,
+            0.5117426633697048
+          ],
+          "2": [
+            0.25781985502534793,
+            0.25778242837273446,
+            0.25781178714069175,
+            0.25776708543439725,
+            0.2577860321474387,
+            0.25778935459514973,
+            0.25777840942939734
+          ]
+        }
+      },
+      "median_ratios": {
+        "5": {
+          "1": 0.511598547002875,
+          "2": 0.25839238309210877
+        },
+        "6": {
+          "1": 0.5117448245524163,
+          "2": 0.2577860321474387
+        }
+      },
+      "log_sha256": "8ae142bf62d06d03d192ebe4e49fb69644f8facbb13666b0bd58dce012c8b33b"
+    },
+    "values-fast-47.log": {
+      "cases_per_rank": 432,
+      "ranks": 12,
+      "case_instances": 5184,
+      "status": "BIT_EXACT PASS",
+      "trials": [
+        {
+          "heads": 5,
+          "trial": 0,
+          "mode": 0,
+          "seconds": 0.00328205
+        },
+        {
+          "heads": 5,
+          "trial": 0,
+          "mode": 1,
+          "seconds": 0.01207514
+        },
+        {
+          "heads": 5,
+          "trial": 0,
+          "mode": 2,
+          "seconds": 0.01798089
+        },
+        {
+          "heads": 5,
+          "trial": 1,
+          "mode": 1,
+          "seconds": 0.01228286
+        },
+        {
+          "heads": 5,
+          "trial": 1,
+          "mode": 2,
+          "seconds": 0.017981181
+        },
+        {
+          "heads": 5,
+          "trial": 1,
+          "mode": 0,
+          "seconds": 0.0032787
+        },
+        {
+          "heads": 5,
+          "trial": 2,
+          "mode": 2,
+          "seconds": 0.01798369
+        },
+        {
+          "heads": 5,
+          "trial": 2,
+          "mode": 0,
+          "seconds": 0.00327766
+        },
+        {
+          "heads": 5,
+          "trial": 2,
+          "mode": 1,
+          "seconds": 0.012073399
+        },
+        {
+          "heads": 5,
+          "trial": 3,
+          "mode": 0,
+          "seconds": 0.003281971
+        },
+        {
+          "heads": 5,
+          "trial": 3,
+          "mode": 1,
+          "seconds": 0.01207384
+        },
+        {
+          "heads": 5,
+          "trial": 3,
+          "mode": 2,
+          "seconds": 0.017984269
+        },
+        {
+          "heads": 5,
+          "trial": 4,
+          "mode": 1,
+          "seconds": 0.01207178
+        },
+        {
+          "heads": 5,
+          "trial": 4,
+          "mode": 2,
+          "seconds": 0.01798012
+        },
+        {
+          "heads": 5,
+          "trial": 4,
+          "mode": 0,
+          "seconds": 0.0032786
+        },
+        {
+          "heads": 5,
+          "trial": 5,
+          "mode": 2,
+          "seconds": 0.0179812
+        },
+        {
+          "heads": 5,
+          "trial": 5,
+          "mode": 0,
+          "seconds": 0.00327759
+        },
+        {
+          "heads": 5,
+          "trial": 5,
+          "mode": 1,
+          "seconds": 0.01207328
+        },
+        {
+          "heads": 5,
+          "trial": 6,
+          "mode": 0,
+          "seconds": 0.00328063
+        },
+        {
+          "heads": 5,
+          "trial": 6,
+          "mode": 1,
+          "seconds": 0.01207407
+        },
+        {
+          "heads": 5,
+          "trial": 6,
+          "mode": 2,
+          "seconds": 0.01798023
+        },
+        {
+          "heads": 6,
+          "trial": 0,
+          "mode": 0,
+          "seconds": 0.00612544
+        },
+        {
+          "heads": 6,
+          "trial": 0,
+          "mode": 1,
+          "seconds": 0.012073341
+        },
+        {
+          "heads": 6,
+          "trial": 0,
+          "mode": 2,
+          "seconds": 0.01798305
+        },
+        {
+          "heads": 6,
+          "trial": 1,
+          "mode": 1,
+          "seconds": 0.01207297
+        },
+        {
+          "heads": 6,
+          "trial": 1,
+          "mode": 2,
+          "seconds": 0.01798168
+        },
+        {
+          "heads": 6,
+          "trial": 1,
+          "mode": 0,
+          "seconds": 0.00612605
+        },
+        {
+          "heads": 6,
+          "trial": 2,
+          "mode": 2,
+          "seconds": 0.01798152
+        },
+        {
+          "heads": 6,
+          "trial": 2,
+          "mode": 0,
+          "seconds": 0.00612731
+        },
+        {
+          "heads": 6,
+          "trial": 2,
+          "mode": 1,
+          "seconds": 0.01207321
+        },
+        {
+          "heads": 6,
+          "trial": 3,
+          "mode": 0,
+          "seconds": 0.006126329
+        },
+        {
+          "heads": 6,
+          "trial": 3,
+          "mode": 1,
+          "seconds": 0.01207422
+        },
+        {
+          "heads": 6,
+          "trial": 3,
+          "mode": 2,
+          "seconds": 0.01798332
+        },
+        {
+          "heads": 6,
+          "trial": 4,
+          "mode": 1,
+          "seconds": 0.012073521
+        },
+        {
+          "heads": 6,
+          "trial": 4,
+          "mode": 2,
+          "seconds": 0.01798383
+        },
+        {
+          "heads": 6,
+          "trial": 4,
+          "mode": 0,
+          "seconds": 0.00612648
+        },
+        {
+          "heads": 6,
+          "trial": 5,
+          "mode": 2,
+          "seconds": 0.01798242
+        },
+        {
+          "heads": 6,
+          "trial": 5,
+          "mode": 0,
+          "seconds": 0.006125879
+        },
+        {
+          "heads": 6,
+          "trial": 5,
+          "mode": 1,
+          "seconds": 0.01207345
+        },
+        {
+          "heads": 6,
+          "trial": 6,
+          "mode": 0,
+          "seconds": 0.00612659
+        },
+        {
+          "heads": 6,
+          "trial": 6,
+          "mode": 1,
+          "seconds": 0.012074339
+        },
+        {
+          "heads": 6,
+          "trial": 6,
+          "mode": 2,
+          "seconds": 0.017983991
+        }
+      ],
+      "paired_ratios": {
+        "5": {
+          "1": [
+            0.2718022316925518,
+            0.2669329455843346,
+            0.2714778166446748,
+            0.2718249537843801,
+            0.2715920932952721,
+            0.2714746945320575,
+            0.27170871131275537
+          ],
+          "2": [
+            0.18252989701844569,
+            0.18234063713612583,
+            0.18225736764813005,
+            0.18249120940083802,
+            0.1823458352891972,
+            0.18227871332280382,
+            0.1824576215098472
+          ]
+        },
+        "6": {
+          "1": [
+            0.5073525215596909,
+            0.5074186384957471,
+            0.5075129149579939,
+            0.5073892143757526,
+            0.5074310965293388,
+            0.5073843019186728,
+            0.5074058298346601
+          ],
+          "2": [
+            0.34062297552417414,
+            0.3406828505456665,
+            0.3407559538904386,
+            0.3406672961388664,
+            0.3406660316517672,
+            0.34065932171531976,
+            0.34066909842203547
+          ]
+        }
+      },
+      "median_ratios": {
+        "5": {
+          "1": 0.2715920932952721,
+          "2": 0.1823458352891972
+        },
+        "6": {
+          "1": 0.5074058298346601,
+          "2": 0.3406672961388664
+        }
+      },
+      "log_sha256": "472b4b8d342d89cc93daceeae0a7e22aed065202418738e17a34181c318cf09d"
+    },
+    "values-conservative-1.log": {
+      "cases_per_rank": 432,
+      "ranks": 12,
+      "case_instances": 5184,
+      "status": "BIT_EXACT PASS",
+      "trials": [
+        {
+          "heads": 5,
+          "trial": 0,
+          "mode": 0,
+          "seconds": 0.11991123
+        },
+        {
+          "heads": 5,
+          "trial": 0,
+          "mode": 1,
+          "seconds": 0.23907934
+        },
+        {
+          "heads": 5,
+          "trial": 0,
+          "mode": 2,
+          "seconds": 0.47398355
+        },
+        {
+          "heads": 5,
+          "trial": 1,
+          "mode": 1,
+          "seconds": 0.23907335
+        },
+        {
+          "heads": 5,
+          "trial": 1,
+          "mode": 2,
+          "seconds": 0.47398285
+        },
+        {
+          "heads": 5,
+          "trial": 1,
+          "mode": 0,
+          "seconds": 0.1199083
+        },
+        {
+          "heads": 5,
+          "trial": 2,
+          "mode": 2,
+          "seconds": 0.47398334
+        },
+        {
+          "heads": 5,
+          "trial": 2,
+          "mode": 0,
+          "seconds": 0.11990802
+        },
+        {
+          "heads": 5,
+          "trial": 2,
+          "mode": 1,
+          "seconds": 0.23907133
+        },
+        {
+          "heads": 5,
+          "trial": 3,
+          "mode": 0,
+          "seconds": 0.1199085
+        },
+        {
+          "heads": 5,
+          "trial": 3,
+          "mode": 1,
+          "seconds": 0.23907411
+        },
+        {
+          "heads": 5,
+          "trial": 3,
+          "mode": 2,
+          "seconds": 0.47398307
+        },
+        {
+          "heads": 5,
+          "trial": 4,
+          "mode": 1,
+          "seconds": 0.23907451
+        },
+        {
+          "heads": 5,
+          "trial": 4,
+          "mode": 2,
+          "seconds": 0.47398289
+        },
+        {
+          "heads": 5,
+          "trial": 4,
+          "mode": 0,
+          "seconds": 0.119909449
+        },
+        {
+          "heads": 5,
+          "trial": 5,
+          "mode": 2,
+          "seconds": 0.47398337
+        },
+        {
+          "heads": 5,
+          "trial": 5,
+          "mode": 0,
+          "seconds": 0.11991005
+        },
+        {
+          "heads": 5,
+          "trial": 5,
+          "mode": 1,
+          "seconds": 0.239074711
+        },
+        {
+          "heads": 5,
+          "trial": 6,
+          "mode": 0,
+          "seconds": 0.11990837
+        },
+        {
+          "heads": 5,
+          "trial": 6,
+          "mode": 1,
+          "seconds": 0.23907207
+        },
+        {
+          "heads": 5,
+          "trial": 6,
+          "mode": 2,
+          "seconds": 0.47398362
+        },
+        {
+          "heads": 6,
+          "trial": 0,
+          "mode": 0,
+          "seconds": 0.14387519
+        },
+        {
+          "heads": 6,
+          "trial": 0,
+          "mode": 1,
+          "seconds": 0.28693521
+        },
+        {
+          "heads": 6,
+          "trial": 0,
+          "mode": 2,
+          "seconds": 0.570169111
+        },
+        {
+          "heads": 6,
+          "trial": 1,
+          "mode": 1,
+          "seconds": 0.28693463
+        },
+        {
+          "heads": 6,
+          "trial": 1,
+          "mode": 2,
+          "seconds": 0.57016937
+        },
+        {
+          "heads": 6,
+          "trial": 1,
+          "mode": 0,
+          "seconds": 0.14387595
+        },
+        {
+          "heads": 6,
+          "trial": 2,
+          "mode": 2,
+          "seconds": 0.57023779
+        },
+        {
+          "heads": 6,
+          "trial": 2,
+          "mode": 0,
+          "seconds": 0.14394079
+        },
+        {
+          "heads": 6,
+          "trial": 2,
+          "mode": 1,
+          "seconds": 0.28693388
+        },
+        {
+          "heads": 6,
+          "trial": 3,
+          "mode": 0,
+          "seconds": 0.14387507
+        },
+        {
+          "heads": 6,
+          "trial": 3,
+          "mode": 1,
+          "seconds": 0.28694279
+        },
+        {
+          "heads": 6,
+          "trial": 3,
+          "mode": 2,
+          "seconds": 0.57017909
+        },
+        {
+          "heads": 6,
+          "trial": 4,
+          "mode": 1,
+          "seconds": 0.28693401
+        },
+        {
+          "heads": 6,
+          "trial": 4,
+          "mode": 2,
+          "seconds": 0.570168991
+        },
+        {
+          "heads": 6,
+          "trial": 4,
+          "mode": 0,
+          "seconds": 0.14387483
+        },
+        {
+          "heads": 6,
+          "trial": 5,
+          "mode": 2,
+          "seconds": 0.57016903
+        },
+        {
+          "heads": 6,
+          "trial": 5,
+          "mode": 0,
+          "seconds": 0.14387633
+        },
+        {
+          "heads": 6,
+          "trial": 5,
+          "mode": 1,
+          "seconds": 0.28693357
+        },
+        {
+          "heads": 6,
+          "trial": 6,
+          "mode": 0,
+          "seconds": 0.14387787
+        },
+        {
+          "heads": 6,
+          "trial": 6,
+          "mode": 1,
+          "seconds": 0.28693597
+        },
+        {
+          "heads": 6,
+          "trial": 6,
+          "mode": 2,
+          "seconds": 0.570168721
+        }
+      ],
+      "paired_ratios": {
+        "5": {
+          "1": [
+            0.5015541284328457,
+            0.5015544392547309,
+            0.5015575058707374,
+            0.5015536814086644,
+            0.5015568117236756,
+            0.5015589039026382,
+            0.5015574173930062
+          ],
+          "2": [
+            0.25298605827143156,
+            0.25298025023479226,
+            0.2529793979678695,
+            0.2529805547696039,
+            0.25298265302361445,
+            0.2529836648066366,
+            0.25297998694554047
+          ]
+        },
+        "6": {
+          "1": [
+            0.5014204774659756,
+            0.5014241397073612,
+            0.5016514257570421,
+            0.5014068135324118,
+            0.5014213198358745,
+            0.5014273164342533,
+            0.5014284894291922
+          ],
+          "2": [
+            0.25233774896655176,
+            0.25233896727914373,
+            0.25242239733006827,
+            0.2523331222125315,
+            0.252337170682788,
+            0.25233978422153164,
+            0.2523426219306758
+          ]
+        }
+      },
+      "median_ratios": {
+        "5": {
+          "1": 0.5015568117236756,
+          "2": 0.2529805547696039
+        },
+        "6": {
+          "1": 0.5014241397073612,
+          "2": 0.25233896727914373
+        }
+      },
+      "log_sha256": "e8bd6159792a095d595a50e9493922bbf4717f1aae722d72758289260fc32565"
+    },
+    "values-conservative-47.log": {
+      "cases_per_rank": 432,
+      "ranks": 12,
+      "case_instances": 5184,
+      "status": "BIT_EXACT PASS",
+      "trials": [
+        {
+          "heads": 5,
+          "trial": 0,
+          "mode": 0,
+          "seconds": 0.003282879
+        },
+        {
+          "heads": 5,
+          "trial": 0,
+          "mode": 1,
+          "seconds": 0.01210848
+        },
+        {
+          "heads": 5,
+          "trial": 0,
+          "mode": 2,
+          "seconds": 0.01800872
+        },
+        {
+          "heads": 5,
+          "trial": 1,
+          "mode": 1,
+          "seconds": 0.0120748
+        },
+        {
+          "heads": 5,
+          "trial": 1,
+          "mode": 2,
+          "seconds": 0.0179812
+        },
+        {
+          "heads": 5,
+          "trial": 1,
+          "mode": 0,
+          "seconds": 0.003275489
+        },
+        {
+          "heads": 5,
+          "trial": 2,
+          "mode": 2,
+          "seconds": 0.01800407
+        },
+        {
+          "heads": 5,
+          "trial": 2,
+          "mode": 0,
+          "seconds": 0.00327616
+        },
+        {
+          "heads": 5,
+          "trial": 2,
+          "mode": 1,
+          "seconds": 0.01207438
+        },
+        {
+          "heads": 5,
+          "trial": 3,
+          "mode": 0,
+          "seconds": 0.00327592
+        },
+        {
+          "heads": 5,
+          "trial": 3,
+          "mode": 1,
+          "seconds": 0.0120752
+        },
+        {
+          "heads": 5,
+          "trial": 3,
+          "mode": 2,
+          "seconds": 0.01798532
+        },
+        {
+          "heads": 5,
+          "trial": 4,
+          "mode": 1,
+          "seconds": 0.01207423
+        },
+        {
+          "heads": 5,
+          "trial": 4,
+          "mode": 2,
+          "seconds": 0.0179803
+        },
+        {
+          "heads": 5,
+          "trial": 4,
+          "mode": 0,
+          "seconds": 0.00327566
+        },
+        {
+          "heads": 5,
+          "trial": 5,
+          "mode": 2,
+          "seconds": 0.01799592
+        },
+        {
+          "heads": 5,
+          "trial": 5,
+          "mode": 0,
+          "seconds": 0.00327564
+        },
+        {
+          "heads": 5,
+          "trial": 5,
+          "mode": 1,
+          "seconds": 0.01207456
+        },
+        {
+          "heads": 5,
+          "trial": 6,
+          "mode": 0,
+          "seconds": 0.00327837
+        },
+        {
+          "heads": 5,
+          "trial": 6,
+          "mode": 1,
+          "seconds": 0.01207532
+        },
+        {
+          "heads": 5,
+          "trial": 6,
+          "mode": 2,
+          "seconds": 0.01803572
+        },
+        {
+          "heads": 6,
+          "trial": 0,
+          "mode": 0,
+          "seconds": 0.00617737
+        },
+        {
+          "heads": 6,
+          "trial": 0,
+          "mode": 1,
+          "seconds": 0.01211797
+        },
+        {
+          "heads": 6,
+          "trial": 0,
+          "mode": 2,
+          "seconds": 0.01799465
+        },
+        {
+          "heads": 6,
+          "trial": 1,
+          "mode": 1,
+          "seconds": 0.01207624
+        },
+        {
+          "heads": 6,
+          "trial": 1,
+          "mode": 2,
+          "seconds": 0.018014261
+        },
+        {
+          "heads": 6,
+          "trial": 1,
+          "mode": 0,
+          "seconds": 0.00612705
+        },
+        {
+          "heads": 6,
+          "trial": 2,
+          "mode": 2,
+          "seconds": 0.01801332
+        },
+        {
+          "heads": 6,
+          "trial": 2,
+          "mode": 0,
+          "seconds": 0.00612709
+        },
+        {
+          "heads": 6,
+          "trial": 2,
+          "mode": 1,
+          "seconds": 0.01207657
+        },
+        {
+          "heads": 6,
+          "trial": 3,
+          "mode": 0,
+          "seconds": 0.00612739
+        },
+        {
+          "heads": 6,
+          "trial": 3,
+          "mode": 1,
+          "seconds": 0.01207547
+        },
+        {
+          "heads": 6,
+          "trial": 3,
+          "mode": 2,
+          "seconds": 0.01801077
+        },
+        {
+          "heads": 6,
+          "trial": 4,
+          "mode": 1,
+          "seconds": 0.01207609
+        },
+        {
+          "heads": 6,
+          "trial": 4,
+          "mode": 2,
+          "seconds": 0.01798651
+        },
+        {
+          "heads": 6,
+          "trial": 4,
+          "mode": 0,
+          "seconds": 0.00612783
+        },
+        {
+          "heads": 6,
+          "trial": 5,
+          "mode": 2,
+          "seconds": 0.01802939
+        },
+        {
+          "heads": 6,
+          "trial": 5,
+          "mode": 0,
+          "seconds": 0.006126081
+        },
+        {
+          "heads": 6,
+          "trial": 5,
+          "mode": 1,
+          "seconds": 0.01207583
+        },
+        {
+          "heads": 6,
+          "trial": 6,
+          "mode": 0,
+          "seconds": 0.00612703
+        },
+        {
+          "heads": 6,
+          "trial": 6,
+          "mode": 1,
+          "seconds": 0.01207561
+        },
+        {
+          "heads": 6,
+          "trial": 6,
+          "mode": 2,
+          "seconds": 0.01798553
+        }
+      ],
+      "paired_ratios": {
+        "5": {
+          "1": [
+            0.2711223043685087,
+            0.27126652201278695,
+            0.2713315300661401,
+            0.2712932290976547,
+            0.2712934903509375,
+            0.27128441947367027,
+            0.2714934262611674
+          ],
+          "2": [
+            0.18229385542115153,
+            0.18216186906324383,
+            0.1819677439601157,
+            0.18214410419164073,
+            0.18218049754453486,
+            0.18202125815184775,
+            0.18177095231019333
+          ]
+        },
+        "6": {
+          "1": [
+            0.5097693755637289,
+            0.507364047087504,
+            0.5073534952391283,
+            0.5074245557315782,
+            0.5074349396203572,
+            0.5073010302397434,
+            0.507388860686955
+          ],
+          "2": [
+            0.34328925541758243,
+            0.3401221954095147,
+            0.3401421836729709,
+            0.3402069983681986,
+            0.34069032847395075,
+            0.33978304313124297,
+            0.34066441189111474
+          ]
+        }
+      },
+      "median_ratios": {
+        "5": {
+          "1": 0.2712932290976547,
+          "2": 0.18214410419164073
+        },
+        "6": {
+          "1": 0.507388860686955,
+          "2": 0.3402069983681986
+        }
+      },
+      "log_sha256": "80bd2070c860622ad6a08d9ed4a3c3ad47c0d60b732b6fba140d535449933d9a"
+    }
+  },
+  "source_and_binary_sha256": {
+    "test_glm53f_mla_values_team.c": "c9c6b7765876c14579c2b409b94c39ebb59c2f4b7dcd954b6480a959db207e28",
+    "glm53f_mla_absorb.h": "fa18b2ca639971bb69606a975e732afa2e79c1e287de26e22c638e6543164edd",
+    "glm53f_mla_cache_f16.h": "f9a0436f75b628a492d0d0b9e33d02ff276dc8fbe4f77c8a6e2f877ac6f580ce",
+    "/home/u14346/work/gemm/glm53f-strata-20261001/a64fx/glm5/build/candidate-mla-values-probe-v1/test_glm53f_mla_values_team-conservative": "5b3e1bc165b7a26ee7278b021018e04c25cf9e69fa256d425302828e05916af2",
+    "/home/u14346/work/gemm/glm53f-strata-20261001/a64fx/glm5/build/candidate-mla-values-probe-v1/test_glm53f_mla_values_team-fast": "acb49a29ff9e3b93a0b713e1cb094d766c4ed6dcdd60c7fcc4d15f4df74165be"
+  },
+  "fixture_source_v1": "#include \"glm53f_mla_absorb.h\"\n#include <mpi.h>\n#include <omp.h>\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <stdint.h>\n#include <math.h>\n\nenum { S = 2052, D = 512, H = 6, GUARD = 16 };\n/* Diagnostic only: retain the volatile division and ascending selected-key\n * FMAs of value64_f16; share the half-cache loads across independent heads. */\nstatic inline __attribute__((always_inline)) void grouped_tile(float *out,\n        const uint16_t *cache, const float *prob, const float *sum,\n        const int *selected, int nt, int begin, const int nh, const int nc) {\n    const svbool_t pg = svptrue_b32();\n    svfloat32_t a0 = svdup_f32(0), b0 = a0;\n    svfloat32_t a1 = a0, b1 = a0, a2 = a0, b2 = a0;\n    for (int t = 0; t < nt; ++t) {\n        const uint16_t *z = cache + (size_t)selected[t] * D + begin;\n        svfloat32_t z0 = glm53f_mla_cache_f16_load(pg, z);\n        svfloat32_t z1 = z0;\n        if (nc == 2) z1 = glm53f_mla_cache_f16_load(pg, z + 16);\n#define STEP(N) if ((N) < nh) { \\\n        float x = prob[(size_t)(N) * S + t] / *((const volatile float *)sum + (N)); \\\n        a##N = svmla_n_f32_x(pg, a##N, z0, x); \\\n        if (nc == 2) b##N = svmla_n_f32_x(pg, b##N, z1, x); }\n        STEP(0); STEP(1); STEP(2);\n#undef STEP\n    }\n#define STORE(N) if ((N) < nh) { \\\n    svst1_f32(pg, out + (size_t)(N) * D + begin, a##N); \\\n    if (nc == 2) svst1_f32(pg, out + (size_t)(N) * D + begin + 16, b##N); }\n    STORE(0); STORE(1); STORE(2);\n#undef STORE\n}\nstatic void values_team(float *out, const uint16_t *cache, const float *prob,\n        const float *sum, const int *selected, int nt, int heads, int mode) {\n    if (!mode) {\n#pragma omp for schedule(static)\n        for (int w = 0; w < heads * 8; ++w)\n            glm53f_mla_value64_f16(out + (size_t)(w / 8) * D, cache,\n                prob + (size_t)(w / 8) * S, sum + w / 8, selected, nt, (w % 8) * 64);\n    } else {\n        const int group = mode == 1 ? 2 : 3, columns = mode == 1 ? 32 : 16;\n        const int blocks = D / columns;\n#pragma omp for schedule(static)\n        for (int w = 0; w < ((heads + group - 1) / group) * blocks; ++w) {\n            int h = (w / blocks) * group, begin = (w % blocks) * columns;\n            int n = heads - h < group ? heads - h : group;\n            float *o = out + (size_t)h * D;\n            const float *p = prob + (size_t)h * S, *s = sum + h;\n            if (mode == 1) {\n                if (n == 1) grouped_tile(o, cache, p, s, selected, nt, begin, 1, 2);\n                else grouped_tile(o, cache, p, s, selected, nt, begin, 2, 2);\n            } else {\n                switch (n) {\n                case 1: grouped_tile(o, cache, p, s, selected, nt, begin, 1, 1); break;\n                case 2: grouped_tile(o, cache, p, s, selected, nt, begin, 2, 1); break;\n                case 3: grouped_tile(o, cache, p, s, selected, nt, begin, 3, 1); break;\n                }\n            }\n        }\n    }\n}\nstatic float input(uint32_t *seed) {\n    *seed = *seed * 1664525u + 1013904223u;\n    uint32_t bits = (*seed & UINT32_C(0x807fffff)) |\n        ((106u + ((*seed >> 24) & 31u)) << 23);\n    float x; memcpy(&x, &bits, sizeof(x)); return x;\n}\nint main(int argc, char **argv) {\n    MPI_Init(&argc, &argv);\n    int rank; MPI_Comm_rank(MPI_COMM_WORLD, &rank);\n    float *cache = malloc((size_t)S * D * sizeof(float));\n    uint16_t *half = malloc((size_t)S * D * sizeof(uint16_t));\n    float prob[H * S], sums[H], expected[H * D + GUARD], actual[H * D + GUARD];\n    int selected[S], bad = 0, cases = 0;\n    if (!cache || !half || svcntw() != 16) MPI_Abort(MPI_COMM_WORLD, 2);\n    uint32_t seed = 173u + (uint32_t)rank * 71u;\n    for (int i = 0; i < S * D; ++i) cache[i] = input(&seed);\n    glm53f_mla_cache_f16_store(half, cache, S * D);\n    for (int h = 0; h < H; ++h) {\n        sums[h] = 1.3f + 0.71f * h;\n        for (int t = 0; t < S; ++t) prob[h * S + t] = fabsf(input(&seed)) * 0.0031f;\n    }\n    const int counts[] = {1, 3, 4, 7, 15, 16, 17, 127, 128, 2048, 2051, 2052};\n    for (int order = 0; order < 3; ++order) {\n        for (int i = 0; i < S; ++i)\n            selected[i] = order == 0 ? i : order == 1 ? S - 1 - i : (i * 37) % S;\n        for (int heads = 1; heads <= H; ++heads)\n            for (size_t ci = 0; ci < sizeof(counts) / sizeof(counts[0]); ++ci) {\n                int nt = counts[ci];\n                memset(expected, 0xa5, sizeof(expected));\n#pragma omp parallel\n                { values_team(expected, half, prob, sums, selected, nt, heads, 0); }\n                for (int mode = 1; mode <= 2; ++mode) {\n                    memset(actual, 0xa5, sizeof(actual));\n#pragma omp parallel\n                    { values_team(actual, half, prob, sums, selected, nt, heads, mode); }\n                    bad |= memcmp(expected, actual, sizeof(actual)) != 0;\n                    for (int i = 0; i < heads * D; ++i) {\n                        uint32_t bits; memcpy(&bits, actual + i, 4);\n                        bad |= (bits & UINT32_C(0x7f800000)) == UINT32_C(0x7f800000);\n                    }\n                    ++cases;\n                }\n            }\n    }\n    int global; MPI_Allreduce(&bad, &global, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);\n    if (!rank) printf(\"MLA_VALUES_TEAM cases=%d finite_values_guards=%s %s\\n\", cases,\n        global ? \"FAIL\" : \"BIT_EXACT\", global ? \"FAIL\" : \"PASS\");\n    if (global) MPI_Abort(MPI_COMM_WORLD, 3);\n    for (int i = 0; i < S; ++i) selected[i] = (i * 37) % S;\n    for (int heads = 5; heads <= H; ++heads)\n        for (int trial = 0; trial < 7; ++trial)\n            for (int step = 0; step < 3; ++step) {\n                int mode = (trial + step) % 3;\n                MPI_Barrier(MPI_COMM_WORLD);\n                double start = MPI_Wtime();\n#pragma omp parallel\n                {\n                    for (int repeat = 0; repeat < 100; ++repeat)\n                        values_team(actual, half, prob, sums, selected, S - repeat % 47, heads, mode);\n                }\n                double dt = MPI_Wtime() - start, maximum;\n                MPI_Reduce(&dt, &maximum, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);\n                if (!rank) printf(\"MLA_VALUES_TEAM_TIME heads=%d trial=%d mode=%d seconds=%.9f\\n\",\n                    heads, trial, mode, maximum);\n            }\n    free(cache); free(half); MPI_Finalize(); return 0;\n}\n",
+  "build_source_note": "Restore the embedded v1 fixture to the canonical source path before replaying the v1 build; the final fixture also adds a prescaled mode.",
+  "build_script": "#!/bin/bash\nset -euo pipefail\ncd \"$HOME/work/gemm/glm53f-strata-20261001/a64fx/glm5\"\nwork=$PWD/../../tmp/strata-mla-logits-20261003\nbin=$PWD/build/candidate-mla-values-probe-v1\n[ ! -e \"$bin\" ]\nmkdir -p \"$bin\"\nexport TMPDIR=$work OPAL_PREFIX=/opt/FJSVxtclanga/tcsds-1.2.43\nunset OMPI_CC OMPI_CXX\ncc=/opt/FJSVxtclanga/tcsds-1.2.43/bin/mpifccpx\nflags=(-Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast -fopenmp -Wall -Wextra -Werror -I. -I../../common)\n\"$cc\" \"${flags[@]}\" -ffast-math -fno-math-errno test_glm53f_mla_values_team.c -lm -o \"$bin/test_glm53f_mla_values_team-fast\"\n\"$cc\" \"${flags[@]}\" test_glm53f_mla_values_team.c -lm -o \"$bin/test_glm53f_mla_values_team-conservative\"\nsha256sum test_glm53f_mla_values_team.c glm53f_mla_absorb.h glm53f_mla_cache_f16.h \"$bin\"/test* > \"$work/values-provenance-v1.sha256\"\necho MLA_VALUES_BUILD_PASS\n",
+  "driver_script": "#!/bin/bash\nset -euo pipefail\ncd \"$HOME/work/gemm/glm53f-strata-20261001\"\nlogs=$PWD/tmp/strata-mla-logits-20261003\n[ \"${PJM_JOBID:-}\" = 52138572 ] && [ \"$PJM_NODE\" = 12 ]\nguard=$(date -d '2026-10-04 04:45:00 JST' +%s)\nwhile ps -p 674 -o args= | grep -q 'bash tmp/strata-mla-logits-20261003/driver-full-v3.sh'; do\n [ \"$(date +%s)\" -lt \"$guard\" ] || exit 75\n sleep 10\ndone\ngrep -q '^MLA_LOGITS_FULL_PASS$' \"$logs/driver-full-v3.log\" || exit 2\ngrep -q '^MLA_VALUES_BUILD_PASS$' \"$logs/build-values-v1.log\" || exit 2\n[ \"$(date +%s)\" -lt \"$((guard-600))\" ] || exit 75\nif pgrep -f '[m]piexec|[p]lexec|[p]lspawn' > /dev/null; then\n echo 'REFUSE concurrent MPI after model prerequisite' >&2; exit 2\nfi\n\nexport GLM53F_BUILD=0 GLM53F_GGUF=$HOME/models/glm53f-gguf-wide/UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf\nexport GLM53F_BIN_DIR=$PWD/a64fx/glm5/build/candidate-mla-values-probe-v1 GLM53F_RUN_TAG=mtp-batch3-gates\nexport XOS_MMM_L_PAGING_POLICY=demand:demand:demand XOS_MMM_L_HPAGE_TYPE=none\nexport OMP_NUM_THREADS=47 OMP_PROC_BIND=close OMP_PLACES=cores OMP_WAIT_POLICY=active FLIB_BARRIER=HARD\nexport GLM53F_PREWARM=1 GLM53F_PROFILE=1 GLM53F_FAST_MATH=1 GLM53F_NO_MATH_ERRNO=1\nexport GLM53F_COMM_OWNER=0 GLM53F_SPARSE_ASYNC=0 GLM53F_NATIVE_Q8_PANEL=0 GLM53F_SPARSE_MLA_BATCH=1\nexport GLM53F_NATIVE_Q8_ROWS8=0 GLM53F_NATIVE_Q8_TILE2X8=0 GLM53F_MLA_FUSED_PROJECTION=0 GLM53F_MHC_FUSED_SYNC=0 GLM53F_MOE_GU_PAD=0\nexport GLM53F_EMBED_BATCH_PACKED=0 GLM53F_HEAD_VERIFY_SHARED=0 GLM53F_DENSE_PREFILL_TILE=4\nfail(){ echo \"error: $*\" >&2; exit 2; }\nsource a64fx/glm5/scripts/glm53f_env.sh\nsource a64fx/glm5/scripts/glm53f_launch.sh\nmkdir -p \"$logdir\" \"$GLM53F_BUILD_DIR\" \"$logs/results\"\n# This synthetic MPI fixture has no model staging or tofu dependency.\nfor math in fast conservative; do\n binary=\"$GLM53F_BIN_DIR/test_glm53f_mla_values_team-$math\"\n for threads in 1 47; do\n  OMP_NUM_THREADS=$threads mpi_run \"mla-values-$math-$threads\" /usr/bin/numactl --interleave=4,5,6,7 \"$binary\"\n  grep '^MLA_VALUES_TEAM .*BIT_EXACT PASS$' \"$last_log\".*.0\n  cp \"$last_log\".*.0 \"$logs/results/values-$math-$threads.log\"\n done\ndone\necho MLA_VALUES_NATIVE_PASS\n"
+}

@@ -1,11 +1,39 @@
 # Strata-inspired GLM53F optimization: implementation and validation
 
-Updated 2026-10-03. Targets are **100 delivered decode tokens/s and 2000
+Updated 2026-10-04. Targets are **100 delivered decode tokens/s and 2000
 prefill tokens/s**, on twelve A64FX nodes, the complete 45-layer
 UD-Q4_K_XL model, top-8 routing, and the saved roughly 8K coding prompt.
 These targets have **not been demonstrated** by the changes below.
 
-## Shared-cache MLA decode scores (October3; native exact, model pending)
+## Prescaled MLA value-cache reuse (October4; native exact, model pending)
+
+`--mla-value-kernel legacy|normalized2`, default`legacy`, divides each
+probability once with the original volatile divisor, then shares half-cache
+loads across two heads and32 columns. Normalization uses the existing logit
+scratch in place; no allocation or collective is added. Both work-sharing
+barriers remain. Only six-head native calls with selected keys, a derived
+FP16 cache, SVE16 lanes and at least512 keys are eligible. Five-head/CP/other
+calls retain legacy. Wide prefill is unchanged.
+
+Unscaled grouping regresses, and five-head prescaled variants regress at47
+threads. The selected six-head helper improves component medians1.506071×
+fast/1.298130× conservative. Strong integrated fixtures pass77760 case
+instances, including4320 direct helper checks, across12 ranks and two math
+modes at1/47 threads. They compare all value/canary bits, finite results,
+three key orders, counts through2052 including511/512/513, zeros and FP32
+subnormal probabilities, and both in-place/separate normalization buffers.
+These are component timings, not model tok/s.
+
+Immutable`candidate-mla-values-model-v1` is built warning-clean. Its serial
+campaign tests combined normalized2 values, split6 prefill and packed
+embedding, with heads3 scores fixed in same-binary controls. Short/full
+state gates, fresh frozen/prior-score controls, five alternating pairs and
+long1024 plain/MTP comparisons are underway. No promotion or confirmed
+value-kernel model gain is claimed. See [integrated native evidence](strata-mla-values-integrated-native-20261004.json),
+[unscaled rejection](strata-mla-values-native-20261004.json) and
+[prescale prototypes](strata-mla-values-prescale-native-20261004.json).
+
+## Shared-cache MLA decode scores (October3/4; small gain, no promotion)
 
 `--mla-logits-kernel legacy|heads3`, default`legacy`, distributes native
 scores as three heads by four selected keys. It reuses latent cache loads,
@@ -26,10 +54,18 @@ but improves less than1% over existing split6, so it is not integrated.
 
 Immutable`candidate-mla-logits-v3` includes the small-context fallback.
 The native fixtures usedv2 with the identical score primitive. Warning-clean
-FCC builds and the host CLI parser pass. Model staging and a serial campaign
-of short/full state gates, fresh frozen controls, five plain pairs and
-1024-token plain/MTP comparisons are pending onPJM52138572. No promotion or
-whole-model performance gain is claimed. Exact native timings, commands and
+FCC builds, the host CLI parser,18 launcher tests and six reporting tests pass.
+Staging completed onPJM52138572. Short128/full8049 prompt gates pass complete
+129-ID counts and internal warmup/trial checks; cross-option endpoint states
+are byte-exact on all12 ranks for both prompts. Fresh frozen controls, five
+plain pairs and1024-token plain/MTP comparisons complete22 runs/38 trials.
+Five plain paired ratios confirm+1.1114% decode/+0.1222% prefill; long MTP
+screen ratios are+1.0925% decode/+0.1464% prefill. Every129/257/1025-ID count
+and reference comparison passes; minimum available8.319031GiB. Absolute
+plain-pair medians are33.805684→34.240471 decode and401.072265→401.112526
+prefill; percentages use paired ratios. Long MTP reaches34.631289 decode,
+but its50.241911s combined timed phases exceed plain50.135670s at1024 outputs.
+No promotion. See [model evidence](strata-mla-logits-model-20261004.json). Exact native timings, commands and
 source/binary hashes are in [native evidence](strata-mla-logits-native-20261003.json).
 
 ## MLA prefill head and column tiles (October3; small gain, no promotion)

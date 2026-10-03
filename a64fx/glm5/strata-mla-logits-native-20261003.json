@@ -658,8 +658,8 @@
   },
   "build_script": "#!/bin/bash\nset -euo pipefail\nroot=$HOME/work/gemm/glm53f-strata-20261001\ncd \"$root/a64fx/glm5\"\nwork=$root/tmp/strata-mla-logits-20261003\nold=$root/tmp/strata-pipeline-20261002/build\nbase=$root/tmp/strata-mhc-sync-20261002/build-integrated-login-v4\nbin=$PWD/build/candidate-mla-logits-v3\nmkdir -p \"$bin\"\nexport TMPDIR=$work OPAL_PREFIX=/opt/FJSVxtclanga/tcsds-1.2.43\nunset OMPI_CC OMPI_CXX\ncc=/opt/FJSVxtclanga/tcsds-1.2.43/bin/mpifccpx\nflags=(-Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast -fopenmp -Wall -Wextra -Werror -ffast-math -fno-math-errno -DGLM53F_PREFILL_ATTN_PANEL=47 -DGLM53F_PREFILL_CAPACITY=4096 -I. -I../../common)\n\"$cc\" \"${flags[@]}\" test_glm53f_mla_logits_team.c -lm -o \"$bin/test_glm53f_mla_logits_team\"\n\"$cc\" -Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast -fopenmp -Wall -Wextra -Werror -I. -I../../common test_glm53f_mla_logits_team.c -lm -o \"$bin/test_glm53f_mla_logits_team-conservative\"\n\"$cc\" \"${flags[@]}\" -DGLM53F_EXTERNAL_ST_IMPLEMENTATION -DGLM53F_SPARSE_NO_MAIN -c glm53f_sparse_layer_12n.c -o \"$work/sparse_logits_v3.o\"\nobjects=(\"$base\"/{q8_panel,gemm_kern,gemm_asm,team,collective}.o \"$root/tmp/strata-iq-scales-20261002/build-integrated-v5/iq_bridge.o\" \"$old/kda_pp_beta_rowwise.o\" \"$root/tmp/strata-pipeline-20261003/dense_tiles_full.o\" \"$old/moe_pp_fast.o\" \"$work/sparse_logits_v3.o\" \"$root/tmp/strata-mtp-batch-20261003/head_verify.o\" \"$root/tmp/strata-mtp-batch-20261003/embedding_prime.o\" \"$old\"/{dist,pipeline}_pp.o)\nlink=(-L\"$root/tmp/strata-mhc-sync-20261002/target-libs\" -lm -lpthread -ltofucom)\n\"$cc\" \"${flags[@]}\" bench_glm53f_run_12n.c \"$base\"/{lookup_spec,mtp_spec}.o \"$root/tmp/strata-mtp-batch-20261003/mtp_prime.o\" \"${objects[@]}\" \"$root/tmp/strata-pipeline-20261003/target_dense_tiles.o\" \"${link[@]}\" -o \"$bin/bench_glm53f_run_12n\"\ncp \"$root/a64fx/glm5/build/candidate-dense-tile-v2/tofu_topo_helper\" \"$bin/tofu_topo_helper\"\nsha256sum \"$bin\"/{test_glm53f_mla_logits_team,bench_glm53f_run_12n} > \"$work/binaries-v3.sha256\"\necho MLA_TILES_BUILD_PASS\n",
   "native_driver": "#!/bin/bash\nset -euo pipefail\ncd \"$HOME/work/gemm/glm53f-strata-20261001\"\nlogs=$PWD/tmp/strata-mla-logits-20261003\n[ \"${PJM_JOBID:-}\" = 52138572 ] && [ \"$PJM_NODE\" = 12 ]\nguard=$(date -d '2026-10-04 04:45:00 JST' +%s)\nexport GLM53F_BUILD=0 GLM53F_GGUF=$HOME/models/glm53f-gguf-wide/UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf\nexport GLM53F_BIN_DIR=$PWD/a64fx/glm5/build/candidate-mla-logits-v2 GLM53F_RUN_TAG=mtp-batch3-gates\nexport XOS_MMM_L_PAGING_POLICY=demand:demand:demand XOS_MMM_L_HPAGE_TYPE=none\nexport OMP_NUM_THREADS=47 OMP_PROC_BIND=close OMP_PLACES=cores OMP_WAIT_POLICY=active FLIB_BARRIER=HARD\nexport GLM53F_PREWARM=1 GLM53F_PROFILE=1 GLM53F_FAST_MATH=1 GLM53F_NO_MATH_ERRNO=1\nexport GLM53F_COMM_OWNER=0 GLM53F_SPARSE_ASYNC=0 GLM53F_NATIVE_Q8_PANEL=0 GLM53F_SPARSE_MLA_BATCH=1\nexport GLM53F_NATIVE_Q8_ROWS8=0 GLM53F_NATIVE_Q8_TILE2X8=0 GLM53F_MLA_FUSED_PROJECTION=0 GLM53F_MHC_FUSED_SYNC=0 GLM53F_MOE_GU_PAD=0\nexport GLM53F_EMBED_BATCH_PACKED=0 GLM53F_HEAD_VERIFY_SHARED=0 GLM53F_DENSE_PREFILL_TILE=4\nfail(){ echo \"error: $*\" >&2; exit 2; }\nsource a64fx/glm5/scripts/glm53f_env.sh\nsource a64fx/glm5/scripts/glm53f_launch.sh\nmkdir -p \"$logdir\" \"$GLM53F_BUILD_DIR\" \"$logs/results\"\n# This synthetic MPI fixture has no model staging or tofu dependency.\nfor math in fast conservative; do\n binary=\"$GLM53F_BIN_DIR/test_glm53f_mla_logits_team\"\n [ \"$math\" = fast ] || binary=\"$binary-conservative\"\n for threads in 1 47; do\n  OMP_NUM_THREADS=$threads mpi_run \"mla-logits-$math-$threads\" /usr/bin/numactl --interleave=4,5,6,7 \"$binary\"\n  grep '^MLA_LOGITS_TEAM .*BIT_EXACT PASS$' \"$last_log\".*.0\n  cp \"$last_log\".*.0 \"$logs/results/logits-$math-$threads.log\"\n done\ndone\necho MLA_LOGITS_NATIVE_PASS\n",
-  "model_measurements": "pending; no promotion or target achievement claimed",
-  "status": "native_exact_model_pending",
+  "model_measurements": "complete; five plain pairs +1.1114% decode/+0.1222% prefill; long MTP screen +1.0925% decode/+0.1464% prefill; no promotion",
+  "status": "model_complete_no_promotion",
   "prefill_isolation": {
     "cases_per_rank": 2376,
     "status": "BIT_EXACT PASS",
@@ -667,6 +667,157 @@
     "increment_over_split6": "less than1%; no production change",
     "five_head_ratio_to_legacy": 0.9815454252084856,
     "hybrid_values32_six_head_ratio": 1.1303603868448624,
-    "not_selected": true
-  }
+    "not_selected": true,
+    "allocation": 52128881,
+    "source_sha256": "5172cc0260a2c4158ce9f665c566933cfc046feb21211afe78d243c6657ba10b",
+    "binary_sha256": "73f9ed1d8703dd7fd79273f7b76a39803c574e4247da637bd6ead48aa7980e46",
+    "log_sha256": "b1fa31648e167a240a47a1b88f89f11e1be481429f26fdc9e6c6aeb0e69ab426",
+    "driver": "#!/bin/bash\nset -euo pipefail\ncd \"$HOME/work/gemm/glm53f-strata-20261001\"\nlogs=$PWD/tmp/strata-mla-logits-20261003\n[ \"${PJM_JOBID:-}\" = 52128881 ] && [ \"$PJM_NODE\" = 12 ]\nguard=$(date -d '2026-10-03 23:00:00 JST' +%s)\n[ \"$(date +%s)\" -lt \"$guard\" ] || exit 75\nexport GLM53F_BUILD=0 GLM53F_GGUF=$HOME/models/glm53f-gguf-wide/UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf\nexport GLM53F_BIN_DIR=$PWD/a64fx/glm5/build/candidate-mla-logits-v1 GLM53F_RUN_TAG=mtp-batch3-gates\nexport XOS_MMM_L_PAGING_POLICY=demand:demand:demand XOS_MMM_L_HPAGE_TYPE=none\nexport OMP_NUM_THREADS=47 OMP_PROC_BIND=close OMP_PLACES=cores OMP_WAIT_POLICY=active FLIB_BARRIER=HARD\nexport GLM53F_PREWARM=1 GLM53F_PROFILE=1 GLM53F_FAST_MATH=1 GLM53F_NO_MATH_ERRNO=1\nexport GLM53F_COMM_OWNER=0 GLM53F_SPARSE_ASYNC=0 GLM53F_NATIVE_Q8_PANEL=0 GLM53F_SPARSE_MLA_BATCH=1\nexport GLM53F_NATIVE_Q8_ROWS8=0 GLM53F_NATIVE_Q8_TILE2X8=0 GLM53F_MLA_FUSED_PROJECTION=0 GLM53F_MHC_FUSED_SYNC=0 GLM53F_MOE_GU_PAD=0\nexport GLM53F_EMBED_BATCH_PACKED=0 GLM53F_HEAD_VERIFY_SHARED=0 GLM53F_DENSE_PREFILL_TILE=4\nfail(){ echo \"error: $*\" >&2; exit 2; }\nsource a64fx/glm5/scripts/glm53f_env.sh\nsource a64fx/glm5/scripts/glm53f_launch.sh\nmkdir -p \"$logdir\" \"$GLM53F_BUILD_DIR\" \"$logs/results\"\nprepare_runtime\nmpi_run mla-head-tiles /usr/bin/numactl --interleave=4,5,6,7 \"$GLM53F_BIN_DIR/test_glm53f_mla_logits_tiles\"\ngrep '^MLA_HEAD_TILES .*BIT_EXACT PASS$' \"$last_log\".*.0\ncp \"$last_log\".*.0 \"$logs/results/native-v1.log\"\necho MLA_HEAD_TILES_PASS\n"
+  },
+  "strata_reference": {
+    "branch": "glm53f",
+    "head": "3bbb469",
+    "source": "src/program/glm_decode.cpp:2954..3040",
+    "technique": "tiled absorbed-query and gathered-key reuse; A64FX keeps the original FP32 lane accumulator and applies cache reuse across independent heads"
+  },
+  "cross_option_endpoint_state": {
+    "short128-state": {
+      "prompt_tokens": 128,
+      "decode_transitions": 128,
+      "generated_ids": 129,
+      "cross_option_endpoint_state": "BIT_EXACT",
+      "ranks": [
+        {
+          "rank": 0,
+          "bytes": 21208496,
+          "sha256": "8bcdd66b9cecd3206559caaf31dc2acb7b3a258ce36dc1ed001f3e8b08d8ec29"
+        },
+        {
+          "rank": 1,
+          "bytes": 21208496,
+          "sha256": "b0b32ed6f4e641108a7430b2e11147281520a43a7886b0eb163a56c3638c1c2d"
+        },
+        {
+          "rank": 2,
+          "bytes": 23645616,
+          "sha256": "51c4550aca832a68078ada313680f2f357db2dd61515d88a53a6e0b5063e7e9b"
+        },
+        {
+          "rank": 3,
+          "bytes": 21208496,
+          "sha256": "d16e40295fb09068ab772b672a8aa123e37dc1b58ecf20d65c30e8760f79af11"
+        },
+        {
+          "rank": 4,
+          "bytes": 21208496,
+          "sha256": "9c5b4da27c2ccce3f4e1523b1bd1a32fc184f62229d7a51b816cd5c63f33f332"
+        },
+        {
+          "rank": 5,
+          "bytes": 23645616,
+          "sha256": "efcbbb6649ed58c1afea7e7971fc75e2e06411250eb7f48ff2be2a0efc9621ed"
+        },
+        {
+          "rank": 6,
+          "bytes": 21208496,
+          "sha256": "8982fd48fbbc2988b49f612c50c9ef3660a39c02ec58f2f7a193f0a51639c2ed"
+        },
+        {
+          "rank": 7,
+          "bytes": 21208496,
+          "sha256": "c4f120e6d06d46d08b009a257e6faf809e0973e474ff2186a578c17045a35b9e"
+        },
+        {
+          "rank": 8,
+          "bytes": 23645616,
+          "sha256": "891b9ed8fc1bb4da172190cc851b3ebaf0ce88efc77385d1d619e213681f700f"
+        },
+        {
+          "rank": 9,
+          "bytes": 21208496,
+          "sha256": "a127479180207bd2b42c9dedc80bde3bf6b272ff7c35b3b0eee3e49cbf1855a9"
+        },
+        {
+          "rank": 10,
+          "bytes": 21208496,
+          "sha256": "cac7d5811e929258dcd70be831fee6f4e01be9c54beed4a388ffd548950be275"
+        },
+        {
+          "rank": 11,
+          "bytes": 23645616,
+          "sha256": "57b4353fecd80674ca7070b51011c11e15dd3af783232953bbe153b66a6b2d20"
+        }
+      ]
+    },
+    "full-state": {
+      "prompt_tokens": 8049,
+      "decode_transitions": 128,
+      "generated_ids": 129,
+      "cross_option_endpoint_state": "BIT_EXACT",
+      "ranks": [
+        {
+          "rank": 0,
+          "bytes": 300105180,
+          "sha256": "666d5ac899220cc0d47be326a1e51273a6f37e495d8cb7921184604dba139666"
+        },
+        {
+          "rank": 1,
+          "bytes": 300105180,
+          "sha256": "fc247c29ac163fd049baf97e14cfa7aeab542084647963da7a0f26253ab5f286"
+        },
+        {
+          "rank": 2,
+          "bytes": 302542300,
+          "sha256": "c0520d2fdadd6195b7eaaa40ee74f801af71b9f48ea86e89571afaea9ae75796"
+        },
+        {
+          "rank": 3,
+          "bytes": 300105180,
+          "sha256": "f6d607b079f6e989da9f2ef1d1fd144ebe84886b0bc38759e7df20032b3d5fec"
+        },
+        {
+          "rank": 4,
+          "bytes": 300105180,
+          "sha256": "76d5ea4af199ff1aa24bf6ac8d9fccb702de12362d6380caea48c3d147dbc9ee"
+        },
+        {
+          "rank": 5,
+          "bytes": 302542300,
+          "sha256": "d3f8359cdd3a1e8827f5bceedf9637024fb032cf57ffdff3c7fa5c298af7904f"
+        },
+        {
+          "rank": 6,
+          "bytes": 300105180,
+          "sha256": "d1182d367de7d33a92938f3473d398630735eb466b9d80b5fb0649fdc831cdc8"
+        },
+        {
+          "rank": 7,
+          "bytes": 300105180,
+          "sha256": "66ec9d10dd30caccf21121f4cb9017c7b8386bb215bd4ca8d110a37d72db2492"
+        },
+        {
+          "rank": 8,
+          "bytes": 302542300,
+          "sha256": "57a78fa6c73cc200d1aaf9d67f9c701291d53ac95f908730e37e86db7fe95905"
+        },
+        {
+          "rank": 9,
+          "bytes": 300105180,
+          "sha256": "bce560ce37336348569c9baebeb2ccfa178b746309379e82652fb58fa5a1516c"
+        },
+        {
+          "rank": 10,
+          "bytes": 300105180,
+          "sha256": "fbfdf61375e0a64a87cd0d7c5cf322ca026bd4ffd2cd888b2c3b6cceb727b847"
+        },
+        {
+          "rank": 11,
+          "bytes": 302542300,
+          "sha256": "1ddd0430010ff03995e084616a4fa66b6808888c3c5ec09474d342648019e244"
+        }
+      ]
+    }
+  },
+  "model_evidence": "strata-mla-logits-model-20261004.json",
+  "implementation_commit": "64536808"
 }

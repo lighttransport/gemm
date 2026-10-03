@@ -561,7 +561,7 @@ static void ensure_mla_shards(glm53f_sparse_context_12n*c){if(c->mla_ql)return;s
  * phases are work-shared by one team; every output element keeps the serial
  * accumulation order (j for ql, t for va), so results match the former
  * single-threaded loop. */
-struct mla_value_call { glm53f_sparse_context_12n *c; float *out; const float *q, *z; const int *selected; int nt, bad, registers; const uint16_t *half; int parallel_softmax, logits_heads3; };
+struct mla_value_call { glm53f_sparse_context_12n *c; float *out; const float *q, *z; const int *selected; int nt, bad, registers; const uint16_t *half; int parallel_softmax, logits_heads3, values_normalized2; };
 static void mla_value_worker(void *context) {
     struct mla_value_call *a = context;
     glm53f_sparse_context_12n *c = a->c;
@@ -617,6 +617,9 @@ static void mla_value_worker(void *context) {
             hsum[h]=sum;
         }
     }
+    if (a->values_normalized2 && a->half && selected && hn == 6 && nt >= 512) {
+        mlb_values_normalized2_team(va, lg, lg, a->half, hsum, selected, nt);
+    } else {
 #pragma omp for schedule(static)
         for(int w=0;w<hn*NDC;w++){
             const int h=w/NDC,d0=(w%NDC)*DC;
@@ -635,6 +638,7 @@ static void mla_value_worker(void *context) {
                 for(int d=d0;d<d0+DC;d+=vl){svbool_t p=svwhilelt_b32(d,LAT);
                     svst1(p,o+d,svmla_n_f32_x(p,svld1(p,o+d),svld1(p,z+(size_t)r*LAT+d),x));}}
         }
+    }
 #pragma omp for schedule(static)
         for(int h=0;h<hn;h++)
             if(glm53f_native_act_prepare(c->q8v_act+(size_t)h*c->q8v_act_bytes,
@@ -685,11 +689,13 @@ static int mla_heads_q8_value(glm53f_sparse_context_12n*c,float*out,
     const char *registers = getenv("GLM53F_MLA_REGISTERS");
     const char *softmax = getenv("GLM53F_MLA_PARALLEL_SOFTMAX");
     const char *logits = getenv("GLM53F_MLA_LOGITS_HEADS3");
+    const char *values = getenv("GLM53F_MLA_VALUES_NORMALIZED2");
     struct mla_value_call call = {c, out, q, z, selected, nt, 0,
         registers && svcntw() == 16 ? atoi(registers) : 0,
         selected == c->selected ? c->latent_f16 : NULL,
         softmax && atoi(softmax) && omp_get_max_threads() > 1,
-        logits && atoi(logits) && svcntw() == 16};
+        logits && atoi(logits) && svcntw() == 16,
+        values && atoi(values) && svcntw() == 16};
     if (glm53f_team_available()) glm53f_team_dispatch(mla_value_worker, &call);
     else {
 #pragma omp parallel

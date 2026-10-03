@@ -1,6 +1,6 @@
 # Resume: GLM53F Strata-inspired optimization, 12 A64FX nodes
 
-Updated 2026-10-03. Capacity4096 remains the promoted TP12 recipe:
+Updated 2026-10-04. Capacity4096 remains the promoted TP12 recipe:
 35.462134 decode /412.273634 prefill tok/s. Neither 100/2000 target is met.
 The approved prefill-first PP3×TP4 architecture is being implemented.
 Distribution/pipeline foundations pass native12-node correctness. Routed
@@ -14,25 +14,46 @@ unchanged. Local tmux socket`tmp/tmux-glm53f/pp1.sock`, launcher session
 `glm53f-logits4`. PJM52128881 was released after its final component gate;
 its `/local` images are gone. Other allocations must not be touched.
 
-**October3 MLA logits continuation (native PASS, model pending):** opt-in
-`--mla-logits-kernel legacy|heads3` shares derived FP16 cache loads across
-three heads and four keys for native decode/scalar verification with at least
-128 selected keys. Original lane accumulation and reductions are retained;
-defaultlegacy and prefill batch paths are unchanged. Strong fixtures pass
-20736 case instances across12 ranks, fast/conservative math and1/47 threads.
-Fast47-thread component medians are2.597682×/2.812923× at5/6 heads; these
-are scoring timings, not model tok/s. Prefill score-only splitting was
-bit-exact but offers less than1% over existing split6 and is not integrated.
-See`a64fx/glm5/strata-mla-logits-native-20261003.json`.
+**October4 active continuation:** score kernel commit`64536808` is fully
+measured, with22 completed model runs/38 trials. Five plain pairs confirm
++1.1114% decode/+0.1222% prefill; long MTP screen +1.0925% decode/+0.1464%
+prefill. All129/257/1025 counts and IDs pass; short/full endpoints are byte
+exact across all12 ranks. Minimum available8.319031GiB. No promotion; see
+`strata-mla-logits-model-20261004.json`. Long MTP's95.6% acceptance yields
+34.631289 tok/s, but combined prefill/decode time50.241911s versus plain
+50.135670s shows no end-to-end advantage at1024 outputs.
 
-Immutable final model candidate`candidate-mla-logits-v3` is built; native
-fixtures usedv2 (identical primitive, before small-context fallback). Remote
-stage driver472 is active and model driver674 waits for its PASS sentinel
-before any MPI launch. Do not overlap MPI or restage. Scratch
-`tmp/strata-mla-logits-20261003/` contains scripts, hashes and results. The
-queued campaign includes short/full raw state checks, fresh frozen control,
-five alternating plain pairs, long1024 plain and MTP comparisons, and conditional
-MTP confirmation. No whole-model gain or promotion is claimed yet.
+New opt-in`--mla-value-kernel legacy|normalized2`, defaultlegacy, divides
+probabilities once into the existing logit scratch, then shares half-cache
+loads across2 heads×32 columns. Guard: six heads, selected keys, derived
+FP16 cache, SVE16 lanes, at least512 keys. Five-head/CP/other paths retain
+legacy; wide prefill is unchanged. Unscaled2×32/3×16 grouping regresses;
+prescaling2×32 improves six-head fast47 component50.6071%/conservative29.8130%
+and preserves bits. Five-head variants regress and are not integrated.
+Actual-helper fixture passes77760 case instances including4320 direct
+helper out-of-place/in-place cases across two math modes and1/47 threads;
+511/512/513 boundaries, zeros/subnormals and canaries are covered.
+See`strata-mla-values-integrated-native-20261004.json`.
+
+Immutable`candidate-mla-values-model-v1` built warning-clean FCC fast math,
+panel47/capacity4096. Active driver10801 is the only MPI owner; prior owners
+472/674/2857/9032 are terminal/PASS. Driver7012 was canceled while idle before
+MPI to broaden its unlaunched prescale fixture. New campaign
+`campaign-values-model-v1.py` uses`results-values-model/`: short/full combined
+state gates, fresh frozen/prior-score controls, isolated value screen, five
+alternating combined pairs (normalized2+split6 prefill+packed embedding),
+and long1024 plain/MTP comparisons. Scores useheads3 throughout except
+frozen. Raw short/full cross-option endpoint states pass byte-for-byte on all12 ranks. Timing confirmation
+continues; no value-kernel whole-model gain or promotion is claimed yet.
+Scratch`tmp/strata-mla-logits-20261003/` archives immutable sources/provenance
+and completed phases. Do not restage or overlap MPI. Defaults and qualified
+recipe stay35.462134 decode/412.273634 prefill; targets remain unmet.
+
+Bridge session49515107 died at00:31 JST when an optional missing-log read hit
+leaked interactive`set -e`; detached owners survived and were verified from
+new session94d5067e. Current session file points to the fresh shell. Keep
+launch error handling in subshells and optional log reads guarded. No push
+authorized; unrelated remote-dev procedure/Q38FN changes remain untouched.
 
 
 **October3 late-evening continuation (complete, no promotion):** new opt-in
