@@ -53,8 +53,9 @@ static inline int glm53f_pp_inventory(const glm53f_dist *d,const glm53f_pp_image
        glm53f_memory_budget_add(budget,vocab,0)||
        glm53f_memory_budget_add(budget,2*native,0))return-1;
     uint64_t cache=(uint64_t)ns*((uint64_t)capacity*(512+2*128)*4+(uint64_t)(capacity/4+1)*128*4+(uint64_t)capacity*512*2);
+    /* Dense bound includes64-row TP4 buffers and prepared-activation peak. */
     if(glm53f_memory_budget_add(budget,cache,0)||
-       glm53f_memory_budget_add(budget,(uint64_t)nk*20*mib+(uint64_t)ns*16*mib+(uint64_t)nd*2*mib,0)||
+       glm53f_memory_budget_add(budget,(uint64_t)nk*20*mib+(uint64_t)ns*16*mib+(uint64_t)nd*6*mib,0)||
        glm53f_memory_budget_add(budget,model_workspace,0)||
        glm53f_memory_budget_add(budget,16*mib+(uint64_t)max_tokens*4096*4,0))return-1;
     if(nr){

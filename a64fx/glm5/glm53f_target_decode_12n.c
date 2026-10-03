@@ -768,9 +768,10 @@ static int target_layers_batch(glm53f_target_model_12n *m, float *streams,
         begin = m->profile ? glm53f_clock() : 0.0;
         if (l < 3) {
             if (tokens > VERIFY_BATCH) {
-                for (int tile = 0; tile < tokens; tile += KERNEL_BATCH) {
+                int dense_tile = glm53f_dense_ffn_batch_capacity_12n(m->dense[l]);
+                for (int tile = 0; tile < tokens; tile += dense_tile) {
                     int panel = tokens - tile;
-                    if (panel > KERNEL_BATCH) panel = KERNEL_BATCH;
+                    if (panel > dense_tile) panel = dense_tile;
                     if (glm53f_dense_ffn_sublayer_batch_12n(
                             m->dense[l], m->batch_output + (size_t)tile * HIDDEN,
                             m->batch_normalized + (size_t)tile * HIDDEN, panel))

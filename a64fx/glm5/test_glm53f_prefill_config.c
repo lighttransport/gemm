@@ -10,6 +10,14 @@ static int parse(const char *key, const char *value, glm53f_prefill_config *c) {
 int main(void) {
     glm53f_prefill_config c = {GLM53F_PREFILL_LEGACY, 32, GLM53F_PREFILL_FAST_DEFAULT, NULL, 0};
     int failed = 0;
+    const char *dense_tiles[] = {"4", "16", "32", "64"};
+    for (int i = 0; i < 4; ++i)
+        failed |= parse("--dense-prefill-tile", dense_tiles[i], &c) != 1 ||
+                  strcmp(getenv("GLM53F_DENSE_PREFILL_TILE"), dense_tiles[i]);
+    const char *bad_dense_tiles[] = {"0", "8", "128", "16junk", "-1", ""};
+    for (int i = 0; i < 6; ++i)
+        failed |= parse("--dense-prefill-tile", bad_dense_tiles[i], &c) != -1;
+    failed |= parse("--dense-prefill-tile", NULL, &c) != -1;
     failed |= parse("--mla-softmax-kernel", "parallel", &c) != 1 || strcmp(getenv("GLM53F_MLA_PARALLEL_SOFTMAX"), "1");
     failed |= parse("--mla-softmax-kernel", "legacy", &c) != 1 || strcmp(getenv("GLM53F_MLA_PARALLEL_SOFTMAX"), "0");
     failed |= parse("--mla-softmax-kernel", "fused", &c) != -1;

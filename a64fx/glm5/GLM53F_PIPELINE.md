@@ -269,3 +269,13 @@ the Python3.6 frontend validates canonical metadata and reports per-layer
 worst norms. Normal and ASan/UBSan host tests pass, including replica
 corruption and cross-layout fixtures. On actual retry2 captures, failing
 fields and changes match NumPy; worst norms agree within1e-12.
+
+
+Identical-input real-weight isolation on fresh PJM52116293 narrows the
+remaining PP arithmetic investigation. Dense gate/up/activation and KDA
+state/convolution/normalized per-head outputs for layers0–2 are bit-exact;
+final output differences are at most1.526e-7 (dense) and1.752e-7 (KDA) relative
+L2. The KDA fixture explicitly exercises63/64-token fast GEMM tiles. These
+synthetic-input MPI component checks do not resolve the actual-prompt
+end-to-end PP failure; downstream quantization amplification remains a
+hypothesis. See [isolation evidence](strata-cross-layout-isolation-20261003.json).

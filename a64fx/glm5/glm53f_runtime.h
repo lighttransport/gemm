@@ -7,6 +7,13 @@
  * Parse before model creation: scratch and communication ownership depend on them. */
 static inline int glm53f_runtime_option(int argc, char **argv, int *index) {
     const char *key = argv[*index], *env;
+    if (!strcmp(key, "--dense-prefill-tile")) {
+        if (*index + 1 >= argc) return -1;
+        const char *value = argv[++*index];
+        if (strcmp(value, "4") && strcmp(value, "16") &&
+            strcmp(value, "32") && strcmp(value, "64")) return -1;
+        return setenv("GLM53F_DENSE_PREFILL_TILE", value, 1) ? -1 : 1;
+    }
     if (!strcmp(key, "--verify-kernel")) env = "GLM53F_VERIFY_GROUPED";
     else if (!strcmp(key, "--decode-executor")) env = "GLM53F_DECODE_EXECUTOR";
     else if (!strcmp(key, "--router-kernel")) env = "GLM53F_ROUTER_FUSE";

@@ -1,0 +1,404 @@
+{
+  "date": "2026-10-03",
+  "allocation": 52116293,
+  "status": "native_component_gates_pass_full_model_pending",
+  "promoted": false,
+  "targets_met": false,
+  "cli": "--dense-prefill-tile 4|16|32|64",
+  "default": 4,
+  "native_bit_exact_cases": 126,
+  "hardware": "12 A64FX nodes compact 2x3x2 normal2GHz/eco0",
+  "threads": 47,
+  "compiler": "Fujitsu mpifccpx -Nclang -O3 SVE fast math -Wall -Wextra -Werror",
+  "arithmetic": "same four-token native row kernels and reductions; wider buffers and fewer calls",
+  "component_trials": [
+    {
+      "layer": 0,
+      "tile": 16,
+      "trial": 0,
+      "baseline_seconds": 0.07837904,
+      "candidate_seconds": 0.0625414,
+      "ratio": 1.253234
+    },
+    {
+      "layer": 0,
+      "tile": 16,
+      "trial": 1,
+      "baseline_seconds": 0.077915411,
+      "candidate_seconds": 0.061747679,
+      "ratio": 1.261835
+    },
+    {
+      "layer": 0,
+      "tile": 16,
+      "trial": 2,
+      "baseline_seconds": 0.07746165,
+      "candidate_seconds": 0.06208638,
+      "ratio": 1.247643
+    },
+    {
+      "layer": 0,
+      "tile": 16,
+      "trial": 3,
+      "baseline_seconds": 0.07805542,
+      "candidate_seconds": 0.06186919,
+      "ratio": 1.26162
+    },
+    {
+      "layer": 0,
+      "tile": 16,
+      "trial": 4,
+      "baseline_seconds": 0.077830129,
+      "candidate_seconds": 0.06212224,
+      "ratio": 1.252855
+    },
+    {
+      "layer": 0,
+      "tile": 32,
+      "trial": 0,
+      "baseline_seconds": 0.0779435,
+      "candidate_seconds": 0.05961564,
+      "ratio": 1.307434
+    },
+    {
+      "layer": 0,
+      "tile": 32,
+      "trial": 1,
+      "baseline_seconds": 0.077988639,
+      "candidate_seconds": 0.05923519,
+      "ratio": 1.316593
+    },
+    {
+      "layer": 0,
+      "tile": 32,
+      "trial": 2,
+      "baseline_seconds": 0.077610641,
+      "candidate_seconds": 0.05961803,
+      "ratio": 1.301798
+    },
+    {
+      "layer": 0,
+      "tile": 32,
+      "trial": 3,
+      "baseline_seconds": 0.07801044,
+      "candidate_seconds": 0.05928258,
+      "ratio": 1.315908
+    },
+    {
+      "layer": 0,
+      "tile": 32,
+      "trial": 4,
+      "baseline_seconds": 0.07758999,
+      "candidate_seconds": 0.05960898,
+      "ratio": 1.301649
+    },
+    {
+      "layer": 0,
+      "tile": 64,
+      "trial": 0,
+      "baseline_seconds": 0.0777813,
+      "candidate_seconds": 0.05843076,
+      "ratio": 1.33117
+    },
+    {
+      "layer": 0,
+      "tile": 64,
+      "trial": 1,
+      "baseline_seconds": 0.077758891,
+      "candidate_seconds": 0.05810476,
+      "ratio": 1.338253
+    },
+    {
+      "layer": 0,
+      "tile": 64,
+      "trial": 2,
+      "baseline_seconds": 0.077323371,
+      "candidate_seconds": 0.058405479,
+      "ratio": 1.323906
+    },
+    {
+      "layer": 0,
+      "tile": 64,
+      "trial": 3,
+      "baseline_seconds": 0.07774864,
+      "candidate_seconds": 0.05810784,
+      "ratio": 1.338006
+    },
+    {
+      "layer": 0,
+      "tile": 64,
+      "trial": 4,
+      "baseline_seconds": 0.077390331,
+      "candidate_seconds": 0.058446559,
+      "ratio": 1.324121
+    },
+    {
+      "layer": 1,
+      "tile": 16,
+      "trial": 0,
+      "baseline_seconds": 0.07696312,
+      "candidate_seconds": 0.06269937,
+      "ratio": 1.227494
+    },
+    {
+      "layer": 1,
+      "tile": 16,
+      "trial": 1,
+      "baseline_seconds": 0.07709563,
+      "candidate_seconds": 0.06237884,
+      "ratio": 1.235926
+    },
+    {
+      "layer": 1,
+      "tile": 16,
+      "trial": 2,
+      "baseline_seconds": 0.07667175,
+      "candidate_seconds": 0.06283794,
+      "ratio": 1.220151
+    },
+    {
+      "layer": 1,
+      "tile": 16,
+      "trial": 3,
+      "baseline_seconds": 0.07707149,
+      "candidate_seconds": 0.06246822,
+      "ratio": 1.233771
+    },
+    {
+      "layer": 1,
+      "tile": 16,
+      "trial": 4,
+      "baseline_seconds": 0.076843699,
+      "candidate_seconds": 0.06278821,
+      "ratio": 1.223856
+    },
+    {
+      "layer": 1,
+      "tile": 32,
+      "trial": 0,
+      "baseline_seconds": 0.07564471,
+      "candidate_seconds": 0.05918181,
+      "ratio": 1.278175
+    },
+    {
+      "layer": 1,
+      "tile": 32,
+      "trial": 1,
+      "baseline_seconds": 0.07582213,
+      "candidate_seconds": 0.058885911,
+      "ratio": 1.287611
+    },
+    {
+      "layer": 1,
+      "tile": 32,
+      "trial": 2,
+      "baseline_seconds": 0.075457949,
+      "candidate_seconds": 0.05919068,
+      "ratio": 1.274828
+    },
+    {
+      "layer": 1,
+      "tile": 32,
+      "trial": 3,
+      "baseline_seconds": 0.07595311,
+      "candidate_seconds": 0.0588898,
+      "ratio": 1.28975
+    },
+    {
+      "layer": 1,
+      "tile": 32,
+      "trial": 4,
+      "baseline_seconds": 0.0755719,
+      "candidate_seconds": 0.05920139,
+      "ratio": 1.276522
+    },
+    {
+      "layer": 1,
+      "tile": 64,
+      "trial": 0,
+      "baseline_seconds": 0.07560262,
+      "candidate_seconds": 0.05847825,
+      "ratio": 1.292833
+    },
+    {
+      "layer": 1,
+      "tile": 64,
+      "trial": 1,
+      "baseline_seconds": 0.07607574,
+      "candidate_seconds": 0.05812793,
+      "ratio": 1.308764
+    },
+    {
+      "layer": 1,
+      "tile": 64,
+      "trial": 2,
+      "baseline_seconds": 0.07617786,
+      "candidate_seconds": 0.05850639,
+      "ratio": 1.302043
+    },
+    {
+      "layer": 1,
+      "tile": 64,
+      "trial": 3,
+      "baseline_seconds": 0.0761802,
+      "candidate_seconds": 0.0581621,
+      "ratio": 1.309791
+    },
+    {
+      "layer": 1,
+      "tile": 64,
+      "trial": 4,
+      "baseline_seconds": 0.07579936,
+      "candidate_seconds": 0.05844925,
+      "ratio": 1.296841
+    },
+    {
+      "layer": 2,
+      "tile": 16,
+      "trial": 0,
+      "baseline_seconds": 0.083296279,
+      "candidate_seconds": 0.06208323,
+      "ratio": 1.341687
+    },
+    {
+      "layer": 2,
+      "tile": 16,
+      "trial": 1,
+      "baseline_seconds": 0.08352652,
+      "candidate_seconds": 0.06170445,
+      "ratio": 1.353655
+    },
+    {
+      "layer": 2,
+      "tile": 16,
+      "trial": 2,
+      "baseline_seconds": 0.08314784,
+      "candidate_seconds": 0.062149511,
+      "ratio": 1.337868
+    },
+    {
+      "layer": 2,
+      "tile": 16,
+      "trial": 3,
+      "baseline_seconds": 0.0835391,
+      "candidate_seconds": 0.06176643,
+      "ratio": 1.3525
+    },
+    {
+      "layer": 2,
+      "tile": 16,
+      "trial": 4,
+      "baseline_seconds": 0.08325679,
+      "candidate_seconds": 0.06213375,
+      "ratio": 1.339961
+    },
+    {
+      "layer": 2,
+      "tile": 32,
+      "trial": 0,
+      "baseline_seconds": 0.08380361,
+      "candidate_seconds": 0.05924881,
+      "ratio": 1.414435
+    },
+    {
+      "layer": 2,
+      "tile": 32,
+      "trial": 1,
+      "baseline_seconds": 0.08367324,
+      "candidate_seconds": 0.0589436,
+      "ratio": 1.419547
+    },
+    {
+      "layer": 2,
+      "tile": 32,
+      "trial": 2,
+      "baseline_seconds": 0.08346224,
+      "candidate_seconds": 0.0592711,
+      "ratio": 1.408144
+    },
+    {
+      "layer": 2,
+      "tile": 32,
+      "trial": 3,
+      "baseline_seconds": 0.08399664,
+      "candidate_seconds": 0.058910999,
+      "ratio": 1.425823
+    },
+    {
+      "layer": 2,
+      "tile": 32,
+      "trial": 4,
+      "baseline_seconds": 0.08369637,
+      "candidate_seconds": 0.05926439,
+      "ratio": 1.412254
+    },
+    {
+      "layer": 2,
+      "tile": 64,
+      "trial": 0,
+      "baseline_seconds": 0.08353272,
+      "candidate_seconds": 0.05843928,
+      "ratio": 1.429393
+    },
+    {
+      "layer": 2,
+      "tile": 64,
+      "trial": 1,
+      "baseline_seconds": 0.08353314,
+      "candidate_seconds": 0.05803063,
+      "ratio": 1.439466
+    },
+    {
+      "layer": 2,
+      "tile": 64,
+      "trial": 2,
+      "baseline_seconds": 0.083140249,
+      "candidate_seconds": 0.0584516,
+      "ratio": 1.422378
+    },
+    {
+      "layer": 2,
+      "tile": 64,
+      "trial": 3,
+      "baseline_seconds": 0.08358993,
+      "candidate_seconds": 0.05809319,
+      "ratio": 1.438894
+    },
+    {
+      "layer": 2,
+      "tile": 64,
+      "trial": 4,
+      "baseline_seconds": 0.083270051,
+      "candidate_seconds": 0.058415771,
+      "ratio": 1.425472
+    }
+  ],
+  "component_median_ratios": {
+    "layer0_tile16": 1.253234,
+    "layer0_tile32": 1.307434,
+    "layer0_tile64": 1.33117,
+    "layer1_tile16": 1.227494,
+    "layer1_tile32": 1.278175,
+    "layer1_tile64": 1.302043,
+    "layer2_tile16": 1.341687,
+    "layer2_tile32": 1.414435,
+    "layer2_tile64": 1.429393
+  },
+  "scope": "dense layers0:3; component timings do not establish whole-model throughput",
+  "full_model_queue": {
+    "stage_pid": 712,
+    "driver_pid": 1193,
+    "deadline_JST": "2026-10-03 14:00",
+    "allocation_expiry_JST": "2026-10-03 14:25:59",
+    "checks": "short128/8049 prompt means/finalstreams/fullstate/firsttoken; fresh frozen IDs; 3-trial screens and 5 fresh paired confirmation",
+    "binary_dir": "a64fx/glm5/build/candidate-dense-tile-v2",
+    "superseded_waiting_driver": 890
+  },
+  "binary_sha256": {
+    "component": "273b5e36eef8540c71b20c66529d82436456b9ed9136f0824689af22cb622693",
+    "runner": "4de2de9c26d2f9f9fe27254eccc0e442b38bea405eae706f7bc9111e7550cbd7",
+    "state_checker": "97c1d63861b4610c3d7794ce6142f3591ecf3e6e1f43669fa173a74943402257",
+    "benchmark": "e2979f89682fd5236742b433d10e4781ee88619ae604bc6985df429e76cf53df"
+  },
+  "log_root": "tmp/strata-pipeline-20261003"
+}

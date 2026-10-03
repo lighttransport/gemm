@@ -5,6 +5,42 @@ prefill tokens/s**, on twelve A64FX nodes, the complete 45-layer
 UD-Q4_K_XL model, top-8 routing, and the saved roughly 8K coding prompt.
 These targets have **not been demonstrated** by the changes below.
 
+## Native dense prefill tiles (October3; full-model qualification pending)
+
+`--dense-prefill-tile 4|16|32|64` selects the native dense batching capacity
+before model construction. Default4 and FP8 behavior stay unchanged. The
+wider path retains four-token Q8 row kernels and four-token reduction slabs;
+it amortizes OpenMP setup and activation-allocation calls. Scratch is bounded
+at64 positions; the PP memory inventory reserves6MiB per dense layer for its
+buffers and prepared-activation peak. Decode and verification use their
+existing scalar/small-batch paths.
+
+On PJM52116293, 12 A64FX nodes/normal2GHz/eco0,47 threads and fast FCC, all126
+real-weight bit-exact cases pass: layers0–2, tiles16/32/64 and14 aligned/tail
+counts through129. Five paired128-position component trials give tile64
+median speedups1.331170,1.302043,1.429393 across the three layers. These are
+component measurements, not whole-model tok/s. The full45-layer short128/
+8049 prompt-mean, final-stream, persistent-state and first-token gates,
+fresh frozen ID controls,3-trial screens and5 fresh paired confirmation are
+queued after new-allocation model staging. No promotion yet. Evidence:
+[strata-dense-prefill-tile-20261003.json](strata-dense-prefill-tile-20261003.json).
+
+Native reproduction after bounded staging:
+
+```sh
+mpiexec -n 12 test_glm53f_dense_prefill_tiles "$TP12_DENSE_STAGE"
+mpiexec -n 12 glm53f_prefill_chunk_check_12n "$MODEL" "$ROUTED" "$SHARED" \
+  "$PROMPT_IDS" "$TRACE" 4096 --reference-chunk 4096 --capture-hidden \
+  --compare-dense-prefill-tile --dense-prefill-tile 64 \
+  --prefill-mode fast --prefill-features 27 --prefill-slab 32 \
+  --prefill-collective mtni
+```
+
+The checker constructs the candidate allocation once, selects tile4 for the
+reference, restores the empty model snapshot and selects the wider tile for
+the candidate. Its endpoints and all prompt means must remain bit-exact.
+The new test programs are built by the shared `check` build.
+
 ## October 2 qualification (complete)
 
 The new opt-in candidates preserve the existing arithmetic and reduction

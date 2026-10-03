@@ -76,7 +76,7 @@ int main(int argc, char **argv) {
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &ranks);
     if (argc < 7 || ranks != 12 || provided < MPI_THREAD_SERIALIZED) {
-        if (!rank) fprintf(stderr, "usage: %s MODEL ROUTED SHARED PROMPT_IDS TRACE_PREFIX CHUNK [--reference-chunk 512] [--capture-hidden] [--compare-moe-prefill-layout] [--compare-kda-prefill-kernel] [--compare-moe-scale-kernel] [--compare-mla-softmax-kernel] [prefill/runtime options]\n", argv[0]);
+        if (!rank) fprintf(stderr, "usage: %s MODEL ROUTED SHARED PROMPT_IDS TRACE_PREFIX CHUNK [--reference-chunk 512] [--capture-hidden] [--compare-dense-prefill-tile] [--compare-moe-prefill-layout] [--compare-kda-prefill-kernel] [--compare-moe-scale-kernel] [--compare-mla-softmax-kernel] [prefill/runtime options]\n", argv[0]);
         MPI_Abort(MPI_COMM_WORLD, 2);
     }
     char *end;
@@ -85,8 +85,9 @@ int main(int argc, char **argv) {
         MPI_Abort(MPI_COMM_WORLD, 2);
     glm53f_prefill_config config = {GLM53F_PREFILL_FAST, 32, 27, NULL, 5};
     int capture_hidden = 0, compare_layout = 0, compare_kda = 0, compare_iq = 0, compare_softmax = 0;
-    int reference_chunk = 512;
+    int reference_chunk = 512, compare_dense = 0, dense_tiles[3] = {4,4,4};
     for (int i = 7; i < argc; ++i) {
+        if (!strcmp(argv[i], "--compare-dense-prefill-tile")) { compare_dense = 1; continue; }
         if (!strcmp(argv[i], "--compare-moe-prefill-layout")) { compare_layout = 1; continue; }
         if (!strcmp(argv[i], "--compare-kda-prefill-kernel")) { compare_kda = 1; continue; }
         if (!strcmp(argv[i], "--compare-moe-scale-kernel")) { compare_iq = 1; continue; }
@@ -133,6 +134,12 @@ int main(int argc, char **argv) {
     if (!m || !empty || !reference ||
         glm53f_target_model_configure_prefill_12n(m, &config) ||
         glm53f_target_snapshot_save_12n(m, empty)) MPI_Abort(MPI_COMM_WORLD, 2);
+    if (compare_dense) {
+        for (int l = 0; l < 3; ++l) {
+            dense_tiles[l] = glm53f_dense_ffn_batch_capacity_12n(m->dense[l]);
+            if (glm53f_dense_ffn_set_batch_tile_12n(m->dense[l], 4)) MPI_Abort(MPI_COMM_WORLD, 2);
+        }
+    }
     long minimum_kb = LONG_MAX;
     int ref_token, token, local_ok = 1;
     int hidden_mismatches = 0, max_hidden_mismatches;
@@ -150,6 +157,9 @@ int main(int argc, char **argv) {
     if (compare_kda && setenv("GLM53F_KDA_PREFILL_COLUMNS", "1", 1)) MPI_Abort(MPI_COMM_WORLD, 2);
     if (compare_softmax && setenv("GLM53F_MLA_PARALLEL_SOFTMAX", "1", 1)) MPI_Abort(MPI_COMM_WORLD, 2);
     if (compare_iq && setenv("GLM53F_IQ_SCALE_WORDS", "1", 1)) MPI_Abort(MPI_COMM_WORLD, 2);
+    if (compare_dense)
+        for (int l = 0; l < 3; ++l)
+            if (glm53f_dense_ffn_set_batch_tile_12n(m->dense[l], dense_tiles[l])) MPI_Abort(MPI_COMM_WORLD, 2);
     if (run_prompt(m, ids, count, (int)chunk, &minimum_kb,
             reference_hidden, candidate_hidden, &hidden_mismatches) || !m->last_streams ||
         glm53f_target_model_readout_12n(m, &token, &logit)) MPI_Abort(MPI_COMM_WORLD, 3);
@@ -165,8 +175,8 @@ int main(int argc, char **argv) {
     MPI_Allreduce(&state_ok, &all_state, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
     MPI_Allreduce(&mismatches, &max_mismatches, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
     MPI_Allreduce(&hidden_mismatches, &max_hidden_mismatches, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
-    if (!rank) printf("GLM53F_PREFILL_CHUNK_CHECK tokens=%d reference_chunk=%d candidate_chunk=%ld capacity=%d compare_moe_layout=%d compare_kda_columns=%d compare_iq_scales=%d compare_mla_softmax=%d hidden_bit_mismatches=%d capture_hidden=%d prompt_hidden_bit_mismatches=%d state=%s first_token=%d/%d min_MemAvailable_GiB=%.6f %s\n",
-        count, reference_chunk, chunk, GLM53F_PREFILL_MAX_TOKENS, compare_layout, compare_kda, compare_iq, compare_softmax, max_mismatches,
+    if (!rank) printf("GLM53F_PREFILL_CHUNK_CHECK tokens=%d reference_chunk=%d candidate_chunk=%ld capacity=%d compare_moe_layout=%d compare_kda_columns=%d compare_iq_scales=%d compare_mla_softmax=%d compare_dense_tile=%d dense_tile=%d hidden_bit_mismatches=%d capture_hidden=%d prompt_hidden_bit_mismatches=%d state=%s first_token=%d/%d min_MemAvailable_GiB=%.6f %s\n",
+        count, reference_chunk, chunk, GLM53F_PREFILL_MAX_TOKENS, compare_layout, compare_kda, compare_iq, compare_softmax, compare_dense, dense_tiles[0], max_mismatches,
         capture_hidden, max_hidden_mismatches,
         all_state ? "BIT_EXACT" : "MISMATCH", ref_token, token, minimum_kb / 1048576.0,
         all_ok ? "PASS" : "FAIL");

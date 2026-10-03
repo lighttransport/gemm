@@ -137,8 +137,8 @@ int main(int argc, char **argv) {
 #else
         const int fast_math = 0;
 #endif
-        printf("GLM53F_BENCH_CONFIG {\"ranks\":12,\"threads\":%d,\"fast_math\":%d,\"prefill_chunk\":%d,\"prefill_capacity\":%d,\"attention_panel\":%d,\"prefill_features\":%u,\"collective\":%d,\"persistent\":%d,\"grouped_verify\":%d,\"router_fused\":%d,\"mhc_fused_sync\":%d,\"mhc_batch_team\":%d,\"kda_decode_columns\":%d,\"kda_prefill_columns\":%d,\"iq_scale_words\":%d,\"mla_parallel_softmax\":%d,\"moe_gu_padding\":%d,\"serialized_owner\":%d}\n",
-            omp_get_max_threads(), fast_math, chunk, GLM53F_PREFILL_MAX_TOKENS, GLM53F_PREFILL_ATTN_TOKENS, config.features, config.collective,
+        printf("GLM53F_BENCH_CONFIG {\"ranks\":12,\"threads\":%d,\"fast_math\":%d,\"prefill_chunk\":%d,\"prefill_capacity\":%d,\"attention_panel\":%d,\"dense_prefill_tile\":%d,\"prefill_features\":%u,\"collective\":%d,\"persistent\":%d,\"grouped_verify\":%d,\"router_fused\":%d,\"mhc_fused_sync\":%d,\"mhc_batch_team\":%d,\"kda_decode_columns\":%d,\"kda_prefill_columns\":%d,\"iq_scale_words\":%d,\"mla_parallel_softmax\":%d,\"moe_gu_padding\":%d,\"serialized_owner\":%d}\n",
+            omp_get_max_threads(), fast_math, chunk, GLM53F_PREFILL_MAX_TOKENS, GLM53F_PREFILL_ATTN_TOKENS, getenv("GLM53F_DENSE_PREFILL_TILE") ? atoi(getenv("GLM53F_DENSE_PREFILL_TILE")) : 4, config.features, config.collective,
             getenv("GLM53F_DECODE_EXECUTOR") ? !!atoi(getenv("GLM53F_DECODE_EXECUTOR")) : 0,
             getenv("GLM53F_VERIFY_GROUPED") ? !!atoi(getenv("GLM53F_VERIFY_GROUPED")) : 0,
             getenv("GLM53F_ROUTER_FUSE") ? !!atoi(getenv("GLM53F_ROUTER_FUSE")) : 0,

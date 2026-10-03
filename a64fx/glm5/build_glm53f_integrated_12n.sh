@@ -79,6 +79,7 @@ if [ "$bin_dir" = . ]; then bin ../utofu-tests/tofu_topo_helper ../utofu-tests/t
 if [ "$mode" != runtime ]; then
     obj target glm53f_target_decode_12n.c -DGLM53F_TARGET_MODEL_NO_MAIN
     bin glm53f_layers_check_12n glm53f_layers_check_12n.c "${objects[@]}"
+    bin test_glm53f_dense_prefill_tiles test_glm53f_dense_prefill_tiles.c "${objects[@]}"
     bin test_glm53f_dense_cross_layout test_glm53f_dense_cross_layout.c "${kernels[@]}" "$build_dir/dist.o"
     bin test_glm53f_kda_cross_layout test_glm53f_kda_cross_layout.c "${kernels[@]}" "$build_dir/dist.o"
     bin test_glm53f_dense_dist test_glm53f_dense_dist.c glm53f_dist.c "$build_dir/dense.o" "$build_dir/kda.o" "${kernels[@]}"

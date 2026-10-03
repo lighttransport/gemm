@@ -6,8 +6,11 @@ The approved prefill-first PP3×TP4 architecture is being implemented.
 Distribution/pipeline foundations pass native12-node correctness. Routed
 4×512 native slicing passes24 exact cases across six formats; real-model
 metadata-only sizing passes all12 ranks. Real PP short cross-layout correctness fails; qualification is incomplete.
-PJM52106727 is the fresh12-node normal2GHz/eco0 allocation, bridge42446→32446→21264,
-host d25-0010s, isolated checkout unchanged. Local launcher tmux socket is
+PJM52106727 has expired; its `/local` images are gone. Current PJM52116293
+starts08:25:59 JST and expires14:25:59 JST (October3), normal2GHz/eco0,
+12 nodes compact2×3×2. Bridge42446→32446→21264, hoste27-6012c, checkout unchanged.
+Launcher tmux session`glm53f-pp2`; job guard14:00 JST. The separate4-node
+allocation52116110 is unrelated and must not be touched. Local launcher tmux socket is
 `tmp/tmux-glm53f/pp1.sock`, session`glm53f-pp1`. PJM52097252 has expired.
 
 The PP runner and all owned component constructors/stagers are now connected
@@ -19,7 +22,39 @@ minimum headroom9.036316GiB. Canonical full-prompt means/streams, per-head
 state and post-decode fields plus route/selection diagnostics are implemented;
 host rejection tests and the legacy40-case repack policy pass.
 
-**Native status (05:10 JST):** all eight PP image components on all12 ranks
+**Current continuation (October3, morning):** identical-input real-weight
+TP12/TP4 isolation probes pass on fresh PJM52116293. Dense layers0:3 gate/up/
+activation values are bit-exact, output rel-L2<=1.526e-7. KDA layers0:3
+state/convolution/per-head normalized outputs are bit-exact for scalar and
+63/64-token fast GEMM tiles; output rel-L2<=1.752e-7. The first KDA fixture
+forgot `KDA_BATCH_TEAM` and read unused batch buffers after scalar fallback;
+that fixture failure is preserved, not a model/kernel failure. Corrected v2
+explicitly logs both GEMM states and passes. See
+`strata-cross-layout-isolation-20261003.json`. Small output rounding followed
+by downstream quantization remains a hypothesis; actual-prompt early-layer
+replay through mHC is still needed. No whole PP correctness fix is claimed.
+
+**New prefill candidate:** `--dense-prefill-tile 4|16|32|64` keeps the existing
+four-token row arithmetic and four-token reduction payload/order, but batches
+native dense computation in wider calls. Default4/FP8 behavior is retained.
+All126 native exact cases pass (three layers ×three wider tiles ×14 tails).
+Five paired component timings at64 give median speedups1.331170,1.302043,
+1.429393 for layers0,1,2. These are component rates, not whole-model tok/s.
+
+Full TP12 restaging **PID712** is active, routed source reads are slow. Its
+success sentinel is `DENSE_TILE_FULL_TP12_STAGE_PASS`. **PID1193** waits for it,
+then runs short128 and8049 complete-prompt means/finalstreams/fullstate/first-
+token bit-exact checks against tile4. Only after those pass does
+`dense-full-campaign.py` run fresh frozen controls,3-trial16/32/64 screens,
+and5 fresh independent baseline/candidate pairs with257 exact IDs. All
+scripts/logs are in `tmp/strata-pipeline-20261003/`. Do not overlap MPI or
+launch duplicate staging. Full runner/canonical checker/benchmark hashes
+are in `dense-full-v2.sha256`; binaries are in
+`a64fx/glm5/build/candidate-dense-tile-v2`. No gain is promoted yet. Current
+full images use the standard `/local/glm53f-q4-*-52116293` paths; component-
+only dense/KDA/PP-core fixtures are under `/local/glm53f-dense-cross-52116293-*`.
+
+**Historical native status (05:10 JST; allocation52106727):** all eight PP image components on all12 ranks
 are staged. All drivers through matched-v1 PID10241 are terminal. The first
 model load passed source/hash checks with11.531250GiB headroom, then exposed
 an incorrect MoE guard requiring a legacy shared blob for native-only PP.

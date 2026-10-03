@@ -41,7 +41,7 @@ static void mv(float*y,const uint8_t*w,const float*s,const float*x,int rows,int 
 #pragma omp parallel for schedule(static)
     for(int r=0;r<rows;r++)y[r]=dot(w+(size_t)r*cols,s+(size_t)(r/B)*nb,x,cols);}
 #endif
-struct glm53f_dense_ffn_context_12n{int rank,i0,in,lb,hb;uint8_t*g,*u,*d;float*gs,*us,*ds,*gv,*uv,*act,*part,*bgv,*buv,*bact,*bpart;int q2,gtype,utype,dtype;const glm53f_dist *dist;int image_rank;};
+struct glm53f_dense_ffn_context_12n{int rank,i0,in,lb,hb;uint8_t*g,*u,*d;float*gs,*us,*ds,*gv,*uv,*act,*part,*bgv,*buv,*bact,*bpart;int q2,gtype,utype,dtype;const glm53f_dist *dist;int image_rank,batch_capacity,batch_tile;};
 
 typedef struct { uint64_t offset, hash; int type, rows, columns, check_hash; } q2_dense_entry;
 
@@ -169,11 +169,25 @@ static glm53f_dense_ffn_context_12n *dense_create(
     c = calloc(1, sizeof(*c)); if (!c) MPI_Abort(MPI_COMM_WORLD, 2);
     c->dist = dist; c->image_rank = dist ? dist->map.world_rank : rank;
     c->rank=rank;c->i0=i0;c->in=in;c->hb=H/B;c->lb=in/B;
+    const char *tile = getenv("GLM53F_DENSE_PREFILL_TILE");
+    c->batch_capacity = 4;
+    if (tile) {
+        if (strcmp(tile,"4") && strcmp(tile,"16") && strcmp(tile,"32") && strcmp(tile,"64")) goto fail;
+        c->batch_capacity = atoi(tile);
+    }
     if(q2_stage&&*q2_stage){if(load_q2_dense(c,q2_stage,layer))goto fail;}else{st=glm53f_st_open(model);if(!st)goto fail;
 #define N(S) snprintf(n,sizeof n,"model.language_model.layers.%d.mlp.%s",layer,S)
     c->g=a256((size_t)in*H);N("gate_proj.weight");rd(st,n,(size_t)i0*H,c->g,(size_t)in*H,rank);c->u=a256((size_t)in*H);N("up_proj.weight");rd(st,n,(size_t)i0*H,c->u,(size_t)in*H,rank);c->gs=a256((size_t)c->lb*c->hb*4);N("gate_proj.weight_scale_inv");rd(st,n,(size_t)(i0/B)*c->hb*4,c->gs,(size_t)c->lb*c->hb*4,rank);c->us=a256((size_t)c->lb*c->hb*4);N("up_proj.weight_scale_inv");rd(st,n,(size_t)(i0/B)*c->hb*4,c->us,(size_t)c->lb*c->hb*4,rank);c->d=a256((size_t)H*in);N("down_proj.weight");rd_cols(st,n,c->d,H,I,i0,in,rank);c->ds=a256((size_t)(H/B)*c->lb*4);N("down_proj.weight_scale_inv");rd_scale_cols(st,n,c->ds,H/B,I/B,i0/B,c->lb,rank);
 #undef N
-    glm53f_st_close(st);st=NULL;}c->gv=a256(in*4);c->uv=a256(in*4);c->act=a256(in*4);c->part=a256(H*4);c->bgv=a256((size_t)4*in*4);c->buv=a256((size_t)4*in*4);c->bact=a256((size_t)4*in*4);c->bpart=a256((size_t)4*H*4);return c;
+    glm53f_st_close(st);st=NULL;}
+    if (!c->q2) c->batch_capacity = 4;
+    c->batch_tile = c->batch_capacity;
+    c->gv=a256(in*4);c->uv=a256(in*4);c->act=a256(in*4);c->part=a256(H*4);
+    c->bgv = a256((size_t)c->batch_capacity * in * sizeof(float));
+    c->buv = a256((size_t)c->batch_capacity * in * sizeof(float));
+    c->bact = a256((size_t)c->batch_capacity * in * sizeof(float));
+    c->bpart = a256((size_t)c->batch_capacity * H * sizeof(float));
+    return c;
 fail:if(st)glm53f_st_close(st);glm53f_dense_ffn_free_12n(c);return NULL;}
 glm53f_dense_ffn_context_12n *glm53f_dense_ffn_create_12n(const char *model, int layer) {
     return dense_create(NULL, model, getenv("GLM53F_Q2_DENSE_STAGE"), layer);
@@ -181,6 +195,14 @@ glm53f_dense_ffn_context_12n *glm53f_dense_ffn_create_12n(const char *model, int
 glm53f_dense_ffn_context_12n *glm53f_dense_ffn_create_dist(const glm53f_dist *dist,
         const char *model, const char *stage, int layer) {
     return dist ? dense_create(dist, model, stage, layer) : NULL;
+}
+int glm53f_dense_ffn_batch_capacity_12n(const glm53f_dense_ffn_context_12n *c) {
+    return c ? (c->q2 ? c->batch_tile : 4) : 0;
+}
+int glm53f_dense_ffn_set_batch_tile_12n(glm53f_dense_ffn_context_12n *c, int tile) {
+    if (!c || (tile != 4 && tile != 16 && tile != 32 && tile != 64) ||
+        tile > c->batch_capacity || (!c->q2 && tile != 4)) return -1;
+    c->batch_tile = tile; return 0;
 }
 static int dense_sum(const glm53f_dense_ffn_context_12n *c,
         const float *input, float *output, int count) {
@@ -215,7 +237,7 @@ int glm53f_dense_ffn_sublayer_12n(void*context,float*out,const float*x){glm53f_d
     for(int j=0;j<c->in;j++){float a=c->gv[j]>10?10:c->gv[j],b=c->uv[j]>10?10:c->uv[j]<-10?-10:c->uv[j];c->act[j]=a/(1+expf(-a))*b;}
 #pragma omp parallel for schedule(static)
     for(int r=0;r<H;r++)c->part[r]=dot(c->d+(size_t)r*c->in,c->ds+(size_t)(r/B)*c->lb,c->act,c->in);return dense_sum(c,c->part,out,H);}
-int glm53f_dense_ffn_sublayer_batch_12n(glm53f_dense_ffn_context_12n*c,float*out,const float*x,int tokens){if(!c||!out||!x||tokens<1||tokens>4)return-1;
+int glm53f_dense_ffn_sublayer_batch_12n(glm53f_dense_ffn_context_12n*c,float*out,const float*x,int tokens){if(!c||!out||!x||tokens<1||tokens>glm53f_dense_ffn_batch_capacity_12n(c))return-1;
     if(c->q2){
         glm53f_native_matrix gu[2] = {
             {c->bgv,c->g,c->gtype,c->in,H}, {c->buv,c->u,c->utype,c->in,H}};
@@ -224,7 +246,13 @@ int glm53f_dense_ffn_sublayer_batch_12n(glm53f_dense_ffn_context_12n*c,float*out
 #pragma omp parallel for schedule(static)
         for(int q=0;q<tokens*c->in;q++){float a=c->bgv[q]>10?10:c->bgv[q],b=c->buv[q]>10?10:c->buv[q]<-10?-10:c->buv[q];c->bact[q]=a/(1+expf(-a))*b;}
         if(glm53f_native_matvec_batch(&down,1,c->bact,tokens))return-1;
-        return dense_sum(c,c->bpart,out,tokens*H);
+        /* Keep the original four-position reductions: a larger payload could
+         * change MPI's reduction tree and therefore the FP32 bits. */
+        for (int base = 0; base < tokens; base += 4) {
+            int n = tokens - base; if (n > 4) n = 4;
+            if (dense_sum(c,c->bpart+(size_t)base*H,out+(size_t)base*H,n*H)) return -1;
+        }
+        return 0;
     }
     glm53f_mv_fp8_block128_bits_batch(c->bgv,c->g,c->gs,x,tokens,c->in,H);glm53f_mv_fp8_block128_bits_batch(c->buv,c->u,c->us,x,tokens,c->in,H);
 #pragma omp parallel for schedule(static)
