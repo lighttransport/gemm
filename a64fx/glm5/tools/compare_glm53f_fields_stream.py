@@ -7,6 +7,7 @@ import re
 import struct
 import subprocess
 from pathlib import Path
+from glm53f_capture_counts import validate_counts, generated_ids_match
 
 
 def capture(prefix, hidden_required):
@@ -157,10 +158,13 @@ def main():
     parser.add_argument('reference'); parser.add_argument('candidate'); parser.add_argument('--checker', required=True)
     parser.add_argument('--phase', choices=['prefill', 'decode'], default='prefill'); parser.add_argument('--bit-exact', action='store_true')
     parser.add_argument('--reference-ids', required=True); parser.add_argument('--candidate-ids', required=True)
+    parser.add_argument('--prompt-tokens', required=True, type=int)
+    parser.add_argument('--output-tokens', required=True, type=int)
     args = parser.parse_args()
+    for prefix in (args.reference, args.candidate):
+        validate_counts(prefix, args.prompt_tokens, args.output_tokens, args.phase)
     result = compare(args.reference, args.candidate, args.checker, args.phase == 'decode', args.bit_exact)
-    a = [int(x) for x in Path(args.reference_ids).read_text().split()]; b = [int(x) for x in Path(args.candidate_ids).read_text().split()]
-    result['generated_ids_exact'] = bool(a) and a == b and all(0 <= x < 154880 for x in a)
+    result['generated_ids_exact'] = generated_ids_match(args.reference_ids, args.candidate_ids, args.output_tokens)
     result['pass'] &= result['generated_ids_exact']
     print(json.dumps(result, indent=2, allow_nan=False)); return 0 if result['pass'] else 1
 

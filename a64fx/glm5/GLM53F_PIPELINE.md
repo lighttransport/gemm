@@ -213,12 +213,15 @@ such runs do not qualify throughput. After retrieving all rank files:
 
 ```sh
 python3 tools/compare_glm53f_fields.py "$TP12_PREFIX" "$PP_PREFIX" \
-  --reference-ids "$TP12_IDS" --candidate-ids "$PP_IDS"
+  --reference-ids "$TP12_IDS" --candidate-ids "$PP_IDS" \
+  --prompt-tokens "$PROMPT_COUNT" --output-tokens 129
 python3 tools/compare_glm53f_fields.py "$TP12_PREFIX" "$PP_PREFIX" --phase decode \
-  --reference-ids "$TP12_IDS" --candidate-ids "$PP_IDS"
+  --reference-ids "$TP12_IDS" --candidate-ids "$PP_IDS" \
+  --prompt-tokens "$PROMPT_COUNT" --output-tokens 129
 # Require exact same-cut/same-microbatch schedule behavior separately.
 python3 tools/compare_glm53f_fields.py "$SERIAL_PREFIX" "$PIPELINE_PREFIX" --bit-exact \
-  --reference-ids "$SERIAL_IDS" --candidate-ids "$PIPELINE_IDS"
+  --reference-ids "$SERIAL_IDS" --candidate-ids "$PIPELINE_IDS" \
+  --prompt-tokens "$PROMPT_COUNT" --output-tokens 129
 ```
 
 The comparator requires complete canonical head coverage, exact structural
@@ -259,7 +262,8 @@ gcc -std=c11 -O2 -Wall -Wextra -Werror -Wpedantic -ffp-contract=off \
   tools/compare_glm53f_field_stream.c -lm -o "$WORK/compare_field_stream"
 python3 tools/compare_glm53f_fields_stream.py "$TP12_PREFIX" "$PP_PREFIX" \
   --checker "$WORK/compare_field_stream" \
-  --reference-ids "$TP12_IDS" --candidate-ids "$PP_IDS"
+  --reference-ids "$TP12_IDS" --candidate-ids "$PP_IDS" \
+  --prompt-tokens "$PROMPT_COUNT" --output-tokens 129
 ```
 
 Use the repository's `tmp/` directory for `$WORK`. Add `--phase decode` for

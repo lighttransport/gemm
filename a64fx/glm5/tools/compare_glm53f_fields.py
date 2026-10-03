@@ -4,6 +4,7 @@ import argparse
 import glob
 import json
 from pathlib import Path
+from glm53f_capture_counts import validate_counts, generated_ids_match
 import numpy as np
 
 
@@ -186,11 +187,13 @@ def main():
     p.add_argument('--tolerance', type=float, default=1e-3)
     p.add_argument('--reference-ids', required=True)
     p.add_argument('--candidate-ids', required=True)
+    p.add_argument('--prompt-tokens', required=True, type=int)
+    p.add_argument('--output-tokens', required=True, type=int)
     args = p.parse_args()
+    for prefix in (args.reference, args.candidate):
+        validate_counts(prefix, args.prompt_tokens, args.output_tokens, args.phase)
     result = compare(args.reference, args.candidate, args.tolerance, args.phase == "decode", args.bit_exact)
-    ref_ids = [int(x) for x in Path(args.reference_ids).read_text().split()]
-    candidate_ids = [int(x) for x in Path(args.candidate_ids).read_text().split()]
-    result['generated_ids_exact'] = bool(ref_ids) and ref_ids == candidate_ids and all(0 <= x < 154880 for x in ref_ids)
+    result['generated_ids_exact'] = generated_ids_match(args.reference_ids, args.candidate_ids, args.output_tokens)
     result['pass'] &= result['generated_ids_exact']
     print(json.dumps(result, indent=2, allow_nan=False))
     return 0 if result['pass'] else 1
