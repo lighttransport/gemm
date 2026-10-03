@@ -27,8 +27,74 @@
   },
   "limitations": [
     "Synthetic identical inputs, MPI reductions, isolated first three layers; not an actual-prompt end-to-end PP qualification",
-    "Initial KDA v1 lacked batch-team flag and checked uninitialized bnormed after scalar fallback. Those norm failures were diagnostic fixture errors, preserved in kda-cross-v1 rank logs; corrected v2 passes."
+    "Initial KDA v1 lacked batch-team flag and checked uninitialized bnormed after scalar fallback. Those norm failures were diagnostic fixture errors, preserved in kda-cross-v1 rank logs; corrected v2 passes.",
+    "Virtual v2 sliced Q8_0R as interleaved blocks and failed all partials; actual layout has separate quantized byte and FP32 scale planes. Corrected immutable v3 passes; failed capture preserved."
   ],
-  "inference": "Local projection/state kernels do not show large intrinsic partition errors; small final-output rounding and subsequent quantization amplification remain to be isolated through mHC with actual prompt inputs.",
-  "log_root": "tmp/strata-pipeline-20261003"
+  "inference": "Original dense partitions plus a stage-local ordered virtual-rank sum reproduce production TP12 MTNI exactly for these synthetic inputs. This is a tested dense projection/reduction approach; actual-prompt mHC propagation and other projection/expert ownership arithmetic remain unresolved.",
+  "log_root": "tmp/strata-pipeline-20261003",
+  "dense_virtual_tp12": {
+    "cases": 9,
+    "slicing": "TP4 Q8_0R byte and scale planes sliced into three original1024-column TP12 partitions",
+    "partial_sums": "BIT_EXACT on all12 ranks",
+    "reduced_output": "BIT_EXACT on all12 ranks",
+    "modes": [
+      "scalar1",
+      "batch1",
+      "batch4"
+    ],
+    "layers": [
+      0,
+      1,
+      2
+    ],
+    "binary_sha256": "0dfe64b5c2331724005c5d7facf224e8b519f793b00a0918763d58928240599d",
+    "rank0_log_sha256": "91d248be54a83a8f620f8f11f101076bc5895be18efa81189dd43eaa5b7fb011",
+    "scope": "Uses original world12 collective after scattering virtual partials; no four-rank reduction emulator or whole-PP fix is implemented",
+    "commands": [
+      "mpiexec -n 12 test_glm53f_dense_cross_layout TP12_DENSE PP_DENSE --virtual-tp12-down"
+    ],
+    "results": [
+      "GLM53F_DENSE_VIRTUAL_TP12 layer=0 tokens=1 scalar=1 partial_bit_mismatches=0 output_bit_mismatches=0 PASS",
+      "GLM53F_DENSE_VIRTUAL_TP12 layer=0 tokens=1 scalar=0 partial_bit_mismatches=0 output_bit_mismatches=0 PASS",
+      "GLM53F_DENSE_VIRTUAL_TP12 layer=0 tokens=4 scalar=0 partial_bit_mismatches=0 output_bit_mismatches=0 PASS",
+      "GLM53F_DENSE_VIRTUAL_TP12 layer=1 tokens=1 scalar=1 partial_bit_mismatches=0 output_bit_mismatches=0 PASS",
+      "GLM53F_DENSE_VIRTUAL_TP12 layer=1 tokens=1 scalar=0 partial_bit_mismatches=0 output_bit_mismatches=0 PASS",
+      "GLM53F_DENSE_VIRTUAL_TP12 layer=1 tokens=4 scalar=0 partial_bit_mismatches=0 output_bit_mismatches=0 PASS",
+      "GLM53F_DENSE_VIRTUAL_TP12 layer=2 tokens=1 scalar=1 partial_bit_mismatches=0 output_bit_mismatches=0 PASS",
+      "GLM53F_DENSE_VIRTUAL_TP12 layer=2 tokens=1 scalar=0 partial_bit_mismatches=0 output_bit_mismatches=0 PASS",
+      "GLM53F_DENSE_VIRTUAL_TP12 layer=2 tokens=4 scalar=0 partial_bit_mismatches=0 output_bit_mismatches=0 PASS"
+    ]
+  },
+  "dense_stage4_mtni": {
+    "cases": 9,
+    "layers": [
+      0,
+      1,
+      2
+    ],
+    "modes": [
+      "scalar1",
+      "batch1",
+      "batch4"
+    ],
+    "reference": "Actual TP12 uTofu six-TNI rank-ordered FP32 reduction; GLM53F_MTNI_DECODE=1 verified mtni=1(x6)",
+    "candidate": "Stage-local MPI_Allgather of three original1024-column partials per TP4 rank; SVE rank0..11 FP32 adds with dependency barrier against compiler reassociation",
+    "result": "Every partial and stage-local reduced output BIT_EXACT on all contributing ranks",
+    "binary_sha256": "5e3c6ba70641c43b01f98b6188fbc35539a0fc798dde99db28db88d8c38700ee",
+    "rank0_log_sha256": "4e237d06dbf5429daddef3f64df227f83770f43d914b26daa8af8a7b1b9d0345",
+    "command": "TOFU_TOPO_PATH=ALLOCATION_TOPOLOGY mpiexec -n 12 test_glm53f_dense_cross_layout TP12_DENSE PP_DENSE --virtual-tp12-down-mtni",
+    "results": [
+      "GLM53F_DENSE_STAGE4_MTNI layer=0 tokens=1 scalar=1 output_bit_mismatches=0 PASS",
+      "GLM53F_DENSE_STAGE4_MTNI layer=0 tokens=1 scalar=0 output_bit_mismatches=0 PASS",
+      "GLM53F_DENSE_STAGE4_MTNI layer=0 tokens=4 scalar=0 output_bit_mismatches=0 PASS",
+      "GLM53F_DENSE_STAGE4_MTNI layer=1 tokens=1 scalar=1 output_bit_mismatches=0 PASS",
+      "GLM53F_DENSE_STAGE4_MTNI layer=1 tokens=1 scalar=0 output_bit_mismatches=0 PASS",
+      "GLM53F_DENSE_STAGE4_MTNI layer=1 tokens=4 scalar=0 output_bit_mismatches=0 PASS",
+      "GLM53F_DENSE_STAGE4_MTNI layer=2 tokens=1 scalar=1 output_bit_mismatches=0 PASS",
+      "GLM53F_DENSE_STAGE4_MTNI layer=2 tokens=1 scalar=0 output_bit_mismatches=0 PASS",
+      "GLM53F_DENSE_STAGE4_MTNI layer=2 tokens=4 scalar=0 output_bit_mismatches=0 PASS"
+    ],
+    "scope": "Dense projection/reduction diagnostic only. No KDA/sparse/routed virtual arithmetic, full-PP correctness fix, or throughput claim.",
+    "original_MPI_mode_regression": "Immutable v4 also passes all9 original MPI partial/output checks after MTNI extension"
+  }
 }

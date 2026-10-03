@@ -279,3 +279,36 @@ L2. The KDA fixture explicitly exercises63/64-token fast GEMM tiles. These
 synthetic-input MPI component checks do not resolve the actual-prompt
 end-to-end PP failure; downstream quantization amplification remains a
 hypothesis. See [isolation evidence](strata-cross-layout-isolation-20261003.json).
+
+
+The virtual-TP12 dense diagnostic now passes9 real-weight cases: scalar1,
+batch1 andbatch4 across layers0–2. TP4's Q8_0R byte and scale planes are sliced
+at the original1024-column boundaries; the original12 virtual partials are
+scattered to12 real ranks and reduced with the same world collective.
+**Every partial and final output is bit-exact.** This establishes a way to
+preserve dense local arithmetic, not a four-rank reduction emulator or a
+whole-PP correctness fix. The initial v2 fixture incorrectly treated Q8_0R
+as interleaved blocks; failed logs are preserved, corrected v3 passes.
+
+```sh
+mpiexec -n 12 test_glm53f_dense_cross_layout "$TP12_DENSE_STAGE" \
+  "$PP_DENSE_STAGE" --virtual-tp12-down
+```
+
+Next isolate actual-prompt mHC propagation and KDA output partitions. The
+qualified TP12 recipe uses MTNI rank-ordered FP32 sums; a stage-local virtual
+reduction must reproduce that order. Routed virtual ownership needs explicit
+care: original `(expert*8+part)%12` ownership is not three contiguous logical
+ranks within the current four-part TP4 images. Do not assume the dense
+mapping generalizes to routed FFN, or promote PP before all canonical gates.
+
+
+The production-MTNI extension also passes9 cases: actual TP12 uTofu MTNI
+(six TNIs, rank0..11 FP32 sum) versus a stage-local four-rank MPI_Allgather
+of three original partials per rank and ordered SVE additions. Every dense
+partial and reduced output is **BIT_EXACT**. `--virtual-tp12-down-mtni`
+requires the current allocation's `TOFU_TOPO_PATH`. An empty SVE dependency
+barrier prevents compiler reassociation of the diagnostic's rank additions.
+This establishes a dense four-rank reduction approach, not a complete PP
+executor; KDA/sparse/routed virtual ownership and actual-prompt mHC still
+need validation. See the same isolation evidence JSON.

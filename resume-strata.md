@@ -11,7 +11,7 @@ starts08:25:59 JST and expires14:25:59 JST (October3), normal2GHz/eco0,
 12 nodes compact2×3×2. Bridge42446→32446→21264, hoste27-6012c, checkout unchanged.
 Launcher tmux session`glm53f-pp2`; job guard14:00 JST. The separate4-node
 allocation52116110 is unrelated and must not be touched. Local launcher tmux socket is
-`tmp/tmux-glm53f/pp1.sock`, session`glm53f-pp1`. PJM52097252 has expired.
+`tmp/tmux-glm53f/pp1.sock`, session`glm53f-pp2`. PJM52097252 has expired.
 
 The PP runner and all owned component constructors/stagers are now connected
 and cross-built. Native fixtures pass dense/shared28 cases each, KDA16,
@@ -41,18 +41,50 @@ All126 native exact cases pass (three layers ×three wider tiles ×14 tails).
 Five paired component timings at64 give median speedups1.331170,1.302043,
 1.429393 for layers0,1,2. These are component rates, not whole-model tok/s.
 
-Full TP12 restaging **PID712** is active, routed source reads are slow. Its
-success sentinel is `DENSE_TILE_FULL_TP12_STAGE_PASS`. **PID1193** waits for it,
-then runs short128 and8049 complete-prompt means/finalstreams/fullstate/first-
-token bit-exact checks against tile4. Only after those pass does
-`dense-full-campaign.py` run fresh frozen controls,3-trial16/32/64 screens,
-and5 fresh independent baseline/candidate pairs with257 exact IDs. All
-scripts/logs are in `tmp/strata-pipeline-20261003/`. Do not overlap MPI or
-launch duplicate staging. Full runner/canonical checker/benchmark hashes
-are in `dense-full-v2.sha256`; binaries are in
-`a64fx/glm5/build/candidate-dense-tile-v2`. No gain is promoted yet. Current
-full images use the standard `/local/glm53f-q4-*-52116293` paths; component-
-only dense/KDA/PP-core fixtures are under `/local/glm53f-dense-cross-52116293-*`.
+Full TP12 restaging **PID712 completed**, every rank/component passes.
+Driver3140 is **terminal/PASS**. Short128 and8049 complete-prompt means/final-
+streams/fullstate/first-token gates pass **BIT_EXACT**, minimum headroom
+10.056885/8.118774GiB. All15 timing runs match all257 frozen IDs. Tile64 five
+fresh paired ratios are **0.995332 prefill /0.981420 decode**: no promotion;
+keep default4 and qualified capacity4096. Median rates(prefill/decode) are
+frozen410.902710/34.809173, candidate409.116828/34.265047. Native final126-case
+unit and setter/capacity guards also pass. Initial driver1193 lacked the
+unchanged topology helper; failure log retained, helper added before3140.
+See `strata-dense-prefill-tile-20261003.json`. Full binary hashes are in
+`tmp/strata-pipeline-20261003/dense-full-v2.sha256`.
+
+**Dense virtual-TP12 proof:** corrected immutable cross-layout v3 passes9
+cases(scalar1,batch1,batch4 ×layers0–2), with zero bit mismatches in every
+original1024-column partial and reduced output. Q8_0R bytes and FP32 scales
+are copied as separate planes. Failed v2 used interleaved copying and is
+preserved; this was a fixture error. The proof uses the original world12
+collective after scattering virtual partials, not a stage-local four-rank
+emulator or complete PP fix. See `strata-cross-layout-isolation-20261003.json`.
+An additional immutable v4 verifies actual production TP12 six-TNI MTNI
+against a four-rank gather of three original partials each plus ordered SVE
+rank0..11 additions: all9 cases, every partial/output **BIT_EXACT**. This is
+a tested dense stage-local approach, not a full PP correctness fix. Native
+v4 PID6284 is terminal/PASS. `--virtual-tp12-down-mtni` needs current topology.
+Next trace actual-prompt mHC and KDA projection partitions. Preserve MTNI's
+original rank order; routed ownership `(expert*8+part)%12` cannot simply use
+the dense three-contiguous-part mapping with four-part PP images.
+
+**Routed cache experiment rejected:** expanding256 columns within each
+unchanged512-column correction boundary passes fast/conservative21 cases
+per math mode on all12 ranks, finite outputs and guards bit-exact. Five
+paired192-part timings at1/12/47/48 threads show about2.5% regressions at the
+114-token cohorts used by4096 prefill;47-thread ratio0.975628. Small14-token
+cohorts gain about2.8%, insufficient for selected recipe. Production header/
+runtime unchanged. Synthetic per-call allocation/copy timing is not whole-
+model throughput. See `strata-moe-expansion-native-20261003.json`; artifacts
+`tmp/strata-moe-expansion-20261003/`.
+
+**All queues terminal:** post-dense5892 and cache6052 PASS; superseded4512/
+5821 terminal fixture/grep failures, captured. No active MPI task remains.
+Allocation52116293 and bridge remain live until14:25:59 JST; guard14:00.
+Standard `/local/glm53f-q4-*-52116293` full images remain available; component
+fixtures `/local/glm53f-dense-cross-52116293-*` remain available. Do not stage
+a duplicate model or overlap native MPI runs. No push authorized.
 
 **Historical native status (05:10 JST; allocation52106727):** all eight PP image components on all12 ranks
 are staged. All drivers through matched-v1 PID10241 are terminal. The first

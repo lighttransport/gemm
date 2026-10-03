@@ -1,0 +1,432 @@
+{
+  "date": "2026-10-03",
+  "allocation": 52116293,
+  "status": "native_arithmetic_PASS_cache_experiment_rejected",
+  "promoted": false,
+  "targets_met": false,
+  "scope": "Synthetic192 distinct Q4/Q5 gate-up parts with Q5/Q6 down projections, identical prepared activations; no whole-model rate",
+  "hypothesis": "256-column expansion may reduce L1 pressure while preserving512-column correction order",
+  "experiment": "Two256-column expanded GEMM calls per original512-column chunk; retain ordered FP32 FMAs and original minimum correction; production header unchanged",
+  "hardware": "12 A64FX nodes, normal2GHz/eco0, compact2x3x2",
+  "compiler": "Fujitsu FCC7.1 mpifccpx -Nclang -O3 SVE, ff-contract=fast, -Wall -Wextra -Werror",
+  "unit_checks": {
+    "math": [
+      "fast",
+      "conservative"
+    ],
+    "cases_per_math_per_rank": 21,
+    "ranks": 12,
+    "outputs_and_guards": "BIT_EXACT and finite",
+    "formats": "Q4/Q5 gate-up, Q5/Q6 down; route tails and cohort boundaries through385 positions"
+  },
+  "timing": {
+    "threads": [
+      1,
+      12,
+      47,
+      48
+    ],
+    "tokens_per_part": [
+      14,
+      114
+    ],
+    "trials_per_shape": 5,
+    "alternating_order": true,
+    "rank_maximum": true,
+    "allocation_and_output_copy_included": true,
+    "median_baseline_over_candidate": {
+      "1_14": 1.028143,
+      "1_114": 0.976134,
+      "12_14": 1.027058,
+      "12_114": 0.975866,
+      "47_14": 1.027819,
+      "47_114": 0.975628,
+      "48_14": 1.028346,
+      "48_114": 0.975266
+    },
+    "rows": [
+      {
+        "threads": 1,
+        "tokens_per_part": 14,
+        "trial": 0,
+        "baseline_seconds": 0.0060307,
+        "candidate_seconds": 0.00583541,
+        "ratio": 1.033466,
+        "outputs": "BIT_EXACT"
+      },
+      {
+        "threads": 1,
+        "tokens_per_part": 14,
+        "trial": 1,
+        "baseline_seconds": 0.005984261,
+        "candidate_seconds": 0.0058131,
+        "ratio": 1.029444,
+        "outputs": "BIT_EXACT"
+      },
+      {
+        "threads": 1,
+        "tokens_per_part": 14,
+        "trial": 2,
+        "baseline_seconds": 0.00597955,
+        "candidate_seconds": 0.005833929,
+        "ratio": 1.024961,
+        "outputs": "BIT_EXACT"
+      },
+      {
+        "threads": 1,
+        "tokens_per_part": 14,
+        "trial": 3,
+        "baseline_seconds": 0.00598071,
+        "candidate_seconds": 0.005817,
+        "ratio": 1.028143,
+        "outputs": "BIT_EXACT"
+      },
+      {
+        "threads": 1,
+        "tokens_per_part": 14,
+        "trial": 4,
+        "baseline_seconds": 0.00598016,
+        "candidate_seconds": 0.00582156,
+        "ratio": 1.027244,
+        "outputs": "BIT_EXACT"
+      },
+      {
+        "threads": 1,
+        "tokens_per_part": 114,
+        "trial": 0,
+        "baseline_seconds": 0.02892206,
+        "candidate_seconds": 0.02961777,
+        "ratio": 0.97651,
+        "outputs": "BIT_EXACT"
+      },
+      {
+        "threads": 1,
+        "tokens_per_part": 114,
+        "trial": 1,
+        "baseline_seconds": 0.028920201,
+        "candidate_seconds": 0.02962728,
+        "ratio": 0.976134,
+        "outputs": "BIT_EXACT"
+      },
+      {
+        "threads": 1,
+        "tokens_per_part": 114,
+        "trial": 2,
+        "baseline_seconds": 0.02889187,
+        "candidate_seconds": 0.02964511,
+        "ratio": 0.974591,
+        "outputs": "BIT_EXACT"
+      },
+      {
+        "threads": 1,
+        "tokens_per_part": 114,
+        "trial": 3,
+        "baseline_seconds": 0.02892966,
+        "candidate_seconds": 0.02962908,
+        "ratio": 0.976394,
+        "outputs": "BIT_EXACT"
+      },
+      {
+        "threads": 1,
+        "tokens_per_part": 114,
+        "trial": 4,
+        "baseline_seconds": 0.02889529,
+        "candidate_seconds": 0.0296702,
+        "ratio": 0.973883,
+        "outputs": "BIT_EXACT"
+      },
+      {
+        "threads": 12,
+        "tokens_per_part": 14,
+        "trial": 0,
+        "baseline_seconds": 0.005986979,
+        "candidate_seconds": 0.00582925,
+        "ratio": 1.027058,
+        "outputs": "BIT_EXACT"
+      },
+      {
+        "threads": 12,
+        "tokens_per_part": 14,
+        "trial": 1,
+        "baseline_seconds": 0.005987599,
+        "candidate_seconds": 0.005814911,
+        "ratio": 1.029698,
+        "outputs": "BIT_EXACT"
+      },
+      {
+        "threads": 12,
+        "tokens_per_part": 14,
+        "trial": 2,
+        "baseline_seconds": 0.00598546,
+        "candidate_seconds": 0.00583329,
+        "ratio": 1.026087,
+        "outputs": "BIT_EXACT"
+      },
+      {
+        "threads": 12,
+        "tokens_per_part": 14,
+        "trial": 3,
+        "baseline_seconds": 0.00598386,
+        "candidate_seconds": 0.005827731,
+        "ratio": 1.026791,
+        "outputs": "BIT_EXACT"
+      },
+      {
+        "threads": 12,
+        "tokens_per_part": 14,
+        "trial": 4,
+        "baseline_seconds": 0.00598816,
+        "candidate_seconds": 0.00582642,
+        "ratio": 1.02776,
+        "outputs": "BIT_EXACT"
+      },
+      {
+        "threads": 12,
+        "tokens_per_part": 114,
+        "trial": 0,
+        "baseline_seconds": 0.02891979,
+        "candidate_seconds": 0.02964276,
+        "ratio": 0.975611,
+        "outputs": "BIT_EXACT"
+      },
+      {
+        "threads": 12,
+        "tokens_per_part": 114,
+        "trial": 1,
+        "baseline_seconds": 0.028878669,
+        "candidate_seconds": 0.02963865,
+        "ratio": 0.974358,
+        "outputs": "BIT_EXACT"
+      },
+      {
+        "threads": 12,
+        "tokens_per_part": 114,
+        "trial": 2,
+        "baseline_seconds": 0.02893037,
+        "candidate_seconds": 0.029645829,
+        "ratio": 0.975866,
+        "outputs": "BIT_EXACT"
+      },
+      {
+        "threads": 12,
+        "tokens_per_part": 114,
+        "trial": 3,
+        "baseline_seconds": 0.02891562,
+        "candidate_seconds": 0.029592399,
+        "ratio": 0.97713,
+        "outputs": "BIT_EXACT"
+      },
+      {
+        "threads": 12,
+        "tokens_per_part": 114,
+        "trial": 4,
+        "baseline_seconds": 0.02892854,
+        "candidate_seconds": 0.02959434,
+        "ratio": 0.977502,
+        "outputs": "BIT_EXACT"
+      },
+      {
+        "threads": 47,
+        "tokens_per_part": 14,
+        "trial": 0,
+        "baseline_seconds": 0.00597887,
+        "candidate_seconds": 0.00581567,
+        "ratio": 1.028062,
+        "outputs": "BIT_EXACT"
+      },
+      {
+        "threads": 47,
+        "tokens_per_part": 14,
+        "trial": 1,
+        "baseline_seconds": 0.005986609,
+        "candidate_seconds": 0.00583024,
+        "ratio": 1.026821,
+        "outputs": "BIT_EXACT"
+      },
+      {
+        "threads": 47,
+        "tokens_per_part": 14,
+        "trial": 2,
+        "baseline_seconds": 0.00598817,
+        "candidate_seconds": 0.00582642,
+        "ratio": 1.027762,
+        "outputs": "BIT_EXACT"
+      },
+      {
+        "threads": 47,
+        "tokens_per_part": 14,
+        "trial": 3,
+        "baseline_seconds": 0.005990501,
+        "candidate_seconds": 0.00582836,
+        "ratio": 1.027819,
+        "outputs": "BIT_EXACT"
+      },
+      {
+        "threads": 47,
+        "tokens_per_part": 14,
+        "trial": 4,
+        "baseline_seconds": 0.00599058,
+        "candidate_seconds": 0.00582646,
+        "ratio": 1.028168,
+        "outputs": "BIT_EXACT"
+      },
+      {
+        "threads": 47,
+        "tokens_per_part": 114,
+        "trial": 0,
+        "baseline_seconds": 0.02895293,
+        "candidate_seconds": 0.02966634,
+        "ratio": 0.975952,
+        "outputs": "BIT_EXACT"
+      },
+      {
+        "threads": 47,
+        "tokens_per_part": 114,
+        "trial": 1,
+        "baseline_seconds": 0.028940099,
+        "candidate_seconds": 0.029696899,
+        "ratio": 0.974516,
+        "outputs": "BIT_EXACT"
+      },
+      {
+        "threads": 47,
+        "tokens_per_part": 114,
+        "trial": 2,
+        "baseline_seconds": 0.02896402,
+        "candidate_seconds": 0.02968758,
+        "ratio": 0.975628,
+        "outputs": "BIT_EXACT"
+      },
+      {
+        "threads": 47,
+        "tokens_per_part": 114,
+        "trial": 3,
+        "baseline_seconds": 0.028940571,
+        "candidate_seconds": 0.02966534,
+        "ratio": 0.975568,
+        "outputs": "BIT_EXACT"
+      },
+      {
+        "threads": 47,
+        "tokens_per_part": 114,
+        "trial": 4,
+        "baseline_seconds": 0.028977909,
+        "candidate_seconds": 0.029644211,
+        "ratio": 0.977523,
+        "outputs": "BIT_EXACT"
+      },
+      {
+        "threads": 48,
+        "tokens_per_part": 14,
+        "trial": 0,
+        "baseline_seconds": 0.005990851,
+        "candidate_seconds": 0.00582551,
+        "ratio": 1.028382,
+        "outputs": "BIT_EXACT"
+      },
+      {
+        "threads": 48,
+        "tokens_per_part": 14,
+        "trial": 1,
+        "baseline_seconds": 0.00598546,
+        "candidate_seconds": 0.00582781,
+        "ratio": 1.027051,
+        "outputs": "BIT_EXACT"
+      },
+      {
+        "threads": 48,
+        "tokens_per_part": 14,
+        "trial": 2,
+        "baseline_seconds": 0.00598455,
+        "candidate_seconds": 0.00581959,
+        "ratio": 1.028346,
+        "outputs": "BIT_EXACT"
+      },
+      {
+        "threads": 48,
+        "tokens_per_part": 14,
+        "trial": 3,
+        "baseline_seconds": 0.00598238,
+        "candidate_seconds": 0.0058269,
+        "ratio": 1.026683,
+        "outputs": "BIT_EXACT"
+      },
+      {
+        "threads": 48,
+        "tokens_per_part": 14,
+        "trial": 4,
+        "baseline_seconds": 0.00598812,
+        "candidate_seconds": 0.00581804,
+        "ratio": 1.029233,
+        "outputs": "BIT_EXACT"
+      },
+      {
+        "threads": 48,
+        "tokens_per_part": 114,
+        "trial": 0,
+        "baseline_seconds": 0.02896932,
+        "candidate_seconds": 0.02967793,
+        "ratio": 0.976123,
+        "outputs": "BIT_EXACT"
+      },
+      {
+        "threads": 48,
+        "tokens_per_part": 114,
+        "trial": 1,
+        "baseline_seconds": 0.02895754,
+        "candidate_seconds": 0.029742399,
+        "ratio": 0.973611,
+        "outputs": "BIT_EXACT"
+      },
+      {
+        "threads": 48,
+        "tokens_per_part": 114,
+        "trial": 2,
+        "baseline_seconds": 0.02897945,
+        "candidate_seconds": 0.02967237,
+        "ratio": 0.976648,
+        "outputs": "BIT_EXACT"
+      },
+      {
+        "threads": 48,
+        "tokens_per_part": 114,
+        "trial": 3,
+        "baseline_seconds": 0.02896321,
+        "candidate_seconds": 0.02969774,
+        "ratio": 0.975266,
+        "outputs": "BIT_EXACT"
+      },
+      {
+        "threads": 48,
+        "tokens_per_part": 114,
+        "trial": 4,
+        "baseline_seconds": 0.02895896,
+        "candidate_seconds": 0.02971928,
+        "ratio": 0.974417,
+        "outputs": "BIT_EXACT"
+      }
+    ]
+  },
+  "decision": "Reject; all114-position cohorts regress about2.4\u20132.5%, including production47/48 threads. About2.8% small-cohort gains do not justify changing4096-token recipe. No runtime path added.",
+  "limitations": [
+    "Synthetic template weights; not a full-model benchmark",
+    "Component fixture allocates per call; production workers reuse buffers",
+    "Initial driver grep required a space before BIT_EXACT, while the log has =BIT_EXACT; fast native tests already passed. Corrected driver reused fast evidence and completed conservative tests and timing."
+  ],
+  "artifacts": {
+    "split256.h": "1f9d965f49e2b770aa0082098c8f51ed597f1cd23bce0ff15f8c7b5c060e6d3f",
+    "test_split256.c": "2170a38872125c2ddcf1da3f50c8a25ad8174f0516e50697a4c5f271d4dd0624",
+    "bench_split256.c": "dca62e8765b606929644b7e1093b36a3f9a4ef569e49ba78d55492bbf52f7c4b",
+    "bench.78.0": "ed4f4129901bc3b038c2741f33bfd84de31eda0a254e6468c1b518b3c4819758"
+  },
+  "binary_sha256": {
+    "fast": "cc2af4eb9864991430a178bba5de13155cd86771c0f7f12333cfe957efd52336",
+    "conservative": "980586e101fd25ab6438a8bc91a469f3c8d1145819c3a67294d61b0aa17723e0",
+    "benchmark": "5f8c5381e7db4786045a99821a3763fc979a832152b53f8a505c3470e98f9608"
+  },
+  "log_root": "tmp/strata-moe-expansion-20261003",
+  "commands": [
+    "bash tmp/strata-moe-expansion-20261003/build.sh",
+    "bash tmp/strata-moe-expansion-20261003/driver-v2.sh"
+  ]
+}

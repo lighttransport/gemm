@@ -1,11 +1,11 @@
 # Strata-inspired GLM53F optimization: implementation and validation
 
-Updated 2026-10-02. Targets are **100 delivered decode tokens/s and 2000
+Updated 2026-10-03. Targets are **100 delivered decode tokens/s and 2000
 prefill tokens/s**, on twelve A64FX nodes, the complete 45-layer
 UD-Q4_K_XL model, top-8 routing, and the saved roughly 8K coding prompt.
 These targets have **not been demonstrated** by the changes below.
 
-## Native dense prefill tiles (October3; full-model qualification pending)
+## Native dense prefill tiles (October3; exact but no promotion)
 
 `--dense-prefill-tile 4|16|32|64` selects the native dense batching capacity
 before model construction. Default4 and FP8 behavior stay unchanged. The
@@ -20,10 +20,15 @@ real-weight bit-exact cases pass: layers0–2, tiles16/32/64 and14 aligned/tail
 counts through129. Five paired128-position component trials give tile64
 median speedups1.331170,1.302043,1.429393 across the three layers. These are
 component measurements, not whole-model tok/s. The full45-layer short128/
-8049 prompt-mean, final-stream, persistent-state and first-token gates,
-fresh frozen ID controls,3-trial screens and5 fresh paired confirmation are
-queued after new-allocation model staging. No promotion yet. Evidence:
-[strata-dense-prefill-tile-20261003.json](strata-dense-prefill-tile-20261003.json).
+8049 prompt-mean, final-stream, persistent-state and first-token gates pass
+**BIT_EXACT**, minimum headroom10.056885/8.118774GiB. All15 fresh screen/
+confirmation runs match all257 frozen output IDs. Five alternating fresh
+baseline/candidate pairs select tile64 but measure median paired ratios
+**0.995332 prefill /0.981420 decode**. Median rates are frozen410.902710 /
+34.809173 and candidate409.116828 /34.265047 tok/s (prefill/decode).
+**No promotion; keep default4 and qualified capacity4096.** The targets remain
+unmet. The final126-case unit also passes setter/capacity rejection guards.
+Evidence: [dense tile report](strata-dense-prefill-tile-20261003.json).
 
 Native reproduction after bounded staging:
 
@@ -40,6 +45,21 @@ The checker constructs the candidate allocation once, selects tile4 for the
 reference, restores the empty model snapshot and selects the wider tile for
 the candidate. Its endpoints and all prompt means must remain bit-exact.
 The new test programs are built by the shared `check` build.
+
+## Routed expansion cache probe (October3; rejected)
+
+A bounded prototype expands256 columns at a time into18KiB, while retaining
+both the original512-column correction boundary and ordered FP32 GEMM FMAs.
+Fast/conservative native Q4/Q5 gate-up and Q5/Q6 down route/guard/finite checks
+pass21 cases per math mode on every rank. Five alternating paired synthetic
+192-part timings at1/12/47/48 threads remain output-bit-exact. At the larger
+114-position cohort corresponding to4096-token prefill, every thread setting
+regresses about2.4–2.5%;47-thread median baseline/candidate ratio0.975628.
+The14-position cohorts improve about2.8%, which does not justify changing the
+selected4096 recipe. The production header and runtime are unchanged. The
+fixture includes per-call allocation/output copies, unlike resident runtime
+workers; these measurements do not establish full-model throughput.
+See [cache-probe evidence](strata-moe-expansion-native-20261003.json).
 
 ## October 2 qualification (complete)
 
