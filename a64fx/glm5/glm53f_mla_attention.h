@@ -55,6 +55,28 @@ static inline __attribute__((always_inline)) void mlb_logits(float *lg, const fl
     }
 }
 
+/* Team-shared decode logits. Each task computes three heads and four
+ * selected keys, sharing cache loads while preserving every dot's lane order.
+ * All team members must enter with the same arguments, using sixteen lanes. */
+static inline void mlb_logits_heads3_team(float *lg, const float *ql,
+        const float *cache, const uint16_t *half, const int *sel,
+        int nt, int heads) {
+    const int blocks = (nt + 3) / 4;
+#pragma omp for schedule(static)
+    for (int w = 0; w < ((heads + 2) / 3) * blocks; ++w) {
+        const int h = (w / blocks) * 3, t = (w % blocks) * 4;
+        const int count = nt - t < 4 ? nt - t : 4;
+        const int n = heads - h < 3 ? heads - h : 3;
+        float *out = lg + (size_t)h * GLM53F_MLA_ATTENTION_SLOTS + t;
+        const float *query = ql + (size_t)h * GLM53F_MLA_ATTENTION_LAT;
+        switch (n) {
+        case 1: mlb_logits(out, query, cache, half, sel + t, count, 1); break;
+        case 2: mlb_logits(out, query, cache, half, sel + t, count, 2); break;
+        case 3: mlb_logits(out, query, cache, half, sel + t, count, 3); break;
+        }
+    }
+}
+
 /* va[h][d] = sum_t p[h][t] * round16(cache[sel[t]][d]) in key order, 64 columns at a time. va rows: va + h*va_stride. */
 static inline __attribute__((always_inline)) void mlb_values(float *va, size_t va_stride, const float *lg,
         const float *cache, const uint16_t *half, const int *sel, int nt, const int NH) {

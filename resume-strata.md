@@ -7,11 +7,33 @@ Distribution/pipeline foundations pass native12-node correctness. Routed
 4×512 native slicing passes24 exact cases across six formats; real-model
 metadata-only sizing passes all12 ranks. Real PP short cross-layout correctness fails; qualification is incomplete.
 PJM52106727 and52116293 have expired; their `/local` images are gone.
-Current PJM52128881 is12 nodes compact2×3×2, normal2GHz/eco0, six hours
-from~17:18 JST October3; the new-run guard is23:00 JST. Bridge42446→32446→21264,
-hoste25-0002g, remote checkout unchanged. Local tmux socket
-`tmp/tmux-glm53f/pp1.sock`, launcher session`glm53f-mtp3`. Other allocations
-must not be touched.
+Current PJM52138572 is12 nodes compact2×3×2, normal2GHz/eco0, six hours
+from23:02:57 JST October3 until05:02:57 JST October4; the new-run guard is
+04:45 JST October4. Bridge42446→32446→21264, hoste25-6014c, remote checkout
+unchanged. Local tmux socket`tmp/tmux-glm53f/pp1.sock`, launcher session
+`glm53f-logits4`. PJM52128881 was released after its final component gate;
+its `/local` images are gone. Other allocations must not be touched.
+
+**October3 MLA logits continuation (native PASS, model pending):** opt-in
+`--mla-logits-kernel legacy|heads3` shares derived FP16 cache loads across
+three heads and four keys for native decode/scalar verification with at least
+128 selected keys. Original lane accumulation and reductions are retained;
+defaultlegacy and prefill batch paths are unchanged. Strong fixtures pass
+20736 case instances across12 ranks, fast/conservative math and1/47 threads.
+Fast47-thread component medians are2.597682×/2.812923× at5/6 heads; these
+are scoring timings, not model tok/s. Prefill score-only splitting was
+bit-exact but offers less than1% over existing split6 and is not integrated.
+See`a64fx/glm5/strata-mla-logits-native-20261003.json`.
+
+Immutable final model candidate`candidate-mla-logits-v3` is built; native
+fixtures usedv2 (identical primitive, before small-context fallback). Remote
+stage driver472 is active and model driver674 waits for its PASS sentinel
+before any MPI launch. Do not overlap MPI or restage. Scratch
+`tmp/strata-mla-logits-20261003/` contains scripts, hashes and results. The
+queued campaign includes short/full raw state checks, fresh frozen control,
+five alternating plain pairs, long1024 plain and MTP comparisons, and conditional
+MTP confirmation. No whole-model gain or promotion is claimed yet.
+
 
 **October3 late-evening continuation (complete, no promotion):** new opt-in
 `--mla-prefill-heads legacy|split6|values32`, defaultlegacy, changes only
@@ -49,9 +71,8 @@ binary/source hashes, complete trials, all pairs, native timings and profiles.
 Drivers9502/10006/10350 are terminal/PASS, including values32's component
 rejection gate; no MPI experiment remains active. Scratch
 `tmp/strata-mla-head-tiles-20261003/` includes scripts/results/13 rank0 logs,
-bounded cross-option state audit and assembly. PJM52128881 and staged images
-remain reusable until~23:18 JST;23:00 new-run guard still applies. Do not
-restage or overlap MPI. No push authorized; unrelated remote-dev procedure
+bounded cross-option state audit and assembly. PJM52128881 has since been released; see the current allocation and active
+drivers above. Do not restage or overlap MPI. No push authorized; unrelated remote-dev procedure
 edit remains untouched. Next: reduce MLA logits/verification work and pursue
 PP's actual-prompt arithmetic isolation; small component gains cannot justify
 assuming the100/2000 targets have been reached.

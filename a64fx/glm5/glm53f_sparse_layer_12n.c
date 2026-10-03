@@ -17,6 +17,7 @@
 #include "glm53f_mla_prefill.h"
 #include "glm53f_mla_absorb.h"
 #include "glm53f_mla_cache_f16.h"
+#include "glm53f_mla_attention.h"
 #include "glm53f_mla_softmax.h"
 #include "glm53f_moe_grouped_native.h"
 #include "glm53f_q80_panel64.h"
@@ -560,7 +561,7 @@ static void ensure_mla_shards(glm53f_sparse_context_12n*c){if(c->mla_ql)return;s
  * phases are work-shared by one team; every output element keeps the serial
  * accumulation order (j for ql, t for va), so results match the former
  * single-threaded loop. */
-struct mla_value_call { glm53f_sparse_context_12n *c; float *out; const float *q, *z; const int *selected; int nt, bad, registers; const uint16_t *half; int parallel_softmax; };
+struct mla_value_call { glm53f_sparse_context_12n *c; float *out; const float *q, *z; const int *selected; int nt, bad, registers; const uint16_t *half; int parallel_softmax, logits_heads3; };
 static void mla_value_worker(void *context) {
     struct mla_value_call *a = context;
     glm53f_sparse_context_12n *c = a->c;
@@ -589,6 +590,9 @@ static void mla_value_worker(void *context) {
                     svuint32_t b=svlsl_n_u32_x(p,svld1uh_u32(p,wk+(size_t)j*LAT+d),16);
                     svst1(p,o+d,svmla_n_f32_x(p,svld1(p,o+d),svreinterpret_f32_u32(b),x));}}
         }
+    if (a->logits_heads3 && a->half && selected && hn <= 6 && nt >= 128) {
+        mlb_logits_heads3_team(lg, ql, z, a->half, selected, nt, hn);
+    } else {
 #pragma omp for schedule(static)
         for(int w=0;w<hn*nt;w++){
             const int h=w/nt,t=w%nt,r=selected?selected[t]:t;
@@ -601,6 +605,7 @@ static void mla_value_worker(void *context) {
                 lg[(size_t)h*SLOTS+t] = svaddv_f32(p, dot);
             } else lg[(size_t)h*SLOTS+t]=f32dot(ql+(size_t)h*LAT,z+(size_t)r*LAT,LAT);
         }
+    }
     if (a->parallel_softmax && nt >= 128) {
         glm53f_mla_softmax_parallel(lg, hsum, c->q8v_maximum, hn, nt, SLOTS);
     } else {
@@ -679,10 +684,12 @@ static int mla_heads_q8_value(glm53f_sparse_context_12n*c,float*out,
     int bad=0;
     const char *registers = getenv("GLM53F_MLA_REGISTERS");
     const char *softmax = getenv("GLM53F_MLA_PARALLEL_SOFTMAX");
+    const char *logits = getenv("GLM53F_MLA_LOGITS_HEADS3");
     struct mla_value_call call = {c, out, q, z, selected, nt, 0,
         registers && svcntw() == 16 ? atoi(registers) : 0,
         selected == c->selected ? c->latent_f16 : NULL,
-        softmax && atoi(softmax) && omp_get_max_threads() > 1};
+        softmax && atoi(softmax) && omp_get_max_threads() > 1,
+        logits && atoi(logits) && svcntw() == 16};
     if (glm53f_team_available()) glm53f_team_dispatch(mla_value_worker, &call);
     else {
 #pragma omp parallel
@@ -1585,8 +1592,6 @@ static inline __attribute__((always_inline)) void mlb_absorb(float *ql, const fl
     MLB_A_ST(0) MLB_A_ST(1) MLB_A_ST(2) MLB_A_ST(3) MLB_A_ST(4) MLB_A_ST(5)
 #undef MLB_A_ST
 }
-
-#include "glm53f_mla_attention.h"
 
 /* Returns 0 on success, -2 when unsupported (caller falls back), -1 on error. */
 static int mla_native_batch(glm53f_sparse_context_12n *c, glm53f_sparse_prefill_workspace_12n *w, int tokens) {

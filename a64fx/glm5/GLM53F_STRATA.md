@@ -5,6 +5,33 @@ prefill tokens/s**, on twelve A64FX nodes, the complete 45-layer
 UD-Q4_K_XL model, top-8 routing, and the saved roughly 8K coding prompt.
 These targets have **not been demonstrated** by the changes below.
 
+## Shared-cache MLA decode scores (October3; native exact, model pending)
+
+`--mla-logits-kernel legacy|heads3`, default`legacy`, distributes native
+scores as three heads by four selected keys. It reuses latent cache loads,
+keeping each dot's original16-lane FMA and horizontal reduction order. The
+runtime requires the derived FP16 cache, selected keys, at most six heads,
+SVE16 lanes and at least128 keys; other calls retain the original worker.
+Wide batched prefill is unchanged. The new helper keeps the work-sharing
+barrier and uses no new scratch or collectives.
+
+The native12-rank fixture passes20736 case instances across fast/conservative
+math and1/47-thread teams. It tests1..6 heads, twelve key counts through2052,
+three selection orders, two cache views, varied signs/mantissas/exponents,
+finite results and strided canaries. Five alternating component pairs at47
+threads yield2.597682×/2.812923× for five/six heads. The six-head saving is
+about25 microseconds per sparse layer; these are component measurements,
+not whole-model tok/s. Score-only prefill splitting passes2376 cases per rank
+but improves less than1% over existing split6, so it is not integrated.
+
+Immutable`candidate-mla-logits-v3` includes the small-context fallback.
+The native fixtures usedv2 with the identical score primitive. Warning-clean
+FCC builds and the host CLI parser pass. Model staging and a serial campaign
+of short/full state gates, fresh frozen controls, five plain pairs and
+1024-token plain/MTP comparisons are pending onPJM52138572. No promotion or
+whole-model performance gain is claimed. Exact native timings, commands and
+source/binary hashes are in [native evidence](strata-mla-logits-native-20261003.json).
+
 ## MLA prefill head and column tiles (October3; small gain, no promotion)
 
 `--mla-prefill-heads legacy|split6|values32`, default`legacy`, adds two opt-in

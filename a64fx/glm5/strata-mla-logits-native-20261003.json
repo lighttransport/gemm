@@ -1,0 +1,672 @@
+{
+  "date": "2026-10-03",
+  "allocation": 52138572,
+  "hardware": "12 A64FX nodes compact2x3x2 normal2GHz/eco0",
+  "primitive": "three heads x four keys sharing latent cache loads, original SVE FMA and horizontal reduction order",
+  "runtime_guard": "opt-in --mla-logits-kernel heads3; native FP16 cache, selected keys, heads<=6, SVE16 lanes, selected_count>=128; legacy elsewhere",
+  "default": "legacy",
+  "native_total_case_instances": 20736,
+  "input_exponents": [
+    106,
+    137
+  ],
+  "input_sign_and_mantissa": "all bits randomized, per-rank seed",
+  "heads": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6
+  ],
+  "selected_counts": [
+    1,
+    3,
+    4,
+    7,
+    15,
+    16,
+    17,
+    127,
+    128,
+    2048,
+    2051,
+    2052
+  ],
+  "selected_orders": [
+    "ascending",
+    "descending",
+    "permuted"
+  ],
+  "cache_views": [
+    "FP32 rounded on load",
+    "stored FP16"
+  ],
+  "measurement": "12-rank maximum; 100 scores inside a single team per timing; varying2052..2006 counts; five alternating pairs",
+  "native": {
+    "logits-conservative-1.log": {
+      "cases_per_rank": 432,
+      "ranks": 12,
+      "case_instances": 5184,
+      "bit_exact_finite_guards": true,
+      "trials": [
+        {
+          "heads": 5,
+          "trial": 0,
+          "candidate": 0,
+          "seconds": 0.144799341
+        },
+        {
+          "heads": 5,
+          "trial": 0,
+          "candidate": 1,
+          "seconds": 0.04741003
+        },
+        {
+          "heads": 5,
+          "trial": 1,
+          "candidate": 1,
+          "seconds": 0.04735605
+        },
+        {
+          "heads": 5,
+          "trial": 1,
+          "candidate": 0,
+          "seconds": 0.144793199
+        },
+        {
+          "heads": 5,
+          "trial": 2,
+          "candidate": 0,
+          "seconds": 0.14478966
+        },
+        {
+          "heads": 5,
+          "trial": 2,
+          "candidate": 1,
+          "seconds": 0.047386169
+        },
+        {
+          "heads": 5,
+          "trial": 3,
+          "candidate": 1,
+          "seconds": 0.04737726
+        },
+        {
+          "heads": 5,
+          "trial": 3,
+          "candidate": 0,
+          "seconds": 0.14478939
+        },
+        {
+          "heads": 5,
+          "trial": 4,
+          "candidate": 0,
+          "seconds": 0.14478918
+        },
+        {
+          "heads": 5,
+          "trial": 4,
+          "candidate": 1,
+          "seconds": 0.04739379
+        },
+        {
+          "heads": 6,
+          "trial": 0,
+          "candidate": 0,
+          "seconds": 0.17391136
+        },
+        {
+          "heads": 6,
+          "trial": 0,
+          "candidate": 1,
+          "seconds": 0.05097157
+        },
+        {
+          "heads": 6,
+          "trial": 1,
+          "candidate": 1,
+          "seconds": 0.051014421
+        },
+        {
+          "heads": 6,
+          "trial": 1,
+          "candidate": 0,
+          "seconds": 0.173910529
+        },
+        {
+          "heads": 6,
+          "trial": 2,
+          "candidate": 0,
+          "seconds": 0.17388146
+        },
+        {
+          "heads": 6,
+          "trial": 2,
+          "candidate": 1,
+          "seconds": 0.05101074
+        },
+        {
+          "heads": 6,
+          "trial": 3,
+          "candidate": 1,
+          "seconds": 0.05099012
+        },
+        {
+          "heads": 6,
+          "trial": 3,
+          "candidate": 0,
+          "seconds": 0.173923899
+        },
+        {
+          "heads": 6,
+          "trial": 4,
+          "candidate": 0,
+          "seconds": 0.173909389
+        },
+        {
+          "heads": 6,
+          "trial": 4,
+          "candidate": 1,
+          "seconds": 0.05099484
+        }
+      ],
+      "paired_ratios": {
+        "5": [
+          3.0541921403551107,
+          3.0575438407553,
+          3.055525759003645,
+          3.0560946327415306,
+          3.055024297487076
+        ],
+        "6": [
+          3.411928649637435,
+          3.4090464145422725,
+          3.4087225552893368,
+          3.4109333141400726,
+          3.410333065070897
+        ]
+      },
+      "median_ratios": {
+        "5": 3.055525759003645,
+        "6": 3.410333065070897
+      },
+      "log_sha256": "4069f0e3882662ec496ddf1a374afe2867768b4678eab8cb8902034febe7de34"
+    },
+    "logits-conservative-47.log": {
+      "cases_per_rank": 432,
+      "ranks": 12,
+      "case_instances": 5184,
+      "bit_exact_finite_guards": true,
+      "trials": [
+        {
+          "heads": 5,
+          "trial": 0,
+          "candidate": 0,
+          "seconds": 0.00353368
+        },
+        {
+          "heads": 5,
+          "trial": 0,
+          "candidate": 1,
+          "seconds": 0.00143243
+        },
+        {
+          "heads": 5,
+          "trial": 1,
+          "candidate": 1,
+          "seconds": 0.00143407
+        },
+        {
+          "heads": 5,
+          "trial": 1,
+          "candidate": 0,
+          "seconds": 0.00352673
+        },
+        {
+          "heads": 5,
+          "trial": 2,
+          "candidate": 0,
+          "seconds": 0.003528929
+        },
+        {
+          "heads": 5,
+          "trial": 2,
+          "candidate": 1,
+          "seconds": 0.00143079
+        },
+        {
+          "heads": 5,
+          "trial": 3,
+          "candidate": 1,
+          "seconds": 0.00142947
+        },
+        {
+          "heads": 5,
+          "trial": 3,
+          "candidate": 0,
+          "seconds": 0.00352828
+        },
+        {
+          "heads": 5,
+          "trial": 4,
+          "candidate": 0,
+          "seconds": 0.003526861
+        },
+        {
+          "heads": 5,
+          "trial": 4,
+          "candidate": 1,
+          "seconds": 0.0014339
+        },
+        {
+          "heads": 6,
+          "trial": 0,
+          "candidate": 0,
+          "seconds": 0.00433046
+        },
+        {
+          "heads": 6,
+          "trial": 0,
+          "candidate": 1,
+          "seconds": 0.00144215
+        },
+        {
+          "heads": 6,
+          "trial": 1,
+          "candidate": 1,
+          "seconds": 0.00144531
+        },
+        {
+          "heads": 6,
+          "trial": 1,
+          "candidate": 0,
+          "seconds": 0.00432903
+        },
+        {
+          "heads": 6,
+          "trial": 2,
+          "candidate": 0,
+          "seconds": 0.00432674
+        },
+        {
+          "heads": 6,
+          "trial": 2,
+          "candidate": 1,
+          "seconds": 0.00144674
+        },
+        {
+          "heads": 6,
+          "trial": 3,
+          "candidate": 1,
+          "seconds": 0.00144602
+        },
+        {
+          "heads": 6,
+          "trial": 3,
+          "candidate": 0,
+          "seconds": 0.00432749
+        },
+        {
+          "heads": 6,
+          "trial": 4,
+          "candidate": 0,
+          "seconds": 0.00432437
+        },
+        {
+          "heads": 6,
+          "trial": 4,
+          "candidate": 1,
+          "seconds": 0.00144276
+        }
+      ],
+      "paired_ratios": {
+        "5": [
+          2.4669128683426065,
+          2.4592453645916867,
+          2.466419949817933,
+          2.4682434748543165,
+          2.459628286491387
+        ],
+        "6": [
+          3.0027805706757276,
+          2.9952259376881085,
+          2.9906824999654398,
+          2.992690280908978,
+          2.997289916548837
+        ]
+      },
+      "median_ratios": {
+        "5": 2.466419949817933,
+        "6": 2.9952259376881085
+      },
+      "log_sha256": "5b4d169b8ddabb3b9aea50999872852db9d8e40ba7ad3abc3962fd27e1a5a6e8"
+    },
+    "logits-fast-1.log": {
+      "cases_per_rank": 432,
+      "ranks": 12,
+      "case_instances": 5184,
+      "bit_exact_finite_guards": true,
+      "trials": [
+        {
+          "heads": 5,
+          "trial": 0,
+          "candidate": 0,
+          "seconds": 0.13771244
+        },
+        {
+          "heads": 5,
+          "trial": 0,
+          "candidate": 1,
+          "seconds": 0.04641487
+        },
+        {
+          "heads": 5,
+          "trial": 1,
+          "candidate": 1,
+          "seconds": 0.046433739
+        },
+        {
+          "heads": 5,
+          "trial": 1,
+          "candidate": 0,
+          "seconds": 0.13770676
+        },
+        {
+          "heads": 5,
+          "trial": 2,
+          "candidate": 0,
+          "seconds": 0.13770728
+        },
+        {
+          "heads": 5,
+          "trial": 2,
+          "candidate": 1,
+          "seconds": 0.046426499
+        },
+        {
+          "heads": 5,
+          "trial": 3,
+          "candidate": 1,
+          "seconds": 0.04642022
+        },
+        {
+          "heads": 5,
+          "trial": 3,
+          "candidate": 0,
+          "seconds": 0.13770863
+        },
+        {
+          "heads": 5,
+          "trial": 4,
+          "candidate": 0,
+          "seconds": 0.13777925
+        },
+        {
+          "heads": 5,
+          "trial": 4,
+          "candidate": 1,
+          "seconds": 0.04645318
+        },
+        {
+          "heads": 6,
+          "trial": 0,
+          "candidate": 0,
+          "seconds": 0.16540928
+        },
+        {
+          "heads": 6,
+          "trial": 0,
+          "candidate": 1,
+          "seconds": 0.05069164
+        },
+        {
+          "heads": 6,
+          "trial": 1,
+          "candidate": 1,
+          "seconds": 0.050693
+        },
+        {
+          "heads": 6,
+          "trial": 1,
+          "candidate": 0,
+          "seconds": 0.16534769
+        },
+        {
+          "heads": 6,
+          "trial": 2,
+          "candidate": 0,
+          "seconds": 0.16534054
+        },
+        {
+          "heads": 6,
+          "trial": 2,
+          "candidate": 1,
+          "seconds": 0.05069986
+        },
+        {
+          "heads": 6,
+          "trial": 3,
+          "candidate": 1,
+          "seconds": 0.05070066
+        },
+        {
+          "heads": 6,
+          "trial": 3,
+          "candidate": 0,
+          "seconds": 0.16534788
+        },
+        {
+          "heads": 6,
+          "trial": 4,
+          "candidate": 0,
+          "seconds": 0.16534719
+        },
+        {
+          "heads": 6,
+          "trial": 4,
+          "candidate": 1,
+          "seconds": 0.05069268
+        }
+      ],
+      "paired_ratios": {
+        "5": [
+          2.966989673783423,
+          2.9656616711395998,
+          2.966135353001741,
+          2.9665656474700035,
+          2.965981015723789
+        ],
+        "6": [
+          3.2630485026722353,
+          3.261746000433985,
+          3.261163640294076,
+          3.2612569540514857,
+          3.26175672700674
+        ]
+      },
+      "median_ratios": {
+        "5": 2.966135353001741,
+        "6": 3.261746000433985
+      },
+      "log_sha256": "5fe1ab78105bf0e22e2f8cf271050745629f1db65a85a71c585fd0d80ea352e9"
+    },
+    "logits-fast-47.log": {
+      "cases_per_rank": 432,
+      "ranks": 12,
+      "case_instances": 5184,
+      "bit_exact_finite_guards": true,
+      "trials": [
+        {
+          "heads": 5,
+          "trial": 0,
+          "candidate": 0,
+          "seconds": 0.003543289
+        },
+        {
+          "heads": 5,
+          "trial": 0,
+          "candidate": 1,
+          "seconds": 0.001364429
+        },
+        {
+          "heads": 5,
+          "trial": 1,
+          "candidate": 1,
+          "seconds": 0.00136358
+        },
+        {
+          "heads": 5,
+          "trial": 1,
+          "candidate": 0,
+          "seconds": 0.00353772
+        },
+        {
+          "heads": 5,
+          "trial": 2,
+          "candidate": 0,
+          "seconds": 0.0035369
+        },
+        {
+          "heads": 5,
+          "trial": 2,
+          "candidate": 1,
+          "seconds": 0.00136156
+        },
+        {
+          "heads": 5,
+          "trial": 3,
+          "candidate": 1,
+          "seconds": 0.00135874
+        },
+        {
+          "heads": 5,
+          "trial": 3,
+          "candidate": 0,
+          "seconds": 0.00353718
+        },
+        {
+          "heads": 5,
+          "trial": 4,
+          "candidate": 0,
+          "seconds": 0.00353616
+        },
+        {
+          "heads": 5,
+          "trial": 4,
+          "candidate": 1,
+          "seconds": 0.00135847
+        },
+        {
+          "heads": 6,
+          "trial": 0,
+          "candidate": 0,
+          "seconds": 0.003894621
+        },
+        {
+          "heads": 6,
+          "trial": 0,
+          "candidate": 1,
+          "seconds": 0.00137326
+        },
+        {
+          "heads": 6,
+          "trial": 1,
+          "candidate": 1,
+          "seconds": 0.00138242
+        },
+        {
+          "heads": 6,
+          "trial": 1,
+          "candidate": 0,
+          "seconds": 0.003888641
+        },
+        {
+          "heads": 6,
+          "trial": 2,
+          "candidate": 0,
+          "seconds": 0.00388459
+        },
+        {
+          "heads": 6,
+          "trial": 2,
+          "candidate": 1,
+          "seconds": 0.001370739
+        },
+        {
+          "heads": 6,
+          "trial": 3,
+          "candidate": 1,
+          "seconds": 0.0014304
+        },
+        {
+          "heads": 6,
+          "trial": 3,
+          "candidate": 0,
+          "seconds": 0.003886821
+        },
+        {
+          "heads": 6,
+          "trial": 4,
+          "candidate": 0,
+          "seconds": 0.003893919
+        },
+        {
+          "heads": 6,
+          "trial": 4,
+          "candidate": 1,
+          "seconds": 0.00139276
+        }
+      ],
+      "paired_ratios": {
+        "5": [
+          2.5969024405080807,
+          2.594435236656448,
+          2.5976820705661154,
+          2.6032795089568275,
+          2.6030460738919516
+        ],
+        "6": [
+          2.836040516726621,
+          2.812922990118777,
+          2.833938481359325,
+          2.7172965604026844,
+          2.7958291450070365
+        ]
+      },
+      "median_ratios": {
+        "5": 2.5976820705661154,
+        "6": 2.812922990118777
+      },
+      "log_sha256": "dc3a2a0046093a03679e4eab08874a98df177cb09f6941b97c8e8361be2744d3"
+    }
+  },
+  "source_sha256": {
+    "a64fx/glm5/glm53f_mla_attention.h": "4ac9cec7dc2317f4fcc4f9e301883da94c9058fe15f6de8391b1e35eb6fd43f9",
+    "a64fx/glm5/glm53f_sparse_layer_12n.c": "99e8ed4fea846c75246b5042e61a1e68cec3bdabaaf6321ddd71563336e80816",
+    "a64fx/glm5/glm53f_runtime.h": "859787685545eb869332d6f16b4efd01da7b5cba3709360c4b7fea89371182ec",
+    "a64fx/glm5/test_glm53f_mla_logits_team.c": "29dd6c45688e58f1c21e4988e9e442c5e45891834ab9fbc62a9c1637151d26a1"
+  },
+  "remote_provenance_sha256": {
+    "a64fx/glm5/glm53f_mla_attention.h": "4ac9cec7dc2317f4fcc4f9e301883da94c9058fe15f6de8391b1e35eb6fd43f9",
+    "a64fx/glm5/glm53f_sparse_layer_12n.c": "99e8ed4fea846c75246b5042e61a1e68cec3bdabaaf6321ddd71563336e80816",
+    "a64fx/glm5/glm53f_runtime.h": "859787685545eb869332d6f16b4efd01da7b5cba3709360c4b7fea89371182ec",
+    "a64fx/glm5/test_glm53f_mla_logits_team.c": "29dd6c45688e58f1c21e4988e9e442c5e45891834ab9fbc62a9c1637151d26a1",
+    "a64fx/glm5/build/candidate-mla-logits-v3/bench_glm53f_run_12n": "44ad21513e5a9a03119f6cbc33301806c68663b04599eff95b879bed9b384192",
+    "a64fx/glm5/build/candidate-mla-logits-v2/test_glm53f_mla_logits_team": "89ad97478c3021f11e9bd164ec56d252d2bb46c6bb1b5bab952d3475abeef5e5",
+    "a64fx/glm5/build/candidate-mla-logits-v2/test_glm53f_mla_logits_team-conservative": "9d4087718fdf35219eea41fc3de7484f073b05d02faae03606afeb7332df21ca"
+  },
+  "build_script": "#!/bin/bash\nset -euo pipefail\nroot=$HOME/work/gemm/glm53f-strata-20261001\ncd \"$root/a64fx/glm5\"\nwork=$root/tmp/strata-mla-logits-20261003\nold=$root/tmp/strata-pipeline-20261002/build\nbase=$root/tmp/strata-mhc-sync-20261002/build-integrated-login-v4\nbin=$PWD/build/candidate-mla-logits-v3\nmkdir -p \"$bin\"\nexport TMPDIR=$work OPAL_PREFIX=/opt/FJSVxtclanga/tcsds-1.2.43\nunset OMPI_CC OMPI_CXX\ncc=/opt/FJSVxtclanga/tcsds-1.2.43/bin/mpifccpx\nflags=(-Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast -fopenmp -Wall -Wextra -Werror -ffast-math -fno-math-errno -DGLM53F_PREFILL_ATTN_PANEL=47 -DGLM53F_PREFILL_CAPACITY=4096 -I. -I../../common)\n\"$cc\" \"${flags[@]}\" test_glm53f_mla_logits_team.c -lm -o \"$bin/test_glm53f_mla_logits_team\"\n\"$cc\" -Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast -fopenmp -Wall -Wextra -Werror -I. -I../../common test_glm53f_mla_logits_team.c -lm -o \"$bin/test_glm53f_mla_logits_team-conservative\"\n\"$cc\" \"${flags[@]}\" -DGLM53F_EXTERNAL_ST_IMPLEMENTATION -DGLM53F_SPARSE_NO_MAIN -c glm53f_sparse_layer_12n.c -o \"$work/sparse_logits_v3.o\"\nobjects=(\"$base\"/{q8_panel,gemm_kern,gemm_asm,team,collective}.o \"$root/tmp/strata-iq-scales-20261002/build-integrated-v5/iq_bridge.o\" \"$old/kda_pp_beta_rowwise.o\" \"$root/tmp/strata-pipeline-20261003/dense_tiles_full.o\" \"$old/moe_pp_fast.o\" \"$work/sparse_logits_v3.o\" \"$root/tmp/strata-mtp-batch-20261003/head_verify.o\" \"$root/tmp/strata-mtp-batch-20261003/embedding_prime.o\" \"$old\"/{dist,pipeline}_pp.o)\nlink=(-L\"$root/tmp/strata-mhc-sync-20261002/target-libs\" -lm -lpthread -ltofucom)\n\"$cc\" \"${flags[@]}\" bench_glm53f_run_12n.c \"$base\"/{lookup_spec,mtp_spec}.o \"$root/tmp/strata-mtp-batch-20261003/mtp_prime.o\" \"${objects[@]}\" \"$root/tmp/strata-pipeline-20261003/target_dense_tiles.o\" \"${link[@]}\" -o \"$bin/bench_glm53f_run_12n\"\ncp \"$root/a64fx/glm5/build/candidate-dense-tile-v2/tofu_topo_helper\" \"$bin/tofu_topo_helper\"\nsha256sum \"$bin\"/{test_glm53f_mla_logits_team,bench_glm53f_run_12n} > \"$work/binaries-v3.sha256\"\necho MLA_TILES_BUILD_PASS\n",
+  "native_driver": "#!/bin/bash\nset -euo pipefail\ncd \"$HOME/work/gemm/glm53f-strata-20261001\"\nlogs=$PWD/tmp/strata-mla-logits-20261003\n[ \"${PJM_JOBID:-}\" = 52138572 ] && [ \"$PJM_NODE\" = 12 ]\nguard=$(date -d '2026-10-04 04:45:00 JST' +%s)\nexport GLM53F_BUILD=0 GLM53F_GGUF=$HOME/models/glm53f-gguf-wide/UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf\nexport GLM53F_BIN_DIR=$PWD/a64fx/glm5/build/candidate-mla-logits-v2 GLM53F_RUN_TAG=mtp-batch3-gates\nexport XOS_MMM_L_PAGING_POLICY=demand:demand:demand XOS_MMM_L_HPAGE_TYPE=none\nexport OMP_NUM_THREADS=47 OMP_PROC_BIND=close OMP_PLACES=cores OMP_WAIT_POLICY=active FLIB_BARRIER=HARD\nexport GLM53F_PREWARM=1 GLM53F_PROFILE=1 GLM53F_FAST_MATH=1 GLM53F_NO_MATH_ERRNO=1\nexport GLM53F_COMM_OWNER=0 GLM53F_SPARSE_ASYNC=0 GLM53F_NATIVE_Q8_PANEL=0 GLM53F_SPARSE_MLA_BATCH=1\nexport GLM53F_NATIVE_Q8_ROWS8=0 GLM53F_NATIVE_Q8_TILE2X8=0 GLM53F_MLA_FUSED_PROJECTION=0 GLM53F_MHC_FUSED_SYNC=0 GLM53F_MOE_GU_PAD=0\nexport GLM53F_EMBED_BATCH_PACKED=0 GLM53F_HEAD_VERIFY_SHARED=0 GLM53F_DENSE_PREFILL_TILE=4\nfail(){ echo \"error: $*\" >&2; exit 2; }\nsource a64fx/glm5/scripts/glm53f_env.sh\nsource a64fx/glm5/scripts/glm53f_launch.sh\nmkdir -p \"$logdir\" \"$GLM53F_BUILD_DIR\" \"$logs/results\"\n# This synthetic MPI fixture has no model staging or tofu dependency.\nfor math in fast conservative; do\n binary=\"$GLM53F_BIN_DIR/test_glm53f_mla_logits_team\"\n [ \"$math\" = fast ] || binary=\"$binary-conservative\"\n for threads in 1 47; do\n  OMP_NUM_THREADS=$threads mpi_run \"mla-logits-$math-$threads\" /usr/bin/numactl --interleave=4,5,6,7 \"$binary\"\n  grep '^MLA_LOGITS_TEAM .*BIT_EXACT PASS$' \"$last_log\".*.0\n  cp \"$last_log\".*.0 \"$logs/results/logits-$math-$threads.log\"\n done\ndone\necho MLA_LOGITS_NATIVE_PASS\n",
+  "model_measurements": "pending; no promotion or target achievement claimed",
+  "status": "native_exact_model_pending",
+  "prefill_isolation": {
+    "cases_per_rank": 2376,
+    "status": "BIT_EXACT PASS",
+    "six_head_component_ratio_to_legacy": 1.1776481585108294,
+    "increment_over_split6": "less than1%; no production change",
+    "five_head_ratio_to_legacy": 0.9815454252084856,
+    "hybrid_values32_six_head_ratio": 1.1303603868448624,
+    "not_selected": true
+  }
+}
