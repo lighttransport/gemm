@@ -5,6 +5,67 @@ prefill tokens/s**, on twelve A64FX nodes, the complete 45-layer
 UD-Q4_K_XL model, top-8 routing, and the saved roughly 8K coding prompt.
 These targets have **not been demonstrated** by the changes below.
 
+## MLA prefill head and column tiles (October3; small gain, no promotion)
+
+`--mla-prefill-heads legacy|split6|values32`, default`legacy`, adds two opt-in
+native prefill experiments. Only the four six-head TP12 slices change;
+five-head and PP slices keep their existing kernels. `split6` runs independent
+three-head groups and retains all six logit rows. `values32` keeps six-head
+cache reuse and reduces the value tile from64 to32 columns. Query/key lane
+reductions, ascending selected-key FMAs, FP16 cache rounding and masked
+softmax tails retain their original order. Allocation size and collectives
+are unchanged. Scalar decode and speculative verification are unaffected.
+
+Strata's absorbed-query/cache/value tiling in
+`src/program/glm_decode.cpp:2965..3040` on local branch`glm53f` at`3bbb469`
+motivated examining tile shape. FCC assembly has vector spills in MLA logits
+and values; the diagnostic records static source-attributed counts, with the
+explicit limitation that these are neither dynamic traffic nor speedups.
+
+FCC fast math builds pass`-Wall -Wextra -Werror`, attentionpanel47 and
+capacity4096. Strong native fixtures pass1584(split6)/1848(values32) cases per
+rank, on all12 ranks. They compare complete logits/values and canaries at
+512/768-float strides, varied signs/mantissas and rank seeds, both cache views,
+ascending/reversed/permuted selected keys, and11 counts through2052. Finite
+checks inspect IEEE exponent bits under fast math. Five alternating native
+tile sweeps give six-head component medians**1.142844× split6** and
+**1.017734× values32**. Values32 fails the5% component gate; model timing was
+skipped. It remains an experimental option with native-only evidence.
+
+Five fresh alternating same-binary whole-model pairs give median paired
+ratios**1.017089 prefill /1.000828 decode**. Absolute rate medians are
+406.956430→413.551356 prefill and34.181202→34.209521 decode tok/s. These
+percentages come from paired ratios, not ratios of absolute medians. Every
+prefill pair improves1.54–1.75%; decode fluctuates and is effectively
+unchanged. The first timed sparse-prefill profile falls0.806→0.766ms/token,
+while routedFFN stays0.840ms/token. Warmup and timed profiles are separately
+retained in their original order.
+
+Fresh frozen control:412.574268 prefill/34.808562 decode. All13 completed
+8049-prompt model runs pass complete129/257 IDs against that frozen reference;
+minimum available8.871399GiB. Full-prompt/128-transition endpoint states match
+byte for byte across legacy/split6 on all12 ranks, in addition to internal
+warmup/trial checks. The report retains each rank's file length and SHA256.
+No short-prompt,1024-token or32K candidate qualification is claimed. Prefill
+gain remains below5%; keep the qualified35.462134 decode/412.273634 prefill
+recipe. Neither100/2000 target is met.
+
+Runtime binaries are immutable`candidate-mla-head-tiles-v2` (split6) and
+`candidate-mla-head-tiles-v4` (adds values32); strong split-only fixturev3 is
+separate. Fixturev5 changes indentation only and passes the final1848 cases
+per rank; its source/binary SHA is recorded separately. V4 build source hashes
+were verified before that formatting; v2 source hashes are
+explicitly labelled reconstructed from the recorded v4 delta. The new
+`test_glm53f_mla_head_tiles` is included in integrated`checkbuild`. Local
+`cc -D_GNU_SOURCE -std=c11 -O2 -Wall -Wextra -Werror
+ a64fx/glm5/test_glm53f_prefill_config.c` passes its five new parser cases;
+all18 launcher tests pass. Native runs use `mpi_run mla-head-tiles
+ /usr/bin/numactl --interleave=4,5,6,7 TEST_BINARY` after canonical runtime
+preparation, with47 threads and the existing FCC binding policy. Exact build,
+driver and model commands, all paired trials, hashes, native timings and
+profiles are in [the evidence report](strata-mla-head-tiles-20261003.json).
+Scratch/scripts are under`tmp/strata-mla-head-tiles-20261003/`.
+
 ## Batched MTP priming and verification weights (October3; qualified MTP gain)
 
 Three independent opt-in candidates are implemented. The benchmark's

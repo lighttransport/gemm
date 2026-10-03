@@ -13,6 +13,49 @@ hoste25-0002g, remote checkout unchanged. Local tmux socket
 `tmp/tmux-glm53f/pp1.sock`, launcher session`glm53f-mtp3`. Other allocations
 must not be touched.
 
+**October3 late-evening continuation (complete, no promotion):** new opt-in
+`--mla-prefill-heads legacy|split6|values32`, defaultlegacy, changes only
+six-head native MLA prefill. `split6` computes independent3+3 head groups;
+`values32` retains six heads and uses32-column value tiles. Each keeps the
+original SVE lane/key accumulation and masked softmax tails. Five-head/PP,
+CP/reference paths and speculative verification retain their existing paths.
+
+Immutable`candidate-mla-head-tiles-v2` has split6; model SHA
+`1401d88a65f7e3c6871feda40b6ec4647018abe3320e0d9247e92f7969cc486a`.
+Immutable`candidate-mla-head-tiles-v4` adds values32; final deployed runtime
+source SHA matches`source-v4.json` for the model code. Final fixturev5 only
+changes indentation fromv4 and passes1848 cases per rank; its committed source
+and binary SHA are separately recorded. Model code is warning-clean FCC fast math,
+panel47/capacity4096. Strong final native fixtures pass1584/1848 cases per
+rank: logits, values, strided canaries, both cache views, three selection
+orders and1..2052 keys. Finite checks inspect IEEE exponent bits. Split6's
+five-pair six-head component median1.142844×; values32 only1.017734×, rejected
+before whole-model runs. Static assembly confirms vector spills in the old
+kernels; spill counts are not dynamic traffic or performance claims.
+
+Five alternating same-binary split6 model pairs confirm **+1.7089% prefill /
++0.0828% decode**. Absolute medians:406.956430→413.551356 prefill and
+34.181202→34.209521 decode. Fresh frozen control412.574268/34.808562
+(prefill/decode). The thirteen8049-prompt runs all pass complete129/257 output
+counts and exact frozen IDs; minimum available8.871399GiB. Full-prompt,
+128-transition endpoint states are byte-exact across legacy/split6 on all12
+ranks, in addition to internal warmup/trial checks. No short-prompt,1024-token
+or32K promotion qualification is claimed: prefill gain is below5% and decode
+is effectively unchanged. Qualified TP12 stays35.462134 decode/412.273634
+prefill;100/2000 targets remain unmet. Values32 has native component evidence
+only. See`a64fx/glm5/strata-mla-head-tiles-20261003.json` for exact commands,
+binary/source hashes, complete trials, all pairs, native timings and profiles.
+
+Drivers9502/10006/10350 are terminal/PASS, including values32's component
+rejection gate; no MPI experiment remains active. Scratch
+`tmp/strata-mla-head-tiles-20261003/` includes scripts/results/13 rank0 logs,
+bounded cross-option state audit and assembly. PJM52128881 and staged images
+remain reusable until~23:18 JST;23:00 new-run guard still applies. Do not
+restage or overlap MPI. No push authorized; unrelated remote-dev procedure
+edit remains untouched. Next: reduce MLA logits/verification work and pursue
+PP's actual-prompt arithmetic isolation; small component gains cannot justify
+assuming the100/2000 targets have been reached.
+
 **October3 evening continuation (complete):** pre-push audit found that
 canonical field CLI tools could pass mismatched generation/capture lengths.
 Commit`bf849e3b` requires explicit`--prompt-tokens`/`--output-tokens`, checks

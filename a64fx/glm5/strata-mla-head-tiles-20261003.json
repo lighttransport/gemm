@@ -1,0 +1,2557 @@
+{
+  "date": "2026-10-03",
+  "allocation": 52128881,
+  "hardware": "12 A64FX nodes compact2x3x2 normal2GHz/eco0",
+  "compiler": "FCC clang SVE fast math -Wall -Wextra -Werror",
+  "attention_panel": 47,
+  "prefill_capacity": 4096,
+  "threads": 47,
+  "promoted": false,
+  "targets_met": false,
+  "qualified_recipe_unchanged": {
+    "decode_tok_s": 35.462134,
+    "prefill_tok_s": 412.273634
+  },
+  "source_sha256_v4": {
+    "a64fx/glm5/glm53f_mla_attention.h": "5af25d55a23ee8062fd0a32d112b4a1ad06e12b4847ff62aa5e2e79de2793672",
+    "a64fx/glm5/glm53f_sparse_layer_12n.c": "942f41e4ca47d7f675027eaf2bd0bfeab4777fe0b87c14c8905f6d2d92963730",
+    "a64fx/glm5/glm53f_runtime.h": "dc1c2bc5a5733f60a71c038aa47e99c89611dc2319bc82183fdf349bdfe852a9",
+    "a64fx/glm5/test_glm53f_mla_head_tiles.c": "553a9843eba914c7c915447b95a3ccf8908010387e4ee51c1b8b403825829f9b"
+  },
+  "remote_binary_and_source_sha256": {
+    "a64fx/glm5/glm53f_mla_attention.h": "5af25d55a23ee8062fd0a32d112b4a1ad06e12b4847ff62aa5e2e79de2793672",
+    "a64fx/glm5/glm53f_sparse_layer_12n.c": "942f41e4ca47d7f675027eaf2bd0bfeab4777fe0b87c14c8905f6d2d92963730",
+    "a64fx/glm5/glm53f_runtime.h": "dc1c2bc5a5733f60a71c038aa47e99c89611dc2319bc82183fdf349bdfe852a9",
+    "a64fx/glm5/test_glm53f_mla_head_tiles.c": "553a9843eba914c7c915447b95a3ccf8908010387e4ee51c1b8b403825829f9b",
+    "a64fx/glm5/build/candidate-mla-head-tiles-v2/bench_glm53f_run_12n": "1401d88a65f7e3c6871feda40b6ec4647018abe3320e0d9247e92f7969cc486a",
+    "a64fx/glm5/build/candidate-mla-head-tiles-v4/bench_glm53f_run_12n": "c82ea4d8937ebbeb822bc3a2e4a8c0fc612bce3e474302781fa3ed1069e129ec",
+    "a64fx/glm5/build/candidate-mla-head-fixture-v3/test_glm53f_mla_head_tiles": "9474c8aa7b713def21f40030ce13dc205686f4db6b19505b8cf96d560f427496",
+    "a64fx/glm5/build/candidate-mla-head-tiles-v4/test_glm53f_mla_head_tiles": "fc9d60ed67ab96df4e0cf89fd45ccb111cac2e78f78755ad722ca8824492ccf7"
+  },
+  "profiles": {
+    "benchmark-mla-tiles-frozen-reference-9608-2.120.0": [
+      "GLM53F_TARGET_PROFILE label=bench-prefill kind=scalar steps=0 ms_pos=0.000 embed=0.000 mhc=0.000 attention=0.000 ffn=0.000 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-prefill kda=0.000 sparse=0.000 dense_ffn=0.000 moe=0.000 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-prefill kind=batch calls=2 positions=8049 ms_pos=2.577 embed=0.058 mhc=0.209 attention=1.270 ffn=1.040 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-prefill kind=batch kda=0.467 sparse=0.803 dense_ffn=0.133 moe=0.907 ms_pos",
+      "GLM53F_SPARSE_PROFILE label=bench-prefill front=0.215 index=0.124 pack=0.000 mla=0.337 output=0.049 allreduce=0.182 cp_unsplit=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE label=bench-prefill router=0.134 local=0.448 allreduce=0.408 nsh_in_local=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE_DETAIL label=bench-prefill native_total=0.258 xquant=0.007 native_tasks_wall=0.245 native_avg_busy=0.231 old_expert_loop=0.002 shared=0.101 combine=0.017 tasks_per_call=27842.0 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-decode kind=scalar steps=256 ms_pos=28.757 embed=0.110 mhc=5.758 attention=14.085 ffn=8.400 head=0.404",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-decode kda=6.809 sparse=7.276 dense_ffn=0.370 moe=8.030 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-decode kind=batch calls=0 positions=0 ms_pos=0.000 embed=0.000 mhc=0.000 attention=0.000 ffn=0.000 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-decode kind=batch kda=0.000 sparse=0.000 dense_ffn=0.000 moe=0.000 ms_pos",
+      "GLM53F_SPARSE_PROFILE label=bench-decode front=1.711 index=2.175 pack=0.000 mla=2.603 output=0.323 allreduce=1.263 cp_unsplit=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE label=bench-decode router=0.759 local=4.784 allreduce=2.874 nsh_in_local=3.698 ms_pos",
+      "GLM53F_MOE_PROFILE_DETAIL label=bench-decode native_total=0.000 xquant=0.000 native_tasks_wall=0.000 native_avg_busy=0.000 old_expert_loop=0.000 shared=0.000 combine=0.000 tasks_per_call=0.0 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-prefill kind=scalar steps=0 ms_pos=0.000 embed=0.000 mhc=0.000 attention=0.000 ffn=0.000 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-prefill kda=0.000 sparse=0.000 dense_ffn=0.000 moe=0.000 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-prefill kind=batch calls=2 positions=8049 ms_pos=2.442 embed=0.050 mhc=0.208 attention=1.211 ffn=0.973 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-prefill kind=batch kda=0.464 sparse=0.746 dense_ffn=0.133 moe=0.841 ms_pos",
+      "GLM53F_SPARSE_PROFILE label=bench-prefill front=0.175 index=0.110 pack=0.000 mla=0.336 output=0.049 allreduce=0.178 cp_unsplit=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE label=bench-prefill router=0.134 local=0.395 allreduce=0.379 nsh_in_local=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE_DETAIL label=bench-prefill native_total=0.238 xquant=0.007 native_tasks_wall=0.225 native_avg_busy=0.221 old_expert_loop=0.002 shared=0.081 combine=0.017 tasks_per_call=27842.0 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-decode kind=scalar steps=256 ms_pos=28.629 embed=0.087 mhc=5.768 attention=13.995 ffn=8.386 head=0.393",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-decode kda=6.794 sparse=7.201 dense_ffn=0.369 moe=8.017 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-decode kind=batch calls=0 positions=0 ms_pos=0.000 embed=0.000 mhc=0.000 attention=0.000 ffn=0.000 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-decode kind=batch kda=0.000 sparse=0.000 dense_ffn=0.000 moe=0.000 ms_pos",
+      "GLM53F_SPARSE_PROFILE label=bench-decode front=1.704 index=2.117 pack=0.000 mla=2.603 output=0.324 allreduce=1.263 cp_unsplit=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE label=bench-decode router=0.752 local=4.777 allreduce=2.877 nsh_in_local=3.689 ms_pos",
+      "GLM53F_MOE_PROFILE_DETAIL label=bench-decode native_total=0.000 xquant=0.000 native_tasks_wall=0.000 native_avg_busy=0.000 old_expert_loop=0.000 shared=0.000 combine=0.000 tasks_per_call=0.0 ms_pos"
+    ],
+    "benchmark-mla-tiles-pair-0-0-10089-2.129.0": [
+      "GLM53F_TARGET_PROFILE label=bench-prefill kind=scalar steps=0 ms_pos=0.000 embed=0.000 mhc=0.000 attention=0.000 ffn=0.000 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-prefill kda=0.000 sparse=0.000 dense_ffn=0.000 moe=0.000 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-prefill kind=batch calls=2 positions=8049 ms_pos=2.612 embed=0.027 mhc=0.207 attention=1.332 ffn=1.046 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-prefill kind=batch kda=0.472 sparse=0.859 dense_ffn=0.134 moe=0.912 ms_pos",
+      "GLM53F_SPARSE_PROFILE label=bench-prefill front=0.221 index=0.126 pack=0.000 mla=0.392 output=0.049 allreduce=0.215 cp_unsplit=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE label=bench-prefill router=0.134 local=0.450 allreduce=0.414 nsh_in_local=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE_DETAIL label=bench-prefill native_total=0.263 xquant=0.007 native_tasks_wall=0.249 native_avg_busy=0.235 old_expert_loop=0.002 shared=0.097 combine=0.017 tasks_per_call=27842.0 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-decode kind=scalar steps=256 ms_pos=29.055 embed=0.151 mhc=5.870 attention=14.179 ffn=8.448 head=0.408",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-decode kda=6.888 sparse=7.292 dense_ffn=0.368 moe=8.080 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-decode kind=batch calls=0 positions=0 ms_pos=0.000 embed=0.000 mhc=0.000 attention=0.000 ffn=0.000 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-decode kind=batch kda=0.000 sparse=0.000 dense_ffn=0.000 moe=0.000 ms_pos",
+      "GLM53F_SPARSE_PROFILE label=bench-decode front=1.706 index=2.157 pack=0.000 mla=2.607 output=0.333 allreduce=1.235 cp_unsplit=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE label=bench-decode router=0.761 local=4.884 allreduce=2.712 nsh_in_local=3.969 ms_pos",
+      "GLM53F_MOE_PROFILE_DETAIL label=bench-decode native_total=0.000 xquant=0.000 native_tasks_wall=0.000 native_avg_busy=0.000 old_expert_loop=0.000 shared=0.000 combine=0.000 tasks_per_call=0.0 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-prefill kind=scalar steps=0 ms_pos=0.000 embed=0.000 mhc=0.000 attention=0.000 ffn=0.000 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-prefill kda=0.000 sparse=0.000 dense_ffn=0.000 moe=0.000 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-prefill kind=batch calls=2 positions=8049 ms_pos=2.479 embed=0.024 mhc=0.206 attention=1.275 ffn=0.974 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-prefill kind=batch kda=0.469 sparse=0.806 dense_ffn=0.135 moe=0.840 ms_pos",
+      "GLM53F_SPARSE_PROFILE label=bench-prefill front=0.179 index=0.114 pack=0.000 mla=0.390 output=0.049 allreduce=0.212 cp_unsplit=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE label=bench-prefill router=0.134 local=0.394 allreduce=0.382 nsh_in_local=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE_DETAIL label=bench-prefill native_total=0.239 xquant=0.007 native_tasks_wall=0.226 native_avg_busy=0.222 old_expert_loop=0.002 shared=0.076 combine=0.018 tasks_per_call=27842.0 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-decode kind=scalar steps=256 ms_pos=29.565 embed=0.092 mhc=5.872 attention=14.464 ffn=8.712 head=0.425",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-decode kda=7.019 sparse=7.444 dense_ffn=0.379 moe=8.334 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-decode kind=batch calls=0 positions=0 ms_pos=0.000 embed=0.000 mhc=0.000 attention=0.000 ffn=0.000 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-decode kind=batch kda=0.000 sparse=0.000 dense_ffn=0.000 moe=0.000 ms_pos",
+      "GLM53F_SPARSE_PROFILE label=bench-decode front=1.690 index=2.170 pack=0.000 mla=2.606 output=0.333 allreduce=1.386 cp_unsplit=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE label=bench-decode router=0.761 local=4.879 allreduce=2.984 nsh_in_local=4.088 ms_pos",
+      "GLM53F_MOE_PROFILE_DETAIL label=bench-decode native_total=0.000 xquant=0.000 native_tasks_wall=0.000 native_avg_busy=0.000 old_expert_loop=0.000 shared=0.000 combine=0.000 tasks_per_call=0.0 ms_pos"
+    ],
+    "benchmark-mla-tiles-pair-0-1-10286-2.132.0": [
+      "GLM53F_TARGET_PROFILE label=bench-prefill kind=scalar steps=0 ms_pos=0.000 embed=0.000 mhc=0.000 attention=0.000 ffn=0.000 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-prefill kda=0.000 sparse=0.000 dense_ffn=0.000 moe=0.000 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-prefill kind=batch calls=2 positions=8049 ms_pos=2.584 embed=0.027 mhc=0.207 attention=1.302 ffn=1.047 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-prefill kind=batch kda=0.472 sparse=0.829 dense_ffn=0.136 moe=0.912 ms_pos",
+      "GLM53F_SPARSE_PROFILE label=bench-prefill front=0.223 index=0.130 pack=0.000 mla=0.353 output=0.049 allreduce=0.184 cp_unsplit=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE label=bench-prefill router=0.134 local=0.449 allreduce=0.409 nsh_in_local=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE_DETAIL label=bench-prefill native_total=0.263 xquant=0.007 native_tasks_wall=0.249 native_avg_busy=0.235 old_expert_loop=0.002 shared=0.096 combine=0.017 tasks_per_call=27842.0 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-decode kind=scalar steps=256 ms_pos=29.703 embed=0.149 mhc=5.845 attention=14.509 ffn=8.797 head=0.402",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-decode kda=7.098 sparse=7.411 dense_ffn=0.391 moe=8.406 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-decode kind=batch calls=0 positions=0 ms_pos=0.000 embed=0.000 mhc=0.000 attention=0.000 ffn=0.000 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-decode kind=batch kda=0.000 sparse=0.000 dense_ffn=0.000 moe=0.000 ms_pos",
+      "GLM53F_SPARSE_PROFILE label=bench-decode front=1.705 index=2.232 pack=0.000 mla=2.597 output=0.333 allreduce=1.299 cp_unsplit=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE label=bench-decode router=0.760 local=4.894 allreduce=2.937 nsh_in_local=3.909 ms_pos",
+      "GLM53F_MOE_PROFILE_DETAIL label=bench-decode native_total=0.000 xquant=0.000 native_tasks_wall=0.000 native_avg_busy=0.000 old_expert_loop=0.000 shared=0.000 combine=0.000 tasks_per_call=0.0 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-prefill kind=scalar steps=0 ms_pos=0.000 embed=0.000 mhc=0.000 attention=0.000 ffn=0.000 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-prefill kda=0.000 sparse=0.000 dense_ffn=0.000 moe=0.000 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-prefill kind=batch calls=2 positions=8049 ms_pos=2.438 embed=0.024 mhc=0.206 attention=1.236 ffn=0.973 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-prefill kind=batch kda=0.470 sparse=0.766 dense_ffn=0.132 moe=0.840 ms_pos",
+      "GLM53F_SPARSE_PROFILE label=bench-prefill front=0.178 index=0.114 pack=0.000 mla=0.351 output=0.049 allreduce=0.172 cp_unsplit=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE label=bench-prefill router=0.134 local=0.394 allreduce=0.380 nsh_in_local=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE_DETAIL label=bench-prefill native_total=0.239 xquant=0.007 native_tasks_wall=0.225 native_avg_busy=0.222 old_expert_loop=0.002 shared=0.077 combine=0.017 tasks_per_call=27842.0 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-decode kind=scalar steps=256 ms_pos=29.268 embed=0.089 mhc=5.842 attention=14.322 ffn=8.622 head=0.393",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-decode kda=7.042 sparse=7.279 dense_ffn=0.387 moe=8.235 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-decode kind=batch calls=0 positions=0 ms_pos=0.000 embed=0.000 mhc=0.000 attention=0.000 ffn=0.000 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-decode kind=batch kda=0.000 sparse=0.000 dense_ffn=0.000 moe=0.000 ms_pos",
+      "GLM53F_SPARSE_PROFILE label=bench-decode front=1.689 index=2.140 pack=0.000 mla=2.596 output=0.333 allreduce=1.270 cp_unsplit=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE label=bench-decode router=0.760 local=4.888 allreduce=2.770 nsh_in_local=3.827 ms_pos",
+      "GLM53F_MOE_PROFILE_DETAIL label=bench-decode native_total=0.000 xquant=0.000 native_tasks_wall=0.000 native_avg_busy=0.000 old_expert_loop=0.000 shared=0.000 combine=0.000 tasks_per_call=0.0 ms_pos"
+    ],
+    "benchmark-mla-tiles-pair-1-0-10793-2.138.0": [
+      "GLM53F_TARGET_PROFILE label=bench-prefill kind=scalar steps=0 ms_pos=0.000 embed=0.000 mhc=0.000 attention=0.000 ffn=0.000 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-prefill kda=0.000 sparse=0.000 dense_ffn=0.000 moe=0.000 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-prefill kind=batch calls=2 positions=8049 ms_pos=2.617 embed=0.027 mhc=0.208 attention=1.337 ffn=1.045 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-prefill kind=batch kda=0.472 sparse=0.865 dense_ffn=0.132 moe=0.914 ms_pos",
+      "GLM53F_SPARSE_PROFILE label=bench-prefill front=0.221 index=0.130 pack=0.000 mla=0.391 output=0.050 allreduce=0.221 cp_unsplit=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE label=bench-prefill router=0.134 local=0.450 allreduce=0.411 nsh_in_local=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE_DETAIL label=bench-prefill native_total=0.265 xquant=0.007 native_tasks_wall=0.251 native_avg_busy=0.237 old_expert_loop=0.002 shared=0.097 combine=0.017 tasks_per_call=27842.0 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-decode kind=scalar steps=256 ms_pos=29.318 embed=0.145 mhc=5.934 attention=14.297 ffn=8.534 head=0.407",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-decode kda=6.966 sparse=7.332 dense_ffn=0.378 moe=8.158 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-decode kind=batch calls=0 positions=0 ms_pos=0.000 embed=0.000 mhc=0.000 attention=0.000 ffn=0.000 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-decode kind=batch kda=0.000 sparse=0.000 dense_ffn=0.000 moe=0.000 ms_pos",
+      "GLM53F_SPARSE_PROFILE label=bench-decode front=1.699 index=2.172 pack=0.000 mla=2.645 output=0.328 allreduce=1.274 cp_unsplit=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE label=bench-decode router=0.761 local=4.898 allreduce=2.828 nsh_in_local=3.923 ms_pos",
+      "GLM53F_MOE_PROFILE_DETAIL label=bench-decode native_total=0.000 xquant=0.000 native_tasks_wall=0.000 native_avg_busy=0.000 old_expert_loop=0.000 shared=0.000 combine=0.000 tasks_per_call=0.0 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-prefill kind=scalar steps=0 ms_pos=0.000 embed=0.000 mhc=0.000 attention=0.000 ffn=0.000 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-prefill kda=0.000 sparse=0.000 dense_ffn=0.000 moe=0.000 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-prefill kind=batch calls=2 positions=8049 ms_pos=2.474 embed=0.024 mhc=0.206 attention=1.271 ffn=0.973 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-prefill kind=batch kda=0.469 sparse=0.802 dense_ffn=0.133 moe=0.840 ms_pos",
+      "GLM53F_SPARSE_PROFILE label=bench-prefill front=0.179 index=0.114 pack=0.000 mla=0.390 output=0.050 allreduce=0.210 cp_unsplit=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE label=bench-prefill router=0.134 local=0.395 allreduce=0.380 nsh_in_local=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE_DETAIL label=bench-prefill native_total=0.239 xquant=0.007 native_tasks_wall=0.226 native_avg_busy=0.223 old_expert_loop=0.002 shared=0.077 combine=0.017 tasks_per_call=27842.0 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-decode kind=scalar steps=256 ms_pos=29.529 embed=0.091 mhc=5.936 attention=14.475 ffn=8.629 head=0.398",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-decode kda=7.041 sparse=7.434 dense_ffn=0.384 moe=8.246 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-decode kind=batch calls=0 positions=0 ms_pos=0.000 embed=0.000 mhc=0.000 attention=0.000 ffn=0.000 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-decode kind=batch kda=0.000 sparse=0.000 dense_ffn=0.000 moe=0.000 ms_pos",
+      "GLM53F_SPARSE_PROFILE label=bench-decode front=1.682 index=2.192 pack=0.000 mla=2.643 output=0.328 allreduce=1.369 cp_unsplit=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE label=bench-decode router=0.761 local=4.892 allreduce=2.923 nsh_in_local=3.963 ms_pos",
+      "GLM53F_MOE_PROFILE_DETAIL label=bench-decode native_total=0.000 xquant=0.000 native_tasks_wall=0.000 native_avg_busy=0.000 old_expert_loop=0.000 shared=0.000 combine=0.000 tasks_per_call=0.0 ms_pos"
+    ],
+    "benchmark-mla-tiles-pair-1-1-10539-2.135.0": [
+      "GLM53F_TARGET_PROFILE label=bench-prefill kind=scalar steps=0 ms_pos=0.000 embed=0.000 mhc=0.000 attention=0.000 ffn=0.000 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-prefill kda=0.000 sparse=0.000 dense_ffn=0.000 moe=0.000 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-prefill kind=batch calls=2 positions=8049 ms_pos=2.577 embed=0.027 mhc=0.207 attention=1.297 ffn=1.046 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-prefill kind=batch kda=0.472 sparse=0.825 dense_ffn=0.134 moe=0.912 ms_pos",
+      "GLM53F_SPARSE_PROFILE label=bench-prefill front=0.217 index=0.127 pack=0.000 mla=0.353 output=0.049 allreduce=0.180 cp_unsplit=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE label=bench-prefill router=0.134 local=0.451 allreduce=0.410 nsh_in_local=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE_DETAIL label=bench-prefill native_total=0.263 xquant=0.007 native_tasks_wall=0.250 native_avg_busy=0.234 old_expert_loop=0.002 shared=0.096 combine=0.017 tasks_per_call=27842.0 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-decode kind=scalar steps=256 ms_pos=29.871 embed=0.150 mhc=5.840 attention=14.633 ffn=8.836 head=0.412",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-decode kda=7.142 sparse=7.491 dense_ffn=0.390 moe=8.447 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-decode kind=batch calls=0 positions=0 ms_pos=0.000 embed=0.000 mhc=0.000 attention=0.000 ffn=0.000 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-decode kind=batch kda=0.000 sparse=0.000 dense_ffn=0.000 moe=0.000 ms_pos",
+      "GLM53F_SPARSE_PROFILE label=bench-decode front=1.708 index=2.262 pack=0.000 mla=2.655 output=0.335 allreduce=1.329 cp_unsplit=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE label=bench-decode router=0.764 local=4.919 allreduce=2.984 nsh_in_local=4.052 ms_pos",
+      "GLM53F_MOE_PROFILE_DETAIL label=bench-decode native_total=0.000 xquant=0.000 native_tasks_wall=0.000 native_avg_busy=0.000 old_expert_loop=0.000 shared=0.000 combine=0.000 tasks_per_call=0.0 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-prefill kind=scalar steps=0 ms_pos=0.000 embed=0.000 mhc=0.000 attention=0.000 ffn=0.000 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-prefill kda=0.000 sparse=0.000 dense_ffn=0.000 moe=0.000 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-prefill kind=batch calls=2 positions=8049 ms_pos=2.432 embed=0.024 mhc=0.206 attention=1.232 ffn=0.970 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-prefill kind=batch kda=0.469 sparse=0.763 dense_ffn=0.132 moe=0.839 ms_pos",
+      "GLM53F_SPARSE_PROFILE label=bench-prefill front=0.176 index=0.113 pack=0.000 mla=0.352 output=0.049 allreduce=0.171 cp_unsplit=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE label=bench-prefill router=0.134 local=0.395 allreduce=0.379 nsh_in_local=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE_DETAIL label=bench-prefill native_total=0.240 xquant=0.007 native_tasks_wall=0.227 native_avg_busy=0.223 old_expert_loop=0.002 shared=0.076 combine=0.017 tasks_per_call=27842.0 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-decode kind=scalar steps=256 ms_pos=29.493 embed=0.090 mhc=5.840 attention=14.445 ffn=8.725 head=0.393",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-decode kda=7.080 sparse=7.365 dense_ffn=0.388 moe=8.337 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-decode kind=batch calls=0 positions=0 ms_pos=0.000 embed=0.000 mhc=0.000 attention=0.000 ffn=0.000 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-decode kind=batch kda=0.000 sparse=0.000 dense_ffn=0.000 moe=0.000 ms_pos",
+      "GLM53F_SPARSE_PROFILE label=bench-decode front=1.689 index=2.151 pack=0.000 mla=2.655 output=0.336 allreduce=1.327 cp_unsplit=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE label=bench-decode router=0.764 local=4.913 allreduce=2.879 nsh_in_local=4.015 ms_pos",
+      "GLM53F_MOE_PROFILE_DETAIL label=bench-decode native_total=0.000 xquant=0.000 native_tasks_wall=0.000 native_avg_busy=0.000 old_expert_loop=0.000 shared=0.000 combine=0.000 tasks_per_call=0.0 ms_pos"
+    ],
+    "benchmark-mla-tiles-pair-2-0-11053-2.141.0": [
+      "GLM53F_TARGET_PROFILE label=bench-prefill kind=scalar steps=0 ms_pos=0.000 embed=0.000 mhc=0.000 attention=0.000 ffn=0.000 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-prefill kda=0.000 sparse=0.000 dense_ffn=0.000 moe=0.000 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-prefill kind=batch calls=2 positions=8049 ms_pos=2.620 embed=0.027 mhc=0.207 attention=1.339 ffn=1.046 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-prefill kind=batch kda=0.472 sparse=0.868 dense_ffn=0.133 moe=0.913 ms_pos",
+      "GLM53F_SPARSE_PROFILE label=bench-prefill front=0.220 index=0.131 pack=0.000 mla=0.391 output=0.049 allreduce=0.221 cp_unsplit=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE label=bench-prefill router=0.134 local=0.450 allreduce=0.413 nsh_in_local=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE_DETAIL label=bench-prefill native_total=0.260 xquant=0.007 native_tasks_wall=0.247 native_avg_busy=0.233 old_expert_loop=0.002 shared=0.098 combine=0.018 tasks_per_call=27842.0 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-decode kind=scalar steps=256 ms_pos=29.347 embed=0.146 mhc=5.910 attention=14.379 ffn=8.500 head=0.412",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-decode kda=7.016 sparse=7.363 dense_ffn=0.376 moe=8.124 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-decode kind=batch calls=0 positions=0 ms_pos=0.000 embed=0.000 mhc=0.000 attention=0.000 ffn=0.000 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-decode kind=batch kda=0.000 sparse=0.000 dense_ffn=0.000 moe=0.000 ms_pos",
+      "GLM53F_SPARSE_PROFILE label=bench-decode front=1.711 index=2.156 pack=0.000 mla=2.614 output=0.327 allreduce=1.291 cp_unsplit=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE label=bench-decode router=0.755 local=4.859 allreduce=2.770 nsh_in_local=3.972 ms_pos",
+      "GLM53F_MOE_PROFILE_DETAIL label=bench-decode native_total=0.000 xquant=0.000 native_tasks_wall=0.000 native_avg_busy=0.000 old_expert_loop=0.000 shared=0.000 combine=0.000 tasks_per_call=0.0 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-prefill kind=scalar steps=0 ms_pos=0.000 embed=0.000 mhc=0.000 attention=0.000 ffn=0.000 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-prefill kda=0.000 sparse=0.000 dense_ffn=0.000 moe=0.000 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-prefill kind=batch calls=2 positions=8049 ms_pos=2.474 embed=0.024 mhc=0.206 attention=1.270 ffn=0.974 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-prefill kind=batch kda=0.469 sparse=0.801 dense_ffn=0.134 moe=0.840 ms_pos",
+      "GLM53F_SPARSE_PROFILE label=bench-prefill front=0.178 index=0.115 pack=0.000 mla=0.390 output=0.049 allreduce=0.209 cp_unsplit=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE label=bench-prefill router=0.134 local=0.394 allreduce=0.383 nsh_in_local=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE_DETAIL label=bench-prefill native_total=0.238 xquant=0.007 native_tasks_wall=0.225 native_avg_busy=0.222 old_expert_loop=0.002 shared=0.077 combine=0.017 tasks_per_call=27842.0 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-decode kind=scalar steps=256 ms_pos=29.255 embed=0.091 mhc=5.907 attention=14.359 ffn=8.503 head=0.395",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-decode kda=7.042 sparse=7.317 dense_ffn=0.375 moe=8.128 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-decode kind=batch calls=0 positions=0 ms_pos=0.000 embed=0.000 mhc=0.000 attention=0.000 ffn=0.000 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-decode kind=batch kda=0.000 sparse=0.000 dense_ffn=0.000 moe=0.000 ms_pos",
+      "GLM53F_SPARSE_PROFILE label=bench-decode front=1.695 index=2.103 pack=0.000 mla=2.613 output=0.327 allreduce=1.308 cp_unsplit=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE label=bench-decode router=0.755 local=4.855 allreduce=2.780 nsh_in_local=3.973 ms_pos",
+      "GLM53F_MOE_PROFILE_DETAIL label=bench-decode native_total=0.000 xquant=0.000 native_tasks_wall=0.000 native_avg_busy=0.000 old_expert_loop=0.000 shared=0.000 combine=0.000 tasks_per_call=0.0 ms_pos"
+    ],
+    "benchmark-mla-tiles-pair-2-1-11306-2.144.0": [
+      "GLM53F_TARGET_PROFILE label=bench-prefill kind=scalar steps=0 ms_pos=0.000 embed=0.000 mhc=0.000 attention=0.000 ffn=0.000 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-prefill kda=0.000 sparse=0.000 dense_ffn=0.000 moe=0.000 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-prefill kind=batch calls=2 positions=8049 ms_pos=2.574 embed=0.027 mhc=0.207 attention=1.298 ffn=1.042 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-prefill kind=batch kda=0.473 sparse=0.825 dense_ffn=0.130 moe=0.912 ms_pos",
+      "GLM53F_SPARSE_PROFILE label=bench-prefill front=0.219 index=0.124 pack=0.000 mla=0.353 output=0.049 allreduce=0.179 cp_unsplit=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE label=bench-prefill router=0.134 local=0.447 allreduce=0.408 nsh_in_local=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE_DETAIL label=bench-prefill native_total=0.265 xquant=0.007 native_tasks_wall=0.250 native_avg_busy=0.236 old_expert_loop=0.002 shared=0.097 combine=0.017 tasks_per_call=27842.0 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-decode kind=scalar steps=256 ms_pos=28.959 embed=0.143 mhc=5.824 attention=14.147 ffn=8.441 head=0.404",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-decode kda=6.880 sparse=7.267 dense_ffn=0.375 moe=8.069 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-decode kind=batch calls=0 positions=0 ms_pos=0.000 embed=0.000 mhc=0.000 attention=0.000 ffn=0.000 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-decode kind=batch kda=0.000 sparse=0.000 dense_ffn=0.000 moe=0.000 ms_pos",
+      "GLM53F_SPARSE_PROFILE label=bench-decode front=1.712 index=2.148 pack=0.000 mla=2.612 output=0.328 allreduce=1.201 cp_unsplit=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE label=bench-decode router=0.759 local=4.938 allreduce=2.764 nsh_in_local=3.838 ms_pos",
+      "GLM53F_MOE_PROFILE_DETAIL label=bench-decode native_total=0.000 xquant=0.000 native_tasks_wall=0.000 native_avg_busy=0.000 old_expert_loop=0.000 shared=0.000 combine=0.000 tasks_per_call=0.0 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-prefill kind=scalar steps=0 ms_pos=0.000 embed=0.000 mhc=0.000 attention=0.000 ffn=0.000 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-prefill kda=0.000 sparse=0.000 dense_ffn=0.000 moe=0.000 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-prefill kind=batch calls=2 positions=8049 ms_pos=2.435 embed=0.024 mhc=0.206 attention=1.236 ffn=0.969 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-prefill kind=batch kda=0.470 sparse=0.766 dense_ffn=0.132 moe=0.837 ms_pos",
+      "GLM53F_SPARSE_PROFILE label=bench-prefill front=0.177 index=0.112 pack=0.000 mla=0.352 output=0.049 allreduce=0.171 cp_unsplit=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE label=bench-prefill router=0.134 local=0.394 allreduce=0.378 nsh_in_local=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE_DETAIL label=bench-prefill native_total=0.239 xquant=0.007 native_tasks_wall=0.226 native_avg_busy=0.222 old_expert_loop=0.002 shared=0.077 combine=0.017 tasks_per_call=27842.0 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-decode kind=scalar steps=256 ms_pos=29.075 embed=0.090 mhc=5.825 attention=14.229 ffn=8.535 head=0.396",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-decode kda=6.958 sparse=7.271 dense_ffn=0.380 moe=8.155 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-decode kind=batch calls=0 positions=0 ms_pos=0.000 embed=0.000 mhc=0.000 attention=0.000 ffn=0.000 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-decode kind=batch kda=0.000 sparse=0.000 dense_ffn=0.000 moe=0.000 ms_pos",
+      "GLM53F_SPARSE_PROFILE label=bench-decode front=1.697 index=2.116 pack=0.000 mla=2.612 output=0.328 allreduce=1.247 cp_unsplit=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE label=bench-decode router=0.759 local=4.933 allreduce=2.758 nsh_in_local=3.889 ms_pos",
+      "GLM53F_MOE_PROFILE_DETAIL label=bench-decode native_total=0.000 xquant=0.000 native_tasks_wall=0.000 native_avg_busy=0.000 old_expert_loop=0.000 shared=0.000 combine=0.000 tasks_per_call=0.0 ms_pos"
+    ],
+    "benchmark-mla-tiles-pair-3-0-11823-2.150.0": [
+      "GLM53F_TARGET_PROFILE label=bench-prefill kind=scalar steps=0 ms_pos=0.000 embed=0.000 mhc=0.000 attention=0.000 ffn=0.000 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-prefill kda=0.000 sparse=0.000 dense_ffn=0.000 moe=0.000 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-prefill kind=batch calls=2 positions=8049 ms_pos=2.620 embed=0.027 mhc=0.207 attention=1.335 ffn=1.050 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-prefill kind=batch kda=0.472 sparse=0.863 dense_ffn=0.138 moe=0.913 ms_pos",
+      "GLM53F_SPARSE_PROFILE label=bench-prefill front=0.219 index=0.127 pack=0.000 mla=0.392 output=0.049 allreduce=0.220 cp_unsplit=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE label=bench-prefill router=0.134 local=0.450 allreduce=0.413 nsh_in_local=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE_DETAIL label=bench-prefill native_total=0.260 xquant=0.007 native_tasks_wall=0.246 native_avg_busy=0.232 old_expert_loop=0.002 shared=0.098 combine=0.017 tasks_per_call=27842.0 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-decode kind=scalar steps=256 ms_pos=29.222 embed=0.142 mhc=5.904 attention=14.270 ffn=8.492 head=0.412",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-decode kda=6.948 sparse=7.322 dense_ffn=0.373 moe=8.119 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-decode kind=batch calls=0 positions=0 ms_pos=0.000 embed=0.000 mhc=0.000 attention=0.000 ffn=0.000 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-decode kind=batch kda=0.000 sparse=0.000 dense_ffn=0.000 moe=0.000 ms_pos",
+      "GLM53F_SPARSE_PROFILE label=bench-decode front=1.705 index=2.167 pack=0.000 mla=2.617 output=0.326 allreduce=1.259 cp_unsplit=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE label=bench-decode router=0.751 local=4.898 allreduce=2.771 nsh_in_local=3.893 ms_pos",
+      "GLM53F_MOE_PROFILE_DETAIL label=bench-decode native_total=0.000 xquant=0.000 native_tasks_wall=0.000 native_avg_busy=0.000 old_expert_loop=0.000 shared=0.000 combine=0.000 tasks_per_call=0.0 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-prefill kind=scalar steps=0 ms_pos=0.000 embed=0.000 mhc=0.000 attention=0.000 ffn=0.000 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-prefill kda=0.000 sparse=0.000 dense_ffn=0.000 moe=0.000 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-prefill kind=batch calls=2 positions=8049 ms_pos=2.478 embed=0.024 mhc=0.206 attention=1.272 ffn=0.976 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-prefill kind=batch kda=0.469 sparse=0.803 dense_ffn=0.135 moe=0.841 ms_pos",
+      "GLM53F_SPARSE_PROFILE label=bench-prefill front=0.178 index=0.115 pack=0.000 mla=0.390 output=0.049 allreduce=0.210 cp_unsplit=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE label=bench-prefill router=0.134 local=0.394 allreduce=0.384 nsh_in_local=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE_DETAIL label=bench-prefill native_total=0.238 xquant=0.007 native_tasks_wall=0.225 native_avg_busy=0.221 old_expert_loop=0.002 shared=0.077 combine=0.017 tasks_per_call=27842.0 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-decode kind=scalar steps=256 ms_pos=28.894 embed=0.089 mhc=5.906 attention=14.075 ffn=8.426 head=0.398",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-decode kda=6.868 sparse=7.208 dense_ffn=0.370 moe=8.056 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-decode kind=batch calls=0 positions=0 ms_pos=0.000 embed=0.000 mhc=0.000 attention=0.000 ffn=0.000 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-decode kind=batch kda=0.000 sparse=0.000 dense_ffn=0.000 moe=0.000 ms_pos",
+      "GLM53F_SPARSE_PROFILE label=bench-decode front=1.690 index=2.075 pack=0.000 mla=2.617 output=0.326 allreduce=1.248 cp_unsplit=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE label=bench-decode router=0.751 local=4.890 allreduce=2.713 nsh_in_local=3.860 ms_pos",
+      "GLM53F_MOE_PROFILE_DETAIL label=bench-decode native_total=0.000 xquant=0.000 native_tasks_wall=0.000 native_avg_busy=0.000 old_expert_loop=0.000 shared=0.000 combine=0.000 tasks_per_call=0.0 ms_pos"
+    ],
+    "benchmark-mla-tiles-pair-3-1-11560-2.147.0": [
+      "GLM53F_TARGET_PROFILE label=bench-prefill kind=scalar steps=0 ms_pos=0.000 embed=0.000 mhc=0.000 attention=0.000 ffn=0.000 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-prefill kda=0.000 sparse=0.000 dense_ffn=0.000 moe=0.000 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-prefill kind=batch calls=2 positions=8049 ms_pos=2.582 embed=0.027 mhc=0.208 attention=1.296 ffn=1.050 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-prefill kind=batch kda=0.473 sparse=0.823 dense_ffn=0.136 moe=0.914 ms_pos",
+      "GLM53F_SPARSE_PROFILE label=bench-prefill front=0.218 index=0.126 pack=0.000 mla=0.353 output=0.049 allreduce=0.182 cp_unsplit=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE label=bench-prefill router=0.134 local=0.451 allreduce=0.415 nsh_in_local=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE_DETAIL label=bench-prefill native_total=0.258 xquant=0.007 native_tasks_wall=0.244 native_avg_busy=0.231 old_expert_loop=0.002 shared=0.097 combine=0.017 tasks_per_call=27842.0 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-decode kind=scalar steps=256 ms_pos=29.822 embed=0.143 mhc=6.051 attention=14.486 ffn=8.732 head=0.410",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-decode kda=7.105 sparse=7.381 dense_ffn=0.388 moe=8.344 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-decode kind=batch calls=0 positions=0 ms_pos=0.000 embed=0.000 mhc=0.000 attention=0.000 ffn=0.000 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-decode kind=batch kda=0.000 sparse=0.000 dense_ffn=0.000 moe=0.000 ms_pos",
+      "GLM53F_SPARSE_PROFILE label=bench-decode front=1.704 index=2.231 pack=0.000 mla=2.597 output=0.332 allreduce=1.265 cp_unsplit=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE label=bench-decode router=0.754 local=4.895 allreduce=2.892 nsh_in_local=3.872 ms_pos",
+      "GLM53F_MOE_PROFILE_DETAIL label=bench-decode native_total=0.000 xquant=0.000 native_tasks_wall=0.000 native_avg_busy=0.000 old_expert_loop=0.000 shared=0.000 combine=0.000 tasks_per_call=0.0 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-prefill kind=scalar steps=0 ms_pos=0.000 embed=0.000 mhc=0.000 attention=0.000 ffn=0.000 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-prefill kda=0.000 sparse=0.000 dense_ffn=0.000 moe=0.000 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-prefill kind=batch calls=2 positions=8049 ms_pos=2.436 embed=0.024 mhc=0.207 attention=1.231 ffn=0.975 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-prefill kind=batch kda=0.470 sparse=0.761 dense_ffn=0.136 moe=0.839 ms_pos",
+      "GLM53F_SPARSE_PROFILE label=bench-prefill front=0.174 index=0.110 pack=0.000 mla=0.351 output=0.049 allreduce=0.171 cp_unsplit=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE label=bench-prefill router=0.134 local=0.395 allreduce=0.379 nsh_in_local=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE_DETAIL label=bench-prefill native_total=0.238 xquant=0.007 native_tasks_wall=0.225 native_avg_busy=0.221 old_expert_loop=0.002 shared=0.078 combine=0.017 tasks_per_call=27842.0 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-decode kind=scalar steps=256 ms_pos=29.932 embed=0.089 mhc=6.048 attention=14.609 ffn=8.792 head=0.395",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-decode kda=7.254 sparse=7.355 dense_ffn=0.393 moe=8.398 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-decode kind=batch calls=0 positions=0 ms_pos=0.000 embed=0.000 mhc=0.000 attention=0.000 ffn=0.000 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-decode kind=batch kda=0.000 sparse=0.000 dense_ffn=0.000 moe=0.000 ms_pos",
+      "GLM53F_SPARSE_PROFILE label=bench-decode front=1.690 index=2.190 pack=0.000 mla=2.597 output=0.332 allreduce=1.292 cp_unsplit=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE label=bench-decode router=0.754 local=4.888 allreduce=2.950 nsh_in_local=3.898 ms_pos",
+      "GLM53F_MOE_PROFILE_DETAIL label=bench-decode native_total=0.000 xquant=0.000 native_tasks_wall=0.000 native_avg_busy=0.000 old_expert_loop=0.000 shared=0.000 combine=0.000 tasks_per_call=0.0 ms_pos"
+    ],
+    "benchmark-mla-tiles-pair-4-0-12077-2.153.0": [
+      "GLM53F_TARGET_PROFILE label=bench-prefill kind=scalar steps=0 ms_pos=0.000 embed=0.000 mhc=0.000 attention=0.000 ffn=0.000 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-prefill kda=0.000 sparse=0.000 dense_ffn=0.000 moe=0.000 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-prefill kind=batch calls=2 positions=8049 ms_pos=2.616 embed=0.027 mhc=0.208 attention=1.335 ffn=1.045 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-prefill kind=batch kda=0.472 sparse=0.863 dense_ffn=0.134 moe=0.912 ms_pos",
+      "GLM53F_SPARSE_PROFILE label=bench-prefill front=0.219 index=0.127 pack=0.000 mla=0.392 output=0.049 allreduce=0.221 cp_unsplit=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE label=bench-prefill router=0.134 local=0.450 allreduce=0.413 nsh_in_local=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE_DETAIL label=bench-prefill native_total=0.259 xquant=0.007 native_tasks_wall=0.245 native_avg_busy=0.232 old_expert_loop=0.002 shared=0.096 combine=0.017 tasks_per_call=27842.0 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-decode kind=scalar steps=256 ms_pos=29.140 embed=0.140 mhc=5.871 attention=14.231 ffn=8.491 head=0.408",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-decode kda=6.936 sparse=7.296 dense_ffn=0.373 moe=8.123 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-decode kind=batch calls=0 positions=0 ms_pos=0.000 embed=0.000 mhc=0.000 attention=0.000 ffn=0.000 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-decode kind=batch kda=0.000 sparse=0.000 dense_ffn=0.000 moe=0.000 ms_pos",
+      "GLM53F_SPARSE_PROFILE label=bench-decode front=1.717 index=2.165 pack=0.000 mla=2.611 output=0.333 allreduce=1.260 cp_unsplit=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE label=bench-decode router=0.758 local=4.907 allreduce=2.775 nsh_in_local=3.895 ms_pos",
+      "GLM53F_MOE_PROFILE_DETAIL label=bench-decode native_total=0.000 xquant=0.000 native_tasks_wall=0.000 native_avg_busy=0.000 old_expert_loop=0.000 shared=0.000 combine=0.000 tasks_per_call=0.0 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-prefill kind=scalar steps=0 ms_pos=0.000 embed=0.000 mhc=0.000 attention=0.000 ffn=0.000 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-prefill kda=0.000 sparse=0.000 dense_ffn=0.000 moe=0.000 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-prefill kind=batch calls=2 positions=8049 ms_pos=2.476 embed=0.024 mhc=0.207 attention=1.270 ffn=0.975 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-prefill kind=batch kda=0.469 sparse=0.801 dense_ffn=0.134 moe=0.841 ms_pos",
+      "GLM53F_SPARSE_PROFILE label=bench-prefill front=0.176 index=0.114 pack=0.000 mla=0.390 output=0.049 allreduce=0.210 cp_unsplit=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE label=bench-prefill router=0.134 local=0.395 allreduce=0.384 nsh_in_local=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE_DETAIL label=bench-prefill native_total=0.239 xquant=0.007 native_tasks_wall=0.226 native_avg_busy=0.222 old_expert_loop=0.002 shared=0.076 combine=0.017 tasks_per_call=27842.0 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-decode kind=scalar steps=256 ms_pos=28.874 embed=0.090 mhc=5.869 attention=14.063 ffn=8.458 head=0.394",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-decode kda=6.866 sparse=7.197 dense_ffn=0.373 moe=8.088 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-decode kind=batch calls=0 positions=0 ms_pos=0.000 embed=0.000 mhc=0.000 attention=0.000 ffn=0.000 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-decode kind=batch kda=0.000 sparse=0.000 dense_ffn=0.000 moe=0.000 ms_pos",
+      "GLM53F_SPARSE_PROFILE label=bench-decode front=1.703 index=2.110 pack=0.000 mla=2.611 output=0.333 allreduce=1.246 cp_unsplit=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE label=bench-decode router=0.759 local=4.901 allreduce=2.772 nsh_in_local=3.866 ms_pos",
+      "GLM53F_MOE_PROFILE_DETAIL label=bench-decode native_total=0.000 xquant=0.000 native_tasks_wall=0.000 native_avg_busy=0.000 old_expert_loop=0.000 shared=0.000 combine=0.000 tasks_per_call=0.0 ms_pos"
+    ],
+    "benchmark-mla-tiles-pair-4-1-12331-2.156.0": [
+      "GLM53F_TARGET_PROFILE label=bench-prefill kind=scalar steps=0 ms_pos=0.000 embed=0.000 mhc=0.000 attention=0.000 ffn=0.000 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-prefill kda=0.000 sparse=0.000 dense_ffn=0.000 moe=0.000 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-prefill kind=batch calls=2 positions=8049 ms_pos=2.582 embed=0.027 mhc=0.208 attention=1.297 ffn=1.051 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-prefill kind=batch kda=0.472 sparse=0.825 dense_ffn=0.137 moe=0.914 ms_pos",
+      "GLM53F_SPARSE_PROFILE label=bench-prefill front=0.221 index=0.128 pack=0.000 mla=0.353 output=0.049 allreduce=0.181 cp_unsplit=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE label=bench-prefill router=0.134 local=0.452 allreduce=0.412 nsh_in_local=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE_DETAIL label=bench-prefill native_total=0.261 xquant=0.007 native_tasks_wall=0.248 native_avg_busy=0.234 old_expert_loop=0.002 shared=0.097 combine=0.017 tasks_per_call=27842.0 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-decode kind=scalar steps=256 ms_pos=29.667 embed=0.148 mhc=5.845 attention=14.535 ffn=8.735 head=0.404",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-decode kda=7.110 sparse=7.425 dense_ffn=0.383 moe=8.352 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-decode kind=batch calls=0 positions=0 ms_pos=0.000 embed=0.000 mhc=0.000 attention=0.000 ffn=0.000 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-decode kind=batch kda=0.000 sparse=0.000 dense_ffn=0.000 moe=0.000 ms_pos",
+      "GLM53F_SPARSE_PROFILE label=bench-decode front=1.707 index=2.223 pack=0.000 mla=2.615 output=0.326 allreduce=1.294 cp_unsplit=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE label=bench-decode router=0.762 local=4.911 allreduce=2.883 nsh_in_local=3.833 ms_pos",
+      "GLM53F_MOE_PROFILE_DETAIL label=bench-decode native_total=0.000 xquant=0.000 native_tasks_wall=0.000 native_avg_busy=0.000 old_expert_loop=0.000 shared=0.000 combine=0.000 tasks_per_call=0.0 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-prefill kind=scalar steps=0 ms_pos=0.000 embed=0.000 mhc=0.000 attention=0.000 ffn=0.000 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-prefill kda=0.000 sparse=0.000 dense_ffn=0.000 moe=0.000 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-prefill kind=batch calls=2 positions=8049 ms_pos=2.438 embed=0.024 mhc=0.207 attention=1.234 ffn=0.973 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-prefill kind=batch kda=0.469 sparse=0.765 dense_ffn=0.135 moe=0.839 ms_pos",
+      "GLM53F_SPARSE_PROFILE label=bench-prefill front=0.180 index=0.115 pack=0.000 mla=0.352 output=0.049 allreduce=0.171 cp_unsplit=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE label=bench-prefill router=0.134 local=0.396 allreduce=0.378 nsh_in_local=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE_DETAIL label=bench-prefill native_total=0.238 xquant=0.007 native_tasks_wall=0.225 native_avg_busy=0.222 old_expert_loop=0.002 shared=0.077 combine=0.018 tasks_per_call=27842.0 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-decode kind=scalar steps=256 ms_pos=29.772 embed=0.091 mhc=5.846 attention=14.587 ffn=8.849 head=0.399",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-decode kda=7.166 sparse=7.421 dense_ffn=0.390 moe=8.459 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-decode kind=batch calls=0 positions=0 ms_pos=0.000 embed=0.000 mhc=0.000 attention=0.000 ffn=0.000 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-decode kind=batch kda=0.000 sparse=0.000 dense_ffn=0.000 moe=0.000 ms_pos",
+      "GLM53F_SPARSE_PROFILE label=bench-decode front=1.692 index=2.197 pack=0.000 mla=2.614 output=0.326 allreduce=1.338 cp_unsplit=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE label=bench-decode router=0.762 local=4.906 allreduce=2.996 nsh_in_local=3.888 ms_pos",
+      "GLM53F_MOE_PROFILE_DETAIL label=bench-decode native_total=0.000 xquant=0.000 native_tasks_wall=0.000 native_avg_busy=0.000 old_expert_loop=0.000 shared=0.000 combine=0.000 tasks_per_call=0.0 ms_pos"
+    ],
+    "benchmark-mla-tiles-short-legacy-9744-2.123.0": [
+      "GLM53F_TARGET_PROFILE label=bench-prefill kind=scalar steps=0 ms_pos=0.000 embed=0.000 mhc=0.000 attention=0.000 ffn=0.000 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-prefill kda=0.000 sparse=0.000 dense_ffn=0.000 moe=0.000 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-prefill kind=batch calls=2 positions=8049 ms_pos=2.621 embed=0.027 mhc=0.207 attention=1.340 ffn=1.046 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-prefill kind=batch kda=0.473 sparse=0.868 dense_ffn=0.134 moe=0.912 ms_pos",
+      "GLM53F_SPARSE_PROFILE label=bench-prefill front=0.223 index=0.130 pack=0.000 mla=0.391 output=0.049 allreduce=0.222 cp_unsplit=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE label=bench-prefill router=0.134 local=0.451 allreduce=0.412 nsh_in_local=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE_DETAIL label=bench-prefill native_total=0.262 xquant=0.007 native_tasks_wall=0.248 native_avg_busy=0.235 old_expert_loop=0.002 shared=0.096 combine=0.017 tasks_per_call=27842.0 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-decode kind=scalar steps=128 ms_pos=29.750 embed=0.215 mhc=5.826 attention=14.536 ffn=8.748 head=0.424",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-decode kda=7.163 sparse=7.373 dense_ffn=0.392 moe=8.356 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-decode kind=batch calls=0 positions=0 ms_pos=0.000 embed=0.000 mhc=0.000 attention=0.000 ffn=0.000 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-decode kind=batch kda=0.000 sparse=0.000 dense_ffn=0.000 moe=0.000 ms_pos",
+      "GLM53F_SPARSE_PROFILE label=bench-decode front=1.709 index=2.221 pack=0.000 mla=2.612 output=0.328 allreduce=1.228 cp_unsplit=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE label=bench-decode router=0.760 local=4.953 allreduce=3.040 nsh_in_local=3.927 ms_pos",
+      "GLM53F_MOE_PROFILE_DETAIL label=bench-decode native_total=0.000 xquant=0.000 native_tasks_wall=0.000 native_avg_busy=0.000 old_expert_loop=0.000 shared=0.000 combine=0.000 tasks_per_call=0.0 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-prefill kind=scalar steps=0 ms_pos=0.000 embed=0.000 mhc=0.000 attention=0.000 ffn=0.000 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-prefill kda=0.000 sparse=0.000 dense_ffn=0.000 moe=0.000 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-prefill kind=batch calls=2 positions=8049 ms_pos=2.474 embed=0.024 mhc=0.206 attention=1.273 ffn=0.971 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-prefill kind=batch kda=0.470 sparse=0.803 dense_ffn=0.134 moe=0.837 ms_pos",
+      "GLM53F_SPARSE_PROFILE label=bench-prefill front=0.179 index=0.112 pack=0.000 mla=0.390 output=0.049 allreduce=0.213 cp_unsplit=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE label=bench-prefill router=0.134 local=0.394 allreduce=0.379 nsh_in_local=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE_DETAIL label=bench-prefill native_total=0.238 xquant=0.007 native_tasks_wall=0.225 native_avg_busy=0.222 old_expert_loop=0.002 shared=0.076 combine=0.017 tasks_per_call=27842.0 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-decode kind=scalar steps=128 ms_pos=29.558 embed=0.092 mhc=5.827 attention=14.488 ffn=8.754 head=0.397",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-decode kda=7.163 sparse=7.325 dense_ffn=0.393 moe=8.361 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-decode kind=batch calls=0 positions=0 ms_pos=0.000 embed=0.000 mhc=0.000 attention=0.000 ffn=0.000 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-decode kind=batch kda=0.000 sparse=0.000 dense_ffn=0.000 moe=0.000 ms_pos",
+      "GLM53F_SPARSE_PROFILE label=bench-decode front=1.700 index=2.191 pack=0.000 mla=2.612 output=0.329 allreduce=1.219 cp_unsplit=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE label=bench-decode router=0.759 local=4.940 allreduce=3.056 nsh_in_local=3.932 ms_pos",
+      "GLM53F_MOE_PROFILE_DETAIL label=bench-decode native_total=0.000 xquant=0.000 native_tasks_wall=0.000 native_avg_busy=0.000 old_expert_loop=0.000 shared=0.000 combine=0.000 tasks_per_call=0.0 ms_pos"
+    ],
+    "benchmark-mla-tiles-short-split6-9899-2.126.0": [
+      "GLM53F_TARGET_PROFILE label=bench-prefill kind=scalar steps=0 ms_pos=0.000 embed=0.000 mhc=0.000 attention=0.000 ffn=0.000 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-prefill kda=0.000 sparse=0.000 dense_ffn=0.000 moe=0.000 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-prefill kind=batch calls=2 positions=8049 ms_pos=2.589 embed=0.027 mhc=0.208 attention=1.294 ffn=1.059 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-prefill kind=batch kda=0.472 sparse=0.822 dense_ffn=0.133 moe=0.927 ms_pos",
+      "GLM53F_SPARSE_PROFILE label=bench-prefill front=0.224 index=0.128 pack=0.000 mla=0.352 output=0.050 allreduce=0.179 cp_unsplit=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE label=bench-prefill router=0.134 local=0.449 allreduce=0.424 nsh_in_local=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE_DETAIL label=bench-prefill native_total=0.261 xquant=0.007 native_tasks_wall=0.248 native_avg_busy=0.234 old_expert_loop=0.002 shared=0.097 combine=0.017 tasks_per_call=27842.0 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-decode kind=scalar steps=128 ms_pos=29.307 embed=0.202 mhc=5.876 attention=14.301 ffn=8.512 head=0.415",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-decode kda=6.926 sparse=7.375 dense_ffn=0.369 moe=8.143 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-decode kind=batch calls=0 positions=0 ms_pos=0.000 embed=0.000 mhc=0.000 attention=0.000 ffn=0.000 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-decode kind=batch kda=0.000 sparse=0.000 dense_ffn=0.000 moe=0.000 ms_pos",
+      "GLM53F_SPARSE_PROFILE label=bench-decode front=1.700 index=2.200 pack=0.000 mla=2.611 output=0.335 allreduce=1.255 cp_unsplit=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE label=bench-decode router=0.758 local=4.891 allreduce=2.793 nsh_in_local=3.827 ms_pos",
+      "GLM53F_MOE_PROFILE_DETAIL label=bench-decode native_total=0.000 xquant=0.000 native_tasks_wall=0.000 native_avg_busy=0.000 old_expert_loop=0.000 shared=0.000 combine=0.000 tasks_per_call=0.0 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-prefill kind=scalar steps=0 ms_pos=0.000 embed=0.000 mhc=0.000 attention=0.000 ffn=0.000 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-prefill kda=0.000 sparse=0.000 dense_ffn=0.000 moe=0.000 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-prefill kind=batch calls=2 positions=8049 ms_pos=2.436 embed=0.024 mhc=0.206 attention=1.235 ffn=0.971 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-prefill kind=batch kda=0.470 sparse=0.765 dense_ffn=0.133 moe=0.838 ms_pos",
+      "GLM53F_SPARSE_PROFILE label=bench-prefill front=0.180 index=0.114 pack=0.000 mla=0.350 output=0.050 allreduce=0.173 cp_unsplit=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE label=bench-prefill router=0.134 local=0.393 allreduce=0.380 nsh_in_local=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE_DETAIL label=bench-prefill native_total=0.240 xquant=0.007 native_tasks_wall=0.227 native_avg_busy=0.222 old_expert_loop=0.002 shared=0.076 combine=0.017 tasks_per_call=27842.0 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-decode kind=scalar steps=128 ms_pos=28.958 embed=0.090 mhc=5.867 attention=14.152 ffn=8.454 head=0.394",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-decode kda=6.910 sparse=7.242 dense_ffn=0.369 moe=8.086 ms_pos",
+      "GLM53F_TARGET_PROFILE label=bench-decode kind=batch calls=0 positions=0 ms_pos=0.000 embed=0.000 mhc=0.000 attention=0.000 ffn=0.000 head=0.000",
+      "GLM53F_TARGET_PROFILE_DETAIL label=bench-decode kind=batch kda=0.000 sparse=0.000 dense_ffn=0.000 moe=0.000 ms_pos",
+      "GLM53F_SPARSE_PROFILE label=bench-decode front=1.687 index=2.128 pack=0.000 mla=2.610 output=0.336 allreduce=1.229 cp_unsplit=0.000 ms_pos",
+      "GLM53F_MOE_PROFILE label=bench-decode router=0.758 local=4.880 allreduce=2.799 nsh_in_local=3.805 ms_pos",
+      "GLM53F_MOE_PROFILE_DETAIL label=bench-decode native_total=0.000 xquant=0.000 native_tasks_wall=0.000 native_avg_busy=0.000 old_expert_loop=0.000 shared=0.000 combine=0.000 tasks_per_call=0.0 ms_pos"
+    ]
+  },
+  "profile_order": "Within each rank0 log, warmup profiles precede the timed trial; use the last occurrence for each phase.",
+  "native": {
+    "split6": {
+      "cases_per_rank": 1584,
+      "ranks": 12,
+      "case_instances": 19008,
+      "all_logits_values_strided_guards": "BIT_EXACT",
+      "finite_checks": "IEEE exponent bits; survives fast math",
+      "head_counts": [
+        5,
+        6
+      ],
+      "strides": [
+        512,
+        768
+      ],
+      "cache_views": [
+        "rounded FP32",
+        "derived FP16"
+      ],
+      "key_orders": [
+        "ascending",
+        "descending",
+        "permuted"
+      ],
+      "key_counts": [
+        1,
+        3,
+        7,
+        15,
+        16,
+        17,
+        127,
+        128,
+        2048,
+        2051,
+        2052
+      ],
+      "timing": "maximum of12 ranks;47 different query tokens, varying selected counts2052..2006,47 OpenMP threads; five alternating tile sweeps",
+      "trials": [
+        {
+          "heads": 5,
+          "trial": 0,
+          "tile": 1,
+          "seconds": 0.22428974
+        },
+        {
+          "heads": 5,
+          "trial": 0,
+          "tile": 2,
+          "seconds": 0.00142621
+        },
+        {
+          "heads": 5,
+          "trial": 0,
+          "tile": 3,
+          "seconds": 0.001140661
+        },
+        {
+          "heads": 5,
+          "trial": 0,
+          "tile": 4,
+          "seconds": 0.001379659
+        },
+        {
+          "heads": 5,
+          "trial": 0,
+          "tile": 5,
+          "seconds": 0.00113615
+        },
+        {
+          "heads": 5,
+          "trial": 0,
+          "tile": 6,
+          "seconds": 0.00113483
+        },
+        {
+          "heads": 5,
+          "trial": 1,
+          "tile": 6,
+          "seconds": 0.0011307
+        },
+        {
+          "heads": 5,
+          "trial": 1,
+          "tile": 5,
+          "seconds": 0.00113586
+        },
+        {
+          "heads": 5,
+          "trial": 1,
+          "tile": 4,
+          "seconds": 0.00138269
+        },
+        {
+          "heads": 5,
+          "trial": 1,
+          "tile": 3,
+          "seconds": 0.00114203
+        },
+        {
+          "heads": 5,
+          "trial": 1,
+          "tile": 2,
+          "seconds": 0.00141571
+        },
+        {
+          "heads": 5,
+          "trial": 1,
+          "tile": 1,
+          "seconds": 0.00220615
+        },
+        {
+          "heads": 5,
+          "trial": 2,
+          "tile": 1,
+          "seconds": 0.00219367
+        },
+        {
+          "heads": 5,
+          "trial": 2,
+          "tile": 2,
+          "seconds": 0.0014171
+        },
+        {
+          "heads": 5,
+          "trial": 2,
+          "tile": 3,
+          "seconds": 0.00114963
+        },
+        {
+          "heads": 5,
+          "trial": 2,
+          "tile": 4,
+          "seconds": 0.00138015
+        },
+        {
+          "heads": 5,
+          "trial": 2,
+          "tile": 5,
+          "seconds": 0.0011385
+        },
+        {
+          "heads": 5,
+          "trial": 2,
+          "tile": 6,
+          "seconds": 0.0011329
+        },
+        {
+          "heads": 5,
+          "trial": 3,
+          "tile": 6,
+          "seconds": 0.00113936
+        },
+        {
+          "heads": 5,
+          "trial": 3,
+          "tile": 5,
+          "seconds": 0.0011312
+        },
+        {
+          "heads": 5,
+          "trial": 3,
+          "tile": 4,
+          "seconds": 0.001383141
+        },
+        {
+          "heads": 5,
+          "trial": 3,
+          "tile": 3,
+          "seconds": 0.00113915
+        },
+        {
+          "heads": 5,
+          "trial": 3,
+          "tile": 2,
+          "seconds": 0.001422049
+        },
+        {
+          "heads": 5,
+          "trial": 3,
+          "tile": 1,
+          "seconds": 0.00221041
+        },
+        {
+          "heads": 5,
+          "trial": 4,
+          "tile": 1,
+          "seconds": 0.00222007
+        },
+        {
+          "heads": 5,
+          "trial": 4,
+          "tile": 2,
+          "seconds": 0.00141296
+        },
+        {
+          "heads": 5,
+          "trial": 4,
+          "tile": 3,
+          "seconds": 0.00113675
+        },
+        {
+          "heads": 5,
+          "trial": 4,
+          "tile": 4,
+          "seconds": 0.001391079
+        },
+        {
+          "heads": 5,
+          "trial": 4,
+          "tile": 5,
+          "seconds": 0.00113404
+        },
+        {
+          "heads": 5,
+          "trial": 4,
+          "tile": 6,
+          "seconds": 0.00113309
+        },
+        {
+          "heads": 6,
+          "trial": 0,
+          "tile": 1,
+          "seconds": 0.00264735
+        },
+        {
+          "heads": 6,
+          "trial": 0,
+          "tile": 2,
+          "seconds": 0.001474461
+        },
+        {
+          "heads": 6,
+          "trial": 0,
+          "tile": 3,
+          "seconds": 0.00129642
+        },
+        {
+          "heads": 6,
+          "trial": 0,
+          "tile": 4,
+          "seconds": 0.00142244
+        },
+        {
+          "heads": 6,
+          "trial": 0,
+          "tile": 5,
+          "seconds": 0.00156079
+        },
+        {
+          "heads": 6,
+          "trial": 0,
+          "tile": 6,
+          "seconds": 0.00147854
+        },
+        {
+          "heads": 6,
+          "trial": 1,
+          "tile": 6,
+          "seconds": 0.00147724
+        },
+        {
+          "heads": 6,
+          "trial": 1,
+          "tile": 5,
+          "seconds": 0.0015727
+        },
+        {
+          "heads": 6,
+          "trial": 1,
+          "tile": 4,
+          "seconds": 0.00143797
+        },
+        {
+          "heads": 6,
+          "trial": 1,
+          "tile": 3,
+          "seconds": 0.0012926
+        },
+        {
+          "heads": 6,
+          "trial": 1,
+          "tile": 2,
+          "seconds": 0.00148141
+        },
+        {
+          "heads": 6,
+          "trial": 1,
+          "tile": 1,
+          "seconds": 0.00264031
+        },
+        {
+          "heads": 6,
+          "trial": 2,
+          "tile": 1,
+          "seconds": 0.0026325
+        },
+        {
+          "heads": 6,
+          "trial": 2,
+          "tile": 2,
+          "seconds": 0.001467641
+        },
+        {
+          "heads": 6,
+          "trial": 2,
+          "tile": 3,
+          "seconds": 0.00129464
+        },
+        {
+          "heads": 6,
+          "trial": 2,
+          "tile": 4,
+          "seconds": 0.0014273
+        },
+        {
+          "heads": 6,
+          "trial": 2,
+          "tile": 5,
+          "seconds": 0.00157417
+        },
+        {
+          "heads": 6,
+          "trial": 2,
+          "tile": 6,
+          "seconds": 0.00148446
+        },
+        {
+          "heads": 6,
+          "trial": 3,
+          "tile": 6,
+          "seconds": 0.00148011
+        },
+        {
+          "heads": 6,
+          "trial": 3,
+          "tile": 5,
+          "seconds": 0.00157393
+        },
+        {
+          "heads": 6,
+          "trial": 3,
+          "tile": 4,
+          "seconds": 0.00142092
+        },
+        {
+          "heads": 6,
+          "trial": 3,
+          "tile": 3,
+          "seconds": 0.00129963
+        },
+        {
+          "heads": 6,
+          "trial": 3,
+          "tile": 2,
+          "seconds": 0.00146383
+        },
+        {
+          "heads": 6,
+          "trial": 3,
+          "tile": 1,
+          "seconds": 0.00264342
+        },
+        {
+          "heads": 6,
+          "trial": 4,
+          "tile": 1,
+          "seconds": 0.00263723
+        },
+        {
+          "heads": 6,
+          "trial": 4,
+          "tile": 2,
+          "seconds": 0.00146604
+        },
+        {
+          "heads": 6,
+          "trial": 4,
+          "tile": 3,
+          "seconds": 0.001298849
+        },
+        {
+          "heads": 6,
+          "trial": 4,
+          "tile": 4,
+          "seconds": 0.001424991
+        },
+        {
+          "heads": 6,
+          "trial": 4,
+          "tile": 5,
+          "seconds": 0.00157868
+        },
+        {
+          "heads": 6,
+          "trial": 4,
+          "tile": 6,
+          "seconds": 0.00148638
+        }
+      ],
+      "six_head_paired_ratios": [
+        1.140479165702473,
+        1.1428438805508279,
+        1.14661990978187,
+        1.1388702938528659,
+        1.1443824493840316
+      ],
+      "six_head_median_ratio": 1.1428438805508279,
+      "log_sha256": "f16fbf1176e0eaff17132fe4f1211825e2c02b4101e5d5c9dea982acabbe3458"
+    },
+    "values32": {
+      "cases_per_rank": 1848,
+      "ranks": 12,
+      "case_instances": 22176,
+      "all_logits_values_strided_guards": "BIT_EXACT",
+      "finite_checks": "IEEE exponent bits; survives fast math",
+      "head_counts": [
+        5,
+        6
+      ],
+      "strides": [
+        512,
+        768
+      ],
+      "cache_views": [
+        "rounded FP32",
+        "derived FP16"
+      ],
+      "key_orders": [
+        "ascending",
+        "descending",
+        "permuted"
+      ],
+      "key_counts": [
+        1,
+        3,
+        7,
+        15,
+        16,
+        17,
+        127,
+        128,
+        2048,
+        2051,
+        2052
+      ],
+      "timing": "maximum of12 ranks;47 different query tokens, varying selected counts2052..2006,47 OpenMP threads; five alternating tile sweeps",
+      "trials": [
+        {
+          "heads": 5,
+          "trial": 0,
+          "tile": 1,
+          "seconds": 0.24382446
+        },
+        {
+          "heads": 5,
+          "trial": 0,
+          "tile": 2,
+          "seconds": 0.00141545
+        },
+        {
+          "heads": 5,
+          "trial": 0,
+          "tile": 3,
+          "seconds": 0.001139509
+        },
+        {
+          "heads": 5,
+          "trial": 0,
+          "tile": 4,
+          "seconds": 0.00136325
+        },
+        {
+          "heads": 5,
+          "trial": 0,
+          "tile": 5,
+          "seconds": 0.00112826
+        },
+        {
+          "heads": 5,
+          "trial": 0,
+          "tile": 6,
+          "seconds": 0.00113459
+        },
+        {
+          "heads": 5,
+          "trial": 0,
+          "tile": 7,
+          "seconds": 0.00112938
+        },
+        {
+          "heads": 5,
+          "trial": 1,
+          "tile": 7,
+          "seconds": 0.00113016
+        },
+        {
+          "heads": 5,
+          "trial": 1,
+          "tile": 6,
+          "seconds": 0.00113278
+        },
+        {
+          "heads": 5,
+          "trial": 1,
+          "tile": 5,
+          "seconds": 0.00112824
+        },
+        {
+          "heads": 5,
+          "trial": 1,
+          "tile": 4,
+          "seconds": 0.00135829
+        },
+        {
+          "heads": 5,
+          "trial": 1,
+          "tile": 3,
+          "seconds": 0.0011222
+        },
+        {
+          "heads": 5,
+          "trial": 1,
+          "tile": 2,
+          "seconds": 0.00140568
+        },
+        {
+          "heads": 5,
+          "trial": 1,
+          "tile": 1,
+          "seconds": 0.00215462
+        },
+        {
+          "heads": 5,
+          "trial": 2,
+          "tile": 1,
+          "seconds": 0.00214649
+        },
+        {
+          "heads": 5,
+          "trial": 2,
+          "tile": 2,
+          "seconds": 0.0014029
+        },
+        {
+          "heads": 5,
+          "trial": 2,
+          "tile": 3,
+          "seconds": 0.00113309
+        },
+        {
+          "heads": 5,
+          "trial": 2,
+          "tile": 4,
+          "seconds": 0.00136235
+        },
+        {
+          "heads": 5,
+          "trial": 2,
+          "tile": 5,
+          "seconds": 0.00112227
+        },
+        {
+          "heads": 5,
+          "trial": 2,
+          "tile": 6,
+          "seconds": 0.001139681
+        },
+        {
+          "heads": 5,
+          "trial": 2,
+          "tile": 7,
+          "seconds": 0.00113211
+        },
+        {
+          "heads": 5,
+          "trial": 3,
+          "tile": 7,
+          "seconds": 0.00113227
+        },
+        {
+          "heads": 5,
+          "trial": 3,
+          "tile": 6,
+          "seconds": 0.00113428
+        },
+        {
+          "heads": 5,
+          "trial": 3,
+          "tile": 5,
+          "seconds": 0.00113037
+        },
+        {
+          "heads": 5,
+          "trial": 3,
+          "tile": 4,
+          "seconds": 0.001359209
+        },
+        {
+          "heads": 5,
+          "trial": 3,
+          "tile": 3,
+          "seconds": 0.00112741
+        },
+        {
+          "heads": 5,
+          "trial": 3,
+          "tile": 2,
+          "seconds": 0.001403959
+        },
+        {
+          "heads": 5,
+          "trial": 3,
+          "tile": 1,
+          "seconds": 0.00214504
+        },
+        {
+          "heads": 5,
+          "trial": 4,
+          "tile": 1,
+          "seconds": 0.00214695
+        },
+        {
+          "heads": 5,
+          "trial": 4,
+          "tile": 2,
+          "seconds": 0.001404289
+        },
+        {
+          "heads": 5,
+          "trial": 4,
+          "tile": 3,
+          "seconds": 0.00112957
+        },
+        {
+          "heads": 5,
+          "trial": 4,
+          "tile": 4,
+          "seconds": 0.00136294
+        },
+        {
+          "heads": 5,
+          "trial": 4,
+          "tile": 5,
+          "seconds": 0.00112748
+        },
+        {
+          "heads": 5,
+          "trial": 4,
+          "tile": 6,
+          "seconds": 0.001137311
+        },
+        {
+          "heads": 5,
+          "trial": 4,
+          "tile": 7,
+          "seconds": 0.00112413
+        },
+        {
+          "heads": 6,
+          "trial": 0,
+          "tile": 1,
+          "seconds": 0.00257166
+        },
+        {
+          "heads": 6,
+          "trial": 0,
+          "tile": 2,
+          "seconds": 0.00145666
+        },
+        {
+          "heads": 6,
+          "trial": 0,
+          "tile": 3,
+          "seconds": 0.00128403
+        },
+        {
+          "heads": 6,
+          "trial": 0,
+          "tile": 4,
+          "seconds": 0.00141576
+        },
+        {
+          "heads": 6,
+          "trial": 0,
+          "tile": 5,
+          "seconds": 0.00155265
+        },
+        {
+          "heads": 6,
+          "trial": 0,
+          "tile": 6,
+          "seconds": 0.001472981
+        },
+        {
+          "heads": 6,
+          "trial": 0,
+          "tile": 7,
+          "seconds": 0.001447961
+        },
+        {
+          "heads": 6,
+          "trial": 1,
+          "tile": 7,
+          "seconds": 0.00144615
+        },
+        {
+          "heads": 6,
+          "trial": 1,
+          "tile": 6,
+          "seconds": 0.00148253
+        },
+        {
+          "heads": 6,
+          "trial": 1,
+          "tile": 5,
+          "seconds": 0.001546269
+        },
+        {
+          "heads": 6,
+          "trial": 1,
+          "tile": 4,
+          "seconds": 0.0014181
+        },
+        {
+          "heads": 6,
+          "trial": 1,
+          "tile": 3,
+          "seconds": 0.00128451
+        },
+        {
+          "heads": 6,
+          "trial": 1,
+          "tile": 2,
+          "seconds": 0.00145966
+        },
+        {
+          "heads": 6,
+          "trial": 1,
+          "tile": 1,
+          "seconds": 0.002583509
+        },
+        {
+          "heads": 6,
+          "trial": 2,
+          "tile": 1,
+          "seconds": 0.002571809
+        },
+        {
+          "heads": 6,
+          "trial": 2,
+          "tile": 2,
+          "seconds": 0.00146593
+        },
+        {
+          "heads": 6,
+          "trial": 2,
+          "tile": 3,
+          "seconds": 0.00128307
+        },
+        {
+          "heads": 6,
+          "trial": 2,
+          "tile": 4,
+          "seconds": 0.00142362
+        },
+        {
+          "heads": 6,
+          "trial": 2,
+          "tile": 5,
+          "seconds": 0.00154711
+        },
+        {
+          "heads": 6,
+          "trial": 2,
+          "tile": 6,
+          "seconds": 0.001473189
+        },
+        {
+          "heads": 6,
+          "trial": 2,
+          "tile": 7,
+          "seconds": 0.00144159
+        },
+        {
+          "heads": 6,
+          "trial": 3,
+          "tile": 7,
+          "seconds": 0.00144296
+        },
+        {
+          "heads": 6,
+          "trial": 3,
+          "tile": 6,
+          "seconds": 0.00146855
+        },
+        {
+          "heads": 6,
+          "trial": 3,
+          "tile": 5,
+          "seconds": 0.00155074
+        },
+        {
+          "heads": 6,
+          "trial": 3,
+          "tile": 4,
+          "seconds": 0.00141149
+        },
+        {
+          "heads": 6,
+          "trial": 3,
+          "tile": 3,
+          "seconds": 0.00128167
+        },
+        {
+          "heads": 6,
+          "trial": 3,
+          "tile": 2,
+          "seconds": 0.001466449
+        },
+        {
+          "heads": 6,
+          "trial": 3,
+          "tile": 1,
+          "seconds": 0.00256924
+        },
+        {
+          "heads": 6,
+          "trial": 4,
+          "tile": 1,
+          "seconds": 0.00257343
+        },
+        {
+          "heads": 6,
+          "trial": 4,
+          "tile": 2,
+          "seconds": 0.001473621
+        },
+        {
+          "heads": 6,
+          "trial": 4,
+          "tile": 3,
+          "seconds": 0.00128267
+        },
+        {
+          "heads": 6,
+          "trial": 4,
+          "tile": 4,
+          "seconds": 0.00141605
+        },
+        {
+          "heads": 6,
+          "trial": 4,
+          "tile": 5,
+          "seconds": 0.00155312
+        },
+        {
+          "heads": 6,
+          "trial": 4,
+          "tile": 6,
+          "seconds": 0.00146697
+        },
+        {
+          "heads": 6,
+          "trial": 4,
+          "tile": 7,
+          "seconds": 0.001441499
+        }
+      ],
+      "six_head_paired_ratios": [
+        1.0172794709249766,
+        1.0251564498841752,
+        1.0219195471666702,
+        1.0177343793313745,
+        1.0176698006727718
+      ],
+      "six_head_median_ratio": 1.0177343793313745,
+      "log_sha256": "2f62df109c985702856a552beb093757ee2a11a2b27eb90f2893c457eef813cf"
+    }
+  },
+  "final_fixture_v5": {
+    "change_from_v4": "indentation only; per-line non-leading bytes verified identical",
+    "source_sha256": "3d7f719c7918e51912f867495e87837703558e4bd7ea0556db071717f69649f1",
+    "remote_sha256": "3d7f719c7918e51912f867495e87837703558e4bd7ea0556db071717f69649f1  test_glm53f_mla_head_tiles.c\n8346fbba0db632cc4db4477cf48c675e1e2cdb857a09b8c4e130aa389d5fdc38  build/candidate-mla-head-fixture-v5/test_glm53f_mla_head_tiles\n",
+    "log_sha256": "39799084b271249ced0619e9b1409f9a553c6a36ae9b0b6d395099eeb294f014",
+    "cases_per_rank": 1848,
+    "ranks": 12,
+    "status": "BIT_EXACT PASS"
+  },
+  "assembly_observation": {
+    "legacy_values_lines_59_80": 181,
+    "values32_lines_142_168": 7,
+    "assembly_sha256": "74932d0a63a39e5bf2b1db71b10ce2d3622250cb5ddd0e4b1506b786d3674843",
+    "caveat": "Static instructions attributed by debug source lines; legacy includes all1..6 specializations, values32 onlysix. These counts are not dynamic traffic or full-model speedups."
+  },
+  "model": {
+    "results": {
+      "status": "paired_model_complete",
+      "promoted": false,
+      "targets_met": false,
+      "allocation": 52128881,
+      "prefill_includes_mtp_teacher_forcing": false,
+      "screens": {},
+      "confirmation": [],
+      "native_gates": true,
+      "binary_sha256": {
+        "frozen": "938d7b7c7a41aa6c2b9c2a51aecee897a2b423430b4eaf0de4ccddc335db4ec5",
+        "candidate": "1401d88a65f7e3c6871feda40b6ec4647018abe3320e0d9247e92f7969cc486a"
+      },
+      "comparison": "same candidate binary legacy versus six-head 3+3 prefill; all other options identical",
+      "pairs": [
+        {
+          "pair": 0,
+          "prefill": 1.0170894123540455,
+          "decode": 1.0281974777605207
+        },
+        {
+          "pair": 1,
+          "prefill": 1.017121388728433,
+          "decode": 1.0164640564146465
+        },
+        {
+          "pair": 2,
+          "prefill": 1.0160914218649473,
+          "decode": 1.000828496317947
+        },
+        {
+          "pair": 3,
+          "prefill": 1.017499847578506,
+          "decode": 0.9863799889814209
+        },
+        {
+          "pair": 4,
+          "prefill": 1.0153646398952338,
+          "decode": 0.9860692733410527
+        }
+      ],
+      "runs": {
+        "frozen-reference": {
+          "prefill": 412.574268,
+          "decode": 34.808562,
+          "trials": [
+            {
+              "trial": 0,
+              "prompt_tokens": 8049,
+              "decode_transitions": 256,
+              "prefill_seconds": 19.509214743,
+              "decode_seconds": 7.354512423,
+              "prefill_tok_s": 412.574268,
+              "decode_tok_s": 34.808562,
+              "minimum_available_kb": 9317376,
+              "tokens_equal": true
+            }
+          ],
+          "variant": null,
+          "mtp_stats": [],
+          "lookup_stats": [
+            {
+              "trial": 0,
+              "lookup": 0,
+              "depth": 4,
+              "adaptive": 1,
+              "accepted": 0,
+              "proposed": 0,
+              "cycles": 0,
+              "fallback_tokens": 0,
+              "lookup_seconds": 0.0,
+              "verify_seconds": 0.0,
+              "rollback_seconds": 0.0,
+              "plain_seconds": 0.0
+            }
+          ],
+          "output_id_count": 257,
+          "output_ids_sha256": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da",
+          "command": {
+            "argv": [
+              "bash",
+              "a64fx/glm5/run_glm53f_12n.sh",
+              "benchmark",
+              "tmp/prompt8k.ids",
+              "/vol0006/mdt0/data/hp250467/work/gemm/glm53f-strata-20261001/tmp/strata-mla-head-tiles-20261003/results/frozen-reference.ids",
+              "--prefill-chunk",
+              "4096",
+              "--transitions",
+              "256",
+              "--repetitions",
+              "1",
+              "--decode-executor",
+              "persistent",
+              "--router-kernel",
+              "fused",
+              "--verify-kernel",
+              "grouped",
+              "--moe-combine-kernel",
+              "vector",
+              "--index-kernel",
+              "heads",
+              "--mla-kernel",
+              "fp16-cache",
+              "--pool-selector",
+              "partition4k",
+              "--q8-row-kernel",
+              "rows4",
+              "--q8-prefill-kernel",
+              "tile4x4",
+              "--mla-projection-kernel",
+              "legacy"
+            ],
+            "variant": null,
+            "state": false,
+            "baseline": true
+          }
+        },
+        "short-legacy": {
+          "prefill": 406.979434,
+          "decode": 34.241443,
+          "trials": [
+            {
+              "trial": 0,
+              "prompt_tokens": 8049,
+              "decode_transitions": 128,
+              "prefill_seconds": 19.777412144,
+              "decode_seconds": 3.738160244,
+              "prefill_tok_s": 406.979434,
+              "decode_tok_s": 34.241443,
+              "minimum_available_kb": 9354048,
+              "tokens_equal": true
+            }
+          ],
+          "variant": null,
+          "mtp_stats": [],
+          "lookup_stats": [
+            {
+              "trial": 0,
+              "lookup": 0,
+              "depth": 4,
+              "adaptive": 1,
+              "accepted": 0,
+              "proposed": 0,
+              "cycles": 0,
+              "fallback_tokens": 0,
+              "lookup_seconds": 0.0,
+              "verify_seconds": 0.0,
+              "rollback_seconds": 0.0,
+              "plain_seconds": 0.0
+            }
+          ],
+          "output_id_count": 129,
+          "output_ids_sha256": "d7090eb8a28046417fc662dc19c34f326c59e22f383d7e9131ca922230363b72",
+          "command": {
+            "argv": [
+              "bash",
+              "a64fx/glm5/run_glm53f_12n.sh",
+              "benchmark",
+              "tmp/prompt8k.ids",
+              "/vol0006/mdt0/data/hp250467/work/gemm/glm53f-strata-20261001/tmp/strata-mla-head-tiles-20261003/results/short-legacy.ids",
+              "--prefill-chunk",
+              "4096",
+              "--transitions",
+              "128",
+              "--repetitions",
+              "1",
+              "--decode-executor",
+              "persistent",
+              "--router-kernel",
+              "fused",
+              "--verify-kernel",
+              "grouped",
+              "--moe-combine-kernel",
+              "vector",
+              "--index-kernel",
+              "heads",
+              "--mla-kernel",
+              "fp16-cache",
+              "--pool-selector",
+              "partition4k",
+              "--q8-row-kernel",
+              "rows4",
+              "--q8-prefill-kernel",
+              "tile4x4",
+              "--mla-projection-kernel",
+              "legacy",
+              "--embedding-batch-kernel",
+              "packed",
+              "--verify-head-kernel",
+              "legacy",
+              "--decode-state-check",
+              "/vol0006/mdt0/data/hp250467/work/gemm/glm53f-strata-20261001/tmp/strata-mla-head-tiles-20261003/results/short-legacy.state"
+            ],
+            "variant": null,
+            "state": true,
+            "baseline": false
+          }
+        },
+        "short-split6": {
+          "prefill": 413.522996,
+          "decode": 34.381027,
+          "trials": [
+            {
+              "trial": 0,
+              "prompt_tokens": 8049,
+              "decode_transitions": 128,
+              "prefill_seconds": 19.46445563,
+              "decode_seconds": 3.722983595,
+              "prefill_tok_s": 413.522996,
+              "decode_tok_s": 34.381027,
+              "minimum_available_kb": 9313088,
+              "tokens_equal": true
+            }
+          ],
+          "variant": {
+            "split6": true
+          },
+          "mtp_stats": [],
+          "lookup_stats": [
+            {
+              "trial": 0,
+              "lookup": 0,
+              "depth": 4,
+              "adaptive": 1,
+              "accepted": 0,
+              "proposed": 0,
+              "cycles": 0,
+              "fallback_tokens": 0,
+              "lookup_seconds": 0.0,
+              "verify_seconds": 0.0,
+              "rollback_seconds": 0.0,
+              "plain_seconds": 0.0
+            }
+          ],
+          "output_id_count": 129,
+          "output_ids_sha256": "d7090eb8a28046417fc662dc19c34f326c59e22f383d7e9131ca922230363b72",
+          "command": {
+            "argv": [
+              "bash",
+              "a64fx/glm5/run_glm53f_12n.sh",
+              "benchmark",
+              "tmp/prompt8k.ids",
+              "/vol0006/mdt0/data/hp250467/work/gemm/glm53f-strata-20261001/tmp/strata-mla-head-tiles-20261003/results/short-split6.ids",
+              "--prefill-chunk",
+              "4096",
+              "--transitions",
+              "128",
+              "--repetitions",
+              "1",
+              "--decode-executor",
+              "persistent",
+              "--router-kernel",
+              "fused",
+              "--verify-kernel",
+              "grouped",
+              "--moe-combine-kernel",
+              "vector",
+              "--index-kernel",
+              "heads",
+              "--mla-kernel",
+              "fp16-cache",
+              "--pool-selector",
+              "partition4k",
+              "--q8-row-kernel",
+              "rows4",
+              "--q8-prefill-kernel",
+              "tile4x4",
+              "--mla-projection-kernel",
+              "legacy",
+              "--embedding-batch-kernel",
+              "packed",
+              "--verify-head-kernel",
+              "legacy",
+              "--mla-prefill-heads",
+              "split6",
+              "--decode-state-check",
+              "/vol0006/mdt0/data/hp250467/work/gemm/glm53f-strata-20261001/tmp/strata-mla-head-tiles-20261003/results/short-split6.state"
+            ],
+            "variant": {
+              "split6": true
+            },
+            "state": true,
+            "baseline": false
+          }
+        },
+        "pair-0-0": {
+          "prefill": 406.205366,
+          "decode": 33.642087,
+          "trials": [
+            {
+              "trial": 0,
+              "prompt_tokens": 8049,
+              "decode_transitions": 256,
+              "prefill_seconds": 19.815100109,
+              "decode_seconds": 7.609516058,
+              "prefill_tok_s": 406.205366,
+              "decode_tok_s": 33.642087,
+              "minimum_available_kb": 9309504,
+              "tokens_equal": true
+            }
+          ],
+          "variant": null,
+          "mtp_stats": [],
+          "lookup_stats": [
+            {
+              "trial": 0,
+              "lookup": 0,
+              "depth": 4,
+              "adaptive": 1,
+              "accepted": 0,
+              "proposed": 0,
+              "cycles": 0,
+              "fallback_tokens": 0,
+              "lookup_seconds": 0.0,
+              "verify_seconds": 0.0,
+              "rollback_seconds": 0.0,
+              "plain_seconds": 0.0
+            }
+          ],
+          "output_id_count": 257,
+          "output_ids_sha256": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da",
+          "command": {
+            "argv": [
+              "bash",
+              "a64fx/glm5/run_glm53f_12n.sh",
+              "benchmark",
+              "tmp/prompt8k.ids",
+              "/vol0006/mdt0/data/hp250467/work/gemm/glm53f-strata-20261001/tmp/strata-mla-head-tiles-20261003/results/pair-0-0.ids",
+              "--prefill-chunk",
+              "4096",
+              "--transitions",
+              "256",
+              "--repetitions",
+              "1",
+              "--decode-executor",
+              "persistent",
+              "--router-kernel",
+              "fused",
+              "--verify-kernel",
+              "grouped",
+              "--moe-combine-kernel",
+              "vector",
+              "--index-kernel",
+              "heads",
+              "--mla-kernel",
+              "fp16-cache",
+              "--pool-selector",
+              "partition4k",
+              "--q8-row-kernel",
+              "rows4",
+              "--q8-prefill-kernel",
+              "tile4x4",
+              "--mla-projection-kernel",
+              "legacy",
+              "--embedding-batch-kernel",
+              "packed",
+              "--verify-head-kernel",
+              "legacy"
+            ],
+            "variant": null,
+            "state": false,
+            "baseline": false
+          }
+        },
+        "pair-0-1": {
+          "prefill": 413.147177,
+          "decode": 34.590709,
+          "trials": [
+            {
+              "trial": 0,
+              "prompt_tokens": 8049,
+              "decode_transitions": 256,
+              "prefill_seconds": 19.482161435,
+              "decode_seconds": 7.40083129,
+              "prefill_tok_s": 413.147177,
+              "decode_tok_s": 34.590709,
+              "minimum_available_kb": 9323008,
+              "tokens_equal": true
+            }
+          ],
+          "variant": {
+            "split6": true
+          },
+          "mtp_stats": [],
+          "lookup_stats": [
+            {
+              "trial": 0,
+              "lookup": 0,
+              "depth": 4,
+              "adaptive": 1,
+              "accepted": 0,
+              "proposed": 0,
+              "cycles": 0,
+              "fallback_tokens": 0,
+              "lookup_seconds": 0.0,
+              "verify_seconds": 0.0,
+              "rollback_seconds": 0.0,
+              "plain_seconds": 0.0
+            }
+          ],
+          "output_id_count": 257,
+          "output_ids_sha256": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da",
+          "command": {
+            "argv": [
+              "bash",
+              "a64fx/glm5/run_glm53f_12n.sh",
+              "benchmark",
+              "tmp/prompt8k.ids",
+              "/vol0006/mdt0/data/hp250467/work/gemm/glm53f-strata-20261001/tmp/strata-mla-head-tiles-20261003/results/pair-0-1.ids",
+              "--prefill-chunk",
+              "4096",
+              "--transitions",
+              "256",
+              "--repetitions",
+              "1",
+              "--decode-executor",
+              "persistent",
+              "--router-kernel",
+              "fused",
+              "--verify-kernel",
+              "grouped",
+              "--moe-combine-kernel",
+              "vector",
+              "--index-kernel",
+              "heads",
+              "--mla-kernel",
+              "fp16-cache",
+              "--pool-selector",
+              "partition4k",
+              "--q8-row-kernel",
+              "rows4",
+              "--q8-prefill-kernel",
+              "tile4x4",
+              "--mla-projection-kernel",
+              "legacy",
+              "--embedding-batch-kernel",
+              "packed",
+              "--verify-head-kernel",
+              "legacy",
+              "--mla-prefill-heads",
+              "split6"
+            ],
+            "variant": {
+              "split6": true
+            },
+            "state": false,
+            "baseline": false
+          }
+        },
+        "pair-1-1": {
+          "prefill": 414.051027,
+          "decode": 34.316719,
+          "trials": [
+            {
+              "trial": 0,
+              "prompt_tokens": 8049,
+              "decode_transitions": 256,
+              "prefill_seconds": 19.439632967,
+              "decode_seconds": 7.459920671,
+              "prefill_tok_s": 414.051027,
+              "decode_tok_s": 34.316719,
+              "minimum_available_kb": 9313152,
+              "tokens_equal": true
+            }
+          ],
+          "variant": {
+            "split6": true
+          },
+          "mtp_stats": [],
+          "lookup_stats": [
+            {
+              "trial": 0,
+              "lookup": 0,
+              "depth": 4,
+              "adaptive": 1,
+              "accepted": 0,
+              "proposed": 0,
+              "cycles": 0,
+              "fallback_tokens": 0,
+              "lookup_seconds": 0.0,
+              "verify_seconds": 0.0,
+              "rollback_seconds": 0.0,
+              "plain_seconds": 0.0
+            }
+          ],
+          "output_id_count": 257,
+          "output_ids_sha256": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da",
+          "command": {
+            "argv": [
+              "bash",
+              "a64fx/glm5/run_glm53f_12n.sh",
+              "benchmark",
+              "tmp/prompt8k.ids",
+              "/vol0006/mdt0/data/hp250467/work/gemm/glm53f-strata-20261001/tmp/strata-mla-head-tiles-20261003/results/pair-1-1.ids",
+              "--prefill-chunk",
+              "4096",
+              "--transitions",
+              "256",
+              "--repetitions",
+              "1",
+              "--decode-executor",
+              "persistent",
+              "--router-kernel",
+              "fused",
+              "--verify-kernel",
+              "grouped",
+              "--moe-combine-kernel",
+              "vector",
+              "--index-kernel",
+              "heads",
+              "--mla-kernel",
+              "fp16-cache",
+              "--pool-selector",
+              "partition4k",
+              "--q8-row-kernel",
+              "rows4",
+              "--q8-prefill-kernel",
+              "tile4x4",
+              "--mla-projection-kernel",
+              "legacy",
+              "--embedding-batch-kernel",
+              "packed",
+              "--verify-head-kernel",
+              "legacy",
+              "--mla-prefill-heads",
+              "split6"
+            ],
+            "variant": {
+              "split6": true
+            },
+            "state": false,
+            "baseline": false
+          }
+        },
+        "pair-1-0": {
+          "prefill": 407.081231,
+          "decode": 33.760878,
+          "trials": [
+            {
+              "trial": 0,
+              "prompt_tokens": 8049,
+              "decode_transitions": 256,
+              "prefill_seconds": 19.772466489,
+              "decode_seconds": 7.582741168,
+              "prefill_tok_s": 407.081231,
+              "decode_tok_s": 33.760878,
+              "minimum_available_kb": 9302336,
+              "tokens_equal": true
+            }
+          ],
+          "variant": null,
+          "mtp_stats": [],
+          "lookup_stats": [
+            {
+              "trial": 0,
+              "lookup": 0,
+              "depth": 4,
+              "adaptive": 1,
+              "accepted": 0,
+              "proposed": 0,
+              "cycles": 0,
+              "fallback_tokens": 0,
+              "lookup_seconds": 0.0,
+              "verify_seconds": 0.0,
+              "rollback_seconds": 0.0,
+              "plain_seconds": 0.0
+            }
+          ],
+          "output_id_count": 257,
+          "output_ids_sha256": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da",
+          "command": {
+            "argv": [
+              "bash",
+              "a64fx/glm5/run_glm53f_12n.sh",
+              "benchmark",
+              "tmp/prompt8k.ids",
+              "/vol0006/mdt0/data/hp250467/work/gemm/glm53f-strata-20261001/tmp/strata-mla-head-tiles-20261003/results/pair-1-0.ids",
+              "--prefill-chunk",
+              "4096",
+              "--transitions",
+              "256",
+              "--repetitions",
+              "1",
+              "--decode-executor",
+              "persistent",
+              "--router-kernel",
+              "fused",
+              "--verify-kernel",
+              "grouped",
+              "--moe-combine-kernel",
+              "vector",
+              "--index-kernel",
+              "heads",
+              "--mla-kernel",
+              "fp16-cache",
+              "--pool-selector",
+              "partition4k",
+              "--q8-row-kernel",
+              "rows4",
+              "--q8-prefill-kernel",
+              "tile4x4",
+              "--mla-projection-kernel",
+              "legacy",
+              "--embedding-batch-kernel",
+              "packed",
+              "--verify-head-kernel",
+              "legacy"
+            ],
+            "variant": null,
+            "state": false,
+            "baseline": false
+          }
+        },
+        "pair-2-0": {
+          "prefill": 407.091061,
+          "decode": 34.181202,
+          "trials": [
+            {
+              "trial": 0,
+              "prompt_tokens": 8049,
+              "decode_transitions": 256,
+              "prefill_seconds": 19.771989036,
+              "decode_seconds": 7.489496809,
+              "prefill_tok_s": 407.091061,
+              "decode_tok_s": 34.181202,
+              "minimum_available_kb": 9361216,
+              "tokens_equal": true
+            }
+          ],
+          "variant": null,
+          "mtp_stats": [],
+          "lookup_stats": [
+            {
+              "trial": 0,
+              "lookup": 0,
+              "depth": 4,
+              "adaptive": 1,
+              "accepted": 0,
+              "proposed": 0,
+              "cycles": 0,
+              "fallback_tokens": 0,
+              "lookup_seconds": 0.0,
+              "verify_seconds": 0.0,
+              "rollback_seconds": 0.0,
+              "plain_seconds": 0.0
+            }
+          ],
+          "output_id_count": 257,
+          "output_ids_sha256": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da",
+          "command": {
+            "argv": [
+              "bash",
+              "a64fx/glm5/run_glm53f_12n.sh",
+              "benchmark",
+              "tmp/prompt8k.ids",
+              "/vol0006/mdt0/data/hp250467/work/gemm/glm53f-strata-20261001/tmp/strata-mla-head-tiles-20261003/results/pair-2-0.ids",
+              "--prefill-chunk",
+              "4096",
+              "--transitions",
+              "256",
+              "--repetitions",
+              "1",
+              "--decode-executor",
+              "persistent",
+              "--router-kernel",
+              "fused",
+              "--verify-kernel",
+              "grouped",
+              "--moe-combine-kernel",
+              "vector",
+              "--index-kernel",
+              "heads",
+              "--mla-kernel",
+              "fp16-cache",
+              "--pool-selector",
+              "partition4k",
+              "--q8-row-kernel",
+              "rows4",
+              "--q8-prefill-kernel",
+              "tile4x4",
+              "--mla-projection-kernel",
+              "legacy",
+              "--embedding-batch-kernel",
+              "packed",
+              "--verify-head-kernel",
+              "legacy"
+            ],
+            "variant": null,
+            "state": false,
+            "baseline": false
+          }
+        },
+        "pair-2-1": {
+          "prefill": 413.641735,
+          "decode": 34.209521,
+          "trials": [
+            {
+              "trial": 0,
+              "prompt_tokens": 8049,
+              "decode_transitions": 256,
+              "prefill_seconds": 19.458868215,
+              "decode_seconds": 7.483296871,
+              "prefill_tok_s": 413.641735,
+              "decode_tok_s": 34.209521,
+              "minimum_available_kb": 9341312,
+              "tokens_equal": true
+            }
+          ],
+          "variant": {
+            "split6": true
+          },
+          "mtp_stats": [],
+          "lookup_stats": [
+            {
+              "trial": 0,
+              "lookup": 0,
+              "depth": 4,
+              "adaptive": 1,
+              "accepted": 0,
+              "proposed": 0,
+              "cycles": 0,
+              "fallback_tokens": 0,
+              "lookup_seconds": 0.0,
+              "verify_seconds": 0.0,
+              "rollback_seconds": 0.0,
+              "plain_seconds": 0.0
+            }
+          ],
+          "output_id_count": 257,
+          "output_ids_sha256": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da",
+          "command": {
+            "argv": [
+              "bash",
+              "a64fx/glm5/run_glm53f_12n.sh",
+              "benchmark",
+              "tmp/prompt8k.ids",
+              "/vol0006/mdt0/data/hp250467/work/gemm/glm53f-strata-20261001/tmp/strata-mla-head-tiles-20261003/results/pair-2-1.ids",
+              "--prefill-chunk",
+              "4096",
+              "--transitions",
+              "256",
+              "--repetitions",
+              "1",
+              "--decode-executor",
+              "persistent",
+              "--router-kernel",
+              "fused",
+              "--verify-kernel",
+              "grouped",
+              "--moe-combine-kernel",
+              "vector",
+              "--index-kernel",
+              "heads",
+              "--mla-kernel",
+              "fp16-cache",
+              "--pool-selector",
+              "partition4k",
+              "--q8-row-kernel",
+              "rows4",
+              "--q8-prefill-kernel",
+              "tile4x4",
+              "--mla-projection-kernel",
+              "legacy",
+              "--embedding-batch-kernel",
+              "packed",
+              "--verify-head-kernel",
+              "legacy",
+              "--mla-prefill-heads",
+              "split6"
+            ],
+            "variant": {
+              "split6": true
+            },
+            "state": false,
+            "baseline": false
+          }
+        },
+        "pair-3-1": {
+          "prefill": 413.551356,
+          "decode": 34.056878,
+          "trials": [
+            {
+              "trial": 0,
+              "prompt_tokens": 8049,
+              "decode_transitions": 256,
+              "prefill_seconds": 19.463120813,
+              "decode_seconds": 7.516837088,
+              "prefill_tok_s": 413.551356,
+              "decode_tok_s": 34.056878,
+              "minimum_available_kb": 9379136,
+              "tokens_equal": true
+            }
+          ],
+          "variant": {
+            "split6": true
+          },
+          "mtp_stats": [],
+          "lookup_stats": [
+            {
+              "trial": 0,
+              "lookup": 0,
+              "depth": 4,
+              "adaptive": 1,
+              "accepted": 0,
+              "proposed": 0,
+              "cycles": 0,
+              "fallback_tokens": 0,
+              "lookup_seconds": 0.0,
+              "verify_seconds": 0.0,
+              "rollback_seconds": 0.0,
+              "plain_seconds": 0.0
+            }
+          ],
+          "output_id_count": 257,
+          "output_ids_sha256": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da",
+          "command": {
+            "argv": [
+              "bash",
+              "a64fx/glm5/run_glm53f_12n.sh",
+              "benchmark",
+              "tmp/prompt8k.ids",
+              "/vol0006/mdt0/data/hp250467/work/gemm/glm53f-strata-20261001/tmp/strata-mla-head-tiles-20261003/results/pair-3-1.ids",
+              "--prefill-chunk",
+              "4096",
+              "--transitions",
+              "256",
+              "--repetitions",
+              "1",
+              "--decode-executor",
+              "persistent",
+              "--router-kernel",
+              "fused",
+              "--verify-kernel",
+              "grouped",
+              "--moe-combine-kernel",
+              "vector",
+              "--index-kernel",
+              "heads",
+              "--mla-kernel",
+              "fp16-cache",
+              "--pool-selector",
+              "partition4k",
+              "--q8-row-kernel",
+              "rows4",
+              "--q8-prefill-kernel",
+              "tile4x4",
+              "--mla-projection-kernel",
+              "legacy",
+              "--embedding-batch-kernel",
+              "packed",
+              "--verify-head-kernel",
+              "legacy",
+              "--mla-prefill-heads",
+              "split6"
+            ],
+            "variant": {
+              "split6": true
+            },
+            "state": false,
+            "baseline": false
+          }
+        },
+        "pair-3-0": {
+          "prefill": 406.43874,
+          "decode": 34.527138,
+          "trials": [
+            {
+              "trial": 0,
+              "prompt_tokens": 8049,
+              "decode_transitions": 256,
+              "prefill_seconds": 19.803722457,
+              "decode_seconds": 7.414457653,
+              "prefill_tok_s": 406.43874,
+              "decode_tok_s": 34.527138,
+              "minimum_available_kb": 9370432,
+              "tokens_equal": true
+            }
+          ],
+          "variant": null,
+          "mtp_stats": [],
+          "lookup_stats": [
+            {
+              "trial": 0,
+              "lookup": 0,
+              "depth": 4,
+              "adaptive": 1,
+              "accepted": 0,
+              "proposed": 0,
+              "cycles": 0,
+              "fallback_tokens": 0,
+              "lookup_seconds": 0.0,
+              "verify_seconds": 0.0,
+              "rollback_seconds": 0.0,
+              "plain_seconds": 0.0
+            }
+          ],
+          "output_id_count": 257,
+          "output_ids_sha256": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da",
+          "command": {
+            "argv": [
+              "bash",
+              "a64fx/glm5/run_glm53f_12n.sh",
+              "benchmark",
+              "tmp/prompt8k.ids",
+              "/vol0006/mdt0/data/hp250467/work/gemm/glm53f-strata-20261001/tmp/strata-mla-head-tiles-20261003/results/pair-3-0.ids",
+              "--prefill-chunk",
+              "4096",
+              "--transitions",
+              "256",
+              "--repetitions",
+              "1",
+              "--decode-executor",
+              "persistent",
+              "--router-kernel",
+              "fused",
+              "--verify-kernel",
+              "grouped",
+              "--moe-combine-kernel",
+              "vector",
+              "--index-kernel",
+              "heads",
+              "--mla-kernel",
+              "fp16-cache",
+              "--pool-selector",
+              "partition4k",
+              "--q8-row-kernel",
+              "rows4",
+              "--q8-prefill-kernel",
+              "tile4x4",
+              "--mla-projection-kernel",
+              "legacy",
+              "--embedding-batch-kernel",
+              "packed",
+              "--verify-head-kernel",
+              "legacy"
+            ],
+            "variant": null,
+            "state": false,
+            "baseline": false
+          }
+        },
+        "pair-4-0": {
+          "prefill": 406.95643,
+          "decode": 34.478747,
+          "trials": [
+            {
+              "trial": 0,
+              "prompt_tokens": 8049,
+              "decode_transitions": 256,
+              "prefill_seconds": 19.778530099,
+              "decode_seconds": 7.424863828,
+              "prefill_tok_s": 406.95643,
+              "decode_tok_s": 34.478747,
+              "minimum_available_kb": 9373504,
+              "tokens_equal": true
+            }
+          ],
+          "variant": null,
+          "mtp_stats": [],
+          "lookup_stats": [
+            {
+              "trial": 0,
+              "lookup": 0,
+              "depth": 4,
+              "adaptive": 1,
+              "accepted": 0,
+              "proposed": 0,
+              "cycles": 0,
+              "fallback_tokens": 0,
+              "lookup_seconds": 0.0,
+              "verify_seconds": 0.0,
+              "rollback_seconds": 0.0,
+              "plain_seconds": 0.0
+            }
+          ],
+          "output_id_count": 257,
+          "output_ids_sha256": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da",
+          "command": {
+            "argv": [
+              "bash",
+              "a64fx/glm5/run_glm53f_12n.sh",
+              "benchmark",
+              "tmp/prompt8k.ids",
+              "/vol0006/mdt0/data/hp250467/work/gemm/glm53f-strata-20261001/tmp/strata-mla-head-tiles-20261003/results/pair-4-0.ids",
+              "--prefill-chunk",
+              "4096",
+              "--transitions",
+              "256",
+              "--repetitions",
+              "1",
+              "--decode-executor",
+              "persistent",
+              "--router-kernel",
+              "fused",
+              "--verify-kernel",
+              "grouped",
+              "--moe-combine-kernel",
+              "vector",
+              "--index-kernel",
+              "heads",
+              "--mla-kernel",
+              "fp16-cache",
+              "--pool-selector",
+              "partition4k",
+              "--q8-row-kernel",
+              "rows4",
+              "--q8-prefill-kernel",
+              "tile4x4",
+              "--mla-projection-kernel",
+              "legacy",
+              "--embedding-batch-kernel",
+              "packed",
+              "--verify-head-kernel",
+              "legacy"
+            ],
+            "variant": null,
+            "state": false,
+            "baseline": false
+          }
+        },
+        "pair-4-1": {
+          "prefill": 413.209169,
+          "decode": 33.998433,
+          "trials": [
+            {
+              "trial": 0,
+              "prompt_tokens": 8049,
+              "decode_transitions": 256,
+              "prefill_seconds": 19.479238592,
+              "decode_seconds": 7.529758754,
+              "prefill_tok_s": 413.209169,
+              "decode_tok_s": 33.998433,
+              "minimum_available_kb": 9353984,
+              "tokens_equal": true
+            }
+          ],
+          "variant": {
+            "split6": true
+          },
+          "mtp_stats": [],
+          "lookup_stats": [
+            {
+              "trial": 0,
+              "lookup": 0,
+              "depth": 4,
+              "adaptive": 1,
+              "accepted": 0,
+              "proposed": 0,
+              "cycles": 0,
+              "fallback_tokens": 0,
+              "lookup_seconds": 0.0,
+              "verify_seconds": 0.0,
+              "rollback_seconds": 0.0,
+              "plain_seconds": 0.0
+            }
+          ],
+          "output_id_count": 257,
+          "output_ids_sha256": "e39e6060a16f2305dd9f7b3d6e15adf2dafc931a33b2bf62735138adacc618da",
+          "command": {
+            "argv": [
+              "bash",
+              "a64fx/glm5/run_glm53f_12n.sh",
+              "benchmark",
+              "tmp/prompt8k.ids",
+              "/vol0006/mdt0/data/hp250467/work/gemm/glm53f-strata-20261001/tmp/strata-mla-head-tiles-20261003/results/pair-4-1.ids",
+              "--prefill-chunk",
+              "4096",
+              "--transitions",
+              "256",
+              "--repetitions",
+              "1",
+              "--decode-executor",
+              "persistent",
+              "--router-kernel",
+              "fused",
+              "--verify-kernel",
+              "grouped",
+              "--moe-combine-kernel",
+              "vector",
+              "--index-kernel",
+              "heads",
+              "--mla-kernel",
+              "fp16-cache",
+              "--pool-selector",
+              "partition4k",
+              "--q8-row-kernel",
+              "rows4",
+              "--q8-prefill-kernel",
+              "tile4x4",
+              "--mla-projection-kernel",
+              "legacy",
+              "--embedding-batch-kernel",
+              "packed",
+              "--verify-head-kernel",
+              "legacy",
+              "--mla-prefill-heads",
+              "split6"
+            ],
+            "variant": {
+              "split6": true
+            },
+            "state": false,
+            "baseline": false
+          }
+        }
+      },
+      "ratios": {
+        "prefill": 1.0170894123540455,
+        "decode": 1.000828496317947
+      },
+      "qualifies_screen": false,
+      "candidate_name": "split6",
+      "minimum_available_gib": 8.87139892578125
+    },
+    "results-v4": {
+      "status": "component_rejected",
+      "promoted": false,
+      "targets_met": false,
+      "allocation": 52128881,
+      "prefill_includes_mtp_teacher_forcing": false,
+      "screens": {},
+      "confirmation": [],
+      "native_gates": true,
+      "binary_sha256": {
+        "frozen": "938d7b7c7a41aa6c2b9c2a51aecee897a2b423430b4eaf0de4ccddc335db4ec5",
+        "candidate": "c82ea4d8937ebbeb822bc3a2e4a8c0fc612bce3e474302781fa3ed1069e129ec"
+      },
+      "comparison": "same candidate binary legacy versus six-head 32-column values; all other options identical",
+      "pairs": [],
+      "native_six_head_ratios": [
+        1.0172794709249766,
+        1.0251564498841752,
+        1.0219195471666702,
+        1.0177343793313745,
+        1.0176698006727718
+      ],
+      "native_six_head_median": 1.0177343793313745,
+      "candidate_name": "values32"
+    }
+  },
+  "campaign_scripts": {
+    "campaign-v2.py": "import datetime, hashlib, json, os, re, statistics, subprocess, time\nfrom pathlib import Path\nroot = Path.cwd(); logs = root / 'tmp/strata-mla-head-tiles-20261003'; out = logs / 'results'\ncandidate = root / 'a64fx/glm5/build/candidate-mla-head-tiles-v2'\nfrozen = root / 'a64fx/glm5/build/candidate-capacity4096-v1'\nguard = datetime.datetime(2026,10,3,14,0,tzinfo=datetime.timezone.utc).timestamp()\nassert os.environ.get('PJM_JOBID') == '52128881'\noptions = ['--decode-executor','persistent','--router-kernel','fused','--verify-kernel','grouped',\n '--moe-combine-kernel','vector','--index-kernel','heads','--mla-kernel','fp16-cache',\n '--pool-selector','partition4k','--q8-row-kernel','rows4','--q8-prefill-kernel','tile4x4',\n '--mla-projection-kernel','legacy']\nsummary = {'status':'running','promoted':False,'targets_met':False,'allocation':52128881,\n 'prefill_includes_mtp_teacher_forcing':True,'screens':{},'confirmation':[], 'native_gates':True}\nsummary['binary_sha256'] = {name:hashlib.sha256((directory/'bench_glm53f_run_12n').read_bytes()).hexdigest() for name,directory in [('frozen',frozen),('candidate',candidate)]}\ndef save():\n (out/'performance.json').write_text(json.dumps(summary,indent=2)+'\\n')\ndef run(label, variant=None, prompt='tmp/prompt8k.ids', transitions=256, repetitions=3, state=False, baseline=False, packed=True):\n if time.time()+600>guard:\n  summary['status']='deferred_allocation_limit';save();raise SystemExit(75)\n directory=frozen if baseline else candidate\n argv=['bash','a64fx/glm5/run_glm53f_12n.sh','benchmark',prompt,str(out/(label+'.ids')),\n       '--prefill-chunk','4096','--transitions',str(transitions),'--repetitions',str(repetitions)]+options\n if not baseline: argv+=['--embedding-batch-kernel','packed' if packed else 'legacy','--verify-head-kernel','legacy']\n if variant and variant.get('split6'):\n  argv+=['--mla-prefill-heads','split6']\n if variant and variant.get('source'):\n  source=variant['source'];argv+=['--speculation',source,'--draft-depth',str(variant['depth']),'--spec-policy',variant['policy']]\n  if source=='mtp':argv+=['--mtp-prime-batch',str(variant['prime']), '--mtp-routed-stage','/local/glm53f-mtp-routed-52128881','--mtp-shared-stage','/local/glm53f-mtp-shared-52128881']\n if state:argv+=['--decode-state-check',str(out/(label+'.state'))]\n env=dict(os.environ,GLM53F_BIN_DIR=str(directory),GLM53F_RUN_TAG='mla-tiles-'+label,\n          GLM53F_BENCH_SOURCE_REV=summary['binary_sha256']['frozen' if baseline else 'candidate'])\n with (out/(label+'.log')).open('x') as stream:\n  stream.write('MTP_BATCH_CONFIG '+json.dumps({'argv':argv,'variant':variant,'state':state,'baseline':baseline})+'\\n');stream.flush()\n  subprocess.run(argv,env=env,stdout=stream,stderr=subprocess.STDOUT,check=True)\n text=(out/(label+'.log')).read_text()\n trials=[json.loads(s) for s in re.findall(r'GLM53F_BENCH_TRIAL (\\{[^\\n]+\\})',text)]\n completed=[json.loads(s) for s in re.findall(r'GLM53F_BENCH_COMPLETE (\\{[^\\n]+\\})',text)]\n assert len(completed)==1 and completed[0]['status']=='PASS' and completed[0]['repetitions']==repetitions\n assert len(trials)==repetitions and [t['trial'] for t in trials]==list(range(repetitions))\n count=len(Path(prompt).read_text().split())\n assert all(t['tokens_equal'] and t['prompt_tokens']==count and t['decode_transitions']==transitions and t['minimum_available_kb']>=2*1024*1024 for t in trials)\n ids=[int(x) for x in (out/(label+'.ids')).read_text().split()]\n assert len(ids)==transitions+1 and all(0<=x<154880 for x in ids)\n if state:assert len(re.findall(r'GLM53F_BENCH_STATE .*state=BIT_EXACT PASS',text))==repetitions+1\n result={'prefill':statistics.median(t['prefill_tok_s'] for t in trials),'decode':statistics.median(t['decode_tok_s'] for t in trials),\n         'trials':trials,'ids':ids,'variant':variant,'mtp_stats':[json.loads(s) for s in re.findall(r'GLM53F_BENCH_MTP (\\{[^\\n]+\\})',text)],\n         'lookup_stats':[json.loads(s) for s in re.findall(r'GLM53F_BENCH_SPEC (\\{[^\\n]+\\})',text)]}\n summary.setdefault('runs',{})[label]=result;save();print('MTP_BATCH_RUN',label,json.dumps({'prefill':result['prefill'],'decode':result['decode']}),flush=True)\n return result\ndef equal(a,b):assert a['ids']==b['ids'],'generated IDs differ from frozen baseline'\n\nsummary.update(comparison='same candidate binary legacy versus six-head 3+3 prefill; all other options identical',prefill_includes_mtp_teacher_forcing=False,pairs=[])\ntry:\n control=run('frozen-reference',baseline=True,repetitions=1)\n legacy=run('short-legacy',prompt='tmp/prompt8k.ids',transitions=128,repetitions=1,state=True)\n split=run('short-split6',variant={'split6':True},prompt='tmp/prompt8k.ids',transitions=128,repetitions=1,state=True)\n equal(legacy,split)\n assert legacy['ids']==control['ids'][:129]\n for pair in range(5):\n  result={}\n  for mode in ((0,1) if pair%2==0 else (1,0)):\n   result[mode]=run('pair-{}-{}'.format(pair,mode),variant={'split6':True} if mode else None,repetitions=1)\n   equal(result[mode],control)\n  summary['pairs'].append({'pair':pair,**{key:result[1][key]/result[0][key] for key in ('prefill','decode')}});save()\n summary['ratios']={key:statistics.median(p[key] for p in summary['pairs']) for key in ('prefill','decode')}\n summary['qualifies_screen']=summary['ratios']['prefill']>=1.05 and summary['ratios']['decode']>=.98\n if summary['qualifies_screen']:\n  a=run('long1024-legacy',transitions=1024,repetitions=1)\n  b=run('long1024-split6',variant={'split6':True},transitions=1024,repetitions=1)\n  equal(a,b)\n summary['status']='paired_model_complete';save()\n print('MLA_TILES_MODEL_COMPLETE',json.dumps(summary['ratios']),flush=True)\nexcept Exception as exc:\n summary.update(status='failed',error=repr(exc));save();raise\n",
+    "campaign-v4.py": "import datetime, hashlib, json, os, re, statistics, subprocess, time\nfrom pathlib import Path\nroot = Path.cwd(); logs = root / 'tmp/strata-mla-head-tiles-20261003'; out = logs / 'results-v4'\ncandidate = root / 'a64fx/glm5/build/candidate-mla-head-tiles-v4'\nfrozen = root / 'a64fx/glm5/build/candidate-capacity4096-v1'\nguard = datetime.datetime(2026,10,3,14,0,tzinfo=datetime.timezone.utc).timestamp()\nassert os.environ.get('PJM_JOBID') == '52128881'\noptions = ['--decode-executor','persistent','--router-kernel','fused','--verify-kernel','grouped',\n '--moe-combine-kernel','vector','--index-kernel','heads','--mla-kernel','fp16-cache',\n '--pool-selector','partition4k','--q8-row-kernel','rows4','--q8-prefill-kernel','tile4x4',\n '--mla-projection-kernel','legacy']\nsummary = {'status':'running','promoted':False,'targets_met':False,'allocation':52128881,\n 'prefill_includes_mtp_teacher_forcing':True,'screens':{},'confirmation':[], 'native_gates':True}\nsummary['binary_sha256'] = {name:hashlib.sha256((directory/'bench_glm53f_run_12n').read_bytes()).hexdigest() for name,directory in [('frozen',frozen),('candidate',candidate)]}\ndef save():\n (out/'performance.json').write_text(json.dumps(summary,indent=2)+'\\n')\ndef run(label, variant=None, prompt='tmp/prompt8k.ids', transitions=256, repetitions=3, state=False, baseline=False, packed=True):\n if time.time()+600>guard:\n  summary['status']='deferred_allocation_limit';save();raise SystemExit(75)\n directory=frozen if baseline else candidate\n argv=['bash','a64fx/glm5/run_glm53f_12n.sh','benchmark',prompt,str(out/(label+'.ids')),\n       '--prefill-chunk','4096','--transitions',str(transitions),'--repetitions',str(repetitions)]+options\n if not baseline: argv+=['--embedding-batch-kernel','packed' if packed else 'legacy','--verify-head-kernel','legacy']\n if not baseline:\n  argv+=['--mla-prefill-heads','values32' if variant and variant.get('split6') else 'legacy']\n if variant and variant.get('source'):\n  source=variant['source'];argv+=['--speculation',source,'--draft-depth',str(variant['depth']),'--spec-policy',variant['policy']]\n  if source=='mtp':argv+=['--mtp-prime-batch',str(variant['prime']), '--mtp-routed-stage','/local/glm53f-mtp-routed-52128881','--mtp-shared-stage','/local/glm53f-mtp-shared-52128881']\n if state:argv+=['--decode-state-check',str(out/(label+'.state'))]\n env=dict(os.environ,GLM53F_BIN_DIR=str(directory),GLM53F_RUN_TAG='mla-values32-'+label,\n          GLM53F_BENCH_SOURCE_REV=summary['binary_sha256']['frozen' if baseline else 'candidate'])\n with (out/(label+'.log')).open('x') as stream:\n  stream.write('MTP_BATCH_CONFIG '+json.dumps({'argv':argv,'variant':variant,'state':state,'baseline':baseline})+'\\n');stream.flush()\n  subprocess.run(argv,env=env,stdout=stream,stderr=subprocess.STDOUT,check=True)\n text=(out/(label+'.log')).read_text()\n trials=[json.loads(s) for s in re.findall(r'GLM53F_BENCH_TRIAL (\\{[^\\n]+\\})',text)]\n completed=[json.loads(s) for s in re.findall(r'GLM53F_BENCH_COMPLETE (\\{[^\\n]+\\})',text)]\n assert len(completed)==1 and completed[0]['status']=='PASS' and completed[0]['repetitions']==repetitions\n assert len(trials)==repetitions and [t['trial'] for t in trials]==list(range(repetitions))\n count=len(Path(prompt).read_text().split())\n assert all(t['tokens_equal'] and t['prompt_tokens']==count and t['decode_transitions']==transitions and t['minimum_available_kb']>=2*1024*1024 for t in trials)\n ids=[int(x) for x in (out/(label+'.ids')).read_text().split()]\n assert len(ids)==transitions+1 and all(0<=x<154880 for x in ids)\n if state:assert len(re.findall(r'GLM53F_BENCH_STATE .*state=BIT_EXACT PASS',text))==repetitions+1\n result={'prefill':statistics.median(t['prefill_tok_s'] for t in trials),'decode':statistics.median(t['decode_tok_s'] for t in trials),\n         'trials':trials,'ids':ids,'variant':variant,'mtp_stats':[json.loads(s) for s in re.findall(r'GLM53F_BENCH_MTP (\\{[^\\n]+\\})',text)],\n         'lookup_stats':[json.loads(s) for s in re.findall(r'GLM53F_BENCH_SPEC (\\{[^\\n]+\\})',text)]}\n summary.setdefault('runs',{})[label]=result;save();print('MTP_BATCH_RUN',label,json.dumps({'prefill':result['prefill'],'decode':result['decode']}),flush=True)\n return result\ndef equal(a,b):assert a['ids']==b['ids'],'generated IDs differ from frozen baseline'\n\nsummary.update(comparison='same candidate binary legacy versus six-head 32-column values; all other options identical',prefill_includes_mtp_teacher_forcing=False,pairs=[])\ntry:\n native=(out/'native.log').read_text()\n rows=[(int(h),int(tr),int(tile),float(dt)) for h,tr,tile,dt in re.findall(r'MLA_HEAD_TILE_TIME heads=(\\d+) trial=(\\d+) tile=(\\d+) seconds=([\\d.]+)',native)]\n component=[next(x[3] for x in rows if x[:3]==(6,tr,6))/next(x[3] for x in rows if x[:3]==(6,tr,7)) for tr in range(5)]\n summary['native_six_head_ratios']=component\n summary['native_six_head_median']=statistics.median(component)\n if summary['native_six_head_median']<1.05:\n  summary['status']='component_rejected';save();print('MLA_VALUES32_COMPONENT_REJECTED',summary['native_six_head_median'],flush=True);raise SystemExit(0)\n previous=json.loads((logs/'results/performance.json').read_text())\n assert previous['status']=='paired_model_complete'\n control=previous['runs']['frozen-reference']\n legacy=run('short-legacy',prompt='tmp/prompt8k.ids',transitions=128,repetitions=1,state=True)\n split=run('short-split6',variant={'split6':True},prompt='tmp/prompt8k.ids',transitions=128,repetitions=1,state=True)\n equal(legacy,split)\n assert legacy['ids']==control['ids'][:129]\n for pair in range(5):\n  result={}\n  for mode in ((0,1) if pair%2==0 else (1,0)):\n   result[mode]=run('pair-{}-{}'.format(pair,mode),variant={'split6':True} if mode else None,repetitions=1)\n   equal(result[mode],control)\n  summary['pairs'].append({'pair':pair,**{key:result[1][key]/result[0][key] for key in ('prefill','decode')}});save()\n summary['ratios']={key:statistics.median(p[key] for p in summary['pairs']) for key in ('prefill','decode')}\n summary['qualifies_screen']=summary['ratios']['prefill']>=1.05 and summary['ratios']['decode']>=.98\n if summary['qualifies_screen']:\n  a=run('long1024-legacy',transitions=1024,repetitions=1)\n  b=run('long1024-split6',variant={'split6':True},transitions=1024,repetitions=1)\n  equal(a,b)\n summary['status']='paired_model_complete';save()\n print('MLA_TILES_MODEL_COMPLETE',json.dumps(summary['ratios']),flush=True)\nexcept Exception as exc:\n summary.update(status='failed',error=repr(exc));save();raise\n"
+  },
+  "driver_scripts": {
+    "driver-v2.sh": "#!/bin/bash\nset -euo pipefail\ncd \"$HOME/work/gemm/glm53f-strata-20261001\"\nlogs=$PWD/tmp/strata-mla-head-tiles-20261003\n[ \"${PJM_JOBID:-}\" = 52128881 ] && [ \"$PJM_NODE\" = 12 ]\nguard=$(date -d '2026-10-03 23:00:00 JST' +%s)\nexport GLM53F_BUILD=0 GLM53F_GGUF=$HOME/models/glm53f-gguf-wide/UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf\nexport GLM53F_BIN_DIR=$PWD/a64fx/glm5/build/candidate-mla-head-tiles-v2 GLM53F_RUN_TAG=mtp-batch3-gates\nexport XOS_MMM_L_PAGING_POLICY=demand:demand:demand XOS_MMM_L_HPAGE_TYPE=none\nexport OMP_NUM_THREADS=47 OMP_PROC_BIND=close OMP_PLACES=cores OMP_WAIT_POLICY=active FLIB_BARRIER=HARD\nexport GLM53F_PREWARM=1 GLM53F_PROFILE=1 GLM53F_FAST_MATH=1 GLM53F_NO_MATH_ERRNO=1\nexport GLM53F_COMM_OWNER=0 GLM53F_SPARSE_ASYNC=0 GLM53F_NATIVE_Q8_PANEL=0 GLM53F_SPARSE_MLA_BATCH=1\nexport GLM53F_NATIVE_Q8_ROWS8=0 GLM53F_NATIVE_Q8_TILE2X8=0 GLM53F_MLA_FUSED_PROJECTION=0 GLM53F_MHC_FUSED_SYNC=0 GLM53F_MOE_GU_PAD=0\nexport GLM53F_EMBED_BATCH_PACKED=0 GLM53F_HEAD_VERIFY_SHARED=0 GLM53F_DENSE_PREFILL_TILE=4\nfail(){ echo \"error: $*\" >&2; exit 2; }\nsource a64fx/glm5/scripts/glm53f_env.sh\nsource a64fx/glm5/scripts/glm53f_launch.sh\nmkdir -p \"$logdir\" \"$GLM53F_BUILD_DIR\" \"$logs/results\"\nprepare_runtime\nmpi_run mla-head-tiles /usr/bin/numactl --interleave=4,5,6,7 \"$GLM53F_BIN_DIR/test_glm53f_mla_head_tiles\"\ngrep '^MLA_HEAD_TILES .*BIT_EXACT PASS$' \"$last_log\".*.0\ncp \"$last_log\".*.0 \"$logs/results/native-v2.log\"\necho MLA_HEAD_TILES_PASS\npython3 \"$logs/campaign-v2.py\"\necho MLA_TILES_FULL_PASS\n",
+    "driver-v3.sh": "#!/bin/bash\nset -euo pipefail\ncd \"$HOME/work/gemm/glm53f-strata-20261001\"\nlogs=$PWD/tmp/strata-mla-head-tiles-20261003\n[ \"${PJM_JOBID:-}\" = 52128881 ] && [ \"$PJM_NODE\" = 12 ]\nguard=$(date -d '2026-10-03 23:00:00 JST' +%s)\nwhile ps -p 9502 -o args= | grep -q 'bash tmp/strata-mla-head-tiles-20261003/driver-v2.sh'; do\n [ \"$(date +%s)\" -lt \"$guard\" ] || exit 75\n sleep 10\ndone\ngrep -q '^MLA_TILES_FULL_PASS$' \"$logs/driver-v2.log\" || exit 2\nexport GLM53F_BUILD=0 GLM53F_GGUF=$HOME/models/glm53f-gguf-wide/UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf\nexport GLM53F_BIN_DIR=$PWD/a64fx/glm5/build/candidate-mla-head-fixture-v3 GLM53F_RUN_TAG=mtp-batch3-gates\nexport XOS_MMM_L_PAGING_POLICY=demand:demand:demand XOS_MMM_L_HPAGE_TYPE=none\nexport OMP_NUM_THREADS=47 OMP_PROC_BIND=close OMP_PLACES=cores OMP_WAIT_POLICY=active FLIB_BARRIER=HARD\nexport GLM53F_PREWARM=1 GLM53F_PROFILE=1 GLM53F_FAST_MATH=1 GLM53F_NO_MATH_ERRNO=1\nexport GLM53F_COMM_OWNER=0 GLM53F_SPARSE_ASYNC=0 GLM53F_NATIVE_Q8_PANEL=0 GLM53F_SPARSE_MLA_BATCH=1\nexport GLM53F_NATIVE_Q8_ROWS8=0 GLM53F_NATIVE_Q8_TILE2X8=0 GLM53F_MLA_FUSED_PROJECTION=0 GLM53F_MHC_FUSED_SYNC=0 GLM53F_MOE_GU_PAD=0\nexport GLM53F_EMBED_BATCH_PACKED=0 GLM53F_HEAD_VERIFY_SHARED=0 GLM53F_DENSE_PREFILL_TILE=4\nfail(){ echo \"error: $*\" >&2; exit 2; }\nsource a64fx/glm5/scripts/glm53f_env.sh\nsource a64fx/glm5/scripts/glm53f_launch.sh\nmkdir -p \"$logdir\" \"$GLM53F_BUILD_DIR\" \"$logs/results\"\nprepare_runtime\nmpi_run mla-head-tiles /usr/bin/numactl --interleave=4,5,6,7 \"$GLM53F_BIN_DIR/test_glm53f_mla_head_tiles\"\ngrep '^MLA_HEAD_TILES .*BIT_EXACT PASS$' \"$last_log\".*.0\ncp \"$last_log\".*.0 \"$logs/results/native-v3.log\"\necho MLA_HEAD_TILES_PASS\n",
+    "driver-v4.sh": "#!/bin/bash\nset -euo pipefail\ncd \"$HOME/work/gemm/glm53f-strata-20261001\"\nlogs=$PWD/tmp/strata-mla-head-tiles-20261003\n[ \"${PJM_JOBID:-}\" = 52128881 ] && [ \"$PJM_NODE\" = 12 ]\nguard=$(date -d '2026-10-03 23:00:00 JST' +%s)\nwhile ps -p 9502 -o args= | grep -q 'bash tmp/strata-mla-head-tiles-20261003/driver-v2.sh'; do\n [ \"$(date +%s)\" -lt \"$guard\" ] || exit 75\n sleep 10\ndone\ngrep -q '^MLA_TILES_FULL_PASS$' \"$logs/driver-v2.log\" || exit 2\nwhile ps -p 10006 -o args= | grep -q 'bash tmp/strata-mla-head-tiles-20261003/driver-v3.sh'; do\n [ \"$(date +%s)\" -lt \"$guard\" ] || exit 75\n sleep 10\ndone\ngrep -q '^MLA_HEAD_TILES_PASS$' \"$logs/driver-v3.log\" || exit 2\nexport GLM53F_BUILD=0 GLM53F_GGUF=$HOME/models/glm53f-gguf-wide/UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf\nexport GLM53F_BIN_DIR=$PWD/a64fx/glm5/build/candidate-mla-head-tiles-v4 GLM53F_RUN_TAG=mtp-batch3-gates\nexport XOS_MMM_L_PAGING_POLICY=demand:demand:demand XOS_MMM_L_HPAGE_TYPE=none\nexport OMP_NUM_THREADS=47 OMP_PROC_BIND=close OMP_PLACES=cores OMP_WAIT_POLICY=active FLIB_BARRIER=HARD\nexport GLM53F_PREWARM=1 GLM53F_PROFILE=1 GLM53F_FAST_MATH=1 GLM53F_NO_MATH_ERRNO=1\nexport GLM53F_COMM_OWNER=0 GLM53F_SPARSE_ASYNC=0 GLM53F_NATIVE_Q8_PANEL=0 GLM53F_SPARSE_MLA_BATCH=1\nexport GLM53F_NATIVE_Q8_ROWS8=0 GLM53F_NATIVE_Q8_TILE2X8=0 GLM53F_MLA_FUSED_PROJECTION=0 GLM53F_MHC_FUSED_SYNC=0 GLM53F_MOE_GU_PAD=0\nexport GLM53F_EMBED_BATCH_PACKED=0 GLM53F_HEAD_VERIFY_SHARED=0 GLM53F_DENSE_PREFILL_TILE=4\nfail(){ echo \"error: $*\" >&2; exit 2; }\nsource a64fx/glm5/scripts/glm53f_env.sh\nsource a64fx/glm5/scripts/glm53f_launch.sh\nmkdir -p \"$logdir\" \"$GLM53F_BUILD_DIR\" \"$logs/results-v4\"\nprepare_runtime\nmpi_run mla-head-tiles /usr/bin/numactl --interleave=4,5,6,7 \"$GLM53F_BIN_DIR/test_glm53f_mla_head_tiles\"\ngrep '^MLA_HEAD_TILES .*BIT_EXACT PASS$' \"$last_log\".*.0\ncp \"$last_log\".*.0 \"$logs/results-v4/native.log\"\necho MLA_HEAD_TILES_PASS\npython3 \"$logs/campaign-v4.py\"\necho MLA_VALUES32_FULL_PASS\n",
+    "driver-v5.sh": "#!/bin/bash\nset -euo pipefail\ncd \"$HOME/work/gemm/glm53f-strata-20261001\"\nlogs=$PWD/tmp/strata-mla-head-tiles-20261003\n[ \"${PJM_JOBID:-}\" = 52128881 ] && [ \"$PJM_NODE\" = 12 ]\nguard=$(date -d '2026-10-03 23:00:00 JST' +%s)\nexport GLM53F_BUILD=0 GLM53F_GGUF=$HOME/models/glm53f-gguf-wide/UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf\nexport GLM53F_BIN_DIR=$PWD/a64fx/glm5/build/candidate-mla-head-fixture-v5 GLM53F_RUN_TAG=mtp-batch3-gates\nexport XOS_MMM_L_PAGING_POLICY=demand:demand:demand XOS_MMM_L_HPAGE_TYPE=none\nexport OMP_NUM_THREADS=47 OMP_PROC_BIND=close OMP_PLACES=cores OMP_WAIT_POLICY=active FLIB_BARRIER=HARD\nexport GLM53F_PREWARM=1 GLM53F_PROFILE=1 GLM53F_FAST_MATH=1 GLM53F_NO_MATH_ERRNO=1\nexport GLM53F_COMM_OWNER=0 GLM53F_SPARSE_ASYNC=0 GLM53F_NATIVE_Q8_PANEL=0 GLM53F_SPARSE_MLA_BATCH=1\nexport GLM53F_NATIVE_Q8_ROWS8=0 GLM53F_NATIVE_Q8_TILE2X8=0 GLM53F_MLA_FUSED_PROJECTION=0 GLM53F_MHC_FUSED_SYNC=0 GLM53F_MOE_GU_PAD=0\nexport GLM53F_EMBED_BATCH_PACKED=0 GLM53F_HEAD_VERIFY_SHARED=0 GLM53F_DENSE_PREFILL_TILE=4\nfail(){ echo \"error: $*\" >&2; exit 2; }\nsource a64fx/glm5/scripts/glm53f_env.sh\nsource a64fx/glm5/scripts/glm53f_launch.sh\nmkdir -p \"$logdir\" \"$GLM53F_BUILD_DIR\" \"$logs/results\"\nprepare_runtime\nmpi_run mla-head-tiles /usr/bin/numactl --interleave=4,5,6,7 \"$GLM53F_BIN_DIR/test_glm53f_mla_head_tiles\"\ngrep '^MLA_HEAD_TILES .*BIT_EXACT PASS$' \"$last_log\".*.0\ncp \"$last_log\".*.0 \"$logs/results/native-v5.log\"\necho MLA_HEAD_TILES_PASS\n"
+  },
+  "baseline_v2_parent_mode": "GLM53F_MLA_PREFILL_SPLIT6 verified unset; v4 uses explicit legacy flag",
+  "cross_option_endpoint_state": {
+    "results": {
+      "cross_option_endpoint_state": "BIT_EXACT",
+      "ranks": [
+        {
+          "rank": 0,
+          "bytes": 300105180,
+          "sha256": "666d5ac899220cc0d47be326a1e51273a6f37e495d8cb7921184604dba139666"
+        },
+        {
+          "rank": 1,
+          "bytes": 300105180,
+          "sha256": "fc247c29ac163fd049baf97e14cfa7aeab542084647963da7a0f26253ab5f286"
+        },
+        {
+          "rank": 2,
+          "bytes": 302542300,
+          "sha256": "c0520d2fdadd6195b7eaaa40ee74f801af71b9f48ea86e89571afaea9ae75796"
+        },
+        {
+          "rank": 3,
+          "bytes": 300105180,
+          "sha256": "f6d607b079f6e989da9f2ef1d1fd144ebe84886b0bc38759e7df20032b3d5fec"
+        },
+        {
+          "rank": 4,
+          "bytes": 300105180,
+          "sha256": "76d5ea4af199ff1aa24bf6ac8d9fccb702de12362d6380caea48c3d147dbc9ee"
+        },
+        {
+          "rank": 5,
+          "bytes": 302542300,
+          "sha256": "d3f8359cdd3a1e8827f5bceedf9637024fb032cf57ffdff3c7fa5c298af7904f"
+        },
+        {
+          "rank": 6,
+          "bytes": 300105180,
+          "sha256": "d1182d367de7d33a92938f3473d398630735eb466b9d80b5fb0649fdc831cdc8"
+        },
+        {
+          "rank": 7,
+          "bytes": 300105180,
+          "sha256": "66ec9d10dd30caccf21121f4cb9017c7b8386bb215bd4ca8d110a37d72db2492"
+        },
+        {
+          "rank": 8,
+          "bytes": 302542300,
+          "sha256": "57a78fa6c73cc200d1aaf9d67f9c701291d53ac95f908730e37e86db7fe95905"
+        },
+        {
+          "rank": 9,
+          "bytes": 300105180,
+          "sha256": "bce560ce37336348569c9baebeb2ccfa178b746309379e82652fb58fa5a1516c"
+        },
+        {
+          "rank": 10,
+          "bytes": 300105180,
+          "sha256": "fbfdf61375e0a64a87cd0d7c5cf322ca026bd4ffd2cd888b2c3b6cceb727b847"
+        },
+        {
+          "rank": 11,
+          "bytes": 302542300,
+          "sha256": "1ddd0430010ff03995e084616a4fa66b6808888c3c5ec09474d342648019e244"
+        }
+      ]
+    }
+  },
+  "strata_reference": {
+    "branch": "glm53f",
+    "head": "3bbb469",
+    "source": "src/program/glm_decode.cpp:2965..3040",
+    "technique": "absorbed-query/cache/value tiling; this A64FX experiment changes only independent heads or value columns, preserving lane and key order"
+  },
+  "build_script_v4": "#!/bin/bash\nset -euo pipefail\nroot=$HOME/work/gemm/glm53f-strata-20261001\ncd \"$root/a64fx/glm5\"\nwork=$root/tmp/strata-mla-head-tiles-20261003\nold=$root/tmp/strata-pipeline-20261002/build\nbase=$root/tmp/strata-mhc-sync-20261002/build-integrated-login-v4\nbin=$PWD/build/candidate-mla-head-tiles-v4\nmkdir -p \"$bin\"\nexport TMPDIR=$work OPAL_PREFIX=/opt/FJSVxtclanga/tcsds-1.2.43\nunset OMPI_CC OMPI_CXX\ncc=/opt/FJSVxtclanga/tcsds-1.2.43/bin/mpifccpx\nflags=(-Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast -fopenmp -Wall -Wextra -Werror -ffast-math -fno-math-errno -DGLM53F_PREFILL_ATTN_PANEL=47 -DGLM53F_PREFILL_CAPACITY=4096 -I. -I../../common)\n\"$cc\" \"${flags[@]}\" test_glm53f_mla_head_tiles.c -lm -o \"$bin/test_glm53f_mla_head_tiles\"\n\"$cc\" \"${flags[@]}\" -DGLM53F_EXTERNAL_ST_IMPLEMENTATION -DGLM53F_SPARSE_NO_MAIN -c glm53f_sparse_layer_12n.c -o \"$work/sparse_values32.o\"\nobjects=(\"$base\"/{q8_panel,gemm_kern,gemm_asm,team,collective}.o \"$root/tmp/strata-iq-scales-20261002/build-integrated-v5/iq_bridge.o\" \"$old/kda_pp_beta_rowwise.o\" \"$root/tmp/strata-pipeline-20261003/dense_tiles_full.o\" \"$old/moe_pp_fast.o\" \"$work/sparse_values32.o\" \"$root/tmp/strata-mtp-batch-20261003/head_verify.o\" \"$root/tmp/strata-mtp-batch-20261003/embedding_prime.o\" \"$old\"/{dist,pipeline}_pp.o)\nlink=(-L\"$root/tmp/strata-mhc-sync-20261002/target-libs\" -lm -lpthread -ltofucom)\n\"$cc\" \"${flags[@]}\" bench_glm53f_run_12n.c \"$base\"/{lookup_spec,mtp_spec}.o \"$root/tmp/strata-mtp-batch-20261003/mtp_prime.o\" \"${objects[@]}\" \"$root/tmp/strata-pipeline-20261003/target_dense_tiles.o\" \"${link[@]}\" -o \"$bin/bench_glm53f_run_12n\"\ncp \"$root/a64fx/glm5/build/candidate-dense-tile-v2/tofu_topo_helper\" \"$bin/tofu_topo_helper\"\nsha256sum \"$bin\"/{test_glm53f_mla_head_tiles,bench_glm53f_run_12n} > \"$work/binaries-v4.sha256\"\necho MLA_TILES_BUILD_PASS\n",
+  "build_script_v2": "#!/bin/bash\nset -euo pipefail\nroot=$HOME/work/gemm/glm53f-strata-20261001\ncd \"$root/a64fx/glm5\"\nwork=$root/tmp/strata-mla-head-tiles-20261003\nold=$root/tmp/strata-pipeline-20261002/build\nbase=$root/tmp/strata-mhc-sync-20261002/build-integrated-login-v4\nbin=$PWD/build/candidate-mla-head-tiles-v2\nmkdir -p \"$bin\"\nexport TMPDIR=$work OPAL_PREFIX=/opt/FJSVxtclanga/tcsds-1.2.43\nunset OMPI_CC OMPI_CXX\ncc=/opt/FJSVxtclanga/tcsds-1.2.43/bin/mpifccpx\nflags=(-Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast -fopenmp -Wall -Wextra -Werror -ffast-math -fno-math-errno -DGLM53F_PREFILL_ATTN_PANEL=47 -DGLM53F_PREFILL_CAPACITY=4096 -I. -I../../common)\n\"$cc\" \"${flags[@]}\" test_glm53f_mla_head_tiles.c -lm -o \"$bin/test_glm53f_mla_head_tiles\"\n\"$cc\" \"${flags[@]}\" -DGLM53F_EXTERNAL_ST_IMPLEMENTATION -DGLM53F_SPARSE_NO_MAIN -c glm53f_sparse_layer_12n.c -o \"$work/sparse_prime.o\"\nobjects=(\"$base\"/{q8_panel,gemm_kern,gemm_asm,team,collective}.o \"$root/tmp/strata-iq-scales-20261002/build-integrated-v5/iq_bridge.o\" \"$old/kda_pp_beta_rowwise.o\" \"$root/tmp/strata-pipeline-20261003/dense_tiles_full.o\" \"$old/moe_pp_fast.o\" \"$work/sparse_prime.o\" \"$root/tmp/strata-mtp-batch-20261003/head_verify.o\" \"$root/tmp/strata-mtp-batch-20261003/embedding_prime.o\" \"$old\"/{dist,pipeline}_pp.o)\nlink=(-L\"$root/tmp/strata-mhc-sync-20261002/target-libs\" -lm -lpthread -ltofucom)\n\"$cc\" \"${flags[@]}\" bench_glm53f_run_12n.c \"$base\"/{lookup_spec,mtp_spec}.o \"$root/tmp/strata-mtp-batch-20261003/mtp_prime.o\" \"${objects[@]}\" \"$root/tmp/strata-pipeline-20261003/target_dense_tiles.o\" \"${link[@]}\" -o \"$bin/bench_glm53f_run_12n\"\ncp \"$root/a64fx/glm5/build/candidate-dense-tile-v2/tofu_topo_helper\" \"$bin/tofu_topo_helper\"\nsha256sum \"$bin\"/{test_glm53f_mla_head_tiles,bench_glm53f_run_12n} > \"$work/binaries-v2.sha256\"\necho MLA_TILES_BUILD_PASS\n",
+  "implementation_base_commit": "d00329ac",
+  "source_sha256_v2_reconstructed": {
+    "a64fx/glm5/glm53f_runtime.h": "e50eafdfb22ec0a5c6288ae73abc50599b0b42b9b597f822385edeaae98b4361",
+    "a64fx/glm5/glm53f_mla_attention.h": "bfb3841d6d9f0fd5408b3bd2e27bb5e0661ccf64387c1728ec68a54fb046e77a",
+    "a64fx/glm5/glm53f_sparse_layer_12n.c": "942f41e4ca47d7f675027eaf2bd0bfeab4777fe0b87c14c8905f6d2d92963730"
+  },
+  "host_checks": [
+    "PREFILL_CONFIG PASS (5 new cases)",
+    "18 launcher tests PASS",
+    "git diff --check PASS"
+  ]
+}

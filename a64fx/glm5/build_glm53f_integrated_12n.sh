@@ -102,6 +102,7 @@ if [ "$mode" != runtime ]; then
     obj mtp_spec glm53f_mtp_spec_12n.c
     bin test_glm53f_lookup_spec test_glm53f_lookup_spec.c "$build_dir/lookup_spec.o"
     bin test_glm53f_mtp_spec test_glm53f_mtp_spec.c
+    bin test_glm53f_mla_head_tiles test_glm53f_mla_head_tiles.c
     bin test_glm53f_head_verify test_glm53f_head_verify.c
     bin test_glm53f_head_hidden -ffunction-sections -fdata-sections -Wl,--gc-sections test_glm53f_head_hidden.c
     bin test_glm53f_mtp_prime_12n "${external[@]}" test_glm53f_mtp_prime_12n.c "${objects[@]}"

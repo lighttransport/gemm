@@ -1623,11 +1623,13 @@ static int mla_native_batch(glm53f_sparse_context_12n *c, glm53f_sparse_prefill_
     }
     if (omp_get_max_threads() > c->mlb_threads) return -1;
     int attention_bad = 0;
+    const char *head_tiles = getenv("GLM53F_MLA_PREFILL_SPLIT6");
+    const int split_six = head_tiles && atoi(head_tiles);
 #pragma omp parallel for schedule(dynamic, 1) reduction(|:attention_bad)
     for (int t = 0; t < tokens; ++t) {
         float *lg = c->mlb_lg + (size_t)omp_get_thread_num() * 8 * MLB_SLOTS;
         /* va is head-major [h][t][LAT]: hand mlb_values the token's row of head 0 and a head stride of tokens*LAT. */
-        attention_bad |= mlb_token_grouped(va + (size_t)t * LAT, va_stride, lg, ql + (size_t)t * hn * LAT, c->latent, c->latent_f16, w->selected[t], w->count[t], hn) != 0;
+        attention_bad |= mlb_token_prefill(va + (size_t)t * LAT, va_stride, lg, ql + (size_t)t * hn * LAT, c->latent, c->latent_f16, w->selected[t], w->count[t], hn, split_six) != 0;
     }
     if (attention_bad) return -1;
     {

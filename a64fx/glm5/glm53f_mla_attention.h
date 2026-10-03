@@ -137,4 +137,83 @@ static inline int mlb_token_grouped(float *va, size_t va_stride, float *lg,
     return 0;
 }
 
+/* Twelve live accumulators instead of twenty-four; retain all six heads'
+ * cache reuse and each column's ascending key accumulation. */
+static inline void mlb_values32_six(float *va, size_t va_stride, const float *lg,
+        const float *cache, const uint16_t *half, const int *sel, int nt) {
+    const svbool_t pg = svptrue_b32();
+    for (int db = 0; db < GLM53F_MLA_ATTENTION_LAT; db += 32) {
+#define MLB_V32_DECL(H) svfloat32_t v##H##0 = svdup_f32(0), v##H##1 = v##H##0
+        MLB_V32_DECL(0); MLB_V32_DECL(1); MLB_V32_DECL(2);
+        MLB_V32_DECL(3); MLB_V32_DECL(4); MLB_V32_DECL(5);
+#undef MLB_V32_DECL
+        for (int t = 0; t < nt; ++t) {
+            const svfloat32_t z0 = mlb_cache_load(pg, cache, half,
+                (size_t)sel[t] * GLM53F_MLA_ATTENTION_LAT + db);
+            const svfloat32_t z1 = mlb_cache_load(pg, cache, half,
+                (size_t)sel[t] * GLM53F_MLA_ATTENTION_LAT + db + 16);
+#define MLB_V32_STEP(H) { const float x = lg[(size_t)(H) * GLM53F_MLA_ATTENTION_SLOTS + t]; \
+            v##H##0 = svmla_n_f32_x(pg, v##H##0, z0, x); \
+            v##H##1 = svmla_n_f32_x(pg, v##H##1, z1, x); }
+            MLB_V32_STEP(0) MLB_V32_STEP(1) MLB_V32_STEP(2)
+            MLB_V32_STEP(3) MLB_V32_STEP(4) MLB_V32_STEP(5)
+#undef MLB_V32_STEP
+        }
+#define MLB_V32_STORE(H) { float *o = va + (size_t)(H) * va_stride + db; \
+            svst1(pg, o, v##H##0); svst1(pg, o + 16, v##H##1); }
+        MLB_V32_STORE(0) MLB_V32_STORE(1) MLB_V32_STORE(2)
+        MLB_V32_STORE(3) MLB_V32_STORE(4) MLB_V32_STORE(5)
+#undef MLB_V32_STORE
+    }
+}
+
+static inline void mlb_token_values32_six(float *va, size_t va_stride,
+        float *lg, const float *ql, const float *cache, const uint16_t *half,
+        const int *sel, int nt) {
+    mlb_logits(lg, ql, cache, half, sel, nt, 6);
+    for (int h = 0; h < 6; ++h) {
+        float *l = lg + (size_t)h * GLM53F_MLA_ATTENTION_SLOTS;
+        const svbool_t pt = svptrue_b32();
+        svfloat32_t vmx = svdup_f32(-INFINITY);
+        int t = 0;
+        for (; t + 16 <= nt; t += 16) vmx = svmax_f32_x(pt, vmx, svld1_f32(pt, l + t));
+        float mx = svmaxv_f32(pt, vmx);
+        for (; t < nt; ++t) if (l[t] > mx) mx = l[t];
+        /* vector exp (rel. error ~1e-7) replaces 12k scalar expf calls per token */
+        svfloat32_t vsum = svdup_f32(0);
+        for (t = 0; t < nt; t += 16) {
+            const svbool_t p = svwhilelt_b32(t, nt);
+            svfloat32_t e = gmn_expf(p, svsub_n_f32_x(p, svld1_f32(p, l + t), mx));
+            svst1_f32(p, l + t, e);
+            vsum = svadd_f32_m(p, vsum, e);
+        }
+        const float sum = svaddv_f32(pt, vsum);
+        for (t = 0; t < nt; t += 16) {
+            const svbool_t p = svwhilelt_b32(t, nt);
+            svst1_f32(p, l + t, svdiv_n_f32_x(p, svld1_f32(p, l + t), sum));
+        }
+    }
+    mlb_values32_six(va, va_stride, lg, cache, half, sel, nt);
+}
+
+/* Six-head tiles approach the SVE register limit. An opt-in 3+3 split
+ * retains each head's arithmetic and complete logits, using six log rows. */
+static inline int mlb_token_prefill(float *va, size_t va_stride, float *lg,
+        const float *ql, const float *cache, const uint16_t *half,
+        const int *sel, int nt, int heads, int split_six) {
+    if (split_six == 2 && heads == 6) {
+        if (!va || !lg || !ql || !cache || !sel ||
+            va_stride < GLM53F_MLA_ATTENTION_LAT || nt < 1 ||
+            nt > GLM53F_MLA_ATTENTION_SLOTS) return -1;
+        mlb_token_values32_six(va, va_stride, lg, ql, cache, half, sel, nt);
+        return 0;
+    }
+    if (!split_six || heads != 6)
+        return mlb_token_grouped(va, va_stride, lg, ql, cache, half, sel, nt, heads);
+    if (mlb_token_grouped(va, va_stride, lg, ql, cache, half, sel, nt, 3)) return -1;
+    return mlb_token_grouped(va + 3 * va_stride, va_stride,
+        lg + 3 * GLM53F_MLA_ATTENTION_SLOTS,
+        ql + 3 * GLM53F_MLA_ATTENTION_LAT, cache, half, sel, nt, 3);
+}
+
 #endif

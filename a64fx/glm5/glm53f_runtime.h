@@ -26,6 +26,7 @@ static inline int glm53f_runtime_option(int argc, char **argv, int *index) {
     else if (!strcmp(key, "--q8-prefill-kernel")) env = "GLM53F_NATIVE_Q8_TILE2X8";
     else if (!strcmp(key, "--embedding-batch-kernel")) env = "GLM53F_EMBED_BATCH_PACKED";
     else if (!strcmp(key, "--verify-head-kernel")) env = "GLM53F_HEAD_VERIFY_SHARED";
+    else if (!strcmp(key, "--mla-prefill-heads")) env = "GLM53F_MLA_PREFILL_SPLIT6";
     else if (!strcmp(key, "--mla-softmax-kernel")) env = "GLM53F_MLA_PARALLEL_SOFTMAX";
     else if (!strcmp(key, "--mla-projection-kernel")) env = "GLM53F_MLA_FUSED_PROJECTION";
     else if (!strcmp(key, "--moe-prefill-layout")) env = "GLM53F_MOE_GU_PAD";
@@ -52,6 +53,7 @@ static inline int glm53f_runtime_option(int argc, char **argv, int *index) {
              (!strcmp(key, "--mla-projection-kernel") && !strcmp(value, "fused")) ||
              (!strcmp(key, "--embedding-batch-kernel") && !strcmp(value, "packed")) ||
              (!strcmp(key, "--verify-head-kernel") && !strcmp(value, "shared")) ||
+             (!strcmp(key, "--mla-prefill-heads") && !strcmp(value, "split6")) ||
              (!strcmp(key, "--mla-softmax-kernel") && !strcmp(value, "parallel")) ||
              (!strcmp(key, "--mhc-kernel") && !strcmp(value, "fused-sync")) ||
              (!strcmp(key, "--mhc-verify-kernel") && !strcmp(value, "team")) ||
@@ -61,7 +63,8 @@ static inline int glm53f_runtime_option(int argc, char **argv, int *index) {
              (!strcmp(key, "--index-kernel") && !strcmp(value, "heads")) ||
              (!strcmp(key, "--mla-kernel") && !strcmp(value, "registers")) ||
              (!strcmp(key, "--decode-executor") && !strcmp(value, "persistent"))) enabled = 1;
-    else if ((!strcmp(key, "--q8-prefill-kernel") && !strcmp(value, "tile4x4-asm")) ||
+    else if ((!strcmp(key, "--mla-prefill-heads") && !strcmp(value, "values32")) ||
+             (!strcmp(key, "--q8-prefill-kernel") && !strcmp(value, "tile4x4-asm")) ||
              (!strcmp(key, "--moe-combine-kernel") && !strcmp(value, "overlap")) ||
              (!strcmp(key, "--index-kernel") && !strcmp(value, "keys4")) ||
              (!strcmp(key, "--mla-kernel") && !strcmp(value, "values"))) enabled = 2;

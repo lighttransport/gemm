@@ -10,6 +10,11 @@ static int parse(const char *key, const char *value, glm53f_prefill_config *c) {
 int main(void) {
     glm53f_prefill_config c = {GLM53F_PREFILL_LEGACY, 32, GLM53F_PREFILL_FAST_DEFAULT, NULL, 0};
     int failed = 0;
+    failed |= parse("--mla-prefill-heads", "split6", &c) != 1 || strcmp(getenv("GLM53F_MLA_PREFILL_SPLIT6"), "1");
+    failed |= parse("--mla-prefill-heads", "values32", &c) != 1 || strcmp(getenv("GLM53F_MLA_PREFILL_SPLIT6"), "2");
+    failed |= parse("--mla-prefill-heads", "legacy", &c) != 1 || strcmp(getenv("GLM53F_MLA_PREFILL_SPLIT6"), "0");
+    failed |= parse("--mla-prefill-heads", "bad", &c) != -1;
+    failed |= parse("--mla-prefill-heads", NULL, &c) != -1;
     failed |= parse("--verify-head-kernel", "shared", &c) != 1 || strcmp(getenv("GLM53F_HEAD_VERIFY_SHARED"), "1");
     failed |= parse("--verify-head-kernel", "legacy", &c) != 1 || strcmp(getenv("GLM53F_HEAD_VERIFY_SHARED"), "0");
     failed |= parse("--verify-head-kernel", "bad", &c) != -1;
