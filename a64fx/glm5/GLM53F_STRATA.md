@@ -28,7 +28,11 @@ Immutable`candidate-mla-values-model-v1` is built warning-clean. Its serial
 campaign tests combined normalized2 values, split6 prefill and packed
 embedding, with heads3 scores fixed in same-binary controls. Short/full
 state gates, fresh frozen/prior-score controls, five alternating pairs and
-long1024 plain/MTP comparisons are underway. No promotion or confirmed
+long1024 plain/MTP comparisons are underway. The first pair improves
+prefill2.7853%/decode2.0484%, with exact IDs; four pairs remain.
+The [running checkpoint](strata-mla-values-model-checkpoint-20261004.json)
+records completed screens, first pair and raw short/full endpoint hashes.
+No promotion or confirmed
 value-kernel model gain is claimed. See [integrated native evidence](strata-mla-values-integrated-native-20261004.json),
 [unscaled rejection](strata-mla-values-native-20261004.json) and
 [prescale prototypes](strata-mla-values-prescale-native-20261004.json).

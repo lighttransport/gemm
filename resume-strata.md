@@ -21,9 +21,10 @@ prefill. All129/257/1025 counts and IDs pass; short/full endpoints are byte
 exact across all12 ranks. Minimum available8.319031GiB. No promotion; see
 `strata-mla-logits-model-20261004.json`. Long MTP's95.6% acceptance yields
 34.631289 tok/s, but combined prefill/decode time50.241911s versus plain
-50.135670s shows no end-to-end advantage at1024 outputs.
+50.135670s shows no combined timed-phase advantage at1024 outputs (load/IO excluded).
 
-New opt-in`--mla-value-kernel legacy|normalized2`, defaultlegacy, divides
+Value kernel commit`5fbc0f66` adds opt-in
+`--mla-value-kernel legacy|normalized2`, defaultlegacy, and divides
 probabilities once into the existing logit scratch, then shares half-cache
 loads across2 heads×32 columns. Guard: six heads, selected keys, derived
 FP16 cache, SVE16 lanes, at least512 keys. Five-head/CP/other paths retain
@@ -43,8 +44,12 @@ MPI to broaden its unlaunched prescale fixture. New campaign
 state gates, fresh frozen/prior-score controls, isolated value screen, five
 alternating combined pairs (normalized2+split6 prefill+packed embedding),
 and long1024 plain/MTP comparisons. Scores useheads3 throughout except
-frozen. Raw short/full cross-option endpoint states pass byte-for-byte on all12 ranks. Timing confirmation
-continues; no value-kernel whole-model gain or promotion is claimed yet.
+frozen. Raw short/full cross-option endpoint states pass byte-for-byte on all12 ranks.
+Screens: isolated values402.033771 prefill/34.235902 decode versus same-binary
+legacy401.166466/34.132069; combined413.304226/34.275158. First pair401.542296→412.726297 prefill and33.527778→34.214550 decode
+(+2.7853%/+2.0484%); four pairs and long comparisons remain. The running
+checkpoint is`a64fx/glm5/strata-mla-values-model-checkpoint-20261004.json`.
+Confirmation continues; no value-kernel whole-model gain or promotion is claimed yet.
 Scratch`tmp/strata-mla-logits-20261003/` archives immutable sources/provenance
 and completed phases. Do not restage or overlap MPI. Defaults and qualified
 recipe stay35.462134 decode/412.273634 prefill; targets remain unmet.
