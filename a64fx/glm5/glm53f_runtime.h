@@ -27,6 +27,7 @@ static inline int glm53f_runtime_option(int argc, char **argv, int *index) {
     else if (!strcmp(key, "--embedding-batch-kernel")) env = "GLM53F_EMBED_BATCH_PACKED";
     else if (!strcmp(key, "--verify-head-kernel")) env = "GLM53F_HEAD_VERIFY_SHARED";
     else if (!strcmp(key, "--mla-prefill-heads")) env = "GLM53F_MLA_PREFILL_SPLIT6";
+    else if (!strcmp(key, "--mtp-target-restore")) env = "GLM53F_MTP_REJECTION_RESTORE";
     else if (!strcmp(key, "--mla-value-kernel")) env = "GLM53F_MLA_VALUES_NORMALIZED2";
     else if (!strcmp(key, "--mla-logits-kernel")) env = "GLM53F_MLA_LOGITS_HEADS3";
     else if (!strcmp(key, "--mla-softmax-kernel")) env = "GLM53F_MLA_PARALLEL_SOFTMAX";
@@ -56,6 +57,7 @@ static inline int glm53f_runtime_option(int argc, char **argv, int *index) {
              (!strcmp(key, "--embedding-batch-kernel") && !strcmp(value, "packed")) ||
              (!strcmp(key, "--verify-head-kernel") && !strcmp(value, "shared")) ||
              (!strcmp(key, "--mla-prefill-heads") && !strcmp(value, "split6")) ||
+             (!strcmp(key, "--mtp-target-restore") && !strcmp(value, "rejection")) ||
              (!strcmp(key, "--mla-value-kernel") && !strcmp(value, "normalized2")) ||
              (!strcmp(key, "--mla-logits-kernel") && !strcmp(value, "heads3")) ||
              (!strcmp(key, "--mla-softmax-kernel") && !strcmp(value, "parallel")) ||

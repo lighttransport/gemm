@@ -46,13 +46,31 @@ alternating combined pairs (normalized2+split6 prefill+packed embedding),
 and long1024 plain/MTP comparisons. Scores useheads3 throughout except
 frozen. Raw short/full cross-option endpoint states pass byte-for-byte on all12 ranks.
 Screens: isolated values402.033771 prefill/34.235902 decode versus same-binary
-legacy401.166466/34.132069; combined413.304226/34.275158. First pair401.542296→412.726297 prefill and33.527778→34.214550 decode
-(+2.7853%/+2.0484%); four pairs and long comparisons remain. The running
-checkpoint is`a64fx/glm5/strata-mla-values-model-checkpoint-20261004.json`.
-Confirmation continues; no value-kernel whole-model gain or promotion is claimed yet.
+legacy401.166466/34.132069; combined413.304226/34.275158. Five pairs confirm+2.9427% prefill/+0.7268% decode, with all257 IDs exact;
+median absolute rates401.299720→413.108692 prefill and34.025137→34.272419
+decode. Long plain/MTP comparisons continue. The running checkpoint is
+`a64fx/glm5/strata-mla-values-model-checkpoint-20261004.json` (19 runs/29
+timed trials); no promotion, and combined gain does not isolate values.
 Scratch`tmp/strata-mla-logits-20261003/` archives immutable sources/provenance
 and completed phases. Do not restage or overlap MPI. Defaults and qualified
 recipe stay35.462134 decode/412.273634 prefill; targets remain unmet.
+
+**Next queued experiment:** opt-in `--mtp-target-restore legacy|rejection`,
+default legacy, skips target snapshot restore on fully accepted windows while
+retaining rejected-prefix restores and MTP replay. Both modes pass1792 host
+controller cases, strict CLI and ASan/UBSan;18 launcher/6 reporting tests pass.
+Separate FCC candidate `candidate-mtp-rejection-restore-v1` built warning-clean.
+Waiting driver13463 depends on10801 terminal/PASS, refuses concurrent MPI,
+and respects04:35 new-run margin. Its seven model runs follow a1792-case
+12-rank native gate: short/full legacy/rejection states and long1024
+plain/MTP screens. No native model result yet. Scratch
+`tmp/strata-mtp-restore-20261004/`; report
+`a64fx/glm5/strata-mtp-rejection-restore-20261004.json`.
+The value-model recorder now verifies source hashes via commit5fbc0f66 because
+the current runtime header adds the new restore option; its immutable candidate
+and measurements retain their original source. Do not rebuild either candidate
+in place or overlap MPI. Finish value report, then audit restore endpoint files
+with bounded frontend reads and archive both campaigns' rank0 logs.
 
 Bridge session49515107 died at00:31 JST when an optional missing-log read hit
 leaked interactive`set -e`; detached owners survived and were verified from

@@ -9,7 +9,7 @@ static double glm53f_clock(void) { return mock_time += 0.001; }
 #include <stdio.h>
 
 enum { MAX_POSITION = 512, STEPS = 128 };
-struct glm53f_target_model_12n { int position, bulk_calls; unsigned hash; float head[5][HIDDEN]; };
+struct glm53f_target_model_12n { int position, bulk_calls, restore_calls, rejected_batches; unsigned hash; float head[5][HIDDEN]; };
 struct glm53f_target_snapshot_12n { int position; unsigned hash; };
 struct glm53f_mtp_context_12n {
     int length, draft_index, reject_at;
@@ -39,7 +39,7 @@ glm53f_target_snapshot_12n *glm53f_target_snapshot_create_12n(const glm53f_targe
 }
 void glm53f_target_snapshot_free_12n(glm53f_target_snapshot_12n *s) { free(s); }
 int glm53f_target_snapshot_restore_12n(glm53f_target_model_12n *m, const glm53f_target_snapshot_12n *s) {
-    m->position = s->position; m->hash = s->hash; return 0;
+    ++m->restore_calls; m->position = s->position; m->hash = s->hash; return 0;
 }
 int glm53f_target_model_step_12n(glm53f_target_model_12n *m, int input,
         int *next, float *logit, float *h) {
@@ -58,6 +58,8 @@ int glm53f_target_model_step_batch_12n(glm53f_target_model_12n *m,
         if (raw) raw[2] = 0;
         after[j]->position = m->position; after[j]->hash = m->hash;
     }
+    for (int j = 0; j + 1 < n; ++j)
+        if (next[j] != input[j + 1]) { ++m->rejected_batches; break; }
     return 0;
 }
 int glm53f_target_model_head_hidden_12n(const glm53f_target_model_12n *m,
@@ -110,6 +112,7 @@ int main(int argc, char **argv) {
     MPI_Init(&argc, &argv);
     int failed = 0, cases = 0;
     const int prompts[] = {1, 4, 47, 128}, lengths[] = {1, 2, 3, 4, 5, 7, 31, 128};
+    for (int restore = 0; restore <= 1; ++restore)
     for (size_t p = 0; p < sizeof(prompts) / sizeof(prompts[0]); ++p)
         for (int depth = 1; depth <= 4; ++depth)
             for (int reject = 0; reject <= depth; ++reject)
@@ -135,6 +138,7 @@ int main(int argc, char **argv) {
                         glm53f_mtp_spec_stats_12n stats;
                         struct observed o = {0, transitions, 0};
                         mock_time = 0;
+                        failed |= setenv("GLM53F_MTP_REJECTION_RESTORE", restore ? "1" : "0", 1);
                         int rc = w ? glm53f_mtp_spec_decode_12n(&m, &mtp, w, prompt,
                             parent, expected_token[prompt], transitions, depth,
                             adaptive ? 1e-6 : 0, ids, &stats, observe, &o) : -1;
@@ -143,6 +147,7 @@ int main(int argc, char **argv) {
                             m.position != prompt + transitions ||
                             m.hash != expected_hash[prompt + transitions] || o.failed || o.last != transitions;
                         if (!rc) {
+                            bad |= m.restore_calls != (restore ? m.rejected_batches : stats.cycles);
                             bad |= stats.accepted > stats.proposed ||
                                 stats.accepted + stats.cycles + stats.fallback_tokens != transitions;
                             if (stats.cache_synchronized) {

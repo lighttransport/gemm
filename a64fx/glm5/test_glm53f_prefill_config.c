@@ -10,6 +10,10 @@ static int parse(const char *key, const char *value, glm53f_prefill_config *c) {
 int main(void) {
     glm53f_prefill_config c = {GLM53F_PREFILL_LEGACY, 32, GLM53F_PREFILL_FAST_DEFAULT, NULL, 0};
     int failed = 0;
+    failed |= parse("--mtp-target-restore", "rejection", &c) != 1 || strcmp(getenv("GLM53F_MTP_REJECTION_RESTORE"), "1");
+    failed |= parse("--mtp-target-restore", "legacy", &c) != 1 || strcmp(getenv("GLM53F_MTP_REJECTION_RESTORE"), "0");
+    failed |= parse("--mtp-target-restore", "invalid", &c) != -1;
+    failed |= parse("--mtp-target-restore", NULL, &c) != -1;
     failed |= parse("--mla-value-kernel", "normalized2", &c) != 1 || strcmp(getenv("GLM53F_MLA_VALUES_NORMALIZED2"), "1");
     failed |= parse("--mla-value-kernel", "legacy", &c) != 1 || strcmp(getenv("GLM53F_MLA_VALUES_NORMALIZED2"), "0");
     failed |= parse("--mla-value-kernel", "bad", &c) != -1;

@@ -5,6 +5,26 @@ prefill tokens/s**, on twelve A64FX nodes, the complete 45-layer
 UD-Q4_K_XL model, top-8 routing, and the saved roughly 8K coding prompt.
 These targets have **not been demonstrated** by the changes below.
 
+## MTP rejected-window restore (October4; host exact, native queued)
+
+`--mtp-target-restore legacy|rejection`, default `legacy`, follows Strata's
+fully accepted window handling (`glm_decode.cpp:4842–4857`, branch `glm53f`,
+commit `3bbb469`). Target verification already ends at the final snapshot
+when all proposals are accepted. The opt-in path skips that redundant restore;
+rejected windows still restore their accepted prefix. MTP teacher-forced
+replay and token accounting retain their existing behavior.
+
+Both modes pass1792 host controller cases with exact IDs, target position/hash,
+true-parent MTP cache contents and restore-call counts. Every rejection prefix,
+depths1..4, short/ragged tails and adaptive fallback are covered. Strict GCC,
+ASan/UBSan (leak detection disabled), CLI parser,18 launcher tests and6 reporting
+tests pass. The host MPI shim does not validate distributed behavior.
+A separate warning-clean FCC candidate is built. Driver13463 waits for
+successful owner10801 completion, idle MPI and allocation headroom, then runs
+native12-rank controller, short/full state and long1024 plain/MTP screens.
+No native-model correctness or speedup is claimed yet. See
+[restore experiment](strata-mtp-rejection-restore-20261004.json).
+
 ## Prescaled MLA value-cache reuse (October4; native exact, model pending)
 
 `--mla-value-kernel legacy|normalized2`, default`legacy`, divides each
@@ -28,12 +48,13 @@ Immutable`candidate-mla-values-model-v1` is built warning-clean. Its serial
 campaign tests combined normalized2 values, split6 prefill and packed
 embedding, with heads3 scores fixed in same-binary controls. Short/full
 state gates, fresh frozen/prior-score controls, five alternating pairs and
-long1024 plain/MTP comparisons are underway. The first pair improves
-prefill2.7853%/decode2.0484%, with exact IDs; four pairs remain.
+long1024 plain/MTP comparisons are underway. Five alternating pairs confirm
+median paired gains2.9427% prefill/0.7268% decode, with exact IDs. Absolute
+rate medians are401.299720→413.108692 prefill and34.025137→34.272419 decode.
+These gains do not pass the5% promotion threshold.
 The [running checkpoint](strata-mla-values-model-checkpoint-20261004.json)
-records completed screens, first pair and raw short/full endpoint hashes.
-No promotion or confirmed
-value-kernel model gain is claimed. See [integrated native evidence](strata-mla-values-integrated-native-20261004.json),
+records completed screens, five pairs and raw short/full endpoint hashes.
+No promotion; combined gains do not isolate the value kernel. See [integrated native evidence](strata-mla-values-integrated-native-20261004.json),
 [unscaled rejection](strata-mla-values-native-20261004.json) and
 [prescale prototypes](strata-mla-values-prescale-native-20261004.json).
 

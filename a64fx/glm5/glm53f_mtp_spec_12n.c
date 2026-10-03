@@ -47,6 +47,8 @@ int glm53f_mtp_spec_decode_12n(glm53f_target_model_12n *m,
         first < 0 || first >= 154880 || transitions < 1 || transitions > 32768 ||
         depth < 1 || depth > MAX_DRAFT ||
         glm53f_mtp_length_12n(mtp) != prompt_count - 1) return -1;
+    const char *restore_mode = getenv("GLM53F_MTP_REJECTION_RESTORE");
+    const int rejection_restore = restore_mode && atoi(restore_mode);
     memset(stats, 0, sizeof(*stats));
     stats->cache_synchronized = 1;
     memcpy(w->parent, parent_hidden, sizeof(w->parent));
@@ -112,7 +114,11 @@ int glm53f_mtp_spec_decode_12n(glm53f_target_model_12n *m,
                 glm53f_target_model_head_hidden_12n(m, w->verified[0], n + 1)) return -1;
             int accepted = 0;
             while (accepted < n && draft[accepted] == prediction[accepted]) ++accepted;
-            if (glm53f_target_snapshot_restore_12n(m, w->after[accepted])) return -1;
+            /* A fully accepted window already ends at after[n]. Keep the
+             * legacy restore by default; the opt-in path rolls back only
+             * rejected windows. MTP replay below still uses target hiddens. */
+            if ((!rejection_restore || accepted < n) &&
+                glm53f_target_snapshot_restore_12n(m, w->after[accepted])) return -1;
             stats->verify_seconds += glm53f_clock() - start;
             start = glm53f_clock();
             /* The first draft pair used the exact parent hidden. Retain it,
