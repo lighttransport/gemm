@@ -101,6 +101,8 @@ int glm53f_native_matvec_team(const glm53f_native_matrix *m, int count,
 int glm53f_native_matvec_multi_team(const glm53f_native_matrix *m, int count,
     const void *const *activation);
 int glm53f_native_matvec_prepared_n(const glm53f_native_matrix *m, int count, const void *activation);
+/* Serial rows [r0, r1) on the calling thread; r0 aligned to the row group. Same per-row arithmetic as the team form. */
+int glm53f_native_matvec_rows(const glm53f_native_matrix *m, int r0, int r1, const void *activation);
 int glm53f_native_matvec_n(const glm53f_native_matrix *m, int count,
                            const float *input);
 /* Token-major inputs/outputs: input stride = columns, each output stride =

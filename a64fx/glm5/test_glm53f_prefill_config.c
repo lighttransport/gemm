@@ -100,6 +100,7 @@ int main(void) {
     failed |= parse("--snapshot-copy", "deferred", &c) != 1 || strcmp(getenv("GLM53F_SNAPSHOT_DEFER"), "1");
     failed |= parse("--env", "GLM53F_KDA_DETAIL=1", &c) != 1 || strcmp(getenv("GLM53F_KDA_DETAIL"), "1");
     failed |= parse("--env", "PATH=x", &c) != -1;
+    failed |= parse("--kda-decode-pipeline", "heads", &c) != 1 || strcmp(getenv("GLM53F_KDA_HEAD_PIPE"), "1");
     failed |= parse("--mhc-post-kernel", "chunked", &c) != 1 || strcmp(getenv("GLM53F_MHC_POST_CHUNK"), "1");
     failed |= parse("--moe-prefill-layout", "padded", &c) != 1 || strcmp(getenv("GLM53F_MOE_GU_PAD"), "1");
     failed |= parse("--moe-prefill-layout", "tight", &c) != 1 || strcmp(getenv("GLM53F_MOE_GU_PAD"), "0");

@@ -315,6 +315,9 @@ static inline void glm53f_mhc_local_team(float *streams, const float *sublayer, 
         scratch->normalized[d] = scratch->collapsed[d] * inv2 * glm53f_bf16_to_f32(norm[d]);
     }
     GLM53F_MHC_MARK(5);   /* collapse + normalize (incl. barrier 2 when not Gram) */
+#ifdef GLM53F_MHC_PHASE_TIMING
+    if (!tid) glm53f_mhc_phase[7] += 1.0;   /* local-kernel calls */
+#endif
     if (glm53f_mhc_next_fn) {
         const uint16_t *next = glm53f_mhc_next_fn;
         for (int m = 0; m < GLM53F_MHC_MIX; ++m)

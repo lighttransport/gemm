@@ -121,7 +121,7 @@ struct glm53f_kda_context_12n {
     int q2_fa_type,q2_fb_type,q2_b_type,q2_ga_type,q2_gb_type;
     int q2_aux,q2_op_cols;
     float *small_g;
-    void *act_x,*act_small,*act_out;
+    void *act_x,*act_small,*act_out,*act_small_g; /* act_small_g: --kda-decode-pipeline heads only */
     unsigned char *batch_act;
     /* int8 panel64 GEMM path for the Q8_0 projections (GLM53F_KDA_GEMM: 1 on (default), 0 off, 2 verify vs native) */
     int kg_state, kg_mode, kg_beta;
@@ -191,7 +191,7 @@ static int kda_native_load(glm53f_kda_context_12n*c){
     else if(rc<0||c->dist)return-1;
 #undef LOAD
     size_t ab=glm53f_native_act_bytes(QKV);
-    c->act_x=a256(ab);c->act_small=a256(ab);c->act_out=a256(ab);c->small_g=a256(D*sizeof(float));
+    c->act_x=a256(ab);c->act_small=a256(ab);c->act_out=a256(ab);c->act_small_g=a256(ab);c->small_g=a256(D*sizeof(float));
     c->q2_native=1;return 0;}
 
 static int kda_is_q80(int type){return type==GLM53F_GGML_Q8_0||type==GLM53F_NATIVE_Q8_0R||type==GLM53F_NATIVE_Q8_0R16;}
@@ -359,6 +359,57 @@ static void kda_worker(void *context) {
 #pragma omp single
             {double t=glm53f_clock();c->detail[0]=t-(*a->td);(*a->td)=t;}
         }
+        {   /* Opt-in GLM53F_KDA_HEAD_PIPE=1 (--kda-decode-pipeline heads): everything after the projections is
+             * head-local, so one task per head runs conv -> fb rows -> norms/decay/beta -> recurrence -> gb rows ->
+             * gated rmsnorm without team barriers between the steps (four phases of ~20 us each otherwise).
+             * Per-element arithmetic and matvec row groups are unchanged. */
+            const char *pipe_env = getenv("GLM53F_KDA_HEAD_PIPE");
+            if (pipe_env && atoi(pipe_env) && c->q2_native && c->q2_aux && a->columns <= 1) {
+#pragma omp single
+                if (glm53f_native_act_prepare(c->act_small, c->small, D,
+                        !kda_is_q80(c->q2_fb_type), kda_is_q80(c->q2_fb_type)) ||
+                    glm53f_native_act_prepare(c->act_small_g, c->small_g, D,
+                        !kda_is_q80(c->q2_gb_type), kda_is_q80(c->q2_gb_type)))
+                    MPI_Abort(MPI_COMM_WORLD,2);
+                const glm53f_native_matrix mf = {c->gate, c->q2_fb, c->q2_fb_type, qd, D},
+                                           mg = {c->gate, c->q2_gb, c->q2_gb_type, qd, D};
+#pragma omp for schedule(static, 1)
+                for (int h = 0; h < hn; ++h) {
+                    for (int which = 0; which < 3; ++which) {
+                        float *o = which == 0 ? q : (which == 1 ? k : v);
+                        const uint16_t *cw = which == 0 ? w->qc : (which == 1 ? w->kc : w->vc);
+                        for (int ch = h * D; ch < (h + 1) * D; ++ch) {
+                            float *st = c->conv + ((size_t)which * qd + ch) * KERNEL, y = 0.0f;
+                            memmove(st, st + 1, (KERNEL - 1) * sizeof(*st));
+                            st[KERNEL - 1] = o[ch];
+                            for (int z = 0; z < KERNEL; z++) y += st[z] * glm53f_bf16_to_f32(cw[(size_t)ch * KERNEL + z]);
+                            o[ch] = y / (1.0f + expf(-y));
+                        }
+                    }
+                    if (glm53f_native_matvec_rows(&mf, h * D, (h + 1) * D, c->act_small)) MPI_Abort(MPI_COMM_WORLD,2);
+                    kda_l2norm(q + (size_t)h * D, D, 1e-6f);
+                    kda_l2norm(k + (size_t)h * D, D, 1e-6f);
+                    glm53f_kda_safe_log_decay(c->decay + (size_t)h * D, c->gate + (size_t)h * D, w->dt + (size_t)h * D, w->al[h], -5.0f, D);
+                    c->beta[h] = glm53f_sigmoid(c->beta[h]);
+                    if (a->columns) {
+                        for (int d = 0; d < D; ++d)
+                            c->decode_factor[h * D + d] = glm53f_kda_scalar_factor(c->decay[h * D + d]);
+                        for (int block = 0; block < 2; ++block)
+                            glm53f_kda_columns64_sve(c->state + (size_t)h * D * D + block * 64,
+                                c->core + h * D + block * 64, q + h * D, k + h * D,
+                                v + h * D + block * 64, c->decode_factor + h * D, c->beta[h]);
+                    } else
+                        glm53f_kda_step_vec_streamed(c->state+(size_t)h*D*D,q+(size_t)h*D,k+(size_t)h*D,v+(size_t)h*D,c->decay+(size_t)h*D,c->beta[h],D,D,c->core+(size_t)h*D,c->work+(size_t)h*D);
+                    if (glm53f_native_matvec_rows(&mg, h * D, (h + 1) * D, c->act_small_g)) MPI_Abort(MPI_COMM_WORLD,2);
+                    glm53f_rmsnorm_gated_bf16(c->normed+(size_t)h*D,c->core+(size_t)h*D,c->gate+(size_t)h*D,w->on,1,D,1e-5f);
+                }
+                if(c->detail_profile){
+#pragma omp single
+                    {double t=glm53f_clock();c->detail[1]=c->detail[2]=c->detail[4]=0;c->detail[3]=t-(*a->td);(*a->td)=t;}
+                }
+                goto kda_head_pipe_done;
+            }
+        }
         conv3_team(q,k,v,c->conv,w->qc,w->kc,w->vc,qd);
         kda_dump("q_conv", q, (size_t)qd * sizeof(float), c->rank, c->layer);
         kda_dump("k_conv", k, (size_t)qd * sizeof(float), c->rank, c->layer);
@@ -439,6 +490,7 @@ static void kda_worker(void *context) {
 #pragma omp single
             {c->detail[4]=glm53f_clock()-(*a->td);}
         }
+kda_head_pipe_done:
         if (a->out) {
             /* Fused output projection (GLM53F_KDA_FUSED_OUT): the same team
              * quantizes the gated output (bit-identical team form) and runs the

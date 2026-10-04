@@ -1135,6 +1135,18 @@ void glm53f_target_profile_report_12n(
             printf(" ms_pos(min/mean/max)\n");
         }
     }
+#ifdef GLM53F_MHC_PHASE_TIMING
+    /* Diagnostic build only: rank-0 time inside the local mHC kernel (thread 0), per call. Compare with
+     * GLM53F_TARGET_GAP mhc_* site times to separate kernel time from entry/dispatch/exit. Cumulative
+     * over the process (prefill uses the batch path, not this kernel). */
+    if (!rank && glm53f_mhc_phase[7] > 0)
+        printf("GLM53F_MHC_INMODEL label=%s calls=%.0f us_per_call: post+ss=%.2f gram+dots=%.2f barrier1=%.2f "
+               "reduce=%.2f sinkhorn=%.2f collapse+norm=%.2f gram_reduce=%.2f\n", label ? label : "target",
+               glm53f_mhc_phase[7], glm53f_mhc_phase[0] * 1e6 / glm53f_mhc_phase[7],
+               glm53f_mhc_phase[1] * 1e6 / glm53f_mhc_phase[7], glm53f_mhc_phase[2] * 1e6 / glm53f_mhc_phase[7],
+               glm53f_mhc_phase[3] * 1e6 / glm53f_mhc_phase[7], glm53f_mhc_phase[4] * 1e6 / glm53f_mhc_phase[7],
+               glm53f_mhc_phase[5] * 1e6 / glm53f_mhc_phase[7], glm53f_mhc_phase[6] * 1e6 / glm53f_mhc_phase[7]);
+#endif
     double kda_max[3], kda_min[3];
     MPI_Reduce(m->batch_kda, kda_max, 3, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     MPI_Reduce(m->batch_kda, kda_min, 3, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);

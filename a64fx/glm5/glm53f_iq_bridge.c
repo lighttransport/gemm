@@ -809,6 +809,26 @@ int glm53f_native_matvec_team(const glm53f_native_matrix *m, int count,
     return native_matvec_multi_team(m, count, &activation, 1);
 }
 
+/* Serial rows [r0, r1) of one matrix with a prepared activation, on the calling thread. r0 must be a multiple of the
+ * matrix's row group (1/4/8/16), so each row uses the same kernel call and arithmetic as the team scheduler. */
+int glm53f_native_matvec_rows(const glm53f_native_matrix *m, int r0, int r1, const void *activation) {
+    if (!m || !activation || r0 < 0 || r1 > m->rows || r0 > r1) return -1;
+    const size_t rb = glm53f_native_row_size(m->type, m->columns);
+    if (!m->output || !m->weight || !rb || native_check(m->type, m->columns, activation)) return -1;
+    const char *rows8_env = getenv("GLM53F_NATIVE_Q8_ROWS8");
+    const int group = m->type == GLM53F_NATIVE_Q8_0R16 ? 16 :
+                      m->type == GLM53F_NATIVE_Q8_0R ? (rows8_env && atoi(rows8_env) ? 8 : 4) : 1;
+    if (r0 % group || (group == 16 && m->rows % 16)) return -1;
+    const native_act *a = activation;
+    for (int r = r0; r < r1; r += group) {
+        if (group == 16) q8_0r16_rows(m->output, m->weight, m->rows, m->columns, r, a);
+        else if (group == 8) q8_0r_rows8(m->output + r, m->weight + (size_t)r * rb, rb, m->rows - r < 8 ? m->rows - r : 8, a);
+        else if (group == 4) q8_0r_rows(m->output + r, m->weight + (size_t)r * rb, rb, m->rows - r < 4 ? m->rows - r : 4, a);
+        else m->output[r] = native_row(m->type, m->weight + (size_t)r * rb, a);
+    }
+    return 0;
+}
+
 /* Independent inputs with one row scheduler and one trailing barrier. */
 int glm53f_native_matvec_multi_team(const glm53f_native_matrix *m, int count,
         const void *const *activation) {
