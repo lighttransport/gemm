@@ -14,6 +14,9 @@
 #include <unistd.h>
 #include <sys/syscall.h>
 #include <omp.h>
+/* Optional diagnostic sync profile (glm53f_sync_profile.c); absent in normal builds. */
+extern void glm53f_sync_profile_reset(void) __attribute__((weak));
+extern void glm53f_sync_profile_report(const char *label, long positions) __attribute__((weak));
 
 static int positive(const char *s, int limit) {
     char *end;
@@ -278,6 +281,7 @@ int main(int argc, char **argv) {
         check(glm53f_target_snapshot_save_12n(m, primed));
         check(glm53f_target_snapshot_restore_12n(m, primed));
         glm53f_target_profile_reset_12n(m);
+        if (glm53f_sync_profile_reset) glm53f_sync_profile_reset();
         MPI_Barrier(MPI_COMM_WORLD);
         begin = glm53f_clock();
         struct memory_guard guard = {minimum, transitions, 0};
@@ -295,6 +299,7 @@ int main(int argc, char **argv) {
         minimum = guard.minimum;
         double decode = elapsed(begin);
         glm53f_target_profile_report_12n(m, "bench-decode");
+        if (glm53f_sync_profile_report) glm53f_sync_profile_report("bench-decode", transitions);
         int equal = trial < 0 || !memcmp(ids, reference,
                             (size_t)(transitions + 1) * sizeof(int)), all;
         MPI_Allreduce(&equal, &all, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
