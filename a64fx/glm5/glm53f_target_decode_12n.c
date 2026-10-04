@@ -162,6 +162,7 @@ struct glm53f_target_model_12n {
     long scalar_steps, batch_calls, batch_positions;
     double scalar_phase[5], batch_phase[5];
     double scalar_detail[4], batch_detail[4]; /* KDA, sparse, dense FFN, MoE. */
+    double mhc_site[3]; /* Plain decode mHC: first attention site, FFN site (incl. fused router), end of layer. */
     double batch_kda[3]; /* Front/recurrence, output projection, reduction. */
 };
 struct glm53f_target_snapshot_12n {
@@ -457,7 +458,7 @@ int glm53f_target_model_step_12n(glm53f_target_model_12n *m, int token,
             target_plan_attention(m, l);
             glm53f_mhc_pre_sve(&m->scratch->mhc, m->streams, &w->attention_mhc,
                                w->input_norm);
-            if (m->profile) m->scalar_phase[1] += glm53f_clock() - begin;
+            if (m->profile) { double e = glm53f_clock() - begin; m->scalar_phase[1] += e; m->mhc_site[0] += e; }
         }
         if (target_sublayer_trace(m->scratch->mhc.normalized, HIDDEN,
                                   "attn_norm", l)) return -1;
@@ -500,7 +501,7 @@ int glm53f_target_model_step_12n(glm53f_target_model_12n *m, int token,
             glm53f_mhc_pre_sve(&m->scratch->mhc, m->streams, &w->ffn_mhc,
                                w->post_attention_norm);
         }
-        if (m->profile) m->scalar_phase[1] += glm53f_clock() - begin;
+        if (m->profile) { double e = glm53f_clock() - begin; m->scalar_phase[1] += e; m->mhc_site[1] += e; }
         if (target_sublayer_trace(m->streams, FLAT,
                                   "hc_attn_post", l)) return -1;
         if (target_sublayer_trace(m->scratch->mhc.normalized, HIDDEN,
@@ -554,7 +555,7 @@ int glm53f_target_model_step_12n(glm53f_target_model_12n *m, int token,
             glm53f_mhc_post_sve(m->streams, m->scratch->sublayer_output,
                                 &m->scratch->mhc);
         if (target_sublayer_trace(m->streams, FLAT, "l_last", l)) return -1;
-        if (m->profile) m->scalar_phase[1] += glm53f_clock() - begin;
+        if (m->profile) { double e = glm53f_clock() - begin; m->scalar_phase[1] += e; m->mhc_site[2] += e; }
         if (target_layer_trace(m->streams, l)) return -1;
     }
     begin = m->profile ? glm53f_clock() : 0.0;
@@ -1093,6 +1094,7 @@ void glm53f_target_profile_reset_12n(glm53f_target_model_12n *m) {
     memset(m->scalar_detail, 0, sizeof(m->scalar_detail));
     memset(m->batch_detail, 0, sizeof(m->batch_detail));
     memset(m->batch_kda, 0, sizeof(m->batch_kda));
+    memset(m->mhc_site, 0, sizeof(m->mhc_site));
     glm53f_moe_stage_profile_reset_12n(m->moe);
     for (int l = 0; l < LAYERS; ++l)
         glm53f_sparse_profile_reset_12n(m->sparse[l]);
@@ -1112,6 +1114,27 @@ void glm53f_target_profile_report_12n(
                MPI_COMM_WORLD);
     MPI_Reduce(m->batch_detail, batch_detail, 4, MPI_DOUBLE, MPI_MAX, 0,
                MPI_COMM_WORLD);
+    {   /* Gap ledger: per-phase min/mean/max over ranks (the lines above are rank maxima,
+         * which fold waiting for the slowest rank into every phase). ms per scalar step. */
+        enum { NG = 12 };
+        static const char *const gname[NG] = {"embed", "mhc", "attention", "ffn", "head", "kda", "sparse",
+                                              "dense_ffn", "moe", "mhc_attn", "mhc_ffn", "mhc_end"};
+        double g[NG], gmin[NG], gmax[NG], gsum[NG];
+        for (int i = 0; i < 5; ++i) g[i] = m->scalar_phase[i];
+        for (int i = 0; i < 4; ++i) g[5 + i] = m->scalar_detail[i];
+        for (int i = 0; i < 3; ++i) g[9 + i] = m->mhc_site[i];
+        MPI_Reduce(g, gmin, NG, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
+        MPI_Reduce(g, gmax, NG, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+        MPI_Reduce(g, gsum, NG, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+        int nranks; MPI_Comm_size(MPI_COMM_WORLD, &nranks);
+        if (!rank && m->scalar_steps) {
+            const double d = 1e3 / m->scalar_steps;
+            printf("GLM53F_TARGET_GAP label=%s steps=%ld", label ? label : "target", m->scalar_steps);
+            for (int i = 0; i < NG; ++i)
+                printf(" %s=%.3f/%.3f/%.3f", gname[i], gmin[i] * d, gsum[i] * d / nranks, gmax[i] * d);
+            printf(" ms_pos(min/mean/max)\n");
+        }
+    }
     double kda_max[3], kda_min[3];
     MPI_Reduce(m->batch_kda, kda_max, 3, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     MPI_Reduce(m->batch_kda, kda_min, 3, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
