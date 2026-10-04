@@ -98,6 +98,7 @@ static void name(char*out,int l,const char*s){snprintf(out,256,"model.language_m
 
 struct glm53f_kda_context_12n {
     int rank, layer, h0, hn, qd, detail_profile;
+    int fused_ready, fused_bad; /* fused attention layer: partial holds this step's o_proj output */
     int ranks, image_rank;
     const glm53f_dist *dist;
     const char *native_stage;
@@ -434,6 +435,34 @@ static void kda_worker(void *context) {
 
 }
 
+/* Fused attention layer (GLM53F_KDA_FUSED_LAYER, --kda-layer-kernel fused):
+ * the preceding mHC team calls this after normalization (all threads, same
+ * input); it runs the KDA worker with the fused output projection into
+ * c->partial, and the KDA sublayer then only reduces. Eligibility is decided
+ * by the caller with glm53f_kda_fusable_12n so every thread agrees. */
+int glm53f_kda_fusable_12n(const glm53f_kda_context_12n *c) {
+    return c && c->q2_native && c->q2_op_cols == c->qd && !c->int8_enabled && !c->detail_profile && !c->dist;
+}
+void glm53f_kda_team_12n(void *context, const float *x) {
+    glm53f_kda_context_12n *c = context;
+    const char *column_env = getenv("GLM53F_KDA_DECODE_COLUMNS");
+    const int columns = column_env && atoi(column_env);
+#pragma omp single
+    {
+        if (columns && !c->decode_factor) c->decode_factor = a256((size_t)c->qd * sizeof(float));
+        c->fused_bad = 0;
+    }
+    double td = 0.0;
+    struct kda_call call = {c, x, NULL, 0.0f, &td, columns, c->partial, 0};
+    kda_worker(&call);
+    if (call.bad) {
+#pragma omp atomic write
+        c->fused_bad = 1;
+    }
+#pragma omp barrier
+#pragma omp single
+    c->fused_ready = !c->fused_bad;
+}
 static int kda_local(glm53f_kda_context_12n*c,float*out,const float*x){
     weights*w=&c->w;int qd=c->qd,hn=c->hn;double td=c->detail_profile?glm53f_clock():0;
     double t0=glm53f_clock();float*q=c->qkv,*k=q+qd,*v=k+qd;
@@ -493,7 +522,7 @@ static int kda_local(glm53f_kda_context_12n*c,float*out,const float*x){
     }
     double t2=glm53f_clock();c->phase[0]=t1-t0;c->phase[1]=t2-t1;c->phase[2]=0;return 0;
 }
-int glm53f_kda_sublayer_12n(void*context,float*out,const float*x){glm53f_kda_context_12n*c=context;if(!c||kda_local(c,c->partial,x))return-1;double t=glm53f_clock();int rc=kda_sum(c,c->partial,out,H);c->phase[2]=glm53f_clock()-t;if(c->detail_profile){for(int i=0;i<5;i++)kd_dec[i]+=c->detail[i];kd_dec[5]+=c->phase[1];kd_dec[6]+=c->phase[2];kd_dec_calls++;if(!kd_atexit_set){kd_atexit_set=1;atexit(kd_report);}}return rc;}
+int glm53f_kda_sublayer_12n(void*context,float*out,const float*x){glm53f_kda_context_12n*c=context;if(c&&c->fused_ready){c->fused_ready=0;return kda_sum(c,c->partial,out,H);}if(!c||kda_local(c,c->partial,x))return-1;double t=glm53f_clock();int rc=kda_sum(c,c->partial,out,H);c->phase[2]=glm53f_clock()-t;if(c->detail_profile){for(int i=0;i<5;i++)kd_dec[i]+=c->detail[i];kd_dec[5]+=c->phase[1];kd_dec[6]+=c->phase[2];kd_dec_calls++;if(!kd_atexit_set){kd_atexit_set=1;atexit(kd_report);}}return rc;}
 static int kda_batch_legacy(glm53f_kda_context_12n*c,float*out,const float*x,int tokens,void*states,size_t stride){size_t bytes=glm53f_kda_state_bytes_12n(c);if(!c||!out||!x||tokens<1||tokens>5||(states&&stride<bytes))return-1;if(tokens==5){if(glm53f_kda_sublayer_batch_capture_12n(c,out,x,4,states,stride))return-1;if(glm53f_kda_sublayer_12n(c,out+(size_t)4*H,x+(size_t)4*H))return-1;return !states||!glm53f_kda_save_state_12n(c,(unsigned char*)states+(size_t)4*stride,stride)?0:-1;}if(tokens==1){if(kda_local(c,c->batch_partial,x))return-1;if(states&&glm53f_kda_save_state_12n(c,states,stride))return-1;}else{weights*w=&c->w;int qd=c->qd,hn=c->hn;double t0=glm53f_clock();glm53f_mv_bf16_batch(c->bq,w->q,x,tokens,qd,H);glm53f_mv_bf16_batch(c->bk,w->k,x,tokens,qd,H);glm53f_mv_bf16_batch(c->bv,w->v,x,tokens,qd,H);glm53f_mv_bf16_batch(c->bsmall_f,w->fa,x,tokens,D,H);glm53f_mv_bf16_batch(c->bgate_f,w->fb,c->bsmall_f,tokens,qd,D);glm53f_mv_bf16_batch(c->bbeta,w->b,x,tokens,hn,H);glm53f_mv_bf16_batch(c->bsmall_g,w->ga,x,tokens,D,H);glm53f_mv_bf16_batch(c->bgate_g,w->gb,c->bsmall_g,tokens,qd,D);for(int t=0;t<tokens;t++){float*q=c->bq+(size_t)t*qd,*k=c->bk+(size_t)t*qd,*v=c->bv+(size_t)t*qd,*gate=c->bgate_f+(size_t)t*qd,*beta=c->bbeta+(size_t)t*hn;glm53f_causal_conv1d_silu_bf16(q,c->conv,q,w->qc,qd,KERNEL);glm53f_causal_conv1d_silu_bf16(k,c->conv+(size_t)qd*KERNEL,k,w->kc,qd,KERNEL);glm53f_causal_conv1d_silu_bf16(v,c->conv+(size_t)2*qd*KERNEL,v,w->vc,qd,KERNEL);for(int h=0;h<hn;h++){glm53f_l2norm(q+(size_t)h*D,D,1e-6f);glm53f_l2norm(k+(size_t)h*D,D,1e-6f);glm53f_kda_safe_log_decay(c->decay+(size_t)h*D,gate+(size_t)h*D,w->dt+(size_t)h*D,w->al[h],-5.0f,D);beta[h]=glm53f_sigmoid(beta[h]);}
 #pragma omp parallel for schedule(static)
             for(int h=0;h<hn;h++)glm53f_kda_step_vec_streamed(c->state+(size_t)h*D*D,q+(size_t)h*D,k+(size_t)h*D,v+(size_t)h*D,c->decay+(size_t)h*D,beta[h],D,D,c->core+(size_t)h*D,c->work+(size_t)h*D);glm53f_rmsnorm_gated_bf16(c->bnormed+(size_t)t*qd,c->core,c->bgate_g+(size_t)t*qd,w->on,hn,D,1e-5f);if(states&&glm53f_kda_save_state_12n(c,(unsigned char*)states+(size_t)t*stride,stride))return-1;}double t1=glm53f_clock();glm53f_mv_bf16_batch(c->batch_partial,w->op,c->bnormed,tokens,H,qd);c->phase[0]=t1-t0;c->phase[1]=glm53f_clock()-t1;}double t=glm53f_clock();int rc=kda_sum(c,c->batch_partial,out,tokens*H);c->phase[2]=glm53f_clock()-t;return rc;}

@@ -511,6 +511,14 @@ int glm53f_target_model_step_12n(glm53f_target_model_12n *m, int token,
         if (m->mhc_chained && l + 1 < LAYERS) {
             const glm53f_target_layer_weights_12n *next = &m->layer_weight[l + 1];
             target_plan_attention(m, l + 1);
+            const char *kda_fused = getenv("GLM53F_KDA_FUSED_LAYER");
+            if (kda_fused && atoi(kda_fused) && glm53f_mhc_fast_on() == 1 && m->kda[l + 1] &&
+                glm53f_kda_fusable_12n(m->kda[l + 1]))
+                /* Same mHC team as post_pre, continuing into the next KDA layer. */
+                glm53f_mhc_fast_route(m->streams, m->scratch->sublayer_output, &m->scratch->mhc,
+                                      &next->attention_mhc, next->input_norm, 1,
+                                      glm53f_kda_team_12n, m->kda[l + 1]);
+            else
             glm53f_mhc_post_pre_sve(m->streams, m->scratch->sublayer_output,
                                     &m->scratch->mhc, &next->attention_mhc,
                                     next->input_norm);
