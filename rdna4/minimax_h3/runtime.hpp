@@ -5,8 +5,21 @@
 #include "../video_common/aotriton_bridge.h"
 #include "h3.h"
 #include "kernels.hpp"
+#include <dlfcn.h>
 #include <iostream>
 #include <random>
+#ifndef HV15N_ROCM
+#include "../../cuda/fa2/cuda_fa2_kernels.h"
+// CUDA mapping of the hipBLAS helper: types 0=F32 (pedantic), 2=F16, 14=BF16; F32 output.
+inline int video_hipblas_gemm(cublasew_context *c, CUdeviceptr y, CUdeviceptr w, CUdeviceptr x,
+                              int m, int n, int k, int type) {
+    if (type == 0)
+        return cublasew_gemm_f32_pedantic_rowmajor_nt(c, y, w, x, m, n, k);
+    if (type == 2)
+        return cublasew_gemm_f16_f16_f32_rowmajor_nt(c, y, w, x, m, n, k);
+    return cublasew_gemm_bf16_bf16_f32_rowmajor_nt(c, y, w, x, m, n, k);
+}
+#endif
 namespace h3 {
 using namespace hv15n;
 inline float bf(float x) {
@@ -37,6 +50,10 @@ struct Engine {
     std::unique_ptr<void, int (*)(void *)> aot_library{nullptr, dlclose};
     video_aotriton_forward_fn aot_attention = nullptr;
     uint64_t aot_calls = 0;
+#ifndef HV15N_ROCM
+    CUmodule flash_bf16 = nullptr, flash_f16 = nullptr;
+    cublasew_context *int8_blas = nullptr;
+#endif
     explicit Engine(const h3_config &c)
         : g(c.device, c.vram_budget_mib, false, false), root(c.model_dir),
           convrot_hipblas(c.convrot_hipblas != 0), bf16_hipblas(c.bf16_hipblas != 0),
@@ -44,7 +61,7 @@ struct Engine {
         require(c.bf16_hipblas == 0 || c.bf16_hipblas == 1, "BF16 backend must be 0 or 1");
         require(c.convrot_hipblas == 0 || c.convrot_hipblas == 1, "ConvRot backend must be 0 or 1");
         require(c.vae_hipblas == 0 || c.vae_hipblas == 1, "VAE backend must be 0 or 1");
-        auto code = Gpu::compile(source);
+        auto code = Gpu::compile(std::string(prelude) + source);
         g.check(cuModuleLoadData(&module, code.data()), "H3 module");
         try {
             if (c.aotriton_bridge) {
@@ -66,11 +83,17 @@ struct Engine {
             for (const char *name : {"h3_round", "h3_pack_bf16", "h3_angles", "h3_qwen_angles",
                                      "h3_rotate", "h3_quant", "h3_norm", "h3_swiglu", "h3_qkv",
                                      "h3_rope", "h3_mod", "h3_gate", "h3_scale_add", "h3_patch",
-                                     "h3_unpatch", "h3_decode_patch", "h3_qwen_attention"}) {
+                                     "h3_unpatch", "h3_decode_patch", "h3_qwen_attention"
+#ifndef HV15N_ROCM
+                                     ,
+                                     "h3_dequant", "h3_pack_heads", "h3_unpack_heads"
+#endif
+                 }) {
                 CUfunction f;
                 g.check(cuModuleGetFunction(&f, module, name), name);
                 g.functions[name] = f;
             }
+#ifdef HV15N_ROCM
             for (auto name : {"video_gemm_i8", "video_gemm_i8_tiled", "video_gemm_i8_pipeline",
                               "video_gemm_bf16"}) {
                 CUfunction f;
@@ -85,7 +108,27 @@ struct Engine {
                 g.check(cuModuleGetFunction(&f, g.flash, name), name);
                 g.functions[name] = f;
             }
+#else
+            require(!c.aotriton_bridge, "the AOTriton bridge is ROCm-only");
+            // Private FlashAttention-2: BF16 head-128 for DiT/refiner, FP16 head-64 for the VAE.
+            auto ptx = Gpu::compile(std::string("#define FA2_D 128\n#define FA2_BR 64\n#define "
+                                                "FA2_BC 16\n#define FA2_CAUSAL 0\n#define FA2_BF16 1\n") +
+                                    k_fa2_attn_src);
+            g.check(cuModuleLoadData(&flash_bf16, ptx.c_str()), "H3 BF16 attention");
+            ptx = Gpu::compile(std::string("#define FA2_D 64\n#define FA2_BR 64\n#define FA2_BC "
+                                           "32\n#define FA2_CAUSAL 0\n") +
+                               k_fa2_attn_src);
+            g.check(cuModuleLoadData(&flash_f16, ptx.c_str()), "H3 FP16 attention");
+            require(cublasewCreate(&int8_blas, g.stream) == 0, "INT8 GEMM requires cuBLAS");
+#endif
         } catch (...) {
+#ifndef HV15N_ROCM
+            if (int8_blas)
+                cublasewDestroy(int8_blas);
+            for (auto m : {flash_bf16, flash_f16})
+                if (m)
+                    cuModuleUnload(m);
+#endif
             cuModuleUnload(module);
             module = nullptr;
             throw;
@@ -96,6 +139,13 @@ struct Engine {
         cuStreamSynchronize(g.stream);
         if (rotation_blas)
             cublasewDestroy(rotation_blas);
+#ifndef HV15N_ROCM
+        if (int8_blas)
+            cublasewDestroy(int8_blas);
+        for (auto m : {flash_bf16, flash_f16})
+            if (m)
+                cuModuleUnload(m);
+#endif
         if (module) {
             cuCtxSetCurrent(g.context);
             cuStreamSynchronize(g.stream);
@@ -202,17 +252,31 @@ struct Engine {
                 e.g.launch("h3_quant", x.rows(), 1, 1, 256, 1, 0, q.pointer, xs.pointer,
                            rotated.pointer, x.rows(), x.channels(), kind);
                 y = e.g.empty({x.rows(), w.shape[0]});
+#ifndef HV15N_ROCM
+                // Exact INT32 sums from cuBLAS IMMA, written into y and scaled in place.
+                require(cublasew_gemm_int8_s32_rowmajor_nt(e.int8_blas, y.pointer, w.pointer,
+                                                           q.pointer, x.rows(), y.channels(),
+                                                           x.channels()) == 0,
+                        "INT8 cuBLAS GEMM failed");
+                e.g.launch("h3_dequant", int((y.count() + 255) / 256), 1, 1, 256, 1, 0, y.pointer,
+                           xs.pointer, scale.pointer, x.rows(), y.channels(), int(kind == 1));
+#else
                 const int tile = x.rows() >= 128 ? 128 : 32;
                 e.g.launch(tile == 128 ? "video_gemm_i8_pipeline" : "video_gemm_i8",
                            (y.channels() + tile - 1) / tile, (x.rows() + tile - 1) / tile, 1, 128,
                            1, 0, y.pointer, q.pointer, w.pointer, xs.pointer, scale.pointer,
                            x.rows(), y.channels(), x.channels(), int(kind == 1), CUdeviceptr(0));
+#endif
                 e.int8_calls++;
                 if (kind == 2)
                     y = e.rounded(y, kind);
             } else if (kind == 1 && !precise) {
                 y = e.g.empty({x.rows(), w.shape[0]});
+#ifndef HV15N_ROCM
+                if (true) { // CUDA uses cuBLAS BF16 GEMM for dense BF16 projections.
+#else
                 if (e.bf16_hipblas) {
+#endif
                     if (!e.rotation_blas)
                         require(cublasewCreate(&e.rotation_blas, e.g.stream) == 0,
                                 "BF16 GEMM requires hipBLAS; use --bf16-hipblas 0 for native WMMA");
@@ -299,6 +363,41 @@ struct Engine {
             g.attention_calls++;
             return out;
         }
+#ifndef HV15N_ROCM
+        {
+            int rows = q.rows();
+            require(heads == kvheads && (kind == 1 ? dim == 128 : dim == 64),
+                    "H3 CUDA attention geometry");
+            auto pq = g.empty_half({heads, rows, dim}), pk = g.empty_half(pq.shape),
+                 pv = g.empty_half(pq.shape);
+            for (auto pair : {std::pair<Tensor *, Tensor *>{&pq, &q}, {&pk, &k}, {&pv, &v}})
+                g.launch("h3_pack_heads", int((q.count() + 255) / 256), 1, 1, 256, 1, 0,
+                         pair.first->pointer, pair.second->pointer, rows, heads, dim, kind);
+            const auto shape = q.shape;
+            q = {};
+            k = {};
+            v = {};
+            auto packed = g.empty_half({heads, rows, dim});
+            CUfunction fn;
+            g.check(cuModuleGetFunction(&fn, kind == 1 ? flash_bf16 : flash_f16, "fa2_attn"),
+                    "H3 attention lookup");
+            float scale = 1.f / std::sqrt(float(dim));
+            int d = dim;
+            void *params[] = {&packed.pointer, &pq.pointer, &pk.pointer, &pv.pointer, &rows, &d,
+                              &scale};
+            g.poll();
+            g.check(cuLaunchKernel(fn, (rows + 63) / 64, heads, 1, 128, 1, 1,
+                                   4 * (dim == 128 ? 16 : 32) * (dim + 8) * 2, g.stream, params,
+                                   nullptr),
+                    "H3 FlashAttention");
+            auto out = g.empty(shape);
+            g.launch("h3_unpack_heads", int((out.count() + 255) / 256), 1, 1, 256, 1, 0,
+                     out.pointer, packed.pointer, rows, heads, dim, kind);
+            g.attention_calls++;
+            g.flash_calls++;
+            return out;
+        }
+#else
         if (aot_attention && kind == 1 && dim == 128 && q.rows() >= 128) {
             const auto shape = q.shape;
             const int rows = q.rows();
@@ -340,6 +439,7 @@ struct Engine {
         g.attention_calls++;
         g.flash_calls++;
         return rounded(out, kind);
+#endif
     }
     Tensor self_attention(Weights &w, const std::string &p, const Tensor &x, int heads, int dim,
                           int kind, const Tensor *angles = nullptr, int pairs = 0,

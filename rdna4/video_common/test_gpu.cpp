@@ -193,7 +193,7 @@ int main() {
             g.check(cuModuleGetFunction(&f, g.mma, name), name);
             g.functions[name] = f;
         }
-        auto code = Gpu::compile(h3::source);
+        auto code = Gpu::compile(std::string(h3::prelude) + h3::source);
         CUmodule mod;
         g.check(cuModuleLoadData(&mod, code.data()), "h3 module");
         for (auto name : {"h3_rotate", "h3_quant", "h3_norm", "h3_qwen_attention"}) {

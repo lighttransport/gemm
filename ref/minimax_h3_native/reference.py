@@ -318,7 +318,7 @@ def main():
     args = p.parse_args()
     manifest, native, out = Path(args.manifest), Path(args.native), Path(args.out)
     generation = json.loads(manifest.read_text())
-    if generation["backend"] != "minimax_h3_rocm_experimental":
+    if generation["backend"] not in ("minimax_h3_rocm_experimental", "minimax_h3_cuda_experimental"):
         raise ValueError("wrong generation backend")
     model = Path(args.model)
     for name, receipt in generation["verified_components"].items():

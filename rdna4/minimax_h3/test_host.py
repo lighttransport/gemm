@@ -122,7 +122,8 @@ class H3Tests(unittest.TestCase):
             out = root / "video"
             with patch.object(gen.video, "run_process", side_effect=RuntimeError("native failure")), patch.object(gen.video, "MemorySampler"), patch.object(gen.video, "device_lock", return_value=nullcontext()):
                 with self.assertRaisesRegex(RuntimeError, "native failure"):
-                    gen.generate(model=model, out=out, prompt="test", allow_experimental=True)
+                    backend = "cuda" if "h3_cuda" in os.environ.get("H3_TEST_LIBRARY", "") else "rocm"
+                    gen.generate(model=model, out=out, prompt="test", allow_experimental=True, backend=backend)
             self.assertFalse(out.exists())
             self.assertFalse(out.with_name("video.partial").exists())
             self.assertEqual(keep.read_text(), "unrelated")

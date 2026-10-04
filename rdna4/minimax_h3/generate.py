@@ -1,4 +1,4 @@
-"""Run native H3 INT8 ConvRot on RDNA4 and publish a silent 24 fps MP4."""
+"""Run native H3 INT8 ConvRot on RDNA4 or CUDA and publish a silent 24 fps MP4."""
 from __future__ import annotations
 import argparse
 import importlib.util
@@ -12,17 +12,26 @@ spec = importlib.util.spec_from_file_location("hv15_video_tools", ROOT / "cuda/h
 video = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(video)
 RUNNER = ROOT / "tmp/video-rocm/h3-build/h3_rocm"
+CUDA_RUNNER = ROOT / "tmp/video-cuda/h3-build/h3_cuda"
+DEFAULT_MODEL = {"rocm": "/mnt/disk01/models/h3/weights", "cuda": "/mnt/nvme01/models/h3/weights"}
 UPSTREAM = "2472a20bd291451acc303917059ab14dfc380478"
 COMPONENTS = ("diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors",
               "text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
               "vae/minimax_h3_video_vae_fp16.safetensors", "tokenizer/tokenizer.json")
 
 
-def generate(*, model="/mnt/disk01/models/h3/weights", out, prompt, width=1344, height=768,
-             frames=124, steps=40, seed=42, device=0, vram_budget_mib=14336, runner=RUNNER,
+def generate(*, model=None, out, prompt, width=1344, height=768,
+             frames=124, steps=40, seed=42, device=0, vram_budget_mib=14336, runner=None,
              allow_experimental=False, keep_frames=False, noise_file=None, audio_noise_file=None,
              dump_dir=None, convrot_hipblas=1, bf16_hipblas=1, aotriton_bridge=None, vae_hipblas=0,
-             cancel=None, progress=None, compress_dumps=False, fp32_hipblas=1):
+             cancel=None, progress=None, compress_dumps=False, fp32_hipblas=1, backend="rocm"):
+    if backend not in ("cuda", "rocm"):
+        raise ValueError("backend must be cuda or rocm")
+    if backend == "cuda" and aotriton_bridge:
+        raise ValueError("the AOTriton bridge is ROCm-only")
+    model = model or DEFAULT_MODEL[backend]
+    runner = runner or (CUDA_RUNNER if backend == "cuda" else RUNNER)
+    backend_name = f"minimax_h3_{backend}_experimental"
     if not allow_experimental:
         raise ValueError("native H3 requires --allow-experimental until full GPU parity is established")
     if not prompt or len(prompt.encode()) > 4096 or type(seed) is not int or not 0 <= seed <= 2**63 - 1:
@@ -32,7 +41,7 @@ def generate(*, model="/mnt/disk01/models/h3/weights", out, prompt, width=1344, 
     if frames < 5 or frames > 362 or (frames - 5) % 17 or not 2 <= steps <= 100:
         raise ValueError("frames must be 17*n+5 in 5..362; steps must be 2..100 sigma-grid points")
     if not 4096 <= vram_budget_mib <= 14336 or device < 0:
-        raise ValueError("invalid AMD device or VRAM budget")
+        raise ValueError("invalid device or VRAM budget")
     model, out, runner = Path(model).resolve(), Path(out).resolve(), Path(runner).resolve()
     stage = out.with_name(out.name + ".partial")
     if out.exists() or stage.exists():
@@ -63,7 +72,11 @@ def generate(*, model="/mnt/disk01/models/h3/weights", out, prompt, width=1344, 
     sources = {str(p.relative_to(ROOT)): video.digest(p) for directory in
                (ROOT / "rdna4/minimax_h3", ROOT / "rdna4/video_common")
                for p in directory.iterdir() if p.suffix in (".cpp", ".h", ".hpp", ".hip", ".py") or p.name == "Makefile"}
-    for name in ("rdna4/rocew.c", "rdna4/rocew.h", "rdna4/hunyuan_video15_native/gpu_hip.cpp",
+    platform = (("cuda/cuew.c", "cuda/cuew.h", "cuda/cublasew.c", "cuda/cublasew.h",
+                 "cuda/fa2/cuda_fa2_kernels.h", "cuda/hunyuan_video15_native/gpu.cpp",
+                 "cuda/minimax_h3/Makefile") if backend == "cuda" else
+                ("rdna4/rocew.c", "rdna4/rocew.h", "rdna4/hunyuan_video15_native/gpu_hip.cpp"))
+    for name in (*platform,
                  "cuda/hunyuan_video15_native/host.hpp", "cuda/hunyuan_video15_native/tokenizer.hpp",
                  "cuda/hunyuan_video15_native/gpu.hpp", "cuda/hunyuan_video15_native/loader.cpp",
                  "cuda/hunyuan_video15_native/kernels.hpp", "common/safetensors.h"):
@@ -77,7 +90,7 @@ def generate(*, model="/mnt/disk01/models/h3/weights", out, prompt, width=1344, 
     if memory < 60 * 1024**2:
         raise ValueError("H3 block offload requires a 64 GB host (at least 60 GiB usable RAM)")
     stage.mkdir(parents=True)
-    sampler = video.MemorySampler("rocm")
+    sampler = video.MemorySampler(backend)
     started = time.monotonic()
     try:
         raw = stage / "frames"
@@ -105,7 +118,7 @@ def generate(*, model="/mnt/disk01/models/h3/weights", out, prompt, width=1344, 
                 finally:
                     sampler.close()
             metrics = json.loads((raw / "metrics.json").read_text())
-            if metrics.get("backend") != "minimax_h3_rocm_experimental" or metrics.get("int8_wmma_calls", 0) <= 0:
+            if metrics.get("backend") != backend_name or metrics.get("int8_wmma_calls", 0) <= 0:
                 raise ValueError("runner did not execute the native H3 INT8 WMMA backend")
             video.package_frames(raw, stage, count=frames, width=width, height=height, cancel=cancel, log=log)
         if compress_dumps:
@@ -124,7 +137,7 @@ def generate(*, model="/mnt/disk01/models/h3/weights", out, prompt, width=1344, 
                        memory_fit="unverified" if sampler.vram is None else "pass" if sampler.vram <= vram_budget_mib else "fail")
         if metrics["memory_fit"] == "fail":
             raise RuntimeError("native process exceeded its VRAM budget")
-        result = {"schema": "minimax_h3.video.v1", "backend": "minimax_h3_rocm_experimental", **provenance,
+        result = {"schema": "minimax_h3.video.v1", "backend": backend_name, **provenance,
                   "checkpoint": "ref2va_pruned_int8_convrot", "references": [], "prompt": prompt,
                   "width": width, "height": height, "frames": frames, "fps": 24, "seed": seed,
                   "sigma_grid_points": steps, "euler_updates": steps - 1,
@@ -154,16 +167,17 @@ def generate(*, model="/mnt/disk01/models/h3/weights", out, prompt, width=1344, 
         raise
 
 
-def main():
+def main(default_backend="rocm"):
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--model", default="/mnt/disk01/models/h3/weights")
+    p.add_argument("--backend", choices=("cuda", "rocm"), default=default_backend)
+    p.add_argument("--model", help="model directory (default depends on --backend)")
     p.add_argument("--out", required=True)
     p.add_argument("--prompt", required=True)
     for name, default in (("width", 1344), ("height", 768), ("frames", 124), ("steps", 40), ("seed", 42),
                           ("device", 0), ("vram-budget-mib", 14336), ("convrot-hipblas", 1), ("bf16-hipblas", 1),
                           ("vae-hipblas", 0), ("fp32-hipblas", 1)):
         p.add_argument("--" + name, type=int, default=default)
-    p.add_argument("--runner", default=str(RUNNER))
+    p.add_argument("--runner")
     for name in ("noise-file", "audio-noise-file", "dump-dir", "aotriton-bridge"):
         p.add_argument("--" + name)
     p.add_argument("--allow-experimental", action="store_true")

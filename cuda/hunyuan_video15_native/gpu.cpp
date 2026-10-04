@@ -63,6 +63,18 @@ void Gpu::clear_weights() {
   packed_weights.clear(); cached_weight_bytes=0; active_weight_file.clear();
 }
 void Gpu::upload_staged(const Tensor &destination, const void *source, CUstream target) {
+  // Very large tensors (e.g. H3 INT8 FFN matrices) stream through bounded 64 MiB chunks.
+  constexpr size_t chunk_bytes = 64ull << 20;
+  if (destination.bytes() > chunk_bytes) {
+    for (size_t offset = 0; offset < destination.bytes(); offset += chunk_bytes) {
+      Tensor part;
+      part.pointer = destination.pointer + offset;
+      part.element_bytes = 1;
+      part.shape = {int(std::min(chunk_bytes, destination.bytes() - offset))};
+      upload_staged(part, static_cast<const unsigned char *>(source) + offset, target);
+    }
+    return;
+  }
   Staging *slot = nullptr;
   for (auto &entry : staging)
     if (entry.bytes >= destination.bytes() && cuEventQuery(entry.ready)==CUDA_SUCCESS) { slot=&entry; break; }

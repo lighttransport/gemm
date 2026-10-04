@@ -37,7 +37,7 @@ int main(int argc, char **argv) {
         for (int i = 1; i < argc; i++) {
             std::string s = argv[i];
             if (s == "--help") {
-                std::cout << "Native MiniMax H3 Ref2VA text-only INT8 ConvRot / RDNA4 WMMA "
+                std::cout << "Native MiniMax H3 Ref2VA text-only INT8 ConvRot (CUDA/RDNA4) "
                              "runner\n--generate --allow-experimental --model DIR --prompt TEXT "
                              "--out-dir EMPTY_DIR\n--width 1344 --height 768 --frames 124 --steps "
                              "40 --seed 42\n--device 0 --vram-budget-mib 14336 --noise-file "

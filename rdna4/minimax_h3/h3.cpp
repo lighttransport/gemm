@@ -1,5 +1,12 @@
 // SPDX-License-Identifier: MIT
 #include "runtime.hpp"
+#ifdef HV15N_ROCM
+#define H3_DEFAULT_MODEL_DIR "/mnt/disk01/models/h3/weights"
+#define H3_BACKEND "minimax_h3_rocm_experimental"
+#else
+#define H3_DEFAULT_MODEL_DIR "/mnt/nvme01/models/h3/weights"
+#define H3_BACKEND "minimax_h3_cuda_experimental"
+#endif
 struct h3_context {
     std::unique_ptr<h3::Engine> engine;
     std::string metrics;
@@ -13,7 +20,7 @@ static int fail(char *error, size_t capacity, const std::string &text) {
 extern "C" {
 void h3_config_defaults(h3_config *c) {
     if (c)
-        *c = {"/mnt/disk01/models/h3/weights", 0, 14336, 1, 1, nullptr, 0};
+        *c = {H3_DEFAULT_MODEL_DIR, 0, 14336, 1, 1, nullptr, 0};
 }
 void h3_request_defaults(h3_request *r) {
     if (r)
@@ -146,7 +153,7 @@ int h3_generate(h3_context *ctx, const h3_request *r, const h3_callbacks *callba
         e.decode(video, t, h, w, r->frames, cb, dump);
         g.check(cuStreamSynchronize(g.stream), "finish H3");
         ctx->metrics =
-            "{\"backend\":\"minimax_h3_rocm_experimental\",\"int8_wmma_calls\":" +
+            "{\"backend\":\"" H3_BACKEND "\",\"int8_wmma_calls\":" +
             std::to_string(e.int8_calls) + ",\"bf16_wmma_calls\":" + std::to_string(e.bf16_calls) +
             ",\"bf16_hipblas_calls\":" + std::to_string(e.bf16_blas_calls) +
             ",\"fp32_hipblas_calls\":" + std::to_string(e.fp32_blas_calls) +

@@ -1,15 +1,47 @@
 // SPDX-License-Identifier: MIT
 #pragma once
 namespace h3 {
-inline const char *source=R"HIP(
+#ifdef HV15N_ROCM
+inline const char *prelude=R"HIP(
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
+__device__ float h3_f16r(float v){return __half2float(__float2half(v));}
+)HIP";
+#else
+// NVRTC prelude: wave32 shuffles map to full-warp sync shuffles.
+inline const char *prelude=R"CUDA(
+#define __shfl_down(v,d) __shfl_down_sync(0xffffffffu,v,d)
+#define __shfl_xor(v,d,w) __shfl_xor_sync(0xffffffffu,v,d,w)
+__device__ float h3_f16r(float v){unsigned short h;float r;asm("cvt.rn.f16.f32 %0,%1;":"=h"(h):"f"(v));asm("cvt.f32.f16 %0,%1;":"=f"(r):"h"(h));return r;}
+extern "C" {
+// [rows, heads*dim] F32 -> [heads, rows, dim] 16-bit (kind 1 BF16, 2 FP16), nearest-even.
+__global__ void h3_pack_heads(unsigned short *out,const float *x,int rows,int heads,int dim,int kind){
+    long i=(long)blockIdx.x*256+threadIdx.x;if(i>=(long)rows*heads*dim)return;
+    int d=i%dim,h=(i/dim)%heads;long r=i/((long)heads*dim);unsigned short v;
+    if(kind==1)asm("cvt.rn.bf16.f32 %0,%1;":"=h"(v):"f"(x[i]));else asm("cvt.rn.f16.f32 %0,%1;":"=h"(v):"f"(x[i]));
+    out[((long)h*rows+r)*dim+d]=v;
+}
+__global__ void h3_unpack_heads(float *out,const unsigned short *x,int rows,int heads,int dim,int kind){
+    long i=(long)blockIdx.x*256+threadIdx.x;if(i>=(long)rows*heads*dim)return;
+    int d=i%dim,h=(i/dim)%heads;long r=i/((long)heads*dim);unsigned short v=x[((long)h*rows+r)*dim+d];float f;
+    if(kind==1)f=__uint_as_float((unsigned)v<<16);else asm("cvt.f32.f16 %0,%1;":"=f"(f):"h"(v));
+    out[i]=f;
+}
+}
+)CUDA";
+#endif
+inline const char *source=R"HIP(
 __device__ float rnd(float v,int kind){
-    if(kind==2)return __half2float(__float2half(v));
+    if(kind==2)return h3_f16r(v);
     if(kind==1){unsigned u=__float_as_uint(v);if((u&0x7f800000u)!=0x7f800000u)u+=0x7fff+((u>>16)&1);return __uint_as_float(u&0xffff0000u);}
     return v;
 }
 extern "C" {
+// Converts exact INT32 GEMM sums in place, matching video_gemm_i8's epilogue.
+__global__ void h3_dequant(float *y,const float *xs,const float *ws,int m,int n,int rounded){
+    long i=(long)blockIdx.x*256+threadIdx.x;if(i>=(long)m*n)return;
+    float v=(float)__float_as_int(y[i])*(xs[i/n]*ws[i%n]);y[i]=rounded?rnd(v,1):v;
+}
 __global__ void h3_round(float *x,long n,int kind){long i=(long)blockIdx.x*256+threadIdx.x;if(i<n)x[i]=rnd(x[i],kind);}
 __global__ void h3_qwen_angles(float *out,int rows){
     long i=(long)blockIdx.x*256+threadIdx.x;if(i>=(long)rows*64)return;

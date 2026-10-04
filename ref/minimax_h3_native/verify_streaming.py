@@ -44,7 +44,7 @@ def validate_receipt(name, receipt, storage_hash, shape, generation_hash, source
 def run(args):
     manifest, native, reference = map(Path, (args.manifest, args.native, args.reference))
     generation = json.loads(manifest.read_text())
-    if generation.get("backend") != "minimax_h3_rocm_experimental" or generation.get("parity") != "unverified":
+    if generation.get("backend") not in ("minimax_h3_rocm_experimental", "minimax_h3_cuda_experimental") or generation.get("parity") != "unverified":
         raise ValueError("expected a complete native H3 generation")
     required = {"width": 1344, "height": 768, "frames": 124, "fps": 24,
                 "sigma_grid_points": 40, "euler_updates": 39, "seed": 42,

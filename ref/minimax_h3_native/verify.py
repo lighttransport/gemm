@@ -189,7 +189,7 @@ def qwen(args):
 def pipeline(args):
     native, reference = Path(args.native), Path(args.reference)
     generation = json.loads(Path(args.manifest).read_text())
-    if generation.get("backend") != "minimax_h3_rocm_experimental" or generation.get("parity") != "unverified":
+    if generation.get("backend") not in ("minimax_h3_rocm_experimental", "minimax_h3_cuda_experimental") or generation.get("parity") != "unverified":
         raise ValueError("expected a complete native H3 generation")
     diagnostic = args.mode == "diagnostic"
     if not diagnostic and (generation["width"], generation["height"], generation["frames"], generation["fps"]) != (1344, 768, 124, 24):
