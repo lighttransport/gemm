@@ -95,6 +95,7 @@ int main(void) {
     failed |= parse("--act-chunk", "7", &c) != -1;
     failed |= parse("--kda-verify-kernel", "columns", &c) != 1 || strcmp(getenv("GLM53F_KDA_VERIFY_COLUMNS"), "1");
     failed |= parse("--mhc-batch-tail", "parallel", &c) != 1 || strcmp(getenv("GLM53F_MHC_BATCH_TAIL"), "1");
+    failed |= parse("--kda-verify-kernel", "columns64", &c) != 1 || strcmp(getenv("GLM53F_KDA_VERIFY_COLUMNS"), "2");
     failed |= parse("--moe-prefill-layout", "padded", &c) != 1 || strcmp(getenv("GLM53F_MOE_GU_PAD"), "1");
     failed |= parse("--moe-prefill-layout", "tight", &c) != 1 || strcmp(getenv("GLM53F_MOE_GU_PAD"), "0");
     failed |= parse("--moe-prefill-layout", "legacy", &c) != 1 || strcmp(getenv("GLM53F_MOE_GU_PAD"), "0");

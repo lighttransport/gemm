@@ -110,6 +110,7 @@ static inline int glm53f_runtime_option(int argc, char **argv, int *index) {
              (!strcmp(key, "--weight-placement") && !strcmp(value, "cmg-experts")) ||
              (!strcmp(key, "--mhc-kernel") && !strcmp(value, "local")) ||
              (!strcmp(key, "--sparse-verify-kernel") && !strcmp(value, "front-onecoll")) ||
+             (!strcmp(key, "--kda-verify-kernel") && !strcmp(value, "columns64")) ||
              (!strcmp(key, "--index-kernel") && !strcmp(value, "keys4")) ||
              (!strcmp(key, "--mla-kernel") && !strcmp(value, "values"))) enabled = 2;
     else if ((!strcmp(key, "--moe-router-prefill") && !strcmp(value, "unroll1")) ||

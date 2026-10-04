@@ -866,7 +866,7 @@ int glm53f_kda_sublayer_batch_capture_12n(glm53f_kda_context_12n *c,
     int columns64 = column_recurrence && column_env && atoi(column_env);
     const char *verify_columns_env = getenv("GLM53F_KDA_VERIFY_COLUMNS");
     const int verify_columns = !column_recurrence && tokens <= 5 && verify_columns_env &&
-                               atoi(verify_columns_env) && svcntw() == 16;
+                               svcntw() == 16 ? atoi(verify_columns_env) : 0;
     if (verify_columns && !c->prefill_decay) {
         c->prefill_decay = a256((size_t)GLM53F_KDA_TILE_TOKENS * qd * sizeof(float));
         c->prefill_core = a256((size_t)GLM53F_KDA_TILE_TOKENS * qd * sizeof(float));
@@ -1051,20 +1051,28 @@ int glm53f_kda_sublayer_batch_capture_12n(glm53f_kda_context_12n *c,
                             c->prefill_decay[off + d] = glm53f_kda_scalar_factor(c->prefill_decay[off + d]);
                         c->bbeta[(size_t)t * hn + h] = glm53f_sigmoid(c->bbeta[(size_t)t * hn + h]);
                     }
+                /* value 2: 64-column blocks (2 per head) avoid the 16-column split's
+                 * strided accesses; value 1: 16-column blocks (8 per head). */
+                const int bw = verify_columns == 2 ? 64 : 16, nb = D / bw;
 #pragma omp for collapse(2) schedule(static)
                 for (int h = 0; h < hn; ++h)
-                    for (int block = 0; block < 8; ++block)
+                    for (int block = 0; block < nb; ++block)
                         for (int t = 0; t < tokens; ++t) {
                             const size_t off = (size_t)t * qd + h * D;
-                            float *st = c->state + (size_t)h * D * D + block * 16;
-                            glm53f_kda_columns16_sve(st, c->prefill_core + off + block * 16,
-                                c->bq + off, c->bk + off, c->bv + off + block * 16,
-                                c->prefill_decay + off, c->bbeta[(size_t)t * hn + h]);
+                            float *st = c->state + (size_t)h * D * D + block * bw;
+                            if (bw == 64)
+                                glm53f_kda_columns64_sve(st, c->prefill_core + off + block * 64,
+                                    c->bq + off, c->bk + off, c->bv + off + block * 64,
+                                    c->prefill_decay + off, c->bbeta[(size_t)t * hn + h]);
+                            else
+                                glm53f_kda_columns16_sve(st, c->prefill_core + off + block * 16,
+                                    c->bq + off, c->bk + off, c->bv + off + block * 16,
+                                    c->prefill_decay + off, c->bbeta[(size_t)t * hn + h]);
                             if (states) {
                                 float *snap = (float *)((unsigned char *)states + (size_t)t * stride) +
-                                              (size_t)h * D * D + block * 16;
+                                              (size_t)h * D * D + block * bw;
                                 for (int d = 0; d < D; ++d)
-                                    memcpy(snap + (size_t)d * D, st + (size_t)d * D, 16 * sizeof(float));
+                                    memcpy(snap + (size_t)d * D, st + (size_t)d * D, (size_t)bw * sizeof(float));
                             }
                         }
 #pragma omp for collapse(2) schedule(static)
