@@ -45,7 +45,7 @@ def convert(directory):
 
 
 def pipeline_names(generation):
-    if generation.get("backend") != "hv15n_cuda_experimental":
+    if generation.get("backend") not in ("hv15n_cuda_experimental", "hv15n_rocm_experimental"):
         raise ValueError("pipeline acceptance requires a completed native generation manifest")
     task, preset = generation.get("task"), generation.get("preset")
     if task not in ("i2v", "t2v") or preset not in ("quality", "fast12") or (task == "t2v" and preset == "fast12"):
@@ -98,10 +98,13 @@ def validate_configs(model_dir, manifest, receipts, generation):
 
 
 def reference_provenance(args, generation, receipts):
+    import torch
     # A full generation manifest binds every independently computed reference.
     # Bounded probes can run without one, but cannot pass pipeline acceptance.
     return {"generation_manifest_sha256": digest(args.generation_manifest) if args.generation_manifest else None,
-            "weights": {k: v["sha256"] for k, v in receipts.items()}, "upstream_revision": UPSTREAM}
+            "weights": {k: v["sha256"] for k, v in receipts.items()}, "upstream_revision": UPSTREAM,
+            "reference_source_sha256": digest(Path(__file__)),
+            "torch_version": str(torch.__version__), "torch_git_version": torch.version.git_version}
 
 
 def validate_references(reference, names, provenance):

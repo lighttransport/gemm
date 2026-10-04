@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+import fcntl
 import hashlib
 import json
 import os
@@ -16,6 +18,7 @@ import time
 ROOT = Path(__file__).resolve().parents[2]
 RUNNER = ROOT / "tmp/hv15-native/build/hv15n"
 DEFAULT_MODEL = Path("/mnt/nvme02/data/models/hv15")
+ROCM_RUNNER = ROOT / "tmp/video-rocm/hv15-build/hv15n_rocm"
 UPSTREAM = "60783e704160023913bee78f0b47036d393d4dfa"
 
 
@@ -150,8 +153,41 @@ def run_process(command, *, cancel=None, progress=None, log=None, on_start=None)
                 process.wait()
 
 
+@contextmanager
+def device_lock(device, cancel=None):
+    path = ROOT / "tmp/pixal3d/device-locks" / f"rocm-{device}.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as lock:
+        while True:
+            if cancel and cancel.is_set():
+                raise Cancelled("cancelled while waiting for AMD device")
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                time.sleep(.1)
+        yield
+
+
+def amd_process_vram(pid):
+    # DRM counters repeat across descriptors; take the maximum for each device.
+    devices = {}
+    for path in Path(f"/proc/{pid}/fdinfo").glob("*"):
+        fields = dict(line.split(":", 1) for line in path.read_text().splitlines() if ":" in line)
+        if "drm-memory-vram" in fields:
+            value, unit = fields["drm-memory-vram"].split()
+            factor = {"KiB": 1 / 1024, "MiB": 1, "bytes": 1 / 1048576}[unit]
+            key = fields.get("drm-pdev", fields.get("drm-client-id", "device"))
+            devices[key] = max(devices.get(key, 0), int(value) * factor)
+    if devices:
+        return sum(devices.values())
+    counters = list(Path(f"/sys/class/kfd/kfd/proc/{pid}").glob("vram_*"))
+    return sum(int(p.read_text()) for p in counters) / 1048576 if counters else None
+
+
 class MemorySampler:
-    def __init__(self):
+    def __init__(self, backend="cuda"):
+        self.backend = backend
         self.stop = threading.Event()
         self.thread = None
         self.vram, self.rss = None, None
@@ -162,13 +198,18 @@ class MemorySampler:
                     for line in Path(f"/proc/{pid}/status").read_text().splitlines():
                         if line.startswith("VmRSS:"):
                             self.rss = max(self.rss or 0, int(line.split()[1]) / 1024)
-                    result = subprocess.run(["nvidia-smi", "--query-compute-apps=pid,used_gpu_memory",
-                        "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=2)
-                    values = [int(parts[1]) for line in result.stdout.splitlines()
-                              if len(parts := [p.strip() for p in line.split(",")]) == 2
-                              and parts[0] == str(pid) and parts[1].isdigit()]
-                    if values:
-                        self.vram = max(self.vram or 0, sum(values))
+                    if self.backend == "rocm":
+                        value = amd_process_vram(pid)
+                        if value is not None:
+                            self.vram = max(self.vram or 0, value)
+                    else:
+                        result = subprocess.run(["nvidia-smi", "--query-compute-apps=pid,used_gpu_memory",
+                            "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=2)
+                        values = [int(parts[1]) for line in result.stdout.splitlines()
+                                  if len(parts := [p.strip() for p in line.split(",")]) == 2
+                                  and parts[0] == str(pid) and parts[1].isdigit()]
+                        if values:
+                            self.vram = max(self.vram or 0, sum(values))
                 except (OSError, ValueError, subprocess.TimeoutExpired):
                     pass
                 self.stop.wait(.2)
@@ -180,29 +221,36 @@ class MemorySampler:
             self.thread.join(timeout=3)
 
 
-def package_frames(frames, out, *, cancel=None, log=None):
+def package_frames(frames, out, *, cancel=None, log=None, count=81, width=480, height=848):
     from PIL import Image
     paths = sorted(frames.glob("frame_*.ppm"))
-    if [p.name for p in paths] != [f"frame_{i:05d}.ppm" for i in range(81)]:
-        raise ValueError("native runner did not produce exactly 81 consecutive frames")
+    if [p.name for p in paths] != [f"frame_{i:05d}.ppm" for i in range(count)]:
+        raise ValueError("native runner did not produce exactly the requested consecutive frames")
     for path in paths:
         with Image.open(path) as image:
-            if image.size != (480, 848) or image.mode != "RGB":
+            if image.size != (width, height) or image.mode != "RGB":
                 raise ValueError("invalid native RGB frame")
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         raise RuntimeError("ffmpeg is required")
     run_process([ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-framerate", "24",
-        "-i", frames / "frame_%05d.ppm", "-frames:v", "81", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        "-i", frames / "frame_%05d.ppm", "-frames:v", str(count), "-c:v", "libx264", "-pix_fmt", "yuv420p",
         "-movflags", "+faststart", out / "clip.mp4"], cancel=cancel, log=log)
     with Image.open(paths[0]) as image:
         image.save(out / "poster.png")
 
 
 def generate(*, model=DEFAULT_MODEL, out, prompt, task="i2v", preset="quality", image=None, negative_prompt="",
-             seed=42, device=0, vram_budget_mib=14336, gemm="repo", gemm_fallback="cublas",
-             runner=RUNNER, allow_experimental=False, keep_frames=False, noise_file=None,
-             dump_dir=None, cancel=None, progress=None):
+             seed=42, device=0, vram_budget_mib=14336, gemm="repo", gemm_fallback=None,
+             runner=None, allow_experimental=False, keep_frames=False, noise_file=None,
+             dump_dir=None, cancel=None, progress=None, backend="cuda", aotriton_bridge=None):
+    if backend not in ("cuda", "rocm"):
+        raise ValueError("backend must be cuda or rocm")
+    runner = Path(runner) if runner else (ROCM_RUNNER if backend == "rocm" else RUNNER)
+    gemm_fallback = gemm_fallback or ("error" if backend == "rocm" else "cublas")
+    vendor = "hipblas" if backend == "rocm" else "cublas"
+    if gemm not in ("repo", vendor) or gemm_fallback not in ("error", vendor):
+        raise ValueError("GEMM choice does not match the backend")
     if not allow_experimental:
         raise ValueError("native inference requires --allow-experimental until GPU parity is established")
     if type(seed) is not int or not 0 <= seed <= 2**63 - 1 or not prompt or len(prompt.encode()) > 4096:
@@ -211,17 +259,31 @@ def generate(*, model=DEFAULT_MODEL, out, prompt, task="i2v", preset="quality", 
         raise ValueError("I2V requires a portrait; T2V omits it")
     memory = next((int(line.split()[1]) for line in Path("/proc/meminfo").read_text().splitlines()
                    if line.startswith("MemTotal:")), 0)
-    if memory < 64 * 1024**2:
-        raise ValueError("the initial block-offload profile requires at least 64 GiB host RAM")
+    if memory < 60 * 1024**2:
+        raise ValueError("the initial block-offload profile requires a 64 GB host (at least 60 GiB usable RAM)")
+    bridge_receipt = None
+    if aotriton_bridge:
+        aotriton_bridge = Path(aotriton_bridge).resolve()
+        if backend != "rocm" or not aotriton_bridge.is_file():
+            raise ValueError("AOTriton bridge requires ROCm and an existing shared library")
+        bridge_receipt = {"path": str(aotriton_bridge), "bytes": aotriton_bridge.stat().st_size,
+                          "sha256": digest(aotriton_bridge)}
     manifest, receipts = model_manifest(model, task, preset)
     # Freeze provenance before executing: an independent coding agent may be
     # rebuilding files while this long-running process is active.
     runner_sha256 = digest(runner)
     source_hashes = {p.name: digest(p) for pattern in ("*.cpp", "*.hpp", "*.h", "*.py", "Makefile")
                      for p in Path(__file__).parent.glob(pattern)}
-    shared_sources = {name: digest(ROOT / name) for name in (
-        "cuda/gemm/cuda_gemm_ptx_kernels.h", "cuda/cuew.c", "cuda/cuew.h",
-        "cuda/cublasew.c", "cuda/cublasew.h", "common/safetensors.h")}
+    shared_names = (("rdna4/rocew.c", "rdna4/rocew.h", "rdna4/video_common/hip_platform.hpp", "rdna4/video_common/aotriton_bridge.h",
+                     "rdna4/video_common/aotriton_bridge.cpp",
+                     "rdna4/video_common/kernels.hpp", "rdna4/video_common/gemm.hip",
+                     "rdna4/video_common/attention.hip", "rdna4/video_common/flex_attention.hip",
+                     "rdna4/video_common/precision.hip", "rdna4/video_common/timestep_basis.hpp",
+                     "rdna4/video_common/make_kernels.py",
+                     "rdna4/hunyuan_video15_native/gpu_hip.cpp", "common/safetensors.h")
+                    if backend == "rocm" else ("cuda/gemm/cuda_gemm_ptx_kernels.h", "cuda/cuew.c",
+                    "cuda/cuew.h", "cuda/cublasew.c", "cuda/cublasew.h", "common/safetensors.h"))
+    shared_sources = {name: digest(ROOT / name) for name in shared_names}
     image_sha256 = digest(image) if image else None
     noise_sha256 = digest(noise_file) if noise_file else None
     out = Path(out).resolve()
@@ -234,6 +296,8 @@ def generate(*, model=DEFAULT_MODEL, out, prompt, task="i2v", preset="quality", 
             "--prompt", prompt, "--negative-prompt", negative_prompt, "--seed", seed, "--device", device,
             "--vram-budget-mib", vram_budget_mib, "--gemm", gemm, "--gemm-fallback", gemm_fallback,
             "--offload", "block", "--allow-experimental", "--out-dir", frames]
+        if aotriton_bridge:
+            command += ["--aotriton-bridge", aotriton_bridge]
         if image:
             prepared, pixels = prepare_image(image, out)
             command += ["--image", prepared, "--vision-pixels", pixels]
@@ -245,15 +309,19 @@ def generate(*, model=DEFAULT_MODEL, out, prompt, task="i2v", preset="quality", 
                 raise ValueError("dump directory must be new or empty")
             active_dump = dump_dir
             command += ["--dump-dir", dump_dir]
-        sampler = MemorySampler()
+        sampler = MemorySampler(backend)
         started = time.monotonic()
         with (out / "runner.log").open("w") as log:
             try:
-                run_process(command, cancel=cancel, progress=progress, log=log, on_start=sampler.start)
+                if backend == "rocm":
+                    with device_lock(device, cancel):
+                        run_process(command, cancel=cancel, progress=progress, log=log, on_start=sampler.start)
+                else:
+                    run_process(command, cancel=cancel, progress=progress, log=log, on_start=sampler.start)
             finally:
                 sampler.close()
             metrics = json.loads((frames / "runner_metrics.json").read_text())
-            if metrics.get("backend") != "hv15n_cuda":
+            if metrics.get("backend") != "hv15n_" + backend:
                 raise ValueError("runner did not identify the repository native backend")
             package_frames(frames, out, cancel=cancel, log=log)
         if cancel and cancel.is_set():
@@ -263,14 +331,14 @@ def generate(*, model=DEFAULT_MODEL, out, prompt, task="i2v", preset="quality", 
                        else ("pass" if sampler.vram <= vram_budget_mib else "fail"))
         if metrics["memory_fit"] == "fail":
             raise RuntimeError("sampled native VRAM exceeded the requested budget")
-        result = {"schema": "hunyuan_video15.video.v1", "backend": "hv15n_cuda_experimental",
+        result = {"schema": "hunyuan_video15.video.v1", "backend": "hv15n_" + backend + "_experimental",
             "upstream_reference_revision": UPSTREAM, "runner_sha256": runner_sha256,
             "runtime_sources": source_hashes, "shared_sources": shared_sources,
             "task": task, "preset": preset, "prompt": prompt, "negative_prompt": negative_prompt,
             "frames": 81, "fps": 24, "width": 480, "height": 848, "seed": seed,
             "steps": 12 if preset == "fast12" else 50, "cfg": 1 if preset == "fast12" else 6,
             "flow_shift": 7 if preset == "fast12" else 5,
-            "gemm": gemm, "gemm_fallback": gemm_fallback, "model": manifest, "verified_components": receipts,
+            "gemm": gemm, "gemm_fallback": gemm_fallback, "aotriton_bridge": bridge_receipt, "model": manifest, "verified_components": receipts,
             "vision_profile": manifest.get("vision_profile") if image else None,
             "image_sha256": image_sha256, "noise_sha256": noise_sha256,
             "vram_budget_mib": vram_budget_mib, "metrics": metrics, "parity": "unverified"}
@@ -294,7 +362,7 @@ def generate(*, model=DEFAULT_MODEL, out, prompt, task="i2v", preset="quality", 
         raise
 
 
-def main():
+def main(default_backend="cuda"):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=str(DEFAULT_MODEL), help="model package directory (default: %(default)s)")
     for option in ("out", "prompt"):
@@ -306,13 +374,15 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--vram-budget-mib", type=int, default=14336)
-    parser.add_argument("--gemm", choices=("repo", "cublas"), default="repo")
-    parser.add_argument("--gemm-fallback", choices=("cublas", "error"), default="cublas")
-    parser.add_argument("--runner", default=str(RUNNER))
+    parser.add_argument("--gemm", choices=("repo", "cublas", "hipblas"), default="repo")
+    parser.add_argument("--gemm-fallback", choices=("cublas", "hipblas", "error"))
+    parser.add_argument("--runner")
+    parser.add_argument("--backend", choices=("cuda", "rocm"), default=default_backend)
     parser.add_argument("--allow-experimental", action="store_true")
     parser.add_argument("--keep-frames", action="store_true")
     parser.add_argument("--noise-file")
     parser.add_argument("--dump-dir")
+    parser.add_argument("--aotriton-bridge", help="optional standalone ROCm FP16 attention bridge")
     args = parser.parse_args()
     print(json.dumps(generate(**vars(args)), indent=2))
 

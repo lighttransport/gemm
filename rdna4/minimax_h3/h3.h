@@ -1,0 +1,43 @@
+// SPDX-License-Identifier: MIT
+#ifndef PIXAL3D_MINIMAX_H3_H
+#define PIXAL3D_MINIMAX_H3_H
+#include <stddef.h>
+#include <stdint.h>
+#ifdef __cplusplus
+extern "C" {
+#endif
+typedef struct h3_context h3_context;
+typedef struct {
+    const char *model_dir;
+    int device, vram_budget_mib;
+    int bf16_hipblas;            /* 1=reference-order dense GEMM, 0=native BF16 WMMA */
+    int convrot_hipblas;         /* 1=dense BF16 Hadamard, 0=factorized native rotation */
+    const char *aotriton_bridge; /* Optional libvideo_aotriton.so for long BF16 attention */
+    int vae_hipblas;             /* Optional FP16 decoder GEMM; default native WMMA */
+} h3_config;
+typedef struct {
+    const char *prompt, *noise_file, *audio_noise_file, *dump_dir;
+    int width, height, frames, steps;
+    int64_t seed;
+} h3_request;
+typedef struct {
+    void (*progress)(int step, int total, void *user);
+    int (*frame)(int index, int width, int height, const unsigned char *rgb, void *user);
+    int (*cancelled)(void *user);
+    void *user;
+} h3_callbacks;
+void h3_config_defaults(h3_config *config);
+void h3_request_defaults(h3_request *request);
+int h3_validate(const h3_request *request, char *error, size_t capacity);
+h3_context *h3_load(const h3_config *config, char *error, size_t capacity);
+/* Idle-context selection; default 1. Configuration struct layout is unchanged. */
+int h3_set_fp32_hipblas(h3_context *context, int enabled, char *error, size_t capacity);
+int h3_generate(h3_context *context, const h3_request *request, const h3_callbacks *callbacks,
+                char *error, size_t capacity);
+const char *h3_metrics(const h3_context *context);
+void h3_cancel(h3_context *context);
+void h3_free(h3_context *context);
+#ifdef __cplusplus
+}
+#endif
+#endif

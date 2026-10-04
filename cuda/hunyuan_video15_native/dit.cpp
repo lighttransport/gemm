@@ -1,7 +1,30 @@
 #include "models.hpp"
+#ifdef HV15N_ROCM
+#include "../../rdna4/video_common/timestep_basis.hpp"
+#endif
 namespace hv15n {
+#ifdef HV15N_ROCM
+// Encoder and scheduler buffers remain FP32; only the model evaluation follows
+// upstream's FP16 autocast. Restore the scope on exceptions and repeated calls.
+struct DitPrecision {
+    Gpu &gpu;
+    bool previous;
+    explicit DitPrecision(Gpu &g) : gpu(g), previous(g.dit_fp16) { g.dit_fp16 = true; }
+    ~DitPrecision() { gpu.dit_fp16 = previous; }
+};
+#define HV15_DIT_PRECISION(g) DitPrecision precision_scope(g)
+#else
+#define HV15_DIT_PRECISION(g) ((void)0)
+#endif
 static Tensor time_embed(Gpu &g, Weights &w, const std::string &prefix,
                          float time) {
+#ifdef HV15N_ROCM
+  auto basis = g.upload(video_rocm::hv15_time_basis(), {1, 128});
+  auto embedding = g.empty({1, 256});
+  g.launch("hv15_time_embedding", 1, 1, 1, 128, 1, 0, embedding.pointer, basis.pointer, time);
+  return g.linear(w, prefix + ".mlp.2",
+                  g.op(g.linear(w, prefix + ".mlp.0", embedding), 3));
+#else
   std::vector<float> values(256);
   for (int i = 0; i < 128; i++) {
     float a = time * std::exp(-std::log(10000.f) * i / 128);
@@ -11,6 +34,7 @@ static Tensor time_embed(Gpu &g, Weights &w, const std::string &prefix,
   return g.linear(
       w, prefix + ".mlp.2",
       g.op(g.linear(w, prefix + ".mlp.0", g.upload(values, {1, 256})), 3));
+#endif
 }
 static Tensor mlp(Gpu &g, Weights &w, const std::string &prefix,
                   const Tensor &x, int activation) {
@@ -63,6 +87,7 @@ static Tensor refined_text(Gpu &g, Weights &w, const Tensor &text, float time) {
 }
 std::pair<Tensor, Tensor> dit_block(Gpu &g, Weights &w, int index, Tensor img, Tensor txt,
                                     const Tensor &vec, int height, int width) {
+  HV15_DIT_PRECISION(g);
   require(index >= 0 && index < 54, "DiT block index");
     g.poll();
     auto p = "double_blocks." + std::to_string(index);
@@ -137,6 +162,7 @@ void dit_blocks(Gpu &g, Weights &w, std::vector<DitState> &states,
 static DitState prepare_dit(Gpu &g, Weights &w, const Tensor &latent, const Tensor &conditioning,
            const Tensor &text, const Tensor &glyph, const Tensor &vision,
            float time, float next_time) {
+  HV15_DIT_PRECISION(g);
   require(latent.shape.size() == 4 && latent.channels() == 32 &&
               conditioning.channels() == 33 &&
               latent.rows() == conditioning.rows(),
@@ -178,6 +204,7 @@ static DitState prepare_dit(Gpu &g, Weights &w, const Tensor &latent, const Tens
   return {img,txt,vec,latent.shape};
 }
 Tensor dit_finish(Gpu &g,Weights &w,const DitState &state) {
+  HV15_DIT_PRECISION(g);
   auto mod = g.linear(w, "final_layer.adaLN_modulation.1", g.op(state.vec, 3));
   auto out = g.linear(w, "final_layer.linear", modulate(g, state.img, mod, 0));
   out.shape = state.shape;

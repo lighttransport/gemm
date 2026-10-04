@@ -10,7 +10,11 @@ int main(int argc, char **argv) {
         auto component = [&](const char *key) {
             return relative_file(model, string(field(root, "components"), key));
         };
+#ifdef HV15N_ROCM
+        Gpu g(0, 14336, false, false);
+#else
         Gpu g(0, 14336, false, true);
+#endif
         std::string name = argv[2];
         Tensor result;
         bool video = false;

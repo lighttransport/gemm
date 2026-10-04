@@ -5,6 +5,11 @@
 #define STB_IMAGE_IMPLEMENTATION
 #include "../../common/stb_image.h"
 using namespace hv15n;
+#ifdef HV15N_ROCM
+static constexpr const char *vendor_name = "hipblas", *default_fallback = "error";
+#else
+static constexpr const char *vendor_name = "cublas", *default_fallback = "cublas";
+#endif
 struct hv15n_context {
     fs::path root;
     std::unique_ptr<Gpu> gpu;
@@ -19,7 +24,7 @@ static int failure(char *error, size_t capacity, const std::string &message) {
 extern "C" {
 void hv15n_config_defaults(hv15n_config *c) {
     if (c)
-        *c = {HV15N_DEFAULT_MODEL_DIR, 0, 14336, "repo", "cublas"};
+        *c = {HV15N_DEFAULT_MODEL_DIR, 0, 14336, "repo", default_fallback};
 }
 void hv15n_request_defaults(hv15n_request *r) {
     if (r)
@@ -48,19 +53,19 @@ int hv15n_validate(const hv15n_request *r, char *error, size_t capacity) {
 hv15n_context *hv15n_load(const hv15n_config *c, char *error, size_t capacity) {
     try {
         require(c && c->model_dir, "model directory is required");
-        require(c->gemm && (std::string(c->gemm) == "repo" || std::string(c->gemm) == "cublas"),
-                "gemm must be repo or cublas");
+        require(c->gemm && (std::string(c->gemm) == "repo" || std::string(c->gemm) == vendor_name),
+                "gemm must be repo or the selected platform vendor");
         require(c->gemm_fallback &&
-                    (std::string(c->gemm_fallback) == "error" || std::string(c->gemm_fallback) == "cublas"),
-                "fallback must be error or cublas");
+                    (std::string(c->gemm_fallback) == "error" || std::string(c->gemm_fallback) == vendor_name),
+                "fallback must be error or the selected platform vendor");
         require(c->device >= 0, "device must be nonnegative");
         auto ctx = std::make_unique<hv15n_context>();
         ctx->root = fs::canonical(c->model_dir);
         Json manifest(ctx->root / "model.json");
         require(string(manifest.value.get(), "schema") == "hunyuan_video15.model.v1",
                 "unsupported model manifest");
-        ctx->gpu = std::make_unique<Gpu>(c->device, c->vram_budget_mib, std::string(c->gemm) == "cublas",
-                                         std::string(c->gemm_fallback) == "cublas");
+        ctx->gpu = std::make_unique<Gpu>(c->device, c->vram_budget_mib, std::string(c->gemm) == vendor_name,
+                                         std::string(c->gemm_fallback) == vendor_name);
         return ctx.release();
     } catch (const std::exception &e) {
         failure(error, capacity, e.what());
@@ -192,7 +197,15 @@ int hv15n_generate(hv15n_context *ctx, const hv15n_request *r, const hv15n_callb
                 if(step==0)g.dump(positive,dump,"dit_first",true);
                 if(steps==50) {
                     auto difference = g.op(positive, 1, &uncond, nullptr, -1.f);
+#ifdef HV15N_ROCM
+                    // Upstream CFG combines Half model outputs before the
+                    // scheduler promotes its velocity to FP32.
+                    difference = g.round_half(std::move(difference));
+                    auto scaled = g.round_half(g.op(difference, 0, nullptr, nullptr, 6.f));
+                    positive = g.round_half(g.op(uncond, 1, &scaled));
+#else
                     positive = g.op(uncond, 1, &difference, nullptr, 6.f);
+#endif
                 }
                 latent = g.op(latent, 1, &positive, nullptr, sigmas[step + 1] - sigmas[step]);
                 if (!dump.empty())
@@ -232,6 +245,27 @@ int hv15n_generate(hv15n_context *ctx, const hv15n_request *r, const hv15n_callb
 }
 const char *hv15n_metrics(const hv15n_context *ctx) {
     return ctx ? ctx->metrics.c_str() : "{}";
+}
+int hv15n_set_aotriton_bridge(hv15n_context *ctx, const char *path, char *error, size_t capacity) {
+#ifdef HV15N_ROCM
+    try {
+        require(ctx && path && *path, "context and bridge path are required");
+        bool expected = false;
+        require(ctx->busy.compare_exchange_strong(expected, true), "context is busy");
+        struct Guard {
+            std::atomic<bool> &busy;
+            ~Guard() { busy = false; }
+        } guard{ctx->busy};
+        ctx->gpu->use_aotriton(path);
+        return 0;
+    } catch (const std::exception &e) {
+        return failure(error, capacity, e.what());
+    }
+#else
+    (void)ctx;
+    (void)path;
+    return failure(error, capacity, "standalone AOTriton attention requires the ROCm backend");
+#endif
 }
 void hv15n_cancel(hv15n_context *ctx) {
     if (ctx)

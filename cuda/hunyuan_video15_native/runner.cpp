@@ -1,6 +1,9 @@
 #include "gpu.hpp"
 #include "hv15_native.h"
 #include "kernels.hpp"
+#ifdef HV15N_ROCM
+#include "../../rdna4/video_common/kernels.hpp"
+#endif
 #include <csignal>
 #include <iostream>
 #include <set>
@@ -45,24 +48,36 @@ int main(int argc, char **argv) {
             "--model",  "--task",          "--preset",     "--prompt",   "--negative-prompt",
             "--image",  "--vision-pixels", "--noise-file", "--dump-dir", "--width",
             "--height", "--frames",        "--seed",       "--device",   "--vram-budget-mib",
-            "--gemm",   "--gemm-fallback", "--offload",    "--out-dir"};
+            "--gemm",   "--gemm-fallback", "--offload",    "--out-dir"
+#ifdef HV15N_ROCM
+            , "--aotriton-bridge"
+#endif
+        };
         for (int i = 1; i < argc; i++) {
             std::string arg = argv[i];
             if (arg == "--help") {
-                std::cout << "Native repository HunyuanVideo-1.5 CUDA runner\n"
+                std::cout << "Native repository HunyuanVideo-1.5 runner\n"
                              "--generate --model DIR --task i2v|t2v --preset quality|fast12 --prompt TEXT\n"
                              "model default: " HV15N_DEFAULT_MODEL_DIR "\n"
                              "--image PREPARED.png --vision-pixels CHW.f32 (I2V only)\n"
                              "--width 480 --height 848 --frames 81 --seed N --out-dir EMPTY_DIR\n"
                              "--device 0 --vram-budget-mib 14336 --offload block\n"
+#ifdef HV15N_ROCM
+                             "--gemm repo|hipblas --gemm-fallback hipblas|error --allow-experimental\n"
+                             "--aotriton-bridge LIB (optional standalone FP16 attention)\n"
+#else
                              "--gemm repo|cublas --gemm-fallback cublas|error --allow-experimental\n"
-                             "--validate: request only; --compile-kernels: NVRTC only, no GPU\n";
+#endif
+                             "--validate: request only; --compile-kernels: runtime compiler only\n";
                 return 0;
             }
             if (arg == "--compile-kernels") {
                 Gpu::compile(ops_source);
                 Gpu::compile(Gpu::mma_source());
-                std::cout << "PASS operators and repository GEMM compiled for compute_120\n";
+#ifdef HV15N_ROCM
+                Gpu::compile(video_rocm::attention_source);
+#endif
+                std::cout << "PASS operators and repository GEMM compiled\n";
                 return 0;
             }
             if (arg == "--validate") {
@@ -129,6 +144,11 @@ int main(int argc, char **argv) {
         std::unique_ptr<hv15n_context, decltype(&hv15n_free)> ctx(hv15n_load(&config, error, sizeof(error)),
                                                                   hv15n_free);
         require(bool(ctx), error);
+#ifdef HV15N_ROCM
+        if (options.count("--aotriton-bridge"))
+            require(hv15n_set_aotriton_bridge(ctx.get(), options["--aotriton-bridge"].c_str(),
+                                             error, sizeof(error)) == 0, error);
+#endif
         hv15n_callbacks callbacks{progress, frame, cancelled, &out};
         int rc = hv15n_generate(ctx.get(), &request, &callbacks, error, sizeof(error));
         std::ofstream metrics(out.directory / "runner_metrics.json");

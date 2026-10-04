@@ -23,6 +23,16 @@ class OrchestrationTests(unittest.TestCase):
         self.root = Path(self.temp.name)
     def tearDown(self):
         self.temp.cleanup()
+    def test_aotriton_bridge_backend_validation(self):
+        bridge = self.root / "bridge.so"
+        bridge.write_bytes(b"fake library")
+        with self.assertRaisesRegex(ValueError, "requires ROCm"):
+            gen.generate(model=self.root, out=self.root / "out", prompt="test",
+                         task="t2v", allow_experimental=True, aotriton_bridge=bridge)
+        with self.assertRaisesRegex(ValueError, "existing shared library"):
+            gen.generate(model=self.root, out=self.root / "out", prompt="test",
+                         task="t2v", backend="rocm", allow_experimental=True,
+                         aotriton_bridge=self.root / "absent.so")
     def test_process_progress_and_cancel(self):
         progress = []
         gen.run_process([sys.executable, "-c", "print('PROGRESS 2 12')"],
