@@ -58,6 +58,16 @@ rank0 logs `tmp/glm53f-q4-52159552/benchmark-decode100-*`. Single-node benches i
   bit-exact tasks (792-case native test PASS at 1/47 threads).
 - **b16 (v17):** local-gram 0.997×, +cmg 1.008×; MTP d2 all-on **45.49** (best so far).
 
+- **j2a (new job, v18):** cmg+columns16 8K BIT_EXACT; but **columns16 0.961/0.957×** and kern (cmg+local-gram+
+  columns16) 0.963/0.963× — the 16-column KDA split is a regression (strided 64-B state accesses, 8× scalar reloads);
+  dropped from later arms. MTP d2 kern 44.57. Verify d2 profile per position: moe 7.52, kda 5.06, mhc 4.05,
+  sparse 3.34 ms — MoE ~55 GB/s effective in verify (j2h microbench queued).
+- **MTP runs without the persistent executor** (`glm53f_mtp_spec_12n.c` never calls `glm53f_team_run`); converting is
+  large (100+ plain parallel regions in verify-path files would nest to 1 thread). j2g measures the executor's
+  value on plain decode first.
+- Pending on new job: j2b (prefetch, columns-64 arm), j2c (crash bisect + act options), j2d (allreduce 2D/MTNI),
+  j2e (KDA verify columns, state-gated MTP), j2f (batch mHC tail), j2g (executor value), j2h (verify MoE micro).
+
 ## Conclusion so far
 Placement and kernel work each give ~1–2% in-model, and removing dispatches/serial sections by fusing whole
 layers into one team gives **nothing** (slightly negative). The 4.9 ms of barrier wait is therefore not
