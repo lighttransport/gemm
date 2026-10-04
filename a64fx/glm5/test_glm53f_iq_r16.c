@@ -80,6 +80,7 @@ static int check(void) {
 
 int main(int argc, char **argv) {
     const int parts = argc > 1 ? atoi(argv[1]) : 5, pool = argc > 2 ? atoi(argv[2]) : 96, iters = 300;
+    setvbuf(stdout, NULL, _IONBF, 0);
     if (check()) { printf("R16_CHECK FAIL\n"); return 1; }
     printf("R16_CHECK ALL PASS\n");
     enum { H = 4096, INTER = 256, GU = 2 * INTER };
@@ -101,7 +102,7 @@ int main(int argc, char **argv) {
     for (int mode = 0; mode < 2; ++mode) {
         double best = 1e30, sum = 0;
         for (int it = -20; it < iters; ++it) {
-            const int base = (it * 7 + 13) % (pool - parts + 1 > 0 ? pool - parts + 1 : 1);
+            const int span = pool - parts + 1 > 0 ? pool - parts + 1 : 1, base = ((it + 20) * 7 + 13) % span;
             const double t0 = now();
 #pragma omp parallel
             {
