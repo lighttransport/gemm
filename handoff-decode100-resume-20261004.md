@@ -96,6 +96,14 @@ Detailed per-campaign history: `handoff-decode100-20261004.md` (same directory).
   Fixed to return the mode. v31 (`candidate-decode100-mfix21-v31`) is the first binary where local-gram really runs;
   j2t gates it (8K exact + pair + MTP d2 best ± KDA head pipeline). The standalone kernel is ~23 µs vs ~48 µs.
 
+## local-gram mHC, first real in-model run (j2t, v31)
+- 8K decode **34.65 vs 32.20 legacy (+7.6%)**, the largest single gain; prefill unchanged.
+- **Not token-equal at 8K:** generated IDs match for 24 tokens and differ from token 25 of 64 (legacy 374, lgram 1969).
+  local-gram is not bit-exact by design (~1e-7 rel in normalized values), so this may be a near-tie flip or an
+  error; no per-step logits were logged. j2t aborted at that assert (no pair / MTP runs).
+- Next: a quality gate instead of bit-exactness — teacher-forced comparison of per-step top-1/top-2 logit margins (or
+  KL) vs legacy over several prompts. If the flip is a near-tie, add local-gram to BEST (expect several %).
+
 ## KDA head pipeline result (j2s)
 - `--kda-decode-pipeline heads` is 8K BIT_EXACT but **does not reduce KDA time** (gap ledger kda mean 7.40 legacy,
   7.30 pipe, 7.43 best+pipe; pair 1.009× / 0.998×). The ~20 µs "small steps" in `GLM53F_KDA_DECODE_DETAIL` were
