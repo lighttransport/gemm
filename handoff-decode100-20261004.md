@@ -43,6 +43,21 @@ rank0 logs `tmp/glm53f-q4-52159552/benchmark-decode100-*`. Single-node benches i
 - **b12 slot (v13, all four fusions):** 8K BIT_EXACT. Pairs: kda-layer +0.3/0.0%, all fusions **−1.3/−1.7%**,
   fusions+cmg+mhc-local +0.2/−0.1%. MTP d2 all-on **45.41** (best so far, within noise).
 
+- **New job PJM52167472** (12 nodes, 19:00→01:00): staged by `tmp/decode100-20261004/stage-j2.sh`; campaigns via
+  `driver-j2.sh WAITPID ARMS TAG BIN` + `campaign-j2.py` (arms JSON). Queue: j2a (v18 kernels), j2b (v19 mHC
+  prefetch), j2c (v20: crash bisect chunk16/hdr/kdaq at 8K + act options).
+- **b14 (v15) crashed (SIGSEGV) at the 8K exact-sync run** with header cache + KDA team quant + fused paths; suspect
+  is one of those options (v13 fusions alone were 8K exact). j2c bisects.
+- **Single-node microbenchmarks (old job, 47 threads, FLIB_BARRIER=HARD):** barrier 1.2 µs; persistent dispatch
+  1.2 µs (2.3 with a barrier); Q8 matvec 11.8 MB cold 33.6 µs (351 GB/s); tiny 48x4096 matvec 2.7 µs;
+  **act_prepare_team(4096) 11.5 µs** → 7.7 (chunk16) → 6.9 (header cache) → **4.6 µs** (both).
+- **mHC local kernel:** the residual copy cost ~16 µs/site (store traffic); eliding it (in-place post update,
+  ce4d6052) + FP64 SVE post (2547fd42): local-gram **26.5 µs/site warm, 31.2 µs with 90 cold sites, legacy 59.5**.
+  In-model (b17, v17 before SVE post) mHC dispatch was still ~62 µs/site; v18+ untested in-model yet.
+- **KDA recurrence:** only 5–6 head tasks → 15.7 µs arrival spread; `--kda-decode-kernel columns16` gives 48
+  bit-exact tasks (792-case native test PASS at 1/47 threads).
+- **b16 (v17):** local-gram 0.997×, +cmg 1.008×; MTP d2 all-on **45.49** (best so far).
+
 ## Conclusion so far
 Placement and kernel work each give ~1–2% in-model, and removing dispatches/serial sections by fusing whole
 layers into one team gives **nothing** (slightly negative). The 4.9 ms of barrier wait is therefore not
@@ -59,8 +74,8 @@ not more fusion of the current one. Candidates, in order:
 
 ## Next steps
 1. Read b14 (v15: local-gram mHC, header cache, KDA team quant, fused-path barrier removal) results.
-2. Continue fusion: attention mHC-pre + KDA/sparse front as the mHC `after_normalize` hook; sparse layer
-   front/select/MLA/o_proj into one region; reduce mHC barriers (2 per call minimum with local kernel).
+2. Fusion is done and measured null; focus on per-phase latency (act prepare, mHC, KDA recurrence spread) and
+   allreduce latency/skew (90/token × ~24 µs pure + ~20 µs skew).
 3. Overlap shared expert with the routed allreduce; consider reduce-scatter + all-gather into next mHC.
 4. Wire R16 into decode experts with a byte-identical R16 prefill expander (`gmn_expand_sblk` mapping in this
    doc's commit message for 0aa37acb) so the GGUF layout can be dropped.
