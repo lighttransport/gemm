@@ -79,7 +79,7 @@ Detailed per-campaign history: `handoff-decode100-20261004.md` (same directory).
 | Part | ms/token | Notes |
 |---|---|---|
 | mHC sites | 6.6 | attention site 0.05; **FFN site 3.6** (~86 µs, includes fused router); **end-of-layer 3.0** (~70 µs). Local work, no MPI. Weights only ~66 MB/token (bf16) → latency-bound. local-gram (2× faster standalone) does not change it in-model — cause unknown, j2r measures it. |
-| KDA (31 layers) | 7.1 | per layer ≈228 µs: proj 60, conv 20, fb+norm+decay 21, recurrence 20, gb+rmsnorm 21, o_proj 14, allreduce 45 (≈2× pure latency). Small steps are head-local but run as team phases with only 6 busy threads. |
+| KDA (31 layers) | 7.1 | per layer ≈228 µs: proj 60 (likely Q8, ~180 GB/s), conv 20, fb+norm+decay 21, recurrence 20, gb+rmsnorm 21, o_proj 14, allreduce 45 (≈2× pure latency). Small steps are head-local but run as team phases with only 6 busy threads. |
 | MoE | 8.0 | router 0.76, local 4.9 (~107 GB/s; Q4_K/Q5_K kernel ≈2.1 instr/byte, IPC ~0.5), allreduce 2.8 (67 µs × 42) |
 | Sparse | 4.5 | front 1.7 (156 GB/s), index 0.6, MLA 1.3, o_proj 0.33 (~500 GB/s), allreduce 0.8 |
 | head/embed/dense | ~0.9 | |
@@ -111,8 +111,10 @@ Detailed per-campaign history: `handoff-decode100-20261004.md` (same directory).
 2. **mHC (6.6 ms):** find the in-model overhead from j2r. Candidates: router inside the FFN site (move it out or make
    it Q8), cold `fn`/streams after MoE evicts L2 (prefetch during the preceding allreduce), serial non-team code
    around `glm53f_mhc_post_pre_sve`. Target ≈2 ms.
-3. **KDA (7.1 ms):** head pipeline (above); projections at 60 µs → requantize bf16-derived projections to Q8_0R16
-   (Q8 matvec reaches ~350 GB/s); overlap the 45 µs allreduce with the next mHC. Target ≈3 ms.
+3. **KDA (7.1 ms):** head pipeline (above); projections at 60 µs are most likely **already Q8** (staged GGUF types;
+   other native weights load as type 1008 = Q8_0R — confirm by printing `c->q2_q_type`), ~11 MB/layer at ~180 GB/s vs
+   ~350 GB/s for the cold Q8 matvec → ~25–30 µs/layer headroom from the kernel/partition, not a format change.
+   Overlap the 45 µs allreduce with the next mHC. Target ≈3–4 ms.
 4. **MoE allreduce skew (2.8 ms):** balanced expert slicing across all 12 ranks (needs restaging; plan P3 in the
    earlier handoff). Shared expert overlapped with the routed allreduce.
 5. Then MTP on top (BEST options); deeper draft only if verify becomes sublinear.
