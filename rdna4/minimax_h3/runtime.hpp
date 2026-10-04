@@ -71,8 +71,9 @@ struct Engine {
     std::thread prefetch_worker;
     std::exception_ptr prefetch_error;
     CUstream prefetch_stream = nullptr;
-    std::array<void *, 2> prefetch_host{};
-    std::array<CUevent, 2> prefetch_free{};
+    static constexpr int prefetch_slots = 4;
+    std::array<void *, prefetch_slots> prefetch_host{};
+    std::array<CUevent, prefetch_slots> prefetch_free{};
     uint64_t prefetch_hits = 0;
     // Optional cuDNN SDPA for BF16 head-128 attention (opt-in, runtime-discovered).
     std::unique_ptr<void, int (*)(void *)> cudnn_library{nullptr, dlclose};
@@ -134,12 +135,26 @@ struct Engine {
                 cuEventDestroy(entry.second.ready);
         prefetched.clear();
     }
+    static void parallel_copy(void *dst, const unsigned char *src, size_t bytes) {
+        constexpr int workers = 4;
+        const size_t part = (bytes / workers + 4095) & ~size_t(4095);
+        std::array<std::thread, workers - 1> helpers;
+        for (int i = 1; i < workers; i++) {
+            size_t begin = std::min(bytes, part * i), end = std::min(bytes, part * (i + 1));
+            helpers[i - 1] = std::thread([=]() {
+                std::memcpy(static_cast<unsigned char *>(dst) + begin, src + begin, end - begin);
+            });
+        }
+        std::memcpy(dst, src, std::min(bytes, part));
+        for (auto &t : helpers)
+            t.join();
+    }
     // Starts uploading every INT8 matrix under `prefix`; joins the previous batch first.
     void prefetch(Weights &w, const std::string &prefix) {
         prefetch_join();
         if (!prefetch_stream) {
             g.check(cuStreamCreate(&prefetch_stream, CU_STREAM_NON_BLOCKING), "prefetch stream");
-            for (int i = 0; i < 2; i++) {
+            for (int i = 0; i < prefetch_slots; i++) {
                 g.check(cuMemHostAlloc(&prefetch_host[i], prefetch_chunk, 0), "prefetch staging");
                 g.check(cuEventCreate(&prefetch_free[i], CU_EVENT_DISABLE_TIMING),
                         "prefetch staging event");
@@ -177,13 +192,14 @@ struct Engine {
                     for (size_t offset = 0; offset < bytes; offset += prefetch_chunk) {
                         const size_t count = std::min(prefetch_chunk, bytes - offset);
                         ok(cuEventSynchronize(prefetch_free[slot]), "staging wait");
-                        std::memcpy(prefetch_host[slot],
-                                    static_cast<const unsigned char *>(source) + offset, count);
+                        // mmap page faults make a single-threaded copy the bottleneck.
+                        parallel_copy(prefetch_host[slot],
+                                      static_cast<const unsigned char *>(source) + offset, count);
                         ok(cuMemcpyHtoDAsync(entry->w.pointer + offset, prefetch_host[slot], count,
                                              prefetch_stream),
                            "upload");
                         ok(cuEventRecord(prefetch_free[slot], prefetch_stream), "staging record");
-                        slot ^= 1;
+                        slot = (slot + 1) % prefetch_slots;
                     }
                     ok(cuEventRecord(entry->ready, prefetch_stream), "ready");
                 }
@@ -296,7 +312,7 @@ struct Engine {
         prefetch_release();
         if (prefetch_stream)
             cuStreamDestroy(prefetch_stream);
-        for (int i = 0; i < 2; i++) {
+        for (int i = 0; i < prefetch_slots; i++) {
             if (prefetch_free[i])
                 cuEventDestroy(prefetch_free[i]);
             if (prefetch_host[i])
@@ -873,8 +889,22 @@ struct Engine {
         auto rotation = qwen_angles(int(ids.size()));
         if (!trace.empty())
             g.dump(rotation, trace, "qwen_rotation");
+#ifndef HV15N_ROCM
+        // Stream layer i+1's INT8 matrices while layer i runs (the encoder is upload-bound).
+        struct PrefetchScope {
+            Engine &e;
+            ~PrefetchScope() { e.prefetch_release(); }
+        } prefetch_scope{*this};
+        prefetch(w, "model.layers.0.");
+#endif
         for (int i = 0; i < 50; i++) {
             g.poll();
+#ifndef HV15N_ROCM
+            if (i + 1 < 50)
+                prefetch(w, "model.layers." + std::to_string(i + 1) + ".");
+            else
+                prefetch_join();
+#endif
             std::string p = "model.layers." + std::to_string(i);
             auto capture = [&](const Tensor &value, const char *name) {
                 if (!trace.empty() && (i == 0 || std::string(name) == "after_mlp"))

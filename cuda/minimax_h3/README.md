@@ -42,9 +42,9 @@ Weights stream per block from mmap, and a 64 GB host is required.
 
   | stage | native CUDA | PyTorch reference |
   |---|---|---|
-  | Qwen3-VL text encoder | 7.4 s | 40 s |
-  | DiT, per Euler update (50 blocks) | 89 s | ~128 s |
-  | VAE decode (124 frames) | 82 s | 249 s |
+  | Qwen3-VL text encoder | 6.0 s | 40 s |
+  | DiT, per Euler update (50 blocks) | 88 s | ~128 s |
+  | VAE decode (124 frames) | 80 s | 249 s |
 
   DiT attention runs at the same speed as PyTorch's (32.7 vs 32.4 TFLOPS) and is
   ~65% of DiT time. DiT INT8 weights for block i+1 are prefetched by a worker
@@ -118,3 +118,8 @@ against 0.044 / 0.076).
 - **VAE host overlap:** tile inputs upload through pinned staging without a stream
   sync, and each chunk's frames are converted and emitted on a worker thread while
   the GPU decodes the next chunk. VAE 89 → 82 s, with identical frames.
+- **Qwen layer prefetch:** layer i+1's INT8 matrices stream on the prefetch worker
+  while layer i runs. The staging copy out of the mmap is split across 4 threads
+  (page faults made a single-threaded copy the bottleneck) and uses 4 pinned 64 MiB
+  slots. Qwen 8.3 → 6.0 s with an identical hidden state; the PCIe 3.0 floor here
+  is ~3.6 s for 26 GB.
