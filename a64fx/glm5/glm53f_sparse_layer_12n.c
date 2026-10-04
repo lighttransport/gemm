@@ -102,6 +102,8 @@ struct glm53f_sparse_context_12n {
     /* Verify-batch front (up to four positions): token-major activations and projection outputs. */
     unsigned char *vf_act_x, *vf_act_q; size_t vf_stride_x, vf_stride_q;
     float *vf_qres, *vf_query, *vf_iq, *vf_iw, *vf_raw;
+    /* Fused sparse layer (glm53f_sparse_team_12n): partial holds this step's o_proj output. */
+    int fused_ready; float *fused_raw; unsigned char *fused_op_act;
     size_t q8v_act_bytes;
     float *qas,*qbs,*kvas,*ops;
     uint16_t *qan,*kvan,*kvb,*wk,*knw,*knb,*gatew,*ape,*wqb,*wp;
@@ -531,17 +533,24 @@ static void pool_score_worker(void *context) {
         }
     }
 }
+static int select_finish(glm53f_sparse_context_12n *c, int tokens, int decode);
 static int select_incremental(glm53f_sparse_context_12n *c, int tokens, int decode) {
-    int np = tokens / KPOOL, nc = TOPK / KPOOL, out = 0;
-    if (nc > np) nc = np;
     const int mode = index_heads_enabled();
     const int replicated = decode && (mode == 3 || mode == 4);
-    struct pool_score_call call = {c, tokens, np, replicated};
+    struct pool_score_call call = {c, tokens, tokens / KPOOL, replicated};
     if (glm53f_team_available()) glm53f_team_dispatch(pool_score_worker, &call);
     else {
 #pragma omp parallel
         { pool_score_worker(&call); }
     }
+    return select_finish(c, tokens, decode);
+}
+/* Serial part of the incremental selection after pool scoring (controller thread). */
+static int select_finish(glm53f_sparse_context_12n *c, int tokens, int decode) {
+    int np = tokens / KPOOL, nc = TOPK / KPOOL, out = 0;
+    if (nc > np) nc = np;
+    const int mode = index_heads_enabled();
+    const int replicated = decode && (mode == 3 || mode == 4);
     if (tokens <= TOPK + KPOOL - 1) qsort(c->pool_score_cache, np, sizeof(pool_score), pool_cmp);
     else {
         /* Replicated caches permit independent decode selection. Prefill
@@ -676,7 +685,8 @@ static void mla_value_worker(void *context) {
         a->bad = 1;
     }
 }
-static int mla_heads_q8_value(glm53f_sparse_context_12n*c,float*out,
+/* Buffers and call record of the native Q8 value path (controller thread). */
+static int mla_value_setup(glm53f_sparse_context_12n*c,struct mla_value_call*call,float*out,
         const float*q,const float*z,const int*selected,int nt){
     enum { SLOTS = TOPK + KPOOL };
     const int hn = c->hn;
@@ -689,24 +699,28 @@ static int mla_heads_q8_value(glm53f_sparse_context_12n*c,float*out,
         c->q8v_sum=a256((size_t)hn*sizeof(float));
         c->q8v_act=a256((size_t)hn*c->q8v_act_bytes);
     }
-    int bad=0;
     const char *registers = getenv("GLM53F_MLA_REGISTERS");
     const char *softmax = getenv("GLM53F_MLA_PARALLEL_SOFTMAX");
     const char *logits = getenv("GLM53F_MLA_LOGITS_HEADS3");
     const char *values = getenv("GLM53F_MLA_VALUES_NORMALIZED2");
-    struct mla_value_call call = {c, out, q, z, selected, nt, 0,
+    *call = (struct mla_value_call){c, out, q, z, selected, nt, 0,
         registers && svcntw() == 16 ? atoi(registers) : 0,
         selected == c->selected ? c->latent_f16 : NULL,
         softmax && atoi(softmax) && omp_get_max_threads() > 1,
         logits && atoi(logits) && svcntw() == 16,
         values && atoi(values) && svcntw() == 16};
+    return 0;
+}
+static int mla_heads_q8_value(glm53f_sparse_context_12n*c,float*out,
+        const float*q,const float*z,const int*selected,int nt){
+    struct mla_value_call call;
+    if (mla_value_setup(c, &call, out, q, z, selected, nt)) return -1;
     if (glm53f_team_available()) glm53f_team_dispatch(mla_value_worker, &call);
     else {
 #pragma omp parallel
         { mla_value_worker(&call); }
     }
-    bad = call.bad;
-    return bad?-1:0;
+    return call.bad ? -1 : 0;
 }
 /* Prefetch plan (glm53f_pf_plan.h): the native q_a / kv_a / q_b matvecs of this layer's decode front. */
 void glm53f_sparse_prefetch_plan_12n(const glm53f_sparse_context_12n *c) {
@@ -952,6 +966,73 @@ static int sparse_front_batch(glm53f_sparse_context_12n *c, int pos, const float
         { sparse_front_batch_worker(&call); }
     }
     return call.bad ? -1 : 0;
+}
+/* Fused sparse decode layer (GLM53F_SPARSE_FUSED_LAYER, --sparse-layer-kernel
+ * fused): the preceding mHC team calls glm53f_sparse_team_12n after
+ * normalization. Front, pool scoring, selection, MLA values and the output
+ * projection run in that one team; serial steps (cache/pool update,
+ * selection, MLA setup) run on the master thread, so any collective inside
+ * selection stays on the MPI thread. Every phase is the dispatched path's
+ * code with the same partitions (bit-identical); the sublayer only reduces. */
+int glm53f_sparse_fusable_12n(const glm53f_sparse_context_12n *c) {
+    const char *f = getenv("GLM53F_SPARSE_FUSE_FRONT");
+    return c && !c->cp && !c->dist && c->q2_native && c->latent_f16 && !c->int8_enabled &&
+           !glm53f_sparse_scalar_reference && !getenv("GLM53F_SPARSE_REFERENCE") && !(f && *f && !atoi(f)) &&
+           sp_is_q80(c->q2_qa_type) && sp_is_q80(c->q2_kva_type) && sp_is_q80(c->q2_qb_type) &&
+           c->length < c->capacity;
+}
+static struct { struct sparse_front_call front; struct pool_score_call score; struct mla_value_call mla; int bad; } sparse_fused;
+void glm53f_sparse_team_12n(void *context, const float *x) {
+    glm53f_sparse_context_12n *c = context;
+    const int pos = c->length, tokens = pos + 1, cols = c->hn * VD;
+#pragma omp master
+    {
+        if (!c->front_act_x) {
+            c->front_act_x = a256((glm53f_native_act_bytes(H) + 255) & ~(size_t)255);
+            c->front_act_q = a256((glm53f_native_act_bytes(QA) + 255) & ~(size_t)255);
+        }
+        if (!c->fused_raw) c->fused_raw = a256((size_t)ID * sizeof(float));
+        if (!c->fused_op_act) c->fused_op_act = a256((glm53f_native_act_bytes(cols) + 255) & ~(size_t)255);
+        sparse_fused.front = (struct sparse_front_call){c, pos, 0, x, c->fused_raw};
+        sparse_fused.bad = 0;
+    }
+#pragma omp barrier
+    sparse_front_worker(&sparse_fused.front);   /* ends with a worksharing barrier */
+#pragma omp master
+    {
+        glm53f_mla_cache_f16_store(c->latent_f16 + (size_t)pos * LAT, c->latent + (size_t)pos * LAT, LAT);
+        if (tokens % KPOOL == 0) update_completed_pool(c, tokens / KPOOL - 1);
+        const int mode = index_heads_enabled();
+        sparse_fused.score = (struct pool_score_call){c, tokens, tokens / KPOOL, mode == 3 || mode == 4};
+        if (sparse_fused.front.bad) sparse_fused.bad = 1;
+    }
+#pragma omp barrier
+    pool_score_worker(&sparse_fused.score);     /* ends with a worksharing barrier */
+#pragma omp master
+    {
+        const int ns = sparse_fused.bad ? 0 : select_finish(c, tokens, 1);
+        if (ns < 1 || mla_value_setup(c, &sparse_fused.mla, c->attn, c->query, c->packed, c->selected, ns))
+            sparse_fused.bad = 1;
+    }
+#pragma omp barrier
+    if (!sparse_fused.bad) {
+        mla_value_worker(&sparse_fused.mla);    /* ends with the v_b team matvec barrier */
+        const glm53f_native_matrix op = {c->partial, c->q2_op, c->q2_op_type, H, cols};
+        const int q80 = sp_is_q80(c->q2_op_type);
+        int bad = glm53f_native_act_prepare_team(c->fused_op_act, c->attn, cols, !q80, q80) != 0;
+        bad |= glm53f_native_matvec_team(&op, 1, c->fused_op_act) != 0;
+        if (bad) {
+#pragma omp atomic write
+            sparse_fused.bad = 1;
+        }
+#pragma omp barrier
+    }
+#pragma omp master
+    {
+        const int ok = !sparse_fused.bad && !sparse_fused.mla.bad;
+        if (ok) c->length++;
+        c->fused_ready = ok ? 1 : -1;
+    }
 }
 struct sparse_pack_call { glm53f_sparse_context_12n *c; int ns; };
 static void sparse_pack_worker(void *context) {
@@ -1398,7 +1479,10 @@ int glm53f_sparse_cache_append_batch_12n(glm53f_sparse_context_12n *c,
     c->length += tokens;
     return 0;
 }
-int glm53f_sparse_sublayer_12n(void*context,float*out,const float*x){glm53f_sparse_context_12n*c=context;if(!c||sparse_attention_local(c,c->attn,x))return-1;int local_cols=c->hn*VD;
+int glm53f_sparse_sublayer_12n(void*context,float*out,const float*x){glm53f_sparse_context_12n*c=context;
+    if(c&&c->fused_ready){const int ok=c->fused_ready>0;c->fused_ready=0;if(!ok)return-1;   /* fused layer already ran */
+        int rc=sparse_sum(c,c->partial,out,H);if(!rc)sparse_dump(c,"dsa_out",out,H*sizeof(float));return rc;}
+    if(!c||sparse_attention_local(c,c->attn,x))return-1;int local_cols=c->hn*VD;
     double begin = sparse_clock(c);
     /* The output projection is the largest sparse-layer matvec.  Use the
      * eight-row SVE kernel so each thread reuses a decoded weight vector

@@ -45,6 +45,7 @@ static inline int glm53f_runtime_option(int argc, char **argv, int *index) {
     else if (!strcmp(key, "--moe-layer-kernel")) env = "GLM53F_MOE_FUSED_LAYER";
     else if (!strcmp(key, "--kda-out-kernel")) env = "GLM53F_KDA_FUSED_OUT";
     else if (!strcmp(key, "--kda-layer-kernel")) env = "GLM53F_KDA_FUSED_LAYER";
+    else if (!strcmp(key, "--sparse-layer-kernel")) env = "GLM53F_SPARSE_FUSED_LAYER";
     else return 0;
     if (*index + 1 >= argc) return -1;
     const char *value = argv[++*index];
@@ -78,6 +79,7 @@ static inline int glm53f_runtime_option(int argc, char **argv, int *index) {
              (!strcmp(key, "--moe-layer-kernel") && !strcmp(value, "fused")) ||
              (!strcmp(key, "--kda-out-kernel") && !strcmp(value, "fused")) ||
              (!strcmp(key, "--kda-layer-kernel") && !strcmp(value, "fused")) ||
+             (!strcmp(key, "--sparse-layer-kernel") && !strcmp(value, "fused")) ||
              ((!strcmp(key, "--kda-decode-kernel") || !strcmp(key, "--kda-prefill-kernel")) && !strcmp(value, "columns")) ||
              (!strcmp(key, "--moe-scale-kernel") && !strcmp(value, "words")) ||
              (!strcmp(key, "--moe-combine-kernel") && !strcmp(value, "vector")) ||
