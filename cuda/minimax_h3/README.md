@@ -43,8 +43,8 @@ Weights stream per block from mmap, and a 64 GB host is required.
   | stage | native CUDA | PyTorch reference |
   |---|---|---|
   | Qwen3-VL text encoder | 6.0 s | 40 s |
-  | DiT, per Euler update (50 blocks) | 88 s | ~128 s |
-  | VAE decode (124 frames) | 80 s | 249 s |
+  | DiT, per Euler update (50 blocks) | 84 s | ~128 s |
+  | VAE decode (124 frames) | 72 s | 249 s |
 
   DiT attention runs at the same speed as PyTorch's (32.7 vs 32.4 TFLOPS) and is
   ~65% of DiT time. DiT INT8 weights for block i+1 are prefetched by a worker
@@ -123,3 +123,15 @@ against 0.044 / 0.076).
   (page faults made a single-threaded copy the bottleneck) and uses 4 pinned 64 MiB
   slots. Qwen 8.3 → 6.0 s with an identical hidden state; the PCIe 3.0 floor here
   is ~3.6 s for 26 GB.
+- **VAE GEMM epilogue:** the four decoder projections run through cuBLASLt with the
+  FP16 bias, FP32 accumulation and FP16 output fused into the epilogue (as torch's
+  half `F.linear`). Consumers read the finished FP16 values. GEMM throughput rose
+  from ~29.8 to ~33.4 TFLOPS (~95% of the measured peak). Full-resolution tiles are
+  bit-identical to the repository GEMM path; 64×64 tiles differ by ~3e-4 relative
+  L2. The 39-frame VAE component check passes against PyTorch (max relative L2
+  0.0014). `H3_VAE_LT=0` selects the repository GEMM. VAE 80 → 72 s.
+- **DiT row kernel:** each warp rotates whole 256-element groups in registers via
+  shuffles, in the same operation order, and the row stays in registers until
+  quantization. There are no block barriers per group and no 28 KB shared buffer.
+  `h3x_row_quant` went from 2.97 to 1.88 s per update (~70% of memory bandwidth),
+  bit-identical. DiT 88 → 84 s.

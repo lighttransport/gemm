@@ -182,13 +182,34 @@ __device__ __forceinline__ unsigned short h3_bits16(float v,int kind){
 __device__ __forceinline__ float h3_from16(unsigned short h,int kind){
     if(kind==1)return __uint_as_float((unsigned)h<<16);float f;asm("cvt.f32.f16 %0,%1;":"=f"(f):"h"(h));return f;
 }
-// Deferred linear epilogue: INT32 sums (h3_dequant) or raw F32 (h3_bias_round).
+// Deferred linear epilogue. mode 0: raw F32 (h3_bias_round), 1: INT32 sums (h3_dequant),
+// 2: finished 16-bit values (cuBLASLt bias epilogue, already rounded).
 __device__ __forceinline__ float h3_lin(const float *y,const float *xs,const float *ws,const float *b,
                                         long row,long n,long col,int i32,int kind){
     float v;
+    if(i32==2)return h3_from16(reinterpret_cast<const unsigned short*>(y)[row*n+col],kind);
     if(i32){v=(float)__float_as_int(y[row*n+col])*(xs[row]*ws[col]);if(kind==1)v=rnd(v,1);if(b){v+=b[col];v=rnd(v,kind);}}
     else{v=y[row*n+col];if(b)v+=b[col];v=rnd(v,kind);}
     return v;
+}
+template<int STRIDE> __device__ __forceinline__ void h3_fht_stage(float (&a)[8],int lane){
+    float o[8];
+#pragma unroll
+    for(int e=0;e<8;e++){
+        int i=lane+32*e,d=(i/STRIDE)%4;float v=0;
+#pragma unroll
+        for(int j=0;j<4;j++){
+            float t;
+            if(STRIDE==1)t=__shfl_sync(0xffffffffu,a[e],(lane&~3)|j);
+            else if(STRIDE==4)t=__shfl_sync(0xffffffffu,a[e],(lane&~12)|(j<<2));
+            else if(STRIDE==16)t=__shfl_sync(0xffffffffu,a[(e&~1)|(j>>1)],(lane&~16)|((j&1)<<4));
+            else t=a[(e&~6)|(j<<1)];
+            v+=(j==3-d?-1.f:1.f)*t;
+        }
+        o[e]=v*.5f;
+    }
+#pragma unroll
+    for(int e=0;e<8;e++)a[e]=o[e];
 }
 extern "C" {
 // h3_norm (mode 2 RMSNorm with optional weight) writing 16-bit activations.
@@ -246,14 +267,14 @@ __global__ void h3x_unpack16(unsigned short *out,const unsigned short *x,int row
     int d=i%dim,h=(i/dim)%heads;long r=i/((long)heads*dim);out[i]=x[((long)h*rows+r)*dim+d];
 }
 // h3_bias_round + h3_scale_add: x = rnd(x + rnd(y + b) * s).
-__global__ void h3x_scale_add(float *x,const float *y,const float *bias,const float *scale,int rows,int k,int kind){
+__global__ void h3x_scale_add(float *x,const float *y,const float *bias,const float *scale,int rows,int k,int kind,int mode){
     long i=(long)blockIdx.x*256+threadIdx.x;if(i>=(long)rows*k)return;
-    float d=h3_lin(y,nullptr,nullptr,bias,i/k,k,i%k,0,kind);x[i]=rnd(x[i]+d*scale[i%k],kind);
+    float d=h3_lin(y,nullptr,nullptr,bias,i/k,k,i%k,mode,kind);x[i]=rnd(x[i]+d*scale[i%k],kind);
 }
 // h3_bias_round + h3_swiglu writing 16-bit activations.
-__global__ void h3x_swiglu16(unsigned short *out,const float *y,const float *bias,int rows,int k,int kind){
+__global__ void h3x_swiglu16(unsigned short *out,const float *y,const float *bias,int rows,int k,int kind,int mode){
     long i=(long)blockIdx.x*256+threadIdx.x;if(i>=(long)rows*k)return;int row=i/k,c=i%k;
-    float a=h3_lin(y,nullptr,nullptr,bias,row,2*k,c,0,kind),b=h3_lin(y,nullptr,nullptr,bias,row,2*k,k+c,0,kind);
+    float a=h3_lin(y,nullptr,nullptr,bias,row,2*k,c,mode,kind),b=h3_lin(y,nullptr,nullptr,bias,row,2*k,k+c,mode,kind);
     out[i]=h3_bits16(rnd(rnd(a/(1.f+expf(-a)),kind)*b,kind),kind);
 }
 // h3_dequant (+bias) + h3_gate on rows [row0, row0+rows): x = rnd(x + delta * rnd(mod)).
@@ -267,13 +288,15 @@ __global__ void h3x_dequant_gate(float *x,const float *y,const float *xs,const f
 // Factorized ConvRot-256 (h3_rotate) + h3_quant for one row per 256-thread block, with
 // an input prologue: 0 plain F32 rows, 1 RMSNorm+modulate (h3_norm mode 2 + h3_mod),
 // 2 SwiGLU of deferred INT32 fc1 sums, 3 packed BF16 attention heads [H,S,D].
-__global__ void h3x_row_quant(signed char *out,float *scales,int rows,int k,int mode,const float *x,
+// Each warp rotates whole 256-element groups in registers (element lane+32*e) with
+// shuffles, keeping h3_rotate's exact operation order; the row stays in registers
+// (k <= 7 groups per warp * 8 warps * 256 = 14336) until quantization.
+__global__ __launch_bounds__(256) void h3x_row_quant(signed char *out,float *scales,int rows,int k,int mode,const float *x,
         const float *nw,const float *mod,int row0,int text,int audio,int chunk,float eps,
         const float *acc,const float *axs,const float *aws,const unsigned short *heads,int nheads,int hdim,int hrows){
-    int lr=blockIdx.x,tid=threadIdx.x;if(lr>=rows)return;
+    int lr=blockIdx.x,tid=threadIdx.x,warp=tid>>5,lane=tid&31;if(lr>=rows)return;
     int r=row0+lr;
-    __shared__ unsigned short rot[14336];
-    __shared__ float a[256],b[256],red[256];
+    __shared__ float b[8],red[8];
     float inv=0,mean=0;
     if(mode==1){
         float sq=0;
@@ -283,34 +306,46 @@ __global__ void h3x_row_quant(signed char *out,float *scales,int rows,int k,int 
         if((tid&31)==0)b[tid/32]=sq;__syncthreads();
         for(int d=4;d;d/=2){if(tid<d)b[tid]+=b[tid+d];__syncthreads();}
         inv=rsqrtf(fmaxf(b[0]/k-mean*mean,0.f)+eps);
-        __syncthreads();
     }
     int m=r<text?1:r<text+audio?5:0;long mbase=(long)m*6*k;
-    float mx=0;
-    for(int g=0;g<k/256;g++){
-        int c=g*256+tid;float val;
-        if(mode==0)val=x[(long)r*k+c];
-        else if(mode==1){
-            float v=(x[(long)r*k+c]-mean)*inv;v=rnd(v*(nw?nw[c]:1),1);
-            float scale=rnd(mod[mbase+(chunk+1)*k+c],1),shift=rnd(mod[mbase+chunk*k+c],1);
-            val=rnd(rnd(v*rnd(1.f+scale,1),1)+shift,1);
-        }else if(mode==2){
-            float ga=h3_lin(acc,axs,aws,nullptr,lr,2*k,c,1,1),gb=h3_lin(acc,axs,aws,nullptr,lr,2*k,k+c,1,1);
-            val=rnd(rnd(ga/(1.f+expf(-ga)),1)*gb,1);
-        }else val=h3_from16(heads[((long)(c/hdim)*hrows+r)*hdim+c%hdim],1);
-        int i=tid;a[i]=val;__syncthreads();
-        for(int stride=1;stride<=64;stride*=4){
-            int d=(i/stride)%4,base=i-d*stride;float v=0;
-            for(int j=0;j<4;j++)v+=(j==3-d?-1.f:1.f)*a[base+j*stride];
-            b[i]=v*.5f;__syncthreads();a[i]=b[i];__syncthreads();
+    const int groups=k/256;
+    float rot[7][8];float mx=0;
+#pragma unroll
+    for(int gi=0;gi<7;gi++){
+        int g=warp+gi*8;if(g>=groups)break;
+        float a[8];
+#pragma unroll
+        for(int e=0;e<8;e++){
+            int c=g*256+lane+32*e;float val;
+            if(mode==0)val=x[(long)r*k+c];
+            else if(mode==1){
+                float v=(x[(long)r*k+c]-mean)*inv;v=rnd(v*(nw?nw[c]:1),1);
+                float scale=rnd(mod[mbase+(chunk+1)*k+c],1),shift=rnd(mod[mbase+chunk*k+c],1);
+                val=rnd(rnd(v*rnd(1.f+scale,1),1)+shift,1);
+            }else if(mode==2){
+                float ga=h3_lin(acc,axs,aws,nullptr,lr,2*k,c,1,1),gb=h3_lin(acc,axs,aws,nullptr,lr,2*k,k+c,1,1);
+                val=rnd(rnd(ga/(1.f+expf(-ga)),1)*gb,1);
+            }else val=h3_from16(heads[((long)(c/hdim)*hrows+r)*hdim+c%hdim],1);
+            a[e]=val;
         }
-        float o=rnd(a[i],1);rot[c]=h3_bits16(o,1);mx=fmaxf(mx,fabsf(o));
-        __syncthreads();
+        h3_fht_stage<1>(a,lane);h3_fht_stage<4>(a,lane);h3_fht_stage<16>(a,lane);h3_fht_stage<64>(a,lane);
+#pragma unroll
+        for(int e=0;e<8;e++){float o=rnd(a[e],1);rot[gi][e]=o;mx=fmaxf(mx,fabsf(o));}
     }
-    red[tid]=mx;__syncthreads();
-    for(int d=128;d;d/=2){if(tid<d)red[tid]=fmaxf(red[tid],red[tid+d]);__syncthreads();}
-    float scale=fmaxf(red[0]*(1.f/127.f),1e-30f);if(tid==0)scales[lr]=scale;
-    for(int c=tid;c<k;c+=256){float math_scale=rnd(scale,1);if(math_scale==0)math_scale=1.17549435e-38f;float v=rnd(h3_from16(rot[c],1)/math_scale,1);int q=(int)rintf(v);out[(long)lr*k+c]=(signed char)max(-128,min(127,q));}
+    for(int d=16;d;d/=2)mx=fmaxf(mx,__shfl_xor(mx,d,32));
+    if(lane==0)red[warp]=mx;__syncthreads();
+    mx=red[0];for(int w=1;w<8;w++)mx=fmaxf(mx,red[w]);
+    float scale=fmaxf(mx*(1.f/127.f),1e-30f);if(tid==0)scales[lr]=scale;
+    float math_scale=rnd(scale,1);if(math_scale==0)math_scale=1.17549435e-38f;
+#pragma unroll
+    for(int gi=0;gi<7;gi++){
+        int g=warp+gi*8;if(g>=groups)break;
+#pragma unroll
+        for(int e=0;e<8;e++){
+            int c=g*256+lane+32*e;float v=rnd(rot[gi][e]/math_scale,1);int q=(int)rintf(v);
+            out[(long)lr*k+c]=(signed char)max(-128,min(127,q));
+        }
+    }
 }
 }
 )CUDA";

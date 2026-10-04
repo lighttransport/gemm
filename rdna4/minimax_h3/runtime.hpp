@@ -387,11 +387,13 @@ struct Engine {
     struct Linear {
         Engine &e;
         Tensor w, scale, bias;
+        Weights *weights;
+        std::string name;
         int kind;
         bool quant, precise;
         Linear(Engine &owner, Weights &weights, const std::string &name, int dtype = 1,
                bool fp32 = false)
-            : e(owner), kind(dtype), quant(weights.dtype(name + ".weight") == "I8"), precise(fp32) {
+            : e(owner), weights(&weights), name(name), kind(dtype), quant(weights.dtype(name + ".weight") == "I8"), precise(fp32) {
             auto shape = weights.shape(name + ".weight");
             require(shape.size() == 2, "linear matrix rank");
             if (quant) {
@@ -742,12 +744,13 @@ struct Engine {
     std::array<Tensor, 3> qkv_pack(const Tensor &y, const Tensor *xs, const Linear &l, int rows,
                                    int heads, int dim, bool interleaved, const Tensor *qw,
                                    const Tensor *kw, const Tensor &angles, int pairs, int kind) {
+        const int mode = y.element_bytes == 2 ? 2 : int(l.quant);
         std::array<Tensor, 3> out{g.empty_half({heads, rows, dim}), g.empty_half({heads, rows, dim}),
                                   g.empty_half({heads, rows, dim})};
         g.launch("h3x_qkv_pack", int((int64_t(rows) * heads + 3) / 4), 1, 1, 128, 1, 0,
                  out[0].pointer, out[1].pointer, out[2].pointer, y.pointer,
                  xs ? xs->pointer : CUdeviceptr(0), l.quant ? l.scale.pointer : CUdeviceptr(0),
-                 l.bias.pointer, int(l.quant), rows, heads, dim, int(interleaved),
+                 mode == 2 ? CUdeviceptr(0) : l.bias.pointer, mode, rows, heads, dim, int(interleaved),
                  qw ? qw->pointer : CUdeviceptr(0), kw ? kw->pointer : CUdeviceptr(0),
                  angles.pointer, pairs, kind, 1e-5f);
         return out;
@@ -795,6 +798,28 @@ struct Engine {
                      mod.pointer, count, k, row, text, audio, 5);
         }
     }
+    // FP16 GEMM with the bias and FP16 rounding fused into the cuBLASLt epilogue
+    // (as torch F.linear). Returns an FP16 tensor, or the raw F32 repo-GEMM output
+    // (bias applied later by the consumer) when cuBLASLt is unavailable.
+    bool vae_lt = !std::getenv("H3_VAE_LT") || std::string(std::getenv("H3_VAE_LT")) != "0";
+    Tensor gemm16(const Tensor &x16, const Linear &l) {
+        if (vae_lt && l.bias.pointer) {
+            if (!rotation_blas)
+                require(cublasewCreate(&rotation_blas, g.stream) == 0, "cuBLAS unavailable");
+            auto y = g.empty_half({x16.rows(), l.w.shape[0]});
+            auto bias16 = g.weight_half(*l.weights, l.name + ".bias");
+            if (cublasew_gemm_f16_f16_f32_lt_bias_rowmajor_nt(rotation_blas, y.pointer, l.w.pointer,
+                                                              x16.pointer, bias16.pointer, 0, 2,
+                                                              x16.rows(), y.channels(),
+                                                              x16.channels()) == 0) {
+                g.blas_gemm++;
+                return y;
+            }
+            vae_lt = false;
+            std::cerr << "H3: cuBLASLt FP16 epilogue unavailable; using repository GEMM\n";
+        }
+        return g.matmul(x16, l.w);
+    }
     // One VAE decoder block with FP16 activations feeding the GEMMs and fused epilogues.
     void vae_block_fused(Weights &w, const std::string &p, Tensor &x, const Tensor &angles) {
         const int rows = x.rows(), k = x.channels();
@@ -806,13 +831,14 @@ struct Engine {
             return h;
         };
         auto scale_add = [&](const Tensor &y, const Linear &l, const Tensor &s, int row, int count) {
+            const int mode = y.element_bytes == 2 ? 2 : 0;
             g.launch("h3x_scale_add", int((int64_t(count) * k + 255) / 256), 1, 1, 256, 1, 0,
-                     x.pointer + size_t(row) * k * 4, y.pointer, l.bias.pointer, s.pointer, count, k,
-                     2);
+                     x.pointer + size_t(row) * k * 4, y.pointer,
+                     mode ? CUdeviceptr(0) : l.bias.pointer, s.pointer, count, k, 2, mode);
         };
         {
             Linear qkv(*this, w, p + ".attn.to_qkv", 2), out(*this, w, p + ".attn.to_out", 2);
-            auto y = g.matmul(norm16(".norm1.weight"), qkv.w);
+            auto y = gemm16(norm16(".norm1.weight"), qkv);
             auto packed = qkv_pack(y, nullptr, qkv, rows, 32, 64, true, nullptr, nullptr, angles, 24, 2);
             y = {};
             auto attended = flash_packed(packed[0], packed[1], packed[2], rows, 32, 64, 2);
@@ -821,7 +847,7 @@ struct Engine {
             g.launch("h3x_unpack16", int((flat.count() + 255) / 256), 1, 1, 256, 1, 0, flat.pointer,
                      attended.pointer, rows, 32, 64);
             attended = {};
-            scale_add(g.matmul(flat, out.w), out, g.weight(w, p + ".scale1"), 0, rows);
+            scale_add(gemm16(flat, out), out, g.weight(w, p + ".scale1"), 0, rows);
         }
         Linear up(*this, w, p + ".ff.w1", 2), down(*this, w, p + ".ff.w2", 2);
         auto h = norm16(".norm2.weight");
@@ -829,12 +855,14 @@ struct Engine {
         const int hidden = up.w.shape[0] / 2;
         for (int row = 0; row < rows; row += ffn_rows) {
             int count = std::min(ffn_rows, rows - row);
-            auto y1 = g.matmul(view(h, row, count), up.w);
+            auto y1 = gemm16(view(h, row, count), up);
+            const int mode = y1.element_bytes == 2 ? 2 : 0;
             auto act = g.empty_half({count, hidden});
             g.launch("h3x_swiglu16", int((int64_t(count) * hidden + 255) / 256), 1, 1, 256, 1, 0,
-                     act.pointer, y1.pointer, up.bias.pointer, count, hidden, 2);
+                     act.pointer, y1.pointer, mode ? CUdeviceptr(0) : up.bias.pointer, count, hidden,
+                     2, mode);
             y1 = {};
-            scale_add(g.matmul(act, down.w), down, s2, row, count);
+            scale_add(gemm16(act, down), down, s2, row, count);
         }
     }
 #endif

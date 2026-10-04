@@ -1233,8 +1233,8 @@ int cublasew_gemm_f16_f16_f32_rowmajor_nn(cublasew_context *ctx,
  * add_bias / gelu kernels on the Blackwell F16xF16 path. Returns -1 (no side
  * effects) if cuBLAS-LT is unavailable so the caller can fall back. */
 /* F16xF16->{F32|F16} GEMM with a fused bias (and optional tanh-GELU) epilogue.
- * y_f16=0: D is FP32; y_f16=1: D is FP16 (d_Y must point at an FP16 buffer). The
- * bias is always FP32 regardless of output type (BIAS_DATA_TYPE forced to F32). */
+ * y_f16=0: D is FP32; y_f16=1: D is FP16 (d_Y must point at an FP16 buffer) with an
+ * FP32 bias; y_f16=2: D and the bias are both FP16 (as torch F.linear in half). */
 int cublasew_gemm_f16_f16_f32_lt_bias_rowmajor_nt(cublasew_context *ctx,
                                                   CUdeviceptr d_Y,
                                                   CUdeviceptr d_W_f16,
@@ -1253,7 +1253,7 @@ int cublasew_gemm_f16_f16_f32_lt_bias_rowmajor_nt(cublasew_context *ctx,
     cublasStatus_t st;
     int op_t = CUBLAS_OP_T, op_n = CUBLAS_OP_N;
     int epilogue = gelu ? CUBLASLT_EPILOGUE_GELU_BIAS : CUBLASLT_EPILOGUE_BIAS;
-    int bias_dt = CUDA_R_32F;
+    int bias_dt = y_f16 == 2 ? CUDA_R_16F : CUDA_R_32F;
     int y_dt = y_f16 ? CUDA_R_16F : CUDA_R_32F;
     void *biasp = (void *)(uintptr_t)d_bias_f32;
     void *Wp = (void *)(uintptr_t)d_W_f16;
