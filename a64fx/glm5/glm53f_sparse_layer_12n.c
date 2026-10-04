@@ -98,6 +98,9 @@ struct glm53f_sparse_context_12n {
     uint8_t *sg_w1, *sg_wqb, *sg_wop; int sg_state; /* int8 panel64 GEMM copies of q_a|kv_a and q_b (prefill front) */
     int8_t *sg_xq, *sg_xp, *sg_qq, *sg_qp, *sg_oq, *sg_op; float *sg_xs, *sg_xsp, *sg_bt, *sg_qs, *sg_qsp, *sg_y1, *sg_yq, *sg_os, *sg_osp, *sg_yo;
     unsigned char *front_act_x, *front_act_q; /* fused decode front: native activations of x and of qres */
+    /* Verify-batch front (up to four positions): token-major activations and projection outputs. */
+    unsigned char *vf_act_x, *vf_act_q; size_t vf_stride_x, vf_stride_q;
+    float *vf_qres, *vf_query, *vf_iq, *vf_iw, *vf_raw;
     size_t q8v_act_bytes;
     float *qas,*qbs,*kvas,*ops;
     uint16_t *qan,*kvan,*kvb,*wk,*knw,*knb,*gatew,*ape,*wqb,*wp;
@@ -861,6 +864,124 @@ static int sparse_front_fused(glm53f_sparse_context_12n *c, int pos, const float
     bad = call.bad;
     return bad ? -1 : 1;
 }
+/* Four bf16 rows against K token inputs. Each (row, token) keeps b16dot8's
+ * lane-wise FMA chain and final reduction, so outputs are bit-identical; the
+ * weight vector is loaded once per K tokens. y[j * ldy + r], x[j * ldx + i]. */
+static inline __attribute__((always_inline)) void b16dot4xk(float *y, size_t ldy,
+        const uint16_t *w, const float *x, size_t ldx, int n, const int K) {
+    svfloat32_t a00 = svdup_f32(0), a01 = a00, a02 = a00, a03 = a00, a10 = a00, a11 = a00, a12 = a00, a13 = a00,
+                a20 = a00, a21 = a00, a22 = a00, a23 = a00, a30 = a00, a31 = a00, a32 = a00, a33 = a00;
+    const int vl = (int)svcntw();
+    for (int i = 0; i < n; i += vl) {
+        svbool_t p = svwhilelt_b32(i, n);
+        svfloat32_t x0 = svld1(p, x + i), x1 = x0, x2 = x0, x3 = x0;
+        if (K > 1) x1 = svld1(p, x + ldx + i);
+        if (K > 2) x2 = svld1(p, x + 2 * ldx + i);
+        if (K > 3) x3 = svld1(p, x + 3 * ldx + i);
+#define R(N, A0, A1, A2, A3) do { svfloat32_t z = svreinterpret_f32_u32(svlsl_n_u32_x(p, \
+            svld1uh_u32(p, w + (size_t)(N) * n + i), 16)); A0 = svmla_x(p, A0, z, x0); \
+            if (K > 1) A1 = svmla_x(p, A1, z, x1); if (K > 2) A2 = svmla_x(p, A2, z, x2); \
+            if (K > 3) A3 = svmla_x(p, A3, z, x3); } while (0)
+        R(0, a00, a01, a02, a03); R(1, a10, a11, a12, a13);
+        R(2, a20, a21, a22, a23); R(3, a30, a31, a32, a33);
+#undef R
+    }
+    svbool_t p = svptrue_b32();
+#define S(J, B0, B1, B2, B3) do { float *o = y + (size_t)(J) * ldy; o[0] = svaddv_f32(p, B0); \
+        o[1] = svaddv_f32(p, B1); o[2] = svaddv_f32(p, B2); o[3] = svaddv_f32(p, B3); } while (0)
+    S(0, a00, a10, a20, a30);
+    if (K > 1) S(1, a01, a11, a21, a31);
+    if (K > 2) S(2, a02, a12, a22, a32);
+    if (K > 3) S(3, a03, a13, a23, a33);
+#undef S
+}
+static void b16dot4x(float *y, size_t ldy, const uint16_t *w, const float *x,
+                     size_t ldx, int n, int k) {
+    switch (k) {
+    case 1: b16dot4xk(y, ldy, w, x, ldx, n, 1); break;
+    case 2: b16dot4xk(y, ldy, w, x, ldx, n, 2); break;
+    case 3: b16dot4xk(y, ldy, w, x, ldx, n, 3); break;
+    default: b16dot4xk(y, ldy, w, x, ldx, n, 4); break;
+    }
+}
+/* Verify-batch version of sparse_front_worker for positions pos..pos+k-1:
+ * every weight is streamed once for all k inputs. Per-position arithmetic is
+ * that of the scalar fused front (same activation quantization, row kernels
+ * and norms); outputs go to the vf_* token-major buffers and cache rows. */
+struct sparse_front_batch_call { glm53f_sparse_context_12n *c; int pos, k, bad; const float *x; };
+static void sparse_front_batch_worker(void *context) {
+    struct sparse_front_batch_call *a = context;
+    glm53f_sparse_context_12n *c = a->c;
+    const int pos = a->pos, k = a->k, qd = c->qd;
+    int bad = 0;
+#pragma omp for schedule(static)
+    for (int t = 0; t < k; ++t)
+        if (glm53f_native_act_prepare(c->vf_act_x + (size_t)t * c->vf_stride_x,
+                                      a->x + (size_t)t * H, H, 0, 1)) bad = 1;
+    const glm53f_native_matrix ax[2] = {{c->vf_qres, c->q2_qa, c->q2_qa_type, QA, H},
+        {c->latent + (size_t)pos * LAT, c->q2_kva, c->q2_kva_type, LAT, H}};
+    bad |= glm53f_native_matvec_batch_team(ax, 2, c->vf_act_x, c->vf_stride_x, k) != 0;
+#pragma omp for schedule(static)
+    for (int b = 0; b < ID / 4 * 2 + IH / 4; ++b) {
+        if (b < ID / 4)
+            b16dot4x(c->vf_raw + b * 4, ID, c->wk + (size_t)b * 4 * H, a->x, H, H, k);
+        else if (b < 2 * ID / 4)
+            b16dot4x(c->gcache + (size_t)pos * ID + (b - ID / 4) * 4, ID,
+                     c->gatew + (size_t)(b - ID / 4) * 4 * H, a->x, H, H, k);
+        else
+            b16dot4x(c->vf_iw + (b - 2 * ID / 4) * 4, IH,
+                     c->wp + (size_t)(b - 2 * ID / 4) * 4 * H, a->x, H, H, k);
+    }
+#pragma omp for schedule(static)
+    for (int t = 0; t < k; ++t) {
+        float *latent = c->latent + (size_t)(pos + t) * LAT;
+        glm53f_rmsnorm_bf16(c->vf_qres + (size_t)t * QA, c->vf_qres + (size_t)t * QA, c->qan, QA, 1e-5f);
+        glm53f_rmsnorm_bf16(latent, latent, c->kvan, LAT, 1e-5f);
+        glm53f_layernorm_bf16(c->key + (size_t)(pos + t) * ID, c->vf_raw + (size_t)t * ID,
+                              c->knw, c->knb, ID, 1e-6f);
+        if (glm53f_native_act_prepare(c->vf_act_q + (size_t)t * c->vf_stride_q,
+                                      c->vf_qres + (size_t)t * QA, QA, 0, 1)) bad = 1;
+    }
+    const glm53f_native_matrix aq = {c->vf_query, c->q2_qb, c->q2_qb_type, qd, QA};
+    bad |= glm53f_native_matvec_batch_team(&aq, 1, c->vf_act_q, c->vf_stride_q, k) != 0;
+#pragma omp for schedule(static)
+    for (int b = 0; b < IH * ID / 4; ++b)
+        b16dot4x(c->vf_iq + b * 4, IH * ID, c->wqb + (size_t)b * 4 * QA, c->vf_qres, QA, QA, k);
+    if (bad) {
+#pragma omp atomic write
+        a->bad = 1;
+    }
+}
+static int sparse_verify_front_enabled(const glm53f_sparse_context_12n *c) {
+    const char *e = getenv("GLM53F_SPARSE_VERIFY_FRONT");
+    const char *f = getenv("GLM53F_SPARSE_FUSE_FRONT");
+    if (!e || atoi(e) <= 0 || c->cp || !c->q2_native || glm53f_sparse_scalar_reference ||
+        (f && *f && !atoi(f)) || getenv("GLM53F_SPARSE_REFERENCE") ||
+        !sp_is_q80(c->q2_qa_type) || !sp_is_q80(c->q2_kva_type) || !sp_is_q80(c->q2_qb_type) ||
+        svcntw() != 16) return 0;
+    return atoi(e);
+}
+static int sparse_front_batch(glm53f_sparse_context_12n *c, int pos, const float *x, int k) {
+    if (k < 1 || k > 4) return -1;
+    if (!c->vf_act_x) {
+        c->vf_stride_x = (glm53f_native_act_bytes(H) + 255) & ~(size_t)255;
+        c->vf_stride_q = (glm53f_native_act_bytes(QA) + 255) & ~(size_t)255;
+        c->vf_act_x = a256(4 * c->vf_stride_x);
+        c->vf_act_q = a256(4 * c->vf_stride_q);
+        c->vf_qres = a256((size_t)4 * QA * 4);
+        c->vf_query = a256((size_t)4 * c->qd * 4);
+        c->vf_iq = a256((size_t)4 * IH * ID * 4);
+        c->vf_iw = a256((size_t)4 * IH * 4);
+        c->vf_raw = a256((size_t)4 * ID * 4);
+    }
+    struct sparse_front_batch_call call = {c, pos, k, 0, x};
+    if (glm53f_team_available()) glm53f_team_dispatch(sparse_front_batch_worker, &call);
+    else {
+#pragma omp parallel
+        { sparse_front_batch_worker(&call); }
+    }
+    return call.bad ? -1 : 0;
+}
 struct sparse_pack_call { glm53f_sparse_context_12n *c; int ns; };
 static void sparse_pack_worker(void *context) {
     struct sparse_pack_call *a = context;
@@ -870,10 +991,12 @@ static void sparse_pack_worker(void *context) {
         for (int d = 0; d < LAT; ++d)
             c->packed[(size_t)i * LAT + d] = (float)(_Float16)c->latent[(size_t)c->selected[i] * LAT + d];
 }
+static int sparse_attention_tail(glm53f_sparse_context_12n *c, float *attn,
+                                 int pos, double begin);
 static int sparse_attention_local_replicated(glm53f_sparse_context_12n *c,
                                              float *attn, const float *x) {
     if (c->length >= c->capacity) return -1;
-    int pos = c->length, tokens = pos + 1, ns;
+    int pos = c->length;
     double begin = sparse_clock(c);
     float raw[ID];
     const int fused = sparse_front_fused(c, pos, x, raw);
@@ -915,6 +1038,13 @@ static int sparse_attention_local_replicated(glm53f_sparse_context_12n *c,
     mv_b16(c->iq, c->wqb, c->qres, IH * ID, QA);
     mv_b16(c->iw, c->wp, x, IH, H);
     }
+    return sparse_attention_tail(c, attn, pos, begin);
+}
+/* Selection and MLA for one decode position whose front outputs (query, iq, iw,
+ * latent/key/gate cache rows) are already written; advances the cache length. */
+static int sparse_attention_tail(glm53f_sparse_context_12n *c, float *attn,
+                                 int pos, double begin) {
+    int tokens = pos + 1, ns;
     if (c->latent_f16) glm53f_mla_cache_f16_store(c->latent_f16 + (size_t)pos * LAT,
         c->latent + (size_t)pos * LAT, LAT);
     c->profile_phase[0] += sparse_clock(c) - begin;
@@ -1356,6 +1486,28 @@ int glm53f_sparse_sublayer_batch_12n(glm53f_sparse_context_12n *c,
     }
     /* Attention and KV updates remain causal. Reuse output-projection weights
      * across verified positions, then combine all positions in one collective. */
+    const int verify_front = sparse_verify_front_enabled(c);
+    if (verify_front) {
+        /* Front projections depend only on each position's input: stream the
+         * replicated front weights once, then run selection/MLA per position
+         * with its own causal length. */
+        const int base = c->length;
+        double begin = sparse_clock(c);
+        if (sparse_front_batch(c, base, x, tokens)) return -1;
+        float *query = c->query, *iq = c->iq, *iw = c->iw;
+        int rc = 0;
+        for (int t = 0; t < tokens && !rc; t++) {
+            c->query = c->vf_query + (size_t)t * c->qd;
+            c->iq = c->vf_iq + (size_t)t * IH * ID;
+            c->iw = c->vf_iw + (size_t)t * IH;
+            rc = sparse_attention_tail(c, c->batch_attn + (size_t)t * cols, base + t,
+                                       t ? sparse_clock(c) : begin);
+        }
+        c->query = query; c->iq = iq; c->iw = iw;
+        if (rc) return -1;
+        if (verify_front == 1) batch_mode = 2;
+        else batch_mode = 1;
+    } else
     for (int t = 0; t < tokens; t++)
         if (sparse_attention_local(c, c->batch_attn + (size_t)t * cols,
                                    x + (size_t)t * H)) return -1;

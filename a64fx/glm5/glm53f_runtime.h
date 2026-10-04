@@ -39,6 +39,7 @@ static inline int glm53f_runtime_option(int argc, char **argv, int *index) {
     else if (!strcmp(key, "--kda-decode-kernel")) env = "GLM53F_KDA_DECODE_COLUMNS";
     else if (!strcmp(key, "--kda-prefill-kernel")) env = "GLM53F_KDA_PREFILL_COLUMNS";
     else if (!strcmp(key, "--mla-kernel")) env = "GLM53F_MLA_REGISTERS";
+    else if (!strcmp(key, "--sparse-verify-kernel")) env = "GLM53F_SPARSE_VERIFY_FRONT";
     else return 0;
     if (*index + 1 >= argc) return -1;
     const char *value = argv[++*index];
@@ -65,6 +66,7 @@ static inline int glm53f_runtime_option(int argc, char **argv, int *index) {
              (!strcmp(key, "--mla-softmax-kernel") && !strcmp(value, "parallel")) ||
              (!strcmp(key, "--mhc-kernel") && !strcmp(value, "fused-sync")) ||
              (!strcmp(key, "--mhc-verify-kernel") && !strcmp(value, "team")) ||
+             (!strcmp(key, "--sparse-verify-kernel") && !strcmp(value, "front")) ||
              ((!strcmp(key, "--kda-decode-kernel") || !strcmp(key, "--kda-prefill-kernel")) && !strcmp(value, "columns")) ||
              (!strcmp(key, "--moe-scale-kernel") && !strcmp(value, "words")) ||
              (!strcmp(key, "--moe-combine-kernel") && !strcmp(value, "vector")) ||
@@ -75,6 +77,7 @@ static inline int glm53f_runtime_option(int argc, char **argv, int *index) {
              (!strcmp(key, "--mla-prefill-heads") && !strcmp(value, "values32")) ||
              (!strcmp(key, "--q8-prefill-kernel") && !strcmp(value, "tile4x4-asm")) ||
              (!strcmp(key, "--moe-combine-kernel") && !strcmp(value, "overlap")) ||
+             (!strcmp(key, "--sparse-verify-kernel") && !strcmp(value, "front-onecoll")) ||
              (!strcmp(key, "--index-kernel") && !strcmp(value, "keys4")) ||
              (!strcmp(key, "--mla-kernel") && !strcmp(value, "values"))) enabled = 2;
     else if ((!strcmp(key, "--moe-router-prefill") && !strcmp(value, "unroll1")) ||

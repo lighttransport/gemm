@@ -69,6 +69,10 @@ int main(void) {
     failed |= parse("--mhc-verify-kernel", "legacy", &c) != 1 || strcmp(getenv("GLM53F_MHC_BATCH_TEAM"), "0");
     failed |= parse("--mhc-verify-kernel", "fused-sync", &c) != -1;
     failed |= parse("--mhc-verify-kernel", NULL, &c) != -1;
+    failed |= parse("--sparse-verify-kernel", "front", &c) != 1 || strcmp(getenv("GLM53F_SPARSE_VERIFY_FRONT"), "1");
+    failed |= parse("--sparse-verify-kernel", "front-onecoll", &c) != 1 || strcmp(getenv("GLM53F_SPARSE_VERIFY_FRONT"), "2");
+    failed |= parse("--sparse-verify-kernel", "legacy", &c) != 1 || strcmp(getenv("GLM53F_SPARSE_VERIFY_FRONT"), "0");
+    failed |= parse("--sparse-verify-kernel", "team", &c) != -1;
     failed |= parse("--moe-prefill-layout", "padded", &c) != 1 || strcmp(getenv("GLM53F_MOE_GU_PAD"), "1");
     failed |= parse("--moe-prefill-layout", "tight", &c) != 1 || strcmp(getenv("GLM53F_MOE_GU_PAD"), "0");
     failed |= parse("--moe-prefill-layout", "legacy", &c) != 1 || strcmp(getenv("GLM53F_MOE_GU_PAD"), "0");
