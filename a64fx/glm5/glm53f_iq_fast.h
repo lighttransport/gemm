@@ -16,6 +16,7 @@
 
 #include <arm_sve.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 typedef struct { float d; int8_t q[256]; } iqf_src_block;   /* == glm5_iq_q8_block */
@@ -187,6 +188,26 @@ static inline void iqf_rows(float *out, const uint8_t *row0, size_t rb, int nrow
             out[r] = tmp[0]; out[r + 1] = tmp[1]; out[r + 2] = tmp[2]; out[r + 3] = tmp[3];
         }
     }
+    /* Opt-in GLM53F_IQF_ROWS4=1: four independent row chains (each row's
+     * arithmetic unchanged) to hide A64FX SDOT/FMA latency; measured IPC ~0.5
+     * with two rows. */
+    static int rows4 = -1;
+    if (rows4 < 0) { const char *e = getenv("GLM53F_IQF_ROWS4"); rows4 = e && atoi(e); }
+    if (rows4 && blocks > 1)
+        for (; r + 3 < nrows; r += 4) {
+            const uint8_t *ra = row0 + (size_t)r * rb, *rb1 = ra + rb, *rc = rb1 + rb, *rd = rc + rb;
+            svfloat32_t a0 = svdup_f32(0.0f), a1 = a0, a2 = a0, a3 = a0;
+            for (int b = 0; b < blocks; ++b) {
+                a0 = IQF_CALL(a0, ra + (size_t)b * bsz, a + b);
+                a1 = IQF_CALL(a1, rb1 + (size_t)b * bsz, a + b);
+                a2 = IQF_CALL(a2, rc + (size_t)b * bsz, a + b);
+                a3 = IQF_CALL(a3, rd + (size_t)b * bsz, a + b);
+            }
+            out[r] = svaddv_f32(iqf_p32, a0);
+            out[r + 1] = svaddv_f32(iqf_p32, a1);
+            out[r + 2] = svaddv_f32(iqf_p32, a2);
+            out[r + 3] = svaddv_f32(iqf_p32, a3);
+        }
     for (; r + 1 < nrows; r += 2) {
         const uint8_t *rowa = row0 + (size_t)r * rb, *rowb = rowa + rb;
         svfloat32_t acca = svdup_f32(0.0f), accb = acca;
