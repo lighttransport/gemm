@@ -6,7 +6,10 @@
  *   2: additionally time a PMPI_Barrier before each allreduce, separating
  *      arrival skew from collective latency (adds one barrier per allreduce);
  *   3: mode 1 plus per-call-site barrier/dispatch counts and wait time
- *      (return addresses; resolve offline with addr2line -f -e BINARY).
+ *      (return addresses; resolve offline with addr2line -f -e BINARY);
+ *   4: mode 3 plus per-site thread arrival spread (max - min arrival time of
+ *      all team threads at each barrier), i.e. phase load imbalance. Approximate:
+ *      a released thread may store its next arrival before thread 0 reads.
  * Production sources are unchanged; results are not throughput measurements. */
 #define _GNU_SOURCE
 #include <mpi.h>
@@ -29,14 +32,15 @@ static struct {
 } sync_stats;
 
 enum { SITES = 512 };
-static struct { uintptr_t pc; uint64_t calls; double seconds; char kind; } sync_site[SITES];
-static void sync_site_add(uintptr_t pc, double seconds, char kind) {
+static struct { uintptr_t pc; uint64_t calls; double seconds, spread; char kind; } sync_site[SITES];
+static void sync_site_add(uintptr_t pc, double seconds, char kind, double spread) {
     unsigned h = (unsigned)((pc >> 2) * 2654435761u) % SITES;
     for (int i = 0; i < SITES; ++i, h = (h + 1) % SITES) {
         if (!sync_site[h].pc) { sync_site[h].pc = pc; sync_site[h].kind = kind; }
-        if (sync_site[h].pc == pc) { ++sync_site[h].calls; sync_site[h].seconds += seconds; return; }
+        if (sync_site[h].pc == pc) { ++sync_site[h].calls; sync_site[h].seconds += seconds; sync_site[h].spread += spread; return; }
     }
 }
+static double sync_arrive[256 * 8];   /* per-thread arrival times, one cache-line stride apart */
 static inline double sync_now(void) {
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);
@@ -57,17 +61,27 @@ void __wrap_glm53f_team_dispatch(glm53f_team_callback fn, void *context) {
     const double t = sync_now() - begin;
     sync_stats.dispatch_s += t;
     ++sync_stats.dispatches;
-    if (sync_mode >= 3) sync_site_add((uintptr_t)__builtin_return_address(0), t, 'D');
+    if (sync_mode >= 3) sync_site_add((uintptr_t)__builtin_return_address(0), t, 'D', 0.0);
 }
 
 void __wrap___kmpc_barrier(void *loc, int32_t gtid) {
-    if (!sync_on() || omp_get_thread_num() != 0) { __real___kmpc_barrier(loc, gtid); return; }
+    const int tid = omp_get_thread_num();
+    if (!sync_on() || (tid != 0 && sync_mode < 4)) { __real___kmpc_barrier(loc, gtid); return; }
     double begin = sync_now();
+    if (sync_mode >= 4 && tid < 256) sync_arrive[tid * 8] = begin;
+    if (tid != 0) { __real___kmpc_barrier(loc, gtid); return; }
     __real___kmpc_barrier(loc, gtid);
     const double t = sync_now() - begin;
     sync_stats.barrier_s += t;
     ++sync_stats.barriers;
-    if (sync_mode >= 3) sync_site_add((uintptr_t)__builtin_return_address(0), t, 'B');
+    double spread = 0.0;
+    if (sync_mode >= 4) {   /* every thread stored its arrival before the barrier completed */
+        const int nt = omp_get_num_threads() < 256 ? omp_get_num_threads() : 256;
+        double lo = sync_arrive[0], hi = sync_arrive[0];
+        for (int i = 1; i < nt; ++i) { const double a = sync_arrive[i * 8]; if (a < lo) lo = a; if (a > hi) hi = a; }
+        spread = hi - lo;
+    }
+    if (sync_mode >= 3) sync_site_add((uintptr_t)__builtin_return_address(0), t, 'B', spread);
 }
 
 int __wrap_glm53f_sum_allreduce_12n(const float *input, float *output, int count) {
@@ -110,8 +124,8 @@ void glm53f_sync_profile_report(const char *label, long positions) {
     if (!rank && sync_mode >= 3)
         for (int i = 0; i < SITES; ++i)
             if (sync_site[i].pc)
-                printf("GLM53F_SYNC_SITE label=%s kind=%c pc=%#lx per_pos=%.2f us_per_pos=%.2f\n", label,
-                       sync_site[i].kind, (unsigned long)sync_site[i].pc, (double)sync_site[i].calls / positions,
-                       sync_site[i].seconds * 1e6 / positions);
+                printf("GLM53F_SYNC_SITE label=%s kind=%c pc=%#lx per_pos=%.2f us_per_pos=%.2f spread_us_per_pos=%.2f\n",
+                       label, sync_site[i].kind, (unsigned long)sync_site[i].pc, (double)sync_site[i].calls / positions,
+                       sync_site[i].seconds * 1e6 / positions, sync_site[i].spread * 1e6 / positions);
     glm53f_sync_profile_reset();
 }
