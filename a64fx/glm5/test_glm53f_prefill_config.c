@@ -81,6 +81,8 @@ int main(void) {
     failed |= parse("--weight-placement", "cmg-experts", &c) != 1 || strcmp(getenv("GLM53F_CMG_PLACE"), "2");
     failed |= parse("--weight-placement", "local", &c) != -1;
     failed |= parse("--mhc-kernel", "local", &c) != 1 || strcmp(getenv("GLM53F_MHC_FUSED_SYNC"), "2");
+    failed |= parse("--moe-layer-kernel", "fused", &c) != 1 || strcmp(getenv("GLM53F_MOE_FUSED_LAYER"), "1");
+    failed |= parse("--moe-layer-kernel", "legacy", &c) != 1 || strcmp(getenv("GLM53F_MOE_FUSED_LAYER"), "0");
     failed |= parse("--moe-prefill-layout", "padded", &c) != 1 || strcmp(getenv("GLM53F_MOE_GU_PAD"), "1");
     failed |= parse("--moe-prefill-layout", "tight", &c) != 1 || strcmp(getenv("GLM53F_MOE_GU_PAD"), "0");
     failed |= parse("--moe-prefill-layout", "legacy", &c) != 1 || strcmp(getenv("GLM53F_MOE_GU_PAD"), "0");

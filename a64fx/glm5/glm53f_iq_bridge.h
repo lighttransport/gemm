@@ -69,6 +69,9 @@ typedef struct {
 } glm53f_iq_shared;
 int glm53f_iq_expert_weighted_shared(float *output, const glm53f_iq_part *parts, const float *weights, int count,
                                      const float *input, const glm53f_iq_shared *sh);
+/* Same, called by every thread of an enclosing team (see glm53f_iq_bridge.c). */
+int glm53f_iq_expert_weighted_shared_team(float *output, const glm53f_iq_part *parts, const float *weights, int count,
+                                          const float *input, const glm53f_iq_shared *sh);
 
 
 int glm53f_native_type_supported(int type);

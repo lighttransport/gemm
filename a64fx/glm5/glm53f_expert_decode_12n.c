@@ -211,6 +211,8 @@ struct glm53f_moe_stage_context_12n {
     expert_offset *table;
     shared_offset shared[NLAYERS];
     unsigned char *blob, *shared_blob;
+    int fused_ready; /* fused MoE layer: local_output holds this layer's experts */
+    int router_in_sublayer; /* router dispatched by the sublayer itself: never fuse */
     uint16_t *router_w;
     int8_t *router_i8;
     float *router_i8_scale;
@@ -790,6 +792,40 @@ void glm53f_moe_router_team_12n(void *context, const float *x) {
             c->router_w + ((size_t)li * NEXPERTS + b * 8) * 4096, x, 4096);
 #pragma omp single
     c->router_ready = 1;
+    /* Opt-in fused MoE layer (GLM53F_MOE_FUSED_LAYER=1, --moe-layer-kernel fused):
+     * the same team continues with top-k (computed identically by every
+     * thread) and the routed+shared expert step, removing the separate expert
+     * dispatch and the serial routing section. Every condition below is
+     * identical across threads, so all of them take the same path. */
+    const char *fused_env = getenv("GLM53F_MOE_FUSED_LAYER");
+    const char *shared_env = getenv("GLM53F_MOE_FUSE_SHARED");
+    const int t = c->active_layer - FIRST_LAYER;
+    if (!fused_env || !atoi(fused_env) || c->router_in_sublayer || !c->nsh_native || c->int8_enabled || t < 0 || t >= NLAYERS ||
+        c->route_export[t] || (shared_env && *shared_env && !atoi(shared_env))) return;
+    int selected[8], npart = 0;
+    float route_weight[8], part_weight[9];
+    glm53f_iq_part iq[9];
+    glm53f_router_topk(c->router_logits, c->router_bias + (size_t)li * NEXPERTS, NEXPERTS, 8, 2.5f,
+                       selected, route_weight);
+    for (int k = 0; k < 8; ++k) {
+        const expert_offset *p = &c->table[(size_t)t * NEXPERTS + selected[k]];
+        if (p->gate_up == UINT64_MAX) continue;
+        if (!p->gate_type && !p->down_type) { npart = 0; break; }
+        iq[npart] = (glm53f_iq_part){c->blob + p->gate_up, c->blob + p->down, p->gate_type, p->down_type, p->inter};
+        part_weight[npart++] = route_weight[k];
+    }
+    const int in = c->nsh_in;
+    const glm53f_iq_shared sh = {
+        .gu = {{c->nsh_gv, c->nsh_g[t], c->nsh_gt[t], in, 4096}, {c->nsh_uv, c->nsh_u[t], c->nsh_ut[t], in, 4096}},
+        .dn = {c->nsh_out, c->nsh_d[t], c->nsh_dt[t], 4096, in},
+        .act_x = c->nsh_act_x, .act_h = c->nsh_act_h, .act = c->nsh_act, .rows = in,
+        .x_q8k = !nsh_is_q80(c->nsh_gt[t]) || !nsh_is_q80(c->nsh_ut[t]),
+        .x_q80 = nsh_is_q80(c->nsh_gt[t]) || nsh_is_q80(c->nsh_ut[t]),
+        .h_q8k = !nsh_is_q80(c->nsh_dt[t]), .h_q80 = nsh_is_q80(c->nsh_dt[t])};
+    const int ok = npart >= 1 &&
+        glm53f_iq_expert_weighted_shared_team(c->scratch->local_output, iq, part_weight, npart, x, &sh) == 0;
+#pragma omp single
+    c->fused_ready = ok;
 }
 struct router_call { glm53f_moe_stage_context_12n *c; const float *x; };
 static void router_worker(void *context) {
@@ -820,10 +856,18 @@ static int moe_trace_routes(glm53f_moe_stage_context_12n *c,const int *selected,
     return 0;
 }
 int glm53f_moe_stage_sublayer_12n(void*context,float*out,const float*x){glm53f_moe_stage_context_12n*c=context;int li=c->active_layer-c->first_layer,selected[8],npart=0;float route_weight[8],part_weight[9];glm53f_expert_part part[9];int8_t router_qx[4096];float router_xs=0;if(li<0||li>=c->layer_count)return-1;double t=c->profile?glm53f_clock():0.0;
+if(c->fused_ready){ /* routed+shared experts already ran in the router team (fused layer) */
+    c->fused_ready=0;c->router_ready=0;
+    int rc=moe_sum(c,c->scratch->local_output,out,4096);
+    if(c->profile)c->profile_phase[2]+=glm53f_clock()-t;
+    return rc;
+}
 if(!c->router_ready&&!c->router_i8){
     if (glm53f_team_available()) {
         struct router_call call = {c, x};
+        c->router_in_sublayer = 1;
         glm53f_team_dispatch(router_worker, &call);
+        c->router_in_sublayer = 0;
     } else {
 #pragma omp parallel for schedule(static)
         for(int b=0;b<NEXPERTS/8;b++)router_dot8(c->router_logits+b*8,c->router_w+((size_t)li*NEXPERTS+b*8)*4096,x,4096);

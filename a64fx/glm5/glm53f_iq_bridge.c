@@ -1530,6 +1530,49 @@ int glm53f_iq_expert_weighted(
     return 0;
 }
 
+/* Team form of glm53f_iq_expert_weighted_shared for a fused decode layer:
+ * call from every thread of an enclosing team (all with identical
+ * arguments). One thread publishes the call in static buffers, all threads
+ * run the same worker, and a trailing barrier publishes the output. Returns
+ * -1 on every thread if the parts are not eligible (nothing computed). */
+static struct iq_fast_call iq_team_call;
+static iqf_act iq_team_in[4096 / 256] __attribute__((aligned(64)));
+static iqf_act iq_team_act[9][2] __attribute__((aligned(64)));
+static float iq_team_gu[9 * 1024] __attribute__((aligned(256)));
+static size_t iq_team_grb[9], iq_team_drb[9];
+static double iq_team_ts[3];
+int glm53f_iq_expert_weighted_shared_team(float *output, const glm53f_iq_part *parts, const float *weights, int count,
+                                          const float *input, const glm53f_iq_shared *sh) {
+    /* Every thread must take the same path (worksharing below), so no lazily
+     * initialized shared state is consulted before the single construct. */
+    const char *fast_env = getenv("GLM53F_IQ_FAST");
+    const int mode = !fast_env || !*fast_env ? 1 : atoi(fast_env);
+    if (mode != 1 || !sh || count < 1 || count > 9) return -1;
+    for (int k = 0; k < count; ++k)
+        if (!((parts[k].gate_type == GLM53F_GGML_Q4_K || parts[k].gate_type == GLM53F_GGML_Q5_K) &&
+              (parts[k].down_type == GLM53F_GGML_Q4_K || parts[k].down_type == GLM53F_GGML_Q5_K) && parts[k].inter <= 512 &&
+              parts[k].inter % 256 == 0)) return -1;
+#pragma omp single
+    {
+        static int initialized;
+        if (!initialized) { iqf_init(); initialized = 1; }
+        int total = 0, affine = glm53f_iq_affine_enabled() && omp_get_num_threads() >= 37 && omp_get_num_threads() <= 48;
+        for (int k = 0; k < count; ++k) {
+            iq_team_grb[k] = dequant_row_size((uint32_t)parts[k].gate_type, 4096);
+            iq_team_drb[k] = dequant_row_size((uint32_t)parts[k].down_type, parts[k].inter);
+            total += 2 * parts[k].inter;
+            affine = affine && parts[k].inter == 256;
+        }
+        const char *scale_env = getenv("GLM53F_IQ_SCALE_WORDS");
+        iq_team_call = (struct iq_fast_call){output, iq_team_gu, parts, weights, input, sh,
+            iq_team_grb, iq_team_drb, iq_team_in, iq_team_act, count, affine, 0, total,
+            scale_env && atoi(scale_env) != 0, 0, &iq_team_ts[0], &iq_team_ts[1], &iq_team_ts[2]};
+    }
+    iq_fast_worker(&iq_team_call);
+#pragma omp barrier
+    return iq_team_call.bad ? -1 : 0;
+}
+
 /* Routed experts plus the native Q8_0 shared expert in one parallel region; returns -1 if the parts are not eligible
  * for the fast kernels (the caller then falls back to the separate paths). */
 int glm53f_iq_expert_weighted_shared(float *output, const glm53f_iq_part *parts, const float *weights, int count,
