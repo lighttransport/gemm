@@ -38,7 +38,27 @@ VAE convolution (1.36 PFLOP per Fast12 decode, measured with `component_probe va
 | Bias and residual add fused into the implicit-GEMM store | removes the `element` passes (3.3 s); bit-identical |
 | `conv_small_n` for `conv_out` (N=3) instead of a 128-wide MMA tile | 1.68 → 0.90 s; FP32 sum order differs (2.2e-6 relative L2, ≤1 level in 8-bit frames) |
 
-GPU kernel time for one VAE decode fell from ~56.5 s to ~47.6 s. Convolution runs at
+| `conv_f16_implicit_v2`: 128×128 CTA (warp 64×32), 3-stage `cp.async` pipeline, M-fastest grid | +1–4% per layer (~30.1 → 30.5–31.6 TFLOPS); bit-identical |
+
+GPU kernel time for one VAE decode fell from ~56.5 s to ~47.6 s, then about 1–2 s more
+with the v2 tile pipeline (interleaved A/B: convolution 46.8/46.2 s → 46.0/44.2 s).
+
+Tile-pipeline exploration (paired runs of the 39-layer-type decode):
+
+| Variant | Convolution throughput |
+|---|---|
+| v1 (64×128 CTA, 2-stage, 4×4 panel order) | ~30.1 TFLOPS |
+| 128×128, BK=32, 3-stage, M-fastest (**adopted**) | ~30.5–31.6 TFLOPS |
+| 128×128, BK=32, N-fastest | 29.1–29.9 |
+| 128×128, BK=64, 2–3 stages | 25.3–26.9 |
+| 128×64, BK=32, 3–4 stages | 26.7–27.2 |
+| 128×256, BK=32/64 | 20.7–21.8 |
+
+During these runs the SM clock stayed at 2070 MHz (the driver reported the
+power-cap reason at 64–94 W), which puts the FP16 tensor peak near 38 TFLOPS.
+Convolution therefore runs at ~80% of that peak, against cuBLAS GEMM's ~91%. Closing
+the rest would need a deeper main-loop redesign (fragment double-buffering or
+warp-specialized loads). Convolution runs at
 ~30 TFLOPS, about 86% of the practical FP16 GEMM ceiling on this card.
 
 Numerics:

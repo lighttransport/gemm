@@ -966,9 +966,15 @@ Tensor Gpu::conv(Weights &w, const std::string &prefix, const Tensor &x,
         residual_pointer = conv_residual->pointer;
         fused_residual = true;
       }
-      check(cuModuleGetFunction(&fn, mma, "conv_f16_implicit"), "implicit convolution lookup");
-      check(cuLaunchKernel(fn, (((n+127)/128+3)&~3), (((m+63)/64+3)&~3), 1,
-                           256,1,1,24576,stream,params,nullptr), "implicit convolution");
+      if (inner % 32 == 0 && channels % 8 == 0) {
+        check(cuModuleGetFunction(&fn, mma, "conv_f16_implicit_v2"), "implicit convolution v2 lookup");
+        check(cuLaunchKernel(fn, (m + 127) / 128, (n + 127) / 128, 1, 256, 1, 1, 3 * (128 + 128) * 32 * 2,
+                             stream, params, nullptr), "implicit convolution v2");
+      } else {
+        check(cuModuleGetFunction(&fn, mma, "conv_f16_implicit"), "implicit convolution lookup");
+        check(cuLaunchKernel(fn, (((n+127)/128+3)&~3), (((m+63)/64+3)&~3), 1,
+                             256,1,1,24576,stream,params,nullptr), "implicit convolution");
+      }
     }
     repo_gemm++; conv_chunks++;
     conv_flops += 2.0 * m * n * inner;

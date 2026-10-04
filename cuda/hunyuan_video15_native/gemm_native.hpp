@@ -130,6 +130,139 @@ __device__ __forceinline__ long long conv_offset(int r, int k, int T,int H,int W
     if(x<0||x>=W||y<0||y>=H||t<0||t>=T)return -1;
     return ((long long)t*H*W+y*W+x)*C+channel;
 }
+// Implicit-GEMM convolution v2: 128 x BN CTA tile, K-step BK (32/64) with an XOR-swizzled
+// shared layout, 8 warps (2 along M x 4 along N, warp tile 64 x BN/4) and a STAGES-deep
+// cp.async pipeline. Rows are output pixels (THWC gather), columns output channels,
+// K = taps*C. Each output accumulates its k16 MMA chunks in ascending order exactly as
+// conv_f16_implicit, so results are bit-identical across variants.
+template <int BN, int BK, int STAGES>
+__device__ __forceinline__ void conv_v2_body(float *Y, const half_raw *X, const half_raw *W, int M, int N,
+        int K, int T, int H, int Wd, int C, int KT, int KH, int KW, int replicate,
+        const float *conv_bias, const float *conv_res) {
+    extern __shared__ __align__(16) half_raw smem_c2[];
+    constexpr int NT = BN / 32, CH = BK / 8, RA = 128 * CH / 256, RB = BN * CH / 256 > 0 ? (BN * CH + 255) / 256 : 1;
+    constexpr int STAGE = (128 + BN) * BK;
+    int tid = threadIdx.x, wid = tid >> 5, lane = tid & 31, gid = lane >> 2, tid4 = lane & 3;
+    // M tiles iterate fastest: consecutive CTAs share one weight tile in L2 (the gathered
+    // input neighborhood is small), avoiding repeated DRAM reads of large weight panels.
+    int cta_m = blockIdx.x * 128, cta_n = blockIdx.y * BN;
+    if (cta_m >= M || cta_n >= N) return;
+    int wm = (wid >> 2) * 64, wn = (wid & 3) * (BN / 4);
+    float acc[4][NT][4];
+#pragma unroll
+    for (int a = 0; a < 4; a++)
+#pragma unroll
+        for (int b = 0; b < NT; b++)
+#pragma unroll
+            for (int c = 0; c < 4; c++) acc[a][b][c] = 0.f;
+    // Loader: chunk i = tid + j*256 -> row i / CH, 16-byte chunk i % CH (constant per thread).
+    const int lchunk = tid % CH, lrow0 = tid / CH, rstep = 256 / CH;
+    int rx[RA], ry[RA], rt[RA], rok[RA];
+#pragma unroll
+    for (int j = 0; j < RA; j++) {
+        int r = cta_m + lrow0 + j * rstep;
+        rok[j] = r < M;
+        int rr = rok[j] ? r : 0, rw = conv_div(rr, Wd), plane = conv_div(rw, H);
+        rx[j] = rr - rw * Wd; ry[j] = rw - plane * H; rt[j] = plane;
+    }
+    const bool pow2 = (C & (C - 1)) == 0, k333 = KW == 3 && KH == 3;
+    const int cshift = __ffs(C) - 1;
+    auto swz = [](int row, int chunk) { return row * BK + ((chunk ^ (row & (CH - 1))) << 3); };
+    auto load_stage = [&](int stage, int kbase) {
+        half_raw *sA = smem_c2 + stage * STAGE, *sB = sA + 128 * BK;
+        int k = kbase + lchunk * 8, channel, point;
+        if (pow2) { channel = k & (C - 1); point = k >> cshift; } else { channel = k % C; point = k / C; }
+        int dx, dy, dt;
+        if (k333) { dx = point % 3 - 1; dy = (point / 3) % 3 - 1; dt = point / 9 - (replicate ? KT - 1 : 0); }
+        else { dx = point % KW - KW / 2; dy = (point / KW) % KH - KH / 2; dt = point / (KW * KH) - (replicate ? KT - 1 : 0); }
+#pragma unroll
+        for (int j = 0; j < RA; j++) {
+            int row = lrow0 + j * rstep;
+            int x = rx[j] + dx, y = ry[j] + dy, t = rt[j] + dt;
+            if (replicate) { x = max(0, min(Wd - 1, x)); y = max(0, min(H - 1, y)); t = max(0, min(T - 1, t)); }
+            bool ok = rok[j] && x >= 0 && x < Wd && y >= 0 && y < H && t >= 0 && t < T;
+            long long offset = ok ? ((long long)t * H * Wd + (long long)y * Wd + x) * C + channel : 0;
+            unsigned dst = __cvta_generic_to_shared(&sA[swz(row, lchunk)]);
+            asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" :: "r"(dst), "l"(X + offset), "r"(ok ? 16 : 0));
+        }
+#pragma unroll
+        for (int j = 0; j < RB; j++) {
+            int row = lrow0 + j * rstep;
+            if (row < BN) {
+                int n = cta_n + row;
+                unsigned dst = __cvta_generic_to_shared(&sB[swz(row, lchunk)]);
+                asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" :: "r"(dst),
+                             "l"(W + (size_t)(n < N ? n : 0) * K + k), "r"(n < N ? 16 : 0));
+            }
+        }
+    };
+    int num_k = K / BK;
+#pragma unroll
+    for (int s = 0; s < STAGES - 1; s++) {
+        if (s < num_k) load_stage(s, s * BK);
+        asm volatile("cp.async.commit_group;\n");
+    }
+    for (int ki = 0; ki < num_k; ki++) {
+        asm volatile("cp.async.wait_group %0;\n" :: "n"(STAGES - 2));
+        __syncthreads();
+        if (ki + STAGES - 1 < num_k) load_stage((ki + STAGES - 1) % STAGES, (ki + STAGES - 1) * BK);
+        asm volatile("cp.async.commit_group;\n");
+        const half_raw *sA = smem_c2 + (ki % STAGES) * STAGE, *sB = sA + 128 * BK;
+#pragma unroll
+        for (int kk = 0; kk < BK / 16; kk++) {
+            int chunk = kk * 2 + (lane >> 4);
+            unsigned a[4][4], b[(NT + 1) / 2][4];
+#pragma unroll
+            for (int mt = 0; mt < 4; mt++) {
+                int row = wm + mt * 16 + (lane & 15);
+                unsigned p = __cvta_generic_to_shared(&sA[swz(row, chunk)]);
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                             : "=r"(a[mt][0]), "=r"(a[mt][1]), "=r"(a[mt][2]), "=r"(a[mt][3]) : "r"(p));
+            }
+#pragma unroll
+            for (int nb = 0; nb < (NT + 1) / 2; nb++) {
+                int row = wn + nb * 16 + (lane & 15);
+                unsigned p = __cvta_generic_to_shared(&sB[swz(row, chunk)]);
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                             : "=r"(b[nb][0]), "=r"(b[nb][1]), "=r"(b[nb][2]), "=r"(b[nb][3]) : "r"(p));
+            }
+#pragma unroll
+            for (int mt = 0; mt < 4; mt++)
+#pragma unroll
+                for (int nt = 0; nt < NT; nt++) {
+                    unsigned b0 = (nt & 1) ? b[nt >> 1][1] : b[nt >> 1][0], b1 = (nt & 1) ? b[nt >> 1][3] : b[nt >> 1][2];
+                    float *d = acc[mt][nt];
+                    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                                 : "r"(a[mt][0]), "r"(a[mt][1]), "r"(a[mt][2]), "r"(a[mt][3]), "r"(b0), "r"(b1));
+                }
+        }
+    }
+    asm volatile("cp.async.wait_group 0;\n");
+#pragma unroll
+    for (int mt = 0; mt < 4; mt++)
+#pragma unroll
+        for (int nt = 0; nt < NT; nt++)
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                int row = cta_m + wm + mt * 16 + gid + (e >> 1) * 8, col = cta_n + wn + nt * 8 + tid4 * 2 + (e & 1);
+                if (row < M && col < N) {
+                    size_t idx = (size_t)row * N + col;
+                    float v_ = conv_bias ? acc[mt][nt][e] + conv_bias[col] : acc[mt][nt][e];
+                    Y[idx] = conv_res ? conv_res[idx] + v_ : v_;
+                }
+            }
+}
+#define H15_CONV_V2(NAME, BN, BK, STAGES, MINB)                                                    \
+    extern "C" __global__ __launch_bounds__(256, MINB) void NAME(float *Y, const half_raw *X,      \
+        const half_raw *W, int M, int N, int K, int T, int H, int Wd, int C, int KT, int KH, int KW, \
+        int replicate, const float *conv_bias, const float *conv_res) {                             \
+        conv_v2_body<BN, BK, STAGES>(Y, X, W, M, N, K, T, H, Wd, C, KT, KH, KW, replicate,           \
+                                     conv_bias, conv_res);                                          \
+    }
+// Measured on the HunyuanVideo VAE (RTX 5060 Ti): 128x128, BK=32, 3 stages, M-fastest is
+// 1-4% faster per layer than conv_f16_implicit; 128x256 and BK=64 variants were slower.
+H15_CONV_V2(conv_f16_implicit_v2, 128, 32, 3, 1)
 // Few-output-channel convolution (decoder conv_out, N=3): weights in shared memory as
 // FP32; each half-warp covers one output row with 16-byte (8-channel) input loads.
 extern "C" __global__ __launch_bounds__(256) void conv_small_n(float *Y, const half_raw *X,
