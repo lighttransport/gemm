@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 #include "runtime.hpp"
+#include <chrono>
 #ifdef HV15N_ROCM
 #define H3_DEFAULT_MODEL_DIR "/mnt/disk01/models/h3/weights"
 #define H3_BACKEND "minimax_h3_rocm_experimental"
@@ -120,11 +121,21 @@ int h3_generate(h3_context *ctx, const h3_request *r, const h3_callbacks *callba
         auto audio = noise(r->audio_noise_file, at * 2, 32, uint64_t(r->seed) + 1);
         g.dump(video, dump, "noise_video");
         g.dump(audio, dump, "noise_audio");
+        using clock = std::chrono::steady_clock;
+        auto seconds = [&](clock::time_point start) {
+            g.check(cuStreamSynchronize(g.stream), "stage timing");
+            return std::chrono::duration<double>(clock::now() - start).count();
+        };
+        auto stage = clock::now();
         auto text = e.encode(r->prompt, dump);
+        double qwen_seconds = seconds(stage), refine_seconds = 0, dit_seconds = 0;
+        stage = clock::now();
         {
             Weights weights(e.root /
                             "diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors");
             text = e.refine(weights, text, dump);
+            refine_seconds = seconds(stage);
+            stage = clock::now();
             auto rotation = e.dit_rope(weights, text.rows(), at, t, h, w);
             auto sigma = [&](int i, float shift) {
                 float base = 1.f - float(i) / float(r->steps - 1);
@@ -146,12 +157,15 @@ int h3_generate(h3_context *ctx, const h3_request *r, const h3_callbacks *callba
                     cb.progress(step + 1, r->steps - 1, cb.user);
             }
         }
+        dit_seconds = seconds(stage);
         text = {};
         audio = {};
         g.clear_weights();
         g.trim_pool();
+        stage = clock::now();
         e.decode(video, t, h, w, r->frames, cb, dump);
         g.check(cuStreamSynchronize(g.stream), "finish H3");
+        double vae_seconds = seconds(stage);
         ctx->metrics =
             "{\"backend\":\"" H3_BACKEND "\",\"int8_wmma_calls\":" +
             std::to_string(e.int8_calls) + ",\"bf16_wmma_calls\":" + std::to_string(e.bf16_calls) +
@@ -159,6 +173,10 @@ int h3_generate(h3_context *ctx, const h3_request *r, const h3_callbacks *callba
             ",\"fp32_hipblas_calls\":" + std::to_string(e.fp32_blas_calls) +
             ",\"convrot_hipblas_calls\":" + std::to_string(e.convrot_blas_calls) +
             ",\"aotriton_attention_calls\":" + std::to_string(e.aot_calls) +
+            ",\"qwen_seconds\":" + std::to_string(qwen_seconds) +
+            ",\"refine_seconds\":" + std::to_string(refine_seconds) +
+            ",\"dit_seconds\":" + std::to_string(dit_seconds) +
+            ",\"vae_seconds\":" + std::to_string(vae_seconds) +
             ",\"sigma_grid_points\":" + std::to_string(r->steps) +
             ",\"euler_updates\":" + std::to_string(r->steps - 1) + ",\"gpu\":" + g.metrics() + "}";
         g.cancel_check = {};

@@ -1,6 +1,7 @@
 #ifndef PIXAL3D_HV15N_HOST_HPP
 #define PIXAL3D_HV15N_HOST_HPP
 #include "../../common/safetensors.h"
+#include <unordered_map>
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -129,6 +130,7 @@ struct Weights {
   std::string identity;
   std::unique_ptr<st_context, decltype(&safetensors_close)> context{
       nullptr, safetensors_close};
+  std::unordered_map<std::string, int> lookup; // safetensors_find is a linear scan
   explicit Weights(const fs::path &path) {
     identity = fs::absolute(path).string() + ":" + std::to_string(fs::file_size(path)) +
                ":" + std::to_string(fs::last_write_time(path).time_since_epoch().count());
@@ -142,15 +144,17 @@ struct Weights {
                   t.nbytes <=
                       context->map_size - context->data_offset - t.offset,
               "tensor outside safetensors file");
+      lookup.emplace(t.name, i);
     }
   }
   int index(const std::string &name) const {
-    int i = safetensors_find(context.get(), name.c_str());
-    require(i >= 0, "missing tensor: " + name);
-    return i;
+    auto it = lookup.find(name);
+    if (it == lookup.end())
+      throw std::runtime_error("missing tensor: " + name);
+    return it->second;
   }
   bool has(const std::string &name) const {
-    return safetensors_find(context.get(), name.c_str()) >= 0;
+    return lookup.count(name) != 0;
   }
   std::vector<int> shape(const std::string &name) const {
     int i = index(name);

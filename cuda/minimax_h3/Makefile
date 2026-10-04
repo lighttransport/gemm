@@ -8,6 +8,10 @@ export CUDA_CACHE_PATH := $(abspath $(BUILD))/cuda-cache
 CXX ?= g++
 CC ?= gcc
 CXXFLAGS ?= -O2 -std=c++17 -Wall -Wextra -Wpedantic
+# Hardware FP16 conversion for host-side VAE tile blending.
+ifeq ($(shell uname -m),x86_64)
+CXXFLAGS += -mf16c
+endif
 CFLAGS ?= -O2 -Wall -Wextra
 LDLIBS := -ldl -lm -lpcre2-8 -pthread
 COMMON := $(BUILD)/gpu.o $(BUILD)/loader.o $(BUILD)/cuew.o $(BUILD)/cublasew.o

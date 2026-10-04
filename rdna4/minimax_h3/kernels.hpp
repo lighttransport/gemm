@@ -42,6 +42,10 @@ __global__ void h3_dequant(float *y,const float *xs,const float *ws,int m,int n,
     long i=(long)blockIdx.x*256+threadIdx.x;if(i>=(long)m*n)return;
     float v=(float)__float_as_int(y[i])*(xs[i/n]*ws[i%n]);y[i]=rounded?rnd(v,1):v;
 }
+// Fused linear epilogue: optional bias add, then activation-dtype rounding (in place).
+__global__ void h3_bias_round(float *y,const float *b,long n,int c,int kind){
+    long i=(long)blockIdx.x*256+threadIdx.x;if(i>=n)return;float v=y[i];if(b)v+=b[i%c];y[i]=rnd(v,kind);
+}
 __global__ void h3_round(float *x,long n,int kind){long i=(long)blockIdx.x*256+threadIdx.x;if(i<n)x[i]=rnd(x[i],kind);}
 __global__ void h3_qwen_angles(float *out,int rows){
     long i=(long)blockIdx.x*256+threadIdx.x;if(i>=(long)rows*64)return;

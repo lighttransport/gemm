@@ -36,9 +36,23 @@ Weights stream per block from mmap, and a 64 GB host is required.
 
 ## Measurements (RTX 5060 Ti 16 GB)
 
-- **Full resolution, one update** (1344×768, 124 frames, `--steps 2`): 335 s wall
-  including VAE, **11,474 MiB** sampled process VRAM (memory fit passes), with
-  15,250 INT8 projections.
+- **Full resolution, one update** (1344×768, 124 frames, `--steps 2`): **202 s**
+  wall, **11,552 MiB** peak process VRAM (memory fit passes). Stage times against
+  the independent PyTorch reference on the same GPU:
+
+  | stage | native CUDA | PyTorch reference |
+  |---|---|---|
+  | Qwen3-VL text encoder | 7.4 s | 40 s |
+  | DiT, per Euler update (50 blocks) | 95 s | ~128 s |
+  | VAE decode (124 frames) | 98 s | 249 s |
+
+  DiT attention runs at the same speed as PyTorch's (32.7 vs 32.4 TFLOPS) and is
+  ~65% of DiT time. VAE gains come from three changes: the 4.6 GiB decoder stays
+  resident, tiles are pipelined (the next tile is enqueued before host stitching;
+  pixels come back through async pinned copies), and host FP16 blending uses
+  F16C. INT8 projections use 4096-row FFN chunks and a fused bias+round epilogue.
+  The optimizations are numerically neutral: a 39-update diagnostic reproduces all
+  87 captured arrays bit-for-bit.
 - **64×64, five frames, 39 updates**: 152 s and 4.6 GB VRAM (the RX 9070 XT took
   313 s).
 - **Components**: checkpoint projections match the CPU INT32 reference (cosine

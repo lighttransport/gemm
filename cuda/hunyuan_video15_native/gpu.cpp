@@ -385,7 +385,7 @@ Tensor Gpu::weight(Weights &w, const std::string &name) {
              result.pointer,raw.pointer,int(raw.count()));
     }
   }
-  const size_t limit = std::min(size_t(w.identity.find("diffusion_models")!=std::string::npos ? 2048 : 4096) << 20, budget / 2);
+  const size_t limit = w.identity.find("minimax_h3_video_vae")!=std::string::npos ? budget / 2 /* keep the H3 decoder resident across tiles */ : std::min(size_t(w.identity.find("diffusion_models")!=std::string::npos ? 2048 : 4096) << 20, budget / 2);
   if (cached_weight_bytes <= limit && result.bytes() <= limit - cached_weight_bytes) {
     packed_weights.emplace(key, result); cached_weight_bytes += result.bytes();
   }
@@ -411,7 +411,7 @@ Tensor Gpu::weight_half(Weights &w, const std::string &name) {
     result = half(weight(w, name));
   }
   // Keep a fixed prefix resident: a scan of all 54 blocks must not thrash an LRU.
-  const size_t limit = std::min(size_t(w.identity.find("diffusion_models")!=std::string::npos ? 2048 : 4096) << 20, budget / 2);
+  const size_t limit = w.identity.find("minimax_h3_video_vae")!=std::string::npos ? budget / 2 /* keep the H3 decoder resident across tiles */ : std::min(size_t(w.identity.find("diffusion_models")!=std::string::npos ? 2048 : 4096) << 20, budget / 2);
   if (cached_weight_bytes <= limit && result.bytes() <= limit - cached_weight_bytes) {
     packed_weights.emplace(key, result);
     cached_weight_bytes += result.bytes();
@@ -722,7 +722,7 @@ Tensor Gpu::conv(Weights &w, const std::string &prefix, const Tensor &x,
       if (raw != packed_weights.end()) {
         cached_weight_bytes -= raw->second.bytes(); packed_weights.erase(raw);
       }
-      const size_t limit = std::min(size_t(w.identity.find("diffusion_models")!=std::string::npos ? 2048 : 4096) << 20, budget / 2);
+      const size_t limit = w.identity.find("minimax_h3_video_vae")!=std::string::npos ? budget / 2 /* keep the H3 decoder resident across tiles */ : std::min(size_t(w.identity.find("diffusion_models")!=std::string::npos ? 2048 : 4096) << 20, budget / 2);
       if (cached_weight_bytes <= limit && reordered.bytes() <= limit - cached_weight_bytes) {
         packed_weights.emplace(key, reordered); cached_weight_bytes += reordered.bytes();
       }

@@ -39,6 +39,8 @@ constexpr auto CU_EVENT_DISABLE_TIMING = hipEventDisableTiming;
 #define cuMemcpyHtoDAsync(d, s, n, t)                                                              \
     hipMemcpyAsync(reinterpret_cast<void *>(d), s, n, hipMemcpyHostToDevice, t)
 #define cuMemcpyDtoH(d, s, n) hipMemcpy(d, reinterpret_cast<void *>(s), n, hipMemcpyDeviceToHost)
+#define cuMemcpyDtoHAsync(d, s, n, t)                                                              \
+    hipMemcpyAsync(d, reinterpret_cast<void *>(s), n, hipMemcpyDeviceToHost, t)
 #define cuMemcpyDtoDAsync(d, s, n, t)                                                              \
     hipMemcpyAsync(reinterpret_cast<void *>(d), reinterpret_cast<void *>(s), n,                    \
                    hipMemcpyDeviceToDevice, t)

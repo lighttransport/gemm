@@ -50,6 +50,11 @@ struct Engine {
     std::unique_ptr<void, int (*)(void *)> aot_library{nullptr, dlclose};
     video_aotriton_forward_fn aot_attention = nullptr;
     uint64_t aot_calls = 0;
+#ifdef HV15N_ROCM
+    int ffn_rows = 256;
+#else
+    int ffn_rows = 4096; // larger FFN chunks keep tensor-core GEMMs efficient
+#endif
 #ifndef HV15N_ROCM
     CUmodule flash_bf16 = nullptr, flash_f16 = nullptr;
     cublasew_context *int8_blas = nullptr;
@@ -86,7 +91,7 @@ struct Engine {
                                      "h3_unpatch", "h3_decode_patch", "h3_qwen_attention"
 #ifndef HV15N_ROCM
                                      ,
-                                     "h3_dequant", "h3_pack_heads", "h3_unpack_heads"
+                                     "h3_dequant", "h3_pack_heads", "h3_unpack_heads", "h3_bias_round"
 #endif
                  }) {
                 CUfunction f;
@@ -307,6 +312,13 @@ struct Engine {
             } else {
                 y = e.g.matmul(x, w, precise);
             }
+#ifndef HV15N_ROCM
+            if (!precise && (bias.pointer || !quant)) {
+                e.g.launch("h3_bias_round", int((y.count() + 255) / 256), 1, 1, 256, 1, 0, y.pointer,
+                           bias.pointer, int64_t(y.count()), y.channels(), kind);
+                return y;
+            }
+#endif
             if (bias.pointer) {
                 y = e.g.op(y, 6, nullptr, &bias);
                 if (!precise)
@@ -479,8 +491,8 @@ struct Engine {
         Linear up(*this, w, p + (vae ? ".w1" : ".fc1"), kind),
             down(*this, w, p + (vae ? ".w2" : ".fc2"), kind);
         auto out = g.empty(x.shape);
-        for (int row = 0; row < x.rows(); row += 256) {
-            int count = std::min(256, x.rows() - row);
+        for (int row = 0; row < x.rows(); row += ffn_rows) {
+            int count = std::min(ffn_rows, x.rows() - row);
             auto part = down(swiglu(up(g.rows(x, row, count)), kind));
             g.check(cuMemcpyDtoDAsync(out.pointer + size_t(row) * x.channels() * 4, part.pointer,
                                       part.bytes(), g.stream),
@@ -703,8 +715,8 @@ struct Engine {
         g.clear_weights();
         return {velocity, av};
     }
-    std::vector<float> decode_tile(Weights &w, const std::vector<float> &z, int t, int h,
-                                   int width) {
+    // Enqueues one tile and returns its device pixels (T*4, H*16, W*16, 3).
+    Tensor decode_tile(Weights &w, const std::vector<float> &z, int t, int h, int width) {
         auto input = rounded(g.upload(z, {t, h, width, 24}), 2);
         auto postw = g.weight_half(w, "post_quant_conv.weight");
         postw.shape = {24, 24};
@@ -752,8 +764,7 @@ struct Engine {
         auto pixels = g.empty({t * 4, h * 16, width * 16, 3});
         g.launch("h3_decode_patch", int((pixels.count() + 255) / 256), 1, 1, 256, 1, 0,
                  pixels.pointer, patches.pointer, t, h, width);
-        auto result = g.download(pixels);
-        return result;
+        return pixels;
     }
     struct Tiles {
         std::vector<int> start, length, overlap;
@@ -782,72 +793,118 @@ struct Engine {
                                       int width) {
         const int height = h * 16, wide = width * 16;
         auto ys = tiles(height), xs = tiles(wide);
-        std::vector<float> canvas(size_t(t * 4) * height * wide * 3), strip;
-        for (size_t iy = 0; iy < ys.start.size(); iy++) {
-            std::vector<float> newstrip, left;
+        std::vector<float> canvas(size_t(t * 4) * height * wide * 3), strip, newstrip, left;
+        std::vector<std::pair<size_t, size_t>> order;
+        for (size_t iy = 0; iy < ys.start.size(); iy++)
+            for (size_t ix = 0; ix < xs.start.size(); ix++)
+                order.push_back({iy, ix});
+        // Double-buffered pipeline: tile k+1 is enqueued before tile k is blended on the
+        // host, so CPU stitching and the pixel download overlap GPU decoding.
+        struct Slot {
+            float *host = nullptr;
+            CUevent ready = nullptr;
+        };
+        const size_t slot_bytes = size_t(t * 4) * 256 * 256 * 3 * 4;
+        std::array<Slot, 2> slots;
+        struct SlotGuard {
+            std::array<Slot, 2> &s;
+            Gpu &g;
+            ~SlotGuard() {
+                cuStreamSynchronize(g.stream);
+                for (auto &x : s) {
+                    if (x.ready)
+                        cuEventDestroy(x.ready);
+                    if (x.host)
+                        cuMemFreeHost(x.host);
+                }
+            }
+        } guard{slots, g};
+        for (auto &slot : slots) {
+            g.check(cuMemHostAlloc(reinterpret_cast<void **>(&slot.host), slot_bytes, 0),
+                    "VAE pinned tile");
+            g.check(cuEventCreate(&slot.ready, CU_EVENT_DISABLE_TIMING), "VAE tile event");
+        }
+        auto start = [&](size_t k) {
+            auto [iy, ix] = order[k];
+            int th = ys.length[iy] / 16, tw = xs.length[ix] / 16, y0 = ys.start[iy] / 16,
+                x0 = xs.start[ix] / 16;
+            std::vector<float> z(size_t(t) * th * tw * 24);
+            for (int tt = 0; tt < t; tt++)
+                for (int y = 0; y < th; y++)
+                    for (int x = 0; x < tw; x++)
+                        std::copy_n(latent.data() + (((size_t)tt * h + y0 + y) * width + x0 + x) * 24,
+                                    24, z.data() + (((size_t)tt * th + y) * tw + x) * 24);
+            auto pixels = decode_tile(w, z, t, th, tw);
+            require(pixels.bytes() <= slot_bytes, "VAE tile exceeds pinned slot");
+            auto &slot = slots[k % 2];
+            g.check(cuMemcpyDtoHAsync(slot.host, pixels.pointer, pixels.bytes(), g.stream),
+                    "VAE tile download");
+            g.check(cuEventRecord(slot.ready, g.stream), "VAE tile ready");
+        };
+        start(0);
+        for (size_t k = 0; k < order.size(); k++) {
+            if (k + 1 < order.size())
+                start(k + 1);
+            auto [iy, ix] = order[k];
+            g.check(cuEventSynchronize(slots[k % 2].ready), "VAE tile wait");
+            g.poll();
+            float *pixel = slots[k % 2].host;
+            if (ix == 0) {
+                if (iy)
+                    strip = std::move(newstrip);
+                newstrip.assign(iy + 1 < ys.start.size()
+                                    ? size_t(t * 4) * ys.overlap[iy] * wide * 3
+                                    : 0,
+                                0.f);
+            }
             int overlap_y = iy ? ys.overlap[iy - 1] : 0;
-            if (iy + 1 < ys.start.size())
-                newstrip.resize(size_t(t * 4) * ys.overlap[iy] * wide * 3);
-            for (size_t ix = 0; ix < xs.start.size(); ix++) {
-                int th = ys.length[iy] / 16, tw = xs.length[ix] / 16, y0 = ys.start[iy] / 16,
-                    x0 = xs.start[ix] / 16;
-                std::vector<float> z(size_t(t) * th * tw * 24);
-                for (int tt = 0; tt < t; tt++)
-                    for (int y = 0; y < th; y++)
-                        for (int x = 0; x < tw; x++)
-                            for (int c = 0; c < 24; c++)
-                                z[(((size_t)tt * th + y) * tw + x) * 24 + c] =
-                                    latent[(((size_t)tt * h + y0 + y) * width + x0 + x) * 24 + c];
-                auto pixel = decode_tile(w, z, t, th, tw);
-                int ph = th * 16, pw = tw * 16, ox = ix ? xs.overlap[ix - 1] : 0;
+            int th = ys.length[iy] / 16, tw = xs.length[ix] / 16;
+            int ph = th * 16, pw = tw * 16, ox = ix ? xs.overlap[ix - 1] : 0;
+            for (int tt = 0; tt < t * 4; tt++)
+                for (int y = 0; y < ph; y++)
+                    for (int x = 0; x < pw; x++)
+                        for (int c = 0; c < 3; c++) {
+                            size_t at = (((size_t)tt * ph + y) * pw + x) * 3 + c;
+                            float v = pixel[at];
+                            require(std::isfinite(v), "nonfinite inference tensor");
+                            if (y < overlap_y) {
+                                v = blend_half(strip[(((size_t)tt * overlap_y + y) * wide +
+                                                      xs.start[ix] + x) *
+                                                         3 +
+                                                     c],
+                                               v, y, overlap_y);
+                            }
+                            if (x < ox) {
+                                v = blend_half(left[(((size_t)tt * ph + y) * ox + x) * 3 + c], v,
+                                               x, ox);
+                            }
+                            pixel[at] = v;
+                        }
+            int keepw = pw - (ix + 1 < xs.start.size() ? xs.overlap[ix] : 0),
+                keeph = ph - (iy + 1 < ys.start.size() ? ys.overlap[iy] : 0);
+            if (ix + 1 < xs.start.size()) {
+                int tail = xs.overlap[ix];
+                left.resize(size_t(t * 4) * ph * tail * 3);
                 for (int tt = 0; tt < t * 4; tt++)
                     for (int y = 0; y < ph; y++)
-                        for (int x = 0; x < pw; x++)
-                            for (int c = 0; c < 3; c++) {
-                                size_t at = (((size_t)tt * ph + y) * pw + x) * 3 + c;
-                                float v = pixel[at];
-                                if (y < overlap_y) {
-                                    v = blend_half(strip[(((size_t)tt * overlap_y + y) * wide +
-                                                          xs.start[ix] + x) *
-                                                             3 +
-                                                         c],
-                                                   v, y, overlap_y);
-                                }
-                                if (x < ox) {
-                                    v = blend_half(left[(((size_t)tt * ph + y) * ox + x) * 3 + c],
-                                                   v, x, ox);
-                                }
-                                pixel[at] = v;
-                            }
-                int keepw = pw - (ix + 1 < xs.start.size() ? xs.overlap[ix] : 0),
-                    keeph = ph - (iy + 1 < ys.start.size() ? ys.overlap[iy] : 0);
-                if (ix + 1 < xs.start.size()) {
-                    int tail = xs.overlap[ix];
-                    left.resize(size_t(t * 4) * ph * tail * 3);
-                    for (int tt = 0; tt < t * 4; tt++)
-                        for (int y = 0; y < ph; y++)
-                            std::copy_n(pixel.data() + (((size_t)tt * ph + y) * pw + pw - tail) * 3,
-                                        tail * 3, left.data() + ((size_t)tt * ph + y) * tail * 3);
-                }
-                for (int tt = 0; tt < t * 4; tt++)
-                    for (int y = 0; y < keeph; y++)
-                        std::copy_n(
-                            pixel.data() + ((size_t)tt * ph + y) * pw * 3, keepw * 3,
-                            canvas.data() +
-                                (((size_t)tt * height + ys.start[iy] + y) * wide + xs.start[ix]) *
-                                    3);
-                if (iy + 1 < ys.start.size()) {
-                    int tail = ys.overlap[iy];
-                    for (int tt = 0; tt < t * 4; tt++)
-                        for (int y = 0; y < tail; y++)
-                            std::copy_n(pixel.data() + ((size_t)tt * ph + ph - tail + y) * pw * 3,
-                                        keepw * 3,
-                                        newstrip.data() +
-                                            (((size_t)tt * tail + y) * wide + xs.start[ix]) * 3);
-                }
-                std::cerr << "H3 VAE tile " << iy + 1 << "," << ix + 1 << "\n";
+                        std::copy_n(pixel + (((size_t)tt * ph + y) * pw + pw - tail) * 3, tail * 3,
+                                    left.data() + ((size_t)tt * ph + y) * tail * 3);
             }
-            strip = std::move(newstrip);
+            for (int tt = 0; tt < t * 4; tt++)
+                for (int y = 0; y < keeph; y++)
+                    std::copy_n(pixel + ((size_t)tt * ph + y) * pw * 3, keepw * 3,
+                                canvas.data() +
+                                    (((size_t)tt * height + ys.start[iy] + y) * wide + xs.start[ix]) *
+                                        3);
+            if (iy + 1 < ys.start.size()) {
+                int tail = ys.overlap[iy];
+                for (int tt = 0; tt < t * 4; tt++)
+                    for (int y = 0; y < tail; y++)
+                        std::copy_n(pixel + ((size_t)tt * ph + ph - tail + y) * pw * 3, keepw * 3,
+                                    newstrip.data() +
+                                        (((size_t)tt * tail + y) * wide + xs.start[ix]) * 3);
+            }
+            std::cerr << "H3 VAE tile " << iy + 1 << "," << ix + 1 << "\n";
         }
         return canvas;
     }
