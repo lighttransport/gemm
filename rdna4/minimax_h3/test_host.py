@@ -45,7 +45,9 @@ class H3Tests(unittest.TestCase):
     def test_convrot_config_rejects_invalid_backend_before_gpu_load(self):
         config = Config()
         self.lib.h3_config_defaults(ctypes.byref(config))
-        self.assertEqual(config.convrot_hipblas, 1)
+        # CUDA defaults to the fused factorized ConvRot; ROCm keeps dense hipBLAS.
+        cuda = "h3_cuda" in os.environ.get("H3_TEST_LIBRARY", "")
+        self.assertEqual(config.convrot_hipblas, 0 if cuda else 1)
         self.assertEqual(config.bf16_hipblas, 1)
         config.convrot_hipblas = 2
         error = ctypes.create_string_buffer(1024)

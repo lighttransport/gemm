@@ -4,9 +4,12 @@
 #ifdef HV15N_ROCM
 #define H3_DEFAULT_MODEL_DIR "/mnt/disk01/models/h3/weights"
 #define H3_BACKEND "minimax_h3_rocm_experimental"
+#define H3_DEFAULT_CONVROT_BLAS 1
 #else
 #define H3_DEFAULT_MODEL_DIR "/mnt/nvme01/models/h3/weights"
 #define H3_BACKEND "minimax_h3_cuda_experimental"
+// CUDA defaults to the fused factorized ConvRot; 1 selects dense cuBLAS BF16 rotation.
+#define H3_DEFAULT_CONVROT_BLAS 0
 #endif
 struct h3_context {
     std::unique_ptr<h3::Engine> engine;
@@ -21,7 +24,7 @@ static int fail(char *error, size_t capacity, const std::string &text) {
 extern "C" {
 void h3_config_defaults(h3_config *c) {
     if (c)
-        *c = {H3_DEFAULT_MODEL_DIR, 0, 14336, 1, 1, nullptr, 0};
+        *c = {H3_DEFAULT_MODEL_DIR, 0, 14336, 1, H3_DEFAULT_CONVROT_BLAS, nullptr, 0};
 }
 void h3_request_defaults(h3_request *r) {
     if (r)

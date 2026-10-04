@@ -171,4 +171,150 @@ __global__ void h3_decode_patch(float *out,const float *x,int t,int h,int w){
 }
 }
 )HIP";
+
+#ifndef HV15N_ROCM
+// CUDA-only fused kernels. Each reproduces the arithmetic of the unfused chain it
+// replaces (same expressions, same reduction order), so results are bit-identical.
+inline const char *fused_source=R"CUDA(
+__device__ __forceinline__ unsigned short h3_bits16(float v,int kind){
+    unsigned short h;if(kind==1)asm("cvt.rn.bf16.f32 %0,%1;":"=h"(h):"f"(v));else asm("cvt.rn.f16.f32 %0,%1;":"=h"(h):"f"(v));return h;
+}
+__device__ __forceinline__ float h3_from16(unsigned short h,int kind){
+    if(kind==1)return __uint_as_float((unsigned)h<<16);float f;asm("cvt.f32.f16 %0,%1;":"=f"(f):"h"(h));return f;
+}
+// Deferred linear epilogue: INT32 sums (h3_dequant) or raw F32 (h3_bias_round).
+__device__ __forceinline__ float h3_lin(const float *y,const float *xs,const float *ws,const float *b,
+                                        long row,long n,long col,int i32,int kind){
+    float v;
+    if(i32){v=(float)__float_as_int(y[row*n+col])*(xs[row]*ws[col]);if(kind==1)v=rnd(v,1);if(b){v+=b[col];v=rnd(v,kind);}}
+    else{v=y[row*n+col];if(b)v+=b[col];v=rnd(v,kind);}
+    return v;
+}
+extern "C" {
+// h3_norm (mode 2 RMSNorm with optional weight) writing 16-bit activations.
+__global__ void h3x_norm16(unsigned short *out,const float *x,const float *w,int rows,int k,float eps,int kind){
+    int row=blockIdx.x,tid=threadIdx.x;if(row>=rows)return;
+    __shared__ float b[256];float sq=0;
+    for(int c=tid*4;c<k;c+=256*4)
+        for(int j=0;j<4;j++){float v=x[(long)row*k+c+j];sq+=v*v;}
+    for(int d=16;d;d/=2)sq+=__shfl_down(sq,d);
+    if((tid&31)==0)b[tid/32]=sq;__syncthreads();
+    for(int d=4;d;d/=2){if(tid<d)b[tid]+=b[tid+d];__syncthreads();}
+    float mean=0,inv=rsqrtf(fmaxf(b[0]/k-mean*mean,0.f)+eps);
+    for(int c=tid;c<k;c+=256){float v=(x[(long)row*k+c]-mean)*inv;v=rnd(v*(w?w[c]:1),kind);out[(long)row*k+c]=h3_bits16(v,kind);}
+}
+// h3_qkv + per-head h3_norm (mode 2) + h3_rope (eager) + h3_pack_heads, one warp per (row, head).
+__global__ void h3x_qkv_pack(unsigned short *pq,unsigned short *pk,unsigned short *pv,const float *y,
+        const float *xs,const float *ws,const float *bias,int i32,int rows,int heads,int dim,int interleaved,
+        const float *qw,const float *kw,const float *angles,int pairs,int kind,float eps){
+    int warp=threadIdx.x>>5,lane=threadIdx.x&31;
+    long item=(long)blockIdx.x*4+warp;if(item>=(long)rows*heads)return;
+    int row=item/heads,head=item%heads;
+    __shared__ float buf[4][128];float *v=buf[warp];
+    long n=(long)heads*3*dim;
+    long base=interleaved?(long)head*3*dim:(long)head*dim;
+    long off[3]={base,base+(long)dim*(interleaved?1:heads),base+(long)dim*(interleaved?2:2*heads)};
+    unsigned short *dst[3]={pq,pk,pv};
+    for(int part=0;part<3;part++){
+        for(int d=lane;d<dim;d+=32)v[d]=h3_lin(y,xs,ws,bias,row,n,off[part]+d,i32,kind);
+        __syncwarp();
+        if(part<2){
+            const float *w=part?kw:qw;
+            float sq=0;
+            if(lane*4<dim)for(int j=0;j<4;j++){float t=v[lane*4+j];sq+=t*t;}
+            for(int d=16;d;d/=2)sq+=__shfl_down(sq,d);
+            sq=__shfl_sync(0xffffffffu,sq,0);
+            float mean=0,inv=rsqrtf(fmaxf(sq/dim-mean*mean,0.f)+eps);
+            __syncwarp();
+            for(int d=lane;d<dim;d+=32){float t=(v[d]-mean)*inv;v[d]=rnd(t*(w?w[d]:1),kind);}
+            __syncwarp();
+            if(angles){
+                for(int p=lane;p<pairs;p+=32){
+                    float c=angles[((long)row*pairs+p)*2],s=angles[((long)row*pairs+p)*2+1],a=v[p],b=v[p+pairs];
+                    v[p]=rnd(rnd(a*c,kind)-b*s,kind);v[p+pairs]=rnd(rnd(b*c,kind)+a*s,kind);
+                }
+                __syncwarp();
+            }
+        }
+        for(int d=lane;d<dim;d+=32)dst[part][((long)head*rows+row)*dim+d]=h3_bits16(v[d],kind);
+        __syncwarp();
+    }
+}
+// [heads, rows, dim] -> [rows, heads*dim], 16-bit to 16-bit.
+__global__ void h3x_unpack16(unsigned short *out,const unsigned short *x,int rows,int heads,int dim){
+    long i=(long)blockIdx.x*256+threadIdx.x;if(i>=(long)rows*heads*dim)return;
+    int d=i%dim,h=(i/dim)%heads;long r=i/((long)heads*dim);out[i]=x[((long)h*rows+r)*dim+d];
+}
+// h3_bias_round + h3_scale_add: x = rnd(x + rnd(y + b) * s).
+__global__ void h3x_scale_add(float *x,const float *y,const float *bias,const float *scale,int rows,int k,int kind){
+    long i=(long)blockIdx.x*256+threadIdx.x;if(i>=(long)rows*k)return;
+    float d=h3_lin(y,nullptr,nullptr,bias,i/k,k,i%k,0,kind);x[i]=rnd(x[i]+d*scale[i%k],kind);
+}
+// h3_bias_round + h3_swiglu writing 16-bit activations.
+__global__ void h3x_swiglu16(unsigned short *out,const float *y,const float *bias,int rows,int k,int kind){
+    long i=(long)blockIdx.x*256+threadIdx.x;if(i>=(long)rows*k)return;int row=i/k,c=i%k;
+    float a=h3_lin(y,nullptr,nullptr,bias,row,2*k,c,0,kind),b=h3_lin(y,nullptr,nullptr,bias,row,2*k,k+c,0,kind);
+    out[i]=h3_bits16(rnd(rnd(a/(1.f+expf(-a)),kind)*b,kind),kind);
+}
+// h3_dequant (+bias) + h3_gate on rows [row0, row0+rows): x = rnd(x + delta * rnd(mod)).
+__global__ void h3x_dequant_gate(float *x,const float *y,const float *xs,const float *ws,const float *bias,
+        const float *mod,int rows,int dim,int row0,int text,int audio,int chunk){
+    long i=(long)blockIdx.x*256+threadIdx.x;if(i>=(long)rows*dim)return;
+    int lr=i/dim,c=i%dim,r=row0+lr,m=r<text?1:r<text+audio?5:0;
+    float delta=h3_lin(y,xs,ws,bias,lr,dim,c,1,1);long at=(long)r*dim+c;
+    x[at]=rnd(x[at]+delta*rnd(mod[(long)m*6*dim+chunk*dim+c],1),1);
+}
+// Factorized ConvRot-256 (h3_rotate) + h3_quant for one row per 256-thread block, with
+// an input prologue: 0 plain F32 rows, 1 RMSNorm+modulate (h3_norm mode 2 + h3_mod),
+// 2 SwiGLU of deferred INT32 fc1 sums, 3 packed BF16 attention heads [H,S,D].
+__global__ void h3x_row_quant(signed char *out,float *scales,int rows,int k,int mode,const float *x,
+        const float *nw,const float *mod,int row0,int text,int audio,int chunk,float eps,
+        const float *acc,const float *axs,const float *aws,const unsigned short *heads,int nheads,int hdim,int hrows){
+    int lr=blockIdx.x,tid=threadIdx.x;if(lr>=rows)return;
+    int r=row0+lr;
+    __shared__ unsigned short rot[14336];
+    __shared__ float a[256],b[256],red[256];
+    float inv=0,mean=0;
+    if(mode==1){
+        float sq=0;
+        for(int c=tid*4;c<k;c+=256*4)
+            for(int j=0;j<4;j++){float v=x[(long)r*k+c+j];sq+=v*v;}
+        for(int d=16;d;d/=2)sq+=__shfl_down(sq,d);
+        if((tid&31)==0)b[tid/32]=sq;__syncthreads();
+        for(int d=4;d;d/=2){if(tid<d)b[tid]+=b[tid+d];__syncthreads();}
+        inv=rsqrtf(fmaxf(b[0]/k-mean*mean,0.f)+eps);
+        __syncthreads();
+    }
+    int m=r<text?1:r<text+audio?5:0;long mbase=(long)m*6*k;
+    float mx=0;
+    for(int g=0;g<k/256;g++){
+        int c=g*256+tid;float val;
+        if(mode==0)val=x[(long)r*k+c];
+        else if(mode==1){
+            float v=(x[(long)r*k+c]-mean)*inv;v=rnd(v*(nw?nw[c]:1),1);
+            float scale=rnd(mod[mbase+(chunk+1)*k+c],1),shift=rnd(mod[mbase+chunk*k+c],1);
+            val=rnd(rnd(v*rnd(1.f+scale,1),1)+shift,1);
+        }else if(mode==2){
+            float ga=h3_lin(acc,axs,aws,nullptr,lr,2*k,c,1,1),gb=h3_lin(acc,axs,aws,nullptr,lr,2*k,k+c,1,1);
+            val=rnd(rnd(ga/(1.f+expf(-ga)),1)*gb,1);
+        }else val=h3_from16(heads[((long)(c/hdim)*hrows+r)*hdim+c%hdim],1);
+        int i=tid;a[i]=val;__syncthreads();
+        for(int stride=1;stride<=64;stride*=4){
+            int d=(i/stride)%4,base=i-d*stride;float v=0;
+            for(int j=0;j<4;j++)v+=(j==3-d?-1.f:1.f)*a[base+j*stride];
+            b[i]=v*.5f;__syncthreads();a[i]=b[i];__syncthreads();
+        }
+        float o=rnd(a[i],1);rot[c]=h3_bits16(o,1);mx=fmaxf(mx,fabsf(o));
+        __syncthreads();
+    }
+    red[tid]=mx;__syncthreads();
+    for(int d=128;d;d/=2){if(tid<d)red[tid]=fmaxf(red[tid],red[tid+d]);__syncthreads();}
+    float scale=fmaxf(red[0]*(1.f/127.f),1e-30f);if(tid==0)scales[lr]=scale;
+    for(int c=tid;c<k;c+=256){float math_scale=rnd(scale,1);if(math_scale==0)math_scale=1.17549435e-38f;float v=rnd(h3_from16(rot[c],1)/math_scale,1);int q=(int)rintf(v);out[(long)lr*k+c]=(signed char)max(-128,min(127,q));}
+}
+}
+)CUDA";
+#else
+inline const char *fused_source="";
+#endif
 }

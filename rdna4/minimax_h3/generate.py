@@ -23,7 +23,7 @@ COMPONENTS = ("diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensor
 def generate(*, model=None, out, prompt, width=1344, height=768,
              frames=124, steps=40, seed=42, device=0, vram_budget_mib=14336, runner=None,
              allow_experimental=False, keep_frames=False, noise_file=None, audio_noise_file=None,
-             dump_dir=None, convrot_hipblas=1, bf16_hipblas=1, aotriton_bridge=None, vae_hipblas=0,
+             dump_dir=None, convrot_hipblas=None, bf16_hipblas=1, aotriton_bridge=None, vae_hipblas=0,
              cancel=None, progress=None, compress_dumps=False, fp32_hipblas=1, backend="rocm", cudnn_attention=None):
     if backend not in ("cuda", "rocm"):
         raise ValueError("backend must be cuda or rocm")
@@ -34,6 +34,8 @@ def generate(*, model=None, out, prompt, width=1344, height=768,
     if backend == "cuda" and aotriton_bridge:
         raise ValueError("the AOTriton bridge is ROCm-only")
     model = model or DEFAULT_MODEL[backend]
+    if convrot_hipblas is None:  # CUDA fuses the factorized rotation by default
+        convrot_hipblas = 0 if backend == "cuda" else 1
     runner = runner or (CUDA_RUNNER if backend == "cuda" else RUNNER)
     backend_name = f"minimax_h3_{backend}_experimental"
     if not allow_experimental:
@@ -181,7 +183,7 @@ def main(default_backend="rocm"):
     p.add_argument("--out", required=True)
     p.add_argument("--prompt", required=True)
     for name, default in (("width", 1344), ("height", 768), ("frames", 124), ("steps", 40), ("seed", 42),
-                          ("device", 0), ("vram-budget-mib", 14336), ("convrot-hipblas", 1), ("bf16-hipblas", 1),
+                          ("device", 0), ("vram-budget-mib", 14336), ("convrot-hipblas", None), ("bf16-hipblas", 1),
                           ("vae-hipblas", 0), ("fp32-hipblas", 1)):
         p.add_argument("--" + name, type=int, default=default)
     p.add_argument("--runner")

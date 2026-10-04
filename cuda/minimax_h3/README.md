@@ -43,8 +43,8 @@ Weights stream per block from mmap, and a 64 GB host is required.
   | stage | native CUDA | PyTorch reference |
   |---|---|---|
   | Qwen3-VL text encoder | 7.4 s | 40 s |
-  | DiT, per Euler update (50 blocks) | 94 s | ~128 s |
-  | VAE decode (124 frames) | 98 s | 249 s |
+  | DiT, per Euler update (50 blocks) | 89 s | ~128 s |
+  | VAE decode (124 frames) | 89 s | 249 s |
 
   DiT attention runs at the same speed as PyTorch's (32.7 vs 32.4 TFLOPS) and is
   ~65% of DiT time. DiT INT8 weights for block i+1 are prefetched by a worker
@@ -93,3 +93,25 @@ With cuDNN 9.19 at full resolution, a DiT update drops from 93.8 s to **90.2 s**
 Outputs stay within the same non-bit-exact noise band against PyTorch as
 FlashAttention-2 (64×64 39-update video/audio latent relative L2 0.041 / 0.054
 against 0.044 / 0.076).
+
+## Fused kernels (CUDA default)
+
+- **DiT:** each projection input goes through one `h3x_row_quant` pass that does
+  RMSNorm+modulate (or SwiGLU of the INT32 fc1 sums, or the packed attention
+  heads), the factorized ConvRot-256, and INT8 quantization. The INT32 GEMM sums
+  are dequantized by their consumers: `h3x_qkv_pack` (q/k/v split + head RMSNorm +
+  RoPE + packing) and `h3x_dequant_gate` (residual gate, per FFN chunk).
+- **VAE:** RMSNorm, SwiGLU and attention unpacking write FP16 directly into the
+  GEMMs. Bias and rounding are folded into the qkv packer, SwiGLU and the scale-add
+  residual.
+- **Numerics:** every fused kernel reproduces the unfused expressions, and a
+  39-update run is bit-identical to `H3_UNFUSED=1` (all 87 captures).
+- **Default ConvRot on CUDA:** the default is now the factorized rotation
+  (`--convrot-hipblas 0`). It differs from dense cuBLAS only in FP32 summation
+  order and lands slightly closer to PyTorch (64×64 39-update video/audio latent
+  relative L2 0.028 / 0.049, against 0.044 / 0.076 dense). `--convrot-hipblas 1`
+  restores the dense, unfused DiT path.
+- **Effect:** elementwise GPU time fell from ~21 s to ~5 s per DiT update and from
+  ~33 s to ~8 s in the VAE. Wall time gained less (DiT 93.8 → 89 s, VAE ~96 → 89 s):
+  attention (~70 s) dominates DiT, and VAE tile enqueue is now partly host-bound
+  (~12 s idle).

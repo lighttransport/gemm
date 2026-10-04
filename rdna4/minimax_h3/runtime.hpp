@@ -211,7 +211,7 @@ struct Engine {
         require(c.bf16_hipblas == 0 || c.bf16_hipblas == 1, "BF16 backend must be 0 or 1");
         require(c.convrot_hipblas == 0 || c.convrot_hipblas == 1, "ConvRot backend must be 0 or 1");
         require(c.vae_hipblas == 0 || c.vae_hipblas == 1, "VAE backend must be 0 or 1");
-        auto code = Gpu::compile(std::string(prelude) + source);
+        auto code = Gpu::compile(std::string(prelude) + source + fused_source);
         g.check(cuModuleLoadData(&module, code.data()), "H3 module");
         try {
             if (c.aotriton_bridge) {
@@ -236,7 +236,9 @@ struct Engine {
                                      "h3_unpatch", "h3_decode_patch", "h3_qwen_attention"
 #ifndef HV15N_ROCM
                                      ,
-                                     "h3_dequant", "h3_pack_heads", "h3_unpack_heads", "h3_bias_round"
+                                     "h3_dequant", "h3_pack_heads", "h3_unpack_heads", "h3_bias_round",
+                                     "h3x_norm16", "h3x_qkv_pack", "h3x_unpack16", "h3x_scale_add",
+                                     "h3x_swiglu16", "h3x_dequant_gate", "h3x_row_quant"
 #endif
                  }) {
                 CUfunction f;
@@ -548,47 +550,13 @@ struct Engine {
             q = {};
             k = {};
             v = {};
-            auto packed = g.empty_half({heads, rows, dim});
-            if (cudnn_attention && kind == 1 && dim == 128) {
-                char error[512] = {};
-                long long bytes = cudnn_workspace(rows, heads, dim, error, sizeof(error));
-                require(bytes >= 0, error);
-                Tensor workspace;
-                if (bytes > 0)
-                    workspace = byte_tensor({int((bytes + 255) / 256), 256});
-                g.poll();
-                require(cudnn_attention(reinterpret_cast<void *>(packed.pointer),
-                                        reinterpret_cast<void *>(pq.pointer),
-                                        reinterpret_cast<void *>(pk.pointer),
-                                        reinterpret_cast<void *>(pv.pointer), rows, heads, dim,
-                                        1.f / std::sqrt(float(dim)),
-                                        reinterpret_cast<void *>(workspace.pointer), g.stream,
-                                        error, sizeof(error)) == 0,
-                        error);
-                cudnn_calls++;
-                auto out = g.empty(shape);
-                g.launch("h3_unpack_heads", int((out.count() + 255) / 256), 1, 1, 256, 1, 0,
-                         out.pointer, packed.pointer, rows, heads, dim, kind);
-                g.attention_calls++;
-                return out;
-            }
-            CUfunction fn;
-            g.check(cuModuleGetFunction(&fn, kind == 1 ? flash_bf16 : flash_f16, "fa2_attn"),
-                    "H3 attention lookup");
-            float scale = 1.f / std::sqrt(float(dim));
-            int d = dim;
-            void *params[] = {&packed.pointer, &pq.pointer, &pk.pointer, &pv.pointer, &rows, &d,
-                              &scale};
-            g.poll();
-            g.check(cuLaunchKernel(fn, (rows + 63) / 64, heads, 1, 128, 1, 1,
-                                   4 * (dim == 128 ? 16 : 32) * (dim + 8) * 2, g.stream, params,
-                                   nullptr),
-                    "H3 FlashAttention");
+            auto packed = flash_packed(pq, pk, pv, rows, heads, dim, kind);
+            pq = {};
+            pk = {};
+            pv = {};
             auto out = g.empty(shape);
             g.launch("h3_unpack_heads", int((out.count() + 255) / 256), 1, 1, 256, 1, 0,
                      out.pointer, packed.pointer, rows, heads, dim, kind);
-            g.attention_calls++;
-            g.flash_calls++;
             return out;
         }
 #else
@@ -669,6 +637,182 @@ struct Engine {
                  x.pointer, x.rows(), out.channels(), kind);
         return out;
     }
+#ifndef HV15N_ROCM
+    // Non-causal attention on packed 16-bit [heads, rows, dim] tensors; returns packed output.
+    Tensor flash_packed(const Tensor &pq, const Tensor &pk, const Tensor &pv, int rows, int heads,
+                        int dim, int kind) {
+        require(kind == 1 ? dim == 128 : dim == 64, "H3 CUDA attention geometry");
+        auto packed = g.empty_half({heads, rows, dim});
+        g.attention_calls++;
+        if (cudnn_attention && kind == 1 && dim == 128) {
+            char error[512] = {};
+            long long bytes = cudnn_workspace(rows, heads, dim, error, sizeof(error));
+            require(bytes >= 0, error);
+            Tensor workspace;
+            if (bytes > 0)
+                workspace = byte_tensor({int((bytes + 255) / 256), 256});
+            g.poll();
+            int status = cudnn_attention(reinterpret_cast<void *>(packed.pointer),
+                                         reinterpret_cast<void *>(pq.pointer),
+                                         reinterpret_cast<void *>(pk.pointer),
+                                         reinterpret_cast<void *>(pv.pointer), rows, heads, dim,
+                                         1.f / std::sqrt(float(dim)),
+                                         reinterpret_cast<void *>(workspace.pointer), g.stream,
+                                         error, sizeof(error));
+            require(status == 0, error);
+            cudnn_calls++;
+            return packed;
+        }
+        CUfunction fn;
+        g.check(cuModuleGetFunction(&fn, kind == 1 ? flash_bf16 : flash_f16, "fa2_attn"),
+                "H3 attention lookup");
+        float scale = 1.f / std::sqrt(float(dim));
+        int d = dim;
+        CUdeviceptr o = packed.pointer, q = pq.pointer, k = pk.pointer, v = pv.pointer;
+        void *params[] = {&o, &q, &k, &v, &rows, &d, &scale};
+        g.poll();
+        g.check(cuLaunchKernel(fn, (rows + 63) / 64, heads, 1, 128, 1, 1,
+                               4 * (dim == 128 ? 16 : 32) * (dim + 8) * 2, g.stream, params,
+                               nullptr),
+                "H3 FlashAttention");
+        g.flash_calls++;
+        return packed;
+    }
+    // Fused paths: CUDA, untraced, factorized ConvRot (bit-identical to the unfused
+    // --convrot-hipblas 0 graph).
+    // H3_UNFUSED=1 selects the original kernel chain (debug/parity checks).
+    bool unfused = std::getenv("H3_UNFUSED") != nullptr;
+    bool fused() const { return trace.empty() && !convrot_hipblas && !unfused; }
+    bool fused_vae() const { return trace.empty() && !unfused; }
+    static Tensor view(const Tensor &x, int row, int count) {
+        Tensor t = x;
+        t.pointer = x.pointer + size_t(row) * x.channels() * x.element_bytes;
+        t.shape = {count, x.channels()};
+        return t;
+    }
+    // Row-wise ConvRot+quantize with a prologue (see h3x_row_quant). Returns INT8 rows + scales.
+    std::pair<Tensor, Tensor> row_quant(int rows, int k, int mode, const Tensor *x, const Tensor *nw,
+                                        const Tensor *mod, int row0, int text, int audio, int chunk,
+                                        const Tensor *acc, const Tensor *axs, const Tensor *aws,
+                                        const Tensor *heads, int nheads, int hdim, int hrows) {
+        require(k % 256 == 0 && k <= 14336, "fused ConvRot width");
+        auto q = byte_tensor({rows, k});
+        auto xs = g.empty({rows});
+        auto ptr = [](const Tensor *t) { return t ? t->pointer : CUdeviceptr(0); };
+        g.launch("h3x_row_quant", rows, 1, 1, 256, 1, 0, q.pointer, xs.pointer, rows, k, mode, ptr(x),
+                 ptr(nw), ptr(mod), row0, text, audio, chunk, 1e-5f, ptr(acc), ptr(axs), ptr(aws),
+                 ptr(heads), nheads, hdim, hrows);
+        return {q, xs};
+    }
+    // INT8 GEMM leaving exact INT32 sums (consumers apply the dequant epilogue).
+    Tensor int8_sums(Linear &l, const Tensor &q) {
+        auto y = g.empty({q.rows(), l.w.shape[0]});
+        require(cublasew_gemm_int8_s32_rowmajor_nt(int8_blas, y.pointer, l.w.pointer, q.pointer,
+                                                   q.rows(), y.channels(), q.channels()) == 0,
+                "INT8 cuBLAS GEMM failed");
+        int8_calls++;
+        return y;
+    }
+    // Packs q/k/v from a deferred linear output (INT32 sums or raw F32) with head norm + RoPE.
+    std::array<Tensor, 3> qkv_pack(const Tensor &y, const Tensor *xs, const Linear &l, int rows,
+                                   int heads, int dim, bool interleaved, const Tensor *qw,
+                                   const Tensor *kw, const Tensor &angles, int pairs, int kind) {
+        std::array<Tensor, 3> out{g.empty_half({heads, rows, dim}), g.empty_half({heads, rows, dim}),
+                                  g.empty_half({heads, rows, dim})};
+        g.launch("h3x_qkv_pack", int((int64_t(rows) * heads + 3) / 4), 1, 1, 128, 1, 0,
+                 out[0].pointer, out[1].pointer, out[2].pointer, y.pointer,
+                 xs ? xs->pointer : CUdeviceptr(0), l.quant ? l.scale.pointer : CUdeviceptr(0),
+                 l.bias.pointer, int(l.quant), rows, heads, dim, int(interleaved),
+                 qw ? qw->pointer : CUdeviceptr(0), kw ? kw->pointer : CUdeviceptr(0),
+                 angles.pointer, pairs, kind, 1e-5f);
+        return out;
+    }
+    // One DiT block: norm+mod+ConvRot+quant -> INT8 -> qkv pack -> attention ->
+    // ConvRot+quant -> INT8 -> dequant+gate; FFN per 4096-row chunk likewise.
+    void dit_block_fused(Weights &w, const std::string &p, Tensor &x, const Tensor &mod,
+                         const Tensor &rotation, int text, int audio) {
+        const int rows = x.rows(), k = x.channels();
+        auto n1 = g.weight(w, p + ".norm1.weight"), n2 = g.weight(w, p + ".norm2.weight");
+        auto qn = g.weight(w, p + ".attn.q_norm.weight"), kn = g.weight(w, p + ".attn.k_norm.weight");
+        {
+            Linear qkv(*this, w, p + ".attn.qkv_proj", 1), out(*this, w, p + ".attn.out_proj", 1);
+            require(qkv.quant && out.quant, "fused DiT expects INT8 projections");
+            auto [q8, xs] = row_quant(rows, k, 1, &x, &n1, &mod, 0, text, audio, 0, nullptr,
+                                      nullptr, nullptr, nullptr, 0, 0, 0);
+            auto sums = int8_sums(qkv, q8);
+            q8 = {};
+            auto packed = qkv_pack(sums, &xs, qkv, rows, 56, 128, false, &qn, &kn, rotation, 48, 1);
+            sums = {};
+            auto attended = flash_packed(packed[0], packed[1], packed[2], rows, 56, 128, 1);
+            packed = {};
+            auto [o8, oxs] = row_quant(rows, 56 * 128, 3, nullptr, nullptr, nullptr, 0, 0, 0, 0,
+                                       nullptr, nullptr, nullptr, &attended, 56, 128, rows);
+            attended = {};
+            auto osum = int8_sums(out, o8);
+            g.launch("h3x_dequant_gate", int((int64_t(rows) * k + 255) / 256), 1, 1, 256, 1, 0,
+                     x.pointer, osum.pointer, oxs.pointer, out.scale.pointer, out.bias.pointer,
+                     mod.pointer, rows, k, 0, text, audio, 2);
+        }
+        Linear up(*this, w, p + ".mlp.fc1", 1), down(*this, w, p + ".mlp.fc2", 1);
+        require(up.quant && down.quant && !up.bias.pointer, "fused DiT FFN expects INT8 without bias");
+        const int hidden = up.w.shape[0] / 2;
+        for (int row = 0; row < rows; row += ffn_rows) {
+            int count = std::min(ffn_rows, rows - row);
+            auto [q8, xs] = row_quant(count, k, 1, &x, &n2, &mod, row, text, audio, 3, nullptr,
+                                      nullptr, nullptr, nullptr, 0, 0, 0);
+            auto s1 = int8_sums(up, q8);
+            auto [h8, hxs] = row_quant(count, hidden, 2, nullptr, nullptr, nullptr, 0, 0, 0, 0, &s1,
+                                       &xs, &up.scale, nullptr, 0, 0, 0);
+            s1 = {};
+            auto s2 = int8_sums(down, h8);
+            g.launch("h3x_dequant_gate", int((int64_t(count) * k + 255) / 256), 1, 1, 256, 1, 0,
+                     x.pointer, s2.pointer, hxs.pointer, down.scale.pointer, down.bias.pointer,
+                     mod.pointer, count, k, row, text, audio, 5);
+        }
+    }
+    // One VAE decoder block with FP16 activations feeding the GEMMs and fused epilogues.
+    void vae_block_fused(Weights &w, const std::string &p, Tensor &x, const Tensor &angles) {
+        const int rows = x.rows(), k = x.channels();
+        auto norm16 = [&](const char *name) {
+            auto gamma = g.weight(w, p + name);
+            auto h = g.empty_half({rows, k});
+            g.launch("h3x_norm16", rows, 1, 1, 256, 1, 0, h.pointer, x.pointer, gamma.pointer, rows,
+                     k, 1e-5f, 2);
+            return h;
+        };
+        auto scale_add = [&](const Tensor &y, const Linear &l, const Tensor &s, int row, int count) {
+            g.launch("h3x_scale_add", int((int64_t(count) * k + 255) / 256), 1, 1, 256, 1, 0,
+                     x.pointer + size_t(row) * k * 4, y.pointer, l.bias.pointer, s.pointer, count, k,
+                     2);
+        };
+        {
+            Linear qkv(*this, w, p + ".attn.to_qkv", 2), out(*this, w, p + ".attn.to_out", 2);
+            auto y = g.matmul(norm16(".norm1.weight"), qkv.w);
+            auto packed = qkv_pack(y, nullptr, qkv, rows, 32, 64, true, nullptr, nullptr, angles, 24, 2);
+            y = {};
+            auto attended = flash_packed(packed[0], packed[1], packed[2], rows, 32, 64, 2);
+            packed = {};
+            auto flat = g.empty_half({rows, 32 * 64});
+            g.launch("h3x_unpack16", int((flat.count() + 255) / 256), 1, 1, 256, 1, 0, flat.pointer,
+                     attended.pointer, rows, 32, 64);
+            attended = {};
+            scale_add(g.matmul(flat, out.w), out, g.weight(w, p + ".scale1"), 0, rows);
+        }
+        Linear up(*this, w, p + ".ff.w1", 2), down(*this, w, p + ".ff.w2", 2);
+        auto h = norm16(".norm2.weight");
+        auto s2 = g.weight(w, p + ".scale2");
+        const int hidden = up.w.shape[0] / 2;
+        for (int row = 0; row < rows; row += ffn_rows) {
+            int count = std::min(ffn_rows, rows - row);
+            auto y1 = g.matmul(view(h, row, count), up.w);
+            auto act = g.empty_half({count, hidden});
+            g.launch("h3x_swiglu16", int((int64_t(count) * hidden + 255) / 256), 1, 1, 256, 1, 0,
+                     act.pointer, y1.pointer, up.bias.pointer, count, hidden, 2);
+            y1 = {};
+            scale_add(g.matmul(act, down.w), down, s2, row, count);
+        }
+    }
+#endif
     Tensor ffn(Weights &w, const std::string &p, const Tensor &x, int kind = 1, bool vae = false) {
         Linear up(*this, w, p + (vae ? ".w1" : ".fc1"), kind),
             down(*this, w, p + (vae ? ".w2" : ".fc2"), kind);
@@ -878,6 +1022,15 @@ struct Engine {
             };
             std::string p = "blocks." + std::to_string(i);
             auto modulation = linear(w, p + ".adaln_proj.linear", emb, 0, true);
+#ifndef HV15N_ROCM
+            if (fused()) {
+                dit_block_fused(w, p, x, modulation, rotation, text.rows(), audio.rows());
+                g.clear_weights();
+                if (i % 10 == 9)
+                    std::cerr << "H3 step " << step << " block " << i + 1 << "/50\n";
+                continue;
+            }
+#endif
             auto z = modulate(norm(&w, p + ".norm1", x), modulation, text.rows(), audio.rows(), 0);
             gated(x, self_attention(w, p + ".attn", z, 56, 128, 1, &rotation, 48), modulation,
                   text.rows(), audio.rows(), 2);
@@ -945,6 +1098,12 @@ struct Engine {
         auto angles = rounded(g.upload(rot, {x.rows(), 24, 2}), 2);
         for (int i = 0; i < 36; i++) {
             auto p = "decoder.transformer_blocks." + std::to_string(i);
+#ifndef HV15N_ROCM
+            if (fused_vae()) {
+                vae_block_fused(w, p, x, angles);
+                continue;
+            }
+#endif
             auto d = self_attention(w, p + ".attn", norm(&w, p + ".norm1", x, 2), 32, 64, 2,
                                     &angles, 24, true);
             auto s = g.weight(w, p + ".scale1");
