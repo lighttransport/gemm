@@ -131,7 +131,7 @@ static inline int glm53f_mhc_fused_sync_on(void) {
     /* Read on the controller before publication, also allowing diagnostic
      * reference/candidate switches with one restored resident model. */
     const char *e = getenv("GLM53F_MHC_FUSED_SYNC");
-    return e && *e && atoi(e);
+    return e && *e ? atoi(e) : 0;   /* mode 0..3; was collapsed to 0/1, so local (2) / local-gram (3) never ran */
 }
 static inline int glm53f_mhc_fast_on(void) {
     if (glm53f_mhc_fast_mode < 0) glm53f_mhc_fast_mode = getenv("GLM53F_MHC_FAST") ? atoi(getenv("GLM53F_MHC_FAST")) : 1;

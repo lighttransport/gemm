@@ -90,13 +90,20 @@ Detailed per-campaign history: `handoff-decode100-20261004.md` (same directory).
 - Routed experts are 15 GB/rank (Q8 would not fit in 29 GB free). Expert kernel experiments (R16, ROWS4) showed it
   is not dependency-bound.
 
+## Bug found (fixed in the commit after c08cd0c3)
+- `glm53f_mhc_fused_sync_on()` returned `e && *e && atoi(e)` (0/1), so **`--mhc-kernel local` and `local-gram` never
+  ran in-model**; every "local-gram" model result in both handoffs actually measured the fused-sync (mode 1) path.
+  Fixed to return the mode. v31 (`candidate-decode100-mfix21-v31`) is the first binary where local-gram really runs;
+  j2t gates it (8K exact + pair + MTP d2 best ± KDA head pipeline). The standalone kernel is ~23 µs vs ~48 µs.
+
 ## In flight at snapshot time (job ends ~01:00)
 - **j2r** (v29, `-DGLM53F_MHC_PHASE_TIMING`): plain legacy vs best; read `GLM53F_MHC_INMODEL` (rank 0 log of the
   best arm) and compare per-call kernel time with the 70–86 µs site times → tells whether mHC time is inside the
   kernel (cold misses / barriers) or around it (dispatch, router, non-team serial code). Diagnostic only.
 - **j2s** (v30): `--kda-decode-pipeline heads` 8K exact gate (`exact_8k pipe`) + 2 alternating pairs
   (`pipe`, `best-pipe`). If not BIT_EXACT, suspect `glm53f_native_matvec_rows` row-group alignment or act prep.
-- Read with: `ssh fugaku1 'grep -h DECODE100 work/gemm/glm53f-strata-20261001/tmp/decode100-20261004/driver-j2[rs].log'`.
+- **j2t** (v31, queued after j2s): local-gram 8K exact gate, one pair vs legacy, MTP d2 BEST and BEST + head pipeline.
+- Read with: `ssh fugaku1 'grep -h DECODE100 work/gemm/glm53f-strata-20261001/tmp/decode100-20261004/driver-j2[rst].log'`.
 
 ## Strategy / next steps (in priority order)
 1. Finish j2r/j2s analysis. If the head pipeline is exact and faster, add it to BEST and run MTP d2/d3.
