@@ -11,7 +11,11 @@
 #include <future>
 #include <thread>
 #ifndef HV15N_ROCM
+// The FA2 header defines several kernel-source strings; only k_fa2_attn_src is used.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-variable"
 #include "../../cuda/fa2/cuda_fa2_kernels.h"
+#pragma GCC diagnostic pop
 #include "../../cuda/minimax_h3/cudnn_bridge.h"
 // CUDA mapping of the hipBLAS helper: types 0=F32 (pedantic), 2=F16, 14=BF16; F32 output.
 inline int video_hipblas_gemm(cublasew_context *c, CUdeviceptr y, CUdeviceptr w, CUdeviceptr x,
