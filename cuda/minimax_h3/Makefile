@@ -39,3 +39,19 @@ test: all
 	cd $(H3) && H3_TEST_LIBRARY=$(abspath $(BUILD)/libh3_cuda.so) PYTHONDONTWRITEBYTECODE=1 python3 -m unittest test_host test_captures test_streaming
 clean:
 	rm -f $(BUILD)/*.o $(BUILD)/h3_cuda $(BUILD)/libh3_cuda.so $(BUILD)/component_probe
+
+# Optional cuDNN SDPA bridge (opt-in at runtime with --cudnn-attention).
+# Needs header-only cudnn-frontend and cuDNN 9 headers; cuDNN itself is loaded at runtime.
+CUDNN_DEPS := $(BUILD)/cudnn-deps
+CUDNN_FRONTEND_INCLUDE ?= $(CUDNN_DEPS)/include
+CUDNN_INCLUDE ?= $(firstword $(wildcard $(VIRTUAL_ENV)/lib/python3*/site-packages/nvidia/cudnn/include /usr/include/x86_64-linux-gnu/cudnn_v9 /usr/local/cuda/include/cudnn9))
+.PHONY: cudnn cudnn-deps
+cudnn-deps:
+	mkdir -p $(CUDNN_DEPS)
+	python3 -m pip download --no-deps nvidia-cudnn-frontend -d $(CUDNN_DEPS)
+	cd $(CUDNN_DEPS) && python3 -m zipfile -e nvidia_cudnn_frontend-*.whl .
+cudnn: $(BUILD)/libh3_cudnn.so
+$(BUILD)/libh3_cudnn.so: cudnn_bridge.cpp cudnn_bridge.h | $(BUILD)
+	test -f "$(CUDNN_FRONTEND_INCLUDE)/cudnn_frontend.h" || { echo "run 'make cudnn-deps' or set CUDNN_FRONTEND_INCLUDE"; exit 1; }
+	test -f "$(CUDNN_INCLUDE)/cudnn.h" || { echo "set CUDNN_INCLUDE to a cuDNN 9 include directory"; exit 1; }
+	$(CXX) -O2 -std=c++17 -shared -fPIC -I"$(CUDNN_FRONTEND_INCLUDE)" -I"$(CUDNN_INCLUDE)" -I/usr/local/cuda/include $< -ldl -o $@

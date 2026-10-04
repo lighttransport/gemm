@@ -66,3 +66,30 @@ Weights stream per block from mmap, and a 64 GB host is required.
   backend switched (FLASH→EFFICIENT) drifts by the same amount (0.036 video /
   0.079 audio, frames 0.024). The 39-update chain amplifies any non-bit-exact
   difference, and CUDA sits at that same noise floor.
+
+## Optional cuDNN attention (opt-in)
+
+DiT and refiner BF16 head-128 attention can use cuDNN 9's fused SDPA through a
+separate bridge library. The default build and runtime do not need cuDNN.
+
+```sh
+make -C cuda/minimax_h3 cudnn-deps                      # fetch header-only cudnn-frontend
+make -C cuda/minimax_h3 cudnn CUDNN_INCLUDE=/path/to/cudnn9/include
+tmp/video-cuda/h3-build/h3_cuda ... --cudnn-attention auto   # or a libh3_cudnn.so path
+```
+
+- **Finding the bridge:** `auto` looks for `libh3_cudnn.so` next to the runner or
+  library, or uses `H3_CUDNN_BRIDGE`.
+- **Finding cuDNN:** the bridge searches for `libcudnn.so.9` in this order:
+  `H3_CUDNN_LIB`, the default loader path, the pip `nvidia/cudnn` package under
+  `$VIRTUAL_ENV`, `$CONDA_PREFIX` or `~/.local`, then system locations.
+- **Failure handling:** if cuDNN is unavailable, `auto` prints a warning and falls
+  back to FlashAttention-2. An explicit bridge path is an error.
+- **Other entry points:** the C API is `h3_set_cudnn_attention()`, and
+  `generate.py` accepts `--cudnn-attention`. Metrics record
+  `cudnn_attention_calls` and the loaded library.
+
+With cuDNN 9.19 at full resolution, a DiT update drops from 93.8 s to **90.2 s**.
+Outputs stay within the same non-bit-exact noise band against PyTorch as
+FlashAttention-2 (64×64 39-update video/audio latent relative L2 0.041 / 0.054
+against 0.044 / 0.076).

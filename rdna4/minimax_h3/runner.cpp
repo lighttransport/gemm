@@ -33,7 +33,7 @@ int main(int argc, char **argv) {
             "--frames",          "--steps",           "--seed",         "--device",
             "--vram-budget-mib", "--convrot-hipblas", "--bf16-hipblas", "--fp32-hipblas",
             "--aotriton-bridge", "--vae-hipblas",     "--noise-file",   "--audio-noise-file",
-            "--dump-dir",        "--out-dir"};
+            "--dump-dir",        "--out-dir",         "--cudnn-attention"};
         for (int i = 1; i < argc; i++) {
             std::string s = argv[i];
             if (s == "--help") {
@@ -43,7 +43,8 @@ int main(int argc, char **argv) {
                              "40 --seed 42\n--device 0 --vram-budget-mib 14336 --noise-file "
                              "NCTHW.f32 --audio-noise-file NC2T.f32\n--dump-dir DIR --validate\n"
                              "--aotriton-bridge libvideo_aotriton.so (optional long attention)\n"
-                             "--vae-hipblas 0|1 (optional FP16 decoder GEMM)\n";
+                             "--vae-hipblas 0|1 (optional FP16 decoder GEMM)\n"
+                             "--cudnn-attention off|auto|libh3_cudnn.so (CUDA, opt-in DiT SDPA)\n";
                 return 0;
             }
             if (s == "--validate") {
@@ -105,12 +106,19 @@ int main(int argc, char **argv) {
         require(fs::is_empty(out), "output directory must be empty");
         std::signal(SIGINT, stop);
         std::signal(SIGTERM, stop);
+        // Call first: the message argument must be read after the API writes it.
         std::unique_ptr<h3_context, decltype(&h3_free)> ctx(h3_load(&c, error, sizeof(error)),
                                                             h3_free);
-        require(bool(ctx), error);
-        require(h3_set_fp32_hipblas(ctx.get(), fp32_hipblas, error, sizeof(error)) == 0, error);
+        require(bool(ctx), std::string(error));
+        int status = h3_set_fp32_hipblas(ctx.get(), fp32_hipblas, error, sizeof(error));
+        require(status == 0, error);
+        if (args.count("--cudnn-attention"))
+            status = h3_set_cudnn_attention(ctx.get(), str("--cudnn-attention", "off"), error,
+                                            sizeof(error));
+        require(status == 0, error);
         h3_callbacks cb{progress, frame, cancelled, &out};
-        require(h3_generate(ctx.get(), &r, &cb, error, sizeof(error)) == 0, error);
+        status = h3_generate(ctx.get(), &r, &cb, error, sizeof(error));
+        require(status == 0, error);
         std::ofstream metrics(out / "metrics.json");
         metrics << h3_metrics(ctx.get()) << "\n";
         require(bool(metrics), "metrics write failed");

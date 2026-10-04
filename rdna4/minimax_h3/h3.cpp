@@ -70,6 +70,53 @@ int h3_set_fp32_hipblas(h3_context *ctx, int enabled, char *error, size_t capaci
     ctx->busy = false;
     return 0;
 }
+int h3_set_cudnn_attention(h3_context *ctx, const char *mode, char *error, size_t capacity) {
+    if (!ctx || !ctx->engine)
+        return fail(error, capacity, "missing H3 context");
+    bool expected = false;
+    if (!ctx->busy.compare_exchange_strong(expected, true))
+        return fail(error, capacity, "H3 context is already generating");
+    struct Busy {
+        h3_context *ctx;
+        ~Busy() { ctx->busy = false; }
+    } busy{ctx};
+    std::string m = mode ? mode : "off";
+#ifdef HV15N_ROCM
+    if (m == "off")
+        return 0;
+    return fail(error, capacity, "cuDNN attention is CUDA-only");
+#else
+    auto &e = *ctx->engine;
+    if (m == "off") {
+        e.disable_cudnn();
+        return 0;
+    }
+    std::string bridge = m;
+    if (m == "auto") {
+        if (const char *env = std::getenv("H3_CUDNN_BRIDGE")) {
+            bridge = env;
+        } else {
+            Dl_info self{};
+            dladdr(reinterpret_cast<void *>(&h3_set_cudnn_attention), &self);
+            h3::fs::path dir = self.dli_fname ? h3::fs::path(self.dli_fname).parent_path() : "";
+            if (dir.empty() || !h3::fs::exists(dir / "libh3_cudnn.so"))
+                dir = h3::fs::read_symlink("/proc/self/exe").parent_path();
+            bridge = (dir / "libh3_cudnn.so").string();
+        }
+    }
+    try {
+        e.enable_cudnn(bridge);
+        std::cerr << "H3 cuDNN attention: " << e.cudnn_info << "\n";
+        return 0;
+    } catch (const std::exception &x) {
+        e.disable_cudnn();
+        if (m != "auto")
+            return fail(error, capacity, x.what());
+        std::cerr << "H3 cuDNN attention unavailable, using FlashAttention-2: " << x.what() << "\n";
+        return 0;
+    }
+#endif
+}
 int h3_generate(h3_context *ctx, const h3_request *r, const h3_callbacks *callbacks, char *error,
                 size_t capacity) {
     if (h3_validate(r, error, capacity) != 0)
@@ -173,6 +220,10 @@ int h3_generate(h3_context *ctx, const h3_request *r, const h3_callbacks *callba
             ",\"fp32_hipblas_calls\":" + std::to_string(e.fp32_blas_calls) +
             ",\"convrot_hipblas_calls\":" + std::to_string(e.convrot_blas_calls) +
             ",\"aotriton_attention_calls\":" + std::to_string(e.aot_calls) +
+#ifndef HV15N_ROCM
+            ",\"cudnn_attention_calls\":" + std::to_string(e.cudnn_calls) +
+            ",\"cudnn_library\":\"" + e.cudnn_info + "\"" +
+#endif
             ",\"qwen_seconds\":" + std::to_string(qwen_seconds) +
             ",\"refine_seconds\":" + std::to_string(refine_seconds) +
             ",\"dit_seconds\":" + std::to_string(dit_seconds) +

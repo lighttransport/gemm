@@ -11,6 +11,7 @@
 #include <thread>
 #ifndef HV15N_ROCM
 #include "../../cuda/fa2/cuda_fa2_kernels.h"
+#include "../../cuda/minimax_h3/cudnn_bridge.h"
 // CUDA mapping of the hipBLAS helper: types 0=F32 (pedantic), 2=F16, 14=BF16; F32 output.
 inline int video_hipblas_gemm(cublasew_context *c, CUdeviceptr y, CUdeviceptr w, CUdeviceptr x,
                               int m, int n, int k, int type) {
@@ -72,6 +73,45 @@ struct Engine {
     std::array<void *, 2> prefetch_host{};
     std::array<CUevent, 2> prefetch_free{};
     uint64_t prefetch_hits = 0;
+    // Optional cuDNN SDPA for BF16 head-128 attention (opt-in, runtime-discovered).
+    std::unique_ptr<void, int (*)(void *)> cudnn_library{nullptr, dlclose};
+    h3_cudnn_workspace_fn cudnn_workspace = nullptr;
+    h3_cudnn_attention_fn cudnn_attention = nullptr;
+    uint64_t cudnn_calls = 0;
+    std::string cudnn_info;
+    void disable_cudnn() {
+        cudnn_workspace = nullptr;
+        cudnn_attention = nullptr;
+        cudnn_info.clear();
+    }
+    // Loads `bridge` (a libh3_cudnn.so path) and lets it discover cuDNN 9.
+    void enable_cudnn(const std::string &bridge) {
+        if (!cudnn_library || cudnn_info.empty()) {
+            std::unique_ptr<void, int (*)(void *)> library(
+                dlopen(bridge.c_str(), RTLD_NOW | RTLD_LOCAL), dlclose);
+            if (!library) {
+                const char *error = dlerror();
+                throw std::runtime_error("cannot load cuDNN bridge " + bridge + ": " +
+                                         (error ? error : "unknown loader error"));
+            }
+            auto abi = reinterpret_cast<h3_cudnn_abi_fn>(dlsym(library.get(), "h3_cudnn_bridge_abi"));
+            auto init = reinterpret_cast<h3_cudnn_init_fn>(dlsym(library.get(), "h3_cudnn_init"));
+            auto workspace =
+                reinterpret_cast<h3_cudnn_workspace_fn>(dlsym(library.get(), "h3_cudnn_workspace"));
+            auto attention =
+                reinterpret_cast<h3_cudnn_attention_fn>(dlsym(library.get(), "h3_cudnn_attention"));
+            require(abi && abi() == 1 && init && workspace && attention,
+                    "unsupported cuDNN bridge ABI");
+            char info[1024] = {};
+            g.check(cuCtxSetCurrent(g.context), "activate H3 context");
+            if (init(std::getenv("H3_CUDNN_LIB"), info, sizeof(info)) != 0)
+                throw std::runtime_error(std::string("cuDNN unavailable: ") + info);
+            cudnn_library = std::move(library);
+            cudnn_workspace = workspace;
+            cudnn_attention = attention;
+            cudnn_info = info;
+        }
+    }
     static constexpr size_t prefetch_chunk = 64ull << 20;
     void prefetch_join() {
         if (prefetch_worker.joinable())
@@ -509,6 +549,29 @@ struct Engine {
             k = {};
             v = {};
             auto packed = g.empty_half({heads, rows, dim});
+            if (cudnn_attention && kind == 1 && dim == 128) {
+                char error[512] = {};
+                long long bytes = cudnn_workspace(rows, heads, dim, error, sizeof(error));
+                require(bytes >= 0, error);
+                Tensor workspace;
+                if (bytes > 0)
+                    workspace = byte_tensor({int((bytes + 255) / 256), 256});
+                g.poll();
+                require(cudnn_attention(reinterpret_cast<void *>(packed.pointer),
+                                        reinterpret_cast<void *>(pq.pointer),
+                                        reinterpret_cast<void *>(pk.pointer),
+                                        reinterpret_cast<void *>(pv.pointer), rows, heads, dim,
+                                        1.f / std::sqrt(float(dim)),
+                                        reinterpret_cast<void *>(workspace.pointer), g.stream,
+                                        error, sizeof(error)) == 0,
+                        error);
+                cudnn_calls++;
+                auto out = g.empty(shape);
+                g.launch("h3_unpack_heads", int((out.count() + 255) / 256), 1, 1, 256, 1, 0,
+                         out.pointer, packed.pointer, rows, heads, dim, kind);
+                g.attention_calls++;
+                return out;
+            }
             CUfunction fn;
             g.check(cuModuleGetFunction(&fn, kind == 1 ? flash_bf16 : flash_f16, "fa2_attn"),
                     "H3 attention lookup");
