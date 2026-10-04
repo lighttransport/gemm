@@ -28,7 +28,7 @@ static void worker(void *context) {
                     a->beta[(size_t)t * heads + h], D, D, a->out + off,
                     a->work + h * D);
             }
-    } else if (a->variant == 1) {
+    } else if (a->variant == 1 || a->variant == 4) {
 #pragma omp for collapse(2) schedule(static)
         for (int h = 0; h < heads; ++h)
             for (int t = 0; t < tokens; ++t)
@@ -36,6 +36,18 @@ static void worker(void *context) {
                     const size_t i = ((size_t)t * heads + h) * D + d;
                     a->factors[i] = glm53f_kda_scalar_factor(a->decay[i]);
                 }
+        if (a->variant == 4) {   /* decode 16-column blocks */
+#pragma omp for collapse(2) schedule(static)
+            for (int h = 0; h < heads; ++h)
+                for (int b = 0; b < 8; ++b)
+                    for (int t = 0; t < tokens; ++t) {
+                        const size_t off = (size_t)t * qstride + h * D;
+                        glm53f_kda_columns16_sve(a->state + (size_t)h * D * D + b * 16,
+                            a->out + off + b * 16, a->q + off, a->k + off,
+                            a->v + off + b * 16, a->factors + off,
+                            a->beta[(size_t)t * heads + h]);
+                    }
+        } else
 #pragma omp for collapse(2) schedule(static)
         for (int h = 0; h < heads; ++h)
             for (int b = 0; b < 2; ++b)
@@ -176,8 +188,7 @@ int main(int argc, char **argv) {
                 fill(&a, mode); run(&a);
                 memcpy(saved, a.state, (size_t)heads * D * D * 4);
                 memcpy(ref, a.out, (size_t)a.tokens * heads * D * 4);
-                {
-                    int variant = 1;
+                for (int variant = 1; variant <= 4; variant += 3) {
                     a.variant = variant; fill(&a, mode);
                     for (int g = 0; g < GUARD; ++g) {
                         state[g] = packed[g] = out[g] = -71.25f;

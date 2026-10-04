@@ -46,4 +46,31 @@ static __attribute__((noinline)) void glm53f_kda_columns64_sve(float *state, flo
     svst1_f32(pg, out + 32, y2); svst1_f32(pg, out + 48, y3);
 }
 
+/* Same recurrence on one 16-value column block (one SVE vector): identical
+ * per-lane FMA chains to glm53f_kda_columns64_sve, so 8 blocks per head can
+ * be spread over the decode team instead of 2. */
+static __attribute__((noinline)) void glm53f_kda_columns16_sve(float *state, float *out,
+        const float *q, const float *k, const float *v, const float *factor, float beta) {
+    if (svcntw() != 16) abort();
+    const svbool_t pg = svptrue_b32();
+    const float scale = 1.0f / sqrtf(128.0f);
+    svfloat32_t w = svdup_f32(0);
+    for (int d = 0; d < 128; ++d) {
+        float *row = state + (size_t)d * 128;
+        svfloat32_t s = svmul_n_f32_x(pg, svld1_f32(pg, row), factor[d]);
+        svst1_f32(pg, row, s);
+        w = svmla_n_f32_x(pg, w, s, k[d]);
+    }
+    w = svmul_n_f32_x(pg, svsub_f32_x(pg, svld1_f32(pg, v), w), beta);
+    svfloat32_t y = svdup_f32(0);
+    for (int d = 0; d < 128; ++d) {
+        float *row = state + (size_t)d * 128;
+        const float kd = k[d], qd = q[d] * scale;
+        svfloat32_t s = svmla_n_f32_x(pg, svld1_f32(pg, row), w, kd);
+        svst1_f32(pg, row, s);
+        y = svmla_n_f32_x(pg, y, s, qd);
+    }
+    svst1_f32(pg, out, y);
+}
+
 #endif

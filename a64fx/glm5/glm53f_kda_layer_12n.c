@@ -398,7 +398,15 @@ static void kda_worker(void *context) {
             const glm53f_native_matrix pop = {NULL, c->q2_op, c->q2_op_type, H, qd};
             kda_prefetch_rows(&pop);
         }
-        if (a->columns) {
+        if (a->columns == 2) {
+            /* 16-column blocks: 8 tasks per head instead of 2 (same lane chains). */
+#pragma omp for collapse(2) schedule(static)
+            for (int h = 0; h < hn; ++h)
+                for (int block = 0; block < 8; ++block)
+                    glm53f_kda_columns16_sve(c->state + (size_t)h * D * D + block * 16,
+                        c->core + h * D + block * 16, q + h * D, k + h * D,
+                        v + h * D + block * 16, c->decode_factor + h * D, c->beta[h]);
+        } else if (a->columns) {
 #pragma omp for collapse(2) schedule(static)
             for (int h = 0; h < hn; ++h)
                 for (int block = 0; block < 2; ++block)
@@ -463,7 +471,7 @@ int glm53f_kda_fusable_12n(glm53f_kda_context_12n *c) {
 void glm53f_kda_team_12n(void *context, const float *x) {
     glm53f_kda_context_12n *c = context;
     const char *column_env = getenv("GLM53F_KDA_DECODE_COLUMNS");
-    const int columns = column_env && atoi(column_env);
+    const int columns = column_env ? atoi(column_env) : 0;
     double td = 0.0;   /* decode_factor and fused_bad were prepared by glm53f_kda_fusable_12n */
     struct kda_call call = {c, x, NULL, 0.0f, &td, columns, c->partial, 0};
     kda_worker(&call);
@@ -481,7 +489,7 @@ static int kda_local(glm53f_kda_context_12n*c,float*out,const float*x){
     int8_t quant_x[H], quant_o[QKV]; float scale_x = 0, scale_o = 0;
     if (c->int8_enabled && glm53f_i8_quantize_x(quant_x, &scale_x, x, H)) return -1;
     const char *column_env = getenv("GLM53F_KDA_DECODE_COLUMNS");
-    int columns = column_env && atoi(column_env);
+    int columns = column_env ? atoi(column_env) : 0;
     if (columns && !c->decode_factor) c->decode_factor = a256((size_t)qd * sizeof(float));
     const char *fused_env = getenv("GLM53F_KDA_FUSED_OUT");
     const int fused_out = fused_env && atoi(fused_env) && c->q2_native && c->q2_op_cols == qd && !c->int8_enabled;

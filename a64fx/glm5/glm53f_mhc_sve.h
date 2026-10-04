@@ -197,16 +197,29 @@ static inline void glm53f_mhc_local_team(float *streams, const float *sublayer, 
          * stored one; each column's four old values are read before any of
          * its four new values is written. Per-element arithmetic unchanged. */
         const float *res = scratch->residual_in_streams ? streams : scratch->residual;
-        for (int d = lo; d < hi; ++d) {
-            double old_v[S];
-            for (int j = 0; j < S; ++j) old_v[j] = res[(size_t)j * W + d];
+        /* FP64 SVE over 8 columns: v = post*sub, then v += c_j*old_j (fused,
+         * j ascending) as the scalar loop compiles under fp-contract=fast. */
+        const svbool_t p64 = svptrue_b64();
+        svfloat64_t ssv = svdup_f64(0.0);
+        for (int d = lo; d < hi; d += 8) {
+#define MHC_LD64(ptr) svcvt_f64_f32_x(p64, svreinterpret_f32_u64(svld1uw_u64(p64, (const uint32_t *)(ptr))))
+            const svfloat64_t sub = MHC_LD64(sublayer + d);
+            const svfloat64_t o0 = MHC_LD64(res + d), o1 = MHC_LD64(res + (size_t)W + d),
+                              o2 = MHC_LD64(res + (size_t)2 * W + d), o3 = MHC_LD64(res + (size_t)3 * W + d);
+#undef MHC_LD64
             for (int k = 0; k < S; ++k) {
-                double v = (double)scratch->post[k] * sublayer[d];
-                for (int j = 0; j < S; ++j) v += (double)scratch->combine[(size_t)j * S + k] * (float)old_v[j];
-                streams[(size_t)k * W + d] = (float)v;
-                ss += (double)streams[(size_t)k * W + d] * streams[(size_t)k * W + d];
+                svfloat64_t v = svmul_n_f64_x(p64, sub, (double)scratch->post[k]);
+                v = svmla_n_f64_x(p64, v, o0, (double)scratch->combine[0 * S + k]);
+                v = svmla_n_f64_x(p64, v, o1, (double)scratch->combine[1 * S + k]);
+                v = svmla_n_f64_x(p64, v, o2, (double)scratch->combine[2 * S + k]);
+                v = svmla_n_f64_x(p64, v, o3, (double)scratch->combine[3 * S + k]);
+                const svfloat32_t vf = svcvt_f32_f64_x(p64, v);
+                svst1w_u64(p64, (uint32_t *)(streams + (size_t)k * W + d), svreinterpret_u64_f32(vf));
+                const svfloat64_t back = svcvt_f64_f32_x(p64, vf);
+                ssv = svmla_f64_x(p64, ssv, back, back);
             }
         }
+        ss = svaddv_f64(p64, ssv);
     } else {
         for (int k = 0; k < S; ++k)
             for (int d = lo; d < hi; ++d) ss += (double)streams[(size_t)k * W + d] * streams[(size_t)k * W + d];

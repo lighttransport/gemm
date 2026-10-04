@@ -89,6 +89,7 @@ int main(void) {
     failed |= parse("--act-header-kernel", "cached", &c) != 1 || strcmp(getenv("GLM53F_ACT_HEADER_CACHE"), "1");
     failed |= parse("--kda-quant-kernel", "team", &c) != 1 || strcmp(getenv("GLM53F_KDA_TEAM_QUANT"), "1");
     failed |= parse("--mhc-kernel", "local-gram", &c) != 1 || strcmp(getenv("GLM53F_MHC_FUSED_SYNC"), "3");
+    failed |= parse("--kda-decode-kernel", "columns16", &c) != 1 || strcmp(getenv("GLM53F_KDA_DECODE_COLUMNS"), "2");
     failed |= parse("--moe-prefill-layout", "padded", &c) != 1 || strcmp(getenv("GLM53F_MOE_GU_PAD"), "1");
     failed |= parse("--moe-prefill-layout", "tight", &c) != 1 || strcmp(getenv("GLM53F_MOE_GU_PAD"), "0");
     failed |= parse("--moe-prefill-layout", "legacy", &c) != 1 || strcmp(getenv("GLM53F_MOE_GU_PAD"), "0");

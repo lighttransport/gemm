@@ -94,6 +94,7 @@ static inline int glm53f_runtime_option(int argc, char **argv, int *index) {
              (!strcmp(key, "--mla-prefill-heads") && !strcmp(value, "values32")) ||
              (!strcmp(key, "--q8-prefill-kernel") && !strcmp(value, "tile4x4-asm")) ||
              (!strcmp(key, "--moe-combine-kernel") && !strcmp(value, "overlap")) ||
+             (!strcmp(key, "--kda-decode-kernel") && !strcmp(value, "columns16")) ||
              (!strcmp(key, "--weight-placement") && !strcmp(value, "cmg-experts")) ||
              (!strcmp(key, "--mhc-kernel") && !strcmp(value, "local")) ||
              (!strcmp(key, "--sparse-verify-kernel") && !strcmp(value, "front-onecoll")) ||
