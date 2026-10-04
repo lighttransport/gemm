@@ -80,6 +80,17 @@ rank0 logs `tmp/glm53f-q4-52159552/benchmark-decode100-*`. Single-node benches i
 - Queued: j2k (`--snapshot-copy parallel`, v24), j2l/j2m (kernel micro), j2n (v25: `--mhc-post-kernel chunked`,
   ROWS4 via per-arm `ENV:` in campaign-j2.py, MLA projection/logits/value opt-ins).
 
+- j2j–j2o (22:00–22:45): `--kda-verify-kernel columns64` d3 best set 47.62; **`--snapshot-copy parallel` +7%**
+  (state-gated d2 46.99→50.25, timed d3 50.98); **`--snapshot-copy deferred`** (f04f4443) d2/d3 state BIT_EXACT,
+  timed **d2 52.03, d3 51.43** (parallel d3 50.78). `--mhc-post-kernel chunked` 50.40 vs 49.26 (single run, noise
+  ±2–4%); MLA opt-ins and ROWS4 (env may not reach ranks via mpiexec) within noise. CMG placement neutral in MTP
+  (d3 defer interleave 51.44 = cmg 51.43).
+- Expert-kernel ILP is not the limit: R16 two-chain 117.9 vs iqf 113.3 µs (5 parts), ROWS4 130.5 vs 127.6 µs.
+  ~2.1 instr/weight byte, IPC ~0.5, 31% load wait. Routed experts are 15 GB/rank (Q8 would not fit in 29 GB).
+- **Best delivered decode: 52.03 tok/s** (MTP d2: placement cmg-experts, mhc local-gram + prefetch next,
+  kda-decode columns, mhc-batch-tail parallel, kda-verify columns64, sparse-verify front, moe-verify-router batch,
+  mhc-verify team, snapshot-copy deferred). Verify ≈17 ms/position vs 28 ms plain; 100 tok/s needs ≈7 ms.
+
 ## Conclusion so far
 Placement and kernel work each give ~1–2% in-model, and removing dispatches/serial sections by fusing whole
 layers into one team gives **nothing** (slightly negative). The 4.9 ms of barrier wait is therefore not
