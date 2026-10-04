@@ -106,6 +106,16 @@ int main(void) {
         }
         printf("MHC_LOCAL_TIME mode=%s mean_us=%.2f best_us=%.2f\n", mode == 3 ? "local-gram" : mode ? "local" : "legacy",
                sum / iters * 1e6, best * 1e6);
+#ifdef GLM53F_MHC_PHASE_TIMING
+        if (mode) {
+            printf("MHC_PHASE mode=%d us/call: post %.2f dots %.2f barrier1 %.2f reduce %.2f sinkhorn %.2f collapse %.2f gram_reduce %.2f\n", mode,
+                   glm53f_mhc_phase[0] / (iters + 20) * 1e6, glm53f_mhc_phase[1] / (iters + 20) * 1e6,
+                   glm53f_mhc_phase[2] / (iters + 20) * 1e6, glm53f_mhc_phase[3] / (iters + 20) * 1e6,
+                   glm53f_mhc_phase[4] / (iters + 20) * 1e6, glm53f_mhc_phase[5] / (iters + 20) * 1e6,
+                   glm53f_mhc_phase[6] / (iters + 20) * 1e6);
+            memset(glm53f_mhc_phase, 0, sizeof(glm53f_mhc_phase));
+        }
+#endif
     }
     return ok ? 0 : 1;
 }

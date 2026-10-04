@@ -278,8 +278,10 @@ static glm53f_target_model_12n *target_model_create(
         if(first<m->end_layer)m->moe=glm53f_moe_stage_create_dist(dist,images->routed,images->shared,model_dir,first,m->end_layer-first);
     }else m->moe = glm53f_moe_stage_create_12n(routed, shared, model_dir, 3, 42);
     m->scratch = a256(sizeof(*m->scratch));
+    m->scratch->mhc.residual_in_streams = 0;
     m->streams = a256((size_t)FLAT * sizeof(float));
     m->batch_scratch = a256((size_t)PREFILL_BATCH * sizeof(*m->batch_scratch));
+    for (int t = 0; t < PREFILL_BATCH; ++t) m->batch_scratch[t].mhc.residual_in_streams = 0;
     m->batch_streams = a256((size_t)PREFILL_BATCH * FLAT * sizeof(float));
     m->batch_normalized = a256((size_t)PREFILL_BATCH * HIDDEN * sizeof(float));
     m->batch_output = a256((size_t)PREFILL_BATCH * HIDDEN * sizeof(float));

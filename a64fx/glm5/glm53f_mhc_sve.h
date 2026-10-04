@@ -60,7 +60,17 @@ typedef struct {
     float residual[GLM53F_MHC_FLAT];
     float post[GLM53F_MHC_STREAMS];
     float combine[GLM53F_MHC_STREAMS * GLM53F_MHC_STREAMS];
+    int residual_in_streams; /* local mHC kernel: the residual equals streams (copy elided) */
 } glm53f_mhc_scratch;
+/* Re-materialize the residual copy for paths that read scratch->residual
+ * after the local kernel elided it (controller thread, before any team). */
+static inline void glm53f_mhc_residual_sync(const glm53f_mhc_scratch *scratch, const float *streams) {
+    glm53f_mhc_scratch *w = (glm53f_mhc_scratch *)scratch;
+    if (w->residual_in_streams) {
+        memcpy(w->residual, streams, sizeof(w->residual));
+        w->residual_in_streams = 0;
+    }
+}
 
 static inline float glm53f_mhc_dot_bf16_sve(
         const uint16_t *weight, const float *x, int n) {
@@ -147,14 +157,31 @@ static inline void glm53f_mhc_coefficients(float *logits,
  * bit-identical to the legacy path; the RMS and mixing-dot reductions are
  * reordered, so downstream values may differ in the last bits. */
 static double glm53f_mhc_partl[128 * 48];   /* per thread: 24 dots, ss, 10 Gram terms */
+#ifdef GLM53F_MHC_PHASE_TIMING
+#include <time.h>
+static double glm53f_mhc_phase[8];   /* 6 = Gram reduction (subset of phase 5 slot order) */
+#define GLM53F_MHC_MARK(i) do { if (!tid) { const double n_ = glm53f_mhc_now(); glm53f_mhc_phase[i] += n_ - mark_; mark_ = n_; } } while (0)
+#else
+#define GLM53F_MHC_MARK(i) do { } while (0)
+#endif   /* per thread: 24 dots, ss, 10 Gram terms */
 static inline void glm53f_mhc_local_team(float *streams, const float *sublayer, glm53f_mhc_scratch *scratch,
         const glm53f_mhc_site *site, const uint16_t *norm, int do_post, float *logits,
         void (*after_normalize)(void *, const float *), void *context, int gram) {
     enum { S = GLM53F_MHC_STREAMS, W = GLM53F_MHC_WIDTH, VL = 16 };
     const int tid = omp_get_thread_num(), nt = omp_get_num_threads();
     if (nt > 128 || svcntw() != VL) abort();
+#ifdef GLM53F_MHC_PHASE_TIMING
+    double mark_ = glm53f_mhc_now();
+#endif
     glm53f_pf_run(tid);
-    const int lo = (int)((long)(W / VL) * tid / nt) * VL, hi = (int)((long)(W / VL) * (tid + 1) / nt) * VL;
+    /* Slice granularity: one SVE vector by default; MHC_EXP_LINE_SLICES uses
+     * whole 256-byte lines (measured slower: uneven 64-chunk split). */
+#ifdef MHC_EXP_LINE_SLICES
+    const int CH = 64;
+#else
+    const int CH = VL;
+#endif
+    const int lo = (int)((long)(W / CH) * tid / nt) * CH, hi = (int)((long)(W / CH) * (tid + 1) / nt) * CH;
     const svbool_t pg = svptrue_b32();
     /* The 96 short mixing-row segments of this slice are cold; issue all their
      * lines up front so the misses overlap with the post update below. */
@@ -166,18 +193,25 @@ static inline void glm53f_mhc_local_team(float *streams, const float *sublayer, 
         }
     double ss = 0.0;
     if (do_post) {
-        for (int k = 0; k < S; ++k)
-            for (int d = lo; d < hi; ++d) {
+        /* In place: the residual is either the elided copy (streams) or the
+         * stored one; each column's four old values are read before any of
+         * its four new values is written. Per-element arithmetic unchanged. */
+        const float *res = scratch->residual_in_streams ? streams : scratch->residual;
+        for (int d = lo; d < hi; ++d) {
+            double old_v[S];
+            for (int j = 0; j < S; ++j) old_v[j] = res[(size_t)j * W + d];
+            for (int k = 0; k < S; ++k) {
                 double v = (double)scratch->post[k] * sublayer[d];
-                for (int j = 0; j < S; ++j)
-                    v += (double)scratch->combine[(size_t)j * S + k] * scratch->residual[(size_t)j * W + d];
+                for (int j = 0; j < S; ++j) v += (double)scratch->combine[(size_t)j * S + k] * (float)old_v[j];
                 streams[(size_t)k * W + d] = (float)v;
                 ss += (double)streams[(size_t)k * W + d] * streams[(size_t)k * W + d];
             }
+        }
     } else {
         for (int k = 0; k < S; ++k)
             for (int d = lo; d < hi; ++d) ss += (double)streams[(size_t)k * W + d] * streams[(size_t)k * W + d];
     }
+    GLM53F_MHC_MARK(0);   /* prefetch issue + post update + sum of squares */
     double *part = glm53f_mhc_partl + (size_t)tid * 48;
     if (gram) {
         /* Gram matrix of the four streams over this slice: the collapsed RMS
@@ -202,7 +236,9 @@ static inline void glm53f_mhc_local_team(float *streams, const float *sublayer, 
         part[m] = svaddv_f32(pg, acc);
     }
     part[GLM53F_MHC_MIX] = ss;
+    GLM53F_MHC_MARK(1);   /* Gram + 24 partial dots */
 #pragma omp barrier
+    GLM53F_MHC_MARK(2);   /* barrier 1 */
     float lg[GLM53F_MHC_MIX], post[S], comb[S * S];
     double total = 0.0;
     for (int t = 0; t < nt; ++t) total += glm53f_mhc_partl[(size_t)t * 48 + GLM53F_MHC_MIX];
@@ -212,16 +248,19 @@ static inline void glm53f_mhc_local_team(float *streams, const float *sublayer, 
         for (int t = 0; t < nt; ++t) dot += glm53f_mhc_partl[(size_t)t * 48 + m];
         lg[m] = (float)dot * inv;
     }
+    GLM53F_MHC_MARK(3);   /* cross-thread reduction of partials */
     for (int k = 0; k < S; ++k) {
         lg[k] = glm53f_sigmoid(lg[k] * site->scale[0] + site->base[k]) + 1e-6f;
         post[k] = 2.0f * glm53f_sigmoid(lg[S + k] * site->scale[1] + site->base[S + k]);
     }
     for (int m = 0; m < S * S; ++m) comb[m] = lg[2 * S + m] * site->scale[2] + site->base[2 * S + m];
     glm53f_mhc_sinkhorn_fast(comb, S, 20, 1e-6f);
+    GLM53F_MHC_MARK(4);   /* sigmoids + Sinkhorn */
     if (!tid) {   /* every thread finished reading post/combine before the barrier above */
         memcpy(scratch->post, post, sizeof(post));
         memcpy(scratch->combine, comb, sizeof(comb));
         memcpy(logits, lg, sizeof(lg));
+        scratch->residual_in_streams = 1;   /* every thread read the residual before barrier 1 */
     }
     if (gram) {
         double G[10] = {0};
@@ -232,12 +271,11 @@ static inline void glm53f_mhc_local_team(float *streams, const float *sublayer, 
                            2.0 * (p0 * p1 * G[1] + p0 * p2 * G[2] + p0 * p3 * G[3] + p1 * p2 * G[5] +
                                   p1 * p3 * G[6] + p2 * p3 * G[8]);
         const float inv2 = 1.0f / sqrtf((float)(ss2 / W) + 1e-5f);
+        GLM53F_MHC_MARK(6);   /* Gram reduction */
         for (int d = lo; d < hi; ++d) {
             float value = 0.0f;
             for (int k = 0; k < S; ++k) {
-                const float sv = streams[(size_t)k * W + d];
-                value += lg[k] * sv;
-                scratch->residual[(size_t)k * W + d] = sv;
+                value += lg[k] * streams[(size_t)k * W + d];
             }
             scratch->collapsed[d] = value;
             scratch->normalized[d] = value * inv2 * glm53f_bf16_to_f32(norm[d]);
@@ -246,11 +284,7 @@ static inline void glm53f_mhc_local_team(float *streams, const float *sublayer, 
     double ss2 = 0.0;
     for (int d = lo; d < hi; ++d) {
         float value = 0.0f;
-        for (int k = 0; k < S; ++k) {
-            const float sv = streams[(size_t)k * W + d];
-            value += lg[k] * sv;
-            scratch->residual[(size_t)k * W + d] = sv;
-        }
+        for (int k = 0; k < S; ++k) value += lg[k] * streams[(size_t)k * W + d];
         scratch->collapsed[d] = value;
         ss2 += (double)value * value;
     }
@@ -262,6 +296,7 @@ static inline void glm53f_mhc_local_team(float *streams, const float *sublayer, 
     for (int d = lo; d < hi; ++d)
         scratch->normalized[d] = scratch->collapsed[d] * inv2 * glm53f_bf16_to_f32(norm[d]);
     }
+    GLM53F_MHC_MARK(5);   /* collapse + normalize (incl. barrier 2 when not Gram) */
     if (after_normalize) {
 #pragma omp barrier
         after_normalize(context, scratch->normalized);
@@ -387,6 +422,10 @@ static inline void glm53f_mhc_fast_route(float *streams, const float *sublayer,
         glm53f_mhc_scratch *scratch, const glm53f_mhc_site *site,
         const uint16_t *norm, int do_post,
         void (*after_normalize)(void *, const float *), void *context) {
+    {   /* the legacy team reads the stored residual */
+        const int fs = glm53f_mhc_fused_sync_on();
+        if (fs != 2 && fs != 3) glm53f_mhc_residual_sync(scratch, streams);
+    }
     glm53f_mhc_call call = {.streams = streams, .sublayer = sublayer,
         .scratch = scratch, .site = site, .norm = norm, .do_post = do_post,
         .after_normalize = after_normalize, .context = context,
@@ -448,6 +487,7 @@ static float glm53f_mhc_pdot[128 * 32];
 static double glm53f_mhc_stamp[8]; static int glm53f_mhc_stamp_on;
 static inline void glm53f_mhc_fast2(float *streams, const float *sublayer, glm53f_mhc_scratch *scratch,
         const glm53f_mhc_site *site, const uint16_t *norm, int do_post) {
+    if (do_post) glm53f_mhc_residual_sync(scratch, streams);
 #pragma omp parallel
     {
         const int tid = omp_get_thread_num(), nt = omp_get_num_threads();
@@ -591,6 +631,7 @@ static inline void glm53f_mhc_pre_sve(
     if (dtl) t4 = glm53f_mhc_now();
 #endif
     memcpy(scratch->residual, streams, sizeof(scratch->residual));
+    scratch->residual_in_streams = 0;
     glm53f_rmsnorm_bf16(scratch->normalized, scratch->collapsed, norm,
                         GLM53F_MHC_WIDTH, 1e-5f);
 #if !GLM53F_MHC_FUSED
@@ -786,6 +827,7 @@ static void glm53f_mhc_post_worker(void *context) {
 static inline void glm53f_mhc_post_sve(
         float *streams, const float *sublayer, const glm53f_mhc_scratch *scratch) {
     const double dt0 = glm53f_mhc_detail_on() ? glm53f_mhc_now() : 0.0;
+    glm53f_mhc_residual_sync(scratch, streams);
     glm53f_mhc_post_call call = {streams, sublayer, scratch};
     if (glm53f_team_available()) glm53f_team_dispatch(glm53f_mhc_post_worker, &call);
     else {
@@ -803,6 +845,7 @@ static inline void glm53f_mhc_post_pre_sve(
         float *streams, const float *sublayer, glm53f_mhc_scratch *scratch,
         const glm53f_mhc_site *next_site, const uint16_t *next_norm) {
     if (glm53f_mhc_fast_on()) { if (glm53f_mhc_fast_on() == 2) glm53f_mhc_fast2(streams, sublayer, scratch, next_site, next_norm, 1); else glm53f_mhc_fast(streams, sublayer, scratch, next_site, next_norm, 1); return; }
+    glm53f_mhc_residual_sync(scratch, streams);
     double sumsq = 0.0;
     float inv = 0.0f, logits[GLM53F_MHC_MIX];
 #pragma omp parallel shared(sumsq,inv,logits)
@@ -850,6 +893,7 @@ static inline void glm53f_mhc_post_pre_sve(
 #pragma omp single
         {
             memcpy(scratch->residual, streams, sizeof(scratch->residual));
+            scratch->residual_in_streams = 0;
             glm53f_rmsnorm_bf16(scratch->normalized, scratch->collapsed,
                                 next_norm, GLM53F_MHC_WIDTH, 1e-5f);
         }
