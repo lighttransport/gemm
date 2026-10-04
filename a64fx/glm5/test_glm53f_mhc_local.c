@@ -12,7 +12,10 @@
 #include <string.h>
 #include <time.h>
 
-enum { SITES = 8, CALLS = 24 };
+#ifndef MHC_TEST_SITES
+#define MHC_TEST_SITES 8
+#endif
+enum { SITES = MHC_TEST_SITES, CALLS = 24 };
 static unsigned rng = 7;
 static float rnd(void) { rng = rng * 1664525u + 1013904223u; return ((int)(rng >> 9) - (1 << 22)) / (float)(1 << 22); }
 static uint16_t bf16(float f) { uint32_t u; memcpy(&u, &f, 4); return (uint16_t)(u >> 16); }
@@ -34,6 +37,7 @@ static void run(state *s, const glm53f_mhc_site *site, const uint16_t *norm, con
 
 int main(void) {
     static uint16_t fn[SITES][GLM53F_MHC_MIX * GLM53F_MHC_FLAT], norm[GLM53F_MHC_WIDTH];
+    const int prefetch_next = getenv("MHC_TEST_PREFETCH") && atoi(getenv("MHC_TEST_PREFETCH"));
     static float base[SITES][GLM53F_MHC_MIX], scale[SITES][3], sub[CALLS][GLM53F_MHC_WIDTH];
     glm53f_mhc_site site[SITES];
     for (int s = 0; s < SITES; ++s) {
@@ -99,6 +103,7 @@ int main(void) {
         double best = 1e30, sum = 0;
         const int iters = 400;
         for (int it = -20; it < iters; ++it) {
+            glm53f_mhc_next_fn = prefetch_next && mode ? site[(it + 21) % SITES].fn : NULL;
             const double t0 = now();
             run(&t, &site[(it + 20) % SITES], norm, sub[(it + 20) % CALLS], 1, mode);
             const double dt = now() - t0;
@@ -117,5 +122,6 @@ int main(void) {
         }
 #endif
     }
+    glm53f_mhc_next_fn = NULL;
     return ok ? 0 : 1;
 }

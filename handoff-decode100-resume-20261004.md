@@ -100,7 +100,8 @@ Detailed per-campaign history: `handoff-decode100-20261004.md` (same directory).
 - **j2r** (v29, `-DGLM53F_MHC_PHASE_TIMING`): plain legacy vs best; read `GLM53F_MHC_INMODEL` (rank 0 log of the
   best arm) and compare per-call kernel time with the 70–86 µs site times → tells whether mHC time is inside the
   kernel (cold misses / barriers) or around it (dispatch, router, non-team serial code). Diagnostic only.
-- **j2s** (v30): `--kda-decode-pipeline heads` 8K exact gate (`exact_8k pipe`) + 2 alternating pairs
+- **j2s** (v30): **8K full-state BIT_EXACT passed** (8K decode 31.68 vs legacy 32.08, single run). Remaining: the
+  512 pairs. `--kda-decode-pipeline heads` 8K exact gate (`exact_8k pipe`) + 2 alternating pairs
   (`pipe`, `best-pipe`). If not BIT_EXACT, suspect `glm53f_native_matvec_rows` row-group alignment or act prep.
 - **j2t** (v31, queued after j2s): local-gram 8K exact gate, one pair vs legacy, MTP d2 BEST and BEST + head pipeline.
 - Read with: `ssh fugaku1 'grep -h DECODE100 work/gemm/glm53f-strata-20261001/tmp/decode100-20261004/driver-j2[rst].log'`.
