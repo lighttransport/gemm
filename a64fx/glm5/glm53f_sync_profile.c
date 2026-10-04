@@ -4,7 +4,9 @@
  *   1: count team dispatches, OpenMP barriers (thread 0) and decode allreduces
  *      with their wall time;
  *   2: additionally time a PMPI_Barrier before each allreduce, separating
- *      arrival skew from collective latency (adds one barrier per allreduce).
+ *      arrival skew from collective latency (adds one barrier per allreduce);
+ *   3: mode 1 plus per-call-site barrier/dispatch counts and wait time
+ *      (return addresses; resolve offline with addr2line -f -e BINARY).
  * Production sources are unchanged; results are not throughput measurements. */
 #define _GNU_SOURCE
 #include <mpi.h>
@@ -12,6 +14,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 
 typedef void (*glm53f_team_callback)(void *);
@@ -25,6 +28,15 @@ static struct {
     double dispatch_s, barrier_s, allreduce_s, skew_s;
 } sync_stats;
 
+enum { SITES = 512 };
+static struct { uintptr_t pc; uint64_t calls; double seconds; char kind; } sync_site[SITES];
+static void sync_site_add(uintptr_t pc, double seconds, char kind) {
+    unsigned h = (unsigned)((pc >> 2) * 2654435761u) % SITES;
+    for (int i = 0; i < SITES; ++i, h = (h + 1) % SITES) {
+        if (!sync_site[h].pc) { sync_site[h].pc = pc; sync_site[h].kind = kind; }
+        if (sync_site[h].pc == pc) { ++sync_site[h].calls; sync_site[h].seconds += seconds; return; }
+    }
+}
 static inline double sync_now(void) {
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);
@@ -42,16 +54,20 @@ void __wrap_glm53f_team_dispatch(glm53f_team_callback fn, void *context) {
     if (!sync_on()) { __real_glm53f_team_dispatch(fn, context); return; }
     double begin = sync_now();
     __real_glm53f_team_dispatch(fn, context);
-    sync_stats.dispatch_s += sync_now() - begin;
+    const double t = sync_now() - begin;
+    sync_stats.dispatch_s += t;
     ++sync_stats.dispatches;
+    if (sync_mode >= 3) sync_site_add((uintptr_t)__builtin_return_address(0), t, 'D');
 }
 
 void __wrap___kmpc_barrier(void *loc, int32_t gtid) {
     if (!sync_on() || omp_get_thread_num() != 0) { __real___kmpc_barrier(loc, gtid); return; }
     double begin = sync_now();
     __real___kmpc_barrier(loc, gtid);
-    sync_stats.barrier_s += sync_now() - begin;
+    const double t = sync_now() - begin;
+    sync_stats.barrier_s += t;
     ++sync_stats.barriers;
+    if (sync_mode >= 3) sync_site_add((uintptr_t)__builtin_return_address(0), t, 'B');
 }
 
 int __wrap_glm53f_sum_allreduce_12n(const float *input, float *output, int count) {
@@ -73,6 +89,7 @@ int __wrap_glm53f_sum_allreduce_12n(const float *input, float *output, int count
 
 void glm53f_sync_profile_reset(void) {
     sync_stats = (__typeof__(sync_stats)){0};
+    memset(sync_site, 0, sizeof(sync_site));
 }
 
 /* Rank 0 prints per-position averages; positions = decoded positions. */
@@ -90,5 +107,11 @@ void glm53f_sync_profile_report(const char *label, long positions) {
                (double)sync_stats.allreduces / positions,
                (double)sync_stats.allreduce_floats / (sync_stats.allreduces ? sync_stats.allreduces : 1),
                sync_stats.allreduce_s * 1e3 / positions, sync_stats.skew_s * 1e3 / positions);
+    if (!rank && sync_mode >= 3)
+        for (int i = 0; i < SITES; ++i)
+            if (sync_site[i].pc)
+                printf("GLM53F_SYNC_SITE label=%s kind=%c pc=%#lx per_pos=%.2f us_per_pos=%.2f\n", label,
+                       sync_site[i].kind, (unsigned long)sync_site[i].pc, (double)sync_site[i].calls / positions,
+                       sync_site[i].seconds * 1e6 / positions);
     glm53f_sync_profile_reset();
 }
