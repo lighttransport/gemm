@@ -104,6 +104,7 @@ if [ "$mode" != runtime ]; then
     bin test_glm53f_mtp_spec test_glm53f_mtp_spec.c
     bin test_glm53f_mla_logits_team test_glm53f_mla_logits_team.c
     bin test_glm53f_mla_values_team test_glm53f_mla_values_team.c
+    bin test_glm53f_router_tiles test_glm53f_router_tiles.c
     bin test_glm53f_mla_head_tiles test_glm53f_mla_head_tiles.c
     bin test_glm53f_head_verify test_glm53f_head_verify.c
     bin test_glm53f_head_hidden -ffunction-sections -fdata-sections -Wl,--gc-sections test_glm53f_head_hidden.c

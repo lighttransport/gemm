@@ -429,6 +429,61 @@ static inline void gmn_router_run(float *out, size_t ldo, const uint16_t *wt_lay
     }
 }
 
+/* Twelve tokens x16 experts reuse packed weights without the36 accumulators
+ * of a12x48 tile. Each output retains the original sequential key FMAs. */
+static inline __attribute__((always_inline)) void gmn_router_block12(float *out,
+        size_t ldo, const uint16_t *wt, const float *x, size_t ldx, int K, const int n) {
+    const svbool_t pg = svptrue_b32();
+#define GR12_DECL(U) svfloat32_t r##U = svdup_f32(0)
+    GR12_DECL(0); GR12_DECL(1); GR12_DECL(2); GR12_DECL(3);
+    GR12_DECL(4); GR12_DECL(5); GR12_DECL(6); GR12_DECL(7);
+    GR12_DECL(8); GR12_DECL(9); GR12_DECL(10); GR12_DECL(11);
+#undef GR12_DECL
+    for (int k = 0; k < K; ++k) {
+        const svfloat32_t w = svreinterpret_f32_u32(svlsl_n_u32_x(pg,
+            svld1uh_u32(pg, wt + (size_t)k * GMN_RTILE), 16));
+#define GR12_STEP(U) if ((U) < n) r##U = svmla_n_f32_x(pg, r##U, w, x[(size_t)(U) * ldx + k])
+        GR12_STEP(0); GR12_STEP(1); GR12_STEP(2); GR12_STEP(3);
+        GR12_STEP(4); GR12_STEP(5); GR12_STEP(6); GR12_STEP(7);
+        GR12_STEP(8); GR12_STEP(9); GR12_STEP(10); GR12_STEP(11);
+#undef GR12_STEP
+    }
+#define GR12_STORE(U) if ((U) < n) svst1_f32(pg, out + (size_t)(U) * ldo, r##U)
+    GR12_STORE(0); GR12_STORE(1); GR12_STORE(2); GR12_STORE(3);
+    GR12_STORE(4); GR12_STORE(5); GR12_STORE(6); GR12_STORE(7);
+    GR12_STORE(8); GR12_STORE(9); GR12_STORE(10); GR12_STORE(11);
+#undef GR12_STORE
+}
+static inline void gmn_router_run12(float *out, size_t ldo,
+        const uint16_t *wt_layer, int tile, const float *x, size_t ldx, int K, int n) {
+    const uint16_t *wt = wt_layer + (size_t)(tile / 3) * K * GMN_RTILE + (tile % 3) * 16;
+    switch (n) {
+#define GR12_CASE(N) case N: gmn_router_block12(out, ldo, wt, x, ldx, K, N); break
+        GR12_CASE(1); GR12_CASE(2); GR12_CASE(3); GR12_CASE(4);
+        GR12_CASE(5); GR12_CASE(6); GR12_CASE(7); GR12_CASE(8);
+        GR12_CASE(9); GR12_CASE(10); GR12_CASE(11); GR12_CASE(12);
+#undef GR12_CASE
+    }
+}
+/* Collective OpenMP entry, also used by the strong native fixture. */
+static inline void gmn_router_prefill(float *out, const uint16_t *wt,
+        const float *x, int tokens, int K, int tiles12) {
+    const int width = tiles12 ? 12 : 6, chunk = tiles12 ? 2 : 4;
+    const int groups = (tokens + width - 1) / width, chunks = (groups + chunk - 1) / chunk;
+    const int tiles = tiles12 ? GMN_NEXP / 16 : GMN_RTILES;
+#pragma omp parallel for schedule(dynamic, 1)
+    for (int task = 0; task < tiles * chunks; ++task) {
+        const int tile = task / chunks, ch = task % chunks;
+        for (int g = ch * chunk; g < groups && g < (ch + 1) * chunk; ++g) {
+            const int t = g * width, n = tokens - t < width ? tokens - t : width;
+            if (tiles12) gmn_router_run12(out + (size_t)t * GMN_NEXP + tile * 16,
+                GMN_NEXP, wt, tile, x + (size_t)t * K, K, K, n);
+            else gmn_router_run(out + (size_t)t * GMN_NEXP + tile * GMN_RTILE,
+                GMN_NEXP, wt, tile, x + (size_t)t * K, K, K, n);
+        }
+    }
+}
+
 #ifdef __cplusplus
 }
 #endif

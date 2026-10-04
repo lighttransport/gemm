@@ -5,6 +5,27 @@ prefill tokens/s**, on twelve A64FX nodes, the complete 45-layer
 UD-Q4_K_XL model, top-8 routing, and the saved roughly 8K coding prompt.
 These targets have **not been demonstrated** by the changes below.
 
+## Packed router12×16 tiles (October4 afternoon; native/model queued)
+
+`--moe-router-prefill legacy|tiles12`, default `legacy`, reads the existing
+BF16 packed router weights with12-token by16-expert tiles. The original
+6×48 tile has18 vector accumulators; the new tile has12 and reuses each
+weight vector across twice as many tokens. Every output keeps the original
+sequential key FMAs. No allocation, collective or repacked copy is added.
+Only packed router mode1, SVE16 and more than6 tokens are eligible; the
+legacy/diagnostic router paths retain their arithmetic.
+
+The eligibility audit discarded an initial four-token legacy-router prototype,
+which would not affect the tuned default packed router. Its idle waiter was
+canceled before MPI, and its source/build logs remain in scratch only.
+The corrected packed candidate builds warning-clean in fast/conservative FCC
+modes. Native fixtures and timing are queued behind model staging on
+PJM52159552. They compare complete288-logit arrays and canaries across72
+cases/rank, all12 token tails, wider boundaries and production4096-column
+shapes. Four math/thread configurations precede component gates and17
+same-binary model gates/timing runs. No gain or native correctness claim yet.
+See [queued router evidence](strata-router-tiles-20261004.json).
+
 ## MTP rejected-window restore (October4; complete, small screen gain, no promotion)
 
 `--mtp-target-restore legacy|rejection`, default `legacy`, follows Strata's

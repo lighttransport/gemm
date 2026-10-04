@@ -1404,17 +1404,10 @@ static int moe_prefill_grouped(glm53f_moe_stage_context_12n *c, float *out,
     float route_weight[GLM53F_PREFILL_MAX_TOKENS][8];
     double begin = c->profile ? glm53f_clock() : 0.0;
     if (c->rg_mode && c->router_wt) {
-        const int gch = 4, ngroups = (tokens + 5) / 6, nch = (ngroups + gch - 1) / gch;
+        const char *tiles = getenv("GLM53F_MOE_ROUTER_TILES12");
+        const int tiles12 = tiles && atoi(tiles) && svcntw() == 16 && tokens > 6 && c->rg_mode == 1;
         const uint16_t *wl = c->router_wt + (size_t)li * NEXPERTS * H;
-#pragma omp parallel for schedule(dynamic, 1)
-        for (int task = 0; task < GMN_RTILES * nch; ++task) {
-            const int tile = task / nch, ch = task % nch;
-            for (int g = ch * gch; g < ngroups && g < (ch + 1) * gch; ++g) {
-                const int t0 = g * 6, n = tokens - t0 < 6 ? tokens - t0 : 6;
-                gmn_router_run(c->batch_router + (size_t)t0 * NEXPERTS + tile * GMN_RTILE, NEXPERTS, wl, tile,
-                               x + (size_t)t0 * H, H, H, n);
-            }
-        }
+        gmn_router_prefill(c->batch_router, wl, x, tokens, H, tiles12);
     }
     if (!c->rg_mode || c->rg_mode == 2 || !c->router_wt) {
         float *ref = c->rg_mode == 2 ? (float *)malloc((size_t)tokens * NEXPERTS * sizeof(float)) : c->batch_router;

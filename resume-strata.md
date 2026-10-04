@@ -7,12 +7,42 @@ Distribution/pipeline foundations pass native12-node correctness. Routed
 4×512 native slicing passes24 exact cases across six formats; real-model
 metadata-only sizing passes all12 ranks. Real PP short cross-layout correctness fails; qualification is incomplete.
 PJM52106727 and52116293 have expired; their `/local` images are gone.
-Current PJM52138572 is12 nodes compact2×3×2, normal2GHz/eco0, six hours
-from23:02:57 JST October3 until05:02:57 JST October4; the new-run guard is
-04:45 JST October4. Bridge42446→32446→21264, hoste25-6014c, remote checkout
-unchanged. Local tmux socket`tmp/tmux-glm53f/pp1.sock`, launcher session
-`glm53f-logits4`. PJM52128881 was released after its final component gate;
+PJM52138572 has expired; its `/local` images are gone. Current PJM52159552
+is12 nodes compact2×3×2, normal2GHz/eco0, six hours from14:05:14 until20:05:14
+JST October4; model new-run cutoff19:35 (600s margin before19:45 guard).
+Bridge42448→32448→21264, hoste25-4008c, remote checkout unchanged.
+Local tmux socket`tmp/tmux-glm53f/pp1.sock`, launcher session
+`glm53f-prefill5`, control`tmp/bash-http-glm53f-prefill5/`.
+Separate four-node allocation52158976 is unrelated and must not be touched. PJM52128881 was released after its final component gate;
 its `/local` images are gone. Other allocations must not be touched.
+
+**October4 afternoon active continuation:** packed prefill router experiment
+`--moe-router-prefill legacy|tiles12`, defaultlegacy, changes6tokens×48experts
+to12×16 using the existing packed BF16 layout. Each output retains sequential
+key FMAs; no extra allocation, collective or weight copy. Runtime guard:
+packed router mode1, SVE16, tokens>6. Diagnostic mode2 and other paths stay
+legacy. FCC fast/conservative candidate `candidate-router-tiles-packed-v1`
+built warning-clean; strict host CLI parser passes. Native/model pending.
+
+Staging owner127 is the sole MPI owner, using target and MTP chunked stagers
+into `/local/*-52159552`. Waiting driver459 requires127 terminal/PASS and
+idle MPI. Four native configurations: fast/conservative ×1/47 threads,
+72 cases/rank each (3456 instances), all288 logits/canaries, all12 tail widths,
+23/24/25 and47/48/49 boundaries,511/512/513/4096-token production shapes,
+K16/31/64 and4096, signed finite values and zeros. Seven alternating component
+pairs at512/4096 use rankmax timing;5%fast/2%conservative gates precede17
+model runs: short/full raw state gates, frozen/same-binary controls and five
+alternating pairs, other options fixed legacy. Guard19:35. Do not overlap MPI.
+Scratch`tmp/strata-router-tiles-20261004/`; evidence
+`a64fx/glm5/strata-router-tiles-20261004.json` includes source/binary hashes,
+build/driver/campaign and status explicitly pending.
+
+Canceled idle waiter337 before MPI: the original legacy four-token router
+prototype was ineligible because the production default is packed mode1.
+Discarded production changes were removed and saved in scratch. Failed
+standalone legacy builds (missing SVE/OMP includes) are also preserved.
+Correct packed candidate does not use them. No throughput gain or native
+correctness is claimed yet. No push authorized.
 
 **October4 active continuation:** score kernel commit`64536808` is fully
 measured, with22 completed model runs/38 trials. Five plain pairs confirm
