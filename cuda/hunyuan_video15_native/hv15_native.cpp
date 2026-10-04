@@ -1,4 +1,5 @@
 #include "hv15_native.h"
+#include <iostream>
 #include "models.hpp"
 #include <random>
 #include <sstream>
@@ -265,6 +266,52 @@ int hv15n_set_aotriton_bridge(hv15n_context *ctx, const char *path, char *error,
     (void)ctx;
     (void)path;
     return failure(error, capacity, "standalone AOTriton attention requires the ROCm backend");
+#endif
+}
+int hv15n_set_cudnn_attention(hv15n_context *ctx, const char *mode, const char *cudnn_library,
+                              char *error, size_t capacity) {
+    std::string m = mode ? mode : "off";
+#ifdef HV15N_ROCM
+    (void)ctx;
+    (void)cudnn_library;
+    if (m == "off")
+        return 0;
+    return failure(error, capacity, "cuDNN attention requires the CUDA backend");
+#else
+    try {
+        require(ctx != nullptr, "context is required");
+        bool expected = false;
+        require(ctx->busy.compare_exchange_strong(expected, true), "context is busy");
+        struct Guard {
+            std::atomic<bool> &busy;
+            ~Guard() { busy = false; }
+        } guard{ctx->busy};
+        if (m == "off") {
+            ctx->gpu->disable_cudnn();
+            return 0;
+        }
+        std::string bridge = m;
+        if (m == "auto") {
+            Dl_info self{};
+            dladdr(reinterpret_cast<void *>(&hv15n_set_cudnn_attention), &self);
+            fs::path dir = self.dli_fname ? fs::path(self.dli_fname).parent_path() : fs::path();
+            if (dir.empty() || !fs::exists(dir / "libh3_cudnn.so"))
+                dir = fs::read_symlink("/proc/self/exe").parent_path();
+            bridge = (dir / "libh3_cudnn.so").string();
+        }
+        try {
+            ctx->gpu->use_cudnn(bridge, cudnn_library && *cudnn_library ? cudnn_library : nullptr);
+            std::cerr << "hv15n cuDNN attention: " << ctx->gpu->cudnn_info << "\n";
+        } catch (const std::exception &e) {
+            ctx->gpu->disable_cudnn();
+            if (m != "auto")
+                throw;
+            std::cerr << "hv15n cuDNN attention unavailable, using FlashAttention-2: " << e.what() << "\n";
+        }
+        return 0;
+    } catch (const std::exception &e) {
+        return failure(error, capacity, e.what());
+    }
 #endif
 }
 void hv15n_cancel(hv15n_context *ctx) {

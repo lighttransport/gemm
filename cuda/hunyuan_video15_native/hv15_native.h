@@ -38,6 +38,13 @@ const char *hv15n_metrics(const hv15n_context *context);
  * The existing configuration struct and CUDA ABI remain unchanged. */
 int hv15n_set_aotriton_bridge(hv15n_context *context, const char *path,
                             char *error, size_t capacity);
+/* CUDA only: opt-in cuDNN SDPA for the DiT attention on an idle context. mode is
+ * NULL/"off" (default, private FlashAttention-2), "auto" (libh3_cudnn.so beside this
+ * library or the executable; falls back with a warning if unavailable) or a bridge path
+ * (errors if unusable). cudnn_library is a libcudnn.so.9 path or NULL (loader search
+ * path and fixed system locations). */
+int hv15n_set_cudnn_attention(hv15n_context *context, const char *mode,
+                              const char *cudnn_library, char *error, size_t capacity);
 void hv15n_cancel(hv15n_context *context);
 void hv15n_free(hv15n_context *context);
 #ifdef __cplusplus

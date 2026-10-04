@@ -90,6 +90,120 @@ Tensor vae_tiled(Gpu &g, Weights &w, const Tensor &input, bool encode) {
     int ot = encode ? (it - 1) / 4 + 1 : (it - 1) * 4 + 1, oh = encode ? ih / 16 : ih * 16,
         ow = encode ? iw / 16 : iw * 16, oc = encode ? 32 : 3;
     std::vector<float> output(product({ot, oh, ow, oc}));
+#ifndef HV15N_ROCM
+    // Pipelined tiles: tile k+1 is uploaded (pinned staging, no stream sync) and enqueued
+    // before tile k is downloaded (async, pinned) and blended on the host, so host work
+    // overlaps GPU decoding. Blending arithmetic is unchanged.
+    std::vector<std::array<int, 4>> order; // y, x, oy, ox
+    std::vector<int> row_start;
+    for (int y = 0, oy = 0; y < ih; y += stride, oy += keep) {
+        row_start.push_back(int(order.size()));
+        for (int x = 0, ox = 0; x < iw; x += stride, ox += keep)
+            order.push_back({y, x, oy, ox});
+    }
+    struct Slot {
+        float *host = nullptr;
+        CUevent ready = nullptr;
+        std::vector<int> shape;
+    };
+    const size_t slot_bytes = size_t(ot) * (encode ? tile / 16 : tile * 16) *
+                              (encode ? tile / 16 : tile * 16) * oc * 4;
+    std::array<Slot, 2> slots;
+    struct SlotGuard {
+        std::array<Slot, 2> &s;
+        Gpu &g;
+        ~SlotGuard() {
+            cuStreamSynchronize(g.stream);
+            for (auto &x : s) {
+                if (x.ready) cuEventDestroy(x.ready);
+                if (x.host) cuMemFreeHost(x.host);
+            }
+        }
+    } guard{slots, g};
+    for (auto &slot : slots) {
+        g.check(cuMemHostAlloc(reinterpret_cast<void **>(&slot.host), slot_bytes, 0), "VAE pinned tile");
+        g.check(cuEventCreate(&slot.ready, CU_EVENT_DISABLE_TIMING), "VAE tile event");
+    }
+    auto start = [&](size_t k) {
+        auto [y, x, oy, ox] = order[k];
+        (void)oy;
+        (void)ox;
+        int th = std::min(tile, ih - y), tw = std::min(tile, iw - x);
+        std::vector<float> pixels(product({it, th, tw, ic}));
+        for (int f = 0; f < it; f++)
+            for (int yy = 0; yy < th; yy++)
+                std::copy_n(source.data() + ((size_t(f) * ih + y + yy) * iw + x) * ic, tw * ic,
+                            pixels.data() + (size_t(f) * th + yy) * tw * ic);
+        auto staged = g.empty({it, th, tw, ic});
+        g.upload_staged(staged, pixels.data(), g.stream);
+        auto decoded = vae(g, w, staged, encode);
+        auto &slot = slots[k % 2];
+        require(decoded.element_bytes == 4 && decoded.bytes() <= slot_bytes, "VAE tile slot size");
+        slot.shape = decoded.shape;
+        g.check(cuMemcpyDtoHAsync(slot.host, decoded.pointer, decoded.bytes(), g.stream),
+                "VAE tile download");
+        g.check(cuEventRecord(slot.ready, g.stream), "VAE tile ready");
+    };
+    std::vector<Tile> previous, row;
+    start(0);
+    for (size_t k = 0; k < order.size(); k++) {
+        g.poll();
+        if (k + 1 < order.size())
+            start(k + 1);
+        auto [y, x, oy, ox] = order[k];
+        (void)y;
+        if (x == 0 && k) {
+            previous = std::move(row);
+            row.clear();
+        }
+        auto &slot = slots[k % 2];
+        g.check(cuEventSynchronize(slot.ready), "VAE tile wait");
+        auto &sh = slot.shape;
+        Tile current{std::vector<float>(slot.host, slot.host + product(sh)), sh[0], sh[1], sh[2], sh[3]};
+        for (float v : current.data)
+            require(std::isfinite(v), "nonfinite inference tensor");
+        require(current.t == ot && current.c == oc, "VAE tile output shape mismatch");
+        size_t col = row.size();
+        if (!previous.empty()) {
+            const auto &above = previous.at(col);
+            int extent = std::min({blend, current.h, above.h});
+            require(above.w == current.w, "VAE vertical tile width mismatch");
+            for (int f = 0; f < ot; f++)
+                for (int yy = 0; yy < extent; yy++)
+                    for (int xx = 0; xx < current.w; xx++)
+                        for (int c = 0; c < oc; c++) {
+                            auto at = current.at(f, yy, xx, c);
+                            float mix = float(yy) / extent;
+                            current.data[at] =
+                                above.data[above.at(f, above.h - extent + yy, xx, c)] * (1.f - mix) +
+                                current.data[at] * mix;
+                        }
+        }
+        if (!row.empty()) {
+            const auto &left = row.back();
+            int extent = std::min({blend, current.w, left.w});
+            require(left.h == current.h, "VAE horizontal tile height mismatch");
+            for (int f = 0; f < ot; f++)
+                for (int yy = 0; yy < current.h; yy++)
+                    for (int xx = 0; xx < extent; xx++)
+                        for (int c = 0; c < oc; c++) {
+                            auto at = current.at(f, yy, xx, c);
+                            float mix = float(xx) / extent;
+                            current.data[at] =
+                                left.data[left.at(f, yy, left.w - extent + xx, c)] * (1.f - mix) +
+                                current.data[at] * mix;
+                        }
+        }
+        int ch = std::min(keep, current.h), cw = std::min(keep, current.w);
+        require(oy + ch <= oh && ox + cw <= ow, "VAE tile bounds");
+        for (int f = 0; f < ot; f++)
+            for (int yy = 0; yy < ch; yy++)
+                std::copy_n(current.data.data() + current.at(f, yy, 0, 0), cw * oc,
+                            output.data() + ((size_t(f) * oh + oy + yy) * ow + ox) * oc);
+        row.push_back(std::move(current));
+    }
+    (void)row_start;
+#else
     std::vector<Tile> previous;
     for (int y = 0, oy = 0; y < ih; y += stride, oy += keep) {
         std::vector<Tile> row;
@@ -146,6 +260,7 @@ Tensor vae_tiled(Gpu &g, Weights &w, const Tensor &input, bool encode) {
         }
         previous = std::move(row);
     }
+#endif
     return g.upload(output, {ot, oh, ow, oc});
 }
 } // namespace hv15n

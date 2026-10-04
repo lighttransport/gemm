@@ -228,3 +228,17 @@ reserved for independent teacher-error evaluation after model selection.
 must improve on the test baseline to be marked reviewable. The active rig is
 never replaced. This training workflow needs real reviewed clips and has not
 been validated by the kernel/component tests.
+
+## Optional cuDNN attention
+
+Joint DiT attention can use cuDNN 9 fused SDPA (FP16) through the bridge shared with
+MiniMax H3. The default build and runtime do not need cuDNN:
+
+```sh
+make -C cuda/minimax_h3 cudnn-deps
+make -C cuda/hunyuan_video15_native cudnn CUDNN_INCLUDE=/path/to/cudnn9/include
+tmp/hv15-native/build/hv15n ... --cudnn-attention auto [--cudnn-library /path/to/libcudnn.so.9]
+```
+
+`auto` falls back to FlashAttention-2 with a warning if cuDNN is unavailable. An
+explicit bridge path must load. The C API is `hv15n_set_cudnn_attention()`.

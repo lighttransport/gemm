@@ -6,12 +6,15 @@
 #else
 #include "../cublasew.h"
 #include "../cuew.h"
+#include "../minimax_h3/cudnn_bridge.h"
+#include <dlfcn.h>
 #endif
 #include "host.hpp"
 #include <atomic>
 #include <array>
 #include <chrono>
 #include <functional>
+#include <thread>
 namespace hv15n {
 struct Gpu;
 struct Allocation {
@@ -42,12 +45,32 @@ struct Gpu {
   std::vector<Staging> staging;
   size_t pinned_bytes = 0;
   std::map<int, CUevent> staged_blocks;
+#ifndef HV15N_ROCM
+  // Block prefetch worker: copies mmap -> pinned (4 threads) and uploads on copy_stream
+  // while the main thread keeps enqueueing compute.
+  std::thread prefetch_worker;
+  int prefetch_worker_index = -1;
+  std::exception_ptr prefetch_error;
+  std::array<void *, 4> prefetch_host{};
+  std::array<CUevent, 4> prefetch_free{};
+  void join_prefetch();
+  // Optional cuDNN SDPA (opt-in) for the packed FP16 DiT attention.
+  std::unique_ptr<void, int (*)(void *)> cudnn_library{nullptr, dlclose};
+  h3_cudnn_workspace_fn cudnn_workspace = nullptr;
+  h3_cudnn_attention_fn cudnn_attention = nullptr;
+  uint64_t cudnn_calls = 0;
+  std::string cudnn_info;
+  void use_cudnn(const std::string &bridge, const char *cudnn_path);
+  void disable_cudnn();
+#endif
   uint64_t prefetch_bytes = 0;
   CUmodule ops = nullptr, mma = nullptr, flash = nullptr;
   cublasew_context *blas = nullptr;
   size_t allocated = 0, peak = 0, budget;
   uint64_t repo_gemm = 0, blas_gemm = 0, fallback_gemm = 0, attention_calls = 0;
   bool vendor, fallback;
+  // Debug/parity only (HV15N_DEBUG_UNFUSED=1): run the original unfused DiT chain.
+  bool unfused_dit = std::getenv("HV15N_DEBUG_UNFUSED") != nullptr;
   bool optimized;
   std::multimap<size_t, CUdeviceptr> free_buffers;
   std::map<std::string, Tensor> packed_weights;
@@ -118,6 +141,20 @@ struct Gpu {
   Tensor modulate(const Tensor &input, const Tensor &modulation, int start);
   Tensor gated(const Tensor &input, const Tensor &delta, const Tensor &modulation, int start);
   Tensor activate(Tensor input, int mode);
+#ifndef HV15N_ROCM
+  // Fused DiT helpers (bit-identical to the unfused chains; see gpu.cpp).
+  Tensor modulate_half(const Tensor &input, const Tensor &modulation, int start);
+  Tensor linear_raw(Weights &weights, const std::string &prefix, const Tensor &input16);
+  Tensor gated_bias(const Tensor &input, const Tensor &raw, const Tensor &bias,
+                    const Tensor &modulation, int start);
+  Tensor bias_gelu_half(const Tensor &raw, const Tensor &bias);
+  void qkv_heads_into(std::array<Tensor, 3> &qkv, Weights &weights, const std::string &prefix,
+                      const Tensor &raw, const Tensor &bias, int height, int width, bool image,
+                      int row0);
+  Tensor flash_half(const Tensor &q, const Tensor &k, const Tensor &v, int rows, int heads,
+                    int dim);
+  Tensor unpack_rows_half(const Tensor &packed, int row0, int count);
+#endif
   std::array<Tensor, 3> qkv_heads(Weights &weights, const std::string &prefix,
                                 const Tensor &qkv, int height, int width, bool image);
   Tensor bare_norm(const Tensor &input, int mode = 0, float eps = 1.e-6f);

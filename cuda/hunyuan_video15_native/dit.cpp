@@ -94,6 +94,42 @@ std::pair<Tensor, Tensor> dit_block(Gpu &g, Weights &w, int index, Tensor img, T
     auto active = g.op(vec, 3);
     auto im = g.linear(w, p + ".img_mod.linear", active),
          tm = g.linear(w, p + ".txt_mod.linear", active);
+#ifndef HV15N_ROCM
+    if (g.optimized && !g.vendor && !g.unfused_dit) {
+      // Fused path: FP16 GEMM inputs written by their producers, biases folded into
+      // consumers, q/k/v written straight into the joint attention layout.
+      auto bias = [&](const std::string &name) { return g.weight(w, p + name + ".bias"); };
+      const int ir = img.rows(), tr = txt.rows(), total = ir + tr;
+      std::array<Tensor, 3> qkv{g.empty_half({16, total, 128}), g.empty_half({16, total, 128}),
+                                g.empty_half({16, total, 128})};
+      {
+        auto raw = g.linear_raw(w, p + ".img_attn_qkv", g.modulate_half(img, im, 0));
+        g.qkv_heads_into(qkv, w, p + ".img_attn", raw, bias(".img_attn_qkv"), height, width, true, 0);
+      }
+      {
+        auto raw = g.linear_raw(w, p + ".txt_attn_qkv", g.modulate_half(txt, tm, 0));
+        g.qkv_heads_into(qkv, w, p + ".txt_attn", raw, bias(".txt_attn_qkv"), height, width, false, ir);
+      }
+      auto attention = g.flash_half(qkv[0], qkv[1], qkv[2], total, 16, 128);
+      qkv = {};
+      auto img_delta = g.linear_raw(w, p + ".img_attn_proj", g.unpack_rows_half(attention, 0, ir));
+      auto txt_delta = g.linear_raw(w, p + ".txt_attn_proj", g.unpack_rows_half(attention, ir, tr));
+      attention = {};
+      auto stream = [&](Tensor x, const Tensor &delta, const Tensor &mod, const char *name) {
+        std::string q = p + "." + name;
+        x = g.gated_bias(x, delta, bias(std::string(".") + name + "_attn_proj"), mod, 4096);
+        auto hidden = g.bias_gelu_half(g.linear_raw(w, q + "_mlp.fc1", g.modulate_half(x, mod, 6144)),
+                                       g.weight(w, q + "_mlp.fc1.bias"));
+        auto out = g.linear_raw(w, q + "_mlp.fc2", hidden);
+        hidden = {};
+        return g.gated_bias(x, out, g.weight(w, q + "_mlp.fc2.bias"), mod, 10240);
+      };
+      img = stream(std::move(img), img_delta, im, "img");
+      img_delta = {};
+      txt = stream(std::move(txt), txt_delta, tm, "txt");
+      return {img, txt};
+    }
+#endif
     auto iqkv = g.linear(w, p + ".img_attn_qkv", modulate(g, img, im, 0)),
          tqkv = g.linear(w, p + ".txt_attn_qkv", modulate(g, txt, tm, 0));
     Tensor q,k,v;

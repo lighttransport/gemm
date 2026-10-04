@@ -54,6 +54,7 @@ void Gpu::trim_pool() {
   free_buffers.clear();
 }
 void Gpu::clear_weights() {
+  join_prefetch();
   if (copy_stream) {
     auto status=cuStreamSynchronize(copy_stream);
     if (deferred_error==CUDA_SUCCESS) deferred_error=status;
@@ -102,10 +103,41 @@ void Gpu::upload_staged(const Tensor &destination, const void *source, CUstream 
   check(cuEventRecord(slot->ready,target), "staging completion");
   upload_bytes+=destination.bytes();
 }
+static void parallel_copy(void *dst, const unsigned char *src, size_t bytes) {
+  // mmap page faults make a single-threaded copy the bottleneck.
+  constexpr int workers = 4;
+  const size_t part = (bytes / workers + 4095) & ~size_t(4095);
+  std::array<std::thread, workers - 1> helpers;
+  for (int i = 1; i < workers; i++) {
+    size_t begin = std::min(bytes, part * i), end = std::min(bytes, part * (i + 1));
+    helpers[i - 1] = std::thread([=]() {
+      std::memcpy(static_cast<unsigned char *>(dst) + begin, src + begin, end - begin);
+    });
+  }
+  std::memcpy(dst, src, std::min(bytes, part));
+  for (auto &t : helpers) t.join();
+}
+void Gpu::join_prefetch() {
+  if (prefetch_worker.joinable()) prefetch_worker.join();
+  prefetch_worker_index = -1;
+  if (prefetch_error) {
+    auto error = prefetch_error;
+    prefetch_error = nullptr;
+    std::rethrow_exception(error);
+  }
+}
 void Gpu::prefetch_block(Weights &w, int index) {
   if (!optimized || vendor || index<0 || index>=54) return;
   if (active_weight_file!=w.identity) { clear_weights(); active_weight_file=w.identity; }
   if (staged_blocks.count(index)) return;
+  join_prefetch();
+  static constexpr size_t chunk = 64ull << 20;
+  if (!prefetch_host[0])
+    for (size_t i = 0; i < prefetch_host.size(); i++) {
+      check(cuMemHostAlloc(&prefetch_host[i], chunk, 0), "prefetch staging");
+      check(cuEventCreate(&prefetch_free[i], CU_EVENT_DISABLE_TIMING), "prefetch staging event");
+      check(cuEventRecord(prefetch_free[i], copy_stream), "prefetch staging");
+    }
   // A pooled destination may still have consumers in the compute stream.
   CUevent safe=nullptr;
   check(cuEventCreate(&safe,CU_EVENT_DISABLE_TIMING), "transfer safety event");
@@ -113,22 +145,47 @@ void Gpu::prefetch_block(Weights &w, int index) {
   check(cuStreamWaitEvent(copy_stream,safe,0), "wait for prior buffer consumers");
   cuEventDestroy(safe);
   std::string prefix="double_blocks."+std::to_string(index)+".";
+  std::vector<std::tuple<const unsigned char *, CUdeviceptr, size_t>> jobs;
   for(int i=0;i<w.context->n_tensors;i++) {
     std::string name=w.context->tensors[i].name;
     if (name.compare(0,prefix.size(),prefix)!=0 || w.dtype(name)!="F16") continue;
     std::string key=w.identity+":f16:"+name;
     if (packed_weights.count(key)) continue;
     auto destination=empty_half(w.shape(name));
-    upload_staged(destination,w.data(name),copy_stream);
+    jobs.emplace_back(static_cast<const unsigned char *>(w.data(name)), destination.pointer,
+                      destination.bytes());
     prefetch_bytes+=destination.bytes(); cached_weight_bytes+=destination.bytes();
+    upload_bytes+=destination.bytes();
     packed_weights.emplace(key,destination);
   }
   CUevent done=nullptr;
   check(cuEventCreate(&done,CU_EVENT_DISABLE_TIMING), "block transfer event");
-  check(cuEventRecord(done,copy_stream), "block transfer completion");
   staged_blocks.emplace(index,done);
+  prefetch_worker_index = index;
+  prefetch_worker = std::thread([this, jobs, done]() {
+    try {
+      auto ok = [](CUresult r, const char *what) {
+        if (r != CUDA_SUCCESS) throw std::runtime_error(std::string("block prefetch: ") + what);
+      };
+      ok(cuCtxSetCurrent(context), "context");
+      size_t slot = 0;
+      for (auto &[source, destination, bytes] : jobs)
+        for (size_t offset = 0; offset < bytes; offset += chunk) {
+          size_t count = std::min(chunk, bytes - offset);
+          ok(cuEventSynchronize(prefetch_free[slot]), "staging wait");
+          parallel_copy(prefetch_host[slot], source + offset, count);
+          ok(cuMemcpyHtoDAsync(destination + offset, prefetch_host[slot], count, copy_stream), "upload");
+          ok(cuEventRecord(prefetch_free[slot], copy_stream), "staging record");
+          slot = (slot + 1) % prefetch_host.size();
+        }
+      ok(cuEventRecord(done, copy_stream), "block transfer completion");
+    } catch (...) {
+      prefetch_error = std::current_exception();
+    }
+  });
 }
 void Gpu::wait_block(int index) {
+  if (prefetch_worker_index == index) join_prefetch();
   auto it=staged_blocks.find(index);
   if (it!=staged_blocks.end()) check(cuStreamWaitEvent(stream,it->second,0), "wait for block weights");
 }
@@ -187,6 +244,52 @@ std::string Gpu::mma_source() {
   v7.replace(guard, std::string("if (cta_m >= M) return;").size(), "if (cta_m >= M || cta_n >= N) return;");
   return source + large_gemm_source + v7 + implicit_conv_source(k_gemm_f16_v7_src);
 }
+// Fused DiT epilogues/prologues. Each reproduces the expressions of the kernel chain
+// it replaces (modulate_norm + convert_half, element bias + gate_add, element bias +
+// GELU + convert_half, element bias + qkv_heads + concat_heads, unpack + convert_half),
+// so results are bit-identical while skipping FP32 round trips.
+static const char *fused_dit_source = R"CUDA(
+extern "C" {
+__global__ void modulate_norm_half(half*y,const float*x,const float*mod,int rows,int c,int start) {
+    int row=blockIdx.x,tid=threadIdx.x;__shared__ float sum[256],sq[256];float a=0.f,b=0.f;
+    for(int j=tid;j<c;j+=256){float v=x[row*c+j];a+=v;b+=v*v;}
+    sum[tid]=a;sq[tid]=b;__syncthreads();
+    for(int d=128;d;d>>=1){if(tid<d){sum[tid]+=sum[tid+d];sq[tid]+=sq[tid+d];}__syncthreads();}
+    float mean=sum[0]/c,inverse=rsqrtf(fmaxf(sq[0]/c-mean*mean,0.f)+1.e-6f);
+    for(int j=tid;j<c;j+=256){float v=(x[row*c+j]-mean)*inverse*(1.f+mod[start+c+j])+mod[start+j];y[row*c+j]=__float2half(v);}
+}
+__global__ void gate_add_bias(float*y,const float*x,const float*z,const float*bias,const float*mod,int count,int c,int start) {
+    int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=count)return;
+    float t=z[i];t+=bias[i%c];y[i]=x[i]+t*mod[start+i%c];
+}
+__global__ void bias_gelu_half(half*y,const float*x,const float*b,int count,int c) {
+    int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=count)return;
+    float v=x[i];v+=b[i%c];v=0.5f*v*(1.f+tanhf(0.7978845608f*(v+0.044715f*v*v*v)));y[i]=__float2half(v);
+}
+__global__ void qkv_heads_bias(half*q,half*k,half*v,const float*packed,const float*bias,const float*qw,const float*kw,
+                               int rows,int height,int width,int image,int total,int row0) {
+    int row=blockIdx.x,head=blockIdx.y,d=threadIdx.x;__shared__ float qa[128],ka[128],qs[128],ks[128];
+    int base=row*6144+head*128,col=head*128+d;
+    float a=packed[base+d],b=packed[base+2048+d],vv=packed[base+4096+d];
+    a+=bias[col];b+=bias[2048+col];vv+=bias[4096+col];
+    qs[d]=a*a;ks[d]=b*b;__syncthreads();
+    for(int s=64;s;s>>=1){if(d<s){qs[d]+=qs[d+s];ks[d]+=ks[d+s];}__syncthreads();}
+    qa[d]=a*rsqrtf(qs[0]/128.f+1.e-6f)*qw[d];ka[d]=b*rsqrtf(ks[0]/128.f+1.e-6f)*kw[d];__syncthreads();
+    if(image){int first=d&~1,axis=first<16?0:first<72?1:2,axisdim=axis==0?16:56;
+        int frequency=(first-(axis==0?0:axis==1?16:72))/2;
+        int position=axis==0?row/(height*width):axis==1?(row/width)%height:row%width;
+        float angle=position*powf(256.f,-2.f*frequency/axisdim),c=cosf(angle),s=sinf(angle);
+        a=(d&1)?qa[d]*c+qa[d-1]*s:qa[d]*c-qa[d+1]*s;
+        b=(d&1)?ka[d]*c+ka[d-1]*s:ka[d]*c-ka[d+1]*s;
+    }else{a=qa[d];b=ka[d];}
+    long out=((long)head*total+row0+row)*128+d;q[out]=__float2half(a);k[out]=__float2half(b);v[out]=__float2half(vv);
+}
+__global__ void unpack_rows_half(half*y,const half*x,int total,int row0,int count,int heads,int dim) {
+    long i=(long)blockIdx.x*blockDim.x+threadIdx.x;if(i>=(long)count*heads*dim)return;
+    int d=i%dim,h=(i/dim)%heads;long r=i/((long)dim*heads);y[i]=x[((long)h*total+row0+r)*dim+d];
+}
+}
+)CUDA";
 Gpu::Gpu(int device, int budget_mib, bool use_vendor, bool allow_fallback, bool use_optimized)
     : budget(size_t(budget_mib - 3072) * 1024 * 1024), vendor(use_vendor),
       fallback(allow_fallback), optimized(use_optimized) {
@@ -209,7 +312,7 @@ Gpu::Gpu(int device, int budget_mib, bool use_vendor, bool allow_fallback, bool 
     check(cuStreamCreate(&copy_stream, CU_STREAM_NON_BLOCKING), "create transfer stream");
     (void)k_fa2_attn_fp8_src;
     (void)k_fa2_ref_src;
-    auto ptx = compile(ops_source);
+    auto ptx = compile(std::string(ops_source) + fused_dit_source);
     check(cuModuleLoadData(&ops, ptx.c_str()), "load operators");
     ptx = compile(mma_source());
     check(cuModuleLoadData(&mma, ptx.c_str()), "load repository GEMM");
@@ -237,7 +340,13 @@ Gpu::Gpu(int device, int budget_mib, bool use_vendor, bool allow_fallback, bool 
   }
 }
 Gpu::~Gpu() {
+  if (prefetch_worker.joinable()) prefetch_worker.join();
+  prefetch_error = nullptr;
   if (copy_stream) cuStreamSynchronize(copy_stream);
+  for (size_t i = 0; i < prefetch_host.size(); i++) {
+    if (prefetch_free[i]) cuEventDestroy(prefetch_free[i]);
+    if (prefetch_host[i]) cuMemFreeHost(prefetch_host[i]);
+  }
   if (stream) cuStreamSynchronize(stream);
   for (const auto &entry : staging) { cuEventDestroy(entry.ready); cuMemFreeHost(entry.data); }
   clear_weights();
@@ -514,6 +623,106 @@ Tensor Gpu::gated(const Tensor &x, const Tensor &delta, const Tensor &mod, int s
   require(x.count()==delta.count() && start>=0 && size_t(start+x.channels())<=mod.count(), "gate bounds");
   auto y = empty(x.shape);
   launch("gate_add", int((x.count()+255)/256),1,1,256,1,0,y.pointer,x.pointer,delta.pointer,mod.pointer,int(x.count()),x.channels(),start);
+  return y;
+}
+Tensor Gpu::modulate_half(const Tensor &x, const Tensor &mod, int start) {
+  require(start >= 0 && size_t(start+2*x.channels()) <= mod.count(), "modulation bounds");
+  auto y = empty_half(x.shape);
+  launch("modulate_norm_half", x.rows(),1,1,256,1,0,y.pointer,x.pointer,mod.pointer,x.rows(),x.channels(),start);
+  return y;
+}
+Tensor Gpu::linear_raw(Weights &w, const std::string &prefix, const Tensor &x16) {
+  require(x16.element_bytes == 2, "raw linear expects FP16 input");
+  return matmul(x16, weight_half(w, prefix + ".weight"));
+}
+Tensor Gpu::gated_bias(const Tensor &x, const Tensor &raw, const Tensor &bias, const Tensor &mod, int start) {
+  require(x.count()==raw.count() && bias.count()==size_t(x.channels()) && start>=0 &&
+          size_t(start+x.channels())<=mod.count(), "gate bounds");
+  auto y = empty(x.shape);
+  launch("gate_add_bias", int((x.count()+255)/256),1,1,256,1,0,y.pointer,x.pointer,raw.pointer,bias.pointer,
+         mod.pointer,int(x.count()),x.channels(),start);
+  return y;
+}
+Tensor Gpu::bias_gelu_half(const Tensor &raw, const Tensor &bias) {
+  require(bias.count()==size_t(raw.channels()), "bias shape");
+  auto y = empty_half(raw.shape);
+  launch("bias_gelu_half", int((raw.count()+255)/256),1,1,256,1,0,y.pointer,raw.pointer,bias.pointer,
+         int(raw.count()),raw.channels());
+  return y;
+}
+void Gpu::qkv_heads_into(std::array<Tensor,3> &qkv, Weights &w, const std::string &prefix, const Tensor &raw,
+                         const Tensor &bias, int height, int width, bool image, int row0) {
+  require(raw.channels()==6144 && bias.count()==6144, "joint QKV shape");
+  auto qw = weight(w,prefix+"_q_norm.weight"), kw = weight(w,prefix+"_k_norm.weight");
+  int total = qkv[0].shape[1];
+  launch("qkv_heads_bias",raw.rows(),16,1,128,1,0,qkv[0].pointer,qkv[1].pointer,qkv[2].pointer,
+         raw.pointer,bias.pointer,qw.pointer,kw.pointer,raw.rows(),height,width,int(image),total,row0);
+}
+Tensor Gpu::flash_half(const Tensor &q, const Tensor &k, const Tensor &v, int rows, int heads, int dim) {
+  require(dim == 128 && !vendor, "packed FP16 attention geometry");
+  if (!flash) {
+    auto ptx = compile(std::string("#define FA2_D 128\n#define FA2_BR 64\n#define FA2_BC 16\n#define FA2_CAUSAL 0\n") + k_fa2_attn_src);
+    check(cuModuleLoadData(&flash, ptx.c_str()), "load private FlashAttention");
+  }
+  auto out = empty_half({heads, rows, dim});
+  float scale = 1.f / std::sqrt(float(dim));
+  if (cudnn_attention) {
+    char error[512] = {};
+    long long bytes = cudnn_workspace(rows, heads, dim, 1, error, sizeof(error));
+    require(bytes >= 0, error);
+    Tensor workspace;
+    if (bytes > 0) workspace = empty_half({int((bytes + 511) / 512), 256});
+    poll();
+    int status = cudnn_attention(reinterpret_cast<void *>(out.pointer), reinterpret_cast<void *>(q.pointer),
+                                 reinterpret_cast<void *>(k.pointer), reinterpret_cast<void *>(v.pointer),
+                                 rows, heads, dim, 1, scale, reinterpret_cast<void *>(workspace.pointer),
+                                 stream, error, sizeof(error));
+    require(status == 0, error);
+    attention_calls++;
+    cudnn_calls++;
+    return out;
+  }
+  CUfunction fn;
+  check(cuModuleGetFunction(&fn, flash, "fa2_attn"), "FlashAttention lookup");
+  CUdeviceptr o = out.pointer, pq = q.pointer, pk = k.pointer, pv = v.pointer;
+  void *params[] = {&o, &pq, &pk, &pv, &rows, &dim, &scale};
+  poll();
+  check(cuLaunchKernel(fn, (rows + 63) / 64, heads, 1, 128, 1, 1,
+                       4 * 16 * (128 + 8) * 2, stream, params, nullptr), "FlashAttention");
+  attention_calls++;
+  flash_calls++;
+  return out;
+}
+void Gpu::disable_cudnn() {
+  cudnn_workspace = nullptr;
+  cudnn_attention = nullptr;
+  cudnn_info.clear();
+}
+void Gpu::use_cudnn(const std::string &bridge, const char *cudnn_path) {
+  if (cudnn_attention) return;
+  std::unique_ptr<void, int (*)(void *)> library(dlopen(bridge.c_str(), RTLD_NOW | RTLD_LOCAL), dlclose);
+  if (!library) {
+    const char *error = dlerror();
+    throw std::runtime_error("cannot load cuDNN bridge " + bridge + ": " + (error ? error : "unknown error"));
+  }
+  auto abi = reinterpret_cast<h3_cudnn_abi_fn>(dlsym(library.get(), "h3_cudnn_bridge_abi"));
+  auto init = reinterpret_cast<h3_cudnn_init_fn>(dlsym(library.get(), "h3_cudnn_init"));
+  auto workspace = reinterpret_cast<h3_cudnn_workspace_fn>(dlsym(library.get(), "h3_cudnn_workspace"));
+  auto attention = reinterpret_cast<h3_cudnn_attention_fn>(dlsym(library.get(), "h3_cudnn_attention"));
+  require(abi && abi() == 2 && init && workspace && attention, "unsupported cuDNN bridge ABI");
+  char info[1024] = {};
+  check(cuCtxSetCurrent(context), "activate context");
+  if (init(cudnn_path, info, sizeof(info)) != 0)
+    throw std::runtime_error(std::string("cuDNN unavailable: ") + info);
+  cudnn_library = std::move(library);
+  cudnn_workspace = workspace;
+  cudnn_attention = attention;
+  cudnn_info = info;
+}
+Tensor Gpu::unpack_rows_half(const Tensor &packed, int row0, int count) {
+  int heads = packed.shape[0], total = packed.shape[1], dim = packed.shape[2];
+  auto y = empty_half({count, heads * dim});
+  launch("unpack_rows_half", int((y.count()+255)/256),1,1,256,1,0,y.pointer,packed.pointer,total,row0,count,heads,dim);
   return y;
 }
 Tensor Gpu::activate(Tensor x, int mode) {
@@ -827,6 +1036,7 @@ std::string Gpu::metrics() const {
     << ",\"buffer_reuses\":" << buffer_reuses
     << ",\"weight_cache_hits\":" << weight_hits
     << ",\"upload_bytes\":" << upload_bytes
+    << ",\"cudnn_attention_calls\":" << cudnn_calls
     << ",\"flash_calls\":" << flash_calls
     << ",\"gemm_v7_calls\":" << gemm_v7_calls
     << ",\"ieee_tiled_calls\":" << ieee_tiled_calls

@@ -108,7 +108,7 @@ struct Engine {
                 reinterpret_cast<h3_cudnn_workspace_fn>(dlsym(library.get(), "h3_cudnn_workspace"));
             auto attention =
                 reinterpret_cast<h3_cudnn_attention_fn>(dlsym(library.get(), "h3_cudnn_attention"));
-            require(abi && abi() == 1 && init && workspace && attention,
+            require(abi && abi() == 2 && init && workspace && attention,
                     "unsupported cuDNN bridge ABI");
             char info[1024] = {};
             g.check(cuCtxSetCurrent(g.context), "activate H3 context");
@@ -752,7 +752,7 @@ struct Engine {
         g.attention_calls++;
         if (cudnn_attention && kind == 1 && dim == 128) {
             char error[512] = {};
-            long long bytes = cudnn_workspace(rows, heads, dim, error, sizeof(error));
+            long long bytes = cudnn_workspace(rows, heads, dim, 0, error, sizeof(error));
             require(bytes >= 0, error);
             Tensor workspace;
             if (bytes > 0)
@@ -761,7 +761,7 @@ struct Engine {
             int status = cudnn_attention(reinterpret_cast<void *>(packed.pointer),
                                          reinterpret_cast<void *>(pq.pointer),
                                          reinterpret_cast<void *>(pk.pointer),
-                                         reinterpret_cast<void *>(pv.pointer), rows, heads, dim,
+                                         reinterpret_cast<void *>(pv.pointer), rows, heads, dim, 0,
                                          1.f / std::sqrt(float(dim)),
                                          reinterpret_cast<void *>(workspace.pointer), g.stream,
                                          error, sizeof(error));

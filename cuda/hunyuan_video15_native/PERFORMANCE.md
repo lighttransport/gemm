@@ -1,5 +1,42 @@
 # Native and PyTorch performance comparison
 
+## Profile-driven optimization (2026-10-05)
+
+Fast12 I2V, 480×848, 81 frames, RTX 5060 Ti 16 GB. The run uses the same portrait,
+prompt and seed 42 as below and repository GEMM only. Wall times are from the
+runner process; stage splits come from its progress timestamps.
+
+| Build | Total | Encoders | DiT (12 steps) | VAE |
+|---|---:|---:|---:|---:|
+| Before (bounded-replay build) | 392.2 s | ~8 s | 304 s | 68 s |
+| Fused DiT + threaded block prefetch + pipelined VAE tiles | **352.7 s** | 8 s | 285 s | 60 s |
+| … + opt-in cuDNN attention (`--cudnn-attention`) | **335.5 s** | 7 s | 267 s | 61 s |
+
+The earlier PyTorch reference completes the same Fast12 video in 724.8 s (below).
+
+Nsight Systems attribution, before → after (one run):
+
+- **DiT idle:** 17.3 s → 0.5 s. `prefetch_block` copied each ~300 MB block from the
+  mmap on the main thread, so the GPU drained its queue every block. A worker thread
+  now copies with 4 threads into 4 pinned 64 MiB slots and uploads on the copy
+  stream.
+- **DiT elementwise:** ~27 s → ~12 s. Bias adds fold into the qkv-head prep, the
+  residual gate and an FC1 bias+GELU kernel. Modulation, GELU and attention unpacking
+  write the FP16 GEMM inputs directly. q/k/v are written straight into the joint
+  attention layout, removing `concat_heads`.
+- **VAE idle:** per-tile synchronous upload, download and host blending are pipelined.
+  Tile k+1 is enqueued before tile k is downloaded (pinned, async) and blended.
+- **Unchanged:** attention (~205 s, 31–32 TFLOPS FP16) and repository GEMM (~73 s,
+  ~31 TFLOPS) dominate. Opt-in cuDNN SDPA brings DiT 285 → 267 s.
+
+Numerics:
+
+- The fused, prefetching and pipelined build reproduces all 20 run captures and all
+  81 frames bit-for-bit (`HV15N_DEBUG_UNFUSED=1` keeps the unfused DiT chain for parity
+  checks).
+- cuDNN attention differs only in rounding: frame relative L2 0.0008, PSNR 67.3 dB
+  against FlashAttention-2.
+
 Measured on 2026-10-03 (JST), NVIDIA RTX 5060 Ti 16 GB, driver 615.71.09,
 PyTorch 2.14.0+cu130. Both paths use the same pinned weights, portrait, input
 noise, prompt and 480×848, 81-frame I2V recipe. Native uses repository GEMM

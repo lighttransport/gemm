@@ -51,6 +51,8 @@ int main(int argc, char **argv) {
             "--gemm",   "--gemm-fallback", "--offload",    "--out-dir"
 #ifdef HV15N_ROCM
             , "--aotriton-bridge"
+#else
+            , "--cudnn-attention", "--cudnn-library"
 #endif
         };
         for (int i = 1; i < argc; i++) {
@@ -67,6 +69,7 @@ int main(int argc, char **argv) {
                              "--aotriton-bridge LIB (optional standalone FP16 attention)\n"
 #else
                              "--gemm repo|cublas --gemm-fallback cublas|error --allow-experimental\n"
+                             "--cudnn-attention off|auto|libh3_cudnn.so --cudnn-library libcudnn.so.9\n"
 #endif
                              "--validate: request only; --compile-kernels: runtime compiler only\n";
                 return 0;
@@ -148,6 +151,16 @@ int main(int argc, char **argv) {
         if (options.count("--aotriton-bridge"))
             require(hv15n_set_aotriton_bridge(ctx.get(), options["--aotriton-bridge"].c_str(),
                                              error, sizeof(error)) == 0, error);
+#else
+        require(!options.count("--cudnn-library") || options.count("--cudnn-attention"),
+                "--cudnn-library requires --cudnn-attention");
+        if (options.count("--cudnn-attention")) {
+            int status = hv15n_set_cudnn_attention(
+                ctx.get(), options["--cudnn-attention"].c_str(),
+                options.count("--cudnn-library") ? options["--cudnn-library"].c_str() : nullptr,
+                error, sizeof(error));
+            require(status == 0, std::string(error));
+        }
 #endif
         hv15n_callbacks callbacks{progress, frame, cancelled, &out};
         int rc = hv15n_generate(ctx.get(), &request, &callbacks, error, sizeof(error));

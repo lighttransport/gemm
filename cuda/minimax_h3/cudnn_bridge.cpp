@@ -22,7 +22,7 @@ namespace fe = cudnn_frontend;
 namespace {
 std::mutex lock;
 cudnnHandle_t handle = nullptr;
-std::map<std::tuple<int, int, int>, std::shared_ptr<fe::graph::Graph>> graphs;
+std::map<std::tuple<int, int, int, int>, std::shared_ptr<fe::graph::Graph>> graphs;
 std::string loaded;
 
 int fail(char *error, size_t capacity, const std::string &text) {
@@ -54,7 +54,7 @@ std::vector<std::string> candidates(const char *library) {
 } // namespace
 
 extern "C" {
-int h3_cudnn_bridge_abi(void) { return 1; }
+int h3_cudnn_bridge_abi(void) { return 2; }
 
 int h3_cudnn_init(const char *library, char *info, size_t capacity) {
     std::lock_guard<std::mutex> guard(lock);
@@ -98,13 +98,14 @@ int h3_cudnn_init(const char *library, char *info, size_t capacity) {
     return fail(info, capacity, "cuDNN 9 not found; tried:" + tried);
 }
 
-static std::shared_ptr<fe::graph::Graph> build(int rows, int heads, int dim, std::string &error) {
-    auto key = std::make_tuple(rows, heads, dim);
+static std::shared_ptr<fe::graph::Graph> build(int rows, int heads, int dim, int fp16,
+                                                std::string &error) {
+    auto key = std::make_tuple(rows, heads, dim, fp16);
     auto it = graphs.find(key);
     if (it != graphs.end())
         return it->second;
     auto g = std::make_shared<fe::graph::Graph>();
-    g->set_io_data_type(fe::DataType_t::BFLOAT16)
+    g->set_io_data_type(fp16 ? fe::DataType_t::HALF : fe::DataType_t::BFLOAT16)
         .set_intermediate_data_type(fe::DataType_t::FLOAT)
         .set_compute_data_type(fe::DataType_t::FLOAT);
     const int64_t s = rows, h = heads, d = dim;
@@ -134,12 +135,13 @@ static std::shared_ptr<fe::graph::Graph> build(int rows, int heads, int dim, std
     return g;
 }
 
-long long h3_cudnn_workspace(int rows, int heads, int dim, char *error, size_t capacity) {
+long long h3_cudnn_workspace(int rows, int heads, int dim, int fp16, char *error,
+                             size_t capacity) {
     std::lock_guard<std::mutex> guard(lock);
     if (!handle)
         return fail(error, capacity, "cuDNN bridge is not initialized");
     std::string message;
-    auto g = build(rows, heads, dim, message);
+    auto g = build(rows, heads, dim, fp16, message);
     if (!g)
         return fail(error, capacity, message);
     int64_t bytes = 0;
@@ -149,7 +151,7 @@ long long h3_cudnn_workspace(int rows, int heads, int dim, char *error, size_t c
 }
 
 int h3_cudnn_attention(void *out, const void *q, const void *k, const void *v, int rows, int heads,
-                       int dim, float scale, void *workspace, void *stream, char *error,
+                       int dim, int fp16, float scale, void *workspace, void *stream, char *error,
                        size_t capacity) {
     std::lock_guard<std::mutex> guard(lock);
     if (!handle)
@@ -157,7 +159,7 @@ int h3_cudnn_attention(void *out, const void *q, const void *k, const void *v, i
     if (std::fabs(scale - 1.f / std::sqrt(float(dim))) > 1e-7f)
         return fail(error, capacity, "cuDNN bridge supports 1/sqrt(dim) scaling only");
     std::string message;
-    auto g = build(rows, heads, dim, message);
+    auto g = build(rows, heads, dim, fp16, message);
     if (!g)
         return fail(error, capacity, message);
     if (fe::detail::set_stream(handle, static_cast<cudaStream_t>(stream)) != CUDNN_STATUS_SUCCESS)

@@ -9,7 +9,7 @@ CFLAGS ?= -O2 -Wall -Wextra
 LDLIBS := -ldl -lm -lpcre2-8 -pthread
 SOURCES := gpu.cpp loader.cpp encoders.cpp dit.cpp vae.cpp hv15_native.cpp
 OBJECTS := $(addprefix $(BUILD)/,$(SOURCES:.cpp=.o)) $(BUILD)/cuew.o $(BUILD)/cublasew.o
-HEADERS := $(wildcard *.hpp) hv15_native.h ../cuew.h ../cublasew.h ../gemm/cuda_gemm_ptx_kernels.h ../fa2/cuda_fa2_kernels.h $(ROOT)/common/safetensors.h $(ROOT)/common/stb_image.h
+HEADERS := $(wildcard *.hpp) hv15_native.h ../minimax_h3/cudnn_bridge.h ../cuew.h ../cublasew.h ../gemm/cuda_gemm_ptx_kernels.h ../fa2/cuda_fa2_kernels.h $(ROOT)/common/safetensors.h $(ROOT)/common/stb_image.h
 .PHONY: all test compile-kernels clean
 all: $(BUILD)/hv15n $(BUILD)/libhv15n.so $(BUILD)/tokenizer_probe $(BUILD)/component_probe
 $(BUILD):
@@ -42,3 +42,13 @@ clean:
 
 $(BUILD)/replay_probe: replay_probe.cpp $(OBJECTS)
 	TMPDIR=$(abspath $(BUILD)) $(CXX) $(CXXFLAGS) $^ $(LDLIBS) -o $@
+
+# Optional cuDNN SDPA bridge shared with MiniMax H3 (opt-in: --cudnn-attention).
+CUDNN_FRONTEND_INCLUDE ?= $(ROOT)/tmp/video-cuda/h3-build/cudnn-deps/include
+CUDNN_INCLUDE ?= $(firstword $(wildcard /usr/include/x86_64-linux-gnu/cudnn_v9 /usr/local/cuda/include/cudnn9))
+.PHONY: cudnn
+cudnn: $(BUILD)/libh3_cudnn.so
+$(BUILD)/libh3_cudnn.so: ../minimax_h3/cudnn_bridge.cpp ../minimax_h3/cudnn_bridge.h | $(BUILD)
+	test -f "$(CUDNN_FRONTEND_INCLUDE)/cudnn_frontend.h" || { echo "run 'make -C cuda/minimax_h3 cudnn-deps' or set CUDNN_FRONTEND_INCLUDE"; exit 1; }
+	test -f "$(CUDNN_INCLUDE)/cudnn.h" || { echo "set CUDNN_INCLUDE to a cuDNN 9 include directory"; exit 1; }
+	$(CXX) -O2 -std=c++17 -shared -fPIC -I"$(CUDNN_FRONTEND_INCLUDE)" -I"$(CUDNN_INCLUDE)" -I/usr/local/cuda/include $< -ldl -o $@
