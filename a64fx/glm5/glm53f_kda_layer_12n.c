@@ -452,19 +452,19 @@ static void kda_worker(void *context) {
  * input); it runs the KDA worker with the fused output projection into
  * c->partial, and the KDA sublayer then only reduces. Eligibility is decided
  * by the caller with glm53f_kda_fusable_12n so every thread agrees. */
-int glm53f_kda_fusable_12n(const glm53f_kda_context_12n *c) {
-    return c && c->q2_native && c->q2_op_cols == c->qd && !c->int8_enabled && !c->detail_profile && !c->dist;
+int glm53f_kda_fusable_12n(glm53f_kda_context_12n *c) {
+    if (!(c && c->q2_native && c->q2_op_cols == c->qd && !c->int8_enabled && !c->detail_profile && !c->dist)) return 0;
+    /* Controller-side setup so the team hook needs no single construct. */
+    const char *column_env = getenv("GLM53F_KDA_DECODE_COLUMNS");
+    if (column_env && atoi(column_env) && !c->decode_factor) c->decode_factor = a256((size_t)c->qd * sizeof(float));
+    c->fused_bad = 0;
+    return 1;
 }
 void glm53f_kda_team_12n(void *context, const float *x) {
     glm53f_kda_context_12n *c = context;
     const char *column_env = getenv("GLM53F_KDA_DECODE_COLUMNS");
     const int columns = column_env && atoi(column_env);
-#pragma omp single
-    {
-        if (columns && !c->decode_factor) c->decode_factor = a256((size_t)c->qd * sizeof(float));
-        c->fused_bad = 0;
-    }
-    double td = 0.0;
+    double td = 0.0;   /* decode_factor and fused_bad were prepared by glm53f_kda_fusable_12n */
     struct kda_call call = {c, x, NULL, 0.0f, &td, columns, c->partial, 0};
     kda_worker(&call);
     if (call.bad) {
@@ -472,8 +472,8 @@ void glm53f_kda_team_12n(void *context, const float *x) {
         c->fused_bad = 1;
     }
 #pragma omp barrier
-#pragma omp single
-    c->fused_ready = !c->fused_bad;
+#pragma omp master
+    c->fused_ready = !c->fused_bad;   /* published to the controller by dispatch completion */
 }
 static int kda_local(glm53f_kda_context_12n*c,float*out,const float*x){
     weights*w=&c->w;int qd=c->qd,hn=c->hn;double td=c->detail_profile?glm53f_clock():0;

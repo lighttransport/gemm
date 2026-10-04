@@ -27,7 +27,7 @@ enum { GLM53F_KDA_TILE_TOKENS = 64 };
 void glm53f_kda_prewarm_12n(glm53f_kda_context_12n *c);
 /* Registers this layer's decode front matrices in the prefetch plan (glm53f_pf_plan.h). */
 void glm53f_kda_prefetch_plan_12n(const glm53f_kda_context_12n *c);
-int glm53f_kda_fusable_12n(const glm53f_kda_context_12n *c);
+int glm53f_kda_fusable_12n(glm53f_kda_context_12n *c);   /* controller: eligibility + hook setup */
 void glm53f_kda_team_12n(void *context, const float *x);
 /* Prefill only: leave per-rank partial outputs unreduced (the caller runs the collective). */
 void glm53f_kda_set_defer_reduce_12n(int on);

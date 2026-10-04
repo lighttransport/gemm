@@ -790,7 +790,9 @@ void glm53f_moe_router_team_12n(void *context, const float *x) {
     for (int b = 0; b < NEXPERTS / 8; ++b)
         router_dot8(c->router_logits + b * 8,
             c->router_w + ((size_t)li * NEXPERTS + b * 8) * 4096, x, 4096);
-#pragma omp single
+    /* The router loop above ended with a barrier; the flag is read by the
+     * controller after dispatch completion, so no further barrier is needed. */
+#pragma omp single nowait
     c->router_ready = 1;
     /* Opt-in fused MoE layer (GLM53F_MOE_FUSED_LAYER=1, --moe-layer-kernel fused):
      * the same team continues with top-k (computed identically by every
@@ -824,8 +826,8 @@ void glm53f_moe_router_team_12n(void *context, const float *x) {
         .h_q8k = !nsh_is_q80(c->nsh_dt[t]), .h_q80 = nsh_is_q80(c->nsh_dt[t])};
     const int ok = npart >= 1 &&
         glm53f_iq_expert_weighted_shared_team(c->scratch->local_output, iq, part_weight, npart, x, &sh) == 0;
-#pragma omp single
-    c->fused_ready = ok;
+#pragma omp master
+    c->fused_ready = ok;   /* identical on every thread; published by dispatch completion */
 }
 struct router_call { glm53f_moe_stage_context_12n *c; const float *x; };
 static void router_worker(void *context) {
