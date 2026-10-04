@@ -318,6 +318,17 @@ static void kda_worker(void *context) {
                 {c->small_g, c->q2_ga, c->q2_ga_type, D, H},
                 {c->beta, c->q2_b, c->q2_b_type, hn, H}};
             const int nmx = c->q2_aux ? 6 : 3;
+            /* Opt-in (GLM53F_KDA_TEAM_QUANT=1): quantize x with the whole team
+             * (bit-identical team form) instead of one thread. */
+            const char *team_quant = getenv("GLM53F_KDA_TEAM_QUANT");
+            if (team_quant && atoi(team_quant)) {
+                int need_q80 = 0, need_q8k = 0;
+                for (int i = 0; i < nmx; ++i) {
+                    if (kda_is_q80(mx[i].type)) need_q80 = 1; else need_q8k = 1;
+                }
+                if (glm53f_native_act_prepare_team(c->act_x, x, H, need_q8k, need_q80))
+                    MPI_Abort(MPI_COMM_WORLD,2);
+            } else {
 #pragma omp single
             {
                 int need_q80 = 0, need_q8k = 0;
@@ -326,6 +337,7 @@ static void kda_worker(void *context) {
                 }
                 if (glm53f_native_act_prepare(c->act_x, x, H, need_q8k, need_q80))
                     MPI_Abort(MPI_COMM_WORLD,2);
+            }
             }
             if (glm53f_native_matvec_team(mx, nmx, c->act_x))
                 MPI_Abort(MPI_COMM_WORLD,2);

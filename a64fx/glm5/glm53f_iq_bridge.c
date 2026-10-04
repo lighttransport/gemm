@@ -284,6 +284,23 @@ int glm53f_native_act_prepare_team(void *storage, const float *input, int column
     int bad = (!storage || !input || columns < 32 || columns % 32 || (need_q8k && columns % 256));
     if (bad) return -1;
     native_act *a = storage;
+    /* Opt-in (GLM53F_ACT_HEADER_CACHE=1): the header below is a pure function
+     * of (storage, columns, flags). When the stored header already matches -
+     * written by an earlier, completed call - every thread sees the same
+     * values and skips the single construct and its barrier together. */
+    static int header_cache = -1;
+    if (header_cache < 0) { const char *e = getenv("GLM53F_ACT_HEADER_CACHE"); header_cache = e && atoi(e); }
+    {
+        unsigned char *base = storage;
+        glm5_iq_q8_block *q8k = (glm5_iq_q8_block *)(base + align256(sizeof(native_act)));
+        block_q8_0 *q80 = (block_q8_0 *)((unsigned char *)q8k + align256((size_t)(columns / 256 + 1) * sizeof(glm5_iq_q8_block)));
+        int8_t *xq = (int8_t *)((unsigned char *)q80 + align256((size_t)(columns / 32) * sizeof(block_q8_0)));
+        float *xpat = (float *)((unsigned char *)xq + align256((size_t)columns));
+        float *xd = (float *)((unsigned char *)xpat + align256((size_t)(columns / 64 + 1) * 16 * sizeof(float)));
+        if (header_cache && a->columns == columns && a->q8k == q8k && a->q80 == q80 && a->xq == xq &&
+            a->xpat == xpat && a->xd == xd && a->has_q8k == (need_q8k != 0) && a->has_q80 == (need_q80 != 0))
+            goto quantize;   /* the matching earlier call already ran the LUT pthread_once */
+    }
 #pragma omp single
     {
         unsigned char *base = storage;
@@ -297,6 +314,7 @@ int glm53f_native_act_prepare_team(void *storage, const float *input, int column
         a->has_q80 = need_q80 != 0;
         if (need_q8k) pthread_once(&glm5_iq_lut_once, glm5_iq_init_luts);
     }
+quantize:
     if (need_q8k) {
 #pragma omp for schedule(static) nowait
         for (int blk = 0; blk < columns / 256; ++blk) glm5_iq_quant_q8(a->q8k + blk, input + 256 * blk, 256);

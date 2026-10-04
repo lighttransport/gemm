@@ -61,7 +61,7 @@ int main(void) {
             int dl = 0, dn = 0;
             for (int m = 0; m < GLM53F_MHC_MIX; ++m) dl += memcmp(&probe.logits[m], &legacy_next.logits[m], 4) != 0;
             for (int i = 0; i < GLM53F_MHC_WIDTH; ++i) dn += memcmp(&probe.scratch.normalized[i], &legacy_next.scratch.normalized[i], 4) != 0;
-            double pabs = 0; for (int i = 0; i < 128 * 32; ++i) pabs += fabs(glm53f_mhc_partl[i]);
+            double pabs = 0; for (int i = 0; i < 128 * 48; ++i) pabs += fabs(glm53f_mhc_partl[i]);
             printf("MHC_LOCAL_PATH partials_abs_sum=%g (nonzero => local path ran)\n", pabs);
             printf("MHC_LOCAL_DIFF logits_bits_differ=%d/%d normalized_bits_differ=%d/%d logit0=%a/%a\n", dl, GLM53F_MHC_MIX, dn,
                    GLM53F_MHC_WIDTH, probe.logits[0], legacy_next.logits[0]);
@@ -76,11 +76,25 @@ int main(void) {
         const double es = rel(loc.streams, ref.streams, GLM53F_MHC_FLAT);
         if (es > worst_stream) worst_stream = es;
     }
-    const int ok = stream_exact && worst_norm < 1e-5 && worst_coef < 1e-5 && worst_stream < 1e-4;
+    /* Gram mode (3): one barrier per site; normalized output within float tolerance of legacy. */
+    double worst_gram = 0;
+    {
+        state g = ref, l = ref;
+        for (int c = 1; c < CALLS; ++c) {
+            state gi = g, li = g;
+            run(&gi, &site[c % SITES], norm, sub[c], 1, 3);
+            run(&li, &site[c % SITES], norm, sub[c], 1, 0);
+            const double e = rel(gi.scratch.normalized, li.scratch.normalized, GLM53F_MHC_WIDTH);
+            if (e > worst_gram) worst_gram = e;
+            g = li; (void)l;
+        }
+    }
+    printf("MHC_GRAM_CHECK worst_normalized_rel=%.2e %s\n", worst_gram, worst_gram < 1e-5 ? "PASS" : "FAIL");
+    const int ok = stream_exact && worst_norm < 1e-5 && worst_coef < 1e-5 && worst_stream < 1e-4 && worst_gram < 1e-5;
     printf("MHC_LOCAL_CHECK threads=%d streams_bit_exact=%d worst_normalized_rel=%.2e worst_combine_rel=%.2e "
            "chained_stream_rel=%.2e %s\n", omp_get_max_threads(), stream_exact, worst_norm, worst_coef, worst_stream,
            ok ? "PASS" : "FAIL");
-    for (int mode = 0; mode <= 2; mode += 2) {
+    for (int mode = 0; mode <= 3; mode += mode ? 1 : 2) {
         state t = ref;
         double best = 1e30, sum = 0;
         const int iters = 400;
@@ -90,7 +104,8 @@ int main(void) {
             const double dt = now() - t0;
             if (it >= 0) { sum += dt; if (dt < best) best = dt; }
         }
-        printf("MHC_LOCAL_TIME mode=%s mean_us=%.2f best_us=%.2f\n", mode ? "local" : "legacy", sum / iters * 1e6, best * 1e6);
+        printf("MHC_LOCAL_TIME mode=%s mean_us=%.2f best_us=%.2f\n", mode == 3 ? "local-gram" : mode ? "local" : "legacy",
+               sum / iters * 1e6, best * 1e6);
     }
     return ok ? 0 : 1;
 }
