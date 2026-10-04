@@ -8,6 +8,7 @@
 #include <dlfcn.h>
 #include <iostream>
 #include <random>
+#include <thread>
 #ifndef HV15N_ROCM
 #include "../../cuda/fa2/cuda_fa2_kernels.h"
 // CUDA mapping of the hipBLAS helper: types 0=F32 (pedantic), 2=F16, 14=BF16; F32 output.
@@ -58,6 +59,110 @@ struct Engine {
 #ifndef HV15N_ROCM
     CUmodule flash_bf16 = nullptr, flash_f16 = nullptr;
     cublasew_context *int8_blas = nullptr;
+    // DiT INT8 weight prefetch: a worker thread copies block i+1 from the mmap into
+    // pinned chunks and uploads them on a private stream while block i computes.
+    struct Prefetched {
+        Tensor w;
+        CUevent ready = nullptr;
+    };
+    std::map<std::string, Prefetched> prefetched;
+    std::thread prefetch_worker;
+    std::exception_ptr prefetch_error;
+    CUstream prefetch_stream = nullptr;
+    std::array<void *, 2> prefetch_host{};
+    std::array<CUevent, 2> prefetch_free{};
+    uint64_t prefetch_hits = 0;
+    static constexpr size_t prefetch_chunk = 64ull << 20;
+    void prefetch_join() {
+        if (prefetch_worker.joinable())
+            prefetch_worker.join();
+        if (prefetch_error) {
+            auto error = prefetch_error;
+            prefetch_error = nullptr;
+            std::rethrow_exception(error);
+        }
+    }
+    void prefetch_release() {
+        if (prefetch_worker.joinable())
+            prefetch_worker.join();
+        prefetch_error = nullptr;
+        if (prefetch_stream)
+            cuStreamSynchronize(prefetch_stream);
+        for (auto &entry : prefetched)
+            if (entry.second.ready)
+                cuEventDestroy(entry.second.ready);
+        prefetched.clear();
+    }
+    // Starts uploading every INT8 matrix under `prefix`; joins the previous batch first.
+    void prefetch(Weights &w, const std::string &prefix) {
+        prefetch_join();
+        if (!prefetch_stream) {
+            g.check(cuStreamCreate(&prefetch_stream, CU_STREAM_NON_BLOCKING), "prefetch stream");
+            for (int i = 0; i < 2; i++) {
+                g.check(cuMemHostAlloc(&prefetch_host[i], prefetch_chunk, 0), "prefetch staging");
+                g.check(cuEventCreate(&prefetch_free[i], CU_EVENT_DISABLE_TIMING),
+                        "prefetch staging event");
+                g.check(cuEventRecord(prefetch_free[i], prefetch_stream), "prefetch staging");
+            }
+        }
+        // Pooled destinations may still be read by queued compute work.
+        CUevent safe = nullptr;
+        g.check(cuEventCreate(&safe, CU_EVENT_DISABLE_TIMING), "prefetch safety event");
+        g.check(cuEventRecord(safe, g.stream), "prefetch safety");
+        g.check(cuStreamWaitEvent(prefetch_stream, safe, 0), "prefetch ordering");
+        cuEventDestroy(safe);
+        std::vector<std::pair<const void *, Prefetched *>> jobs;
+        for (int i = 0; i < w.context->n_tensors; i++) {
+            std::string name = w.context->tensors[i].name;
+            if (name.compare(0, prefix.size(), prefix) || w.dtype(name) != "I8" ||
+                name.size() < 7 || name.compare(name.size() - 7, 7, ".weight") ||
+                prefetched.count(name))
+                continue;
+            auto &entry = prefetched[name];
+            entry.w = byte_tensor(w.shape(name));
+            g.check(cuEventCreate(&entry.ready, CU_EVENT_DISABLE_TIMING), "prefetch event");
+            jobs.push_back({w.data(name), &entry});
+        }
+        prefetch_worker = std::thread([this, jobs]() {
+            try {
+                auto ok = [](CUresult r, const char *what) {
+                    if (r != CUDA_SUCCESS)
+                        throw std::runtime_error(std::string("prefetch: ") + what);
+                };
+                ok(cuCtxSetCurrent(g.context), "context");
+                int slot = 0;
+                for (auto &[source, entry] : jobs) {
+                    const size_t bytes = entry->w.bytes();
+                    for (size_t offset = 0; offset < bytes; offset += prefetch_chunk) {
+                        const size_t count = std::min(prefetch_chunk, bytes - offset);
+                        ok(cuEventSynchronize(prefetch_free[slot]), "staging wait");
+                        std::memcpy(prefetch_host[slot],
+                                    static_cast<const unsigned char *>(source) + offset, count);
+                        ok(cuMemcpyHtoDAsync(entry->w.pointer + offset, prefetch_host[slot], count,
+                                             prefetch_stream),
+                           "upload");
+                        ok(cuEventRecord(prefetch_free[slot], prefetch_stream), "staging record");
+                        slot ^= 1;
+                    }
+                    ok(cuEventRecord(entry->ready, prefetch_stream), "ready");
+                }
+            } catch (...) {
+                prefetch_error = std::current_exception();
+            }
+        });
+    }
+    // Returns a prefetched matrix (ordering the compute stream after its upload).
+    bool take_prefetched(const std::string &name, Tensor &out) {
+        auto it = prefetched.find(name);
+        if (it == prefetched.end())
+            return false;
+        g.check(cuStreamWaitEvent(g.stream, it->second.ready, 0), "prefetched weight");
+        cuEventDestroy(it->second.ready);
+        out = std::move(it->second.w);
+        prefetched.erase(it);
+        prefetch_hits++;
+        return true;
+    }
 #endif
     explicit Engine(const h3_config &c)
         : g(c.device, c.vram_budget_mib, false, false), root(c.model_dir),
@@ -145,6 +250,15 @@ struct Engine {
         if (rotation_blas)
             cublasewDestroy(rotation_blas);
 #ifndef HV15N_ROCM
+        prefetch_release();
+        if (prefetch_stream)
+            cuStreamDestroy(prefetch_stream);
+        for (int i = 0; i < 2; i++) {
+            if (prefetch_free[i])
+                cuEventDestroy(prefetch_free[i]);
+            if (prefetch_host[i])
+                cuMemFreeHost(prefetch_host[i]);
+        }
         if (int8_blas)
             cublasewDestroy(int8_blas);
         for (auto m : {flash_bf16, flash_f16})
@@ -228,8 +342,13 @@ struct Engine {
                         "unsupported H3 INT8 format");
                 require(weights.shape(name + ".weight_scale") == std::vector<int>({shape[0], 1}),
                         "INT8 row scale shape");
-                w = e.byte_tensor(shape);
-                e.g.upload_staged(w, weights.data(name + ".weight"), e.g.stream);
+#ifndef HV15N_ROCM
+                if (!e.take_prefetched(name + ".weight", w))
+#endif
+                {
+                    w = e.byte_tensor(shape);
+                    e.g.upload_staged(w, weights.data(name + ".weight"), e.g.stream);
+                }
                 scale = e.g.weight(weights, name + ".weight_scale");
             } else if (kind == 1 && !precise) {
                 // Preserve BF16 weights; FP16 conversion loses subnormal bits.
@@ -673,7 +792,20 @@ struct Engine {
         auto emb = time_embed(w, tv, ta);
         g.clear_weights();
         require(trace.empty() || x.rows() <= 256, "DiT tracing requires at most 256 tokens");
+#ifndef HV15N_ROCM
+        struct PrefetchScope {
+            Engine &e;
+            ~PrefetchScope() { e.prefetch_release(); }
+        } prefetch_scope{*this};
+        prefetch(w, "blocks.0.");
+#endif
         for (int i = 0; i < 50; i++) {
+#ifndef HV15N_ROCM
+            if (i + 1 < 50)
+                prefetch(w, "blocks." + std::to_string(i + 1) + ".");
+            else
+                prefetch_join();
+#endif
             auto capture = [&](const char *stage) {
                 if (!trace.empty()) {
                     char name[96];

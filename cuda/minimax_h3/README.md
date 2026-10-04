@@ -43,11 +43,12 @@ Weights stream per block from mmap, and a 64 GB host is required.
   | stage | native CUDA | PyTorch reference |
   |---|---|---|
   | Qwen3-VL text encoder | 7.4 s | 40 s |
-  | DiT, per Euler update (50 blocks) | 95 s | ~128 s |
+  | DiT, per Euler update (50 blocks) | 94 s | ~128 s |
   | VAE decode (124 frames) | 98 s | 249 s |
 
   DiT attention runs at the same speed as PyTorch's (32.7 vs 32.4 TFLOPS) and is
-  ~65% of DiT time. VAE gains come from three changes: the 4.6 GiB decoder stays
+  ~65% of DiT time. DiT INT8 weights for block i+1 are prefetched by a worker
+  thread on a private stream while block i computes (saved ~1.6 s per update). VAE gains come from three changes: the 4.6 GiB decoder stays
   resident, tiles are pipelined (the next tile is enqueued before host stitching;
   pixels come back through async pinned copies), and host FP16 blending uses
   F16C. INT8 projections use 4096-row FFN chunks and a fused bias+round epilogue.
