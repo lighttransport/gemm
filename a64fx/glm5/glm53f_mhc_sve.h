@@ -156,6 +156,14 @@ static inline void glm53f_mhc_local_team(float *streams, const float *sublayer, 
     glm53f_pf_run(tid);
     const int lo = (int)((long)(W / VL) * tid / nt) * VL, hi = (int)((long)(W / VL) * (tid + 1) / nt) * VL;
     const svbool_t pg = svptrue_b32();
+    /* The 96 short mixing-row segments of this slice are cold; issue all their
+     * lines up front so the misses overlap with the post update below. */
+    for (int m = 0; m < GLM53F_MHC_MIX; ++m)
+        for (int k = 0; k < S; ++k) {
+            const char *p = (const char *)(site->fn + (size_t)m * GLM53F_MHC_FLAT + (size_t)k * W + lo);
+            for (int o = 0; o < (hi - lo) * 2; o += 256) __builtin_prefetch(p + o, 0, 2);
+            __builtin_prefetch(p + (hi - lo) * 2 - 1, 0, 2);
+        }
     double ss = 0.0;
     if (do_post) {
         for (int k = 0; k < S; ++k)

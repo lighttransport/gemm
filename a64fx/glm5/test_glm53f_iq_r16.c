@@ -81,6 +81,10 @@ static int check(void) {
 int main(int argc, char **argv) {
     const int parts = argc > 1 ? atoi(argv[1]) : 5, pool = argc > 2 ? atoi(argv[2]) : 96, iters = 300;
     setvbuf(stdout, NULL, _IONBF, 0);
+    if (getenv("INTERLEAVE") && atoi(getenv("INTERLEAVE"))) {   /* same 4-CMG interleave as the runtime */
+        unsigned long m = 0xF0UL;
+        syscall(SYS_set_mempolicy, 3L, &m, 8UL);
+    }
     if (check()) { printf("R16_CHECK FAIL\n"); return 1; }
     printf("R16_CHECK ALL PASS\n");
     enum { H = 4096, INTER = 256, GU = 2 * INTER };

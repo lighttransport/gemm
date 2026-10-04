@@ -99,14 +99,13 @@ static inline void glm53f_cmg_batch_flush(glm53f_cmg_batch *b) {
     }
     b->n = 0;
 }
-/* Pages whose midpoint lies in [lo, hi) go to node; a range smaller than a
- * page keeps the page holding its start. */
+/* Only pages lying entirely inside [lo, hi) go to node: re-homing drops a
+ * page's contents temporarily, so pages shared with other heap objects (the
+ * edges of a weight buffer) must never be touched. */
 static inline void glm53f_cmg_add_range(glm53f_cmg_batch *b, uintptr_t lo, uintptr_t hi, int node) {
     const uintptr_t ps = (uintptr_t)sysconf(_SC_PAGESIZE);
     if (hi <= lo) return;
-    for (uintptr_t pg = lo & ~(ps - 1); pg < hi; pg += ps) {
-        const uintptr_t mid = pg + ps / 2;
-        if (!(mid >= lo && mid < hi) && !(pg <= lo && lo < pg + ps && hi - lo < ps)) continue;
+    for (uintptr_t pg = (lo + ps - 1) & ~(ps - 1); pg + ps <= hi; pg += ps) {
         b->pages[b->n] = (void *)pg; b->nodes[b->n] = node; ++b->st->requested;
         if (++b->n == GLM53F_CMG_PLACE_BATCH) glm53f_cmg_batch_flush(b);
     }
