@@ -320,6 +320,24 @@ quantize:
         for (int blk = 0; blk < columns / 256; ++blk) glm5_iq_quant_q8(a->q8k + blk, input + 256 * blk, 256);
     }
     if (need_q80) {
+        /* Opt-in GLM53F_ACT_CHUNK=n: contiguous chunks of n 32-column blocks per
+         * thread. The 34-byte blocks and per-block scale arrays otherwise put
+         * ~8 threads on every 256-byte line (false sharing; 13 us vs 6.5 us
+         * serial for 4096 columns on A64FX). Per-block results are unchanged. */
+        static int act_chunk = -1;
+        if (act_chunk < 0) { const char *e = getenv("GLM53F_ACT_CHUNK"); act_chunk = e && atoi(e) > 0 ? atoi(e) : 0; }
+        const int chunk = act_chunk;
+        if (chunk) {
+#pragma omp for schedule(static)
+            for (int c0 = 0; c0 < (columns / 32 + chunk - 1) / chunk; ++c0)
+                for (int blk = c0 * chunk; blk < (c0 + 1) * chunk && blk < columns / 32; ++blk) {
+                    quantize_q8_0_activation(a->q80 + blk, input + 32 * blk, 32);
+                    memcpy(a->xq + 32 * blk, a->q80[blk].qs, 32);
+                    const float d = ggml_fp16_to_fp32(a->q80[blk].d);
+                    a->xd[blk] = d;
+                    for (int j = 0; j < 8; ++j) a->xpat[(blk >> 1) * 16 + (blk & 1) * 8 + j] = d;
+                }
+        } else
 #pragma omp for schedule(static)
         for (int blk = 0; blk < columns / 32; ++blk) {
             quantize_q8_0_activation(a->q80 + blk, input + 32 * blk, 32);
