@@ -96,6 +96,23 @@ Detailed per-campaign history: `handoff-decode100-20261004.md` (same directory).
   Fixed to return the mode. v31 (`candidate-decode100-mfix21-v31`) is the first binary where local-gram really runs;
   j2t gates it (8K exact + pair + MTP d2 best ± KDA head pipeline). The standalone kernel is ~23 µs vs ~48 µs.
 
+## In-model PMU profile (j2v, v32 `-DGLM53F_FAPP`, `GLM53F_FAPP_EVENTS` hook; fapp must wrap mpiexec)
+Rank 0, legacy plain decode (fapp itself slows decode 35.5 → 26.8 tok/s; use ratios only):
+| Region | IPC | wait L2 miss | wait L1 miss | all load waits |
+|---|---|---|---|---|
+| kda | 0.69 | 12% | 10% | 42% |
+| ffn (MoE/dense) | 0.74 | 10% | 9% | 39% |
+| mhc_ffn | 0.54 | 8% | 11% | 43% |
+| mhc_end | 0.57 | 5% | 10% | 38% |
+| sparse | 0.60 | 23% | 11% | 50% |
+- **No region is memory-bandwidth bound in-model** (≤12% L2-miss wait except sparse 23%). The 6× standalone/in-model
+  matvec gap is latency/sync/overhead (barrier spin, small per-thread work, dependent phases), not HBM or cross-CMG.
+  L2-refill byte counts are far below known weight traffic — not usable as bandwidth.
+- Implication for 2×: change the execution model (fewer/cheaper syncs per layer, more work per thread, 4 ranks/node
+  with CMG-local 12-thread teams) rather than more kernel/format tuning. CSV: `tmp/decode100-20261004/fapp-j2v-legacy.csv`;
+  raw: `tmp/glm53f-q4-52167472/benchmark-decode100-j2v-*.fapp` (post-process with `fapppx -A -Icpupa -tcsv`).
+- Also from j2u (fapp-slowed, valid timing ratio): best set with real local-gram **1.078×** legacy plain decode.
+
 ## local-gram mHC, first real in-model run (j2t, v31)
 - 8K decode **34.65 vs 32.20 legacy (+7.6%)**, the largest single gain; prefill unchanged.
 - **Not token-equal at 8K:** generated IDs match for 24 tokens and differ from token 25 of 64 (legacy 374, lgram 1969).
