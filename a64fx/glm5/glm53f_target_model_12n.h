@@ -40,6 +40,7 @@ int glm53f_target_model_readout_12n(glm53f_target_model_12n *model,
 int glm53f_target_export_fields_12n(glm53f_target_model_12n *model, const char *prefix);
 int glm53f_target_trace_open_12n(glm53f_target_model_12n *model, const char *prefix, int compare);
 int glm53f_target_trace_close_12n(glm53f_target_model_12n *model);
+int glm53f_target_place_weights_12n(glm53f_target_model_12n *m);
 int glm53f_target_model_step_12n(
     glm53f_target_model_12n *model, int input_token,
     int *next_token, float *next_logit, float *target_hidden);

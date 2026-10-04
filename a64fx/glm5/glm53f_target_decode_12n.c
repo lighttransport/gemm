@@ -29,6 +29,7 @@
 #include <unistd.h>
 #include "glm53f_state_io.h"
 #include "glm53f_prefill_gemm.h"
+#include "glm53f_cmg_place.h"
 
 enum { LAYERS = 45, HIDDEN = 4096, STREAMS = 4, FLAT = 16384, MIX = 24,
        MAX_GENERATED_TOKENS = 32768, VERIFY_BATCH = 5,
@@ -391,6 +392,30 @@ static void target_plan_attention(const glm53f_target_model_12n *m, int l) {
 static void target_plan_ffn(glm53f_target_model_12n *m, int l) {
     glm53f_pf_clear();
     if (l >= 3) glm53f_moe_stage_prefetch_plan_12n(m->moe, l);
+}
+/* Opt-in load-time CMG-local placement of decode weights (glm53f_cmg_place.h).
+ * Call once after creation, before decoding; the active plan is cleared. */
+int glm53f_target_place_weights_12n(glm53f_target_model_12n *m) {
+    int node[GLM53F_PF_MAX_THREADS], rank = 0;
+    if (!m) return -1;
+    const int nt = glm53f_cmg_thread_nodes(node, GLM53F_PF_MAX_THREADS);
+    if (nt < 1) return -1;
+    glm53f_cmg_place_stats st = {0, 0, 0, 0};
+    const double begin = glm53f_clock();
+    glm53f_pf_collecting = 1;
+    for (int l = m->first_layer; l < m->end_layer && l < LAYERS; ++l) {
+        target_plan_attention(m, l);
+        glm53f_cmg_place_table(node, nt, &st);
+        target_plan_ffn(m, l);
+        glm53f_cmg_place_table(node, nt, &st);
+    }
+    glm53f_pf_collecting = 0;
+    glm53f_pf_clear();
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    if (!rank)
+        printf("GLM53F_CMG_PLACE threads=%d nodes=%d..%d pages=%ld moved=%ld already=%ld failed=%ld seconds=%.3f\n",
+               nt, node[0], node[nt - 1], st.requested, st.moved, st.already, st.failed, glm53f_clock() - begin);
+    return 0;
 }
 int glm53f_target_model_step_12n(glm53f_target_model_12n *m, int token,
         int *next_token, float *next_logit, float *target_hidden) {

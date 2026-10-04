@@ -259,6 +259,11 @@ void glm53f_kda_prefetch_plan_12n(const glm53f_kda_context_12n *c) {
         {NULL, c->q2_q, c->q2_q_type, qd, H}, {NULL, c->q2_k, c->q2_k_type, qd, H}, {NULL, c->q2_v, c->q2_v_type, qd, H},
         {NULL, c->q2_fa, c->q2_fa_type, D, H}, {NULL, c->q2_ga, c->q2_ga_type, D, H}, {NULL, c->q2_b, c->q2_b_type, hn, H}};
     glm53f_pf_add_matvec(mx, c->q2_aux ? 6 : 3);
+    if (glm53f_pf_collecting && c->q2_op_cols == qd) {
+        /* Placement only: the decode output projection's own team partition. */
+        const glm53f_native_matrix op = {NULL, c->q2_op, c->q2_op_type, H, qd};
+        glm53f_pf_add_matvec(&op, 1);
+    }
 }
 /* Issue (non-blocking) L2 prefetches for this thread's static row slice of a native matrix that a LATER stage of the
  * layer will read.  The slice is the one native_matvec_team gives this thread, so the lines land in the CMG that uses

@@ -200,6 +200,8 @@ int main(int argc, char **argv) {
         MPI_Abort(MPI_COMM_WORLD, 2);
     }
     check(glm53f_target_model_configure_prefill_12n(m, &config));
+    if (getenv("GLM53F_CMG_PLACE") && atoi(getenv("GLM53F_CMG_PLACE")))
+        check(glm53f_target_place_weights_12n(m));
     glm53f_mtp_context_12n *mtp = NULL;
     glm53f_mtp_spec_workspace_12n *mtp_workspace = NULL;
     float *prompt_hidden = NULL;

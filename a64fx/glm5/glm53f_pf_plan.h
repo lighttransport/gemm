@@ -17,10 +17,14 @@ typedef struct { int n; glm53f_pf_span s[GLM53F_PF_MAX_THREADS][GLM53F_PF_MAX_IT
 extern glm53f_pf_table glm53f_pf_tab;
 __attribute__((weak)) glm53f_pf_table glm53f_pf_tab;
 
+/* Set while glm53f_cmg_place.h collects row partitions for load-time page
+ * placement: plans are built without enabling decode prefetch. */
+extern int glm53f_pf_collecting;
+__attribute__((weak)) int glm53f_pf_collecting;
 static inline int glm53f_pf_enabled(void) {
     static int v = -1;
     if (v < 0) { const char *e = getenv("GLM53F_PF_PLAN"); v = e && *e && atoi(e); } /* default off: net-neutral, see below */
-    return v;
+    return v || glm53f_pf_collecting;
 }
 static inline size_t glm53f_pf_cap(void) {
     static long v = -1;

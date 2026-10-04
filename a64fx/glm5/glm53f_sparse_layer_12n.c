@@ -715,6 +715,16 @@ void glm53f_sparse_prefetch_plan_12n(const glm53f_sparse_context_12n *c) {
     const glm53f_native_matrix aq = {NULL, c->q2_qb, c->q2_qb_type, c->qd, QA};
     glm53f_pf_add_matvec(ax, 2);
     glm53f_pf_add_matvec(&aq, 1);
+    if (glm53f_pf_collecting) {
+        /* Placement only: output projection and per-head v_b, each one team call. */
+        const glm53f_native_matrix op = {NULL, c->q2_op, c->q2_op_type, H, c->hn * VD};
+        glm53f_pf_add_matvec(&op, 1);
+        const size_t vb_row = glm53f_native_row_size(c->q2_vb_type, LAT);
+        for (int h = 0; h < c->hn && c->q2_vb && vb_row; ++h) {
+            const glm53f_native_matrix vb = {NULL, c->q2_vb + (size_t)h * VD * vb_row, c->q2_vb_type, VD, LAT};
+            glm53f_pf_add_matvec(&vb, 1);
+        }
+    }
 }
 /* ---- int8 panel64 GEMM for the native Q8_0 prefill projections (q_a|kv_a and q_b), as in the KDA prefill ------------- */
 enum { SG_T = GLM53F_PREFILL_ATTN_TOKENS + 4 };
