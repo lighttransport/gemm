@@ -444,6 +444,14 @@ int glm53f_target_place_weights_12n(glm53f_target_model_12n *m) {
                st.failed, ex.requested, ex.moved, ex.already, ex.failed, st.move_errno, middle - begin, glm53f_clock() - middle);
     return 0;
 }
+#ifdef GLM53F_FAPP
+#include "fj_tool/fapp.h"
+#define GLM53F_FAPP_START(name, n) fapp_start(name, n, 0)
+#define GLM53F_FAPP_STOP(name, n) fapp_stop(name, n, 0)
+#else
+#define GLM53F_FAPP_START(name, n) do { } while (0)
+#define GLM53F_FAPP_STOP(name, n) do { } while (0)
+#endif
 int glm53f_target_model_step_12n(glm53f_target_model_12n *m, int token,
         int *next_token, float *next_logit, float *target_hidden) {
     double begin = m && m->profile ? glm53f_clock() : 0.0;
@@ -463,12 +471,14 @@ int glm53f_target_model_step_12n(glm53f_target_model_12n *m, int token,
         if (target_sublayer_trace(m->scratch->mhc.normalized, HIDDEN,
                                   "attn_norm", l)) return -1;
         begin = m->profile ? glm53f_clock() : 0.0;
+        if (m->kda[l]) GLM53F_FAPP_START("kda", 2); else GLM53F_FAPP_START("sparse", 3);
         int rc = m->kda[l] ?
             glm53f_kda_sublayer_12n(m->kda[l], m->scratch->sublayer_output,
                                     m->scratch->mhc.normalized) :
             glm53f_sparse_sublayer_12n(m->sparse[l], m->scratch->sublayer_output,
                                        m->scratch->mhc.normalized);
         if (rc) return -1;
+        if (m->kda[l]) GLM53F_FAPP_STOP("kda", 2); else GLM53F_FAPP_STOP("sparse", 3);
         if (target_sublayer_trace(m->scratch->sublayer_output, HIDDEN,
                                   "kda_out", l)) return -1;
         if (m->profile) {
@@ -477,6 +487,7 @@ int glm53f_target_model_step_12n(glm53f_target_model_12n *m, int token,
             m->scalar_detail[m->kda[l] ? 0 : 1] += elapsed;
         }
         begin = m->profile ? glm53f_clock() : 0.0;
+        GLM53F_FAPP_START("mhc_ffn", 4);
         target_plan_ffn(m, l);
         const int fuse_router = l >= 3 && glm53f_mhc_fast_on() == 1 &&
             getenv("GLM53F_ROUTER_FUSE") && atoi(getenv("GLM53F_ROUTER_FUSE"));
@@ -501,12 +512,14 @@ int glm53f_target_model_step_12n(glm53f_target_model_12n *m, int token,
             glm53f_mhc_pre_sve(&m->scratch->mhc, m->streams, &w->ffn_mhc,
                                w->post_attention_norm);
         }
+        GLM53F_FAPP_STOP("mhc_ffn", 4);
         if (m->profile) { double e = glm53f_clock() - begin; m->scalar_phase[1] += e; m->mhc_site[1] += e; }
         if (target_sublayer_trace(m->streams, FLAT,
                                   "hc_attn_post", l)) return -1;
         if (target_sublayer_trace(m->scratch->mhc.normalized, HIDDEN,
                                   "ffn_norm", l)) return -1;
         begin = m->profile ? glm53f_clock() : 0.0;
+        GLM53F_FAPP_START("ffn", 5);
         if (l < 3) {
             rc = glm53f_dense_ffn_sublayer_12n(
                 m->dense[l], m->scratch->sublayer_output,
@@ -518,6 +531,7 @@ int glm53f_target_model_step_12n(glm53f_target_model_12n *m, int token,
                 m->scratch->mhc.normalized);
         }
         if (rc) return -1;
+        GLM53F_FAPP_STOP("ffn", 5);
         if (target_sublayer_trace(m->scratch->sublayer_output, HIDDEN,
                                   "ffn_out", l)) return -1;
         if (m->profile) {
@@ -526,6 +540,7 @@ int glm53f_target_model_step_12n(glm53f_target_model_12n *m, int token,
             m->scalar_detail[l < 3 ? 2 : 3] += elapsed;
         }
         begin = m->profile ? glm53f_clock() : 0.0;
+        GLM53F_FAPP_START("mhc_end", 6);
         if (m->mhc_chained && l + 1 < LAYERS) {
             const glm53f_target_layer_weights_12n *next = &m->layer_weight[l + 1];
             target_plan_attention(m, l + 1);
@@ -555,6 +570,7 @@ int glm53f_target_model_step_12n(glm53f_target_model_12n *m, int token,
             glm53f_mhc_post_sve(m->streams, m->scratch->sublayer_output,
                                 &m->scratch->mhc);
         if (target_sublayer_trace(m->streams, FLAT, "l_last", l)) return -1;
+        GLM53F_FAPP_STOP("mhc_end", 6);
         if (m->profile) { double e = glm53f_clock() - begin; m->scalar_phase[1] += e; m->mhc_site[2] += e; }
         if (target_layer_trace(m->streams, l)) return -1;
     }
