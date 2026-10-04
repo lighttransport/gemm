@@ -11,6 +11,8 @@ int main(void) {
     glm53f_prefill_config c = {GLM53F_PREFILL_LEGACY, 32, GLM53F_PREFILL_FAST_DEFAULT, NULL, 0};
     int failed = 0;
     failed |= parse("--moe-router-prefill", "tiles12", &c) != 1 || strcmp(getenv("GLM53F_MOE_ROUTER_TILES12"), "1");
+    failed |= parse("--moe-router-prefill", "tiles8", &c) != 1 || strcmp(getenv("GLM53F_MOE_ROUTER_TILES12"), "2");
+    failed |= parse("--moe-router-prefill", "unroll1", &c) != 1 || strcmp(getenv("GLM53F_MOE_ROUTER_TILES12"), "3");
     failed |= parse("--moe-router-prefill", "legacy", &c) != 1 || strcmp(getenv("GLM53F_MOE_ROUTER_TILES12"), "0");
     failed |= parse("--moe-router-prefill", "bad", &c) != -1;
     failed |= parse("--moe-router-prefill", NULL, &c) != -1;

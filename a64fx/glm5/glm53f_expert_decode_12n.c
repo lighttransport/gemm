@@ -1405,9 +1405,11 @@ static int moe_prefill_grouped(glm53f_moe_stage_context_12n *c, float *out,
     double begin = c->profile ? glm53f_clock() : 0.0;
     if (c->rg_mode && c->router_wt) {
         const char *tiles = getenv("GLM53F_MOE_ROUTER_TILES12");
-        const int tiles12 = tiles && atoi(tiles) && svcntw() == 16 && tokens > 6 && c->rg_mode == 1;
+        const int mode = tiles ? atoi(tiles) : 0;
+        const int tile_mode = (mode >= 1 && mode <= 3) && svcntw() == 16 &&
+            tokens > (mode == 2 ? 8 : 6) && c->rg_mode == 1 ? mode : 0;
         const uint16_t *wl = c->router_wt + (size_t)li * NEXPERTS * H;
-        gmn_router_prefill(c->batch_router, wl, x, tokens, H, tiles12);
+        gmn_router_prefill(c->batch_router, wl, x, tokens, H, tile_mode);
     }
     if (!c->rg_mode || c->rg_mode == 2 || !c->router_wt) {
         float *ref = c->rg_mode == 2 ? (float *)malloc((size_t)tokens * NEXPERTS * sizeof(float)) : c->batch_router;

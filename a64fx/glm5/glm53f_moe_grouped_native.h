@@ -465,18 +465,103 @@ static inline void gmn_router_run12(float *out, size_t ldo,
 #undef GR12_CASE
     }
 }
+/* Eight tokens x32 experts. Packed48-column tiles can straddle the two
+ * halves, so compute their packed pointers separately; do not repack weights. */
+static inline __attribute__((always_inline)) void gmn_router_block8(float *out,
+        size_t ldo, const uint16_t *w0, const uint16_t *w1, const float *x,
+        size_t ldx, int K, const int n) {
+    const svbool_t pg = svptrue_b32();
+#define GR8_DECL(U) svfloat32_t a##U = svdup_f32(0), b##U = a##U
+    GR8_DECL(0); GR8_DECL(1); GR8_DECL(2); GR8_DECL(3);
+    GR8_DECL(4); GR8_DECL(5); GR8_DECL(6); GR8_DECL(7);
+#undef GR8_DECL
+    for (int k = 0; k < K; ++k) {
+        const svfloat32_t v0 = svreinterpret_f32_u32(svlsl_n_u32_x(pg,
+            svld1uh_u32(pg, w0 + (size_t)k * GMN_RTILE), 16));
+        const svfloat32_t v1 = svreinterpret_f32_u32(svlsl_n_u32_x(pg,
+            svld1uh_u32(pg, w1 + (size_t)k * GMN_RTILE), 16));
+#define GR8_STEP(U) if ((U) < n) { const float v = x[(size_t)(U) * ldx + k]; \
+        a##U = svmla_n_f32_x(pg, a##U, v0, v); b##U = svmla_n_f32_x(pg, b##U, v1, v); }
+        GR8_STEP(0); GR8_STEP(1); GR8_STEP(2); GR8_STEP(3);
+        GR8_STEP(4); GR8_STEP(5); GR8_STEP(6); GR8_STEP(7);
+#undef GR8_STEP
+    }
+#define GR8_STORE(U) if ((U) < n) { svst1_f32(pg, out + (size_t)(U) * ldo, a##U); \
+        svst1_f32(pg, out + (size_t)(U) * ldo + 16, b##U); }
+    GR8_STORE(0); GR8_STORE(1); GR8_STORE(2); GR8_STORE(3);
+    GR8_STORE(4); GR8_STORE(5); GR8_STORE(6); GR8_STORE(7);
+#undef GR8_STORE
+}
+static inline void gmn_router_run8(float *out, size_t ldo,
+        const uint16_t *wt, int tile, const float *x, size_t ldx, int K, int n) {
+    const int r0 = tile * 32, r1 = r0 + 16;
+    const uint16_t *w0 = wt + (size_t)(r0 / GMN_RTILE) * K * GMN_RTILE + r0 % GMN_RTILE;
+    const uint16_t *w1 = wt + (size_t)(r1 / GMN_RTILE) * K * GMN_RTILE + r1 % GMN_RTILE;
+    switch (n) {
+#define GR8_CASE(N) case N: gmn_router_block8(out, ldo, w0, w1, x, ldx, K, N); break
+        GR8_CASE(1); GR8_CASE(2); GR8_CASE(3); GR8_CASE(4);
+        GR8_CASE(5); GR8_CASE(6); GR8_CASE(7); GR8_CASE(8);
+#undef GR8_CASE
+    }
+}
+static inline __attribute__((always_inline)) void gmn_router_block_unroll1(float *out, size_t ldo, const uint16_t *wt,
+        const float *x, size_t ldx, int K, const int n) {
+    const svbool_t pg = svptrue_b32();
+#define GMN_R_DECL(U) svfloat32_t r##U##0 = svdup_f32(0), r##U##1 = r##U##0, r##U##2 = r##U##0
+    GMN_R_DECL(0); GMN_R_DECL(1); GMN_R_DECL(2); GMN_R_DECL(3); GMN_R_DECL(4); GMN_R_DECL(5);
+#undef GMN_R_DECL
+    /* FCC key-loop unrolling otherwise extends broadcasts across keys. */
+#if defined(__clang__)
+#pragma clang loop unroll(disable)
+#elif defined(__GNUC__)
+#pragma GCC unroll 1
+#endif
+    for (int k = 0; k < K; ++k) {
+        const uint16_t *wp = wt + (size_t)k * GMN_RTILE;
+        const svfloat32_t w0 = svreinterpret_f32_u32(svlsl_n_u32_x(pg, svld1uh_u32(pg, wp), 16));
+        const svfloat32_t w1 = svreinterpret_f32_u32(svlsl_n_u32_x(pg, svld1uh_u32(pg, wp + 16), 16));
+        const svfloat32_t w2 = svreinterpret_f32_u32(svlsl_n_u32_x(pg, svld1uh_u32(pg, wp + 32), 16));
+#define GMN_R_STEP(U) if ((U) < n) { const float xv = x[(size_t)(U) * ldx + k]; \
+        r##U##0 = svmla_n_f32_x(pg, r##U##0, w0, xv); r##U##1 = svmla_n_f32_x(pg, r##U##1, w1, xv); \
+        r##U##2 = svmla_n_f32_x(pg, r##U##2, w2, xv); }
+        GMN_R_STEP(0) GMN_R_STEP(1) GMN_R_STEP(2) GMN_R_STEP(3) GMN_R_STEP(4) GMN_R_STEP(5)
+#undef GMN_R_STEP
+    }
+#define GMN_R_ST(U) if ((U) < n) { float *o = out + (size_t)(U) * ldo; \
+    svst1_f32(pg, o, r##U##0); svst1_f32(pg, o + 16, r##U##1); svst1_f32(pg, o + 32, r##U##2); }
+    GMN_R_ST(0) GMN_R_ST(1) GMN_R_ST(2) GMN_R_ST(3) GMN_R_ST(4) GMN_R_ST(5)
+#undef GMN_R_ST
+}
+
+/* n tokens (1..6) of tile `tile`: out points at out[t0][tile*48]. */
+static inline void gmn_router_run_unroll1(float *out, size_t ldo, const uint16_t *wt_layer, int tile,
+        const float *x, size_t ldx, int K, int n) {
+    const uint16_t *wt = wt_layer + (size_t)tile * K * GMN_RTILE;
+    switch (n) {
+#define GMN_R_CASE(N) case N: gmn_router_block_unroll1(out, ldo, wt, x, ldx, K, N); break;
+    GMN_R_CASE(1) GMN_R_CASE(2) GMN_R_CASE(3) GMN_R_CASE(4) GMN_R_CASE(5) GMN_R_CASE(6)
+#undef GMN_R_CASE
+    }
+}
+
+
 /* Collective OpenMP entry, also used by the strong native fixture. */
 static inline void gmn_router_prefill(float *out, const uint16_t *wt,
-        const float *x, int tokens, int K, int tiles12) {
-    const int width = tiles12 ? 12 : 6, chunk = tiles12 ? 2 : 4;
+        const float *x, int tokens, int K, int tile_mode) {
+    const int width = tile_mode == 2 ? 8 : tile_mode == 1 ? 12 : 6;
+    const int chunk = tile_mode == 2 ? 3 : tile_mode == 1 ? 2 : 4;
     const int groups = (tokens + width - 1) / width, chunks = (groups + chunk - 1) / chunk;
-    const int tiles = tiles12 ? GMN_NEXP / 16 : GMN_RTILES;
+    const int tiles = tile_mode == 2 ? GMN_NEXP / 32 : tile_mode == 1 ? GMN_NEXP / 16 : GMN_RTILES;
 #pragma omp parallel for schedule(dynamic, 1)
     for (int task = 0; task < tiles * chunks; ++task) {
         const int tile = task / chunks, ch = task % chunks;
         for (int g = ch * chunk; g < groups && g < (ch + 1) * chunk; ++g) {
             const int t = g * width, n = tokens - t < width ? tokens - t : width;
-            if (tiles12) gmn_router_run12(out + (size_t)t * GMN_NEXP + tile * 16,
+            if (tile_mode == 2) gmn_router_run8(out + (size_t)t * GMN_NEXP + tile * 32,
+                GMN_NEXP, wt, tile, x + (size_t)t * K, K, K, n);
+            else if (tile_mode == 3) gmn_router_run_unroll1(out + (size_t)t * GMN_NEXP + tile * GMN_RTILE,
+                GMN_NEXP, wt, tile, x + (size_t)t * K, K, K, n);
+            else if (tile_mode == 1) gmn_router_run12(out + (size_t)t * GMN_NEXP + tile * 16,
                 GMN_NEXP, wt, tile, x + (size_t)t * K, K, K, n);
             else gmn_router_run(out + (size_t)t * GMN_NEXP + tile * GMN_RTILE,
                 GMN_NEXP, wt, tile, x + (size_t)t * K, K, K, n);

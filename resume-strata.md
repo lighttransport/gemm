@@ -16,6 +16,35 @@ Local tmux socket`tmp/tmux-glm53f/pp1.sock`, launcher session
 Separate four-node allocation52158976 is unrelated and must not be touched. PJM52128881 was released after its final component gate;
 its `/local` images are gone. Other allocations must not be touched.
 
+**October4 router follow-up:** adds opt-in `tiles8` and `unroll1` to
+`--moe-router-prefill`; defaultlegacy. `tiles8` computes8tokens×32experts with
+separate packed pointers for halves that straddle48-column tiles; no repack
+or new allocation. `unroll1` keeps6×48 and disables key-loop unrolling with
+guarded Clang/GCC pragmas. Every output retains sequential key FMAs.
+Runtime guard remains packed mode1, SVE16, tokens>8 for tiles8/>6 otherwise.
+Diagnostic mode2 and nonpacked paths staylegacy.
+
+FCC fast/conservative candidate`candidate-router-tiles-eight-v3` built
+warning-clean. Strict host parser passes; native/model still pending.
+Expanded fixture compares all three variants against original loops:72
+cases/rank/configuration,3456 cases and10368 bit-equivalence comparisons
+expected across fast/conservative×1/47. Four-mode rotating sweeps at512/4096
+choose only a shape passing5%fast/2%conservative on both sizes; then17
+model runs/five alternating pairs. No measured gain or native correctness
+yet. Static full-shape FCC probes show SVE spill stores/reloads original6×48
+4/6,12×16 7/7,8×32 4/6,unroll1 0/0, excluding ABI saves. These are static
+probe counts, not dynamic traffic or speedups.
+
+Stage127 remains the sole MPI owner;12×16 driver459 is waiting. Final
+follow-up1052 waits for459 terminal andROUTER_TILES_NATIVE_PASS, checks idle
+MPI/cutoff19:35, and uses scratch`tmp/strata-router-eight-20261004/`.
+Idle follow-up waiters788/943 were canceled before MPI to expand/guard the
+unlaunched fixture; immutable v1/v2 binaries and logs are preserved. Do not
+relaunch, rebuild binaries in place or overlap MPI. New source changes do
+not affect the existing12×16 binary, whose provenance is commit3d74197b.
+Evidence`a64fx/glm5/strata-router-shapes-20261004.json` contains final hashes,
+build/driver/campaign/selection and assembly probe. No push authorized.
+
 **October4 afternoon active continuation:** packed prefill router experiment
 `--moe-router-prefill legacy|tiles12`, defaultlegacy, changes6tokens×48experts
 to12×16 using the existing packed BF16 layout. Each output retains sequential

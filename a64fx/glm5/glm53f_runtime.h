@@ -71,12 +71,14 @@ static inline int glm53f_runtime_option(int argc, char **argv, int *index) {
              (!strcmp(key, "--index-kernel") && !strcmp(value, "heads")) ||
              (!strcmp(key, "--mla-kernel") && !strcmp(value, "registers")) ||
              (!strcmp(key, "--decode-executor") && !strcmp(value, "persistent"))) enabled = 1;
-    else if ((!strcmp(key, "--mla-prefill-heads") && !strcmp(value, "values32")) ||
+    else if ((!strcmp(key, "--moe-router-prefill") && !strcmp(value, "tiles8")) ||
+             (!strcmp(key, "--mla-prefill-heads") && !strcmp(value, "values32")) ||
              (!strcmp(key, "--q8-prefill-kernel") && !strcmp(value, "tile4x4-asm")) ||
              (!strcmp(key, "--moe-combine-kernel") && !strcmp(value, "overlap")) ||
              (!strcmp(key, "--index-kernel") && !strcmp(value, "keys4")) ||
              (!strcmp(key, "--mla-kernel") && !strcmp(value, "values"))) enabled = 2;
-    else if ((!strcmp(key, "--q8-prefill-kernel") && !strcmp(value, "tile2x8-asm")) ||
+    else if ((!strcmp(key, "--moe-router-prefill") && !strcmp(value, "unroll1")) ||
+             (!strcmp(key, "--q8-prefill-kernel") && !strcmp(value, "tile2x8-asm")) ||
              (!strcmp(key, "--mla-kernel") && !strcmp(value, "fp16-cache")) ||
              (!strcmp(key, "--index-kernel") && !strcmp(value, "replicated-heads"))) enabled = 3;
     else if (!strcmp(key, "--index-kernel") && !strcmp(value, "replicated-keys4")) enabled = 4;

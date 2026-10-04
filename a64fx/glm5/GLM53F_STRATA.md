@@ -5,6 +5,26 @@ prefill tokens/s**, on twelve A64FX nodes, the complete 45-layer
 UD-Q4_K_XL model, top-8 routing, and the saved roughly 8K coding prompt.
 These targets have **not been demonstrated** by the changes below.
 
+## Router shape and key-loop unrolling follow-up (October4; native/model queued)
+
+`--moe-router-prefill` also accepts `tiles8` and `unroll1`, retaining default
+`legacy`. The8×32 tile uses16 accumulators and two packed-weight pointers
+when a32-expert tile crosses a48-expert packed boundary. `unroll1` preserves
+the original6×48 arithmetic while disabling key-loop unrolling. Clang/GCC
+pragmas are guarded; performance has only been built/probed with FCC clang.
+Each output retains sequential key FMAs; buffers and collectives are unchanged.
+
+FCC static full-shape probes show SVE spill stores/reloads of4/6(original),
+7/7(12×16),4/6(8×32), and0/0(unroll1), excluding ABI callee saves.
+These are standalone compiler diagnostics, not dynamic traffic or speedups.
+The final isolated candidate builds warning-clean in fast/conservative modes.
+Four native configurations compare three alternatives, then rotating native
+sweeps select only a shape passing both size/math gates before17 model runs
+and five alternating pairs. Native correctness and performance are pending.
+The final driver waits behind the earlier12×16 campaign; canceled idle
+follow-up revisions never launched MPI. See
+[shape and unroll evidence](strata-router-shapes-20261004.json).
+
 ## Packed router12×16 tiles (October4 afternoon; native/model queued)
 
 `--moe-router-prefill legacy|tiles12`, default `legacy`, reads the existing

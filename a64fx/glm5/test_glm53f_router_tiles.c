@@ -15,7 +15,7 @@ static float input(void) {
 }
 static void run(float *out, const uint16_t *w, const float *x,
         int tokens, int rows, int cols, int mode) {
-    if (mode) gmn_router_prefill(out, w, x, tokens, cols, 1);
+    if (mode) gmn_router_prefill(out, w, x, tokens, cols, mode);
     else {
         const int ngroups = (tokens + 5) / 6, nch = (ngroups + 3) / 4;
 #pragma omp parallel for schedule(dynamic, 1)
@@ -42,8 +42,12 @@ static int check(int tokens, int rows, int cols, int rank) {
     for (size_t i = 0; i < count + 32; ++i) a[i] = b[i] = -12345;
     gmn_router_pack(packed, w, cols);
     run(a + 16, packed, x, tokens, rows, cols, 0);
-    run(b + 16, packed, x, tokens, rows, cols, 1);
-    int bad = memcmp(a, b, (count + 32) * 4) != 0;
+    int bad = 0;
+    for (int mode = 1; mode <= 3; ++mode) {
+        for (size_t i = 0; i < count + 32; ++i) b[i] = -12345;
+        run(b + 16, packed, x, tokens, rows, cols, mode);
+        bad |= memcmp(a, b, (count + 32) * 4) != 0;
+    }
     for (size_t i = 16; i < count + 16; ++i) { uint32_t u; memcpy(&u, b + i, 4); bad |= (u & 0x7f800000u) == 0x7f800000u; }
     for (int i = 0; i < 16; ++i) bad |= a[i] != -12345 || a[count + 16 + i] != -12345;
     free(w); free(packed); free(x); free(a); free(b); return bad;
@@ -55,10 +59,10 @@ static void bench(int tokens, int rank) {
     if (!w || !x || !y) MPI_Abort(MPI_COMM_WORLD, 2);
     for (int i = 0; i < R * C; ++i) w[i] = 0x3f00 + (i % 127);
     for (size_t i = 0; i < (size_t)tokens * C; ++i) x[i] = (float)(i % 31) * .01f;
-    for (int mode = 0; mode < 2; ++mode) run(y, w, x, tokens, R, C, mode);
+    for (int mode = 0; mode < 4; ++mode) run(y, w, x, tokens, R, C, mode);
     for (int pair = 0; pair < 7; ++pair)
-        for (int turn = 0; turn < 2; ++turn) {
-            int mode = turn ^ (pair & 1);
+        for (int turn = 0; turn < 4; ++turn) {
+            int mode = (turn + pair) % 4;
             MPI_Barrier(MPI_COMM_WORLD);
             double begin = MPI_Wtime();
             for (int rep = 0; rep < 2; ++rep) run(y, w, x, tokens, R, C, mode);
