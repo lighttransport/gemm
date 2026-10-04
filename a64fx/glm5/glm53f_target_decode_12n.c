@@ -396,25 +396,38 @@ static void target_plan_ffn(glm53f_target_model_12n *m, int l) {
 /* Opt-in load-time CMG-local placement of decode weights (glm53f_cmg_place.h).
  * Call once after creation, before decoding; the active plan is cleared. */
 int glm53f_target_place_weights_12n(glm53f_target_model_12n *m) {
-    int node[GLM53F_PF_MAX_THREADS], rank = 0;
+    static glm53f_cmg_batch batch;
+    int node[GLM53F_PF_MAX_THREADS], cmg_node[4], rank = 0;
     if (!m) return -1;
     const int nt = glm53f_cmg_thread_nodes(node, GLM53F_PF_MAX_THREADS);
-    if (nt < 1) return -1;
-    glm53f_cmg_place_stats st = {0, 0, 0, 0};
+    if (nt < 37) return -1;
+    for (int c = 0; c < 4; ++c) cmg_node[c] = node[12 * c < nt ? 12 * c : nt - 1];
+    glm53f_cmg_place_stats st = {0, 0, 0, 0}, ex = {0, 0, 0, 0};
     const double begin = glm53f_clock();
+    batch.n = 0; batch.st = &st;
     glm53f_pf_collecting = 1;
     for (int l = m->first_layer; l < m->end_layer && l < LAYERS; ++l) {
         target_plan_attention(m, l);
-        glm53f_cmg_place_table(node, nt, &st);
+        glm53f_cmg_place_table(&batch, node, nt);
         target_plan_ffn(m, l);
-        glm53f_cmg_place_table(node, nt, &st);
+        glm53f_cmg_place_table(&batch, node, nt);
     }
     glm53f_pf_collecting = 0;
     glm53f_pf_clear();
+    glm53f_cmg_batch_flush(&batch);
+    const double middle = glm53f_clock();
+    /* Routed experts follow the CMG-affine split; enable it with the placement. */
+    if (getenv("GLM53F_IQ_AFFINE") && atoi(getenv("GLM53F_IQ_AFFINE"))) {
+        batch.st = &ex;
+        glm53f_moe_stage_place_experts_12n(m->moe, &batch, nt, cmg_node);
+        glm53f_cmg_batch_flush(&batch);
+    }
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     if (!rank)
-        printf("GLM53F_CMG_PLACE threads=%d nodes=%d..%d pages=%ld moved=%ld already=%ld failed=%ld seconds=%.3f\n",
-               nt, node[0], node[nt - 1], st.requested, st.moved, st.already, st.failed, glm53f_clock() - begin);
+        printf("GLM53F_CMG_PLACE threads=%d cmg_nodes=%d,%d,%d,%d dense_pages=%ld moved=%ld already=%ld failed=%ld "
+               "expert_pages=%ld moved=%ld already=%ld failed=%ld seconds=%.3f,%.3f\n",
+               nt, cmg_node[0], cmg_node[1], cmg_node[2], cmg_node[3], st.requested, st.moved, st.already,
+               st.failed, ex.requested, ex.moved, ex.already, ex.failed, middle - begin, glm53f_clock() - middle);
     return 0;
 }
 int glm53f_target_model_step_12n(glm53f_target_model_12n *m, int token,

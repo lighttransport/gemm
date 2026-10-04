@@ -38,39 +38,65 @@ static inline int glm53f_cmg_thread_nodes(int *node, int max_threads) {
     return bad || nt > max_threads ? -1 : nt;
 }
 
-static inline int glm53f_cmg_flush(void **pages, int *nodes, int *status, int n,
-                                   glm53f_cmg_place_stats *st) {
-    if (!n) return 0;
-    long rc = syscall(SYS_move_pages, 0, (unsigned long)n, pages, nodes, status, 1L /* MPOL_MF_MOVE */);
-    if (rc < 0) { st->failed += n; return -1; }
-    for (int i = 0; i < n; ++i) {
-        if (status[i] == nodes[i]) ++st->moved;
-        else if (status[i] >= 0) ++st->already;
-        else ++st->failed;
+typedef struct glm53f_cmg_batch {
+    void *pages[GLM53F_CMG_PLACE_BATCH];
+    int nodes[GLM53F_CMG_PLACE_BATCH], status[GLM53F_CMG_PLACE_BATCH], n;
+    glm53f_cmg_place_stats *st;
+} glm53f_cmg_batch;
+
+static inline void glm53f_cmg_batch_flush(glm53f_cmg_batch *b) {
+    if (!b->n) return;
+    long rc = syscall(SYS_move_pages, 0, (unsigned long)b->n, b->pages, b->nodes, b->status, 1L /* MPOL_MF_MOVE */);
+    if (rc < 0) b->st->failed += b->n;
+    else
+        for (int i = 0; i < b->n; ++i) {
+            if (b->status[i] == b->nodes[i]) ++b->st->moved;
+            else if (b->status[i] >= 0) ++b->st->already;
+            else ++b->st->failed;
+        }
+    b->n = 0;
+}
+/* Pages whose midpoint lies in [lo, hi) go to node; a range smaller than a
+ * page keeps the page holding its start. */
+static inline void glm53f_cmg_add_range(glm53f_cmg_batch *b, uintptr_t lo, uintptr_t hi, int node) {
+    const uintptr_t ps = (uintptr_t)sysconf(_SC_PAGESIZE);
+    if (hi <= lo) return;
+    for (uintptr_t pg = lo & ~(ps - 1); pg < hi; pg += ps) {
+        const uintptr_t mid = pg + ps / 2;
+        if (!(mid >= lo && mid < hi) && !(pg <= lo && lo < pg + ps && hi - lo < ps)) continue;
+        b->pages[b->n] = (void *)pg; b->nodes[b->n] = node; ++b->st->requested;
+        if (++b->n == GLM53F_CMG_PLACE_BATCH) glm53f_cmg_batch_flush(b);
     }
-    return 0;
+}
+/* Row split of iq_cmg_bounds (glm53f_iq_bridge.c): CMG c owns rows [bound[c], bound[c+1]). */
+static inline void glm53f_cmg_row_bounds(int rows, int nt, int *bound) {
+    int cum = 0;
+    bound[0] = 0;
+    for (int c = 0; c < 4; ++c) {
+        int n = nt - c * 12; n = n < 0 ? 0 : (n > 12 ? 12 : n);
+        cum += n;
+        bound[c + 1] = c == 3 ? rows : (int)((long long)rows * cum / nt) & ~1;
+    }
+}
+/* Rows of one matrix split by CMG; cmg_node[c] is the NUMA node of CMG c. */
+static inline void glm53f_cmg_place_rows(glm53f_cmg_batch *b, const uint8_t *base, size_t row_bytes,
+                                         int rows, int nt, const int *cmg_node) {
+    int bound[5];
+    if (!base || !row_bytes || rows < 1) return;
+    glm53f_cmg_row_bounds(rows, nt, bound);
+    for (int c = 0; c < 4; ++c)
+        glm53f_cmg_add_range(b, (uintptr_t)(base + (size_t)bound[c] * row_bytes),
+                             (uintptr_t)(base + (size_t)bound[c + 1] * row_bytes), cmg_node[c]);
 }
 
 /* Place the spans currently in glm53f_pf_tab (one plan = one decode stage). */
-static inline void glm53f_cmg_place_table(const int *node, int nt, glm53f_cmg_place_stats *st) {
-    static void *pages[GLM53F_CMG_PLACE_BATCH];
-    static int nodes[GLM53F_CMG_PLACE_BATCH], status[GLM53F_CMG_PLACE_BATCH];
-    const uintptr_t ps = (uintptr_t)sysconf(_SC_PAGESIZE);
-    int n = 0;
+static inline void glm53f_cmg_place_table(glm53f_cmg_batch *b, const int *node, int nt) {
     if (nt > GLM53F_PF_MAX_THREADS) nt = GLM53F_PF_MAX_THREADS;
     for (int i = 0; i < glm53f_pf_tab.n; ++i)
         for (int t = 0; t < nt; ++t) {
             const glm53f_pf_span *sp = &glm53f_pf_tab.s[t][i];
-            if (!sp->p || !sp->len) continue;
-            const uintptr_t lo = (uintptr_t)sp->p, hi = lo + sp->len;
-            for (uintptr_t pg = lo & ~(ps - 1); pg < hi; pg += ps) {
-                const uintptr_t mid = pg + ps / 2;
-                /* Midpoint ownership; spans smaller than a page keep their first page. */
-                if (!(mid >= lo && mid < hi) && !(pg <= lo && lo < pg + ps && sp->len < ps)) continue;
-                pages[n] = (void *)pg; nodes[n] = node[t]; ++st->requested;
-                if (++n == GLM53F_CMG_PLACE_BATCH) { glm53f_cmg_flush(pages, nodes, status, n, st); n = 0; }
-            }
+            if (sp->p && sp->len)
+                glm53f_cmg_add_range(b, (uintptr_t)sp->p, (uintptr_t)sp->p + sp->len, node[t]);
         }
-    glm53f_cmg_flush(pages, nodes, status, n, st);
 }
 #endif

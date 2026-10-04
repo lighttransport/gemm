@@ -24,6 +24,7 @@
 #include "glm53f_prefill.h"
 #include "glm53f_moe_grouped_native.h"
 #include "glm53f_bf16_rows.h"
+#include "glm53f_cmg_place.h"
 #include "kern/glm53f_kern.h"
 #include "../../common/glm53f_safetensors.h"
 #include "../../common/glm53f_ref.h"
@@ -758,6 +759,25 @@ void glm53f_moe_stage_prefetch_plan_12n(glm53f_moe_stage_context_12n *c, int lay
         const glm53f_native_matrix dn = {NULL, c->nsh_d[t], c->nsh_dt[t], 4096, in};
         glm53f_pf_add_matvec(gu, 2);
         glm53f_pf_add_matvec(&dn, 1);
+    }
+}
+/* CMG-local placement of every routed-expert part this rank owns, matching the
+ * affine decode split (GLM53F_IQ_AFFINE=1): CMG c streams rows
+ * [bound[c], bound[c+1]) of each part's gate/up and down matrices. */
+void glm53f_moe_stage_place_experts_12n(glm53f_moe_stage_context_12n *c, glm53f_cmg_batch *b,
+                                        int nt, const int *cmg_node) {
+    if (!c || !c->blob || !c->table) return;
+    for (int li = 0; li < c->layer_count; ++li) {
+        const int t = c->first_layer + li - FIRST_LAYER;
+        if (t < 0 || t >= NLAYERS) continue;
+        for (int e = 0; e < NEXPERTS; ++e) {
+            const expert_offset *p = &c->table[(size_t)t * NEXPERTS + e];
+            if (p->gate_up == UINT64_MAX || !p->gate_type || !p->down_type) continue;
+            glm53f_cmg_place_rows(b, c->blob + p->gate_up, glm53f_iq_row_size(p->gate_type, 4096),
+                                  2 * p->inter, nt, cmg_node);
+            glm53f_cmg_place_rows(b, c->blob + p->down, glm53f_iq_row_size(p->down_type, p->inter),
+                                  4096, nt, cmg_node);
+        }
     }
 }
 void glm53f_moe_router_team_12n(void *context, const float *x) {
