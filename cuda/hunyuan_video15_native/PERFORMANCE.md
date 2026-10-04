@@ -11,6 +11,7 @@ runner process; stage splits come from its progress timestamps.
 | Before (bounded-replay build) | 392.2 s | ~8 s | 304 s | 68 s |
 | Fused DiT + threaded block prefetch + pipelined VAE tiles | **352.7 s** | 8 s | 285 s | 60 s |
 | … + opt-in cuDNN attention (`--cudnn-attention`) | **335.5 s** | 7 s | 267 s | 61 s |
+| VAE convolution work (default attention) | **344.8 s** | 7 s | 285 s | 52 s |
 
 The earlier PyTorch reference completes the same Fast12 video in 724.8 s (below).
 
@@ -28,6 +29,17 @@ Nsight Systems attribution, before → after (one run):
   Tile k+1 is enqueued before tile k is downloaded (pinned, async) and blended.
 - **Unchanged:** attention (~205 s, 31–32 TFLOPS FP16) and repository GEMM (~73 s,
   ~31 TFLOPS) dominate. Opt-in cuDNN SDPA brings DiT 285 → 267 s.
+
+VAE convolution (1.36 PFLOP per Fast12 decode, measured with `component_probe vae_decode`):
+
+| Change | Effect |
+|---|---|
+| Divide-free `conv_offset` (power-of-two channels, literal 3×3×3 taps, float-reciprocal row split) | identical offsets; kernel ~28.5 → ~30 TFLOPS |
+| Bias and residual add fused into the implicit-GEMM store | removes the `element` passes (3.3 s); bit-identical |
+| `conv_small_n` for `conv_out` (N=3) instead of a 128-wide MMA tile | 1.68 → 0.90 s; FP32 sum order differs (2.2e-6 relative L2, ≤1 level in 8-bit frames) |
+
+GPU kernel time for one VAE decode fell from ~56.5 s to ~47.6 s. Convolution runs at
+~30 TFLOPS, about 86% of the practical FP16 GEMM ceiling on this card.
 
 Numerics:
 

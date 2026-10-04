@@ -4,10 +4,14 @@ static Tensor residual(Gpu &g, Weights &w, const std::string &p, const Tensor &x
     auto z = g.optimized ? g.norm_silu(w,p+".norm1",x) : g.op(g.norm(w, p + ".norm1", x, 2), 3);
     z = g.conv(w, p + ".conv1.conv", z);
     z = g.optimized ? g.norm_silu(w,p+".norm2",z) : g.op(g.norm(w, p + ".norm2", z, 2), 3);
-    z = g.conv(w, p + ".conv2.conv", z);
     auto skip = x;
     if (w.has(p + ".nin_shortcut.weight"))
         skip = g.conv(w, p + ".nin_shortcut", x, false);
+#ifndef HV15N_ROCM
+    if (g.optimized && !g.vendor)
+        return g.conv_add(w, p + ".conv2.conv", z, skip); // residual fused into the conv epilogue
+#endif
+    z = g.conv(w, p + ".conv2.conv", z);
     return g.op(skip, 1, &z);
 }
 static Tensor middle(Gpu &g, Weights &w, const std::string &p, Tensor x) {

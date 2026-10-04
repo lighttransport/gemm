@@ -719,6 +719,16 @@ void Gpu::use_cudnn(const std::string &bridge, const char *cudnn_path) {
   cudnn_attention = attention;
   cudnn_info = info;
 }
+Tensor Gpu::conv_add(Weights &w, const std::string &prefix, const Tensor &x, const Tensor &residual) {
+  conv_residual = &residual;
+  fused_residual = false;
+  Tensor y;
+  try { y = conv(w, prefix, x); } catch (...) { conv_residual = nullptr; throw; }
+  conv_residual = nullptr;
+  // Paths without the fused epilogue (1x1, im2col, small-N) add the residual here.
+  if (!fused_residual) y = op(residual, 1, &y);
+  return y;
+}
 Tensor Gpu::unpack_rows_half(const Tensor &packed, int row0, int count) {
   int heads = packed.shape[0], total = packed.shape[1], dim = packed.shape[2];
   auto y = empty_half({count, heads * dim});
@@ -938,19 +948,30 @@ Tensor Gpu::conv(Weights &w, const std::string &prefix, const Tensor &x,
     }
     auto hx = half(x);
     int m = x.rows(), n = ws[0], inner = weights.channels(), channels = x.channels(), replicate = int(causal);
+    CUdeviceptr bias_pointer = bias.pointer, residual_pointer = 0;
     CUfunction fn;
-    check(cuModuleGetFunction(&fn, mma, "conv_f16_implicit"), "implicit convolution lookup");
     void *params[] = {&y.pointer,&hx.pointer,&reordered.pointer,&m,&n,&inner,
-                     &t,&h,&width,&channels,&kt,&kh,&kw,&replicate};
+                     &t,&h,&width,&channels,&kt,&kh,&kw,&replicate,&bias_pointer,&residual_pointer};
     poll();
-    check(cuLaunchKernel(fn, (((n+127)/128+3)&~3), (((m+63)/64+3)&~3), 1,
-                         256,1,1,24576,stream,params,nullptr), "implicit convolution");
-    if (bias.pointer) {
-      CUdeviceptr zero = 0;
-      launch("element", int((y.count()+255)/256),1,1,256,1,0,y.pointer,y.pointer,
-             zero,bias.pointer,int(y.count()),y.channels(),6,1.f,0.f);
+    if (n <= 4 && n * inner * 4 <= 48 * 1024 && channels % 128 == 0) {
+      void *small[] = {&y.pointer,&hx.pointer,&reordered.pointer,&bias_pointer,&m,&n,&inner,
+                       &t,&h,&width,&channels,&kt,&kh,&kw,&replicate};
+      check(cuModuleGetFunction(&fn, mma, "conv_small_n"), "small convolution lookup");
+      unsigned shared = unsigned(n * inner * 4);
+      require(shared <= 48 * 1024 && channels % 128 == 0, "small convolution geometry");
+      check(cuLaunchKernel(fn, 36 * 8, 1, 1, 256, 1, 1, shared, stream, small, nullptr), "small convolution");
+    } else {
+      if (conv_residual) {
+        require(conv_residual->count() == y.count() && conv_residual->element_bytes == 4, "residual shape");
+        residual_pointer = conv_residual->pointer;
+        fused_residual = true;
+      }
+      check(cuModuleGetFunction(&fn, mma, "conv_f16_implicit"), "implicit convolution lookup");
+      check(cuLaunchKernel(fn, (((n+127)/128+3)&~3), (((m+63)/64+3)&~3), 1,
+                           256,1,1,24576,stream,params,nullptr), "implicit convolution");
     }
     repo_gemm++; conv_chunks++;
+    conv_flops += 2.0 * m * n * inner;
     return y;
   }
   int chunk = optimized ? std::max(1, std::min(32768, int((128ull << 20) / (weights.channels() * 2ull))))
@@ -1037,6 +1058,7 @@ std::string Gpu::metrics() const {
     << ",\"weight_cache_hits\":" << weight_hits
     << ",\"upload_bytes\":" << upload_bytes
     << ",\"cudnn_attention_calls\":" << cudnn_calls
+    << ",\"conv_gflop\":" << conv_flops / 1e9
     << ",\"flash_calls\":" << flash_calls
     << ",\"gemm_v7_calls\":" << gemm_v7_calls
     << ",\"ieee_tiled_calls\":" << ieee_tiled_calls

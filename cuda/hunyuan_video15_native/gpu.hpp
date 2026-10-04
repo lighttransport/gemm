@@ -78,6 +78,7 @@ struct Gpu {
   std::string active_weight_file;
   uint64_t allocations = 0, buffer_reuses = 0, upload_bytes = 0, weight_hits = 0;
   uint64_t flash_calls = 0, gemm_v7_calls = 0, conv_chunks = 0;
+  double conv_flops = 0, conv_seconds = 0; // implicit-GEMM convolution work (metrics)
   uint64_t ieee_tiled_calls = 0;
 #ifdef HV15N_ROCM
   uint64_t f16_tiled_calls = 0;
@@ -154,6 +155,11 @@ struct Gpu {
   Tensor flash_half(const Tensor &q, const Tensor &k, const Tensor &v, int rows, int heads,
                     int dim);
   Tensor unpack_rows_half(const Tensor &packed, int row0, int count);
+  // Convolution with the residual add fused into the implicit-GEMM epilogue.
+  Tensor conv_add(Weights &weights, const std::string &prefix, const Tensor &input,
+                  const Tensor &residual);
+  const Tensor *conv_residual = nullptr;
+  bool fused_residual = false; // set when conv() consumed conv_residual
 #endif
   std::array<Tensor, 3> qkv_heads(Weights &weights, const std::string &prefix,
                                 const Tensor &qkv, int height, int width, bool image);

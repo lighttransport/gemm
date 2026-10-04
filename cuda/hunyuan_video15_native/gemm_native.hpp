@@ -80,7 +80,18 @@ inline std::string implicit_conv_source(const std::string &base) {
         require(count > 0, "repository convolution source signature changed");
     };
     replace("gemm_f16_v7", "conv_f16_implicit");
-    replace("int M, int N, int K)", "int M, int N, int K, int T, int H, int Wd, int C, int KT, int KH, int KW, int replicate)");
+    replace("int M, int N, int K)", "int M, int N, int K, int T, int H, int Wd, int C, int KT, int KH, int KW, int replicate, const float *conv_bias, const float *conv_res)");
+    // Fused bias epilogue: the same single FP32 add as the separate bias pass.
+    for (const char *part : {"Y[(size_t)yr0 * N + yc0] = d0[nt];", "Y[(size_t)yr0 * N + yc1] = d1[nt];",
+                             "Y[(size_t)yr1 * N + yc0] = d2[nt];", "Y[(size_t)yr1 * N + yc1] = d3[nt];"}) {
+        std::string from = part, column = from.substr(from.find("+ ") + 2, 3),
+                    value = from.substr(from.find("= ") + 2, 6);
+        // Fused epilogue: bias (single FP32 add), then the optional residual (skip + y),
+        // matching the separate bias and residual passes exactly.
+        std::string index = from.substr(from.find('[') + 1, from.find(']') - from.find('[') - 1);
+        replace(from, "{ float v_ = conv_bias ? " + value + " + conv_bias[" + column + "] : " + value +
+                          "; Y[" + index + "] = conv_res ? conv_res[" + index + "] + v_ : v_; }");
+    }
     replace("if (cta_m >= M) return;", "if (cta_m >= M || cta_n >= N) return;");
     for (const std::string &offset : {std::string("0"), std::string("next_k")}) {
         replace("const half_raw *src = &X[(size_t)g_row_a * K + " + offset + " + col_a];",
@@ -98,13 +109,97 @@ inline std::string implicit_conv_source(const std::string &base) {
         pos = instruction + 45;
     }
     return R"CUDA(
+// Exact quotient of non-negative n < 2^24 by d >= 1 without an integer divide:
+// a float estimate corrected by at most one step.
+__device__ __forceinline__ int conv_div(int n, int d) {
+    int q=__float2int_rz(__int2float_rn(n)*__frcp_rn(__int2float_rn(d)));
+    if(q*d>n)q--; else if((q+1)*d<=n)q++;
+    return q;
+}
 __device__ __forceinline__ long long conv_offset(int r, int k, int T,int H,int W,int C,int KT,int KH,int KW,int replicate) {
-    int channel=k%C, point=k/C;
-    int dx=point%KW-KW/2,dy=(point/KW)%KH-KH/2,dt=point/(KW*KH)-(replicate?KT-1:0);
-    int x=r%W+dx,y=(r/W)%H+dy,t=r/(W*H)+dt;
+    // Same offsets as the divide-based form: C is a power of two for every VAE layer
+    // (shift/mask), 3x3x3 taps divide by literals, and row splits use conv_div.
+    int channel,point;
+    if((C&(C-1))==0){int s=__ffs(C)-1;channel=k&(C-1);point=k>>s;}else{channel=k%C;point=k/C;}
+    int dx,dy,dt;
+    if(KW==3&&KH==3){dx=point%3-1;dy=(point/3)%3-1;dt=point/9-(replicate?KT-1:0);}
+    else{dx=point%KW-KW/2;dy=(point/KW)%KH-KH/2;dt=point/(KW*KH)-(replicate?KT-1:0);}
+    int rw=conv_div(r,W),plane=conv_div(rw,H);
+    int x=r-rw*W+dx,y=rw-plane*H+dy,t=plane+dt;
     if(replicate){x=max(0,min(W-1,x));y=max(0,min(H-1,y));t=max(0,min(T-1,t));}
     if(x<0||x>=W||y<0||y>=H||t<0||t>=T)return -1;
     return ((long long)t*H*W+y*W+x)*C+channel;
+}
+// Few-output-channel convolution (decoder conv_out, N=3): weights in shared memory as
+// FP32; each half-warp covers one output row with 16-byte (8-channel) input loads.
+extern "C" __global__ __launch_bounds__(256) void conv_small_n(float *Y, const half_raw *X,
+        const half_raw *Wt, const float *bias, int M, int N, int K, int T, int H, int Wd, int C,
+        int KT, int KH, int KW, int replicate) {
+    extern __shared__ float wsm[]; // [N][K]
+    const unsigned short *wraw = reinterpret_cast<const unsigned short *>(Wt);
+    // Bank-conflict-free layout: within each 128-channel chunk, channel lane*8+j is
+    // stored at j*16+lane so a half-warp reads consecutive words for fixed j.
+    for (int i = threadIdx.x; i < N * K; i += blockDim.x) {
+        int c = i % 128, rest = i - c;
+        float wv; asm("cvt.f32.f16 %0,%1;" : "=f"(wv) : "h"(wraw[i]));
+        wsm[rest + (c & 7) * 16 + (c >> 3)] = wv;
+    }
+    __syncthreads();
+    int lane = threadIdx.x & 15, group = (blockIdx.x * blockDim.x + threadIdx.x) >> 4;
+    int groups = gridDim.x * blockDim.x >> 4, volume = KT * KH * KW;
+    for (int row = group; row < M; row += groups) {
+        float acc[4] = {0.f, 0.f, 0.f, 0.f};
+        // Row coordinates once per row; per-tap offsets follow conv_offset's rules.
+        int rw = conv_div(row, Wd), plane = conv_div(rw, H);
+        int x0 = row - rw * Wd, y0 = rw - plane * H, t0 = plane;
+        if (volume == 27 && C == 128) {
+            // Issue all 27 tap loads before the arithmetic (memory-level parallelism).
+            uint4 taps[27];
+#pragma unroll
+            for (int point = 0; point < 27; point++) {
+                int dx = point % 3 - 1, dy = (point / 3) % 3 - 1, dt = point / 9 - (replicate ? KT - 1 : 0);
+                int x = x0 + dx, y = y0 + dy, t = t0 + dt;
+                if (replicate) { x = max(0, min(Wd - 1, x)); y = max(0, min(H - 1, y)); t = max(0, min(T - 1, t)); }
+                bool inside = x >= 0 && x < Wd && y >= 0 && y < H && t >= 0 && t < T;
+                long long base = ((long long)t * H * Wd + y * Wd + x) * 128 + lane * 8;
+                taps[point] = inside ? *reinterpret_cast<const uint4 *>(reinterpret_cast<const unsigned short *>(X) + base)
+                                     : make_uint4(0, 0, 0, 0);
+            }
+#pragma unroll
+            for (int point = 0; point < 27; point++) {
+                const unsigned short *h = reinterpret_cast<const unsigned short *>(&taps[point]);
+#pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    float xv; asm("cvt.f32.f16 %0,%1;" : "=f"(xv) : "h"(h[j]));
+                    _Pragma("unroll") for (int o = 0; o < 4; o++) if (o < N)
+                        acc[o] = fmaf(xv, wsm[o * K + point * 128 + j * 16 + lane], acc[o]);
+                }
+            }
+        } else
+        for (int point = 0; point < volume; point++) {
+            int dx = point % KW - KW / 2, dy = (point / KW) % KH - KH / 2,
+                dt = point / (KW * KH) - (replicate ? KT - 1 : 0);
+            int x = x0 + dx, y = y0 + dy, t = t0 + dt;
+            if (replicate) { x = max(0, min(Wd - 1, x)); y = max(0, min(H - 1, y)); t = max(0, min(T - 1, t)); }
+            if (x < 0 || x >= Wd || y < 0 || y >= H || t < 0 || t >= T) continue;
+            long long base = ((long long)t * H * Wd + y * Wd + x) * C;
+            for (int c = lane * 8; c < C; c += 128) {
+                uint4 packed = *reinterpret_cast<const uint4 *>(reinterpret_cast<const unsigned short *>(X) + base + c);
+                const unsigned short *h = reinterpret_cast<const unsigned short *>(&packed);
+#pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    float xv; asm("cvt.f32.f16 %0,%1;" : "=f"(xv) : "h"(h[j]));
+                    _Pragma("unroll") for (int o = 0; o < 4; o++) if (o < N)
+                        acc[o] = fmaf(xv, wsm[o * K + point * C + (c - lane * 8) + j * 16 + lane], acc[o]);
+                }
+            }
+        }
+        _Pragma("unroll") for (int o = 0; o < 4; o++) if (o < N) {
+            float v = acc[o];
+            for (int d = 8; d; d >>= 1) v += __shfl_xor_sync(0xffffffffu, v, d, 16);
+            if (lane == 0) Y[(size_t)row * N + o] = bias ? v + bias[o] : v;
+        }
+    }
 }
 )CUDA" + source;
 }
