@@ -43,8 +43,8 @@ Weights stream per block from mmap, and a 64 GB host is required.
   | stage | native CUDA | PyTorch reference |
   |---|---|---|
   | Qwen3-VL text encoder | 6.0 s | 40 s |
-  | DiT, per Euler update (50 blocks) | 84 s | ~128 s |
-  | VAE decode (124 frames) | 72 s | 249 s |
+  | DiT, per Euler update (50 blocks) | 82 s | ~128 s |
+  | VAE decode (124 frames) | 68 s | 249 s |
 
   DiT attention runs at the same speed as PyTorch's (32.7 vs 32.4 TFLOPS) and is
   ~65% of DiT time. DiT INT8 weights for block i+1 are prefetched by a worker
@@ -135,3 +135,14 @@ against 0.044 / 0.076).
   quantization. There are no block barriers per group and no 28 KB shared buffer.
   `h3x_row_quant` went from 2.97 to 1.88 s per update (~70% of memory bandwidth),
   bit-identical. DiT 88 → 84 s.
+- **GPU idle removal:**
+  - The DiT/Qwen prefetch stages every tensor of the next layer (norms, scales,
+    biases, adaLN), and the GPU converts them, so the compute stream never queues
+    host-to-device copies behind prefetch traffic. DiT idle fell from ~7 s to ~1.4 s
+    per update.
+  - The VAE runs one tile pipeline across all temporal chunks with uninitialized
+    double-buffered canvases.
+  - The 4.6 GB decoder is bulk-staged into the weight cache by the parallel prefetch
+    worker, while dummy cuBLASLt GEMMs load the projection kernels.
+  - VAE idle fell from ~6.5 s to ~4 s at full resolution, and to 0.75 s inside the
+    39-frame probe. Outputs are bit-identical.

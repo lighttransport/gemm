@@ -64,7 +64,9 @@ struct Engine {
     // DiT INT8 weight prefetch: a worker thread copies block i+1 from the mmap into
     // pinned chunks and uploads them on a private stream while block i computes.
     struct Prefetched {
-        Tensor w;
+        Tensor w; // raw checkpoint bytes
+        std::vector<int> shape;
+        std::string dtype;
         CUevent ready = nullptr;
     };
     std::map<std::string, Prefetched> prefetched;
@@ -170,12 +172,16 @@ struct Engine {
         std::vector<std::pair<const void *, Prefetched *>> jobs;
         for (int i = 0; i < w.context->n_tensors; i++) {
             std::string name = w.context->tensors[i].name;
-            if (name.compare(0, prefix.size(), prefix) || w.dtype(name) != "I8" ||
-                name.size() < 7 || name.compare(name.size() - 7, 7, ".weight") ||
-                prefetched.count(name))
+            // Every tensor of the layer: small ones too, so the compute stream never
+            // queues host-to-device copies behind the large prefetch transfers.
+            auto dtype = w.dtype(name);
+            if (name.compare(0, prefix.size(), prefix) || prefetched.count(name) ||
+                (dtype != "I8" && dtype != "F32" && dtype != "F16" && dtype != "BF16"))
                 continue;
             auto &entry = prefetched[name];
-            entry.w = byte_tensor(w.shape(name));
+            entry.shape = w.shape(name);
+            entry.dtype = dtype;
+            entry.w = byte_tensor({int(product(entry.shape) * safetensors_dtype_size(dtype.c_str()))});
             g.check(cuEventCreate(&entry.ready, CU_EVENT_DISABLE_TIMING), "prefetch event");
             jobs.push_back({w.data(name), &entry});
         }
@@ -208,18 +214,87 @@ struct Engine {
             }
         });
     }
-    // Returns a prefetched matrix (ordering the compute stream after its upload).
+    // Returns a prefetched INT8 matrix (ordering the compute stream after its upload).
     bool take_prefetched(const std::string &name, Tensor &out) {
         auto it = prefetched.find(name);
-        if (it == prefetched.end())
+        if (it == prefetched.end() || it->second.dtype != "I8")
             return false;
         g.check(cuStreamWaitEvent(g.stream, it->second.ready, 0), "prefetched weight");
         cuEventDestroy(it->second.ready);
         out = std::move(it->second.w);
+        out.shape = it->second.shape;
         prefetched.erase(it);
         prefetch_hits++;
         return true;
     }
+#endif
+#ifndef HV15N_ROCM
+    // Bulk-stages every FP16 tensor under `prefix` through the parallel prefetch worker
+    // straight into the Gpu weight cache (as Gpu::weight_half would place them).
+    void warm_half_cache(Weights &w, const std::string &prefix) {
+        if (g.active_weight_file != w.identity) {
+            g.clear_weights();
+            g.active_weight_file = w.identity;
+        }
+        prefetch(w, prefix);
+        // While the worker copies, load the cuBLASLt kernels for the VAE projection
+        // shapes (lazy module loading otherwise idles the GPU at the first tile).
+        if (vae_lt && trace.empty()) {
+            if (!rotation_blas)
+                require(cublasewCreate(&rotation_blas, g.stream) == 0, "cuBLAS unavailable");
+            const int rows = 7 * 256 + 5;
+            auto x = g.empty_half({rows, 8192}), wt = g.empty_half({16384, 8192}),
+                 y = g.empty_half({rows, 16384}), b = g.empty_half({16384});
+            for (auto [n, k] : {std::pair<int, int>{6144, 2048}, {2048, 2048}, {16384, 2048},
+                                {2048, 8192}})
+                cublasew_gemm_f16_f16_f32_lt_bias_rowmajor_nt(rotation_blas, y.pointer, wt.pointer,
+                                                              x.pointer, b.pointer, 0, 2, rows, n, k);
+        }
+        prefetch_join();
+        for (auto it = prefetched.begin(); it != prefetched.end();) {
+            auto &entry = it->second;
+            if (entry.dtype != "F16") {
+                ++it;
+                continue;
+            }
+            g.check(cuStreamWaitEvent(g.stream, entry.ready, 0), "warm weight");
+            cuEventDestroy(entry.ready);
+            Tensor t = entry.w;
+            t.shape = entry.shape;
+            t.element_bytes = 2;
+            g.packed_weights[w.identity + ":f16:" + it->first] = t;
+            g.cached_weight_bytes += t.bytes();
+            it = prefetched.erase(it);
+        }
+        prefetch_release();
+    }
+#endif
+    // FP32 copy of a checkpoint tensor: from the prefetch buffer when staged (converted
+    // on the GPU), otherwise through the regular weight cache.
+    Tensor weight32(Weights &w, const std::string &name) {
+#ifndef HV15N_ROCM
+        auto it = prefetched.find(name);
+        if (it != prefetched.end() && it->second.dtype != "I8") {
+            g.check(cuStreamWaitEvent(g.stream, it->second.ready, 0), "prefetched weight");
+            cuEventDestroy(it->second.ready);
+            auto entry = std::move(it->second);
+            prefetched.erase(it);
+            prefetch_hits++;
+            if (entry.dtype == "F32") {
+                entry.w.shape = entry.shape;
+                entry.w.element_bytes = 4;
+                return entry.w;
+            }
+            auto out = g.empty(entry.shape);
+            g.launch(entry.dtype == "F16" ? "convert_float" : "convert_bfloat",
+                     int((out.count() + 255) / 256), 1, 1, 256, 1, 0, out.pointer, entry.w.pointer,
+                     int(out.count()));
+            return out;
+        }
+#endif
+        return g.weight(w, name);
+    }
+#ifndef HV15N_ROCM
 #endif
     explicit Engine(const h3_config &c)
         : g(c.device, c.vram_budget_mib, false, false), root(c.model_dir),
@@ -418,7 +493,7 @@ struct Engine {
                     w = e.byte_tensor(shape);
                     e.g.upload_staged(w, weights.data(name + ".weight"), e.g.stream);
                 }
-                scale = e.g.weight(weights, name + ".weight_scale");
+                scale = e.weight32(weights, name + ".weight_scale");
             } else if (kind == 1 && !precise) {
                 // Preserve BF16 weights; FP16 conversion loses subnormal bits.
                 w = e.g.empty_half(shape);
@@ -430,11 +505,11 @@ struct Engine {
                                w.pointer, full.pointer, int64_t(w.count()));
                 }
             } else {
-                w = precise ? e.g.weight(weights, name + ".weight")
+                w = precise ? e.weight32(weights, name + ".weight")
                             : e.g.weight_half(weights, name + ".weight");
             }
             if (weights.has(name + ".bias"))
-                bias = e.g.weight(weights, name + ".bias");
+                bias = e.weight32(weights, name + ".bias");
         }
         Tensor operator()(const Tensor &x) {
             require(x.channels() == w.shape[1] && x.element_bytes == 4, "linear input");
@@ -760,8 +835,9 @@ struct Engine {
     void dit_block_fused(Weights &w, const std::string &p, Tensor &x, const Tensor &mod,
                          const Tensor &rotation, int text, int audio) {
         const int rows = x.rows(), k = x.channels();
-        auto n1 = g.weight(w, p + ".norm1.weight"), n2 = g.weight(w, p + ".norm2.weight");
-        auto qn = g.weight(w, p + ".attn.q_norm.weight"), kn = g.weight(w, p + ".attn.k_norm.weight");
+        auto n1 = weight32(w, p + ".norm1.weight"), n2 = weight32(w, p + ".norm2.weight");
+        auto qn = weight32(w, p + ".attn.q_norm.weight"),
+             kn = weight32(w, p + ".attn.k_norm.weight");
         {
             Linear qkv(*this, w, p + ".attn.qkv_proj", 1), out(*this, w, p + ".attn.out_proj", 1);
             require(qkv.quant && out.quant, "fused DiT expects INT8 projections");
@@ -1210,125 +1286,6 @@ struct Engine {
             out.start.push_back(out.start.back() + 256 - out.overlap[i]);
         return out;
     }
-    std::vector<float> decode_spatial(Weights &w, const std::vector<float> &latent, int t, int h,
-                                      int width) {
-        const int height = h * 16, wide = width * 16;
-        auto ys = tiles(height), xs = tiles(wide);
-        std::vector<float> canvas(size_t(t * 4) * height * wide * 3), strip, newstrip, left;
-        std::vector<std::pair<size_t, size_t>> order;
-        for (size_t iy = 0; iy < ys.start.size(); iy++)
-            for (size_t ix = 0; ix < xs.start.size(); ix++)
-                order.push_back({iy, ix});
-        // Double-buffered pipeline: tile k+1 is enqueued before tile k is blended on the
-        // host, so CPU stitching and the pixel download overlap GPU decoding.
-        struct Slot {
-            float *host = nullptr;
-            CUevent ready = nullptr;
-        };
-        const size_t slot_bytes = size_t(t * 4) * 256 * 256 * 3 * 4;
-        std::array<Slot, 2> slots;
-        struct SlotGuard {
-            std::array<Slot, 2> &s;
-            Gpu &g;
-            ~SlotGuard() {
-                cuStreamSynchronize(g.stream);
-                for (auto &x : s) {
-                    if (x.ready)
-                        cuEventDestroy(x.ready);
-                    if (x.host)
-                        cuMemFreeHost(x.host);
-                }
-            }
-        } guard{slots, g};
-        for (auto &slot : slots) {
-            g.check(cuMemHostAlloc(reinterpret_cast<void **>(&slot.host), slot_bytes, 0),
-                    "VAE pinned tile");
-            g.check(cuEventCreate(&slot.ready, CU_EVENT_DISABLE_TIMING), "VAE tile event");
-        }
-        auto start = [&](size_t k) {
-            auto [iy, ix] = order[k];
-            int th = ys.length[iy] / 16, tw = xs.length[ix] / 16, y0 = ys.start[iy] / 16,
-                x0 = xs.start[ix] / 16;
-            std::vector<float> z(size_t(t) * th * tw * 24);
-            for (int tt = 0; tt < t; tt++)
-                for (int y = 0; y < th; y++)
-                    for (int x = 0; x < tw; x++)
-                        std::copy_n(latent.data() + (((size_t)tt * h + y0 + y) * width + x0 + x) * 24,
-                                    24, z.data() + (((size_t)tt * th + y) * tw + x) * 24);
-            auto pixels = decode_tile(w, z, t, th, tw);
-            require(pixels.bytes() <= slot_bytes, "VAE tile exceeds pinned slot");
-            auto &slot = slots[k % 2];
-            g.check(cuMemcpyDtoHAsync(slot.host, pixels.pointer, pixels.bytes(), g.stream),
-                    "VAE tile download");
-            g.check(cuEventRecord(slot.ready, g.stream), "VAE tile ready");
-        };
-        start(0);
-        for (size_t k = 0; k < order.size(); k++) {
-            if (k + 1 < order.size())
-                start(k + 1);
-            auto [iy, ix] = order[k];
-            g.check(cuEventSynchronize(slots[k % 2].ready), "VAE tile wait");
-            g.poll();
-            float *pixel = slots[k % 2].host;
-            if (ix == 0) {
-                if (iy)
-                    strip = std::move(newstrip);
-                newstrip.assign(iy + 1 < ys.start.size()
-                                    ? size_t(t * 4) * ys.overlap[iy] * wide * 3
-                                    : 0,
-                                0.f);
-            }
-            int overlap_y = iy ? ys.overlap[iy - 1] : 0;
-            int th = ys.length[iy] / 16, tw = xs.length[ix] / 16;
-            int ph = th * 16, pw = tw * 16, ox = ix ? xs.overlap[ix - 1] : 0;
-            for (int tt = 0; tt < t * 4; tt++)
-                for (int y = 0; y < ph; y++)
-                    for (int x = 0; x < pw; x++)
-                        for (int c = 0; c < 3; c++) {
-                            size_t at = (((size_t)tt * ph + y) * pw + x) * 3 + c;
-                            float v = pixel[at];
-                            require(std::isfinite(v), "nonfinite inference tensor");
-                            if (y < overlap_y) {
-                                v = blend_half(strip[(((size_t)tt * overlap_y + y) * wide +
-                                                      xs.start[ix] + x) *
-                                                         3 +
-                                                     c],
-                                               v, y, overlap_y);
-                            }
-                            if (x < ox) {
-                                v = blend_half(left[(((size_t)tt * ph + y) * ox + x) * 3 + c], v,
-                                               x, ox);
-                            }
-                            pixel[at] = v;
-                        }
-            int keepw = pw - (ix + 1 < xs.start.size() ? xs.overlap[ix] : 0),
-                keeph = ph - (iy + 1 < ys.start.size() ? ys.overlap[iy] : 0);
-            if (ix + 1 < xs.start.size()) {
-                int tail = xs.overlap[ix];
-                left.resize(size_t(t * 4) * ph * tail * 3);
-                for (int tt = 0; tt < t * 4; tt++)
-                    for (int y = 0; y < ph; y++)
-                        std::copy_n(pixel + (((size_t)tt * ph + y) * pw + pw - tail) * 3, tail * 3,
-                                    left.data() + ((size_t)tt * ph + y) * tail * 3);
-            }
-            for (int tt = 0; tt < t * 4; tt++)
-                for (int y = 0; y < keeph; y++)
-                    std::copy_n(pixel + ((size_t)tt * ph + y) * pw * 3, keepw * 3,
-                                canvas.data() +
-                                    (((size_t)tt * height + ys.start[iy] + y) * wide + xs.start[ix]) *
-                                        3);
-            if (iy + 1 < ys.start.size()) {
-                int tail = ys.overlap[iy];
-                for (int tt = 0; tt < t * 4; tt++)
-                    for (int y = 0; y < tail; y++)
-                        std::copy_n(pixel + ((size_t)tt * ph + ph - tail + y) * pw * 3, keepw * 3,
-                                    newstrip.data() +
-                                        (((size_t)tt * tail + y) * wide + xs.start[ix]) * 3);
-            }
-            std::cerr << "H3 VAE tile " << iy + 1 << "," << ix + 1 << "\n";
-        }
-        return canvas;
-    }
     void decode(const Tensor &video, int t, int h, int width, int requested, const h3_callbacks &cb,
                 const fs::path &dump) {
         struct VendorGuard {
@@ -1349,6 +1306,9 @@ struct Engine {
             g.vendor = true;
         }
         Weights w(root / "vae/minimax_h3_video_vae_fp16.safetensors");
+#ifndef HV15N_ROCM
+        warm_half_cache(w, "decoder.");
+#endif
         auto latent = g.download(video), mean = w.floats("latents_mean"),
              stddev = w.floats("latents_std");
         for (size_t i = 0; i < latent.size(); i++)
@@ -1386,12 +1346,77 @@ struct Engine {
                     "frame callback cancelled");
             emitted++;
         };
+        // One tile pipeline across all temporal chunks: tile k+1 (possibly of the next
+        // chunk) is enqueued before tile k is stitched on the host, and finished chunks
+        // are blended and emitted on a worker, so chunk boundaries do not idle the GPU.
+        const int height = h * 16, wide = width * 16;
+        auto ys = tiles(height), xs = tiles(wide);
+        struct Item {
+            int chunk;
+            size_t iy, ix;
+        };
+        std::vector<Item> order;
+        std::vector<int> counts(chunks);
         for (int i = 0; i < chunks; i++) {
-            int count = std::min(7, t + padded - i * 5);
-            std::vector<float> clip(latent.begin() + size_t(i * 5) * h * width * 24,
-                                    latent.begin() + size_t(i * 5 + count) * h * width * 24);
-            auto frames = decode_spatial(w, clip, count, h, width);
-            int first = std::min(20, count * 4) - 3;
+            counts[i] = std::min(7, t + padded - i * 5);
+            for (size_t iy = 0; iy < ys.start.size(); iy++)
+                for (size_t ix = 0; ix < xs.start.size(); ix++)
+                    order.push_back({i, iy, ix});
+        }
+        struct Slot {
+            float *host = nullptr;
+            CUevent ready = nullptr;
+        };
+        const size_t slot_bytes = size_t(7 * 4) * 256 * 256 * 3 * 4;
+        std::array<Slot, 2> slots;
+        struct SlotGuard {
+            std::array<Slot, 2> &s;
+            Gpu &g;
+            ~SlotGuard() {
+                cuStreamSynchronize(g.stream);
+                for (auto &x : s) {
+                    if (x.ready)
+                        cuEventDestroy(x.ready);
+                    if (x.host)
+                        cuMemFreeHost(x.host);
+                }
+            }
+        } slot_guard{slots, g};
+        for (auto &slot : slots) {
+            g.check(cuMemHostAlloc(reinterpret_cast<void **>(&slot.host), slot_bytes, 0),
+                    "VAE pinned tile");
+            g.check(cuEventCreate(&slot.ready, CU_EVENT_DISABLE_TIMING), "VAE tile event");
+        }
+        auto start = [&](size_t k) {
+            auto [i, iy, ix] = order[k];
+            int count = counts[i], th = ys.length[iy] / 16, tw = xs.length[ix] / 16,
+                y0 = ys.start[iy] / 16, x0 = xs.start[ix] / 16;
+            std::vector<float> z(size_t(count) * th * tw * 24);
+            for (int tt = 0; tt < count; tt++)
+                for (int y = 0; y < th; y++)
+                    for (int x = 0; x < tw; x++)
+                        std::copy_n(latent.data() +
+                                        (((size_t)(i * 5 + tt) * h + y0 + y) * width + x0 + x) * 24,
+                                    24, z.data() + (((size_t)tt * th + y) * tw + x) * 24);
+            auto pixels = decode_tile(w, z, count, th, tw);
+            require(pixels.bytes() <= slot_bytes, "VAE tile exceeds pinned slot");
+            auto &slot = slots[k % 2];
+            g.check(cuMemcpyDtoHAsync(slot.host, pixels.pointer, pixels.bytes(), g.stream),
+                    "VAE tile download");
+            g.check(cuEventRecord(slot.ready, g.stream), "VAE tile ready");
+        };
+        // Two chunk canvases alternate: the writer reads one while the next chunk fills
+        // the other (each writer is joined before a new one starts).
+        // Uninitialized (tiles overwrite every element), so first-touch page faults are
+        // spread over tile stitching instead of one large zero-fill at a chunk start.
+        const size_t canvas_floats = size_t(7 * 4) * height * wide * 3;
+        std::array<std::unique_ptr<float[]>, 2> canvases{
+            std::unique_ptr<float[]>(new float[canvas_floats]),
+            std::unique_ptr<float[]>(new float[canvas_floats])};
+        std::vector<float> strip, newstrip, left;
+        auto finish = [&](int i) {
+            float *frames = canvases[i % 2].get();
+            int count = counts[i], first = std::min(20, count * 4) - 3;
             if (!overlap.empty())
                 for (int f = 0; f < int(overlap.size() / pixels) && f < first; f++)
                     for (size_t j = 0; j < pixels; j++) {
@@ -1401,23 +1426,88 @@ struct Engine {
             int tail = count * 4 - 23;
             overlap.clear();
             if (tail > 0)
-                overlap.assign(frames.begin() + 23 * pixels, frames.end());
-            // Emit this chunk's frames on a worker while the GPU decodes the next chunk;
-            // one emission is in flight at a time, so frame order is preserved.
+                overlap.assign(frames + 23 * pixels, frames + size_t(count * 4) * pixels);
             if (writer.valid())
                 writer.get();
-            g.poll();
-            auto owned = std::make_shared<std::vector<float>>(std::move(frames));
-            auto last = i + 1 == chunks && tail > 0
-                            ? std::make_shared<std::vector<float>>(overlap)
-                            : std::shared_ptr<std::vector<float>>();
-            writer = std::async(std::launch::async, [&, owned, last, first, tail]() {
+            auto last = i + 1 == chunks && tail > 0 ? std::make_shared<std::vector<float>>(overlap)
+                                                    : std::shared_ptr<std::vector<float>>();
+            const float *data = frames;
+            writer = std::async(std::launch::async, [&, data, last, first, tail]() {
                 for (int f = 0; f < first; f++)
-                    emit(owned->data() + size_t(f + 3) * pixels);
+                    emit(data + size_t(f + 3) * pixels);
                 if (last)
                     for (int f = 0; f < tail; f++)
                         emit(last->data() + size_t(f) * pixels);
             });
+        };
+        start(0);
+        for (size_t k = 0; k < order.size(); k++) {
+            if (k + 1 < order.size())
+                start(k + 1);
+            auto [i, iy, ix] = order[k];
+            const int count = counts[i];
+            g.check(cuEventSynchronize(slots[k % 2].ready), "VAE tile wait");
+            g.poll();
+            float *pixel = slots[k % 2].host;
+            float *canvas = canvases[i % 2].get();
+            if (ix == 0) {
+                if (iy)
+                    strip = std::move(newstrip);
+                newstrip.assign(iy + 1 < ys.start.size()
+                                    ? size_t(count * 4) * ys.overlap[iy] * wide * 3
+                                    : 0,
+                                0.f);
+            }
+            int overlap_y = iy ? ys.overlap[iy - 1] : 0;
+            int th = ys.length[iy] / 16, tw = xs.length[ix] / 16;
+            int ph = th * 16, pw = tw * 16, ox = ix ? xs.overlap[ix - 1] : 0;
+            for (int tt = 0; tt < count * 4; tt++)
+                for (int y = 0; y < ph; y++)
+                    for (int x = 0; x < pw; x++)
+                        for (int c = 0; c < 3; c++) {
+                            size_t at = (((size_t)tt * ph + y) * pw + x) * 3 + c;
+                            float v = pixel[at];
+                            require(std::isfinite(v), "nonfinite inference tensor");
+                            if (y < overlap_y) {
+                                v = blend_half(strip[(((size_t)tt * overlap_y + y) * wide +
+                                                      xs.start[ix] + x) *
+                                                         3 +
+                                                     c],
+                                               v, y, overlap_y);
+                            }
+                            if (x < ox) {
+                                v = blend_half(left[(((size_t)tt * ph + y) * ox + x) * 3 + c], v,
+                                               x, ox);
+                            }
+                            pixel[at] = v;
+                        }
+            int keepw = pw - (ix + 1 < xs.start.size() ? xs.overlap[ix] : 0),
+                keeph = ph - (iy + 1 < ys.start.size() ? ys.overlap[iy] : 0);
+            if (ix + 1 < xs.start.size()) {
+                int tail = xs.overlap[ix];
+                left.resize(size_t(count * 4) * ph * tail * 3);
+                for (int tt = 0; tt < count * 4; tt++)
+                    for (int y = 0; y < ph; y++)
+                        std::copy_n(pixel + (((size_t)tt * ph + y) * pw + pw - tail) * 3, tail * 3,
+                                    left.data() + ((size_t)tt * ph + y) * tail * 3);
+            }
+            for (int tt = 0; tt < count * 4; tt++)
+                for (int y = 0; y < keeph; y++)
+                    std::copy_n(pixel + ((size_t)tt * ph + y) * pw * 3, keepw * 3,
+                                canvas +
+                                    (((size_t)tt * height + ys.start[iy] + y) * wide + xs.start[ix]) *
+                                        3);
+            if (iy + 1 < ys.start.size()) {
+                int tail = ys.overlap[iy];
+                for (int tt = 0; tt < count * 4; tt++)
+                    for (int y = 0; y < tail; y++)
+                        std::copy_n(pixel + ((size_t)tt * ph + ph - tail + y) * pw * 3, keepw * 3,
+                                    newstrip.data() +
+                                        (((size_t)tt * tail + y) * wide + xs.start[ix]) * 3);
+            }
+            std::cerr << "H3 VAE tile " << iy + 1 << "," << ix + 1 << "\n";
+            if (iy + 1 == ys.start.size() && ix + 1 == xs.start.size())
+                finish(i);
         }
         if (writer.valid())
             writer.get();
