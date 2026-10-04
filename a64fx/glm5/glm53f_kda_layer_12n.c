@@ -864,6 +864,13 @@ int glm53f_kda_sublayer_batch_capture_12n(glm53f_kda_context_12n *c,
                            (c->prefill.features & GLM53F_PREFILL_RECURRENCE);
     const char *column_env = getenv("GLM53F_KDA_PREFILL_COLUMNS");
     int columns64 = column_recurrence && column_env && atoi(column_env);
+    const char *verify_columns_env = getenv("GLM53F_KDA_VERIFY_COLUMNS");
+    const int verify_columns = !column_recurrence && tokens <= 5 && verify_columns_env &&
+                               atoi(verify_columns_env) && svcntw() == 16;
+    if (verify_columns && !c->prefill_decay) {
+        c->prefill_decay = a256((size_t)GLM53F_KDA_TILE_TOKENS * qd * sizeof(float));
+        c->prefill_core = a256((size_t)GLM53F_KDA_TILE_TOKENS * qd * sizeof(float));
+    }
     if (column_recurrence && !c->prefill_state) {
         c->prefill_state = a256((size_t)hn * D * D * sizeof(float));
         c->prefill_decay = a256((size_t)GLM53F_KDA_TILE_TOKENS * qd * sizeof(float));
@@ -1022,6 +1029,51 @@ int glm53f_kda_sublayer_batch_capture_12n(glm53f_kda_context_12n *c,
                             c->bgate_g + off, w->on, 1, D, 1e-5f);
                     }
                 KD_MARK(4);
+            } else if (verify_columns) {
+                /* Opt-in GLM53F_KDA_VERIFY_COLUMNS=1: verify batches spread the
+                 * recurrence over (head, 16-column block) tasks that walk the
+                 * positions in order (same per-column chains as the streamed
+                 * step; decode's scalar-exp factors), instead of 5-6 head tasks. */
+#pragma omp for collapse(2) schedule(static)
+                for (int h = 0; h < hn; ++h)
+                    for (int t = 0; t < tokens; ++t) {
+                        const size_t off = (size_t)t * qd + h * D;
+                        if (c->q2_native) {
+                            kda_l2norm(c->bq + off, D, 1e-6f);
+                            kda_l2norm(c->bk + off, D, 1e-6f);
+                        } else {
+                            glm53f_l2norm(c->bq + off, D, 1e-6f);
+                            glm53f_l2norm(c->bk + off, D, 1e-6f);
+                        }
+                        glm53f_kda_safe_log_decay(c->prefill_decay + off,
+                            c->bgate_f + off, w->dt + h * D, w->al[h], -5.0f, D);
+                        for (int d = 0; d < D; ++d)
+                            c->prefill_decay[off + d] = glm53f_kda_scalar_factor(c->prefill_decay[off + d]);
+                        c->bbeta[(size_t)t * hn + h] = glm53f_sigmoid(c->bbeta[(size_t)t * hn + h]);
+                    }
+#pragma omp for collapse(2) schedule(static)
+                for (int h = 0; h < hn; ++h)
+                    for (int block = 0; block < 8; ++block)
+                        for (int t = 0; t < tokens; ++t) {
+                            const size_t off = (size_t)t * qd + h * D;
+                            float *st = c->state + (size_t)h * D * D + block * 16;
+                            glm53f_kda_columns16_sve(st, c->prefill_core + off + block * 16,
+                                c->bq + off, c->bk + off, c->bv + off + block * 16,
+                                c->prefill_decay + off, c->bbeta[(size_t)t * hn + h]);
+                            if (states) {
+                                float *snap = (float *)((unsigned char *)states + (size_t)t * stride) +
+                                              (size_t)h * D * D + block * 16;
+                                for (int d = 0; d < D; ++d)
+                                    memcpy(snap + (size_t)d * D, st + (size_t)d * D, 16 * sizeof(float));
+                            }
+                        }
+#pragma omp for collapse(2) schedule(static)
+                for (int h = 0; h < hn; ++h)
+                    for (int t = 0; t < tokens; ++t) {
+                        const size_t off = (size_t)t * qd + h * D;
+                        glm53f_rmsnorm_gated_bf16(c->bnormed + off, c->prefill_core + off,
+                            c->bgate_g + off, w->on, 1, D, 1e-5f);
+                    }
             } else {
 #pragma omp for schedule(static)
             for (int h = 0; h < hn; ++h)
