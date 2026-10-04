@@ -285,6 +285,8 @@ struct kda_call {
     float scale_x;
     double *td;
     int columns;
+    float *out;      /* fused output projection target (NULL: master runs it) */
+    int bad;
 };
 static void kda_worker(void *context) {
     struct kda_call *a = context;
@@ -416,6 +418,19 @@ static void kda_worker(void *context) {
 #pragma omp single
             {c->detail[4]=glm53f_clock()-(*a->td);}
         }
+        if (a->out) {
+            /* Fused output projection (GLM53F_KDA_FUSED_OUT): the same team
+             * quantizes the gated output (bit-identical team form) and runs the
+             * column-sliced o_proj with the dispatched path's row partition. */
+            const glm53f_native_matrix mo = {a->out, c->q2_op, c->q2_op_type, H, qd};
+            int bad = glm53f_native_act_prepare_team(c->act_out, c->normed, qd,
+                    !kda_is_q80(c->q2_op_type), kda_is_q80(c->q2_op_type)) != 0;
+            bad |= glm53f_native_matvec_team(&mo, 1, c->act_out) != 0;
+            if (bad) {
+#pragma omp atomic write
+                a->bad = 1;
+            }
+        }
 
 }
 
@@ -427,7 +442,9 @@ static int kda_local(glm53f_kda_context_12n*c,float*out,const float*x){
     const char *column_env = getenv("GLM53F_KDA_DECODE_COLUMNS");
     int columns = column_env && atoi(column_env);
     if (columns && !c->decode_factor) c->decode_factor = a256((size_t)qd * sizeof(float));
-    struct kda_call call = {c, x, quant_x, scale_x, &td, columns};
+    const char *fused_env = getenv("GLM53F_KDA_FUSED_OUT");
+    const int fused_out = fused_env && atoi(fused_env) && c->q2_native && c->q2_op_cols == qd && !c->int8_enabled;
+    struct kda_call call = {c, x, quant_x, scale_x, &td, columns, fused_out ? out : NULL, 0};
     if (glm53f_team_available()) glm53f_team_dispatch(kda_worker, &call);
     else {
 #pragma omp parallel
@@ -441,7 +458,9 @@ static int kda_local(glm53f_kda_context_12n*c,float*out,const float*x){
     kda_dump("core", c->core, (size_t)qd * sizeof(float), c->rank, c->layer);
     kda_dump("normed", c->normed, (size_t)qd * sizeof(float), c->rank, c->layer);
     double t1=glm53f_clock();
-    if (c->q2_native && c->q2_op_cols == qd) {
+    if (fused_out) {
+        if (call.bad) return -1;
+    } else if (c->q2_native && c->q2_op_cols == qd) {
         /* Column-sliced output: Q8_0 blocks align to heads, so quantizing the
          * local slice equals llama.cpp's full-vector quantization.  The
          * partial product joins the existing sum all-reduce. */

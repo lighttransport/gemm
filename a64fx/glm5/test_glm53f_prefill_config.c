@@ -83,6 +83,7 @@ int main(void) {
     failed |= parse("--mhc-kernel", "local", &c) != 1 || strcmp(getenv("GLM53F_MHC_FUSED_SYNC"), "2");
     failed |= parse("--moe-layer-kernel", "fused", &c) != 1 || strcmp(getenv("GLM53F_MOE_FUSED_LAYER"), "1");
     failed |= parse("--moe-layer-kernel", "legacy", &c) != 1 || strcmp(getenv("GLM53F_MOE_FUSED_LAYER"), "0");
+    failed |= parse("--kda-out-kernel", "fused", &c) != 1 || strcmp(getenv("GLM53F_KDA_FUSED_OUT"), "1");
     failed |= parse("--moe-prefill-layout", "padded", &c) != 1 || strcmp(getenv("GLM53F_MOE_GU_PAD"), "1");
     failed |= parse("--moe-prefill-layout", "tight", &c) != 1 || strcmp(getenv("GLM53F_MOE_GU_PAD"), "0");
     failed |= parse("--moe-prefill-layout", "legacy", &c) != 1 || strcmp(getenv("GLM53F_MOE_GU_PAD"), "0");

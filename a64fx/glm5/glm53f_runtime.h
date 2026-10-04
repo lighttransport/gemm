@@ -43,6 +43,7 @@ static inline int glm53f_runtime_option(int argc, char **argv, int *index) {
     else if (!strcmp(key, "--moe-verify-router")) env = "GLM53F_MOE_VERIFY_ROUTER";
     else if (!strcmp(key, "--weight-placement")) env = "GLM53F_CMG_PLACE";
     else if (!strcmp(key, "--moe-layer-kernel")) env = "GLM53F_MOE_FUSED_LAYER";
+    else if (!strcmp(key, "--kda-out-kernel")) env = "GLM53F_KDA_FUSED_OUT";
     else return 0;
     if (*index + 1 >= argc) return -1;
     const char *value = argv[++*index];
@@ -74,6 +75,7 @@ static inline int glm53f_runtime_option(int argc, char **argv, int *index) {
              (!strcmp(key, "--moe-verify-router") && !strcmp(value, "batch")) ||
              (!strcmp(key, "--weight-placement") && !strcmp(value, "cmg")) ||
              (!strcmp(key, "--moe-layer-kernel") && !strcmp(value, "fused")) ||
+             (!strcmp(key, "--kda-out-kernel") && !strcmp(value, "fused")) ||
              ((!strcmp(key, "--kda-decode-kernel") || !strcmp(key, "--kda-prefill-kernel")) && !strcmp(value, "columns")) ||
              (!strcmp(key, "--moe-scale-kernel") && !strcmp(value, "words")) ||
              (!strcmp(key, "--moe-combine-kernel") && !strcmp(value, "vector")) ||
