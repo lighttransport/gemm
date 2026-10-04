@@ -23,6 +23,7 @@
 #include "glm53f_int8.h"
 #include "glm53f_prefill.h"
 #include "glm53f_moe_grouped_native.h"
+#include "glm53f_bf16_rows.h"
 #include "kern/glm53f_kern.h"
 #include "../../common/glm53f_safetensors.h"
 #include "../../common/glm53f_ref.h"
@@ -1744,9 +1745,24 @@ int glm53f_moe_stage_sublayer_batch_12n(glm53f_moe_stage_context_12n*c,float*out
     }
     enum{MAXP=9,H=4096}; glm53f_expert_part parts[4*MAXP]; float weights[4*MAXP]; int counts[4];
     memset(parts,0,sizeof(parts)); memset(weights,0,sizeof(weights));
+    /* Verify batches: one team streams the router weights once for all
+     * positions; each logit keeps glm53f_dot_bf16_sve's chain (see router_dot8). */
+    static float verify_logits[4][NEXPERTS];
+    const char *verify_router_env = getenv("GLM53F_MOE_VERIFY_ROUTER");
+    const int verify_router = tokens > 1 && tokens <= 4 && svcntw() == 16 &&
+        verify_router_env && atoi(verify_router_env);
+    if (verify_router) {
+#pragma omp parallel for schedule(static)
+        for (int b = 0; b < NEXPERTS / 4; ++b)
+            glm53f_bf16_dot4x(&verify_logits[0][b * 4], NEXPERTS,
+                c->router_w + ((size_t)li * NEXPERTS + b * 4) * H, x, H, H, tokens);
+    }
     for(int t=0;t<tokens;t++){int selected[8],npart=0;float route_weight[8];const float*xt=x+(size_t)t*H;
+        if (verify_router) memcpy(c->router_logits, verify_logits[t], sizeof(verify_logits[t]));
+        else {
 #pragma omp parallel for schedule(static)
         for(int e=0;e<NEXPERTS;e++)c->router_logits[e]=glm53f_dot_bf16_sve(c->router_w+((size_t)li*NEXPERTS+e)*H,xt,H);
+        }
         glm53f_router_topk(c->router_logits,c->router_bias+(size_t)li*NEXPERTS,NEXPERTS,8,2.5f,selected,route_weight);if(moe_trace_routes(c,selected,route_weight,1))return-1;
         for(int k=0;k<8;k++){expert_offset*p=&c->table[table_layer*NEXPERTS+selected[k]];if(p->gate_up==UINT64_MAX)continue;parts[t*MAXP+npart]=(glm53f_expert_part){c->blob+p->gate_up,p->gate_up_scale==UINT64_MAX?NULL:(const float*)(c->blob+p->gate_up_scale),c->blob+p->down,p->down_scale==UINT64_MAX?NULL:(const float*)(c->blob+p->down_scale),p->inter,p->gate_type,p->down_type};weights[t*MAXP+npart++]=route_weight[k];}
         counts[t]=npart;

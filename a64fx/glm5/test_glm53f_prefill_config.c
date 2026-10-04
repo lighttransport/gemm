@@ -73,6 +73,9 @@ int main(void) {
     failed |= parse("--sparse-verify-kernel", "front-onecoll", &c) != 1 || strcmp(getenv("GLM53F_SPARSE_VERIFY_FRONT"), "2");
     failed |= parse("--sparse-verify-kernel", "legacy", &c) != 1 || strcmp(getenv("GLM53F_SPARSE_VERIFY_FRONT"), "0");
     failed |= parse("--sparse-verify-kernel", "team", &c) != -1;
+    failed |= parse("--moe-verify-router", "batch", &c) != 1 || strcmp(getenv("GLM53F_MOE_VERIFY_ROUTER"), "1");
+    failed |= parse("--moe-verify-router", "legacy", &c) != 1 || strcmp(getenv("GLM53F_MOE_VERIFY_ROUTER"), "0");
+    failed |= parse("--moe-verify-router", "fused", &c) != -1;
     failed |= parse("--moe-prefill-layout", "padded", &c) != 1 || strcmp(getenv("GLM53F_MOE_GU_PAD"), "1");
     failed |= parse("--moe-prefill-layout", "tight", &c) != 1 || strcmp(getenv("GLM53F_MOE_GU_PAD"), "0");
     failed |= parse("--moe-prefill-layout", "legacy", &c) != 1 || strcmp(getenv("GLM53F_MOE_GU_PAD"), "0");
