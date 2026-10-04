@@ -57,6 +57,7 @@ static inline int glm53f_runtime_option(int argc, char **argv, int *index) {
     else if (!strcmp(key, "--mhc-prefetch")) env = "GLM53F_MHC_PREFETCH_NEXT";
     else if (!strcmp(key, "--kda-verify-kernel")) env = "GLM53F_KDA_VERIFY_COLUMNS";
     else if (!strcmp(key, "--mhc-batch-tail")) env = "GLM53F_MHC_BATCH_TAIL";
+    else if (!strcmp(key, "--snapshot-copy")) env = "GLM53F_SNAPSHOT_PARALLEL";
     else return 0;
     if (*index + 1 >= argc) return -1;
     const char *value = argv[++*index];
@@ -96,6 +97,7 @@ static inline int glm53f_runtime_option(int argc, char **argv, int *index) {
              (!strcmp(key, "--mhc-prefetch") && !strcmp(value, "next")) ||
              (!strcmp(key, "--kda-verify-kernel") && !strcmp(value, "columns")) ||
              (!strcmp(key, "--mhc-batch-tail") && !strcmp(value, "parallel")) ||
+             (!strcmp(key, "--snapshot-copy") && !strcmp(value, "parallel")) ||
              ((!strcmp(key, "--kda-decode-kernel") || !strcmp(key, "--kda-prefill-kernel")) && !strcmp(value, "columns")) ||
              (!strcmp(key, "--moe-scale-kernel") && !strcmp(value, "words")) ||
              (!strcmp(key, "--moe-combine-kernel") && !strcmp(value, "vector")) ||

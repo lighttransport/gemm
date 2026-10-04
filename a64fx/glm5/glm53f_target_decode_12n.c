@@ -767,14 +767,30 @@ static int target_layers_batch(glm53f_target_model_12n *m, float *streams,
                                                        m->prefill.slab_tokens)) return -1;
                 }
             }
-            if (after)
-                for (int t = 0; t < tokens; t++) {
+            if (after) {
+                for (int t = 0; t < tokens; t++)
                     if (!after[t] || after[t]->kda_bytes < state_off + bytes)
                         return -1;
+                /* Opt-in GLM53F_SNAPSHOT_PARALLEL=1: copy the per-position
+                 * verify snapshots (~6 x 64 KB per position per layer) in 64 KB
+                 * chunks across the team instead of serially. Same bytes. */
+                const char *par_env = getenv("GLM53F_SNAPSHOT_PARALLEL");
+                if (par_env && atoi(par_env)) {
+                    enum { CHUNK = 65536 };
+                    const size_t nchunk = (bytes + CHUNK - 1) / CHUNK;
+#pragma omp parallel for collapse(2) schedule(static)
+                    for (int t = 0; t < tokens; t++)
+                        for (size_t q = 0; q < nchunk; ++q) {
+                            const size_t o = q * CHUNK, n = bytes - o < CHUNK ? bytes - o : CHUNK;
+                            memcpy(after[t]->kda_state + state_off + o,
+                                   m->batch_state + (size_t)t * m->batch_state_stride + o, n);
+                        }
+                } else
+                for (int t = 0; t < tokens; t++)
                     memcpy(after[t]->kda_state + state_off,
                            m->batch_state + (size_t)t * m->batch_state_stride,
                            bytes);
-                }
+            }
             state_off += bytes;
         } else {
             int base = glm53f_sparse_length_12n(m->sparse[l]);
