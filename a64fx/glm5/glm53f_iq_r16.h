@@ -129,7 +129,41 @@ static inline void glm53f_r16_tile_ref(float out[16], const uint8_t *tile, int b
     memcpy(out, acc, sizeof(acc));
 }
 
-/* One 16-row tile over `blocks` super-blocks; out[0..15]. SVE vector length 512. */
+/* One 16-row tile over `blocks` super-blocks; out[0..15]. SVE vector length 512.
+ * Latency-oriented: two independent SDOT chains per 32-column group and
+ * alternating scale/min accumulators for even/odd groups (A64FX SDOT/MLA
+ * latencies otherwise serialize the tile at IPC ~0.5). Integer sums are
+ * order-independent, so results equal the single-chain formulation. */
+static inline __attribute__((always_inline)) svint32_t glm53f_r16_group(const uint8_t *v, const uint8_t *qh, int q5,
+        const int8_t *xq, svbool_t p8) {
+    const svint8_t xa = svld1rq_s8(p8, xq), xb = svld1rq_s8(p8, xq + 16);
+    svuint8_t w0 = svld1_u8(p8, v), w1 = svld1_u8(p8, v + 64), w2 = svld1_u8(p8, v + 128), w3 = svld1_u8(p8, v + 192);
+    svuint8_t l0 = svand_n_u8_x(p8, w0, 15), h0 = svlsr_n_u8_x(p8, w0, 4);
+    svuint8_t l1 = svand_n_u8_x(p8, w1, 15), h1 = svlsr_n_u8_x(p8, w1, 4);
+    svuint8_t l2 = svand_n_u8_x(p8, w2, 15), h2 = svlsr_n_u8_x(p8, w2, 4);
+    svuint8_t l3 = svand_n_u8_x(p8, w3, 15), h3 = svlsr_n_u8_x(p8, w3, 4);
+    if (q5) {
+        const svuint8_t hb = svld1_u8(p8, qh);
+        l0 = svorr_u8_x(p8, l0, svand_n_u8_x(p8, svlsl_n_u8_x(p8, hb, 4), 16));
+        h0 = svorr_u8_x(p8, h0, svand_n_u8_x(p8, svlsl_n_u8_x(p8, hb, 3), 16));
+        l1 = svorr_u8_x(p8, l1, svand_n_u8_x(p8, svlsl_n_u8_x(p8, hb, 2), 16));
+        h1 = svorr_u8_x(p8, h1, svand_n_u8_x(p8, svlsl_n_u8_x(p8, hb, 1), 16));
+        l2 = svorr_u8_x(p8, l2, svand_n_u8_x(p8, hb, 16));
+        h2 = svorr_u8_x(p8, h2, svand_n_u8_x(p8, svlsr_n_u8_x(p8, hb, 1), 16));
+        l3 = svorr_u8_x(p8, l3, svand_n_u8_x(p8, svlsr_n_u8_x(p8, hb, 2), 16));
+        h3 = svorr_u8_x(p8, h3, svand_n_u8_x(p8, svlsr_n_u8_x(p8, hb, 3), 16));
+    }
+    svint32_t da = svdup_s32(0), db = svdup_s32(0);
+    da = svdot_lane_s32(da, svreinterpret_s8_u8(l0), xa, 0);
+    db = svdot_lane_s32(db, svreinterpret_s8_u8(h0), xa, 1);
+    da = svdot_lane_s32(da, svreinterpret_s8_u8(l1), xa, 2);
+    db = svdot_lane_s32(db, svreinterpret_s8_u8(h1), xa, 3);
+    da = svdot_lane_s32(da, svreinterpret_s8_u8(l2), xb, 0);
+    db = svdot_lane_s32(db, svreinterpret_s8_u8(h2), xb, 1);
+    da = svdot_lane_s32(da, svreinterpret_s8_u8(l3), xb, 2);
+    db = svdot_lane_s32(db, svreinterpret_s8_u8(h3), xb, 3);
+    return svadd_s32_x(svptrue_b32(), da, db);
+}
 static inline __attribute__((always_inline)) void glm53f_r16_tile(float *out, const uint8_t *tile, int blocks, int q5,
                                                                   const glm53f_r16_act *a) {
     const size_t tb = glm53f_r16_block_bytes(q5);
@@ -140,37 +174,16 @@ static inline __attribute__((always_inline)) void glm53f_r16_tile(float *out, co
         const int8_t *sc = (const int8_t *)(o + 128), *mn = sc + 128;
         const uint8_t *qs = o + GLM53F_R16_HEAD, *qh = qs + 8 * 4 * 64;
         const int8_t *xq = a[b].q;
-        svint32_t tot = svdup_s32(0), mins = svdup_s32(0);
-        for (int g = 0; g < 8; ++g) {
-            const svint8_t xa = svld1rq_s8(p8, xq + g * 32), xb = svld1rq_s8(p8, xq + g * 32 + 16);
-            const uint8_t *v = qs + g * 4 * 64;
-            svuint8_t w0 = svld1_u8(p8, v), w1 = svld1_u8(p8, v + 64), w2 = svld1_u8(p8, v + 128), w3 = svld1_u8(p8, v + 192);
-            svuint8_t l0 = svand_n_u8_x(p8, w0, 15), h0 = svlsr_n_u8_x(p8, w0, 4);
-            svuint8_t l1 = svand_n_u8_x(p8, w1, 15), h1 = svlsr_n_u8_x(p8, w1, 4);
-            svuint8_t l2 = svand_n_u8_x(p8, w2, 15), h2 = svlsr_n_u8_x(p8, w2, 4);
-            svuint8_t l3 = svand_n_u8_x(p8, w3, 15), h3 = svlsr_n_u8_x(p8, w3, 4);
-            if (q5) {
-                const svuint8_t hb = svld1_u8(p8, qh + g * 64);
-/* bit s of hb moves to bit 4 (value 16) of the s-th nibble vector */
-                const svuint8_t b0 = svand_n_u8_x(p8, svlsl_n_u8_x(p8, hb, 4), 16), b1 = svand_n_u8_x(p8, svlsl_n_u8_x(p8, hb, 3), 16);
-                const svuint8_t b2 = svand_n_u8_x(p8, svlsl_n_u8_x(p8, hb, 2), 16), b3 = svand_n_u8_x(p8, svlsl_n_u8_x(p8, hb, 1), 16);
-                const svuint8_t b4 = svand_n_u8_x(p8, hb, 16), b5 = svand_n_u8_x(p8, svlsr_n_u8_x(p8, hb, 1), 16);
-                const svuint8_t b6 = svand_n_u8_x(p8, svlsr_n_u8_x(p8, hb, 2), 16), b7 = svand_n_u8_x(p8, svlsr_n_u8_x(p8, hb, 3), 16);
-                l0 = svorr_u8_x(p8, l0, b0); h0 = svorr_u8_x(p8, h0, b1); l1 = svorr_u8_x(p8, l1, b2); h1 = svorr_u8_x(p8, h1, b3);
-                l2 = svorr_u8_x(p8, l2, b4); h2 = svorr_u8_x(p8, h2, b5); l3 = svorr_u8_x(p8, l3, b6); h3 = svorr_u8_x(p8, h3, b7);
-            }
-            svint32_t dot = svdup_s32(0);
-            dot = svdot_lane_s32(dot, svreinterpret_s8_u8(l0), xa, 0);
-            dot = svdot_lane_s32(dot, svreinterpret_s8_u8(h0), xa, 1);
-            dot = svdot_lane_s32(dot, svreinterpret_s8_u8(l1), xa, 2);
-            dot = svdot_lane_s32(dot, svreinterpret_s8_u8(h1), xa, 3);
-            dot = svdot_lane_s32(dot, svreinterpret_s8_u8(l2), xb, 0);
-            dot = svdot_lane_s32(dot, svreinterpret_s8_u8(h2), xb, 1);
-            dot = svdot_lane_s32(dot, svreinterpret_s8_u8(l3), xb, 2);
-            dot = svdot_lane_s32(dot, svreinterpret_s8_u8(h3), xb, 3);
-            tot = svmla_s32_x(p32, tot, dot, svld1sb_s32(p32, sc + g * 16));
-            mins = svmla_n_s32_x(p32, mins, svld1sb_s32(p32, mn + g * 16), a[b].s[g]);
+        svint32_t tot0 = svdup_s32(0), tot1 = svdup_s32(0), min0 = svdup_s32(0), min1 = svdup_s32(0);
+        for (int g = 0; g < 8; g += 2) {
+            const svint32_t d0 = glm53f_r16_group(qs + g * 4 * 64, qh + g * 64, q5, xq + g * 32, p8);
+            const svint32_t d1 = glm53f_r16_group(qs + (g + 1) * 4 * 64, qh + (g + 1) * 64, q5, xq + (g + 1) * 32, p8);
+            tot0 = svmla_s32_x(p32, tot0, d0, svld1sb_s32(p32, sc + g * 16));
+            tot1 = svmla_s32_x(p32, tot1, d1, svld1sb_s32(p32, sc + (g + 1) * 16));
+            min0 = svmla_n_s32_x(p32, min0, svld1sb_s32(p32, mn + g * 16), a[b].s[g]);
+            min1 = svmla_n_s32_x(p32, min1, svld1sb_s32(p32, mn + (g + 1) * 16), a[b].s[g + 1]);
         }
+        const svint32_t tot = svadd_s32_x(p32, tot0, tot1), mins = svadd_s32_x(p32, min0, min1);
         const svfloat32_t d = svld1_f32(p32, (const float *)o), dm = svld1_f32(p32, (const float *)o + 16);
         acc = svmla_f32_x(p32, acc, svmul_n_f32_x(p32, d, a[b].d), svcvt_f32_s32_x(p32, tot));
         acc = svmls_f32_x(p32, acc, svmul_n_f32_x(p32, dm, a[b].d), svcvt_f32_s32_x(p32, mins));
