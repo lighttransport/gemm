@@ -96,6 +96,15 @@ Detailed per-campaign history: `handoff-decode100-20261004.md` (same directory).
   Fixed to return the mode. v31 (`candidate-decode100-mfix21-v31`) is the first binary where local-gram really runs;
   j2t gates it (8K exact + pair + MTP d2 best ± KDA head pipeline). The standalone kernel is ~23 µs vs ~48 µs.
 
+## KDA head pipeline result (j2s)
+- `--kda-decode-pipeline heads` is 8K BIT_EXACT but **does not reduce KDA time** (gap ledger kda mean 7.40 legacy,
+  7.30 pipe, 7.43 best+pipe; pair 1.009× / 0.998×). The ~20 µs "small steps" in `GLM53F_KDA_DECODE_DETAIL` were
+  mostly thread-0 waiting for straggler threads of the projection phase, not their own work.
+- Real KDA cost: projections + allreduce; ~11 MB/layer at an **effective ~58 GB/s in-model vs ~350 GB/s for the same
+  Q8 matvec standalone**. Explaining this 6× standalone/in-model gap is the key open question (candidates: thread
+  imbalance in the row partition, cross-CMG/TLB effects, interference with the communication thread, cold
+  activations). Next diagnostic: fapp PMU profile of the full model with regions around KDA projections, mHC, MoE.
+
 ## In flight at snapshot time (job ends ~01:00)
 - **j2r** (v29, `-DGLM53F_MHC_PHASE_TIMING`): plain legacy vs best; read `GLM53F_MHC_INMODEL` (rank 0 log of the
   best arm) and compare per-call kernel time with the 70–86 µs site times → tells whether mHC time is inside the
