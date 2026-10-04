@@ -468,6 +468,10 @@ int glm53f_target_model_step_12n(glm53f_target_model_12n *m, int token,
         target_plan_ffn(m, l);
         const int fuse_router = l >= 3 && glm53f_mhc_fast_on() == 1 &&
             getenv("GLM53F_ROUTER_FUSE") && atoi(getenv("GLM53F_ROUTER_FUSE"));
+        {   /* FFN-side mHC: the next site is layer l+1's attention mHC */
+            const char *pf = getenv("GLM53F_MHC_PREFETCH_NEXT");
+            glm53f_mhc_next_fn = pf && atoi(pf) && l + 1 < LAYERS ? m->layer_weight[l + 1].attention_mhc.fn : NULL;
+        }
         if (fuse_router) {
             glm53f_moe_stage_set_layer_12n(m->moe, l);
             if (!m->mhc_chained)
@@ -513,6 +517,10 @@ int glm53f_target_model_step_12n(glm53f_target_model_12n *m, int token,
         if (m->mhc_chained && l + 1 < LAYERS) {
             const glm53f_target_layer_weights_12n *next = &m->layer_weight[l + 1];
             target_plan_attention(m, l + 1);
+            {   /* attention-side mHC of l+1: the next site is its FFN mHC */
+                const char *pf = getenv("GLM53F_MHC_PREFETCH_NEXT");
+                glm53f_mhc_next_fn = pf && atoi(pf) ? next->ffn_mhc.fn : NULL;
+            }
             const char *kda_fused = getenv("GLM53F_KDA_FUSED_LAYER");
             const char *sparse_fused = getenv("GLM53F_SPARSE_FUSED_LAYER");
             if (kda_fused && atoi(kda_fused) && glm53f_mhc_fast_on() == 1 && m->kda[l + 1] &&

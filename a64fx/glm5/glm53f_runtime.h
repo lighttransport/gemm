@@ -48,6 +48,7 @@ static inline int glm53f_runtime_option(int argc, char **argv, int *index) {
     else if (!strcmp(key, "--sparse-layer-kernel")) env = "GLM53F_SPARSE_FUSED_LAYER";
     else if (!strcmp(key, "--act-header-kernel")) env = "GLM53F_ACT_HEADER_CACHE";
     else if (!strcmp(key, "--kda-quant-kernel")) env = "GLM53F_KDA_TEAM_QUANT";
+    else if (!strcmp(key, "--mhc-prefetch")) env = "GLM53F_MHC_PREFETCH_NEXT";
     else return 0;
     if (*index + 1 >= argc) return -1;
     const char *value = argv[++*index];
@@ -84,6 +85,7 @@ static inline int glm53f_runtime_option(int argc, char **argv, int *index) {
              (!strcmp(key, "--sparse-layer-kernel") && !strcmp(value, "fused")) ||
              (!strcmp(key, "--act-header-kernel") && !strcmp(value, "cached")) ||
              (!strcmp(key, "--kda-quant-kernel") && !strcmp(value, "team")) ||
+             (!strcmp(key, "--mhc-prefetch") && !strcmp(value, "next")) ||
              ((!strcmp(key, "--kda-decode-kernel") || !strcmp(key, "--kda-prefill-kernel")) && !strcmp(value, "columns")) ||
              (!strcmp(key, "--moe-scale-kernel") && !strcmp(value, "words")) ||
              (!strcmp(key, "--moe-combine-kernel") && !strcmp(value, "vector")) ||

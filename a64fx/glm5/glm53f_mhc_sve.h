@@ -157,6 +157,11 @@ static inline void glm53f_mhc_coefficients(float *logits,
  * bit-identical to the legacy path; the RMS and mixing-dot reductions are
  * reordered, so downstream values may differ in the last bits. */
 static double glm53f_mhc_partl[128 * 48];   /* per thread: 24 dots, ss, 10 Gram terms */
+/* Opt-in (GLM53F_MHC_PREFETCH_NEXT=1): the controller publishes the mixing
+ * weights of the mHC site that follows the current one; at the end of the
+ * local kernel each thread issues L2 prefetches for its own slice of them, so
+ * they arrive during the intervening sublayer instead of on the critical path. */
+static const uint16_t *glm53f_mhc_next_fn;
 #ifdef GLM53F_MHC_PHASE_TIMING
 #include <time.h>
 static double glm53f_mhc_phase[8];   /* 6 = Gram reduction (subset of phase 5 slot order) */
@@ -310,6 +315,15 @@ static inline void glm53f_mhc_local_team(float *streams, const float *sublayer, 
         scratch->normalized[d] = scratch->collapsed[d] * inv2 * glm53f_bf16_to_f32(norm[d]);
     }
     GLM53F_MHC_MARK(5);   /* collapse + normalize (incl. barrier 2 when not Gram) */
+    if (glm53f_mhc_next_fn) {
+        const uint16_t *next = glm53f_mhc_next_fn;
+        for (int m = 0; m < GLM53F_MHC_MIX; ++m)
+            for (int k = 0; k < S; ++k) {
+                const char *p = (const char *)(next + (size_t)m * GLM53F_MHC_FLAT + (size_t)k * W + lo);
+                for (int o = 0; o < (hi - lo) * 2; o += 256) __builtin_prefetch(p + o, 0, 2);
+                __builtin_prefetch(p + (hi - lo) * 2 - 1, 0, 2);
+            }
+    }
     if (after_normalize) {
 #pragma omp barrier
         after_normalize(context, scratch->normalized);
