@@ -14,6 +14,10 @@ static inline int glm53f_runtime_option(int argc, char **argv, int *index) {
             strcmp(value, "32") && strcmp(value, "64")) return -1;
         return setenv("GLM53F_DENSE_PREFILL_TILE", value, 1) ? -1 : 1;
     }
+    if (!strcmp(key, "--snapshot-copy") && *index + 1 < argc && !strcmp(argv[*index + 1], "deferred")) {
+        ++*index;   /* verify keeps per-layer state slots; restore copies only the accepted one */
+        return setenv("GLM53F_SNAPSHOT_DEFER", "1", 1) || setenv("GLM53F_SNAPSHOT_PARALLEL", "0", 1) ? -1 : 1;
+    }
     if (!strcmp(key, "--act-chunk")) {   /* contiguous 32-column blocks per thread in act_prepare_team */
         if (*index + 1 >= argc) return -1;
         const char *value = argv[++*index];

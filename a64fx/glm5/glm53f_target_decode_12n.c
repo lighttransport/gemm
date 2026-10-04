@@ -151,6 +151,11 @@ struct glm53f_target_model_12n {
     int hidden_export_count, hidden_export_remaining;
     unsigned char *batch_state;
     size_t batch_state_stride;
+    /* Opt-in GLM53F_SNAPSHOT_DEFER=1: verify writes each position's KDA state
+     * into per-layer slots (VERIFY_BATCH x layer bytes at VERIFY_BATCH x the
+     * snapshot offset) and after[t] only records slot t; restore copies the
+     * accepted slot back. Valid until the next verify batch. */
+    unsigned char *defer_states;
     int profile, mhc_chained;
     glm53f_prefill_config prefill;
     float *prefill_gemm_arena;
@@ -163,6 +168,7 @@ struct glm53f_target_snapshot_12n {
     unsigned char *kda_state;
     size_t kda_bytes;
     int sparse_length[LAYERS];
+    int deferred; /* 0: kda_state holds the state; t+1: defer slot t. */
 };
 
 static inline int target_export_hidden_write(glm53f_target_model_12n *m,const float *streams,int tokens) {
@@ -296,6 +302,11 @@ static glm53f_target_model_12n *target_model_create(
     /* Prompt-only tiles do not capture recurrent snapshots.  Keep that large
      * allocation at the speculative verifier's independent ABI limit. */
     m->batch_state = a256(m->batch_state_stride?(size_t)VERIFY_BATCH*m->batch_state_stride:1);
+    if (getenv("GLM53F_SNAPSHOT_DEFER") && atoi(getenv("GLM53F_SNAPSHOT_DEFER"))) {
+        size_t total = 0;
+        for (int l = 0; l < LAYERS; l++) total += glm53f_kda_state_bytes_12n(m->kda[l]);
+        if (total && !(m->defer_states = a256((size_t)VERIFY_BATCH * total))) goto fail;
+    }
     if ((!dist&&(!m->embedding||!m->head||!m->moe)) ||
         (dist&&((dist->map.stage==0&&!m->embedding)||(dist->map.stage==2&&!m->head)||(m->end_layer>3&&!m->moe))) || !m->scratch || !m->streams ||
         !m->batch_scratch || !m->batch_streams || !m->batch_normalized ||
@@ -746,9 +757,11 @@ static int target_layers_batch(glm53f_target_model_12n *m, float *streams,
                 if (glm53f_kda_sublayer_batch_capture_12n(
                         m->kda[l], kda_out + (size_t)tile * HIDDEN,
                         m->batch_normalized + (size_t)tile * HIDDEN, n,
+                        after && m->defer_states ? m->defer_states +
+                            (size_t)VERIFY_BATCH * state_off + (size_t)tile * bytes :
                         after ? m->batch_state +
                             (size_t)tile * m->batch_state_stride : NULL,
-                        m->batch_state_stride))
+                        after && m->defer_states ? bytes : m->batch_state_stride))
                     return target_layer_failure(m, l, "kda");
                 if (async_kda) glm53f_async_ready_12n(tile + n);
                 if (m->profile) {
@@ -767,7 +780,12 @@ static int target_layers_batch(glm53f_target_model_12n *m, float *streams,
                                                        m->prefill.slab_tokens)) return -1;
                 }
             }
-            if (after) {
+            if (after && m->defer_states) {
+                for (int t = 0; t < tokens; t++) {
+                    if (!after[t] || after[t]->kda_bytes < state_off + bytes) return -1;
+                    after[t]->deferred = t + 1;
+                }
+            } else if (after) {
                 for (int t = 0; t < tokens; t++)
                     if (!after[t] || after[t]->kda_bytes < state_off + bytes)
                         return -1;
@@ -1048,8 +1066,24 @@ glm53f_target_snapshot_12n *glm53f_target_snapshot_create_12n(
     return s;
 }
 void glm53f_target_snapshot_free_12n(glm53f_target_snapshot_12n*s){if(s){free(s->kda_state);free(s);}}
-int glm53f_target_snapshot_save_12n(const glm53f_target_model_12n*m,glm53f_target_snapshot_12n*s){if(!m||!s)return-1;size_t off=0;for(int l=0;l<LAYERS;l++){size_t n=glm53f_kda_state_bytes_12n(m->kda[l]);if(n&&glm53f_kda_save_state_12n(m->kda[l],s->kda_state+off,n))return-1;off+=n;s->sparse_length[l]=glm53f_sparse_length_12n(m->sparse[l]);}return off==s->kda_bytes?0:-1;}
-int glm53f_target_snapshot_restore_12n(glm53f_target_model_12n*m,const glm53f_target_snapshot_12n*s){if(!m||!s)return-1;m->last_streams=NULL;size_t off=0;for(int l=0;l<LAYERS;l++){size_t n=glm53f_kda_state_bytes_12n(m->kda[l]);if(n&&glm53f_kda_restore_state_12n(m->kda[l],s->kda_state+off,n))return-1;off+=n;if(m->sparse[l]&&glm53f_sparse_restore_length_12n(m->sparse[l],s->sparse_length[l]))return-1;}return off==s->kda_bytes?0:-1;}
+int glm53f_target_snapshot_save_12n(const glm53f_target_model_12n*m,glm53f_target_snapshot_12n*s){if(!m||!s)return-1;s->deferred=0;size_t off=0;for(int l=0;l<LAYERS;l++){size_t n=glm53f_kda_state_bytes_12n(m->kda[l]);if(n&&glm53f_kda_save_state_12n(m->kda[l],s->kda_state+off,n))return-1;off+=n;s->sparse_length[l]=glm53f_sparse_length_12n(m->sparse[l]);}return off==s->kda_bytes?0:-1;}
+int glm53f_target_snapshot_restore_12n(glm53f_target_model_12n*m,const glm53f_target_snapshot_12n*s){
+    if(!m||!s)return-1;
+    if(s->deferred){
+        if(!m->defer_states||s->deferred>VERIFY_BATCH)return-1;
+        m->last_streams=NULL;
+        size_t offs[LAYERS],off=0;int rc=0;
+        for(int l=0;l<LAYERS;l++){offs[l]=off;off+=glm53f_kda_state_bytes_12n(m->kda[l]);}
+        if(off!=s->kda_bytes)return-1;
+        /* Each layer's state is independent: restore them across the team. */
+#pragma omp parallel for schedule(dynamic,1) reduction(|:rc)
+        for(int l=0;l<LAYERS;l++){size_t n=glm53f_kda_state_bytes_12n(m->kda[l]);
+            if(n)rc|=glm53f_kda_restore_state_12n(m->kda[l],m->defer_states+(size_t)VERIFY_BATCH*offs[l]+(size_t)(s->deferred-1)*n,n)!=0;}
+        if(rc)return-1;
+        for(int l=0;l<LAYERS;l++)if(m->sparse[l]&&glm53f_sparse_restore_length_12n(m->sparse[l],s->sparse_length[l]))return-1;
+        return 0;
+    }
+m->last_streams=NULL;size_t off=0;for(int l=0;l<LAYERS;l++){size_t n=glm53f_kda_state_bytes_12n(m->kda[l]);if(n&&glm53f_kda_restore_state_12n(m->kda[l],s->kda_state+off,n))return-1;off+=n;if(m->sparse[l]&&glm53f_sparse_restore_length_12n(m->sparse[l],s->sparse_length[l]))return-1;}return off==s->kda_bytes?0:-1;}
 
 void glm53f_target_profile_reset_12n(glm53f_target_model_12n *m) {
     if (!m) return;
@@ -1142,7 +1176,7 @@ void glm53f_target_model_free_12n(glm53f_target_model_12n *m) {
     glm53f_sparse_prefill_workspace_free_12n(m->sparse_prefill);
     free(m->prefill_gemm_arena);
     if (m->trace) { fclose(m->trace->file); free(m->trace); }
-    free(m->batch_state); free(m->batch_output); free(m->batch_normalized);
+    free(m->batch_state); free(m->defer_states); free(m->batch_output); free(m->batch_normalized);
     free(m->batch_streams); free(m->batch_scratch);
     free(m->streams); free(m->scratch);
     glm53f_moe_stage_free_12n(m->moe);
