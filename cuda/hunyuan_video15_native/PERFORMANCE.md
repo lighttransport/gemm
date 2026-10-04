@@ -30,6 +30,12 @@ Nsight Systems attribution, before → after (one run):
 - **Unchanged:** attention (~205 s, 31–32 TFLOPS FP16) and repository GEMM (~73 s,
   ~31 TFLOPS) dominate. Opt-in cuDNN SDPA brings DiT 285 → 267 s.
 
+DiT attention (`cuda/fa2`, see its bench_log):
+- The kernel skips the identity rescale, loads K/V fragments with `ldmatrix.x4`, and
+  uses `ex2.approx.ftz`. This takes 317–320 → 291–293 ms per 34,138-token call
+  (~31 → ~33.5 TFLOPS), with bit-identical captures.
+- Interleaved full-run A/B: DiT 306/293 s → 281/284 s.
+
 VAE convolution (1.36 PFLOP per Fast12 decode, measured with `component_probe vae_decode`):
 
 | Change | Effect |

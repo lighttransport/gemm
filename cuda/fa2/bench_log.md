@@ -148,3 +148,34 @@ a tweak:
 Correctness was re-verified beyond the default 8-row window: **full output across
 8 q-CTAs**, **partial last blocks** (S=500, S=333), and **causal diagonal masking**
 (S=130) all validate `cos = 1.00000`.
+
+## Main-loop trims (2026-10-05, RTX 5060 Ti, SM clock 2070 MHz)
+
+FP16, B=1 H=16 S=34138 D=128, BR=64 BC=16 (HunyuanVideo 1.5 joint attention), three runs
+per variant in one session:
+
+| Change | ms |
+|---|---:|
+| Baseline | 317–320 |
+| + skip the O/l rescale when no row max in the warp changed | 311–315 |
+| + `ldmatrix.x4` for the K and V^T fragments of two n8 tiles | 306–315 |
+| + `ex2.approx.ftz.f32` instead of `exp2f` (drops the subnormal fix-up) | **291–293** |
+
+**Bit-identical outputs:**
+- When no row max changes, alpha is exactly 1, so the O multiply is skipped. The row
+  sum update keeps its original statements (`l *= alpha` unconditionally, then
+  `l += rs`), so FMA contraction behaves as before both under NVRTC's default and
+  under pixal3d's `--fmad=false`. Moving `l *= alpha` into the branch split the
+  contracted FMA into two roundings and changed results.
+- An NVRTC old-versus-new harness (f16/bf16, D=64/128, causal and non-causal,
+  S=130/777/2048, fmad on/off) shows 0 differing outputs in all 48 configurations.
+- Results flushed by `ex2.approx.ftz` lie below FP16 range for P and are absorbed by
+  row sums of 1 or more.
+- MiniMax H3 (BF16) reproduces all 82 non-frame captures of a 39-update run, and
+  HunyuanVideo Fast12 (FP16) all 19 captures.
+
+**Other checks:**
+- Verification passes for f16/bf16 at D=64/128/256, partial blocks (S=333, 500, 1031)
+  and causal S=130.
+- Interleaved full Fast12 runs: DiT 306 → 281 s and 293 → 284 s. BC=32 remains slower
+  (330 ms).
