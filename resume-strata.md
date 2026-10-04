@@ -1,6 +1,7 @@
 # Resume: GLM53F Strata-inspired optimization, 12 A64FX nodes
 
-Updated 2026-10-04. Capacity4096 remains the promoted TP12 recipe:
+Updated 2026-10-04. For a concise live handoff and exact recovery commands,
+read [handoff-strata-20261004.md](handoff-strata-20261004.md). Capacity4096 remains the promoted TP12 recipe:
 35.462134 decode /412.273634 prefill tok/s. Neither 100/2000 target is met.
 The approved prefill-first PP3×TP4 architecture is being implemented.
 Distribution/pipeline foundations pass native12-node correctness. Routed
