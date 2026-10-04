@@ -68,6 +68,18 @@ rank0 logs `tmp/glm53f-q4-52159552/benchmark-decode100-*`. Single-node benches i
 - Pending on new job: j2b (prefetch, columns-64 arm), j2c (crash bisect + act options), j2d (allreduce 2D/MTNI),
   j2e (KDA verify columns, state-gated MTP), j2f (batch mHC tail), j2g (executor value), j2h (verify MoE micro).
 
+## New-job results (PJM52167472, 21:00–22:00)
+- j2f: batch-mHC tail parallel → MTP d2 46.47, **d3 47.07** (d3 without tail 45.30). Verify is ~92% of MTP decode
+  time (draft 6%, replay 1.5%); acceptance 42/43 (d2), 47/51 (d3). d3 verify ≈73 ms/cycle for 4 positions.
+- j2g: persistent executor worth +3.6% on plain decode (no-executor 0.966/0.963×). MTP doesn't use it.
+- j2h: verify-MoE micro: batching saves only 6–11%; cost ∝ distinct expert bytes at 64–81 GB/s.
+  fapp (j2i): IPC 0.54, ~31% load-wait cycles → dependency-latency bound. Responses: R16 two-chain tile
+  (9e385cd4, j2l), `GLM53F_IQF_ROWS4` four-row interleave (24f5dfd9, j2m).
+- j2c2: **`--act-header-kernel cached` alone segfaults at 8K** (cause of b14). Do not use; chunk is fine.
+- j2j: `--kda-verify-kernel columns64` d2 state BIT_EXACT, 46.06 (state-gated, vs columns16 44.22); best-set d2 46.93.
+- Queued: j2k (`--snapshot-copy parallel`, v24), j2l/j2m (kernel micro), j2n (v25: `--mhc-post-kernel chunked`,
+  ROWS4 via per-arm `ENV:` in campaign-j2.py, MLA projection/logits/value opt-ins).
+
 ## Conclusion so far
 Placement and kernel work each give ~1–2% in-model, and removing dispatches/serial sections by fusing whole
 layers into one team gives **nothing** (slightly negative). The 4.9 ms of barrier wait is therefore not

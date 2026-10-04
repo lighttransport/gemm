@@ -958,6 +958,36 @@ static inline void glm53f_mhc_post_pre_sve(
 static inline void glm53f_mhc_post_batch_sve(
         float *streams, const float *sublayer,
         const glm53f_mhc_scratch *scratch, int tokens, size_t stride) {
+    /* Opt-in GLM53F_MHC_POST_CHUNK=1: split each (position, stream) row into
+     * 256-column chunks so verify batches use the whole team (3 positions x 4
+     * streams is only 12 tasks). Per-element arithmetic unchanged. */
+    const char *chunk_env = getenv("GLM53F_MHC_POST_CHUNK");
+    if (chunk_env && atoi(chunk_env)) {
+        enum { CW = 256, NC = GLM53F_MHC_WIDTH / CW };
+#pragma omp parallel for collapse(3) schedule(static)
+        for (int t = 0; t < tokens; ++t)
+            for (int k = 0; k < GLM53F_MHC_STREAMS; ++k)
+                for (int c = 0; c < NC; ++c) {
+                    float *dst = streams + (size_t)t * GLM53F_MHC_FLAT + (size_t)k * GLM53F_MHC_WIDTH;
+                    const glm53f_mhc_scratch *s = (const glm53f_mhc_scratch *)
+                                      ((const unsigned char *)scratch + (size_t)t * stride);
+                    const float *res = s->residual;
+                    for (int d = c * CW; d < (c + 1) * CW; ++d) {
+#if GLM53F_MHC_POST_FLOAT
+                        float v = s->post[k] * sublayer[(size_t)t * GLM53F_MHC_WIDTH + d];
+                        for (int j = 0; j < GLM53F_MHC_STREAMS; ++j)
+                            v += s->combine[(size_t)j * GLM53F_MHC_STREAMS + k] * res[(size_t)j * GLM53F_MHC_WIDTH + d];
+#else
+                        double v = (double)s->post[k] * sublayer[(size_t)t * GLM53F_MHC_WIDTH + d];
+                        for (int j = 0; j < GLM53F_MHC_STREAMS; ++j)
+                            v += (double)s->combine[(size_t)j * GLM53F_MHC_STREAMS + k] *
+                                 res[(size_t)j * GLM53F_MHC_WIDTH + d];
+#endif
+                        dst[d] = (float)v;
+                    }
+                }
+        return;
+    }
 #pragma omp parallel for collapse(2) schedule(static)
     for (int t = 0; t < tokens; ++t)
         for (int k = 0; k < GLM53F_MHC_STREAMS; ++k) {
