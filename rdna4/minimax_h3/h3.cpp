@@ -73,7 +73,8 @@ int h3_set_fp32_hipblas(h3_context *ctx, int enabled, char *error, size_t capaci
     ctx->busy = false;
     return 0;
 }
-int h3_set_cudnn_attention(h3_context *ctx, const char *mode, char *error, size_t capacity) {
+int h3_set_cudnn_attention(h3_context *ctx, const char *mode, const char *cudnn_library,
+                           char *error, size_t capacity) {
     if (!ctx || !ctx->engine)
         return fail(error, capacity, "missing H3 context");
     bool expected = false;
@@ -85,6 +86,7 @@ int h3_set_cudnn_attention(h3_context *ctx, const char *mode, char *error, size_
     } busy{ctx};
     std::string m = mode ? mode : "off";
 #ifdef HV15N_ROCM
+    (void)cudnn_library;
     if (m == "off")
         return 0;
     return fail(error, capacity, "cuDNN attention is CUDA-only");
@@ -96,19 +98,15 @@ int h3_set_cudnn_attention(h3_context *ctx, const char *mode, char *error, size_
     }
     std::string bridge = m;
     if (m == "auto") {
-        if (const char *env = std::getenv("H3_CUDNN_BRIDGE")) {
-            bridge = env;
-        } else {
-            Dl_info self{};
-            dladdr(reinterpret_cast<void *>(&h3_set_cudnn_attention), &self);
-            h3::fs::path dir = self.dli_fname ? h3::fs::path(self.dli_fname).parent_path() : "";
-            if (dir.empty() || !h3::fs::exists(dir / "libh3_cudnn.so"))
-                dir = h3::fs::read_symlink("/proc/self/exe").parent_path();
-            bridge = (dir / "libh3_cudnn.so").string();
-        }
+        Dl_info self{};
+        dladdr(reinterpret_cast<void *>(&h3_set_cudnn_attention), &self);
+        h3::fs::path dir = self.dli_fname ? h3::fs::path(self.dli_fname).parent_path() : "";
+        if (dir.empty() || !h3::fs::exists(dir / "libh3_cudnn.so"))
+            dir = h3::fs::read_symlink("/proc/self/exe").parent_path();
+        bridge = (dir / "libh3_cudnn.so").string();
     }
     try {
-        e.enable_cudnn(bridge);
+        e.enable_cudnn(bridge, cudnn_library && *cudnn_library ? cudnn_library : nullptr);
         std::cerr << "H3 cuDNN attention: " << e.cudnn_info << "\n";
         return 0;
     } catch (const std::exception &x) {

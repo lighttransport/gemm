@@ -9,7 +9,8 @@ extern "C" {
 #endif
 /* Returns 1. */
 typedef int (*h3_cudnn_abi_fn)(void);
-/* Locates and loads cuDNN 9; library may be NULL for automatic discovery.
+/* Loads cuDNN 9 from `library`, or when NULL from the default loader search path and
+ * fixed system locations (no environment variables are read).
  * Returns 0 on success and writes the loaded cuDNN path/version into info. */
 typedef int (*h3_cudnn_init_fn)(const char *library, char *info, size_t capacity);
 /* Workspace bytes for a BF16 [1, heads, rows, dim] non-causal forward, or -1. */

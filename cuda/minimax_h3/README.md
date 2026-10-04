@@ -75,18 +75,20 @@ separate bridge library. The default build and runtime do not need cuDNN.
 ```sh
 make -C cuda/minimax_h3 cudnn-deps                      # fetch header-only cudnn-frontend
 make -C cuda/minimax_h3 cudnn CUDNN_INCLUDE=/path/to/cudnn9/include
-tmp/video-cuda/h3-build/h3_cuda ... --cudnn-attention auto   # or a libh3_cudnn.so path
+tmp/video-cuda/h3-build/h3_cuda ... --cudnn-attention auto \
+    --cudnn-library /path/to/libcudnn.so.9   # optional; or pass a libh3_cudnn.so path
 ```
 
-- **Finding the bridge:** `auto` looks for `libh3_cudnn.so` next to the runner or
-  library, or uses `H3_CUDNN_BRIDGE`.
-- **Finding cuDNN:** the bridge searches for `libcudnn.so.9` in this order:
-  `H3_CUDNN_LIB`, the default loader path, the pip `nvidia/cudnn` package under
-  `$VIRTUAL_ENV`, `$CONDA_PREFIX` or `~/.local`, then system locations.
+- **Finding the bridge:** `auto` loads `libh3_cudnn.so` from beside the runner or
+  library; an explicit bridge path may be passed instead.
+- **Finding cuDNN:** `--cudnn-library PATH` (C API `cudnn_library`) selects
+  `libcudnn.so.9`. Without it, the default loader search path and fixed system
+  locations are tried. No environment variables select or locate libraries.
 - **Failure handling:** if cuDNN is unavailable, `auto` prints a warning and falls
   back to FlashAttention-2. An explicit bridge path is an error.
-- **Other entry points:** the C API is `h3_set_cudnn_attention()`, and
-  `generate.py` accepts `--cudnn-attention`. Metrics record
+- **Other entry points:** the C API is
+  `h3_set_cudnn_attention(ctx, mode, cudnn_library, ...)`, and `generate.py`
+  accepts `--cudnn-attention` / `--cudnn-library`. Metrics record
   `cudnn_attention_calls` and the loaded library.
 
 With cuDNN 9.19 at full resolution, a DiT update drops from 93.8 s to **90.2 s**.
@@ -105,7 +107,8 @@ against 0.044 / 0.076).
   GEMMs. Bias and rounding are folded into the qkv packer, SwiGLU and the scale-add
   residual.
 - **Numerics:** every fused kernel reproduces the unfused expressions, and a
-  39-update run is bit-identical to `H3_UNFUSED=1` (all 87 captures).
+  39-update run is bit-identical to the unfused graph (debug switch
+  `H3_DEBUG_UNFUSED=1`; all 87 captures).
 - **Default ConvRot on CUDA:** the default is now the factorized rotation
   (`--convrot-hipblas 0`). It differs from dense cuBLAS only in FP32 summation
   order and lands slightly closer to PyTorch (64×64 39-update video/audio latent
@@ -129,7 +132,7 @@ against 0.044 / 0.076).
   from ~29.8 to ~33.4 TFLOPS (~95% of the measured peak). Full-resolution tiles are
   bit-identical to the repository GEMM path; 64×64 tiles differ by ~3e-4 relative
   L2. The 39-frame VAE component check passes against PyTorch (max relative L2
-  0.0014). `H3_VAE_LT=0` selects the repository GEMM. VAE 80 → 72 s.
+  0.0014). The debug switch `H3_DEBUG_VAE_REPO_GEMM=1` selects the repository GEMM. VAE 80 → 72 s.
 - **DiT row kernel:** each warp rotates whole 256-element groups in registers via
   shuffles, in the same operation order, and the row stays in registers until
   quantization. There are no block barriers per group and no 28 KB shared buffer.
@@ -146,3 +149,9 @@ against 0.044 / 0.076).
     worker, while dummy cuBLASLt GEMMs load the projection kernels.
   - VAE idle fell from ~6.5 s to ~4 s at full resolution, and to 0.75 s inside the
     39-frame probe. Outputs are bit-identical.
+
+Runtime behavior is selected only by runner arguments and the C API. Environment
+variables are reserved for debug/parity diagnostics (`H3_DEBUG_UNFUSED`,
+`H3_DEBUG_VAE_REPO_GEMM`). The cuDNN bridge sets cudnn-frontend's private
+`CUDNN_FRONTEND_CUDART_LIB_NAME` to `libcudart.so.13` (that library's only cudart
+selector, never overriding an existing value).

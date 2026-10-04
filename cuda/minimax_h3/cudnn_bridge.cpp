@@ -30,21 +30,13 @@ int fail(char *error, size_t capacity, const std::string &text) {
         std::snprintf(error, capacity, "%s", text.c_str());
     return -1;
 }
+// An explicit library path is used as-is; otherwise the default loader search and fixed
+// system locations are tried. No environment variables are consulted.
 std::vector<std::string> candidates(const char *library) {
     if (library && *library)
         return {library};
-    std::vector<std::string> out;
-    if (const char *env = std::getenv("H3_CUDNN_LIB"))
-        out.push_back(env);
-    out.push_back("libcudnn.so.9"); // default loader search (LD_LIBRARY_PATH, ldconfig)
+    std::vector<std::string> out{"libcudnn.so.9"};
     std::vector<std::string> patterns;
-    for (const char *var : {"VIRTUAL_ENV", "CONDA_PREFIX"})
-        if (const char *root = std::getenv(var))
-            patterns.push_back(std::string(root) +
-                               "/lib/python3*/site-packages/nvidia/cudnn/lib/libcudnn.so.9");
-    if (const char *home = std::getenv("HOME"))
-        patterns.push_back(std::string(home) +
-                           "/.local/lib/python3*/site-packages/nvidia/cudnn/lib/libcudnn.so.9");
     for (const char *p : {"/usr/local/lib/python3*/dist-packages/nvidia/cudnn/lib/libcudnn.so.9",
                           "/usr/lib/python3/dist-packages/nvidia/cudnn/lib/libcudnn.so.9",
                           "/usr/local/cuda/lib64/libcudnn.so.9",
@@ -70,7 +62,8 @@ int h3_cudnn_init(const char *library, char *info, size_t capacity) {
         std::snprintf(info, capacity, "%s", loaded.c_str());
         return 0;
     }
-    // Prefer the driver-matched CUDA 13 runtime when several are installed.
+    // cudnn-frontend selects its CUDA runtime only through this variable; pin the
+    // driver-matched CUDA 13 runtime when several are installed (never overrides).
     setenv("CUDNN_FRONTEND_CUDART_LIB_NAME", "libcudart.so.13", 0);
     std::string tried;
     for (auto &path : candidates(library)) {

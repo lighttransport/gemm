@@ -24,11 +24,14 @@ def generate(*, model=None, out, prompt, width=1344, height=768,
              frames=124, steps=40, seed=42, device=0, vram_budget_mib=14336, runner=None,
              allow_experimental=False, keep_frames=False, noise_file=None, audio_noise_file=None,
              dump_dir=None, convrot_hipblas=None, bf16_hipblas=1, aotriton_bridge=None, vae_hipblas=0,
-             cancel=None, progress=None, compress_dumps=False, fp32_hipblas=1, backend="rocm", cudnn_attention=None):
+             cancel=None, progress=None, compress_dumps=False, fp32_hipblas=1, backend="rocm", cudnn_attention=None,
+             cudnn_library=None):
     if backend not in ("cuda", "rocm"):
         raise ValueError("backend must be cuda or rocm")
     if cudnn_attention not in (None, "off", "auto") and not Path(cudnn_attention).is_file():
         raise ValueError("cudnn_attention must be off, auto or a bridge library path")
+    if cudnn_library and (cudnn_attention in (None, "off") or not Path(cudnn_library).is_file()):
+        raise ValueError("cudnn_library must be an existing file and requires cudnn_attention")
     if backend == "rocm" and cudnn_attention not in (None, "off"):
         raise ValueError("cuDNN attention is CUDA-only")
     if backend == "cuda" and aotriton_bridge:
@@ -110,6 +113,8 @@ def generate(*, model=None, out, prompt, width=1344, height=768,
             command += ["--aotriton-bridge", aotriton_bridge]
         if cudnn_attention:
             command += ["--cudnn-attention", cudnn_attention]
+        if cudnn_library:
+            command += ["--cudnn-library", Path(cudnn_library).resolve()]
         for flag, value in (("--noise-file", noise_file), ("--audio-noise-file", audio_noise_file), ("--dump-dir", dump_dir)):
             if value:
                 path = Path(value).resolve()
@@ -188,6 +193,7 @@ def main(default_backend="rocm"):
         p.add_argument("--" + name, type=int, default=default)
     p.add_argument("--runner")
     p.add_argument("--cudnn-attention", help="CUDA only: off, auto or libh3_cudnn.so path (opt-in DiT SDPA)")
+    p.add_argument("--cudnn-library", help="CUDA only: libcudnn.so.9 path for --cudnn-attention")
     for name in ("noise-file", "audio-noise-file", "dump-dir", "aotriton-bridge"):
         p.add_argument("--" + name)
     p.add_argument("--allow-experimental", action="store_true")

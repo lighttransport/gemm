@@ -93,7 +93,7 @@ struct Engine {
         cudnn_info.clear();
     }
     // Loads `bridge` (a libh3_cudnn.so path) and lets it discover cuDNN 9.
-    void enable_cudnn(const std::string &bridge) {
+    void enable_cudnn(const std::string &bridge, const char *cudnn_path) {
         if (!cudnn_library || cudnn_info.empty()) {
             std::unique_ptr<void, int (*)(void *)> library(
                 dlopen(bridge.c_str(), RTLD_NOW | RTLD_LOCAL), dlclose);
@@ -112,7 +112,7 @@ struct Engine {
                     "unsupported cuDNN bridge ABI");
             char info[1024] = {};
             g.check(cuCtxSetCurrent(g.context), "activate H3 context");
-            if (init(std::getenv("H3_CUDNN_LIB"), info, sizeof(info)) != 0)
+            if (init(cudnn_path, info, sizeof(info)) != 0)
                 throw std::runtime_error(std::string("cuDNN unavailable: ") + info);
             cudnn_library = std::move(library);
             cudnn_workspace = workspace;
@@ -786,8 +786,8 @@ struct Engine {
     }
     // Fused paths: CUDA, untraced, factorized ConvRot (bit-identical to the unfused
     // --convrot-hipblas 0 graph).
-    // H3_UNFUSED=1 selects the original kernel chain (debug/parity checks).
-    bool unfused = std::getenv("H3_UNFUSED") != nullptr;
+    // Debug/parity only: H3_DEBUG_UNFUSED=1 runs the original unfused kernel chain.
+    bool unfused = std::getenv("H3_DEBUG_UNFUSED") != nullptr;
     bool fused() const { return trace.empty() && !convrot_hipblas && !unfused; }
     bool fused_vae() const { return trace.empty() && !unfused; }
     static Tensor view(const Tensor &x, int row, int count) {
@@ -881,7 +881,8 @@ struct Engine {
     // FP16 GEMM with the bias and FP16 rounding fused into the cuBLASLt epilogue
     // (as torch F.linear). Returns an FP16 tensor, or the raw F32 repo-GEMM output
     // (bias applied later by the consumer) when cuBLASLt is unavailable.
-    bool vae_lt = !std::getenv("H3_VAE_LT") || std::string(std::getenv("H3_VAE_LT")) != "0";
+    // Debug/parity only: H3_DEBUG_VAE_REPO_GEMM=1 keeps the repository FP16 GEMM.
+    bool vae_lt = std::getenv("H3_DEBUG_VAE_REPO_GEMM") == nullptr;
     Tensor gemm16(const Tensor &x16, const Linear &l) {
         if (vae_lt && l.bias.pointer) {
             if (!rotation_blas)

@@ -44,7 +44,8 @@ clean:
 # Needs header-only cudnn-frontend and cuDNN 9 headers; cuDNN itself is loaded at runtime.
 CUDNN_DEPS := $(BUILD)/cudnn-deps
 CUDNN_FRONTEND_INCLUDE ?= $(CUDNN_DEPS)/include
-CUDNN_INCLUDE ?= $(firstword $(wildcard $(VIRTUAL_ENV)/lib/python3*/site-packages/nvidia/cudnn/include /usr/include/x86_64-linux-gnu/cudnn_v9 /usr/local/cuda/include/cudnn9))
+# cuDNN 9 headers: pass CUDNN_INCLUDE=DIR (e.g. a pip nvidia/cudnn/include directory).
+CUDNN_INCLUDE ?= $(firstword $(wildcard /usr/include/x86_64-linux-gnu/cudnn_v9 /usr/local/cuda/include/cudnn9))
 .PHONY: cudnn cudnn-deps
 cudnn-deps:
 	mkdir -p $(CUDNN_DEPS)

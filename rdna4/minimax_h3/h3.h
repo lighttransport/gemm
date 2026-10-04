@@ -33,11 +33,12 @@ h3_context *h3_load(const h3_config *config, char *error, size_t capacity);
 /* Idle-context selection; default 1. Configuration struct layout is unchanged. */
 int h3_set_fp32_hipblas(h3_context *context, int enabled, char *error, size_t capacity);
 /* CUDA only: opt-in cuDNN SDPA for DiT attention on an idle context. mode is NULL/"off"
- * (default, private FlashAttention-2), "auto" (find libh3_cudnn.so next to this library or
- * via H3_CUDNN_BRIDGE; cuDNN 9 is discovered at runtime, H3_CUDNN_LIB overrides; falls back
- * to FlashAttention-2 with a warning if unavailable), or an explicit bridge path (errors if
- * unusable). */
-int h3_set_cudnn_attention(h3_context *context, const char *mode, char *error, size_t capacity);
+ * (default, private FlashAttention-2), "auto" (libh3_cudnn.so next to this library or the
+ * executable; falls back to FlashAttention-2 with a warning if unavailable), or an explicit
+ * bridge path (errors if unusable). cudnn_library is a libcudnn.so.9 path, or NULL to use
+ * the default loader search and fixed system locations. */
+int h3_set_cudnn_attention(h3_context *context, const char *mode, const char *cudnn_library,
+                           char *error, size_t capacity);
 int h3_generate(h3_context *context, const h3_request *request, const h3_callbacks *callbacks,
                 char *error, size_t capacity);
 const char *h3_metrics(const h3_context *context);
