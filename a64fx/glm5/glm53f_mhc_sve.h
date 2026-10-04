@@ -138,10 +138,102 @@ static inline void glm53f_mhc_coefficients(float *logits,
         scratch->combine[m] = logits[2 * GLM53F_MHC_STREAMS + m] * site->scale[2] + site->base[2 * GLM53F_MHC_STREAMS + m];
     glm53f_mhc_sinkhorn_fast(scratch->combine, GLM53F_MHC_STREAMS, 20, 1e-6f);
 }
+/* Opt-in locality variant (GLM53F_MHC_FUSED_SYNC=2, --mhc-kernel local).
+ * Each thread owns whole 16-column vectors of all four streams for the
+ * whole call: post update, sum of squares and partial dots of the 24 mixing
+ * rows run on its own slice; after one barrier every thread reduces the
+ * partials in thread order and computes sigmoid/Sinkhorn itself (no single
+ * section), then collapses and normalizes the same slice. Stream values are
+ * bit-identical to the legacy path; the RMS and mixing-dot reductions are
+ * reordered, so downstream values may differ in the last bits. */
+static double glm53f_mhc_partl[128 * 32];
+static inline void glm53f_mhc_local_team(float *streams, const float *sublayer, glm53f_mhc_scratch *scratch,
+        const glm53f_mhc_site *site, const uint16_t *norm, int do_post, float *logits,
+        void (*after_normalize)(void *, const float *), void *context) {
+    enum { S = GLM53F_MHC_STREAMS, W = GLM53F_MHC_WIDTH, VL = 16 };
+    const int tid = omp_get_thread_num(), nt = omp_get_num_threads();
+    if (nt > 128 || svcntw() != VL) abort();
+    glm53f_pf_run(tid);
+    const int lo = (int)((long)(W / VL) * tid / nt) * VL, hi = (int)((long)(W / VL) * (tid + 1) / nt) * VL;
+    const svbool_t pg = svptrue_b32();
+    double ss = 0.0;
+    if (do_post) {
+        for (int k = 0; k < S; ++k)
+            for (int d = lo; d < hi; ++d) {
+                double v = (double)scratch->post[k] * sublayer[d];
+                for (int j = 0; j < S; ++j)
+                    v += (double)scratch->combine[(size_t)j * S + k] * scratch->residual[(size_t)j * W + d];
+                streams[(size_t)k * W + d] = (float)v;
+                ss += (double)streams[(size_t)k * W + d] * streams[(size_t)k * W + d];
+            }
+    } else {
+        for (int k = 0; k < S; ++k)
+            for (int d = lo; d < hi; ++d) ss += (double)streams[(size_t)k * W + d] * streams[(size_t)k * W + d];
+    }
+    double *part = glm53f_mhc_partl + (size_t)tid * 32;
+    for (int m = 0; m < GLM53F_MHC_MIX; ++m) {
+        const uint16_t *fn = site->fn + (size_t)m * GLM53F_MHC_FLAT;
+        svfloat32_t acc = svdup_f32(0.0f);
+        for (int k = 0; k < S; ++k)
+            for (int d = lo; d < hi; d += VL) {
+                const svfloat32_t w = svreinterpret_f32_u32(svlsl_n_u32_x(pg, svld1uh_u32(pg, fn + (size_t)k * W + d), 16));
+                acc = svmla_f32_x(pg, acc, w, svld1_f32(pg, streams + (size_t)k * W + d));
+            }
+        part[m] = svaddv_f32(pg, acc);
+    }
+    part[GLM53F_MHC_MIX] = ss;
+#pragma omp barrier
+    float lg[GLM53F_MHC_MIX], post[S], comb[S * S];
+    double total = 0.0;
+    for (int t = 0; t < nt; ++t) total += glm53f_mhc_partl[(size_t)t * 32 + GLM53F_MHC_MIX];
+    const float inv = 1.0f / sqrtf((float)(total / GLM53F_MHC_FLAT) + 1e-5f);
+    for (int m = 0; m < GLM53F_MHC_MIX; ++m) {
+        double dot = 0.0;
+        for (int t = 0; t < nt; ++t) dot += glm53f_mhc_partl[(size_t)t * 32 + m];
+        lg[m] = (float)dot * inv;
+    }
+    for (int k = 0; k < S; ++k) {
+        lg[k] = glm53f_sigmoid(lg[k] * site->scale[0] + site->base[k]) + 1e-6f;
+        post[k] = 2.0f * glm53f_sigmoid(lg[S + k] * site->scale[1] + site->base[S + k]);
+    }
+    for (int m = 0; m < S * S; ++m) comb[m] = lg[2 * S + m] * site->scale[2] + site->base[2 * S + m];
+    glm53f_mhc_sinkhorn_fast(comb, S, 20, 1e-6f);
+    double ss2 = 0.0;
+    for (int d = lo; d < hi; ++d) {
+        float value = 0.0f;
+        for (int k = 0; k < S; ++k) {
+            const float sv = streams[(size_t)k * W + d];
+            value += lg[k] * sv;
+            scratch->residual[(size_t)k * W + d] = sv;
+        }
+        scratch->collapsed[d] = value;
+        ss2 += (double)value * value;
+    }
+    glm53f_mhc_part2[tid * 8] = ss2;
+    if (!tid) {   /* every thread finished reading post/combine before the barrier above */
+        memcpy(scratch->post, post, sizeof(post));
+        memcpy(scratch->combine, comb, sizeof(comb));
+        memcpy(logits, lg, sizeof(lg));
+    }
+#pragma omp barrier
+    double total2 = 0.0;
+    for (int t = 0; t < nt; ++t) total2 += glm53f_mhc_part2[t * 8];
+    const float inv2 = 1.0f / sqrtf((float)(total2 / W) + 1e-5f);
+    for (int d = lo; d < hi; ++d)
+        scratch->normalized[d] = scratch->collapsed[d] * inv2 * glm53f_bf16_to_f32(norm[d]);
+    if (after_normalize) {
+#pragma omp barrier
+        after_normalize(context, scratch->normalized);
+    }
+}
 static inline void glm53f_mhc_fast_team(float *streams, const float *sublayer, glm53f_mhc_scratch *scratch,
         const glm53f_mhc_site *site, const uint16_t *norm, int do_post, float *logits,
         void (*after_normalize)(void *, const float *), void *context,
         int fused_sync, _Atomic int *mix_pending) {
+    if (fused_sync == 2) {
+        glm53f_mhc_local_team(streams, sublayer, scratch, site, norm, do_post, logits, after_normalize, context);
+        return;
+    }
     {
         const int tid = omp_get_thread_num(), nt = omp_get_num_threads();
         if (nt > 128) abort();

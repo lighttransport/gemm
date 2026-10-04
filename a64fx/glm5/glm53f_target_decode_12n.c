@@ -402,7 +402,7 @@ int glm53f_target_place_weights_12n(glm53f_target_model_12n *m) {
     const int nt = glm53f_cmg_thread_nodes(node, GLM53F_PF_MAX_THREADS);
     if (nt < 37) return -1;
     for (int c = 0; c < 4; ++c) cmg_node[c] = node[12 * c < nt ? 12 * c : nt - 1];
-    glm53f_cmg_place_stats st = {0, 0, 0, 0}, ex = {0, 0, 0, 0};
+    glm53f_cmg_place_stats st = {0, 0, 0, 0, 0}, ex = {0, 0, 0, 0, 0};
     const double begin = glm53f_clock();
     batch.n = 0; batch.st = &st;
     glm53f_pf_collecting = 1;
@@ -425,9 +425,9 @@ int glm53f_target_place_weights_12n(glm53f_target_model_12n *m) {
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     if (!rank)
         printf("GLM53F_CMG_PLACE threads=%d cmg_nodes=%d,%d,%d,%d dense_pages=%ld moved=%ld already=%ld failed=%ld "
-               "expert_pages=%ld moved=%ld already=%ld failed=%ld seconds=%.3f,%.3f\n",
+               "expert_pages=%ld moved=%ld already=%ld failed=%ld move_pages_errno=%d seconds=%.3f,%.3f\n",
                nt, cmg_node[0], cmg_node[1], cmg_node[2], cmg_node[3], st.requested, st.moved, st.already,
-               st.failed, ex.requested, ex.moved, ex.already, ex.failed, middle - begin, glm53f_clock() - middle);
+               st.failed, ex.requested, ex.moved, ex.already, ex.failed, st.move_errno, middle - begin, glm53f_clock() - middle);
     return 0;
 }
 int glm53f_target_model_step_12n(glm53f_target_model_12n *m, int token,
