@@ -733,6 +733,11 @@ static inline void glm53f_mhc_pre_batch_team_sve(glm53f_mhc_scratch *scratch, co
     double sumsq = 0.0;
     float inv[5], logits[5 * GLM53F_MHC_MIX];
     if (tokens < 1 || tokens > 5) abort();
+    /* Opt-in (GLM53F_MHC_BATCH_TAIL=1): run the per-position residual copy and
+     * RMS normalization inside the team (one position's serial FP64 chain per
+     * thread, copies in 4 KB chunks) instead of serially after the region. */
+    const char *tail_env = getenv("GLM53F_MHC_BATCH_TAIL");
+    const int par_tail = tail_env && atoi(tail_env);
 #pragma omp parallel shared(sumsq, inv, logits)
     {
         for (int t = 0; t < tokens; ++t) {
@@ -783,7 +788,26 @@ static inline void glm53f_mhc_pre_batch_team_sve(glm53f_mhc_scratch *scratch, co
                 q->collapsed[d] = v;
             }
         }
+        if (par_tail) {
+#pragma omp for collapse(2) schedule(static)
+            for (int t = 0; t < tokens; ++t)
+                for (int c = 0; c < GLM53F_MHC_FLAT / 1024; ++c) {
+                    glm53f_mhc_scratch *q = (glm53f_mhc_scratch *)
+                        ((unsigned char *)scratch + (size_t)t * scratch_stride);
+                    memcpy(q->residual + (size_t)c * 1024, streams + (size_t)t * GLM53F_MHC_FLAT + (size_t)c * 1024,
+                           1024 * sizeof(float));
+                }
+#pragma omp for schedule(static)
+            for (int t = 0; t < tokens; ++t) {
+                glm53f_mhc_scratch *q = (glm53f_mhc_scratch *)
+                    ((unsigned char *)scratch + (size_t)t * scratch_stride);
+                glm53f_rmsnorm_bf16(q->normalized, q->collapsed, norm, GLM53F_MHC_WIDTH, 1e-5f);
+                memcpy(normalized + (size_t)t * GLM53F_MHC_WIDTH, q->normalized,
+                       GLM53F_MHC_WIDTH * sizeof(float));
+            }
+        }
     }
+    if (par_tail) return;
     /* Retain the reference's serial residual copy and FP64 RMS chain. */
     for (int t = 0; t < tokens; ++t) {
         glm53f_mhc_scratch *q = (glm53f_mhc_scratch *)
