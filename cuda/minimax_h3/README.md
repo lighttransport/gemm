@@ -44,7 +44,7 @@ Weights stream per block from mmap, and a 64 GB host is required.
   |---|---|---|
   | Qwen3-VL text encoder | 7.4 s | 40 s |
   | DiT, per Euler update (50 blocks) | 89 s | ~128 s |
-  | VAE decode (124 frames) | 89 s | 249 s |
+  | VAE decode (124 frames) | 82 s | 249 s |
 
   DiT attention runs at the same speed as PyTorch's (32.7 vs 32.4 TFLOPS) and is
   ~65% of DiT time. DiT INT8 weights for block i+1 are prefetched by a worker
@@ -115,3 +115,6 @@ against 0.044 / 0.076).
   ~33 s to ~8 s in the VAE. Wall time gained less (DiT 93.8 → 89 s, VAE ~96 → 89 s):
   attention (~70 s) dominates DiT, and VAE tile enqueue is now partly host-bound
   (~12 s idle).
+- **VAE host overlap:** tile inputs upload through pinned staging without a stream
+  sync, and each chunk's frames are converted and emitted on a worker thread while
+  the GPU decodes the next chunk. VAE 89 → 82 s, with identical frames.

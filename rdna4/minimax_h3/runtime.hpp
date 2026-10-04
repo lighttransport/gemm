@@ -8,6 +8,7 @@
 #include <dlfcn.h>
 #include <iostream>
 #include <random>
+#include <future>
 #include <thread>
 #ifndef HV15N_ROCM
 #include "../../cuda/fa2/cuda_fa2_kernels.h"
@@ -312,6 +313,14 @@ struct Engine {
             cuStreamSynchronize(g.stream);
             cuModuleUnload(module);
         }
+    }
+    // Stream-ordered upload through pinned staging (Gpu::upload synchronizes the stream,
+    // which would stall the pipelined VAE tile enqueue).
+    Tensor upload_async(const std::vector<float> &data, const std::vector<int> &shape) {
+        require(data.size() == product(shape), "upload shape mismatch");
+        auto t = g.empty(shape);
+        g.upload_staged(t, data.data(), g.stream);
+        return t;
     }
     Tensor byte_tensor(std::vector<int> shape) {
         Tensor t;
@@ -1065,7 +1074,7 @@ struct Engine {
     }
     // Enqueues one tile and returns its device pixels (T*4, H*16, W*16, 3).
     Tensor decode_tile(Weights &w, const std::vector<float> &z, int t, int h, int width) {
-        auto input = rounded(g.upload(z, {t, h, width, 24}), 2);
+        auto input = rounded(upload_async(z, {t, h, width, 24}), 2);
         auto postw = g.weight_half(w, "post_quant_conv.weight");
         postw.shape = {24, 24};
         auto post = g.matmul(input, postw);
@@ -1074,7 +1083,7 @@ struct Engine {
         auto x = linear(w, "decoder.x_embedder", post, 2);
         auto registers = g.weight(w, "decoder.register_tokens");
         registers.shape = {4, 2048};
-        x = g.concat(g.concat(x, registers), g.upload(std::vector<float>(2048), {1, 2048}));
+        x = g.concat(g.concat(x, registers), upload_async(std::vector<float>(2048), {1, 2048}));
         std::vector<float> rot(size_t(x.rows()) * 24 * 2, 0);
         for (int r = 0; r < x.rows(); r++) {
             float coord[3] = {0, 0, 0};
@@ -1095,7 +1104,7 @@ struct Engine {
                     rot[at + 1] = std::sin(angle);
                 }
         }
-        auto angles = rounded(g.upload(rot, {x.rows(), 24, 2}), 2);
+        auto angles = rounded(upload_async(rot, {x.rows(), 24, 2}), 2);
         for (int i = 0; i < 36; i++) {
             auto p = "decoder.transformer_blocks." + std::to_string(i);
 #ifndef HV15N_ROCM
@@ -1297,10 +1306,10 @@ struct Engine {
         const size_t pixels = size_t(h * 16) * width * 16 * 3;
         std::vector<float> overlap;
         int emitted = 0;
+        std::future<void> writer;
         auto emit = [&](const float *frame) {
             if (emitted >= requested)
                 return;
-            g.poll();
             std::vector<unsigned char> rgb(pixels);
             const float m[] = {.485f, .456f, .406f}, s[] = {.229f, .224f, .225f};
             std::vector<float> values(pixels);
@@ -1331,16 +1340,29 @@ struct Engine {
                         auto &v = frames[size_t(f + 3) * pixels + j];
                         v = blend_half(overlap[size_t(f) * pixels + j], v, f, 5);
                     }
-            for (int f = 0; f < first; f++)
-                emit(frames.data() + size_t(f + 3) * pixels);
             int tail = count * 4 - 23;
             overlap.clear();
             if (tail > 0)
                 overlap.assign(frames.begin() + 23 * pixels, frames.end());
-            if (i + 1 == chunks)
-                for (int f = 0; f < tail; f++)
-                    emit(overlap.data() + size_t(f) * pixels);
+            // Emit this chunk's frames on a worker while the GPU decodes the next chunk;
+            // one emission is in flight at a time, so frame order is preserved.
+            if (writer.valid())
+                writer.get();
+            g.poll();
+            auto owned = std::make_shared<std::vector<float>>(std::move(frames));
+            auto last = i + 1 == chunks && tail > 0
+                            ? std::make_shared<std::vector<float>>(overlap)
+                            : std::shared_ptr<std::vector<float>>();
+            writer = std::async(std::launch::async, [&, owned, last, first, tail]() {
+                for (int f = 0; f < first; f++)
+                    emit(owned->data() + size_t(f + 3) * pixels);
+                if (last)
+                    for (int f = 0; f < tail; f++)
+                        emit(last->data() + size_t(f) * pixels);
+            });
         }
+        if (writer.valid())
+            writer.get();
         require(emitted == requested, "VAE frame count mismatch");
     }
 };
