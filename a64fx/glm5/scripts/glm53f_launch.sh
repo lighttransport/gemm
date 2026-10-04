@@ -9,11 +9,12 @@ mpi_run() {
     # A parent shell and a nested launcher can reuse the same run tag. Keep
     # each launch's rank files separate, including repeated preflight calls.
     last_log="$logdir/$label-$run_tag-$BASHPID-$glm53f_mpi_sequence"
-    # Diagnostic: GLM53F_FAPP_EVENTS=0x..,0x.. wraps benchmark ranks in a fapp PMU collection (<log>.fapp).
+    # Diagnostic: GLM53F_FAPP_EVENTS=0x..,0x.. runs benchmark launches under a fapp PMU collection (<log>.fapp).
+    # fapp must wrap mpiexec (wrapping each rank yields incomplete, invalid data).
     local wrap=()
     [ "$label" = benchmark ] && [ -n "${GLM53F_FAPP_EVENTS:-}" ] &&
         wrap=(fapp -C -d "$last_log.fapp" -Icpupa "-Hevent_raw=$GLM53F_FAPP_EVENTS")
-    "$mpiexec_bin" -n 12 -of-proc "$last_log" "${wrap[@]}" "$@"
+    "${wrap[@]}" "$mpiexec_bin" -n 12 -of-proc "$last_log" "$@"
 }
 require_ranks() {
     local rank files
