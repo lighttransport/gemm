@@ -2,7 +2,7 @@
 import json
 from pathlib import Path
 
-BACKENDS = ("repo", "legacy", "wan", "h3", "hv15-rocm")
+BACKENDS = ("repo", "legacy", "wan", "h3", "h3-fl2va", "hv15-rocm")
 
 
 class WanBackend:
@@ -98,7 +98,8 @@ class H3Backend:
     default_frames = 124
     presets = ("quality", "fast12", "fast5")
     hardware = "rocm"
-    identity_conditioned = False
+    identity_conditioned = True
+    variant = 'ref2va'
     manages_device_lock = True
     default_model = Path("/mnt/disk01/models/h3/weights")
 
@@ -112,21 +113,30 @@ class H3Backend:
         if preset not in self.presets:
             raise ValueError("unsupported H3 preset")
         model = Path(model or self.default_model)
-        for name in self.module.COMPONENTS:
+        for name in (f'diffusion_models/minimax_h3_{self.variant}_pruned_int8_convrot.safetensors',
+                     *self.module.COMPONENTS[1:]):
             if not (model / name).is_file():
                 raise ValueError(f"missing H3 component: {name}")
-        return {"task": "t2v", "identity_conditioned": False}
+        return {"task": "r2v" if self.variant == 'ref2va' else "i2v", "identity_conditioned": True}
 
     def generate(self, *, image, preset="quality", model=None, frames=124, **kwargs):
         if frames not in self.frames or preset not in self.presets:
             raise ValueError("unsupported H3 frame count/preset")
-        # H3 has no reference-image conditioning in the current native graph.
+        conditioning = {'reference_images': [image]} if self.variant == 'ref2va' else {'first_frame': image}
+        if self.variant == 'ref2va':
+            kwargs['prompt'] = 'The person in <Picture 1>. '+kwargs['prompt']
         result = self.module.generate(model=model or self.default_model, backend="rocm", frames=frames,
-            steps={"quality": 40, "fast12": 13, "fast5": 6}[preset], width=480, height=832, **kwargs)
-        result.update(task="t2v", preset=preset, identity_conditioned=False, synthetic=True,
+            steps={"quality": 40, "fast12": 13, "fast5": 6}[preset], width=480, height=832,
+            variant=self.variant, **conditioning, **kwargs)
+        result.update(task="r2v" if self.variant == 'ref2va' else "i2v", preset=preset,
+                      identity_conditioned=True, synthetic=True,
                       source_portrait_sha256=self.module.video.digest(image),
-                      source_portrait_used_for_conditioning=False)
+                      source_portrait_used_for_conditioning=True)
         return result
+
+
+class H3Fl2vaBackend(H3Backend):
+    variant = 'fl2va'
 
 
 class RepositoryBackend:
@@ -167,4 +177,6 @@ def select(backend='repo'):
         return Hv15RocmBackend()
     if backend == 'h3':
         return H3Backend()
+    if backend == 'h3-fl2va':
+        return H3Fl2vaBackend()
     raise ValueError(f'video backend must be one of {BACKENDS}')

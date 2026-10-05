@@ -108,7 +108,7 @@ __global__ void h3_qkv(float *q,float *k,float *v,const float *x,int rows,int he
 }
 __global__ void h3_qwen_attention(float *out,const float *q,const float *k,const float *v,int rows,int heads,int kvheads,int dim,float root_scale){
     int row=blockIdx.x,head=blockIdx.y,lane=threadIdx.x,kh=head/(heads/kvheads);
-    __shared__ float scores[512],prob[512];
+    __shared__ float scores[2048],prob[2048];
     for(int j=lane;j<rows;j+=32){
         float dot=-__int_as_float(0x7f800000);
         if(j<=row){dot=0;
@@ -148,6 +148,16 @@ __global__ void h3_gate(float *x,const float *delta,const float *mod,int rows,in
     long i=(long)blockIdx.x*256+threadIdx.x;if(i>=(long)rows*dim)return;
     int r=i/dim,c=i%dim,m=r<text?1:r<text+audio?5:0;
     x[i]=rnd(x[i]+delta[i]*rnd(mod[(long)m*6*dim+chunk*dim+c],kind),kind);
+}
+__global__ void h3_mod_index(float *out,const float *x,const float *mod,const float *indices,int rows,int dim,int chunk){
+    long i=(long)blockIdx.x*256+threadIdx.x;if(i>=(long)rows*dim)return;
+    int c=i%dim,m=(int)indices[i/dim];long base=(long)m*6*dim;
+    float scale=rnd(mod[base+(chunk+1)*dim+c],1),shift=rnd(mod[base+chunk*dim+c],1);
+    out[i]=rnd(rnd(x[i]*rnd(1.f+scale,1),1)+shift,1);
+}
+__global__ void h3_gate_index(float *x,const float *delta,const float *mod,const float *indices,int rows,int dim,int chunk){
+    long i=(long)blockIdx.x*256+threadIdx.x;if(i<(long)rows*dim)
+        x[i]=rnd(x[i]+delta[i]*rnd(mod[(long)(int)indices[i/dim]*6*dim+chunk*dim+i%dim],1),1);
 }
 __global__ void h3_scale_add(float *x,const float *delta,const float *scale,int rows,int k,int kind){
     long i=(long)blockIdx.x*256+threadIdx.x;if(i<(long)rows*k)x[i]=rnd(x[i]+delta[i]*scale[i%k],kind);

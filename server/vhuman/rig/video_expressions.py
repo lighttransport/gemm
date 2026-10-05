@@ -91,9 +91,9 @@ def generate(*, portrait, out, backend='wan', model=None, preset='fast5', frames
     if not names or len(set(names)) != len(names) or any(n not in EXPRESSIONS for n in names):
         raise ValueError('provide unique known expression names')
     selected = select(backend)
-    if backend not in ('wan', 'h3', 'hv15-rocm') or preset not in selected.presets:
+    if backend not in ('wan', 'h3', 'h3-fl2va', 'hv15-rocm') or preset not in selected.presets:
         raise ValueError('unsupported expression backend/preset')
-    frames = frames if frames is not None else (9 if backend == 'wan' else 22 if backend == 'h3' else 81)
+    frames = frames if frames is not None else (9 if backend == 'wan' else 22 if backend.startswith('h3') else 81)
     if frames not in selected.frames:
         raise ValueError('unsupported expression frame count')
     out = Path(out)
@@ -194,7 +194,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--portrait', type=Path, required=True)
     parser.add_argument('--out', type=Path, required=True)
-    parser.add_argument('--backend', choices=('wan','h3','hv15-rocm'), default='wan')
+    parser.add_argument('--backend', choices=('wan','h3','h3-fl2va','hv15-rocm'), default='wan')
     parser.add_argument('--model', type=Path)
     parser.add_argument('--preset', choices=('fast5','fast12','quality'), default='fast5')
     parser.add_argument('--frames', type=int)

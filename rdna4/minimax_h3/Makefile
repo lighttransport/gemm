@@ -12,9 +12,9 @@ AOTRITON_ROOT ?= /opt/aotriton
 .PHONY: all test clean aotriton
 all: $(BUILD)/h3_rocm $(BUILD)/libh3_rocm.so $(BUILD)/component_probe
 aotriton: $(BUILD)/libvideo_aotriton.so
-$(BUILD)/libvideo_aotriton.so: ../video_common/aotriton_bridge.cpp ../video_common/aotriton_bridge.h | $(BUILD)
+$(BUILD)/libvideo_aotriton.so: ../video_common/aotriton_bridge.cpp ../video_common/aotriton_bridge.h blaslt.cpp | $(BUILD)
 	test -f "$(AOTRITON_ROOT)/include/aotriton/flash.h"
-	$(CXX) $(CXXFLAGS) -D__HIP_PLATFORM_AMD__ -I/opt/rocm/include -I"$(AOTRITON_ROOT)/include" -shared -fPIC $< -L"$(AOTRITON_ROOT)/lib" -laotriton_v2 -L/opt/rocm/lib -Wl,--no-as-needed -lamdhip64 -Wl,--as-needed -Wl,-rpath,"$(AOTRITON_ROOT)/lib:/opt/rocm/lib" -o $@
+	$(CXX) $(CXXFLAGS) -D__HIP_PLATFORM_AMD__ -I/opt/rocm/include -I"$(AOTRITON_ROOT)/include" -shared -fPIC $< blaslt.cpp -L"$(AOTRITON_ROOT)/lib" -laotriton_v2 -L/opt/rocm/lib -lhipblaslt -Wl,--no-as-needed -lamdhip64 -Wl,--as-needed -Wl,-rpath,"$(AOTRITON_ROOT)/lib:/opt/rocm/lib" -o $@
 $(BUILD):
 	mkdir -p $@
 ../video_common/kernels.hpp: ../video_common/make_kernels.py ../video_common/gemm.hip ../video_common/attention.hip ../video_common/flex_attention.hip ../video_common/precision.hip ../qimg/hip_qimg_kernels.h

@@ -8,20 +8,32 @@ int main(int argc, char **argv) {
             "component_probe MODEL qwen PROMPT OUT | MODEL linear WEIGHTS PREFIX INPUT ROWS OUT");
         h3_config config;
         h3_config_defaults(&config);
+        const char *conditioning = nullptr;
         while (argc >= 3) {
             std::string option = argv[argc - 2];
             if (option == "--aotriton-bridge")
                 config.aotriton_bridge = argv[argc - 1];
+            else if (option == "--conditioning")
+                conditioning = argv[argc - 1];
             else if (option == "--vae-hipblas") {
                 std::string value = argv[argc - 1];
                 require(value == "0" || value == "1", "VAE backend must be 0 or 1");
                 config.vae_hipblas = value == "1";
+            } else if (option == "--vram-budget-mib") {
+                config.vram_budget_mib = std::stoi(argv[argc - 1]);
             } else
                 break;
             argc -= 2;
         }
         config.model_dir = argv[1];
         Engine engine(config);
+        if (conditioning) {
+            engine.conditioning = conditioning;
+            Json receipt(engine.conditioning / "manifest.json");
+            engine.variant = string(receipt.value.get(), "variant");
+            engine.condition_text_rows = int(field(receipt.value.get(), "text_rows")->num);
+            engine.condition_rows = int(field(receipt.value.get(), "condition_rows")->num);
+        }
         auto &g = engine.g;
         if (std::string(argv[2]) == "qwen-rope") {
             require(argc == 5, "qwen-rope needs sequence length and output directory");
@@ -38,8 +50,7 @@ int main(int argc, char **argv) {
             int rows = int(shape->arr.items[1].num);
             auto x = g.upload(read_f32(fs::path(argv[3]) / "qwen_hidden.f32", size_t(rows) * 5120),
                               {rows, 5120});
-            Weights weights(fs::path(argv[1]) /
-                            "diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors");
+            Weights weights(engine.checkpoint());
             engine.trace = argv[4];
             engine.refine(weights, x, argv[4]);
         } else if (std::string(argv[2]) == "vae") {
@@ -80,7 +91,7 @@ int main(int argc, char **argv) {
                               ? engine.norm(&weights, prefix, input, kind)
                               : engine.linear(weights, prefix, input, kind, kind == 0);
             g.dump(output, argv[7], "output");
-        } else if (std::string(argv[2]) == "dit-block" || std::string(argv[2]) == "dit-step") {
+        } else if (std::string(argv[2]) == "dit-block" || std::string(argv[2]) == "dit-step" || std::string(argv[2]) == "dit-stream") {
             require(argc == 5, "dit-block probe needs capture directory and output directory");
             fs::path in = argv[3], out = argv[4];
             Json meta(in / "noise_video.json");
@@ -127,13 +138,29 @@ int main(int argc, char **argv) {
                      video.pointer, t, h, w);
             auto vi = engine.rounded(engine.linear(weights, "video_patch_proj", patches, 1, true)),
                  au = engine.rounded(engine.linear(weights, "audio_patch_proj", audio, 1, true));
-            auto x = g.concat(g.concat(text, au), vi);
+            auto x = engine.pack_rows({&text, &au, &vi});
             g.clear_weights();
             stamp("embedding");
             auto mod = engine.linear(weights, "blocks.0.adaln_proj.linear", emb, 0, true);
             auto z = engine.modulate(engine.norm(&weights, "blocks.0.norm1", x), mod, text.rows(),
                                      audio.rows(), 0);
             stamp("norm_and_modulate");
+            if (std::string(argv[2]) == "dit-stream") {
+                auto delta = engine.self_attention(weights, "blocks.0.attn", z, 56, 128, 1, &rotation, 48);
+                engine.gated(x, delta, mod, text.rows(), audio.rows(), 2);
+                delta = {};
+                z = engine.modulate(engine.norm(&weights, "blocks.0.norm2", x), mod, text.rows(), audio.rows(), 3);
+                delta = engine.ffn(weights, "blocks.0.mlp", z);
+                engine.gated(x, delta, mod, text.rows(), audio.rows(), 5);
+                stamp("streamed_attention_and_ffn");
+                g.dump(x, out, "dit_block_0");
+                fs::create_directories(out);
+                std::ofstream file(out / "metrics.json");
+                file << "{\"scope\":\"one_block_memory_probe\",\"packed_rows\":" << x.rows()
+                     << ",\"convrot_hipblaslt_calls\":" << engine.convrot_lt_calls
+                     << ",\"gpu\":" << g.metrics() << "}\n";
+                return 0;
+            }
             auto packed = engine.linear(weights, "blocks.0.attn.qkv_proj", z);
             stamp("qkv");
             auto q = g.empty({x.rows(), 7168}), k = g.empty(q.shape), v = g.empty(q.shape);

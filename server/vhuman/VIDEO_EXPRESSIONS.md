@@ -10,7 +10,7 @@ the repository CPU GEMM executor; the parser explicitly uses CPU ONNX Runtime.
 Install `requirements-face-parsing.txt` in the ROCm environment and build
 `make -C cpu/vhuman libvhuman_landmarks.so`.
 
-The vhuman server and `video` CLI accept `--video-backend wan`, `h3` or
+The vhuman server and `video` CLI accept `--video-backend wan`, `h3`, `h3-fl2va` or
 `hv15-rocm` with `--backend rocm` and experimental opt-in. Model directories
 default to `/mnt/disk01/models/wan22`, `/mnt/disk01/models/h3/weights` and
 `/mnt/disk01/models/hv15`. Each child owns the shared AMD device lock; the
@@ -19,8 +19,12 @@ server does not take it a second time. No CUDA GPU is required.
 Wan uses Q8_0 weights and the HIP projection runner with hipBLASLt. Short
 iterations use `fast5` and 9 frames (legal counts are 4*n+1).
 H3 `fast5` uses six sigma points/five Euler updates, normally 22 frames
-(17*n+5). **H3 currently supports text-to-video only: the portrait is not
-used for conditioning.** HV1.5 supports 81 frames with `fast12` or `quality`.
+(17*n+5). `h3` conditions Ref2VA on the portrait as `<Picture 1>`;
+`h3-fl2va` anchors FL2VA's first frame to the portrait. Both use a default
+12,288 MiB budget, staged PyTorch ROCm image encoders, and the native HIP
+language model, DiT and decoder. See the
+[H3 setup and validation instructions](../../rdna4/minimax_h3/README.md).
+HV1.5 supports 81 frames with `fast12` or `quality`.
 
 Generate one candidate expression:
 
@@ -31,7 +35,8 @@ LD_LIBRARY_PATH=/opt/rocm/core-7.14/lib \
   --backend wan --preset fast5 --frames 9 --names smile
 ```
 
-Use `--backend h3 --preset fast5 --frames 22` or
+Use `--backend h3 --preset fast5 --frames 22`,
+`--backend h3-fl2va --preset fast5 --frames 22`, or
 `--backend hv15-rocm --preset fast12 --frames 81` for the other runners.
 The server's existing `expressions` job also accepts `video_backend`,
 `names`, `model`, `preset`, `frames` and `seed`; it writes a new directory
@@ -78,8 +83,16 @@ Validation on RX 9070 XT: Wan HIP, 480x832, nine frames, five steps took
 153.583 s total, 29.997 s preparation/denoising, 8412.47 MiB peak allocated,
 3000 HIP projections. Native MediaPipe found one face in all nine frames;
 the selected smile weights were 0.837/0.800. Five-step quality is a smoke test,
-not a final expression quality assessment. H3/HV1.5 expression generation
-has not yet been validated end to end by this workflow.
+not a final expression quality assessment. A portrait-conditioned H3 Ref2VA
+candidate at 480x832, 22 frames and five updates completed with 5129.20 MiB
+sampled peak and 309.914 s generation time excluding model verification.
+MediaPipe found a face in all 22 frames and selected smile weights 0.949/0.950.
+A first-frame FL2VA candidate at the same resolution and update count
+completed in 202.508 s, with 5214.73 MiB sampled peak and a visible face in all
+22 frames. Its selected smile weights were 0.910/0.870. Both H3 modes also
+passed independent five-update, 64x64 diagnostics with exact latent updates.
+Full-trajectory parity, identity review and HV1.5 expression capture remain
+unvalidated. These single-run timings are not comparative throughput benchmarks.
 
 The small synthetic GNM build exported a 383x51 matrix, jaw-driven coefficients,
 the UV side mask and individual expression atlases. Its largest single-control

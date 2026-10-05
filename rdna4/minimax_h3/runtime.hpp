@@ -47,9 +47,16 @@ struct Engine {
     Gpu g;
     CUmodule module = nullptr;
     uint64_t int8_calls = 0, bf16_calls = 0, bf16_blas_calls = 0, convrot_blas_calls = 0,
-             fp32_blas_calls = 0;
+             fp32_blas_calls = 0, convrot_lt_calls = 0;
     fs::path root;
     fs::path trace;
+    fs::path conditioning;
+    std::string variant = "ref2va";
+    int condition_rows = 0, condition_text_rows = 0;
+    Tensor condition_patches, dit_mod_indices;
+    fs::path checkpoint() const {
+        return root / ("diffusion_models/minimax_h3_" + variant + "_pruned_int8_convrot.safetensors");
+    }
     bool convrot_hipblas, bf16_hipblas, vae_hipblas;
     bool fp32_hipblas = true;
     cublasew_context *rotation_blas = nullptr;
@@ -58,6 +65,11 @@ struct Engine {
     video_aotriton_forward_fn aot_attention = nullptr;
     uint64_t aot_calls = 0;
 #ifdef HV15N_ROCM
+    using LtForward = int (*)(void *, void *, const void *, const void *, int, int, int,
+                              void *, size_t, void *);
+    std::unique_ptr<void, void (*)(void *)> lt_state{nullptr, +[](void *) {}};
+    LtForward lt_forward = nullptr;
+    Tensor lt_workspace;
     int ffn_rows = 256;
 #else
     int ffn_rows = 4096; // larger FFN chunks keep tensor-core GEMMs efficient
@@ -325,11 +337,24 @@ struct Engine {
                 aot_attention = reinterpret_cast<video_aotriton_forward_fn>(
                     dlsym(aot_library.get(), "video_aotriton_forward"));
                 require(aot_attention != nullptr, "missing AOTriton attention entry point");
+#ifdef HV15N_ROCM
+                auto create = reinterpret_cast<int (*)(void **)>(dlsym(aot_library.get(), "video_bf16_lt_create"));
+                auto destroy = reinterpret_cast<void (*)(void *)>(dlsym(aot_library.get(), "video_bf16_lt_destroy"));
+                auto lt_abi = reinterpret_cast<int (*)(void)>(dlsym(aot_library.get(), "video_bf16_lt_abi"));
+                lt_forward = reinterpret_cast<LtForward>(dlsym(aot_library.get(), "video_bf16_lt_forward"));
+                if (create && destroy && lt_forward) {
+                    require(lt_abi && lt_abi() == 1, "unsupported BF16 ConvRot bridge ABI");
+                    void *state = nullptr;
+                    require(create(&state) == 0 && state, "hipBLASLt ConvRot initialization failed");
+                    lt_state = std::unique_ptr<void, void (*)(void *)>(state, destroy);
+                } else
+                    lt_forward = nullptr;
+#endif
             }
             for (const char *name : {"h3_round", "h3_pack_bf16", "h3_angles", "h3_qwen_angles",
                                      "h3_rotate", "h3_quant", "h3_norm", "h3_swiglu", "h3_qkv",
                                      "h3_rope", "h3_mod", "h3_gate", "h3_scale_add", "h3_patch",
-                                     "h3_unpatch", "h3_decode_patch", "h3_qwen_attention"
+                                     "h3_unpatch", "h3_decode_patch", "h3_qwen_attention", "h3_mod_index", "h3_gate_index"
 #ifndef HV15N_ROCM
                                      ,
                                      "h3_dequant", "h3_pack_heads", "h3_unpack_heads", "h3_bias_round",
@@ -457,9 +482,29 @@ struct Engine {
         g.launch("h3_pack_bf16", int((x.count() + 255) / 256), 1, 1, 256, 1, 0, packed.pointer,
                  x.pointer, int64_t(x.count()));
         // torch.matmul folds the leading group dimensions into one GEMM.
+#ifdef HV15N_ROCM
+        if (lt_forward || !conditioning.empty()) {
+            auto product = g.empty_half(x.shape);
+            require(lt_forward && lt_state, "conditioned H3 needs the hipBLASLt-enabled AOTriton bridge");
+            if (!lt_workspace.pointer)
+                lt_workspace = byte_tensor({32 * 1024 * 1024});
+            require(lt_forward(lt_state.get(), reinterpret_cast<void *>(product.pointer),
+                               reinterpret_cast<void *>(rotation_weight.pointer),
+                               reinterpret_cast<void *>(packed.pointer), int(x.count() / 256),
+                               256, 256, reinterpret_cast<void *>(lt_workspace.pointer),
+                               lt_workspace.bytes(), g.stream) == 0, "hipBLASLt ConvRot GEMM failed");
+            convrot_lt_calls++;
+            g.launch("convert_bfloat", int((out.count() + 255) / 256), 1, 1, 256, 1, 0,
+                     out.pointer, product.pointer, int(out.count()));
+        } else
+            require(video_hipblas_gemm(rotation_blas, out.pointer, rotation_weight.pointer,
+                                   packed.pointer, int(x.count() / 256), 256, 256, 14) == 0,
+                "BF16 ConvRot hipBLAS GEMM failed");
+#else
         require(video_hipblas_gemm(rotation_blas, out.pointer, rotation_weight.pointer,
                                    packed.pointer, int(x.count() / 256), 256, 256, 14) == 0,
                 "BF16 ConvRot hipBLAS GEMM failed");
+#endif
         convrot_blas_calls++;
         return rounded(out, 1);
     }
@@ -634,7 +679,7 @@ struct Engine {
         // Qwen's short causal sequence keeps FP32 softmax and value accumulation;
         // quantized projections and the resulting hidden states remain BF16.
         if (causal) {
-            require(q.rows() <= 512 && kind == 1 && dim == 128, "Qwen attention geometry");
+            require(q.rows() <= 2048 && kind == 1 && dim == 128, "Qwen attention geometry");
             auto out = g.empty(q.shape);
             g.launch("h3_qwen_attention", q.rows(), heads, 1, 32, 1, 0, out.pointer, q.pointer,
                      k.pointer, v.pointer, q.rows(), heads, kvheads, dim,
@@ -666,7 +711,7 @@ struct Engine {
             return out;
         }
 #else
-        if (aot_attention && kind == 1 && dim == 128 && q.rows() >= 128) {
+        if (aot_attention && kind == 1 && dim == 128) {
             const auto shape = q.shape;
             const int rows = q.rows();
             auto pq = g.empty_half(q.shape), pk = g.empty_half(k.shape), pv = g.empty_half(v.shape);
@@ -712,13 +757,24 @@ struct Engine {
     Tensor self_attention(Weights &w, const std::string &p, const Tensor &x, int heads, int dim,
                           int kind, const Tensor *angles = nullptr, int pairs = 0,
                           bool interleaved = false) {
-        auto packed = linear(w, p + (interleaved ? ".to_qkv" : ".qkv_proj"), x, kind);
-        if (!trace.empty())
-            g.dump(packed, trace, p + ".qkv");
         auto q = g.empty({x.rows(), heads * dim}), k = g.empty(q.shape), v = g.empty(q.shape);
-        g.launch("h3_qkv", int((q.count() + 255) / 256), 1, 1, 256, 1, 0, q.pointer, k.pointer,
-                 v.pointer, packed.pointer, x.rows(), heads, dim, int(interleaved));
-        packed = {};
+        // Stream QKV projection rows directly into the persistent split outputs.
+        // A full 37k-token packed projection otherwise duplicates ~3 GiB.
+        const std::string name = p + (interleaved ? ".to_qkv" : ".qkv_proj");
+        {
+            Linear projection(*this, w, name, kind);
+            int tile = trace.empty() ? 512 : x.rows();
+            for (int row = 0; row < x.rows(); row += tile) {
+                int count = std::min(tile, x.rows() - row);
+                auto packed = projection(g.rows(x, row, count));
+                if (!trace.empty())
+                    g.dump(packed, trace, p + ".qkv");
+                size_t offset = size_t(row) * heads * dim * sizeof(float);
+                g.launch("h3_qkv", (count * heads * dim + 255) / 256, 1, 1, 256, 1, 0,
+                         q.pointer + offset, k.pointer + offset, v.pointer + offset,
+                         packed.pointer, count, heads, dim, int(interleaved));
+            }
+        }
         q = head_norm(interleaved ? nullptr : &w, p + ".q_norm", q, dim, kind);
         k = head_norm(interleaved ? nullptr : &w, p + ".k_norm", k, dim, kind);
         if (angles) {
@@ -966,11 +1022,22 @@ struct Engine {
     Tensor modulate(const Tensor &x, const Tensor &mod, int text, int audio, int chunk,
                     int kind = 1) {
         auto y = g.empty(x.shape);
+        if (dit_mod_indices.pointer && text > 0) {
+            require(kind == 1 && dit_mod_indices.rows() == x.rows(), "condition modulation layout");
+            g.launch("h3_mod_index", int((x.count() + 255) / 256), 1, 1, 256, 1, 0,
+                     y.pointer, x.pointer, mod.pointer, dit_mod_indices.pointer, x.rows(), x.channels(), chunk);
+            return y;
+        }
         g.launch("h3_mod", int((x.count() + 255) / 256), 1, 1, 256, 1, 0, y.pointer, x.pointer,
                  mod.pointer, x.rows(), x.channels(), text, audio, chunk, kind);
         return y;
     }
     void gated(Tensor &x, const Tensor &delta, const Tensor &mod, int text, int audio, int chunk) {
+        if (dit_mod_indices.pointer && text > 0) {
+            g.launch("h3_gate_index", int((x.count() + 255) / 256), 1, 1, 256, 1, 0,
+                     x.pointer, delta.pointer, mod.pointer, dit_mod_indices.pointer, x.rows(), x.channels(), chunk);
+            return;
+        }
         g.launch("h3_gate", int((x.count() + 255) / 256), 1, 1, 256, 1, 0, x.pointer, delta.pointer,
                  mod.pointer, x.rows(), x.channels(), text, audio, chunk, 1);
     }
@@ -996,6 +1063,12 @@ struct Engine {
             }
         auto x = g.upload(data, {int(ids.size()), 5120});
         auto rotation = qwen_angles(int(ids.size()));
+        if (!conditioning.empty()) {
+            x = g.upload(read_f32(conditioning / "qwen_inputs.f32", size_t(condition_text_rows) * 5120),
+                         {condition_text_rows, 5120});
+            rotation = g.upload(read_f32(conditioning / "qwen_rotation.f32", size_t(condition_text_rows) * 64 * 2),
+                                {condition_text_rows, 64, 2});
+        }
         if (!trace.empty())
             g.dump(rotation, trace, "qwen_rotation");
 #ifndef HV15N_ROCM
@@ -1016,7 +1089,7 @@ struct Engine {
 #endif
             std::string p = "model.layers." + std::to_string(i);
             auto capture = [&](const Tensor &value, const char *name) {
-                if (!trace.empty() && (i == 0 || std::string(name) == "after_mlp"))
+                if (!trace.empty() && (i == 0 || i == 3 || std::string(name) == "after_mlp"))
                     g.dump(value, trace, p + "." + name);
             };
             auto z = norm(&w, p + ".input_layernorm", x, 1, 2, 1e-6);
@@ -1049,6 +1122,10 @@ struct Engine {
             auto activated = rounded(g.op(gate, 2, &up));
             capture(activated, "activated");
             x = residual(x, linear(w, p + ".mlp.down_proj", activated), 1);
+            if (!conditioning.empty() && i < 3) {
+                auto deepstack = g.upload(read_f32(conditioning / ("deepstack_" + std::to_string(i) + ".f32"), x.count()), x.shape);
+                x = residual(x, deepstack, 1);
+            }
             capture(x, "after_mlp");
             g.clear_weights();
             if (i % 10 == 9)
@@ -1112,6 +1189,11 @@ struct Engine {
             time += (tt % 5 == 0 ? 1 : 4) * (5. / 3.);
         }
         auto input = g.upload(phases, {total, 48});
+        if (!conditioning.empty()) {
+            total += condition_rows;
+            phases = read_f32(conditioning / "dit_phases.f32", size_t(total)*48);
+            input = g.upload(phases, {total, 48});
+        }
         auto out = g.empty({total, 48, 2});
         g.launch("h3_angles", int((phases.size() + 255) / 256), 1, 1, 256, 1, 0, out.pointer,
                  input.pointer, int64_t(phases.size()), 1);
@@ -1120,9 +1202,10 @@ struct Engine {
     Tensor time_embed(Weights &w, float tv, float ta) {
         auto table = w.floats("adaln_t_table");
         require(table.size() == 1025 * 8, "AdaLN basis shape");
-        std::vector<float> values(16);
-        float times[] = {tv, ta};
-        for (int r = 0; r < 2; r++) {
+        int count = conditioning.empty() ? 2 : 3;
+        std::vector<float> values(size_t(count)*8);
+        float times[] = {tv, ta, std::max(tv, .999f)};
+        for (int r = 0; r < count; r++) {
             float pos = std::clamp(times[r], 0.f, 1.f) * 1024;
             int i = std::min(int(std::floor(pos)), 1023);
             float f = pos - i;
@@ -1133,7 +1216,24 @@ struct Engine {
                                             : std::fma(-(1.f - f), end - start, end);
             }
         }
-        return g.upload(values, {2, 8});
+        return g.upload(values, {count, 8});
+    }
+    Tensor pack_rows(std::initializer_list<const Tensor *> parts) {
+        require(parts.size() > 0, "empty packed sequence");
+        int rows = 0, channels = (*parts.begin())->channels();
+        for (const Tensor *part : parts) {
+            require(part->element_bytes == 4 && part->channels() == channels,
+                    "packed sequence channels/dtype");
+            rows += part->rows();
+        }
+        auto out = g.empty({rows, channels});
+        size_t offset = 0;
+        for (const Tensor *part : parts) {
+            g.check(cuMemcpyDtoDAsync(out.pointer + offset, part->pointer, part->bytes(), g.stream),
+                    "pack H3 sequence");
+            offset += part->bytes();
+        }
+        return out;
     }
     std::array<Tensor, 2> denoise(Weights &w, const Tensor &text, const Tensor &video,
                                   const Tensor &audio, const Tensor &rotation, int t, int h,
@@ -1143,7 +1243,19 @@ struct Engine {
                  video.pointer, t, h, width);
         auto vi = rounded(linear(w, "video_patch_proj", patches, 1, true)),
              au = rounded(linear(w, "audio_patch_proj", audio, 1, true));
-        auto x = g.concat(g.concat(text, au), vi);
+        Tensor x;
+        if (!conditioning.empty()) {
+            auto cond = rounded(linear(w, "video_patch_proj", condition_patches, 1, true));
+            x = pack_rows({&text, &cond, &au, &vi});
+            auto indices = read_f32(conditioning / "text_tags.f32", text.rows());
+            for (float tag : indices)
+                require(tag == 0.f || tag == 1.f, "conditioning text tag must be video or text");
+            indices.insert(indices.end(), condition_rows, 6.f);
+            indices.insert(indices.end(), audio.rows(), 5.f);
+            indices.insert(indices.end(), vi.rows(), 0.f);
+            dit_mod_indices = g.upload(indices, {x.rows(), 1});
+        } else
+            x = pack_rows({&text, &au, &vi});
         auto emb = time_embed(w, tv, ta);
         g.clear_weights();
         require(trace.empty() || x.rows() <= 256, "DiT tracing requires at most 256 tokens");
@@ -1171,7 +1283,7 @@ struct Engine {
             std::string p = "blocks." + std::to_string(i);
             auto modulation = linear(w, p + ".adaln_proj.linear", emb, 0, true);
 #ifndef HV15N_ROCM
-            if (fused()) {
+            if (fused() && conditioning.empty()) {
                 dit_block_fused(w, p, x, modulation, rotation, text.rows(), audio.rows());
                 g.clear_weights();
                 if (i % 10 == 9)
@@ -1203,8 +1315,8 @@ struct Engine {
             z = modulate(z, mod, 0, 0, 0, 0);
             return linear(w, name, z, 0, true);
         };
-        auto av = finish(text.rows(), audio.rows(), 1, "final_layer.audio_out"),
-             vv = finish(text.rows() + audio.rows(), vi.rows(), 0, "final_layer.video_out");
+        auto av = finish(text.rows() + condition_rows, audio.rows(), 1, "final_layer.audio_out"),
+             vv = finish(text.rows() + condition_rows + audio.rows(), vi.rows(), 0, "final_layer.video_out");
         auto velocity = g.empty(video.shape);
         g.launch("h3_unpatch", int((video.count() + 255) / 256), 1, 1, 256, 1, 0, velocity.pointer,
                  vv.pointer, t, h, width);

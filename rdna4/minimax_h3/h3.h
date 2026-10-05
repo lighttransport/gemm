@@ -32,6 +32,11 @@ int h3_validate(const h3_request *request, char *error, size_t capacity);
 h3_context *h3_load(const h3_config *config, char *error, size_t capacity);
 /* Idle-context selection; default 1. Configuration struct layout is unchanged. */
 int h3_set_fp32_hipblas(h3_context *context, int enabled, char *error, size_t capacity);
+/* Idle-context image conditioning. variant="ref2va" or "fl2va"; directory is a
+ * caller-verified h3.image_conditioning.v1 bundle, or NULL for text-only generation.
+ * Existing configuration/request ABI layouts remain unchanged. */
+int h3_set_conditioning(h3_context *context, const char *variant, const char *directory,
+                        char *error, size_t capacity);
 /* CUDA only: opt-in cuDNN SDPA for DiT attention on an idle context. mode is NULL/"off"
  * (default, private FlashAttention-2), "auto" (libh3_cudnn.so next to this library or the
  * executable; falls back to FlashAttention-2 with a warning if unavailable), or an explicit

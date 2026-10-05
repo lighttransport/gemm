@@ -32,7 +32,7 @@ class ExpressionMappingTests(unittest.TestCase):
         self.assertIn(9, wan.frames)
         self.assertIn(22, h3.frames)
         self.assertEqual(hv.frames, (81,))
-        self.assertFalse(h3.identity_conditioned)
+        self.assertTrue(h3.identity_conditioned)
         for adapter in (wan, h3, hv):
             self.assertTrue(adapter.manages_device_lock)
             self.assertEqual(adapter.hardware, 'rocm')
@@ -52,14 +52,24 @@ class ExpressionMappingTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'fallback'):
                 adapter.generate(image='portrait.png', out='clip', prompt='smile')
 
-    def test_h3_records_unconditioned_portrait_and_five_updates(self):
+    def test_h3_conditions_portrait_and_uses_five_updates(self):
         adapter = select('h3')
         with patch.object(adapter.module, 'generate', return_value={}) as runner, \
                 patch.object(adapter.module.video, 'digest', return_value='portrait-hash'):
             result = adapter.generate(image='portrait.png', out='clip', prompt='smile', frames=22, preset='fast5')
             self.assertNotIn('image', runner.call_args.kwargs)
+            self.assertEqual(runner.call_args.kwargs['reference_images'], ['portrait.png'])
             self.assertEqual(runner.call_args.kwargs['steps'], 6)
-            self.assertFalse(result['source_portrait_used_for_conditioning'])
+            self.assertTrue(result['source_portrait_used_for_conditioning'])
+
+    def test_h3_fl2va_anchors_first_frame(self):
+        adapter = select('h3-fl2va')
+        with patch.object(adapter.module, 'generate', return_value={}) as runner, \
+                patch.object(adapter.module.video, 'digest', return_value='portrait-hash'):
+            adapter.generate(image='portrait.png', out='clip', prompt='smile', frames=22, preset='fast5')
+            self.assertEqual(runner.call_args.kwargs['variant'], 'fl2va')
+            self.assertEqual(runner.call_args.kwargs['first_frame'], 'portrait.png')
+            self.assertNotIn('reference_images', runner.call_args.kwargs)
 
     def test_unreviewed_capture_cannot_become_rig_data(self):
         with patch('pathlib.Path.read_text', return_value='{"state":"candidate","review":{}}'):

@@ -21,13 +21,28 @@ COMPONENTS = ("diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensor
 
 
 def generate(*, model=None, out, prompt, width=1344, height=768,
-             frames=124, steps=40, seed=42, device=0, vram_budget_mib=14336, runner=None,
+             frames=124, steps=40, seed=42, device=0, vram_budget_mib=12288, runner=None,
              allow_experimental=False, keep_frames=False, noise_file=None, audio_noise_file=None,
              dump_dir=None, convrot_hipblas=None, bf16_hipblas=1, aotriton_bridge=None, vae_hipblas=0,
              cancel=None, progress=None, compress_dumps=False, fp32_hipblas=1, backend="rocm", cudnn_attention=None,
-             cudnn_library=None):
+             cudnn_library=None, variant="ref2va", reference_images=(), first_frame=None,
+             last_frame=None, conditioning_dir=None, conditioning_python=None, conditioning_comfy=None):
     if backend not in ("cuda", "rocm"):
         raise ValueError("backend must be cuda or rocm")
+    if variant not in ("ref2va", "fl2va"):
+        raise ValueError("variant must be ref2va or fl2va")
+    reference_images = list(reference_images or ())
+    sources_images = reference_images if variant == 'ref2va' else [p for p in (first_frame, last_frame) if p]
+    if (variant == 'ref2va' and (first_frame or last_frame)) or (variant == 'fl2va' and reference_images):
+        raise ValueError('reference images require ref2va; keyframes require fl2va')
+    if len(reference_images) > 9 or (conditioning_dir and sources_images):
+        raise ValueError('provide at most nine images; a prepared bundle cannot be combined with image arguments')
+    if backend != 'rocm' and (sources_images or conditioning_dir):
+        raise ValueError('image conditioning currently requires the ROCm backend')
+    if (sources_images or conditioning_dir) and aotriton_bridge is None:
+        aotriton_bridge = ROOT / 'tmp/video-rocm/h3-build/libvideo_aotriton.so'
+        if not aotriton_bridge.is_file():
+            raise ValueError('conditioned H3 requires the standalone AOTriton bridge; build the aotriton target')
     if cudnn_attention not in (None, "off", "auto") and not Path(cudnn_attention).is_file():
         raise ValueError("cudnn_attention must be off, auto or a bridge library path")
     if cudnn_library and (cudnn_attention in (None, "off") or not Path(cudnn_library).is_file()):
@@ -73,7 +88,8 @@ def generate(*, model=None, out, prompt, width=1344, height=768,
     if type(compress_dumps) is not bool or (compress_dumps and not dump_dir):
         raise ValueError("dump compression requires a capture directory")
     receipts = {}
-    for name in COMPONENTS:
+    checkpoint_name = f"diffusion_models/minimax_h3_{variant}_pruned_int8_convrot.safetensors"
+    for name in (checkpoint_name, *COMPONENTS[1:]):
         path = (model / name).resolve()
         if not path.is_relative_to(model) or not path.is_file() or path.with_suffix(path.suffix + ".aria2").exists():
             raise ValueError(f"missing or incomplete H3 component: {name}")
@@ -100,6 +116,7 @@ def generate(*, model=None, out, prompt, width=1344, height=768,
         raise ValueError("H3 block offload requires a 64 GB host (at least 60 GiB usable RAM)")
     stage.mkdir(parents=True)
     sampler = video.MemorySampler(backend)
+    encoder_sampler = video.MemorySampler(backend)
     started = time.monotonic()
     try:
         raw = stage / "frames"
@@ -109,6 +126,34 @@ def generate(*, model=None, out, prompt, width=1344, height=768,
                    "--seed", seed, "--device", device, "--vram-budget-mib", vram_budget_mib,
                    "--convrot-hipblas", convrot_hipblas, "--bf16-hipblas", bf16_hipblas,
                    "--vae-hipblas", vae_hipblas, "--fp32-hipblas", fp32_hipblas, "--out-dir", raw]
+        command += ['--variant', variant]
+        prepare_command = None
+        prepared = None
+        if conditioning_dir:
+            prepared = stage / 'conditioning'
+            shutil.copytree(Path(conditioning_dir).resolve(), prepared)
+            prepared = prepared.resolve()
+        if sources_images:
+            prepared = stage/'conditioning'
+            prepared = prepared.resolve()
+            model_receipt = stage / 'encoder_model.json'
+            video.atomic_json(model_receipt, {'model': str(model), 'verified_components': receipts,
+                'snapshot': {name: [(model/name).stat().st_size, (model/name).stat().st_mtime_ns,
+                                    (model/name).stat().st_ino] for name in receipts}})
+            python = conditioning_python or ROOT/'tmp/vhuman-rocm-venv/bin/python'
+            prepare_command = ['sh', ROOT/'rdna4/minimax_h3/condition.sh', python, '--model', model,
+                '--out', prepared, '--prompt', prompt, '--variant', variant, '--width', width,
+                '--height', height, '--frames', frames, '--seed', seed, '--device', device,
+                '--vram-budget-mib', vram_budget_mib, '--model-receipt', model_receipt]
+            if conditioning_comfy:
+                prepare_command += ['--comfy', conditioning_comfy]
+            if reference_images:
+                prepare_command += ['--images', *reference_images]
+            for flag, image in (('--first-frame', first_frame), ('--last-frame', last_frame)):
+                if image:
+                    prepare_command += [flag, image]
+        if prepared:
+            command += ['--conditioning', prepared]
         if aotriton_bridge:
             command += ["--aotriton-bridge", aotriton_bridge]
         if cudnn_attention:
@@ -127,12 +172,40 @@ def generate(*, model=None, out, prompt, width=1344, height=768,
         with (stage / "runner.log").open("w") as log:
             with video.device_lock(device, cancel):
                 try:
+                    if prepare_command:
+                        try:
+                            video.run_process(prepare_command, cancel=cancel, log=log, on_start=encoder_sampler.start)
+                        finally:
+                            encoder_sampler.close()
+                        if encoder_sampler.vram is not None and encoder_sampler.vram > vram_budget_mib:
+                            raise RuntimeError('image encoder exceeded its VRAM budget')
+                    condition_receipt = None
+                    if prepared:
+                        condition_receipt = json.loads((prepared/'manifest.json').read_text())
+                        if condition_receipt.get('schema') != 'h3.image_conditioning.v1' or condition_receipt.get('variant') != variant:
+                            raise ValueError('invalid conditioning receipt')
+                        if condition_receipt.get('verified_components') != receipts:
+                            raise ValueError('conditioning weights mismatch; regenerate the encoder bundle')
+                        if any(condition_receipt.get(k) != v for k, v in
+                               (('prompt',prompt),('width',width),('height',height),('frames',frames),('seed',seed))):
+                            raise ValueError('conditioning recipe mismatch')
+                        required = {'qwen_inputs.f32', 'qwen_rotation.f32', 'text_tags.f32',
+                                    'dit_phases.f32', 'condition_patches.f32'}
+                        required.update(f'deepstack_{i}.f32' for i in range(3))
+                        if not required.issubset(condition_receipt.get('files', {})):
+                            raise ValueError('conditioning receipt omits a required file')
+                        for name, item in condition_receipt['files'].items():
+                            path = (prepared/name).resolve()
+                            if not path.is_relative_to(prepared) or video.digest(path) != item['sha256'] or path.stat().st_size != item['bytes']:
+                                raise ValueError('conditioning file hash/size mismatch')
                     video.run_process(command, cancel=cancel, progress=progress, log=log, on_start=sampler.start)
                 finally:
                     sampler.close()
             metrics = json.loads((raw / "metrics.json").read_text())
             if metrics.get("backend") != backend_name or metrics.get("int8_wmma_calls", 0) <= 0:
                 raise ValueError("runner did not execute the native H3 INT8 WMMA backend")
+            if prepared and (metrics.get('variant') != variant or metrics.get('condition_rows') != condition_receipt['condition_rows']):
+                raise ValueError('native runner did not consume the requested image conditioning')
             video.package_frames(raw, stage, count=frames, width=width, height=height, cancel=cancel, log=log)
         if compress_dumps:
             capture_spec = importlib.util.spec_from_file_location(
@@ -145,13 +218,17 @@ def generate(*, model=None, out, prompt, width=1344, height=768,
                 raise video.Cancelled("cancelled")
         if cancel and cancel.is_set():
             raise video.Cancelled("cancelled")
-        metrics.update(wall_seconds=time.monotonic() - started, sampled_peak_vram_mib=sampler.vram,
+        peak_vram = max(sampler.vram or 0, encoder_sampler.vram or 0) if sampler.vram is not None else None
+        metrics.update(wall_seconds=time.monotonic() - started, sampled_peak_vram_mib=peak_vram,
+                       encoder_peak_vram_mib=encoder_sampler.vram,
                        sampled_peak_host_rss_mib=sampler.rss,
-                       memory_fit="unverified" if sampler.vram is None else "pass" if sampler.vram <= vram_budget_mib else "fail")
+                       memory_fit="unverified" if peak_vram is None else "pass" if peak_vram <= vram_budget_mib else "fail")
         if metrics["memory_fit"] == "fail":
             raise RuntimeError("native process exceeded its VRAM budget")
         result = {"schema": "minimax_h3.video.v1", "backend": backend_name, **provenance,
-                  "checkpoint": "ref2va_pruned_int8_convrot", "references": [], "prompt": prompt,
+                  "checkpoint": variant+"_pruned_int8_convrot", "variant": variant,
+                  "references": condition_receipt['sources'] if condition_receipt else [],
+                  "conditioning": condition_receipt, "identity_conditioned": bool(condition_receipt), "prompt": prompt,
                   "width": width, "height": height, "frames": frames, "fps": 24, "seed": seed,
                   "sigma_grid_points": steps, "euler_updates": steps - 1,
                   "video_shift": 12, "audio_shift": 3, "joint_audio_denoising": True, "audio_output": False,
@@ -170,6 +247,7 @@ def generate(*, model=None, out, prompt, width=1344, height=768,
         return result
     except BaseException as error:
         sampler.close()
+        encoder_sampler.close()
         if dump_dir and Path(dump_dir).is_dir():
             try:
                 video.atomic_json(Path(dump_dir) / "failure.json", {**provenance, "error": str(error),
@@ -187,8 +265,12 @@ def main(default_backend="rocm"):
     p.add_argument("--model", help="model directory (default depends on --backend)")
     p.add_argument("--out", required=True)
     p.add_argument("--prompt", required=True)
+    p.add_argument('--variant', choices=('ref2va','fl2va'), default='ref2va')
+    p.add_argument('--reference-image', dest='reference_images', action='append', default=[])
+    for name in ('first-frame', 'last-frame', 'conditioning-dir', 'conditioning-python', 'conditioning-comfy'):
+        p.add_argument('--'+name)
     for name, default in (("width", 1344), ("height", 768), ("frames", 124), ("steps", 40), ("seed", 42),
-                          ("device", 0), ("vram-budget-mib", 14336), ("convrot-hipblas", None), ("bf16-hipblas", 1),
+                          ("device", 0), ("vram-budget-mib", 12288), ("convrot-hipblas", None), ("bf16-hipblas", 1),
                           ("vae-hipblas", 0), ("fp32-hipblas", 1)):
         p.add_argument("--" + name, type=int, default=default)
     p.add_argument("--runner")

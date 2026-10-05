@@ -124,6 +124,9 @@ def qwen(args):
     rotation = (rotation / 16).to(device)
     dtype = torch.bfloat16
     rows = len(ids)
+    conditioned = Path(args.conditioning_dir) if getattr(args, 'conditioning_dir', None) else None
+    if conditioned:
+        rows = json.loads((conditioned/'manifest.json').read_text())['text_rows']
     with safe_open(model / "text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors", framework="pt", device="cpu") as weights:
         def norm(x, name):
             return torch.nn.functional.rms_norm(x, (x.shape[-1],), weights.get_tensor(name + ".weight").to(device), 1e-6)
@@ -148,6 +151,10 @@ def qwen(args):
         frequencies = 1 / 5000000 ** (torch.arange(64, dtype=torch.float32, device=device) / 64)
         angles = positions * frequencies
         cosine, sine = angles.cos(), angles.sin()
+        if conditioned:
+            x = torch.from_numpy(np.fromfile(conditioned/'qwen_inputs.f32', '<f4').reshape(rows,5120)).to(device,dtype)
+            rotary = torch.from_numpy(np.fromfile(conditioned/'qwen_rotation.f32','<f4').reshape(rows,64,2)).to(device)
+            cosine, sine = rotary[...,0], rotary[...,1]
         def rope(x):
             left, right = x.float().chunk(2, -1)
             # The pinned Qwen rotary matrix stays FP32, including both products.
@@ -167,6 +174,9 @@ def qwen(args):
             z = norm(x, p + ".post_attention_layernorm")
             z = torch.nn.functional.silu(linear(z, p + ".mlp.gate_proj")) * linear(z, p + ".mlp.up_proj")
             x = x + linear(z, p + ".mlp.down_proj")
+            if conditioned and layer < 3:
+                ds = np.fromfile(conditioned/f'deepstack_{layer}.f32','<f4').reshape(rows,5120)
+                x = x + torch.from_numpy(ds).to(device,dtype)
             print(f"reference Qwen layer {layer + 1}/50", flush=True)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=False)
@@ -178,6 +188,7 @@ def qwen(args):
         "reference_source_sha256": digest(__file__),
         "capture_reader_sha256": digest(captures.__file__),
         "qwen_hidden_sha256": digest(out / "qwen_hidden.npy"),
+        "conditioning_manifest_sha256": digest(conditioned/'manifest.json') if conditioned else None,
         "components": {name: digest(model / name) for name in (
             "tokenizer/tokenizer.json", "text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors")},
     }, indent=2) + "\n")
@@ -189,6 +200,8 @@ def qwen(args):
 def pipeline(args):
     native, reference = Path(args.native), Path(args.reference)
     generation = json.loads(Path(args.manifest).read_text())
+    if generation.get('conditioning'):
+        raise ValueError('use ref/minimax_h3_native/conditioning.py for conditioned diagnostics')
     if generation.get("backend") not in ("minimax_h3_rocm_experimental", "minimax_h3_cuda_experimental") or generation.get("parity") != "unverified":
         raise ValueError("expected a complete native H3 generation")
     diagnostic = args.mode == "diagnostic"
@@ -256,6 +269,7 @@ def main():
     c.add_argument("--out", required=True)
     c.set_defaults(run=components)
     c = sub.add_parser("qwen")
+    c.add_argument('--conditioning-dir')
     c.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
     c.add_argument("--model", default="/mnt/disk01/models/h3/weights")
     for name in ("prompt", "native", "out"):

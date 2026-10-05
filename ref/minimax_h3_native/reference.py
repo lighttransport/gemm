@@ -151,9 +151,9 @@ class Reference:
         angles = (ids[..., None] * self.weight("rope.inv_freq")).reshape(-1, 48)
         return angles.cos().bfloat16(), angles.sin().bfloat16()
 
-    def time_embed(self, tv, ta):
+    def time_embed(self, tv, ta, tc=None):
         table = self.weight("adaln_t_table", torch.float32)
-        pos = torch.tensor([tv, ta], device=self.device, dtype=torch.float32).clamp(0, 1) * 1024
+        pos = torch.tensor([tv, ta] if tc is None else [tv, ta, tc], device=self.device, dtype=torch.float32).clamp(0, 1) * 1024
         low = pos.floor().long().clamp(max=1023)
         return torch.lerp(table[low], table[low + 1], (pos - low)[:, None])
 
@@ -169,7 +169,7 @@ class Reference:
         for start, stop, row in segments:
             x[start:stop].addcmul_(delta[start:stop], mod[row, chunk].to(x.dtype))
 
-    def denoise(self, text, video, audio, rotation, tv, ta, step):
+    def denoise(self, text, video, audio, rotation, tv, ta, step, conditioning=None):
         t, h, w, _ = video.shape
         patches = video.reshape(t, h // 2, 2, w // 2, 2, 24).permute(0, 1, 3, 5, 2, 4).reshape(-1, 96)
         vi = self.linear(patches, "video_patch_proj", True).bfloat16()
@@ -178,10 +178,23 @@ class Reference:
         nt, na = len(text), len(audio)
         segments = ((0, nt, 1), (nt, nt + na, 5), (nt + na, len(x), 0))
         emb = self.time_embed(tv, ta)
+        nc = 0
+        if conditioning:
+            cond = self.linear(conditioning['patches'], 'video_patch_proj', True).bfloat16()
+            nc = len(cond)
+            x = torch.cat((text, cond, au, vi))
+            tags = conditioning['text_tags']
+            segments, begin = [], 0
+            for stop in range(1, nt+1):
+                if stop == nt or tags[stop] != tags[begin]:
+                    segments.append((begin, stop, int(tags[begin])))
+                    begin = stop
+            segments.extend(((nt,nt+nc,6),(nt+nc,nt+nc+na,5),(nt+nc+na,len(x),0)))
+            emb = self.time_embed(tv, ta, max(tv, .999))
         self.clear()
         for i in range(50):
             p = f"blocks.{i}"
-            mod = self.linear(emb, p + ".adaln_proj.linear", True).reshape(6, 6, 5376)
+            mod = self.linear(emb, p + ".adaln_proj.linear", True).reshape(len(emb)*3, 6, 5376)
             z = self.modulate(self.norm(x, p + ".norm1"), mod, segments, 0)
             self.gated(x, self.attention(z, p + ".attn", rotation), mod, segments, 2)
             z = self.modulate(self.norm(x, p + ".norm2"), mod, segments, 3)
@@ -189,12 +202,12 @@ class Reference:
             self.clear()
             if i % 10 == 9:
                 print(f"reference step {step} block {i + 1}/50", flush=True)
-        final = self.linear(emb, "final_layer.adaln_proj.linear", True).reshape(2, 2, 5376)
+        final = self.linear(emb, "final_layer.adaln_proj.linear", True).reshape(len(emb), 2, 5376)
         def finish(part, row, name):
             part = self.norm(part, "final_layer.norm").float() * (1 + final[row, 1]) + final[row, 0]
             return self.linear(part, name, True)
-        av = finish(x[nt:nt + na], 1, "final_layer.audio_out")
-        vv = finish(x[nt + na:], 0, "final_layer.video_out")
+        av = finish(x[nt+nc:nt+nc + na], 1, "final_layer.audio_out")
+        vv = finish(x[nt+nc + na:], 0, "final_layer.video_out")
         vv = vv.reshape(t, h // 2, w // 2, 24, 2, 2).permute(0, 1, 4, 2, 5, 3).reshape_as(video)
         self.clear()
         return vv, av

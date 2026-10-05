@@ -571,7 +571,7 @@ def main(argv=None) -> int:
     sp.add_argument("--seed", type=int, default=42)
     sp.add_argument("--model", help="prepared model directory")
     sp.add_argument("--runner", help="native video executable")
-    sp.add_argument("--video-backend", choices=("repo", "legacy", "wan", "h3", "hv15-rocm"), default="repo")
+    sp.add_argument("--video-backend", choices=("repo", "legacy", "wan", "h3", "h3-fl2va", "hv15-rocm"), default="repo")
     sp.add_argument("--allow-experimental", action="store_true")
     sp.set_defaults(fn=cmd_video)
     sub.add_parser("replate", help="re-extract the plate library from its source images").set_defaults(fn=cmd_replate)

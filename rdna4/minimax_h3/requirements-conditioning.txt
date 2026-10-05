@@ -1,0 +1,7 @@
+# Install in an existing PyTorch ROCm environment. Torch must be a ROCm build.
+numpy
+Pillow
+safetensors
+tokenizers
+comfy-aimdo==0.5.5
+comfy-kitchen==0.2.37

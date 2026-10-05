@@ -1,8 +1,10 @@
 # MiniMax H3 INT8 on RDNA4
 
-Native C++ text-only generation using the local MiniMax H3 **Ref2VA pruned INT8
-ConvRot** checkpoint. HIPRTC compiles gfx1200/gfx1201 kernels; signed INT8 WMMA
-accumulates into INT32. There is no PyTorch dependency in the inference runner.
+Native C++ generation using MiniMax H3 **Ref2VA or FL2VA pruned INT8
+ConvRot** checkpoints. HIPRTC compiles gfx1200/gfx1201 kernels; signed INT8 WMMA
+accumulates into INT32. The inference runner has no PyTorch dependency. Image
+conditioning uses bounded upstream PyTorch ROCm visual and VAE encoders before
+the native Qwen language model, packed DiT, and decoder run.
 The Python wrapper packages frames into a silent MP4 and records provenance.
 
 Build from the repository root:
@@ -68,10 +70,12 @@ python3 rdna4/minimax_h3/generate.py \
 Defaults are 1344×768, 124 frames, 24 fps, seed 42, 40 sigma-grid points
 (**39 Euler updates**), video shift 12 and audio shift 3. The model retains both
 stereo audio streams during every denoising step; audio decoding and muxing are
-omitted. No reference inputs, guidance branch or LoRA are applied.
+omitted. Text-only generation applies no reference inputs, guidance branch or LoRA.
 
-The 14,336 MiB process budget reserves 3,072 MiB for runtime overhead. Block
-weights stream from immutable mmap files. FFNs process 256 rows at a time;
+The default 12,288 MiB process budget reserves 3,072 MiB for runtime overhead.
+`--vram-budget-mib 14336` permits extra headroom on a 16 GB device. Block
+weights stream from immutable mmap files. QKV projections stream 512 rows at
+a time to avoid a second full-size packed projection. FFNs process 256 rows at a time;
 attention uses bounded online softmax; VAE decoding uses 256-pixel spatial tiles
 and seven-latent temporal windows. A 64 GB host is required by the wrapper.
 The decoder retains its bounded FP16 weight cache across tiles. A 39-frame
@@ -87,6 +91,111 @@ Callbacks publish transient RGB frame buffers and denoising progress.
 stereo noise. `--dump-dir` captures F32 states, each Euler update, and decoded
 frames for reference comparison. Diagnostic geometries start at 64×64 and five
 frames; dimensions must be multiples of 32, and frame counts must be `17*n+5`.
+
+## Image conditioning on ROCm
+
+Ref2VA accepts up to nine `--reference-image` inputs. Name references in the
+prompt as `<Picture 1>`, `<Picture 2>`, etc. FL2VA accepts `--first-frame`,
+`--last-frame`, or both, using its separate FL2VA checkpoint. Reference video
+and audio inputs are not implemented. Output is silent video.
+
+Install [requirements-conditioning.txt](requirements-conditioning.txt) in a
+PyTorch ROCm environment. The default interpreter is
+`tmp/vhuman-rocm-venv/bin/python`; override with `--conditioning-python`.
+The encoder imports ComfyUI revision
+`2472a20bd291451acc303917059ab14dfc380478`; check it out at
+`tmp/video-rocm/pytorch-bench-comfy`, or select it with `--conditioning-comfy`.
+Build the standalone AOTriton bridge as described above. The image wrapper
+selects `tmp/video-rocm/h3-build/libvideo_aotriton.so` by default, including
+short refiner attention to preserve upstream numerical behavior.
+
+The H3 bridge also provides cached hipBLASLt BF16 ConvRot plans. It matches
+PyTorch's `X @ rotation` dispatch, BF16 output type, and non-transposed right
+operand. Using a transpose on the symmetric Hadamard matrix changes the
+selected reduction and can move a BF16 rounding tie across an INT8 boundary.
+The native allocator budgets its 32 MiB workspace; all checkpoint INT8
+projections retain signed WMMA. Metrics include `convrot_hipblaslt_calls`.
+Build requires the ROCm hipBLASLt headers and library. AOTriton headers and
+library shipped with this ROCm PyTorch can be selected with
+`AOTRITON_ROOT=/mnt/disk01/vhuman-rocm/venv/lib/python3.12/site-packages/torch`;
+the compiled bridge calls standalone GPU libraries and does not call PyTorch.
+
+```sh
+python3 rdna4/minimax_h3/generate.py \
+  --variant ref2va --reference-image portrait.png \
+  --prompt 'The person in <Picture 1> smiles, fixed camera.' \
+  --width 480 --height 832 --frames 22 --steps 6 \
+  --out tmp/video-rocm/h3-reference --allow-experimental
+
+python3 rdna4/minimax_h3/generate.py \
+  --variant fl2va --first-frame first.png --last-frame last.png \
+  --prompt 'The person smiles, fixed camera.' \
+  --width 480 --height 832 --frames 22 --steps 6 \
+  --out tmp/video-rocm/h3-keyframes --allow-experimental
+```
+
+Keep all three weight components and the tokenizer in the existing H3 model
+directory. FL2VA additionally needs
+`diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors` from
+Comfy-Org/MiniMax-H3 revision `e5eb578a89295337b8ff433a035929ce0279e0b6`;
+SHA256 `e889202c41dafb67b10d67b97f0d8541508036a6090af23425a5c2615d03c47a`.
+
+The visual tower and VAE encoder load sequentially and exit before native
+generation. Reference scaling uses equal shares of the target canvas area,
+rounded to 32-pixel dimensions; Qwen visual
+tokens are capped at 1536 total. FL2VA keyframes use the target canvas. Packed
+reference/keyframe tokens remain fixed during every Euler update and use the
+upstream visual-conditioning timestep and rotary coordinates. The bundle
+records encoder input/output hashes, frame anchors, geometry, seed and model
+provenance. `--conditioning-dir` reuses a matching bundle, copying it into
+the new generation directory and validating required files and checksums.
+Bundles bind all model component hashes; a bundle from different weights is
+rejected. Encoder weights are checked for modification during preprocessing.
+
+Check conditioned captures using the independent references:
+
+```sh
+python3 ref/minimax_h3_native/verify.py qwen \
+  --prompt 'The person in <Picture 1> smiles, fixed camera.' \
+  --conditioning-dir tmp/video-rocm/h3-reference/conditioning \
+  --native tmp/video-rocm/h3-reference-dump --out tmp/video-rocm/h3-reference-qwen
+python3 ref/minimax_h3_native/conditioning.py \
+  --generation tmp/video-rocm/h3-reference --native tmp/video-rocm/h3-reference-dump \
+  --qwen-reference tmp/video-rocm/h3-reference-qwen --out tmp/video-rocm/h3-reference-check.json
+```
+
+Capture generation with `--dump-dir` when using these checks. Diagnostic
+similarity does not certify portrait identity, expression quality, or the
+default 39-update trajectory; experimental opt-in remains required.
+
+On RX 9070 XT, both 64x64, five-frame Ref2VA and two-keyframe FL2VA diagnostics
+passed all 18 comparisons through five Euler updates. Conditioned Qwen,
+refiner and every video/audio update were exact. Decoded-frame relative L2
+was <=0.00149 for Ref2VA and <=0.00106 for FL2VA. Both final runs had 5005 MiB
+sampled peak, with 1350 native INT8 WMMA and hipBLASLt ConvRot calls.
+A full-resolution 1344x768, 124-frame single-block memory probe included
+4096 text/conditioning-equivalent rows and peaked at 9456 MiB under the
+12,288 MiB budget, including the corrected ConvRot provider. This is a memory probe,
+not a complete full-resolution generation or full-trajectory parity claim.
+
+The vhuman Ref2VA smile candidate at 480x832, 22 frames and five updates
+completed with 5129 MiB sampled peak and 309.914 seconds including image
+preprocessing, native inference and packaging, excluding model verification.
+DiT time was 121.446 seconds. MediaPipe found a face in all 22 frames and
+selected smile weights 0.949/0.950. These remain unreviewed candidate assets.
+The final FL2VA first-frame candidate at the same resolution, frame count
+and update count completed in 202.508 seconds, with 5215 MiB sampled peak,
+109.533 seconds in the DiT, and one visible face in all 22 frames. Its selected
+smile weights were 0.910/0.870. These single-run timings are not a comparative
+PyTorch benchmark. Direct packing into one buffer preserves all 21 native
+diagnostic captures exactly and avoids intermediate concatenations.
+
+The BF16 rounding-boundary GPU regression is separate from host tests:
+
+```sh
+H3_GPU_TESTS=1 LD_LIBRARY_PATH=/opt/rocm/core-7.14/lib \
+  tmp/vhuman-rocm-venv/bin/python -m unittest rdna4.minimax_h3.test_convrot_gpu
+```
 
 ## Numerical validation
 

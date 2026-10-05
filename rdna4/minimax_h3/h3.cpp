@@ -24,7 +24,7 @@ static int fail(char *error, size_t capacity, const std::string &text) {
 extern "C" {
 void h3_config_defaults(h3_config *c) {
     if (c)
-        *c = {H3_DEFAULT_MODEL_DIR, 0, 14336, 1, H3_DEFAULT_CONVROT_BLAS, nullptr, 0};
+        *c = {H3_DEFAULT_MODEL_DIR, 0, 12288, 1, H3_DEFAULT_CONVROT_BLAS, nullptr, 0};
 }
 void h3_request_defaults(h3_request *r) {
     if (r)
@@ -72,6 +72,54 @@ int h3_set_fp32_hipblas(h3_context *ctx, int enabled, char *error, size_t capaci
     ctx->engine->fp32_hipblas = enabled != 0;
     ctx->busy = false;
     return 0;
+}
+int h3_set_conditioning(h3_context *ctx, const char *variant, const char *directory,
+                        char *error, size_t capacity) {
+    if (!ctx || !ctx->engine)
+        return fail(error, capacity, "missing H3 context");
+    bool expected = false;
+    if (!ctx->busy.compare_exchange_strong(expected, true))
+        return fail(error, capacity, "H3 context is already generating");
+    struct Busy { h3_context *ctx; ~Busy() { ctx->busy = false; } } busy{ctx};
+    try {
+        using namespace h3;
+        std::string mode = variant ? variant : "ref2va";
+        require(mode == "ref2va" || mode == "fl2va", "variant must be ref2va or fl2va");
+        fs::path folder = directory ? directory : "";
+        int rows = 0, text = 0;
+        if (!folder.empty()) {
+            Json manifest(folder / "manifest.json");
+            auto obj = manifest.value.get();
+            require(string(obj, "schema") == "h3.image_conditioning.v1" &&
+                        string(obj, "variant") == mode, "conditioning schema/variant mismatch");
+            auto integer = [&](const char *key, int maximum) {
+                auto value = field(obj, key);
+                require(value && value->type == JSON_NUMBER && std::isfinite(value->num) &&
+                            value->num >= 1 && value->num <= maximum && std::floor(value->num) == value->num,
+                        std::string("invalid conditioning ") + key);
+                return int(value->num);
+            };
+            text = integer("text_rows", 2048);
+            rows = integer("condition_rows", 32768);
+            for (const char *name : {"qwen_inputs.f32", "qwen_rotation.f32", "deepstack_0.f32",
+                                     "deepstack_1.f32", "deepstack_2.f32", "text_tags.f32",
+                                     "dit_phases.f32", "condition_patches.f32"})
+                relative_file(folder, name);
+        }
+        auto &e = *ctx->engine;
+#ifdef HV15N_ROCM
+        if (!folder.empty())
+            require(e.aot_attention && (!e.convrot_hipblas || e.lt_forward),
+                    "conditioned H3 requires the hipBLASLt-enabled AOTriton bridge");
+#endif
+        e.variant = mode;
+        e.conditioning = folder;
+        e.condition_rows = rows;
+        e.condition_text_rows = text;
+        return 0;
+    } catch (const std::exception &e) {
+        return fail(error, capacity, e.what());
+    }
 }
 int h3_set_cudnn_attention(h3_context *ctx, const char *mode, const char *cudnn_library,
                            char *error, size_t capacity) {
@@ -135,6 +183,8 @@ int h3_generate(h3_context *ctx, const h3_request *r, const h3_callbacks *callba
         using namespace h3;
         auto &e = *ctx->engine;
         auto &g = e.g;
+        e.dit_mod_indices = {};
+        e.condition_patches = {};
         h3_callbacks cb = callbacks ? *callbacks : h3_callbacks{};
         g.check(cuCtxSetCurrent(g.context), "activate H3 context");
         g.cancelled = false;
@@ -175,16 +225,34 @@ int h3_generate(h3_context *ctx, const h3_request *r, const h3_callbacks *callba
             return std::chrono::duration<double>(clock::now() - start).count();
         };
         auto stage = clock::now();
+        if (!e.conditioning.empty()) {
+            Json manifest(e.conditioning / "manifest.json");
+            auto obj = manifest.value.get();
+            for (auto pair : {std::pair<const char *, int>{"width", r->width}, {"height", r->height},
+                               {"frames", r->frames}}) {
+                auto v = field(obj, pair.first);
+                require(v && v->type == JSON_NUMBER && v->num == pair.second,
+                        "conditioning target geometry mismatch");
+            }
+            require(string(obj, "prompt") == r->prompt, "conditioning prompt mismatch");
+            auto condition_seed = field(obj, "seed");
+            require(condition_seed && condition_seed->type == JSON_NUMBER &&
+                        condition_seed->num == double(r->seed), "conditioning seed mismatch");
+            e.condition_patches = g.upload(read_f32(e.conditioning / "condition_patches.f32",
+                                                   size_t(e.condition_rows)*96), {e.condition_rows, 96});
+            g.dump(e.condition_patches, dump, "condition_patches");
+        }
         auto text = e.encode(r->prompt, dump);
         double qwen_seconds = seconds(stage), refine_seconds = 0, dit_seconds = 0;
         stage = clock::now();
         {
-            Weights weights(e.root /
-                            "diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors");
+            Weights weights(e.checkpoint());
             text = e.refine(weights, text, dump);
             refine_seconds = seconds(stage);
             stage = clock::now();
             auto rotation = e.dit_rope(weights, text.rows(), at, t, h, w);
+            if (!e.conditioning.empty())
+                g.dump(rotation, dump, "condition_rotation");
             auto sigma = [&](int i, float shift) {
                 float base = 1.f - float(i) / float(r->steps - 1);
                 return shift * base / (1.f + (shift - 1.f) * base);
@@ -208,6 +276,8 @@ int h3_generate(h3_context *ctx, const h3_request *r, const h3_callbacks *callba
         dit_seconds = seconds(stage);
         text = {};
         audio = {};
+        e.condition_patches = {};
+        e.dit_mod_indices = {};
         g.clear_weights();
         g.trim_pool();
         stage = clock::now();
@@ -229,6 +299,8 @@ int h3_generate(h3_context *ctx, const h3_request *r, const h3_callbacks *callba
             ",\"refine_seconds\":" + std::to_string(refine_seconds) +
             ",\"dit_seconds\":" + std::to_string(dit_seconds) +
             ",\"vae_seconds\":" + std::to_string(vae_seconds) +
+            ",\"variant\":" + escape(e.variant) + ",\"condition_rows\":" + std::to_string(e.condition_rows) +
+            ",\"convrot_hipblaslt_calls\":" + std::to_string(e.convrot_lt_calls) +
             ",\"sigma_grid_points\":" + std::to_string(r->steps) +
             ",\"euler_updates\":" + std::to_string(r->steps - 1) + ",\"gpu\":" + g.metrics() + "}";
         g.cancel_check = {};

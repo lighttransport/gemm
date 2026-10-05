@@ -33,16 +33,18 @@ int main(int argc, char **argv) {
             "--frames",          "--steps",           "--seed",         "--device",
             "--vram-budget-mib", "--convrot-hipblas", "--bf16-hipblas", "--fp32-hipblas",
             "--aotriton-bridge", "--vae-hipblas",     "--noise-file",   "--audio-noise-file",
-            "--dump-dir",        "--out-dir",         "--cudnn-attention", "--cudnn-library"};
+            "--dump-dir",        "--out-dir",         "--cudnn-attention", "--cudnn-library",
+            "--variant", "--conditioning"};
         for (int i = 1; i < argc; i++) {
             std::string s = argv[i];
             if (s == "--help") {
-                std::cout << "Native MiniMax H3 Ref2VA text-only INT8 ConvRot (CUDA/RDNA4) "
+                std::cout << "Native MiniMax H3 Ref2VA/FL2VA INT8 ConvRot (CUDA/RDNA4) "
                              "runner\n--generate --allow-experimental --model DIR --prompt TEXT "
                              "--out-dir EMPTY_DIR\n--width 1344 --height 768 --frames 124 --steps "
-                             "40 --seed 42\n--device 0 --vram-budget-mib 14336 --noise-file "
+                             "40 --seed 42\n--device 0 --vram-budget-mib 12288 --noise-file "
                              "NCTHW.f32 --audio-noise-file NC2T.f32\n--dump-dir DIR --validate\n"
-                             "--aotriton-bridge libvideo_aotriton.so (optional long attention)\n"
+                             "--variant ref2va|fl2va --conditioning PREPARED_BUNDLE\n"
+                             "--aotriton-bridge libvideo_aotriton.so (HIP attention)\n"
                              "--vae-hipblas 0|1 (optional FP16 decoder GEMM)\n"
                              "--cudnn-attention off|auto|libh3_cudnn.so (CUDA, opt-in DiT SDPA)\n"
                              "--cudnn-library libcudnn.so.9 (default: loader path, system dirs)\n";
@@ -95,6 +97,8 @@ int main(int argc, char **argv) {
         r.audio_noise_file = str("--audio-noise-file", nullptr);
         r.dump_dir = str("--dump-dir", nullptr);
         char error[8192] = {};
+        std::string variant = str("--variant", "ref2va");
+        require(variant == "ref2va" || variant == "fl2va", "invalid H3 variant");
         require(h3_validate(&r, error, sizeof(error)) == 0, error);
         if (validate) {
             std::cout << "PASS H3 request validation\n";
@@ -112,6 +116,9 @@ int main(int argc, char **argv) {
                                                             h3_free);
         require(bool(ctx), std::string(error));
         int status = h3_set_fp32_hipblas(ctx.get(), fp32_hipblas, error, sizeof(error));
+        require(status == 0, error);
+        status = h3_set_conditioning(ctx.get(), str("--variant", "ref2va"),
+                                     str("--conditioning", nullptr), error, sizeof(error));
         require(status == 0, error);
         require(!args.count("--cudnn-library") || args.count("--cudnn-attention"),
                 "--cudnn-library requires --cudnn-attention");
