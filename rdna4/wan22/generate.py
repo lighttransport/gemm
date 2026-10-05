@@ -105,7 +105,7 @@ def generate(args):
                 if args.dump_latents:
                     import numpy as np
                     np.save(args.out / f"latent_{step:03d}.npy", latents.float().cpu().numpy())
-                print(f"update {step + 1}/{args.steps}", flush=True)
+                print(f"PROGRESS {step + 1} {args.steps}", flush=True)
                 if step + 1 == args.steps:
                     torch.cuda.synchronize()
                     denoise_seconds = time.monotonic() - pipeline_started

@@ -505,11 +505,17 @@ $('video-cancel').addEventListener('click', async () => {
 
 api('/health').then((h) => {
   videoAvailable = !!h.video?.available;
-  for (const option of $('video-preset').options) option.disabled = !h.video?.presets?.includes(option.value);
-  if ($('video-preset').selectedOptions[0]?.disabled) $('video-preset').value = h.video?.presets?.[0] || 'quality';
+  const previousPreset = $('video-preset').value, previousFrames = Number($('video-frames').value);
+  $('video-preset').replaceChildren(...(h.video?.presets || []).map(preset =>
+    new Option(({quality: 'Quality', fast12: 'Fast · 12 steps', fast5: 'Fast · 5 steps'})[preset] || preset, preset)));
+  if (h.video?.presets?.includes(previousPreset)) $('video-preset').value = previousPreset;
+  $('video-frames').replaceChildren(...(h.video?.frames || []).map(frames =>
+    new Option(`${frames} frames · ${(frames / (h.video?.fps || 24)).toFixed(2)} seconds`, String(frames))));
+  $('video-frames').value = String(h.video?.frames?.includes(previousFrames) ? previousFrames : h.video?.default_frames);
   $('video-go').disabled = !videoAvailable || !state.current;
   if (!videoAvailable) $('video-msg').textContent = 'Video backend needs model setup and experimental enablement.';
   else if (h.video.mock) $('video-msg').textContent = 'Mock mode: static portrait clip.';
+  else if (h.video.identity_conditioned === false) $('video-msg').textContent = 'H3 generates from text. The portrait does not condition the video; identity needs review.';
   else $('video-msg').textContent = 'Experimental video backend; quality and memory fit are unverified.';
   const g = h.gpu ? `${h.gpu.name} · ${h.gpu.free_mib} MiB free` : 'no GPU';
   $('health').textContent = `${g} · Qwen ${h.qwen.available ? 'ready' : 'n/a'} · Pixal3D ${h.pixal3d.available ? 'ready' : 'n/a'}`;

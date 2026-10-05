@@ -63,6 +63,11 @@ EXPRESSIONS = {
 
 def expressions_job(service, request: dict, progress, cancel, python=None, mock=False) -> dict:
     """{head_id, names (default all), preset (low8|fast12), steps, seed}"""
+    if request.get('video_backend') in ('wan', 'h3', 'hv15-rocm'):
+        if mock:
+            raise ValueError('video expression capture requires real observation assets')
+        from .video_expressions import expressions_job as video_job
+        return video_job(service, request, progress, cancel)
     import sys
     from .. import gpu, qwen
     head_id = request.get("head_id")

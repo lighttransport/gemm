@@ -1,0 +1,2 @@
+# Optional CPU reference preprocessing. Video inference uses PyTorch ROCm/HIP.
+onnxruntime==1.30.0

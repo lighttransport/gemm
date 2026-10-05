@@ -360,10 +360,10 @@ def assemble(folder, out_dir=None, res: int = 2048, iters: int = 600, log=print,
     else:
         baked = bake.bake(active_tmpl, parts_t[0], pos, subj, out, res=res, lining_srgb=lining_rgb, log=log)
     wrinkle_maps = None
-    if face_model == "procedural" and (expr_dir / "manifest.json").exists():
+    if (expr_dir / "manifest.json").exists():
         from . import wrinkles
         brow_y = float(np.mean([b[:, 1].mean() for b in feat.brows]))
-        wrinkle_maps = wrinkles.bake(tmpl, parts_t[0], pos, subj, expr_dir, out, res=min(res, 2048), log=log,
+        wrinkle_maps = wrinkles.bake(active_tmpl, parts_t[0], pos, subj, expr_dir, out, res=min(res, 2048), log=log,
                                      brow_y=brow_y)
     t = lap("bake", t)
     # ---- parts ---------------------------------------------------------------------------
@@ -408,6 +408,24 @@ def assemble(folder, out_dir=None, res: int = 2048, iters: int = 600, log=print,
     shape_names = sorted({n for p in parts for n in p.shapes})
     rig = rig_definition(skel, shape_names)
     rig["face_model"] = face_model
+    if source is not None and source.name == 'gnm_v3':
+        from .gnm_expression import project
+        alignment = source_stats['expression_basis_alignment']
+        basis = alignment['scale'] * np.einsum('evc,dc->evd', source.expression_basis,
+                                               np.asarray(alignment['rotation']))
+        evaluator = rigdef.Rig(rig)
+        targets = []
+        for control in rigdef.LR_FACE_V1:
+            evaluated = evaluator.evaluate({control: 1})
+            weights = dict(zip(evaluator.shape_names, evaluated['weights']))
+            posed = pos.astype(np.float64).copy()
+            for name, delta in shapes.items():
+                posed += weights.get(name, 0) * delta
+            targets.append(rigdef.deform(posed, Jn, W, evaluated['skin']) - pos)
+        source_stats['expression_mapping'] = project(basis, np.stack(targets),
+            rigdef.LR_FACE_V1, source.expression_names)
+        source_stats['expression_mapping']['includes_joint_skinning'] = True
+        source_stats['expression_mapping']['combination_note'] = 'linear single-control approximation; joint rotations and correctives are nonlinear'
     if source_stats:
         rig["face_model_source"] = {k: v for k, v in source_stats.items() if k != "identity_coefficients"}
     if wrinkle_maps:

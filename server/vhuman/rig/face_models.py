@@ -66,6 +66,13 @@ def _sha256(path: Path) -> str:
 
 
 def _gnm_path(cache: Path) -> Path:
+    if Path(cache) == MODEL_CACHE:
+        from ..face_assets import asset_path
+        installed = asset_path("gnm")
+        if installed.is_file():
+            if _sha256(installed) != GNM_SHA256:
+                raise ValueError(f"GNM v3 weight hash mismatch: {installed}")
+            return installed
     path = cache / "gnm-v3/gnm_head.npz"
     if not path.exists():
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -382,6 +389,11 @@ def fit_and_transfer(src: Source, proc_pos: np.ndarray, proc_tris: np.ndarray,
                  median_surface_distance_mm=round(float(np.median(error)) * 1000, 3),
                  p95_surface_distance_mm=round(float(np.quantile(error, .95)) * 1000, 3),
                  vertices=int(len(pos)), triangles=int(len(src.triangles)))
+    if src.name == "gnm_v3":
+        from .gnm_expression import project
+        stats['expression_mapping'] = project(basis, np.stack([shapes[k] for k in names]),
+                                              names, src.expression_names)
+        stats['expression_basis_alignment'] = {'scale': float(scale), 'rotation': R.tolist()}
     return pos.astype(np.float32), shapes, J, W, stats
 
 

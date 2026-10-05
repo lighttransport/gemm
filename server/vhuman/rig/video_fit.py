@@ -28,7 +28,8 @@ VIDEO_TYPES = {"video/mp4": ".mp4", "video/webm": ".webm", "video/quicktime": ".
 MAX_UPLOAD = 64 << 20
 MAX_SECONDS = 30
 FPS = 30
-MODEL = Path(__file__).resolve().parents[3] / "tmp/vhuman-rig/models/face_landmarker.task"
+from ..face_assets import asset_path
+MODEL = asset_path("mediapipe")
 ANCHORS = (("nose_tip", 4), ("upper_lip", 13), ("lower_lip", 14),
            ("menton", 152), ("mouth_right", 61), ("mouth_left", 291),
            ("eye_right", (33, 133, 159, 145)), ("eye_left", (263, 362, 386, 374)))

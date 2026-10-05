@@ -508,9 +508,9 @@ def main(argv=None) -> int:
     ap.add_argument("--tts-backend", choices=("auto", "cpu", "cuda", "rocm"), default="auto")
     ap.add_argument("--emotion-runner", default=None, help="SenseVoiceSmall GGUF runtime executable")
     ap.add_argument("--emotion-model", default=None, help="SenseVoiceSmall GGUF model path")
-    ap.add_argument("--video-model", help="prepared HunyuanVideo-1.5 directory containing model.json")
-    ap.add_argument("--video-backend", choices=("repo", "legacy"), default="repo")
-    ap.add_argument("--video-runner", help="native HunyuanVideo-1.5 executable")
+    ap.add_argument("--video-model", help="prepared directory for the selected video model")
+    ap.add_argument("--video-backend", choices=("repo", "legacy", "wan", "h3", "hv15-rocm"), default="repo")
+    ap.add_argument("--video-runner", help="executable or script for the selected video backend")
     ap.add_argument("--video-experimental", action="store_true", help="enable unvalidated native video generation")
     args = ap.parse_args(argv)
     from . import runtime

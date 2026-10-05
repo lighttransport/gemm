@@ -71,7 +71,8 @@ class VideoTests(unittest.TestCase):
             "-i", str(path), "-map", "0:v:0", "-f", "null", "-", "-progress", "pipe:1"], text=True)
         counters = dict(line.split("=", 1) for line in decoded.splitlines() if "=" in line)
         self.assertEqual(counters["frame"], "81")
-        self.assertEqual(counters["out_time_us"], "3375000")
+        # ffmpeg versions report either final PTS or total duration here.
+        self.assertAlmostEqual(int(counters["out_time_us"])/1e6, 81/24, delta=1/24+.000001)
         metadata = json.loads(video.video_file(self.service, "testhead", result["id"], "manifest.json").read_text())
         self.assertEqual(metadata["request"]["frames"], 81)
         for run, name in (("..", "clip.mp4"), (result["id"], "runner.log"),
@@ -150,8 +151,10 @@ class VideoTests(unittest.TestCase):
             "sources": {"weights.safetensors": {"fixture": True}}}
         (model / "model.json").write_text(json.dumps(manifest))
         out = self.work / "native-output"
+        runner = self.work / "fixture-runner"
+        runner.write_bytes(b"fixture")
         kwargs = {"model": model, "image": self.work / "heads/testhead/portrait.png",
-                  "prompt": "smile", "out": out}
+                  "prompt": "smile", "out": out, "runner": runner}
         with self.assertRaisesRegex(ValueError, "unverified"):
             native.generate(**kwargs)
         self.assertFalse(out.exists())

@@ -89,6 +89,10 @@ def bake(tmpl, skin_part, pos, subj, folder: Path, out_dir: Path, res: int = 102
     manifest = json.loads((folder / "manifest.json").read_text())
     n_img = np.asarray(Image.open(folder / manifest["ref"]).convert("RGB"))
     alpha = np.asarray(Image.open(subj.portrait).convert("RGBA"))[..., 3].astype(np.float32) / 255
+    imported = tmpl.info.get('model') is not None
+    if imported:
+        from ..face_parsing import FaceParser
+        alpha *= np.isin(FaceParser()(n_img), [1, 10])
     cam = PixalCamera.from_portrait(subj.portrait, math.radians(subj.fit["camera"]["fov_deg"]))
     # texels -> neutral surface points, tangent frames, portrait pixels
     tid, bary = rasterize_uv(skin_part.uv, skin_part.tris, res)
@@ -112,12 +116,14 @@ def bake(tmpl, skin_part, pos, subj, folder: Path, out_dir: Path, res: int = 102
     wv = skin_part.vmap[corners]
     grp, ring = tmpl.group[wv], tmpl.ring[wv]
     edge = (((grp <= 1) & (grp >= 0) & (ring <= 1)) | ((grp == 2) & (ring <= 2))).any(1)
-    facing = facing * ~edge
+    if not imported:
+        facing = facing * ~edge
     if brow_y is not None:               # no creases in the hair: fade out 45-60 mm above the brows
         from .common import smoothstep
         facing = facing * smoothstep(brow_y + 0.060, brow_y + 0.045, p[:, 1])
     per_group: dict[str, np.ndarray] = {}
     stats = {}
+    expression_maps = []
     for name, spec in manifest["expressions"].items():
         f = folder / spec["file"]
         if not f.exists():
@@ -129,10 +135,28 @@ def bake(tmpl, skin_part, pos, subj, folder: Path, out_dir: Path, res: int = 102
         g = sample(np.stack([gx, gy], -1), px)                   # d(detail)/d(pixel)
         c = sample(conf[..., None], px)[:, 0] * facing
         # height ~ detail (brighter = raised); slope along t = grad . (pixels per metre along t) / (pixels per metre)
-        scale = np.linalg.norm(dt, axis=1).mean()
+        scale = max(float(np.linalg.norm(dt, axis=1).mean()), 1e-9)
         st = (g * dt).sum(1) / scale
         sb = (g * db).sum(1) / scale
         slope = -np.stack([st, sb], 1) * c[:, None]              # a height field's normal: (-dh/dt, -dh/db, 1)
+        # Preserve each observed expression's appearance and slope separately.
+        from .exprdata import EXPRESSIONS
+        if name in EXPRESSIONS:
+            magnitude = np.linalg.norm(slope, axis=1)
+            k_expr = SLOPE_P99 / max(float(np.percentile(magnitude[magnitude > 0], 99)), 1e-9) if (magnitude > 0).any() else 0
+            normal = np.full((res, res, 3), 128, np.uint8)
+            normal[..., 2] = 255
+            normal[ys, xs, :2] = np.round(127.5 + 127.5*np.clip(slope*k_expr, -.95, .95)).astype(np.uint8)
+            Image.fromarray(normal).save(out_dir/f'wm_expr_{name}.png')
+            F, _ = consistent_flow(n_img, e_img)
+            appearance = sample(e_img, px + sample(F, px))
+            atlas = np.zeros((res, res, 4), np.uint8)
+            atlas[ys, xs, :3] = np.clip(appearance, 0, 255).astype(np.uint8)
+            atlas[ys, xs, 3] = np.round(np.clip(c, 0, 1)*255).astype(np.uint8)
+            Image.fromarray(atlas).save(out_dir/f'appearance_{name}.png')
+            expression_maps.append({'name': name, 'normal': f'wm_expr_{name}.png',
+                'appearance': f'appearance_{name}.png', 'drivers': spec.get('controls', {}),
+                'scale': k_expr, 'interpretation': 'registered lit appearance; shading-derived normals'})
         grp = spec.get("wrinkle_group", "mouth")
         prev = per_group.get(grp)
         if prev is None:
@@ -140,14 +164,15 @@ def bake(tmpl, skin_part, pos, subj, folder: Path, out_dir: Path, res: int = 102
         else:
             take = np.linalg.norm(slope, axis=1) > np.linalg.norm(prev, axis=1)
             prev[take] = slope[take]
-        stats[name] = {"group": grp, "p99_detail": round(float(np.percentile(np.abs(D[conf > 0.5]), 99)), 4)}
+        valid = np.abs(D[conf > 0.5])
+        stats[name] = {"group": grp, "p99_detail": round(float(np.percentile(valid, 99)), 4) if len(valid) else 0}
     maps = []
     for grp, slope in per_group.items():
         mag = np.linalg.norm(slope, axis=1)
         hi = float(np.percentile(mag[mag > 0], 99.5)) if (mag > 0).any() else 0.0
         slope = slope * np.minimum(1.0, hi / np.maximum(mag, 1e-12))[:, None]      # clamp the few hotspots
         mag = np.linalg.norm(slope, axis=1)
-        k = SLOPE_P99 / max(float(np.percentile(mag[mag > 0], 99)) if (mag > 0).any() else 0.0, 1e-9)
+        k = SLOPE_P99 / max(float(np.percentile(mag[mag > 0], 99)), 1e-9) if (mag > 0).any() else 0
         s = np.clip(slope * k, -0.95, 0.95)
         img = np.full((res, res, 3), 128, np.float32)
         img[..., 2] = 255
@@ -160,7 +185,13 @@ def bake(tmpl, skin_part, pos, subj, folder: Path, out_dir: Path, res: int = 102
         if log:
             log(f"wrinkle map {grp}: scale {k:.3f}")
     from .template import UV_FRONT
-    return {"maps": maps, "u_center": UV_FRONT[0], "side_width": 0.006,
+    extra = {}
+    if imported:
+        side = np.full((res, res), 128, np.uint8)
+        side[ys, xs] = np.round(np.clip(.5 + p[:, 0]/.012, 0, 1)*255).astype(np.uint8)
+        Image.fromarray(side).save(out_dir/'wm_side.png')
+        extra['side_file'] = 'wm_side.png'
+    return {"maps": maps, "expression_maps": expression_maps, **extra, "u_center": UV_FRONT[0], "side_width": 0.006,
             "blend": "tangent-space slopes (rg * 2 - 1) added to the skin normal map's xy, times the group weight "
                      "for the texel's side (u > u_center: the subject's left); weight = clamp(sum of driver "
                      "control * factor) with left/right controls counting for their side",

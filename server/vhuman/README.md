@@ -1,6 +1,8 @@
 # Independent procedural virtual humans
 
 For RX 9070 XT / RDNA4, see [ROCm setup and validation](ROCM.md).
+For Wan/H3/HV1.5 expression capture, downloaded face models and GNM mapping,
+see [ROCm expression candidates and GNM](VIDEO_EXPRESSIONS.md).
 
 A local eye/head viewer with synthetic procedural textures, analytic refraction,
 portable glTF export, portrait-based eye fitting and optional Qwen/Pixal3D jobs.

@@ -1,5 +1,6 @@
 """Portrait expression video jobs. Generated clips are previews, not rig training data."""
 from __future__ import annotations
+from contextlib import nullcontext
 import json
 from pathlib import Path
 import re
@@ -28,7 +29,7 @@ BRIEF_BLINK_PROMPT = (
 )
 FILES = {"clip.mp4", "poster.png", "manifest.json", "metrics.json"}
 
-def validate(request):
+def validate(request, *, supported_frames=(81, 121), default_frames=81, presets=("quality", "fast12")):
     if not isinstance(request, dict):
         raise ServiceError("video request must be an object")
     hid = request.get("head_id")
@@ -38,11 +39,11 @@ def validate(request):
     if not isinstance(expression, str) or expression not in EXPRESSIONS:
         raise ServiceError("unknown expression")
     preset = request.get("preset", "quality")
-    if not isinstance(preset, str) or preset not in ("quality", "fast12"):
-        raise ServiceError("preset must be quality or fast12")
-    frames, seed = request.get("frames", 81), request.get("seed", 42)
-    if type(frames) is not int or frames not in (81, 121):
-        raise ServiceError("frames must be 81 or 121")
+    if not isinstance(preset, str) or preset not in presets:
+        raise ServiceError(f"preset must be one of {presets}")
+    frames, seed = request.get("frames", default_frames), request.get("seed", 42)
+    if type(frames) is not int or frames not in supported_frames:
+        raise ServiceError("selected video backend does not support this frame count")
     if type(seed) is not int or not 0 <= seed <= 2**63 - 1:
         raise ServiceError("seed must be a non-negative signed 64-bit integer")
     prompt = request.get("prompt", "")
@@ -85,9 +86,10 @@ def list_videos(service, hid):
 
 def availability(model=None, runner=None, *, mock=False, allow_experimental=False, backend='repo'):
     selected = native if mock else select_backend(backend)
+    model = model or getattr(selected, "default_model", None)
     presets = ["quality", "fast12"] if mock else []
     if not mock and model:
-        for preset in ("quality", "fast12"):
+        for preset in getattr(selected, "presets", ("quality", "fast12")):
             try:
                 selected.load_manifest(model, "i2v", preset)
                 presets.append(preset)
@@ -96,13 +98,16 @@ def availability(model=None, runner=None, *, mock=False, allow_experimental=Fals
     return {"available": mock or bool(presets and Path(runner or selected.RUNNER).is_file() and allow_experimental),
         "experimental": not mock, "mock": mock, "presets": presets,
         "expressions": list(EXPRESSIONS), "frames": list(getattr(selected, "frames", (81, 121))), "fps": 24,
-        "backend": "mock" if mock else backend,
+        "default_frames": getattr(selected, "default_frames", 81),
+        "backend": "mock" if mock else backend, "identity_conditioned": getattr(selected, "identity_conditioned", True),
         "parity": "unverified", "memory_fit": "unverified"}
 
 def video_job(service, request, progress, cancel: threading.Event, *, model=None,
               runner=None, mock=False, allow_experimental=False, backend='repo'):
     selected = native if mock else select_backend(backend)
-    req = validate(request)
+    req = validate(request, supported_frames=getattr(selected, 'frames', (81, 121)),
+                   default_frames=getattr(selected, 'default_frames', 81),
+                   presets=getattr(selected, 'presets', ('quality', 'fast12')))
     if req['frames'] not in getattr(selected, 'frames', (81, 121)):
         raise ServiceError('selected video backend does not support this frame count')
     portrait = service.head_file(req["head_id"], "portrait.png")
@@ -130,12 +135,15 @@ def video_job(service, request, progress, cancel: threading.Event, *, model=None
         else:
             if not allow_experimental:
                 raise ServiceError("enable --video-experimental; full pipeline parity is unverified")
-            if gpu.backend() != "cuda":
-                raise ServiceError("HunyuanVideo-1.5 currently requires CUDA")
+            hardware = getattr(selected, "hardware", "cuda")
+            if gpu.backend() != hardware:
+                raise ServiceError(f"selected video backend requires {hardware}")
+            model = model or getattr(selected, "default_model", None)
             if not model:
                 raise ServiceError("configure --video-model with a prepared HunyuanVideo-1.5 model directory")
-            progress(0.03, "waiting for the CUDA device")
-            with gpu.device_session(14336, cancel=cancel):
+            progress(0.03, f"waiting for the {hardware} device")
+            session = nullcontext() if getattr(selected, "manages_device_lock", False) else gpu.device_session(14336, cancel=cancel)
+            with session:
                 manifest = selected.generate(model=model, runner=runner or selected.RUNNER,
                     image=portrait, prompt=req["prompt"], out=out, preset=req["preset"],
                     frames=req["frames"], seed=req["seed"], device=gpu.device_index(),

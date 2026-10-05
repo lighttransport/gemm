@@ -837,6 +837,7 @@ controls.addEventListener('change', updateJointMarkers);
 // weighted by its driver controls for the texel's side of the face.
 function patchWrinkles(mat, W) {
   const uni = { wmCenter: { value: W.def.u_center }, wmWidth: { value: W.def.side_width } };
+  if (W.side) uni.wmSide = { value: W.side };
   W.maps.forEach((m, i) => { uni[`wmTex${i}`] = { value: m.tex }; uni[`wmW${i}`] = { value: new THREE.Vector2() }; });
   W.uniforms = uni;
   const prev = mat.onBeforeCompile;
@@ -847,16 +848,17 @@ function patchWrinkles(mat, W) {
     const sum = W.maps.map((_, i) => `s += mix(wmW${i}.y, wmW${i}.x, side) * (texture2D(wmTex${i}, uv).xy * 2.0 - 1.0);`).join('\n');
     sh.fragmentShader = sh.fragmentShader.replace('#include <common>', `#include <common>
 uniform float wmCenter; uniform float wmWidth;
+${W.side ? 'uniform sampler2D wmSide;' : ''}
 ${decl}
 vec2 wrinkleSlope(vec2 uv) {
-  float side = smoothstep(wmCenter - wmWidth, wmCenter + wmWidth, uv.x);   // 1: the subject's left
+  float side = ${W.side ? 'texture2D(wmSide, uv).r' : 'smoothstep(wmCenter - wmWidth, wmCenter + wmWidth, uv.x)'};
   vec2 s = vec2(0.0);
   ${sum}
   return s;
 }`).replace('mapN.xy *= normalScale;', 'mapN.xy *= normalScale;\n\tmapN.xy += wrinkleSlope(vNormalMapUv);');
   };
   const key = mat.customProgramCacheKey ? mat.customProgramCacheKey() : '';
-  mat.customProgramCacheKey = () => key + '|wrinkles' + W.maps.length;
+  mat.customProgramCacheKey = () => key + '|wrinkles' + W.maps.length + (W.side ? '|side' : '');
   mat.needsUpdate = true;
 }
 function wrinkleWeights(values) {
@@ -1555,6 +1557,12 @@ async function loadRig(h) {
       return Object.assign({ tex }, m);
     }));
     state.wrinkles = { def: def.wrinkles, maps };
+    if (def.wrinkles.side_file) {
+      const side = await tl.loadAsync(base + def.wrinkles.side_file);
+      side.flipY = false;
+      side.colorSpace = THREE.NoColorSpace;
+      state.wrinkles.side = side;
+    }
     gltf.scene.traverse((o) => { if (o.isMesh && o.name === 'head_skin') for (const mat of [].concat(o.material)) patchWrinkles(mat, state.wrinkles); });
   }
   const gaussianCount=state.candidates?.find(c=>c.id===state.candidate)?.manifest?.gaussians||0;

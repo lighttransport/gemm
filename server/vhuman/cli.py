@@ -381,7 +381,7 @@ def cmd_video(args) -> dict:
     from . import video
     return video.video_job(EyeService(Path(args.work)),
         {"head_id": args.head, "expression": args.expression, "prompt": args.prompt,
-         "preset": args.preset, "frames": args.frames, "seed": args.seed},
+         "preset": args.preset, "seed": args.seed, **({"frames": args.frames} if args.frames is not None else {})},
         _progress, threading.Event(), model=args.model, runner=args.runner,
         mock=args.mock, allow_experimental=args.allow_experimental, backend=args.video_backend)
 
@@ -566,12 +566,12 @@ def main(argv=None) -> int:
     sp.add_argument("--head", required=True)
     sp.add_argument("--expression", choices=("smile", "laugh", "surprise", "sad", "angry", "blink"), default="smile")
     sp.add_argument("--prompt", default="")
-    sp.add_argument("--preset", choices=("quality", "fast12"), default="quality")
-    sp.add_argument("--frames", type=int, choices=(81, 121), default=81)
+    sp.add_argument("--preset", choices=("quality", "fast12", "fast5"), default="quality")
+    sp.add_argument("--frames", type=int, help="backend-specific frame count (Wan: 4*n+1; H3: 17*n+5)")
     sp.add_argument("--seed", type=int, default=42)
     sp.add_argument("--model", help="prepared model directory")
     sp.add_argument("--runner", help="native video executable")
-    sp.add_argument("--video-backend", choices=("repo", "legacy"), default="repo")
+    sp.add_argument("--video-backend", choices=("repo", "legacy", "wan", "h3", "hv15-rocm"), default="repo")
     sp.add_argument("--allow-experimental", action="store_true")
     sp.set_defaults(fn=cmd_video)
     sub.add_parser("replate", help="re-extract the plate library from its source images").set_defaults(fn=cmd_replate)

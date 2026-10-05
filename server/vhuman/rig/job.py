@@ -25,6 +25,9 @@ RIG_FILES = ("rig.glb", "rig.json", "rig.usda", "rig_usd.zip", "preview.png", "r
 RIG_FILES += ("soft_deformer.safetensors", "soft_deformer_lod1.safetensors",
               "soft_deformer_lod2.safetensors", "soft_deformer_report.json")
 RIG_FILES += ("skin_material.json", "rig_coverage.png", "rig_confidence.png", "rig_specular.png")
+from .exprdata import EXPRESSIONS
+RIG_FILES += ('wm_side.png',) + tuple(f'{prefix}{name}.png'
+    for name in EXPRESSIONS for prefix in ('wm_expr_', 'appearance_'))
 MIN_FREE_MIB = 1536
 
 
