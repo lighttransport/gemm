@@ -3,6 +3,7 @@
 #include <hip/hip_runtime.h>
 #include <hipblaslt/hipblaslt.h>
 #include <map>
+#include <mutex>
 #include <tuple>
 #include <cstdio>
 
@@ -24,6 +25,7 @@ struct WanPlan {
 
 struct WanBlas {
     hipblasLtHandle_t handle = nullptr;
+    std::mutex mutex;
     std::map<std::tuple<int, int, int, bool>, WanPlan> plans;
     ~WanBlas() {
         plans.clear();
@@ -61,6 +63,9 @@ extern "C" int wan22_projection_blas(void *context, _Float16 *out, const _Float1
     if (!context || !out || !input || !packed || !scratch || m <= 0 || n <= 0 || k <= 0 || k % 32)
         return int(hipErrorInvalidValue);
     auto *state = static_cast<WanBlas *>(context);
+    // ctypes releases the GIL. Protect plan creation, mutable bias descriptors
+    // and handle dispatch across host threads without synchronizing GPU streams.
+    std::lock_guard<std::mutex> guard(state->mutex);
     auto key = std::make_tuple(m, n, k, bias != nullptr);
     auto found = state->plans.find(key);
     if (found == state->plans.end()) {

@@ -14,6 +14,8 @@ bias presence, rebinds each layer's bias, and shares a 32 MiB PyTorch workspace
 per stream. `--hip-gemm wmma` retains the shared Hunyuan WMMA kernels in
 `rdna4/video_common/gemm.hip`; FP32 input callers also retain this path.
 This is W8A16 inference, not H3's dynamic activation INT8/ConvRot algorithm.
+Host-side plan lookup, bias rebinding and hipBLASLt dispatch are protected by
+a native mutex for concurrent callers; GPU streams are not synchronized.
 All tensor storage belongs to PyTorch and launches use its current HIP stream. Nonquantized
 projections use PyTorch. `--backend pytorch` provides an independent GGUF
 dequantization/GEMM comparison path without loading our HIP adapter.
@@ -83,7 +85,8 @@ or full-resolution memory fit. The manifest records `parity: unverified`.
 `make -C rdna4/wan22 test` checks four projection shapes with signed values,
 matrix tails, large K and a nondefault stream under both GEMM paths. It tests
 no bias, replacement bias pointers in cached plans, FP32 callers and shaped
-inputs. hipBLASLt fixtures and a two-block, 21-projection synthetic Wan graph
+inputs, plus simultaneous host calls on two GPU streams with distinct biases.
+hipBLASLt fixtures and a two-block, 21-projection synthetic Wan graph
 match the independent PyTorch reference exactly on the tested system. The
 WMMA graph passes at relative L2 0.000512.
 
@@ -196,7 +199,13 @@ the target of on-par full-size DiT execution is met. Full-size and nine-frame
 synthetic DiT outputs are exactly equal to PyTorch (relative L2 0, cosine 1).
 Peak allocation in the paired full-size probe is **6,963 MiB**, including the
 workspace. All five captured nine-frame schedule updates also match exactly.
-That short schedule executes 3,000 HIP projections and peaks at 5,710 MiB;
+After the host-concurrency fix, the default hipBLASLt path also completes the
+normal 64×64 / five-frame / two-update VAE and MP4 smoke test. Both captured
+updates match the independent PyTorch reference exactly, and decoded MP4 pixel
+MAE is 0. `ffprobe` confirms five 64×64 frames at 24 fps. Audit artifacts are
+`tmp/video-rocm/wan22-audit-video/` and
+`tmp/video-rocm/wan22-build/audit-video-parity.json`.
+The nine-frame, five-update schedule executes 3,000 HIP projections and peaks at 5,710 MiB;
 loading, CPU UMT5, preparation and denoising total 47.59 seconds with HIP versus
 47.55 seconds with PyTorch. VAE is skipped for this iteration profile.
 The small end-to-end timings include CPU UMT5 and VAE, so they do not represent

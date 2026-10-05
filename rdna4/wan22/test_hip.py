@@ -1,4 +1,6 @@
 """Independent Q8_0 decode + PyTorch GEMM comparison on the RX 9070 XT."""
+import concurrent.futures
+import threading
 import torch
 from gguf import GGMLQuantizationType
 from diffusers.quantizers.gguf.utils import GGUFParameter, dequantize_gguf_tensor
@@ -51,6 +53,26 @@ def check_runner(gemm):
     expected = torch.nn.functional.linear(x.float(), dense.float()) + bias.float()
     torch.testing.assert_close(actual.reshape(256, n), expected, rtol=.002, atol=.03125)
     assert actual.dtype == torch.float32
+    if gemm == "blaslt":
+        barrier = threading.Barrier(2)
+        inputs = [torch.randn(129, k, device="cuda", dtype=torch.float16) for _ in range(2)]
+        biases = [torch.randn(n, device="cuda", dtype=torch.float16) + i for i in range(2)]
+        torch.cuda.synchronize()
+        def concurrent_projection(index):
+            torch.cuda.set_device(runner.device)
+            stream = torch.cuda.Stream()
+            with torch.cuda.stream(stream):
+                expected = torch.nn.functional.linear(inputs[index], dense, biases[index])
+                outputs = []
+                for _ in range(8):
+                    barrier.wait(timeout=30)
+                    outputs.append(runner.linear(inputs[index], weight, biases[index]))
+                stream.synchronize()
+                for output in outputs:
+                    torch.testing.assert_close(output, expected, rtol=.002, atol=.03125)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            list(pool.map(concurrent_projection, range(2)))
+        print("PASS blaslt concurrent host threads, separate streams and biases")
     # Exercise the actual Wan graph's normalization, expanded timestep, RoPE,
     # self/cross-attention and FFN around quantized projections.
     from diffusers import WanTransformer3DModel
