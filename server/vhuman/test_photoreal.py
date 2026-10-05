@@ -4,10 +4,37 @@ import numpy as np
 from .reconstruction.reference import Camera
 from .reconstruction.temporal import crop_camera
 from .reconstruction.skin_detail import driver_matrix,evaluate
-from .reconstruction.offline_assets import bound_tubes,attachment_frames
+from .reconstruction.offline_assets import bound_tubes,attachment_frames,curved_cap
 
 
 class PhotorealTests(unittest.TestCase):
+    def test_curved_cap_preserves_outline_and_is_closed(self):
+        camera=Camera(1400,255,299,np.array([.02,.03,1.5]),np.eye(3))
+        angle=np.linspace(0,2*np.pi,40,endpoint=False)
+        contour=np.array([255,140])+np.stack((90*np.cos(angle),70*np.sin(angle)),-1)
+        vertices,faces,split=curved_cap(camera,contour,.03)
+        pixels,_=camera.project(vertices[:len(contour)])
+        np.testing.assert_allclose(pixels,contour,atol=1e-10)
+        edges=np.sort(np.concatenate((faces[:,[0,1]],faces[:,[1,2]],faces[:,[2,0]])),axis=1)
+        _,counts=np.unique(edges,axis=0,return_counts=True)
+        np.testing.assert_equal(counts,2)
+        triangles=vertices[faces]
+        area=np.linalg.norm(np.cross(triangles[:,1]-triangles[:,0],triangles[:,2]-triangles[:,0]),axis=1)
+        self.assertGreater(area.min(),1e-10)
+        volume=np.einsum('ij,ij->i',triangles[:,0],np.cross(triangles[:,1],triangles[:,2])).sum()/6
+        self.assertGreater(volume,0)
+        self.assertGreater(np.ptp(vertices[:,2]),.01)
+
+    def test_concave_cap_fan_does_not_fold(self):
+        camera=Camera(1400,255,299,np.array([.02,.03,1.5]),np.eye(3))
+        contour=np.array([[0,0],[4,0],[4,4],[2,2],[0,4]],float)*30+[200,70]
+        vertices,faces,split=curved_cap(camera,contour,.03)
+        pixels,_=camera.project(vertices)
+        t=pixels[faces[:split]]
+        a=t[:,1]-t[:,0];b=t[:,2]-t[:,0]
+        signed=a[:,0]*b[:,1]-a[:,1]*b[:,0]
+        self.assertTrue((signed>1e-8).all() or (signed<-1e-8).all())
+
     def test_generated_crop_preserves_camera_rays(self):
         camera=Camera(1400,255,299,np.array([.02,.03,1.5]),np.eye(3))
         target=np.array([480,832]);source=np.array([510,598])

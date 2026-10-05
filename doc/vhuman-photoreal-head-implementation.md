@@ -159,3 +159,21 @@ Random complete identity, expression, joint rotation and translation achieved
 NumPy RMS below 1e-16 m and PyTorch RMS about 1.1e-8 m. Tests also check batched
 sampling against full equations, gradients, crop rays, barycentric attachment,
 accessory masking, portrait mismatch and neutral/compression wrinkle gauges.
+
+### Curved accessory refinement
+
+The cap now uses a closed curved shell rather than a flat contour extrusion.
+Front rings preserve camera-projected portrait UVs; the unseen rear uses a
+separate navy cloth prior so the badge and foreground skin do not stretch onto
+its sides. A polygon-kernel centre prevents inverted fans at concave rims.
+Parsing notches are simplified progressively (3–16 pixels); the selected
+simplification, 18 mm front bulge and 90 mm rear depth are recorded as priors.
+An outline without a valid kernel fails preparation rather than exporting a
+folded shell. The brim and unseen cap shape remain approximate.
+
+Validation on RX 9070 XT: 49 reconstruction tests pass, including closed-edge,
+positive-volume, camera-outline and concave-fan checks. The matching 1024 px,
+256-sample happy/frame-20/right-light/20-degree render took 24.96 seconds
+including packed-scene reload validation, using 2463.33 MiB whole-device VRAM
+(previous flat-cap render: 24.15 seconds, 2463.28 MiB). Artifacts are under
+`tmp/vhuman-hopper-photoreal/offline/happy14/`; `happy10/` is the comparison.

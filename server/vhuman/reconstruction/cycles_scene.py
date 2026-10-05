@@ -238,6 +238,7 @@ def run(request):
     materials['hat'],principled=material('hat',(.015,.018,.025),.7)
     hattex=image_node(materials['hat'].node_tree.nodes,out/'accessory_source.png')
     materials['hat'].node_tree.links.new(hattex.outputs['Color'],principled.inputs['Base Color'])
+    materials['hat_cloth'],_=material('inferred_navy_cap_cloth',(.015,.018,.025),.7)
     objects={}
     for part in config['parts']:
         name=part['name'];mesh=bpy.data.meshes.new(name)
@@ -246,7 +247,7 @@ def run(request):
         uv.data.foreach_set('uv',values.ravel())
         obj=bpy.data.objects.new(name,mesh);bpy.context.collection.objects.link(obj);mesh.materials.append(materials[part['material']])
         objects[name]=obj
-        for polygon in mesh.polygons:polygon.use_smooth=part['material'] not in ('hat','glass')
+        for polygon in mesh.polygons:polygon.use_smooth=part['material'] not in ('glass',)
         if part['material']=='skin':
             modifier=obj.modifiers.new('skin_subdivision','SUBSURF');modifier.levels=1;modifier.render_levels=2
         if part['material']=='glass':

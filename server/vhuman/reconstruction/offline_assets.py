@@ -12,6 +12,63 @@ def projected_plane(camera, pixels, z):
     return camera.origin+rays*((z-camera.origin[2])/rays[:,2])[:,None]
 
 
+def curved_cap(camera, contour, z, rings=12):
+    """Closed ray-calibrated cap; unseen depth is a bounded geometric prior.
+
+    Front rings preserve portrait UVs. The shared silhouette ring joins a
+    separate, untextured rear dome, so source badges never stretch onto sides.
+    """
+    contour=np.asarray(contour,float)
+    # Intersect the interior half-planes to find a star-shaped polygon kernel.
+    # A plain vertex mean can sit below a concave cap rim and invert the fan.
+    following=np.roll(contour,-1,axis=0)
+    signed=(contour[:,0]*following[:,1]-contour[:,1]*following[:,0]).sum()
+    if signed<0:contour=contour[::-1]
+    lo=contour.min(0);hi=contour.max(0)
+    kernel=np.array([lo,[hi[0],lo[1]],hi,[lo[0],hi[1]]],float)
+    for a,b in zip(contour,np.roll(contour,-1,axis=0)):
+        edge=b-a;clipped=[]
+        for x,y in zip(kernel,np.roll(kernel,-1,axis=0)):
+            dx=edge[0]*(x-a)[1]-edge[1]*(x-a)[0]
+            dy=edge[0]*(y-a)[1]-edge[1]*(y-a)[0]
+            if dx>=-1e-9:clipped.append(x)
+            if (dx>=0)!=(dy>=0):clipped.append(x+(y-x)*dx/(dx-dy))
+        kernel=np.asarray(clipped).reshape(-1,2)
+        if not len(kernel):raise ValueError('cap outline is not star-shaped; simplify its parsing contour')
+    centre=kernel.mean(0);n=len(contour)
+    vertices=[];faces=[];front_count=0
+    for rear in (False,True):
+        start=len(vertices)
+        # Only the front owns the boundary; rear indices reuse that seam.
+        for ring in range(rings):
+            r=1-ring/rings
+            pixels=centre+(contour-centre)*r
+            depth=z+(.018 if not rear else -.09)*np.sqrt(1-r*r)
+            points=projected_plane(camera,pixels,depth)
+            if rear and ring==0:continue
+            vertices.extend(points)
+        centre_index=len(vertices)
+        vertices.extend(projected_plane(camera,centre[None],z+(-.09 if rear else .018)))
+        def indices(ring):
+            if rear and ring==0:return np.arange(n)
+            return np.arange(n)+(start+(ring-1)*n if rear else start+ring*n)
+        for ring in range(rings-1):
+            a=indices(ring);b=indices(ring+1)
+            for i in range(n):
+                j=(i+1)%n
+                faces.extend([[a[i],b[i],b[j]],[a[i],b[j],a[j]]])
+        a=indices(rings-1)
+        faces.extend([[a[i],centre_index,a[(i+1)%n]] for i in range(n)])
+        if not rear:front_count=len(faces)
+        else:
+            faces[front_count:]=[f[::-1] for f in faces[front_count:]]
+    vertices=np.asarray(vertices);faces=np.asarray(faces,int)
+    triangles=vertices[faces]
+    volume=np.einsum('ij,ij->i',triangles[:,0],np.cross(triangles[:,1],triangles[:,2])).sum()/6
+    if volume<0:faces=faces[:,::-1]
+    return vertices,faces,front_count
+
+
 def attachment_frames(points):
     x=points[...,1,:]-points[...,0,:]
     x/=np.maximum(np.linalg.norm(x,axis=-1,keepdims=True),1e-12)
@@ -151,21 +208,23 @@ def prepare(candidate, out, *, accessories='keep', detail_preset='mature'):
         if contours:
             contour=max(contours,key=cv2.contourArea)
             if cv2.contourArea(contour)>100:
-                contour=cv2.convexHull(contour)[:,0].astype(float)
                 forehead=full[model.group('forehead_region')]
                 cap_z=float(forehead[:,2].max())+.006
-                front=projected_plane(camera,contour,cap_z)
-                back=front.copy();back[:,2]-=.09
-                n=len(front);v=np.concatenate([front,back,front.mean(0)[None],back.mean(0)[None]])
-                faces=[]
-                for i in range(n):
-                    j=(i+1)%n
-                    faces.extend([[2*n,i,j],[2*n+1,n+j,n+i],[i,n+i,n+j],[i,n+j,j]])
-                faces=np.asarray(faces)
+                # Suppress segmentation notches before constructing a radial shell.
+                for tolerance in (3.,5.,8.,12.,16.):
+                    outline=cv2.approxPolyDP(contour,tolerance,True)[:,0].astype(float)
+                    try:
+                        v,faces,front_count=curved_cap(camera,outline,cap_z)
+                        break
+                    except ValueError:
+                        if tolerance==16.:raise
+
                 pixels,_=camera.project(v)
                 texture=pixels/[w,h]
-                part('hat',v,faces,texture[faces],'hat')
-                accessory_records.append(dict(name='hat',source='visible contour extrusion; hidden cap shape is an artist prior',inferred_geometry=True))
+                part('hat_front',v,faces[:front_count],texture[faces[:front_count]],'hat')
+                part('hat_back',v,faces[front_count:],texture[faces[front_count:]],'hat_cloth')
+                accessory_records.append(dict(name='hat',source='parsed outline and ray-projected front; curved hidden cloth dome is an artist prior',
+                    inferred_geometry=True,outline_simplification_px=tolerance,front_bulge_m=.018,rear_depth_m=.09))
     if accessories not in ('keep','omit'):raise ValueError('invalid accessories policy')
     # Visible side hair: stable scalp roots, no hat pixels used as hair evidence.
     hair=(labels==17)&(yy>min(p[1] for p in eye_pixels)-ipd*.25)&(confidence>.4)
