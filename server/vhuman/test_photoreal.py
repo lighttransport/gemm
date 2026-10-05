@@ -25,6 +25,16 @@ class PhotorealTests(unittest.TestCase):
         self.assertGreater(volume,0)
         self.assertGreater(np.ptp(vertices[:,2]),.01)
 
+    def test_cap_rear_retains_width_to_cover_scalp(self):
+        camera=Camera(1400,255,299,np.array([.02,.03,1.5]),np.eye(3))
+        angle=np.linspace(0,2*np.pi,40,endpoint=False)
+        contour=np.array([255,140])+np.stack((90*np.cos(angle),70*np.sin(angle)),-1)
+        vertices,faces,split=curved_cap(camera,contour,.03)
+        n=len(contour);rear_start=12*n+1
+        pixels,_=camera.project(vertices[rear_start:rear_start+n])
+        self.assertGreater(np.ptp(pixels[:,0])/np.ptp(contour[:,0]),.98)
+        self.assertAlmostEqual(vertices[-1,2],-.17)
+
     def test_concave_cap_fan_does_not_fold(self):
         camera=Camera(1400,255,299,np.array([.02,.03,1.5]),np.eye(3))
         contour=np.array([[0,0],[4,0],[4,4],[2,2],[0,4]],float)*30+[200,70]

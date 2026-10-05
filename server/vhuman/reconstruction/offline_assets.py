@@ -12,7 +12,7 @@ def projected_plane(camera, pixels, z):
     return camera.origin+rays*((z-camera.origin[2])/rays[:,2])[:,None]
 
 
-def curved_cap(camera, contour, z, rings=12):
+def curved_cap(camera, contour, z, rings=12, rear_depth=.20):
     """Closed ray-calibrated cap; unseen depth is a bounded geometric prior.
 
     Front rings preserve portrait UVs. The shared silhouette ring joins a
@@ -41,14 +41,17 @@ def curved_cap(camera, contour, z, rings=12):
         start=len(vertices)
         # Only the front owns the boundary; rear indices reuse that seam.
         for ring in range(rings):
-            r=1-ring/rings
+            # A quarter-ellipse retains width near the rim while extending
+            # over the scalp. A shrinking linear fan left the temples exposed.
+            angle=ring/rings*np.pi/2
+            r=np.cos(angle) if rear else 1-ring/rings
             pixels=centre+(contour-centre)*r
-            depth=z+(.018 if not rear else -.09)*np.sqrt(1-r*r)
+            depth=z-rear_depth*np.sin(angle) if rear else z+.018*np.sqrt(1-r*r)
             points=projected_plane(camera,pixels,depth)
             if rear and ring==0:continue
             vertices.extend(points)
         centre_index=len(vertices)
-        vertices.extend(projected_plane(camera,centre[None],z+(-.09 if rear else .018)))
+        vertices.extend(projected_plane(camera,centre[None],z+(-rear_depth if rear else .018)))
         def indices(ring):
             if rear and ring==0:return np.arange(n)
             return np.arange(n)+(start+(ring-1)*n if rear else start+ring*n)
@@ -224,7 +227,7 @@ def prepare(candidate, out, *, accessories='keep', detail_preset='mature'):
                 part('hat_front',v,faces[:front_count],texture[faces[:front_count]],'hat')
                 part('hat_back',v,faces[front_count:],texture[faces[front_count:]],'hat_cloth')
                 accessory_records.append(dict(name='hat',source='parsed outline and ray-projected front; curved hidden cloth dome is an artist prior',
-                    inferred_geometry=True,outline_simplification_px=tolerance,front_bulge_m=.018,rear_depth_m=.09))
+                    inferred_geometry=True,outline_simplification_px=tolerance,front_bulge_m=.018,rear_depth_m=.20))
     if accessories not in ('keep','omit'):raise ValueError('invalid accessories policy')
     # Visible side hair: stable scalp roots, no hat pixels used as hair evidence.
     hair=(labels==17)&(yy>min(p[1] for p in eye_pixels)-ipd*.25)&(confidence>.4)

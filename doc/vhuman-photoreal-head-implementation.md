@@ -177,3 +177,16 @@ positive-volume, camera-outline and concave-fan checks. The matching 1024 px,
 including packed-scene reload validation, using 2463.33 MiB whole-device VRAM
 (previous flat-cap render: 24.15 seconds, 2463.28 MiB). Artifacts are under
 `tmp/vhuman-hopper-photoreal/offline/happy14/`; `happy10/` is the comparison.
+
+The next cap refinement replaces the rear linear radial taper with a
+quarter-ellipse profile. It retains more than 98% of the projected rim width
+at its first rear ring and extends 200 mm from the front plane, improving
+crown and temple coverage in the 20-degree review. This depth remains an
+explicit artist prior; it is not recovered from the portrait. Front geometry
+and camera-projected UVs remain unchanged. The cloth/photo seam and brim
+remain visible limitations.
+
+The regression suite now has 50 passing tests, including rear-width and depth
+checks. `offline/happy15/` is the matching 1024 px / 256-sample comparison:
+24.51 seconds including packed-scene validation, 2463.31 MiB whole-device
+VRAM. `offline/frontal15/` supplies the frontal draft check.
