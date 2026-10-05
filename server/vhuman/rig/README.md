@@ -530,3 +530,54 @@ restricts it to use in connection with NVIDIA Audio2Face.
   tongue spheres, lip pairs); sphere proxies are coarser than the teeth and
   tongue meshes. USD/vchar playback has no projection (it evaluates UsdSkel). The native runtime covers the welded head; teeth, tongue and eyes are
   rigid or simply skinned in the exports.
+## Basic-expression video catalogs
+
+`expression_catalog` generates neutral, happy, sad, angry, fear, surprise, and
+disgust clips from one portrait using the ROCm H3 FL2VA runner. Pass a GNM rig
+already built for that portrait. The defaults are the short experimental
+preview configuration: 480 × 832, 22 frames at 24 fps, five Euler updates.
+
+```sh
+LD_LIBRARY_PATH=/opt/rocm/core-7.14/lib \
+TMPDIR="$PWD/tmp/video-rocm/h3-build" PYTHONDONTWRITEBYTECODE=1 \
+tmp/vhuman-rocm-venv/bin/python -m server.vhuman.rig.expression_catalog \
+  --portrait tmp/video-rocm/wan22-build/expression-validation/portrait.jpg \
+  --rig tmp/video-rocm/wan22-build/expression-validation/gnm-head/rig \
+  --out tmp/video-rocm/hopper-basic-expressions
+```
+
+Each expression has separate generated, landmark, GNM mesh, face-parsing,
+and four-panel MP4s. Matching `*_all.mp4` reels concatenate all seven in the
+order above. The four panels show generated video at upper left, landmarks at
+upper right, GNM mesh at lower left, and parsing at lower right. All panels use
+the same decoded frames and timestamps. Original generation clips are retained
+under each expression's `video/` directory.
+
+Landmarks and blendshape observations use the native CPU MediaPipe executor;
+parsing uses the pinned CPU BiSeNet ONNX model. Mesh fitting uses GNM's anatomical
+groups, refines its identity PCA on the neutral clip, and fixes that identity
+across the remaining clips. It jointly fits expression controls and an
+orthographic similarity camera with temporal regularization. This is a
+monocular fit to eight semantic anchors, with measured reprojection errors;
+it is not a recovered 3D ground truth. The software renderer uses a z-buffer.
+An additional regional GNM expression-PCA fit corrects remaining landmark
+motion, including mouth opening. Its bounded projected solver redistributes
+motion to available modes when a coefficient reaches its limit; the neutral
+identity stays fixed.
+
+`observations.json` preserves dense landmark observations, measured/fitted
+controls, camera parameters, and the 383 regional GNM expression coefficients
+from the control projection plus the fitted PCA residual. The control mapping
+approximates nonlinear skinning. `mesh_fit.npz` stores actual fitted skin
+vertices, triangles, UVs, identity coefficients, controls, and regional PCA
+residuals; `face_parsing.npz` stores per-frame labels.
+The catalog remains marked synthetic and unreviewed; generating a prompt does
+not certify the intended emotion or approve its use as rig training data.
+
+Re-running resumes completed generation clips after checking their settings
+and portrait receipt. `--rerender-debug` rebuilds debug exports without repeating
+generation. Use `--preset fast12` or `quality` and a new output directory for
+more denoising updates; H3 frame counts are `5 + 17*n` through 124.
+`audit.json` checks all 40 movies' frame counts and rates, fixed identity,
+coefficient bounds, and reprojection of the saved mesh vertices. `gnm_schema.json`
+provides the original GNM parameter names and mesh units.
