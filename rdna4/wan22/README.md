@@ -143,3 +143,36 @@ LD_LIBRARY_PATH=/opt/rocm/core-7.14/lib TMPDIR="$PWD/tmp" \
   tmp/vhuman-rocm-venv/bin/python rdna4/wan22/probe.py \
   --out tmp/video-rocm/wan22-build/actual-dit-parity.json
 ```
+
+## HIP versus PyTorch performance
+
+On the RX 9070 XT, the full-geometry DiT benchmark uses the same Q8_0 weights,
+832×480 / 81-frame geometry, 226 synthetic text tokens and timestep 500.
+Loading, text encoding, scheduler and VAE are excluded. Each backend runs once
+to warm up, then three synchronized passes alternate order in the same process.
+Both retain PyTorch attention; only quantized projection execution differs.
+
+| Measurement | Repository HIP | PyTorch ROCm reference | HIP runtime gap |
+| --- | ---: | ---: | ---: |
+| Full-size DiT forward, median of 3 | 18.411 s | 10.215 s | +80.2% (1.802×) |
+| 64×64 / 5 frames / 2 updates, end-to-end, single run | 44.941 s | 40.334 s | +11.4% (1.114×) |
+| 832×480 / 81 frames / 50 updates, end-to-end | 2,592.7 s | Unmeasured | Unmeasured |
+
+Full-size pass samples are PyTorch `[10.2201, 10.2126, 10.2150]` seconds and
+HIP `[18.5048, 18.3579, 18.4105]` seconds. DiT parity passes at relative L2
+0.003552 and cosine 0.9999937, with 7,239 MiB peak PyTorch allocation.
+The small end-to-end timings include CPU UMT5 and VAE, so they do not represent
+DiT throughput. A full-schedule PyTorch reference is required to measure the
+full-video gap. HIP currently expands weights for every projection and uses
+the repository FP16 WMMA GEMM; this benchmark does not isolate the cost of
+expansion, GEMM, or Python dispatch.
+
+```sh
+LD_LIBRARY_PATH=/opt/rocm/core-7.14/lib TMPDIR="$PWD/tmp" \
+  tmp/vhuman-rocm-venv/bin/python rdna4/wan22/probe.py \
+  --width 832 --height 480 --frames 81 --text-tokens 226 \
+  --benchmark-repeats 3 --out tmp/video-rocm/wan22-build/full-dit-benchmark.json
+```
+
+Raw measurements are recorded in that JSON and `full-dit-benchmark.log` beside
+it. The benchmark uses synthetic conditioning rather than a generated prompt.
