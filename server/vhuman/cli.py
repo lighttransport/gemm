@@ -264,10 +264,33 @@ def cmd_reconstruction(args):
     req = dict(head_id=getattr(args, 'head', None), portrait=getattr(args, 'portrait', None),
                face_model=args.face_model, observations=args.observations, profile=args.profile,
                gaussians=args.gaussians, depth_installation=args.depth_installation,
-               res=args.res, iterations=args.iterations, build_rig=not args.no_rig, roughness=args.roughness, f0=args.f0,
-               detail_um=args.detail_um,spatial_materials=args.spatial_materials,auto_exclusions=args.auto_exclusions)
+               res=args.res, texture_res=args.texture_res, iterations=args.iterations, build_rig=not args.no_rig, roughness=args.roughness, f0=args.f0,
+               detail_um=args.detail_um,spatial_materials=args.spatial_materials,auto_exclusions=args.auto_exclusions,
+               occlusion_mode=args.occlusion_mode)
     return reconstruction_job(EyeService(Path(args.work)), req, _progress, threading.Event(),
                               python=args.rig_python, direct=getattr(args, 'portrait', None) is not None)
+
+
+def cmd_rig_render(args):
+    from .reconstruction.offline_render import render
+    return render(args.candidate, args.out, device=args.render_device, preset=args.preset,
+                  accessories=args.accessories, detail_preset=args.detail_preset,
+                  gpu_index=args.device, motion=args.motion, frame=args.frame, appearance=args.appearance,
+                  lighting=args.lighting,yaw=args.yaw)
+
+
+def cmd_portrait_create(args):
+    import subprocess
+    from .runtime import python_command
+    command=[args.rig_python,'-m','server.vhuman.reconstruction.create',
+        '--portrait',args.portrait,'--out',args.out,'--backend',args.video_backend,
+        '--preset',args.preset,'--texture-res',str(args.texture_res),'--accessories',args.accessories,
+        '--detail-preset',args.detail_preset,'--render-preset',args.render_preset]
+    for name in ('candidate','expression_catalog','motion_root','appearance_root'):
+        if getattr(args,name):command.extend(['--'+name.replace('_','-'),str(getattr(args,name))])
+    if args.generate_probes:command.append('--generate-probes')
+    subprocess.run(python_command(command),check=True,stdout=sys.stderr)
+    return json.loads((Path(args.out)/'creation.json').read_text())
 
 
 def cmd_body(args) -> dict:
@@ -492,6 +515,7 @@ def main(argv=None) -> int:
         sp.add_argument("--observations", help="manual face_observations.v1 JSON")
         sp.add_argument("--profile", choices=("geometry", "material", "full"), default="full")
         sp.add_argument("--res", type=int, choices=(256, 512, 1024), default=512)
+        sp.add_argument('--texture-res',type=int,choices=(256,512,1024,2048),help='separate skin atlas resolution')
         sp.add_argument("--iterations", type=int, default=80)
         sp.add_argument("--gaussians", type=int, choices=(0, 2000, 8000, 20000), default=0)
         sp.add_argument("--depth-installation")
@@ -500,8 +524,33 @@ def main(argv=None) -> int:
         sp.add_argument("--detail-um",type=float,default=0.,help="optional authored normal detail, 0..30 micrometres")
         sp.add_argument("--spatial-materials",action="store_true",help="regional fit only with calibrated multi-light observations")
         sp.add_argument("--auto-exclusions",action="store_true",help="photo/model-derived occlusion heuristic for texture baking")
+        sp.add_argument("--occlusion-mode",choices=('auto','manual'),default='auto',help='parsing masks before geometry fitting; manual masks take precedence')
         sp.add_argument("--no-rig", action="store_true")
         sp.set_defaults(fn=cmd_reconstruction)
+    sp = sub.add_parser('portrait-create',help='one-portrait head/bust with native I2V, anatomy and offline HIP render')
+    sp.add_argument('--portrait',required=True);sp.add_argument('--out',required=True)
+    sp.add_argument('--candidate');sp.add_argument('--expression-catalog');sp.add_argument('--motion-root');sp.add_argument('--appearance-root')
+    sp.add_argument('--video-backend',choices=('wan','h3','h3-fl2va','hv15-rocm'),default='h3-fl2va')
+    sp.add_argument('--preset',default='fast5')
+    sp.add_argument('--texture-res',type=int,choices=(256,512,1024,2048),default=1024)
+    sp.add_argument('--accessories',choices=('keep','omit'),default='keep')
+    sp.add_argument('--detail-preset',choices=('source','mature'),default='mature')
+    sp.add_argument('--render-preset',choices=('draft','final'),default='final')
+    sp.add_argument('--generate-probes',action='store_true')
+    sp.set_defaults(fn=cmd_portrait_create)
+    sp = sub.add_parser('rig-render', help='render complete GNM anatomy with Cycles HIP')
+    sp.add_argument('--candidate', required=True, help='completed reconstruction run directory')
+    sp.add_argument('--out', required=True, help='empty artifact directory')
+    sp.add_argument('--render-device', choices=('hip','cpu'), default='hip')
+    sp.add_argument('--preset', choices=('draft','final'), default='draft')
+    sp.add_argument('--accessories', choices=('keep','omit'), default='keep')
+    sp.add_argument('--detail-preset', choices=('source','mature'), default='mature')
+    sp.add_argument('--motion',help='native GNM motion directory')
+    sp.add_argument('--frame',type=int,default=1)
+    sp.add_argument('--appearance',help='gated I2V appearance directory')
+    sp.add_argument('--lighting',choices=('studio','left','right','rim'),default='studio')
+    sp.add_argument('--yaw',type=float,default=0)
+    sp.set_defaults(fn=cmd_rig_render)
     sp = sub.add_parser("body", help="Qwen full-body image -> SAM 3D Body -> Pixal3D -> combined avatar")
     sp.add_argument("--head", required=True, help="existing head with a facial rig")
     sp.add_argument("--outfit", default="plain fitted shirt, trousers and shoes")

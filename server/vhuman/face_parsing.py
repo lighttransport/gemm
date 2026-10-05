@@ -18,6 +18,10 @@ class FaceParser:
         self.session = ort.InferenceSession(str(model), options, providers=['CPUExecutionProvider'])
 
     def __call__(self, rgb):
+        return self.predict(rgb)[0]
+
+    def predict(self, rgb):
+        """Return labels and softmax confidence without changing legacy callers."""
         import cv2
         rgb = np.asarray(rgb, dtype=np.uint8)
         image = cv2.resize(rgb, (512, 512), interpolation=cv2.INTER_LINEAR).astype(np.float32) / 255
@@ -25,4 +29,9 @@ class FaceParser:
         value = self.session.run(None, {self.session.get_inputs()[0].name:
                                       image.transpose(2, 0, 1)[None].astype(np.float32)})[0]
         labels = value[0].argmax(0).astype(np.uint8)
-        return cv2.resize(labels, (rgb.shape[1], rgb.shape[0]), interpolation=cv2.INTER_NEAREST)
+        logits = value[0] - value[0].max(0, keepdims=True)
+        probability = np.exp(logits)
+        confidence = probability.max(0) / probability.sum(0)
+        size = (rgb.shape[1], rgb.shape[0])
+        return (cv2.resize(labels, size, interpolation=cv2.INTER_NEAREST),
+                cv2.resize(confidence, size, interpolation=cv2.INTER_LINEAR))

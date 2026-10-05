@@ -370,13 +370,22 @@ def export_head(out: Path, mesh: dict, keep: np.ndarray, poses: list[EyePose], e
 
 def fit_head(portrait, head_glb, out_dir, fov_deg: float = 20.0, plates: list[dict] | None = None,
              plate_loader=None, res: int = 1024, iris_info: dict | None = None, skin_params: dict | None = None,
-             anatomical_poses: list[EyePose] | None = None) -> dict:
+             anatomical_poses: list[EyePose] | None = None, eye_observations=None) -> dict:
     """The whole fit: eyes in the portrait, rays onto the head, carve, export."""
     skin_params = skin.validate(skin_params)
     started = time.perf_counter()
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    eyes = L.find_eyes(portrait)
+    if eye_observations is None:
+        try:
+            eyes = L.find_eyes(portrait)
+        except L.LandmarkError:
+            eyes = L.tracked_eyes(portrait)
+    else:
+        eyes = eye_observations
+    if len(eyes)!=2 or {eye.side for eye in eyes}!={'left','right'}:
+        raise ValueError('two anatomical eye observations required')
+    eyes=sorted(eyes,key=lambda eye:eye.side!='right')
     cam = PixalCamera.from_portrait(portrait, math.radians(fov_deg))
     mesh = mesh_from_glb(Path(head_glb))
     if anatomical_poses is None:

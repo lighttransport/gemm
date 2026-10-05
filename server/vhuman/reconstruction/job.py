@@ -36,6 +36,8 @@ def reconstruction_job(service, request, progress, cancel, *, python=None, mock=
     res, iterations = int(request.get('res',512)),int(request.get('iterations',80))
     if res not in (256,512,1024) or not 10<=iterations<=300:
         raise ValueError('res must be 256/512/1024; iterations 10..300')
+    texture_res=int(request.get('texture_res') or res)
+    if texture_res not in (256,512,1024,2048):raise ValueError('invalid texture resolution')
     roughness,f0 = float(request.get('roughness',.55)),float(request.get('f0',.028))
     if not .08<=roughness<=1. or not .005<=f0<=.04:
         raise ValueError('invalid roughness/F0 prior')
@@ -49,9 +51,13 @@ def reconstruction_job(service, request, progress, cancel, *, python=None, mock=
         raise ValueError('gaussians must be 0/2000/8000/20000')
     cmd = [str(py),'-m','server.vhuman.reconstruction.pipeline',str(folder),'--run-id',run_id,
            '--profile',profile,'--face-model',model,'--res',str(res),'--iterations',str(iterations),
-           '--roughness',str(roughness),'--f0',str(f0),'--detail-um',str(detail_um)]
+           '--roughness',str(roughness),'--f0',str(f0),'--detail-um',str(detail_um),'--texture-res',str(texture_res)]
     if request.get('spatial_materials',False):cmd.append('--spatial-materials')
     if request.get('auto_exclusions',False):cmd.append('--auto-exclusions')
+    occlusion_mode = request.get('occlusion_mode','auto')
+    if occlusion_mode not in ('auto','manual'):
+        raise ValueError('occlusion mode must be auto or manual')
+    cmd.extend(['--occlusion-mode',occlusion_mode])
     if request.get('build_rig',True):
         cmd.append('--rig')
     for key,flag in [('observations','--observations'),('depth_installation','--depth-installation')]:

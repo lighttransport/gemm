@@ -47,6 +47,14 @@ def anchor_indices(vertices, camera, anchors, anatomical=None):
     return out
 
 
+def attached_point(vertices, row, anchors):
+    ids = row[1]
+    weight = np.asarray(anchors[row[0]].get('barycentric', np.full(len(ids),1/len(ids))),float)
+    if weight.shape != ids.shape or not np.isfinite(weight).all() or (weight<0).any() or abs(weight.sum()-1)>1e-5:
+        raise ValueError('invalid barycentric landmark weights')
+    return (vertices[...,ids,:]*weight[:,None]).sum(-2)
+
+
 def initialize(source, subject):
     """Align model anatomy to analytic eyes before weak surface fitting.
 
@@ -70,7 +78,7 @@ head height or move the model's sockets. This is a neutral initialization.
 
 
 def fit(source, initial, views, *, scale=1., rotation=None, max_modes=24, iterations=80, surface_prior=None,
-        freeze_pose=False, expression_groups=None):
+        freeze_pose=False, expression_groups=None, seed=None):
     from scipy.optimize import least_squares
     from scipy.spatial.transform import Rotation
     from scipy.spatial import cKDTree
@@ -119,6 +127,15 @@ def fit(source, initial, views, *, scale=1., rotation=None, max_modes=24, iterat
     # Pose translation and expression are independent per view; shared identity.
     count = ni + ng*(6+ne)
     x = np.zeros(count)
+    if seed:
+        coefficients=np.asarray(seed.get('identity_coefficients',[]))
+        x[:min(ni,len(coefficients))]=coefficients[:ni]
+        for j in range(nv):
+            off=ni+group_index[j]*(6+ne)
+            x[off:off+3]=seed['pose_translations'][j]
+            x[off+3:off+6]=seed['pose_rotations'][j]
+            old=dict(zip(seed['expression_modes'],seed['expression_coefficients'][j]))
+            x[off+6:off+6+ne]=[old.get(int(mode),0) for mode in expression_modes]
     def split(x, j):
         off = ni+group_index[j]*(6+ne)
         return x[:ni], x[off:off+3], x[off+6:off+6+ne], x[off+3:off+6]
@@ -129,8 +146,8 @@ def fit(source, initial, views, *, scale=1., rotation=None, max_modes=24, iterat
         residual = []
         for j, c in enumerate(cams):
             _, trans, expression, pose_rotation = split(x, j)
-            attachments_p = np.array([p[a[1]].mean(0) for a in anchors[j]])
-            attachments_e = np.stack([eb[:,a[1]].mean(1) for a in anchors[j]],axis=1)
+            attachments_p = np.array([attached_point(p,a,views[j]['anchors']) for a in anchors[j]])
+            attachments_e = np.stack([attached_point(eb,a,views[j]['anchors']) for a in anchors[j]],axis=1)
             moving = (attachments_p + np.einsum('i,ivc->vc', expression, attachments_e)) @ Rotation.from_rotvec(pose_rotation).as_matrix().T + trans
             pixels, depth = c.project(moving)
             target = np.array([a[2] for a in anchors[j]])
@@ -232,3 +249,47 @@ def fit(source, initial, views, *, scale=1., rotation=None, max_modes=24, iterat
                                'camera intrinsics and metric scale held fixed; pose is a nuisance fit',
                                'mask silhouette contour attachments fixed at initialization; large pose changes need new initialization'])
     return candidate.astype(np.float32), np.asarray(captured, np.float32), cams, report
+
+
+def fit_staged(source, initial, views, **kwargs):
+    """Expand identity only when withheld anatomical landmarks improve.
+
+    A portrait enables 32/64 head modes. 170 head modes require multiple
+    independently calibrated directions; eye and tooth identity stays frozen.
+    Withheld tracker landmarks test correspondence consistency, not true depth.
+    """
+    import copy
+    train=copy.deepcopy(views)
+    heldout=[]
+    for view in train:
+        names=sorted(name for name in view.get('anchors',{}) if name.startswith('mp_'))
+        keep={name:view['anchors'].pop(name) for name in names[::10]}
+        heldout.append(keep)
+    if sum(map(len,heldout))<20:
+        return fit(source,initial,views,**kwargs)
+    stages=[32,64]
+    camera_rot=[Camera.from_dict(v['camera']).rotation for v in views]
+    if len(views)>=3 and max(np.linalg.norm(r-camera_rot[0]) for r in camera_rot)>.25:
+        stages.append(170)
+    def validation(captured,cameras):
+        errors=[]
+        for i,anchors in enumerate(heldout):
+            rows=anchor_indices(initial,cameras[i],anchors)
+            for row in rows:
+                from .correspondence import occlusion_weight
+                if occlusion_weight(views[i],row[2])<=0:continue
+                p=attached_point(captured[i],row,anchors)
+                projected,_=cameras[i].project(p[None])
+                errors.append(np.linalg.norm(projected[0]-row[2]))
+        return float(np.mean(errors)) if errors else float('inf')
+    accepted=None;accepted_error=float('inf');history=[]
+    for modes in stages:
+        result=fit(source,initial,train,max_modes=modes,seed=accepted[3] if accepted else None,**kwargs)
+        error=validation(result[1],result[2])
+        take=accepted is None or error<accepted_error*.995
+        history.append(dict(modes=modes,withheld_landmark_error_px=error,accepted=take))
+        if take:accepted,accepted_error=result,error
+        else:break
+    accepted[3]['identity_stages']=history
+    accepted[3]['identity_validation']='every tenth dense tracker attachment withheld; synthetic correspondence validation, not measured 3D'
+    return accepted

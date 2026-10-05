@@ -54,6 +54,39 @@ class LandmarkError(ValueError):
     pass
 
 
+def tracked_eyes(portrait):
+    """Native MediaPipe iris/lid observations for glasses and complex backgrounds.
+
+    Iris colour is an appearance estimate through any lens, not a measurement
+    of the unobstructed iris. Face confidence is not per-landmark confidence.
+    """
+    import cv2
+    from ..native_landmarks import FaceLandmarker
+    from ..face_assets import asset_path
+    rgb=np.asarray(Image.open(portrait).convert('RGB'))
+    h,w=rgb.shape[:2]
+    with FaceLandmarker(asset_path('mediapipe')) as tracker:
+        detected=tracker.detect(rgb,blendshapes=False)
+    if len(detected)!=1:
+        raise LandmarkError('native eye fitting requires exactly one face')
+    face=detected[0];points=face['landmarks'][:,:2]*[w,h]
+    eyes=[]
+    rows=[('right',468,[469,470,471,472],[33,7,163,144,145,153,154,155,133,173,157,158,159,160,161,246],(133,33)),
+          ('left',473,[474,475,476,477],[263,249,390,373,374,380,381,382,362,398,384,385,386,387,388,466],(362,263))]
+    for side,center,ring,contour,corners in rows:
+        xy=points[center];radius=float(np.median(np.linalg.norm(points[ring]-xy,axis=1)))
+        if not np.isfinite(xy).all() or not 1<=radius<.1*w:
+            raise LandmarkError('invalid native iris observation')
+        mask=np.zeros((h,w),np.uint8)
+        cv2.fillPoly(mask,[np.rint(points[contour]).astype(np.int32)],1)
+        eye=Eye(side,float(xy[0]),float(xy[1]),radius,radius*.45,mask.astype(bool),mask.astype(bool),
+                tuple(tuple(points[i]) for i in corners),score=float(min(face['presence'],face['detection_score'])))
+        eye.color=_iris_color(rgb.astype(np.float32)/255,eye)
+        eye.color['status']='native iris appearance estimate; lens/occlusion uncertainty remains'
+        eyes.append(eye)
+    return eyes
+
+
 def _gauss(img: np.ndarray, sigma: float) -> np.ndarray:
     """Separable Gaussian via FFT (float)."""
     h, w = img.shape

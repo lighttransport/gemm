@@ -461,6 +461,8 @@ def audit_catalog(out):
 
 def run(args):
     from PIL import Image, ImageOps
+    from ..reconstruction.provenance import verify_rig_portrait
+    verify_rig_portrait(args.rig, args.portrait)
     out = args.out
     out.mkdir(parents=True, exist_ok=True)
     ref = out / 'reference.png'

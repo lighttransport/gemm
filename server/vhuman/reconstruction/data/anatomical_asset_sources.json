@@ -1,0 +1,13 @@
+{
+  "license": "Apache-2.0",
+  "gnm_landmarks68.txt": {
+    "source": "https://github.com/google/GNM/blob/fd704e805ff11bddeac3d972af5a253cea7edc37/gnm/shape/data/landmarks/head_sparse_68.txt",
+    "sha256": "d8b6066a87ca37c48bcf4d0834542db841709b65cb983e873fa1e441a22219d0",
+    "note": "Official v3 GNM barycentric landmarks; rounded weights normalized to sum to one."
+  },
+  "mediapipe_canonical.txt": {
+    "source": "https://github.com/google-ai-edge/mediapipe/blob/v0.10.21/mediapipe/modules/face_geometry/data/canonical_face_model.obj",
+    "sha256": "8bac80443397e113f41a8b565ea72c59390bc031d9defab289dba7bc0c54e618",
+    "note": "468-point canonical face geometry, centimetres. Dense GNM transfer is inferred, not an official Google correspondence."
+  }
+}

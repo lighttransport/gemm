@@ -1,0 +1,230 @@
+"""Prepare portable metric meshes, optical eyes and separate accessory priors."""
+import json
+from pathlib import Path
+import numpy as np
+from PIL import Image
+from .reference import Camera
+
+
+def projected_plane(camera, pixels, z):
+    rays=camera.rays(np.asarray(pixels))
+    if (abs(rays[:,2])<1e-6).any():raise ValueError('accessory ray parallel to face plane')
+    return camera.origin+rays*((z-camera.origin[2])/rays[:,2])[:,None]
+
+
+def attachment_frames(points):
+    x=points[...,1,:]-points[...,0,:]
+    x/=np.maximum(np.linalg.norm(x,axis=-1,keepdims=True),1e-12)
+    z=np.cross(x,points[...,2,:]-points[...,0,:])
+    z/=np.maximum(np.linalg.norm(z,axis=-1,keepdims=True),1e-12)
+    return np.stack((x,np.cross(z,x),z),-1)
+
+
+def bound_tubes(paths,root_ids,root_weights,full,radius):
+    """Small surface-bound tubes for wet lines and eyelashes, in metric H."""
+    positions=[];triangles=[];ids=[];weights=[];segments=8
+    angle=np.linspace(0,2*np.pi,segments,endpoint=False)
+    for path,attachments,barycentric in zip(paths,root_ids,root_weights):
+        start=len(positions);direction=np.gradient(path,axis=0)
+        direction/=np.maximum(np.linalg.norm(direction,axis=-1,keepdims=True),1e-12)
+        x=np.cross(direction,np.array([0,1.,0]))
+        bad=np.linalg.norm(x,axis=-1)<1e-8
+        x[bad]=np.cross(direction[bad],np.array([1.,0,0]))
+        x/=np.maximum(np.linalg.norm(x,axis=-1,keepdims=True),1e-12)
+        y=np.cross(direction,x)
+        for i,p in enumerate(path):
+            positions.extend(p+radius*(np.cos(angle)[:,None]*x[i]+np.sin(angle)[:,None]*y[i]))
+            ids.extend([attachments[i]]*segments);weights.extend([barycentric[i]]*segments)
+        for i in range(len(path)-1):
+            for j in range(segments):
+                a=start+i*segments+j;b=start+i*segments+(j+1)%segments
+                triangles.extend([[a,b,a+segments],[b,b+segments,a+segments]])
+    positions=np.asarray(positions);triangles=np.asarray(triangles);ids=np.asarray(ids);weights=np.asarray(weights)
+    roots=(full[ids]*weights[:,:,None]).sum(1)
+    frames=attachment_frames(full[ids[:,:3]])
+    offsets=np.einsum('vij,vj->vi',frames.transpose(0,2,1),positions-roots)
+    return positions,triangles,dict(ids=ids,weights=weights,offsets=offsets)
+
+
+def prepare(candidate, out, *, accessories='keep', detail_preset='mature'):
+    import cv2
+    from ..face_parsing import FaceParser
+    from ..rig.gnm_model import GNMModel
+    from ..rig.common import vertex_normals
+    from ..eye import assets,geometry,iris,optics,sclera
+    from ..eye import params as params_module
+    from .skin_detail import build
+    candidate,out=Path(candidate),Path(out)
+    out.mkdir(parents=True,exist_ok=True)
+    from .provenance import validate_candidate
+    manifest=validate_candidate(candidate)
+    camera=Camera.from_dict(manifest['geometry']['fitted_cameras'][0])
+    with np.load(candidate/'geometry.npz',allow_pickle=False) as z:
+        if 'full_captured' not in z:raise ValueError('offline rendering needs complete GNM anatomy; rebuild candidate')
+        full=z['full_captured'][0];tri=z['full_triangles'];uv=z['full_triangle_uvs']
+        joints=z['gnm_joint_positions'];component=z['full_component_ids'];names=z['component_names']
+    model=GNMModel();parts=[];arrays={}
+    def part(name,positions,triangles,texcoords,material, *, native=False, joint=None,surface=None):
+        ids,remapped=np.unique(triangles,return_inverse=True)
+        arrays[name+'_positions']=np.asarray(positions[ids],np.float32)
+        arrays[name+'_triangles']=np.asarray(remapped.reshape(-1,3),np.int32)
+        arrays[name+'_uvs']=np.asarray(texcoords,np.float32)
+        if native:arrays[name+'_native_ids']=ids
+        if surface:
+            for key,value in surface.items():arrays[name+'_surface_'+key]=value[ids]
+        parts.append(dict(name=name,material=material,native=native,joint=joint,surface_bound=bool(surface)))
+    for i,name in enumerate(names):
+        if name in ('left_eye','right_eye'):continue
+        selected=component==i
+        material='skin' if name=='skin' else 'tongue' if name=='tongue' else 'teeth'
+        if material=='teeth':
+            gum=model.group('gums')[tri].all(1)
+            for kind,mask in [('teeth',selected&~gum),('gums',selected&gum)]:
+                if mask.any():part(str(name)+'_'+kind,full,tri[mask],uv[mask],kind,native=True)
+        elif material=='skin':
+            cavity=model.group('mouth_sock')[tri].all(1)
+            part('skin',full,tri[selected&~cavity],uv[selected&~cavity],'skin',native=True)
+            if (selected&cavity).any():part('mouth_cavity',full,tri[selected&cavity],uv[selected&cavity],'cavity',native=True)
+        else:part(str(name),full,tri[selected],uv[selected],material,native=True)
+    head_folder=candidate.parents[1]
+    fit_document=json.loads((head_folder/'fit.json').read_text())
+    eye_params=fit_document['eye_params']
+    eye_params=params_module.validate(eye_params)
+    image=np.asarray(Image.open(candidate/'portrait.png').convert('RGB'))
+    Image.fromarray(image).save(out/'accessory_source.png')
+    labels,confidence=FaceParser().predict(image)
+    pupil_status='source eye fitting estimate'
+    if (labels==6).sum()>20 and any(e.get('color',{}).get('status','').startswith('native iris') for e in fit_document['eyes']):
+        # The native tracker observes iris rings, not pupil boundaries. A dark
+        # glasses frame is not pupil evidence; retain a labelled default ratio.
+        eye_params['pupil']['dilation']=1.;eye_params['pupil']['scale']=1.
+        pupil_status='authored 0.30 ratio under glasses; no pupil boundary measurement'
+    profile=optics.profile_from_params(eye_params)
+    it,st=assets.structures(eye_params,512)
+    Image.fromarray(assets.srgb_u8(iris.bake_color(it,eye_params,512,sclera.sampler(st,eye_params)))).save(out/'iris.png')
+    Image.fromarray(assets.shell_textures(eye_params,st,512)['base']).save(out/'sclera.png')
+    for side,joint in [('left',2),('right',3)]:
+        shell=geometry.shell(profile,rings=80,segments=96)
+        idx=shell.indices.reshape(-1,3)
+        cornea=(shell.positions[idx,2].mean(1)>profile.z_limbus)
+        for name,mask,material in [('cornea',cornea,'cornea'),('sclera',~cornea,'sclera')]:
+            part(side+'_'+name,shell.positions+joints[joint],idx[mask],shell.uvs[idx[mask]],material,joint=joint)
+        disk=geometry.iris_disk(eye_params,profile,rings=32,segments=96);idx=disk.indices.reshape(-1,3)
+        pupil_radius=optics.iris_radius(eye_params,profile)*params_module.pupil_ratio(eye_params)
+        radius=np.linalg.norm(disk.positions[:,:2],axis=1)
+        idx=idx[(radius[idx]>=pupil_radius).all(1)]
+        part(side+'_iris',disk.positions+joints[joint],idx,disk.uvs[idx],'iris',joint=joint)
+        angle=np.linspace(0,2*np.pi,96,endpoint=False)
+        z=profile.iris_z(eye_params['optics']['chamber_depth'])
+        ring=np.stack((np.cos(angle)*pupil_radius*1.4,np.sin(angle)*pupil_radius*1.4,np.full(96,z-.0002)),-1)
+        cup=np.concatenate((np.array([[0,0,z-.004]]),ring))
+        faces=np.stack((np.zeros(96,int),np.arange(96)+1,np.roll(np.arange(96),-1)+1),-1)
+        part(side+'_pupil_cup',cup+joints[joint],faces,np.zeros((96,3,2)),'pupil',joint=joint)
+    h,w=image.shape[:2]
+    obs=json.loads((candidate/'observations.json').read_text())['views'][0]['anchors']
+    eye_pixels=[np.asarray(obs[k]['xy']) for k in ('eye_right','eye_left')]
+    ipd=float(np.linalg.norm(eye_pixels[1]-eye_pixels[0]))
+    yy,xx=np.mgrid[:h,:w]
+    curves={};accessory_records=[]
+    if accessories=='keep':
+        for side,center in zip(('right','left'),eye_pixels):
+            area=(labels==6)&(abs(xx-center[0])<ipd*.55)&(abs(yy-center[1])<ipd*.4)
+            py,px=np.nonzero(area)
+            if len(px)<20:continue
+            lo=np.array([px.min(),py.min()]);hi=np.array([px.max(),py.max()]);c=(lo+hi)/2;r=(hi-lo)/2
+            angle=np.linspace(0,2*np.pi,64,endpoint=False)
+            # Superellipse gives rounded rectangular lenses.
+            t=np.stack((np.sign(np.cos(angle))*abs(np.cos(angle))**.6,
+                        np.sign(np.sin(angle))*abs(np.sin(angle))**.6),-1)
+            boundary=projected_plane(camera,c+t*r,.026)
+            curves[side+'_glasses_frame']=boundary
+            lens=np.concatenate([projected_plane(camera,c[None],.026),boundary])
+            faces=np.stack((np.zeros(64,int),np.arange(64)+1,np.roll(np.arange(64),-1)+1),-1)
+            part(side+'_glasses_lens',lens,faces,np.zeros((64,3,2)),'glass')
+            accessory_records.append(dict(name=side+'_glasses',source='parsing silhouette + planar lens prior',inferred_geometry=True))
+        if len(curves)==2:
+            centers=np.array([curves[s+'_glasses_frame'].mean(0) for s in ('right','left')])
+            bridge=np.stack((centers[0]+[.025,.007,0],centers.mean(0)+[0,.011,.004],centers[1]+[-.025,.007,0]))
+            curves['glasses_bridge']=bridge
+        hat=(labels==18)&(yy<min(p[1] for p in eye_pixels)-ipd*.25)
+        contours,_=cv2.findContours(hat.astype(np.uint8),cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            contour=max(contours,key=cv2.contourArea)
+            if cv2.contourArea(contour)>100:
+                contour=cv2.convexHull(contour)[:,0].astype(float)
+                forehead=full[model.group('forehead_region')]
+                cap_z=float(forehead[:,2].max())+.006
+                front=projected_plane(camera,contour,cap_z)
+                back=front.copy();back[:,2]-=.09
+                n=len(front);v=np.concatenate([front,back,front.mean(0)[None],back.mean(0)[None]])
+                faces=[]
+                for i in range(n):
+                    j=(i+1)%n
+                    faces.extend([[2*n,i,j],[2*n+1,n+j,n+i],[i,n+i,n+j],[i,n+j,j]])
+                faces=np.asarray(faces)
+                pixels,_=camera.project(v)
+                texture=pixels/[w,h]
+                part('hat',v,faces,texture[faces],'hat')
+                accessory_records.append(dict(name='hat',source='visible contour extrusion; hidden cap shape is an artist prior',inferred_geometry=True))
+    if accessories not in ('keep','omit'):raise ValueError('invalid accessories policy')
+    # Visible side hair: stable scalp roots, no hat pixels used as hair evidence.
+    hair=(labels==17)&(yy>min(p[1] for p in eye_pixels)-ipd*.25)&(confidence>.4)
+    skin=model.group('skin_exterior');p=full[skin];skin_tri=model.data['triangles']
+    remap=np.full(len(full),-1,int);remap[np.flatnonzero(skin)]=np.arange(skin.sum())
+    allowed=skin[skin_tri].all(1);normals=vertex_normals(p,remap[skin_tri[allowed]])
+    projected,_=camera.project(p)
+    from scipy.spatial import cKDTree
+    hy,hx=np.nonzero(hair);rng=np.random.default_rng(19)
+    hair_paths=[];hair_roots=[]
+    if len(hx):
+        count=min(5000,len(hx)*20);chosen=rng.choice(len(hx),count,replace=True)
+        _,nearest=cKDTree(projected).query(np.column_stack((hx[chosen],hy[chosen])))
+        for idx in nearest:
+            tangent=rng.normal(size=3);tangent-=normals[idx]*np.dot(tangent,normals[idx])
+            tangent/=max(np.linalg.norm(tangent),1e-8)
+            root=p[idx]+normals[idx]*.0005+tangent*rng.uniform(0,.0003)
+            length=rng.uniform(.012,.032)
+            direction=normals[idx]*.2+np.array([np.sign(root[0])*.2,-1,0])
+            direction/=np.linalg.norm(direction)
+            t=np.linspace(0,1,8)
+            hair_paths.append(root+t[:,None]*length*direction+(t*t)[:,None]*np.array([0,0,-.006]))
+            hair_roots.append(np.flatnonzero(skin)[idx])
+    # Lower-lid wet line and sparse lashes use fixed anatomical attachments.
+    from .dense_landmarks import attachments
+    lid_ids,lid_weights,_=attachments();skin_ids=np.flatnonzero(skin)
+    lid_points=(full[skin_ids[lid_ids]]*lid_weights[:,:,None]).sum(1)
+    lash_paths=[];lash_ids=[];lash_weights=[]
+    for side,lower,upper in [
+        ('right',[33,7,163,144,145,153,154,155,133],[33,246,161,160,159,158,157,173,133]),
+        ('left',[263,249,390,373,374,380,381,382,362],[263,466,388,387,386,385,384,398,362])]:
+        tearpath=lid_points[lower]+[0,0,.00015]
+        v,t,binding=bound_tubes([tearpath],[skin_ids[lid_ids[lower]]],[lid_weights[lower]],full,.00012)
+        part(side+'_tearline',v,t,np.zeros((len(t),3,2)),'tear',surface=binding)
+        p=lid_points[upper]
+        for i in range(len(p)-1):
+            for t in np.linspace(0,1,5,endpoint=False):
+                root=p[i]*(1-t)+p[i+1]*t
+                direction=np.array([np.sign(root[0])*.1,.4,1]);direction/=np.linalg.norm(direction)
+                length=rng.uniform(.002,.004)
+                lash_paths.append(root+np.linspace(0,1,5)[:,None]*length*direction)
+                ids=np.concatenate((skin_ids[lid_ids[upper[i]]],skin_ids[lid_ids[upper[i+1]]]))
+                weights=np.concatenate((lid_weights[upper[i]]*(1-t),lid_weights[upper[i+1]]*t))
+                lash_ids.append(np.tile(ids,(5,1)));lash_weights.append(np.tile(weights,(5,1)))
+    if lash_paths:
+        v,t,binding=bound_tubes(lash_paths,lash_ids,lash_weights,full,.000025)
+        part('eyelashes',v,t,np.zeros((len(t),3,2)),'lash',surface=binding)
+    arrays['hair_curves']=np.asarray(hair_paths,np.float32).reshape(-1,8,3)
+    arrays['hair_root_ids']=np.asarray(hair_roots,np.int32)
+    arrays['rest_joints']=joints
+    for name,path in curves.items():arrays[name]=path.astype(np.float32)
+    np.savez_compressed(out/'scene_assets.npz',**arrays)
+    detail=build(candidate,out,preset=detail_preset)
+    scene=dict(schema='vhuman.offline_scene.v1',candidate=str(candidate.resolve()),parts=parts,
+        camera=camera.as_dict(),source_size=[w,h],curves=list(curves),accessories=accessory_records,
+        hair=dict(strands=len(hair_paths),lashes=len(lash_paths),source='visible parsing + scalp attachment; density, strand shape and depth inferred'),
+        optical_eyes=dict(source='analytic GNM-profile shell, iris annulus and recessed pupil cavity',
+            pupil_ratio=params_module.pupil_ratio(eye_params),pupil_status=pupil_status,
+            ior=eye_params['optics']['ior_cornea'] if 'ior_cornea' in eye_params['optics'] else 1.376),
+        detail=detail,material=manifest['material'])
+    (out/'scene.json').write_text(json.dumps(scene,indent=2))
+    return scene

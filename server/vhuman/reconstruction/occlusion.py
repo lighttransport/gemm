@@ -9,6 +9,28 @@ from PIL import Image
 from .reference import srgb_to_linear
 
 
+def parsing_masks(view, out, parser):
+    """Image-only masks, computed before fitting; manual annotations win."""
+    from scipy.ndimage import binary_dilation
+    from pathlib import Path
+    image = np.asarray(Image.open(view['image_path']).convert('RGB'))
+    labels, confidence = parser.predict(image)
+    occluders = np.isin(labels, [6, 9, 15, 16, 17, 18])
+    exclusion = binary_dilation(occluders, iterations=2) | (confidence < .4)
+    skin = np.isin(labels, [1, 2, 3, 4, 5, 7, 8, 10, 11, 12, 13, 14])
+    out = Path(out)
+    manual_exclusion = bool(view.get('exclusion_mask_path'))
+    for kind, mask in [('exclusion', exclusion), ('silhouette', skin)]:
+        key = kind+'_mask_path'
+        if not view.get(key):
+            path = out.with_name(out.name+'_'+kind+'.png')
+            Image.fromarray(mask.astype(np.uint8)*255).save(path)
+            view[key] = str(path)
+    return dict(method='pre-fit image-only face parsing', excluded_pixels=int(exclusion.sum()),
+                confidence_threshold=.4, independent_ground_truth=False,
+                manual_exclusion_retained=manual_exclusion)
+
+
 def estimate(image,anchors,skin_mask):
     from scipy.ndimage import binary_opening,binary_dilation
     rgb=np.asarray(image,float)/255.;h,w=rgb.shape[:2]

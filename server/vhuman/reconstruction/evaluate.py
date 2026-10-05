@@ -28,12 +28,12 @@ def outline_metrics(predicted, target, allowed, tolerance=2):
 
 
 def landmark_metrics(vertices, camera, anchors, canonical, view):
-    from .fitting import anchor_indices
+    from .fitting import anchor_indices, attached_point
     from .correspondence import occlusion_weight
     rows = anchor_indices(vertices,camera,anchors,canonical)
     if not rows:
         return dict(count=0,rms_px=None,nme_ipd=None)
-    point = np.array([vertices[row[1]].mean(0) for row in rows])
+    point = np.array([attached_point(vertices,row,anchors) for row in rows])
     xy,_ = camera.project(point)
     error = np.linalg.norm(xy-np.array([row[2] for row in rows]),axis=1)
     weight = np.array([row[3]*occlusion_weight(view,row[2]) for row in rows])

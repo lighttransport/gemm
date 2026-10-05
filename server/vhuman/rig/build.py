@@ -407,6 +407,8 @@ def assemble(folder, out_dir=None, res: int = 2048, iters: int = 600, log=print,
         "baseColorFactor": [0.68, 0.28, 0.29, 1.0], "metallicFactor": 0.0, "roughnessFactor": 0.45}}}
     shape_names = sorted({n for p in parts for n in p.shapes})
     rig = rig_definition(skel, shape_names)
+    from ..reconstruction.provenance import portrait_record
+    rig['portrait_provenance'] = portrait_record(subj.portrait)
     rig["face_model"] = face_model
     if source is not None and source.name == 'gnm_v3':
         from .gnm_expression import project

@@ -315,7 +315,10 @@ def extract(subj: Subject, fov_deg: float | None = None) -> Features:
     cam_d = subj.fit["camera"]
     fov = math.radians(fov_deg if fov_deg is not None else cam_d["fov_deg"])
     cam = PixalCamera.from_portrait(subj.portrait, fov)
-    eyes2d = L.find_eyes(subj.portrait)
+    try:
+        eyes2d = L.find_eyes(subj.portrait)
+    except L.LandmarkError:
+        eyes2d = L.tracked_eyes(subj.portrait)
     caster = Caster(subj, cam)
     eyes = []
     for e2, pose in zip(eyes2d, subj.eyes):

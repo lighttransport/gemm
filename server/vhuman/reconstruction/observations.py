@@ -81,14 +81,19 @@ def load(path):
                 ids = a['vertices']
                 if not isinstance(ids,list) or not 1<=len(ids)<=32 or any(type(i) is not int or i<0 for i in ids):
                     raise ValueError('invalid anchor vertex list')
+            if 'barycentric' in a:
+                weights = np.asarray(a['barycentric'], float)
+                ids = a.get('vertices', [a.get('vertex')])
+                if weights.shape != (len(ids),) or not np.isfinite(weights).all() or (weights < 0).any() or abs(weights.sum()-1) > 1e-5:
+                    raise ValueError('invalid barycentric landmark weights')
         view['image_path'] = str(image)
         view['pixel_sha256'] = pixel_sha256(image)
     return doc
 
 
-def observe(image, camera=None, task=None):
-    from ..rig.face_models import MODEL_CACHE
-    task = Path(task) if task else MODEL_CACHE / 'face_landmarker.task'
+def observe(image, camera=None, task=None, *, dense=False):
+    from ..face_assets import asset_path
+    task = Path(task) if task else asset_path('mediapipe')
     if not task.is_file() or sha256(task) != TASK_SHA256:
         raise ValueError('verified MediaPipe task missing; run setup_face_video.sh or provide manual observations')
     from ..native_landmarks import FaceLandmarker
@@ -103,6 +108,9 @@ def observe(image, camera=None, task=None):
     p = result[0]['landmarks'][:, :2] * [w, h]
     view = dict(image=str(image), sha256=sha256(image), pixel_sha256=pixel_sha256(image), size=[w, h],
                 anchors={name: dict(xy=p[ids].mean(0).tolist(), weight=.8) for name, ids in ANCHORS.items()})
+    if dense:
+        from .dense_landmarks import observe_points
+        view['anchors'].update(observe_points(p))
     if camera is not None:
         view['camera'] = camera.as_dict()
     return dict(format=FORMAT, coordinates='original image pixels, top-left, pixel centres',
