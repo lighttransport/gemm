@@ -5,8 +5,8 @@ from diffusers.quantizers.gguf.utils import GGUFParameter, dequantize_gguf_tenso
 from hip_runner import HipRunner
 
 
-def main():
-    runner = HipRunner()
+def check_runner(gemm):
+    runner = HipRunner(gemm=gemm)
     torch.manual_seed(42)
     for m, n, k in [(1, 17, 32), (17, 67, 96), (129, 257, 256), (256, 256, 1024)]:
         blocks = n * k // 32
@@ -16,20 +16,41 @@ def main():
         packed = packed.reshape(n, k // 32 * 34).cuda()
         weight = GGUFParameter(packed, quant_type=GGMLQuantizationType.Q8_0)
         x = torch.randn(m, k, device="cuda", dtype=torch.float16)
-        bias = torch.randn(n, device="cuda", dtype=torch.float16)
         # Exercise nondefault stream and tails; reference decodes independently.
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(stream):
-            actual = runner.linear(x, weight, bias)
-            dense = dequantize_gguf_tensor(weight).half()
-            expected = torch.nn.functional.linear(x, dense) + bias
-        torch.cuda.current_stream().wait_stream(stream)
-        torch.testing.assert_close(actual, expected, rtol=.002, atol=.03125)
-        rel = torch.linalg.vector_norm(actual.float() - expected.float()) / torch.linalg.vector_norm(expected.float())
-        assert rel < .001, rel
-        print(f"PASS {m}x{n}x{k}: relative L2={float(rel):.7f}")
-    assert runner.calls == 4
+        # Reuse plans with new bias pointers and distinguish bias/no-bias plans.
+        for bias in (None, torch.randn(n, device="cuda", dtype=torch.float16),
+                     torch.randn(n, device="cuda", dtype=torch.float16)):
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                actual = runner.linear(x, weight, bias)
+                dense = dequantize_gguf_tensor(weight).half()
+                if gemm == "blaslt":
+                    expected = torch.nn.functional.linear(x, dense, bias)
+                else:
+                    expected = torch.nn.functional.linear(x, dense)
+                    if bias is not None:
+                        expected = expected + bias
+            torch.cuda.current_stream().wait_stream(stream)
+            torch.testing.assert_close(actual, expected, rtol=.002, atol=.03125)
+            rel = torch.linalg.vector_norm(actual.float() - expected.float()) / torch.linalg.vector_norm(expected.float())
+            assert rel < .001, rel
+            print(f"PASS {gemm} {m}x{n}x{k} bias={bias is not None}: relative L2={float(rel):.7f}")
+    assert runner.calls == 12
+    # Reject a host bias before the native bridge can launch a GPU read of it.
+    try:
+        runner.linear(x, weight, torch.zeros(n, dtype=torch.float16))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("Host bias must be rejected")
+    assert runner.calls == 12
+    # FP32 callers retain the WMMA accumulation and output dtype path.
+    actual = runner.linear(x.float().reshape(2, 128, k), weight, bias.float())
+    expected = torch.nn.functional.linear(x.float(), dense.float()) + bias.float()
+    torch.testing.assert_close(actual.reshape(256, n), expected, rtol=.002, atol=.03125)
+    assert actual.dtype == torch.float32
     # Exercise the actual Wan graph's normalization, expanded timestep, RoPE,
     # self/cross-attention and FFN around quantized projections.
     from diffusers import WanTransformer3DModel
@@ -62,7 +83,12 @@ def main():
     rel = torch.linalg.vector_norm(actual.float() - expected.float()) / torch.linalg.vector_norm(expected.float())
     torch.testing.assert_close(actual, expected, rtol=.005, atol=.005)
     assert rel < .002, rel
-    print(f"PASS Wan graph: {installed} HIP modules, relative L2={float(rel):.7f}")
+    print(f"PASS {gemm} Wan graph: {installed} HIP modules, relative L2={float(rel):.7f}")
+
+
+def main():
+    for gemm in ("wmma", "blaslt"):
+        check_runner(gemm)
 
 
 if __name__ == "__main__":

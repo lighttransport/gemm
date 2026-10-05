@@ -2,22 +2,41 @@
 import ctypes
 from pathlib import Path
 import types
+import weakref
 
 ROOT = Path(__file__).resolve().parents[2]
 
 
 class HipRunner:
-    def __init__(self, library=None):
+    def __init__(self, library=None, gemm="blaslt"):
         import torch
         if not torch.version.hip or not torch.cuda.is_available():
             raise RuntimeError("Wan requires PyTorch ROCm and an accessible AMD GPU")
-        arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+        self.device = torch.cuda.current_device()
+        arch = torch.cuda.get_device_properties(self.device).gcnArchName.split(":")[0]
         if arch != "gfx1201":
             raise RuntimeError(f"This HIP build targets gfx1201; found {arch}")
         self.library = ctypes.CDLL(str(library or ROOT / "tmp/video-rocm/wan22-build/libwan22_hip.so"))
         self.projection = self.library.wan22_projection
         self.projection.argtypes = [ctypes.c_void_p] * 4 + [ctypes.c_int] * 3 + [ctypes.c_void_p]
         self.projection.restype = ctypes.c_int
+        if gemm not in ("wmma", "blaslt"):
+            raise ValueError("GEMM must be wmma or blaslt")
+        self.gemm = gemm
+        self.context = ctypes.c_void_p()
+        self.workspaces = {}
+        if gemm == "blaslt":
+            self.library.wan22_blas_create.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
+            self.library.wan22_blas_create.restype = ctypes.c_int
+            self.library.wan22_blas_destroy.argtypes = [ctypes.c_void_p]
+            self.library.wan22_blas_destroy.restype = None
+            status = self.library.wan22_blas_create(ctypes.byref(self.context))
+            if status:
+                raise RuntimeError(f"Wan hipBLASLt initialization failed: {status}")
+            self._cleanup = weakref.finalize(self, self.library.wan22_blas_destroy, self.context)
+            self.blas_projection = self.library.wan22_projection_blas
+            self.blas_projection.argtypes = [ctypes.c_void_p] * 7 + [ctypes.c_size_t] + [ctypes.c_int] * 3 + [ctypes.c_void_p]
+            self.blas_projection.restype = ctypes.c_int
         self.calls = 0
 
     def linear(self, inputs, weight, bias=None):
@@ -30,13 +49,33 @@ class HipRunner:
             raise ValueError("Invalid Q8_0 projection shape")
         if not inputs.is_cuda or inputs.device != weight.device:
             raise ValueError("Input and weights must be on the same AMD GPU")
+        if inputs.device.index != self.device:
+            raise ValueError("Input GPU must match the HIP runner's device")
+        if bias is not None and (bias.device != inputs.device or bias.ndim != 1 or bias.numel() != n):
+            raise ValueError("Bias must be a vector on the input GPU with one value per output column")
         x = inputs.to(torch.float16).contiguous().reshape(-1, k)
         packed = weight.as_tensor().contiguous()
         if packed.dtype != torch.uint8 or packed.numel() != n * k // 32 * 34:
             raise ValueError("Invalid Q8_0 packed storage")
         scratch = torch.empty((n, k), dtype=torch.float16, device=x.device)
-        out = torch.empty((x.shape[0], n), dtype=torch.float32, device=x.device)
         stream = torch.cuda.current_stream(x.device)
+        if self.gemm == "blaslt" and inputs.dtype == torch.float16:
+            # One workspace per stream prevents races in asynchronous callers.
+            key = (x.device.index, stream.cuda_stream)
+            if key not in self.workspaces:
+                self.workspaces[key] = torch.empty(32 * 1048576, dtype=torch.uint8, device=x.device)
+            workspace = self.workspaces[key]
+            out = torch.empty((x.shape[0], n), dtype=torch.float16, device=x.device)
+            bias_half = bias.to(torch.float16).contiguous() if bias is not None else None
+            status = self.blas_projection(self.context, out.data_ptr(), x.data_ptr(), packed.data_ptr(),
+                                          scratch.data_ptr(), bias_half.data_ptr() if bias_half is not None else 0,
+                                          workspace.data_ptr(), workspace.numel(), x.shape[0], n, k,
+                                          stream.cuda_stream)
+            if status:
+                raise RuntimeError(f"Wan hipBLASLt projection failed: status {status}")
+            self.calls += 1
+            return out.reshape(*inputs.shape[:-1], n)
+        out = torch.empty((x.shape[0], n), dtype=torch.float32, device=x.device)
         status = self.projection(out.data_ptr(), x.data_ptr(), packed.data_ptr(), scratch.data_ptr(),
                                  x.shape[0], n, k, stream.cuda_stream)
         if status:

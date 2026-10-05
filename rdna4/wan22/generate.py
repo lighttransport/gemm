@@ -25,9 +25,12 @@ def parse_args():
     parser.add_argument("--fps", type=int, default=24)
     parser.add_argument("--guidance-scale", type=float, default=5.0)
     parser.add_argument("--backend", choices=("hip", "pytorch"), default="hip")
+    parser.add_argument("--hip-gemm", choices=("blaslt", "wmma"), default="blaslt")
     parser.add_argument("--vram-budget-mib", type=int, default=14336)
     parser.add_argument("--text-device", choices=("cpu", "gpu"), default="cpu")
     parser.add_argument("--dump-latents", action="store_true")
+    parser.add_argument("--latent-only", action="store_true",
+                        help="Skip VAE and MP4 for fast DiT optimization iterations")
     args = parser.parse_args()
     if args.width < 64 or args.height < 64 or args.width % 32 or args.height % 32:
         parser.error("width and height must be multiples of 32 and at least 64")
@@ -68,7 +71,7 @@ def generate(args):
                 str(checkpoint), config=str(pipeline_dir), subfolder="transformer",
                 quantization_config=GGUFQuantizationConfig(compute_dtype=torch.float16),
                 torch_dtype=torch.float16, local_files_only=True)
-            runner = HipRunner() if args.backend == "hip" else None
+            runner = HipRunner(gemm=args.hip_gemm) if args.backend == "hip" else None
             count = runner.install(transformer) if runner else 0
             vae = AutoencoderKLWan.from_pretrained(pipeline_dir, subfolder="vae",
                                                    torch_dtype=torch.float32, local_files_only=True)
@@ -91,7 +94,9 @@ def generate(args):
                 negative = negative.to("cuda", dtype=torch.float16)
             pipe.enable_model_cpu_offload()
             pipe.vae.enable_tiling()
+            denoise_seconds = None
             def callback(pipeline, step, timestep, values):
+                nonlocal denoise_seconds
                 latents = values["latents"]
                 if not torch.isfinite(latents).all():
                     raise RuntimeError(f"Nonfinite latent at update {step}")
@@ -101,21 +106,32 @@ def generate(args):
                     import numpy as np
                     np.save(args.out / f"latent_{step:03d}.npy", latents.float().cpu().numpy())
                 print(f"update {step + 1}/{args.steps}", flush=True)
+                if step + 1 == args.steps:
+                    torch.cuda.synchronize()
+                    denoise_seconds = time.monotonic() - pipeline_started
                 return values
             kwargs = dict(prompt_embeds=embeds, negative_prompt_embeds=negative,
                           width=args.width, height=args.height, num_frames=args.frames,
                           num_inference_steps=args.steps, guidance_scale=args.guidance_scale,
                           generator=torch.Generator(device="cpu").manual_seed(args.seed),
                           callback_on_step_end=callback)
+            if args.latent_only:
+                kwargs["output_type"] = "latent"
             if args.image:
                 kwargs["image"] = load_image(str(args.image)).convert("RGB")
                 pipe.register_to_config(expand_timesteps=True)
             with torch.inference_mode():
+                pipeline_started = time.monotonic()
                 frames = pipe(**kwargs).frames[0]
             import numpy as np
-            if len(frames) != args.frames or not np.isfinite(frames).all():
-                raise RuntimeError("Invalid decoded frames")
-            export_to_video(frames, str(args.out / "video.mp4"), fps=args.fps)
+            if args.latent_only:
+                if not torch.isfinite(frames).all():
+                    raise RuntimeError("Invalid final latent")
+                np.save(args.out / "final_latent.npy", frames.float().cpu().numpy())
+            else:
+                if len(frames) != args.frames or not np.isfinite(frames).all():
+                    raise RuntimeError("Invalid decoded frames")
+                export_to_video(frames, str(args.out / "video.mp4"), fps=args.fps)
             torch.cuda.synchronize()
             sampler.close()
             if runner and runner.calls == 0:
@@ -123,6 +139,8 @@ def generate(args):
             if sampler.vram is not None and sampler.vram > args.vram_budget_mib:
                 raise RuntimeError("Sampled process VRAM exceeds requested budget")
             manifest = {"backend": f"wan22_rocm_{args.backend}", "model": str(model),
+                        "hip_gemm": runner.gemm if runner else None,
+                        "latent_only": args.latent_only,
                         "quantization": "Q8_0 weight-only INT8, FP16 compute",
                         "parity": "unverified", "prompt": args.prompt,
                         "negative_prompt": args.negative_prompt,
@@ -133,6 +151,8 @@ def generate(args):
                         "device": torch.cuda.get_device_name(), "hip_modules": count,
                         "hip_projection_calls": runner.calls if runner else 0,
                         "seconds": time.monotonic() - started,
+                        "denoise_seconds": denoise_seconds,
+                        "denoise_timing_scope": "Pipeline preparation and denoising, including first DiT upload and captures",
                         "peak_allocated_mib": torch.cuda.max_memory_allocated() / 1048576,
                         "peak_process_vram_mib": sampler.vram,
                         "vram_budget_mib": args.vram_budget_mib}

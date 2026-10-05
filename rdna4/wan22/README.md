@@ -1,16 +1,20 @@
 # Wan 2.2 TI2V-5B on RX 9070 XT
 
 This backend uses PyTorch ROCm/Diffusers for the Wan graph, UMT5, scheduler,
-attention and VAE, and repository HIP WMMA for the quantized DiT projections.
+attention and VAE, and a native HIP adapter for the quantized DiT projections.
 It supports text-to-video and first-frame image-to-video. The 14B dual-expert
 models are outside this backend's scope.
 
 The pinned [QuantStack Q8_0 checkpoint](https://huggingface.co/QuantStack/Wan2.2-TI2V-5B-GGUF)
 is 5.4 GB. Q8_0 is signed, block-scaled **weight-only INT8**. Each HIP projection
-expands only its own weights into a temporary FP16 buffer, then invokes the
-shared Hunyuan FP16 WMMA kernels in `rdna4/video_common/gemm.hip`. This is
-W8A16 inference, not H3's dynamic activation INT8/ConvRot algorithm. All memory
-belongs to PyTorch and launches use its current HIP stream. Nonquantized
+expands only its own weights into a temporary FP16 buffer using our fused HIP
+decoder. The default `--hip-gemm blaslt` uses AMD hipBLASLt FP32 accumulation
+with fused bias and FP16 output. It caches host-side plans by matrix shape and
+bias presence, rebinds each layer's bias, and shares a 32 MiB PyTorch workspace
+per stream. `--hip-gemm wmma` retains the shared Hunyuan WMMA kernels in
+`rdna4/video_common/gemm.hip`; FP32 input callers also retain this path.
+This is W8A16 inference, not H3's dynamic activation INT8/ConvRot algorithm.
+All tensor storage belongs to PyTorch and launches use its current HIP stream. Nonquantized
 projections use PyTorch. `--backend pytorch` provides an independent GGUF
 dequantization/GEMM comparison path without loading our HIP adapter.
 
@@ -35,6 +39,22 @@ semantics are loaded from the pinned model configuration. Dimensions must be
 multiples of 32; frames must be `4*n+1`. A reduced diagnostic uses
 `--width 64 --height 64 --frames 5 --steps 2 --dump-latents`.
 
+For fast optimization iterations, use full spatial resolution with nine frames
+(Wan requires `4*n+1`, so ten frames are invalid), five updates and no VAE:
+
+```sh
+sh rdna4/wan22/run.sh --prompt 'A red ball rolling on a wooden table.' \
+  --width 832 --height 480 --frames 9 --steps 5 --latent-only --dump-latents \
+  --out tmp/video-rocm/wan22-fast-hip
+```
+
+Add `--backend pytorch` and use a new output directory to obtain the reference.
+`--latent-only` writes `final_latent.npy` instead of an MP4. `compare.py` compares
+the captured schedule when both runs use this option. The manifest records
+`denoise_seconds`, including pipeline preparation, the first DiT upload and
+optional capture overhead; `seconds` additionally includes loading and text
+encoding, plus VAE/video work when enabled.
+
 Weights live under `/mnt/disk01/models/wan22/{gguf,pipeline}`. Only the Q8_0 DiT,
 official BF16 UMT5, tokenizer, FP32 VAE and configurations are downloaded;
 the dense DiT and other quantizations are excluded. Allow roughly 20 GB disk
@@ -47,7 +67,7 @@ encodes on GPU before moving it back to CPU. Model CPU offload separates DiT
 and VAE residency; spatial VAE tiling is enabled. The 14,336 MiB allocation
 limit reserves device headroom, and the shared H3/Hunyuan AMD device lock
 serializes generation. GPU access needs `/dev/kfd` and the AMD render node.
-Builds target gfx1201 and use HIP 7.14; Python requires a ROCm PyTorch build,
+Builds target gfx1201 and use HIP 7.14 with hipBLASLt; Python requires a ROCm PyTorch build,
 GGUF-capable Diffusers, Transformers, Accelerate, NumPy and video packaging.
 The tested environment is PyTorch 2.11.0 ROCm 7.2.2 and Diffusers 0.41.0.dev0.
 
@@ -60,11 +80,16 @@ or full-resolution memory fit. The manifest records `parity: unverified`.
 
 ## Validation
 
-`make -C rdna4/wan22 test` passes four projection fixtures (including signed
-values, matrix tails, large K and a nondefault stream). Maximum relative L2
-against independent GGUF dequantization plus PyTorch GEMM is 0.0000195.
-A two-block synthetic Wan graph with 21 HIP projections passes at relative
-L2 0.000515.
+`make -C rdna4/wan22 test` checks four projection shapes with signed values,
+matrix tails, large K and a nondefault stream under both GEMM paths. It tests
+no bias, replacement bias pointers in cached plans, FP32 callers and shaped
+inputs. hipBLASLt fixtures and a two-block, 21-projection synthetic Wan graph
+match the independent PyTorch reference exactly on the tested system. The
+WMMA graph passes at relative L2 0.000512.
+
+The following video runs and original DiT probes used the **WMMA** path before
+the hipBLASLt optimization; optimized measurements follow in the performance
+section.
 
 The downloaded Q8_0 model has 300 quantized projection tensors across 30
 blocks. An actual-weight complete DiT comparison on shared 2×4×4 latent noise,
@@ -151,28 +176,61 @@ On the RX 9070 XT, the full-geometry DiT benchmark uses the same Q8_0 weights,
 Loading, text encoding, scheduler and VAE are excluded. Each backend runs once
 to warm up, then three synchronized passes alternate order in the same process.
 Both retain PyTorch attention; only quantized projection execution differs.
+The optimized path keeps our HIP Q8 decoder and replaces the generic WMMA
+GEMM with hipBLASLt, including a fused bias/output epilogue. It does not invoke
+Diffusers dequantization or PyTorch linear for quantized FP16 projections.
 
 | Measurement | Repository HIP | PyTorch ROCm reference | HIP runtime gap |
 | --- | ---: | ---: | ---: |
-| Full-size DiT forward, median of 3 | 18.411 s | 10.215 s | +80.2% (1.802×) |
-| 64×64 / 5 frames / 2 updates, end-to-end, single run | 44.941 s | 40.334 s | +11.4% (1.114×) |
-| 832×480 / 81 frames / 50 updates, end-to-end | 2,592.7 s | Unmeasured | Unmeasured |
+| Original WMMA, full-size DiT forward, median of 3 | 18.411 s | 10.215 s | +80.2% (1.802×) |
+| Optimized hipBLASLt, full-size DiT forward, median of 3 | 10.209 s | 10.218 s | −0.09%, effectively on par |
+| Optimized hipBLASLt, 9-frame DiT forward, median of 3 | 1.369 s | 1.374 s | −0.4%, effectively on par |
+| Optimized hipBLASLt, 832×480 / 9 frames / 5 updates, preparation + denoising, single run | 17.427 s | 17.598 s | −1.0% |
+| Original WMMA, 64×64 / 5 frames / 2 updates, end-to-end, single run | 44.941 s | 40.334 s | +11.4% (1.114×) |
+| Original WMMA, 832×480 / 81 frames / 50 updates, end-to-end | 2,592.7 s | Unmeasured | Unmeasured |
 
-Full-size pass samples are PyTorch `[10.2201, 10.2126, 10.2150]` seconds and
-HIP `[18.5048, 18.3579, 18.4105]` seconds. DiT parity passes at relative L2
-0.003552 and cosine 0.9999937, with 7,239 MiB peak PyTorch allocation.
+Optimized full-size samples are PyTorch `[10.2267, 10.2177, 10.2181]` seconds
+and HIP `[10.2071, 10.2107, 10.2087]` seconds: **44.5% less runtime** than the
+original HIP median. The small advantage over PyTorch is within timing noise;
+the target of on-par full-size DiT execution is met. Full-size and nine-frame
+synthetic DiT outputs are exactly equal to PyTorch (relative L2 0, cosine 1).
+Peak allocation in the paired full-size probe is **6,963 MiB**, including the
+workspace. All five captured nine-frame schedule updates also match exactly.
+That short schedule executes 3,000 HIP projections and peaks at 5,710 MiB;
+loading, CPU UMT5, preparation and denoising total 47.59 seconds with HIP versus
+47.55 seconds with PyTorch. VAE is skipped for this iteration profile.
 The small end-to-end timings include CPU UMT5 and VAE, so they do not represent
 DiT throughput. A full-schedule PyTorch reference is required to measure the
-full-video gap. HIP currently expands weights for every projection and uses
-the repository FP16 WMMA GEMM; this benchmark does not isolate the cost of
-expansion, GEMM, or Python dispatch.
+full-video gap. The optimized full 50-update video has not been benchmarked.
+Q8 weights stay compressed between projections; no full-model FP16 cache is
+introduced. Single-forward comparisons use synthetic conditioning, while the
+five-update comparison uses actual CPU-encoded prompt embeddings.
 
 ```sh
 LD_LIBRARY_PATH=/opt/rocm/core-7.14/lib TMPDIR="$PWD/tmp" \
   tmp/vhuman-rocm-venv/bin/python rdna4/wan22/probe.py \
   --width 832 --height 480 --frames 81 --text-tokens 226 \
-  --benchmark-repeats 3 --out tmp/video-rocm/wan22-build/full-dit-benchmark.json
+  --hip-gemm blaslt --benchmark-repeats 3 \
+  --out tmp/video-rocm/wan22-build/blaslt-full-dit.json
 ```
 
-Raw measurements are recorded in that JSON and `full-dit-benchmark.log` beside
-it. The benchmark uses synthetic conditioning rather than a generated prompt.
+Use `--frames 9` for faster iterations and `--hip-gemm wmma` for the old path.
+Raw optimized results are `blaslt-full-dit.json`, `blaslt-short-dit.json` and
+`blaslt-5step-parity.json` under `tmp/video-rocm/wan22-build/`.
+`bench_projection.py --out RESULT.json` measures representative attention/FFN
+shapes with CUDA/HIP events, including decode, GEMM and bias, for independent
+PyTorch, original WMMA and optimized hipBLASLt on synthetic Q8 weights.
+
+The projection benchmark confirms the main saving at 8,190 latent tokens
+(median of five, milliseconds, including Q8 decoding and bias):
+
+| Projection N×K | Original WMMA | Optimized hipBLASLt | PyTorch |
+| --- | ---: | ---: | ---: |
+| Attention 3,072×3,072 | 11.51 | 3.48 | 3.39 |
+| FFN expansion 14,336×3,072 | 187.92 | 27.40 | 27.32 |
+| FFN reduction 3,072×14,336 | 98.62 | 31.23 | 31.60 |
+
+These isolated projection timings explain the DiT improvement; they do not
+measure attention or scheduler execution. All optimized projection outputs in
+this benchmark match PyTorch exactly. Raw samples are in
+`tmp/video-rocm/wan22-build/projection-performance.json`.

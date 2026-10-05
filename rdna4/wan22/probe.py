@@ -21,6 +21,7 @@ def main():
     parser.add_argument("--benchmark-repeats", type=int, default=0,
                         help="Warmed, alternating synchronized passes per backend")
     parser.add_argument("--text-tokens", type=int, default=32)
+    parser.add_argument("--hip-gemm", choices=("blaslt", "wmma"), default="blaslt")
     args = parser.parse_args()
     if args.benchmark_repeats < 0 or args.text_tokens < 1:
         parser.error("Benchmark repeats must be nonnegative and text tokens positive")
@@ -50,7 +51,7 @@ def main():
             torch.cuda.synchronize()
             print("PyTorch GGUF reference completed", flush=True)
             original_forwards = [(module, module.forward) for module in model.modules()]
-            runner = HipRunner()
+            runner = HipRunner(gemm=args.hip_gemm)
             count = runner.install(model)
             hip_forwards = [(module, module.forward) for module in model.modules()]
             print("Running repository HIP projections", flush=True)
@@ -76,7 +77,7 @@ def main():
         sampler.close()
         relative = torch.linalg.vector_norm(actual - expected) / torch.linalg.vector_norm(expected)
         cosine = torch.nn.functional.cosine_similarity(actual.flatten(), expected.flatten(), dim=0)
-        result = {"hip_modules": count, "hip_calls": runner.calls,
+        result = {"hip_gemm": args.hip_gemm, "hip_modules": count, "hip_calls": runner.calls,
                   "relative_l2": float(relative), "cosine": float(cosine),
                   "peak_allocated_mib": torch.cuda.max_memory_allocated() / 1048576,
                   "peak_process_vram_mib": sampler.vram, "seconds": time.monotonic() - started,

@@ -20,6 +20,8 @@ def main():
                 "steps", "seed", "fps", "guidance_scale", "torch", "rocm"):
         if hip[key] != reference[key]:
             raise ValueError(f"Mismatched generation setting: {key}")
+    if hip.get("latent_only", False) != reference.get("latent_only", False):
+        raise ValueError("Mismatched latent-only setting")
     results = []
     for step in range(hip["steps"]):
         name = f"latent_{step:03d}.npy"
@@ -39,10 +41,11 @@ def main():
         if len(data) != expected_size:
             raise ValueError("Decoded MP4 frame count or dimensions do not match")
         return np.frombuffer(data, dtype=np.uint8).astype(np.float64)
-    frame_mae = float(np.mean(np.abs(frames(args.hip) - frames(args.reference))))
-    result = {"scope": "captured schedule and encoded MP4; not raw-frame parity",
+    latent_only = hip.get("latent_only", False)
+    frame_mae = None if latent_only else float(np.mean(np.abs(frames(args.hip) - frames(args.reference))))
+    result = {"scope": "captured schedule only" if latent_only else "captured schedule and encoded MP4; not raw-frame parity",
               "updates": results, "decoded_mp4_mae_255": frame_mae,
-              "passed": all(r["passed"] for r in results) and frame_mae <= 2.0}
+              "passed": all(r["passed"] for r in results) and (latent_only or frame_mae <= 2.0)}
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result, indent=2))
