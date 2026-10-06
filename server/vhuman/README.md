@@ -1224,6 +1224,77 @@ Run `python -m unittest server.vhuman.test_photoreal server.vhuman.test_quality
 server.vhuman.test_reconstruction server.vhuman.test_mobile_preprocess
 server.vhuman.test_mobile` for the 74-test preprocessing/material/runtime suite.
 
+### Mesh-guided multiview skin completion
+
+`reconstruction.multiview_skin` adds ear, rear-head and elevated crown views
+rendered from the fitted GNM mesh. It orbits calibrated cameras around the
+captured mesh, keeping geometry fixed. Each masked Qwen edit uses a four-panel
+condition image: target view, original portrait, adjacent mesh view and frontal
+mesh view. The native HIP runner still receives **one contact-sheet reference**,
+not multiple independent native image conditions. A separate 512px init image
+and mask retain full target resolution and exact protected pixels.
+
+```sh
+python -m server.vhuman.reconstruction.multiview_skin all \
+  --candidate tmp/vhuman-public-portraits/obama/head/reconstruction/material12 \
+  --work tmp/vhuman-generated-skin/obama-multiview01 \
+  --prior-work tmp/vhuman-generated-skin/obama01 \
+  --out tmp/vhuman-public-portraits/obama/head/reconstruction/multiview14 \
+  --steps 20 --edit-steps 12
+```
+
+`--prior-work` optionally reuses an existing T2I skin patch after checking its
+generation request and checksum. Omit it to generate a new patch. Stages
+`prepare`, `edit`, `bake` and `review` can run separately. Six masked edits use
+the `low8` INT8 ROCm backend, with five actual denoising updates for a 12-step
+schedule at strength 0.45. The workflow releases the GPU after each edit.
+
+The bake projects edits through the exact cameras with depth and facing tests.
+Overlapping residuals are fused only when at least two supported views agree
+within 0.012 linear RGB; conflicting overlaps are rejected, and single-view
+support is reduced. The face parser rejects confidently generated eyes, hair,
+mouth cavities and accessories, while the mesh mask determines rear-scalp
+coverage where frontal face parsing is unreliable. Broad illumination is
+removed and the existing 0.025 residual cap and 6mm observation feather remain.
+All photographed texels, geometry and observation-confidence maps are preserved.
+`review.html` compares the original atlas, raw edit and final baked atlas in
+every camera. Browser review also provides ear, back-head and crown view presets.
+Pass `--skin-review tmp/vhuman-generated-skin/obama-multiview01` to
+`mobile.browser` when building the viewer to include the comparison gallery.
+Its checksummed review manifest must match the exported geometry and completed
+base-color hash; the viewer exposes a “Compare multiview skin bake” link.
+
+This path uses spatial multiview agreement instead of requiring six Wan clips.
+It does not infer hair, ear geometry, hidden markings or measured wrinkle depth;
+generated detail retains `qwen-research` provenance. A single-view region is
+explicitly uncorroborated and agreement between generated views is not evidence
+of likeness.
+
+Obama validation (`multiview14`): six 512px edits took 244–245 seconds each
+(1,468 seconds total). The bake modified 550,365 unseen texels and retained all
+175,326 photographed texels byte-for-byte. Of 361,705 overlapping texels,
+353,631 had agreeing edits and 8,074 were rejected. A total of 478,080 texels
+received accepted edited-view support. Unobserved atlas change was 1.02 sRGB
+levels RMS, so this is conservative fine-detail completion. Geometry, portrait,
+observation/confidence maps, normal and ORM maps retained their original hashes.
+The prior Wan-assisted path still reproduces its original base-color hash.
+
+Artifacts: `tmp/vhuman-mobile/obama11`,
+`tmp/vhuman-browser/player-multiview01`, and
+`tmp/vhuman-browser/multiview-check01/verification.json`. The AMD WebGL2 check
+passed native/WASM parity (zero vertex error), all five inspection cameras,
+relighting/detail, audio timing and cancellation at 29.9 animated FPS.
+
+```sh
+python -m unittest server.vhuman.test_generated_skin server.vhuman.test_photoreal \
+  server.vhuman.test_quality server.vhuman.test_reconstruction \
+  server.vhuman.test_mobile_preprocess server.vhuman.test_mobile
+# 85 tests passed
+python -m server.vhuman.mobile.browser_verify \
+  --player tmp/vhuman-browser/player-multiview01 \
+  --out tmp/vhuman-browser/multiview-check01 --hardware
+```
+
 ### Generated detail for unobserved skin
 
 `reconstruction.generated_skin` uses the installed native ROCm Qwen-Image 2.1

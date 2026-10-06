@@ -123,6 +123,10 @@ async function main(){
         note.textContent='Unseen skin includes AI-generated texture. Photographed skin is preserved.';
         status.insertAdjacentElement('afterend',note);
     }
+    if(config.skin_review==='skin-review/review.html'){
+        const link=document.createElement('a');link.href=config.skin_review;link.textContent='Compare multiview skin bake';
+        link.style.color='#d6b789';link.target='_blank';link.rel='noopener';status.insertAdjacentElement('afterend',link);
+    }
     const buffers={};
     for(const [name,file] of Object.entries(manifest.files)){
         if(name.includes('/')||name.includes('\\')||file.bytes>256*1024*1024)throw Error('Invalid asset filename/size');
@@ -151,6 +155,14 @@ async function main(){
     }
     const box=new THREE.Box3().setFromObject(gltf.scene),center=box.getCenter(new THREE.Vector3()),size=box.getSize(new THREE.Vector3());
     const camera=new THREE.PerspectiveCamera(35,1,.01,10);camera.position.copy(center).add(new THREE.Vector3(0,0,Math.max(size.y*1.8,.35)));camera.lookAt(center);
+    const reviewViews={front:[0,0],left:[-85,10],right:[85,10],rear:[180,20],crown:[0,75]};
+    state.setView=name=>{
+        if(!reviewViews[name])throw Error('Unknown review view');
+        const [yaw,pitch]=reviewViews[name].map(v=>v*Math.PI/180),radius=Math.max(size.y*1.8,.35);
+        camera.position.copy(center).add(new THREE.Vector3(Math.sin(yaw)*Math.cos(pitch),Math.sin(pitch),Math.cos(yaw)*Math.cos(pitch)).multiplyScalar(radius));
+        camera.lookAt(center);$('view').value=name;
+    };
+    $('view').onchange=()=>state.setView($('view').value);
     const key=new THREE.DirectionalLight(0xffefd9,3.2);key.position.set(-.4,.5,1);
     const fill=new THREE.DirectionalLight(0xcbdfff,1.1);fill.position.set(.7,.1,1);
     const ambient=new THREE.HemisphereLight(0xd6e4ff,0x5f4837,1.2);scene.add(key,fill,ambient);
@@ -204,7 +216,7 @@ async function main(){
     $('yaw').oninput=()=>{state.animate=false;poseDirty=true;};
     $('detail').onchange=()=>{state.detail=$('detail').checked;updateDetail(latestExpression);};
     $('sweep').onclick=()=>{state.animate=!state.animate;sweepStarted=performance.now();$('sweep').textContent=state.animate?'Pause sweep':'Play pose sweep';};
-    $('reset').onclick=()=>{state.animate=false;$('yaw').value=0;$('sweep').textContent='Play pose sweep';poseDirty=true;};
+    $('reset').onclick=()=>{state.animate=false;$('yaw').value=0;state.setView('front');$('sweep').textContent='Play pose sweep';poseDirty=true;};
     document.addEventListener('visibilitychange',()=>{if(document.hidden){state.animate=false;speech.close();}});
     window.addEventListener('pagehide',()=>{worker.terminate();speech.close();});
     let lastDraw=0;

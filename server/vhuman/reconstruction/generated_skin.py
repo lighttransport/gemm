@@ -28,7 +28,7 @@ def write_json(path, value):
     Path(path).write_text(json.dumps(value,indent=2))
 
 
-def qwen_generate(out, prompt, *, reference=None, mask=None, steps=20, seed=317,
+def qwen_generate(out, prompt, *, reference=None, mask=None, init_image=None, steps=20, seed=317,
                   model='/mnt/disk01/models/qimg-21', package='/mnt/disk01/models/qimg-21-fast/int8-smooth-a0.6'):
     """Use the installed HIP backend, releasing it before video generation."""
     from .. import gpu
@@ -41,6 +41,7 @@ def qwen_generate(out, prompt, *, reference=None, mask=None, steps=20, seed=317,
     request=dict(prompt=prompt,steps=steps,seed=seed,model=str(Path(model).resolve()),
         package=str(Path(package).resolve()),reference_sha256=sha256(reference) if reference else None,
         mask_sha256=sha256(mask) if mask else None)
+    if init_image is not None:request['init_image_sha256']=sha256(init_image)
     if receipt.exists():
         previous=json.loads(receipt.read_text())
         if previous['request']!=request or previous['sha256']!=sha256(out):
@@ -51,7 +52,7 @@ def qwen_generate(out, prompt, *, reference=None, mask=None, steps=20, seed=317,
     with gpu.execution('rocm',0,Path(model).parent),gpu.device_session(10000):
         try:
             result=backend.generate(GenRequest(prompt=prompt,out=out,width=512,height=512,steps=steps,
-                seed=seed,references=(reference,) if reference else (),init_image=reference if mask else None,
+                seed=seed,references=(reference,) if reference else (),init_image=(init_image or reference) if mask else None,
                 mask=mask,mask_as_reference=False,strength=.45 if mask else 1.,true_cfg_scale=1.))
         finally:backend.close()
     record=dict(request=request,sha256=sha256(out),generator='Qwen-Image-2.1',
@@ -111,11 +112,12 @@ def triplanar_detail(points, normals, plate, period=.045):
     return result
 
 
-def orbit_camera(points, yaw, resolution=512):
+def orbit_camera(points, yaw, resolution=512, pitch=0):
     centre=(points.min(0)+points.max(0))/2
     extent=float(np.ptp(points,axis=0).max());distance=extent*3
-    angle=np.deg2rad(yaw);back=np.array([np.sin(angle),0.,np.cos(angle)])
-    right=normalize(np.cross([0.,1.,0.],back));up=np.cross(back,right)
+    angle=np.deg2rad(yaw);elevation=np.deg2rad(pitch)
+    back=np.array([np.sin(angle)*np.cos(elevation),np.sin(elevation),np.cos(angle)*np.cos(elevation)])
+    right=np.array([np.cos(angle),0.,-np.sin(angle)]);up=np.cross(back,right)
     return Camera(.82*resolution*distance/extent,resolution/2,resolution/2,
                   centre+distance*back,np.stack((right,up,back)))
 
@@ -279,34 +281,68 @@ def bake(candidate, work, out):
     base=np.asarray(Image.open(candidate/'skin_basecolor.png').convert('RGB'))
     observed=np.asarray(Image.open(candidate/'skin_coverage.png'))>0
     accum=np.zeros_like(points);weights=np.zeros(len(points));reports=[]
+    multiview=record.get('consistency')=='multiview'
+    view_colors=[];view_weights=[]
     from ..face_parsing import FaceParser
     from .occlusion import skin_bake_mask
     parser=FaceParser()
     for view in record['views']:
         folder=work/view['name'];camera=Camera.from_dict(view['camera'])
-        edit_record=json.loads((folder/'edited.json').read_text());temporal=json.loads((folder/'temporal.json').read_text())
-        if sha256(folder/'edited.png')!=edit_record['sha256'] or temporal['reference_sha256']!=edit_record['sha256']:
+        edit_record=json.loads((folder/'edited.json').read_text())
+        if sha256(folder/'edited.png')!=edit_record['sha256']:
             raise ValueError('edited image receipt mismatch')
-        if temporal['video_sha256']!=sha256(folder/'video/clip.mp4'):raise ValueError('video receipt mismatch')
-        if temporal['consensus_sha256']!=sha256(folder/'temporal_consensus.png') or temporal['support_sha256']!=sha256(folder/'temporal_support.npy'):
-            raise ValueError('temporal consensus checksum mismatch')
         edited=srgb_to_linear(np.asarray(Image.open(folder/'edited.png').convert('RGB'))/255)
-        consensus=srgb_to_linear(np.asarray(Image.open(folder/'temporal_consensus.png').convert('RGB'))/255)
         source=srgb_to_linear(np.asarray(Image.open(folder/'input.png').convert('RGB'))/255)
+        if multiview:
+            request=edit_record['request']
+            if (request.get('init_image_sha256')!=sha256(folder/'input.png')
+                    or request['reference_sha256']!=sha256(folder/'reference.png')
+                    or request['mask_sha256']!=sha256(folder/'mask.png')):
+                raise ValueError('multiview edit input receipt mismatch')
+            consensus=edited;temporal=None;gate=np.ones(edited.shape[:2])
+            mask_bool=np.asarray(Image.open(folder/'mask.png'))>0
+            original_bytes=np.asarray(Image.open(folder/'input.png').convert('RGB'))
+            edited_bytes=np.asarray(Image.open(folder/'edited.png').convert('RGB'))
+            if edited_bytes.shape!=original_bytes.shape or not np.array_equal(edited_bytes[~mask_bool],original_bytes[~mask_bool]):
+                raise ValueError('multiview edit changed protected pixels')
+        else:
+            temporal=json.loads((folder/'temporal.json').read_text())
+            if temporal['reference_sha256']!=edit_record['sha256']:raise ValueError('edited image receipt mismatch')
+            if temporal['video_sha256']!=sha256(folder/'video/clip.mp4'):raise ValueError('video receipt mismatch')
+            if temporal['consensus_sha256']!=sha256(folder/'temporal_consensus.png') or temporal['support_sha256']!=sha256(folder/'temporal_support.npy'):
+                raise ValueError('temporal consensus checksum mismatch')
+            consensus=srgb_to_linear(np.asarray(Image.open(folder/'temporal_consensus.png').convert('RGB'))/255)
+            gate=np.load(folder/'temporal_support.npy')
         residual=band_detail((edited+consensus)*.5-source)
         mask=np.asarray(Image.open(folder/'mask.png'),float)/255
         # Exclude newly generated eyes/hair/accessories from skin detail.
         labels,confidence=parser.predict(np.uint8(linear_to_srgb(edited)*255+.5))
-        eligible=mask*(~skin_bake_mask(labels,confidence))*np.load(folder/'temporal_support.npy')
+        if multiview:
+            # Face parsers often call a rear scalp background. The calibrated
+            # mesh/mask supplies the silhouette; reject confident foreign parts.
+            excluded=np.isin(labels,[2,3,4,5,6,9,11,12,13,15,16,17,18])&(confidence>=.7)
+        else:excluded=skin_bake_mask(labels,confidence)
+        eligible=mask*(~excluded)*gate
         xy,z=camera.project(points);uv=xy/512
         depth=np.load(folder/'depth.npy');ix=np.clip(xy[:,0].astype(int),0,511);iy=np.clip(xy[:,1].astype(int),0,511)
         facing=np.maximum((normals*normalize(camera.origin-points)).sum(1),0)
         seen=(uv.min(1)>=0)&(uv.max(1)<1)&(abs(depth[iy,ix]-z)<.002)&(facing>.3)
         weight=sample(eligible,uv)*seen*facing**2
-        accum+=sample(residual,uv)*weight[:,None];weights+=weight
+        color=sample(residual,uv)
+        if multiview:view_colors.append(color);view_weights.append(weight)
+        accum+=color*weight[:,None];weights+=weight
         reports.append(dict(view=view['name'],accepted_texels=int((weight>.05).sum()),temporal=temporal,
                             edit_sha256=edit_record['sha256']))
-    delta=seed_detail+accum/np.maximum(weights[:,None],1e-12)
+        if multiview:
+            reports[-1]['projected_texels']=reports[-1].pop('accepted_texels')
+            reports[-1]['edit_seconds']=edit_record['seconds']
+            reports[-1]['condition_sha256']=edit_record['request']['reference_sha256']
+    consistency=None
+    if multiview:
+        from .multiview_skin import fuse_views
+        detail,weights,consistency=fuse_views(view_colors,view_weights)
+    else:detail=accum/np.maximum(weights[:,None],1e-12)
+    delta=seed_detail+detail
     delta=np.clip(delta,-.025,.025)*blend[valid,None]
     result=apply_detail(base,valid,delta,observed)
     # Keep all evidence maps and geometry unchanged; generated support is separate.
@@ -320,7 +356,8 @@ def bake(candidate, work, out):
     support=np.zeros(valid.shape);support[valid]=np.minimum(.05+weights,.25)*blend[valid]
     Image.fromarray(np.uint8(support*255+.5)).save(out/'skin_generated_support.png')
     report=dict(schema='vhuman.synthetic_skin_completion.v1',work=str(work.resolve()),
-        synthetic=True,license='qwen-research',generator='Qwen-Image-2.1 + Wan2.2',
+        synthetic=True,license='qwen-research',generator='Qwen-Image-2.1 mesh-guided multiview' if multiview else 'Qwen-Image-2.1 + Wan2.2',
+        basecolor_sha256=sha256(out/'skin_basecolor.png'),
         inputs=record['inputs'],prior=json.loads((work/'skin_prior.json').read_text()),
         photographed_texels_changed=int(np.any(result[observed]!=base[observed],axis=-1).sum()),
         generated_texels=int((valid&np.any(result!=base,axis=-1)).sum()),
@@ -329,6 +366,9 @@ def bake(candidate, work, out):
         limitations=['generated detail is an appearance prior, not recovered anatomy',
                      'I2V agreement measures self-consistency, not photographic accuracy',
                      'no generated colors enter measured confidence or permissive training'])
+    if multiview:
+        report['multiview_consistency']=consistency
+        report['limitations'][1]='multiview agreement measures synthetic self-consistency, not photographic accuracy'
     manifest['material']['synthetic_completion']=report
     manifest['material_refinement']=dict(source=str(candidate.resolve()),geometry_unchanged=True)
     write_json(out/'manifest.json',manifest);write_json(out/'skin_material.json',manifest['material'])

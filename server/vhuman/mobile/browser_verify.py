@@ -117,6 +117,18 @@ def verify(player,out,hardware=False):
             cdp.evaluate('document.getElementById("detail").checked=false;document.getElementById("detail").dispatchEvent(new Event("change"))')
             cdp.wait_for(f'vhuman.frames>{frame+1}')
             if canvas()==before:raise AssertionError('skin detail toggle did not change pixels')
+            # Inspection cameras must reveal new surfaces without changing the
+            # native fitted geometry or expression.
+            native_before=cdp.evaluate('vhuman.nativeVertices()')
+            cdp.evaluate('document.getElementById("lighting").value="studio";document.getElementById("lighting").dispatchEvent(new Event("change"))')
+            for view in ('left','right','rear','crown','front'):
+                before=canvas();frame=cdp.evaluate('vhuman.frames')
+                cdp.evaluate(f'vhuman.setView({json.dumps(view)})')
+                cdp.wait_for(f'vhuman.frames>{frame+1}')
+                if canvas()==before:raise AssertionError('review camera did not change the frame: '+view)
+                if cdp.evaluate('vhuman.nativeVertices()')!=native_before:raise AssertionError('review camera changed native geometry')
+                shot=cdp.call('Page.captureScreenshot',{'format':'png'})
+                (out/f'view-{view}.png').write_bytes(base64.b64decode(shot['data']))
             with speech_fixture(player/'avatar') as speech_port:
                 cdp.evaluate(f'vhuman.speech.connect("ws://127.0.0.1:{speech_port}")')
                 cdp.wait_for('vhuman.speech.ready',timeout=10)
@@ -145,7 +157,7 @@ def verify(player,out,hardware=False):
                 poses=len(errors),timings=timings,renderer=driver,display_fps=(last['frames']-first['frames'])*1000/(last['time']-first['time']),
                 animated_display_fps=(animation_end['frames']-animation_start['frames'])*1000/(animation_end['time']-animation_start['time']),
                 animated_pose_fps=(animation_end['poses']-animation_start['poses'])*1000/(animation_end['time']-animation_start['time']),
-                audio=audio,frame_checks=['relighting','dynamic detail','audio sample clock','cancellation'],
+                audio=audio,frame_checks=['relighting','dynamic detail','ear/rear/crown cameras','audio sample clock','cancellation'],
                 passed=bool(float(np.percentile(errors,95))<.25 and float(np.percentile(binding_errors,95))<.25 and max(activation_errors,default=0)<1e-5))
             (out/'verification.json').write_text(json.dumps(result,indent=2))
             if not result['passed']:raise AssertionError(result)

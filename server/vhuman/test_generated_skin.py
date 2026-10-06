@@ -1,12 +1,80 @@
 """Synthetic completion protects observations and rejects unstable video evidence."""
 import unittest
 import json
+from pathlib import Path
+import tempfile
+from unittest.mock import patch
 import numpy as np
 from .reconstruction.generated_skin import (band_detail,unseen_weight,triplanar_detail,
     temporal_consistency,render_plate,orbit_camera,apply_detail)
+from .reconstruction.multiview_skin import fuse_views,contact_sheet,verify_inputs
+from .reconstruction.reference import Camera
+from .reconstruction.observations import sha256
+from PIL import Image
 
 
 class GeneratedSkinTests(unittest.TestCase):
+    def test_multiview_input_and_review_reject_tampering(self):
+        from .mobile.browser import build
+        work=Path(__file__).resolve().parents[2]/'tmp/vhuman-generated-skin-tests'
+        work.mkdir(parents=True,exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=work) as directory:
+            root=Path(directory);image=root/'reference.png';image.write_bytes(b'original reference')
+            record={'inputs':{'reference.png':sha256(image)}}
+            verify_inputs(root,record)
+            image.write_bytes(b'changed reference')
+            with self.assertRaises(ValueError):verify_inputs(root,record)
+            with self.assertRaises(ValueError):verify_inputs(root,{'inputs':{'../outside':'wrong'}})
+            (root/'review.html').write_text('review')
+            review=dict(schema='vhuman.multiview_skin_review.v1',geometry_sha256='geometry',basecolor_sha256='bake',
+                        files={'review.html':sha256(root/'review.html')})
+            manifest=dict(source_geometry_sha256='geometry',material={'synthetic_completion':{'basecolor_sha256':'other bake'}})
+            (root/'review.json').write_text(json.dumps(review))
+            with patch('server.vhuman.mobile.browser.validate_package',return_value=manifest):
+                with self.assertRaisesRegex(ValueError,'another baked material'):
+                    build(root,root/'out',root,skin_review=root)
+                manifest['material']['synthetic_completion']['basecolor_sha256']='bake'
+                (root/'review.html').write_text('altered review')
+                with self.assertRaisesRegex(ValueError,'checksum'):
+                    build(root,root/'out',root,skin_review=root)
+
+    def test_elevated_camera_sees_crown_and_roundtrips(self):
+        points=np.array([[-.1,-.1,-.1],[.1,.1,.1]])
+        for pitch in (0,65,75,90):
+            camera=Camera.from_dict(orbit_camera(points,35,pitch=pitch).as_dict())
+            xy,z=camera.project(np.array([[0.,0.,0.]]))
+            np.testing.assert_allclose(xy,[[256,256]],atol=1e-8)
+            self.assertGreater(z[0],0)
+            if pitch:self.assertGreater(camera.origin[1],0)
+
+    def test_multiview_rejects_disagreement_and_keeps_corroborated_detail(self):
+        colors=np.array([[[.01,0,0],[.02,0,0],[.01,0,0]],
+                         [[.011,0,0],[-.02,0,0],[.02,0,0]]])
+        weights=np.array([[1.,1.,1.],[1.,1.,0.]])
+        result,support,report=fuse_views(colors,weights)
+        np.testing.assert_allclose(result[0],[.0105,0,0])
+        np.testing.assert_array_equal(result[1],[0,0,0])
+        np.testing.assert_allclose(result[2],[.01,0,0])
+        np.testing.assert_allclose(support,[2,0,.075])
+        self.assertEqual(report['agreeing_overlap_texels'],1)
+        self.assertEqual(report['rejected_overlap_texels'],1)
+        with self.assertRaises(ValueError):fuse_views(colors,-weights)
+
+    def test_multiview_outlier_does_not_bias_consensus(self):
+        colors=np.array([[[.01,.005,0]],[[.011,.004,0]],[[-.025,-.025,.025]]])
+        result,support,_=fuse_views(colors,np.ones((3,1)))
+        np.testing.assert_allclose(result,[[.0105,.0045,0]])
+        np.testing.assert_array_equal(support,[2])
+        result,support,_=fuse_views(colors,np.zeros((3,1)))
+        np.testing.assert_array_equal(result,np.zeros((1,3)))
+        np.testing.assert_array_equal(support,[0])
+
+    def test_contact_sheet_keeps_target_and_guides_in_fixed_quadrants(self):
+        colors=((255,0,0),(0,255,0),(0,0,255),(255,255,0))
+        sheet=np.asarray(contact_sheet(*(Image.new('RGB',(512,512),c) for c in colors)))
+        for xy,color in zip(((256,256),(768,256),(256,768),(768,768)),colors):
+            np.testing.assert_array_equal(sheet[xy[1],xy[0]],color)
+
     def test_final_bake_keeps_photographed_bytes_exactly(self):
         base=np.random.default_rng(12).integers(0,256,(8,8,3),dtype=np.uint8)
         valid=np.ones((8,8),bool);valid[0]=False
